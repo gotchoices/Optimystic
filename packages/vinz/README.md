@@ -1,5 +1,5 @@
-# @votetorrent/vinz
-> Vinz Clortho - The Keymaster. Threshold Cryptography for VoteTorrent
+# @optimystic/vinz
+> Vinz Clortho - The Keymaster. Threshold Cryptography for Optimystic
 
 This package implements Distributed Key Generation (DKG) of threshold cryptography primitives based on Feldman's Verifiable Secret Sharing (VSS) scheme over the secp256k1 curve. It allows a group of participants to collaboratively generate a shared public key without any single participant knowing the corresponding private key. A threshold number of participants can later cooperate to reconstruct the private key or perform operations requiring it (like decryption).
 
@@ -16,7 +16,7 @@ This library currently uses Feldman's Verifiable Secret Sharing (VSS) scheme ope
 **Why Feldman VSS?**
 
 *   **Verifiability:** It allows participants to verify the consistency of shares they receive during the DKG process. This is crucial to prevent malicious participants from disrupting the key generation.
-*   **Composite Public Key Generation:** The VSS scheme naturally produces a composite public key corresponding to the shared secret. This is essential for Vote Torrent's use case, where votes will be secured using the composite public key.
+*   **Composite Public Key Generation:** The VSS scheme naturally produces a composite public key corresponding to the shared secret. This is essential for peer-to-peer app use cases, where multiple users may composite a public key.
 *   **Maturity:** Feldman VSS combined with elliptic curves is a well-understood and relatively mature technique in threshold cryptography.
 
 **Post-Quantum Considerations:**
@@ -44,7 +44,7 @@ This process ensures that no single participant knows the final private key \( P
 
 ## Installation
 
-This package is part of the VoteTorrent monorepo. Install dependencies from the root of the repository:
+This package is part of the Optimystic monorepo. Install dependencies from the root of the repository:
 
 ```sh
 npm install

@@ -1,4 +1,4 @@
-import type { BlockId, TrxId, TrxRev, Transform, IBlock } from "@votetorrent/db-core";
+import type { BlockId, TrxId, TrxRev, Transform, IBlock } from "@optimystic/db-core";
 import type { BlockMetadata } from "./struct";
 
 export interface IRawStorage {

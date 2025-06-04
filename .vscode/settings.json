@@ -29,7 +29,7 @@
 		"Trxs",
 		"uncheckpointed",
 		"upserted",
-		"votetorrent",
+		"optimystic",
 		"yamux"
 	],
 	"svg.preview.background": "custom"

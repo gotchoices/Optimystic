@@ -1,4 +1,4 @@
-import type { BlockId, IBlock, TrxId, TrxRev, TrxTransform, TrxTransforms } from "@votetorrent/db-core";
+import type { BlockId, IBlock, TrxId, TrxRev, TrxTransform, TrxTransforms } from "@optimystic/db-core";
 
 export type RevisionRange = [
 	/** Inclusive start */

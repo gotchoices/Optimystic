@@ -1,4 +1,4 @@
-import type { IBlock, Transform, TrxId, TrxRev } from "@votetorrent/db-core";
+import type { IBlock, Transform, TrxId, TrxRev } from "@optimystic/db-core";
 
 /** Interface for block-level storage operations */
 export interface IBlockStorage {

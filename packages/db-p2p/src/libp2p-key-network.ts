@@ -1,6 +1,6 @@
 import type { AbortOptions, Libp2p, PeerId, Stream } from "@libp2p/interface";
 import { first } from "./it-utility.js";
-import type { ClusterPeers, FindCoordinatorOptions, IKeyNetwork, IPeerNetwork } from "@votetorrent/db-core";
+import type { ClusterPeers, FindCoordinatorOptions, IKeyNetwork, IPeerNetwork } from "@optimystic/db-core";
 import all from "it-all";
 
 export class Libp2pKeyPeerNetwork implements IKeyNetwork, IPeerNetwork {

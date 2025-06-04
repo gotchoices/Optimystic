@@ -1,12 +1,12 @@
 #!/usr/bin/env node
 import { Command } from 'commander';
-import { createLibp2pNode } from '@votetorrent/vote-engine';
+import { createLibp2pNode } from '@optimystic/db-p2p';
 
 const program = new Command();
 
 program
   .name('vt-test')
-  .description('VoteTorrent test CLI')
+  .description('Optimystic test CLI')
   .version('0.0.1');
 
 program

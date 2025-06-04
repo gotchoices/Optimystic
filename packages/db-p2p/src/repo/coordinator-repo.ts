@@ -1,4 +1,4 @@
-import type { PendRequest, TrxBlocks, IRepo, MessageOptions, CommitResult, GetBlockResults, PendResult, BlockGets, CommitRequest, RepoMessage, TrxId, IKeyNetwork, IPeerNetwork } from "@votetorrent/db-core";
+import type { PendRequest, TrxBlocks, IRepo, MessageOptions, CommitResult, GetBlockResults, PendResult, BlockGets, CommitRequest, RepoMessage, TrxId, IKeyNetwork, IPeerNetwork } from "@optimystic/db-core";
 import { ClusterCoordinator } from "./cluster-coordinator.js";
 import type { ClusterClient } from "../cluster/client.js";
 import type { PeerId } from "@libp2p/interface";

@@ -1,7 +1,7 @@
 import { pipe } from 'it-pipe';
 import { decode as lpDecode, encode as lpEncode } from 'it-length-prefixed';
 import type { Startable, Logger, IncomingStreamData } from '@libp2p/interface';
-import type { ICluster, ClusterRecord } from '@votetorrent/db-core';
+import type { ICluster, ClusterRecord } from '@optimystic/db-core';
 import type { Uint8ArrayList } from 'uint8arraylist';
 
 interface BaseComponents {

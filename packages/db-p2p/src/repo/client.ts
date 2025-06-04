@@ -1,6 +1,6 @@
 import type { IRepo, GetBlockResults, PendSuccess, StaleFailure, TrxBlocks, MessageOptions, CommitResult,
-	PendRequest, CommitRequest, BlockGets, IPeerNetwork} from "@votetorrent/db-core";
-import type { RepoMessage } from "@votetorrent/db-core";
+	PendRequest, CommitRequest, BlockGets, IPeerNetwork} from "@optimystic/db-core";
+import type { RepoMessage } from "@optimystic/db-core";
 import type { PeerId } from "@libp2p/interface";
 import { ProtocolClient } from "../protocol-client.js";
 

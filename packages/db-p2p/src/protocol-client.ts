@@ -2,7 +2,7 @@ import { pipe } from 'it-pipe';
 import { encode as lpEncode, decode as lpDecode } from 'it-length-prefixed';
 import { pushable } from 'it-pushable';
 import type { PeerId } from '@libp2p/interface';
-import type { IPeerNetwork } from '@votetorrent/db-core';
+import type { IPeerNetwork } from '@optimystic/db-core';
 import { first } from './it-utility.js';
 
 /** Base class for clients that communicate via a libp2p protocol */

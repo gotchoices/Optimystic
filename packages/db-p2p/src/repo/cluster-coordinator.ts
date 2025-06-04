@@ -1,9 +1,9 @@
 import { peerIdFromString } from "@libp2p/peer-id";
-import type { ClusterRecord, IKeyNetwork, RepoMessage, BlockId, ClusterPeers, MessageOptions, Signature } from "@votetorrent/db-core";
+import type { ClusterRecord, IKeyNetwork, RepoMessage, BlockId, ClusterPeers, MessageOptions, Signature } from "@optimystic/db-core";
 import { base58btc } from "multiformats/bases/base58";
 import { sha256 } from "multiformats/hashes/sha2";
 import { ClusterClient } from "../cluster/client.js";
-import { Pending } from "@votetorrent/db-core";
+import { Pending } from "@optimystic/db-core";
 import type { PeerId } from "@libp2p/interface";
 
 /**

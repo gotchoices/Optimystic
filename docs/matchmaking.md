@@ -3,13 +3,15 @@ Rendezvous-based matchmaking in Kademlia DHT Networks
 
 ## Introduction
 
-In VoteTorrent's peer-to-peer (P2P) networks, efficient matchmaking between peers is crucial, especially when dealing with dynamic and varying network sizes. VoteTorrent's rendezvous-based matchmaking design ensures that peers can find each other efficiently, whether the network has millions of nodes or just a few, and whether the subset of nodes interested in a particular task is large or sparse.  Broadly, matchmaking is used for:
-* Finding peers with which to form blocks together
-* Asking peers to do work, such as transacting changes to shared records
+In Optimystic's peer-to-peer (P2P) networks, efficient matchmaking between peers is crucial, especially when dealing with dynamic and varying network sizes. Optimystic's rendezvous-based matchmaking design ensures that peers can find each other efficiently, whether the network has millions of nodes or just a few, and whether the subset of nodes interested in a particular task is large or sparse. Broadly, matchmaking is used for:
+* Finding peers to collaborate on distributed tasks such as forming processing clusters
+* Requesting peers to perform work, such as coordinating changes to shared data structures
+* Discovering nodes with specific capabilities or resources
+* Load balancing work across available nodes in the network
 
 ## Overview of the Design
 
-The core idea is to have nodes "meet" at as local as possible rendezvous points.  **rendezvous keys** are derived from a combination of **local node address information** and **task-specific hashes**. Peers adjust the specificity of these keys based on the distribution of their local Kademlia buckets and the network conditions. By doing so, peers can effectively control the granularity of their search and matchmaking process.
+The core idea is to have nodes "meet" at as local as possible rendezvous points. **Rendezvous keys** are derived from a combination of **local node address information** and **task-specific hashes**. Peers adjust the specificity of these keys based on the distribution of their local Kademlia buckets and the network conditions. By doing so, peers can effectively control the granularity of their search and matchmaking process.
 
 - **Most General Rendezvous Key**: A key that points to a single location in the DHT, the place of maximal likelihood to find other interested peers.
 - **Most Specific Rendezvous Keys**: Keys that are more widely distributed across the DHT, representing less likely places to find other interested peers.

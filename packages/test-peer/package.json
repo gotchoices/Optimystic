@@ -1,8 +1,8 @@
 {
-  "name": "@votetorrent/test-peer",
+  "name": "@optimystic/test-peer",
   "version": "0.0.1",
   "type": "module",
-  "description": "Test peer implementation for VoteTorrent",
+  "description": "Test peer implementation for Optimystic",
   "main": "dist/src/index.js",
   "types": "./dist/src/index.d.ts",
   "files": [
@@ -32,10 +32,8 @@
   "dependencies": {
     "@libp2p/interface": "^2.7.0",
     "@libp2p/peer-id": "^4.2.4",
-    "@votetorrent/db-core": "^0.0.1",
-    "@votetorrent/db-p2p": "^0.0.1",
-    "@votetorrent/vote-core": "^0.0.1",
-    "@votetorrent/vote-engine": "^0.0.1",
+    "@optimystic/db-core": "^0.0.1",
+    "@optimystic/db-p2p": "^0.0.1",
     "commander": "^13.1.0",
     "uint8arrays": "^5.1.0"
   },

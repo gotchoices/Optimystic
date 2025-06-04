@@ -1,6 +1,6 @@
-import type { IRepo, ClusterRecord, Signature, RepoMessage } from "@votetorrent/db-core";
-import type { ICluster } from "@votetorrent/db-core";
-import type { IPeerNetwork } from "@votetorrent/db-core";
+import type { IRepo, ClusterRecord, Signature, RepoMessage } from "@optimystic/db-core";
+import type { ICluster } from "@optimystic/db-core";
+import type { IPeerNetwork } from "@optimystic/db-core";
 import { ClusterClient } from "./client.js";
 import type { PeerId } from "@libp2p/interface";
 import { peerIdFromString } from "@libp2p/peer-id";

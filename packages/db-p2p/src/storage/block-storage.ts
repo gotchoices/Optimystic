@@ -1,5 +1,5 @@
-import type { BlockId, IBlock, Transform, TrxId, TrxRev } from "@votetorrent/db-core";
-import { Latches, applyTransform } from "@votetorrent/db-core";
+import type { BlockId, IBlock, Transform, TrxId, TrxRev } from "@optimystic/db-core";
+import { Latches, applyTransform } from "@optimystic/db-core";
 import type { BlockArchive, BlockMetadata, RestoreCallback, RevisionRange } from "./struct.js";
 import type { IRawStorage } from "./i-raw-storage.js";
 import { mergeRanges } from "./helpers.js";

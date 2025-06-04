@@ -1,5 +1,5 @@
 import { type PeerId } from '@libp2p/interface';
-import type { IPeerNetwork, ICluster, ClusterRecord } from '@votetorrent/db-core';
+import type { IPeerNetwork, ICluster, ClusterRecord } from '@optimystic/db-core';
 import { ProtocolClient } from '../protocol-client.js';
 
 export class ClusterClient extends ProtocolClient implements ICluster {

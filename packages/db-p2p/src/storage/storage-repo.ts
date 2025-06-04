@@ -2,9 +2,9 @@ import type {
 	IRepo, MessageOptions, BlockId, CommitRequest, CommitResult, GetBlockResults, PendRequest, PendResult, TrxBlocks,
 	TrxId, BlockGets, TrxPending, PendSuccess, TrxTransform, TrxTransforms,
 	Transforms
-} from "@votetorrent/db-core";
+} from "@optimystic/db-core";
 import { Latches, transformForBlockId, applyTransform, groupBy, concatTransform, emptyTransforms,
-	blockIdsForTransforms, transformsFromTransform } from "@votetorrent/db-core";
+	blockIdsForTransforms, transformsFromTransform } from "@optimystic/db-core";
 import { asyncIteratorToArray } from "../it-utility.js";
 import type { IBlockStorage } from "./i-block-storage.js";
 
