@@ -26,8 +26,9 @@
     "dep-check": "aegir dep-check"
   },
   "devDependencies": {
-    "@types/node": "^22.13.10",
-    "aegir": "^45.1.4"
+    "@types/node": "^24.0.12",
+    "aegir": "^47.0.20",
+    "typescript": "^5.8.3"
   },
   "dependencies": {
     "@libp2p/interface": "^1.7.0",
