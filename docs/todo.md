@@ -1,3 +1,4 @@
+* Implement cross-collection transactions by concatenating transactors
 * Have the NetworkTransactor look for intersections between clusters, rather than arbitrary coordinators.
 * Resolve case for concurrent collection creation
 * Potential enhancement: have the peers at or around the block's CID submit the block, to make the source more anonymous
@@ -12,3 +13,4 @@
 * Implement data compression for block storage to reduce network overhead
 * Add support for custom collection types beyond trees and diaries
 * Implement cross-network federation capabilities for multi-cluster deployments
+* Fix for collection test: "should handle concurrent modifications"
