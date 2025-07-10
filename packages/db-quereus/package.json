@@ -22,9 +22,6 @@
     "clean": "rm -rf dist",
     "typecheck": "tsc --noEmit"
   },
-  "peerDependencies": {
-    "quereus": "^0.1.0"
-  },
   "devDependencies": {
     "@types/node": "^24.0.12",
 		"aegir": "^47.0.20",
@@ -32,6 +29,7 @@
     "typescript": "^5.8.3"
   },
   "dependencies": {
+    "@quereus/quereus": "^0.2.1",
     "@optimystic/db-core": "*",
     "@optimystic/db-p2p": "*",
     "@libp2p/interface": "^2.10.5",
@@ -42,7 +40,10 @@
     "@chainsafe/libp2p-gossipsub": "^14.1.1",
     "@libp2p/identify": "^3.0.38",
     "@libp2p/bootstrap": "^11.0.46",
-    "libp2p": "^2.9.0"
+    "libp2p": "^2.9.0",
+    "@noble/curves": "^1.9.2",
+    "@noble/hashes": "^1.6.0",
+    "uint8arrays": "^5.1.0"
   },
   "keywords": [
     "quereus",
