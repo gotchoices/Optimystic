@@ -13,7 +13,7 @@ export function coordinatorRepo(keyNetwork: IKeyNetwork, createClusterClient: (p
 
 /** Cluster coordination repo - uses local store, as well as distributes changes to other nodes using cluster consensus. */
 export class CoordinatorRepo implements IRepo {
-	private clusterManager: ClusterCoordinator;
+	private coordinator: ClusterCoordinator;
 	private readonly DEFAULT_TIMEOUT = 30000; // 30 seconds default timeout
 
 	constructor(
@@ -22,7 +22,7 @@ export class CoordinatorRepo implements IRepo {
 		private readonly storageRepo: IRepo,
 	) {
 		// Cast KeyNetwork to IKeyNetwork to satisfy the type system
-		this.clusterManager = new ClusterCoordinator(keyNetwork, createClusterClient);
+		this.coordinator = new ClusterCoordinator(keyNetwork, createClusterClient);
 	}
 
 	async get(blockGets: BlockGets, options?: MessageOptions): Promise<GetBlockResults> {
@@ -50,10 +50,12 @@ export class CoordinatorRepo implements IRepo {
 				};
 
 				// Execute the cluster transaction for this block
-				await this.clusterManager.executeClusterTransaction(blockId, message, options);
+				await this.coordinator.executeClusterTransaction(blockId, message, options);
+
+				// TODO: cross-check the result with the local store
 			} catch (error) {
 				console.error(`Error verifying block ${blockId} with cluster:`, error);
-				// We might want to mark this block as potentially inconsistent
+				// TODO: Deal with potentially inconsistent block
 			}
 		});
 
@@ -78,7 +80,7 @@ export class CoordinatorRepo implements IRepo {
 		try {
 			// For each block ID, execute a cluster transaction
 			const clusterPromises = blockIds.map(blockId =>
-				this.clusterManager.executeClusterTransaction(blockId, message, options)
+				this.coordinator.executeClusterTransaction(blockId, message, options)
 			);
 
 			// Wait for all cluster transactions to complete
@@ -108,7 +110,7 @@ export class CoordinatorRepo implements IRepo {
 		try {
 			// For each block ID, execute a cluster transaction
 			const clusterPromises = blockIds.map(blockId =>
-				this.clusterManager.executeClusterTransaction(blockId, message, options)
+				this.coordinator.executeClusterTransaction(blockId, message, options)
 			);
 
 			// Wait for all cluster transactions to complete
@@ -137,7 +139,7 @@ export class CoordinatorRepo implements IRepo {
 		try {
 			// For each block ID, execute a cluster transaction
 			const clusterPromises = blockIds.map(blockId =>
-				this.clusterManager.executeClusterTransaction(blockId, message, options)
+				this.coordinator.executeClusterTransaction(blockId, message, options)
 			);
 
 			// Wait for all cluster transactions to complete

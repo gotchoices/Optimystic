@@ -19,12 +19,14 @@ In distributed content-addressed systems:
 
 Optimystic provides a **layered architecture** that maintains ACID properties while achieving horizontal scalability and fault tolerance:
 
-1. **Content-addressable block storage** with immutable, versioned units
-2. **Distributed data structures** (B-trees, chains) built on block primitives
+1. **Randomly distributed block storage** with immutable, versioned units
+2. **Block-based data structures** (B-trees, chains) built on block primitives
 3. **Transaction logging** with integrity guarantees and checkpointing
 4. **Collection abstractions** that combine data structures with distributed transactions
 5. **Distributed coordination** through log-first transaction ordering
 6. **Peer-to-peer networking** with cluster-aware consensus and failure recovery
+
+A key innovation of this system is that the transaction payload is transmitted prior to the commital, as part of the "pend" phase.  This minimizes the overhead of commitment since the propagation and validation of the transaction are complete prior to commit.
 
 ## Architecture
 
