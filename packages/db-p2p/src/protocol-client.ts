@@ -17,7 +17,7 @@ export class ProtocolClient {
 		protocol: string,
 		options?: { signal?: AbortSignal }
 	): Promise<T> {
-		const stream = await this.peerNetwork.dialProtocol(
+		const stream = await this.peerNetwork.connect(
 			this.peerId,
 			protocol,
 			{ signal: options?.signal }

@@ -7,7 +7,7 @@ export class Libp2pKeyPeerNetwork implements IKeyNetwork, IPeerNetwork {
 	constructor(private readonly libp2p: Libp2p) {
 	}
 
-	dialProtocol(peerId: PeerId, protocol: string, options?: AbortOptions): Promise<Stream> {
+	connect(peerId: PeerId, protocol: string, options?: AbortOptions): Promise<Stream> {
 		const dialOptions = { runOnLimitedConnection: true, negotiateFully: false } as const;
 		return this.libp2p.dialProtocol(peerId, [protocol], dialOptions);
 	}

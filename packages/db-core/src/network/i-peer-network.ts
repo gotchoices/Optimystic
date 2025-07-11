@@ -4,5 +4,5 @@ export type IPeerNetwork = {
   /**
    * Dial a peer and establish a protocol stream
    */
-  dialProtocol(peerId: PeerId, protocol: string, options?: AbortOptions): Promise<Stream>;
+  connect(peerId: PeerId, protocol: string, options?: AbortOptions): Promise<Stream>;
 }
