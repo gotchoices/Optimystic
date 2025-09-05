@@ -2,6 +2,10 @@ import { pipe } from 'it-pipe';
 import { decode as lpDecode, encode as lpEncode } from 'it-length-prefixed';
 import type { Startable, Logger, IncomingStreamData } from '@libp2p/interface';
 import type { ICluster, ClusterRecord } from '@optimystic/db-core';
+import { computeResponsibility } from '../routing/responsibility.js'
+import { peersEqual } from '../peer-utils.js'
+import { buildKnownPeers } from '../routing/libp2p-known-peers.js'
+import { encodePeers } from '../repo/redirect.js'
 import type { Uint8ArrayList } from 'uint8arraylist';
 
 interface BaseComponents {
@@ -22,6 +26,7 @@ export interface ClusterServiceInit {
 	maxInboundStreams?: number,
 	maxOutboundStreams?: number,
 	logPrefix?: string,
+  kBucketSize?: number,
 }
 
 export function clusterService(init: ClusterServiceInit = {}): (components: ClusterServiceComponents) => ClusterService {
@@ -39,6 +44,7 @@ export class ClusterService implements Startable {
 	private readonly cluster: ICluster;
 	private readonly components: ClusterServiceComponents;
 	private running: boolean;
+  private readonly k: number;
 
 	constructor(components: ClusterServiceComponents, init: ClusterServiceInit = {}) {
 		this.components = components;
@@ -48,6 +54,7 @@ export class ClusterService implements Startable {
 		this.log = components.logger.forComponent(init.logPrefix ?? 'db-p2p:cluster');
 		this.cluster = components.cluster;
 		this.running = false;
+    this.k = init.kBucketSize ?? 10;
 	}
 
 	readonly [Symbol.toStringTag] = '@libp2p/cluster';
@@ -85,9 +92,32 @@ export class ClusterService implements Startable {
 				const message = JSON.parse(decoded) as { operation: string; record: ClusterRecord };
 
 				// Process the operation
-				let response: ClusterRecord;
+				let response: any;
 				if (message.operation === 'update') {
-					response = await this.cluster.update(message.record);
+          // Use message.record.message as key source; this is RepoMessage carrying block IDs
+          const tailId = (message.record?.message as any)?.commit?.tailId ?? (message.record?.message as any)?.pend ? Object.keys((message.record as any).message.pend.transforms)[0] : undefined
+          if (tailId) {
+            const { sha256 } = await import('multiformats/hashes/sha2')
+            const mh = await sha256.digest(new TextEncoder().encode(tailId))
+            const key = mh.digest
+            const nm: any = (this.components as any).libp2p?.services?.networkManager
+            if (nm?.getCluster) {
+              const cluster: any[] = await nm.getCluster(key)
+              ;(message as any).cluster = (cluster as any[]).map(p => p.toString?.() ?? String(p))
+              const selfId = (this.components as any).libp2p.peerId
+              const isMember = cluster.some((p: any) => peersEqual(p, selfId))
+              if (!isMember) {
+                const peers = cluster.filter((p: any) => !peersEqual(p, selfId))
+                response = encodePeers(peers.map((pid: any) => ({ id: pid.toString(), addrs: [] })))
+              } else {
+                response = await this.cluster.update(message.record)
+              }
+            } else {
+              response = await this.cluster.update(message.record)
+            }
+					} else {
+						response = await this.cluster.update(message.record)
+					}
 				} else {
 					throw new Error(`Unknown operation: ${message.operation}`);
 				}

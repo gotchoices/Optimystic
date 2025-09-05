@@ -297,7 +297,7 @@ export class ClusterMember implements ICluster {
     }
 
     private hasConflict(record: ClusterRecord): boolean {
-        for (const [_, state] of this.activeTransactions) {
+        		for (const [_, state] of Array.from(this.activeTransactions.entries())) {
             if (this.operationsConflict(state.record.message.operations, record.message.operations)) {
                 return true;
             }
@@ -309,7 +309,7 @@ export class ClusterMember implements ICluster {
         const blocks1 = new Set(this.getAffectedBlockIds(ops1));
         const blocks2 = new Set(this.getAffectedBlockIds(ops2));
 
-        for (const block of blocks1) {
+        		for (const block of Array.from(blocks1)) {
             if (blocks2.has(block)) return true;
         }
 
@@ -413,7 +413,7 @@ export class ClusterMember implements ICluster {
 
     private queueExpiredTransactions(): void {
         const now = Date.now();
-        for (const [messageHash, state] of this.activeTransactions) {
+        		for (const [messageHash, state] of Array.from(this.activeTransactions.entries())) {
             if (state.record.message.expiration && state.record.message.expiration < now) {
                 this.cleanupQueue.push(messageHash);
             }

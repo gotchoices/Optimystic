@@ -1,7 +1,8 @@
 import type {
 	IRepo, MessageOptions, BlockId, CommitRequest, CommitResult, GetBlockResults, PendRequest, PendResult, TrxBlocks,
 	TrxId, BlockGets, TrxPending, PendSuccess, TrxTransform, TrxTransforms,
-	Transforms
+	Transforms,
+	GetBlockResult
 } from "@optimystic/db-core";
 import { Latches, transformForBlockId, applyTransform, groupBy, concatTransform, emptyTransforms,
 	blockIdsForTransforms, transformsFromTransform } from "@optimystic/db-core";
@@ -24,7 +25,7 @@ export class StorageRepo implements IRepo {
 				const missing = latest
 					? context.committed.filter(c => c.rev > latest.rev)
 					: context.committed;
-				for (const { trxId, rev } of missing.toSorted((a, b) => a.rev - b.rev)) {
+				for (const { trxId, rev } of missing.sort((a, b) => a.rev - b.rev)) {
 					const pending = await blockStorage.getPendingTransaction(trxId);
 					if (pending) {
 						await this.internalCommit(blockId, trxId, rev, blockStorage);
@@ -33,6 +34,9 @@ export class StorageRepo implements IRepo {
 			}
 
 			const blockRev = await blockStorage.getBlock(context?.rev);
+			if (!blockRev) {
+				return [blockId, { state: {} } as GetBlockResult];
+			}
 
 			// Include pending transaction if requested
 			if (context?.trxId !== undefined) {
@@ -154,7 +158,7 @@ export class StorageRepo implements IRepo {
 	}
 
 	async commit(request: CommitRequest, options?: MessageOptions): Promise<CommitResult> {
-		const uniqueBlockIds = [...new Set(request.blockIds)].sort();
+		const uniqueBlockIds = Array.from(new Set(request.blockIds)).sort();
 		const releases: (() => void)[] = [];
 
 		try {
@@ -252,7 +256,7 @@ export class StorageRepo implements IRepo {
 		// Get prior materialized block if it exists
 		const latest = await storage.getLatest();
 		const priorBlock = latest
-			? (await storage.getBlock(latest.rev)).block
+			? (await storage.getBlock(latest.rev))?.block
 			: undefined;
 
 		// Apply transform and save materialized block

@@ -5,6 +5,9 @@ import { sha256 } from "multiformats/hashes/sha2";
 import { ClusterClient } from "../cluster/client.js";
 import { Pending } from "@optimystic/db-core";
 import type { PeerId } from "@libp2p/interface";
+import { createLogger } from '../logger.js'
+
+const log = createLogger('cluster')
 
 /**
  * Manages the state of cluster transactions for a specific block ID
@@ -41,9 +44,13 @@ export class ClusterCoordinator {
 	 * Gets all peers in the cluster for a specific block ID
 	 */
 	private async getClusterForBlock(blockId: BlockId): Promise<ClusterPeers> {
-		// Convert blockId to Uint8Array for DHT lookup
 		const blockIdBytes = new TextEncoder().encode(blockId);
-		return await this.keyNetwork.findCluster(blockIdBytes);
+		try {
+			return await this.keyNetwork.findCluster(blockIdBytes);
+		} catch (e) {
+			log('WARN findCluster failed for %s: %o', blockId, e)
+			return {} as ClusterPeers
+		}
 	}
 
 	/**
@@ -107,7 +114,7 @@ export class ClusterCoordinator {
 
 		// Wait for all promises to complete
 		const results = await Promise.all(promiseRequests.map(p => p.result().catch(err => {
-			console.error('Failed to get promise from peer:', err);
+			log('WARN promise from peer failed: %o', err)
 			return null;
 		})));
 
@@ -139,7 +146,7 @@ export class ClusterCoordinator {
 
 		// Wait for all commits to complete
 		const results = await Promise.all(commitRequests.map(p => p.result().catch(err => {
-			console.error('Failed to commit to peer:', err);
+			log('WARN commit to peer failed: %o', err)
 			return null;
 		})));
 

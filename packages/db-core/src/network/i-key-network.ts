@@ -9,7 +9,7 @@ export type FindCoordinatorOptions = {
 
 export type IKeyNetwork = {
 	/**
-	 * Find a coordinator node responsible for a given key in the KadDHT and establish connection
+	 * Find a coordinator node responsible for a given key and establish connection
 	 * @param key The key to find coordinator for
 	 * @returns Promise resolving to ID of coordinator node
 	 */

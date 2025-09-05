@@ -32,5 +32,6 @@
 		"optimystic",
 		"yamux"
 	],
-	"svg.preview.background": "custom"
+	"svg.preview.background": "custom",
+	"npm.packageManager": "yarn"
 }

@@ -1,5 +1,5 @@
 import type { BlockId, TrxId, TrxRev, Transform, IBlock } from "@optimystic/db-core";
-import type { BlockMetadata } from "./struct";
+import type { BlockMetadata } from "./struct.js";
 
 export interface IRawStorage {
 	// Metadata operations

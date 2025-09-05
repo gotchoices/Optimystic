@@ -17,10 +17,10 @@ export class BlockStorage implements IBlockStorage {
         return meta?.latest;
     }
 
-    async getBlock(rev?: number): Promise<{ block: IBlock, trxRev: TrxRev }> {
+    async getBlock(rev?: number): Promise<{ block: IBlock, trxRev: TrxRev } | undefined> {
         const meta = await this.storage.getMetadata(this.blockId);
         if (!meta) {
-            throw new Error(`Block ${this.blockId} not found`);
+            return undefined;
         }
 
         const targetRev = rev ?? meta.latest?.rev;

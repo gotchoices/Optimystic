@@ -69,7 +69,7 @@ export class NetworkSimulation implements IKeyNetwork {
 		const nodes = await Promise.all(Array.from({ length: scenario.nodeCount }, async () => {
 			const peerId = await createEd25519PeerId();
 			// Type assertion to bypass the type compatibility issue
-			return await NetworkNode.create(peerId);
+			return await NetworkNode.create(peerId as unknown as PeerId);
 		}));
 
 		return new NetworkSimulation(nodes, { clusterSize: scenario.clusterSize });

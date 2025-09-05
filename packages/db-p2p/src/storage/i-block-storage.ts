@@ -6,7 +6,7 @@ export interface IBlockStorage {
     getLatest(): Promise<TrxRev | undefined>;
 
     /** Gets a materialized block at the given revision */
-    getBlock(rev?: number): Promise<{ block: IBlock, trxRev: TrxRev }>;
+    getBlock(rev?: number): Promise<{ block: IBlock, trxRev: TrxRev } | undefined>;
 
     /** Gets a transaction by ID */
     getTransaction(trxId: TrxId): Promise<Transform | undefined>;

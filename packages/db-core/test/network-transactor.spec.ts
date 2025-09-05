@@ -289,7 +289,7 @@ describe('NetworkTransactor', () => {
       const trxId = generateRandomTrxId()
 
       // Find the coordinator for this block
-      const key = blockIdToBytes(blockId)
+      const key = await blockIdToBytes(blockId)
       const closestNodes = network.findCluster(key)
 
       // Make the coordinator unavailable

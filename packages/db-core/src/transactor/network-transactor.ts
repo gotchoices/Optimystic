@@ -48,7 +48,7 @@ export class NetworkTransactor implements ITransactor {
 				batch => batch.payload,
 				(gets, blockId, mergeWithGets) => [...(mergeWithGets ?? []), ...gets.filter(bid => bid === blockId)],
 				expiration,
-				async (blockId, options) => this.keyNetwork.findCoordinator(blockIdToBytes(blockId), options)
+				async (blockId, options) => this.keyNetwork.findCoordinator(await blockIdToBytes(blockId), options)
 			);
 		} catch (e) {
 			error = e as Error;
@@ -56,7 +56,13 @@ export class NetworkTransactor implements ITransactor {
 
 		// Only throw if we had actual failures and no successful retries
 		if (!everyBatch(batches, b => b.request?.isResponse as boolean)) {
-			error = Error(`Some peers did not complete: ${Array.from(incompleteBatches(batches)).map(b => b.peerId).join(", ")}`);
+			const details = this.formatBatchStatuses(batches,
+				b => (b.request?.isResponse as boolean) ?? false,
+				b => {
+					const status = b.request == null ? 'no-response' : (b.request.isResponse ? 'response' : 'in-flight')
+					return `${b.peerId.toString()}[block:${b.blockId}](${status})`
+				})
+			error = Error(`Some peers did not complete: ${details}`);
 		}
 
 		if (error) {
@@ -102,14 +108,29 @@ export class NetworkTransactor implements ITransactor {
 				batch => blockIdsForTransforms(batch.payload),
 				transformForBlock,
 				expiration,
-				async (blockId, options) => this.keyNetwork.findCoordinator(blockIdToBytes(blockId), options)
+				async (blockId, options) => this.keyNetwork.findCoordinator(await blockIdToBytes(blockId), options)
 			);
+			// Cache resolved coordinators for follow-up commit to hit the same peers
+			try {
+				const maybeRecord = (this.keyNetwork as any)?.recordCoordinator;
+				if (typeof maybeRecord === 'function') {
+					for (const b of Array.from(allBatches(batches))) {
+						maybeRecord(await blockIdToBytes(b.blockId), b.peerId);
+					}
+				}
+			} catch (e) { console.warn('⚠️ Failed to record coordinator hint'); }
 		} catch (e) {
 			error = e as Error;
 		}
 
 		if (!everyBatch(batches, b => b.request?.isResponse as boolean && b.request!.response!.success)) {
-			error = Error(`Some peers did not complete: ${Array.from(incompleteBatches(batches)).map(b => b.peerId).join(", ")}`);
+			const details = this.formatBatchStatuses(batches,
+				b => (b.request?.isResponse as boolean && (b.request as any).response?.success) ?? false,
+				b => {
+					const status = b.request == null ? 'no-response' : (b.request.isResponse ? 'non-success' : 'in-flight')
+					return `${b.peerId.toString()}[block:${b.blockId}](${status})`
+				})
+			error = Error(`Some peers did not complete: ${details}`);
 		}
 
 		if (error) { // If any failures, cancel all pending transactions as background microtask
@@ -147,7 +168,7 @@ export class NetworkTransactor implements ITransactor {
 			batch => batch.payload,
 			mergeBlocks,
 			expiration,
-			async (blockId, options) => this.keyNetwork.findCoordinator(blockIdToBytes(blockId), options)
+			async (blockId, options) => this.keyNetwork.findCoordinator(await blockIdToBytes(blockId), options)
 		);
 	}
 
@@ -207,14 +228,20 @@ export class NetworkTransactor implements ITransactor {
 				batch => batch.payload,
 				mergeBlocks,
 				expiration,
-				async (blockId, options) => this.keyNetwork.findCoordinator(blockIdToBytes(blockId), options)
+				async (blockId, options) => this.keyNetwork.findCoordinator(await blockIdToBytes(blockId), options)
 			);
 		} catch (e) {
 			error = e as Error;
 		}
 
 		if (!everyBatch(batches, b => b.request?.isResponse as boolean && b.request!.response!.success)) {
-			error = Error(`Some peers did not complete: ${Array.from(incompleteBatches(batches)).map(b => b.peerId).join(", ")}`);
+			const details = this.formatBatchStatuses(batches,
+				b => (b.request?.isResponse as boolean && (b.request as any).response?.success) ?? false,
+				b => {
+					const status = b.request == null ? 'no-response' : (b.request.isResponse ? 'non-success' : 'in-flight')
+					return `${b.peerId.toString()}[blocks:${b.payload instanceof Array ? (b.payload as any[]).length : 1}](${status})`
+				})
+			error = Error(`Some peers did not complete: ${details}`);
 		}
 		return { batches, error };
 	};
@@ -231,7 +258,7 @@ export class NetworkTransactor implements ITransactor {
 			payload,
 			getBlockPayload,
 			excludedPeers,
-			async (blockId, options) => this.keyNetwork.findCoordinator(blockIdToBytes(blockId), options)
+			async (blockId, options) => this.keyNetwork.findCoordinator(await blockIdToBytes(blockId), options)
 		);
 	}
 
@@ -253,8 +280,21 @@ export class NetworkTransactor implements ITransactor {
 			batch => batch.payload,
 			mergeBlocks,
 			expiration,
-			async (blockId, options) => this.keyNetwork.findCoordinator(blockIdToBytes(blockId), options)
+			async (blockId, options) => this.keyNetwork.findCoordinator(await blockIdToBytes(blockId), options)
 		);
+	}
+
+	private formatBatchStatuses<TPayload, TResponse>(
+		batches: CoordinatorBatch<TPayload, TResponse>[],
+		isSuccess: (b: CoordinatorBatch<TPayload, TResponse>) => boolean,
+		formatter: (b: CoordinatorBatch<TPayload, TResponse>) => string
+	): string {
+		const incompletes = Array.from(incompleteBatches(batches))
+		let details = incompletes.map(formatter).join(', ')
+		if (details.length === 0) {
+			details = Array.from(allBatches(batches)).map(formatter).join(', ')
+		}
+		return details
 	}
 }
 

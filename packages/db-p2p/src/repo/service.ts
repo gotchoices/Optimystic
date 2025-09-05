@@ -2,6 +2,11 @@ import { pipe } from 'it-pipe'
 import { decode as lpDecode, encode as lpEncode } from 'it-length-prefixed'
 import type { Startable, Logger, IncomingStreamData } from '@libp2p/interface'
 import type { IRepo, RepoMessage } from '@optimystic/db-core'
+import { computeResponsibility } from '../routing/responsibility.js'
+import { peersEqual } from '../peer-utils.js'
+import { sha256 } from 'multiformats/hashes/sha2'
+import { buildKnownPeers } from '../routing/libp2p-known-peers.js'
+import { encodePeers } from './redirect.js'
 import type { Uint8ArrayList } from 'uint8arraylist'
 
 // Define Components interface
@@ -23,6 +28,7 @@ export type RepoServiceInit = {
   maxInboundStreams?: number,
   maxOutboundStreams?: number,
   logPrefix?: string,
+  kBucketSize?: number,
 }
 
 export function repoService(init: RepoServiceInit = {}): (components: RepoServiceComponents) => RepoService {
@@ -40,6 +46,7 @@ export class RepoService implements Startable {
   private readonly repo: IRepo
   private readonly components: RepoServiceComponents
   private running: boolean
+  private readonly k: number
 
   constructor(components: RepoServiceComponents, init: RepoServiceInit = {}) {
     this.components = components
@@ -49,6 +56,7 @@ export class RepoService implements Startable {
     this.log = components.logger.forComponent(init.logPrefix ?? 'db-p2p:repo-service')
     this.repo = components.repo
     this.running = false
+    this.k = init.kBucketSize ?? 10
   }
 
   readonly [Symbol.toStringTag] = '@libp2p/repo-service'
@@ -99,21 +107,72 @@ export class RepoService implements Startable {
         let response: any
 
         if ('get' in operation) {
-          response = await this.repo.get(operation.get, {
-            expiration: message.expiration
-          })
+          // With small meshes (known peers < k), any node is effectively in-cluster
+          {
+            // Use sha256 digest of block id string for consistent key space
+            const mh = await sha256.digest(new TextEncoder().encode(operation.get.blockIds[0]!))
+            const key = mh.digest
+            const nm: any = (this.components as any).libp2p?.services?.networkManager
+            if (nm?.getCluster) {
+              const cluster: any[] = await nm.getCluster(key)
+              ;(message as any).cluster = (cluster as any[]).map(p => p.toString?.() ?? String(p))
+              const selfId = (this.components as any).libp2p.peerId
+              const isMember = cluster.some((p: any) => peersEqual(p, selfId))
+              if (!isMember) {
+                const peers = cluster.filter((p: any) => !peersEqual(p, selfId))
+                response = encodePeers(peers.map((pid: any) => ({ id: pid.toString(), addrs: [] })))
+              } else {
+                response = await this.repo.get(operation.get, { expiration: message.expiration })
+              }
+            } else {
+              response = await this.repo.get(operation.get, { expiration: message.expiration })
+            }
+          }
         } else if ('pend' in operation) {
-          response = await this.repo.pend(operation.pend, {
-            expiration: message.expiration
-          })
+          {
+            const id = Object.keys(operation.pend.transforms)[0]!
+            const mh = await sha256.digest(new TextEncoder().encode(id))
+            const key = mh.digest
+            const nm: any = (this.components as any).libp2p?.services?.networkManager
+            if (nm?.getCluster) {
+              const cluster: any[] = await nm.getCluster(key)
+              ;(message as any).cluster = (cluster as any[]).map(p => p.toString?.() ?? String(p))
+              const selfId = (this.components as any).libp2p.peerId
+              const isMember = cluster.some((p: any) => peersEqual(p, selfId))
+              if (!isMember) {
+                const peers = cluster.filter((p: any) => !peersEqual(p, selfId))
+                response = encodePeers(peers.map((pid: any) => ({ id: pid.toString(), addrs: [] })))
+              } else {
+                response = await this.repo.pend(operation.pend, { expiration: message.expiration })
+              }
+            } else {
+              response = await this.repo.pend(operation.pend, { expiration: message.expiration })
+            }
+          }
         } else if ('cancel' in operation) {
           response = await this.repo.cancel(operation.cancel.trxRef, {
             expiration: message.expiration
           })
         } else if ('commit' in operation) {
-          response = await this.repo.commit(operation.commit, {
-            expiration: message.expiration
-          })
+          {
+            const mh = await sha256.digest(new TextEncoder().encode(operation.commit.tailId))
+            const key = mh.digest
+            const nm: any = (this.components as any).libp2p?.services?.networkManager
+            if (nm?.getCluster) {
+              const cluster: any[] = await nm.getCluster(key)
+              ;(message as any).cluster = (cluster as any[]).map(p => p.toString?.() ?? String(p))
+              const selfId = (this.components as any).libp2p.peerId
+              const isMember = cluster.some((p: any) => peersEqual(p, selfId))
+              if (!isMember) {
+                const peers = cluster.filter((p: any) => !peersEqual(p, selfId))
+                response = encodePeers(peers.map((pid: any) => ({ id: pid.toString(), addrs: [] })))
+              } else {
+                response = await this.repo.commit(operation.commit, { expiration: message.expiration })
+              }
+            } else {
+              response = await this.repo.commit(operation.commit, { expiration: message.expiration })
+            }
+          }
         }
 
         // Encode and yield the response
