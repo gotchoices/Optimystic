@@ -1,0 +1,112 @@
+import { spawn } from 'child_process'
+import * as fs from 'fs'
+import * as path from 'path'
+import { fileURLToPath } from 'url'
+
+type Child = ReturnType<typeof spawn>
+
+export interface MeshNodeInfo {
+	peerId: string
+	multiaddrs: string[]
+	port: number
+	networkName: string
+	timestamp: number
+	pid: number
+}
+
+export interface MeshHandle {
+	children: Child[]
+	infoFiles: string[]
+	info: MeshNodeInfo[]
+	stop: () => Promise<void>
+}
+
+function resolveTestPeerCli(): string {
+	const here = path.dirname(fileURLToPath(import.meta.url))
+	let dir = here
+	let repoRoot: string | null = null
+	while (true) {
+		const parent = path.dirname(dir)
+		if (parent === dir) break
+		if (path.basename(dir) === 'packages') {
+			repoRoot = path.dirname(dir)
+			break
+		}
+		dir = parent
+	}
+	const root = repoRoot ?? path.resolve(process.cwd(), '..', '..', '..')
+	return path.join(root, 'packages', 'test-peer', 'dist', 'cli.js')
+}
+
+function startNode(params: { port: number, bootstrap?: string, announceFile: string }): Child {
+	const cli = resolveTestPeerCli()
+	const args = [
+		cli,
+		'service',
+		'--port', String(params.port),
+		'--network', 'optimystic-test',
+		...(params.bootstrap ? ['--bootstrap', params.bootstrap] : []),
+		'--storage', 'memory',
+		'--announce-file', params.announceFile
+	]
+	return spawn('node', args, { stdio: 'pipe' })
+}
+
+async function waitForFile(file: string, timeoutMs: number): Promise<void> {
+	const start = Date.now()
+	while (Date.now() - start < timeoutMs) {
+		if (fs.existsSync(file)) return
+		await new Promise(r => setTimeout(r, 100))
+	}
+	throw new Error(`Timeout waiting for ${file}`)
+}
+
+async function readNodeInfo(file: string): Promise<MeshNodeInfo> {
+	const text = await fs.promises.readFile(file, 'utf-8')
+	return JSON.parse(text) as MeshNodeInfo
+}
+
+export async function startMesh(n: number, basePort = 8111): Promise<MeshHandle> {
+	const workDir = path.join(process.cwd(), '.mesh-tests')
+	fs.mkdirSync(workDir, { recursive: true })
+
+	const files = Array.from({ length: n }, (_, i) => path.join(workDir, `node-${i + 1}.json`))
+	const children: Child[] = []
+	const info: MeshNodeInfo[] = []
+
+	// First node (no bootstrap)
+	const port1 = basePort
+	const file1 = files[0]!
+	children.push(startNode({ port: port1, announceFile: file1 }))
+	await waitForFile(file1, 20000)
+	const info1 = await readNodeInfo(file1)
+	info.push(info1)
+
+	const bootstrap = info1.multiaddrs.join(',')
+
+	// Remaining nodes
+	for (let i = 1; i < n; i++) {
+		const port = basePort + i
+		const file = files[i]!
+		children.push(startNode({ port, bootstrap, announceFile: file }))
+		await waitForFile(file, 20000)
+		info.push(await readNodeInfo(file))
+	}
+
+	async function stop(): Promise<void> {
+		await Promise.all(children.map(async c => {
+			await new Promise<void>((_resolve) => {
+				const resolve = _resolve
+				try {
+					c.on('close', () => resolve())
+					c.kill('SIGINT')
+				} catch {
+					resolve()
+				}
+			})
+		}))
+	}
+
+	return { children, infoFiles: files, info, stop }
+}
+
