@@ -41,7 +41,7 @@ describe.skip('FRET mesh sanity', function () {
 				return path.join(root, 'packages', 'test-peer', 'dist', 'cli.js')
 			}
 
-			async function runPeer(args: string[]): Promise<{ code: number, output: string }>{
+			async function runPeer(args: string[]): Promise<{ code: number, output: string }> {
 				const cli = resolveCli()
 				return await new Promise(resolve => {
 					const child = spawn('node', [cli, 'run', '--bootstrap', bootstrap, '--action', ...args], { stdio: ['ignore', 'pipe', 'pipe'] })

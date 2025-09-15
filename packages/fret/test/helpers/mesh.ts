@@ -94,14 +94,17 @@ export async function startMesh(n: number, basePort = 8111): Promise<MeshHandle>
 	}
 
 	async function stop(): Promise<void> {
-		await Promise.all(children.map(c => new Promise<void>(resolve => {
-			try {
-				c.on('close', () => resolve())
-				c.kill('SIGINT')
-			} catch {
-				resolve()
-			}
-		})))
+		await Promise.all(children.map(async c => {
+			await new Promise<void>((_resolve) => {
+				const resolve = _resolve
+				try {
+					c.on('close', () => resolve())
+					c.kill('SIGINT')
+				} catch {
+					resolve()
+				}
+			})
+		}))
 	}
 
 	return { children, infoFiles: files, info, stop }
