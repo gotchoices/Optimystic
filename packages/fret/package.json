@@ -1,0 +1,43 @@
+{
+	"name": "@optimystic/fret",
+	"version": "0.0.1",
+	"type": "module",
+	"description": "FRET (Finger Ring Ensemble Topology) overlay and tests for Optimystic",
+	"main": "dist/src/index.js",
+	"types": "./dist/src/index.d.ts",
+	"files": [
+		"src",
+		"test",
+		"dist",
+		"!dist/test",
+		"!**/*.tsbuildinfo"
+	],
+	"exports": {
+		".": {
+			"types": "./dist/src/index.d.ts",
+			"import": "./dist/src/index.js"
+		}
+	},
+	"scripts": {
+		"clean": "aegir clean",
+		"build": "aegir build --env node",
+		"lint": "aegir lint",
+		"pretest": "yarn workspace @optimystic/db-core build && yarn workspace @optimystic/db-p2p build && yarn workspace @optimystic/test-peer build",
+		"test": "aegir test",
+		"test:node": "aegir test -t node",
+		"dep-check": "aegir dep-check"
+	},
+	"devDependencies": {
+		"@types/node": "^22.13.10",
+		"aegir": "^45.1.4"
+	},
+	"dependencies": {
+		"debug": "^4.4.1"
+	},
+	"aegir": {
+		"build": {
+			"bundle": false
+		}
+	}
+}
+

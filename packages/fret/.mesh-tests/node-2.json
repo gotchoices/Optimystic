@@ -1,0 +1,11 @@
+{
+  "peerId": "12D3KooWLyTHcNsAidsptHjHEr184cs7rXWkiNFkWUAR7eUWoSDW",
+  "multiaddrs": [
+    "/ip4/127.0.0.1/tcp/8212/p2p/12D3KooWLyTHcNsAidsptHjHEr184cs7rXWkiNFkWUAR7eUWoSDW",
+    "/ip4/172.30.0.2/tcp/8212/p2p/12D3KooWLyTHcNsAidsptHjHEr184cs7rXWkiNFkWUAR7eUWoSDW"
+  ],
+  "port": 8212,
+  "networkName": "optimystic-test",
+  "timestamp": 1757949249901,
+  "pid": 6917
+}
