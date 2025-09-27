@@ -75,15 +75,15 @@ async function createLibp2pKeyNetwork(
  * Create a test key network (for testing purposes)
  */
 async function createTestKeyNetwork(): Promise<IKeyNetwork> {
-  // Import the test key network from db-core test utilities
-  // This is a placeholder - the actual implementation would depend on
-  // how the test utilities are structured in db-core
-  try {
-    const { TestKeyNetwork } = await import('@optimystic/db-core/test');
-    return new TestKeyNetwork();
-  } catch (error) {
-    throw new Error('Test key network not available. Make sure @optimystic/db-core test utilities are installed.');
-  }
+  // Provide a local stub to avoid build-time dependency on non-existent test utilities
+  return {
+    async findCoordinator() {
+      throw new Error('Test key network is not available in this build.');
+    },
+    async findCluster() {
+      throw new Error('Test key network is not available in this build.');
+    },
+  };
 }
 
 /**

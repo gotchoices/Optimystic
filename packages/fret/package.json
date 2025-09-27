@@ -1,0 +1,42 @@
+{
+  "name": "@optimystic/fret",
+  "version": "0.0.1",
+  "type": "module",
+  "description": "FRET: Finger Ring Ensemble Topology (libp2p ring overlay with Digitree)",
+  "main": "dist/src/index.js",
+  "types": "./dist/src/index.d.ts",
+  "files": [
+    "src",
+    "dist",
+    "!dist/test",
+    "!**/*.tsbuildinfo"
+  ],
+  "exports": {
+    ".": {
+      "types": "./dist/src/index.d.ts",
+      "import": "./dist/src/index.js"
+    }
+  },
+  "scripts": {
+    "clean": "aegir clean",
+    "build": "aegir build --env node",
+    "lint": "aegir lint",
+    "test": "aegir test",
+    "test:node": "aegir test -t node",
+    "dep-check": "aegir dep-check"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.12",
+    "aegir": "^47.0.20",
+    "typescript": "^5.8.3"
+  },
+  "dependencies": {
+    "@libp2p/interface": "^2.10.5",
+    "@libp2p/peer-id": "^5.1.8",
+    "libp2p": "^2.9.0",
+    "multiformats": "^13.3.2",
+    "uint8arrays": "^5.1.0",
+    "digitree": "^1.4.3",
+    "debug": "^4.4.1"
+  }
+}

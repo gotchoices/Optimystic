@@ -27,13 +27,15 @@ This document proposes FRET, a Chord-style ring overlay with symmetric successor
 
 ### Relevance scoring and table management
 - The routing table has a hard capacity C. When over capacity, evict the lowest-relevance entries.
-- Relevance score components:
-  - Access recency: most recently used gets a bonus (LRU effect).
-  - Access frequency (de-correlated by storing most recent access timestamp): damp correlated bursts; retain consistently useful nodes (LFU effect).
-  - Routing node preference (near exponential distances): preference for approximately exponential gaps from self (as in finger ideals) with a randomized phase shift to avoid hotspots. Nodes at distances near 2^i multiples of ring circumference relative to p get a significance dependent boost.
-  - Exponential distance balance: Reasonbly balance each level of exponential distance
-  - Health: recent successful pings/streams boost; timeouts/EOFs decay.
-  - Neighbors: entries in S(p) ∪ P(p) get infinite score unless explicitly dead
+- Components (bucketless, sparsity-weighted):
+  - Access recency (EMA decay) and frequency (log-slowing).
+  - Health: success/failure ratio and average RTT.
+  - Sparsity bonus over distances: maintain a smooth blend of distances without hard buckets.
+    - Compute normalized log-distance x ∈ [0,1] from self to peer (1 = far, 0 = near).
+    - Maintain a tiny KDE over x with m fixed centers and EMA occupancy.
+    - Sparsity bonus S(x) = clamp(((ideal(x)+ε)/(density(x)+ε))^β, sMin, sMax).
+    - This increases score for underrepresented distances and tapers overrepresented ones.
+  - Neighbors: entries in S(p) ∪ P(p) are always retained unless explicitly dead.
 - Victim selection: lowest score first.
 
 ### Join and bootstrap
@@ -137,6 +139,7 @@ Payload inclusion heuristic:
   - Max outbound: 64 (Edge) / 256 (Core)
   - Stream timeout: 30s default, 10s for ping
   - Multiplexing: reuse streams for multiple requests where possible
+  - Snapshot caps: successors/predecessors/sample are profile-bounded (Edge ≤ 6/6/6, Core ≤ 12/12/8)
 
 ### Active vs passive state (network manager)
 - Passive: background stabilization at a modest cadence; only gentle maintenance (no aggressive dialing).
@@ -153,6 +156,11 @@ Notes:
 - Each repo instance initializes with a nonce.
 - Neighbors exchanging state include repo nonces; cross-partition healing only allowed if nonces match and revisions do not conflict; otherwise manual reconciliation.
 - FRET surfaces "neighborhood merge" events to higher layers when previously disjoint rings connect.
+
+### Fuzzy routing intervals (emergent finger-like structure)
+- During routing and stabilization, we bias discovery/merges toward logarithmically spaced intervals around targets rather than exact keys.
+- Combined with sparsity-weighted relevance, this seeds routing-relevant peers without explicit finger tables.
+- The cache thus self-organizes into a distance-balanced spine that accelerates future lookups, while remaining purely cache/relevance-driven.
 
 ### Small vs large networks
 - Small (n << k): successor walk yields min(n, k). Deterministic and fast (one hop likely sufficient).
@@ -277,21 +285,24 @@ Notes:
 - Counting and diagnostics:
   - `getCount` for quick checks; use `first/last`, `ascending/descending` for ordered scans
 
-#### Relevance score calculation
+#### Relevance score calculation (bucketless sparsity model)
 ```
-relevance(p) = w_lru * recency_score(p)
-             + w_lfu * frequency_score(p)  
-             + w_exp * exponential_distance_score(p)
-             + w_health * health_score(p)
-             + (is_neighbor(p) ? INFINITY : 0)
+Inputs per-peer: lastAccess, accessCount, successCount, failureCount, avgLatencyMs.
+Global: KDE centers ci (m≈12), occupancy Oi (EMA), kernel width σ, decay α, exponent β.
 
-where:
-- recency_score = exp(-λ_r * time_since_access)
-- frequency_score = log(1 + access_count) / (1 + time_correlation_factor)
-- exponential_distance_score = Σ(i=0..log n) gaussian(dist, 2^i, σ)
-- health_score = success_rate * (1 - avg_latency/timeout)
-- Default weights: w_lru=0.3, w_lfu=0.2, w_exp=0.3, w_health=0.2
+x = normalized_log_distance(self, peer) ∈ [0,1]
+observe: Oi ← (1−α)Oi + α·Kσ(|x−ci|)
+density(x) = Σ Oi·Kσ(|x−ci|)
+ideal(x) = Σ 1·Kσ(|x−ci|)   // uniform target
+S(x) = clamp(((ideal(x)+ε)/(density(x)+ε))^β, sMin, sMax)
+
+base = w_r·recency(lastAccess) + w_f·freq(accessCount) + w_h·health(success/failure, avgLatency)
+relevance = base · S(x)
 ```
+
+Notes:
+- No explicit buckets or finger tables; a single ordered Digitree plus sparsity-aware scoring yields an emergent, distance-balanced cache well-suited to routing.
+- During a routing walk, temporary (ephemeral) multipliers may bias candidates near the desired step distance, but long-term scores remain governed by S(x).
 
 #### Cohort assembly algorithm
 ```

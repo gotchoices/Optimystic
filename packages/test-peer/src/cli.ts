@@ -168,9 +168,6 @@ class TestPeerSession {
 			networkName: options.network || 'optimystic-test',
 			storageType: options.storage || 'memory',
 			storagePath: options.storagePath,
-			// CLI should default to server-mode DHT with kBucketSize tuned for overlap
-			dhtClientMode: false,
-			dhtKBucketSize: 20
 		});
 
 		console.log(`✅ Node started with ID: ${node.peerId.toString()}`);

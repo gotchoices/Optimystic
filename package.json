@@ -12,10 +12,13 @@
     "clean": "yarn workspaces run clean",
     "build": "yarn workspaces run build",
     "lint": "yarn workspaces run lint",
-    "test": "yarn workspaces run test"
+    "test": "yarn workspaces run test",
+    "format": "prettier --cache --log-level warn --write \"packages/fret/src/**/*.{ts,tsx,js,jsx}\"",
+    "format:check": "prettier --cache --log-level warn --check \"packages/fret/src/**/*.{ts,tsx,js,jsx}\""
   },
   "devDependencies": {
     "@types/node": "^22.13.10",
-    "aegir": "^45.1.4"
+    "aegir": "^45.1.4",
+    "prettier": "^3.6.2"
   }
 }

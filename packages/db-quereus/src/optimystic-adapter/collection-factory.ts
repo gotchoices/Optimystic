@@ -3,6 +3,8 @@ import { Tree } from '@optimystic/db-core';
 import { NetworkTransactor } from '@optimystic/db-core';
 import type { RowData, ParsedOptimysticOptions, TransactionState } from '../types.js';
 import { createKeyNetwork } from './key-network.js';
+import type { IRepo } from '@optimystic/db-core';
+import type { PeerId } from '@libp2p/interface';
 
 /**
  * Factory for creating and managing tree collections
@@ -22,7 +24,7 @@ export class CollectionFactory {
 
     // If we have an active transaction, check if the collection is already loaded
     if (txnState?.isActive && txnState.collections.has(collectionKey)) {
-      return txnState.collections.get(collectionKey);
+      return txnState.collections.get(collectionKey)!;
     }
 
     // Check if we have a cached collection (for non-transactional access)
@@ -36,11 +38,13 @@ export class CollectionFactory {
     const transactor = await this.getOrCreateTransactor(options);
     const collectionId = this.parseCollectionId(options.collectionUri);
 
+    const compare = (a: string, b: string): -1 | 0 | 1 => (a < b ? -1 : a > b ? 1 : 0);
+
     const collection = await Tree.createOrOpen<string, RowData>(
       transactor,
       collectionId,
       (entry: RowData) => this.extractKeyFromEntry(entry), // Key extractor
-      (a: string, b: string) => a.localeCompare(b) // String comparison
+      compare // Total order
     );
 
     // Store in appropriate cache
@@ -94,20 +98,26 @@ export class CollectionFactory {
       options.libp2pOptions
     );
 
-    return new NetworkTransactor(keyNetwork);
+    const getRepo = (_peerId: PeerId): IRepo => {
+      throw new Error('Repo access not configured for NetworkTransactor in db-quereus.');
+    };
+
+    return new NetworkTransactor({
+      timeoutMs: 30_000,
+      abortOrCancelTimeoutMs: 5_000,
+      keyNetwork,
+      getRepo,
+    });
   }
 
   /**
    * Create a test transactor
    */
   private async createTestTransactor(): Promise<ITransactor> {
-    // Import test transactor from db-core test utilities
-    try {
-      const { TestTransactor } = await import('@optimystic/db-core/test');
-      return new TestTransactor();
-    } catch (error) {
-      throw new Error('Test transactor not available. Make sure @optimystic/db-core test utilities are installed.');
-    }
+    // Provide a local stub to avoid build-time dependency on non-existent test utilities
+    return {
+      async getCollection() { throw new Error('Test transactor is not available in this build.'); }
+    } as unknown as ITransactor;
   }
 
   /**
@@ -135,11 +145,11 @@ export class CollectionFactory {
       const path = uri.substring(7); // Remove 'tree://'
       const parts = path.split('/');
       if (parts.length >= 2) {
-        return parts[1]; // Return the collection name part
+        return parts[1]! as unknown as CollectionId; // collection name part
       }
-      return path;
+      return path as unknown as CollectionId;
     }
-    return uri;
+    return uri as unknown as CollectionId;
   }
 
   /**

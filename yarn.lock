@@ -5676,6 +5676,11 @@ diff@^8.0.1:
   resolved "https://registry.npmjs.org/diff/-/diff-8.0.2.tgz"
   integrity sha512-sSuxWU5j5SR9QQji/o2qMvqRNYRDOcBTgsJ/DeCf4iSN4gW+gNMXM7wFIP+fdXZxoNiAnHUTGjCr+TSWXdRDKg==
 
+digitree@^1.4.3:
+  version "1.4.3"
+  resolved "https://registry.yarnpkg.com/digitree/-/digitree-1.4.3.tgz#afe040cc45ee615b3e759971bebe7208344db356"
+  integrity sha512-ci0yfyUAa+imhZYNL2szQ0VYwX5WDHLYgYZ264nvjNB5Ov1nX7EO2eva08dCjYhucvYAlbCICkx75/p5gu31VA==
+
 dir-glob@^3.0.0, dir-glob@^3.0.1:
   version "3.0.1"
   resolved "https://registry.npmjs.org/dir-glob/-/dir-glob-3.0.1.tgz"
@@ -11143,6 +11148,11 @@ premove@^4.0.0:
   version "4.0.0"
   resolved "https://registry.npmjs.org/premove/-/premove-4.0.0.tgz"
   integrity sha512-zim/Hr4+FVdCIM7zL9b9Z0Wfd5Ya3mnKtiuDv7L5lzYzanSq6cOcVJ7EFcgK4I0pt28l8H0jX/x3nyog380XgQ==
+
+prettier@^3.6.2:
+  version "3.6.2"
+  resolved "https://registry.yarnpkg.com/prettier/-/prettier-3.6.2.tgz#ccda02a1003ebbb2bfda6f83a074978f608b9393"
+  integrity sha512-I7AIg5boAr5R0FFtJ6rCfD+LFsWHp81dolrFD8S79U9tb8Az2nGrJncnMSnys+bpQJfRUzqs9hnA81OAA3hCuQ==
 
 pretty-ms@^9.2.0:
   version "9.2.0"

@@ -8,9 +8,21 @@
 import { CollectionFactory } from './optimystic-adapter/collection-factory.js';
 import { TransactionBridge } from './optimystic-adapter/txn-bridge.js';
 import type { ParsedOptimysticOptions, RowData } from './types.js';
-import { VirtualTable, StatusCode } from '@quereus/quereus';
+import { VirtualTable, StatusCode, IndexScanFlags, IndexConstraintOp } from '@quereus/quereus';
 import type { VirtualTableModule, BaseModuleConfig, Database, TableSchema, Row, FilterInfo, IndexInfo, RowOp } from '@quereus/quereus';
 import { Tree } from '@optimystic/db-core';
+import { KeyRange } from '@optimystic/db-core';
+
+type RowDataScalar = RowData[number];
+function toRowDataValue(v: unknown): RowDataScalar {
+  if (v === undefined) return null;
+  if (typeof v === 'bigint') return Number(v);
+  if (v === null) return null;
+  if (typeof v === 'string' || typeof v === 'number' || typeof v === 'boolean') return v;
+  if (v instanceof Uint8Array) return v;
+  // Last resort stringify for unexpected types
+  return String(v);
+}
 
 /**
  * Configuration interface for Optimystic module
@@ -119,9 +131,11 @@ export class OptimysticVirtualTable extends VirtualTable {
       return;
     }
 
-    const entry = this.collection.at(path);
+    const entry = this.collection.at(path) as any;
     if (entry && entry.length >= 2) {
-      yield [entry[0], entry[1]]; // [id, data]
+      const c0 = (entry[0] === undefined ? null : (typeof entry[0] === 'bigint' ? Number(entry[0]) : entry[0])) as any;
+      const c1 = (entry[1] === undefined ? null : (typeof entry[1] === 'bigint' ? Number(entry[1]) : entry[1])) as any;
+      yield [c0, c1] as Row;
     }
   }
 
@@ -143,32 +157,34 @@ export class OptimysticVirtualTable extends VirtualTable {
     if (!this.collection) return;
 
     try {
-      // Try to use proper KeyRange
-      const { KeyRange } = await import('@optimystic/db-core/src/btree/index.js');
-      const iterator = this.collection.range(new KeyRange(undefined, undefined, true));
+      const iterator = this.collection.range(new KeyRange<string>(undefined, undefined, true));
 
       for await (const path of iterator) {
         if (!this.collection.isValid(path)) {
           continue;
         }
 
-        const entry = this.collection.at(path);
+        const entry = this.collection.at(path) as any;
         if (entry && entry.length >= 2) {
-          yield [entry[0], entry[1]]; // [id, data]
+          const c0 = (entry[0] === undefined ? null : (typeof entry[0] === 'bigint' ? Number(entry[0]) : entry[0])) as any;
+          const c1 = (entry[1] === undefined ? null : (typeof entry[1] === 'bigint' ? Number(entry[1]) : entry[1])) as any;
+          yield [c0, c1] as Row;
         }
       }
     } catch (error) {
-      // Fallback for import issues
-      const iterator = this.collection.range({ isAscending: true });
+      // Fallback plain ascending iteration if needed
+      const iterator = this.collection.range({ isAscending: true } as any);
 
       for await (const path of iterator) {
         if (!this.collection.isValid(path)) {
           continue;
         }
 
-        const entry = this.collection.at(path);
+        const entry = this.collection.at(path) as any;
         if (entry && entry.length >= 2) {
-          yield [entry[0], entry[1]]; // [id, data]
+          const c0 = (entry[0] === undefined ? null : (typeof entry[0] === 'bigint' ? Number(entry[0]) : entry[0])) as any;
+          const c1 = (entry[1] === undefined ? null : (typeof entry[1] === 'bigint' ? Number(entry[1]) : entry[1])) as any;
+          yield [c0, c1] as Row;
         }
       }
     }
@@ -188,45 +204,55 @@ export class OptimysticVirtualTable extends VirtualTable {
 
     try {
       switch (operation) {
-        case 'INSERT':
+        case 'insert':
           if (!values || values.length < 2) {
             throw new Error('INSERT requires id and data values');
           }
-          const insertKey = String(values[0]);
-          const insertData = values[1];
-          await this.collection.replace([[insertKey, [insertKey, insertData]]]);
-          return values;
+          {
+            const v = values as Row;
+            const insertKey = String(v[0] ?? '');
+            const insertData = toRowDataValue(v[1]);
+            await this.collection.replace([[insertKey, [insertKey, insertData]]]);
+            return v;
+          }
 
-        case 'UPDATE':
+        case 'update':
           if (!values || values.length < 2) {
             throw new Error('UPDATE requires id and data values');
           }
           if (!oldKeyValues || oldKeyValues.length < 1) {
             throw new Error('UPDATE requires old key values');
           }
-          const oldKey = String(oldKeyValues[0]);
-          const newKey = String(values[0]);
-          const updateData = values[1];
+          {
+            const v = values as Row;
+            const o = oldKeyValues as Row;
+            const oldKey = String(o[0] ?? '');
+            const newKey = String(v[0] ?? '');
+            const updateData = toRowDataValue(v[1]);
 
-          if (oldKey !== newKey) {
-            // Key changed - delete old, insert new
-            await this.collection.replace([
-              [oldKey, undefined],
-              [newKey, [newKey, updateData]]
-            ]);
-          } else {
-            // Simple update
-            await this.collection.replace([[newKey, [newKey, updateData]]]);
+            if (oldKey !== newKey) {
+              // Key changed - delete old, insert new
+              await this.collection.replace([
+                [oldKey, undefined],
+                [newKey, [newKey, updateData]]
+              ]);
+            } else {
+              // Simple update
+              await this.collection.replace([[newKey, [newKey, updateData]]]);
+            }
+            return v;
           }
-          return values;
 
-        case 'DELETE':
+        case 'delete':
           if (!oldKeyValues || oldKeyValues.length < 1) {
             throw new Error('DELETE requires old key values');
           }
-          const deleteKey = String(oldKeyValues[0]);
-          await this.collection.replace([[deleteKey, undefined]]);
-          return undefined;
+          {
+            const o = oldKeyValues as Row;
+            const deleteKey = String(o[0] ?? '');
+            await this.collection.replace([[deleteKey, undefined]]);
+            return undefined;
+          }
 
         default:
           throw new Error(`Unsupported operation: ${operation}`);
@@ -392,7 +418,7 @@ export class OptimysticModule implements VirtualTableModule<OptimysticVirtualTab
 
       for (let i = 0; i < indexInfo.aConstraint.length; i++) {
         const constraint = indexInfo.aConstraint[i];
-        if (constraint.iColumn === 0 && constraint.op === 'EQ' && constraint.usable) {
+        if (constraint && constraint.iColumn === 0 && constraint.op === IndexConstraintOp.EQ && constraint.usable) {
           // Primary key equality - best case
           bestCost = 1.0;
           bestRows = 1;
@@ -402,7 +428,7 @@ export class OptimysticModule implements VirtualTableModule<OptimysticVirtualTab
             omit: true
           };
           break;
-        } else if (constraint.iColumn === 0 && ['GT', 'GE', 'LT', 'LE'].includes(constraint.op) && constraint.usable) {
+        } else if (constraint && constraint.iColumn === 0 && [IndexConstraintOp.GT, IndexConstraintOp.GE, IndexConstraintOp.LT, IndexConstraintOp.LE].includes(constraint.op) && constraint.usable) {
           // Range scan
           bestCost = 100.0;
           bestRows = 100;
@@ -425,7 +451,7 @@ export class OptimysticModule implements VirtualTableModule<OptimysticVirtualTab
       indexInfo.idxNum = indexNum;
       indexInfo.idxStr = indexNum === 1 ? 'point' : indexNum === 2 ? 'range' : 'scan';
       indexInfo.orderByConsumed = false;
-      indexInfo.idxFlags = indexNum === 1 ? 0x0001 : 0; // UNIQUE flag for point lookups
+      indexInfo.idxFlags = indexNum === 1 ? IndexScanFlags.UNIQUE : 0;
 
       return StatusCode.OK;
     } catch (error) {
