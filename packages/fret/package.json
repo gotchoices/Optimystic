@@ -21,14 +21,17 @@
     "clean": "aegir clean",
     "build": "aegir build --env node",
     "lint": "aegir lint",
-    "test": "aegir test",
+    "test": "aegir test -t node",
     "test:node": "aegir test -t node",
     "dep-check": "aegir dep-check"
   },
   "devDependencies": {
     "@types/node": "^24.0.12",
     "aegir": "^47.0.20",
-    "typescript": "^5.8.3"
+    "typescript": "^5.8.3",
+    "@libp2p/tcp": "^10.1.18",
+    "@chainsafe/libp2p-noise": "^16.1.4",
+    "@chainsafe/libp2p-yamux": "^7.0.4"
   },
   "dependencies": {
     "@libp2p/interface": "^2.10.5",

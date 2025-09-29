@@ -43,5 +43,5 @@ export class Libp2pFretService implements Startable {
 }
 
 export function fretService(cfg?: Partial<FretConfig>) {
-	return (components: Components) => new Libp2pFretService(components, cfg);
+    return (components: Components & { fret: Libp2pFretService }) => new Libp2pFretService(components as Components, cfg);
 }
