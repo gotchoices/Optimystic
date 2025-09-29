@@ -17,6 +17,8 @@ import { FileRawStorage } from './storage/file-storage.js';
 import type { IRawStorage } from './storage/i-raw-storage.js';
 import { multiaddr } from '@multiformats/multiaddr';
 import { networkManagerService } from './network/network-manager-service.js';
+import { getPeerNetwork } from './network/get-network-manager.js';
+import { fretService } from './fret/service.js';
 
 export type NodeOptions = {
 	port: number;
@@ -121,6 +123,11 @@ export async function createLibp2pNode(options: NodeOptions): Promise<Libp2p> {
         })
         return svcFactory(components)
       }
+			,
+			fret: (components: any) => {
+				const factory = fretService({ clusterSize: options.clusterSize ?? 10 })
+				return factory(components)
+			}
 		},
 		// Add bootstrap nodes as needed
 		peerDiscovery: [
@@ -159,5 +166,10 @@ export async function createLibp2pNode(options: NodeOptions): Promise<Libp2p> {
 	// Best-effort: ask DHT to refresh routing table if supported
 	try { (node as any).services?.dht?.refreshRoutingTable?.(); } catch {}
 
+	// Provide peer network adapter for protocol clients
+	try { (node as any).peerNetwork = getPeerNetwork(node) } catch {}
+	// Provide libp2p to custom services that accept it
+	try { (node as any).services?.networkManager?.setLibp2p?.(node) } catch {}
+	try { (node as any).services?.fret?.setLibp2p?.(node) } catch {}
 	return node;
 }
