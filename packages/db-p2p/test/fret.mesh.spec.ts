@@ -28,6 +28,12 @@ describe('FRET integration - small mesh cluster redirects', function () {
       const resp = await client.get({ blockIds: ['block-1'] }, {})
       if ('redirect' in resp) {
         expect(resp.redirect.peers).to.have.length.greaterThan(0)
+        // Ensure peers exclude caller and self
+        const callerId = nodes[1].peerId.toString()
+        const targetId = nodes[0].peerId.toString()
+        const peerIds = resp.redirect.peers.map((p: any) => p.id)
+        expect(peerIds).to.not.include(callerId)
+        expect(peerIds).to.not.include(targetId)
       } else {
         expect(resp).to.exist
       }
