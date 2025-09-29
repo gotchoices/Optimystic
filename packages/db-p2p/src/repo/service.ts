@@ -112,14 +112,15 @@ export class RepoService implements Startable {
             // Use sha256 digest of block id string for consistent key space
             const mh = await sha256.digest(new TextEncoder().encode(operation.get.blockIds[0]!))
             const key = mh.digest
+            const fret: any = (this.components as any).libp2p?.services?.fret
             const nm: any = (this.components as any).libp2p?.services?.networkManager
-            if (nm?.getCluster) {
-              const cluster: any[] = await nm.getCluster(key)
+            if (fret?.getCluster || nm?.getCluster) {
+              const cluster: any[] = fret?.getCluster ? await fret.getCluster(key) : await nm.getCluster(key)
               ;(message as any).cluster = (cluster as any[]).map(p => p.toString?.() ?? String(p))
               const selfId = (this.components as any).libp2p.peerId
               const isMember = cluster.some((p: any) => peersEqual(p, selfId))
               if (!isMember) {
-                const peers = cluster.filter((p: any) => !peersEqual(p, selfId))
+                const peers = cluster.filter((p: any) => !peersEqual(p, selfId) && !peersEqual(p, peerId))
                 response = encodePeers(peers.map((pid: any) => ({ id: pid.toString(), addrs: [] })))
               } else {
                 response = await this.repo.get(operation.get, { expiration: message.expiration })
@@ -133,14 +134,15 @@ export class RepoService implements Startable {
             const id = Object.keys(operation.pend.transforms)[0]!
             const mh = await sha256.digest(new TextEncoder().encode(id))
             const key = mh.digest
+            const fret: any = (this.components as any).libp2p?.services?.fret
             const nm: any = (this.components as any).libp2p?.services?.networkManager
-            if (nm?.getCluster) {
-              const cluster: any[] = await nm.getCluster(key)
+            if (fret?.getCluster || nm?.getCluster) {
+              const cluster: any[] = fret?.getCluster ? await fret.getCluster(key) : await nm.getCluster(key)
               ;(message as any).cluster = (cluster as any[]).map(p => p.toString?.() ?? String(p))
               const selfId = (this.components as any).libp2p.peerId
               const isMember = cluster.some((p: any) => peersEqual(p, selfId))
               if (!isMember) {
-                const peers = cluster.filter((p: any) => !peersEqual(p, selfId))
+                const peers = cluster.filter((p: any) => !peersEqual(p, selfId) && !peersEqual(p, peerId))
                 response = encodePeers(peers.map((pid: any) => ({ id: pid.toString(), addrs: [] })))
               } else {
                 response = await this.repo.pend(operation.pend, { expiration: message.expiration })
@@ -157,14 +159,15 @@ export class RepoService implements Startable {
           {
             const mh = await sha256.digest(new TextEncoder().encode(operation.commit.tailId))
             const key = mh.digest
+            const fret: any = (this.components as any).libp2p?.services?.fret
             const nm: any = (this.components as any).libp2p?.services?.networkManager
-            if (nm?.getCluster) {
-              const cluster: any[] = await nm.getCluster(key)
+            if (fret?.getCluster || nm?.getCluster) {
+              const cluster: any[] = fret?.getCluster ? await fret.getCluster(key) : await nm.getCluster(key)
               ;(message as any).cluster = (cluster as any[]).map(p => p.toString?.() ?? String(p))
               const selfId = (this.components as any).libp2p.peerId
               const isMember = cluster.some((p: any) => peersEqual(p, selfId))
               if (!isMember) {
-                const peers = cluster.filter((p: any) => !peersEqual(p, selfId))
+                const peers = cluster.filter((p: any) => !peersEqual(p, selfId) && !peersEqual(p, peerId))
                 response = encodePeers(peers.map((pid: any) => ({ id: pid.toString(), addrs: [] })))
               } else {
                 response = await this.repo.commit(operation.commit, { expiration: message.expiration })
