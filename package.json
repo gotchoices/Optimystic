@@ -20,5 +20,8 @@
     "@types/node": "^22.13.10",
     "aegir": "^45.1.4",
     "prettier": "^3.6.2"
+  },
+  "dependencies": {
+    "@multiformats/multiaddr": "^12.3.4"
   }
 }

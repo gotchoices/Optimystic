@@ -151,7 +151,7 @@ export class FretService implements IFretService, Startable {
 		this.startStabilizationLoop();
 		if (this.mode === 'active') void this.preconnectNeighbors();
 		// One-time post-bootstrap announce when first remote connects
-		this.node.addEventListener('peer:connect', async (evt: any) => {
+        this.node.addEventListener('peer:connect', async (evt: any) => {
 			if (this.postBootstrapAnnounced) return;
 			this.postBootstrapAnnounced = true;
 			try { await this.announceNeighborsBounded(8); } catch {}
