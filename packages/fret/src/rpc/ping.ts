@@ -13,16 +13,19 @@ export function registerPing(node: Libp2p): void {
 }
 
 export async function sendPing(node: Libp2p, peer: string): Promise<{ ok: boolean; rttMs: number }> {
-	const start = Date.now();
-	const pid = peerIdFromString(peer);
-	const conn = await (node as any).dialProtocol(pid, [PROTOCOL_PING]);
-	const stream = conn.stream ?? conn;
-	const chunks: Uint8Array[] = [];
-	for await (const chunk of stream.source) {
-		if (chunk?.subarray) chunks.push(chunk);
-	}
-	const res = await decodeJson<{ ok: boolean }>(concat(chunks));
-	return { ok: Boolean(res.ok), rttMs: Math.max(0, Date.now() - start) };
+    const start = Date.now();
+    const pid = peerIdFromString(peer);
+    const conn = await (node as any).dialProtocol(pid, [PROTOCOL_PING]);
+    const stream = conn.stream ?? conn;
+    const chunks: Uint8Array[] = [];
+    for await (const chunk of stream.source) {
+        if (chunk?.subarray) chunks.push(chunk);
+    }
+    // Some libp2p implementations may send empty frames before actual data; guard decode
+    const body = concat(chunks);
+    if (body.length === 0) return { ok: false, rttMs: Math.max(0, Date.now() - start) };
+    const res = await decodeJson<{ ok: boolean }>(body);
+    return { ok: Boolean(res.ok), rttMs: Math.max(0, Date.now() - start) };
 }
 
 function concat(chunks: Uint8Array[]): Uint8Array {

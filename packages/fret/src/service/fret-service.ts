@@ -244,6 +244,16 @@ export class FretService implements IFretService, Startable {
 		}
 	}
 
+	private hasAddresses(id: string): boolean {
+		try {
+			// libp2p >=2 exposes getMultiaddrsForPeer
+			const addrs = (this.node as any).getMultiaddrsForPeer?.(peerIdFromString(id)) ?? [];
+			return Array.isArray(addrs) && addrs.length > 0;
+		} catch {
+			return false;
+		}
+	}
+
 	private async proactiveAnnounceOnStart(): Promise<void> {
 		try {
 			await this.announceNeighborsBounded(8);
@@ -254,13 +264,14 @@ export class FretService implements IFretService, Startable {
 
 	private async announceNeighborsBounded(maxCount: number): Promise<void> {
 		const selfCoord = await hashPeerId(this.node.peerId);
+		const selfStr = this.node.peerId.toString();
 		const ids = Array.from(new Set([
 			...this.getNeighbors(selfCoord, 'right', this.cfg.m),
 			...this.getNeighbors(selfCoord, 'left', this.cfg.m)
-		])).slice(0, maxCount);
+		])).filter((id) => id !== selfStr).slice(0, maxCount);
 		const snap = await this.snapshot();
 		for (const id of ids) {
-			if (!this.isConnected(id)) {
+			if (this.isConnected(id) || this.hasAddresses(id)) {
 				try { await announceNeighbors(this.node, id, snap); this.diag.announcementsSent++; } catch (err) { console.warn('announce failed', id, err); }
 			}
 		}
@@ -269,12 +280,15 @@ export class FretService implements IFretService, Startable {
 	private async preconnectNeighbors(): Promise<void> {
 		try {
 			const selfCoord = await hashPeerId(this.node.peerId);
+			const selfStr = this.node.peerId.toString();
 			const ids = Array.from(new Set([
 				...this.getNeighbors(selfCoord, 'right', Math.min(6, this.cfg.m)),
 				...this.getNeighbors(selfCoord, 'left', Math.min(6, this.cfg.m))
-			]));
+			])).filter((id) => id !== selfStr);
 			for (const id of ids) {
-				try { await sendPing(this.node, id); this.diag.pingsSent++; } catch {}
+				if (this.isConnected(id) || this.hasAddresses(id)) {
+					try { await sendPing(this.node, id); this.diag.pingsSent++; } catch {}
+				}
 			}
 		} catch {}
 	}
@@ -286,13 +300,16 @@ export class FretService implements IFretService, Startable {
 			if (!this.preconnectRunning || this.mode !== 'active') { this.preconnectRunning = false; return; }
 			try {
 				const selfCoord = await this.selfCoord();
+				const selfStr = this.node.peerId.toString();
 				const budget = this.cfg.profile === 'core' ? 6 : 3;
 				const ids = Array.from(new Set([
 					...this.getNeighbors(selfCoord, 'right', Math.min(12, this.cfg.m)),
 					...this.getNeighbors(selfCoord, 'left', Math.min(12, this.cfg.m))
-				])).slice(0, budget);
+				])).filter((id) => id !== selfStr).slice(0, budget);
 				for (const id of ids) {
-					try { await sendPing(this.node, id); this.diag.pingsSent++; } catch {}
+					if (this.isConnected(id) || this.hasAddresses(id)) {
+						try { await sendPing(this.node, id); this.diag.pingsSent++; } catch {}
+					}
 				}
 			} catch {}
 			setTimeout(tick, 1000);
@@ -303,10 +320,11 @@ export class FretService implements IFretService, Startable {
 	private async sendLeaveToNeighbors(): Promise<void> {
 		try {
 			const selfCoord = await hashPeerId(this.node.peerId);
+			const selfStr = this.node.peerId.toString();
 			const ids = Array.from(new Set([
 				...this.getNeighbors(selfCoord, 'right', this.cfg.m),
 				...this.getNeighbors(selfCoord, 'left', this.cfg.m)
-			])).slice(0, 8);
+			])).filter((id) => id !== selfStr).slice(0, 8);
 			const notice = { v: 1, from: this.node.peerId.toString(), timestamp: Date.now() } as const;
 			for (const id of ids) {
 				try { await sendLeave(this.node, id, notice); } catch {}
@@ -465,7 +483,9 @@ export class FretService implements IFretService, Startable {
 
 	private async stabilizeOnce(): Promise<void> {
 		const selfCoord = await hashPeerId(this.node.peerId);
-		const near = this.getNeighbors(selfCoord, 'both', Math.max(2, this.cfg.m));
+		const selfStr = this.node.peerId.toString();
+		const nearAll = this.getNeighbors(selfCoord, 'both', Math.max(2, this.cfg.m));
+		const near = nearAll.filter((id) => id !== selfStr && (this.isConnected(id) || this.hasAddresses(id)));
 		await this.probeNeighborsLatency(near.slice(0, 4));
 		await this.mergeNeighborSnapshots(near.slice(0, 4));
 	}
