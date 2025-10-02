@@ -12,9 +12,10 @@ export interface LeaveNoticeV1 {
 
 export function registerLeave(
 	node: Libp2p,
-	onLeave: (notice: LeaveNoticeV1) => Promise<void> | void
+	onLeave: (notice: LeaveNoticeV1) => Promise<void> | void,
+	protocol = PROTOCOL_LEAVE
 ): void {
-	node.handle(PROTOCOL_LEAVE, async ({ stream }) => {
+	node.handle(protocol, async ({ stream }) => {
 		try {
 			const bytes = await readAll(stream);
 			const msg = await decodeJson<LeaveNoticeV1>(bytes);
@@ -33,10 +34,11 @@ export function registerLeave(
 export async function sendLeave(
 	node: Libp2p,
 	peerIdStr: string,
-	notice: LeaveNoticeV1
+	notice: LeaveNoticeV1,
+	protocol = PROTOCOL_LEAVE
 ): Promise<void> {
 	const pid = peerIdFromString(peerIdStr);
-	const stream = await node.dialProtocol(pid, [PROTOCOL_LEAVE]);
+	const stream = await node.dialProtocol(pid, [protocol]);
 	await stream.sink(
 		(async function* () {
 			yield await encodeJson(notice);

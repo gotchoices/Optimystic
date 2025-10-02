@@ -6,6 +6,7 @@ export interface FretConfig {
 	capacity: number;
 	profile: 'edge' | 'core';
 	bootstraps?: string[];
+	networkName?: string;
 }
 
 export interface NeighborSnapshotV1 {
@@ -66,6 +67,7 @@ export { FretService as FretServiceImpl } from './service/fret-service.js';
 import { FretService as FretServiceClass } from './service/fret-service.js';
 export { seedDiscovery } from './service/discovery.js';
 export { Libp2pFretService, fretService } from './service/libp2p-fret-service.js';
+export { hashKey, hashPeerId } from './ring/hash.js';
 
 export function createFret(node: any, cfg?: Partial<FretConfig>): FretService {
 	return new FretServiceClass(node, cfg) as FretService;

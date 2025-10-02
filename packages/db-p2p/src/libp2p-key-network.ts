@@ -4,6 +4,7 @@ import type { ClusterPeers, FindCoordinatorOptions, IKeyNetwork, IPeerNetwork } 
 import { peerIdFromString } from '@libp2p/peer-id'
 import { multiaddr } from '@multiformats/multiaddr'
 import type { FretService } from '@optimystic/fret'
+import { hashKey } from '@optimystic/fret'
 
 interface WithFretService { services?: { fret?: FretService } }
 
@@ -49,9 +50,10 @@ export class Libp2pKeyPeerNetwork implements IKeyNetwork, IPeerNetwork {
 		return svc
 	}
 
-	private getNeighborIdsForKey(key: Uint8Array, wants: number): string[] {
+	private async getNeighborIdsForKey(key: Uint8Array, wants: number): Promise<string[]> {
 		const fret = this.getFret()
-		const both = fret.getNeighbors(key, 'both', wants)
+		const coord = await hashKey(key)
+		const both = fret.getNeighbors(coord, 'both', wants)
 		return Array.from(new Set(both)).slice(0, wants)
 	}
 
@@ -59,7 +61,7 @@ export class Libp2pKeyPeerNetwork implements IKeyNetwork, IPeerNetwork {
 		const cached = this.getCachedCoordinator(key)
 		if (cached != null) return cached
 
-		const ids = this.getNeighborIdsForKey(key, 1)
+		const ids = await this.getNeighborIdsForKey(key, 1)
 		const idStr = ids[0] ?? this.libp2p.peerId.toString()
 		const pid = peerIdFromString(idStr)
 		this.recordCoordinator(key, pid)
@@ -86,10 +88,10 @@ export class Libp2pKeyPeerNetwork implements IKeyNetwork, IPeerNetwork {
 	}
 
 	async findCluster(key: Uint8Array): Promise<ClusterPeers> {
-		const ids = Array.from(new Set([
-			...this.getNeighborIdsForKey(key, 16),
-			this.libp2p.peerId.toString()
-		]))
+		const fret = this.getFret()
+		const coord = await hashKey(key)
+		const cohort = fret.assembleCohort(coord, 16)
+		const ids = Array.from(new Set([...cohort, this.libp2p.peerId.toString()]))
 
 		const peers: ClusterPeers = {}
 		const connectedByPeer = this.getConnectedAddrsByPeer()

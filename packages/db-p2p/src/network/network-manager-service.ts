@@ -1,4 +1,6 @@
 import type { Startable, Logger, PeerId } from '@libp2p/interface'
+import type { FretService } from '@optimystic/fret'
+import { hashKey } from '@optimystic/fret'
 
 export type NetworkManagerServiceInit = {
   clusterSize?: number
@@ -13,6 +15,8 @@ type Components = {
   logger: { forComponent: (name: string) => Logger },
   registrar: { handle: (...args: any[]) => Promise<void>, unhandle: (...args: any[]) => Promise<void> }
 }
+
+interface WithFretService { services?: { fret?: FretService } }
 
 export class NetworkManagerService implements Startable {
   private running = false
@@ -50,6 +54,15 @@ export class NetworkManagerService implements Startable {
     }
   }
 
+  private getFret(): FretService | null {
+    try {
+      const libp2p = this.getLibp2p()
+      return (libp2p as unknown as WithFretService).services?.fret ?? null
+    } catch {
+      return null
+    }
+  }
+
   get [Symbol.toStringTag](): string { return '@libp2p/network-manager' }
 
   async start(): Promise<void> {
@@ -66,7 +79,7 @@ export class NetworkManagerService implements Startable {
   async ready(): Promise<void> {
     if (this.readyPromise) return this.readyPromise
     this.readyPromise = (async () => {
-      // Best-effort seed of keys to populate peer routing cache
+      // Best-effort seed of keys to populate peer routing cache via FRET
       await Promise.all((this.cfg.seedKeys ?? []).map(k => this.seedKey(k).catch(e => this.log.error('seed key failed %o', e))))
       // Minimal settle delay
       await new Promise(r => setTimeout(r, 50))
@@ -75,15 +88,17 @@ export class NetworkManagerService implements Startable {
   }
 
   private async seedKey(key: Uint8Array): Promise<void> {
-    const ctl = new AbortController()
-    const t = setTimeout(() => ctl.abort(), this.cfg.estimation.timeoutMs)
+    const fret = this.getFret()
+    if (!fret) {
+      this.log('FRET not available for seedKey')
+      return
+    }
     try {
-      const libp2p = this.getLibp2p()
-      for await (const _ of libp2p.peerRouting.getClosestPeers(key, { signal: ctl.signal, useCache: true })) {
-        break
-      }
-    } catch (e) { this.log.error('closestPeers seed failed %o', e) }
-    finally { clearTimeout(t) }
+      const coord = await hashKey(key)
+      const _neighbors = fret.getNeighbors(coord, 'both', 1)
+    } catch (e) {
+      this.log.error('FRET seedKey failed %o', e)
+    }
   }
 
   private toCacheKey(key: Uint8Array): string {
@@ -156,21 +171,29 @@ export class NetworkManagerService implements Startable {
   }
 
   /**
-   * Find the nearest peer to the provided content key using the DHT (if available),
-   * falling back to locally known peers. This is used only to choose an anchor peer.
+   * Find the nearest peer to the provided content key using FRET,
+   * falling back to self if FRET is unavailable.
    */
   private async findNearestPeerToKey(key: Uint8Array): Promise<PeerId> {
+    const fret = this.getFret()
     const libp2p = this.getLibp2p()
-    // Prefer DHT closestPeers to pick a good anchor (fast path when connected)
-    try {
-      const ctl = new AbortController()
-      const t = setTimeout(() => ctl.abort(), this.cfg.estimation.timeoutMs)
+
+    if (fret) {
       try {
-        for await (const pid of libp2p.peerRouting.getClosestPeers(key, { signal: ctl.signal, useCache: true })) {
-          if (!this.isBlacklisted(pid)) { clearTimeout(t); return pid }
+        const coord = await hashKey(key)
+        const neighbors = fret.getNeighbors(coord, 'both', 1)
+        if (neighbors.length > 0) {
+          const pidStr = neighbors[0]
+          if (pidStr) {
+            const { peerIdFromString } = await import('@libp2p/peer-id')
+            const pid = peerIdFromString(pidStr)
+            if (!this.isBlacklisted(pid)) return pid
+          }
         }
-      } finally { clearTimeout(t) }
-    } catch { /* ignore and fall back */ }
+      } catch (e) {
+        this.log('FRET findNearestPeerToKey failed, using fallback: %o', e)
+      }
+    }
 
     // Fallback: choose among self + connected peers + known peers by distance to key
     const connected: PeerId[] = (libp2p.getConnections?.() ?? []).map((c: any) => c.remotePeer)
@@ -184,21 +207,46 @@ export class NetworkManagerService implements Startable {
   }
 
   /**
-   * Compute cluster anchored on the nearest peer to the key, then select K peers
-   * closest to that anchor's PeerId (peer-centric clusters).
+   * Compute cluster using FRET's assembleCohort for content-addressed peer selection.
    */
   async getCluster(key: Uint8Array): Promise<PeerId[]> {
     const ck = this.toCacheKey(key)
     const cached = this.clusterCache.get(ck)
     if (cached && cached.expires > Date.now()) return cached.ids
 
+    const fret = this.getFret()
     const libp2p = this.getLibp2p()
+
+    if (fret) {
+      try {
+        const coord = await hashKey(key)
+        const cohortIds = fret.assembleCohort(coord, this.cfg.clusterSize)
+        const { peerIdFromString } = await import('@libp2p/peer-id')
+
+        const ids = cohortIds
+          .map(idStr => {
+            try {
+              return peerIdFromString(idStr)
+            } catch {
+              return null
+            }
+          })
+          .filter((pid): pid is PeerId => pid !== null && !this.isBlacklisted(pid))
+
+        if (ids.length > 0) {
+          this.clusterCache.set(ck, { ids, expires: Date.now() + this.cfg.cacheTTLs.clusterMs })
+          return ids
+        }
+      } catch (e) {
+        this.log('FRET getCluster failed, using fallback: %o', e)
+      }
+    }
+
+    // Fallback: peer-centric clustering if FRET unavailable
     const anchor = await this.findNearestPeerToKey(key)
     const anchorMh = anchor.toMultihash().bytes
-
-    // Start with anchor + connected + known peers, filter blacklist, sort by distance to anchor
     const connected: PeerId[] = (libp2p.getConnections?.() ?? []).map((c: any) => c.remotePeer)
-    const candidates = [anchor, libp2p.peerId, ...connected, ...this.getKnownPeers()] // include self
+    const candidates = [anchor, libp2p.peerId, ...connected, ...this.getKnownPeers()]
       .filter((p, idx, arr) => !this.isBlacklisted(p) && arr.findIndex(x => x.toString() === p.toString()) === idx)
     const sorted = candidates.sort((a, b) => this.lexLess(this.xor(a.toMultihash().bytes, anchorMh), this.xor(b.toMultihash().bytes, anchorMh)) ? -1 : 1)
     const K = Math.min(this.cfg.clusterSize, sorted.length)
@@ -208,27 +256,19 @@ export class NetworkManagerService implements Startable {
   }
 
   async getCoordinator(key: Uint8Array): Promise<PeerId> {
-		// First try the cache
     const ck = this.toCacheKey(key)
     const hit = this.coordinatorCache.get(ck)
     if (hit) {
-			if (hit.expires > Date.now()) {
-				return hit.id
-			} else {
-				this.coordinatorCache.delete(ck)
-			}
-		}
-
-    // Prefer the nearest peer to the key as coordinator; avoid dialing here to
-    // keep discovery fast and avoid component availability issues. The caller
-    // will dial when needed via protocol clients.
-    const libp2p = this.getLibp2p()
-    const anchor = await this.findNearestPeerToKey(key)
-    if (!this.isBlacklisted(anchor)) {
-      this.recordCoordinator(key, anchor)
-      return anchor
+      if (hit.expires > Date.now()) {
+        return hit.id
+      } else {
+        this.coordinatorCache.delete(ck)
+      }
     }
+
+    // Use FRET-based cluster selection for coordinator
     const cluster = await this.getCluster(key)
+    const libp2p = this.getLibp2p()
     const candidate = cluster.find(p => !this.isBlacklisted(p)) ?? libp2p.peerId
     this.recordCoordinator(key, candidate)
     return candidate

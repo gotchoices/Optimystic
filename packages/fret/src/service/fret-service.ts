@@ -11,6 +11,7 @@ import type {
 import { DigitreeStore, type PeerEntry } from '../store/digitree-store.js';
 import { hashKey, hashPeerId, coordToBase64url } from '../ring/hash.js';
 import type { Libp2p } from 'libp2p';
+import { makeProtocols } from '../rpc/protocols.js';
 import { registerNeighbors, fetchNeighbors, announceNeighbors } from '../rpc/neighbors.js';
 import { registerMaybeAct, sendMaybeAct } from '../rpc/maybe-act.js';
 import { registerLeave, sendLeave } from '../rpc/leave.js';
@@ -19,6 +20,7 @@ import { fromString as u8FromString } from 'uint8arrays/from-string';
 import { estimateSizeAndConfidence } from '../estimate/size-estimator.js';
 import { TokenBucket } from '../utils/token-bucket.js';
 import { peerIdFromString } from '@libp2p/peer-id';
+import { multiaddr } from '@multiformats/multiaddr';
 import { chooseNextHop } from '../selector/next-hop.js';
 import {
     createSparsityModel,
@@ -48,6 +50,7 @@ export class FretService implements IFretService, Startable {
 	private readonly sparsity: SparsityModel = createSparsityModel();
 	private cachedSelfCoord: Uint8Array | null = null;
 	private preconnectRunning = false;
+	private readonly protocols: ReturnType<typeof import('../rpc/protocols.js').makeProtocols>;
 	private readonly diag = {
 		peersDiscovered: 0,
 		snapshotsFetched: 0,
@@ -67,7 +70,10 @@ export class FretService implements IFretService, Startable {
 			capacity: cfg?.capacity ?? 2048,
 			profile: cfg?.profile ?? 'core',
 			bootstraps: cfg?.bootstraps ?? [],
+			networkName: cfg?.networkName ?? 'default',
 		};
+		// Create network-specific protocols
+		this.protocols = makeProtocols(this.cfg.networkName);
 		// Discovery rate differs by profile
 		this.bucketDiscovery = new TokenBucket(
 			this.cfg.profile === 'core' ? 50 : 10,
@@ -195,11 +201,12 @@ export class FretService implements IFretService, Startable {
 			async () => this.handleNeighborsRequest(),
 			(from, snap) => {
 				void this.mergeAnnounceSnapshot(from, snap);
-			}
+			},
+			this.protocols
 		);
-		registerMaybeAct(this.node, async (msg) => this.handleMaybeAct(msg));
-		registerLeave(this.node, async (notice) => this.handleLeave(notice.from));
-		registerPing(this.node);
+		registerMaybeAct(this.node, async (msg) => this.handleMaybeAct(msg), this.protocols.PROTOCOL_MAYBE_ACT);
+		registerLeave(this.node, async (notice) => this.handleLeave(notice.from), this.protocols.PROTOCOL_LEAVE);
+		registerPing(this.node, this.protocols.PROTOCOL_PING);
 	}
 
 	private async handleNeighborsRequest(): Promise<NeighborSnapshotV1> {
@@ -272,7 +279,7 @@ export class FretService implements IFretService, Startable {
 		const snap = await this.snapshot();
 		for (const id of ids) {
 			if (this.isConnected(id) || this.hasAddresses(id)) {
-				try { await announceNeighbors(this.node, id, snap); this.diag.announcementsSent++; } catch (err) { console.warn('announce failed', id, err); }
+				try { await announceNeighbors(this.node, id, snap, this.protocols.PROTOCOL_NEIGHBORS_ANNOUNCE); this.diag.announcementsSent++; } catch (err) { console.warn('announce failed', id, err); }
 			}
 		}
 	}
@@ -287,7 +294,7 @@ export class FretService implements IFretService, Startable {
 			])).filter((id) => id !== selfStr);
 			for (const id of ids) {
 				if (this.isConnected(id) || this.hasAddresses(id)) {
-					try { await sendPing(this.node, id); this.diag.pingsSent++; } catch {}
+					try { await sendPing(this.node, id, this.protocols.PROTOCOL_PING); this.diag.pingsSent++; } catch {}
 				}
 			}
 		} catch {}
@@ -308,7 +315,7 @@ export class FretService implements IFretService, Startable {
 				])).filter((id) => id !== selfStr).slice(0, budget);
 				for (const id of ids) {
 					if (this.isConnected(id) || this.hasAddresses(id)) {
-						try { await sendPing(this.node, id); this.diag.pingsSent++; } catch {}
+						try { await sendPing(this.node, id, this.protocols.PROTOCOL_PING); this.diag.pingsSent++; } catch {}
 					}
 				}
 			} catch {}
@@ -325,10 +332,10 @@ export class FretService implements IFretService, Startable {
 				...this.getNeighbors(selfCoord, 'right', this.cfg.m),
 				...this.getNeighbors(selfCoord, 'left', this.cfg.m)
 			])).filter((id) => id !== selfStr).slice(0, 8);
-			const notice = { v: 1, from: this.node.peerId.toString(), timestamp: Date.now() } as const;
-			for (const id of ids) {
-				try { await sendLeave(this.node, id, notice); } catch {}
-			}
+		const notice = { v: 1, from: this.node.peerId.toString(), timestamp: Date.now() } as const;
+		for (const id of ids) {
+			try { await sendLeave(this.node, id, notice, this.protocols.PROTOCOL_LEAVE); } catch {}
+		}
 		} catch {}
 	}
 
@@ -365,10 +372,10 @@ export class FretService implements IFretService, Startable {
 			const warm = newIds.slice(0, Math.min(newIds.length, 6));
 			for (const id of warm) {
 				try {
-					await sendPing(this.node, id);
+					await sendPing(this.node, id, this.protocols.PROTOCOL_PING);
 					if (!this.isConnected(id)) {
 						const snap = await this.snapshot();
-						await announceNeighbors(this.node, id, snap);
+						await announceNeighbors(this.node, id, snap, this.protocols.PROTOCOL_NEIGHBORS_ANNOUNCE);
 					}
 				} catch (err) {
 					console.warn('warm/announce failed for', id, err);
@@ -466,15 +473,26 @@ export class FretService implements IFretService, Startable {
 	private async seedFromBootstraps(): Promise<void> {
 		if (!this.cfg.bootstraps || this.cfg.bootstraps.length === 0) return;
 		const discovered: string[] = [];
-		for (const id of this.cfg.bootstraps.slice(0, 8)) {
+		for (const bootstrapEntry of this.cfg.bootstraps.slice(0, 8)) {
 			try {
+				let id = bootstrapEntry;
+				// If it's a multiaddr, extract the peer ID using proper parsing
+				if (bootstrapEntry.startsWith('/')) {
+					try {
+						const ma = multiaddr(bootstrapEntry);
+						const peerIdStr = ma.getPeerId();
+						if (peerIdStr) id = peerIdStr;
+					} catch {
+						// Not a valid multiaddr, assume it's already a peer ID
+					}
+				}
 				const pid = peerIdFromString(id);
 				const coord = await hashPeerId(pid);
 				if (!this.store.getById(id)) discovered.push(id);
 				this.store.upsert(id, coord);
 				await this.applyTouch(id, coord);
 			} catch (err) {
-				console.warn('seedFromBootstraps failed for', id, err);
+				console.warn('seedFromBootstraps failed for', bootstrapEntry, err);
 			}
 		}
 		this.enforceCapacity();
@@ -493,7 +511,7 @@ export class FretService implements IFretService, Startable {
 	private async probeNeighborsLatency(ids: string[]): Promise<void> {
 		for (const id of ids) {
 			try {
-				const res = await sendPing(this.node, id);
+				const res = await sendPing(this.node, id, this.protocols.PROTOCOL_PING);
 				this.diag.pingsSent++;
 				if (res.ok) {
 					const coord = this.store.getById(id)?.coord ?? (await hashPeerId(peerIdFromString(id)));
@@ -519,7 +537,7 @@ export class FretService implements IFretService, Startable {
 		const announced: string[] = [];
 		for (const id of ids) {
 			try {
-				const snap: NeighborSnapshotV1 = await fetchNeighbors(this.node, id);
+				const snap: NeighborSnapshotV1 = await fetchNeighbors(this.node, id, this.protocols.PROTOCOL_NEIGHBORS);
 				this.diag.snapshotsFetched++;
 				const capSucc = this.cfg.profile === 'core' ? 16 : 8;
 				const capPred = this.cfg.profile === 'core' ? 16 : 8;
@@ -711,12 +729,12 @@ export class FretService implements IFretService, Startable {
 			const linkQ = (_id: string) => 0.5;
 			const next = chooseNextHop(this.store, coord, candidates, (id) => this.isConnected(id), linkQ);
 			if (next) {
-				const fwd: RouteAndMaybeActV1 = {
-					...msg,
-					ttl: msg.ttl - 1,
-					breadcrumbs: [...(msg.breadcrumbs ?? []), selfId]
-				};
-				try { return await sendMaybeAct(this.node, next, fwd); } catch (err) { console.warn('forward maybeAct failed to', next, err); }
+			const fwd: RouteAndMaybeActV1 = {
+				...msg,
+				ttl: msg.ttl - 1,
+				breadcrumbs: [...(msg.breadcrumbs ?? []), selfId]
+			};
+			try { return await sendMaybeAct(this.node, next, fwd, this.protocols.PROTOCOL_MAYBE_ACT); } catch (err) { console.warn('forward maybeAct failed to', next, err); }
 			}
 		}
 		const { n, confidence } = estimateSizeAndConfidence(this.store, this.cfg.m);

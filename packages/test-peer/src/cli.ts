@@ -66,37 +66,24 @@ class TestPeerSession {
 		});
 	}
 
-	private async warmUpKadDHT(node: any): Promise<void> {
+	private async waitForFretReady(node: any): Promise<void> {
 		try {
+			const fret = (node as any).services?.fret;
+			if (!fret) {
+				console.log('⚠️  FRET service not available');
+				return;
+			}
+
 			const hadConn = node.getConnections().length > 0;
 			if (!hadConn) {
-				return; // no peers to warm up against
+				console.log('🔗 No connections yet, skipping FRET warm-up');
+				return;
 			}
-    const keys: Uint8Array[] = [
-        node.peerId.toMultihash().bytes,
-        randomBytes(32),
-        randomBytes(32),
-        randomBytes(32)
-      ];
-			const budgetMs = 15000;
-			await Promise.all(keys.map(async (key) => {
-				const ctl = new AbortController();
-				const t = setTimeout(() => ctl.abort(), budgetMs);
-				try {
-          for await (const _peer of node.peerRouting.getClosestPeers(key, { signal: ctl.signal, useCache: true })) {
-						break; // only need first result to seed the table
-					}
-				} catch (error) {
-					if (error instanceof Error && error.name === 'AbortError') {
-						console.log('🧭 DHT warm-up: timed out (non-fatal)');
-					} else {
-						console.warn('⚠️ DHT warm-up issue:', error);
-					}
-				}
-				finally { clearTimeout(t); }
-			}));
+
+			await fret.ready();
+			console.log('✅ FRET service ready');
 		} catch (error) {
-			console.warn('⚠️ DHT warm-up wrapper issue:', error);
+			console.warn('⚠️ FRET readiness check issue:', error);
 		}
 	}
 
@@ -236,6 +223,9 @@ class TestPeerSession {
 		} else {
 			console.log('🧭 Network ready');
 		}
+
+		// Wait for FRET to be ready
+		await this.waitForFretReady(node);
 
 		// Optionally announce node info to a file for launchers/mesh setups
 		if (options.announceFile) {

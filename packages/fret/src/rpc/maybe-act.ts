@@ -6,9 +6,10 @@ import type { Stream } from '@libp2p/interface';
 
 export function registerMaybeAct(
 	node: Libp2p,
-	handle: (msg: RouteAndMaybeActV1) => Promise<NearAnchorV1 | { commitCertificate: string }>
+	handle: (msg: RouteAndMaybeActV1) => Promise<NearAnchorV1 | { commitCertificate: string }>,
+	protocol = PROTOCOL_MAYBE_ACT
 ): void {
-	node.handle(PROTOCOL_MAYBE_ACT, async ({ stream }) => {
+	node.handle(protocol, async ({ stream }) => {
 		try {
 			const bytes = await readAll(stream);
 			const msg = await decodeJson<RouteAndMaybeActV1>(bytes);
@@ -27,10 +28,11 @@ export function registerMaybeAct(
 export async function sendMaybeAct(
 	node: Libp2p,
 	peerIdStr: string,
-	msg: RouteAndMaybeActV1
+	msg: RouteAndMaybeActV1,
+	protocol = PROTOCOL_MAYBE_ACT
 ): Promise<NearAnchorV1 | { commitCertificate: string }> {
 	const pid = peerIdFromString(peerIdStr);
-	const stream = await node.dialProtocol(pid, [PROTOCOL_MAYBE_ACT]);
+	const stream = await node.dialProtocol(pid, [protocol]);
 	await stream.sink(
 		(async function* () {
 			yield await encodeJson(msg);

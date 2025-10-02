@@ -69,7 +69,7 @@ export async function createLibp2pNode(options: NodeOptions): Promise<Libp2p> {
 		streamMuxers: [yamux()],
 		services: {
 			identify: identify({
-				protocolPrefix: `/p2p/${options.networkName}`
+				protocolPrefix: `/optimystic/${options.networkName}`
 			}),
 			ping: ping(),
 			pubsub: gossipsub(),
@@ -77,7 +77,7 @@ export async function createLibp2pNode(options: NodeOptions): Promise<Libp2p> {
 			// Custom services - create wrapper factories that inject dependencies
 			cluster: (components: any) => {
 				const serviceFactory = clusterService({
-					protocolPrefix: `/db-p2p`
+					protocolPrefix: `/optimystic/${options.networkName}`
 				});
 				return serviceFactory({
 					logger: components.logger,
@@ -88,7 +88,7 @@ export async function createLibp2pNode(options: NodeOptions): Promise<Libp2p> {
 
 			repo: (components: any) => {
 				const serviceFactory = repoService({
-					protocolPrefix: `/db-p2p`
+					protocolPrefix: `/optimystic/${options.networkName}`
 				});
 				return serviceFactory({
 					logger: components.logger,
@@ -104,7 +104,14 @@ export async function createLibp2pNode(options: NodeOptions): Promise<Libp2p> {
 				})
 				return svcFactory(components)
 			},
-			fret: fretService({ k: 15, m: 8, capacity: 2048, profile: (options.bootstrapNodes?.length ?? 0) > 0 ? 'core' : 'edge' })
+			fret: fretService({
+				k: 15,
+				m: 8,
+				capacity: 2048,
+				profile: (options.bootstrapNodes?.length ?? 0) > 0 ? 'core' : 'edge',
+				networkName: options.networkName,
+				bootstraps: options.bootstrapNodes ?? []
+			})
 		},
 		// Add bootstrap nodes as needed
 		peerDiscovery: [

@@ -12,9 +12,10 @@ import type { Stream } from '@libp2p/interface';
 export function registerNeighbors(
 	node: Libp2p,
 	getSnapshot: () => NeighborSnapshotV1 | Promise<NeighborSnapshotV1>,
-	onAnnounce?: (from: string, snapshot: NeighborSnapshotV1) => void
+	onAnnounce?: (from: string, snapshot: NeighborSnapshotV1) => void,
+	protocols = { PROTOCOL_NEIGHBORS, PROTOCOL_NEIGHBORS_ANNOUNCE }
 ): void {
-	node.handle(PROTOCOL_NEIGHBORS, async ({ stream }) => {
+	node.handle(protocols.PROTOCOL_NEIGHBORS, async ({ stream }) => {
 		try {
 			const snap = await getSnapshot();
 			await stream.sink(
@@ -29,7 +30,7 @@ export function registerNeighbors(
 
 	// Optional: accept pushed announcements of neighbor snapshots
 	if (onAnnounce) {
-		node.handle(PROTOCOL_NEIGHBORS_ANNOUNCE, async ({ stream }) => {
+		node.handle(protocols.PROTOCOL_NEIGHBORS_ANNOUNCE, async ({ stream }) => {
 			try {
 				const bytes = await readAll(stream);
 				const snap = await decodeJson<NeighborSnapshotV1>(bytes);
@@ -48,10 +49,11 @@ export function registerNeighbors(
 
 export async function fetchNeighbors(
 	node: Libp2p,
-	peerIdOrStr: string
+	peerIdOrStr: string,
+	protocol = PROTOCOL_NEIGHBORS
 ): Promise<NeighborSnapshotV1> {
 	const pid = peerIdFromString(peerIdOrStr);
-	const stream = await node.dialProtocol(pid, [PROTOCOL_NEIGHBORS]);
+	const stream = await node.dialProtocol(pid, [protocol]);
 	const bytes = await readAll(stream);
 	return await decodeJson<NeighborSnapshotV1>(bytes);
 }
@@ -59,10 +61,11 @@ export async function fetchNeighbors(
 export async function announceNeighbors(
 	node: Libp2p,
 	peerIdOrStr: string,
-	snapshot: NeighborSnapshotV1
+	snapshot: NeighborSnapshotV1,
+	protocol = PROTOCOL_NEIGHBORS_ANNOUNCE
 ): Promise<void> {
 	const pid = peerIdFromString(peerIdOrStr);
-	const stream = await node.dialProtocol(pid, [PROTOCOL_NEIGHBORS_ANNOUNCE]);
+	const stream = await node.dialProtocol(pid, [protocol]);
 	await stream.sink(
 		(async function* () {
 			yield await encodeJson(snapshot);

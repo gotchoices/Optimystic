@@ -2,8 +2,8 @@ import type { Libp2p } from 'libp2p';
 import { peerIdFromString } from '@libp2p/peer-id';
 import { PROTOCOL_PING, encodeJson, decodeJson } from './protocols.js';
 
-export function registerPing(node: Libp2p): void {
-	node.handle(PROTOCOL_PING, async ({ stream }) => {
+export function registerPing(node: Libp2p, protocol = PROTOCOL_PING): void {
+	node.handle(protocol, async ({ stream }) => {
 		await stream.sink(
 			(async function* () {
 				yield await encodeJson({ ok: true, ts: Date.now() });
@@ -12,10 +12,10 @@ export function registerPing(node: Libp2p): void {
 	});
 }
 
-export async function sendPing(node: Libp2p, peer: string): Promise<{ ok: boolean; rttMs: number }> {
+export async function sendPing(node: Libp2p, peer: string, protocol = PROTOCOL_PING): Promise<{ ok: boolean; rttMs: number }> {
     const start = Date.now();
     const pid = peerIdFromString(peer);
-    const conn = await (node as any).dialProtocol(pid, [PROTOCOL_PING]);
+    const conn = await (node as any).dialProtocol(pid, [protocol]);
     const stream = conn.stream ?? conn;
     const chunks: Uint8Array[] = [];
     for await (const chunk of stream.source) {
@@ -24,6 +24,9 @@ export async function sendPing(node: Libp2p, peer: string): Promise<{ ok: boolea
     // Some libp2p implementations may send empty frames before actual data; guard decode
     const body = concat(chunks);
     if (body.length === 0) return { ok: false, rttMs: Math.max(0, Date.now() - start) };
+    // Check for whitespace-only responses
+    const text = new TextDecoder().decode(body).trim();
+    if (text.length === 0) return { ok: false, rttMs: Math.max(0, Date.now() - start) };
     const res = await decodeJson<{ ok: boolean }>(body);
     return { ok: Boolean(res.ok), rttMs: Math.max(0, Date.now() - start) };
 }
