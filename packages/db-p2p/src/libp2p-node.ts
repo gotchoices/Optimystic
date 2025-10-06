@@ -16,7 +16,7 @@ import { FileRawStorage } from './storage/file-storage.js';
 import type { IRawStorage } from './storage/i-raw-storage.js';
 import { multiaddr } from '@multiformats/multiaddr';
 import { networkManagerService } from './network/network-manager-service.js';
-import { fretService } from '@optimystic/fret';
+import { fretService, Libp2pFretService } from '@optimystic/fret';
 
 export type NodeOptions = {
 	port: number;
@@ -59,6 +59,7 @@ export async function createLibp2pNode(options: NodeOptions): Promise<Libp2p> {
 	const peerId = options.id ? await peerIdFromString(options.id) : undefined;
 
 	const libp2pOptions: any = {
+		start: false,
 		...(peerId ? { peerId } : {}),
 		addresses: {
 			listen: [`/ip4/0.0.0.0/tcp/${options.port}`]
@@ -97,21 +98,29 @@ export async function createLibp2pNode(options: NodeOptions): Promise<Libp2p> {
 				});
 			},
 
-			networkManager: (components: any) => {
-				const svcFactory = networkManagerService({
+            networkManager: (components: any) => {
+                const svcFactory = networkManagerService({
 					clusterSize: options.clusterSize ?? 10,
 					expectedRemotes: (options.bootstrapNodes?.length ?? 0) > 0
-				})
-				return svcFactory(components)
+                })
+                const svc = svcFactory(components)
+                try { (svc as any).setLibp2p?.(components.libp2p) } catch {}
+                return svc
 			},
-			fret: fretService({
+            fret: (components: any) => {
+                const svcFactory = fretService({
 				k: 15,
 				m: 8,
 				capacity: 2048,
 				profile: (options.bootstrapNodes?.length ?? 0) > 0 ? 'core' : 'edge',
 				networkName: options.networkName,
 				bootstraps: options.bootstrapNodes ?? []
-			})
+                });
+                const svc = svcFactory(components) as Libp2pFretService;
+                // Inject the libp2p instance explicitly to avoid MissingServiceError
+                try { svc.setLibp2p(components.libp2p); } catch {}
+                return svc;
+            }
 		},
 		// Add bootstrap nodes as needed
 		peerDiscovery: [
@@ -120,6 +129,10 @@ export async function createLibp2pNode(options: NodeOptions): Promise<Libp2p> {
 	};
 
 	const node = await createLibp2p(libp2pOptions);
+
+	// Inject libp2p reference into services that need it before start
+	try { ((node as any).services?.fret as any)?.setLibp2p?.(node) } catch {}
+	try { ((node as any).services?.networkManager as any)?.setLibp2p?.(node) } catch {}
 
 	await node.start();
 

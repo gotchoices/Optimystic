@@ -8,18 +8,39 @@ type Components = { libp2p: Libp2p };
 
 export class Libp2pFretService implements Startable {
 	private inner: FretService | null = null;
-	constructor(private readonly components: Components, private readonly cfg?: Partial<FretConfig>) {}
+  private nodeRef: Libp2p | null = null;
+  constructor(private readonly components: Components, private readonly cfg?: Partial<FretConfig>) {}
 	get [Symbol.toStringTag](): string {
 		return '@optimystic/fret';
 	}
-	private ensure(): FretService {
-		if (!this.inner) this.inner = new CoreFretService(this.components.libp2p, this.cfg);
-		return this.inner;
-	}
+  private ensure(): FretService {
+    if (!this.inner) {
+      if (!this.nodeRef) {
+        throw new Error('Libp2pFretService: libp2p node not injected');
+      }
+      this.inner = new CoreFretService(this.nodeRef, this.cfg);
+    }
+    return this.inner;
+  }
+  /**
+   * Allows the hosting application to inject the libp2p node reference
+   * prior to start(). This avoids relying on a libp2p-provided "libp2p"
+   * component which may not exist in some environments.
+   */
+  public setLibp2p(node: Libp2p): void {
+    this.nodeRef = node;
+  }
 	async start(): Promise<void> {
-		// Emit any currently known peers to libp2p discovery
-		seedDiscovery(this.components.libp2p, (this.inner as any)?.store ?? ({} as any));
+    // Ensure inner service is constructed with a valid libp2p instance
+    this.ensure();
+    // Emit any currently known peers to libp2p discovery
+    if (!this.nodeRef) throw new Error('Libp2pFretService.start: libp2p node not injected');
+    seedDiscovery(this.nodeRef, (this.inner as any)?.store ?? ({} as any));
 		await this.ensure().start();
+	}
+
+	async ready(): Promise<void> {
+		await this.ensure().ready();
 	}
 	async stop(): Promise<void> {
 		await this.inner?.stop();

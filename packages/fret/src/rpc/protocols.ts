@@ -22,6 +22,14 @@ export async function encodeJson(obj: unknown): Promise<Uint8Array> {
 }
 
 export async function decodeJson<T = unknown>(bytes: Uint8Array): Promise<T> {
-	const text = new TextDecoder().decode(bytes);
-	return JSON.parse(text) as T;
+    // guard against binary frames or empty buffers from underlying muxers
+    if (bytes.byteLength === 0) throw new Error('empty response');
+    // strip any leading/trailing nulls/whitespace
+    let start = 0;
+    let end = bytes.byteLength;
+    while (start < end && (bytes[start] === 0 || bytes[start] === 9 || bytes[start] === 10 || bytes[start] === 13 || bytes[start] === 32)) start++;
+    while (end > start && (bytes[end - 1] === 0 || bytes[end - 1] === 9 || bytes[end - 1] === 10 || bytes[end - 1] === 13 || bytes[end - 1] === 32)) end--;
+    if (end <= start) throw new Error('whitespace response');
+    const text = new TextDecoder().decode(bytes.subarray(start, end));
+    return JSON.parse(text) as T;
 }
