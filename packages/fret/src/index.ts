@@ -19,6 +19,7 @@ export interface NeighborSnapshotV1 {
 	size_estimate?: number;
 	confidence?: number;
 	sig: string;
+	metadata?: Record<string, any>;
 }
 
 export interface RouteAndMaybeActV1 {
@@ -61,6 +62,9 @@ export interface FretService {
 	expandCohort(current: string[], key: Uint8Array, step: number, exclude?: Set<string>): string[];
 	routeAct(msg: RouteAndMaybeActV1): Promise<NearAnchorV1 | { commitCertificate: string }>;
 	report(evt: ReportEvent): void;
+	setMetadata(metadata: Record<string, any>): void;
+	getMetadata(peerId: string): Record<string, any> | undefined;
+	listPeers(): Array<{ id: string; metadata?: Record<string, any> }>;
 }
 
 export { FretService as FretServiceImpl } from './service/fret-service.js';

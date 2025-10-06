@@ -13,7 +13,7 @@
       "env": {
         "MESH_NODES": "3",
         "MESH_BASE_PORT": "8011",
-        "DEBUG": "libp2p:*,db-p2p:*"
+        "DEBUG": "optimystic:*,db-p2p:*,libp2p:connection-manager,-libp2p:connection-manager:dial-queue,-libp2p:*:error"
       },
       "console": "integratedTerminal"
     },
@@ -29,7 +29,7 @@
       ],
       "cwd": "${workspaceFolder}",
       "env": {
-        "DEBUG": "libp2p:*,db-p2p:*"
+        "DEBUG": "db-p2p:repo-service,optimystic:*,db-p2p:*,libp2p:connection-manager,-libp2p:connection-manager:dial-queue,-libp2p:*:error"
       },
       "console": "integratedTerminal",
       "autoAttachChildProcesses": true

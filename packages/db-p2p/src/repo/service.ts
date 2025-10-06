@@ -107,7 +107,6 @@ export class RepoService implements Startable {
         let response: any
 
         if ('get' in operation) {
-          // With small meshes (known peers < k), any node is effectively in-cluster
           {
             // Use sha256 digest of block id string for consistent key space
             const mh = await sha256.digest(new TextEncoder().encode(operation.get.blockIds[0]!))
@@ -118,7 +117,8 @@ export class RepoService implements Startable {
               ;(message as any).cluster = (cluster as any[]).map(p => p.toString?.() ?? String(p))
               const selfId = (this.components as any).libp2p.peerId
               const isMember = cluster.some((p: any) => peersEqual(p, selfId))
-              if (!isMember) {
+              const smallMesh = cluster.length < this.k
+              if (!smallMesh && !isMember) {
                 const peers = cluster.filter((p: any) => !peersEqual(p, selfId))
                 response = encodePeers(peers.map((pid: any) => ({ id: pid.toString(), addrs: [] })))
               } else {
@@ -139,7 +139,8 @@ export class RepoService implements Startable {
               ;(message as any).cluster = (cluster as any[]).map(p => p.toString?.() ?? String(p))
               const selfId = (this.components as any).libp2p.peerId
               const isMember = cluster.some((p: any) => peersEqual(p, selfId))
-              if (!isMember) {
+              const smallMesh = cluster.length < this.k
+              if (!smallMesh && !isMember) {
                 const peers = cluster.filter((p: any) => !peersEqual(p, selfId))
                 response = encodePeers(peers.map((pid: any) => ({ id: pid.toString(), addrs: [] })))
               } else {
@@ -163,7 +164,8 @@ export class RepoService implements Startable {
               ;(message as any).cluster = (cluster as any[]).map(p => p.toString?.() ?? String(p))
               const selfId = (this.components as any).libp2p.peerId
               const isMember = cluster.some((p: any) => peersEqual(p, selfId))
-              if (!isMember) {
+              const smallMesh = cluster.length < this.k
+              if (!smallMesh && !isMember) {
                 const peers = cluster.filter((p: any) => !peersEqual(p, selfId))
                 response = encodePeers(peers.map((pid: any) => ({ id: pid.toString(), addrs: [] })))
               } else {

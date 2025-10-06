@@ -104,9 +104,21 @@ If a revision is requested that is not materialized, the block storage will mate
 
 Block Storage may choose to sweep old revisions and materialized blocks to free up space.  If an older revision is needed, the storage system will attempt to retrieve it from an archive.
 
-## Archival Storage
+## Archival Storage & Block Restoration
 
 Optimystic's archival storage system, called **Arachnode**, organizes storage nodes into concentric rings, with each ring representing progressively finer partitions of the keyspace. The outermost ring, called Ring Zulu, handles transactions and dynamic ranges based on an overlap factor rather than specific partition boundaries. Any storage nodes in the innermost ring, ring 0, would store the entire keyspace, while nodes in outer rings manage smaller, more specific portions of the keyspace. This design allows nodes to adjust their range responsibility based on storage capacity, dynamically shifting to more granular rings when needed.
+
+### Ring Zulu Implementation
+
+**Ring Zulu** providing automatic block restoration from cluster peers. When a node is missing a block or specific revision:
+
+1. The block ID is hashed to a content-addressed coordinate
+2. FRET's `assembleCohort()` identifies nearest cluster peers
+3. Peers are queried in order (connected first, closest by distance)
+4. The first peer with the block provides a `BlockArchive` for restoration
+5. If Ring Zulu peers don't have the block, the query falls back to Ring N, etc.
+
+This hierarchical restoration system ensures data availability and resilience while leveraging the existing FRET overlay for peer discovery. The same mechanism used for transaction coordination now enables efficient block recovery.
 
 Nodes in Arachnode maintain references to neighboring nodes within their ring and across adjacent inner and outer rings to facilitate data propagation and retrieval. As storage capacity reaches its limit, a node moves outward, adjusting its range and offloading excess data to nodes in the inner rings. This self-organizing system balances load across the rings, with global demand monitored through overlap factor sampling. This adaptive structure provides scalable, efficient storage management, with nodes dynamically adjusting their participation in rings to meet the system's overall storage and processing needs.
 

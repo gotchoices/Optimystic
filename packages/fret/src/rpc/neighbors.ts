@@ -8,6 +8,9 @@ import {
 } from './protocols.js';
 import type { NeighborSnapshotV1 } from '../index.js';
 import type { Stream } from '@libp2p/interface';
+import { createLogger } from '../logger.js';
+
+const log = createLogger('rpc:neighbors');
 
 export function registerNeighbors(
 	node: Libp2p,
@@ -23,6 +26,7 @@ export function registerNeighbors(
 					yield await encodeJson(snap);
 				})()
 			);
+			try { (stream as any).close?.(); } catch { }
 		} catch (err) {
 			console.error('neighbors handler error:', err);
 		}
@@ -40,6 +44,7 @@ export function registerNeighbors(
 						yield await encodeJson({ ok: true });
 					})()
 				);
+				try { (stream as any).close?.(); } catch { }
 			} catch (err) {
 				console.error('neighbors announce handler error:', err);
 			}
@@ -53,9 +58,20 @@ export async function fetchNeighbors(
 	protocol = PROTOCOL_NEIGHBORS
 ): Promise<NeighborSnapshotV1> {
 	const pid = peerIdFromString(peerIdOrStr);
-	const stream = await node.dialProtocol(pid, [protocol]);
-	const bytes = await readAll(stream);
-	return await decodeJson<NeighborSnapshotV1>(bytes);
+	// Prefer existing connection stream to avoid dials
+	const conns = (node as any).getConnections?.(pid) ?? [];
+	if (!Array.isArray(conns) || conns.length === 0 || typeof conns[0]?.newStream !== 'function') {
+		// No existing connection - skip to reduce churn
+		return { v: 1, from: peerIdOrStr, timestamp: Date.now(), successors: [], predecessors: [], sig: '' } as NeighborSnapshotV1;
+	}
+	try {
+		const stream = await conns[0].newStream([protocol]);
+		const bytes = await readAll(stream);
+		return await decodeJson<NeighborSnapshotV1>(bytes);
+	} catch (err) {
+		log('fetchNeighbors decode failed for %s - %o', peerIdOrStr, err);
+		return { v: 1, from: peerIdOrStr, timestamp: Date.now(), successors: [], predecessors: [], sig: '' } as NeighborSnapshotV1;
+	}
 }
 
 export async function announceNeighbors(
@@ -65,18 +81,30 @@ export async function announceNeighbors(
 	protocol = PROTOCOL_NEIGHBORS_ANNOUNCE
 ): Promise<void> {
 	const pid = peerIdFromString(peerIdOrStr);
-	const stream = await node.dialProtocol(pid, [protocol]);
-	await stream.sink(
-		(async function* () {
-			yield await encodeJson(snapshot);
-		})()
-	);
+	const conns = (node as any).getConnections?.(pid) ?? [];
+	if (!Array.isArray(conns) || conns.length === 0 || typeof conns[0]?.newStream !== 'function') {
+		return; // skip if not connected
+	}
+	try {
+		const stream = await conns[0].newStream([protocol]);
+		await stream.sink(
+			(async function* () {
+				yield await encodeJson(snapshot);
+			})()
+		);
+		try { (stream as any).close?.(); } catch { }
+	} catch (err) { log('announceNeighbors failed to %s - %o', peerIdOrStr, err) }
 }
 
 function toBytes(chunk: unknown): Uint8Array {
 	if (chunk instanceof Uint8Array) return chunk;
-	const maybe = chunk as { subarray?: (start?: number, end?: number) => Uint8Array };
-	if (typeof maybe?.subarray === 'function') return maybe.subarray(0);
+	const maybe = chunk as { subarray?: (start?: number, end?: number) => Uint8Array } & ArrayBufferView;
+	if (typeof maybe?.subarray === 'function') {
+		try { return maybe.subarray(0); } catch (err) { log('toBytes subarray failed - %o', err) }
+	}
+	if (ArrayBuffer.isView(maybe)) {
+		return new Uint8Array(maybe.buffer, maybe.byteOffset, maybe.byteLength);
+	}
 	throw new Error('Unsupported chunk type in neighbors read');
 }
 

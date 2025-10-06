@@ -38,7 +38,13 @@ export async function sendLeave(
 	protocol = PROTOCOL_LEAVE
 ): Promise<void> {
 	const pid = peerIdFromString(peerIdStr);
-	const stream = await node.dialProtocol(pid, [protocol]);
+	const conns = (node as any).getConnections?.(pid) ?? [];
+	let stream: any;
+	if (Array.isArray(conns) && conns.length > 0 && typeof conns[0]?.newStream === 'function') {
+		stream = await conns[0].newStream([protocol]);
+	} else {
+		stream = await node.dialProtocol(pid, [protocol]);
+	}
 	await stream.sink(
 		(async function* () {
 			yield await encodeJson(notice);

@@ -61,8 +61,10 @@ export class NetworkTransactor implements ITransactor {
 				b => {
 					const status = b.request == null ? 'no-response' : (b.request.isResponse ? 'response' : 'in-flight')
 					return `${b.peerId.toString()}[block:${b.blockId}](${status})`
-				})
-			error = Error(`Some peers did not complete: ${details}`);
+				});
+			const aggregate = new Error(`Some peers did not complete: ${details}${error ? `; root: ${error.message}` : ''}`);
+			(aggregate as any).cause = error;
+			throw aggregate;
 		}
 
 		if (error) {
@@ -112,13 +114,13 @@ export class NetworkTransactor implements ITransactor {
 			);
 			// Cache resolved coordinators for follow-up commit to hit the same peers
 			try {
-				const maybeRecord = (this.keyNetwork as any)?.recordCoordinator;
-				if (typeof maybeRecord === 'function') {
+				const pn: any = this.keyNetwork as any;
+				if (typeof pn?.recordCoordinator === 'function') {
 					for (const b of Array.from(allBatches(batches))) {
-						maybeRecord(await blockIdToBytes(b.blockId), b.peerId);
+						pn.recordCoordinator(await blockIdToBytes(b.blockId), b.peerId);
 					}
 				}
-			} catch (e) { console.warn('⚠️ Failed to record coordinator hint'); }
+			} catch (e) { console.warn('Failed to record coordinator hint', e); }
 		} catch (e) {
 			error = e as Error;
 		}
@@ -129,8 +131,12 @@ export class NetworkTransactor implements ITransactor {
 				b => {
 					const status = b.request == null ? 'no-response' : (b.request.isResponse ? 'non-success' : 'in-flight')
 					return `${b.peerId.toString()}[block:${b.blockId}](${status})`
-				})
-			error = Error(`Some peers did not complete: ${details}`);
+				});
+			const aggregate = new Error(`Some peers did not complete: ${details}${error ? `; root: ${error.message}` : ''}`);
+			const prior = error;
+			(aggregate as any).cause = prior;
+			(aggregate as AggregateError).errors = prior ? [prior] : [];
+			error = aggregate;
 		}
 
 		if (error) { // If any failures, cancel all pending transactions as background microtask
@@ -239,9 +245,13 @@ export class NetworkTransactor implements ITransactor {
 				b => (b.request?.isResponse as boolean && (b.request as any).response?.success) ?? false,
 				b => {
 					const status = b.request == null ? 'no-response' : (b.request.isResponse ? 'non-success' : 'in-flight')
-					return `${b.peerId.toString()}[blocks:${b.payload instanceof Array ? (b.payload as any[]).length : 1}](${status})`
-				})
-			error = Error(`Some peers did not complete: ${details}`);
+					const resp: any = (b.request as any)?.response;
+					const extra = resp && resp.success === false ? (Array.isArray(resp.missing) ? ` missing=${resp.missing.length}` : ' success=false') : '';
+					return `${b.peerId.toString()}[blocks:${b.payload instanceof Array ? (b.payload as any[]).length : 1}](${status})${extra ? ' ' + extra : ''}`
+				});
+			const aggregate = new Error(`Some peers did not complete: ${details}${error ? `; root: ${error.message}` : ''}`);
+			(aggregate as any).cause = error;
+			error = aggregate;
 		}
 		return { batches, error };
 	};

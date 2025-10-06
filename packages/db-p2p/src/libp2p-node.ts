@@ -17,16 +17,31 @@ import type { IRawStorage } from './storage/i-raw-storage.js';
 import { multiaddr } from '@multiformats/multiaddr';
 import { networkManagerService } from './network/network-manager-service.js';
 import { fretService } from '@optimystic/fret';
+import { syncService } from './sync/service.js';
+import { RestorationCoordinator } from './storage/restoration-coordinator-v2.js';
+import { RingSelector } from './storage/ring-selector.js';
+import { StorageMonitor } from './storage/storage-monitor.js';
+import type { StorageMonitorConfig } from './storage/storage-monitor.js';
+import { ArachnodeFretAdapter } from './storage/arachnode-fret-adapter.js';
+import type { RestoreCallback } from './storage/struct.js';
+import type { FretService } from '@optimystic/fret';
 
 export type NodeOptions = {
 	port: number;
 	bootstrapNodes: string[];
 	networkName: string;
+	fretProfile?: 'edge' | 'core';
 	id?: string; // optional peer id
 	relay?: boolean; // enable relay service
 	storageType?: 'memory' | 'file'; // storage backend type
 	storagePath?: string; // path for file storage (required if storageType is 'file')
 	clusterSize?: number; // desired cluster size per key
+
+	/** Arachnode storage configuration */
+	arachnode?: {
+		enableRingZulu?: boolean; // default: true
+		storage?: StorageMonitorConfig;
+	};
 };
 
 export async function createLibp2pNode(options: NodeOptions): Promise<Libp2p> {
@@ -43,8 +58,15 @@ export async function createLibp2pNode(options: NodeOptions): Promise<Libp2p> {
 		rawStorage = new MemoryRawStorage();
 	}
 
-	// Create shared storage layers
-	const storageRepo = new StorageRepo((blockId) => new BlockStorage(blockId, rawStorage));
+	// Create placeholder restore callback (will be replaced after node starts)
+	let restoreCallback: RestoreCallback = async (_blockId, _rev?) => {
+		return undefined;
+	};
+
+	// Create shared storage layers with restoration callback
+	const storageRepo = new StorageRepo((blockId) =>
+		new BlockStorage(blockId, rawStorage, restoreCallback)
+	);
 
 	// Create cluster member logic
 	const clusterLogic = {
@@ -59,11 +81,18 @@ export async function createLibp2pNode(options: NodeOptions): Promise<Libp2p> {
 	const peerId = options.id ? await peerIdFromString(options.id) : undefined;
 
 	const libp2pOptions: any = {
+		start: false,
 		...(peerId ? { peerId } : {}),
 		addresses: {
 			listen: [`/ip4/0.0.0.0/tcp/${options.port}`]
 		},
-		connectionManager: { autoDial: true },
+		connectionManager: {
+			autoDial: false,
+			minConnections: 1,
+			maxConnections: 16,
+			inboundConnectionUpgradeTimeout: 10_000,
+			dialQueue: { concurrency: 2, attempts: 2 }
+		},
 		transports: [tcp()],
 		connectionEncrypters: [noise()],
 		streamMuxers: [yamux()],
@@ -72,7 +101,10 @@ export async function createLibp2pNode(options: NodeOptions): Promise<Libp2p> {
 				protocolPrefix: `/optimystic/${options.networkName}`
 			}),
 			ping: ping(),
-			pubsub: gossipsub(),
+			pubsub: gossipsub({
+				allowPublishToZeroTopicPeers: true,
+				heartbeatInterval: 7000
+			}),
 
 			// Custom services - create wrapper factories that inject dependencies
 			cluster: (components: any) => {
@@ -97,18 +129,29 @@ export async function createLibp2pNode(options: NodeOptions): Promise<Libp2p> {
 				});
 			},
 
+			sync: (components: any) => {
+				const serviceFactory = syncService({
+					protocolPrefix: `/optimystic/${options.networkName}`
+				});
+				return serviceFactory({
+					logger: components.logger,
+					registrar: components.registrar,
+					repo: storageRepo
+				});
+			},
+
 			networkManager: (components: any) => {
 				const svcFactory = networkManagerService({
 					clusterSize: options.clusterSize ?? 10,
 					expectedRemotes: (options.bootstrapNodes?.length ?? 0) > 0
-				})
-				return svcFactory(components)
+				});
+				return svcFactory(components);
 			},
 			fret: fretService({
 				k: 15,
 				m: 8,
 				capacity: 2048,
-				profile: (options.bootstrapNodes?.length ?? 0) > 0 ? 'core' : 'edge',
+				profile: options.fretProfile ?? 'edge',
 				networkName: options.networkName,
 				bootstraps: options.bootstrapNodes ?? []
 			})
@@ -121,19 +164,85 @@ export async function createLibp2pNode(options: NodeOptions): Promise<Libp2p> {
 
 	const node = await createLibp2p(libp2pOptions);
 
+	const fretServiceInstance = (node as any).services?.fret;
+	if (fretServiceInstance?.setLibp2p) {
+		fretServiceInstance.setLibp2p(node);
+	}
+
+	const networkManager = (node as any).services?.networkManager;
+	if (networkManager?.setLibp2p) {
+		networkManager.setLibp2p(node);
+	}
+
 	await node.start();
 
-	// Proactively dial bootstrap nodes to speed up connectivity
-	if (options.bootstrapNodes?.length) {
-		const log = (node as any).logger?.forComponent?.('db-p2p:bootstrap-dial');
-		for (const addr of options.bootstrapNodes) {
-			try {
-				await node.dial(multiaddr(addr));
-			} catch (e) {
-				log?.warn?.('dial to bootstrap %s failed: %o', addr, e);
-			}
+	// Initialize Arachnode ring membership and restoration
+	const enableArachnode = options.arachnode?.enableRingZulu ?? true;
+	if (enableArachnode) {
+		const log = (node as any).logger?.forComponent?.('db-p2p:arachnode');
+		const fret = (node as any).services?.fret as any;
+
+		if (fret) {
+			const fretAdapter = new ArachnodeFretAdapter(fret);
+
+			const storageMonitor = new StorageMonitor(rawStorage, options.arachnode?.storage ?? {});
+			const ringSelector = new RingSelector(fretAdapter, storageMonitor, {
+				minCapacity: 100 * 1024 * 1024, // 100MB minimum
+				thresholds: {
+					moveOut: 0.85,
+					moveIn: 0.40
+				}
+			});
+
+			// Determine and announce ring membership
+			const peerId = node.peerId.toString();
+			const arachnodeInfo = await ringSelector.createArachnodeInfo(peerId);
+			fretAdapter.setArachnodeInfo(arachnodeInfo);
+
+			log?.('Announced Arachnode membership: Ring %d', arachnodeInfo.ringDepth);
+
+			// Setup restoration coordinator with FRET adapter
+			const restorationCoordinatorV2 = new RestorationCoordinator(
+				fretAdapter,
+				{ connect: (pid, protocol) => node.dialProtocol(pid, [protocol]) },
+				`/optimystic/${options.networkName}`
+			);
+
+			// Update restore callback to use new coordinator
+			const newRestoreCallback: RestoreCallback = async (blockId, rev?) => {
+				return await restorationCoordinatorV2.restore(blockId, rev);
+			};
+
+			// Replace the restore callback (this is a bit hacky, but works for now)
+			// In production, we'd want to properly manage this
+			(storageRepo as any).createBlockStorage = (blockId: string) =>
+				new BlockStorage(blockId, rawStorage, newRestoreCallback);
+
+			// Monitor capacity and adjust ring periodically
+			const monitorInterval = setInterval(async () => {
+				const transition = await ringSelector.shouldTransition();
+				if (transition.shouldMove) {
+					log?.('Ring transition needed: moving %s to Ring %d',
+						transition.direction, transition.newRingDepth);
+
+					// Update Arachnode info with new ring
+					const updatedInfo = await ringSelector.createArachnodeInfo(peerId);
+					fretAdapter.setArachnodeInfo(updatedInfo);
+				}
+			}, 60_000); // Check every minute
+
+			// Cleanup on node stop
+			const originalStop = node.stop.bind(node);
+			node.stop = async () => {
+				clearInterval(monitorInterval);
+				await originalStop();
+			};
+		} else {
+			log?.('FRET service not available, Arachnode disabled');
 		}
 	}
+
+	// Skip proactive bootstrap dials; rely on discovery and minimal churn
 
 	return node;
 }

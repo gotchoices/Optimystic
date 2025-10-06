@@ -1,6 +1,9 @@
 import type { Libp2p } from 'libp2p';
 import { peerIdFromString } from '@libp2p/peer-id';
 import { PROTOCOL_PING, encodeJson, decodeJson } from './protocols.js';
+import { createLogger } from '../logger.js';
+
+const log = createLogger('rpc:ping');
 
 export function registerPing(node: Libp2p, protocol = PROTOCOL_PING): void {
 	node.handle(protocol, async ({ stream }) => {
@@ -13,22 +16,52 @@ export function registerPing(node: Libp2p, protocol = PROTOCOL_PING): void {
 }
 
 export async function sendPing(node: Libp2p, peer: string, protocol = PROTOCOL_PING): Promise<{ ok: boolean; rttMs: number }> {
-    const start = Date.now();
-    const pid = peerIdFromString(peer);
-    const conn = await (node as any).dialProtocol(pid, [protocol]);
-    const stream = conn.stream ?? conn;
-    const chunks: Uint8Array[] = [];
-    for await (const chunk of stream.source) {
-        if (chunk?.subarray) chunks.push(chunk);
-    }
-    // Some libp2p implementations may send empty frames before actual data; guard decode
-    const body = concat(chunks);
-    if (body.length === 0) return { ok: false, rttMs: Math.max(0, Date.now() - start) };
-    // Check for whitespace-only responses
-    const text = new TextDecoder().decode(body).trim();
-    if (text.length === 0) return { ok: false, rttMs: Math.max(0, Date.now() - start) };
-    const res = await decodeJson<{ ok: boolean }>(body);
-    return { ok: Boolean(res.ok), rttMs: Math.max(0, Date.now() - start) };
+	const start = Date.now();
+	const pid = peerIdFromString(peer);
+	let stream: any;
+	try {
+		const conns = (node as any).getConnections?.(pid) ?? [];
+		if (Array.isArray(conns) && conns.length > 0 && typeof conns[0]?.newStream === 'function') {
+			stream = await conns[0].newStream([protocol]);
+		} else {
+			const conn = await (node as any).dialProtocol(pid, [protocol]);
+			stream = (conn as any).stream ?? conn;
+		}
+	} catch (e) {
+		// fallback to dial if newStream path failed
+		const conn = await (node as any).dialProtocol(pid, [protocol]);
+		stream = (conn as any).stream ?? conn;
+	}
+	let first: Uint8Array | null = null;
+	for await (const chunk of stream.source) {
+		if (chunk == null) continue;
+		try {
+			if (chunk instanceof Uint8Array) { first = chunk; break; }
+			if (typeof (chunk as any).subarray === 'function') {
+				const maybe = (chunk as any).subarray();
+				if (maybe instanceof Uint8Array) { first = maybe; break; }
+				if (ArrayBuffer.isView(maybe)) {
+					first = new Uint8Array(maybe.buffer, maybe.byteOffset, maybe.byteLength);
+					break;
+				}
+			}
+			if (ArrayBuffer.isView(chunk)) {
+				first = new Uint8Array((chunk as ArrayBufferView).buffer, (chunk as ArrayBufferView).byteOffset, (chunk as ArrayBufferView).byteLength);
+				break;
+			}
+		} catch (err) { log('sendPing chunk handling failed - %o', err) }
+	}
+	const rttMs = Math.max(0, Date.now() - start);
+	if (!first || first.length === 0) return { ok: false, rttMs };
+	const text = new TextDecoder().decode(first).trim();
+	if (!text || text[0] !== '{' || !text.endsWith('}')) return { ok: false, rttMs };
+	try {
+		const res = await decodeJson<{ ok: boolean }>(first);
+		return { ok: Boolean(res.ok), rttMs };
+	} catch (err) {
+		log('sendPing decode failed - %o', err)
+		return { ok: false, rttMs };
+	}
 }
 
 function concat(chunks: Uint8Array[]): Uint8Array {

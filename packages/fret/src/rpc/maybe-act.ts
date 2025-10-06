@@ -32,7 +32,13 @@ export async function sendMaybeAct(
 	protocol = PROTOCOL_MAYBE_ACT
 ): Promise<NearAnchorV1 | { commitCertificate: string }> {
 	const pid = peerIdFromString(peerIdStr);
-	const stream = await node.dialProtocol(pid, [protocol]);
+	const conns = (node as any).getConnections?.(pid) ?? [];
+	let stream: any;
+	if (Array.isArray(conns) && conns.length > 0 && typeof conns[0]?.newStream === 'function') {
+		stream = await conns[0].newStream([protocol]);
+	} else {
+		stream = await node.dialProtocol(pid, [protocol]);
+	}
 	await stream.sink(
 		(async function* () {
 			yield await encodeJson(msg);

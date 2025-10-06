@@ -12,6 +12,7 @@ export interface PeerEntry {
 	successCount: number;
 	failureCount: number;
 	avgLatencyMs: number;
+	metadata?: Record<string, any>;
 }
 
 function coordToHex(coord: Uint8Array): string {

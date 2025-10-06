@@ -6,7 +6,8 @@ Optimystic is a distributed database system built on peer-to-peer networks. It p
 
 * **Distributed Database Core** - Transactional database with ACID properties across peer-to-peer networks
 * **Block-based Storage** - Versioned data blocks with efficient storage and retrieval
-* **Matchmaking System** - Efficient peer discovery and task coordination
+* **Block Restoration** - Automatic recovery of missing blocks from cluster peers (Ring Zulu)
+* **Matchmaking System** - Efficient peer discovery and task coordination via FRET
 * **Archival Storage** - Scalable long-term storage through the Arachnode system
 * **Cross-Collection Transactions** - Support for complex operations spanning multiple data collections
 
@@ -14,14 +15,16 @@ See the following documentation:
 
 * [Technical Architecture](docs/architecture.md)
 * [Distributed Database System](docs/optimystic.md)
-* [Matchmaking](docs/matchmaking.md)
-* [Storage Architecture](docs/arachnode.md)
+* [FRET DHT System](docs/fret.md)
+* [Storage Architecture (Arachnode)](docs/arachnode.md)
+* [Ring Zulu Integration](docs/ring-zulu-integration.md)
 * [Block Repository](docs/repository.md)
 
 ## Packages
 
 * **Database Core** - packages/db-core - Database core functionality, not specific to any particular storage topology
-* **Database P2P** - packages/db-p2p - Database integration with libp2p
+* **Database P2P** - packages/db-p2p - Database integration with libp2p, including Arachnode ring discovery
+* **FRET** - packages/fret - Finger Ring Ensemble Topology DHT for efficient peer discovery
 * **Test Peer** - packages/test-peer - CLI for testing peer-to-peer functionality
 * **Vinz** - packages/vinz - Library for threshold cryptography
 

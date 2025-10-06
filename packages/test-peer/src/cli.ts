@@ -1,11 +1,14 @@
 #!/usr/bin/env node
 import { Command } from 'commander';
-import { getNetworkManager, createLibp2pNode, StorageRepo, BlockStorage, MemoryRawStorage, FileRawStorage, Libp2pKeyPeerNetwork, RepoClient } from '@optimystic/db-p2p';
+import debug from 'debug';
+import { getNetworkManager, createLibp2pNode, StorageRepo, BlockStorage, MemoryRawStorage, FileRawStorage, Libp2pKeyPeerNetwork, RepoClient, ArachnodeFretAdapter } from '@optimystic/db-p2p';
 import { Diary, NetworkTransactor, BTree, ITransactor, BlockGets, GetBlockResults, TrxBlocks, BlockTrxStatus, PendRequest, PendResult, CommitRequest, CommitResult } from '@optimystic/db-core';
 import * as readline from 'readline';
 import * as path from 'path';
 import * as fs from 'fs';
 import { randomBytes } from 'node:crypto';
+
+const logDebug = debug('optimystic:test-peer');
 
 // Simple local transactor for single-node scenarios
 class LocalTransactor implements ITransactor {
@@ -45,6 +48,24 @@ class TestPeerSession {
 	private session: NetworkSession | null = null;
 	private rl: readline.Interface | null = null;
 
+	private parseStorageCapacity(options: { storageCapacity?: string }): number | undefined {
+		if (!options.storageCapacity) return undefined;
+		const parsed = Number(options.storageCapacity);
+		if (!Number.isFinite(parsed) || parsed <= 0) {
+			throw new Error('--storage-capacity must be a positive number of bytes');
+		}
+		return parsed;
+	}
+
+	private buildArachnodeOptions(storageCapacityBytes?: number) {
+		return {
+			enableRingZulu: true,
+			storage: {
+				totalBytes: storageCapacityBytes
+			}
+		};
+	}
+
 	private async waitForFirstConnection(node: any, timeoutMs: number): Promise<void> {
 		if (node.getConnections().length > 0) return;
 		await new Promise<void>((resolve) => {
@@ -71,19 +92,52 @@ class TestPeerSession {
 			const fret = (node as any).services?.fret;
 			if (!fret) {
 				console.log('⚠️  FRET service not available');
+				logDebug('FRET service missing on node');
 				return;
 			}
 
 			const hadConn = node.getConnections().length > 0;
 			if (!hadConn) {
 				console.log('🔗 No connections yet, skipping FRET warm-up');
+				logDebug('skipping FRET ready check - no connections');
 				return;
 			}
 
+			if (typeof fret.ready !== 'function') {
+				console.log('⚠️  FRET service does not expose ready()');
+				logDebug('FRET ready() not present, skipping wait');
+				return;
+			}
+			logDebug('waiting for FRET ready');
 			await fret.ready();
 			console.log('✅ FRET service ready');
 		} catch (error) {
 			console.warn('⚠️ FRET readiness check issue:', error);
+			logDebug('FRET readiness check issue', error);
+		}
+	}
+
+	private logRingInfo(node: any, totalCapacityOverride?: number): void {
+		const fret = (node as any).services?.fret;
+		if (!fret) {
+			logDebug('ring info unavailable (no FRET service)');
+			return;
+		}
+		const adapter = new ArachnodeFretAdapter(fret);
+		const myInfo = adapter.getMyArachnodeInfo();
+		if (myInfo) {
+			logDebug('local arachnode info', myInfo);
+		} else {
+			logDebug('no arachnode info published yet');
+		}
+		const rings = adapter.getKnownRings();
+		const stats = adapter.getRingStats();
+		logDebug('discovered ring depths', rings);
+		if (stats.length) {
+			logDebug('ring statistics', stats);
+		}
+		if (totalCapacityOverride) {
+			logDebug('storage capacity override active', { bytes: totalCapacityOverride });
 		}
 	}
 
@@ -105,8 +159,10 @@ class TestPeerSession {
 		id?: string;
 		relay?: boolean;
 		network?: string;
+		fretProfile?: 'edge' | 'core';
 		storage?: 'memory' | 'file';
 		storagePath?: string;
+		storageCapacity?: string;
 		announceFile?: string;
 		offline?: boolean;
 	}): Promise<void> {
@@ -146,15 +202,33 @@ class TestPeerSession {
 			}
 		}
 
-		// Create libp2p node
+		const storageCapacityBytes = this.parseStorageCapacity(options);
+		if (storageCapacityBytes) {
+			const humanReadable = storageCapacityBytes >= 1024 * 1024 * 1024 ? `${(storageCapacityBytes / (1024 * 1024 * 1024)).toFixed(2)} GB` : `${storageCapacityBytes} bytes`;
+			console.log(`📦 Storage capacity override set to ${humanReadable}`);
+			logDebug('storage capacity override set', { bytes: storageCapacityBytes, human: humanReadable });
+		}
+		logDebug('starting libp2p node', {
+			port: options.port,
+			bootstrapCount: bootstrapNodes.length,
+			storage: options.storage,
+			storagePath: options.storagePath,
+			storageCapacityBytes,
+			mode: options.offline ? 'offline' : 'distributed'
+		});
 		const node = await createLibp2pNode({
 			port: parseInt(options.port || '0'),
 			bootstrapNodes,
 			id: options.id,
 			relay: options.relay || false,
 			networkName: options.network || 'optimystic-test',
+			fretProfile: options.fretProfile,
 			storageType: options.storage || 'memory',
 			storagePath: options.storagePath,
+			arachnode: {
+				enableRingZulu: true,
+				storage: storageCapacityBytes ? { totalBytes: storageCapacityBytes } : undefined
+			}
 		});
 
 		console.log(`✅ Node started with ID: ${node.peerId.toString()}`);
@@ -213,6 +287,7 @@ class TestPeerSession {
 		};
 
 		console.log('✅ Distributed transaction system initialized');
+		logDebug('session initialized', { peerId: node.peerId.toString(), offline: isOffline, bootstrap: bootstrapNodes });
 
 		// Network manager readiness (service-based)
 		const nm = getNetworkManager(node);
@@ -220,12 +295,15 @@ class TestPeerSession {
 		if (bootstrapNodes.length > 0 && (nm as any).awaitHealthy) {
 			const ok = await (nm as any).awaitHealthy(1, 5000);
 			console.log(`🧭 Network ${ok ? 'healthy' : 'not healthy yet'} (remotes in peerStore=${ok ? '>=1' : '0'})`);
+			logDebug('network manager status', { healthy: ok, status: nm.getStatus?.() });
 		} else {
 			console.log('🧭 Network ready');
+			logDebug('network manager ready', { status: nm.getStatus?.() });
 		}
 
 		// Wait for FRET to be ready
 		await this.waitForFretReady(node);
+		this.logRingInfo(node, storageCapacityBytes);
 
 		// Optionally announce node info to a file for launchers/mesh setups
 		if (options.announceFile) {
@@ -251,6 +329,7 @@ class TestPeerSession {
 			console.log('🔄 Bootstrapping to network...');
 			await new Promise(resolve => setTimeout(resolve, 2000));
 			console.log('✅ Network bootstrap complete');
+			this.logRingInfo(node, storageCapacityBytes);
 		}
 	}
 
@@ -487,8 +566,10 @@ program
 	.option('-i, --id <string>', 'Peer ID')
 	.option('-r, --relay', 'Enable relay service')
 	.option('-n, --network <string>', 'Network name', 'optimystic-test')
+	.option('--fret-profile <profile>', "FRET profile: 'edge' or 'core'", 'edge')
 	.option('-s, --storage <type>', 'Storage type: memory or file', 'memory')
 	.option('--storage-path <path>', 'Path for file storage')
+	.option('--storage-capacity <bytes>', 'Override storage capacity in bytes (for ring selection)')
 	.option('--bootstrap-file <path>', 'Path to JSON containing bootstrap multiaddrs or node list')
 	.option('--announce-file <path>', 'Write node info (peerId, multiaddrs) to this JSON file for mesh launchers')
 	.action(async (options) => {
@@ -516,8 +597,10 @@ program
 	.option('-i, --id <string>', 'Peer ID')
 	.option('-r, --relay', 'Enable relay service')
 	.option('-n, --network <string>', 'Network name', 'optimystic-test')
+	.option('--fret-profile <profile>', "FRET profile: 'edge' or 'core'", 'edge')
 	.option('-s, --storage <type>', 'Storage type: memory or file', 'memory')
 	.option('--storage-path <path>', 'Path for file storage')
+	.option('--storage-capacity <bytes>', 'Override storage capacity in bytes (for ring selection)')
 	.option('--announce-file <path>', 'Write node info (peerId, multiaddrs) to this JSON file for mesh launchers')
 	.action(async (options) => {
 		try {
@@ -544,8 +627,10 @@ program
 	.option('-i, --id <string>', 'Peer ID')
 	.option('-r, --relay', 'Enable relay service')
 	.option('-n, --network <string>', 'Network name', 'optimystic-test')
+	.option('--fret-profile <profile>', "FRET profile: 'edge' or 'core'", 'edge')
 	.option('-s, --storage <type>', 'Storage type: memory or file', 'memory')
 	.option('--storage-path <path>', 'Path for file storage')
+	.option('--storage-capacity <bytes>', 'Override storage capacity in bytes (for ring selection)')
 	.option('--bootstrap-file <path>', 'Path to JSON containing bootstrap multiaddrs or node list')
 	.option('--stay-connected', 'Stay connected after action completes')
 	.option('--announce-file <path>', 'Write node info (peerId, multiaddrs) to this JSON file for mesh launchers')

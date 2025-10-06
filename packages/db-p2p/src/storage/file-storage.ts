@@ -3,6 +3,9 @@ import * as path from 'path';
 import type { BlockId, IBlock, Transform, TrxId, TrxRev } from "@optimystic/db-core";
 import type { BlockMetadata } from "./struct.js";
 import type { IRawStorage } from "./i-raw-storage.js";
+import { createLogger } from '../logger.js'
+
+const log = createLogger('storage:file')
 
 export class FileRawStorage implements IRawStorage {
 	constructor(private readonly basePath: string) {
@@ -45,15 +48,16 @@ export class FileRawStorage implements IRawStorage {
 	async deletePendingTransaction(blockId: BlockId, trxId: TrxId): Promise<void> {
 		const pendingPath = this.getPendingTrxPath(blockId, trxId);
 		await fs.unlink(pendingPath)
-			.catch(() => {
+			.catch((err) => {
 				// Ignore if file doesn't exist
+				if ((err as any)?.code !== 'ENOENT') log('deletePendingTransaction unlink failed for %s/%s - %o', blockId, trxId, err)
 			});
 	}
 
 	async *listPendingTransactions(blockId: BlockId): AsyncIterable<TrxId> {
 		const pendingPath = path.join(this.getBlockPath(blockId), 'pend');
 
-		const files = await fs.readdir(pendingPath).catch(() => [] as string[]);
+		const files = await fs.readdir(pendingPath).catch((err) => { log('listPendingTransactions readdir failed for %s - %o', blockId, err); return [] as string[] });
 		for (const file of files) {
 			if (!file.endsWith('.json')) continue;
 			const rawTrxId = file.slice(0, -5);
@@ -95,8 +99,9 @@ export class FileRawStorage implements IRawStorage {
 			);
 		} else {
 			await fs.unlink(this.getMaterializedPath(blockId, trxId))
-				.catch(() => {
+				.catch((err) => {
 					// Ignore if file doesn't exist
+					if ((err as any)?.code !== 'ENOENT') log('saveMaterializedBlock unlink failed for %s/%s - %o', blockId, trxId, err)
 				});
 		}
 	}
@@ -113,6 +118,7 @@ export class FileRawStorage implements IRawStorage {
 				if (err.code === 'ENOENT') {
 					throw new Error(`Pending transaction ${trxId} not found for block ${blockId}`);
 				}
+				log('promotePendingTransaction rename failed for %s/%s - %o', blockId, trxId, err)
 				throw err;
 			});
 	}

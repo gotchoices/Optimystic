@@ -30,6 +30,9 @@ import {
     recordFailure as scoreFailure,
     type SparsityModel,
 } from '../store/relevance.js';
+import { createLogger } from '../logger.js';
+
+const log = createLogger('service:fret');
 
 interface WithPeerStore {
 	peerStore?: { getPeers?: () => Array<{ id: PeerId }> };
@@ -51,6 +54,7 @@ export class FretService implements IFretService, Startable {
 	private cachedSelfCoord: Uint8Array | null = null;
 	private preconnectRunning = false;
 	private readonly protocols: ReturnType<typeof import('../rpc/protocols.js').makeProtocols>;
+	private metadata?: Record<string, any>;
 	private readonly diag = {
 		peersDiscovered: 0,
 		snapshotsFetched: 0,
@@ -160,7 +164,7 @@ export class FretService implements IFretService, Startable {
 		this.node.addEventListener('peer:connect', async (evt: any) => {
 			if (this.postBootstrapAnnounced) return;
 			this.postBootstrapAnnounced = true;
-			try { await this.announceNeighborsBounded(8); } catch {}
+			try { await this.announceNeighborsBounded(8); } catch (err) { log('postBootstrap announce failed - %o', err) }
 		});
 		this.node.addEventListener('peer:connect', async (evt: any) => {
 			try {
@@ -169,7 +173,7 @@ export class FretService implements IFretService, Startable {
 				const coord = this.store.getById(id)?.coord ?? (await hashPeerId(peerIdFromString(id)));
 				this.store.setState(id, 'connected');
 				await this.applyTouch(id, coord);
-			} catch {}
+			} catch (err) { log('peer:connect handler failed - %o', err) }
 		});
 		this.node.addEventListener('peer:disconnect', async (evt: any) => {
 			try {
@@ -178,7 +182,7 @@ export class FretService implements IFretService, Startable {
 				const coord = this.store.getById(id)?.coord ?? (await hashPeerId(peerIdFromString(id)));
 				this.store.setState(id, 'disconnected');
 				await this.applyFailure(id, coord);
-			} catch {}
+			} catch (err) { log('peer:disconnect handler failed - %o', err) }
 		});
 	}
 
@@ -294,10 +298,10 @@ export class FretService implements IFretService, Startable {
 			])).filter((id) => id !== selfStr);
 			for (const id of ids) {
 				if (this.isConnected(id) || this.hasAddresses(id)) {
-					try { await sendPing(this.node, id, this.protocols.PROTOCOL_PING); this.diag.pingsSent++; } catch {}
+					try { await sendPing(this.node, id, this.protocols.PROTOCOL_PING); this.diag.pingsSent++; } catch (err) { log('preconnectNeighbors ping failed for %s - %o', id, err) }
 				}
 			}
-		} catch {}
+		} catch (err) { log('preconnectNeighbors outer failed - %o', err) }
 	}
 
 	private startActivePreconnectLoop(): void {
@@ -315,10 +319,10 @@ export class FretService implements IFretService, Startable {
 				])).filter((id) => id !== selfStr).slice(0, budget);
 				for (const id of ids) {
 					if (this.isConnected(id) || this.hasAddresses(id)) {
-						try { await sendPing(this.node, id, this.protocols.PROTOCOL_PING); this.diag.pingsSent++; } catch {}
+						try { await sendPing(this.node, id, this.protocols.PROTOCOL_PING); this.diag.pingsSent++; } catch (err) { log('active preconnect ping failed for %s - %o', id, err) }
 					}
 				}
-			} catch {}
+			} catch (err) { log('active preconnect tick failed - %o', err) }
 			setTimeout(tick, 1000);
 		};
 		void tick();
@@ -334,9 +338,9 @@ export class FretService implements IFretService, Startable {
 			])).filter((id) => id !== selfStr).slice(0, 8);
 		const notice = { v: 1, from: this.node.peerId.toString(), timestamp: Date.now() } as const;
 		for (const id of ids) {
-			try { await sendLeave(this.node, id, notice, this.protocols.PROTOCOL_LEAVE); } catch {}
+			try { await sendLeave(this.node, id, notice, this.protocols.PROTOCOL_LEAVE); } catch (err) { log('sendLeave failed for %s - %o', id, err) }
 		}
-		} catch {}
+		} catch (err) { log('sendLeaveToNeighbors outer failed - %o', err) }
 	}
 
 	private async handleLeave(peerId: string): Promise<void> {
@@ -395,6 +399,14 @@ export class FretService implements IFretService, Startable {
 			if (!this.store.getById(from)) discovered.push(from);
 			this.store.upsert(from, selfCoord);
 			await this.applyTouch(from, selfCoord);
+
+			if (snap.metadata) {
+				const entry = this.store.getById(from);
+				if (entry) {
+					entry.metadata = snap.metadata;
+				}
+			}
+
 			for (const pid of [...(snap.successors ?? []), ...(snap.predecessors ?? [])]) {
 				try {
 					const coord = await hashPeerId(peerIdFromString(pid));
@@ -407,12 +419,12 @@ export class FretService implements IFretService, Startable {
 			}
 			// merge bounded sample if present
 			for (const s of snap.sample ?? []) {
-				try {
+					try {
 					const coord = u8FromString(s.coord, 'base64url');
 					if (!this.store.getById(s.id)) discovered.push(s.id);
 					this.store.upsert(s.id, coord);
 					await this.applyTouch(s.id, coord);
-				} catch {}
+					} catch (err) { log('mergeAnnounceSnapshot sample upsert failed for %s - %o', s.id, err) }
 			}
 			this.enforceCapacity();
 			this.emitDiscovered(discovered);
@@ -523,7 +535,8 @@ export class FretService implements IFretService, Startable {
 					this.diag.pingsFail++;
 				}
 			} catch (err) {
-				console.warn('ping failed for', id, err);
+				// benign during churn - do not warn each tick
+				// console.warn('ping failed for', id, err);
 				try {
 					const coord = this.store.getById(id)?.coord ?? (await hashPeerId(peerIdFromString(id)));
 					await this.applyFailure(id, coord);
@@ -554,13 +567,13 @@ export class FretService implements IFretService, Startable {
 					}
 				}
 				const capSample = this.cfg.profile === 'core' ? 8 : 6;
-				for (const s of (snap.sample ?? []).slice(0, capSample)) {
-					try {
+		for (const s of (snap.sample ?? []).slice(0, capSample)) {
+			try {
 						const coord = u8FromString(s.coord, 'base64url');
 						if (!this.store.getById(s.id)) announced.push(s.id);
 						this.store.upsert(s.id, coord);
 						await this.applyTouch(s.id, coord);
-					} catch {}
+				} catch (err) { log('mergeNeighborSnapshots sample upsert failed for %s - %o', s.id, err) }
 				}
 			} catch (err) {
 				console.warn('fetchNeighbors failed for', id, err);
@@ -597,6 +610,7 @@ export class FretService implements IFretService, Startable {
 			size_estimate: n,
 			confidence,
 			sig: '',
+			metadata: this.metadata,
 		};
 	}
 
@@ -752,5 +766,21 @@ export class FretService implements IFretService, Startable {
 
 	report(_evt: ReportEvent): void {
 		// no-op until reputation is enabled
+	}
+
+	setMetadata(metadata: Record<string, any>): void {
+		this.metadata = metadata;
+	}
+
+	getMetadata(peerId: string): Record<string, any> | undefined {
+		const entry = this.store.getById(peerId);
+		return entry?.metadata;
+	}
+
+	listPeers(): Array<{ id: string; metadata?: Record<string, any> }> {
+		return this.store.list().map(entry => ({
+			id: entry.id,
+			metadata: entry.metadata
+		}));
 	}
 }

@@ -425,8 +425,73 @@ For detailed information about specific components:
 - **[Repo Interface](./docs/repo.md)**: Distributed database operations
 - **[Cluster Consensus](./docs/cluster.md)**: 2-phase commit and distributed consensus
 
+## Block Restoration & Arachnode Integration
+
+The db-p2p package includes **dynamic Arachnode ring discovery** for automatic block restoration across storage tiers.
+
+### How Block Restoration Works
+
+When a node is missing a block or revision, the restoration system:
+
+1. **Determines storage rings** - Nodes self-select ring depth based on capacity
+2. **Discovers peers via FRET** - Ring membership propagates via existing neighbor exchange
+3. **Queries rings intelligently** - Tries transaction ring first, then inner storage rings
+4. **Filters by partition** - Only queries peers responsible for the block's keyspace
+
+### Ring Selection
+
+Nodes calculate their appropriate ring depth using:
+
+```
+ringDepth = ceil(-log2(available_capacity / estimated_demand))
+```
+
+**Examples:**
+- 100% coverage → Ring 0 (full keyspace)
+- 50% coverage → Ring 1 (2 partitions)  
+- 1% coverage → Ring 7 (128 partitions)
+
+### Architecture
+
+```
+FRET (Pure DHT)
+  - Generic metadata transport
+  - Peer discovery & routing
+  
+ArachnodeFretAdapter (Plugin Layer)
+  - Arachnode-specific semantics
+  - Ring discovery methods
+  
+Restoration Components
+  - RingSelector: Capacity-based ring selection
+  - RestorationCoordinator: Multi-ring queries
+  - StorageMonitor: Capacity tracking
+  - SyncService/Client: Block request protocol
+```
+
+### Configuration
+
+```typescript
+const node = await createLibp2pNode({
+    port: 9000,
+    networkName: 'mynet',
+    bootstrapNodes: ['...'],
+    clusterSize: 10,  // Cluster size for peer discovery
+    arachnode: {
+        enableRingZulu: true  // Default: enabled
+    }
+});
+```
+
+### Ring Transitions
+
+Nodes automatically transition between rings based on capacity thresholds:
+- **Move OUT** (to more granular ring) when > 85% capacity used
+- **Move IN** (to broader ring) when < 40% capacity used
+
 ## Related Packages
 
 - **[@optimystic/db-core](../db-core)**: Core database interfaces and local operations
 - **[@optimystic/db-quereus](../db-quereus)**: Query engine and data access patterns
+- **[@optimystic/fret](../fret)**: DHT implementation for peer discovery
 
