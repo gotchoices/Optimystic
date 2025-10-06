@@ -16,7 +16,7 @@ import { FileRawStorage } from './storage/file-storage.js';
 import type { IRawStorage } from './storage/i-raw-storage.js';
 import { multiaddr } from '@multiformats/multiaddr';
 import { networkManagerService } from './network/network-manager-service.js';
-import { fretService } from '@optimystic/fret';
+import { fretService, Libp2pFretService } from '@optimystic/fret';
 import { syncService } from './sync/service.js';
 import { RestorationCoordinator } from './storage/restoration-coordinator-v2.js';
 import { RingSelector } from './storage/ring-selector.js';
@@ -144,17 +144,24 @@ export async function createLibp2pNode(options: NodeOptions): Promise<Libp2p> {
 				const svcFactory = networkManagerService({
 					clusterSize: options.clusterSize ?? 10,
 					expectedRemotes: (options.bootstrapNodes?.length ?? 0) > 0
-				});
-				return svcFactory(components);
+				})
+				const svc = svcFactory(components)
+				try { (svc as any).setLibp2p?.(components.libp2p) } catch { }
+				return svc
 			},
-			fret: fretService({
-				k: 15,
-				m: 8,
-				capacity: 2048,
-				profile: options.fretProfile ?? 'edge',
-				networkName: options.networkName,
-				bootstraps: options.bootstrapNodes ?? []
-			})
+			fret: (components: any) => {
+				const svcFactory = fretService({
+					k: 15,
+					m: 8,
+					capacity: 2048,
+					profile: options.fretProfile ?? ((options.bootstrapNodes?.length ?? 0) > 0 ? 'core' : 'edge'),
+					networkName: options.networkName,
+					bootstraps: options.bootstrapNodes ?? []
+				});
+				const svc = svcFactory(components) as Libp2pFretService;
+				try { svc.setLibp2p(components.libp2p); } catch { }
+				return svc;
+			}
 		},
 		// Add bootstrap nodes as needed
 		peerDiscovery: [
@@ -164,15 +171,9 @@ export async function createLibp2pNode(options: NodeOptions): Promise<Libp2p> {
 
 	const node = await createLibp2p(libp2pOptions);
 
-	const fretServiceInstance = (node as any).services?.fret;
-	if (fretServiceInstance?.setLibp2p) {
-		fretServiceInstance.setLibp2p(node);
-	}
-
-	const networkManager = (node as any).services?.networkManager;
-	if (networkManager?.setLibp2p) {
-		networkManager.setLibp2p(node);
-	}
+	// Inject libp2p reference into services that need it before start
+	try { ((node as any).services?.fret as any)?.setLibp2p?.(node) } catch { }
+	try { ((node as any).services?.networkManager as any)?.setLibp2p?.(node) } catch { }
 
 	await node.start();
 
