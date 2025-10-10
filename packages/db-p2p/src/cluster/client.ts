@@ -18,10 +18,17 @@ export class ClusterClient extends ProtocolClient implements ICluster {
 			operation: 'update',
 			record
 		};
-    const response = await this.processMessage<any>(
-      message,
-      (this.protocolPrefix ?? '/db-p2p') + '/cluster/1.0.0'
-    );
+    const preferred = (this.protocolPrefix ?? '/db-p2p') + '/cluster/1.0.0'
+    let response: any
+    try {
+      response = await this.processMessage<any>(message, preferred)
+    } catch (err) {
+      if (preferred !== '/db-p2p/cluster/1.0.0') {
+        response = await this.processMessage<any>(message, '/db-p2p/cluster/1.0.0')
+      } else {
+        throw err
+      }
+    }
     if (response?.redirect?.peers?.length) {
       if (hop >= 2) {
         throw new Error('Redirect loop detected in ClusterClient (max hops reached)')

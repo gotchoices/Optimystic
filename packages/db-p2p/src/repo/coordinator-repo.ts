@@ -7,8 +7,8 @@ interface CoordinatorRepoComponents {
 	storageRepo: IRepo
 }
 
-export function coordinatorRepo(keyNetwork: IKeyNetwork, createClusterClient: (peerId: PeerId) => ClusterClient): (components: CoordinatorRepoComponents) => CoordinatorRepo {
-	return (components: CoordinatorRepoComponents) => new CoordinatorRepo(keyNetwork, createClusterClient, components.storageRepo);
+export function coordinatorRepo(keyNetwork: IKeyNetwork, createClusterClient: (peerId: PeerId) => ClusterClient, cfg?: { clusterSize?: number; allowClusterDownsize?: boolean; clusterSizeTolerance?: number }): (components: CoordinatorRepoComponents) => CoordinatorRepo {
+	return (components: CoordinatorRepoComponents) => new CoordinatorRepo(keyNetwork, createClusterClient, components.storageRepo, cfg);
 }
 
 /** Cluster coordination repo - uses local store, as well as distributes changes to other nodes using cluster consensus. */
@@ -20,9 +20,14 @@ export class CoordinatorRepo implements IRepo {
 		readonly keyNetwork: IKeyNetwork,
 		readonly createClusterClient: (peerId: PeerId) => ClusterClient,
 		private readonly storageRepo: IRepo,
+		cfg?: { clusterSize?: number; allowClusterDownsize?: boolean; clusterSizeTolerance?: number }
 	) {
-		// Cast KeyNetwork to IKeyNetwork to satisfy the type system
-		this.coordinator = new ClusterCoordinator(keyNetwork, createClusterClient);
+		const policy = {
+			clusterSize: cfg?.clusterSize ?? 10,
+			allowClusterDownsize: cfg?.allowClusterDownsize ?? true,
+			clusterSizeTolerance: cfg?.clusterSizeTolerance ?? 0.5
+		};
+		this.coordinator = new ClusterCoordinator(keyNetwork, createClusterClient, policy);
 	}
 
 	async get(blockGets: BlockGets, options?: MessageOptions): Promise<GetBlockResults> {
@@ -77,21 +82,17 @@ export class CoordinatorRepo implements IRepo {
 			expiration: options?.expiration ?? Date.now() + this.DEFAULT_TIMEOUT
 		};
 
+		const peerCount = await this.coordinator.getClusterSize(blockIds[0]!)
+		if (peerCount <= 1) {
+			return await this.storageRepo.pend(request, options)
+		}
+
 		try {
-			// For each block ID, execute a cluster transaction
-			const clusterPromises = blockIds.map(blockId =>
-				this.coordinator.executeClusterTransaction(blockId, message, options)
-			);
-
-			// Wait for all cluster transactions to complete
-			const results = await Promise.all(clusterPromises);
-
-			// If all cluster transactions succeeded, apply the pend to the local store
-			return await this.storageRepo.pend(request, options);
+			await Promise.all(blockIds.map(blockId => this.coordinator.executeClusterTransaction(blockId, message, options)))
+			return await this.storageRepo.pend(request, options)
 		} catch (error) {
-			// If any transaction fails, we should attempt to cancel the successful ones
-			console.error('Failed to complete pend operation:', error);
-			throw error;
+			console.error('Failed to complete pend operation:', error)
+			throw error
 		}
 	}
 
@@ -136,20 +137,17 @@ export class CoordinatorRepo implements IRepo {
 			expiration: options?.expiration ?? Date.now() + this.DEFAULT_TIMEOUT
 		};
 
+		const peerCount = await this.coordinator.getClusterSize(blockIds[0]!)
+		if (peerCount <= 1) {
+			return await this.storageRepo.commit(request, options)
+		}
 		try {
-			// For each block ID, execute a cluster transaction
-			const clusterPromises = blockIds.map(blockId =>
-				this.coordinator.executeClusterTransaction(blockId, message, options)
-			);
-
-			// Wait for all cluster transactions to complete
-			await Promise.all(clusterPromises);
-
-			// If all cluster transactions succeeded, apply the commit to the local store
-			return await this.storageRepo.commit(request, options);
+			const clusterPromises = blockIds.map(blockId => this.coordinator.executeClusterTransaction(blockId, message, options))
+			await Promise.all(clusterPromises)
+			return await this.storageRepo.commit(request, options)
 		} catch (error) {
-			console.error('Failed to complete commit operation:', error);
-			throw error;
+			console.error('Failed to complete commit operation:', error)
+			throw error
 		}
 	}
 }

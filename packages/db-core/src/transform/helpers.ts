@@ -3,7 +3,7 @@ import type { BlockId, BlockOperation, BlockOperations, BlockStore, IBlock, Tran
 /** Mutates the given block with a copy of the given operation */
 export function applyOperation(block: IBlock, [entity, index, deleteCount, inserted]: BlockOperation) {
 	if (Array.isArray(inserted)) {
-    (block as unknown as any)[entity].splice(index, deleteCount, ...structuredClone(inserted));
+		(block as unknown as any)[entity].splice(index, deleteCount, ...structuredClone(inserted));
 	} else {
 		(block as unknown as any)[entity] = structuredClone(inserted);
 	}
@@ -28,32 +28,34 @@ export function withOperation(block: IBlock, [entity, index, deleteCount, insert
 
 /** The set of distinct block ids affected by the transform */
 export function blockIdsForTransforms(transforms: Transforms | undefined) {
-	return !transforms
-			? []
-			: [...new Set([...Object.keys(transforms.inserts), ...Object.keys(transforms.updates), ...transforms.deletes])];
+	if (!transforms) return [];
+	const insertIds = Object.keys(transforms.inserts ?? {});
+	const updateIds = Object.keys(transforms.updates ?? {});
+	const deleteIds = transforms.deletes ?? [];
+	return [...new Set([...insertIds, ...updateIds, ...deleteIds])];
 }
 
 /** Returns an empty transform */
 export function emptyTransforms(): Transforms {
-	return { inserts: {}, updates: {}, deletes: new Set() };
+	return { inserts: {}, updates: {}, deletes: [] };
 }
 
 export function copyTransforms(transform: Transforms): Transforms {
-	return { inserts: { ...transform.inserts }, updates: { ...transform.updates }, deletes: new Set(transform.deletes) };
+	return { inserts: { ...transform.inserts }, updates: { ...transform.updates }, deletes: transform.deletes };
 }
 
 export function mergeTransforms(a: Transforms, b: Transforms): Transforms {
 	return {
 		inserts: { ...a.inserts, ...b.inserts },
 		updates: { ...a.updates, ...b.updates },
-		deletes: new Set([...a.deletes, ...b.deletes])
+		deletes: [...a.deletes, ...b.deletes]
 	};
 }
 
 export function isTransformsEmpty(transform: Transforms): boolean {
 	return Object.keys(transform.inserts).length === 0
 		&& Object.keys(transform.updates).length === 0
-		&& transform.deletes.size === 0;
+		&& transform.deletes.length === 0;
 }
 
 export function concatTransforms(...transforms: Transforms[]): Transforms {
@@ -71,9 +73,9 @@ export function transformForBlockId(transform: Transforms, blockId: BlockId): Tr
 
 export function transformsFromTransform(transform: Transform, blockId: BlockId): Transforms {
 	return {
-		...(transform.insert ? { inserts: { [blockId]: transform.insert } } : { inserts: {} }),
-		...(transform.updates ? { updates: { [blockId]: transform.updates } } : { updates: {} }),
-		...(transform.delete ? { deletes: new Set([blockId]) } : { deletes: new Set() })
+		inserts: transform.insert ? { [blockId]: transform.insert } : {},
+		updates: transform.updates ? { [blockId]: transform.updates } : {},
+		deletes: transform.delete ? [blockId] : []
 	};
 }
 
@@ -110,6 +112,6 @@ export function concatTransform(transforms: Transforms, blockId: BlockId, transf
 	return {
 		inserts: { ...transforms.inserts, ...(transform.insert ? { [blockId]: transform.insert } : {}) },
 		updates: { ...transforms.updates, ...(transform.updates ? { [blockId]: transform.updates } : {}) },
-		deletes: new Set([...transforms.deletes, ...(transform.delete ? [blockId] : [])])
+		deletes: [...transforms.deletes, ...(transform.delete ? [blockId] : [])]
 	};
 }

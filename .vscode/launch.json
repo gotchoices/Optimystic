@@ -52,6 +52,43 @@
       "skipFiles": [
         "<node_internals>/**"
       ]
+    },
+    {
+      "type": "node",
+      "request": "launch",
+      "name": "Debug Quick Test (3-node mesh)",
+      "program": "${workspaceFolder}/packages/test-peer/dist/test/quick-test.js",
+      "cwd": "${workspaceFolder}",
+      "env": {
+        "DEBUG": "optimystic:*,db-p2p:*"
+      },
+      "console": "integratedTerminal",
+      "internalConsoleOptions": "neverOpen",
+      "sourceMaps": true,
+      "skipFiles": [
+        "<node_internals>/**"
+      ]
+    },
+    {
+      "type": "node",
+      "request": "launch",
+      "name": "Debug Test Peer Tests",
+      "cwd": "${workspaceFolder}/packages/test-peer",
+      "program": "${workspaceFolder}/node_modules/aegir/src/index.js",
+      "args": [
+        "test",
+        "-t",
+        "node",
+        "--",
+        "--test-name-pattern",
+        "Distributed Diary"
+      ],
+      "console": "integratedTerminal",
+      "internalConsoleOptions": "neverOpen",
+      "sourceMaps": true,
+      "skipFiles": [
+        "<node_internals>/**"
+      ]
     }
   ],
   "compounds": [

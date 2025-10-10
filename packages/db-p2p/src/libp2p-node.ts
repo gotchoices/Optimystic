@@ -36,6 +36,10 @@ export type NodeOptions = {
 	storageType?: 'memory' | 'file'; // storage backend type
 	storagePath?: string; // path for file storage (required if storageType is 'file')
 	clusterSize?: number; // desired cluster size per key
+	clusterPolicy?: {
+		allowDownsize?: boolean;
+		sizeTolerance?: number; // acceptable relative difference (e.g. 0.5 = +/-50%)
+	};
 
 	/** Arachnode storage configuration */
 	arachnode?: {
@@ -109,7 +113,10 @@ export async function createLibp2pNode(options: NodeOptions): Promise<Libp2p> {
 			// Custom services - create wrapper factories that inject dependencies
 			cluster: (components: any) => {
 				const serviceFactory = clusterService({
-					protocolPrefix: `/optimystic/${options.networkName}`
+					protocolPrefix: `/optimystic/${options.networkName}`,
+					configuredClusterSize: options.clusterSize ?? 10,
+					allowClusterDownsize: options.clusterPolicy?.allowDownsize ?? true,
+					clusterSizeTolerance: options.clusterPolicy?.sizeTolerance ?? 0.5
 				});
 				return serviceFactory({
 					logger: components.logger,
@@ -143,7 +150,9 @@ export async function createLibp2pNode(options: NodeOptions): Promise<Libp2p> {
 			networkManager: (components: any) => {
 				const svcFactory = networkManagerService({
 					clusterSize: options.clusterSize ?? 10,
-					expectedRemotes: (options.bootstrapNodes?.length ?? 0) > 0
+					expectedRemotes: (options.bootstrapNodes?.length ?? 0) > 0,
+					allowClusterDownsize: options.clusterPolicy?.allowDownsize ?? true,
+					clusterSizeTolerance: options.clusterPolicy?.sizeTolerance ?? 0.5
 				})
 				const svc = svcFactory(components)
 				try { (svc as any).setLibp2p?.(components.libp2p) } catch { }

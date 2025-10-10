@@ -59,6 +59,23 @@ Optimystic is suitable for applications requiring:
 * **Audit Trails** - Immutable logs of system events and changes
 * **Decentralized Storage** - Resilient data storage without central points of failure
 
+## Testing
+
+An automated test suite with VS Code debugging is ready for use:
+
+```bash
+# Quick test with detailed output
+yarn workspace @optimystic/test-peer build
+yarn workspace @optimystic/test-peer test:quick
+```
+
+**📖 See [START-HERE.md](START-HERE.md) to begin using the automated test loop!**
+
+Additional documentation:
+- [TESTING-GUIDE.md](TESTING-GUIDE.md) - Comprehensive testing guide
+- [QUICK-REFERENCE.md](QUICK-REFERENCE.md) - Command reference
+- [packages/test-peer/test/README.md](packages/test-peer/test/README.md) - Test-specific docs
+
 ## Contributing
 
 If you would like to help out, the following skills will be most useful:

@@ -16,7 +16,7 @@ export class Tracker<T extends IBlock> implements IBlockStore<T> {
 		if (block) {
 			const ops = this.transforms.updates[id] ?? [];
 			ops.forEach(op => applyOperation(block!, op));
-			if (Object.hasOwn(this.transforms.deletes, id)) {
+			if (this.transforms.deletes?.includes(id)) {
 				return undefined;
 			}
 		} else if (Object.hasOwn(this.transforms.inserts, id)) {
@@ -36,7 +36,7 @@ export class Tracker<T extends IBlock> implements IBlockStore<T> {
 
 	insert(block: T) {
 		this.transforms.inserts[block.header.id] = structuredClone(block);
-		this.transforms.deletes.delete(block.header.id);
+		this.transforms.deletes.splice(this.transforms.deletes.indexOf(block.header.id), 1);
 	}
 
 	update(blockId: BlockId, op: BlockOperation) {
@@ -51,7 +51,7 @@ export class Tracker<T extends IBlock> implements IBlockStore<T> {
 	delete(blockId: BlockId) {
 		delete this.transforms.inserts[blockId];
 		delete this.transforms.updates[blockId];
-		this.transforms.deletes.add(blockId);
+		this.transforms.deletes.push(blockId);
 	}
 
 	reset(newTransform = emptyTransforms()) {

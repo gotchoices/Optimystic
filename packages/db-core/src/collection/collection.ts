@@ -132,7 +132,7 @@ export class Collection<TAction> implements ICollection<TAction> {
 				const staleFailure = await this.source.transact(tracker.transforms, trxId, newRev, this.id, addResult.tailPath.block.header.id);
 				if (staleFailure) {
 					if (staleFailure.pending) {
-						// Wait for short time to allow the pending transactions to commit
+						// Wait for short time to allow the pending transactions to commit (bounded backoff)
 						await new Promise(resolve => setTimeout(resolve, PendingRetryDelayMs));
 					}
 					await this.update();

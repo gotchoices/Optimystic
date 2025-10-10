@@ -38,27 +38,53 @@ export function makeBatchesByPeer<TPayload, TResponse>(
  * Iterates over all batches that have not completed, whether subsumed or not
  */
 export function* incompleteBatches<TPayload, TResponse>(batches: CoordinatorBatch<TPayload, TResponse>[]): IterableIterator<CoordinatorBatch<TPayload, TResponse>> {
-	for (const batch of batches) {
-		if (!batch.request || !batch.request.isResponse) yield batch;
-		if (batch.subsumedBy) yield* incompleteBatches(batch.subsumedBy);
-	}
+    const stack: CoordinatorBatch<TPayload, TResponse>[] = [...batches];
+    while (stack.length > 0) {
+        const batch = stack.pop()!;
+        if (!batch.request || !batch.request.isResponse) {
+            yield batch;
+        }
+        if (batch.subsumedBy && batch.subsumedBy.length) {
+            stack.push(...batch.subsumedBy);
+        }
+    }
 }
 
 /**
  * Checks if all completed batches (ignoring failures) satisfy a predicate
  */
 export function everyBatch<TPayload, TResponse>(batches: CoordinatorBatch<TPayload, TResponse>[], predicate: (batch: CoordinatorBatch<TPayload, TResponse>) => boolean): boolean {
-	return batches.every(b => (b.subsumedBy && everyBatch(b.subsumedBy, predicate)) || predicate(b));
+    // For each root batch require that SOME node in its retry tree satisfies the predicate.
+    // Use iterative DFS to avoid recursion depth and minimize allocations.
+    for (const root of batches) {
+        let found = false;
+        const stack: CoordinatorBatch<TPayload, TResponse>[] = [root];
+        while (stack.length > 0) {
+            const node = stack.pop()!;
+            if (predicate(node)) { found = true; break; }
+            if (node.subsumedBy && node.subsumedBy.length) {
+                for (let i = 0; i < node.subsumedBy.length; i++) stack.push(node.subsumedBy[i]!);
+            }
+        }
+        if (!found) return false;
+    }
+    return true;
 }
 
 /**
  * Iterates over all batches that satisfy an optional predicate, whether subsumed or not
  */
 export function* allBatches<TPayload, TResponse>(batches: CoordinatorBatch<TPayload, TResponse>[], predicate?: (batch: CoordinatorBatch<TPayload, TResponse>) => boolean): IterableIterator<CoordinatorBatch<TPayload, TResponse>> {
-	for (const batch of batches) {
-		if (!predicate || predicate(batch)) yield batch;
-		if (batch.subsumedBy) yield* allBatches(batch.subsumedBy, predicate);
-	}
+    const stack: CoordinatorBatch<TPayload, TResponse>[] = [...batches];
+    while (stack.length > 0) {
+        const batch = stack.pop()!;
+        if (!predicate || predicate(batch)) {
+            yield batch;
+        }
+        if (batch.subsumedBy && batch.subsumedBy.length) {
+            stack.push(...batch.subsumedBy);
+        }
+    }
 }
 
 /**
@@ -85,36 +111,41 @@ export async function processBatches<TPayload, TResponse>(
 	expiration: number,
 	findCoordinator: (blockId: BlockId, options: { excludedPeers: PeerId[] }) => Promise<PeerId>
 ): Promise<void> {
-	await Promise.all(batches.map(async (batch) => {
-		batch.request = new Pending(process(batch)
-			.catch(async e => {
-				// TODO: log failure
-				// logger.log(`operation failed for ${batch.peerId}`);
-				if (expiration > Date.now()) {
-					const excludedPeers = [batch.peerId, ...(batch.excludedPeers ?? [])];
-					// Redistribute failed attempts and append to original batches
-					const retries = await createBatchesForPayload<TPayload, TResponse>(
-						getBlockIds(batch),
-						batch.payload,
-						getBlockPayload,
-						excludedPeers,
-						findCoordinator
-					);
-					// Process the new attempts
-					if (retries.length > 0 && expiration > Date.now()) {
-						batch.subsumedBy = retries;
-						// Append new attempts to the original batches map
-						await processBatches(retries, process, getBlockIds, getBlockPayload, expiration, findCoordinator);
-					}
-				}
-				throw e;
-			}));
-	}));
+    // Root-map ensures retries are recorded on the original batch to avoid deep trees
+    const rootOf = new WeakMap<CoordinatorBatch<TPayload, TResponse>, CoordinatorBatch<TPayload, TResponse>>();
+    for (const b of batches) rootOf.set(b, b);
 
-	// Wait for all pending requests to settle (resolve or reject)
-	await Promise.all(batches.map(b => b.request?.result().catch(() => {
-		/* Ignore errors here, handled by Pending state */
-	})));
+    // Process a set of batches concurrently and enqueue retries flatly onto the root's subsumedBy list
+    const processSet = async (set: CoordinatorBatch<TPayload, TResponse>[]) => {
+        await Promise.all(set.map(async (batch) => {
+            batch.request = new Pending(process(batch)
+                .catch(async e => {
+                    if (expiration > Date.now()) {
+                        const excludedPeers = [batch.peerId, ...(batch.excludedPeers ?? [])];
+                        const retries = await createBatchesForPayload<TPayload, TResponse>(
+                            getBlockIds(batch),
+                            batch.payload,
+                            getBlockPayload,
+                            excludedPeers,
+                            findCoordinator
+                        );
+                        if (retries.length > 0 && expiration > Date.now()) {
+                            const root = rootOf.get(batch) ?? batch;
+                            root.subsumedBy = [...(root.subsumedBy ?? []), ...retries];
+                            for (const r of retries) rootOf.set(r, root);
+                            // Process retries, but ensure further failures also attach to the same root
+                            await processSet(retries);
+                        }
+                    }
+                    throw e;
+                }));
+        }));
+
+        // Wait for all in this set to settle
+        await Promise.all(set.map(b => b.request?.result().catch(() => { /* ignore */ })));
+    };
+
+    await processSet(batches);
 }
 
 /**

@@ -58,7 +58,7 @@ describe('TransactorSource', () => {
       transforms: {
         inserts: { [blockId]: block },
         updates: {},
-        deletes: new Set()
+        deletes: []
       },
       policy: 'c'
     })
@@ -97,7 +97,7 @@ describe('TransactorSource', () => {
     const transform: Transforms = {
       inserts: { [blockId]: { header: { id: blockId, type: 'block', collectionId: 'test' } } },
       updates: {},
-      deletes: new Set()
+      deletes: []
     }
 
     const result = await source.transact(transform, trxId, 1, blockId, blockId)
@@ -122,7 +122,7 @@ describe('TransactorSource', () => {
       transforms: {
         inserts: { [blockId]: { header: { id: blockId, type: 'block', collectionId: 'test' } } },
         updates: {},
-        deletes: new Set()
+        deletes: []
       },
       policy: 'c'
     })
@@ -131,7 +131,7 @@ describe('TransactorSource', () => {
     const transform: Transforms = {
       inserts: {},
       updates: { [blockId]: [createBlockOperation()] },
-      deletes: new Set()
+      deletes: []
     }
 
     const result = await source.transact(transform, trxId2, 1, blockId, blockId)
@@ -150,7 +150,7 @@ describe('TransactorSource', () => {
       transforms: {
         inserts: { [blockId]: { header: { id: blockId, type: 'block', collectionId: 'test' } } },
         updates: {},
-        deletes: new Set()
+        deletes: []
       },
       policy: 'c'
     })
@@ -168,7 +168,7 @@ describe('TransactorSource', () => {
     const transform: Transforms = {
       inserts: {},
       updates: { [blockId]: [createBlockOperation()] },
-      deletes: new Set()
+      deletes: []
     }
 
     // Try to commit with a stale revision
@@ -188,7 +188,7 @@ describe('TransactorSource', () => {
       transforms: {
         inserts: { [blockId]: { header: { id: blockId, type: 'block', collectionId: 'test' } } },
         updates: {},
-        deletes: new Set()
+        deletes: []
       },
       policy: 'c'
     })
@@ -197,7 +197,7 @@ describe('TransactorSource', () => {
     const transform: Transforms = {
       inserts: {},
       updates: { [blockId]: [createBlockOperation()] },
-      deletes: new Set()
+      deletes: []
     }
 
     // Start update transaction
@@ -232,7 +232,7 @@ describe('TransactorSource', () => {
         transforms: {
           inserts: { [blockId1]: { header: { id: blockId1, type: 'block', collectionId: 'test' }, test: [] } as TestBlock },
           updates: {},
-          deletes: new Set()
+          deletes: []
         },
         policy: 'c'
       }),
@@ -241,7 +241,7 @@ describe('TransactorSource', () => {
         transforms: {
           inserts: { [blockId2]: { header: { id: blockId2, type: 'block', collectionId: 'test' }, test: [] } as TestBlock },
           updates: {},
-          deletes: new Set()
+          deletes: []
         },
         policy: 'c'
       })
@@ -266,13 +266,13 @@ describe('TransactorSource', () => {
     const transform1: Transforms = {
       inserts: {},
       updates: { [blockId1]: [createBlockOperation()] },
-      deletes: new Set()
+      deletes: []
     }
 
     const transform2: Transforms = {
       inserts: {},
       updates: { [blockId2]: [createBlockOperation()] },
-      deletes: new Set()
+      deletes: []
     }
 
     // Execute update transactions concurrently
@@ -304,7 +304,7 @@ describe('TransactorSource', () => {
         [contentId]: { header: { id: contentId, type: 'content', collectionId: 'test' }, test: [] } as TestBlock
       },
       updates: {},
-      deletes: new Set()
+      deletes: []
     }
 
     // Insert initial blocks
@@ -319,7 +319,7 @@ describe('TransactorSource', () => {
         [headerId]: [createBlockOperation('header-update-1')],
         [tailId]: [createBlockOperation('tail-update-1')]
       },
-      deletes: new Set()
+      deletes: []
     }
 
     // Start first transaction
@@ -334,7 +334,7 @@ describe('TransactorSource', () => {
         [headerId]: [createBlockOperation('header-update-2')],
         [tailId]: [createBlockOperation('tail-update-2')]
       },
-      deletes: new Set()
+      deletes: []
     }
 
     // Start second transaction (using same rev=2)
@@ -361,7 +361,7 @@ describe('TransactorSource', () => {
     const updateTransform: Transforms = {
       inserts: {},
       updates: { [blockId]: [createBlockOperation()] },
-      deletes: new Set()
+      deletes: []
     }
 
     // This should fail because the block doesn't exist
@@ -372,7 +372,7 @@ describe('TransactorSource', () => {
     const insertTransform: Transforms = {
       inserts: { [blockId]: { header: { id: blockId, type: 'block', collectionId: 'test' } } },
       updates: {},
-      deletes: new Set()
+      deletes: []
     }
 
     const insertResult = await source.transact(insertTransform, generateTrxId(), 1, 'header-id', 'tail-id')

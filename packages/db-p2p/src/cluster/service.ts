@@ -27,6 +27,9 @@ export interface ClusterServiceInit {
 	maxOutboundStreams?: number,
 	logPrefix?: string,
   kBucketSize?: number,
+  configuredClusterSize?: number,
+  allowClusterDownsize?: boolean,
+  clusterSizeTolerance?: number,
 }
 
 export function clusterService(init: ClusterServiceInit = {}): (components: ClusterServiceComponents) => ClusterService {
@@ -45,6 +48,9 @@ export class ClusterService implements Startable {
 	private readonly components: ClusterServiceComponents;
 	private running: boolean;
   private readonly k: number;
+  private readonly configuredClusterSize: number;
+  private readonly allowDownsize: boolean;
+  private readonly sizeTolerance: number;
 
 	constructor(components: ClusterServiceComponents, init: ClusterServiceInit = {}) {
 		this.components = components;
@@ -55,6 +61,9 @@ export class ClusterService implements Startable {
 		this.cluster = components.cluster;
 		this.running = false;
     this.k = init.kBucketSize ?? 10;
+    this.configuredClusterSize = init.configuredClusterSize ?? 10;
+    this.allowDownsize = init.allowClusterDownsize ?? true;
+    this.sizeTolerance = init.clusterSizeTolerance ?? 0.5;
 	}
 
 	readonly [Symbol.toStringTag] = '@libp2p/cluster';
@@ -93,7 +102,7 @@ export class ClusterService implements Startable {
 
 				// Process the operation
 				let response: any;
-				if (message.operation === 'update') {
+					if (message.operation === 'update') {
           // Use message.record.message as key source; this is RepoMessage carrying block IDs
           const tailId = (message.record?.message as any)?.commit?.tailId ?? (message.record?.message as any)?.pend ? Object.keys((message.record as any).message.pend.transforms)[0] : undefined
           if (tailId) {
@@ -110,6 +119,17 @@ export class ClusterService implements Startable {
                 const peers = cluster.filter((p: any) => !peersEqual(p, selfId))
                 response = encodePeers(peers.map((pid: any) => ({ id: pid.toString(), addrs: [] })))
               } else {
+                const suggested = message.record?.suggestedClusterSize
+                const actual = cluster.length
+                if (!this.allowDownsize && actual < this.configuredClusterSize) {
+                  throw new Error(`Cluster undersized (actual=${actual}, required=${this.configuredClusterSize})`)
+                }
+                if (typeof suggested === 'number') {
+                  const maxDiff = Math.ceil(Math.max(1, suggested * this.sizeTolerance))
+                  if (Math.abs(actual - suggested) > maxDiff) {
+                    this.log('cluster size variance beyond tolerance (expected=%d actual=%d)', suggested, actual)
+                  }
+                }
                 response = await this.cluster.update(message.record)
               }
             } else {

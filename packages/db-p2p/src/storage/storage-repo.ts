@@ -4,8 +4,10 @@ import type {
 	Transforms,
 	GetBlockResult
 } from "@optimystic/db-core";
-import { Latches, transformForBlockId, applyTransform, groupBy, concatTransform, emptyTransforms,
-	blockIdsForTransforms, transformsFromTransform } from "@optimystic/db-core";
+import {
+	Latches, transformForBlockId, applyTransform, groupBy, concatTransform, emptyTransforms,
+	blockIdsForTransforms, transformsFromTransform
+} from "@optimystic/db-core";
 import { asyncIteratorToArray } from "../it-utility.js";
 import type { IBlockStorage } from "./i-block-storage.js";
 
@@ -89,7 +91,7 @@ export class StorageRepo implements IRepo {
 			// Handle any conflicting revisions
 			if (request.rev !== undefined || transforms.insert) {
 				const latest = await blockStorage.getLatest();
-				if (latest && latest.rev >=	(request.rev ?? 0)) {
+				if (latest && latest.rev >= (request.rev ?? 0)) {
 					const transforms = await asyncIteratorToArray(blockStorage.listRevisions(request.rev ?? 0, latest.rev));
 					for (const trxRev of transforms) {
 						const transform = await blockStorage.getTransaction(trxRev.trxId);

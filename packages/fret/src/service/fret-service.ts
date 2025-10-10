@@ -401,10 +401,8 @@ export class FretService implements IFretService, Startable {
 			await this.applyTouch(from, selfCoord);
 
 			if (snap.metadata) {
-				const entry = this.store.getById(from);
-				if (entry) {
-					entry.metadata = snap.metadata;
-				}
+				// Update metadata via store.update to avoid mutating frozen entries
+				this.store.update(from, { metadata: snap.metadata });
 			}
 
 			for (const pid of [...(snap.successors ?? []), ...(snap.predecessors ?? [])]) {

@@ -93,6 +93,7 @@
     * Run simulation across N∈{5,25,100}, churn∈{0,1,5}%/s, profiles∈{edge,core}; export JSON metrics artifacts
 
 * FRET implementation (remaining)
+  * Add round-trip timing into peer cache; given this a relevance score so that "nearer" peers get preference.  How to score?  Maybe incrementally maintain the distribution of timings and gaussian score relatively.
   * Register FRET as a libp2p PeerDiscovery module that emits discovered peers from neighbor snapshots
   * Proactive announcements on start and after topology change (bounded fanout, non-connected only)
   * Iterative anchor lookup and forwarding (maybeAct): TTL, breadcrumbs, connected-first next-hop

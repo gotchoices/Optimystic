@@ -29,6 +29,7 @@ export class ClusterCoordinator {
 	constructor(
 		private readonly keyNetwork: IKeyNetwork,
 		private readonly createClusterClient: (peerId: PeerId) => ClusterClient,
+		private readonly cfg: { clusterSize: number; allowClusterDownsize: boolean; clusterSizeTolerance: number }
 	) { }
 
 	/**
@@ -53,6 +54,19 @@ export class ClusterCoordinator {
 		}
 	}
 
+	private makeRecord(peers: ClusterPeers, messageHash: string, message: RepoMessage): ClusterRecord {
+		const peerCount = Object.keys(peers ?? {}).length;
+		return {
+			messageHash,
+			peers,
+			message,
+			promises: {},
+			commits: {},
+			suggestedClusterSize: peerCount || undefined,
+			minRequiredSize: this.cfg.allowClusterDownsize ? undefined : this.cfg.clusterSize
+		};
+	}
+
 	/**
 	 * Initiates a 2-phase transaction for a specific block ID
 	 */
@@ -64,7 +78,16 @@ export class ClusterCoordinator {
 		const messageHash = await this.createMessageHash(message);
 
 		// Create a cluster record for this transaction
-		const record: ClusterRecord = { messageHash, peers, message, promises: {}, commits: {} };
+		const record = this.makeRecord(peers, messageHash, message);
+		log('cluster-tx:start', {
+			messageHash,
+			blockId,
+			peerCount: Object.keys(peers ?? {}).length,
+			allowDownsize: this.cfg.allowClusterDownsize,
+			configuredSize: this.cfg.clusterSize,
+			suggestedSize: record.suggestedClusterSize,
+			minRequiredSize: record.minRequiredSize
+		});
 
 		// Create a new pending transaction
 		const transactionPromise = this.executeTransaction(peers, record);
@@ -80,24 +103,37 @@ export class ClusterCoordinator {
 		this.transactions.set(messageHash, state);
 
 		// Wait for the transaction to complete
-		return await pending.result();
+		return await pending.result().finally(() => {
+			log('cluster-tx:complete', { messageHash });
+		});
 	}
 
 	/**
 	 * Executes the full transaction process
 	 */
 	private async executeTransaction(peers: ClusterPeers, record: ClusterRecord): Promise<ClusterRecord> {
-		// Phase 1: Collect promises from peers
-		const promiseResults = await this.collectPromises(peers, record);
-
-		// Check if we have majority consensus
-		const majority = Math.floor(Object.keys(peers).length / 2) + 1;
-		if (Object.keys(promiseResults.record.promises).length < majority) {
+		const peerCount = Object.keys(peers).length;
+		if (!this.cfg.allowClusterDownsize && peerCount < this.cfg.clusterSize) {
+			log('cluster-tx:reject-downsize', { peerCount, required: this.cfg.clusterSize });
+			throw new Error(`Cluster size ${peerCount} below configured minimum ${this.cfg.clusterSize}`);
+		}
+		const promised = await this.collectPromises(peers, record);
+		const majority = Math.floor(peerCount / 2) + 1;
+		if (peerCount > 1 && Object.keys(promised.record.promises).length < majority) {
+			log('cluster-tx:majority-failed', {
+				messageHash: record.messageHash,
+				peerCount,
+				promises: Object.keys(promised.record.promises).length,
+				majority
+			});
 			throw new Error(`Failed to get majority consensus for transaction ${record.messageHash}`);
 		}
+		return await this.commitTransaction(promised.record);
+	}
 
-		// Phase 2: Commit the transaction
-		return await this.commitTransaction(promiseResults.record);
+	async getClusterSize(blockId: BlockId): Promise<number> {
+		const peers = await this.getClusterForBlock(blockId);
+		return Object.keys(peers ?? {}).length;
 	}
 
 	/**
@@ -108,24 +144,35 @@ export class ClusterCoordinator {
 		const promiseRequests = Object.keys(peers).map(peerIdStr => {
 			const peerIdObj = peerIdFromString(peerIdStr);
 			const client = this.createClusterClient(peerIdObj);
+			log('cluster-tx:promise-request', { messageHash: record.messageHash, peerId: peerIdStr });
 			const promise = client.update(record);
 			return new Pending(promise);
 		});
 
 		// Wait for all promises to complete
-		const results = await Promise.all(promiseRequests.map(p => p.result().catch(err => {
-			log('WARN promise from peer failed: %o', err)
+		const results = await Promise.all(promiseRequests.map((p, idx) => p.result().then(res => {
+			const peerIdStr = Object.keys(peers)[idx]!;
+			log('cluster-tx:promise-response', { messageHash: record.messageHash, peerId: peerIdStr, success: true });
+			return res;
+		}).catch(err => {
+			const peerIdStr = Object.keys(peers)[idx]!;
+			log('cluster-tx:promise-response', { messageHash: record.messageHash, peerId: peerIdStr, success: false, error: err });
 			return null;
 		})));
 
 		// Merge all promises into the record
-		const updatedRecord = { ...record };
 		for (const result of results.filter(Boolean) as ClusterRecord[]) {
-			// Merge promises from this peer
-			updatedRecord.promises = { ...updatedRecord.promises, ...result.promises };
+			if (typeof record.suggestedClusterSize === 'number' && typeof result.suggestedClusterSize === 'number') {
+				const expected = result.suggestedClusterSize;
+				const actual = Object.keys(peers).length;
+				const maxDiff = Math.ceil(Math.max(1, expected * this.cfg.clusterSizeTolerance));
+				if (Math.abs(actual - expected) > maxDiff) {
+					log('cluster-tx:size-variance', { expected, actual, tolerance: this.cfg.clusterSizeTolerance });
+				}
+			}
+			record.promises = { ...record.promises, ...result.promises };
 		}
-
-		return { record: updatedRecord };
+		return { record };
 	}
 
 	/**
@@ -133,30 +180,34 @@ export class ClusterCoordinator {
 	 */
 	private async commitTransaction(record: ClusterRecord): Promise<ClusterRecord> {
 		// For each peer, create a client and send the commit
-		const commitRequests = Object.keys(record.peers).map(peerIdStr => {
+		const peerIds = Object.keys(record.peers);
+		const commitRequests = peerIds.map(peerIdStr => {
 			const peerIdObj = peerIdFromString(peerIdStr);
 			const client = this.createClusterClient(peerIdObj);
+			log('cluster-tx:commit-request', { messageHash: record.messageHash, peerId: peerIdStr });
 			const promise = client.update({
 				...record,
 				// Add our commit signature
-				commits: { ...record.commits, "self": "signature" as unknown as Signature }
+				commits: { ...record.commits, self: 'signature' as unknown as Signature }
 			});
 			return new Pending(promise);
 		});
 
 		// Wait for all commits to complete
-		const results = await Promise.all(commitRequests.map(p => p.result().catch(err => {
-			log('WARN commit to peer failed: %o', err)
+		const results = await Promise.all(commitRequests.map((p, idx) => p.result().then(res => {
+			const peerIdStr = peerIds[idx]!;
+			log('cluster-tx:commit-response', { messageHash: record.messageHash, peerId: peerIdStr, success: true });
+			return res;
+		}).catch(err => {
+			const peerIdStr = peerIds[idx]!;
+			log('cluster-tx:commit-response', { messageHash: record.messageHash, peerId: peerIdStr, success: false, error: err });
 			return null;
 		})));
 
 		// Merge all commits into the record
-		const updatedRecord = { ...record };
 		for (const result of results.filter(Boolean) as ClusterRecord[]) {
-			// Merge commits from this peer
-			updatedRecord.commits = { ...updatedRecord.commits, ...result.commits };
+			record.commits = { ...record.commits, ...result.commits };
 		}
-
-		return updatedRecord;
+		return record;
 	}
 }

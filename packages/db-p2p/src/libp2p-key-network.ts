@@ -92,8 +92,10 @@ export class Libp2pKeyPeerNetwork implements IKeyNetwork, IPeerNetwork {
 			return connectedPick
 		}
 
-		// last resort: self, even if excluded to break cycles
-		return this.libp2p.peerId
+		// last resort: prefer self only if not excluded; otherwise fail fast to avoid retry cycles
+		const self = this.libp2p.peerId
+		if (!excludedSet.has(self.toString())) return self
+		throw new Error('No coordinator available for key (all candidates excluded)')
 	}
 
 	private getConnectedAddrsByPeer(): Record<string, string[]> {

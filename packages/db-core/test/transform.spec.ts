@@ -36,7 +36,7 @@ describe('Transform functionality', () => {
 
       tracker.insert(newBlock)
       expect(tracker.transforms.inserts['new-id']).to.deep.equal(newBlock)
-      expect(tracker.transforms.deletes.has('new-id')).to.be.false
+      expect(tracker.transforms.deletes.includes('new-id')).to.be.false
     })
 
     it('should track updates correctly', async () => {
@@ -51,7 +51,7 @@ describe('Transform functionality', () => {
       const tracker = new Tracker(mockSource)
 
       tracker.delete('test-id' as BlockId)
-      expect(tracker.transforms.deletes.has('test-id')).to.be.true
+      expect(tracker.transforms.deletes.includes('test-id')).to.be.true
       expect(tracker.transforms.inserts['test-id']).to.be.undefined
       expect(tracker.transforms.updates['test-id']).to.be.undefined
     })
@@ -95,7 +95,7 @@ describe('Transform functionality', () => {
       const transform: Transforms = {
         inserts: { 'id1': testBlock },
         updates: { 'id2': [] },
-        deletes: new Set(['id3'])
+        deletes: ['id3']
       }
 
       const ids = blockIdsForTransforms(transform)
@@ -106,18 +106,18 @@ describe('Transform functionality', () => {
       const transform1: Transforms = {
         inserts: { 'id1': testBlock },
         updates: {},
-        deletes: new Set()
+        deletes: []
       }
 
       const transform2: Transforms = {
         inserts: { 'id2': testBlock },
         updates: {},
-        deletes: new Set(['id3'])
+        deletes: ['id3']
       }
 
       const merged = mergeTransforms(transform1, transform2)
       expect(merged.inserts).to.have.keys(['id1', 'id2'])
-      expect(merged.deletes.has('id3')).to.be.true
+      expect(merged.deletes.includes('id3')).to.be.true
     })
 
     it('should concatenate multiple transforms', () => {
@@ -125,25 +125,25 @@ describe('Transform functionality', () => {
         {
           inserts: { 'id1': testBlock },
           updates: {},
-          deletes: new Set()
+          deletes: []
         },
         {
           inserts: { 'id2': testBlock },
           updates: {},
-          deletes: new Set(['id3'])
+          deletes: ['id3']
         }
       ]
 
       const concatenated = concatTransforms(...transforms)
       expect(concatenated.inserts).to.have.keys(['id1', 'id2'])
-      expect(concatenated.deletes.has('id3')).to.be.true
+      expect(concatenated.deletes.includes('id3')).to.be.true
     })
 
     it('should create transform for specific block id', () => {
       const transform: Transforms = {
         inserts: { 'id1': testBlock, 'id2': testBlock },
         updates: { 'id1': [], 'id3': [] },
-        deletes: new Set(['id1', 'id4'])
+        deletes: ['id1', 'id4']
       }
 
       const blockTransform = transformForBlockId(transform, 'id1' as BlockId)

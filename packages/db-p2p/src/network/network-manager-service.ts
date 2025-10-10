@@ -9,6 +9,8 @@ export type NetworkManagerServiceInit = {
 	readiness?: { minPeers: number, maxWaitMs: number }
 	cacheTTLs?: { coordinatorMs: number, clusterMs: number }
 	expectedRemotes?: boolean
+	allowClusterDownsize?: boolean
+	clusterSizeTolerance?: number
 }
 
 type Components = {
@@ -41,7 +43,9 @@ export class NetworkManagerService implements Startable {
 			estimation: init.estimation ?? { samples: 8, kth: 5, timeoutMs: 1000, ttlMs: 60_000 },
 			readiness: init.readiness ?? { minPeers: 1, maxWaitMs: 2000 },
 			cacheTTLs: init.cacheTTLs ?? { coordinatorMs: 30 * 60_000, clusterMs: 5 * 60_000 },
-			expectedRemotes: init.expectedRemotes ?? false
+			expectedRemotes: init.expectedRemotes ?? false,
+			allowClusterDownsize: init.allowClusterDownsize ?? true,
+			clusterSizeTolerance: init.clusterSizeTolerance ?? 0.5
 		}
 	}
 
@@ -225,7 +229,10 @@ export class NetworkManagerService implements Startable {
 
 		if (fret) {
 			const coord = await hashKey(key);
-			const cohortIds = fret.assembleCohort(coord, this.cfg.clusterSize);
+			const diag: any = (fret as any).getDiagnostics?.() ?? {};
+			const estimate = typeof diag.estimate === 'number' ? diag.estimate : (typeof diag.n === 'number' ? diag.n : undefined);
+			const targetSize = Math.max(1, Math.min(this.cfg.clusterSize, Number.isFinite(estimate) ? (estimate as number) : this.cfg.clusterSize));
+			const cohortIds = fret.assembleCohort(coord, targetSize);
 			const { peerIdFromString } = await import('@libp2p/peer-id');
 
 			const ids = cohortIds
@@ -241,6 +248,7 @@ export class NetworkManagerService implements Startable {
 
 			if (ids.length > 0) {
 				this.clusterCache.set(ck, { ids, expires: Date.now() + this.cfg.cacheTTLs.clusterMs });
+				this.lastEstimate = estimate != null ? { estimate, samples: diag.samples ?? 0, updated: Date.now() } : this.lastEstimate;
 				return ids;
 			}
 		}

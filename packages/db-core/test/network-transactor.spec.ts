@@ -67,7 +67,7 @@ describe('NetworkTransactor', () => {
             [blockId]: [createBlockOperation()]
           },
           inserts: {},
-          deletes: new Set()
+          deletes: []
         },
         policy: 'c' // Continue normally if there are pending transactions
       }
@@ -98,7 +98,7 @@ describe('NetworkTransactor', () => {
               [blockId]: [createBlockOperation()]
             },
             inserts: {},
-            deletes: new Set()
+            deletes: []
           },
           policy: 'c' // Continue normally if there are pending transactions
         }
@@ -131,7 +131,7 @@ describe('NetworkTransactor', () => {
 						[blockId]: { header: { id: blockId, type: 'block', collectionId: 'test' } }
 					},
           updates: {},
-          deletes: new Set()
+          deletes: []
         },
         policy: 'c' // Continue normally if there are pending transactions
       }
@@ -164,7 +164,7 @@ describe('NetworkTransactor', () => {
             [blockId]: [createBlockOperation()]
           },
           inserts: {},
-          deletes: new Set()
+          deletes: []
         },
         policy: 'c' // Continue normally if there are pending transactions
       }
@@ -264,7 +264,7 @@ describe('NetworkTransactor', () => {
             [blockId]: [createBlockOperation()]
           },
           inserts: {},
-          deletes: new Set()
+          deletes: []
         },
         policy: 'c' // Continue normally if there are pending transactions
       }
@@ -305,7 +305,7 @@ describe('NetworkTransactor', () => {
               [blockId]: [createBlockOperation()]
             },
             inserts: {},
-            deletes: new Set()
+            deletes: []
           },
           policy: 'c' // Continue normally if there are pending transactions
         }

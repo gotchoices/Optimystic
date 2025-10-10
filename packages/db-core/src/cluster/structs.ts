@@ -20,4 +20,7 @@ export type ClusterRecord = {
 	message: RepoMessage;
 	promises: { [peerId: string]: Signature };
 	commits: { [peerId: string]: Signature };
+	/** Sender’s recommended cluster size: min(estimated network size, configured cluster size) */
+	suggestedClusterSize?: number;
+	minRequiredSize?: number;
 }

@@ -25,6 +25,8 @@
     "lint": "aegir lint",
     "test": "aegir test",
     "test:node": "aegir test -t node",
+    "test:quick": "node dist/test/quick-test.js",
+    "test:quick:debug": "node --inspect-brk dist/test/quick-test.js",
     "dep-check": "aegir dep-check"
   },
   "devDependencies": {

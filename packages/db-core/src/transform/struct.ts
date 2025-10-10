@@ -10,7 +10,7 @@ export type Transforms = {
 	/** Block update operations by BlockId */
 	updates: Record<BlockId, BlockOperations>;
 	/** Set of deleted BlockIds */
-	deletes: Set<BlockId>;
+	deletes: BlockId[];
 };
 
 /** A transform is a block-level mutation.
