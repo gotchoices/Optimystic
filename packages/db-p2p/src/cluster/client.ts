@@ -9,8 +9,8 @@ export class ClusterClient extends ProtocolClient implements ICluster {
 	}
 
 	/** Create a new client instance */
-	public static create(peerId: PeerId, peerNetwork: IPeerNetwork): ClusterClient {
-		return new ClusterClient(peerId, peerNetwork);
+	public static create(peerId: PeerId, peerNetwork: IPeerNetwork, protocolPrefix?: string): ClusterClient {
+		return new ClusterClient(peerId, peerNetwork, protocolPrefix);
 	}
 
   async update(record: ClusterRecord, hop: number = 0): Promise<ClusterRecord> {
@@ -40,7 +40,7 @@ export class ClusterClient extends ProtocolClient implements ICluster {
         throw new Error('Redirect loop detected in ClusterClient (same peer)')
       }
       this.recordCoordinatorForRecordIfSupported(record, nextId)
-      const nextClient = ClusterClient.create(nextId, this.peerNetwork)
+      const nextClient = ClusterClient.create(nextId, this.peerNetwork, this.protocolPrefix)
       return await nextClient.update(record, hop + 1)
     }
     return response as ClusterRecord;

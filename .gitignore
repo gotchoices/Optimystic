@@ -87,3 +87,4 @@ typings/
 dist
 out
 .mesh/node-*.json
+.mesh/mesh-ready.json

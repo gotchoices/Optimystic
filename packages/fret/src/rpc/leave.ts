@@ -40,16 +40,22 @@ export async function sendLeave(
 	const pid = peerIdFromString(peerIdStr);
 	const conns = (node as any).getConnections?.(pid) ?? [];
 	let stream: any;
-	if (Array.isArray(conns) && conns.length > 0 && typeof conns[0]?.newStream === 'function') {
-		stream = await conns[0].newStream([protocol]);
-	} else {
-		stream = await node.dialProtocol(pid, [protocol]);
+	try {
+		if (Array.isArray(conns) && conns.length > 0 && typeof conns[0]?.newStream === 'function') {
+			stream = await conns[0].newStream([protocol]);
+		} else {
+			stream = await node.dialProtocol(pid, [protocol]);
+		}
+		await stream.sink(
+			(async function* () {
+				yield await encodeJson(notice);
+			})()
+		);
+	} finally {
+		if (stream) {
+			try { await stream.close(); } catch {}
+		}
 	}
-	await stream.sink(
-		(async function* () {
-			yield await encodeJson(notice);
-		})()
-	);
 }
 
 function toBytes(chunk: unknown): Uint8Array {

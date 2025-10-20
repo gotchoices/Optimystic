@@ -135,11 +135,28 @@ export class NetworkManagerService implements Startable {
 	async awaitHealthy(minRemotes: number, timeoutMs: number): Promise<boolean> {
 		const start = Date.now()
 		while (Date.now() - start < timeoutMs) {
-			const peers = this.getKnownPeers()
-			if (peers.length >= minRemotes) return true
+			const libp2p = this.getLibp2p()
+			if (libp2p) {
+				// Require actual active connections, not just peerStore knowledge
+				const connections = libp2p.getConnections?.() ?? []
+				const connectedPeers = new Set(connections.map((c: any) => c.remotePeer.toString()))
+				if (connectedPeers.size >= minRemotes) {
+					this.log('awaitHealthy: satisfied with %d connections', connectedPeers.size)
+					return true
+				}
+			}
 			await new Promise(r => setTimeout(r, 100))
 		}
-		return this.getKnownPeers().length >= minRemotes
+		// Final check
+		const libp2p = this.getLibp2p()
+		if (libp2p) {
+			const connections = libp2p.getConnections?.() ?? []
+			const connectedPeers = new Set(connections.map((c: any) => c.remotePeer.toString()))
+			const satisfied = connectedPeers.size >= minRemotes
+			this.log('awaitHealthy: timeout - %d connections (needed %d)', connectedPeers.size, minRemotes)
+			return satisfied
+		}
+		return false
 	}
 
 	/**

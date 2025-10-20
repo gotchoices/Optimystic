@@ -64,12 +64,12 @@ async function createNode(port: number, bootstrapNodes: string[]): Promise<TestN
 		}
 	});
 
-	const rawStorage = new MemoryRawStorage();
-	const storageRepo = new StorageRepo((blockId: string) =>
-		new BlockStorage(blockId, rawStorage)
-	);
+	const coordinatedRepo = (node as any).coordinatedRepo;
+	const keyNetwork = (node as any).keyNetwork;
 
-	const keyNetwork = new Libp2pKeyPeerNetwork(node);
+	if (!coordinatedRepo) {
+		throw new Error('coordinatedRepo not available on node');
+	}
 
 	const transactor = new NetworkTransactor({
 		timeoutMs: 30000,
@@ -77,8 +77,8 @@ async function createNode(port: number, bootstrapNodes: string[]): Promise<TestN
 		keyNetwork,
 		getRepo: (peerId) => {
 			return peerId.toString() === node.peerId.toString()
-				? storageRepo
-				: RepoClient.create(peerId, keyNetwork);
+				? coordinatedRepo  // Use coordinated repo for self to enable cluster consensus
+				: RepoClient.create(peerId, keyNetwork, '/optimystic/quick-test');
 		}
 	});
 
@@ -89,7 +89,7 @@ async function createNode(port: number, bootstrapNodes: string[]): Promise<TestN
 
 	return {
 		node,
-		storageRepo,
+		storageRepo: (node as any).storageRepo,
 		transactor,
 		peerId,
 		port

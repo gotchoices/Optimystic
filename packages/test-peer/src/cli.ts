@@ -111,10 +111,56 @@ class TestPeerSession {
 			logDebug('waiting for FRET ready');
 			await fret.ready();
 			console.log('✅ FRET service ready');
+
+			// Log FRET diagnostics
+			const knownPeers = typeof fret.listPeers === 'function' ? fret.listPeers() : [];
+			const netSize = typeof fret.getNetworkSizeEstimate === 'function' ? fret.getNetworkSizeEstimate() : undefined;
+			logDebug('FRET diagnostics after ready', {
+				knownPeers: knownPeers.map((p: any) => p.id ?? p.toString()),
+				knownPeerCount: knownPeers.length,
+				networkSizeEstimate: netSize
+			});
+			console.log(`📊 FRET knows ${knownPeers.length} peer(s)`);
 		} catch (error) {
 			console.warn('⚠️ FRET readiness check issue:', error);
 			logDebug('FRET readiness check issue', error);
 		}
+	}
+
+	private async waitForFretConvergence(node: any, minPeers: number, timeoutMs: number): Promise<boolean> {
+		const fret = (node as any).services?.fret;
+		if (!fret || typeof fret.listPeers !== 'function') {
+			logDebug('FRET convergence check skipped - no listPeers method');
+			return false;
+		}
+
+		const start = Date.now();
+		let lastCount = 0;
+		while (Date.now() - start < timeoutMs) {
+			const peers = fret.listPeers();
+			const count = Array.isArray(peers) ? peers.length : 0;
+			if (count !== lastCount) {
+				logDebug('FRET convergence progress', { peerCount: count, target: minPeers, peers: peers.map((p: any) => p.id) });
+				lastCount = count;
+			}
+			if (count >= minPeers) {
+				console.log(`✅ FRET discovered ${count} peer(s)`);
+				return true;
+			}
+			await new Promise(r => setTimeout(r, 200));
+		}
+
+		const finalPeers = fret.listPeers();
+		const finalCount = Array.isArray(finalPeers) ? finalPeers.length : 0;
+		console.log(`✅ FRET discovered ${finalCount} peer(s)`);
+		logDebug('FRET convergence completed', {
+			finalPeerCount: finalCount,
+			targetPeers: minPeers,
+			elapsed: timeoutMs,
+			peers: finalPeers.map((p: any) => p.id)
+		});
+		// Return true if we have at least some peers, even if not the target
+		return finalCount > 0;
 	}
 
 	private logRingInfo(node: any, totalCapacityOverride?: number): void {
@@ -188,14 +234,66 @@ class TestPeerSession {
 		if (options.bootstrapFile) {
 			try {
 				const filePath = path.resolve(options.bootstrapFile);
-				const contents = fs.readFileSync(filePath, 'utf-8');
-				const json = JSON.parse(contents) as { multiaddrs?: string[] } | { nodes?: { multiaddrs: string[] }[] };
-				if (Array.isArray((json as any).nodes)) {
-					for (const n of (json as any).nodes) {
-						if (Array.isArray(n.multiaddrs)) bootstrapNodes.push(...n.multiaddrs);
+				const stat = fs.statSync(filePath);
+
+				// If it's a directory, wait for mesh-ready.json and use it
+				if (stat.isDirectory()) {
+					const readyFile = path.join(filePath, 'mesh-ready.json');
+
+					// Wait for mesh-ready.json (up to 30 seconds)
+					console.log('⏳ Waiting for mesh to be ready...');
+					const waitStart = Date.now();
+					while (!fs.existsSync(readyFile) && Date.now() - waitStart < 30000) {
+						await new Promise(r => setTimeout(r, 100));
 					}
-				} else if (Array.isArray((json as any).multiaddrs)) {
-					bootstrapNodes.push(...(json as any).multiaddrs);
+
+					if (fs.existsSync(readyFile)) {
+						// Use mesh-ready.json which has current node info
+						const readyContents = fs.readFileSync(readyFile, 'utf-8');
+						const readyJson = JSON.parse(readyContents) as { ready: boolean; nodes: { peerId: string; multiaddrs: string[] }[] };
+						logDebug('loading bootstrap from mesh-ready', { nodeCount: readyJson.nodes.length });
+
+						for (const node of readyJson.nodes) {
+							if (Array.isArray(node.multiaddrs) && node.multiaddrs.length > 0) {
+								// Prefer localhost for same-machine testing
+								const localAddr = node.multiaddrs.find(a => a.includes('/ip4/127.0.0.1/'));
+								bootstrapNodes.push(localAddr ?? node.multiaddrs[0]!);
+								logDebug('loaded bootstrap from mesh-ready', { peerId: node.peerId, addr: localAddr ?? node.multiaddrs[0] });
+							}
+						}
+						console.log(`📋 Loaded ${bootstrapNodes.length} bootstrap address(es) from mesh-ready.json`);
+					} else {
+						console.warn('⚠️  Timeout waiting for mesh-ready.json, falling back to node-*.json files');
+						// Fallback to old behavior
+						const files = fs.readdirSync(filePath).filter(f => f.startsWith('node-') && f.endsWith('.json'));
+						logDebug('loading bootstrap from directory (fallback)', { dir: filePath, files });
+						for (const file of files) {
+							const fullPath = path.join(filePath, file);
+							try {
+								const contents = fs.readFileSync(fullPath, 'utf-8');
+								const json = JSON.parse(contents) as { multiaddrs?: string[]; peerId?: string };
+								if (Array.isArray(json.multiaddrs) && json.multiaddrs.length > 0) {
+									const localAddr = json.multiaddrs.find(a => a.includes('/ip4/127.0.0.1/'));
+									bootstrapNodes.push(localAddr ?? json.multiaddrs[0]!);
+									logDebug('loaded bootstrap from file', { file, peerId: json.peerId, addr: localAddr ?? json.multiaddrs[0] });
+								}
+							} catch (err) {
+								logDebug('failed to read bootstrap file', { file: fullPath, error: (err as Error).message });
+							}
+						}
+						console.log(`📋 Loaded ${bootstrapNodes.length} bootstrap address(es) from ${filePath}`);
+					}
+				} else {
+					// Single file - existing logic
+					const contents = fs.readFileSync(filePath, 'utf-8');
+					const json = JSON.parse(contents) as { multiaddrs?: string[] } | { nodes?: { multiaddrs: string[] }[] };
+					if (Array.isArray((json as any).nodes)) {
+						for (const n of (json as any).nodes) {
+							if (Array.isArray(n.multiaddrs)) bootstrapNodes.push(...n.multiaddrs);
+						}
+					} else if (Array.isArray((json as any).multiaddrs)) {
+						bootstrapNodes.push(...(json as any).multiaddrs);
+					}
 				}
 			} catch (err) {
 				console.error('❌ Failed to read bootstrap file:', (err as Error).message);
@@ -256,6 +354,12 @@ class TestPeerSession {
       }
     };
 
+		// Get the coordinated repo that includes cluster consensus
+		const coordinatedRepo = (node as any).coordinatedRepo;
+		if (!coordinatedRepo) {
+			throw new Error('coordinatedRepo not available on node');
+		}
+
 		// Determine operating mode
 		const isOffline = Boolean(options.offline);
 		console.log(`🔧 Mode: ${isOffline ? 'Offline (LocalTransactor)' : 'Distributed (NetworkTransactor)'}`);
@@ -271,8 +375,8 @@ class TestPeerSession {
 				keyNetwork,
 				getRepo: (peerId) => {
 					return peerId.toString() === node.peerId.toString()
-						? storageRepo
-						: RepoClient.create(peerId, keyNetwork);
+						? coordinatedRepo  // Use coordinated repo for self to enable cluster consensus
+						: RepoClient.create(peerId, keyNetwork, `/optimystic/${options.network || 'optimystic-test'}`);
 				}
 			});
 		}
@@ -293,8 +397,11 @@ class TestPeerSession {
 		const nm = getNetworkManager(node);
 		await nm.ready();
 		if (bootstrapNodes.length > 0 && (nm as any).awaitHealthy) {
-			const ok = await (nm as any).awaitHealthy(1, 5000);
-			console.log(`🧭 Network ${ok ? 'healthy' : 'not healthy yet'} (remotes in peerStore=${ok ? '>=1' : '0'})`);
+			// Require at least 2 connections when multiple bootstrap nodes available
+			// This ensures better mesh connectivity before operations begin
+			const minConnections = Math.min(2, bootstrapNodes.length);
+			const ok = await (nm as any).awaitHealthy(minConnections, 10000);
+			console.log(`🧭 Network ${ok ? 'healthy' : 'not healthy yet'} (active connections=${ok ? `>=${minConnections}` : '<' + minConnections})`);
 			logDebug('network manager status', { healthy: ok, status: nm.getStatus?.() });
 		} else {
 			console.log('🧭 Network ready');
@@ -330,6 +437,14 @@ class TestPeerSession {
 			await new Promise(resolve => setTimeout(resolve, 2000));
 			console.log('✅ Network bootstrap complete');
 			this.logRingInfo(node, storageCapacityBytes);
+
+			// Wait for FRET to discover peers (best effort, non-blocking)
+			// FRET neighbor announcements happen asynchronously and take time to propagate
+			const minPeers = 1;  // At least discover one peer
+			if (bootstrapNodes.length > 0) {
+				console.log(`🔍 Waiting for FRET to discover peers...`);
+				await this.waitForFretConvergence(node, minPeers, 8000);
+			}
 		}
 	}
 

@@ -64,13 +64,18 @@ export async function fetchNeighbors(
 		// No existing connection - skip to reduce churn
 		return { v: 1, from: peerIdOrStr, timestamp: Date.now(), successors: [], predecessors: [], sig: '' } as NeighborSnapshotV1;
 	}
+	let stream: any;
 	try {
-		const stream = await conns[0].newStream([protocol]);
+		stream = await conns[0].newStream([protocol]);
 		const bytes = await readAll(stream);
 		return await decodeJson<NeighborSnapshotV1>(bytes);
 	} catch (err) {
 		log('fetchNeighbors decode failed for %s - %o', peerIdOrStr, err);
 		return { v: 1, from: peerIdOrStr, timestamp: Date.now(), successors: [], predecessors: [], sig: '' } as NeighborSnapshotV1;
+	} finally {
+		if (stream) {
+			try { await stream.close(); } catch {}
+		}
 	}
 }
 
@@ -85,15 +90,21 @@ export async function announceNeighbors(
 	if (!Array.isArray(conns) || conns.length === 0 || typeof conns[0]?.newStream !== 'function') {
 		return; // skip if not connected
 	}
+	let stream: any;
 	try {
-		const stream = await conns[0].newStream([protocol]);
+		stream = await conns[0].newStream([protocol]);
 		await stream.sink(
 			(async function* () {
 				yield await encodeJson(snapshot);
 			})()
 		);
-		try { (stream as any).close?.(); } catch { }
-	} catch (err) { log('announceNeighbors failed to %s - %o', peerIdOrStr, err) }
+	} catch (err) {
+		log('announceNeighbors failed to %s - %o', peerIdOrStr, err);
+	} finally {
+		if (stream) {
+			try { await stream.close(); } catch {}
+		}
+	}
 }
 
 function toBytes(chunk: unknown): Uint8Array {

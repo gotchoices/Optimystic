@@ -13,8 +13,8 @@ export class RepoClient extends ProtocolClient implements IRepo {
 	}
 
 	/** Create a new client instance */
-	public static create(peerId: PeerId, peerNetwork: IPeerNetwork): RepoClient {
-		return new RepoClient(peerId, peerNetwork);
+	public static create(peerId: PeerId, peerNetwork: IPeerNetwork, protocolPrefix?: string): RepoClient {
+		return new RepoClient(peerId, peerNetwork, protocolPrefix);
 	}
 
 	async get(blockGets: BlockGets, options: MessageOptions): Promise<GetBlockResults> {
@@ -76,11 +76,11 @@ export class RepoClient extends ProtocolClient implements IRepo {
 			if (next.id === currentIdStr) {
 				throw new Error('Redirect loop detected in RepoClient (same peer)')
 			}
-			// cache hint
-			this.recordCoordinatorForOpsIfSupported(operations, nextId)
-			// single-hop retry against target peer using repo protocol
-			const nextClient = RepoClient.create(nextId, this.peerNetwork)
-			return await nextClient.processRepoMessage<T>(operations, options, hop + 1)
+		// cache hint
+		this.recordCoordinatorForOpsIfSupported(operations, nextId)
+		// single-hop retry against target peer using repo protocol
+		const nextClient = RepoClient.create(nextId, this.peerNetwork, this.protocolPrefix)
+		return await nextClient.processRepoMessage<T>(operations, options, hop + 1)
 		}
 		return response as T;
 	}

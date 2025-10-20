@@ -8,4 +8,5 @@ export type RepoMessage = {
 		{ commit: CommitRequest }
 	],
 	expiration?: number,
+	coordinatingBlockIds?: string[],
 };

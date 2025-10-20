@@ -20,8 +20,8 @@
   "scripts": {
     "clean": "aegir clean",
     "build": "aegir build --env node",
-    "mesh": "node dist/mesh.js",
-    "start": "node dist/cli.js",
+    "mesh": "node dist/src/mesh.js",
+    "start": "node dist/src/cli.js",
     "lint": "aegir lint",
     "test": "aegir test",
     "test:node": "aegir test -t node",

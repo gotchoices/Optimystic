@@ -65,6 +65,12 @@ export interface FretService {
 	setMetadata(metadata: Record<string, any>): void;
 	getMetadata(peerId: string): Record<string, any> | undefined;
 	listPeers(): Array<{ id: string; metadata?: Record<string, any> }>;
+
+	// Network size estimation
+	reportNetworkSize(estimate: number, confidence: number, source?: string): void;
+	getNetworkSizeEstimate(): { size_estimate: number; confidence: number; sources: number };
+	getNetworkChurn(): number;
+	detectPartition(): boolean;
 }
 
 export { FretService as FretServiceImpl } from './service/fret-service.js';

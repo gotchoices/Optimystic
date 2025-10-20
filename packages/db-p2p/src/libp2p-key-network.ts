@@ -68,33 +68,58 @@ export class Libp2pKeyPeerNetwork implements IKeyNetwork, IPeerNetwork {
 
 	async findCoordinator(key: Uint8Array, _options?: Partial<FindCoordinatorOptions>): Promise<PeerId> {
 		const excludedSet = new Set<string>((_options?.excludedPeers ?? []).map(p => p.toString()))
+		const keyStr = this.toCacheKey(key).substring(0, 12);
+
+		this.log('findCoordinator:start key=%s excluded=%o', keyStr, Array.from(excludedSet).map(s => s.substring(0, 12)))
 
 		// honor cache if not excluded
 		const cached = this.getCachedCoordinator(key)
-		if (cached != null && !excludedSet.has(cached.toString())) return cached
+		if (cached != null && !excludedSet.has(cached.toString())) {
+			this.log('findCoordinator:cached-hit key=%s coordinator=%s', keyStr, cached.toString().substring(0, 12))
+			return cached
+		}
 
-		// prefer FRET neighbors, pick first non-excluded
+		// Get currently connected peers for filtering
+		const connected = (this.libp2p.getConnections?.() ?? []).map((c: any) => c.remotePeer) as PeerId[]
+		const connectedSet = new Set(connected.map(p => p.toString()))
+		this.log('findCoordinator:connected-peers key=%s count=%d peers=%o', keyStr, connected.length, connected.map(p => p.toString().substring(0, 12)))
+
+		// prefer FRET neighbors that are also connected, pick first non-excluded
 		try {
 			const ids = await this.getNeighborIdsForKey(key, this.clusterSize)
-			const pick = ids.find(id => !excludedSet.has(id))
+			this.log('findCoordinator:fret-neighbors key=%s candidates=%o', keyStr, ids.map(s => s.substring(0, 12)))
+
+			// Filter to only connected FRET neighbors
+			const connectedFretIds = ids.filter(id => connectedSet.has(id) || id === this.libp2p.peerId.toString())
+			this.log('findCoordinator:fret-connected key=%s count=%d peers=%o', keyStr, connectedFretIds.length, connectedFretIds.map(s => s.substring(0, 12)))
+
+			const pick = connectedFretIds.find(id => !excludedSet.has(id))
 			if (pick) {
 				const pid = peerIdFromString(pick)
 				this.recordCoordinator(key, pid)
+				this.log('findCoordinator:fret-selected key=%s coordinator=%s', keyStr, pick.substring(0, 12))
 				return pid
 			}
-		} catch (err) { this.log('findCoordinator getNeighborIdsForKey failed - %o', err) }
+		} catch (err) {
+			this.log('findCoordinator getNeighborIdsForKey failed - %o', err)
+		}
 
-		// fallback: prefer an existing connected peer that's not excluded
-		const connected = (this.libp2p.getConnections?.() ?? []).map((c: any) => c.remotePeer) as PeerId[]
+		// fallback: prefer any existing connected peer that's not excluded
 		const connectedPick = connected.find(p => !excludedSet.has(p.toString()))
 		if (connectedPick) {
 			this.recordCoordinator(key, connectedPick)
+			this.log('findCoordinator:connected-fallback key=%s coordinator=%s', keyStr, connectedPick.toString().substring(0, 12))
 			return connectedPick
 		}
 
 		// last resort: prefer self only if not excluded; otherwise fail fast to avoid retry cycles
 		const self = this.libp2p.peerId
-		if (!excludedSet.has(self.toString())) return self
+		if (!excludedSet.has(self.toString())) {
+			this.log('findCoordinator:self-selected key=%s coordinator=%s', keyStr, self.toString().substring(0, 12))
+			return self
+		}
+
+		this.log('findCoordinator:all-excluded key=%s self=%s', keyStr, self.toString().substring(0, 12))
 		throw new Error('No coordinator available for key (all candidates excluded)')
 	}
 
@@ -121,10 +146,18 @@ export class Libp2pKeyPeerNetwork implements IKeyNetwork, IPeerNetwork {
 		const fret = this.getFret()
 		const coord = await hashKey(key)
 		const cohort = fret.assembleCohort(coord, this.clusterSize)
+		const keyStr = this.toCacheKey(key).substring(0, 12);
+
+		// Include self in the cohort
 		const ids = Array.from(new Set([...cohort, this.libp2p.peerId.toString()]))
 
-		const peers: ClusterPeers = {}
 		const connectedByPeer = this.getConnectedAddrsByPeer()
+		const connectedPeerIds = Object.keys(connectedByPeer)
+
+		this.log('findCluster key=%s fretCohort=%d connected=%d cohortPeers=%o',
+			keyStr, cohort.length, connectedPeerIds.length, ids.map(s => s.substring(0, 12)))
+
+		const peers: ClusterPeers = {}
 
 		for (const idStr of ids) {
 			if (idStr === this.libp2p.peerId.toString()) {
@@ -135,6 +168,11 @@ export class Libp2pKeyPeerNetwork implements IKeyNetwork, IPeerNetwork {
 			const addrs = this.parseMultiaddrs(strings)
 			peers[idStr] = { multiaddrs: addrs, publicKey: new Uint8Array() }
 		}
+
+		this.log('findCluster:result key=%s clusterSize=%d withAddrs=%d connectedInCohort=%d',
+			keyStr, Object.keys(peers).length,
+			Object.values(peers).filter(p => p.multiaddrs.length > 0).length,
+			ids.filter(id => connectedPeerIds.includes(id) || id === this.libp2p.peerId.toString()).length)
 		return peers
 	}
 }

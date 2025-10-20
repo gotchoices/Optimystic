@@ -230,6 +230,11 @@ describe('Distributed Diary Operations', () => {
 		);
 
 		const keyNetwork = new Libp2pKeyPeerNetwork(node);
+		const coordinatedRepo = (node as any).coordinatedRepo;
+
+		if (!coordinatedRepo) {
+			throw new Error('coordinatedRepo not available on node');
+		}
 
 		const transactor = new NetworkTransactor({
 			timeoutMs: 30000,
@@ -237,8 +242,8 @@ describe('Distributed Diary Operations', () => {
 			keyNetwork,
 			getRepo: (peerId) => {
 				return peerId.toString() === node.peerId.toString()
-					? storageRepo
-					: RepoClient.create(peerId, keyNetwork);
+					? coordinatedRepo  // Use coordinated repo for self to enable cluster consensus
+					: RepoClient.create(peerId, keyNetwork, `/optimystic/${NETWORK_NAME}`);
 			}
 		});
 

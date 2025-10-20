@@ -54,18 +54,13 @@ export class NetworkTransactor implements ITransactor {
 			error = e as Error;
 		}
 
-		// Second-chance retry: if a batch "succeeded" but returned no concrete block data, try a different coordinator
-		const isUsefulResponse = (b: CoordinatorBatch<BlockId[], GetBlockResults>) => {
-			if (!b.request?.isResponse) return false;
-			const resp = b.request.response as GetBlockResults | undefined;
-			if (!resp) return false;
-			return b.payload.some(bid => {
-				const r: any = (resp as any)[bid];
-				return r && typeof r === 'object' && 'block' in r && r.block != null;
-			});
+		// Second-chance retry: ONLY if batch failed to respond (not if it responded with "not found")
+		// A response of { blockId: null } is valid and means the block doesn't exist
+		const hasValidResponse = (b: CoordinatorBatch<BlockId[], GetBlockResults>) => {
+			return b.request?.isResponse === true && b.request.response != null;
 		};
 
-		const retryable = Array.from(allBatches(batches)).filter(b => !isUsefulResponse(b as any)) as CoordinatorBatch<BlockId[], GetBlockResults>[];
+		const retryable = Array.from(allBatches(batches)).filter(b => !hasValidResponse(b as any)) as CoordinatorBatch<BlockId[], GetBlockResults>[];
 		if (retryable.length > 0 && Date.now() < expiration) {
 			try {
 				const excludedByRoot = new Map<CoordinatorBatch<BlockId[], GetBlockResults>, Set<PeerId>>();
@@ -136,6 +131,48 @@ export class NetworkTransactor implements ITransactor {
 		throw new Error("Method not implemented.");
 	}
 
+	private async consolidateCoordinators(
+		blockIds: BlockId[],
+		transforms: Transforms,
+		transformForBlock: (payload: Transforms, blockId: BlockId, mergeWith?: Transforms) => Transforms
+	): Promise<CoordinatorBatch<Transforms, PendResult>[]> {
+		const blockCoordinators = await Promise.all(
+			blockIds.map(async bid => ({
+				blockId: bid,
+				coordinator: await this.keyNetwork.findCoordinator(await blockIdToBytes(bid), { excludedPeers: [] })
+			}))
+		);
+
+		const byCoordinator = new Map<string, BlockId[]>();
+		for (const { blockId, coordinator } of blockCoordinators) {
+			const key = coordinator.toString();
+			const blocks = byCoordinator.get(key) ?? [];
+			blocks.push(blockId);
+			byCoordinator.set(key, blocks);
+		}
+
+		const batches: CoordinatorBatch<Transforms, PendResult>[] = [];
+		for (const [coordinatorStr, consolidatedBlocks] of byCoordinator) {
+			const coordinator = blockCoordinators.find(bc => bc.coordinator.toString() === coordinatorStr)!.coordinator;
+
+			let batchTransforms: Transforms = { inserts: {}, updates: {}, deletes: [] };
+			for (const bid of consolidatedBlocks) {
+				const blockTransforms = transformForBlock(transforms, bid, batchTransforms);
+				batchTransforms = blockTransforms;
+			}
+
+			batches.push({
+				peerId: coordinator,
+				payload: batchTransforms,
+				blockId: consolidatedBlocks[0]!,
+				coordinatingBlockIds: consolidatedBlocks,
+				excludedPeers: []
+			} as any);
+		}
+
+		return batches;
+	}
+
 	async pend(blockTrx: PendRequest): Promise<PendResult> {
 		const transformForBlock = (payload: Transforms, blockId: BlockId, mergeWithPayload: Transforms | undefined): Transforms => {
 			const filteredTransform = transformForBlockId(payload, blockId);
@@ -144,7 +181,7 @@ export class NetworkTransactor implements ITransactor {
 				: transformsFromTransform(filteredTransform, blockId);
 		};
 		const blockIds = blockIdsForTransforms(blockTrx.transforms);
-		const batches = await this.batchesForPayload<Transforms, PendResult>(blockIds, blockTrx.transforms, transformForBlock, []);
+		const batches = await this.consolidateCoordinators(blockIds, blockTrx.transforms, transformForBlock);
 		const expiration = Date.now() + this.timeoutMs;
 
 		let error: Error | undefined;
@@ -152,7 +189,13 @@ export class NetworkTransactor implements ITransactor {
 			// Process all batches, noting all outstanding peers
 			await processBatches(
 				batches,
-				(batch) => this.getRepo(batch.peerId).pend({ ...blockTrx, transforms: batch.payload }, { expiration }),
+				(batch) => this.getRepo(batch.peerId).pend(
+					{ ...blockTrx, transforms: batch.payload },
+					{
+						expiration,
+						coordinatingBlockIds: (batch as any).coordinatingBlockIds
+					} as any
+				),
 				batch => blockIdsForTransforms(batch.payload),
 				transformForBlock,
 				expiration,
@@ -227,7 +270,8 @@ export class NetworkTransactor implements ITransactor {
 	async commit(request: CommitRequest): Promise<CommitResult> {
 		const allBlockIds = [...new Set([...request.blockIds, request.tailId])];
 
-		if (request.headerId) {	// Commit the header block if this is a first time commit
+		// Commit the header block if provided and not already in blockIds
+		if (request.headerId && !request.blockIds.includes(request.headerId)) {
 			const headerResult = await this.commitBlock(request.headerId, allBlockIds, request.trxId, request.rev);
 			if (!headerResult.success) {
 				return headerResult;
@@ -240,12 +284,18 @@ export class NetworkTransactor implements ITransactor {
 			return tailResult;
 		}
 
-		// Commit all remaining block ids
-		const { batches, error } = await this.commitBlocks({ blockIds: request.blockIds.filter(bid => bid !== request.tailId), trxId: request.trxId, rev: request.rev });
-		if (error) {
-			// Non-tail block commit failures should not fail the overall transaction once the tail has committed.
-			// Proceed and rely on reconciliation paths (e.g. reads with context) to finalize state on lagging peers.
-			try { console.warn('[NetworkTransactor] non-tail commit had errors; proceeding after tail commit:', error.message); } catch { /* ignore */ }
+		// Commit all remaining block ids (excluding tail and header if it was already handled)
+		const remainingBlocks = request.blockIds.filter(bid =>
+			bid !== request.tailId &&
+			!(request.headerId && bid === request.headerId && !request.blockIds.includes(request.headerId))
+		);
+		if (remainingBlocks.length > 0) {
+			const { batches, error } = await this.commitBlocks({ blockIds: remainingBlocks, trxId: request.trxId, rev: request.rev });
+			if (error) {
+				// Non-tail block commit failures should not fail the overall transaction once the tail has committed.
+				// Proceed and rely on reconciliation paths (e.g. reads with context) to finalize state on lagging peers.
+				try { console.warn('[NetworkTransactor] non-tail commit had errors; proceeding after tail commit:', error.message); } catch { /* ignore */ }
+			}
 		}
 
 		return { success: true };

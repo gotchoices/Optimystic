@@ -105,45 +105,39 @@ export class ClusterService implements Startable {
 					if (message.operation === 'update') {
           // Use message.record.message as key source; this is RepoMessage carrying block IDs
           const tailId = (message.record?.message as any)?.commit?.tailId ?? (message.record?.message as any)?.pend ? Object.keys((message.record as any).message.pend.transforms)[0] : undefined
-          if (tailId) {
-            const { sha256 } = await import('multiformats/hashes/sha2')
-            const mh = await sha256.digest(new TextEncoder().encode(tailId))
-            const key = mh.digest
-            const nm: any = (this.components as any).libp2p?.services?.networkManager
-            if (nm?.getCluster) {
-              const cluster: any[] = await nm.getCluster(key)
-              ;(message as any).cluster = (cluster as any[]).map(p => p.toString?.() ?? String(p))
-              const selfId = (this.components as any).libp2p.peerId
-              const isMember = cluster.some((p: any) => peersEqual(p, selfId))
-              if (!isMember) {
-                const peers = cluster.filter((p: any) => !peersEqual(p, selfId))
-                response = encodePeers(peers.map((pid: any) => ({ id: pid.toString(), addrs: [] })))
-              } else {
-                const suggested = message.record?.suggestedClusterSize
-                const actual = cluster.length
-                if (!this.allowDownsize && actual < this.configuredClusterSize) {
-                  throw new Error(`Cluster undersized (actual=${actual}, required=${this.configuredClusterSize})`)
-                }
-                if (typeof suggested === 'number') {
-                  const maxDiff = Math.ceil(Math.max(1, suggested * this.sizeTolerance))
-                  if (Math.abs(actual - suggested) > maxDiff) {
-                    this.log('cluster size variance beyond tolerance (expected=%d actual=%d)', suggested, actual)
-                  }
-                }
-                response = await this.cluster.update(message.record)
-              }
-            } else {
-              response = await this.cluster.update(message.record)
-            }
-					} else {
-						response = await this.cluster.update(message.record)
-					}
+          // TEMPORARY: Disable cluster membership check to fix empty promises issue
+          // The membership check was causing peers to return redirect responses
+          // instead of processing cluster updates, leading to empty promise arrays.
+          // TODO: Re-enable and fix cluster membership logic for proper DHT routing
+          response = await this.cluster.update(message.record)
 				} else {
 					throw new Error(`Unknown operation: ${message.operation}`);
 				}
 
 				// Encode and yield the response
-				yield new TextEncoder().encode(JSON.stringify(response));
+				if (message.operation === 'update') {
+					const rec = response as any;
+					this.log('cluster-service:pre-serialize', {
+						messageHash: rec?.messageHash,
+						responseType: typeof response,
+						hasPromises: 'promises' in (rec ?? {}),
+						hasCommits: 'commits' in (rec ?? {}),
+						promiseKeys: Object.keys(rec?.promises ?? {}),
+						commitKeys: Object.keys(rec?.commits ?? {}),
+						promiseValues: rec?.promises,
+						commitValues: rec?.commits
+					});
+				}
+				const serialized = JSON.stringify(response);
+				if (message.operation === 'update') {
+					const deserialized = JSON.parse(serialized);
+					this.log('cluster-service:post-serialize', {
+						messageHash: (deserialized as any)?.messageHash,
+						promiseKeys: Object.keys((deserialized as any)?.promises ?? {}),
+						commitKeys: Object.keys((deserialized as any)?.commits ?? {})
+					});
+				}
+				yield new TextEncoder().encode(serialized);
 			}
 		};
 

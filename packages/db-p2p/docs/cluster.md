@@ -151,13 +151,14 @@ enum TransactionPhase {
 └─────────────────┘    └─────────────────┘
 ```
 
-### Phase 1: Promise Collection
+### Phase 1: Promise Collection (Super-Majority Required)
 
-During the promise phase, each peer evaluates whether they can commit to the transaction:
+During the promise phase, each peer evaluates whether they can commit to the transaction. **The coordinator requires a super-majority (default 3/4) of promises** to proceed to the commit phase, providing stronger consensus guarantees than simple majority.
 
 ```typescript
 private async handlePromiseNeeded(record: ClusterRecord): Promise<ClusterRecord> {
   // Check for conflicts with existing transactions
+  // Uses race resolution: transaction with more promises wins
   if (this.hasConflict(record)) {
     return this.rejectTransaction(record, 'Conflict detected');
   }
@@ -178,9 +179,17 @@ private async handlePromiseNeeded(record: ClusterRecord): Promise<ClusterRecord>
 }
 ```
 
-### Phase 2: Commit Execution
+**Super-Majority Validation** (in ClusterCoordinator):
+```typescript
+const superMajority = Math.ceil(peerCount * this.cfg.superMajorityThreshold); // Default 0.75
+if (promiseCount < superMajority) {
+  throw new Error(`Failed to get super-majority: ${promiseCount}/${peerCount}`);
+}
+```
 
-Once all peers have promised, the commit phase begins:
+### Phase 2: Commit Execution (Simple Majority Required)
+
+Once super-majority promises are collected, the commit phase begins. **Commits only require a simple majority (>50%)** to prove commitment. The coordinator can return success to the client as soon as majority commits are received, with remaining propagation happening in the background.
 
 ```typescript
 private async handleCommitNeeded(record: ClusterRecord): Promise<ClusterRecord> {
@@ -290,11 +299,29 @@ private operationsConflict(ops1: RepoMessage['operations'], ops2: RepoMessage['o
 }
 ```
 
-### Resolution Strategies
+### Race Resolution
 
-- **Rejection**: Conflicting transactions are rejected with clear error messages
-- **Queuing**: Non-conflicting transactions can proceed in parallel
-- **Timeout**: Expired transactions are automatically rejected
+When two transactions conflict (operate on the same blocks), the system uses deterministic race resolution:
+
+```typescript
+private resolveRace(existing: ClusterRecord, incoming: ClusterRecord): 'keep-existing' | 'accept-incoming' {
+  const existingCount = Object.keys(existing.promises).length;
+  const incomingCount = Object.keys(incoming.promises).length;
+  
+  // Transaction with more promises wins
+  if (existingCount > incomingCount) return 'keep-existing';
+  if (incomingCount > existingCount) return 'accept-incoming';
+  
+  // Tie-breaker: higher message hash wins (deterministic)
+  return existing.messageHash > incoming.messageHash ? 'keep-existing' : 'accept-incoming';
+}
+```
+
+**Resolution Strategies:**
+- **Promise Count Wins**: Transaction with more promises has made more progress
+- **Deterministic Tie-Breaking**: Hash comparison ensures all peers make the same decision
+- **Automatic Abort**: Losing transaction is cleanly aborted
+- **Parallel Non-Conflicting**: Transactions on different blocks proceed in parallel
 
 ## Cryptographic Security
 
@@ -347,6 +374,19 @@ private async validateSignatures(record: ClusterRecord): Promise<void> {
 ```
 
 ## Fault Tolerance and Recovery
+
+### Commit Retry Loop
+
+Once the tail block commits, the coordinator now tracks any peers that promised but failed to acknowledge their commit. These peers are treated as *in-doubt* participants and are retried with exponential backoff until:
+
+- The peer acknowledges the commit and the local record reflects its signature; or
+- The retry budget is exhausted (defaults: 5 attempts, growth capped at 30 s intervals).
+
+Retries reuse the original `ClusterRecord` so peers that missed the initial commit can still apply the operation idempotently.
+
+A successful retry clears the pending list; hitting the max attempts emits `cluster-tx:retry-abort` so operators can intervene. The coordinator keeps the transaction in memory while any peers remain unfixed, ensuring follow-up requests (reads, additional commits) see a consistent state.
+
+Cluster members are idempotent: they ignore duplicate commits once their signature is present, so forced retries do not double-apply user operations.
 
 ### Timeout Management
 
@@ -564,6 +604,94 @@ class TimeoutError extends Error {
 - **Sybil Resistance**: Cryptographic peer identity prevents Sybil attacks
 - **Byzantine Fault Tolerance**: Majority consensus prevents Byzantine failures
 - **DoS Protection**: Rate limiting and timeout mechanisms
+
+## Network Size Estimation and Partition Detection
+
+The cluster system integrates with FRET (Finger Ring Ensemble Topology) for network-wide size estimation and partition detection.
+
+### Network Size Tracking
+
+Cluster records include network size hints from the coordinator:
+
+```typescript
+export interface ClusterRecord {
+  messageHash: string;
+  peers: ClusterPeers;
+  message: RepoMessage;
+  promises: Record<string, Signature>;
+  commits: Record<string, Signature>;
+  networkSizeHint?: number;        // Coordinator's network size estimate
+  networkSizeConfidence?: number;  // Confidence in estimate (0-1)
+}
+```
+
+**Size Observation Sources:**
+- **FRET Digitree**: Primary source from chord ring topology
+- **Ping Responses**: Peers share size estimates in ping messages
+- **Cluster Messages**: Coordinators propagate size hints
+- **Neighbor Announcements**: FRET announcements include size estimates
+
+### Small Cluster Validation
+
+When cluster size falls below minimum (default 3), the coordinator validates it's not a partition:
+
+```typescript
+private async validateSmallCluster(localSize: number): Promise<boolean> {
+  const estimate = this.fretService.getNetworkSizeEstimate();
+  
+  if (estimate.confidence > 0.5) {
+    // Check if estimates are within same order of magnitude
+    const orderOfMagnitude = Math.floor(Math.log10(estimate.size_estimate + 1));
+    const localOrderOfMagnitude = Math.floor(Math.log10(localSize + 1));
+    
+    return Math.abs(orderOfMagnitude - localOrderOfMagnitude) <= 1;
+  }
+  
+  return true; // Accept in development without confident estimate
+}
+```
+
+### Partition Detection
+
+FRET monitors for network partitions using multiple signals:
+
+- **Sudden Size Drop**: >50% reduction in network size estimate
+- **High Churn Rate**: >10% peers/minute joining or leaving
+- **Mass Unreachability**: Multiple peers suddenly unreachable
+- **Goodbye Tracking**: Explicit leave messages vs silent failures
+
+## Configuration Options
+
+The cluster system supports comprehensive configuration through `ClusterConsensusConfig`:
+
+```typescript
+interface ClusterConsensusConfig {
+  superMajorityThreshold: number;     // Default 0.75 (3/4)
+  simpleMajorityThreshold: number;    // Default 0.51 (>50%)
+  minAbsoluteClusterSize: number;     // Default 3
+  allowClusterDownsize: boolean;      // Default true
+  clusterSizeTolerance: number;       // Default 0.5 (50% variance)
+  partitionDetectionWindow: number;   // Default 60000ms (1 min)
+}
+```
+
+**Configuration in libp2p-node.ts:**
+```typescript
+const coordinatorRepoFactory = coordinatorRepo(
+  keyNetwork,
+  createClusterClient,
+  {
+    clusterSize: 10,
+    superMajorityThreshold: 0.75,
+    simpleMajorityThreshold: 0.51,
+    minAbsoluteClusterSize: 3,
+    allowClusterDownsize: true,
+    clusterSizeTolerance: 0.5,
+    partitionDetectionWindow: 60000
+  },
+  fretService
+);
+```
 
 ## Future Enhancements
 

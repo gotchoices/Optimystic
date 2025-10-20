@@ -7,7 +7,7 @@
       "name": "Optimystic: Start Mesh (N=3) then Debug Peer",
       "runtimeExecutable": "node",
       "runtimeArgs": [
-        "packages/test-peer/dist/mesh.js"
+        "packages/test-peer/dist/src/mesh.js"
       ],
       "cwd": "${workspaceFolder}",
       "env": {
@@ -21,15 +21,15 @@
       "type": "node",
       "request": "launch",
       "name": "Optimystic: Debug Interactive Peer (bootstraps to mesh)",
-      "program": "${workspaceFolder}/packages/test-peer/dist/cli.js",
+      "program": "${workspaceFolder}/packages/test-peer/dist/src/cli.js",
       "args": [
         "interactive",
         "--network", "optimystic-test",
-        "--bootstrap-file", "${workspaceFolder}/.mesh/node-1.json"
+        "--bootstrap-file", "${workspaceFolder}/.mesh"
       ],
       "cwd": "${workspaceFolder}",
       "env": {
-        "DEBUG": "db-p2p:repo-service,optimystic:*,db-p2p:*,libp2p:connection-manager,-libp2p:connection-manager:dial-queue,-libp2p:*:error"
+        "DEBUG": "db-core:network-transactor,db-p2p:cluster,db-p2p:cluster:error,-db-p2p:*,-optimystic:*,-libp2p:*"
       },
       "console": "integratedTerminal",
       "autoAttachChildProcesses": true

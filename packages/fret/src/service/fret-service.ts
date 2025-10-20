@@ -66,6 +66,16 @@ export class FretService implements IFretService, Startable {
 		evictions: 0,
 	};
 
+	// Network size observation tracking
+	private networkObservations: Array<{
+		estimate: number;
+		confidence: number;
+		timestamp: number;
+		source: string;
+	}> = [];
+	private readonly maxObservations = 100;
+	private readonly observationWindowMs = 300000; // 5 minutes
+
 	constructor(node: Libp2p, cfg?: Partial<FretConfig>) {
 		this.node = node;
 		this.cfg = {
@@ -210,7 +220,11 @@ export class FretService implements IFretService, Startable {
 		);
 		registerMaybeAct(this.node, async (msg) => this.handleMaybeAct(msg), this.protocols.PROTOCOL_MAYBE_ACT);
 		registerLeave(this.node, async (notice) => this.handleLeave(notice.from), this.protocols.PROTOCOL_LEAVE);
-		registerPing(this.node, this.protocols.PROTOCOL_PING);
+		registerPing(
+			this.node,
+			this.protocols.PROTOCOL_PING,
+			() => this.getNetworkSizeEstimate()
+		);
 	}
 
 	private async handleNeighborsRequest(): Promise<NeighborSnapshotV1> {
@@ -764,6 +778,144 @@ export class FretService implements IFretService, Startable {
 
 	report(_evt: ReportEvent): void {
 		// no-op until reputation is enabled
+	}
+
+	/**
+	 * Add an external network size observation (e.g., from cluster messages, peer queries)
+	 */
+	reportNetworkSize(estimate: number, confidence: number, source: string = 'external'): void {
+		const now = Date.now();
+		this.networkObservations.push({
+			estimate,
+			confidence,
+			timestamp: now,
+			source
+		});
+
+		// Trim old observations
+		const cutoff = now - this.observationWindowMs;
+		this.networkObservations = this.networkObservations.filter(o => o.timestamp > cutoff);
+
+		// Keep only most recent observations
+		if (this.networkObservations.length > this.maxObservations) {
+			this.networkObservations = this.networkObservations.slice(-this.maxObservations);
+		}
+	}
+
+	/**
+	 * Get enhanced network size estimate combining FRET's estimate with external observations
+	 */
+	getNetworkSizeEstimate(): { size_estimate: number; confidence: number; sources: number } {
+		// Get FRET's own estimate
+		const fretEstimate = estimateSizeAndConfidence(this.store, this.cfg.m);
+
+		// Add FRET estimate as an observation
+		const now = Date.now();
+		const allObservations = [
+			{
+				estimate: fretEstimate.n,
+				confidence: fretEstimate.confidence,
+				timestamp: now,
+				source: 'fret'
+			},
+			...this.networkObservations
+		];
+
+		if (allObservations.length === 0) {
+			return { size_estimate: 0, confidence: 0, sources: 0 };
+		}
+
+		// Weight recent observations more heavily with exponential decay
+		let totalWeight = 0;
+		let weightedSum = 0;
+		let confidenceSum = 0;
+
+		for (const obs of allObservations) {
+			const age = now - obs.timestamp;
+			const recencyWeight = Math.exp(-age / (this.observationWindowMs / 3));
+			const weight = recencyWeight * obs.confidence;
+
+			weightedSum += obs.estimate * weight;
+			confidenceSum += obs.confidence * recencyWeight;
+			totalWeight += weight;
+		}
+
+		if (totalWeight === 0) {
+			return { size_estimate: 0, confidence: 0, sources: 0 };
+		}
+
+		const estimate = Math.round(weightedSum / totalWeight);
+		const avgConfidence = confidenceSum / allObservations.length;
+
+		return {
+			size_estimate: estimate,
+			confidence: Math.min(1, avgConfidence),
+			sources: allObservations.length
+		};
+	}
+
+	/**
+	 * Calculate recent rate of change in network size estimates
+	 * Returns change per minute
+	 */
+	getNetworkChurn(): number {
+		if (this.networkObservations.length < 2) {
+			return 0;
+		}
+
+		const now = Date.now();
+		const halfWindow = this.observationWindowMs / 2;
+		const cutoff = now - halfWindow;
+
+		const recentObs = this.networkObservations.filter(o => o.timestamp > cutoff);
+		const olderObs = this.networkObservations.filter(o => o.timestamp <= cutoff);
+
+		if (recentObs.length === 0 || olderObs.length === 0) {
+			return 0;
+		}
+
+		const recentAvg = recentObs.reduce((sum, o) => sum + o.estimate, 0) / recentObs.length;
+		const olderAvg = olderObs.reduce((sum, o) => sum + o.estimate, 0) / olderObs.length;
+
+		// Return change per minute
+		const changePerMs = (recentAvg - olderAvg) / halfWindow;
+		return changePerMs * 60000;
+	}
+
+	/**
+	 * Detect if we're likely in a network partition based on sudden drop
+	 */
+	detectPartition(): boolean {
+		if (this.networkObservations.length < 10) {
+			return false; // Not enough data
+		}
+
+		const current = this.getNetworkSizeEstimate();
+		if (current.confidence < 0.3) {
+			return false; // Not confident enough
+		}
+
+		// Get estimate from 30 seconds ago
+		const thirtySecondsAgo = Date.now() - 30000;
+		const oldObs = this.networkObservations.filter(o => o.timestamp < thirtySecondsAgo);
+
+		if (oldObs.length < 3) {
+			return false;
+		}
+
+		const oldAvg = oldObs.slice(-5).reduce((sum, o) => sum + o.estimate, 0) / Math.min(5, oldObs.length);
+
+		// Detect sudden drop of more than 50%
+		const dropRatio = current.size_estimate / oldAvg;
+		if (dropRatio < 0.5) {
+			return true;
+		}
+
+		// Also check churn rate
+		const churn = Math.abs(this.getNetworkChurn());
+		const churnThreshold = current.size_estimate * 0.1; // 10% per minute is suspicious
+
+		return churn > churnThreshold;
 	}
 
 	setMetadata(metadata: Record<string, any>): void {

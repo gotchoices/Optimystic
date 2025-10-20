@@ -14,6 +14,11 @@ import { BlockStorage } from './storage/block-storage.js';
 import { MemoryRawStorage } from './storage/memory-storage.js';
 import { FileRawStorage } from './storage/file-storage.js';
 import type { IRawStorage } from './storage/i-raw-storage.js';
+import { clusterMember } from './cluster/cluster-repo.js';
+import { coordinatorRepo } from './repo/coordinator-repo.js';
+import { Libp2pKeyPeerNetwork } from './libp2p-key-network.js';
+import { ClusterClient } from './cluster/client.js';
+import type { IRepo, ICluster } from '@optimystic/db-core';
 import { multiaddr } from '@multiformats/multiaddr';
 import { networkManagerService } from './network/network-manager-service.js';
 import { fretService, Libp2pFretService } from '@optimystic/fret';
@@ -25,6 +30,7 @@ import type { StorageMonitorConfig } from './storage/storage-monitor.js';
 import { ArachnodeFretAdapter } from './storage/arachnode-fret-adapter.js';
 import type { RestoreCallback } from './storage/struct.js';
 import type { FretService } from '@optimystic/fret';
+import { PartitionDetector } from './cluster/partition-detector.js';
 
 export type NodeOptions = {
 	port: number;
@@ -72,12 +78,34 @@ export async function createLibp2pNode(options: NodeOptions): Promise<Libp2p> {
 		new BlockStorage(blockId, rawStorage, restoreCallback)
 	);
 
-	// Create cluster member logic
-	const clusterLogic = {
-		async update(record: any) {
-			// Simple implementation for single node - just return the record
-			// In a real multi-node setup, this would implement consensus logic
-			return record;
+	let clusterImpl: ICluster | undefined;
+	let coordinatedRepo: IRepo | undefined;
+
+	const clusterProxy: ICluster = {
+		async update(record) {
+			if (!clusterImpl) {
+				throw new Error('ClusterMember not initialized');
+			}
+			return await clusterImpl.update(record);
+		}
+	};
+
+	const repoProxy: IRepo = {
+		async get(blockGets, options) {
+			const target = coordinatedRepo ?? storageRepo;
+			return await target.get(blockGets, options);
+		},
+		async pend(request, options) {
+			const target = coordinatedRepo ?? storageRepo;
+			return await target.pend(request, options);
+		},
+		async cancel(trxRef, options) {
+			const target = coordinatedRepo ?? storageRepo;
+			return await target.cancel(trxRef, options);
+		},
+		async commit(request, options) {
+			const target = coordinatedRepo ?? storageRepo;
+			return await target.commit(request, options);
 		}
 	};
 
@@ -91,7 +119,7 @@ export async function createLibp2pNode(options: NodeOptions): Promise<Libp2p> {
 			listen: [`/ip4/0.0.0.0/tcp/${options.port}`]
 		},
 		connectionManager: {
-			autoDial: false,
+			autoDial: true,
 			minConnections: 1,
 			maxConnections: 16,
 			inboundConnectionUpgradeTimeout: 10_000,
@@ -121,7 +149,7 @@ export async function createLibp2pNode(options: NodeOptions): Promise<Libp2p> {
 				return serviceFactory({
 					logger: components.logger,
 					registrar: components.registrar,
-					cluster: clusterLogic
+					cluster: clusterProxy
 				});
 			},
 
@@ -132,7 +160,7 @@ export async function createLibp2pNode(options: NodeOptions): Promise<Libp2p> {
 				return serviceFactory({
 					logger: components.logger,
 					registrar: components.registrar,
-					repo: storageRepo
+					repo: repoProxy
 				});
 			},
 
@@ -143,7 +171,7 @@ export async function createLibp2pNode(options: NodeOptions): Promise<Libp2p> {
 				return serviceFactory({
 					logger: components.logger,
 					registrar: components.registrar,
-					repo: storageRepo
+					repo: repoProxy
 				});
 			},
 
@@ -185,6 +213,45 @@ export async function createLibp2pNode(options: NodeOptions): Promise<Libp2p> {
 	try { ((node as any).services?.networkManager as any)?.setLibp2p?.(node) } catch { }
 
 	await node.start();
+
+	// Initialize cluster coordination components
+	const keyNetwork = new Libp2pKeyPeerNetwork(node);
+	const protocolPrefix = `/optimystic/${options.networkName}`;
+	const createClusterClient = (peerId: any) => ClusterClient.create(peerId, keyNetwork, protocolPrefix);
+
+	// Create partition detector and get FRET service
+	const partitionDetector = new PartitionDetector();
+	const fretSvc = (node as any).services?.fret as FretService | undefined;
+
+	clusterImpl = clusterMember({
+		storageRepo,
+		peerNetwork: keyNetwork,
+		peerId: node.peerId,
+		protocolPrefix,
+		partitionDetector,
+		fretService: fretSvc
+	});
+
+	const coordinatorRepoFactory = coordinatorRepo(
+		keyNetwork,
+		createClusterClient,
+		{
+			clusterSize: options.clusterSize ?? 10,
+			superMajorityThreshold: 0.67,  // 2/3 instead of 3/4 - more forgiving for small networks
+			simpleMajorityThreshold: 0.51,
+			minAbsoluteClusterSize: 2,     // Allow 2-node clusters for development/small networks
+			allowClusterDownsize: options.clusterPolicy?.allowDownsize ?? true,
+			clusterSizeTolerance: options.clusterPolicy?.sizeTolerance ?? 0.5,
+			partitionDetectionWindow: 60000
+		},
+		fretSvc
+	);
+
+	coordinatedRepo = coordinatorRepoFactory({
+		storageRepo,
+		localCluster: clusterImpl,
+		localPeerId: node.peerId
+	});
 
 	// Initialize Arachnode ring membership and restoration
 	const enableArachnode = options.arachnode?.enableRingZulu ?? true;
@@ -253,6 +320,11 @@ export async function createLibp2pNode(options: NodeOptions): Promise<Libp2p> {
 	}
 
 	// Skip proactive bootstrap dials; rely on discovery and minimal churn
+
+	// Expose coordinated repo and storage for external use
+	(node as any).coordinatedRepo = coordinatedRepo;
+	(node as any).storageRepo = storageRepo;
+	(node as any).keyNetwork = keyNetwork;
 
 	return node;
 }
