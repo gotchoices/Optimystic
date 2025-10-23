@@ -1,0 +1,113 @@
+{
+  "name": "@optimystic/quereus-plugin-optimystic",
+  "version": "0.2.0",
+  "description": "Quereus plugin for Optimystic distributed tree collections",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "import": "./dist/index.js",
+      "types": "./dist/index.d.ts"
+    },
+    "./plugin": {
+      "import": "./dist/plugin.js",
+      "types": "./dist/plugin.d.ts"
+    }
+  },
+  "files": [
+    "dist",
+    "src",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "tsup",
+    "dev": "tsup --watch",
+    "clean": "rm -rf dist",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@quereus/quereus": "^0.4.5",
+    "@types/node": "^24.0.12",
+    "aegir": "^47.0.20",
+    "tsup": "^8.5.0",
+    "typescript": "^5.8.3"
+  },
+  "dependencies": {
+    "@chainsafe/libp2p-gossipsub": "^14.1.1",
+    "@chainsafe/libp2p-yamux": "^7.0.4",
+    "@libp2p/bootstrap": "^11.0.46",
+    "@libp2p/identify": "^3.0.38",
+    "@libp2p/interface": "^2.10.5",
+    "@libp2p/kad-dht": "^15.1.10",
+    "@libp2p/noise": "^12.0.1",
+    "@libp2p/tcp": "^10.1.18",
+    "@optimystic/db-core": "*",
+    "@optimystic/db-p2p": "*",
+    "debug": "^4.4.1",
+    "libp2p": "^2.9.0"
+  },
+  "peerDependencies": {
+    "@quereus/quereus": "^0.4.5"
+  },
+  "engines": {
+    "quereus": "^0.4.5"
+  },
+  "keywords": [
+    "quereus-plugin",
+    "quereus",
+    "optimystic",
+    "sql",
+    "vtab",
+    "plugin",
+    "distributed",
+    "database",
+    "virtual-table"
+  ],
+  "author": "Optimystic Team",
+  "license": "MIT",
+  "quereus": {
+    "provides": {
+      "vtables": ["optimystic"],
+      "functions": [],
+      "collations": []
+    },
+    "settings": [
+      {
+        "key": "default_transactor",
+        "label": "Default Transactor",
+        "type": "string",
+        "default": "network",
+        "help": "Default transactor type (network, test, or custom)"
+      },
+      {
+        "key": "default_key_network",
+        "label": "Default Key Network",
+        "type": "string",
+        "default": "libp2p",
+        "help": "Default key network type (libp2p, test, or custom)"
+      },
+      {
+        "key": "default_port",
+        "label": "Default Port",
+        "type": "number",
+        "default": 0,
+        "help": "Default port for libp2p nodes (0 = random)"
+      },
+      {
+        "key": "default_network_name",
+        "label": "Default Network Name",
+        "type": "string",
+        "default": "optimystic",
+        "help": "Default network identifier"
+      },
+      {
+        "key": "enable_cache",
+        "label": "Enable Caching",
+        "type": "boolean",
+        "default": true,
+        "help": "Whether to cache collections between queries"
+      }
+    ]
+  }
+}

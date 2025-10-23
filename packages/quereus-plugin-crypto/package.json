@@ -1,0 +1,71 @@
+{
+	"name": "@optimystic/quereus-plugin-crypto",
+	"version": "0.2.0",
+	"description": "Quereus plugin providing cryptographic functions (digest, sign, verify)",
+	"type": "module",
+	"main": "dist/index.js",
+	"types": "dist/index.d.ts",
+	"exports": {
+		".": {
+			"import": "./dist/index.js",
+			"types": "./dist/index.d.ts"
+		},
+		"./plugin": {
+			"import": "./dist/plugin.js",
+			"types": "./dist/plugin.d.ts"
+		}
+	},
+	"files": [
+		"dist",
+		"src",
+		"README.md"
+	],
+	"scripts": {
+		"build": "tsup",
+		"dev": "tsup --watch",
+		"clean": "rm -rf dist",
+		"typecheck": "tsc --noEmit"
+	},
+	"devDependencies": {
+		"@quereus/quereus": "^0.4.5",
+		"@types/node": "^24.0.12",
+		"aegir": "^47.0.20",
+		"tsup": "^8.5.0",
+		"typescript": "^5.8.3"
+	},
+	"dependencies": {
+		"@noble/curves": "^1.9.6",
+		"@noble/hashes": "^1.8.0",
+		"uint8arrays": "^5.1.0"
+	},
+	"peerDependencies": {
+		"@quereus/quereus": "^0.4.5"
+	},
+	"engines": {
+		"quereus": "^0.4.5"
+	},
+	"keywords": [
+		"quereus-plugin",
+		"quereus",
+		"crypto",
+		"cryptography",
+		"digest",
+		"hash",
+		"signature",
+		"sign",
+		"verify",
+		"secp256k1",
+		"ed25519",
+		"p256"
+	],
+	"author": "Optimystic Team",
+	"license": "MIT",
+	"quereus": {
+		"provides": {
+			"functions": ["digest", "sign", "verify", "hash_mod", "random_bytes"],
+			"vtables": [],
+			"collations": []
+		},
+		"settings": []
+	}
+}

@@ -1,0 +1,14 @@
+{
+	"extends": "aegir/src/config/tsconfig.aegir.json",
+	"compilerOptions": {
+		"outDir": "dist",
+		"strictFunctionTypes": true,
+		"noUncheckedIndexedAccess": true,
+		"skipLibCheck": true,
+		"incremental": false,
+		"composite": false,
+		"resolveJsonModule": true
+	},
+	"include": ["src/**/*"]
+}
+
