@@ -1,0 +1,30 @@
+{
+  "$schema": "https://quereus.dev/schemas/quoomb-config.json",
+  "description": "Config for Quoomb Web - browser-based SQL console",
+  "plugins": [
+    {
+      "source": "npm:@optimystic/quereus-plugin-optimystic",
+      "config": {
+        "default_transactor": "network",
+        "default_key_network": "libp2p",
+        "enable_cache": true,
+        "networkName": "optimystic-web"
+      }
+    }
+  ],
+  "autoload": true,
+  "notes": [
+    "For Quoomb Web:",
+    "1. Open Quoomb Web in your browser",
+    "2. Click Settings → Import Config",
+    "3. Upload this file or paste the JSON",
+    "4. Config will be saved to browser localStorage",
+    "5. Plugins will auto-load on page refresh",
+    "",
+    "Note: Browser-based libp2p has limitations:",
+    "- Uses WebRTC or WebSockets for transport",
+    "- May need WebRTC-enabled bootstrap nodes",
+    "- Consider using WebSocket multiaddrs for bootstrap"
+  ]
+}
+

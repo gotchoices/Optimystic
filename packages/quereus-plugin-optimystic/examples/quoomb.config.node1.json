@@ -1,0 +1,23 @@
+{
+  "$schema": "https://quereus.dev/schemas/quoomb-config.json",
+  "description": "First node in a multi-node mesh - starts bootstrap node",
+  "plugins": [
+    {
+      "source": "npm:@optimystic/quereus-plugin-optimystic",
+      "config": {
+        "default_transactor": "network",
+        "default_key_network": "libp2p",
+        "enable_cache": true,
+        "port": 8011,
+        "networkName": "optimystic-dev"
+      }
+    }
+  ],
+  "autoload": true,
+  "notes": [
+    "Start this node first with: quoomb --config quoomb.config.node1.json",
+    "After startup, copy the listening address shown (e.g., /ip4/127.0.0.1/tcp/8011/p2p/12D3KooW...)",
+    "Use that address as the bootstrap value in node2 config"
+  ]
+}
+

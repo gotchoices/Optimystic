@@ -2675,10 +2675,10 @@
   resolved "https://registry.yarnpkg.com/@polka/url/-/url-1.0.0-next.29.tgz#5a40109a1ab5f84d6fd8fc928b19f367cbe7e7b1"
   integrity sha512-wwQAWhWSuHaag8c4q/KN/vCoeOJYshAIvMQwD4GpSb3OiZklFfvAgmj0VCBBImRpuF/aFgIRzllXlVX93Jevww==
 
-"@quereus/quereus@^0.4.5":
-  version "0.4.5"
-  resolved "https://registry.yarnpkg.com/@quereus/quereus/-/quereus-0.4.5.tgz#1b691fb6a57181fbfdd0586dc36410127c7d651d"
-  integrity sha512-Y6vocSN/dub8ShF6Rke5zArhcYdnhgGfUSpBM/kMmmtC9funrKv1ZiyITFQBl7mXdXJPoIboW3cRWiXhp86TyQ==
+"@quereus/quereus@^0.4.8":
+  version "0.4.8"
+  resolved "https://registry.yarnpkg.com/@quereus/quereus/-/quereus-0.4.8.tgz#69ad43137a063e3d7d7276887bea17b991f2edaa"
+  integrity sha512-lXQsUn7pQ6Vx72to/oc2r1BW5fGmSUhv1WBjAGOkJSVWE5ooNQigwuveI5hDygujvAQWjMWxavdVtwAmf3paMw==
   dependencies:
     debug "^4.4.1"
     fast-json-patch "^3.1.1"

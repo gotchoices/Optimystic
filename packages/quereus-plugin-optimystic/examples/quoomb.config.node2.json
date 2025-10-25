@@ -1,0 +1,29 @@
+{
+  "$schema": "https://quereus.dev/schemas/quoomb-config.json",
+  "description": "Second node in a multi-node mesh - connects to node1",
+  "plugins": [
+    {
+      "source": "npm:@optimystic/quereus-plugin-optimystic",
+      "config": {
+        "default_transactor": "network",
+        "default_key_network": "libp2p",
+        "enable_cache": true,
+        "port": 8012,
+        "networkName": "optimystic-dev",
+        "bootstrap": "REPLACE_WITH_NODE1_MULTIADDR"
+      }
+    }
+  ],
+  "autoload": true,
+  "notes": [
+    "Before starting this node:",
+    "1. Start node1 first (see quoomb.config.node1.json)",
+    "2. Copy the multiaddr from node1 (e.g., /ip4/127.0.0.1/tcp/8011/p2p/12D3KooW...)",
+    "3. Replace REPLACE_WITH_NODE1_MULTIADDR with that address",
+    "4. Start this node with: quoomb --config quoomb.config.node2.json",
+    "",
+    "Alternative: Use environment variable:",
+    "  BOOTSTRAP_ADDR=/ip4/.../p2p/... quoomb --config quoomb.config.node2.env.json"
+  ]
+}
+

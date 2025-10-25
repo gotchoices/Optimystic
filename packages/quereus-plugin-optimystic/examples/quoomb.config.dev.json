@@ -1,0 +1,16 @@
+{
+  "$schema": "https://quereus.dev/schemas/quoomb-config.json",
+  "description": "Development config - uses test transactor (no network)",
+  "plugins": [
+    {
+      "source": "npm:@optimystic/quereus-plugin-optimystic",
+      "config": {
+        "default_transactor": "test",
+        "default_key_network": "test",
+        "enable_cache": false
+      }
+    }
+  ],
+  "autoload": true
+}
+

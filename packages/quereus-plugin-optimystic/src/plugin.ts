@@ -24,7 +24,7 @@ export default function register(db: Database, config: Record<string, SqlValue> 
 	const txnBridge = new TransactionBridge(collectionFactory);
 	const optimysticModule = new OptimysticModule(collectionFactory, txnBridge);
 
-	// Note: Transaction hooks are handled by the virtual table's xBegin, xCommit, xRollback methods
+	// Note: Transaction hooks are handled by the virtual table's begin, commit, rollback methods
 
 	return {
 		vtables: [

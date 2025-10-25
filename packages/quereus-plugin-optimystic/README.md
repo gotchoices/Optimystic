@@ -8,6 +8,8 @@ This plugin allows you to query and manipulate Optimystic distributed tree colle
 
 For cryptographic functions (hashing, signing, verification), see the separate [@optimystic/quereus-plugin-crypto](../quereus-plugin-crypto) package.
 
+**📖 New to Optimystic SQL? See [QUICK-START.md](./QUICK-START.md) for a 5-minute tutorial!**
+
 ## Installation
 
 ```bash
@@ -15,6 +17,33 @@ npm install @optimystic/quereus-plugin-optimystic
 ```
 
 ## Quick Start
+
+### Using Quoomb (Interactive SQL Console)
+
+The easiest way to get started is with [Quoomb](https://github.com/Digithought/quereus/tree/main/packages/quoomb-cli), the interactive SQL console for Quereus:
+
+```bash
+# Install Quoomb globally
+npm install -g @quereus/quoomb-cli
+
+# Start with Optimystic plugin using example config
+quoomb --config node_modules/@optimystic/quereus-plugin-optimystic/examples/quoomb.config.dev.json
+```
+
+Then in the Quoomb console:
+
+```sql
+CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)
+  USING optimystic('tree://app/users');
+
+INSERT INTO users VALUES (1, 'Alice'), (2, 'Bob');
+
+SELECT * FROM users;
+```
+
+**See [examples/README.md](./examples/README.md) for multi-node mesh setup and more configurations.**
+
+### Programmatic Usage
 
 ```typescript
 import { Database } from '@quereus/quereus';

@@ -27,7 +27,7 @@
     "typecheck": "tsc --noEmit"
   },
   "devDependencies": {
-    "@quereus/quereus": "^0.4.5",
+    "@quereus/quereus": "^0.4.8",
     "@types/node": "^24.0.12",
     "aegir": "^47.0.20",
     "tsup": "^8.5.0",
@@ -48,10 +48,10 @@
     "libp2p": "^2.9.0"
   },
   "peerDependencies": {
-    "@quereus/quereus": "^0.4.5"
+    "@quereus/quereus": "^0.4.8"
   },
   "engines": {
-    "quereus": "^0.4.5"
+    "quereus": "^0.4.8"
   },
   "keywords": [
     "quereus-plugin",
