@@ -4,17 +4,18 @@ import { NetworkTransactor } from '@optimystic/db-core';
 import type { RowData, ParsedOptimysticOptions, TransactionState } from '../types.js';
 import { createKeyNetwork } from './key-network.js';
 import type { IRepo } from '@optimystic/db-core';
-import type { PeerId } from '@libp2p/interface';
+import type { PeerId, Libp2p } from '@libp2p/interface';
 
 /**
  * Factory for creating and managing tree collections
  */
 export class CollectionFactory {
-  private collections = new Map<string, Tree<string, RowData>>();
   private transactors = new Map<string, ITransactor>();
+  private libp2pNodes = new Map<string, { node: Libp2p; coordinatedRepo: IRepo }>();
 
   /**
    * Create or get a tree collection
+   * Collections are only cached within a transaction to ensure proper isolation
    */
   async createOrGetCollection(
     options: ParsedOptimysticOptions,
@@ -22,16 +23,9 @@ export class CollectionFactory {
   ): Promise<Tree<string, RowData>> {
     const collectionKey = this.getCollectionKey(options);
 
-    // If we have an active transaction, check if the collection is already loaded
+    // Check transaction-specific cache (only cache within transaction scope)
     if (txnState?.isActive && txnState.collections.has(collectionKey)) {
       return txnState.collections.get(collectionKey)!;
-    }
-
-    // Check if we have a cached collection (for non-transactional access)
-    if (!txnState && this.collections.has(collectionKey)) {
-      const collection = this.collections.get(collectionKey)!;
-      // TODO: Check if collection is stale and needs update()
-      return collection;
     }
 
     // Create new collection
@@ -40,18 +34,22 @@ export class CollectionFactory {
 
     const compare = (a: string, b: string): -1 | 0 | 1 => (a < b ? -1 : a > b ? 1 : 0);
 
+    // Schema tree uses simple [key, value] tuples, not RowData arrays
+    const isSchemaTree = options.collectionUri === 'tree://optimystic/schema';
+    const keyExtractor = isSchemaTree
+      ? (entry: any) => entry[0] as string  // For schema tree: [tableName, schema]
+      : (entry: RowData) => this.extractKeyFromEntry(entry);  // For data trees: extract from RowData
+
     const collection = await Tree.createOrOpen<string, RowData>(
       transactor,
       collectionId,
-      (entry: RowData) => this.extractKeyFromEntry(entry), // Key extractor
+      keyExtractor,
       compare // Total order
     );
 
-    // Store in appropriate cache
+    // Store in transaction-specific cache (if we have an active transaction)
     if (txnState?.isActive) {
       txnState.collections.set(collectionKey, collection);
-    } else {
-      this.collections.set(collectionKey, collection);
     }
 
     return collection;
@@ -64,6 +62,9 @@ export class CollectionFactory {
     switch (options.transactor) {
       case 'network':
         return await this.createNetworkTransactor(options);
+
+      case 'local':
+        return await this.createLocalTransactor();
 
       case 'test':
         return await this.createTestTransactor();
@@ -92,14 +93,60 @@ export class CollectionFactory {
    * Create a network transactor
    */
   private async createNetworkTransactor(options: ParsedOptimysticOptions): Promise<ITransactor> {
-    const keyNetwork = await createKeyNetwork(
-      options.keyNetwork,
-      options.libp2p,
-      options.libp2pOptions
-    );
+    // Create or get libp2p node
+    const nodeKey = this.getNodeKey(options);
+    let nodeInfo = this.libp2pNodes.get(nodeKey);
 
-    const getRepo = (_peerId: PeerId): IRepo => {
-      throw new Error('Repo access not configured for NetworkTransactor in db-quereus.');
+    if (!nodeInfo) {
+      // Create a new libp2p node with all necessary services
+      const { createLibp2pNode, Libp2pKeyPeerNetwork, RepoClient } = await import('@optimystic/db-p2p');
+
+      const node = await createLibp2pNode({
+        port: options.libp2pOptions?.port ?? 0,
+        networkName: options.libp2pOptions?.networkName ?? 'optimystic',
+        bootstrapNodes: options.libp2pOptions?.bootstrapNodes ?? [],
+        storageType: 'memory', // Use memory storage for now
+        fretProfile: 'edge',
+        clusterSize: 1, // Allow single-node clusters
+        clusterPolicy: {
+          allowDownsize: true,
+          sizeTolerance: 1.0 // Very permissive for single-node testing
+        },
+        arachnode: {
+          enableRingZulu: true
+        }
+      });
+
+      // Get the coordinatedRepo that was created by createLibp2pNode
+      const coordinatedRepo = (node as any).coordinatedRepo as IRepo;
+      if (!coordinatedRepo) {
+        throw new Error('Failed to get coordinatedRepo from libp2p node');
+      }
+
+      nodeInfo = { node, coordinatedRepo };
+      this.libp2pNodes.set(nodeKey, nodeInfo);
+
+      console.log(`✅ Created libp2p node: ${node.peerId.toString()}`);
+      console.log(`📡 Listening on:`);
+      node.getMultiaddrs().forEach((ma) => {
+        console.log(`   ${ma.toString()}`);
+      });
+    }
+
+    const { node, coordinatedRepo } = nodeInfo;
+
+    // Create Libp2pKeyPeerNetwork which implements both IKeyNetwork and IPeerNetwork
+    const { Libp2pKeyPeerNetwork, RepoClient } = await import('@optimystic/db-p2p');
+    const keyNetwork = new Libp2pKeyPeerNetwork(node);
+    const protocolPrefix = `/optimystic/${options.libp2pOptions?.networkName ?? 'optimystic'}`;
+
+    const getRepo = (peerId: PeerId): IRepo => {
+      // If it's the local peer, return the coordinated repo
+      if (peerId.toString() === node.peerId.toString()) {
+        return coordinatedRepo;
+      }
+      // For remote peers, create a RepoClient
+      return RepoClient.create(peerId, keyNetwork, protocolPrefix);
     };
 
     return new NetworkTransactor({
@@ -111,13 +158,64 @@ export class CollectionFactory {
   }
 
   /**
-   * Create a test transactor
+   * Create a local transactor (in-memory, single-node, no network)
+   */
+  private async createLocalTransactor(): Promise<ITransactor> {
+    const { StorageRepo, BlockStorage, MemoryRawStorage } = await import('@optimystic/db-p2p');
+
+    // Create a shared memory storage for all blocks
+    const memoryStorage = new MemoryRawStorage();
+    const storageRepo = new StorageRepo((blockId: string) => new BlockStorage(blockId, memoryStorage));
+
+    // LocalTransactor implementation (simple wrapper around StorageRepo)
+    return {
+      async get(blockGets) {
+        return await storageRepo.get(blockGets);
+      },
+      async getStatus(_trxRefs) {
+        throw new Error('getStatus not implemented in local transactor');
+      },
+      async pend(request) {
+        return await storageRepo.pend(request);
+      },
+      async commit(request) {
+        return await storageRepo.commit(request);
+      },
+      async cancel(trxRef) {
+        return await storageRepo.cancel(trxRef);
+      },
+    } as ITransactor;
+  }
+
+  /**
+   * Create a test transactor (in-memory, single-node)
    */
   private async createTestTransactor(): Promise<ITransactor> {
-    // Provide a local stub to avoid build-time dependency on non-existent test utilities
+    const { StorageRepo, BlockStorage, MemoryRawStorage } = await import('@optimystic/db-p2p');
+
+    // Create a shared memory storage for all blocks
+    const memoryStorage = new MemoryRawStorage();
+
+    const storageRepo = new StorageRepo((blockId) => new BlockStorage(blockId, memoryStorage));
+
+    // Simple local transactor that wraps StorageRepo
     return {
-      async getCollection() { throw new Error('Test transactor is not available in this build.'); }
-    } as unknown as ITransactor;
+      async get(blockGets) {
+        return await storageRepo.get(blockGets);
+      },
+      async getStatus(_trxRefs) {
+        throw new Error('getStatus not implemented in test transactor');
+      },
+      async pend(request) {
+        return await storageRepo.pend(request);
+      },
+      async commit(request) {
+        return await storageRepo.commit(request);
+      },
+      async cancel(trxRef) {
+        return await storageRepo.cancel(trxRef);
+      },
+    } as ITransactor;
   }
 
   /**
@@ -140,6 +238,9 @@ export class CollectionFactory {
    * Parse collection URI to extract collection ID
    */
   private parseCollectionId(uri: string): CollectionId {
+    if (!uri) {
+      throw new Error('Collection URI is required');
+    }
     // Parse URIs like 'tree://mydb/users' or just 'users'
     if (uri.startsWith('tree://')) {
       const path = uri.substring(7); // Remove 'tree://'
@@ -181,11 +282,40 @@ export class CollectionFactory {
   }
 
   /**
-   * Clear all cached collections (useful for testing or cleanup)
+   * Get the peer ID from the current libp2p node (if available)
+   */
+  getPeerId(options: ParsedOptimysticOptions): string | undefined {
+    const nodeKey = this.getNodeKey(options);
+    const nodeInfo = this.libp2pNodes.get(nodeKey);
+    return nodeInfo?.node.peerId.toString();
+  }
+
+  /**
+   * Generate a unique key for libp2p node caching
+   */
+  private getNodeKey(options: ParsedOptimysticOptions): string {
+    const networkName = options.libp2pOptions?.networkName ?? 'optimystic';
+    const port = options.libp2pOptions?.port ?? 0;
+    return `${networkName}:${port}`;
+  }
+
+  /**
+   * Clear all cached transactors (useful for testing or cleanup)
+   * Note: Collections are only cached within transactions, not globally
    */
   clearCache(): void {
-    this.collections.clear();
     this.transactors.clear();
+  }
+
+  /**
+   * Shutdown all libp2p nodes
+   */
+  async shutdown(): Promise<void> {
+    for (const [key, { node }] of this.libp2pNodes.entries()) {
+      console.log(`Stopping libp2p node: ${key}`);
+      await node.stop();
+    }
+    this.libp2pNodes.clear();
   }
 
   /**

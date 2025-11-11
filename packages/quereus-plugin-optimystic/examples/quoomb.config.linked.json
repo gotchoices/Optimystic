@@ -1,0 +1,25 @@
+{
+  "$schema": "https://quereus.dev/schemas/quoomb-config.json",
+  "description": "Config using npm link with test transactor for local development",
+  "plugins": [
+    {
+      "source": "@optimystic/quereus-plugin-optimystic/plugin",
+      "config": {
+        "default_transactor": "test",
+        "default_key_network": "test",
+        "enable_cache": false
+      }
+    }
+  ],
+  "autoload": true,
+  "notes": [
+    "Before using this config:",
+    "1. cd packages/quereus-plugin-optimystic",
+    "2. npm run build",
+    "3. npm link",
+    "4. quoomb --config examples/quoomb.config.linked.json",
+    "",
+    "This uses TestTransactor which is in-memory only but doesn't require network setup"
+  ]
+}
+

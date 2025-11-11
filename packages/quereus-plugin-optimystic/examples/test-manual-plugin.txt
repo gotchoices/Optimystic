@@ -1,0 +1,23 @@
+Test script for manually loading the plugin in interactive mode:
+
+1. Start quoomb:
+   quoomb
+
+2. Install the plugin:
+   .plugin install file:///C:/projects/optimystic/packages/quereus-plugin-optimystic/dist/plugin.js
+
+3. Configure the plugin:
+   .plugin config optimystic default_transactor=test default_key_network=test
+
+4. Enable the plugin:
+   .plugin enable optimystic
+
+5. Create a table:
+   CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT) USING optimystic('tree://test/users');
+
+6. Insert data:
+   INSERT INTO users VALUES (1, 'Alice'), (2, 'Bob');
+
+7. Query:
+   SELECT * FROM users;
+

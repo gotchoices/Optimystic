@@ -2,6 +2,14 @@
 
 A Quereus virtual table plugin that provides SQL access to Optimystic distributed tree collections.
 
+## What's New
+
+- ✨ **TransactionId() function** - Get unique transaction identifiers for audit logging
+- 🔧 **Transaction-specific caching** - Better isolation and no stale data
+- 🧪 **Distributed testing** - Automated tests for multi-node operations
+
+See [CHANGELOG.md](./CHANGELOG.md) for details.
+
 ## Overview
 
 This plugin allows you to query and manipulate Optimystic distributed tree collections using standard SQL syntax through Quereus. It bridges the gap between SQL databases and Optimystic's distributed data structures.
@@ -203,6 +211,39 @@ await db.exec('COMMIT'); // Syncs changes to the distributed network
 - **COMMIT**: Syncs all collections used in the transaction
 - **ROLLBACK**: Discards local changes and clears collection cache
 
+### TransactionId() Function
+
+The plugin provides a `TransactionId()` SQL function that returns a unique identifier for the current transaction:
+
+```sql
+-- Get transaction ID
+BEGIN;
+SELECT TransactionId();  -- Returns base64url-encoded 32-byte ID
+COMMIT;
+
+-- Use in WITH CONTEXT clause
+CREATE TABLE audit_log (
+  id TEXT PRIMARY KEY,
+  action TEXT,
+  txn_id TEXT DEFAULT context_txn_id
+) USING optimystic('tree://app/audit')
+WITH CONTEXT (
+  context_txn_id TEXT
+);
+
+INSERT INTO audit_log (id, action)
+WITH CONTEXT context_txn_id = TransactionId()
+VALUES ('log1', 'user_created');
+```
+
+**Features:**
+- Returns NULL outside of transactions
+- Returns the same ID throughout a transaction
+- Different ID for each transaction
+- 32-byte format: 16 bytes SHA-256(peer ID) + 16 bytes random
+- Base64url encoded for safe use in SQL
+- Works immediately after BEGIN (no DML required)
+
 ## Cryptographic Functions
 
 For cryptographic functions (hashing, signing, verification, random bytes), use the separate [@optimystic/quereus-plugin-crypto](../quereus-plugin-crypto) package:
@@ -291,6 +332,22 @@ npm run build
 ```bash
 npm run typecheck
 ```
+
+### Testing
+
+```bash
+# Run all tests
+npm test
+
+# Run only distributed tests
+npm exec aegir test -t node -- --grep "Distributed"
+
+# Manual interactive mesh test
+npm run build
+node dist/test/manual-mesh-test.js
+```
+
+See [test/TESTING.md](./test/TESTING.md) for detailed testing documentation.
 
 ## License
 

@@ -1,6 +1,7 @@
 import type { ITransactor } from '@optimystic/db-core';
 import type { TransactionState, ParsedOptimysticOptions } from '../types.js';
 import { CollectionFactory } from './collection-factory.js';
+import { generateTransactionId } from '../util/generate-transaction-id.js';
 
 /**
  * Transaction bridge between Quereus and Optimystic
@@ -23,10 +24,15 @@ export class TransactionBridge {
 
     const transactor = await this.collectionFactory.createTransactor(options);
 
+    // Generate a unique transaction ID (includes peer ID hash if available)
+    const peerId = this.collectionFactory.getPeerId(options);
+    const transactionId = generateTransactionId(peerId);
+
     this.currentTransaction = {
       transactor,
       isActive: true,
       collections: new Map(),
+      transactionId,
     };
 
     return this.currentTransaction;

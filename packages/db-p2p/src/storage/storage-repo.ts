@@ -262,9 +262,8 @@ export class StorageRepo implements IRepo {
 			: undefined;
 
 		// Apply transform and save materialized block
-		const newBlock = priorBlock
-			? applyTransform(priorBlock, transform)
-			: undefined;
+		// applyTransform handles undefined priorBlock correctly for inserts
+		const newBlock = applyTransform(priorBlock, transform);
 		if (newBlock) {
 			await storage.saveMaterializedBlock(trxId, newBlock);
 		}

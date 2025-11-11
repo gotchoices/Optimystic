@@ -3,7 +3,7 @@
   "description": "Development config - uses test transactor (no network)",
   "plugins": [
     {
-      "source": "npm:@optimystic/quereus-plugin-optimystic",
+      "source": "${OPTIMYSTIC_PLUGIN:-@optimystic/quereus-plugin-optimystic}/plugin",
       "config": {
         "default_transactor": "test",
         "default_key_network": "test",

@@ -18,16 +18,23 @@
   "files": [
     "dist",
     "src",
+    "examples",
     "README.md"
   ],
   "scripts": {
     "build": "tsup",
     "dev": "tsup --watch",
     "clean": "rm -rf dist",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "test": "aegir test -t node",
+    "test:watch": "aegir test -t node --watch",
+    "quoomb": "npm run build && quoomb --config examples/quoomb.config.local.json",
+    "quoomb:dev": "quoomb --config examples/quoomb.config.dev.json",
+    "quoomb:node1": "npm run build && quoomb --config examples/quoomb.config.node1.json",
+    "quoomb:node2": "quoomb --config examples/quoomb.config.node2.env.json"
   },
   "devDependencies": {
-    "@quereus/quereus": "^0.4.8",
+    "@quereus/quereus": "^0.4.11",
     "@types/node": "^24.0.12",
     "aegir": "^47.0.20",
     "tsup": "^8.5.0",
@@ -42,16 +49,17 @@
     "@libp2p/kad-dht": "^15.1.10",
     "@libp2p/noise": "^12.0.1",
     "@libp2p/tcp": "^10.1.18",
+    "@noble/hashes": "^1.8.0",
     "@optimystic/db-core": "*",
     "@optimystic/db-p2p": "*",
     "debug": "^4.4.1",
     "libp2p": "^2.9.0"
   },
   "peerDependencies": {
-    "@quereus/quereus": "^0.4.8"
+    "@quereus/quereus": "^0.4.11"
   },
   "engines": {
-    "quereus": "^0.4.8"
+    "quereus": "^0.4.11"
   },
   "keywords": [
     "quereus-plugin",
@@ -68,8 +76,12 @@
   "license": "MIT",
   "quereus": {
     "provides": {
-      "vtables": ["optimystic"],
-      "functions": [],
+      "vtables": [
+        "optimystic"
+      ],
+      "functions": [
+        "TransactionId"
+      ],
       "collations": []
     },
     "settings": [

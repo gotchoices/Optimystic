@@ -1,0 +1,22 @@
+{
+  "$schema": "https://quereus.dev/schemas/quoomb-config.json",
+  "description": "Config using absolute file path - EDIT THE PATH BELOW",
+  "plugins": [
+    {
+      "source": "file:///C:/projects/optimystic/packages/quereus-plugin-optimystic/dist/plugin.js",
+      "config": {
+        "default_transactor": "test",
+        "default_key_network": "test",
+        "enable_cache": false
+      }
+    }
+  ],
+  "autoload": true,
+  "notes": [
+    "IMPORTANT: Edit the 'source' path above to match your actual file system path",
+    "Windows: file:///C:/path/to/plugin.js",
+    "Unix: file:///absolute/path/to/plugin.js",
+    "Make sure to run 'npm run build' first!"
+  ]
+}
+

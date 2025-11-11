@@ -1,0 +1,22 @@
+{
+  "$schema": "https://quereus.dev/schemas/quoomb-config.json",
+  "description": "Local development config - loads plugin from local file system",
+  "plugins": [
+    {
+      "source": "../dist/plugin.js",
+      "config": {
+        "default_transactor": "test",
+        "default_key_network": "test",
+        "enable_cache": false
+      }
+    }
+  ],
+  "autoload": true,
+  "notes": [
+    "This config loads the plugin from the local dist/ directory",
+    "Path is relative to this config file location",
+    "Make sure to run 'npm run build' first!",
+    "Usage: quoomb --config examples/quoomb.config.local.json"
+  ]
+}
+

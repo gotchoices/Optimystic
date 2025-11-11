@@ -2,20 +2,30 @@
  * Tests for secondary index support in Optimystic quereus plugin
  */
 
-import { describe, it, expect, beforeEach } from 'vitest';
+import { expect } from 'aegir/chai';
 import { Database } from '@quereus/quereus';
-import { register } from '../src/plugin.js';
+import register from '../dist/plugin.js';
 
 describe('Optimystic Index Support', () => {
 	let db: Database;
 
 	beforeEach(async () => {
 		db = new Database();
-		await register(db, {
+		const plugin = register(db, {
 			default_transactor: 'test',
 			default_key_network: 'test',
 			enable_cache: false,
 		});
+
+		// Register vtables
+		for (const vtable of plugin.vtables) {
+			db.registerVtabModule(vtable.name, vtable.module, vtable.auxData);
+		}
+
+		// Register functions
+		for (const func of plugin.functions) {
+			db.registerFunction(func.schema);
+		}
 	});
 
 	describe('CREATE INDEX', () => {

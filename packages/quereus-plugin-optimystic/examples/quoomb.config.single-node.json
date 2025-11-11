@@ -1,0 +1,25 @@
+{
+  "$schema": "https://quereus.dev/schemas/quoomb-config.json",
+  "description": "Single-node network config for testing - uses npm linked plugin",
+  "plugins": [
+    {
+      "source": "@optimystic/quereus-plugin-optimystic/plugin",
+      "config": {
+        "default_transactor": "network",
+        "default_key_network": "libp2p",
+        "default_port": 0,
+        "default_network_name": "optimystic-test",
+        "enable_cache": true
+      }
+    }
+  ],
+  "autoload": true,
+  "notes": [
+    "This config uses NetworkTransactor with a single node",
+    "Before using:",
+    "1. npm run build",
+    "2. npm link",
+    "3. quoomb --config examples/quoomb.config.single-node.json"
+  ]
+}
+

@@ -7,9 +7,10 @@
 
 import { CollectionFactory } from './optimystic-adapter/collection-factory.js';
 import { TransactionBridge } from './optimystic-adapter/txn-bridge.js';
+import { OptimysticVirtualTableConnection } from './optimystic-adapter/vtab-connection.js';
 import type { ParsedOptimysticOptions } from './types.js';
 import { VirtualTable } from '@quereus/quereus';
-import type { VirtualTableModule, BaseModuleConfig, Database, TableSchema, Row, FilterInfo, RowOp, BestAccessPlanRequest, BestAccessPlanResult, OrderingSpec } from '@quereus/quereus';
+import type { VirtualTableModule, BaseModuleConfig, Database, TableSchema, Row, FilterInfo, RowOp, BestAccessPlanRequest, BestAccessPlanResult, OrderingSpec, VirtualTableConnection } from '@quereus/quereus';
 import { Tree } from '@optimystic/db-core';
 import { KeyRange } from '@optimystic/db-core';
 import { SchemaManager } from './schema/schema-manager.js';
@@ -32,12 +33,16 @@ export interface OptimysticModuleConfig extends BaseModuleConfig {
   encoding?: 'json' | 'msgpack';
 }
 
+let instanceCounter = 0;
+
 /**
  * Production-grade virtual table for Optimystic tree collections
  */
 export class OptimysticVirtualTable extends VirtualTable {
+  private instanceId = ++instanceCounter;
   private collection?: Tree<string, any>;
   private isInitialized = false;
+  private initializationPromise?: Promise<void>;
   private txnBridge: TransactionBridge;
   private collectionFactory: CollectionFactory;
   private options: ParsedOptimysticOptions;
@@ -45,6 +50,7 @@ export class OptimysticVirtualTable extends VirtualTable {
   private rowCodec?: RowCodec;
   private indexManager?: IndexManager;
   private statisticsCollector?: StatisticsCollector;
+  private connection?: OptimysticVirtualTableConnection;
   public tableSchema: TableSchema; // Changed from private to public to match base class
 
   constructor(
@@ -74,6 +80,20 @@ export class OptimysticVirtualTable extends VirtualTable {
       return;
     }
 
+    // If initialization is already in progress, wait for it
+    if (this.initializationPromise) {
+      return this.initializationPromise;
+    }
+
+    // Start initialization
+    this.initializationPromise = this.doInitialize();
+    return this.initializationPromise;
+  }
+
+  /**
+   * Internal initialization logic
+   */
+  private async doInitialize(): Promise<void> {
     try {
       const txnState = this.txnBridge.getCurrentTransaction();
       this.collection = await this.collectionFactory.createOrGetCollection(
@@ -95,6 +115,30 @@ export class OptimysticVirtualTable extends VirtualTable {
         if (!storedSchema) {
           throw new Error('Failed to store and retrieve schema');
         }
+      } else {
+        // Existing table - update our tableSchema with the loaded schema
+        // This is important for connect() which creates a minimal schema
+        this.tableSchema.columns = storedSchema.columns.map((col, index) => ({
+          name: col.name,
+          affinity: col.affinity as any,
+          notNull: col.notNull,
+          primaryKey: col.primaryKey,
+          pkOrder: col.pkOrder,
+          defaultValue: col.defaultValue,
+          collation: col.collation,
+          generated: col.generated,
+          pkDirection: col.pkDirection,
+          index,
+        }));
+        this.tableSchema.columnIndexMap = new Map(
+          storedSchema.columns.map((col, index) => [col.name.toLowerCase(), index])
+        );
+        this.tableSchema.primaryKeyDefinition = storedSchema.primaryKeyDefinition.map(pk => ({
+          index: pk.index,
+          desc: pk.desc,
+          autoIncrement: pk.autoIncrement,
+          collation: pk.collation,
+        }));
       }
 
       this.rowCodec = new RowCodec(storedSchema, this.options.encoding);
@@ -107,7 +151,7 @@ export class OptimysticVirtualTable extends VirtualTable {
         };
         const tree = await this.collectionFactory.createOrGetCollection(
           indexOptions,
-          transactor ? { transactor, isActive: true, collections: new Map() } : undefined
+          transactor ? { transactor, isActive: true, collections: new Map(), transactionId: '' } : undefined
         );
         // Index trees store string->string mappings (IndexKey->PrimaryKey)
         return tree as unknown as Tree<string, string>;
@@ -128,16 +172,61 @@ export class OptimysticVirtualTable extends VirtualTable {
 
   /**
    * Disconnects from this virtual table connection instance
+   * Note: We don't reset isInitialized or collection here because the table
+   * should remain initialized across multiple statements/connections
    */
   async disconnect(): Promise<void> {
-    this.collection = undefined;
-    this.isInitialized = false;
+    // Don't reset state - the table should remain initialized
+  }
+
+  /**
+   * Ensures a connection is established and registered with the database
+   * This is called automatically on first table access, but can also be called
+   * explicitly to register the connection early (e.g., for transaction support)
+   */
+  async ensureConnectionRegistered(): Promise<OptimysticVirtualTableConnection> {
+    if (!this.connection) {
+      // Check if there's already an active connection for this table in the database
+      // Using type assertion to access internal methods
+      const db = this.db as any;
+      const existingConnections = db.getConnectionsForTable(this.tableName);
+      if (existingConnections.length > 0 && existingConnections[0] instanceof OptimysticVirtualTableConnection) {
+        this.connection = existingConnections[0] as OptimysticVirtualTableConnection;
+      } else {
+        // Create a new connection and register it with the database
+        this.connection = new OptimysticVirtualTableConnection(this.tableName, this.txnBridge, this.options);
+        await db.registerConnection(this.connection);
+      }
+    }
+    return this.connection;
+  }
+
+  /**
+   * Creates a new VirtualTableConnection for transaction support
+   */
+  createConnection(): VirtualTableConnection {
+    return new OptimysticVirtualTableConnection(this.tableName, this.txnBridge, this.options);
+  }
+
+  /**
+   * Gets the current connection if this table maintains one internally
+   */
+  getConnection(): VirtualTableConnection | undefined {
+    return this.connection;
   }
 
   /**
    * Opens a direct data stream for this virtual table based on filter criteria
    */
   async* query(filterInfo: FilterInfo): AsyncIterable<Row> {
+    // Ensure connection is registered
+    await this.ensureConnectionRegistered();
+
+    // Wait for initialization if needed
+    if (!this.isInitialized) {
+      await this.initialize();
+    }
+
     if (!this.collection || !this.rowCodec || !this.indexManager) {
       throw new Error('Table not initialized');
     }
@@ -305,6 +394,14 @@ export class OptimysticVirtualTable extends VirtualTable {
     values: Row | undefined,
     oldKeyValues?: Row
   ): Promise<Row | undefined> {
+    // Ensure connection is registered
+    await this.ensureConnectionRegistered();
+
+    // Wait for initialization if needed
+    if (!this.isInitialized) {
+      await this.initialize();
+    }
+
     if (!this.collection || !this.rowCodec || !this.indexManager) {
       throw new Error('Table not initialized');
     }
@@ -403,6 +500,7 @@ export class OptimysticVirtualTable extends VirtualTable {
    */
   async begin(): Promise<void> {
     try {
+      await this.ensureConnectionRegistered();
       await this.txnBridge.beginTransaction(this.options);
     } catch (error) {
       const message = `Begin transaction failed: ${error instanceof Error ? error.message : String(error)}`;
@@ -443,28 +541,35 @@ export class OptimysticVirtualTable extends VirtualTable {
  */
 export class OptimysticModule implements VirtualTableModule<OptimysticVirtualTable, OptimysticModuleConfig> {
   private schemaManager: SchemaManager;
+  private tables = new Map<string, OptimysticVirtualTable>();
 
   constructor(
     private collectionFactory: CollectionFactory,
     private txnBridge: TransactionBridge
   ) {
-    // Create schema manager with a factory function for the schema tree
-    this.schemaManager = new SchemaManager(async (transactor) => {
+    // Schema manager will be created per-table with appropriate transactor settings
+    this.schemaManager = new SchemaManager(async (_transactor) => {
+      throw new Error('Schema manager not initialized - this should not be called');
+    });
+  }
+
+  /**
+   * Create a schema manager for a specific table's transactor configuration
+   */
+  private createSchemaManager(tableOptions: ParsedOptimysticOptions): SchemaManager {
+    return new SchemaManager(async (transactor) => {
       const schemaOptions: ParsedOptimysticOptions = {
         collectionUri: 'tree://optimystic/schema',
-        transactor: 'network',
-        keyNetwork: 'libp2p',
-        libp2pOptions: {
-          port: 0,
-          networkName: 'optimystic',
-          bootstrapNodes: [],
-        },
+        transactor: tableOptions.transactor,
+        keyNetwork: tableOptions.keyNetwork,
+        libp2p: tableOptions.libp2p,
+        libp2pOptions: tableOptions.libp2pOptions,
         cache: true,
         encoding: 'json',
       };
       return await this.collectionFactory.createOrGetCollection(
         schemaOptions,
-        transactor ? { transactor, isActive: true, collections: new Map() } : undefined
+        transactor ? { transactor, isActive: true, collections: new Map(), transactionId: '' } : undefined
       );
     });
   }
@@ -509,7 +614,15 @@ export class OptimysticModule implements VirtualTableModule<OptimysticVirtualTab
     db: Database,
     tableSchema: TableSchema
   ): OptimysticVirtualTable {
+    const tableKey = `${tableSchema.schemaName}.${tableSchema.name}`.toLowerCase();
+
+    // Check if table already exists
+    if (this.tables.has(tableKey)) {
+      throw new Error(`Optimystic table '${tableSchema.name}' already exists in schema '${tableSchema.schemaName}'.`);
+    }
+
     const options = this.parseTableSchema(tableSchema);
+    const schemaManager = this.createSchemaManager(options);
     const table = new OptimysticVirtualTable(
       db,
       this,
@@ -519,11 +632,18 @@ export class OptimysticModule implements VirtualTableModule<OptimysticVirtualTab
       options,
       this.collectionFactory,
       this.txnBridge,
-      this.schemaManager
+      schemaManager
     );
 
-    // Initialize asynchronously - this might need to be handled differently
-    table.initialize().catch(error => {
+    // Cache the table
+    this.tables.set(tableKey, table);
+
+    // Initialize and register connection asynchronously
+    // This ensures the connection is available for transactions even before first data access
+    table.initialize().then(async () => {
+      // Ensure connection is registered so BEGIN can find it
+      await table.ensureConnectionRegistered();
+    }).catch(error => {
       console.error('Failed to initialize Optimystic table:', error);
     });
 
@@ -536,57 +656,19 @@ export class OptimysticModule implements VirtualTableModule<OptimysticVirtualTab
   connect(
     db: Database,
     _pAux: unknown,
-    moduleName: string,
+    _moduleName: string,
     schemaName: string,
     tableName: string,
-    options: OptimysticModuleConfig
+    _options: OptimysticModuleConfig
   ): OptimysticVirtualTable {
-    const parsedOptions: ParsedOptimysticOptions = {
-      collectionUri: options.collectionUri,
-      transactor: options.transactor || 'network',
-      keyNetwork: options.keyNetwork || 'libp2p',
-      libp2pOptions: {
-        port: options.port || 0,
-        networkName: options.networkName || 'optimystic',
-        bootstrapNodes: [],
-      },
-      cache: options.cache !== false,
-      encoding: options.encoding || 'json',
-    };
+    const tableKey = `${schemaName}.${tableName}`.toLowerCase();
+    const existingTable = this.tables.get(tableKey);
 
-    // For connect, we need to retrieve the schema from storage
-    // For now, create a minimal schema - this will be loaded during initialize
-    const tableSchema: TableSchema = {
-      name: tableName,
-      schemaName,
-      columns: [],
-      columnIndexMap: new Map(),
-      primaryKeyDefinition: [],
-      checkConstraints: [],
-      vtabModule: this,
-      vtabModuleName: moduleName,
-      vtabArgs: options as any,
-      isView: false,
-    };
+    if (!existingTable) {
+      throw new Error(`Optimystic table definition for '${tableName}' not found. Cannot connect.`);
+    }
 
-    const table = new OptimysticVirtualTable(
-      db,
-      this,
-      schemaName,
-      tableName,
-      tableSchema,
-      parsedOptions,
-      this.collectionFactory,
-      this.txnBridge,
-      this.schemaManager
-    );
-
-    // Initialize asynchronously - will load schema from storage
-    table.initialize().catch(error => {
-      console.error('Failed to initialize Optimystic table:', error);
-    });
-
-    return table;
+    return existingTable;
   }
 
   /**
