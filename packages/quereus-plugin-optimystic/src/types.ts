@@ -73,9 +73,12 @@ export interface ColumnDefinition {
 }
 
 /**
- * Row data as stored in the tree (array format)
+ * Row data as stored in the tree
+ * Format: [primaryKey, encodedRow]
+ * - primaryKey: string representation of the primary key (composite keys are joined with \x00)
+ * - encodedRow: JSON-encoded row data
  */
-export type RowData = (string | number | boolean | null | Uint8Array)[];
+export type RowData = [string, string];
 
 /**
  * Transaction state for managing Optimystic transactions

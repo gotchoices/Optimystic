@@ -254,17 +254,11 @@ export class CollectionFactory {
   }
 
   /**
-   * Extract key from entry (assumes first element is the primary key)
+   * Extract key from entry
+   * Entry format: [primaryKey, encodedRow]
    */
   private extractKeyFromEntry(entry: RowData): string {
-    if (entry.length === 0) {
-      throw new Error('Entry must have at least one element (primary key)');
-    }
-    const key = entry[0];
-    if (typeof key !== 'string') {
-      throw new Error('Primary key must be a string');
-    }
-    return key;
+    return entry[0];
   }
 
   /**

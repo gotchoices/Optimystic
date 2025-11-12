@@ -6,6 +6,7 @@
  */
 
 import type { Row, SqlValue } from '@quereus/quereus';
+import { resolveCollation, compareSqlValues, type CollationFunction } from '@quereus/quereus';
 import type { StoredTableSchema } from './schema-manager.js';
 
 /**
@@ -210,6 +211,102 @@ export class RowCodec {
 	 */
 	getSchema(): StoredTableSchema {
 		return this.schema;
+	}
+
+	/**
+	 * Create a comparison function for primary keys that respects collations
+	 * This is used by the Tree to maintain proper sort order
+	 */
+	createPrimaryKeyComparator(): (a: string, b: string) => -1 | 0 | 1 {
+		const pkDef = this.schema.primaryKeyDefinition;
+
+		// For empty primary key (singleton table), all keys are equal
+		if (pkDef.length === 0) {
+			return () => 0;
+		}
+
+		// For single-column primary key
+		if (pkDef.length === 1) {
+			const collationName = pkDef[0]?.collation || 'BINARY';
+			const collationFunc = resolveCollation(collationName);
+			const desc = pkDef[0]?.desc || false;
+			const multiplier = desc ? -1 : 1;
+
+			return (a: string, b: string): -1 | 0 | 1 => {
+				// Deserialize the key parts
+				const valueA = this.deserializeKeyPart(a);
+				const valueB = this.deserializeKeyPart(b);
+
+				// Compare using the appropriate collation
+				const result = this.compareValues(valueA, valueB, collationFunc);
+				return (result * multiplier) as -1 | 0 | 1;
+			};
+		}
+
+		// For composite primary key
+		const collationFuncs = pkDef.map(def => resolveCollation(def.collation || 'BINARY'));
+		const descFlags = pkDef.map(def => def.desc || false);
+
+		return (a: string, b: string): -1 | 0 | 1 => {
+			// Split composite keys
+			const partsA = a.split('\x00');
+			const partsB = b.split('\x00');
+
+			// Compare each part in order
+			for (let i = 0; i < pkDef.length; i++) {
+				const valueA = this.deserializeKeyPart(partsA[i] || '');
+				const valueB = this.deserializeKeyPart(partsB[i] || '');
+
+				const result = this.compareValues(valueA, valueB, collationFuncs[i]!);
+				if (result !== 0) {
+					const multiplier = descFlags[i] ? -1 : 1;
+					return (result * multiplier) as -1 | 0 | 1;
+				}
+			}
+
+			return 0;
+		};
+	}
+
+	/**
+	 * Deserialize a key part back to its original value
+	 */
+	private deserializeKeyPart(serialized: string): SqlValue {
+		if (serialized === '\x01NULL\x01') {
+			return null;
+		}
+
+		// Try to parse as number
+		const num = Number(serialized);
+		if (!isNaN(num) && serialized !== '') {
+			return num;
+		}
+
+		// Otherwise treat as string
+		return serialized;
+	}
+
+	/**
+	 * Compare two values using the specified collation
+	 */
+	private compareValues(a: SqlValue, b: SqlValue, collationFunc: CollationFunction): number {
+		// Handle nulls first
+		if (a === null && b === null) return 0;
+		if (a === null) return -1;
+		if (b === null) return 1;
+
+		// For strings, use the collation function
+		if (typeof a === 'string' && typeof b === 'string') {
+			return collationFunc(a, b);
+		}
+
+		// For numbers, use numeric comparison
+		if (typeof a === 'number' && typeof b === 'number') {
+			return a < b ? -1 : a > b ? 1 : 0;
+		}
+
+		// For mixed types, use SQL comparison rules
+		return compareSqlValues(a, b, 'BINARY');
 	}
 }
 

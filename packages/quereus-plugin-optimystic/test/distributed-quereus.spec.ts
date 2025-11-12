@@ -1,6 +1,6 @@
 /**
  * Distributed Quereus Test
- * 
+ *
  * Creates a mesh of N nodes, creates Quereus tables with Optimystic backend,
  * performs DML operations, and verifies data replication across all nodes.
  */
@@ -17,7 +17,7 @@ import {
 	RepoClient
 } from '@optimystic/db-p2p';
 import { NetworkTransactor } from '@optimystic/db-core';
-import { register } from '../src/plugin.js';
+import register from '../dist/plugin.js';
 
 interface TestNode {
 	node: any;
@@ -136,7 +136,7 @@ describe('Distributed Quereus Operations', () => {
 
 		// Insert data from different nodes
 		console.log('\nInserting data from different nodes...');
-		
+
 		await nodes[0]!.db.exec(`INSERT INTO ${tableName} (id, name, price) VALUES ('1', 'Widget', 19.99)`);
 		console.log('   Node 1: Inserted Widget');
 		await delay(500);
@@ -152,9 +152,14 @@ describe('Distributed Quereus Operations', () => {
 		// Verify all nodes see all data
 		console.log('\nVerifying data on all nodes...');
 		for (let i = 0; i < nodes.length; i++) {
-			const results = await nodes[i]!.db.prepare(`SELECT * FROM ${tableName} ORDER BY id`).all();
+			const stmt = await nodes[i]!.db.prepare(`SELECT * FROM ${tableName} ORDER BY id`);
+			const results = [];
+			for await (const row of stmt.all()) {
+				results.push(row);
+			}
+			await stmt.finalize();
 			console.log(`   Node ${i + 1}: ${results.length} rows`);
-			
+
 			assert.strictEqual(results.length, 3, `Node ${i + 1} should have 3 rows`);
 			assert.strictEqual(results[0]!.name, 'Widget');
 			assert.strictEqual(results[1]!.name, 'Gadget');
@@ -257,9 +262,14 @@ describe('Distributed Quereus Operations', () => {
 		// Verify deletion on all nodes
 		console.log('Verifying deletion on all nodes...');
 		for (let i = 0; i < nodes.length; i++) {
-			const results = await nodes[i]!.db.prepare(`SELECT * FROM ${tableName} ORDER BY id`).all();
+			const stmt = await nodes[i]!.db.prepare(`SELECT * FROM ${tableName} ORDER BY id`);
+			const results = [];
+			for await (const row of stmt.all()) {
+				results.push(row);
+			}
+			await stmt.finalize();
 			console.log(`   Node ${i + 1}: ${results.length} rows`);
-			
+
 			assert.strictEqual(results.length, 2, `Node ${i + 1} should have 2 rows`);
 			assert.strictEqual(results[0]!.id, '1');
 			assert.strictEqual(results[1]!.id, '3');
@@ -292,30 +302,38 @@ describe('Distributed Quereus Operations', () => {
 			throw new Error('coordinatedRepo not available on node');
 		}
 
-		const repoClient = new RepoClient(coordinatedRepo);
-		const transactor = new NetworkTransactor(repoClient, keyNetwork, node.peerId);
+		const protocolPrefix = `/optimystic/${NETWORK_NAME}`;
+		const transactor = new NetworkTransactor({
+			timeoutMs: 30_000,
+			abortOrCancelTimeoutMs: 5_000,
+			keyNetwork,
+			getRepo: (peerId) => {
+				// If it's the local peer, return the coordinated repo
+				if (peerId.toString() === node.peerId.toString()) {
+					return coordinatedRepo;
+				}
+				// For remote peers, create a RepoClient
+				return RepoClient.create(peerId, keyNetwork, protocolPrefix);
+			}
+		});
 
 		// Create Quereus database
 		const db = new Database();
 
-		// Register Optimystic plugin with this node's transactor
-		const plugin = await register(db, {
-			transactor,
-			keyNetwork,
-			node
+		// Register Optimystic plugin with default settings
+		const plugin = register(db, {
+			default_transactor: 'test', // We'll override with our custom transactor
+			default_key_network: 'test',
+			enable_cache: false
 		});
 
 		// Register the plugin's virtual tables and functions
-		if (plugin.vtables) {
-			for (const [name, vtable] of Object.entries(plugin.vtables)) {
-				db.registerVirtualTableModule(name, vtable);
-			}
+		for (const vtable of plugin.vtables) {
+			db.registerVtabModule(vtable.name, vtable.module, vtable.auxData);
 		}
 
-		if (plugin.functions) {
-			for (const [name, func] of Object.entries(plugin.functions)) {
-				db.registerFunction(name, func);
-			}
+		for (const func of plugin.functions) {
+			db.registerFunction(func.schema);
 		}
 
 		return {

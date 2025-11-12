@@ -10,11 +10,13 @@ import { TransactionBridge } from './optimystic-adapter/txn-bridge.js';
 import { OptimysticVirtualTableConnection } from './optimystic-adapter/vtab-connection.js';
 import type { ParsedOptimysticOptions } from './types.js';
 import { VirtualTable } from '@quereus/quereus';
-import type { VirtualTableModule, BaseModuleConfig, Database, TableSchema, Row, FilterInfo, RowOp, BestAccessPlanRequest, BestAccessPlanResult, OrderingSpec, VirtualTableConnection } from '@quereus/quereus';
+import type { VirtualTableModule, BaseModuleConfig, Database, TableSchema, Row, FilterInfo, RowOp, BestAccessPlanRequest, BestAccessPlanResult, OrderingSpec, VirtualTableConnection, TableIndexSchema as IndexSchema } from '@quereus/quereus';
 import { Tree } from '@optimystic/db-core';
 import { KeyRange } from '@optimystic/db-core';
 import { SchemaManager } from './schema/schema-manager.js';
 import { RowCodec } from './schema/row-codec.js';
+import { SqlDataType } from '@quereus/quereus';
+import { INTEGER_TYPE, REAL_TYPE, TEXT_TYPE, BLOB_TYPE, NUMERIC_TYPE, NULL_TYPE, type LogicalType } from '@quereus/quereus';
 import { IndexManager } from './schema/index-manager.js';
 import { StatisticsCollector } from './schema/statistics-collector.js';
 
@@ -34,6 +36,30 @@ export interface OptimysticModuleConfig extends BaseModuleConfig {
 }
 
 let instanceCounter = 0;
+
+/**
+ * Helper function to convert SqlDataType affinity to LogicalType
+ */
+function affinityToLogicalType(affinity: SqlDataType): LogicalType {
+	switch (affinity) {
+		case SqlDataType.NULL:
+			return NULL_TYPE;
+		case SqlDataType.INTEGER:
+			return INTEGER_TYPE;
+		case SqlDataType.REAL:
+			return REAL_TYPE;
+		case SqlDataType.TEXT:
+			return TEXT_TYPE;
+		case SqlDataType.BLOB:
+			return BLOB_TYPE;
+		case SqlDataType.NUMERIC:
+			return NUMERIC_TYPE;
+		case SqlDataType.BOOLEAN:
+			return INTEGER_TYPE; // BOOLEAN stored as INTEGER
+		default:
+			return BLOB_TYPE; // Default fallback
+	}
+}
 
 /**
  * Production-grade virtual table for Optimystic tree collections
@@ -121,6 +147,7 @@ export class OptimysticVirtualTable extends VirtualTable {
         this.tableSchema.columns = storedSchema.columns.map((col, index) => ({
           name: col.name,
           affinity: col.affinity as any,
+          logicalType: affinityToLogicalType(col.affinity as any),
           notNull: col.notNull,
           primaryKey: col.primaryKey,
           pkOrder: col.pkOrder,
@@ -360,8 +387,9 @@ export class OptimysticVirtualTable extends VirtualTable {
           continue;
         }
 
-        const entry = this.collection.at(path) as [string, any];
+        const entry = this.collection.at(path);
         if (entry && entry.length >= 2) {
+          // Entry format: [primaryKey, encodedRow]
           const encodedRow = entry[1];
           const row = this.rowCodec.decodeRow(encodedRow);
           yield row;
@@ -376,8 +404,9 @@ export class OptimysticVirtualTable extends VirtualTable {
           continue;
         }
 
-        const entry = this.collection.at(path) as [string, any];
+        const entry = this.collection.at(path);
         if (entry && entry.length >= 2) {
+          // Entry format: [primaryKey, encodedRow]
           const encodedRow = entry[1];
           const row = this.rowCodec.decodeRow(encodedRow);
           yield row;
@@ -419,7 +448,8 @@ export class OptimysticVirtualTable extends VirtualTable {
             const encodedRow = this.rowCodec.encodeRow(values);
 
             // Insert into main table
-            await this.collection.replace([[insertKey, encodedRow]]);
+            // Entry format: [primaryKey, encodedRow]
+            await this.collection.replace([[insertKey, [insertKey, encodedRow]]]);
 
             // Insert into all indexes
             await this.indexManager.insertIndexEntries(values, insertKey, txnState?.transactor);
@@ -447,11 +477,11 @@ export class OptimysticVirtualTable extends VirtualTable {
               // Key changed - delete old, insert new
               await this.collection.replace([
                 [oldKey, undefined],
-                [newKey, encodedRow]
+                [newKey, [newKey, encodedRow]]
               ]);
             } else {
               // Simple update
-              await this.collection.replace([[newKey, encodedRow]]);
+              await this.collection.replace([[newKey, [newKey, encodedRow]]]);
             }
 
             // Update all indexes
@@ -492,6 +522,83 @@ export class OptimysticVirtualTable extends VirtualTable {
       const message = `${operation} failed: ${error instanceof Error ? error.message : String(error)}`;
       this.setErrorMessage(message);
       throw new Error(message);
+    }
+  }
+
+  /**
+   * Add an index to the table schema
+   */
+  async addIndex(indexSchema: IndexSchema): Promise<void> {
+    // Wait for initialization if needed
+    if (!this.isInitialized) {
+      await this.initialize();
+    }
+
+    if (!this.schemaManager || !this.indexManager) {
+      throw new Error('Table not initialized');
+    }
+
+    // Update the stored schema with the new index
+    const storedSchema = await this.schemaManager.getSchema(this.tableName);
+    if (!storedSchema) {
+      throw new Error('Schema not found');
+    }
+
+    // Add the index to the stored schema
+    const updatedSchema = {
+      ...storedSchema,
+      indexes: [...storedSchema.indexes, {
+        name: indexSchema.name,
+        columns: indexSchema.columns.map((col: { index: number; desc?: boolean; collation?: string }) => ({
+          index: col.index,
+          desc: col.desc,
+          collation: col.collation,
+        })),
+      }],
+    };
+
+    // Save the updated schema
+    const txnState = this.txnBridge.getCurrentTransaction();
+    await this.schemaManager.storeSchema({
+      ...this.tableSchema,
+      indexes: updatedSchema.indexes.map(idx => ({
+        name: idx.name,
+        columns: idx.columns,
+      })),
+    }, txnState?.transactor);
+
+    // Initialize the new index tree
+    const indexTreeFactory = async (indexName: string, transactor?: any) => {
+      const indexOptions: ParsedOptimysticOptions = {
+        ...this.options,
+        collectionUri: `${this.options.collectionUri}/index/${indexName}`,
+      };
+      const tree = await this.collectionFactory.createOrGetCollection(
+        indexOptions,
+        transactor ? { transactor, isActive: true, collections: new Map(), transactionId: '' } : undefined
+      );
+      return tree as unknown as Tree<string, string>;
+    };
+
+    const indexTree = await indexTreeFactory(indexSchema.name, txnState?.transactor);
+
+    // Add the index to the index manager
+    if (this.indexManager) {
+      (this.indexManager as any).indexTrees.set(indexSchema.name, indexTree);
+      (this.indexManager as any).schema = updatedSchema;
+    }
+
+    // Populate the index with existing data
+    if (this.collection && this.rowCodec) {
+      const firstPath = await this.collection.first();
+      for await (const path of this.collection.ascending(firstPath)) {
+        const encodedRow = this.collection.at(path);
+        if (encodedRow) {
+          const row = this.rowCodec.decodeRow(encodedRow);
+          const primaryKey = this.rowCodec.extractPrimaryKey(row);
+          await this.indexManager.insertIndexEntries(row, primaryKey, txnState?.transactor);
+        }
+      }
     }
   }
 
@@ -669,6 +776,26 @@ export class OptimysticModule implements VirtualTableModule<OptimysticVirtualTab
     }
 
     return existingTable;
+  }
+
+  /**
+   * Creates an index on an Optimystic virtual table
+   */
+  async createIndex(
+    _db: Database,
+    schemaName: string,
+    tableName: string,
+    indexSchema: IndexSchema
+  ): Promise<void> {
+    const tableKey = `${schemaName}.${tableName}`.toLowerCase();
+    const table = this.tables.get(tableKey);
+
+    if (!table) {
+      throw new Error(`Optimystic table '${tableName}' not found in schema '${schemaName}'. Cannot create index.`);
+    }
+
+    // Update the stored schema with the new index
+    await table.addIndex(indexSchema);
   }
 
   /**

@@ -45,22 +45,31 @@ describe('Optimystic Index Support', () => {
 			await db.exec('CREATE INDEX idx_category ON products(category)');
 
 			// Verify index was created
-			const indexes = await db.exec('SELECT name FROM sqlite_master WHERE type="index" AND tbl_name="products"');
-			expect(indexes).toContainEqual({ name: 'idx_category' });
+			const indexes = [];
+			for await (const row of db.eval('SELECT name FROM schema() WHERE type="index" AND tbl_name="products"')) {
+				indexes.push(row);
+			}
+			expect(indexes.some((i: any) => i.name === 'idx_category')).to.be.true;
 		});
 
 		it('should create multi-column index', async () => {
 			await db.exec('CREATE INDEX idx_category_price ON products(category, price)');
 
-			const indexes = await db.exec('SELECT name FROM sqlite_master WHERE type="index" AND tbl_name="products"');
-			expect(indexes).toContainEqual({ name: 'idx_category_price' });
+			const indexes = [];
+			for await (const row of db.eval('SELECT name FROM schema() WHERE type="index" AND tbl_name="products"')) {
+				indexes.push(row);
+			}
+			expect(indexes.some((i: any) => i.name === 'idx_category_price')).to.be.true;
 		});
 
 		it('should create unique index', async () => {
 			await db.exec('CREATE UNIQUE INDEX idx_name ON products(name)');
 
-			const indexes = await db.exec('SELECT name FROM sqlite_master WHERE type="index" AND tbl_name="products"');
-			expect(indexes).toContainEqual({ name: 'idx_name' });
+			const indexes = [];
+			for await (const row of db.eval('SELECT name FROM schema() WHERE type="index" AND tbl_name="products"')) {
+				indexes.push(row);
+			}
+			expect(indexes.some((i: any) => i.name === 'idx_name')).to.be.true;
 		});
 	});
 
