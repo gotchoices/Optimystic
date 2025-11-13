@@ -44,11 +44,11 @@ export class Collection<TAction> implements ICollection<TAction> {
 
 		if (header) {	// Collection already exists
 			const log = (await Log.open<Action<TAction>>(tracker, id))!;
-			source.trxContext = await log.getTrxContext();
+			source.actionContext = await log.getActionContext();
 		} else {	// Collection does not exist
 			const headerBlock = init.createHeaderBlock(id, tracker);
 			tracker.insert(headerBlock);
-			source.trxContext = undefined;
+			source.actionContext = undefined;
 			await Log.open<Action<TAction>>(tracker, id);
 		}
 
@@ -61,17 +61,17 @@ export class Collection<TAction> implements ICollection<TAction> {
 	}
 
 	private async internalTransact(...actions: Action<TAction>[]) {
-		const trx = new Atomic(this.tracker);
+		const atomic = new Atomic(this.tracker);
 
 		for (const action of actions) {
 			const handler = this.handlers[action.type];
 			if (!handler) {
 				throw new Error(`No handler for action type ${action.type}`);
 			}
-			await handler(action, trx);
+			await handler(action, atomic);
 		}
 
-		trx.commit();
+		atomic.commit();
 	}
 
 	/** Load external changes and update our context to the latest log revision - resolve any conflicts with our pending actions. */
@@ -81,9 +81,9 @@ export class Collection<TAction> implements ICollection<TAction> {
 		const tracker = new Tracker(source);
 
 		// Get the latest entries from the log, starting from where we left off
-		const trxContext = this.source.trxContext;
+		const actionContext = this.source.actionContext;
 		const log = await Log.open<Action<TAction>>(tracker, this.id);
-		const latest = log ? await log.getFrom(trxContext?.rev ?? 0) : undefined;
+		const latest = log ? await log.getFrom(actionContext?.rev ?? 0) : undefined;
 
 		// Process the entries and track the blocks they affect
 		let anyConflicts = false;
@@ -101,7 +101,7 @@ export class Collection<TAction> implements ICollection<TAction> {
 		}
 
 		// Update our context to the latest
-		this.source.trxContext = latest?.context;
+		this.source.actionContext = latest?.context;
 	}
 
 	/** Push our pending actions to the transactor */
@@ -110,42 +110,42 @@ export class Collection<TAction> implements ICollection<TAction> {
 		const release = await Latches.acquire(lockId);
 		try {
 			const bytes = randomBytes(16);
-			const trxId = uint8ArrayToString(bytes, 'base64url');
+			const actionId = uint8ArrayToString(bytes, 'base64url');
 
 			while (this.pending.length || !isTransformsEmpty(this.tracker.transforms)) {
-				// Snapshot the pending actions so that any new actions aren't assumed to be part of this transaction
+				// Snapshot the pending actions so that any new actions aren't assumed to be part of this action
 				const pending = [...this.pending];
 
-				// Create a snapshot tracker for the transaction, so that we can ditch the log changes if we have to retry the transaction
+				// Create a snapshot tracker for the action, so that we can ditch the log changes if we have to retry the action
 				const snapshot = copyTransforms(this.tracker.transforms);
 				const tracker = new Tracker(this.sourceCache, snapshot);
 
-				// Add the transaction to the log (in local tracking space)
+				// Add the action to the log (in local tracking space)
 				const log = await Log.open<Action<TAction>>(tracker, this.id);
 				if (!log) {
 					throw new Error(`Log not found for collection ${this.id}`);
 				}
-				const newRev = (this.source.trxContext?.rev ?? 0) + 1;
-				const addResult = await log.addActions(pending, trxId, newRev, () => tracker.transformedBlockIds());
+				const newRev = (this.source.actionContext?.rev ?? 0) + 1;
+				const addResult = await log.addActions(pending, actionId, newRev, () => tracker.transformedBlockIds());
 
-				// Commit the transaction to the transactor
-				const staleFailure = await this.source.transact(tracker.transforms, trxId, newRev, this.id, addResult.tailPath.block.header.id);
+				// Commit the action to the transactor
+				const staleFailure = await this.source.transact(tracker.transforms, actionId, newRev, this.id, addResult.tailPath.block.header.id);
 				if (staleFailure) {
 					if (staleFailure.pending) {
-						// Wait for short time to allow the pending transactions to commit (bounded backoff)
+						// Wait for short time to allow the pending actions to commit (bounded backoff)
 						await new Promise(resolve => setTimeout(resolve, PendingRetryDelayMs));
 					}
 					await this.update();
 				} else {
-					// Clear the pending actions that were part of this transaction
+					// Clear the pending actions that were part of this action
 					this.pending = this.pending.slice(pending.length);
-					// Reset cache and replay any actions that were added during the transaction
+					// Reset cache and replay any actions that were added during the action
 					const transforms = tracker.reset();
 					await this.replayActions();
 					this.sourceCache.transformCache(transforms);
-					this.source.trxContext = this.source.trxContext
-						? { committed: [...this.source.trxContext.committed, { trxId, rev: newRev }], rev: newRev }
-						: { committed: [{ trxId, rev: newRev }], rev: newRev };
+					this.source.actionContext = this.source.actionContext
+						? { committed: [...this.source.actionContext.committed, { actionId, rev: newRev }], rev: newRev }
+						: { committed: [{ actionId, rev: newRev }], rev: newRev };
 				}
 			}
 		} finally {

@@ -103,15 +103,15 @@ Collections communicate with remote state through a **transactor** (covered in d
 - **Conflict detection** across network participants
 - **Block distribution** and storage coordination
 
-### Transaction Context
+### Action Context
 
-Collections maintain awareness of the distributed transaction state:
+Collections maintain awareness of the distributed action state:
 
 ```typescript
-type TrxContext = {
-  committed: TrxRev[];  // Transactions that may not be checkpointed
-  rev: number;          // Latest known revision number
-  trxId?: TrxId;        // Optional uncommitted pending transaction ID
+type ActionContext = {
+  committed: ActionRev[];  // Actions that may not be checkpointed
+  rev: number;             // Latest known revision number
+  actionId?: ActionId;     // Optional uncommitted pending action ID
 };
 ```
 
@@ -131,7 +131,7 @@ async update() {
   
   // 2. Get latest entries from the log since our last update
   const log = await Log.open<Action<TAction>>(tracker, this.id);
-  const latest = log ? await log.getFrom(this.source.trxContext?.rev ?? 0) : undefined;
+  const latest = log ? await log.getFrom(this.source.actionContext?.rev ?? 0) : undefined;
   
   // 3. Process remote actions and detect conflicts
   let anyConflicts = false;

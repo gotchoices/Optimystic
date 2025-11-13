@@ -1,4 +1,4 @@
-import type { BlockId, CollectionId, TrxContext, TrxId, TrxRev } from "../index.js";
+import type { BlockId, CollectionId, ActionContext, ActionId, ActionRev } from "../index.js";
 
 /** A log entry - either an action or a checkpoint */
 export type LogEntry<TAction> = {
@@ -12,29 +12,29 @@ export type LogEntry<TAction> = {
 
 /** An action entry represents a unit of work that is atomic */
 export type ActionEntry<TAction> = {
-	/** Generated unique identifier for the transaction */
-	readonly trxId: TrxId;
+	/** Generated unique identifier for the action */
+	readonly actionId: ActionId;
 	/** Actions to be applied */
 	readonly actions: TAction[];
-	/** Block ids affected by the transaction - includes the log related blocks */
+	/** Block ids affected by the action - includes the log related blocks */
 	blockIds: BlockId[]; // NOTE: this is updated after being generated to include the log-related block transforms
-	/** Other collection ids affected by the transaction - this transaction is conditional on successful commit in all of these collections */
+	/** Other collection ids affected by the action - this action is conditional on successful commit in all of these collections */
 	readonly collectionIds?: CollectionId[];
 };
 
-/** A checkpoint entry restates the currently uncheckpointed transactions */
+/** A checkpoint entry restates the currently uncheckpointed actions */
 export type CheckpointEntry = {
-	/** The current set of pending transaction/revs
+	/** The current set of pending action/revs
 	 * - actions implicitly increase the set of pending Ids
 	 * - this restates the entire current set
 	 * - missing from the set are the implicitly checkpointed ones */
-	readonly pendings: TrxRev[];
+	readonly pendings: ActionRev[];
 };
 
 export const LogDataBlockType = "LGD";
 export const LogHeaderBlockType = "LGH";
 
 export type GetFromResult<TAction> = {
-	context: TrxContext | undefined;
+	context: ActionContext | undefined;
 	entries: ActionEntry<TAction>[];
 };

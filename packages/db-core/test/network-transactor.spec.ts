@@ -4,10 +4,10 @@ import { NetworkSimulation } from './simulation.js'
 import type { Scenario } from './simulation.js'
 import { randomBytes } from '@libp2p/crypto'
 import { blockIdToBytes } from '../src/utility/block-id-to-bytes.js'
-import type { BlockId, PendRequest, TrxId, BlockOperation } from '../src/index.js'
+import type { BlockId, PendRequest, ActionId, BlockOperation } from '../src/index.js'
 import type { PeerId } from '@libp2p/interface'
 import { toString as uint8ArrayToString } from 'uint8arrays/to-string'
-import { generateRandomTrxId } from './generate-random-trx-id.js'
+import { generateRandomActionId } from './generate-random-trx-id.js'
 
 describe('NetworkTransactor', () => {
   // Helper to generate block IDs
@@ -58,10 +58,10 @@ describe('NetworkTransactor', () => {
     it('should pend a transaction on the network', async () => {
       const { networkTransactor } = await setupNetworkTest()
       const blockId = generateBlockId()
-      const trxId = generateRandomTrxId()
+      const actionId = generateRandomActionId()
 
       const pendRequest: PendRequest = {
-        trxId,
+        actionId,
         transforms: {
           updates: {
             [blockId]: [createBlockOperation()]
@@ -84,7 +84,7 @@ describe('NetworkTransactor', () => {
     it('should handle pend failures gracefully', async () => {
       const { network, networkTransactor } = await setupNetworkTest()
       const blockId = generateBlockId()
-      const trxId = generateRandomTrxId()
+      const actionId = generateRandomActionId()
 
       // Make one of the nodes unavailable if nodes array is not empty
       if (network.nodes.length > 0) {
@@ -92,7 +92,7 @@ describe('NetworkTransactor', () => {
         firstNode!.transactor.available = false
 
         const pendRequest: PendRequest = {
-          trxId,
+          actionId,
           transforms: {
             updates: {
               [blockId]: [createBlockOperation()]
@@ -121,11 +121,11 @@ describe('NetworkTransactor', () => {
     it('should commit a pending transaction', async () => {
       const { networkTransactor } = await setupNetworkTest()
       const blockId = generateBlockId()
-      const trxId = generateRandomTrxId()
+      const actionId = generateRandomActionId()
 
       // First pend the transaction
       const pendRequest: PendRequest = {
-        trxId,
+        actionId,
         transforms: {
           inserts: {	// Has to be an insert for a non-existing block
 						[blockId]: { header: { id: blockId, type: 'block', collectionId: 'test' } }
@@ -140,7 +140,7 @@ describe('NetworkTransactor', () => {
 
       // Then commit it
       const result = await networkTransactor.commit({
-        trxId,
+        actionId,
         rev: 1,
         blockIds: [blockId],
         tailId: blockId,
@@ -154,11 +154,11 @@ describe('NetworkTransactor', () => {
     it('should cancel a pending transaction', async () => {
       const { networkTransactor } = await setupNetworkTest()
       const blockId = generateBlockId()
-      const trxId = generateRandomTrxId()
+      const actionId = generateRandomActionId()
 
       // First pend the transaction
       const pendRequest: PendRequest = {
-        trxId,
+        actionId,
         transforms: {
           updates: {
             [blockId]: [createBlockOperation()]
@@ -173,14 +173,14 @@ describe('NetworkTransactor', () => {
 
       // Then cancel it
       await networkTransactor.cancel({
-        trxId,
+        actionId,
         blockIds: [blockId]
       })
 
       // Verify it was canceled by trying to commit, which should fail
       try {
         await networkTransactor.commit({
-          trxId,
+          actionId,
           rev: 1,
           blockIds: [blockId],
           tailId: blockId,
@@ -197,11 +197,11 @@ describe('NetworkTransactor', () => {
   //   it('should get the status of transactions', async () => {
   //     const { networkTransactor } = await setupNetworkTest()
   //     const blockId = generateBlockId()
-  //     const trxId = generateRandomTrxId()
+  //     const actionId = generateRandomActionId()
 
   //     // First pend the transaction
   //     const pendRequest: PendRequest = {
-  //       trxId,
+  //       actionId,
   //       transforms: {
   //         updates: {
   //           [blockId]: [createBlockOperation()]
@@ -216,7 +216,7 @@ describe('NetworkTransactor', () => {
 
   //     // Check status
   //     const statusResult = await networkTransactor.getStatus([{
-  //       trxId,
+  //       actionId,
   //       blockIds: [blockId]
   //     }])
 
@@ -255,10 +255,10 @@ describe('NetworkTransactor', () => {
 
       // Try to pend a transaction with the partial transactor
       const blockId = generateBlockId()
-      const trxId = generateRandomTrxId()
+      const actionId = generateRandomActionId()
 
       const pendRequest: PendRequest = {
-        trxId,
+        actionId,
         transforms: {
           updates: {
             [blockId]: [createBlockOperation()]
@@ -286,7 +286,7 @@ describe('NetworkTransactor', () => {
 
       // Make a block ID
       const blockId = generateBlockId()
-      const trxId = generateRandomTrxId()
+      const actionId = generateRandomActionId()
 
       // Find the coordinator for this block
       const key = await blockIdToBytes(blockId)
@@ -299,7 +299,7 @@ describe('NetworkTransactor', () => {
 
         // Try to pend a transaction - it should fall back to another node
         const pendRequest: PendRequest = {
-          trxId,
+          actionId,
           transforms: {
             updates: {
               [blockId]: [createBlockOperation()]

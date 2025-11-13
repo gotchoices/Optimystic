@@ -1,8 +1,8 @@
-import type { TrxId } from "../src/collection/transaction";
+import type { ActionId } from "../src/collection/action";
 import { toString as uint8ArrayToString } from 'uint8arrays/to-string';
 
 // Helper function to generate deterministic UUIDs for testing
-export function generateNumericTrxId(num: number): TrxId {
+export function generateNumericActionId(num: number): ActionId {
 	// Convert num to Uint8Array handling is num is larger than 255
 	const bytes = new Uint8Array(4);
 	bytes[0] = num & 0xff;

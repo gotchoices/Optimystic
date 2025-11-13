@@ -41,12 +41,12 @@ The `ITransactor` interface defines the core distributed transaction operations:
 interface ITransactor {
   // Read operations
   get(blockGets: BlockGets): Promise<GetBlockResults>;
-  getStatus(trxRefs: TrxBlocks[]): Promise<BlockTrxStatus[]>;
-  
-  // Transaction operations
-  pend(blockTrx: PendRequest): Promise<PendResult>;
+  getStatus(actionRefs: ActionBlocks[]): Promise<BlockActionStatus[]>;
+
+  // Action operations
+  pend(blockAction: PendRequest): Promise<PendResult>;
   commit(request: CommitRequest): Promise<CommitResult>;
-  cancel(trxRef: TrxBlocks): Promise<void>;
+  cancel(actionRef: ActionBlocks): Promise<void>;
 }
 ```
 
@@ -238,31 +238,31 @@ type StaleFailure = {
 };
 ```
 
-#### Missing Transactions
+#### Missing Actions
 
-**Missing transactions** represent committed changes that occurred after our local snapshot:
+**Missing actions** represent committed changes that occurred after our local snapshot:
 
 ```typescript
-type TrxTransforms = {
-  trxId: TrxId;
+type ActionTransforms = {
+  actionId: ActionId;
   rev?: number;
   transforms: Transforms;  // The actual changes that were committed
 };
 ```
 
-When `missing` transactions are returned:
+When `missing` actions are returned:
 - **Remote state has advanced** beyond our local revision
 - **We need to update** our snapshot with these committed changes
-- **Our transaction must be rebased** on the newer state
+- **Our action must be rebased** on the newer state
 
-#### Pending Transactions
+#### Pending Actions
 
-**Pending transactions** represent in-flight changes on blocks we want to modify:
+**Pending actions** represent in-flight changes on blocks we want to modify:
 
 ```typescript
-type TrxPending = {
+type ActionPending = {
   blockId: BlockId;
-  trxId: TrxId;
+  actionId: ActionId;
   transform?: Transform;  // The pending change (if policy allows)
 };
 ```
@@ -275,25 +275,25 @@ When `pending` transactions are returned:
 #### Handling Conflict Resolution
 
 ```typescript
-const staleFailure = await source.transact(transforms, trxId, rev, headerId, tailId);
+const staleFailure = await source.transact(transforms, actionId, rev, headerId, tailId);
 if (staleFailure) {
   if (staleFailure.missing) {
     // Remote state has advanced - we need to update our snapshot
-    await collection.update();  // Fetch missing transactions
+    await collection.update();  // Fetch missing actions
     // Filter/replay our pending actions against new state
     await collection.replayActions();
   }
-  
+
   if (staleFailure.pending) {
-    // Other transactions are in progress
+    // Other actions are in progress
     // Strategy 1: Wait and retry
     await new Promise(resolve => setTimeout(resolve, 100));
-    
+
     // Strategy 2: Proceed with awareness of pending changes
     // (depending on application logic and conflict tolerance)
   }
-  
-  // Retry the transaction with updated state
+
+  // Retry the action with updated state
 }
 ```
 

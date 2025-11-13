@@ -1,5 +1,5 @@
 import { type PeerId } from "@libp2p/interface";
-import type { TrxTransforms, TrxBlocks, BlockTrxStatus, ITransactor, PendSuccess, StaleFailure, IKeyNetwork, BlockId, GetBlockResults, PendResult, CommitResult, PendRequest, IRepo, BlockGets, Transforms, CommitRequest, TrxId, RepoCommitRequest } from "../index.js";
+import type { ActionTransforms, ActionBlocks, BlockActionStatus, ITransactor, PendSuccess, StaleFailure, IKeyNetwork, BlockId, GetBlockResults, PendResult, CommitResult, PendRequest, IRepo, BlockGets, Transforms, CommitRequest, ActionId, RepoCommitRequest } from "../index.js";
 import { transformForBlockId, groupBy, concatTransforms, concatTransform, transformsFromTransform, blockIdsForTransforms } from "../index.js";
 import { blockIdToBytes } from "../utility/block-id-to-bytes.js";
 import { isRecordEmpty } from "../utility/is-record-empty.js";
@@ -127,7 +127,7 @@ export class NetworkTransactor implements ITransactor {
 		return Object.fromEntries(resultEntries) as GetBlockResults;
 	}
 
-	async getStatus(blockTrxes: TrxBlocks[]): Promise<BlockTrxStatus[]> {
+	async getStatus(blockActions: ActionBlocks[]): Promise<BlockActionStatus[]> {
 		throw new Error("Method not implemented.");
 	}
 
@@ -173,15 +173,15 @@ export class NetworkTransactor implements ITransactor {
 		return batches;
 	}
 
-	async pend(blockTrx: PendRequest): Promise<PendResult> {
+	async pend(blockAction: PendRequest): Promise<PendResult> {
 		const transformForBlock = (payload: Transforms, blockId: BlockId, mergeWithPayload: Transforms | undefined): Transforms => {
 			const filteredTransform = transformForBlockId(payload, blockId);
 			return mergeWithPayload
 				? concatTransform(mergeWithPayload, blockId, filteredTransform)
 				: transformsFromTransform(filteredTransform, blockId);
 		};
-		const blockIds = blockIdsForTransforms(blockTrx.transforms);
-		const batches = await this.consolidateCoordinators(blockIds, blockTrx.transforms, transformForBlock);
+		const blockIds = blockIdsForTransforms(blockAction.transforms);
+		const batches = await this.consolidateCoordinators(blockIds, blockAction.transforms, transformForBlock);
 		const expiration = Date.now() + this.timeoutMs;
 
 		let error: Error | undefined;
@@ -190,7 +190,7 @@ export class NetworkTransactor implements ITransactor {
 			await processBatches(
 				batches,
 				(batch) => this.getRepo(batch.peerId).pend(
-					{ ...blockTrx, transforms: batch.payload },
+					{ ...blockAction, transforms: batch.payload },
 					{
 						expiration,
 						coordinatingBlockIds: (batch as any).coordinatingBlockIds
@@ -228,13 +228,13 @@ export class NetworkTransactor implements ITransactor {
 			error = aggregate;
 		}
 
-		if (error) { // If any failures, cancel all pending transactions as background microtask
-			Promise.resolve().then(() => this.cancelBatch(batches, { blockIds, trxId: blockTrx.trxId }));
+		if (error) { // If any failures, cancel all pending actions as background microtask
+			Promise.resolve().then(() => this.cancelBatch(batches, { blockIds, actionId: blockAction.actionId }));
 			const stale = Array.from(allBatches(batches, b => b.request?.isResponse as boolean && !b.request!.response!.success));
 			if (stale.length > 0) {	// Any active stale failures should preempt reporting connection or other potential transient errors (we have information)
 				return {
 					success: false,
-					missing: distinctBlockTrxTransforms(stale.flatMap(b => (b.request!.response! as StaleFailure).missing).filter((x): x is TrxTransforms => x !== undefined)),
+					missing: distinctBlockActionTransforms(stale.flatMap(b => (b.request!.response! as StaleFailure).missing).filter((x): x is ActionTransforms => x !== undefined)),
 				};
 			}
 			throw error;	// No stale failures, report the original error
@@ -245,21 +245,21 @@ export class NetworkTransactor implements ITransactor {
 		return {
 			success: true,
 			pending: completed.flatMap(b => (b.request!.response! as PendSuccess).pending),
-			blockIds: blockIdsForTransforms(blockTrx.transforms)
+			blockIds: blockIdsForTransforms(blockAction.transforms)
 		};
 	}
 
-	async cancel(trxRef: TrxBlocks): Promise<void> {
+	async cancel(actionRef: ActionBlocks): Promise<void> {
 		const batches = await this.batchesForPayload<BlockId[], void>(
-			trxRef.blockIds,
-			trxRef.blockIds,
+			actionRef.blockIds,
+			actionRef.blockIds,
 			mergeBlocks,
 			[]
 		);
 		const expiration = Date.now() + this.abortOrCancelTimeoutMs;
 		await processBatches(
 			batches,
-			(batch) => this.getRepo(batch.peerId).cancel({ trxId: trxRef.trxId, blockIds: batch.payload }, { expiration }),
+			(batch) => this.getRepo(batch.peerId).cancel({ actionId: actionRef.actionId, blockIds: batch.payload }, { expiration }),
 			batch => batch.payload,
 			mergeBlocks,
 			expiration,
@@ -272,14 +272,14 @@ export class NetworkTransactor implements ITransactor {
 
 		// Commit the header block if provided and not already in blockIds
 		if (request.headerId && !request.blockIds.includes(request.headerId)) {
-			const headerResult = await this.commitBlock(request.headerId, allBlockIds, request.trxId, request.rev);
+			const headerResult = await this.commitBlock(request.headerId, allBlockIds, request.actionId, request.rev);
 			if (!headerResult.success) {
 				return headerResult;
 			}
 		}
 
 		// Commit the tail block
-		const tailResult = await this.commitBlock(request.tailId, allBlockIds, request.trxId, request.rev);
+		const tailResult = await this.commitBlock(request.tailId, allBlockIds, request.actionId, request.rev);
 		if (!tailResult.success) {
 			return tailResult;
 		}
@@ -290,9 +290,9 @@ export class NetworkTransactor implements ITransactor {
 			!(request.headerId && bid === request.headerId && !request.blockIds.includes(request.headerId))
 		);
 		if (remainingBlocks.length > 0) {
-			const { batches, error } = await this.commitBlocks({ blockIds: remainingBlocks, trxId: request.trxId, rev: request.rev });
+			const { batches, error } = await this.commitBlocks({ blockIds: remainingBlocks, actionId: request.actionId, rev: request.rev });
 			if (error) {
-				// Non-tail block commit failures should not fail the overall transaction once the tail has committed.
+				// Non-tail block commit failures should not fail the overall action once the tail has committed.
 				// Proceed and rely on reconciliation paths (e.g. reads with context) to finalize state on lagging peers.
 				try { console.warn('[NetworkTransactor] non-tail commit had errors; proceeding after tail commit:', error.message); } catch { /* ignore */ }
 			}
@@ -301,15 +301,15 @@ export class NetworkTransactor implements ITransactor {
 		return { success: true };
 	}
 
-	private async commitBlock(blockId: BlockId, blockIds: BlockId[], trxId: TrxId, rev: number): Promise<CommitResult> {
-		const { batches: tailBatches, error: tailError } = await this.commitBlocks({ blockIds: [blockId], trxId, rev });
+	private async commitBlock(blockId: BlockId, blockIds: BlockId[], actionId: ActionId, rev: number): Promise<CommitResult> {
+		const { batches: tailBatches, error: tailError } = await this.commitBlocks({ blockIds: [blockId], actionId, rev });
 		if (tailError) {
-			// Cancel all pending transactions as background microtask
-			Promise.resolve().then(() => this.cancel({ blockIds, trxId }));
+			// Cancel all pending actions as background microtask
+			Promise.resolve().then(() => this.cancel({ blockIds, actionId }));
 			// Collect and return any active stale failures
 			const stale = Array.from(allBatches(tailBatches, b => b.request?.isResponse as boolean && !b.request!.response!.success));
 			if (stale.length > 0) {
-				return { missing: distinctBlockTrxTransforms(stale.flatMap(b => (b.request!.response! as StaleFailure).missing!)), success: false as const };
+				return { missing: distinctBlockActionTransforms(stale.flatMap(b => (b.request!.response! as StaleFailure).missing!)), success: false as const };
 			}
 			throw tailError;
 		}
@@ -317,14 +317,14 @@ export class NetworkTransactor implements ITransactor {
 	}
 
 	/** Attempts to commit a set of blocks, and handles failures and errors */
-	private async commitBlocks({ blockIds, trxId, rev }: RepoCommitRequest) {
+	private async commitBlocks({ blockIds, actionId, rev }: RepoCommitRequest) {
 		const expiration = Date.now() + this.timeoutMs;
 		const batches = await this.batchesForPayload<BlockId[], CommitResult>(blockIds, blockIds, mergeBlocks, []);
 		let error: Error | undefined;
 		try {
 			await processBatches(
 				batches,
-				(batch) => this.getRepo(batch.peerId).commit({ trxId, blockIds: batch.payload, rev }, { expiration }),
+				(batch) => this.getRepo(batch.peerId).commit({ actionId, blockIds: batch.payload, rev }, { expiration }),
 				batch => batch.payload,
 				mergeBlocks,
 				expiration,
@@ -369,18 +369,18 @@ export class NetworkTransactor implements ITransactor {
 	/** Cancels a pending transaction by canceling all blocks associated with the transaction, including failed peers */
 	private async cancelBatch<TPayload, TResponse>(
 		batches: CoordinatorBatch<TPayload, TResponse>[],
-		trxRef: TrxBlocks,
+		actionRef: ActionBlocks,
 	) {
 		const expiration = Date.now() + this.abortOrCancelTimeoutMs;
 		const operationBatches = makeBatchesByPeer(
 			Array.from(allBatches(batches)).map(b => [b.blockId, b.peerId] as const),
-			trxRef.blockIds,
+			actionRef.blockIds,
 			mergeBlocks,
 			[]
 		);
 		await processBatches(
 			operationBatches,
-			(batch) => this.getRepo(batch.peerId).cancel({ trxId: trxRef.trxId, blockIds: batch.payload }, { expiration }),
+			(batch) => this.getRepo(batch.peerId).cancel({ actionId: actionRef.actionId, blockIds: batch.payload }, { expiration }),
 			batch => batch.payload,
 			mergeBlocks,
 			expiration,
@@ -404,10 +404,10 @@ export class NetworkTransactor implements ITransactor {
 
 
 /**
- * Returns the block trxes grouped by transaction id and concatenated transforms
+ * Returns the block actions grouped by action id and concatenated transforms
  */
-export function distinctBlockTrxTransforms(blockTrxes: TrxTransforms[]): TrxTransforms[] {
-	const grouped = groupBy(blockTrxes, ({ trxId }) => trxId);
-	return Object.entries(grouped).map(([trxId, trxes]) =>
-		({ trxId, transforms: concatTransforms(...trxes.map(t => t.transforms)) } as TrxTransforms));
+export function distinctBlockActionTransforms(blockActions: ActionTransforms[]): ActionTransforms[] {
+	const grouped = groupBy(blockActions, ({ actionId }) => actionId);
+	return Object.entries(grouped).map(([actionId, actions]) =>
+		({ actionId, transforms: concatTransforms(...actions.map(t => t.transforms)) } as ActionTransforms));
 }

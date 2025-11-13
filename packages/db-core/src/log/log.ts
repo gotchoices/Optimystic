@@ -1,6 +1,6 @@
 import { sha256 } from 'multiformats/hashes/sha2'
 import { Chain, entryAt, nameof } from "../index.js";
-import type { IBlock, BlockId, TrxId, CollectionId, ChainPath, TrxRev, TrxContext, ChainInitOptions, BlockStore } from "../index.js";
+import type { IBlock, BlockId, ActionId, CollectionId, ChainPath, ActionRev, ActionContext, ChainInitOptions, BlockStore } from "../index.js";
 import type { ChainHeaderBlockType, ChainDataNode } from '../chain/chain-nodes.js';
 import type { LogEntry, ActionEntry } from "./index.js";
 import { LogDataBlockType, LogHeaderBlockType } from "./index.js";
@@ -37,8 +37,8 @@ export class Log<TAction> {
 	}
 
 	/** Adds a new entry to the log. */
-	async addActions(actions: TAction[], transactionId: TrxId, rev: number, getBlockIds: () => BlockId[], collectionIds: CollectionId[] = [], timestamp: number = Date.now()) {
-		const entry = { timestamp, rev, action: { trxId: transactionId, actions, blockIds: [], collectionIds } } as LogEntry<TAction>;
+	async addActions(actions: TAction[], actionId: ActionId, rev: number, getBlockIds: () => BlockId[], collectionIds: CollectionId[] = [], timestamp: number = Date.now()) {
+		const entry = { timestamp, rev, action: { actionId, actions, blockIds: [], collectionIds } } as LogEntry<TAction>;
 		const tailPath = await this.chain.add(entry);
 		const entryWithBlockIds = { ...entry, action: { ...entry.action!, blockIds: getBlockIds() } };
 		this.chain.updateAt(tailPath, entryWithBlockIds);
@@ -46,14 +46,14 @@ export class Log<TAction> {
 	}
 
 	/** Adds a checkpoint to the log. */
-	async addCheckpoint(pendings: TrxRev[], rev: number, timestamp: number = Date.now()) {
+	async addCheckpoint(pendings: ActionRev[], rev: number, timestamp: number = Date.now()) {
 		const entry = { timestamp, rev, checkpoint: { pendings } };
 		const tailPath = await this.chain.add(entry);
 		return { entry, tailPath };
 	}
 
-	/** Gets the transaction context of the log. */
-	async getTrxContext(): Promise<TrxContext | undefined> {
+	/** Gets the action context of the log. */
+	async getActionContext(): Promise<ActionContext | undefined> {
 		const tailPath = await this.chain.getTail();
 		if (!tailPath) {
 			return undefined;
@@ -72,7 +72,7 @@ export class Log<TAction> {
 	/** Gets the actions from startRev (exclusive), to latest in the log. */
 	async getFrom(startRev: number | undefined): Promise<GetFromResult<TAction>> {
 		const entries: ActionEntry<TAction>[] = [];
-		const pendings: TrxRev[] = [];
+		const pendings: ActionRev[] = [];
 		let rev: number | undefined;
 		let checkpointPath: ChainPath<LogEntry<TAction>> | undefined;
 		// Step through collecting both pending and entries until a checkpoint is found
@@ -84,7 +84,7 @@ export class Log<TAction> {
 				pendings.unshift(...entry.checkpoint.pendings);
 				break;
 			}
-			pendings.unshift({ trxId: entry.action!.trxId, rev: entry.rev });
+			pendings.unshift({ actionId: entry.action!.actionId, rev: entry.rev });
 			if (startRev !== undefined && entry.rev > startRev) {
 				entries.unshift(entry.action!);
 			}	// Can't stop at rev, because we need to collect all pending actions for the context
@@ -127,13 +127,13 @@ export class Log<TAction> {
 		return lastPath ? { path: lastPath, pendings: [], rev } : undefined;
 	}
 
-	/** Returns the set of pending transactions following, the given checkpoint path. */
+	/** Returns the set of pending actions following, the given checkpoint path. */
 	private async pendingFrom(starting: ChainPath<LogEntry<TAction>>) {
-		const pendings: TrxRev[] = [];
+		const pendings: ActionRev[] = [];
 		for await (const actionPath of this.chain.select(starting)) {
 			const entry = entryAt<LogEntry<TAction>>(actionPath);
 			if (entry?.action) {
-				pendings.push({ trxId: entry.action.trxId, rev: entry.rev });
+				pendings.push({ actionId: entry.action.actionId, rev: entry.rev });
 			}
 		}
 		return pendings;

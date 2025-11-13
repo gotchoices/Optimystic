@@ -1,45 +1,45 @@
-import type { CollectionId, BlockId, IBlock, TrxId, Transform, Transforms } from "../index.js";
-import type { TrxContext, TrxRev } from "../collection/transaction.js";
+import type { CollectionId, BlockId, IBlock, ActionId, Transform, Transforms } from "../index.js";
+import type { ActionContext, ActionRev } from "../collection/action.js";
 
-export type TrxBlocks = {
+export type ActionBlocks = {
 	blockIds: BlockId[];
-	trxId: TrxId;
+	actionId: ActionId;
 };
 
-export type TrxTransforms = {
-	trxId: TrxId;
+export type ActionTransforms = {
+	actionId: ActionId;
 	rev?: number;
 	transforms: Transforms;
 };
 
-export type TrxTransform = {
-	trxId: TrxId;
+export type ActionTransform = {
+	actionId: ActionId;
 	rev?: number;
 	transform: Transform;
 };
 
-export type TrxPending = {
+export type ActionPending = {
 	blockId: BlockId;
-	trxId: TrxId;
+	actionId: ActionId;
 	transform?: Transform;
 };
 
-export type PendRequest = TrxTransforms & {
-	/** What to do if there are any pending transactions.
+export type PendRequest = ActionTransforms & {
+	/** What to do if there are any pending actions.
 	 * 'c' is continue normally,
-	 * 'f' is fail, returning the pending TrxIds,
-	 * 'r' is return, which fails but returns the pending TrxIds and their transforms */
+	 * 'f' is fail, returning the pending ActionIds,
+	 * 'r' is return, which fails but returns the pending ActionIds and their transforms */
 	policy: 'c' | 'f' | 'r';
 };
 
-export type BlockTrxStatus = TrxBlocks & {
+export type BlockActionStatus = ActionBlocks & {
 	statuses: ('pending' | 'committed' | 'checkpointed' | 'aborted')[];
 };
 
 export type PendSuccess = {
 	success: true;
-	/** List of already pending transactions that were found on blocks touched by this pend */
-	pending: TrxPending[];
+	/** List of already pending actions that were found on blocks touched by this pend */
+	pending: ActionPending[];
 	/** The affected blocks */
 	blockIds: BlockId[];
 };
@@ -48,20 +48,20 @@ export type StaleFailure = {
 	success: false;
 	/** The reason for the failure */
 	reason?: string;
-	/** List of transactions that have already been committed and are newer than our known revision */
-	missing?: TrxTransforms[];
-	/** List of transactions that are pending on the blocks touched by this pend */
-	pending?: TrxPending[];
+	/** List of actions that have already been committed and are newer than our known revision */
+	missing?: ActionTransforms[];
+	/** List of actions that are pending on the blocks touched by this pend */
+	pending?: ActionPending[];
 };
 
 export type PendResult = PendSuccess | StaleFailure;
 
-export type CommitRequest = TrxBlocks & {
+export type CommitRequest = ActionBlocks & {
 	/** The header block of the collection, if this is a new collection (commit first) */
 	headerId?: BlockId;
 	/** The tail block of the log (commit next) */
 	tailId: BlockId;
-	/** The new revision for the committed transaction */
+	/** The new revision for the committed action */
 	rev: number;
 };
 
@@ -73,23 +73,23 @@ export type CommitSuccess = {
 	coordinatorId?: CollectionId;
 };
 
-export type BlockTrxState = {
-	/** The latest transaction that has been committed */
-	latest?: TrxRev;
-	/** If present, the specified transactions are pending */
-	pendings?: TrxId[];
+export type BlockActionState = {
+	/** The latest action that has been committed */
+	latest?: ActionRev;
+	/** If present, the specified actions are pending */
+	pendings?: ActionId[];
 };
 
 export type BlockGets = {
 	blockIds: BlockId[];
-	context?: TrxContext;	// Latest if this is omitted
+	context?: ActionContext;	// Latest if this is omitted
 };
 
 export type GetBlockResult = {
 	/** The retrieved block - undefined if the block was deleted	 */
 	block?: IBlock;
 	/** The latest and pending states of the repo that retrieved the block */
-	state: BlockTrxState;
+	state: BlockActionState;
 };
 
 export type GetBlockResults = Record<BlockId, GetBlockResult>;

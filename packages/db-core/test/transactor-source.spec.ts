@@ -3,7 +3,7 @@ import { TransactorSource } from '../src/transactor/transactor-source.js'
 import { TestTransactor } from './test-transactor.js'
 import { randomBytes } from '@libp2p/crypto'
 import { toString as uint8ArrayToString } from 'uint8arrays/to-string'
-import type { IBlock, TrxId, TrxContext, Transforms, BlockOperation, CommitRequest } from '../src/index.js'
+import type { IBlock, ActionId, ActionContext, Transforms, BlockOperation, CommitRequest } from '../src/index.js'
 
 describe('TransactorSource', () => {
 	type TestBlock = IBlock & { test: string[] }
@@ -16,7 +16,7 @@ describe('TransactorSource', () => {
   const createBlockOperation = (inserted = 'new-test-value'): BlockOperation => ['test', 0, 0, [inserted]]
 
   // Helper to generate a random transaction ID
-  const generateTrxId = (): TrxId => uint8ArrayToString(randomBytes(16), 'base64url') as TrxId
+  const generateTrxId = (): ActionId => uint8ArrayToString(randomBytes(16), 'base64url') as ActionId
 
   beforeEach(() => {
     network = new TestTransactor()
@@ -54,7 +54,7 @@ describe('TransactorSource', () => {
     const pendingTrxId = generateTrxId()
     // Add block to network
     await network.pend({
-      trxId: pendingTrxId,
+      actionId: pendingTrxId,
       transforms: {
         inserts: { [blockId]: block },
         updates: {},
@@ -63,7 +63,7 @@ describe('TransactorSource', () => {
       policy: 'c'
     })
     await network.commit({
-      trxId: pendingTrxId,
+      actionId: pendingTrxId,
       blockIds: [blockId],
       rev: 1,
       tailId: blockId
@@ -80,8 +80,8 @@ describe('TransactorSource', () => {
 
   it('should handle transaction context in block retrieval', async () => {
     const blockId = 'test-block'
-    const trxContext: TrxContext = {
-      committed: [{ trxId: generateTrxId(), rev: 1 }],
+    const trxContext: ActionContext = {
+      committed: [{ actionId: generateTrxId(), rev: 1 }],
       rev: 1
     }
 
@@ -92,7 +92,7 @@ describe('TransactorSource', () => {
 
   it('should handle successful transaction lifecycle', async () => {
     const blockId = 'test-block'
-    const trxId = generateTrxId()
+    const actionId = generateTrxId()
     // First operation has to be an insert for a non-existing block
     const transform: Transforms = {
       inserts: { [blockId]: { header: { id: blockId, type: 'block', collectionId: 'test' } } },
@@ -100,7 +100,7 @@ describe('TransactorSource', () => {
       deletes: []
     }
 
-    const result = await source.transact(transform, trxId, 1, blockId, blockId)
+    const result = await source.transact(transform, actionId, 1, blockId, blockId)
     expect(result).to.be.undefined
 
     const pendingTrx = network.getPendingTransactions()
@@ -108,7 +108,7 @@ describe('TransactorSource', () => {
 
     const committedTrx = network.getCommittedTransactions()
     expect(committedTrx.size).to.equal(1)
-    expect(committedTrx.has(trxId)).to.be.true
+    expect(committedTrx.has(actionId)).to.be.true
   })
 
   it('should handle failed pend operation', async () => {
@@ -118,7 +118,7 @@ describe('TransactorSource', () => {
 
     // Create a pending transaction with an insert
     await network.pend({
-      trxId: trxId1,
+      actionId: trxId1,
       transforms: {
         inserts: { [blockId]: { header: { id: blockId, type: 'block', collectionId: 'test' } } },
         updates: {},
@@ -142,11 +142,11 @@ describe('TransactorSource', () => {
 
   it('should handle failed commit operation', async () => {
     const blockId = 'test-block'
-    const trxId = generateTrxId()
+    const actionId = generateTrxId()
 
     // First create the block with an insert
     await network.pend({
-      trxId,
+      actionId,
       transforms: {
         inserts: { [blockId]: { header: { id: blockId, type: 'block', collectionId: 'test' } } },
         updates: {},
@@ -160,7 +160,7 @@ describe('TransactorSource', () => {
       headerId: 'header-id',
       tailId: 'tail-id',
       blockIds: [blockId],
-      trxId,
+      actionId,
       rev: 2
     })
 
@@ -180,11 +180,11 @@ describe('TransactorSource', () => {
 
   it('should handle transaction rollback', async () => {
     const blockId = 'test-block'
-    const trxId = generateTrxId()
+    const actionId = generateTrxId()
 
     // First create the block with an insert
     await network.pend({
-      trxId,
+      actionId,
       transforms: {
         inserts: { [blockId]: { header: { id: blockId, type: 'block', collectionId: 'test' } } },
         updates: {},
@@ -202,14 +202,14 @@ describe('TransactorSource', () => {
 
     // Start update transaction
     await network.pend({
-      trxId: generateTrxId(),
+      actionId: generateTrxId(),
       transforms: transform,
       policy: 'c'
     })
 
     // Rollback the transaction
     await network.cancel({
-      trxId,
+      actionId,
       blockIds: [blockId]
     })
 
@@ -228,7 +228,7 @@ describe('TransactorSource', () => {
     // First create both blocks with inserts
     await Promise.all([
       network.pend({
-        trxId: trxId1,
+        actionId: trxId1,
         transforms: {
           inserts: { [blockId1]: { header: { id: blockId1, type: 'block', collectionId: 'test' }, test: [] } as TestBlock },
           updates: {},
@@ -237,7 +237,7 @@ describe('TransactorSource', () => {
         policy: 'c'
       }),
       network.pend({
-        trxId: trxId2,
+        actionId: trxId2,
         transforms: {
           inserts: { [blockId2]: { header: { id: blockId2, type: 'block', collectionId: 'test' }, test: [] } as TestBlock },
           updates: {},
@@ -250,13 +250,13 @@ describe('TransactorSource', () => {
     // Commit both blocks
     await Promise.all([
       network.commit({
-        trxId: trxId1,
+        actionId: trxId1,
         blockIds: [blockId1],
         rev: 1,
         tailId: blockId1
       }),
       network.commit({
-        trxId: trxId2,
+        actionId: trxId2,
         blockIds: [blockId2],
         rev: 1,
         tailId: blockId2
@@ -355,7 +355,7 @@ describe('TransactorSource', () => {
 
   it('should handle update operations only on existing blocks', async () => {
     const blockId = 'test-block'
-    const trxId = generateTrxId()
+    const actionId = generateTrxId()
 
     // Try to update a non-existent block
     const updateTransform: Transforms = {
@@ -366,7 +366,7 @@ describe('TransactorSource', () => {
 
     // This should fail because the block doesn't exist
 		// Error should look like: Error: Commit Error: Transaction dPWSdMgzCagwbE2ERPUi7A has no insert for new block test-block
-		await expect(source.transact(updateTransform, trxId, 1, 'header-id', 'tail-id')).to.be.rejected
+		await expect(source.transact(updateTransform, actionId, 1, 'header-id', 'tail-id')).to.be.rejected
 
     // Now create the block with an insert
     const insertTransform: Transforms = {
