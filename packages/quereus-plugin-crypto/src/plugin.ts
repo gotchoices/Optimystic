@@ -6,6 +6,7 @@
  */
 
 import type { Database, FunctionFlags, SqlValue } from '@quereus/quereus';
+import { TEXT_TYPE, INTEGER_TYPE, BOOLEAN_TYPE } from '@quereus/quereus';
 import { digest, sign, verify, hashMod, randomBytes } from './crypto.js';
 
 /**
@@ -20,7 +21,7 @@ export default function register(_db: Database, _config: Record<string, SqlValue
 				name: 'digest',
 				numArgs: -1, // Variable arguments: data, algorithm?, inputEncoding?, outputEncoding?
 				flags: 1 as FunctionFlags, // UTF8
-				returnType: { typeClass: 'scalar' as const, sqlType: 'TEXT' },
+				returnType: { typeClass: 'scalar' as const, logicalType: TEXT_TYPE, nullable: false },
 				implementation: (...args: SqlValue[]) => {
 					const [data, algorithm = 'sha256', inputEncoding = 'base64url', outputEncoding = 'base64url'] = args;
 					return digest(data as string, algorithm as any, inputEncoding as any, outputEncoding as any);
@@ -32,7 +33,7 @@ export default function register(_db: Database, _config: Record<string, SqlValue
 				name: 'sign',
 				numArgs: -1, // Variable arguments: data, privateKey, curve?, inputEncoding?, keyEncoding?, outputEncoding?
 				flags: 1 as FunctionFlags,
-				returnType: { typeClass: 'scalar' as const, sqlType: 'TEXT' },
+				returnType: { typeClass: 'scalar' as const, logicalType: TEXT_TYPE, nullable: false },
 				implementation: (...args: SqlValue[]) => {
 					const [data, privateKey, curve = 'secp256k1', inputEncoding = 'base64url', keyEncoding = 'base64url', outputEncoding = 'base64url'] = args;
 					return sign(data as string, privateKey as string, curve as any, inputEncoding as any, keyEncoding as any, outputEncoding as any);
@@ -44,11 +45,11 @@ export default function register(_db: Database, _config: Record<string, SqlValue
 				name: 'verify',
 				numArgs: -1, // Variable arguments: data, signature, publicKey, curve?, inputEncoding?, sigEncoding?, keyEncoding?
 				flags: 1 as FunctionFlags,
-				returnType: { typeClass: 'scalar' as const, sqlType: 'INTEGER' },
+				returnType: { typeClass: 'scalar' as const, logicalType: BOOLEAN_TYPE, nullable: false },
 				implementation: (...args: SqlValue[]) => {
 					const [data, signature, publicKey, curve = 'secp256k1', inputEncoding = 'base64url', sigEncoding = 'base64url', keyEncoding = 'base64url'] = args;
 					const result = verify(data as string, signature as string, publicKey as string, curve as any, inputEncoding as any, sigEncoding as any, keyEncoding as any);
-					return result ? 1 : 0;
+					return result;
 				},
 			},
 		},
@@ -57,7 +58,7 @@ export default function register(_db: Database, _config: Record<string, SqlValue
 				name: 'hash_mod',
 				numArgs: -1, // Variable arguments: data, bits, algorithm?, inputEncoding?
 				flags: 1 as FunctionFlags,
-				returnType: { typeClass: 'scalar' as const, sqlType: 'INTEGER' },
+				returnType: { typeClass: 'scalar' as const, logicalType: INTEGER_TYPE, nullable: false },
 				implementation: (...args: SqlValue[]) => {
 					const [data, bits, algorithm = 'sha256', inputEncoding = 'base64url'] = args;
 					return hashMod(data as string, bits as number, algorithm as any, inputEncoding as any);
@@ -69,7 +70,7 @@ export default function register(_db: Database, _config: Record<string, SqlValue
 				name: 'random_bytes',
 				numArgs: -1, // Variable arguments: bits?, encoding?
 				flags: 1 as FunctionFlags,
-				returnType: { typeClass: 'scalar' as const, sqlType: 'TEXT' },
+				returnType: { typeClass: 'scalar' as const, logicalType: TEXT_TYPE, nullable: false },
 				implementation: (...args: SqlValue[]) => {
 					const [bits = 256, encoding = 'base64url'] = args;
 					return randomBytes(bits as number, encoding as any);

@@ -16,7 +16,7 @@ import { KeyRange } from '@optimystic/db-core';
 import { SchemaManager } from './schema/schema-manager.js';
 import { RowCodec } from './schema/row-codec.js';
 import { SqlDataType } from '@quereus/quereus';
-import { INTEGER_TYPE, REAL_TYPE, TEXT_TYPE, BLOB_TYPE, NUMERIC_TYPE, NULL_TYPE, type LogicalType } from '@quereus/quereus';
+import { INTEGER_TYPE, REAL_TYPE, TEXT_TYPE, BLOB_TYPE, NUMERIC_TYPE, NULL_TYPE, BOOLEAN_TYPE, type LogicalType } from '@quereus/quereus';
 import { IndexManager } from './schema/index-manager.js';
 import { StatisticsCollector } from './schema/statistics-collector.js';
 
@@ -55,7 +55,7 @@ function affinityToLogicalType(affinity: SqlDataType): LogicalType {
 		case SqlDataType.NUMERIC:
 			return NUMERIC_TYPE;
 		case SqlDataType.BOOLEAN:
-			return INTEGER_TYPE; // BOOLEAN stored as INTEGER
+			return BOOLEAN_TYPE;
 		default:
 			return BLOB_TYPE; // Default fallback
 	}

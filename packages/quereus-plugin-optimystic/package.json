@@ -1,6 +1,6 @@
 {
   "name": "@optimystic/quereus-plugin-optimystic",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Quereus plugin for Optimystic distributed tree collections",
   "type": "module",
   "main": "dist/index.js",
@@ -34,7 +34,7 @@
     "quoomb:node2": "quoomb --config examples/quoomb.config.node2.env.json"
   },
   "devDependencies": {
-    "@quereus/quereus": "^0.5.1",
+    "@quereus/quereus": "^0.6.1",
     "@types/node": "^24.0.12",
     "aegir": "^47.0.20",
     "tsup": "^8.5.0",
@@ -56,10 +56,10 @@
     "libp2p": "^2.9.0"
   },
   "peerDependencies": {
-    "@quereus/quereus": "^0.5.1"
+    "@quereus/quereus": "^0.6.1"
   },
   "engines": {
-    "quereus": "^0.5.1"
+    "quereus": "^0.6.1"
   },
   "keywords": [
     "quereus-plugin",
