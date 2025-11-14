@@ -40,10 +40,16 @@ Additionally, for SQL validation:
 
 ### Core Principles
 
-1. **Transactions span collections**: A transaction captures a logical mutation that may affect multiple collections
-2. **Pluggable validation engines**: The transaction payload is engine-specific (SQL for Quereus, but could be other rule systems)
-3. **Critical cluster consensus**: All log tail clusters (critical blocks) must participate in consensus
-4. **Deterministic replay**: Validators re-execute the transaction payload and verify the resulting actions match
+1. **Coordinator-centric API**: TransactionCoordinator is the ONLY interface for all mutations (single or multi-collection)
+2. **Immediate local execution**: Actions are executed immediately through collections to update local snapshots
+3. **Transaction context orchestration**: TransactionContext coordinates multi-collection commits
+4. **Snapshot isolation**: Collections maintain local trackers that reflect pending changes before network commit
+5. **Transactions span collections**: A transaction captures a logical mutation that may affect multiple collections
+6. **Pluggable execution engines**: The transaction payload is engine-specific (SQL for Quereus, actions for testing, etc.)
+7. **Critical cluster consensus**: All log tail clusters (critical blocks) must participate in consensus
+8. **Deterministic replay**: Validators re-execute the transaction payload and verify the resulting actions match
+9. **Actions with return values**: Actions can return results (for reads, queries, etc.)
+10. **Collection-specific operations**: Collections define their own action types (Tree has scan, Diary has append, etc.)
 
 ### Transaction Structure
 
@@ -74,27 +80,41 @@ type ReadDependency = {
 type Action<T> = {
   type: ActionType;
   data: T;
-  transaction?: {
-    cid: string;        // Transaction CID (always present for multi-collection txns)
-    full?: Transaction; // Optional: embed full transaction for validators
-  };
+  transaction?: string; // Transaction CID (for multi-collection txns)
 };
+
+// Action handlers can return values (for reads, queries, etc.)
+type ActionHandler<T, TResult = void> = (
+  action: Action<T>,
+  store: BlockStore<IBlock>
+) => Promise<TResult>;
 ```
 
 ### Transaction Flow
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
-│                    Client (Proposer)                        │
-│  1. Execute transaction through engine (e.g., Quereus)      │
-│  2. Capture: payload, reads, resulting actions              │
-│  3. Create Transaction with CID                             │
-│  4. Extract block operations from all actions               │
+│                    Client Application                       │
+│  1. Create TransactionContext via coordinator.begin()       │
+│  2. Add actions to context (reads and writes)               │
+│     • Actions are IMMEDIATELY executed through collections  │
+│     • Collections update local trackers (snapshot isolation)│
+│     • Actions tagged with transaction reference             │
+│  3. Call context.commit()                                   │
 └─────────────────┬───────────────────────────────────────────┘
                   │
                   ▼
 ┌─────────────────────────────────────────────────────────────┐
 │              Transaction Coordinator (db-core)              │
+│                                                             │
+│  Step 1: Collect transforms from collections                │
+│    • Collections already have transforms in their trackers  │
+│    • Transforms generated when actions were added           │
+│                                                             │
+│  Step 2: Create transaction payload                         │
+│    • Bundle all collection actions                          │
+│    • Include read dependencies                              │
+│    • Generate transaction CID                               │
 │                                                             │
 │  Phase 1: GATHER (only if multiple collections affected)    │
 │    • Identify all affected collections                      │
@@ -965,5 +985,4 @@ await db.execute("INSERT INTO users (id, name) VALUES (1, 'Alice')");
 ✅ **Index Consistency**: Index updated atomically with main table
 ✅ **Determinism**: All validators got same result from re-execution
 ✅ **Scalability**: No global transaction log, no single bottleneck
-
 
