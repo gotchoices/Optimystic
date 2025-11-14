@@ -139,7 +139,7 @@ SELECT sign('message', 'cHJpdmF0ZUtleQ', 'ed25519', 'utf8') as ed25519_sig;
 
 ### verify(data, signature, publicKey, curve?, inputEncoding?, sigEncoding?, keyEncoding?)
 
-Verify signatures. Returns 1 for valid, 0 for invalid.
+Verify signatures. Returns true for valid, false for invalid.
 
 ```sql
 -- Verify secp256k1 signature

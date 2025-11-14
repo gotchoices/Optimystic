@@ -1,6 +1,6 @@
 {
 	"name": "@optimystic/quereus-plugin-crypto",
-	"version": "0.2.0",
+	"version": "0.3.0",
 	"description": "Quereus plugin providing cryptographic functions (digest, sign, verify)",
 	"type": "module",
 	"main": "dist/index.js",
@@ -27,7 +27,7 @@
 		"typecheck": "tsc --noEmit"
 	},
 	"devDependencies": {
-		"@quereus/quereus": "^0.5.1",
+		"@quereus/quereus": "^0.6.1",
 		"@types/node": "^24.0.12",
 		"aegir": "^47.0.20",
 		"tsup": "^8.5.0",
@@ -39,10 +39,10 @@
 		"uint8arrays": "^5.1.0"
 	},
 	"peerDependencies": {
-		"@quereus/quereus": "^0.5.1"
+		"@quereus/quereus": "^0.6.1"
 	},
 	"engines": {
-		"quereus": "^0.5.1"
+		"quereus": "^0.6.1"
 	},
 	"keywords": [
 		"quereus-plugin",

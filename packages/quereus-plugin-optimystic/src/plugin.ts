@@ -5,7 +5,8 @@
  * All metadata is in package.json - no manifest export needed.
  */
 
-import type { Database, SqlValue, FunctionFlags, SqlDataType } from '@quereus/quereus';
+import type { Database, SqlValue, FunctionFlags } from '@quereus/quereus';
+import { TEXT_TYPE } from '@quereus/quereus';
 import { CollectionFactory } from './optimystic-adapter/collection-factory.js';
 import { TransactionBridge } from './optimystic-adapter/txn-bridge.js';
 import { OptimysticModule } from './optimystic-module.js';
@@ -46,7 +47,7 @@ export default function register(db: Database, config: Record<string, SqlValue> 
 					flags: 1 as FunctionFlags, // UTF8
 					returnType: {
 						typeClass: 'scalar' as const,
-						affinity: 3 as SqlDataType, // TEXT
+						logicalType: TEXT_TYPE,
 						nullable: true,
 						isReadOnly: true,
 					},
