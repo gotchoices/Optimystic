@@ -1,112 +1,83 @@
 import type { ITransactionEngine, Transaction, ExecutionResult, CollectionActions } from './transaction.js';
+import type { TransactionCoordinator } from './coordinator.js';
+
+export const ACTIONS_ENGINE_ID = "actions@1.0.0";
 
 /**
  * Built-in action-based transaction engine for testing.
  *
- * This engine treats the payload as a JSON-encoded list of collection actions.
+ * This engine treats each statement as a JSON-encoded CollectionActions object.
  * It's useful for testing the transaction infrastructure without needing SQL.
  *
- * Payload format:
+ * Each statement format:
  * ```json
  * {
- *   "collections": [
- *     {
- *       "collectionId": "users",
- *       "actions": [
- *         { "type": "insert", "data": { "id": 1, "name": "Alice" } }
- *       ]
- *     }
+ *   "collectionId": "users",
+ *   "actions": [
+ *     { "type": "insert", "data": { "id": 1, "name": "Alice" } }
  *   ]
  * }
  * ```
  */
 export class ActionsEngine implements ITransactionEngine {
+	constructor(private coordinator: TransactionCoordinator) {}
+
 	async execute(transaction: Transaction): Promise<ExecutionResult> {
 		try {
-			// Parse the payload
-			const payload = JSON.parse(transaction.payload) as ActionsPayload;
+			// Parse each statement as a CollectionActions object
+			const allActions: CollectionActions[] = [];
 
-			// Validate payload structure
-			if (!payload.collections || !Array.isArray(payload.collections)) {
-				return {
-					success: false,
-					error: 'Invalid payload: missing or invalid collections array'
-				};
-			}
+			for (const statement of transaction.statements) {
+				const collectionActions = JSON.parse(statement) as CollectionActions;
 
-			// Validate each collection
-			for (const collection of payload.collections) {
-				if (!collection.collectionId || typeof collection.collectionId !== 'string') {
+				// Validate structure
+				if (!collectionActions.collectionId || typeof collectionActions.collectionId !== 'string') {
 					return {
 						success: false,
-						error: 'Invalid payload: collection missing collectionId'
+						error: 'Invalid statement: missing collectionId'
 					};
 				}
 
-				if (!collection.actions || !Array.isArray(collection.actions)) {
+				if (!collectionActions.actions || !Array.isArray(collectionActions.actions)) {
 					return {
 						success: false,
-						error: `Invalid payload: collection ${collection.collectionId} missing or invalid actions array`
+						error: `Invalid statement: collection ${collectionActions.collectionId} missing or invalid actions array`
 					};
 				}
+
+				allActions.push(collectionActions);
+
+				// Apply actions through coordinator (for validation/replay)
+				await this.coordinator.applyActions([collectionActions], transaction.stamp.id);
 			}
 
-			// Return the actions as-is (no re-execution needed for this simple engine)
+			// Return success (actions already applied)
 			return {
 				success: true,
-				actions: payload.collections
+				actions: allActions
 			};
 		} catch (error) {
 			return {
 				success: false,
-				error: `Failed to parse payload: ${error instanceof Error ? error.message : String(error)}`
+				error: `Failed to execute transaction: ${error instanceof Error ? error.message : String(error)}`
 			};
 		}
 	}
 }
 
 /**
- * Payload format for the actions engine.
+ * Statement format for the actions engine (array of CollectionActions).
+ * @deprecated Use CollectionActions[] directly
  */
-export type ActionsPayload = {
+export type ActionsStatement = {
 	collections: CollectionActions[];
 };
 
 /**
- * Helper to create an actions-based transaction payload.
+ * Helper to create an actions-based transaction statements array.
+ * Each CollectionActions becomes a separate statement.
  */
-export function createActionsPayload(collections: CollectionActions[]): string {
-	return JSON.stringify({ collections } satisfies ActionsPayload);
-}
-
-/**
- * Helper to create a transaction ID from peer ID and timestamp.
- */
-export function createTransactionId(peerId: string, timestamp: number): string {
-	return `${peerId}-${timestamp}`;
-}
-
-/**
- * Helper to create a content ID (CID) for a transaction.
- * In a real implementation, this would use a cryptographic hash.
- * For now, we use a simple hash of the stringified transaction.
- */
-export function createTransactionCid(transaction: Omit<Transaction, 'cid'>): string {
-	const content = JSON.stringify({
-		engine: transaction.engine,
-		payload: transaction.payload,
-		reads: transaction.reads,
-		transactionId: transaction.transactionId
-	});
-
-	// Simple hash for now (in production, use SHA-256 or similar)
-	let hash = 0;
-	for (let i = 0; i < content.length; i++) {
-		const char = content.charCodeAt(i);
-		hash = ((hash << 5) - hash) + char;
-		hash = hash & hash; // Convert to 32-bit integer
-	}
-
-	return `cid-${Math.abs(hash).toString(16)}`;
+export function createActionsStatements(collections: CollectionActions[]): string[] {
+	return collections.map(c => JSON.stringify(c));
 }
 

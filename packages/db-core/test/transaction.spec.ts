@@ -1,15 +1,15 @@
 import { expect } from 'aegir/chai';
 import {
 	ActionsEngine,
-	createActionsPayload,
+	createActionsStatements,
+	createTransactionStamp,
 	createTransactionId,
-	createTransactionCid,
 	TransactionCoordinator,
-	TransactionContext,
+	Tree,
 	type Transaction,
-	type CollectionActions,
-	type ITransactor
+	type CollectionActions
 } from '../src/index.js';
+import { TestTransactor } from './test-transactor.js';
 
 describe('Transaction', () => {
 	describe('Transaction Structure', () => {
@@ -23,68 +23,101 @@ describe('Transaction', () => {
 				}
 			];
 
-			const payload = createActionsPayload(collections);
-			const transactionId = createTransactionId('peer1', Date.now());
+			const statements = createActionsStatements(collections);
+			const stamp = createTransactionStamp(
+				'peer1',
+				Date.now(),
+				'schema-hash-123',
+				'actions@1.0.0'
+			);
 
-			const transaction: Omit<Transaction, 'cid'> = {
-				engine: 'actions@1.0.0',
-				payload,
-				reads: [
-					{ blockId: 'block1', revision: 1 }
-				],
-				transactionId
+			const reads = [{ blockId: 'block1', revision: 1 }];
+			const transaction: Transaction = {
+				stamp,
+				statements,
+				reads,
+				id: createTransactionId(stamp.id, statements, reads)
 			};
 
-			const cid = createTransactionCid(transaction);
-			const fullTransaction: Transaction = { ...transaction, cid };
-
-			expect(fullTransaction.engine).to.equal('actions@1.0.0');
-			expect(fullTransaction.payload).to.be.a('string');
-			expect(fullTransaction.reads).to.have.lengthOf(1);
-			expect(fullTransaction.transactionId).to.be.a('string');
-			expect(fullTransaction.cid).to.be.a('string');
+			expect(transaction.stamp.engineId).to.equal('actions@1.0.0');
+			expect(transaction.stamp.id).to.be.a('string');
+			expect(transaction.statements).to.be.an('array');
+			expect(transaction.statements).to.have.lengthOf(1);
+			expect(transaction.reads).to.have.lengthOf(1);
+			expect(transaction.id).to.be.a('string');
 		});
 
-		it('should create unique transaction IDs for different peers', () => {
+		it('should create unique stamp IDs for different peers', () => {
 			const timestamp = Date.now();
-			const id1 = createTransactionId('peer1', timestamp);
-			const id2 = createTransactionId('peer2', timestamp);
+			const stamp1 = createTransactionStamp(
+				'peer1',
+				timestamp,
+				'schema-hash-123',
+				'actions@1.0.0'
+			);
+			const stamp2 = createTransactionStamp(
+				'peer2',
+				timestamp,
+				'schema-hash-123',
+				'actions@1.0.0'
+			);
 
-			expect(id1).to.not.equal(id2);
-			expect(id1).to.include('peer1');
-			expect(id2).to.include('peer2');
+			expect(stamp1.id).to.not.equal(stamp2.id);
 		});
 
-		it('should create unique CIDs for different transactions', () => {
-			const transaction1: Omit<Transaction, 'cid'> = {
-				engine: 'actions@1.0.0',
-				payload: createActionsPayload([]),
-				reads: [],
-				transactionId: 'txn1'
+		it('should create unique transaction IDs for different transactions', () => {
+			const stamp1 = createTransactionStamp(
+				'peer1',
+				Date.now(),
+				'schema-hash-123',
+				'actions@1.0.0'
+			);
+
+			const stamp2 = createTransactionStamp(
+				'peer2',
+				Date.now(),
+				'schema-hash-123',
+				'actions@1.0.0'
+			);
+
+			const statements1 = createActionsStatements([]);
+			const statements2 = createActionsStatements([]);
+			const reads1 = [{ blockId: 'block1', revision: 1 }];
+			const reads2 = [{ blockId: 'block2', revision: 2 }];
+
+			const transaction1: Transaction = {
+				stamp: stamp1,
+				statements: statements1,
+				reads: reads1,
+				id: createTransactionId(stamp1.id, statements1, reads1)
 			};
 
-			const transaction2: Omit<Transaction, 'cid'> = {
-				engine: 'actions@1.0.0',
-				payload: createActionsPayload([]),
-				reads: [],
-				transactionId: 'txn2'
+			const transaction2: Transaction = {
+				stamp: stamp2,
+				statements: statements2,
+				reads: reads2,
+				id: createTransactionId(stamp2.id, statements2, reads2)
 			};
 
-			const cid1 = createTransactionCid(transaction1);
-			const cid2 = createTransactionCid(transaction2);
-
-			expect(cid1).to.not.equal(cid2);
+			expect(transaction1.id).to.not.equal(transaction2.id);
 		});
 	});
 
 	describe('ActionsEngine', () => {
 		let engine: ActionsEngine;
+		let coordinator: TransactionCoordinator;
 
 		beforeEach(() => {
-			engine = new ActionsEngine();
+			const transactor = new TestTransactor();
+			const collections = new Map();
+			coordinator = new TransactionCoordinator(transactor, collections);
+			engine = new ActionsEngine(coordinator);
 		});
 
-		it('should execute a transaction with valid actions payload', async () => {
+		it('should parse and validate actions statements', async () => {
+			// Test that ActionsEngine can parse statements correctly
+			// Note: Execution will fail because no collection is registered,
+			// but we can verify the parsing and validation logic
 			const collections: CollectionActions[] = [
 				{
 					collectionId: 'users',
@@ -95,24 +128,30 @@ describe('Transaction', () => {
 				}
 			];
 
-			const payload = createActionsPayload(collections);
+			const statements = createActionsStatements(collections);
+			const stamp = createTransactionStamp(
+				'peer1',
+				Date.now(),
+				'schema-hash-123',
+				'actions@1.0.0'
+			);
+
 			const transaction: Transaction = {
-				engine: 'actions@1.0.0',
-				payload,
+				stamp,
+				statements,
 				reads: [],
-				transactionId: createTransactionId('peer1', Date.now()),
-				cid: 'test-cid'
+				id: createTransactionId(stamp.id, statements, [])
 			};
 
 			const result = await engine.execute(transaction);
 
-			expect(result.success).to.be.true;
-			expect(result.actions).to.have.lengthOf(1);
-			expect(result.actions![0]!.collectionId).to.equal('users');
-			expect(result.actions![0]!.actions).to.have.lengthOf(2);
+			// Execution fails because no collection is registered
+			expect(result.success).to.be.false;
+			expect(result.error).to.include('Collection not found');
 		});
 
-		it('should execute a transaction with multiple collections', async () => {
+		it('should validate multiple collections in statements', async () => {
+			// Test that ActionsEngine can parse statements with multiple collections
 			const collections: CollectionActions[] = [
 				{
 					collectionId: 'users',
@@ -124,130 +163,124 @@ describe('Transaction', () => {
 				}
 			];
 
-			const payload = createActionsPayload(collections);
+			const statements = createActionsStatements(collections);
+			const stamp = createTransactionStamp(
+				'peer1',
+				Date.now(),
+				'schema-hash-123',
+				'actions@1.0.0'
+			);
+
 			const transaction: Transaction = {
-				engine: 'actions@1.0.0',
-				payload,
+				stamp,
+				statements,
 				reads: [],
-				transactionId: createTransactionId('peer1', Date.now()),
-				cid: 'test-cid'
+				id: createTransactionId(stamp.id, statements, [])
 			};
 
 			const result = await engine.execute(transaction);
 
-			expect(result.success).to.be.true;
-			expect(result.actions).to.have.lengthOf(2);
+			// Execution fails because no collections are registered
+			expect(result.success).to.be.false;
+			expect(result.error).to.include('Collection not found');
 		});
 
-		it('should fail execution for invalid JSON payload', async () => {
+		it('should fail execution for invalid JSON statements', async () => {
+			const stamp = createTransactionStamp(
+				'peer1',
+				Date.now(),
+				'schema-hash-123',
+				'actions@1.0.0'
+			);
+
 			const transaction: Transaction = {
-				engine: 'actions@1.0.0',
-				payload: 'invalid json',
+				stamp,
+				statements: ['invalid json'],
 				reads: [],
-				transactionId: createTransactionId('peer1', Date.now()),
-				cid: 'test-cid'
+				id: createTransactionId(stamp.id, ['invalid json'], [])
 			};
 
 			const result = await engine.execute(transaction);
 
 			expect(result.success).to.be.false;
-			expect(result.error).to.include('Failed to parse payload');
+			expect(result.error).to.include('Failed to execute transaction');
 		});
 	});
 
-	describe('TransactionContext', () => {
-		let coordinator: TransactionCoordinator;
-		let mockTransactor: ITransactor;
+	// TransactionContext tests removed - use TransactionSession instead
+	// TransactionContext is now an internal implementation detail used by commitTransaction()
 
-		beforeEach(() => {
-			// Create a minimal mock transactor
-			mockTransactor = {
-				get: async () => ({ blocks: [] }),
-				pend: async () => ({ success: true }),
-				commit: async () => ({ success: true }),
-				cancel: async () => {},
-				getStatus: async () => []
-			} as unknown as ITransactor;
+	describe('Integration with Collections', () => {
+		it('should execute actions through collections via ActionsEngine', async () => {
+			// Create a test transactor
+			const transactor = new TestTransactor();
 
-			const engines = new Map();
-			engines.set('actions@1.0.0', new ActionsEngine());
-
-			coordinator = new TransactionCoordinator(
-				mockTransactor,
-				engines,
-				new Map()
+			// Create a Tree collection
+			type TestEntry = { key: number; value: string };
+			const usersTree = await Tree.createOrOpen<number, TestEntry>(
+				transactor,
+				'users-tree',
+				entry => entry.key
 			);
-		});
 
-		it('should create a transaction context with begin()', () => {
-			const context = coordinator.begin();
+			// Access the underlying collection (Tree wraps a Collection)
+			const underlyingCollection = (usersTree as any).collection;
 
-			expect(context).to.be.instanceOf(TransactionContext);
-			expect(context.transactionId).to.be.a('string');
-			expect(context.engine).to.equal('actions@1.0.0');
-		});
+			// Create coordinator with the underlying collection
+			const collections = new Map();
+			collections.set('users-tree', underlyingCollection);
 
-		it('should allow custom engine in begin()', () => {
-			const context = coordinator.begin('custom@1.0.0');
+			const coordinator = new TransactionCoordinator(
+				transactor,
+				collections
+			);
+			const actionsEngine = new ActionsEngine(coordinator);
 
-			expect(context.engine).to.equal('custom@1.0.0');
-		});
+			// Create transaction with actions
+			const collectionActions: CollectionActions[] = [
+				{
+					collectionId: 'users-tree',
+					actions: [{
+						type: 'replace',
+						data: [[1, { key: 1, value: 'Alice' }]]
+					}]
+				},
+				{
+					collectionId: 'users-tree',
+					actions: [{
+						type: 'replace',
+						data: [[2, { key: 2, value: 'Bob' }]]
+					}]
+				}
+			];
 
-		it('should accumulate actions in context', async () => {
-			const context = coordinator.begin();
+			const statements = createActionsStatements(collectionActions);
+			const stamp = createTransactionStamp(
+				'test-peer',
+				Date.now(),
+				'schema-hash-123',
+				'actions@1.0.0'
+			);
 
-			await context.addAction('users', { type: 'insert', data: { id: 1, name: 'Alice' } });
-			await context.addAction('users', { type: 'insert', data: { id: 2, name: 'Bob' } });
-			await context.addAction('posts', { type: 'insert', data: { id: 1, userId: 1 } });
+			const transaction: Transaction = {
+				stamp,
+				statements,
+				reads: [],
+				id: createTransactionId(stamp.id, statements, [])
+			};
 
-			const collectionActions = context.getCollectionActions();
-			expect(collectionActions.size).to.equal(2);
-			expect(collectionActions.get('users')).to.have.lengthOf(2);
-			expect(collectionActions.get('posts')).to.have.lengthOf(1);
-		});
+			// Execute transaction through engine
+			const result = await actionsEngine.execute(transaction);
 
-		it('should track affected collections', async () => {
-			const context = coordinator.begin();
-
-			await context.addAction('users', { type: 'insert', data: { id: 1 } });
-			await context.addAction('posts', { type: 'insert', data: { id: 1 } });
-
-			const affected = context.getAffectedCollections();
-			expect(affected.size).to.equal(2);
-			expect(affected.has('users')).to.be.true;
-			expect(affected.has('posts')).to.be.true;
-		});
-
-		it('should track read dependencies', () => {
-			const context = coordinator.begin();
-
-			context.addRead({ blockId: 'block1', revision: 1 });
-			context.addRead({ blockId: 'block2', revision: 2 });
-
-			const reads = context.getReads();
-			expect(reads).to.have.lengthOf(2);
-			expect(reads[0]!.blockId).to.equal('block1');
-			expect(reads[1]!.blockId).to.equal('block2');
-		});
-
-		it('should rollback accumulated state', async () => {
-			const context = coordinator.begin();
-
-			await context.addAction('users', { type: 'insert', data: { id: 1 } });
-			context.addRead({ blockId: 'block1', revision: 1 });
-
-			context.rollback();
-
-			expect(context.getCollectionActions().size).to.equal(0);
-			expect(context.getReads()).to.have.lengthOf(0);
-		});
-
-		it('should handle empty commit', async () => {
-			const context = coordinator.begin();
-
-			const result = await context.commit();
-
+			// Verify execution succeeded
 			expect(result.success).to.be.true;
+
+			// Verify local snapshot sees the changes (via tracker)
+			const aliceValue = await usersTree.get(1);
+			expect(aliceValue).to.deep.equal({ key: 1, value: 'Alice' });
+
+			const bobValue = await usersTree.get(2);
+			expect(bobValue).to.deep.equal({ key: 2, value: 'Bob' });
 		});
 	});
 });

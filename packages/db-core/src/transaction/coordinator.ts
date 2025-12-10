@@ -1,10 +1,11 @@
-import type { ITransactor, BlockId, CollectionId, Transforms, ActionId } from "../index.js";
+import type { ITransactor, BlockId, CollectionId, Transforms, PendRequest, CommitRequest, ActionId } from "../index.js";
 import type { Transaction, ExecutionResult, ITransactionEngine, CollectionActions } from "./transaction.js";
 import type { PeerId } from "@libp2p/interface";
 import type { Collection } from "../collection/collection.js";
 import { TransactionContext } from "./context.js";
-import { createActionsPayload, createTransactionId, createTransactionCid } from "./actions-engine.js";
-import { blockIdsForTransforms } from "../index.js";
+import { createActionsStatements } from "./actions-engine.js";
+import { createTransactionStamp, createTransactionId } from "./transaction.js";
+import { Log, blockIdsForTransforms, transformsFromTransform } from "../index.js";
 
 /**
  * Coordinates multi-collection transactions.
@@ -12,35 +13,85 @@ import { blockIdsForTransforms } from "../index.js";
  * This is the ONLY interface for all mutations (single or multi-collection).
  *
  * Responsibilities:
- * - Provide transaction context for accumulating actions
- * - Execute transaction through engine to get actions
+ * - Manage collections (create as needed)
  * - Apply actions to collections (run handlers, write to logs)
- * - Group block operations by cluster
- * - Identify critical clusters (log tail clusters)
- * - GATHER phase: collect nominees from critical clusters (multi-collection only)
- * - PEND/COMMIT/PROPAGATE/CHECKPOINT phases
+ * - Commit transactions by running consensus phases (GATHER, PEND, COMMIT)
  */
 export class TransactionCoordinator {
 	constructor(
 		private readonly transactor: ITransactor,
-		private readonly engines: Map<string, ITransactionEngine>,
 		private readonly collections: Map<CollectionId, Collection<any>>
 	) {}
 
 	/**
-	 * Begin a new transaction.
+	 * Apply actions to collections (called by engines during statement execution).
 	 *
-	 * @param engine - The engine to use (default: 'actions@1.0.0')
-	 * @returns A new transaction context
+	 * This is the core method that engines call to apply actions to collections.
+	 * Actions are tagged with the stamp ID and executed immediately through collections
+	 * to update the local snapshot.
+	 *
+	 * @param actions - The actions to apply (per collection)
+	 * @param stampId - The transaction stamp ID to tag actions with
 	 */
-	begin(engine: string = 'actions@1.0.0'): TransactionContext {
-		const transactionId = createTransactionId('local', Date.now());
-		return new TransactionContext(this, transactionId, engine);
+	async applyActions(
+		actions: CollectionActions[],
+		stampId: string
+	): Promise<void> {
+		for (const { collectionId, actions: collectionActions } of actions) {
+			// Get collection
+			const collection = this.collections.get(collectionId);
+			if (!collection) {
+				throw new Error(`Collection not found: ${collectionId}`);
+			}
+
+			// Apply each action (tagged with stampId)
+			for (const action of collectionActions) {
+				const taggedAction = { ...(action as any), transaction: stampId };
+				await collection.act(taggedAction);
+			}
+		}
+	}
+
+	/**
+	 * Commit a transaction (actions already applied, orchestrate PEND/COMMIT).
+	 *
+	 * This is called by TransactionSession.commit() after all statements have been executed.
+	 * Actions have already been applied to collections via applyActions(), so this method
+	 * just orchestrates the distributed consensus.
+	 *
+	 * @param transaction - The transaction to commit
+	 */
+	async commit(transaction: Transaction): Promise<void> {
+		// TODO: Implement the new commit flow
+		// 1. Collect operations from collection trackers
+		// 2. Compute hash of ALL operations
+		// 3. Group operations by block
+		// 4. Identify critical clusters
+		// 5. Execute consensus phases (GATHER, PEND, COMMIT)
+
+		// For now, throw an error to indicate this is not yet implemented
+		throw new Error('New commit() method not yet implemented - use execute() for now');
+	}
+
+	/**
+	 * Rollback a transaction (undo applied actions).
+	 *
+	 * This is called by TransactionSession.rollback() to undo all actions
+	 * that were applied via applyActions().
+	 *
+	 * @param stampId - The transaction stamp ID to rollback
+	 */
+	async rollback(stampId: string): Promise<void> {
+		// TODO: Implement rollback
+		// Clear trackers for this transaction
+		// For now, throw an error to indicate this is not yet implemented
+		throw new Error('rollback() not yet implemented');
 	}
 
 	/**
 	 * Commit a transaction context.
 	 *
+	 * @deprecated Use TransactionSession instead of TransactionContext
 	 * This is called by TransactionContext.commit().
 	 *
 	 * @param context - The transaction context to commit
@@ -55,18 +106,31 @@ export class TransactionCoordinator {
 			return { success: true }; // Nothing to commit
 		}
 
-		// Create transaction payload
+		// Create transaction statements
+		const statements = createActionsStatements(collectionActions);
+		const reads = context.getReads();
+
+		// Create stamp from context
+		const stamp = createTransactionStamp(
+			'local', // TODO: Get from context or coordinator
+			Date.now(),
+			'', // TODO: Get from engine
+			context.engine
+		);
+
 		const transaction: Transaction = {
-			engine: context.engine,
-			payload: createActionsPayload(collectionActions),
-			reads: context.getReads(),
-			transactionId: context.transactionId,
-			cid: '' // Will be computed
+			stamp,
+			statements,
+			reads,
+			id: createTransactionId(stamp.id, statements, reads)
 		};
-		transaction.cid = createTransactionCid(transaction);
+
+		// Create ActionsEngine for execution (TransactionContext only supports actions)
+		const { ActionsEngine } = await import('./actions-engine.js');
+		const engine = new ActionsEngine(this);
 
 		// Execute through standard path
-		return await this.execute(transaction);
+		return await this.execute(transaction, engine);
 	}
 
 	/**
@@ -76,17 +140,13 @@ export class TransactionCoordinator {
 	 * or indirectly via commitTransaction().
 	 *
 	 * @param transaction - The transaction to execute
+	 * @param engine - The engine to use for executing the transaction
 	 * @returns Execution result with actions and results
 	 */
-	async execute(transaction: Transaction): Promise<ExecutionResult> {
-		// 1. Get engine and execute to get actions
-		const engine = this.getEngine(transaction.engine);
-		if (!engine) {
-			return {
-				success: false,
-				error: `Unknown engine: ${transaction.engine}`
-			};
-		}
+	async execute(transaction: Transaction, engine: ITransactionEngine): Promise<ExecutionResult> {
+		// 1. Validate engine matches transaction
+		// Note: We don't enforce this strictly since the engine is passed in explicitly
+		// The caller is responsible for ensuring the correct engine is used
 
 		const result = await engine.execute(transaction);
 		if (!result.success) {
@@ -154,11 +214,49 @@ export class TransactionCoordinator {
 		results?: any[];
 		error?: string;
 	}> {
-		// TODO: Implement action application
-		// For now, return placeholder
+		const collection = this.collections.get(collectionActions.collectionId);
+		if (!collection) {
+			return {
+				success: false,
+				error: `Collection not found: ${collectionActions.collectionId}`
+			};
+		}
+
+		// At this point, actions have already been executed through collection.act()
+		// when they were added to the TransactionContext. The collection's tracker
+		// already has the transforms, and the actions are in the pending buffer.
+
+		// Get transforms from the collection's tracker
+		const transforms = collection.tracker.transforms;
+
+		// Write actions to the collection's log to get the log tail block ID
+		const log = await Log.open(collection.tracker, collectionActions.collectionId);
+		if (!log) {
+			return {
+				success: false,
+				error: `Log not found for collection ${collectionActions.collectionId}`
+			};
+		}
+
+		// Generate action ID from transaction ID
+		const actionId = transaction.id;
+		const newRev = (collection['source'].actionContext?.rev ?? 0) + 1;
+
+		// Add actions to log (this updates the tracker with log block changes)
+		const addResult = await log.addActions(
+			collectionActions.actions,
+			actionId,
+			newRev,
+			() => blockIdsForTransforms(transforms),
+			allCollectionIds
+		);
+
+		// Return the transforms and log tail block ID
 		return {
-			success: false,
-			error: 'applyActionsToCollection not yet implemented'
+			success: true,
+			transforms,
+			logTailBlockId: addResult.tailPath.block.header.id,
+			results: [] // TODO: Collect results from action handlers when we support read operations
 		};
 	}
 
@@ -180,6 +278,7 @@ export class TransactionCoordinator {
 
 		// 2. PEND phase: distribute to all block clusters
 		const pendResult = await this.pendPhase(
+			transaction.id as ActionId,
 			collectionTransforms,
 			superclusterNominees
 		);
@@ -189,12 +288,13 @@ export class TransactionCoordinator {
 
 		// 3. COMMIT phase: commit to all critical blocks
 		const commitResult = await this.commitPhase(
+			transaction.id as ActionId,
 			criticalBlockIds,
-			transaction.transactionId
+			pendResult.pendedBlockIds!
 		);
 		if (!commitResult.success) {
 			// Cancel pending actions on failure
-			await this.cancelPhase(collectionTransforms, transaction.transactionId);
+			await this.cancelPhase(transaction.id as ActionId, collectionTransforms);
 			return commitResult;
 		}
 
@@ -229,26 +329,98 @@ export class TransactionCoordinator {
 	 * PEND phase: Distribute transaction to all affected block clusters.
 	 */
 	private async pendPhase(
+		actionId: ActionId,
 		collectionTransforms: Map<CollectionId, Transforms>,
 		_superclusterNominees: Set<PeerId> | null
-	): Promise<{ success: boolean; error?: string }> {
-		// TODO: Implement multi-collection pend
-		// For now, just validate that we have transforms
+	): Promise<{ success: boolean; error?: string; pendedBlockIds?: Map<CollectionId, BlockId[]> }> {
 		if (collectionTransforms.size === 0) {
 			return { success: false, error: 'No transforms to pend' };
 		}
 
-		return { success: true };
+		const pendedBlockIds = new Map<CollectionId, BlockId[]>();
+
+		// Pend each collection's transforms
+		for (const [collectionId, transforms] of collectionTransforms.entries()) {
+			const collection = this.collections.get(collectionId);
+			if (!collection) {
+				return { success: false, error: `Collection not found: ${collectionId}` };
+			}
+
+			// Get revision from the collection's source
+			const rev = (collection['source'].actionContext?.rev ?? 0) + 1;
+
+			// Create pend request
+			const pendRequest: PendRequest = {
+				actionId,
+				rev,
+				transforms,
+				policy: 'r' // Return policy: fail but return pending actions
+			};
+
+			// Pend the transaction
+			const pendResult = await this.transactor.pend(pendRequest);
+			if (!pendResult.success) {
+				return {
+					success: false,
+					error: `Pend failed for collection ${collectionId}: ${pendResult.reason}`
+				};
+			}
+
+			// Store the pended block IDs for commit phase
+			pendedBlockIds.set(collectionId, pendResult.blockIds);
+		}
+
+		return { success: true, pendedBlockIds };
 	}
 
 	/**
 	 * COMMIT phase: Commit to all critical blocks.
 	 */
 	private async commitPhase(
-		_criticalBlockIds: BlockId[],
-		_transactionId: string
+		actionId: ActionId,
+		criticalBlockIds: BlockId[],
+		pendedBlockIds: Map<CollectionId, BlockId[]>
 	): Promise<{ success: boolean; error?: string }> {
-		// TODO: Implement multi-collection commit
+		// Commit each collection's transaction
+		for (const [collectionId, blockIds] of pendedBlockIds.entries()) {
+			const collection = this.collections.get(collectionId);
+			if (!collection) {
+				return { success: false, error: `Collection not found: ${collectionId}` };
+			}
+
+			// Get revision
+			const rev = (collection['source'].actionContext?.rev ?? 0) + 1;
+
+			// Find the critical block (log tail) for this collection
+			const logTailBlockId = criticalBlockIds.find(blockId =>
+				blockIds.includes(blockId)
+			);
+
+			if (!logTailBlockId) {
+				return {
+					success: false,
+					error: `Log tail block not found for collection ${collectionId}`
+				};
+			}
+
+			// Create commit request
+			const commitRequest: CommitRequest = {
+				actionId,
+				blockIds,
+				tailId: logTailBlockId,
+				rev
+			};
+
+			// Commit the transaction
+			const commitResult = await this.transactor.commit(commitRequest);
+			if (!commitResult.success) {
+				return {
+					success: false,
+					error: `Commit failed for collection ${collectionId}`
+				};
+			}
+		}
+
 		return { success: true };
 	}
 
@@ -256,17 +428,26 @@ export class TransactionCoordinator {
 	 * CANCEL phase: Cancel pending actions on all affected blocks.
 	 */
 	private async cancelPhase(
-		_collectionTransforms: Map<CollectionId, Transforms>,
-		_transactionId: string
+		actionId: ActionId,
+		collectionTransforms: Map<CollectionId, Transforms>
 	): Promise<void> {
-		// TODO: Implement multi-collection cancel
+		// Cancel each collection's pending transaction
+		for (const [collectionId, transforms] of collectionTransforms.entries()) {
+			const collection = this.collections.get(collectionId);
+			if (!collection) {
+				continue; // Skip if collection not found
+			}
+
+			// Get the block IDs from transforms
+			const blockIds = blockIdsForTransforms(transforms);
+
+			// Cancel the transaction
+			await this.transactor.cancel({
+				actionId,
+				blockIds
+			});
+		}
 	}
 
-	/**
-	 * Get the engine for a given engine identifier.
-	 */
-	private getEngine(engineId: string): ITransactionEngine | undefined {
-		return this.engines.get(engineId);
-	}
 }
 

@@ -12,6 +12,13 @@ To support multi-collection transactions, we introduce a clear hierarchy:
 - **Action**: A logical mutation to a single collection, resulting in one or more operations
 - **Transaction**: A logical mutation spanning multiple collections, resulting in one or more actions per collection
 
+### Transaction Identity
+
+Transactions have two distinct identifiers:
+
+- **Transaction Stamp** (`stampId`): Created at transaction BEGIN, remains stable throughout the transaction lifecycle. Contains peer ID, timestamp, schema hash, and engine ID. Exposed to users via `StampId()` UDF.
+- **Transaction CID** (`cid`): Computed at COMMIT as a hash of the stamp + statements + reads. This is the final, immutable transaction identity used in logs and block references.
+
 ## Current Architecture (Single-Collection)
 
 Currently, transactions are scoped to a single collection:
@@ -45,30 +52,40 @@ Additionally, for SQL validation:
 3. **Transaction context orchestration**: TransactionContext coordinates multi-collection commits
 4. **Snapshot isolation**: Collections maintain local trackers that reflect pending changes before network commit
 5. **Transactions span collections**: A transaction captures a logical mutation that may affect multiple collections
-6. **Pluggable execution engines**: The transaction payload is engine-specific (SQL for Quereus, actions for testing, etc.)
+6. **Pluggable execution engines**: The transaction 'statements' payload is engine-specific (SQL for Quereus, actions for testing, etc.)
 7. **Critical cluster consensus**: All log tail clusters (critical blocks) must participate in consensus
-8. **Deterministic replay**: Validators re-execute the transaction payload and verify the resulting actions match
+8. **Deterministic replay**: Validators re-execute the transaction statements and verify the resulting block operations match
 9. **Actions with return values**: Actions can return results (for reads, queries, etc.)
 10. **Collection-specific operations**: Collections define their own action types (Tree has scan, Diary has append, etc.)
 
 ### Transaction Structure
 
 ```typescript
-type Transaction = {
-  // Engine identification
-  engine: string;  // e.g., "quereus@0.5.3"
+// Stamp ID: Hash of the stamp (exposed to users via StampId() UDF)
+type StampId = string;
 
-  // Engine-specific payload
-  payload: string;  // For Quereus: JSON-encoded SQL statements; for testing: JSON-encoded actions
+// Transaction Stamp: Created at BEGIN, stable throughout transaction
+type TransactionStamp = {
+  peerId: PeerId;           // Who initiated the transaction
+  timestamp: number;        // When transaction started (milliseconds)
+  schemaHash: string;       // Hash of schema version(s) for validation
+  engineId: string;         // Which engine (e.g., 'quereus@0.5.3')
+  id: StampId;              // Identity of stamp (Hash of peerId + timestamp + schemaHash + engineId)- stable throughout transaction
+};
+
+// Transaction: Finalized at COMMIT
+type Transaction = {
+  // Reference to the stamp
+  stampId: StampId;
+
+  // Engine-specific statements (for replay/validation)
+  statements: string;  // For Quereus: SQL statements; for ActionsEngine: JSON-encoded actions
 
   // Read dependencies for optimistic concurrency control
   reads: ReadDependency[];
 
-  // Transaction identifier (used for deduplication, auditing)
-  transactionId: string;  // Hash of peer ID + timestamp
-
-  // Content identifier (hash of all above fields)
-  cid: string;  // Cryptographic hash for integrity
+  // Transaction identifier 
+  id: string;  // used in logs (hash of stampId + statements + reads)
 };
 
 type ReadDependency = {
@@ -80,7 +97,7 @@ type ReadDependency = {
 type Action<T> = {
   type: ActionType;
   data: T;
-  transaction?: string; // Transaction CID (for multi-collection txns)
+  transaction: Transaction;
 };
 
 // Action handlers can return values (for reads, queries, etc.)
@@ -90,31 +107,53 @@ type ActionHandler<T, TResult = void> = (
 ) => Promise<TResult>;
 ```
 
-### Transaction Flow
+### Transaction Execution Flow
+
+The transaction system separates **statement execution** (handled by engines) from **transaction coordination** (handled by the coordinator).
+
+#### Architecture Layers
+
+1. **Transaction Engine** (e.g., QuereusEngine, ActionsEngine)
+   - Takes coordinator as constructor argument
+   - Receives statements from user code
+   - Translates statements into actions
+   - Calls `coordinator.applyActions(actions, stampId)` to execute immediately
+
+2. **Transaction Coordinator**
+   - Applies actions to collections (creates collections if needed)
+   - Actions are immediately executed, updating local snapshots (snapshot isolation)
+   - Orchestrates GATHER/PEND/COMMIT/CANCEL phases across collections
+   - Does NOT re-execute actions during commit (already applied)
+
+3. **Transaction Session**
+   - Stateful session manager for incremental transaction building
+   - Accumulates statements as they arrive
+   - On commit: compiles statements → Transaction, calls coordinator.commit()
+
+#### Flow Example (Quereus SQL)
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
-│                    Client Application                       │
-│  1. Create TransactionContext via coordinator.begin()       │
-│  2. Add actions to context (reads and writes)               │
-│     • Actions are IMMEDIATELY executed through collections  │
-│     • Collections update local trackers (snapshot isolation)│
-│     • Actions tagged with transaction reference             │
-│  3. Call context.commit()                                   │
+│                    Quereus Module                           │
+│  1. Receive SQL statement from Quereus engine               │
+│  2. Determine affected collections from mutation request    │
+│  3. Log statement to session (create session if needed)     │
+│  4. Translate statement → actions                           │
+│  5. Call coordinator.applyActions(actions, stampId)         │
+│     • Coordinator creates collections if needed             │
+│     • Actions executed immediately (snapshot isolation)     │
+│     • Actions recorded in trackers (pending state)          │
+│  6. More statements...                                      │
+│  7. Call session.commit()                                   │
 └─────────────────┬───────────────────────────────────────────┘
                   │
                   ▼
 ┌─────────────────────────────────────────────────────────────┐
 │              Transaction Coordinator (db-core)              │
 │                                                             │
-│  Step 1: Collect transforms from collections                │
-│    • Collections already have transforms in their trackers  │
-│    • Transforms generated when actions were added           │
-│                                                             │
-│  Step 2: Create transaction payload                         │
-│    • Bundle all collection actions                          │
-│    • Include read dependencies                              │
-│    • Generate transaction CID                               │
+│  Coordinator receives commit request with:                  │
+│    • Transaction (stampId + statements + reads)             │
+│    • Actions already applied to collections (in trackers)   │
 │                                                             │
 │  Phase 1: GATHER (only if multiple collections affected)    │
 │    • Identify all affected collections                      │
@@ -125,14 +164,20 @@ type ActionHandler<T, TResult = void> = (
 │    • Skip this phase if only one collection affected        │
 │                                                             │
 │  Phase 2: PEND                                              │
-│    • Send transaction + operations to all block clusters    │
-│    • Include supercluster nominee list (if multi-collection)│
-│    • Clusters validate and prepare (but don't commit)       │
+│    • Collect all operations from collection trackers        │
+│    • Compute hash of ALL operations (across all blocks)     │
+│    • Send to all affected block clusters:                   │
+│      - Full Transaction (for replay/validation)             │
+│      - Operations hash (single hash for entire transaction) │
+│      - Which blocks this peer should coordinate + revisions │
+│      - Supercluster nominee list (if multi-collection)      │
+│    • Each cluster validates (see below)                     │
 │                                                             │
 │  Phase 3: COMMIT                                            │
 │    • Send commit to all critical clusters (log tails)       │
 │    • Each critical cluster achieves consensus               │
 │    • All must succeed for transaction to proceed            │
+│    • Transaction logged by CID (not actions)                │
 │                                                             │
 │  Phase 4: PROPAGATE (managed by clusters)                   │
 │    • Clusters finalize their local changes                  │
@@ -140,7 +185,8 @@ type ActionHandler<T, TResult = void> = (
 │                                                             │
 │  Phase 5: CHECKPOINT (managed by clusters)                  │
 │    • Clusters append to their collection's log              │
-│    • Each collection records its actions from transaction   │
+│    • Log entry references Transaction CID                   │
+│    • Full Transaction stored (statements + reads)           │
 │    • Client doesn't manage this phase                       │
 │                                                             │
 └─────────────────┬───────────────────────────────────────────┘
@@ -150,24 +196,32 @@ type ActionHandler<T, TResult = void> = (
 │              Cluster Participants (Validators)              │
 │                                                             │
 │  During PEND Phase:                                         │
-│    1. Receive Transaction + proposed operations             │
-│    2. Verify engine version matches local                   │
-│    3. Verify read dependencies (no stale reads)             │
-│    4. Re-execute payload through local engine               │
-│    5. Compare resulting actions with proposed               │
-│    6. Vote accept/reject based on match                     │
+│    1. Receive Transaction + operations hash + block list    │
+│    2. Verify stamp.engineId matches local engine            │
+│    3. Verify stamp.schemaHash matches local schema          │
+│    4. Verify read dependencies (no stale reads)             │
+│    5. Re-execute transaction.statements through engine      │
+│       • Engine translates statements → actions              │
+│       • Actions applied to local collections (temp state)   │
+│       • Operations collected from trackers                  │
+│    6. Compute hash of ALL operations (entire transaction)   │
+│    7. Compare with sender's operations hash                 │
+│    8. If match → PEND the blocks this peer coordinates      │
+│    9. If mismatch → Reject (Byzantine fault or bug)         │
 │                                                             │
 │  During COMMIT Phase (critical clusters only):              │
 │    1. Achieve consensus with other critical clusters        │
 │    2. Commit to log if consensus reached                    │
+│    3. Log entry contains Transaction (by CID)               │
 │                                                             │
 │  During PROPAGATE Phase (cluster-managed):                  │
 │    1. Finalize local block changes                          │
 │    2. Make changes visible                                  │
 │                                                             │
 │  During CHECKPOINT Phase (cluster-managed):                 │
-│    1. Append actions to collection log                      │
-│    2. Include transaction CID reference                     │
+│    1. Append Transaction to collection log                  │
+│    2. Transaction referenced by CID                         │
+│    3. Full Transaction stored for future replay             │
 │                                                             │
 └─────────────────────────────────────────────────────────────┘
 ```
@@ -244,30 +298,43 @@ COMMIT Phase:
 
 ## Key Components
 
-### 1. Transaction Type (db-core)
+### 1. Transaction Types (db-core)
 
-The core transaction structure in db-core:
+The core transaction structures in db-core:
 
 ```typescript
 // In db-core/src/transaction/transaction.ts
-export type Transaction = {
-  // Engine identification (name + version)
-  engine: string;
 
-  // Engine-specific payload (opaque to db-core)
-  payload: string;
+// Transaction Stamp: Created at BEGIN, stable throughout transaction
+export type TransactionStamp = {
+  peerId: PeerId;           // Who initiated the transaction
+  timestamp: number;        // When transaction started (milliseconds)
+  schemaHash: string;       // Hash of schema version(s) for validation
+  engineId: string;         // Which engine (e.g., 'quereus@0.5.3')
+};
+
+// Stamp ID: Hash of the stamp
+export type StampId = string;
+
+// Helper to create stamp ID
+export function createStampId(stamp: TransactionStamp): StampId {
+  return hash(JSON.stringify(stamp));
+}
+
+// Transaction: Finalized at COMMIT
+export type Transaction = {
+  // Reference to the stamp (stable ID)
+  stampId: StampId;
+
+  // Engine-specific statements (for replay/validation)
+  statements: string;
 
   // Read dependencies for optimistic concurrency control
   reads: ReadDependency[];
 
-  // Transaction identifier
-  transactionId: string;
-
-  // Content identifier (hash of engine + payload + reads + transactionId)
+  // Content identifier (hash of stampId + statements + reads)
+  // This is the final transaction identity used in logs
   cid: string;
-
-  // Resulting actions per collection (captured during execution)
-  actions: Map<CollectionId, Action<unknown>[]>;
 };
 
 export type ReadDependency = {
@@ -275,139 +342,252 @@ export type ReadDependency = {
   revision: number;
 };
 
-// Actions now carry their transaction context
+// Actions carry their transaction stamp ID
 export type Action<T> = {
   type: ActionType;
   data: T;
-
-  // NEW: Transaction context
-  transaction?: {
-    cid: string;  // Reference to parent transaction
-    // Optionally embed full transaction for validation
-    full?: Transaction;
-  };
+  transaction?: StampId; // Transaction stamp ID (stable throughout execution)
 };
 ```
 
-### 2. Built-in Transaction Plugin (db-core)
+### 2. Built-in Actions Engine (db-core)
 
-For testing and simple use cases, db-core provides a built-in plugin:
+For testing and simple use cases, db-core provides a built-in actions engine:
 
 ```typescript
-// In db-core/src/transaction/plugins/action-plugin.ts
-export const ACTION_TRANSACTION_ENGINE = "action-tx@1.0.0";
+// In db-core/src/transaction/actions-engine.ts
+export const ACTIONS_ENGINE_ID = "actions@1.0.0";
 
-export type ActionTransactionPayload = {
-  // Direct specification of actions per collection
-  actions: Array<{
-    collectionId: CollectionId;
-    actions: Action<unknown>[];
-  }>;
+export type ActionsStatement = {
+  // Direct specification of actions for a single collection
+  collectionId: CollectionId;
+  actions: Action<unknown>[];
 };
 
-// This plugin simply executes the actions as specified
-// No validation beyond basic structure
+// The ActionsEngine takes a coordinator and applies actions directly
+export class ActionsEngine implements ITransactionEngine {
+  constructor(private coordinator: TransactionCoordinator) {}
+
+  async executeStatement(statement: string, stampId: StampId): Promise<void> {
+    const actionsStatement: ActionsStatement = JSON.parse(statement);
+
+    // Apply actions through coordinator
+    await this.coordinator.applyActions(
+      [actionsStatement],
+      stampId
+    );
+  }
+
+  async execute(transaction: Transaction): Promise<void> {
+    // For validation/replay: parse all statements and apply
+    const statements: ActionsStatement[] = JSON.parse(transaction.statements);
+
+    for (const statement of statements) {
+      await this.coordinator.applyActions([statement], transaction.stampId);
+    }
+  }
+}
 ```
 
 This allows testing multi-collection transactions without Quereus.
 
-### 3. Quereus Transaction Plugin (quereus-plugin-optimystic)
+### 3. Quereus Transaction Engine (quereus-plugin-optimystic)
 
 The Quereus-specific transaction engine:
 
 ```typescript
 // In quereus-plugin-optimystic/src/transaction/quereus-engine.ts
-export const QUEREUS_TRANSACTION_ENGINE = "quereus-sql@1.0.0";
+export const QUEREUS_ENGINE_ID = "quereus@0.5.3";
 
-export type QuereusTransactionPayload = {
+export type QuereusStatements = {
   // SQL statements in execution order
   statements: Array<{
     sql: string;
     params: SqlValue[];
   }>;
-
-  // Schema version hash (all participants must match)
-  schemaVersion: string;
-
-  // Context values for determinism
-  contextValues: Record<string, SqlValue>;
 };
 
-// Transaction capture during SQL execution
-class TransactionCapture {
-  statements: Array<{ sql: string; params: SqlValue[] }> = [];
-  reads: ReadDependency[] = [];
-  affectedCollections = new Set<CollectionId>();
-  contextValues: Record<string, SqlValue> = {};
-}
+// The QuereusEngine wraps a Quereus database instance
+export class QuereusEngine implements ITransactionEngine {
+  constructor(private db: QuereusDatabase) {}
 
-class OptimysticModule implements VirtualTableModule {
-  private currentTransaction?: TransactionCapture;
+  async executeStatement(statement: string, stampId: StampId): Promise<void> {
+    const { sql, params } = JSON.parse(statement);
 
-  async xBegin(context: VirtualTableContext): Promise<void> {
-    this.currentTransaction = new TransactionCapture();
+    // Execute SQL through Quereus
+    // Quereus module will translate to actions and call coordinator.applyActions()
+    await this.db.exec(sql, params, { stampId });
   }
 
+  async execute(transaction: Transaction): Promise<void> {
+    // For validation/replay: execute all SQL statements
+    const statements: QuereusStatements = JSON.parse(transaction.statements);
+
+    for (const stmt of statements.statements) {
+      await this.db.exec(stmt.sql, stmt.params, { stampId: transaction.stampId });
+    }
+  }
+
+  async getSchemaHash(): Promise<string> {
+    // Serialize schema from catalog
+    const schema = await this.db.catalog.serialize();
+    return hash(schema);
+  }
+}
+
+// Optimystic Module (virtual table module for Quereus)
+class OptimysticModule implements VirtualTableModule {
+  private session?: TransactionSession;
+
+  constructor(
+    private coordinator: TransactionCoordinator,
+    private collectionId: CollectionId
+  ) {}
+
   async xUpdate(context: VirtualTableContext, ...): Promise<void> {
-    // Capture the SQL statement
-    if (this.currentTransaction && context.sql) {
-      this.currentTransaction.statements.push({
-        sql: context.sql,
-        params: context.params || []
-      });
+    // Get or create session from context
+    const stampId = context.stampId || this.createStampId();
+    if (!this.session || this.session.stampId !== stampId) {
+      this.session = new TransactionSession(
+        this.coordinator,
+        stampId,
+        QUEREUS_ENGINE_ID
+      );
     }
 
-    // Execute the operation (existing code)
-    // ...
+    // Log the SQL statement to the session
+    const statement = JSON.stringify({
+      sql: context.sql,
+      params: context.params || []
+    });
+    await this.session.execute(statement);
 
-    // Track affected collections
-    this.currentTransaction?.affectedCollections.add(this.collectionId);
-    for (const indexId of this.indexManager.getIndexCollectionIds()) {
-      this.currentTransaction?.affectedCollections.add(indexId);
-    }
+    // Determine affected collections from mutation request
+    const affectedCollections = [
+      this.collectionId,
+      ...this.indexManager.getIndexCollectionIds()
+    ];
+
+    // Translate statement to actions
+    const actions = this.translateToActions(context);
+
+    // Apply actions through coordinator
+    await this.coordinator.applyActions(
+      affectedCollections.map(collectionId => ({
+        collectionId,
+        actions: actions.filter(a => a.collectionId === collectionId)
+      })),
+      stampId
+    );
   }
 
   async xCommit(context: VirtualTableContext): Promise<void> {
-    if (!this.currentTransaction) return;
+    if (!this.session) return;
 
-    // Create Quereus payload
-    const payload: QuereusTransactionPayload = {
-      statements: this.currentTransaction.statements,
-      schemaVersion: await this.schemaManager.getSchemaHash(),
-      contextValues: this.currentTransaction.contextValues
+    // Commit the session (compiles statements → Transaction, orchestrates PEND/COMMIT)
+    await this.session.commit();
+    this.session = undefined;
+  }
+
+  async xRollback(context: VirtualTableContext): Promise<void> {
+    if (!this.session) return;
+
+    await this.session.rollback();
+    this.session = undefined;
+  }
+
+  private createStampId(): StampId {
+    const stamp: TransactionStamp = {
+      peerId: this.coordinator.peerId,
+      timestamp: Date.now(),
+      schemaHash: await this.getSchemaHash(),
+      engineId: QUEREUS_ENGINE_ID
     };
+    return createStampId(stamp);
+  }
 
-    // Create Transaction
-    const transactionId = generateTransactionId();
+  private async getSchemaHash(): Promise<string> {
+    // Get schema hash from engine or cache
+    // Avoid recomputing if schema hasn't changed
+    return this.schemaHashCache || await this.computeSchemaHash();
+  }
+
+```
+
+### 4. Transaction Session (db-core)
+
+Manages incremental transaction building:
+
+```typescript
+// In db-core/src/transaction/session.ts
+export class TransactionSession {
+  private readonly statements: string[] = [];
+  private committed = false;
+  private rolledBack = false;
+
+  constructor(
+    private readonly coordinator: TransactionCoordinator,
+    public readonly stampId: StampId,
+    public readonly engineId: string
+  ) {}
+
+  async execute(statement: string): Promise<void> {
+    if (this.committed || this.rolledBack) {
+      throw new Error('Transaction already finalized');
+    }
+
+    // Accumulate the statement for later compilation
+    this.statements.push(statement);
+
+    // Execute through engine (engine will call coordinator.applyActions)
+    const engine = this.coordinator.getEngine(this.engineId);
+    await engine.executeStatement(statement, this.stampId);
+  }
+
+  async commit(): Promise<void> {
+    if (this.committed || this.rolledBack) {
+      throw new Error('Transaction already finalized');
+    }
+
+    // Compile statements into complete transaction
     const transaction: Transaction = {
-      engine: QUEREUS_TRANSACTION_ENGINE,
-      payload: JSON.stringify(payload),
-      reads: this.currentTransaction.reads,
-      transactionId,
-      cid: computeCID({ engine, payload, reads, transactionId }),
-      actions: await this.captureActions()
+      stampId: this.stampId,
+      statements: this.compileStatements(),
+      reads: [], // TODO: Track reads during execution
+      cid: createTransactionCid(
+        this.stampId,
+        this.compileStatements(),
+        []
+      )
     };
 
-    // Execute through transaction coordinator
-    await this.coordinator.executeTransaction(transaction);
+    // Execute through coordinator (orchestrates PEND/COMMIT)
+    await this.coordinator.commit(transaction);
 
-    this.currentTransaction = undefined;
+    this.committed = true;
+  }
+
+  async rollback(): Promise<void> {
+    if (this.committed || this.rolledBack) {
+      throw new Error('Transaction already finalized');
+    }
+
+    // Rollback through coordinator
+    await this.coordinator.rollback(this.stampId);
+
+    this.rolledBack = true;
+  }
+
+  private compileStatements(): string {
+    // Engine-specific compilation
+    // For ActionsEngine: JSON array of statements
+    // For QuereusEngine: JSON object with statements array
+    return JSON.stringify(this.statements);
   }
 }
 ```
 
-**Required**: Quereus must pass SQL through `VirtualTableContext`:
-
-```typescript
-// In quereus/src/vtab/context.ts
-export interface VirtualTableContext {
-  // ... existing fields ...
-  sql?: string;
-  params?: SqlValue[];
-}
-```
-
-### 4. Transaction Coordinator (db-core)
+### 5. Transaction Coordinator (db-core)
 
 Coordinates multi-collection transactions with critical cluster consensus:
 
@@ -416,44 +596,80 @@ Coordinates multi-collection transactions with critical cluster consensus:
 export class TransactionCoordinator {
   constructor(
     private transactor: ITransactor,
-    private collections: Map<CollectionId, Collection>
+    private collections: Map<CollectionId, Collection>,
+    private engines: Map<string, ITransactionEngine>
   ) {}
 
-  async executeTransaction(transaction: Transaction): Promise<void> {
-    // Extract block operations from all actions
-    const blockOps = this.extractBlockOperations(transaction.actions);
+  // Apply actions to collections (called by engines during statement execution)
+  async applyActions(
+    actions: CollectionActions[],
+    stampId: StampId
+  ): Promise<void> {
+    for (const { collectionId, actions: collectionActions } of actions) {
+      // Get or create collection
+      let collection = this.collections.get(collectionId);
+      if (!collection) {
+        collection = await this.createCollection(collectionId);
+        this.collections.set(collectionId, collection);
+      }
 
-    // Group operations by cluster
-    const clusterGroups = this.groupByCluster(blockOps);
+      // Apply each action (tagged with stampId)
+      for (const action of collectionActions) {
+        const taggedAction = { ...action, transaction: stampId };
+        await collection.act(taggedAction);
+      }
+    }
+  }
+
+  // Commit a transaction (actions already applied, orchestrate PEND/COMMIT)
+  async commit(transaction: Transaction): Promise<void> {
+    // Collect operations from collection trackers
+    const operations = await this.collectOperations(transaction.stampId);
+
+    // Compute hash of ALL operations (entire transaction)
+    const operationsHash = this.hashOperations(operations);
+
+    // Group operations by block
+    const blockOperations = this.groupByBlock(operations);
 
     // Identify critical clusters (log tail clusters for affected collections)
     const criticalClusters = await this.getCriticalClusters(
-      Array.from(transaction.actions.keys())
+      Array.from(this.getAffectedCollections(transaction.stampId))
     );
 
-    // Execute 5-phase consensus
-    await this.executeConsensus(transaction, clusterGroups, criticalClusters);
+    // Execute consensus phases
+    await this.executeConsensus(
+      transaction,
+      operationsHash,
+      blockOperations,
+      criticalClusters
+    );
+  }
+
+  // Rollback a transaction (undo applied actions)
+  async rollback(stampId: StampId): Promise<void> {
+    // Clear trackers for this transaction
+    for (const collection of this.collections.values()) {
+      await collection.clearPending(stampId);
+    }
   }
 
   private async executeConsensus(
     transaction: Transaction,
-    clusterGroups: Map<ClusterId, BlockOperation[]>,
+    operationsHash: string,
+    blockOperations: Map<BlockId, { rev: number; operations: Operation[] }>,
     criticalClusters: Set<ClusterId>
   ): Promise<void> {
-    // Phase 1: GATHER - Collect critical cluster nominees
+    // Phase 1: GATHER - Collect critical cluster nominees (skip if single collection)
     const superclusterNominees = await this.gatherPhase(criticalClusters);
 
-    // Phase 2: PEND - Distribute to all block clusters
-    await this.pendPhase(transaction, clusterGroups, superclusterNominees);
+    // Phase 2: PEND - Distribute to all block clusters for validation
+    await this.pendPhase(transaction, operationsHash, blockOperations, superclusterNominees);
 
     // Phase 3: COMMIT - Consensus across critical clusters
     await this.commitPhase(transaction, criticalClusters);
 
-    // Phase 4: PROPAGATE - Finalize on block clusters
-    await this.propagatePhase(transaction, clusterGroups);
-
-    // Phase 5: CHECKPOINT - Record in collection logs
-    await this.checkpointPhase(transaction);
+    // Phases 4-5 (PROPAGATE, CHECKPOINT) are cluster-managed
   }
 
   private async gatherPhase(
@@ -476,7 +692,6 @@ export class TransactionCoordinator {
     for (const nominees of nomineesByCluster) {
       for (const nominee of nominees) {
         // Nodes can spot-check nominees from other neighborhoods
-        // based on routing data they have
         if (this.isReasonableNominee(nominee)) {
           supercluster.add(nominee);
         }
@@ -485,39 +700,96 @@ export class TransactionCoordinator {
 
     return supercluster;
   }
+
+  private async pendPhase(
+    transaction: Transaction,
+    operationsHash: string,
+    blockOperations: Map<BlockId, { rev: number; operations: Operation[] }>,
+    superclusterNominees: Set<PeerId> | null
+  ): Promise<void> {
+    // Send PEND request to each affected block cluster
+    const pendRequests = Array.from(blockOperations.entries()).map(
+      ([blockId, { rev }]) => ({
+        transaction,
+        operationsHash,
+        blocks: [{ blockId, rev }],
+        policy: { superclusterNominees }
+      })
+    );
+
+    await Promise.all(
+      pendRequests.map(req => this.transactor.pend(req))
+    );
+  }
 }
 ```
 
-### 5. Transaction Validator (quereus-plugin-optimystic)
+### 6. ITransactor Interface Updates (db-core)
+
+The `ITransactor` interface needs updates to support transaction validation:
+
+```typescript
+// In db-core/src/transactor.ts
+
+export type PendRequest = {
+  transaction: Transaction;        // Full transaction for replay/validation
+  operationsHash: string;          // Hash of ALL operations (entire transaction)
+  blocks: Array<{                  // Which blocks this peer should coordinate
+    blockId: BlockId;
+    rev: number;                   // Expected revision
+  }>;
+  policy: {
+    superclusterNominees?: Set<PeerId>; // For multi-collection consensus
+  };
+};
+
+export interface ITransactor {
+  // ... existing methods ...
+
+  // PEND: Validate and prepare transaction
+  pend(request: PendRequest): Promise<{ success: boolean; error?: string }>;
+
+  // Query cluster nominees for GATHER phase
+  queryClusterNominees(clusterId: ClusterId): Promise<Set<PeerId>>;
+}
+```
+
+### 7. Transaction Validator (cluster participants)
 
 Cluster participants validate transactions by re-executing:
 
 ```typescript
-// In quereus-plugin-optimystic/src/transaction/validator.ts
-export class QuereusTransactionValidator {
-  constructor(private db: Database) {}
+// In db-p2p or similar (cluster participant logic)
+export class TransactionValidator {
+  constructor(
+    private coordinator: TransactionCoordinator,
+    private engines: Map<string, ITransactionEngine>
+  ) {}
 
-  async validate(
-    transaction: Transaction,
-    requestedOps: BlockOperation[]
-  ): Promise<ValidationResult> {
-    // 1. Verify engine matches
-    if (!transaction.engine.startsWith('quereus-sql@')) {
+  async validate(request: PendRequest): Promise<ValidationResult> {
+    const { transaction, operationsHash, blocks } = request;
+
+    // 1. Get the stamp to verify engine and schema
+    const stamp = await this.getStamp(transaction.stampId);
+    if (!stamp) {
+      return { valid: false, reason: 'Unknown transaction stamp' };
+    }
+
+    // 2. Verify engine matches
+    const engine = this.engines.get(stamp.engineId);
+    if (!engine) {
       return {
         valid: false,
-        reason: `Unknown engine: ${transaction.engine}`
+        reason: `Unknown engine: ${stamp.engineId}`
       };
     }
 
-    // 2. Parse payload
-    const payload: QuereusTransactionPayload = JSON.parse(transaction.payload);
-
-    // 3. Verify schema version
-    const localSchemaVersion = await this.getSchemaVersion();
-    if (localSchemaVersion !== payload.schemaVersion) {
+    // 3. Verify schema hash (engine-specific)
+    const localSchemaHash = await engine.getSchemaHash();
+    if (localSchemaHash !== stamp.schemaHash) {
       return {
         valid: false,
-        reason: `Schema mismatch: local=${localSchemaVersion}, tx=${payload.schemaVersion}`
+        reason: `Schema mismatch: local=${localSchemaHash}, stamp=${stamp.schemaHash}`
       };
     }
 
@@ -532,48 +804,60 @@ export class QuereusTransactionValidator {
       }
     }
 
-    // 5. Re-execute SQL statements
-    const localActions = await this.reExecuteSQL(transaction, payload);
+    // 5. Re-execute transaction statements through engine
+    // This creates a temporary coordinator state for validation
+    const tempCoordinator = this.createTempCoordinator();
+    const engine = this.engines.get(stamp.engineId)!;
 
-    // 6. Extract block operations from local execution
-    const localOps = this.extractBlockOperations(localActions);
+    await engine.execute(transaction);
 
-    // 7. Filter to only the ops this cluster is responsible for
-    const relevantLocalOps = localOps.filter(op =>
-      requestedOps.some(req => req.blockId === op.blockId)
-    );
+    // 6. Collect ALL operations from temp coordinator's trackers
+    const localOperations = await tempCoordinator.collectOperations(transaction.stampId);
 
-    // 8. Compare block operations
-    const match = this.compareBlockOps(relevantLocalOps, requestedOps);
+    // 7. Compute hash of ALL operations (entire transaction)
+    const localOperationsHash = this.hashOperations(localOperations);
 
-    return {
-      valid: match,
-      reason: match ? undefined : 'Block operations mismatch'
-    };
+    // 8. Compare with sender's operations hash
+    if (localOperationsHash !== operationsHash) {
+      return {
+        valid: false,
+        reason: `Operations hash mismatch: local=${localOperationsHash}, sender=${operationsHash}`
+      };
+    }
+
+    // 9. Validation succeeded - PEND the blocks this peer coordinates
+    for (const { blockId, rev } of blocks) {
+      await this.transactor.pend({
+        transaction,
+        operationsHash,
+        blocks: [{ blockId, rev }],
+        policy: request.policy
+      });
+    }
+
+    return { valid: true };
   }
 
-  private async reExecuteSQL(
-    transaction: Transaction,
-    payload: QuereusTransactionPayload
-  ): Promise<Map<CollectionId, Action[]>> {
-    // Execute in isolated transaction context
-    return await this.db.transaction(async (tx) => {
-      // Set context values for determinism
-      for (const [key, value] of Object.entries(payload.contextValues)) {
-        tx.setContextValue(key, value);
-      }
+  private createTempCoordinator(): TransactionCoordinator {
+    // Create a temporary coordinator for validation
+    // Uses same collections but isolated tracker state
+    return new TransactionCoordinator(
+      this.transactor,
+      new Map(this.coordinator.collections),
+      this.engines
+    );
+  }
 
-      // Execute each statement
-      for (const stmt of payload.statements) {
-        await tx.execute(stmt.sql, stmt.params, {
-          transactionId: transaction.transactionId,
-          deterministic: true  // Disallow non-deterministic functions
-        });
-      }
-
-      // Extract actions from the transaction
-      return await this.captureActions(tx);
-    });
+  private hashOperations(operations: Operation[]): string {
+    // Deterministic hash of all operations
+    const serialized = JSON.stringify(
+      operations.map(op => ({
+        blockId: op.blockId,
+        type: op.type,
+        data: op.data
+      }))
+    );
+    return hash(serialized);
   }
 }
 ```
@@ -612,17 +896,19 @@ export class QuereusTransactionValidator {
 
 ### db-core
 **Responsibilities**:
-- Transaction type definition
-- TransactionCoordinator for multi-collection consensus
-- Built-in action-based transaction plugin (for testing)
+- Transaction types (TransactionStamp, Transaction)
+- TransactionCoordinator for applying actions and orchestrating consensus
+- TransactionSession for incremental transaction building
+- Built-in ActionsEngine (for testing)
+- ITransactionEngine interface
 - Block operation extraction from collections
-- Validation hook integration
 
-**New Files**:
-- `src/transaction/transaction.ts` - Transaction type, Action.transaction field
-- `src/transaction/coordinator.ts` - TransactionCoordinator with GATHER phase
-- `src/transaction/plugins/action-plugin.ts` - Built-in action plugin
-- `src/transaction/validator.ts` - Validator interface
+**Key Files**:
+- `src/transaction/transaction.ts` - Transaction types (TransactionStamp, Transaction, StampId)
+- `src/transaction/coordinator.ts` - TransactionCoordinator (applyActions, commit, rollback)
+- `src/transaction/session.ts` - TransactionSession (execute, commit, rollback)
+- `src/transaction/actions-engine.ts` - Built-in ActionsEngine
+- `src/transactor.ts` - Updated PendRequest with transaction validation
 
 **Dependencies**: None (core package)
 
@@ -652,30 +938,30 @@ export class QuereusTransactionValidator {
 
 ### quereus-plugin-optimystic
 **Responsibilities**:
-- Quereus transaction plugin (QUEREUS_TRANSACTION_ENGINE)
-- Transaction capture during SQL execution
-- SQL validator implementation
-- Schema version hashing
+- QuereusEngine (implements ITransactionEngine)
+- OptimysticModule (VirtualTableModule with transaction support)
+- Schema hashing (for validation)
 - Integration with TransactionCoordinator
 - P2P integration
 
-**New Files**:
-- `src/transaction/quereus-engine.ts` - Quereus transaction plugin
-- `src/transaction/validator.ts` - QuereusTransactionValidator
-- `src/transaction/capture.ts` - Transaction capture logic
-- `src/plugin.ts` - Integrates module + p2p
+**Key Files**:
+- `src/transaction/quereus-engine.ts` - QuereusEngine (executeStatement, execute, getSchemaHash)
+- `src/optimystic-module.ts` - OptimysticModule with TransactionSession integration
+- `src/plugin.ts` - Integrates module + coordinator + p2p
 
-**Dependencies**: quereus, quereus-optimystic-module, db-core, db-p2p
+**Dependencies**: quereus, db-core, db-p2p
 
 ### db-p2p
 **Responsibilities**:
 - NetworkTransactor implementation
 - Support for multi-collection consensus (GATHER phase)
 - Cluster nominee queries
-- No SQL-specific knowledge
+- Transaction validation (re-execution through engines)
+- No SQL-specific knowledge (engine-agnostic)
 
 **Modified Files**:
-- `src/network-transactor.ts` - Add GATHER phase support
+- `src/network-transactor.ts` - Updated PendRequest handling, GATHER phase support
+- `src/transaction-validator.ts` - Generic transaction validator (uses ITransactionEngine)
 
 **Dependencies**: db-core
 
@@ -699,82 +985,101 @@ export class QuereusTransactionValidator {
 **Deliverable**: Consistent nomenclature throughout db-core, ready for Transaction layer
 
 ### Phase 1: Transaction Infrastructure (db-core)
-**Goal**: Establish transaction type and coordinator in db-core
+**Goal**: Establish transaction types and basic infrastructure
 
 **Tasks**:
-- [ ] Define Transaction type in db-core
-- [ ] Define Action.transaction field
-- [ ] Implement built-in action-based transaction plugin
-- [ ] Add block operation extraction from Collections
-- [ ] Create validator interface
-- [ ] Basic tests for transaction structure
+- [x] Define TransactionStamp type (peerId, timestamp, schemaHash, engineId)
+- [x] Define Transaction type (stampId, statements, reads, cid)
+- [x] Define StampId type and createStampId() helper
+- [x] Update Action type to include transaction: StampId field
+- [x] Implement ActionsEngine (executeStatement, execute)
+- [x] Implement TransactionSession (execute, commit, rollback)
+- [x] Basic tests for transaction structure
 
-**Deliverable**: db-core has transaction infrastructure (no multi-collection yet)
+**Deliverable**: db-core has transaction infrastructure with stamp/CID separation
 
 ### Phase 2: Multi-Collection Coordinator (db-core)
 **Goal**: Implement multi-collection transaction coordination
 
 **Tasks**:
-- [ ] Implement TransactionCoordinator class
-- [ ] Add cluster grouping logic for block operations
+- [x] Implement TransactionCoordinator.applyActions() (called by engines)
+- [x] Implement TransactionCoordinator.commit() (orchestrates PEND/COMMIT)
+- [x] Implement TransactionCoordinator.rollback() (clears trackers)
+- [ ] Implement operation collection from trackers
+- [ ] Implement operation hashing (single hash for entire transaction)
 - [ ] Implement critical cluster identification
-- [ ] Implement GATHER phase (nominee collection)
-- [ ] Extend PEND/COMMIT/PROPAGATE/CHECKPOINT for multi-collection
-- [ ] Tests for multi-collection coordination with action plugin
+- [ ] Implement GATHER phase (nominee collection, skip if single collection)
+- [ ] Implement PEND phase (send transaction + operations hash + block list)
+- [ ] Implement COMMIT phase (consensus across critical clusters)
+- [ ] Update PendRequest type (transaction, operationsHash, blocks, policy)
+- [ ] Tests for multi-collection coordination with ActionsEngine
 
 **Deliverable**: Can coordinate transactions across multiple collections
 
 ### Phase 3: Network Support (db-p2p)
-**Goal**: Add network support for multi-collection consensus
+**Goal**: Add network support for multi-collection consensus and validation
 
 **Tasks**:
+- [ ] Update PendRequest type in ITransactor interface
+- [ ] Implement TransactionValidator (generic, engine-agnostic)
+  - [ ] Verify stamp.engineId matches local engine
+  - [ ] Verify stamp.schemaHash matches local schema
+  - [ ] Verify read dependencies
+  - [ ] Re-execute transaction through engine
+  - [ ] Compute operations hash from temp coordinator
+  - [ ] Compare with sender's operations hash
 - [ ] Extend NetworkTransactor for GATHER phase
 - [ ] Implement cluster nominee queries
 - [ ] Add nominee reasonableness checks
 - [ ] Tests for network-level multi-collection transactions
 
-**Deliverable**: Multi-collection transactions work over network
+**Deliverable**: Multi-collection transactions work over network with validation
 
-### Phase 4: Quereus Determinism (quereus)
-**Goal**: Enable deterministic SQL execution
-
-**Tasks**:
-- [ ] Add `sql`, `params` to VirtualTableContext
-- [ ] Populate context during execution
-- [ ] Implement "with context" clause parsing
-- [ ] Add deterministic execution mode
-- [ ] Reject non-deterministic functions outside context
-- [ ] Tests for deterministic execution
-
-**Deliverable**: Quereus supports deterministic execution
-
-### Phase 5: SQL Transaction Capture (quereus-plugin-optimystic)
-**Goal**: Capture SQL transactions
+### Phase 4: Quereus Engine (quereus-plugin-optimystic)
+**Goal**: Implement QuereusEngine for SQL transaction execution
 
 **Tasks**:
-- [ ] Define QuereusTransactionPayload type
-- [ ] Implement transaction capture in OptimysticModule
-- [ ] Add xBegin/xCommit hooks
-- [ ] Capture SQL statements, reads, context values
-- [ ] Implement schema version hashing
-- [ ] Create Transaction from captured data
-- [ ] Tests for transaction capture
+- [ ] Define QuereusStatements type (array of {sql, params})
+- [ ] Implement QuereusEngine class
+  - [ ] Constructor takes QuereusDatabase
+  - [ ] executeStatement() - execute single SQL statement
+  - [ ] execute() - execute all statements (for validation)
+  - [ ] getSchemaHash() - serialize catalog and hash
+- [ ] Implement schema hash caching (avoid recomputing if unchanged)
+- [ ] Tests for QuereusEngine
 
-**Deliverable**: Can capture SQL transactions
+**Deliverable**: QuereusEngine can execute and validate SQL transactions
 
-### Phase 6: SQL Validation (quereus-plugin-optimystic)
-**Goal**: Validate transactions by re-executing SQL
+### Phase 5: Optimystic Module Integration (quereus-plugin-optimystic)
+**Goal**: Integrate TransactionSession into OptimysticModule
 
 **Tasks**:
-- [ ] Implement QuereusTransactionValidator
-- [ ] Add schema version validation
-- [ ] Add read dependency validation
-- [ ] Implement SQL re-execution
-- [ ] Implement action comparison
-- [ ] Integrate with db-core validator interface
-- [ ] Tests for validation logic
+- [ ] Update OptimysticModule to use TransactionSession
+- [ ] Create/get session from context.stampId
+- [ ] Log SQL statements to session in xUpdate
+- [ ] Translate SQL to actions
+- [ ] Call coordinator.applyActions() with stampId
+- [ ] Implement xCommit (session.commit())
+- [ ] Implement xRollback (session.rollback())
+- [ ] Implement createStampId() helper
+  - [ ] Get peerId from coordinator
+  - [ ] Get timestamp from Date.now()
+  - [ ] Get schemaHash from engine (cached)
+  - [ ] Set engineId to QUEREUS_ENGINE_ID
+- [ ] Tests for module integration
 
-**Deliverable**: Cluster participants can validate SQL transactions
+**Deliverable**: SQL statements flow through TransactionSession → QuereusEngine → Coordinator
+
+### Phase 6: StampId() UDF (quereus-plugin-optimystic)
+**Goal**: Expose StampId() UDF for SQL users
+
+**Tasks**:
+- [ ] Implement StampId() UDF in Quereus
+- [ ] Pass stampId through VirtualTableContext
+- [ ] Document usage (for deduplication, auditing)
+- [ ] Tests for StampId() UDF
+
+**Deliverable**: Users can access transaction stamp ID in SQL
 
 ### Phase 7: Integration & Testing
 **Goal**: End-to-end integration and testing
@@ -811,57 +1116,74 @@ Instead of a persistent "supercluster", we use a temporary coordination:
 - No persistent supercluster structure needed
 
 ### 4. Pluggable Transaction Engines
-The transaction payload is engine-specific, allowing:
-- SQL validation (Quereus)
+The transaction statements are engine-specific, allowing:
+- SQL validation (QuereusEngine)
 - Other rule systems (future)
-- Built-in action-based plugin (testing)
+- Built-in ActionsEngine (testing)
 
 This keeps db-core generic while enabling powerful validation.
 
-### 5. Actions Carry Transaction Context
-Actions include transaction CID (and optionally full transaction) so validators have all needed information without separate lookups.
+### 5. Engine Takes Coordinator, Not Vice Versa
+Engines take the coordinator as a constructor argument:
+- Coordinator is the "database" - the core abstraction
+- Engines are statement translators/executors
+- Engines call `coordinator.applyActions()` to execute
+- Clean separation: coordinator doesn't know about engines during construction
 
-### 6. Read Tracking at Block Level
-For Phase 1, track reads at block granularity:
+### 6. Actions Carry Transaction Stamp ID
+Actions include `transaction: StampId` field:
+- StampId is stable throughout transaction lifecycle
+- Used to track which actions belong to which transaction
+- Validators can look up full Transaction by stampId if needed
+
+### 7. Transaction Stamp vs Transaction CID
+Two distinct identifiers serve different purposes:
+- **StampId**: Created at BEGIN, stable throughout, exposed to users via `StampId()` UDF
+- **CID**: Computed at COMMIT, final immutable identity, used in logs
+- Stamp contains: peerId, timestamp, schemaHash, engineId
+- CID is hash of: stampId + statements + reads
+
+### 8. Blocks Don't Receive Operations, They Validate Transactions
+Key insight: Blocks don't need the full operation details during PEND:
+- Send full Transaction (statements) for replay
+- Send operations hash (single hash for entire transaction)
+- Send which blocks this peer should coordinate
+- Receiving node replays transaction, computes own operations hash
+- If hashes match → validation succeeds
+- Broader validation: every participant validates entire transaction
+
+### 9. Schema Hash in Transaction Stamp
+Schema hash is part of the stamp (not transaction):
+- Computed at transaction BEGIN
+- All participants must match for validation to succeed
+- Engine-specific: QuereusEngine serializes catalog, ActionsEngine may use collection list
+- Cached to avoid recomputing if schema unchanged
+
+### 10. Read Tracking at Block Level
+Track reads at block granularity:
 - Simpler implementation
 - Sufficient for optimistic concurrency control
 - Can refine to row-level later if needed
 
-### 7. Determinism via "with context"
-Non-deterministic functions (NOW(), RANDOM()) are captured through "with context" clauses:
-- Quereus rejects non-deterministic functions outside context
-- Context values captured and included in transaction
-- All peers use same context values during re-execution
-- Example: `SELECT * FROM users WITH CONTEXT (now: NOW()) WHERE created < now`
-
-### 8. Schema Version Hashing
-All participants must have matching schema versions:
-- Schema changes prohibited during normal operation
-- Schema changes require cluster-wide coordination (future work)
-- Focus on validation for now
-
-### 9. TransactionId() Integration
-Use TransactionId() function for transaction identification:
-- Returns current transaction's ID
-- Useful for audit trails and debugging
-- Included in transaction for deterministic re-execution
-
-### 10. Performance Trade-offs
-Accept cost of re-executing SQL on cluster participants:
+### 11. Performance Trade-offs
+Accept cost of re-executing statements on cluster participants:
 - Still better than blockchain (not everyone replicates everything)
 - Only cluster participants for affected blocks re-execute
+- Broader validation: each participant validates entire transaction
 - Can optimize later with Merkle trees, sampling, caching
 
 ## Success Criteria
 
 1. **Multi-Collection Atomicity**: Transactions affecting multiple collections (table + indexes) commit atomically or not at all
-2. **Constraint Validation**: PRIMARY KEY, UNIQUE, CHECK, NOT NULL constraints validated across the network
-3. **Collation Correctness**: String comparisons respect declared collations
-4. **Schema Consistency**: All peers reject transactions with schema mismatches
-5. **Deterministic Execution**: Same SQL produces same actions on all peers
-6. **Conflict Detection**: Stale reads detected and rejected
-7. **Critical Cluster Consensus**: All log tail clusters participate in consensus
-8. **Pluggable Engines**: Built-in action plugin and Quereus plugin both work
+2. **Statement Validation**: Validators re-execute statements and verify operations match
+3. **Schema Consistency**: All peers reject transactions with schema mismatches (via stamp.schemaHash)
+4. **Deterministic Execution**: Same statements produce same operations on all peers
+5. **Conflict Detection**: Stale reads detected and rejected
+6. **Critical Cluster Consensus**: All log tail clusters participate in consensus
+7. **Pluggable Engines**: ActionsEngine and QuereusEngine both work
+8. **Operations Hash Validation**: Single hash validates entire transaction across all blocks
+9. **Stamp/CID Separation**: StampId stable throughout, CID computed at commit
+10. **Engine-Agnostic Validation**: db-p2p validates any engine through ITransactionEngine interface
 
 ## Key Architectural Insights
 
@@ -872,20 +1194,35 @@ No global transaction log - each collection maintains its own log. Transactions 
 Critical clusters form temporary consensus groups via GATHER phase, not persistent superclusters. This avoids creating new bottlenecks.
 
 ### 3. Separation of Mechanism and Policy
-- **db-core**: Provides mechanism (multi-collection transactions, validation hooks)
-- **quereus-plugin-optimystic**: Provides policy (SQL validation)
-- **db-p2p**: Provides transport (no SQL knowledge)
+- **db-core**: Provides mechanism (TransactionCoordinator, TransactionSession, ITransactionEngine)
+- **quereus-plugin-optimystic**: Provides policy (QuereusEngine, schema hashing)
+- **db-p2p**: Provides transport and validation (engine-agnostic)
 
 This separation enables:
-- Testing multi-collection transactions without SQL
-- Alternative validation strategies
-- Reuse of components
+- Testing multi-collection transactions without SQL (ActionsEngine)
+- Alternative validation strategies (different engines)
+- Reuse of components across different use cases
 
-### 4. Action as Unit of Replication
-Actions remain the unit of replication and replay. Transactions are a coordination layer above actions, not a replacement.
+### 4. Statements as Unit of Validation
+Transactions are validated by re-executing statements, not by comparing operations directly:
+- Validators replay transaction statements through their local engine
+- Compute operations hash from resulting operations
+- Compare hash with sender's hash
+- Ensures semantic correctness, not just structural correctness
 
-### 5. Validation Through Re-execution
-Rather than trying to validate block operations directly, validators re-execute the transaction payload and compare resulting actions. This ensures semantic correctness, not just structural correctness.
+### 5. Layered Architecture
+Clear separation between layers:
+- **Engine Layer**: Translates statements → actions (QuereusEngine, ActionsEngine)
+- **Coordinator Layer**: Applies actions, orchestrates consensus (TransactionCoordinator)
+- **Session Layer**: Manages incremental transaction building (TransactionSession)
+- **Network Layer**: Validates and distributes transactions (db-p2p)
+
+### 6. Operations Hash for Efficiency
+Single hash validates entire transaction:
+- Avoids sending full operation details to every block
+- Each validator computes hash from their replay
+- Broader validation: every participant validates entire transaction
+- Detects Byzantine faults or bugs in statement execution
 
 ## Putting It All Together: Example Flow
 
@@ -898,56 +1235,105 @@ This affects:
 
 ### Step-by-Step Flow
 
-**1. Client Execution (quereus-plugin-optimystic)**
+**1. BEGIN Transaction (quereus-plugin-optimystic)**
+```typescript
+// User calls:
+await db.execute("BEGIN");
+
+// OptimysticModule creates TransactionStamp:
+const stamp: TransactionStamp = {
+  peerId: coordinator.getPeerId(),
+  timestamp: Date.now(),
+  schemaHash: await quereusEngine.getSchemaHash(), // Cached
+  engineId: 'quereus@0.5.3'
+};
+const stampId = createStampId(stamp);
+
+// Create TransactionSession:
+const session = new TransactionSession(coordinator, stampId, 'quereus@0.5.3');
+```
+
+**2. Execute Statement (quereus-plugin-optimystic)**
 ```typescript
 // User calls:
 await db.execute("INSERT INTO users (id, name) VALUES (1, 'Alice')");
 
-// OptimysticModule.xBegin() called
-// - Creates TransactionCapture
+// Session executes statement:
+await session.execute("INSERT INTO users (id, name) VALUES (1, 'Alice')");
 
-// OptimysticModule.xUpdate() called
-// - Captures SQL: "INSERT INTO users..."
-// - Executes: Updates main table collection
-// - Executes: Updates index collection
-// - Tracks affected collections: [users, users_by_name]
+// QuereusEngine.executeStatement() called:
+// - Translates SQL to actions:
+//   - users collection: INSERT action
+//   - users_by_name collection: INSERT action
+// - Calls coordinator.applyActions([...], stampId)
 
-// OptimysticModule.xCommit() called
-// - Creates QuereusTransactionPayload
-// - Creates Transaction with CID
-// - Calls TransactionCoordinator.executeTransaction()
+// Coordinator.applyActions() called:
+// - Applies actions to collections immediately (local snapshot)
+// - Actions tagged with stampId
+// - Operations recorded in collection trackers
 ```
 
-**2. GATHER Phase (db-core TransactionCoordinator)**
+**3. COMMIT Transaction (quereus-plugin-optimystic)**
 ```typescript
-// Identify critical blocks:
-// - users collection → log tail block 0xABCD
-// - users_by_name collection → log tail block 0x1234
+// User calls:
+await db.execute("COMMIT");
 
-// Query clusters:
-// - 0xABCD cluster → nominees: {peer1, peer2, peer3}
-// - 0x1234 cluster → nominees: {peer4, peer5, peer6}
+// Session.commit() called:
+// - Compiles statements: JSON.stringify(["INSERT INTO users..."])
+// - Creates Transaction:
+const transaction: Transaction = {
+  stampId,
+  statements: JSON.stringify(["INSERT INTO users (id, name) VALUES (1, 'Alice')"]),
+  reads: [], // TODO: Track reads
+  cid: createTransactionCid(stampId, statements, [])
+};
 
-// Supercluster: {peer1, peer2, peer3, peer4, peer5, peer6}
+// - Calls coordinator.commit(transaction)
 ```
 
-**3. PEND Phase (db-p2p NetworkTransactor)**
+**4. GATHER Phase (db-core TransactionCoordinator)**
 ```typescript
-// Send to all block clusters:
-// - Transaction (engine, payload, reads, CID, actions)
-// - Block operations for their blocks
-// - Supercluster nominee list
+// Coordinator.commit() called:
+// - Collects operations from trackers (users, users_by_name)
+// - Computes operations hash (single hash for ALL operations)
+// - Groups operations by block
+// - Identifies critical clusters:
+//   - users collection → log tail block 0xABCD
+//   - users_by_name collection → log tail block 0x1234
+
+// GATHER phase (multi-collection):
+// - Query 0xABCD cluster → nominees: {peer1, peer2, peer3}
+// - Query 0x1234 cluster → nominees: {peer4, peer5, peer6}
+// - Supercluster: {peer1, peer2, peer3, peer4, peer5, peer6}
+```
+
+**5. PEND Phase (db-p2p NetworkTransactor)**
+```typescript
+// Send PendRequest to all affected block clusters:
+const pendRequest: PendRequest = {
+  transaction,
+  operationsHash: "0xABCDEF...", // Hash of ALL operations
+  blocks: [
+    { blockId: "0xABCD", rev: 5 },  // users log tail
+    { blockId: "0x1234", rev: 3 }   // users_by_name log tail
+  ],
+  policy: { superclusterNominees: {peer1, peer2, peer3, peer4, peer5, peer6} }
+};
 
 // Each cluster participant validates:
-// - Parse QuereusTransactionPayload
-// - Check schema version matches
-// - Check read dependencies
-// - Re-execute: INSERT INTO users (id, name) VALUES (1, 'Alice')
-// - Compare resulting actions with proposed
-// - Vote: accept/reject
+// 1. Get stamp from transaction.stampId
+// 2. Verify stamp.engineId matches local engine
+// 3. Verify stamp.schemaHash matches local schema
+// 4. Verify read dependencies
+// 5. Create temp coordinator for validation
+// 6. Re-execute transaction through QuereusEngine
+// 7. Collect ALL operations from temp coordinator
+// 8. Compute operations hash
+// 9. Compare with sender's operationsHash
+// 10. If match → PEND succeeds, else reject
 ```
 
-**4. COMMIT Phase (db-p2p NetworkTransactor)**
+**6. COMMIT Phase (db-p2p NetworkTransactor)**
 ```typescript
 // Send commit to critical clusters:
 // - 0xABCD cluster (users log tail)
@@ -959,17 +1345,13 @@ await db.execute("INSERT INTO users (id, name) VALUES (1, 'Alice')");
 // - If any fails, entire transaction aborts
 ```
 
-**5. PROPAGATE Phase**
+**7. PROPAGATE & CHECKPOINT Phases**
 ```typescript
 // Notify all block clusters of success
 // Clusters finalize their local changes
-```
-
-**6. CHECKPOINT Phase**
-```typescript
 // Append to collection logs:
-// - users log: records actions for users collection
-// - users_by_name log: records actions for index collection
+// - users log: records actions with transaction.cid
+// - users_by_name log: records actions with transaction.cid
 
 // Each log entry includes:
 // - Transaction CID
