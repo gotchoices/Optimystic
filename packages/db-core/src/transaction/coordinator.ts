@@ -1,4 +1,4 @@
-import type { ITransactor, BlockId, CollectionId, Transforms, PendRequest, CommitRequest, ActionId } from "../index.js";
+import type { ITransactor, BlockId, CollectionId, Transforms, PendRequest, CommitRequest, ActionId, IBlock, BlockOperations } from "../index.js";
 import type { Transaction, ExecutionResult, ITransactionEngine, CollectionActions } from "./transaction.js";
 import type { PeerId } from "@libp2p/interface";
 import type { Collection } from "../collection/collection.js";
@@ -6,6 +6,14 @@ import { TransactionContext } from "./context.js";
 import { createActionsStatements } from "./actions-engine.js";
 import { createTransactionStamp, createTransactionId } from "./transaction.js";
 import { Log, blockIdsForTransforms, transformsFromTransform } from "../index.js";
+
+/**
+ * Represents an operation on a block within a collection.
+ */
+type Operation =
+	| { readonly type: 'insert'; readonly collectionId: CollectionId; readonly blockId: BlockId; readonly block: IBlock }
+	| { readonly type: 'update'; readonly collectionId: CollectionId; readonly blockId: BlockId; readonly operations: BlockOperations }
+	| { readonly type: 'delete'; readonly collectionId: CollectionId; readonly blockId: BlockId };
 
 /**
  * Coordinates multi-collection transactions.
@@ -62,15 +70,71 @@ export class TransactionCoordinator {
 	 * @param transaction - The transaction to commit
 	 */
 	async commit(transaction: Transaction): Promise<void> {
-		// TODO: Implement the new commit flow
-		// 1. Collect operations from collection trackers
-		// 2. Compute hash of ALL operations
-		// 3. Group operations by block
-		// 4. Identify critical clusters
-		// 5. Execute consensus phases (GATHER, PEND, COMMIT)
+		// Collect transforms and determine critical blocks for each affected collection
+		const collectionData = Array.from(this.collections.entries())
+			.map(([collectionId, collection]) => ({
+				collectionId,
+				collection,
+				transforms: collection.tracker.transforms
+			}))
+			.filter(({ transforms }) =>
+				Object.keys(transforms.inserts).length +
+				Object.keys(transforms.updates).length +
+				transforms.deletes.length > 0
+			);
 
-		// For now, throw an error to indicate this is not yet implemented
-		throw new Error('New commit() method not yet implemented - use execute() for now');
+		if (collectionData.length === 0) {
+			return; // Nothing to commit
+		}
+
+		// Get critical block IDs (log tail) for each affected collection
+		// The critical block is the current log tail that must participate in consensus
+		const collectionTransforms = new Map<CollectionId, Transforms>();
+		const criticalBlocks = new Map<CollectionId, BlockId>();
+
+		for (const { collectionId, collection, transforms } of collectionData) {
+			collectionTransforms.set(collectionId, transforms);
+
+			// Get the current log tail block ID (critical block)
+			const log = await Log.open(collection.tracker, collectionId);
+			if (!log) {
+				throw new Error(`Log not found for collection ${collectionId}`);
+			}
+
+			const tailPath = await (log as unknown as { chain: { getTail: () => Promise<{ block: { header: { id: BlockId } } } | undefined> } }).chain.getTail();
+			if (tailPath) {
+				criticalBlocks.set(collectionId, tailPath.block.header.id);
+			}
+		}
+
+		// Compute hash of ALL operations across ALL collections
+		// This hash is used for validation - validators re-execute the transaction
+		// and compare their computed operations hash with this one
+		const allOperations = collectionData.flatMap(({ collectionId, transforms }) => [
+			...Object.entries(transforms.inserts).map(([blockId, block]) =>
+				({ type: 'insert' as const, collectionId, blockId, block })
+			),
+			...Object.entries(transforms.updates).map(([blockId, operations]) =>
+				({ type: 'update' as const, collectionId, blockId, operations })
+			),
+			...transforms.deletes.map(blockId =>
+				({ type: 'delete' as const, collectionId, blockId })
+			)
+		]);
+
+		// TODO: Pass operationsHash to PEND phase when we update PendRequest type
+		const _operationsHash = this.hashOperations(allOperations);
+
+		// Execute consensus phases (GATHER, PEND, COMMIT)
+		const coordResult = await this.coordinateTransaction(
+			transaction,
+			collectionTransforms,
+			criticalBlocks
+		);
+
+		if (!coordResult.success) {
+			throw new Error(`Transaction commit failed: ${coordResult.error}`);
+		}
 	}
 
 	/**
@@ -79,13 +143,31 @@ export class TransactionCoordinator {
 	 * This is called by TransactionSession.rollback() to undo all actions
 	 * that were applied via applyActions().
 	 *
-	 * @param stampId - The transaction stamp ID to rollback
+	 * @param _stampId - The transaction stamp ID to rollback (currently unused - we clear all trackers)
 	 */
-	async rollback(stampId: string): Promise<void> {
-		// TODO: Implement rollback
-		// Clear trackers for this transaction
-		// For now, throw an error to indicate this is not yet implemented
-		throw new Error('rollback() not yet implemented');
+	async rollback(_stampId: string): Promise<void> {
+		// Clear trackers for all collections
+		// This discards all pending changes that were applied via applyActions()
+		// TODO: In the future, we may want to track which collections were affected by
+		// a specific stampId and only reset those trackers
+		for (const collection of this.collections.values()) {
+			// Reset the tracker to discard all pending transforms
+			collection.tracker.reset();
+		}
+	}
+
+	/**
+	 * Compute hash of all operations in a transaction.
+	 * This hash is used for validation - validators re-execute the transaction
+	 * and compare their computed operations hash with this one.
+	 */
+	private hashOperations(operations: readonly Operation[]): string {
+		const operationsData = JSON.stringify(operations);
+		const hash = Array.from(operationsData).reduce((acc, char) => {
+			const charCode = char.charCodeAt(0);
+			return ((acc << 5) - acc + charCode) & acc;
+		}, 0);
+		return `ops:${Math.abs(hash).toString(36)}`;
 	}
 
 	/**
@@ -313,8 +395,8 @@ export class TransactionCoordinator {
 	 * @returns Set of peer IDs to use for consensus, or null for single-collection
 	 */
 	private async gatherPhase(
-		criticalBlockIds: BlockId[]
-	): Promise<Set<PeerId> | null> {
+		criticalBlockIds: readonly BlockId[]
+	): Promise<ReadonlySet<PeerId> | null> {
 		// Skip GATHER if only one collection affected
 		if (criticalBlockIds.length === 1) {
 			return null; // Use normal single-collection consensus
@@ -330,8 +412,8 @@ export class TransactionCoordinator {
 	 */
 	private async pendPhase(
 		actionId: ActionId,
-		collectionTransforms: Map<CollectionId, Transforms>,
-		_superclusterNominees: Set<PeerId> | null
+		collectionTransforms: ReadonlyMap<CollectionId, Transforms>,
+		_superclusterNominees: ReadonlySet<PeerId> | null
 	): Promise<{ success: boolean; error?: string; pendedBlockIds?: Map<CollectionId, BlockId[]> }> {
 		if (collectionTransforms.size === 0) {
 			return { success: false, error: 'No transforms to pend' };

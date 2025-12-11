@@ -16,8 +16,8 @@ To support multi-collection transactions, we introduce a clear hierarchy:
 
 Transactions have two distinct identifiers:
 
-- **Transaction Stamp** (`stampId`): Created at transaction BEGIN, remains stable throughout the transaction lifecycle. Contains peer ID, timestamp, schema hash, and engine ID. Exposed to users via `StampId()` UDF.
-- **Transaction CID** (`cid`): Computed at COMMIT as a hash of the stamp + statements + reads. This is the final, immutable transaction identity used in logs and block references.
+- **Transaction Stamp ID** (`stamp.id`): Created at transaction BEGIN, remains stable throughout the transaction lifecycle. This is a hash of the stamp fields (peer ID, timestamp, schema hash, engine ID). Exposed to users via `StampId()` UDF.
+- **Transaction ID** (`transaction.id`): Computed at COMMIT as a hash of the stamp.id + statements + reads. This is the final, immutable transaction identity used in logs and block references.
 
 ## Current Architecture (Single-Collection)
 
@@ -61,31 +61,28 @@ Additionally, for SQL validation:
 ### Transaction Structure
 
 ```typescript
-// Stamp ID: Hash of the stamp (exposed to users via StampId() UDF)
-type StampId = string;
-
 // Transaction Stamp: Created at BEGIN, stable throughout transaction
 type TransactionStamp = {
-  peerId: PeerId;           // Who initiated the transaction
+  peerId: string;           // Who initiated the transaction
   timestamp: number;        // When transaction started (milliseconds)
   schemaHash: string;       // Hash of schema version(s) for validation
   engineId: string;         // Which engine (e.g., 'quereus@0.5.3')
-  id: StampId;              // Identity of stamp (Hash of peerId + timestamp + schemaHash + engineId)- stable throughout transaction
+  id: string;               // Stamp ID (hash of peerId + timestamp + schemaHash + engineId) - stable throughout transaction
 };
 
 // Transaction: Finalized at COMMIT
 type Transaction = {
-  // Reference to the stamp
-  stampId: StampId;
+  // The transaction stamp (contains stable stamp.id)
+  stamp: TransactionStamp;
 
   // Engine-specific statements (for replay/validation)
-  statements: string;  // For Quereus: SQL statements; for ActionsEngine: JSON-encoded actions
+  statements: string[];  // Array of statements - for Quereus: SQL statements; for ActionsEngine: JSON-encoded actions
 
   // Read dependencies for optimistic concurrency control
   reads: ReadDependency[];
 
-  // Transaction identifier 
-  id: string;  // used in logs (hash of stampId + statements + reads)
+  // Transaction identifier used in logs (hash of stamp.id + statements + reads)
+  id: string;
 };
 
 type ReadDependency = {
@@ -93,11 +90,11 @@ type ReadDependency = {
   revision: number;  // Expected revision
 };
 
-// Actions reference the transaction they came from
+// Actions reference the transaction stamp ID they came from
 type Action<T> = {
   type: ActionType;
   data: T;
-  transaction: Transaction;
+  transaction: string;  // stamp.id
 };
 
 // Action handlers can return values (for reads, queries, etc.)
@@ -350,6 +347,36 @@ export type Action<T> = {
 };
 ```
 
+### 1. Transaction Engine Interface (db-core)
+
+Engines translate domain-specific statements into actions. The engine interface is minimal - engines don't need to track state or manage transactions:
+
+```typescript
+// In db-core/src/transaction/engine.ts
+export interface ITransactionEngine {
+  /**
+   * Execute a complete transaction and return the resulting actions.
+   * This is used both during transaction building (to translate statements)
+   * and during validation/replay (to verify operations hash).
+   *
+   * @param transaction - The transaction to execute
+   * @returns ExecutionResult with success flag and actions (if successful)
+   */
+  execute(transaction: Transaction): Promise<ExecutionResult>;
+}
+
+export type ExecutionResult = {
+  success: boolean;
+  error?: string;
+  actions?: CollectionActions[];
+};
+
+export type CollectionActions = {
+  collectionId: string;
+  actions: Action<any>[];
+};
+```
+
 ### 2. Built-in Actions Engine (db-core)
 
 For testing and simple use cases, db-core provides a built-in actions engine:
@@ -358,32 +385,24 @@ For testing and simple use cases, db-core provides a built-in actions engine:
 // In db-core/src/transaction/actions-engine.ts
 export const ACTIONS_ENGINE_ID = "actions@1.0.0";
 
-export type ActionsStatement = {
-  // Direct specification of actions for a single collection
-  collectionId: CollectionId;
-  actions: Action<unknown>[];
-};
-
 // The ActionsEngine takes a coordinator and applies actions directly
+// Each statement is a JSON-encoded CollectionActions object
 export class ActionsEngine implements ITransactionEngine {
   constructor(private coordinator: TransactionCoordinator) {}
 
-  async executeStatement(statement: string, stampId: StampId): Promise<void> {
-    const actionsStatement: ActionsStatement = JSON.parse(statement);
+  async execute(transaction: Transaction): Promise<ExecutionResult> {
+    try {
+      // Parse all statements (each is a JSON-encoded CollectionActions)
+      const actions: CollectionActions[] = transaction.statements.map(stmt =>
+        JSON.parse(stmt)
+      );
 
-    // Apply actions through coordinator
-    await this.coordinator.applyActions(
-      [actionsStatement],
-      stampId
-    );
-  }
-
-  async execute(transaction: Transaction): Promise<void> {
-    // For validation/replay: parse all statements and apply
-    const statements: ActionsStatement[] = JSON.parse(transaction.statements);
-
-    for (const statement of statements) {
-      await this.coordinator.applyActions([statement], transaction.stampId);
+      return { success: true, actions };
+    } catch (error) {
+      return {
+        success: false,
+        error: error instanceof Error ? error.message : 'Failed to parse actions'
+      };
     }
   }
 }
@@ -399,32 +418,38 @@ The Quereus-specific transaction engine:
 // In quereus-plugin-optimystic/src/transaction/quereus-engine.ts
 export const QUEREUS_ENGINE_ID = "quereus@0.5.3";
 
-export type QuereusStatements = {
-  // SQL statements in execution order
-  statements: Array<{
-    sql: string;
-    params: SqlValue[];
-  }>;
-};
-
-// The QuereusEngine wraps a Quereus database instance
+// The QuereusEngine wraps a Quereus database instance and coordinator
 export class QuereusEngine implements ITransactionEngine {
-  constructor(private db: QuereusDatabase) {}
+  constructor(
+    private db: QuereusDatabase,
+    private coordinator: TransactionCoordinator
+  ) {}
 
-  async executeStatement(statement: string, stampId: StampId): Promise<void> {
-    const { sql, params } = JSON.parse(statement);
+  async execute(transaction: Transaction): Promise<ExecutionResult> {
+    try {
+      const actions: CollectionActions[] = [];
 
-    // Execute SQL through Quereus
-    // Quereus module will translate to actions and call coordinator.applyActions()
-    await this.db.exec(sql, params, { stampId });
-  }
+      // Execute each SQL statement and collect resulting actions
+      for (const statement of transaction.statements) {
+        const { sql, params } = JSON.parse(statement);
 
-  async execute(transaction: Transaction): Promise<void> {
-    // For validation/replay: execute all SQL statements
-    const statements: QuereusStatements = JSON.parse(transaction.statements);
+        // Execute SQL through Quereus
+        // The Optimystic virtual table module will translate to actions
+        // and call coordinator.applyActions()
+        const result = await this.db.exec(sql, params, {
+          stampId: transaction.stamp.id
+        });
 
-    for (const stmt of statements.statements) {
-      await this.db.exec(stmt.sql, stmt.params, { stampId: transaction.stampId });
+        // Collect actions from the execution
+        // (In practice, actions are collected from the coordinator's trackers)
+      }
+
+      return { success: true, actions };
+    } catch (error) {
+      return {
+        success: false,
+        error: error instanceof Error ? error.message : 'Failed to execute SQL'
+      };
     }
   }
 
@@ -516,106 +541,141 @@ class OptimysticModule implements VirtualTableModule {
 
 ### 4. Transaction Session (db-core)
 
-Manages incremental transaction building:
+Manages incremental transaction building. The session:
+1. Creates a stable transaction stamp at BEGIN (in constructor)
+2. Acts as a container for statements
+3. Enlists the engine to translate statements to actions (if not already provided)
+4. Commits by creating a complete Transaction and calling coordinator.commit()
 
 ```typescript
 // In db-core/src/transaction/session.ts
 export class TransactionSession {
   private readonly statements: string[] = [];
+  private readonly stamp: TransactionStamp;  // Created at BEGIN, stable throughout transaction
   private committed = false;
   private rolledBack = false;
 
   constructor(
     private readonly coordinator: TransactionCoordinator,
-    public readonly stampId: StampId,
-    public readonly engineId: string
-  ) {}
-
-  async execute(statement: string): Promise<void> {
-    if (this.committed || this.rolledBack) {
-      throw new Error('Transaction already finalized');
-    }
-
-    // Accumulate the statement for later compilation
-    this.statements.push(statement);
-
-    // Execute through engine (engine will call coordinator.applyActions)
-    const engine = this.coordinator.getEngine(this.engineId);
-    await engine.executeStatement(statement, this.stampId);
+    private readonly engine: ITransactionEngine,
+    peerId: string = 'local',
+    schemaHash: string = ''
+  ) {
+    // Create stamp at BEGIN (stable throughout transaction)
+    this.stamp = createTransactionStamp(
+      peerId,
+      Date.now(),
+      schemaHash,
+      'unknown' // TODO: Get engine ID from engine
+    );
   }
 
-  async commit(): Promise<void> {
+  async execute(statement: string, actions?: CollectionActions[]): Promise<{ success: boolean; error?: string }> {
     if (this.committed || this.rolledBack) {
-      throw new Error('Transaction already finalized');
+      return { success: false, error: 'Transaction already finalized' };
     }
 
-    // Compile statements into complete transaction
+    // If actions not provided, enlist engine to translate statement
+    let actionsToApply: CollectionActions[];
+    if (actions) {
+      actionsToApply = actions;
+    } else {
+      const tempTransaction: Transaction = {
+        stamp: this.stamp,
+        statements: [statement],
+        reads: [],
+        id: 'temp'
+      };
+      const result = await this.engine.execute(tempTransaction);
+      if (!result.success || !result.actions) {
+        return { success: false, error: result.error || 'Failed to translate statement' };
+      }
+      actionsToApply = result.actions;
+    }
+
+    // Apply actions through coordinator
+    await this.coordinator.applyActions(actionsToApply, this.stamp.id);
+    this.statements.push(statement);
+    return { success: true };
+  }
+
+  async commit(): Promise<ExecutionResult> {
+    if (this.committed) {
+      return { success: false, error: 'Transaction already committed' };
+    }
+    if (this.rolledBack) {
+      return { success: false, error: 'Transaction already rolled back' };
+    }
+
+    // Create the complete transaction
     const transaction: Transaction = {
-      stampId: this.stampId,
-      statements: this.compileStatements(),
-      reads: [], // TODO: Track reads during execution
-      cid: createTransactionCid(
-        this.stampId,
-        this.compileStatements(),
-        []
-      )
+      stamp: this.stamp,
+      statements: this.statements,
+      reads: [], // TODO: Track reads during statement execution
+      id: createTransactionId(this.stamp.id, this.statements, [])
     };
 
-    // Execute through coordinator (orchestrates PEND/COMMIT)
+    // Commit through coordinator (which will orchestrate PEND/COMMIT)
     await this.coordinator.commit(transaction);
 
     this.committed = true;
+    return { success: true };
   }
 
-  async rollback(): Promise<void> {
-    if (this.committed || this.rolledBack) {
-      throw new Error('Transaction already finalized');
+  async rollback(): Promise<ExecutionResult> {
+    if (this.committed) {
+      return { success: false, error: 'Transaction already committed' };
+    }
+    if (this.rolledBack) {
+      return { success: false, error: 'Transaction already rolled back' };
     }
 
     // Rollback through coordinator
-    await this.coordinator.rollback(this.stampId);
+    await this.coordinator.rollback(this.stamp.id);
 
     this.rolledBack = true;
+    return { success: true };
   }
 
-  private compileStatements(): string {
-    // Engine-specific compilation
-    // For ActionsEngine: JSON array of statements
-    // For QuereusEngine: JSON object with statements array
-    return JSON.stringify(this.statements);
+  getStampId(): string {
+    return this.stamp.id;
+  }
+
+  getStamp(): TransactionStamp {
+    return this.stamp;
   }
 }
 ```
 
 ### 5. Transaction Coordinator (db-core)
 
-Coordinates multi-collection transactions with critical cluster consensus:
+Coordinates multi-collection transactions. The coordinator is mostly unaware of statements - it just manages collections:
+1. Takes actions and plays them against collections (creating collections as needed)
+2. Commits, given a transaction, by running the appropriate phases against the collection(s) involved
 
 ```typescript
 // In db-core/src/transaction/coordinator.ts
 export class TransactionCoordinator {
   constructor(
-    private transactor: ITransactor,
-    private collections: Map<CollectionId, Collection>,
-    private engines: Map<string, ITransactionEngine>
+    private readonly transactor: ITransactor,
+    private readonly collections: Map<CollectionId, Collection<any>>
   ) {}
 
   // Apply actions to collections (called by engines during statement execution)
   async applyActions(
     actions: CollectionActions[],
-    stampId: StampId
+    stampId: string
   ): Promise<void> {
     for (const { collectionId, actions: collectionActions } of actions) {
-      // Get or create collection
-      let collection = this.collections.get(collectionId);
+      // Get collection
+      const collection = this.collections.get(collectionId);
       if (!collection) {
-        collection = await this.createCollection(collectionId);
-        this.collections.set(collectionId, collection);
+        throw new Error(`Collection not found: ${collectionId}`);
       }
 
       // Apply each action (tagged with stampId)
       for (const action of collectionActions) {
-        const taggedAction = { ...action, transaction: stampId };
+        const taggedAction = { ...(action as any), transaction: stampId };
         await collection.act(taggedAction);
       }
     }
@@ -623,103 +683,207 @@ export class TransactionCoordinator {
 
   // Commit a transaction (actions already applied, orchestrate PEND/COMMIT)
   async commit(transaction: Transaction): Promise<void> {
-    // Collect operations from collection trackers
-    const operations = await this.collectOperations(transaction.stampId);
+    // 1. Collect operations from collection trackers and identify critical blocks
+    const collectionTransforms = new Map<CollectionId, Transforms>();
+    const criticalBlocks = new Map<CollectionId, BlockId>();
+    const allOperations: any[] = [];
 
-    // Compute hash of ALL operations (entire transaction)
-    const operationsHash = this.hashOperations(operations);
+    for (const [collectionId, collection] of this.collections.entries()) {
+      // Check if this collection has pending changes for this transaction
+      const transforms = collection.tracker.transforms;
+      const hasChanges = Object.keys(transforms.inserts).length +
+                         Object.keys(transforms.updates).length +
+                         transforms.deletes.length > 0;
 
-    // Group operations by block
-    const blockOperations = this.groupByBlock(operations);
+      if (hasChanges) {
+        collectionTransforms.set(collectionId, transforms);
 
-    // Identify critical clusters (log tail clusters for affected collections)
-    const criticalClusters = await this.getCriticalClusters(
-      Array.from(this.getAffectedCollections(transaction.stampId))
-    );
+        // Collect all operations from this collection's transforms
+        for (const [blockId, block] of Object.entries(transforms.inserts)) {
+          allOperations.push({ type: 'insert', collectionId, blockId, block });
+        }
+        for (const [blockId, operations] of Object.entries(transforms.updates)) {
+          allOperations.push({ type: 'update', collectionId, blockId, operations });
+        }
+        for (const blockId of transforms.deletes) {
+          allOperations.push({ type: 'delete', collectionId, blockId });
+        }
 
-    // Execute consensus phases
-    await this.executeConsensus(
-      transaction,
-      operationsHash,
-      blockOperations,
-      criticalClusters
-    );
-  }
-
-  // Rollback a transaction (undo applied actions)
-  async rollback(stampId: StampId): Promise<void> {
-    // Clear trackers for this transaction
-    for (const collection of this.collections.values()) {
-      await collection.clearPending(stampId);
-    }
-  }
-
-  private async executeConsensus(
-    transaction: Transaction,
-    operationsHash: string,
-    blockOperations: Map<BlockId, { rev: number; operations: Operation[] }>,
-    criticalClusters: Set<ClusterId>
-  ): Promise<void> {
-    // Phase 1: GATHER - Collect critical cluster nominees (skip if single collection)
-    const superclusterNominees = await this.gatherPhase(criticalClusters);
-
-    // Phase 2: PEND - Distribute to all block clusters for validation
-    await this.pendPhase(transaction, operationsHash, blockOperations, superclusterNominees);
-
-    // Phase 3: COMMIT - Consensus across critical clusters
-    await this.commitPhase(transaction, criticalClusters);
-
-    // Phases 4-5 (PROPAGATE, CHECKPOINT) are cluster-managed
-  }
-
-  private async gatherPhase(
-    criticalClusters: Set<ClusterId>
-  ): Promise<Set<PeerId> | null> {
-    // Skip GATHER if only one collection affected
-    if (criticalClusters.size === 1) {
-      return null; // Use normal single-collection consensus
-    }
-
-    // Query each critical cluster for their participant nominees
-    const nomineesByCluster = await Promise.all(
-      Array.from(criticalClusters).map(clusterId =>
-        this.transactor.queryClusterNominees(clusterId)
-      )
-    );
-
-    // Merge into supercluster nominee list
-    const supercluster = new Set<PeerId>();
-    for (const nominees of nomineesByCluster) {
-      for (const nominee of nominees) {
-        // Nodes can spot-check nominees from other neighborhoods
-        if (this.isReasonableNominee(nominee)) {
-          supercluster.add(nominee);
+        // Get the log tail block ID (critical block) for this collection
+        const log = await Log.open(collection.tracker, collectionId);
+        if (log) {
+          const tailPath = await (log as any).chain.getTail();
+          if (tailPath) {
+            criticalBlocks.set(collectionId, tailPath.block.header.id);
+          }
         }
       }
     }
 
-    return supercluster;
+    if (collectionTransforms.size === 0) {
+      return; // Nothing to commit
+    }
+
+    // 2. Compute hash of ALL operations across ALL collections
+    // This hash is used for validation - validators re-execute the transaction
+    // and compare their computed operations hash with this one
+    // TODO: Pass operationsHash to PEND phase when we update PendRequest type
+    const _operationsHash = this.hashOperations(allOperations);
+
+    // 3. Execute consensus phases (GATHER, PEND, COMMIT)
+    const coordResult = await this.coordinateTransaction(
+      transaction,
+      collectionTransforms,
+      criticalBlocks
+    );
+
+    if (!coordResult.success) {
+      throw new Error(`Transaction commit failed: ${coordResult.error}`);
+    }
+  }
+
+  // Rollback a transaction (undo applied actions)
+  async rollback(_stampId: string): Promise<void> {
+    // Clear trackers for all collections
+    // This discards all pending changes that were applied via applyActions()
+    // TODO: In the future, we may want to track which collections were affected by
+    // a specific stampId and only reset those trackers
+    for (const collection of this.collections.values()) {
+      collection.tracker.reset();
+    }
+  }
+
+  private hashOperations(operations: any[]): string {
+    const operationsData = JSON.stringify(operations);
+    let hash = 0;
+    for (let i = 0; i < operationsData.length; i++) {
+      const char = operationsData.charCodeAt(i);
+      hash = ((hash << 5) - hash) + char;
+      hash = hash & hash;
+    }
+    return `ops:${Math.abs(hash).toString(36)}`;
+  }
+
+  private async coordinateTransaction(
+    transaction: Transaction,
+    collectionTransforms: Map<CollectionId, Transforms>,
+    criticalBlocks: Map<CollectionId, BlockId>
+  ): Promise<{ success: boolean; error?: string }> {
+    // Phase 1: GATHER - Collect critical cluster nominees (skip if single collection)
+    const superclusterNominees = criticalBlocks.size > 1
+      ? await this.gatherPhase(criticalBlocks)
+      : null;
+
+    // Phase 2: PEND - Distribute to all block clusters for validation
+    const pendResult = await this.pendPhase(
+      transaction,
+      collectionTransforms,
+      criticalBlocks,
+      superclusterNominees
+    );
+    if (!pendResult.success) {
+      await this.cancelPhase(transaction, criticalBlocks);
+      return pendResult;
+    }
+
+    // Phase 3: COMMIT - Consensus across critical clusters
+    const commitResult = await this.commitPhase(transaction, criticalBlocks);
+    if (!commitResult.success) {
+      await this.cancelPhase(transaction, criticalBlocks);
+      return commitResult;
+    }
+
+    // Phases 4-5 (PROPAGATE, CHECKPOINT) are cluster-managed
+    return { success: true };
+  }
+
+  private async gatherPhase(
+    criticalBlocks: Map<CollectionId, BlockId>
+  ): Promise<Set<string>> {
+    // Query each critical cluster for their participant nominees
+    const nominees = new Set<string>();
+
+    for (const blockId of criticalBlocks.values()) {
+      const cluster = await this.transactor.getCluster(blockId);
+      for (const peerId of cluster) {
+        nominees.add(peerId);
+      }
+    }
+
+    return nominees;
   }
 
   private async pendPhase(
     transaction: Transaction,
-    operationsHash: string,
-    blockOperations: Map<BlockId, { rev: number; operations: Operation[] }>,
-    superclusterNominees: Set<PeerId> | null
-  ): Promise<void> {
-    // Send PEND request to each affected block cluster
-    const pendRequests = Array.from(blockOperations.entries()).map(
-      ([blockId, { rev }]) => ({
-        transaction,
-        operationsHash,
-        blocks: [{ blockId, rev }],
-        policy: { superclusterNominees }
-      })
-    );
+    collectionTransforms: Map<CollectionId, Transforms>,
+    criticalBlocks: Map<CollectionId, BlockId>,
+    superclusterNominees: Set<string> | null
+  ): Promise<{ success: boolean; error?: string }> {
+    // Send PEND request to each critical block cluster
+    const pendPromises: Promise<{ success: boolean; error?: string }>[] = [];
 
-    await Promise.all(
-      pendRequests.map(req => this.transactor.pend(req))
-    );
+    for (const [collectionId, blockId] of criticalBlocks.entries()) {
+      const transforms = collectionTransforms.get(collectionId);
+      if (!transforms) continue;
+
+      const pendPromise = this.transactor.pend({
+        transaction,
+        blockId,
+        transforms,
+        superclusterNominees: superclusterNominees ? Array.from(superclusterNominees) : undefined
+      });
+      pendPromises.push(pendPromise);
+    }
+
+    const results = await Promise.all(pendPromises);
+    const failed = results.find(r => !r.success);
+    if (failed) {
+      return failed;
+    }
+
+    return { success: true };
+  }
+
+  private async commitPhase(
+    transaction: Transaction,
+    criticalBlocks: Map<CollectionId, BlockId>
+  ): Promise<{ success: boolean; error?: string }> {
+    // Commit to all critical blocks
+    const commitPromises: Promise<{ success: boolean; error?: string }>[] = [];
+
+    for (const blockId of criticalBlocks.values()) {
+      const commitPromise = this.transactor.commit({
+        transaction,
+        blockId
+      });
+      commitPromises.push(commitPromise);
+    }
+
+    const results = await Promise.all(commitPromises);
+    const failed = results.find(r => !r.success);
+    if (failed) {
+      return failed;
+    }
+
+    return { success: true };
+  }
+
+  private async cancelPhase(
+    transaction: Transaction,
+    criticalBlocks: Map<CollectionId, BlockId>
+  ): Promise<void> {
+    // Cancel pending actions on all critical blocks
+    const cancelPromises: Promise<void>[] = [];
+
+    for (const blockId of criticalBlocks.values()) {
+      const cancelPromise = this.transactor.cancel({
+        transaction,
+        blockId
+      });
+      cancelPromises.push(cancelPromise);
+    }
+
+    await Promise.all(cancelPromises);
   }
 }
 ```
@@ -1136,12 +1300,13 @@ Actions include `transaction: StampId` field:
 - Used to track which actions belong to which transaction
 - Validators can look up full Transaction by stampId if needed
 
-### 7. Transaction Stamp vs Transaction CID
+### 7. Transaction Stamp vs Transaction ID
 Two distinct identifiers serve different purposes:
-- **StampId**: Created at BEGIN, stable throughout, exposed to users via `StampId()` UDF
-- **CID**: Computed at COMMIT, final immutable identity, used in logs
-- Stamp contains: peerId, timestamp, schemaHash, engineId
-- CID is hash of: stampId + statements + reads
+- **Stamp ID** (`stamp.id`): Created at BEGIN (hash of peerId + timestamp + schemaHash + engineId), stable throughout, exposed to users via `StampId()` UDF
+- **Transaction ID** (`transaction.id`): Computed at COMMIT (hash of stamp.id + statements + reads), final immutable identity, used in logs
+- Both are hashes, both are internal to their respective structures
+- Stamp contains: peerId, timestamp, schemaHash, engineId, id
+- Transaction contains: stamp, statements, reads, id
 
 ### 8. Blocks Don't Receive Operations, They Validate Transactions
 Key insight: Blocks don't need the full operation details during PEND:
@@ -1182,7 +1347,7 @@ Accept cost of re-executing statements on cluster participants:
 6. **Critical Cluster Consensus**: All log tail clusters participate in consensus
 7. **Pluggable Engines**: ActionsEngine and QuereusEngine both work
 8. **Operations Hash Validation**: Single hash validates entire transaction across all blocks
-9. **Stamp/CID Separation**: StampId stable throughout, CID computed at commit
+9. **Stamp/ID Separation**: Stamp.id stable throughout (created at BEGIN), transaction.id computed at commit
 10. **Engine-Agnostic Validation**: db-p2p validates any engine through ITransactionEngine interface
 
 ## Key Architectural Insights
@@ -1211,10 +1376,10 @@ Transactions are validated by re-executing statements, not by comparing operatio
 - Ensures semantic correctness, not just structural correctness
 
 ### 5. Layered Architecture
-Clear separation between layers:
-- **Engine Layer**: Translates statements → actions (QuereusEngine, ActionsEngine)
-- **Coordinator Layer**: Applies actions, orchestrates consensus (TransactionCoordinator)
-- **Session Layer**: Manages incremental transaction building (TransactionSession)
+Clear separation between layers with simplified dependencies:
+- **Engine Layer**: Translates statements → actions (QuereusEngine, ActionsEngine). Engines take coordinator as constructor argument.
+- **Coordinator Layer**: Mostly unaware of statements - just manages collections. Applies actions to collections, orchestrates consensus phases.
+- **Session Layer**: Container for statements, creates stamp at BEGIN, enlists engine to translate statements, commits by creating Transaction and calling coordinator.commit()
 - **Network Layer**: Validates and distributes transactions (db-p2p)
 
 ### 6. Operations Hash for Efficiency
