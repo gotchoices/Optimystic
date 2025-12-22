@@ -122,12 +122,12 @@ export class TransactionCoordinator {
 			)
 		]);
 
-		// TODO: Pass operationsHash to PEND phase when we update PendRequest type
-		const _operationsHash = this.hashOperations(allOperations);
+		const operationsHash = this.hashOperations(allOperations);
 
 		// Execute consensus phases (GATHER, PEND, COMMIT)
 		const coordResult = await this.coordinateTransaction(
 			transaction,
+			operationsHash,
 			collectionTransforms,
 			criticalBlocks
 		);
@@ -261,9 +261,24 @@ export class TransactionCoordinator {
 			actionResults.set(collectionActions.collectionId, applyResult.results!);
 		}
 
-		// 3. Coordinate (GATHER if multi-collection)
+		// 3. Compute operations hash for validation
+		const allOperations = Array.from(collectionTransforms.entries()).flatMap(([collectionId, transforms]) => [
+			...Object.entries(transforms.inserts).map(([blockId, block]) =>
+				({ type: 'insert' as const, collectionId, blockId, block })
+			),
+			...Object.entries(transforms.updates).map(([blockId, operations]) =>
+				({ type: 'update' as const, collectionId, blockId, operations })
+			),
+			...transforms.deletes.map(blockId =>
+				({ type: 'delete' as const, collectionId, blockId })
+			)
+		]);
+		const operationsHash = this.hashOperations(allOperations);
+
+		// 4. Coordinate (GATHER if multi-collection)
 		const coordResult = await this.coordinateTransaction(
 			transaction,
+			operationsHash,
 			collectionTransforms,
 			criticalBlocks
 		);
@@ -346,11 +361,13 @@ export class TransactionCoordinator {
 	 * Coordinate a transaction across multiple collections.
 	 *
 	 * @param transaction - The transaction to coordinate
+	 * @param operationsHash - Hash of all operations for validation
 	 * @param collectionTransforms - Map of collectionId to its transforms
 	 * @param criticalBlocks - Map of collectionId to its log tail blockId
 	 */
 	private async coordinateTransaction(
 		transaction: Transaction,
+		operationsHash: string,
 		collectionTransforms: Map<CollectionId, Transforms>,
 		criticalBlocks: Map<CollectionId, BlockId>
 	): Promise<{ success: boolean; error?: string }> {
@@ -360,7 +377,8 @@ export class TransactionCoordinator {
 
 		// 2. PEND phase: distribute to all block clusters
 		const pendResult = await this.pendPhase(
-			transaction.id as ActionId,
+			transaction,
+			operationsHash,
 			collectionTransforms,
 			superclusterNominees
 		);
@@ -402,24 +420,51 @@ export class TransactionCoordinator {
 			return null; // Use normal single-collection consensus
 		}
 
-		// TODO: Query each critical cluster for nominees
-		// For now, return empty set (will be implemented in Phase 3 with network support)
-		return new Set<PeerId>();
+		// Check if transactor supports cluster queries (optional method)
+		if (!this.transactor.queryClusterNominees) {
+			// Transactor doesn't support cluster queries - proceed without supercluster
+			return null;
+		}
+
+		// Query each critical cluster for their nominees and merge into supercluster
+		const nomineePromises = criticalBlockIds.map(blockId =>
+			this.transactor.queryClusterNominees!(blockId)
+		);
+		const results = await Promise.all(nomineePromises);
+
+		// Merge all nominees into a single set
+		const supercluster = results.reduce(
+			(acc, result) => {
+				result.nominees.forEach(nominee => acc.add(nominee));
+				return acc;
+			},
+			new Set<PeerId>()
+		);
+
+		return supercluster;
 	}
 
 	/**
 	 * PEND phase: Distribute transaction to all affected block clusters.
+	 *
+	 * @param transaction - The full transaction for replay/validation
+	 * @param operationsHash - Hash of all operations for validation
+	 * @param collectionTransforms - Map of collectionId to its transforms
+	 * @param superclusterNominees - Nominees for multi-collection consensus (null for single-collection)
 	 */
 	private async pendPhase(
-		actionId: ActionId,
+		transaction: Transaction,
+		operationsHash: string,
 		collectionTransforms: ReadonlyMap<CollectionId, Transforms>,
-		_superclusterNominees: ReadonlySet<PeerId> | null
+		superclusterNominees: ReadonlySet<PeerId> | null
 	): Promise<{ success: boolean; error?: string; pendedBlockIds?: Map<CollectionId, BlockId[]> }> {
 		if (collectionTransforms.size === 0) {
 			return { success: false, error: 'No transforms to pend' };
 		}
 
 		const pendedBlockIds = new Map<CollectionId, BlockId[]>();
+		const actionId = transaction.id as ActionId;
+		const nominees = superclusterNominees ? Array.from(superclusterNominees) : undefined;
 
 		// Pend each collection's transforms
 		for (const [collectionId, transforms] of collectionTransforms.entries()) {
@@ -431,12 +476,15 @@ export class TransactionCoordinator {
 			// Get revision from the collection's source
 			const rev = (collection['source'].actionContext?.rev ?? 0) + 1;
 
-			// Create pend request
+			// Create pend request with transaction and operations hash for validation
 			const pendRequest: PendRequest = {
 				actionId,
 				rev,
 				transforms,
-				policy: 'r' // Return policy: fail but return pending actions
+				policy: 'r', // Return policy: fail but return pending actions
+				transaction,
+				operationsHash,
+				superclusterNominees: nominees
 			};
 
 			// Pend the transaction

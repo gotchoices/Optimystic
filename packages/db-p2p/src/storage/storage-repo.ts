@@ -1,8 +1,9 @@
 import type {
-	IRepo, MessageOptions, BlockId, CommitRequest, CommitResult, GetBlockResults, PendRequest, PendResult, TrxBlocks,
-	TrxId, BlockGets, TrxPending, PendSuccess, TrxTransform, TrxTransforms,
+	IRepo, MessageOptions, BlockId, CommitRequest, CommitResult, GetBlockResults, PendRequest, PendResult, ActionBlocks,
+	ActionId, BlockGets, ActionPending, PendSuccess, ActionTransform, ActionTransforms,
 	Transforms,
-	GetBlockResult
+	GetBlockResult,
+	PendValidationHook
 } from "@optimystic/db-core";
 import {
 	Latches, transformForBlockId, applyTransform, groupBy, concatTransform, emptyTransforms,
@@ -11,10 +12,20 @@ import {
 import { asyncIteratorToArray } from "../it-utility.js";
 import type { IBlockStorage } from "./i-block-storage.js";
 
+export type StorageRepoOptions = {
+	/** Optional hook to validate transactions in PendRequests */
+	validatePend?: PendValidationHook;
+};
+
 export class StorageRepo implements IRepo {
+	private readonly validatePend?: PendValidationHook;
+
 	constructor(
-		private readonly createBlockStorage: (blockId: BlockId) => IBlockStorage
-	) { }
+		private readonly createBlockStorage: (blockId: BlockId) => IBlockStorage,
+		options?: StorageRepoOptions
+	) {
+		this.validatePend = options?.validatePend;
+	}
 
 	async get({ blockIds, context }: BlockGets, options?: MessageOptions): Promise<GetBlockResults> {
 		const distinctBlockIds = Array.from(new Set(blockIds));
@@ -27,10 +38,10 @@ export class StorageRepo implements IRepo {
 				const missing = latest
 					? context.committed.filter(c => c.rev > latest.rev)
 					: context.committed;
-				for (const { trxId, rev } of missing.sort((a, b) => a.rev - b.rev)) {
-					const pending = await blockStorage.getPendingTransaction(trxId);
+				for (const { actionId, rev } of missing.sort((a, b) => a.rev - b.rev)) {
+					const pending = await blockStorage.getPendingTransaction(actionId);
 					if (pending) {
-						await this.internalCommit(blockId, trxId, rev, blockStorage);
+						await this.internalCommit(blockId, actionId, rev, blockStorage);
 					}
 				}
 			}
@@ -40,18 +51,18 @@ export class StorageRepo implements IRepo {
 				return [blockId, { state: {} } as GetBlockResult];
 			}
 
-			// Include pending transaction if requested
-			if (context?.trxId !== undefined) {
-				const pendingTransform = await blockStorage.getPendingTransaction(context.trxId);
+			// Include pending action if requested
+			if (context?.actionId !== undefined) {
+				const pendingTransform = await blockStorage.getPendingTransaction(context.actionId);
 				if (!pendingTransform) {
-					throw new Error(`Pending transaction ${context.trxId} not found`);
+					throw new Error(`Pending action ${context.actionId} not found`);
 				}
 				const block = applyTransform(blockRev.block, pendingTransform);
 				return [blockId, {
 					block,
 					state: {
 						latest: await blockStorage.getLatest(),
-						pendings: [context.trxId]
+						pendings: [context.actionId]
 					}
 				}];
 			}
@@ -68,10 +79,21 @@ export class StorageRepo implements IRepo {
 		return Object.fromEntries(results);
 	}
 
-	async pend(request: PendRequest, options?: MessageOptions): Promise<PendResult> {
+	async pend(request: PendRequest, _options?: MessageOptions): Promise<PendResult> {
+		// Validate transaction if present and validation hook is configured
+		if (this.validatePend && request.transaction && request.operationsHash) {
+			const validationResult = await this.validatePend(request.transaction, request.operationsHash);
+			if (!validationResult.valid) {
+				return {
+					success: false,
+					reason: validationResult.reason ?? 'Transaction validation failed'
+				};
+			}
+		}
+
 		const blockIds = blockIdsForTransforms(request.transforms);
-		const pendings: TrxPending[] = [];
-		const missing: TrxTransforms[] = [];
+		const pendings: ActionPending[] = [];
+		const missing: ActionTransforms[] = [];
 
 		// Potential race condition: A concurrent commit operation could complete
 		// between the conflict checks (latest.rev, listPendingTransactions) and the
@@ -84,23 +106,23 @@ export class StorageRepo implements IRepo {
 			const blockStorage = this.createBlockStorage(blockId);
 			const transforms = transformForBlockId(request.transforms, blockId);
 
-			// First handle any pending transactions
+			// First handle any pending actions
 			const pending = await asyncIteratorToArray(blockStorage.listPendingTransactions());
-			pendings.push(...pending.map(trxId => ({ blockId, trxId } as TrxPending)));
+			pendings.push(...pending.map(actionId => ({ blockId, actionId })));
 
 			// Handle any conflicting revisions
 			if (request.rev !== undefined || transforms.insert) {
 				const latest = await blockStorage.getLatest();
 				if (latest && latest.rev >= (request.rev ?? 0)) {
 					const transforms = await asyncIteratorToArray(blockStorage.listRevisions(request.rev ?? 0, latest.rev));
-					for (const trxRev of transforms) {
-						const transform = await blockStorage.getTransaction(trxRev.trxId);
+					for (const actionRev of transforms) {
+						const transform = await blockStorage.getTransaction(actionRev.actionId);
 						if (!transform) {
-							throw new Error(`Missing transaction ${trxRev.trxId} for block ${blockId}`);
+							throw new Error(`Missing action ${actionRev.actionId} for block ${blockId}`);
 						}
 						missing.push({
-							trxId: trxRev.trxId,
-							rev: trxRev.rev,
+							actionId: actionRev.actionId,
+							rev: actionRev.rev,
 							transforms: transformsFromTransform(transform, blockId)
 						});
 					}
@@ -116,18 +138,18 @@ export class StorageRepo implements IRepo {
 		}
 
 		if (pendings.length > 0) {
-			if (request.policy === 'f') {	// Fail on pending transactions
+			if (request.policy === 'f') {	// Fail on pending actions
 				return { success: false, pending: pendings };
-			} else if (request.policy === 'r') {	// Return populated pending transactions
+			} else if (request.policy === 'r') {	// Return populated pending actions
 				return {
 					success: false,
-					pending: await Promise.all(pendings.map(async trx => {
-						const blockStorage = this.createBlockStorage(trx.blockId);
+					pending: await Promise.all(pendings.map(async action => {
+						const blockStorage = this.createBlockStorage(action.blockId);
 						return {
-							blockId: trx.blockId,
-							trxId: trx.trxId,
-							transform: (await blockStorage.getPendingTransaction(trx.trxId))
-								?? (await blockStorage.getTransaction(trx.trxId))!	// Possible that since enumeration, the transaction has been promoted
+							blockId: action.blockId,
+							actionId: action.actionId,
+							transform: (await blockStorage.getPendingTransaction(action.actionId))
+								?? (await blockStorage.getTransaction(action.actionId))!	// Possible that since enumeration, the action has been promoted
 						}
 					}))
 				};
@@ -135,14 +157,14 @@ export class StorageRepo implements IRepo {
 		}
 
 
-		// Simultaneously save pending transaction for each block
-		// Note: that this is not atomic, after we checked for conflicts and pending transactions
-		// new pending or committed transactions may have been added.  This is okay, because
+		// Simultaneously save pending action for each block
+		// Note: that this is not atomic, after we checked for conflicts and pending actions
+		// new pending or committed actions may have been added.  This is okay, because
 		// this check during pend is conservative.
 		await Promise.all(blockIds.map(blockId => {
 			const blockStorage = this.createBlockStorage(blockId);
 			const blockTransform = transformForBlockId(request.transforms, blockId);
-			return blockStorage.savePendingTransaction(request.trxId, blockTransform);
+			return blockStorage.savePendingTransaction(request.actionId, blockTransform);
 		}));
 
 		return {
@@ -152,10 +174,10 @@ export class StorageRepo implements IRepo {
 		} as PendSuccess;
 	}
 
-	async cancel(trxRef: TrxBlocks, options?: MessageOptions): Promise<void> {
-		await Promise.all(trxRef.blockIds.map(blockId => {
+	async cancel(actionRef: ActionBlocks, _options?: MessageOptions): Promise<void> {
+		await Promise.all(actionRef.blockIds.map(blockId => {
 			const blockStorage = this.createBlockStorage(blockId);
-			return blockStorage.deletePendingTransaction(trxRef.trxId);
+			return blockStorage.deletePendingTransaction(actionRef.actionId);
 		}));
 	}
 
@@ -178,20 +200,20 @@ export class StorageRepo implements IRepo {
 				storage: this.createBlockStorage(blockId)
 			}));
 
-			// Check for stale revisions and collect missing transactions
-			const missedCommits: { blockId: BlockId, transforms: TrxTransform[] }[] = [];
+			// Check for stale revisions and collect missing actions
+			const missedCommits: { blockId: BlockId, transforms: ActionTransform[] }[] = [];
 			for (const { blockId, storage } of blockStorages) {
 				const latest = await storage.getLatest();
 				if (latest && latest.rev >= request.rev) {
-					const transforms: TrxTransform[] = [];
-					for await (const trxRev of storage.listRevisions(request.rev, latest.rev)) {
-						const transform = await storage.getTransaction(trxRev.trxId);
+					const transforms: ActionTransform[] = [];
+					for await (const actionRev of storage.listRevisions(request.rev, latest.rev)) {
+						const transform = await storage.getTransaction(actionRev.actionId);
 						if (!transform) {
-							throw new Error(`Missing transaction ${trxRev.trxId} for block ${blockId}`);
+							throw new Error(`Missing action ${actionRev.actionId} for block ${blockId}`);
 						}
 						transforms.push({
-							trxId: trxRev.trxId,
-							rev: trxRev.rev,
+							actionId: actionRev.actionId,
+							rev: actionRev.rev,
 							transform
 						});
 					}
@@ -202,29 +224,29 @@ export class StorageRepo implements IRepo {
 			if (missedCommits.length) {
 				return { // Return directly, locks will be released in finally
 					success: false,
-					missing: perBlockTrxTransformsToPerTransaction(missedCommits)
+					missing: perBlockActionTransformsToPerAction(missedCommits)
 				};
 			}
 
-			// Check for missing pending transactions
-			const missingPends: { blockId: BlockId, trxId: TrxId }[] = [];
+			// Check for missing pending actions
+			const missingPends: { blockId: BlockId, actionId: ActionId }[] = [];
 			for (const { blockId, storage } of blockStorages) {
-				const pendingTrx = await storage.getPendingTransaction(request.trxId);
-				if (!pendingTrx) {
-					missingPends.push({ blockId, trxId: request.trxId });
+				const pendingAction = await storage.getPendingTransaction(request.actionId);
+				if (!pendingAction) {
+					missingPends.push({ blockId, actionId: request.actionId });
 				}
 			}
 
 			if (missingPends.length) {
-				throw new Error(`Pending transaction ${request.trxId} not found for block(s): ${missingPends.map(p => p.blockId).join(', ')}`);
+				throw new Error(`Pending action ${request.actionId} not found for block(s): ${missingPends.map(p => p.blockId).join(', ')}`);
 			}
 
-			// Commit the transaction for each block
+			// Commit the action for each block
 			// This loop will execute atomically for all blocks due to the acquired locks
 			for (const { blockId, storage } of blockStorages) {
 				try {
 					// internalCommit will throw if it encounters an issue
-					await this.internalCommit(blockId, request.trxId, request.rev, storage);
+					await this.internalCommit(blockId, request.actionId, request.rev, storage);
 				} catch (err) {
 					// TODO: Recover as best we can. Rollback or handle partial commit? For now, return failure.
 					return {
@@ -242,17 +264,17 @@ export class StorageRepo implements IRepo {
 		return { success: true };
 	}
 
-	private async internalCommit(blockId: BlockId, trxId: TrxId, rev: number, storage: IBlockStorage): Promise<void> {
+	private async internalCommit(blockId: BlockId, actionId: ActionId, rev: number, storage: IBlockStorage): Promise<void> {
 		// Note: This method is called within the locked critical section of commit()
 		// So, operations like getPendingTransaction, getLatest, getBlock, saveMaterializedBlock,
 		// saveRevision, promotePendingTransaction, setLatest are protected against
 		// concurrent commits for the *same blockId*.
 
-		const transform = await storage.getPendingTransaction(trxId);
+		const transform = await storage.getPendingTransaction(actionId);
 		// No need to check if !transform here, as the caller (commit) already verified this.
 		// If it's null here, it indicates a logic error or race condition bypassed the lock (unlikely).
 		if (!transform) {
-			throw new Error(`Consistency Error: Pending transaction ${trxId} disappeared for block ${blockId} within critical section.`);
+			throw new Error(`Consistency Error: Pending action ${actionId} disappeared for block ${blockId} within critical section.`);
 		}
 
 		// Get prior materialized block if it exists
@@ -265,33 +287,33 @@ export class StorageRepo implements IRepo {
 		// applyTransform handles undefined priorBlock correctly for inserts
 		const newBlock = applyTransform(priorBlock, transform);
 		if (newBlock) {
-			await storage.saveMaterializedBlock(trxId, newBlock);
+			await storage.saveMaterializedBlock(actionId, newBlock);
 		}
 
-		// Save revision and promote transaction *before* updating latest
+		// Save revision and promote action *before* updating latest
 		// This ensures that if the process crashes between these steps,
 		// the 'latest' pointer doesn't point to a revision that hasn't been fully recorded.
-		await storage.saveRevision(rev, trxId);
-		await storage.promotePendingTransaction(trxId);
+		await storage.saveRevision(rev, actionId);
+		await storage.promotePendingTransaction(actionId);
 
 		// Update latest revision *last*
-		await storage.setLatest({ trxId, rev });
+		await storage.setLatest({ actionId, rev });
 	}
 }
 
-/** Converts list of missing transactions per block into a list of missing transactions across blocks. */
-function perBlockTrxTransformsToPerTransaction(missing: { blockId: BlockId; transforms: TrxTransform[]; }[]) {
+/** Converts list of missing actions per block into a list of missing actions across blocks. */
+function perBlockActionTransformsToPerAction(missing: { blockId: BlockId; transforms: ActionTransform[]; }[]) {
 	const missingFlat = missing.flatMap(({ blockId, transforms }) =>
 		transforms.map(transform => ({ blockId, transform }))
 	);
-	const missingByTrxId = groupBy(missingFlat, ({ transform }) => transform.trxId);
-	return Object.entries(missingByTrxId).map(([trxId, items]) =>
+	const missingByActionId = groupBy(missingFlat, ({ transform }) => transform.actionId);
+	return Object.entries(missingByActionId).map(([actionId, items]) =>
 		items.reduce((acc, { blockId, transform }) => {
 			concatTransform(acc.transforms, blockId, transform.transform);
 			return acc;
 		}, {
-			trxId: trxId as TrxId,
-			rev: items[0]!.transform.rev,	// Assumption: all missing trxIds share the same revision
+			actionId: actionId as ActionId,
+			rev: items[0]!.transform.rev,	// Assumption: all missing actionIds share the same revision
 			transforms: emptyTransforms()
 		})
 	);

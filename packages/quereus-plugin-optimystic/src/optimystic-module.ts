@@ -10,7 +10,20 @@ import { TransactionBridge } from './optimystic-adapter/txn-bridge.js';
 import { OptimysticVirtualTableConnection } from './optimystic-adapter/vtab-connection.js';
 import type { ParsedOptimysticOptions } from './types.js';
 import { VirtualTable } from '@quereus/quereus';
-import type { VirtualTableModule, BaseModuleConfig, Database, TableSchema, Row, FilterInfo, RowOp, BestAccessPlanRequest, BestAccessPlanResult, OrderingSpec, VirtualTableConnection, TableIndexSchema as IndexSchema } from '@quereus/quereus';
+import type { VirtualTableModule, BaseModuleConfig, Database, TableSchema, Row, FilterInfo, BestAccessPlanRequest, BestAccessPlanResult, OrderingSpec, VirtualTableConnection, TableIndexSchema as IndexSchema, RowOp } from '@quereus/quereus';
+import { ConflictResolution } from '@quereus/quereus';
+
+/**
+ * Arguments passed to VirtualTable.update() method.
+ * Mirrors the interface from @quereus/quereus vtab/table.ts
+ */
+interface UpdateArgs {
+	operation: RowOp;
+	values: Row | undefined;
+	oldKeyValues?: Row;
+	onConflict?: ConflictResolution;
+	mutationStatement?: string;
+}
 import { Tree } from '@optimystic/db-core';
 import { KeyRange } from '@optimystic/db-core';
 import { SchemaManager } from './schema/schema-manager.js';
@@ -96,6 +109,9 @@ export class OptimysticVirtualTable extends VirtualTable {
     this.collectionFactory = collectionFactory;
     this.txnBridge = txnBridge;
     this.schemaManager = schemaManager;
+
+    // Enable statement capture for replication/transaction logging
+    this.wantStatements = true;
   }
 
   /**
@@ -418,11 +434,9 @@ export class OptimysticVirtualTable extends VirtualTable {
   /**
    * Performs an INSERT, UPDATE, or DELETE operation
    */
-  async update(
-    operation: RowOp,
-    values: Row | undefined,
-    oldKeyValues?: Row
-  ): Promise<Row | undefined> {
+  async update(args: UpdateArgs): Promise<Row | undefined> {
+    const { operation, values, oldKeyValues, mutationStatement } = args;
+
     // Ensure connection is registered
     await this.ensureConnectionRegistered();
 
@@ -433,6 +447,11 @@ export class OptimysticVirtualTable extends VirtualTable {
 
     if (!this.collection || !this.rowCodec || !this.indexManager) {
       throw new Error('Table not initialized');
+    }
+
+    // Capture the mutation statement if provided (for transaction replication)
+    if (mutationStatement) {
+      this.txnBridge.addStatement(mutationStatement);
     }
 
     const txnState = this.txnBridge.getCurrentTransaction();

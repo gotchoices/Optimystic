@@ -23,14 +23,14 @@ type LogEntry<TAction> = {
 };
 
 type ActionEntry<TAction> = {
-  trxId: TrxId;
+  actionId: ActionId;
   actions: TAction[];
   blockIds: BlockId[];        // Blocks affected by transaction
   collectionIds?: CollectionId[];  // Collections involved
 };
 
 type CheckpointEntry = {
-  pendings: TrxRev[];     // Currently uncommitted transactions
+  pendings: ActionRev[];     // Currently uncommitted transactions
 };
 ```
 
@@ -72,7 +72,7 @@ const { entry, tailPath } = await log.addActions(
 
 // Add checkpoint
 const { entry, tailPath } = await log.addCheckpoint(
-  [{ trxId: 'tx1', rev: 120 }, { trxId: 'tx2', rev: 121 }],  // Pending transactions
+  [{ actionId: 'tx1', rev: 120 }, { actionId: 'tx2', rev: 121 }],  // Pending transactions
   123,                          // Current revision
   Date.now()                    // Timestamp
 );
@@ -81,9 +81,9 @@ const { entry, tailPath } = await log.addCheckpoint(
 ### Transaction Context
 
 ```typescript
-// Get current transaction context
-const context = await log.getTrxContext();
-// Returns: { committed: TrxRev[], rev: number }
+// Get current action context
+const context = await log.getActionContext();
+// Returns: { committed: ActionRev[], rev: number }
 
 // Get actions from specific revision
 const { context, entries } = await log.getFrom(100);

@@ -1,4 +1,4 @@
-import type { PendRequest, TrxBlocks, IRepo, MessageOptions, CommitResult, GetBlockResults, PendResult, BlockGets, CommitRequest, RepoMessage, TrxId, IKeyNetwork, IPeerNetwork, ICluster, ClusterRecord, ClusterConsensusConfig } from "@optimystic/db-core";
+import type { PendRequest, ActionBlocks, IRepo, MessageOptions, CommitResult, GetBlockResults, PendResult, BlockGets, CommitRequest, RepoMessage, IKeyNetwork, ICluster, ClusterConsensusConfig } from "@optimystic/db-core";
 import { ClusterCoordinator } from "./cluster-coordinator.js";
 import type { ClusterClient } from "../cluster/client.js";
 import type { PeerId } from "@libp2p/interface";
@@ -78,15 +78,15 @@ export class CoordinatorRepo implements IRepo {
 		}
 	}
 
-	async cancel(trxRef: TrxBlocks, options?: MessageOptions): Promise<void> {
+	async cancel(actionRef: ActionBlocks, options?: MessageOptions): Promise<void> {
 		// TODO: Verify that we are a proximate node for all block IDs in the request
 
 		// Extract all block IDs affected by this cancel operation
-		const blockIds = Object.keys(trxRef);
+		const blockIds = actionRef.blockIds;
 
 		// Create a message for this cancel operation with timeout
 		const message: RepoMessage = {
-			operations: [{ cancel: { trxRef } }],
+			operations: [{ cancel: { actionRef } }],
 			expiration: options?.expiration ?? Date.now() + this.DEFAULT_TIMEOUT
 		};
 
@@ -100,7 +100,7 @@ export class CoordinatorRepo implements IRepo {
 			await Promise.all(clusterPromises);
 
 			// If all cluster transactions succeeded, apply the cancel to the local store
-			await this.storageRepo.cancel(trxRef, options);
+			await this.storageRepo.cancel(actionRef, options);
 		} catch (error) {
 			console.error('Failed to complete cancel operation:', error);
 			throw error;

@@ -255,9 +255,9 @@ Provides versioned block storage with conflict resolution:
 
 ```typescript
 class BlockStorage implements IBlockStorage {
-  async getBlock(rev?: number): Promise<{ block: IBlock, trxRev: TrxRev }>
-  async savePendingTransaction(trxId: TrxId, transform: Transform): Promise<void>
-  async promotePendingTransaction(trxId: TrxId): Promise<void>
+  async getBlock(rev?: number): Promise<{ block: IBlock, actionRev: ActionRev }>
+  async savePendingAction(actionId: ActionId, transform: Transform): Promise<void>
+  async promotePendingAction(actionId: ActionId): Promise<void>
   async ensureRevision(rev: number): Promise<void>
 }
 ```
@@ -275,11 +275,11 @@ JSON-based file storage with atomic operations:
 // File system organization
 {basePath}/
 ├── {blockId}/
-│   ├── meta.json           # Block metadata and revision ranges
-│   ├── revs/{rev}.json     # Revision → TrxId mappings
-│   ├── pend/{trxId}.json   # Pending transactions
-│   ├── trx/{trxId}.json    # Committed transactions
-│   └── blocks/{trxId}.json # Materialized blocks
+│   ├── meta.json             # Block metadata and revision ranges
+│   ├── revs/{rev}.json       # Revision → ActionId mappings
+│   ├── pend/{actionId}.json  # Pending actions
+│   ├── trx/{actionId}.json   # Committed actions
+│   └── blocks/{actionId}.json # Materialized blocks
 ```
 
 **Key Features:**
@@ -378,13 +378,13 @@ const blocks = await client.get({
 
 // But automatically coordinate across the cluster
 const pendResult = await client.pend({
-  trxId: 'tx1',
+  actionId: 'tx1',
   transforms: { block1: [/* operations */] },
   rev: 11
 });
 
 const commitResult = await client.commit({
-  trxId: 'tx1',
+  actionId: 'tx1',
   blockIds: ['block1'],
   rev: 11
 });

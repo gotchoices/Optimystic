@@ -192,6 +192,23 @@ describe('NetworkTransactor', () => {
     })
   })
 
+  describe('queryClusterNominees', () => {
+    it('should return cluster nominees for a block', async () => {
+      const { networkTransactor } = await setupNetworkTest({ nodeCount: 5, clusterSize: 3 })
+      const blockId = generateBlockId()
+
+      const result = await networkTransactor.queryClusterNominees(blockId)
+
+      expect(result).to.be.an('object')
+      expect(result.nominees).to.be.an('array')
+      expect(result.nominees.length).to.be.greaterThan(0)
+      // Each nominee should be a PeerId
+      result.nominees.forEach(nominee => {
+        expect(nominee.toString()).to.be.a('string')
+      })
+    })
+  })
+
 	// Not implemented yet
   // describe('getStatus', () => {
   //   it('should get the status of transactions', async () => {

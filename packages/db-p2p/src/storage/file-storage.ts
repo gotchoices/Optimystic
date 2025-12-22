@@ -1,6 +1,6 @@
 import { promises as fs } from 'fs';
 import * as path from 'path';
-import type { BlockId, IBlock, Transform, TrxId, TrxRev } from "@optimystic/db-core";
+import type { BlockId, IBlock, Transform, ActionId, ActionRev } from "@optimystic/db-core";
 import type { BlockMetadata } from "./struct.js";
 import type { IRawStorage } from "./i-raw-storage.js";
 import { createLogger } from '../logger.js'
@@ -23,102 +23,102 @@ export class FileRawStorage implements IRawStorage {
 		);
 	}
 
-	async getRevision(blockId: BlockId, rev: number): Promise<TrxId | undefined> {
-		return this.readIfExists<TrxId>(this.getRevisionPath(blockId, rev));
+	async getRevision(blockId: BlockId, rev: number): Promise<ActionId | undefined> {
+		return this.readIfExists<ActionId>(this.getRevisionPath(blockId, rev));
 	}
 
-	async saveRevision(blockId: BlockId, rev: number, trxId: TrxId): Promise<void> {
+	async saveRevision(blockId: BlockId, rev: number, actionId: ActionId): Promise<void> {
 		await this.ensureAndWriteFile(
 			this.getRevisionPath(blockId, rev),
-			trxId
+			actionId
 		);
 	}
 
-	async getPendingTransaction(blockId: BlockId, trxId: TrxId): Promise<Transform | undefined> {
-		return this.readIfExists<Transform>(this.getPendingTrxPath(blockId, trxId));
+	async getPendingTransaction(blockId: BlockId, actionId: ActionId): Promise<Transform | undefined> {
+		return this.readIfExists<Transform>(this.getPendingActionPath(blockId, actionId));
 	}
 
-	async savePendingTransaction(blockId: BlockId, trxId: TrxId, transform: Transform): Promise<void> {
+	async savePendingTransaction(blockId: BlockId, actionId: ActionId, transform: Transform): Promise<void> {
 		await this.ensureAndWriteFile(
-			this.getPendingTrxPath(blockId, trxId),
+			this.getPendingActionPath(blockId, actionId),
 			JSON.stringify(transform)
 		);
 	}
 
-	async deletePendingTransaction(blockId: BlockId, trxId: TrxId): Promise<void> {
-		const pendingPath = this.getPendingTrxPath(blockId, trxId);
+	async deletePendingTransaction(blockId: BlockId, actionId: ActionId): Promise<void> {
+		const pendingPath = this.getPendingActionPath(blockId, actionId);
 		await fs.unlink(pendingPath)
 			.catch((err) => {
 				// Ignore if file doesn't exist
-				if ((err as any)?.code !== 'ENOENT') log('deletePendingTransaction unlink failed for %s/%s - %o', blockId, trxId, err)
+				if ((err as NodeJS.ErrnoException)?.code !== 'ENOENT') log('deletePendingTransaction unlink failed for %s/%s - %o', blockId, actionId, err)
 			});
 	}
 
-	async *listPendingTransactions(blockId: BlockId): AsyncIterable<TrxId> {
+	async *listPendingTransactions(blockId: BlockId): AsyncIterable<ActionId> {
 		const pendingPath = path.join(this.getBlockPath(blockId), 'pend');
 
 		const files = await fs.readdir(pendingPath).catch((err) => { log('listPendingTransactions readdir failed for %s - %o', blockId, err); return [] as string[] });
 		for (const file of files) {
 			if (!file.endsWith('.json')) continue;
-			const rawTrxId = file.slice(0, -5);
-			if (!/^[\w\d]+-[\w\d]+-[\w\d]+-[\w\d]+-[\w\d]+$/.test(rawTrxId)) continue;
-			yield rawTrxId as TrxId;
+			const rawActionId = file.slice(0, -5);
+			if (!/^[\w\d]+-[\w\d]+-[\w\d]+-[\w\d]+-[\w\d]+$/.test(rawActionId)) continue;
+			yield rawActionId as ActionId;
 		}
 	}
 
-	async getTransaction(blockId: BlockId, trxId: TrxId): Promise<Transform | undefined> {
-		return this.readIfExists<Transform>(this.getTrxPath(blockId, trxId));
+	async getTransaction(blockId: BlockId, actionId: ActionId): Promise<Transform | undefined> {
+		return this.readIfExists<Transform>(this.getActionPath(blockId, actionId));
 	}
 
-	async *listRevisions(blockId: BlockId, startRev: number, endRev: number): AsyncIterable<TrxRev> {
+	async *listRevisions(blockId: BlockId, startRev: number, endRev: number): AsyncIterable<ActionRev> {
 		// TODO: Optimize this for sparse revs
 		for (let rev = startRev; startRev <= endRev ? rev <= endRev : rev >= endRev; startRev <= endRev ? ++rev : --rev) {
-			const trxId = await this.getRevision(blockId, rev);
-			if (trxId) {
-				yield { trxId, rev };
+			const actionId = await this.getRevision(blockId, rev);
+			if (actionId) {
+				yield { actionId, rev };
 			}
 		}
 	}
 
-	async saveTransaction(blockId: BlockId, trxId: TrxId, transform: Transform): Promise<void> {
+	async saveTransaction(blockId: BlockId, actionId: ActionId, transform: Transform): Promise<void> {
 		await this.ensureAndWriteFile(
-			this.getTrxPath(blockId, trxId),
+			this.getActionPath(blockId, actionId),
 			JSON.stringify(transform)
 		);
 	}
 
-	async getMaterializedBlock(blockId: BlockId, trxId: TrxId): Promise<IBlock | undefined> {
-		return this.readIfExists<IBlock>(this.getMaterializedPath(blockId, trxId));
+	async getMaterializedBlock(blockId: BlockId, actionId: ActionId): Promise<IBlock | undefined> {
+		return this.readIfExists<IBlock>(this.getMaterializedPath(blockId, actionId));
 	}
 
-	async saveMaterializedBlock(blockId: BlockId, trxId: TrxId, block?: IBlock): Promise<void> {
+	async saveMaterializedBlock(blockId: BlockId, actionId: ActionId, block?: IBlock): Promise<void> {
 		if (block) {
 			await this.ensureAndWriteFile(
-				this.getMaterializedPath(blockId, trxId),
+				this.getMaterializedPath(blockId, actionId),
 				JSON.stringify(block)
 			);
 		} else {
-			await fs.unlink(this.getMaterializedPath(blockId, trxId))
+			await fs.unlink(this.getMaterializedPath(blockId, actionId))
 				.catch((err) => {
 					// Ignore if file doesn't exist
-					if ((err as any)?.code !== 'ENOENT') log('saveMaterializedBlock unlink failed for %s/%s - %o', blockId, trxId, err)
+					if ((err as NodeJS.ErrnoException)?.code !== 'ENOENT') log('saveMaterializedBlock unlink failed for %s/%s - %o', blockId, actionId, err)
 				});
 		}
 	}
 
-	async promotePendingTransaction(blockId: BlockId, trxId: TrxId): Promise<void> {
-		const pendingPath = this.getPendingTrxPath(blockId, trxId);
-		const trxPath = this.getTrxPath(blockId, trxId);
+	async promotePendingTransaction(blockId: BlockId, actionId: ActionId): Promise<void> {
+		const pendingPath = this.getPendingActionPath(blockId, actionId);
+		const actionPath = this.getActionPath(blockId, actionId);
 
 		// Ensure target directory exists
-		await fs.mkdir(path.dirname(trxPath), { recursive: true });
+		await fs.mkdir(path.dirname(actionPath), { recursive: true });
 
-		return fs.rename(pendingPath, trxPath)
+		return fs.rename(pendingPath, actionPath)
 			.catch(err => {
 				if (err.code === 'ENOENT') {
-					throw new Error(`Pending transaction ${trxId} not found for block ${blockId}`);
+					throw new Error(`Pending action ${actionId} not found for block ${blockId}`);
 				}
-				log('promotePendingTransaction rename failed for %s/%s - %o', blockId, trxId, err)
+				log('promotePendingTransaction rename failed for %s/%s - %o', blockId, actionId, err)
 				throw err;
 			});
 	}
@@ -135,16 +135,16 @@ export class FileRawStorage implements IRawStorage {
 		return path.join(this.getBlockPath(blockId), 'revs', `${rev}.json`);
 	}
 
-	private getPendingTrxPath(blockId: BlockId, trxId: TrxId): string {
-		return path.join(this.getBlockPath(blockId), 'pend', `${trxId}.json`);
+	private getPendingActionPath(blockId: BlockId, actionId: ActionId): string {
+		return path.join(this.getBlockPath(blockId), 'pend', `${actionId}.json`);
 	}
 
-	private getTrxPath(blockId: BlockId, trxId: TrxId): string {
-		return path.join(this.getBlockPath(blockId), 'trx', `${trxId}.json`);
+	private getActionPath(blockId: BlockId, actionId: ActionId): string {
+		return path.join(this.getBlockPath(blockId), 'actions', `${actionId}.json`);
 	}
 
-	private getMaterializedPath(blockId: BlockId, trxId: TrxId): string {
-		return path.join(this.getBlockPath(blockId), 'blocks', `${trxId}.json`);
+	private getMaterializedPath(blockId: BlockId, actionId: ActionId): string {
+		return path.join(this.getBlockPath(blockId), 'blocks', `${actionId}.json`);
 	}
 
 	private async readIfExists<T>(filePath: string): Promise<T | undefined> {

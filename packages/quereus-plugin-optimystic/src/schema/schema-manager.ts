@@ -172,7 +172,7 @@ export class SchemaManager {
 	private columnSchemaToStored(col: ColumnSchema): StoredColumnSchema {
 		return {
 			name: col.name,
-			affinity: String(col.affinity), // Convert SqlDataType enum to string
+			affinity: col.logicalType.name, // Use logicalType.name for storage
 			notNull: col.notNull,
 			primaryKey: col.primaryKey,
 			pkOrder: col.pkOrder,

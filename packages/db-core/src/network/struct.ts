@@ -1,5 +1,7 @@
 import type { CollectionId, BlockId, IBlock, ActionId, Transform, Transforms } from "../index.js";
 import type { ActionContext, ActionRev } from "../collection/action.js";
+import type { Transaction } from "../transaction/transaction.js";
+import type { PeerId } from "@libp2p/interface";
 
 export type ActionBlocks = {
 	blockIds: BlockId[];
@@ -30,6 +32,12 @@ export type PendRequest = ActionTransforms & {
 	 * 'f' is fail, returning the pending ActionIds,
 	 * 'r' is return, which fails but returns the pending ActionIds and their transforms */
 	policy: 'c' | 'f' | 'r';
+	/** For multi-collection transactions: the full transaction for replay/validation */
+	transaction?: Transaction;
+	/** For multi-collection transactions: hash of ALL operations across all blocks */
+	operationsHash?: string;
+	/** For multi-collection transactions: supercluster nominees for consensus */
+	superclusterNominees?: PeerId[];
 };
 
 export type BlockActionStatus = ActionBlocks & {
@@ -93,3 +101,37 @@ export type GetBlockResult = {
 };
 
 export type GetBlockResults = Record<BlockId, GetBlockResult>;
+
+/**
+ * Result of validating a transaction in a PendRequest.
+ */
+export type PendValidationResult = {
+	/** Whether validation passed */
+	valid: boolean;
+	/** Reason for validation failure (if valid=false) */
+	reason?: string;
+};
+
+/**
+ * Hook for validating transactions in PendRequests.
+ *
+ * This hook is called by the storage layer when receiving a PendRequest
+ * that includes a transaction and operationsHash. If validation fails,
+ * the pend operation is rejected.
+ *
+ * If the hook is not provided, validation is skipped (storage-only nodes).
+ */
+export type PendValidationHook = (
+	transaction: Transaction,
+	operationsHash: string
+) => Promise<PendValidationResult>;
+
+// Backward compatibility aliases (deprecated - use Action* names)
+/** @deprecated Use ActionBlocks instead */
+export type TrxBlocks = ActionBlocks;
+/** @deprecated Use ActionTransforms instead */
+export type TrxTransforms = ActionTransforms;
+/** @deprecated Use ActionTransform instead */
+export type TrxTransform = ActionTransform;
+/** @deprecated Use ActionPending instead */
+export type TrxPending = ActionPending;

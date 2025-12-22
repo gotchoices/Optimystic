@@ -175,26 +175,26 @@ async sync() {
     while (this.pending.length || !isTransformsEmpty(this.tracker.transforms)) {
       // 1. Snapshot current pending actions
       const pending = [...this.pending];
-      const trxId = generateTransactionId();
-      
+      const actionId = generateActionId();
+
       // 2. Create transaction snapshot
       const snapshot = copyTransforms(this.tracker.transforms);
       const tracker = new Tracker(this.sourceCache, snapshot);
-      
+
       // 3. Add transaction to log (locally)
       const log = await Log.open<Action<TAction>>(tracker, this.id);
       const newRev = (this.source.trxContext?.rev ?? 0) + 1;
       const addResult = await log.addActions(
-        pending, trxId, newRev, 
+        pending, actionId, newRev,
         () => tracker.transformedBlockIds()
       );
-      
+
       // 4. Attempt to commit to remote via transactor
       const staleFailure = await this.source.transact(
-        tracker.transforms, trxId, newRev, 
+        tracker.transforms, actionId, newRev,
         this.id, addResult.tailPath.block.header.id
       );
-      
+
       if (staleFailure) {
         // 5a. Stale failure - remote state has changed
         if (staleFailure.pending) {
@@ -210,7 +210,7 @@ async sync() {
         await this.replayActions();
         this.sourceCache.transformCache(transforms);
         this.source.trxContext = {
-          committed: [...(this.source.trxContext?.committed ?? []), { trxId, rev: newRev }],
+          committed: [...(this.source.trxContext?.committed ?? []), { actionId, rev: newRev }],
           rev: newRev
         };
       }
@@ -432,10 +432,10 @@ Collections coordinate with a transactor source and a transactor:
 
 ```typescript
 // TransactorSource handles network communication
-const source = new TransactorSource(id, transactor, trxContext);
+const source = new TransactorSource(id, transactor, actionContext);
 
-// Network transactions
-await source.transact(transforms, trxId, newRev, collectionId, logBlockId);
+// Network actions
+await source.transact(transforms, actionId, newRev, collectionId, logBlockId);
 ```
 
 ### Caching System

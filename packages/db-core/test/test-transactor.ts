@@ -1,4 +1,4 @@
-import { type ITransactor, type GetBlockResults, type ActionBlocks, type BlockActionStatus, type PendResult, type CommitResult, type PendRequest, type BlockId, type CommitRequest, type BlockGets, type IBlock, type ActionId, type ActionTransforms, type Transform, type Transforms, ensuredMap, Latches } from "../src/index.js";
+import { type ITransactor, type GetBlockResults, type ActionBlocks, type BlockActionStatus, type PendResult, type CommitResult, type PendRequest, type BlockId, type CommitRequest, type BlockGets, type IBlock, type ActionId, type ActionTransforms, type Transform, type Transforms, ensuredMap, Latches, type ClusterNomineesResult } from "../src/index.js";
 import { applyTransform, blockIdsForTransforms, transformForBlockId, emptyTransforms, concatTransform, transformsFromTransform } from "../src/transform/index.js";
 
 type RevisionNumber = number;
@@ -8,12 +8,12 @@ type BlockState = {
   materializedBlocks: Map<RevisionNumber, IBlock>;
   /** The latest revision number */
   latestRev: RevisionNumber;
-  /** The transaction that created each revision */
-  revisionTrxs: Map<RevisionNumber, ActionId>;
-  /** Currently pending transactions */
-  pendingTrxs: Map<ActionId, Transform>;
-	/** Committed transactions */
-	committedTrxs: Map<ActionId, Transform>;
+  /** The action that created each revision */
+  revisionActions: Map<RevisionNumber, ActionId>;
+  /** Currently pending actions */
+  pendingActions: Map<ActionId, Transform>;
+	/** Committed actions */
+	committedActions: Map<ActionId, Transform>;
 }
 
 // Simple in-memory transactor for testing that maintains materialized blocks for every revision
@@ -62,16 +62,16 @@ export class TestTransactor implements ITransactor {
 				// Get the appropriate materialized block based on context
 				let block: IBlock | undefined;
 				if (blockGets.context?.actionId !== undefined) {
-					// If requesting a specific transaction, apply pending transform if it exists
-					const pendingTransform = blockState.pendingTrxs.get(blockGets.context.actionId);
+					// If requesting a specific action, apply pending transform if it exists
+					const pendingTransform = blockState.pendingActions.get(blockGets.context.actionId);
 					if (pendingTransform) {
 						// Read latest committed block as base for pending transform
 						const baseBlock = blockState.materializedBlocks.get(blockState.latestRev);
 						block = applyTransformSafe(baseBlock, pendingTransform);
 					} else {
-						// Trx not pending, maybe committed? Or maybe invalid actionId for context.
-						// For simplicity, return undefined block if specific pending trx not found.
-						// A more complex impl might check committedTrxs history.
+						// Action not pending, maybe committed? Or maybe invalid actionId for context.
+						// For simplicity, return undefined block if specific pending action not found.
+						// A more complex impl might check committedActions history.
 						block = undefined;
 					}
 				} else if (blockGets.context?.rev !== undefined) {
@@ -83,7 +83,7 @@ export class TestTransactor implements ITransactor {
 				}
 
 
-				const actionId = blockState.revisionTrxs.get(blockState.latestRev);
+				const actionId = blockState.revisionActions.get(blockState.latestRev);
 				results[blockId] = {
 					block,
 					state: {
@@ -91,7 +91,7 @@ export class TestTransactor implements ITransactor {
 							rev: blockState.latestRev,
 							actionId
 						} : undefined,
-						pendings: Array.from(blockState.pendingTrxs.keys())
+						pendings: Array.from(blockState.pendingActions.keys())
 					}
 				};
 			}
@@ -104,14 +104,14 @@ export class TestTransactor implements ITransactor {
     return results;
   }
 
-  async getStatus(trxRefs: ActionBlocks[]): Promise<BlockActionStatus[]> {
-    return trxRefs.map(ref => ({
+  async getStatus(actionRefs: ActionBlocks[]): Promise<BlockActionStatus[]> {
+    return actionRefs.map(ref => ({
       ...ref,
       statuses: ref.blockIds.map(blockId => {
         const blockState = this.blocks.get(blockId);
         if (!blockState) return 'aborted';
-        return blockState.pendingTrxs.has(ref.actionId) ? 'pending'
-					: Array.from(blockState.revisionTrxs.values()).some(actionId => actionId === ref.actionId) ? 'committed'
+        return blockState.pendingActions.has(ref.actionId) ? 'pending'
+					: Array.from(blockState.revisionActions.values()).some(actionId => actionId === ref.actionId) ? 'committed'
 					: 'aborted';
       })
     }));
@@ -131,10 +131,10 @@ export class TestTransactor implements ITransactor {
 			if (!blockTransform) continue; // Should not happen
 
 			if (blockState) {
-				// Check for existing pending transactions
-				if (blockState.pendingTrxs.size > 0) {
-					blockState.pendingTrxs.forEach((_, pendingTrxId) => {
-						conflictingPendings.push({ blockId, actionId: pendingTrxId });
+				// Check for existing pending actions
+				if (blockState.pendingActions.size > 0) {
+					blockState.pendingActions.forEach((_, pendingActionId) => {
+						conflictingPendings.push({ blockId, actionId: pendingActionId });
 					});
 				}
 
@@ -142,23 +142,23 @@ export class TestTransactor implements ITransactor {
 				if (rev !== undefined || blockTransform.insert) {
 					const checkRev = rev ?? 0; // Check from revision 0 if it's an insert
 					if (blockState.latestRev >= checkRev) {
-						// Collect conflicting committed transactions
+						// Collect conflicting committed actions
 						const missingForBlock = new Map<ActionId, { rev: number, transform: Transform }>();
 						for (let r = checkRev as number; r <= blockState.latestRev; r++) {
-							const committedTrxId = blockState.revisionTrxs.get(r);
-							if (committedTrxId !== undefined) {
-								const committedTransform = blockState.committedTrxs.get(committedTrxId);
+							const committedActionId = blockState.revisionActions.get(r);
+							if (committedActionId !== undefined) {
+								const committedTransform = blockState.committedActions.get(committedActionId);
 								if (committedTransform) {
-									missingForBlock.set(committedTrxId, { rev: r, transform: committedTransform });
+									missingForBlock.set(committedActionId, { rev: r, transform: committedTransform });
 								}
 							}
 						}
 
 						// Add collected missing transforms for this block to the main missing list
-						for (const [mTrxId, data] of missingForBlock.entries()) {
-							let existing = missing.find(m => m.actionId === mTrxId);
+						for (const [mActionId, data] of missingForBlock.entries()) {
+							let existing = missing.find(m => m.actionId === mActionId);
 							if (!existing) {
-								existing = { actionId: mTrxId, rev: data.rev, transforms: emptyTransforms() };
+								existing = { actionId: mActionId, rev: data.rev, transforms: emptyTransforms() };
 								missing.push(existing);
 							}
 							existing.rev = Math.max(existing.rev ?? 0, data.rev);
@@ -184,12 +184,12 @@ export class TestTransactor implements ITransactor {
 			} else if (policy === 'r') {
 				// Simulate fetching pending transforms for 'r' policy
 				const pendingWithTransforms = conflictingPendings
-					.map(({ blockId: pBlockId, actionId: pTrxId }) => {
+					.map(({ blockId: pBlockId, actionId: pActionId }) => {
 						const pBlockState = this.blocks.get(pBlockId);
-						const pTransform = pBlockState?.pendingTrxs.get(pTrxId)
-							?? pBlockState?.committedTrxs.get(pTrxId); // Might have been committed since check
+						const pTransform = pBlockState?.pendingActions.get(pActionId)
+							?? pBlockState?.committedActions.get(pActionId); // Might have been committed since check
 						if (pTransform) {
-							return { blockId: pBlockId, actionId: pTrxId, transform: pTransform };
+							return { blockId: pBlockId, actionId: pActionId, transform: pTransform };
 						}
 						return null; // Handle case where it disappeared (cancelled?)
 					})
@@ -208,7 +208,7 @@ export class TestTransactor implements ITransactor {
 			const blockTransform = transformForBlockId(transforms, blockId);
 			if (blockTransform) {
 				const blockState = ensuredMap(this.blocks, blockId, () => newBlockState());
-				blockState.pendingTrxs.set(actionId, blockTransform);
+				blockState.pendingActions.set(actionId, blockTransform);
 			}
 		}
 
@@ -220,12 +220,12 @@ export class TestTransactor implements ITransactor {
 		} as PendResult;
 	}
 
-  async cancel(trxRef: ActionBlocks): Promise<void> {
+  async cancel(actionRef: ActionBlocks): Promise<void> {
 		this.checkAvailable();
-    for (const blockId of trxRef.blockIds) {
+    for (const blockId of actionRef.blockIds) {
       const blockState = this.blocks.get(blockId);
       if (blockState) {
-        blockState.pendingTrxs.delete(trxRef.actionId);
+        blockState.pendingActions.delete(actionRef.actionId);
       }
     }
   }
@@ -253,47 +253,47 @@ export class TestTransactor implements ITransactor {
       });
 
       if (staleBlocks.length > 0) {
-        // Collect missing transactions for stale blocks
-        const missingByTrx = new Map<ActionId, Transforms>();
+        // Collect missing actions for stale blocks
+        const missingByAction = new Map<ActionId, Transforms>();
         for (const blockId of staleBlocks) {
           const blockState = this.blocks.get(blockId)!;
           for (let r = rev; r <= blockState.latestRev; r++) {
-            const committedTrxId = blockState.revisionTrxs.get(r);
-            if (committedTrxId) {
-              const transform = blockState.committedTrxs.get(committedTrxId);
+            const committedActionId = blockState.revisionActions.get(r);
+            if (committedActionId) {
+              const transform = blockState.committedActions.get(committedActionId);
               if (transform) {
-                const existing = missingByTrx.get(committedTrxId) ?? emptyTransforms();
-                missingByTrx.set(committedTrxId, concatTransform(existing, blockId, transform));
+                const existing = missingByAction.get(committedActionId) ?? emptyTransforms();
+                missingByAction.set(committedActionId, concatTransform(existing, blockId, transform));
               }
             }
           }
         }
 
-        const missing: ActionTransforms[] = Array.from(missingByTrx.entries()).map(([actionId, transforms]) => ({
+        const missing: ActionTransforms[] = Array.from(missingByAction.entries()).map(([actionId, transforms]) => ({
           actionId,
           rev: Array.from(this.blocks.values())
-            .flatMap(bs => Array.from(bs.revisionTrxs.entries()))
-            .find(([, tId]) => tId === actionId)?.[0] ?? rev,
+            .flatMap(bs => Array.from(bs.revisionActions.entries()))
+            .find(([, aId]) => aId === actionId)?.[0] ?? rev,
           transforms
         }));
         return { success: false, missing };
       }
 
-      // Verify all blocks have the pending transaction
+      // Verify all blocks have the pending action
       for (const blockId of blockIds) {
         const blockState = this.blocks.get(blockId);
-        if (!blockState || !blockState.pendingTrxs.has(actionId)) {
+        if (!blockState || !blockState.pendingActions.has(actionId)) {
           return {
             success: false,
-            reason: `Transaction ${actionId} not found or not pending for block ${blockId}`
+            reason: `Action ${actionId} not found or not pending for block ${blockId}`
           };
         }
       }
 
-      // Commit the transaction for each block
+      // Commit the action for each block
       for (const blockId of blockIds) {
         const blockState = this.blocks.get(blockId)!;
-        const transform = blockState.pendingTrxs.get(actionId)!;
+        const transform = blockState.pendingActions.get(actionId)!;
 
         // Get base block to apply transform to
         const baseBlock = blockState.materializedBlocks.get(blockState.latestRev);
@@ -301,13 +301,13 @@ export class TestTransactor implements ITransactor {
         let newBlock: IBlock | undefined;
         if (!baseBlock) {
           if (!transform.insert) {
-            throw new Error(`Commit Error: Transaction ${actionId} has no insert for new block ${blockId}`);
+            throw new Error(`Commit Error: Action ${actionId} has no insert for new block ${blockId}`);
           }
           newBlock = structuredClone(transform.insert);
         } else {
           newBlock = applyTransformSafe(baseBlock, transform);
           if (!newBlock && !transform.delete) {
-            throw new Error(`Commit Error: Transaction ${actionId} resulted in undefined block but had no delete flag for block ${blockId}`);
+            throw new Error(`Commit Error: Action ${actionId} resulted in undefined block but had no delete flag for block ${blockId}`);
           }
         }
 
@@ -317,9 +317,9 @@ export class TestTransactor implements ITransactor {
 
         // Update block state
         blockState.latestRev = rev;
-        blockState.revisionTrxs.set(rev, actionId);
-        blockState.committedTrxs.set(actionId, transform);
-        blockState.pendingTrxs.delete(actionId);
+        blockState.revisionActions.set(rev, actionId);
+        blockState.committedActions.set(actionId, transform);
+        blockState.pendingActions.delete(actionId);
       }
 
       // --- End of Critical Section (Simulated) ---
@@ -337,10 +337,10 @@ export class TestTransactor implements ITransactor {
     this.blocks.clear();
   }
 
-  getPendingTransactions(): Map<ActionId, ActionTransforms> {
+  getPendingActions(): Map<ActionId, ActionTransforms> {
     const allPending = new Map<ActionId, ActionTransforms>();
     for (const [blockId, blockState] of this.blocks.entries()) {
-      for (const [actionId, transform] of blockState.pendingTrxs) {
+      for (const [actionId, transform] of blockState.pendingActions) {
         const existing = allPending.get(actionId);
         if (!existing) {
           allPending.set(actionId, { actionId, transforms: transformsFromTransform(transform, blockId) });
@@ -352,11 +352,11 @@ export class TestTransactor implements ITransactor {
     return allPending;
   }
 
-  getCommittedTransactions(): Map<ActionId, ActionTransforms> {
+  getCommittedActions(): Map<ActionId, ActionTransforms> {
     const allCommitted = new Map<ActionId, ActionTransforms>();
     for (const [blockId, blockState] of this.blocks.entries()) {
-      for (const [rev, actionId] of blockState.revisionTrxs) {
-        const transform = blockState.committedTrxs.get(actionId);
+      for (const [rev, actionId] of blockState.revisionActions) {
+        const transform = blockState.committedActions.get(actionId);
         if (transform) {
           const existing = allCommitted.get(actionId);
           if (!existing) {
@@ -383,15 +383,18 @@ export class TestTransactor implements ITransactor {
 			throw new Error('Transactor is not available');
 		}
 	}
+
+	/** Optional method for querying cluster nominees (used in GATHER phase for multi-collection transactions) */
+	queryClusterNominees?: (blockId: BlockId) => Promise<ClusterNomineesResult>;
 }
 
 function newBlockState(): BlockState {
 	return {
 		materializedBlocks: new Map(),
 		latestRev: 0,
-		revisionTrxs: new Map(),
-		pendingTrxs: new Map(),
-		committedTrxs: new Map()
+		revisionActions: new Map(),
+		pendingActions: new Map(),
+		committedActions: new Map()
 	};
 }
 

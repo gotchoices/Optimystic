@@ -10,7 +10,7 @@
   },
   "scripts": {
     "clean": "yarn workspaces run clean",
-    "build": "yarn workspace @optimystic/vinz run build && yarn workspace @optimystic/db-core run build && yarn workspace @optimystic/fret run build && yarn workspace @optimystic/db-p2p run build && yarn workspace @optimystic/db-quereus run build && yarn workspace @optimystic/test-peer run build",
+    "build": "yarn workspace @optimystic/vinz run build && yarn workspace @optimystic/db-core run build && yarn workspace @optimystic/fret run build && yarn workspace @optimystic/db-p2p run build && yarn workspace @optimystic/quereus-plugin-crypto run build && && yarn workspace @optimystic/quereus-plugin-optimystic run build yarn workspace @optimystic/test-peer run build",
     "build:parallel": "yarn workspaces run build",
     "lint": "yarn workspaces run lint",
     "test": "yarn workspaces run test",

@@ -202,8 +202,8 @@ export class SyncService implements Startable {
 				blockId,
 				revisions: {
 					[latest.rev]: {
-						trx: {
-							trxId: latest.trxId,
+						action: {
+							actionId: latest.actionId,
 							transform: { insert: blockResult.block }
 						},
 						block: blockResult.block

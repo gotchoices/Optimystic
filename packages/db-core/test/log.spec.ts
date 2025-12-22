@@ -246,17 +246,17 @@ describe('Log', () => {
     const log = await Log.create<string>(store)
 
     // Add several actions
-    const trxIds: ActionId[] = []
+    const actionIds: ActionId[] = []
     for (let i = 1; i <= 5; i++) {
       const actionId = generateNumericActionId(i)
-      trxIds.push(actionId)
+      actionIds.push(actionId)
       await log.addActions([`action${i}`], actionId, i, () => [])
     }
 
     // Add a checkpoint that only keeps first two actions
     await log.addCheckpoint([
-      { actionId: trxIds[0]!, rev: 1 },
-      { actionId: trxIds[1]!, rev: 2 }
+      { actionId: actionIds[0]!, rev: 1 },
+      { actionId: actionIds[1]!, rev: 2 }
     ], 6)
 
     // Retrieve from different points
@@ -266,9 +266,9 @@ describe('Log', () => {
     // Context should reflect checkpoint state
     expect(fromRev2.context?.committed.length).to.equal(2)
 
-		const trx6 = generateNumericActionId(6)
-    trxIds.push(trx6)
-    await log.addActions(['action6'], trx6, 7, () => [])
+		const actionId6 = generateNumericActionId(6)
+    actionIds.push(actionId6)
+    await log.addActions(['action6'], actionId6, 7, () => [])
 
     const fromRev4 = await log.getFrom(4)
     expect(fromRev4.entries.length).to.equal(2) // Action 5,6
@@ -276,9 +276,9 @@ describe('Log', () => {
     expect(fromRev4.entries[1]?.actions?.[0]).to.equal('action6')
 
 		expect(fromRev4.context?.committed.length).to.equal(3)
-    expect(fromRev4.context?.committed[0]).to.deep.equal({ actionId: trxIds[0]!, rev: 1 })
-    expect(fromRev4.context?.committed[1]).to.deep.equal({ actionId: trxIds[1]!, rev: 2 })
-    expect(fromRev4.context?.committed[2]).to.deep.equal({ actionId: trx6, rev: 7 })
+    expect(fromRev4.context?.committed[0]).to.deep.equal({ actionId: actionIds[0]!, rev: 1 })
+    expect(fromRev4.context?.committed[1]).to.deep.equal({ actionId: actionIds[1]!, rev: 2 })
+    expect(fromRev4.context?.committed[2]).to.deep.equal({ actionId: actionId6, rev: 7 })
   })
 
   it('should properly track dirtied blocks via getBlockIds callback', async () => {

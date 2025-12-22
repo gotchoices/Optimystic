@@ -1,5 +1,6 @@
 import { type PeerId } from "@libp2p/interface";
-import type { ActionTransforms, ActionBlocks, BlockActionStatus, ITransactor, PendSuccess, StaleFailure, IKeyNetwork, BlockId, GetBlockResults, PendResult, CommitResult, PendRequest, IRepo, BlockGets, Transforms, CommitRequest, ActionId, RepoCommitRequest } from "../index.js";
+import { peerIdFromString } from "@libp2p/peer-id";
+import type { ActionTransforms, ActionBlocks, BlockActionStatus, ITransactor, PendSuccess, StaleFailure, IKeyNetwork, BlockId, GetBlockResults, PendResult, CommitResult, PendRequest, IRepo, BlockGets, Transforms, CommitRequest, ActionId, RepoCommitRequest, ClusterNomineesResult } from "../index.js";
 import { transformForBlockId, groupBy, concatTransforms, concatTransform, transformsFromTransform, blockIdsForTransforms } from "../index.js";
 import { blockIdToBytes } from "../utility/block-id-to-bytes.js";
 import { isRecordEmpty } from "../utility/is-record-empty.js";
@@ -265,6 +266,13 @@ export class NetworkTransactor implements ITransactor {
 			expiration,
 			async (blockId, options) => this.keyNetwork.findCoordinator(await blockIdToBytes(blockId), options)
 		);
+	}
+
+	async queryClusterNominees(blockId: BlockId): Promise<ClusterNomineesResult> {
+		const blockIdBytes = await blockIdToBytes(blockId);
+		const clusterPeers = await this.keyNetwork.findCluster(blockIdBytes);
+		const nominees = Object.keys(clusterPeers).map(idStr => peerIdFromString(idStr));
+		return { nominees };
 	}
 
 	async commit(request: CommitRequest): Promise<CommitResult> {

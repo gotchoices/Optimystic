@@ -29,4 +29,3 @@ export type ActionContext = {
 	/** Optional uncommitted pending action ID */
 	actionId?: ActionId;
 };
-

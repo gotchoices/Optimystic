@@ -166,7 +166,7 @@ export class RepoService implements Startable {
 						}
 					}
 				} else if ('cancel' in operation) {
-					response = await this.repo.cancel(operation.cancel.trxRef, {
+					response = await this.repo.cancel(operation.cancel.actionRef, {
 						expiration: message.expiration
 					})
 				} else if ('commit' in operation) {

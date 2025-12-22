@@ -1134,14 +1134,14 @@ export class TransactionValidator {
 ### Phase 0: Nomenclature Alignment (db-core)
 **Goal**: Align all existing code with Operation/Action/Transaction hierarchy
 
-**Context**: The codebase currently uses "TrxId" and related terminology inconsistently. We need to establish clear nomenclature before adding multi-collection transactions.
+**Context**: The codebase uses "ActionId/ActionRev" as the canonical type names, with "TrxId/TrxRev" as deprecated aliases for backward compatibility.
 
 **Tasks**:
-- [ ] Audit all uses of "Trx", "TrxId", "transaction" in db-core
-- [ ] Rename to use "Action" terminology consistently
-- [ ] Update type names: `TrxId` → `ActionId`
-- [ ] Update function names: `getTrxId()` → `getActionId()`
-- [ ] Update comments and documentation
+- [x] Audit all uses of "Trx", "TrxId", "transaction" in db-core
+- [x] Rename to use "Action" terminology consistently
+- [x] Update type names: `TrxId` → `ActionId` (TrxId kept as deprecated alias)
+- [x] Update function names: `getTrxId()` → `getActionId()`
+- [x] Update comments and documentation
 - [ ] Ensure "transaction" is reserved for the new multi-collection concept
 - [ ] Update tests to use new nomenclature
 - [ ] Verify no breaking changes to public API (or document them)

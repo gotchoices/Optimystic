@@ -1,5 +1,5 @@
 import type {
-	IRepo, GetBlockResults, PendSuccess, StaleFailure, TrxBlocks, MessageOptions, CommitResult,
+	IRepo, GetBlockResults, PendSuccess, StaleFailure, ActionBlocks, MessageOptions, CommitResult,
 	PendRequest, CommitRequest, BlockGets, IPeerNetwork
 } from "@optimystic/db-core";
 import type { RepoMessage } from "@optimystic/db-core";
@@ -31,9 +31,9 @@ export class RepoClient extends ProtocolClient implements IRepo {
 		);
 	}
 
-	async cancel(trxRef: TrxBlocks, options: MessageOptions): Promise<void> {
+	async cancel(actionRef: ActionBlocks, options: MessageOptions): Promise<void> {
 		return this.processRepoMessage<void>(
-			[{ cancel: { trxRef } }],
+			[{ cancel: { actionRef } }],
 			options
 		);
 	}

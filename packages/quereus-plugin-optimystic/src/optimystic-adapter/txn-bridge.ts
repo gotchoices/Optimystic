@@ -9,6 +9,8 @@ import { generateTransactionId } from '../util/generate-transaction-id.js';
 export class TransactionBridge {
   private currentTransaction: TransactionState | null = null;
   private collectionFactory: CollectionFactory;
+  /** Accumulated SQL statements for the current transaction */
+  private accumulatedStatements: string[] = [];
 
   constructor(collectionFactory: CollectionFactory) {
     this.collectionFactory = collectionFactory;
@@ -27,6 +29,9 @@ export class TransactionBridge {
     // Generate a unique transaction ID (includes peer ID hash if available)
     const peerId = this.collectionFactory.getPeerId(options);
     const transactionId = generateTransactionId(peerId);
+
+    // Clear any previously accumulated statements
+    this.accumulatedStatements = [];
 
     this.currentTransaction = {
       transactor,
@@ -56,6 +61,9 @@ export class TransactionBridge {
       // In Optimystic, changes are applied locally and then synced
       this.currentTransaction.isActive = false;
 
+      // Clear accumulated statements after successful commit
+      this.accumulatedStatements = [];
+
     } catch (error) {
       // If sync fails, we need to rollback
       await this.rollbackTransaction();
@@ -76,6 +84,9 @@ export class TransactionBridge {
     this.currentTransaction.collections.clear();
     this.currentTransaction.isActive = false;
 
+    // Clear accumulated statements on rollback
+    this.accumulatedStatements = [];
+
     // Clear the collection factory cache to force fresh collections
     this.collectionFactory.clearCache();
   }
@@ -92,6 +103,32 @@ export class TransactionBridge {
    */
   isTransactionActive(): boolean {
     return this.currentTransaction?.isActive ?? false;
+  }
+
+  /**
+   * Add a SQL statement to the accumulated statements for the current transaction.
+   * Statements are only accumulated when a transaction is active.
+   * @param statement The deterministic SQL statement to accumulate
+   */
+  addStatement(statement: string): void {
+    if (this.currentTransaction?.isActive) {
+      this.accumulatedStatements.push(statement);
+    }
+  }
+
+  /**
+   * Get all accumulated SQL statements for the current transaction.
+   * @returns Array of SQL statements in execution order
+   */
+  getStatements(): readonly string[] {
+    return this.accumulatedStatements;
+  }
+
+  /**
+   * Get the count of accumulated statements
+   */
+  getStatementCount(): number {
+    return this.accumulatedStatements.length;
   }
 
   /**

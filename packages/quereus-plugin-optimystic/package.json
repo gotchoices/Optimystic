@@ -34,7 +34,7 @@
     "quoomb:node2": "quoomb --config examples/quoomb.config.node2.env.json"
   },
   "devDependencies": {
-    "@quereus/quereus": "^0.6.1",
+    "@quereus/quereus": "^0.6.12",
     "@types/node": "^24.0.12",
     "aegir": "^47.0.20",
     "tsup": "^8.5.0",
@@ -56,10 +56,10 @@
     "libp2p": "^2.9.0"
   },
   "peerDependencies": {
-    "@quereus/quereus": "^0.6.1"
+    "@quereus/quereus": "^0.6.12"
   },
   "engines": {
-    "quereus": "^0.6.1"
+    "quereus": "^0.6.12"
   },
   "keywords": [
     "quereus-plugin",
@@ -80,7 +80,7 @@
         "optimystic"
       ],
       "functions": [
-        "TransactionId"
+        "StampId"
       ],
       "collations": []
     },

@@ -2,7 +2,7 @@
 import { Command } from 'commander';
 import debug from 'debug';
 import { getNetworkManager, createLibp2pNode, StorageRepo, BlockStorage, MemoryRawStorage, FileRawStorage, Libp2pKeyPeerNetwork, RepoClient, ArachnodeFretAdapter } from '@optimystic/db-p2p';
-import { Diary, NetworkTransactor, BTree, ITransactor, BlockGets, GetBlockResults, TrxBlocks, BlockTrxStatus, PendRequest, PendResult, CommitRequest, CommitResult } from '@optimystic/db-core';
+import { Diary, NetworkTransactor, BTree, ITransactor, BlockGets, GetBlockResults, ActionBlocks, BlockActionStatus, PendRequest, PendResult, CommitRequest, CommitResult } from '@optimystic/db-core';
 import * as readline from 'readline';
 import * as path from 'path';
 import * as fs from 'fs';
@@ -18,20 +18,20 @@ class LocalTransactor implements ITransactor {
 		return await this.storageRepo.get(blockGets);
 	}
 
-	async getStatus(trxRefs: TrxBlocks[]): Promise<BlockTrxStatus[]> {
+	async getStatus(_actionRefs: ActionBlocks[]): Promise<BlockActionStatus[]> {
 		throw new Error("Method not implemented.");
 	}
 
-	async pend(blockTrx: PendRequest): Promise<PendResult> {
-		return await this.storageRepo.pend(blockTrx);
+	async pend(blockAction: PendRequest): Promise<PendResult> {
+		return await this.storageRepo.pend(blockAction);
 	}
 
 	async commit(request: CommitRequest): Promise<CommitResult> {
 		return await this.storageRepo.commit(request);
 	}
 
-	async cancel(trxRef: TrxBlocks): Promise<void> {
-		return await this.storageRepo.cancel(trxRef);
+	async cancel(actionRef: ActionBlocks): Promise<void> {
+		return await this.storageRepo.cancel(actionRef);
 	}
 }
 

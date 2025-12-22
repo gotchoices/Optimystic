@@ -68,18 +68,18 @@ if (state.pendings.length > 0) {
 }
 ```
 
-**Get Status**: Checks transaction status across multiple blocks
+**Get Status**: Checks action status across multiple blocks
 
 ```typescript
 const statuses = await transactor.getStatus([
-  { blockId: 'block1', trxId: 'tx1' },
-  { blockId: 'block2', trxId: 'tx2' }
+  { blockId: 'block1', actionId: 'tx1' },
+  { blockId: 'block2', actionId: 'tx2' }
 ]);
 ```
 
 ### Transaction Operations
 
-**Pend**: Submits a transaction for coordination without committing
+**Pend**: Submits an action for coordination without committing
 
 ```typescript
 const pendResult = await transactor.pend({
@@ -88,7 +88,7 @@ const pendResult = await transactor.pend({
     updates: { 'existingBlock': [operation1, operation2] },
     deletes: new Set(['deletedBlock'])
   },
-  trxId: 'transaction-123',
+  actionId: 'action-123',
   rev: 124,
   policy: 'r'  // Retry policy
 });
@@ -99,19 +99,19 @@ if (!pendResult.success) {
 }
 ```
 
-**Commit**: Finalizes a pending transaction
+**Commit**: Finalizes a pending action
 
 ```typescript
 const commitResult = await transactor.commit({
   headerId: 'collection-header',  // Optional: prioritize collection header
   tailId: 'log-tail-block',       // Optional: prioritize log tail
   blockIds: pendResult.blockIds,  // Blocks from pend operation
-  trxId: 'transaction-123',
+  actionId: 'action-123',
   rev: 124
 });
 
 if (!commitResult.success) {
-  // Transaction failed due to conflicts
+  // Action failed due to conflicts
   return commitResult; // Contains conflict information
 }
 ```
@@ -133,8 +133,8 @@ class TransactorSource<TBlock extends IBlock> implements BlockSource<TBlock> {
   createBlockHeader(type: BlockType, newId?: BlockId): BlockHeader;
   generateId(): BlockId;
   
-  // Transaction coordination
-  async transact(transforms: Transforms, trxId: TrxId, rev: number, 
+  // Action coordination
+  async transact(transforms: Transforms, actionId: ActionId, rev: number,
                 headerId: BlockId, tailId: BlockId): Promise<StaleFailure | undefined>;
 }
 ```
@@ -156,26 +156,26 @@ async tryGet(id: BlockId): Promise<TBlock | undefined> {
 }
 ```
 
-### Transaction Execution
+### Action Execution
 
 ```typescript
-async transact(transforms: Transforms, trxId: TrxId, rev: number, 
+async transact(transforms: Transforms, actionId: ActionId, rev: number,
               headerId: BlockId, tailId: BlockId): Promise<StaleFailure | undefined> {
-  // Step 1: Pend the transaction
-  const pendResult = await this.transactor.pend({ 
-    transforms, trxId, rev, policy: 'r' 
+  // Step 1: Pend the action
+  const pendResult = await this.transactor.pend({
+    transforms, actionId, rev, policy: 'r'
   });
-  
+
   if (!pendResult.success) {
     return pendResult; // Stale failure
   }
-  
-  // Step 2: Commit the transaction
+
+  // Step 2: Commit the action
   const commitResult = await this.transactor.commit({
     headerId: transforms.inserts[headerId] ? headerId : undefined,
     tailId,
     blockIds: pendResult.blockIds,
-    trxId,
+    actionId,
     rev
   });
   
@@ -214,7 +214,7 @@ await transactor.commit({
   headerId: 'collection-header',  // Optional: new collections only
   tailId: 'log-tail-block',       // CRITICAL: Process this block first
   blockIds: allAffectedBlocks,    // All blocks including tail
-  trxId: 'transaction-123',
+  actionId: 'action-123',
   rev: 124
 });
 ```
@@ -304,7 +304,7 @@ The `pend` operation accepts different policies for handling concurrent transact
 ```typescript
 type PendRequest = {
   transforms: Transforms;
-  trxId: TrxId;
+  actionId: ActionId;
   rev?: number;
   policy: 'c' | 'f' | 'r';  // Continue, Fail, or Return
 };

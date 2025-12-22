@@ -46,7 +46,7 @@ Here is how a transaction proceeds for a given cluster:
 - **Purpose**: Post a transaction for a set of blocks
 - **Input**: `PendRequest` containing:
   - `transform` - The changes to apply
-  - `trxId` - Transaction identifier
+  - `actionId` - Action identifier
   - `pending` - How to handle existing pending transactions
 - **Output**: `PendResult` indicating success or failure with pending transaction information
 - **Behavior**:

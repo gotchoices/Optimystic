@@ -1,4 +1,10 @@
-import type { GetBlockResults, ActionBlocks, BlockActionStatus, PendResult, CommitResult, PendRequest, CommitRequest, BlockGets } from "../index.js";
+import type { GetBlockResults, ActionBlocks, BlockActionStatus, PendResult, CommitResult, PendRequest, CommitRequest, BlockGets, BlockId } from "../index.js";
+import type { PeerId } from "@libp2p/interface";
+
+export type ClusterNomineesResult = {
+	/** Peer IDs of the cluster members who can participate in consensus */
+	nominees: PeerId[];
+};
 
 export type ITransactor = {
 	/** Get blocks by their IDs and versions or a specific action
@@ -29,4 +35,10 @@ export type ITransactor = {
 		- If the action mentions other collections, those are assumed conditions - returned conditions only list inherited conditions
 	 */
 	commit(request: CommitRequest): Promise<CommitResult>;
+
+	/** Query cluster nominees for a critical block (used in GATHER phase for multi-collection transactions)
+		- Returns the peer IDs of cluster members who can participate in consensus for the given block
+		- Used to build the supercluster for multi-collection transaction consensus
+	 */
+	queryClusterNominees?(blockId: BlockId): Promise<ClusterNomineesResult>;
 }

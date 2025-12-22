@@ -1,4 +1,4 @@
-import type { BlockId, IBlock, Transform, TrxId, TrxRev } from "@optimystic/db-core";
+import type { BlockId, IBlock, Transform, ActionId, ActionRev } from "@optimystic/db-core";
 import { Latches, applyTransform } from "@optimystic/db-core";
 import type { BlockArchive, BlockMetadata, RestoreCallback, RevisionRange } from "./struct.js";
 import type { IRawStorage } from "./i-raw-storage.js";
@@ -12,12 +12,12 @@ export class BlockStorage implements IBlockStorage {
 		private readonly restoreCallback?: RestoreCallback
 	) { }
 
-	async getLatest(): Promise<TrxRev | undefined> {
+	async getLatest(): Promise<ActionRev | undefined> {
 		const meta = await this.storage.getMetadata(this.blockId);
 		return meta?.latest;
 	}
 
-	async getBlock(rev?: number): Promise<{ block: IBlock, trxRev: TrxRev } | undefined> {
+	async getBlock(rev?: number): Promise<{ block: IBlock, actionRev: ActionRev } | undefined> {
 		const meta = await this.storage.getMetadata(this.blockId);
 		if (!meta) {
 			return undefined;
@@ -32,48 +32,48 @@ export class BlockStorage implements IBlockStorage {
 		return await this.materializeBlock(meta, targetRev);
 	}
 
-	async getTransaction(trxId: TrxId): Promise<Transform | undefined> {
-		return await this.storage.getTransaction(this.blockId, trxId);
+	async getTransaction(actionId: ActionId): Promise<Transform | undefined> {
+		return await this.storage.getTransaction(this.blockId, actionId);
 	}
 
-	async getPendingTransaction(trxId: TrxId): Promise<Transform | undefined> {
-		return await this.storage.getPendingTransaction(this.blockId, trxId);
+	async getPendingTransaction(actionId: ActionId): Promise<Transform | undefined> {
+		return await this.storage.getPendingTransaction(this.blockId, actionId);
 	}
 
-	async *listPendingTransactions(): AsyncIterable<TrxId> {
+	async *listPendingTransactions(): AsyncIterable<ActionId> {
 		yield* this.storage.listPendingTransactions(this.blockId);
 	}
 
-	async savePendingTransaction(trxId: TrxId, transform: Transform): Promise<void> {
+	async savePendingTransaction(actionId: ActionId, transform: Transform): Promise<void> {
 		let meta = await this.storage.getMetadata(this.blockId);
 		if (!meta) {
 			meta = { latest: undefined, ranges: [[0]] };
 			await this.storage.saveMetadata(this.blockId, meta);
 		}
-		await this.storage.savePendingTransaction(this.blockId, trxId, transform);
+		await this.storage.savePendingTransaction(this.blockId, actionId, transform);
 	}
 
-	async deletePendingTransaction(trxId: TrxId): Promise<void> {
-		await this.storage.deletePendingTransaction(this.blockId, trxId);
+	async deletePendingTransaction(actionId: ActionId): Promise<void> {
+		await this.storage.deletePendingTransaction(this.blockId, actionId);
 	}
 
-	async *listRevisions(startRev: number, endRev: number): AsyncIterable<TrxRev> {
+	async *listRevisions(startRev: number, endRev: number): AsyncIterable<ActionRev> {
 		yield* this.storage.listRevisions(this.blockId, startRev, endRev);
 	}
 
-	async saveMaterializedBlock(trxId: TrxId, block: IBlock | undefined): Promise<void> {
-		await this.storage.saveMaterializedBlock(this.blockId, trxId, block);
+	async saveMaterializedBlock(actionId: ActionId, block: IBlock | undefined): Promise<void> {
+		await this.storage.saveMaterializedBlock(this.blockId, actionId, block);
 	}
 
-	async saveRevision(rev: number, trxId: TrxId): Promise<void> {
-		await this.storage.saveRevision(this.blockId, rev, trxId);
+	async saveRevision(rev: number, actionId: ActionId): Promise<void> {
+		await this.storage.saveRevision(this.blockId, rev, actionId);
 	}
 
-	async promotePendingTransaction(trxId: TrxId): Promise<void> {
-		await this.storage.promotePendingTransaction(this.blockId, trxId);
+	async promotePendingTransaction(actionId: ActionId): Promise<void> {
+		await this.storage.promotePendingTransaction(this.blockId, actionId);
 	}
 
-	async setLatest(latest: TrxRev): Promise<void> {
+	async setLatest(latest: ActionRev): Promise<void> {
 		const meta = await this.storage.getMetadata(this.blockId);
 		if (!meta) {
 			throw new Error(`Block ${this.blockId} not found`);
@@ -113,34 +113,34 @@ export class BlockStorage implements IBlockStorage {
 		}
 	}
 
-	private async materializeBlock(meta: BlockMetadata, targetRev: number): Promise<{ block: IBlock, trxRev: TrxRev }> {
+	private async materializeBlock(_meta: BlockMetadata, targetRev: number): Promise<{ block: IBlock, actionRev: ActionRev }> {
 		let block: IBlock | undefined;
-		let materializedTrxRev: TrxRev | undefined;
-		const transactions: TrxRev[] = [];
+		let materializedActionRev: ActionRev | undefined;
+		const actions: ActionRev[] = [];
 
 		// Find the materialized block
-		for await (const trxRev of this.storage.listRevisions(this.blockId, targetRev, 1)) {
-			const materializedBlock = await this.storage.getMaterializedBlock(this.blockId, trxRev.trxId);
+		for await (const actionRev of this.storage.listRevisions(this.blockId, targetRev, 1)) {
+			const materializedBlock = await this.storage.getMaterializedBlock(this.blockId, actionRev.actionId);
 			if (materializedBlock) {
 				block = materializedBlock;
-				materializedTrxRev = trxRev;
+				materializedActionRev = actionRev;
 				break;
 			} else {
-				transactions.push(trxRev);
+				actions.push(actionRev);
 			}
 		}
 
-		if (!block || !materializedTrxRev) {
+		if (!block || !materializedActionRev) {
 			// There is an implicit requirement that there must be a materialization of the block somewhere in it's history.  If the log is truncated, a materialization must be made at the truncation point..
 			throw new Error(`Failed to find materialized block ${this.blockId} for revision ${targetRev}`);
 		}
 
 		// Apply transforms in reverse order
-		for (let i = transactions.length - 1; i >= 0; --i) {
-			const { trxId } = transactions[i]!;
-			const transform = await this.storage.getTransaction(this.blockId, trxId);
+		for (let i = actions.length - 1; i >= 0; --i) {
+			const { actionId } = actions[i]!;
+			const transform = await this.storage.getTransaction(this.blockId, actionId);
 			if (!transform) {
-				throw new Error(`Missing transaction ${trxId} for block ${this.blockId}`);
+				throw new Error(`Missing action ${actionId} for block ${this.blockId}`);
 			}
 			block = applyTransform(block, transform);
 		}
@@ -148,11 +148,11 @@ export class BlockStorage implements IBlockStorage {
 		if (!block) {
 			throw new Error(`Block ${this.blockId} has been deleted`);
 		}
-		if (transactions.length) {
-			await this.storage.saveMaterializedBlock(this.blockId, transactions[0]!.trxId, block);
-			return { block, trxRev: transactions[0]! };
+		if (actions.length) {
+			await this.storage.saveMaterializedBlock(this.blockId, actions[0]!.actionId, block);
+			return { block, actionRev: actions[0]! };
 		}
-		return { block, trxRev: materializedTrxRev };
+		return { block, actionRev: materializedActionRev };
 	}
 
 	private async restoreBlock(rev: number): Promise<BlockArchive | undefined> {
@@ -164,12 +164,12 @@ export class BlockStorage implements IBlockStorage {
 		const revisions = Object.entries(archive.revisions)
 			.map(([rev, data]) => ({ rev: Number(rev), data }));
 
-		// Save all revisions, transactions, and materializations
-		for (const { rev, data: { trx, block } } of revisions) {
+		// Save all revisions, actions, and materializations
+		for (const { rev, data: { action, block } } of revisions) {
 			await Promise.all([
-				this.storage.saveRevision(this.blockId, rev, trx.trxId),
-				this.storage.saveTransaction(this.blockId, trx.trxId, trx.transform),
-				block ? this.storage.saveMaterializedBlock(this.blockId, trx.trxId, block) : Promise.resolve()
+				this.storage.saveRevision(this.blockId, rev, action.actionId),
+				this.storage.saveTransaction(this.blockId, action.actionId, action.transform),
+				block ? this.storage.saveMaterializedBlock(this.blockId, action.actionId, block) : Promise.resolve()
 			]);
 		}
 	}

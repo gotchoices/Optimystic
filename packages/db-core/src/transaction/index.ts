@@ -5,7 +5,9 @@ export type {
 	TransactionRef,
 	ITransactionEngine,
 	ExecutionResult,
-	CollectionActions
+	CollectionActions,
+	ValidationResult,
+	ITransactionValidator
 } from './transaction.js';
 
 export {
@@ -24,4 +26,5 @@ export type { ActionsStatement } from './actions-engine.js';
 export { TransactionCoordinator } from './coordinator.js';
 export { TransactionContext } from './context.js';
 export { TransactionSession } from './session.js';
-
+export { TransactionValidator } from './validator.js';
+export type { EngineRegistration, ValidationCoordinatorFactory } from './validator.js';

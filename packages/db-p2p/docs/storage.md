@@ -71,16 +71,16 @@ The `FileRawStorage` class implements `IRawStorage` using a file system backend 
 ├── {blockId}/
 │   ├── meta.json           # Block metadata
 │   ├── revs/
-│   │   ├── {rev}.json      # Revision → TrxId mapping
+│   │   ├── {rev}.json      # Revision → ActionId mapping
 │   │   └── ...
 │   ├── pend/
-│   │   ├── {trxId}.json    # Pending transactions
+│   │   ├── {actionId}.json # Pending actions
 │   │   └── ...
 │   ├── trx/
-│   │   ├── {trxId}.json    # Committed transactions
+│   │   ├── {actionId}.json # Committed actions
 │   │   └── ...
 │   └── blocks/
-│       ├── {trxId}.json    # Materialized blocks
+│       ├── {actionId}.json # Materialized blocks
 │       └── ...
 └── ...
 ```
@@ -91,7 +91,7 @@ The `FileRawStorage` class implements `IRawStorage` using a file system backend 
 ```typescript
 export type BlockMetadata = {
   ranges: RevisionRange[];    // Available revision ranges
-  latest?: TrxRev;           // Latest revision info
+  latest?: ActionRev;         // Latest revision info
 };
 ```
 
@@ -109,7 +109,7 @@ export type BlockArchive = {
   blockId: BlockId;
   revisions: ArchiveRevisions;
   range: RevisionRange;
-  pending?: Record<TrxId, TrxTransforms>;
+  pending?: Record<ActionId, ActionTransforms>;
 };
 ```
 
@@ -175,20 +175,20 @@ const repo = new StorageRepo(blockId =>
 // Get blocks with context
 const result = await repo.get({
   blockIds: ['block1', 'block2'],
-  context: { rev: 10, trxId: 'trx123' }
+  context: { rev: 10, actionId: 'action123' }
 });
 
-// Create pending transaction
+// Create pending action
 const pendResult = await repo.pend({
-  trxId: 'trx124',
+  actionId: 'action124',
   transforms: { /* ... */ },
   rev: 11,
-  policy: 'w'  // Wait for pending transactions
+  policy: 'w'  // Wait for pending actions
 });
 
-// Commit transaction
+// Commit action
 const commitResult = await repo.commit({
-  trxId: 'trx124',
+  actionId: 'action124',
   blockIds: ['block1', 'block2'],
   rev: 11
 });

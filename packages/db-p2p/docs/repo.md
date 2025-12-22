@@ -261,8 +261,8 @@ const client = RepoClient.create(peerId, peerNetwork);
 
 // Perform distributed database operations
 const blocks = await client.get({ blockIds: ['block1'] });
-const pendResult = await client.pend({ trxId: 'tx1', transforms: {...} });
-const commitResult = await client.commit({ trxId: 'tx1', blockIds: ['block1'] });
+const pendResult = await client.pend({ actionId: 'tx1', transforms: {...} });
+const commitResult = await client.commit({ actionId: 'tx1', blockIds: ['block1'] });
 ```
 
 ### Server-Side Setup

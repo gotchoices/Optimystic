@@ -413,7 +413,7 @@ export class ClusterMember implements ICluster {
 				} else if ('commit' in operation) {
 					await this.storageRepo.commit(operation.commit);
 				} else if ('cancel' in operation) {
-					await this.storageRepo.cancel(operation.cancel.trxRef);
+					await this.storageRepo.cancel(operation.cancel.actionRef);
 				}
 			}
 		}
@@ -527,7 +527,7 @@ export class ClusterMember implements ICluster {
 			} else if ('commit' in operation) {
 				operation.commit.blockIds.forEach(id => blockIds.add(id));
 			} else if ('cancel' in operation) {
-				Object.keys(operation.cancel.trxRef).forEach(id => blockIds.add(id));
+				operation.cancel.actionRef.blockIds.forEach(id => blockIds.add(id));
 			}
 		}
 

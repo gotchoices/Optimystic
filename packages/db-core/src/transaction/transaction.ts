@@ -155,3 +155,51 @@ export type CollectionActions = {
 	actions: unknown[];
 };
 
+/**
+ * Result of transaction validation.
+ */
+export type ValidationResult = {
+	/** Whether validation succeeded */
+	valid: boolean;
+	/** Reason for validation failure (if valid=false) */
+	reason?: string;
+	/** The operations hash computed during validation (for debugging) */
+	computedHash?: string;
+};
+
+/**
+ * Transaction validator interface.
+ * Pluggable validators implement this to verify transaction integrity.
+ *
+ * Validators are invoked when a node receives a PendRequest with a transaction.
+ * They re-execute the transaction and verify the operations match.
+ */
+export interface ITransactionValidator {
+	/**
+	 * Validate a transaction by re-executing and comparing operations hash.
+	 *
+	 * Validation steps:
+	 * 1. Verify stamp.engineId matches a known engine
+	 * 2. Verify stamp.schemaHash matches local schema
+	 * 3. Verify read dependencies (no stale reads)
+	 * 4. Re-execute transaction.statements through engine (isolated state)
+	 * 5. Collect operations from re-execution
+	 * 6. Compute hash of operations
+	 * 7. Compare with sender's operationsHash
+	 *
+	 * @param transaction - The transaction to validate
+	 * @param operationsHash - The hash to compare against
+	 * @returns Validation result
+	 */
+	validate(transaction: Transaction, operationsHash: string): Promise<ValidationResult>;
+
+	/**
+	 * Get the schema hash for a given engine.
+	 * Used to verify the sender's schema matches local schema.
+	 *
+	 * @param engineId - The engine identifier
+	 * @returns The schema hash, or undefined if engine not found
+	 */
+	getSchemaHash(engineId: string): Promise<string | undefined>;
+}
+

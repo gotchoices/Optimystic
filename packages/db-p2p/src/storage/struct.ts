@@ -1,4 +1,4 @@
-import type { BlockId, IBlock, TrxId, TrxRev, TrxTransform, TrxTransforms } from "@optimystic/db-core";
+import type { BlockId, IBlock, ActionId, ActionRev, ActionTransform, ActionTransforms } from "@optimystic/db-core";
 
 export type RevisionRange = [
 	/** Inclusive start */
@@ -11,10 +11,10 @@ export type BlockMetadata = {
 	// Revision ranges that are present in storage
 	ranges: RevisionRange[];
 	/** Latest revision - present if the repo is not empty */
-	latest?: TrxRev;
+	latest?: ActionRev;
 };
 
-export type ArchiveRevisions = Record<number, { trx: TrxTransform, block?: IBlock }>;
+export type ArchiveRevisions = Record<number, { action: ActionTransform, block?: IBlock }>;
 
 export type BlockArchive = {
 	blockId: BlockId;
@@ -22,8 +22,8 @@ export type BlockArchive = {
 	revisions: ArchiveRevisions;
 	/** Explicit range covered by this archive since revisions may be sparse */
 	range: RevisionRange;
-	/** Pending transactions - present if this range is open-ended */
-	pending?: Record<TrxId, TrxTransforms>;
+	/** Pending actions - present if this range is open-ended */
+	pending?: Record<ActionId, ActionTransforms>;
 }
 
 /** Should return a BlockRepo with the given rev (materialized) if given,

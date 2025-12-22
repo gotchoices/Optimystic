@@ -10,7 +10,7 @@ import { TEXT_TYPE } from '@quereus/quereus';
 import { CollectionFactory } from './optimystic-adapter/collection-factory.js';
 import { TransactionBridge } from './optimystic-adapter/txn-bridge.js';
 import { OptimysticModule } from './optimystic-module.js';
-import { createTransactionIdFunction } from './functions/transaction-id.js';
+import { createStampIdFunction } from './functions/transaction-id.js';
 
 /**
  * Plugin registration function
@@ -26,8 +26,8 @@ export default function register(db: Database, config: Record<string, SqlValue> 
 	const txnBridge = new TransactionBridge(collectionFactory);
 	const optimysticModule = new OptimysticModule(collectionFactory, txnBridge);
 
-	// Create the TransactionId function
-	const transactionIdFunc = createTransactionIdFunction(txnBridge);
+	// Create the StampId function
+	const stampIdFunc = createStampIdFunction(txnBridge);
 
 	// Note: Transaction hooks are handled by the virtual table's begin, commit, rollback methods
 
@@ -42,7 +42,7 @@ export default function register(db: Database, config: Record<string, SqlValue> 
 		functions: [
 			{
 				schema: {
-					name: 'TransactionId',
+					name: 'StampId',
 					numArgs: 0,
 					flags: 1 as FunctionFlags, // UTF8
 					returnType: {
@@ -51,7 +51,7 @@ export default function register(db: Database, config: Record<string, SqlValue> 
 						nullable: true,
 						isReadOnly: true,
 					},
-					implementation: transactionIdFunc,
+					implementation: stampIdFunc,
 				},
 			},
 		],
