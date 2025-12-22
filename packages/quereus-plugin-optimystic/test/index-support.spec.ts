@@ -3,8 +3,18 @@
  */
 
 import { expect } from 'aegir/chai';
-import { Database } from '@quereus/quereus';
+import { Database, SqlValue } from '@quereus/quereus';
 import register from '../dist/plugin.js';
+
+type Row = Record<string, SqlValue>;
+
+const collectRows = async (iter: AsyncIterable<Row>): Promise<Row[]> => {
+	const rows: Row[] = [];
+	for await (const row of iter) {
+		rows.push(row);
+	}
+	return rows;
+};
 
 describe('Optimystic Index Support', () => {
 	let db: Database;
@@ -100,46 +110,46 @@ describe('Optimystic Index Support', () => {
 		});
 
 		it('should use index for equality search', async () => {
-			const result = await db.exec('SELECT * FROM products WHERE category = "Tools"');
-			expect(result).toHaveLength(3);
-			expect(result.every(r => r.category === 'Tools')).toBe(true);
+			const result = await collectRows(db.eval('SELECT * FROM products WHERE category = "Tools"'));
+			expect(result).to.have.lengthOf(3);
+			expect(result.every(r => r.category === 'Tools')).to.equal(true);
 		});
 
 		it('should use index for range search', async () => {
-			const result = await db.exec('SELECT * FROM products WHERE price >= 20 AND price <= 50');
-			expect(result).toHaveLength(2);
+			const result = await collectRows(db.eval('SELECT * FROM products WHERE price >= 20 AND price <= 50'));
+			expect(result).to.have.lengthOf(2);
 		});
 
 		it('should use composite index', async () => {
-			const result = await db.exec('SELECT * FROM products WHERE category = "Electronics" AND price > 50');
-			expect(result).toHaveLength(1);
-			expect(result[0].name).toBe('Gizmo');
+			const result = await collectRows(db.eval('SELECT * FROM products WHERE category = "Electronics" AND price > 50'));
+			expect(result).to.have.lengthOf(1);
+			expect(result[0]!.name).to.equal('Gizmo');
 		});
 
 		it('should maintain index on INSERT', async () => {
 			await db.exec(`INSERT INTO products (id, name, category, price, stock) VALUES (6, 'Contraption', 'Tools', 39.99, 60)`);
 
-			const result = await db.exec('SELECT * FROM products WHERE category = "Tools"');
-			expect(result).toHaveLength(4);
+			const result = await collectRows(db.eval('SELECT * FROM products WHERE category = "Tools"'));
+			expect(result).to.have.lengthOf(4);
 		});
 
 		it('should maintain index on UPDATE', async () => {
 			await db.exec(`UPDATE products SET category = 'Hardware' WHERE id = 1`);
 
-			const toolsResult = await db.exec('SELECT * FROM products WHERE category = "Tools"');
-			expect(toolsResult).toHaveLength(2);
+			const toolsResult = await collectRows(db.eval('SELECT * FROM products WHERE category = "Tools"'));
+			expect(toolsResult).to.have.lengthOf(2);
 
-			const hardwareResult = await db.exec('SELECT * FROM products WHERE category = "Hardware"');
-			expect(hardwareResult).toHaveLength(1);
-			expect(hardwareResult[0].name).toBe('Widget');
+			const hardwareResult = await collectRows(db.eval('SELECT * FROM products WHERE category = "Hardware"'));
+			expect(hardwareResult).to.have.lengthOf(1);
+			expect(hardwareResult[0]!.name).to.equal('Widget');
 		});
 
 		it('should maintain index on DELETE', async () => {
 			await db.exec(`DELETE FROM products WHERE id = 1`);
 
-			const result = await db.exec('SELECT * FROM products WHERE category = "Tools"');
-			expect(result).toHaveLength(2);
-			expect(result.every(r => r.id !== 1)).toBe(true);
+			const result = await collectRows(db.eval('SELECT * FROM products WHERE category = "Tools"'));
+			expect(result).to.have.lengthOf(2);
+			expect(result.every(r => r.id !== 1)).to.equal(true);
 		});
 	});
 
@@ -169,26 +179,26 @@ describe('Optimystic Index Support', () => {
 
 		it('should choose best index for query', async () => {
 			// Query with email constraint should use idx_email
-			const result = await db.exec('SELECT * FROM users WHERE email = "user50@example.com"');
-			expect(result).toHaveLength(1);
-			expect(result[0].id).toBe(50);
+			const result = await collectRows(db.eval('SELECT * FROM users WHERE email = "user50@example.com"'));
+			expect(result).to.have.lengthOf(1);
+			expect(result[0]!.id).to.equal(50);
 		});
 
 		it('should use composite index when beneficial', async () => {
 			// Query with city and age should use idx_city_age
-			const result = await db.exec('SELECT * FROM users WHERE city = "City5" AND age > 30');
-			expect(result.length).toBeGreaterThan(0);
-			expect(result.every(r => r.city === 'City5' && r.age > 30)).toBe(true);
+			const result = await collectRows(db.eval('SELECT * FROM users WHERE city = "City5" AND age > 30'));
+			expect(result.length).to.be.greaterThan(0);
+			expect(result.every(r => r.city === 'City5' && (r.age as number) > 30)).to.equal(true);
 		});
 
 		it('should handle ORDER BY with index', async () => {
 			// ORDER BY indexed column should be optimized
-			const result = await db.exec('SELECT * FROM users WHERE city = "City1" ORDER BY age');
-			expect(result.length).toBeGreaterThan(0);
+			const result = await collectRows(db.eval('SELECT * FROM users WHERE city = "City1" ORDER BY age'));
+			expect(result.length).to.be.greaterThan(0);
 
 			// Verify ordering
 			for (let i = 1; i < result.length; i++) {
-				expect(result[i].age).toBeGreaterThanOrEqual(result[i - 1].age);
+				expect(result[i]!.age as number).to.be.at.least(result[i - 1]!.age as number);
 			}
 		});
 	});
@@ -214,8 +224,8 @@ describe('Optimystic Index Support', () => {
 					(4, NULL)
 			`);
 
-			const result = await db.exec('SELECT * FROM test_table WHERE value IS NULL');
-			expect(result).toHaveLength(2);
+			const result = await collectRows(db.eval('SELECT * FROM test_table WHERE value IS NULL'));
+			expect(result).to.have.lengthOf(2);
 		});
 
 		it('should handle empty strings in index', async () => {
@@ -226,8 +236,8 @@ describe('Optimystic Index Support', () => {
 					(3, '')
 			`);
 
-			const result = await db.exec('SELECT * FROM test_table WHERE value = ""');
-			expect(result).toHaveLength(2);
+			const result = await collectRows(db.eval('SELECT * FROM test_table WHERE value = ""'));
+			expect(result).to.have.lengthOf(2);
 		});
 
 		it('should handle duplicate values in non-unique index', async () => {
@@ -238,8 +248,8 @@ describe('Optimystic Index Support', () => {
 					(3, 'duplicate')
 			`);
 
-			const result = await db.exec('SELECT * FROM test_table WHERE value = "duplicate"');
-			expect(result).toHaveLength(3);
+			const result = await collectRows(db.eval('SELECT * FROM test_table WHERE value = "duplicate"'));
+			expect(result).to.have.lengthOf(3);
 		});
 	});
 });

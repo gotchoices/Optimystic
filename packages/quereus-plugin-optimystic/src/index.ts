@@ -30,3 +30,13 @@ export type {
 	RowData,
 	TransactionState,
 } from './types.js';
+
+// Export transaction engine
+export {
+	QuereusEngine,
+	QUEREUS_ENGINE_ID,
+	createQuereusStatement,
+	createQuereusStatements
+} from './transaction/index.js';
+
+export type { QuereusStatement } from './transaction/index.js';

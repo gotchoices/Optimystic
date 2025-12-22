@@ -3,8 +3,18 @@
  */
 
 import { expect } from 'aegir/chai';
-import { Database } from '@quereus/quereus';
+import { Database, SqlValue } from '@quereus/quereus';
 import register from '../dist/plugin.js';
+
+type Row = Record<string, SqlValue>;
+
+const collectRows = async (iter: AsyncIterable<Row>): Promise<Row[]> => {
+	const rows: Row[] = [];
+	for await (const row of iter) {
+		rows.push(row);
+	}
+	return rows;
+};
 
 describe('Optimystic Schema Support', () => {
 	let db: Database;
@@ -151,8 +161,8 @@ describe('Optimystic Schema Support', () => {
 		it('should handle NULL values', async () => {
 			await db.exec(`INSERT INTO users (id, name, email) VALUES (1, 'Alice', NULL)`);
 
-			const result = await db.exec('SELECT * FROM users WHERE id = 1');
-			expect(result[0].email).toBeNull();
+			const result = await collectRows(db.eval('SELECT * FROM users WHERE id = 1'));
+			expect(result[0]!.email).to.be.null;
 		});
 	});
 
@@ -176,15 +186,15 @@ describe('Optimystic Schema Support', () => {
 		it('should update single row', async () => {
 			await db.exec(`UPDATE users SET email = 'alice.new@example.com' WHERE id = 1`);
 
-			const result = await db.exec('SELECT * FROM users WHERE id = 1');
-			expect(result[0].email).toBe('alice.new@example.com');
+			const result = await collectRows(db.eval('SELECT * FROM users WHERE id = 1'));
+			expect(result[0]!.email).to.equal('alice.new@example.com');
 		});
 
 		it('should update multiple rows', async () => {
 			await db.exec(`UPDATE users SET email = 'updated@example.com'`);
 
-			const result = await db.exec('SELECT * FROM users');
-			expect(result.every(r => r.email === 'updated@example.com')).toBe(true);
+			const result = await collectRows(db.eval('SELECT * FROM users'));
+			expect(result.every(r => r.email === 'updated@example.com')).to.equal(true);
 		});
 	});
 
@@ -220,12 +230,9 @@ describe('Optimystic Schema Support', () => {
 		it('should delete multiple rows', async () => {
 			await db.exec(`DELETE FROM users WHERE id > 1`);
 
-			const result = [];
-			for await (const row of db.eval('SELECT * FROM users')) {
-				result.push(row);
-			}
+			const result = await collectRows(db.eval('SELECT * FROM users'));
 			expect(result).to.have.lengthOf(1);
-			expect(result[0].id).to.equal(1);
+			expect(result[0]!.id).to.equal(1);
 		});
 
 		it('should delete all rows', async () => {
@@ -286,12 +293,9 @@ describe('Optimystic Schema Support', () => {
 		});
 
 		it('should order results', async () => {
-			const result = [];
-			for await (const row of db.eval('SELECT * FROM products ORDER BY price DESC')) {
-				result.push(row);
-			}
-			expect(result[0].name).to.equal('Gizmo');
-			expect(result[3].name).to.equal('Doohickey');
+			const result = await collectRows(db.eval('SELECT * FROM products ORDER BY price DESC'));
+			expect(result[0]!.name).to.equal('Gizmo');
+			expect(result[3]!.name).to.equal('Doohickey');
 		});
 
 		it('should limit results', async () => {

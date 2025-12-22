@@ -3,8 +3,8 @@ import { Log } from '../src/log/index.js'
 import type { LogBlock } from '../src/log/index.js'
 import { TestLogStore } from './test-log-store.js'
 import type { ActionId, ActionRev } from '../src/index.js'
-import { generateNumericActionId } from './generate-numeric-trx-id.js'
-import { generateRandomActionId } from './generate-random-trx-id.js'
+import { generateNumericActionId } from './generate-numeric-action-id.js'
+import { generateRandomActionId } from './generate-random-action-id.js'
 
 describe('Log', () => {
   let store: TestLogStore
