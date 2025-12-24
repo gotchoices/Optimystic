@@ -1,6 +1,7 @@
 import type { IRepo, ClusterRecord, Signature, RepoMessage } from "@optimystic/db-core";
 import type { ICluster } from "@optimystic/db-core";
 import type { IPeerNetwork } from "@optimystic/db-core";
+import { blockIdsForTransforms } from "@optimystic/db-core";
 import { ClusterClient } from "./client.js";
 import type { PeerId } from "@libp2p/interface";
 import { peerIdFromString } from "@libp2p/peer-id";
@@ -178,6 +179,8 @@ export class ClusterMember implements ICluster {
 					messageHash: record.messageHash,
 					commits: Object.keys(currentRecord.commits ?? {})
 				});
+				// After adding our commit, clear the transaction - the coordinator will handle consensus
+				shouldPersist = false;
 				break;
 			case TransactionPhase.Consensus:
 				log('cluster-member:action-consensus', {
@@ -506,14 +509,42 @@ export class ClusterMember implements ICluster {
 	}
 
 	private operationsConflict(ops1: RepoMessage['operations'], ops2: RepoMessage['operations']): boolean {
+		// Check if one is a commit for the same action as a pend - these don't conflict
+		const actionId1 = this.getActionId(ops1);
+		const actionId2 = this.getActionId(ops2);
+		if (actionId1 && actionId2 && actionId1 === actionId2) {
+			// Same action - commit is resolving the pend, not conflicting
+			return false;
+		}
+
 		const blocks1 = new Set(this.getAffectedBlockIds(ops1));
 		const blocks2 = new Set(this.getAffectedBlockIds(ops2));
 
 		for (const block of Array.from(blocks1)) {
-			if (blocks2.has(block)) return true;
+			if (blocks2.has(block)) {
+				log('cluster-member:conflict-detected', {
+					blocks1: Array.from(blocks1),
+					blocks2: Array.from(blocks2),
+					conflictingBlock: block
+				});
+				return true;
+			}
 		}
 
 		return false;
+	}
+
+	private getActionId(operations: RepoMessage['operations']): string | undefined {
+		for (const operation of operations) {
+			if ('pend' in operation) {
+				return operation.pend.actionId;
+			} else if ('commit' in operation) {
+				return operation.commit.actionId;
+			} else if ('cancel' in operation) {
+				return operation.cancel.actionRef.actionId;
+			}
+		}
+		return undefined;
 	}
 
 	private getAffectedBlockIds(operations: RepoMessage['operations']): string[] {
@@ -523,7 +554,8 @@ export class ClusterMember implements ICluster {
 			if ('get' in operation) {
 				operation.get.blockIds.forEach(id => blockIds.add(id));
 			} else if ('pend' in operation) {
-				Object.keys(operation.pend.transforms).forEach(id => blockIds.add(id));
+				// Use blockIdsForTransforms to correctly extract block IDs from Transforms structure
+				blockIdsForTransforms(operation.pend.transforms).forEach(id => blockIds.add(id));
 			} else if ('commit' in operation) {
 				operation.commit.blockIds.forEach(id => blockIds.add(id));
 			} else if ('cancel' in operation) {

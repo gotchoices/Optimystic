@@ -275,11 +275,28 @@ export class OptimysticVirtualTable extends VirtualTable {
     }
 
     try {
-      if (filterInfo.idxNum === 1) {
-        // Point lookup on primary key
+      // Parse idxStr to determine access strategy
+      // Quereus uses idxStr like 'idx=_primary_(0);plan=2' for equality seeks
+      const planType = this.parsePlanType(filterInfo.idxStr);
+
+      // Debug logging
+      console.log(`[OptimysticVirtualTable.query] idxStr=${filterInfo.idxStr}, idxNum=${filterInfo.idxNum}, planType=${planType}, args.length=${filterInfo.args.length}, args=${JSON.stringify(filterInfo.args)}`);
+
+      if (planType === 2 && filterInfo.args.length > 0) {
+        // Primary key equality seek (plan=2)
+        console.log(`[OptimysticVirtualTable.query] Using point lookup with key: ${filterInfo.args[0]}`);
+        yield* this.executePointLookup(String(filterInfo.args[0]));
+      } else if (planType === 3) {
+        // Range query on primary key (plan=3)
+        console.log(`[OptimysticVirtualTable.query] Using range query`);
+        yield* this.executeRangeQuery(filterInfo);
+      } else if (filterInfo.idxNum === 1) {
+        // Legacy: Point lookup on primary key
+        console.log(`[OptimysticVirtualTable.query] Using legacy point lookup`);
         yield* this.executePointLookup(filterInfo.args[0] ? String(filterInfo.args[0]) : '');
       } else if (filterInfo.idxNum === 2) {
-        // Range query on primary key
+        // Legacy: Range query on primary key
+        console.log(`[OptimysticVirtualTable.query] Using legacy range query`);
         yield* this.executeRangeQuery(filterInfo);
       } else if (filterInfo.idxNum >= 10) {
         // Index-based scan
@@ -287,9 +304,11 @@ export class OptimysticVirtualTable extends VirtualTable {
         if (!indexName || typeof indexName !== 'string') {
           throw new Error('Index name not provided for index scan');
         }
+        console.log(`[OptimysticVirtualTable.query] Using index scan on ${indexName}`);
         yield* this.executeIndexScan(indexName, filterInfo.args);
       } else {
         // Full table scan
+        console.log(`[OptimysticVirtualTable.query] Using full table scan`);
         yield* this.executeTableScan();
       }
     } catch (error) {
@@ -300,20 +319,47 @@ export class OptimysticVirtualTable extends VirtualTable {
   }
 
   /**
+   * Parse the plan type from idxStr
+   * Quereus uses format like 'idx=_primary_(0);plan=2'
+   */
+  private parsePlanType(idxStr: string | null): number | undefined {
+    if (!idxStr) return undefined;
+    const match = idxStr.match(/plan=(\d+)/);
+    return match?.[1] ? parseInt(match[1], 10) : undefined;
+  }
+
+  /**
    * Execute a point lookup query
    */
   private async* executePointLookup(key: string): AsyncIterable<Row> {
     if (!this.collection || !this.rowCodec) return;
 
+    // Update from network to get latest data
+    console.log(`[OptimysticVirtualTable.executePointLookup] Looking up key=${key}, collection id=${(this.collection as any).id || 'unknown'}`);
+    console.log(`[OptimysticVirtualTable.executePointLookup] Before update - checking entry...`);
+    const beforePath = await this.collection.find(key);
+    console.log(`[OptimysticVirtualTable.executePointLookup] Before update: path isValid=${this.collection.isValid(beforePath)}`);
+    if (this.collection.isValid(beforePath)) {
+      const beforeEntry = this.collection.at(beforePath);
+      console.log(`[OptimysticVirtualTable.executePointLookup] Before update: entry=${beforeEntry ? 'exists' : 'null'}`);
+    }
+
+    await this.collection.update();
+    console.log(`[OptimysticVirtualTable.executePointLookup] Collection updated`);
+
     const path = await this.collection.find(key);
+    console.log(`[OptimysticVirtualTable.executePointLookup] path=${JSON.stringify(path)}, isValid=${this.collection.isValid(path)}`);
     if (!this.collection.isValid(path)) {
+      console.log(`[OptimysticVirtualTable.executePointLookup] Path is invalid, returning empty`);
       return;
     }
 
     const entry = this.collection.at(path) as [string, any];
+    console.log(`[OptimysticVirtualTable.executePointLookup] entry=${entry ? `[${entry[0]}, ${typeof entry[1]}]` : 'null'}`);
     if (entry && entry.length >= 2) {
       const encodedRow = entry[1];
       const row = this.rowCodec.decodeRow(encodedRow);
+      console.log(`[OptimysticVirtualTable.executePointLookup] Decoded row=${JSON.stringify(row)}`);
       yield row;
     }
   }
@@ -390,43 +436,67 @@ export class OptimysticVirtualTable extends VirtualTable {
   }
 
   /**
-   * Execute a full table scan
+   * Execute a full table scan with retry on path invalidation
+   * In a distributed system, incoming replicated changes can mutate the tree during iteration.
+   * This method handles path invalidation by restarting from the last known key.
    */
   private async* executeTableScan(): AsyncIterable<Row> {
     if (!this.collection || !this.rowCodec) return;
 
-    try {
-      const iterator = this.collection.range(new KeyRange<string>(undefined, undefined, true));
+    // Update from network to get latest data
+    await this.collection.update();
 
-      for await (const path of iterator) {
-        if (!this.collection.isValid(path)) {
+    const maxRetries = 5;
+    let retryCount = 0;
+    let lastKey: string | undefined;
+    const yieldedKeys = new Set<string>();
+
+    while (retryCount < maxRetries) {
+      try {
+        // Create range starting from lastKey (exclusive) if we're retrying
+        const range = lastKey
+          ? new KeyRange<string>({ key: lastKey, inclusive: false }, undefined, true)
+          : new KeyRange<string>(undefined, undefined, true);
+
+        const iterator = this.collection.range(range);
+
+        for await (const path of iterator) {
+          if (!this.collection.isValid(path)) {
+            continue;
+          }
+
+          const entry = this.collection.at(path);
+          if (entry && entry.length >= 2) {
+            const key = entry[0];
+            // Skip if we've already yielded this key (shouldn't happen but safety check)
+            if (yieldedKeys.has(key)) {
+              lastKey = key;
+              continue;
+            }
+
+            const encodedRow = entry[1];
+            const row = this.rowCodec.decodeRow(encodedRow);
+            yieldedKeys.add(key);
+            lastKey = key;
+            yield row;
+          }
+        }
+        // Successfully completed iteration
+        return;
+      } catch (error) {
+        const errorMessage = error instanceof Error ? error.message : String(error);
+        if (errorMessage.includes('Path is invalid due to mutation')) {
+          // Tree was mutated during iteration, retry from last known position
+          retryCount++;
+          if (retryCount >= maxRetries) {
+            throw new Error(`Table scan failed after ${maxRetries} retries due to concurrent mutations`);
+          }
+          // Small delay before retry to let mutations settle
+          await new Promise(resolve => setTimeout(resolve, 50));
           continue;
         }
-
-        const entry = this.collection.at(path);
-        if (entry && entry.length >= 2) {
-          // Entry format: [primaryKey, encodedRow]
-          const encodedRow = entry[1];
-          const row = this.rowCodec.decodeRow(encodedRow);
-          yield row;
-        }
-      }
-    } catch (error) {
-      // Fallback plain ascending iteration if needed
-      const iterator = this.collection.range({ isAscending: true } as any);
-
-      for await (const path of iterator) {
-        if (!this.collection.isValid(path)) {
-          continue;
-        }
-
-        const entry = this.collection.at(path);
-        if (entry && entry.length >= 2) {
-          // Entry format: [primaryKey, encodedRow]
-          const encodedRow = entry[1];
-          const row = this.rowCodec.decodeRow(encodedRow);
-          yield row;
-        }
+        // Re-throw non-mutation errors
+        throw error;
       }
     }
   }
@@ -491,16 +561,31 @@ export class OptimysticVirtualTable extends VirtualTable {
             const newKey = this.rowCodec.extractPrimaryKey(values);
             const encodedRow = this.rowCodec.encodeRow(values);
 
+            console.log(`[OptimysticVirtualTable.update] UPDATE: oldKey=${oldKey}, newKey=${newKey}, values=${JSON.stringify(values)}, oldKeyValues=${JSON.stringify(oldKeyValues)}`);
+
             // Update main table
             if (oldKey !== newKey) {
               // Key changed - delete old, insert new
+              console.log(`[OptimysticVirtualTable.update] Key changed, deleting old and inserting new`);
               await this.collection.replace([
                 [oldKey, undefined],
                 [newKey, [newKey, encodedRow]]
               ]);
             } else {
               // Simple update
+              console.log(`[OptimysticVirtualTable.update] Simple update with key=${newKey}, encodedRow type=${typeof encodedRow}, length=${encodedRow instanceof Uint8Array ? encodedRow.length : (encodedRow as string).length}`);
+              console.log(`[OptimysticVirtualTable.update] Collection id=${(this.collection as any).id || 'unknown'}`);
+              console.log(`[OptimysticVirtualTable.update] Calling collection.replace with key=${newKey}`);
               await this.collection.replace([[newKey, [newKey, encodedRow]]]);
+              console.log(`[OptimysticVirtualTable.update] collection.replace completed`);
+
+              // Verify the entry was added
+              const verifyPath = await this.collection.find(newKey);
+              console.log(`[OptimysticVirtualTable.update] Verify: path isValid=${this.collection.isValid(verifyPath)}`);
+              if (this.collection.isValid(verifyPath)) {
+                const verifyEntry = this.collection.at(verifyPath);
+                console.log(`[OptimysticVirtualTable.update] Verify: entry=${verifyEntry ? 'exists' : 'null'}`);
+              }
             }
 
             // Update all indexes
@@ -705,6 +790,7 @@ export class OptimysticModule implements VirtualTableModule<OptimysticVirtualTab
    */
   private parseTableSchema(tableSchema: TableSchema): ParsedOptimysticOptions {
     const args = tableSchema.vtabArgs || {};
+    console.log(`[OptimysticModule.parseTableSchema] Table: ${tableSchema.name}, vtabArgs: ${JSON.stringify(args)}`);
 
     // Extract collection URI from first positional argument or use default
     const collectionUri = (args['0'] as string) || `tree://default/${tableSchema.name}`;

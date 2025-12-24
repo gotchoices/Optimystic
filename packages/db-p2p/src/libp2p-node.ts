@@ -45,6 +45,7 @@ export type NodeOptions = {
 	clusterPolicy?: {
 		allowDownsize?: boolean;
 		sizeTolerance?: number; // acceptable relative difference (e.g. 0.5 = +/-50%)
+		superMajorityThreshold?: number; // fraction of peers needed for super-majority (default: 0.67)
 	};
 
 	/** Arachnode storage configuration */
@@ -237,7 +238,7 @@ export async function createLibp2pNode(options: NodeOptions): Promise<Libp2p> {
 		createClusterClient,
 		{
 			clusterSize: options.clusterSize ?? 10,
-			superMajorityThreshold: 0.67,  // 2/3 instead of 3/4 - more forgiving for small networks
+			superMajorityThreshold: options.clusterPolicy?.superMajorityThreshold ?? 0.67,
 			simpleMajorityThreshold: 0.51,
 			minAbsoluteClusterSize: 2,     // Allow 2-node clusters for development/small networks
 			allowClusterDownsize: options.clusterPolicy?.allowDownsize ?? true,

@@ -77,7 +77,7 @@ export class CollectionFactory {
   /**
    * Get or create a transactor (with caching)
    */
-  private async getOrCreateTransactor(options: ParsedOptimysticOptions): Promise<ITransactor> {
+  async getOrCreateTransactor(options: ParsedOptimysticOptions): Promise<ITransactor> {
     const transactorKey = this.getTransactorKey(options);
 
     if (this.transactors.has(transactorKey)) {
@@ -99,18 +99,18 @@ export class CollectionFactory {
 
     if (!nodeInfo) {
       // Create a new libp2p node with all necessary services
-      const { createLibp2pNode, Libp2pKeyPeerNetwork, RepoClient } = await import('@optimystic/db-p2p');
+      const { createLibp2pNode } = await import('@optimystic/db-p2p');
 
       const node = await createLibp2pNode({
         port: options.libp2pOptions?.port ?? 0,
         networkName: options.libp2pOptions?.networkName ?? 'optimystic',
         bootstrapNodes: options.libp2pOptions?.bootstrapNodes ?? [],
-        storageType: 'memory', // Use memory storage for now
+        storageType: 'memory',
         fretProfile: 'edge',
-        clusterSize: 1, // Allow single-node clusters
+        clusterSize: 1,
         clusterPolicy: {
           allowDownsize: true,
-          sizeTolerance: 1.0 // Very permissive for single-node testing
+          sizeTolerance: 1.0
         },
         arachnode: {
           enableRingZulu: true
@@ -125,12 +125,6 @@ export class CollectionFactory {
 
       nodeInfo = { node, coordinatedRepo };
       this.libp2pNodes.set(nodeKey, nodeInfo);
-
-      console.log(`✅ Created libp2p node: ${node.peerId.toString()}`);
-      console.log(`📡 Listening on:`);
-      node.getMultiaddrs().forEach((ma) => {
-        console.log(`   ${ma.toString()}`);
-      });
     }
 
     const { node, coordinatedRepo } = nodeInfo;
@@ -282,6 +276,23 @@ export class CollectionFactory {
     const nodeKey = this.getNodeKey(options);
     const nodeInfo = this.libp2pNodes.get(nodeKey);
     return nodeInfo?.node.peerId.toString();
+  }
+
+  /**
+   * Register an existing libp2p node for use by the factory.
+   * This allows tests to inject pre-created nodes instead of having the factory create new ones.
+   */
+  registerLibp2pNode(networkName: string, node: Libp2p, coordinatedRepo: IRepo): void {
+    const nodeKey = `${networkName}:0`; // Use port 0 as default for registered nodes
+    this.libp2pNodes.set(nodeKey, { node, coordinatedRepo });
+  }
+
+  /**
+   * Register an existing transactor for use by the factory.
+   * This allows tests to inject pre-created transactors.
+   */
+  registerTransactor(key: string, transactor: ITransactor): void {
+    this.transactors.set(key, transactor);
   }
 
   /**

@@ -59,6 +59,10 @@ async function createNode(port: number, bootstrapNodes: string[]): Promise<TestN
 		networkName: 'quick-test',
 		storageType: 'memory',
 		fretProfile: 'edge',
+		clusterSize: 3,
+		clusterPolicy: {
+			superMajorityThreshold: 0.51  // Simple majority for small test clusters
+		},
 		arachnode: {
 			enableRingZulu: true
 		}
@@ -131,9 +135,62 @@ async function main() {
 			nodes.push(node);
 		}
 
-		// Wait for network convergence
-		console.log('\n⏳ Waiting for network convergence (3s)...');
-		await delay(3000);
+		// Wait for FRET convergence on all nodes
+		console.log('\n⏳ Waiting for FRET convergence...');
+		const targetPeers = MESH_SIZE - 1; // Each node should know about all other nodes
+		const convergenceTimeout = 30000; // 30 seconds max
+
+		for (let i = 0; i < nodes.length; i++) {
+			const node = nodes[i]!;
+			const fret = (node.node as any).services?.fret;
+			if (!fret || typeof fret.listPeers !== 'function') {
+				console.log(`   Node ${i + 1}: FRET not available, skipping convergence check`);
+				continue;
+			}
+
+			const start = Date.now();
+			let lastCount = 0;
+			while (Date.now() - start < convergenceTimeout) {
+				const peers = fret.listPeers();
+				const count = Array.isArray(peers) ? peers.length : 0;
+				if (count !== lastCount) {
+					console.log(`   Node ${i + 1}: FRET discovered ${count}/${targetPeers} peers`);
+					lastCount = count;
+				}
+				if (count >= targetPeers) {
+					break;
+				}
+				await delay(200);
+			}
+			const finalPeers = fret.listPeers();
+			console.log(`   ✅ Node ${i + 1}: FRET knows ${finalPeers.length} peer(s)`);
+		}
+
+		// Ensure full mesh connectivity - dial all known peers
+		console.log('\n🔗 Ensuring full mesh connectivity...');
+		for (let i = 0; i < nodes.length; i++) {
+			const node = nodes[i]!;
+			for (let j = 0; j < nodes.length; j++) {
+				if (i === j) continue;
+				const targetNode = nodes[j]!;
+				const targetPeerId = targetNode.node.peerId;
+				const existingConns = node.node.getConnections(targetPeerId);
+				if (existingConns.length === 0) {
+					try {
+						const targetAddrs = targetNode.node.getMultiaddrs();
+						if (targetAddrs.length > 0) {
+							await node.node.dial(targetAddrs[0]!);
+							console.log(`   Node ${i + 1} -> Node ${j + 1}: Connected`);
+						}
+					} catch (err) {
+						console.log(`   Node ${i + 1} -> Node ${j + 1}: Failed to connect - ${(err as Error).message}`);
+					}
+				}
+			}
+		}
+
+		// Wait for connections to stabilize
+		await delay(1000);
 
 		// Log connection status
 		console.log('\n📊 Network Status:');

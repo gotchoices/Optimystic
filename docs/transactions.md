@@ -1249,17 +1249,31 @@ export class TransactionValidator {
 ### Phase 7: Integration & Testing
 **Goal**: End-to-end integration and testing
 
+**Implementation**: `packages/quereus-plugin-optimystic/test/distributed-transaction-validation.spec.ts`
+
 **Tasks**:
-- [ ] Integrate TransactionCoordinator with OptimysticModule
-- [ ] Add validation to cluster consensus handlers
-- [ ] End-to-end tests with multiple peers
-- [ ] Test constraint validation across network
-- [ ] Test schema mismatch handling
-- [ ] Test stale read detection
-- [ ] Test multi-collection atomicity
+- [x] Integrate TransactionCoordinator with OptimysticModule (via existing TransactionBridge)
+- [ ] Add validation to cluster consensus handlers (requires full validator integration)
+- [x] End-to-end tests with multiple peers (3-node mesh with FileRawStorage)
+- [x] Test constraint validation across network (CHECK constraints validated on each peer)
+- [ ] Test schema mismatch handling (TODO: requires schema hash comparison in validator)
+- [ ] Test stale read detection (TODO: requires read dependency tracking)
+- [x] Test multi-collection atomicity (table + index collection coordination)
+- [x] Test StampId-based non-repeatability via WITH CONTEXT
+- [x] Fix connection dropout causing self-coordination (retry logic in findCoordinator)
+- [ ] Implement self-coordination guard (see "Coordinator Selection and Network Resilience" section)
 - [ ] Performance testing and optimization
 
-**Deliverable**: Fully functional SQL-validated distributed transactions
+**Test Coverage**:
+- `should validate CHECK constraints independently on each peer` - Verifies constraints enforced everywhere
+- `should enforce non-repeatability using StampId via WITH CONTEXT` - Demonstrates idempotency pattern
+- `should coordinate multi-collection transactions (table + index)` - Tests INSERT/UPDATE/DELETE across collections
+- `should verify file storage persistence across operations` - Confirms FileRawStorage works
+- `should handle concurrent transactions with constraints` - Tests concurrent updates with constraint validation
+
+**Network Resilience Fix**: Added retry logic (3 attempts, 500ms delay) to `findCoordinator()` to handle temporary connection dropouts that were causing nodes to incorrectly self-coordinate.
+
+**Deliverable**: Fully functional SQL-validated distributed transactions (core tests complete, advanced validation pending)
 
 ## Design Decisions
 
@@ -1533,4 +1547,332 @@ const pendRequest: PendRequest = {
 ✅ **Index Consistency**: Index updated atomically with main table
 ✅ **Determinism**: All validators got same result from re-execution
 ✅ **Scalability**: No global transaction log, no single bottleneck
+
+## Coordinator Selection and Network Resilience
+
+### The Coordinator Selection Problem
+
+When a node needs to store or retrieve a block, it must find a coordinator for that block's key. The coordinator is typically chosen from FRET neighbors responsible for that key's position in the DHT. However, network conditions can temporarily disrupt connections, leading to incorrect coordinator selection.
+
+### Current Implementation
+
+The `findCoordinator()` method in `Libp2pKeyPeerNetwork` uses this priority order:
+
+1. **Cache hit**: Return cached coordinator if valid and not excluded
+2. **Connected FRET neighbors**: Prefer FRET neighbors that are currently connected
+3. **Any connected peer**: Fallback to any connected peer
+4. **Self-coordination**: Last resort, select self as coordinator
+
+**Retry Logic**: If no connections are found, retry up to 3 times with 500ms delay before self-selection. This handles temporary connection dropouts.
+
+### Self-Coordination: The Danger
+
+Self-coordination is dangerous because it can lead to:
+- **Data isolation**: Node creates blocks that peers can't discover
+- **Consensus violations**: Writes succeed without quorum
+- **Fork creation**: Parallel "truths" emerge in the network
+
+### Self-Coordination Guard (Design)
+
+We need strict criteria before allowing self-coordination. The principle: **If we've ever seen a larger network, assume our connectivity is the problem, not the network shrinking.**
+
+#### Decision Criteria
+
+```typescript
+interface SelfCoordinationGuard {
+  // Network observation tracking
+  highWaterMark: number;           // Maximum network size ever observed
+  lastConnectedTime: number;       // When we last had connections
+  lastNetworkEstimate: number;     // Most recent network size estimate
+
+  // Thresholds
+  isolationGracePeriod: number;    // Time before allowing self-coord (e.g., 30s)
+  networkShrinkageThreshold: 0.5;  // >50% shrinkage is suspicious
+}
+
+function shouldAllowSelfCoordination(guard: SelfCoordinationGuard): Decision {
+  // Case 1: New/bootstrap node (never seen larger network)
+  if (guard.highWaterMark <= 1) {
+    return { allow: true, reason: 'bootstrap-node' };
+  }
+
+  // Case 2: FRET detects partition
+  if (fret.detectPartition()) {
+    return { allow: false, reason: 'partition-detected' };
+  }
+
+  // Case 3: Suspicious network shrinkage (>50% drop)
+  const shrinkage = 1 - (guard.lastNetworkEstimate / guard.highWaterMark);
+  if (shrinkage > guard.networkShrinkageThreshold) {
+    return { allow: false, reason: 'suspicious-shrinkage' };
+  }
+
+  // Case 4: Recently connected (grace period not elapsed)
+  const timeSinceConnection = Date.now() - guard.lastConnectedTime;
+  if (timeSinceConnection < guard.isolationGracePeriod) {
+    return { allow: false, reason: 'grace-period-not-elapsed' };
+  }
+
+  // Case 5: Extended isolation with gradual shrinkage
+  // Network may have genuinely shrunk over time
+  return { allow: true, reason: 'extended-isolation', warn: true };
+}
+```
+
+#### Integration with FRET
+
+FRET already provides the necessary observability:
+
+- **`getNetworkSizeEstimate()`**: Current network size with confidence
+- **`detectPartition()`**: Detects >50% sudden drop or high churn
+- **`reportNetworkSize()`**: Aggregates observations from peer pings
+- **Ping responses include size estimates**: Peers share their view of network size
+
+#### Implementation Plan
+
+1. **Track high water mark** in `Libp2pKeyPeerNetwork`:
+   ```typescript
+   private networkHighWaterMark = 1;
+   private lastConnectedTime = Date.now();
+   ```
+
+2. **Update on connections**:
+   ```typescript
+   // In connection event handler
+   const estimate = fret.getNetworkSizeEstimate();
+   this.networkHighWaterMark = Math.max(this.networkHighWaterMark, estimate.size_estimate);
+   this.lastConnectedTime = Date.now();
+   ```
+
+3. **Guard self-coordination**:
+   ```typescript
+   // In findCoordinator(), before returning self
+   const decision = this.shouldAllowSelfCoordination();
+   if (!decision.allow) {
+     throw new Error(`Self-coordination blocked: ${decision.reason}`);
+   }
+   if (decision.warn) {
+     this.log.warn('Self-coordination allowed with caution: %s', decision.reason);
+   }
+   ```
+
+4. **Configurable thresholds**:
+   ```typescript
+   interface CoordinatorConfig {
+     selfCoordinationGracePeriod?: number;  // Default: 30000ms
+     networkShrinkageThreshold?: number;    // Default: 0.5
+     allowSelfCoordination?: boolean;       // Default: true (for testing)
+   }
+   ```
+
+### Read vs Write Considerations
+
+Self-coordination risks differ by operation:
+
+| Operation | Risk | Recommendation |
+|-----------|------|----------------|
+| **Read** | Stale data | Allow with warning; client can retry |
+| **Write (new block)** | Orphaned data | Block unless bootstrap node |
+| **Write (existing block)** | Fork creation | Block; require quorum confirmation |
+| **Collection header lookup** | Missing data | Retry with backoff; block self-coord |
+
+The current retry logic (3 attempts, 500ms delay) addresses the common case of temporary connection dropout. The self-coordination guard addresses the rarer case of genuine network partitions.
+
+### Supercluster Nominee Reasonableness (Future)
+
+For multi-collection transactions, nodes receive supercluster nominee lists from the initiating peer. These should be validated:
+
+1. **Size check**: List should be consistent with network size estimates
+2. **Distribution check**: Nominees should span appropriate key ranges
+3. **Connectivity check**: At least some nominees should be reachable
+4. **Cross-validation**: Query a subset of nominees to verify they agree
+
+This prevents malicious or buggy peers from creating artificially small or biased consensus groups.
+
+### Partition Recovery and Reconciliation (Design)
+
+The self-coordination guard prevents *most* partition-isolated writes, but cannot prevent all:
+
+- **Bootstrap nodes**: New nodes starting during partition may legitimately create blocks
+- **Extended isolation**: After grace period, we allow writes with warning
+- **Mid-transaction partitions**: A partition during PEND phase may leave orphaned state
+
+When a partition heals, we need mechanisms to detect divergence and reconcile.
+
+#### The Island Scenario
+
+Consider an "island" - a subset of nodes that becomes isolated from the larger network:
+
+```
+                    PARTITION
+    ┌─────────────────┼─────────────────┐
+    │   Mainland      │     Island      │
+    │   (N nodes)     │   (M nodes)     │
+    │                 │                 │
+    │   Continues     │   May continue  │
+    │   normally      │   if M >= k     │
+    │                 │   (quorum)      │
+    └─────────────────┼─────────────────┘
+                      │
+              After healing...
+                      │
+    ┌─────────────────┴─────────────────┐
+    │         Merged Network            │
+    │   Potentially conflicting state   │
+    │   • Different log tail revisions  │
+    │   • Same action IDs, diff content │
+    │   • Orphaned pending transactions │
+    └───────────────────────────────────┘
+```
+
+If the island had enough nodes to form quorum (k nodes for a cluster), it may have continued committing transactions. These transactions are locally valid but globally problematic.
+
+#### Partition Heal Detection
+
+When a node reconnects to more peers, it should detect the partition heal:
+
+```typescript
+interface PartitionHealEvent {
+  // Our state at time of heal
+  localHighWaterMark: number;
+  localLogTails: Map<CollectionId, { blockId: BlockId, rev: number }>;
+
+  // State observed from reconnected peers
+  networkHighWaterMark: number;
+  peerLogTails: Map<CollectionId, { blockId: BlockId, rev: number }[]>;
+
+  // Classification
+  hadDivergence: boolean;
+  affectedCollections: CollectionId[];
+}
+```
+
+Triggers for heal detection:
+1. Network size estimate jumps significantly (inverse of partition detection)
+2. Connection count increases substantially
+3. Peer announces log tail revision we don't recognize
+
+#### Divergence Classification
+
+When comparing local state to peer state:
+
+| Scenario | Detection | Severity |
+|----------|-----------|----------|
+| **Behind** | Peer has higher rev, we have subset | Low - just sync |
+| **Ahead** | We have higher rev, peer has subset | Medium - we created in isolation |
+| **Forked** | Different content at same rev | High - conflicting transactions |
+| **Orphaned PENDs** | We have PEND that peers never saw | Medium - need cleanup |
+
+#### Reconciliation Strategy
+
+The key insight: **transactions that were created in isolation lack global consensus, even if they had local quorum**. When the island reconnects, it must defer to the mainland's view of history.
+
+**Principle**: The larger partition is authoritative. The smaller partition's isolated transactions become "tentative" and may need replay.
+
+```
+┌────────────────────────────────────────────────────────────┐
+│                  Reconciliation Flow                       │
+├────────────────────────────────────────────────────────────┤
+│                                                            │
+│  1. DETECT: Partition heal observed                        │
+│     └─> Compare log tails with newly-connected peers       │
+│                                                            │
+│  2. CLASSIFY: For each divergent collection                │
+│     ├─> Behind: Normal sync, no conflict                   │
+│     ├─> Ahead (isolated commits): Mark as tentative        │
+│     └─> Forked: Identify conflict point                    │
+│                                                            │
+│  3. RESOLVE: For tentative/forked transactions             │
+│     ├─> Extract logical mutation descriptors               │
+│     ├─> Roll back to last consensus point                  │
+│     ├─> Apply mainland transactions first                  │
+│     └─> Attempt to replay island transactions              │
+│                                                            │
+│  4. REPLAY: Re-execute island transactions                 │
+│     ├─> If valid against new state: Propose as new tx      │
+│     ├─> If conflicts: Queue for user/app resolution        │
+│     └─> If constraint violation: Report failure            │
+│                                                            │
+└────────────────────────────────────────────────────────────┘
+```
+
+#### Extending Conflict Resolution
+
+Current conflict resolution in `StorageRepo.update` handles revision conflicts during normal sync. Partition reconciliation extends this:
+
+**Current (Sync-time)**:
+- Detect revision mismatch
+- Return missing transforms to caller
+- Caller can retry with merged state
+
+**Extended (Partition-recovery)**:
+- Detect divergent history (not just revision gaps)
+- Identify transactions that need replay
+- Preserve logical intent (mutation descriptors) for re-execution
+- Handle multi-collection transactions atomically
+
+The transaction payload format already supports this - we store:
+- `statements`: Logical mutation descriptors (e.g., SQL statements)
+- `actions`: Resulting collection mutations
+
+For replay, we can re-execute the `statements` against the reconciled state, which may produce different `actions` than the original isolated execution.
+
+#### Tentative Transaction States
+
+Transactions created during partition enter a "tentative" state upon heal detection:
+
+```typescript
+interface TentativeTransaction {
+  transactionId: TransactionId;
+  originalActions: Map<BlockId, Action>;
+  statements: TransactionStatement[];  // For replay
+
+  // Resolution tracking
+  status: 'pending-replay' | 'replayed' | 'conflict' | 'abandoned';
+  conflictsWith?: TransactionId[];     // Mainland transactions that conflict
+  replayedAs?: TransactionId;          // New transaction ID if successfully replayed
+}
+```
+
+#### Application-Level Handling
+
+Some conflicts cannot be automatically resolved:
+
+1. **Semantic conflicts**: Two users edited the same row differently
+2. **Constraint violations**: Replayed transaction violates constraints added by mainland
+3. **Ordering dependencies**: Island transaction depends on another island transaction that failed
+
+These require application-level conflict resolution:
+
+```typescript
+interface ConflictResolutionCallback {
+  // Called when automatic replay fails
+  onConflict(
+    tentative: TentativeTransaction,
+    currentState: ReadonlyDatabase,
+    conflictingTransactions: TransactionId[]
+  ): Promise<ConflictResolution>;
+}
+
+type ConflictResolution =
+  | { action: 'abandon' }                           // Discard island transaction
+  | { action: 'force' }                             // Apply anyway (admin override)
+  | { action: 'transform', newStatements: TransactionStatement[] }  // Modified version
+  | { action: 'defer' }                             // Queue for later resolution
+```
+
+#### Implementation Considerations
+
+1. **Orphaned PEND cleanup**: Pending transactions that never committed should timeout after partition heal + grace period
+
+2. **Log tail divergence gossip**: Peers should periodically exchange log tail checksums to detect divergence even without explicit partition detection
+
+3. **Partition history**: Track partition events for debugging and to avoid repeated reconciliation attempts
+
+4. **Consistency levels**: Applications may opt for different partition behavior:
+   - `strict`: Block all writes during suspected partition (current guard behavior)
+   - `available`: Allow writes, queue for reconciliation (needs this recovery mechanism)
+   - `manual`: Allow writes, require explicit reconciliation
+
+This partition recovery system ensures that even if isolated writes occur, the network can eventually converge to a consistent state while preserving as much work as possible.
 

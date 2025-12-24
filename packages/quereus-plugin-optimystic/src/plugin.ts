@@ -56,6 +56,9 @@ export default function register(db: Database, config: Record<string, SqlValue> 
 			},
 		],
 		collations: [],
+		// Expose internal components for testing and advanced usage
+		collectionFactory,
+		txnBridge,
 	};
 }
 

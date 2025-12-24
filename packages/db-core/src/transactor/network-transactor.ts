@@ -55,13 +55,27 @@ export class NetworkTransactor implements ITransactor {
 			error = e as Error;
 		}
 
-		// Second-chance retry: ONLY if batch failed to respond (not if it responded with "not found")
-		// A response of { blockId: null } is valid and means the block doesn't exist
+		// Second-chance retry: if batch failed to respond OR responded with "not found"
+		// Different cluster members may have different views; retry with other coordinators
 		const hasValidResponse = (b: CoordinatorBatch<BlockId[], GetBlockResults>) => {
 			return b.request?.isResponse === true && b.request.response != null;
 		};
 
-		const retryable = Array.from(allBatches(batches)).filter(b => !hasValidResponse(b as any)) as CoordinatorBatch<BlockId[], GetBlockResults>[];
+		const hasBlockInResponse = (b: CoordinatorBatch<BlockId[], GetBlockResults>) => {
+			if (!hasValidResponse(b)) return false;
+			const resp = b.request!.response! as GetBlockResults;
+			return b.payload.some(bid => {
+				const entry = resp[bid];
+				return entry && typeof entry === 'object' && 'block' in entry && entry.block != null;
+			});
+		};
+
+		// Retry batches that either failed to respond OR responded with "not found"
+		// This provides tolerance for different cluster member views
+		const retryable = Array.from(allBatches(batches)).filter(b =>
+			!hasValidResponse(b as any) || !hasBlockInResponse(b as any)
+		) as CoordinatorBatch<BlockId[], GetBlockResults>[];
+
 		if (retryable.length > 0 && Date.now() < expiration) {
 			try {
 				const excludedByRoot = new Map<CoordinatorBatch<BlockId[], GetBlockResults>, Set<PeerId>>();

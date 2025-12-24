@@ -3,7 +3,8 @@
  */
 
 import { expect } from 'aegir/chai';
-import { Database, SqlValue } from '@quereus/quereus';
+import { Database } from '@quereus/quereus';
+import type { SqlValue } from '@quereus/quereus';
 import register from '../dist/plugin.js';
 
 type Row = Record<string, SqlValue>;

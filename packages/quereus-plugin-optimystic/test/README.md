@@ -27,7 +27,23 @@ node packages/quereus-plugin-optimystic/dist/test/manual-mesh-test.js
 ### Distributed Tests
 
 - **`distributed-quereus.spec.ts`** - Automated distributed operations tests (4 tests)
+- **`distributed-transaction-validation.spec.ts`** - Transaction validation tests with file storage (5 tests)
 - **`manual-mesh-test.ts`** - Interactive manual testing script
+
+### Transaction Validation Tests (Phase 7)
+
+The `distributed-transaction-validation.spec.ts` suite tests end-to-end distributed transactions with:
+
+- **Real file storage** (`FileRawStorage`) instead of memory
+- **CHECK constraint validation** independently on each peer
+- **StampId-based non-repeatability** via `WITH CONTEXT`
+- **Multi-collection transactions** (table + index coordination)
+- **Concurrent transactions** with constraint enforcement
+
+```bash
+# Run transaction validation tests
+yarn workspace @optimystic/quereus-plugin-optimystic exec aegir test -t node -- --grep "Transaction Validation"
+```
 
 ## Distributed Testing
 

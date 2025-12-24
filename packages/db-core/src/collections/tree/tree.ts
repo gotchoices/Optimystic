@@ -56,6 +56,14 @@ export class Tree<TKey, TEntry> {
 			await this.collection.updateAndSync();
 	}
 
+	/**
+	 * Update the local state from the network.
+	 * Call this before reading to ensure you have the latest data.
+	 */
+	async update(): Promise<void> {
+		await this.collection.update();
+	}
+
 	// Read actions
 
 	async first(): Promise<Path<TKey, TEntry>> {

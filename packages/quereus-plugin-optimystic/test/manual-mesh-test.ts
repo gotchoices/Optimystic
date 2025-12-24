@@ -7,7 +7,8 @@
  *   MESH_SIZE=3 node dist/test/manual-mesh-test.js
  */
 
-import { Database, SqlValue } from '@quereus/quereus';
+import { Database } from '@quereus/quereus';
+import type { SqlValue } from '@quereus/quereus';
 import {
 	createLibp2pNode,
 	Libp2pKeyPeerNetwork,

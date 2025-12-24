@@ -62,13 +62,17 @@ export class TransactionBridge {
    *
    * If transaction mode is enabled, creates a TransactionSession for
    * distributed consensus. Otherwise, uses legacy direct sync mode.
+   *
+   * Following SQLite semantics: if a transaction is already active,
+   * this is a no-op and returns the existing transaction.
    */
   async beginTransaction(options: ParsedOptimysticOptions): Promise<TransactionState> {
     if (this.currentTransaction?.isActive) {
-      throw new Error('Transaction already active');
+      // Already in transaction - SQLite semantics: BEGIN is a no-op
+      return this.currentTransaction;
     }
 
-    const transactor = await this.collectionFactory.createTransactor(options);
+    const transactor = await this.collectionFactory.getOrCreateTransactor(options);
     const peerId = this.collectionFactory.getPeerId(options);
 
     // Clear any previously accumulated statements
@@ -164,8 +168,10 @@ export class TransactionBridge {
     this.accumulatedStatements = [];
     this.session = null;
 
-    // Clear the collection factory cache to force fresh collections
-    this.collectionFactory.clearCache();
+    // Note: We intentionally do NOT clear the collection factory cache here.
+    // The transactor cache contains pre-registered transactors that should persist
+    // across transactions. Clearing them would cause the factory to create new
+    // disconnected transactors instead of using the registered ones.
   }
 
   /**
