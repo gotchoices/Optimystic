@@ -87,6 +87,10 @@ export class BTree<TKey, TEntry> {
 		const endPath = range.last
 			? await this.findLast(range)
 			: (range.isAscending ? await this.last() : await this.first());
+		// If the tree is empty or endPath is not on an entry, return early
+		if (!endPath.on) {
+			return;
+		}
 		const endKey = this.keyFromPath(endPath);
 		const iterable = range.isAscending
 			? this.internalAscending(startPath)
@@ -94,7 +98,7 @@ export class BTree<TKey, TEntry> {
 		const iter = iterable[Symbol.asyncIterator]();
 		const ascendingFactor = range.isAscending ? 1 : -1;
 		for await (let path of iter) {
-			if (!path.on || !endPath.on || this.compare(
+			if (!path.on || this.compare(
 				this.keyFromPath(path),
 				endKey
 			) * ascendingFactor > 0) {

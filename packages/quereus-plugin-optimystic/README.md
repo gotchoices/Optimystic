@@ -347,7 +347,7 @@ npm run build
 node dist/test/manual-mesh-test.js
 ```
 
-See [test/TESTING.md](./test/TESTING.md) for detailed testing documentation.
+See [test/README.md](./test/README.md) for detailed testing documentation.
 
 ## License
 

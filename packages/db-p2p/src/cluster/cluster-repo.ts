@@ -1,4 +1,4 @@
-import type { IRepo, ClusterRecord, Signature, RepoMessage } from "@optimystic/db-core";
+import type { IRepo, ClusterRecord, Signature, RepoMessage, ITransactionValidator } from "@optimystic/db-core";
 import type { ICluster } from "@optimystic/db-core";
 import type { IPeerNetwork } from "@optimystic/db-core";
 import { blockIdsForTransforms } from "@optimystic/db-core";
@@ -37,10 +37,19 @@ interface ClusterMemberComponents {
 	protocolPrefix?: string;
 	partitionDetector?: PartitionDetector;
 	fretService?: FretService;
+	validator?: ITransactionValidator;
 }
 
 export function clusterMember(components: ClusterMemberComponents): ClusterMember {
-	return new ClusterMember(components.storageRepo, components.peerNetwork, components.peerId, components.protocolPrefix, components.partitionDetector, components.fretService);
+	return new ClusterMember(
+		components.storageRepo,
+		components.peerNetwork,
+		components.peerId,
+		components.protocolPrefix,
+		components.partitionDetector,
+		components.fretService,
+		components.validator
+	);
 }
 
 /**
@@ -61,7 +70,8 @@ export class ClusterMember implements ICluster {
 		private readonly peerId: PeerId,
 		private readonly protocolPrefix?: string,
 		private readonly partitionDetector?: PartitionDetector,
-		private readonly fretService?: FretService
+		private readonly fretService?: FretService,
+		private readonly validator?: ITransactionValidator
 	) {
 		// Periodically clean up expired transactions
 		setInterval(() => this.queueExpiredTransactions(), 60000);
@@ -372,10 +382,19 @@ export class ClusterMember implements ICluster {
 	}
 
 	private async handlePromiseNeeded(record: ClusterRecord): Promise<ClusterRecord> {
-		const signature: Signature = {
-			type: 'approve',
-			signature: 'approved' // TODO: Actually sign the promise hash
-		};
+		// Validate pend operations if we have a validator
+		const validationResult = await this.validatePendOperations(record);
+
+		const signature: Signature = validationResult.valid
+			? { type: 'approve', signature: 'approved' }
+			: { type: 'reject', signature: 'rejected', rejectReason: validationResult.reason };
+
+		if (!validationResult.valid) {
+			log('cluster-member:validation-rejected', {
+				messageHash: record.messageHash,
+				reason: validationResult.reason
+			});
+		}
 
 		return {
 			...record,
@@ -384,6 +403,32 @@ export class ClusterMember implements ICluster {
 				[this.peerId.toString()]: signature
 			}
 		};
+	}
+
+	/**
+	 * Validates pend operations in a cluster record using the transaction validator.
+	 * Returns success if no validator is configured (backwards compatibility).
+	 */
+	private async validatePendOperations(record: ClusterRecord): Promise<{ valid: boolean; reason?: string }> {
+		if (!this.validator) {
+			return { valid: true };
+		}
+
+		// Find pend operations in the message
+		for (const operation of record.message.operations) {
+			if ('pend' in operation) {
+				const pendRequest = operation.pend;
+				// Only validate if we have a transaction and operationsHash
+				if (pendRequest.transaction && pendRequest.operationsHash) {
+					const result = await this.validator.validate(pendRequest.transaction, pendRequest.operationsHash);
+					if (!result.valid) {
+						return { valid: false, reason: result.reason };
+					}
+				}
+			}
+		}
+
+		return { valid: true };
 	}
 
 	private async handleCommitNeeded(record: ClusterRecord): Promise<ClusterRecord> {

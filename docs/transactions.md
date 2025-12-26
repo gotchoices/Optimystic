@@ -1253,14 +1253,18 @@ export class TransactionValidator {
 
 **Tasks**:
 - [x] Integrate TransactionCoordinator with OptimysticModule (via existing TransactionBridge)
-- [ ] Add validation to cluster consensus handlers (requires full validator integration)
+- [x] Add validation to cluster consensus handlers (TransactionValidator integrated into ClusterMember)
 - [x] End-to-end tests with multiple peers (3-node mesh with FileRawStorage)
 - [x] Test constraint validation across network (CHECK constraints validated on each peer)
-- [ ] Test schema mismatch handling (TODO: requires schema hash comparison in validator)
+- [x] Test local schema enforcement (column visibility based on local schema)
+- [x] Test schema hash mismatch rejection (TransactionValidator rejects mismatched schema hashes)
 - [ ] Test stale read detection (TODO: requires read dependency tracking)
 - [x] Test multi-collection atomicity (table + index collection coordination)
 - [x] Test StampId-based non-repeatability via WITH CONTEXT
 - [x] Fix connection dropout causing self-coordination (retry logic in findCoordinator)
+- [x] Add early abort for rejection super-minority (ClusterCoordinator aborts when rejections exceed threshold)
+- [x] Upgrade QuereusEngine schema hash to SHA-256 (using @noble/hashes)
+- [x] Add validator option to createLibp2pNode (passes through to ClusterMember)
 - [ ] Implement self-coordination guard (see "Coordinator Selection and Network Resilience" section)
 - [ ] Performance testing and optimization
 
@@ -1269,7 +1273,8 @@ export class TransactionValidator {
 - `should enforce non-repeatability using StampId via WITH CONTEXT` - Demonstrates idempotency pattern
 - `should coordinate multi-collection transactions (table + index)` - Tests INSERT/UPDATE/DELETE across collections
 - `should verify file storage persistence across operations` - Confirms FileRawStorage works
-- `should handle concurrent transactions with constraints` - Tests concurrent updates with constraint validation
+- `should handle sequential transactions with constraints from multiple nodes` - Tests sequential updates with CHECK constraint validation
+- `should demonstrate local schema enforcement (column visibility)` - Verifies local schema filters columns from replicated data
 
 **Network Resilience Fix**: Added retry logic (3 attempts, 500ms delay) to `findCoordinator()` to handle temporary connection dropouts that were causing nodes to incorrectly self-coordinate.
 

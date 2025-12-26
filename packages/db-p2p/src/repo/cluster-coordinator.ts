@@ -200,18 +200,42 @@ export class ClusterCoordinator {
 		// Collect promises with super-majority requirement
 		const promised = await this.collectPromises(peers, record);
 		const superMajority = Math.ceil(peerCount * this.cfg.superMajorityThreshold);
-		const promiseCount = Object.keys(promised.record.promises).length;
 
-		if (peerCount > 1 && promiseCount < superMajority) {
+		// Count approvals and rejections separately
+		const promises = promised.record.promises;
+		const approvalCount = Object.values(promises).filter(sig => sig.type === 'approve').length;
+		const rejectionCount = Object.values(promises).filter(sig => sig.type === 'reject').length;
+
+		// Check if rejections make super-majority impossible
+		// If more than (peerCount - superMajority) nodes reject, we can never reach super-majority
+		const maxAllowedRejections = peerCount - superMajority;
+		if (rejectionCount > maxAllowedRejections) {
+			const rejectReasons = Object.entries(promises)
+				.filter(([_, sig]) => sig.type === 'reject')
+				.map(([peerId, sig]) => `${peerId}: ${sig.rejectReason ?? 'unknown'}`)
+				.join('; ');
+			log('cluster-tx:rejected-by-validators', {
+				messageHash: record.messageHash,
+				peerCount,
+				rejections: rejectionCount,
+				maxAllowed: maxAllowedRejections,
+				reasons: rejectReasons
+			});
+			this.updateTransactionRecord(promised.record, 'rejected-by-validators');
+			throw new Error(`Transaction rejected by validators (${rejectionCount}/${peerCount} rejected): ${rejectReasons}`);
+		}
+
+		if (peerCount > 1 && approvalCount < superMajority) {
 			log('cluster-tx:supermajority-failed', {
 				messageHash: record.messageHash,
 				peerCount,
-				promises: promiseCount,
+				approvals: approvalCount,
+				rejections: rejectionCount,
 				superMajority,
 				threshold: this.cfg.superMajorityThreshold
 			});
 			this.updateTransactionRecord(promised.record, 'supermajority-failed');
-			throw new Error(`Failed to get super-majority: ${promiseCount}/${peerCount} (needed ${superMajority})`);
+			throw new Error(`Failed to get super-majority: ${approvalCount}/${peerCount} approvals (needed ${superMajority}, ${rejectionCount} rejections)`);
 		}
 
 		return await this.commitTransaction(promised.record);

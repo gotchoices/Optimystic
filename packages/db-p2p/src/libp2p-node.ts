@@ -18,7 +18,7 @@ import { clusterMember } from './cluster/cluster-repo.js';
 import { coordinatorRepo } from './repo/coordinator-repo.js';
 import { Libp2pKeyPeerNetwork } from './libp2p-key-network.js';
 import { ClusterClient } from './cluster/client.js';
-import type { IRepo, ICluster } from '@optimystic/db-core';
+import type { IRepo, ICluster, ITransactionValidator } from '@optimystic/db-core';
 import { multiaddr } from '@multiformats/multiaddr';
 import { networkManagerService } from './network/network-manager-service.js';
 import { fretService, Libp2pFretService } from '@optimystic/fret';
@@ -53,6 +53,9 @@ export type NodeOptions = {
 		enableRingZulu?: boolean; // default: true
 		storage?: StorageMonitorConfig;
 	};
+
+	/** Transaction validator for cluster consensus */
+	validator?: ITransactionValidator;
 };
 
 export async function createLibp2pNode(options: NodeOptions): Promise<Libp2p> {
@@ -230,7 +233,8 @@ export async function createLibp2pNode(options: NodeOptions): Promise<Libp2p> {
 		peerId: node.peerId,
 		protocolPrefix,
 		partitionDetector,
-		fretService: fretSvc
+		fretService: fretSvc,
+		validator: options.validator
 	});
 
 	const coordinatorRepoFactory = coordinatorRepo(

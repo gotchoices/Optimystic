@@ -31,19 +31,6 @@ export class ProtocolClient {
 					for await (const data of source) {
 						const decoded = new TextDecoder().decode(data.subarray());
 						const parsed = JSON.parse(decoded);
-						// Debug logging for cluster responses
-						if (protocol.includes('/cluster/')) {
-							console.log('[ProtocolClient] Received response:', {
-								messageHash: (parsed as any)?.messageHash,
-								hasPromisesField: 'promises' in (parsed ?? {}),
-								hasCommitsField: 'commits' in (parsed ?? {}),
-								promisesType: typeof (parsed as any)?.promises,
-								commitsType: typeof (parsed as any)?.commits,
-								promiseKeys: Object.keys((parsed as any)?.promises ?? {}),
-								commitKeys: Object.keys((parsed as any)?.commits ?? {}),
-								fullResponse: JSON.stringify(parsed).substring(0, 200)
-							});
-						}
 						yield parsed;
 					}
 				}

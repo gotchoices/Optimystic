@@ -6,6 +6,7 @@ import type {
 	CollectionActions,
 	TransactionCoordinator
 } from '@optimystic/db-core';
+import { sha256 } from '@noble/hashes/sha256';
 
 /**
  * Engine ID for Quereus SQL transactions.
@@ -123,7 +124,7 @@ export class QuereusEngine implements ITransactionEngine {
 	 * Compute the schema hash from the database catalog.
 	 *
 	 * Uses the schema() table-valued function to get schema information,
-	 * then hashes the canonical representation.
+	 * then hashes the canonical representation using SHA-256.
 	 */
 	private async computeSchemaHash(): Promise<string> {
 		// Query schema information from Quereus
@@ -140,23 +141,20 @@ export class QuereusEngine implements ITransactionEngine {
 		// Serialize to canonical JSON
 		const catalogJson = JSON.stringify(schemaInfo);
 
-		// Compute hash using simple string hash (FNV-1a style)
-		const hash = this.hashString(catalogJson);
-		return `schema:${hash}`;
+		// Compute SHA-256 hash using @noble/hashes
+		const hashBytes = sha256(new TextEncoder().encode(catalogJson));
+		// Use first 16 bytes encoded as base64url for compact representation
+		const hashBase64 = bytesToBase64url(hashBytes.slice(0, 16));
+		return `schema:${hashBase64}`;
 	}
+}
 
-	/**
-	 * Simple string hash function (FNV-1a inspired).
-	 * Returns a base36 encoded hash string.
-	 */
-	private hashString(str: string): string {
-		let hash = 0x811c9dc5; // FNV offset basis (32-bit)
-		for (let i = 0; i < str.length; i++) {
-			hash ^= str.charCodeAt(i);
-			hash = (hash * 0x01000193) >>> 0; // FNV prime, keep as unsigned 32-bit
-		}
-		return hash.toString(36);
-	}
+/**
+ * Convert bytes to base64url encoding (URL-safe, no padding).
+ */
+function bytesToBase64url(bytes: Uint8Array): string {
+	const base64 = btoa(String.fromCharCode(...bytes));
+	return base64.replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
 }
 
 /**

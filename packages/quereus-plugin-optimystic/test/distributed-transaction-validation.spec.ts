@@ -393,14 +393,15 @@ describe('Distributed Transaction Validation', () => {
 
 		console.log(`\n📝 Test: Sequential transactions with constraints for "${tableName}"`);
 
-		// Create table on Node 1 first
+		// Create table on Node 1 first (with CHECK constraint for non-negative balance)
 		await nodes[0]!.db.exec(`
 			CREATE TABLE ${tableName} (
 				account_id TEXT PRIMARY KEY,
-				balance INTEGER
+				balance INTEGER,
+				CONSTRAINT non_negative CHECK (balance >= 0)
 			) USING optimystic('${collectionUri}', transactor='network', networkName='${NETWORK_NAME}')
 		`);
-		console.log('   Node 1: Table created');
+		console.log('   Node 1: Table created with CHECK constraint');
 
 		// Wait for collection to be available on the network
 		await delay(2000);
@@ -410,15 +411,16 @@ describe('Distributed Transaction Validation', () => {
 		console.log('✅ Initial balance created on Node 1');
 		await delay(2000);
 
-		// Create table on other nodes
+		// Create table on other nodes (with matching CHECK constraint)
 		for (let i = 1; i < nodes.length; i++) {
 			await nodes[i]!.db.exec(`
 				CREATE TABLE ${tableName} (
 					account_id TEXT PRIMARY KEY,
-					balance INTEGER
+					balance INTEGER,
+					CONSTRAINT non_negative CHECK (balance >= 0)
 				) USING optimystic('${collectionUri}', transactor='network', networkName='${NETWORK_NAME}')
 			`);
-			console.log(`   Node ${i + 1}: Table created`);
+			console.log(`   Node ${i + 1}: Table created with CHECK constraint`);
 			await delay(1000);
 		}
 		await delay(2000);
@@ -479,6 +481,74 @@ describe('Distributed Transaction Validation', () => {
 		}
 		expect(constraintViolated, 'Negative balance should fail constraint').to.be.true;
 		console.log('✅ Constraint violation correctly rejected');
+	});
+
+	it('should demonstrate local schema enforcement (column visibility)', async () => {
+		// Wait for FRET layer to stabilize
+		console.log('\n⏳ Waiting for FRET layer to stabilize...');
+		await delay(5000);
+
+		const tableName = 'schema_local_' + Date.now();
+		const collectionUri = `tree://test/${tableName}`;
+
+		console.log(`\n📝 Test: Local schema enforcement for "${tableName}"`);
+
+		// Create table on Node 1 with EXTRA column
+		await nodes[0]!.db.exec(`
+			CREATE TABLE ${tableName} (
+				id TEXT PRIMARY KEY,
+				name TEXT NOT NULL,
+				extra_field TEXT
+			) USING optimystic('${collectionUri}', transactor='network', networkName='${NETWORK_NAME}')
+		`);
+		console.log('   Node 1: Table created WITH extra_field column');
+
+		await delay(2000);
+
+		// Create table on Node 2 WITHOUT extra column
+		await nodes[1]!.db.exec(`
+			CREATE TABLE ${tableName} (
+				id TEXT PRIMARY KEY,
+				name TEXT NOT NULL
+			) USING optimystic('${collectionUri}', transactor='network', networkName='${NETWORK_NAME}')
+		`);
+		console.log('   Node 2: Table created WITHOUT extra_field column');
+
+		await delay(2000);
+
+		// Insert from Node 1 (uses extra_field)
+		await nodes[0]!.db.exec(
+			`INSERT INTO ${tableName} (id, name, extra_field) VALUES ('1', 'Alice', 'extra_value')`
+		);
+		console.log('✅ Insert with extra_field succeeded on Node 1');
+		await delay(3000);
+
+		// Query from Node 1 - should see the extra field
+		const row1 = await nodes[0]!.db.prepare(`SELECT * FROM ${tableName} WHERE id = '1'`).get();
+		expect(row1, 'Node 1 should see the row').to.exist;
+		expect(row1.extra_field).to.equal('extra_value');
+		console.log('   Node 1: Sees extra_field = "extra_value"');
+
+		// Query from Node 2 - the underlying data has extra_field but schema doesn't
+		// Local schema determines what columns are visible in SELECT *
+		const row2 = await nodes[1]!.db.prepare(`SELECT * FROM ${tableName} WHERE id = '1'`).get();
+		expect(row2, 'Node 2 should see the row').to.exist;
+		expect(row2.name).to.equal('Alice');
+		// Node 2's schema doesn't include extra_field, so it won't be in SELECT *
+		console.log(`   Node 2: Row data = ${JSON.stringify(row2)}`);
+
+		// Verify that extra_field is NOT visible on Node 2 (local schema enforcement)
+		expect(row2.extra_field, 'Node 2 should NOT see extra_field').to.be.undefined;
+		console.log('✅ Local schema correctly filters columns (extra_field not visible on Node 2)');
+
+		// NOTE: This test demonstrates LOCAL schema enforcement.
+		// Each node's schema determines what columns are visible in queries.
+		// The underlying data may contain additional fields, but they are filtered
+		// by the local schema during query execution.
+		//
+		// Future work: TransactionValidator integration will reject transactions
+		// where stamp.schemaHash doesn't match local schema during PEND phase.
+		// See docs/transactions.md Phase 7 task: "Add validation to cluster consensus handlers"
 	});
 
 	async function createNode(port: number, bootstrapNodes: string[], index: number): Promise<TestNode> {

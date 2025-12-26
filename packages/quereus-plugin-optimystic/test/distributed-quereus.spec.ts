@@ -297,8 +297,9 @@ describe('Distributed Quereus Operations', () => {
 		await nodes[0]!.db.exec(`
 			INSERT INTO ${tableName} VALUES ('1', 'Keep'), ('2', 'Delete'), ('3', 'Keep')
 		`);
+		console.log('   Inserted 3 rows on Node 1');
 
-		await delay(1000);
+		await delay(2000);
 
 		// Create table on other nodes
 		for (let i = 1; i < nodes.length; i++) {
@@ -308,14 +309,30 @@ describe('Distributed Quereus Operations', () => {
 					data TEXT
 				) USING optimystic('${collectionUri}', transactor='network', networkName='${NETWORK_NAME}')
 			`);
+			console.log(`   Created table on Node ${i + 1}`);
+			await delay(1000);
 		}
 
-		await delay(1000);
+		await delay(2000);
+
+		// Verify initial data replicated before deleting
+		console.log('\nVerifying initial data on all nodes before DELETE...');
+		for (let i = 0; i < nodes.length; i++) {
+			const stmt = await nodes[i]!.db.prepare(`SELECT * FROM ${tableName} ORDER BY id`);
+			const results = [];
+			for await (const row of stmt.all()) {
+				results.push(row);
+			}
+			await stmt.finalize();
+			console.log(`   Node ${i + 1}: ${results.length} rows - ${JSON.stringify(results.map(r => r.id))}`);
+			expect(results.length, `Node ${i + 1} should have 3 rows before DELETE`).to.equal(3);
+		}
 
 		// Delete from node 3
 		console.log('\nDeleting row from Node 3...');
 		await nodes[2]!.db.exec(`DELETE FROM ${tableName} WHERE id = '2'`);
-		await delay(1500);
+		console.log('   DELETE executed');
+		await delay(3000);
 
 		// Verify deletion on all nodes
 		console.log('Verifying deletion on all nodes...');
@@ -326,7 +343,7 @@ describe('Distributed Quereus Operations', () => {
 				results.push(row);
 			}
 			await stmt.finalize();
-			console.log(`   Node ${i + 1}: ${results.length} rows`);
+			console.log(`   Node ${i + 1}: ${results.length} rows - ${JSON.stringify(results.map(r => r.id))}`);
 
 			expect(results.length, `Node ${i + 1} should have 2 rows`).to.equal(2);
 			expect(results[0]!.id).to.equal('1');
