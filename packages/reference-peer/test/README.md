@@ -1,4 +1,4 @@
-# Test Peer Automated Tests
+# Reference Peer Automated Tests
 
 This directory contains automated tests for debugging the distributed diary operations across a mesh of nodes.
 
@@ -10,13 +10,13 @@ The `quick-test.ts` provides a standalone script that creates a 3-node mesh and 
 
 ```bash
 # Build first
-yarn workspace @optimystic/test-peer build
+yarn workspace @optimystic/reference-peer build
 
 # Run the test
-yarn workspace @optimystic/test-peer test:quick
+yarn workspace @optimystic/reference-peer test:quick
 
 # Run with debugging enabled
-yarn workspace @optimystic/test-peer test:quick:debug
+yarn workspace @optimystic/reference-peer test:quick:debug
 ```
 
 ### What the Quick Test Does
@@ -41,13 +41,13 @@ The `distributed-diary.spec.ts` provides a comprehensive test suite using Node.j
 
 ```bash
 # Build first
-yarn workspace @optimystic/test-peer build
+yarn workspace @optimystic/reference-peer build
 
 # Run all tests
-yarn workspace @optimystic/test-peer test:node
+yarn workspace @optimystic/reference-peer test:node
 
 # Run specific test
-yarn workspace @optimystic/test-peer test:node -- --test-name-pattern "should distribute diary entries"
+yarn workspace @optimystic/reference-peer test:node -- --test-name-pattern "should distribute diary entries"
 ```
 
 ### Test Cases
@@ -90,7 +90,7 @@ Three debug configurations are available in `.vscode/launch.json`:
 ### Set Breakpoints
 
 Common places to set breakpoints:
-- `packages/test-peer/src/cli.ts` - `createDiary()`, `addEntry()`
+- `packages/reference-peer/src/cli.ts` - `createDiary()`, `addEntry()`
 - `packages/db-core/src/collections/diary.ts` - `append()`, `select()`
 - `packages/db-core/src/transactor/network-transactor.ts` - `pend()`, `commit()`
 - `packages/db-p2p/src/storage/storage-repo.ts` - Storage operations
@@ -101,13 +101,13 @@ Set the `DEBUG` environment variable:
 
 ```bash
 # All optimystic logs
-DEBUG=optimystic:*,db-p2p:* yarn workspace @optimystic/test-peer test:quick
+DEBUG=optimystic:*,db-p2p:* yarn workspace @optimystic/reference-peer test:quick
 
 # Specific subsystems
-DEBUG=db-p2p:repo-service,db-p2p:cluster-service yarn workspace @optimystic/test-peer test:quick
+DEBUG=db-p2p:repo-service,db-p2p:cluster-service yarn workspace @optimystic/reference-peer test:quick
 
 # Include libp2p connection logs
-DEBUG=optimystic:*,libp2p:connection-manager yarn workspace @optimystic/test-peer test:quick
+DEBUG=optimystic:*,libp2p:connection-manager yarn workspace @optimystic/reference-peer test:quick
 ```
 
 ### Watch for Common Issues
@@ -134,8 +134,8 @@ TestNode (per node)
 
 1. Make code changes in `packages/db-core` or `packages/db-p2p`
 2. Build: `yarn workspace @optimystic/db-p2p build`
-3. Build test-peer: `yarn workspace @optimystic/test-peer build`
-4. Run quick test: `yarn workspace @optimystic/test-peer test:quick`
+3. Build reference-peer: `yarn workspace @optimystic/reference-peer build`
+4. Run quick test: `yarn workspace @optimystic/reference-peer test:quick`
 5. Set breakpoints and debug in VS Code
 
 ## Verifying Storage Distribution
@@ -174,7 +174,7 @@ Look for console output like:
 ### Build errors
 - Run `yarn install` in workspace root
 - Build dependencies first: `yarn workspace @optimystic/db-core build`
-- Clean and rebuild: `yarn workspace @optimystic/test-peer clean && yarn workspace @optimystic/test-peer build`
+- Clean and rebuild: `yarn workspace @optimystic/reference-peer clean && yarn workspace @optimystic/reference-peer build`
 
 
 

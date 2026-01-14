@@ -298,7 +298,7 @@ const rawStorage = new FileRawStorage('./test-data/node-' + port);
 
 ## Related Files
 
-- `packages/test-peer/test/distributed-diary.spec.ts` - Similar tests for Diary (lower-level)
+- `packages/reference-peer/test/distributed-diary.spec.ts` - Similar tests for Diary (lower-level)
 - `packages/quereus-plugin-optimystic/examples/` - Example configs for manual testing
 - `TEST-SETUP-SUMMARY.md` - Overview of test infrastructure
 

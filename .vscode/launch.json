@@ -7,7 +7,7 @@
       "name": "Optimystic: Start Mesh (N=3) then Debug Peer",
       "runtimeExecutable": "node",
       "runtimeArgs": [
-        "packages/test-peer/dist/src/mesh.js"
+        "packages/reference-peer/dist/src/mesh.js"
       ],
       "cwd": "${workspaceFolder}",
       "env": {
@@ -21,10 +21,10 @@
       "type": "node",
       "request": "launch",
       "name": "Optimystic: Debug Interactive Peer (bootstraps to mesh)",
-      "program": "${workspaceFolder}/packages/test-peer/dist/src/cli.js",
+      "program": "${workspaceFolder}/packages/reference-peer/dist/src/cli.js",
       "args": [
         "interactive",
-        "--network", "optimystic-test",
+        "--network", "optimystic",
         "--bootstrap-file", "${workspaceFolder}/.mesh"
       ],
       "cwd": "${workspaceFolder}",
@@ -57,7 +57,7 @@
       "type": "node",
       "request": "launch",
       "name": "Debug Quick Test (3-node mesh)",
-      "program": "${workspaceFolder}/packages/test-peer/dist/test/quick-test.js",
+      "program": "${workspaceFolder}/packages/reference-peer/dist/test/quick-test.js",
       "cwd": "${workspaceFolder}",
       "env": {
         "DEBUG": "optimystic:*,db-p2p:*"
@@ -73,7 +73,7 @@
       "type": "node",
       "request": "launch",
       "name": "Debug Test Peer Tests",
-      "cwd": "${workspaceFolder}/packages/test-peer",
+      "cwd": "${workspaceFolder}/packages/reference-peer",
       "program": "${workspaceFolder}/node_modules/aegir/src/index.js",
       "args": [
         "test",

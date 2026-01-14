@@ -23,7 +23,7 @@
     "lint": "aegir lint",
     "test": "aegir test",
     "test:node": "aegir test -t node",
-		"prove": "node --loader ts-node/esm test/test.ts",
+    "prove": "node --loader ts-node/esm test/test.ts",
     "dep-check": "aegir dep-check"
   },
   "devDependencies": {

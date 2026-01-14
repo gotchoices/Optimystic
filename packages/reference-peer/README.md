@@ -1,4 +1,4 @@
-# Optimystic Test Peer (CLI)
+# Optimystic Reference Peer (CLI)
 
 A developer-friendly CLI for running an Optimystic peer over libp2p and exercising collections and distributed transactions.
 
@@ -19,13 +19,13 @@ From the repo root:
 ```sh
 # Build p2p and the CLI (recommended sequence)
 yarn --silent workspace @optimystic/db-p2p build
-yarn --silent workspace @optimystic/test-peer build
+yarn --silent workspace @optimystic/reference-peer build
 ```
 
 You can also build just the CLI:
 
 ```sh
-yarn --silent workspace @optimystic/test-peer build
+yarn --silent workspace @optimystic/reference-peer build
 ```
 
 ---
@@ -36,9 +36,9 @@ yarn --silent workspace @optimystic/test-peer build
 This starts a libp2p node and drops you into interactive mode.
 
 ```sh
-node packages/test-peer/dist/cli.js interactive \
+node packages/reference-peer/dist/cli.js interactive \
   --port 8011 \
-  --network optimystic-test
+  --network optimystic
 ```
 
 You will see listening multiaddrs like:
@@ -52,9 +52,9 @@ Share one of these with other peers as a `--bootstrap` address.
 ### Start a second node (join via bootstrap)
 
 ```sh
-node packages/test-peer/dist/cli.js interactive \
+node packages/reference-peer/dist/cli.js interactive \
   --port 8021 \
-  --network optimystic-test \
+  --network optimystic \
   --bootstrap "/ip4/127.0.0.1/tcp/8011/p2p/<PEER_ID>"
 ```
 
@@ -64,19 +64,19 @@ node packages/test-peer/dist/cli.js interactive \
 
 ## Mesh Orchestrator (local multi-node)
 
-`packages/test-peer/src/mesh.ts` (built to `packages/test-peer/dist/mesh.js`) launches a small local mesh of headless service peers and writes their info to `.mesh/node-*.json`. Useful for testing discovery/bootstrapping and for the provided VS Code launch profiles.
+`packages/reference-peer/src/mesh.ts` (built to `packages/reference-peer/dist/mesh.js`) launches a small local mesh of headless service peers and writes their info to `.mesh/node-*.json`. Useful for testing discovery/bootstrapping and for the provided VS Code launch profiles.
 
 Run after building:
 
 ```sh
 # Defaults: 2 nodes starting at port 8011
-node packages/test-peer/dist/mesh.js
+node packages/reference-peer/dist/mesh.js
 
 # Configure size and base port
 # macOS/Linux
-MESH_NODES=3 MESH_BASE_PORT=8011 node packages/test-peer/dist/mesh.js
+MESH_NODES=3 MESH_BASE_PORT=8011 node packages/reference-peer/dist/mesh.js
 # Windows (cmd)
-set MESH_NODES=3 && set MESH_BASE_PORT=8011 && node packages/test-peer/dist/mesh.js
+set MESH_NODES=3 && set MESH_BASE_PORT=8011 && node packages/reference-peer/dist/mesh.js
 ```
 
 What happens:
@@ -92,7 +92,7 @@ Output file example (`.mesh/node-1.json`):
   "peerId": "12D3Koo...",
   "multiaddrs": ["/ip4/127.0.0.1/tcp/8011/p2p/12D3Koo..."],
   "port": 8011,
-  "networkName": "optimystic-test",
+  "networkName": "optimystic",
   "timestamp": 1700000000000,
   "pid": 12345
 }
@@ -127,10 +127,10 @@ Examples:
 
 ```sh
 # Memory (default)
-node packages/test-peer/dist/cli.js interactive --port 8011
+node packages/reference-peer/dist/cli.js interactive --port 8011
 
 # File-backed
-node packages/test-peer/dist/cli.js interactive \
+node packages/reference-peer/dist/cli.js interactive \
   --port 8011 \
   --storage file \
   --storage-path "./.optimystic-storage/node-8011"
@@ -141,7 +141,7 @@ node packages/test-peer/dist/cli.js interactive \
 ## Interactive Mode
 
 ```sh
-node packages/test-peer/dist/cli.js interactive [options]
+node packages/reference-peer/dist/cli.js interactive [options]
 ```
 
 Options:
@@ -149,7 +149,7 @@ Options:
 - `-b, --bootstrap <string>`: Comma-separated list of bootstrap multiaddrs
 - `-i, --id <string>`: Optional peer id
 - `-r, --relay`: Enable relay service
-- `-n, --network <string>`: Network name (default: `optimystic-test`)
+- `-n, --network <string>`: Network name (default: `optimystic`)
 - `-s, --storage <type>`: `memory` | `file` (default: `memory`)
 - `--storage-path <path>`: Required when `--storage file`
 
@@ -173,7 +173,7 @@ Available interactive commands:
 ## Single-Action Mode
 
 ```sh
-node packages/test-peer/dist/cli.js run --action <action> [options]
+node packages/reference-peer/dist/cli.js run --action <action> [options]
 ```
 
 Actions:
@@ -190,26 +190,26 @@ Examples:
 
 ```sh
 # Create a diary and disconnect
-node packages/test-peer/dist/cli.js run \
+node packages/refrence-peer/dist/cli.js run \
   --action create-diary \
   --diary my-diary \
   --port 8001
 
 # Add an entry
-node packages/test-peer/dist/cli.js run \
+node packages/reference-peer/dist/cli.js run \
   --action add-entry \
   --diary my-diary \
   --content "Hello, Optimystic!" \
   --port 8002
 
 # Read entries
-node packages/test-peer/dist/cli.js run \
+node packages/reference-peer/dist/cli.js run \
   --action read-diary \
   --diary my-diary \
   --port 8003
 
 # List and then stay connected to keep working
-node packages/test-peer/dist/cli.js run \
+node packages/reference-peer/dist/cli.js run \
   --action list-diaries \
   --stay-connected \
   --port 8004
@@ -224,7 +224,7 @@ node packages/test-peer/dist/cli.js run \
   - Ensure you’ve rebuilt the packages so bootstrap discovery is conditional
 - "_started not set"
   - Fixed: custom libp2p services now pass only the required `logger` and `registrar`
-  - Rebuild `@optimystic/db-p2p` and `@optimystic/test-peer`
+  - Rebuild `@optimystic/db-p2p` and `@optimystic/reference-peer`
 - No peers found in distributed mode
   - Verify `--bootstrap` addresses are correct and reachable
   - You can provide multiple bootstrap addresses (comma-separated)
@@ -246,13 +246,13 @@ Rebuild after making changes:
 
 ```sh
 yarn --silent workspace @optimystic/db-p2p build
-yarn --silent workspace @optimystic/test-peer build
+yarn --silent workspace @optimystic/reference-peer build
 ```
 
 Optionally, you can run via the `start` script:
 
 ```sh
-yarn --silent workspace @optimystic/test-peer start -- interactive --port 8011
+yarn --silent workspace @optimystic/reference-peer start -- interactive --port 8011
 ```
 
 (Anything after `--` is forwarded to the CLI.)

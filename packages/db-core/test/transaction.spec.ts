@@ -260,7 +260,7 @@ describe('Transaction', () => {
 
 			const statements = createActionsStatements(collectionActions);
 			const stamp = createTransactionStamp(
-				'test-peer',
+				'reference-peer',
 				Date.now(),
 				'schema-hash-123',
 				'actions@1.0.0'
@@ -344,7 +344,7 @@ describe('Transaction', () => {
 
 			const statements = createActionsStatements(collectionActions);
 			const stamp = createTransactionStamp(
-				'test-peer',
+				'reference-peer',
 				Date.now(),
 				'schema-hash-123',
 				'actions@1.0.0'
@@ -435,7 +435,7 @@ describe('Transaction', () => {
 
 			const statements = createActionsStatements(collectionActions);
 			const stamp = createTransactionStamp(
-				'test-peer',
+				'reference-peer',
 				Date.now(),
 				'schema-hash-123',
 				'actions@1.0.0'
@@ -504,7 +504,7 @@ describe('Transaction', () => {
 
 			const statements = createActionsStatements(collectionActions);
 			const stamp = createTransactionStamp(
-				'test-peer',
+				'reference-peer',
 				Date.now(),
 				'schema-hash-123',
 				'actions@1.0.0'
@@ -584,7 +584,7 @@ describe('Transaction', () => {
 
 			const statements = createActionsStatements(collectionActions);
 			const stamp = createTransactionStamp(
-				'test-peer',
+				'reference-peer',
 				Date.now(),
 				'schema-hash-123',
 				'actions@1.0.0'
@@ -661,7 +661,7 @@ describe('Transaction', () => {
 			];
 
 			const statements = createActionsStatements(collectionActions);
-			const stamp = createTransactionStamp('test-peer', Date.now(), 'schema-hash-123', 'actions@1.0.0');
+			const stamp = createTransactionStamp('reference-peer', Date.now(), 'schema-hash-123', 'actions@1.0.0');
 			const transaction: Transaction = {
 				stamp,
 				statements,
@@ -735,7 +735,7 @@ describe('Transaction', () => {
 			];
 
 			const statements = createActionsStatements(collectionActions);
-			const stamp = createTransactionStamp('test-peer', Date.now(), 'schema-hash-123', 'actions@1.0.0');
+			const stamp = createTransactionStamp('reference-peer', Date.now(), 'schema-hash-123', 'actions@1.0.0');
 			const transaction: Transaction = {
 				stamp,
 				statements,
@@ -818,7 +818,7 @@ describe('Transaction', () => {
 			];
 
 			const statements = createActionsStatements(collectionActions);
-			const stamp = createTransactionStamp('test-peer', Date.now(), 'schema-hash-123', 'actions@1.0.0');
+			const stamp = createTransactionStamp('reference-peer', Date.now(), 'schema-hash-123', 'actions@1.0.0');
 			const transaction: Transaction = {
 				stamp,
 				statements,
@@ -868,7 +868,7 @@ describe('Transaction', () => {
 			];
 
 			const statements = createActionsStatements(collectionActions);
-			const stamp = createTransactionStamp('test-peer', Date.now(), 'schema-hash-123', 'actions@1.0.0');
+			const stamp = createTransactionStamp('reference-peer', Date.now(), 'schema-hash-123', 'actions@1.0.0');
 			const transaction: Transaction = {
 				stamp,
 				statements,
@@ -901,7 +901,7 @@ describe('Transaction', () => {
 
 			// Empty transaction with no actions
 			const statements = createActionsStatements([]);
-			const stamp = createTransactionStamp('test-peer', Date.now(), 'schema-hash-123', 'actions@1.0.0');
+			const stamp = createTransactionStamp('reference-peer', Date.now(), 'schema-hash-123', 'actions@1.0.0');
 			const transaction: Transaction = {
 				stamp,
 				statements,
@@ -994,7 +994,7 @@ describe('Transaction', () => {
 			];
 
 			const statements = createActionsStatements(collectionActions);
-			const stamp = createTransactionStamp('test-peer', Date.now(), 'schema-hash-123', 'actions@1.0.0');
+			const stamp = createTransactionStamp('reference-peer', Date.now(), 'schema-hash-123', 'actions@1.0.0');
 			const transaction: Transaction = {
 				stamp,
 				statements,
@@ -1060,7 +1060,7 @@ describe('Transaction', () => {
 			];
 
 			const statements = createActionsStatements(collectionActions);
-			const stamp = createTransactionStamp('test-peer', Date.now(), 'schema-hash-123', 'actions@1.0.0');
+			const stamp = createTransactionStamp('reference-peer', Date.now(), 'schema-hash-123', 'actions@1.0.0');
 
 			const transaction: Transaction = {
 				stamp,
@@ -1112,7 +1112,7 @@ describe('Transaction', () => {
 
 			const validator = new TransactionValidator(engines, createValidationCoordinator);
 
-			const stamp = createTransactionStamp('test-peer', Date.now(), 'schema-hash-123', 'unknown-engine@1.0.0');
+			const stamp = createTransactionStamp('reference-peer', Date.now(), 'schema-hash-123', 'unknown-engine@1.0.0');
 			const transaction: Transaction = {
 				stamp,
 				statements: [],
@@ -1158,7 +1158,7 @@ describe('Transaction', () => {
 
 			const validator = new TransactionValidator(engines, createValidationCoordinator);
 
-			const stamp = createTransactionStamp('test-peer', Date.now(), 'schema-hash-123', 'actions@1.0.0');
+			const stamp = createTransactionStamp('reference-peer', Date.now(), 'schema-hash-123', 'actions@1.0.0');
 			const transaction: Transaction = {
 				stamp,
 				statements: [],

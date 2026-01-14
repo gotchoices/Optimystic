@@ -1,8 +1,8 @@
 {
-  "name": "@optimystic/test-peer",
+  "name": "@optimystic/reference-peer",
   "version": "0.0.1",
   "type": "module",
-  "description": "Test peer implementation for Optimystic",
+  "description": "Reference peer implementation for Optimystic",
   "main": "dist/src/index.js",
   "types": "./dist/src/index.d.ts",
   "files": [
@@ -34,12 +34,12 @@
     "aegir": "^45.1.4"
   },
   "dependencies": {
-    "debug": "^4.4.1",
     "@libp2p/interface": "^2.10.5",
     "@libp2p/peer-id": "^5.1.8",
-    "@optimystic/db-core": "^0.0.1",
-    "@optimystic/db-p2p": "^0.0.1",
+    "@optimystic/db-core": "workspace:^",
+    "@optimystic/db-p2p": "workspace:^",
     "commander": "^14.0.0",
+    "debug": "^4.4.1",
     "uint8arrays": "^5.1.0"
   },
   "aegir": {

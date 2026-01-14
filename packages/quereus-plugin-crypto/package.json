@@ -62,7 +62,13 @@
 	"license": "MIT",
 	"quereus": {
 		"provides": {
-			"functions": ["digest", "sign", "verify", "hash_mod", "random_bytes"],
+			"functions": [
+				"digest",
+				"sign",
+				"verify",
+				"hash_mod",
+				"random_bytes"
+			],
 			"vtables": [],
 			"collations": []
 		},

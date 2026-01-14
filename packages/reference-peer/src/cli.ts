@@ -8,7 +8,7 @@ import * as path from 'path';
 import * as fs from 'fs';
 import { randomBytes } from 'node:crypto';
 
-const logDebug = debug('optimystic:test-peer');
+const logDebug = debug('optimystic:ref-peer');
 
 // Simple local transactor for single-node scenarios
 class LocalTransactor implements ITransactor {
@@ -44,7 +44,7 @@ interface NetworkSession {
 	isSingleNode: boolean; // Track if we're in single-node mode
 }
 
-class TestPeerSession {
+class PeerSession {
 	private session: NetworkSession | null = null;
 	private rl: readline.Interface | null = null;
 
@@ -319,7 +319,7 @@ class TestPeerSession {
 			bootstrapNodes,
 			id: options.id,
 			relay: options.relay || false,
-			networkName: options.network || 'optimystic-test',
+			networkName: options.network || 'optimystic',
 			fretProfile: options.fretProfile,
 			storageType: options.storage || 'memory',
 			storagePath: options.storagePath,
@@ -376,7 +376,7 @@ class TestPeerSession {
 				getRepo: (peerId) => {
 					return peerId.toString() === node.peerId.toString()
 						? coordinatedRepo  // Use coordinated repo for self to enable cluster consensus
-						: RepoClient.create(peerId, keyNetwork, `/optimystic/${options.network || 'optimystic-test'}`);
+						: RepoClient.create(peerId, keyNetwork, `/optimystic/${options.network || 'optimystic'}`);
 				}
 			});
 		}
@@ -419,7 +419,7 @@ class TestPeerSession {
 					peerId: node.peerId.toString(),
 					multiaddrs: addrs,
 					port: parseInt(options.port || '0'),
-					networkName: options.network || 'optimystic-test',
+					networkName: options.network || 'optimystic',
 					timestamp: Date.now(),
 					pid: process.pid
 				};
@@ -654,7 +654,7 @@ class TestPeerSession {
 }
 
 const program = new Command();
-const session = new TestPeerSession();
+const session = new PeerSession();
 
 // Ensure cleanup on process exit
 process.on('SIGINT', async () => {
@@ -668,8 +668,8 @@ process.on('SIGTERM', async () => {
 });
 
 program
-	.name('optimystic-test-peer')
-	.description('Optimystic P2P Database Test Client')
+	.name('optimystic-reference-peer')
+	.description('Optimystic P2P Database Reference Peer')
 	.version('0.0.1');
 
 // Interactive mode - network-first approach
@@ -680,7 +680,7 @@ program
 	.option('-b, --bootstrap <string>', 'Comma-separated list of bootstrap nodes')
 	.option('-i, --id <string>', 'Peer ID')
 	.option('-r, --relay', 'Enable relay service')
-	.option('-n, --network <string>', 'Network name', 'optimystic-test')
+	.option('-n, --network <string>', 'Network name', 'optimystic')
 	.option('--fret-profile <profile>', "FRET profile: 'edge' or 'core'", 'edge')
 	.option('-s, --storage <type>', 'Storage type: memory or file', 'memory')
 	.option('--storage-path <path>', 'Path for file storage')
@@ -711,7 +711,7 @@ program
 	.option('--bootstrap-file <path>', 'Path to JSON containing bootstrap multiaddrs or node list')
 	.option('-i, --id <string>', 'Peer ID')
 	.option('-r, --relay', 'Enable relay service')
-	.option('-n, --network <string>', 'Network name', 'optimystic-test')
+	.option('-n, --network <string>', 'Network name', 'optimystic')
 	.option('--fret-profile <profile>', "FRET profile: 'edge' or 'core'", 'edge')
 	.option('-s, --storage <type>', 'Storage type: memory or file', 'memory')
 	.option('--storage-path <path>', 'Path for file storage')
@@ -741,7 +741,7 @@ program
 	.option('-b, --bootstrap <string>', 'Comma-separated list of bootstrap nodes')
 	.option('-i, --id <string>', 'Peer ID')
 	.option('-r, --relay', 'Enable relay service')
-	.option('-n, --network <string>', 'Network name', 'optimystic-test')
+	.option('-n, --network <string>', 'Network name', 'optimystic')
 	.option('--fret-profile <profile>', "FRET profile: 'edge' or 'core'", 'edge')
 	.option('-s, --storage <type>', 'Storage type: memory or file', 'memory')
 	.option('--storage-path <path>', 'Path for file storage')

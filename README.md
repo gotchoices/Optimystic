@@ -25,7 +25,7 @@ See the following documentation:
 * **Database Core** - packages/db-core - Database core functionality, not specific to any particular storage topology
 * **Database P2P** - packages/db-p2p - Database integration with libp2p, including Arachnode ring discovery
 * **FRET** - packages/fret - Finger Ring Ensemble Topology DHT for efficient peer discovery
-* **Test Peer** - packages/test-peer - CLI for testing peer-to-peer functionality
+* **Reference Peer** - packages/reference-peer - CLI for testing peer-to-peer functionality
 * **Vinz** - packages/vinz - Library for threshold cryptography
 
 ## How to use:
@@ -65,8 +65,8 @@ An automated test suite with VS Code debugging is ready for use:
 
 ```bash
 # Quick test with detailed output
-yarn workspace @optimystic/test-peer build
-yarn workspace @optimystic/test-peer test:quick
+yarn workspace @optimystic/reference-peer build
+yarn workspace @optimystic/reference-peer test:quick
 ```
 
 **📖 See [START-HERE.md](START-HERE.md) to begin using the automated test loop!**
@@ -74,7 +74,7 @@ yarn workspace @optimystic/test-peer test:quick
 Additional documentation:
 - [TESTING-GUIDE.md](TESTING-GUIDE.md) - Comprehensive testing guide
 - [QUICK-REFERENCE.md](QUICK-REFERENCE.md) - Command reference
-- [packages/test-peer/test/README.md](packages/test-peer/test/README.md) - Test-specific docs
+- [packages/reference-peer/test/README.md](packages/reference-peer/test/README.md) - Test-specific docs
 
 ## Contributing
 

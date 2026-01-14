@@ -22,10 +22,10 @@ async function waitForFile(file: string, timeoutMs: number) {
 
 function startNode({ port, bootstrap, announceFile, extraArgs = [] as string[] }: { port: number, bootstrap?: string, announceFile?: string, extraArgs?: string[] }) {
   const args = [
-    'packages/test-peer/dist/src/cli.js',
+    'packages/reference-peer/dist/src/cli.js',
     'service',
     '--port', String(port),
-    '--network', 'optimystic-test',
+    '--network', 'optimystic',
     ...(bootstrap ? ['--bootstrap', bootstrap] : []),
     '--storage', 'memory',
     ...(announceFile ? ['--announce-file', announceFile] : [])
