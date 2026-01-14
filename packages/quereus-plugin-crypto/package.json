@@ -27,7 +27,7 @@
 		"typecheck": "tsc --noEmit"
 	},
 	"devDependencies": {
-		"@quereus/quereus": "^0.6.12",
+		"@quereus/quereus": "^0.13.0",
 		"@types/node": "^24.0.12",
 		"aegir": "^47.0.20",
 		"tsup": "^8.5.0",
@@ -39,7 +39,7 @@
 		"uint8arrays": "^5.1.0"
 	},
 	"peerDependencies": {
-		"@quereus/quereus": "^0.6.12"
+		"@quereus/quereus": "^0.13.0"
 	},
 	"engines": {
 		"quereus": "^0.6.12"

@@ -30,7 +30,7 @@ describe('Optimystic Schema Support', () => {
 
 		// Register vtables
 		for (const vtable of plugin.vtables) {
-			db.registerVtabModule(vtable.name, vtable.module, vtable.auxData);
+			db.registerModule(vtable.name, vtable.module, vtable.auxData);
 		}
 
 		// Register functions

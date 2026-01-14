@@ -783,10 +783,10 @@ export class OptimysticModule implements VirtualTableModule<OptimysticVirtualTab
   /**
    * Creates the persistent definition of a virtual table
    */
-  create(
+  async create(
     db: Database,
     tableSchema: TableSchema
-  ): OptimysticVirtualTable {
+  ): Promise<OptimysticVirtualTable> {
     const tableKey = `${tableSchema.schemaName}.${tableSchema.name}`.toLowerCase();
 
     // Check if table already exists
@@ -811,14 +811,10 @@ export class OptimysticModule implements VirtualTableModule<OptimysticVirtualTab
     // Cache the table
     this.tables.set(tableKey, table);
 
-    // Initialize and register connection asynchronously
-    // This ensures the connection is available for transactions even before first data access
-    table.initialize().then(async () => {
-      // Ensure connection is registered so BEGIN can find it
-      await table.ensureConnectionRegistered();
-    }).catch(error => {
-      console.error('Failed to initialize Optimystic table:', error);
-    });
+    // Initialize table and register connection before returning
+    // This ensures the table is fully ready for queries and transactions
+    await table.initialize();
+    await table.ensureConnectionRegistered();
 
     return table;
   }
@@ -826,20 +822,24 @@ export class OptimysticModule implements VirtualTableModule<OptimysticVirtualTab
   /**
    * Connects to an existing virtual table definition
    */
-  connect(
+  async connect(
     db: Database,
     _pAux: unknown,
     _moduleName: string,
     schemaName: string,
     tableName: string,
     _options: OptimysticModuleConfig
-  ): OptimysticVirtualTable {
+  ): Promise<OptimysticVirtualTable> {
     const tableKey = `${schemaName}.${tableName}`.toLowerCase();
     const existingTable = this.tables.get(tableKey);
 
     if (!existingTable) {
       throw new Error(`Optimystic table definition for '${tableName}' not found. Cannot connect.`);
     }
+
+    // Ensure the table is initialized before returning
+    // (should already be initialized from create(), but this handles edge cases)
+    await existingTable.initialize();
 
     return existingTable;
   }

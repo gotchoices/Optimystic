@@ -30,7 +30,7 @@ describe('Optimystic Index Support', () => {
 
 		// Register vtables
 		for (const vtable of plugin.vtables) {
-			db.registerVtabModule(vtable.name, vtable.module, vtable.auxData);
+			db.registerModule(vtable.name, vtable.module, vtable.auxData);
 		}
 
 		// Register functions
@@ -57,7 +57,7 @@ describe('Optimystic Index Support', () => {
 
 			// Verify index was created
 			const indexes = [];
-			for await (const row of db.eval('SELECT name FROM schema() WHERE type="index" AND tbl_name="products"')) {
+			for await (const row of db.eval("SELECT name FROM schema() WHERE type='index' AND tbl_name='products'")) {
 				indexes.push(row);
 			}
 			expect(indexes.some((i: any) => i.name === 'idx_category')).to.be.true;
@@ -67,7 +67,7 @@ describe('Optimystic Index Support', () => {
 			await db.exec('CREATE INDEX idx_category_price ON products(category, price)');
 
 			const indexes = [];
-			for await (const row of db.eval('SELECT name FROM schema() WHERE type="index" AND tbl_name="products"')) {
+			for await (const row of db.eval("SELECT name FROM schema() WHERE type='index' AND tbl_name='products'")) {
 				indexes.push(row);
 			}
 			expect(indexes.some((i: any) => i.name === 'idx_category_price')).to.be.true;
@@ -77,7 +77,7 @@ describe('Optimystic Index Support', () => {
 			await db.exec('CREATE UNIQUE INDEX idx_name ON products(name)');
 
 			const indexes = [];
-			for await (const row of db.eval('SELECT name FROM schema() WHERE type="index" AND tbl_name="products"')) {
+			for await (const row of db.eval("SELECT name FROM schema() WHERE type='index' AND tbl_name='products'")) {
 				indexes.push(row);
 			}
 			expect(indexes.some((i: any) => i.name === 'idx_name')).to.be.true;

@@ -8,15 +8,22 @@
       "packages/*"
     ]
   },
-  "scripts": {
-    "clean": "yarn workspaces run clean",
-    "build": "yarn workspace @optimystic/vinz run build && yarn workspace @optimystic/db-core run build && yarn workspace @optimystic/fret run build && yarn workspace @optimystic/db-p2p run build && yarn workspace @optimystic/quereus-plugin-crypto run build && && yarn workspace @optimystic/quereus-plugin-optimystic run build yarn workspace @optimystic/test-peer run build",
-    "build:parallel": "yarn workspaces run build",
-    "lint": "yarn workspaces run lint",
-    "test": "yarn workspaces run test",
-    "format": "prettier --cache --log-level warn --write \"packages/fret/src/**/*.{ts,tsx,js,jsx}\"",
-    "format:check": "prettier --cache --log-level warn --check \"packages/fret/src/**/*.{ts,tsx,js,jsx}\""
-  },
+	"scripts": {
+		"clean": "yarn workspaces run clean",
+		"build": "yarn workspace @optimystic/vinz run build && yarn workspace @optimystic/db-core run build && yarn workspace @optimystic/fret run build && yarn workspace @optimystic/db-p2p run build && yarn workspace @optimystic/quereus-plugin-crypto run build && && yarn workspace @optimystic/quereus-plugin-optimystic run build yarn workspace @optimystic/test-peer run build",
+		"build:parallel": "yarn workspaces run build",
+		"lint": "yarn workspaces run lint",
+		"test": "yarn workspaces run test",
+		"format": "prettier --cache --log-level warn --write \"packages/fret/src/**/*.{ts,tsx,js,jsx}\"",
+		"format:check": "prettier --cache --log-level warn --check \"packages/fret/src/**/*.{ts,tsx,js,jsx}\"",
+		"pub": "yarn pub:vinz && yarn pub:db-core && yarn pub:db-p2p && yarn pub:quereus-plugin-crypto && yarn pub:quereus-plugin-optimystic && yarn pub:test-peer",
+		"pub:vinz": "cd packages/vinz && yarn clean && yarn build && npx bumpp --no-push --no-commit --no-tag --no-git-check -y && yarn npm publish --access public",
+		"pub:db-core": "cd packages/db-core && yarn clean && yarn build && npx bumpp --no-push --no-commit --no-tag --no-git-check -y && yarn npm publish --access public",
+		"pub:db-p2p": "cd packages/db-p2p && yarn clean && yarn build && npx bumpp --no-push --no-commit --no-tag --no-git-check -y && yarn npm publish --access public",
+		"pub:quereus-plugin-crypto": "cd packages/quereus-plugin-crypto && yarn clean && yarn build && npx bumpp --no-push --no-commit --no-tag --no-git-check -y && yarn npm publish --access public",
+		"pub:quereus-plugin-optimystic": "cd packages/quereus-plugin-optimystic && yarn clean && yarn build && npx bumpp --no-push --no-commit --no-tag --no-git-check -y && yarn npm publish --access public",
+		"pub:test-peer": "cd packages/test-peer && yarn clean && yarn build && npx bumpp --no-push --no-commit --no-tag --no-git-check -y && yarn npm publish --access public"
+	},
   "devDependencies": {
     "@types/node": "^22.13.10",
     "aegir": "^45.1.4",

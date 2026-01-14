@@ -411,7 +411,7 @@ describe('Distributed Quereus Operations', () => {
 
 		// Register the plugin's virtual tables and functions
 		for (const vtable of plugin.vtables) {
-			db.registerVtabModule(vtable.name, vtable.module, vtable.auxData);
+			db.registerModule(vtable.name, vtable.module, vtable.auxData);
 		}
 
 		for (const func of plugin.functions) {

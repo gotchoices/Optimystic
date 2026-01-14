@@ -34,7 +34,7 @@
     "quoomb:node2": "quoomb --config examples/quoomb.config.node2.env.json"
   },
   "devDependencies": {
-    "@quereus/quereus": "^0.6.12",
+    "@quereus/quereus": "^0.13.0",
     "@types/node": "^24.0.12",
     "aegir": "^47.0.20",
     "tsup": "^8.5.0",
@@ -56,7 +56,7 @@
     "libp2p": "^2.9.0"
   },
   "peerDependencies": {
-    "@quereus/quereus": "^0.6.12"
+    "@quereus/quereus": "^0.13.0"
   },
   "engines": {
     "quereus": "^0.6.12"

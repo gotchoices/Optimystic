@@ -599,7 +599,7 @@ describe('Distributed Transaction Validation', () => {
 		plugin.collectionFactory.registerTransactor(`network:libp2p`, transactor);
 
 		for (const vtable of plugin.vtables) {
-			db.registerVtabModule(vtable.name, vtable.module, vtable.auxData);
+			db.registerModule(vtable.name, vtable.module, vtable.auxData);
 		}
 		for (const func of plugin.functions) {
 			db.registerFunction(func.schema);
