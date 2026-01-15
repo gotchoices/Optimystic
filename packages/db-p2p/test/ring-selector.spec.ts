@@ -1,5 +1,4 @@
-import { describe, it, beforeEach } from 'node:test';
-import assert from 'node:assert';
+import { expect } from 'aegir/chai';
 import { RingSelector, type RingSelectorConfig } from '../src/storage/ring-selector.js';
 import type { ArachnodeFretAdapter } from '../src/storage/arachnode-fret-adapter.js';
 
@@ -57,28 +56,28 @@ describe('RingSelector', () => {
 		it('returns -1 when capacity below minimum', async () => {
 			monitor.setCapacity(512 * 1024, 0); // 512KB, below 1MB minimum
 			const ring = await selector.determineRing();
-			assert.strictEqual(ring, -1);
+			expect(ring).to.equal(-1);
 		});
 
 		it('returns ring 0 for very large capacity', async () => {
 			// With huge capacity relative to estimated data, ring 0 (full keyspace)
 			monitor.setCapacity(1024 * 1024 * 1024 * 10, 0); // 10GB
 			const ring = await selector.determineRing();
-			assert.strictEqual(ring, 0);
+			expect(ring).to.equal(0);
 		});
 
 		it('returns higher ring depth for smaller capacity', async () => {
 			// With less capacity, need more partitions
 			monitor.setCapacity(10 * 1024 * 1024, 0); // 10MB
 			const ring = await selector.determineRing();
-			assert.ok(ring > 0, `Expected ring > 0, got ${ring}`);
+			expect(ring).to.be.greaterThan(0);
 		});
 
 		it('caps ring depth at 16', async () => {
 			// Extremely small capacity should still cap at ring 16
 			monitor.setCapacity(1024 * 1024, 0); // Exactly at minimum
 			const ring = await selector.determineRing();
-			assert.ok(ring <= 16, `Ring ${ring} exceeds cap of 16`);
+			expect(ring).to.be.at.most(16);
 		});
 
 		it('ring depth increases as available capacity decreases', async () => {
@@ -90,27 +89,27 @@ describe('RingSelector', () => {
 			monitor.setCapacity(1024 * 1024 * 1024, 900 * 1024 * 1024); // 100MB available
 			const ring2 = await selector.determineRing();
 
-			assert.ok(ring2 >= ring1, `Ring should increase or stay same as capacity decreases: ${ring1} -> ${ring2}`);
+			expect(ring2).to.be.at.least(ring1);
 		});
 	});
 
 	describe('calculatePartition', () => {
 		it('returns undefined for ring 0', async () => {
 			const partition = await selector.calculatePartition(0, 'some-peer-id');
-			assert.strictEqual(partition, undefined);
+			expect(partition).to.equal(undefined);
 		});
 
 		it('returns partition info for ring > 0', async () => {
 			try {
 				const partition = await selector.calculatePartition(4, 'some-peer-id');
-				assert.ok(partition !== undefined, 'Partition should not be undefined');
-				assert.strictEqual(partition.prefixBits, 4);
-				assert.ok(partition.prefixValue >= 0, 'Prefix value should be >= 0');
-				assert.ok(partition.prefixValue < 16, `Prefix value ${partition.prefixValue} should be < 16`);
+				expect(partition).to.not.equal(undefined);
+				expect(partition!.prefixBits).to.equal(4);
+				expect(partition!.prefixValue).to.be.at.least(0);
+				expect(partition!.prefixValue).to.be.lessThan(16);
 			} catch (err) {
 				// hashPeerId might fail for non-multiaddr peer IDs - that's acceptable
 				// The function depends on p2p-fret's hashPeerId which expects real peer IDs
-				assert.ok(err instanceof Error, 'Should throw an error for invalid peer ID format');
+				expect(err).to.be.instanceOf(Error);
 			}
 		});
 
@@ -119,16 +118,13 @@ describe('RingSelector', () => {
 			try {
 				for (const ringDepth of [1, 2, 3, 8, 12]) {
 					const partition = await selector.calculatePartition(ringDepth, `peer-${ringDepth}`);
-					assert.ok(partition !== undefined);
+					expect(partition).to.not.equal(undefined);
 					const maxValue = Math.pow(2, ringDepth);
-					assert.ok(
-						partition.prefixValue < maxValue,
-						`Ring ${ringDepth}: value ${partition.prefixValue} >= max ${maxValue}`
-					);
+					expect(partition!.prefixValue).to.be.lessThan(maxValue);
 				}
 			} catch (err) {
 				// hashPeerId may fail with test peer ID strings
-				assert.ok(err instanceof Error);
+				expect(err).to.be.instanceOf(Error);
 			}
 		});
 
@@ -137,10 +133,10 @@ describe('RingSelector', () => {
 				const peerId = 'consistent-peer-id';
 				const p1 = await selector.calculatePartition(5, peerId);
 				const p2 = await selector.calculatePartition(5, peerId);
-				assert.deepStrictEqual(p1, p2);
+				expect(p1).to.deep.equal(p2);
 			} catch (err) {
 				// hashPeerId may fail with test peer ID strings
-				assert.ok(err instanceof Error);
+				expect(err).to.be.instanceOf(Error);
 			}
 		});
 
@@ -153,10 +149,10 @@ describe('RingSelector', () => {
 				);
 				const values = partitions.map(p => p!.prefixValue);
 				const uniqueValues = new Set(values);
-				assert.ok(uniqueValues.size >= 1, 'Should have at least some partition variety');
+				expect(uniqueValues.size).to.be.at.least(1);
 			} catch (err) {
 				// hashPeerId may fail with test peer ID strings
-				assert.ok(err instanceof Error);
+				expect(err).to.be.instanceOf(Error);
 			}
 		});
 	});
@@ -165,15 +161,15 @@ describe('RingSelector', () => {
 		it('no transition when usage is in normal range', async () => {
 			monitor.setCapacity(1000, 500); // 50% used
 			const result = await selector.shouldTransition();
-			assert.strictEqual(result.shouldMove, false);
+			expect(result.shouldMove).to.equal(false);
 		});
 
 		it('suggests moving out when usage exceeds moveOut threshold', async () => {
 			monitor.setCapacity(1000, 850); // 85% used, above 80% threshold
 			const result = await selector.shouldTransition();
-			assert.strictEqual(result.shouldMove, true);
-			assert.strictEqual(result.direction, 'out');
-			assert.ok(result.newRingDepth !== undefined);
+			expect(result.shouldMove).to.equal(true);
+			expect(result.direction).to.equal('out');
+			expect(result.newRingDepth).to.not.equal(undefined);
 		});
 
 		it('suggests moving in when usage below moveIn threshold', async () => {
@@ -183,8 +179,8 @@ describe('RingSelector', () => {
 
 			// May or may not suggest moving in depending on current ring
 			if (result.shouldMove && result.direction === 'in') {
-				assert.ok(result.newRingDepth !== undefined);
-				assert.ok(result.newRingDepth >= 0);
+				expect(result.newRingDepth).to.not.equal(undefined);
+				expect(result.newRingDepth).to.be.at.least(0);
 			}
 		});
 
@@ -195,7 +191,7 @@ describe('RingSelector', () => {
 
 			// Even though usage is low, can't move to ring -1
 			if (result.shouldMove) {
-				assert.notStrictEqual(result.direction, 'in');
+				expect(result.direction).to.not.equal('in');
 			}
 		});
 	});
@@ -205,11 +201,11 @@ describe('RingSelector', () => {
 			monitor.setCapacity(1024 * 1024 * 1024, 100 * 1024 * 1024); // 1GB total, 100MB used
 			const info = await selector.createArachnodeInfo('my-peer-id');
 
-			assert.ok(info.ringDepth >= 0);
-			assert.strictEqual(info.capacity.total, 1024 * 1024 * 1024);
-			assert.strictEqual(info.capacity.used, 100 * 1024 * 1024);
-			assert.strictEqual(info.capacity.available, 924 * 1024 * 1024);
-			assert.strictEqual(info.status, 'active');
+			expect(info.ringDepth).to.be.at.least(0);
+			expect(info.capacity.total).to.equal(1024 * 1024 * 1024);
+			expect(info.capacity.used).to.equal(100 * 1024 * 1024);
+			expect(info.capacity.available).to.equal(924 * 1024 * 1024);
+			expect(info.status).to.equal('active');
 		});
 
 		it('handles below-minimum capacity gracefully', async () => {
@@ -217,8 +213,8 @@ describe('RingSelector', () => {
 			const info = await selector.createArachnodeInfo('low-capacity-peer');
 
 			// ringDepth becomes max(0, -1) = 0 when below minimum
-			assert.strictEqual(info.ringDepth, 0);
-			assert.strictEqual(info.status, 'active');
+			expect(info.ringDepth).to.equal(0);
+			expect(info.status).to.equal('active');
 		});
 
 		it('includes partition info for non-zero ring depth', async () => {
@@ -227,12 +223,12 @@ describe('RingSelector', () => {
 				const info = await selector.createArachnodeInfo('partitioned-peer');
 
 				if (info.ringDepth > 0) {
-					assert.ok(info.partition !== undefined);
-					assert.ok(info.partition.prefixBits > 0);
+					expect(info.partition).to.not.equal(undefined);
+					expect(info.partition!.prefixBits).to.be.greaterThan(0);
 				}
 			} catch (err) {
 				// hashPeerId may fail with test peer ID strings
-				assert.ok(err instanceof Error);
+				expect(err).to.be.instanceOf(Error);
 			}
 		});
 	});
@@ -249,15 +245,13 @@ describe('RingSelector', () => {
 
 				for (const { bits, maxValue } of testCases) {
 					const partition = await selector.calculatePartition(bits, 'test-peer-for-prefix');
-					assert.ok(partition !== undefined);
-					assert.ok(
-						partition.prefixValue >= 0 && partition.prefixValue < maxValue,
-						`For ${bits} bits, value ${partition.prefixValue} should be in [0, ${maxValue})`
-					);
+					expect(partition).to.not.equal(undefined);
+					expect(partition!.prefixValue).to.be.at.least(0);
+					expect(partition!.prefixValue).to.be.lessThan(maxValue);
 				}
 			} catch (err) {
 				// hashPeerId may fail with test peer ID strings
-				assert.ok(err instanceof Error);
+				expect(err).to.be.instanceOf(Error);
 			}
 		});
 	});

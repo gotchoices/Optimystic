@@ -1,5 +1,4 @@
-import { describe, it, beforeEach } from 'node:test';
-import assert from 'node:assert';
+import { expect } from 'aegir/chai';
 import { ClusterMember, clusterMember } from '../src/cluster/cluster-repo.js';
 import type { IRepo, ClusterRecord, RepoMessage, Signature, BlockGets, GetBlockResults, PendRequest, PendResult, CommitRequest, CommitResult, ActionBlocks, ClusterPeers, Transforms, IBlock, BlockId, BlockHeader } from '@optimystic/db-core';
 import type { IPeerNetwork } from '@optimystic/db-core';
@@ -71,12 +70,13 @@ const createClusterRecord = (
 	peers: ClusterPeers,
 	operations: RepoMessage['operations'],
 	promises: Record<string, Signature> = {},
-	commits: Record<string, Signature> = {}
+	commits: Record<string, Signature> = {},
+	expiration?: number
 ): ClusterRecord => ({
 	messageHash,
 	message: {
 		operations,
-		expiration: Date.now() + 30000
+		expiration: expiration ?? Date.now() + 30000
 	},
 	peers,
 	promises,
@@ -127,8 +127,8 @@ describe('ClusterMember', () => {
 
 			const result = await clusterMemberInstance.update(record);
 
-			assert.ok(result.promises[ourId], 'Should have added our promise');
-			assert.strictEqual(result.promises[ourId]!.type, 'approve');
+			expect(result.promises[ourId]).to.not.equal(undefined);
+			expect(result.promises[ourId]!.type).to.equal('approve');
 		});
 
 		it('does not re-add promise if already present', async () => {
@@ -146,7 +146,7 @@ describe('ClusterMember', () => {
 			const result = await clusterMemberInstance.update(record);
 
 			// Should still have a promise
-			assert.ok(result.promises[ourId]);
+			expect(result.promises[ourId]).to.not.equal(undefined);
 		});
 	});
 
@@ -169,8 +169,8 @@ describe('ClusterMember', () => {
 
 			const result = await clusterMemberInstance.update(record);
 
-			assert.ok(result.commits[ourId], 'Should have added our commit');
-			assert.strictEqual(result.commits[ourId]!.type, 'approve');
+			expect(result.commits[ourId]).to.not.equal(undefined);
+			expect(result.commits[ourId]!.type).to.equal('approve');
 		});
 
 		it('does not commit without all promises', async () => {
@@ -187,14 +187,13 @@ describe('ClusterMember', () => {
 
 			const result = await clusterMemberInstance.update(record);
 
-			assert.strictEqual(result.commits[ourId], undefined, 'Should not commit yet');
+			expect(result.commits[ourId]).to.equal(undefined);
 		});
 	});
 
 	describe('update - rejection handling', () => {
 		it('detects rejected transaction from promise rejection', async () => {
 			const otherPeerId = await makePeerId();
-			const ourId = selfPeerId.toString();
 			const otherId = otherPeerId.toString();
 			const peers = makeClusterPeers([selfPeerId, otherPeerId]);
 
@@ -209,7 +208,7 @@ describe('ClusterMember', () => {
 			const result = await clusterMemberInstance.update(record);
 
 			// Transaction is in rejected state
-			assert.ok(result);
+			expect(result).to.not.equal(undefined);
 		});
 	});
 
@@ -228,12 +227,12 @@ describe('ClusterMember', () => {
 				commits: {}
 			};
 
-			await assert.rejects(
-				async () => {
-					await clusterMemberInstance.update(record);
-				},
-				/expired/i
-			);
+			try {
+				await clusterMemberInstance.update(record);
+				expect.fail('Should have thrown');
+			} catch (err) {
+				expect((err as Error).message.toLowerCase()).to.include('expired');
+			}
 		});
 	});
 
@@ -245,29 +244,34 @@ describe('ClusterMember', () => {
 			const peer2Id = peer2.toString();
 			const peer3Id = peer3.toString();
 			const peers = makeClusterPeers([selfPeerId, peer2, peer3]);
+			const expiration = Date.now() + 30000;
 
 			// First update with peer2's promise
 			const record1 = createClusterRecord(
 				'merge-test',
 				peers,
 				makeGetOperation(['block-1']),
-				{ [peer2Id]: { type: 'approve', signature: 'p2' } }
+				{ [peer2Id]: { type: 'approve', signature: 'p2' } },
+				{},
+				expiration
 			);
 
 			await clusterMemberInstance.update(record1);
 
-			// Second update with peer3's promise
+			// Second update with peer3's promise - same expiration for same message content
 			const record2 = createClusterRecord(
 				'merge-test',
 				peers,
 				makeGetOperation(['block-1']),
-				{ [peer3Id]: { type: 'approve', signature: 'p3' } }
+				{ [peer3Id]: { type: 'approve', signature: 'p3' } },
+				{},
+				expiration
 			);
 
 			const result = await clusterMemberInstance.update(record2);
 
 			// Should have merged promises
-			assert.ok(result.promises[peer2Id] || result.promises[ourId]);
+			expect(result.promises[peer2Id] || result.promises[ourId]).to.not.equal(undefined);
 		});
 
 		it('throws on message content mismatch', async () => {
@@ -293,12 +297,12 @@ describe('ClusterMember', () => {
 				commits: {}
 			};
 
-			await assert.rejects(
-				async () => {
-					await clusterMemberInstance.update(record2);
-				},
-				/mismatch/i
-			);
+			try {
+				await clusterMemberInstance.update(record2);
+				expect.fail('Should have thrown');
+			} catch (err) {
+				expect((err as Error).message.toLowerCase()).to.include('mismatch');
+			}
 		});
 	});
 
@@ -329,7 +333,7 @@ describe('ClusterMember', () => {
 
 			// Should NOT execute operations since we already have our commit
 			// This ensures idempotent handling of duplicate consensus messages
-			assert.strictEqual(mockRepo.getCalls.length, 0, 'Should not re-execute when already committed');
+			expect(mockRepo.getCalls.length).to.equal(0);
 		});
 
 		it('adds commit when all promises present', async () => {
@@ -355,8 +359,8 @@ describe('ClusterMember', () => {
 			const result = await clusterMemberInstance.update(record);
 
 			// Should have added our commit
-			assert.ok(result.commits[ourId], 'Should add our commit');
-			assert.strictEqual(result.commits[ourId]!.type, 'approve');
+			expect(result.commits[ourId]).to.not.equal(undefined);
+			expect(result.commits[ourId]!.type).to.equal('approve');
 		});
 	});
 
@@ -377,14 +381,13 @@ describe('ClusterMember', () => {
 			]);
 
 			// Both should complete without error
-			assert.ok(result1);
-			assert.ok(result2);
+			expect(result1).to.not.equal(undefined);
+			expect(result2).to.not.equal(undefined);
 		});
 	});
 
 	describe('conflict detection', () => {
 		it('detects conflicting operations on same block', async () => {
-			const ourId = selfPeerId.toString();
 			const peers = makeClusterPeers([selfPeerId]);
 
 			// First transaction operates on block-1
@@ -405,7 +408,7 @@ describe('ClusterMember', () => {
 
 			// Should detect conflict and handle via race resolution
 			const result = await clusterMemberInstance.update(record2);
-			assert.ok(result);
+			expect(result).to.not.equal(undefined);
 		});
 
 		it('operations on different blocks do not conflict', async () => {
@@ -428,7 +431,7 @@ describe('ClusterMember', () => {
 
 			// Different blocks - no conflict
 			const result = await clusterMemberInstance.update(record2);
-			assert.ok(result.promises[ourId], 'Should add promise for non-conflicting transaction');
+			expect(result.promises[ourId]).to.not.equal(undefined);
 		});
 	});
 
@@ -449,7 +452,6 @@ describe('ClusterMember', () => {
 				}
 			});
 
-			const ourId = selfPeerId.toString();
 			const peers = makeClusterPeers([selfPeerId]);
 			const transforms: Transforms = {
 				inserts: { 'block-1': makeBlock('block-1') },
@@ -473,7 +475,7 @@ describe('ClusterMember', () => {
 
 			await validatingMember.update(record);
 
-			assert.strictEqual(validationCalled, true);
+			expect(validationCalled).to.equal(true);
 		});
 
 		it('rejects promise when validation fails', async () => {
@@ -512,8 +514,8 @@ describe('ClusterMember', () => {
 			const result = await validatingMember.update(record);
 
 			// Should have a reject promise
-			assert.strictEqual(result.promises[ourId]?.type, 'reject');
-			assert.ok(result.promises[ourId]?.rejectReason?.includes('Validation failed'));
+			expect(result.promises[ourId]?.type).to.equal('reject');
+			expect(result.promises[ourId]?.rejectReason).to.include('Validation failed');
 		});
 	});
 });

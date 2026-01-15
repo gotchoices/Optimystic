@@ -1,5 +1,4 @@
-import { describe, it, beforeEach } from 'node:test';
-import assert from 'node:assert';
+import { expect } from 'aegir/chai';
 import { StorageRepo } from '../src/storage/storage-repo.js';
 import { BlockStorage } from '../src/storage/block-storage.js';
 import { MemoryRawStorage } from '../src/storage/memory-storage.js';
@@ -47,9 +46,9 @@ describe('StorageRepo', () => {
 
 			const result = await repo.pend(request);
 
-			assert.strictEqual(result.success, true);
+			expect(result.success).to.equal(true);
 			if (result.success) {
-				assert.deepStrictEqual(result.blockIds, ['block-1']);
+				expect(result.blockIds).to.deep.equal(['block-1']);
 			}
 		});
 
@@ -69,10 +68,10 @@ describe('StorageRepo', () => {
 			});
 
 			// Continue behavior allows the pend but reports existing pendings
-			assert.strictEqual(result.success, true);
+			expect(result.success).to.equal(true);
 			if (result.success) {
-				assert.ok(result.pending?.length === 1);
-				assert.strictEqual(result.pending[0]!.actionId, 'action-1');
+				expect(result.pending?.length).to.equal(1);
+				expect(result.pending![0]!.actionId).to.equal('action-1');
 			}
 		});
 
@@ -89,9 +88,9 @@ describe('StorageRepo', () => {
 				policy: 'f'
 			});
 
-			assert.strictEqual(result.success, false);
+			expect(result.success).to.equal(false);
 			if (!result.success && 'pending' in result) {
-				assert.ok(result.pending!.length > 0);
+				expect(result.pending!.length).to.be.greaterThan(0);
 			}
 		});
 
@@ -108,12 +107,12 @@ describe('StorageRepo', () => {
 				policy: 'r'
 			});
 
-			assert.strictEqual(result.success, false);
+			expect(result.success).to.equal(false);
 			if (!result.success && 'pending' in result) {
-				assert.ok(result.pending!.length > 0);
+				expect(result.pending!.length).to.be.greaterThan(0);
 				// 'r' policy returns transform data
 				const pending = result.pending as Array<{ blockId: BlockId; actionId: ActionId; transform?: unknown }>;
-				assert.ok('transform' in pending[0]!);
+				expect('transform' in pending[0]!).to.equal(true);
 			}
 		});
 
@@ -135,9 +134,9 @@ describe('StorageRepo', () => {
 				policy: 'c'
 			});
 
-			assert.strictEqual(result.success, false);
+			expect(result.success).to.equal(false);
 			if (!result.success && 'missing' in result) {
-				assert.ok(result.missing!.length > 0);
+				expect(result.missing!.length).to.be.greaterThan(0);
 			}
 		});
 
@@ -157,10 +156,10 @@ describe('StorageRepo', () => {
 				policy: 'c'
 			});
 
-			assert.strictEqual(result.success, true);
+			expect(result.success).to.equal(true);
 			if (result.success) {
-				assert.ok(result.blockIds!.includes('block-1'));
-				assert.ok(result.blockIds!.includes('block-2'));
+				expect(result.blockIds!.includes('block-1')).to.equal(true);
+				expect(result.blockIds!.includes('block-2')).to.equal(true);
 			}
 		});
 
@@ -180,9 +179,9 @@ describe('StorageRepo', () => {
 				operationsHash: 'mock-hash'
 			});
 
-			assert.strictEqual(result.success, false);
+			expect(result.success).to.equal(false);
 			if (!result.success && 'reason' in result) {
-				assert.strictEqual(result.reason, 'Test rejection');
+				expect(result.reason).to.equal('Test rejection');
 			}
 		});
 	});
@@ -207,7 +206,7 @@ describe('StorageRepo', () => {
 
 			// Verify pending exists
 			const beforeCancel = await repo.get({ blockIds: ['block-1' as BlockId] });
-			assert.ok(beforeCancel['block-1']?.state.pendings?.includes('action-1'), 'Pending should exist before cancel');
+			expect(beforeCancel['block-1']?.state.pendings?.includes('action-1')).to.equal(true);
 
 			// Cancel the pending action
 			await repo.cancel({
@@ -217,10 +216,7 @@ describe('StorageRepo', () => {
 
 			// Verify pending is gone
 			const afterCancel = await repo.get({ blockIds: ['block-1' as BlockId] });
-			assert.ok(
-				!afterCancel['block-1']?.state.pendings?.includes('action-1'),
-				'Pending should be removed after cancel'
-			);
+			expect(afterCancel['block-1']?.state.pendings?.includes('action-1')).to.not.equal(true);
 		});
 
 		it('handles cancel of non-existent action gracefully', async () => {
@@ -236,8 +232,8 @@ describe('StorageRepo', () => {
 		it('returns empty state for nonexistent block', async () => {
 			const result = await repo.get({ blockIds: ['nonexistent' as BlockId] });
 
-			assert.ok('nonexistent' in result);
-			assert.deepStrictEqual(result['nonexistent']!.state, {});
+			expect('nonexistent' in result).to.equal(true);
+			expect(result['nonexistent']!.state).to.deep.equal({});
 		});
 
 		it('deduplicates block IDs', async () => {
@@ -256,7 +252,7 @@ describe('StorageRepo', () => {
 			});
 
 			// Should only have one entry
-			assert.strictEqual(Object.keys(result).length, 1);
+			expect(Object.keys(result).length).to.equal(1);
 		});
 
 		it('lists pending transactions in state', async () => {
@@ -278,7 +274,7 @@ describe('StorageRepo', () => {
 
 			const result = await repo.get({ blockIds: ['block-1' as BlockId] });
 
-			assert.ok(result['block-1']!.state.pendings?.includes('pending-1'));
+			expect(result['block-1']!.state.pendings?.includes('pending-1')).to.equal(true);
 		});
 	});
 });
