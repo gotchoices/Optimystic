@@ -1,5 +1,5 @@
 import type { BlockId } from '@optimystic/db-core';
-import { hashKey } from '@optimystic/fret';
+import { hashKey } from 'p2p-fret';
 import { peerIdFromString } from '@libp2p/peer-id';
 import type { BlockArchive, RestoreCallback } from './struct.js';
 import { SyncClient } from '../sync/client.js';

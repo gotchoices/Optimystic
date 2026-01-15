@@ -2,7 +2,7 @@ import type { PendRequest, ActionBlocks, IRepo, MessageOptions, CommitResult, Ge
 import { ClusterCoordinator } from "./cluster-coordinator.js";
 import type { ClusterClient } from "../cluster/client.js";
 import type { PeerId } from "@libp2p/interface";
-import type { FretService } from "@optimystic/fret";
+import type { FretService } from "p2p-fret";
 
 interface CoordinatorRepoComponents {
 	storageRepo: IRepo;

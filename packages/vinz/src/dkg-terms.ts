@@ -1,7 +1,6 @@
 // packages/proofs/src/dkg-terms.ts
-import { TextEncoder } from 'util'; // Use standard TextEncoder
 import { hashBytes } from './helpers.js';
-import { toString as uint8ArrayToString } from 'uint8arrays/to-string'; // For encoding
+import { toString as uint8ArrayToString } from 'uint8arrays/to-string';
 
 /** Defines the immutable parameters for a DKG instance. */
 export interface DKGTerms {

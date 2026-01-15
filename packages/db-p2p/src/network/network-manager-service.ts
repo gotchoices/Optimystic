@@ -1,6 +1,6 @@
 import type { Startable, Logger, PeerId, Libp2p } from '@libp2p/interface'
-import type { FretService } from '@optimystic/fret'
-import { hashKey } from '@optimystic/fret'
+import type { FretService } from 'p2p-fret'
+import { hashKey } from 'p2p-fret'
 
 export type NetworkManagerServiceInit = {
 	clusterSize?: number

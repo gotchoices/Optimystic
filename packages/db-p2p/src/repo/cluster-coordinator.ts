@@ -7,7 +7,7 @@ import { Pending } from "@optimystic/db-core";
 import type { PeerId } from "@libp2p/interface";
 import { createLogger } from '../logger.js'
 import type { ClusterLogPeerOutcome } from './types.js'
-import type { FretService } from "@optimystic/fret";
+import type { FretService } from "p2p-fret";
 
 const log = createLogger('cluster')
 

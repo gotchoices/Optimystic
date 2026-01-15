@@ -15,7 +15,7 @@ See the following documentation:
 
 * [Technical Architecture](docs/architecture.md)
 * [Distributed Database System](docs/optimystic.md)
-* [FRET DHT System](docs/fret.md)
+* [FRET DHT System](p2p-fret docs/fret.md)
 * [Storage Architecture (Arachnode)](docs/arachnode.md)
 * [Ring Zulu Integration](docs/ring-zulu-integration.md)
 * [Block Repository](docs/repository.md)
@@ -24,7 +24,6 @@ See the following documentation:
 
 * **Database Core** - packages/db-core - Database core functionality, not specific to any particular storage topology
 * **Database P2P** - packages/db-p2p - Database integration with libp2p, including Arachnode ring discovery
-* **FRET** - packages/fret - Finger Ring Ensemble Topology DHT for efficient peer discovery
 * **Reference Peer** - packages/reference-peer - CLI for testing peer-to-peer functionality
 * **Vinz** - packages/vinz - Library for threshold cryptography
 

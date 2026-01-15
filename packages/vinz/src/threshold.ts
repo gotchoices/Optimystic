@@ -1,6 +1,5 @@
 import { ProjectivePoint as Point, utils, CURVE } from '@noble/secp256k1';
-import { TextEncoder, TextDecoder } from 'util'; // Use standard En/Decoders
-import { concat as uint8ArrayConcat } from 'uint8arrays/concat'; // For concatenating Uint8Arrays
+import { concat as uint8ArrayConcat } from 'uint8arrays/concat';
 import {
 	bigintToBytes,
 	hashBytes,

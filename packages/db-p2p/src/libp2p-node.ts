@@ -21,7 +21,7 @@ import { ClusterClient } from './cluster/client.js';
 import type { IRepo, ICluster, ITransactionValidator } from '@optimystic/db-core';
 import { multiaddr } from '@multiformats/multiaddr';
 import { networkManagerService } from './network/network-manager-service.js';
-import { fretService, Libp2pFretService } from '@optimystic/fret';
+import { fretService, Libp2pFretService } from 'p2p-fret';
 import { syncService } from './sync/service.js';
 import { RestorationCoordinator } from './storage/restoration-coordinator-v2.js';
 import { RingSelector } from './storage/ring-selector.js';
@@ -29,7 +29,7 @@ import { StorageMonitor } from './storage/storage-monitor.js';
 import type { StorageMonitorConfig } from './storage/storage-monitor.js';
 import { ArachnodeFretAdapter } from './storage/arachnode-fret-adapter.js';
 import type { RestoreCallback } from './storage/struct.js';
-import type { FretService } from '@optimystic/fret';
+import type { FretService } from 'p2p-fret';
 import { PartitionDetector } from './cluster/partition-detector.js';
 
 export type NodeOptions = {

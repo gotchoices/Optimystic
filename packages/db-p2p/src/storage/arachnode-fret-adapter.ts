@@ -1,4 +1,4 @@
-import type { FretService } from '@optimystic/fret';
+import type { FretService } from 'p2p-fret';
 
 /**
  * Arachnode ring membership information.

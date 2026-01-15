@@ -9,7 +9,7 @@ import { sha256 } from "multiformats/hashes/sha2";
 import { toString as uint8ArrayToString } from 'uint8arrays/to-string';
 import { createLogger } from '../logger.js'
 import type { PartitionDetector } from "./partition-detector.js";
-import type { FretService } from "@optimystic/fret";
+import type { FretService } from "p2p-fret";
 
 const log = createLogger('cluster-member')
 

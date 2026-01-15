@@ -1,4 +1,4 @@
-import { hashPeerId } from '@optimystic/fret';
+import { hashPeerId } from 'p2p-fret';
 import type { StorageMonitor } from './storage-monitor.js';
 import type { ArachnodeInfo, ArachnodeFretAdapter } from './arachnode-fret-adapter.js';
 

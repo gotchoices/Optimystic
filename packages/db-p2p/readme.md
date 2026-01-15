@@ -493,5 +493,5 @@ Nodes automatically transition between rings based on capacity thresholds:
 
 - **[@optimystic/db-core](../db-core)**: Core database interfaces and local operations
 - **[@optimystic/db-quereus](../db-quereus)**: Query engine and data access patterns
-- **[@optimystic/fret](../fret)**: DHT implementation for peer discovery
+- **[p2p-fret](../fret)**: DHT implementation for peer discovery
 

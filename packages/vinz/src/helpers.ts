@@ -1,6 +1,5 @@
 import { sha256 } from 'multiformats/hashes/sha2';
-import { utils, CURVE } from '@noble/secp256k1';
-import { invert } from '@noble/curves/abstract/modular';
+import { utils, CURVE, etc } from '@noble/secp256k1';
 
 export function bigintToBytes(num: bigint, bytes = 32) {
 	const hex = num.toString(16).padStart(bytes * 2, '0');
@@ -81,7 +80,7 @@ export function lagrangeInterpolateAtZero(points: { x: bigint; y: bigint }[], n:
 			// Calculate L_i(0) = product_{j!=i} x_j / (x_j - x_i)
 			const numerator = xj;
 			const denominator = (xj - xi + n) % n;
-			const invDenominator = invert(denominator, n);
+			const invDenominator = etc.invert(denominator, n);
 			basis = (basis * numerator * invDenominator) % n;
 		}
 		secret = (secret + yi * basis) % n;

@@ -43,7 +43,6 @@
     "@libp2p/tcp": "^10.1.18",
     "@libp2p/websockets": "^9.2.18",
     "@optimystic/db-core": "^0.0.1",
-    "@optimystic/fret": "^0.0.1",
     "async-mutex": "^0.5.0",
     "debug": "^4.4.1",
     "it-all": "^3.0.7",
@@ -51,6 +50,7 @@
     "it-pipe": "^3.0.1",
     "libp2p": "^2.9.0",
     "multiformats": "^13.3.2",
+    "p2p-fret": "^0.1.0",
     "uint8arrays": "^5.1.0"
   }
 }

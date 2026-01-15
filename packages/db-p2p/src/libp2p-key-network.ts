@@ -3,8 +3,8 @@ import { toString as u8ToString } from 'uint8arrays/to-string'
 import type { ClusterPeers, FindCoordinatorOptions, IKeyNetwork, IPeerNetwork } from "@optimystic/db-core";
 import { peerIdFromString } from '@libp2p/peer-id'
 import { multiaddr } from '@multiformats/multiaddr'
-import type { FretService } from '@optimystic/fret'
-import { hashKey } from '@optimystic/fret'
+import type { FretService } from 'p2p-fret'
+import { hashKey } from 'p2p-fret'
 import { createLogger } from './logger.js'
 
 interface WithFretService { services?: { fret?: FretService } }
