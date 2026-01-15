@@ -90,3 +90,6 @@ out
 .mesh/node-*.json
 .mesh/mesh-ready.json
 packages/reference-peer/.optimystic-node.json
+
+# Yarn configuration with secrets
+.yarnrc.yml
