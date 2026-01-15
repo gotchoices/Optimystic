@@ -32,13 +32,13 @@ yarn --silent workspace @optimystic/reference-peer build
 
 ## Quick Start
 
+After building, the CLI is available as `yarn optimystic-peer` from the workspace root, or you can run `node packages/reference-peer/dist/src/cli.js` directly.
+
 ### Start the first node (no bootstrap)
 This starts a libp2p node and drops you into interactive mode.
 
 ```sh
-node packages/reference-peer/dist/cli.js interactive \
-  --port 8011 \
-  --network optimystic
+yarn optimystic-peer interactive --port 8011 --network optimystic
 ```
 
 You will see listening multiaddrs like:
@@ -52,7 +52,7 @@ Share one of these with other peers as a `--bootstrap` address.
 ### Start a second node (join via bootstrap)
 
 ```sh
-node packages/reference-peer/dist/cli.js interactive \
+yarn optimystic-peer interactive \
   --port 8021 \
   --network optimystic \
   --bootstrap "/ip4/127.0.0.1/tcp/8011/p2p/<PEER_ID>"
@@ -64,19 +64,19 @@ node packages/reference-peer/dist/cli.js interactive \
 
 ## Mesh Orchestrator (local multi-node)
 
-`packages/reference-peer/src/mesh.ts` (built to `packages/reference-peer/dist/mesh.js`) launches a small local mesh of headless service peers and writes their info to `.mesh/node-*.json`. Useful for testing discovery/bootstrapping and for the provided VS Code launch profiles.
+`packages/reference-peer/src/mesh.ts` (built to `packages/reference-peer/dist/src/mesh.js`) launches a small local mesh of headless service peers and writes their info to `.mesh/node-*.json`. Useful for testing discovery/bootstrapping and for the provided VS Code launch profiles.
 
 Run after building:
 
 ```sh
 # Defaults: 2 nodes starting at port 8011
-node packages/reference-peer/dist/mesh.js
+yarn workspace @optimystic/reference-peer mesh
 
 # Configure size and base port
 # macOS/Linux
-MESH_NODES=3 MESH_BASE_PORT=8011 node packages/reference-peer/dist/mesh.js
+MESH_NODES=3 MESH_BASE_PORT=8011 yarn workspace @optimystic/reference-peer mesh
 # Windows (cmd)
-set MESH_NODES=3 && set MESH_BASE_PORT=8011 && node packages/reference-peer/dist/mesh.js
+set MESH_NODES=3 && set MESH_BASE_PORT=8011 && yarn workspace @optimystic/reference-peer mesh
 ```
 
 What happens:
@@ -127,10 +127,10 @@ Examples:
 
 ```sh
 # Memory (default)
-node packages/reference-peer/dist/cli.js interactive --port 8011
+yarn optimystic-peer interactive --port 8011
 
 # File-backed
-node packages/reference-peer/dist/cli.js interactive \
+yarn optimystic-peer interactive \
   --port 8011 \
   --storage file \
   --storage-path "./.optimystic-storage/node-8011"
@@ -141,7 +141,7 @@ node packages/reference-peer/dist/cli.js interactive \
 ## Interactive Mode
 
 ```sh
-node packages/reference-peer/dist/cli.js interactive [options]
+yarn optimystic-peer interactive [options]
 ```
 
 Options:
@@ -173,7 +173,7 @@ Available interactive commands:
 ## Single-Action Mode
 
 ```sh
-node packages/reference-peer/dist/cli.js run --action <action> [options]
+yarn optimystic-peer run --action <action> [options]
 ```
 
 Actions:
@@ -190,26 +190,26 @@ Examples:
 
 ```sh
 # Create a diary and disconnect
-node packages/refrence-peer/dist/cli.js run \
+yarn optimystic-peer run \
   --action create-diary \
   --diary my-diary \
   --port 8001
 
 # Add an entry
-node packages/reference-peer/dist/cli.js run \
+yarn optimystic-peer run \
   --action add-entry \
   --diary my-diary \
   --content "Hello, Optimystic!" \
   --port 8002
 
 # Read entries
-node packages/reference-peer/dist/cli.js run \
+yarn optimystic-peer run \
   --action read-diary \
   --diary my-diary \
   --port 8003
 
 # List and then stay connected to keep working
-node packages/reference-peer/dist/cli.js run \
+yarn optimystic-peer run \
   --action list-diaries \
   --stay-connected \
   --port 8004
@@ -245,17 +245,19 @@ node packages/reference-peer/dist/cli.js run \
 Rebuild after making changes:
 
 ```sh
-yarn --silent workspace @optimystic/db-p2p build
-yarn --silent workspace @optimystic/reference-peer build
+yarn workspace @optimystic/db-p2p build
+yarn workspace @optimystic/reference-peer build
 ```
 
-Optionally, you can run via the `start` script:
+After building, the CLI is available as:
 
 ```sh
-yarn --silent workspace @optimystic/reference-peer start -- interactive --port 8011
-```
+# From workspace root (recommended)
+yarn optimystic-peer interactive --port 8011
 
-(Anything after `--` is forwarded to the CLI.)
+# Or via the start script
+yarn workspace @optimystic/reference-peer start -- interactive --port 8011
+```
 
 ---
 

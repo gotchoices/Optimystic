@@ -17,6 +17,23 @@
       "import": "./dist/src/index.js"
     }
   },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/gotchoices/optimystic.git",
+    "directory": "packages/db-p2p"
+  },
+  "author": "Got Choices Foundation",
+  "license": "MIT",
+  "keywords": [
+    "optimystic",
+    "database",
+    "p2p",
+    "peer-to-peer",
+    "libp2p",
+    "distributed",
+    "dht",
+    "gossipsub"
+  ],
   "scripts": {
     "clean": "aegir clean",
     "build": "aegir build --env node",
@@ -42,7 +59,7 @@
     "@libp2p/ping": "^2.0.36",
     "@libp2p/tcp": "^10.1.18",
     "@libp2p/websockets": "^9.2.18",
-    "@optimystic/db-core": "^0.0.1",
+    "@optimystic/db-core": "workspace:^",
     "async-mutex": "^0.5.0",
     "debug": "^4.4.1",
     "it-all": "^3.0.7",

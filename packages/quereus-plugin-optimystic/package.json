@@ -24,7 +24,7 @@
   "scripts": {
     "build": "tsup",
     "dev": "tsup --watch",
-    "clean": "rm -rf dist",
+    "clean": "rimraf dist",
     "typecheck": "tsc --noEmit",
     "test": "aegir test -t node",
     "test:watch": "aegir test -t node --watch",
@@ -37,6 +37,7 @@
     "@quereus/quereus": "^0.13.0",
     "@types/node": "^24.0.12",
     "aegir": "^47.0.20",
+    "rimraf": "^6.0.1",
     "tsup": "^8.5.0",
     "typescript": "^5.8.3"
   },
@@ -50,8 +51,8 @@
     "@libp2p/noise": "^12.0.1",
     "@libp2p/tcp": "^10.1.18",
     "@noble/hashes": "^1.8.0",
-    "@optimystic/db-core": "*",
-    "@optimystic/db-p2p": "*",
+    "@optimystic/db-core": "workspace:^",
+    "@optimystic/db-p2p": "workspace:^",
     "debug": "^4.4.1",
     "libp2p": "^2.9.0"
   },
@@ -72,7 +73,12 @@
     "database",
     "virtual-table"
   ],
-  "author": "Optimystic Team",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/gotchoices/optimystic.git",
+    "directory": "packages/quereus-plugin-optimystic"
+  },
+  "author": "Got Choices Foundation",
   "license": "MIT",
   "quereus": {
     "provides": {

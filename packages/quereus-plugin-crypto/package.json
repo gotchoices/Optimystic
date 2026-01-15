@@ -23,13 +23,14 @@
 	"scripts": {
 		"build": "tsup",
 		"dev": "tsup --watch",
-		"clean": "rm -rf dist",
+		"clean": "rimraf dist",
 		"typecheck": "tsc --noEmit"
 	},
 	"devDependencies": {
 		"@quereus/quereus": "^0.13.0",
 		"@types/node": "^24.0.12",
 		"aegir": "^47.0.20",
+		"rimraf": "^6.0.1",
 		"tsup": "^8.5.0",
 		"typescript": "^5.8.3"
 	},
@@ -58,7 +59,12 @@
 		"ed25519",
 		"p256"
 	],
-	"author": "Optimystic Team",
+	"repository": {
+		"type": "git",
+		"url": "https://github.com/gotchoices/optimystic.git",
+		"directory": "packages/quereus-plugin-crypto"
+	},
+	"author": "Got Choices Foundation",
 	"license": "MIT",
 	"quereus": {
 		"provides": {

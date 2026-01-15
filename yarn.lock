@@ -3424,7 +3424,7 @@ __metadata:
   languageName: node
   linkType: hard
 
-"@optimystic/db-core@npm:*, @optimystic/db-core@npm:^0.0.1, @optimystic/db-core@workspace:^, @optimystic/db-core@workspace:packages/db-core":
+"@optimystic/db-core@workspace:^, @optimystic/db-core@workspace:packages/db-core":
   version: 0.0.0-use.local
   resolution: "@optimystic/db-core@workspace:packages/db-core"
   dependencies:
@@ -3440,7 +3440,7 @@ __metadata:
   languageName: unknown
   linkType: soft
 
-"@optimystic/db-p2p@npm:*, @optimystic/db-p2p@workspace:^, @optimystic/db-p2p@workspace:packages/db-p2p":
+"@optimystic/db-p2p@workspace:^, @optimystic/db-p2p@workspace:packages/db-p2p":
   version: 0.0.0-use.local
   resolution: "@optimystic/db-p2p@workspace:packages/db-p2p"
   dependencies:
@@ -3455,7 +3455,7 @@ __metadata:
     "@libp2p/ping": "npm:^2.0.36"
     "@libp2p/tcp": "npm:^10.1.18"
     "@libp2p/websockets": "npm:^9.2.18"
-    "@optimystic/db-core": "npm:^0.0.1"
+    "@optimystic/db-core": "workspace:^"
     "@types/node": "npm:^24.0.12"
     aegir: "npm:^47.0.20"
     async-mutex: "npm:^0.5.0"
@@ -3490,6 +3490,7 @@ __metadata:
     "@quereus/quereus": "npm:^0.13.0"
     "@types/node": "npm:^24.0.12"
     aegir: "npm:^47.0.20"
+    rimraf: "npm:^6.0.1"
     tsup: "npm:^8.5.0"
     typescript: "npm:^5.8.3"
     uint8arrays: "npm:^5.1.0"
@@ -3511,13 +3512,14 @@ __metadata:
     "@libp2p/noise": "npm:^12.0.1"
     "@libp2p/tcp": "npm:^10.1.18"
     "@noble/hashes": "npm:^1.8.0"
-    "@optimystic/db-core": "npm:*"
-    "@optimystic/db-p2p": "npm:*"
+    "@optimystic/db-core": "workspace:^"
+    "@optimystic/db-p2p": "workspace:^"
     "@quereus/quereus": "npm:^0.13.0"
     "@types/node": "npm:^24.0.12"
     aegir: "npm:^47.0.20"
     debug: "npm:^4.4.1"
     libp2p: "npm:^2.9.0"
+    rimraf: "npm:^6.0.1"
     tsup: "npm:^8.5.0"
     typescript: "npm:^5.8.3"
   peerDependencies:
@@ -3538,6 +3540,8 @@ __metadata:
     commander: "npm:^14.0.0"
     debug: "npm:^4.4.1"
     uint8arrays: "npm:^5.1.0"
+  bin:
+    optimystic-peer: ./dist/src/cli.js
   languageName: unknown
   linkType: soft
 

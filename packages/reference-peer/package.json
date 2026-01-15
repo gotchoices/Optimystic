@@ -4,6 +4,9 @@
   "type": "module",
   "description": "Reference peer implementation for Optimystic",
   "main": "dist/src/index.js",
+  "bin": {
+    "optimystic-peer": "./dist/src/cli.js"
+  },
   "types": "./dist/src/index.d.ts",
   "files": [
     "src",
@@ -17,6 +20,21 @@
       "import": "./dist/src/index.js"
     }
   },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/gotchoices/optimystic.git",
+    "directory": "packages/reference-peer"
+  },
+  "author": "Got Choices Foundation",
+  "license": "MIT",
+  "keywords": [
+    "optimystic",
+    "reference-peer",
+    "cli",
+    "p2p",
+    "peer-to-peer",
+    "libp2p"
+  ],
   "scripts": {
     "clean": "aegir clean",
     "build": "aegir build --env node",

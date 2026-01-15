@@ -17,6 +17,21 @@
       "import": "./dist/src/index.js"
     }
   },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/gotchoices/optimystic.git",
+    "directory": "packages/vinz"
+  },
+  "author": "Got Choices Foundation",
+  "license": "MIT",
+  "keywords": [
+    "optimystic",
+    "threshold-cryptography",
+    "cryptography",
+    "crypto",
+    "secp256k1",
+    "multiformats"
+  ],
   "scripts": {
     "clean": "aegir clean",
     "build": "aegir build --env node",
