@@ -9,6 +9,9 @@
       "packages/*"
     ]
   },
+  "resolutions": {
+    "@quereus/quereus": "portal:../quereus/packages/quereus"
+  },
   "scripts": {
     "clean": "yarn clean:db-core && yarn clean:db-p2p && yarn clean:quereus-crypto && yarn clean:quereus-optimystic && yarn clean:reference-peer",
     "clean:db-core": "cd packages/db-core && yarn clean",

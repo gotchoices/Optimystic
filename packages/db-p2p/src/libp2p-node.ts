@@ -6,6 +6,7 @@ import { identify } from '@libp2p/identify';
 import { ping } from '@libp2p/ping';
 import { gossipsub } from '@chainsafe/libp2p-gossipsub';
 import { bootstrap } from '@libp2p/bootstrap';
+import { circuitRelayServer, circuitRelayTransport } from '@libp2p/circuit-relay-v2';
 import { peerIdFromString } from '@libp2p/peer-id';
 import { clusterService } from './cluster/service.js';
 import { repoService } from './repo/service.js';
@@ -129,7 +130,8 @@ export async function createLibp2pNode(options: NodeOptions): Promise<Libp2p> {
 			inboundConnectionUpgradeTimeout: 10_000,
 			dialQueue: { concurrency: 2, attempts: 2 }
 		},
-		transports: [tcp()],
+		// Add circuitRelayTransport so this node can dial through relays
+		transports: [tcp(), circuitRelayTransport()],
 		connectionEncrypters: [noise()],
 		streamMuxers: [yamux()],
 		services: {
@@ -141,6 +143,8 @@ export async function createLibp2pNode(options: NodeOptions): Promise<Libp2p> {
 				allowPublishToZeroTopicPeers: true,
 				heartbeatInterval: 7000
 			}),
+			// Circuit relay server - enables this node to relay connections for other peers
+			...(options.relay ? { relay: circuitRelayServer() } : {}),
 
 			// Custom services - create wrapper factories that inject dependencies
 			cluster: (components: any) => {

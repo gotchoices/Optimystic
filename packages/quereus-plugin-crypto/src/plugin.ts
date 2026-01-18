@@ -5,9 +5,14 @@
  * All metadata is in package.json - no manifest export needed.
  */
 
-import type { Database, FunctionFlags, SqlValue } from '@quereus/quereus';
-import { TEXT_TYPE, INTEGER_TYPE, BOOLEAN_TYPE } from '@quereus/quereus';
+import type { Database, SqlValue } from '@quereus/quereus';
+import { FunctionFlags, TEXT_TYPE, INTEGER_TYPE, BOOLEAN_TYPE } from '@quereus/quereus';
 import { digest, sign, verify, hashMod, randomBytes } from './crypto.js';
+
+// Flags for deterministic functions (UTF8 + DETERMINISTIC)
+const DETERMINISTIC_FLAGS = FunctionFlags.UTF8 | FunctionFlags.DETERMINISTIC;
+// Flags for non-deterministic functions (UTF8 only)
+const NON_DETERMINISTIC_FLAGS = FunctionFlags.UTF8;
 
 /**
  * Plugin registration function
@@ -20,7 +25,7 @@ export default function register(_db: Database, _config: Record<string, SqlValue
 			schema: {
 				name: 'digest',
 				numArgs: -1, // Variable arguments: data, algorithm?, inputEncoding?, outputEncoding?
-				flags: 1 as FunctionFlags, // UTF8
+				flags: DETERMINISTIC_FLAGS, // digest is deterministic
 				returnType: { typeClass: 'scalar' as const, logicalType: TEXT_TYPE, nullable: false },
 				implementation: (...args: SqlValue[]) => {
 					const [data, algorithm = 'sha256', inputEncoding = 'base64url', outputEncoding = 'base64url'] = args;
@@ -32,7 +37,7 @@ export default function register(_db: Database, _config: Record<string, SqlValue
 			schema: {
 				name: 'sign',
 				numArgs: -1, // Variable arguments: data, privateKey, curve?, inputEncoding?, keyEncoding?, outputEncoding?
-				flags: 1 as FunctionFlags,
+				flags: DETERMINISTIC_FLAGS, // sign is deterministic (same key + data = same signature)
 				returnType: { typeClass: 'scalar' as const, logicalType: TEXT_TYPE, nullable: false },
 				implementation: (...args: SqlValue[]) => {
 					const [data, privateKey, curve = 'secp256k1', inputEncoding = 'base64url', keyEncoding = 'base64url', outputEncoding = 'base64url'] = args;
@@ -44,7 +49,7 @@ export default function register(_db: Database, _config: Record<string, SqlValue
 			schema: {
 				name: 'verify',
 				numArgs: -1, // Variable arguments: data, signature, publicKey, curve?, inputEncoding?, sigEncoding?, keyEncoding?
-				flags: 1 as FunctionFlags,
+				flags: DETERMINISTIC_FLAGS, // verify is deterministic
 				returnType: { typeClass: 'scalar' as const, logicalType: BOOLEAN_TYPE, nullable: false },
 				implementation: (...args: SqlValue[]) => {
 					const [data, signature, publicKey, curve = 'secp256k1', inputEncoding = 'base64url', sigEncoding = 'base64url', keyEncoding = 'base64url'] = args;
@@ -57,7 +62,7 @@ export default function register(_db: Database, _config: Record<string, SqlValue
 			schema: {
 				name: 'hash_mod',
 				numArgs: -1, // Variable arguments: data, bits, algorithm?, inputEncoding?
-				flags: 1 as FunctionFlags,
+				flags: DETERMINISTIC_FLAGS, // hash_mod is deterministic
 				returnType: { typeClass: 'scalar' as const, logicalType: INTEGER_TYPE, nullable: false },
 				implementation: (...args: SqlValue[]) => {
 					const [data, bits, algorithm = 'sha256', inputEncoding = 'base64url'] = args;
@@ -69,7 +74,7 @@ export default function register(_db: Database, _config: Record<string, SqlValue
 			schema: {
 				name: 'random_bytes',
 				numArgs: -1, // Variable arguments: bits?, encoding?
-				flags: 1 as FunctionFlags,
+				flags: NON_DETERMINISTIC_FLAGS, // random_bytes is NOT deterministic
 				returnType: { typeClass: 'scalar' as const, logicalType: TEXT_TYPE, nullable: false },
 				implementation: (...args: SqlValue[]) => {
 					const [bits = 256, encoding = 'base64url'] = args;
