@@ -2,7 +2,7 @@ import type { ITransactor, TransactionCoordinator, ITransactionEngine } from '@o
 import { TransactionSession, createTransactionStamp, createTransactionId } from '@optimystic/db-core';
 import type { TransactionState, ParsedOptimysticOptions } from '../types.js';
 import { CollectionFactory } from './collection-factory.js';
-import { generateTransactionId as generateLegacyTransactionId } from '../util/generate-transaction-id.js';
+import { generateStampId } from '../util/generate-stamp-id.js';
 import { QUEREUS_ENGINE_ID } from '../transaction/quereus-engine.js';
 
 /**
@@ -94,13 +94,13 @@ export class TransactionBridge {
     // Generate transaction ID from session or legacy method
     const transactionId = this.session
       ? this.session.getStampId()
-      : generateLegacyTransactionId(peerId);
+      : generateStampId(peerId);
 
     this.currentTransaction = {
       transactor,
       isActive: true,
       collections: new Map(),
-      transactionId,
+      stampId: transactionId,
     };
 
     return this.currentTransaction;

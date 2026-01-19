@@ -194,7 +194,7 @@ export class OptimysticVirtualTable extends VirtualTable {
         };
         const tree = await this.collectionFactory.createOrGetCollection(
           indexOptions,
-          transactor ? { transactor, isActive: true, collections: new Map(), transactionId: '' } : undefined
+          transactor ? { transactor, isActive: true, collections: new Map(), stampId: '' } : undefined
         );
         // Index trees store string->string mappings (IndexKey->PrimaryKey)
         return tree as unknown as Tree<string, string>;
@@ -641,7 +641,7 @@ export class OptimysticVirtualTable extends VirtualTable {
       };
       const tree = await this.collectionFactory.createOrGetCollection(
         indexOptions,
-        transactor ? { transactor, isActive: true, collections: new Map(), transactionId: '' } : undefined
+        transactor ? { transactor, isActive: true, collections: new Map(), stampId: '' } : undefined
       );
       return tree as unknown as Tree<string, string>;
     };
@@ -742,7 +742,7 @@ export class OptimysticModule implements VirtualTableModule<OptimysticVirtualTab
       };
       return await this.collectionFactory.createOrGetCollection(
         schemaOptions,
-        transactor ? { transactor, isActive: true, collections: new Map(), transactionId: '' } : undefined
+        transactor ? { transactor, isActive: true, collections: new Map(), stampId: '' } : undefined
       );
     });
   }

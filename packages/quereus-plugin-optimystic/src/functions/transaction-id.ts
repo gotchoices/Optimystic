@@ -23,7 +23,7 @@ export function createStampIdFunction(txnBridge: TransactionBridge) {
 			return null;
 		}
 
-		return currentTxn.transactionId;
+		return currentTxn.stampId;
 	};
 }
 

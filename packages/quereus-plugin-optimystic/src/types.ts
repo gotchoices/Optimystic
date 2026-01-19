@@ -87,5 +87,5 @@ export interface TransactionState {
   transactor: ITransactor;
   isActive: boolean;
   collections: Map<string, any>; // Tree collections used in this transaction
-  transactionId: string; // Unique identifier for this transaction (stable within transaction, cycles between)
+  stampId: string; // Unique identifier for this transaction (stable within transaction, cycles between)
 }
