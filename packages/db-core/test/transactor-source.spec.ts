@@ -366,7 +366,9 @@ describe('TransactorSource', () => {
 
     // This should fail because the block doesn't exist
 		// Error should look like: Error: Commit Error: Transaction dPWSdMgzCagwbE2ERPUi7A has no insert for new block test-block
-		await expect(source.transact(updateTransform, actionId, 1, 'header-id', 'tail-id')).to.be.rejected
+		const transactPromise = source.transact(updateTransform, actionId, 1, 'header-id', 'tail-id')
+		transactPromise.catch(() => { /* expected rejection - prevent unhandled rejection in browser */ })
+		await expect(transactPromise).to.be.rejected
 
     // Now create the block with an insert
     const insertTransform: Transforms = {

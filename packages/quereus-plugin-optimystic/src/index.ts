@@ -31,12 +31,13 @@ export type {
 	TransactionState,
 } from './types.js';
 
-// Export transaction engine
+// Export transaction engine and validator
 export {
 	QuereusEngine,
 	QUEREUS_ENGINE_ID,
 	createQuereusStatement,
-	createQuereusStatements
+	createQuereusStatements,
+	createQuereusValidator,
 } from './transaction/index.js';
 
-export type { QuereusStatement } from './transaction/index.js';
+export type { QuereusStatement, QuereusValidatorOptions } from './transaction/index.js';

@@ -14,3 +14,6 @@ export {
 
 export type { QuereusStatement } from './quereus-engine.js';
 
+export { createQuereusValidator } from './quereus-validator.js';
+export type { QuereusValidatorOptions } from './quereus-validator.js';
+

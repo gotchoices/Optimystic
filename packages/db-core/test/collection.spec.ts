@@ -317,7 +317,9 @@ describe('Collection', () => {
 
     // Simulate failed sync by making transactor temporarily unavailable
     transactor.setAvailable(false)
-    await expect(collection.updateAndSync()).to.be.rejected
+    const updatePromise = collection.updateAndSync()
+    updatePromise.catch(() => { /* expected rejection - prevent unhandled rejection in browser */ })
+    await expect(updatePromise).to.be.rejected
 
     // Restore transactor and retry
     transactor.setAvailable(true)

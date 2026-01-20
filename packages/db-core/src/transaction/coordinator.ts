@@ -157,6 +157,40 @@ export class TransactionCoordinator {
 	}
 
 	/**
+	 * Get current transforms from all collections.
+	 *
+	 * This collects transforms from each collection's tracker. Useful for
+	 * validation scenarios where transforms need to be extracted after
+	 * engine execution.
+	 */
+	getTransforms(): Map<CollectionId, Transforms> {
+		const transforms = new Map<CollectionId, Transforms>();
+		for (const [collectionId, collection] of this.collections.entries()) {
+			const collectionTransforms = collection.tracker.transforms;
+			const hasChanges =
+				Object.keys(collectionTransforms.inserts).length > 0 ||
+				Object.keys(collectionTransforms.updates).length > 0 ||
+				collectionTransforms.deletes.length > 0;
+			if (hasChanges) {
+				transforms.set(collectionId, collectionTransforms);
+			}
+		}
+		return transforms;
+	}
+
+	/**
+	 * Reset all collection trackers.
+	 *
+	 * This clears pending transforms from all collections. Useful for
+	 * cleaning up after validation or when starting a new transaction.
+	 */
+	resetTransforms(): void {
+		for (const collection of this.collections.values()) {
+			collection.tracker.reset();
+		}
+	}
+
+	/**
 	 * Compute hash of all operations in a transaction.
 	 * This hash is used for validation - validators re-execute the transaction
 	 * and compare their computed operations hash with this one.

@@ -8,9 +8,16 @@ import {
 	QuereusEngine,
 	QUEREUS_ENGINE_ID,
 	createQuereusStatement,
-	createQuereusStatements
+	createQuereusStatements,
+	createQuereusValidator,
 } from '../dist/index.js';
 import register from '../dist/plugin.js';
+import {
+	TransactionCoordinator,
+	createTransactionStamp,
+	createTransactionId,
+	type Transaction,
+} from '@optimystic/db-core';
 
 describe('QuereusEngine', () => {
 	let db: Database;
@@ -150,5 +157,85 @@ describe('QuereusEngine', () => {
 			expect(hash2).to.not.equal(hash1);
 		});
 	});
-});
 
+	describe('Quereus Validator', () => {
+		it('should create a validator with QuereusEngine', async () => {
+			// Create a TransactionCoordinator with empty collections
+			// (for testing validator creation, not actual transaction execution)
+			const mockTransactor = {
+				pend: async () => ({}),
+				commit: async () => {},
+				abort: async () => {},
+				queryClusterNominees: async () => ({ nodes: [], assignments: {} }),
+			};
+			const collections = new Map();
+			const coordinator = new TransactionCoordinator(mockTransactor as any, collections);
+
+			const validator = createQuereusValidator({
+				db,
+				coordinator,
+			});
+
+			expect(validator).to.exist;
+			expect(validator.validate).to.be.a('function');
+		});
+
+		it('should reject transaction with unknown engine', async () => {
+			const mockTransactor = {
+				pend: async () => ({}),
+				commit: async () => {},
+				abort: async () => {},
+				queryClusterNominees: async () => ({ nodes: [], assignments: {} }),
+			};
+			const collections = new Map();
+			const coordinator = new TransactionCoordinator(mockTransactor as any, collections);
+
+			const validator = createQuereusValidator({
+				db,
+				coordinator,
+			});
+
+			// Create a transaction with a different engine ID
+			const stamp = createTransactionStamp('test-peer', Date.now(), 'schema-hash', 'other-engine@1.0.0');
+			const transaction: Transaction = {
+				stamp,
+				statements: [],
+				reads: [],
+				id: createTransactionId(stamp.id, [], []),
+			};
+
+			const result = await validator.validate(transaction, 'ops:abc');
+			expect(result.valid).to.be.false;
+			expect(result.reason).to.include('Unknown engine');
+		});
+
+		it('should reject transaction with schema mismatch', async () => {
+			const mockTransactor = {
+				pend: async () => ({}),
+				commit: async () => {},
+				abort: async () => {},
+				queryClusterNominees: async () => ({ nodes: [], assignments: {} }),
+			};
+			const collections = new Map();
+			const coordinator = new TransactionCoordinator(mockTransactor as any, collections);
+
+			const validator = createQuereusValidator({
+				db,
+				coordinator,
+			});
+
+			// Create a transaction with wrong schema hash
+			const stamp = createTransactionStamp('test-peer', Date.now(), 'wrong-schema-hash', QUEREUS_ENGINE_ID);
+			const transaction: Transaction = {
+				stamp,
+				statements: [],
+				reads: [],
+				id: createTransactionId(stamp.id, [], []),
+			};
+
+			const result = await validator.validate(transaction, 'ops:abc');
+			expect(result.valid).to.be.false;
+			expect(result.reason).to.include('Schema mismatch');
+		});
+	});
+});
