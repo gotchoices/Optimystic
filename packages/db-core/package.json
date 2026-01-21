@@ -1,6 +1,6 @@
 {
   "name": "@optimystic/db-core",
-  "version": "0.0.1",
+  "version": "0.1.0",
   "type": "module",
   "description": "Core database functionality for Optimystic",
   "main": "dist/src/index.js",
