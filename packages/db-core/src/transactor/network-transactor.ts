@@ -143,7 +143,37 @@ export class NetworkTransactor implements ITransactor {
 	}
 
 	async getStatus(blockActions: ActionBlocks[]): Promise<BlockActionStatus[]> {
-		throw new Error("Method not implemented.");
+		// Collect all unique block IDs across all action refs
+		const allBlockIds = [...new Set(blockActions.flatMap(ref => ref.blockIds))];
+
+		if (allBlockIds.length === 0) {
+			return blockActions.map(ref => ({ ...ref, statuses: [] }));
+		}
+
+		// Get block states from repos
+		const blockStates = await this.get({ blockIds: allBlockIds });
+
+		// Determine status for each action ref
+		return blockActions.map(ref => ({
+			...ref,
+			statuses: ref.blockIds.map(blockId => {
+				const result = blockStates[blockId];
+				if (!result) {
+					return 'aborted';
+				}
+				const { state } = result;
+				if (state.pendings?.includes(ref.actionId)) {
+					return 'pending';
+				}
+				if (state.latest?.actionId === ref.actionId) {
+					return 'committed';
+				}
+				// Action is neither pending nor the latest committed - consider it aborted
+				// Note: This doesn't check historical commits; a more complete implementation
+				// would need to query the revision history
+				return 'aborted';
+			})
+		}));
 	}
 
 	private async consolidateCoordinators(

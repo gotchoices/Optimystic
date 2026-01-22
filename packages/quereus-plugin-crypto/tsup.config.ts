@@ -6,13 +6,12 @@ export default defineConfig({
 		plugin: 'src/plugin.ts',
 	},
 	format: ['esm'],
-	dts: {
-		resolve: true,
-	},
+	dts: true,
 	sourcemap: true,
 	clean: true,
 	splitting: false,
 	treeshake: true,
 	skipNodeModulesBundle: true,
+	target: 'node16',
 });
 

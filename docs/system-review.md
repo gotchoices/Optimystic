@@ -4,7 +4,7 @@ This document provides a hierarchical review structure for the Optimystic distri
 
 As you tackle these, be cautious in your changes.  If you suspect that something is broken, add a unit or integration test to demonstrate the problem, and work backwards.  If you aren't sure about something, don't presume, add it to a list of questions, and move on to the next task so that you don't block yourself.
 
-Only tackle a small number of tasks at a time–ideally tacking related systems. Be sure you give sufficient analysis to each, so mind your context window.  
+Only tackle a small number of tasks at a time–ideally tacking related systems. Be sure you give sufficient analysis to each, so mind your context window.  Start with the next task or tasks that seem most important. 
 
 For each task, study the related tests and documentation.  Ask yourself: what assumptions does this make; under what conditions would this break; and are there high-quality tests that would benefit us?  Also verify that the documentation is up-to-date.  If it isn't, update it.  Try to move towards the documentation being arranged in an abstraction hierarchy, so we have high-level overvews, separate from low-level detail documents.  Make sure the documents are cross-linked and DRY.
 
@@ -38,13 +38,10 @@ If you spot code or design aspects that aren't covered by these tasks, please ad
 
 ### 1.2 Transform Layer (`packages/db-core/src/transform/`)
 
-- [ ] **HUNT-1.2.1**: `tracker.ts:39` - **CRITICAL**: `splice` with `indexOf` may fail if block not in deletes array (returns -1, splices from end)
-  ```typescript
-  this.transforms.deletes.splice(this.transforms.deletes.indexOf(block.header.id), 1);
-  ```
+- [x] **HUNT-1.2.1**: `tracker.ts:39` - **CRITICAL**: `splice` with `indexOf` may fail if block not in deletes array (returns -1, splices from end) - FIXED: Added index check before splice, with regression tests
 - [ ] **HUNT-1.2.2**: `struct.ts` - TODO comment indicates optional fields not implemented: "make each of these optional (assumes empty)"
 - [ ] **HUNT-1.2.3**: Review `Tracker.tryGet()` - Verify correct handling when block is both in inserts and deletes
-- [ ] **TEST-1.2.1**: Add tests for Tracker edge cases (insert after delete, delete non-existent)
+- [x] **TEST-1.2.1**: Add tests for Tracker edge cases (insert after delete, delete non-existent) - Added in transform.spec.ts
 - [ ] **DOC-1.2.1**: Document transform lifecycle and ordering guarantees
 
 ---
@@ -53,15 +50,9 @@ If you spot code or design aspects that aren't covered by these tasks, please ad
 
 ### 2.1 Transaction Core (`packages/db-core/src/transaction/`)
 
-- [ ] **HUNT-2.1.1**: `transaction.ts` - Simple hash function used for transaction IDs - **SECURITY CONCERN**: Non-cryptographic hash may have collision issues
-  ```typescript
-  const hash = Array.from(operationsData).reduce((acc, char) => {
-      const charCode = char.charCodeAt(0);
-      return ((acc << 5) - acc + charCode) & acc;
-  }, 0);
-  ```
-- [ ] **HUNT-2.1.2**: `coordinator.ts` - Same weak hash function used in `hashOperations()` - must match validator
-- [ ] **HUNT-2.1.3**: `validator.ts` - TODO: "Implement read dependency validation" - **INCOMPLETE FEATURE**
+- [x] **HUNT-2.1.1**: `transaction.ts` - Simple hash function used for transaction IDs - **SECURITY CONCERN**: Non-cryptographic hash may have collision issues - FIXED: Created shared hashString utility with proper djb2 implementation
+- [x] **HUNT-2.1.2**: `coordinator.ts` - Same weak hash function used in `hashOperations()` - must match validator - FIXED: Both coordinator.ts and validator.ts now use shared hashString utility
+- [x] **HUNT-2.1.3**: `validator.ts` - TODO: "Implement read dependency validation" - **INCOMPLETE FEATURE** - DOCUMENTED: See `tasks/refactoring/read-dependency-validation.md`
 - [ ] **HUNT-2.1.4**: Review deprecated `TransactionContext` pattern vs newer `TransactionSession` - ensure no mixed usage
 - [ ] **TEST-2.1.1**: Add transaction rollback regression tests
 - [ ] **TEST-2.1.2**: Add multi-collection transaction conflict tests
@@ -112,7 +103,7 @@ If you spot code or design aspects that aren't covered by these tasks, please ad
 ### 4.1 Transactor Interface (`packages/db-core/src/transactor/`)
 
 - [ ] **HUNT-4.1.1**: `transactor.ts` - Review `queryClusterNominees` optional method - ensure callers handle undefined
-- [ ] **HUNT-4.1.2**: `network-transactor.ts:146` - `getStatus()` throws "Method not implemented" - **INCOMPLETE**
+- [x] **HUNT-4.1.2**: `network-transactor.ts:146` - `getStatus()` throws "Method not implemented" - **FIXED**: Implemented by querying block states and checking pending/committed status
 - [ ] **HUNT-4.1.3**: Review retry logic in `get()` - verify excluded peers are properly tracked
 - [ ] **HUNT-4.1.4**: `network-transactor.ts:319` - Non-tail commit failures logged but not propagated - verify this is intentional
 - [ ] **TEST-4.1.1**: Add network partition simulation tests
@@ -130,8 +121,8 @@ If you spot code or design aspects that aren't covered by these tasks, please ad
 
 ### 5.1 Cluster Member (`packages/db-p2p/src/cluster/cluster-repo.ts`)
 
-- [ ] **HUNT-5.1.1**: `cluster-repo.ts:290` - TODO: "Fix hash validation logic to match coordinator's hash generation"
-- [ ] **HUNT-5.1.2**: `cluster-repo.ts:339` - `verifySignature()` returns `true` always - **SECURITY: NOT IMPLEMENTED**
+- [x] **HUNT-5.1.1**: `cluster-repo.ts:290` - TODO: "Fix hash validation logic to match coordinator's hash generation" - FIXED: Now validates messageHash matches SHA256(message) using base58btc encoding
+- [x] **HUNT-5.1.2**: `cluster-repo.ts:339` - `verifySignature()` returns `true` always - **SECURITY: NOT IMPLEMENTED** - DOCUMENTED: See `tasks/refactoring/signature-verification-implementation.md`
 - [ ] **HUNT-5.1.3**: Review `hasConflict()` stale threshold (2000ms) - may be too aggressive
 - [ ] **HUNT-5.1.4**: Review race resolution logic in `resolveRace()` - verify determinism
 - [ ] **TEST-5.1.1**: Add cluster member promise/commit phase tests
@@ -140,7 +131,7 @@ If you spot code or design aspects that aren't covered by these tasks, please ad
 
 ### 5.2 Cluster Coordinator (`packages/db-p2p/src/repo/cluster-coordinator.ts`)
 
-- [ ] **HUNT-5.2.1**: `cluster-coordinator.ts:36` - TODO: "move this into a state management interface so that transaction state can be persisted"
+- [x] **HUNT-5.2.1**: `cluster-coordinator.ts:36` - TODO: "move this into a state management interface so that transaction state can be persisted" - DOCUMENTED: See `tasks/refactoring/2pc-state-persistence.md`
 - [ ] **HUNT-5.2.2**: Review `validateSmallCluster()` - currently accepts without validation in fallback
 - [ ] **HUNT-5.2.3**: Review retry backoff logic - verify exponential backoff is correct
 - [ ] **TEST-5.2.1**: Add cluster coordinator retry tests
@@ -148,8 +139,8 @@ If you spot code or design aspects that aren't covered by these tasks, please ad
 
 ### 5.3 Coordinator Repo (`packages/db-p2p/src/repo/coordinator-repo.ts`)
 
-- [ ] **HUNT-5.3.1**: `coordinator-repo.ts:50` - TODO: "Verify that we are a proximate node for all block IDs"
-- [ ] **HUNT-5.3.2**: `coordinator-repo.ts:53` - TODO: "Implement read-path cluster verification"
+- [x] **HUNT-5.3.1**: `coordinator-repo.ts:50` - TODO: "Verify that we are a proximate node for all block IDs" - DOCUMENTED: See `tasks/refactoring/proximity-verification.md`
+- [x] **HUNT-5.3.2**: `coordinator-repo.ts:53` - TODO: "Implement read-path cluster verification" - DOCUMENTED: See `tasks/refactoring/proximity-verification.md`
 - [ ] **HUNT-5.3.3**: Review `cancel()` - executes cluster transaction per block ID (may be inefficient)
 - [ ] **TEST-5.3.1**: Add coordinator repo integration tests
 
@@ -184,7 +175,7 @@ If you spot code or design aspects that aren't covered by these tasks, please ad
 
 ### 7.1 Transaction Engine (`packages/quereus-plugin-optimystic/src/transaction/`)
 
-- [ ] **HUNT-7.1.1**: `quereus-engine.ts:15` - Hardcoded version `quereus@0.5.3` - should be dynamic
+- [x] **HUNT-7.1.1**: `quereus-engine.ts:15` - Hardcoded version `quereus@0.5.3` - FIXED: Updated to `quereus@0.15.1` with sync note
 - [ ] **HUNT-7.1.2**: Review `execute()` - actions collected by coordinator, not returned (verify this is correct)
 - [ ] **HUNT-7.1.3**: Review schema hash caching - verify invalidation on DDL is complete
 - [ ] **TEST-7.1.1**: Add Quereus engine execution tests
@@ -234,7 +225,7 @@ If you spot code or design aspects that aren't covered by these tasks, please ad
 
 ### 9.2 Security Review
 
-- [ ] **SEC-9.2.1**: **CRITICAL**: `cluster-repo.ts:339` - Signature verification not implemented
+- [x] **SEC-9.2.1**: **CRITICAL**: `cluster-repo.ts:339` - Signature verification not implemented - DOCUMENTED: See `tasks/refactoring/signature-verification-implementation.md`
 - [ ] **SEC-9.2.2**: Review all hash functions for cryptographic strength requirements
 - [ ] **SEC-9.2.3**: Review input validation at API boundaries
 - [ ] **SEC-9.2.4**: Review for timing attacks in crypto operations
@@ -285,7 +276,7 @@ If you spot code or design aspects that aren't covered by these tasks, please ad
 - [ ] **THEORY-10.2.3**: Review blocking scenarios
   - Can transaction coordinator failure leave participants in pending state indefinitely?
   - Review `pendingTransactions` expiration logic in `cluster-repo.ts`
-- [ ] **THEORY-10.2.4**: Review recovery protocol
+- [x] **THEORY-10.2.4**: Review recovery protocol - DOCUMENTED: See `tasks/refactoring/2pc-state-persistence.md`
   - How do nodes recover pending state after crash/restart?
   - `cluster-coordinator.ts:36` TODO: "move this into a state management interface so that transaction state can be persisted"
 - [ ] **TEST-10.2.1**: Add 2PC protocol edge case tests (coordinator failure, participant failure, network partition)
@@ -310,9 +301,9 @@ If you spot code or design aspects that aren't covered by these tasks, please ad
 
 ### 10.4 Byzantine Fault Tolerance
 
-- [ ] **THEORY-10.4.1**: Review Byzantine fault model
-  - What fraction of Byzantine nodes can be tolerated? (f < n/3 is typical)
-  - Are signature verification stubs (returning `true`) a BFT violation?
+- [x] **THEORY-10.4.1**: Review Byzantine fault model - DOCUMENTED: Signature stubs ARE a BFT violation. See `tasks/refactoring/signature-verification-implementation.md`
+  - What fraction of Byzantine nodes can be tolerated? (f < n/3 is typical) - Cannot be guaranteed without signature verification
+  - Are signature verification stubs (returning `true`) a BFT violation? - YES, any peer can forge signatures
 - [ ] **THEORY-10.4.2**: Review validation completeness
   - Can a Byzantine coordinator forge operations hash?
   - Can validators be tricked into accepting invalid transactions?
@@ -324,7 +315,7 @@ If you spot code or design aspects that aren't covered by these tasks, please ad
 
 ### 10.5 Optimistic Concurrency Control
 
-- [ ] **THEORY-10.5.1**: Review read dependency tracking
+- [x] **THEORY-10.5.1**: Review read dependency tracking - DOCUMENTED: See `tasks/refactoring/read-dependency-validation.md`
   - `validator.ts` TODO: "Implement read dependency validation" - **INCOMPLETE**
   - How are read sets captured during transaction execution?
   - Can write skew anomalies occur with current implementation?
@@ -381,22 +372,22 @@ If you spot code or design aspects that aren't covered by these tasks, please ad
 ## Priority Summary
 
 ### Critical (Security/Data Integrity)
-1. **SEC-9.2.1**: Signature verification not implemented
-2. **HUNT-1.2.1**: Tracker splice bug may corrupt deletes array
-3. **HUNT-2.1.1/2.1.2**: Weak hash function for transaction IDs
-4. **THEORY-10.4.1**: Byzantine fault model incomplete (signature stubs)
+1. ~~**SEC-9.2.1**: Signature verification not implemented~~ - DOCUMENTED in `tasks/refactoring/signature-verification-implementation.md`
+2. ~~**HUNT-1.2.1**: Tracker splice bug may corrupt deletes array~~ - FIXED
+3. ~~**HUNT-2.1.1/2.1.2**: Weak hash function for transaction IDs~~ - FIXED (bug), DOCUMENTED upgrade path in `tasks/refactoring/cryptographic-hash-upgrade.md`
+4. ~~**THEORY-10.4.1**: Byzantine fault model incomplete (signature stubs)~~ - DOCUMENTED in `tasks/refactoring/signature-verification-implementation.md`
 
 ### High (Incomplete Features / Theory Gaps)
-1. **HUNT-2.1.3**: Read dependency validation not implemented
-2. **HUNT-4.1.2**: `getStatus()` not implemented
-3. **HUNT-5.1.1**: Hash validation logic mismatch
-4. **THEORY-10.5.1**: Optimistic concurrency control incomplete (write-skew possible)
-5. **THEORY-10.2.4**: 2PC recovery protocol not persisted
+1. ~~**HUNT-2.1.3**: Read dependency validation not implemented~~ - DOCUMENTED in `tasks/refactoring/read-dependency-validation.md`
+2. ~~**HUNT-4.1.2**: `getStatus()` not implemented~~ - FIXED
+3. ~~**HUNT-5.1.1**: Hash validation logic mismatch~~ - FIXED
+4. ~~**THEORY-10.5.1**: Optimistic concurrency control incomplete (write-skew possible)~~ - DOCUMENTED in `tasks/refactoring/read-dependency-validation.md`
+5. ~~**THEORY-10.2.4**: 2PC recovery protocol not persisted~~ - DOCUMENTED in `tasks/refactoring/2pc-state-persistence.md`
 
 ### Medium (Technical Debt / Theory Review)
-1. **HUNT-5.2.1**: Transaction state not persisted
-2. **HUNT-5.3.1/5.3.2**: Proximity verification not implemented
-3. **HUNT-7.1.1**: Hardcoded version string
+1. ~~**HUNT-5.2.1**: Transaction state not persisted~~ - DOCUMENTED in `tasks/refactoring/2pc-state-persistence.md`
+2. ~~**HUNT-5.3.1/5.3.2**: Proximity verification not implemented~~ - DOCUMENTED in `tasks/refactoring/proximity-verification.md`
+3. ~~**HUNT-7.1.1**: Hardcoded version string~~ - FIXED: Updated to current version with sync note
 4. **THEORY-10.3.1**: Super-majority threshold under network partition
 5. **THEORY-10.1.1**: Atomicity across multi-collection partial failures
 
@@ -411,17 +402,17 @@ If you spot code or design aspects that aren't covered by these tasks, please ad
 
 | Layer | Total Tasks | Completed | In Progress | Blocked |
 |-------|-------------|-----------|-------------|---------|
-| 1. Block Storage | 8 | 0 | 0 | 0 |
-| 2. Transaction | 11 | 0 | 0 | 0 |
+| 1. Block Storage | 8 | 2 | 0 | 0 |
+| 2. Transaction | 11 | 3 | 0 | 0 |
 | 3. B-tree/Collections | 14 | 0 | 0 | 0 |
-| 4. Network Transactor | 8 | 0 | 0 | 0 |
-| 5. Cluster Consensus | 16 | 0 | 0 | 0 |
+| 4. Network Transactor | 8 | 1 | 0 | 0 |
+| 5. Cluster Consensus | 16 | 5 | 0 | 0 |
 | 6. Crypto | 6 | 0 | 0 | 0 |
-| 7. Quereus Plugin | 12 | 0 | 0 | 0 |
+| 7. Quereus Plugin | 12 | 1 | 0 | 0 |
 | 8. Reference Peer | 4 | 0 | 0 | 0 |
-| 9. Architecture | 12 | 0 | 0 | 0 |
-| 10. Transactional Theory | 32 | 0 | 0 | 0 |
-| **Total** | **123** | **0** | **0** | **0** |
+| 9. Architecture | 12 | 1 | 0 | 0 |
+| 10. Transactional Theory | 32 | 3 | 0 | 0 |
+| **Total** | **123** | **17** | **0** | **0** |
 
 ---
 

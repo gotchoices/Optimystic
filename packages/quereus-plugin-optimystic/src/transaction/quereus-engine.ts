@@ -11,8 +11,10 @@ import { sha256 } from '@noble/hashes/sha256';
 /**
  * Engine ID for Quereus SQL transactions.
  * Format: "quereus@{version}" where version matches the quereus package version.
+ * NOTE: Keep this in sync with @quereus/quereus package.json version.
+ * TODO: Import version dynamically from @quereus/quereus when it exports its version.
  */
-export const QUEREUS_ENGINE_ID = 'quereus@0.5.3';
+export const QUEREUS_ENGINE_ID = 'quereus@0.15.1';
 
 /**
  * Statement format for Quereus transactions.

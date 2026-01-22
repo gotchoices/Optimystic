@@ -64,6 +64,38 @@ describe('Transform functionality', () => {
       expect(oldTransforms.inserts['test-id']).to.deep.equal(testBlock)
       expect(tracker.transforms).to.deep.equal(emptyTransforms())
     })
+
+    it('should not corrupt deletes array when inserting block not in deletes', async () => {
+      const tracker = new Tracker(mockSource)
+      // Pre-populate deletes with some entries
+      tracker.delete('existing-delete-1' as BlockId)
+      tracker.delete('existing-delete-2' as BlockId)
+      expect(tracker.transforms.deletes).to.have.lengthOf(2)
+
+      // Insert a new block that was never deleted
+      const newBlock = { ...testBlock, header: { ...testBlock.header, id: 'new-id' as BlockId } }
+      tracker.insert(newBlock)
+
+      // Deletes array should remain unchanged (no corruption from splice(-1, 1))
+      expect(tracker.transforms.deletes).to.have.lengthOf(2)
+      expect(tracker.transforms.deletes).to.include('existing-delete-1')
+      expect(tracker.transforms.deletes).to.include('existing-delete-2')
+    })
+
+    it('should remove block from deletes when re-inserting previously deleted block', async () => {
+      const tracker = new Tracker(mockSource)
+      const blockId = 'reinserted-block' as BlockId
+      const block = { ...testBlock, header: { ...testBlock.header, id: blockId } }
+
+      // Delete the block first
+      tracker.delete(blockId)
+      expect(tracker.transforms.deletes).to.include(blockId)
+
+      // Re-insert the block
+      tracker.insert(block)
+      expect(tracker.transforms.deletes).to.not.include(blockId)
+      expect(tracker.transforms.inserts[blockId]).to.deep.equal(block)
+    })
   })
 
   describe('Transform Helpers', () => {

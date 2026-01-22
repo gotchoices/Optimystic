@@ -6,6 +6,18 @@ import type { PeerId } from '@libp2p/interface';
 import { peerIdFromPrivateKey } from '@libp2p/peer-id';
 import { generateKeyPair } from '@libp2p/crypto/keys';
 import { multiaddr } from '@multiformats/multiaddr';
+import { sha256 } from 'multiformats/hashes/sha2';
+import { base58btc } from 'multiformats/bases/base58';
+
+/**
+ * Compute message hash using the same algorithm as the coordinator.
+ * Must match cluster-coordinator.ts createMessageHash().
+ */
+const computeMessageHash = async (message: RepoMessage): Promise<string> => {
+	const msgBytes = new TextEncoder().encode(JSON.stringify(message));
+	const hashBytes = await sha256.digest(msgBytes);
+	return base58btc.encode(hashBytes.digest);
+};
 
 const makePeerId = async (): Promise<PeerId> => {
 	const key = await generateKeyPair('Ed25519');
@@ -65,23 +77,26 @@ class MockPeerNetwork implements IPeerNetwork {
 	}
 }
 
-const createClusterRecord = (
-	messageHash: string,
+const createClusterRecord = async (
 	peers: ClusterPeers,
 	operations: RepoMessage['operations'],
 	promises: Record<string, Signature> = {},
 	commits: Record<string, Signature> = {},
 	expiration?: number
-): ClusterRecord => ({
-	messageHash,
-	message: {
+): Promise<ClusterRecord> => {
+	const message: RepoMessage = {
 		operations,
 		expiration: expiration ?? Date.now() + 30000
-	},
-	peers,
-	promises,
-	commits
-});
+	};
+	const messageHash = await computeMessageHash(message);
+	return {
+		messageHash,
+		message,
+		peers,
+		promises,
+		commits
+	};
+};
 
 const makeGetOperation = (blockIds: string[]): RepoMessage['operations'] => [
 	{ get: { blockIds } }
@@ -119,8 +134,7 @@ describe('ClusterMember', () => {
 			const ourId = selfPeerId.toString();
 			const peers = makeClusterPeers([selfPeerId, otherPeerId]);
 
-			const record = createClusterRecord(
-				'hash-1',
+			const record = await createClusterRecord(
 				peers,
 				makeGetOperation(['block-1'])
 			);
@@ -136,8 +150,7 @@ describe('ClusterMember', () => {
 			const peers = makeClusterPeers([selfPeerId]);
 			const existingPromise: Signature = { type: 'approve', signature: 'existing' };
 
-			const record = createClusterRecord(
-				'hash-1',
+			const record = await createClusterRecord(
 				peers,
 				makeGetOperation(['block-1']),
 				{ [ourId]: existingPromise }
@@ -157,8 +170,7 @@ describe('ClusterMember', () => {
 			const otherId = otherPeerId.toString();
 			const peers = makeClusterPeers([selfPeerId, otherPeerId]);
 
-			const record = createClusterRecord(
-				'hash-2',
+			const record = await createClusterRecord(
 				peers,
 				makeGetOperation(['block-1']),
 				{
@@ -178,8 +190,7 @@ describe('ClusterMember', () => {
 			const ourId = selfPeerId.toString();
 			const peers = makeClusterPeers([selfPeerId, otherPeerId]);
 
-			const record = createClusterRecord(
-				'hash-3',
+			const record = await createClusterRecord(
 				peers,
 				makeGetOperation(['block-1']),
 				{ [ourId]: { type: 'approve', signature: 'p1' } } // Missing other's promise
@@ -197,8 +208,7 @@ describe('ClusterMember', () => {
 			const otherId = otherPeerId.toString();
 			const peers = makeClusterPeers([selfPeerId, otherPeerId]);
 
-			const record = createClusterRecord(
-				'hash-reject',
+			const record = await createClusterRecord(
 				peers,
 				makeGetOperation(['block-1']),
 				{ [otherId]: { type: 'reject', signature: 'rejected', rejectReason: 'test' } }
@@ -247,8 +257,7 @@ describe('ClusterMember', () => {
 			const expiration = Date.now() + 30000;
 
 			// First update with peer2's promise
-			const record1 = createClusterRecord(
-				'merge-test',
+			const record1 = await createClusterRecord(
 				peers,
 				makeGetOperation(['block-1']),
 				{ [peer2Id]: { type: 'approve', signature: 'p2' } },
@@ -258,15 +267,11 @@ describe('ClusterMember', () => {
 
 			await clusterMemberInstance.update(record1);
 
-			// Second update with peer3's promise - same expiration for same message content
-			const record2 = createClusterRecord(
-				'merge-test',
-				peers,
-				makeGetOperation(['block-1']),
-				{ [peer3Id]: { type: 'approve', signature: 'p3' } },
-				{},
-				expiration
-			);
+			// Second update with peer3's promise - same message content, so same hash
+			const record2: ClusterRecord = {
+				...record1,
+				promises: { [peer3Id]: { type: 'approve', signature: 'p3' } }
+			};
 
 			const result = await clusterMemberInstance.update(record2);
 
@@ -277,17 +282,16 @@ describe('ClusterMember', () => {
 		it('throws on message content mismatch', async () => {
 			const peers = makeClusterPeers([selfPeerId]);
 
-			const record1 = createClusterRecord(
-				'mismatch-test',
+			const record1 = await createClusterRecord(
 				peers,
 				makeGetOperation(['block-1'])
 			);
 
 			await clusterMemberInstance.update(record1);
 
-			// Same hash but different message content
+			// Same hash but different message content - this is a forgery attempt
 			const record2: ClusterRecord = {
-				messageHash: 'mismatch-test',
+				messageHash: record1.messageHash,
 				message: {
 					operations: makeGetOperation(['block-2']), // Different!
 					expiration: Date.now() + 30000
@@ -315,8 +319,7 @@ describe('ClusterMember', () => {
 
 			// Record already at consensus with our commit present
 			// Implementation checks hasLocalCommit - if we already committed, don't re-execute
-			const record = createClusterRecord(
-				'consensus-test',
+			const record = await createClusterRecord(
 				peers,
 				makeGetOperation(['block-1']),
 				{
@@ -343,8 +346,7 @@ describe('ClusterMember', () => {
 			const peers = makeClusterPeers([selfPeerId, otherPeerId]);
 
 			// All promises present, other has committed, we need to commit
-			const record = createClusterRecord(
-				'commit-needed-test',
+			const record = await createClusterRecord(
 				peers,
 				makeGetOperation(['block-1']),
 				{
@@ -368,8 +370,7 @@ describe('ClusterMember', () => {
 		it('serializes concurrent updates for same transaction', async () => {
 			const peers = makeClusterPeers([selfPeerId]);
 
-			const record = createClusterRecord(
-				'concurrent-test',
+			const record = await createClusterRecord(
 				peers,
 				makeGetOperation(['block-1'])
 			);
@@ -391,8 +392,7 @@ describe('ClusterMember', () => {
 			const peers = makeClusterPeers([selfPeerId]);
 
 			// First transaction operates on block-1
-			const record1 = createClusterRecord(
-				'conflict-1',
+			const record1 = await createClusterRecord(
 				peers,
 				makePendOperation('a1', 'block-1')
 			);
@@ -400,8 +400,7 @@ describe('ClusterMember', () => {
 			await clusterMemberInstance.update(record1);
 
 			// Second transaction also operates on block-1
-			const record2 = createClusterRecord(
-				'conflict-2',
+			const record2 = await createClusterRecord(
 				peers,
 				makePendOperation('a2', 'block-1')
 			);
@@ -415,16 +414,14 @@ describe('ClusterMember', () => {
 			const ourId = selfPeerId.toString();
 			const peers = makeClusterPeers([selfPeerId]);
 
-			const record1 = createClusterRecord(
-				'no-conflict-1',
+			const record1 = await createClusterRecord(
 				peers,
 				makePendOperation('a1', 'block-1')
 			);
 
 			await clusterMemberInstance.update(record1);
 
-			const record2 = createClusterRecord(
-				'no-conflict-2',
+			const record2 = await createClusterRecord(
 				peers,
 				makePendOperation('a2', 'block-2')
 			);
@@ -459,8 +456,7 @@ describe('ClusterMember', () => {
 				deletes: []
 			};
 
-			const record = createClusterRecord(
-				'validation-test',
+			const record = await createClusterRecord(
 				peers,
 				[{
 					pend: {
@@ -497,8 +493,7 @@ describe('ClusterMember', () => {
 				deletes: []
 			};
 
-			const record = createClusterRecord(
-				'validation-fail-test',
+			const record = await createClusterRecord(
 				peers,
 				[{
 					pend: {

@@ -6,6 +6,7 @@ import { ClusterClient } from "./client.js";
 import type { PeerId } from "@libp2p/interface";
 import { peerIdFromString } from "@libp2p/peer-id";
 import { sha256 } from "multiformats/hashes/sha2";
+import { base58btc } from "multiformats/bases/base58";
 import { toString as uint8ArrayToString } from 'uint8arrays/to-string';
 import { createLogger } from '../logger.js'
 import type { PartitionDetector } from "./partition-detector.js";
@@ -287,8 +288,11 @@ export class ClusterMember implements ICluster {
 	}
 
 	private async validateRecord(record: ClusterRecord): Promise<void> {
-		// TODO: Fix hash validation logic to match coordinator's hash generation
-		// The coordinator creates the hash from the message, but this tries to re-hash the hash itself
+		// Validate message hash matches the message content
+		const expectedHash = await this.computeMessageHash(record.message);
+		if (expectedHash !== record.messageHash) {
+			throw new Error(`Message hash mismatch: expected=${expectedHash}, received=${record.messageHash}`);
+		}
 
 		// Validate signatures
 		await this.validateSignatures(record);
@@ -299,10 +303,14 @@ export class ClusterMember implements ICluster {
 		}
 	}
 
-	private async computeMessageHash(record: ClusterRecord): Promise<string> {
-		const msgBytes = new TextEncoder().encode(record.messageHash + JSON.stringify(record.message));
+	/**
+	 * Compute message hash using the same algorithm as the coordinator.
+	 * Must match cluster-coordinator.ts createMessageHash().
+	 */
+	private async computeMessageHash(message: RepoMessage): Promise<string> {
+		const msgBytes = new TextEncoder().encode(JSON.stringify(message));
 		const hashBytes = await sha256.digest(msgBytes);
-		return uint8ArrayToString(hashBytes.digest, 'base64url');
+		return base58btc.encode(hashBytes.digest);
 	}
 
 	private async validateSignatures(record: ClusterRecord): Promise<void> {

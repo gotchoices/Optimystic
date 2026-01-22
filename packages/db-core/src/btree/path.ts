@@ -1,4 +1,4 @@
-import type { BranchNode, LeafNode } from "./nodes";
+import type { BranchNode, LeafNode } from "./nodes.js";
 
 export class PathBranch<TKey> {
 	constructor (

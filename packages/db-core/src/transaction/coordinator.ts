@@ -5,7 +5,7 @@ import type { Collection } from "../collection/collection.js";
 import { TransactionContext } from "./context.js";
 import { createActionsStatements } from "./actions-engine.js";
 import { createTransactionStamp, createTransactionId } from "./transaction.js";
-import { Log, blockIdsForTransforms, transformsFromTransform } from "../index.js";
+import { Log, blockIdsForTransforms, transformsFromTransform, hashString } from "../index.js";
 
 /**
  * Represents an operation on a block within a collection.
@@ -197,11 +197,7 @@ export class TransactionCoordinator {
 	 */
 	private hashOperations(operations: readonly Operation[]): string {
 		const operationsData = JSON.stringify(operations);
-		const hash = Array.from(operationsData).reduce((acc, char) => {
-			const charCode = char.charCodeAt(0);
-			return ((acc << 5) - acc + charCode) & acc;
-		}, 0);
-		return `ops:${Math.abs(hash).toString(36)}`;
+		return `ops:${hashString(operationsData)}`;
 	}
 
 	/**

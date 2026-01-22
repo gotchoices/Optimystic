@@ -1,4 +1,4 @@
-import type { ActionId } from "../src/collection/action";
+import type { ActionId } from "../src/collection/action.js";
 import { toString as uint8ArrayToString } from 'uint8arrays/to-string';
 
 // Helper function to generate deterministic UUIDs for testing

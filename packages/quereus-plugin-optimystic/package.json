@@ -45,6 +45,7 @@
     "@chainsafe/libp2p-gossipsub": "^14.1.1",
     "@chainsafe/libp2p-yamux": "^7.0.4",
     "@libp2p/bootstrap": "^11.0.46",
+    "@libp2p/crypto": "^5.1.13",
     "@libp2p/identify": "^3.0.38",
     "@libp2p/interface": "^2.10.5",
     "@libp2p/kad-dht": "^15.1.10",
@@ -54,7 +55,8 @@
     "@optimystic/db-core": "workspace:^",
     "@optimystic/db-p2p": "workspace:^",
     "debug": "^4.4.1",
-    "libp2p": "^2.9.0"
+    "libp2p": "^2.9.0",
+    "uint8arrays": "^5.1.0"
   },
   "peerDependencies": {
     "@quereus/quereus": "^0.13.0"

@@ -1,5 +1,6 @@
 import type { BlockId } from "../blocks/index.js";
 import type { CollectionId } from "../collection/index.js";
+import { hashString } from "../utility/hash-string.js";
 
 /**
  * Transaction Stamp: Created at BEGIN, stable throughout transaction lifecycle.
@@ -94,19 +95,7 @@ export function createTransactionId(
 	return `tx:${hashString(txData)}`;
 }
 
-/**
- * Simple hash function for creating IDs.
- * Uses a basic hash for now - can be replaced with proper cryptographic hash later.
- */
-function hashString(str: string): string {
-	let hash = 0;
-	for (let i = 0; i < str.length; i++) {
-		const char = str.charCodeAt(i);
-		hash = ((hash << 5) - hash) + char;
-		hash = hash & hash; // Convert to 32-bit integer
-	}
-	return Math.abs(hash).toString(36);
-}
+
 
 /**
  * Transaction engine interface.

@@ -48,8 +48,10 @@
     "dep-check": "aegir dep-check"
   },
   "devDependencies": {
+    "@types/debug": "^4.1.12",
     "@types/node": "^22.13.10",
-    "aegir": "^45.1.4"
+    "aegir": "^45.1.4",
+    "typescript": "^5.9.3"
   },
   "dependencies": {
     "@libp2p/interface": "^2.10.5",

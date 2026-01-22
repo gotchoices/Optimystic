@@ -1,6 +1,6 @@
-import type { BlockId, BlockStore } from "../blocks";
-import type { ITreeNode } from "./nodes";
-import type { TreeBlock } from "./tree-block";
+import type { BlockId, BlockStore } from "../blocks/index.js";
+import type { ITreeNode } from "./nodes.js";
+import type { TreeBlock } from "./tree-block.js";
 
 export interface ITreeTrunk {
 	/** Gets the root node of the tree */

@@ -2,6 +2,7 @@ import type { BlockId, CollectionId, IBlock, BlockOperations, Transforms, ITrans
 import type { Transaction, ITransactionEngine, ITransactionValidator, ValidationResult, CollectionActions } from './transaction.js';
 import type { Collection } from '../collection/collection.js';
 import { Tracker } from '../transform/tracker.js';
+import { hashString } from '../utility/hash-string.js';
 
 /**
  * Represents an operation on a block within a collection.
@@ -140,11 +141,7 @@ export class TransactionValidator implements ITransactionValidator {
 	 */
 	private hashOperations(operations: readonly Operation[]): string {
 		const operationsData = JSON.stringify(operations);
-		const hash = Array.from(operationsData).reduce((acc, char) => {
-			const charCode = char.charCodeAt(0);
-			return ((acc << 5) - acc + charCode) & acc;
-		}, 0);
-		return `ops:${Math.abs(hash).toString(36)}`;
+		return `ops:${hashString(operationsData)}`;
 	}
 }
 

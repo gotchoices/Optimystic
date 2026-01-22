@@ -36,7 +36,10 @@ export class Tracker<T extends IBlock> implements IBlockStore<T> {
 
 	insert(block: T) {
 		this.transforms.inserts[block.header.id] = structuredClone(block);
-		this.transforms.deletes.splice(this.transforms.deletes.indexOf(block.header.id), 1);
+		const deleteIndex = this.transforms.deletes.indexOf(block.header.id);
+		if (deleteIndex >= 0) {
+			this.transforms.deletes.splice(deleteIndex, 1);
+		}
 	}
 
 	update(blockId: BlockId, op: BlockOperation) {

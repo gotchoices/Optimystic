@@ -1,14 +1,26 @@
 {
-	"extends": "aegir/src/config/tsconfig.aegir.json",
 	"compilerOptions": {
+		"target": "ES2022",
+		"module": "NodeNext",
+		"moduleResolution": "NodeNext",
+		"lib": ["ES2022"],
 		"outDir": "dist",
+		"rootDir": ".",
+		"strict": true,
 		"strictFunctionTypes": true,
 		"noUncheckedIndexedAccess": true,
+		"esModuleInterop": true,
+		"allowSyntheticDefaultImports": true,
 		"skipLibCheck": true,
-		"incremental": false,
-		"composite": false,
-		"resolveJsonModule": true
+		"forceConsistentCasingInFileNames": true,
+		"declaration": true,
+		"declarationMap": true,
+		"sourceMap": true,
+		"resolveJsonModule": true,
+		"allowImportingTsExtensions": false,
+		"verbatimModuleSyntax": false
 	},
-	"include": ["src/**/*"]
+	"include": ["src"],
+	"exclude": ["node_modules", "dist"]
 }
 

@@ -10,6 +10,7 @@ export * from "./transaction/index.js";
 export * from "./transactor/index.js";
 export * from "./transform/index.js";
 export * from "./utility/groupby.js";
+export * from "./utility/hash-string.js";
 export * from "./utility/latches.js";
 export * from "./utility/nameof.js";
 export * from "./utility/ensured.js";
