@@ -171,9 +171,7 @@ export class BTree<TKey, TEntry> {
 		const path = await this.find(newKey);
 		if (path.on) {
 			const result = await this.updateAt(path, getUpdated(this.getEntry(path)));	// Don't use internalUpdate - need to freeze and check for mutation
-			if (result[0].on) {
-				result[0].version = ++this._version;
-			}
+			// Note: updateAt already increments version, so don't double-increment here
 			return result;
 		} else {
 			await this.internalInsertAt(path, Object.freeze(newEntry));
@@ -456,7 +454,7 @@ export class BTree<TKey, TEntry> {
 		if (path.on) {
 			apply(this.store, path.leafNode, [entries$, path.leafIndex, 1, []]);
 			if (path.branches.length > 0) {   // Only worry about underflows, balancing, etc. if not root
-				if (path.leafIndex === 0) { // If we deleted index 0, update branches with new key
+				if (path.leafIndex === 0 && path.leafNode.entries.length > 0) { // If we deleted index 0 and leaf is not empty, update branches with new key
 					const pathBranch = path.branches.at(-1)!;
 					this.updatePartition(pathBranch.index, path, path.branches.length - 1,
 						this.keyFromPath(path));
@@ -682,7 +680,7 @@ export class BTree<TKey, TEntry> {
 			return path.branches[depth + 1]?.node ?? path.leafNode;
 		}
 
-		if (depth === 0 || (branch.nodes.length >= NodeCapacity << 1)) {
+		if (depth === 0 || (branch.nodes.length >= NodeCapacity >>> 1)) {
 			return undefined;
 		}
 
