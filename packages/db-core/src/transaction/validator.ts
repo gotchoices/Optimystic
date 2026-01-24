@@ -123,13 +123,13 @@ export class TransactionValidator implements ITransactionValidator {
 	 */
 	private collectOperations(transforms: Map<CollectionId, Transforms>): readonly Operation[] {
 		return Array.from(transforms.entries()).flatMap(([collectionId, t]) => [
-			...Object.entries(t.inserts).map(([blockId, block]) =>
+			...Object.entries(t.inserts ?? {}).map(([blockId, block]) =>
 				({ type: 'insert' as const, collectionId, blockId, block })
 			),
-			...Object.entries(t.updates).map(([blockId, operations]) =>
+			...Object.entries(t.updates ?? {}).map(([blockId, operations]) =>
 				({ type: 'update' as const, collectionId, blockId, operations })
 			),
-			...t.deletes.map(blockId =>
+			...(t.deletes ?? []).map(blockId =>
 				({ type: 'delete' as const, collectionId, blockId })
 			)
 		]);

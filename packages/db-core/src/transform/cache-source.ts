@@ -39,13 +39,13 @@ export class CacheSource<T extends IBlock> implements BlockSource<T> {
 
 	/** Mutates the cache without affecting the source */
 	transformCache(transform: Transforms) {
-		for (const blockId of transform.deletes) {
+		for (const blockId of transform.deletes ?? []) {
 			this.cache.delete(blockId);
 		}
-		for (const [, block] of Object.entries(transform.inserts)) {
+		for (const [, block] of Object.entries(transform.inserts ?? {})) {
 			this.cache.set(block.header.id, structuredClone(block) as T);
 		}
-		for (const [blockId, operations] of Object.entries(transform.updates)) {
+		for (const [blockId, operations] of Object.entries(transform.updates ?? {})) {
 			for (const op of operations) {
 				const block = this.cache.get(blockId);
 				if (block) {

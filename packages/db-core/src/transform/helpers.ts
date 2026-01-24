@@ -41,21 +41,21 @@ export function emptyTransforms(): Transforms {
 }
 
 export function copyTransforms(transform: Transforms): Transforms {
-	return { inserts: { ...transform.inserts }, updates: { ...transform.updates }, deletes: transform.deletes };
+	return { inserts: { ...transform.inserts }, updates: { ...transform.updates }, deletes: transform.deletes ? [...transform.deletes] : undefined };
 }
 
 export function mergeTransforms(a: Transforms, b: Transforms): Transforms {
 	return {
 		inserts: { ...a.inserts, ...b.inserts },
 		updates: { ...a.updates, ...b.updates },
-		deletes: [...a.deletes, ...b.deletes]
+		deletes: [...(a.deletes ?? []), ...(b.deletes ?? [])]
 	};
 }
 
 export function isTransformsEmpty(transform: Transforms): boolean {
-	return Object.keys(transform.inserts).length === 0
-		&& Object.keys(transform.updates).length === 0
-		&& transform.deletes.length === 0;
+	return Object.keys(transform.inserts ?? {}).length === 0
+		&& Object.keys(transform.updates ?? {}).length === 0
+		&& (transform.deletes?.length ?? 0) === 0;
 }
 
 export function concatTransforms(...transforms: Transforms[]): Transforms {
@@ -65,9 +65,9 @@ export function concatTransforms(...transforms: Transforms[]): Transforms {
 
 export function transformForBlockId(transform: Transforms, blockId: BlockId): Transform {
 	return {
-		...(blockId in transform.inserts ? { insert: transform.inserts[blockId] } : {}),
-		...(blockId in transform.updates ? { updates: transform.updates[blockId] } : {}),
-		...(blockId in transform.deletes ? { delete: true } : {})
+		...(transform.inserts && blockId in transform.inserts ? { insert: transform.inserts[blockId] } : {}),
+		...(transform.updates && blockId in transform.updates ? { updates: transform.updates[blockId] } : {}),
+		...(transform.deletes?.includes(blockId) ? { delete: true } : {})
 	};
 }
 
@@ -80,13 +80,13 @@ export function transformsFromTransform(transform: Transform, blockId: BlockId):
 }
 
 export function applyTransformToStore<T extends IBlock>(transform: Transforms, store: BlockStore<T>) {
-	for (const blockId of transform.deletes) {
+	for (const blockId of transform.deletes ?? []) {
 		store.delete(blockId);
 	}
-	for (const [, block] of Object.entries(transform.inserts)) {
+	for (const [, block] of Object.entries(transform.inserts ?? {})) {
 		store.insert(block as T);
 	}
-	for (const [blockId, operations] of Object.entries(transform.updates)) {
+	for (const [blockId, operations] of Object.entries(transform.updates ?? {})) {
 		for (const op of operations) {
 			store.update(blockId, op);
 		}
@@ -112,6 +112,6 @@ export function concatTransform(transforms: Transforms, blockId: BlockId, transf
 	return {
 		inserts: { ...transforms.inserts, ...(transform.insert ? { [blockId]: transform.insert } : {}) },
 		updates: { ...transforms.updates, ...(transform.updates ? { [blockId]: transform.updates } : {}) },
-		deletes: [...transforms.deletes, ...(transform.delete ? [blockId] : [])]
+		deletes: [...(transforms.deletes ?? []), ...(transform.delete ? [blockId] : [])]
 	};
 }

@@ -78,9 +78,9 @@ export class TransactionCoordinator {
 				transforms: collection.tracker.transforms
 			}))
 			.filter(({ transforms }) =>
-				Object.keys(transforms.inserts).length +
-				Object.keys(transforms.updates).length +
-				transforms.deletes.length > 0
+				Object.keys(transforms.inserts ?? {}).length +
+				Object.keys(transforms.updates ?? {}).length +
+				(transforms.deletes?.length ?? 0) > 0
 			);
 
 		if (collectionData.length === 0) {
@@ -111,13 +111,13 @@ export class TransactionCoordinator {
 		// This hash is used for validation - validators re-execute the transaction
 		// and compare their computed operations hash with this one
 		const allOperations = collectionData.flatMap(({ collectionId, transforms }) => [
-			...Object.entries(transforms.inserts).map(([blockId, block]) =>
+			...Object.entries(transforms.inserts ?? {}).map(([blockId, block]) =>
 				({ type: 'insert' as const, collectionId, blockId, block })
 			),
-			...Object.entries(transforms.updates).map(([blockId, operations]) =>
+			...Object.entries(transforms.updates ?? {}).map(([blockId, operations]) =>
 				({ type: 'update' as const, collectionId, blockId, operations })
 			),
-			...transforms.deletes.map(blockId =>
+			...(transforms.deletes ?? []).map(blockId =>
 				({ type: 'delete' as const, collectionId, blockId })
 			)
 		]);
@@ -168,9 +168,9 @@ export class TransactionCoordinator {
 		for (const [collectionId, collection] of this.collections.entries()) {
 			const collectionTransforms = collection.tracker.transforms;
 			const hasChanges =
-				Object.keys(collectionTransforms.inserts).length > 0 ||
-				Object.keys(collectionTransforms.updates).length > 0 ||
-				collectionTransforms.deletes.length > 0;
+				Object.keys(collectionTransforms.inserts ?? {}).length > 0 ||
+				Object.keys(collectionTransforms.updates ?? {}).length > 0 ||
+				(collectionTransforms.deletes?.length ?? 0) > 0;
 			if (hasChanges) {
 				transforms.set(collectionId, collectionTransforms);
 			}
@@ -293,13 +293,13 @@ export class TransactionCoordinator {
 
 		// 3. Compute operations hash for validation
 		const allOperations = Array.from(collectionTransforms.entries()).flatMap(([collectionId, transforms]) => [
-			...Object.entries(transforms.inserts).map(([blockId, block]) =>
+			...Object.entries(transforms.inserts ?? {}).map(([blockId, block]) =>
 				({ type: 'insert' as const, collectionId, blockId, block })
 			),
-			...Object.entries(transforms.updates).map(([blockId, operations]) =>
+			...Object.entries(transforms.updates ?? {}).map(([blockId, operations]) =>
 				({ type: 'update' as const, collectionId, blockId, operations })
 			),
-			...transforms.deletes.map(blockId =>
+			...(transforms.deletes ?? []).map(blockId =>
 				({ type: 'delete' as const, collectionId, blockId })
 			)
 		]);

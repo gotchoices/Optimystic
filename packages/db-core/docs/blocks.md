@@ -9,7 +9,7 @@ Blocks are the fundamental storage units in Optimystic, designed to be:
 - **Versioned** - Changes are tracked through operations and transforms
 - **Distributed** - Can be stored and retrieved across the network
 - **Typed** - Each block has a registered type for identification
-- **Addressable** - Uniquely identified by base32-encoded block IDs
+- **Addressable** - Uniquely identified by base64url-encoded block IDs
 
 ## Core Components
 
@@ -172,7 +172,7 @@ The block subsystem integrates with Optimystic's transform system for atomic upd
 const transforms: Transforms = {
   inserts: { [blockId]: newBlock },
   updates: { [blockId]: [operation1, operation2] },
-  deletes: new Set([deletedBlockId])
+  deletes: [deletedBlockId]
 };
 
 // Apply transforms to a store
@@ -195,7 +195,7 @@ console.log(await testStore.tryGet(blockId));
 
 ## Implementation Notes
 
-- **Block IDs**: Base32-encoded strings for network efficiency
+- **Block IDs**: Base64url-encoded 256-bit random values for DHT address space and collision resistance
 - **Deep Cloning**: Operations use `structuredClone` for immutability
 - **Serializable**: Blocks should be serializable via the JSON.parse and JSON.stringify
 - **Error Handling**: Missing blocks throw descriptive errors

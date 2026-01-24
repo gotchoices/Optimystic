@@ -1,4 +1,4 @@
-export type BlockId = string;	// base32 encoded
+export type BlockId = string;	// base64url encoded (256-bit random)
 export type BlockType = string;	// Generally a short code
 
 export type BlockHeader = {

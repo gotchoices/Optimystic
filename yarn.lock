@@ -3707,7 +3707,7 @@ __metadata:
   dependencies:
     debug: "npm:^4.4.3"
     fast-json-patch: "npm:^3.1.1"
-    inheritree: "npm:^0.3.2"
+    inheritree: "npm:^0.3.4"
     moat-maker: "npm:^2.2.0"
     temporal-polyfill: "npm:^0.3.0"
     uint8arrays: "npm:^5.1.0"
@@ -10340,10 +10340,10 @@ __metadata:
   languageName: node
   linkType: hard
 
-"inheritree@npm:^0.3.2":
-  version: 0.3.2
-  resolution: "inheritree@npm:0.3.2"
-  checksum: 10c0/f60cbf77fe12d024a2730deef475f1a16879e335a40e49ba786e833197d11528f0ccff96b1414d2344cf350b5e1c991c94e8d98a59b87bd4a23145649189fc8e
+"inheritree@npm:^0.3.4":
+  version: 0.3.4
+  resolution: "inheritree@npm:0.3.4"
+  checksum: 10c0/31c3791c5d140a04c952ccd9ca8db05bc5a5cfbc89cd6b966f483e5548819f084a9d1776a4f8e2d31c5da5f627c383a8ef62a5ae228ee3625fb3889811c97c27
   languageName: node
   linkType: hard
 

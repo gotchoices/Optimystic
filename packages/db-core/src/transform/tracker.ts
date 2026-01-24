@@ -14,12 +14,12 @@ export class Tracker<T extends IBlock> implements IBlockStore<T> {
 	async tryGet(id: BlockId): Promise<T | undefined> {
 		const block = await this.source.tryGet(id);
 		if (block) {
-			const ops = this.transforms.updates[id] ?? [];
+			const ops = this.transforms.updates?.[id] ?? [];
 			ops.forEach(op => applyOperation(block!, op));
 			if (this.transforms.deletes?.includes(id)) {
 				return undefined;
 			}
-		} else if (Object.hasOwn(this.transforms.inserts, id)) {
+		} else if (this.transforms.inserts && Object.hasOwn(this.transforms.inserts, id)) {
 			return structuredClone(this.transforms.inserts[id]) as T;
 		}
 
@@ -35,26 +35,30 @@ export class Tracker<T extends IBlock> implements IBlockStore<T> {
 	}
 
 	insert(block: T) {
-		this.transforms.inserts[block.header.id] = structuredClone(block);
-		const deleteIndex = this.transforms.deletes.indexOf(block.header.id);
+		const inserts = this.transforms.inserts ??= {};
+		inserts[block.header.id] = structuredClone(block);
+		const deletes = this.transforms.deletes;
+		const deleteIndex = deletes?.indexOf(block.header.id) ?? -1;
 		if (deleteIndex >= 0) {
-			this.transforms.deletes.splice(deleteIndex, 1);
+			deletes!.splice(deleteIndex, 1);
 		}
 	}
 
 	update(blockId: BlockId, op: BlockOperation) {
-		const inserted = this.transforms.inserts[blockId];
+		const inserted = this.transforms.inserts?.[blockId];
 		if (inserted) {
 			applyOperation(inserted, op);
 		} else {
-			ensured(this.transforms.updates, blockId, () => []).push(structuredClone(op));
+			const updates = this.transforms.updates ??= {};
+			ensured(updates, blockId, () => []).push(structuredClone(op));
 		}
 	}
 
 	delete(blockId: BlockId) {
-		delete this.transforms.inserts[blockId];
-		delete this.transforms.updates[blockId];
-		this.transforms.deletes.push(blockId);
+		if (this.transforms.inserts) delete this.transforms.inserts[blockId];
+		if (this.transforms.updates) delete this.transforms.updates[blockId];
+		const deletes = this.transforms.deletes ??= [];
+		deletes.push(blockId);
 	}
 
 	reset(newTransform = emptyTransforms()) {
