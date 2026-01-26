@@ -49,6 +49,15 @@ export type NodeOptions = {
 		superMajorityThreshold?: number; // fraction of peers needed for super-majority (default: 0.67)
 	};
 
+	/**
+	 * Responsibility K - the replica set size for determining cluster membership.
+	 * This is distinct from kBucketSize (DHT routing) and clusterSize (consensus quorum).
+	 * When a node receives a request, it checks if it's in the top responsibilityK
+	 * peers (by XOR distance) for the key. If not, it redirects to closer peers.
+	 * Default: 1 (only the closest peer is responsible)
+	 */
+	responsibilityK?: number;
+
 	/** Arachnode storage configuration */
 	arachnode?: {
 		enableRingZulu?: boolean; // default: true
@@ -152,7 +161,8 @@ export async function createLibp2pNode(options: NodeOptions): Promise<Libp2p> {
 					protocolPrefix: `/optimystic/${options.networkName}`,
 					configuredClusterSize: options.clusterSize ?? 10,
 					allowClusterDownsize: options.clusterPolicy?.allowDownsize ?? true,
-					clusterSizeTolerance: options.clusterPolicy?.sizeTolerance ?? 0.5
+					clusterSizeTolerance: options.clusterPolicy?.sizeTolerance ?? 0.5,
+					responsibilityK: options.responsibilityK ?? 1
 				});
 				return serviceFactory({
 					logger: components.logger,
@@ -163,7 +173,8 @@ export async function createLibp2pNode(options: NodeOptions): Promise<Libp2p> {
 
 			repo: (components: any) => {
 				const serviceFactory = repoService({
-					protocolPrefix: `/optimystic/${options.networkName}`
+					protocolPrefix: `/optimystic/${options.networkName}`,
+					responsibilityK: options.responsibilityK ?? 1
 				});
 				return serviceFactory({
 					logger: components.logger,

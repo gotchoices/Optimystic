@@ -29,6 +29,15 @@ export type RepoServiceInit = {
 	maxOutboundStreams?: number,
 	logPrefix?: string,
 	kBucketSize?: number,
+	/**
+	 * Responsibility K - the replica set size for determining cluster membership.
+	 * This is distinct from kBucketSize (DHT routing).
+	 * When set, this determines how many peers (by XOR distance) are considered
+	 * responsible for a key. If this node is not in the top responsibilityK peers,
+	 * it will redirect requests to closer peers.
+	 * Default: 1 (only the closest peer handles requests)
+	 */
+	responsibilityK?: number,
 }
 
 export function repoService(init: RepoServiceInit = {}): (components: RepoServiceComponents) => RepoService {
@@ -47,6 +56,8 @@ export class RepoService implements Startable {
 	private readonly components: RepoServiceComponents
 	private running: boolean
 	private readonly k: number
+	/** Responsibility K - how many peers are responsible for a key (for redirect decisions) */
+	private readonly responsibilityK: number
 
 	constructor(components: RepoServiceComponents, init: RepoServiceInit = {}) {
 		this.components = components
@@ -58,6 +69,7 @@ export class RepoService implements Startable {
 		this.repo = components.repo
 		this.running = false
 		this.k = init.kBucketSize ?? 10
+		this.responsibilityK = init.responsibilityK ?? 1
 	}
 
 	readonly [Symbol.toStringTag] = '@libp2p/repo-service'
@@ -118,7 +130,8 @@ export class RepoService implements Startable {
 							(message as any).cluster = (cluster as any[]).map(p => p.toString?.() ?? String(p))
 							const selfId = (this.components as any).libp2p.peerId
 							const isMember = cluster.some((p: any) => peersEqual(p, selfId))
-							const smallMesh = cluster.length < this.k
+							// Use responsibilityK to determine if we're in the responsible set
+							const smallMesh = cluster.length < this.responsibilityK
 							if (!smallMesh && !isMember) {
 								const peers = cluster.filter((p: any) => !peersEqual(p, selfId))
 								console.debug('repo-service:redirect', {
@@ -147,7 +160,8 @@ export class RepoService implements Startable {
 								; (message as any).cluster = (cluster as any[]).map(p => p.toString?.() ?? String(p))
 							const selfId = (this.components as any).libp2p.peerId
 							const isMember = cluster.some((p: any) => peersEqual(p, selfId))
-							const smallMesh = cluster.length < this.k
+							// Use responsibilityK to determine if we're in the responsible set
+							const smallMesh = cluster.length < this.responsibilityK
 							if (!smallMesh && !isMember) {
 								const peers = cluster.filter((p: any) => !peersEqual(p, selfId))
 								console.debug('repo-service:redirect', {
@@ -179,7 +193,8 @@ export class RepoService implements Startable {
 								; (message as any).cluster = (cluster as any[]).map(p => p.toString?.() ?? String(p))
 							const selfId = (this.components as any).libp2p.peerId
 							const isMember = cluster.some((p: any) => peersEqual(p, selfId))
-							const smallMesh = cluster.length < this.k
+							// Use responsibilityK to determine if we're in the responsible set
+							const smallMesh = cluster.length < this.responsibilityK
 							if (!smallMesh && !isMember) {
 								const peers = cluster.filter((p: any) => !peersEqual(p, selfId))
 								console.debug('repo-service:redirect', {

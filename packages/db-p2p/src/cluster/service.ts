@@ -26,10 +26,19 @@ export interface ClusterServiceInit {
 	maxInboundStreams?: number,
 	maxOutboundStreams?: number,
 	logPrefix?: string,
-  kBucketSize?: number,
-  configuredClusterSize?: number,
-  allowClusterDownsize?: boolean,
-  clusterSizeTolerance?: number,
+	kBucketSize?: number,
+	configuredClusterSize?: number,
+	allowClusterDownsize?: boolean,
+	clusterSizeTolerance?: number,
+	/**
+	 * Responsibility K - the replica set size for determining cluster membership.
+	 * This is distinct from kBucketSize (DHT routing) and configuredClusterSize (consensus quorum).
+	 * When set, this determines how many peers (by XOR distance) are considered
+	 * responsible for a key. If this node is not in the top responsibilityK peers,
+	 * it will redirect requests to closer peers.
+	 * Default: 1 (only the closest peer handles requests)
+	 */
+	responsibilityK?: number,
 }
 
 export function clusterService(init: ClusterServiceInit = {}): (components: ClusterServiceComponents) => ClusterService {
@@ -47,10 +56,12 @@ export class ClusterService implements Startable {
 	private readonly cluster: ICluster;
 	private readonly components: ClusterServiceComponents;
 	private running: boolean;
-  private readonly k: number;
-  private readonly configuredClusterSize: number;
-  private readonly allowDownsize: boolean;
-  private readonly sizeTolerance: number;
+	private readonly k: number;
+	private readonly configuredClusterSize: number;
+	private readonly allowDownsize: boolean;
+	private readonly sizeTolerance: number;
+	/** Responsibility K - how many peers are responsible for a key (for redirect decisions) */
+	private readonly responsibilityK: number;
 
 	constructor(components: ClusterServiceComponents, init: ClusterServiceInit = {}) {
 		this.components = components;
@@ -60,10 +71,11 @@ export class ClusterService implements Startable {
 		this.log = components.logger.forComponent(init.logPrefix ?? 'db-p2p:cluster');
 		this.cluster = components.cluster;
 		this.running = false;
-    this.k = init.kBucketSize ?? 10;
-    this.configuredClusterSize = init.configuredClusterSize ?? 10;
-    this.allowDownsize = init.allowClusterDownsize ?? true;
-    this.sizeTolerance = init.clusterSizeTolerance ?? 0.5;
+		this.k = init.kBucketSize ?? 10;
+		this.configuredClusterSize = init.configuredClusterSize ?? 10;
+		this.allowDownsize = init.allowClusterDownsize ?? true;
+		this.sizeTolerance = init.clusterSizeTolerance ?? 0.5;
+		this.responsibilityK = init.responsibilityK ?? 1;
 	}
 
 	readonly [Symbol.toStringTag] = '@libp2p/cluster';

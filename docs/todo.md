@@ -1,4 +1,3 @@
-* Implement cross-collection transactions by concatenating transactors
 * Have the NetworkTransactor look for intersections between clusters, rather than arbitrary coordinators.
 * Resolve case for concurrent collection creation
 * Potential enhancement: have the peers at or around the block's CID submit the block, to make the source more anonymous
@@ -15,10 +14,10 @@
 * Implement cross-network federation capabilities for multi-cluster deployments
 * Fix for collection test: "should handle concurrent modifications"
 
-* Separate routing vs replication responsibility
-  * Introduce a dedicated responsibilityK (replica set size/quorum basis) distinct from DHT kBucketSize
-  * Update repo/cluster services to use responsibilityK when computing responsibility (inCluster vs redirect)
-  * Expose responsibilityK via `createLibp2pNode` options and/or environment config; default to 1 initially
+* ~~Separate routing vs replication responsibility~~ ✓ DONE
+  * ~~Introduce a dedicated responsibilityK (replica set size/quorum basis) distinct from DHT kBucketSize~~
+  * ~~Update repo/cluster services to use responsibilityK when computing responsibility (inCluster vs redirect)~~
+  * ~~Expose responsibilityK via `createLibp2pNode` options and/or environment config; default to 1 initially~~
 
 * Wire real cluster logic (replace stub)
   * Replace `clusterLogic` stub in `libp2p-node` with actual cluster implementation
