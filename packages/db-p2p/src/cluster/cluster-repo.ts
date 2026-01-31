@@ -53,6 +53,9 @@ export function clusterMember(components: ClusterMemberComponents): ClusterMembe
 	);
 }
 
+// How long to keep executed transaction records (10 minutes)
+const ExecutedTransactionTtlMs = 10 * 60 * 1000;
+
 /**
  * Handles cluster-side operations, managing promises and commits for cluster updates
  * and coordinating with the local storage repo.
@@ -60,6 +63,8 @@ export function clusterMember(components: ClusterMemberComponents): ClusterMembe
 export class ClusterMember implements ICluster {
 	// Track active transactions by their message hash
 	private activeTransactions: Map<string, TransactionState> = new Map();
+	// Track executed consensus transactions to prevent duplicate execution (messageHash -> executedAt timestamp)
+	private executedTransactions: Map<string, number> = new Map();
 	// Queue of transactions to clean up
 	private cleanupQueue: string[] = [];
 	// Serialize concurrent updates for the same transaction
@@ -78,6 +83,14 @@ export class ClusterMember implements ICluster {
 		setInterval(() => this.queueExpiredTransactions(), 60000);
 		// Process cleanup queue
 		setInterval(() => this.processCleanupQueue(), 1000);
+	}
+
+	/**
+	 * Checks if a transaction's operations were already executed during consensus.
+	 * Used by the coordinator to avoid duplicate execution in CoordinatorRepo.
+	 */
+	wasTransactionExecuted(messageHash: string): boolean {
+		return this.executedTransactions.has(messageHash);
 	}
 
 	/**
@@ -190,7 +203,16 @@ export class ClusterMember implements ICluster {
 					messageHash: record.messageHash,
 					commits: Object.keys(currentRecord.commits ?? {})
 				});
-				// After adding our commit, clear the transaction - the coordinator will handle consensus
+				// After adding our commit, check if we now have consensus and execute if so
+				{
+					const newPhase = await this.getTransactionPhase(currentRecord);
+					if (newPhase === TransactionPhase.Consensus) {
+						log('cluster-member:action-consensus-after-commit', {
+							messageHash: record.messageHash
+						});
+						await this.handleConsensus(currentRecord);
+					}
+				}
 				shouldPersist = false;
 				break;
 			case TransactionPhase.Consensus:
@@ -457,23 +479,70 @@ export class ClusterMember implements ICluster {
 		};
 	}
 
+	/**
+	 * Executes operations after consensus is reached.
+	 *
+	 * @warning This method executes on ALL cluster peers, not just the coordinator.
+	 * Each peer independently applies the operations to its local storage.
+	 *
+	 * @pitfall **Check-then-act race** - Must check AND mark as executed atomically
+	 * (before any `await`) to prevent duplicate execution. JavaScript's single-threaded
+	 * nature makes synchronous check-and-set atomic.
+	 *
+	 * @pitfall **Independent node storage** - Each node has its own storage. After consensus,
+	 * each node applies operations locally. Nodes must fetch missing blocks from cluster
+	 * peers via `restoreCallback` if they don't have prior revisions.
+	 *
+	 * @see docs/internals.md "Check-Then-Act Race in Consensus" and "Independent Node Storage" pitfalls
+	 */
 	private async handleConsensus(record: ClusterRecord): Promise<void> {
-		// Execute the operations only if we haven't already
-		const state = this.activeTransactions.get(record.messageHash);
-		if (!this.hasLocalCommit(state?.record ?? record)) {
+		// Check-and-set ATOMICALLY to prevent race condition where multiple calls
+		// pass the check before any completes. Since JavaScript is single-threaded,
+		// this synchronous check-and-set is atomic before any await.
+		if (this.executedTransactions.has(record.messageHash)) {
+			log('cluster-member:consensus-already-executed', { messageHash: record.messageHash });
+			return;
+		}
+		// Mark as executing IMMEDIATELY before any async operations
+		this.executedTransactions.set(record.messageHash, Date.now());
+
+		try {
+			// Execute the operations - check return values for failures
 			for (const operation of record.message.operations) {
 				if ('get' in operation) {
 					await this.storageRepo.get(operation.get);
 				} else if ('pend' in operation) {
-					await this.storageRepo.pend(operation.pend);
+					const result = await this.storageRepo.pend(operation.pend);
+					if (!result.success) {
+						log('cluster-member:consensus-pend-failed', {
+							messageHash: record.messageHash,
+							actionId: operation.pend.actionId,
+							reason: result.reason,
+							hasMissing: !!result.missing?.length,
+							hasPending: !!result.pending?.length
+						});
+						throw new Error(`Consensus pend failed for action ${operation.pend.actionId}: ${result.reason ?? 'stale revision'}`);
+					}
 				} else if ('commit' in operation) {
-					await this.storageRepo.commit(operation.commit);
+					const result = await this.storageRepo.commit(operation.commit);
+					if (!result.success) {
+						log('cluster-member:consensus-commit-failed', {
+							messageHash: record.messageHash,
+							actionId: operation.commit.actionId,
+							reason: result.reason,
+							hasMissing: !!result.missing?.length
+						});
+						throw new Error(`Consensus commit failed for action ${operation.commit.actionId}: ${result.reason ?? 'stale revision'}`);
+					}
 				} else if ('cancel' in operation) {
 					await this.storageRepo.cancel(operation.cancel.actionRef);
 				}
 			}
+		} catch (err) {
+			// On failure, remove from executedTransactions so it can be retried
+			this.executedTransactions.delete(record.messageHash);
+			throw err;
 		}
-		// Don't clear here - will be cleared by shouldPersist = false in the main flow
 	}
 
 	private async handleRejection(record: ClusterRecord): Promise<void> {
@@ -501,10 +570,25 @@ export class ClusterMember implements ICluster {
 		const now = Date.now();
 		const staleThresholdMs = 2000; // 2 seconds - allow more time for distributed consensus
 
+		const incomingBlockIds = this.getAffectedBlockIds(record.message.operations);
+		log('cluster-member:hasConflict-check', {
+			messageHash: record.messageHash,
+			activeCount: this.activeTransactions.size,
+			incomingBlockIds
+		});
+
 		for (const [existingHash, state] of Array.from(this.activeTransactions.entries())) {
 			if (existingHash === record.messageHash) {
 				continue;
 			}
+
+			const existingBlockIds = this.getAffectedBlockIds(state.record.message.operations);
+			log('cluster-member:hasConflict-compare', {
+				existing: existingHash,
+				incoming: record.messageHash,
+				existingBlockIds,
+				incomingBlockIds
+			});
 
 			// Clean up stale transactions that have been around too long
 			if (now - state.lastUpdate > staleThresholdMs) {
@@ -673,6 +757,13 @@ export class ClusterMember implements ICluster {
 		for (const [messageHash, state] of Array.from(this.activeTransactions.entries())) {
 			if (state.record.message.expiration && state.record.message.expiration < now) {
 				this.cleanupQueue.push(messageHash);
+			}
+		}
+		// Also clean up old executed transaction records
+		const expirationThreshold = now - ExecutedTransactionTtlMs;
+		for (const [messageHash, executedAt] of Array.from(this.executedTransactions.entries())) {
+			if (executedAt < expirationThreshold) {
+				this.executedTransactions.delete(messageHash);
 			}
 		}
 	}

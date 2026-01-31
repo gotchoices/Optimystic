@@ -44,7 +44,11 @@ export class ClusterCoordinator {
 		private readonly keyNetwork: IKeyNetwork,
 		private readonly createClusterClient: (peerId: PeerId) => ClusterClient,
 		private readonly cfg: ClusterConsensusConfig & { clusterSize: number },
-		private readonly localCluster?: { update: (record: ClusterRecord) => Promise<ClusterRecord>; peerId: PeerId },
+		private readonly localCluster?: {
+			update: (record: ClusterRecord) => Promise<ClusterRecord>;
+			peerId: PeerId;
+			wasTransactionExecuted?: (messageHash: string) => boolean;
+		},
 		private readonly fretService?: FretService
 	) { }
 
@@ -103,9 +107,13 @@ export class ClusterCoordinator {
 	}
 
 	/**
-	 * Initiates a 2-phase transaction for a specific block ID
+	 * Initiates a 2-phase transaction for a specific block ID.
+	 * Returns the cluster record and whether the local cluster already executed the operations.
 	 */
-	async executeClusterTransaction(blockId: BlockId, message: RepoMessage, options?: MessageOptions): Promise<any> {
+	async executeClusterTransaction(blockId: BlockId, message: RepoMessage, options?: MessageOptions): Promise<{
+		record: ClusterRecord;
+		localExecuted: boolean;
+	}> {
 		// Get the cluster peers for this block
 		const peers = await this.getClusterForBlock(blockId);
 
@@ -144,7 +152,9 @@ export class ClusterCoordinator {
 		// Wait for the transaction to complete
 		try {
 			const result = await pending.result();
-			return result;
+			// Check if the local cluster already executed the operations during consensus
+			const localExecuted = this.localCluster?.wasTransactionExecuted?.(messageHash) ?? false;
+			return { record: result, localExecuted };
 		} finally {
 			const stored = this.transactions.get(messageHash);
 			const retrySnapshot = stored?.retry ? {
@@ -461,7 +471,19 @@ export class ClusterCoordinator {
 				threshold: this.cfg.simpleMajorityThreshold
 			});
 			// Simple majority proves commitment - we can return success
-			// Background propagation to remaining peers will continue
+			// Notify local cluster with the final merged record so it can execute operations
+			if (this.localCluster) {
+				try {
+					await this.localCluster.update(record);
+				} catch (err) {
+					// Local execution errors shouldn't fail the transaction since consensus was reached
+					console.log(`[COORDINATOR] LOCAL EXECUTION ERROR hash=${record.messageHash.slice(0, 8)} error=${err instanceof Error ? err.message : String(err)}`);
+					log('cluster-tx:local-execution-error', {
+						messageHash: record.messageHash,
+						error: err instanceof Error ? err.message : String(err)
+					});
+				}
+			}
 		}
 
 		const missingPeers = commitFailures.map(entry => entry.peerId);

@@ -10,11 +10,16 @@ export class CacheSource<T extends IBlock> implements BlockSource<T> {
 
 	async tryGet(id: BlockId): Promise<T | undefined> {
 		let block = this.cache.get(id);
+		const cacheHit = !!block;
 		if (!block) {
 			block = await this.source.tryGet(id);
 			if (block) {
 				this.cache.set(id, block);
 			}
+		}
+		const entries = (block as any)?.entries?.length ?? 0;
+		if (entries > 0) {
+			console.log(`[CACHE-TRYGET] blockId=${id.slice(0,12)}... cacheHit=${cacheHit} entries=${entries}`);
 		}
 		return structuredClone(block);
 	}

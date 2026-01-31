@@ -57,7 +57,7 @@ async function createNode(port: number, bootstrapNodes: string[]): Promise<TestN
 		port,
 		bootstrapNodes,
 		networkName: 'quick-test',
-		storageType: 'memory',
+		storage: () => new MemoryRawStorage(),
 		fretProfile: 'edge',
 		clusterSize: 3,
 		clusterPolicy: {

@@ -326,3 +326,11 @@ await eventLog.append(eventData);
 - **[Collections](docs/collections.md)** - High-level abstractions with conflict resolution
 - **[Transactors](docs/transactor.md)** - Distributed transaction coordination
 - **[Network](docs/network.md)** - Peer-to-peer implementation architecture
+
+### Internal Architecture
+
+For developers and AI agents working on internals, see [Internals Guide](../../docs/internals.md) for:
+- Data flow diagrams (read/write/commit paths)
+- Mutation contracts (which functions mutate vs clone)
+- Key invariants and common pitfalls
+- Type glossary and debugging tips

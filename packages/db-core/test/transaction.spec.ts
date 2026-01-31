@@ -933,9 +933,9 @@ describe('Transaction', () => {
 						actionId: request.actionId,
 						hasTransaction: !!request.transaction,
 						hasOperationsHash: !!request.operationsHash,
-						blockCount: Object.keys(request.transforms.inserts).length +
-							Object.keys(request.transforms.updates).length +
-							request.transforms.deletes.length
+						blockCount: Object.keys(request.transforms.inserts ?? {}).length +
+							Object.keys(request.transforms.updates ?? {}).length +
+							(request.transforms.deletes?.length ?? 0)
 					}
 				});
 				return originalPend(request);

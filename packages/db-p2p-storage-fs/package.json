@@ -1,12 +1,9 @@
 {
-  "name": "@optimystic/reference-peer",
-  "version": "0.0.1",
+  "name": "@optimystic/db-p2p-storage-fs",
+  "version": "0.1.0",
   "type": "module",
-  "description": "Reference peer implementation for Optimystic",
+  "description": "Node.js filesystem storage backend for @optimystic/db-p2p",
   "main": "dist/src/index.js",
-  "bin": {
-    "optimystic-peer": "./dist/src/cli.js"
-  },
   "types": "./dist/src/index.d.ts",
   "files": [
     "src",
@@ -23,28 +20,24 @@
   "repository": {
     "type": "git",
     "url": "https://github.com/gotchoices/optimystic.git",
-    "directory": "packages/reference-peer"
+    "directory": "packages/db-p2p-storage-fs"
   },
   "author": "Got Choices Foundation",
   "license": "MIT",
   "keywords": [
     "optimystic",
-    "reference-peer",
-    "cli",
+    "database",
     "p2p",
-    "peer-to-peer",
-    "libp2p"
+    "storage",
+    "filesystem",
+    "node"
   ],
   "scripts": {
     "clean": "aegir clean",
     "build": "aegir build --env node",
-    "mesh": "node dist/src/mesh.js",
-    "start": "node dist/src/cli.js",
     "lint": "aegir lint",
     "test": "aegir test",
     "test:node": "aegir test -t node",
-    "test:quick": "node dist/test/quick-test.js",
-    "test:quick:debug": "node --inspect-brk dist/test/quick-test.js",
     "dep-check": "aegir dep-check"
   },
   "devDependencies": {
@@ -54,21 +47,8 @@
     "typescript": "^5.9.3"
   },
   "dependencies": {
-    "@libp2p/interface": "^2.10.5",
-    "@libp2p/peer-id": "^5.1.8",
     "@optimystic/db-core": "workspace:^",
     "@optimystic/db-p2p": "workspace:^",
-    "@optimystic/db-p2p-storage-fs": "workspace:^",
-    "commander": "^14.0.0",
-    "debug": "^4.4.1",
-    "uint8arrays": "^5.1.0"
-  },
-  "aegir": {
-    "build": {
-      "bundle": false
-    },
-    "test": {
-      "target": ["node"]
-    }
+    "debug": "^4.4.1"
   }
 }

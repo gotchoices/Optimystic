@@ -143,10 +143,10 @@ export class RepoService implements Startable {
 								})
 								response = encodePeers(peers.map((pid: any) => ({ id: pid.toString(), addrs: [] })))
 							} else {
-								response = await this.repo.get(operation.get, { expiration: message.expiration })
+								response = await this.repo.get(operation.get, { expiration: message.expiration, skipClusterFetch: true } as any)
 							}
 						} else {
-							response = await this.repo.get(operation.get, { expiration: message.expiration })
+							response = await this.repo.get(operation.get, { expiration: message.expiration, skipClusterFetch: true } as any)
 						}
 					}
 				} else if ('pend' in operation) {

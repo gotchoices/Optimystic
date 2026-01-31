@@ -35,8 +35,8 @@ describe('Transform functionality', () => {
       const newBlock = { ...testBlock, header: { ...testBlock.header, id: 'new-id' as BlockId } }
 
       tracker.insert(newBlock)
-      expect(tracker.transforms.inserts['new-id']).to.deep.equal(newBlock)
-      expect(tracker.transforms.deletes.includes('new-id')).to.be.false
+      expect(tracker.transforms.inserts!['new-id']).to.deep.equal(newBlock)
+      expect(tracker.transforms.deletes?.includes('new-id') ?? false).to.be.false
     })
 
     it('should track updates correctly', async () => {
@@ -44,16 +44,16 @@ describe('Transform functionality', () => {
       const operation: BlockOperation = ['data', 0, 0, 'updated']
 
       tracker.update('test-id' as BlockId, operation)
-      expect(tracker.transforms.updates['test-id']).to.deep.equal([operation])
+      expect(tracker.transforms.updates!['test-id']).to.deep.equal([operation])
     })
 
     it('should track deletes correctly', async () => {
       const tracker = new Tracker(mockSource)
 
       tracker.delete('test-id' as BlockId)
-      expect(tracker.transforms.deletes.includes('test-id')).to.be.true
-      expect(tracker.transforms.inserts['test-id']).to.be.undefined
-      expect(tracker.transforms.updates['test-id']).to.be.undefined
+      expect(tracker.transforms.deletes!.includes('test-id')).to.be.true
+      expect(tracker.transforms.inserts?.['test-id']).to.be.undefined
+      expect(tracker.transforms.updates?.['test-id']).to.be.undefined
     })
 
     it('should reset transform correctly', async () => {
@@ -61,7 +61,7 @@ describe('Transform functionality', () => {
       tracker.insert(testBlock)
 
       const oldTransforms = tracker.reset()
-      expect(oldTransforms.inserts['test-id']).to.deep.equal(testBlock)
+      expect(oldTransforms.inserts!['test-id']).to.deep.equal(testBlock)
       expect(tracker.transforms).to.deep.equal(emptyTransforms())
     })
 
@@ -94,7 +94,7 @@ describe('Transform functionality', () => {
       // Re-insert the block
       tracker.insert(block)
       expect(tracker.transforms.deletes).to.not.include(blockId)
-      expect(tracker.transforms.inserts[blockId]).to.deep.equal(block)
+      expect(tracker.transforms.inserts![blockId]).to.deep.equal(block)
     })
   })
 
@@ -149,7 +149,7 @@ describe('Transform functionality', () => {
 
       const merged = mergeTransforms(transform1, transform2)
       expect(merged.inserts).to.have.keys(['id1', 'id2'])
-      expect(merged.deletes.includes('id3')).to.be.true
+      expect(merged.deletes!.includes('id3')).to.be.true
     })
 
     it('should concatenate multiple transforms', () => {
@@ -168,7 +168,7 @@ describe('Transform functionality', () => {
 
       const concatenated = concatTransforms(...transforms)
       expect(concatenated.inserts).to.have.keys(['id1', 'id2'])
-      expect(concatenated.deletes.includes('id3')).to.be.true
+      expect(concatenated.deletes!.includes('id3')).to.be.true
     })
 
     it('should create transform for specific block id', () => {

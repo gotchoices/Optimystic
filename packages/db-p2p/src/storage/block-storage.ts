@@ -124,6 +124,8 @@ export class BlockStorage implements IBlockStorage {
 			if (materializedBlock) {
 				block = materializedBlock;
 				materializedActionRev = actionRev;
+				const matEntries = (materializedBlock as any)?.entries?.length ?? 0;
+				console.log(`[MATERIALIZE] blockId=${this.blockId.slice(0,12)}... foundMaterialized rev=${actionRev.rev} entries=${matEntries} actionsToApply=${actions.length}`);
 				break;
 			} else {
 				actions.push(actionRev);

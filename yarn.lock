@@ -3500,6 +3500,20 @@ __metadata:
   languageName: unknown
   linkType: soft
 
+"@optimystic/db-p2p-storage-fs@workspace:^, @optimystic/db-p2p-storage-fs@workspace:packages/db-p2p-storage-fs":
+  version: 0.0.0-use.local
+  resolution: "@optimystic/db-p2p-storage-fs@workspace:packages/db-p2p-storage-fs"
+  dependencies:
+    "@optimystic/db-core": "workspace:^"
+    "@optimystic/db-p2p": "workspace:^"
+    "@types/debug": "npm:^4.1.12"
+    "@types/node": "npm:^22.13.10"
+    aegir: "npm:^45.1.4"
+    debug: "npm:^4.4.1"
+    typescript: "npm:^5.9.3"
+  languageName: unknown
+  linkType: soft
+
 "@optimystic/db-p2p@workspace:^, @optimystic/db-p2p@workspace:packages/db-p2p":
   version: 0.0.0-use.local
   resolution: "@optimystic/db-p2p@workspace:packages/db-p2p"
@@ -3604,6 +3618,7 @@ __metadata:
     "@libp2p/peer-id": "npm:^5.1.8"
     "@optimystic/db-core": "workspace:^"
     "@optimystic/db-p2p": "workspace:^"
+    "@optimystic/db-p2p-storage-fs": "workspace:^"
     "@types/debug": "npm:^4.1.12"
     "@types/node": "npm:^22.13.10"
     aegir: "npm:^45.1.4"

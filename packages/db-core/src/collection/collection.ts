@@ -164,11 +164,14 @@ export class Collection<TAction> implements ICollection<TAction> {
 		if (!log) {
 			throw new Error(`Log not found for collection ${this.id}`);
 		}
+		let entryCount = 0;
 		for await (const entry of log.select(undefined, forward)) {
+			entryCount++;
 			if (entry.action) {
 				yield* forward ? entry.action.actions : entry.action.actions.reverse();
 			}
 		}
+		console.log(`[SELECT-LOG] collectionId=${this.id.slice(0,12)}... entryCount=${entryCount}`);
 	}
 
 	private async replayActions() {

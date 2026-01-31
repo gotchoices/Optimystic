@@ -17,7 +17,6 @@ import {
 	createLibp2pNode,
 	StorageRepo,
 	BlockStorage,
-	FileRawStorage,
 	MemoryRawStorage,
 	Libp2pKeyPeerNetwork,
 	RepoClient
@@ -559,7 +558,7 @@ describe('Distributed Transaction Validation', () => {
 			port,
 			bootstrapNodes,
 			networkName: NETWORK_NAME,
-			storageType: 'memory',
+			storage: () => new MemoryRawStorage(),
 			fretProfile: 'core',  // Use 'core' profile for more consistent coordinator selection
 			clusterSize: MESH_SIZE,
 			clusterPolicy: {

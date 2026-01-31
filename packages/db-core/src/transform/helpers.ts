@@ -1,6 +1,12 @@
 import type { BlockId, BlockOperation, BlockOperations, BlockStore, IBlock, Transform, Transforms } from "../index.js";
 
-/** Mutates the given block with a copy of the given operation */
+/**
+ * Mutates the given block with a copy of the given operation.
+ *
+ * @warning **MUTATES IN PLACE** - Callers must clone the block first if the original needs preservation.
+ * Storage implementations must clone on get/save to prevent cross-revision contamination.
+ * @see docs/internals.md for mutation contracts
+ */
 export function applyOperation(block: IBlock, [entity, index, deleteCount, inserted]: BlockOperation) {
 	if (Array.isArray(inserted)) {
 		(block as unknown as any)[entity].splice(index, deleteCount, ...structuredClone(inserted));
@@ -9,7 +15,12 @@ export function applyOperation(block: IBlock, [entity, index, deleteCount, inser
 	}
 }
 
-/** Mutates the given block with the given set of operations */
+/**
+ * Mutates the given block with the given set of operations.
+ *
+ * @warning **MUTATES IN PLACE** - Callers must clone the block first if the original needs preservation.
+ * @see docs/internals.md for mutation contracts
+ */
 export function applyOperations(block: IBlock, operations: BlockOperations) {
 	for (const op of operations) {
 		applyOperation(block, op);
@@ -40,8 +51,19 @@ export function emptyTransforms(): Transforms {
 	return { inserts: {}, updates: {}, deletes: [] };
 }
 
+/**
+ * Creates a deep copy of a Transforms object.
+ *
+ * @pitfall Updates arrays MUST be deep cloned - a shallow copy like `{ ...transform.updates }`
+ * shares array references, causing mutations in one consumer to affect others.
+ * @see docs/internals.md "Shallow Copy of Transforms" pitfall
+ */
 export function copyTransforms(transform: Transforms): Transforms {
-	return { inserts: { ...transform.inserts }, updates: { ...transform.updates }, deletes: transform.deletes ? [...transform.deletes] : undefined };
+	// Deep clone updates arrays to prevent shared references
+	const updates = transform.updates
+		? Object.fromEntries(Object.entries(transform.updates).map(([k, v]) => [k, structuredClone(v)]))
+		: undefined;
+	return { inserts: { ...transform.inserts }, updates, deletes: transform.deletes ? [...transform.deletes] : undefined };
 }
 
 export function mergeTransforms(a: Transforms, b: Transforms): Transforms {
@@ -63,10 +85,18 @@ export function concatTransforms(...transforms: Transforms[]): Transforms {
 }
 
 
+/**
+ * Extracts the transform for a specific block from a Transforms object.
+ *
+ * @pitfall Updates array MUST be deep cloned - extracting without cloning shares
+ * the array reference, causing mutations to affect the original Transforms.
+ * @see docs/internals.md "Shallow Copy of Transforms" pitfall
+ */
 export function transformForBlockId(transform: Transforms, blockId: BlockId): Transform {
 	return {
 		...(transform.inserts && blockId in transform.inserts ? { insert: transform.inserts[blockId] } : {}),
-		...(transform.updates && blockId in transform.updates ? { updates: transform.updates[blockId] } : {}),
+		// Clone updates array to prevent shared references
+		...(transform.updates && blockId in transform.updates ? { updates: structuredClone(transform.updates[blockId]) } : {}),
 		...(transform.deletes?.includes(blockId) ? { delete: true } : {})
 	};
 }

@@ -495,3 +495,10 @@ Nodes automatically transition between rings based on capacity thresholds:
 - **[@optimystic/db-quereus](../db-quereus)**: Query engine and data access patterns
 - **[p2p-fret](../fret)**: DHT implementation for peer discovery
 
+### Internal Architecture
+
+For developers and AI agents working on internals, see [Internals Guide](../../docs/internals.md) for:
+- Data flow diagrams (read/write/commit paths)
+- Mutation contracts (which functions mutate vs clone)
+- Key invariants and common pitfalls
+- Type glossary and debugging tips

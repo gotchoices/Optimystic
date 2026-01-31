@@ -60,7 +60,8 @@ export class MemoryRawStorage implements IRawStorage {
 	}
 
 	async savePendingTransaction(blockId: BlockId, actionId: ActionId, transform: Transform): Promise<void> {
-		this.pendingActions.set(this.getActionKey(blockId, actionId), transform);
+		// Clone transform to prevent external modifications from affecting stored data
+		this.pendingActions.set(this.getActionKey(blockId, actionId), structuredClone(transform));
 	}
 
 	async deletePendingTransaction(blockId: BlockId, actionId: ActionId): Promise<void> {
@@ -84,14 +85,32 @@ export class MemoryRawStorage implements IRawStorage {
 		this.actions.set(this.getActionKey(blockId, actionId), transform);
 	}
 
+	/**
+	 * Retrieves a materialized block at a specific revision.
+	 *
+	 * @pitfall **MUST return a clone** - `applyTransform()` mutates blocks in place.
+	 * If we return the stored reference, mutations corrupt ALL revisions that share
+	 * the same underlying object.
+	 * @see docs/internals.md "Storage Returns References" pitfall
+	 */
 	async getMaterializedBlock(blockId: BlockId, actionId: ActionId): Promise<IBlock | undefined> {
-		return this.materializedBlocks.get(this.getActionKey(blockId, actionId));
+		const block = this.materializedBlocks.get(this.getActionKey(blockId, actionId));
+		// Clone to prevent external mutations from affecting stored data
+		return block ? structuredClone(block) : undefined;
 	}
 
+	/**
+	 * Stores a materialized block at a specific revision.
+	 *
+	 * @pitfall **MUST store a clone** - callers may continue mutating the block after saving.
+	 * If we store the reference, those mutations corrupt the stored data.
+	 * @see docs/internals.md "Storage Returns References" pitfall
+	 */
 	async saveMaterializedBlock(blockId: BlockId, actionId: ActionId, block?: IBlock): Promise<void> {
 		const key = this.getActionKey(blockId, actionId);
 		if (block) {
-			this.materializedBlocks.set(key, block);
+			// Clone to prevent external mutations from affecting stored data
+			this.materializedBlocks.set(key, structuredClone(block));
 		} else {
 			this.materializedBlocks.delete(key);
 		}

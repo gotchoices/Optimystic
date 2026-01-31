@@ -13,17 +13,17 @@ import { repoService } from './repo/service.js';
 import { StorageRepo } from './storage/storage-repo.js';
 import { BlockStorage } from './storage/block-storage.js';
 import { MemoryRawStorage } from './storage/memory-storage.js';
-import { FileRawStorage } from './storage/file-storage.js';
 import type { IRawStorage } from './storage/i-raw-storage.js';
 import { clusterMember } from './cluster/cluster-repo.js';
 import { coordinatorRepo } from './repo/coordinator-repo.js';
 import { Libp2pKeyPeerNetwork } from './libp2p-key-network.js';
 import { ClusterClient } from './cluster/client.js';
 import type { IRepo, ICluster, ITransactionValidator } from '@optimystic/db-core';
-import { multiaddr } from '@multiformats/multiaddr';
 import { networkManagerService } from './network/network-manager-service.js';
 import { fretService, Libp2pFretService } from 'p2p-fret';
 import { syncService } from './sync/service.js';
+import { SyncClient } from './sync/client.js';
+import type { ClusterLatestCallback } from './repo/coordinator-repo.js';
 import { RestorationCoordinator } from './storage/restoration-coordinator-v2.js';
 import { RingSelector } from './storage/ring-selector.js';
 import { StorageMonitor } from './storage/storage-monitor.js';
@@ -33,6 +33,9 @@ import type { RestoreCallback } from './storage/struct.js';
 import type { FretService } from 'p2p-fret';
 import { PartitionDetector } from './cluster/partition-detector.js';
 
+/** Factory function or instance for creating raw storage */
+export type RawStorageProvider = IRawStorage | (() => IRawStorage);
+
 export type NodeOptions = {
 	port: number;
 	bootstrapNodes: string[];
@@ -40,8 +43,8 @@ export type NodeOptions = {
 	fretProfile?: 'edge' | 'core';
 	id?: string; // optional peer id
 	relay?: boolean; // enable relay service
-	storageType?: 'memory' | 'file'; // storage backend type
-	storagePath?: string; // path for file storage (required if storageType is 'file')
+	/** Storage provider - either an IRawStorage instance or a factory function. Defaults to MemoryRawStorage if not provided. */
+	storage?: RawStorageProvider;
 	clusterSize?: number; // desired cluster size per key
 	clusterPolicy?: {
 		allowDownsize?: boolean;
@@ -68,19 +71,15 @@ export type NodeOptions = {
 	validator?: ITransactionValidator;
 };
 
-export async function createLibp2pNode(options: NodeOptions): Promise<Libp2p> {
-	// Create storage based on type
-	const storageType = options.storageType ?? 'memory';
-	let rawStorage: IRawStorage;
-
-	if (storageType === 'file') {
-		if (!options.storagePath) {
-			throw new Error('storagePath is required when storageType is "file"');
-		}
-		rawStorage = new FileRawStorage(options.storagePath);
-	} else {
-		rawStorage = new MemoryRawStorage();
+function resolveStorage(provider: RawStorageProvider | undefined): IRawStorage {
+	if (!provider) {
+		return new MemoryRawStorage();
 	}
+	return typeof provider === 'function' ? provider() : provider;
+}
+
+export async function createLibp2pNode(options: NodeOptions): Promise<Libp2p> {
+	const rawStorage = resolveStorage(options.storage);
 
 	// Create placeholder restore callback (will be replaced after node starts)
 	let restoreCallback: RestoreCallback = async (_blockId, _rev?) => {
@@ -267,10 +266,32 @@ export async function createLibp2pNode(options: NodeOptions): Promise<Libp2p> {
 		fretSvc
 	);
 
+	// Create callback for querying cluster peers for their latest block revision
+	const clusterLatestCallback: ClusterLatestCallback = async (peerId, blockId) => {
+		const syncClient = new SyncClient(peerId, keyNetwork, protocolPrefix);
+		try {
+			const response = await syncClient.requestBlock({ blockId, rev: undefined });
+			if (response.success && response.archive) {
+				const revisions = Object.keys(response.archive.revisions).map(Number);
+				if (revisions.length > 0) {
+					const maxRev = Math.max(...revisions);
+					const revisionData = response.archive.revisions[maxRev];
+					if (revisionData?.action) {
+						return { actionId: revisionData.action.actionId, rev: maxRev };
+					}
+				}
+			}
+		} catch {
+			// Peer may be unreachable - return undefined to skip this peer
+		}
+		return undefined;
+	};
+
 	coordinatedRepo = coordinatorRepoFactory({
 		storageRepo,
 		localCluster: clusterImpl,
-		localPeerId: node.peerId
+		localPeerId: node.peerId,
+		clusterLatestCallback
 	});
 
 	// Initialize Arachnode ring membership and restoration

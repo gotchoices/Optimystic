@@ -13,8 +13,12 @@ export class Tracker<T extends IBlock> implements IBlockStore<T> {
 
 	async tryGet(id: BlockId): Promise<T | undefined> {
 		const block = await this.source.tryGet(id);
+		const sourceEntries = (block as any)?.entries?.length ?? 0;
 		if (block) {
 			const ops = this.transforms.updates?.[id] ?? [];
+			if (ops.length > 0 || sourceEntries > 0) {
+				console.log(`[TRACKER-TRYGET] blockId=${id.slice(0,12)}... sourceEntries=${sourceEntries} opsToApply=${ops.length}`);
+			}
 			ops.forEach(op => applyOperation(block!, op));
 			if (this.transforms.deletes?.includes(id)) {
 				return undefined;

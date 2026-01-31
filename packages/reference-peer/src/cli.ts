@@ -1,7 +1,8 @@
 #!/usr/bin/env node
 import { Command } from 'commander';
 import debug from 'debug';
-import { getNetworkManager, createLibp2pNode, StorageRepo, BlockStorage, MemoryRawStorage, FileRawStorage, Libp2pKeyPeerNetwork, RepoClient, ArachnodeFretAdapter } from '@optimystic/db-p2p';
+import { getNetworkManager, createLibp2pNode, StorageRepo, BlockStorage, MemoryRawStorage, Libp2pKeyPeerNetwork, RepoClient, ArachnodeFretAdapter, type IRawStorage } from '@optimystic/db-p2p';
+import { FileRawStorage } from '@optimystic/db-p2p-storage-fs';
 import { Diary, NetworkTransactor, BTree, ITransactor, BlockGets, GetBlockResults, ActionBlocks, BlockActionStatus, PendRequest, PendResult, CommitRequest, CommitResult } from '@optimystic/db-core';
 import * as readline from 'readline';
 import * as path from 'path';
@@ -314,6 +315,15 @@ class PeerSession {
 			storageCapacityBytes,
 			mode: options.offline ? 'offline' : 'distributed'
 		});
+
+		// Create storage provider based on options
+		const createStorage = (): IRawStorage => {
+			if (options.storage === 'file') {
+				return new FileRawStorage(options.storagePath!);
+			}
+			return new MemoryRawStorage();
+		};
+
 		const node = await createLibp2pNode({
 			port: parseInt(options.port || '0'),
 			bootstrapNodes,
@@ -321,8 +331,7 @@ class PeerSession {
 			relay: options.relay || false,
 			networkName: options.network || 'optimystic',
 			fretProfile: options.fretProfile,
-			storageType: options.storage || 'memory',
-			storagePath: options.storagePath,
+			storage: createStorage,
 			arachnode: {
 				enableRingZulu: true,
 				storage: storageCapacityBytes ? { totalBytes: storageCapacityBytes } : undefined
@@ -338,10 +347,8 @@ class PeerSession {
 			console.log(`   ${s}`);
 		});
 
-		// Set up storage layer
-		const rawStorage = options.storage === 'file'
-			? new FileRawStorage(options.storagePath!)
-			: new MemoryRawStorage();
+		// Set up storage layer for local transactor (uses same storage as node)
+		const rawStorage = createStorage();
 		const storageRepo = new StorageRepo((blockId: string) => new BlockStorage(blockId, rawStorage));
 
 		// Create key network implementation using libp2p

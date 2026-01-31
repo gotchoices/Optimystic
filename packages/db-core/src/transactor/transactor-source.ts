@@ -49,7 +49,7 @@ export class TransactorSource<TBlock extends IBlock> implements BlockSource<TBlo
 		if (!pendResult.success) {
 			return pendResult;
 		}
-		const isNew = Object.hasOwn(transform.inserts, headerId);
+		const isNew = transform.inserts && Object.hasOwn(transform.inserts, headerId);
 		const commitResult = await this.transactor.commit({
 			headerId: isNew ? headerId : undefined,
 			tailId,
