@@ -35,6 +35,11 @@ export class Diary<TEntry> {
         await this.collection.updateAndSync();
     }
 
+    /** Fetch the latest state from the network */
+    async update(): Promise<void> {
+        await this.collection.update();
+    }
+
     async *select(forward = true): AsyncIterableIterator<TEntry> {
         for await (const entry of this.collection.selectLog(forward)) {
             yield entry.data;

@@ -1,5 +1,5 @@
-import type { IBlock, Action, ActionType, ActionHandler, BlockId, ITransactor, ActionEntry, BlockStore } from "../index.js";
-import { Log, Atomic, Tracker, copyTransforms, CacheSource, isTransformsEmpty, TransactorSource, blockIdsForTransforms, transformsFromTransform } from "../index.js";
+import type { IBlock, Action, ActionType, ActionHandler, BlockId, ITransactor, BlockStore } from "../index.js";
+import { Log, Atomic, Tracker, copyTransforms, CacheSource, isTransformsEmpty, TransactorSource } from "../index.js";
 import type { CollectionHeaderBlock, CollectionId, ICollection } from "./index.js";
 import { randomBytes } from '@libp2p/crypto';
 import { toString as uint8ArrayToString } from 'uint8arrays/to-string';
@@ -21,6 +21,7 @@ export type CollectionInitOptions<TAction> = {
 
 export class Collection<TAction> implements ICollection<TAction> {
 	private pending: Action<TAction>[] = [];
+	private readonly latchId: string;
 
 	protected constructor(
 		public readonly id: CollectionId,
@@ -33,6 +34,7 @@ export class Collection<TAction> implements ICollection<TAction> {
 		public readonly tracker: Tracker<IBlock>,
 		private readonly filterConflict?: (action: Action<TAction>, potential: Action<TAction>[]) => Action<TAction> | undefined,
 	) {
+		this.latchId = `Collection:${this.id}`;
 	}
 
 	static async createOrOpen<TAction>(transactor: ITransactor, id: CollectionId, init: CollectionInitOptions<TAction>) {
@@ -56,6 +58,15 @@ export class Collection<TAction> implements ICollection<TAction> {
 	}
 
 	async act(...actions: Action<TAction>[]) {
+		const release = await Latches.acquire(this.latchId);
+		try {
+			await this.actInternal(...actions);
+		} finally {
+			release();
+		}
+	}
+
+	private async actInternal(...actions: Action<TAction>[]) {
 		await this.internalTransact(...actions);
 		this.pending.push(...actions);
 	}
@@ -76,6 +87,15 @@ export class Collection<TAction> implements ICollection<TAction> {
 
 	/** Load external changes and update our context to the latest log revision - resolve any conflicts with our pending actions. */
 	async update() {
+		const release = await Latches.acquire(this.latchId);
+		try {
+			await this.updateInternal();
+		} finally {
+			release();
+		}
+	}
+
+	private async updateInternal() {
 		// Start with a context that can see to the end of the log
 		const source = new TransactorSource(this.id, this.transactor, undefined);
 		const tracker = new Tracker(source);
@@ -92,7 +112,7 @@ export class Collection<TAction> implements ICollection<TAction> {
 			this.pending = this.pending.map(p => this.doFilterConflict(p, entry.actions) ? p : undefined)
 				.filter(Boolean) as Action<TAction>[];
 			this.sourceCache.clear(entry.blockIds);
-			anyConflicts = anyConflicts || tracker.conflicts(new Set(entry.blockIds)).length > 0;
+			anyConflicts = anyConflicts || this.tracker.conflicts(new Set(entry.blockIds)).length > 0;
 		}
 
 		// On conflicts, clear related caching and block-tracking and replay logical operations
@@ -106,57 +126,65 @@ export class Collection<TAction> implements ICollection<TAction> {
 
 	/** Push our pending actions to the transactor */
 	async sync() {
-		const lockId = `Collection.sync:${this.id}`;
-		const release = await Latches.acquire(lockId);
+		const release = await Latches.acquire(this.latchId);
 		try {
-			const bytes = randomBytes(16);
-			const actionId = uint8ArrayToString(bytes, 'base64url');
-
-			while (this.pending.length || !isTransformsEmpty(this.tracker.transforms)) {
-				// Snapshot the pending actions so that any new actions aren't assumed to be part of this action
-				const pending = [...this.pending];
-
-				// Create a snapshot tracker for the action, so that we can ditch the log changes if we have to retry the action
-				const snapshot = copyTransforms(this.tracker.transforms);
-				const tracker = new Tracker(this.sourceCache, snapshot);
-
-				// Add the action to the log (in local tracking space)
-				const log = await Log.open<Action<TAction>>(tracker, this.id);
-				if (!log) {
-					throw new Error(`Log not found for collection ${this.id}`);
-				}
-				const newRev = (this.source.actionContext?.rev ?? 0) + 1;
-				const addResult = await log.addActions(pending, actionId, newRev, () => tracker.transformedBlockIds());
-
-				// Commit the action to the transactor
-				const staleFailure = await this.source.transact(tracker.transforms, actionId, newRev, this.id, addResult.tailPath.block.header.id);
-				if (staleFailure) {
-					if (staleFailure.pending) {
-						// Wait for short time to allow the pending actions to commit (bounded backoff)
-						await new Promise(resolve => setTimeout(resolve, PendingRetryDelayMs));
-					}
-					await this.update();
-				} else {
-					// Clear the pending actions that were part of this action
-					this.pending = this.pending.slice(pending.length);
-					// Reset cache and replay any actions that were added during the action
-					const transforms = tracker.reset();
-					await this.replayActions();
-					this.sourceCache.transformCache(transforms);
-					this.source.actionContext = this.source.actionContext
-						? { committed: [...this.source.actionContext.committed, { actionId, rev: newRev }], rev: newRev }
-						: { committed: [{ actionId, rev: newRev }], rev: newRev };
-				}
-			}
+			await this.syncInternal();
 		} finally {
 			release();
 		}
 	}
 
+	private async syncInternal() {
+		const bytes = randomBytes(16);
+		const actionId = uint8ArrayToString(bytes, 'base64url');
+
+		while (this.pending.length || !isTransformsEmpty(this.tracker.transforms)) {
+			// Snapshot the pending actions so that any new actions aren't assumed to be part of this action
+			const pending = [...this.pending];
+
+			// Create a snapshot tracker for the action, so that we can ditch the log changes if we have to retry the action
+			const snapshot = copyTransforms(this.tracker.transforms);
+			const tracker = new Tracker(this.sourceCache, snapshot);
+
+			// Add the action to the log (in local tracking space)
+			const log = await Log.open<Action<TAction>>(tracker, this.id);
+			if (!log) {
+				throw new Error(`Log not found for collection ${this.id}`);
+			}
+			const newRev = (this.source.actionContext?.rev ?? 0) + 1;
+			const addResult = await log.addActions(pending, actionId, newRev, () => tracker.transformedBlockIds());
+
+			// Commit the action to the transactor
+			const staleFailure = await this.source.transact(tracker.transforms, actionId, newRev, this.id, addResult.tailPath.block.header.id);
+			if (staleFailure) {
+				if (staleFailure.pending) {
+					// Wait for short time to allow the pending actions to commit (bounded backoff)
+					await new Promise(resolve => setTimeout(resolve, PendingRetryDelayMs));
+				}
+				// Fetch latest state - updateInternal() will call replayActions() if there are conflicts
+				await this.updateInternal();
+			} else {
+				// Clear the pending actions that were part of this action
+				this.pending = this.pending.slice(pending.length);
+				// Reset cache and replay any actions that were added during the action
+				const transforms = tracker.reset();
+				await this.replayActions();
+				this.sourceCache.transformCache(transforms);
+				this.source.actionContext = this.source.actionContext
+					? { committed: [...this.source.actionContext.committed, { actionId, rev: newRev }], rev: newRev }
+					: { committed: [{ actionId, rev: newRev }], rev: newRev };
+			}
+		}
+	}
+
 	async updateAndSync() {
-		// TODO: introduce timer and potentially change stats to determine when to sync, rather than always syncing
-		await this.update();
-		await this.sync();
+		const release = await Latches.acquire(this.latchId);
+		try {
+			await this.updateInternal();
+			await this.syncInternal();
+		} finally {
+			release();
+		}
 	}
 
 	async *selectLog(forward = true): AsyncIterableIterator<Action<TAction>> {
@@ -164,27 +192,22 @@ export class Collection<TAction> implements ICollection<TAction> {
 		if (!log) {
 			throw new Error(`Log not found for collection ${this.id}`);
 		}
-		let entryCount = 0;
 		for await (const entry of log.select(undefined, forward)) {
-			entryCount++;
 			if (entry.action) {
 				yield* forward ? entry.action.actions : entry.action.actions.reverse();
 			}
 		}
-		console.log(`[SELECT-LOG] collectionId=${this.id.slice(0,12)}... entryCount=${entryCount}`);
 	}
 
 	private async replayActions() {
 		this.tracker.reset();
-		// Because pending could be appended while we're async, we need to snapshot and repeat until empty
-		while (this.pending.length) {
-			const pending = [...this.pending];
-			this.pending = [];
-			await this.internalTransact(...pending);
+		// Replay pending actions against the fresh tracker state (always called under latch)
+		for (const action of this.pending) {
+			await this.internalTransact(action);
 		}
 	}
 
-	/** Called for each local action that may be in conflict with a remote action.
+	/** Called for each local action that may be in conflict with a remote action (always called under latch).
 	 * @param action - The local action to check
 	 * @param potential - The remote action that is potentially in conflict
 	 * @returns true if the action should be kept, false to discard it
@@ -195,7 +218,8 @@ export class Collection<TAction> implements ICollection<TAction> {
 			if (!replacement) {
 				return false;
 			} else if (replacement !== action) {
-				this.act(replacement);
+				// Queue replacement - it will be applied in replayActions()
+				this.pending.push(replacement);
 			}
 		}
 		return true;

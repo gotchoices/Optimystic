@@ -274,7 +274,7 @@ export class NetworkTransactor implements ITransactor {
 		}
 
 		if (error) { // If any failures, cancel all pending actions as background microtask
-			Promise.resolve().then(() => this.cancelBatch(batches, { blockIds, actionId: blockAction.actionId }));
+			void Promise.resolve().then(() => this.cancelBatch(batches, { blockIds, actionId: blockAction.actionId }));
 			const stale = Array.from(allBatches(batches, b => b.request?.isResponse as boolean && !b.request!.response!.success));
 			if (stale.length > 0) {	// Any active stale failures should preempt reporting connection or other potential transient errors (we have information)
 				return {

@@ -477,7 +477,6 @@ export class ClusterCoordinator {
 					await this.localCluster.update(record);
 				} catch (err) {
 					// Local execution errors shouldn't fail the transaction since consensus was reached
-					console.log(`[COORDINATOR] LOCAL EXECUTION ERROR hash=${record.messageHash.slice(0, 8)} error=${err instanceof Error ? err.message : String(err)}`);
 					log('cluster-tx:local-execution-error', {
 						messageHash: record.messageHash,
 						error: err instanceof Error ? err.message : String(err)

@@ -275,6 +275,7 @@ describe('Distributed Diary Operations', () => {
 
 		// Verify all writes succeeded
 		console.log('Verifying all writes succeeded...');
+		await diaries[0]!.update();  // Fetch latest state from network
 		const finalEntries: any[] = [];
 		for await (const entry of diaries[0]!.select()) {
 			const typedEntry = entry as any;

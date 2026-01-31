@@ -168,9 +168,9 @@ export class CoordinatorRepo implements IRepo {
 		const allBlockIds = Object.keys(request.transforms);
 		const coordinatingBlockIds = (options as any)?.coordinatingBlockIds ?? allBlockIds;
 
-		const peerCount = await this.coordinator.getClusterSize(coordinatingBlockIds[0]!)
+		const peerCount = await this.coordinator.getClusterSize(coordinatingBlockIds[0]!);
 		if (peerCount <= 1) {
-			return await this.storageRepo.pend(request, options)
+			return await this.storageRepo.pend(request, options);
 		}
 
 		const message: RepoMessage = {

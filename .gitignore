@@ -87,8 +87,7 @@ typings/
 dist
 out
 
-.mesh/node-*.json
-.mesh/mesh-ready.json
+.mesh
 packages/reference-peer/.optimystic-node.json
 
 # Yarn configuration with secrets

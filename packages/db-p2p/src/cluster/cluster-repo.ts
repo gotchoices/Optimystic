@@ -437,19 +437,37 @@ export class ClusterMember implements ICluster {
 
 	/**
 	 * Validates pend operations in a cluster record using the transaction validator.
+	 * Also checks for stale revisions to prevent consensus on operations that would fail.
 	 * Returns success if no validator is configured (backwards compatibility).
 	 */
 	private async validatePendOperations(record: ClusterRecord): Promise<{ valid: boolean; reason?: string }> {
-		if (!this.validator) {
-			return { valid: true };
-		}
-
 		// Find pend operations in the message
 		for (const operation of record.message.operations) {
 			if ('pend' in operation) {
 				const pendRequest = operation.pend;
-				// Only validate if we have a transaction and operationsHash
-				if (pendRequest.transaction && pendRequest.operationsHash) {
+
+				// Check for stale revisions before allowing consensus
+				if (pendRequest.rev !== undefined) {
+					const blockIds = blockIdsForTransforms(pendRequest.transforms);
+					// Get block states to check latest revisions
+					const blockResults = await this.storageRepo.get({ blockIds });
+					for (const blockId of blockIds) {
+						const blockResult = blockResults[blockId];
+						const latestRev = blockResult?.state?.latest?.rev;
+						if (latestRev !== undefined && latestRev >= pendRequest.rev) {
+							log('cluster-member:validation-stale-revision', {
+								messageHash: record.messageHash,
+								blockId,
+								requestedRev: pendRequest.rev,
+								latestRev
+							});
+							return { valid: false, reason: `stale revision: block ${blockId} at rev ${latestRev}, requested rev ${pendRequest.rev}` };
+						}
+					}
+				}
+
+				// Run custom validator if configured
+				if (this.validator && pendRequest.transaction && pendRequest.operationsHash) {
 					const result = await this.validator.validate(pendRequest.transaction, pendRequest.operationsHash);
 					if (!result.valid) {
 						return { valid: false, reason: result.reason };

@@ -91,14 +91,11 @@ export class Chain<TEntry> {
 		const { headerBlock, block: oldTail } = path;
 		let tail = oldTail;
 
-		console.log(`[CHAIN-ADD] blockId=${tail.header.id.slice(0,12)}... tailEntries=${tail.entries.length}`);
-
 		const trx = new Atomic(this.store);
 
 		// Attempt to fit in current block
 		const copied = entries.slice(0, EntriesPerBlock - tail.entries.length);
 		if (copied.length > 0) {
-			console.log(`[CHAIN-ADD] spliceIndex=${tail.entries.length} copiedCount=${copied.length}`);
 			apply(trx, tail, [entries$, tail.entries.length, 0, copied]);
 			entries = entries.slice(copied.length);
 		}
@@ -240,7 +237,6 @@ export class Chain<TEntry> {
 		if (!path) {
 			return;
 		}
-		console.log(`[CHAIN-SELECT] chainId=${this.id.slice(0,12)}... startBlockId=${path.block.header.id.slice(0,12)}... startBlockEntries=${path.block.entries.length}`);
 		let block: ChainDataNode<TEntry> | undefined = path.block;
 
 		let index = path.index;
