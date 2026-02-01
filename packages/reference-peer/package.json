@@ -68,7 +68,9 @@
       "bundle": false
     },
     "test": {
-      "target": ["node"]
+      "target": [
+        "node"
+      ]
     }
   }
 }

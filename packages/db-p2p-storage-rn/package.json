@@ -1,8 +1,8 @@
 {
-  "name": "@optimystic/db-core",
+  "name": "@optimystic/db-p2p-storage-rn",
   "version": "0.1.0",
   "type": "module",
-  "description": "Core database functionality for Optimystic",
+  "description": "React Native storage backend for @optimystic/db-p2p using MMKV",
   "main": "dist/src/index.js",
   "types": "./dist/src/index.d.ts",
   "files": [
@@ -20,17 +20,17 @@
   "repository": {
     "type": "git",
     "url": "https://github.com/gotchoices/optimystic.git",
-    "directory": "packages/db-core"
+    "directory": "packages/db-p2p-storage-rn"
   },
   "author": "Got Choices Foundation",
   "license": "MIT",
   "keywords": [
     "optimystic",
     "database",
-    "core",
-    "distributed",
-    "transactional",
-    "acid"
+    "p2p",
+    "storage",
+    "react-native",
+    "mmkv"
   ],
   "scripts": {
     "clean": "aegir clean",
@@ -41,19 +41,28 @@
     "dep-check": "aegir dep-check"
   },
   "devDependencies": {
+    "@types/debug": "^4.1.12",
     "@types/mocha": "^10.0.10",
     "@types/node": "^25.1.0",
     "aegir": "^47.0.26",
     "typescript": "^5.9.3"
   },
   "dependencies": {
-    "@libp2p/crypto": "^5.1.13",
-    "@libp2p/interface": "^3.1.0",
-    "@libp2p/peer-id": "^6.0.4",
-    "@libp2p/peer-id-factory": "^4.2.4",
-    "@multiformats/multiaddr": "^13.0.1",
-    "debug": "^4.4.3",
-    "multiformats": "^13.4.2",
-    "uint8arrays": "^5.1.0"
+    "@optimystic/db-core": "workspace:^",
+    "@optimystic/db-p2p": "workspace:^",
+    "debug": "^4.4.3"
+  },
+  "peerDependencies": {
+    "react-native-mmkv": "^3.0.0 || ^2.0.0"
+  },
+  "peerDependenciesMeta": {
+    "react-native-mmkv": {
+      "optional": false
+    }
+  },
+  "aegir": {
+    "build": {
+      "bundle": false
+    }
   }
 }

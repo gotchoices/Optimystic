@@ -24,6 +24,8 @@ See the following documentation:
 
 * **Database Core** - packages/db-core - Database core functionality, not specific to any particular storage topology
 * **Database P2P** - packages/db-p2p - Database integration with libp2p, including Arachnode ring discovery
+* **Database P2P Storage (Filesystem)** - packages/db-p2p-storage-fs - Node.js filesystem storage backend
+* **Database P2P Storage (React Native)** - packages/db-p2p-storage-rn - React Native storage backend using MMKV
 * **Reference Peer** - packages/reference-peer - CLI for testing peer-to-peer functionality (run via `optimystic-peer`)
 * **Quereus Plugin Crypto** - packages/quereus-plugin-crypto - Quereus plugin providing cryptographic functions
 * **Quereus Plugin Optimystic** - packages/quereus-plugin-optimystic - Quereus plugin for Optimystic distributed tree collections

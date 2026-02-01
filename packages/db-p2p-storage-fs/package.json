@@ -1,54 +1,60 @@
 {
-  "name": "@optimystic/db-p2p-storage-fs",
-  "version": "0.1.0",
-  "type": "module",
-  "description": "Node.js filesystem storage backend for @optimystic/db-p2p",
-  "main": "dist/src/index.js",
-  "types": "./dist/src/index.d.ts",
-  "files": [
-    "src",
-    "dist",
-    "!dist/test",
-    "!**/*.tsbuildinfo"
-  ],
-  "exports": {
-    ".": {
-      "types": "./dist/src/index.d.ts",
-      "import": "./dist/src/index.js"
-    }
-  },
-  "repository": {
-    "type": "git",
-    "url": "https://github.com/gotchoices/optimystic.git",
-    "directory": "packages/db-p2p-storage-fs"
-  },
-  "author": "Got Choices Foundation",
-  "license": "MIT",
-  "keywords": [
-    "optimystic",
-    "database",
-    "p2p",
-    "storage",
-    "filesystem",
-    "node"
-  ],
-  "scripts": {
-    "clean": "aegir clean",
-    "build": "aegir build --env node",
-    "lint": "aegir lint",
-    "test": "aegir test",
-    "test:node": "aegir test -t node",
-    "dep-check": "aegir dep-check"
-  },
-  "devDependencies": {
-    "@types/debug": "^4.1.12",
-    "@types/node": "^22.13.10",
-    "aegir": "^45.1.4",
-    "typescript": "^5.9.3"
-  },
-  "dependencies": {
-    "@optimystic/db-core": "workspace:^",
-    "@optimystic/db-p2p": "workspace:^",
-    "debug": "^4.4.1"
-  }
+	"name": "@optimystic/db-p2p-storage-fs",
+	"version": "0.1.0",
+	"type": "module",
+	"description": "Node.js filesystem storage backend for @optimystic/db-p2p",
+	"main": "dist/src/index.js",
+	"types": "./dist/src/index.d.ts",
+	"files": [
+		"src",
+		"dist",
+		"!dist/test",
+		"!**/*.tsbuildinfo"
+	],
+	"exports": {
+		".": {
+			"types": "./dist/src/index.d.ts",
+			"import": "./dist/src/index.js"
+		}
+	},
+	"repository": {
+		"type": "git",
+		"url": "https://github.com/gotchoices/optimystic.git",
+		"directory": "packages/db-p2p-storage-fs"
+	},
+	"author": "Got Choices Foundation",
+	"license": "MIT",
+	"keywords": [
+		"optimystic",
+		"database",
+		"p2p",
+		"storage",
+		"filesystem",
+		"node"
+	],
+	"scripts": {
+		"clean": "aegir clean",
+		"build": "aegir build --env node",
+		"lint": "aegir lint",
+		"test": "aegir test",
+		"test:node": "aegir test -t node",
+		"dep-check": "aegir dep-check"
+	},
+	"devDependencies": {
+		"@types/debug": "^4.1.12",
+		"@types/mocha": "^10.0.10",
+		"@types/node": "^25.1.0",
+		"aegir": "^47.0.26",
+		"typescript": "^5.9.3"
+	},
+	"dependencies": {
+		"@optimystic/db-core": "workspace:^",
+		"@optimystic/db-p2p": "workspace:^",
+		"debug": "^4.4.3"
+	},
+	"aegir": {
+		"build": {
+			"bundle": false
+		}
+	}
 }

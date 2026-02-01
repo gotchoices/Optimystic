@@ -1,11 +1,9 @@
-﻿{
+{
 	"compilerOptions": {
 		"target": "ES2022",
 		"module": "Node16",
 		"moduleResolution": "Node16",
-		"lib": [
-			"ES2022"
-		],
+		"lib": ["ES2022"],
 		"rootDir": ".",
 		"outDir": "dist",
 		"strict": true,
@@ -22,12 +20,7 @@
 		"allowImportingTsExtensions": false,
 		"verbatimModuleSyntax": false
 	},
-	"include": [
-		"src",
-		"test"
-	],
-	"exclude": [
-		"node_modules",
-		"dist"
-	]
+	"include": ["src", "test"],
+	"exclude": ["node_modules", "dist"]
 }
+
