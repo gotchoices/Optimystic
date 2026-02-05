@@ -219,7 +219,15 @@ export class ClusterMember implements ICluster {
 				log('cluster-member:action-consensus', {
 					messageHash: record.messageHash
 				});
-				await this.handleConsensus(currentRecord);
+				// If the incoming record already had our commit, we already executed
+				// (idempotency for duplicate consensus messages)
+				if (inboundPhase !== 'commit') {
+					await this.handleConsensus(currentRecord);
+				} else {
+					log('cluster-member:consensus-skip-already-committed', {
+						messageHash: record.messageHash
+					});
+				}
 				// Don't call clearTransaction here - it happens in handleConsensus
 				shouldPersist = false;
 				break;
