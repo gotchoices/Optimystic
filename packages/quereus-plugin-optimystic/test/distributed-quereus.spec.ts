@@ -358,7 +358,6 @@ describe('Distributed Quereus Operations', () => {
 			port,
 			bootstrapNodes,
 			networkName: NETWORK_NAME,
-			storageType: 'memory',
 			fretProfile: 'edge',
 			clusterSize: MESH_SIZE,  // Match cluster size to actual network size
 			clusterPolicy: {

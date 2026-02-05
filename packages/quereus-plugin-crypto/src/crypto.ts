@@ -5,13 +5,13 @@
  * All functions accept and return base64url strings by default for SQL compatibility.
  */
 
-import { sha256, sha512 } from '@noble/hashes/sha2';
-import { blake3 } from '@noble/hashes/blake3';
-import { concatBytes, utf8ToBytes } from '@noble/hashes/utils';
-import { secp256k1 } from '@noble/curves/secp256k1';
-import { p256 } from '@noble/curves/nist';
-import { ed25519 } from '@noble/curves/ed25519';
-import { hexToBytes, bytesToHex } from '@noble/curves/abstract/utils';
+import { sha256, sha512 } from '@noble/hashes/sha2.js';
+import { blake3 } from '@noble/hashes/blake3.js';
+import { concatBytes, utf8ToBytes } from '@noble/hashes/utils.js';
+import { secp256k1 } from '@noble/curves/secp256k1.js';
+import { p256 } from '@noble/curves/nist.js';
+import { ed25519 } from '@noble/curves/ed25519.js';
+import { hexToBytes, bytesToHex } from '@noble/curves/utils.js';
 import { toString as uint8ArrayToString, fromString as uint8ArrayFromString } from 'uint8arrays';
 
 // Type definitions
@@ -192,20 +192,15 @@ export function sign(
 	let sigBytes: Uint8Array;
 
 	switch (curve) {
-		case 'secp256k1': {
-			const sig = secp256k1.sign(dataBytes, keyBytes, { lowS: true });
-			sigBytes = sig.toCompactRawBytes();
+		case 'secp256k1':
+			sigBytes = secp256k1.sign(dataBytes, keyBytes, { lowS: true });
 			break;
-		}
-		case 'p256': {
-			const sig = p256.sign(dataBytes, keyBytes, { lowS: true });
-			sigBytes = sig.toCompactRawBytes();
+		case 'p256':
+			sigBytes = p256.sign(dataBytes, keyBytes, { lowS: true });
 			break;
-		}
-		case 'ed25519': {
+		case 'ed25519':
 			sigBytes = ed25519.sign(dataBytes, keyBytes);
 			break;
-		}
 		default:
 			throw new Error(`Unsupported curve: ${curve}`);
 	}
@@ -288,13 +283,13 @@ export function generatePrivateKey(curve: CurveType = 'secp256k1', encoding: Enc
 
 	switch (curve) {
 		case 'secp256k1':
-			keyBytes = secp256k1.utils.randomPrivateKey();
+			keyBytes = secp256k1.utils.randomSecretKey();
 			break;
 		case 'p256':
-			keyBytes = p256.utils.randomPrivateKey();
+			keyBytes = p256.utils.randomSecretKey();
 			break;
 		case 'ed25519':
-			keyBytes = ed25519.utils.randomPrivateKey();
+			keyBytes = ed25519.utils.randomSecretKey();
 			break;
 		default:
 			throw new Error(`Unsupported curve: ${curve}`);

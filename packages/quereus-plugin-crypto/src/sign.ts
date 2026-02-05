@@ -6,10 +6,10 @@
  * Compatible with React Native and all JS environments.
  */
 
-import { secp256k1 } from '@noble/curves/secp256k1';
-import { p256 } from '@noble/curves/nist';
-import { ed25519 } from '@noble/curves/ed25519';
-import { bytesToHex, hexToBytes } from '@noble/curves/abstract/utils';
+import { secp256k1 } from '@noble/curves/secp256k1.js';
+import { p256 } from '@noble/curves/nist.js';
+import { ed25519 } from '@noble/curves/ed25519.js';
+import { bytesToHex, hexToBytes } from '@noble/curves/utils.js';
 
 /**
  * Supported elliptic curve types
@@ -83,35 +83,25 @@ function normalizeDigest(digest: DigestInput): Uint8Array {
 }
 
 /**
- * Format signature based on requested format
+ * Format signature based on requested format.
+ * In @noble/curves v2.0.1, sign() returns Uint8Array directly.
  */
-function formatSignature(signature: any, format: SignatureFormat, curve: CurveType): Uint8Array | string {
+function formatSignature(signature: Uint8Array, format: SignatureFormat, curve: CurveType): Uint8Array | string {
   switch (format) {
     case 'uint8array':
-      if (curve === 'ed25519') {
-        return signature;
-      }
-      return signature.toCompactRawBytes();
+    case 'compact':
+      return signature;
 
     case 'hex':
-      if (curve === 'ed25519') {
-        return bytesToHex(signature);
-      }
-      return signature.toCompactHex();
-
-    case 'compact':
-      if (curve === 'ed25519') {
-        return signature;
-      }
-      return signature.toCompactRawBytes();
+      return bytesToHex(signature);
 
     case 'der':
       if (curve === 'ed25519') {
         throw new Error('DER format not supported for ed25519');
       }
-      // Note: DER encoding would require additional implementation
-      // For now, fall back to compact
-      return signature.toCompactRawBytes();
+      // DER format requires the sign() call to request it via format option
+      // For now, return compact format as fallback
+      return signature;
 
     default:
       throw new Error(`Unsupported signature format: ${format}`);
@@ -214,11 +204,11 @@ Sign.ed25519 = (digest: DigestInput, privateKey: PrivateKeyInput, options: Omit<
 Sign.generatePrivateKey = (curve: CurveType = 'secp256k1'): Uint8Array => {
   switch (curve) {
     case 'secp256k1':
-      return secp256k1.utils.randomPrivateKey();
+      return secp256k1.utils.randomSecretKey();
     case 'p256':
-      return p256.utils.randomPrivateKey();
+      return p256.utils.randomSecretKey();
     case 'ed25519':
-      return ed25519.utils.randomPrivateKey();
+      return ed25519.utils.randomSecretKey();
     default:
       throw new Error(`Unsupported curve: ${curve}`);
   }

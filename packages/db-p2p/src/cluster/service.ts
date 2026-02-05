@@ -1,17 +1,13 @@
 import { pipe } from 'it-pipe';
 import { decode as lpDecode, encode as lpEncode } from 'it-length-prefixed';
-import type { Startable, Logger, IncomingStreamData } from '@libp2p/interface';
+import type { Startable, Logger, Stream, Connection, StreamHandler } from '@libp2p/interface';
 import type { ICluster, ClusterRecord } from '@optimystic/db-core';
-import { computeResponsibility } from '../routing/responsibility.js'
-import { peersEqual } from '../peer-utils.js'
-import { buildKnownPeers } from '../routing/libp2p-known-peers.js'
-import { encodePeers } from '../repo/redirect.js'
 import type { Uint8ArrayList } from 'uint8arraylist';
 
 interface BaseComponents {
 	logger: { forComponent: (name: string) => Logger },
 	registrar: {
-		handle: (protocol: string, handler: (data: IncomingStreamData) => void, options: any) => Promise<void>,
+		handle: (protocol: string, handler: StreamHandler, options: any) => Promise<void>,
 		unhandle: (protocol: string) => Promise<void>
 	}
 }
@@ -102,8 +98,7 @@ export class ClusterService implements Startable {
 		this.running = false;
 	}
 
-	private handleIncomingStream(data: IncomingStreamData): void {
-		const { stream, connection } = data;
+	private handleIncomingStream(stream: Stream, connection: Connection): void {
 		const peerId = connection.remotePeer;
 
 		const processStream = async function* (this: ClusterService, source: AsyncIterable<Uint8ArrayList>) {
@@ -153,16 +148,22 @@ export class ClusterService implements Startable {
 			}
 		};
 
-		Promise.resolve().then(async () => {
-			await pipe(
-				stream,
-				(source) => lpDecode(source),
-				processStream.bind(this),
-				(source) => lpEncode(source),
-				stream
-			);
-		}).catch((err: Error) => {
-			this.log.error('error handling cluster protocol message from %p - %e', peerId, err);
-		});
+		void (async () => {
+			try {
+				const responses = pipe(
+					stream,
+					(source) => lpDecode(source),
+					processStream.bind(this),
+					(source) => lpEncode(source)
+				);
+				for await (const chunk of responses) {
+					stream.send(chunk);
+				}
+				await stream.close();
+			} catch (err) {
+				this.log.error('error handling cluster protocol message from %p - %e', peerId, err);
+				stream.abort(err instanceof Error ? err : new Error(String(err)));
+			}
+		})();
 	}
 }

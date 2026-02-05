@@ -1,6 +1,6 @@
 import { randomBytes } from '@libp2p/crypto';
 import { toString as uint8ArrayToString } from 'uint8arrays/to-string';
-import { sha256 } from '@noble/hashes/sha256';
+import { sha256 } from '@noble/hashes/sha2.js';
 
 /**
  * Generates a unique transaction stamp ID that includes a hash of the peer ID

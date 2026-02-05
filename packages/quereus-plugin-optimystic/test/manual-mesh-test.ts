@@ -44,7 +44,6 @@ async function createNode(port: number, bootstrapNodes: string[], networkName: s
 		port,
 		bootstrapNodes,
 		networkName,
-		storageType: 'memory',
 		fretProfile: 'edge',
 		arachnode: {
 			enableRingZulu: true

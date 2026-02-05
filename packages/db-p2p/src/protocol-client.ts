@@ -1,6 +1,5 @@
 import { pipe } from 'it-pipe';
 import { encode as lpEncode, decode as lpDecode } from 'it-length-prefixed';
-import { pushable } from 'it-pushable';
 import type { PeerId } from '@libp2p/interface';
 import type { IPeerNetwork } from '@optimystic/db-core';
 import { first } from './it-utility.js';
@@ -24,8 +23,18 @@ export class ProtocolClient {
 		);
 
 		try {
+			// Send the request using length-prefixed encoding
+			const encoded = pipe(
+				[new TextEncoder().encode(JSON.stringify(message))],
+				lpEncode
+			);
+			for await (const chunk of encoded) {
+				stream.send(chunk);
+			}
+
+			// Read the response from the stream (which is now directly AsyncIterable)
 			const source = pipe(
-				stream.source,
+				stream,
 				lpDecode,
 				async function* (source) {
 					for await (const data of source) {
@@ -36,19 +45,9 @@ export class ProtocolClient {
 				}
 			) as AsyncIterable<T>;
 
-			const sink = pushable();
-			void pipe(
-				sink,
-				lpEncode,
-				stream.sink
-			);
-
-			sink.push(new TextEncoder().encode(JSON.stringify(message)));
-			sink.end();
-
 			return await first(() => source, () => { throw new Error('No response received') });
 		} finally {
-			stream.close();
+			await stream.close();
 		}
 	}
 }

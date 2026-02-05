@@ -6,7 +6,7 @@ import type {
 	CollectionActions,
 	TransactionCoordinator
 } from '@optimystic/db-core';
-import { sha256 } from '@noble/hashes/sha256';
+import { sha256 } from '@noble/hashes/sha2.js';
 
 /**
  * Engine ID for Quereus SQL transactions.

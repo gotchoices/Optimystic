@@ -105,7 +105,6 @@ export class CollectionFactory {
         port: options.libp2pOptions?.port ?? 0,
         networkName: options.libp2pOptions?.networkName ?? 'optimystic',
         bootstrapNodes: options.libp2pOptions?.bootstrapNodes ?? [],
-        storageType: 'memory',
         fretProfile: 'edge',
         clusterSize: 1,
         clusterPolicy: {

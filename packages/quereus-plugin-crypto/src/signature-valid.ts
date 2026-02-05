@@ -6,10 +6,10 @@
  * Compatible with React Native and all JS environments.
  */
 
-import { secp256k1 } from '@noble/curves/secp256k1';
-import { p256 } from '@noble/curves/nist';
-import { ed25519 } from '@noble/curves/ed25519';
-import { hexToBytes } from '@noble/curves/abstract/utils';
+import { secp256k1 } from '@noble/curves/secp256k1.js';
+import { p256 } from '@noble/curves/nist.js';
+import { ed25519 } from '@noble/curves/ed25519.js';
+import { hexToBytes } from '@noble/curves/utils.js';
 
 /**
  * Supported elliptic curve types
@@ -72,40 +72,23 @@ function detectSignatureFormat(signature: Uint8Array, curve: CurveType): 'compac
 }
 
 /**
- * Parse signature based on format and curve
+ * Parse signature based on format and curve.
+ * In @noble/curves v2.0.1, uses Signature.fromBytes(bytes, format).
  */
-function parseSignature(signature: Uint8Array, format: 'compact' | 'der' | 'raw', curve: CurveType): any {
+function parseSignature(signature: Uint8Array, format: 'compact' | 'der' | 'raw', curve: CurveType): Uint8Array {
   if (curve === 'ed25519') {
     // Ed25519 signatures are always raw 64-byte format
     return signature;
   }
 
-  // For ECDSA curves
-  switch (format) {
-    case 'compact':
-      if (curve === 'secp256k1') {
-        return secp256k1.Signature.fromCompact(signature);
-      } else if (curve === 'p256') {
-        return p256.Signature.fromCompact(signature);
-      }
-      break;
+  // For ECDSA curves in v2.0.1, verify() accepts raw bytes directly
+  // The format parameter is used to parse signature bytes into the expected format
+  const sigFormat = format === 'raw' ? 'compact' : format;
 
-    case 'der':
-      if (curve === 'secp256k1') {
-        return secp256k1.Signature.fromDER(signature);
-      } else if (curve === 'p256') {
-        return p256.Signature.fromDER(signature);
-      }
-      break;
-
-    case 'raw':
-      // Treat as compact for ECDSA
-      if (curve === 'secp256k1') {
-        return secp256k1.Signature.fromCompact(signature);
-      } else if (curve === 'p256') {
-        return p256.Signature.fromCompact(signature);
-      }
-      break;
+  if (curve === 'secp256k1') {
+    return secp256k1.Signature.fromBytes(signature, sigFormat).toBytes();
+  } else if (curve === 'p256') {
+    return p256.Signature.fromBytes(signature, sigFormat).toBytes();
   }
 
   throw new Error(`Failed to parse signature for curve ${curve} with format ${format}`);

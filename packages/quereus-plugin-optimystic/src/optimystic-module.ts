@@ -10,20 +10,7 @@ import { TransactionBridge } from './optimystic-adapter/txn-bridge.js';
 import { OptimysticVirtualTableConnection } from './optimystic-adapter/vtab-connection.js';
 import type { ParsedOptimysticOptions } from './types.js';
 import { VirtualTable } from '@quereus/quereus';
-import type { VirtualTableModule, BaseModuleConfig, Database, TableSchema, Row, FilterInfo, BestAccessPlanRequest, BestAccessPlanResult, OrderingSpec, VirtualTableConnection, TableIndexSchema as IndexSchema, RowOp } from '@quereus/quereus';
-import { ConflictResolution } from '@quereus/quereus';
-
-/**
- * Arguments passed to VirtualTable.update() method.
- * Mirrors the interface from @quereus/quereus vtab/table.ts
- */
-interface UpdateArgs {
-	operation: RowOp;
-	values: Row | undefined;
-	oldKeyValues?: Row;
-	onConflict?: ConflictResolution;
-	mutationStatement?: string;
-}
+import type { VirtualTableModule, BaseModuleConfig, Database, TableSchema, Row, FilterInfo, BestAccessPlanRequest, BestAccessPlanResult, OrderingSpec, VirtualTableConnection, TableIndexSchema as IndexSchema, UpdateArgs, UpdateResult } from '@quereus/quereus';
 import { Tree } from '@optimystic/db-core';
 import { KeyRange } from '@optimystic/db-core';
 import { SchemaManager } from './schema/schema-manager.js';
@@ -481,7 +468,7 @@ export class OptimysticVirtualTable extends VirtualTable {
   /**
    * Performs an INSERT, UPDATE, or DELETE operation
    */
-  async update(args: UpdateArgs): Promise<Row | undefined> {
+  async update(args: UpdateArgs): Promise<UpdateResult> {
     const { operation, values, oldKeyValues, mutationStatement } = args;
 
     // Ensure connection is registered
@@ -523,7 +510,7 @@ export class OptimysticVirtualTable extends VirtualTable {
             // Update statistics
             this.statisticsCollector?.incrementRowCount();
 
-            return values;
+            return { status: 'ok', row: values };
           }
 
         case 'update':
@@ -559,7 +546,7 @@ export class OptimysticVirtualTable extends VirtualTable {
               txnState?.transactor
             );
 
-            return values;
+            return { status: 'ok', row: values };
           }
 
         case 'delete':
@@ -578,7 +565,7 @@ export class OptimysticVirtualTable extends VirtualTable {
             // Update statistics
             this.statisticsCollector?.decrementRowCount();
 
-            return undefined;
+            return { status: 'ok' };
           }
 
         default:

@@ -6,10 +6,10 @@
  * Compatible with React Native and all JS environments.
  */
 
-import { sha256 } from '@noble/hashes/sha2';
-import { sha512 } from '@noble/hashes/sha2';
-import { blake3 } from '@noble/hashes/blake3';
-import { concatBytes, utf8ToBytes } from '@noble/hashes/utils';
+import { sha256 } from '@noble/hashes/sha2.js';
+import { sha512 } from '@noble/hashes/sha2.js';
+import { blake3 } from '@noble/hashes/blake3.js';
+import { concatBytes, utf8ToBytes } from '@noble/hashes/utils.js';
 
 /**
  * Hash algorithm options

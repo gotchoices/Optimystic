@@ -132,8 +132,9 @@ export class SyncService implements Startable {
 	private async readRequest(stream: Stream): Promise<SyncRequest> {
 		const messages: Uint8Array[] = [];
 
+		// Stream is now directly AsyncIterable in libp2p v3
 		await pipe(
-			stream.source,
+			stream,
 			lp.decode,
 			async (source) => {
 				for await (const msg of source) {
@@ -157,11 +158,11 @@ export class SyncService implements Startable {
 		const json = JSON.stringify(response);
 		const bytes = u8FromString(json, 'utf8');
 
-		await pipe(
-			[bytes],
-			lp.encode,
-			stream.sink
-		);
+		// Use stream.send() instead of piping to stream.sink in libp2p v3
+		const encoded = pipe([bytes], lp.encode);
+		for await (const chunk of encoded) {
+			stream.send(chunk);
+		}
 	}
 
 	/**

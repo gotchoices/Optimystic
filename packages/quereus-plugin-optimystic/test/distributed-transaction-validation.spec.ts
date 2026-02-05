@@ -157,7 +157,7 @@ describe('Distributed Transaction Validation', () => {
 				`SELECT * FROM ${tableName} WHERE id = '1'`
 			).get();
 			expect(result, `Node ${i + 1} should see the row`).to.exist;
-			expect(result.price).to.equal(19.99);
+			expect(result!.price).to.equal(19.99);
 		}
 		console.log('✅ Row replicated to all nodes');
 
@@ -233,15 +233,15 @@ describe('Distributed Transaction Validation', () => {
 		// Verify stamp was captured
 		const row = await nodes[0]!.db.prepare(`SELECT * FROM ${tableName} WHERE id = 'entry1'`).get();
 		expect(row, 'Row should exist').to.exist;
-		expect(row.stamp_id, 'stamp_id should be captured').to.equal(stampId);
-		console.log(`✅ Captured stamp_id: ${(row.stamp_id as string).slice(0, 16)}...`);
+		expect(row!.stamp_id, 'stamp_id should be captured').to.equal(stampId);
+		console.log(`✅ Captured stamp_id: ${(row!.stamp_id as string).slice(0, 16)}...`);
 
 		// Verify replicated to other nodes
 		console.log('Waiting for replication...');
 		await delay(5000);
 		for (let i = 1; i < nodes.length; i++) {
 			const result = await nodes[i]!.db.prepare(`SELECT stamp_id FROM ${tableName} WHERE id = 'entry1'`).get();
-			console.log(`   Node ${i + 1}: stamp_id = ${result?.stamp_id?.slice(0, 16) || 'undefined'}...`);
+			console.log(`   Node ${i + 1}: stamp_id = ${String(result?.stamp_id ?? 'undefined').slice(0, 16)}...`);
 			expect(result?.stamp_id, `Node ${i + 1} should have stamp_id`).to.equal(stampId);
 		}
 		console.log('✅ StampId replicated to all nodes');
@@ -525,19 +525,19 @@ describe('Distributed Transaction Validation', () => {
 		// Query from Node 1 - should see the extra field
 		const row1 = await nodes[0]!.db.prepare(`SELECT * FROM ${tableName} WHERE id = '1'`).get();
 		expect(row1, 'Node 1 should see the row').to.exist;
-		expect(row1.extra_field).to.equal('extra_value');
+		expect(row1!.extra_field).to.equal('extra_value');
 		console.log('   Node 1: Sees extra_field = "extra_value"');
 
 		// Query from Node 2 - the underlying data has extra_field but schema doesn't
 		// Local schema determines what columns are visible in SELECT *
 		const row2 = await nodes[1]!.db.prepare(`SELECT * FROM ${tableName} WHERE id = '1'`).get();
 		expect(row2, 'Node 2 should see the row').to.exist;
-		expect(row2.name).to.equal('Alice');
+		expect(row2!.name).to.equal('Alice');
 		// Node 2's schema doesn't include extra_field, so it won't be in SELECT *
 		console.log(`   Node 2: Row data = ${JSON.stringify(row2)}`);
 
 		// Verify that extra_field is NOT visible on Node 2 (local schema enforcement)
-		expect(row2.extra_field, 'Node 2 should NOT see extra_field').to.be.undefined;
+		expect(row2!.extra_field, 'Node 2 should NOT see extra_field').to.be.undefined;
 		console.log('✅ Local schema correctly filters columns (extra_field not visible on Node 2)');
 
 		// NOTE: This test demonstrates LOCAL schema enforcement.

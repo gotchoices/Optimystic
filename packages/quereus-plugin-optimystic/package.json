@@ -1,6 +1,6 @@
 {
   "name": "@optimystic/quereus-plugin-optimystic",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "description": "Quereus plugin for Optimystic distributed tree collections",
   "type": "module",
   "main": "dist/index.js",
@@ -34,35 +34,35 @@
     "quoomb:node2": "quoomb --config examples/quoomb.config.node2.env.json"
   },
   "devDependencies": {
-    "@quereus/quereus": "^0.13.0",
-    "@types/node": "^24.0.12",
-    "aegir": "^47.0.20",
-    "rimraf": "^6.0.1",
-    "tsup": "^8.5.0",
-    "typescript": "^5.8.3"
+    "@quereus/quereus": "^0.16.2",
+    "@types/node": "^25.2.0",
+    "aegir": "^47.0.26",
+    "rimraf": "^6.1.2",
+    "tsup": "^8.5.1",
+    "typescript": "^5.9.3"
   },
   "dependencies": {
-    "@chainsafe/libp2p-gossipsub": "^14.1.1",
-    "@chainsafe/libp2p-yamux": "^7.0.4",
-    "@libp2p/bootstrap": "^11.0.46",
+    "@chainsafe/libp2p-gossipsub": "^14.1.2",
+    "@chainsafe/libp2p-yamux": "^8.0.1",
+    "@libp2p/bootstrap": "^12.0.11",
     "@libp2p/crypto": "^5.1.13",
-    "@libp2p/identify": "^3.0.38",
-    "@libp2p/interface": "^2.10.5",
-    "@libp2p/kad-dht": "^15.1.10",
-    "@libp2p/noise": "^12.0.1",
-    "@libp2p/tcp": "^10.1.18",
-    "@noble/hashes": "^1.8.0",
+    "@libp2p/identify": "^4.0.10",
+    "@libp2p/interface": "^3.1.0",
+    "@libp2p/kad-dht": "^16.1.3",
+    "@libp2p/noise": "^1.0.1",
+    "@libp2p/tcp": "^11.0.10",
+    "@noble/hashes": "^2.0.1",
     "@optimystic/db-core": "workspace:^",
     "@optimystic/db-p2p": "workspace:^",
-    "debug": "^4.4.1",
-    "libp2p": "^2.9.0",
+    "debug": "^4.4.3",
+    "libp2p": "^3.1.3",
     "uint8arrays": "^5.1.0"
   },
   "peerDependencies": {
-    "@quereus/quereus": "^0.13.0"
+    "@quereus/quereus": "^0.16.2"
   },
   "engines": {
-    "quereus": "^0.6.12"
+    "quereus": "^0.16.2"
   },
   "keywords": [
     "quereus-plugin",
