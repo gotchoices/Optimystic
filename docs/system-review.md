@@ -282,9 +282,23 @@ If you spot code or design aspects that aren't covered by these tasks, please ad
 
 ### 9.4 Documentation
 
-- [ ] **DOC-9.4.1**: Review `docs/architecture.md` for accuracy
-- [ ] **DOC-9.4.2**: Review `docs/optimystic.md` for accuracy
-- [ ] **DOC-9.4.3**: Review `docs/transactions.md` for accuracy
+- [x] **DOC-9.4.1**: Review `docs/architecture.md` for accuracy - FIXED:
+  - Overview and P2P section claimed "Kademlia DHT" but system uses FRET overlay on libp2p. Updated to reference FRET.
+  - Glossary "DHT/Kademlia" entry updated to "DHT/FRET" with `assembleCohort()` and `getNeighbors()` references.
+  - Matchmaking, storage, and Arachnode sections verified accurate; cross-links to optimystic.md, matchmaking.md, arachnode.md all valid.
+- [x] **DOC-9.4.2**: Review `docs/optimystic.md` for accuracy - FIXED:
+  - "Hashed Tree" collection type listed but not implemented (only Tree and Diary exist). Marked as "(planned)".
+  - Transaction phases (Pend, Commit, Propagate, Checkpoint) match TransactionCoordinator implementation.
+  - Transactor operations (get, pend, cancel, commit) match ITransactor interface.
+  - Block structures (Log Block, Block Repository, Block Transaction) match db-core types.
+  - Network Transactor & Clustering section accurately describes 2PC with cryptographic signatures.
+  - Ring Zulu section correctly references FRET's `assembleCohort()`. Cross-links valid.
+- [x] **DOC-9.4.3**: Review `docs/transactions.md` for accuracy - FIXED:
+  - Package structure listed phantom "quereus-optimystic-module" as separate package; this was absorbed into quereus-plugin-optimystic. Consolidated into single section.
+  - Dependency diagram correctly shows quereus, db-core, quereus-plugin-optimystic, db-p2p.
+  - Transaction phases (GATHER, PEND, COMMIT, PROPAGATE, CHECKPOINT) match TransactionCoordinator.
+  - Type definitions (TransactionStamp, StampId, PendRequest) match current implementation.
+  - Implementation phase tracking accurate (Phases 1-7 status matches codebase).
 - [ ] **DOC-9.4.4**: Add missing API documentation
 
 ---

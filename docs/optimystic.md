@@ -32,7 +32,7 @@ A collection is the fundamental unit of data storage in Optimystic.  It consists
 Types of collections include:
 * **Diary** - an append-only list of entries
 * **Tree** - a dictionary or index like structure that stores entries in terms of a key based order
-  * **Hashed Tree** - a tree where each node contains a hash of its children or entries (Merkle tree)
+  * **Hashed Tree** (planned) - a tree where each node contains a hash of its children or entries (Merkle tree)
 
 Each collection has a unique identifier, which is a reference to a block ID containing the collection's header.
 

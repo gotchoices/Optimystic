@@ -2,13 +2,13 @@
 
 ## Overview
 
-Optimystic is a distributed database system built on peer-to-peer networks using Kademlia DHT (Distributed Hash Table). The system provides a robust foundation for distributed applications requiring consistent, scalable data storage and efficient peer coordination.
+Optimystic is a distributed database system built on peer-to-peer networks using libp2p with a FRET (Flexible Routing Efficient Transport) DHT overlay. The system provides a robust foundation for distributed applications requiring consistent, scalable data storage and efficient peer coordination.
 
 ## Core Components
 
 ### Peer-to-Peer Networks
 
-The foundation of Optimystic is a peer-to-peer network based on the Kademlia DHT. A Kademlia DHT is a distributed hash table that allows nodes to find each other and exchange information efficiently across the network.
+The foundation of Optimystic is a peer-to-peer network built on libp2p with FRET as the DHT overlay service. FRET provides Kademlia-style distributed hash table routing, allowing nodes to find each other and exchange information efficiently across the network.
 
 Each network deployment varies in terms of what specific information is stored and exchanged, but the core protocols remain consistent. The fundamental capabilities of Optimystic networks include:
 
@@ -55,7 +55,7 @@ For details, see [Arachnode](arachnode.md).
 * **Block** - a versioned unit of data storage that can contain multiple records with scrambled ordering for privacy
 * **Cluster** - a group of peers responsible for maintaining and processing operations on specific blocks based on their proximity in the DHT keyspace
 * **Collection** - a logical grouping of related data that can be queried and modified as a unit
-* **DHT/Kademlia** - Distributed Hash Table - network protocol used to communicate and coordinate operations on a peer-to-peer basis without central servers
+* **DHT/FRET** - Distributed Hash Table via FRET (Flexible Routing Efficient Transport) overlay on libp2p - provides peer discovery (`getNeighbors()`), cluster assembly (`assembleCohort()`), and coordination without central servers
 * **Matchmaking** - the process of finding and connecting peers for collaborative tasks
 * **Pool** - a forming block that is not yet finalized or committed to the network
 * **Rendezvous Point** - a location in the DHT keyspace where peers meet to coordinate activities

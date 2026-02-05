@@ -1089,28 +1089,18 @@ export class TransactionValidator {
 
 **Dependencies**: None (core package)
 
-### quereus-optimystic-module
-**Responsibilities**:
-- VirtualTableModule implementation using db-core Trees
-- No p2p dependencies (pure module)
-
-**Files**:
-- `src/optimystic-module.ts` - VirtualTableModule implementation
-- `src/types.ts` - Module types
-
-**Dependencies**: quereus, db-core
-
 ### quereus-plugin-optimystic
 **Responsibilities**:
+- OptimysticModule (VirtualTableModule using db-core Trees)
 - QuereusEngine (implements ITransactionEngine)
-- OptimysticModule (VirtualTableModule with transaction support)
 - Schema hashing (for validation)
 - Integration with TransactionCoordinator
 - P2P integration
 
 **Key Files**:
+- `src/optimystic-module.ts` - OptimysticModule (VirtualTableModule implementation)
+- `src/types.ts` - Module types
 - `src/transaction/quereus-engine.ts` - QuereusEngine (executeStatement, execute, getSchemaHash)
-- `src/optimystic-module.ts` - OptimysticModule with TransactionSession integration
 - `src/plugin.ts` - Integrates module + coordinator + p2p
 
 **Dependencies**: quereus, db-core, db-p2p
