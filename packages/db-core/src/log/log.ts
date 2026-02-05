@@ -1,5 +1,6 @@
 import { sha256 } from 'multiformats/hashes/sha2'
-import { Chain, entryAt, nameof } from "../index.js";
+import { Chain, entryAt } from "../index.js";
+import { nameof } from "../utility/nameof.js";
 import type { IBlock, BlockId, ActionId, CollectionId, ChainPath, ActionRev, ActionContext, ChainInitOptions, BlockStore } from "../index.js";
 import type { ChainHeaderBlockType, ChainDataNode } from '../chain/chain-nodes.js';
 import type { LogEntry, ActionEntry } from "./index.js";
