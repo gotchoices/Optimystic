@@ -5,7 +5,6 @@ import type { IPeerNetwork } from '@optimystic/db-core';
 import type { PeerId } from '@libp2p/interface';
 import { peerIdFromPrivateKey } from '@libp2p/peer-id';
 import { generateKeyPair } from '@libp2p/crypto/keys';
-import { multiaddr } from '@multiformats/multiaddr';
 import { sha256 } from 'multiformats/hashes/sha2';
 import { base58btc } from 'multiformats/bases/base58';
 
@@ -38,7 +37,7 @@ const makeClusterPeers = (peerIds: PeerId[]): ClusterPeers => {
 	const peers: ClusterPeers = {};
 	for (const peerId of peerIds) {
 		peers[peerId.toString()] = {
-			multiaddrs: [multiaddr('/ip4/127.0.0.1/tcp/8000')],
+			multiaddrs: ['/ip4/127.0.0.1/tcp/8000'],
 			publicKey: new Uint8Array(32)
 		};
 	}

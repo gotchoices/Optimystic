@@ -1,4 +1,3 @@
-import type { Multiaddr } from "@multiformats/multiaddr";
 import type { RepoMessage } from "../network/repo-protocol.js";
 
 export type Signature = {
@@ -9,7 +8,7 @@ export type Signature = {
 
 export type ClusterPeers = {
 	[id: string]: {
-		multiaddrs: Multiaddr[];
+		multiaddrs: string[];
 		publicKey: Uint8Array;
 	};
 };

@@ -1,4 +1,4 @@
-import { randomBytes } from '@libp2p/crypto';
+import { randomBytes } from '@noble/hashes/utils.js';
 import { toString as uint8ArrayToString } from 'uint8arrays/to-string';
 import { sha256 } from '@noble/hashes/sha2.js';
 

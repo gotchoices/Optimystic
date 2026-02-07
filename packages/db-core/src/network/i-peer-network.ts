@@ -1,4 +1,4 @@
-import type { AbortOptions, PeerId, Stream } from "@libp2p/interface";
+import type { AbortOptions, PeerId, Stream } from "./types.js";
 
 export type IPeerNetwork = {
   /**

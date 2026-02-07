@@ -1,7 +1,7 @@
 import type { CollectionId, BlockId, IBlock, ActionId, Transform, Transforms } from "../index.js";
 import type { ActionContext, ActionRev } from "../collection/action.js";
 import type { Transaction } from "../transaction/transaction.js";
-import type { PeerId } from "@libp2p/interface";
+import type { PeerId } from "./types.js";
 
 export type ActionBlocks = {
 	blockIds: BlockId[];

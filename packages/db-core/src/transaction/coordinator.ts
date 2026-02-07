@@ -1,6 +1,6 @@
 import type { ITransactor, BlockId, CollectionId, Transforms, PendRequest, CommitRequest, ActionId, IBlock, BlockOperations } from "../index.js";
 import type { Transaction, ExecutionResult, ITransactionEngine, CollectionActions } from "./transaction.js";
-import type { PeerId } from "@libp2p/interface";
+import type { PeerId } from "../network/types.js";
 import type { Collection } from "../collection/collection.js";
 import { TransactionContext } from "./context.js";
 import { createActionsStatements } from "./actions-engine.js";

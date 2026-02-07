@@ -26,5 +26,3 @@ export * from "./routing/responsibility.js";
 export * from "./routing/libp2p-known-peers.js";
 export * from "./network/network-manager-service.js";
 export * from "./network/get-network-manager.js";
-
-

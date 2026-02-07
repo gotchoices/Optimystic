@@ -1,7 +1,7 @@
 import type { IBlock, Action, ActionType, ActionHandler, BlockId, ITransactor, BlockStore } from "../index.js";
 import { Log, Atomic, Tracker, copyTransforms, CacheSource, isTransformsEmpty, TransactorSource } from "../index.js";
 import type { CollectionHeaderBlock, CollectionId, ICollection } from "./index.js";
-import { randomBytes } from '@libp2p/crypto';
+import { randomBytes } from '@noble/hashes/utils.js';
 import { toString as uint8ArrayToString } from 'uint8arrays/to-string';
 import { Latches } from "../utility/latches.js";
 

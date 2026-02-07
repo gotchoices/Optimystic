@@ -483,6 +483,50 @@ const node = await createLibp2pNode({
 });
 ```
 
+#### Custom transports (including React Native)
+
+By default, `createLibp2pNode()` uses TCP + circuit-relay transport.
+
+To use non-default transports, pass `transports` (and typically `listenAddrs`):
+
+```typescript
+import { webSockets } from '@libp2p/websockets';
+import { circuitRelayTransport } from '@libp2p/circuit-relay-v2';
+import { createLibp2pNode } from '@optimystic/db-p2p';
+
+const node = await createLibp2pNode({
+    networkName: 'mynet',
+    bootstrapNodes: ['/dns4/relay.example.com/tcp/443/wss/p2p/12D3...'],
+    transports: [webSockets(), circuitRelayTransport()],
+    listenAddrs: [],  // client-only; no incoming connections
+});
+```
+
+#### React Native
+
+For React Native, import from `@optimystic/db-p2p/rn` instead of the root entrypoint.
+The `/rn` entrypoint does **not** import `@libp2p/tcp`, so Metro/Hermes won't try to
+bundle Node-only native modules. It requires `options.transports` explicitly:
+
+```typescript
+import { webSockets } from '@libp2p/websockets';
+import { circuitRelayTransport } from '@libp2p/circuit-relay-v2';
+import { createLibp2pNode } from '@optimystic/db-p2p/rn';
+
+const node = await createLibp2pNode({
+    networkName: 'mynet',
+    bootstrapNodes: ['/dns4/relay.example.com/tcp/443/wss/p2p/12D3...'],
+    transports: [webSockets(), circuitRelayTransport()],
+});
+```
+
+RN environments (Hermes, JSC) may also need polyfills for globals that libp2p
+and its dependencies expect.  Install these early (e.g. in your app's entry file
+before any other imports):
+
+- `crypto.getRandomValues` — e.g. `react-native-get-random-values`
+- `TextEncoder` / `TextDecoder` — e.g. `text-encoding` or `fast-text-encoding`
+
 ### Ring Transitions
 
 Nodes automatically transition between rings based on capacity thresholds:

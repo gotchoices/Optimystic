@@ -23,7 +23,7 @@ See the following documentation:
 ## Packages
 
 * **Database Core** - packages/db-core - Database core functionality, not specific to any particular storage topology
-* **Database P2P** - packages/db-p2p - Database integration with libp2p, including Arachnode ring discovery
+* **Database P2P** - packages/db-p2p - Database integration with libp2p, including Arachnode ring discovery (also exports `@optimystic/db-p2p/rn` for React Native — see below)
 * **Database P2P Storage (Filesystem)** - packages/db-p2p-storage-fs - Node.js filesystem storage backend
 * **Database P2P Storage (React Native)** - packages/db-p2p-storage-rn - React Native storage backend using MMKV
 * **Reference Peer** - packages/reference-peer - CLI for testing peer-to-peer functionality (run via `optimystic-peer`)
@@ -51,6 +51,28 @@ Stand-alone nodes can be hosted on any platform supporting Node.js. A node can b
 Whether transactional or storage-focused, a stand-alone node can optionally serve as:
   * **Public Gateway** - providing a public IP/DNS address for incoming connections from mobile apps and NAT traversal
   * **Bootstrap Node** - providing stable entry points for new nodes joining the network
+
+## React Native
+
+`@optimystic/db-p2p/rn` provides a Metro/Hermes-safe entrypoint that excludes Node-only
+transports (`@libp2p/tcp`).  Callers must supply their own transports:
+
+```typescript
+import { webSockets } from '@libp2p/websockets';
+import { circuitRelayTransport } from '@libp2p/circuit-relay-v2';
+import { createLibp2pNode } from '@optimystic/db-p2p/rn';
+
+const node = await createLibp2pNode({
+    networkName: 'mynet',
+    bootstrapNodes: ['/dns4/relay.example.com/tcp/443/wss/p2p/12D3...'],
+    transports: [webSockets(), circuitRelayTransport()],
+});
+```
+
+For persistent storage on RN, use `@optimystic/db-p2p-storage-rn` (MMKV backend).
+
+See [packages/db-p2p README](packages/db-p2p/README.md#react-native) for full details
+including required polyfills.
 
 ## Use Cases
 

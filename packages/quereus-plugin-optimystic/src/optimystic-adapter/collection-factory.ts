@@ -1,10 +1,10 @@
-import type { ITransactor, CollectionId } from '@optimystic/db-core';
+import type { ITransactor, CollectionId, PeerId } from '@optimystic/db-core';
 import { Tree } from '@optimystic/db-core';
 import { NetworkTransactor } from '@optimystic/db-core';
 import type { RowData, ParsedOptimysticOptions, TransactionState } from '../types.js';
 import { createKeyNetwork } from './key-network.js';
 import type { IRepo } from '@optimystic/db-core';
-import type { PeerId, Libp2p } from '@libp2p/interface';
+import type { Libp2p } from '@libp2p/interface';
 
 /**
  * Factory for creating and managing tree collections

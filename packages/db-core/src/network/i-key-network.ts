@@ -1,4 +1,4 @@
-import type { PeerId } from "@libp2p/interface";
+import type { PeerId } from "./types.js";
 import type { ClusterPeers } from "../cluster/structs.js";
 
 export type FindCoordinatorOptions = {

@@ -3936,6 +3936,7 @@ __metadata:
     "@libp2p/peer-id": "npm:^6.0.4"
     "@libp2p/peer-id-factory": "npm:^4.2.4"
     "@multiformats/multiaddr": "npm:^13.0.1"
+    "@noble/hashes": "npm:^2.0.1"
     "@types/mocha": "npm:^10.0.10"
     "@types/node": "npm:^25.1.0"
     aegir: "npm:^47.0.26"

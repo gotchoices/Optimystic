@@ -5,7 +5,7 @@ import type { Scenario } from './simulation.js'
 import { randomBytes } from '@libp2p/crypto'
 import { blockIdToBytes } from '../src/utility/block-id-to-bytes.js'
 import type { BlockId, PendRequest, ActionId, BlockOperation } from '../src/index.js'
-import type { PeerId } from '@libp2p/interface'
+import type { PeerId } from '../src/index.js'
 import { toString as uint8ArrayToString } from 'uint8arrays/to-string'
 import { generateRandomActionId } from './generate-random-action-id.js'
 

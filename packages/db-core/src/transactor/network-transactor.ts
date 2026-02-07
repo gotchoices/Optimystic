@@ -1,5 +1,5 @@
-import { type PeerId } from "@libp2p/interface";
-import { peerIdFromString } from "@libp2p/peer-id";
+import { peerIdFromString } from "../network/types.js";
+import type { PeerId } from "../network/types.js";
 import type { ActionTransforms, ActionBlocks, BlockActionStatus, ITransactor, PendSuccess, StaleFailure, IKeyNetwork, BlockId, GetBlockResults, PendResult, CommitResult, PendRequest, IRepo, BlockGets, Transforms, CommitRequest, ActionId, RepoCommitRequest, ClusterNomineesResult } from "../index.js";
 import { transformForBlockId, groupBy, concatTransforms, concatTransform, transformsFromTransform, blockIdsForTransforms } from "../index.js";
 import { blockIdToBytes } from "../utility/block-id-to-bytes.js";

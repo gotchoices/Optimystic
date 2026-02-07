@@ -1,7 +1,7 @@
 import { pipe } from 'it-pipe';
 import { encode as lpEncode, decode as lpDecode } from 'it-length-prefixed';
-import type { PeerId } from '@libp2p/interface';
-import type { IPeerNetwork } from '@optimystic/db-core';
+import type { Stream as Libp2pStream } from '@libp2p/interface';
+import type { PeerId, IPeerNetwork } from '@optimystic/db-core';
 import { first } from './it-utility.js';
 
 /** Base class for clients that communicate via a libp2p protocol */
@@ -20,7 +20,7 @@ export class ProtocolClient {
 			this.peerId,
 			protocol,
 			{ signal: options?.signal }
-		);
+		) as unknown as Libp2pStream;
 
 		try {
 			// Send the request using length-prefixed encoding

@@ -1,5 +1,5 @@
 import type { GetBlockResults, ActionBlocks, BlockActionStatus, PendResult, CommitResult, PendRequest, CommitRequest, BlockGets, BlockId } from "../index.js";
-import type { PeerId } from "@libp2p/interface";
+import type { PeerId } from "../network/types.js";
 
 export type ClusterNomineesResult = {
 	/** Peer IDs of the cluster members who can participate in consensus */

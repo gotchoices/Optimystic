@@ -1,9 +1,8 @@
 import type {
 	IRepo, GetBlockResults, PendSuccess, StaleFailure, ActionBlocks, MessageOptions, CommitResult,
-	PendRequest, CommitRequest, BlockGets, IPeerNetwork
+	PendRequest, CommitRequest, BlockGets, IPeerNetwork, PeerId
 } from "@optimystic/db-core";
 import type { RepoMessage } from "@optimystic/db-core";
-import type { PeerId } from "@libp2p/interface";
 import { ProtocolClient } from "../protocol-client.js";
 import { peerIdFromString } from "@libp2p/peer-id";
 

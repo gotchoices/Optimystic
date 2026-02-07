@@ -1,9 +1,7 @@
 import { sha256 } from 'multiformats/hashes/sha2'
 import { createEd25519PeerId } from '@libp2p/peer-id-factory';
-import type { AbortOptions, Ed25519PeerId, PeerId, Stream } from '@libp2p/interface';
 import { TestTransactor } from './test-transactor.js';
-import type { ClusterPeers, FindCoordinatorOptions, IKeyNetwork } from '../src/index.js';
-import { multiaddr } from '@multiformats/multiaddr';
+import type { AbortOptions, ClusterPeers, FindCoordinatorOptions, IKeyNetwork, PeerId, Stream } from '../src/index.js';
 
 export type Scenario = {
 	nodeCount: number;
@@ -94,31 +92,15 @@ export class NetworkSimulation implements IKeyNetwork {
 		for (const node of closestNodes) {
 			// Create the ClusterPeers entry
 			result[node.peerId.toString()] = {
-				multiaddrs: node.multiaddrs.map(addr => multiaddr(addr)),
-				publicKey: this.getPeerPublicKeyBytes(node.peerId),
+				multiaddrs: node.multiaddrs,
+				publicKey: this.getPeerIdBytes(node.peerId),
 			};
 		}
 
 		return result;
 	}
 
-	/**
-	 * Helper to safely extract public key bytes from a PeerId
-	 * @param peerId - The peer ID to extract public key from
-	 * @returns Uint8Array of public key bytes
-	 */
-	private getPeerPublicKeyBytes(peerId: PeerId): Uint8Array {
-		if (peerId.publicKey) {
-			// For Ed25519 and other key types that expose bytes directly
-			if (peerId.publicKey instanceof Uint8Array) {
-				return peerId.publicKey;
-			}
-
-			// Fall back to string encoding for other key types
-			return new TextEncoder().encode(peerId.toString());
-		}
-
-		// No public key available, use string representation
+	private getPeerIdBytes(peerId: PeerId): Uint8Array {
 		return new TextEncoder().encode(peerId.toString());
 	}
 
@@ -136,7 +118,7 @@ export class NetworkSimulation implements IKeyNetwork {
 			.filter(node => !excludedIds.has(node.peerId.toString()))
 			.map(node => {
 				// Create a byte array from the peer ID for distance calculation
-				const peerIdBytes = this.getPeerPublicKeyBytes(node.peerId);
+				const peerIdBytes = this.getPeerIdBytes(node.peerId);
 
 				return { node, distance: xorDistance(key, peerIdBytes) };
 			})

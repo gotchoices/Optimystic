@@ -1,4 +1,4 @@
-import { type PeerId } from "@libp2p/interface";
+import type { PeerId } from "../network/types.js";
 import type { BlockId } from "../index.js";
 import { Pending } from "./pending.js";
 

@@ -290,10 +290,10 @@ export class Libp2pKeyPeerNetwork implements IKeyNetwork, IPeerNetwork {
 		return byPeer
 	}
 
-	private parseMultiaddrs(addrs: string[]): ReturnType<typeof multiaddr>[] {
-		const out: ReturnType<typeof multiaddr>[] = []
+	private parseMultiaddrs(addrs: string[]): string[] {
+		const out: string[] = []
 		for (const a of addrs) {
-			try { out.push(multiaddr(a)) } catch (err) { console.warn('invalid multiaddr from connection', a, err) }
+			try { multiaddr(a); out.push(a) } catch (err) { console.warn('invalid multiaddr from connection', a, err) }
 		}
 		return out
 	}
@@ -317,12 +317,11 @@ export class Libp2pKeyPeerNetwork implements IKeyNetwork, IPeerNetwork {
 
 		for (const idStr of ids) {
 			if (idStr === this.libp2p.peerId.toString()) {
-				peers[idStr] = { multiaddrs: this.libp2p.getMultiaddrs(), publicKey: this.libp2p.peerId.publicKey?.raw ?? new Uint8Array() }
+				peers[idStr] = { multiaddrs: this.libp2p.getMultiaddrs().map(ma => ma.toString()), publicKey: this.libp2p.peerId.publicKey?.raw ?? new Uint8Array() }
 				continue
 			}
 			const strings = connectedByPeer[idStr] ?? []
-			const addrs = this.parseMultiaddrs(strings)
-			peers[idStr] = { multiaddrs: addrs, publicKey: new Uint8Array() }
+			peers[idStr] = { multiaddrs: this.parseMultiaddrs(strings), publicKey: new Uint8Array() }
 		}
 
 		this.log('findCluster:result key=%s clusterSize=%d withAddrs=%d connectedInCohort=%d',
