@@ -418,4 +418,99 @@ describe('Chain', () => {
             expect(remaining[49]).to.equal('entry99');
         });
     });
+
+    // TEST-3.2.1: Chain resilience and edge case tests
+    describe('resilience tests (TEST-3.2.1)', () => {
+        it('should maintain integrity through interleaved add and dequeue', async () => {
+            // Track all entries added (FIFO order) and total dequeued
+            const allAdded: string[] = [];
+            const allDequeued: string[] = [];
+
+            for (let batch = 0; batch < 5; batch++) {
+                const entries = Array.from({ length: 20 }, (_, i) => `batch${batch}-entry${i}`);
+                await chain.add(...entries);
+                allAdded.push(...entries);
+
+                const dequeued = await chain.dequeue(10);
+                expect(dequeued).to.have.length(10);
+                allDequeued.push(...dequeued);
+            }
+
+            // Dequeued items should match FIFO order of added items
+            expect(allDequeued).to.deep.equal(allAdded.slice(0, 50));
+
+            // Verify remaining 50 entries match the tail of what was added
+            const remaining: string[] = [];
+            for await (const path of chain.select()) {
+                remaining.push(entryAt(path)!);
+            }
+            expect(remaining).to.deep.equal(allAdded.slice(50));
+        })
+
+        it('should maintain integrity through interleaved add and pop', async () => {
+            for (let batch = 0; batch < 5; batch++) {
+                const entries = Array.from({ length: 20 }, (_, i) => `batch${batch}-entry${i}`);
+                await chain.add(...entries);
+
+                const popped = await chain.pop(10);
+                expect(popped).to.have.length(10);
+                expect(popped[9]).to.equal(`batch${batch}-entry19`);
+            }
+
+            const remaining: string[] = [];
+            for await (const path of chain.select()) {
+                remaining.push(entryAt(path)!);
+            }
+            expect(remaining).to.have.length(50);
+        })
+
+        it('should handle drain and refill cycle', async () => {
+            // Fill
+            await chain.add(...Array.from({ length: 100 }, (_, i) => `fill1-${i}`));
+
+            // Drain completely
+            const drained = await chain.dequeue(100);
+            expect(drained).to.have.length(100);
+
+            // Verify empty
+            const emptyEntries: string[] = [];
+            for await (const path of chain.select()) {
+                emptyEntries.push(entryAt(path)!);
+            }
+            expect(emptyEntries).to.have.length(0);
+
+            // Refill
+            await chain.add(...Array.from({ length: 50 }, (_, i) => `fill2-${i}`));
+
+            const refilled: string[] = [];
+            for await (const path of chain.select()) {
+                refilled.push(entryAt(path)!);
+            }
+            expect(refilled).to.have.length(50);
+            expect(refilled[0]).to.equal('fill2-0');
+            expect(refilled[49]).to.equal('fill2-49');
+        })
+
+        it('should maintain bidirectional navigation after mixed operations', async () => {
+            await chain.add(...Array.from({ length: 100 }, (_, i) => `entry${i}`));
+            await chain.dequeue(30);
+            await chain.pop(20);
+
+            // Forward
+            const forward: string[] = [];
+            for await (const path of chain.select()) {
+                forward.push(entryAt(path)!);
+            }
+            expect(forward).to.have.length(50);
+            expect(forward[0]).to.equal('entry30');
+            expect(forward[49]).to.equal('entry79');
+
+            // Backward
+            const backward: string[] = [];
+            for await (const path of chain.select(undefined, false)) {
+                backward.push(entryAt(path)!);
+            }
+            expect(backward).to.deep.equal([...forward].reverse());
+        })
+    });
 });

@@ -246,4 +246,158 @@ describe('BTree', () => {
     expect(await safeBtree.get(30)).to.equal(30)
     expect(await safeBtree.get(40)).to.equal(40)
   })
+
+  // TEST-3.1.1: B-tree stress tests for large datasets
+  describe('stress tests (TEST-3.1.1)', () => {
+    it('should handle 500 random-order inserts', async () => {
+      const values = Array.from({ length: 500 }, (_, i) => i)
+      // Fisher-Yates shuffle
+      for (let i = values.length - 1; i > 0; i--) {
+        const j = Math.floor(Math.random() * (i + 1));
+        [values[i], values[j]] = [values[j]!, values[i]!]
+      }
+
+      for (const v of values) {
+        await btree.insert(v!)
+      }
+
+      for (let i = 0; i < 500; i++) {
+        expect(await btree.get(i)).to.equal(i)
+      }
+
+      // Verify sorted iteration
+      const collected: number[] = []
+      const path = await btree.first()
+      while (path.on) {
+        collected.push(btree.at(path)!)
+        await btree.moveNext(path)
+      }
+      expect(collected).to.deep.equal(Array.from({ length: 500 }, (_, i) => i))
+    })
+
+    it('should handle delete of every other element in a large tree', async () => {
+      for (let i = 0; i < 500; i++) {
+        await btree.insert(i)
+      }
+
+      // Delete all even values
+      for (let i = 0; i < 500; i += 2) {
+        const path = await btree.find(i)
+        expect(path.on).to.be.true
+        await btree.deleteAt(path)
+      }
+
+      // Verify only odd values remain
+      for (let i = 0; i < 500; i++) {
+        if (i % 2 === 0) {
+          expect(await btree.get(i)).to.be.undefined
+        } else {
+          expect(await btree.get(i)).to.equal(i)
+        }
+      }
+    })
+
+    it('should maintain correct count across splits and merges', async () => {
+      for (let i = 0; i < 300; i++) {
+        await btree.insert(i)
+      }
+
+      const countAll = await btree.getCount()
+      expect(countAll).to.equal(300)
+
+      // Delete half from the middle
+      for (let i = 100; i < 200; i++) {
+        const path = await btree.find(i)
+        await btree.deleteAt(path)
+      }
+
+      expect(await btree.getCount()).to.equal(200)
+    })
+
+    it('should handle bulk upserts on large dataset', async () => {
+      for (let i = 0; i < 200; i++) {
+        await btree.insert(i)
+      }
+
+      // Upsert all existing and new values
+      for (let i = 0; i < 400; i++) {
+        await btree.upsert(i)
+      }
+
+      expect(await btree.getCount()).to.equal(400)
+      for (let i = 0; i < 400; i++) {
+        expect(await btree.get(i)).to.equal(i)
+      }
+    })
+  })
+
+  // TEST-3.1.2: Concurrent mutation tests (path invalidation)
+  describe('path invalidation (TEST-3.1.2)', () => {
+    it('should invalidate path after insert', async () => {
+      await btree.insert(10)
+      const path = await btree.find(10)
+      expect(path.on).to.be.true
+      expect(btree.isValid(path)).to.be.true
+
+      await btree.insert(20)
+      expect(btree.isValid(path)).to.be.false
+    })
+
+    it('should invalidate path after deleteAt', async () => {
+      await btree.insert(10)
+      await btree.insert(20)
+      const pathTo10 = await btree.find(10)
+      expect(btree.isValid(pathTo10)).to.be.true
+
+      const pathTo20 = await btree.find(20)
+      await btree.deleteAt(pathTo20)
+
+      expect(btree.isValid(pathTo10)).to.be.false
+    })
+
+    it('should invalidate path after updateAt', async () => {
+      await btree.insert(10)
+      await btree.insert(20)
+      const pathTo10 = await btree.find(10)
+
+      const pathTo20 = await btree.find(20)
+      await btree.updateAt(pathTo20, 25)
+
+      expect(btree.isValid(pathTo10)).to.be.false
+    })
+
+    it('should invalidate path after upsert', async () => {
+      await btree.insert(10)
+      const path = await btree.find(10)
+
+      await btree.upsert(30)
+      expect(btree.isValid(path)).to.be.false
+    })
+
+    it('should throw on stale path usage', async () => {
+      await btree.insert(10)
+      await btree.insert(20)
+      const path = await btree.find(10)
+
+      await btree.insert(30) // invalidate
+
+      expect(() => btree.at(path)).to.throw('Path is invalid')
+      await expect(btree.moveNext(path)).to.be.rejectedWith('Path is invalid')
+      await expect(btree.movePrior(path)).to.be.rejectedWith('Path is invalid')
+      await expect(btree.deleteAt(path)).to.be.rejectedWith('Path is invalid')
+      await expect(btree.updateAt(path, 99)).to.be.rejectedWith('Path is invalid')
+    })
+
+    it('should return valid path from mutation operations', async () => {
+      await btree.insert(10)
+      const insertPath = await btree.insert(20)
+      expect(btree.isValid(insertPath)).to.be.true
+
+      const [updatePath] = await btree.updateAt(insertPath, 25)
+      expect(btree.isValid(updatePath)).to.be.true
+
+      const upsertPath = await btree.upsert(30)
+      expect(btree.isValid(upsertPath)).to.be.true
+    })
+  })
 })

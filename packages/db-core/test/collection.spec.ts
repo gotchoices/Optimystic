@@ -1,5 +1,5 @@
 import { expect } from 'aegir/chai'
-import { Collection } from '../src/collection/index.js'
+import { Collection, type CollectionInitOptions } from '../src/collection/index.js'
 import { TestTransactor } from './test-transactor.js'
 import type { Action, ActionHandler, BlockStore, IBlock } from '../src/index.js'
 
@@ -332,5 +332,155 @@ describe('Collection', () => {
     }
     expect(actions).to.have.lengthOf(1)
     expect(actions[0]).to.deep.equal(action)
+  })
+
+  // TEST-3.3.1: Collection conflict resolution tests (filterConflict callback behavior)
+  describe('conflict resolution (TEST-3.3.1)', () => {
+    it('should discard pending action when filterConflict returns undefined', async () => {
+      const optionsWithFilter: CollectionInitOptions<TestAction> = {
+        ...initOptions,
+        filterConflict: (_action, _potential) => undefined
+      }
+
+      const collection1 = await Collection.createOrOpen<TestAction>(transactor, collectionId, optionsWithFilter)
+      const collection2 = await Collection.createOrOpen<TestAction>(transactor, collectionId, optionsWithFilter)
+
+      // Sync collection1 first to establish the log
+      await collection1.updateAndSync()
+      await collection2.update()
+
+      // Add remote action via collection1
+      const remoteAction: Action<TestAction> = {
+        type: 'set',
+        data: { value: 'remote', timestamp: 1 }
+      }
+      await collection1.act(remoteAction)
+      await collection1.sync()
+
+      // Add local pending action to collection2
+      const localAction: Action<TestAction> = {
+        type: 'set',
+        data: { value: 'local', timestamp: 2 }
+      }
+      await collection2.act(localAction)
+
+      // Update collection2 - should trigger filterConflict and discard the local action
+      await collection2.updateAndSync()
+
+      // Should only have the remote action (local was discarded)
+      const actions: Action<TestAction>[] = []
+      for await (const a of collection2.selectLog()) {
+        actions.push(a)
+      }
+      expect(actions).to.have.lengthOf(1)
+      expect(actions[0]?.data.value).to.equal('remote')
+    })
+
+    it('should keep pending action when filterConflict returns original action', async () => {
+      const optionsWithFilter: CollectionInitOptions<TestAction> = {
+        ...initOptions,
+        filterConflict: (action, _potential) => action
+      }
+
+      const collection1 = await Collection.createOrOpen<TestAction>(transactor, collectionId, optionsWithFilter)
+      const collection2 = await Collection.createOrOpen<TestAction>(transactor, collectionId, optionsWithFilter)
+
+      await collection1.updateAndSync()
+      await collection2.update()
+
+      const remoteAction: Action<TestAction> = {
+        type: 'set',
+        data: { value: 'remote', timestamp: 1 }
+      }
+      await collection1.act(remoteAction)
+      await collection1.sync()
+
+      const localAction: Action<TestAction> = {
+        type: 'set',
+        data: { value: 'local', timestamp: 2 }
+      }
+      await collection2.act(localAction)
+
+      // Update and sync collection2 - filterConflict keeps local action
+      await collection2.updateAndSync()
+
+      const actions: Action<TestAction>[] = []
+      for await (const a of collection2.selectLog()) {
+        actions.push(a)
+      }
+      // Remote + local both present
+      expect(actions).to.have.lengthOf(2)
+      expect(actions.map(a => a.data.value)).to.include('remote')
+      expect(actions.map(a => a.data.value)).to.include('local')
+    })
+
+    it('should keep pending when no filterConflict provided', async () => {
+      const collection1 = await Collection.createOrOpen<TestAction>(transactor, collectionId, initOptions)
+      const collection2 = await Collection.createOrOpen<TestAction>(transactor, collectionId, initOptions)
+
+      await collection1.updateAndSync()
+      await collection2.update()
+
+      await collection1.act({ type: 'set', data: { value: 'remote', timestamp: 1 } })
+      await collection1.sync()
+
+      await collection2.act({ type: 'set', data: { value: 'local', timestamp: 2 } })
+      await collection2.updateAndSync()
+
+      const actions: Action<TestAction>[] = []
+      for await (const a of collection2.selectLog()) {
+        actions.push(a)
+      }
+      expect(actions).to.have.lengthOf(2)
+    })
+  })
+
+  // TEST-3.3.2: Concurrent sync() tests
+  describe('concurrent sync (TEST-3.3.2)', () => {
+    it('should serialize concurrent sync calls via latch', async () => {
+      const collection = await Collection.createOrOpen<TestAction>(transactor, collectionId, initOptions)
+
+      for (let i = 0; i < 5; i++) {
+        await collection.act({
+          type: 'set',
+          data: { value: `value-${i}`, timestamp: Date.now() + i }
+        })
+      }
+
+      // Trigger multiple syncs concurrently - they should serialize
+      await Promise.all([
+        collection.updateAndSync(),
+        collection.updateAndSync(),
+        collection.updateAndSync()
+      ])
+
+      const actions: Action<TestAction>[] = []
+      for await (const a of collection.selectLog()) {
+        actions.push(a)
+      }
+      expect(actions).to.have.lengthOf(5)
+    })
+
+    it('should handle act during sync', async () => {
+      const collection = await Collection.createOrOpen<TestAction>(transactor, collectionId, initOptions)
+
+      await collection.act({ type: 'set', data: { value: 'before-sync', timestamp: 1 } })
+
+      // Start sync
+      const syncPromise = collection.updateAndSync()
+
+      // Add action during sync (will be queued due to latch)
+      const actPromise = collection.act({ type: 'set', data: { value: 'during-sync', timestamp: 2 } })
+
+      await syncPromise
+      await actPromise
+      await collection.updateAndSync()
+
+      const actions: Action<TestAction>[] = []
+      for await (const a of collection.selectLog()) {
+        actions.push(a)
+      }
+      expect(actions).to.have.lengthOf(2)
+    })
   })
 })

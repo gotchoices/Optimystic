@@ -339,4 +339,97 @@ describe('Log', () => {
       expect(entry.actions).to.deep.equal(expectedActions)
     }
   })
+
+  // TEST-3.2.2: Log checkpoint consistency tests
+  describe('checkpoint consistency (TEST-3.2.2)', () => {
+    it('should handle checkpoint with empty pendings', async () => {
+      const log = await Log.create<string>(store)
+
+      await log.addActions(['action1'], generateNumericActionId(1), 1, () => [])
+      await log.addCheckpoint([], 2)
+
+      const context = await log.getActionContext()
+      expect(context?.committed).to.deep.equal([])
+      expect(context?.rev).to.equal(2)
+    })
+
+    it('should handle getFrom at exact checkpoint boundary', async () => {
+      const log = await Log.create<string>(store)
+      const id1 = generateNumericActionId(1)
+      const id2 = generateNumericActionId(2)
+      const id3 = generateNumericActionId(3)
+
+      await log.addActions(['action1'], id1, 1, () => [])
+      await log.addActions(['action2'], id2, 2, () => [])
+      await log.addCheckpoint([{ actionId: id1, rev: 1 }, { actionId: id2, rev: 2 }], 3)
+      await log.addActions(['action3'], id3, 4, () => [])
+
+      // getFrom at the checkpoint rev should return only action3
+      const result = await log.getFrom(3)
+      expect(result.entries).to.have.lengthOf(1)
+      expect(result.entries[0]?.actions[0]).to.equal('action3')
+    })
+
+    it('should correctly rebuild context across checkpoint with subsequent actions', async () => {
+      const log = await Log.create<string>(store)
+      const ids = Array.from({ length: 5 }, (_, i) => generateNumericActionId(i + 1))
+
+      await log.addActions(['a1'], ids[0]!, 1, () => [])
+      await log.addActions(['a2'], ids[1]!, 2, () => [])
+      // Checkpoint only keeps action 1
+      await log.addCheckpoint([{ actionId: ids[0]!, rev: 1 }], 3)
+      await log.addActions(['a3'], ids[2]!, 4, () => [])
+      await log.addActions(['a4'], ids[3]!, 5, () => [])
+
+      const result = await log.getFrom(0)
+      // Should return all actions from rev > 0
+      expect(result.entries).to.have.lengthOf(4)
+      // Context should have checkpoint pendings + subsequent actions
+      expect(result.context?.committed).to.have.lengthOf(3) // id[0] from checkpoint + id[2] + id[3]
+    })
+
+    it('should handle sequential checkpoints overriding each other', async () => {
+      const log = await Log.create<string>(store)
+      const id1 = generateNumericActionId(1)
+      const id2 = generateNumericActionId(2)
+
+      await log.addActions(['a1'], id1, 1, () => [])
+      await log.addActions(['a2'], id2, 2, () => [])
+
+      // First checkpoint: both committed
+      await log.addCheckpoint([{ actionId: id1, rev: 1 }, { actionId: id2, rev: 2 }], 3)
+      let context = await log.getActionContext()
+      expect(context?.committed).to.have.lengthOf(2)
+
+      // Second checkpoint: only id2 remains
+      await log.addCheckpoint([{ actionId: id2, rev: 2 }], 4)
+      context = await log.getActionContext()
+      expect(context?.committed).to.have.lengthOf(1)
+      expect(context?.committed[0]?.actionId).to.equal(id2)
+    })
+
+    it('should handle getFrom spanning before and after checkpoint', async () => {
+      const log = await Log.create<string>(store)
+      const id1 = generateNumericActionId(1)
+      const id2 = generateNumericActionId(2)
+      const id3 = generateNumericActionId(3)
+
+      await log.addActions(['before-cp'], id1, 1, () => [])
+      await log.addCheckpoint([{ actionId: id1, rev: 1 }], 2)
+      await log.addActions(['after-cp-1'], id2, 3, () => [])
+      await log.addActions(['after-cp-2'], id3, 4, () => [])
+
+      // From rev 0 should include all actions
+      const fromStart = await log.getFrom(0)
+      expect(fromStart.entries).to.have.lengthOf(3)
+      expect(fromStart.entries[0]?.actions[0]).to.equal('before-cp')
+      expect(fromStart.entries[1]?.actions[0]).to.equal('after-cp-1')
+      expect(fromStart.entries[2]?.actions[0]).to.equal('after-cp-2')
+
+      // From rev 2 (at checkpoint) should return only post-checkpoint actions
+      const fromCheckpoint = await log.getFrom(2)
+      expect(fromCheckpoint.entries).to.have.lengthOf(2)
+      expect(fromCheckpoint.entries[0]?.actions[0]).to.equal('after-cp-1')
+    })
+  })
 })

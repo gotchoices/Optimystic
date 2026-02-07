@@ -228,12 +228,54 @@ const [resultPath, wasUpdate] = await tree.merge(
 );
 ```
 
+## Invariants
+
+The B-tree maintains these structural invariants at all times:
+
+| Property | Value | Notes |
+|----------|-------|-------|
+| Node capacity | 64 entries/children | `NodeCapacity` constant |
+| Minimum fill (non-root) | 32 entries/children | `NodeCapacity >>> 1` |
+| Split point | `(length + 1) >>> 1` | Midpoint of overfull node |
+| Data location | Leaf nodes only | B+-tree variant (no leaf linked list) |
+| Entry immutability | `Object.freeze()` on insert/upsert | Prevents mutation after storage |
+
+### Rebalancing Rules
+
+- **Split**: triggered when a node reaches `NodeCapacity` during insert. Splits at `(entries.length + 1) >>> 1`, promoting the first key of the new right node into the parent branch.
+- **Borrow**: after a delete, if a sibling has more than `NodeCapacity >>> 1` entries, one entry is transferred.
+- **Merge**: after a delete, if two siblings' combined entries fit within `NodeCapacity`, they are merged and the parent partition is removed. Merges cascade upward.
+- **Root collapse**: when the root branch has zero partitions (one child), that child becomes the new root.
+
+### Path Invalidation
+
+A monotonic `_version` counter tracks tree mutations. Paths capture the version at creation time; any subsequent mutation increments the version, making all outstanding paths invalid. Operations that accept a path (`at`, `deleteAt`, `updateAt`, `moveNext`, `movePrior`, `ascending`, `descending`) call `validatePath()` which throws on stale paths. Mutation operations (`insert`, `upsert`, `deleteAt`, `updateAt`, `merge`) return a fresh path with the new version.
+
 ## Performance Characteristics
 
-- **Node Capacity**: 64 entries per node
-- **Tree Height**: O(log n) for balanced access
-- **Range Queries**: Efficient iteration without loading entire tree
-- **Memory Usage**: Blocks loaded on-demand, structured cloning for consistency
-- **Network Efficiency**: Block-based storage minimizes network transfers
+### Time Complexity
 
+| Operation | Complexity | Notes |
+|-----------|-----------|-------|
+| `find` / `get` | O(log₆₄ n) | Binary search at each level |
+| `insert` | O(log₆₄ n) | Plus amortized O(1) split cost |
+| `deleteAt` | O(log₆₄ n) | Plus amortized rebalance |
+| `updateAt` | O(log₆₄ n) | O(1) if key unchanged; delete+insert if key changes |
+| `upsert` / `merge` | O(log₆₄ n) | find + insert or update |
+| `first` / `last` | O(log₆₄ n) | Descend one edge of tree |
+| `next` / `prior` | O(1) amortized | O(log₆₄ n) worst-case at block boundary |
+| `range` iteration | O(k + log₆₄ n) | k = results returned |
+| `getCount` | O(n / avg-fill) | Visits every leaf node |
+| `drop` | O(n / 64) | Visits every node |
 
+### Space and Memory
+
+- **Branching factor 64** → tree height ≈ log₆₄(n). A tree with 1M entries is ~3 levels deep.
+- **Blocks loaded on demand** via the `BlockStore` abstraction; no full-tree materialization.
+- **Structured cloning** (`structuredClone`) used for block isolation — reads never alias stored data.
+- **Block size** depends on entry size; `ring-selector.ts` estimates ~100 KB typical.
+
+### Network Efficiency
+
+- Each tree operation touches at most O(log₆₄ n) blocks, so only a small fraction of the tree is fetched per operation.
+- Splits and merges create/delete at most 2 blocks per level, keeping write amplification low.

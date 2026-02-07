@@ -43,13 +43,13 @@ Additionally, for SQL validation:
 - Cluster participants need to validate SQL semantics (constraints, collations, triggers)
 - Validation requires re-executing the transaction with the same engine and schema
 
-## Proposed Architecture
+## Architecture
 
 ### Core Principles
 
 1. **Coordinator-centric API**: TransactionCoordinator is the ONLY interface for all mutations (single or multi-collection)
 2. **Immediate local execution**: Actions are executed immediately through collections to update local snapshots
-3. **Transaction context orchestration**: TransactionContext coordinates multi-collection commits
+3. **Transaction session orchestration**: TransactionSession coordinates multi-collection commits
 4. **Snapshot isolation**: Collections maintain local trackers that reflect pending changes before network commit
 5. **Transactions span collections**: A transaction captures a logical mutation that may affect multiple collections
 6. **Pluggable execution engines**: The transaction 'statements' payload is engine-specific (SQL for Quereus, actions for testing, etc.)
@@ -320,18 +320,18 @@ export function createStampId(stamp: TransactionStamp): StampId {
 
 // Transaction: Finalized at COMMIT
 export type Transaction = {
-  // Reference to the stamp (stable ID)
-  stampId: StampId;
+  // The transaction stamp (contains stable stamp.id)
+  stamp: TransactionStamp;
 
   // Engine-specific statements (for replay/validation)
-  statements: string;
+  statements: string[];
 
   // Read dependencies for optimistic concurrency control
   reads: ReadDependency[];
 
-  // Content identifier (hash of stampId + statements + reads)
-  // This is the final transaction identity used in logs
-  cid: string;
+  // Transaction identifier (hash of stamp.id + statements + reads)
+  // This is the final transaction identity used in logs and block references
+  id: string;
 };
 
 export type ReadDependency = {
@@ -1143,7 +1143,7 @@ export class TransactionValidator {
 
 **Tasks**:
 - [x] Define TransactionStamp type (peerId, timestamp, schemaHash, engineId)
-- [x] Define Transaction type (stampId, statements, reads, cid)
+- [x] Define Transaction type (stamp, statements, reads, id)
 - [x] Define StampId type and createStampId() helper
 - [x] Update Action type to include transaction: StampId field
 - [x] Implement ActionsEngine (executeStatement, execute)
@@ -1422,10 +1422,8 @@ const stamp: TransactionStamp = {
   schemaHash: await quereusEngine.getSchemaHash(), // Cached
   engineId: 'quereus@0.5.3'
 };
-const stampId = createStampId(stamp);
-
-// Create TransactionSession:
-const session = new TransactionSession(coordinator, stampId, 'quereus@0.5.3');
+// Create TransactionSession (stamp is created internally):
+const session = new TransactionSession(coordinator, engine, peerId, schemaHash);
 ```
 
 **2. Execute Statement (quereus-plugin-optimystic)**
@@ -1454,13 +1452,13 @@ await session.execute("INSERT INTO users (id, name) VALUES (1, 'Alice')");
 await db.execute("COMMIT");
 
 // Session.commit() called:
-// - Compiles statements: JSON.stringify(["INSERT INTO users..."])
+// - Compiles accumulated statements
 // - Creates Transaction:
 const transaction: Transaction = {
-  stampId,
-  statements: JSON.stringify(["INSERT INTO users (id, name) VALUES (1, 'Alice')"]),
+  stamp,
+  statements: ["INSERT INTO users (id, name) VALUES (1, 'Alice')"],
   reads: [], // TODO: Track reads
-  cid: createTransactionCid(stampId, statements, [])
+  id: createTransactionId(stamp.id, statements, [])
 };
 
 // - Calls coordinator.commit(transaction)
@@ -1496,7 +1494,7 @@ const pendRequest: PendRequest = {
 };
 
 // Each cluster participant validates:
-// 1. Get stamp from transaction.stampId
+// 1. Get stamp from transaction.stamp
 // 2. Verify stamp.engineId matches local engine
 // 3. Verify stamp.schemaHash matches local schema
 // 4. Verify read dependencies
@@ -1525,11 +1523,11 @@ const pendRequest: PendRequest = {
 // Notify all block clusters of success
 // Clusters finalize their local changes
 // Append to collection logs:
-// - users log: records actions with transaction.cid
-// - users_by_name log: records actions with transaction.cid
+// - users log: records actions with transaction.id
+// - users_by_name log: records actions with transaction.id
 
 // Each log entry includes:
-// - Transaction CID
+// - Transaction ID
 // - Actions for that collection
 // - Transaction metadata (for future validators)
 ```

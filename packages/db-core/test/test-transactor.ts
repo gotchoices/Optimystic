@@ -75,8 +75,8 @@ export class TestTransactor implements ITransactor {
 						block = undefined;
 					}
 				} else if (blockGets.context?.rev !== undefined) {
-					// If requesting a specific revision, get the materialized block at that revision
-					block = structuredClone(blockState.materializedBlocks.get(blockGets.context.rev));
+					// Return the materialized block at the highest revision ≤ requested
+					block = structuredClone(latestMaterializedAt(blockState, blockGets.context.rev));
 				} else {
 					// Otherwise return latest materialized block
 					block = structuredClone(blockState.materializedBlocks.get(blockState.latestRev));
@@ -396,6 +396,15 @@ function newBlockState(): BlockState {
 		pendingActions: new Map(),
 		committedActions: new Map()
 	};
+}
+
+/** Returns the materialized block at the highest revision ≤ the given revision */
+function latestMaterializedAt(blockState: BlockState, maxRev: number): IBlock | undefined {
+	for (let rev = maxRev; rev >= 0; rev--) {
+		const block = blockState.materializedBlocks.get(rev);
+		if (block) return block;
+	}
+	return undefined;
 }
 
 function applyTransformSafe(block: IBlock | undefined, transform: Transform): IBlock | undefined {

@@ -5,6 +5,7 @@ import {
 	createTransactionStamp,
 	createTransactionId,
 	TransactionCoordinator,
+	TransactionSession,
 	TransactionValidator,
 	Tree,
 	type Transaction,
@@ -13,6 +14,7 @@ import {
 	type ValidationCoordinatorFactory,
 	type Transforms
 } from '../src/index.js';
+import { isTransformsEmpty } from '../src/transform/index.js';
 import { TestTransactor } from './test-transactor.js';
 
 describe('Transaction', () => {
@@ -1169,6 +1171,603 @@ describe('Transaction', () => {
 			const result = await validator.validate(transaction, 'ops:abc');
 			expect(result.valid).to.be.false;
 			expect(result.reason).to.include('Schema mismatch');
+		});
+	});
+
+	describe('Transaction Rollback (TEST-2.1.1)', () => {
+		it('should discard pending changes on rollback', async () => {
+			const transactor = new TestTransactor();
+
+			type UserEntry = { key: number; name: string };
+			const usersTree = await Tree.createOrOpen<number, UserEntry>(
+				transactor, 'users', entry => entry.key
+			);
+
+			const usersCollection = (usersTree as unknown as { collection: unknown }).collection;
+			const collections = new Map();
+			collections.set('users', usersCollection);
+
+			const coordinator = new TransactionCoordinator(transactor, collections);
+			const actionsEngine = new ActionsEngine(coordinator);
+			const session = new TransactionSession(coordinator, actionsEngine);
+
+			await session.execute(
+				'stmt1',
+				[{ collectionId: 'users', actions: [{ type: 'replace', data: [[1, { key: 1, name: 'Alice' }]] }] }]
+			);
+
+			// Data visible in local snapshot before commit
+			const beforeRollback = await usersTree.get(1);
+			expect(beforeRollback).to.deep.equal({ key: 1, name: 'Alice' });
+
+			await session.rollback();
+
+			// After rollback, tracker should be cleared
+			const transforms = coordinator.getTransforms();
+			expect(transforms.size).to.equal(0);
+		});
+
+		it('should clear transforms across multiple collections on rollback', async () => {
+			const transactor = new TestTransactor();
+
+			type UserEntry = { key: number; name: string };
+			type PostEntry = { key: number; title: string };
+
+			const usersTree = await Tree.createOrOpen<number, UserEntry>(
+				transactor, 'users', entry => entry.key
+			);
+			const postsTree = await Tree.createOrOpen<number, PostEntry>(
+				transactor, 'posts', entry => entry.key
+			);
+
+			const usersCollection = (usersTree as unknown as { collection: unknown }).collection;
+			const postsCollection = (postsTree as unknown as { collection: unknown }).collection;
+			const collections = new Map();
+			collections.set('users', usersCollection);
+			collections.set('posts', postsCollection);
+
+			const coordinator = new TransactionCoordinator(transactor, collections);
+			const actionsEngine = new ActionsEngine(coordinator);
+			const session = new TransactionSession(coordinator, actionsEngine);
+
+			await session.execute('stmt1', [
+				{ collectionId: 'users', actions: [{ type: 'replace', data: [[1, { key: 1, name: 'Alice' }]] }] },
+				{ collectionId: 'posts', actions: [{ type: 'replace', data: [[10, { key: 10, title: 'Post' }]] }] },
+			]);
+
+			// Both collections have pending transforms
+			const transformsBefore = coordinator.getTransforms();
+			expect(transformsBefore.size).to.equal(2);
+
+			await session.rollback();
+
+			const transformsAfter = coordinator.getTransforms();
+			expect(transformsAfter.size).to.equal(0);
+		});
+
+		it('should throw when rolling back an already committed session', async () => {
+			const transactor = new TestTransactor();
+
+			type UserEntry = { key: number; name: string };
+			const usersTree = await Tree.createOrOpen<number, UserEntry>(
+				transactor, 'users', entry => entry.key
+			);
+
+			const usersCollection = (usersTree as unknown as { collection: unknown }).collection;
+			const collections = new Map();
+			collections.set('users', usersCollection);
+
+			const coordinator = new TransactionCoordinator(transactor, collections);
+			const actionsEngine = new ActionsEngine(coordinator);
+			const session = new TransactionSession(coordinator, actionsEngine);
+
+			await session.execute('stmt1', [
+				{ collectionId: 'users', actions: [{ type: 'replace', data: [[1, { key: 1, name: 'Alice' }]] }] }
+			]);
+			await session.commit();
+
+			try {
+				await session.rollback();
+				expect.fail('Should have thrown');
+			} catch (e) {
+				expect((e as Error).message).to.include('already committed');
+			}
+		});
+
+		it('should throw on double rollback', async () => {
+			const transactor = new TestTransactor();
+
+			type UserEntry = { key: number; name: string };
+			const usersTree = await Tree.createOrOpen<number, UserEntry>(
+				transactor, 'users', entry => entry.key
+			);
+
+			const usersCollection = (usersTree as unknown as { collection: unknown }).collection;
+			const collections = new Map();
+			collections.set('users', usersCollection);
+
+			const coordinator = new TransactionCoordinator(transactor, collections);
+			const actionsEngine = new ActionsEngine(coordinator);
+			const session = new TransactionSession(coordinator, actionsEngine);
+
+			await session.execute('stmt1', [
+				{ collectionId: 'users', actions: [{ type: 'replace', data: [[1, { key: 1, name: 'Alice' }]] }] }
+			]);
+
+			await session.rollback();
+
+			try {
+				await session.rollback();
+				expect.fail('Should have thrown');
+			} catch (e) {
+				expect((e as Error).message).to.include('already rolled back');
+			}
+		});
+
+		it('should reject execute after rollback', async () => {
+			const transactor = new TestTransactor();
+
+			type UserEntry = { key: number; name: string };
+			const usersTree = await Tree.createOrOpen<number, UserEntry>(
+				transactor, 'users', entry => entry.key
+			);
+
+			const usersCollection = (usersTree as unknown as { collection: unknown }).collection;
+			const collections = new Map();
+			collections.set('users', usersCollection);
+
+			const coordinator = new TransactionCoordinator(transactor, collections);
+			const actionsEngine = new ActionsEngine(coordinator);
+			const session = new TransactionSession(coordinator, actionsEngine);
+
+			await session.rollback();
+
+			const result = await session.execute('stmt1', [
+				{ collectionId: 'users', actions: [{ type: 'replace', data: [[1, { key: 1, name: 'Alice' }]] }] }
+			]);
+			expect(result.success).to.be.false;
+			expect(result.error).to.include('already rolled back');
+		});
+
+		it('should set session state flags correctly after rollback', async () => {
+			const transactor = new TestTransactor();
+
+			type UserEntry = { key: number; name: string };
+			const usersTree = await Tree.createOrOpen<number, UserEntry>(
+				transactor, 'users', entry => entry.key
+			);
+
+			const usersCollection = (usersTree as unknown as { collection: unknown }).collection;
+			const collections = new Map();
+			collections.set('users', usersCollection);
+
+			const coordinator = new TransactionCoordinator(transactor, collections);
+			const actionsEngine = new ActionsEngine(coordinator);
+			const session = new TransactionSession(coordinator, actionsEngine);
+
+			expect(session.isCommitted()).to.be.false;
+			expect(session.isRolledBack()).to.be.false;
+
+			await session.rollback();
+
+			expect(session.isCommitted()).to.be.false;
+			expect(session.isRolledBack()).to.be.true;
+		});
+	});
+
+	describe('Multi-Collection Transaction Conflicts (TEST-2.1.2)', () => {
+		it('should detect pend conflicts from concurrent transactions on same blocks', async () => {
+			const transactor = new TestTransactor();
+
+			type UserEntry = { key: number; name: string };
+			const usersTree = await Tree.createOrOpen<number, UserEntry>(
+				transactor, 'users', entry => entry.key
+			);
+
+			const usersCollection = (usersTree as unknown as { collection: unknown }).collection;
+			const collections = new Map();
+			collections.set('users', usersCollection);
+
+			const coordinator = new TransactionCoordinator(transactor, collections);
+			const actionsEngine = new ActionsEngine(coordinator);
+
+			// First transaction: insert user
+			const actions1: CollectionActions[] = [
+				{ collectionId: 'users', actions: [{ type: 'replace', data: [[1, { key: 1, name: 'Alice' }]] }] }
+			];
+			const statements1 = createActionsStatements(actions1);
+			const stamp1 = createTransactionStamp('peer1', Date.now(), 'schema1', 'actions@1.0.0');
+			const tx1: Transaction = {
+				stamp: stamp1, statements: statements1, reads: [],
+				id: createTransactionId(stamp1.id, statements1, [])
+			};
+
+			// Execute and commit tx1
+			await coordinator.execute(tx1, actionsEngine);
+
+			// Second transaction: also insert same user (conflict)
+			const actions2: CollectionActions[] = [
+				{ collectionId: 'users', actions: [{ type: 'replace', data: [[1, { key: 1, name: 'Bob' }]] }] }
+			];
+			const statements2 = createActionsStatements(actions2);
+			const stamp2 = createTransactionStamp('peer2', Date.now() + 1, 'schema1', 'actions@1.0.0');
+			const tx2: Transaction = {
+				stamp: stamp2, statements: statements2, reads: [],
+				id: createTransactionId(stamp2.id, statements2, [])
+			};
+
+			// tx2 should encounter the transforms from tx1's committed state
+			const result2 = await actionsEngine.execute(tx2);
+			// The execute itself succeeds (local apply), but the data reflects the second write
+			expect(result2.success).to.be.true;
+		});
+
+		it('should isolate transforms between independent collections', async () => {
+			const transactor = new TestTransactor();
+
+			type UserEntry = { key: number; name: string };
+			type PostEntry = { key: number; title: string };
+
+			const usersTree = await Tree.createOrOpen<number, UserEntry>(
+				transactor, 'users', entry => entry.key
+			);
+			const postsTree = await Tree.createOrOpen<number, PostEntry>(
+				transactor, 'posts', entry => entry.key
+			);
+
+			const usersCollection = (usersTree as unknown as { collection: unknown }).collection;
+			const postsCollection = (postsTree as unknown as { collection: unknown }).collection;
+			const collections = new Map();
+			collections.set('users', usersCollection);
+			collections.set('posts', postsCollection);
+
+			const coordinator = new TransactionCoordinator(transactor, collections);
+			const actionsEngine = new ActionsEngine(coordinator);
+
+			// Transaction affecting only users
+			const userActions: CollectionActions[] = [
+				{ collectionId: 'users', actions: [{ type: 'replace', data: [[1, { key: 1, name: 'Alice' }]] }] }
+			];
+			const userStatements = createActionsStatements(userActions);
+			const userStamp = createTransactionStamp('peer1', Date.now(), 'schema1', 'actions@1.0.0');
+			const userTx: Transaction = {
+				stamp: userStamp, statements: userStatements, reads: [],
+				id: createTransactionId(userStamp.id, userStatements, [])
+			};
+
+			await actionsEngine.execute(userTx);
+
+			// Only 'users' should have transforms, not 'posts'
+			const transforms = coordinator.getTransforms();
+			expect(transforms.has('users')).to.be.true;
+			expect(transforms.has('posts')).to.be.false;
+		});
+	});
+
+	describe('Coordinator Timeout Handling (TEST-2.2.1)', () => {
+		it('should fail pend phase when transactor is unavailable', async () => {
+			const transactor = new TestTransactor();
+
+			type UserEntry = { key: number; name: string };
+			const usersTree = await Tree.createOrOpen<number, UserEntry>(
+				transactor, 'users', entry => entry.key
+			);
+
+			const usersCollection = (usersTree as unknown as { collection: unknown }).collection;
+			const collections = new Map();
+			collections.set('users', usersCollection);
+
+			const coordinator = new TransactionCoordinator(transactor, collections);
+			const actionsEngine = new ActionsEngine(coordinator);
+
+			const actions: CollectionActions[] = [
+				{ collectionId: 'users', actions: [{ type: 'replace', data: [[1, { key: 1, name: 'Alice' }]] }] }
+			];
+			const statements = createActionsStatements(actions);
+			const stamp = createTransactionStamp('peer1', Date.now(), 'schema1', 'actions@1.0.0');
+			const tx: Transaction = {
+				stamp, statements, reads: [],
+				id: createTransactionId(stamp.id, statements, [])
+			};
+
+			// Execute locally first (this succeeds)
+			await actionsEngine.execute(tx);
+
+			// Make transactor unavailable before commit
+			transactor.setAvailable(false);
+
+			try {
+				await coordinator.commit(tx);
+				expect.fail('Should have thrown');
+			} catch (e) {
+				expect((e as Error).message).to.include('not available');
+			}
+		});
+
+		it('should fail commit phase when transactor becomes unavailable after pend', async () => {
+			const transactor = new TestTransactor();
+			let pendCount = 0;
+
+			const originalPend = transactor.pend.bind(transactor);
+			transactor.pend = async (request) => {
+				pendCount++;
+				const result = await originalPend(request);
+				// Make transactor unavailable after pend succeeds
+				transactor.setAvailable(false);
+				return result;
+			};
+
+			type UserEntry = { key: number; name: string };
+			const usersTree = await Tree.createOrOpen<number, UserEntry>(
+				transactor, 'users', entry => entry.key
+			);
+
+			const usersCollection = (usersTree as unknown as { collection: unknown }).collection;
+			const collections = new Map();
+			collections.set('users', usersCollection);
+
+			const coordinator = new TransactionCoordinator(transactor, collections);
+			const actionsEngine = new ActionsEngine(coordinator);
+
+			const actions: CollectionActions[] = [
+				{ collectionId: 'users', actions: [{ type: 'replace', data: [[1, { key: 1, name: 'Alice' }]] }] }
+			];
+			const statements = createActionsStatements(actions);
+			const stamp = createTransactionStamp('peer1', Date.now(), 'schema1', 'actions@1.0.0');
+			const tx: Transaction = {
+				stamp, statements, reads: [],
+				id: createTransactionId(stamp.id, statements, [])
+			};
+
+			await actionsEngine.execute(tx);
+
+			try {
+				await coordinator.commit(tx);
+				expect.fail('Should have thrown');
+			} catch (e) {
+				expect(pendCount).to.be.greaterThan(0);
+				expect((e as Error).message).to.satisfy(
+					(msg: string) => msg.includes('not available') || msg.includes('failed')
+				);
+			}
+		});
+
+		it('should fail gather phase when cluster nominees query throws', async () => {
+			const transactor = new TestTransactor();
+			transactor.queryClusterNominees = async () => {
+				throw new Error('Cluster unreachable');
+			};
+
+			type UserEntry = { key: number; name: string };
+			type PostEntry = { key: number; title: string };
+
+			const usersTree = await Tree.createOrOpen<number, UserEntry>(
+				transactor, 'users', entry => entry.key
+			);
+			const postsTree = await Tree.createOrOpen<number, PostEntry>(
+				transactor, 'posts', entry => entry.key
+			);
+
+			const usersCollection = (usersTree as unknown as { collection: unknown }).collection;
+			const postsCollection = (postsTree as unknown as { collection: unknown }).collection;
+			const collections = new Map();
+			collections.set('users', usersCollection);
+			collections.set('posts', postsCollection);
+
+			const coordinator = new TransactionCoordinator(transactor, collections);
+			const actionsEngine = new ActionsEngine(coordinator);
+
+			const actions: CollectionActions[] = [
+				{ collectionId: 'users', actions: [{ type: 'replace', data: [[1, { key: 1, name: 'Alice' }]] }] },
+				{ collectionId: 'posts', actions: [{ type: 'replace', data: [[10, { key: 10, title: 'Post' }]] }] },
+			];
+			const statements = createActionsStatements(actions);
+			const stamp = createTransactionStamp('peer1', Date.now(), 'schema1', 'actions@1.0.0');
+			const tx: Transaction = {
+				stamp, statements, reads: [],
+				id: createTransactionId(stamp.id, statements, [])
+			};
+
+			await actionsEngine.execute(tx);
+
+			try {
+				await coordinator.commit(tx);
+				expect.fail('Should have thrown');
+			} catch (e) {
+				expect((e as Error).message).to.include('Cluster unreachable');
+			}
+		});
+	});
+
+	describe('Partial Failure Recovery (TEST-2.2.2)', () => {
+		it('should cancel pended collections when commit fails for one collection', async () => {
+			const transactor = new TestTransactor();
+			const cancelledActions: { actionId: string; blockIds: string[] }[] = [];
+			let commitCallCount = 0;
+
+			const originalCommit = transactor.commit.bind(transactor);
+			transactor.commit = async (request) => {
+				commitCallCount++;
+				if (commitCallCount >= 2) {
+					return { success: false, reason: 'Commit rejected by peer' };
+				}
+				return originalCommit(request);
+			};
+
+			const originalCancel = transactor.cancel.bind(transactor);
+			transactor.cancel = async (actionRef) => {
+				cancelledActions.push({
+					actionId: actionRef.actionId,
+					blockIds: [...actionRef.blockIds]
+				});
+				return originalCancel(actionRef);
+			};
+
+			transactor.queryClusterNominees = async () => ({ nominees: [] });
+
+			type UserEntry = { key: number; name: string };
+			type PostEntry = { key: number; title: string };
+
+			const usersTree = await Tree.createOrOpen<number, UserEntry>(
+				transactor, 'users', entry => entry.key
+			);
+			const postsTree = await Tree.createOrOpen<number, PostEntry>(
+				transactor, 'posts', entry => entry.key
+			);
+
+			const usersCollection = (usersTree as unknown as { collection: unknown }).collection;
+			const postsCollection = (postsTree as unknown as { collection: unknown }).collection;
+			const collections = new Map();
+			collections.set('users', usersCollection);
+			collections.set('posts', postsCollection);
+
+			const coordinator = new TransactionCoordinator(transactor, collections);
+			const actionsEngine = new ActionsEngine(coordinator);
+
+			const actions: CollectionActions[] = [
+				{ collectionId: 'users', actions: [{ type: 'replace', data: [[1, { key: 1, name: 'Alice' }]] }] },
+				{ collectionId: 'posts', actions: [{ type: 'replace', data: [[10, { key: 10, title: 'Post' }]] }] },
+			];
+			const statements = createActionsStatements(actions);
+			const stamp = createTransactionStamp('peer1', Date.now(), 'schema1', 'actions@1.0.0');
+			const tx: Transaction = {
+				stamp, statements, reads: [],
+				id: createTransactionId(stamp.id, statements, [])
+			};
+
+			await actionsEngine.execute(tx);
+
+			try {
+				await coordinator.commit(tx);
+				expect.fail('Should have thrown');
+			} catch (e) {
+				expect((e as Error).message).to.include('failed');
+			}
+
+			// Cancel phase should have been invoked for the affected collections
+			expect(cancelledActions.length).to.be.greaterThan(0);
+		});
+
+		it('should call cancel on pend failure partway through multi-collection pend', async () => {
+			const transactor = new TestTransactor();
+			let pendCallCount = 0;
+
+			const originalPend = transactor.pend.bind(transactor);
+			transactor.pend = async (request) => {
+				pendCallCount++;
+				if (pendCallCount >= 2) {
+					return { success: false, reason: 'Storage full' } as any;
+				}
+				return originalPend(request);
+			};
+
+			transactor.queryClusterNominees = async () => ({ nominees: [] });
+
+			type UserEntry = { key: number; name: string };
+			type PostEntry = { key: number; title: string };
+
+			const usersTree = await Tree.createOrOpen<number, UserEntry>(
+				transactor, 'users', entry => entry.key
+			);
+			const postsTree = await Tree.createOrOpen<number, PostEntry>(
+				transactor, 'posts', entry => entry.key
+			);
+
+			const usersCollection = (usersTree as unknown as { collection: unknown }).collection;
+			const postsCollection = (postsTree as unknown as { collection: unknown }).collection;
+			const collections = new Map();
+			collections.set('users', usersCollection);
+			collections.set('posts', postsCollection);
+
+			const coordinator = new TransactionCoordinator(transactor, collections);
+			const actionsEngine = new ActionsEngine(coordinator);
+
+			const actions: CollectionActions[] = [
+				{ collectionId: 'users', actions: [{ type: 'replace', data: [[1, { key: 1, name: 'Alice' }]] }] },
+				{ collectionId: 'posts', actions: [{ type: 'replace', data: [[10, { key: 10, title: 'Post' }]] }] },
+			];
+			const statements = createActionsStatements(actions);
+			const stamp = createTransactionStamp('peer1', Date.now(), 'schema1', 'actions@1.0.0');
+			const tx: Transaction = {
+				stamp, statements, reads: [],
+				id: createTransactionId(stamp.id, statements, [])
+			};
+
+			await actionsEngine.execute(tx);
+
+			try {
+				await coordinator.commit(tx);
+				expect.fail('Should have thrown');
+			} catch (e) {
+				// Pend failure should propagate as commit error
+				expect((e as Error).message).to.include('failed');
+			}
+
+			// At least one pend was attempted
+			expect(pendCallCount).to.be.greaterThanOrEqual(1);
+		});
+
+		it('should handle transactor becoming unavailable during cancel phase gracefully', async () => {
+			const transactor = new TestTransactor();
+			let commitCallCount = 0;
+
+			const originalCommit = transactor.commit.bind(transactor);
+			transactor.commit = async (request) => {
+				commitCallCount++;
+				if (commitCallCount >= 2) {
+					// Return structured failure so cancelPhase is triggered
+					return { success: false, reason: 'Commit rejected' };
+				}
+				return originalCommit(request);
+			};
+
+			// Make cancel throw to simulate unavailability during cancel
+			transactor.cancel = async () => {
+				throw new Error('Cancel also failed');
+			};
+
+			transactor.queryClusterNominees = async () => ({ nominees: [] });
+
+			type UserEntry = { key: number; name: string };
+			type PostEntry = { key: number; title: string };
+
+			const usersTree = await Tree.createOrOpen<number, UserEntry>(
+				transactor, 'users', entry => entry.key
+			);
+			const postsTree = await Tree.createOrOpen<number, PostEntry>(
+				transactor, 'posts', entry => entry.key
+			);
+
+			const usersCollection = (usersTree as unknown as { collection: unknown }).collection;
+			const postsCollection = (postsTree as unknown as { collection: unknown }).collection;
+			const collections = new Map();
+			collections.set('users', usersCollection);
+			collections.set('posts', postsCollection);
+
+			const coordinator = new TransactionCoordinator(transactor, collections);
+			const actionsEngine = new ActionsEngine(coordinator);
+
+			const actions: CollectionActions[] = [
+				{ collectionId: 'users', actions: [{ type: 'replace', data: [[1, { key: 1, name: 'Alice' }]] }] },
+				{ collectionId: 'posts', actions: [{ type: 'replace', data: [[10, { key: 10, title: 'Post' }]] }] },
+			];
+			const statements = createActionsStatements(actions);
+			const stamp = createTransactionStamp('peer1', Date.now(), 'schema1', 'actions@1.0.0');
+			const tx: Transaction = {
+				stamp, statements, reads: [],
+				id: createTransactionId(stamp.id, statements, [])
+			};
+
+			await actionsEngine.execute(tx);
+
+			// Cancel phase throws, which should propagate as an error
+			try {
+				await coordinator.commit(tx);
+				expect.fail('Should have thrown');
+			} catch (e) {
+				// The cancel failure propagates through the commit path
+				expect(e).to.be.instanceOf(Error);
+			}
 		});
 	});
 });

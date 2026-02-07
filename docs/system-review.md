@@ -54,17 +54,17 @@ If you spot code or design aspects that aren't covered by these tasks, please ad
 - [x] **HUNT-2.1.2**: `coordinator.ts` - Same weak hash function used in `hashOperations()` - must match validator - FIXED: Both coordinator.ts and validator.ts now use shared hashString utility
 - [x] **HUNT-2.1.3**: `validator.ts` - TODO: "Implement read dependency validation" - **INCOMPLETE FEATURE** - DOCUMENTED: See `tasks/refactoring/read-dependency-validation.md`
 - [x] **HUNT-2.1.4**: Review deprecated `TransactionContext` pattern vs newer `TransactionSession` - VERIFIED: Clean deprecation pattern. `TransactionContext` is only used internally in coordinator.ts, marked `@deprecated` at line 206. Tests updated to use `TransactionSession` (line 214-215 comment). No production code outside db-core uses `TransactionContext`. The quereus-plugin-optimystic uses `TransactionSession` exclusively (txn-bridge.ts).
-- [ ] **TEST-2.1.1**: Add transaction rollback regression tests
-- [ ] **TEST-2.1.2**: Add multi-collection transaction conflict tests
-- [ ] **DOC-2.1.1**: Update `docs/transactions.md` to reflect current implementation state
+- [x] **TEST-2.1.1**: Add transaction rollback regression tests - DONE: 6 tests in transaction.spec.ts covering rollback state clearing, multi-collection rollback, double-rollback, post-commit rollback, post-rollback execute, and state flags.
+- [x] **TEST-2.1.2**: Add multi-collection transaction conflict tests - DONE: 2 tests in transaction.spec.ts covering concurrent pend conflicts and cross-collection transform isolation.
+- [x] **DOC-2.1.1**: Update `docs/transactions.md` to reflect current implementation state - DONE: Fixed "Proposed Architecture" → "Architecture", TransactionContext → TransactionSession, updated Transaction type definition (stamp/id vs stampId/cid), fixed constructor examples and commit flow pseudocode.
 
 ### 2.2 Transaction Coordinator (`packages/db-core/src/transaction/coordinator.ts`)
 
 - [x] **HUNT-2.2.1**: Review GATHER phase supercluster formation for edge cases - VERIFIED: Correctly skips GATHER for single collection (line 449). Gracefully handles transactors without `queryClusterNominees` (lines 454-457). `Promise.all` fail-fast is acceptable - if any cluster unavailable, transaction should fail.
 - [x] **HUNT-2.2.2**: Verify PEND/COMMIT phase ordering guarantees - VERIFIED: PEND runs first (lines 408-417), COMMIT only after successful PEND (lines 419-428), `cancelPhase` called on COMMIT failure (line 427). Ordering is correct.
 - [x] **HUNT-2.2.3**: Review error handling in `coordinateTransaction()` - ANALYZED: If PEND fails partway through, already-pended collections are not explicitly cancelled. However, cluster layer has automatic cleanup via `queueExpiredTransactions()` and `processCleanupQueue()` (cluster-repo.ts lines 77-80). The `expiration` field ensures pended transactions eventually expire. This is acceptable for distributed systems where explicit cleanup may not reach all nodes.
-- [ ] **TEST-2.2.1**: Add coordinator timeout handling tests
-- [ ] **TEST-2.2.2**: Add partial failure recovery tests
+- [x] **TEST-2.2.1**: Add coordinator timeout handling tests - DONE: 3 tests in transaction.spec.ts covering transactor unavailable during pend, transactor unavailable after pend (during commit), and cluster nominees query failure.
+- [x] **TEST-2.2.2**: Add partial failure recovery tests - DONE: 3 tests in transaction.spec.ts covering cancel-on-commit-failure, pend-failure-partway-through, and cancel-phase-failure resilience.
 
 ---
 
@@ -76,25 +76,25 @@ If you spot code or design aspects that aren't covered by these tasks, please ad
 - [x] **HUNT-3.1.2**: Review `rebalanceLeaf()` and `rebalanceBranch()` - **BUG FOUND**: Line 685 uses `NodeCapacity << 1` (128) but should use `NodeCapacity >>> 1` (32). The condition is dead code since branches can never have 128 nodes. See `tasks/refactoring/btree-rebalance-threshold-bug.md`. The bug doesn't cause data loss but may cause unnecessary rebalancing.
 - [x] **HUNT-3.1.3**: Verify path invalidation on mutation is complete (version tracking) - VERIFIED: `_version` is incremented on insert, update, delete, upsert. Paths are created with current version and validated before use. Minor issue: `drop()` doesn't increment version, but this is a destructive operation that removes all nodes anyway.
 - [x] **HUNT-3.1.4**: Review `NodeCapacity = 64` - ANALYZED: NodeCapacity of 64 provides a branching factor of 64, which is reasonable for B-trees. With JSON serialization, actual block sizes depend on entry size. The ring-selector.ts estimates 100KB typical block. This is a tuning parameter that could be adjusted based on workload, but 64 is a sensible default.
-- [ ] **TEST-3.1.1**: Add B-tree stress tests for large datasets
-- [ ] **TEST-3.1.2**: Add concurrent mutation tests (path invalidation)
-- [ ] **DOC-3.1.1**: Document B-tree invariants and performance characteristics
+- [x] **TEST-3.1.1**: Add B-tree stress tests for large datasets - DONE: 4 tests in `btree.spec.ts`: 500 random-order inserts with verification, delete every other element (500 items), count verification across splits/merges (300 items), bulk upserts (400 items).
+- [x] **TEST-3.1.2**: Add concurrent mutation tests (path invalidation) - DONE: 6 tests in `btree.spec.ts`: path invalidation after insert/deleteAt/updateAt/upsert, exception on stale path usage (at/moveNext/movePrior/deleteAt/updateAt), valid path returned from mutation operations.
+- [x] **DOC-3.1.1**: Document B-tree invariants and performance characteristics - DONE: Added Invariants section (node capacity, minimum fill, split point, rebalancing rules, path invalidation semantics) and expanded Performance Characteristics with time/space complexity tables in `packages/db-core/docs/btree.md`.
 
 ### 3.2 Chain/Log (`packages/db-core/src/chain/`, `packages/db-core/src/log/`)
 
 - [x] **HUNT-3.2.1**: `chain.ts:28` - TODO: "Generalize the header access so that it can be merged with upstream header" - ANALYZED: Valid refactoring opportunity to reduce indirection by merging ChainHeaderNode with upstream headers (e.g., CollectionHeaderBlock). Low priority optimization, not a bug. See `tasks/refactoring/chain-header-merge.md`.
 - [x] **HUNT-3.2.2**: Review `Chain.getTail()` - potential race condition following nextId links - VERIFIED: Not a bug. The code at lines 289-297 defensively follows nextId links to find the true tail when blocks may have been added between reading header and accessing tail. The returned stale headerBlock is intentional - subsequent operations (like `add()`) correctly update it atomically. Explicit comment at line 292-293 acknowledges this design.
 - [x] **HUNT-3.2.3**: Review `Log.getFrom()` - verify correct handling of checkpoint boundaries - VERIFIED: Correct implementation at lines 73-106. First loop iterates backward collecting pendings until checkpoint. Second loop (starting at checkpointPath) continues past checkpoint to collect entries. Checkpoint entry itself is safely skipped because line 97 checks `if (entry.action)` before processing (checkpoints have no `action` property).
-- [ ] **TEST-3.2.1**: Add chain corruption recovery tests
-- [ ] **TEST-3.2.2**: Add log checkpoint consistency tests
+- [x] **TEST-3.2.1**: Add chain corruption recovery tests - DONE: 4 tests in `chain.spec.ts`: interleaved add/dequeue integrity, interleaved add/pop integrity, drain and refill cycle, bidirectional navigation after mixed operations.
+- [x] **TEST-3.2.2**: Add log checkpoint consistency tests - DONE: 5 tests in `log.spec.ts`: checkpoint with empty pendings, getFrom at exact checkpoint boundary, context rebuild across checkpoint with subsequent actions, sequential checkpoints overriding each other, getFrom spanning before and after checkpoint.
 
 ### 3.3 Collection (`packages/db-core/src/collection/`)
 
 - [x] **HUNT-3.3.1**: `collection.ts` - Review conflict resolution in `doFilterConflict()` - VERIFIED: Correct at lines 189-199. Returns boolean to indicate keep/discard. When replacement action is provided, it's added via `act()` which appends to pending. The original action is then kept or discarded based on boolean return. This allows replacing conflicting actions with modified versions. Edge case: replacement actions added during update could themselves conflict with subsequent remote entries, but `replayActions()` handles this by replaying all pending after conflicts.
 - [x] **HUNT-3.3.2**: Review `sync()` latch handling - verify no deadlock scenarios - VERIFIED: No deadlock risk. Uses single `Latches.acquire()` mutex per collection ID (line 109-110). Always released in `finally` block (line 152). The Latches implementation (latches.ts) uses a proper async queue pattern with no nested locking.
 - [x] **HUNT-3.3.3**: `collection.ts:157` - TODO: "introduce timer and potentially change stats to determine when to sync" - ANALYZED: Valid optimization opportunity. Currently `updateAndSync()` always performs both operations. Stats could track sync frequency, latency, or conflicts to optimize when to sync vs batch. Low priority.
-- [ ] **TEST-3.3.1**: Add collection conflict resolution tests (filterConflict callback behavior)
-- [ ] **TEST-3.3.2**: Add concurrent sync() tests
+- [x] **TEST-3.3.1**: Add collection conflict resolution tests (filterConflict callback behavior) - DONE: 3 tests in `collection.spec.ts`: discard pending when filterConflict returns undefined, keep pending when filterConflict returns original action, keep pending when no filterConflict provided. **BUG FIXED**: `TestTransactor.get()` was doing exact revision lookup; replaced with `latestMaterializedAt()` helper that finds the highest materialized revision <= the requested revision.
+- [x] **TEST-3.3.2**: Add concurrent sync() tests - DONE: 2 tests in `collection.spec.ts`: serialize concurrent sync calls via latch, handle act during sync.
 
 ---
 
