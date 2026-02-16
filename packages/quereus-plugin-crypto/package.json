@@ -24,7 +24,9 @@
 		"build": "tsup",
 		"dev": "tsup --watch",
 		"clean": "rimraf dist",
-		"typecheck": "tsc --noEmit"
+		"typecheck": "tsc --noEmit",
+		"test": "aegir test -t node",
+		"test:node": "aegir test -t node"
 	},
 	"devDependencies": {
 		"@quereus/quereus": "^0.16.2",

@@ -160,8 +160,8 @@ If you spot code or design aspects that aren't covered by these tasks, please ad
 - [x] **HUNT-6.1.1**: `crypto.ts` - Review `hashMod()` for bias in modulo operation with large bit counts - VERIFIED: Lines 138-159. Modulo by 2^bits is unbiased (equivalent to bit masking). Uses 64-bit hash input, limited to 53 bits output (JS safe integer). No bias issues.
 - [x] **HUNT-6.1.2**: Verify all crypto operations use constant-time comparisons where needed - VERIFIED: Delegates to `@noble/curves` library which implements constant-time operations. No manual byte comparisons in user code.
 - [x] **HUNT-6.1.3**: Review error handling in `verify()` - currently catches all errors and returns false - VERIFIED: Lines 264-266. Standard pattern for signature verification - returning false for any error prevents information leakage about failure reason. Acceptable security practice.
-- [ ] **TEST-6.1.1**: Add crypto function edge case tests (empty inputs, max sizes)
-- [ ] **TEST-6.1.2**: Add signature verification tests for all supported curves
+- [x] **TEST-6.1.1**: Add crypto function edge case tests (empty inputs, max sizes) - DONE: 18 tests in `quereus-plugin-crypto/test/crypto.spec.ts` covering digest (all algorithms, encodings, Uint8Array input, error cases), hashMod (boundary bits 1/53, determinism, invalid range), and randomBytes (byte count, hex output, uniqueness).
+- [x] **TEST-6.1.2**: Add signature verification tests for all supported curves - DONE: 32 tests in `quereus-plugin-crypto/test/crypto.spec.ts` covering sign/verify round-trip for secp256k1/p256/ed25519, corrupted signatures, wrong public key, base64url encoding round-trip, key generation, SignatureValid with convenience methods, batch verification, detailed output, and invalid input handling.
 - [ ] **DOC-6.1.1**: Document supported algorithms and encoding formats
 
 ### 6.2 Signature Validation (`packages/quereus-plugin-crypto/src/signature-valid.ts`)
@@ -203,7 +203,7 @@ If you spot code or design aspects that aren't covered by these tasks, please ad
 - [x] **HUNT-7.4.2**: Review `index-manager.ts` - verify index consistency - VERIFIED: Lines 159-165 correctly handle key changes (delete old, insert new). Index maintenance is correct. TODO at line 207 for proper KeyRange implementation is minor.
 - [x] **HUNT-7.4.3**: Review `row-codec.ts` - verify encoding/decoding round-trip - GAP IDENTIFIED: (1) Line 190: bigint → Number() loses precision for large values. (2) Line 76: Uint8Array encoded as base64 but not decoded back - breaks round-trip for binary data. Should add base64 → Uint8Array conversion in decodeRow().
 - [ ] **TEST-7.4.1**: Add schema migration tests
-- [ ] **TEST-7.4.2**: Add row codec edge case tests
+- [x] **TEST-7.4.2**: Add row codec edge case tests - DONE: 22 tests in `quereus-plugin-optimystic/test/row-codec.spec.ts` covering basic round-trip (strings, numbers, nulls, booleans), bigint precision loss bug documentation, Uint8Array round-trip bug documentation, primary key extraction (single/composite), primary key comparator, and schema utilities.
 
 ---
 
@@ -540,12 +540,12 @@ If you spot code or design aspects that aren't covered by these tasks, please ad
 | 3. B-tree/Collections | 14 | 10 | 3 TEST, 1 DOC |
 | 4. Network Transactor | 8 | 5 | 2 TEST, 1 DOC |
 | 5. Cluster Consensus | 16 | 12 | 3 TEST, 1 DOC |
-| 6. Crypto | 6 | 4 | 1 TEST, 1 DOC |
-| 7. Quereus Plugin | 12 | 10 | 2 TEST |
+| 6. Crypto | 6 | 6 | 1 DOC |
+| 7. Quereus Plugin | 12 | 11 | 1 TEST |
 | 8. Reference Peer | 4 | 2 | 1 TEST, 1 DOC |
 | 9. Architecture | 16 | 12 | 4 DOC |
 | 10. Transactional Theory | 34 | 27 | 7 TEST |
-| **Total** | **130** | **98** | **23 TEST, 9 DOC** |
+| **Total** | **130** | **101** | **20 TEST, 9 DOC** |
 
 **Note**: All HUNT-* (code review) and THEORY-* (transactional theory) tasks are COMPLETE. Remaining tasks are TEST-* (test coverage) and DOC-* (documentation) items.
 

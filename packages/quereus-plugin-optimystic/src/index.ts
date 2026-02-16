@@ -21,6 +21,10 @@ export { registerKeyNetwork, registerTransactor } from './optimystic-adapter/key
 // Export virtual table classes
 export { OptimysticModule, OptimysticVirtualTable } from './optimystic-module.js';
 
+// Export schema utilities
+export { RowCodec, type EncodedRow, type PrimaryKeyValue, type EncodingFormat } from './schema/row-codec.js';
+export type { StoredTableSchema, StoredColumnSchema, StoredPrimaryKeyColumn } from './schema/schema-manager.js';
+
 // Export types for TypeScript users
 export type {
 	OptimysticOptions as OptimysticTreeOptions,
