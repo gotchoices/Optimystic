@@ -277,4 +277,168 @@ describe('StorageRepo', () => {
 			expect(result['block-1']!.state.pendings?.includes('pending-1')).to.equal(true);
 		});
 	});
+
+	describe('concurrent commits (TEST-5.4.1)', () => {
+		it('serializes concurrent commits to same block via latches', async () => {
+			// Setup: create block and two pending actions
+			const blockStorage = new BlockStorage('block-1' as BlockId, rawStorage);
+			const testBlock = makeBlock('block-1', { items: [] });
+			await blockStorage.savePendingTransaction('setup' as ActionId, { insert: testBlock });
+			await blockStorage.saveMaterializedBlock('setup' as ActionId, testBlock);
+			await blockStorage.saveRevision(1, 'setup' as ActionId);
+			await blockStorage.promotePendingTransaction('setup' as ActionId);
+			await blockStorage.setLatest({ actionId: 'setup' as ActionId, rev: 1 });
+
+			await repo.pend({
+				actionId: 'a1' as ActionId,
+				transforms: makeUpdateTransforms('block-1' as BlockId, [['items', 0, 0, ['first']]]),
+				policy: 'c'
+			});
+
+			await repo.pend({
+				actionId: 'a2' as ActionId,
+				transforms: makeUpdateTransforms('block-1' as BlockId, [['items', 0, 0, ['second']]]),
+				policy: 'c'
+			});
+
+			// Commit both concurrently
+			const [result1, result2] = await Promise.all([
+				repo.commit({ actionId: 'a1' as ActionId, blockIds: ['block-1' as BlockId], tailId: 'block-1' as BlockId, rev: 2 }),
+				repo.commit({ actionId: 'a2' as ActionId, blockIds: ['block-1' as BlockId], tailId: 'block-1' as BlockId, rev: 3 })
+			]);
+
+			// One should succeed and the other should either succeed or fail with stale revision
+			const successes = [result1, result2].filter(r => r.success);
+			expect(successes.length).to.be.greaterThanOrEqual(1);
+		});
+
+		it('prevents deadlocks by sorting lock acquisition order', async () => {
+			// Setup two blocks
+			for (const blockId of ['block-a', 'block-b']) {
+				const storage = new BlockStorage(blockId as BlockId, rawStorage);
+				const block = makeBlock(blockId, { items: [] });
+				await storage.savePendingTransaction('setup' as ActionId, { insert: block });
+				await storage.saveMaterializedBlock('setup' as ActionId, block);
+				await storage.saveRevision(1, 'setup' as ActionId);
+				await storage.promotePendingTransaction('setup' as ActionId);
+				await storage.setLatest({ actionId: 'setup' as ActionId, rev: 1 });
+			}
+
+			const transforms: Transforms = {
+				inserts: {},
+				updates: {
+					'block-a': [['items', 0, 0, ['new-a']]],
+					'block-b': [['items', 0, 0, ['new-b']]]
+				},
+				deletes: []
+			};
+
+			await repo.pend({
+				actionId: 'multi-a' as ActionId,
+				transforms,
+				policy: 'c'
+			});
+
+			await repo.pend({
+				actionId: 'multi-b' as ActionId,
+				transforms,
+				policy: 'c'
+			});
+
+			// Commit operations on both blocks concurrently - should not deadlock
+			const [r1, r2] = await Promise.all([
+				repo.commit({
+					actionId: 'multi-a' as ActionId,
+					blockIds: ['block-a' as BlockId, 'block-b' as BlockId],
+					tailId: 'block-a' as BlockId,
+					rev: 2
+				}),
+				repo.commit({
+					actionId: 'multi-b' as ActionId,
+					blockIds: ['block-b' as BlockId, 'block-a' as BlockId], // reversed order
+					tailId: 'block-b' as BlockId,
+					rev: 3
+				})
+			]);
+
+			// At least one should succeed; the other may fail with stale revision
+			const successes = [r1, r2].filter(r => r.success);
+			expect(successes.length).to.be.greaterThanOrEqual(1);
+		});
+	});
+
+	describe('partial commit recovery (TEST-5.4.2)', () => {
+		it('returns failure when commit fails partway through multi-block commit', async () => {
+			// Setup block-1 with a committed block
+			const storage1 = new BlockStorage('block-1' as BlockId, rawStorage);
+			const block1 = makeBlock('block-1', { items: [] });
+			await storage1.savePendingTransaction('setup' as ActionId, { insert: block1 });
+			await storage1.saveMaterializedBlock('setup' as ActionId, block1);
+			await storage1.saveRevision(1, 'setup' as ActionId);
+			await storage1.promotePendingTransaction('setup' as ActionId);
+			await storage1.setLatest({ actionId: 'setup' as ActionId, rev: 1 });
+
+			// Setup block-2 with a committed block
+			const storage2 = new BlockStorage('block-2' as BlockId, rawStorage);
+			const block2 = makeBlock('block-2', { items: [] });
+			await storage2.savePendingTransaction('setup' as ActionId, { insert: block2 });
+			await storage2.saveMaterializedBlock('setup' as ActionId, block2);
+			await storage2.saveRevision(1, 'setup' as ActionId);
+			await storage2.promotePendingTransaction('setup' as ActionId);
+			await storage2.setLatest({ actionId: 'setup' as ActionId, rev: 1 });
+
+			// Pend action on both blocks
+			const transforms: Transforms = {
+				inserts: {},
+				updates: {
+					'block-1': [['items', 0, 0, ['new-1']]],
+					'block-2': [['items', 0, 0, ['new-2']]]
+				},
+				deletes: []
+			};
+
+			await repo.pend({
+				actionId: 'a1' as ActionId,
+				transforms,
+				policy: 'c'
+			});
+
+			// Commit action on block-1 directly to create a stale revision conflict for block-1
+			await repo.pend({
+				actionId: 'conflict' as ActionId,
+				transforms: makeUpdateTransforms('block-1' as BlockId, [['items', 0, 0, ['conflict']]]),
+				policy: 'c'
+			});
+			await repo.commit({
+				actionId: 'conflict' as ActionId,
+				blockIds: ['block-1' as BlockId],
+				tailId: 'block-1' as BlockId,
+				rev: 2
+			});
+
+			// Now try to commit a1 with stale revision - should fail
+			const result = await repo.commit({
+				actionId: 'a1' as ActionId,
+				blockIds: ['block-1' as BlockId, 'block-2' as BlockId],
+				tailId: 'block-1' as BlockId,
+				rev: 2
+			});
+
+			expect(result.success).to.equal(false);
+		});
+
+		it('rejects commit for non-existent pending action', async () => {
+			try {
+				await repo.commit({
+					actionId: 'nonexistent' as ActionId,
+					blockIds: ['block-1' as BlockId],
+					tailId: 'block-1' as BlockId,
+					rev: 1
+				});
+				expect.fail('Should have thrown');
+			} catch (err) {
+				expect((err as Error).message).to.include('Pending action');
+			}
+		});
+	});
 });

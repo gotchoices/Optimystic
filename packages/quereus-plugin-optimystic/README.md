@@ -1,358 +1,137 @@
 # @optimystic/quereus-plugin-optimystic
 
-A Quereus virtual table plugin that provides SQL access to Optimystic distributed tree collections.
-
-## What's New
-
-- ✨ **TransactionId() function** - Get unique transaction identifiers for audit logging
-- 🔧 **Transaction-specific caching** - Better isolation and no stale data
-- 🧪 **Distributed testing** - Automated tests for multi-node operations
-
-See [CHANGELOG.md](./CHANGELOG.md) for details.
+A [Quereus](https://github.com/nicktobey/quereus) virtual table plugin that provides SQL access to [Optimystic](../../docs/internals.md) distributed tree collections.
 
 ## Overview
 
-This plugin allows you to query and manipulate Optimystic distributed tree collections using standard SQL syntax through Quereus. It bridges the gap between SQL databases and Optimystic's distributed data structures.
+This plugin registers an `optimystic` virtual table module and a `StampId()` SQL function with Quereus. Tables created with `USING optimystic(...)` are backed by Optimystic distributed trees — you define your own schema (columns, types, indexes) and the plugin handles encoding, storage, and distributed sync.
 
-For cryptographic functions (hashing, signing, verification), see the separate [@optimystic/quereus-plugin-crypto](../quereus-plugin-crypto) package.
-
-**📖 New to Optimystic SQL? See [QUICK-START.md](./QUICK-START.md) for a 5-minute tutorial!**
-
-## Installation
-
-```bash
-npm install @optimystic/quereus-plugin-optimystic
-```
+For cryptographic functions, see the separate [@optimystic/quereus-plugin-crypto](../quereus-plugin-crypto) package.
 
 ## Quick Start
 
-### Using Quoomb (Interactive SQL Console)
-
-The easiest way to get started is with [Quoomb](https://github.com/Digithought/quereus/tree/main/packages/quoomb-cli), the interactive SQL console for Quereus:
-
-```bash
-# Install Quoomb globally
-npm install -g @quereus/quoomb-cli
-
-# Start with Optimystic plugin using example config
-quoomb --config node_modules/@optimystic/quereus-plugin-optimystic/examples/quoomb.config.dev.json
-```
-
-Then in the Quoomb console:
-
-```sql
-CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)
-  USING optimystic('tree://app/users');
-
-INSERT INTO users VALUES (1, 'Alice'), (2, 'Bob');
-
-SELECT * FROM users;
-```
-
-**See [examples/README.md](./examples/README.md) for multi-node mesh setup and more configurations.**
-
-### Programmatic Usage
-
 ```typescript
 import { Database } from '@quereus/quereus';
-import { loadPlugin } from '@quereus/quereus/util/plugin-loader.js';
+import { register } from '@optimystic/quereus-plugin-optimystic';
 
 const db = new Database();
+register(db, { debug: false });
 
-// Load and register the plugin
-await loadPlugin('npm:@optimystic/quereus-plugin-optimystic', db, {
-  default_transactor: 'network',
-  default_key_network: 'libp2p',
-  enable_cache: true
-});
-
-// Create a virtual table backed by an Optimystic tree collection
 await db.exec(`
-  CREATE TABLE users USING optimystic(
-    'tree://myapp/users',
-    transactor='network',
-    keyNetwork='libp2p'
-  )
+  CREATE TABLE users (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    email TEXT
+  ) USING optimystic('tree://myapp/users', transactor='test', keyNetwork='test');
 `);
 
-// Query the distributed data
-const users = await db.all('SELECT * FROM users WHERE id = ?', ['user123']);
+await db.exec("INSERT INTO users VALUES ('u1', 'Alice', 'alice@example.com')");
+const rows = await db.all("SELECT * FROM users WHERE id = 'u1'");
 ```
 
-## Plugin Settings
-
-The plugin can be configured when loading with the following settings:
-
-- **default_transactor**: Default transactor type (`'network'`, `'test'`, or custom) - default: `'network'`
-- **default_key_network**: Default key network type (`'libp2p'`, `'test'`, or custom) - default: `'libp2p'`
-- **default_port**: Default port for libp2p nodes (0 = random) - default: `0`
-- **default_network_name**: Default network identifier - default: `'optimystic'`
-- **enable_cache**: Whether to cache collections between queries - default: `true`
-
-```typescript
-await loadPlugin('npm:@optimystic/quereus-plugin-optimystic', db, {
-  default_transactor: 'network',
-  default_key_network: 'libp2p',
-  default_port: 0,
-  default_network_name: 'myapp',
-  enable_cache: true
-});
-```
+See [examples/README.md](./examples/README.md) for Quoomb interactive console configs and multi-node mesh setup.
 
 ## Virtual Table Options
 
-The plugin supports various configuration options passed as arguments to the `USING` clause:
+Options are passed in the `USING optimystic(...)` clause:
 
-### Basic Options
-
-- **collectionUri** (required): URI identifying the tree collection (e.g., `'tree://myapp/users'`)
-- **transactor**: Type of transactor to use (`'network'`, `'test'`, or custom)
-- **keyNetwork**: Type of key network (`'libp2p'`, `'test'`, or custom)
-
-### Network Options
-
-- **port**: Port for libp2p node (default: from plugin settings)
-- **networkName**: Network identifier (default: from plugin settings)
-- **cache**: Enable local caching (default: from plugin settings)
-- **encoding**: Row encoding format (`'json'` or `'msgpack'`, default: `'json'`)
-
-### Example with Options
+| Option | Description | Default |
+|---|---|---|
+| First positional arg | Collection URI (e.g. `'tree://myapp/users'`) | `tree://default/{tableName}` |
+| `transactor` | `'network'`, `'test'`, or custom registered name | `'network'` |
+| `keyNetwork` | `'libp2p'`, `'test'`, or custom registered name | `'libp2p'` |
+| `port` | libp2p listen port (0 = random) | `0` |
+| `networkName` | Network identifier for protocol prefixes | `'optimystic'` |
+| `cache` | Enable local collection caching | `true` |
+| `encoding` | Row encoding format: `'json'` or `'msgpack'` | `'json'` |
 
 ```sql
-CREATE TABLE products USING optimystic(
+CREATE TABLE products (
+  id TEXT PRIMARY KEY,
+  name TEXT NOT NULL,
+  price REAL
+) USING optimystic(
   'tree://store/products',
   transactor='network',
   keyNetwork='libp2p',
   port=8080,
-  networkName='mystore',
-  cache=true,
-  encoding='json'
+  networkName='mystore'
 );
-```
-
-## SQL Operations
-
-### SELECT Queries
-
-```sql
--- Point lookups (optimized)
-SELECT * FROM users WHERE id = 'user123';
-
--- Range scans
-SELECT * FROM users WHERE id BETWEEN 'user100' AND 'user200';
-
--- Full table scans
-SELECT * FROM users ORDER BY id;
-```
-
-### INSERT Operations
-
-```sql
-INSERT INTO users (id, data) 
-VALUES ('user456', '{"name": "Alice", "email": "alice@example.com"}');
-```
-
-### UPDATE Operations
-
-```sql
-UPDATE users 
-SET data = '{"name": "Alice Smith", "email": "alice.smith@example.com"}'
-WHERE id = 'user456';
-```
-
-### DELETE Operations
-
-```sql
-DELETE FROM users WHERE id = 'user456';
 ```
 
 ## Data Model
 
-The plugin provides a simple key-value interface to Optimystic tree collections:
+You define your own schema — the plugin supports arbitrary columns and types. The primary key is serialized as the tree key (composite keys are joined with `\x00`). Non-key columns are JSON-encoded as the tree value.
 
-- **Primary Key**: The `id` column serves as the tree key (TEXT type)
-- **Data**: The `data` column stores the value (TEXT type, can be JSON)
-- **Schema**: Fixed schema with `id` and `data` columns
-
-### Example Schema
-
-```sql
--- The schema is automatically defined as:
-CREATE TABLE optimystic_tree (
-  id TEXT PRIMARY KEY,
-  data TEXT
-);
-```
-
-### Storing Complex Data
-
-```sql
--- Store JSON data in the data column
-INSERT INTO users VALUES ('user123', '{"name": "Alice", "email": "alice@example.com"}');
-
--- Query JSON data using Quereus JSON functions
-SELECT id, json_extract(data, '$.name') as name 
-FROM users 
-WHERE json_extract(data, '$.email') LIKE '%@example.com';
-```
+Primary keys must be TEXT (tree keys are strings). Standard SQL operations (SELECT, INSERT, UPDATE, DELETE) all work. Point lookups on the primary key and range scans are optimized; other predicates require a full scan.
 
 ## Transactions
 
-The plugin supports Quereus transactions, which map to Optimystic's sync mechanism:
+The plugin maps Quereus transactions to Optimystic's distributed sync:
 
-```typescript
-await db.exec('BEGIN');
-await db.exec("INSERT INTO users VALUES ('u1', '{\"name\": \"John\", \"email\": \"john@example.com\"}')");
-await db.exec("INSERT INTO users VALUES ('u2', '{\"name\": \"Jane\", \"email\": \"jane@example.com\"}')");
-await db.exec('COMMIT'); // Syncs changes to the distributed network
-```
+- **BEGIN** — Creates a transactor and generates a stamp ID
+- **COMMIT** — Syncs all collections (or commits through `TransactionSession` for distributed consensus)
+- **ROLLBACK** — Discards local changes and clears session state
 
-- **BEGIN**: Creates a new Optimystic transactor
-- **COMMIT**: Syncs all collections used in the transaction
-- **ROLLBACK**: Discards local changes and clears collection cache
+The `TransactionBridge` supports two modes:
+1. **Legacy mode** (default): Direct collection sync on commit
+2. **Transaction mode**: Uses `TransactionSession` for distributed consensus when configured with a coordinator and engine via `configureTransactionMode()`
 
-### TransactionId() Function
+### StampId() Function
 
-The plugin provides a `TransactionId()` SQL function that returns a unique identifier for the current transaction:
+Returns the current transaction's unique stamp ID, or NULL outside a transaction.
 
 ```sql
--- Get transaction ID
 BEGIN;
-SELECT TransactionId();  -- Returns base64url-encoded 32-byte ID
+SELECT StampId();  -- base64url-encoded 32-byte ID
 COMMIT;
-
--- Use in WITH CONTEXT clause
-CREATE TABLE audit_log (
-  id TEXT PRIMARY KEY,
-  action TEXT,
-  txn_id TEXT DEFAULT context_txn_id
-) USING optimystic('tree://app/audit')
-WITH CONTEXT (
-  context_txn_id TEXT
-);
-
-INSERT INTO audit_log (id, action)
-WITH CONTEXT context_txn_id = TransactionId()
-VALUES ('log1', 'user_created');
 ```
 
-**Features:**
-- Returns NULL outside of transactions
-- Returns the same ID throughout a transaction
-- Different ID for each transaction
-- 32-byte format: 16 bytes SHA-256(peer ID) + 16 bytes random
-- Base64url encoded for safe use in SQL
-- Works immediately after BEGIN (no DML required)
+Format: 16 bytes SHA-256(peer ID) + 16 random bytes, base64url encoded. Stable within a transaction, unique across transactions and peers.
 
-## Cryptographic Functions
+## Transaction Engine
 
-For cryptographic functions (hashing, signing, verification, random bytes), use the separate [@optimystic/quereus-plugin-crypto](../quereus-plugin-crypto) package:
+The package exports a `QuereusEngine` that implements `ITransactionEngine` from `@optimystic/db-core`. It re-executes SQL statements through Quereus for transaction validation, and computes schema hashes from the database catalog.
 
 ```typescript
-// Load both plugins
-await loadPlugin('npm:@optimystic/quereus-plugin-optimystic', db);
-await loadPlugin('npm:@optimystic/quereus-plugin-crypto', db);
+import { QuereusEngine, QUEREUS_ENGINE_ID, createQuereusValidator } from '@optimystic/quereus-plugin-optimystic';
 
-// Use crypto functions in SQL
-const hash = await db.get("SELECT digest('hello world', 'sha256', 'utf8', 'base64url') as hash");
-const nonce = await db.get("SELECT random_bytes(256) as nonce");
+const engine = new QuereusEngine(db, coordinator);
+const validator = createQuereusValidator({ db, coordinator });
 ```
 
-See the [crypto plugin documentation](../quereus-plugin-crypto/README.md) for complete details.
+`createQuereusStatement()` and `createQuereusStatements()` are helpers for building the JSON statement format used in transaction records.
 
 ## Custom Networks and Transactors
 
-You can register custom implementations for advanced use cases:
+Register custom implementations before creating tables that reference them:
 
 ```typescript
 import { registerKeyNetwork, registerTransactor } from '@optimystic/quereus-plugin-optimystic';
 
-// Register a custom key network
 registerKeyNetwork('mynetwork', MyCustomKeyNetwork);
-
-// Register a custom transactor
 registerTransactor('mytransactor', MyCustomTransactor);
-
-// Use in SQL
-await db.exec(`
-  CREATE TABLE data USING optimystic(
-    'tree://app/data',
-    transactor='mytransactor',
-    keyNetwork='mynetwork'
-  )
-`);
 ```
 
-## Performance Considerations
-
-### Query Optimization
-
-- **Point Lookups**: Queries with `WHERE id = ?` are highly optimized
-- **Range Scans**: Queries with `WHERE id BETWEEN ? AND ?` use efficient tree iteration
-- **Full Scans**: Queries without key constraints iterate the entire collection
-
-### Caching
-
-- Collections are cached within transactions and between queries
-- Set `cache=false` to disable caching if memory is a concern
-- Cache is automatically cleared on rollback
-
-### Network Efficiency
-
-- Use transactions to batch multiple operations
-- Consider using `'test'` transactor for local development
-- Configure appropriate libp2p options for your network topology
-
-## Error Handling
-
-The plugin maps Optimystic errors to appropriate SQL error codes:
-
-- **Collection not found**: `SQLITE_CONSTRAINT_PRIMARYKEY`
-- **Network timeouts**: `SQLITE_BUSY`
-- **Decoding failures**: `SQLITE_CORRUPT`
-- **Configuration errors**: `SQLITE_ERROR`
+Then use `transactor='mytransactor'` or `keyNetwork='mynetwork'` in your `USING` clause.
 
 ## Limitations
 
-- Primary key must be TEXT type (tree keys are strings)
-- No secondary indexes (use appropriate WHERE clauses for performance)
+- Primary keys must be TEXT type (tree keys are strings)
+- `msgpack` encoding is declared but not yet implemented
+- Savepoints are not implemented
 - Cross-collection transactions not yet supported
-- Savepoints not implemented
 
 ## Development
 
-### Building
-
 ```bash
-npm run build
+npm run build        # Build with tsup
+npm run typecheck    # Type check
+npm test             # Run tests (aegir, node)
 ```
 
-### Type Checking
-
-```bash
-npm run typecheck
-```
-
-### Testing
-
-```bash
-# Run all tests
-npm test
-
-# Run only distributed tests
-npm exec aegir test -t node -- --grep "Distributed"
-
-# Manual interactive mesh test
-npm run build
-node dist/test/manual-mesh-test.js
-```
-
-See [test/README.md](./test/README.md) for detailed testing documentation.
+See [test/README.md](./test/README.md) for test details.
 
 ## License
 
 MIT
-
-## Contributing
-
-Contributions are welcome! Please see the main Optimystic repository for contribution guidelines. 

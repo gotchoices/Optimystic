@@ -3,8 +3,8 @@ import type { Transaction, ExecutionResult, ITransactionEngine, CollectionAction
 import type { PeerId } from "../network/types.js";
 import type { Collection } from "../collection/collection.js";
 import { TransactionContext } from "./context.js";
-import { createActionsStatements } from "./actions-engine.js";
-import { createTransactionStamp, createTransactionId } from "./transaction.js";
+import { ActionsEngine } from "./actions-engine.js";
+import { createActionsStatements, createTransactionStamp, createTransactionId } from "./transaction.js";
 import { Log, blockIdsForTransforms, transformsFromTransform, hashString } from "../index.js";
 
 /**
@@ -237,8 +237,6 @@ export class TransactionCoordinator {
 			id: createTransactionId(stamp.id, statements, reads)
 		};
 
-		// Create ActionsEngine for execution (TransactionContext only supports actions)
-		const { ActionsEngine } = await import('./actions-engine.js');
 		const engine = new ActionsEngine(this);
 
 		// Execute through standard path

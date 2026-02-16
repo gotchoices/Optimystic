@@ -7,21 +7,20 @@ export type {
 	ExecutionResult,
 	CollectionActions,
 	ValidationResult,
-	ITransactionValidator
+	ITransactionValidator,
+	ActionsStatement
 } from './transaction.js';
 
 export {
 	createTransactionStamp,
-	createTransactionId
+	createTransactionId,
+	createActionsStatements
 } from './transaction.js';
 
 export {
 	ActionsEngine,
 	ACTIONS_ENGINE_ID,
-	createActionsStatements
 } from './actions-engine.js';
-
-export type { ActionsStatement } from './actions-engine.js';
 
 export { TransactionCoordinator } from './coordinator.js';
 export { TransactionContext } from './context.js';

@@ -125,8 +125,8 @@ If you spot code or design aspects that aren't covered by these tasks, please ad
 - [x] **HUNT-5.1.2**: `cluster-repo.ts:339` - `verifySignature()` returns `true` always - **SECURITY: NOT IMPLEMENTED** - DOCUMENTED: See `tasks/refactoring/signature-verification-implementation.md`
 - [x] **HUNT-5.1.3**: Review `hasConflict()` stale threshold (2000ms) - may be too aggressive - ANALYZED: Lines 500-542. The 2000ms threshold is a reasonable trade-off for distributed consensus. Too short risks premature cleanup in high-latency networks; too long blocks new transactions. Could be made configurable but current value is reasonable. Not a bug.
 - [x] **HUNT-5.1.4**: Review race resolution logic in `resolveRace()` - verify determinism - VERIFIED: Lines 548-561. Deterministic: (1) transaction with more promises wins, (2) tie-breaker uses string comparison of message hash. All nodes reach same conclusion given same inputs.
-- [ ] **TEST-5.1.1**: Add cluster member promise/commit phase tests
-- [ ] **TEST-5.1.2**: Add transaction expiration handling tests
+- [x] **TEST-5.1.1**: Add cluster member promise/commit phase tests - DONE: 5 tests in `cluster-repo.spec.ts` covering single-node, 3-peer accumulation, rejection handling, consensus execution
+- [x] **TEST-5.1.2**: Add transaction expiration handling tests - DONE: 3 tests in `cluster-repo.spec.ts` covering past, present, future expirations
 - [ ] **DOC-5.1.1**: Document cluster consensus protocol
 
 ### 5.2 Cluster Coordinator (`packages/db-p2p/src/repo/cluster-coordinator.ts`)
@@ -135,7 +135,7 @@ If you spot code or design aspects that aren't covered by these tasks, please ad
 - [x] **HUNT-5.2.2**: Review `validateSmallCluster()` - currently accepts without validation in fallback - VERIFIED: Lines 253-286. Intentional design - uses FRET for production validation, fallback accepts for dev/testing. Comment at line 279 documents this. Low risk if FRET is properly configured.
 - [x] **HUNT-5.2.3**: Review retry backoff logic - verify exponential backoff is correct - VERIFIED: Lines 38-41, 508. Correct exponential backoff: 2s → 4s → 8s → 16s → 30s (capped). Max 5 attempts. Implementation at line 508 uses `Math.min(existing.intervalMs * retryBackoffFactor, retryMaxIntervalMs)`.
 - [ ] **TEST-5.2.1**: Add cluster coordinator retry tests
-- [ ] **TEST-5.2.2**: Add super-majority threshold tests
+- [x] **TEST-5.2.2**: Add super-majority threshold tests - DONE: 2 tests in `cluster-repo.spec.ts` covering 2-node and 4-node cluster thresholds
 
 ### 5.3 Coordinator Repo (`packages/db-p2p/src/repo/coordinator-repo.ts`)
 
@@ -148,8 +148,8 @@ If you spot code or design aspects that aren't covered by these tasks, please ad
 
 - [x] **HUNT-5.4.1**: `storage-repo.ts:98-104` - Documented race condition between conflict check and save - VERIFIED: Well-documented at lines 98-104. Intentional trade-off: avoids locking overhead, relies on commit-time validation as final arbiter. Correct design decision.
 - [x] **HUNT-5.4.2**: `storage-repo.ts:251` - TODO: "Recover as best we can. Rollback or handle partial commit?" - DOCUMENTED: Lines 245-265. Partial commit is possible if block N fails after blocks 1..N-1 succeed. Locks prevent concurrent access but don't provide rollback. Returns failure but doesn't undo successful commits. Should be addressed in `tasks/refactoring/2pc-state-persistence.md`.
-- [ ] **TEST-5.4.1**: Add storage repo concurrent commit tests
-- [ ] **TEST-5.4.2**: Add partial commit recovery tests
+- [x] **TEST-5.4.1**: Add storage repo concurrent commit tests - DONE: 2 tests in `storage-repo.spec.ts` covering latch serialization and deadlock prevention
+- [x] **TEST-5.4.2**: Add partial commit recovery tests - DONE: 2 tests in `storage-repo.spec.ts` covering stale revision conflict and non-existent pending action
 
 ---
 

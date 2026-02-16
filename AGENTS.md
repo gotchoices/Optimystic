@@ -11,5 +11,6 @@
 * Avoid "swallowing" exceptions; exceptions should be exceptional - use results for expected conditions.
 * Prefer expressive over imperative.
 * Small, single-purpose functions/methods.  Decompose into separate functions over documented sub-sections - function names document the semantics.
+* We want to be platform agnostic (browser, node, RN, etc.) unless we're explicitly building something platform specific
 
 This is an important system; write production-grade, maintainble, and expressive code that we don't have to revisit later.  Read @docs/internals.md to quickly come up to speed on contributing - also maintain this document.

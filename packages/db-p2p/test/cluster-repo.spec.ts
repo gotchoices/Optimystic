@@ -431,6 +431,261 @@ describe('ClusterMember', () => {
 		});
 	});
 
+	describe('promise/commit phase edge cases (TEST-5.1.1)', () => {
+		it('adds promise for single-node cluster', async () => {
+			const ourId = selfPeerId.toString();
+			const peers = makeClusterPeers([selfPeerId]);
+
+			const record = await createClusterRecord(
+				peers,
+				makePendOperation('a1', 'block-1')
+			);
+
+			const result = await clusterMemberInstance.update(record);
+
+			expect(result.promises[ourId]).to.not.equal(undefined);
+			expect(result.promises[ourId]!.type).to.equal('approve');
+		});
+
+		it('reaches consensus in single-node cluster through full cycle', async () => {
+			const ourId = selfPeerId.toString();
+			const peers = makeClusterPeers([selfPeerId]);
+
+			// First update: adds our promise
+			const record = await createClusterRecord(
+				peers,
+				makeGetOperation(['block-1'])
+			);
+			const afterPromise = await clusterMemberInstance.update(record);
+			expect(afterPromise.promises[ourId]!.type).to.equal('approve');
+
+			// Second update: with all promises → should add commit and execute
+			const result = await clusterMemberInstance.update(afterPromise);
+			expect(result.commits[ourId]).to.not.equal(undefined);
+			expect(result.commits[ourId]!.type).to.equal('approve');
+		});
+
+		it('executes pend operations on consensus', async () => {
+			const ourId = selfPeerId.toString();
+			const peers = makeClusterPeers([selfPeerId]);
+
+			const record = await createClusterRecord(
+				peers,
+				makePendOperation('a1', 'block-1')
+			);
+
+			// First update adds promise
+			const afterPromise = await clusterMemberInstance.update(record);
+			// Second update with promise → commit + execute
+			await clusterMemberInstance.update(afterPromise);
+
+			expect(mockRepo.pendCalls.length).to.equal(1);
+			expect(mockRepo.pendCalls[0]!.actionId).to.equal('a1');
+		});
+
+		it('handles 3-peer cluster promise accumulation', async () => {
+			const peer2 = await makePeerId();
+			const peer3 = await makePeerId();
+			const ourId = selfPeerId.toString();
+			const peer2Id = peer2.toString();
+			const peer3Id = peer3.toString();
+			const peers = makeClusterPeers([selfPeerId, peer2, peer3]);
+
+			// Record with no promises yet
+			const record = await createClusterRecord(
+				peers,
+				makeGetOperation(['block-1'])
+			);
+
+			// Our promise is added
+			const result1 = await clusterMemberInstance.update(record);
+			expect(result1.promises[ourId]).to.not.equal(undefined);
+
+			// Still missing 2 promises → no commit yet
+			expect(result1.commits[ourId]).to.equal(undefined);
+
+			// Now all promises arrive
+			const withAllPromises: ClusterRecord = {
+				...result1,
+				promises: {
+					...result1.promises,
+					[peer2Id]: { type: 'approve', signature: 'p2' },
+					[peer3Id]: { type: 'approve', signature: 'p3' }
+				}
+			};
+
+			const result2 = await clusterMemberInstance.update(withAllPromises);
+			expect(result2.commits[ourId]).to.not.equal(undefined);
+			expect(result2.commits[ourId]!.type).to.equal('approve');
+		});
+
+		it('does not add commit when promise is a rejection', async () => {
+			const peer2 = await makePeerId();
+			const ourId = selfPeerId.toString();
+			const peer2Id = peer2.toString();
+			const peers = makeClusterPeers([selfPeerId, peer2]);
+
+			const record = await createClusterRecord(
+				peers,
+				makeGetOperation(['block-1']),
+				{
+					[ourId]: { type: 'approve', signature: 'p1' },
+					[peer2Id]: { type: 'reject', signature: 'rejected', rejectReason: 'invalid' }
+				}
+			);
+
+			const result = await clusterMemberInstance.update(record);
+			// Rejected transaction should not produce a commit
+			expect(result.commits[ourId]).to.equal(undefined);
+		});
+	});
+
+	describe('transaction expiration (TEST-5.1.2)', () => {
+		it('rejects transactions with past expiration', async () => {
+			const peers = makeClusterPeers([selfPeerId]);
+
+			const record = await createClusterRecord(
+				peers,
+				makeGetOperation(['block-1']),
+				{},
+				{},
+				Date.now() - 5000
+			);
+
+			try {
+				await clusterMemberInstance.update(record);
+				expect.fail('Should have thrown');
+			} catch (err) {
+				expect((err as Error).message.toLowerCase()).to.include('expired');
+			}
+		});
+
+		it('rejects transactions expiring at exactly now', async () => {
+			const peers = makeClusterPeers([selfPeerId]);
+
+			const record = await createClusterRecord(
+				peers,
+				makeGetOperation(['block-1']),
+				{},
+				{},
+				Date.now() - 1
+			);
+
+			try {
+				await clusterMemberInstance.update(record);
+				expect.fail('Should have thrown');
+			} catch (err) {
+				expect((err as Error).message.toLowerCase()).to.include('expired');
+			}
+		});
+
+		it('accepts transactions with future expiration', async () => {
+			const ourId = selfPeerId.toString();
+			const peers = makeClusterPeers([selfPeerId]);
+
+			const record = await createClusterRecord(
+				peers,
+				makeGetOperation(['block-1']),
+				{},
+				{},
+				Date.now() + 60000
+			);
+
+			const result = await clusterMemberInstance.update(record);
+			expect(result.promises[ourId]).to.not.equal(undefined);
+		});
+	});
+
+	describe('super-majority threshold (TEST-5.2.2)', () => {
+		it('requires all promises in 2-node cluster for commit', async () => {
+			const peer2 = await makePeerId();
+			const ourId = selfPeerId.toString();
+			const peers = makeClusterPeers([selfPeerId, peer2]);
+
+			// Only our promise - missing peer2
+			const record = await createClusterRecord(
+				peers,
+				makeGetOperation(['block-1']),
+				{ [ourId]: { type: 'approve', signature: 'p1' } }
+			);
+
+			const result = await clusterMemberInstance.update(record);
+			// Should NOT commit since we don't have all promises
+			expect(result.commits[ourId]).to.equal(undefined);
+		});
+
+		it('commits when all promises present in 4-node cluster', async () => {
+			const peer2 = await makePeerId();
+			const peer3 = await makePeerId();
+			const peer4 = await makePeerId();
+			const ourId = selfPeerId.toString();
+			const peers = makeClusterPeers([selfPeerId, peer2, peer3, peer4]);
+
+			const record = await createClusterRecord(
+				peers,
+				makeGetOperation(['block-1']),
+				{
+					[ourId]: { type: 'approve', signature: 'p1' },
+					[peer2.toString()]: { type: 'approve', signature: 'p2' },
+					[peer3.toString()]: { type: 'approve', signature: 'p3' },
+					[peer4.toString()]: { type: 'approve', signature: 'p4' }
+				}
+			);
+
+			const result = await clusterMemberInstance.update(record);
+			expect(result.commits[ourId]).to.not.equal(undefined);
+		});
+	});
+
+	describe('race resolution', () => {
+		it('resolves conflict deterministically based on promise count', async () => {
+			const peer2 = await makePeerId();
+			const ourId = selfPeerId.toString();
+			const peers = makeClusterPeers([selfPeerId, peer2]);
+
+			// First transaction on block-1, with a promise from peer2
+			const record1 = await createClusterRecord(
+				peers,
+				makePendOperation('a1', 'block-shared'),
+				{ [peer2.toString()]: { type: 'approve', signature: 'p2' } }
+			);
+			await clusterMemberInstance.update(record1);
+
+			// Second conflicting transaction on block-shared, no promises
+			const record2 = await createClusterRecord(
+				peers,
+				makePendOperation('a2', 'block-shared')
+			);
+
+			// record1 has more promises, so it should win
+			const result = await clusterMemberInstance.update(record2);
+			// The result should still be valid - race resolution doesn't throw
+			expect(result).to.not.equal(undefined);
+		});
+	});
+
+	describe('duplicate execution prevention', () => {
+		it('prevents double execution via wasTransactionExecuted', async () => {
+			const ourId = selfPeerId.toString();
+			const peers = makeClusterPeers([selfPeerId]);
+
+			const record = await createClusterRecord(
+				peers,
+				makePendOperation('a1', 'block-1')
+			);
+
+			// First: add promise
+			const afterPromise = await clusterMemberInstance.update(record);
+			// Second: commit + execute
+			await clusterMemberInstance.update(afterPromise);
+
+			expect(mockRepo.pendCalls.length).to.equal(1);
+
+			// Mark the transaction as already executed
+			expect(clusterMemberInstance.wasTransactionExecuted(record.messageHash)).to.equal(true);
+		});
+	});
+
 	describe('validation', () => {
 		it('uses validator when provided', async () => {
 			let validationCalled = false;

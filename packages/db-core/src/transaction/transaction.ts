@@ -145,6 +145,22 @@ export type CollectionActions = {
 };
 
 /**
+ * Helper to create an actions-based transaction statements array.
+ * Each CollectionActions becomes a separate JSON-encoded statement.
+ */
+export function createActionsStatements(collections: CollectionActions[]): string[] {
+	return collections.map(c => JSON.stringify(c));
+}
+
+/**
+ * Statement format for the actions engine (array of CollectionActions).
+ * @deprecated Use CollectionActions[] directly
+ */
+export type ActionsStatement = {
+	collections: CollectionActions[];
+};
+
+/**
  * Result of transaction validation.
  */
 export type ValidationResult = {

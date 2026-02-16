@@ -7,6 +7,7 @@
 
 import type { Row, SqlValue } from '@quereus/quereus';
 import { resolveCollation, compareSqlValues, type CollationFunction } from '@quereus/quereus';
+import { toString as uint8ToString } from 'uint8arrays/to-string';
 import type { StoredTableSchema } from './schema-manager.js';
 
 /**
@@ -174,8 +175,7 @@ export class RowCodec {
 		}
 
 		if (value instanceof Uint8Array) {
-			// Convert to base64 for string representation
-			return Buffer.from(value).toString('base64');
+			return uint8ToString(value, 'base64');
 		}
 
 		// Fallback
@@ -191,9 +191,8 @@ export class RowCodec {
 			return Number(value);
 		}
 
-		// Uint8Array needs special handling for JSON
 		if (value instanceof Uint8Array && this.encoding === 'json') {
-			return Buffer.from(value).toString('base64');
+			return uint8ToString(value, 'base64');
 		}
 
 		return value;

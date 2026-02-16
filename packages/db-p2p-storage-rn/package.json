@@ -1,6 +1,6 @@
 {
   "name": "@optimystic/db-p2p-storage-rn",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "type": "module",
   "description": "React Native storage backend for @optimystic/db-p2p using MMKV",
   "main": "dist/src/index.js",

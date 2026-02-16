@@ -1,4 +1,5 @@
 import type { Startable, Logger, PeerId, Libp2p } from '@libp2p/interface'
+import { peerIdFromString } from '@libp2p/peer-id'
 import type { FretService } from 'p2p-fret'
 import { hashKey } from 'p2p-fret'
 import { toString as u8ToString } from 'uint8arrays/to-string'
@@ -203,7 +204,6 @@ export class NetworkManagerService implements Startable {
 			if (neighbors.length > 0) {
 				const pidStr = neighbors[0];
 				if (pidStr) {
-					const { peerIdFromString } = await import('@libp2p/peer-id');
 					const pid = peerIdFromString(pidStr);
 					if (!this.isBlacklisted(pid)) {
 						return pid;
@@ -251,8 +251,6 @@ export class NetworkManagerService implements Startable {
 			const estimate = typeof diag.estimate === 'number' ? diag.estimate : (typeof diag.n === 'number' ? diag.n : undefined);
 			const targetSize = Math.max(1, Math.min(this.cfg.clusterSize, Number.isFinite(estimate) ? (estimate as number) : this.cfg.clusterSize));
 			const cohortIds = fret.assembleCohort(coord, targetSize);
-			const { peerIdFromString } = await import('@libp2p/peer-id');
-
 			const ids = cohortIds
 				.map(idStr => {
 					try {

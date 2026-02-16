@@ -1,9 +1,15 @@
-import type { ITransactor, CollectionId, PeerId } from '@optimystic/db-core';
-import { Tree } from '@optimystic/db-core';
-import { NetworkTransactor } from '@optimystic/db-core';
+import type { ITransactor, CollectionId, PeerId, IRepo } from '@optimystic/db-core';
+import { Tree, NetworkTransactor } from '@optimystic/db-core';
+import {
+	createLibp2pNode,
+	Libp2pKeyPeerNetwork,
+	RepoClient,
+	StorageRepo,
+	BlockStorage,
+	MemoryRawStorage,
+} from '@optimystic/db-p2p';
 import type { RowData, ParsedOptimysticOptions, TransactionState } from '../types.js';
-import { createKeyNetwork } from './key-network.js';
-import type { IRepo } from '@optimystic/db-core';
+import { getCustomRegistry } from './key-network.js';
 import type { Libp2p } from '@libp2p/interface';
 
 /**
@@ -98,9 +104,6 @@ export class CollectionFactory {
     let nodeInfo = this.libp2pNodes.get(nodeKey);
 
     if (!nodeInfo) {
-      // Create a new libp2p node with all necessary services
-      const { createLibp2pNode } = await import('@optimystic/db-p2p');
-
       const node = await createLibp2pNode({
         port: options.libp2pOptions?.port ?? 0,
         networkName: options.libp2pOptions?.networkName ?? 'optimystic',
@@ -128,8 +131,6 @@ export class CollectionFactory {
 
     const { node, coordinatedRepo } = nodeInfo;
 
-    // Create Libp2pKeyPeerNetwork which implements both IKeyNetwork and IPeerNetwork
-    const { Libp2pKeyPeerNetwork, RepoClient } = await import('@optimystic/db-p2p');
     const keyNetwork = new Libp2pKeyPeerNetwork(node);
     const protocolPrefix = `/optimystic/${options.libp2pOptions?.networkName ?? 'optimystic'}`;
 
@@ -154,9 +155,6 @@ export class CollectionFactory {
    * Create a local transactor (in-memory, single-node, no network)
    */
   private async createLocalTransactor(): Promise<ITransactor> {
-    const { StorageRepo, BlockStorage, MemoryRawStorage } = await import('@optimystic/db-p2p');
-
-    // Create a shared memory storage for all blocks
     const memoryStorage = new MemoryRawStorage();
     const storageRepo = new StorageRepo((blockId: string) => new BlockStorage(blockId, memoryStorage));
 
@@ -184,9 +182,6 @@ export class CollectionFactory {
    * Create a test transactor (in-memory, single-node)
    */
   private async createTestTransactor(): Promise<ITransactor> {
-    const { StorageRepo, BlockStorage, MemoryRawStorage } = await import('@optimystic/db-p2p');
-
-    // Create a shared memory storage for all blocks
     const memoryStorage = new MemoryRawStorage();
 
     const storageRepo = new StorageRepo((blockId) => new BlockStorage(blockId, memoryStorage));
@@ -215,8 +210,6 @@ export class CollectionFactory {
    * Create a custom transactor
    */
   private async createCustomTransactor(name: string): Promise<ITransactor> {
-    // This would use the custom registry from key-network.ts
-    const { getCustomRegistry } = await import('./key-network.js');
     const registry = getCustomRegistry();
 
     const CustomTransactor = registry.transactors.get(name);
