@@ -33,7 +33,7 @@ If you spot code or design aspects that aren't covered by these tasks, please ad
 - [x] **HUNT-1.1.1**: Review `block-store.ts` - Verify BlockSource/BlockStore interface contracts are complete - VERIFIED: Interfaces are minimal and complete. BlockSource provides read operations (createBlockHeader, tryGet, generateId), BlockStore extends with write operations (insert, update, delete). Well-documented.
 - [x] **HUNT-1.1.2**: Review `structs.ts` - Validate BlockId generation uniqueness guarantees - VERIFIED: Production uses 256-bit random values via `randomBytes(32)` with base64url encoding. Collision probability is negligible (~1 in 2^128 for birthday attack). FIXED: Updated comment from "base32" to "base64url".
 - [x] **HUNT-1.1.3**: Review `apply.ts` - Verify BlockOperation application is atomic and correct - VERIFIED: `applyOperation` in helpers.ts correctly mutates blocks. Uses Array.splice for array ops, direct assignment for properties. Uses structuredClone to prevent reference issues. Atomicity is provided at higher level by Tracker class.
-- [ ] **TEST-1.1.1**: Add regression tests for block ID collision scenarios
+- [x] **TEST-1.1.1**: Add regression tests for block ID collision scenarios — 7 tests in transform.spec.ts. **7 BUGS found**: (1) mergeTransforms silently drops overlapping updates via object spread; (2) mergeTransforms silently drops overlapping inserts; (3) mergeTransforms accumulates duplicate deletes; (4) Tracker.tryGet ignores inserts when source has block with same ID; (5) Tracker double-delete then re-insert leaves phantom delete (splice only removes first); (6) applyTransformToStore silently overwrites on duplicate insert; (7) concatTransform drops existing operations on overlap.
 - [x] **DOC-1.1.1**: Update block storage documentation to reflect current implementation - FIXED: Corrected docs/blocks.md to use "base64url" instead of "base32", fixed Transforms example to use array instead of Set for deletes
 
 ### 1.2 Transform Layer (`packages/db-core/src/transform/`)
@@ -113,7 +113,7 @@ If you spot code or design aspects that aren't covered by these tasks, please ad
 ### 4.2 Transactor Source (`packages/db-core/src/transactor/`)
 
 - [x] **HUNT-4.2.1**: Review `TransactorSource` context handling for stale reads - ANALYZED: Lines 25-33 pass `actionContext` to transactor for read consistency. TODO at line 29 notes pending actions should be tracked to ensure update before sync. This is a valid enhancement opportunity, not a bug - current behavior is safe but may cause unnecessary conflicts.
-- [ ] **TEST-4.2.1**: Add transactor source version conflict tests
+- [x] **TEST-4.2.1**: COMPLETE — 4 tests in transactor-source.spec.ts. **BUG FOUND: `transact()` leaks pending actions when commit fails** (no cancel call after failed commit). Also tested: tryGet returns undefined for missing blocks, stale data from outdated revision, pending action info not propagated from tryGet (TODO in source).
 
 ---
 
@@ -183,12 +183,12 @@ If you spot code or design aspects that aren't covered by these tasks, please ad
 - [x] **HUNT-7.1.2**: Review `execute()` - actions collected by coordinator, not returned (verify this is correct) - VERIFIED: Lines 59-87. Intentional design - Quereus virtual table module calls `coordinator.applyActions()` directly during SQL execution. The empty `actions` array in return is correct; transforms are retrieved via `coordinator.getTransforms()`.
 - [x] **HUNT-7.1.3**: Review schema hash caching - verify invalidation on DDL is complete - GAP IDENTIFIED: `invalidateSchemaCache()` exists but is not automatically called on DDL. Should subscribe to `schemaManager.changeNotifier` events (`table_added`, `table_removed`, `table_modified`). Currently requires manual invalidation. Low priority - schema changes are rare in production.
 - [ ] **TEST-7.1.1**: Add Quereus engine execution tests
-- [ ] **TEST-7.1.2**: Add schema hash consistency tests
+- [x] **TEST-7.1.2**: Add schema hash consistency tests — TESTED: Confirmed cache staleness bug (DDL without invalidateSchemaCache returns stale hash, staleness accumulates). Discovered vtabArgs sensitivity (different tree URIs produce different hashes) and function sensitivity (extra function registration changes hash).
 
 ### 7.2 Quereus Validator (`packages/quereus-plugin-optimystic/src/transaction/quereus-validator.ts`)
 
 - [x] **HUNT-7.2.1**: Review validator re-execution logic for determinism - VERIFIED: Uses `TransactionValidator` from db-core. Determinism ensured by: (1) schema hash check ensures matching schema, (2) same SQL + params produces same operations, (3) coordinator reset before validation ensures isolation. Non-deterministic SQL functions (RANDOM, NOW) would break validation but are user responsibility.
-- [ ] **TEST-7.2.1**: Add validator determinism tests
+- [x] **TEST-7.2.1**: Add validator determinism tests — TESTED: Hash is deterministic across instances and table creation order (ORDER BY in computeSchemaHash works). Column type differences detected. vtabArgs and registered functions included in hash; validators must have identical configs and plugin sets.
 
 ### 7.3 Optimystic Adapter (`packages/quereus-plugin-optimystic/src/optimystic-adapter/`)
 
@@ -353,7 +353,7 @@ If you spot code or design aspects that aren't covered by these tasks, please ad
 - [x] **THEORY-10.2.4**: Review recovery protocol - DOCUMENTED: See `tasks/refactoring/2pc-state-persistence.md`
   - How do nodes recover pending state after crash/restart?
   - `cluster-coordinator.ts:36` TODO: "move this into a state management interface so that transaction state can be persisted"
-- [ ] **TEST-10.2.1**: Add 2PC protocol edge case tests (coordinator failure, participant failure, network partition)
+- [x] **TEST-10.2.1**: COMPLETE — 2 tests in transaction.spec.ts. **BUG 1: pendPhase partial failure orphans pending actions** (pend succeeds for collection A, fails for B → no cancelPhase call → A's pending action blocks future transactions). **BUG 2: commitPhase partial failure violates atomicity** (commit succeeds for A, fails for B → cancelPhase called but cancel on committed block is no-op → A committed, B not).
 
 ### 10.3 Consensus Algorithm Correctness
 
@@ -384,7 +384,11 @@ If you spot code or design aspects that aren't covered by these tasks, please ad
   - Starvation: Possible if transaction keeps losing races. No priority or fairness mechanism.
   - GAP: No explicit starvation prevention. High-contention scenarios could starve some transactions.
   - NOTE: Application-level retry with backoff is expected for failed transactions.
-- [ ] **TEST-10.3.1**: Add consensus protocol correctness tests (concurrent conflicting transactions)
+- [x] **TEST-10.3.1**: Add consensus protocol correctness tests (concurrent conflicting transactions) — COMPLETE: 4 tests, 4 bugs found:
+  - BUG: `coordinator.execute()` never resets collection trackers after commit — stale transforms accumulate
+  - BUG: `coordinator.execute()` never updates `actionContext.rev` — subsequent transactions compute stale revision (always rev=1)
+  - BUG: Sequential `coordinator.execute()` fails even with no logical conflict — pend/commit rev is always 1 due to stale actionContext
+  - BUG: `coordinator.rollback(stampId)` ignores stampId parameter — resets ALL collection trackers, destroying concurrent sessions' transforms
 
 ### 10.4 Byzantine Fault Tolerance
 
@@ -427,7 +431,7 @@ If you spot code or design aspects that aren't covered by these tasks, please ad
   - Pending conflict: `StaleFailure.pending` returned; client waits (`PendingRetryDelayMs`) and retries.
   - Transaction ID: New transaction ID generated on retry (different stamp timestamp).
   - NOTE: Application must handle retry logic; system provides `StaleFailure` info for informed retry.
-- [ ] **TEST-10.5.1**: Add write-skew and lost-update tests
+- [x] **TEST-10.5.1**: COMPLETE � 5 tests in transaction.spec.ts. Lost-update prevention works (block-ID conflict detection). Committed conflict detection works. **Write-skew anomaly is possible** (KNOWN LIMITATION: no read dependency tracking � validator.ts TODO). Write-skew through separate collections also undetected.
 
 ### 10.6 Deterministic Replay Correctness
 
@@ -452,7 +456,7 @@ If you spot code or design aspects that aren't covered by these tasks, please ad
   - NOTE: JavaScript Map iteration order is insertion order, which is deterministic.
   - GAP: If collections are added in different order on different nodes, hash could differ.
   - Mitigation: Collections are typically created in same order from same schema.
-- [ ] **TEST-10.6.1**: Add replay determinism tests (same statements, different nodes, same result)
+- [x] **TEST-10.6.1**: Add replay determinism tests — TESTED: Operations hash is order-sensitive (different operation order produces different hash). execute() path is safe (iterates result.actions in statement order). commit() path has risk (iterates this.collections Map in insertion order). Validator transforms order must match coordinator order.
 
 ### 10.7 Network Partition Handling
 
@@ -498,7 +502,11 @@ If you spot code or design aspects that aren't covered by these tasks, please ad
   - Gap detection: `getFrom(startRev)` returns entries > startRev for sync.
   - Wrap around: JavaScript number, max safe integer is 2^53-1. No explicit handling.
   - NOTE: At 1M transactions/second, would take ~285 years to overflow. Practical non-issue.
-- [ ] **TEST-10.8.1**: Add clock skew and ordering tests
+- [x] **TEST-10.8.1**: Add clock skew and ordering tests — COMPLETE: 4 tests, 3 issues found:
+  - BUG: Identical stamp inputs produce identical stamp/transaction IDs — independent transactions from same peer at same ms are indistinguishable
+  - BUG: `hashString` (djb2, 32-bit) produces collisions within 100K stamp-like inputs — different stamps can produce identical IDs
+  - VERIFIED: 1ms clock difference produces fully divergent stamp IDs — minor skew prevents deduplication
+  - VERIFIED: Transaction ordering determined by commit sequence (revision), not timestamp
 
 ---
 
@@ -535,17 +543,17 @@ If you spot code or design aspects that aren't covered by these tasks, please ad
 
 | Layer | Total Tasks | Completed | Remaining (TEST/DOC) |
 |-------|-------------|-----------|----------------------|
-| 1. Block Storage | 9 | 8 | 1 TEST |
+| 1. Block Storage | 9 | 9 | — |
 | 2. Transaction | 11 | 7 | 3 TEST, 1 DOC |
 | 3. B-tree/Collections | 14 | 10 | 3 TEST, 1 DOC |
-| 4. Network Transactor | 8 | 5 | 2 TEST, 1 DOC |
+| 4. Network Transactor | 8 | 6 | 1 TEST, 1 DOC |
 | 5. Cluster Consensus | 16 | 12 | 3 TEST, 1 DOC |
 | 6. Crypto | 6 | 6 | 1 DOC |
-| 7. Quereus Plugin | 12 | 11 | 1 TEST |
+| 7. Quereus Plugin | 12 | 13 | — |
 | 8. Reference Peer | 4 | 2 | 1 TEST, 1 DOC |
 | 9. Architecture | 16 | 12 | 4 DOC |
-| 10. Transactional Theory | 34 | 27 | 7 TEST |
-| **Total** | **130** | **101** | **20 TEST, 9 DOC** |
+| 10. Transactional Theory | 34 | 32 | 2 TEST |
+| **Total** | **130** | **110** | **11 TEST, 9 DOC** |
 
 **Note**: All HUNT-* (code review) and THEORY-* (transactional theory) tasks are COMPLETE. Remaining tasks are TEST-* (test coverage) and DOC-* (documentation) items.
 

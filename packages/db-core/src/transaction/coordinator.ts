@@ -315,7 +315,24 @@ export class TransactionCoordinator {
 			return coordResult;
 		}
 
-		// 4. Return results from actions
+		// 5. Update actionContext and reset trackers after successful commit
+		for (const collectionActions of result.actions) {
+			const collection = this.collections.get(collectionActions.collectionId);
+			if (collection) {
+				const newRev = (collection['source'].actionContext?.rev ?? 0) + 1;
+				const actionId = transaction.id;
+				collection['source'].actionContext = {
+					committed: [
+						...(collection['source'].actionContext?.committed ?? []),
+						{ actionId, rev: newRev }
+					],
+					rev: newRev,
+				};
+				collection.tracker.reset();
+			}
+		}
+
+		// 6. Return results from actions
 		return {
 			success: true,
 			actions: result.actions,
@@ -518,6 +535,10 @@ export class TransactionCoordinator {
 			// Pend the transaction
 			const pendResult = await this.transactor.pend(pendRequest);
 			if (!pendResult.success) {
+				// Cancel any already-pended collections before returning
+				for (const [pendedCollectionId, pendedBlockIdList] of pendedBlockIds.entries()) {
+					await this.transactor.cancel({ actionId, blockIds: pendedBlockIdList });
+				}
 				return {
 					success: false,
 					error: `Pend failed for collection ${collectionId}: ${pendResult.reason}`

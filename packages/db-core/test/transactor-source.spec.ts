@@ -3,7 +3,7 @@ import { TransactorSource } from '../src/transactor/transactor-source.js'
 import { TestTransactor } from './test-transactor.js'
 import { randomBytes } from '@libp2p/crypto'
 import { toString as uint8ArrayToString } from 'uint8arrays/to-string'
-import type { IBlock, ActionId, ActionContext, Transforms, BlockOperation, CommitRequest } from '../src/index.js'
+import type { IBlock, ActionId, ActionContext, Transforms, BlockOperation, CommitRequest, PendRequest, PendResult, CommitResult } from '../src/index.js'
 
 describe('TransactorSource', () => {
 	type TestBlock = IBlock & { test: string[] }
@@ -384,4 +384,132 @@ describe('TransactorSource', () => {
     const updateResult = await source.transact(updateTransform, generateActionId(), 2, 'header-id', 'tail-id')
     expect(updateResult).to.be.undefined
   })
+
+	describe('Version Conflict and Stale Read Tests (TEST-4.2.1)', () => {
+		it('should cancel pending action when commit fails', async () => {
+			const transactor = new TestTransactor();
+			const src = new TransactorSource('coll', transactor, undefined);
+			const blockId = 'leak-block';
+			const actionId = generateActionId();
+
+			// Setup: insert and commit a block at rev 1
+			await transactor.pend({
+				actionId: 'init' as ActionId,
+				transforms: { inserts: { [blockId]: { header: { id: blockId, type: 'T', collectionId: 'coll' } } }, updates: {}, deletes: [] },
+				policy: 'c',
+			});
+			await transactor.commit({ actionId: 'init' as ActionId, blockIds: [blockId], tailId: blockId, rev: 1 });
+
+			// Sabotage: make commit always fail while pend succeeds
+			const originalCommit = transactor.commit.bind(transactor);
+			transactor.commit = async (_req: CommitRequest): Promise<CommitResult> => {
+				return { success: false, missing: [{ actionId: 'phantom' as ActionId, rev: 99, transforms: { inserts: {}, updates: {}, deletes: [] } }] };
+			};
+
+			// transact: pend will succeed, commit will fail
+			const updateTransforms: Transforms = {
+				inserts: {},
+				updates: { [blockId]: [['data', 0, 0, 'leaked']] },
+				deletes: [],
+			};
+			const result = await src.transact(updateTransforms, actionId, 2, blockId, blockId);
+			expect(result).to.not.be.undefined;
+			expect(result!.success).to.be.false;
+
+			// FIX VERIFIED: transact() now cancels the pending action on commit failure.
+			const pending = transactor.getPendingActions();
+			expect(pending.size, 'pending action should be cancelled after commit failure').to.equal(0);
+
+			// Retry should succeed now that no orphaned pending blocks the way
+			transactor.commit = originalCommit;
+			const newActionId = generateActionId();
+			const retryResult = await src.transact(updateTransforms, newActionId, 2, blockId, blockId);
+			expect(retryResult, 'retry should succeed after clean cancel').to.be.undefined;
+		});
+
+		it('should return undefined from tryGet when result entry has no block (e.g. non-existent block ID in response)', async () => {
+			const transactor = new TestTransactor();
+			const src = new TransactorSource<IBlock>('coll', transactor, undefined);
+
+			// tryGet for a block that was never inserted — TestTransactor returns { block: undefined, state: ... }
+			const result = await src.tryGet('never-inserted');
+			// The block should be undefined — tryGet returns undefined
+			expect(result).to.be.undefined;
+		});
+
+		it('should return stale data when actionContext has outdated revision', async () => {
+			const transactor = new TestTransactor();
+			const blockId = 'versioned-block';
+
+			// Insert at rev 1
+			await transactor.pend({
+				actionId: 'v1' as ActionId,
+				transforms: { inserts: { [blockId]: { header: { id: blockId, type: 'T', collectionId: 'c' }, data: 'rev1' } as IBlock }, updates: {}, deletes: [] },
+				policy: 'c',
+			});
+			await transactor.commit({ actionId: 'v1' as ActionId, blockIds: [blockId], tailId: blockId, rev: 1 });
+
+			// Update at rev 2
+			await transactor.pend({
+				actionId: 'v2' as ActionId,
+				transforms: { inserts: {}, updates: { [blockId]: [['data', 0, 0, 'rev2']] }, deletes: [] },
+				policy: 'c',
+				rev: 2,
+			});
+			await transactor.commit({ actionId: 'v2' as ActionId, blockIds: [blockId], tailId: blockId, rev: 2 });
+
+			// Source pinned to rev 1 context — should see old data
+			const staleSource = new TransactorSource('c', transactor, { committed: [{ actionId: 'v1' as ActionId, rev: 1 }], rev: 1 });
+			const staleBlock = await staleSource.tryGet(blockId) as IBlock & { data: string };
+			expect(staleBlock).to.not.be.undefined;
+			expect((staleBlock as any).data, 'stale source should see rev 1 data').to.equal('rev1');
+
+			// Source with no context (latest) — should see new data
+			const latestSource = new TransactorSource('c', transactor, undefined);
+			const latestBlock = await latestSource.tryGet(blockId) as IBlock & { data: string };
+			expect(latestBlock).to.not.be.undefined;
+			expect((latestBlock as any).data, 'latest source should see rev 2 data').to.equal('rev2');
+		});
+
+		it('should not propagate pending action info from tryGet (TODO in source code)', async () => {
+			const transactor = new TestTransactor();
+			const src = new TransactorSource<IBlock & { data: string }>('c', transactor, undefined);
+			const blockId = 'pending-info-block';
+
+			// Insert and commit
+			await transactor.pend({
+				actionId: 'init' as ActionId,
+				transforms: { inserts: { [blockId]: { header: { id: blockId, type: 'T', collectionId: 'c' }, data: 'orig' } as IBlock }, updates: {}, deletes: [] },
+				policy: 'c',
+			});
+			await transactor.commit({ actionId: 'init' as ActionId, blockIds: [blockId], tailId: blockId, rev: 1 });
+
+			// Create a pending action on the same block
+			await transactor.pend({
+				actionId: 'pending-tx' as ActionId,
+				transforms: { inserts: {}, updates: { [blockId]: [['data', 0, 0, 'modified']] }, deletes: [] },
+				policy: 'c',
+				rev: 2,
+			});
+
+			// tryGet returns the committed block, but does NOT record/propagate the pending info
+			const block = await src.tryGet(blockId);
+			expect(block).to.not.be.undefined;
+			expect((block as any).data).to.equal('orig');
+
+			// The TODO at line 29 of transactor-source.ts means: pending state is ignored
+			// A subsequent transact could conflict with this untracked pending action
+			const result = await src.transact(
+				{ inserts: {}, updates: { [blockId]: [['data', 0, 0, 'my-update']] }, deletes: [] },
+				generateActionId(),
+				2,
+				blockId,
+				blockId,
+			);
+			// transact uses policy 'r', so it returns the pending conflicts instead of failing
+			expect(result).to.not.be.undefined;
+			expect(result!.success).to.be.false;
+			expect((result as any).pending, 'should report the untracked pending action').to.be.an('array').that.is.not.empty;
+		});
+	});
 })

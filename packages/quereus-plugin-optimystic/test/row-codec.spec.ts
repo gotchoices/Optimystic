@@ -240,6 +240,163 @@ describe('RowCodec', () => {
 		});
 	});
 
+	describe('key serialization edge cases', () => {
+		it('should collide when key contains \\x00 separator (known bug)', () => {
+			// BUG: Composite keys using \x00 as separator have no escaping.
+			// A key value containing \x00 causes collision during comparison.
+			const schema = makeSchema(
+				[{ name: 'a', affinity: 'TEXT' }, { name: 'b', affinity: 'TEXT' }],
+				[0, 1]
+			);
+			const codec = new RowCodec(schema);
+			const cmp = codec.createPrimaryKeyComparator();
+
+			// ('foo\x00bar', 'baz') serializes to 'foo\x00bar\x00baz'
+			// ('foo', 'bar') serializes to 'foo\x00bar'
+			// On split, the first becomes ['foo', 'bar', 'baz'] — 3 parts for a 2-part key
+			const pk1 = codec.extractPrimaryKey(['foo\x00bar', 'baz']);
+			const pk2 = codec.extractPrimaryKey(['foo', 'bar']);
+			// These are different rows but collide after the first 2 parts are compared
+			expect(cmp(pk1, pk2)).to.equal(0); // BUG: should not be equal
+		});
+
+		it('should lose text affinity for numeric-looking strings (known bug)', () => {
+			// BUG: deserializeKeyPart() always tries Number() first, ignoring column affinity.
+			// TEXT "123" is deserialized as number 123, so comparator uses numeric ordering.
+			const textSchema = makeSchema([{ name: 'id', affinity: 'TEXT' }]);
+			const textCodec = new RowCodec(textSchema);
+			const textCmp = textCodec.createPrimaryKeyComparator();
+
+			const intSchema = makeSchema([{ name: 'id', affinity: 'INTEGER' }]);
+			const intCodec = new RowCodec(intSchema);
+			const intCmp = intCodec.createPrimaryKeyComparator();
+
+			// TEXT column: "123" vs "9" — should be lexicographic ("1" < "9"), but...
+			expect(textCmp('123', '9')).to.be.above(0); // BUG: numeric comparison used
+			// INTEGER column: 123 vs 9 — correctly numeric
+			expect(intCmp('123', '9')).to.be.above(0);
+		});
+
+		it('should sort negative numbers correctly', () => {
+			const schema = makeSchema([{ name: 'id', affinity: 'INTEGER' }]);
+			const codec = new RowCodec(schema);
+			const cmp = codec.createPrimaryKeyComparator();
+
+			// -10 < -2 < 0 < 5
+			expect(cmp('-10', '-2')).to.be.below(0);
+			expect(cmp('-2', '0')).to.be.below(0);
+			expect(cmp('0', '5')).to.be.below(0);
+			expect(cmp('-10', '5')).to.be.below(0);
+		});
+
+		it('should handle NaN in key serialization', () => {
+			const schema = makeSchema([{ name: 'id', affinity: 'REAL' }]);
+			const codec = new RowCodec(schema);
+
+			// NaN.toString() === "NaN"
+			// deserializeKeyPart("NaN") → Number("NaN") is NaN, isNaN(NaN) is true
+			// so it falls through to string — type confusion
+			const pk = codec.extractPrimaryKey([NaN]);
+			expect(pk).to.equal('NaN');
+
+			// But comparator should handle NaN keys consistently
+			const cmp = codec.createPrimaryKeyComparator();
+			// NaN compared to anything should be consistent (not crash)
+			expect(() => cmp('NaN', '5')).to.not.throw();
+		});
+
+		it('should handle Infinity and -Infinity in keys', () => {
+			const schema = makeSchema([{ name: 'id', affinity: 'REAL' }]);
+			const codec = new RowCodec(schema);
+
+			const posPk = codec.extractPrimaryKey([Infinity]);
+			const negPk = codec.extractPrimaryKey([-Infinity]);
+
+			expect(posPk).to.equal('Infinity');
+			expect(negPk).to.equal('-Infinity');
+
+			// deserializeKeyPart("Infinity") → Number("Infinity") → Infinity (a number)
+			// This actually works for comparison, but let's verify
+			const cmp = codec.createPrimaryKeyComparator();
+			expect(cmp(negPk, '0')).to.be.below(0);
+			expect(cmp('0', posPk)).to.be.below(0);
+			expect(cmp(negPk, posPk)).to.be.below(0);
+		});
+
+		it('should handle empty string as a key value', () => {
+			const schema = makeSchema([{ name: 'id', affinity: 'TEXT' }]);
+			const codec = new RowCodec(schema);
+
+			// Empty string key — serializeKeyPart returns ""
+			// deserializeKeyPart("") → Number("") is 0, isNaN(0) is false, "" !== ""... wait
+			// Actually: Number("") === 0, isNaN(0) === false, but serialized !== '' check:
+			// the condition is `!isNaN(num) && serialized !== ''` — so empty string stays as string
+			const pk = codec.extractPrimaryKey(['']);
+			expect(pk).to.equal('');
+		});
+
+		it('should handle empty string in composite key without confusing split', () => {
+			const schema = makeSchema(
+				[{ name: 'a', affinity: 'TEXT' }, { name: 'b', affinity: 'TEXT' }],
+				[0, 1]
+			);
+			const codec = new RowCodec(schema);
+
+			// ('', 'x') → '\x00x', ('x', '') → 'x\x00'
+			const pk1 = codec.extractPrimaryKey(['', 'x']);
+			const pk2 = codec.extractPrimaryKey(['x', '']);
+
+			const cmp = codec.createPrimaryKeyComparator();
+			expect(cmp(pk1, pk2)).to.not.equal(0);
+		});
+
+		it('should treat whitespace-only string as number 0 (known bug)', () => {
+			// BUG: Number(" ") === 0, so deserializeKeyPart treats space as 0
+			const schema = makeSchema([{ name: 'id', affinity: 'TEXT' }]);
+			const codec = new RowCodec(schema);
+			const cmp = codec.createPrimaryKeyComparator();
+
+			// Space key and "0" key should be different, but both deserialize to 0
+			expect(cmp(' ', '0')).to.equal(0); // BUG: space becomes number 0
+		});
+
+		it('should collide \\x01NULL\\x01 literal with actual null (known bug)', () => {
+			// BUG: The NULL sentinel '\x01NULL\x01' has no escaping mechanism.
+			// A literal string value of '\x01NULL\x01' is indistinguishable from null.
+			const schema = makeSchema([{ name: 'id', affinity: 'TEXT' }]);
+			const codec = new RowCodec(schema);
+
+			const nullPk = codec.extractPrimaryKey([null]);
+			const literalPk = codec.extractPrimaryKey(['\x01NULL\x01']);
+			expect(nullPk).to.equal(literalPk); // BUG: collision
+		});
+
+		it('should treat scientific notation "1e2" as number 100 (known bug)', () => {
+			// BUG: deserializeKeyPart("1e2") → Number("1e2") → 100
+			// TEXT column with key "1e2" becomes indistinguishable from "100"
+			const schema = makeSchema([{ name: 'id', affinity: 'TEXT' }]);
+			const codec = new RowCodec(schema);
+			const cmp = codec.createPrimaryKeyComparator();
+
+			expect(cmp('1e2', '100')).to.equal(0); // BUG: "1e2" treated as number 100
+		});
+
+		it('should handle hex strings like "0xff" in key deserialization', () => {
+			const schema = makeSchema([{ name: 'id', affinity: 'TEXT' }]);
+			const codec = new RowCodec(schema);
+
+			// "0xff" → Number("0xff") === 255
+			// So deserializeKeyPart will treat "0xff" as the number 255
+			const cmp = codec.createPrimaryKeyComparator();
+
+			// For a TEXT column, "0xff" should sort as text, not as 255
+			// "0xff" vs "256" — lexicographic: "0" < "2", so "0xff" < "256"
+			// but if treated as numbers: 255 < 256
+			// The result happens to match but for the wrong reason
+			expect(cmp('0xff', '3')).to.not.equal(0);
+		});
+	});
+
 	describe('schema utilities', () => {
 		it('should report column count', () => {
 			const schema = makeSchema([{ name: 'a', affinity: 'TEXT' }, { name: 'b', affinity: 'TEXT' }]);

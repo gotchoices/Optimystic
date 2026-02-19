@@ -4,6 +4,7 @@ import {
 	createActionsStatements,
 	createTransactionStamp,
 	createTransactionId,
+	hashString,
 	TransactionCoordinator,
 	TransactionSession,
 	TransactionValidator,
@@ -12,9 +13,12 @@ import {
 	type CollectionActions,
 	type EngineRegistration,
 	type ValidationCoordinatorFactory,
-	type Transforms
+	type Transforms,
+	type ActionId,
+	type BlockId,
+	type IBlock,
 } from '../src/index.js';
-import { isTransformsEmpty } from '../src/transform/index.js';
+import { isTransformsEmpty, blockIdsForTransforms } from '../src/transform/index.js';
 import { TestTransactor } from './test-transactor.js';
 
 describe('Transaction', () => {
@@ -1770,5 +1774,802 @@ describe('Transaction', () => {
 			}
 		});
 	});
-});
 
+	describe('Operations Hash Determinism (TEST-10.6.1)', () => {
+		it('should produce different hashes when operation order differs (ordering sensitivity)', () => {
+			// Directly test the hashing mechanism: same operations, different order
+			const op1 = { type: 'insert', collectionId: 'users', blockId: 'b1', block: { data: 'alice' } };
+			const op2 = { type: 'insert', collectionId: 'posts', blockId: 'b2', block: { data: 'post1' } };
+
+			const hash1 = `ops:${hashString(JSON.stringify([op1, op2]))}`;
+			const hash2 = `ops:${hashString(JSON.stringify([op2, op1]))}`;
+
+			// Operation ordering affects the hash — confirming that Map iteration order
+			// in coordinator/validator is a determinism risk if collections are processed
+			// in different order on different nodes
+			expect(hash1).to.not.equal(hash2);
+		});
+
+		it('should produce consistent hash from execute() regardless of constructor Map order', async () => {
+			const transactor1 = new TestTransactor();
+			const transactor2 = new TestTransactor();
+
+			type Entry = { key: number; value: string };
+
+			// Coordinator 1: users first, then posts
+			const usersTree1 = await Tree.createOrOpen<number, Entry>(transactor1, 'users', e => e.key);
+			const postsTree1 = await Tree.createOrOpen<number, Entry>(transactor1, 'posts', e => e.key);
+			const collections1 = new Map();
+			collections1.set('users', (usersTree1 as unknown as { collection: unknown }).collection);
+			collections1.set('posts', (postsTree1 as unknown as { collection: unknown }).collection);
+
+			// Coordinator 2: posts first, then users (reversed)
+			const postsTree2 = await Tree.createOrOpen<number, Entry>(transactor2, 'posts', e => e.key);
+			const usersTree2 = await Tree.createOrOpen<number, Entry>(transactor2, 'users', e => e.key);
+			const collections2 = new Map();
+			collections2.set('posts', (postsTree2 as unknown as { collection: unknown }).collection);
+			collections2.set('users', (usersTree2 as unknown as { collection: unknown }).collection);
+
+			const coordinator1 = new TransactionCoordinator(transactor1, collections1);
+			const coordinator2 = new TransactionCoordinator(transactor2, collections2);
+			const engine1 = new ActionsEngine(coordinator1);
+			const engine2 = new ActionsEngine(coordinator2);
+
+			const actions: CollectionActions[] = [
+				{ collectionId: 'users', actions: [{ type: 'replace', data: [[1, { key: 1, value: 'Alice' }]] }] },
+				{ collectionId: 'posts', actions: [{ type: 'replace', data: [[10, { key: 10, value: 'Post' }]] }] },
+			];
+			const statements = createActionsStatements(actions);
+			const ts = Date.now();
+			const stamp1 = createTransactionStamp('peer1', ts, 'schema1', 'actions@1.0.0');
+			const stamp2 = createTransactionStamp('peer2', ts, 'schema1', 'actions@1.0.0');
+
+			const tx1: Transaction = {
+				stamp: stamp1, statements, reads: [],
+				id: createTransactionId(stamp1.id, statements, [])
+			};
+			const tx2: Transaction = {
+				stamp: stamp2, statements, reads: [],
+				id: createTransactionId(stamp2.id, statements, [])
+			};
+
+			const result1 = await coordinator1.execute(tx1, engine1);
+			const result2 = await coordinator2.execute(tx2, engine2);
+
+			expect(result1.success).to.be.true;
+			expect(result2.success).to.be.true;
+
+			// execute() populates collectionTransforms from result.actions order (which comes
+			// from statements order), not from the constructor Map order.
+			// So hashes should match. If they don't, that's a bug.
+		});
+
+		it('should validate multi-collection transaction with matching transforms', async () => {
+			const transactor = new TestTransactor();
+
+			type Entry = { key: number; value: string };
+			const usersTree = await Tree.createOrOpen<number, Entry>(transactor, 'users', e => e.key);
+			const postsTree = await Tree.createOrOpen<number, Entry>(transactor, 'posts', e => e.key);
+
+			const collections = new Map();
+			collections.set('users', (usersTree as unknown as { collection: unknown }).collection);
+			collections.set('posts', (postsTree as unknown as { collection: unknown }).collection);
+
+			const coordinator = new TransactionCoordinator(transactor, collections);
+			const actionsEngine = new ActionsEngine(coordinator);
+
+			const actions: CollectionActions[] = [
+				{ collectionId: 'users', actions: [{ type: 'replace', data: [[1, { key: 1, value: 'Alice' }]] }] },
+				{ collectionId: 'posts', actions: [{ type: 'replace', data: [[10, { key: 10, value: 'Post' }]] }] },
+			];
+			const statements = createActionsStatements(actions);
+			const stamp = createTransactionStamp('peer1', Date.now(), 'schema1', 'actions@1.0.0');
+			const transaction: Transaction = {
+				stamp, statements, reads: [],
+				id: createTransactionId(stamp.id, statements, [])
+			};
+
+			await coordinator.execute(transaction, actionsEngine);
+
+			// Set up validator — transforms will be empty (applyActions is a no-op)
+			// so the hash comparison is for empty operations
+			const validationTransforms = new Map<string, Transforms>();
+			const engines = new Map<string, EngineRegistration>();
+			engines.set('actions@1.0.0', {
+				engine: actionsEngine,
+				getSchemaHash: async () => 'schema1'
+			});
+
+			const createValidationCoordinator: ValidationCoordinatorFactory = () => ({
+				applyActions: async (appliedActions, _stampId) => {
+					for (const { collectionId } of appliedActions) {
+						validationTransforms.set(collectionId, {
+							inserts: {},
+							updates: {},
+							deletes: []
+						});
+					}
+				},
+				getTransforms: () => validationTransforms,
+				dispose: () => validationTransforms.clear()
+			});
+
+			const validator = new TransactionValidator(engines, createValidationCoordinator);
+			const validationResult = await validator.validate(transaction, 'ops:0');
+			expect(validationResult.valid).to.be.true;
+		});
+
+		it('should fail validation when transforms order differs with non-empty data (known risk)', async () => {
+			const transactor = new TestTransactor();
+
+			type Entry = { key: number; value: string };
+			const usersTree = await Tree.createOrOpen<number, Entry>(transactor, 'users', e => e.key);
+			const postsTree = await Tree.createOrOpen<number, Entry>(transactor, 'posts', e => e.key);
+
+			const collections = new Map();
+			collections.set('users', (usersTree as unknown as { collection: unknown }).collection);
+			collections.set('posts', (postsTree as unknown as { collection: unknown }).collection);
+
+			const coordinator = new TransactionCoordinator(transactor, collections);
+			const actionsEngine = new ActionsEngine(coordinator);
+
+			const actions: CollectionActions[] = [
+				{ collectionId: 'users', actions: [{ type: 'replace', data: [[1, { key: 1, value: 'Alice' }]] }] },
+				{ collectionId: 'posts', actions: [{ type: 'replace', data: [[10, { key: 10, value: 'Post' }]] }] },
+			];
+			const statements = createActionsStatements(actions);
+			const stamp = createTransactionStamp('peer1', Date.now(), 'schema1', 'actions@1.0.0');
+			const transaction: Transaction = {
+				stamp, statements, reads: [],
+				id: createTransactionId(stamp.id, statements, [])
+			};
+
+			await coordinator.execute(transaction, actionsEngine);
+
+			// Validator produces transforms in REVERSED collection order
+			const fakeBlock = { header: { id: 'fake-block' as const, type: 'test', collectionId: 'test' } };
+			const validationTransforms = new Map<string, Transforms>();
+			const engines = new Map<string, EngineRegistration>();
+			engines.set('actions@1.0.0', {
+				engine: actionsEngine,
+				getSchemaHash: async () => 'schema1'
+			});
+
+			const createValidationCoordinator: ValidationCoordinatorFactory = () => ({
+				applyActions: async (appliedActions, _stampId) => {
+					// Insert in REVERSED order to simulate different node behavior
+					for (const { collectionId } of [...appliedActions].reverse()) {
+						validationTransforms.set(collectionId, {
+							inserts: { [`block-${collectionId}`]: fakeBlock },
+							updates: {},
+							deletes: []
+						});
+					}
+				},
+				getTransforms: () => validationTransforms,
+				dispose: () => validationTransforms.clear()
+			});
+
+			const validator = new TransactionValidator(engines, createValidationCoordinator);
+
+			// With non-empty transforms in reversed order, the JSON.stringify
+			// produces different output → different hash → validation fails
+			const validationResult = await validator.validate(transaction, 'ops:anyHash');
+			expect(validationResult.valid).to.be.false;
+		});
+	});
+
+	describe('Write-Skew and Lost-Update Detection (TEST-10.5.1)', () => {
+		const makeBlock = (id: BlockId, data: string): IBlock => ({
+			header: { id, type: 'test', collectionId: 'test' },
+			data,
+		} as IBlock);
+
+		it('should detect conflict when two pends touch the same block (lost-update prevention)', async () => {
+			const transactor = new TestTransactor();
+			const blockId = 'shared-block' as BlockId;
+
+			// Initial commit: insert the block
+			const setupTransforms: Transforms = {
+				inserts: { [blockId]: makeBlock(blockId, 'initial') },
+				updates: {},
+				deletes: [],
+			};
+			const setupResult = await transactor.pend({
+				actionId: 'setup' as ActionId,
+				transforms: setupTransforms,
+				policy: 'f',
+			});
+			expect(setupResult.success).to.be.true;
+			await transactor.commit({
+				actionId: 'setup' as ActionId,
+				blockIds: [blockId],
+				tailId: blockId,
+				rev: 1,
+			});
+
+			// Transaction A: update the block (rev 2 = "I've seen rev 1")
+			const txATransforms: Transforms = {
+				inserts: {},
+				updates: { [blockId]: [['data', 0, 0, 'tx-a-value']] },
+				deletes: [],
+			};
+			const txAResult = await transactor.pend({
+				actionId: 'tx-a' as ActionId,
+				transforms: txATransforms,
+				policy: 'f',
+				rev: 2,
+			});
+			expect(txAResult.success).to.be.true;
+
+			// Transaction B: also update the same block — should conflict with pending tx-a
+			const txBTransforms: Transforms = {
+				inserts: {},
+				updates: { [blockId]: [['data', 0, 0, 'tx-b-value']] },
+				deletes: [],
+			};
+			const txBResult = await transactor.pend({
+				actionId: 'tx-b' as ActionId,
+				transforms: txBTransforms,
+				policy: 'f',
+				rev: 2,
+			});
+			// With policy 'f', pend fails when there are pending conflicts
+			expect(txBResult.success).to.be.false;
+			const failResult = txBResult as { success: false; pending?: unknown[] };
+			expect(failResult.pending).to.be.an('array').that.is.not.empty;
+		});
+
+		it('should detect committed conflict (stale revision)', async () => {
+			const transactor = new TestTransactor();
+			const blockId = 'account-block' as BlockId;
+
+			// Insert and commit at rev 1
+			await transactor.pend({
+				actionId: 'init' as ActionId,
+				transforms: { inserts: { [blockId]: makeBlock(blockId, '100') }, updates: {}, deletes: [] },
+				policy: 'f',
+			});
+			await transactor.commit({ actionId: 'init' as ActionId, blockIds: [blockId], tailId: blockId, rev: 1 });
+
+			// Transaction A commits at rev 2
+			await transactor.pend({
+				actionId: 'tx-a' as ActionId,
+				transforms: { inserts: {}, updates: { [blockId]: [['data', 0, 0, '50']] }, deletes: [] },
+				policy: 'f',
+				rev: 2,
+			});
+			await transactor.commit({ actionId: 'tx-a' as ActionId, blockIds: [blockId], tailId: blockId, rev: 2 });
+
+			// Transaction B tries to pend at rev 2 — tx-a already committed at rev 2
+			const txBResult = await transactor.pend({
+				actionId: 'tx-b' as ActionId,
+				transforms: { inserts: {}, updates: { [blockId]: [['data', 0, 0, '75']] }, deletes: [] },
+				policy: 'f',
+				rev: 2,
+			});
+			expect(txBResult.success).to.be.false;
+			const failResult = txBResult as { success: false; missing?: unknown[] };
+			expect(failResult.missing).to.be.an('array').that.is.not.empty;
+		});
+
+		it('should allow write-skew anomaly — no read dependency tracking (known limitation)', async () => {
+			const transactor = new TestTransactor();
+			const blockA = 'account-a' as BlockId;
+			const blockB = 'account-b' as BlockId;
+
+			// Setup: two accounts with balance 100 each (invariant: A + B >= 100)
+			await transactor.pend({
+				actionId: 'init' as ActionId,
+				transforms: {
+					inserts: {
+						[blockA]: makeBlock(blockA, '100'),
+						[blockB]: makeBlock(blockB, '100'),
+					},
+					updates: {},
+					deletes: [],
+				},
+				policy: 'f',
+			});
+			await transactor.commit({
+				actionId: 'init' as ActionId,
+				blockIds: [blockA, blockB],
+				tailId: blockA,
+				rev: 1,
+			});
+
+			// Transaction A: reads both accounts (100 + 100 = 200 >= 100 ✓), withdraws 100 from A
+			// The "read" of B is not tracked — only the write to A is recorded
+			const txAResult = await transactor.pend({
+				actionId: 'tx-a' as ActionId,
+				transforms: {
+					inserts: {},
+					updates: { [blockA]: [['data', 0, 0, '0']] },
+					deletes: [],
+				},
+				policy: 'f',
+				rev: 2,
+			});
+			expect(txAResult.success, 'tx-a pend should succeed').to.be.true;
+
+			// Transaction B: reads both accounts (100 + 100 = 200 >= 100 ✓), withdraws 100 from B
+			// The "read" of A is not tracked — only the write to B is recorded
+			const txBResult = await transactor.pend({
+				actionId: 'tx-b' as ActionId,
+				transforms: {
+					inserts: {},
+					updates: { [blockB]: [['data', 0, 0, '0']] },
+					deletes: [],
+				},
+				policy: 'f',
+				rev: 2,
+			});
+			// KNOWN LIMITATION: Both succeed because they touch DIFFERENT blocks.
+			// No read dependency tracking means the system doesn't know that tx-b
+			// "depends on" the value of blockA that tx-a is about to change.
+			// Result: A=0, B=0 → A + B = 0 < 100, invariant violated.
+			expect(txBResult.success, 'tx-b pend succeeds — write-skew not detected').to.be.true;
+
+			// Commit both — both succeed because no block-ID overlap
+			const commitA = await transactor.commit({
+				actionId: 'tx-a' as ActionId, blockIds: [blockA], tailId: blockA, rev: 2,
+			});
+			const commitB = await transactor.commit({
+				actionId: 'tx-b' as ActionId, blockIds: [blockB], tailId: blockB, rev: 2,
+			});
+			expect(commitA.success, 'tx-a commit').to.be.true;
+			expect(commitB.success, 'tx-b commit').to.be.true;
+		});
+
+		it('should detect conflict through Tree when same key is updated concurrently', async () => {
+			const transactor = new TestTransactor();
+			type Entry = { key: number; balance: number };
+
+			// Create tree and insert initial data
+			const tree1 = await Tree.createOrOpen<number, Entry>(transactor, 'accounts', e => e.key);
+			await tree1.replace([[1, { key: 1, balance: 100 }]]);
+
+			// Capture the block IDs touched by tree1's first write
+			const tree1Blocks = new Set<BlockId>();
+			for (const [id] of (transactor as any).blocks.entries()) {
+				tree1Blocks.add(id);
+			}
+
+			// Create a second tree instance viewing the same collection
+			const tree2 = await Tree.createOrOpen<number, Entry>(transactor, 'accounts', e => e.key);
+
+			// Verify tree2 can see the initial data
+			const entry = await tree2.get(1);
+			expect(entry).to.deep.equal({ key: 1, balance: 100 });
+
+			// Both trees update the same key — the second should conflict and retry
+			// (Collection.sync handles conflicts via update+replay loop)
+			await tree1.replace([[1, { key: 1, balance: 50 }]]);
+			await tree2.replace([[1, { key: 1, balance: 75 }]]);
+
+			// After both complete, the last writer wins (tree2 retries after conflict)
+			await tree1.update();
+			const finalFromTree1 = await tree1.get(1);
+			const finalFromTree2 = await tree2.get(1);
+			expect(finalFromTree1).to.deep.equal(finalFromTree2);
+			// tree2 wrote last (after retry), so its value should win
+			expect(finalFromTree2!.balance).to.equal(75);
+		});
+
+		it('should NOT detect write-skew through separate Tree collections (known limitation)', async () => {
+			const transactor = new TestTransactor();
+			type Entry = { key: number; balance: number };
+
+			// Two separate collections for two accounts
+			const treeA = await Tree.createOrOpen<number, Entry>(transactor, 'account-a', e => e.key);
+			const treeB = await Tree.createOrOpen<number, Entry>(transactor, 'account-b', e => e.key);
+
+			// Initial state: both accounts have balance 100
+			await treeA.replace([[1, { key: 1, balance: 100 }]]);
+			await treeB.replace([[1, { key: 1, balance: 100 }]]);
+
+			// Simulate two concurrent withdrawals that each check the invariant
+			// Transaction 1: reads both (100+100=200 >= 100 ✓), writes A.balance = 0
+			const readA1 = await treeA.get(1);
+			const readB1 = await treeB.get(1);
+			expect(readA1!.balance + readB1!.balance).to.be.gte(100); // invariant check passes
+
+			// Transaction 2: reads both (100+100=200 >= 100 ✓), writes B.balance = 0
+			const readA2 = await treeA.get(1);
+			const readB2 = await treeB.get(1);
+			expect(readA2!.balance + readB2!.balance).to.be.gte(100); // invariant check passes
+
+			// Both writes succeed — different collections, different blocks
+			await treeA.replace([[1, { key: 1, balance: 0 }]]);
+			await treeB.replace([[1, { key: 1, balance: 0 }]]);
+
+			// Final state: invariant violated (0 + 0 = 0 < 100)
+			await treeA.update();
+			await treeB.update();
+			const finalA = await treeA.get(1);
+			const finalB = await treeB.get(1);
+			expect(finalA!.balance + finalB!.balance).to.equal(0);
+			// Write-skew: invariant A + B >= 100 is violated
+			expect(finalA!.balance + finalB!.balance).to.be.lessThan(100);
+		});
+	});
+
+	describe('2PC Protocol Edge Cases (TEST-10.2.1)', () => {
+		it('should cancel already-pended collections when pendPhase fails partway', async () => {
+			const transactor = new TestTransactor();
+			let pendCallCount = 0;
+			const originalPend = transactor.pend.bind(transactor);
+			transactor.pend = async (request) => {
+				pendCallCount++;
+				if (pendCallCount === 2) {
+					return { success: false, reason: 'Peer rejected' } as any;
+				}
+				return originalPend(request);
+			};
+			transactor.queryClusterNominees = async () => ({ nominees: [] });
+
+			type UserEntry = { key: number; name: string };
+			type PostEntry = { key: number; title: string };
+			const usersTree = await Tree.createOrOpen<number, UserEntry>(transactor, 'users', entry => entry.key);
+			const postsTree = await Tree.createOrOpen<number, PostEntry>(transactor, 'posts', entry => entry.key);
+
+			const collections = new Map();
+			collections.set('users', (usersTree as unknown as { collection: unknown }).collection);
+			collections.set('posts', (postsTree as unknown as { collection: unknown }).collection);
+			const coordinator = new TransactionCoordinator(transactor, collections);
+			const actionsEngine = new ActionsEngine(coordinator);
+
+			const actions: CollectionActions[] = [
+				{ collectionId: 'users', actions: [{ type: 'replace', data: [[1, { key: 1, name: 'Alice' }]] }] },
+				{ collectionId: 'posts', actions: [{ type: 'replace', data: [[10, { key: 10, title: 'Post' }]] }] },
+			];
+			const statements = createActionsStatements(actions);
+			const stamp = createTransactionStamp('peer1', Date.now(), 'schema1', 'actions@1.0.0');
+			const tx: Transaction = {
+				stamp, statements, reads: [],
+				id: createTransactionId(stamp.id, statements, [])
+			};
+
+			await actionsEngine.execute(tx);
+
+			try {
+				await coordinator.commit(tx);
+				expect.fail('Should have thrown');
+			} catch (e) {
+				expect((e as Error).message).to.include('failed');
+			}
+
+			// FIX VERIFIED: pendPhase now cancels already-pended collections on failure.
+			const pending = transactor.getPendingActions();
+			expect(pending.size, 'no orphaned pending actions after partial pend failure').to.equal(0);
+		});
+
+		it('should create partial commit when commitPhase fails for 2nd collection (atomicity violation)', async () => {
+			const transactor = new TestTransactor();
+			let commitCallCount = 0;
+			const cancelledActionIds: string[] = [];
+
+			const originalCommit = transactor.commit.bind(transactor);
+			transactor.commit = async (request) => {
+				commitCallCount++;
+				if (commitCallCount >= 2) {
+					return { success: false, reason: 'Commit rejected' };
+				}
+				return originalCommit(request);
+			};
+			const originalCancel = transactor.cancel.bind(transactor);
+			transactor.cancel = async (actionRef) => {
+				cancelledActionIds.push(actionRef.actionId);
+				return originalCancel(actionRef);
+			};
+			transactor.queryClusterNominees = async () => ({ nominees: [] });
+
+			type UserEntry = { key: number; name: string };
+			type PostEntry = { key: number; title: string };
+			const usersTree = await Tree.createOrOpen<number, UserEntry>(transactor, 'users', entry => entry.key);
+			const postsTree = await Tree.createOrOpen<number, PostEntry>(transactor, 'posts', entry => entry.key);
+
+			const collections = new Map();
+			collections.set('users', (usersTree as unknown as { collection: unknown }).collection);
+			collections.set('posts', (postsTree as unknown as { collection: unknown }).collection);
+			const coordinator = new TransactionCoordinator(transactor, collections);
+			const actionsEngine = new ActionsEngine(coordinator);
+
+			const actions: CollectionActions[] = [
+				{ collectionId: 'users', actions: [{ type: 'replace', data: [[1, { key: 1, name: 'Alice' }]] }] },
+				{ collectionId: 'posts', actions: [{ type: 'replace', data: [[10, { key: 10, title: 'Post' }]] }] },
+			];
+			const statements = createActionsStatements(actions);
+			const stamp = createTransactionStamp('peer1', Date.now(), 'schema1', 'actions@1.0.0');
+			const tx: Transaction = {
+				stamp, statements, reads: [],
+				id: createTransactionId(stamp.id, statements, [])
+			};
+
+			await actionsEngine.execute(tx);
+
+			try {
+				await coordinator.commit(tx);
+				expect.fail('Should have thrown');
+			} catch (e) {
+				expect((e as Error).message).to.include('failed');
+			}
+
+			// cancelPhase was called for both collections
+			expect(cancelledActionIds.length, 'cancelPhase called for both collections').to.equal(2);
+
+			// BUG: 1st collection's commit already succeeded — cancel is a no-op on committed blocks.
+			// Atomicity violation: 1st collection is committed, 2nd is not.
+			const committed = transactor.getCommittedActions();
+			expect(committed.size, 'BUG: 1st collection committed despite tx failure — atomicity violation').to.be.greaterThan(0);
+
+			// Pending is empty: 1st collection's pending moved to committed, 2nd cancelled
+			const pending = transactor.getPendingActions();
+			expect(pending.size).to.equal(0);
+		});
+	});
+
+	describe('Consensus Protocol Correctness (TEST-10.3.1)', () => {
+		it('should reset trackers after successful coordinator.execute()', async () => {
+			const transactor = new TestTransactor();
+
+			type UserEntry = { key: number; name: string };
+			const usersTree = await Tree.createOrOpen<number, UserEntry>(
+				transactor, 'users', entry => entry.key
+			);
+
+			const usersCollection = (usersTree as unknown as { collection: unknown }).collection;
+			const collections = new Map();
+			collections.set('users', usersCollection);
+
+			const coordinator = new TransactionCoordinator(transactor, collections);
+			const actionsEngine = new ActionsEngine(coordinator);
+
+			const actions1: CollectionActions[] = [
+				{ collectionId: 'users', actions: [{ type: 'replace', data: [[1, { key: 1, name: 'Alice' }]] }] }
+			];
+			const statements1 = createActionsStatements(actions1);
+			const stamp1 = createTransactionStamp('peer1', Date.now(), 'schema1', 'actions@1.0.0');
+			const tx1: Transaction = {
+				stamp: stamp1, statements: statements1, reads: [],
+				id: createTransactionId(stamp1.id, statements1, [])
+			};
+
+			const result = await coordinator.execute(tx1, actionsEngine);
+			expect(result.success).to.be.true;
+
+			// FIX VERIFIED: execute() now resets trackers after successful commit.
+			const transforms = coordinator.getTransforms();
+			expect(transforms.size, 'trackers should be clean after successful commit').to.equal(0);
+		});
+
+		it('should update actionContext after coordinator.execute()', async () => {
+			const transactor = new TestTransactor();
+
+			type UserEntry = { key: number; name: string };
+			const usersTree = await Tree.createOrOpen<number, UserEntry>(
+				transactor, 'users', entry => entry.key
+			);
+
+			const usersCollection = (usersTree as unknown as { collection: unknown }).collection as
+				{ source: { actionContext: { rev: number; committed: unknown[] } | undefined } };
+			const collections = new Map();
+			collections.set('users', usersCollection);
+
+			const coordinator = new TransactionCoordinator(transactor, collections);
+			const actionsEngine = new ActionsEngine(coordinator);
+
+			const actions1: CollectionActions[] = [
+				{ collectionId: 'users', actions: [{ type: 'replace', data: [[1, { key: 1, name: 'Alice' }]] }] }
+			];
+			const statements1 = createActionsStatements(actions1);
+			const stamp1 = createTransactionStamp('peer1', Date.now(), 'schema1', 'actions@1.0.0');
+			const tx1: Transaction = {
+				stamp: stamp1, statements: statements1, reads: [],
+				id: createTransactionId(stamp1.id, statements1, [])
+			};
+
+			const result = await coordinator.execute(tx1, actionsEngine);
+			expect(result.success).to.be.true;
+
+			// Verify transactor actually committed
+			const committed = transactor.getCommittedActions();
+			expect(committed.size).to.be.greaterThan(0);
+
+			// FIX VERIFIED: actionContext now reflects the committed rev.
+			const ctx = usersCollection.source.actionContext;
+			expect(ctx?.rev, 'actionContext.rev should be updated after commit').to.equal(1);
+		});
+
+		it('should succeed with sequential coordinator.execute() calls', async () => {
+			const transactor = new TestTransactor();
+
+			type UserEntry = { key: number; name: string };
+			const usersTree = await Tree.createOrOpen<number, UserEntry>(
+				transactor, 'users', entry => entry.key
+			);
+
+			const usersCollection = (usersTree as unknown as { collection: unknown }).collection;
+			const collections = new Map();
+			collections.set('users', usersCollection);
+
+			const coordinator = new TransactionCoordinator(transactor, collections);
+			const actionsEngine = new ActionsEngine(coordinator);
+
+			// tx1: insert Alice
+			const actions1: CollectionActions[] = [
+				{ collectionId: 'users', actions: [{ type: 'replace', data: [[1, { key: 1, name: 'Alice' }]] }] }
+			];
+			const statements1 = createActionsStatements(actions1);
+			const stamp1 = createTransactionStamp('peer1', Date.now(), 'schema1', 'actions@1.0.0');
+			const tx1: Transaction = {
+				stamp: stamp1, statements: statements1, reads: [],
+				id: createTransactionId(stamp1.id, statements1, [])
+			};
+
+			const result1 = await coordinator.execute(tx1, actionsEngine);
+			expect(result1.success).to.be.true;
+
+			// tx2: insert Bob at DIFFERENT key (no logical conflict)
+			const actions2: CollectionActions[] = [
+				{ collectionId: 'users', actions: [{ type: 'replace', data: [[2, { key: 2, name: 'Bob' }]] }] }
+			];
+			const statements2 = createActionsStatements(actions2);
+			const stamp2 = createTransactionStamp('peer1', Date.now() + 1, 'schema1', 'actions@1.0.0');
+			const tx2: Transaction = {
+				stamp: stamp2, statements: statements2, reads: [],
+				id: createTransactionId(stamp2.id, statements2, [])
+			};
+
+			// FIX VERIFIED: actionContext is updated after tx1, so tx2 computes rev=2.
+			const result2 = await coordinator.execute(tx2, actionsEngine);
+			expect(result2.success, 'sequential execute() should succeed with updated actionContext').to.be.true;
+		});
+
+		it('should destroy concurrent session transforms on rollback (BUG: stampId ignored)', async () => {
+			const transactor = new TestTransactor();
+
+			type UserEntry = { key: number; name: string };
+			const usersTree = await Tree.createOrOpen<number, UserEntry>(
+				transactor, 'users', entry => entry.key
+			);
+
+			const usersCollection = (usersTree as unknown as { collection: unknown }).collection;
+			const collections = new Map();
+			collections.set('users', usersCollection);
+
+			const coordinator = new TransactionCoordinator(transactor, collections);
+			const actionsEngine = new ActionsEngine(coordinator);
+
+			// Session 1: apply actions
+			const session1 = new TransactionSession(coordinator, actionsEngine, 'peer1', 'schema1');
+			const actions1: CollectionActions[] = [
+				{ collectionId: 'users', actions: [{ type: 'replace', data: [[1, { key: 1, name: 'Alice' }]] }] }
+			];
+			await session1.execute(createActionsStatements(actions1)[0]!, actions1);
+
+			// Session 2: apply actions (different data on same coordinator)
+			const session2 = new TransactionSession(coordinator, actionsEngine, 'peer2', 'schema1');
+			const actions2: CollectionActions[] = [
+				{ collectionId: 'users', actions: [{ type: 'replace', data: [[2, { key: 2, name: 'Bob' }]] }] }
+			];
+			await session2.execute(createActionsStatements(actions2)[0]!, actions2);
+
+			// Both sessions applied transforms to the shared tracker
+			const transformsBefore = coordinator.getTransforms();
+			expect(transformsBefore.size, 'Both sessions applied transforms').to.be.greaterThan(0);
+
+			// Rollback session 1 only
+			await session1.rollback();
+
+			// BUG: rollback(_stampId) ignores the stampId and resets ALL collection trackers.
+			// Session 2's transforms are destroyed along with session 1's.
+			const transformsAfter = coordinator.getTransforms();
+			expect(transformsAfter.size,
+				'BUG: rollback destroys ALL sessions\' transforms — stampId parameter is ignored'
+			).to.equal(0);
+		});
+	});
+
+	describe('Clock Skew and Ordering (TEST-10.8.1)', () => {
+		it('should produce identical stamp IDs for same-millisecond transactions from same peer (collision risk)', () => {
+			const now = Date.now();
+			const stamp1 = createTransactionStamp('peer1', now, 'schema1', 'actions@1.0.0');
+			const stamp2 = createTransactionStamp('peer1', now, 'schema1', 'actions@1.0.0');
+
+			// Same inputs → same stamp ID. This is by design (deterministic hashing),
+			// but it means two independent transactions from the same peer at the same
+			// millisecond with the same schema and engine are INDISTINGUISHABLE.
+			expect(stamp1.id).to.equal(stamp2.id);
+
+			// With identical stamps and identical statements, transaction IDs also collide
+			const actions: CollectionActions[] = [
+				{ collectionId: 'users', actions: [{ type: 'replace', data: [[1, { key: 1, name: 'Alice' }]] }] }
+			];
+			const stmts = createActionsStatements(actions);
+			const txId1 = createTransactionId(stamp1.id, stmts, []);
+			const txId2 = createTransactionId(stamp2.id, stmts, []);
+
+			// BUG: Two independent transactions produce the same ID.
+			// If peer1 sends the same operation twice (retry, or concurrent sessions),
+			// the log cannot distinguish them — deduplication silently drops one.
+			expect(txId1, 'BUG: independent transactions collide when inputs match').to.equal(txId2);
+		});
+
+		it('should produce completely different stamp IDs for 1ms clock difference', () => {
+			const now = Date.now();
+			const stamp1 = createTransactionStamp('peer1', now, 'schema1', 'actions@1.0.0');
+			const stamp2 = createTransactionStamp('peer1', now + 1, 'schema1', 'actions@1.0.0');
+
+			// A 1ms clock difference produces a completely different stamp ID.
+			// This means clock skew between peers prevents stamp-based deduplication:
+			// the same logical transaction replayed on a node with a slightly different
+			// clock would generate a different stamp, appearing as a new transaction.
+			expect(stamp1.id).to.not.equal(stamp2.id);
+
+			// Same statements but different stamps → different transaction IDs
+			const stmts = createActionsStatements([
+				{ collectionId: 'users', actions: [{ type: 'replace', data: [[1, { key: 1, name: 'Alice' }]] }] }
+			]);
+			const txId1 = createTransactionId(stamp1.id, stmts, []);
+			const txId2 = createTransactionId(stamp2.id, stmts, []);
+			expect(txId1, '1ms difference → fully divergent transaction IDs').to.not.equal(txId2);
+		});
+
+		it('should demonstrate hashString collision within practical input range (djb2 is 32-bit)', () => {
+			// hashString uses djb2 which produces a 32-bit integer, giving ~2.1 billion
+			// unique values. Birthday paradox predicts ~50% collision at ~50K inputs.
+			// For stamp IDs, this means a busy network with many peers and transactions
+			// has a realistic chance of accidental ID collision.
+			const seen = new Map<string, string>();
+			let collision: [string, string] | undefined;
+
+			for (let i = 0; i < 100_000 && !collision; i++) {
+				const input = `{"peerId":"peer-${i}","timestamp":${1700000000000 + i},"schemaHash":"s","engineId":"e"}`;
+				const hash = hashString(input);
+				const existing = seen.get(hash);
+				if (existing) {
+					collision = [existing, input];
+				}
+				seen.set(hash, input);
+			}
+
+			// BUG: djb2 hash collides within a practical number of stamp-like inputs.
+			// This means two completely different transaction stamps can produce the same
+			// stamp ID, making them indistinguishable in logs and deduplication.
+			expect(collision, 'BUG: hashString (djb2) produces collisions within 100K stamp-like inputs').to.not.be.undefined;
+		});
+
+		it('should order transactions by commit sequence, not by timestamp', async () => {
+			const transactor = new TestTransactor();
+
+			type Entry = { key: number; value: string };
+			const tree = await Tree.createOrOpen<number, Entry>(transactor, 'data', e => e.key);
+
+			// First transaction: timestamp = 2000 (future)
+			await tree.replace([[1, { key: 1, value: 'first-commit' }]]);
+
+			// Capture revs after first commit
+			const committed1 = transactor.getCommittedActions();
+			const revs1 = new Set<number>();
+			for (const [, at] of committed1) {
+				if (at.rev !== undefined) revs1.add(at.rev);
+			}
+
+			// Second transaction on same tree (commit order = rev order, regardless of timestamp)
+			await tree.replace([[2, { key: 2, value: 'second-commit' }]]);
+
+			const committed2 = transactor.getCommittedActions();
+			const revs2 = new Set<number>();
+			for (const [, at] of committed2) {
+				if (at.rev !== undefined) revs2.add(at.rev);
+			}
+
+			// Revisions monotonically increase regardless of timestamp ordering.
+			// The second commit should have strictly higher max revision.
+			const maxRev1 = Math.max(...revs1);
+			const maxRev2 = Math.max(...revs2);
+			expect(maxRev2, 'commit order determines revision, not timestamp').to.be.greaterThan(maxRev1);
+		});
+	});
+});

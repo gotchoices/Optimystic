@@ -158,6 +158,157 @@ describe('QuereusEngine', () => {
 		});
 	});
 
+	describe('Schema hash cache staleness (TEST-7.1.2)', () => {
+		const mockCoordinator = {} as any;
+
+		it('should return stale hash after DDL without invalidation (known bug)', async () => {
+			const engine = new QuereusEngine(db, mockCoordinator);
+			const hash1 = await engine.getSchemaHash();
+
+			await db.exec(`
+				CREATE TABLE staleness_test (
+					id INTEGER PRIMARY KEY, name TEXT
+				) USING optimystic('tree://test/staleness')
+			`);
+
+			// BUG: hash is stale — no automatic DDL detection
+			const hash2 = await engine.getSchemaHash();
+			expect(hash2).to.equal(hash1);
+
+			engine.invalidateSchemaCache();
+			const hash3 = await engine.getSchemaHash();
+			expect(hash3).to.not.equal(hash1);
+		});
+
+		it('should accumulate staleness across multiple DDL operations (known bug)', async () => {
+			const engine = new QuereusEngine(db, mockCoordinator);
+			const hash1 = await engine.getSchemaHash();
+
+			await db.exec(`CREATE TABLE t1 (id INTEGER PRIMARY KEY) USING optimystic('tree://test/t1')`);
+			await db.exec(`CREATE TABLE t2 (id INTEGER PRIMARY KEY) USING optimystic('tree://test/t2')`);
+
+			// Still returns original hash — stale through two DDL changes
+			const hash2 = await engine.getSchemaHash();
+			expect(hash2).to.equal(hash1);
+
+			engine.invalidateSchemaCache();
+			const hash3 = await engine.getSchemaHash();
+			expect(hash3).to.not.equal(hash1);
+		});
+	});
+
+	describe('Schema hash determinism (TEST-7.2.1)', () => {
+		const mockCoordinator = {} as any;
+
+		function createFreshDb() {
+			const freshDb = new Database();
+			const plugin = register(freshDb, {
+				default_transactor: 'test',
+				default_key_network: 'test',
+				enable_cache: false,
+			});
+			for (const vtable of plugin.vtables) {
+				freshDb.registerModule(vtable.name, vtable.module, vtable.auxData);
+			}
+			for (const func of plugin.functions) {
+				freshDb.registerFunction(func.schema);
+			}
+			return freshDb;
+		}
+
+		it('should produce identical hash for two databases with identical schema', async () => {
+			await db.exec(`
+				CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT NOT NULL, email TEXT)
+				USING optimystic('tree://test/users')
+			`);
+			const engine1 = new QuereusEngine(db, mockCoordinator);
+			engine1.invalidateSchemaCache();
+			const hash1 = await engine1.getSchemaHash();
+
+			const db2 = createFreshDb();
+			await db2.exec(`
+				CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT NOT NULL, email TEXT)
+				USING optimystic('tree://test/users')
+			`);
+			const engine2 = new QuereusEngine(db2, mockCoordinator);
+			engine2.invalidateSchemaCache();
+			const hash2 = await engine2.getSchemaHash();
+
+			expect(hash1).to.equal(hash2);
+		});
+
+		it('should produce same hash regardless of table creation order', async () => {
+			await db.exec(`CREATE TABLE aaa (id INTEGER PRIMARY KEY) USING optimystic('tree://test/aaa')`);
+			await db.exec(`CREATE TABLE zzz (id INTEGER PRIMARY KEY) USING optimystic('tree://test/zzz')`);
+			const engine1 = new QuereusEngine(db, mockCoordinator);
+			engine1.invalidateSchemaCache();
+			const hash1 = await engine1.getSchemaHash();
+
+			const db2 = createFreshDb();
+			await db2.exec(`CREATE TABLE zzz (id INTEGER PRIMARY KEY) USING optimystic('tree://test/zzz')`);
+			await db2.exec(`CREATE TABLE aaa (id INTEGER PRIMARY KEY) USING optimystic('tree://test/aaa')`);
+			const engine2 = new QuereusEngine(db2, mockCoordinator);
+			engine2.invalidateSchemaCache();
+			const hash2 = await engine2.getSchemaHash();
+
+			// ORDER BY type, name in computeSchemaHash should make this deterministic
+			expect(hash1).to.equal(hash2);
+		});
+
+		it('should detect column type difference', async () => {
+			await db.exec(`CREATE TABLE typed (id INTEGER PRIMARY KEY, value TEXT) USING optimystic('tree://test/typed')`);
+			const engine1 = new QuereusEngine(db, mockCoordinator);
+			engine1.invalidateSchemaCache();
+			const hash1 = await engine1.getSchemaHash();
+
+			const db2 = createFreshDb();
+			await db2.exec(`CREATE TABLE typed (id INTEGER PRIMARY KEY, value INTEGER) USING optimystic('tree://test/typed')`);
+			const engine2 = new QuereusEngine(db2, mockCoordinator);
+			engine2.invalidateSchemaCache();
+			const hash2 = await engine2.getSchemaHash();
+
+			expect(hash1).to.not.equal(hash2);
+		});
+
+		it('should include vtabArgs in hash — different tree URIs produce different hashes', async () => {
+			await db.exec(`CREATE TABLE t (id INTEGER PRIMARY KEY) USING optimystic('tree://app1/data')`);
+			const engine1 = new QuereusEngine(db, mockCoordinator);
+			engine1.invalidateSchemaCache();
+			const hash1 = await engine1.getSchemaHash();
+
+			const db2 = createFreshDb();
+			await db2.exec(`CREATE TABLE t (id INTEGER PRIMARY KEY) USING optimystic('tree://app2/data')`);
+			const engine2 = new QuereusEngine(db2, mockCoordinator);
+			engine2.invalidateSchemaCache();
+			const hash2 = await engine2.getSchemaHash();
+
+			// vtabArgs are in the sql column from schema(), so different URIs → different hashes.
+			// This means validators MUST have matching vtab configs, not just matching columns.
+			expect(hash1).to.not.equal(hash2);
+		});
+
+		it('should include functions in hash — extra function registration changes hash', async () => {
+			const engine1 = new QuereusEngine(db, mockCoordinator);
+			engine1.invalidateSchemaCache();
+			const hash1 = await engine1.getSchemaHash();
+
+			// Register an extra function
+			db.registerFunction({
+				name: 'extra_func',
+				numArgs: 0,
+				flags: 1 as any,
+				returnType: { typeClass: 'scalar' as const, logicalType: { name: 'TEXT' } as any, nullable: true, isReadOnly: true },
+				implementation: () => 'hello',
+			});
+			engine1.invalidateSchemaCache();
+			const hash2 = await engine1.getSchemaHash();
+
+			// Functions appear in schema() output, so an extra function changes the hash.
+			// If one node registers more functions, schema validation will fail.
+			expect(hash1).to.not.equal(hash2);
+		});
+	});
+
 	describe('Quereus Validator', () => {
 		it('should create a validator with QuereusEngine', async () => {
 			// Create a TransactionCoordinator with empty collections

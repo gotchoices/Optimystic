@@ -58,6 +58,7 @@ export class TransactorSource<TBlock extends IBlock> implements BlockSource<TBlo
 			rev
 		});
 		if (!commitResult.success) {
+			await this.transactor.cancel({ actionId, blockIds: pendResult.blockIds });
 			return commitResult;
 		}
 	}
