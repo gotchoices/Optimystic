@@ -591,10 +591,13 @@ export class OptimysticVirtualTable extends VirtualTable {
       throw new Error('Table not initialized');
     }
 
-    // Update the stored schema with the new index
     const storedSchema = await this.schemaManager.getSchema(this.tableName);
     if (!storedSchema) {
       throw new Error('Schema not found');
+    }
+
+    if (storedSchema.indexes.some(idx => idx.name === indexSchema.name)) {
+      return;
     }
 
     // Add the index to the stored schema
