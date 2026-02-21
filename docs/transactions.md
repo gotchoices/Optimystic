@@ -1255,7 +1255,7 @@ export class TransactionValidator {
 - [x] Add early abort for rejection super-minority (ClusterCoordinator aborts when rejections exceed threshold)
 - [x] Upgrade QuereusEngine schema hash to SHA-256 (using @noble/hashes)
 - [x] Add validator option to createLibp2pNode (passes through to ClusterMember)
-- [ ] Implement self-coordination guard (see "Coordinator Selection and Network Resilience" section)
+- [x] Implement self-coordination guard (see "Coordinator Selection and Network Resilience" section)
 - [ ] Performance testing and optimization
 
 **Test Coverage**:

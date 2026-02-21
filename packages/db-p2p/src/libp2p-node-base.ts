@@ -15,7 +15,7 @@ import { MemoryRawStorage } from './storage/memory-storage.js';
 import type { IRawStorage } from './storage/i-raw-storage.js';
 import { clusterMember } from './cluster/cluster-repo.js';
 import { coordinatorRepo } from './repo/coordinator-repo.js';
-import { Libp2pKeyPeerNetwork } from './libp2p-key-network.js';
+import { Libp2pKeyPeerNetwork, type NetworkMode, type NetworkStatePersistence } from './libp2p-key-network.js';
 import { ClusterClient } from './cluster/client.js';
 import type { IRepo, ICluster, ITransactionValidator } from '@optimystic/db-core';
 import { networkManagerService } from './network/network-manager-service.js';
@@ -80,6 +80,9 @@ export type NodeOptions = {
 
 	/** Transaction validator for cluster consensus */
 	validator?: ITransactionValidator;
+
+	/** Optional persistence for network state (HWM, FRET table) across restarts */
+	persistence?: NetworkStatePersistence;
 };
 
 function resolveStorage(provider: RawStorageProvider | undefined): IRawStorage {
@@ -252,7 +255,9 @@ export async function createLibp2pNodeBase(
 	await node.start();
 
 	// Initialize cluster coordination components
-	const keyNetwork = new Libp2pKeyPeerNetwork(node);
+	const networkMode: NetworkMode = (options.bootstrapNodes?.length ?? 0) > 0 ? 'joining' : 'forming';
+	const keyNetwork = new Libp2pKeyPeerNetwork(node, options.clusterSize, undefined, networkMode, options.persistence);
+	await keyNetwork.initFromPersistedState();
 	const protocolPrefix = `/optimystic/${options.networkName}`;
 	const createClusterClient = (peerId: any) => ClusterClient.create(peerId, keyNetwork, protocolPrefix);
 

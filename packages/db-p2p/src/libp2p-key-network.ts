@@ -3,11 +3,26 @@ import { toString as u8ToString } from 'uint8arrays/to-string'
 import type { ClusterPeers, FindCoordinatorOptions, IKeyNetwork, IPeerNetwork } from "@optimystic/db-core";
 import { peerIdFromString } from '@libp2p/peer-id'
 import { multiaddr } from '@multiformats/multiaddr'
-import type { FretService } from 'p2p-fret'
+import type { FretService, SerializedTable } from 'p2p-fret'
 import { hashKey } from 'p2p-fret'
 import { createLogger } from './logger.js'
 
 interface WithFretService { services?: { fret?: FretService } }
+
+export type NetworkMode = 'forming' | 'joining';
+
+export interface PersistedNetworkState {
+	version: 1;
+	networkHighWaterMark: number;
+	lastConnectedTimestamp: number;
+	consecutiveIsolatedSessions: number;
+	fretTable?: SerializedTable;
+}
+
+export interface NetworkStatePersistence {
+	load(): Promise<PersistedNetworkState | undefined>;
+	save(state: PersistedNetworkState): Promise<void>;
+}
 
 /**
  * Configuration options for self-coordination behavior
@@ -26,7 +41,7 @@ export interface SelfCoordinationConfig {
  */
 export interface SelfCoordinationDecision {
 	allow: boolean;
-	reason: 'bootstrap-node' | 'partition-detected' | 'suspicious-shrinkage' | 'grace-period-not-elapsed' | 'extended-isolation' | 'disabled';
+	reason: 'bootstrap-node' | 'partition-detected' | 'suspicious-shrinkage' | 'grace-period-not-elapsed' | 'extended-isolation' | 'hwm-decay' | 'disabled';
 	warn?: boolean;
 }
 
@@ -34,17 +49,24 @@ export class Libp2pKeyPeerNetwork implements IKeyNetwork, IPeerNetwork {
 	private readonly selfCoordinationConfig: Required<SelfCoordinationConfig>;
 	private networkHighWaterMark = 1;
 	private lastConnectedTime = Date.now();
+	private consecutiveIsolatedSessions = 0;
+	private readonly networkMode: NetworkMode;
+	private readonly persistence?: NetworkStatePersistence;
 
 	constructor(
 		private readonly libp2p: Libp2p,
 		private readonly clusterSize: number = 16,
-		selfCoordinationConfig?: SelfCoordinationConfig
+		selfCoordinationConfig?: SelfCoordinationConfig,
+		networkMode?: NetworkMode,
+		persistence?: NetworkStatePersistence
 	) {
 		this.selfCoordinationConfig = {
 			gracePeriodMs: selfCoordinationConfig?.gracePeriodMs ?? 30_000,
 			shrinkageThreshold: selfCoordinationConfig?.shrinkageThreshold ?? 0.5,
 			allowSelfCoordination: selfCoordinationConfig?.allowSelfCoordination ?? true
 		};
+		this.networkMode = networkMode ?? 'forming';
+		this.persistence = persistence;
 		this.setupConnectionTracking();
 	}
 
@@ -72,6 +94,7 @@ export class Libp2pKeyPeerNetwork implements IKeyNetwork, IPeerNetwork {
 		const connections = this.libp2p.getConnections?.() ?? [];
 		if (connections.length > 0) {
 			this.lastConnectedTime = Date.now();
+			this.consecutiveIsolatedSessions = 0;
 		}
 
 		try {
@@ -90,6 +113,56 @@ export class Libp2pKeyPeerNetwork implements IKeyNetwork, IPeerNetwork {
 				this.log('network-hwm-updated mark=%d (from connections)', this.networkHighWaterMark);
 			}
 		}
+
+		this.persistState();
+	}
+
+	async initFromPersistedState(): Promise<void> {
+		if (!this.persistence) return;
+		const state = await this.persistence.load();
+		if (!state) return;
+
+		this.networkHighWaterMark = state.networkHighWaterMark;
+		this.lastConnectedTime = state.lastConnectedTimestamp;
+		this.consecutiveIsolatedSessions = state.consecutiveIsolatedSessions;
+
+		if (state.fretTable) {
+			try {
+				this.getFret().importTable(state.fretTable);
+			} catch (err) { this.log('init:fret-import-skipped %o', err); }
+		}
+
+		// If HWM > 1 but FRET table is empty/self-only, increment isolated sessions
+		if (state.networkHighWaterMark > 1) {
+			const fretEntryCount = state.fretTable?.entries?.length ?? 0;
+			if (fretEntryCount <= 1) {
+				this.consecutiveIsolatedSessions++;
+				this.log('init:isolated-session count=%d hwm=%d', this.consecutiveIsolatedSessions, this.networkHighWaterMark);
+			}
+		}
+	}
+
+	private canRetryImprove(fretNeighborIds: string[]): boolean {
+		if (this.networkMode !== 'forming') return true;
+		if (this.networkHighWaterMark > 1) return true;
+		const onlySelf = fretNeighborIds.length <= 1
+			&& (fretNeighborIds.length === 0 || fretNeighborIds[0] === this.libp2p.peerId.toString());
+		return !onlySelf;
+	}
+
+	private persistState(): void {
+		if (!this.persistence) return;
+		const state: PersistedNetworkState = {
+			version: 1,
+			networkHighWaterMark: this.networkHighWaterMark,
+			lastConnectedTimestamp: this.lastConnectedTime,
+			consecutiveIsolatedSessions: this.consecutiveIsolatedSessions,
+		};
+		try {
+			const fret = this.getFret();
+			state.fretTable = fret.exportTable();
+		} catch { /* FRET not available */ }
+		void this.persistence.save(state).catch(err => this.log('persist-state-failed %o', err));
 	}
 
 	/**
@@ -107,6 +180,12 @@ export class Libp2pKeyPeerNetwork implements IKeyNetwork, IPeerNetwork {
 		// Case 1: New/bootstrap node (never seen larger network)
 		if (this.networkHighWaterMark <= 1) {
 			return { allow: true, reason: 'bootstrap-node' };
+		}
+
+		// Case 1b: Repeated isolation across sessions — decay HWM to allow eventual self-coordination
+		if (this.consecutiveIsolatedSessions >= 3) {
+			this.log('self-coord-allowed: hwm-decayed sessions=%d', this.consecutiveIsolatedSessions);
+			return { allow: true, reason: 'hwm-decay', warn: true };
 		}
 
 		// Case 2: Check for partition via FRET
@@ -222,8 +301,9 @@ export class Libp2pKeyPeerNetwork implements IKeyNetwork, IPeerNetwork {
 			this.log('findCoordinator:connected-peers key=%s count=%d peers=%o attempt=%d', keyStr, connected.length, connected.map(p => p.toString().substring(0, 12)), attempt)
 
 			// prefer FRET neighbors that are also connected, pick first non-excluded
+			let ids: string[] = [];
 			try {
-				const ids = await this.getNeighborIdsForKey(key, this.clusterSize)
+				ids = await this.getNeighborIdsForKey(key, this.clusterSize)
 				this.log('findCoordinator:fret-neighbors key=%s candidates=%o', keyStr, ids.map(s => s.substring(0, 12)))
 
 				// Filter to only connected FRET neighbors
@@ -251,6 +331,11 @@ export class Libp2pKeyPeerNetwork implements IKeyNetwork, IPeerNetwork {
 
 			// If no connections and not the last attempt, wait and retry
 			if (connected.length === 0 && attempt < maxRetries - 1) {
+				if (!this.canRetryImprove(ids)) {
+					this.log('findCoordinator:retry-futile key=%s mode=%s hwm=%d',
+						keyStr, this.networkMode, this.networkHighWaterMark);
+					break;
+				}
 				this.log('findCoordinator:no-connections-retry key=%s attempt=%d delay=%dms', keyStr, attempt, retryDelayMs)
 				await new Promise(resolve => setTimeout(resolve, retryDelayMs))
 				continue

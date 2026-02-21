@@ -1,3 +1,5 @@
+## General
+
 * Don't create useless summary documents, or make giant summaries to the user.  Keep the existing project documents up to date.
 * Comments should only be non-obvious, and should be timeless (no "added this", etc.)
 * Prefix with `_` for unused arguments.
@@ -12,5 +14,9 @@
 * Prefer expressive over imperative.
 * Small, single-purpose functions/methods.  Decompose into separate functions over documented sub-sections - function names document the semantics.
 * We want to be platform agnostic (browser, node, RN, etc.) unless we're explicitly building something platform specific
+
+## Tasks
+
+- If the user mentions tasks (e.g. work task...), read tasks/agents.md to know what to do
 
 This is an important system; write production-grade, maintainble, and expressive code that we don't have to revisit later.  Read @docs/internals.md to quickly come up to speed on contributing - also maintain this document.

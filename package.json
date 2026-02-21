@@ -47,7 +47,8 @@
     "pub:quereus-crypto": "cd packages/quereus-plugin-crypto && yarn clean && npx bumpp --no-push --no-commit --no-tag --no-git-check -y && yarn build && yarn npm publish --access public",
     "pub:quereus-optimystic": "cd packages/quereus-plugin-optimystic && yarn clean && npx bumpp --no-push --no-commit --no-tag --no-git-check -y && yarn build && yarn npm publish --access public",
     "pub:reference-peer": "cd packages/reference-peer && yarn clean && npx bumpp --no-push --no-commit --no-tag --no-git-check -y && yarn build && yarn npm publish --access public",
-    "pub:vinz": "cd packages/vinz && yarn clean && npx bumpp --no-push --no-commit --no-tag --no-git-check -y && yarn build && yarn npm publish --access public"
+    "pub:vinz": "cd packages/vinz && yarn clean && npx bumpp --no-push --no-commit --no-tag --no-git-check -y && yarn build && yarn npm publish --access public",
+    "upgrade:fret": "ncu -u --workspaces --filter 'p2p-fret'"
   },
   "devDependencies": {
     "@types/node": "^22.13.10",
