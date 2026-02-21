@@ -1,6 +1,6 @@
 import { expect } from 'aegir/chai';
 import { ClusterMember, clusterMember } from '../src/cluster/cluster-repo.js';
-import type { IRepo, ClusterRecord, RepoMessage, Signature, BlockGets, GetBlockResults, PendRequest, PendResult, CommitRequest, CommitResult, ActionBlocks, ClusterPeers, Transforms, IBlock, BlockId, BlockHeader } from '@optimystic/db-core';
+import type { IRepo, ClusterRecord, RepoMessage, Signature, BlockGets, GetBlockResults, PendRequest, PendResult, CommitRequest, CommitResult, ActionBlocks, ClusterPeers, Transforms, IBlock, BlockId, BlockHeader, CollectionAcl, CollectionHeaderBlock } from '@optimystic/db-core';
 import type { IPeerNetwork } from '@optimystic/db-core';
 import type { PeerId } from '@libp2p/interface';
 import { peerIdFromPrivateKey } from '@libp2p/peer-id';
@@ -683,6 +683,206 @@ describe('ClusterMember', () => {
 
 			// Mark the transaction as already executed
 			expect(clusterMemberInstance.wasTransactionExecuted(record.messageHash)).to.equal(true);
+		});
+	});
+
+	describe('collection access controls', () => {
+		const collectionId = 'collection-1';
+
+		const makeHeaderBlockWithAcl = (acl: CollectionAcl): CollectionHeaderBlock => ({
+			header: { id: collectionId as BlockId, type: 'CH', collectionId: collectionId as BlockId },
+			acl,
+		});
+
+		const makeAclMockRepo = (acl?: CollectionAcl) => {
+			const repo = new MockRepo();
+			if (acl) {
+				const headerBlock = makeHeaderBlockWithAcl(acl);
+				repo.get = async (blockGets: BlockGets) => {
+					const result: GetBlockResults = {};
+					for (const bid of blockGets.blockIds) {
+						if (bid === collectionId) {
+							result[bid] = { block: headerBlock, state: { latest: undefined, pendings: undefined } as any };
+						}
+					}
+					return result;
+				};
+			}
+			return repo;
+		};
+
+		it('allows writes when no ACL is set (open collection)', async () => {
+			const repo = makeAclMockRepo(); // No header returned — new collection
+			const member = clusterMember({
+				storageRepo: repo,
+				peerNetwork: mockNetwork,
+				peerId: selfPeerId,
+			});
+
+			const ourId = selfPeerId.toString();
+			const peers = makeClusterPeers([selfPeerId]);
+			const transforms: Transforms = {
+				inserts: { 'block-new': { header: { id: 'block-new' as BlockId, type: 'CHN', collectionId: collectionId as BlockId } } },
+				updates: {},
+				deletes: [],
+			};
+
+			const record = await createClusterRecord(
+				peers,
+				[{ pend: { actionId: 'a1', transforms, policy: 'c', transaction: { statements: [], stamp: { peerId: 'untrusted-peer' } } as any, operationsHash: 'hash' } }],
+			);
+
+			const result = await member.update(record);
+			expect(result.promises[ourId]?.type).to.equal('approve');
+		});
+
+		it('rejects writes from unauthorized peers', async () => {
+			const acl: CollectionAcl = {
+				defaultPermission: 'read',
+				grants: { 'admin-peer': 'admin' },
+			};
+			const repo = makeAclMockRepo(acl);
+			const member = clusterMember({
+				storageRepo: repo,
+				peerNetwork: mockNetwork,
+				peerId: selfPeerId,
+			});
+
+			const ourId = selfPeerId.toString();
+			const peers = makeClusterPeers([selfPeerId]);
+			const transforms: Transforms = {
+				inserts: { 'block-new': { header: { id: 'block-new' as BlockId, type: 'CHN', collectionId: collectionId as BlockId } } },
+				updates: {},
+				deletes: [],
+			};
+
+			const record = await createClusterRecord(
+				peers,
+				[{ pend: { actionId: 'a1', transforms, policy: 'c', transaction: { statements: [], stamp: { peerId: 'unauthorized-peer' } } as any, operationsHash: 'hash' } }],
+			);
+
+			const result = await member.update(record);
+			expect(result.promises[ourId]?.type).to.equal('reject');
+			expect(result.promises[ourId]?.rejectReason).to.include('access-denied');
+		});
+
+		it('allows writes from authorized peers', async () => {
+			const acl: CollectionAcl = {
+				defaultPermission: 'read',
+				grants: { 'writer-peer': 'write' },
+			};
+			const repo = makeAclMockRepo(acl);
+			const member = clusterMember({
+				storageRepo: repo,
+				peerNetwork: mockNetwork,
+				peerId: selfPeerId,
+			});
+
+			const ourId = selfPeerId.toString();
+			const peers = makeClusterPeers([selfPeerId]);
+			const transforms: Transforms = {
+				inserts: { 'block-new': { header: { id: 'block-new' as BlockId, type: 'CHN', collectionId: collectionId as BlockId } } },
+				updates: {},
+				deletes: [],
+			};
+
+			const record = await createClusterRecord(
+				peers,
+				[{ pend: { actionId: 'a1', transforms, policy: 'c', transaction: { statements: [], stamp: { peerId: 'writer-peer' } } as any, operationsHash: 'hash' } }],
+			);
+
+			const result = await member.update(record);
+			expect(result.promises[ourId]?.type).to.equal('approve');
+		});
+
+		it('rejects ACL modifications from non-admin peers', async () => {
+			const acl: CollectionAcl = {
+				defaultPermission: 'write',
+				grants: { 'admin-peer': 'admin' },
+			};
+			const repo = makeAclMockRepo(acl);
+			const member = clusterMember({
+				storageRepo: repo,
+				peerNetwork: mockNetwork,
+				peerId: selfPeerId,
+			});
+
+			const ourId = selfPeerId.toString();
+			const peers = makeClusterPeers([selfPeerId]);
+			const transforms: Transforms = {
+				inserts: { 'block-new': { header: { id: 'block-new' as BlockId, type: 'CHN', collectionId: collectionId as BlockId } } },
+				updates: { [collectionId]: [['acl', 0, 1, { defaultPermission: 'read' }]] },
+				deletes: [],
+			};
+
+			const record = await createClusterRecord(
+				peers,
+				[{ pend: { actionId: 'a1', transforms, policy: 'c', transaction: { statements: [], stamp: { peerId: 'writer-peer' } } as any, operationsHash: 'hash' } }],
+			);
+
+			const result = await member.update(record);
+			expect(result.promises[ourId]?.type).to.equal('reject');
+			expect(result.promises[ourId]?.rejectReason).to.include('access-denied');
+			expect(result.promises[ourId]?.rejectReason).to.include('admin');
+		});
+
+		it('allows ACL modifications from admin peers', async () => {
+			const acl: CollectionAcl = {
+				defaultPermission: 'write',
+				grants: { 'admin-peer': 'admin' },
+			};
+			const repo = makeAclMockRepo(acl);
+			const member = clusterMember({
+				storageRepo: repo,
+				peerNetwork: mockNetwork,
+				peerId: selfPeerId,
+			});
+
+			const ourId = selfPeerId.toString();
+			const peers = makeClusterPeers([selfPeerId]);
+			const transforms: Transforms = {
+				inserts: { 'block-new': { header: { id: 'block-new' as BlockId, type: 'CHN', collectionId: collectionId as BlockId } } },
+				updates: { [collectionId]: [['acl', 0, 1, { defaultPermission: 'read' }]] },
+				deletes: [],
+			};
+
+			const record = await createClusterRecord(
+				peers,
+				[{ pend: { actionId: 'a1', transforms, policy: 'c', transaction: { statements: [], stamp: { peerId: 'admin-peer' } } as any, operationsHash: 'hash' } }],
+			);
+
+			const result = await member.update(record);
+			expect(result.promises[ourId]?.type).to.equal('approve');
+		});
+
+		it('skips ACL check when no transaction stamp (backward compatibility)', async () => {
+			const acl: CollectionAcl = {
+				defaultPermission: 'read',
+				grants: {},
+			};
+			const repo = makeAclMockRepo(acl);
+			const member = clusterMember({
+				storageRepo: repo,
+				peerNetwork: mockNetwork,
+				peerId: selfPeerId,
+			});
+
+			const ourId = selfPeerId.toString();
+			const peers = makeClusterPeers([selfPeerId]);
+			const transforms: Transforms = {
+				inserts: { 'block-new': { header: { id: 'block-new' as BlockId, type: 'CHN', collectionId: collectionId as BlockId } } },
+				updates: {},
+				deletes: [],
+			};
+
+			// No transaction in pend request (legacy path)
+			const record = await createClusterRecord(
+				peers,
+				[{ pend: { actionId: 'a1', transforms, policy: 'c' } }],
+			);
+
+			const result = await member.update(record);
+			expect(result.promises[ourId]?.type).to.equal('approve');
 		});
 	});
 

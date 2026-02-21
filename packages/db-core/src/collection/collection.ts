@@ -1,6 +1,6 @@
 import type { IBlock, Action, ActionType, ActionHandler, BlockId, ITransactor, BlockStore } from "../index.js";
 import { Log, Atomic, Tracker, copyTransforms, CacheSource, isTransformsEmpty, TransactorSource } from "../index.js";
-import type { CollectionHeaderBlock, CollectionId, ICollection } from "./index.js";
+import type { CollectionAcl, CollectionHeaderBlock, CollectionId, ICollection } from "./index.js";
 import { randomBytes } from '@noble/hashes/utils.js';
 import { toString as uint8ArrayToString } from 'uint8arrays/to-string';
 import { Latches } from "../utility/latches.js";
@@ -16,7 +16,9 @@ export type CollectionInitOptions<TAction> = {
 	 * @returns The original action, a replacement action (return a new instance; will be
 	 * 	applied through act()), or undefined to discard this action
 	 */
-	filterConflict?: (action: Action<TAction>, potential: Action<TAction>[]) => Action<TAction> | undefined
+	filterConflict?: (action: Action<TAction>, potential: Action<TAction>[]) => Action<TAction> | undefined;
+	/** Optional access control list to set on the header block when creating a new collection. */
+	acl?: CollectionAcl;
 }
 
 export class Collection<TAction> implements ICollection<TAction> {
@@ -49,6 +51,9 @@ export class Collection<TAction> implements ICollection<TAction> {
 			source.actionContext = await log.getActionContext();
 		} else {	// Collection does not exist
 			const headerBlock = init.createHeaderBlock(id, tracker);
+			if (init.acl) {
+				(headerBlock as CollectionHeaderBlock).acl = init.acl;
+			}
 			tracker.insert(headerBlock);
 			source.actionContext = undefined;
 			await Log.open<Action<TAction>>(tracker, id);

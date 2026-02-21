@@ -1,5 +1,6 @@
 import { expect } from 'aegir/chai'
-import { Collection, type CollectionInitOptions } from '../src/collection/index.js'
+import { Collection, type CollectionInitOptions, createDefaultAcl, checkPermission } from '../src/collection/index.js'
+import type { CollectionHeaderBlock } from '../src/collection/index.js'
 import { TestTransactor } from './test-transactor.js'
 import type { Action, ActionHandler, BlockStore, IBlock } from '../src/index.js'
 
@@ -432,6 +433,30 @@ describe('Collection', () => {
         actions.push(a)
       }
       expect(actions).to.have.lengthOf(2)
+    })
+  })
+
+  describe('access control', () => {
+    it('should set ACL on header block when acl option provided', async () => {
+      const acl = createDefaultAcl('creator-peer')
+      const optionsWithAcl: CollectionInitOptions<TestAction> = {
+        ...initOptions,
+        acl,
+      }
+
+      const collection = await Collection.createOrOpen<TestAction>(transactor, collectionId, optionsWithAcl)
+      const headerBlock = await collection.tracker.tryGet(collectionId) as CollectionHeaderBlock
+      expect(headerBlock.acl).to.deep.equal(acl)
+      expect(checkPermission(headerBlock.acl, 'creator-peer', 'admin')).to.be.true
+      expect(checkPermission(headerBlock.acl, 'other-peer', 'write')).to.be.false
+    })
+
+    it('should not set ACL when acl option is omitted', async () => {
+      const collection = await Collection.createOrOpen<TestAction>(transactor, collectionId, initOptions)
+      const headerBlock = await collection.tracker.tryGet(collectionId) as CollectionHeaderBlock
+      expect(headerBlock.acl).to.be.undefined
+      // Open collection: everyone has write
+      expect(checkPermission(headerBlock.acl, 'any-peer', 'write')).to.be.true
     })
   })
 
