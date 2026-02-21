@@ -1,0 +1,30 @@
+----
+description: Replace clusterLogic stub in libp2p-node with actual cluster implementation
+dependencies: ClusterCoordinator, ClusterMember, CoordinatorRepo, StorageRepo
+----
+
+## Summary
+
+The real cluster logic is fully wired in `packages/db-p2p/src/libp2p-node-base.ts`. No stub remains.
+
+### What was done
+
+- **Member-side** (`ClusterMember` from `cluster/cluster-repo.ts`): created via `clusterMember()` at line 268, injected into a lazy `clusterProxy` that the `ClusterService` uses to handle inbound protocol messages. `ClusterMember` implements `ICluster.update()` with full 2PC participation: promise validation (including stale-revision checks and custom `ITransactionValidator`), commit signing, consensus execution against local `StorageRepo`, conflict detection with race resolution, and transaction expiration.
+
+- **Coordinator-side** (`CoordinatorRepo` from `repo/coordinator-repo.ts`): created via `coordinatorRepo()` factory at line 278, injected into a lazy `repoProxy` that the `RepoService` uses. `CoordinatorRepo` wraps `StorageRepo` with cluster consensus: `pend()` and `commit()` build a `RepoMessage`, call `ClusterCoordinator.executeClusterTransaction()` (which runs full 2PC with super-majority promises then simple-majority commits), and skip local execution if the cluster member already applied ops during consensus. `get()` falls through to `StorageRepo` with cluster-peer discovery for missing blocks.
+
+- **Bootstrap ordering**: lazy proxies (`clusterProxy`, `repoProxy`) are created before `createLibp2p()` and filled in after the node starts, solving the circular dependency between libp2p services and the implementations that need the running node.
+
+### Key files
+
+- `packages/db-p2p/src/libp2p-node-base.ts` — wiring
+- `packages/db-p2p/src/cluster/cluster-repo.ts` — `ClusterMember` (ICluster impl)
+- `packages/db-p2p/src/repo/cluster-coordinator.ts` — `ClusterCoordinator` (2PC engine)
+- `packages/db-p2p/src/repo/coordinator-repo.ts` — `CoordinatorRepo` (IRepo wrapper)
+- `packages/db-p2p/src/cluster/service.ts` — `ClusterService` (libp2p protocol handler)
+- `packages/db-p2p/src/cluster/client.ts` — `ClusterClient` (protocol client with redirect)
+
+### Remaining related items (tracked separately)
+
+- Signature verification is stubbed (`verifySignature()` returns `true`) — tracked in `4-signature-verification-implementation.md`
+- `ClusterService` has a disabled membership/redirect check (line 115-118 comment) — may need its own task once routing is validated

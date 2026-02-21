@@ -19,11 +19,11 @@
   * ~~Update repo/cluster services to use responsibilityK when computing responsibility (inCluster vs redirect)~~
   * ~~Expose responsibilityK via `createLibp2pNode` options and/or environment config; default to 1 initially~~
 
-* Wire real cluster logic (replace stub)
-  * Replace `clusterLogic` stub in `libp2p-node` with actual cluster implementation
-  * Coordinator-side: use `ClusterCoordinator` to run 2PC across responsibility peers
-  * Member-side: implement an `ICluster` member that validates/pends/commits against local `StorageRepo`
-  * Ensure `CoordinatorRepo` is used for distributed ops and `StorageRepo` only for local execution
+* ~~Wire real cluster logic (replace stub)~~ ✓ DONE
+  * ~~Replace `clusterLogic` stub in `libp2p-node` with actual cluster implementation~~
+  * ~~Coordinator-side: use `ClusterCoordinator` to run 2PC across responsibility peers~~
+  * ~~Member-side: implement an `ICluster` member that validates/pends/commits against local `StorageRepo`~~
+  * ~~Ensure `CoordinatorRepo` is used for distributed ops and `StorageRepo` only for local execution~~
 
 * Strategic instrumentation (debug-based)
   * Add `createLogger(subNamespace)` helper in each package using `debug` with base namespaces:
