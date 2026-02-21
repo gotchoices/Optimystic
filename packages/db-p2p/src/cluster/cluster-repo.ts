@@ -1,7 +1,7 @@
-import type { IRepo, ClusterRecord, Signature, RepoMessage, ITransactionValidator, CollectionHeaderBlock, Transforms, IBlock } from "@optimystic/db-core";
+import type { IRepo, ClusterRecord, Signature, RepoMessage, ITransactionValidator } from "@optimystic/db-core";
 import type { ICluster } from "@optimystic/db-core";
 import type { IPeerNetwork } from "@optimystic/db-core";
-import { blockIdsForTransforms, checkPermission } from "@optimystic/db-core";
+import { blockIdsForTransforms } from "@optimystic/db-core";
 import { ClusterClient } from "./client.js";
 import type { PeerId } from "@libp2p/interface";
 import { peerIdFromString } from "@libp2p/peer-id";
@@ -474,16 +474,6 @@ export class ClusterMember implements ICluster {
 					}
 				}
 
-				// Check collection-level access controls
-				const aclResult = await this.checkCollectionAcl(pendRequest.transforms, pendRequest.transaction?.stamp.peerId);
-				if (!aclResult.valid) {
-					log('cluster-member:validation-acl-denied', {
-						messageHash: record.messageHash,
-						reason: aclResult.reason
-					});
-					return aclResult;
-				}
-
 				// Run custom validator if configured
 				if (this.validator && pendRequest.transaction && pendRequest.operationsHash) {
 					const result = await this.validator.validate(pendRequest.transaction, pendRequest.operationsHash);
@@ -495,79 +485,6 @@ export class ClusterMember implements ICluster {
 		}
 
 		return { valid: true };
-	}
-
-	/**
-	 * Check collection-level access controls for transforms.
-	 * Extracts collection IDs from inserted blocks, fetches collection headers,
-	 * and verifies the requesting peer has write permission.
-	 */
-	private async checkCollectionAcl(
-		transforms: Transforms,
-		requestingPeerId: string | undefined,
-	): Promise<{ valid: boolean; reason?: string }> {
-		if (!requestingPeerId) {
-			return { valid: true }; // No peer identity available; skip ACL check
-		}
-
-		// Collect distinct collection IDs from inserted blocks
-		const collectionIds = new Set<string>();
-		for (const block of Object.values(transforms.inserts ?? {}) as IBlock[]) {
-			if (block.header?.collectionId) {
-				collectionIds.add(block.header.collectionId);
-			}
-		}
-
-		// For updates on existing blocks, fetch block to learn the collection ID
-		for (const blockId of Object.keys(transforms.updates ?? {})) {
-			if (collectionIds.size > 0) {
-				break; // Already have at least one collection ID from inserts
-			}
-			try {
-				const results = await this.storageRepo.get({ blockIds: [blockId] });
-				const block = results[blockId]?.block;
-				if (block?.header?.collectionId) {
-					collectionIds.add(block.header.collectionId);
-				}
-			} catch {
-				// Ignore fetch errors during ACL check
-			}
-		}
-
-		// Check ACL for each collection
-		for (const collectionId of collectionIds) {
-			try {
-				const results = await this.storageRepo.get({ blockIds: [collectionId] });
-				const header = results[collectionId]?.block as CollectionHeaderBlock | undefined;
-				if (!header?.acl) {
-					continue; // No ACL — collection is open
-				}
-
-				// Determine required permission level
-				const aclModified = this.isAclModified(transforms, collectionId);
-				const required = aclModified ? 'admin' as const : 'write' as const;
-
-				if (!checkPermission(header.acl, requestingPeerId, required)) {
-					return {
-						valid: false,
-						reason: `access-denied: peer ${requestingPeerId} lacks ${required} permission on collection ${collectionId}`,
-					};
-				}
-			} catch {
-				// If we can't fetch the header, skip ACL check for this collection
-			}
-		}
-
-		return { valid: true };
-	}
-
-	/** Check whether transforms modify the ACL field on a collection header block. */
-	private isAclModified(transforms: Transforms, collectionId: string): boolean {
-		const ops = transforms.updates?.[collectionId];
-		if (!ops) {
-			return false;
-		}
-		return ops.some(([entity]) => entity === 'acl');
 	}
 
 	private async handleCommitNeeded(record: ClusterRecord): Promise<ClusterRecord> {
