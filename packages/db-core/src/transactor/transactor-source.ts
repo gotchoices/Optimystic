@@ -50,16 +50,21 @@ export class TransactorSource<TBlock extends IBlock> implements BlockSource<TBlo
 			return pendResult;
 		}
 		const isNew = transform.inserts && Object.hasOwn(transform.inserts, headerId);
-		const commitResult = await this.transactor.commit({
-			headerId: isNew ? headerId : undefined,
-			tailId,
-			blockIds: pendResult.blockIds,
-			actionId,
-			rev
-		});
-		if (!commitResult.success) {
+		try {
+			const commitResult = await this.transactor.commit({
+				headerId: isNew ? headerId : undefined,
+				tailId,
+				blockIds: pendResult.blockIds,
+				actionId,
+				rev
+			});
+			if (!commitResult.success) {
+				await this.transactor.cancel({ actionId, blockIds: pendResult.blockIds });
+				return commitResult;
+			}
+		} catch (e) {
 			await this.transactor.cancel({ actionId, blockIds: pendResult.blockIds });
-			return commitResult;
+			throw e;
 		}
 	}
 }

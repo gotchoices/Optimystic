@@ -1429,6 +1429,11 @@ describe('Transaction', () => {
 			const coordinator = new TransactionCoordinator(transactor, collections);
 			const actionsEngine = new ActionsEngine(coordinator);
 
+			// Snapshot posts transforms before execution (includes creation transforms)
+			const postsTransformsBefore = JSON.parse(JSON.stringify(
+				(postsCollection as unknown as { tracker: { transforms: unknown } }).tracker.transforms
+			));
+
 			// Transaction affecting only users
 			const userActions: CollectionActions[] = [
 				{ collectionId: 'users', actions: [{ type: 'replace', data: [[1, { key: 1, name: 'Alice' }]] }] }
@@ -1442,10 +1447,11 @@ describe('Transaction', () => {
 
 			await actionsEngine.execute(userTx);
 
-			// Only 'users' should have transforms, not 'posts'
-			const transforms = coordinator.getTransforms();
-			expect(transforms.has('users')).to.be.true;
-			expect(transforms.has('posts')).to.be.false;
+			// Posts transforms should be unchanged (user transaction shouldn't affect posts)
+			const postsTransformsAfter = JSON.parse(JSON.stringify(
+				(postsCollection as unknown as { tracker: { transforms: unknown } }).tracker.transforms
+			));
+			expect(postsTransformsAfter).to.deep.equal(postsTransformsBefore);
 		});
 	});
 

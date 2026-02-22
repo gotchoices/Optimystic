@@ -182,42 +182,42 @@ describe('TransactorSource', () => {
 
   it('should handle action rollback', async () => {
     const blockId = 'test-block'
-    const actionId = generateActionId()
 
-    // First create the block with an insert
+    // Create and commit the block
+    const insertActionId = generateActionId()
     await network.pend({
-      actionId,
+      actionId: insertActionId,
       transforms: {
-        inserts: { [blockId]: { header: { id: blockId, type: 'block', collectionId: 'test' } } },
+        inserts: { [blockId]: { header: { id: blockId, type: 'block', collectionId: 'test' }, test: [] } as TestBlock },
         updates: {},
         deletes: []
       },
       policy: 'c'
     })
+    await network.commit({ actionId: insertActionId, blockIds: [blockId], rev: 1 })
 
-    // Then update it
+    // Start an update action
+    const updateActionId = generateActionId()
     const transform: Transforms = {
       inserts: {},
       updates: { [blockId]: [createBlockOperation()] },
       deletes: []
     }
-
-    // Start update action
     await network.pend({
-      actionId: generateActionId(),
+      actionId: updateActionId,
       transforms: transform,
       policy: 'c'
     })
 
-    // Rollback the action
+    // Rollback the update action
     await network.cancel({
-      actionId,
+      actionId: updateActionId,
       blockIds: [blockId]
     })
 
     // Verify block is available for new actions
     const newActionId = generateActionId()
-    const result = await source.transact(transform, newActionId, 1, 'header-id', 'tail-id')
+    const result = await source.transact(transform, newActionId, 2, 'header-id', 'tail-id')
     expect(result).to.be.undefined
   })
 
@@ -374,7 +374,7 @@ describe('TransactorSource', () => {
 
     // Now create the block with an insert
     const insertTransform: Transforms = {
-      inserts: { [blockId]: { header: { id: blockId, type: 'block', collectionId: 'test' } } },
+      inserts: { [blockId]: { header: { id: blockId, type: 'block', collectionId: 'test' }, test: [] } as TestBlock },
       updates: {},
       deletes: []
     }

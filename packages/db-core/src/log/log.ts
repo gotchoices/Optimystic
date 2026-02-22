@@ -56,7 +56,7 @@ export class Log<TAction> {
 	/** Gets the action context of the log. */
 	async getActionContext(): Promise<ActionContext | undefined> {
 		const tailPath = await this.chain.getTail();
-		if (!tailPath) {
+		if (!tailPath || tailPath.block.entries.length === 0) {
 			return undefined;
 		}
 		const checkpoint = await this.findCheckpoint(tailPath);
