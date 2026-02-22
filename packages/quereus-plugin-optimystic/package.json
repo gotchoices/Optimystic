@@ -27,7 +27,7 @@
     "clean": "rimraf dist",
     "typecheck": "tsc --noEmit",
     "pretest": "npm run build",
-    "test": "node --import ./register.mjs node_modules/mocha/bin/mocha.js \"test/**/*.spec.ts\" --colors",
+    "test": "node --import ./register.mjs node_modules/mocha/bin/mocha.js \"test/**/*.spec.ts\" --colors --reporter min",
     "quoomb": "npm run build && quoomb --config examples/quoomb.config.local.json",
     "quoomb:dev": "quoomb --config examples/quoomb.config.dev.json",
     "quoomb:node1": "npm run build && quoomb --config examples/quoomb.config.node1.json",

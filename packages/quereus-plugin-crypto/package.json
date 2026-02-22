@@ -26,7 +26,7 @@
 		"clean": "rimraf dist",
 		"typecheck": "tsc --noEmit",
 		"pretest": "npm run build",
-		"test": "node --import ./register.mjs node_modules/mocha/bin/mocha.js \"test/**/*.spec.ts\" --colors"
+		"test": "node --import ./register.mjs node_modules/mocha/bin/mocha.js \"test/**/*.spec.ts\" --colors --reporter min"
 	},
 	"devDependencies": {
 		"@quereus/quereus": "^0.16.2",

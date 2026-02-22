@@ -35,7 +35,7 @@
   "scripts": {
     "clean": "rimraf dist",
     "build": "tsc",
-    "test": "node --import ./register.mjs node_modules/mocha/bin/mocha.js \"test/**/*.spec.ts\" --colors",
+    "test": "node --import ./register.mjs node_modules/mocha/bin/mocha.js \"test/**/*.spec.ts\" --colors --reporter min",
     "prove": "node --loader ts-node/esm test/test.ts"
   },
   "devDependencies": {
