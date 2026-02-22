@@ -1,4 +1,4 @@
-import { expect } from 'aegir/chai'
+import { expect } from 'chai'
 import type { BlockId, BlockOperation, IBlock, BlockType, BlockSource, Transforms } from '../src/index.js'
 import { Tracker } from '../src/transform/tracker.js'
 import { applyOperation, withOperation, blockIdsForTransforms, emptyTransforms, mergeTransforms, concatTransforms, transformForBlockId, applyTransformToStore, concatTransform } from '../src/index.js'

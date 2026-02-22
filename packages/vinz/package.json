@@ -33,17 +33,21 @@
     "multiformats"
   ],
   "scripts": {
-    "clean": "aegir clean",
-    "build": "aegir build --env node",
-    "lint": "aegir lint",
-    "test": "aegir test",
-    "test:node": "aegir test -t node",
-    "prove": "node --loader ts-node/esm test/test.ts",
-    "dep-check": "aegir dep-check"
+    "clean": "rimraf dist",
+    "build": "tsc",
+    "test": "node --import ./register.mjs node_modules/mocha/bin/mocha.js \"test/**/*.spec.ts\" --colors",
+    "prove": "node --loader ts-node/esm test/test.ts"
   },
   "devDependencies": {
+    "@types/chai-as-promised": "^8.0.2",
+    "@types/mocha": "^10.0.10",
     "@types/node": "^22.14.0",
-    "aegir": "^45.1.4"
+    "chai": "^6.2.2",
+    "chai-as-promised": "^8.0.2",
+    "mocha": "^11.7.5",
+    "rimraf": "^6.1.2",
+    "ts-node": "^10.9.2",
+    "typescript": "^5.9.3"
   },
   "dependencies": {
     "@noble/secp256k1": "^2.2.3",

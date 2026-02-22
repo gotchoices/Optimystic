@@ -33,28 +33,19 @@
 		"node"
 	],
 	"scripts": {
-		"clean": "aegir clean",
-		"build": "aegir build --env node",
-		"lint": "aegir lint",
-		"test": "aegir test",
-		"test:node": "aegir test -t node",
-		"dep-check": "aegir dep-check"
+		"clean": "rimraf dist",
+		"build": "tsc"
 	},
 	"devDependencies": {
 		"@types/debug": "^4.1.12",
 		"@types/mocha": "^10.0.10",
 		"@types/node": "^25.1.0",
-		"aegir": "^47.0.26",
+		"rimraf": "^6.1.2",
 		"typescript": "^5.9.3"
 	},
 	"dependencies": {
 		"@optimystic/db-core": "workspace:^",
 		"@optimystic/db-p2p": "workspace:^",
 		"debug": "^4.4.3"
-	},
-	"aegir": {
-		"build": {
-			"bundle": false
-		}
 	}
 }

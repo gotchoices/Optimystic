@@ -1,4 +1,6 @@
-import { expect } from 'aegir/chai'
+import { use, expect } from 'chai'
+import chaiAsPromised from 'chai-as-promised'
+use(chaiAsPromised)
 import { TransactorSource } from '../src/transactor/transactor-source.js'
 import { TestTransactor } from './test-transactor.js'
 import { randomBytes } from '@libp2p/crypto'

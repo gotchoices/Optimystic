@@ -8,7 +8,7 @@
  * - Multi-collection (table + index) transaction coordination
  */
 
-import { expect } from 'aegir/chai';
+import { expect } from 'chai';
 import { promises as fs } from 'node:fs';
 import * as path from 'node:path';
 import * as os from 'node:os';

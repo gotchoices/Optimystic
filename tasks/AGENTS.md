@@ -17,8 +17,6 @@ Don't combine tasks unless they are tightly related.
 
 For new tasks: put a new file into fix/ or plan/ but focus on the description/requirements of the issue or feature, expected behavior, use case, etc.  Don't do planning, add TODO items, or get ahead, unless you already posess key information that would be useful.
 
-If you need to test against a running vite, there is one running on localhost:3002.  There is a backend running on localhost:3100.
-
 For the file:
 ----
 description: <brief description>

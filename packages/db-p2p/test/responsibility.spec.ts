@@ -1,4 +1,4 @@
-import { expect } from 'aegir/chai';
+import { expect } from 'chai';
 import { peerIdFromPrivateKey } from '@libp2p/peer-id';
 import { generateKeyPair } from '@libp2p/crypto/keys';
 import { xorDistanceBytes, lessThanLex, sortPeersByDistance, computeResponsibility, type KnownPeer } from '../src/routing/responsibility.js';

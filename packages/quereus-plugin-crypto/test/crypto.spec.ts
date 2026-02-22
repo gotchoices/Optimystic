@@ -1,4 +1,4 @@
-import { expect } from 'aegir/chai';
+import { expect } from 'chai';
 import {
 	digest, hashMod, randomBytes, sign, verify,
 	generatePrivateKey, getPublicKey,

@@ -36,12 +36,9 @@
     "acid"
   ],
   "scripts": {
-    "clean": "aegir clean",
-    "build": "aegir build --env node",
-    "lint": "aegir lint",
-    "test": "aegir test",
-    "test:node": "aegir test -t node",
-    "dep-check": "aegir dep-check"
+    "clean": "rimraf dist",
+    "build": "tsc",
+    "test": "node --import ./register.mjs node_modules/mocha/bin/mocha.js \"test/**/*.spec.ts\" --colors"
   },
   "devDependencies": {
     "@libp2p/crypto": "^5.1.13",
@@ -49,9 +46,14 @@
     "@libp2p/peer-id": "^6.0.4",
     "@libp2p/peer-id-factory": "^4.2.4",
     "@multiformats/multiaddr": "^13.0.1",
+    "@types/chai-as-promised": "^8.0.2",
     "@types/mocha": "^10.0.10",
     "@types/node": "^25.1.0",
-    "aegir": "^47.0.26",
+    "chai": "^6.2.2",
+    "chai-as-promised": "^8.0.2",
+    "mocha": "^11.7.5",
+    "rimraf": "^6.1.2",
+    "ts-node": "^10.9.2",
     "typescript": "^5.9.3"
   },
   "dependencies": {

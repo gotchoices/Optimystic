@@ -1,4 +1,4 @@
-import { expect } from 'aegir/chai'
+import { expect } from 'chai'
 import { Tree } from '../src/collections/tree/index.js'
 import { TestTransactor } from './test-transactor.js'
 import { KeyRange, KeyBound } from '../src/btree/index.js'

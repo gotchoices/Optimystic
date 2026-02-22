@@ -127,7 +127,7 @@ Then use `transactor='mytransactor'` or `keyNetwork='mynetwork'` in your `USING`
 ```bash
 npm run build        # Build with tsup
 npm run typecheck    # Type check
-npm test             # Run tests (aegir, node)
+npm test             # Run tests (mocha, node)
 ```
 
 See [test/README.md](./test/README.md) for test details.

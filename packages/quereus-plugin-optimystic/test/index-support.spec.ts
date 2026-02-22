@@ -2,7 +2,7 @@
  * Tests for secondary index support in Optimystic quereus plugin
  */
 
-import { expect } from 'aegir/chai';
+import { expect } from 'chai';
 import { Database } from '@quereus/quereus';
 import type { SqlValue } from '@quereus/quereus';
 import register from '../dist/plugin.js';

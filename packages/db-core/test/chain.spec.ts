@@ -1,4 +1,4 @@
-import { expect } from 'aegir/chai'
+import { expect } from 'chai'
 import { Chain, EntriesPerBlock, entryAt } from '../src/chain/chain.js';
 import { TestBlockStore } from './test-block-store.js';
 import type { ChainDataNode } from '../src/chain/chain-nodes.js';

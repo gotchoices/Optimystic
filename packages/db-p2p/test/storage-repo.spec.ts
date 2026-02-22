@@ -1,4 +1,4 @@
-import { expect } from 'aegir/chai';
+import { expect } from 'chai';
 import { StorageRepo } from '../src/storage/storage-repo.js';
 import { BlockStorage } from '../src/storage/block-storage.js';
 import { MemoryRawStorage } from '../src/storage/memory-storage.js';

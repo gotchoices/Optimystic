@@ -1,5 +1,5 @@
 import { NetworkSimulation, type Scenario } from './simulation.js';
-import { expect } from 'aegir/chai'
+import { expect } from 'chai'
 
 describe('NetworkSimulation', () => {
   it('should create a network with the specified number of nodes', async () => {

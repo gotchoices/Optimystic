@@ -82,6 +82,18 @@ saveMaterializedBlock(block): store(structuredClone(block));
 - All nodes MUST share the same header block for a collection
 - `Collection.createOrOpen()` checks local storage first, then cluster
 
+## Cluster Authentication
+
+The cluster two-phase commit uses **cryptographic signatures**, not to be confused with ACLs.  Each peer in a `ClusterRecord.peers` entry carries a `publicKey: Uint8Array` derived from their libp2p peer ID.
+
+- **Promise phase**: each cluster member signs the promise hash with its private key
+- **Commit phase**: each cluster member signs the commit hash with its private key
+- **Validation**: every peer verifies all signatures against `record.peers[peerId].publicKey` before accepting the record
+
+This proves that the peers listed in the cluster actually voted — a coordinator cannot forge votes.  The verification hooks (`validateSignatures`, `verifySignature`, `computePromiseHash`, `computeCommitHash`) are wired in `ClusterMember` but currently stubbed (`verifySignature` returns `true`).  See task `4-cluster-signature-verification`.
+
+**Important**: cluster authentication is about _identity verification_ (did this peer really vote?), not _authorization_ (is this peer allowed to write?).  Authorization decisions like per-collection permissions belong at a higher layer (e.g. application or collection module), not in the cluster consensus path.
+
 ## Common Pitfalls
 
 ### 1. Shallow Copy of Transforms

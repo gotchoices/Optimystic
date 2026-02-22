@@ -1,4 +1,4 @@
-import { expect } from 'aegir/chai';
+import { expect } from 'chai';
 import { RingSelector, type RingSelectorConfig } from '../src/storage/ring-selector.js';
 import type { ArachnodeFretAdapter } from '../src/storage/arachnode-fret-adapter.js';
 

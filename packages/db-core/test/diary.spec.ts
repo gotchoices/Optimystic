@@ -1,4 +1,4 @@
-import { expect } from 'aegir/chai'
+import { expect } from 'chai'
 import { Diary } from '../src/collections/diary/index.js'
 import { TestTransactor } from './test-transactor.js'
 

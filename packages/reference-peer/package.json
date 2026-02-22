@@ -36,21 +36,23 @@
     "libp2p"
   ],
   "scripts": {
-    "clean": "aegir clean",
-    "build": "aegir build --env node",
+    "clean": "rimraf dist",
+    "build": "tsc",
     "mesh": "node dist/src/mesh.js",
     "start": "node dist/src/cli.js",
-    "lint": "aegir lint",
-    "test": "aegir test",
-    "test:node": "aegir test -t node",
+    "test": "node --import ./register.mjs node_modules/mocha/bin/mocha.js \"test/**/*.spec.ts\" --colors",
     "test:quick": "node dist/test/quick-test.js",
-    "test:quick:debug": "node --inspect-brk dist/test/quick-test.js",
-    "dep-check": "aegir dep-check"
+    "test:quick:debug": "node --inspect-brk dist/test/quick-test.js"
   },
   "devDependencies": {
+    "@types/chai": "^5.2.3",
     "@types/debug": "^4.1.12",
+    "@types/mocha": "^10.0.10",
     "@types/node": "^22.13.10",
-    "aegir": "^45.1.4",
+    "chai": "^6.2.2",
+    "mocha": "^11.7.5",
+    "rimraf": "^6.1.2",
+    "ts-node": "^10.9.2",
     "typescript": "^5.9.3"
   },
   "dependencies": {
@@ -62,15 +64,5 @@
     "commander": "^14.0.0",
     "debug": "^4.4.1",
     "uint8arrays": "^5.1.0"
-  },
-  "aegir": {
-    "build": {
-      "bundle": false
-    },
-    "test": {
-      "target": [
-        "node"
-      ]
-    }
   }
 }

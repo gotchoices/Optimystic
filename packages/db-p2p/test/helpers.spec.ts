@@ -1,4 +1,4 @@
-import { expect } from 'aegir/chai';
+import { expect } from 'chai';
 import { mergeRanges } from '../src/storage/helpers.js';
 
 describe('mergeRanges', () => {

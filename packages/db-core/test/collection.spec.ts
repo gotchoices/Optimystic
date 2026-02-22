@@ -1,4 +1,6 @@
-import { expect } from 'aegir/chai'
+import { use, expect } from 'chai'
+import chaiAsPromised from 'chai-as-promised'
+use(chaiAsPromised)
 import { Collection, type CollectionInitOptions } from '../src/collection/index.js'
 import { TestTransactor } from './test-transactor.js'
 import type { Action, ActionHandler, BlockStore, IBlock } from '../src/index.js'

@@ -2,7 +2,7 @@
  * Tests for QuereusEngine - SQL transaction engine for Optimystic
  */
 
-import { expect } from 'aegir/chai';
+import { expect } from 'chai';
 import { Database } from '@quereus/quereus';
 import {
 	QuereusEngine,

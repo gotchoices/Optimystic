@@ -9,7 +9,7 @@ This guide explains how to test the Optimystic Quereus plugin.
 yarn workspace @optimystic/quereus-plugin-optimystic test
 
 # Run only distributed tests
-yarn workspace @optimystic/quereus-plugin-optimystic exec aegir test -t node -- --grep "Distributed"
+cd packages/quereus-plugin-optimystic && yarn test --grep "Distributed"
 
 # Run manual mesh test
 yarn workspace @optimystic/quereus-plugin-optimystic build
@@ -42,7 +42,7 @@ The `distributed-transaction-validation.spec.ts` suite tests end-to-end distribu
 
 ```bash
 # Run transaction validation tests
-yarn workspace @optimystic/quereus-plugin-optimystic exec aegir test -t node -- --grep "Transaction Validation"
+cd packages/quereus-plugin-optimystic && yarn test --grep "Transaction Validation"
 ```
 
 ## Distributed Testing
@@ -58,7 +58,7 @@ The distributed tests create a mesh of N nodes, perform DML operations (INSERT, 
 yarn workspace @optimystic/quereus-plugin-optimystic build
 
 # Run the distributed tests
-yarn workspace @optimystic/quereus-plugin-optimystic exec aegir test -t node -- --grep "Distributed Quereus"
+cd packages/quereus-plugin-optimystic && yarn test --grep "Distributed Quereus"
 ```
 
 ### What It Tests
@@ -259,7 +259,7 @@ If data isn't replicating:
 
 If tests timeout:
 
-1. Increase mocha timeout in `.aegir.js`
+1. Increase mocha timeout via `--timeout` flag
 2. Reduce `MESH_SIZE`
 3. Increase delays between operations
 

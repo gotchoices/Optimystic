@@ -5,7 +5,7 @@
  * performs DML operations, and verifies data replication across all nodes.
  */
 
-import { expect } from 'aegir/chai';
+import { expect } from 'chai';
 import { Database } from '@quereus/quereus';
 import {
 	createLibp2pNode,

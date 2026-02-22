@@ -1,4 +1,4 @@
-import { expect } from 'aegir/chai'
+import { expect } from 'chai'
 import { NetworkTransactor } from '../src/transactor/network-transactor.js'
 import { NetworkSimulation } from './simulation.js'
 import type { Scenario } from './simulation.js'

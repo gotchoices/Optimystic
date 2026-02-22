@@ -1,4 +1,6 @@
-import { expect } from 'aegir/chai';
+import { use, expect } from 'chai';
+import chaiAsPromised from 'chai-as-promised';
+use(chaiAsPromised);
 import { Buffer } from 'buffer';
 import {
 	initParticipantContributionState, initParticipantVerificationState, initCommonDKGState,

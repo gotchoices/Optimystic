@@ -2,7 +2,7 @@
  * Tests for StampId() SQL function
  */
 
-import { expect } from 'aegir/chai';
+import { expect } from 'chai';
 import { Database } from '@quereus/quereus';
 import register from '../dist/plugin.js';
 

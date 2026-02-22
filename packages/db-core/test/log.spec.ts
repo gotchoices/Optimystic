@@ -1,4 +1,4 @@
-import { expect } from 'aegir/chai'
+import { expect } from 'chai'
 import { Log } from '../src/log/index.js'
 import type { LogBlock } from '../src/log/index.js'
 import { TestLogStore } from './test-log-store.js'
