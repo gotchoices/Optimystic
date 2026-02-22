@@ -23,7 +23,7 @@ import { TestTransactor } from './test-transactor.js';
 
 describe('Transaction', () => {
 	describe('Transaction Structure', () => {
-		it('should create a valid transaction with all required fields', () => {
+		it('should create a valid transaction with all required fields', async () => {
 			const collections: CollectionActions[] = [
 				{
 					collectionId: 'users',
@@ -34,7 +34,7 @@ describe('Transaction', () => {
 			];
 
 			const statements = createActionsStatements(collections);
-			const stamp = createTransactionStamp(
+			const stamp = await createTransactionStamp(
 				'peer1',
 				Date.now(),
 				'schema-hash-123',
@@ -46,7 +46,7 @@ describe('Transaction', () => {
 				stamp,
 				statements,
 				reads,
-				id: createTransactionId(stamp.id, statements, reads)
+				id: await createTransactionId(stamp.id, statements, reads)
 			};
 
 			expect(transaction.stamp.engineId).to.equal('actions@1.0.0');
@@ -57,15 +57,15 @@ describe('Transaction', () => {
 			expect(transaction.id).to.be.a('string');
 		});
 
-		it('should create unique stamp IDs for different peers', () => {
+		it('should create unique stamp IDs for different peers', async () => {
 			const timestamp = Date.now();
-			const stamp1 = createTransactionStamp(
+			const stamp1 = await createTransactionStamp(
 				'peer1',
 				timestamp,
 				'schema-hash-123',
 				'actions@1.0.0'
 			);
-			const stamp2 = createTransactionStamp(
+			const stamp2 = await createTransactionStamp(
 				'peer2',
 				timestamp,
 				'schema-hash-123',
@@ -75,15 +75,15 @@ describe('Transaction', () => {
 			expect(stamp1.id).to.not.equal(stamp2.id);
 		});
 
-		it('should create unique transaction IDs for different transactions', () => {
-			const stamp1 = createTransactionStamp(
+		it('should create unique transaction IDs for different transactions', async () => {
+			const stamp1 = await createTransactionStamp(
 				'peer1',
 				Date.now(),
 				'schema-hash-123',
 				'actions@1.0.0'
 			);
 
-			const stamp2 = createTransactionStamp(
+			const stamp2 = await createTransactionStamp(
 				'peer2',
 				Date.now(),
 				'schema-hash-123',
@@ -99,14 +99,14 @@ describe('Transaction', () => {
 				stamp: stamp1,
 				statements: statements1,
 				reads: reads1,
-				id: createTransactionId(stamp1.id, statements1, reads1)
+				id: await createTransactionId(stamp1.id, statements1, reads1)
 			};
 
 			const transaction2: Transaction = {
 				stamp: stamp2,
 				statements: statements2,
 				reads: reads2,
-				id: createTransactionId(stamp2.id, statements2, reads2)
+				id: await createTransactionId(stamp2.id, statements2, reads2)
 			};
 
 			expect(transaction1.id).to.not.equal(transaction2.id);
@@ -139,7 +139,7 @@ describe('Transaction', () => {
 			];
 
 			const statements = createActionsStatements(collections);
-			const stamp = createTransactionStamp(
+			const stamp = await createTransactionStamp(
 				'peer1',
 				Date.now(),
 				'schema-hash-123',
@@ -150,7 +150,7 @@ describe('Transaction', () => {
 				stamp,
 				statements,
 				reads: [],
-				id: createTransactionId(stamp.id, statements, [])
+				id: await createTransactionId(stamp.id, statements, [])
 			};
 
 			const result = await engine.execute(transaction);
@@ -174,7 +174,7 @@ describe('Transaction', () => {
 			];
 
 			const statements = createActionsStatements(collections);
-			const stamp = createTransactionStamp(
+			const stamp = await createTransactionStamp(
 				'peer1',
 				Date.now(),
 				'schema-hash-123',
@@ -185,7 +185,7 @@ describe('Transaction', () => {
 				stamp,
 				statements,
 				reads: [],
-				id: createTransactionId(stamp.id, statements, [])
+				id: await createTransactionId(stamp.id, statements, [])
 			};
 
 			const result = await engine.execute(transaction);
@@ -196,7 +196,7 @@ describe('Transaction', () => {
 		});
 
 		it('should fail execution for invalid JSON statements', async () => {
-			const stamp = createTransactionStamp(
+			const stamp = await createTransactionStamp(
 				'peer1',
 				Date.now(),
 				'schema-hash-123',
@@ -207,7 +207,7 @@ describe('Transaction', () => {
 				stamp,
 				statements: ['invalid json'],
 				reads: [],
-				id: createTransactionId(stamp.id, ['invalid json'], [])
+				id: await createTransactionId(stamp.id, ['invalid json'], [])
 			};
 
 			const result = await engine.execute(transaction);
@@ -265,7 +265,7 @@ describe('Transaction', () => {
 			];
 
 			const statements = createActionsStatements(collectionActions);
-			const stamp = createTransactionStamp(
+			const stamp = await createTransactionStamp(
 				'reference-peer',
 				Date.now(),
 				'schema-hash-123',
@@ -276,7 +276,7 @@ describe('Transaction', () => {
 				stamp,
 				statements,
 				reads: [],
-				id: createTransactionId(stamp.id, statements, [])
+				id: await createTransactionId(stamp.id, statements, [])
 			};
 
 			// Execute transaction through engine
@@ -349,7 +349,7 @@ describe('Transaction', () => {
 			];
 
 			const statements = createActionsStatements(collectionActions);
-			const stamp = createTransactionStamp(
+			const stamp = await createTransactionStamp(
 				'reference-peer',
 				Date.now(),
 				'schema-hash-123',
@@ -360,7 +360,7 @@ describe('Transaction', () => {
 				stamp,
 				statements,
 				reads: [],
-				id: createTransactionId(stamp.id, statements, [])
+				id: await createTransactionId(stamp.id, statements, [])
 			};
 
 			// Execute transaction through engine
@@ -440,7 +440,7 @@ describe('Transaction', () => {
 			];
 
 			const statements = createActionsStatements(collectionActions);
-			const stamp = createTransactionStamp(
+			const stamp = await createTransactionStamp(
 				'reference-peer',
 				Date.now(),
 				'schema-hash-123',
@@ -451,7 +451,7 @@ describe('Transaction', () => {
 				stamp,
 				statements,
 				reads: [],
-				id: createTransactionId(stamp.id, statements, [])
+				id: await createTransactionId(stamp.id, statements, [])
 			};
 
 			// Execute transaction through coordinator.execute() which goes through full PEND flow
@@ -509,7 +509,7 @@ describe('Transaction', () => {
 			];
 
 			const statements = createActionsStatements(collectionActions);
-			const stamp = createTransactionStamp(
+			const stamp = await createTransactionStamp(
 				'reference-peer',
 				Date.now(),
 				'schema-hash-123',
@@ -520,7 +520,7 @@ describe('Transaction', () => {
 				stamp,
 				statements,
 				reads: [],
-				id: createTransactionId(stamp.id, statements, [])
+				id: await createTransactionId(stamp.id, statements, [])
 			};
 
 			// Execute transaction through coordinator.execute() which goes through full flow
@@ -589,7 +589,7 @@ describe('Transaction', () => {
 			];
 
 			const statements = createActionsStatements(collectionActions);
-			const stamp = createTransactionStamp(
+			const stamp = await createTransactionStamp(
 				'reference-peer',
 				Date.now(),
 				'schema-hash-123',
@@ -600,7 +600,7 @@ describe('Transaction', () => {
 				stamp,
 				statements,
 				reads: [],
-				id: createTransactionId(stamp.id, statements, [])
+				id: await createTransactionId(stamp.id, statements, [])
 			};
 
 			// Execute transaction through coordinator.execute() which goes through full flow
@@ -667,12 +667,12 @@ describe('Transaction', () => {
 			];
 
 			const statements = createActionsStatements(collectionActions);
-			const stamp = createTransactionStamp('reference-peer', Date.now(), 'schema-hash-123', 'actions@1.0.0');
+			const stamp = await createTransactionStamp('reference-peer', Date.now(), 'schema-hash-123', 'actions@1.0.0');
 			const transaction: Transaction = {
 				stamp,
 				statements,
 				reads: [],
-				id: createTransactionId(stamp.id, statements, [])
+				id: await createTransactionId(stamp.id, statements, [])
 			};
 
 			const result = await actionsEngine.execute(transaction);
@@ -741,12 +741,12 @@ describe('Transaction', () => {
 			];
 
 			const statements = createActionsStatements(collectionActions);
-			const stamp = createTransactionStamp('reference-peer', Date.now(), 'schema-hash-123', 'actions@1.0.0');
+			const stamp = await createTransactionStamp('reference-peer', Date.now(), 'schema-hash-123', 'actions@1.0.0');
 			const transaction: Transaction = {
 				stamp,
 				statements,
 				reads: [],
-				id: createTransactionId(stamp.id, statements, [])
+				id: await createTransactionId(stamp.id, statements, [])
 			};
 
 			const result = await coordinator.execute(transaction, actionsEngine);
@@ -824,12 +824,12 @@ describe('Transaction', () => {
 			];
 
 			const statements = createActionsStatements(collectionActions);
-			const stamp = createTransactionStamp('reference-peer', Date.now(), 'schema-hash-123', 'actions@1.0.0');
+			const stamp = await createTransactionStamp('reference-peer', Date.now(), 'schema-hash-123', 'actions@1.0.0');
 			const transaction: Transaction = {
 				stamp,
 				statements,
 				reads: [],
-				id: createTransactionId(stamp.id, statements, [])
+				id: await createTransactionId(stamp.id, statements, [])
 			};
 
 			await coordinator.execute(transaction, actionsEngine);
@@ -874,12 +874,12 @@ describe('Transaction', () => {
 			];
 
 			const statements = createActionsStatements(collectionActions);
-			const stamp = createTransactionStamp('reference-peer', Date.now(), 'schema-hash-123', 'actions@1.0.0');
+			const stamp = await createTransactionStamp('reference-peer', Date.now(), 'schema-hash-123', 'actions@1.0.0');
 			const transaction: Transaction = {
 				stamp,
 				statements,
 				reads: [],
-				id: createTransactionId(stamp.id, statements, [])
+				id: await createTransactionId(stamp.id, statements, [])
 			};
 
 			const result = await actionsEngine.execute(transaction);
@@ -907,12 +907,12 @@ describe('Transaction', () => {
 
 			// Empty transaction with no actions
 			const statements = createActionsStatements([]);
-			const stamp = createTransactionStamp('reference-peer', Date.now(), 'schema-hash-123', 'actions@1.0.0');
+			const stamp = await createTransactionStamp('reference-peer', Date.now(), 'schema-hash-123', 'actions@1.0.0');
 			const transaction: Transaction = {
 				stamp,
 				statements,
 				reads: [],
-				id: createTransactionId(stamp.id, statements, [])
+				id: await createTransactionId(stamp.id, statements, [])
 			};
 
 			const result = await coordinator.execute(transaction, actionsEngine);
@@ -1000,12 +1000,12 @@ describe('Transaction', () => {
 			];
 
 			const statements = createActionsStatements(collectionActions);
-			const stamp = createTransactionStamp('reference-peer', Date.now(), 'schema-hash-123', 'actions@1.0.0');
+			const stamp = await createTransactionStamp('reference-peer', Date.now(), 'schema-hash-123', 'actions@1.0.0');
 			const transaction: Transaction = {
 				stamp,
 				statements,
 				reads: [],
-				id: createTransactionId(stamp.id, statements, [])
+				id: await createTransactionId(stamp.id, statements, [])
 			};
 
 			const result = await coordinator.execute(transaction, actionsEngine);
@@ -1066,13 +1066,13 @@ describe('Transaction', () => {
 			];
 
 			const statements = createActionsStatements(collectionActions);
-			const stamp = createTransactionStamp('reference-peer', Date.now(), 'schema-hash-123', 'actions@1.0.0');
+			const stamp = await createTransactionStamp('reference-peer', Date.now(), 'schema-hash-123', 'actions@1.0.0');
 
 			const transaction: Transaction = {
 				stamp,
 				statements,
 				reads: [],
-				id: createTransactionId(stamp.id, statements, [])
+				id: await createTransactionId(stamp.id, statements, [])
 			};
 
 			// Execute to get operations hash
@@ -1104,7 +1104,8 @@ describe('Transaction', () => {
 			const validator = new TransactionValidator(engines, createValidationCoordinator);
 
 			// Validation should succeed with matching hash (using empty transforms since we simplified)
-			const validationResult = await validator.validate(transaction, 'ops:0');
+			const expectedHash = `ops:${await hashString(JSON.stringify([]))}`;
+			const validationResult = await validator.validate(transaction, expectedHash);
 			expect(validationResult.valid).to.be.true;
 		});
 
@@ -1118,12 +1119,12 @@ describe('Transaction', () => {
 
 			const validator = new TransactionValidator(engines, createValidationCoordinator);
 
-			const stamp = createTransactionStamp('reference-peer', Date.now(), 'schema-hash-123', 'unknown-engine@1.0.0');
+			const stamp = await createTransactionStamp('reference-peer', Date.now(), 'schema-hash-123', 'unknown-engine@1.0.0');
 			const transaction: Transaction = {
 				stamp,
 				statements: [],
 				reads: [],
-				id: createTransactionId(stamp.id, [], [])
+				id: await createTransactionId(stamp.id, [], [])
 			};
 
 			const result = await validator.validate(transaction, 'ops:abc');
@@ -1164,12 +1165,12 @@ describe('Transaction', () => {
 
 			const validator = new TransactionValidator(engines, createValidationCoordinator);
 
-			const stamp = createTransactionStamp('reference-peer', Date.now(), 'schema-hash-123', 'actions@1.0.0');
+			const stamp = await createTransactionStamp('reference-peer', Date.now(), 'schema-hash-123', 'actions@1.0.0');
 			const transaction: Transaction = {
 				stamp,
 				statements: [],
 				reads: [],
-				id: createTransactionId(stamp.id, [], [])
+				id: await createTransactionId(stamp.id, [], [])
 			};
 
 			const result = await validator.validate(transaction, 'ops:abc');
@@ -1193,7 +1194,7 @@ describe('Transaction', () => {
 
 			const coordinator = new TransactionCoordinator(transactor, collections);
 			const actionsEngine = new ActionsEngine(coordinator);
-			const session = new TransactionSession(coordinator, actionsEngine);
+			const session = await TransactionSession.create(coordinator, actionsEngine);
 
 			await session.execute(
 				'stmt1',
@@ -1232,7 +1233,7 @@ describe('Transaction', () => {
 
 			const coordinator = new TransactionCoordinator(transactor, collections);
 			const actionsEngine = new ActionsEngine(coordinator);
-			const session = new TransactionSession(coordinator, actionsEngine);
+			const session = await TransactionSession.create(coordinator, actionsEngine);
 
 			await session.execute('stmt1', [
 				{ collectionId: 'users', actions: [{ type: 'replace', data: [[1, { key: 1, name: 'Alice' }]] }] },
@@ -1263,7 +1264,7 @@ describe('Transaction', () => {
 
 			const coordinator = new TransactionCoordinator(transactor, collections);
 			const actionsEngine = new ActionsEngine(coordinator);
-			const session = new TransactionSession(coordinator, actionsEngine);
+			const session = await TransactionSession.create(coordinator, actionsEngine);
 
 			await session.execute('stmt1', [
 				{ collectionId: 'users', actions: [{ type: 'replace', data: [[1, { key: 1, name: 'Alice' }]] }] }
@@ -1292,7 +1293,7 @@ describe('Transaction', () => {
 
 			const coordinator = new TransactionCoordinator(transactor, collections);
 			const actionsEngine = new ActionsEngine(coordinator);
-			const session = new TransactionSession(coordinator, actionsEngine);
+			const session = await TransactionSession.create(coordinator, actionsEngine);
 
 			await session.execute('stmt1', [
 				{ collectionId: 'users', actions: [{ type: 'replace', data: [[1, { key: 1, name: 'Alice' }]] }] }
@@ -1322,7 +1323,7 @@ describe('Transaction', () => {
 
 			const coordinator = new TransactionCoordinator(transactor, collections);
 			const actionsEngine = new ActionsEngine(coordinator);
-			const session = new TransactionSession(coordinator, actionsEngine);
+			const session = await TransactionSession.create(coordinator, actionsEngine);
 
 			await session.rollback();
 
@@ -1347,7 +1348,7 @@ describe('Transaction', () => {
 
 			const coordinator = new TransactionCoordinator(transactor, collections);
 			const actionsEngine = new ActionsEngine(coordinator);
-			const session = new TransactionSession(coordinator, actionsEngine);
+			const session = await TransactionSession.create(coordinator, actionsEngine);
 
 			expect(session.isCommitted()).to.be.false;
 			expect(session.isRolledBack()).to.be.false;
@@ -1380,10 +1381,10 @@ describe('Transaction', () => {
 				{ collectionId: 'users', actions: [{ type: 'replace', data: [[1, { key: 1, name: 'Alice' }]] }] }
 			];
 			const statements1 = createActionsStatements(actions1);
-			const stamp1 = createTransactionStamp('peer1', Date.now(), 'schema1', 'actions@1.0.0');
+			const stamp1 = await createTransactionStamp('peer1', Date.now(), 'schema1', 'actions@1.0.0');
 			const tx1: Transaction = {
 				stamp: stamp1, statements: statements1, reads: [],
-				id: createTransactionId(stamp1.id, statements1, [])
+				id: await createTransactionId(stamp1.id, statements1, [])
 			};
 
 			// Execute and commit tx1
@@ -1394,10 +1395,10 @@ describe('Transaction', () => {
 				{ collectionId: 'users', actions: [{ type: 'replace', data: [[1, { key: 1, name: 'Bob' }]] }] }
 			];
 			const statements2 = createActionsStatements(actions2);
-			const stamp2 = createTransactionStamp('peer2', Date.now() + 1, 'schema1', 'actions@1.0.0');
+			const stamp2 = await createTransactionStamp('peer2', Date.now() + 1, 'schema1', 'actions@1.0.0');
 			const tx2: Transaction = {
 				stamp: stamp2, statements: statements2, reads: [],
-				id: createTransactionId(stamp2.id, statements2, [])
+				id: await createTransactionId(stamp2.id, statements2, [])
 			};
 
 			// tx2 should encounter the transforms from tx1's committed state
@@ -1433,10 +1434,10 @@ describe('Transaction', () => {
 				{ collectionId: 'users', actions: [{ type: 'replace', data: [[1, { key: 1, name: 'Alice' }]] }] }
 			];
 			const userStatements = createActionsStatements(userActions);
-			const userStamp = createTransactionStamp('peer1', Date.now(), 'schema1', 'actions@1.0.0');
+			const userStamp = await createTransactionStamp('peer1', Date.now(), 'schema1', 'actions@1.0.0');
 			const userTx: Transaction = {
 				stamp: userStamp, statements: userStatements, reads: [],
-				id: createTransactionId(userStamp.id, userStatements, [])
+				id: await createTransactionId(userStamp.id, userStatements, [])
 			};
 
 			await actionsEngine.execute(userTx);
@@ -1468,10 +1469,10 @@ describe('Transaction', () => {
 				{ collectionId: 'users', actions: [{ type: 'replace', data: [[1, { key: 1, name: 'Alice' }]] }] }
 			];
 			const statements = createActionsStatements(actions);
-			const stamp = createTransactionStamp('peer1', Date.now(), 'schema1', 'actions@1.0.0');
+			const stamp = await createTransactionStamp('peer1', Date.now(), 'schema1', 'actions@1.0.0');
 			const tx: Transaction = {
 				stamp, statements, reads: [],
-				id: createTransactionId(stamp.id, statements, [])
+				id: await createTransactionId(stamp.id, statements, [])
 			};
 
 			// Execute locally first (this succeeds)
@@ -1517,10 +1518,10 @@ describe('Transaction', () => {
 				{ collectionId: 'users', actions: [{ type: 'replace', data: [[1, { key: 1, name: 'Alice' }]] }] }
 			];
 			const statements = createActionsStatements(actions);
-			const stamp = createTransactionStamp('peer1', Date.now(), 'schema1', 'actions@1.0.0');
+			const stamp = await createTransactionStamp('peer1', Date.now(), 'schema1', 'actions@1.0.0');
 			const tx: Transaction = {
 				stamp, statements, reads: [],
-				id: createTransactionId(stamp.id, statements, [])
+				id: await createTransactionId(stamp.id, statements, [])
 			};
 
 			await actionsEngine.execute(tx);
@@ -1566,10 +1567,10 @@ describe('Transaction', () => {
 				{ collectionId: 'posts', actions: [{ type: 'replace', data: [[10, { key: 10, title: 'Post' }]] }] },
 			];
 			const statements = createActionsStatements(actions);
-			const stamp = createTransactionStamp('peer1', Date.now(), 'schema1', 'actions@1.0.0');
+			const stamp = await createTransactionStamp('peer1', Date.now(), 'schema1', 'actions@1.0.0');
 			const tx: Transaction = {
 				stamp, statements, reads: [],
-				id: createTransactionId(stamp.id, statements, [])
+				id: await createTransactionId(stamp.id, statements, [])
 			};
 
 			await actionsEngine.execute(tx);
@@ -1633,10 +1634,10 @@ describe('Transaction', () => {
 				{ collectionId: 'posts', actions: [{ type: 'replace', data: [[10, { key: 10, title: 'Post' }]] }] },
 			];
 			const statements = createActionsStatements(actions);
-			const stamp = createTransactionStamp('peer1', Date.now(), 'schema1', 'actions@1.0.0');
+			const stamp = await createTransactionStamp('peer1', Date.now(), 'schema1', 'actions@1.0.0');
 			const tx: Transaction = {
 				stamp, statements, reads: [],
-				id: createTransactionId(stamp.id, statements, [])
+				id: await createTransactionId(stamp.id, statements, [])
 			};
 
 			await actionsEngine.execute(tx);
@@ -1691,10 +1692,10 @@ describe('Transaction', () => {
 				{ collectionId: 'posts', actions: [{ type: 'replace', data: [[10, { key: 10, title: 'Post' }]] }] },
 			];
 			const statements = createActionsStatements(actions);
-			const stamp = createTransactionStamp('peer1', Date.now(), 'schema1', 'actions@1.0.0');
+			const stamp = await createTransactionStamp('peer1', Date.now(), 'schema1', 'actions@1.0.0');
 			const tx: Transaction = {
 				stamp, statements, reads: [],
-				id: createTransactionId(stamp.id, statements, [])
+				id: await createTransactionId(stamp.id, statements, [])
 			};
 
 			await actionsEngine.execute(tx);
@@ -1756,10 +1757,10 @@ describe('Transaction', () => {
 				{ collectionId: 'posts', actions: [{ type: 'replace', data: [[10, { key: 10, title: 'Post' }]] }] },
 			];
 			const statements = createActionsStatements(actions);
-			const stamp = createTransactionStamp('peer1', Date.now(), 'schema1', 'actions@1.0.0');
+			const stamp = await createTransactionStamp('peer1', Date.now(), 'schema1', 'actions@1.0.0');
 			const tx: Transaction = {
 				stamp, statements, reads: [],
-				id: createTransactionId(stamp.id, statements, [])
+				id: await createTransactionId(stamp.id, statements, [])
 			};
 
 			await actionsEngine.execute(tx);
@@ -1776,13 +1777,13 @@ describe('Transaction', () => {
 	});
 
 	describe('Operations Hash Determinism (TEST-10.6.1)', () => {
-		it('should produce different hashes when operation order differs (ordering sensitivity)', () => {
+		it('should produce different hashes when operation order differs (ordering sensitivity)', async () => {
 			// Directly test the hashing mechanism: same operations, different order
 			const op1 = { type: 'insert', collectionId: 'users', blockId: 'b1', block: { data: 'alice' } };
 			const op2 = { type: 'insert', collectionId: 'posts', blockId: 'b2', block: { data: 'post1' } };
 
-			const hash1 = `ops:${hashString(JSON.stringify([op1, op2]))}`;
-			const hash2 = `ops:${hashString(JSON.stringify([op2, op1]))}`;
+			const hash1 = `ops:${await hashString(JSON.stringify([op1, op2]))}`;
+			const hash2 = `ops:${await hashString(JSON.stringify([op2, op1]))}`;
 
 			// Operation ordering affects the hash — confirming that Map iteration order
 			// in coordinator/validator is a determinism risk if collections are processed
@@ -1821,16 +1822,16 @@ describe('Transaction', () => {
 			];
 			const statements = createActionsStatements(actions);
 			const ts = Date.now();
-			const stamp1 = createTransactionStamp('peer1', ts, 'schema1', 'actions@1.0.0');
-			const stamp2 = createTransactionStamp('peer2', ts, 'schema1', 'actions@1.0.0');
+			const stamp1 = await createTransactionStamp('peer1', ts, 'schema1', 'actions@1.0.0');
+			const stamp2 = await createTransactionStamp('peer2', ts, 'schema1', 'actions@1.0.0');
 
 			const tx1: Transaction = {
 				stamp: stamp1, statements, reads: [],
-				id: createTransactionId(stamp1.id, statements, [])
+				id: await createTransactionId(stamp1.id, statements, [])
 			};
 			const tx2: Transaction = {
 				stamp: stamp2, statements, reads: [],
-				id: createTransactionId(stamp2.id, statements, [])
+				id: await createTransactionId(stamp2.id, statements, [])
 			};
 
 			const result1 = await coordinator1.execute(tx1, engine1);
@@ -1863,10 +1864,10 @@ describe('Transaction', () => {
 				{ collectionId: 'posts', actions: [{ type: 'replace', data: [[10, { key: 10, value: 'Post' }]] }] },
 			];
 			const statements = createActionsStatements(actions);
-			const stamp = createTransactionStamp('peer1', Date.now(), 'schema1', 'actions@1.0.0');
+			const stamp = await createTransactionStamp('peer1', Date.now(), 'schema1', 'actions@1.0.0');
 			const transaction: Transaction = {
 				stamp, statements, reads: [],
-				id: createTransactionId(stamp.id, statements, [])
+				id: await createTransactionId(stamp.id, statements, [])
 			};
 
 			await coordinator.execute(transaction, actionsEngine);
@@ -1895,7 +1896,8 @@ describe('Transaction', () => {
 			});
 
 			const validator = new TransactionValidator(engines, createValidationCoordinator);
-			const validationResult = await validator.validate(transaction, 'ops:0');
+			const expectedHash = `ops:${await hashString(JSON.stringify([]))}`;
+			const validationResult = await validator.validate(transaction, expectedHash);
 			expect(validationResult.valid).to.be.true;
 		});
 
@@ -1918,10 +1920,10 @@ describe('Transaction', () => {
 				{ collectionId: 'posts', actions: [{ type: 'replace', data: [[10, { key: 10, value: 'Post' }]] }] },
 			];
 			const statements = createActionsStatements(actions);
-			const stamp = createTransactionStamp('peer1', Date.now(), 'schema1', 'actions@1.0.0');
+			const stamp = await createTransactionStamp('peer1', Date.now(), 'schema1', 'actions@1.0.0');
 			const transaction: Transaction = {
 				stamp, statements, reads: [],
-				id: createTransactionId(stamp.id, statements, [])
+				id: await createTransactionId(stamp.id, statements, [])
 			};
 
 			await coordinator.execute(transaction, actionsEngine);
@@ -2224,10 +2226,10 @@ describe('Transaction', () => {
 				{ collectionId: 'posts', actions: [{ type: 'replace', data: [[10, { key: 10, title: 'Post' }]] }] },
 			];
 			const statements = createActionsStatements(actions);
-			const stamp = createTransactionStamp('peer1', Date.now(), 'schema1', 'actions@1.0.0');
+			const stamp = await createTransactionStamp('peer1', Date.now(), 'schema1', 'actions@1.0.0');
 			const tx: Transaction = {
 				stamp, statements, reads: [],
-				id: createTransactionId(stamp.id, statements, [])
+				id: await createTransactionId(stamp.id, statements, [])
 			};
 
 			await actionsEngine.execute(tx);
@@ -2280,10 +2282,10 @@ describe('Transaction', () => {
 				{ collectionId: 'posts', actions: [{ type: 'replace', data: [[10, { key: 10, title: 'Post' }]] }] },
 			];
 			const statements = createActionsStatements(actions);
-			const stamp = createTransactionStamp('peer1', Date.now(), 'schema1', 'actions@1.0.0');
+			const stamp = await createTransactionStamp('peer1', Date.now(), 'schema1', 'actions@1.0.0');
 			const tx: Transaction = {
 				stamp, statements, reads: [],
-				id: createTransactionId(stamp.id, statements, [])
+				id: await createTransactionId(stamp.id, statements, [])
 			};
 
 			await actionsEngine.execute(tx);
@@ -2329,10 +2331,10 @@ describe('Transaction', () => {
 				{ collectionId: 'users', actions: [{ type: 'replace', data: [[1, { key: 1, name: 'Alice' }]] }] }
 			];
 			const statements1 = createActionsStatements(actions1);
-			const stamp1 = createTransactionStamp('peer1', Date.now(), 'schema1', 'actions@1.0.0');
+			const stamp1 = await createTransactionStamp('peer1', Date.now(), 'schema1', 'actions@1.0.0');
 			const tx1: Transaction = {
 				stamp: stamp1, statements: statements1, reads: [],
-				id: createTransactionId(stamp1.id, statements1, [])
+				id: await createTransactionId(stamp1.id, statements1, [])
 			};
 
 			const result = await coordinator.execute(tx1, actionsEngine);
@@ -2363,10 +2365,10 @@ describe('Transaction', () => {
 				{ collectionId: 'users', actions: [{ type: 'replace', data: [[1, { key: 1, name: 'Alice' }]] }] }
 			];
 			const statements1 = createActionsStatements(actions1);
-			const stamp1 = createTransactionStamp('peer1', Date.now(), 'schema1', 'actions@1.0.0');
+			const stamp1 = await createTransactionStamp('peer1', Date.now(), 'schema1', 'actions@1.0.0');
 			const tx1: Transaction = {
 				stamp: stamp1, statements: statements1, reads: [],
-				id: createTransactionId(stamp1.id, statements1, [])
+				id: await createTransactionId(stamp1.id, statements1, [])
 			};
 
 			const result = await coordinator.execute(tx1, actionsEngine);
@@ -2401,10 +2403,10 @@ describe('Transaction', () => {
 				{ collectionId: 'users', actions: [{ type: 'replace', data: [[1, { key: 1, name: 'Alice' }]] }] }
 			];
 			const statements1 = createActionsStatements(actions1);
-			const stamp1 = createTransactionStamp('peer1', Date.now(), 'schema1', 'actions@1.0.0');
+			const stamp1 = await createTransactionStamp('peer1', Date.now(), 'schema1', 'actions@1.0.0');
 			const tx1: Transaction = {
 				stamp: stamp1, statements: statements1, reads: [],
-				id: createTransactionId(stamp1.id, statements1, [])
+				id: await createTransactionId(stamp1.id, statements1, [])
 			};
 
 			const result1 = await coordinator.execute(tx1, actionsEngine);
@@ -2415,10 +2417,10 @@ describe('Transaction', () => {
 				{ collectionId: 'users', actions: [{ type: 'replace', data: [[2, { key: 2, name: 'Bob' }]] }] }
 			];
 			const statements2 = createActionsStatements(actions2);
-			const stamp2 = createTransactionStamp('peer1', Date.now() + 1, 'schema1', 'actions@1.0.0');
+			const stamp2 = await createTransactionStamp('peer1', Date.now() + 1, 'schema1', 'actions@1.0.0');
 			const tx2: Transaction = {
 				stamp: stamp2, statements: statements2, reads: [],
-				id: createTransactionId(stamp2.id, statements2, [])
+				id: await createTransactionId(stamp2.id, statements2, [])
 			};
 
 			// FIX VERIFIED: actionContext is updated after tx1, so tx2 computes rev=2.
@@ -2442,14 +2444,14 @@ describe('Transaction', () => {
 			const actionsEngine = new ActionsEngine(coordinator);
 
 			// Session 1: apply actions
-			const session1 = new TransactionSession(coordinator, actionsEngine, 'peer1', 'schema1');
+			const session1 = await TransactionSession.create(coordinator, actionsEngine, 'peer1', 'schema1');
 			const actions1: CollectionActions[] = [
 				{ collectionId: 'users', actions: [{ type: 'replace', data: [[1, { key: 1, name: 'Alice' }]] }] }
 			];
 			await session1.execute(createActionsStatements(actions1)[0]!, actions1);
 
 			// Session 2: apply actions (different data on same coordinator)
-			const session2 = new TransactionSession(coordinator, actionsEngine, 'peer2', 'schema1');
+			const session2 = await TransactionSession.create(coordinator, actionsEngine, 'peer2', 'schema1');
 			const actions2: CollectionActions[] = [
 				{ collectionId: 'users', actions: [{ type: 'replace', data: [[2, { key: 2, name: 'Bob' }]] }] }
 			];
@@ -2472,10 +2474,10 @@ describe('Transaction', () => {
 	});
 
 	describe('Clock Skew and Ordering (TEST-10.8.1)', () => {
-		it('should produce identical stamp IDs for same-millisecond transactions from same peer (collision risk)', () => {
+		it('should produce identical stamp IDs for same-millisecond transactions from same peer (collision risk)', async () => {
 			const now = Date.now();
-			const stamp1 = createTransactionStamp('peer1', now, 'schema1', 'actions@1.0.0');
-			const stamp2 = createTransactionStamp('peer1', now, 'schema1', 'actions@1.0.0');
+			const stamp1 = await createTransactionStamp('peer1', now, 'schema1', 'actions@1.0.0');
+			const stamp2 = await createTransactionStamp('peer1', now, 'schema1', 'actions@1.0.0');
 
 			// Same inputs → same stamp ID. This is by design (deterministic hashing),
 			// but it means two independent transactions from the same peer at the same
@@ -2487,8 +2489,8 @@ describe('Transaction', () => {
 				{ collectionId: 'users', actions: [{ type: 'replace', data: [[1, { key: 1, name: 'Alice' }]] }] }
 			];
 			const stmts = createActionsStatements(actions);
-			const txId1 = createTransactionId(stamp1.id, stmts, []);
-			const txId2 = createTransactionId(stamp2.id, stmts, []);
+			const txId1 = await createTransactionId(stamp1.id, stmts, []);
+			const txId2 = await createTransactionId(stamp2.id, stmts, []);
 
 			// BUG: Two independent transactions produce the same ID.
 			// If peer1 sends the same operation twice (retry, or concurrent sessions),
@@ -2496,10 +2498,10 @@ describe('Transaction', () => {
 			expect(txId1, 'BUG: independent transactions collide when inputs match').to.equal(txId2);
 		});
 
-		it('should produce completely different stamp IDs for 1ms clock difference', () => {
+		it('should produce completely different stamp IDs for 1ms clock difference', async () => {
 			const now = Date.now();
-			const stamp1 = createTransactionStamp('peer1', now, 'schema1', 'actions@1.0.0');
-			const stamp2 = createTransactionStamp('peer1', now + 1, 'schema1', 'actions@1.0.0');
+			const stamp1 = await createTransactionStamp('peer1', now, 'schema1', 'actions@1.0.0');
+			const stamp2 = await createTransactionStamp('peer1', now + 1, 'schema1', 'actions@1.0.0');
 
 			// A 1ms clock difference produces a completely different stamp ID.
 			// This means clock skew between peers prevents stamp-based deduplication:
@@ -2511,22 +2513,20 @@ describe('Transaction', () => {
 			const stmts = createActionsStatements([
 				{ collectionId: 'users', actions: [{ type: 'replace', data: [[1, { key: 1, name: 'Alice' }]] }] }
 			]);
-			const txId1 = createTransactionId(stamp1.id, stmts, []);
-			const txId2 = createTransactionId(stamp2.id, stmts, []);
+			const txId1 = await createTransactionId(stamp1.id, stmts, []);
+			const txId2 = await createTransactionId(stamp2.id, stmts, []);
 			expect(txId1, '1ms difference → fully divergent transaction IDs').to.not.equal(txId2);
 		});
 
-		it('should demonstrate hashString collision within practical input range (djb2 is 32-bit)', () => {
-			// hashString uses djb2 which produces a 32-bit integer, giving ~2.1 billion
-			// unique values. Birthday paradox predicts ~50% collision at ~50K inputs.
-			// For stamp IDs, this means a busy network with many peers and transactions
-			// has a realistic chance of accidental ID collision.
+		it('should not produce hashString collisions within practical input range (SHA-256)', async () => {
+			// SHA-256 produces 256-bit output — collision within 100K inputs is
+			// astronomically unlikely (birthday bound ~2^128).
 			const seen = new Map<string, string>();
 			let collision: [string, string] | undefined;
 
 			for (let i = 0; i < 100_000 && !collision; i++) {
 				const input = `{"peerId":"peer-${i}","timestamp":${1700000000000 + i},"schemaHash":"s","engineId":"e"}`;
-				const hash = hashString(input);
+				const hash = await hashString(input);
 				const existing = seen.get(hash);
 				if (existing) {
 					collision = [existing, input];
@@ -2534,10 +2534,7 @@ describe('Transaction', () => {
 				seen.set(hash, input);
 			}
 
-			// BUG: djb2 hash collides within a practical number of stamp-like inputs.
-			// This means two completely different transaction stamps can produce the same
-			// stamp ID, making them indistinguishable in logs and deduplication.
-			expect(collision, 'BUG: hashString (djb2) produces collisions within 100K stamp-like inputs').to.not.be.undefined;
+			expect(collision, 'SHA-256 should not collide within 100K inputs').to.be.undefined;
 		});
 
 		it('should order transactions by commit sequence, not by timestamp', async () => {

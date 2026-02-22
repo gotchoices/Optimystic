@@ -96,7 +96,7 @@ export class TransactionValidator implements ITransactionValidator {
 			const allOperations = this.collectOperations(transforms);
 
 			// 8. Compute hash
-			const computedHash = this.hashOperations(allOperations);
+			const computedHash = await this.hashOperations(allOperations);
 
 			// 9. Compare with sender's hash
 			if (computedHash !== operationsHash) {
@@ -139,9 +139,9 @@ export class TransactionValidator implements ITransactionValidator {
 	 * Compute hash of all operations.
 	 * Must match TransactionCoordinator.hashOperations for consistent validation.
 	 */
-	private hashOperations(operations: readonly Operation[]): string {
+	private async hashOperations(operations: readonly Operation[]): Promise<string> {
 		const operationsData = JSON.stringify(operations);
-		return `ops:${hashString(operationsData)}`;
+		return `ops:${await hashString(operationsData)}`;
 	}
 }
 

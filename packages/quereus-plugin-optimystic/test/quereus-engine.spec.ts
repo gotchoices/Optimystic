@@ -347,12 +347,12 @@ describe('QuereusEngine', () => {
 			});
 
 			// Create a transaction with a different engine ID
-			const stamp = createTransactionStamp('test-peer', Date.now(), 'schema-hash', 'other-engine@1.0.0');
+			const stamp = await createTransactionStamp('test-peer', Date.now(), 'schema-hash', 'other-engine@1.0.0');
 			const transaction: Transaction = {
 				stamp,
 				statements: [],
 				reads: [],
-				id: createTransactionId(stamp.id, [], []),
+				id: await createTransactionId(stamp.id, [], []),
 			};
 
 			const result = await validator.validate(transaction, 'ops:abc');
@@ -376,12 +376,12 @@ describe('QuereusEngine', () => {
 			});
 
 			// Create a transaction with wrong schema hash
-			const stamp = createTransactionStamp('test-peer', Date.now(), 'wrong-schema-hash', QUEREUS_ENGINE_ID);
+			const stamp = await createTransactionStamp('test-peer', Date.now(), 'wrong-schema-hash', QUEREUS_ENGINE_ID);
 			const transaction: Transaction = {
 				stamp,
 				statements: [],
 				reads: [],
-				id: createTransactionId(stamp.id, [], []),
+				id: await createTransactionId(stamp.id, [], []),
 			};
 
 			const result = await validator.validate(transaction, 'ops:abc');

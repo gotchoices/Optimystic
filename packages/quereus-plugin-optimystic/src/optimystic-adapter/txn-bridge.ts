@@ -1,5 +1,5 @@
 import type { ITransactor, TransactionCoordinator, ITransactionEngine } from '@optimystic/db-core';
-import { TransactionSession, createTransactionStamp, createTransactionId } from '@optimystic/db-core';
+import { TransactionSession } from '@optimystic/db-core';
 import type { TransactionState, ParsedOptimysticOptions } from '../types.js';
 import { CollectionFactory } from './collection-factory.js';
 import { generateStampId } from '../util/generate-stamp-id.js';
@@ -81,7 +81,7 @@ export class TransactionBridge {
     // Create TransactionSession if transaction mode is enabled
     if (this.coordinator && this.engine && this.schemaHashProvider) {
       const schemaHash = await this.schemaHashProvider();
-      this.session = new TransactionSession(
+      this.session = await TransactionSession.create(
         this.coordinator,
         this.engine,
         peerId,

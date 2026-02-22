@@ -122,7 +122,7 @@ export class TransactionCoordinator {
 			)
 		]);
 
-		const operationsHash = this.hashOperations(allOperations);
+		const operationsHash = await this.hashOperations(allOperations);
 
 		// Execute consensus phases (GATHER, PEND, COMMIT)
 		const coordResult = await this.coordinateTransaction(
@@ -195,9 +195,9 @@ export class TransactionCoordinator {
 	 * This hash is used for validation - validators re-execute the transaction
 	 * and compare their computed operations hash with this one.
 	 */
-	private hashOperations(operations: readonly Operation[]): string {
+	private async hashOperations(operations: readonly Operation[]): Promise<string> {
 		const operationsData = JSON.stringify(operations);
-		return `ops:${hashString(operationsData)}`;
+		return `ops:${await hashString(operationsData)}`;
 	}
 
 	/**
@@ -223,7 +223,7 @@ export class TransactionCoordinator {
 		const reads = context.getReads();
 
 		// Create stamp from context
-		const stamp = createTransactionStamp(
+		const stamp = await createTransactionStamp(
 			'local', // TODO: Get from context or coordinator
 			Date.now(),
 			'', // TODO: Get from engine
@@ -234,7 +234,7 @@ export class TransactionCoordinator {
 			stamp,
 			statements,
 			reads,
-			id: createTransactionId(stamp.id, statements, reads)
+			id: await createTransactionId(stamp.id, statements, reads)
 		};
 
 		const engine = new ActionsEngine(this);
@@ -301,7 +301,7 @@ export class TransactionCoordinator {
 				({ type: 'delete' as const, collectionId, blockId })
 			)
 		]);
-		const operationsHash = this.hashOperations(allOperations);
+		const operationsHash = await this.hashOperations(allOperations);
 
 		// 4. Coordinate (GATHER if multi-collection)
 		const coordResult = await this.coordinateTransaction(

@@ -14,7 +14,7 @@ import { createTransactionStamp, createTransactionId } from "./transaction.js";
  * - The Transaction is then committed through coordinator.commit() for PEND/COMMIT orchestration
  *
  * Usage:
- *   const session = new TransactionSession(coordinator, engine);
+ *   const session = await TransactionSession.create(coordinator, engine);
  *   await session.execute('INSERT INTO users (id, name) VALUES (?, ?)', [1, 'Alice']);
  *   await session.execute('SELECT * FROM orders WHERE user_id = ?', [1]);
  *   const result = await session.commit();
@@ -27,19 +27,31 @@ export class TransactionSession {
 	private committed = false;
 	private rolledBack = false;
 
-	constructor(
+	private constructor(
 		private readonly coordinator: TransactionCoordinator,
 		private readonly engine: ITransactionEngine,
-		peerId: string = 'local', // TODO: Get from coordinator or config
-		schemaHash: string = '' // TODO: Get from engine
+		stamp: TransactionStamp
 	) {
-		// Create stamp at BEGIN (stable throughout transaction)
-		this.stamp = createTransactionStamp(
+		this.stamp = stamp;
+	}
+
+	/**
+	 * Create a new TransactionSession.
+	 * Uses async factory because stamp creation requires SHA-256 hashing.
+	 */
+	static async create(
+		coordinator: TransactionCoordinator,
+		engine: ITransactionEngine,
+		peerId: string = 'local',
+		schemaHash: string = ''
+	): Promise<TransactionSession> {
+		const stamp = await createTransactionStamp(
 			peerId,
 			Date.now(),
 			schemaHash,
 			'unknown' // TODO: Get engine ID from engine
 		);
+		return new TransactionSession(coordinator, engine, stamp);
 	}
 
 	/**
@@ -113,7 +125,7 @@ export class TransactionSession {
 			stamp: this.stamp,
 			statements: this.statements,
 			reads: [], // TODO: Track reads during statement execution
-			id: createTransactionId(this.stamp.id, this.statements, [])
+			id: await createTransactionId(this.stamp.id, this.statements, [])
 		};
 
 		// Commit through coordinator (which will orchestrate PEND/COMMIT)

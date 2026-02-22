@@ -71,14 +71,14 @@ export type TransactionRef = string; // The transaction ID
  * Create a transaction stamp with computed id.
  * The id is a hash of the stamp fields.
  */
-export function createTransactionStamp(
+export async function createTransactionStamp(
 	peerId: string,
 	timestamp: number,
 	schemaHash: string,
 	engineId: string
-): TransactionStamp {
+): Promise<TransactionStamp> {
 	const stampData = JSON.stringify({ peerId, timestamp, schemaHash, engineId });
-	const id = `stamp:${hashString(stampData)}`;
+	const id = `stamp:${await hashString(stampData)}`;
 	return { peerId, timestamp, schemaHash, engineId, id };
 }
 
@@ -86,13 +86,13 @@ export function createTransactionStamp(
  * Create a transaction id from stamp id, statements, and reads.
  * This is the final transaction identity used in logs.
  */
-export function createTransactionId(
+export async function createTransactionId(
 	stampId: string,
 	statements: string[],
 	reads: ReadDependency[]
-): string {
+): Promise<string> {
 	const txData = JSON.stringify({ stampId, statements, reads });
-	return `tx:${hashString(txData)}`;
+	return `tx:${await hashString(txData)}`;
 }
 
 
