@@ -50,8 +50,8 @@ If you spot code or design aspects that aren't covered by these tasks, please ad
 
 ### 2.1 Transaction Core (`packages/db-core/src/transaction/`)
 
-- [x] **HUNT-2.1.1**: `transaction.ts` - Simple hash function used for transaction IDs - **SECURITY CONCERN**: Non-cryptographic hash may have collision issues - FIXED: Created shared hashString utility with proper djb2 implementation
-- [x] **HUNT-2.1.2**: `coordinator.ts` - Same weak hash function used in `hashOperations()` - must match validator - FIXED: Both coordinator.ts and validator.ts now use shared hashString utility
+- [x] **HUNT-2.1.1**: `transaction.ts` - Simple hash function used for transaction IDs - **SECURITY CONCERN**: Non-cryptographic hash may have collision issues - FIXED: Upgraded hashString from djb2 to SHA-256 (`multiformats/hashes/sha2`). Now async, returns base64url-encoded 256-bit output.
+- [x] **HUNT-2.1.2**: `coordinator.ts` - Same weak hash function used in `hashOperations()` - must match validator - FIXED: Both coordinator.ts and validator.ts use shared async hashString (SHA-256)
 - [x] **HUNT-2.1.3**: `validator.ts` - TODO: "Implement read dependency validation" - **INCOMPLETE FEATURE** - DOCUMENTED: See `tasks/refactoring/read-dependency-validation.md`
 - [x] **HUNT-2.1.4**: Review deprecated `TransactionContext` pattern vs newer `TransactionSession` - VERIFIED: Clean deprecation pattern. `TransactionContext` is only used internally in coordinator.ts, marked `@deprecated` at line 206. Tests updated to use `TransactionSession` (line 214-215 comment). No production code outside db-core uses `TransactionContext`. The quereus-plugin-optimystic uses `TransactionSession` exclusively (txn-bridge.ts).
 - [x] **TEST-2.1.1**: Add transaction rollback regression tests - DONE: 6 tests in transaction.spec.ts covering rollback state clearing, multi-collection rollback, double-rollback, post-commit rollback, post-rollback execute, and state flags.
@@ -247,7 +247,7 @@ If you spot code or design aspects that aren't covered by these tasks, please ad
 ### 9.2 Security Review
 
 - [x] **SEC-9.2.1**: **CRITICAL**: `cluster-repo.ts:339` - Signature verification not implemented - DOCUMENTED: See `tasks/refactoring/signature-verification-implementation.md`
-- [x] **SEC-9.2.2**: Review all hash functions for cryptographic strength requirements - VERIFIED: Cryptographic ops use SHA-256/512/BLAKE3 from @noble/hashes. Non-crypto uses (FNV-1a for schema versioning, djb2 for identifiers) are documented and appropriate.
+- [x] **SEC-9.2.2**: Review all hash functions for cryptographic strength requirements - VERIFIED: Cryptographic ops use SHA-256/512/BLAKE3 from @noble/hashes. Transaction identifiers now use SHA-256 via `multiformats/hashes/sha2`. Non-crypto uses (FNV-1a for schema versioning) are documented and appropriate.
 - [x] **SEC-9.2.3**: Review input validation at API boundaries - VERIFIED:
   - SQL layer: `validateValue()`, `validateAndParse()` in types/validation.ts. Statement `bindAll()` validates parameter types.
   - Network layer: `validateRecord()` in cluster-repo.ts validates message hash, signatures, expiration.
@@ -396,12 +396,10 @@ If you spot code or design aspects that aren't covered by these tasks, please ad
   - What fraction of Byzantine nodes can be tolerated? (f < n/3 is typical) - Cannot be guaranteed without signature verification
   - Are signature verification stubs (returning `true`) a BFT violation? - YES, any peer can forge signatures
 - [x] **THEORY-10.4.2**: Review validation completeness - VERIFIED with GAPS:
-  - Hash generation: `hashOperations()` uses `JSON.stringify()` + `hashString()` (djb2, non-cryptographic).
+  - Hash generation: `hashOperations()` uses `JSON.stringify()` + `hashString()` (SHA-256, cryptographic).
   - Validators re-execute: `TransactionValidator.validate()` re-runs SQL, computes own hash, compares.
-  - Byzantine coordinator: Could forge hash if djb2 collision found (feasible with effort).
-  - GAP: djb2 is NOT collision-resistant. See `tasks/refactoring/cryptographic-hash-upgrade.md`.
+  - SHA-256 is collision-resistant (birthday bound ~2^128). Hash forging is computationally infeasible.
   - Mitigation: Validators re-execute and compare, so forged hash would fail validation.
-  - NOTE: Upgrade to SHA-256 recommended for operationsHash.
 - [x] **THEORY-10.4.3**: Review equivocation prevention - VERIFIED with GAPS:
   - Promise structure: `Signature` type has `type: 'approve' | 'reject'` and `signature` string.
   - Promise hash: `computePromiseHash()` includes messageHash + message (SHA-256).
@@ -504,7 +502,7 @@ If you spot code or design aspects that aren't covered by these tasks, please ad
   - NOTE: At 1M transactions/second, would take ~285 years to overflow. Practical non-issue.
 - [x] **TEST-10.8.1**: Add clock skew and ordering tests — COMPLETE: 4 tests, 3 issues found:
   - BUG: Identical stamp inputs produce identical stamp/transaction IDs — independent transactions from same peer at same ms are indistinguishable
-  - BUG: `hashString` (djb2, 32-bit) produces collisions within 100K stamp-like inputs — different stamps can produce identical IDs
+  - FIXED: `hashString` upgraded from djb2 (32-bit, collision-prone) to SHA-256 (256-bit) — no collisions within 100K inputs
   - VERIFIED: 1ms clock difference produces fully divergent stamp IDs — minor skew prevents deduplication
   - VERIFIED: Transaction ordering determined by commit sequence (revision), not timestamp
 

@@ -194,7 +194,7 @@ describe('TransactorSource', () => {
       },
       policy: 'c'
     })
-    await network.commit({ actionId: insertActionId, blockIds: [blockId], rev: 1 })
+    await network.commit({ actionId: insertActionId, blockIds: [blockId], tailId: blockId, rev: 1 })
 
     // Start an update action
     const updateActionId = generateActionId()

@@ -473,10 +473,11 @@ class OptimysticModule implements VirtualTableModule {
     // Get or create session from context
     const stampId = context.stampId || this.createStampId();
     if (!this.session || this.session.stampId !== stampId) {
-      this.session = new TransactionSession(
+      this.session = await TransactionSession.create(
         this.coordinator,
-        stampId,
-        QUEREUS_ENGINE_ID
+        this.engine,
+        peerId,
+        schemaHash
       );
     }
 
@@ -1422,8 +1423,8 @@ const stamp: TransactionStamp = {
   schemaHash: await quereusEngine.getSchemaHash(), // Cached
   engineId: 'quereus@0.5.3'
 };
-// Create TransactionSession (stamp is created internally):
-const session = new TransactionSession(coordinator, engine, peerId, schemaHash);
+// Create TransactionSession (stamp creation is async due to SHA-256 hashing):
+const session = await TransactionSession.create(coordinator, engine, peerId, schemaHash);
 ```
 
 **2. Execute Statement (quereus-plugin-optimystic)**
