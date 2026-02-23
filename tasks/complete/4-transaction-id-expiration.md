@@ -28,7 +28,7 @@ Added an `expiration` field to `TransactionStamp` that encodes an absolute milli
 
 ## Testing
 
-New tests in `packages/db-core/test/transaction.spec.ts`:
+Tests in `packages/db-core/test/transaction.spec.ts`:
 - `stamp includes expiration computed from timestamp + ttlMs` — verifies default TTL
 - `stamp with custom TTL computes correct expiration` — verifies custom TTL
 - `different expirations produce different stamp IDs` — verifies expiration is part of hash
@@ -43,4 +43,12 @@ All 213 db-core tests pass. Quereus plugin builds cleanly (uses default TTL via 
 
 - `npm run build` passes for `@optimystic/db-core` and `quereus-plugin-optimystic`
 - `npm test` passes for `@optimystic/db-core` (213 tests)
-- Existing tests unaffected (optional `ttlMs` parameter with default preserves backward compatibility)
+- Backward compatible: optional `ttlMs` parameter with default preserves all existing call sites
+
+## Review Notes
+
+- Interface is clean: absolute epoch avoids clock-drift during distributed validation
+- Expiration hashed into stamp ID prevents tampering
+- Early rejection at all four enforcement points avoids wasted computation
+- Tests use past timestamps + tiny TTL rather than mocking `Date.now()` — pragmatic and non-fragile
+- Exports properly re-exported from `transaction/index.ts`
