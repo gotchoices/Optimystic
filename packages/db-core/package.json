@@ -15,6 +15,10 @@
     ".": {
       "types": "./dist/src/index.d.ts",
       "import": "./dist/src/index.js"
+    },
+    "./test": {
+      "types": "./dist/test/test-transactor.d.ts",
+      "import": "./dist/test/test-transactor.js"
     }
   },
   "repository": {
