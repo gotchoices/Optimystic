@@ -1,6 +1,9 @@
 import type { PeerId } from "../network/types.js";
 import type { BlockId } from "../index.js";
 import { Pending } from "./pending.js";
+import { createLogger } from "../logger.js";
+
+const log = createLogger('batch-coordinator');
 
 /**
  * Represents a batch of operations for a specific block coordinated by a peer
@@ -122,6 +125,7 @@ export async function processBatches<TPayload, TResponse>(
                 .catch(async e => {
                     if (expiration > Date.now()) {
                         const excludedPeers = [batch.peerId, ...(batch.excludedPeers ?? [])];
+                        log('retry peer=%s excluded=%d', batch.peerId.toString(), excludedPeers.length);
                         const retries = await createBatchesForPayload<TPayload, TResponse>(
                             getBlockIds(batch),
                             batch.payload,
@@ -170,5 +174,7 @@ export async function createBatchesForPayload<TPayload, TResponse>(
 	);
 
 	// Group blocks around their coordinating peers
-	return makeBatchesByPeer<TPayload, TResponse>(blockIdPeerId, payload, getBlockPayload, excludedPeers);
+	const batches = makeBatchesByPeer<TPayload, TResponse>(blockIdPeerId, payload, getBlockPayload, excludedPeers);
+	log('createBatches blockIds=%d batches=%d excluded=%d', distinctBlockIds.size, batches.length, excludedPeers.length);
+	return batches;
 }

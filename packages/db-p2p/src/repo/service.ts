@@ -6,6 +6,9 @@ import { peersEqual } from '../peer-utils.js'
 import { sha256 } from 'multiformats/hashes/sha2'
 import { encodePeers } from './redirect.js'
 import type { Uint8ArrayList } from 'uint8arraylist'
+import { createLogger } from '../logger.js'
+
+const debugLog = createLogger('repo-service')
 
 // Define Components interface
 interface BaseComponents {
@@ -131,13 +134,7 @@ export class RepoService implements Startable {
 							const smallMesh = cluster.length < this.responsibilityK
 							if (!smallMesh && !isMember) {
 								const peers = cluster.filter((p: any) => !peersEqual(p, selfId))
-								console.debug('repo-service:redirect', {
-									peerId: selfId.toString(),
-									reason: 'not-cluster-member',
-									operation: 'get',
-									blockId: operation.get.blockIds[0],
-									cluster: cluster.map((p: any) => p.toString?.() ?? String(p))
-								})
+								debugLog('redirect op=get blockId=%s cluster=%d', operation.get.blockIds[0], cluster.length)
 								response = encodePeers(peers.map((pid: any) => ({ id: pid.toString(), addrs: [] })))
 							} else {
 								response = await this.repo.get(operation.get, { expiration: message.expiration, skipClusterFetch: true } as any)
@@ -161,13 +158,7 @@ export class RepoService implements Startable {
 							const smallMesh = cluster.length < this.responsibilityK
 							if (!smallMesh && !isMember) {
 								const peers = cluster.filter((p: any) => !peersEqual(p, selfId))
-								console.debug('repo-service:redirect', {
-									peerId: selfId.toString(),
-									reason: 'not-cluster-member',
-									operation: 'pend',
-									blockId: id,
-									cluster: cluster.map((p: any) => p.toString?.() ?? String(p))
-								})
+								debugLog('redirect op=pend blockId=%s cluster=%d', id, cluster.length)
 								response = encodePeers(peers.map((pid: any) => ({ id: pid.toString(), addrs: [] })))
 							} else {
 								response = await this.repo.pend(operation.pend, { expiration: message.expiration })
@@ -194,13 +185,7 @@ export class RepoService implements Startable {
 							const smallMesh = cluster.length < this.responsibilityK
 							if (!smallMesh && !isMember) {
 								const peers = cluster.filter((p: any) => !peersEqual(p, selfId))
-								console.debug('repo-service:redirect', {
-									peerId: selfId.toString(),
-									reason: 'not-cluster-member',
-									operation: 'commit',
-									tailId: operation.commit.tailId,
-									cluster: cluster.map((p: any) => p.toString?.() ?? String(p))
-								})
+								debugLog('redirect op=commit tailId=%s cluster=%d', operation.commit.tailId, cluster.length)
 								response = encodePeers(peers.map((pid: any) => ({ id: pid.toString(), addrs: [] })))
 							} else {
 								response = await this.repo.commit(operation.commit, { expiration: message.expiration })

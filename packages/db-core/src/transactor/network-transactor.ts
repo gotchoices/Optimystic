@@ -5,6 +5,9 @@ import { transformForBlockId, groupBy, concatTransforms, concatTransform, transf
 import { blockIdToBytes } from "../utility/block-id-to-bytes.js";
 import { isRecordEmpty } from "../utility/is-record-empty.js";
 import { type CoordinatorBatch, makeBatchesByPeer, incompleteBatches, everyBatch, allBatches, mergeBlocks, processBatches, createBatchesForPayload } from "../utility/batch-coordinator.js";
+import { createLogger } from "../logger.js";
+
+const log = createLogger('network-transactor');
 
 type NetworkTransactorInit = {
 	timeoutMs: number;
@@ -31,6 +34,7 @@ export class NetworkTransactor implements ITransactor {
 	async get(blockGets: BlockGets): Promise<GetBlockResults> {
 		// Group by block id
 		const distinctBlockIds = Array.from(new Set(blockGets.blockIds));
+		log('get blockIds=%d', distinctBlockIds.length);
 
 		const batches = await this.batchesForPayload<BlockId[], GetBlockResults>(
 			distinctBlockIds,
@@ -77,6 +81,7 @@ export class NetworkTransactor implements ITransactor {
 		) as CoordinatorBatch<BlockId[], GetBlockResults>[];
 
 		if (retryable.length > 0 && Date.now() < expiration) {
+			log('get:retry retryable=%d', retryable.length);
 			try {
 				const excludedByRoot = new Map<CoordinatorBatch<BlockId[], GetBlockResults>, Set<PeerId>>();
 				for (const b of retryable) {
@@ -128,6 +133,7 @@ export class NetworkTransactor implements ITransactor {
 		// Ensure we have at least one response per requested block id
 		const missingIds = distinctBlockIds.filter(bid => !resultEntries.has(bid));
 		if (missingIds.length > 0) {
+			log('get:missing blockIds=%o', missingIds);
 			const details = this.formatBatchStatuses(batches,
 				b => (b.request?.isResponse as boolean) ?? false,
 				b => {
@@ -227,6 +233,7 @@ export class NetworkTransactor implements ITransactor {
 		};
 		const blockIds = blockIdsForTransforms(blockAction.transforms);
 		const batches = await this.consolidateCoordinators(blockIds, blockAction.transforms, transformForBlock);
+		log('pend actionId=%s blockIds=%d batches=%d', blockAction.actionId, blockIds.length, batches.length);
 		const expiration = Date.now() + this.timeoutMs;
 
 		let error: Error | undefined;
@@ -274,9 +281,11 @@ export class NetworkTransactor implements ITransactor {
 		}
 
 		if (error) { // If any failures, cancel all pending actions as background microtask
+			log('pend:cancel actionId=%s', blockAction.actionId);
 			void Promise.resolve().then(() => this.cancelBatch(batches, { blockIds, actionId: blockAction.actionId }));
 			const stale = Array.from(allBatches(batches, b => b.request?.isResponse as boolean && !b.request!.response!.success));
 			if (stale.length > 0) {	// Any active stale failures should preempt reporting connection or other potential transient errors (we have information)
+				log('pend:stale actionId=%s staleCount=%d', blockAction.actionId, stale.length);
 				return {
 					success: false,
 					missing: distinctBlockActionTransforms(stale.flatMap(b => (b.request!.response! as StaleFailure).missing).filter((x): x is ActionTransforms => x !== undefined)),
@@ -295,6 +304,7 @@ export class NetworkTransactor implements ITransactor {
 	}
 
 	async cancel(actionRef: ActionBlocks): Promise<void> {
+		log('cancel actionId=%s blockIds=%d', actionRef.actionId, actionRef.blockIds.length);
 		const batches = await this.batchesForPayload<BlockId[], void>(
 			actionRef.blockIds,
 			actionRef.blockIds,
@@ -320,6 +330,7 @@ export class NetworkTransactor implements ITransactor {
 	}
 
 	async commit(request: CommitRequest): Promise<CommitResult> {
+		log('commit actionId=%s rev=%d blockIds=%d', request.actionId, request.rev, request.blockIds.length);
 		const allBlockIds = [...new Set([...request.blockIds, request.tailId])];
 
 		// Commit the header block if provided and not already in blockIds
@@ -372,6 +383,7 @@ export class NetworkTransactor implements ITransactor {
 	private async commitBlocks({ blockIds, actionId, rev }: RepoCommitRequest) {
 		const expiration = Date.now() + this.timeoutMs;
 		const batches = await this.batchesForPayload<BlockId[], CommitResult>(blockIds, blockIds, mergeBlocks, []);
+		log('commitBlocks actionId=%s rev=%d batches=%d', actionId, rev, batches.length);
 		let error: Error | undefined;
 		try {
 			await processBatches(

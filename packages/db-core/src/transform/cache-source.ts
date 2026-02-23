@@ -1,5 +1,8 @@
 import type { IBlock, BlockHeader, BlockId, BlockSource, BlockType, Transforms } from "../index.js";
 import { applyOperation } from "../index.js";
+import { createLogger } from "../logger.js";
+
+const log = createLogger('cache');
 
 export class CacheSource<T extends IBlock> implements BlockSource<T> {
 	protected cache = new Map<BlockId, T>();
@@ -10,10 +13,15 @@ export class CacheSource<T extends IBlock> implements BlockSource<T> {
 
 	async tryGet(id: BlockId): Promise<T | undefined> {
 		let block = this.cache.get(id);
-		if (!block) {
+		if (block) {
+			log('hit id=%s', id);
+		} else {
 			block = await this.source.tryGet(id);
 			if (block) {
 				this.cache.set(id, block);
+				log('miss:loaded id=%s cacheSize=%d', id, this.cache.size);
+			} else {
+				log('miss:absent id=%s', id);
 			}
 		}
 		return structuredClone(block);

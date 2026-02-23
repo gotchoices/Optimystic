@@ -11,6 +11,9 @@ import {
 } from "@optimystic/db-core";
 import { asyncIteratorToArray } from "../it-utility.js";
 import type { IBlockStorage } from "./i-block-storage.js";
+import { createLogger } from "../logger.js";
+
+const log = createLogger('storage-repo');
 
 export type StorageRepoOptions = {
 	/** Optional hook to validate transactions in PendRequests */
@@ -29,6 +32,7 @@ export class StorageRepo implements IRepo {
 
 	async get({ blockIds, context }: BlockGets, options?: MessageOptions): Promise<GetBlockResults> {
 		const distinctBlockIds = Array.from(new Set(blockIds));
+		log('get blockIds=%d', distinctBlockIds.length);
 		const results = await Promise.all(distinctBlockIds.map(async (blockId) => {
 			const blockStorage = this.createBlockStorage(blockId);
 
@@ -92,6 +96,7 @@ export class StorageRepo implements IRepo {
 		}
 
 		const blockIds = blockIdsForTransforms(request.transforms);
+		log('pend actionId=%s blockIds=%d rev=%s', request.actionId, blockIds.length, request.rev);
 		const pendings: ActionPending[] = [];
 		const missing: ActionTransforms[] = [];
 
@@ -131,6 +136,7 @@ export class StorageRepo implements IRepo {
 		}
 
 		if (missing.length) {
+			log('pend:stale actionId=%s missing=%d', request.actionId, missing.length);
 			return {
 				success: false,
 				missing
@@ -175,6 +181,7 @@ export class StorageRepo implements IRepo {
 	}
 
 	async cancel(actionRef: ActionBlocks, _options?: MessageOptions): Promise<void> {
+		log('cancel actionId=%s blockIds=%d', actionRef.actionId, actionRef.blockIds.length);
 		await Promise.all(actionRef.blockIds.map(blockId => {
 			const blockStorage = this.createBlockStorage(blockId);
 			return blockStorage.deletePendingTransaction(actionRef.actionId);
@@ -182,6 +189,7 @@ export class StorageRepo implements IRepo {
 	}
 
 	async commit(request: CommitRequest, options?: MessageOptions): Promise<CommitResult> {
+		log('commit actionId=%s rev=%d blockIds=%d', request.actionId, request.rev, request.blockIds.length);
 		const uniqueBlockIds = Array.from(new Set(request.blockIds)).sort();
 		const releases: (() => void)[] = [];
 
@@ -222,6 +230,7 @@ export class StorageRepo implements IRepo {
 			}
 
 			if (missedCommits.length) {
+				log('commit:stale actionId=%s missed=%d', request.actionId, missedCommits.length);
 				return { // Return directly, locks will be released in finally
 					success: false,
 					missing: perBlockActionTransformsToPerAction(missedCommits)

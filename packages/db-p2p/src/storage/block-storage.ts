@@ -4,6 +4,9 @@ import type { BlockArchive, BlockMetadata, RestoreCallback, RevisionRange } from
 import type { IRawStorage } from "./i-raw-storage.js";
 import { mergeRanges } from "./helpers.js";
 import type { IBlockStorage } from "./i-block-storage.js";
+import { createLogger } from "../logger.js";
+
+const log = createLogger('block-storage');
 
 export class BlockStorage implements IBlockStorage {
 	constructor(
@@ -45,6 +48,7 @@ export class BlockStorage implements IBlockStorage {
 	}
 
 	async savePendingTransaction(actionId: ActionId, transform: Transform): Promise<void> {
+		log('pend blockId=%s actionId=%s', this.blockId, actionId);
 		let meta = await this.storage.getMetadata(this.blockId);
 		if (!meta) {
 			meta = { latest: undefined, ranges: [[0]] };
@@ -54,6 +58,7 @@ export class BlockStorage implements IBlockStorage {
 	}
 
 	async deletePendingTransaction(actionId: ActionId): Promise<void> {
+		log('cancel blockId=%s actionId=%s', this.blockId, actionId);
 		await this.storage.deletePendingTransaction(this.blockId, actionId);
 	}
 
@@ -70,6 +75,7 @@ export class BlockStorage implements IBlockStorage {
 	}
 
 	async promotePendingTransaction(actionId: ActionId): Promise<void> {
+		log('commit blockId=%s actionId=%s', this.blockId, actionId);
 		await this.storage.promotePendingTransaction(this.blockId, actionId);
 	}
 

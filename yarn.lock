@@ -1057,6 +1057,7 @@ __metadata:
     "@multiformats/multiaddr": "npm:^13.0.1"
     "@noble/hashes": "npm:^2.0.1"
     "@types/chai-as-promised": "npm:^8.0.2"
+    "@types/debug": "npm:^4.1.12"
     "@types/mocha": "npm:^10.0.10"
     "@types/node": "npm:^25.1.0"
     chai: "npm:^6.2.2"
