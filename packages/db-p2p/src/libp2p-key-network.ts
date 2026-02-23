@@ -406,7 +406,8 @@ export class Libp2pKeyPeerNetwork implements IKeyNetwork, IPeerNetwork {
 				continue
 			}
 			const strings = connectedByPeer[idStr] ?? []
-			peers[idStr] = { multiaddrs: this.parseMultiaddrs(strings), publicKey: new Uint8Array() }
+			const remotePeerId = peerIdFromString(idStr)
+			peers[idStr] = { multiaddrs: this.parseMultiaddrs(strings), publicKey: remotePeerId.publicKey?.raw ?? new Uint8Array() }
 		}
 
 		this.log('findCluster:result key=%s clusterSize=%d withAddrs=%d connectedInCohort=%d',

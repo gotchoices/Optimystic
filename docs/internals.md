@@ -90,7 +90,7 @@ The cluster two-phase commit uses **cryptographic signatures**, not to be confus
 - **Commit phase**: each cluster member signs the commit hash with its private key
 - **Validation**: every peer verifies all signatures against `record.peers[peerId].publicKey` before accepting the record
 
-This proves that the peers listed in the cluster actually voted — a coordinator cannot forge votes.  The verification hooks (`validateSignatures`, `verifySignature`, `computePromiseHash`, `computeCommitHash`) are wired in `ClusterMember` but currently stubbed (`verifySignature` returns `true`).  See task `4-cluster-signature-verification`.
+This proves that the peers listed in the cluster actually voted — a coordinator cannot forge votes.  The signing and verification flow lives in `ClusterMember`: `signVote` signs the hash+vote payload with the local peer's Ed25519 private key, `verifySignature` reconstructs the public key from `record.peers` via `publicKeyFromRaw` and verifies the signature, and `validateSignatures` runs verification for all promises and commits on every incoming record.  The signing payload includes the vote type and reject reason (if any), preventing vote tampering.
 
 **Important**: cluster authentication is about _identity verification_ (did this peer really vote?), not _authorization_ (is this peer allowed to write?).  Authorization decisions like per-collection permissions belong at a higher layer (e.g. application or collection module), not in the cluster consensus path.
 

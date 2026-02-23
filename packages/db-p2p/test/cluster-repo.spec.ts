@@ -2,11 +2,17 @@ import { expect } from 'chai';
 import { ClusterMember, clusterMember } from '../src/cluster/cluster-repo.js';
 import type { IRepo, ClusterRecord, RepoMessage, Signature, BlockGets, GetBlockResults, PendRequest, PendResult, CommitRequest, CommitResult, ActionBlocks, ClusterPeers, Transforms, IBlock, BlockId, BlockHeader } from '@optimystic/db-core';
 import type { IPeerNetwork } from '@optimystic/db-core';
-import type { PeerId } from '@libp2p/interface';
+import type { PeerId, PrivateKey } from '@libp2p/interface';
 import { peerIdFromPrivateKey } from '@libp2p/peer-id';
 import { generateKeyPair } from '@libp2p/crypto/keys';
 import { sha256 } from 'multiformats/hashes/sha2';
 import { base58btc } from 'multiformats/bases/base58';
+import { toString as uint8ArrayToString } from 'uint8arrays/to-string';
+
+interface KeyPair {
+	peerId: PeerId;
+	privateKey: PrivateKey;
+}
 
 /**
  * Compute message hash using the same algorithm as the coordinator.
@@ -18,9 +24,41 @@ const computeMessageHash = async (message: RepoMessage): Promise<string> => {
 	return base58btc.encode(hashBytes.digest);
 };
 
-const makePeerId = async (): Promise<PeerId> => {
-	const key = await generateKeyPair('Ed25519');
-	return peerIdFromPrivateKey(key);
+const makeKeyPair = async (): Promise<KeyPair> => {
+	const privateKey = await generateKeyPair('Ed25519');
+	return { peerId: peerIdFromPrivateKey(privateKey), privateKey };
+};
+
+const computePromiseHash = async (record: ClusterRecord): Promise<string> => {
+	const msgBytes = new TextEncoder().encode(record.messageHash + JSON.stringify(record.message));
+	const hashBytes = await sha256.digest(msgBytes);
+	return uint8ArrayToString(hashBytes.digest, 'base64url');
+};
+
+const computeCommitHash = async (record: ClusterRecord): Promise<string> => {
+	const msgBytes = new TextEncoder().encode(record.messageHash + JSON.stringify(record.message) + JSON.stringify(record.promises));
+	const hashBytes = await sha256.digest(msgBytes);
+	return uint8ArrayToString(hashBytes.digest, 'base64url');
+};
+
+const signVote = async (privateKey: PrivateKey, hash: string, type: 'approve' | 'reject', rejectReason?: string): Promise<string> => {
+	const payload = hash + ':' + type + (rejectReason ? ':' + rejectReason : '');
+	const sigBytes = await privateKey.sign(new TextEncoder().encode(payload));
+	return uint8ArrayToString(sigBytes, 'base64url');
+};
+
+const makeSignedPromise = async (privateKey: PrivateKey, record: ClusterRecord, type: 'approve' | 'reject' = 'approve', rejectReason?: string): Promise<Signature> => {
+	const promiseHash = await computePromiseHash(record);
+	const sig = await signVote(privateKey, promiseHash, type, rejectReason);
+	return type === 'approve'
+		? { type: 'approve', signature: sig }
+		: { type: 'reject', signature: sig, rejectReason };
+};
+
+const makeSignedCommit = async (privateKey: PrivateKey, record: ClusterRecord, type: 'approve' | 'reject' = 'approve'): Promise<Signature> => {
+	const commitHash = await computeCommitHash(record);
+	const sig = await signVote(privateKey, commitHash, type);
+	return { type, signature: sig };
 };
 
 const makeHeader = (id: string): BlockHeader => ({
@@ -33,12 +71,12 @@ const makeBlock = (id: string): IBlock => ({
 	header: makeHeader(id)
 });
 
-const makeClusterPeers = (peerIds: PeerId[]): ClusterPeers => {
+const makeClusterPeers = (keyPairs: KeyPair[]): ClusterPeers => {
 	const peers: ClusterPeers = {};
-	for (const peerId of peerIds) {
+	for (const { peerId } of keyPairs) {
 		peers[peerId.toString()] = {
 			multiaddrs: ['/ip4/127.0.0.1/tcp/8000'],
-			publicKey: new Uint8Array(32)
+			publicKey: peerId.publicKey!.raw
 		};
 	}
 	return peers;
@@ -113,25 +151,26 @@ const makePendOperation = (actionId: string, blockId: string): RepoMessage['oper
 describe('ClusterMember', () => {
 	let mockRepo: MockRepo;
 	let mockNetwork: MockPeerNetwork;
-	let selfPeerId: PeerId;
+	let selfKeyPair: KeyPair;
 	let clusterMemberInstance: ClusterMember;
 
 	beforeEach(async () => {
 		mockRepo = new MockRepo();
 		mockNetwork = new MockPeerNetwork();
-		selfPeerId = await makePeerId();
+		selfKeyPair = await makeKeyPair();
 		clusterMemberInstance = clusterMember({
 			storageRepo: mockRepo,
 			peerNetwork: mockNetwork,
-			peerId: selfPeerId
+			peerId: selfKeyPair.peerId,
+			privateKey: selfKeyPair.privateKey
 		});
 	});
 
 	describe('update - promise phase', () => {
 		it('adds own promise when not present', async () => {
-			const otherPeerId = await makePeerId();
-			const ourId = selfPeerId.toString();
-			const peers = makeClusterPeers([selfPeerId, otherPeerId]);
+			const otherKeyPair = await makeKeyPair();
+			const ourId = selfKeyPair.peerId.toString();
+			const peers = makeClusterPeers([selfKeyPair, otherKeyPair]);
 
 			const record = await createClusterRecord(
 				peers,
@@ -145,17 +184,22 @@ describe('ClusterMember', () => {
 		});
 
 		it('does not re-add promise if already present', async () => {
-			const ourId = selfPeerId.toString();
-			const peers = makeClusterPeers([selfPeerId]);
-			const existingPromise: Signature = { type: 'approve', signature: 'existing' };
+			const ourId = selfKeyPair.peerId.toString();
+			const peers = makeClusterPeers([selfKeyPair]);
 
 			const record = await createClusterRecord(
 				peers,
-				makeGetOperation(['block-1']),
-				{ [ourId]: existingPromise }
+				makeGetOperation(['block-1'])
 			);
+			const existingPromise = await makeSignedPromise(selfKeyPair.privateKey, record);
 
-			const result = await clusterMemberInstance.update(record);
+			// Add promise to the same record (not a new one with different hash)
+			const recordWithPromise: ClusterRecord = {
+				...record,
+				promises: { [ourId]: existingPromise }
+			};
+
+			const result = await clusterMemberInstance.update(recordWithPromise);
 
 			// Should still have a promise
 			expect(result.promises[ourId]).to.not.equal(undefined);
@@ -164,19 +208,22 @@ describe('ClusterMember', () => {
 
 	describe('update - commit phase', () => {
 		it('adds commit when all promises received', async () => {
-			const otherPeerId = await makePeerId();
-			const ourId = selfPeerId.toString();
-			const otherId = otherPeerId.toString();
-			const peers = makeClusterPeers([selfPeerId, otherPeerId]);
+			const otherKeyPair = await makeKeyPair();
+			const ourId = selfKeyPair.peerId.toString();
+			const otherId = otherKeyPair.peerId.toString();
+			const peers = makeClusterPeers([selfKeyPair, otherKeyPair]);
 
-			const record = await createClusterRecord(
+			const baseRecord = await createClusterRecord(
 				peers,
-				makeGetOperation(['block-1']),
-				{
-					[ourId]: { type: 'approve', signature: 'p1' },
-					[otherId]: { type: 'approve', signature: 'p2' }
-				}
+				makeGetOperation(['block-1'])
 			);
+			const ourPromise = await makeSignedPromise(selfKeyPair.privateKey, baseRecord);
+			const otherPromise = await makeSignedPromise(otherKeyPair.privateKey, baseRecord);
+
+			const record: ClusterRecord = {
+				...baseRecord,
+				promises: { [ourId]: ourPromise, [otherId]: otherPromise }
+			};
 
 			const result = await clusterMemberInstance.update(record);
 
@@ -185,15 +232,20 @@ describe('ClusterMember', () => {
 		});
 
 		it('does not commit without all promises', async () => {
-			const otherPeerId = await makePeerId();
-			const ourId = selfPeerId.toString();
-			const peers = makeClusterPeers([selfPeerId, otherPeerId]);
+			const otherKeyPair = await makeKeyPair();
+			const ourId = selfKeyPair.peerId.toString();
+			const peers = makeClusterPeers([selfKeyPair, otherKeyPair]);
 
-			const record = await createClusterRecord(
+			const baseRecord = await createClusterRecord(
 				peers,
-				makeGetOperation(['block-1']),
-				{ [ourId]: { type: 'approve', signature: 'p1' } } // Missing other's promise
+				makeGetOperation(['block-1'])
 			);
+			const ourPromise = await makeSignedPromise(selfKeyPair.privateKey, baseRecord);
+
+			const record: ClusterRecord = {
+				...baseRecord,
+				promises: { [ourId]: ourPromise } // Missing other's promise
+			};
 
 			const result = await clusterMemberInstance.update(record);
 
@@ -203,15 +255,20 @@ describe('ClusterMember', () => {
 
 	describe('update - rejection handling', () => {
 		it('detects rejected transaction from promise rejection', async () => {
-			const otherPeerId = await makePeerId();
-			const otherId = otherPeerId.toString();
-			const peers = makeClusterPeers([selfPeerId, otherPeerId]);
+			const otherKeyPair = await makeKeyPair();
+			const otherId = otherKeyPair.peerId.toString();
+			const peers = makeClusterPeers([selfKeyPair, otherKeyPair]);
 
-			const record = await createClusterRecord(
+			const baseRecord = await createClusterRecord(
 				peers,
-				makeGetOperation(['block-1']),
-				{ [otherId]: { type: 'reject', signature: 'rejected', rejectReason: 'test' } }
+				makeGetOperation(['block-1'])
 			);
+			const rejection = await makeSignedPromise(otherKeyPair.privateKey, baseRecord, 'reject', 'test');
+
+			const record: ClusterRecord = {
+				...baseRecord,
+				promises: { [otherId]: rejection }
+			};
 
 			// Should not throw, handles rejection gracefully
 			const result = await clusterMemberInstance.update(record);
@@ -223,7 +280,7 @@ describe('ClusterMember', () => {
 
 	describe('update - expiration', () => {
 		it('rejects expired transactions', async () => {
-			const peers = makeClusterPeers([selfPeerId]);
+			const peers = makeClusterPeers([selfKeyPair]);
 
 			const record: ClusterRecord = {
 				messageHash: 'expired-hash',
@@ -247,29 +304,37 @@ describe('ClusterMember', () => {
 
 	describe('update - record merging', () => {
 		it('merges promises from multiple updates', async () => {
-			const peer2 = await makePeerId();
-			const peer3 = await makePeerId();
-			const ourId = selfPeerId.toString();
-			const peer2Id = peer2.toString();
-			const peer3Id = peer3.toString();
-			const peers = makeClusterPeers([selfPeerId, peer2, peer3]);
+			const peer2 = await makeKeyPair();
+			const peer3 = await makeKeyPair();
+			const ourId = selfKeyPair.peerId.toString();
+			const peer2Id = peer2.peerId.toString();
+			const peer3Id = peer3.peerId.toString();
+			const peers = makeClusterPeers([selfKeyPair, peer2, peer3]);
 			const expiration = Date.now() + 30000;
 
-			// First update with peer2's promise
-			const record1 = await createClusterRecord(
+			const baseRecord = await createClusterRecord(
 				peers,
 				makeGetOperation(['block-1']),
-				{ [peer2Id]: { type: 'approve', signature: 'p2' } },
+				{},
 				{},
 				expiration
 			);
+			const p2Promise = await makeSignedPromise(peer2.privateKey, baseRecord);
+
+			// First update with peer2's promise
+			const record1: ClusterRecord = {
+				...baseRecord,
+				promises: { [peer2Id]: p2Promise }
+			};
 
 			await clusterMemberInstance.update(record1);
 
-			// Second update with peer3's promise - same message content, so same hash
+			const p3Promise = await makeSignedPromise(peer3.privateKey, baseRecord);
+
+			// Second update with peer3's promise - same base record
 			const record2: ClusterRecord = {
-				...record1,
-				promises: { [peer3Id]: { type: 'approve', signature: 'p3' } }
+				...baseRecord,
+				promises: { [peer3Id]: p3Promise }
 			};
 
 			const result = await clusterMemberInstance.update(record2);
@@ -279,7 +344,7 @@ describe('ClusterMember', () => {
 		});
 
 		it('throws on message content mismatch', async () => {
-			const peers = makeClusterPeers([selfPeerId]);
+			const peers = makeClusterPeers([selfKeyPair]);
 
 			const record1 = await createClusterRecord(
 				peers,
@@ -311,51 +376,61 @@ describe('ClusterMember', () => {
 
 	describe('update - consensus execution', () => {
 		it('skips execution when already committed (idempotency)', async () => {
-			const otherPeerId = await makePeerId();
-			const ourId = selfPeerId.toString();
-			const otherId = otherPeerId.toString();
-			const peers = makeClusterPeers([selfPeerId, otherPeerId]);
+			const otherKeyPair = await makeKeyPair();
+			const ourId = selfKeyPair.peerId.toString();
+			const otherId = otherKeyPair.peerId.toString();
+			const peers = makeClusterPeers([selfKeyPair, otherKeyPair]);
+
+			const baseRecord = await createClusterRecord(
+				peers,
+				makeGetOperation(['block-1'])
+			);
+			const ourPromise = await makeSignedPromise(selfKeyPair.privateKey, baseRecord);
+			const otherPromise = await makeSignedPromise(otherKeyPair.privateKey, baseRecord);
+
+			const promisedRecord: ClusterRecord = {
+				...baseRecord,
+				promises: { [ourId]: ourPromise, [otherId]: otherPromise }
+			};
+			const ourCommit = await makeSignedCommit(selfKeyPair.privateKey, promisedRecord);
+			const otherCommit = await makeSignedCommit(otherKeyPair.privateKey, promisedRecord);
 
 			// Record already at consensus with our commit present
-			// Implementation checks hasLocalCommit - if we already committed, don't re-execute
-			const record = await createClusterRecord(
-				peers,
-				makeGetOperation(['block-1']),
-				{
-					[ourId]: { type: 'approve', signature: 'p1' },
-					[otherId]: { type: 'approve', signature: 'p2' }
-				},
-				{
-					[ourId]: { type: 'approve', signature: 'c1' },
-					[otherId]: { type: 'approve', signature: 'c2' }
-				}
-			);
+			const record: ClusterRecord = {
+				...promisedRecord,
+				commits: { [ourId]: ourCommit, [otherId]: otherCommit }
+			};
 
 			await clusterMemberInstance.update(record);
 
 			// Should NOT execute operations since we already have our commit
-			// This ensures idempotent handling of duplicate consensus messages
 			expect(mockRepo.getCalls.length).to.equal(0);
 		});
 
 		it('adds commit when all promises present', async () => {
-			const otherPeerId = await makePeerId();
-			const ourId = selfPeerId.toString();
-			const otherId = otherPeerId.toString();
-			const peers = makeClusterPeers([selfPeerId, otherPeerId]);
+			const otherKeyPair = await makeKeyPair();
+			const ourId = selfKeyPair.peerId.toString();
+			const otherId = otherKeyPair.peerId.toString();
+			const peers = makeClusterPeers([selfKeyPair, otherKeyPair]);
+
+			const baseRecord = await createClusterRecord(
+				peers,
+				makeGetOperation(['block-1'])
+			);
+			const ourPromise = await makeSignedPromise(selfKeyPair.privateKey, baseRecord);
+			const otherPromise = await makeSignedPromise(otherKeyPair.privateKey, baseRecord);
+
+			const promisedRecord: ClusterRecord = {
+				...baseRecord,
+				promises: { [ourId]: ourPromise, [otherId]: otherPromise }
+			};
+			const otherCommit = await makeSignedCommit(otherKeyPair.privateKey, promisedRecord);
 
 			// All promises present, other has committed, we need to commit
-			const record = await createClusterRecord(
-				peers,
-				makeGetOperation(['block-1']),
-				{
-					[ourId]: { type: 'approve', signature: 'p1' },
-					[otherId]: { type: 'approve', signature: 'p2' }
-				},
-				{
-					[otherId]: { type: 'approve', signature: 'c2' }
-				}
-			);
+			const record: ClusterRecord = {
+				...promisedRecord,
+				commits: { [otherId]: otherCommit }
+			};
 
 			const result = await clusterMemberInstance.update(record);
 
@@ -367,7 +442,7 @@ describe('ClusterMember', () => {
 
 	describe('update - concurrent serialization', () => {
 		it('serializes concurrent updates for same transaction', async () => {
-			const peers = makeClusterPeers([selfPeerId]);
+			const peers = makeClusterPeers([selfKeyPair]);
 
 			const record = await createClusterRecord(
 				peers,
@@ -388,7 +463,7 @@ describe('ClusterMember', () => {
 
 	describe('conflict detection', () => {
 		it('detects conflicting operations on same block', async () => {
-			const peers = makeClusterPeers([selfPeerId]);
+			const peers = makeClusterPeers([selfKeyPair]);
 
 			// First transaction operates on block-1
 			const record1 = await createClusterRecord(
@@ -410,8 +485,8 @@ describe('ClusterMember', () => {
 		});
 
 		it('operations on different blocks do not conflict', async () => {
-			const ourId = selfPeerId.toString();
-			const peers = makeClusterPeers([selfPeerId]);
+			const ourId = selfKeyPair.peerId.toString();
+			const peers = makeClusterPeers([selfKeyPair]);
 
 			const record1 = await createClusterRecord(
 				peers,
@@ -433,8 +508,8 @@ describe('ClusterMember', () => {
 
 	describe('promise/commit phase edge cases (TEST-5.1.1)', () => {
 		it('adds promise for single-node cluster', async () => {
-			const ourId = selfPeerId.toString();
-			const peers = makeClusterPeers([selfPeerId]);
+			const ourId = selfKeyPair.peerId.toString();
+			const peers = makeClusterPeers([selfKeyPair]);
 
 			const record = await createClusterRecord(
 				peers,
@@ -448,8 +523,8 @@ describe('ClusterMember', () => {
 		});
 
 		it('reaches consensus in single-node cluster through full cycle', async () => {
-			const ourId = selfPeerId.toString();
-			const peers = makeClusterPeers([selfPeerId]);
+			const ourId = selfKeyPair.peerId.toString();
+			const peers = makeClusterPeers([selfKeyPair]);
 
 			// First update: adds our promise
 			const record = await createClusterRecord(
@@ -459,15 +534,15 @@ describe('ClusterMember', () => {
 			const afterPromise = await clusterMemberInstance.update(record);
 			expect(afterPromise.promises[ourId]!.type).to.equal('approve');
 
-			// Second update: with all promises → should add commit and execute
+			// Second update: with all promises -> should add commit and execute
 			const result = await clusterMemberInstance.update(afterPromise);
 			expect(result.commits[ourId]).to.not.equal(undefined);
 			expect(result.commits[ourId]!.type).to.equal('approve');
 		});
 
 		it('executes pend operations on consensus', async () => {
-			const ourId = selfPeerId.toString();
-			const peers = makeClusterPeers([selfPeerId]);
+			const ourId = selfKeyPair.peerId.toString();
+			const peers = makeClusterPeers([selfKeyPair]);
 
 			const record = await createClusterRecord(
 				peers,
@@ -476,7 +551,7 @@ describe('ClusterMember', () => {
 
 			// First update adds promise
 			const afterPromise = await clusterMemberInstance.update(record);
-			// Second update with promise → commit + execute
+			// Second update with promise -> commit + execute
 			await clusterMemberInstance.update(afterPromise);
 
 			expect(mockRepo.pendCalls.length).to.equal(1);
@@ -484,12 +559,12 @@ describe('ClusterMember', () => {
 		});
 
 		it('handles 3-peer cluster promise accumulation', async () => {
-			const peer2 = await makePeerId();
-			const peer3 = await makePeerId();
-			const ourId = selfPeerId.toString();
-			const peer2Id = peer2.toString();
-			const peer3Id = peer3.toString();
-			const peers = makeClusterPeers([selfPeerId, peer2, peer3]);
+			const peer2 = await makeKeyPair();
+			const peer3 = await makeKeyPair();
+			const ourId = selfKeyPair.peerId.toString();
+			const peer2Id = peer2.peerId.toString();
+			const peer3Id = peer3.peerId.toString();
+			const peers = makeClusterPeers([selfKeyPair, peer2, peer3]);
 
 			// Record with no promises yet
 			const record = await createClusterRecord(
@@ -501,16 +576,18 @@ describe('ClusterMember', () => {
 			const result1 = await clusterMemberInstance.update(record);
 			expect(result1.promises[ourId]).to.not.equal(undefined);
 
-			// Still missing 2 promises → no commit yet
+			// Still missing 2 promises -> no commit yet
 			expect(result1.commits[ourId]).to.equal(undefined);
 
-			// Now all promises arrive
+			// Now all promises arrive (properly signed)
+			const p2Promise = await makeSignedPromise(peer2.privateKey, record);
+			const p3Promise = await makeSignedPromise(peer3.privateKey, record);
 			const withAllPromises: ClusterRecord = {
 				...result1,
 				promises: {
 					...result1.promises,
-					[peer2Id]: { type: 'approve', signature: 'p2' },
-					[peer3Id]: { type: 'approve', signature: 'p3' }
+					[peer2Id]: p2Promise,
+					[peer3Id]: p3Promise
 				}
 			};
 
@@ -520,19 +597,22 @@ describe('ClusterMember', () => {
 		});
 
 		it('does not add commit when promise is a rejection', async () => {
-			const peer2 = await makePeerId();
-			const ourId = selfPeerId.toString();
-			const peer2Id = peer2.toString();
-			const peers = makeClusterPeers([selfPeerId, peer2]);
+			const peer2 = await makeKeyPair();
+			const ourId = selfKeyPair.peerId.toString();
+			const peer2Id = peer2.peerId.toString();
+			const peers = makeClusterPeers([selfKeyPair, peer2]);
 
-			const record = await createClusterRecord(
+			const baseRecord = await createClusterRecord(
 				peers,
-				makeGetOperation(['block-1']),
-				{
-					[ourId]: { type: 'approve', signature: 'p1' },
-					[peer2Id]: { type: 'reject', signature: 'rejected', rejectReason: 'invalid' }
-				}
+				makeGetOperation(['block-1'])
 			);
+			const ourPromise = await makeSignedPromise(selfKeyPair.privateKey, baseRecord);
+			const peer2Rejection = await makeSignedPromise(peer2.privateKey, baseRecord, 'reject', 'invalid');
+
+			const record: ClusterRecord = {
+				...baseRecord,
+				promises: { [ourId]: ourPromise, [peer2Id]: peer2Rejection }
+			};
 
 			const result = await clusterMemberInstance.update(record);
 			// Rejected transaction should not produce a commit
@@ -542,7 +622,7 @@ describe('ClusterMember', () => {
 
 	describe('transaction expiration (TEST-5.1.2)', () => {
 		it('rejects transactions with past expiration', async () => {
-			const peers = makeClusterPeers([selfPeerId]);
+			const peers = makeClusterPeers([selfKeyPair]);
 
 			const record = await createClusterRecord(
 				peers,
@@ -561,7 +641,7 @@ describe('ClusterMember', () => {
 		});
 
 		it('rejects transactions expiring at exactly now', async () => {
-			const peers = makeClusterPeers([selfPeerId]);
+			const peers = makeClusterPeers([selfKeyPair]);
 
 			const record = await createClusterRecord(
 				peers,
@@ -580,8 +660,8 @@ describe('ClusterMember', () => {
 		});
 
 		it('accepts transactions with future expiration', async () => {
-			const ourId = selfPeerId.toString();
-			const peers = makeClusterPeers([selfPeerId]);
+			const ourId = selfKeyPair.peerId.toString();
+			const peers = makeClusterPeers([selfKeyPair]);
 
 			const record = await createClusterRecord(
 				peers,
@@ -598,16 +678,21 @@ describe('ClusterMember', () => {
 
 	describe('super-majority threshold (TEST-5.2.2)', () => {
 		it('requires all promises in 2-node cluster for commit', async () => {
-			const peer2 = await makePeerId();
-			const ourId = selfPeerId.toString();
-			const peers = makeClusterPeers([selfPeerId, peer2]);
+			const peer2 = await makeKeyPair();
+			const ourId = selfKeyPair.peerId.toString();
+			const peers = makeClusterPeers([selfKeyPair, peer2]);
+
+			const baseRecord = await createClusterRecord(
+				peers,
+				makeGetOperation(['block-1'])
+			);
+			const ourPromise = await makeSignedPromise(selfKeyPair.privateKey, baseRecord);
 
 			// Only our promise - missing peer2
-			const record = await createClusterRecord(
-				peers,
-				makeGetOperation(['block-1']),
-				{ [ourId]: { type: 'approve', signature: 'p1' } }
-			);
+			const record: ClusterRecord = {
+				...baseRecord,
+				promises: { [ourId]: ourPromise }
+			};
 
 			const result = await clusterMemberInstance.update(record);
 			// Should NOT commit since we don't have all promises
@@ -615,22 +700,30 @@ describe('ClusterMember', () => {
 		});
 
 		it('commits when all promises present in 4-node cluster', async () => {
-			const peer2 = await makePeerId();
-			const peer3 = await makePeerId();
-			const peer4 = await makePeerId();
-			const ourId = selfPeerId.toString();
-			const peers = makeClusterPeers([selfPeerId, peer2, peer3, peer4]);
+			const peer2 = await makeKeyPair();
+			const peer3 = await makeKeyPair();
+			const peer4 = await makeKeyPair();
+			const ourId = selfKeyPair.peerId.toString();
+			const peers = makeClusterPeers([selfKeyPair, peer2, peer3, peer4]);
 
-			const record = await createClusterRecord(
+			const baseRecord = await createClusterRecord(
 				peers,
-				makeGetOperation(['block-1']),
-				{
-					[ourId]: { type: 'approve', signature: 'p1' },
-					[peer2.toString()]: { type: 'approve', signature: 'p2' },
-					[peer3.toString()]: { type: 'approve', signature: 'p3' },
-					[peer4.toString()]: { type: 'approve', signature: 'p4' }
-				}
+				makeGetOperation(['block-1'])
 			);
+			const ourPromise = await makeSignedPromise(selfKeyPair.privateKey, baseRecord);
+			const p2Promise = await makeSignedPromise(peer2.privateKey, baseRecord);
+			const p3Promise = await makeSignedPromise(peer3.privateKey, baseRecord);
+			const p4Promise = await makeSignedPromise(peer4.privateKey, baseRecord);
+
+			const record: ClusterRecord = {
+				...baseRecord,
+				promises: {
+					[ourId]: ourPromise,
+					[peer2.peerId.toString()]: p2Promise,
+					[peer3.peerId.toString()]: p3Promise,
+					[peer4.peerId.toString()]: p4Promise
+				}
+			};
 
 			const result = await clusterMemberInstance.update(record);
 			expect(result.commits[ourId]).to.not.equal(undefined);
@@ -639,16 +732,20 @@ describe('ClusterMember', () => {
 
 	describe('race resolution', () => {
 		it('resolves conflict deterministically based on promise count', async () => {
-			const peer2 = await makePeerId();
-			const ourId = selfPeerId.toString();
-			const peers = makeClusterPeers([selfPeerId, peer2]);
+			const peer2 = await makeKeyPair();
+			const peers = makeClusterPeers([selfKeyPair, peer2]);
 
-			// First transaction on block-1, with a promise from peer2
-			const record1 = await createClusterRecord(
+			const baseRecord1 = await createClusterRecord(
 				peers,
-				makePendOperation('a1', 'block-shared'),
-				{ [peer2.toString()]: { type: 'approve', signature: 'p2' } }
+				makePendOperation('a1', 'block-shared')
 			);
+			const p2Promise = await makeSignedPromise(peer2.privateKey, baseRecord1);
+
+			// First transaction on block-shared, with a promise from peer2
+			const record1: ClusterRecord = {
+				...baseRecord1,
+				promises: { [peer2.peerId.toString()]: p2Promise }
+			};
 			await clusterMemberInstance.update(record1);
 
 			// Second conflicting transaction on block-shared, no promises
@@ -666,8 +763,7 @@ describe('ClusterMember', () => {
 
 	describe('duplicate execution prevention', () => {
 		it('prevents double execution via wasTransactionExecuted', async () => {
-			const ourId = selfPeerId.toString();
-			const peers = makeClusterPeers([selfPeerId]);
+			const peers = makeClusterPeers([selfKeyPair]);
 
 			const record = await createClusterRecord(
 				peers,
@@ -693,7 +789,8 @@ describe('ClusterMember', () => {
 			const validatingMember = clusterMember({
 				storageRepo: mockRepo,
 				peerNetwork: mockNetwork,
-				peerId: selfPeerId,
+				peerId: selfKeyPair.peerId,
+				privateKey: selfKeyPair.privateKey,
 				validator: {
 					validate: async (_txn, _hash) => {
 						validationCalled = true;
@@ -703,7 +800,7 @@ describe('ClusterMember', () => {
 				}
 			});
 
-			const peers = makeClusterPeers([selfPeerId]);
+			const peers = makeClusterPeers([selfKeyPair]);
 			const transforms: Transforms = {
 				inserts: { 'block-1': makeBlock('block-1') },
 				updates: {},
@@ -732,15 +829,16 @@ describe('ClusterMember', () => {
 			const validatingMember = clusterMember({
 				storageRepo: mockRepo,
 				peerNetwork: mockNetwork,
-				peerId: selfPeerId,
+				peerId: selfKeyPair.peerId,
+				privateKey: selfKeyPair.privateKey,
 				validator: {
 					validate: async () => ({ valid: false, reason: 'Validation failed' }),
 					getSchemaHash: async () => 'test-hash'
 				}
 			});
 
-			const ourId = selfPeerId.toString();
-			const peers = makeClusterPeers([selfPeerId]);
+			const ourId = selfKeyPair.peerId.toString();
+			const peers = makeClusterPeers([selfKeyPair]);
 			const transforms: Transforms = {
 				inserts: { 'block-1': makeBlock('block-1') },
 				updates: {},
@@ -765,6 +863,91 @@ describe('ClusterMember', () => {
 			// Should have a reject promise
 			expect(result.promises[ourId]?.type).to.equal('reject');
 			expect(result.promises[ourId]?.rejectReason).to.include('Validation failed');
+		});
+	});
+
+	describe('signature verification', () => {
+		it('rejects forged promise signatures', async () => {
+			const otherKeyPair = await makeKeyPair();
+			const forgerKeyPair = await makeKeyPair();
+			const otherId = otherKeyPair.peerId.toString();
+			const peers = makeClusterPeers([selfKeyPair, otherKeyPair]);
+
+			const baseRecord = await createClusterRecord(
+				peers,
+				makeGetOperation(['block-1'])
+			);
+			// Sign with forger's key but attribute to otherKeyPair
+			const forgedPromise = await makeSignedPromise(forgerKeyPair.privateKey, baseRecord);
+
+			const record: ClusterRecord = {
+				...baseRecord,
+				promises: { [otherId]: forgedPromise }
+			};
+
+			try {
+				await clusterMemberInstance.update(record);
+				expect.fail('Should have thrown');
+			} catch (err) {
+				expect((err as Error).message).to.include('Invalid promise signature');
+			}
+		});
+
+		it('rejects forged commit signatures', async () => {
+			const otherKeyPair = await makeKeyPair();
+			const forgerKeyPair = await makeKeyPair();
+			const ourId = selfKeyPair.peerId.toString();
+			const otherId = otherKeyPair.peerId.toString();
+			const peers = makeClusterPeers([selfKeyPair, otherKeyPair]);
+
+			const baseRecord = await createClusterRecord(
+				peers,
+				makeGetOperation(['block-1'])
+			);
+			const ourPromise = await makeSignedPromise(selfKeyPair.privateKey, baseRecord);
+			const otherPromise = await makeSignedPromise(otherKeyPair.privateKey, baseRecord);
+
+			const promisedRecord: ClusterRecord = {
+				...baseRecord,
+				promises: { [ourId]: ourPromise, [otherId]: otherPromise }
+			};
+			// Sign commit with forger's key but attribute to otherKeyPair
+			const forgedCommit = await makeSignedCommit(forgerKeyPair.privateKey, promisedRecord);
+
+			const record: ClusterRecord = {
+				...promisedRecord,
+				commits: { [otherId]: forgedCommit }
+			};
+
+			try {
+				await clusterMemberInstance.update(record);
+				expect.fail('Should have thrown');
+			} catch (err) {
+				expect((err as Error).message).to.include('Invalid commit signature');
+			}
+		});
+
+		it('accepts properly signed promises and commits', async () => {
+			const ourId = selfKeyPair.peerId.toString();
+			const peers = makeClusterPeers([selfKeyPair]);
+
+			const record = await createClusterRecord(
+				peers,
+				makeGetOperation(['block-1'])
+			);
+
+			// First update adds signed promise
+			const afterPromise = await clusterMemberInstance.update(record);
+			expect(afterPromise.promises[ourId]!.type).to.equal('approve');
+			// Signature should be a base64url string, not a placeholder
+			expect(afterPromise.promises[ourId]!.signature).to.not.equal('approved');
+			expect(afterPromise.promises[ourId]!.signature.length).to.be.greaterThan(10);
+
+			// Second update adds signed commit
+			const afterCommit = await clusterMemberInstance.update(afterPromise);
+			expect(afterCommit.commits[ourId]!.type).to.equal('approve');
+			expect(afterCommit.commits[ourId]!.signature).to.not.equal('committed');
+			expect(afterCommit.commits[ourId]!.signature.length).to.be.greaterThan(10);
 		});
 	});
 });

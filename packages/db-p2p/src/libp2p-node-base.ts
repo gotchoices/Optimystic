@@ -7,6 +7,7 @@ import { gossipsub } from '@chainsafe/libp2p-gossipsub';
 import { bootstrap } from '@libp2p/bootstrap';
 import { circuitRelayServer } from '@libp2p/circuit-relay-v2';
 import { peerIdFromString } from '@libp2p/peer-id';
+import { generateKeyPair } from '@libp2p/crypto/keys';
 import { clusterService } from './cluster/service.js';
 import { repoService } from './repo/service.js';
 import { StorageRepo } from './storage/storage-repo.js';
@@ -142,15 +143,15 @@ export async function createLibp2pNodeBase(
 		}
 	};
 
-	// Parse peer ID if provided
-	const peerId = options.id ? await peerIdFromString(options.id) : undefined;
+	// Generate or derive the private key for this node
+	const nodePrivateKey = await generateKeyPair('Ed25519');
 
 	const listenAddrs = options.listenAddrs ?? defaults.listenAddrs;
 	const transports = options.transports ?? defaults.transports;
 
 	const libp2pOptions: unknown = {
 		start: false,
-		...(peerId ? { peerId } : {}),
+		privateKey: nodePrivateKey,
 		addresses: {
 			listen: listenAddrs
 		},
@@ -269,6 +270,7 @@ export async function createLibp2pNodeBase(
 		storageRepo,
 		peerNetwork: keyNetwork,
 		peerId: node.peerId,
+		privateKey: nodePrivateKey,
 		protocolPrefix,
 		partitionDetector,
 		fretService: fretSvc,

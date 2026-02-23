@@ -477,11 +477,12 @@ private async processCleanupQueue(): Promise<void> {
 ### Setting Up a Cluster Node
 
 ```typescript
-// Create cluster member with storage repo
+// Create cluster member with storage repo and signing key
 const clusterMember = new ClusterMember(
   storageRepo,
   peerNetwork,
-  peerId
+  peerId,
+  privateKey
 );
 
 // Create cluster service

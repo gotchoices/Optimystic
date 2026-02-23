@@ -3,11 +3,12 @@ import type { ICluster } from "@optimystic/db-core";
 import type { IPeerNetwork } from "@optimystic/db-core";
 import { blockIdsForTransforms } from "@optimystic/db-core";
 import { ClusterClient } from "./client.js";
-import type { PeerId } from "@libp2p/interface";
+import type { PeerId, PrivateKey } from "@libp2p/interface";
 import { peerIdFromString } from "@libp2p/peer-id";
+import { publicKeyFromRaw } from "@libp2p/crypto/keys";
 import { sha256 } from "multiformats/hashes/sha2";
 import { base58btc } from "multiformats/bases/base58";
-import { toString as uint8ArrayToString } from 'uint8arrays/to-string';
+import { toString as uint8ArrayToString, fromString as uint8ArrayFromString } from 'uint8arrays';
 import { createLogger } from '../logger.js'
 import type { PartitionDetector } from "./partition-detector.js";
 import type { FretService } from "p2p-fret";
@@ -35,6 +36,7 @@ interface ClusterMemberComponents {
 	storageRepo: IRepo;
 	peerNetwork: IPeerNetwork;
 	peerId: PeerId;
+	privateKey: PrivateKey;
 	protocolPrefix?: string;
 	partitionDetector?: PartitionDetector;
 	fretService?: FretService;
@@ -46,6 +48,7 @@ export function clusterMember(components: ClusterMemberComponents): ClusterMembe
 		components.storageRepo,
 		components.peerNetwork,
 		components.peerId,
+		components.privateKey,
 		components.protocolPrefix,
 		components.partitionDetector,
 		components.fretService,
@@ -69,11 +72,14 @@ export class ClusterMember implements ICluster {
 	private cleanupQueue: string[] = [];
 	// Serialize concurrent updates for the same transaction
 	private pendingUpdates: Map<string, Promise<ClusterRecord>> = new Map();
+	// Temporarily set during validateSignatures so verifySignature can access the record
+	private currentValidationRecord?: ClusterRecord;
 
 	constructor(
 		private readonly storageRepo: IRepo,
 		private readonly peerNetwork: IPeerNetwork,
 		private readonly peerId: PeerId,
+		private readonly privateKey: PrivateKey,
 		private readonly protocolPrefix?: string,
 		private readonly partitionDetector?: PartitionDetector,
 		private readonly fretService?: FretService,
@@ -344,20 +350,25 @@ export class ClusterMember implements ICluster {
 	}
 
 	private async validateSignatures(record: ClusterRecord): Promise<void> {
-		// Validate promise signatures
-		const promiseHash = await this.computePromiseHash(record);
-		for (const [peerId, signature] of Object.entries(record.promises)) {
-			if (!await this.verifySignature(peerId, promiseHash, signature)) {
-				throw new Error(`Invalid promise signature from ${peerId}`);
+		this.currentValidationRecord = record;
+		try {
+			// Validate promise signatures
+			const promiseHash = await this.computePromiseHash(record);
+			for (const [peerId, signature] of Object.entries(record.promises)) {
+				if (!await this.verifySignature(peerId, promiseHash, signature)) {
+					throw new Error(`Invalid promise signature from ${peerId}`);
+				}
 			}
-		}
 
-		// Validate commit signatures
-		const commitHash = await this.computeCommitHash(record);
-		for (const [peerId, signature] of Object.entries(record.commits)) {
-			if (!await this.verifySignature(peerId, commitHash, signature)) {
-				throw new Error(`Invalid commit signature from ${peerId}`);
+			// Validate commit signatures
+			const commitHash = await this.computeCommitHash(record);
+			for (const [peerId, signature] of Object.entries(record.commits)) {
+				if (!await this.verifySignature(peerId, commitHash, signature)) {
+					throw new Error(`Invalid commit signature from ${peerId}`);
+				}
 			}
+		} finally {
+			this.currentValidationRecord = undefined;
 		}
 	}
 
@@ -373,9 +384,26 @@ export class ClusterMember implements ICluster {
 		return uint8ArrayToString(hashBytes.digest, 'base64url');
 	}
 
+	private computeSigningPayload(hash: string, type: string, rejectReason?: string): Uint8Array {
+		const payload = hash + ':' + type + (rejectReason ? ':' + rejectReason : '');
+		return new TextEncoder().encode(payload);
+	}
+
+	private async signVote(hash: string, type: 'approve' | 'reject', rejectReason?: string): Promise<string> {
+		const payload = this.computeSigningPayload(hash, type, rejectReason);
+		const sigBytes = await this.privateKey.sign(payload);
+		return uint8ArrayToString(sigBytes, 'base64url');
+	}
+
 	private async verifySignature(peerId: string, hash: string, signature: Signature): Promise<boolean> {
-		// TODO: Implement actual signature verification
-		return true;
+		const peerInfo = this.currentValidationRecord?.peers[peerId];
+		if (!peerInfo?.publicKey?.length) {
+			throw new Error(`No public key for peer ${peerId}`);
+		}
+		const pubKey = publicKeyFromRaw(peerInfo.publicKey);
+		const payload = this.computeSigningPayload(hash, signature.type, signature.rejectReason);
+		const sigBytes = uint8ArrayFromString(signature.signature, 'base64url');
+		return pubKey.verify(payload, sigBytes);
 	}
 
 	private async getTransactionPhase(record: ClusterRecord): Promise<TransactionPhase> {
@@ -423,9 +451,14 @@ export class ClusterMember implements ICluster {
 		// Validate pend operations if we have a validator
 		const validationResult = await this.validatePendOperations(record);
 
+		const promiseHash = await this.computePromiseHash(record);
+		const type = validationResult.valid ? 'approve' as const : 'reject' as const;
+		const rejectReason = validationResult.valid ? undefined : validationResult.reason;
+		const sig = await this.signVote(promiseHash, type, rejectReason);
+
 		const signature: Signature = validationResult.valid
-			? { type: 'approve', signature: 'approved' }
-			: { type: 'reject', signature: 'rejected', rejectReason: validationResult.reason };
+			? { type: 'approve', signature: sig }
+			: { type: 'reject', signature: sig, rejectReason };
 
 		if (!validationResult.valid) {
 			log('cluster-member:validation-rejected', {
@@ -491,9 +524,11 @@ export class ClusterMember implements ICluster {
 		if (this.hasLocalCommit(record)) {
 			return record;
 		}
+		const commitHash = await this.computeCommitHash(record);
+		const sig = await this.signVote(commitHash, 'approve');
 		const signature: Signature = {
 			type: 'approve',
-			signature: 'committed' // TODO: Actually sign the commit hash
+			signature: sig
 		};
 
 		return {
@@ -749,10 +784,13 @@ export class ClusterMember implements ICluster {
 		if (!state) return;
 
 		if (!state.record.promises[this.peerId.toString()]) {
+			const rejectReason = 'Transaction expired';
+			const promiseHash = await this.computePromiseHash(state.record);
+			const sig = await this.signVote(promiseHash, 'reject', rejectReason);
 			const signature: Signature = {
 				type: 'reject',
-				signature: 'rejected',
-				rejectReason: 'Transaction expired'
+				signature: sig,
+				rejectReason
 			};
 
 			const updatedRecord = {
