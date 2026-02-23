@@ -3,6 +3,8 @@
  * Task Runner — processes outstanding tasks through the pipeline stages
  * by invoking an agentic CLI tool for each one.
  *
+ * Version: 1.0.0
+ *
  * Key design choices:
  *   - The task list is snapshotted once at startup.  Tasks created by the agent
  *     during this run are NOT picked up, ensuring each task advances exactly one
@@ -16,12 +18,15 @@
  *   node tasks/run-tasks.mjs [options]
  *
  * Options:
- *   --min-priority <n>   Only process tasks with priority >= n  (default: 3)
+ *   --min-priority <n>   Default min priority for all stages  (default: 3)
+ *   --stages <list>      Comma-separated stages to process, optionally with per-stage
+ *                        min priority as  stage:n  (default: fix,plan,implement,review)
+ *                        Examples:
+ *                          --stages fix,implement
+ *                          --stages review:5,implement:3
+ *                          --stages fix:4,implement,review:5  (uses --min-priority for bare names)
  *   --agent <name>       Agent adapter to use: claude | auggie | cursor  (default: claude)
  *   --dry-run            List tasks that would be processed, don't invoke agent
- *   --stages <list>      Comma-separated stages to process     (default: test,review,implement,plan,fix)
- *   --once               Process one task and exit
- *   --max <n>            Process at most n tasks then exit
  *   --help               Show this help
  */
 
@@ -267,10 +272,9 @@ async function runAgent(agentName, prompt, cwd, logFile, { stage } = {}) {
 	const logStream = createWriteStream(logFile, { flags: 'a' });
 	const { cmd, args, shellCmd, formatStream } = adapterResult;
 
-	const spawnOpts = { cwd, stdio: ['ignore', 'pipe', 'pipe'], shell: true };
 	const spawnArgs = shellCmd
-		? [shellCmd, []] // single string avoids DEP0190
-		: [cmd, args];
+		? [shellCmd, [], { cwd, stdio: ['ignore', 'pipe', 'pipe'], shell: true }]
+		: [cmd, args, { cwd, stdio: ['ignore', 'pipe', 'pipe'], shell: false }];
 
 	function writeOut(text) {
 		process.stdout.write(text);
@@ -279,7 +283,7 @@ async function runAgent(agentName, prompt, cwd, logFile, { stage } = {}) {
 
 	try {
 		return await new Promise((resolve, reject) => {
-			const child = spawn(...spawnArgs, spawnOpts);
+			const child = spawn(...spawnArgs);
 
 			let buf = '';
 			child.stdout.on('data', (chunk) => {
@@ -298,10 +302,11 @@ async function runAgent(agentName, prompt, cwd, logFile, { stage } = {}) {
 			});
 
 			child.on('error', (err) => {
-				logStream.end(`\n[runner] Agent spawn error: ${err.message}\n`);
 				const label = shellCmd ? 'agent' : cmd;
 				console.error(`Failed to spawn ${label}: ${err.message}`);
-				reject(err);
+				logStream.end(`\n[runner] Agent spawn error: ${err.message}\n`);
+				logStream.once('finish', () => reject(err));
+				logStream.once('error', () => reject(err));
 			});
 
 			child.on('close', (code) => {
@@ -310,7 +315,8 @@ async function runAgent(agentName, prompt, cwd, logFile, { stage } = {}) {
 					writeOut(out);
 				}
 				logStream.end(`\n[runner] Agent exited with code ${code}\n`);
-				resolve(code ?? 1);
+				logStream.once('finish', () => resolve(code ?? 1));
+				logStream.once('error', () => resolve(code ?? 1));
 			});
 		});
 	} finally {
@@ -332,15 +338,27 @@ function printHelp() {
 		'Usage: node tasks/run-tasks.mjs [options]',
 		'',
 		'Options:',
-		'  --min-priority <n>   Only tasks with priority >= n  (default: 3)',
-		'  --agent <name>       claude | auggie | cursor       (default: claude)',
+		'  --min-priority <n>   Default min priority for all stages  (default: 3)',
+		'  --stages <list>      Comma-separated stages, optionally with per-stage min priority',
+		'                       as  stage:n  (default: fix,plan,implement,review)',
+		'                       e.g.  --stages review:5,implement:3,fix',
+		'  --agent <name>       claude | auggie | cursor              (default: claude)',
 		'  --dry-run            List tasks without invoking agent',
-		'  --stages <list>      Comma-separated stage filter   (default: fix,plan,implement,review,test)',
-		'  --once               Process exactly one task',
-		'  --max <n>            Process at most n tasks',
 		'  --help               Show this help',
 	];
 	console.log(lines.join('\n'));
+}
+
+/**
+ * Parse --stages value into an ordered array of { stage, minPriority } entries.
+ * Bare stage names use the global defaultMin.
+ */
+function parseStages(raw, defaultMin) {
+	return raw.split(',').map(token => {
+		const [stage, pStr] = token.trim().split(':');
+		const minPriority = pStr !== undefined ? parseInt(pStr, 10) : defaultMin;
+		return { stage, minPriority };
+	});
 }
 
 function parseArgs(argv) {
@@ -348,9 +366,7 @@ function parseArgs(argv) {
 		minPriority: 3,
 		agent: 'claude',
 		dryRun: false,
-		stages: null, // null = use default reversed order
-		once: false,
-		max: Infinity,
+		stagesRaw: null,
 	};
 
 	for (let i = 0; i < argv.length; i++) {
@@ -366,14 +382,7 @@ function parseArgs(argv) {
 				opts.dryRun = true;
 				break;
 			case '--stages':
-				opts.stages = argv[++i].split(',').map(s => s.trim());
-				break;
-			case '--once':
-				opts.once = true;
-				opts.max = 1;
-				break;
-			case '--max':
-				opts.max = parseInt(argv[++i], 10);
+				opts.stagesRaw = argv[++i];
 				break;
 			case '--help':
 				printHelp();
@@ -381,11 +390,17 @@ function parseArgs(argv) {
 		}
 	}
 
-	if (!opts.stages) {
-		opts.stages = [...PENDING_STAGES];
+	const stagesRaw = opts.stagesRaw ?? PENDING_STAGES.join(',');
+	const stages = parseStages(stagesRaw, opts.minPriority);
+
+	for (const { stage } of stages) {
+		if (!PENDING_STAGES.includes(stage)) {
+			console.error(`Unknown stage: "${stage}". Valid stages: ${PENDING_STAGES.join(', ')}`);
+			process.exit(1);
+		}
 	}
 
-	return opts;
+	return { ...opts, stages };
 }
 
 // ─── Main loop ─────────────────────────────────────────────────────────────────
@@ -399,40 +414,30 @@ async function main() {
 
 	// Snapshot the task list once — tasks created by the agent during this run
 	// are NOT picked up, ensuring each task advances exactly one stage.
-	let allTasks = [];
-	for (const stage of opts.stages) {
-		if (!PENDING_STAGES.includes(stage)) {
-			console.warn(`Skipping unknown stage: ${stage}`);
-			continue;
-		}
-		const tasks = await discoverTasks(tasksDir, stage, opts.minPriority);
+	const allTasks = [];
+	for (const { stage, minPriority } of opts.stages) {
+		const tasks = await discoverTasks(tasksDir, stage, minPriority);
 		allTasks.push(...tasks);
 	}
 
 	if (allTasks.length === 0) {
-		console.log(`No tasks found with priority >= ${opts.minPriority} in stages: ${opts.stages.join(', ')}`);
+		const stageSummary = opts.stages.map(({ stage, minPriority }) => `${stage}(>=${minPriority})`).join(', ');
+		console.log(`No tasks found in stages: ${stageSummary}`);
 		return;
 	}
 
 	// Sort: stage order first (as given in opts.stages), then priority descending
-	const stageIndex = (stage) => {
-		const idx = opts.stages.indexOf(stage);
-		return idx >= 0 ? idx : 999;
-	};
+	const stageOrder = new Map(opts.stages.map(({ stage }, i) => [stage, i]));
 	allTasks.sort((a, b) => {
-		const sa = stageIndex(a.stage);
-		const sb = stageIndex(b.stage);
+		const sa = stageOrder.get(a.stage) ?? 999;
+		const sb = stageOrder.get(b.stage) ?? 999;
 		if (sa !== sb) return sa - sb;
 		return b.priority - a.priority;
 	});
 
-	// Apply --max / --once limit
-	if (opts.max < allTasks.length) {
-		allTasks = allTasks.slice(0, opts.max);
-	}
-
 	if (opts.dryRun) {
-		console.log(`\nPending tasks (priority >= ${opts.minPriority}), processing order:\n`);
+		const stageSummary = opts.stages.map(({ stage, minPriority }) => `${stage}(>=${minPriority})`).join(', ');
+		console.log(`\nPending tasks in: ${stageSummary}\n`);
 		for (const t of allTasks) {
 			console.log(`  [${t.stage.padEnd(9)}] P${t.priority}  ${t.file}`);
 		}
