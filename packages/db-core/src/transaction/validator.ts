@@ -1,5 +1,6 @@
 import type { BlockId, CollectionId, IBlock, BlockOperations, Transforms, ITransactor } from '../index.js';
 import type { Transaction, ITransactionEngine, ITransactionValidator, ValidationResult, CollectionActions } from './transaction.js';
+import { isTransactionExpired } from './transaction.js';
 import type { Collection } from '../collection/collection.js';
 import { Tracker } from '../transform/tracker.js';
 import { hashString } from '../utility/hash-string.js';
@@ -50,6 +51,14 @@ export class TransactionValidator implements ITransactionValidator {
 
 	async validate(transaction: Transaction, operationsHash: string): Promise<ValidationResult> {
 		const { stamp, statements } = transaction;
+
+		// 0. Check expiration before any other work
+		if (isTransactionExpired(stamp)) {
+			return {
+				valid: false,
+				reason: `Transaction expired at ${stamp.expiration}`
+			};
+		}
 
 		// 1. Verify engine exists
 		const registration = this.engines.get(stamp.engineId);

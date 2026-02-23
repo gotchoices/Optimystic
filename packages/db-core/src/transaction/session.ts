@@ -1,6 +1,6 @@
 import type { TransactionCoordinator } from "./coordinator.js";
 import type { Transaction, ExecutionResult, ITransactionEngine, TransactionStamp, CollectionActions } from "./transaction.js";
-import { createTransactionStamp, createTransactionId } from "./transaction.js";
+import { createTransactionStamp, createTransactionId, isTransactionExpired } from "./transaction.js";
 
 /**
  * TransactionSession manages incremental transaction building.
@@ -43,13 +43,15 @@ export class TransactionSession {
 		coordinator: TransactionCoordinator,
 		engine: ITransactionEngine,
 		peerId: string = 'local',
-		schemaHash: string = ''
+		schemaHash: string = '',
+		ttlMs?: number
 	): Promise<TransactionSession> {
 		const stamp = await createTransactionStamp(
 			peerId,
 			Date.now(),
 			schemaHash,
-			'unknown' // TODO: Get engine ID from engine
+			'unknown', // TODO: Get engine ID from engine
+			ttlMs
 		);
 		return new TransactionSession(coordinator, engine, stamp);
 	}
@@ -118,6 +120,9 @@ export class TransactionSession {
 		}
 		if (this.rolledBack) {
 			return { success: false, error: 'Transaction already rolled back' };
+		}
+		if (isTransactionExpired(this.stamp)) {
+			return { success: false, error: `Transaction expired at ${this.stamp.expiration}` };
 		}
 
 		// Create the complete transaction

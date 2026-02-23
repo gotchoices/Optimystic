@@ -67,7 +67,8 @@ type TransactionStamp = {
   timestamp: number;        // When transaction started (milliseconds)
   schemaHash: string;       // Hash of schema version(s) for validation
   engineId: string;         // Which engine (e.g., 'quereus@0.5.3')
-  id: string;               // Stamp ID (hash of peerId + timestamp + schemaHash + engineId) - stable throughout transaction
+  expiration: number;       // Absolute ms epoch after which transaction is invalid (timestamp + ttlMs)
+  id: string;               // Stamp ID (hash of all fields above) - stable throughout transaction
 };
 
 // Transaction: Finalized at COMMIT
@@ -308,6 +309,7 @@ export type TransactionStamp = {
   timestamp: number;        // When transaction started (milliseconds)
   schemaHash: string;       // Hash of schema version(s) for validation
   engineId: string;         // Which engine (e.g., 'quereus@0.5.3')
+  expiration: number;       // Absolute ms epoch after which transaction is invalid
 };
 
 // Stamp ID: Hash of the stamp

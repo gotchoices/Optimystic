@@ -4,7 +4,7 @@ import type { PeerId } from "../network/types.js";
 import type { Collection } from "../collection/collection.js";
 import { TransactionContext } from "./context.js";
 import { ActionsEngine } from "./actions-engine.js";
-import { createActionsStatements, createTransactionStamp, createTransactionId } from "./transaction.js";
+import { createActionsStatements, createTransactionStamp, createTransactionId, isTransactionExpired } from "./transaction.js";
 import { Log, blockIdsForTransforms, transformsFromTransform, hashString } from "../index.js";
 
 /**
@@ -70,6 +70,10 @@ export class TransactionCoordinator {
 	 * @param transaction - The transaction to commit
 	 */
 	async commit(transaction: Transaction): Promise<void> {
+		if (isTransactionExpired(transaction.stamp)) {
+			throw new Error(`Transaction expired at ${transaction.stamp.expiration}`);
+		}
+
 		// Collect transforms and determine critical blocks for each affected collection
 		const collectionData = Array.from(this.collections.entries())
 			.map(([collectionId, collection]) => ({
@@ -254,6 +258,10 @@ export class TransactionCoordinator {
 	 * @returns Execution result with actions and results
 	 */
 	async execute(transaction: Transaction, engine: ITransactionEngine): Promise<ExecutionResult> {
+		if (isTransactionExpired(transaction.stamp)) {
+			return { success: false, error: `Transaction expired at ${transaction.stamp.expiration}` };
+		}
+
 		// 1. Validate engine matches transaction
 		// Note: We don't enforce this strictly since the engine is passed in explicitly
 		// The caller is responsible for ensuring the correct engine is used

@@ -14,7 +14,9 @@ export type {
 export {
 	createTransactionStamp,
 	createTransactionId,
-	createActionsStatements
+	createActionsStatements,
+	DEFAULT_TRANSACTION_TTL_MS,
+	isTransactionExpired
 } from './transaction.js';
 
 export {

@@ -4,12 +4,15 @@ import {
 	createActionsStatements,
 	createTransactionStamp,
 	createTransactionId,
+	DEFAULT_TRANSACTION_TTL_MS,
+	isTransactionExpired,
 	hashString,
 	TransactionCoordinator,
 	TransactionSession,
 	TransactionValidator,
 	Tree,
 	type Transaction,
+	type TransactionStamp,
 	type CollectionActions,
 	type EngineRegistration,
 	type ValidationCoordinatorFactory,
@@ -2543,6 +2546,26 @@ describe('Transaction', () => {
 			expect(collision, 'SHA-256 should not collide within 100K inputs').to.be.undefined;
 		});
 
+		it('stamp includes expiration computed from timestamp + ttlMs', async () => {
+			const ts = 1700000000000;
+			const stamp = await createTransactionStamp('peer1', ts, 'schema1', 'actions@1.0.0');
+			expect(stamp.expiration).to.equal(ts + DEFAULT_TRANSACTION_TTL_MS);
+		});
+
+		it('stamp with custom TTL computes correct expiration', async () => {
+			const ts = 1700000000000;
+			const customTtl = 60_000;
+			const stamp = await createTransactionStamp('peer1', ts, 'schema1', 'actions@1.0.0', customTtl);
+			expect(stamp.expiration).to.equal(ts + customTtl);
+		});
+
+		it('different expirations produce different stamp IDs', async () => {
+			const ts = 1700000000000;
+			const stamp1 = await createTransactionStamp('peer1', ts, 'schema1', 'actions@1.0.0', 30_000);
+			const stamp2 = await createTransactionStamp('peer1', ts, 'schema1', 'actions@1.0.0', 60_000);
+			expect(stamp1.id).to.not.equal(stamp2.id);
+		});
+
 		it('should order transactions by commit sequence, not by timestamp', async () => {
 			const transactor = new TestTransactor();
 
@@ -2573,6 +2596,66 @@ describe('Transaction', () => {
 			const maxRev1 = Math.max(...revs1);
 			const maxRev2 = Math.max(...revs2);
 			expect(maxRev2, 'commit order determines revision, not timestamp').to.be.greaterThan(maxRev1);
+		});
+	});
+
+	describe('Transaction Expiration', () => {
+		it('isTransactionExpired returns false for non-expired stamp', async () => {
+			const stamp = await createTransactionStamp('peer1', Date.now(), 'schema1', 'actions@1.0.0');
+			expect(isTransactionExpired(stamp)).to.be.false;
+		});
+
+		it('isTransactionExpired returns true for expired stamp', async () => {
+			// Create stamp with timestamp far in the past so it's already expired
+			const stamp = await createTransactionStamp('peer1', 1000, 'schema1', 'actions@1.0.0', 1);
+			expect(isTransactionExpired(stamp)).to.be.true;
+		});
+
+		it('TransactionValidator rejects expired transaction', async () => {
+			// Create a stamp that is already expired
+			const stamp = await createTransactionStamp('peer1', 1000, 'schema1', 'actions@1.0.0', 1);
+			const transaction: Transaction = {
+				stamp,
+				statements: [],
+				reads: [],
+				id: await createTransactionId(stamp.id, [], [])
+			};
+
+			const engines = new Map<string, EngineRegistration>();
+			engines.set('actions@1.0.0', {
+				engine: new ActionsEngine({} as any),
+				getSchemaHash: async () => 'schema1'
+			});
+
+			const validator = new TransactionValidator(engines, () => ({
+				applyActions: async () => {},
+				getTransforms: () => new Map(),
+				dispose: () => {}
+			}));
+
+			const result = await validator.validate(transaction, 'ops:whatever');
+			expect(result.valid).to.be.false;
+			expect(result.reason).to.include('expired');
+		});
+
+		it('TransactionSession.commit rejects expired transaction', async () => {
+			const transactor = new TestTransactor();
+			type Entry = { key: number; value: string };
+			const tree = await Tree.createOrOpen<number, Entry>(transactor, 'data', e => e.key);
+			const usersCollection = (tree as unknown as { collection: unknown }).collection;
+			const collections = new Map<string, any>([['data', usersCollection]]);
+			const coordinator = new TransactionCoordinator(transactor, collections);
+			const engine = new ActionsEngine(coordinator);
+
+			// Create session with a very short TTL (1ms) so it expires immediately
+			const session = await TransactionSession.create(coordinator, engine, 'peer1', 'schema1', 1);
+
+			// Wait a tick to ensure expiration
+			await new Promise(resolve => setTimeout(resolve, 5));
+
+			const result = await session.commit();
+			expect(result.success).to.be.false;
+			expect(result.error).to.include('expired');
 		});
 	});
 });

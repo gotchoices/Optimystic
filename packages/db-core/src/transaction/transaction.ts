@@ -21,6 +21,9 @@ export type TransactionStamp = {
 	/** Which engine (e.g., 'quereus@0.5.3', 'actions@1.0.0') */
 	engineId: string;
 
+	/** Absolute ms epoch after which transaction is invalid */
+	expiration: number;
+
 	/** Hash of the stamp fields (computed) - stable identifier throughout transaction */
 	id: string;
 };
@@ -67,19 +70,29 @@ export type ReadDependency = {
  */
 export type TransactionRef = string; // The transaction ID
 
+/** Default transaction time-to-live in milliseconds (30 seconds). */
+export const DEFAULT_TRANSACTION_TTL_MS = 30_000;
+
+/** Check whether a transaction stamp has expired. */
+export function isTransactionExpired(stamp: TransactionStamp): boolean {
+	return Date.now() > stamp.expiration;
+}
+
 /**
  * Create a transaction stamp with computed id.
- * The id is a hash of the stamp fields.
+ * The id is a hash of the stamp fields (including expiration).
  */
 export async function createTransactionStamp(
 	peerId: string,
 	timestamp: number,
 	schemaHash: string,
-	engineId: string
+	engineId: string,
+	ttlMs: number = DEFAULT_TRANSACTION_TTL_MS
 ): Promise<TransactionStamp> {
-	const stampData = JSON.stringify({ peerId, timestamp, schemaHash, engineId });
+	const expiration = timestamp + ttlMs;
+	const stampData = JSON.stringify({ peerId, timestamp, schemaHash, engineId, expiration });
 	const id = `stamp:${await hashString(stampData)}`;
-	return { peerId, timestamp, schemaHash, engineId, id };
+	return { peerId, timestamp, schemaHash, engineId, expiration, id };
 }
 
 /**
