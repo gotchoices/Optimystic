@@ -1,0 +1,33 @@
+----
+description: Mesh sanity integration tests for multi-node consensus
+dependencies: db-p2p (ClusterMember, ClusterCoordinator, CoordinatorRepo, StorageRepo), db-core (IKeyNetwork, ICluster, ClusterPeers)
+----
+
+## Summary
+
+Component-integration tests wiring real ClusterMember + StorageRepo + CoordinatorRepo instances across N nodes with a mock mesh network, verifying consensus and coordination paths without real libp2p transport.
+
+## Files
+
+- `packages/db-p2p/test/mesh-harness.ts` — reusable `createMesh(nodeCount, options)` factory
+- `packages/db-p2p/test/mesh-sanity.spec.ts` — 11 integration tests across 3 suites
+
+## Test Coverage
+
+- **K=1 (fast path):** write, read-back, cross-node discovery, independent writes
+- **K=3 (full 2PC):** consensus pend+commit, data verification, promise-phase failure (threshold=0.75), partial-failure tolerance (threshold=0.51), multi-coordinator writes
+- **DHT degraded:** empty findCluster error, subset cluster adaptation, unreachable peer tolerance
+
+## Validation
+
+- `yarn test:db-p2p` — 133 passing (11 new mesh tests)
+- `yarn build:db-p2p` — clean
+- All tests exercise public interfaces only (pend/commit/get/update)
+- Mock implementations correctly satisfy IKeyNetwork, ICluster, IPeerNetwork interfaces
+- No implementation leakage — no private field or internal method access
+
+## Known Limitations (by design)
+
+- Only the coordinating node materializes data after consensus commit (peers skip execution in `inboundPhase === 'commit'`)
+- Cross-node block replication requires `restoreCallback` on BlockStorage, not wired in mock harness
+- `skipClusterFetch` option uses `as any` cast — pre-existing pattern in coordinator-repo.ts and service.ts
