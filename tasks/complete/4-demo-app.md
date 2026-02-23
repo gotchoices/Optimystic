@@ -1,0 +1,50 @@
+----
+description: Hello world demo app (messages) exercising the full stack
+dependencies: db-core (Tree, Diary, Collection)
+----
+
+## Summary
+
+`packages/demo` — a "messages" app exercising Tree and Diary collections across the Optimystic stack. Serves as both a smoke test and a reference implementation.
+
+## What was built
+
+### `MessageApp` class (`packages/demo/src/message-app.ts`)
+- Wraps `Tree<string, Message>` for CRUD on messages (keyed by ID)
+- Wraps `Diary<Activity>` for an append-only activity log
+- API: `create()`, `addMessage()`, `getMessage()`, `updateMessage()`, `deleteMessage()`, `listMessages()`, `getActivity()`
+
+### Package structure
+- `packages/demo/` — private workspace package
+- Dependencies: `@optimystic/db-core` (workspace)
+- Follows existing conventions: mocha+chai tests, ts-node ESM, same tsconfig pattern
+
+### Supporting changes
+- **db-core**: Added `./test` subpath export exposing `TestTransactor` for workspace consumers
+- **root package.json**: Added `clean:demo`, `build:demo`, `test:demo` scripts wired into aggregates
+- **root README.md**: Added demo package to Packages listing
+
+## Review findings
+
+### Passed
+- Build: `yarn build:demo` compiles without errors
+- Tests: 12 passing (CRUD, error cases, multi-instance sharing, empty state, activity log)
+- No regressions: `yarn test:db-core` — 206 passing
+- Code quality: clean interfaces, proper error handling, private constructor + static factory pattern
+- Convention conformance: tsconfig, mocha runner, register.mjs all match workspace patterns
+- DRY: no duplication; repeated `update()` calls before reads are necessary per-method
+
+### Acceptable deviations (private package)
+- Missing `files`, `repository`, `author`, `license` fields in package.json — not needed since `private: true`
+
+## Key files
+- `packages/demo/src/message-app.ts` — core app class
+- `packages/demo/src/run.ts` — CLI demo script
+- `packages/demo/test/message-app.spec.ts` — 12 tests
+- `packages/db-core/package.json` — `./test` export
+
+## Usage
+```bash
+yarn workspace @optimystic/demo start    # run demo
+yarn test:demo                           # run tests
+```

@@ -29,6 +29,7 @@ See the following documentation:
 * **Reference Peer** - packages/reference-peer - CLI for testing peer-to-peer functionality (run via `optimystic-peer`)
 * **Quereus Plugin Crypto** - packages/quereus-plugin-crypto - Quereus plugin providing cryptographic functions
 * **Quereus Plugin Optimystic** - packages/quereus-plugin-optimystic - Quereus plugin for Optimystic distributed tree collections
+* **Demo** - packages/demo - Hello world demo app exercising Tree and Diary collections across the full stack
 
 ## How to use:
 
