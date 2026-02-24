@@ -15,29 +15,39 @@ This means the agent can split one plan into multiple implement tasks, adjust pr
 
 **Commit per task** — The agent is instructed to commit when done (e.g. `task(plan): short description`). This gives the human a clean commit history to review between runs.
 
-**Human reviews between runs** — The script is non-interactive. Run it with `--max` or `--once` to process a batch, review the commits, then run again.
+**Human reviews between runs** — The script is non-interactive. Run it, review the commits, then run again.
 
 ## Usage
 
 ```bash
-# Dry run — see what would be processed at priority >= 3
+# Dry run — see what would be processed (default: all stages, priority >= 3)
 node tasks/run-tasks.mjs --dry-run
 
-# Process all tasks priority >= 4 (default agent: claude)
+# Raise the default min priority to 4
 node tasks/run-tasks.mjs --min-priority 4
 
-# Process just one task
-node tasks/run-tasks.mjs --once
+# Only certain stages (inherit default min priority)
+node tasks/run-tasks.mjs --stages fix,implement
 
-# Only review + test stages, priority >= 3
-node tasks/run-tasks.mjs --stages review,test
+# Per-stage min priorities
+node tasks/run-tasks.mjs --stages review:5,implement:3,fix:4
 
-# Process at most 5 tasks
-node tasks/run-tasks.mjs --max 5
+# Mixed — bare stage names use --min-priority as the default
+node tasks/run-tasks.mjs --min-priority 3 --stages fix:4,implement,review:5
 
 # Use a different agent CLI
 node tasks/run-tasks.mjs --agent auggie
 ```
+
+### Options
+
+| Option | Default | Description |
+|---|---|---|
+| `--min-priority <n>` | `3` | Default min priority applied to all stages |
+| `--stages <list>` | `fix,plan,implement,review` | Comma-separated stages to process. Each entry can be bare (`fix`) or include a per-stage min priority (`fix:4`). Bare entries use `--min-priority`. |
+| `--agent <name>` | `claude` | Agent adapter: `claude`, `auggie`, or `cursor` |
+| `--dry-run` | — | List tasks that would be processed without invoking the agent |
+| `--help` | — | Show help |
 
 ## Logs
 

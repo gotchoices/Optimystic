@@ -3,7 +3,7 @@
  * Task Runner — processes outstanding tasks through the pipeline stages
  * by invoking an agentic CLI tool for each one.
  *
- * Version: 1.0.0
+ * Version: 1.0.2
  *
  * Key design choices:
  *   - The task list is snapshotted once at startup.  Tasks created by the agent
@@ -35,12 +35,16 @@ import { join, basename, relative } from 'node:path';
 import { spawn } from 'node:child_process';
 import { constants, createWriteStream } from 'node:fs';
 
-/** Format Claude stream-json line to readable text. */
+/**
+ * Format stream-json lines to readable text.
+ * Returns { text, done? } — when done is true the agent has emitted its
+ * final result and the runner should stop waiting for a clean exit.
+ */
 function formatClaudeJsonLine(line) {
 	try {
 		const obj = JSON.parse(line);
 		if (obj.type === 'system' && obj.subtype === 'init') {
-			return `[session ${obj.session_id ?? '?'}]\n`;
+			return { text: `[session ${obj.session_id ?? '?'}]\n` };
 		}
 		if (obj.type === 'assistant') {
 			const content = obj.message?.content ?? [];
@@ -55,7 +59,7 @@ function formatClaudeJsonLine(line) {
 					parts.push(`\n[TOOL:${block.name}] ${inputStr}\n`);
 				}
 			}
-			return parts.join('') || '';
+			return { text: parts.join('') || '' };
 		}
 		if (obj.type === 'user') {
 			const content = obj.message?.content ?? [];
@@ -70,55 +74,60 @@ function formatClaudeJsonLine(line) {
 					parts.push(`\n[USER]\n${block.text}\n`);
 				}
 			}
-			return parts.join('') || '';
+			return { text: parts.join('') || '' };
 		}
 		if (obj.type === 'result') {
 			const status = obj.is_error ? '✗ ERROR' : '✓ DONE';
 			const cost = obj.total_cost_usd != null ? ` | cost $${obj.total_cost_usd.toFixed(4)}` : '';
 			const dur = obj.duration_ms != null ? ` | ${(obj.duration_ms / 1000).toFixed(1)}s` : '';
-			return `\n[RESULT ${status}${dur}${cost}]\n${obj.result ?? ''}\n`;
+			return {
+				text: `\n[RESULT ${status}${dur}${cost}]\n${obj.result ?? ''}\n`,
+				done: true,
+				exitCode: obj.is_error ? 1 : 0,
+			};
 		}
 	} catch {
 		/* not JSON, pass through */
 	}
-	return line.endsWith('\n') ? line : line + '\n';
+	const text = line.endsWith('\n') ? line : line + '\n';
+	return { text };
 }
 
-/** Format Cursor stream-json line to readable text (no jq required). */
 function formatCursorJsonLine(line) {
 	try {
 		const obj = JSON.parse(line);
 		if (obj.type === 'user') {
 			const t = obj.message?.content?.[0]?.text ?? '';
-			return `\n[USER]\n${t}\n`;
+			return { text: `\n[USER]\n${t}\n` };
 		}
 		if (obj.type === 'assistant') {
 			const t = obj.message?.content?.[0]?.text ?? '';
-			return `\n[ASSISTANT]\n${t}\n`;
+			return { text: `\n[ASSISTANT]\n${t}\n` };
 		}
 		if (obj.type === 'tool_call' && obj.subtype === 'started') {
 			const tc = obj.tool_call ?? {};
-			if (tc.shellToolCall) return `\n[SHELL] ${tc.shellToolCall.args?.command ?? ''}\n`;
-			if (tc.readToolCall) return `\n[READ] ${tc.readToolCall.args?.path ?? ''}\n`;
-			if (tc.editToolCall) return `\n[EDIT] ${tc.editToolCall.args?.path ?? ''}\n`;
-			if (tc.writeToolCall) return `\n[WRITE] ${tc.writeToolCall.args?.path ?? ''}\n`;
-			if (tc.grepToolCall) return `\n[GREP] ${tc.grepToolCall.args?.pattern ?? ''} in ${tc.grepToolCall.args?.path ?? ''}\n`;
-			if (tc.lsToolCall) return `\n[LS] ${tc.lsToolCall.args?.path ?? ''}\n`;
-			if (tc.deleteToolCall) return `\n[DELETE] ${tc.deleteToolCall.args?.path ?? ''}\n`;
-			return `\n[TOOL] ${Object.keys(tc)[0] ?? '?'}\n`;
+			if (tc.shellToolCall) return { text: `\n[SHELL] ${tc.shellToolCall.args?.command ?? ''}\n` };
+			if (tc.readToolCall) return { text: `\n[READ] ${tc.readToolCall.args?.path ?? ''}\n` };
+			if (tc.editToolCall) return { text: `\n[EDIT] ${tc.editToolCall.args?.path ?? ''}\n` };
+			if (tc.writeToolCall) return { text: `\n[WRITE] ${tc.writeToolCall.args?.path ?? ''}\n` };
+			if (tc.grepToolCall) return { text: `\n[GREP] ${tc.grepToolCall.args?.pattern ?? ''} in ${tc.grepToolCall.args?.path ?? ''}\n` };
+			if (tc.lsToolCall) return { text: `\n[LS] ${tc.lsToolCall.args?.path ?? ''}\n` };
+			if (tc.deleteToolCall) return { text: `\n[DELETE] ${tc.deleteToolCall.args?.path ?? ''}\n` };
+			return { text: `\n[TOOL] ${Object.keys(tc)[0] ?? '?'}\n` };
 		}
 		if (obj.type === 'tool_call' && obj.subtype === 'completed') {
 			const tc = obj.tool_call ?? {};
 			const ok = (r) => r?.success != null;
-			if (tc.shellToolCall) return ok(tc.shellToolCall.result) ? `  ✓ exit ${tc.shellToolCall.result.success?.exitCode ?? 0}\n` : `  ✗ failed\n`;
-			if (tc.readToolCall) return ok(tc.readToolCall.result) ? `  ✓ read ${tc.readToolCall.result.success?.totalLines ?? 0} lines\n` : `  ✗ failed\n`;
-			if (tc.editToolCall || tc.writeToolCall || tc.deleteToolCall) return ok(Object.values(tc)[0]?.result) ? `  ✓ done\n` : `  ✗ failed\n`;
-			return `  ✓ done\n`;
+			if (tc.shellToolCall) return { text: ok(tc.shellToolCall.result) ? `  ✓ exit ${tc.shellToolCall.result.success?.exitCode ?? 0}\n` : `  ✗ failed\n` };
+			if (tc.readToolCall) return { text: ok(tc.readToolCall.result) ? `  ✓ read ${tc.readToolCall.result.success?.totalLines ?? 0} lines\n` : `  ✗ failed\n` };
+			if (tc.editToolCall || tc.writeToolCall || tc.deleteToolCall) return { text: ok(Object.values(tc)[0]?.result) ? `  ✓ done\n` : `  ✗ failed\n` };
+			return { text: `  ✓ done\n` };
 		}
 	} catch {
 		/* not JSON, pass through */
 	}
-	return line.endsWith('\n') ? line : line + '\n';
+	const text = line.endsWith('\n') ? line : line + '\n';
+	return { text };
 }
 
 // ─── Agent adapters ────────────────────────────────────────────────────────────
@@ -256,6 +265,8 @@ async function buildPrompt(task, tasksDir) {
 	].join('\n');
 }
 
+const IDLE_TIMEOUT_MS = 10 * 60 * 1000; // 10 minutes with no output → assume hung
+
 /** Write prompt to a temp instruction file, spawn the agent, tee output to log. Returns exit code. */
 async function runAgent(agentName, prompt, cwd, logFile, { stage } = {}) {
 	const adapter = agents[agentName];
@@ -276,27 +287,71 @@ async function runAgent(agentName, prompt, cwd, logFile, { stage } = {}) {
 		? [shellCmd, [], { cwd, stdio: ['ignore', 'pipe', 'pipe'], shell: true }]
 		: [cmd, args, { cwd, stdio: ['ignore', 'pipe', 'pipe'], shell: false }];
 
-	function writeOut(text) {
-		process.stdout.write(text);
-		logStream.write(text);
-	}
-
 	try {
 		return await new Promise((resolve, reject) => {
 			const child = spawn(...spawnArgs);
+			let idleTimer = null;
+			let resultExitCode = null;  // set when stream-json emits a result event
+			let settled = false;
+
+			function settle(code) {
+				if (settled) return;
+				settled = true;
+				clearTimeout(idleTimer);
+				logStream.end(`\n[runner] Agent exited with code ${code}\n`);
+				logStream.once('finish', () => resolve(code));
+				logStream.once('error', () => resolve(code));
+			}
+
+			function resetIdleTimer() {
+				if (idleTimer) clearTimeout(idleTimer);
+				idleTimer = setTimeout(() => {
+					const msg = `\n[runner] Agent idle for ${IDLE_TIMEOUT_MS / 60000}min — killing as hung.\n`;
+					process.stderr.write(msg);
+					logStream.write(msg);
+					child.kill();
+				}, IDLE_TIMEOUT_MS);
+			}
+
+			resetIdleTimer();
+
+			function writeOut(text) {
+				process.stdout.write(text);
+				if (!logStream.write(text)) {
+					child.stdout.pause();
+					logStream.once('drain', () => child.stdout.resume());
+				}
+			}
+
+			function processLine(line) {
+				if (!formatStream) { writeOut(line + '\n'); return; }
+				const result = formatStream(line);
+				if (result.text) writeOut(result.text);
+				if (result.done) {
+					resultExitCode = result.exitCode ?? 0;
+					// Known CLI bug: process may hang after result event.
+					// Give it a short grace period then kill and resolve.
+					clearTimeout(idleTimer);
+					idleTimer = setTimeout(() => {
+						const msg = `\n[runner] Agent sent result but didn't exit — killing stale process.\n`;
+						process.stderr.write(msg);
+						logStream.write(msg);
+						child.kill();
+					}, 30_000);
+				}
+			}
 
 			let buf = '';
 			child.stdout.on('data', (chunk) => {
+				if (resultExitCode == null) resetIdleTimer();
 				buf += chunk.toString();
 				const lines = buf.split('\n');
 				buf = lines.pop() ?? '';
-				for (const line of lines) {
-					const out = formatStream ? formatStream(line) : line + '\n';
-					writeOut(out);
-				}
+				for (const line of lines) processLine(line);
 			});
 
 			child.stderr.on('data', (chunk) => {
+				if (resultExitCode == null) resetIdleTimer();
 				process.stderr.write(chunk);
 				logStream.write(chunk);
 			});
@@ -310,13 +365,10 @@ async function runAgent(agentName, prompt, cwd, logFile, { stage } = {}) {
 			});
 
 			child.on('close', (code) => {
-				if (buf) {
-					const out = formatStream ? formatStream(buf.trimEnd()) : buf + '\n';
-					writeOut(out);
-				}
-				logStream.end(`\n[runner] Agent exited with code ${code}\n`);
-				logStream.once('finish', () => resolve(code ?? 1));
-				logStream.once('error', () => resolve(code ?? 1));
+				if (buf) processLine(buf.trimEnd());
+				// Prefer the exit code extracted from the result event (the
+				// OS code can be bogus, e.g. 0xFFFFFFFF after kill).
+				settle(resultExitCode ?? code ?? 1);
 			});
 		});
 	} finally {

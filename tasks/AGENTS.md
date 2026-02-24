@@ -15,12 +15,13 @@ Stages:
 
 Don't combine tasks unless they are tightly related.
 
-For new tasks: put a new file into fix/ or plan/ but focus on the description/requirements of the issue or feature, expected behavior, use case, etc.  Don't do planning, add TODO items, or get ahead, unless you already posess key information that would be useful.
+For new tasks: put a new file into fix/ or plan/ but focus on the description/requirements of the issue or feature, expected behavior, use case, etc.  Don't do planning, don't add TODO items, or get ahead, unless you already posess key information that would be useful.
 
 Task file template:
-----
+
 description: <brief description>
 dependencies: <needed other tasks, modularity points, external libraries>
+files: <optional list of known relevant files>
 ----
 <timeless architecture description focused on prose, diagrams, and interfaces/types/schema>
 
