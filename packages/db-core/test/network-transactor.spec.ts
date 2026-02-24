@@ -4,10 +4,12 @@ import { NetworkSimulation } from './simulation.js'
 import type { Scenario } from './simulation.js'
 import { randomBytes } from '@libp2p/crypto'
 import { blockIdToBytes } from '../src/utility/block-id-to-bytes.js'
-import type { BlockId, PendRequest, ActionId, BlockOperation } from '../src/index.js'
+import type { BlockId, PendRequest, ActionId, BlockOperation, ClusterPeers, FindCoordinatorOptions, IKeyNetwork } from '../src/index.js'
 import type { PeerId } from '../src/index.js'
+import { peerIdFromString } from '../src/network/types.js'
 import { toString as uint8ArrayToString } from 'uint8arrays/to-string'
 import { generateRandomActionId } from './generate-random-action-id.js'
+import { TestTransactor } from './test-transactor.js'
 
 describe('NetworkTransactor', () => {
   // Helper to generate block IDs
@@ -339,5 +341,246 @@ describe('NetworkTransactor', () => {
         coordinator.transactor.available = true
       }
     })
+  })
+
+  // Tests for cluster intersection coordinator selection
+  describe('cluster intersection consolidation', () => {
+    // Mock IKeyNetwork with explicit control over cluster membership
+    class MockKeyNetwork implements IKeyNetwork {
+      private clusterMap = new Map<string, string[]>();
+      private fallbackCoordinator: string;
+
+      constructor(fallbackCoordinator: string) {
+        this.fallbackCoordinator = fallbackCoordinator;
+      }
+
+      /** Register cluster peers for a blockId (pre-hashes to match findCluster lookup) */
+      async setCluster(blockId: BlockId, peerIds: string[]) {
+        const keyBytes = await blockIdToBytes(blockId);
+        const keyStr = uint8ArrayToString(keyBytes, 'base64url');
+        this.clusterMap.set(keyStr, peerIds);
+      }
+
+      async findCoordinator(_key: Uint8Array, _options?: Partial<FindCoordinatorOptions>): Promise<PeerId> {
+        return peerIdFromString(this.fallbackCoordinator);
+      }
+
+      async findCluster(key: Uint8Array): Promise<ClusterPeers> {
+        const keyStr = uint8ArrayToString(key, 'base64url');
+        const peerIds = this.clusterMap.get(keyStr);
+        if (!peerIds) {
+          return { [this.fallbackCoordinator]: { multiaddrs: [], publicKey: new Uint8Array() } };
+        }
+        const peers: ClusterPeers = {};
+        for (const pid of peerIds) {
+          peers[pid] = { multiaddrs: [], publicKey: new Uint8Array() };
+        }
+        return peers;
+      }
+    }
+
+    it('should use a shared cluster peer to consolidate multi-block transactions', async () => {
+      const peerA = 'peer-A';
+      const peerB = 'peer-B';
+      const peerShared = 'peer-shared';
+
+      const mockNetwork = new MockKeyNetwork(peerA);
+
+      const blockId1 = 'block-1' as BlockId;
+      const blockId2 = 'block-2' as BlockId;
+
+      // Block 1 cluster: peerA, peerShared
+      // Block 2 cluster: peerB, peerShared
+      // Intersection: peerShared — should be selected as coordinator for both
+      await mockNetwork.setCluster(blockId1, [peerA, peerShared]);
+      await mockNetwork.setCluster(blockId2, [peerB, peerShared]);
+
+      // Track which peers receive pend requests
+      const pendedPeers: string[] = [];
+      const transactors = new Map<string, TestTransactor>();
+      for (const pid of [peerA, peerB, peerShared]) {
+        transactors.set(pid, new TestTransactor());
+      }
+
+      const networkTransactor = new NetworkTransactor({
+        timeoutMs: 1000,
+        abortOrCancelTimeoutMs: 500,
+        keyNetwork: mockNetwork,
+        getRepo: (peerId: PeerId) => {
+          const pid = peerId.toString();
+          pendedPeers.push(pid);
+          const t = transactors.get(pid);
+          if (!t) throw new Error(`No transactor for ${pid}`);
+          return t;
+        }
+      });
+
+      const actionId = generateRandomActionId();
+      const pendRequest: PendRequest = {
+        actionId,
+        transforms: {
+          updates: {
+            [blockId1]: [createBlockOperation()],
+            [blockId2]: [createBlockOperation()]
+          },
+          inserts: {},
+          deletes: []
+        },
+        policy: 'c'
+      };
+
+      const result = await networkTransactor.pend(pendRequest);
+      expect(result.success).to.be.true;
+
+      // The shared peer should be the only coordinator (1 batch instead of 2)
+      expect(pendedPeers).to.have.length(1);
+      expect(pendedPeers[0]).to.equal(peerShared);
+    });
+
+    it('should fall back to per-block coordinators for non-overlapping clusters', async () => {
+      const peerA = 'peer-A';
+      const peerB = 'peer-B';
+
+      const mockNetwork = new MockKeyNetwork(peerA);
+
+      const blockId1 = 'block-1' as BlockId;
+      const blockId2 = 'block-2' as BlockId;
+
+      // Disjoint clusters
+      await mockNetwork.setCluster(blockId1, [peerA]);
+      await mockNetwork.setCluster(blockId2, [peerB]);
+
+      const pendedPeers: string[] = [];
+      const transactors = new Map<string, TestTransactor>();
+      for (const pid of [peerA, peerB]) {
+        transactors.set(pid, new TestTransactor());
+      }
+
+      const networkTransactor = new NetworkTransactor({
+        timeoutMs: 1000,
+        abortOrCancelTimeoutMs: 500,
+        keyNetwork: mockNetwork,
+        getRepo: (peerId: PeerId) => {
+          const pid = peerId.toString();
+          pendedPeers.push(pid);
+          const t = transactors.get(pid);
+          if (!t) throw new Error(`No transactor for ${pid}`);
+          return t;
+        }
+      });
+
+      const actionId = generateRandomActionId();
+      const pendRequest: PendRequest = {
+        actionId,
+        transforms: {
+          updates: {
+            [blockId1]: [createBlockOperation()],
+            [blockId2]: [createBlockOperation()]
+          },
+          inserts: {},
+          deletes: []
+        },
+        policy: 'c'
+      };
+
+      const result = await networkTransactor.pend(pendRequest);
+      expect(result.success).to.be.true;
+
+      // Each block gets its own coordinator — 2 batches
+      expect(pendedPeers).to.have.length(2);
+    });
+
+    it('should handle single-block transactions normally', async () => {
+      const peerA = 'peer-A';
+      const peerB = 'peer-B';
+
+      const mockNetwork = new MockKeyNetwork(peerA);
+
+      const blockId1 = 'block-1' as BlockId;
+      await mockNetwork.setCluster(blockId1, [peerA, peerB]);
+
+      const pendedPeers: string[] = [];
+      const transactors = new Map<string, TestTransactor>();
+      for (const pid of [peerA, peerB]) {
+        transactors.set(pid, new TestTransactor());
+      }
+
+      const networkTransactor = new NetworkTransactor({
+        timeoutMs: 1000,
+        abortOrCancelTimeoutMs: 500,
+        keyNetwork: mockNetwork,
+        getRepo: (peerId: PeerId) => {
+          const pid = peerId.toString();
+          pendedPeers.push(pid);
+          const t = transactors.get(pid);
+          if (!t) throw new Error(`No transactor for ${pid}`);
+          return t;
+        }
+      });
+
+      const actionId = generateRandomActionId();
+      const pendRequest: PendRequest = {
+        actionId,
+        transforms: {
+          updates: {
+            [blockId1]: [createBlockOperation()]
+          },
+          inserts: {},
+          deletes: []
+        },
+        policy: 'c'
+      };
+
+      const result = await networkTransactor.pend(pendRequest);
+      expect(result.success).to.be.true;
+
+      // Single block = single batch
+      expect(pendedPeers).to.have.length(1);
+    });
+
+    it('should gracefully degrade when findCluster throws', async () => {
+      const peerA = 'peer-A';
+
+      const mockNetwork: IKeyNetwork = {
+        async findCoordinator(_key: Uint8Array, _options?: Partial<FindCoordinatorOptions>): Promise<PeerId> {
+          return peerIdFromString(peerA);
+        },
+        async findCluster(_key: Uint8Array): Promise<ClusterPeers> {
+          throw new Error('FRET not available');
+        }
+      };
+
+      const transactors = new Map<string, TestTransactor>();
+      transactors.set(peerA, new TestTransactor());
+
+      const networkTransactor = new NetworkTransactor({
+        timeoutMs: 1000,
+        abortOrCancelTimeoutMs: 500,
+        keyNetwork: mockNetwork,
+        getRepo: (peerId: PeerId) => {
+          const t = transactors.get(peerId.toString());
+          if (!t) throw new Error(`No transactor for ${peerId.toString()}`);
+          return t;
+        }
+      });
+
+      const blockId1 = 'block-1' as BlockId;
+      const actionId = generateRandomActionId();
+      const pendRequest: PendRequest = {
+        actionId,
+        transforms: {
+          updates: {
+            [blockId1]: [createBlockOperation()]
+          },
+          inserts: {},
+          deletes: []
+        },
+        policy: 'c'
+      };
+
+      // Should succeed via findCoordinator fallback
+      const result = await networkTransactor.pend(pendRequest);
+      expect(result.success).to.be.true;
+    });
   })
 })

@@ -187,24 +187,77 @@ export class NetworkTransactor implements ITransactor {
 		transforms: Transforms,
 		transformForBlock: (payload: Transforms, blockId: BlockId, mergeWith?: Transforms) => Transforms
 	): Promise<CoordinatorBatch<Transforms, PendResult>[]> {
-		const blockCoordinators = await Promise.all(
-			blockIds.map(async bid => ({
+		// Use cluster intersections to minimize the number of coordinators.
+		// For each block, find its full cluster, then greedily assign blocks to
+		// peers that appear in the most clusters — reducing round trips when
+		// blocks share cluster members.
+
+		// Step 1: Get cluster peer sets for each block
+		const blockClusterPeerIds: Map<BlockId, Set<string>> = new Map();
+		const fallbackBlocks: BlockId[] = [];
+
+		await Promise.all(blockIds.map(async bid => {
+			try {
+				const clusterPeers = await this.keyNetwork.findCluster(await blockIdToBytes(bid));
+				blockClusterPeerIds.set(bid, new Set(Object.keys(clusterPeers)));
+			} catch {
+				fallbackBlocks.push(bid);
+			}
+		}));
+
+		// Step 2: Build peer → blocks index (which blocks each peer can coordinate)
+		const peerBlocks = new Map<string, BlockId[]>();
+		for (const [blockId, peerIds] of blockClusterPeerIds) {
+			for (const peerId of peerIds) {
+				const blocks = peerBlocks.get(peerId) ?? [];
+				blocks.push(blockId);
+				peerBlocks.set(peerId, blocks);
+			}
+		}
+
+		// Step 3: Greedy set cover — assign blocks to peers covering the most uncovered blocks
+		const uncovered = new Set(blockClusterPeerIds.keys());
+		const assignments = new Map<string, BlockId[]>(); // peerIdStr → assigned blockIds
+
+		while (uncovered.size > 0) {
+			let bestPeer: string | undefined;
+			let bestCount = 0;
+
+			for (const [peerId, blocks] of peerBlocks) {
+				const coverCount = blocks.filter(bid => uncovered.has(bid)).length;
+				if (coverCount > bestCount) {
+					bestCount = coverCount;
+					bestPeer = peerId;
+				}
+			}
+
+			if (!bestPeer || bestCount === 0) break;
+
+			const covered = peerBlocks.get(bestPeer)!.filter(bid => uncovered.has(bid));
+			assignments.set(bestPeer, covered);
+			for (const bid of covered) uncovered.delete(bid);
+		}
+
+		// Step 4: Any remaining uncovered blocks fall back to findCoordinator
+		for (const bid of uncovered) fallbackBlocks.push(bid);
+
+		const fallbackCoordinators = await Promise.all(
+			fallbackBlocks.map(async bid => ({
 				blockId: bid,
 				coordinator: await this.keyNetwork.findCoordinator(await blockIdToBytes(bid), { excludedPeers: [] })
 			}))
 		);
-
-		const byCoordinator = new Map<string, BlockId[]>();
-		for (const { blockId, coordinator } of blockCoordinators) {
+		for (const { blockId, coordinator } of fallbackCoordinators) {
 			const key = coordinator.toString();
-			const blocks = byCoordinator.get(key) ?? [];
-			blocks.push(blockId);
-			byCoordinator.set(key, blocks);
+			const existing = assignments.get(key) ?? [];
+			existing.push(blockId);
+			assignments.set(key, existing);
 		}
 
+		// Step 5: Convert assignments to batches
 		const batches: CoordinatorBatch<Transforms, PendResult>[] = [];
-		for (const [coordinatorStr, consolidatedBlocks] of byCoordinator) {
-			const coordinator = blockCoordinators.find(bc => bc.coordinator.toString() === coordinatorStr)!.coordinator;
+		for (const [peerIdStr, consolidatedBlocks] of assignments) {
+			const peerId = peerIdFromString(peerIdStr);
 
 			let batchTransforms: Transforms = { inserts: {}, updates: {}, deletes: [] };
 			for (const bid of consolidatedBlocks) {
@@ -213,7 +266,7 @@ export class NetworkTransactor implements ITransactor {
 			}
 
 			batches.push({
-				peerId: coordinator,
+				peerId,
 				payload: batchTransforms,
 				blockId: consolidatedBlocks[0]!,
 				coordinatingBlockIds: consolidatedBlocks,
