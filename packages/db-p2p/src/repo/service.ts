@@ -1,10 +1,10 @@
 import { pipe } from 'it-pipe'
 import { decode as lpDecode, encode as lpEncode } from 'it-length-prefixed'
-import type { Startable, Logger, Stream, Connection, StreamHandler } from '@libp2p/interface'
+import type { Startable, Logger, Stream, Connection, StreamHandler, PeerId } from '@libp2p/interface'
 import type { IRepo, RepoMessage } from '@optimystic/db-core'
 import { peersEqual } from '../peer-utils.js'
 import { sha256 } from 'multiformats/hashes/sha2'
-import { encodePeers } from './redirect.js'
+import { encodePeers, type RedirectPayload } from './redirect.js'
 import type { Uint8ArrayList } from 'uint8arraylist'
 import { createLogger } from '../logger.js'
 
@@ -19,8 +19,15 @@ interface BaseComponents {
 	}
 }
 
+export interface NetworkManagerLike {
+	getCluster(key: Uint8Array): Promise<PeerId[]>
+}
+
 export type RepoServiceComponents = BaseComponents & {
 	repo: IRepo
+	networkManager?: NetworkManagerLike
+	peerId?: PeerId
+	getConnectionAddrs?: (peerId: PeerId) => string[]
 }
 
 export type RepoServiceInit = {
@@ -103,6 +110,61 @@ export class RepoService implements Startable {
 		this.running = false
 	}
 
+	private getNetworkManager(): NetworkManagerLike | undefined {
+		if (this.components.networkManager) return this.components.networkManager
+		return (this.components as any).libp2p?.services?.networkManager as NetworkManagerLike | undefined
+	}
+
+	private getSelfId(): PeerId | undefined {
+		if (this.components.peerId) return this.components.peerId
+		return (this.components as any).libp2p?.peerId as PeerId | undefined
+	}
+
+	private getPeerAddrs(peerId: PeerId): string[] {
+		if (this.components.getConnectionAddrs) return this.components.getConnectionAddrs(peerId)
+		const libp2p = (this.components as any).libp2p
+		if (!libp2p?.getConnections) return []
+		const conns: any[] = libp2p.getConnections(peerId) ?? []
+		const addrs: string[] = []
+		for (const c of conns) {
+			const addr = c.remoteAddr?.toString?.()
+			if (addr) addrs.push(addr)
+		}
+		return addrs
+	}
+
+	/**
+	 * Check if this node should redirect the request for a given key.
+	 * Returns a RedirectPayload if not responsible, null if should handle locally.
+	 * Also attaches cluster info to the message for downstream use.
+	 */
+	async checkRedirect(blockKey: string, opName: string, message: RepoMessage): Promise<RedirectPayload | null> {
+		const nm = this.getNetworkManager()
+		if (!nm) return null
+
+		const mh = await sha256.digest(new TextEncoder().encode(blockKey))
+		const key = mh.digest
+		const cluster = await nm.getCluster(key)
+		;(message as any).cluster = cluster.map((p: PeerId) => p.toString?.() ?? String(p))
+
+		const selfId = this.getSelfId()
+		if (!selfId) return null
+
+		const isMember = cluster.some((p: PeerId) => peersEqual(p, selfId))
+		const smallMesh = cluster.length < this.responsibilityK
+
+		if (!smallMesh && !isMember) {
+			const peers = cluster.filter((p: PeerId) => !peersEqual(p, selfId))
+			debugLog('redirect op=%s blockKey=%s cluster=%d', opName, blockKey, cluster.length)
+			return encodePeers(peers.map((pid: PeerId) => ({
+				id: pid.toString(),
+				addrs: this.getPeerAddrs(pid)
+			})))
+		}
+
+		return null
+	}
+
 	/**
 	 * Handle incoming streams on the repo protocol
 	 */
@@ -120,79 +182,40 @@ export class RepoService implements Startable {
 				let response: any
 
 				if ('get' in operation) {
-					{
-						// Use sha256 digest of block id string for consistent key space
-						const mh = await sha256.digest(new TextEncoder().encode(operation.get.blockIds[0]!))
-						const key = mh.digest
-						const nm: any = (this.components as any).libp2p?.services?.networkManager
-						if (nm?.getCluster) {
-							const cluster: any[] = await nm.getCluster(key);
-							(message as any).cluster = (cluster as any[]).map(p => p.toString?.() ?? String(p))
-							const selfId = (this.components as any).libp2p.peerId
-							const isMember = cluster.some((p: any) => peersEqual(p, selfId))
-							// Use responsibilityK to determine if we're in the responsible set
-							const smallMesh = cluster.length < this.responsibilityK
-							if (!smallMesh && !isMember) {
-								const peers = cluster.filter((p: any) => !peersEqual(p, selfId))
-								debugLog('redirect op=get blockId=%s cluster=%d', operation.get.blockIds[0], cluster.length)
-								response = encodePeers(peers.map((pid: any) => ({ id: pid.toString(), addrs: [] })))
-							} else {
-								response = await this.repo.get(operation.get, { expiration: message.expiration, skipClusterFetch: true } as any)
-							}
-						} else {
-							response = await this.repo.get(operation.get, { expiration: message.expiration, skipClusterFetch: true } as any)
-						}
+					const blockKey = operation.get.blockIds[0]!
+					const redirect = await this.checkRedirect(blockKey, 'get', message)
+					if (redirect) {
+						response = redirect
+					} else {
+						response = await this.repo.get(operation.get, { expiration: message.expiration, skipClusterFetch: true } as any)
 					}
 				} else if ('pend' in operation) {
-					{
-						const id = Object.keys(operation.pend.transforms)[0]!
-						const mh = await sha256.digest(new TextEncoder().encode(id))
-						const key = mh.digest
-						const nm: any = (this.components as any).libp2p?.services?.networkManager
-						if (nm?.getCluster) {
-							const cluster: any[] = await nm.getCluster(key)
-								; (message as any).cluster = (cluster as any[]).map(p => p.toString?.() ?? String(p))
-							const selfId = (this.components as any).libp2p.peerId
-							const isMember = cluster.some((p: any) => peersEqual(p, selfId))
-							// Use responsibilityK to determine if we're in the responsible set
-							const smallMesh = cluster.length < this.responsibilityK
-							if (!smallMesh && !isMember) {
-								const peers = cluster.filter((p: any) => !peersEqual(p, selfId))
-								debugLog('redirect op=pend blockId=%s cluster=%d', id, cluster.length)
-								response = encodePeers(peers.map((pid: any) => ({ id: pid.toString(), addrs: [] })))
-							} else {
-								response = await this.repo.pend(operation.pend, { expiration: message.expiration })
-							}
-						} else {
-							response = await this.repo.pend(operation.pend, { expiration: message.expiration })
-						}
+					const blockKey = Object.keys(operation.pend.transforms)[0]!
+					const redirect = await this.checkRedirect(blockKey, 'pend', message)
+					if (redirect) {
+						response = redirect
+					} else {
+						response = await this.repo.pend(operation.pend, { expiration: message.expiration })
 					}
 				} else if ('cancel' in operation) {
-					response = await this.repo.cancel(operation.cancel.actionRef, {
-						expiration: message.expiration
-					})
-				} else if ('commit' in operation) {
-					{
-						const mh = await sha256.digest(new TextEncoder().encode(operation.commit.tailId))
-						const key = mh.digest
-						const nm: any = (this.components as any).libp2p?.services?.networkManager
-						if (nm?.getCluster) {
-							const cluster: any[] = await nm.getCluster(key)
-								; (message as any).cluster = (cluster as any[]).map(p => p.toString?.() ?? String(p))
-							const selfId = (this.components as any).libp2p.peerId
-							const isMember = cluster.some((p: any) => peersEqual(p, selfId))
-							// Use responsibilityK to determine if we're in the responsible set
-							const smallMesh = cluster.length < this.responsibilityK
-							if (!smallMesh && !isMember) {
-								const peers = cluster.filter((p: any) => !peersEqual(p, selfId))
-								debugLog('redirect op=commit tailId=%s cluster=%d', operation.commit.tailId, cluster.length)
-								response = encodePeers(peers.map((pid: any) => ({ id: pid.toString(), addrs: [] })))
-							} else {
-								response = await this.repo.commit(operation.commit, { expiration: message.expiration })
-							}
+					const blockKey = operation.cancel.actionRef.blockIds[0]
+					if (blockKey) {
+						const redirect = await this.checkRedirect(blockKey, 'cancel', message)
+						if (redirect) {
+							response = redirect
 						} else {
-							response = await this.repo.commit(operation.commit, { expiration: message.expiration })
+							response = await this.repo.cancel(operation.cancel.actionRef, { expiration: message.expiration })
 						}
+					} else {
+						response = await this.repo.cancel(operation.cancel.actionRef, { expiration: message.expiration })
+					}
+				} else if ('commit' in operation) {
+					const blockKey = operation.commit.tailId
+					const redirect = await this.checkRedirect(blockKey, 'commit', message)
+					if (redirect) {
+						response = redirect
+					} else {
+						response = await this.repo.commit(operation.commit, { expiration: message.expiration })
 					}
 				}
 
