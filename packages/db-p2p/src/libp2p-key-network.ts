@@ -6,6 +6,7 @@ import { multiaddr } from '@multiformats/multiaddr'
 import type { FretService, SerializedTable } from 'p2p-fret'
 import { hashKey } from 'p2p-fret'
 import { createLogger } from './logger.js'
+import type { IPeerReputation } from './reputation/types.js'
 
 interface WithFretService { services?: { fret?: FretService } }
 
@@ -58,7 +59,8 @@ export class Libp2pKeyPeerNetwork implements IKeyNetwork, IPeerNetwork {
 		private readonly clusterSize: number = 16,
 		selfCoordinationConfig?: SelfCoordinationConfig,
 		networkMode?: NetworkMode,
-		persistence?: NetworkStatePersistence
+		persistence?: NetworkStatePersistence,
+		private readonly reputation?: IPeerReputation
 	) {
 		this.selfCoordinationConfig = {
 			gracePeriodMs: selfCoordinationConfig?.gracePeriodMs ?? 30_000,
@@ -306,11 +308,15 @@ export class Libp2pKeyPeerNetwork implements IKeyNetwork, IPeerNetwork {
 				ids = await this.getNeighborIdsForKey(key, this.clusterSize)
 				this.log('findCoordinator:fret-neighbors key=%s candidates=%o', keyStr, ids.map(s => s.substring(0, 12)))
 
-				// Filter to only connected FRET neighbors
-				const connectedFretIds = ids.filter(id => connectedSet.has(id) || id === this.libp2p.peerId.toString())
+				// Filter to only connected FRET neighbors, excluding banned peers
+				const connectedFretIds = ids
+					.filter(id => (connectedSet.has(id) || id === this.libp2p.peerId.toString())
+						&& !excludedSet.has(id)
+						&& !(this.reputation?.isBanned(id)))
+					.sort((a, b) => (this.reputation?.getScore(a) ?? 0) - (this.reputation?.getScore(b) ?? 0))
 				this.log('findCoordinator:fret-connected key=%s count=%d peers=%o', keyStr, connectedFretIds.length, connectedFretIds.map(s => s.substring(0, 12)))
 
-				const pick = connectedFretIds.find(id => !excludedSet.has(id))
+				const pick = connectedFretIds[0]
 				if (pick) {
 					const pid = peerIdFromString(pick)
 					this.recordCoordinator(key, pid)
@@ -321,8 +327,11 @@ export class Libp2pKeyPeerNetwork implements IKeyNetwork, IPeerNetwork {
 				this.log('findCoordinator getNeighborIdsForKey failed - %o', err)
 			}
 
-			// fallback: prefer any existing connected peer that's not excluded
-			const connectedPick = connected.find(p => !excludedSet.has(p.toString()))
+			// fallback: prefer any existing connected peer that's not excluded or banned
+			const connectedPick = connected
+				.filter(p => !excludedSet.has(p.toString()) && !(this.reputation?.isBanned(p.toString())))
+				.sort((a, b) => (this.reputation?.getScore(a.toString()) ?? 0) - (this.reputation?.getScore(b.toString()) ?? 0))
+				[0]
 			if (connectedPick) {
 				this.recordCoordinator(key, connectedPick)
 				this.log('findCoordinator:connected-fallback key=%s coordinator=%s', keyStr, connectedPick.toString().substring(0, 12))

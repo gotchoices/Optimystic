@@ -32,6 +32,7 @@ import { ArachnodeFretAdapter } from './storage/arachnode-fret-adapter.js';
 import type { RestoreCallback } from './storage/struct.js';
 import type { FretService } from 'p2p-fret';
 import { PartitionDetector } from './cluster/partition-detector.js';
+import { PeerReputationService } from './reputation/peer-reputation.js';
 
 type Libp2pInit = NonNullable<Parameters<typeof createLibp2p>[0]>;
 export type Libp2pTransports = NonNullable<Libp2pInit['transports']>;
@@ -255,12 +256,18 @@ export async function createLibp2pNodeBase(
 
 	await node.start();
 
+	// Initialize peer reputation service
+	const reputation = new PeerReputationService();
+
 	// Initialize cluster coordination components
 	const networkMode: NetworkMode = (options.bootstrapNodes?.length ?? 0) > 0 ? 'joining' : 'forming';
-	const keyNetwork = new Libp2pKeyPeerNetwork(node, options.clusterSize, undefined, networkMode, options.persistence);
+	const keyNetwork = new Libp2pKeyPeerNetwork(node, options.clusterSize, undefined, networkMode, options.persistence, reputation);
 	await keyNetwork.initFromPersistedState();
 	const protocolPrefix = `/optimystic/${options.networkName}`;
 	const createClusterClient = (peerId: any) => ClusterClient.create(peerId, keyNetwork, protocolPrefix);
+
+	// Inject reputation into NetworkManagerService
+	try { ((node as any).services?.networkManager as any)?.setReputation?.(reputation); } catch { }
 
 	// Create partition detector and get FRET service
 	const partitionDetector = new PartitionDetector();
@@ -274,7 +281,8 @@ export async function createLibp2pNodeBase(
 		protocolPrefix,
 		partitionDetector,
 		fretService: fretSvc,
-		validator: options.validator
+		validator: options.validator,
+		reputation
 	});
 
 	const coordinatorRepoFactory = coordinatorRepo(
@@ -289,7 +297,8 @@ export async function createLibp2pNodeBase(
 			clusterSizeTolerance: options.clusterPolicy?.sizeTolerance ?? 0.5,
 			partitionDetectionWindow: 60000
 		},
-		fretSvc
+		fretSvc,
+		reputation
 	);
 
 	// Create callback for querying cluster peers for their latest block revision
@@ -388,6 +397,7 @@ export async function createLibp2pNodeBase(
 	(node as any).coordinatedRepo = coordinatedRepo;
 	(node as any).storageRepo = storageRepo;
 	(node as any).keyNetwork = keyNetwork;
+	(node as any).reputation = reputation;
 
 	return node;
 }

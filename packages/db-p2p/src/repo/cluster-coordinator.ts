@@ -8,6 +8,8 @@ import type { PeerId } from "@libp2p/interface";
 import { createLogger } from '../logger.js'
 import type { ClusterLogPeerOutcome } from './types.js'
 import type { FretService } from "p2p-fret";
+import type { IPeerReputation } from "../reputation/types.js";
+import { PenaltyReason } from "../reputation/types.js";
 
 const log = createLogger('cluster')
 
@@ -49,7 +51,8 @@ export class ClusterCoordinator {
 			peerId: PeerId;
 			wasTransactionExecuted?: (messageHash: string) => boolean;
 		},
-		private readonly fretService?: FretService
+		private readonly fretService?: FretService,
+		private readonly reputation?: IPeerReputation
 	) { }
 
 	/**
@@ -327,6 +330,7 @@ export class ClusterCoordinator {
 			const peerIdStr = peerIds[idx]!;
 			log('cluster-tx:promise-response', { messageHash: record.messageHash, peerId: peerIdStr, success: false, error: err });
 			summary.push({ peerId: peerIdStr, success: false, error: err instanceof Error ? err.message : String(err) });
+			this.reputation?.reportPeer(peerIdStr, PenaltyReason.ConsensusTimeout, `promise:${record.messageHash}`);
 			return null;
 		})));
 		const successes = summary.filter(entry => entry.success).map(entry => entry.peerId);
@@ -414,6 +418,7 @@ export class ClusterCoordinator {
 			const peerIdStr = peerIds[idx]!;
 			log('cluster-tx:commit-response', { messageHash: record.messageHash, peerId: peerIdStr, success: false, error: err });
 			summary.push({ peerId: peerIdStr, success: false, error: err instanceof Error ? err.message : String(err) });
+			this.reputation?.reportPeer(peerIdStr, PenaltyReason.ConsensusTimeout, `commit:${record.messageHash}`);
 			return null;
 		})));
 		const commitSuccesses = summary.filter(entry => entry.success).map(entry => entry.peerId);

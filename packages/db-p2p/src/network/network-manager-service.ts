@@ -3,6 +3,8 @@ import { peerIdFromString } from '@libp2p/peer-id'
 import type { FretService } from 'p2p-fret'
 import { hashKey } from 'p2p-fret'
 import { toString as u8ToString } from 'uint8arrays/to-string'
+import type { IPeerReputation } from '../reputation/types.js'
+import { PenaltyReason } from '../reputation/types.js'
 
 export type NetworkManagerServiceInit = {
 	clusterSize?: number
@@ -33,8 +35,7 @@ export class NetworkManagerService implements Startable {
 	private readonly coordinatorCache = new Map<string, { id: PeerId, expires: number }>()
 	private readonly clusterCache = new Map<string, { ids: PeerId[], expires: number }>()
 	private lastEstimate: { estimate: number, samples: number, updated: number } | null = null
-	// lightweight blacklist (local reputation)
-	private readonly blacklist = new Map<string, { score: number, expires: number }>()
+	private reputation?: IPeerReputation
 	private libp2pRef: Libp2p | undefined
 
 	constructor(private readonly components: Components, init: NetworkManagerServiceInit = {}) {
@@ -53,6 +54,10 @@ export class NetworkManagerService implements Startable {
 
 	setLibp2p(libp2p: Libp2p): void {
 		this.libp2pRef = libp2p;
+	}
+
+	setReputation(reputation: IPeerReputation): void {
+		this.reputation = reputation;
 	}
 
 	private getLibp2p(): Libp2p | undefined {
@@ -162,23 +167,14 @@ export class NetworkManagerService implements Startable {
 	}
 
 	/**
-	 * Record a misbehaving peer. Higher score means worse reputation.
-	 * Entries expire to allow eventual forgiveness.
+	 * Record a misbehaving peer. Delegates to IPeerReputation if available.
 	 */
-	reportBadPeer(peerId: PeerId, penalty: number = 1, ttlMs: number = 10 * 60_000): void {
-		const id = peerId.toString()
-		const prev = this.blacklist.get(id)
-		const score = (prev?.score ?? 0) + Math.max(1, penalty)
-		this.blacklist.set(id, { score, expires: Date.now() + ttlMs })
+	reportBadPeer(peerId: PeerId, reason: PenaltyReason = PenaltyReason.ConnectionFailure): void {
+		this.reputation?.reportPeer(peerId.toString(), reason)
 	}
 
 	private isBlacklisted(peerId: PeerId): boolean {
-		const id = peerId.toString()
-		const rec = this.blacklist.get(id)
-		if (!rec) return false
-		if (rec.expires <= Date.now()) { this.blacklist.delete(id); return false }
-		// simple threshold; can be tuned or exposed later
-		return rec.score >= 3
+		return this.reputation?.isBanned(peerId.toString()) ?? false
 	}
 
 	recordCoordinator(key: Uint8Array, peerId: PeerId): void {
@@ -298,7 +294,11 @@ export class NetworkManagerService implements Startable {
 		if (!libp2p) {
 			throw new Error('Libp2p not initialized');
 		}
-		const candidate = cluster.find(p => !this.isBlacklisted(p)) ?? libp2p.peerId;
+		// Prefer non-banned, non-deprioritized peers; fall back to deprioritized before self
+		const candidate = cluster
+			.filter(p => !this.isBlacklisted(p))
+			.sort((a, b) => (this.reputation?.getScore(a.toString()) ?? 0) - (this.reputation?.getScore(b.toString()) ?? 0))
+			[0] ?? libp2p.peerId;
 		this.recordCoordinator(key, candidate);
 		return candidate;
 	}

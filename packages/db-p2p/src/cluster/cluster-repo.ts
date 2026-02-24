@@ -12,6 +12,8 @@ import { toString as uint8ArrayToString, fromString as uint8ArrayFromString } fr
 import { createLogger } from '../logger.js'
 import type { PartitionDetector } from "./partition-detector.js";
 import type { FretService } from "p2p-fret";
+import type { IPeerReputation } from "../reputation/types.js";
+import { PenaltyReason } from "../reputation/types.js";
 
 const log = createLogger('cluster-member')
 
@@ -41,6 +43,7 @@ interface ClusterMemberComponents {
 	partitionDetector?: PartitionDetector;
 	fretService?: FretService;
 	validator?: ITransactionValidator;
+	reputation?: IPeerReputation;
 }
 
 export function clusterMember(components: ClusterMemberComponents): ClusterMember {
@@ -52,7 +55,8 @@ export function clusterMember(components: ClusterMemberComponents): ClusterMembe
 		components.protocolPrefix,
 		components.partitionDetector,
 		components.fretService,
-		components.validator
+		components.validator,
+		components.reputation
 	);
 }
 
@@ -83,12 +87,13 @@ export class ClusterMember implements ICluster {
 		private readonly protocolPrefix?: string,
 		private readonly partitionDetector?: PartitionDetector,
 		private readonly fretService?: FretService,
-		private readonly validator?: ITransactionValidator
+		private readonly validator?: ITransactionValidator,
+		private readonly reputation?: IPeerReputation
 	) {
-		// Periodically clean up expired transactions
-		setInterval(() => this.queueExpiredTransactions(), 60000);
+		// Periodically clean up expired transactions (.unref() so tests/short-lived processes can exit)
+		setInterval(() => this.queueExpiredTransactions(), 60000).unref();
 		// Process cleanup queue
-		setInterval(() => this.processCleanupQueue(), 1000);
+		setInterval(() => this.processCleanupQueue(), 1000).unref();
 	}
 
 	/**
@@ -124,7 +129,7 @@ export class ClusterMember implements ICluster {
 			// Remove from pending updates after a short delay to allow concurrent calls to see it
 			setTimeout(() => {
 				this.pendingUpdates.delete(record.messageHash);
-			}, 100);
+			}, 100).unref();
 		}
 	}
 
@@ -356,6 +361,7 @@ export class ClusterMember implements ICluster {
 			const promiseHash = await this.computePromiseHash(record);
 			for (const [peerId, signature] of Object.entries(record.promises)) {
 				if (!await this.verifySignature(peerId, promiseHash, signature)) {
+					this.reputation?.reportPeer(peerId, PenaltyReason.InvalidSignature, `promise:${record.messageHash}`);
 					throw new Error(`Invalid promise signature from ${peerId}`);
 				}
 			}
@@ -364,6 +370,7 @@ export class ClusterMember implements ICluster {
 			const commitHash = await this.computeCommitHash(record);
 			for (const [peerId, signature] of Object.entries(record.commits)) {
 				if (!await this.verifySignature(peerId, commitHash, signature)) {
+					this.reputation?.reportPeer(peerId, PenaltyReason.InvalidSignature, `commit:${record.messageHash}`);
 					throw new Error(`Invalid commit signature from ${peerId}`);
 				}
 			}
@@ -619,11 +626,11 @@ export class ClusterMember implements ICluster {
 			promiseTimeout: setTimeout(
 				() => this.handleExpiration(record.messageHash),
 				record.message.expiration - Date.now()
-			),
+			).unref(),
 			resolutionTimeout: setTimeout(
 				() => this.resolveWithPeers(record.messageHash),
 				record.message.expiration + 5000 - Date.now()
-			)
+			).unref()
 		};
 	}
 

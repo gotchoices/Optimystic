@@ -5,6 +5,7 @@ import type { PeerId } from "@libp2p/interface";
 import { peerIdFromString } from "@libp2p/peer-id";
 import type { FretService } from "p2p-fret";
 import { createLogger } from '../logger.js';
+import type { IPeerReputation } from "../reputation/types.js";
 
 const log = createLogger('coordinator-repo');
 
@@ -37,7 +38,8 @@ export function coordinatorRepo(
 	keyNetwork: IKeyNetwork,
 	createClusterClient: (peerId: PeerId) => ClusterClient,
 	cfg?: Partial<ClusterConsensusConfig> & { clusterSize?: number },
-	fretService?: FretService
+	fretService?: FretService,
+	reputation?: IPeerReputation
 ): (components: CoordinatorRepoComponents) => CoordinatorRepo {
 	return (components: CoordinatorRepoComponents) => new CoordinatorRepo(
 		keyNetwork,
@@ -47,7 +49,8 @@ export function coordinatorRepo(
 		components.localCluster,
 		components.localPeerId,
 		fretService,
-		components.clusterLatestCallback
+		components.clusterLatestCallback,
+		reputation
 	);
 }
 
@@ -64,7 +67,8 @@ export class CoordinatorRepo implements IRepo {
 		localCluster?: LocalClusterWithExecutionTracking,
 		localPeerId?: PeerId,
 		fretService?: FretService,
-		private readonly clusterLatestCallback?: ClusterLatestCallback
+		private readonly clusterLatestCallback?: ClusterLatestCallback,
+		reputation?: IPeerReputation
 	) {
 		const policy: ClusterConsensusConfig & { clusterSize: number } = {
 			clusterSize: cfg?.clusterSize ?? 10,
@@ -80,7 +84,7 @@ export class CoordinatorRepo implements IRepo {
 			peerId: localPeerId,
 			wasTransactionExecuted: localCluster.wasTransactionExecuted?.bind(localCluster)
 		} : undefined;
-		this.coordinator = new ClusterCoordinator(keyNetwork, createClusterClient, policy, localClusterRef, fretService);
+		this.coordinator = new ClusterCoordinator(keyNetwork, createClusterClient, policy, localClusterRef, fretService, reputation);
 	}
 
 	async get(blockGets: BlockGets, options?: MessageOptions): Promise<GetBlockResults> {
