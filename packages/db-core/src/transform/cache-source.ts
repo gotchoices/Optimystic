@@ -1,15 +1,21 @@
 import type { IBlock, BlockHeader, BlockId, BlockSource, BlockType, Transforms } from "../index.js";
 import { applyOperation } from "../index.js";
+import { LruMap } from "../utility/lru-map.js";
 import { createLogger } from "../logger.js";
 
 const log = createLogger('cache');
 
+const DefaultMaxSize = 128;
+
 export class CacheSource<T extends IBlock> implements BlockSource<T> {
-	protected cache = new Map<BlockId, T>();
+	protected cache: LruMap<BlockId, T>;
 
 	constructor(
-		protected readonly source: BlockSource<T>
-	) { }
+		protected readonly source: BlockSource<T>,
+		maxSize = DefaultMaxSize
+	) {
+		this.cache = new LruMap(maxSize);
+	}
 
 	async tryGet(id: BlockId): Promise<T | undefined> {
 		let block = this.cache.get(id);
