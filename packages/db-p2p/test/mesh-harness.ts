@@ -162,8 +162,23 @@ export async function createMesh(nodeCount: number, options: MeshOptions): Promi
 	};
 
 	for (const node of nodes) {
+		// Wrap key network to include self in findCluster (matches real Libp2pKeyPeerNetwork behavior)
+		const nodeKeyNetwork: IKeyNetwork = {
+			findCoordinator: (key, opts) => keyNetwork.findCoordinator(key, opts),
+			async findCluster(key) {
+				const peers = await keyNetwork.findCluster(key);
+				const selfStr = node.peerId.toString();
+				if (!(selfStr in peers)) {
+					peers[selfStr] = {
+						multiaddrs: ['/ip4/127.0.0.1/tcp/8000'],
+						publicKey: node.peerId.publicKey!.raw
+					};
+				}
+				return peers;
+			}
+		};
 		const factory = coordinatorRepo(
-			keyNetwork,
+			nodeKeyNetwork,
 			(peerId: PeerId) => createClusterClient(peerId) as any,
 			{
 				clusterSize: options.clusterSize ?? nodeCount,

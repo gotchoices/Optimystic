@@ -1,4 +1,5 @@
 import type { PendRequest, ActionBlocks, IRepo, MessageOptions, CommitResult, GetBlockResults, PendResult, BlockGets, CommitRequest, RepoMessage, IKeyNetwork, ICluster, ClusterConsensusConfig, BlockId, ActionRev } from "@optimystic/db-core";
+import { LruMap } from "@optimystic/db-core";
 import { ClusterCoordinator } from "./cluster-coordinator.js";
 import type { ClusterClient } from "../cluster/client.js";
 import type { PeerId } from "@libp2p/interface";
@@ -58,6 +59,9 @@ export function coordinatorRepo(
 export class CoordinatorRepo implements IRepo {
 	private coordinator: ClusterCoordinator;
 	private readonly DEFAULT_TIMEOUT = 30000; // 30 seconds default timeout
+	private readonly localPeerId?: PeerId;
+	private readonly responsibilityCache = new LruMap<string, { inCluster: boolean, expires: number }>(1000);
+	private static readonly RESPONSIBILITY_TTL_MS = 60_000;
 
 	constructor(
 		readonly keyNetwork: IKeyNetwork,
@@ -70,6 +74,7 @@ export class CoordinatorRepo implements IRepo {
 		private readonly clusterLatestCallback?: ClusterLatestCallback,
 		reputation?: IPeerReputation
 	) {
+		this.localPeerId = localPeerId;
 		const policy: ClusterConsensusConfig & { clusterSize: number } = {
 			clusterSize: cfg?.clusterSize ?? 10,
 			superMajorityThreshold: cfg?.superMajorityThreshold ?? 0.75,
@@ -87,7 +92,61 @@ export class CoordinatorRepo implements IRepo {
 		this.coordinator = new ClusterCoordinator(keyNetwork, createClusterClient, policy, localClusterRef, fretService, reputation);
 	}
 
+	/**
+	 * Check if this node is in the cluster for a given block.
+	 * Uses findCluster membership — in the real network layer, self is always
+	 * included in the cohort when this node is responsible. This serves as a
+	 * defense-in-depth guard for requests that arrive at the wrong node.
+	 * Returns true if localPeerId is not set (backward compat for single-node/test setups).
+	 */
+	private async isResponsibleForBlock(blockId: BlockId): Promise<boolean> {
+		if (!this.localPeerId) return true;
+
+		const cached = this.responsibilityCache.get(blockId);
+		if (cached && cached.expires > Date.now()) {
+			return cached.inCluster;
+		}
+
+		const blockIdBytes = new TextEncoder().encode(blockId);
+		let inCluster: boolean;
+		try {
+			const peers = await this.keyNetwork.findCluster(blockIdBytes);
+			inCluster = this.localPeerId.toString() in peers;
+		} catch (err) {
+			log('proximity:check-error', { blockId, error: (err as Error).message });
+			// On failure, assume responsible to avoid false rejections
+			return true;
+		}
+
+		this.responsibilityCache.set(blockId, { inCluster, expires: Date.now() + CoordinatorRepo.RESPONSIBILITY_TTL_MS });
+		log('proximity:checked', { blockId, inCluster });
+		return inCluster;
+	}
+
+	/**
+	 * Verify this node is responsible for all given block IDs. Throws if not.
+	 */
+	private async verifyResponsibility(blockIds: BlockId[]): Promise<void> {
+		const notResponsible: BlockId[] = [];
+		for (const blockId of blockIds) {
+			if (!await this.isResponsibleForBlock(blockId)) {
+				notResponsible.push(blockId);
+			}
+		}
+		if (notResponsible.length > 0) {
+			log('proximity:rejected', { blockIds: notResponsible });
+			throw new Error(`Not responsible for block(s): ${notResponsible.join(', ')}`);
+		}
+	}
+
 	async get(blockGets: BlockGets, options?: MessageOptions): Promise<GetBlockResults> {
+		// Soft proximity check — warn but still serve reads for graceful degradation
+		for (const blockId of blockGets.blockIds) {
+			if (!await this.isResponsibleForBlock(blockId)) {
+				log('proximity:get-warning', { blockId, msg: 'serving read for non-responsible block' });
+			}
+		}
+
 		// First try local storage
 		const localResult = await this.storageRepo.get(blockGets, options);
 
@@ -170,6 +229,7 @@ export class CoordinatorRepo implements IRepo {
 
 	async pend(request: PendRequest, options?: MessageOptions): Promise<PendResult> {
 		const allBlockIds = Object.keys(request.transforms);
+		await this.verifyResponsibility(allBlockIds);
 		const coordinatingBlockIds = (options as any)?.coordinatingBlockIds ?? allBlockIds;
 
 		const peerCount = await this.coordinator.getClusterSize(coordinatingBlockIds[0]!);
@@ -213,10 +273,8 @@ export class CoordinatorRepo implements IRepo {
 	}
 
 	async cancel(actionRef: ActionBlocks, options?: MessageOptions): Promise<void> {
-		// TODO: Verify that we are a proximate node for all block IDs in the request
-
-		// Extract all block IDs affected by this cancel operation
 		const blockIds = actionRef.blockIds;
+		await this.verifyResponsibility(blockIds);
 
 		// Create a message for this cancel operation with timeout
 		const message: RepoMessage = {
@@ -246,6 +304,7 @@ export class CoordinatorRepo implements IRepo {
 
 	async commit(request: CommitRequest, options?: MessageOptions): Promise<CommitResult> {
 		const blockIds = request.blockIds;
+		await this.verifyResponsibility(blockIds);
 
 		const peerCount = await this.coordinator.getClusterSize(blockIds[0]!);
 		if (peerCount <= 1) {
