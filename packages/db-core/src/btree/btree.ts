@@ -4,6 +4,7 @@ import { apply, get } from "../blocks/index.js";
 import { TreeLeafBlockType, TreeBranchBlockType, entries$, nodes$, partitions$ } from "./nodes.js";
 import type { BranchNode, ITreeNode, LeafNode } from "./nodes.js";
 import type { TreeBlock } from "./tree-block.js";
+import { AtomicProxy } from "../transform/atomic-proxy.js";
 
 export const NodeCapacity = 64;
 
@@ -15,6 +16,7 @@ export const NodeCapacity = 64;
  */
 export class BTree<TKey, TEntry> {
 	protected _version = 0;	// only for path invalidation
+	private _proxy?: AtomicProxy<ITreeNode>;
 
 	/**
 	 * @param [compare=(a: TKey, b: TKey) => a < b ? -1 : a > b ? 1 : 0] a comparison function for keys.  The default uses < and > operators.
@@ -26,6 +28,10 @@ export class BTree<TKey, TEntry> {
 		public readonly keyFromEntry = (entry: TEntry) => entry as unknown as TKey,
 		public readonly compare = (a: TKey, b: TKey) => a < b ? -1 : a > b ? 1 : 0 as number,
 	) {
+	}
+
+	private atomic<T>(fn: () => Promise<T>): Promise<T> {
+		return this._proxy ? this._proxy.atomic(fn) : fn();
 	}
 
 	static createRoot(
@@ -41,10 +47,13 @@ export class BTree<TKey, TEntry> {
 		compare = (a: TKey, b: TKey) => a < b ? -1 : a > b ? 1 : 0,
 		newId?: BlockId,
 	) {
-		const root = BTree.createRoot(store as BlockStore<TreeBlock>);
-		store.insert(root);
-		const trunk = createTrunk(store as BlockStore<TreeBlock>, root.header.id, newId);
-		return new BTree(store, trunk, keyFromEntry, compare);
+		const proxy = new AtomicProxy(store);
+		const root = BTree.createRoot(proxy as BlockStore<TreeBlock>);
+		proxy.insert(root);
+		const trunk = createTrunk(proxy as BlockStore<TreeBlock>, root.header.id, newId);
+		const tree = new BTree(proxy, trunk, keyFromEntry, compare);
+		tree._proxy = proxy;
+		return tree;
 	}
 
 	/** @returns a path to the first entry (on = false if no entries) */
@@ -118,12 +127,14 @@ export class BTree<TKey, TEntry> {
 	 * Added entries are frozen to ensure immutability
 	 * @returns path to the new (on = true) or conflicting (on = false) row. */
 	async insert(entry: TEntry): Promise<Path<TKey, TEntry>> {
-		Object.freeze(entry);	// Ensure immutability
-		const path = await this.internalInsert(entry);
-		if (path.on) {
-			path.version = ++this._version;
-		}
-		return path;
+		return this.atomic(async () => {
+			Object.freeze(entry);	// Ensure immutability
+			const path = await this.internalInsert(entry);
+			if (path.on) {
+				path.version = ++this._version;
+			}
+			return path;
+		});
 	}
 
 	/** Updates the entry at the given path to the given value.  Deletes and inserts if the key changes.
@@ -135,30 +146,34 @@ export class BTree<TKey, TEntry> {
 	 * 		* wasUpdate = true, given path is not on an entry
 	 * 		* else newEntry's new key already present; returned path is "near" existing entry */
 	async updateAt(path: Path<TKey, TEntry>, newEntry: TEntry): Promise<[path: Path<TKey, TEntry>, wasUpdate: boolean]> {
-		this.validatePath(path);
-		if (path.on) {
-			Object.freeze(newEntry);
-		}
-		const result = await this.internalUpdate(path, newEntry);
-		if (result[0].on) {
-			result[0].version = ++this._version;
-		}
-		return result;
+		return this.atomic(async () => {
+			this.validatePath(path);
+			if (path.on) {
+				Object.freeze(newEntry);
+			}
+			const result = await this.internalUpdate(path, newEntry);
+			if (result[0].on) {
+				result[0].version = ++this._version;
+			}
+			return result;
+		});
 	}
 
 	/** Inserts the entry if it doesn't exist, or updates it if it does.
 	 * The entry is frozen to ensure immutability.
 	 * @returns path to the new entry.  on = true if existing; on = false if new. */
 	async upsert(entry: TEntry): Promise<Path<TKey, TEntry>> {
-		const path = await this.find(this.keyFromEntry(entry));
-		Object.freeze(entry);
-		if (path.on) {
-			this.updateEntry(path, entry);
-		} else {
-			await this.internalInsertAt(path, entry);
-		}
-		path.version = ++this._version;
-		return path;
+		return this.atomic(async () => {
+			const path = await this.find(this.keyFromEntry(entry));
+			Object.freeze(entry);
+			if (path.on) {
+				this.updateEntry(path, entry);
+			} else {
+				await this.internalInsertAt(path, entry);
+			}
+			path.version = ++this._version;
+			return path;
+		});
 	}
 
 	/** Inserts or updates depending on the existence of the given key, using callbacks to generate the new value.
@@ -167,18 +182,20 @@ export class BTree<TKey, TEntry> {
 	 * @returns path to new entry and whether an update or insert attempted.
 	 * If getUpdated callback returns a row that is already present, the resulting path will not be on. */
 	async merge(newEntry: TEntry, getUpdated: (existing: TEntry) => TEntry): Promise<[path: Path<TKey, TEntry>, wasUpdate: boolean]> {
-		const newKey = await this.keyFromEntry(newEntry);
-		const path = await this.find(newKey);
-		if (path.on) {
-			const result = await this.updateAt(path, getUpdated(this.getEntry(path)));	// Don't use internalUpdate - need to freeze and check for mutation
-			// Note: updateAt already increments version, so don't double-increment here
-			return result;
-		} else {
-			await this.internalInsertAt(path, Object.freeze(newEntry));
-			path.on = true;
-			path.version = ++this._version;
-			return [path, false];
-		}
+		return this.atomic(async () => {
+			const newKey = await this.keyFromEntry(newEntry);
+			const path = await this.find(newKey);
+			if (path.on) {
+				const result = await this.updateAt(path, getUpdated(this.getEntry(path)));	// Don't use internalUpdate - need to freeze and check for mutation
+				// Note: updateAt already increments version, so don't double-increment here
+				return result;
+			} else {
+				await this.internalInsertAt(path, Object.freeze(newEntry));
+				path.on = true;
+				path.version = ++this._version;
+				return [path, false];
+			}
+		});
 	}
 
 	/** Deletes the entry at the given path.
@@ -186,19 +203,23 @@ export class BTree<TKey, TEntry> {
 	 * @returns true if the delete succeeded (the key was found); false otherwise.
 	*/
 	async deleteAt(path: Path<TKey, TEntry>): Promise<boolean> {
-		this.validatePath(path);
-		const result = await this.internalDelete(path);
-		if (result) {
-			++this._version;
-		}
-		return result;
+		return this.atomic(async () => {
+			this.validatePath(path);
+			const result = await this.internalDelete(path);
+			if (result) {
+				++this._version;
+			}
+			return result;
+		});
 	}
 
 	async drop() {	// Node: only when a root treeBlock
-		const root = await this.trunk.get();
-		for await (const id of this.nodeIds(root)) {
-			this.store.delete(id);
-		}
+		return this.atomic(async () => {
+			const root = await this.trunk.get();
+			for await (const id of this.nodeIds(root)) {
+				this.store.delete(id);
+			}
+		});
 	}
 
 	/** Iterates forward starting from the path location (inclusive) to the end.

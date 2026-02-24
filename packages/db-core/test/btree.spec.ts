@@ -402,4 +402,132 @@ describe('BTree', () => {
       expect(btree.isValid(upsertPath)).to.be.true
     })
   })
+
+  describe('atomic rollback', () => {
+    async function collectAll(): Promise<number[]> {
+      const values: number[] = [];
+      const path = await btree.first();
+      while (path.on) {
+        values.push(btree.at(path)!);
+        await btree.moveNext(path);
+      }
+      return values;
+    }
+
+    it('should preserve tree after failed insert', async () => {
+      for (let i = 0; i < 100; i++) {
+        await btree.insert(i);
+      }
+      const before = await collectAll();
+      expect(before).to.have.length(100);
+
+      // Sabotage reads - insert's find() will fail inside the atomic
+      const realTryGet = store.tryGet.bind(store);
+      store.tryGet = async () => { throw new Error('Store failure'); };
+
+      await expect(btree.insert(100)).to.be.rejectedWith('Store failure');
+
+      store.tryGet = realTryGet;
+
+      // Tree should be unchanged and fully functional
+      const after = await collectAll();
+      expect(after).to.deep.equal(before);
+
+      // Should still accept new inserts
+      await btree.insert(100);
+      expect(await btree.get(100)).to.equal(100);
+    })
+
+    it('should preserve tree after failed delete', async () => {
+      for (let i = 0; i < 100; i++) {
+        await btree.insert(i);
+      }
+      const before = await collectAll();
+
+      // Get a valid path, then sabotage reads before deleteAt
+      const path = await btree.find(50);
+      expect(path.on).to.be.true;
+
+      const realTryGet = store.tryGet.bind(store);
+      store.tryGet = async () => { throw new Error('Store failure'); };
+
+      // deleteAt applies the entry deletion to the Atomic, then tries to
+      // rebalance (which reads siblings via tryGet) - may fail there.
+      // If rebalance isn't needed, the delete succeeds through the Atomic.
+      let failed = false;
+      try {
+        await btree.deleteAt(path);
+      } catch {
+        failed = true;
+      }
+
+      store.tryGet = realTryGet;
+
+      if (failed) {
+        // Atomic rolled back - all values preserved
+        const after = await collectAll();
+        expect(after).to.deep.equal(before);
+      } else {
+        // Delete committed - one fewer value
+        expect(await btree.get(50)).to.be.undefined;
+        expect(await btree.getCount()).to.equal(99);
+      }
+
+      // Tree is functional either way
+      await btree.insert(200);
+      expect(await btree.get(200)).to.equal(200);
+    })
+
+    it('should preserve tree after failed upsert', async () => {
+      for (let i = 0; i < 50; i++) {
+        await btree.insert(i);
+      }
+      const before = await collectAll();
+
+      const realTryGet = store.tryGet.bind(store);
+      store.tryGet = async () => { throw new Error('Store failure'); };
+
+      await expect(btree.upsert(999)).to.be.rejectedWith('Store failure');
+
+      store.tryGet = realTryGet;
+
+      const after = await collectAll();
+      expect(after).to.deep.equal(before);
+    })
+
+    it('should roll back partial delete when rebalance read fails', async () => {
+      // Insert 65 values to force one split:
+      //   leaf1: [0..31], leaf2: [32..64], root branch
+      for (let i = 0; i < 65; i++) {
+        await btree.insert(i);
+      }
+
+      // Delete 32 to bring leaf2 to exactly 32 entries [33..64]
+      const path32 = await btree.find(32);
+      await btree.deleteAt(path32);
+      expect(await btree.getCount()).to.equal(64);
+
+      // Now deleting 33 triggers rebalance (leaf2 drops to 31 < 32).
+      // Rebalance tries to read sibling via tryGet, which we sabotage.
+      const path33 = await btree.find(33);
+      expect(path33.on).to.be.true;
+
+      const realTryGet = store.tryGet.bind(store);
+      store.tryGet = async () => { throw new Error('Rebalance failure'); };
+
+      // The atomic wrapper: apply() deletes entry 33 (recorded in Atomic),
+      // then rebalance reads sibling → tryGet fails → Atomic rolls back.
+      await expect(btree.deleteAt(path33)).to.be.rejectedWith('Rebalance failure');
+
+      store.tryGet = realTryGet;
+
+      // Entry 33 should still exist (deletion was rolled back)
+      expect(await btree.get(33)).to.equal(33);
+      expect(await btree.getCount()).to.equal(64);
+
+      // Tree should still be fully functional
+      await btree.insert(100);
+      expect(await btree.get(100)).to.equal(100);
+    })
+  })
 })
