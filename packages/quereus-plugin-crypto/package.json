@@ -29,7 +29,7 @@
 		"test": "node --import ./register.mjs node_modules/mocha/bin/mocha.js \"test/**/*.spec.ts\" --colors --reporter min"
 	},
 	"devDependencies": {
-		"@quereus/quereus": "^0.16.2",
+		"@quereus/quereus": "^0.18.0",
 		"@types/chai": "^5.2.3",
 		"@types/mocha": "^10.0.10",
 		"@types/node": "^25.2.0",

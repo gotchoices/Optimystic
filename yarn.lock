@@ -1180,7 +1180,7 @@ __metadata:
   dependencies:
     "@noble/curves": "npm:^2.0.1"
     "@noble/hashes": "npm:^2.0.1"
-    "@quereus/quereus": "npm:^0.16.2"
+    "@quereus/quereus": "npm:^0.18.0"
     "@types/chai": "npm:^5.2.3"
     "@types/mocha": "npm:^10.0.10"
     "@types/node": "npm:^25.2.0"
@@ -1212,7 +1212,7 @@ __metadata:
     "@noble/hashes": "npm:^2.0.1"
     "@optimystic/db-core": "workspace:^"
     "@optimystic/db-p2p": "workspace:^"
-    "@quereus/quereus": "npm:^0.16.2"
+    "@quereus/quereus": "npm:^0.18.0"
     "@types/chai": "npm:^5.2.3"
     "@types/mocha": "npm:^10.0.10"
     "@types/node": "npm:^25.2.0"
