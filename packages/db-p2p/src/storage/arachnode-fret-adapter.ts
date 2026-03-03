@@ -119,6 +119,17 @@ export class ArachnodeFretAdapter {
 	}
 
 	/**
+	 * Update the status field of this node's ArachnodeInfo.
+	 * No-op if no ArachnodeInfo has been set yet.
+	 */
+	setStatus(status: ArachnodeInfo['status']): void {
+		const current = this.getMyArachnodeInfo();
+		if (current) {
+			this.setArachnodeInfo({ ...current, status });
+		}
+	}
+
+	/**
 	 * Access the underlying FRET service.
 	 */
 	getFret(): FretService {

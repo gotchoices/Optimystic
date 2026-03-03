@@ -5,6 +5,9 @@ import { hashKey } from 'p2p-fret'
 import { toString as u8ToString } from 'uint8arrays/to-string'
 import type { IPeerReputation } from '../reputation/types.js'
 import { PenaltyReason } from '../reputation/types.js'
+import { RebalanceMonitor, type RebalanceMonitorConfig } from '../cluster/rebalance-monitor.js'
+import type { PartitionDetector } from '../cluster/partition-detector.js'
+import type { ArachnodeFretAdapter } from '../storage/arachnode-fret-adapter.js'
 
 export type NetworkManagerServiceInit = {
 	clusterSize?: number
@@ -37,6 +40,7 @@ export class NetworkManagerService implements Startable {
 	private lastEstimate: { estimate: number, samples: number, updated: number } | null = null
 	private reputation?: IPeerReputation
 	private libp2pRef: Libp2p | undefined
+	private rebalanceMonitor?: RebalanceMonitor
 
 	constructor(private readonly components: Components, init: NetworkManagerServiceInit = {}) {
 		this.log = components.logger.forComponent('db-p2p:network-manager')
@@ -58,6 +62,30 @@ export class NetworkManagerService implements Startable {
 
 	setReputation(reputation: IPeerReputation): void {
 		this.reputation = reputation;
+	}
+
+	/**
+	 * Initialize the rebalance monitor. Call after libp2p, FRET, and adapter are available.
+	 */
+	initRebalanceMonitor(
+		partitionDetector: PartitionDetector,
+		fretAdapter: ArachnodeFretAdapter,
+		config?: RebalanceMonitorConfig
+	): RebalanceMonitor {
+		const libp2p = this.getLibp2p()
+		const fret = this.getFret()
+		if (!libp2p || !fret) {
+			throw new Error('Cannot init RebalanceMonitor: libp2p or FRET not available')
+		}
+		this.rebalanceMonitor = new RebalanceMonitor(
+			{ libp2p, fret, partitionDetector, fretAdapter },
+			config
+		)
+		return this.rebalanceMonitor
+	}
+
+	getRebalanceMonitor(): RebalanceMonitor | undefined {
+		return this.rebalanceMonitor
 	}
 
 	private getLibp2p(): Libp2p | undefined {
@@ -82,6 +110,9 @@ export class NetworkManagerService implements Startable {
 	}
 
 	async stop(): Promise<void> {
+		if (this.rebalanceMonitor) {
+			await this.rebalanceMonitor.stop()
+		}
 		this.running = false
 	}
 
