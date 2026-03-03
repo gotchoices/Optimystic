@@ -1,0 +1,43 @@
+description: Atomic wrappers for BTree mutation methods to prevent store corruption on errors
+dependencies: btree, transform/atomic, transform/tracker
+files:
+  - packages/db-core/src/transform/atomic-proxy.ts
+  - packages/db-core/src/transform/index.ts
+  - packages/db-core/src/btree/btree.ts
+  - packages/db-core/test/btree.spec.ts
+  - packages/db-core/docs/btree.md
+----
+
+## What Was Built
+
+`AtomicProxy<T>` — a `BlockStore` wrapper that collects all store operations during a scoped mutation into an `Atomic` tracker, committing as a batch on success or discarding on error.
+
+Each BTree public mutation method (`insert`, `upsert`, `merge`, `updateAt`, `deleteAt`, `drop`) is wrapped in `this.atomic()`. Trees created via `BTree.create()` get atomicity; direct `new BTree()` construction does not (backward compatible for the collection system which manages its own tracker).
+
+## Key Files
+
+- **`transform/atomic-proxy.ts`** — `AtomicProxy<T>` class (49 lines). Implements `BlockStore<T>`, delegates to a swappable `_active` target. `atomic<R>(fn)` creates an `Atomic` tracker, swaps delegation, runs `fn`, commits/rolls back. Re-entrant safe: nested calls skip tracker creation.
+- **`btree/btree.ts`** — `BTree.create()` wraps the store in `AtomicProxy` shared by tree and trunk. Private `_proxy` field + `atomic()` helper.
+- **`transform/index.ts`** — Re-exports `AtomicProxy`.
+
+## Review Notes
+
+**Code quality**: Clean, minimal, focused. AtomicProxy is 49 lines with clear SRP. No over-engineering. The re-entrancy guard (`_active !== _base`) elegantly handles `merge` → `updateAt` nesting.
+
+**Correctness**: `_version` increments are positioned after mutation logic within the atomic callback, so they're never reached on error — no version rollback needed. The `finally` block always restores `_active = _base`. Trunk operations (root pointer updates) share the same atomic batch via the shared proxy.
+
+**Tests**: 4 new tests (252 total), well-structured:
+- Failed insert — sabotaged `tryGet`, tree unchanged, accepts new inserts after
+- Failed delete — handles both success (no rebalance needed) and failure paths
+- Failed upsert — sabotaged `tryGet`, tree unchanged
+- Partial delete rollback — precise setup forcing rebalance failure after entry deletion; verifies deleted entry restored
+
+**Docs**: Added "Atomic Mutations" section to `btree.md` documenting the behavior, `create()` vs `new` distinction, and re-entrancy safety.
+
+## Testing
+
+```
+252 passing (1s)
+```
+
+Build compiles cleanly.

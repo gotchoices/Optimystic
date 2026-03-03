@@ -247,6 +247,12 @@ The B-tree maintains these structural invariants at all times:
 - **Merge**: after a delete, if two siblings' combined entries fit within `NodeCapacity`, they are merged and the parent partition is removed. Merges cascade upward.
 - **Root collapse**: when the root branch has zero partitions (one child), that child becomes the new root.
 
+### Atomic Mutations
+
+Trees created via `BTree.create()` wrap the store in an `AtomicProxy`, so each public mutation method (`insert`, `upsert`, `merge`, `updateAt`, `deleteAt`, `drop`) collects all block operations into an `Atomic` tracker and commits them as a batch on success, or discards them on error. The BTree and its trunk share the same proxy, so root pointer updates are part of the same atomic batch. Nested mutations (e.g., `merge` → `updateAt`) are re-entrant safe — inner calls skip creating a new tracker.
+
+Trees constructed directly via `new BTree()` do not get atomicity; this path is used by the collection system which manages its own tracker externally.
+
 ### Path Invalidation
 
 A monotonic `_version` counter tracks tree mutations. Paths capture the version at creation time; any subsequent mutation increments the version, making all outstanding paths invalid. Operations that accept a path (`at`, `deleteAt`, `updateAt`, `moveNext`, `movePrior`, `ascending`, `descending`) call `validatePath()` which throws on stale paths. Mutation operations (`insert`, `upsert`, `deleteAt`, `updateAt`, `merge`) return a fresh path with the new version.
