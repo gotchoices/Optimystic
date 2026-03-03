@@ -75,11 +75,11 @@ export class RepoClient extends ProtocolClient implements IRepo {
 			if (next.id === currentIdStr) {
 				throw new Error('Redirect loop detected in RepoClient (same peer)')
 			}
-		// cache hint
-		this.recordCoordinatorForOpsIfSupported(operations, nextId)
-		// single-hop retry against target peer using repo protocol
-		const nextClient = RepoClient.create(nextId, this.peerNetwork, this.protocolPrefix)
-		return await nextClient.processRepoMessage<T>(operations, options, hop + 1)
+			// cache hint
+			this.recordCoordinatorForOpsIfSupported(operations, nextId)
+			// single-hop retry against target peer using repo protocol
+			const nextClient = RepoClient.create(nextId, this.peerNetwork, this.protocolPrefix)
+			return await nextClient.processRepoMessage<T>(operations, options, hop + 1)
 		}
 		return response as T;
 	}
@@ -96,6 +96,10 @@ export class RepoClient extends ProtocolClient implements IRepo {
 		}
 		if ('commit' in op) {
 			return new TextEncoder().encode(op.commit.tailId);
+		}
+		if ('cancel' in op) {
+			const id = op.cancel.actionRef.blockIds[0];
+			return id ? new TextEncoder().encode(id) : undefined;
 		}
 		return undefined;
 	}

@@ -13,5 +13,3 @@ export function encodePeers(peers: Array<{ id: string, addrs: string[] }>): Redi
     }
   }
 }
-
-
