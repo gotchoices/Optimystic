@@ -1,4 +1,4 @@
-import type { IRepo, ClusterRecord, Signature, RepoMessage, ITransactionValidator } from "@optimystic/db-core";
+import type { IRepo, ClusterRecord, Signature, RepoMessage, ITransactionValidator, ClusterConsensusConfig } from "@optimystic/db-core";
 import type { ICluster } from "@optimystic/db-core";
 import type { IPeerNetwork } from "@optimystic/db-core";
 import { blockIdsForTransforms } from "@optimystic/db-core";
@@ -44,6 +44,7 @@ interface ClusterMemberComponents {
 	fretService?: FretService;
 	validator?: ITransactionValidator;
 	reputation?: IPeerReputation;
+	consensusConfig?: ClusterConsensusConfig;
 }
 
 export function clusterMember(components: ClusterMemberComponents): ClusterMember {
@@ -56,7 +57,8 @@ export function clusterMember(components: ClusterMemberComponents): ClusterMembe
 		components.partitionDetector,
 		components.fretService,
 		components.validator,
-		components.reputation
+		components.reputation,
+		components.consensusConfig
 	);
 }
 
@@ -79,6 +81,9 @@ export class ClusterMember implements ICluster {
 	// Temporarily set during validateSignatures so verifySignature can access the record
 	private currentValidationRecord?: ClusterRecord;
 
+	/** Effective super-majority threshold. Defaults to 1.0 (unanimity) for backward compatibility. */
+	private readonly superMajorityThreshold: number;
+
 	constructor(
 		private readonly storageRepo: IRepo,
 		private readonly peerNetwork: IPeerNetwork,
@@ -88,8 +93,10 @@ export class ClusterMember implements ICluster {
 		private readonly partitionDetector?: PartitionDetector,
 		private readonly fretService?: FretService,
 		private readonly validator?: ITransactionValidator,
-		private readonly reputation?: IPeerReputation
+		private readonly reputation?: IPeerReputation,
+		consensusConfig?: ClusterConsensusConfig
 	) {
+		this.superMajorityThreshold = consensusConfig?.superMajorityThreshold ?? 1.0;
 		// Periodically clean up expired transactions (.unref() so tests/short-lived processes can exit)
 		setInterval(() => this.queueExpiredTransactions(), 60000).unref();
 		// Process cleanup queue
@@ -416,13 +423,15 @@ export class ClusterMember implements ICluster {
 	private async getTransactionPhase(record: ClusterRecord): Promise<TransactionPhase> {
 		const peerCount = Object.keys(record.peers).length;
 		const promiseCount = Object.keys(record.promises).length;
-		const commitCount = Object.keys(record.commits).length;
 		const ourId = this.peerId.toString();
 
-		// Check for rejections
+		const superMajority = Math.ceil(peerCount * this.superMajorityThreshold);
+		const maxAllowedRejections = peerCount - superMajority;
+
+		// Check for rejections — rejected if too many rejections to ever reach super-majority
 		const rejectedPromises = Object.values(record.promises).filter(s => s.type === 'reject');
 		const rejectedCommits = Object.values(record.commits).filter(s => s.type === 'reject');
-		if (rejectedPromises.length > 0 || this.hasMajority(rejectedCommits.length, peerCount)) {
+		if (rejectedPromises.length > maxAllowedRejections || this.hasMajority(rejectedCommits.length, peerCount)) {
 			return TransactionPhase.Rejected;
 		}
 
@@ -431,14 +440,15 @@ export class ClusterMember implements ICluster {
 			return TransactionPhase.OurPromiseNeeded;
 		}
 
-		// Check if still collecting promises
-		if (promiseCount < peerCount) {
-			return TransactionPhase.Promising;
+		// Check if we have enough approved promises to proceed to commit
+		const approvedPromises = Object.values(record.promises).filter(s => s.type === 'approve');
+		if (approvedPromises.length >= superMajority && !record.commits[ourId]) {
+			return TransactionPhase.OurCommitNeeded;
 		}
 
-		// Check if we need to commit
-		if (promiseCount === peerCount && !record.commits[ourId]) {
-			return TransactionPhase.OurCommitNeeded;
+		// Check if still collecting promises
+		if (promiseCount < peerCount && approvedPromises.length < superMajority) {
+			return TransactionPhase.Promising;
 		}
 
 		// Check for consensus

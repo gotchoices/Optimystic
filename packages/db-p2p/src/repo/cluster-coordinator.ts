@@ -251,6 +251,28 @@ export class ClusterCoordinator {
 			throw new Error(`Failed to get super-majority: ${approvalCount}/${peerCount} approvals (needed ${superMajority}, ${rejectionCount} rejections)`);
 		}
 
+		// Mark as disputed when minority rejections exist but super-majority approves
+		if (rejectionCount > 0 && approvalCount >= superMajority) {
+			const rejectingPeers: string[] = [];
+			const rejectReasons: { [peerId: string]: string } = {};
+			for (const [peerId, sig] of Object.entries(promises)) {
+				if (sig.type === 'reject') {
+					rejectingPeers.push(peerId);
+					rejectReasons[peerId] = sig.rejectReason ?? 'unknown';
+				}
+			}
+			promised.record.disputed = true;
+			promised.record.disputeEvidence = { rejectingPeers, rejectReasons };
+			log('cluster-tx:disputed', {
+				messageHash: record.messageHash,
+				rejectingPeers,
+				rejectReasons,
+				approvalCount,
+				rejectionCount,
+				peerCount
+			});
+		}
+
 		return await this.commitTransaction(promised.record);
 	}
 

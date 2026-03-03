@@ -281,6 +281,15 @@ export async function createLibp2pNodeBase(
 	const partitionDetector = new PartitionDetector();
 	const fretSvc = (node as any).services?.fret as FretService | undefined;
 
+	const consensusConfig = {
+		superMajorityThreshold: options.clusterPolicy?.superMajorityThreshold ?? 0.67,
+		simpleMajorityThreshold: 0.51,
+		minAbsoluteClusterSize: 2,
+		allowClusterDownsize: options.clusterPolicy?.allowDownsize ?? true,
+		clusterSizeTolerance: options.clusterPolicy?.sizeTolerance ?? 0.5,
+		partitionDetectionWindow: 60000
+	};
+
 	clusterImpl = clusterMember({
 		storageRepo,
 		peerNetwork: keyNetwork,
@@ -290,7 +299,8 @@ export async function createLibp2pNodeBase(
 		partitionDetector,
 		fretService: fretSvc,
 		validator: options.validator,
-		reputation
+		reputation,
+		consensusConfig
 	});
 
 	const coordinatorRepoFactory = coordinatorRepo(
@@ -298,12 +308,7 @@ export async function createLibp2pNodeBase(
 		createClusterClient,
 		{
 			clusterSize: options.clusterSize ?? 10,
-			superMajorityThreshold: options.clusterPolicy?.superMajorityThreshold ?? 0.67,
-			simpleMajorityThreshold: 0.51,
-			minAbsoluteClusterSize: 2,
-			allowClusterDownsize: options.clusterPolicy?.allowDownsize ?? true,
-			clusterSizeTolerance: options.clusterPolicy?.sizeTolerance ?? 0.5,
-			partitionDetectionWindow: 60000
+			...consensusConfig
 		},
 		fretSvc,
 		reputation

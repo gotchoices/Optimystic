@@ -27,6 +27,13 @@ export type ClusterRecord = {
 	networkSizeHint?: number;
 	/** Confidence in the network size estimate (0-1) */
 	networkSizeConfidence?: number;
+	/** Transaction proceeded despite minority rejections */
+	disputed?: boolean;
+	/** Evidence of the dispute: which peers rejected and why */
+	disputeEvidence?: {
+		rejectingPeers: string[];
+		rejectReasons: { [peerId: string]: string };
+	};
 }
 
 export interface ClusterConsensusConfig {

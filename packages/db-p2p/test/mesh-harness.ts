@@ -1,5 +1,5 @@
 import type { PeerId, PrivateKey } from '@libp2p/interface';
-import type { IKeyNetwork, ClusterPeers, ICluster, ClusterRecord, IRepo, BlockId, ActionRev } from '@optimystic/db-core';
+import type { IKeyNetwork, ClusterPeers, ICluster, ClusterRecord, IRepo, BlockId, ActionRev, ClusterConsensusConfig } from '@optimystic/db-core';
 import type { FindCoordinatorOptions } from '@optimystic/db-core';
 import type { IPeerNetwork } from '@optimystic/db-core';
 import { peerIdFromPrivateKey } from '@libp2p/peer-id';
@@ -117,11 +117,21 @@ export async function createMesh(nodeCount: number, options: MeshOptions): Promi
 			(blockId: BlockId) => new BlockStorage(blockId, rawStorage)
 		);
 
+		const consensusConfig: ClusterConsensusConfig = {
+			superMajorityThreshold: options.superMajorityThreshold ?? 0.75,
+			simpleMajorityThreshold: 0.51,
+			minAbsoluteClusterSize: 2,
+			allowClusterDownsize: options.allowClusterDownsize ?? true,
+			clusterSizeTolerance: 0.5,
+			partitionDetectionWindow: 60000
+		};
+
 		const member = clusterMember({
 			storageRepo,
 			peerNetwork,
 			peerId,
-			privateKey
+			privateKey,
+			consensusConfig
 		});
 
 		nodes.push({
