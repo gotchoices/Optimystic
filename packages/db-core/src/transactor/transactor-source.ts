@@ -1,8 +1,11 @@
 import { randomBytes } from '@noble/hashes/utils.js'
 import { toString as uint8ArrayToString } from 'uint8arrays/to-string'
 import type { IBlock, BlockId, BlockHeader, ITransactor, ActionId, StaleFailure, ActionContext, BlockType, BlockSource, Transforms } from "../index.js";
+import type { ReadDependency } from "../transaction/transaction.js";
 
 export class TransactorSource<TBlock extends IBlock> implements BlockSource<TBlock> {
+	private readDependencies: ReadDependency[] = [];
+
 	constructor(
 		private readonly collectionId: BlockId,
 		private readonly transactor: ITransactor,
@@ -26,10 +29,20 @@ export class TransactorSource<TBlock extends IBlock> implements BlockSource<TBlo
 		const result = await this.transactor.get({ blockIds: [id], context: this.actionContext });
 		if (result) {
 			const { block, state } = result[id]!;
+			// Record read dependency for optimistic concurrency control
+			this.readDependencies.push({ blockId: id, revision: state.latest?.rev ?? 0 });
 			// TODO: if the state reports that there is a pending action, record this so that we are sure to update before syncing
 			//state.pendings
 			return block as TBlock;
 		}
+	}
+
+	getReadDependencies(): ReadDependency[] {
+		return this.readDependencies;
+	}
+
+	clearReadDependencies(): void {
+		this.readDependencies = [];
 	}
 
 	/**

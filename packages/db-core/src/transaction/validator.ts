@@ -1,5 +1,6 @@
 import type { BlockId, CollectionId, IBlock, BlockOperations, Transforms, ITransactor } from '../index.js';
-import type { Transaction, ITransactionEngine, ITransactionValidator, ValidationResult, CollectionActions } from './transaction.js';
+import type { Transaction, ITransactionEngine, ITransactionValidator, ValidationResult, CollectionActions, ReadDependency } from './transaction.js';
+import type { BlockActionState } from '../network/struct.js';
 import { isTransactionExpired } from './transaction.js';
 import type { Collection } from '../collection/collection.js';
 import { Tracker } from '../transform/tracker.js';
@@ -38,6 +39,12 @@ export type ValidationCoordinatorFactory = () => {
 };
 
 /**
+ * Provides current block state for read dependency validation.
+ * Returns the latest BlockActionState for a given block, or undefined if the block doesn't exist.
+ */
+export type BlockStateProvider = (blockId: BlockId) => Promise<BlockActionState | undefined>;
+
+/**
  * Transaction validator implementation.
  *
  * Validates transactions by re-executing them and comparing operations hash.
@@ -46,7 +53,8 @@ export type ValidationCoordinatorFactory = () => {
 export class TransactionValidator implements ITransactionValidator {
 	constructor(
 		private readonly engines: Map<string, EngineRegistration>,
-		private readonly createValidationCoordinator: ValidationCoordinatorFactory
+		private readonly createValidationCoordinator: ValidationCoordinatorFactory,
+		private readonly blockStateProvider?: BlockStateProvider
 	) {}
 
 	async validate(transaction: Transaction, operationsHash: string): Promise<ValidationResult> {
@@ -79,8 +87,18 @@ export class TransactionValidator implements ITransactionValidator {
 		}
 
 		// 3. Verify read dependencies (optimistic concurrency)
-		// TODO: Implement read dependency validation
-		// For now, we skip this check - will be implemented with proper block versioning
+		if (this.blockStateProvider && transaction.reads.length > 0) {
+			for (const read of transaction.reads) {
+				const currentState = await this.blockStateProvider(read.blockId);
+				const currentRev = currentState?.latest?.rev ?? 0;
+				if (currentRev !== read.revision) {
+					return {
+						valid: false,
+						reason: `Stale read: block ${read.blockId} was at revision ${read.revision} but is now at ${currentRev}`
+					};
+				}
+			}
+		}
 
 		// 4. Create isolated validation coordinator
 		const validationCoordinator = this.createValidationCoordinator();

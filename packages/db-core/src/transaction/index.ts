@@ -28,4 +28,4 @@ export { TransactionCoordinator } from './coordinator.js';
 export { TransactionContext } from './context.js';
 export { TransactionSession } from './session.js';
 export { TransactionValidator } from './validator.js';
-export type { EngineRegistration, ValidationCoordinatorFactory } from './validator.js';
+export type { EngineRegistration, ValidationCoordinatorFactory, BlockStateProvider } from './validator.js';

@@ -1,5 +1,5 @@
 import type { ITransactor, BlockId, CollectionId, Transforms, PendRequest, CommitRequest, ActionId, IBlock, BlockOperations } from "../index.js";
-import type { Transaction, ExecutionResult, ITransactionEngine, CollectionActions } from "./transaction.js";
+import type { Transaction, ExecutionResult, ITransactionEngine, CollectionActions, ReadDependency } from "./transaction.js";
 import type { PeerId } from "../network/types.js";
 import type { Collection } from "../collection/collection.js";
 import { TransactionContext } from "./context.js";
@@ -191,6 +191,26 @@ export class TransactionCoordinator {
 	resetTransforms(): void {
 		for (const collection of this.collections.values()) {
 			collection.tracker.reset();
+		}
+	}
+
+	/**
+	 * Collect read dependencies from all participating collections.
+	 */
+	getReadDependencies(): ReadDependency[] {
+		const reads: ReadDependency[] = [];
+		for (const collection of this.collections.values()) {
+			reads.push(...collection.getReadDependencies());
+		}
+		return reads;
+	}
+
+	/**
+	 * Clear read dependencies from all collections.
+	 */
+	clearReadDependencies(): void {
+		for (const collection of this.collections.values()) {
+			collection.clearReadDependencies();
 		}
 	}
 

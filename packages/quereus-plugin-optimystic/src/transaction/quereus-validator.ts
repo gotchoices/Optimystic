@@ -12,6 +12,7 @@ import type {
 	Transforms,
 	CollectionId,
 	CollectionActions,
+	BlockStateProvider,
 } from '@optimystic/db-core';
 import { TransactionValidator, type EngineRegistration, type ValidationCoordinatorFactory } from '@optimystic/db-core';
 import { QuereusEngine, QUEREUS_ENGINE_ID } from './quereus-engine.js';
@@ -24,6 +25,8 @@ export interface QuereusValidatorOptions {
 	db: Database;
 	/** The transaction coordinator for the database */
 	coordinator: TransactionCoordinator;
+	/** Optional provider for looking up current block state (for read dependency validation) */
+	blockStateProvider?: BlockStateProvider;
 }
 
 /**
@@ -81,6 +84,6 @@ export function createQuereusValidator(options: QuereusValidatorOptions): ITrans
 		};
 	};
 
-	return new TransactionValidator(engines, createValidationCoordinator);
+	return new TransactionValidator(engines, createValidationCoordinator, options.blockStateProvider);
 }
 

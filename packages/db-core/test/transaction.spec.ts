@@ -16,10 +16,12 @@ import {
 	type CollectionActions,
 	type EngineRegistration,
 	type ValidationCoordinatorFactory,
+	type BlockStateProvider,
 	type Transforms,
 	type ActionId,
 	type BlockId,
 	type IBlock,
+	type BlockActionState,
 } from '../src/index.js';
 import { isTransformsEmpty, blockIdsForTransforms } from '../src/transform/index.js';
 import { TestTransactor } from './test-transactor.js';
@@ -2165,6 +2167,221 @@ describe('Transaction', () => {
 			expect(finalFromTree1).to.deep.equal(finalFromTree2);
 			// tree2 wrote last (after retry), so its value should win
 			expect(finalFromTree2!.balance).to.equal(75);
+		});
+
+		it('should detect write-skew via read dependency validation', async () => {
+			const transactor = new TestTransactor();
+			const blockA = 'account-a' as BlockId;
+			const blockB = 'account-b' as BlockId;
+
+			// Setup: two accounts with balance 100 each (invariant: A + B >= 100)
+			await transactor.pend({
+				actionId: 'init' as ActionId,
+				transforms: {
+					inserts: {
+						[blockA]: makeBlock(blockA, '100'),
+						[blockB]: makeBlock(blockB, '100'),
+					},
+					updates: {},
+					deletes: [],
+				},
+				policy: 'f',
+			});
+			await transactor.commit({
+				actionId: 'init' as ActionId,
+				blockIds: [blockA, blockB],
+				tailId: blockA,
+				rev: 1,
+			});
+
+			// Simulate read dependencies: tx-a reads both blocks at rev 1
+			const txAReads = [
+				{ blockId: blockA, revision: 1 },
+				{ blockId: blockB, revision: 1 },
+			];
+
+			// Simulate read dependencies: tx-b reads both blocks at rev 1
+			const txBReads = [
+				{ blockId: blockA, revision: 1 },
+				{ blockId: blockB, revision: 1 },
+			];
+
+			// Transaction A: writes to blockA (withdraw 100)
+			await transactor.pend({
+				actionId: 'tx-a' as ActionId,
+				transforms: {
+					inserts: {},
+					updates: { [blockA]: [['data', 0, 0, '0']] },
+					deletes: [],
+				},
+				policy: 'f',
+				rev: 2,
+			});
+			await transactor.commit({
+				actionId: 'tx-a' as ActionId,
+				blockIds: [blockA],
+				tailId: blockA,
+				rev: 2,
+			});
+
+			// Now blockA is at rev 2. Validate tx-b's read dependencies.
+			// tx-b read blockA at rev 1, but it's now at rev 2 → stale read
+			const blockStateProvider: BlockStateProvider = async (blockId) => {
+				const result = await transactor.get({ blockIds: [blockId] });
+				return result[blockId]?.state;
+			};
+
+			const engines = new Map<string, EngineRegistration>();
+			engines.set('actions@1.0.0', {
+				engine: new ActionsEngine({} as any),
+				getSchemaHash: async () => 'schema1'
+			});
+			const validator = new TransactionValidator(
+				engines,
+				() => ({ applyActions: async () => {}, getTransforms: () => new Map(), dispose: () => {} }),
+				blockStateProvider
+			);
+
+			const stamp = await createTransactionStamp('peer-b', Date.now(), 'schema1', 'actions@1.0.0');
+			const txB: Transaction = {
+				stamp,
+				statements: [],
+				reads: txBReads,
+				id: await createTransactionId(stamp.id, [], txBReads),
+			};
+
+			const result = await validator.validate(txB, `ops:${await hashString(JSON.stringify([]))}`);
+			expect(result.valid).to.be.false;
+			expect(result.reason).to.include('Stale read');
+			expect(result.reason).to.include(blockA);
+		});
+
+		it('should pass validation when reads have not changed', async () => {
+			const transactor = new TestTransactor();
+			const blockA = 'block-a' as BlockId;
+
+			// Setup: create a block at rev 1
+			await transactor.pend({
+				actionId: 'init' as ActionId,
+				transforms: { inserts: { [blockA]: makeBlock(blockA, 'data') }, updates: {}, deletes: [] },
+				policy: 'f',
+			});
+			await transactor.commit({
+				actionId: 'init' as ActionId,
+				blockIds: [blockA],
+				tailId: blockA,
+				rev: 1,
+			});
+
+			// Read dependency at rev 1 — block is still at rev 1
+			const reads = [{ blockId: blockA, revision: 1 }];
+
+			const blockStateProvider: BlockStateProvider = async (blockId) => {
+				const result = await transactor.get({ blockIds: [blockId] });
+				return result[blockId]?.state;
+			};
+
+			const engines = new Map<string, EngineRegistration>();
+			engines.set('actions@1.0.0', {
+				engine: new ActionsEngine({} as any),
+				getSchemaHash: async () => 'schema1'
+			});
+			const validator = new TransactionValidator(
+				engines,
+				() => ({ applyActions: async () => {}, getTransforms: () => new Map(), dispose: () => {} }),
+				blockStateProvider
+			);
+
+			const stamp = await createTransactionStamp('peer1', Date.now(), 'schema1', 'actions@1.0.0');
+			const tx: Transaction = {
+				stamp,
+				statements: [],
+				reads,
+				id: await createTransactionId(stamp.id, [], reads),
+			};
+
+			const expectedHash = `ops:${await hashString(JSON.stringify([]))}`;
+			const result = await validator.validate(tx, expectedHash);
+			expect(result.valid).to.be.true;
+		});
+
+		it('should detect when a non-existent block (rev 0) gets created', async () => {
+			const transactor = new TestTransactor();
+			const blockA = 'new-block' as BlockId;
+
+			// Read dependency: block didn't exist (rev 0)
+			const reads = [{ blockId: blockA, revision: 0 }];
+
+			// Now create the block
+			await transactor.pend({
+				actionId: 'create' as ActionId,
+				transforms: { inserts: { [blockA]: makeBlock(blockA, 'data') }, updates: {}, deletes: [] },
+				policy: 'f',
+			});
+			await transactor.commit({
+				actionId: 'create' as ActionId,
+				blockIds: [blockA],
+				tailId: blockA,
+				rev: 1,
+			});
+
+			// blockA is now at rev 1, but read expected rev 0 → stale
+			const blockStateProvider: BlockStateProvider = async (blockId) => {
+				const result = await transactor.get({ blockIds: [blockId] });
+				return result[blockId]?.state;
+			};
+
+			const engines = new Map<string, EngineRegistration>();
+			engines.set('actions@1.0.0', {
+				engine: new ActionsEngine({} as any),
+				getSchemaHash: async () => 'schema1'
+			});
+			const validator = new TransactionValidator(
+				engines,
+				() => ({ applyActions: async () => {}, getTransforms: () => new Map(), dispose: () => {} }),
+				blockStateProvider
+			);
+
+			const stamp = await createTransactionStamp('peer1', Date.now(), 'schema1', 'actions@1.0.0');
+			const tx: Transaction = {
+				stamp,
+				statements: [],
+				reads,
+				id: await createTransactionId(stamp.id, [], reads),
+			};
+
+			const expectedHash = `ops:${await hashString(JSON.stringify([]))}`;
+			const result = await validator.validate(tx, expectedHash);
+			expect(result.valid).to.be.false;
+			expect(result.reason).to.include('Stale read');
+		});
+
+		it('should pass validation when transaction has no reads (backward compatible)', async () => {
+			const engines = new Map<string, EngineRegistration>();
+			engines.set('actions@1.0.0', {
+				engine: new ActionsEngine({} as any),
+				getSchemaHash: async () => 'schema1'
+			});
+
+			const blockStateProvider: BlockStateProvider = async () => undefined;
+
+			const validator = new TransactionValidator(
+				engines,
+				() => ({ applyActions: async () => {}, getTransforms: () => new Map(), dispose: () => {} }),
+				blockStateProvider
+			);
+
+			const stamp = await createTransactionStamp('peer1', Date.now(), 'schema1', 'actions@1.0.0');
+			const tx: Transaction = {
+				stamp,
+				statements: [],
+				reads: [],
+				id: await createTransactionId(stamp.id, [], []),
+			};
+
+			const expectedHash = `ops:${await hashString(JSON.stringify([]))}`;
+			const result = await validator.validate(tx, expectedHash);
+			expect(result.valid).to.be.true;
 		});
 
 		it('should NOT detect write-skew through separate Tree collections (known limitation)', async () => {

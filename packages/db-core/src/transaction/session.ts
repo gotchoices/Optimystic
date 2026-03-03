@@ -125,16 +125,22 @@ export class TransactionSession {
 			return { success: false, error: `Transaction expired at ${this.stamp.expiration}` };
 		}
 
+		// Collect read dependencies from all participating collections
+		const reads = this.coordinator.getReadDependencies();
+
 		// Create the complete transaction
 		const transaction: Transaction = {
 			stamp: this.stamp,
 			statements: this.statements,
-			reads: [], // TODO: Track reads during statement execution
-			id: await createTransactionId(this.stamp.id, this.statements, [])
+			reads,
+			id: await createTransactionId(this.stamp.id, this.statements, reads)
 		};
 
 		// Commit through coordinator (which will orchestrate PEND/COMMIT)
 		await this.coordinator.commit(transaction);
+
+		// Clear read dependencies after successful commit
+		this.coordinator.clearReadDependencies();
 
 		this.committed = true;
 		return { success: true };
@@ -157,6 +163,7 @@ export class TransactionSession {
 
 		// Rollback through coordinator
 		await this.coordinator.rollback(this.stamp.id);
+		this.coordinator.clearReadDependencies();
 		this.rolledBack = true;
 		this.statements.length = 0;
 	}
