@@ -16,6 +16,10 @@ export enum PenaltyReason {
 	ProtocolViolation = 'protocol-violation',
 	/** Connection-level failures (lighter weight) */
 	ConnectionFailure = 'connection-failure',
+	/** Majority peer approved a transaction that was later found invalid via dispute */
+	FalseApproval = 'false-approval',
+	/** Challenger lost a dispute (their rejection was wrong) */
+	DisputeLost = 'dispute-lost',
 }
 
 /** Default penalty weights by reason */
@@ -28,6 +32,8 @@ export const DEFAULT_PENALTY_WEIGHTS: Record<PenaltyReason, number> = {
 	[PenaltyReason.ExpiredTransaction]: 3,
 	[PenaltyReason.ProtocolViolation]: 30,
 	[PenaltyReason.ConnectionFailure]: 2,
+	[PenaltyReason.FalseApproval]: 40,
+	[PenaltyReason.DisputeLost]: 30,
 };
 
 /** Thresholds controlling graduated reputation responses */

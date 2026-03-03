@@ -42,4 +42,8 @@ export interface ClusterConsensusConfig {
 	clusterSizeTolerance: number;
 	/** Window for detecting partition in milliseconds (default 60000 = 1 min) */
 	partitionDetectionWindow: number;
+	/** Enable dispute escalation protocol (default false) */
+	disputeEnabled?: boolean;
+	/** Timeout for dispute arbitration in milliseconds (default 60000) */
+	disputeArbitrationTimeoutMs?: number;
 }

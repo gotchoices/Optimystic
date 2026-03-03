@@ -28,3 +28,4 @@ export * from "./routing/libp2p-known-peers.js";
 export * from "./network/network-manager-service.js";
 export * from "./network/get-network-manager.js";
 export * from "./reputation/index.js";
+export * from "./dispute/index.js";

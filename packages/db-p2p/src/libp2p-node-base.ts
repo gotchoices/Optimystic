@@ -33,6 +33,11 @@ import type { RestoreCallback } from './storage/struct.js';
 import type { FretService } from 'p2p-fret';
 import { PartitionDetector } from './cluster/partition-detector.js';
 import { PeerReputationService } from './reputation/peer-reputation.js';
+import { DisputeService } from './dispute/dispute-service.js';
+import { DisputeClient } from './dispute/client.js';
+import { disputeProtocolService } from './dispute/service.js';
+import { selectArbitrators } from './dispute/arbitrator-selection.js';
+import type { DisputeConfig } from './dispute/types.js';
 
 type Libp2pInit = NonNullable<Parameters<typeof createLibp2p>[0]>;
 export type Libp2pTransports = NonNullable<Libp2pInit['transports']>;
@@ -85,6 +90,9 @@ export type NodeOptions = {
 
 	/** Optional persistence for network state (HWM, FRET table) across restarts */
 	persistence?: NetworkStatePersistence;
+
+	/** Dispute protocol configuration */
+	dispute?: Partial<DisputeConfig>;
 };
 
 function resolveStorage(provider: RawStorageProvider | undefined): IRawStorage {
@@ -393,11 +401,45 @@ export async function createLibp2pNodeBase(
 		}
 	}
 
+	// Initialize dispute service if enabled
+	let disputeServiceInstance: DisputeService | undefined;
+	if (options.dispute?.disputeEnabled) {
+		const createDisputeClient = (peerId: any) => DisputeClient.create(peerId, keyNetwork, protocolPrefix);
+		disputeServiceInstance = new DisputeService({
+			peerId: node.peerId,
+			privateKey: nodePrivateKey,
+			peerNetwork: keyNetwork,
+			createDisputeClient,
+			reputation,
+			validator: options.validator,
+			config: options.dispute,
+			selectArbitrators: async (blockId: string, excludePeers: string[], count: number) => {
+				const { hashKey: fretHashKey } = await import('p2p-fret');
+				const blockIdBytes = new TextEncoder().encode(blockId);
+				const fret = (node as any).services?.fret as FretService | undefined;
+				if (!fret) return [];
+				// Get a larger cohort and exclude the original cluster peers
+				const cohortSize = count + excludePeers.length + 1;
+				const hashedCoord = await fretHashKey(blockIdBytes);
+				const allPeerIdStrs = fret.assembleCohort(hashedCoord, cohortSize) as string[];
+				// Filter out original cluster peers and self, convert to PeerId
+				const excludeSet = new Set(excludePeers);
+				excludeSet.add(node.peerId.toString());
+				const arbitratorPeerIds = allPeerIdStrs
+					.filter(pid => !excludeSet.has(pid))
+					.slice(0, count)
+					.map(pid => peerIdFromString(pid));
+				return arbitratorPeerIds;
+			},
+		});
+	}
+
 	// Expose coordinated repo and storage for external use
 	(node as any).coordinatedRepo = coordinatedRepo;
 	(node as any).storageRepo = storageRepo;
 	(node as any).keyNetwork = keyNetwork;
 	(node as any).reputation = reputation;
+	(node as any).disputeService = disputeServiceInstance;
 
 	return node;
 }
