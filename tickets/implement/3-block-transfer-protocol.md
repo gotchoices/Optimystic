@@ -61,10 +61,8 @@ interface BlockTransferConfig {
 ```
 
 **For gained blocks** (pull):
-1. Identify existing holders by querying `fret.assembleCohort()` for each block.
-2. Open a `BlockTransfer` stream to the closest available holder.
-3. Request block data via `pull` message.
-4. Store received blocks locally via the storage layer.
+1. Reuse `RestorationCoordinator.restore()` which already handles discovering holders (ring peers, inner storage rings) and fetching block data. This avoids duplicating the discovery-and-fetch logic that already works for cache-miss restoration.
+2. The coordinator's existing ring-walking strategy (transaction ring peers first, then inner rings) applies directly to rebalance-driven pulls.
 
 **For lost blocks** (push):
 1. If `enablePush` is true, proactively send blocks to new responsible peers.

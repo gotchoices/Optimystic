@@ -267,11 +267,10 @@ If you spot code or design aspects that aren't covered by these tasks, please ad
   - Reasonable for JSON-serialized blocks (~100KB typical).
   - NOTE: Could be tuned based on workload, but 64 is sensible default.
 - [x] **PERF-9.3.3**: Review caching strategies (CacheSource, schema hash cache) - VERIFIED:
-  - CacheSource: Simple Map-based cache with `structuredClone` for isolation. `transformCache()` applies mutations without source access.
+  - CacheSource: LRU-bounded cache (default 128 entries) with `structuredClone` for isolation. `transformCache()` applies mutations without source access.
   - Schema hash cache: `schemaHashCache` in QuereusEngine with `invalidateSchemaCache()` on DDL.
   - Query cache: `CacheNode` with threshold-based overflow (default 10000 rows), spill strategy option.
   - Tuning: `OptimizerTuning.cache` configures spillThreshold (100000), maxSpillBuffer (10000).
-  - NOTE: No LRU eviction in CacheSource - relies on `clear()` calls.
 - [x] **PERF-9.3.4**: Review cluster consensus round-trip overhead - VERIFIED:
   - Round-trips: 2 phases (PEND + COMMIT), each requires super-majority/simple-majority responses.
   - Batching: `makeBatchesByPeer()` groups blocks by coordinator, parallel execution across clusters.
