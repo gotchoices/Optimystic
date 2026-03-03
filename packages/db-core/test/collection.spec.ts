@@ -180,7 +180,7 @@ describe('Collection', () => {
     expect(logActions).to.deep.equal([...actions].reverse())
   })
 
-  it('should error on concurrent creation', async () => {
+  it('should resolve concurrent creation (first synced wins)', async () => {
     const collection1 = await Collection.createOrOpen<TestAction>(transactor, collectionId, initOptions)
     const collection2 = await Collection.createOrOpen<TestAction>(transactor, collectionId, initOptions)
 
@@ -189,38 +189,104 @@ describe('Collection', () => {
     await collection2.sync()
   })
 
-  it('should handle concurrent modifications', async () => {
+  it('should allow operations on losing collection after concurrent creation', async () => {
     const collection1 = await Collection.createOrOpen<TestAction>(transactor, collectionId, initOptions)
     const collection2 = await Collection.createOrOpen<TestAction>(transactor, collectionId, initOptions)
 
-    // Add actions to both collections concurrently
+    // collection1 wins the creation race
+    await collection1.sync()
+    // collection2 loses, recovers
+    await collection2.sync()
+
+    // collection2 should be usable after recovery
+    const action: Action<TestAction> = {
+      type: 'set',
+      data: { value: 'post-recovery', timestamp: Date.now() }
+    }
+    await collection2.act(action)
+    await collection2.sync()
+
+    // collection1 should see collection2's action after updating
+    await collection1.update()
+    const actions: Action<TestAction>[] = []
+    for await (const a of collection1.selectLog()) {
+      actions.push(a)
+    }
+    expect(actions).to.have.lengthOf(1)
+    expect(actions[0]!.data.value).to.equal('post-recovery')
+  })
+
+  it('should resolve concurrent creation with pending data on both peers', async () => {
+    const collection1 = await Collection.createOrOpen<TestAction>(transactor, collectionId, initOptions)
+    const collection2 = await Collection.createOrOpen<TestAction>(transactor, collectionId, initOptions)
+
+    // Both peers add data before either syncs
     const action1: Action<TestAction> = {
       type: 'set',
-      data: {
-        value: 'value 1',
-        timestamp: Date.now()
-      }
+      data: { value: 'peer1-data', timestamp: 1 }
+    }
+    const action2: Action<TestAction> = {
+      type: 'set',
+      data: { value: 'peer2-data', timestamp: 2 }
+    }
+
+    await collection1.act(action1)
+    await collection2.act(action2)
+
+    // collection1 syncs first (wins creation, commits action1)
+    await collection1.sync()
+
+    // collection2 syncs (loses creation, should recover and commit action2)
+    await collection2.updateAndSync()
+
+    // Both should converge
+    await collection1.update()
+    await collection2.update()
+
+    const actions1: Action<TestAction>[] = []
+    for await (const a of collection1.selectLog()) {
+      actions1.push(a)
+    }
+
+    const actions2: Action<TestAction>[] = []
+    for await (const a of collection2.selectLog()) {
+      actions2.push(a)
+    }
+
+    expect(actions1).to.have.lengthOf(2)
+    expect(actions2).to.have.lengthOf(2)
+    expect(new Set(actions1.map(a => a.data.value)))
+      .to.deep.equal(new Set(['peer1-data', 'peer2-data']))
+    expect(new Set(actions2.map(a => a.data.value)))
+      .to.deep.equal(new Set(['peer1-data', 'peer2-data']))
+  })
+
+  it('should handle latch-serialized concurrent sync after concurrent creation', async () => {
+    const collection1 = await Collection.createOrOpen<TestAction>(transactor, collectionId, initOptions)
+    const collection2 = await Collection.createOrOpen<TestAction>(transactor, collectionId, initOptions)
+
+    const action1: Action<TestAction> = {
+      type: 'set',
+      data: { value: 'value 1', timestamp: Date.now() }
     }
 
     const action2: Action<TestAction> = {
       type: 'set',
-      data: {
-        value: 'value 2',
-        timestamp: Date.now() + 1
-      }
+      data: { value: 'value 2', timestamp: Date.now() + 1 }
     }
 
+    await collection1.act(action1)
+    await collection2.act(action2)
+
+    // Both sync via Promise.all - serialized by shared latch
     await Promise.all([
-      collection1.act(action1).then(() => collection1.sync()),
-      collection2.act(action2).then(() => collection2.sync())
+      collection1.updateAndSync(),
+      collection2.updateAndSync()
     ])
 
-		await collection1.update(),
-		await collection2.update()
-		// await Promise.all([
-    // ])
+    await collection1.update()
+    await collection2.update()
 
-    // Both collections should see both actions
     const actions1: Action<TestAction>[] = []
     for await (const action of collection1.selectLog()) {
       actions1.push(action)
@@ -231,13 +297,13 @@ describe('Collection', () => {
       actions2.push(action)
     }
 
-		// TODO: Fix this test; it is not concurrent.
-    // expect(actions1).to.have.lengthOf(2)
-    // expect(actions2).to.have.lengthOf(2)
-    // expect(new Set(actions1.map(a => a.data.value)))
-    //   .to.deep.equal(new Set(['value 1', 'value 2']))
-    // expect(new Set(actions2.map(a => a.data.value)))
-    //   .to.deep.equal(new Set(['value 1', 'value 2']))
+    // Both collections should see both actions
+    expect(actions1).to.have.lengthOf(2)
+    expect(actions2).to.have.lengthOf(2)
+    expect(new Set(actions1.map(a => a.data.value)))
+      .to.deep.equal(new Set(['value 1', 'value 2']))
+    expect(new Set(actions2.map(a => a.data.value)))
+      .to.deep.equal(new Set(['value 1', 'value 2']))
   })
 
   it('should handle multiple action types', async () => {

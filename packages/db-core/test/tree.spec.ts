@@ -313,4 +313,31 @@ describe('Tree', () => {
     const retrieved2 = await tree2.get(entry2.key)
     expect(retrieved2).to.deep.equal(entry2)
   })
+
+  describe('concurrent creation', () => {
+    it('should resolve concurrent Tree creation and allow post-recovery operations', async () => {
+      const tree1 = await Tree.createOrOpen<number, TestEntry>(network, 'concurrent-tree', e => e.key)
+      const tree2 = await Tree.createOrOpen<number, TestEntry>(network, 'concurrent-tree', e => e.key)
+
+      // tree1 wins the creation race
+      await tree1.replace([[1, { key: 1, value: 'from-tree1' }]])
+
+      // tree2 loses, should recover and be usable
+      await tree2.replace([[2, { key: 2, value: 'from-tree2' }]])
+
+      // Both should converge
+      await tree1.update()
+      await tree2.update()
+
+      const val1from1 = await tree1.get(1)
+      const val2from1 = await tree1.get(2)
+      const val1from2 = await tree2.get(1)
+      const val2from2 = await tree2.get(2)
+
+      expect(val1from1).to.deep.equal({ key: 1, value: 'from-tree1' })
+      expect(val2from1).to.deep.equal({ key: 2, value: 'from-tree2' })
+      expect(val1from2).to.deep.equal({ key: 1, value: 'from-tree1' })
+      expect(val2from2).to.deep.equal({ key: 2, value: 'from-tree2' })
+    })
+  })
 })
