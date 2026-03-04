@@ -5,7 +5,7 @@ import { transformForBlockId, groupBy, concatTransforms, concatTransform, transf
 import { blockIdToBytes } from "../utility/block-id-to-bytes.js";
 import { isRecordEmpty } from "../utility/is-record-empty.js";
 import { type CoordinatorBatch, makeBatchesByPeer, incompleteBatches, everyBatch, allBatches, mergeBlocks, processBatches, createBatchesForPayload } from "../utility/batch-coordinator.js";
-import { createLogger } from "../logger.js";
+import { createLogger, verbose } from "../logger.js";
 
 const log = createLogger('network-transactor');
 
@@ -34,6 +34,7 @@ export class NetworkTransactor implements ITransactor {
 	async get(blockGets: BlockGets): Promise<GetBlockResults> {
 		// Group by block id
 		const distinctBlockIds = Array.from(new Set(blockGets.blockIds));
+		const t0 = Date.now();
 		log('get blockIds=%d', distinctBlockIds.length);
 
 		const batches = await this.batchesForPayload<BlockId[], GetBlockResults>(
@@ -145,6 +146,7 @@ export class NetworkTransactor implements ITransactor {
 			throw aggregate;
 		}
 
+		log('get:done blockIds=%d ms=%d', distinctBlockIds.length, Date.now() - t0);
 		return Object.fromEntries(resultEntries) as GetBlockResults;
 	}
 
@@ -278,6 +280,7 @@ export class NetworkTransactor implements ITransactor {
 	}
 
 	async pend(blockAction: PendRequest): Promise<PendResult> {
+		const t0 = Date.now();
 		const transformForBlock = (payload: Transforms, blockId: BlockId, mergeWithPayload: Transforms | undefined): Transforms => {
 			const filteredTransform = transformForBlockId(payload, blockId);
 			return mergeWithPayload
@@ -287,6 +290,16 @@ export class NetworkTransactor implements ITransactor {
 		const blockIds = blockIdsForTransforms(blockAction.transforms);
 		const batches = await this.consolidateCoordinators(blockIds, blockAction.transforms, transformForBlock);
 		log('pend actionId=%s blockIds=%d batches=%d', blockAction.actionId, blockIds.length, batches.length);
+		if (verbose) {
+			const batchSummary = batches.map(b => ({
+				peer: b.peerId.toString().substring(0, 12),
+				blocks: (b as any).coordinatingBlockIds ?? [b.blockId],
+				inserts: Object.keys(b.payload.inserts ?? {}).length,
+				updates: Object.keys(b.payload.updates ?? {}).length,
+				deletes: b.payload.deletes?.length ?? 0
+			}));
+			log('pend:batches actionId=%s detail=%o', blockAction.actionId, batchSummary);
+		}
 		const expiration = Date.now() + this.timeoutMs;
 
 		let error: Error | undefined;
@@ -349,6 +362,7 @@ export class NetworkTransactor implements ITransactor {
 
 		// Collect replies back into result structure
 		const completed = Array.from(allBatches(batches, b => b.request?.isResponse as boolean && b.request!.response!.success));
+		log('pend:done actionId=%s ms=%d batches=%d', blockAction.actionId, Date.now() - t0, batches.length);
 		return {
 			success: true,
 			pending: completed.flatMap(b => (b.request!.response! as PendSuccess).pending),
@@ -383,6 +397,7 @@ export class NetworkTransactor implements ITransactor {
 	}
 
 	async commit(request: CommitRequest): Promise<CommitResult> {
+		const t0 = Date.now();
 		log('commit actionId=%s rev=%d blockIds=%d', request.actionId, request.rev, request.blockIds.length);
 		const allBlockIds = [...new Set([...request.blockIds, request.tailId])];
 
@@ -414,6 +429,7 @@ export class NetworkTransactor implements ITransactor {
 			}
 		}
 
+		log('commit:done actionId=%s ms=%d', request.actionId, Date.now() - t0);
 		return { success: true };
 	}
 

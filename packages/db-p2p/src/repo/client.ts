@@ -44,6 +44,15 @@ export class RepoClient extends ProtocolClient implements IRepo {
 		);
 	}
 
+	private extractCorrelationId(operations: RepoMessage['operations']): string | undefined {
+		const op = operations[0];
+		if (!op) return undefined;
+		if ('pend' in op) return op.pend.actionId;
+		if ('commit' in op) return op.commit.actionId;
+		if ('cancel' in op) return op.cancel.actionRef.actionId;
+		return undefined;
+	}
+
 	private async processRepoMessage<T>(
 		operations: RepoMessage['operations'],
 		options: MessageOptions,
@@ -53,6 +62,7 @@ export class RepoClient extends ProtocolClient implements IRepo {
 			operations,
 			expiration: options.expiration,
 		};
+		const correlationId = this.extractCorrelationId(operations);
 		const deadline = options.expiration ?? (Date.now() + 30_000)
 		const msLeft = Math.max(1, deadline - Date.now())
 		const withTimeout = async <U>(fn: () => Promise<U>): Promise<U> => {
@@ -63,7 +73,7 @@ export class RepoClient extends ProtocolClient implements IRepo {
 		}
 		let response: any
 		const preferred = (this.protocolPrefix ?? '/db-p2p') + '/repo/1.0.0'
-		response = await withTimeout(() => super.processMessage<any>(message, preferred, { signal: options?.signal }))
+		response = await withTimeout(() => super.processMessage<any>(message, preferred, { signal: options?.signal, correlationId }))
 
 		if (response?.redirect?.peers?.length) {
 			if (hop >= 2) {

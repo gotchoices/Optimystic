@@ -17,10 +17,11 @@ export class ProtocolClient {
 	protected async processMessage<T>(
 		message: unknown,
 		protocol: string,
-		options?: { signal?: AbortSignal }
+		options?: { signal?: AbortSignal; correlationId?: string }
 	): Promise<T> {
 		const peer = this.peerId.toString();
-		log('dial peer=%s protocol=%s', peer, protocol);
+		const cid = options?.correlationId;
+		log('dial peer=%s protocol=%s%s', peer, protocol, cid ? ` cid=${cid}` : '');
 		const t0 = Date.now();
 
 		let stream: Libp2pStream;
@@ -31,10 +32,10 @@ export class ProtocolClient {
 				{ signal: options?.signal }
 			) as unknown as Libp2pStream;
 		} catch (err) {
-			log('dial:fail peer=%s protocol=%s ms=%d', peer, protocol, Date.now() - t0);
+			log('dial:fail peer=%s protocol=%s ms=%d%s', peer, protocol, Date.now() - t0, cid ? ` cid=${cid}` : '');
 			throw err;
 		}
-		log('dial:ok peer=%s ms=%d', peer, Date.now() - t0);
+		log('dial:ok peer=%s ms=%d%s', peer, Date.now() - t0, cid ? ` cid=${cid}` : '');
 
 		try {
 			// Send the request using length-prefixed encoding
@@ -54,7 +55,7 @@ export class ProtocolClient {
 				async function* (source) {
 					for await (const data of source) {
 						if (firstByte) {
-							log('first-byte peer=%s ms=%d', peer, Date.now() - t0);
+							log('first-byte peer=%s ms=%d%s', peer, Date.now() - t0, cid ? ` cid=${cid}` : '');
 							firstByte = false;
 						}
 						const decoded = new TextDecoder().decode(data.subarray());
@@ -65,7 +66,7 @@ export class ProtocolClient {
 			) as AsyncIterable<T>;
 
 			const result = await first(() => source, () => { throw new Error('No response received') });
-			log('response peer=%s protocol=%s ms=%d', peer, protocol, Date.now() - t0);
+			log('response peer=%s protocol=%s ms=%d%s', peer, protocol, Date.now() - t0, cid ? ` cid=${cid}` : '');
 			return result;
 		} finally {
 			await stream.close();

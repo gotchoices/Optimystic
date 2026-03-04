@@ -6,6 +6,9 @@ import { TransactionContext } from "./context.js";
 import { ActionsEngine } from "./actions-engine.js";
 import { createActionsStatements, createTransactionStamp, createTransactionId, isTransactionExpired } from "./transaction.js";
 import { Log, blockIdsForTransforms, transformsFromTransform, hashString } from "../index.js";
+import { createLogger } from "../logger.js";
+
+const log = createLogger('trx:coordinator');
 
 /**
  * Represents an operation on a block within a collection.
@@ -278,6 +281,9 @@ export class TransactionCoordinator {
 	 * @returns Execution result with actions and results
 	 */
 	async execute(transaction: Transaction, engine: ITransactionEngine): Promise<ExecutionResult> {
+		const trxId = transaction.id;
+		const t0 = Date.now();
+
 		if (isTransactionExpired(transaction.stamp)) {
 			return { success: false, error: `Transaction expired at ${transaction.stamp.expiration}` };
 		}
@@ -286,8 +292,11 @@ export class TransactionCoordinator {
 		// Note: We don't enforce this strictly since the engine is passed in explicitly
 		// The caller is responsible for ensuring the correct engine is used
 
+		const tEngine = Date.now();
 		const result = await engine.execute(transaction);
+		const engineMs = Date.now() - tEngine;
 		if (!result.success) {
+			log('execute:done trxId=%s engine=%dms success=false total=%dms', trxId, engineMs, Date.now() - t0);
 			return result;
 		}
 
@@ -296,6 +305,7 @@ export class TransactionCoordinator {
 		}
 
 		// 2. Apply actions to collections and collect transforms
+		const tApply = Date.now();
 		const collectionTransforms = new Map<CollectionId, Transforms>();
 		const criticalBlocks = new Map<CollectionId, BlockId>();
 		const actionResults = new Map<CollectionId, any[]>();
@@ -331,7 +341,10 @@ export class TransactionCoordinator {
 		]);
 		const operationsHash = await this.hashOperations(allOperations);
 
+		const applyMs = Date.now() - tApply;
+
 		// 4. Coordinate (GATHER if multi-collection)
+		const tCoord = Date.now();
 		const coordResult = await this.coordinateTransaction(
 			transaction,
 			operationsHash,
@@ -339,7 +352,9 @@ export class TransactionCoordinator {
 			criticalBlocks
 		);
 
+		const coordMs = Date.now() - tCoord;
 		if (!coordResult.success) {
+			log('execute:done trxId=%s engine=%dms apply=%dms coordinate=%dms success=false total=%dms', trxId, engineMs, applyMs, coordMs, Date.now() - t0);
 			return coordResult;
 		}
 
@@ -361,6 +376,7 @@ export class TransactionCoordinator {
 		}
 
 		// 6. Return results from actions
+		log('execute:done trxId=%s engine=%dms apply=%dms coordinate=%dms total=%dms', trxId, engineMs, applyMs, coordMs, Date.now() - t0);
 		return {
 			success: true,
 			actions: result.actions,
@@ -444,36 +460,48 @@ export class TransactionCoordinator {
 		collectionTransforms: Map<CollectionId, Transforms>,
 		criticalBlocks: Map<CollectionId, BlockId>
 	): Promise<{ success: boolean; error?: string }> {
+		const trxId = transaction.id;
+		const t0 = Date.now();
+
 		// 1. GATHER phase: collect critical cluster nominees (skip if single collection)
 		const criticalBlockIds = Array.from(criticalBlocks.values());
+		const tGather = Date.now();
 		const superclusterNominees = await this.gatherPhase(criticalBlockIds);
+		const gatherMs = Date.now() - tGather;
 
 		// 2. PEND phase: distribute to all block clusters
+		const tPend = Date.now();
 		const pendResult = await this.pendPhase(
 			transaction,
 			operationsHash,
 			collectionTransforms,
 			superclusterNominees
 		);
+		const pendMs = Date.now() - tPend;
 		if (!pendResult.success) {
+			log('trx:phases trxId=%s gather=%dms pend=%dms (failed) total=%dms', trxId, gatherMs, pendMs, Date.now() - t0);
 			return pendResult;
 		}
 
 		// 3. COMMIT phase: commit to all critical blocks
+		const tCommit = Date.now();
 		const commitResult = await this.commitPhase(
 			transaction.id as ActionId,
 			criticalBlockIds,
 			pendResult.pendedBlockIds!
 		);
+		const commitMs = Date.now() - tCommit;
 		if (!commitResult.success) {
 			// Cancel pending actions on failure
 			await this.cancelPhase(transaction.id as ActionId, collectionTransforms);
+			log('trx:phases trxId=%s gather=%dms pend=%dms commit=%dms (failed) total=%dms', trxId, gatherMs, pendMs, commitMs, Date.now() - t0);
 			return commitResult;
 		}
 
 		// 4. PROPAGATE and CHECKPOINT phases are handled by clusters automatically
 		// (as per user's note: "managed by each cluster, the client doesn't have to worry about them")
 
+		log('trx:phases trxId=%s gather=%dms pend=%dms commit=%dms total=%dms', trxId, gatherMs, pendMs, commitMs, Date.now() - t0);
 		return { success: true };
 	}
 

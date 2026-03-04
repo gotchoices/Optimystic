@@ -5,7 +5,7 @@ import { sha256 } from "multiformats/hashes/sha2";
 import { ClusterClient } from "../cluster/client.js";
 import { Pending } from "@optimystic/db-core";
 import type { PeerId } from "@libp2p/interface";
-import { createLogger } from '../logger.js'
+import { createLogger, verbose } from '../logger.js'
 import type { ClusterLogPeerOutcome } from './types.js'
 import type { FretService } from "p2p-fret";
 import type { IPeerReputation } from "../reputation/types.js";
@@ -326,6 +326,13 @@ export class ClusterCoordinator {
 	private async collectPromises(peers: ClusterPeers, record: ClusterRecord): Promise<{ record: ClusterRecord }> {
 		const peerIds = Object.keys(peers);
 		const summary: ClusterLogPeerOutcome[] = [];
+		if (verbose) {
+			const peerDetail = peerIds.map(id => ({
+				id: id.substring(0, 12),
+				addrs: peers[id]?.multiaddrs?.length ?? 0
+			}));
+			log('cluster-tx:promise-peers', { messageHash: record.messageHash, peers: peerDetail });
+		}
 		// For each peer, create a client and request a promise
 		const promiseRequests = peerIds.map(peerIdStr => {
 			const isLocal = this.localCluster && peerIdStr === this.localCluster.peerId.toString();
@@ -416,6 +423,13 @@ export class ClusterCoordinator {
 		// For each peer, create a client and send the commit
 		const peerIds = Object.keys(record.peers);
 		const summary: ClusterLogPeerOutcome[] = [];
+		if (verbose) {
+			const peerDetail = peerIds.map(id => ({
+				id: id.substring(0, 12),
+				addrs: record.peers[id]?.multiaddrs?.length ?? 0
+			}));
+			log('cluster-tx:commit-peers', { messageHash: record.messageHash, peers: peerDetail });
+		}
 		// Send the record with promises to all peers
 		// Each peer will add its own commit signature
 		const commitPayload = {
