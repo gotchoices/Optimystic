@@ -365,26 +365,10 @@ describe('RebalanceMonitor', () => {
 	});
 
 	describe('ArachnodeInfo status transitions', () => {
-		it('setStatus updates the status through fretAdapter', () => {
-			// Set up initial arachnode info via metadata
-			const selfStr = selfId.toString();
-			(mockFret as any).peerMetadata = new Map();
-			(mockFret as any).peerMetadata.set(selfStr, {
-				arachnode: makeArachnodeInfo('active')
-			});
-			// Override getMyArachnodeInfo for testing
-			const origGetMy = fretAdapter.getMyArachnodeInfo.bind(fretAdapter);
-
-			// We need the adapter to know our peer ID. Override getMyArachnodeInfo.
-			let storedInfo: ArachnodeInfo = makeArachnodeInfo('active');
+		it('setStatus delegates to fretAdapter.setStatus', () => {
+			const statusLog: Array<ArachnodeInfo['status']> = [];
 			const adapter = {
-				getMyArachnodeInfo: () => storedInfo,
-				setArachnodeInfo: (info: ArachnodeInfo) => { storedInfo = info; },
-				setStatus: (status: ArachnodeInfo['status']) => {
-					const current = adapter.getMyArachnodeInfo();
-					if (current) adapter.setArachnodeInfo({ ...current, status });
-				},
-				getFret: () => mockFret
+				setStatus: (status: ArachnodeInfo['status']) => { statusLog.push(status); }
 			} as unknown as ArachnodeFretAdapter;
 
 			const monitor = new RebalanceMonitor({
@@ -393,13 +377,10 @@ describe('RebalanceMonitor', () => {
 			});
 
 			monitor.setStatus('moving');
-			expect(storedInfo.status).to.equal('moving');
-
 			monitor.setStatus('active');
-			expect(storedInfo.status).to.equal('active');
-
 			monitor.setStatus('leaving');
-			expect(storedInfo.status).to.equal('leaving');
+
+			expect(statusLog).to.deep.equal(['moving', 'active', 'leaving']);
 		});
 	});
 

@@ -6,6 +6,7 @@ import type { ArachnodeFretAdapter, ArachnodeInfo } from '../storage/arachnode-f
 import { createLogger } from '../logger.js'
 
 const log = createLogger('rebalance-monitor')
+const textEncoder = new TextEncoder()
 
 export interface RebalanceEvent {
 	/** Block IDs this node has gained responsibility for */
@@ -164,7 +165,7 @@ export class RebalanceMonitor implements Startable {
 		const newOwners = new Map<string, string[]>()
 
 		for (const blockId of this.trackedBlocks) {
-			const key = new TextEncoder().encode(blockId)
+			const key = textEncoder.encode(blockId)
 			const coord = await hashKey(key)
 
 			// Get the current cohort — assembleCohort returns peer IDs sorted by distance
@@ -217,9 +218,6 @@ export class RebalanceMonitor implements Startable {
 	 * Update ArachnodeInfo status through the fret adapter.
 	 */
 	setStatus(status: ArachnodeInfo['status']): void {
-		const current = this.deps.fretAdapter.getMyArachnodeInfo()
-		if (current) {
-			this.deps.fretAdapter.setArachnodeInfo({ ...current, status })
-		}
+		this.deps.fretAdapter.setStatus(status)
 	}
 }
