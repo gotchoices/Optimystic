@@ -601,6 +601,38 @@ describe('DisputeService', () => {
 			const svc = createDisputeService(peer);
 			expect(svc.getDisputeStatus('unknown-hash')).to.be.undefined;
 		});
+
+		it('should return committed-invalidated after challenger wins', async () => {
+			const challenger = clusterPeers[0]!;
+			const svc = createDisputeService(challenger, { evidenceHash: 'hash-A' });
+			for (const arb of arbitratorPeers) {
+				createDisputeService(arb, { evidenceHash: 'hash-A' });
+			}
+
+			const record = await makeClusterRecord(clusterPeers, 'block-1', {
+				rejectPeers: new Set([challenger.peerId.toString()]),
+			});
+
+			const result = await svc.initiateDispute(record, makeEvidence('hash-A'));
+			expect(result!.outcome).to.equal('challenger-wins');
+			expect(svc.getDisputeStatus(record.messageHash)).to.equal('committed-invalidated');
+		});
+
+		it('should return committed-validated after majority wins', async () => {
+			const challenger = clusterPeers[0]!;
+			const svc = createDisputeService(challenger, { evidenceHash: 'hash-A' });
+			for (const arb of arbitratorPeers) {
+				createDisputeService(arb, { evidenceHash: 'hash-B' });
+			}
+
+			const record = await makeClusterRecord(clusterPeers, 'block-1', {
+				rejectPeers: new Set([challenger.peerId.toString()]),
+			});
+
+			const result = await svc.initiateDispute(record, makeEvidence('hash-A'));
+			expect(result!.outcome).to.equal('majority-wins');
+			expect(svc.getDisputeStatus(record.messageHash)).to.equal('committed-validated');
+		});
 	});
 
 	describe('reputation effects', () => {

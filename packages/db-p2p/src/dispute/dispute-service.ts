@@ -63,6 +63,8 @@ export class DisputeService {
 	private activeDisputes: Map<string, DisputeChallenge> = new Map();
 	/** Resolved disputes (disputeId -> resolution) */
 	private resolvedDisputes: Map<string, DisputeResolution> = new Map();
+	/** Challenges retained after resolution for status lookups */
+	private resolvedChallenges: Map<string, DisputeChallenge> = new Map();
 	/** Track which transactions we've already disputed (prevent spam) */
 	private disputedTransactions: Set<string> = new Set();
 
@@ -179,6 +181,7 @@ export class DisputeService {
 		const votes = await this.collectVotes(challenge, arbitrators);
 		const resolution = this.resolveDispute(challenge, votes);
 
+		this.resolvedChallenges.set(disputeId, challenge);
 		this.activeDisputes.delete(disputeId);
 		this.resolvedDisputes.set(disputeId, resolution);
 
@@ -448,6 +451,6 @@ export class DisputeService {
 	}
 
 	private findChallengeForDispute(disputeId: string): DisputeChallenge | undefined {
-		return this.activeDisputes.get(disputeId);
+		return this.activeDisputes.get(disputeId) ?? this.resolvedChallenges.get(disputeId);
 	}
 }
