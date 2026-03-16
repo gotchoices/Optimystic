@@ -92,6 +92,8 @@ For each block involved in the transaction, the network transactor selects a pee
 
 In the event that the operation's expiration arrives, any peer left in-doubt can reach out to other peers in the cluster.  Possession of a consensus of commit signatures, however gathered, constitutes proof that the transaction succeeded.  Possession of a consensus of commit rejection signatures constitutes proof of transaction failure.  Cluster peers continue to propagate signature records around to each other until the transaction goes to success or failure.  If the originator doesn't receive a response from the coordinator by the expiration, it can reach out to any other of the cluster peers for an update on the operation's status.
 
+When cluster peers disagree on transaction validity, the transaction is blocked and escalated through progressively wider audiences until consensus is reached. The losing side is ejected and the ring segment self-heals. For details, see [Right-is-Right](right-is-right.md).
+
 ## Block Storage
 
 Block Storage is composed of:

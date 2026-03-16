@@ -184,6 +184,58 @@ Missing Transactions → Return newer committed transactions for rebasing
 - Background cleanup ensures failed transactions don't consume resources
 - Graceful degradation when network conditions deteriorate
 
+## Retry Semantics
+
+### Peer Exclusion
+
+When a coordinator peer fails to respond (timeout or error), the Network Transactor excludes it from future attempts and asks FRET for the next-nearest peer in the keyspace:
+
+```
+Attempt 1: block-A → peer P1 (fails)
+Attempt 2: block-A → peer P2 (excluded: {P1}) → finds P2 via FRET
+Attempt 3: block-A → peer P3 (excluded: {P1, P2}) → finds P3 via FRET
+```
+
+Exclusion sets accumulate across retries for the same block within a single transaction, preventing repeated attempts to unreachable peers.
+
+### Commit Retry Loop
+
+After the initial commit phase, the `ClusterCoordinator` tracks any peers that promised but failed to acknowledge their commit. These in-doubt participants are retried with exponential backoff:
+
+| Attempt | Delay  |
+|---------|--------|
+| 1       | 2 s    |
+| 2       | 4 s    |
+| 3       | 8 s    |
+| 4       | 16 s   |
+| 5       | 30 s (cap) |
+
+- The coordinator returns success to the caller as soon as **simple majority** commits are received — retries happen in the background
+- A successful retry removes the peer from the pending set; when the set is empty, retry state is cleared
+- After 5 failed attempts, the coordinator emits `cluster-tx:retry-abort` and stops retrying
+- Retries reuse the original `ClusterRecord`, so peers can apply the operation idempotently
+
+### Timeout Budgets
+
+- **Transaction-level**: `expiration` timestamp on `RepoMessage` (default 30 s from `CoordinatorRepo.DEFAULT_TIMEOUT`)
+- **Abort/cancel**: 5 s timeout (`abortOrCancelTimeoutMs`) for cleanup after failures
+- **Peer query**: 3 s per-peer timeout when querying cluster for latest revision
+- Cleanup intervals: expired transaction queue processed every 60 s, cleanup queue every 1 s
+
+### Stale Failure Handling
+
+When a peer reports that its local revision is behind (stale data), the Network Transactor returns a `StaleFailure` with the `missing` field containing the newer committed transactions. This allows the collection layer to:
+
+1. Incorporate the missing transactions (rebase)
+2. Replay the original actions on top
+3. Retry the transaction with fresh state
+
+This avoids treating stale reads as hard failures and enables optimistic retry without full re-coordination.
+
+### Background Cancellation
+
+When a pend or commit fails partway, already-pended blocks must be cancelled to free their pending slots. Cancellation runs as a background task (`void Promise.resolve().then(...)`) so the error propagates to the caller immediately while cleanup proceeds asynchronously.
+
 ## Why This Architecture Succeeds
 
 ### Solving Content-Addressing vs. Transaction Atomicity

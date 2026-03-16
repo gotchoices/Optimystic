@@ -189,24 +189,28 @@ if (promiseCount < superMajority) {
 
 ### Phase 2: Commit Execution (Simple Majority Required)
 
-Once super-majority promises are collected, the commit phase begins. **Commits only require a simple majority (>50%)** to prove commitment. The coordinator can return success to the client as soon as majority commits are received, with remaining propagation happening in the background.
+Once super-majority promises are collected, the commit phase begins. **Commits only require a simple majority (>50%)** to prove commitment. The coordinator can return success to the client as soon as majority commits are received, with remaining propagation happening in the background via the [commit retry loop](#commit-retry-loop).
+
+Each cluster member transitions to the commit phase when it sees enough approving promises (based on its configured threshold):
 
 ```typescript
 private async handleCommitNeeded(record: ClusterRecord): Promise<ClusterRecord> {
-  // Verify all promises are present
+  // Verify super-majority of approving promises are present
   const peerCount = Object.keys(record.peers).length;
-  const promiseCount = Object.keys(record.promises).length;
-  
-  if (promiseCount !== peerCount) {
-    throw new Error('Incomplete promise collection');
+  const approvalCount = Object.values(record.promises)
+    .filter(sig => sig.type === 'approve').length;
+  const superMajority = Math.ceil(peerCount * this.cfg.superMajorityThreshold);
+
+  if (approvalCount < superMajority) {
+    return record; // Not enough approvals yet
   }
-  
+
   // Create commit signature
   const signature: Signature = {
     type: 'approve',
     signature: await this.signCommitHash(record)
   };
-  
+
   return {
     ...record,
     commits: {
@@ -219,24 +223,50 @@ private async handleCommitNeeded(record: ClusterRecord): Promise<ClusterRecord> 
 
 ### Consensus Achievement
 
-When majority consensus is reached, the transaction is executed:
+When majority consensus is reached, the transaction is executed. Execution is guarded by a synchronous check-and-set on `executedTransactions` to prevent duplicate execution — JavaScript's single-threaded event loop makes this atomic as long as the guard runs before the first `await`:
 
 ```typescript
 private async handleConsensus(record: ClusterRecord): Promise<void> {
-  // Execute the database operations
-  for (const operation of record.message.operations) {
-    if ('get' in operation) {
-      await this.storageRepo.get(operation.get);
-    } else if ('pend' in operation) {
-      await this.storageRepo.pend(operation.pend);
-    } else if ('commit' in operation) {
-      await this.storageRepo.commit(operation.commit);
-    } else if ('cancel' in operation) {
-      await this.storageRepo.cancel(operation.cancel.trxRef);
+  // ATOMIC: synchronous check-and-set before any await
+  if (this.executedTransactions.has(record.messageHash)) {
+    return; // Already executed — idempotent
+  }
+  this.executedTransactions.set(record.messageHash, Date.now());
+
+  try {
+    for (const operation of record.message.operations) {
+      if ('pend' in operation) {
+        await this.storageRepo.pend(operation.pend);
+      } else if ('commit' in operation) {
+        await this.storageRepo.commit(operation.commit);
+      } else if ('cancel' in operation) {
+        await this.storageRepo.cancel(operation.cancel.trxRef);
+      } else if ('get' in operation) {
+        await this.storageRepo.get(operation.get);
+      }
     }
+  } catch (err) {
+    this.executedTransactions.delete(record.messageHash); // Allow retry on failure
+    throw err;
   }
 }
 ```
+
+### Dispute Marking
+
+When a minority of peers reject the transaction but the super-majority threshold is still met, the coordinator marks the record as **disputed** and attaches evidence. This allows upper layers (e.g., the [Right-is-Right dispute protocol](../../../docs/right-is-right.md)) to track dissent and potentially escalate:
+
+```typescript
+if (rejectionCount > 0 && approvalCount >= superMajority) {
+  record.disputed = true;
+  record.disputeEvidence = {
+    rejectingPeers: [...dissenting peer IDs],
+    rejectReasons: { [peerId]: reason }
+  };
+}
+```
+
+Dispute evidence is carried on the `ClusterRecord` and propagated to all cluster members during the commit phase.
 
 ## Transaction State Management
 
@@ -553,30 +583,17 @@ const updatedRecord = await clusterMember.update(incomingRecord);
 
 ## Error Handling and Monitoring
 
-### Error Types
+### Error Conditions
 
-```typescript
-// Network errors
-class NetworkError extends Error {
-  constructor(peerId: string, operation: string) {
-    super(`Network error with peer ${peerId} during ${operation}`);
-  }
-}
+Errors are thrown as plain `Error` instances with descriptive messages. Key error conditions:
 
-// Consensus errors
-class ConsensusError extends Error {
-  constructor(reason: string) {
-    super(`Consensus failed: ${reason}`);
-  }
-}
-
-// Timeout errors
-class TimeoutError extends Error {
-  constructor(messageHash: string) {
-    super(`Transaction ${messageHash} timed out`);
-  }
-}
-```
+- **Cluster too small**: `Cluster size N below minimum M and not validated` — cluster doesn't meet `minAbsoluteClusterSize` and FRET validation failed
+- **Downsize rejected**: `Cluster size N below configured minimum M` — `allowClusterDownsize` is false and cluster shrank
+- **Super-majority failed**: `Failed to get super-majority: N/M approvals (needed K, R rejections)` — too few approving promises
+- **Validator rejection**: `Transaction rejected by validators (N/M rejected): reasons` — rejection count exceeds `maxAllowedRejections`
+- **Expiration**: `Transaction expired` — transaction's `message.expiration` timestamp passed
+- **Hash mismatch**: `Message hash mismatch` — incoming record's message doesn't match its hash (forgery detection)
+- **Signature invalid**: `Invalid promise/commit signature from peerId` — cryptographic signature verification failed
 
 ### Monitoring Metrics
 
@@ -590,21 +607,21 @@ class TimeoutError extends Error {
 
 ### Cryptographic Integrity
 
-- **Message Hashing**: All messages have cryptographic hashes
-- **Signature Verification**: All operations are signed and verified
-- **Replay Protection**: Timestamps prevent replay attacks
+- **Message Hashing**: SHA-256 hashes (base58btc encoded) uniquely identify transactions
+- **Signature Verification**: Ed25519 signatures on promise and commit hashes are verified against the public key registered in `ClusterPeers`; forged signatures are rejected
+- **Replay Protection**: `executedTransactions` cache (10-minute TTL) prevents re-execution of committed transactions
 
 ### Access Control
 
-- **Peer Authentication**: Only authenticated peers can participate
-- **Operation Authorization**: Fine-grained permissions for operations
-- **Cluster Membership**: Dynamic and secure cluster membership
+- **Peer Identity**: Ed25519 key pairs tied to libp2p peer IDs
+- **Cluster Membership**: Only peers returned by `findCluster()` (via FRET) participate in consensus for a given block
 
-### Attack Prevention
+### Attack Mitigation
 
-- **Sybil Resistance**: Cryptographic peer identity prevents Sybil attacks
-- **Byzantine Fault Tolerance**: Majority consensus prevents Byzantine failures
-- **DoS Protection**: Rate limiting and timeout mechanisms
+- **Forgery Detection**: Message hash is validated against message content; mismatches are rejected
+- **Byzantine Tolerance**: Super-majority threshold (default 75%) means both halves of a 50/50 partition cannot commit; up to 25% Byzantine nodes are tolerated
+- **Timeout / DoS**: Transaction expiration and cleanup intervals (60s queue, 1s process) prevent resource exhaustion from stale transactions
+- **Reputation**: Failed peers are reported via `IPeerReputation` with `PenaltyReason.ConsensusTimeout`
 
 ## Network Size Estimation and Partition Detection
 
@@ -621,8 +638,16 @@ export interface ClusterRecord {
   message: RepoMessage;
   promises: Record<string, Signature>;
   commits: Record<string, Signature>;
-  networkSizeHint?: number;        // Coordinator's network size estimate
-  networkSizeConfidence?: number;  // Confidence in estimate (0-1)
+  coordinatingBlockIds?: BlockId[];    // Block IDs driving cluster selection
+  suggestedClusterSize?: number;       // Cluster size observed by coordinator
+  minRequiredSize?: number;            // Minimum required (when allowClusterDownsize=false)
+  networkSizeHint?: number;            // FRET network size estimate
+  networkSizeConfidence?: number;      // Confidence in estimate (0-1)
+  disputed?: boolean;                  // True when minority rejected but super-majority approved
+  disputeEvidence?: {                  // Evidence of dissent for dispute protocol
+    rejectingPeers: string[];
+    rejectReasons: Record<string, string>;
+  };
 }
 ```
 

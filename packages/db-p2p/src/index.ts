@@ -2,6 +2,8 @@ export * from "./cluster/client.js";
 export * from "./cluster/cluster-repo.js";
 export * from "./cluster/service.js";
 export * from "./cluster/rebalance-monitor.js";
+export * from "./cluster/block-transfer.js";
+export * from "./cluster/block-transfer-service.js";
 export * from "./protocol-client.js";
 export * from "./repo/client.js";
 export * from "./repo/cluster-coordinator.js";

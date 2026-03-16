@@ -1,5 +1,7 @@
-description: Dispute escalation protocol — overridden minorities can challenge to a wider audience, with arbitration, reputation effects, and engine health
+description: Dispute escalation protocol — validity disagreements block the transaction and cascade to wider audiences until one side wins
 dependencies: 3-right-is-right-threshold-promises (implemented)
+architecture: docs/right-is-right.md
+status: implemented (V1 — async disputes; target is synchronous cascading escalation per architecture doc)
 files:
   - packages/db-p2p/src/dispute/types.ts
   - packages/db-p2p/src/dispute/dispute-service.ts
@@ -21,11 +23,13 @@ files:
 
 When a transaction proceeds despite minority rejections (threshold-promises), the overridden minority can escalate to independent arbitrators. The dispute runs asynchronously — the transaction is already committed; the dispute determines whether it was valid.
 
+> **Note**: This is V1 of the dispute protocol. The target architecture (see `docs/right-is-right.md`) changes the model significantly: validity disagreements will block the transaction synchronously, disagreeing members will orchestrate cascading escalation through a deterministically-selected dissent coordinator, and the losing side will be ejected rather than just penalized. The V1 implementation below will evolve toward that design.
+
 ### Flow
 
 1. **Initiation**: A ClusterMember whose rejection was overridden calls `DisputeService.initiateDispute()` with the ClusterRecord and its own ValidationEvidence.
 
-2. **Arbitrator Selection**: Next K peers beyond the original cluster are selected using XOR-distance (same mechanism as cluster selection, but offset). This ensures independence and determinism.
+2. **Arbitrator Selection**: Next K peers beyond the original cluster are selected using FRET ring-distance (same mechanism as cluster selection, but offset). This ensures independence and determinism.
 
 3. **Challenge**: The dispute challenge (including the full record and challenger's evidence) is sent to all arbitrators.
 
@@ -69,7 +73,7 @@ New libp2p protocol: `/{prefix}/dispute/1.0.0`
 - handleChallenge: evidence matching, evidence mismatch, invalid signatures
 - resolveDispute: super-majority calculation for all three outcomes
 - handleResolution: engine health tracking on false-approval penalty
-- Arbitrator selection: XOR-distance ordering, cluster exclusion, edge cases
+- Arbitrator selection: FRET ring-distance ordering, cluster exclusion, edge cases
 - Penalty weights: FalseApproval=40, DisputeLost=30
 - Full integration: end-to-end dispute from initiation through resolution with mock services
 

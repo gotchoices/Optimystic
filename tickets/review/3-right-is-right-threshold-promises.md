@@ -1,5 +1,7 @@
 description: Threshold-based promise resolution — minority rejections no longer block consensus
 dependencies: cluster-signature-verification (complete), peer-reputation-system (in review)
+architecture: docs/right-is-right.md
+status: implemented (V1 — threshold override; target is unanimity-required with synchronous dispute escalation per architecture doc)
 files:
   - packages/db-core/src/cluster/structs.ts
   - packages/db-p2p/src/cluster/cluster-repo.ts
@@ -55,3 +57,5 @@ All pre-existing cluster-repo.spec.ts tests continue to pass because the default
 - In production (`libp2p-node-base.ts`), the member now shares the same threshold as the coordinator (default 0.67)
 - Consumers should check `record.disputed` after consensus to detect minority-objection transactions
 - The dispute evidence is recorded but not yet acted on — the dispute protocol (separate ticket) will consume it
+
+> **Note**: The target architecture (see `docs/right-is-right.md`) reverses the threshold model: instead of overriding minority rejections via super-majority, any validity disagreement will block the transaction and trigger synchronous cascading escalation. The threshold-based code serves as scaffolding for V1 but will be replaced by a unanimity-required model where disputes are resolved before commit.

@@ -4,7 +4,8 @@ import type { PeerId, Stream } from '@libp2p/interface';
 import { generateKeyPair } from '@libp2p/crypto/keys';
 import { peerIdFromPrivateKey } from '@libp2p/peer-id';
 import { PartitionDetector } from '../src/cluster/partition-detector.js';
-import { BlockTransferCoordinator, type RebalanceEvent } from '../src/cluster/block-transfer.js';
+import { BlockTransferCoordinator } from '../src/cluster/block-transfer.js';
+import type { RebalanceEvent } from '../src/cluster/rebalance-monitor.js';
 import { BlockTransferService, type BlockTransferRequest, type BlockTransferResponse, buildBlockTransferProtocol } from '../src/cluster/block-transfer-service.js';
 import type { RestorationCoordinator } from '../src/storage/restoration-coordinator-v2.js';
 import type { BlockArchive } from '../src/storage/struct.js';
@@ -263,6 +264,24 @@ describe('BlockTransferCoordinator', () => {
 	});
 
 	describe('concurrency limiting', () => {
+		it('does not deadlock when all concurrent tasks retry', async function () {
+			this.timeout(5000);
+			let callCount = 0;
+			restoration.restore = async (blockId: string) => {
+				callCount++;
+				// First round (2 calls) fail, second round succeeds
+				if (callCount <= 2) return undefined;
+				return makeArchive(blockId);
+			};
+
+			// maxConcurrency=2, both blocks fail on first attempt and retry
+			const result = await coordinator.pullBlocks(['block-a', 'block-b']);
+
+			expect(result.succeeded).to.have.length(2);
+			expect(result.failed).to.have.length(0);
+			expect(callCount).to.equal(4);
+		});
+
 		it('limits concurrent transfers to maxConcurrency', async () => {
 			let maxConcurrent = 0;
 			let currentConcurrent = 0;

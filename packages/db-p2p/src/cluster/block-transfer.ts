@@ -1,27 +1,12 @@
-import type { BlockId, IRepo } from '@optimystic/db-core';
-import type { PeerId, IPeerNetwork } from '@optimystic/db-core';
+import type { IRepo, IPeerNetwork } from '@optimystic/db-core';
 import { peerIdFromString } from '@libp2p/peer-id';
 import type { PartitionDetector } from './partition-detector.js';
 import type { RestorationCoordinator } from '../storage/restoration-coordinator-v2.js';
-import { BlockTransferClient, type BlockTransferRequest, type BlockTransferResponse } from './block-transfer-service.js';
+import { BlockTransferClient } from './block-transfer-service.js';
+import type { RebalanceEvent } from './rebalance-monitor.js';
 import { createLogger } from '../logger.js';
 
 const log = createLogger('block-transfer');
-
-/**
- * Rebalance event describing gained/lost block responsibilities.
- * Matches the RebalanceMonitor spec from the sibling ticket.
- */
-export interface RebalanceEvent {
-	/** Block IDs this node has gained responsibility for */
-	gained: string[];
-	/** Block IDs this node has lost responsibility for */
-	lost: string[];
-	/** Peers that are now closer for the lost blocks: blockId → peerId[] */
-	newOwners: Map<string, string[]>;
-	/** Timestamp of the topology change that triggered this */
-	triggeredAt: number;
-}
 
 export interface BlockTransferConfig {
 	/** Max concurrent transfers. Default: 4 */
@@ -32,11 +17,6 @@ export interface BlockTransferConfig {
 	maxRetries?: number;
 	/** Whether to push blocks to new owners proactively. Default: true */
 	enablePush?: boolean;
-}
-
-interface TransferTask {
-	blockId: string;
-	attempt: number;
 }
 
 /**
@@ -84,11 +64,9 @@ export class BlockTransferCoordinator {
 		const succeeded: string[] = [];
 		const failed: string[] = [];
 
-		const tasks = blockIds
-			.filter(id => !this.inFlight.has(`pull:${id}`))
-			.map(id => ({ blockId: id, attempt: 0 }));
+		const ids = blockIds.filter(id => !this.inFlight.has(`pull:${id}`));
 
-		await Promise.all(tasks.map(task => this.executePull(task, succeeded, failed)));
+		await Promise.all(ids.map(id => this.executePull(id, succeeded, failed)));
 
 		return { succeeded, failed };
 	}
@@ -111,11 +89,9 @@ export class BlockTransferCoordinator {
 		const succeeded: string[] = [];
 		const failed: string[] = [];
 
-		const tasks = blockIds
-			.filter(id => !this.inFlight.has(`push:${id}`) && newOwners.has(id))
-			.map(id => ({ blockId: id, attempt: 0 }));
+		const ids = blockIds.filter(id => !this.inFlight.has(`push:${id}`) && newOwners.has(id));
 
-		await Promise.all(tasks.map(task => this.executePush(task, newOwners, succeeded, failed)));
+		await Promise.all(ids.map(id => this.executePush(id, newOwners, succeeded, failed)));
 
 		return { succeeded, failed };
 	}
@@ -139,37 +115,40 @@ export class BlockTransferCoordinator {
 	}
 
 	private async executePull(
-		task: TransferTask,
+		blockId: string,
 		succeeded: string[],
 		failed: string[]
 	): Promise<void> {
-		const key = `pull:${task.blockId}`;
+		const key = `pull:${blockId}`;
 		if (this.inFlight.has(key)) return;
 		this.inFlight.add(key);
 
 		try {
-			await this.acquireSemaphore();
-			try {
-				const archive = await this.withTimeout(
-					this.restorationCoordinator.restore(task.blockId),
-					this.transferTimeoutMs
-				);
+			for (let attempt = 0; ; attempt++) {
+				await this.acquireSemaphore();
+				let archive: Awaited<ReturnType<RestorationCoordinator['restore']>>;
+				try {
+					archive = await this.withTimeout(
+						this.restorationCoordinator.restore(blockId),
+						this.transferTimeoutMs
+					);
+				} finally {
+					this.releaseSemaphore();
+				}
 
 				if (archive) {
-					log('pull:ok block=%s', task.blockId);
-					succeeded.push(task.blockId);
-				} else if (task.attempt < this.maxRetries) {
-					log('pull:retry block=%s attempt=%d', task.blockId, task.attempt + 1);
-					this.inFlight.delete(key);
-					await this.delay(this.backoffMs(task.attempt));
-					await this.executePull({ ...task, attempt: task.attempt + 1 }, succeeded, failed);
+					log('pull:ok block=%s', blockId);
+					succeeded.push(blockId);
 					return;
-				} else {
-					log('pull:failed block=%s', task.blockId);
-					failed.push(task.blockId);
 				}
-			} finally {
-				this.releaseSemaphore();
+				if (attempt < this.maxRetries) {
+					log('pull:retry block=%s attempt=%d', blockId, attempt + 1);
+					await this.delay(this.backoffMs(attempt));
+					continue;
+				}
+				log('pull:failed block=%s', blockId);
+				failed.push(blockId);
+				return;
 			}
 		} finally {
 			this.inFlight.delete(key);
@@ -177,71 +156,73 @@ export class BlockTransferCoordinator {
 	}
 
 	private async executePush(
-		task: TransferTask,
+		blockId: string,
 		newOwners: Map<string, string[]>,
 		succeeded: string[],
 		failed: string[]
 	): Promise<void> {
-		const key = `push:${task.blockId}`;
+		const key = `push:${blockId}`;
 		if (this.inFlight.has(key)) return;
 		this.inFlight.add(key);
 
 		try {
-			await this.acquireSemaphore();
-			try {
-				const owners = newOwners.get(task.blockId);
-				if (!owners || owners.length === 0) {
-					failed.push(task.blockId);
-					return;
-				}
-
-				// Read block data from local storage
-				const result = await this.repo.get({ blockIds: [task.blockId] });
-				const blockResult = result[task.blockId];
-				if (!blockResult?.block) {
-					log('push:no-local-data block=%s', task.blockId);
-					failed.push(task.blockId);
-					return;
-				}
-
-				const blockData = new TextEncoder().encode(JSON.stringify(blockResult.block));
-
-				// Push to at least one new owner
+			for (let attempt = 0; ; attempt++) {
+				await this.acquireSemaphore();
 				let pushed = false;
-				for (const ownerPeerIdStr of owners) {
-					try {
-						const peerId = peerIdFromString(ownerPeerIdStr);
-						const client = new BlockTransferClient(peerId, this.peerNetwork, this.protocolPrefix);
-						const response = await this.withTimeout(
-							client.pushBlocks([task.blockId], [blockData]),
-							this.transferTimeoutMs
-						);
-
-						if (response && !response.missing.includes(task.blockId)) {
-							pushed = true;
-							log('push:ok block=%s peer=%s', task.blockId, ownerPeerIdStr);
-							break;
-						}
-					} catch (err) {
-						log('push:peer-error block=%s peer=%s err=%s',
-							task.blockId, ownerPeerIdStr, (err as Error).message);
+				try {
+					const owners = newOwners.get(blockId);
+					if (!owners || owners.length === 0) {
+						failed.push(blockId);
+						return;
 					}
+
+					// Read block data from local storage
+					const result = await this.repo.get({ blockIds: [blockId] });
+					const blockResult = result[blockId];
+					if (!blockResult?.block) {
+						log('push:no-local-data block=%s', blockId);
+						failed.push(blockId);
+						return;
+					}
+
+					const blockData = new TextEncoder().encode(JSON.stringify(blockResult.block));
+
+					// Push to at least one new owner
+					for (const ownerPeerIdStr of owners) {
+						try {
+							const peerId = peerIdFromString(ownerPeerIdStr);
+							const client = new BlockTransferClient(peerId, this.peerNetwork, this.protocolPrefix);
+							const response = await this.withTimeout(
+								client.pushBlocks([blockId], [blockData]),
+								this.transferTimeoutMs
+							);
+
+							if (response && !response.missing.includes(blockId)) {
+								pushed = true;
+								log('push:ok block=%s peer=%s', blockId, ownerPeerIdStr);
+								break;
+							}
+						} catch (err) {
+							log('push:peer-error block=%s peer=%s err=%s',
+								blockId, ownerPeerIdStr, (err as Error).message);
+						}
+					}
+				} finally {
+					this.releaseSemaphore();
 				}
 
 				if (pushed) {
-					succeeded.push(task.blockId);
-				} else if (task.attempt < this.maxRetries) {
-					log('push:retry block=%s attempt=%d', task.blockId, task.attempt + 1);
-					this.inFlight.delete(key);
-					await this.delay(this.backoffMs(task.attempt));
-					await this.executePush({ ...task, attempt: task.attempt + 1 }, newOwners, succeeded, failed);
+					succeeded.push(blockId);
 					return;
-				} else {
-					log('push:failed block=%s', task.blockId);
-					failed.push(task.blockId);
 				}
-			} finally {
-				this.releaseSemaphore();
+				if (attempt < this.maxRetries) {
+					log('push:retry block=%s attempt=%d', blockId, attempt + 1);
+					await this.delay(this.backoffMs(attempt));
+					continue;
+				}
+				log('push:failed block=%s', blockId);
+				failed.push(blockId);
+				return;
 			}
 		} finally {
 			this.inFlight.delete(key);

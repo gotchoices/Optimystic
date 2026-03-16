@@ -29,6 +29,12 @@ The matchmaking process differs for active matchers and waiting workers. Active 
 
 For details, see [matchmaking](matchmaking.md).
 
+## Right-is-Right: Validity Disputes & Cascading Consensus
+
+When cluster peers disagree on transaction validity, the transaction is blocked and a dispute escalation begins. Disagreeing members independently recruit the next ring of peers (by FRET distance) to re-execute and vote. If the expanded audience also splits, escalation continues — growing the audience geometrically until one side achieves consensus. The losing side is ejected and the ring segment self-heals. This creates an economic cost curve: honest disagreements resolve cheaply (one escalation round), while coordinated attacks cost more and are eventually outvoted by the wider honest network.
+
+For details, see [Right-is-Right](right-is-right.md).
+
 ## Application Integration
 
 Applications built on Optimystic can leverage the distributed database system to store and manage their data structures. Data is organized into collections that can be queried and modified through distributed transactions. The system ensures consistency across the network while providing scalability through its distributed architecture.

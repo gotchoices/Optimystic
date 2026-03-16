@@ -127,6 +127,9 @@ export class BlockTransferService implements Startable {
 		return { blocks, missing };
 	}
 
+	// TODO: handlePush validates incoming block data but does not persist it.
+	// The pushed data is a serialized IBlock, not a full BlockArchive with revisions.
+	// Persistence should be wired when RebalanceMonitor integrates with BlockStorage.saveRestored().
 	private async handlePush(request: BlockTransferRequest): Promise<BlockTransferResponse> {
 		const blocks: Record<string, string> = {};
 		const missing: string[] = [];
@@ -135,7 +138,7 @@ export class BlockTransferService implements Startable {
 			return { blocks: {}, missing: request.blockIds };
 		}
 
-		// Accept pushed blocks — for each block, check if we already have it (idempotent)
+		// Accept pushed blocks — for each block, validate we received parseable data
 		for (const blockId of request.blockIds) {
 			const data = request.blockData[blockId];
 			if (data) {

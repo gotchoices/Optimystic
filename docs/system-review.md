@@ -108,7 +108,7 @@ If you spot code or design aspects that aren't covered by these tasks, please ad
 - [x] **HUNT-4.1.4**: `network-transactor.ts:344-351` - Non-tail commit failures logged but not propagated - VERIFIED INTENTIONAL: Comment explains design: once tail commits, transaction succeeds. Non-tail blocks reconcile via "reads with context" path. Valid eventual consistency pattern.
 - [ ] **TEST-4.1.1**: Add network partition simulation tests
 - [ ] **TEST-4.1.2**: Add coordinator failover tests
-- [ ] **DOC-4.1.1**: Document network transactor retry semantics
+- [x] **DOC-4.1.1**: Document network transactor retry semantics - DONE: Added Retry Semantics section to `packages/db-core/docs/network.md` covering peer exclusion, commit retry loop with exponential backoff (2s→30s cap, 5 attempts), timeout budgets (30s default, 5s abort, 3s peer query), stale failure handling, and background cancellation.
 
 ### 4.2 Transactor Source (`packages/db-core/src/transactor/`)
 
@@ -127,14 +127,14 @@ If you spot code or design aspects that aren't covered by these tasks, please ad
 - [x] **HUNT-5.1.4**: Review race resolution logic in `resolveRace()` - verify determinism - VERIFIED: Lines 548-561. Deterministic: (1) transaction with more promises wins, (2) tie-breaker uses string comparison of message hash. All nodes reach same conclusion given same inputs.
 - [x] **TEST-5.1.1**: Add cluster member promise/commit phase tests - DONE: 5 tests in `cluster-repo.spec.ts` covering single-node, 3-peer accumulation, rejection handling, consensus execution
 - [x] **TEST-5.1.2**: Add transaction expiration handling tests - DONE: 3 tests in `cluster-repo.spec.ts` covering past, present, future expirations
-- [ ] **DOC-5.1.1**: Document cluster consensus protocol
+- [x] **DOC-5.1.1**: Document cluster consensus protocol - UPDATED: Fixed Phase 2 code example (threshold-based commit, not unanimity), added Dispute Marking section, expanded ClusterRecord interface with new fields (coordinatingBlockIds, suggestedClusterSize, minRequiredSize, disputed, disputeEvidence), fixed Error Types (replaced fabricated classes with actual error conditions), updated Security section to reflect implemented Ed25519 signature verification.
 
 ### 5.2 Cluster Coordinator (`packages/db-p2p/src/repo/cluster-coordinator.ts`)
 
 - [x] **HUNT-5.2.1**: `cluster-coordinator.ts:36` - TODO: "move this into a state management interface so that transaction state can be persisted" - DOCUMENTED: See `tasks/refactoring/2pc-state-persistence.md`
 - [x] **HUNT-5.2.2**: Review `validateSmallCluster()` - currently accepts without validation in fallback - VERIFIED: Lines 253-286. Intentional design - uses FRET for production validation, fallback accepts for dev/testing. Comment at line 279 documents this. Low risk if FRET is properly configured.
 - [x] **HUNT-5.2.3**: Review retry backoff logic - verify exponential backoff is correct - VERIFIED: Lines 38-41, 508. Correct exponential backoff: 2s → 4s → 8s → 16s → 30s (capped). Max 5 attempts. Implementation at line 508 uses `Math.min(existing.intervalMs * retryBackoffFactor, retryMaxIntervalMs)`.
-- [ ] **TEST-5.2.1**: Add cluster coordinator retry tests
+- [x] **TEST-5.2.1**: Add cluster coordinator retry tests - DONE: 5 tests in `cluster-coordinator.spec.ts` covering: all-peers-commit (no retry), simple-majority-with-failure, background retry of failed peers, retry success on peer recovery, exponential backoff on persistent failure.
 - [x] **TEST-5.2.2**: Add super-majority threshold tests - DONE: 2 tests in `cluster-repo.spec.ts` covering 2-node and 4-node cluster thresholds
 
 ### 5.3 Coordinator Repo (`packages/db-p2p/src/repo/coordinator-repo.ts`)
@@ -543,14 +543,14 @@ If you spot code or design aspects that aren't covered by these tasks, please ad
 | 1. Block Storage | 9 | 9 | — |
 | 2. Transaction | 11 | 7 | 3 TEST, 1 DOC |
 | 3. B-tree/Collections | 14 | 10 | 3 TEST, 1 DOC |
-| 4. Network Transactor | 8 | 6 | 1 TEST, 1 DOC |
-| 5. Cluster Consensus | 16 | 12 | 3 TEST, 1 DOC |
+| 4. Network Transactor | 8 | 7 | 1 TEST |
+| 5. Cluster Consensus | 16 | 14 | 2 TEST |
 | 6. Crypto | 6 | 6 | 1 DOC |
 | 7. Quereus Plugin | 12 | 13 | — |
 | 8. Reference Peer | 4 | 2 | 1 TEST, 1 DOC |
 | 9. Architecture | 16 | 12 | 4 DOC |
 | 10. Transactional Theory | 34 | 32 | 2 TEST |
-| **Total** | **130** | **110** | **11 TEST, 9 DOC** |
+| **Total** | **130** | **113** | **10 TEST, 7 DOC** |
 
 **Note**: All HUNT-* (code review) and THEORY-* (transactional theory) tasks are COMPLETE. Remaining tasks are TEST-* (test coverage) and DOC-* (documentation) items.
 

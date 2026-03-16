@@ -94,6 +94,10 @@ This proves that the peers listed in the cluster actually voted — a coordinato
 
 **Important**: cluster authentication is about _identity verification_ (did this peer really vote?), not _authorization_ (is this peer allowed to write?).  Authorization decisions like per-collection permissions belong at a higher layer (e.g. application or collection module), not in the cluster consensus path.
 
+### Validity Disputes & Cascading Consensus
+
+When cluster peers disagree on transaction validity, the transaction is blocked and escalated to progressively wider audiences until one side achieves consensus. The losing side is ejected and the ring segment self-heals. The coordinator is implicitly on the "approve" side (it validated before sending to the cluster), so disagreeing members independently orchestrate the escalation through a deterministically-selected dissent coordinator. See [Right-is-Right](right-is-right.md) for full details.
+
 ## Common Pitfalls
 
 ### 1. Shallow Copy of Transforms
