@@ -162,7 +162,7 @@ If you spot code or design aspects that aren't covered by these tasks, please ad
 - [x] **HUNT-6.1.3**: Review error handling in `verify()` - currently catches all errors and returns false - VERIFIED: Lines 264-266. Standard pattern for signature verification - returning false for any error prevents information leakage about failure reason. Acceptable security practice.
 - [x] **TEST-6.1.1**: Add crypto function edge case tests (empty inputs, max sizes) - DONE: 18 tests in `quereus-plugin-crypto/test/crypto.spec.ts` covering digest (all algorithms, encodings, Uint8Array input, error cases), hashMod (boundary bits 1/53, determinism, invalid range), and randomBytes (byte count, hex output, uniqueness).
 - [x] **TEST-6.1.2**: Add signature verification tests for all supported curves - DONE: 32 tests in `quereus-plugin-crypto/test/crypto.spec.ts` covering sign/verify round-trip for secp256k1/p256/ed25519, corrupted signatures, wrong public key, base64url encoding round-trip, key generation, SignatureValid with convenience methods, batch verification, detailed output, and invalid input handling.
-- [ ] **DOC-6.1.1**: Document supported algorithms and encoding formats
+- [x] **DOC-6.1.1**: Document supported algorithms and encoding formats - DONE: Created `packages/quereus-plugin-crypto/docs/crypto.md` with algorithm reference tables (SHA-256/SHA-512/BLAKE3), curve specifications (secp256k1/p256/ed25519), encoding format details (base64url/base64/hex/utf8/bytes), SQL function signatures with determinism flags, signature format auto-detection, security properties, and dependency listing.
 
 ### 6.2 Signature Validation (`packages/quereus-plugin-crypto/src/signature-valid.ts`)
 
@@ -195,7 +195,7 @@ If you spot code or design aspects that aren't covered by these tasks, please ad
 - [x] **HUNT-7.3.1**: Review `collection-factory.ts` - verify collection lifecycle management - VERIFIED: Lines 26-53 (collection caching is transaction-scoped), lines 77-90 (transactor caching), lines 318-324 (proper shutdown). Lifecycle management is correct.
 - [x] **HUNT-7.3.2**: Review `vtab-connection.ts` - verify virtual table connection handling - VERIFIED: Lines 34-42 handle implicit transactions (begins if not active before commit). Savepoints are no-op (documented). Disconnect rolls back active transaction. Correct implementation.
 - [x] **HUNT-7.3.3**: Review `txn-bridge.ts` - verify transaction bridging is complete - VERIFIED: Two modes (legacy direct sync, transaction mode with distributed consensus). Lines 69-107 (begin), 115-143 (commit), 150-175 (rollback). Both modes properly handled.
-- [ ] **TEST-7.3.1**: Add adapter integration tests
+- [x] **TEST-7.3.1**: Add adapter integration tests - DONE: 41 tests in `adapter-integration.spec.ts` covering CollectionFactory (transactor creation/caching, collection lifecycle, transaction-scoped caching, registerTransactor, clearCache, custom transactor error, URI parsing), TransactionBridge (legacy mode begin/commit/rollback, double-begin SQLite semantics, statement accumulation/clearing, transaction mode detection, cleanup, savepoint errors), VirtualTableConnection via SQL (implicit transactions, explicit BEGIN/COMMIT, ROLLBACK, multi-table transactions, sequential transactions), KeyNetwork registration, and end-to-end plugin lifecycle (CRUD, DROP/re-CREATE). **FINDING**: Dual-entry-point bundling (tsup splitting:false) creates separate module instances for `customRegistry` in key-network.ts — `registerTransactor()` from index.js and CollectionFactory from plugin.js have isolated registries. Factory-level `registerTransactor()` works correctly.
 
 ### 7.4 Schema Management (`packages/quereus-plugin-optimystic/src/schema/`)
 
@@ -545,16 +545,16 @@ If you spot code or design aspects that aren't covered by these tasks, please ad
 | 3. B-tree/Collections | 14 | 10 | 3 TEST, 1 DOC |
 | 4. Network Transactor | 8 | 7 | 1 TEST |
 | 5. Cluster Consensus | 16 | 15 | 1 TEST |
-| 6. Crypto | 6 | 6 | 1 DOC |
-| 7. Quereus Plugin | 14 | 15 | — |
+| 6. Crypto | 6 | 7 | — |
+| 7. Quereus Plugin | 15 | 16 | — |
 | 8. Reference Peer | 4 | 2 | 1 TEST, 1 DOC |
 | 9. Architecture | 16 | 12 | 4 DOC |
 | 10. Transactional Theory | 34 | 32 | 2 TEST |
-| **Total** | **132** | **116** | **7 TEST, 7 DOC** |
+| **Total** | **134** | **118** | **6 TEST, 6 DOC** |
 
 **Note**: All HUNT-* (code review) and THEORY-* (transactional theory) tasks are COMPLETE. Remaining tasks are TEST-* (test coverage) and DOC-* (documentation) items.
 
-**Latest session**: Completed TEST-7.1.1 (16 tests), TEST-7.4.1 (15 tests), TEST-5.3.1 (14 tests). Fixed `OptimysticModule.destroy()` bug (tables not removed from registry on DROP TABLE). Found Quereus virtual table NOT NULL default behavior.
+**Latest session**: Completed TEST-7.3.1 (41 tests in adapter-integration.spec.ts) and DOC-6.1.1 (crypto.md). Found bundling isolation issue with dual-entry-point tsup config creating separate module-scoped registries for `registerTransactor`/`registerKeyNetwork`.
 
 ---
 
