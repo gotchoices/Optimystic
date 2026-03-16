@@ -142,7 +142,7 @@ If you spot code or design aspects that aren't covered by these tasks, please ad
 - [x] **HUNT-5.3.1**: `coordinator-repo.ts:50` - TODO: "Verify that we are a proximate node for all block IDs" - DOCUMENTED: See `tasks/refactoring/proximity-verification.md`
 - [x] **HUNT-5.3.2**: `coordinator-repo.ts:53` - TODO: "Implement read-path cluster verification" - DOCUMENTED: See `tasks/refactoring/proximity-verification.md`
 - [x] **HUNT-5.3.3**: Review `cancel()` - executes cluster transaction per block ID (may be inefficient) - VERIFIED: Lines 81-108. Intentional design - each block ID may have different cluster coordinators. The full message is sent per block which is slightly inefficient but correct. Could optimize by filtering message per block, but low priority.
-- [ ] **TEST-5.3.1**: Add coordinator repo integration tests
+- [x] **TEST-5.3.1**: Add coordinator repo integration tests - DONE: 14 tests in `coordinator-repo-integration.spec.ts` covering cancel operations (fast path + cluster consensus), sequential transactions with revision tracking, multi-block pend/commit/cancel, cluster consensus with local execution tracking, cross-node block discovery via clusterLatestCallback, and failure scenarios (all-peers-fail, commit-phase-fail, commit-after-cancel).
 
 ### 5.4 Storage Repo (`packages/db-p2p/src/storage/storage-repo.ts`)
 
@@ -182,7 +182,7 @@ If you spot code or design aspects that aren't covered by these tasks, please ad
 - [x] **HUNT-7.1.1**: `quereus-engine.ts:15` - Hardcoded version `quereus@0.5.3` - FIXED: Updated to `quereus@0.15.1` with sync note
 - [x] **HUNT-7.1.2**: Review `execute()` - actions collected by coordinator, not returned (verify this is correct) - VERIFIED: Lines 59-87. Intentional design - Quereus virtual table module calls `coordinator.applyActions()` directly during SQL execution. The empty `actions` array in return is correct; transforms are retrieved via `coordinator.getTransforms()`.
 - [x] **HUNT-7.1.3**: Review schema hash caching - verify invalidation on DDL is complete - GAP IDENTIFIED: `invalidateSchemaCache()` exists but is not automatically called on DDL. Should subscribe to `schemaManager.changeNotifier` events (`table_added`, `table_removed`, `table_modified`). Currently requires manual invalidation. Low priority - schema changes are rare in production.
-- [ ] **TEST-7.1.1**: Add Quereus engine execution tests
+- [x] **TEST-7.1.1**: Add Quereus engine execution tests - DONE: 16 tests in `engine-execution.spec.ts` covering execute() with single/multiple/parameterized SQL statements, DELETE operations, empty transactions, error handling (invalid SQL, invalid JSON, non-existent table), partial failure behavior (no rollback across statements), multi-table execution, and idempotency/determinism. **FINDING**: Quereus virtual tables default columns to NOT NULL unless explicitly marked `NULL` — differs from standard SQLite behavior.
 - [x] **TEST-7.1.2**: Add schema hash consistency tests — TESTED: Confirmed cache staleness bug (DDL without invalidateSchemaCache returns stale hash, staleness accumulates). Discovered vtabArgs sensitivity (different tree URIs produce different hashes) and function sensitivity (extra function registration changes hash).
 
 ### 7.2 Quereus Validator (`packages/quereus-plugin-optimystic/src/transaction/quereus-validator.ts`)
@@ -202,7 +202,7 @@ If you spot code or design aspects that aren't covered by these tasks, please ad
 - [x] **HUNT-7.4.1**: Review `schema-manager.ts` - verify schema versioning - GAP IDENTIFIED: No explicit schema versioning. Schema stored/retrieved but no version tracking. Cache could become stale if another node updates schema. Low priority for single-node, important for multi-node.
 - [x] **HUNT-7.4.2**: Review `index-manager.ts` - verify index consistency - VERIFIED: Lines 159-165 correctly handle key changes (delete old, insert new). Index maintenance is correct. TODO at line 207 for proper KeyRange implementation is minor.
 - [x] **HUNT-7.4.3**: Review `row-codec.ts` - verify encoding/decoding round-trip - GAP IDENTIFIED: (1) Line 190: bigint → Number() loses precision for large values. (2) Line 76: Uint8Array encoded as base64 but not decoded back - breaks round-trip for binary data. Should add base64 → Uint8Array conversion in decodeRow().
-- [ ] **TEST-7.4.1**: Add schema migration tests
+- [x] **TEST-7.4.1**: Add schema migration tests - DONE: 15 tests in `schema-migration.spec.ts` covering initial schema creation (catalog, columns, multi-table), DROP TABLE cleanup, schema replacement (DROP + re-CREATE with different columns), schema hash consistency across DDL changes (version tracking, column detection), data preservation, create/drop cycles, table isolation, and schema hash agreement across nodes. **BUG FIXED**: `OptimysticModule.destroy()` was a no-op — didn't remove tables from internal registry, causing `"table already exists"` on re-CREATE after DROP. Fixed by adding `this.tables.delete(tableKey)` to `destroy()`.
 - [x] **TEST-7.4.2**: Add row codec edge case tests - DONE: 22 tests in `quereus-plugin-optimystic/test/row-codec.spec.ts` covering basic round-trip (strings, numbers, nulls, booleans), bigint precision loss bug documentation, Uint8Array round-trip bug documentation, primary key extraction (single/composite), primary key comparator, and schema utilities.
 
 ---
@@ -544,15 +544,17 @@ If you spot code or design aspects that aren't covered by these tasks, please ad
 | 2. Transaction | 11 | 7 | 3 TEST, 1 DOC |
 | 3. B-tree/Collections | 14 | 10 | 3 TEST, 1 DOC |
 | 4. Network Transactor | 8 | 7 | 1 TEST |
-| 5. Cluster Consensus | 16 | 14 | 2 TEST |
+| 5. Cluster Consensus | 16 | 15 | 1 TEST |
 | 6. Crypto | 6 | 6 | 1 DOC |
-| 7. Quereus Plugin | 12 | 13 | — |
+| 7. Quereus Plugin | 14 | 15 | — |
 | 8. Reference Peer | 4 | 2 | 1 TEST, 1 DOC |
 | 9. Architecture | 16 | 12 | 4 DOC |
 | 10. Transactional Theory | 34 | 32 | 2 TEST |
-| **Total** | **130** | **113** | **10 TEST, 7 DOC** |
+| **Total** | **132** | **116** | **7 TEST, 7 DOC** |
 
 **Note**: All HUNT-* (code review) and THEORY-* (transactional theory) tasks are COMPLETE. Remaining tasks are TEST-* (test coverage) and DOC-* (documentation) items.
+
+**Latest session**: Completed TEST-7.1.1 (16 tests), TEST-7.4.1 (15 tests), TEST-5.3.1 (14 tests). Fixed `OptimysticModule.destroy()` bug (tables not removed from registry on DROP TABLE). Found Quereus virtual table NOT NULL default behavior.
 
 ---
 

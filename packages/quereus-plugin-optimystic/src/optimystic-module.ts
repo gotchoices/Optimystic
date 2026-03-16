@@ -1037,7 +1037,8 @@ export class OptimysticModule implements VirtualTableModule<OptimysticVirtualTab
   }
 
   /**
-   * Destroys the underlying persistent representation of the virtual table
+   * Destroys the underlying persistent representation of the virtual table.
+   * Removes the table from the internal registry so the name can be re-used.
    */
   async destroy(
     _db: Database,
@@ -1046,9 +1047,7 @@ export class OptimysticModule implements VirtualTableModule<OptimysticVirtualTab
     schemaName: string,
     tableName: string
   ): Promise<void> {
-    // For now, this is a no-op since we don't have persistent schema storage
-    // In a full implementation, this would clean up any metadata or resources
-    void schemaName;
-    void tableName;
+    const tableKey = `${schemaName}.${tableName}`.toLowerCase();
+    this.tables.delete(tableKey);
   }
 }
