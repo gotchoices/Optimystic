@@ -17,6 +17,8 @@ export type CoordinatorBatch<TPayload, TResponse> = {
 	subsumedBy?: CoordinatorBatch<TPayload, TResponse>[];
 	/** Peers that have already been tried (and failed) */
 	excludedPeers?: PeerId[];
+	/** When a batch coordinates multiple blocks (via cluster intersection), lists all block IDs */
+	coordinatingBlockIds?: BlockId[];
 }
 
 /**

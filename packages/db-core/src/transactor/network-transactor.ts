@@ -273,7 +273,7 @@ export class NetworkTransactor implements ITransactor {
 				blockId: consolidatedBlocks[0]!,
 				coordinatingBlockIds: consolidatedBlocks,
 				excludedPeers: []
-			} as any);
+			});
 		}
 
 		return batches;
@@ -293,7 +293,7 @@ export class NetworkTransactor implements ITransactor {
 		if (verbose) {
 			const batchSummary = batches.map(b => ({
 				peer: b.peerId.toString().substring(0, 12),
-				blocks: (b as any).coordinatingBlockIds ?? [b.blockId],
+				blocks: b.coordinatingBlockIds ?? [b.blockId],
 				inserts: Object.keys(b.payload.inserts ?? {}).length,
 				updates: Object.keys(b.payload.updates ?? {}).length,
 				deletes: b.payload.deletes?.length ?? 0
@@ -311,7 +311,7 @@ export class NetworkTransactor implements ITransactor {
 					{ ...blockAction, transforms: batch.payload },
 					{
 						expiration,
-						coordinatingBlockIds: (batch as any).coordinatingBlockIds
+						coordinatingBlockIds: batch.coordinatingBlockIds
 					} as any
 				),
 				batch => blockIdsForTransforms(batch.payload),
