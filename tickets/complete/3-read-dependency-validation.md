@@ -1,0 +1,58 @@
+# Read Dependency Validation — Complete
+
+description: Read dependency capture and validation for optimistic concurrency control, preventing write-skew anomalies
+dependencies: None
+files:
+  - packages/db-core/src/transactor/transactor-source.ts
+  - packages/db-core/src/collection/collection.ts
+  - packages/db-core/src/transaction/coordinator.ts
+  - packages/db-core/src/transaction/session.ts
+  - packages/db-core/src/transaction/validator.ts
+  - packages/db-core/src/transaction/index.ts
+  - packages/db-core/src/transaction/transaction.ts
+  - packages/quereus-plugin-optimystic/src/transaction/quereus-validator.ts
+  - packages/db-core/test/transaction.spec.ts
+----
+
+## What Was Built
+
+Read dependency capture and validation across the transaction lifecycle to prevent write-skew anomalies in optimistic concurrency control.
+
+**Data flow**: `TransactorSource.tryGet()` records `{ blockId, revision }` on every block access → `Collection` delegates → `TransactionCoordinator` aggregates across collections → `TransactionSession.commit()` collects reads into the `Transaction` → `TransactionValidator` checks each read dependency against current block state before allowing re-execution.
+
+**Key types**:
+- `ReadDependency` (`transaction.ts`): `{ blockId, revision }` — single source of truth
+- `BlockStateProvider` (`validator.ts`): `(blockId) => Promise<BlockActionState | undefined>` — injectable lookup function
+- `Transaction.reads` field includes read deps in the transaction hash for identity
+
+## Key Design Decisions
+
+- Read deps recorded at `TransactorSource.tryGet()` level, meaning ALL block reads (including internal structural blocks like log chain nodes) are captured. This is maximally correct but potentially over-conservative for conflict detection.
+- `CacheSource` naturally deduplicates — only the first read of a block reaches `TransactorSource`.
+- `BlockStateProvider` is optional in `TransactionValidator` constructor — when absent, read validation is skipped (backward compatible).
+- Non-existent blocks record `revision: 0`, detected as stale if the block is subsequently created.
+
+## Testing
+
+All 261 tests pass. 5 read-dependency-specific test cases in `packages/db-core/test/transaction.spec.ts`:
+
+- **Write-skew detection**: tx-b's read of blockA at rev 1 becomes stale after tx-a commits rev 2 → validator rejects
+- **Reads unchanged**: block still at expected revision → passes
+- **Non-existent block created**: read at rev 0, block now rev 1 → stale detected
+- **No reads (backward compat)**: empty reads array → passes regardless
+- **Raw transactor write-skew preserved**: confirms the known limitation at pend/commit level (validator layer is what catches it)
+
+## Usage
+
+```typescript
+// Validator with read dependency checking
+const blockStateProvider: BlockStateProvider = async (blockId) => {
+  const result = await transactor.get({ blockIds: [blockId] });
+  return result[blockId]?.state;
+};
+
+const validator = new TransactionValidator(engines, coordinatorFactory, blockStateProvider);
+
+// Quereus validator
+const validator = createQuereusValidator({ db, coordinator, blockStateProvider });
+```
