@@ -620,6 +620,7 @@ Errors are thrown as plain `Error` instances with descriptive messages. Key erro
 
 - **Forgery Detection**: Message hash is validated against message content; mismatches are rejected
 - **Byzantine Tolerance**: Super-majority threshold (default 75%) means both halves of a 50/50 partition cannot commit; up to 25% Byzantine nodes are tolerated
+- **Equivocation Detection**: `detectEquivocation()` in `mergeRecords()` compares existing vs incoming vote types for each peer. If a peer changes their vote (approve↔reject) for the same transaction, the first-seen signature is preserved and a `PenaltyReason.Equivocation` penalty (weight 100) is applied. A single equivocation exceeds the default ban threshold (80), resulting in immediate peer exclusion. Same-type re-delivery (retransmission) is not flagged.
 - **Timeout / DoS**: Transaction expiration and cleanup intervals (60s queue, 1s process) prevent resource exhaustion from stale transactions
 - **Reputation**: Failed peers are reported via `IPeerReputation` with `PenaltyReason.ConsensusTimeout`
 

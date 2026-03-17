@@ -399,15 +399,14 @@ If you spot code or design aspects that aren't covered by these tasks, please ad
   - Validators re-execute: `TransactionValidator.validate()` re-runs SQL, computes own hash, compares.
   - SHA-256 is collision-resistant (birthday bound ~2^128). Hash forging is computationally infeasible.
   - Mitigation: Validators re-execute and compare, so forged hash would fail validation.
-- [x] **THEORY-10.4.3**: Review equivocation prevention - VERIFIED with GAPS:
+- [x] **THEORY-10.4.3**: Review equivocation prevention - VERIFIED:
   - Promise structure: `Signature` type has `type: 'approve' | 'reject'` and `signature` string.
   - Promise hash: `computePromiseHash()` includes messageHash + message (SHA-256).
   - Commit hash: `computeCommitHash()` includes messageHash + message + promises.
-  - GAP: `verifySignature()` is a stub returning `true` - no actual signature verification.
-  - GAP: No equivocation detection mechanism. Byzantine node could promise to multiple conflicting transactions.
-  - Mitigation: Super-majority (75%) makes equivocation harder to exploit.
-  - NOTE: Signature verification implementation would enable equivocation detection via conflicting signed promises.
-- [x] **TEST-10.4.1**: Add Byzantine fault injection tests - DONE: 19 tests in `byzantine-fault-injection.spec.ts` covering forged signature attacks (impersonation, post-promise forgery, random bytes), message hash tampering, equivocation attacks (KNOWN LIMITATION: last-write-wins on promise merging enables undetected equivocation without signature comparison), Byzantine minority threshold tests (1-of-5 cannot block, 2-of-5 blocks), cumulative reputation penalties (3 forged signatures → ban), public key attacks (missing, wrong key), mesh-level Byzantine scenarios (unreachable nodes, majority failure, partition recovery), signature type mismatch attacks, and edge-case signatures (empty, truncated).
+  - `verifySignature()` uses Ed25519 via `publicKeyFromRaw()` + `pubKey.verify()` (implemented in signature-verification ticket).
+  - Equivocation detection: `detectEquivocation()` in `ClusterMember.mergeRecords()` compares existing vs incoming vote types. Type changes (approve↔reject) trigger `PenaltyReason.Equivocation` (weight 100, exceeds ban threshold 80). First-seen signature is preserved.
+  - Super-majority (75%) further limits equivocation impact.
+- [x] **TEST-10.4.1**: Add Byzantine fault injection tests - DONE: 22 tests in `byzantine-fault-injection.spec.ts` covering forged signature attacks (impersonation, post-promise forgery, random bytes), message hash tampering, equivocation attacks (promise equivocation detected, commit equivocation detected, equivocation triggers ban, no false positive on re-delivery), Byzantine minority threshold tests (1-of-5 cannot block, 2-of-5 blocks), cumulative reputation penalties (3 forged signatures → ban), public key attacks (missing, wrong key), mesh-level Byzantine scenarios (unreachable nodes, majority failure, partition recovery), signature type mismatch attacks, and edge-case signatures (empty, truncated).
 
 ### 10.5 Optimistic Concurrency Control
 
@@ -554,7 +553,7 @@ If you spot code or design aspects that aren't covered by these tasks, please ad
 
 **Note**: All HUNT-* (code review) and THEORY-* (transactional theory) tasks are COMPLETE. Remaining tasks are TEST-* (test coverage) and DOC-* (documentation) items.
 
-**Latest session**: Completed TEST-6.2.1 (17 tests in signature-validation-integration.spec.ts) and TEST-10.4.1 (19 tests in byzantine-fault-injection.spec.ts). Confirmed libp2p Ed25519 ↔ @noble/curves cross-library compatibility. Documented equivocation gap: last-write-wins promise merging enables undetected equivocation without explicit signature comparison.
+**Latest session**: Completed TEST-6.2.1 (17 tests in signature-validation-integration.spec.ts) and TEST-10.4.1 (22 tests in byzantine-fault-injection.spec.ts). Confirmed libp2p Ed25519 ↔ @noble/curves cross-library compatibility. Equivocation detection implemented: `detectEquivocation()` in `ClusterMember` detects vote-type changes and applies `PenaltyReason.Equivocation` (weight 100, triggers ban).
 
 ---
 
