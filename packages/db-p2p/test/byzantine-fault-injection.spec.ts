@@ -340,12 +340,14 @@ describe('Byzantine Fault Injection (TEST-10.4.1)', () => {
 			const byzantine = await makeKeyPair();
 			const byzantineId = byzantine.peerId.toString();
 			const peers = makeClusterPeers([honest, byzantine]);
+			const reputation = new PeerReputationService();
 
 			const member = clusterMember({
 				storageRepo: mockRepo,
 				peerNetwork: mockNetwork,
 				peerId: honest.peerId,
-				privateKey: honest.privateKey
+				privateKey: honest.privateKey,
+				reputation
 			});
 
 			const record = await createClusterRecord(peers, makeGetOperation(['block-1']));
@@ -358,21 +360,149 @@ describe('Byzantine Fault Injection (TEST-10.4.1)', () => {
 			};
 			const result1 = await member.update(withApprove);
 
-			// Second: Byzantine tries to change their promise to reject (different record)
+			// Second: Byzantine tries to change their promise to reject
 			const rejectPromise = await makeSignedPromise(byzantine.privateKey, record, 'reject', 'changed-mind');
 			const withReject: ClusterRecord = {
 				...record,
 				promises: { [byzantineId]: rejectPromise }
 			};
-
-			// The merge should accept the incoming (last-write-wins on signatures)
-			// but the signature for 'reject' has a different payload than 'approve'
-			// so both are cryptographically valid — the system doesn't detect this equivocation
-			// (KNOWN LIMITATION: no equivocation detection without signature comparison)
 			const result2 = await member.update(withReject);
 
-			// Document the equivocation gap: the latest promise overwrites the first
-			expect(result2.promises[byzantineId]!.type).to.equal('reject');
+			// Equivocation detected: original 'approve' promise is preserved
+			expect(result2.promises[byzantineId]!.type).to.equal('approve');
+			// Penalty was applied
+			const summary = reputation.getReputation(byzantineId);
+			expect(summary.penaltyCount).to.equal(1);
+		});
+
+		it('Byzantine peer cannot commit approve and reject for the same transaction', async () => {
+			// Use 5 peers so the transaction stays in Promising phase (persisted)
+			// after the first update — unanimity requires all 5 promises before commit phase
+			const honest = await makeKeyPair();
+			const byzantine = await makeKeyPair();
+			const peer3 = await makeKeyPair();
+			const peer4 = await makeKeyPair();
+			const peer5 = await makeKeyPair();
+			const byzantineId = byzantine.peerId.toString();
+			const peers = makeClusterPeers([honest, byzantine, peer3, peer4, peer5]);
+			const reputation = new PeerReputationService();
+
+			const member = clusterMember({
+				storageRepo: mockRepo,
+				peerNetwork: mockNetwork,
+				peerId: honest.peerId,
+				privateKey: honest.privateKey,
+				reputation
+			});
+
+			const record = await createClusterRecord(peers, makeGetOperation(['block-1']));
+
+			// Only 3 of 5 peers have promised — still in Promising phase, state will persist
+			const ourPromise = await makeSignedPromise(honest.privateKey, record);
+			const byzantinePromise = await makeSignedPromise(byzantine.privateKey, record);
+			const peer3Promise = await makeSignedPromise(peer3.privateKey, record);
+			const partialPromises = {
+				[honest.peerId.toString()]: ourPromise,
+				[byzantineId]: byzantinePromise,
+				[peer3.peerId.toString()]: peer3Promise
+			};
+
+			// Byzantine sends approve commit (signed over partial promises)
+			const recordWithPartialPromises: ClusterRecord = { ...record, promises: partialPromises };
+			const approveCommit = await makeSignedCommit(byzantine.privateKey, recordWithPartialPromises);
+
+			// Update 1: 3/5 promises + byzantine approve commit → Promising phase, state persisted
+			const withApproveCommit: ClusterRecord = {
+				...record,
+				promises: partialPromises,
+				commits: { [byzantineId]: approveCommit }
+			};
+			await member.update(withApproveCommit);
+
+			// Update 2: same promises but byzantine now sends reject commit
+			const rejectCommit = await makeSignedCommit(byzantine.privateKey, recordWithPartialPromises, 'reject');
+			const withRejectCommit: ClusterRecord = {
+				...record,
+				promises: partialPromises,
+				commits: { [byzantineId]: rejectCommit }
+			};
+			const result = await member.update(withRejectCommit);
+
+			// Original approve commit is preserved (first-seen wins)
+			expect(result.commits[byzantineId]!.type).to.equal('approve');
+			// Equivocation penalty applied
+			const summary = reputation.getReputation(byzantineId);
+			expect(summary.penaltyCount).to.equal(1);
+		});
+
+		it('equivocation triggers ban (weight 100 exceeds ban threshold 80)', async () => {
+			const honest = await makeKeyPair();
+			const byzantine = await makeKeyPair();
+			const byzantineId = byzantine.peerId.toString();
+			const peers = makeClusterPeers([honest, byzantine]);
+			const reputation = new PeerReputationService();
+
+			const member = clusterMember({
+				storageRepo: mockRepo,
+				peerNetwork: mockNetwork,
+				peerId: honest.peerId,
+				privateKey: honest.privateKey,
+				reputation
+			});
+
+			const record = await createClusterRecord(peers, makeGetOperation(['block-1']));
+
+			// Byzantine peer sends approve then reject
+			const approvePromise = await makeSignedPromise(byzantine.privateKey, record, 'approve');
+			const withApprove: ClusterRecord = {
+				...record,
+				promises: { [byzantineId]: approvePromise }
+			};
+			await member.update(withApprove);
+
+			const rejectPromise = await makeSignedPromise(byzantine.privateKey, record, 'reject', 'flip');
+			const withReject: ClusterRecord = {
+				...record,
+				promises: { [byzantineId]: rejectPromise }
+			};
+			await member.update(withReject);
+
+			// Single equivocation (weight 100) exceeds ban threshold (80)
+			expect(reputation.isBanned(byzantineId)).to.equal(true);
+		});
+
+		it('no false positive on identical re-delivery of same promise', async () => {
+			const honest = await makeKeyPair();
+			const other = await makeKeyPair();
+			const otherId = other.peerId.toString();
+			const peers = makeClusterPeers([honest, other]);
+			const reputation = new PeerReputationService();
+
+			const member = clusterMember({
+				storageRepo: mockRepo,
+				peerNetwork: mockNetwork,
+				peerId: honest.peerId,
+				privateKey: honest.privateKey,
+				reputation
+			});
+
+			const record = await createClusterRecord(peers, makeGetOperation(['block-1']));
+
+			// Peer sends approve promise
+			const approvePromise = await makeSignedPromise(other.privateKey, record, 'approve');
+			const withPromise: ClusterRecord = {
+				...record,
+				promises: { [otherId]: approvePromise }
+			};
+			await member.update(withPromise);
+
+			// Same promise re-delivered (e.g., network retransmission)
+			await member.update(withPromise);
+
+			// No penalty — same type, not equivocation
+			const summary = reputation.getReputation(otherId);
+			expect(summary.penaltyCount).to.equal(0);
+			// Promise is preserved correctly
 		});
 	});
 

@@ -306,7 +306,8 @@ export class ClusterMember implements ICluster {
 	}
 
 	/**
-	 * Merges two records, validating that non-signature fields match
+	 * Merges two records, validating that non-signature fields match.
+	 * Detects equivocation (same peer changing vote type) and applies penalties.
 	 */
 	private async mergeRecords(existing: ClusterRecord, incoming: ClusterRecord): Promise<ClusterRecord> {
 		log('cluster-member:merge-records', {
@@ -327,12 +328,62 @@ export class ClusterMember implements ICluster {
 			throw new Error('Peers mismatch');
 		}
 
-		// Merge signatures, keeping the most recent valid ones
+		// Merge signatures with equivocation detection
+		const mergedPromises = this.detectEquivocation(
+			existing.promises, incoming.promises, 'promise', existing.messageHash
+		);
+		const mergedCommits = this.detectEquivocation(
+			existing.commits, incoming.commits, 'commit', existing.messageHash
+		);
+
 		return {
 			...existing,
-			promises: { ...existing.promises, ...incoming.promises },
-			commits: { ...existing.commits, ...incoming.commits }
+			promises: mergedPromises,
+			commits: mergedCommits
 		};
+	}
+
+	/**
+	 * Compares existing vs incoming signatures for the same peers.
+	 * If a peer's vote type changed (approve↔reject), that's equivocation:
+	 * report a penalty and keep the first-seen signature.
+	 * New peers are accepted normally.
+	 */
+	private detectEquivocation(
+		existing: Record<string, Signature>,
+		incoming: Record<string, Signature>,
+		phase: 'promise' | 'commit',
+		messageHash: string
+	): Record<string, Signature> {
+		const merged = { ...existing };
+
+		for (const [peerId, incomingSig] of Object.entries(incoming)) {
+			const existingSig = existing[peerId];
+			if (existingSig) {
+				if (existingSig.type !== incomingSig.type) {
+					// Equivocation detected: peer changed their vote type
+					log('cluster-member:equivocation-detected', {
+						peerId,
+						phase,
+						messageHash,
+						existingType: existingSig.type,
+						incomingType: incomingSig.type
+					});
+					this.reputation?.reportPeer(
+						peerId,
+						PenaltyReason.Equivocation,
+						`${phase}:${messageHash}:${existingSig.type}->${incomingSig.type}`
+					);
+					// Keep first-seen signature — do not let the peer flip their vote
+				}
+				// Same type: keep existing (no-op, already in merged)
+			} else {
+				// New peer — accept normally
+				merged[peerId] = incomingSig;
+			}
+		}
+
+		return merged;
 	}
 
 	private async validateRecord(record: ClusterRecord): Promise<void> {
