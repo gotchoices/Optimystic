@@ -2,35 +2,13 @@ import type { Libp2p } from '@libp2p/interface';
 import type { IKeyNetwork } from '@optimystic/db-core';
 import { Libp2pKeyPeerNetwork } from '@optimystic/db-p2p';
 import { createLibp2pNode } from '@optimystic/db-p2p';
-import type { LibP2PNodeOptions, CustomImplementationRegistry } from '../types.js';
+import type { LibP2PNodeOptions } from '../types.js';
 
 /**
- * Global registry for custom implementations
- */
-const customRegistry: CustomImplementationRegistry = {
-  transactors: new Map(),
-  keyNetworks: new Map(),
-};
-
-/**
- * Register a custom key network implementation
- */
-export function registerKeyNetwork(name: string, implementation: new (...args: any[]) => IKeyNetwork): void {
-  customRegistry.keyNetworks.set(name, implementation);
-}
-
-/**
- * Register a custom transactor implementation
- */
-export function registerTransactor(name: string, implementation: new (...args: any[]) => any): void {
-  customRegistry.transactors.set(name, implementation);
-}
-
-/**
- * Create a key network instance based on configuration
+ * Create a key network instance based on configuration (built-in types only)
  */
 export async function createKeyNetwork(
-  type: 'libp2p' | 'test' | string,
+  type: 'libp2p' | 'test',
   libp2p?: Libp2p,
   libp2pOptions?: LibP2PNodeOptions
 ): Promise<IKeyNetwork> {
@@ -40,9 +18,6 @@ export async function createKeyNetwork(
 
     case 'test':
       return await createTestKeyNetwork();
-
-    default:
-      return await createCustomKeyNetwork(type);
   }
 }
 
@@ -86,21 +61,3 @@ async function createTestKeyNetwork(): Promise<IKeyNetwork> {
   };
 }
 
-/**
- * Create a custom key network implementation
- */
-async function createCustomKeyNetwork(name: string): Promise<IKeyNetwork> {
-  const CustomKeyNetwork = customRegistry.keyNetworks.get(name);
-  if (!CustomKeyNetwork) {
-    throw new Error(`Custom key network '${name}' not found. Register it first using registerKeyNetwork().`);
-  }
-
-  return new CustomKeyNetwork();
-}
-
-/**
- * Get the custom implementation registry (for testing/debugging)
- */
-export function getCustomRegistry(): CustomImplementationRegistry {
-  return customRegistry;
-}

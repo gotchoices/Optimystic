@@ -1,4 +1,4 @@
-import type { ITransactor, CollectionId, PeerId, IRepo } from '@optimystic/db-core';
+import type { ITransactor, IKeyNetwork, CollectionId, PeerId, IRepo } from '@optimystic/db-core';
 import { Tree, NetworkTransactor } from '@optimystic/db-core';
 import {
 	createLibp2pNode,
@@ -9,7 +9,6 @@ import {
 	MemoryRawStorage,
 } from '@optimystic/db-p2p';
 import type { RowData, ParsedOptimysticOptions, TransactionState } from '../types.js';
-import { getCustomRegistry } from './key-network.js';
 import type { Libp2p } from '@libp2p/interface';
 
 /**
@@ -18,6 +17,8 @@ import type { Libp2p } from '@libp2p/interface';
 export class CollectionFactory {
   private transactors = new Map<string, ITransactor>();
   private libp2pNodes = new Map<string, { node: Libp2p; coordinatedRepo: IRepo }>();
+  private customTransactorCtors = new Map<string, new (...args: any[]) => ITransactor>();
+  private customKeyNetworkCtors = new Map<string, new (...args: any[]) => IKeyNetwork>();
 
   /**
    * Create or get a tree collection
@@ -131,7 +132,7 @@ export class CollectionFactory {
 
     const { node, coordinatedRepo } = nodeInfo;
 
-    const keyNetwork = new Libp2pKeyPeerNetwork(node);
+    const keyNetwork = this.resolveKeyNetwork(options.keyNetwork, node);
     const protocolPrefix = `/optimystic/${options.libp2pOptions?.networkName ?? 'optimystic'}`;
 
     const getRepo = (peerId: PeerId): IRepo => {
@@ -210,14 +211,35 @@ export class CollectionFactory {
    * Create a custom transactor
    */
   private async createCustomTransactor(name: string): Promise<ITransactor> {
-    const registry = getCustomRegistry();
-
-    const CustomTransactor = registry.transactors.get(name);
+    const CustomTransactor = this.customTransactorCtors.get(name);
     if (!CustomTransactor) {
-      throw new Error(`Custom transactor '${name}' not found. Register it first using registerTransactor().`);
+      throw new Error(
+        `Custom transactor '${name}' not found. Register it first using collectionFactory.registerCustomTransactor().`
+      );
     }
 
     return new CustomTransactor();
+  }
+
+  /**
+   * Resolve a key network by type, using built-in or custom implementations.
+   * Returns Libp2pKeyPeerNetwork (which implements both IKeyNetwork and IPeerNetwork)
+   * for the built-in 'libp2p' type. Custom implementations must also satisfy both interfaces.
+   */
+  private resolveKeyNetwork(type: string, libp2pNode: Libp2p): Libp2pKeyPeerNetwork {
+    switch (type) {
+      case 'libp2p':
+        return new Libp2pKeyPeerNetwork(libp2pNode);
+      default: {
+        const CustomKeyNetwork = this.customKeyNetworkCtors.get(type);
+        if (!CustomKeyNetwork) {
+          throw new Error(
+            `Custom key network '${type}' not found. Register it first using collectionFactory.registerCustomKeyNetwork().`
+          );
+        }
+        return new CustomKeyNetwork() as unknown as Libp2pKeyPeerNetwork;
+      }
+    }
   }
 
   /**
@@ -285,6 +307,22 @@ export class CollectionFactory {
    */
   registerTransactor(key: string, transactor: ITransactor): void {
     this.transactors.set(key, transactor);
+  }
+
+  /**
+   * Register a custom transactor class by name.
+   * When `options.transactor` matches `name`, the factory will instantiate this class.
+   */
+  registerCustomTransactor(name: string, ctor: new (...args: any[]) => ITransactor): void {
+    this.customTransactorCtors.set(name, ctor);
+  }
+
+  /**
+   * Register a custom key network class by name.
+   * When `options.keyNetwork` matches `name`, the factory will instantiate this class.
+   */
+  registerCustomKeyNetwork(name: string, ctor: new (...args: any[]) => IKeyNetwork): void {
+    this.customKeyNetworkCtors.set(name, ctor);
   }
 
   /**

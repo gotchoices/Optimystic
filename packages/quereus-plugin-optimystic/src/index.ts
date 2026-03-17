@@ -15,9 +15,6 @@
 // Re-export the plugin register function
 export { default as register } from './plugin.js';
 
-// Export utility functions for custom implementations
-export { registerKeyNetwork, registerTransactor } from './optimystic-adapter/key-network.js';
-
 // Export virtual table classes
 export { OptimysticModule, OptimysticVirtualTable } from './optimystic-module.js';
 

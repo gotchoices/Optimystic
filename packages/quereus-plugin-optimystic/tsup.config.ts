@@ -12,6 +12,6 @@ export default defineConfig({
   target: 'node16',
   external: ['quereus', '@optimystic/db-core', '@optimystic/db-p2p'],
   treeshake: true,
-  splitting: false,
+  splitting: true,
   minify: false,
 });

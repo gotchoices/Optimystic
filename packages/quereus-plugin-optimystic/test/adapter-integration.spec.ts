@@ -13,7 +13,6 @@ import { expect } from 'chai';
 import { Database } from '@quereus/quereus';
 import type { SqlValue } from '@quereus/quereus';
 import register from '../dist/plugin.js';
-import { registerKeyNetwork, registerTransactor } from '../dist/index.js';
 import type { TransactionState } from '../dist/index.js';
 
 type Row = Record<string, SqlValue>;
@@ -634,27 +633,49 @@ describe('VirtualTableConnection via SQL (TEST-7.3.1)', () => {
 // Key Network Registration
 // ─────────────────────────────────────────────────────
 
-describe('Key Network Registration (TEST-7.3.1)', () => {
-	it('should register a custom key network implementation', () => {
+describe('Custom Registration via Factory (TEST-7.3.1)', () => {
+	it('should register and instantiate a custom transactor class via factory', async () => {
+		const { plugin } = createTestEnv();
+		const factory = plugin.collectionFactory;
+
+		let instantiated = false;
+
+		class TestTransactor {
+			constructor() { instantiated = true; }
+			async get() { return []; }
+			async getStatus() { throw new Error('not impl'); }
+			async pend() { return {}; }
+			async commit() { return {}; }
+			async cancel() { }
+		}
+
+		factory.registerCustomTransactor('test-custom-tx', TestTransactor as any);
+
+		const options = {
+			collectionUri: 'tree://test/custom-tx',
+			transactor: 'test-custom-tx',
+			keyNetwork: 'test' as const,
+			libp2pOptions: {},
+			cache: false,
+			encoding: 'json' as const,
+		};
+
+		const transactor = await factory.getOrCreateTransactor(options);
+		expect(transactor).to.be.instanceOf(TestTransactor);
+		expect(instantiated).to.be.true;
+	});
+
+	it('should register a custom key network class via factory', () => {
+		const { plugin } = createTestEnv();
+		const factory = plugin.collectionFactory;
+
 		class TestKeyNetwork {
 			async findCoordinator() { return null; }
 			async findCluster() { return []; }
 		}
 
 		// Should not throw
-		registerKeyNetwork('test-custom-kn', TestKeyNetwork as any);
-	});
-
-	it('should register a custom transactor implementation', () => {
-		class TestTransactor {
-			async get() { return []; }
-			async pend() { return {}; }
-			async commit() { return {}; }
-			async cancel() { }
-		}
-
-		// Should not throw
-		registerTransactor('test-custom-tx', TestTransactor as any);
+		factory.registerCustomKeyNetwork('test-custom-kn', TestKeyNetwork as any);
 	});
 
 	it('should use factory-registered transactor instance for custom transactor key', async () => {
@@ -669,7 +690,7 @@ describe('Key Network Registration (TEST-7.3.1)', () => {
 			cancel: async () => { },
 		} as any;
 
-		// Register via factory instance method (bypasses global registry bundling issue)
+		// Register via factory instance method
 		// The transactor key format is `${transactor}:${keyNetwork}`
 		factory.registerTransactor('my-custom:test', mockTransactor);
 
@@ -684,6 +705,28 @@ describe('Key Network Registration (TEST-7.3.1)', () => {
 
 		const transactor = await factory.getOrCreateTransactor(options);
 		expect(transactor).to.equal(mockTransactor);
+	});
+
+	it('should throw with helpful message for unregistered custom transactor', async () => {
+		const { plugin } = createTestEnv();
+		const factory = plugin.collectionFactory;
+
+		const options = {
+			collectionUri: 'tree://test/unknown',
+			transactor: 'unknown-tx',
+			keyNetwork: 'test' as const,
+			libp2pOptions: {},
+			cache: false,
+			encoding: 'json' as const,
+		};
+
+		try {
+			await factory.getOrCreateTransactor(options);
+			expect.fail('Should have thrown');
+		} catch (e: any) {
+			expect(e.message).to.include('unknown-tx');
+			expect(e.message).to.include('registerCustomTransactor');
+		}
 	});
 });
 

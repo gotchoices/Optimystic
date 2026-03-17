@@ -1,5 +1,5 @@
 import type { Libp2p } from '@libp2p/interface';
-import type { IKeyNetwork, ITransactor } from '@optimystic/db-core';
+import type { ITransactor } from '@optimystic/db-core';
 
 /**
  * Configuration for the optimystic virtual table
@@ -52,14 +52,6 @@ export interface ParsedOptimysticOptions {
   libp2pOptions: LibP2PNodeOptions;
   cache: boolean;
   encoding: 'json' | 'msgpack';
-}
-
-/**
- * Registry for custom transactor and key network implementations
- */
-export interface CustomImplementationRegistry {
-  transactors: Map<string, new (...args: any[]) => ITransactor>;
-  keyNetworks: Map<string, new (...args: any[]) => IKeyNetwork>;
 }
 
 /**
