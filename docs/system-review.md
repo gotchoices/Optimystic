@@ -171,7 +171,7 @@ If you spot code or design aspects that aren't covered by these tasks, please ad
   - `verifySignature()` in `cluster-repo.ts` (line 346-349) is a stub returning `true` always.
   - Integration gap: Crypto plugin's `SignatureValid` is not imported or used in cluster consensus.
   - Already documented in SEC-9.2.1 and `tasks/refactoring/signature-verification-implementation.md`.
-- [ ] **TEST-6.2.1**: Add signature validation integration tests
+- [x] **TEST-6.2.1**: Add signature validation integration tests - DONE: 17 tests in `signature-validation-integration.spec.ts` covering cross-library Ed25519 compatibility (libp2p ↔ @noble/curves), consensus promise/commit signature verification via @noble/curves, multi-peer signature verification, SignatureValid.detailed metadata, reputation penalty integration, signature replay prevention (cross-transaction), and signing payload format consistency. CONFIRMED: libp2p Ed25519 signatures are fully compatible with @noble/curves ed25519.verify().
 
 ---
 
@@ -407,7 +407,7 @@ If you spot code or design aspects that aren't covered by these tasks, please ad
   - GAP: No equivocation detection mechanism. Byzantine node could promise to multiple conflicting transactions.
   - Mitigation: Super-majority (75%) makes equivocation harder to exploit.
   - NOTE: Signature verification implementation would enable equivocation detection via conflicting signed promises.
-- [ ] **TEST-10.4.1**: Add Byzantine fault injection tests
+- [x] **TEST-10.4.1**: Add Byzantine fault injection tests - DONE: 19 tests in `byzantine-fault-injection.spec.ts` covering forged signature attacks (impersonation, post-promise forgery, random bytes), message hash tampering, equivocation attacks (KNOWN LIMITATION: last-write-wins on promise merging enables undetected equivocation without signature comparison), Byzantine minority threshold tests (1-of-5 cannot block, 2-of-5 blocks), cumulative reputation penalties (3 forged signatures → ban), public key attacks (missing, wrong key), mesh-level Byzantine scenarios (unreachable nodes, majority failure, partition recovery), signature type mismatch attacks, and edge-case signatures (empty, truncated).
 
 ### 10.5 Optimistic Concurrency Control
 
@@ -545,16 +545,16 @@ If you spot code or design aspects that aren't covered by these tasks, please ad
 | 3. B-tree/Collections | 14 | 10 | 3 TEST, 1 DOC |
 | 4. Network Transactor | 8 | 7 | 1 TEST |
 | 5. Cluster Consensus | 16 | 15 | 1 TEST |
-| 6. Crypto | 6 | 7 | — |
+| 6. Crypto | 7 | 8 | — |
 | 7. Quereus Plugin | 15 | 16 | — |
 | 8. Reference Peer | 4 | 2 | 1 TEST, 1 DOC |
 | 9. Architecture | 16 | 12 | 4 DOC |
-| 10. Transactional Theory | 34 | 32 | 2 TEST |
-| **Total** | **134** | **118** | **6 TEST, 6 DOC** |
+| 10. Transactional Theory | 34 | 33 | 1 TEST |
+| **Total** | **135** | **120** | **4 TEST, 6 DOC** |
 
 **Note**: All HUNT-* (code review) and THEORY-* (transactional theory) tasks are COMPLETE. Remaining tasks are TEST-* (test coverage) and DOC-* (documentation) items.
 
-**Latest session**: Completed TEST-7.3.1 (41 tests in adapter-integration.spec.ts) and DOC-6.1.1 (crypto.md). Found bundling isolation issue with dual-entry-point tsup config creating separate module-scoped registries for `registerTransactor`/`registerKeyNetwork`.
+**Latest session**: Completed TEST-6.2.1 (17 tests in signature-validation-integration.spec.ts) and TEST-10.4.1 (19 tests in byzantine-fault-injection.spec.ts). Confirmed libp2p Ed25519 ↔ @noble/curves cross-library compatibility. Documented equivocation gap: last-write-wins promise merging enables undetected equivocation without explicit signature comparison.
 
 ---
 

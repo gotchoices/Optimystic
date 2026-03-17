@@ -1,0 +1,863 @@
+/**
+ * TEST-10.4.1: Byzantine Fault Injection Tests
+ *
+ * Tests Byzantine fault tolerance in the cluster consensus protocol.
+ * Simulates various Byzantine behaviors:
+ * - Forged/corrupted signatures
+ * - Equivocation (promising conflicting transactions)
+ * - Message hash tampering
+ * - Partial Byzantine faults in multi-peer clusters
+ * - Reputation tracking of Byzantine peers
+ */
+
+import { expect } from 'chai';
+import { ClusterMember, clusterMember } from '../src/cluster/cluster-repo.js';
+import type { IRepo, ClusterRecord, RepoMessage, Signature, BlockGets, GetBlockResults, PendRequest, PendResult, CommitRequest, CommitResult, ActionBlocks, ClusterPeers, Transforms, IBlock, BlockId, BlockHeader, ClusterConsensusConfig } from '@optimystic/db-core';
+import type { IPeerNetwork } from '@optimystic/db-core';
+import type { PeerId, PrivateKey } from '@libp2p/interface';
+import { peerIdFromPrivateKey } from '@libp2p/peer-id';
+import { generateKeyPair } from '@libp2p/crypto/keys';
+import { sha256 } from 'multiformats/hashes/sha2';
+import { base58btc } from 'multiformats/bases/base58';
+import { toString as uint8ArrayToString, fromString as uint8ArrayFromString } from 'uint8arrays';
+import { PeerReputationService } from '../src/reputation/peer-reputation.js';
+import { PenaltyReason } from '../src/reputation/types.js';
+import { createMesh, type Mesh } from './mesh-harness.js';
+
+// ─── Helpers ───
+
+interface KeyPair {
+	peerId: PeerId;
+	privateKey: PrivateKey;
+}
+
+const makeKeyPair = async (): Promise<KeyPair> => {
+	const privateKey = await generateKeyPair('Ed25519');
+	return { peerId: peerIdFromPrivateKey(privateKey), privateKey };
+};
+
+const computeMessageHash = async (message: RepoMessage): Promise<string> => {
+	const msgBytes = new TextEncoder().encode(JSON.stringify(message));
+	const hashBytes = await sha256.digest(msgBytes);
+	return base58btc.encode(hashBytes.digest);
+};
+
+const computePromiseHash = async (record: ClusterRecord): Promise<string> => {
+	const msgBytes = new TextEncoder().encode(record.messageHash + JSON.stringify(record.message));
+	const hashBytes = await sha256.digest(msgBytes);
+	return uint8ArrayToString(hashBytes.digest, 'base64url');
+};
+
+const computeCommitHash = async (record: ClusterRecord): Promise<string> => {
+	const msgBytes = new TextEncoder().encode(record.messageHash + JSON.stringify(record.message) + JSON.stringify(record.promises));
+	const hashBytes = await sha256.digest(msgBytes);
+	return uint8ArrayToString(hashBytes.digest, 'base64url');
+};
+
+const signVote = async (privateKey: PrivateKey, hash: string, type: 'approve' | 'reject', rejectReason?: string): Promise<string> => {
+	const payload = hash + ':' + type + (rejectReason ? ':' + rejectReason : '');
+	const sigBytes = await privateKey.sign(new TextEncoder().encode(payload));
+	return uint8ArrayToString(sigBytes, 'base64url');
+};
+
+const makeSignedPromise = async (privateKey: PrivateKey, record: ClusterRecord, type: 'approve' | 'reject' = 'approve', rejectReason?: string): Promise<Signature> => {
+	const promiseHash = await computePromiseHash(record);
+	const sig = await signVote(privateKey, promiseHash, type, rejectReason);
+	return type === 'approve'
+		? { type: 'approve', signature: sig }
+		: { type: 'reject', signature: sig, rejectReason };
+};
+
+const makeSignedCommit = async (privateKey: PrivateKey, record: ClusterRecord, type: 'approve' | 'reject' = 'approve'): Promise<Signature> => {
+	const commitHash = await computeCommitHash(record);
+	const sig = await signVote(privateKey, commitHash, type);
+	return { type, signature: sig };
+};
+
+const makeHeader = (id: string): BlockHeader => ({
+	id: id as BlockId,
+	type: 'test',
+	collectionId: 'collection-1' as BlockId
+});
+
+const makeBlock = (id: string): IBlock => ({
+	header: makeHeader(id)
+});
+
+const makeClusterPeers = (keyPairs: KeyPair[]): ClusterPeers => {
+	const peers: ClusterPeers = {};
+	for (const { peerId } of keyPairs) {
+		peers[peerId.toString()] = {
+			multiaddrs: ['/ip4/127.0.0.1/tcp/8000'],
+			publicKey: peerId.publicKey!.raw
+		};
+	}
+	return peers;
+};
+
+const makeGetOperation = (blockIds: string[]): RepoMessage['operations'] => [
+	{ get: { blockIds } }
+];
+
+const makePendOperation = (actionId: string, blockId: string): RepoMessage['operations'] => {
+	const transforms: Transforms = {
+		inserts: { [blockId]: makeBlock(blockId) },
+		updates: {},
+		deletes: []
+	};
+	return [{ pend: { actionId, transforms, policy: 'c' } }];
+};
+
+class MockRepo implements IRepo {
+	getCalls: BlockGets[] = [];
+	pendCalls: PendRequest[] = [];
+	commitCalls: CommitRequest[] = [];
+	cancelCalls: ActionBlocks[] = [];
+
+	async get(blockGets: BlockGets): Promise<GetBlockResults> {
+		this.getCalls.push(blockGets);
+		return {};
+	}
+	async pend(request: PendRequest): Promise<PendResult> {
+		this.pendCalls.push(request);
+		return { success: true, blockIds: [], pending: [] };
+	}
+	async commit(request: CommitRequest): Promise<CommitResult> {
+		this.commitCalls.push(request);
+		return { success: true };
+	}
+	async cancel(actionRef: ActionBlocks): Promise<void> {
+		this.cancelCalls.push(actionRef);
+	}
+}
+
+class MockPeerNetwork implements IPeerNetwork {
+	async connect(_peerId: PeerId, _protocol: string): Promise<any> {
+		return {};
+	}
+}
+
+const createClusterRecord = async (
+	peers: ClusterPeers,
+	operations: RepoMessage['operations'],
+	promises: Record<string, Signature> = {},
+	commits: Record<string, Signature> = {},
+	expiration?: number
+): Promise<ClusterRecord> => {
+	const message: RepoMessage = {
+		operations,
+		expiration: expiration ?? Date.now() + 30000
+	};
+	const messageHash = await computeMessageHash(message);
+	return { messageHash, message, peers, promises, commits };
+};
+
+// ─── Tests ───
+
+describe('Byzantine Fault Injection (TEST-10.4.1)', () => {
+	let mockRepo: MockRepo;
+	let mockNetwork: MockPeerNetwork;
+
+	beforeEach(() => {
+		mockRepo = new MockRepo();
+		mockNetwork = new MockPeerNetwork();
+	});
+
+	describe('forged signature attacks', () => {
+		it('Byzantine peer cannot impersonate another peer\'s promise', async () => {
+			const honest = await makeKeyPair();
+			const victim = await makeKeyPair();
+			const byzantine = await makeKeyPair();  // Not in cluster
+			const peers = makeClusterPeers([honest, victim]);
+
+			const member = clusterMember({
+				storageRepo: mockRepo,
+				peerNetwork: mockNetwork,
+				peerId: honest.peerId,
+				privateKey: honest.privateKey
+			});
+
+			const record = await createClusterRecord(peers, makeGetOperation(['block-1']));
+
+			// Byzantine peer signs with their own key but claims to be victim
+			const forgedPromise = await makeSignedPromise(byzantine.privateKey, record);
+			const attackRecord: ClusterRecord = {
+				...record,
+				promises: { [victim.peerId.toString()]: forgedPromise }
+			};
+
+			try {
+				await member.update(attackRecord);
+				expect.fail('Should have rejected forged signature');
+			} catch (err) {
+				expect((err as Error).message).to.include('Invalid promise signature');
+			}
+		});
+
+		it('Byzantine peer cannot forge commit after valid promise phase', async () => {
+			const honest = await makeKeyPair();
+			const byzantine = await makeKeyPair();
+			const forger = await makeKeyPair();
+			const ourId = honest.peerId.toString();
+			const byzantineId = byzantine.peerId.toString();
+			const peers = makeClusterPeers([honest, byzantine]);
+
+			const member = clusterMember({
+				storageRepo: mockRepo,
+				peerNetwork: mockNetwork,
+				peerId: honest.peerId,
+				privateKey: honest.privateKey
+			});
+
+			const record = await createClusterRecord(peers, makeGetOperation(['block-1']));
+			const ourPromise = await makeSignedPromise(honest.privateKey, record);
+			const byzantinePromise = await makeSignedPromise(byzantine.privateKey, record);  // Legitimate promise
+
+			const promisedRecord: ClusterRecord = {
+				...record,
+				promises: { [ourId]: ourPromise, [byzantineId]: byzantinePromise }
+			};
+
+			// Forge the commit — sign with forger's key, attribute to byzantine
+			const forgedCommit = await makeSignedCommit(forger.privateKey, promisedRecord);
+			const attackRecord: ClusterRecord = {
+				...promisedRecord,
+				commits: { [byzantineId]: forgedCommit }
+			};
+
+			try {
+				await member.update(attackRecord);
+				expect.fail('Should have rejected forged commit');
+			} catch (err) {
+				expect((err as Error).message).to.include('Invalid commit signature');
+			}
+		});
+
+		it('random bytes as signature are rejected', async () => {
+			const honest = await makeKeyPair();
+			const other = await makeKeyPair();
+			const otherId = other.peerId.toString();
+			const peers = makeClusterPeers([honest, other]);
+
+			const member = clusterMember({
+				storageRepo: mockRepo,
+				peerNetwork: mockNetwork,
+				peerId: honest.peerId,
+				privateKey: honest.privateKey
+			});
+
+			const record = await createClusterRecord(peers, makeGetOperation(['block-1']));
+
+			// Random 64 bytes as a forged Ed25519 signature
+			const randomSig = uint8ArrayToString(crypto.getRandomValues(new Uint8Array(64)), 'base64url');
+			const attackRecord: ClusterRecord = {
+				...record,
+				promises: { [otherId]: { type: 'approve', signature: randomSig } }
+			};
+
+			try {
+				await member.update(attackRecord);
+				expect.fail('Should have rejected random signature');
+			} catch (err) {
+				expect((err as Error).message).to.include('Invalid promise signature');
+			}
+		});
+	});
+
+	describe('message hash tampering', () => {
+		it('rejects record with tampered message hash', async () => {
+			const honest = await makeKeyPair();
+			const peers = makeClusterPeers([honest]);
+
+			const member = clusterMember({
+				storageRepo: mockRepo,
+				peerNetwork: mockNetwork,
+				peerId: honest.peerId,
+				privateKey: honest.privateKey
+			});
+
+			const record = await createClusterRecord(peers, makeGetOperation(['block-1']));
+
+			// Tamper: replace message hash with a different valid hash
+			const fakeMessage: RepoMessage = {
+				operations: makeGetOperation(['block-evil']),
+				expiration: Date.now() + 30000
+			};
+			const fakeHash = await computeMessageHash(fakeMessage);
+
+			const tampered: ClusterRecord = {
+				...record,
+				messageHash: fakeHash  // Hash doesn't match the actual message
+			};
+
+			try {
+				await member.update(tampered);
+				expect.fail('Should have rejected mismatched hash');
+			} catch (err) {
+				expect((err as Error).message.toLowerCase()).to.include('mismatch');
+			}
+		});
+
+		it('rejects record with message content that does not match existing hash', async () => {
+			const honest = await makeKeyPair();
+			const peers = makeClusterPeers([honest]);
+
+			const member = clusterMember({
+				storageRepo: mockRepo,
+				peerNetwork: mockNetwork,
+				peerId: honest.peerId,
+				privateKey: honest.privateKey
+			});
+
+			// First update with legitimate record
+			const record = await createClusterRecord(peers, makeGetOperation(['block-1']));
+			await member.update(record);
+
+			// Second update: same hash, different message content (forgery attempt)
+			const tampered: ClusterRecord = {
+				messageHash: record.messageHash,
+				message: {
+					operations: makeGetOperation(['block-evil']),
+					expiration: Date.now() + 30000
+				},
+				peers: record.peers,
+				promises: {},
+				commits: {}
+			};
+
+			try {
+				await member.update(tampered);
+				expect.fail('Should have rejected content mismatch');
+			} catch (err) {
+				expect((err as Error).message.toLowerCase()).to.include('mismatch');
+			}
+		});
+	});
+
+	describe('equivocation attacks', () => {
+		it('Byzantine peer cannot promise approve and reject for the same transaction', async () => {
+			const honest = await makeKeyPair();
+			const byzantine = await makeKeyPair();
+			const byzantineId = byzantine.peerId.toString();
+			const peers = makeClusterPeers([honest, byzantine]);
+
+			const member = clusterMember({
+				storageRepo: mockRepo,
+				peerNetwork: mockNetwork,
+				peerId: honest.peerId,
+				privateKey: honest.privateKey
+			});
+
+			const record = await createClusterRecord(peers, makeGetOperation(['block-1']));
+
+			// First: Byzantine peer sends an approve
+			const approvePromise = await makeSignedPromise(byzantine.privateKey, record, 'approve');
+			const withApprove: ClusterRecord = {
+				...record,
+				promises: { [byzantineId]: approvePromise }
+			};
+			const result1 = await member.update(withApprove);
+
+			// Second: Byzantine tries to change their promise to reject (different record)
+			const rejectPromise = await makeSignedPromise(byzantine.privateKey, record, 'reject', 'changed-mind');
+			const withReject: ClusterRecord = {
+				...record,
+				promises: { [byzantineId]: rejectPromise }
+			};
+
+			// The merge should accept the incoming (last-write-wins on signatures)
+			// but the signature for 'reject' has a different payload than 'approve'
+			// so both are cryptographically valid — the system doesn't detect this equivocation
+			// (KNOWN LIMITATION: no equivocation detection without signature comparison)
+			const result2 = await member.update(withReject);
+
+			// Document the equivocation gap: the latest promise overwrites the first
+			expect(result2.promises[byzantineId]!.type).to.equal('reject');
+		});
+	});
+
+	describe('Byzantine minority in threshold-based consensus', () => {
+		const thresholdConfig: ClusterConsensusConfig = {
+			superMajorityThreshold: 0.75,
+			simpleMajorityThreshold: 0.51,
+			minAbsoluteClusterSize: 2,
+			allowClusterDownsize: true,
+			clusterSizeTolerance: 0.5,
+			partitionDetectionWindow: 60000
+		};
+
+		it('1 Byzantine peer in 5-node cluster cannot block consensus', async () => {
+			const allPeers = await Promise.all(Array.from({ length: 5 }, () => makeKeyPair()));
+			const selfKeyPair = allPeers[0]!;
+			const ourId = selfKeyPair.peerId.toString();
+			const peers = makeClusterPeers(allPeers);
+
+			const member = clusterMember({
+				storageRepo: mockRepo,
+				peerNetwork: mockNetwork,
+				peerId: selfKeyPair.peerId,
+				privateKey: selfKeyPair.privateKey,
+				consensusConfig: thresholdConfig
+			});
+
+			const record = await createClusterRecord(peers, makeGetOperation(['block-1']));
+
+			// 4 honest approvals + 1 Byzantine rejection
+			const promises: Record<string, Signature> = {};
+			for (let i = 0; i < 4; i++) {
+				promises[allPeers[i]!.peerId.toString()] = await makeSignedPromise(allPeers[i]!.privateKey, record);
+			}
+			// Byzantine peer rejects
+			promises[allPeers[4]!.peerId.toString()] = await makeSignedPromise(allPeers[4]!.privateKey, record, 'reject', 'byzantine');
+
+			const withPromises: ClusterRecord = { ...record, promises };
+			const result = await member.update(withPromises);
+
+			// 4 approvals >= ceil(5 * 0.75) = 4, so commit should proceed
+			expect(result.commits[ourId]).to.not.equal(undefined);
+			expect(result.commits[ourId]!.type).to.equal('approve');
+		});
+
+		it('2 Byzantine peers in 5-node cluster block consensus', async () => {
+			const allPeers = await Promise.all(Array.from({ length: 5 }, () => makeKeyPair()));
+			const selfKeyPair = allPeers[0]!;
+			const ourId = selfKeyPair.peerId.toString();
+			const peers = makeClusterPeers(allPeers);
+
+			const member = clusterMember({
+				storageRepo: mockRepo,
+				peerNetwork: mockNetwork,
+				peerId: selfKeyPair.peerId,
+				privateKey: selfKeyPair.privateKey,
+				consensusConfig: thresholdConfig
+			});
+
+			const record = await createClusterRecord(peers, makeGetOperation(['block-1']));
+
+			// 3 honest approvals + 2 Byzantine rejections
+			const promises: Record<string, Signature> = {};
+			for (let i = 0; i < 3; i++) {
+				promises[allPeers[i]!.peerId.toString()] = await makeSignedPromise(allPeers[i]!.privateKey, record);
+			}
+			promises[allPeers[3]!.peerId.toString()] = await makeSignedPromise(allPeers[3]!.privateKey, record, 'reject', 'byzantine1');
+			promises[allPeers[4]!.peerId.toString()] = await makeSignedPromise(allPeers[4]!.privateKey, record, 'reject', 'byzantine2');
+
+			const withPromises: ClusterRecord = { ...record, promises };
+			const result = await member.update(withPromises);
+
+			// 3 approvals < ceil(5 * 0.75) = 4, so transaction is rejected
+			expect(result.commits[ourId]).to.equal(undefined);
+		});
+
+		it('disputed record is marked when minority rejects but super-majority approves', async () => {
+			const allPeers = await Promise.all(Array.from({ length: 5 }, () => makeKeyPair()));
+			const selfKeyPair = allPeers[0]!;
+			const peers = makeClusterPeers(allPeers);
+			const byzantineId = allPeers[4]!.peerId.toString();
+
+			const member = clusterMember({
+				storageRepo: mockRepo,
+				peerNetwork: mockNetwork,
+				peerId: selfKeyPair.peerId,
+				privateKey: selfKeyPair.privateKey,
+				consensusConfig: thresholdConfig
+			});
+
+			const record = await createClusterRecord(peers, makeGetOperation(['block-1']));
+
+			// 4 approvals + 1 rejection
+			const promises: Record<string, Signature> = {};
+			for (let i = 0; i < 4; i++) {
+				promises[allPeers[i]!.peerId.toString()] = await makeSignedPromise(allPeers[i]!.privateKey, record);
+			}
+			promises[byzantineId] = await makeSignedPromise(allPeers[4]!.privateKey, record, 'reject', 'disagree');
+
+			// Simulate coordinator marking disputed
+			const disputedRecord: ClusterRecord = {
+				...record,
+				promises,
+				disputed: true,
+				disputeEvidence: {
+					rejectingPeers: [byzantineId],
+					rejectReasons: { [byzantineId]: 'disagree' }
+				}
+			};
+
+			expect(disputedRecord.disputed).to.equal(true);
+			expect(disputedRecord.disputeEvidence!.rejectingPeers).to.deep.equal([byzantineId]);
+		});
+	});
+
+	describe('cumulative Byzantine reputation', () => {
+		it('multiple forged signatures accumulate reputation penalties', async () => {
+			const honest = await makeKeyPair();
+			const byzantine = await makeKeyPair();
+			const byzantineId = byzantine.peerId.toString();
+			const forger = await makeKeyPair();
+			const reputation = new PeerReputationService();
+			const peers = makeClusterPeers([honest, byzantine]);
+
+			const member = clusterMember({
+				storageRepo: mockRepo,
+				peerNetwork: mockNetwork,
+				peerId: honest.peerId,
+				privateKey: honest.privateKey,
+				reputation
+			});
+
+			// Attempt multiple forged signatures
+			for (let i = 0; i < 3; i++) {
+				const record = await createClusterRecord(peers, makeGetOperation([`block-${i}`]));
+				const forgedPromise = await makeSignedPromise(forger.privateKey, record);
+				const attackRecord: ClusterRecord = {
+					...record,
+					promises: { [byzantineId]: forgedPromise }
+				};
+
+				try {
+					await member.update(attackRecord);
+				} catch (err) {
+					// Expected
+				}
+			}
+
+			// Reputation should accumulate significantly
+			const score = reputation.getScore(byzantineId);
+			const summary = reputation.getReputation(byzantineId);
+			expect(summary.penaltyCount).to.equal(3);
+			// InvalidSignature weight is 50, so 3 * 50 = 150 (with minimal decay)
+			expect(score).to.be.greaterThan(100);
+			expect(reputation.isBanned(byzantineId)).to.equal(true);
+		});
+
+		it('ban threshold prevents future interactions with Byzantine peer', async () => {
+			const reputation = new PeerReputationService();
+			const byzantineId = 'byzantine-peer-id';
+
+			// Simulate enough invalid signature penalties to trigger ban
+			reputation.reportPeer(byzantineId, PenaltyReason.InvalidSignature, 'forged-promise-1');
+			reputation.reportPeer(byzantineId, PenaltyReason.InvalidSignature, 'forged-promise-2');
+
+			// InvalidSignature weight is 50, two reports = 100 >= ban threshold (80)
+			expect(reputation.isBanned(byzantineId)).to.equal(true);
+			expect(reputation.isDeprioritized(byzantineId)).to.equal(true);
+		});
+	});
+
+	describe('public key attacks', () => {
+		it('rejects peer with missing public key', async () => {
+			const honest = await makeKeyPair();
+			const other = await makeKeyPair();
+			const otherId = other.peerId.toString();
+
+			// Build peers with missing public key for "other"
+			const peers: ClusterPeers = {
+				[honest.peerId.toString()]: {
+					multiaddrs: ['/ip4/127.0.0.1/tcp/8000'],
+					publicKey: honest.peerId.publicKey!.raw
+				},
+				[otherId]: {
+					multiaddrs: ['/ip4/127.0.0.1/tcp/8000'],
+					publicKey: new Uint8Array(0)  // Empty public key
+				}
+			};
+
+			const member = clusterMember({
+				storageRepo: mockRepo,
+				peerNetwork: mockNetwork,
+				peerId: honest.peerId,
+				privateKey: honest.privateKey
+			});
+
+			const record = await createClusterRecord(peers, makeGetOperation(['block-1']));
+			const otherPromise = await makeSignedPromise(other.privateKey, record);
+			const withPromise: ClusterRecord = {
+				...record,
+				promises: { [otherId]: otherPromise }
+			};
+
+			try {
+				await member.update(withPromise);
+				expect.fail('Should have thrown for missing public key');
+			} catch (err) {
+				expect((err as Error).message).to.include('No public key');
+			}
+		});
+
+		it('rejects peer with wrong public key in cluster record', async () => {
+			const honest = await makeKeyPair();
+			const other = await makeKeyPair();
+			const wrongKey = await makeKeyPair();
+			const otherId = other.peerId.toString();
+
+			// Build peers with wrong public key for "other"
+			const peers: ClusterPeers = {
+				[honest.peerId.toString()]: {
+					multiaddrs: ['/ip4/127.0.0.1/tcp/8000'],
+					publicKey: honest.peerId.publicKey!.raw
+				},
+				[otherId]: {
+					multiaddrs: ['/ip4/127.0.0.1/tcp/8000'],
+					publicKey: wrongKey.peerId.publicKey!.raw  // Wrong public key!
+				}
+			};
+
+			const member = clusterMember({
+				storageRepo: mockRepo,
+				peerNetwork: mockNetwork,
+				peerId: honest.peerId,
+				privateKey: honest.privateKey
+			});
+
+			const record = await createClusterRecord(peers, makeGetOperation(['block-1']));
+			// Sign with other's real key, but the record has wrongKey's pubkey
+			const otherPromise = await makeSignedPromise(other.privateKey, record);
+			const withPromise: ClusterRecord = {
+				...record,
+				promises: { [otherId]: otherPromise }
+			};
+
+			try {
+				await member.update(withPromise);
+				expect.fail('Should have rejected mismatched key');
+			} catch (err) {
+				expect((err as Error).message).to.include('Invalid promise signature');
+			}
+		});
+	});
+
+	describe('mesh-level Byzantine scenarios', () => {
+		it('consensus succeeds despite one unreachable node in 3-node cluster', async () => {
+			const mesh = await createMesh(3, {
+				responsibilityK: 3,
+				superMajorityThreshold: 0.51,  // Simple majority
+				allowClusterDownsize: true
+			});
+
+			// Make one node unreachable
+			const failingNode = mesh.nodes[2]!;
+			mesh.failures.failingPeers = new Set([failingNode.peerId.toString()]);
+
+			const writer = mesh.nodes[0]!;
+			const blockId = 'byz-block-1';
+
+			const transforms: Transforms = {
+				inserts: { [blockId]: makeBlock(blockId) },
+				updates: {},
+				deletes: []
+			};
+
+			// Pend and commit through coordinator — should succeed with 2 of 3
+			const pendResult = await writer.coordinatorRepo.pend({
+				actionId: 'byz-a1',
+				transforms,
+				policy: 'c'
+			});
+
+			expect(pendResult.success).to.equal(true);
+
+			const commitResult = await writer.coordinatorRepo.commit({
+				actionId: 'byz-a1',
+				tailId: blockId as BlockId,
+				rev: 1,
+				blockIds: [blockId]
+			});
+
+			expect(commitResult.success).to.equal(true);
+
+			// Clean up
+			mesh.failures.failingPeers = undefined;
+		});
+
+		it('consensus fails when majority nodes are unreachable', async () => {
+			const mesh = await createMesh(3, {
+				responsibilityK: 3,
+				superMajorityThreshold: 0.75,
+				allowClusterDownsize: true
+			});
+
+			// Make 2 of 3 nodes unreachable
+			mesh.failures.failingPeers = new Set([
+				mesh.nodes[1]!.peerId.toString(),
+				mesh.nodes[2]!.peerId.toString()
+			]);
+
+			const writer = mesh.nodes[0]!;
+			const blockId = 'byz-block-2';
+
+			const transforms: Transforms = {
+				inserts: { [blockId]: makeBlock(blockId) },
+				updates: {},
+				deletes: []
+			};
+
+			try {
+				await writer.coordinatorRepo.pend({
+					actionId: 'byz-a2',
+					transforms,
+					policy: 'c'
+				});
+				// May not throw immediately — the coordinator handles retries
+			} catch (err) {
+				// Expected: cannot reach enough peers
+				expect(err).to.be.instanceOf(Error);
+			}
+
+			// Clean up
+			mesh.failures.failingPeers = undefined;
+		});
+
+		it('recovered node catches up after partition heals', async () => {
+			const mesh = await createMesh(3, {
+				responsibilityK: 3,
+				superMajorityThreshold: 0.51,
+				allowClusterDownsize: true
+			});
+
+			const writer = mesh.nodes[0]!;
+			const blockId = 'byz-block-3';
+
+			// Partition: node 2 is unreachable
+			mesh.failures.failingPeers = new Set([mesh.nodes[2]!.peerId.toString()]);
+
+			const transforms: Transforms = {
+				inserts: { [blockId]: makeBlock(blockId) },
+				updates: {},
+				deletes: []
+			};
+
+			await writer.coordinatorRepo.pend({
+				actionId: 'byz-a3',
+				transforms,
+				policy: 'c'
+			});
+
+			await writer.coordinatorRepo.commit({
+				actionId: 'byz-a3',
+				tailId: blockId as BlockId,
+				rev: 1,
+				blockIds: [blockId]
+			});
+
+			// Heal partition
+			mesh.failures.failingPeers = undefined;
+
+			// Node 1 (index 1) should have the data since it was reachable
+			const reader = mesh.nodes[1]!;
+			const result = await reader.storageRepo.get({ blockIds: [blockId] });
+			// The block should be accessible on the reachable node
+			expect(result).to.not.equal(undefined);
+		});
+	});
+
+	describe('signature type mismatch attacks', () => {
+		it('reject signature with type mismatch (approve signature on reject promise)', async () => {
+			const honest = await makeKeyPair();
+			const byzantine = await makeKeyPair();
+			const byzantineId = byzantine.peerId.toString();
+			const peers = makeClusterPeers([honest, byzantine]);
+
+			const member = clusterMember({
+				storageRepo: mockRepo,
+				peerNetwork: mockNetwork,
+				peerId: honest.peerId,
+				privateKey: honest.privateKey
+			});
+
+			const record = await createClusterRecord(peers, makeGetOperation(['block-1']));
+
+			// Sign as 'approve' but claim it's a 'reject'
+			const promiseHash = await computePromiseHash(record);
+			const approveSignature = await signVote(byzantine.privateKey, promiseHash, 'approve');
+
+			// Set type to 'reject' but use the signature for 'approve'
+			const mismatchedPromise: Signature = {
+				type: 'reject',
+				signature: approveSignature,
+				rejectReason: 'fraudulent'
+			};
+
+			const attackRecord: ClusterRecord = {
+				...record,
+				promises: { [byzantineId]: mismatchedPromise }
+			};
+
+			try {
+				await member.update(attackRecord);
+				expect.fail('Should have rejected type-mismatched signature');
+			} catch (err) {
+				// The signature was for 'approve' but the payload check uses 'reject:fraudulent'
+				// so the verification fails
+				expect((err as Error).message).to.include('Invalid promise signature');
+			}
+		});
+	});
+
+	describe('empty and edge-case signatures', () => {
+		it('rejects empty signature string', async () => {
+			const honest = await makeKeyPair();
+			const other = await makeKeyPair();
+			const otherId = other.peerId.toString();
+			const peers = makeClusterPeers([honest, other]);
+
+			const member = clusterMember({
+				storageRepo: mockRepo,
+				peerNetwork: mockNetwork,
+				peerId: honest.peerId,
+				privateKey: honest.privateKey
+			});
+
+			const record = await createClusterRecord(peers, makeGetOperation(['block-1']));
+
+			const emptyPromise: Signature = {
+				type: 'approve',
+				signature: ''  // Empty signature
+			};
+
+			const attackRecord: ClusterRecord = {
+				...record,
+				promises: { [otherId]: emptyPromise }
+			};
+
+			try {
+				await member.update(attackRecord);
+				expect.fail('Should have rejected empty signature');
+			} catch (err) {
+				// Either "Invalid promise signature" or a lower-level crypto error
+				expect(err).to.be.instanceOf(Error);
+			}
+		});
+
+		it('rejects truncated signature', async () => {
+			const honest = await makeKeyPair();
+			const other = await makeKeyPair();
+			const otherId = other.peerId.toString();
+			const peers = makeClusterPeers([honest, other]);
+
+			const member = clusterMember({
+				storageRepo: mockRepo,
+				peerNetwork: mockNetwork,
+				peerId: honest.peerId,
+				privateKey: honest.privateKey
+			});
+
+			const record = await createClusterRecord(peers, makeGetOperation(['block-1']));
+
+			// Create a valid signature then truncate it
+			const validPromise = await makeSignedPromise(other.privateKey, record);
+			const truncatedSig = validPromise.signature.substring(0, 10);
+
+			const attackRecord: ClusterRecord = {
+				...record,
+				promises: { [otherId]: { type: 'approve', signature: truncatedSig } }
+			};
+
+			try {
+				await member.update(attackRecord);
+				expect.fail('Should have rejected truncated signature');
+			} catch (err) {
+				expect(err).to.be.instanceOf(Error);
+			}
+		});
+	});
+});

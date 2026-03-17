@@ -1,0 +1,46 @@
+description: Transaction metrics instrumentation — timing, correlation IDs, and verbose tracing
+dependencies: none
+files:
+  - packages/db-core/src/logger.ts
+  - packages/db-p2p/src/logger.ts
+  - packages/db-core/src/transaction/coordinator.ts
+  - packages/db-core/src/transactor/network-transactor.ts
+  - packages/db-p2p/src/protocol-client.ts
+  - packages/db-p2p/src/libp2p-key-network.ts
+  - packages/db-p2p/src/repo/cluster-coordinator.ts
+  - packages/db-p2p/src/repo/client.ts
+  - packages/db-core/test/transaction-metrics.spec.ts
+  - packages/db-p2p/test/transaction-metrics.spec.ts
+----
+
+## What was built
+
+Lightweight observability instrumentation across the transaction pipeline covering three concerns:
+
+### 1. Timing Metrics (`Date.now()` deltas)
+- **TransactionCoordinator.coordinateTransaction()**: `trx:phases trxId=%s gather=%dms pend=%dms commit=%dms total=%dms`
+- **TransactionCoordinator.execute()**: engine/apply/coordinate phase timings with `trxId`
+- **NetworkTransactor.get()**: `get:done blockIds=%d ms=%d`
+- **NetworkTransactor.pend()**: `pend:done actionId=%s ms=%d batches=%d`
+- **NetworkTransactor.commit()**: `commit:done actionId=%s ms=%d`
+- **findCoordinator()**: `findCoordinator:done key=%s ms=%d source=%s` (cache/fret/connected-fallback/self)
+- **findCluster()**: `findCluster:done key=%s ms=%d peers=%d`
+
+### 2. Correlation IDs
+- `trxId` (transaction.id) in coordinator logs
+- `actionId` in network-transactor pend/commit/cancel logs, extracted by RepoClient and forwarded as `correlationId` to ProtocolClient
+- `messageHash` in all cluster-coordinator logs
+
+### 3. Verbose Tracing (`OPTIMYSTIC_VERBOSE=1` or `true`)
+- Both `db-core/src/logger.ts` and `db-p2p/src/logger.ts` export a `verbose` boolean
+- Gated verbose sections in: NetworkTransactor.pend (batch detail), ClusterCoordinator.collectPromises/commitTransaction (peer lists with addresses), findCoordinator (FRET candidates, connected peers), findCluster (cohort detail)
+
+## Testing
+- `packages/db-core/test/transaction-metrics.spec.ts`: verbose flag type and default value
+- `packages/db-p2p/test/transaction-metrics.spec.ts`: verbose flag type and default value
+- Build passes (db-core: 261 tests, db-p2p: 318 tests — all passing)
+
+## Usage
+- Enable debug logging: `DEBUG=optimystic:*`
+- Enable verbose tracing: `OPTIMYSTIC_VERBOSE=1`
+- Both can be combined for full observability
