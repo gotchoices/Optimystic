@@ -107,14 +107,15 @@ VS Code integration:
 
 ## Modes
 
-- Single-node (no `--bootstrap`):
-  - Uses an in-process local transactor (no network consensus)
-  - Great for local development
-- Distributed (with `--bootstrap`):
-  - Uses the network transactor (libp2p services for repo/cluster)
+- **Offline** (`--offline`):
+  - Uses an in-process `LocalTransactor` (no network consensus)
+  - Great for local development and testing without network overhead
+- **Distributed** (default):
+  - Uses `NetworkTransactor` with libp2p services for repo and cluster consensus
+  - Works with or without `--bootstrap`; without bootstrap the node is isolated until peers connect
   - Suitable for exercising peer-to-peer coordination
 
-Bootstrap discovery is only enabled when `--bootstrap` is provided.
+Note: the `--offline` flag controls which transactor is used, not the presence of `--bootstrap`. A node started without `--bootstrap` but without `--offline` still uses the `NetworkTransactor` and can accept inbound connections.
 
 ---
 
@@ -147,11 +148,16 @@ yarn optimystic-peer interactive [options]
 Options:
 - `-p, --port <number>`: Port to listen on (default: 0 = auto)
 - `-b, --bootstrap <string>`: Comma-separated list of bootstrap multiaddrs
+- `--bootstrap-file <path>`: Path to JSON file or directory containing bootstrap addresses (supports `mesh-ready.json` and `node-*.json` formats)
 - `-i, --id <string>`: Optional peer id
 - `-r, --relay`: Enable relay service
 - `-n, --network <string>`: Network name (default: `optimystic`)
+- `--fret-profile <profile>`: FRET profile: `edge` or `core` (default: `edge`)
 - `-s, --storage <type>`: `memory` | `file` (default: `memory`)
 - `--storage-path <path>`: Required when `--storage file`
+- `--storage-capacity <bytes>`: Override storage capacity in bytes (used for ring selection / arachnode sizing)
+- `--announce-file <path>`: Write node info (peerId, multiaddrs) to this JSON file for mesh launchers
+- `--offline`: Use local transactor instead of network transactor (no distributed consensus)
 
 Once started, you’ll see a prompt:
 
@@ -167,6 +173,18 @@ Available interactive commands:
 - `list-diaries` – List created diaries in this session
 - `read-diary <name>` – Stream all entries
 - `exit` / `quit` – Disconnect and exit
+
+---
+
+## Service Mode (Headless)
+
+```sh
+yarn optimystic-peer service [options]
+```
+
+Starts a headless service node with no interactive prompt. The node stays alive until killed. Useful for mesh nodes in launch profiles and automated testing.
+
+Accepts the same network/storage options as interactive mode (except `--offline`).
 
 ---
 
@@ -229,13 +247,42 @@ yarn optimystic-peer run \
   - Verify `--bootstrap` addresses are correct and reachable
   - You can provide multiple bootstrap addresses (comma-separated)
 - Data not persisting across restarts
-  - Use `--storage file --storage-path <dir)` to persist locally
+  - Use `--storage file --storage-path <dir>` to persist locally
+
+---
+
+## Testing
+
+The reference peer includes integration tests that exercise the full distributed stack:
+
+```sh
+# Build dependencies first
+yarn workspace @optimystic/db-p2p build
+yarn workspace @optimystic/reference-peer build
+
+# Run the mocha test suite (3-node mesh)
+yarn workspace @optimystic/reference-peer test
+
+# Run the standalone quick test script (for debugging)
+yarn workspace @optimystic/reference-peer test:quick
+
+# Run with debug logging
+yarn workspace @optimystic/reference-peer test:quick:debug
+```
+
+The test suite (`test/distributed-diary.spec.ts`) spins up a 3-node mesh with real libp2p connections and tests:
+- Cross-node diary creation and access
+- Distributed entry propagation across all nodes
+- Storage consistency verification
+- Concurrent writes from multiple nodes
+
+See [test/README.md](./test/README.md) for debugging tips and VS Code launch configurations.
 
 ---
 
 ## Notes
-- In single-node mode, operations execute locally (no network coordination). This is ideal for development.
-- In distributed mode, operations are coordinated via libp2p protocols for repo and cluster.
+- In offline mode, operations execute locally (no network coordination). This is ideal for development.
+- In distributed mode (default), operations are coordinated via libp2p protocols for repo and cluster.
 - Multiaddrs printed at startup can be used as bootstrap addresses for subsequent nodes.
 
 ---

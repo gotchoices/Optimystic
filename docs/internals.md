@@ -63,7 +63,7 @@ saveMaterializedBlock(block): store(structuredClone(block));
 ## Key Invariants
 
 ### Block Identity
-- `blockId` = content-addressed ID (base32), immutable
+- `blockId` = content-addressed ID (base64url), immutable
 - `actionId` = transaction identifier, unique per commit
 - `rev` = revision number, monotonically increasing per block
 
@@ -94,9 +94,49 @@ This proves that the peers listed in the cluster actually voted — a coordinato
 
 **Important**: cluster authentication is about _identity verification_ (did this peer really vote?), not _authorization_ (is this peer allowed to write?).  Authorization decisions like per-collection permissions belong at a higher layer (e.g. application or collection module), not in the cluster consensus path.
 
+### Equivocation Detection
+
+`ClusterMember.detectEquivocation()` catches peers that flip their vote (approve → reject or vice versa) for the same transaction phase. During `mergeRecords()`, if an incoming signature has a different vote type than the existing one for the same peer:
+
+- The **first-seen** signature is preserved (the flip is rejected)
+- A `PenaltyReason.Equivocation` penalty (weight 100) is reported via the reputation service
+- A single equivocation triggers a ban (weight 100 exceeds the default ban threshold of 80)
+
+Same-type re-delivery (retransmission) is not flagged, avoiding false positives.
+
 ### Validity Disputes & Cascading Consensus
 
 When cluster peers disagree on transaction validity, the transaction is blocked and escalated to progressively wider audiences until one side achieves consensus. The losing side is ejected and the ring segment self-heals. The coordinator is implicitly on the "approve" side (it validated before sending to the cluster), so disagreeing members independently orchestrate the escalation through a deterministically-selected dissent coordinator. See [Right-is-Right](right-is-right.md) for full details.
+
+## Read Dependency Validation
+
+Read dependency tracking prevents **write-skew anomalies** in optimistic concurrency control. Every block read during a transaction is recorded as a `ReadDependency` (`{ blockId, revision }`), and validators check that none of those blocks have been modified before allowing the transaction to commit.
+
+**Data flow**: `TransactorSource.tryGet()` records reads → `Collection` delegates → `TransactionCoordinator` aggregates across collections → `TransactionSession.commit()` collects reads into the `Transaction` → `TransactionValidator` checks each read against current block state.
+
+Key design decisions:
+- Reads are captured at `TransactorSource.tryGet()` level, meaning ALL block reads (including internal structural blocks) are tracked — maximally correct but potentially over-conservative
+- `CacheSource` naturally deduplicates — only the first read of a block reaches `TransactorSource`
+- Non-existent blocks record `revision: 0`; if subsequently created, the read is detected as stale
+- `BlockStateProvider` is optional in `TransactionValidator` — when absent, read validation is skipped (backward compatible)
+
+## Proximity Verification
+
+`CoordinatorRepo` rejects write requests for blocks the node is not responsible for. FRET routing is the primary guard; proximity verification catches misrouted requests.
+
+- **Write path (strict)**: `pend`, `cancel`, `commit` throw `Not responsible for block(s): ...` if any block fails the cluster membership check
+- **Read path (soft)**: `get` logs a warning but still serves — reads are best-effort
+- **Fail-open**: If `findCluster` throws (network failure), the check assumes responsible to avoid false rejections
+- **Caching**: `LruMap` with 1000 entries and 60s TTL avoids repeated `findCluster` lookups
+
+## Observability
+
+Transaction metrics are instrumented with `debug` logging and optional verbose tracing:
+
+- **Timing**: Phase-level timings (`gather`, `pend`, `commit`, `total`) with `trxId` correlation
+- **Correlation IDs**: `trxId` in coordinator, `actionId` in network-transactor, `messageHash` in cluster-coordinator
+- **Verbose mode**: Set `OPTIMYSTIC_VERBOSE=1` for detailed batch, peer list, and FRET candidate logging
+- **Enable**: `DEBUG=optimystic:*` for standard logs, combine with `OPTIMYSTIC_VERBOSE=1` for full tracing
 
 ## Common Pitfalls
 
@@ -143,6 +183,10 @@ await doWork();
 ### 5. Latch Deadlocks
 **Bug**: Latches are per-node, not distributed. Concurrent transactions on same block can deadlock.
 **Symptom**: Test hangs indefinitely during concurrent writes.
+
+## Quereus SQL Dialect
+
+Quereus is **not** SQLite. It is a distinct SQL engine aligned with [The Third Manifesto](https://www.dcs.warwick.ac.uk/~hugh/TTM/DTATRM.pdf). The most important departure: **columns default to NOT NULL** unless explicitly marked `NULL`. Use `pragma default_column_nullability = 'nullable'` for SQL-standard behavior. Other notable differences include empty primary keys for singleton tables (`PRIMARY KEY ()`), native temporal/JSON types, all-virtual-table architecture, operation-specific CHECK constraints, and no triggers. See the [quereus-plugin-optimystic README](../packages/quereus-plugin-optimystic/README.md#quereus-sql-dialect) and the [Quereus SQL Reference](https://github.com/nicktobey/quereus/blob/main/docs/sql.md) (Section 11) for the full list.
 
 ## Type Glossary
 

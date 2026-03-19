@@ -115,6 +115,21 @@ registerTransactor('mytransactor', MyCustomTransactor);
 
 Then use `transactor='mytransactor'` or `keyNetwork='mynetwork'` in your `USING` clause.
 
+## Quereus SQL Dialect
+
+Quereus is not SQLite — it is a distinct SQL engine with intentional departures from the SQL standard, aligned with [The Third Manifesto](https://www.dcs.warwick.ac.uk/~hugh/TTM/DTATRM.pdf). Key differences that affect schema design:
+
+- **Columns default to NOT NULL** unless explicitly marked `NULL`. This avoids the "billion-dollar mistake" of nullable-by-default. Use `pragma default_column_nullability = 'nullable'` for SQL-standard behavior.
+- **Native temporal types** (`DATE`, `TIME`, `DATETIME`) backed by the Temporal API, instead of storing dates as TEXT/REAL/INTEGER.
+- **Native JSON type** with deep equality comparison, not text-based.
+- **All tables are virtual tables** — the `USING` clause specifies the backing module.
+- **Operation-specific CHECK constraints** — e.g., `CHECK ON INSERT (price >= 0)`.
+- **Empty primary keys for singleton tables** — `PRIMARY KEY ()` creates a table limited to 0 or 1 rows, useful for configuration or state tables.
+- **Conversion functions** (`integer()`, `date()`, `json()`) preferred over `CAST`.
+- **No triggers** — event-driven logic belongs in the application layer.
+
+For the full dialect reference, see the [Quereus SQL Reference](https://github.com/nicktobey/quereus/blob/main/docs/sql.md), particularly Section 11 ("Quereus vs. SQLite").
+
 ## Limitations
 
 - Primary keys must be TEXT type (tree keys are strings)

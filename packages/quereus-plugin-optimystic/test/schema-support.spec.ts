@@ -52,7 +52,7 @@ describe('Optimystic Schema Support', () => {
 
 			// Verify table was created
 			const tables = [];
-			for await (const row of db.eval('SELECT name FROM schema() WHERE type="table"')) {
+			for await (const row of db.eval("SELECT name FROM schema() WHERE type='table'")) {
 				tables.push(row);
 			}
 			expect(tables.some((t: any) => t.name === 'users')).to.be.true;
@@ -76,7 +76,7 @@ describe('Optimystic Schema Support', () => {
 			`);
 
 			const results = [];
-			for await (const row of db.eval('SELECT * FROM products WHERE id = "prod1"')) {
+			for await (const row of db.eval("SELECT * FROM products WHERE id = 'prod1'")) {
 				results.push(row);
 			}
 			expect(results).to.have.lengthOf(1);
@@ -125,7 +125,7 @@ describe('Optimystic Schema Support', () => {
 				CREATE TABLE users (
 					id INTEGER PRIMARY KEY,
 					name TEXT NOT NULL,
-					email TEXT
+					email TEXT NULL
 				) USING optimystic('tree://test/users')
 			`);
 		});
@@ -278,7 +278,7 @@ describe('Optimystic Schema Support', () => {
 
 		it('should filter by equality', async () => {
 			const result = [];
-			for await (const row of db.eval('SELECT * FROM products WHERE category = "Tools"')) {
+			for await (const row of db.eval("SELECT * FROM products WHERE category = 'Tools'")) {
 				result.push(row);
 			}
 			expect(result).to.have.lengthOf(2);

@@ -1181,7 +1181,7 @@ export class TransactionValidator {
 - [x] Implement TransactionValidator (generic, engine-agnostic) in db-core/src/transaction/validator.ts
   - [x] Verify stamp.engineId matches local engine
   - [x] Verify stamp.schemaHash matches local schema
-  - [ ] Verify read dependencies (TODO: will be implemented with proper block versioning)
+  - [x] Verify read dependencies (checks `Transaction.reads` against current block state via `BlockStateProvider`)
   - [x] Re-execute transaction through engine
   - [x] Compute operations hash from temp coordinator
   - [x] Compare with sender's operations hash
@@ -1251,7 +1251,7 @@ export class TransactionValidator {
 - [x] Test constraint validation across network (CHECK constraints validated on each peer)
 - [x] Test local schema enforcement (column visibility based on local schema)
 - [x] Test schema hash mismatch rejection (TransactionValidator rejects mismatched schema hashes)
-- [ ] Test stale read detection (TODO: requires read dependency tracking)
+- [x] Test stale read detection (write-skew detection, non-existent block creation, backward compat with empty reads)
 - [x] Test multi-collection atomicity (table + index collection coordination)
 - [x] Test StampId-based non-repeatability via WITH CONTEXT
 - [x] Fix connection dropout causing self-coordination (retry logic in findCoordinator)

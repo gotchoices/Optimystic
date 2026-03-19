@@ -7,6 +7,7 @@
  */
 
 import type { Tree } from '@optimystic/db-core';
+import { KeyRange } from '@optimystic/db-core';
 import type { ITransactor } from '@optimystic/db-core';
 import type { Row, SqlValue } from '@quereus/quereus';
 import type { StoredTableSchema, StoredIndexSchema } from './schema-manager.js';
@@ -79,15 +80,17 @@ export class IndexManager {
 	}
 
 	/**
-	 * Insert index entries for a new row
+	 * Insert index entries for a new row.
+	 *
+	 * Index tree keys are composites of indexKey + primaryKey to support
+	 * non-unique indexes (multiple rows with the same indexed value).
+	 * Format: indexKey\x00primaryKey -> primaryKey
 	 */
 	async insertIndexEntries(
 		row: Row,
 		primaryKey: PrimaryKey,
 		transactor?: ITransactor
 	): Promise<void> {
-		const updates: Array<[string, IndexEntry[]]> = [];
-
 		for (const index of this.schema.indexes) {
 			const indexKey = this.createIndexKey(index, row);
 			const tree = this.indexTrees.get(index.name);
@@ -95,15 +98,11 @@ export class IndexManager {
 				throw new Error(`Index tree not found: ${index.name}`);
 			}
 
-			updates.push([index.name, [[indexKey, primaryKey]]]);
-		}
-
-		// Apply all index updates
-		for (const [indexName, entries] of updates) {
-			const tree = this.indexTrees.get(indexName);
-			if (tree) {
-				await tree.replace(entries);
-			}
+			// Composite tree key: indexKey + primaryKey ensures uniqueness
+			// Store as [treeKey, primaryKey] so the tree's keyExtractor (entry[0])
+			// returns the treeKey for proper sorting and range scans
+			const treeKey = `${indexKey}\x00${primaryKey}`;
+			await tree.replace([[treeKey, [treeKey, primaryKey]]]);
 		}
 	}
 
@@ -115,8 +114,6 @@ export class IndexManager {
 		primaryKey: PrimaryKey,
 		transactor?: ITransactor
 	): Promise<void> {
-		const updates: Array<[string, Array<[IndexKey, undefined]>]> = [];
-
 		for (const index of this.schema.indexes) {
 			const indexKey = this.createIndexKey(index, row);
 			const tree = this.indexTrees.get(index.name);
@@ -124,15 +121,9 @@ export class IndexManager {
 				throw new Error(`Index tree not found: ${index.name}`);
 			}
 
-			updates.push([index.name, [[indexKey, undefined]]]);
-		}
-
-		// Apply all index deletions
-		for (const [indexName, entries] of updates) {
-			const tree = this.indexTrees.get(indexName);
-			if (tree) {
-				await tree.replace(entries);
-			}
+			// Composite tree key must match the format used in insertIndexEntries
+			const treeKey = `${indexKey}\x00${primaryKey}`;
+			await tree.replace([[treeKey, undefined]]);
 		}
 	}
 
@@ -156,11 +147,14 @@ export class IndexManager {
 				throw new Error(`Index tree not found: ${index.name}`);
 			}
 
-			if (oldIndexKey !== newIndexKey || oldPrimaryKey !== newPrimaryKey) {
+			const oldTreeKey = `${oldIndexKey}\x00${oldPrimaryKey}`;
+			const newTreeKey = `${newIndexKey}\x00${newPrimaryKey}`;
+
+			if (oldTreeKey !== newTreeKey) {
 				// Index key or primary key changed - delete old, insert new
 				await tree.replace([
-					[oldIndexKey, undefined],
-					[newIndexKey, newPrimaryKey]
+					[oldTreeKey, undefined],
+					[newTreeKey, [newTreeKey, newPrimaryKey]]
 				]);
 			}
 			// If both keys are the same, no update needed
@@ -168,7 +162,11 @@ export class IndexManager {
 	}
 
 	/**
-	 * Find rows using an index
+	 * Find rows using an index.
+	 *
+	 * Since index tree keys are composites of indexKey\x00primaryKey,
+	 * we do a range scan from indexKey\x00 (inclusive) to indexKey\x01 (exclusive)
+	 * to find all entries matching the given index key.
 	 */
 	async* findByIndex(
 		indexName: string,
@@ -179,14 +177,37 @@ export class IndexManager {
 			throw new Error(`Index tree not found: ${indexName}`);
 		}
 
-		const path = await tree.find(indexKey);
-		if (!tree.isValid(path)) {
-			return;
-		}
+		// Update tree to get latest data
+		await tree.update();
 
-		const entry = tree.at(path) as unknown as [IndexKey, PrimaryKey];
-		if (entry && entry.length >= 2) {
-			yield entry[1];
+		// Range scan for all entries with this index key prefix
+		// Tree keys are formatted as: indexKey\x00primaryKey
+		// Scan from indexKey\x00 (inclusive) to indexKey\x01 (exclusive)
+		const startKey = `${indexKey}\x00`;
+		const endKey = `${indexKey}\x01`; // \x01 > \x00, so this is the exclusive upper bound
+
+		const range = new KeyRange<string>(
+			{ key: startKey, inclusive: true },
+			{ key: endKey, inclusive: false },
+			true // ascending
+		);
+
+		for await (const path of tree.range(range)) {
+			if (!tree.isValid(path)) {
+				continue;
+			}
+
+			const entry = tree.at(path);
+			if (entry != null) {
+				// Entry format: [treeKey, primaryKey]
+				// Extract the primaryKey from the stored tuple
+				const primaryKey = Array.isArray(entry) && entry.length >= 2
+					? entry[1]
+					: (typeof entry === 'string' ? entry : null);
+				if (primaryKey != null) {
+					yield String(primaryKey);
+				}
+			}
 		}
 	}
 
@@ -204,28 +225,29 @@ export class IndexManager {
 			throw new Error(`Index tree not found: ${indexName}`);
 		}
 
-		// TODO: Implement proper range scanning with KeyRange
-		// For now, do a full scan and filter
-		const iterator = tree.range({ isAscending: ascending } as any);
+		await tree.update();
 
-		for await (const path of iterator) {
+		// Build range using the composite key format
+		const rangeStart = startKey !== undefined
+			? { key: `${startKey}\x00`, inclusive: true }
+			: undefined;
+		const rangeEnd = endKey !== undefined
+			? { key: `${endKey}\x01`, inclusive: false }
+			: undefined;
+
+		const range = new KeyRange<string>(rangeStart, rangeEnd, ascending);
+
+		for await (const path of tree.range(range)) {
 			if (!tree.isValid(path)) {
 				continue;
 			}
 
-			const entry = tree.at(path) as unknown as [IndexKey, PrimaryKey];
-			if (entry && entry.length >= 2) {
-				const [key, primaryKey] = entry;
-
-				// Apply range filters
-				if (startKey !== undefined && key < startKey) {
-					continue;
+			const entry = tree.at(path);
+			if (entry != null && Array.isArray(entry) && entry.length >= 2) {
+				const primaryKey = entry[1];
+				if (primaryKey != null) {
+					yield String(primaryKey);
 				}
-				if (endKey !== undefined && key > endKey) {
-					break;
-				}
-
-				yield primaryKey;
 			}
 		}
 	}

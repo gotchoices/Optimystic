@@ -250,12 +250,11 @@ export class CollectionFactory {
       throw new Error('Collection URI is required');
     }
     // Parse URIs like 'tree://mydb/users' or just 'users'
+    // Use the full path as the collection ID to ensure uniqueness
+    // (e.g., index trees at tree://test/products/index/idx_name must not
+    //  collide with the main table at tree://test/products)
     if (uri.startsWith('tree://')) {
       const path = uri.substring(7); // Remove 'tree://'
-      const parts = path.split('/');
-      if (parts.length >= 2) {
-        return parts[1]! as unknown as CollectionId; // collection name part
-      }
       return path as unknown as CollectionId;
     }
     return uri as unknown as CollectionId;

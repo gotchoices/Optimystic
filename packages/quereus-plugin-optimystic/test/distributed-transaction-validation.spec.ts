@@ -35,7 +35,9 @@ interface TestNode {
 
 const delay = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 
-describe('Distributed Transaction Validation', () => {
+describe('Distributed Transaction Validation', function () {
+	this.timeout(120000);
+
 	const nodes: TestNode[] = [];
 	const MESH_SIZE = 3;
 	// Use a random port range to avoid conflicts with other tests

@@ -28,7 +28,9 @@ interface TestNode {
 
 const delay = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 
-describe('Distributed Quereus Operations', () => {
+describe('Distributed Quereus Operations', function () {
+	this.timeout(120000);
+
 	const nodes: TestNode[] = [];
 	const MESH_SIZE = 3;
 	const BASE_PORT = 9100;

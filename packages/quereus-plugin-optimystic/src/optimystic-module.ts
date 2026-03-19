@@ -264,9 +264,17 @@ export class OptimysticVirtualTable extends VirtualTable {
     try {
       // Parse idxStr to determine access strategy
       // Quereus uses idxStr like 'idx=_primary_(0);plan=2' for equality seeks
+      // or 'idx=idx_category(0);plan=2' for secondary index seeks
       const planType = this.parsePlanType(filterInfo.idxStr);
+      const indexName = this.parseIndexName(filterInfo.idxStr);
 
-      if (planType === 2 && filterInfo.args.length > 0) {
+      // Determine if this is a secondary index (not primary key)
+      const isSecondaryIndex = indexName != null && indexName !== '_primary_';
+
+      if (isSecondaryIndex && filterInfo.args.length > 0) {
+        // Secondary index seek - route to index scan
+        yield* this.executeIndexScan(indexName, filterInfo.args);
+      } else if (planType === 2 && filterInfo.args.length > 0) {
         // Primary key equality seek (plan=2)
         yield* this.executePointLookup(String(filterInfo.args[0]));
       } else if (planType === 3) {
@@ -279,12 +287,12 @@ export class OptimysticVirtualTable extends VirtualTable {
         // Legacy: Range query on primary key
         yield* this.executeRangeQuery(filterInfo);
       } else if (filterInfo.idxNum >= 10) {
-        // Index-based scan
-        const indexName = filterInfo.idxStr;
-        if (!indexName || typeof indexName !== 'string') {
+        // Legacy: Index-based scan
+        const idxName = filterInfo.idxStr;
+        if (!idxName || typeof idxName !== 'string') {
           throw new Error('Index name not provided for index scan');
         }
-        yield* this.executeIndexScan(indexName, filterInfo.args);
+        yield* this.executeIndexScan(idxName, filterInfo.args);
       } else {
         // Full table scan
         yield* this.executeTableScan();
@@ -304,6 +312,16 @@ export class OptimysticVirtualTable extends VirtualTable {
     if (!idxStr) return undefined;
     const match = idxStr.match(/plan=(\d+)/);
     return match?.[1] ? parseInt(match[1], 10) : undefined;
+  }
+
+  /**
+   * Parse the index name from idxStr
+   * Quereus uses format like 'idx=idx_name(0);plan=2'
+   */
+  private parseIndexName(idxStr: string | null): string | undefined {
+    if (!idxStr) return undefined;
+    const match = idxStr.match(/idx=([^(;]+)/);
+    return match?.[1] || undefined;
   }
 
   /**
@@ -349,6 +367,9 @@ export class OptimysticVirtualTable extends VirtualTable {
     if (!indexSchema) {
       throw new Error(`Index not found: ${indexName}`);
     }
+
+    // Update collection to get latest data
+    await this.collection.update();
 
     // Build index key from constraint values
     // args contains the values for the matched constraints in order
@@ -874,9 +895,17 @@ export class OptimysticModule implements VirtualTableModule<OptimysticVirtualTab
     let bestOrdering: OrderingSpec[] | undefined = undefined;
     let bestIsSet = false;
     let bestExplains = `Full table scan (${tableRowCount} rows)`;
+    let bestIndexName: string | undefined = undefined;
+    let bestSeekColumnIndexes: number[] | undefined = undefined;
 
     // Check primary key constraints first
     const pkColumns = tableInfo.primaryKeyDefinition.map(pk => pk.index);
+
+    // Check if ALL primary key columns have equality constraints (required for point lookup)
+    const fullPkEquality = pkColumns.length > 0 && pkColumns.every(pkCol =>
+      request.filters.some(f => f && f.usable && f.op === '=' && f.columnIndex === pkCol)
+    );
+
     for (let i = 0; i < request.filters.length; i++) {
       const filter = request.filters[i];
       if (!filter || !filter.usable) continue;
@@ -884,13 +913,18 @@ export class OptimysticModule implements VirtualTableModule<OptimysticVirtualTab
       // Check if this is a primary key column
       const isPkColumn = pkColumns.includes(filter.columnIndex);
 
-      if (isPkColumn && filter.op === '=') {
-        // Primary key equality - best case: O(log n)
+      if (isPkColumn && filter.op === '=' && fullPkEquality) {
+        // Full primary key equality - best case: O(log n)
         const pkCost = Math.log2(Math.max(2, tableRowCount)) * 2;
         bestCost = pkCost;
         bestRows = 1;
-        bestHandledFilters = request.filters.map((_, idx) => idx === i);
+        // Mark ALL PK equality filters as handled
+        bestHandledFilters = request.filters.map((f) =>
+          f != null && f.usable && f.op === '=' && pkColumns.includes(f.columnIndex)
+        );
         bestIsSet = true; // PK lookup guarantees unique row
+        bestIndexName = '_primary_';
+        bestSeekColumnIndexes = [...pkColumns];
         bestExplains = `Primary key equality seek (cost: ${pkCost.toFixed(2)})`;
 
         // Point lookup always satisfies any ORDER BY (single row)
@@ -898,6 +932,17 @@ export class OptimysticModule implements VirtualTableModule<OptimysticVirtualTab
           bestOrdering = [...request.requiredOrdering];
         }
         break; // Can't get better than this
+      } else if (isPkColumn && filter.op === '=' && !fullPkEquality) {
+        // Partial PK match - don't mark as handled, let Quereus apply the filter
+        // but still estimate reduced selectivity for cost calculation
+        const partialPkCost = tableRowCount * 0.3;
+        if (partialPkCost < bestCost) {
+          bestCost = partialPkCost;
+          bestRows = Math.max(1, Math.floor(tableRowCount * 0.3));
+          bestHandledFilters = request.filters.map(() => false); // NOT handled
+          bestIsSet = false;
+          bestExplains = `Partial primary key scan (cost: ${partialPkCost.toFixed(2)})`;
+        }
       } else if (isPkColumn && ['>', '>=', '<', '<='].includes(filter.op)) {
         // Primary key range scan: O(log n + k)
         const selectivity = 0.25; // Heuristic for range queries
@@ -909,6 +954,8 @@ export class OptimysticModule implements VirtualTableModule<OptimysticVirtualTab
           bestRows = rangeRows;
           bestHandledFilters = request.filters.map((_, idx) => idx === i);
           bestIsSet = false;
+          bestIndexName = '_primary_';
+          bestSeekColumnIndexes = [...pkColumns];
           bestExplains = `Primary key range scan (selectivity: ${selectivity.toFixed(2)}, cost: ${rangeCost.toFixed(2)})`;
 
           // Check if ORDER BY matches primary key order
@@ -964,6 +1011,8 @@ export class OptimysticModule implements VirtualTableModule<OptimysticVirtualTab
             bestHandledFilters = request.filters.map((_, idx) => matchedFilterIndices.includes(idx));
             // Note: IndexSchema doesn't have unique property in quereus 0.4.8, so we can't determine uniqueness
             bestIsSet = false;
+            bestIndexName = index.name;
+            bestSeekColumnIndexes = matchedFilterIndices.map(fi => request.filters[fi]!.columnIndex);
             bestExplains = `Index seek on ${index.name} ` +
               `(selectivity: ${selectivity.toFixed(4)}, cost: ${indexCost.toFixed(2)})`;
 
@@ -982,6 +1031,8 @@ export class OptimysticModule implements VirtualTableModule<OptimysticVirtualTab
       cost: bestCost,
       rows: bestRows,
       providesOrdering: bestOrdering,
+      indexName: bestIndexName,
+      seekColumnIndexes: bestSeekColumnIndexes,
       isSet: bestIsSet,
       explains: bestExplains,
     };

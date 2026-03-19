@@ -45,8 +45,8 @@ describe('QuereusEngine', () => {
 			expect(QUEREUS_ENGINE_ID).to.match(/^quereus@\d+\.\d+\.\d+$/);
 		});
 
-		it('should be quereus@0.5.3', () => {
-			expect(QUEREUS_ENGINE_ID).to.equal('quereus@0.5.3');
+		it('should be quereus@0.15.1', () => {
+			expect(QUEREUS_ENGINE_ID).to.equal('quereus@0.15.1');
 		});
 	});
 
