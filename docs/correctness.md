@@ -233,25 +233,25 @@ Starvation: a transaction could theoretically lose every race indefinitely. Howe
 
 ## 5. Byzantine Fault Tolerance
 
-### Theorem 10: Adaptive Byzantine Tolerance
+### Theorem 10: Adaptive Byzantine Tolerance (Validation)
 
-**Statement.** The system tolerates up to *f < N/2* Byzantine nodes globally, with cost proportional to the local Byzantine fraction.
+**Statement.** Transaction validation tolerates up to *f < N/2* Byzantine nodes globally, with validation cost proportional to the local Byzantine fraction.
 
-This is not standard BFT. The tolerance is *adaptive*: the protocol automatically escalates its defense based on the fraction of Byzantine nodes encountered.
+This is not standard BFT. The tolerance is *adaptive*: the validation protocol automatically escalates its defense based on the fraction of Byzantine validators encountered.
 
 **Proof sketch.**
 
-*Tier 1 — Fast path (f_local = 0).* If all cluster peers are honest, transactions commit unanimously. Cost: one round trip. This is the common case.
+*Tier 1 — Fast path (f_local = 0).* If all cluster validators are honest, the transaction validates unanimously. Cost: one round trip. This is the common case.
 
-*Tier 2 — Local super-majority (f_local < K/4).* If fewer than 25% of cluster peers are Byzantine, the honest super-majority (≥75%) overrides the minority. The transaction commits with the minority flagged. Cost: one round trip plus reputation updates.
+*Tier 2 — Local super-majority (f_local < K/4).* If fewer than 25% of cluster validators are Byzantine, the honest super-majority (≥75%) overrides the minority. The transaction validates with the minority flagged. Cost: one round trip plus reputation updates.
 
-*Tier 3 — Local minority honest (K/4 ≤ f_local < K).* If the Byzantine fraction exceeds the local super-majority threshold, the honest minority triggers a dispute. The dissent coordinator enlists peers from the wider network. Since the global honest fraction p > 1/2, the enlistees are expected to be majority-honest. Cost: one or more escalation rounds.
+*Tier 3 — Local minority honest (K/4 ≤ f_local < K).* If the Byzantine fraction exceeds the local super-majority threshold, the honest minority triggers a dispute. The dissent coordinator enlists validators from the wider network. Since the global honest fraction p > 1/2, the enlistees are expected to be majority-honest. Cost: one or more escalation rounds.
 
-*Tier 4 — Cascading escalation (wide Byzantine presence).* If enlistees are also split, escalation continues to progressively wider ring segments. Each round ejects losing peers, increasing the honest fraction. Cost: O(log N) rounds in the worst case.
+*Tier 4 — Cascading escalation (wide Byzantine presence).* If enlisted validators are also split, escalation continues to progressively wider ring segments. Each round ejects losing validators, increasing the honest fraction. Cost: O(log N) rounds in the worst case.
 
 *Convergence.* At each escalation level, the resolution threshold is 2/3 super-majority of decisive arbitrator votes. With global honest majority (p > 1/2), the expected arbitrator honest fraction exceeds 1/2, and the probability of achieving 2/3 honest decisive votes is bounded below by a positive constant. The honest side wins with probability approaching 1 as the audience grows.
 
-*Ejection.* Losing peers accumulate reputation penalties (FalseApproval: 40 points, DisputeLost: 30 points). Accumulated penalties ≥80 trigger banning. Equivocation (signing conflicting votes for the same transaction) triggers immediate ban (100 points). Ejected peers cannot participate in future consensus for the affected ring segment. The ring self-heals by incorporating the next-nearest FRET neighbors.
+*Ejection.* Losing validators accumulate reputation penalties (FalseApproval: 40 points, DisputeLost: 30 points). Accumulated penalties ≥80 trigger banning. Equivocation (signing conflicting votes for the same transaction) triggers immediate ban (100 points). Ejected validators cannot participate in future validation for the affected ring segment. The ring self-heals by incorporating the next-nearest FRET neighbors.
 
 **Cost model.**
 
@@ -263,9 +263,9 @@ This is not standard BFT. The tolerance is *adaptive*: the protocol automaticall
 | Second escalation | wide | 3 | ~4× |
 | Full cascade | near-global | O(log N) | O(log N)× |
 
-The system degenerates to whole-network consensus (blockchain-style) only when Byzantine nodes are widespread — a scenario that should be exceedingly rare given the economic incentives against it (ejection, reputation loss).
+Validation degenerates to whole-network consensus (blockchain-style) only when Byzantine validators are widespread — a scenario that should be exceedingly rare given the economic incentives against it (ejection, reputation loss).
 
-**Depends on:** Global honest majority, dispute escalation mechanism, reputation-based ejection, FRET ring topology for deterministic arbitrator selection.
+**Depends on:** Global honest majority, dispute escalation mechanism, reputation-based ejection, FRET ring topology for deterministic validator/arbitrator selection.
 
 ### Theorem 11: Equivocation Detection
 
@@ -301,6 +301,64 @@ Forging requires either:
 Therefore, each signature is attributable to exactly one node, and the signed content cannot be modified without invalidating the signature.
 
 **Depends on:** Ed25519 unforgeability (§1.3), SHA-256 collision resistance (§1.3).
+
+### Theorem 13: Byzantine Coordinator Innocuity
+
+**Statement.** A Byzantine coordinator cannot cause honest validators to commit an invalid transaction.
+
+**Proof sketch.**
+
+The coordinator proposes a transaction by distributing *(stamp, statements, parameters, readDependencies, operationsHash)* to the cluster. Consider each possible coordinator lie:
+
+*Lie about operations.* The coordinator claims an operations hash that does not match the actual re-execution result. Every honest validator independently re-executes the statements against the declared base state (Theorem 4) and computes its own operations hash. The hash mismatch causes rejection. The coordinator cannot predict a collision (SHA-256 collision resistance).
+
+*Lie about read dependencies.* The coordinator declares read dependencies that don't match actual block revisions. Validators check each *(blockId, revision)* pair against their local state. A mismatch triggers stale-read rejection. The coordinator cannot forge block state on honest validators.
+
+*Send inconsistent content to different clusters.* In a multi-collection transaction, the coordinator could send different transaction content to different clusters. However, the transaction ID is a content hash — SHA-256(stamp.id, statements, readDependencies). Different content produces different transaction IDs. The 2PC protocol keys on transaction ID, so inconsistent proposals are independent transactions, not a single atomic commit. The coordinator cannot achieve atomic multi-collection commit on inconsistent content.
+
+*Refuse to complete 2PC.* The coordinator could send PEND but never send COMMIT, holding locks indefinitely. Transaction expiration (§4, Theorem 7) bounds this: expired pended transactions are cleaned up by cluster members independently of the coordinator.
+
+**Bound.** A Byzantine coordinator can waste validator resources (bounded by expiration) and sabotage its own transactions. It cannot cause any honest validator to accept invalid state.
+
+**Depends on:** Deterministic replay (Theorem 4), SHA-256 collision resistance (§1.3), transaction content-addressing, expiration enforcement (Theorem 7).
+
+### Theorem 14: Sync/Recovery Integrity
+
+**Statement.** A recovering node can reconstruct correct state from cluster peers despite up to *f < K/2* Byzantine peers in the cluster, where *K* is the cluster size.
+
+**Proof sketch.**
+
+A recovering node fetches block history from cluster peers. Two mechanisms provide integrity:
+
+*Content addressing.* Each block's ID is a cryptographic hash of its content. A Byzantine peer cannot serve fabricated content for a known block ID without finding a SHA-256 collision. The recovering node verifies each block's hash on receipt.
+
+*Prior-hash chain verification.* Each log entry contains the SHA-256 hash of the previous entry. The recovering node walks the chain from the latest entry backward, verifying each link. A Byzantine peer cannot splice entries into the chain without breaking a link (collision resistance) or forking the chain at some point.
+
+*Multi-peer consistency.* The recovering node fetches the same block range from multiple cluster peers and compares. With honest majority in the cluster (*f < K/2*), at least ⌈K/2⌉ + 1 peers serve the canonical chain. The recovering node takes the chain attested by the majority. A Byzantine minority cannot outvote the honest majority on chain content.
+
+*Commit signatures as trust anchor.* Each committed transaction carries super-majority signatures from the committing cluster (≥75% at commit time). The recovering node can verify these signatures against known peer identities without trusting any single peer. A committed block with valid super-majority signatures is canonical regardless of who served it.
+
+**Bound.** Requires at least one honest, reachable peer in the cluster. If all reachable peers are Byzantine, the recovering node cannot distinguish a valid chain from a fabricated one — but this violates the honest majority assumption within the cluster, which is itself protected by the global honest majority through dispute escalation (Theorem 10).
+
+**Depends on:** SHA-256 collision resistance (§1.3), prior-hash chain integrity (Theorem 6), Ed25519 signature verification (Theorem 12), honest cluster majority.
+
+### Theorem 15: Read-Path Integrity
+
+**Statement.** A node reading block data from a Byzantine peer can detect content forgery. Stale reads are detectable within transactions but not for unvalidated out-of-band reads.
+
+**Proof sketch.**
+
+*Integrity (forgery detection).* Block IDs are content hashes. A reader that knows a block ID can fetch the block from any peer and verify the hash. A Byzantine peer serving tampered content produces a hash mismatch — detected immediately. This holds unconditionally: no trust in the serving peer is required, only knowledge of the expected block ID.
+
+*Freshness within transactions.* A transaction captures read dependencies *(blockId, revision)* for every block accessed during execution. At validation time, validators verify each dependency against current state (Theorem 5). If a Byzantine peer served a stale block during execution, the recorded revision won't match, and validators reject. The transaction author is protected from acting on stale reads.
+
+*Freshness outside transactions.* An application performing a casual read (outside a transaction) from a single peer has no protocol-level freshness guarantee. A Byzantine peer can serve a block at an old revision without detection, because there is no validator checking read dependencies. The reader sees internally consistent (content-addressed) but potentially outdated data.
+
+*Availability.* A Byzantine peer can refuse to serve blocks entirely (omission). Multi-peer fetching from the cluster mitigates this — with honest majority, at least ⌈K/2⌉ + 1 peers are willing to serve. The reader falls back to alternative cluster members.
+
+**Bound.** Content integrity is unconditional given the block ID. Freshness is guaranteed only within validated transactions. Out-of-band reads are consistent but not guaranteed fresh — applications requiring freshness must use transactions or read from multiple peers and compare revisions.
+
+**Depends on:** SHA-256 collision resistance (§1.3), read dependency tracking (Theorem 5), cluster honest majority for availability.
 
 ---
 
@@ -387,10 +445,13 @@ The properties above compose to provide the following end-to-end guarantee:
 > 3. Committed transactions are durable and survive up to 25% node failure per cluster.
 > 4. Multi-collection transactions are atomic.
 > 5. Concurrent transactions are isolated at the snapshot level with write-skew prevention.
-> 6. Byzantine nodes are detected and ejected, with cost proportional to the fraction of Byzantine nodes encountered.
+> 6. Byzantine validators are detected and ejected, with validation cost proportional to the fraction of Byzantine validators encountered.
 > 7. Network partitions cannot cause split-brain; the minority partition blocks writes rather than risk inconsistency.
+> 8. A Byzantine coordinator cannot cause honest validators to commit invalid state.
+> 9. Recovering nodes reconstruct correct state despite Byzantine peers, given honest cluster majority.
+> 10. Block content integrity is unconditionally verifiable; read freshness is guaranteed within transactions.
 
-These guarantees degrade gracefully: as the Byzantine fraction increases, the system spends more work on dispute resolution but maintains safety. Only when f ≥ N/2 can safety be violated.
+These guarantees degrade gracefully: as the Byzantine fraction increases, validation spends more work on dispute resolution but maintains safety. Only when f ≥ N/2 can safety be violated.
 
 ---
 
@@ -428,31 +489,44 @@ For the core consensus algorithm only (dispute escalation convergence, race reso
                     │  Majority (f < N/2)  │
                     └──────────┬──────────┘
                                │
-              ┌────────────────┼────────────────┐
-              │                │                │
-              ▼                ▼                ▼
-    ┌─────────────────┐ ┌───────────┐ ┌────────────────┐
-    │ Dispute          │ │ Consensus │ │ Equivocation   │
-    │ Convergence (T8) │ │ Safety    │ │ Detection (T11)│
-    └────────┬────────┘ │ (T1)      │ └────────────────┘
-             │          └─────┬─────┘
-             │                │
-             ▼                ▼
-    ┌─────────────────┐ ┌───────────────────┐
-    │ Adaptive BFT    │ │ Partition Safety   │
-    │ (T10)           │ │ (T2)              │
-    └─────────────────┘ └───────────────────┘
+          ┌────────────────┬───┴───┬────────────────┐
+          │                │       │                │
+          ▼                ▼       ▼                ▼
+┌─────────────────┐ ┌───────────┐ │  ┌────────────────┐
+│ Dispute          │ │ Consensus │ │  │ Equivocation   │
+│ Convergence (T8) │ │ Safety    │ │  │ Detection (T11)│
+└────────┬────────┘ │ (T1)      │ │  └────────────────┘
+         │          └─────┬─────┘ │
+         │                │       │
+         ▼                ▼       ▼
+┌─────────────────┐ ┌──────────┐ ┌──────────────────┐
+│ Adaptive BFT    │ │ Partition│ │ Sync/Recovery    │
+│ Validation (T10)│ │ Safety   │ │ Integrity (T14)  │
+└─────────────────┘ │ (T2)     │ └──────────────────┘
+                    └──────────┘
 
-    ┌──────────────┐    ┌──────────────┐    ┌──────────────┐
-    │ Deterministic │    │ Snapshot     │    │ Atomicity    │
-    │ Replay (T4)   │    │ Isolation    │    │ (T3)         │
-    │               │    │ (T5)         │    │              │
-    └───────┬──────┘    └──────┬───────┘    └──────┬───────┘
-            │                  │                    │
-            ▼                  ▼                    ▼
-    ┌──────────────┐    ┌──────────────┐    ┌──────────────┐
-    │ SHA-256       │    │ Read Dep     │    │ 2PC State    │
-    │ Collision     │    │ Tracking     │    │ Persistence  │
-    │ Resistance    │    │              │    │              │
-    └──────────────┘    └──────────────┘    └──────────────┘
+┌──────────────┐    ┌──────────────┐    ┌──────────────┐
+│ Deterministic │    │ Snapshot     │    │ Atomicity    │
+│ Replay (T4)   │    │ Isolation    │    │ (T3)         │
+│               │    │ (T5)         │    │              │
+└──┬─────┬─────┘    └──────┬───────┘    └──────┬───────┘
+   │     │                 │                    │
+   │     │                 ▼                    ▼
+   │     │          ┌──────────────┐    ┌──────────────┐
+   │     │          │ Read Dep     │    │ 2PC State    │
+   │     │          │ Tracking     │    │ Persistence  │
+   │     │          └──────┬───────┘    └──────────────┘
+   │     │                 │
+   ▼     ▼                 ▼
+┌──────────────┐    ┌──────────────────┐
+│ SHA-256       │    │ Read-Path        │
+│ Collision     │    │ Integrity (T15)  │
+│ Resistance    │    └──────────────────┘
+└──────┬───────┘
+       │
+       ▼
+┌──────────────────┐
+│ Coordinator      │
+│ Innocuity (T13)  │
+└──────────────────┘
 ```
