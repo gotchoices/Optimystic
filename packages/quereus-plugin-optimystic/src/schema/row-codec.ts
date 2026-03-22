@@ -8,7 +8,8 @@
 import type { Row, SqlValue } from '@quereus/quereus';
 import { resolveCollation, compareSqlValues, type CollationFunction } from '@quereus/quereus';
 import { toString as uint8ToString } from 'uint8arrays/to-string';
-import type { StoredTableSchema } from './schema-manager.js';
+import { fromString as uint8FromString } from 'uint8arrays/from-string';
+import type { StoredTableSchema, StoredColumnSchema } from './schema-manager.js';
 
 /**
  * Encoding format for row data
@@ -74,7 +75,7 @@ export class RowCodec {
 		for (let i = 0; i < this.schema.columns.length; i++) {
 			const col = this.schema.columns[i];
 			if (!col) continue;
-			row[i] = rowObj[col.name] ?? null;
+			row[i] = this.denormalizeValue(rowObj[col.name], col);
 		}
 
 		return row;
@@ -186,9 +187,13 @@ export class RowCodec {
 	 * Normalize a value for storage
 	 */
 	private normalizeValue(value: SqlValue): SqlValue {
-		// Convert bigint to number for JSON compatibility
 		if (typeof value === 'bigint') {
-			return Number(value);
+			// Small bigints safely convert to Number
+			if (value >= Number.MIN_SAFE_INTEGER && value <= Number.MAX_SAFE_INTEGER) {
+				return Number(value);
+			}
+			// Large bigints use tagged encoding to preserve precision
+			return { $bigint: value.toString() } as unknown as SqlValue;
 		}
 
 		if (value instanceof Uint8Array && this.encoding === 'json') {
@@ -196,6 +201,25 @@ export class RowCodec {
 		}
 
 		return value;
+	}
+
+	/**
+	 * Restore a value from storage format using column schema
+	 */
+	private denormalizeValue(value: unknown, col: StoredColumnSchema): SqlValue {
+		if (value === null || value === undefined) return null;
+
+		// Restore tagged bigint
+		if (typeof value === 'object' && value !== null && '$bigint' in value) {
+			return BigInt((value as { $bigint: string }).$bigint);
+		}
+
+		// Restore Uint8Array from base64 for BLOB columns
+		if (col.affinity === 'BLOB' && typeof value === 'string') {
+			return uint8FromString(value, 'base64');
+		}
+
+		return value as SqlValue;
 	}
 
 	/**

@@ -89,7 +89,7 @@ describe('RowCodec', () => {
 			expect(decoded[0]).to.equal(42);
 		});
 
-		it('should lose precision for bigints > 2^53 (known bug)', () => {
+		it('should preserve precision for bigints > 2^53', () => {
 			const schema = makeSchema([{ name: 'id', affinity: 'INTEGER' }]);
 			const codec = new RowCodec(schema);
 
@@ -98,10 +98,7 @@ describe('RowCodec', () => {
 			const encoded = codec.encodeRow(row);
 			const decoded = codec.decodeRow(encoded);
 
-			// Documents the known precision loss bug (HUNT-7.4.3 line 190):
-			// normalizeValue() converts bigint to Number, which truncates to 2^53.
-			// The original value (2^53 + 1) is irrecoverably lost.
-			expect(decoded[0]).to.equal(9007199254740992); // got 2^53, not 2^53+1
+			expect(decoded[0]).to.equal(largeBigint);
 		});
 	});
 
@@ -118,7 +115,7 @@ describe('RowCodec', () => {
 			expect(parsed.data).to.be.a('string');
 		});
 
-		it('should not restore Uint8Array on decode (known bug)', () => {
+		it('should round-trip Uint8Array values via base64 encoding', () => {
 			const schema = makeSchema([{ name: 'id', affinity: 'INTEGER' }, { name: 'data', affinity: 'BLOB' }]);
 			const codec = new RowCodec(schema);
 
@@ -127,10 +124,8 @@ describe('RowCodec', () => {
 			const encoded = codec.encodeRow(row);
 			const decoded = codec.decodeRow(encoded);
 
-			// This documents the known round-trip bug (HUNT-7.4.3 line 193)
-			// Uint8Array is encoded to base64 but decodeRow() returns the raw base64 string
-			expect(decoded[1]).to.be.a('string');
-			expect(decoded[1]).to.not.be.instanceOf(Uint8Array);
+			expect(decoded[1]).to.be.instanceOf(Uint8Array);
+			expect(new Uint8Array(decoded[1] as Uint8Array)).to.deep.equal(original);
 		});
 	});
 
