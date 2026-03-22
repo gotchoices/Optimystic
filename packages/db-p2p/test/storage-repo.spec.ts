@@ -278,6 +278,89 @@ describe('StorageRepo', () => {
 		});
 	});
 
+	describe('context-driven pending block serving (TEST-5.4.3)', () => {
+		it('serves and promotes a pending block when context proves the action is committed', async () => {
+			// Pend an action that inserts a block — simulating the pend phase
+			const pendResult = await repo.pend({
+				actionId: 'action-1' as ActionId,
+				transforms: makeInsertTransforms('block-1' as BlockId, makeBlock('block-1', { items: ['data'] })),
+				policy: 'c'
+			});
+			expect(pendResult.success).to.equal(true);
+
+			// Do NOT commit through normal path — simulating non-tail commit failure
+			// The action was committed via the tail, so context knows it's committed
+
+			// Get with context proving the action is committed
+			const result = await repo.get({
+				blockIds: ['block-1' as BlockId],
+				context: { committed: [{ actionId: 'action-1' as ActionId, rev: 1 }], rev: 1 }
+			});
+
+			// Block should be served (promoted from pending to committed)
+			expect(result['block-1']?.block).to.not.equal(undefined);
+			expect(result['block-1']?.block?.header.id).to.equal('block-1');
+			expect(result['block-1']?.state.latest?.rev).to.equal(1);
+		});
+
+		it('after context-driven promotion, contextless get returns the block', async () => {
+			// Pend an action
+			await repo.pend({
+				actionId: 'action-1' as ActionId,
+				transforms: makeInsertTransforms('block-1' as BlockId, makeBlock('block-1', { items: ['data'] })),
+				policy: 'c'
+			});
+
+			// Context-driven get triggers promotion
+			await repo.get({
+				blockIds: ['block-1' as BlockId],
+				context: { committed: [{ actionId: 'action-1' as ActionId, rev: 1 }], rev: 1 }
+			});
+
+			// Subsequent contextless get should find the block (promotion persisted)
+			const result = await repo.get({ blockIds: ['block-1' as BlockId] });
+			expect(result['block-1']?.block).to.not.equal(undefined);
+			expect(result['block-1']?.block?.header.id).to.equal('block-1');
+			expect(result['block-1']?.state.latest?.rev).to.equal(1);
+		});
+
+		it('promotes multiple pending blocks from same action via context', async () => {
+			// Multi-block action: tail and non-tail
+			const transforms: Transforms = {
+				inserts: {
+					'tail-block': makeBlock('tail-block'),
+					'data-block': makeBlock('data-block', { items: ['value'] })
+				},
+				updates: {},
+				deletes: []
+			};
+
+			await repo.pend({
+				actionId: 'multi-action' as ActionId,
+				transforms,
+				policy: 'c'
+			});
+
+			// Only commit the tail block via normal path
+			await repo.commit({
+				actionId: 'multi-action' as ActionId,
+				blockIds: ['tail-block' as BlockId],
+				tailId: 'tail-block' as BlockId,
+				rev: 1
+			});
+
+			// Get non-tail block with context — should promote from pending
+			const result = await repo.get({
+				blockIds: ['data-block' as BlockId],
+				context: { committed: [{ actionId: 'multi-action' as ActionId, rev: 1 }], rev: 1 }
+			});
+
+			expect(result['data-block']?.block).to.not.equal(undefined);
+			expect(result['data-block']?.block?.header.id).to.equal('data-block');
+			expect(result['data-block']?.state.latest?.rev).to.equal(1);
+		});
+	});
+
 	describe('concurrent commits (TEST-5.4.1)', () => {
 		it('serializes concurrent commits to same block via latches', async () => {
 			// Setup: create block and two pending actions

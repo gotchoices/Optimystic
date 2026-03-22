@@ -315,6 +315,40 @@ describe('CoordinatorRepo Integration (TEST-5.3.1)', () => {
 		});
 	});
 
+	describe('context-driven pending block serving (TEST-5.4.3)', () => {
+		it('should serve a pending block via context when data is only on the writing peer', async () => {
+			// responsibilityK=1: each block goes to one peer only
+			const mesh = await createMesh(3, { responsibilityK: 1 });
+			const writer = mesh.nodes[0]!;
+			const reader = mesh.nodes[1]!;
+			const blockId = 'block-pending-ctx' as BlockId;
+
+			// Pend on the writer — pending data only on writer's storage
+			const pendResult = await writer.storageRepo.pend({
+				actionId: 'a-pctx',
+				transforms: { inserts: { [blockId]: makeBlock(blockId) }, updates: {}, deletes: [] },
+				policy: 'c'
+			});
+			expect(pendResult.success).to.equal(true);
+
+			// Do NOT commit (simulating non-tail commit failure after tail committed)
+
+			// Reader tries to get the block with context proving the action is committed
+			// This should work: the cluster fetch should query the writer with context,
+			// triggering promotion on the writer, then syncing back to reader
+			const result = await reader.coordinatorRepo.get({
+				blockIds: [blockId],
+				context: { committed: [{ actionId: 'a-pctx', rev: 1 }], rev: 1 }
+			});
+
+			// BUG: The block is NOT found because clusterLatestCallback doesn't pass context
+			// to the remote peer, so the remote peer can't promote its pending data.
+			// After fix, the block should be served:
+			expect(result[blockId]?.block).to.not.equal(undefined,
+				'Pending block should be served when context proves the action is committed');
+		});
+	});
+
 	describe('failure scenarios', () => {
 		it('should fail pend when all cluster peers are unreachable', async () => {
 			const mesh = await createMesh(3, {
