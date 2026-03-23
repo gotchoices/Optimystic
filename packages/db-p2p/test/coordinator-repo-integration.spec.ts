@@ -317,8 +317,9 @@ describe('CoordinatorRepo Integration (TEST-5.3.1)', () => {
 
 	describe('context-driven pending block serving (TEST-5.4.3)', () => {
 		it('should serve a pending block via context when data is only on the writing peer', async () => {
-			// responsibilityK=1: each block goes to one peer only
-			const mesh = await createMesh(3, { responsibilityK: 1 });
+			// responsibilityK=3: all peers are discoverable so the reader's cluster
+			// query will include the writer (data is still only pended on one peer)
+			const mesh = await createMesh(3, { responsibilityK: 3 });
 			const writer = mesh.nodes[0]!;
 			const reader = mesh.nodes[1]!;
 			const blockId = 'block-pending-ctx' as BlockId;
@@ -341,9 +342,8 @@ describe('CoordinatorRepo Integration (TEST-5.3.1)', () => {
 				context: { committed: [{ actionId: 'a-pctx', rev: 1 }], rev: 1 }
 			});
 
-			// BUG: The block is NOT found because clusterLatestCallback doesn't pass context
-			// to the remote peer, so the remote peer can't promote its pending data.
-			// After fix, the block should be served:
+			// Context is forwarded through the cluster callback to the remote peer,
+			// triggering promotion of the pending block:
 			expect(result[blockId]?.block).to.not.equal(undefined,
 				'Pending block should be served when context proves the action is committed');
 		});
