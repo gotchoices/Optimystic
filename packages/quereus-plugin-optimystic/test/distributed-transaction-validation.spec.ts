@@ -111,8 +111,7 @@ describe('Distributed Transaction Validation', function () {
 
 	// No beforeEach/afterEach hooks - let tests run naturally like distributed-quereus.spec.ts
 
-	// Skipped: blocked by commit-phase partial failure (ticket 4-transaction-commit-phase-atomicity) — re-enable after fix
-	it.skip('should validate CHECK constraints independently on each peer', async () => {
+	it('should validate CHECK constraints independently on each peer', async () => {
 		const tableName = 'validated_products_' + Date.now();
 		const collectionUri = `tree://test/${tableName}`;
 
@@ -179,8 +178,7 @@ describe('Distributed Transaction Validation', function () {
 		console.log('✅ Invalid INSERT correctly rejected');
 	});
 
-	// Skipped: blocked by commit-phase partial failure (ticket 4-transaction-commit-phase-atomicity) — re-enable after fix
-	it.skip('should enforce non-repeatability using StampId in column', async () => {
+	it('should enforce non-repeatability using StampId in column', async () => {
 		// Wait for FRET layer to stabilize after previous test
 		console.log('\n⏳ Waiting for FRET layer to stabilize...');
 		await delay(5000);
@@ -334,8 +332,7 @@ describe('Distributed Transaction Validation', function () {
 		console.log('✅ Delete replicated to all nodes');
 	});
 
-	// Skipped: blocked by commit-phase partial failure (ticket 4-transaction-commit-phase-atomicity) — re-enable after fix
-	it.skip('should verify file storage persistence across operations', async () => {
+	it('should verify file storage persistence across operations', async () => {
 		const tableName = 'persisted_data_' + Date.now();
 		const collectionUri = `tree://test/${tableName}`;
 
@@ -391,8 +388,7 @@ describe('Distributed Transaction Validation', function () {
 		console.log('✅ Data persisted and replicated correctly');
 	});
 
-	// Skipped: blocked by commit-phase partial failure (ticket 4-transaction-commit-phase-atomicity) — re-enable after fix
-	it.skip('should handle sequential transactions with constraints from multiple nodes', async () => {
+	it('should handle sequential transactions with constraints from multiple nodes', async () => {
 		const tableName = 'balance_' + Date.now();
 		const collectionUri = `tree://test/${tableName}`;
 
@@ -488,8 +484,7 @@ describe('Distributed Transaction Validation', function () {
 		console.log('✅ Constraint violation correctly rejected');
 	});
 
-	// Skipped: blocked by commit-phase partial failure (ticket 4-transaction-commit-phase-atomicity) — re-enable after fix
-	it.skip('should demonstrate local schema enforcement (column visibility)', async () => {
+	it('should demonstrate local schema enforcement (column visibility)', async () => {
 		// Wait for FRET layer to stabilize
 		console.log('\n⏳ Waiting for FRET layer to stabilize...');
 		await delay(5000);

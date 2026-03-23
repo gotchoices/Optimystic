@@ -2475,14 +2475,15 @@ describe('Transaction', () => {
 			expect(pending.size, 'no orphaned pending actions after partial pend failure').to.equal(0);
 		});
 
-		it('should create partial commit when commitPhase fails for 2nd collection (atomicity violation)', async () => {
+		it('should do forward recovery with retry and targeted cancel on partial commit failure', async () => {
 			const transactor = new TestTransactor();
 			let commitCallCount = 0;
-			const cancelledActionIds: string[] = [];
+			const cancelledCollectionBlockIds: BlockId[][] = [];
 
 			const originalCommit = transactor.commit.bind(transactor);
 			transactor.commit = async (request) => {
 				commitCallCount++;
+				// First call succeeds (collection A), all subsequent calls fail (collection B retries)
 				if (commitCallCount >= 2) {
 					return { success: false, reason: 'Commit rejected' };
 				}
@@ -2490,7 +2491,7 @@ describe('Transaction', () => {
 			};
 			const originalCancel = transactor.cancel.bind(transactor);
 			transactor.cancel = async (actionRef) => {
-				cancelledActionIds.push(actionRef.actionId);
+				cancelledCollectionBlockIds.push(actionRef.blockIds);
 				return originalCancel(actionRef);
 			};
 			transactor.queryClusterNominees = async () => ({ nominees: [] });
@@ -2526,17 +2527,80 @@ describe('Transaction', () => {
 				expect((e as Error).message).to.include('failed');
 			}
 
-			// cancelPhase was called for both collections
-			expect(cancelledActionIds.length, 'cancelPhase called for both collections').to.equal(2);
-
-			// BUG: 1st collection's commit already succeeded — cancel is a no-op on committed blocks.
-			// Atomicity violation: 1st collection is committed, 2nd is not.
+			// Forward recovery: 1st collection committed (unavoidable once commit succeeds)
 			const committed = transactor.getCommittedActions();
-			expect(committed.size, 'BUG: 1st collection committed despite tx failure — atomicity violation').to.be.greaterThan(0);
+			expect(committed.size, 'forward recovery: 1st collection committed after successful commit').to.equal(1);
 
-			// Pending is empty: 1st collection's pending moved to committed, 2nd cancelled
+			// Targeted cancel: only the still-pending (failed) collection was cancelled, not the committed one
+			expect(cancelledCollectionBlockIds.length, 'cancel called only for the non-committed collection').to.equal(1);
+
+			// No orphaned pending actions remain
 			const pending = transactor.getPendingActions();
-			expect(pending.size).to.equal(0);
+			expect(pending.size, 'no orphaned pending actions').to.equal(0);
+
+			// Verify retry: 1 success + 3 retries for the failed collection = 4 total commit calls
+			expect(commitCallCount, 'commit retried 3 times for the failed collection').to.equal(4);
+		});
+
+		it('should retry and succeed when commit transiently fails', async () => {
+			const transactor = new TestTransactor();
+			let commitCallCount = 0;
+			const cancelledBlockIds: BlockId[][] = [];
+
+			const originalCommit = transactor.commit.bind(transactor);
+			transactor.commit = async (request) => {
+				commitCallCount++;
+				// Fail on 2nd call only (1st collection succeeds, 2nd fails once then succeeds on retry)
+				if (commitCallCount === 2) {
+					return { success: false, reason: 'Transient failure' };
+				}
+				return originalCommit(request);
+			};
+			const originalCancel = transactor.cancel.bind(transactor);
+			transactor.cancel = async (actionRef) => {
+				cancelledBlockIds.push(actionRef.blockIds);
+				return originalCancel(actionRef);
+			};
+			transactor.queryClusterNominees = async () => ({ nominees: [] });
+
+			type UserEntry = { key: number; name: string };
+			type PostEntry = { key: number; title: string };
+			const usersTree = await Tree.createOrOpen<number, UserEntry>(transactor, 'users', entry => entry.key);
+			const postsTree = await Tree.createOrOpen<number, PostEntry>(transactor, 'posts', entry => entry.key);
+
+			const collections = new Map();
+			collections.set('users', (usersTree as unknown as { collection: unknown }).collection);
+			collections.set('posts', (postsTree as unknown as { collection: unknown }).collection);
+			const coordinator = new TransactionCoordinator(transactor, collections);
+			const actionsEngine = new ActionsEngine(coordinator);
+
+			const actions: CollectionActions[] = [
+				{ collectionId: 'users', actions: [{ type: 'replace', data: [[1, { key: 1, name: 'Alice' }]] }] },
+				{ collectionId: 'posts', actions: [{ type: 'replace', data: [[10, { key: 10, title: 'Post' }]] }] },
+			];
+			const statements = createActionsStatements(actions);
+			const stamp = await createTransactionStamp('peer1', Date.now(), 'schema1', 'actions@1.0.0');
+			const tx: Transaction = {
+				stamp, statements, reads: [],
+				id: await createTransactionId(stamp.id, statements, [])
+			};
+
+			await actionsEngine.execute(tx);
+			await coordinator.commit(tx);
+
+			// Both collections should be committed after retry succeeds
+			const committed = transactor.getCommittedActions();
+			expect(committed.size, 'both collections committed via forward recovery').to.be.greaterThanOrEqual(1);
+
+			// No cancel calls should have been made
+			expect(cancelledBlockIds.length, 'no cancel calls when retry succeeds').to.equal(0);
+
+			// No orphaned pending actions
+			const pending = transactor.getPendingActions();
+			expect(pending.size, 'no orphaned pending actions').to.equal(0);
+
+			// Verify retry happened: 1st collection succeeded on attempt 1, 2nd failed then succeeded = 3 total
+			expect(commitCallCount, 'commit called 3 times total (1 + fail + retry)').to.equal(3);
 		});
 	});
 

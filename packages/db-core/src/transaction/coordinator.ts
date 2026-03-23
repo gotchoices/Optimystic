@@ -555,7 +555,7 @@ export class TransactionCoordinator {
 			return pendResult;
 		}
 
-		// 3. COMMIT phase: commit to all critical blocks
+		// 3. COMMIT phase: commit to all critical blocks (with retry for forward recovery)
 		const tCommit = Date.now();
 		const commitResult = await this.commitPhase(
 			transaction.id as ActionId,
@@ -564,10 +564,14 @@ export class TransactionCoordinator {
 		);
 		const commitMs = Date.now() - tCommit;
 		if (!commitResult.success) {
-			// Cancel pending actions on failure
-			await this.cancelPhase(transaction.id as ActionId, collectionTransforms);
+			// Targeted cancel: only cancel collections that are still pending (not already committed)
+			await this.cancelPhase(
+				transaction.id as ActionId,
+				pendResult.pendedBlockIds!,
+				commitResult.committedCollections
+			);
 			log('trx:phases trxId=%s gather=%dms pend=%dms commit=%dms (failed) total=%dms', trxId, gatherMs, pendMs, commitMs, Date.now() - t0);
-			return commitResult;
+			return { success: false, error: commitResult.error };
 		}
 
 		// 4. PROPAGATE and CHECKPOINT phases are handled by clusters automatically
@@ -681,18 +685,36 @@ export class TransactionCoordinator {
 	}
 
 	/**
-	 * COMMIT phase: Commit to all critical blocks.
+	 * COMMIT phase: Commit to all critical blocks with retry for transient failures.
+	 *
+	 * Once all collections are pended (Phase 1 passes), the coordinator has decided
+	 * to commit. Failed commits are retried (forward recovery) before giving up.
+	 * Returns which collections committed vs failed so the caller can do targeted cancel.
 	 */
 	private async commitPhase(
 		actionId: ActionId,
 		criticalBlockIds: BlockId[],
 		pendedBlockIds: Map<CollectionId, BlockId[]>
-	): Promise<{ success: boolean; error?: string }> {
-		// Commit each collection's transaction
+	): Promise<{
+		success: boolean;
+		error?: string;
+		committedCollections: Set<CollectionId>;
+		failedCollections: Set<CollectionId>;
+	}> {
+		const committedCollections = new Set<CollectionId>();
+		const failedCollections = new Set<CollectionId>();
+
+		// Commit each collection's transaction with retry
 		for (const [collectionId, blockIds] of pendedBlockIds.entries()) {
 			const collection = this.collections.get(collectionId);
 			if (!collection) {
-				return { success: false, error: `Collection not found: ${collectionId}` };
+				failedCollections.add(collectionId);
+				return {
+					success: false,
+					error: `Collection not found: ${collectionId}`,
+					committedCollections,
+					failedCollections
+				};
 			}
 
 			// Get revision
@@ -704,9 +726,12 @@ export class TransactionCoordinator {
 			);
 
 			if (!logTailBlockId) {
+				failedCollections.add(collectionId);
 				return {
 					success: false,
-					error: `Log tail block not found for collection ${collectionId}`
+					error: `Log tail block not found for collection ${collectionId}`,
+					committedCollections,
+					failedCollections
 				};
 			}
 
@@ -718,41 +743,42 @@ export class TransactionCoordinator {
 				rev
 			};
 
-			// Commit the transaction
-			const commitResult = await this.transactor.commit(commitRequest);
-			if (!commitResult.success) {
-				return {
-					success: false,
-					error: `Commit failed for collection ${collectionId}`
-				};
+			// Retry up to 3 attempts for transient failures
+			let committed = false;
+			for (let attempt = 0; attempt < 3 && !committed; attempt++) {
+				const commitResult = await this.transactor.commit(commitRequest);
+				if (commitResult.success) {
+					committed = true;
+					committedCollections.add(collectionId);
+				} else if (attempt === 2) {
+					failedCollections.add(collectionId);
+					return {
+						success: false,
+						error: `Commit failed for collection ${collectionId} after 3 attempts`,
+						committedCollections,
+						failedCollections
+					};
+				}
 			}
 		}
 
-		return { success: true };
+		return { success: true, committedCollections, failedCollections };
 	}
 
 	/**
-	 * CANCEL phase: Cancel pending actions on all affected blocks.
+	 * CANCEL phase: Cancel pending actions on affected blocks.
+	 *
+	 * Uses the authoritative pended block IDs from pendPhase rather than
+	 * recomputing from transforms. Optionally skips already-committed collections.
 	 */
 	private async cancelPhase(
 		actionId: ActionId,
-		collectionTransforms: Map<CollectionId, Transforms>
+		pendedBlockIds: Map<CollectionId, BlockId[]>,
+		excludeCollections?: Set<CollectionId>
 	): Promise<void> {
-		// Cancel each collection's pending transaction
-		for (const [collectionId, transforms] of collectionTransforms.entries()) {
-			const collection = this.collections.get(collectionId);
-			if (!collection) {
-				continue; // Skip if collection not found
-			}
-
-			// Get the block IDs from transforms
-			const blockIds = blockIdsForTransforms(transforms);
-
-			// Cancel the transaction
-			await this.transactor.cancel({
-				actionId,
-				blockIds
-			});
+		for (const [collectionId, blockIds] of pendedBlockIds.entries()) {
+			if (excludeCollections?.has(collectionId)) continue;
+			await this.transactor.cancel({ actionId, blockIds });
 		}
 	}
 
