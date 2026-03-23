@@ -3,7 +3,7 @@ import chaiAsPromised from 'chai-as-promised'
 use(chaiAsPromised)
 import { Collection, type CollectionInitOptions } from '../src/collection/index.js'
 import { TestTransactor } from './test-transactor.js'
-import type { Action, ActionHandler, BlockStore, IBlock } from '../src/index.js'
+import type { Action, ActionHandler, BlockStore, IBlock, ITransactor, BlockGets, GetBlockResults, ActionBlocks, BlockActionStatus, PendRequest, PendResult, CommitRequest, CommitResult, BlockId } from '../src/index.js'
 
 interface TestAction {
   value: string
@@ -549,6 +549,115 @@ describe('Collection', () => {
         actions.push(a)
       }
       expect(actions).to.have.lengthOf(2)
+    })
+  })
+
+  describe('context bootstrap on collection open', () => {
+    /**
+     * PartialCommitTransactor wraps a TestTransactor to simulate partial commits:
+     * when partialMode is ON, commit() only commits the header and tail blocks,
+     * leaving the rest as pending. This reproduces the scenario where a commit
+     * completed its tail but non-tail blocks are still in-flight.
+     */
+    class PartialCommitTransactor implements ITransactor {
+      partialMode = false
+      constructor(private inner: TestTransactor) {}
+
+      get(b: BlockGets): Promise<GetBlockResults> { return this.inner.get(b) }
+      getStatus(a: ActionBlocks[]): Promise<BlockActionStatus[]> { return this.inner.getStatus(a) }
+      pend(r: PendRequest): Promise<PendResult> { return this.inner.pend(r) }
+      cancel(a: ActionBlocks): Promise<void> { return this.inner.cancel(a) }
+
+      async commit(request: CommitRequest): Promise<CommitResult> {
+        if (this.partialMode) {
+          // Only commit header + tail blocks, leaving the rest as pending
+          const committed = request.blockIds.filter(id =>
+            id === request.tailId || id === request.headerId
+          )
+          return this.inner.commit({ ...request, blockIds: committed })
+        }
+        return this.inner.commit(request)
+      }
+    }
+
+    it('should bootstrap context and open collection with pending non-tail blocks', async () => {
+      const inner = new TestTransactor()
+      const partial = new PartialCommitTransactor(inner)
+
+      // Create and sync collection normally (partialMode OFF)
+      const c1 = await Collection.createOrOpen<TestAction>(partial, collectionId, initOptions)
+      await c1.updateAndSync()
+
+      // Add enough entries in separate syncs to fill the first chain block (32 entries)
+      // and overflow to a second, creating non-tail chain data blocks
+      for (let i = 0; i < 34; i++) {
+        await c1.act({ type: 'set', data: { value: `entry-${i}`, timestamp: i } })
+        await c1.sync()
+      }
+
+      // Now enable partial commit mode: next sync only commits header + tail
+      partial.partialMode = true
+      await c1.act({ type: 'set', data: { value: 'partial-entry', timestamp: 100 } })
+      await c1.sync()
+
+      // Open a fresh collection handle — without bootstrap fix this would fail
+      // because chain walk reads non-tail blocks with context=undefined
+      const c2 = await Collection.createOrOpen<TestAction>(partial, collectionId, initOptions)
+
+      // Verify collection opened successfully and can read the log
+      const actions: Action<TestAction>[] = []
+      for await (const a of c2.selectLog()) {
+        actions.push(a)
+      }
+      expect(actions.length).to.be.greaterThanOrEqual(35)
+    })
+
+    it('should bootstrap context in updateInternal with pending non-tail blocks', async () => {
+      const inner = new TestTransactor()
+      const partial = new PartialCommitTransactor(inner)
+
+      // Create collection and sync normally
+      const c1 = await Collection.createOrOpen<TestAction>(partial, collectionId, initOptions)
+      await c1.updateAndSync()
+
+      // Fill chain to overflow
+      for (let i = 0; i < 34; i++) {
+        await c1.act({ type: 'set', data: { value: `entry-${i}`, timestamp: i } })
+        await c1.sync()
+      }
+
+      // Open a second handle while everything is committed
+      const c2 = await Collection.createOrOpen<TestAction>(partial, collectionId, initOptions)
+
+      // Now partial-commit a new entry on c1
+      partial.partialMode = true
+      await c1.act({ type: 'set', data: { value: 'partial-entry', timestamp: 100 } })
+      await c1.sync()
+
+      // c2.update() should succeed — updateInternal bootstraps context from tail
+      await c2.update()
+
+      const actions: Action<TestAction>[] = []
+      for await (const a of c2.selectLog()) {
+        actions.push(a)
+      }
+      expect(actions.length).to.be.greaterThanOrEqual(35)
+    })
+
+    it('should handle createOrOpen with no prior commits (no bootstrap needed)', async () => {
+      // Fresh collection with no prior commits should work fine — no tailId to bootstrap from
+      const c = await Collection.createOrOpen<TestAction>(transactor, collectionId, initOptions)
+      expect(c.id).to.equal(collectionId)
+
+      // Should be able to add actions and sync
+      await c.act({ type: 'set', data: { value: 'first', timestamp: 1 } })
+      await c.updateAndSync()
+
+      const actions: Action<TestAction>[] = []
+      for await (const a of c.selectLog()) {
+        actions.push(a)
+      }
+      expect(actions).to.have.lengthOf(1)
     })
   })
 })

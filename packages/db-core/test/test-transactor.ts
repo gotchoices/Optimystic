@@ -74,6 +74,26 @@ export class TestTransactor implements ITransactor {
 						// A more complex impl might check committedActions history.
 						block = undefined;
 					}
+				} else if (blockGets.context?.committed) {
+					// Check context.committed for matching pending actions — mirrors coordinator
+					// behavior: context.committed proves the action succeeded, so pending blocks
+					// for that action should be served.
+					for (const { actionId: cId } of blockGets.context.committed) {
+						const pendingTransform = blockState.pendingActions.get(cId);
+						if (pendingTransform) {
+							const baseBlock = blockState.materializedBlocks.get(blockState.latestRev);
+							block = applyTransformSafe(baseBlock, pendingTransform);
+							break;
+						}
+					}
+					// Fall through to standard resolution if no pending match
+					if (block === undefined) {
+						if (blockGets.context.rev !== undefined) {
+							block = structuredClone(latestMaterializedAt(blockState, blockGets.context.rev));
+						} else {
+							block = structuredClone(blockState.materializedBlocks.get(blockState.latestRev));
+						}
+					}
 				} else if (blockGets.context?.rev !== undefined) {
 					// Return the materialized block at the highest revision ≤ requested
 					block = structuredClone(latestMaterializedAt(blockState, blockGets.context.rev));

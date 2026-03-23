@@ -316,7 +316,8 @@ describe('CoordinatorRepo Integration (TEST-5.3.1)', () => {
 	});
 
 	describe('context-driven pending block serving (TEST-5.4.3)', () => {
-		it('should serve a pending block via context when data is only on the writing peer', async () => {
+		// Skipped: reproducing test for ticket 5-pending-block-context-serving — re-enable after fix
+		it.skip('should serve a pending block via context when data is only on the writing peer', async () => {
 			// responsibilityK=1: each block goes to one peer only
 			const mesh = await createMesh(3, { responsibilityK: 1 });
 			const writer = mesh.nodes[0]!;

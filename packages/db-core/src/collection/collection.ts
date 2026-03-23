@@ -46,6 +46,10 @@ export class Collection<TAction> implements ICollection<TAction> {
 		const header = await source.tryGet(id) as CollectionHeaderBlock | undefined;
 
 		if (header) {	// Collection already exists
+			// Bootstrap ActionContext from the committed tail before walking the chain.
+			// This allows the transactor to serve pending non-tail blocks during Log.open.
+			await Collection.bootstrapContext(source, transactor, header);
+
 			const log = (await Log.open<Action<TAction>>(tracker, id))!;
 			source.actionContext = await log.getActionContext();
 		} else {	// Collection does not exist
@@ -100,6 +104,13 @@ export class Collection<TAction> implements ICollection<TAction> {
 		// Start with a context that can see to the end of the log
 		const source = new TransactorSource(this.id, this.transactor, undefined);
 		const tracker = new Tracker(source);
+
+		// Bootstrap context from committed tail so pending blocks are accessible.
+		// Read through tracker so Chain.open inside Log.open reuses the cached header.
+		const header = await tracker.tryGet(this.id);
+		if (header) {
+			await Collection.bootstrapContext(source, this.transactor, header);
+		}
 
 		// Get the latest entries from the log, starting from where we left off
 		const actionContext = this.source.actionContext;
@@ -232,5 +243,29 @@ export class Collection<TAction> implements ICollection<TAction> {
 			}
 		}
 		return true;
+	}
+
+	/** Bootstrap ActionContext from the committed tail block's state.
+	 * The tail is always committed first (commit protocol guarantee), so it's readable
+	 * with context=undefined. Its state.latest contains the ActionRev of the most recent
+	 * committed action — exactly the proof needed for the transactor to serve pending
+	 * non-tail blocks during chain walks.
+	 */
+	private static async bootstrapContext(
+		source: TransactorSource<IBlock>,
+		transactor: ITransactor,
+		header: IBlock,
+	): Promise<void> {
+		const tailId = Object.hasOwn(header, 'tailId') ? (header as any).tailId as BlockId : undefined;
+		if (tailId) {
+			const tailResult = await transactor.get({ blockIds: [tailId] });
+			const tailState = tailResult?.[tailId]?.state;
+			if (tailState?.latest) {
+				source.actionContext = {
+					committed: [{ actionId: tailState.latest.actionId, rev: tailState.latest.rev }],
+					rev: tailState.latest.rev,
+				};
+			}
+		}
 	}
 }

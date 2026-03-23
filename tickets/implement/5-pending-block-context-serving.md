@@ -95,6 +95,7 @@ Phase 2: Update callback implementations
 - [ ] Search for other ClusterLatestCallback implementations and update them
 
 Phase 3: Verify
+- [ ] Re-enable the skipped reproducing test in coordinator-repo-integration.spec.ts (line ~319, marked `.skip`)
 - [ ] Run the full db-p2p test suite — all tests including the new TEST-5.4.3 should pass
 - [ ] Run db-core tests to confirm no regressions
 - [ ] Run the build

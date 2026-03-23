@@ -133,6 +133,23 @@ Add a new test: "should retry and succeed when commit transiently fails":
 - Both collections should end up committed
 - No cancel calls should be made
 
+## Skipped Integration Tests
+
+The following distributed integration tests are skipped (`.skip`) because they all fail with "Some peers did not complete ... (in-flight)" during commit phase. Re-enable after fix:
+
+**quereus-plugin-optimystic/test/distributed-quereus.spec.ts** (4 tests):
+- should create table on one node and access from another
+- should distribute INSERT operations across all nodes
+- should handle UPDATE operations across nodes
+- should handle DELETE operations across nodes
+
+**quereus-plugin-optimystic/test/distributed-transaction-validation.spec.ts** (5 tests):
+- should validate CHECK constraints independently on each peer
+- should enforce non-repeatability using StampId in column
+- should verify file storage persistence across operations
+- should handle sequential transactions with constraints from multiple nodes
+- should demonstrate local schema enforcement (column visibility)
+
 ## TODO
 
 - Modify `commitPhase` return type to include `committedCollections` and `failedCollections` sets
@@ -141,4 +158,5 @@ Add a new test: "should retry and succeed when commit transiently fails":
 - Refactor `cancelPhase` signature to accept `pendedBlockIds: Map<CollectionId, BlockId[]>` and optional `excludeCollections` set
 - Update existing TEST-10.2.1 partial commit test to assert improved behavior (targeted cancel, no orphaned pendings)
 - Add new test: transient commit failure recovers via retry (all collections committed)
-- Verify all 261 existing tests still pass
+- Re-enable the 9 skipped integration tests in quereus-plugin-optimystic (distributed-quereus.spec.ts and distributed-transaction-validation.spec.ts)
+- Verify all existing tests still pass
