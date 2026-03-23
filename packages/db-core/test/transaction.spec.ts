@@ -1212,12 +1212,12 @@ describe('Transaction', () => {
 
 			await session.rollback();
 
-			// After rollback, tracker should be cleared
-			const transforms = coordinator.getTransforms();
-			expect(transforms.size).to.equal(0);
+			// After rollback, session's data should no longer be visible
+			const afterRollback = await usersTree.get(1);
+			expect(afterRollback, 'Alice should be gone after rollback').to.be.undefined;
 		});
 
-		it('should clear transforms across multiple collections on rollback', async () => {
+		it('should discard session data across multiple collections on rollback', async () => {
 			const transactor = new TestTransactor();
 
 			type UserEntry = { key: number; name: string };
@@ -1251,8 +1251,11 @@ describe('Transaction', () => {
 
 			await session.rollback();
 
-			const transformsAfter = coordinator.getTransforms();
-			expect(transformsAfter.size).to.equal(0);
+			// Session's data should be gone from both collections
+			const alice = await usersTree.get(1);
+			expect(alice, 'Alice should be gone after rollback').to.be.undefined;
+			const post = await postsTree.get(10);
+			expect(post, 'Post should be gone after rollback').to.be.undefined;
 		});
 
 		it('should throw when rolling back an already committed session', async () => {
@@ -2760,7 +2763,7 @@ describe('Transaction', () => {
 			expect(usersCollection.source.actionContext?.rev, 'rev should increment to 2').to.equal(2);
 		});
 
-		it('should destroy concurrent session transforms on rollback (BUG: stampId ignored)', async () => {
+		it('should only rollback the given session transforms, preserving other sessions', async () => {
 			const transactor = new TestTransactor();
 
 			type UserEntry = { key: number; name: string };
@@ -2796,12 +2799,20 @@ describe('Transaction', () => {
 			// Rollback session 1 only
 			await session1.rollback();
 
-			// BUG: rollback(_stampId) ignores the stampId and resets ALL collection trackers.
-			// Session 2's transforms are destroyed along with session 1's.
+			// Session 1's data (Alice) should be gone
+			const alice = await usersTree.get(1);
+			expect(alice, 'Alice should be gone after session 1 rollback').to.be.undefined;
+
+			// Session 2's data (Bob) should survive the rollback
+			const bob = await usersTree.get(2);
+			expect(bob, 'Bob should survive session 1 rollback').to.not.be.undefined;
+			expect((bob as UserEntry).name, 'Bob\'s data should be intact').to.equal('Bob');
+
+			// Transforms should still exist (session 2's changes are preserved)
 			const transformsAfter = coordinator.getTransforms();
 			expect(transformsAfter.size,
-				'BUG: rollback destroys ALL sessions\' transforms — stampId parameter is ignored'
-			).to.equal(0);
+				'rollback should preserve other sessions\' transforms'
+			).to.be.greaterThan(0);
 		});
 	});
 

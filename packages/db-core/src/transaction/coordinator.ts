@@ -29,6 +29,14 @@ type Operation =
  * - Commit transactions by running consensus phases (GATHER, PEND, COMMIT)
  */
 export class TransactionCoordinator {
+	/** Per-stampId tracking: snapshot before first apply + accumulated actions for replay */
+	private stampData = new Map<string, {
+		order: number;
+		preSnapshot: Map<CollectionId, Transforms>;
+		actionBatches: CollectionActions[][];
+	}>();
+	private nextStampOrder = 0;
+
 	constructor(
 		private readonly transactor: ITransactor,
 		private readonly collections: Map<CollectionId, Collection<any>>
@@ -48,14 +56,36 @@ export class TransactionCoordinator {
 		actions: CollectionActions[],
 		stampId: string
 	): Promise<void> {
+		// On first call for this stampId, snapshot all collections for potential rollback
+		if (!this.stampData.has(stampId)) {
+			const snapshot = new Map<CollectionId, Transforms>();
+			for (const [id, col] of this.collections) {
+				snapshot.set(id, structuredClone(col.tracker.transforms));
+			}
+			this.stampData.set(stampId, {
+				order: this.nextStampOrder++,
+				preSnapshot: snapshot,
+				actionBatches: []
+			});
+		}
+		this.stampData.get(stampId)!.actionBatches.push(actions);
+
+		await this.applyActionsRaw(actions, stampId);
+	}
+
+	/**
+	 * Apply actions without tracking (used internally and for replay during rollback).
+	 */
+	private async applyActionsRaw(
+		actions: CollectionActions[],
+		stampId: string
+	): Promise<void> {
 		for (const { collectionId, actions: collectionActions } of actions) {
-			// Get collection
 			const collection = this.collections.get(collectionId);
 			if (!collection) {
 				throw new Error(`Collection not found: ${collectionId}`);
 			}
 
-			// Apply each action (tagged with stampId)
 			for (const action of collectionActions) {
 				const taggedAction = { ...(action as any), transaction: stampId };
 				await collection.act(taggedAction);
@@ -155,24 +185,50 @@ export class TransactionCoordinator {
 			};
 			collection.tracker.reset();
 		}
+
+		// Clean up stamp tracking data
+		this.stampData.delete(transaction.stamp.id);
 	}
 
 	/**
-	 * Rollback a transaction (undo applied actions).
+	 * Rollback a transaction (undo only the given stampId's applied actions).
 	 *
-	 * This is called by TransactionSession.rollback() to undo all actions
-	 * that were applied via applyActions().
+	 * Restores tracker state to the snapshot taken before the stampId's first
+	 * applyActions call, then replays any later stamps' actions to preserve
+	 * other sessions' transforms.
 	 *
-	 * @param _stampId - The transaction stamp ID to rollback (currently unused - we clear all trackers)
+	 * @param stampId - The transaction stamp ID to rollback
 	 */
-	async rollback(_stampId: string): Promise<void> {
-		// Clear trackers for all collections
-		// This discards all pending changes that were applied via applyActions()
-		// TODO: In the future, we may want to track which collections were affected by
-		// a specific stampId and only reset those trackers
-		for (const collection of this.collections.values()) {
-			// Reset the tracker to discard all pending transforms
-			collection.tracker.reset();
+	async rollback(stampId: string): Promise<void> {
+		const data = this.stampData.get(stampId);
+		if (!data) return;
+
+		// Reset all collection trackers to the state before this stamp
+		for (const [collectionId, transforms] of data.preSnapshot) {
+			const collection = this.collections.get(collectionId);
+			if (collection) {
+				collection.tracker.reset(structuredClone(transforms));
+			}
+		}
+
+		this.stampData.delete(stampId);
+
+		// Replay all remaining stamps that came after the rolled-back one, in order
+		const toReplay = [...this.stampData.entries()]
+			.filter(([, d]) => d.order > data.order)
+			.sort(([, a], [, b]) => a.order - b.order);
+
+		for (const [replayStampId, replayData] of toReplay) {
+			// Update the snapshot to reflect current (post-rollback) state
+			const newSnapshot = new Map<CollectionId, Transforms>();
+			for (const [id, col] of this.collections) {
+				newSnapshot.set(id, structuredClone(col.tracker.transforms));
+			}
+			replayData.preSnapshot = newSnapshot;
+
+			for (const actionBatch of replayData.actionBatches) {
+				await this.applyActionsRaw(actionBatch, replayStampId);
+			}
 		}
 	}
 
@@ -387,6 +443,9 @@ export class TransactionCoordinator {
 				collection.tracker.reset();
 			}
 		}
+
+		// Clean up stamp tracking data
+		this.stampData.delete(transaction.stamp.id);
 
 		// 6. Return results from actions
 		log('execute:done trxId=%s engine=%dms apply=%dms coordinate=%dms total=%dms', trxId, engineMs, applyMs, coordMs, Date.now() - t0);
