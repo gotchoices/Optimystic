@@ -142,6 +142,19 @@ export class TransactionCoordinator {
 		if (!coordResult.success) {
 			throw new Error(`Transaction commit failed: ${coordResult.error}`);
 		}
+
+		// Reset trackers and update actionContext after successful commit
+		for (const { collection } of collectionData) {
+			const newRev = (collection['source'].actionContext?.rev ?? 0) + 1;
+			collection['source'].actionContext = {
+				committed: [
+					...(collection['source'].actionContext?.committed ?? []),
+					{ actionId: transaction.id, rev: newRev }
+				],
+				rev: newRev,
+			};
+			collection.tracker.reset();
+		}
 	}
 
 	/**

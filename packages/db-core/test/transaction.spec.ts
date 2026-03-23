@@ -2654,6 +2654,112 @@ describe('Transaction', () => {
 			expect(result2.success, 'sequential execute() should succeed with updated actionContext').to.be.true;
 		});
 
+		it('should reset trackers after successful session.commit()', async () => {
+			const transactor = new TestTransactor();
+
+			type UserEntry = { key: number; name: string };
+			const usersTree = await Tree.createOrOpen<number, UserEntry>(
+				transactor, 'users', entry => entry.key
+			);
+
+			const usersCollection = (usersTree as unknown as { collection: unknown }).collection;
+			const collections = new Map();
+			collections.set('users', usersCollection);
+
+			const coordinator = new TransactionCoordinator(transactor, collections);
+			const actionsEngine = new ActionsEngine(coordinator);
+			const session = await TransactionSession.create(coordinator, actionsEngine, 'peer1', 'schema1');
+
+			const actions1: CollectionActions[] = [
+				{ collectionId: 'users', actions: [{ type: 'replace', data: [[1, { key: 1, name: 'Alice' }]] }] }
+			];
+			await session.execute(createActionsStatements(actions1)[0]!, actions1);
+
+			// Transforms exist before commit
+			const transformsBefore = coordinator.getTransforms();
+			expect(transformsBefore.size).to.be.greaterThan(0);
+
+			const result = await session.commit();
+			expect(result.success).to.be.true;
+
+			// FIX VERIFIED: commit() via session path now resets trackers
+			const transformsAfter = coordinator.getTransforms();
+			expect(transformsAfter.size, 'trackers should be clean after session commit').to.equal(0);
+		});
+
+		it('should update actionContext.rev after successful session.commit()', async () => {
+			const transactor = new TestTransactor();
+
+			type UserEntry = { key: number; name: string };
+			const usersTree = await Tree.createOrOpen<number, UserEntry>(
+				transactor, 'users', entry => entry.key
+			);
+
+			const usersCollection = (usersTree as unknown as { collection: unknown }).collection as
+				{ source: { actionContext: { rev: number; committed: unknown[] } | undefined } };
+			const collections = new Map();
+			collections.set('users', usersCollection);
+
+			const coordinator = new TransactionCoordinator(transactor, collections);
+			const actionsEngine = new ActionsEngine(coordinator);
+			const session = await TransactionSession.create(coordinator, actionsEngine, 'peer1', 'schema1');
+
+			const actions1: CollectionActions[] = [
+				{ collectionId: 'users', actions: [{ type: 'replace', data: [[1, { key: 1, name: 'Alice' }]] }] }
+			];
+			await session.execute(createActionsStatements(actions1)[0]!, actions1);
+
+			const result = await session.commit();
+			expect(result.success).to.be.true;
+
+			// FIX VERIFIED: actionContext.rev is updated after session commit
+			const ctx = usersCollection.source.actionContext;
+			expect(ctx?.rev, 'actionContext.rev should be 1 after first session commit').to.equal(1);
+		});
+
+		it('should update actionContext.rev correctly after session commit enabling sequential execute()', async () => {
+			const transactor = new TestTransactor();
+
+			type UserEntry = { key: number; name: string };
+			const usersTree = await Tree.createOrOpen<number, UserEntry>(
+				transactor, 'users', entry => entry.key
+			);
+
+			const usersCollection = (usersTree as unknown as { collection: unknown }).collection as
+				{ source: { actionContext: { rev: number; committed: unknown[] } | undefined } };
+			const collections = new Map();
+			collections.set('users', usersCollection);
+
+			const coordinator = new TransactionCoordinator(transactor, collections);
+			const actionsEngine = new ActionsEngine(coordinator);
+
+			// Session 1: insert Alice via session path
+			const session1 = await TransactionSession.create(coordinator, actionsEngine, 'peer1', 'schema1');
+			const actions1: CollectionActions[] = [
+				{ collectionId: 'users', actions: [{ type: 'replace', data: [[1, { key: 1, name: 'Alice' }]] }] }
+			];
+			await session1.execute(createActionsStatements(actions1)[0]!, actions1);
+			const result1 = await session1.commit();
+			expect(result1.success).to.be.true;
+			expect(usersCollection.source.actionContext?.rev).to.equal(1);
+
+			// FIX VERIFIED: after session commit, actionContext.rev=1 and trackers are clean,
+			// so a subsequent execute() correctly computes rev=2 instead of stale rev=1
+			const actions2: CollectionActions[] = [
+				{ collectionId: 'users', actions: [{ type: 'replace', data: [[2, { key: 2, name: 'Bob' }]] }] }
+			];
+			const statements2 = createActionsStatements(actions2);
+			const stamp2 = await createTransactionStamp('peer1', Date.now() + 1, 'schema1', 'actions@1.0.0');
+			const tx2: Transaction = {
+				stamp: stamp2, statements: statements2, reads: [],
+				id: await createTransactionId(stamp2.id, statements2, [])
+			};
+
+			const result2 = await coordinator.execute(tx2, actionsEngine);
+			expect(result2.success, 'execute() after session commit should succeed with updated rev').to.be.true;
+			expect(usersCollection.source.actionContext?.rev, 'rev should increment to 2').to.equal(2);
+		});
+
 		it('should destroy concurrent session transforms on rollback (BUG: stampId ignored)', async () => {
 			const transactor = new TestTransactor();
 
