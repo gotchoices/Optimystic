@@ -1,0 +1,34 @@
+description: Bootstrap ActionContext from committed tail block before chain walk in Collection.createOrOpen/updateInternal — fixes Missing Block when non-tail blocks are still pending after a partial commit
+dependencies: 5-pending-block-context-serving (storage-side complement; both needed for full convergence)
+files:
+  - packages/db-core/src/collection/collection.ts — Collection.bootstrapContext, createOrOpen, updateInternal
+  - packages/db-core/test/test-transactor.ts — TestTransactor.get (context.committed branch)
+  - packages/db-core/test/collection.spec.ts — "context bootstrap on collection open" describe block
+----
+
+## What was built
+
+**`Collection.bootstrapContext`** (private static) — Reads `tailId` from the header block, fetches the committed tail from the transactor (context=undefined, valid because tail is always committed first), and constructs a bootstrap `ActionContext` from `state.latest`. Called in both `createOrOpen` and `updateInternal` before `Log.open`.
+
+**`TestTransactor.get()` context.committed branch** — When `context.committed` includes a matching `actionId` for a pending block, that pending block is served (mirroring real coordinator behavior). Falls through to standard rev/latest resolution when no pending match.
+
+**`PartialCommitTransactor`** (test helper) — Wraps `TestTransactor`; when `partialMode` is ON, `commit()` only commits tail + header blocks, leaving the rest pending.
+
+## Key design decisions
+
+- Bootstrap context contains only the latest committed ActionRev (single entry). This is sufficient because the commit protocol guarantees sequential completion — if the latest tail is committed, all prior actions are fully committed.
+- `bootstrapContext` calls `transactor.get` directly (not through source/tracker) to avoid caching the bootstrap read. The full context from `log.getActionContext()` immediately replaces it after the chain walk.
+- Uses the established `Object.hasOwn` + cast pattern (consistent with `chain.ts`) for `tailId` access on the header block.
+
+## Tests
+
+Three tests in `collection.spec.ts` under "context bootstrap on collection open":
+
+1. **createOrOpen with pending non-tail blocks** — 34 entries overflow chain block at 32, partial-commit one more, open fresh handle. Verifies chain walk succeeds and all 35+ entries are readable.
+2. **updateInternal with pending non-tail blocks** — Same overflow scenario via `c2.update()` on an existing handle after a partial commit on c1.
+3. **createOrOpen with no prior commits** — Regression test: fresh collection with no tailId bootstraps gracefully.
+
+## Validation
+
+- Build: `npm run build` — clean
+- Tests: `npm test` in `packages/db-core` — 268 passing, 0 failing
