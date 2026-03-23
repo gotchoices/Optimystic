@@ -147,11 +147,11 @@ export class TransactionSession {
 	}
 
 	/**
-	 * Rollback the transaction (discard local state).
+	 * Rollback the transaction (undo this session's applied actions).
 	 *
-	 * Note: Actions have already been applied to collections' trackers.
-	 * Rollback just prevents commit and clears session state.
-	 * Collections will discard tracker state when they sync or update.
+	 * Delegates to coordinator.rollback(stampId) which restores collection
+	 * trackers to the pre-session snapshot and replays any later sessions'
+	 * actions to preserve their transforms.
 	 */
 	async rollback(): Promise<void> {
 		if (this.committed) {

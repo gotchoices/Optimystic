@@ -1,0 +1,41 @@
+# Coordinator Rollback: Scope by stampId
+
+description: coordinator.rollback(stampId) now only discards the given stampId's transforms, preserving other sessions' state
+files:
+  - packages/db-core/src/transaction/coordinator.ts
+  - packages/db-core/src/transaction/session.ts
+  - packages/db-core/test/transaction.spec.ts
+----
+
+## What was built
+
+Fixed `TransactionCoordinator.rollback(stampId)` to undo only the given stampId's transforms, preserving other concurrent sessions' state. Previously rollback ignored the stampId and reset ALL collection trackers.
+
+### Approach: Snapshot + Replay
+
+- On first `applyActions()` for a stampId, `structuredClone` all collections' transforms into a `preSnapshot`
+- Accumulate action batches per stampId in `stampData` map
+- On `rollback(stampId)`: restore trackers to the pre-snapshot, then replay later stamps' action batches
+- Cleanup on `commit()`/`execute()`: delete the stampData entry
+
+## Review notes
+
+- Stale comment in `session.ts:rollback()` was updated to accurately describe the new behavior
+- Filed `tickets/fix/3-rollback-interleaved-batches.md` for an edge case where interleaved `execute()` calls across sessions can cause lower-order stamps' later batches to be lost on rollback of a higher-order stamp
+
+## Key test cases
+
+- Single-session rollback: session data removed, tree structure preserved
+- Multi-collection rollback: data removed from all affected collections
+- Multi-session rollback (the bug fix): rolling back session 1 preserves session 2's data
+- Already-committed / already-rolled-back guard errors
+- Reject execute after rollback
+- Session state flags after rollback
+
+## Testing
+
+- **db-core**: 268 tests passing
+
+## Usage
+
+No API changes — `session.rollback()` works the same way, just correctly scoped now.
