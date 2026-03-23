@@ -2588,9 +2588,9 @@ describe('Transaction', () => {
 			await actionsEngine.execute(tx);
 			await coordinator.commit(tx);
 
-			// Both collections should be committed after retry succeeds
+			// Transaction committed (both collections share one actionId, so committed.size === 1)
 			const committed = transactor.getCommittedActions();
-			expect(committed.size, 'both collections committed via forward recovery').to.be.greaterThanOrEqual(1);
+			expect(committed.size, 'transaction committed').to.equal(1);
 
 			// No cancel calls should have been made
 			expect(cancelledBlockIds.length, 'no cancel calls when retry succeeds').to.equal(0);
