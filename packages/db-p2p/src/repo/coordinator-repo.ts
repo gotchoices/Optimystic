@@ -1,4 +1,4 @@
-import type { PendRequest, ActionBlocks, IRepo, MessageOptions, CommitResult, GetBlockResults, PendResult, BlockGets, CommitRequest, RepoMessage, IKeyNetwork, ICluster, ClusterConsensusConfig, BlockId, ActionRev } from "@optimystic/db-core";
+import type { PendRequest, ActionBlocks, IRepo, MessageOptions, CommitResult, GetBlockResults, PendResult, BlockGets, CommitRequest, RepoMessage, IKeyNetwork, ICluster, ClusterConsensusConfig, BlockId, ActionRev, ActionContext } from "@optimystic/db-core";
 import { LruMap } from "@optimystic/db-core";
 import { ClusterCoordinator } from "./cluster-coordinator.js";
 import type { ClusterClient } from "../cluster/client.js";
@@ -22,7 +22,7 @@ interface LocalClusterWithExecutionTracking extends ICluster {
  * Callback to query a cluster peer for their latest revision of a block.
  * Returns the peer's latest ActionRev if they have the block, undefined otherwise.
  */
-export type ClusterLatestCallback = (peerId: PeerId, blockId: BlockId) => Promise<ActionRev | undefined>;
+export type ClusterLatestCallback = (peerId: PeerId, blockId: BlockId, context?: ActionContext) => Promise<ActionRev | undefined>;
 
 interface CoordinatorRepoComponents {
 	storageRepo: IRepo;
@@ -159,7 +159,7 @@ export class CoordinatorRepo implements IRepo {
 				// If block not found locally (no state), try cluster peers
 				if (!localEntry?.state?.latest) {
 					try {
-						await this.fetchBlockFromCluster(blockId);
+						await this.fetchBlockFromCluster(blockId, blockGets.context);
 						// Re-fetch after sync
 						const refreshed = await this.storageRepo.get({ blockIds: [blockId], context: blockGets.context }, options);
 						if (refreshed[blockId]) {
@@ -175,11 +175,11 @@ export class CoordinatorRepo implements IRepo {
 		return localResult;
 	}
 
-	private async fetchBlockFromCluster(blockId: BlockId): Promise<void> {
+	private async fetchBlockFromCluster(blockId: BlockId, context?: ActionContext): Promise<void> {
 		if (!this.clusterLatestCallback) return;
 
 		// Query cluster for the block
-		const clusterLatest = await this.queryClusterForLatest(blockId);
+		const clusterLatest = await this.queryClusterForLatest(blockId, context);
 		if (clusterLatest) {
 			// Found on cluster - trigger restoration to sync the block
 			await this.storageRepo.get({ blockIds: [blockId], context: { committed: [clusterLatest], rev: clusterLatest.rev } });
@@ -190,7 +190,7 @@ export class CoordinatorRepo implements IRepo {
 	/**
 	 * Query cluster peers to find the maximum latest revision for a block.
 	 */
-	private async queryClusterForLatest(blockId: BlockId): Promise<ActionRev | undefined> {
+	private async queryClusterForLatest(blockId: BlockId, context?: ActionContext): Promise<ActionRev | undefined> {
 		const blockIdBytes = new TextEncoder().encode(blockId);
 		const peers = await this.keyNetwork.findCluster(blockIdBytes);
 		if (!peers || Object.keys(peers).length === 0) {
@@ -211,7 +211,7 @@ export class CoordinatorRepo implements IRepo {
 		const latestResults = await Promise.allSettled(
 			peerIds.map(peerIdStr => {
 				const peerId = peerIdFromString(peerIdStr);
-				return withTimeout(this.clusterLatestCallback!(peerId, blockId), 3000);
+				return withTimeout(this.clusterLatestCallback!(peerId, blockId, context), 3000);
 			})
 		);
 

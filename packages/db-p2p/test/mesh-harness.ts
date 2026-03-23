@@ -109,10 +109,13 @@ export async function createMesh(nodeCount: number, options: MeshOptions): Promi
 	// Build nodes array (partially — coordinatorRepo added after keyNetwork is ready)
 	const nodes: MeshNode[] = [];
 	const peerNetwork = new MockPeerNetwork();
+	// Map peerId → rawStorage for data sync simulation in clusterLatestCallback
+	const rawStorages = new Map<string, InstanceType<typeof MemoryRawStorage>>();
 
 	// Phase 1: create storage + cluster members
 	for (const { peerId, privateKey } of keyPairs) {
 		const rawStorage = new MemoryRawStorage();
+		rawStorages.set(peerId.toString(), rawStorage);
 		const storageRepo = new StorageRepo(
 			(blockId: BlockId) => new BlockStorage(blockId, rawStorage)
 		);
@@ -161,17 +164,39 @@ export async function createMesh(nodeCount: number, options: MeshOptions): Promi
 		};
 	};
 
-	const clusterLatestCallback: ClusterLatestCallback = async (peerId: PeerId, blockId: BlockId): Promise<ActionRev | undefined> => {
-		const target = nodes.find(n => n.peerId.equals(peerId));
-		if (!target) return undefined;
-		const result = await target.storageRepo.get(
-			{ blockIds: [blockId] },
-			{ skipClusterFetch: true } as any
-		);
-		return result[blockId]?.state?.latest;
-	};
-
 	for (const node of nodes) {
+		const localRawStorage = rawStorages.get(node.peerId.toString())!;
+
+		// Per-node callback: queries remote peer and replicates committed data locally
+		// (simulates what SyncClient does in production)
+		const clusterLatestCallback: ClusterLatestCallback = async (peerId: PeerId, blockId: BlockId, context?): Promise<ActionRev | undefined> => {
+			const target = nodes.find(n => n.peerId.equals(peerId));
+			if (!target) return undefined;
+			const result = await target.storageRepo.get(
+				{ blockIds: [blockId], context },
+				{ skipClusterFetch: true } as any
+			);
+			const entry = result[blockId];
+			const latest = entry?.state?.latest;
+
+			// Simulate data sync: replicate committed block data to local storage
+			if (latest && entry?.block) {
+				const localBlockStorage = new BlockStorage(blockId as BlockId, localRawStorage);
+				const localLatest = await localBlockStorage.getLatest();
+				if (!localLatest || localLatest.rev < latest.rev) {
+					// Ensure metadata exists
+					const meta = await localRawStorage.getMetadata(blockId as BlockId);
+					if (!meta) {
+						await localRawStorage.saveMetadata(blockId as BlockId, { latest: undefined, ranges: [[0]] });
+					}
+					await localBlockStorage.saveMaterializedBlock(latest.actionId, entry.block);
+					await localBlockStorage.saveRevision(latest.rev, latest.actionId);
+					await localBlockStorage.setLatest(latest);
+				}
+			}
+
+			return latest;
+		};
 		// Wrap key network to include self in findCluster (matches real Libp2pKeyPeerNetwork behavior)
 		const nodeKeyNetwork: IKeyNetwork = {
 			findCoordinator: (key, opts) => keyNetwork.findCoordinator(key, opts),

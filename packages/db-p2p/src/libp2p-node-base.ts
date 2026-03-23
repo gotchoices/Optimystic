@@ -315,7 +315,7 @@ export async function createLibp2pNodeBase(
 	);
 
 	// Create callback for querying cluster peers for their latest block revision
-	const clusterLatestCallback: ClusterLatestCallback = async (peerId, blockId) => {
+	const clusterLatestCallback: ClusterLatestCallback = async (peerId, blockId, _context?) => {
 		const syncClient = new SyncClient(peerId, keyNetwork, protocolPrefix);
 		try {
 			const response = await syncClient.requestBlock({ blockId, rev: undefined });
