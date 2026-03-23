@@ -2878,6 +2878,69 @@ describe('Transaction', () => {
 				'rollback should preserve other sessions\' transforms'
 			).to.be.greaterThan(0);
 		});
+
+		it('should preserve interleaved batches from lower-order stamp when higher-order stamp is rolled back', async () => {
+			const transactor = new TestTransactor();
+
+			type UserEntry = { key: number; name: string };
+			const usersTree = await Tree.createOrOpen<number, UserEntry>(
+				transactor, 'users', entry => entry.key
+			);
+
+			const usersCollection = (usersTree as unknown as { collection: unknown }).collection;
+			const collections = new Map();
+			collections.set('users', usersCollection);
+
+			const coordinator = new TransactionCoordinator(transactor, collections);
+			const actionsEngine = new ActionsEngine(coordinator);
+
+			// Session 1 created first (order=0)
+			const session1 = await TransactionSession.create(coordinator, actionsEngine, 'peer1', 'schema1');
+			// Session 2 created second (order=1)
+			const session2 = await TransactionSession.create(coordinator, actionsEngine, 'peer2', 'schema1');
+
+			// Session 1 inserts Alice (stamp1 gets snapshot S0={})
+			await session1.execute(createActionsStatements([
+				{ collectionId: 'users', actions: [{ type: 'replace', data: [[1, { key: 1, name: 'Alice' }]] }] }
+			])[0]!, [
+				{ collectionId: 'users', actions: [{ type: 'replace', data: [[1, { key: 1, name: 'Alice' }]] }] }
+			]);
+
+			// Session 2 inserts Bob (stamp2 gets snapshot S1={Alice})
+			await session2.execute(createActionsStatements([
+				{ collectionId: 'users', actions: [{ type: 'replace', data: [[2, { key: 2, name: 'Bob' }]] }] }
+			])[0]!, [
+				{ collectionId: 'users', actions: [{ type: 'replace', data: [[2, { key: 2, name: 'Bob' }]] }] }
+			]);
+
+			// Session 1 inserts Charlie AFTER session 2's snapshot (interleaved batch)
+			await session1.execute(createActionsStatements([
+				{ collectionId: 'users', actions: [{ type: 'replace', data: [[3, { key: 3, name: 'Charlie' }]] }] }
+			])[0]!, [
+				{ collectionId: 'users', actions: [{ type: 'replace', data: [[3, { key: 3, name: 'Charlie' }]] }] }
+			]);
+
+			// Verify all three exist before rollback
+			expect(await usersTree.get(1), 'Alice before rollback').to.not.be.undefined;
+			expect(await usersTree.get(2), 'Bob before rollback').to.not.be.undefined;
+			expect(await usersTree.get(3), 'Charlie before rollback').to.not.be.undefined;
+
+			// Rollback session 2 (higher-order stamp)
+			await session2.rollback();
+
+			// Bob (session 2) should be gone
+			const bob = await usersTree.get(2);
+			expect(bob, 'Bob should be gone after session 2 rollback').to.be.undefined;
+
+			// Alice and Charlie (session 1) should both survive
+			const alice = await usersTree.get(1);
+			expect(alice, 'Alice should survive session 2 rollback').to.not.be.undefined;
+			expect((alice as UserEntry).name).to.equal('Alice');
+
+			const charlie = await usersTree.get(3);
+			expect(charlie, 'Charlie should survive session 2 rollback (interleaved batch)').to.not.be.undefined;
+			expect((charlie as UserEntry).name).to.equal('Charlie');
+		});
 	});
 
 	describe('Clock Skew and Ordering (TEST-10.8.1)', () => {

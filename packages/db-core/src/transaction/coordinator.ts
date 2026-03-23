@@ -203,23 +203,35 @@ export class TransactionCoordinator {
 		const data = this.stampData.get(stampId);
 		if (!data) return;
 
-		// Reset all collection trackers to the state before this stamp
-		for (const [collectionId, transforms] of data.preSnapshot) {
+		this.stampData.delete(stampId);
+
+		// Collect all remaining stamps to replay
+		const toReplay = [...this.stampData.entries()]
+			.sort(([, a], [, b]) => a.order - b.order);
+
+		// Find the earliest snapshot among the rolled-back stamp and all remaining stamps.
+		// This is necessary because interleaved execution means a lower-order stamp
+		// may have batches applied after a higher-order stamp's snapshot was taken.
+		let earliestSnapshot = data.preSnapshot;
+		let earliestOrder = data.order;
+		for (const [, d] of toReplay) {
+			if (d.order < earliestOrder) {
+				earliestSnapshot = d.preSnapshot;
+				earliestOrder = d.order;
+			}
+		}
+
+		// Restore to the earliest snapshot
+		for (const [collectionId, transforms] of earliestSnapshot) {
 			const collection = this.collections.get(collectionId);
 			if (collection) {
 				collection.tracker.reset(structuredClone(transforms));
 			}
 		}
 
-		this.stampData.delete(stampId);
-
-		// Replay all remaining stamps that came after the rolled-back one, in order
-		const toReplay = [...this.stampData.entries()]
-			.filter(([, d]) => d.order > data.order)
-			.sort(([, a], [, b]) => a.order - b.order);
-
+		// Replay all remaining stamps' batches in order
 		for (const [replayStampId, replayData] of toReplay) {
-			// Update the snapshot to reflect current (post-rollback) state
+			// Update the snapshot to reflect current (post-replay) state
 			const newSnapshot = new Map<CollectionId, Transforms>();
 			for (const [id, col] of this.collections) {
 				newSnapshot.set(id, structuredClone(col.tracker.transforms));
