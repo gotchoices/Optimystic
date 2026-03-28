@@ -5,6 +5,7 @@ import { pipe } from 'it-pipe';
 import { fromString as u8FromString } from 'uint8arrays/from-string';
 import { toString as u8ToString } from 'uint8arrays/to-string';
 import * as lp from 'it-length-prefixed';
+import type { Uint8ArrayList } from 'uint8arraylist';
 
 export interface SyncServiceInit {
 	protocolPrefix?: string;
@@ -48,9 +49,7 @@ export class SyncService implements Startable {
 	async start(): Promise<void> {
 		if (this.running) return;
 
-		await this.registrar.handle(this.protocol, async (data: any) => {
-			await this.handleSyncRequest(data.stream);
-		});
+		await this.registrar.handle(this.protocol, this.handleSyncRequest.bind(this));
 
 		this.running = true;
 		this.log('Sync service started on protocol %s', this.protocol);
@@ -65,104 +64,71 @@ export class SyncService implements Startable {
 
 	/**
 	 * Handle an incoming sync request stream.
+	 * Uses a streaming pipeline (like the repo service) to process the
+	 * first request and yield a response without waiting for the client
+	 * to close its write side — avoids a read/write deadlock.
 	 */
-	private async handleSyncRequest(stream: Stream): Promise<void> {
-		try {
-			// Read request using length-prefixed protocol
-			const request = await this.readRequest(stream);
+	/**
+	 * Handle an incoming sync request stream.
+	 * Uses a streaming pipeline (like the repo service) to process the
+	 * request and yield a response immediately — avoids a read/write deadlock.
+	 */
+	private handleSyncRequest(stream: any): void {
+		const self = this;
+		void (async () => {
+			try {
+				const processStream = async function* (source: AsyncIterable<Uint8ArrayList> | Iterable<Uint8ArrayList>) {
+					for await (const msg of source) {
+						const json = u8ToString(msg.subarray(), 'utf8');
+						const request = JSON.parse(json) as SyncRequest;
 
-			this.log(
-				'[Ring Zulu] Received sync request for block %s revision %s',
-				request.blockId,
-				request.rev ?? 'latest'
-			);
+						self.log(
+							'[Ring Zulu] Received sync request for block %s revision %s',
+							request.blockId,
+							request.rev ?? 'latest'
+						);
 
-			// Build archive from local storage
-			const archive = await this.buildArchive(
-				request.blockId,
-				request.rev,
-				request.includePending,
-				request.maxRevisions
-			);
+						const archive = await self.buildArchive(
+							request.blockId,
+							request.rev,
+							request.includePending,
+							request.maxRevisions
+						);
 
-			// Send response
-			const response: SyncResponse = archive
-				? {
-					success: true,
-					archive,
-					responderId: stream.id
-				}
-				: {
-					success: false,
-					error: 'Block not found in local storage'
+						const response: SyncResponse = archive
+							? { success: true, archive, responderId: stream.id ?? stream.stream?.id }
+							: { success: false, error: 'Block not found in local storage' };
+
+						self.log(
+							'[Ring Zulu] %s sync request for block %s',
+							response.success ? 'Fulfilled' : 'Failed',
+							request.blockId
+						);
+
+						yield new TextEncoder().encode(JSON.stringify(response));
+						return;
+					}
 				};
 
-			await this.sendResponse(stream, response);
-
-			this.log(
-				'[Ring Zulu] %s sync request for block %s',
-				response.success ? 'Fulfilled' : 'Failed',
-				request.blockId
-			);
-		} catch (error) {
-			this.log.error('Error handling sync request:', error);
-
-			// Try to send error response
-			try {
-				const errorResponse: SyncResponse = {
-					success: false,
-					error: error instanceof Error ? error.message : 'Unknown error'
-				};
-				await this.sendResponse(stream, errorResponse);
-			} catch (sendError) {
-				this.log.error('Failed to send error response:', sendError);
-			}
-		} finally {
-			try {
-				await stream.close();
-			} catch (closeError) {
-				// Ignore close errors
-			}
-		}
-	}
-
-	/**
-	 * Read and parse a sync request from the stream.
-	 */
-	private async readRequest(stream: Stream): Promise<SyncRequest> {
-		const messages: Uint8Array[] = [];
-
-		// Stream is now directly AsyncIterable in libp2p v3
-		await pipe(
-			stream,
-			lp.decode,
-			async (source) => {
-				for await (const msg of source) {
-					messages.push(msg.subarray());
+				// Use the same streaming pipeline pattern as the repo service.
+				// The registrar handler receives the stream (or data object) directly.
+				const actualStream = stream.stream ?? stream;
+				const responses = pipe(
+					actualStream,
+					(source: any) => lp.decode(source),
+					processStream,
+					(source: any) => lp.encode(source)
+				);
+				for await (const chunk of responses) {
+					actualStream.send(chunk);
 				}
+				await actualStream.close();
+			} catch (error) {
+				self.log.error('Error handling sync request:', error);
+				const actualStream = stream.stream ?? stream;
+				try { actualStream.abort(error instanceof Error ? error : new Error(String(error))); } catch { /* ignore */ }
 			}
-		);
-
-		if (messages.length === 0) {
-			throw new Error('No request received');
-		}
-
-		const json = u8ToString(messages[0]!, 'utf8');
-		return JSON.parse(json) as SyncRequest;
-	}
-
-	/**
-	 * Send a sync response to the stream.
-	 */
-	private async sendResponse(stream: Stream, response: SyncResponse): Promise<void> {
-		const json = JSON.stringify(response);
-		const bytes = u8FromString(json, 'utf8');
-
-		// Use stream.send() instead of piping to stream.sink in libp2p v3
-		const encoded = pipe([bytes], lp.encode);
-		for await (const chunk of encoded) {
-			stream.send(chunk);
-		}
+		})();
 	}
 
 	/**
@@ -189,7 +155,7 @@ export class SyncService implements Startable {
 			const result = await this.repo.get({
 				blockIds: [blockId],
 				context
-			});
+			}, { skipClusterFetch: true } as any);
 
 			const blockResult = result[blockId];
 			if (!blockResult || !blockResult.state.latest) {

@@ -369,11 +369,11 @@ describe('NetworkTransactor', () => {
         const keyStr = uint8ArrayToString(key, 'base64url');
         const peerIds = this.clusterMap.get(keyStr);
         if (!peerIds) {
-          return { [this.fallbackCoordinator]: { multiaddrs: [], publicKey: new Uint8Array() } };
+          return { [this.fallbackCoordinator]: { multiaddrs: [], publicKey: '' } };
         }
         const peers: ClusterPeers = {};
         for (const pid of peerIds) {
-          peers[pid] = { multiaddrs: [], publicKey: new Uint8Array() };
+          peers[pid] = { multiaddrs: [], publicKey: '' };
         }
         return peers;
       }

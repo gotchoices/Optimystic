@@ -23,7 +23,12 @@ export class ClusterClient extends ProtocolClient implements ICluster {
       response = await this.processMessage<any>(message, preferred)
     } catch (err) {
       if (preferred !== '/db-p2p/cluster/1.0.0') {
-        response = await this.processMessage<any>(message, '/db-p2p/cluster/1.0.0')
+        try {
+          response = await this.processMessage<any>(message, '/db-p2p/cluster/1.0.0')
+        } catch (fallbackErr) {
+          // Throw original error - fallback protocol is likely not registered
+          throw err
+        }
       } else {
         throw err
       }

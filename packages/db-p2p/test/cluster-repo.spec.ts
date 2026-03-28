@@ -9,6 +9,16 @@ import { sha256 } from 'multiformats/hashes/sha2';
 import { base58btc } from 'multiformats/bases/base58';
 import { toString as uint8ArrayToString } from 'uint8arrays/to-string';
 
+// ─── Canonical JSON for deterministic hashing ───
+
+function canonicalJson(value: unknown): string {
+	return JSON.stringify(value, (_, v) =>
+		v && typeof v === 'object' && !Array.isArray(v)
+			? Object.keys(v).sort().reduce((o: Record<string, unknown>, k) => { o[k] = v[k]; return o; }, {})
+			: v
+	);
+}
+
 interface KeyPair {
 	peerId: PeerId;
 	privateKey: PrivateKey;
@@ -19,7 +29,7 @@ interface KeyPair {
  * Must match cluster-coordinator.ts createMessageHash().
  */
 const computeMessageHash = async (message: RepoMessage): Promise<string> => {
-	const msgBytes = new TextEncoder().encode(JSON.stringify(message));
+	const msgBytes = new TextEncoder().encode(canonicalJson(message));
 	const hashBytes = await sha256.digest(msgBytes);
 	return base58btc.encode(hashBytes.digest);
 };
@@ -30,13 +40,13 @@ const makeKeyPair = async (): Promise<KeyPair> => {
 };
 
 const computePromiseHash = async (record: ClusterRecord): Promise<string> => {
-	const msgBytes = new TextEncoder().encode(record.messageHash + JSON.stringify(record.message));
+	const msgBytes = new TextEncoder().encode(record.messageHash + canonicalJson(record.message));
 	const hashBytes = await sha256.digest(msgBytes);
 	return uint8ArrayToString(hashBytes.digest, 'base64url');
 };
 
 const computeCommitHash = async (record: ClusterRecord): Promise<string> => {
-	const msgBytes = new TextEncoder().encode(record.messageHash + JSON.stringify(record.message) + JSON.stringify(record.promises));
+	const msgBytes = new TextEncoder().encode(record.messageHash + canonicalJson(record.message) + canonicalJson(record.promises));
 	const hashBytes = await sha256.digest(msgBytes);
 	return uint8ArrayToString(hashBytes.digest, 'base64url');
 };
@@ -76,7 +86,7 @@ const makeClusterPeers = (keyPairs: KeyPair[]): ClusterPeers => {
 	for (const { peerId } of keyPairs) {
 		peers[peerId.toString()] = {
 			multiaddrs: ['/ip4/127.0.0.1/tcp/8000'],
-			publicKey: peerId.publicKey!.raw
+			publicKey: uint8ArrayToString(peerId.publicKey!.raw, 'base64url')
 		};
 	}
 	return peers;
@@ -403,8 +413,10 @@ describe('ClusterMember', () => {
 
 			await clusterMemberInstance.update(record);
 
-			// Should NOT execute operations since we already have our commit
-			expect(mockRepo.getCalls.length).to.equal(0);
+			// With consensus broadcast, the first time we see a record at consensus
+			// we execute the operations (idempotency guard prevents re-execution).
+			// The record contains a 'get' operation, so getCalls should be 1.
+			expect(mockRepo.getCalls.length).to.equal(1);
 		});
 
 		it('adds commit when all promises present', async () => {

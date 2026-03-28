@@ -24,6 +24,16 @@ import { PeerReputationService } from '../src/reputation/peer-reputation.js';
 import { PenaltyReason } from '../src/reputation/types.js';
 import { createMesh, type Mesh } from './mesh-harness.js';
 
+// ─── Canonical JSON for deterministic hashing ───
+
+function canonicalJson(value: unknown): string {
+	return JSON.stringify(value, (_, v) =>
+		v && typeof v === 'object' && !Array.isArray(v)
+			? Object.keys(v).sort().reduce((o: Record<string, unknown>, k) => { o[k] = v[k]; return o; }, {})
+			: v
+	);
+}
+
 // ─── Helpers ───
 
 interface KeyPair {
@@ -37,19 +47,19 @@ const makeKeyPair = async (): Promise<KeyPair> => {
 };
 
 const computeMessageHash = async (message: RepoMessage): Promise<string> => {
-	const msgBytes = new TextEncoder().encode(JSON.stringify(message));
+	const msgBytes = new TextEncoder().encode(canonicalJson(message));
 	const hashBytes = await sha256.digest(msgBytes);
 	return base58btc.encode(hashBytes.digest);
 };
 
 const computePromiseHash = async (record: ClusterRecord): Promise<string> => {
-	const msgBytes = new TextEncoder().encode(record.messageHash + JSON.stringify(record.message));
+	const msgBytes = new TextEncoder().encode(record.messageHash + canonicalJson(record.message));
 	const hashBytes = await sha256.digest(msgBytes);
 	return uint8ArrayToString(hashBytes.digest, 'base64url');
 };
 
 const computeCommitHash = async (record: ClusterRecord): Promise<string> => {
-	const msgBytes = new TextEncoder().encode(record.messageHash + JSON.stringify(record.message) + JSON.stringify(record.promises));
+	const msgBytes = new TextEncoder().encode(record.messageHash + canonicalJson(record.message) + canonicalJson(record.promises));
 	const hashBytes = await sha256.digest(msgBytes);
 	return uint8ArrayToString(hashBytes.digest, 'base64url');
 };
@@ -89,7 +99,7 @@ const makeClusterPeers = (keyPairs: KeyPair[]): ClusterPeers => {
 	for (const { peerId } of keyPairs) {
 		peers[peerId.toString()] = {
 			multiaddrs: ['/ip4/127.0.0.1/tcp/8000'],
-			publicKey: peerId.publicKey!.raw
+			publicKey: uint8ArrayToString(peerId.publicKey!.raw, 'base64url')
 		};
 	}
 	return peers;
@@ -684,11 +694,11 @@ describe('Byzantine Fault Injection (TEST-10.4.1)', () => {
 			const peers: ClusterPeers = {
 				[honest.peerId.toString()]: {
 					multiaddrs: ['/ip4/127.0.0.1/tcp/8000'],
-					publicKey: honest.peerId.publicKey!.raw
+					publicKey: uint8ArrayToString(honest.peerId.publicKey!.raw, 'base64url')
 				},
 				[otherId]: {
 					multiaddrs: ['/ip4/127.0.0.1/tcp/8000'],
-					publicKey: new Uint8Array(0)  // Empty public key
+					publicKey: ''  // Empty public key
 				}
 			};
 
@@ -724,11 +734,11 @@ describe('Byzantine Fault Injection (TEST-10.4.1)', () => {
 			const peers: ClusterPeers = {
 				[honest.peerId.toString()]: {
 					multiaddrs: ['/ip4/127.0.0.1/tcp/8000'],
-					publicKey: honest.peerId.publicKey!.raw
+					publicKey: uint8ArrayToString(honest.peerId.publicKey!.raw, 'base64url')
 				},
 				[otherId]: {
 					multiaddrs: ['/ip4/127.0.0.1/tcp/8000'],
-					publicKey: wrongKey.peerId.publicKey!.raw  // Wrong public key!
+					publicKey: uint8ArrayToString(wrongKey.peerId.publicKey!.raw, 'base64url')  // Wrong public key!
 				}
 			};
 

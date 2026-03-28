@@ -14,6 +14,16 @@ import { PenaltyReason } from '../src/reputation/types.js';
 import { selectArbitrators } from '../src/dispute/arbitrator-selection.js';
 import { sortPeersByDistance, type KnownPeer } from '../src/routing/responsibility.js';
 
+// ─── Canonical JSON for deterministic hashing ───
+
+function canonicalJson(value: unknown): string {
+	return JSON.stringify(value, (_, v) =>
+		v && typeof v === 'object' && !Array.isArray(v)
+			? Object.keys(v).sort().reduce((o: Record<string, unknown>, k) => { o[k] = v[k]; return o; }, {})
+			: v
+	);
+}
+
 // Helpers
 
 async function makeKeyPair() {
@@ -23,7 +33,7 @@ async function makeKeyPair() {
 }
 
 async function computeMessageHash(message: any): Promise<string> {
-	const msgBytes = new TextEncoder().encode(JSON.stringify(message));
+	const msgBytes = new TextEncoder().encode(canonicalJson(message));
 	const hashBytes = await sha256.digest(msgBytes);
 	return base58btc.encode(hashBytes.digest);
 }
@@ -53,12 +63,12 @@ async function makeClusterRecord(
 	for (const { peerId } of peers) {
 		clusterPeers[peerId.toString()] = {
 			multiaddrs: ['/ip4/127.0.0.1/tcp/8000'],
-			publicKey: peerId.publicKey!.raw,
+			publicKey: uint8ArrayToString(peerId.publicKey!.raw, 'base64url'),
 		};
 	}
 
 	// Build promises - some approve, some reject
-	const promiseHashInput = messageHash + JSON.stringify(message);
+	const promiseHashInput = messageHash + canonicalJson(message);
 	const promiseHashBytes = await sha256.digest(new TextEncoder().encode(promiseHashInput));
 	const promiseHash = uint8ArrayToString(promiseHashBytes.digest, 'base64url');
 
@@ -77,7 +87,7 @@ async function makeClusterRecord(
 	}
 
 	// Build commits (from approving peers only)
-	const commitHashInput = messageHash + JSON.stringify(message) + JSON.stringify(promises);
+	const commitHashInput = messageHash + canonicalJson(message) + canonicalJson(promises);
 	const commitHashBytes = await sha256.digest(new TextEncoder().encode(commitHashInput));
 	const commitHash = uint8ArrayToString(commitHashBytes.digest, 'base64url');
 

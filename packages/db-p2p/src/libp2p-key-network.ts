@@ -1,5 +1,5 @@
 import type { AbortOptions, Libp2p, PeerId, Stream } from "@libp2p/interface";
-import { toString as u8ToString } from 'uint8arrays/to-string'
+import { toString as u8ToString, fromString as u8FromString } from 'uint8arrays'
 import type { ClusterPeers, FindCoordinatorOptions, IKeyNetwork, IPeerNetwork } from "@optimystic/db-core";
 import { peerIdFromString } from '@libp2p/peer-id'
 import { multiaddr } from '@multiformats/multiaddr'
@@ -416,12 +416,14 @@ export class Libp2pKeyPeerNetwork implements IKeyNetwork, IPeerNetwork {
 
 		for (const idStr of ids) {
 			if (idStr === this.libp2p.peerId.toString()) {
-				peers[idStr] = { multiaddrs: this.libp2p.getMultiaddrs().map(ma => ma.toString()), publicKey: this.libp2p.peerId.publicKey?.raw ?? new Uint8Array() }
+				const raw = this.libp2p.peerId.publicKey?.raw ?? new Uint8Array()
+				peers[idStr] = { multiaddrs: this.libp2p.getMultiaddrs().map(ma => ma.toString()), publicKey: u8ToString(raw, 'base64url') }
 				continue
 			}
 			const strings = connectedByPeer[idStr] ?? []
 			const remotePeerId = peerIdFromString(idStr)
-			peers[idStr] = { multiaddrs: this.parseMultiaddrs(strings), publicKey: remotePeerId.publicKey?.raw ?? new Uint8Array() }
+			const raw = remotePeerId.publicKey?.raw ?? new Uint8Array()
+			peers[idStr] = { multiaddrs: this.parseMultiaddrs(strings), publicKey: u8ToString(raw, 'base64url') }
 		}
 
 		this.log('findCluster:done key=%s ms=%d peers=%d',

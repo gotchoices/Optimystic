@@ -45,7 +45,8 @@
   "scripts": {
     "clean": "rimraf dist",
     "build": "tsc",
-    "test": "node --import ./register.mjs node_modules/mocha/bin/mocha.js \"test/**/*.spec.ts\" --colors --reporter min"
+    "test": "node --import ./register.mjs node_modules/mocha/bin/mocha.js \"test/**/*.spec.ts\" --colors --reporter min",
+    "test:verbose": "node --import ./register.mjs node_modules/mocha/bin/mocha.js \"test/**/*.spec.ts\" --colors --reporter spec"
   },
   "devDependencies": {
     "@types/chai": "^5.2.3",

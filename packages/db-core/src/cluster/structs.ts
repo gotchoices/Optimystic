@@ -9,7 +9,8 @@ export type Signature = {
 export type ClusterPeers = {
 	[id: string]: {
 		multiaddrs: string[];
-		publicKey: Uint8Array;
+		/** Base64url-encoded public key (serialization-safe) */
+		publicKey: string;
 	};
 };
 

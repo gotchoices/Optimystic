@@ -93,11 +93,15 @@ export class NetworkSimulation implements IKeyNetwork {
 			// Create the ClusterPeers entry
 			result[node.peerId.toString()] = {
 				multiaddrs: node.multiaddrs,
-				publicKey: this.getPeerIdBytes(node.peerId),
+				publicKey: this.getPeerIdString(node.peerId),
 			};
 		}
 
 		return result;
+	}
+
+	private getPeerIdString(peerId: PeerId): string {
+		return peerId.toString();
 	}
 
 	private getPeerIdBytes(peerId: PeerId): Uint8Array {

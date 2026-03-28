@@ -4,6 +4,7 @@ import type { ClusterRecord, ClusterPeers, IKeyNetwork, RepoMessage, ClusterCons
 import type { PeerId } from '@libp2p/interface';
 import { peerIdFromPrivateKey } from '@libp2p/peer-id';
 import { generateKeyPair } from '@libp2p/crypto/keys';
+import { toString as u8ToString } from 'uint8arrays';
 
 const makePeerId = async (): Promise<PeerId> => {
 	const pk = await generateKeyPair('Ed25519');
@@ -85,7 +86,7 @@ describe('ClusterCoordinator retry logic (TEST-5.2.1)', function () {
 			const idStr = pid.toString();
 			clusterPeers[idStr] = {
 				multiaddrs: ['/ip4/127.0.0.1/tcp/8000'],
-				publicKey: pid.publicKey!.raw
+				publicKey: u8ToString(pid.publicKey!.raw, 'base64url')
 			};
 			mockClusters.set(idStr, new MockClusterClient(idStr));
 		}
@@ -114,15 +115,15 @@ describe('ClusterCoordinator retry logic (TEST-5.2.1)', function () {
 		// All 3 commits present
 		expect(Object.keys(result.record.commits)).to.have.length(3);
 
-		// Each mock called exactly twice (promise + commit)
+		// Each mock called exactly three times (promise + commit + consensus broadcast)
 		for (const [_, mock] of mockClusters) {
-			expect(mock.updateCalls).to.equal(2);
+			expect(mock.updateCalls).to.equal(3);
 		}
 
 		// No retry in background — wait briefly and verify no extra calls
 		await new Promise(r => setTimeout(r, 300));
 		for (const [_, mock] of mockClusters) {
-			expect(mock.updateCalls).to.equal(2);
+			expect(mock.updateCalls).to.equal(3);
 		}
 	});
 
@@ -144,8 +145,8 @@ describe('ClusterCoordinator retry logic (TEST-5.2.1)', function () {
 
 		await coordinator.executeClusterTransaction('block-1' as BlockId, makeMessage());
 
-		// Initially: 1 promise call + 1 failed commit call = 2
-		expect(failingMock.updateCalls).to.equal(2);
+		// Initially: 1 promise call + 1 failed commit call + 1 consensus broadcast = 3
+		expect(failingMock.updateCalls).to.equal(3);
 
 		// Wait for first retry (initial interval is 2000ms)
 		await new Promise(r => setTimeout(r, 2500));

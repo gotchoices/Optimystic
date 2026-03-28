@@ -207,11 +207,11 @@ export class CoordinatorRepo implements IRepo {
 				new Promise<undefined>(resolve => setTimeout(() => resolve(undefined), timeoutMs))
 			]);
 
-		// Query peers in parallel for their latest revision (with 3 second timeout per peer)
+		// Query peers in parallel for their latest revision (with 1s timeout per peer)
 		const latestResults = await Promise.allSettled(
 			peerIds.map(peerIdStr => {
 				const peerId = peerIdFromString(peerIdStr);
-				return withTimeout(this.clusterLatestCallback!(peerId, blockId, context), 3000);
+				return withTimeout(this.clusterLatestCallback!(peerId, blockId, context), 1000);
 			})
 		);
 

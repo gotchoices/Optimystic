@@ -237,15 +237,8 @@ export class ClusterMember implements ICluster {
 				log('cluster-member:action-consensus', {
 					messageHash: record.messageHash
 				});
-				// If the incoming record already had our commit, we already executed
-				// (idempotency for duplicate consensus messages)
-				if (inboundPhase !== 'commit') {
-					await this.handleConsensus(currentRecord);
-				} else {
-					log('cluster-member:consensus-skip-already-committed', {
-						messageHash: record.messageHash
-					});
-				}
+				// handleConsensus has its own idempotency guard via executedTransactions
+				await this.handleConsensus(currentRecord);
 				// Don't call clearTransaction here - it happens in handleConsensus
 				shouldPersist = false;
 				break;
@@ -407,7 +400,7 @@ export class ClusterMember implements ICluster {
 	 * Must match cluster-coordinator.ts createMessageHash().
 	 */
 	private async computeMessageHash(message: RepoMessage): Promise<string> {
-		const msgBytes = new TextEncoder().encode(JSON.stringify(message));
+		const msgBytes = new TextEncoder().encode(ClusterMember.canonicalJson(message));
 		const hashBytes = await sha256.digest(msgBytes);
 		return base58btc.encode(hashBytes.digest);
 	}
@@ -437,14 +430,23 @@ export class ClusterMember implements ICluster {
 		}
 	}
 
+	/** Deterministic JSON: sorts object keys so hash is order-independent */
+	private static canonicalJson(value: unknown): string {
+		return JSON.stringify(value, (_, v) =>
+			v && typeof v === 'object' && !Array.isArray(v)
+				? Object.keys(v).sort().reduce((o: Record<string, unknown>, k) => { o[k] = v[k]; return o; }, {})
+				: v
+		);
+	}
+
 	private async computePromiseHash(record: ClusterRecord): Promise<string> {
-		const msgBytes = new TextEncoder().encode(record.messageHash + JSON.stringify(record.message));
+		const msgBytes = new TextEncoder().encode(record.messageHash + ClusterMember.canonicalJson(record.message));
 		const hashBytes = await sha256.digest(msgBytes);
 		return uint8ArrayToString(hashBytes.digest, 'base64url');
 	}
 
 	private async computeCommitHash(record: ClusterRecord): Promise<string> {
-		const msgBytes = new TextEncoder().encode(record.messageHash + JSON.stringify(record.message) + JSON.stringify(record.promises));
+		const msgBytes = new TextEncoder().encode(record.messageHash + ClusterMember.canonicalJson(record.message) + ClusterMember.canonicalJson(record.promises));
 		const hashBytes = await sha256.digest(msgBytes);
 		return uint8ArrayToString(hashBytes.digest, 'base64url');
 	}
@@ -465,7 +467,9 @@ export class ClusterMember implements ICluster {
 		if (!peerInfo?.publicKey?.length) {
 			throw new Error(`No public key for peer ${peerId}`);
 		}
-		const pubKey = publicKeyFromRaw(peerInfo.publicKey);
+		// publicKey is base64url-encoded string (JSON-serialization safe)
+		const keyBytes = uint8ArrayFromString(peerInfo.publicKey, 'base64url');
+		const pubKey = publicKeyFromRaw(keyBytes);
 		const payload = this.computeSigningPayload(hash, signature.type, signature.rejectReason);
 		const sigBytes = uint8ArrayFromString(signature.signature, 'base64url');
 		return pubKey.verify(payload, sigBytes);

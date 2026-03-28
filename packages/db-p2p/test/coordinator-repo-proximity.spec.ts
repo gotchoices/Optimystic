@@ -6,6 +6,7 @@ import type { IRepo, IKeyNetwork, ClusterPeers, BlockGets, GetBlockResults, Pend
 import type { FindCoordinatorOptions } from '@optimystic/db-core';
 import { CoordinatorRepo } from '../src/repo/coordinator-repo.js';
 import type { ClusterClient } from '../src/cluster/client.js';
+import { toString as u8ToString } from 'uint8arrays';
 
 const makePeerId = async (): Promise<PeerId> => {
 	const key = await generateKeyPair('Ed25519');
@@ -18,7 +19,7 @@ const makeClusterPeers = (peerIds: PeerId[]): ClusterPeers => {
 	for (const peerId of peerIds) {
 		peers[peerId.toString()] = {
 			multiaddrs: ['/ip4/127.0.0.1/tcp/8000'],
-			publicKey: peerId.publicKey?.raw ?? new Uint8Array()
+			publicKey: u8ToString(peerId.publicKey?.raw ?? new Uint8Array(), 'base64url')
 		};
 	}
 	return peers;

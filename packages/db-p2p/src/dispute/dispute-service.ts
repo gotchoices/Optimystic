@@ -437,11 +437,14 @@ export class DisputeService {
 	private async verifyDisputeSignature(
 		disputeId: string,
 		signature: string,
-		publicKey?: Uint8Array
+		publicKey?: string | Uint8Array
 	): Promise<boolean> {
 		if (!publicKey?.length) return false;
 		try {
-			const pubKey = publicKeyFromRaw(publicKey);
+			const keyBytes = typeof publicKey === 'string'
+				? uint8ArrayFromString(publicKey, 'base64url')
+				: publicKey;
+			const pubKey = publicKeyFromRaw(keyBytes);
 			const payload = new TextEncoder().encode(disputeId);
 			const sigBytes = uint8ArrayFromString(signature, 'base64url');
 			return pubKey.verify(payload, sigBytes);

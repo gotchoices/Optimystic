@@ -16,7 +16,8 @@
     "clean": "rimraf dist",
     "build": "tsc",
     "start": "node --import ./register.mjs src/run.ts",
-    "test": "node --import ./register.mjs node_modules/mocha/bin/mocha.js \"test/**/*.spec.ts\" --colors --reporter min"
+    "test": "node --import ./register.mjs node_modules/mocha/bin/mocha.js \"test/**/*.spec.ts\" --colors --reporter min",
+    "test:verbose": "node --import ./register.mjs node_modules/mocha/bin/mocha.js \"test/**/*.spec.ts\" --colors --reporter spec"
   },
   "devDependencies": {
     "@types/chai": "^5.2.3",

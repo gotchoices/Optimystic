@@ -11,6 +11,7 @@ import { BlockStorage } from '../src/storage/block-storage.js';
 import { coordinatorRepo, type ClusterLatestCallback } from '../src/repo/coordinator-repo.js';
 import type { CoordinatorRepo } from '../src/repo/coordinator-repo.js';
 import { sortPeersByDistance, type KnownPeer } from '../src/routing/responsibility.js';
+import { toString as u8ToString } from 'uint8arrays';
 
 export interface MeshNode {
 	peerId: PeerId;
@@ -70,7 +71,7 @@ class MockMeshKeyNetwork implements IKeyNetwork {
 		for (const node of selected) {
 			peers[node.peerId.toString()] = {
 				multiaddrs: ['/ip4/127.0.0.1/tcp/8000'],
-				publicKey: node.peerId.publicKey!.raw
+				publicKey: u8ToString(node.peerId.publicKey!.raw, 'base64url')
 			};
 		}
 		return peers;
@@ -206,7 +207,7 @@ export async function createMesh(nodeCount: number, options: MeshOptions): Promi
 				if (!(selfStr in peers)) {
 					peers[selfStr] = {
 						multiaddrs: ['/ip4/127.0.0.1/tcp/8000'],
-						publicKey: node.peerId.publicKey!.raw
+						publicKey: u8ToString(node.peerId.publicKey!.raw, 'base64url')
 					};
 				}
 				return peers;

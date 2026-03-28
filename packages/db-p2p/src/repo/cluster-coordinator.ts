@@ -58,8 +58,17 @@ export class ClusterCoordinator {
 	/**
 	 * Creates a base 58 BTC string hash for a message to uniquely identify a transaction
 	 */
+	/** Deterministic JSON: sorts object keys so hash is order-independent */
+	private static canonicalJson(value: unknown): string {
+		return JSON.stringify(value, (_, v) =>
+			v && typeof v === 'object' && !Array.isArray(v)
+				? Object.keys(v).sort().reduce((o: Record<string, unknown>, k) => { o[k] = v[k]; return o; }, {})
+				: v
+		);
+	}
+
 	private async createMessageHash(message: RepoMessage): Promise<string> {
-		const msgBytes = new TextEncoder().encode(JSON.stringify(message));
+		const msgBytes = new TextEncoder().encode(ClusterCoordinator.canonicalJson(message));
 		const hashBytes = await sha256.digest(msgBytes);
 		return base58btc.encode(hashBytes.digest);
 	}
@@ -511,26 +520,43 @@ export class ClusterCoordinator {
 				peerCount,
 				threshold: this.cfg.simpleMajorityThreshold
 			});
-			// Simple majority proves commitment - we can return success
-			// Notify local cluster with the final merged record so it can execute operations
-			if (this.localCluster) {
-				try {
-					await this.localCluster.update(record);
-				} catch (err) {
-					// Local execution errors shouldn't fail the transaction since consensus was reached
-					log('cluster-tx:local-execution-error', {
-						messageHash: record.messageHash,
-						error: err instanceof Error ? err.message : String(err)
-					});
-				}
-			}
-		}
+			// Broadcast the merged record (with all commit signatures) to ALL peers
+			// so each peer can independently reach consensus and execute the operations.
+			// Without this, only the coordinator's local cluster executes — remote peers
+			// never see enough commits to reach consensus on their own.
+			const broadcastResults = await Promise.allSettled(
+				peerIds.map(peerIdStr => {
+					const isLocal = this.localCluster && peerIdStr === this.localCluster.peerId.toString();
+					return isLocal
+						? this.localCluster!.update(record)
+						: this.createClusterClient(peerIdFromString(peerIdStr)).update(record).catch(err => {
+							log('cluster-tx:consensus-broadcast-error', { messageHash: record.messageHash, peerId: peerIdStr, error: (err as Error).message });
+							return null;
+						});
+				})
+			);
 
-		const missingPeers = commitFailures.map(entry => entry.peerId);
-		if (missingPeers.length > 0) {
-			this.scheduleCommitRetry(record.messageHash, record, missingPeers);
+			// Check for broadcast failures (excluding local)
+			const broadcastFailures: string[] = [];
+			broadcastResults.forEach((result, idx) => {
+				const peerId = peerIds[idx]!;
+				const isLocal = this.localCluster && peerId === this.localCluster.peerId.toString();
+				if (!isLocal && (result.status === 'rejected' || result.value === null)) {
+					broadcastFailures.push(peerId);
+				}
+			});
+			if (broadcastFailures.length > 0) {
+				this.scheduleCommitRetry(record.messageHash, record, broadcastFailures);
+			} else {
+				this.clearRetry(record.messageHash);
+			}
 		} else {
-			this.clearRetry(record.messageHash);
+			const missingPeers = commitFailures.map(entry => entry.peerId);
+			if (missingPeers.length > 0) {
+				this.scheduleCommitRetry(record.messageHash, record, missingPeers);
+			} else {
+				this.clearRetry(record.messageHash);
+			}
 		}
 		return record;
 	}

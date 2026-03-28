@@ -370,11 +370,12 @@ describe('Distributed Transaction Validation', function () {
 		}
 		await delay(2000);
 
-		// Verify files exist in storage directory
-		const storageFiles = await fs.readdir(nodes[0]!.storagePath, { recursive: true });
-		const hasFiles = storageFiles.length > 0;
-		console.log(`   Node 1 storage has ${storageFiles.length} files/directories`);
-		expect(hasFiles, 'Storage directory should have files').to.be.true;
+		// Verify data persisted on Node 1 (the originator)
+		const originStmt = await nodes[0]!.db.prepare(`SELECT SUM(value) as total FROM ${tableName}`);
+		const originResult = await originStmt.get();
+		await originStmt.finalize();
+		console.log(`   Node 1: total = ${originResult?.total}`);
+		expect(originResult?.total, 'Node 1 should see sum of 600').to.equal(600);
 
 		// Verify data on other nodes
 		for (let i = 1; i < nodes.length; i++) {

@@ -25,7 +25,8 @@
 		"dev": "tsup --watch",
 		"clean": "rimraf dist",
 		"typecheck": "tsc --noEmit",
-		"test": "node --import ./register.mjs node_modules/mocha/bin/mocha.js \"test/**/*.spec.ts\" --colors --reporter min"
+		"test": "node --import ./register.mjs node_modules/mocha/bin/mocha.js \"test/**/*.spec.ts\" --colors --reporter min",
+		"test:verbose": "node --import ./register.mjs node_modules/mocha/bin/mocha.js \"test/**/*.spec.ts\" --colors --reporter spec"
 	},
 	"devDependencies": {
 		"@quereus/quereus": "^0.18.0",
