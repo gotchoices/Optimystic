@@ -15,19 +15,16 @@ import * as os from 'node:os';
 import { Database } from '@quereus/quereus';
 import {
 	createLibp2pNode,
-	StorageRepo,
-	BlockStorage,
-	MemoryRawStorage,
 	Libp2pKeyPeerNetwork,
 	RepoClient
 } from '@optimystic/db-p2p';
+import { FileRawStorage } from '@optimystic/db-p2p-storage-fs';
 import { NetworkTransactor } from '@optimystic/db-core';
 import register from '../dist/plugin.js';
 
 interface TestNode {
 	node: any;
 	db: Database;
-	storageRepo: StorageRepo;
 	transactor: NetworkTransactor;
 	peerId: string;
 	storagePath: string;
@@ -386,6 +383,11 @@ describe('Distributed Transaction Validation', function () {
 			console.log(`   Node ${i + 1}: total = ${result?.total}`);
 			expect(result?.total, `Node ${i + 1} should see sum of 600`).to.equal(600);
 		}
+		// Verify that FileRawStorage actually persisted data to disk
+		const node1StorageContents = await fs.readdir(nodes[0]!.storagePath);
+		expect(node1StorageContents.length, 'Node 1 storage should contain block directories on disk').to.be.greaterThan(0);
+		console.log(`   Node 1 storage dirs: ${node1StorageContents.join(', ')}`);
+
 		console.log('✅ Data persisted and replicated correctly');
 	});
 
@@ -561,7 +563,7 @@ describe('Distributed Transaction Validation', function () {
 			port,
 			bootstrapNodes,
 			networkName: NETWORK_NAME,
-			storage: () => new MemoryRawStorage(),
+			storage: new FileRawStorage(storagePath),
 			fretProfile: 'core',  // Use 'core' profile for more consistent coordinator selection
 			clusterSize: MESH_SIZE,
 			clusterPolicy: {
@@ -569,12 +571,6 @@ describe('Distributed Transaction Validation', function () {
 			},
 			arachnode: { enableRingZulu: true }
 		});
-
-		// Use MemoryRawStorage for now to debug - FileRawStorage may have issues
-		const rawStorage = new MemoryRawStorage();
-		const storageRepo = new StorageRepo((blockId: string) =>
-			new BlockStorage(blockId, rawStorage)
-		);
 
 		const keyNetwork = new Libp2pKeyPeerNetwork(node);
 		const coordinatedRepo = (node as any).coordinatedRepo;
@@ -607,7 +603,7 @@ describe('Distributed Transaction Validation', function () {
 			db.registerFunction(func.schema);
 		}
 
-		return { node, db, storageRepo, transactor, peerId: node.peerId.toString(), storagePath };
+		return { node, db, transactor, peerId: node.peerId.toString(), storagePath };
 	}
 });
 

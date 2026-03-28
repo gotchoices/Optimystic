@@ -29,7 +29,7 @@ export class FileRawStorage implements IRawStorage {
 	async saveRevision(blockId: BlockId, rev: number, actionId: ActionId): Promise<void> {
 		await this.ensureAndWriteFile(
 			this.getRevisionPath(blockId, rev),
-			actionId
+			JSON.stringify(actionId)
 		);
 	}
 
