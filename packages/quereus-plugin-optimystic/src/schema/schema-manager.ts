@@ -42,7 +42,6 @@ export interface StoredColumnSchema {
 export interface StoredPrimaryKeyColumn {
 	index: number;
 	desc?: boolean;
-	autoIncrement?: boolean;
 	collation?: string;
 }
 
@@ -155,7 +154,6 @@ export class SchemaManager {
 			primaryKeyDefinition: schema.primaryKeyDefinition.map(pk => ({
 				index: pk.index,
 				desc: pk.desc,
-				autoIncrement: pk.autoIncrement,
 				collation: pk.collation,
 			})),
 			indexes: (schema.indexes || []).map(idx => this.indexSchemaToStored(idx)),

@@ -166,7 +166,6 @@ export class OptimysticVirtualTable extends VirtualTable {
         this.tableSchema.primaryKeyDefinition = storedSchema.primaryKeyDefinition.map(pk => ({
           index: pk.index,
           desc: pk.desc,
-          autoIncrement: pk.autoIncrement,
           collation: pk.collation,
         }));
       }

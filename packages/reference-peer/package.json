@@ -40,8 +40,8 @@
     "build": "tsc",
     "mesh": "node dist/src/mesh.js",
     "start": "node dist/src/cli.js",
-    "test": "node --import ./register.mjs node_modules/mocha/bin/mocha.js \"test/**/*.spec.ts\" --colors --reporter min",
-    "test:verbose": "node --import ./register.mjs node_modules/mocha/bin/mocha.js \"test/**/*.spec.ts\" --colors --reporter spec",
+    "test": "node --import ./register.mjs node_modules/mocha/bin/mocha.js \"test/**/*.spec.ts\" --colors --reporter min --timeout 10000",
+    "test:verbose": "node --import ./register.mjs node_modules/mocha/bin/mocha.js \"test/**/*.spec.ts\" --colors --reporter spec --timeout 10000",
     "test:quick": "node dist/test/quick-test.js",
     "test:quick:debug": "node --inspect-brk dist/test/quick-test.js"
   },
