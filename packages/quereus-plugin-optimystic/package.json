@@ -1,6 +1,6 @@
 {
   "name": "@optimystic/quereus-plugin-optimystic",
-  "version": "0.9.0",
+  "version": "0.9.1",
   "description": "Quereus plugin for Optimystic distributed tree collections",
   "type": "module",
   "main": "dist/index.js",
@@ -34,7 +34,8 @@
     "quoomb:node2": "quoomb --config examples/quoomb.config.node2.env.json"
   },
   "devDependencies": {
-    "@quereus/quereus": "^0.18.0",
+    "@optimystic/db-p2p-storage-fs": "workspace:^",
+    "@quereus/quereus": "^1.2.0",
     "@types/chai": "^5.2.3",
     "@types/mocha": "^10.0.10",
     "@types/node": "^25.2.0",
