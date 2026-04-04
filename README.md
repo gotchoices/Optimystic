@@ -72,8 +72,10 @@ const node = await createLibp2pNode({
 
 For persistent storage on RN, use `@optimystic/db-p2p-storage-rn` (MMKV backend).
 
-See [packages/db-p2p README](packages/db-p2p/README.md#react-native) for full details
-including required polyfills.
+Hermes requires polyfills for several globals (crypto, structuredClone,
+Promise.withResolvers, EventTarget, etc.) and Metro module aliases for Node.js
+built-ins (os, crypto, stream, buffer).  See [packages/db-p2p README](packages/db-p2p/README.md#react-native)
+for the full polyfill checklist and recommended shims.
 
 ## Use Cases
 

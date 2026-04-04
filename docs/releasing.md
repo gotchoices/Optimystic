@@ -9,8 +9,17 @@ Tags use the `v` prefix (e.g. `v0.7.0`).
 
 - `yarn build` succeeds
 - `yarn test` passes
+- Clean working tree (`git status` shows no uncommitted changes)
 
-## Steps
+## Quick Release
+
+```bash
+yarn release
+```
+
+This runs `yarn bump` (interactive version prompt, commits, tags, pushes) then `yarn pub` (clean + build + publish each package).
+
+## Step by Step
 
 ### 1. Ensure a clean working tree
 
@@ -19,9 +28,7 @@ git status          # no uncommitted changes
 git pull origin main
 ```
 
-### 2. Bump versions
-
-`bumpp` updates all `package.json` files, tags, and pushes. You commit manually first.
+### 2. Bump, commit, tag, and push
 
 ```bash
 # Interactive — prompts for version type (major / minor / patch / prerelease)
@@ -35,23 +42,11 @@ yarn bump --release major
 
 `bumpp` will:
 1. Update `version` in all `package.json` files (recursive)
-2. Create an annotated tag: `v{version}`
-3. Push the commit and tag to `origin`
+2. Commit the changes
+3. Create an annotated tag: `v{version}`
+4. Push the commit and tag to `origin`
 
-It will **not** commit — you do that yourself before running bump:
-
-### 3. Commit
-
-Commit all pending changes (including any work beyond the version bump) before running `yarn bump`:
-
-```bash
-git add -A
-git commit -m "v{version}"
-```
-
-Then `yarn bump` will tag and push.
-
-### 4. Publish to npm
+### 3. Publish to npm
 
 ```bash
 # Publish all public packages (clean + build + publish each)
@@ -67,7 +62,7 @@ yarn pub:quereus-crypto
 # etc.
 ```
 
-### 5. Create a GitHub release (optional)
+### 4. Create a GitHub release (optional)
 
 ```bash
 gh release create v{version} --generate-notes
@@ -83,7 +78,7 @@ yarn bump --release prerelease --preid beta  # e.g. 0.7.0-beta.0
 Publish prereleases with a dist-tag so they don't become `latest`:
 
 ```bash
-# Publish each package with --tag next manually
+# Manually publish each package with --tag next
 ```
 
 ## Version Alignment
@@ -94,7 +89,6 @@ All packages in the monorepo share the same version number. The `--recursive` fl
 
 - [ ] `yarn build` succeeds
 - [ ] `yarn test` passes
-- [ ] Commit: `git add -A && git commit -m "v{version}"`
-- [ ] `yarn bump` (interactive version selection — tags and pushes)
-- [ ] `yarn pub`
+- [ ] Clean working tree
+- [ ] `yarn release` (or `yarn bump` + `yarn pub` separately)
 - [ ] GitHub release created

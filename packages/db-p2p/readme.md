@@ -520,12 +520,38 @@ const node = await createLibp2pNode({
 });
 ```
 
-RN environments (Hermes, JSC) may also need polyfills for globals that libp2p
-and its dependencies expect.  Install these early (e.g. in your app's entry file
-before any other imports):
+RN environments (Hermes) need polyfills for globals that libp2p and its
+dependencies expect. Install these early (e.g. in your app's entry file
+before any other imports).
 
-- `crypto.getRandomValues` — e.g. `react-native-get-random-values`
-- `TextEncoder` / `TextDecoder` — e.g. `text-encoding` or `fast-text-encoding`
+**Global polyfills** (patch `globalThis` before any library code):
+
+| API | Required by | Notes |
+|-----|-------------|-------|
+| `crypto.getRandomValues()` | @noble/hashes, @libp2p/crypto | RN 0.76+ New Architecture provides natively; fallback via e.g. `react-native-get-random-values` |
+| `crypto.subtle.digest()` | multiformats/hashes/sha2-browser | Async SHA-256/SHA-512 — implement via @noble/hashes |
+| `structuredClone()` | @optimystic/db-core | JSON round-trip is sufficient |
+| `Promise.withResolvers()` | @libp2p/utils, @chainsafe/libp2p-yamux, it-queue | ES2024 — simple shim |
+| `AbortSignal.prototype.throwIfAborted()` | libp2p, @libp2p/circuit-relay-v2, it-pushable | DOM spec addition — simple shim |
+| Timer `.ref()` / `.unref()` | @optimystic/db-p2p, undici | Wrap Hermes numeric timer IDs in objects with no-op `.ref()`/`.unref()` methods; patch `clearTimeout`/`clearInterval` to unwrap |
+| `Event`, `CustomEvent`, `EventTarget` | libp2p, @libp2p/interface | Custom shim or npm `event-target-polyfill` |
+| `Intl.PluralRules` | moat-maker | English-only ordinal/cardinal shim is sufficient |
+
+**Node.js built-in module shims** (via Metro `extraNodeModules` or bundler aliases):
+
+| Module | Required by | Recommended shim |
+|--------|-------------|------------------|
+| `os` / `node:os` | @libp2p/utils | Custom shim: `networkInterfaces()` → `{}`, `platform()` → `Platform.OS` |
+| `crypto` / `node:crypto` | multiformats/hashes/sha2 | Custom shim: `createHash()` via @noble/hashes |
+| `stream` / `node:stream` | libp2p | `readable-stream` (npm) |
+| `buffer` / `node:buffer` | libp2p, multiformats | `buffer` (npm) |
+
+**Built-in (no polyfill needed):**
+- `TextEncoder` — built-in to Hermes
+- `TextDecoder` — built-in to Expo SDK 52+ (UTF-8 only)
+- `BigInt` — built-in to Hermes since RN 0.70
+
+See the [Sereus reference-app-rn](https://github.com/gotchoices/sereus/tree/master/packages/reference-app-rn/polyfills) for working polyfill implementations.
 
 ### Ring Transitions
 
