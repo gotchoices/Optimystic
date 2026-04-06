@@ -16,7 +16,7 @@ files:
 
 ## Context
 
-`ClusterCoordinator` and `ClusterMember` store all 2PC transaction state in plain `Map`s (cluster-coordinator.ts:39, cluster-repo.ts:74-76). On crash, state is lost and transactions may be orphaned. This ticket extracts that state behind a platform-agnostic interface so that a persistent implementation (file, MMKV, etc.) can be injected later.
+`ClusterCoordinator` and `ClusterMember` store all 2PC transaction state in plain `Map`s (cluster-coordinator.ts:39, cluster-repo.ts:74-76). On crash, state is lost and transactions may be orphaned. This ticket extracts that state behind a platform-agnostic interface so that a persistent implementation can be injected later via `IKVStore` (see recovery-persistence ticket).
 
 This is purely a refactoring ticket. The `MemoryTransactionStateStore` preserves exact current behavior. All existing tests must pass unchanged.
 

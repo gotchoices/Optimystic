@@ -1,55 +1,131 @@
-# 2PC File Persistence + Recovery Protocol
+# 2PC Portable Persistence + Recovery Protocol
 
-description: Persistent ITransactionStateStore implementation with crash recovery for coordinator and participant
+description: IKVStore abstraction, PersistentTransactionStateStore implementation, and crash recovery for coordinator and participant
 dependencies: 4-2pc-state-store-interface (interface must be wired first)
 files:
-  - packages/db-p2p-storage-fs/src/file-transaction-state-store.ts (NEW - file-based implementation)
+  - packages/db-p2p/src/storage/i-kv-store.ts (NEW - portable async key-value interface)
+  - packages/db-p2p/src/storage/memory-kv-store.ts (NEW - in-memory IKVStore for testing)
+  - packages/db-p2p/src/cluster/persistent-transaction-state-store.ts (NEW - IKVStore-backed ITransactionStateStore)
+  - packages/db-p2p/src/index.ts (export new modules)
+  - packages/db-p2p-storage-fs/src/file-kv-store.ts (NEW - fs-based IKVStore)
   - packages/db-p2p-storage-fs/src/index.ts (export new module)
+  - packages/db-p2p-storage-rn/src/mmkv-kv-store.ts (NEW - MMKV-backed IKVStore adapter)
+  - packages/db-p2p-storage-rn/src/index.ts (export new module)
   - packages/db-p2p/src/repo/cluster-coordinator.ts (add recovery method)
   - packages/db-p2p/src/cluster/cluster-repo.ts (add recovery method)
-  - packages/db-p2p/test/transaction-state-store.spec.ts (NEW - persistence + recovery tests)
-  - packages/db-p2p-storage-fs/package.json (verify no new deps needed)
   - packages/db-p2p/src/libp2p-node-base.ts (call recovery on startup)
+  - packages/db-p2p/test/transaction-state-store.spec.ts (NEW - persistence + recovery tests)
 ----
 
 ## Context
 
-After the `ITransactionStateStore` interface is wired (see dependency ticket), this ticket adds a file-based persistent implementation and startup recovery logic. This is what actually enables crash recovery for 2PC transactions.
+After the `ITransactionStateStore` interface is wired (see dependency ticket), this ticket adds persistent transaction state and startup recovery logic. This is what actually enables crash recovery for 2PC transactions.
 
-## FileTransactionStateStore
+The project uses portable storage abstractions (`IRawStorage` with `FileRawStorage`, `MMKVRawStorage`, `MemoryRawStorage` implementations) so it runs on Node, React Native, NativeScript, and browser. Transaction state persistence must follow this same pattern — no direct `fs.promises` or other platform-specific I/O in the store implementation.
 
-File-based implementation in `db-p2p-storage-fs`, following the same patterns as `FileRawStorage` (file-storage.ts).
+Since `IRawStorage` is block-oriented (keyed by `BlockId` + `ActionId`, stores `Transform`/`BlockMetadata`), it doesn't map cleanly to the key-value semantics needed for transaction state. Instead, we introduce a minimal `IKVStore` interface — a general-purpose portable async key-value abstraction. Platform packages provide implementations using their existing infrastructure (`fs.promises`, MMKV, etc.), and `PersistentTransactionStateStore` is written once in `db-p2p` on top of `IKVStore`.
 
-### Directory Layout
+## IKVStore Interface
+
+New file: `packages/db-p2p/src/storage/i-kv-store.ts`
+
+```typescript
+/** Portable async key-value store. Platform packages provide implementations. */
+export interface IKVStore {
+    get(key: string): Promise<string | undefined>;
+    set(key: string, value: string): Promise<void>;
+    delete(key: string): Promise<void>;
+    /** Return all keys matching the given prefix */
+    list(prefix: string): Promise<string[]>;
+}
+```
+
+This is intentionally minimal — just enough for `PersistentTransactionStateStore` and reusable for future needs (e.g., `NetworkStatePersistence` could be refactored to use it).
+
+### MemoryKVStore
+
+New file: `packages/db-p2p/src/storage/memory-kv-store.ts`
+
+In-memory `IKVStore` backed by a `Map<string, string>`. Used for testing `PersistentTransactionStateStore` without platform I/O.
+
+## Platform Implementations
+
+### FileKVStore (db-p2p-storage-fs)
+
+New file: `packages/db-p2p-storage-fs/src/file-kv-store.ts`
+
+Maps keys to files under a base directory. Keys may contain `/` separators which become subdirectories:
+- Key `coordinator/abc123` → file `{basePath}/coordinator/abc123.json`
+- `list("coordinator/")` → `readdir` on `{basePath}/coordinator/`, return prefixed keys
+
+Uses `fs.promises` — same patterns as `FileRawStorage` (`ensureDir` + `writeFile`, `unlink` ignoring ENOENT, `readdir` + `readFile`).
+
+Export from `packages/db-p2p-storage-fs/src/index.ts`:
+```
+export * from "./file-kv-store.js";
+```
+
+### MMKVKVStore (db-p2p-storage-rn)
+
+New file: `packages/db-p2p-storage-rn/src/mmkv-kv-store.ts`
+
+Trivial adapter wrapping the existing `MMKV` interface (already defined in mmkv-storage.ts):
+
+```typescript
+import type { MMKV } from './mmkv-storage.js';
+import type { IKVStore } from '@optimystic/db-p2p';
+
+export class MMKVKVStore implements IKVStore {
+    constructor(private readonly mmkv: MMKV, private readonly prefix = 'optimystic:txn:') {}
+    async get(key: string) { return this.mmkv.getString(this.prefix + key); }
+    async set(key: string, value: string) { this.mmkv.set(this.prefix + key, value); }
+    async delete(key: string) { this.mmkv.delete(this.prefix + key); }
+    async list(prefix: string) {
+        const fullPrefix = this.prefix + prefix;
+        return this.mmkv.getAllKeys()
+            .filter(k => k.startsWith(fullPrefix))
+            .map(k => k.slice(this.prefix.length));
+    }
+}
+```
+
+Export from `packages/db-p2p-storage-rn/src/index.ts`:
+```
+export * from "./mmkv-kv-store.js";
+```
+
+## PersistentTransactionStateStore
+
+New file: `packages/db-p2p/src/cluster/persistent-transaction-state-store.ts`
+
+Implements `ITransactionStateStore` using an `IKVStore` for persistence. Written once, works on all platforms.
+
+### Key Namespace
 
 ```
-{basePath}/
-├── coordinator/
-│   ├── {messageHash}.json       # PersistedCoordinatorState
-│   └── ...
-├── participant/
-│   ├── {messageHash}.json       # PersistedParticipantState
-│   └── ...
-└── executed/
-    ├── {messageHash}.json       # { timestamp: number }
-    └── ...
+coordinator/{messageHash}   → JSON(PersistedCoordinatorState)
+participant/{messageHash}    → JSON(PersistedParticipantState)
+executed/{messageHash}       → JSON({ timestamp: number })
 ```
 
 ### Implementation Notes
 
-- Use `fs.promises` for all I/O (same as FileRawStorage)
-- `ensureDir` + `writeFile` pattern from FileRawStorage
-- `readdir` + `readFile` for `getAll*` methods
-- `unlink` for delete (ignore ENOENT, same as FileRawStorage.deletePendingTransaction)
-- `messageHash` is base58btc-encoded, safe for filenames
+- Constructor takes `IKVStore`
+- All methods are thin JSON serialize/deserialize wrappers over `IKVStore` get/set/delete/list
+- `getAllCoordinatorStates()` → `kvStore.list("coordinator/")` then `kvStore.get()` each key, parse JSON
+- `getAllParticipantStates()` → `kvStore.list("participant/")` then `kvStore.get()` each key, parse JSON
+- `pruneExecuted(olderThan)` → `kvStore.list("executed/")`, get each, delete if `timestamp < olderThan`
+- `messageHash` is base58btc-encoded, safe for filenames/keys
 - JSON serialization (ClusterRecord is fully JSON-serializable — signatures are base64url strings)
 - No locking needed: single-process access, JS single-threaded event loop
 
-### Export from db-p2p-storage-fs
+### Export from db-p2p
 
-Add to `packages/db-p2p-storage-fs/src/index.ts`:
+Add to `packages/db-p2p/src/index.ts`:
 ```
-export * from "./file-transaction-state-store.js";
+export * from "./storage/i-kv-store.js";
+export * from "./storage/memory-kv-store.js";
+export * from "./cluster/persistent-transaction-state-store.js";
 ```
 
 ## Recovery Protocol
@@ -134,15 +210,21 @@ The recovery methods are optional (no-op when `stateStore` is undefined).
 
 ## Tests
 
-### Unit tests for FileTransactionStateStore
+### Unit tests for IKVStore implementations
+- MemoryKVStore: set/get/delete round-trip, list with prefix filtering, delete of non-existent key is no-op
+- FileKVStore: same suite but against temp directory (cleanup after test)
+
+### Unit tests for PersistentTransactionStateStore
 - Save/get/delete coordinator state round-trip
-- Save/get/delete participant state round-trip  
+- Save/get/delete participant state round-trip
 - markExecuted + wasExecuted round-trip
 - getAllCoordinatorStates returns all entries
 - getAllParticipantStates returns all entries
 - pruneExecuted removes old entries, keeps recent
 - Delete of non-existent key is no-op (no throw)
 - Concurrent writes to different keys
+
+Uses `MemoryKVStore` as the backing store — tests the serialization/persistence logic without platform I/O.
 
 ### Recovery scenario tests
 - **Coordinator recovery: expired transactions cleaned up** — persist a coordinator state with expired message, call recoverTransactions, verify deleted
@@ -160,28 +242,36 @@ The recovery methods are optional (no-op when `stateStore` is undefined).
 
 ## TODO
 
-### Phase 1: FileTransactionStateStore
-- Create `packages/db-p2p-storage-fs/src/file-transaction-state-store.ts`
-- Implement all ITransactionStateStore methods using fs.promises
-- Export from `packages/db-p2p-storage-fs/src/index.ts`
+### Phase 1: IKVStore interface + implementations
+- Create `packages/db-p2p/src/storage/i-kv-store.ts` with `IKVStore` interface
+- Create `packages/db-p2p/src/storage/memory-kv-store.ts` (Map-backed, for testing)
+- Create `packages/db-p2p-storage-fs/src/file-kv-store.ts` (fs.promises-backed)
+- Create `packages/db-p2p-storage-rn/src/mmkv-kv-store.ts` (MMKV adapter)
+- Export from respective `index.ts` files
 
-### Phase 2: Coordinator recovery
+### Phase 2: PersistentTransactionStateStore
+- Create `packages/db-p2p/src/cluster/persistent-transaction-state-store.ts`
+- Implement all ITransactionStateStore methods via IKVStore with JSON serialization
+- Export from `packages/db-p2p/src/index.ts`
+
+### Phase 3: Coordinator recovery
 - Add `recoverTransactions()` to ClusterCoordinator
 - Handle expired cleanup, broadcasting retry resumption, stale state cleanup
 - Log all recovery actions
 
-### Phase 3: Member recovery
+### Phase 4: Member recovery
 - Add `recoverTransactions()` to ClusterMember
 - Restore executedTransactions from store
 - Restore activeTransactions with fresh timeouts
 - Clean up expired entries
 
-### Phase 4: Startup wiring
+### Phase 5: Startup wiring
 - Call recovery methods during node bootstrap in libp2p-node-base.ts
 - Ensure recovery happens before the node accepts incoming requests
 
-### Phase 5: Tests
-- Unit tests for FileTransactionStateStore
+### Phase 6: Tests
+- Unit tests for MemoryKVStore and FileKVStore
+- Unit tests for PersistentTransactionStateStore (using MemoryKVStore)
 - Recovery scenario tests for coordinator
 - Recovery scenario tests for member (especially double-execution prevention)
 - Run full test suite: `yarn test:p2p` and `yarn test:p2p-storage-fs`
