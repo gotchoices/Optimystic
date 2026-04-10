@@ -177,6 +177,10 @@ describe('ClusterMember', () => {
 		});
 	});
 
+	afterEach(() => {
+		clusterMemberInstance.dispose();
+	});
+
 	describe('update - promise phase', () => {
 		it('adds own promise when not present', async () => {
 			const otherKeyPair = await makeKeyPair();
@@ -1202,7 +1206,6 @@ describe('ClusterMember', () => {
 
 	describe('dispose', () => {
 		it('clears intervals and empties active transactions', async () => {
-			const ourId = selfKeyPair.peerId.toString();
 			const peers = makeClusterPeers([selfKeyPair]);
 
 			// Create a transaction so there's active state
@@ -1215,14 +1218,13 @@ describe('ClusterMember', () => {
 			// Call dispose
 			clusterMemberInstance.dispose();
 
-			// Active transactions should be empty — verified by sending a new record
-			// for the same block without conflict (if state leaked, this would conflict)
+			// After dispose, a new transaction should process cleanly from scratch
 			const record2 = await createClusterRecord(
 				peers,
 				makePendOperation('a1', 'block-1')
 			);
-			const result = await record2; // just a record, no conflict possible after dispose
-			expect(result).to.not.equal(undefined);
+			const result = await clusterMemberInstance.update(record2);
+			expect(result.promises[selfKeyPair.peerId.toString()]).to.not.equal(undefined);
 		});
 
 		it('clears per-transaction timeouts from active transactions', async () => {
