@@ -168,11 +168,18 @@ function makeMockPeerNetwork(pushCalls: PushCall[], failTargets: Set<string> = n
 	};
 }
 
-function createMockStream(targetId: string, failTargets: Set<string>) {
-	let requestData: any = null;
+function createMockStream(_targetId: string, _failTargets: Set<string>) {
+	// Build a varint-LP-encoded response matching BlockTransferResponse
+	const response: { blocks: Record<string, string>; missing: string[] } = { blocks: {}, missing: [] };
+	const payload = new TextEncoder().encode(JSON.stringify(response));
+	// Varint encode the length (works for payloads < 128 bytes)
+	const frame = new Uint8Array(1 + payload.length);
+	frame[0] = payload.length;
+	frame.set(payload, 1);
 
 	return {
-		close: () => {},
+		send: (_data: any) => {},
+		close: async () => {},
 		closeRead: () => {},
 		closeWrite: () => {},
 		abort: () => {},
@@ -185,30 +192,9 @@ function createMockStream(targetId: string, failTargets: Set<string>) {
 		readStatus: 'ready',
 		writeStatus: 'ready',
 		log: { enabled: false, trace: () => {}, error: () => {} },
-		sink: async (source: any) => {
-			// Consume the source to satisfy the pipe
-			for await (const chunk of source) {
-				// Parse the request from the chunk
-				try {
-					const data = chunk instanceof Uint8Array ? chunk : chunk.subarray();
-					requestData = JSON.parse(new TextDecoder().decode(data));
-				} catch {
-					// Ignore parse errors in mock
-				}
-			}
-		},
-		source: (async function*() {
-			// Wait a tick for sink to process
-			await new Promise(r => setTimeout(r, 1));
-			// Return a successful response
-			const response = { received: [], missing: [] };
-			const encoded = new TextEncoder().encode(JSON.stringify(response));
-			// Length-prefix: 4 bytes big-endian length + data
-			const frame = new Uint8Array(encoded.length + 4);
-			new DataView(frame.buffer).setUint32(0, encoded.length);
-			frame.set(encoded, 4);
+		async *[Symbol.asyncIterator]() {
 			yield frame;
-		})()
+		},
 	};
 }
 
@@ -410,6 +396,32 @@ describe('SpreadOnChurnMonitor', () => {
 			expect(event!.spread[0]!.targets).to.deep.equal([peer3Str]);
 		});
 
+		it('records failed pushes in the spread result', async () => {
+			const selfStr = selfId.toString();
+			const peer4Str = peerId4.toString();
+			const peer5Str = peerId5.toString();
+
+			mockFret.setNeighborDistance(0);
+			mockFret.setCohort('*', [selfStr, peerId2.toString()]);
+			// Two expansion targets: peer4 (will succeed) and peer5 (will fail)
+			mockFret.setExpandResult('*', [selfStr, peerId2.toString(), peer4Str, peer5Str]);
+
+			const failTargets = new Set([peer5Str]);
+			const monitor = makeMonitor({
+				peerNetwork: makeMockPeerNetwork(pushCalls, failTargets) as any,
+			});
+			monitor.trackBlock('block-1');
+
+			const event = await monitor.checkNow();
+			expect(event).to.not.be.null;
+
+			const entry = event!.spread[0]!;
+			expect(entry.targets).to.include(peer4Str);
+			expect(entry.targets).to.include(peer5Str);
+			expect(entry.succeeded).to.include(peer4Str);
+			expect(entry.failed).to.include(peer5Str);
+		});
+
 		it('graceful no-op when expand returns nothing new', async () => {
 			const selfStr = selfId.toString();
 			const peer2Str = peerId2.toString();
@@ -462,6 +474,33 @@ describe('SpreadOnChurnMonitor', () => {
 			expect(event!.effectiveD).to.equal(3);
 
 			await monitor.stop();
+		});
+
+		it('scales d up under low cluster health', async () => {
+			const selfStr = selfId.toString();
+			const peer4Str = peerId4.toString();
+
+			// spreadDistance=2, rank=2 normally ineligible (rank >= d).
+			// With low health (estimate/clusterSize < threshold), d scales up.
+			mockFret.setNeighborDistance(2);
+			mockFret.setCohort('*', [selfStr, peerId2.toString(), peerId3.toString()]);
+			mockFret.setExpandResult('*', [selfStr, peerId2.toString(), peerId3.toString(), peer4Str]);
+
+			// Simulate low cluster health: getDiagnostics returns estimate much lower than clusterSize
+			const fretWithDiag = Object.create(mockFret);
+			fretWithDiag.getDiagnostics = () => ({ estimate: 2 });
+
+			const monitor = makeMonitor(
+				{ fret: fretWithDiag as unknown as FretService, clusterSize: 10 },
+				{ spreadDistance: 2, dynamicSpreadDistance: true, healthThreshold: 0.6 }
+			);
+			monitor.trackBlock('block-1');
+
+			// estimate/clusterSize = 2/10 = 0.2 < 0.6 threshold
+			// scaled = ceil(2 * (10/2)) = 10, capped at floor(10/2) = 5
+			const event = await monitor.checkNow();
+			expect(event).to.not.be.null;
+			expect(event!.effectiveD).to.equal(5);
 		});
 
 		it('uses base d when churn is stable', async () => {

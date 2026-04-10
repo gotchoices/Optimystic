@@ -201,7 +201,7 @@ export class SpreadOnChurnMonitor implements Startable {
 				continue
 			}
 
-			const blockData = new TextEncoder().encode(JSON.stringify(blockResult.block))
+			const blockData = textEncoder.encode(JSON.stringify(blockResult.block))
 
 			// Push to each target
 			const succeeded: string[] = []

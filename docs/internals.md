@@ -129,6 +129,24 @@ Key design decisions:
 - **Fail-open**: If `findCluster` throws (network failure), the check assumes responsible to avoid false rejections
 - **Caching**: `LruMap` with 1000 entries and 60s TTL avoids repeated `findCluster` lookups
 
+## Cluster Health Monitors
+
+Two topology-aware monitors react to peer arrivals/departures via `connection:open`/`connection:close` events on libp2p. Both are `Startable`, debounce rapid changes, and suppress activity during detected partitions.
+
+### RebalanceMonitor
+
+Tracks whether the local node's responsibility for blocks has changed after topology shifts. Emits `RebalanceEvent` with `gained`/`lost` block lists and `newOwners` for lost blocks. Throttled to one scan per `minRebalanceIntervalMs` (default 60s).
+
+### SpreadOnChurnMonitor (Middle-Out)
+
+Proactively pushes tracked blocks to expansion targets on peer departure. Only "middle" peers (FRET `neighborDistance` rank < d) spread, bounding fan-out to 2d across the cluster. Uses `BlockTransferClient.pushBlocks()` with reason `'replication'`.
+
+**Dynamic d**: Under rapid churn (3+ departures in sliding window) or low cluster health (FRET estimate/clusterSize < threshold), `effectiveD` scales up, capped at `clusterSize / 2`.
+
+**Partition suppression**: Skips spread when `PartitionDetector.detectPartition()` returns true.
+
+Both monitors are initialized through `NetworkManagerService.initRebalanceMonitor()` / `initSpreadOnChurnMonitor()` and stopped together in `NetworkManagerService.stop()`.
+
 ## Observability
 
 Transaction metrics are instrumented with `debug` logging and optional verbose tracing:
