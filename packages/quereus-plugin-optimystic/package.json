@@ -35,7 +35,7 @@
   },
   "devDependencies": {
     "@optimystic/db-p2p-storage-fs": "workspace:^",
-    "@quereus/quereus": "^1.3.1",
+    "@quereus/quereus": "^2.0.0",
     "@types/chai": "^5.2.3",
     "@types/mocha": "^10.0.10",
     "@types/node": "^25.2.0",
