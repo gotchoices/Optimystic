@@ -194,16 +194,14 @@ describe('Schema Migration (TEST-7.4.1)', () => {
 			const initialHash = await engine.getSchemaHash();
 			expect(engine.getSchemaVersion()).to.equal(0);
 
-			// Add a table
+			// Add a table — auto-invalidation bumps version
 			await db.exec(`CREATE TABLE cycle1 (id INTEGER PRIMARY KEY) USING optimystic('tree://test/c1')`);
-			engine.invalidateSchemaCache();
 			expect(engine.getSchemaVersion()).to.equal(1);
 			const hash1 = await engine.getSchemaHash();
 			expect(hash1).to.not.equal(initialHash);
 
-			// Drop the table
+			// Drop the table — auto-invalidation bumps version again
 			await db.exec('DROP TABLE cycle1');
-			engine.invalidateSchemaCache();
 			expect(engine.getSchemaVersion()).to.equal(2);
 			const hash2 = await engine.getSchemaHash();
 

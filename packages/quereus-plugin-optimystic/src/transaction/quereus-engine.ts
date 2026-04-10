@@ -41,11 +41,24 @@ export type QuereusStatement = {
 export class QuereusEngine implements ITransactionEngine {
 	private schemaHashCache: string | undefined;
 	private schemaVersion: number = 0;
+	private unsubscribeSchema: (() => void) | undefined;
 
 	constructor(
 		private readonly db: Database,
 		private readonly coordinator: TransactionCoordinator
-	) {}
+	) {
+		this.unsubscribeSchema = this.db.onSchemaChange(() => this.invalidateSchemaCache());
+	}
+
+	/**
+	 * Dispose of this engine, unsubscribing from schema change events.
+	 */
+	dispose(): void {
+		if (this.unsubscribeSchema) {
+			this.unsubscribeSchema();
+			this.unsubscribeSchema = undefined;
+		}
+	}
 
 	/**
 	 * Execute a transaction's statements and produce actions.

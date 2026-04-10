@@ -158,10 +158,10 @@ describe('QuereusEngine', () => {
 		});
 	});
 
-	describe('Schema hash cache staleness (TEST-7.1.2)', () => {
+	describe('Schema hash auto-invalidation on DDL (TEST-7.1.2)', () => {
 		const mockCoordinator = {} as any;
 
-		it('should return stale hash after DDL without invalidation (known bug)', async () => {
+		it('should auto-invalidate cache after DDL', async () => {
 			const engine = new QuereusEngine(db, mockCoordinator);
 			const hash1 = await engine.getSchemaHash();
 
@@ -171,26 +171,44 @@ describe('QuereusEngine', () => {
 				) USING optimystic('tree://test/staleness')
 			`);
 
-			// BUG: hash is stale — no automatic DDL detection
+			// Cache is automatically invalidated via onSchemaChange
 			const hash2 = await engine.getSchemaHash();
-			expect(hash2).to.equal(hash1);
-
-			engine.invalidateSchemaCache();
-			const hash3 = await engine.getSchemaHash();
-			expect(hash3).to.not.equal(hash1);
+			expect(hash2).to.not.equal(hash1);
 		});
 
-		it('should accumulate staleness across multiple DDL operations (known bug)', async () => {
+		it('should auto-invalidate across multiple DDL operations', async () => {
 			const engine = new QuereusEngine(db, mockCoordinator);
 			const hash1 = await engine.getSchemaHash();
 
 			await db.exec(`CREATE TABLE t1 (id INTEGER PRIMARY KEY) USING optimystic('tree://test/t1')`);
+
+			const hash2 = await engine.getSchemaHash();
+			expect(hash2).to.not.equal(hash1);
+
 			await db.exec(`CREATE TABLE t2 (id INTEGER PRIMARY KEY) USING optimystic('tree://test/t2')`);
 
-			// Still returns original hash — stale through two DDL changes
+			const hash3 = await engine.getSchemaHash();
+			expect(hash3).to.not.equal(hash2);
+			expect(hash3).to.not.equal(hash1);
+		});
+
+		it('should stop auto-invalidation after dispose()', async () => {
+			const engine = new QuereusEngine(db, mockCoordinator);
+			const hash1 = await engine.getSchemaHash();
+
+			engine.dispose();
+
+			await db.exec(`
+				CREATE TABLE disposed_test (
+					id INTEGER PRIMARY KEY, name TEXT
+				) USING optimystic('tree://test/disposed')
+			`);
+
+			// After dispose, cache is NOT auto-invalidated — hash is stale
 			const hash2 = await engine.getSchemaHash();
 			expect(hash2).to.equal(hash1);
 
+			// Manual invalidation still works
 			engine.invalidateSchemaCache();
 			const hash3 = await engine.getSchemaHash();
 			expect(hash3).to.not.equal(hash1);
