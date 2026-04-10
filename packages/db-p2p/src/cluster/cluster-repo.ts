@@ -83,6 +83,9 @@ export class ClusterMember implements ICluster {
 	private pendingUpdates: Map<string, Promise<ClusterRecord>> = new Map();
 	// Temporarily set during validateSignatures so verifySignature can access the record
 	private currentValidationRecord?: ClusterRecord;
+	// Interval handles for periodic cleanup (stored so dispose() can clear them)
+	private readonly expirationInterval: NodeJS.Timeout;
+	private readonly cleanupInterval: NodeJS.Timeout;
 
 	/** Effective super-majority threshold. Defaults to 1.0 (unanimity) for backward compatibility. */
 	private readonly superMajorityThreshold: number;
@@ -102,9 +105,26 @@ export class ClusterMember implements ICluster {
 	) {
 		this.superMajorityThreshold = consensusConfig?.superMajorityThreshold ?? 1.0;
 		// Periodically clean up expired transactions (.unref() so tests/short-lived processes can exit)
-		setInterval(() => this.queueExpiredTransactions(), 60000).unref();
+		this.expirationInterval = setInterval(() => this.queueExpiredTransactions(), 60000);
+		this.expirationInterval.unref();
 		// Process cleanup queue
-		setInterval(() => this.processCleanupQueue(), 1000).unref();
+		this.cleanupInterval = setInterval(() => this.processCleanupQueue(), 1000);
+		this.cleanupInterval.unref();
+	}
+
+	/**
+	 * Clears all interval and timeout handles and empties active state.
+	 * Called during node shutdown to prevent leaked timers.
+	 */
+	dispose(): void {
+		clearInterval(this.expirationInterval);
+		clearInterval(this.cleanupInterval);
+		for (const [, state] of this.activeTransactions) {
+			if (state.promiseTimeout) clearTimeout(state.promiseTimeout);
+			if (state.resolutionTimeout) clearTimeout(state.resolutionTimeout);
+		}
+		this.activeTransactions.clear();
+		this.cleanupQueue.length = 0;
 	}
 
 	/**

@@ -451,6 +451,15 @@ export async function createLibp2pNodeBase(
 		});
 	}
 
+	// Cleanup cluster member intervals on node stop
+	{
+		const previousStop = node.stop.bind(node);
+		node.stop = async () => {
+			(clusterImpl as import('./cluster/cluster-repo.js').ClusterMember).dispose();
+			await previousStop();
+		};
+	}
+
 	// Expose coordinated repo and storage for external use
 	(node as any).coordinatedRepo = coordinatedRepo;
 	(node as any).storageRepo = storageRepo;
