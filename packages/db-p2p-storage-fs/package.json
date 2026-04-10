@@ -1,6 +1,6 @@
 {
 	"name": "@optimystic/db-p2p-storage-fs",
-	"version": "0.9.3",
+	"version": "0.10.0",
 	"type": "module",
 	"description": "Node.js filesystem storage backend for @optimystic/db-p2p",
 	"main": "dist/src/index.js",
