@@ -18,34 +18,25 @@ files:
 
 ## What was built
 
-### IChainHeader interface
-Extracted `{ headId: BlockId; tailId: BlockId }` into `IChainHeader` in `chain-nodes.ts`. `ChainHeaderNode` is now `IBlock & IChainHeader` — structurally identical, but the fields are reusable. Exported through `chain/index.ts` barrel.
+- **IChainHeader** type (`{ headId: BlockId; tailId: BlockId }`) extracted in `chain-nodes.ts`, exported through barrel. `ChainHeaderNode = IBlock & IChainHeader`.
+- **Chain.create()** gained `existingHeaderId` option — reuses an already-inserted block as chain header, applying headId/tailId via `apply()`.
+- **Log.create()** signature changed from positional `BlockId` to `{ newId?, existingHeaderId? }` options object, passing through to Chain.create.
+- **CollectionHeaderBlock** now `IBlock & Partial<IChainHeader>`, giving typed access to `tailId` in `bootstrapContext` — eliminated `(header as any).tailId` cast.
+- Removed the `// TODO: Generalize the header access...` comment.
 
-### Chain.create() with existingHeaderId
-`ChainCreateOptions` gained an `existingHeaderId?: BlockId` option. When provided, `Chain.create()` fetches the existing block and applies `headId`/`tailId` via `apply()` instead of inserting a new header. Throws if the block doesn't exist.
+## Testing
 
-### Log.create() signature change
-`Log.create()` second parameter changed from `BlockId` (positional `newId`) to `{ newId?: BlockId; existingHeaderId?: BlockId }`. All existing callers pass no second arg, so this is backwards-compatible at the call site level.
+284 tests passing (db-core). 4 new tests:
 
-### CollectionHeaderBlock type safety
-`CollectionHeaderBlock` now extends `Partial<IChainHeader>`, so `headId` and `tailId` are part of the type. The `bootstrapContext` method parameter narrowed from `IBlock` to `CollectionHeaderBlock`, eliminating the `(header as any).tailId` cast.
-
-### Removed TODO
-The `// TODO: Generalize the header access...` comment at chain.ts:28 was removed — this ticket implements that generalization.
-
-## Testing notes
-
-4 new tests added (273 total, all passing):
-
-- **chain.spec.ts**: "should create with existingHeaderId, reusing a pre-inserted block" — verifies headId/tailId are applied and upstream fields preserved
+- **chain.spec.ts**: "should create with existingHeaderId, reusing a pre-inserted block" — headId/tailId applied, upstream fields preserved
 - **chain.spec.ts**: "should support full chain operations on a chain created with existingHeaderId" — add, pop, dequeue, iterate
 - **chain.spec.ts**: "should throw when existingHeaderId references a non-existent block" — error path
-- **log.spec.ts**: "should create a log with existingHeaderId" — full log operations on merged header, upstream fields preserved
+- **log.spec.ts**: "should create a log with existingHeaderId" — full log operations, upstream fields preserved
 
 ## Usage
 
 ```typescript
-// Upstream header can now formally include chain fields
+// Upstream header can formally include chain fields
 type MyHeader = IBlock & Partial<IChainHeader> & { myField: string };
 
 // Create chain on pre-existing header block — no extra block
