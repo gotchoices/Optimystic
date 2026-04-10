@@ -206,6 +206,34 @@ describe('Optimystic Index Support', () => {
 		});
 	});
 
+	describe('addIndex with existing data', () => {
+		it('should populate index from pre-existing rows', async () => {
+			// Create table and insert data BEFORE creating index — triggers addIndex() population loop
+			await db.exec(`
+				CREATE TABLE categories (
+					id TEXT PRIMARY KEY,
+					type_id TEXT,
+					name TEXT
+				) USING optimystic('tree://test/categories')
+			`);
+
+			await db.exec(`
+				INSERT INTO categories (id, type_id, name) VALUES
+					('cat-eating', 'food', 'Eating'),
+					('cat-sleeping', 'activity', 'Sleeping'),
+					('cat-cooking', 'food', 'Cooking')
+			`);
+
+			// Creating the index after data exists triggers addIndex() to populate from existing rows
+			await db.exec('CREATE INDEX idx_categories_type ON categories(type_id)');
+
+			// Verify the index is usable and returns correct results
+			const result = await collectRows(db.eval("SELECT * FROM categories WHERE type_id = 'food'"));
+			expect(result).to.have.lengthOf(2);
+			expect(result.every(r => r.type_id === 'food')).to.equal(true);
+		});
+	});
+
 	describe('Index edge cases', () => {
 		beforeEach(async () => {
 			await db.exec(`

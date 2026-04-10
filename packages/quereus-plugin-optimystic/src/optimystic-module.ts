@@ -668,8 +668,9 @@ export class OptimysticVirtualTable extends VirtualTable {
     if (this.collection && this.rowCodec) {
       const firstPath = await this.collection.first();
       for await (const path of this.collection.ascending(firstPath)) {
-        const encodedRow = this.collection.at(path);
-        if (encodedRow) {
+        const entry = this.collection.at(path) as [string, EncodedRow] | undefined;
+        if (entry && entry.length >= 2) {
+          const encodedRow = entry[1];
           const row = this.rowCodec.decodeRow(encodedRow);
           const primaryKey = this.rowCodec.extractPrimaryKey(row);
           await this.indexManager.insertIndexEntries(row, primaryKey, txnState?.transactor);
