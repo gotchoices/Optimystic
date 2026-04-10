@@ -1,9 +1,7 @@
 import { expect } from 'chai'
 import {
 	registerCollectionType, getCollectionType, getCollectionTypes,
-	type CollectionTypeDescriptor,
 	Collection, type CollectionInitOptions, type ICollection, type Action,
-	type BlockStore, type IBlock,
 } from '../src/index.js'
 import { DiaryHeaderBlockType } from '../src/collections/diary/struct.js'
 import { TreeHeaderBlockType } from '../src/collections/tree/struct.js'
