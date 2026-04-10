@@ -11,11 +11,14 @@
 Chains consist of two types of blocks:
 
 ```typescript
-// Header block - tracks the chain's endpoints
-type ChainHeaderNode = IBlock & {
+// Chain header fields - extracted so upstream headers can include them
+type IChainHeader = {
   headId: BlockId;  // First block in chain
   tailId: BlockId;  // Last block in chain
 };
+
+// Header block - tracks the chain's endpoints
+type ChainHeaderNode = IBlock & IChainHeader;
 
 // Data block - contains actual entries
 type ChainDataNode<TEntry> = IBlock & {
@@ -51,9 +54,30 @@ const chain = await Chain.create<string>(store, {
   createHeaderBlock: (id) => ({ header: store.createBlockHeader(ChainHeaderBlockType, id) })
 });
 
+// Create a chain using a pre-existing block as the header (merged header pattern)
+const chain = await Chain.create<string>(store, {
+  existingHeaderId: upstreamBlock.header.id
+});
+
 // Open existing chain
 const chain = await Chain.open<string>(store, 'existing-chain-id');
 ```
+
+### Merged Header Pattern
+
+When a chain is embedded in a larger structure (e.g. a collection), the upstream header block can serve double duty as the chain header. The `IChainHeader` interface (`headId`, `tailId`) is extracted so upstream types can formally include these fields:
+
+```typescript
+// Upstream header includes chain fields
+type CollectionHeaderBlock = IBlock & Partial<IChainHeader> & { ... };
+
+// Create chain on the existing header — no extra block inserted
+const chain = await Chain.create<string>(store, {
+  existingHeaderId: collectionHeader.header.id
+});
+```
+
+This avoids an extra level of indirection and makes the merged relationship type-safe.
 
 ### Stack Operations (LIFO)
 

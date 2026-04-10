@@ -33,8 +33,12 @@ export class Log<TAction> {
 	}
 
 	/** Creates a new log. */
-	static async create<TAction>(store: BlockStore<IBlock>, newId?: BlockId) {
-		return new Log<TAction>(await Chain.create<LogEntry<TAction>>(store, { ...Log.getChainOptions(store), newId }));
+	static async create<TAction>(store: BlockStore<IBlock>, options?: { newId?: BlockId; existingHeaderId?: BlockId }) {
+		return new Log<TAction>(await Chain.create<LogEntry<TAction>>(store, {
+			...Log.getChainOptions(store),
+			newId: options?.newId,
+			existingHeaderId: options?.existingHeaderId,
+		}));
 	}
 
 	/** Adds a new entry to the log. */

@@ -23,9 +23,10 @@ export type ChainInitOptions<TEntry> = {
 
 export type ChainCreateOptions<TEntry> = ChainInitOptions<TEntry> & {
 	newId?: BlockId;
+	/** Use an already-inserted block as the chain header instead of creating a new one.
+	 *  headId and tailId will be set on it via apply(). */
+	existingHeaderId?: BlockId;
 };
-
-// TODO: Generalize the header access so that it can be merged with upstream header (e.g. collection header) and thus avoid another level of indirection
 
 /** Represents a chain of blocks, forming a stack, queue, or log. */
 export class Chain<TEntry> {
@@ -39,6 +40,19 @@ export class Chain<TEntry> {
 	/** Creates a new queue, with an optional given id. */
 	static async create<TEntry>(store: BlockStore<IBlock>, options?: ChainCreateOptions<TEntry>) {
 		const tailBlock = Chain.createTailBlock<TEntry>(store, options);
+
+		if (options?.existingHeaderId) {
+			// Use an already-inserted block as the chain header
+			const existing = await store.tryGet(options.existingHeaderId);
+			if (!existing) {
+				throw new Error(`Existing header block ${options.existingHeaderId} not found`);
+			}
+			apply(store, existing, [headId$, 0, 0, tailBlock.header.id]);
+			apply(store, existing, [tailId$, 0, 0, tailBlock.header.id]);
+			store.insert(tailBlock);
+			return new Chain<TEntry>(store, existing.header.id, options);
+		}
+
 		const headerBlock = {
 			...(options?.createHeaderBlock?.(options?.newId) ?? { header: store.createBlockHeader(ChainHeaderBlockType, options?.newId) }),
 			headId: tailBlock.header.id,

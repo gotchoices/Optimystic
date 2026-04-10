@@ -2,6 +2,7 @@ import { expect } from 'chai'
 import { Chain, EntriesPerBlock, entryAt } from '../src/chain/chain.js';
 import { TestBlockStore } from './test-block-store.js';
 import type { ChainDataNode } from '../src/chain/chain-nodes.js';
+import { ChainHeaderBlockType } from '../src/chain/chain-nodes.js';
 
 describe('Chain', () => {
     let store: TestBlockStore;
@@ -29,6 +30,53 @@ describe('Chain', () => {
             const customId = 'custom-chain';
             const customChain = await Chain.create<string>(store, { newId: customId });
             expect(customChain.id).to.equal(customId);
+        });
+
+        it('should create with existingHeaderId, reusing a pre-inserted block', async () => {
+            // Insert an upstream header block first
+            const existingBlock = { header: store.createBlockHeader('UH'), label: 'upstream' } as any;
+            store.insert(existingBlock);
+            const existingId = existingBlock.header.id;
+
+            const chainFromExisting = await Chain.create<string>(store, { existingHeaderId: existingId });
+            expect(chainFromExisting.id).to.equal(existingId);
+
+            // Verify the existing block got headId/tailId applied
+            const headerBlock = await store.tryGet(existingId) as any;
+            expect(headerBlock.headId).to.exist;
+            expect(headerBlock.tailId).to.exist;
+            expect(headerBlock.headId).to.equal(headerBlock.tailId);
+            // Upstream fields should be preserved
+            expect(headerBlock.label).to.equal('upstream');
+        });
+
+        it('should support full chain operations on a chain created with existingHeaderId', async () => {
+            const existingBlock = { header: store.createBlockHeader(ChainHeaderBlockType) } as any;
+            store.insert(existingBlock);
+
+            const chainFromExisting = await Chain.create<string>(store, { existingHeaderId: existingBlock.header.id });
+            await chainFromExisting.add('a', 'b', 'c');
+
+            const entries: string[] = [];
+            for await (const path of chainFromExisting.select()) {
+                entries.push(entryAt(path)!);
+            }
+            expect(entries).to.deep.equal(['a', 'b', 'c']);
+
+            const popped = await chainFromExisting.pop(1);
+            expect(popped).to.deep.equal(['c']);
+
+            const dequeued = await chainFromExisting.dequeue(1);
+            expect(dequeued).to.deep.equal(['a']);
+        });
+
+        it('should throw when existingHeaderId references a non-existent block', async () => {
+            try {
+                await Chain.create<string>(store, { existingHeaderId: 'nonexistent' });
+                expect.fail('should have thrown');
+            } catch (e: any) {
+                expect(e.message).to.include('not found');
+            }
         });
     });
 

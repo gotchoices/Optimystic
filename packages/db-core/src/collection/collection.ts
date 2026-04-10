@@ -107,7 +107,7 @@ export class Collection<TAction> implements ICollection<TAction> {
 
 		// Bootstrap context from committed tail so pending blocks are accessible.
 		// Read through tracker so Chain.open inside Log.open reuses the cached header.
-		const header = await tracker.tryGet(this.id);
+		const header = await tracker.tryGet(this.id) as CollectionHeaderBlock | undefined;
 		if (header) {
 			await Collection.bootstrapContext(source, this.transactor, header);
 		}
@@ -254,9 +254,9 @@ export class Collection<TAction> implements ICollection<TAction> {
 	private static async bootstrapContext(
 		source: TransactorSource<IBlock>,
 		transactor: ITransactor,
-		header: IBlock,
+		header: CollectionHeaderBlock,
 	): Promise<void> {
-		const tailId = Object.hasOwn(header, 'tailId') ? (header as any).tailId as BlockId : undefined;
+		const tailId = header.tailId;
 		if (tailId) {
 			const tailResult = await transactor.get({ blockIds: [tailId] });
 			const tailState = tailResult?.[tailId]?.state;

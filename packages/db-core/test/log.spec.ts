@@ -340,6 +340,29 @@ describe('Log', () => {
     }
   })
 
+  it('should create a log with existingHeaderId', async () => {
+    // Insert a block to serve as the log header
+    const existingBlock = { header: store.createBlockHeader('UH'), label: 'upstream' } as any;
+    store.insert(existingBlock);
+
+    const log = await Log.create<string>(store, { existingHeaderId: existingBlock.header.id });
+    expect(log.id).to.equal(existingBlock.header.id);
+
+    // Verify the log is fully functional
+    const actionId = generateRandomActionId();
+    await log.addActions(['action1'], actionId, 1, () => []);
+
+    const result = await log.getFrom(0);
+    expect(result.entries).to.have.lengthOf(1);
+    expect(result.entries[0]?.actions[0]).to.equal('action1');
+
+    // Verify upstream fields are preserved on the header block
+    const headerBlock = await store.tryGet(existingBlock.header.id) as any;
+    expect(headerBlock.label).to.equal('upstream');
+    expect(headerBlock.headId).to.exist;
+    expect(headerBlock.tailId).to.exist;
+  })
+
   // TEST-3.2.2: Log checkpoint consistency tests
   describe('checkpoint consistency (TEST-3.2.2)', () => {
     it('should handle checkpoint with empty pendings', async () => {

@@ -51,11 +51,16 @@ type LogBlock<TAction> = ChainDataNode<LogEntry<TAction>> & {
 
 ```typescript
 // Create new log
-const log = await Log.create<MyAction>(store, 'log-id');
+const log = await Log.create<MyAction>(store, { newId: 'log-id' });
+
+// Create a log using an existing block as the header (merged header pattern)
+const log = await Log.create<MyAction>(store, { existingHeaderId: upstreamBlock.header.id });
 
 // Open existing log
 const log = await Log.open<MyAction>(store, 'existing-log-id');
 ```
+
+The `existingHeaderId` option lets a log share a header block with an upstream structure (e.g. a collection header), avoiding an extra level of indirection. The `headId` and `tailId` chain fields are applied to the existing block via `apply()`.
 
 ### Transaction Operations
 

@@ -13,10 +13,12 @@ export const nextId$ = nameof<ChainDataNode<any>>("nextId");
 
 export const ChainDataBlockType = registerBlockType('CHD', 'ChainDataBlock');
 
-export type ChainHeaderNode = IBlock & {
+export type IChainHeader = {
 	headId: BlockId;
 	tailId: BlockId;
 };
+
+export type ChainHeaderNode = IBlock & IChainHeader;
 
 export const headId$ = nameof<ChainHeaderNode>("headId");
 export const tailId$ = nameof<ChainHeaderNode>("tailId");
