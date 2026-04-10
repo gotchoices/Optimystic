@@ -19,6 +19,7 @@ import { coordinatorRepo } from './repo/coordinator-repo.js';
 import { Libp2pKeyPeerNetwork, type NetworkMode, type NetworkStatePersistence } from './libp2p-key-network.js';
 import { ClusterClient } from './cluster/client.js';
 import type { IRepo, ICluster, ITransactionValidator } from '@optimystic/db-core';
+import type { ITransactionStateStore } from './cluster/i-transaction-state-store.js';
 import { networkManagerService } from './network/network-manager-service.js';
 import { fretService, Libp2pFretService } from 'p2p-fret';
 import { syncService } from './sync/service.js';
@@ -93,6 +94,9 @@ export type NodeOptions = {
 
 	/** Dispute protocol configuration */
 	dispute?: Partial<DisputeConfig>;
+
+	/** Optional persistent store for 2PC transaction state (enables crash recovery) */
+	transactionStateStore?: ITransactionStateStore;
 };
 
 function resolveStorage(provider: RawStorageProvider | undefined): IRawStorage {
@@ -300,7 +304,8 @@ export async function createLibp2pNodeBase(
 		fretService: fretSvc,
 		validator: options.validator,
 		reputation,
-		consensusConfig
+		consensusConfig,
+		stateStore: options.transactionStateStore
 	});
 
 	const coordinatorRepoFactory = coordinatorRepo(
@@ -311,7 +316,8 @@ export async function createLibp2pNodeBase(
 			...consensusConfig
 		},
 		fretSvc,
-		reputation
+		reputation,
+		options.transactionStateStore
 	);
 
 	// Create callback for querying cluster peers for their latest block revision
@@ -341,6 +347,12 @@ export async function createLibp2pNodeBase(
 		localPeerId: node.peerId,
 		clusterLatestCallback
 	});
+
+	// Recover persisted transaction state before accepting new requests
+	if (options.transactionStateStore) {
+		await (clusterImpl as import('./cluster/cluster-repo.js').ClusterMember).recoverTransactions();
+		await (coordinatedRepo as import('./repo/coordinator-repo.js').CoordinatorRepo).recoverTransactions();
+	}
 
 	// Initialize Arachnode ring membership and restoration
 	const enableArachnode = options.arachnode?.enableRingZulu ?? true;

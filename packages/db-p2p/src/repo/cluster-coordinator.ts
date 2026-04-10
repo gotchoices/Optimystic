@@ -10,6 +10,7 @@ import type { ClusterLogPeerOutcome } from './types.js'
 import type { FretService } from "p2p-fret";
 import type { IPeerReputation } from "../reputation/types.js";
 import { PenaltyReason } from "../reputation/types.js";
+import type { ITransactionStateStore } from "../cluster/i-transaction-state-store.js";
 
 const log = createLogger('cluster')
 
@@ -52,7 +53,8 @@ export class ClusterCoordinator {
 			wasTransactionExecuted?: (messageHash: string) => boolean;
 		},
 		private readonly fretService?: FretService,
-		private readonly reputation?: IPeerReputation
+		private readonly reputation?: IPeerReputation,
+		private readonly stateStore?: ITransactionStateStore
 	) { }
 
 	/**
@@ -156,6 +158,7 @@ export class ClusterCoordinator {
 			lastUpdate: Date.now()
 		};
 		this.transactions.set(messageHash, state);
+		this.persistCoordinatorState(messageHash, record, 'promising');
 		log('cluster-tx:transaction-store', {
 			messageHash,
 			transactionKeys: Array.from(this.transactions.keys())
@@ -185,6 +188,7 @@ export class ClusterCoordinator {
 				// Wait a bit before cleanup to allow any in-flight responses to arrive
 				setTimeout(() => {
 					this.transactions.delete(messageHash);
+					this.deleteCoordinatorState(messageHash);
 					log('cluster-tx:transaction-remove', {
 						messageHash,
 						remaining: Array.from(this.transactions.keys())
@@ -282,6 +286,7 @@ export class ClusterCoordinator {
 			});
 		}
 
+		this.persistCoordinatorState(promised.record.messageHash, promised.record, 'committing');
 		return await this.commitTransaction(promised.record);
 	}
 
@@ -606,6 +611,11 @@ export class ClusterCoordinator {
 			intervalMs: baseInterval,
 			timer
 		};
+		this.persistCoordinatorState(messageHash, state.record, 'broadcasting', {
+			pendingPeers: Array.from(pendingPeers),
+			attempt: nextAttempt,
+			intervalMs: baseInterval
+		});
 		log('cluster-tx:retry-scheduled', { messageHash, attempt: nextAttempt, missingPeers, delayMs: baseInterval });
 	}
 
@@ -671,10 +681,71 @@ export class ClusterCoordinator {
 		// Clean up the transaction after retry is complete
 		setTimeout(() => {
 			this.transactions.delete(messageHash);
+			this.deleteCoordinatorState(messageHash);
 			log('cluster-tx:transaction-remove', {
 				messageHash,
 				remaining: Array.from(this.transactions.keys())
 			});
 		}, 100);
+	}
+
+	/** Fire-and-forget persist — errors are logged, never thrown. */
+	private persistCoordinatorState(
+		messageHash: string,
+		record: ClusterRecord,
+		phase: 'promising' | 'committing' | 'broadcasting',
+		retryState?: { pendingPeers: string[]; attempt: number; intervalMs: number }
+	): void {
+		if (!this.stateStore) return;
+		this.stateStore.saveCoordinatorState(messageHash, {
+			messageHash,
+			record,
+			lastUpdate: Date.now(),
+			phase,
+			retryState
+		}).catch(err => log('cluster-tx:persist-error', { messageHash, error: (err as Error).message }));
+	}
+
+	/** Fire-and-forget delete — errors are logged, never thrown. */
+	private deleteCoordinatorState(messageHash: string): void {
+		if (!this.stateStore) return;
+		this.stateStore.deleteCoordinatorState(messageHash)
+			.catch(err => log('cluster-tx:persist-delete-error', { messageHash, error: (err as Error).message }));
+	}
+
+	/**
+	 * Recover coordinator transactions from persistent store after a restart.
+	 * Called during node startup, before accepting new requests.
+	 */
+	async recoverTransactions(): Promise<void> {
+		if (!this.stateStore) return;
+		const states = await this.stateStore.getAllCoordinatorStates();
+		for (const state of states) {
+			const { messageHash } = state;
+			// Expired — clean up
+			if (state.record.message.expiration && state.record.message.expiration < Date.now()) {
+				log('cluster-tx:recovery-expired', { messageHash });
+				await this.stateStore.deleteCoordinatorState(messageHash);
+				continue;
+			}
+			// Broadcasting phase with retry state — resume retries
+			if (state.phase === 'broadcasting' && state.retryState) {
+				log('cluster-tx:recovery-resume-broadcast', { messageHash, attempt: state.retryState.attempt });
+				const pending = new Pending(Promise.resolve(state.record));
+				const txState: ClusterTransactionState = {
+					messageHash,
+					record: state.record,
+					pending,
+					lastUpdate: state.lastUpdate
+				};
+				this.transactions.set(messageHash, txState);
+				// Schedule retry from where we left off
+				this.scheduleCommitRetry(messageHash, state.record, state.retryState.pendingPeers);
+				continue;
+			}
+			// Promising or committing — cannot resume (caller context is gone)
+			log('cluster-tx:recovery-stale', { messageHash, phase: state.phase });
+			await this.stateStore.deleteCoordinatorState(messageHash);
+		}
 	}
 }

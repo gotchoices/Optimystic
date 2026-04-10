@@ -7,6 +7,7 @@ import { peerIdFromString } from "@libp2p/peer-id";
 import type { FretService } from "p2p-fret";
 import { createLogger } from '../logger.js';
 import type { IPeerReputation } from "../reputation/types.js";
+import type { ITransactionStateStore } from "../cluster/i-transaction-state-store.js";
 
 const log = createLogger('coordinator-repo');
 
@@ -40,7 +41,8 @@ export function coordinatorRepo(
 	createClusterClient: (peerId: PeerId) => ClusterClient,
 	cfg?: Partial<ClusterConsensusConfig> & { clusterSize?: number },
 	fretService?: FretService,
-	reputation?: IPeerReputation
+	reputation?: IPeerReputation,
+	stateStore?: ITransactionStateStore
 ): (components: CoordinatorRepoComponents) => CoordinatorRepo {
 	return (components: CoordinatorRepoComponents) => new CoordinatorRepo(
 		keyNetwork,
@@ -51,7 +53,8 @@ export function coordinatorRepo(
 		components.localPeerId,
 		fretService,
 		components.clusterLatestCallback,
-		reputation
+		reputation,
+		stateStore
 	);
 }
 
@@ -72,7 +75,8 @@ export class CoordinatorRepo implements IRepo {
 		localPeerId?: PeerId,
 		fretService?: FretService,
 		private readonly clusterLatestCallback?: ClusterLatestCallback,
-		reputation?: IPeerReputation
+		reputation?: IPeerReputation,
+		stateStore?: ITransactionStateStore
 	) {
 		this.localPeerId = localPeerId;
 		const policy: ClusterConsensusConfig & { clusterSize: number } = {
@@ -89,7 +93,12 @@ export class CoordinatorRepo implements IRepo {
 			peerId: localPeerId,
 			wasTransactionExecuted: localCluster.wasTransactionExecuted?.bind(localCluster)
 		} : undefined;
-		this.coordinator = new ClusterCoordinator(keyNetwork, createClusterClient, policy, localClusterRef, fretService, reputation);
+		this.coordinator = new ClusterCoordinator(keyNetwork, createClusterClient, policy, localClusterRef, fretService, reputation, stateStore);
+	}
+
+	/** Recover coordinator transactions from persistent store after a restart. */
+	async recoverTransactions(): Promise<void> {
+		await this.coordinator.recoverTransactions();
 	}
 
 	/**

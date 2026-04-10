@@ -14,6 +14,7 @@ import type { PartitionDetector } from "./partition-detector.js";
 import type { FretService } from "p2p-fret";
 import type { IPeerReputation } from "../reputation/types.js";
 import { PenaltyReason } from "../reputation/types.js";
+import type { ITransactionStateStore } from "./i-transaction-state-store.js";
 
 const log = createLogger('cluster-member')
 
@@ -45,6 +46,7 @@ interface ClusterMemberComponents {
 	validator?: ITransactionValidator;
 	reputation?: IPeerReputation;
 	consensusConfig?: ClusterConsensusConfig;
+	stateStore?: ITransactionStateStore;
 }
 
 export function clusterMember(components: ClusterMemberComponents): ClusterMember {
@@ -58,7 +60,8 @@ export function clusterMember(components: ClusterMemberComponents): ClusterMembe
 		components.fretService,
 		components.validator,
 		components.reputation,
-		components.consensusConfig
+		components.consensusConfig,
+		components.stateStore
 	);
 }
 
@@ -94,7 +97,8 @@ export class ClusterMember implements ICluster {
 		private readonly fretService?: FretService,
 		private readonly validator?: ITransactionValidator,
 		private readonly reputation?: IPeerReputation,
-		consensusConfig?: ClusterConsensusConfig
+		consensusConfig?: ClusterConsensusConfig,
+		private readonly stateStore?: ITransactionStateStore
 	) {
 		this.superMajorityThreshold = consensusConfig?.superMajorityThreshold ?? 1.0;
 		// Periodically clean up expired transactions (.unref() so tests/short-lived processes can exit)
@@ -275,6 +279,7 @@ export class ClusterMember implements ICluster {
 				promiseTimeout: timeouts.promiseTimeout,
 				resolutionTimeout: timeouts.resolutionTimeout
 			});
+			this.persistParticipantState(record.messageHash, currentRecord);
 			log('cluster-member:state-persist', {
 				messageHash: record.messageHash,
 				storedPromises: Object.keys(currentRecord.promises ?? {}),
@@ -637,7 +642,10 @@ export class ClusterMember implements ICluster {
 			return;
 		}
 		// Mark as executing IMMEDIATELY before any async operations
-		this.executedTransactions.set(record.messageHash, Date.now());
+		const executedAt = Date.now();
+		this.executedTransactions.set(record.messageHash, executedAt);
+		this.stateStore?.markExecuted(record.messageHash, executedAt)
+			.catch(err => log('cluster-member:persist-executed-error', { messageHash: record.messageHash, error: (err as Error).message }));
 
 		try {
 			// Execute the operations - check return values for failures
@@ -902,6 +910,8 @@ export class ClusterMember implements ICluster {
 				this.executedTransactions.delete(messageHash);
 			}
 		}
+		this.stateStore?.pruneExecuted(expirationThreshold)
+			.catch(err => log('cluster-member:prune-executed-error', { error: (err as Error).message }));
 	}
 
 	private async processCleanupQueue(): Promise<void> {
@@ -937,10 +947,77 @@ export class ClusterMember implements ICluster {
 			clearTimeout(state.resolutionTimeout);
 		}
 		this.activeTransactions.delete(messageHash);
+		this.stateStore?.deleteParticipantState(messageHash)
+			.catch(err => log('cluster-member:persist-delete-error', { messageHash, error: (err as Error).message }));
 		log('cluster-member:clear-done', {
 			messageHash,
 			remaining: Array.from(this.activeTransactions.keys())
 		});
+	}
+
+	/** Fire-and-forget persist — errors are logged, never thrown. */
+	private persistParticipantState(messageHash: string, record: ClusterRecord): void {
+		if (!this.stateStore) return;
+		this.stateStore.saveParticipantState(messageHash, {
+			messageHash,
+			record,
+			lastUpdate: Date.now()
+		}).catch(err => log('cluster-member:persist-error', { messageHash, error: (err as Error).message }));
+	}
+
+	/**
+	 * Recover member transactions from persistent store after a restart.
+	 * Called during node startup, before accepting new requests.
+	 */
+	async recoverTransactions(): Promise<void> {
+		if (!this.stateStore) return;
+		const now = Date.now();
+
+		// 1. Prune expired executed entries from persistent store
+		await this.stateStore.pruneExecuted(now - ExecutedTransactionTtlMs);
+		// Note: executed transactions are checked via wasTransactionExecutedAsync() at runtime,
+		// which falls back to the persistent store when the in-memory map misses.
+
+		// 2. Restore active participant states
+		const participantStates = await this.stateStore.getAllParticipantStates();
+		for (const state of participantStates) {
+			const { messageHash } = state;
+			// Expired — clean up
+			if (state.record.message.expiration && state.record.message.expiration < now) {
+				log('cluster-member:recovery-expired', { messageHash });
+				await this.stateStore.deleteParticipantState(messageHash);
+				continue;
+			}
+			// Restore into activeTransactions with fresh timeouts
+			log('cluster-member:recovery-restore', { messageHash });
+			const timeouts = this.setupTimeouts(state.record);
+			this.activeTransactions.set(messageHash, {
+				record: state.record,
+				lastUpdate: state.lastUpdate,
+				promiseTimeout: timeouts.promiseTimeout,
+				resolutionTimeout: timeouts.resolutionTimeout
+			});
+		}
+
+		log('cluster-member:recovery-complete', {
+			restoredActive: this.activeTransactions.size,
+			restoredExecuted: this.executedTransactions.size
+		});
+	}
+
+	/**
+	 * Checks if a transaction's operations were already executed during consensus.
+	 * Falls back to the persistent store when the in-memory map misses.
+	 */
+	async wasTransactionExecutedAsync(messageHash: string): Promise<boolean> {
+		if (this.executedTransactions.has(messageHash)) return true;
+		if (!this.stateStore) return false;
+		const persisted = await this.stateStore.wasExecuted(messageHash);
+		if (persisted) {
+			// Re-populate in-memory map for future synchronous checks
+			this.executedTransactions.set(messageHash, Date.now());
+		}
+		return persisted;
 	}
 }
 
