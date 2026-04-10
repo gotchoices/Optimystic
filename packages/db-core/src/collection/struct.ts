@@ -3,17 +3,15 @@ import type { IChainHeader } from "../chain/chain-nodes.js";
 
 export type CollectionId = BlockId;
 
-export type CollectionHeaderType = 'CH';
-
-export type CollectionHeaderBlock = IBlock & Partial<IChainHeader> & {
-	header: {
-		type: CollectionHeaderType;
-	};
-};
+export type CollectionHeaderBlock = IBlock & Partial<IChainHeader>;
 
 export interface ICollection<TAction> {
+	readonly id: CollectionId;
+	act(...actions: Action<TAction>[]): Promise<void>;
 	update(): Promise<void>;
 	sync(): Promise<void>;
+	updateAndSync(): Promise<void>;
+	selectLog(forward?: boolean): AsyncIterableIterator<Action<TAction>>;
 }
 
 export type CreateCollectionAction = Action<void> & {

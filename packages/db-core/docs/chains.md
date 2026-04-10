@@ -69,7 +69,7 @@ When a chain is embedded in a larger structure (e.g. a collection), the upstream
 
 ```typescript
 // Upstream header includes chain fields
-type CollectionHeaderBlock = IBlock & Partial<IChainHeader> & { ... };
+type CollectionHeaderBlock = IBlock & Partial<IChainHeader>;
 
 // Create chain on the existing header — no extra block inserted
 const chain = await Chain.create<string>(store, {

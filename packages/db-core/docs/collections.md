@@ -34,12 +34,9 @@ class Collection<TAction> {
 Every collection has an associated transaction log that records all mutations:
 
 ```typescript
-// Collection header block
-type CollectionHeaderBlock = IBlock & {
-  header: {
-    type: CollectionHeaderType;
-  };
-};
+// Collection header block — identified by having header.id === collectionId
+// The block header's type field (a registered BlockType like "DIH", "TRE") discriminates the collection type
+type CollectionHeaderBlock = IBlock & Partial<IChainHeader>;
 
 // The collection ID doubles as the log ID
 type CollectionId = BlockId;
@@ -497,7 +494,14 @@ for await (const path of userTree.range({ from: 'user1', to: 'user9' })) {
 
 ### Custom Collections
 
+Custom collection types can be built by defining action handlers, a header block factory, and
+optionally registering with the collection type registry for discoverability:
+
 ```typescript
+// 1. Register a block type for the custom header
+const CustomHeaderBlockType = registerBlockType("CUS", "CustomHeaderBlock");
+
+// 2. Define the collection wrapper
 class CustomCollection<TData> {
   private collection: Collection<CustomAction<TData>>;
   
@@ -521,4 +525,39 @@ class CustomCollection<TData> {
     return new CustomCollection(collection);
   }
 }
+
+// 3. Register with the collection type registry
+registerCollectionType({
+  blockType: CustomHeaderBlockType,
+  name: "Custom",
+  // Provide an open factory if the type can be opened with default settings
+  open: (transactor, id) => Collection.createOrOpen(transactor, id, {
+    modules: { "custom_action": async () => {} },
+    createHeaderBlock: (hid, store) => ({
+      header: store.createBlockHeader(CustomHeaderBlockType, hid)
+    })
+  }),
+});
 ```
+
+#### Collection Type Registry
+
+The registry maps block header types to collection-level metadata and optional factories:
+
+```typescript
+import { registerCollectionType, getCollectionType, getCollectionTypes } from '@optimystic/db-core';
+
+// Look up a collection type by its header block type
+const descriptor = getCollectionType("DIH"); // Diary
+descriptor?.name;  // "Diary"
+descriptor?.open;  // factory function (or undefined for types like Tree that require parameters)
+
+// Enumerate all registered types
+for (const [blockType, descriptor] of getCollectionTypes()) {
+  console.log(`${descriptor.name} (${blockType})`);
+}
+```
+
+Built-in types are registered automatically when their modules are imported:
+- **Diary** (`"DIH"`) — registered with an `open` factory
+- **Tree** (`"TRE"`) — registered without `open` (requires `keyFromEntry` and `compare` parameters)

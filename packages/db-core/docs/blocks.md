@@ -156,11 +156,9 @@ type ChainDataNode<TEntry> = IBlock & {
 Blocks store collection metadata and configuration:
 
 ```typescript
-type CollectionHeaderBlock = IBlock & {
-  name: string;
-  version: number;
-  // ... other collection metadata
-};
+// Collection header block — identified by having header.id === collectionId
+// The block header's type field (a registered BlockType) discriminates the collection type
+type CollectionHeaderBlock = IBlock & Partial<IChainHeader>;
 ```
 
 ## Transform System

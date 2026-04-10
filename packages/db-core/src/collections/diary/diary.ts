@@ -1,6 +1,6 @@
-import { Collection } from "../../index.js";
+import { Collection, registerCollectionType } from "../../index.js";
 import type { ITransactor, Action, BlockId, BlockStore, IBlock, CollectionInitOptions, CollectionId } from "../../index.js";
-import { DiaryHeaderBlockType } from "./index.js";
+import { DiaryHeaderBlockType } from "./struct.js";
 
 export class Diary<TEntry> {
     private constructor(
@@ -46,3 +46,14 @@ export class Diary<TEntry> {
         }
     }
 }
+
+registerCollectionType({
+	blockType: DiaryHeaderBlockType,
+	name: "Diary",
+	open: (transactor, id) => Collection.createOrOpen(transactor, id, {
+		modules: { "append": async () => {} },
+		createHeaderBlock: (hid, store) => ({
+			header: store.createBlockHeader(DiaryHeaderBlockType, hid)
+		})
+	}),
+});
