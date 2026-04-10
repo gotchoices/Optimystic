@@ -6,6 +6,7 @@ import { toString as u8ToString } from 'uint8arrays/to-string'
 import type { IPeerReputation } from '../reputation/types.js'
 import { PenaltyReason } from '../reputation/types.js'
 import { RebalanceMonitor, type RebalanceMonitorConfig } from '../cluster/rebalance-monitor.js'
+import { SpreadOnChurnMonitor, type SpreadOnChurnConfig, type SpreadOnChurnDeps } from '../cluster/spread-on-churn.js'
 import type { PartitionDetector } from '../cluster/partition-detector.js'
 import type { ArachnodeFretAdapter } from '../storage/arachnode-fret-adapter.js'
 
@@ -41,6 +42,7 @@ export class NetworkManagerService implements Startable {
 	private reputation?: IPeerReputation
 	private libp2pRef: Libp2p | undefined
 	private rebalanceMonitor?: RebalanceMonitor
+	private spreadOnChurnMonitor?: SpreadOnChurnMonitor
 
 	constructor(private readonly components: Components, init: NetworkManagerServiceInit = {}) {
 		this.log = components.logger.forComponent('db-p2p:network-manager')
@@ -88,6 +90,33 @@ export class NetworkManagerService implements Startable {
 		return this.rebalanceMonitor
 	}
 
+	/**
+	 * Initialize the spread-on-churn monitor. Call after libp2p, FRET are available.
+	 * Caller provides repo and peerNetwork (not held by NetworkManagerService directly).
+	 */
+	initSpreadOnChurnMonitor(
+		partitionDetector: PartitionDetector,
+		repo: SpreadOnChurnDeps['repo'],
+		peerNetwork: SpreadOnChurnDeps['peerNetwork'],
+		clusterSize: number,
+		config?: Partial<SpreadOnChurnConfig>
+	): SpreadOnChurnMonitor {
+		const libp2p = this.getLibp2p()
+		const fret = this.getFret()
+		if (!libp2p || !fret) {
+			throw new Error('Cannot init SpreadOnChurnMonitor: libp2p or FRET not available')
+		}
+		this.spreadOnChurnMonitor = new SpreadOnChurnMonitor(
+			{ libp2p, fret, partitionDetector, repo, peerNetwork, clusterSize },
+			config
+		)
+		return this.spreadOnChurnMonitor
+	}
+
+	getSpreadOnChurnMonitor(): SpreadOnChurnMonitor | undefined {
+		return this.spreadOnChurnMonitor
+	}
+
 	private getLibp2p(): Libp2p | undefined {
 		return this.libp2pRef ?? this.components.libp2p;
 	}
@@ -112,6 +141,9 @@ export class NetworkManagerService implements Startable {
 	async stop(): Promise<void> {
 		if (this.rebalanceMonitor) {
 			await this.rebalanceMonitor.stop()
+		}
+		if (this.spreadOnChurnMonitor) {
+			await this.spreadOnChurnMonitor.stop()
 		}
 		this.running = false
 	}
