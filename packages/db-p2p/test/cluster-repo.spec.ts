@@ -1,5 +1,6 @@
 import { expect } from 'chai';
 import { ClusterMember, clusterMember } from '../src/cluster/cluster-repo.js';
+import { MemoryTransactionStateStore } from '../src/cluster/memory-transaction-state-store.js';
 import type { IRepo, ClusterRecord, RepoMessage, Signature, BlockGets, GetBlockResults, PendRequest, PendResult, CommitRequest, CommitResult, ActionBlocks, ClusterPeers, Transforms, IBlock, BlockId, BlockHeader, ClusterConsensusConfig } from '@optimystic/db-core';
 import type { IPeerNetwork } from '@optimystic/db-core';
 import type { PeerId, PrivateKey } from '@libp2p/interface';
@@ -791,6 +792,102 @@ describe('ClusterMember', () => {
 
 			// Mark the transaction as already executed
 			expect(clusterMemberInstance.wasTransactionExecuted(record.messageHash)).to.equal(true);
+		});
+
+		it('wasTransactionExecutedAsync falls back to persistent store after restart', async () => {
+			const stateStore = new MemoryTransactionStateStore();
+			const memberWithStore = clusterMember({
+				storageRepo: mockRepo,
+				peerNetwork: mockNetwork,
+				peerId: selfKeyPair.peerId,
+				privateKey: selfKeyPair.privateKey,
+				stateStore
+			});
+
+			const peers = makeClusterPeers([selfKeyPair]);
+			const record = await createClusterRecord(
+				peers,
+				makePendOperation('a1', 'block-1')
+			);
+
+			// Execute the transaction (promise + consensus)
+			const afterPromise = await memberWithStore.update(record);
+			await memberWithStore.update(afterPromise);
+			memberWithStore.dispose();
+
+			// Wait for fire-and-forget markExecuted to complete
+			await new Promise(resolve => setTimeout(resolve, 50));
+
+			// Verify persistent store has the executed marker
+			expect(await stateStore.wasExecuted(record.messageHash)).to.equal(true);
+
+			// Simulate restart: new member with same persistent store
+			const restartedMember = clusterMember({
+				storageRepo: new MockRepo(),
+				peerNetwork: mockNetwork,
+				peerId: selfKeyPair.peerId,
+				privateKey: selfKeyPair.privateKey,
+				stateStore
+			});
+
+			// Sync check misses (in-memory map is empty after restart)
+			expect(restartedMember.wasTransactionExecuted(record.messageHash)).to.equal(false);
+			// Async check finds it in persistent store
+			expect(await restartedMember.wasTransactionExecutedAsync(record.messageHash)).to.equal(true);
+			// After async check, sync check should now hit (re-populated in-memory map)
+			expect(restartedMember.wasTransactionExecuted(record.messageHash)).to.equal(true);
+			restartedMember.dispose();
+		});
+
+		it('persistent dedup prevents double execution after restart', async () => {
+			const stateStore = new MemoryTransactionStateStore();
+			const mockRepo1 = new MockRepo();
+			const memberWithStore = clusterMember({
+				storageRepo: mockRepo1,
+				peerNetwork: mockNetwork,
+				peerId: selfKeyPair.peerId,
+				privateKey: selfKeyPair.privateKey,
+				stateStore
+			});
+
+			const peers = makeClusterPeers([selfKeyPair]);
+			const record = await createClusterRecord(
+				peers,
+				makePendOperation('a1', 'block-1')
+			);
+
+			// Execute the transaction
+			const afterPromise = await memberWithStore.update(record);
+			await memberWithStore.update(afterPromise);
+			expect(mockRepo1.pendCalls.length).to.equal(1);
+			memberWithStore.dispose();
+
+			// Wait for fire-and-forget markExecuted to complete
+			await new Promise(resolve => setTimeout(resolve, 50));
+
+			// Simulate restart with new repo
+			const mockRepo2 = new MockRepo();
+			const restartedMember = clusterMember({
+				storageRepo: mockRepo2,
+				peerNetwork: mockNetwork,
+				peerId: selfKeyPair.peerId,
+				privateKey: selfKeyPair.privateKey,
+				stateStore
+			});
+
+			// Re-send the same consensus record — should NOT re-execute
+			const fullRecord: ClusterRecord = {
+				...afterPromise,
+				commits: { ...afterPromise.commits }
+			};
+			// Need to add a commit to reach consensus for single-peer cluster
+			const commitSig = await makeSignedCommit(selfKeyPair.privateKey, afterPromise);
+			fullRecord.commits[selfKeyPair.peerId.toString()] = commitSig;
+
+			await restartedMember.update(fullRecord);
+			// mockRepo2 should have zero pend calls — execution was prevented by persistent dedup
+			expect(mockRepo2.pendCalls.length).to.equal(0);
+			restartedMember.dispose();
 		});
 	});
 

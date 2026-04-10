@@ -252,7 +252,10 @@ export class ClusterMember implements ICluster {
 						log('cluster-member:action-consensus-after-commit', {
 							messageHash: record.messageHash
 						});
-						await this.handleConsensus(currentRecord);
+						// Check persistent store for post-recovery dedup before synchronous guard
+						if (!await this.wasTransactionExecutedAsync(currentRecord.messageHash)) {
+							await this.handleConsensus(currentRecord);
+						}
 					}
 				}
 				shouldPersist = false;
@@ -261,8 +264,12 @@ export class ClusterMember implements ICluster {
 				log('cluster-member:action-consensus', {
 					messageHash: record.messageHash
 				});
-				// handleConsensus has its own idempotency guard via executedTransactions
-				await this.handleConsensus(currentRecord);
+				// Check persistent store for post-recovery dedup before synchronous guard
+				if (await this.wasTransactionExecutedAsync(currentRecord.messageHash)) {
+					log('cluster-member:consensus-already-executed', { messageHash: record.messageHash });
+				} else {
+					await this.handleConsensus(currentRecord);
+				}
 				// Don't call clearTransaction here - it happens in handleConsensus
 				shouldPersist = false;
 				break;

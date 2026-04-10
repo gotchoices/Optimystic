@@ -36,7 +36,6 @@ interface ClusterTransactionState {
 
 /** Manages distributed transactions across clusters */
 export class ClusterCoordinator {
-	// TODO: move this into a state management interface so that transaction state can be persisted
 	private transactions: Map<string, ClusterTransactionState> = new Map();
 	private readonly retryInitialIntervalMs = 2000;
 	private readonly retryBackoffFactor = 2;
