@@ -8,6 +8,7 @@ import { bootstrap } from '@libp2p/bootstrap';
 import { circuitRelayServer } from '@libp2p/circuit-relay-v2';
 import { peerIdFromString } from '@libp2p/peer-id';
 import { generateKeyPair } from '@libp2p/crypto/keys';
+import type { PrivateKey } from '@libp2p/interface';
 import { clusterService } from './cluster/service.js';
 import { repoService } from './repo/service.js';
 import { StorageRepo } from './storage/storage-repo.js';
@@ -97,6 +98,16 @@ export type NodeOptions = {
 
 	/** Optional persistent store for 2PC transaction state (enables crash recovery) */
 	transactionStateStore?: ITransactionStateStore;
+
+	/**
+	 * Optional Ed25519 private key for this node. When provided, the libp2p
+	 * node uses this identity instead of generating a fresh keypair. Use this
+	 * to persist peer identity across process restarts.
+	 *
+	 * Accepts a libp2p `PrivateKey` (as returned by `generateKeyPair('Ed25519')`
+	 * or `privateKeyFromProtobuf(...)` from `@libp2p/crypto/keys`).
+	 */
+	privateKey?: PrivateKey;
 };
 
 function resolveStorage(provider: RawStorageProvider | undefined): IRawStorage {
@@ -156,8 +167,7 @@ export async function createLibp2pNodeBase(
 		}
 	};
 
-	// Generate or derive the private key for this node
-	const nodePrivateKey = await generateKeyPair('Ed25519');
+	const nodePrivateKey = options.privateKey ?? await generateKeyPair('Ed25519');
 
 	const listenAddrs = options.listenAddrs ?? defaults.listenAddrs;
 	const transports = options.transports ?? defaults.transports;
