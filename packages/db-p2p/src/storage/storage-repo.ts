@@ -51,17 +51,16 @@ export class StorageRepo implements IRepo {
 			}
 
 			const blockRev = await blockStorage.getBlock(context?.rev);
-			if (!blockRev) {
-				return [blockId, { state: {} } as GetBlockResult];
-			}
 
-			// Include pending action if requested
+			// Include pending action if requested — handled first so a pending-only
+			// insert (no committed revision yet) can still be served by applying the
+			// pending transform to an undefined prior block.
 			if (context?.actionId !== undefined) {
 				const pendingTransform = await blockStorage.getPendingTransaction(context.actionId);
 				if (!pendingTransform) {
 					throw new Error(`Pending action ${context.actionId} not found`);
 				}
-				const block = applyTransform(blockRev.block, pendingTransform);
+				const block = applyTransform(blockRev?.block, pendingTransform);
 				return [blockId, {
 					block,
 					state: {
@@ -69,6 +68,10 @@ export class StorageRepo implements IRepo {
 						pendings: [context.actionId]
 					}
 				}];
+			}
+
+			if (!blockRev) {
+				return [blockId, { state: {} } as GetBlockResult];
 			}
 
 			const pendings = await asyncIteratorToArray(blockStorage.listPendingTransactions());

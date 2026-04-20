@@ -5,7 +5,13 @@ export interface IBlockStorage {
     /** Gets the latest revision information for this block */
     getLatest(): Promise<ActionRev | undefined>;
 
-    /** Gets a materialized block at the given revision */
+    /**
+     * Gets a materialized block at the given revision.
+     * Returns undefined when the block has no materialized content yet — either
+     * no metadata exists, or metadata exists (seeded by a pending transaction)
+     * but no revision has been committed. Throws only when a specific `rev` was
+     * requested but cannot be located.
+     */
     getBlock(rev?: number): Promise<{ block: IBlock, actionRev: ActionRev } | undefined>;
 
     /** Gets an action by ID */

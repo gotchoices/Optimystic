@@ -255,6 +255,22 @@ describe('StorageRepo', () => {
 			expect(Object.keys(result).length).to.equal(1);
 		});
 
+		it('returns empty state when block has only pending transaction (no committed revision)', async () => {
+			// Pend without committing — seeds metadata via savePendingTransaction
+			// but does NOT commit any revision.
+			await repo.pend({
+				actionId: 'pending-only' as ActionId,
+				transforms: makeInsertTransforms('block-1' as BlockId, makeBlock('block-1')),
+				policy: 'c'
+			});
+
+			// Contextless get should return empty state, not throw.
+			const result = await repo.get({ blockIds: ['block-1' as BlockId] });
+
+			expect('block-1' in result).to.equal(true);
+			expect(result['block-1']!.state).to.deep.equal({});
+		});
+
 		it('lists pending transactions in state', async () => {
 			// Create block first
 			const blockStorage = new BlockStorage('block-1' as BlockId, rawStorage);

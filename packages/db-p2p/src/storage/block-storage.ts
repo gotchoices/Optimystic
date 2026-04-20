@@ -26,11 +26,14 @@ export class BlockStorage implements IBlockStorage {
 			return undefined;
 		}
 
-		const targetRev = rev ?? meta.latest?.rev;
-		if (targetRev === undefined) {
-			throw new Error(`No revision specified and no latest revision exists for block ${this.blockId}`);
+		// Pending-only state: metadata was seeded by savePendingTransaction but no
+		// revision has been committed yet. Treat as "doesn't exist" for the default
+		// request path — matches StorageRepo.get()'s contract that undefined => empty.
+		if (rev === undefined && meta.latest === undefined) {
+			return undefined;
 		}
 
+		const targetRev = rev ?? meta.latest!.rev;
 		await this.ensureRevision(meta, targetRev);
 		return await this.materializeBlock(meta, targetRev);
 	}
