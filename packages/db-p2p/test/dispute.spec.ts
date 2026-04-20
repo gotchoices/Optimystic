@@ -176,7 +176,7 @@ describe('EngineHealthMonitor', () => {
 	it('should auto-recover when losses fall below threshold', () => {
 		const monitor = new EngineHealthMonitor({
 			engineHealthDisputeThreshold: 3,
-			engineHealthWindowMs: 1, // 1ms window for testing
+			engineHealthWindowMs: 25, // window large enough that 3 synchronous recordDisputeLoss() calls can't outrun it
 		});
 		monitor.recordDisputeLoss();
 		monitor.recordDisputeLoss();
@@ -188,7 +188,7 @@ describe('EngineHealthMonitor', () => {
 			setTimeout(() => {
 				expect(monitor.isUnhealthy()).to.be.false;
 				resolve();
-			}, 10);
+			}, 100);
 		});
 	});
 
