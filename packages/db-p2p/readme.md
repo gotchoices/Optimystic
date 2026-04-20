@@ -483,6 +483,41 @@ const node = await createLibp2pNode({
 });
 ```
 
+#### Solo / bootstrap / mobile nodes (no remote peers)
+
+A node can operate fully on its own — no bootstrap peers, no listen addresses, no
+connectivity to other peers. This is the common shape for a mobile app on first
+launch or for a local-only sanity test.
+
+```typescript
+const soloNode = await createLibp2pNode({
+    networkName: 'mynet',
+    bootstrapNodes: [],           // no bootstrap
+    listenAddrs: [],              // no incoming connections
+    transports: [webSockets()],   // transports still required
+    clusterSize: 1,
+});
+```
+
+In solo mode:
+
+- The node is its own coordinator. `CoordinatorRepo` short-circuits to local
+  storage when the cluster size is ≤ 1, so `pend`/`commit` do not require
+  cluster consensus and do not attempt to dial self.
+- Block restoration is skipped when the only discovered peer is self.
+  `RestorationCoordinator` will return `undefined` immediately rather than
+  attempt to dial self (which would hang on a node with no listen addrs).
+- If an operation fails for some other reason, `findCoordinator` surfaces a
+  distinguishable `FindCoordinatorError` with `code ===
+  FIND_COORDINATOR_ERROR_CODES.SELF_COORDINATION_EXHAUSTED` rather than the
+  generic "all candidates excluded". The aggregate error thrown by
+  `NetworkTransactor` preserves the ORIGINAL first-attempt cause so callers can
+  diagnose the real problem.
+
+Once remote peers become reachable, the node transitions out of solo mode
+automatically as FRET discovers them. Persisted network state (HWM, FRET
+table) carries across restarts when an `options.persistence` is supplied.
+
 #### Custom transports (including React Native)
 
 By default, `createLibp2pNode()` uses TCP + circuit-relay transport.

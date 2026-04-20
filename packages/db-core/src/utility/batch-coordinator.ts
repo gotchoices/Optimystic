@@ -125,22 +125,31 @@ export async function processBatches<TPayload, TResponse>(
         await Promise.all(set.map(async (batch) => {
             batch.request = new Pending(process(batch)
                 .catch(async e => {
+                    // Always rethrow the ORIGINAL first-attempt error `e` so batch.request.error
+                    // preserves the root cause. If retry setup itself fails (e.g., findCoordinator
+                    // throws "self-exhausted" on a solo node), that retry error MUST NOT mask `e`.
                     if (expiration > Date.now()) {
                         const excludedPeers = [batch.peerId, ...(batch.excludedPeers ?? [])];
                         log('retry peer=%s excluded=%d', batch.peerId.toString(), excludedPeers.length);
-                        const retries = await createBatchesForPayload<TPayload, TResponse>(
-                            getBlockIds(batch),
-                            batch.payload,
-                            getBlockPayload,
-                            excludedPeers,
-                            findCoordinator
-                        );
-                        if (retries.length > 0 && expiration > Date.now()) {
-                            const root = rootOf.get(batch) ?? batch;
-                            root.subsumedBy = [...(root.subsumedBy ?? []), ...retries];
-                            for (const r of retries) rootOf.set(r, root);
-                            // Process retries, but ensure further failures also attach to the same root
-                            await processSet(retries);
+                        try {
+                            const retries = await createBatchesForPayload<TPayload, TResponse>(
+                                getBlockIds(batch),
+                                batch.payload,
+                                getBlockPayload,
+                                excludedPeers,
+                                findCoordinator
+                            );
+                            if (retries.length > 0 && expiration > Date.now()) {
+                                const root = rootOf.get(batch) ?? batch;
+                                root.subsumedBy = [...(root.subsumedBy ?? []), ...retries];
+                                for (const r of retries) rootOf.set(r, root);
+                                // Process retries, but ensure further failures also attach to the same root
+                                await processSet(retries);
+                            }
+                        } catch (retryErr) {
+                            log('retry:setup-failed peer=%s original=%o retry=%o',
+                                batch.peerId.toString(), e, retryErr);
+                            // Swallow retryErr; the original `e` is authoritative.
                         }
                     }
                     throw e;

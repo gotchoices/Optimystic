@@ -139,10 +139,12 @@ export class NetworkTransactor implements ITransactor {
 				b => (b.request?.isResponse as boolean) ?? false,
 				b => {
 					const status = b.request == null ? 'no-response' : (b.request.isResponse ? 'response' : 'in-flight')
-					return `${b.peerId.toString()}[block:${b.blockId}](${status})`
+					const errMsg = b.request?.isError ? ` cause=${errorMessage(b.request.error)}` : ''
+					return `${b.peerId.toString()}[block:${b.blockId}](${status})${errMsg}`
 				});
-			const aggregate = new Error(`Some peers did not complete: ${details}${error ? `; root: ${error.message}` : ''}`);
-			(aggregate as any).cause = error;
+			const rootCause = firstBatchError(batches) ?? error;
+			const aggregate = new Error(`Some peers did not complete: ${details}${rootCause ? `; root: ${rootCause.message}` : ''}`);
+			(aggregate as any).cause = rootCause;
 			throw aggregate;
 		}
 
@@ -337,12 +339,16 @@ export class NetworkTransactor implements ITransactor {
 				b => (b.request?.isResponse as boolean && (b.request as any).response?.success) ?? false,
 				b => {
 					const status = b.request == null ? 'no-response' : (b.request.isResponse ? 'non-success' : 'in-flight')
-					return `${b.peerId.toString()}[block:${b.blockId}](${status})`
+					const errMsg = b.request?.isError ? ` cause=${errorMessage(b.request.error)}` : ''
+					return `${b.peerId.toString()}[block:${b.blockId}](${status})${errMsg}`
 				});
-			const aggregate = new Error(`Some peers did not complete: ${details}${error ? `; root: ${error.message}` : ''}`);
-			const prior = error;
-			(aggregate as any).cause = prior;
-			(aggregate as AggregateError).errors = prior ? [prior] : [];
+			// Prefer the first-attempt per-batch error over any outer `error` so the root cause
+			// surfaced in the aggregate message is the actual coordinator failure, not any
+			// downstream "no coordinator available" thrown by retry lookup.
+			const rootCause = firstBatchError(batches) ?? error;
+			const aggregate = new Error(`Some peers did not complete: ${details}${rootCause ? `; root: ${rootCause.message}` : ''}`);
+			(aggregate as any).cause = rootCause;
+			(aggregate as AggregateError).errors = rootCause ? [rootCause] : [];
 			error = aggregate;
 		}
 
@@ -474,10 +480,12 @@ export class NetworkTransactor implements ITransactor {
 					const status = b.request == null ? 'no-response' : (b.request.isResponse ? 'non-success' : 'in-flight')
 					const resp: any = (b.request as any)?.response;
 					const extra = resp && resp.success === false ? (Array.isArray(resp.missing) ? ` missing=${resp.missing.length}` : ' success=false') : '';
-					return `${b.peerId.toString()}[blocks:${b.payload instanceof Array ? (b.payload as any[]).length : 1}](${status})${extra ? ' ' + extra : ''}`
+					const errMsg = b.request?.isError ? ` cause=${errorMessage(b.request.error)}` : ''
+					return `${b.peerId.toString()}[blocks:${b.payload instanceof Array ? (b.payload as any[]).length : 1}](${status})${extra ? ' ' + extra : ''}${errMsg}`
 				});
-			const aggregate = new Error(`Some peers did not complete: ${details}${error ? `; root: ${error.message}` : ''}`);
-			(aggregate as any).cause = error;
+			const rootCause = firstBatchError(batches) ?? error;
+			const aggregate = new Error(`Some peers did not complete: ${details}${rootCause ? `; root: ${rootCause.message}` : ''}`);
+			(aggregate as any).cause = rootCause;
 			error = aggregate;
 		}
 		return { batches, error };
@@ -535,6 +543,36 @@ export class NetworkTransactor implements ITransactor {
 	}
 }
 
+
+/** Returns a readable message for an unknown error value. */
+function errorMessage(err: unknown): string {
+	if (err instanceof Error) return err.message;
+	if (err == null) return 'unknown';
+	try { return String(err); } catch { return 'unknown'; }
+}
+
+/**
+ * Returns the first batch-level error encountered across the batch tree,
+ * preferring root batches over retries. Used to preserve the ORIGINAL first-attempt
+ * failure reason when constructing aggregate errors — retry lookup failures
+ * (e.g., findCoordinator throwing because self is excluded on a solo node) must
+ * not shadow the actual root cause.
+ */
+function firstBatchError<TPayload, TResponse>(batches: CoordinatorBatch<TPayload, TResponse>[]): Error | undefined {
+	// Prefer errors on root batches first
+	for (const root of batches) {
+		if (root.request?.isError) return asError(root.request.error);
+	}
+	// Fall back to errors in any retry subtree
+	for (const b of allBatches(batches)) {
+		if (b.request?.isError) return asError(b.request.error);
+	}
+	return undefined;
+}
+
+function asError(err: unknown): Error {
+	return err instanceof Error ? err : new Error(errorMessage(err));
+}
 
 /**
  * Returns the block actions grouped by action id and concatenated transforms

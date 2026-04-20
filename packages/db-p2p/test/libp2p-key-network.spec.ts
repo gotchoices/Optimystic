@@ -5,6 +5,8 @@ import type { PeerId, Libp2p, Connection } from '@libp2p/interface';
 import type { SerializedTable } from 'p2p-fret';
 import {
 	Libp2pKeyPeerNetwork,
+	FindCoordinatorError,
+	FIND_COORDINATOR_ERROR_CODES,
 	type NetworkMode,
 	type NetworkStatePersistence,
 	type PersistedNetworkState,
@@ -337,6 +339,82 @@ describe('Libp2pKeyPeerNetwork', () => {
 
 			// Should be reset because connections.length > 0
 			expect((network as any).consecutiveIsolatedSessions).to.equal(0);
+		});
+	});
+
+	describe('findCoordinator() — solo/bootstrap node error codes', () => {
+		it('returns self on first call when no excludes', async () => {
+			const fret = {
+				getNeighbors: () => [],
+				getNetworkSizeEstimate: () => ({ size_estimate: 1, confidence: 0.5 }),
+				detectPartition: () => false,
+				exportTable: () => undefined
+			};
+			const libp2p = createMockLibp2p(selfPeerId, { fret });
+			const network = new Libp2pKeyPeerNetwork(libp2p, 16, undefined, 'forming');
+			const key = new TextEncoder().encode('optimystic/schema');
+			const result = await network.findCoordinator(key);
+			expect(result.toString()).to.equal(selfPeerId.toString());
+		});
+
+		it('throws SELF_COORDINATION_EXHAUSTED (not "all candidates excluded") when self is excluded on solo node', async () => {
+			const fret = {
+				getNeighbors: () => [],
+				getNetworkSizeEstimate: () => ({ size_estimate: 1, confidence: 0.5 }),
+				detectPartition: () => false,
+				exportTable: () => undefined
+			};
+			const libp2p = createMockLibp2p(selfPeerId, { fret });
+			const network = new Libp2pKeyPeerNetwork(libp2p, 16, undefined, 'forming');
+			const key = new TextEncoder().encode('optimystic/schema');
+
+			let caught: unknown;
+			try {
+				await network.findCoordinator(key, { excludedPeers: [selfPeerId] });
+				expect.fail('Expected findCoordinator to throw when self is excluded on solo node');
+			} catch (err) {
+				caught = err;
+			}
+
+			expect(caught).to.be.instanceOf(FindCoordinatorError);
+			expect((caught as FindCoordinatorError).code).to.equal(
+				FIND_COORDINATOR_ERROR_CODES.SELF_COORDINATION_EXHAUSTED
+			);
+			// Sanity: the error should NOT be the generic "all candidates excluded" message
+			expect((caught as Error).message).to.match(/exhausted/i);
+		});
+
+		it('throws NO_COORDINATOR_AVAILABLE (not self-exhausted) when HWM>1 and self excluded', async () => {
+			// Simulate a node that has seen a larger network (HWM > 1) but is currently isolated
+			const persistence = new MemoryPersistence({
+				version: 1,
+				networkHighWaterMark: 10,
+				lastConnectedTimestamp: Date.now() - 10 * 60_000,
+				consecutiveIsolatedSessions: 3 // enough for hwm-decay
+			});
+			const fret = {
+				getNeighbors: () => [],
+				getNetworkSizeEstimate: () => ({ size_estimate: 10, confidence: 0.5 }),
+				detectPartition: () => false,
+				exportTable: () => undefined
+			};
+			const libp2p = createMockLibp2p(selfPeerId, { fret });
+			const network = new Libp2pKeyPeerNetwork(libp2p, 16, undefined, 'forming', persistence);
+			await network.initFromPersistedState();
+
+			const key = new TextEncoder().encode('some-block');
+			let caught: unknown;
+			try {
+				await network.findCoordinator(key, { excludedPeers: [selfPeerId] });
+				expect.fail('Expected findCoordinator to throw');
+			} catch (err) {
+				caught = err;
+			}
+			expect(caught).to.be.instanceOf(FindCoordinatorError);
+			// HWM > 1 → not the solo-exhausted case
+			expect((caught as FindCoordinatorError).code).to.equal(
+				FIND_COORDINATOR_ERROR_CODES.NO_COORDINATOR_AVAILABLE
+			);
 		});
 	});
 

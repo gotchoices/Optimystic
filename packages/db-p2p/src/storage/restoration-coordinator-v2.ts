@@ -27,7 +27,9 @@ export class RestorationCoordinator {
 	constructor(
 		private readonly fretAdapter: ArachnodeFretAdapter,
 		private readonly peerNetwork: IPeerNetwork,
-		private readonly protocolPrefix: string
+		private readonly protocolPrefix: string,
+		/** Optional self peer id — used to skip dialing self on solo/bootstrap nodes. */
+		private readonly selfPeerId?: string
 	) {}
 
 	private readonly log = createLogger('storage:restoration')
@@ -43,7 +45,18 @@ export class RestorationCoordinator {
 		const myPeers = await this.getMyRingPeers(blockId);
 		const myRingDepth = this.getMyRingDepth();
 
-		for (const peerId of myPeers) {
+		// Avoid dialing self: on a solo/bootstrap node with no listenAddrs, dialing self
+		// either hangs or fails noisily. Filter self out of the ring-peer list so the loop
+		// below can no-op cleanly when self is the only candidate.
+		const nonSelfMyPeers = this.selfPeerId
+			? myPeers.filter(p => p !== this.selfPeerId)
+			: myPeers;
+		if (nonSelfMyPeers.length === 0 && myRingDepth <= 0) {
+			this.log('restore:solo-node-skip blockId=%s', blockId);
+			return undefined;
+		}
+
+		for (const peerId of nonSelfMyPeers) {
 			const archive = await this.queryPeer(peerId, blockId, rev);
 			if (archive) {
 				this.recordSuccess(myRingDepth, blockId, Date.now() - startTime);
@@ -55,10 +68,11 @@ export class RestorationCoordinator {
 		for (let ringDepth = myRingDepth - 1; ringDepth >= 0; ringDepth--) {
 			const storagePeers = this.fretAdapter.findPeersAtRing(ringDepth);
 
-			// Filter to peers responsible for this block's partition
-			const responsiblePeers = this.filterByPartition(storagePeers, blockId, ringDepth);
+			// Filter to peers responsible for this block's partition (skip self — cannot dial self).
+			const responsiblePeers = this.filterByPartition(storagePeers, blockId, ringDepth)
+				.filter(p => !this.selfPeerId || p !== this.selfPeerId);
 
-		for (const peerIdStr of responsiblePeers) {
+			for (const peerIdStr of responsiblePeers) {
 				const archive = await this.queryPeer(peerIdStr, blockId, rev);
 				if (archive) {
 					this.recordSuccess(ringDepth, blockId, Date.now() - startTime);

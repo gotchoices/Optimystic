@@ -20,6 +20,40 @@ const makeTransforms = (blockId: string): Transforms => ({
 
 describe('Mesh Sanity Tests', () => {
 
+	describe('Suite 0: 1-node (solo) mesh, bootstrap / mobile scenario', () => {
+		let mesh: Mesh;
+
+		beforeEach(async () => {
+			mesh = await createMesh(1, { responsibilityK: 1, clusterSize: 1, superMajorityThreshold: 0.51 });
+		});
+
+		it('solo node pends and commits its own schema block via peerCount<=1 short-circuit', async () => {
+			const node = mesh.nodes[0]!;
+			const blockId = 'optimystic/schema';
+
+			const pendResult = await node.coordinatorRepo.pend(
+				{ actionId: 'schema-a1', transforms: makeTransforms(blockId), policy: 'c' }
+			);
+			expect(pendResult.success).to.equal(true);
+
+			const commitResult = await node.coordinatorRepo.commit(
+				{ actionId: 'schema-a1', tailId: blockId as BlockId, rev: 1, blockIds: [blockId] }
+			);
+			expect(commitResult.success).to.equal(true);
+
+			const result = await node.coordinatorRepo.get({ blockIds: [blockId] });
+			expect(result[blockId]?.block?.header.id).to.equal(blockId);
+		});
+
+		it('solo node reads non-existent block without hanging and returns empty state', async () => {
+			const node = mesh.nodes[0]!;
+			const result = await node.coordinatorRepo.get({ blockIds: ['never-existed'] });
+			// An empty state (no block) is the correct solo-node answer — not an error, not a hang.
+			expect(result['never-existed']).to.exist;
+			expect(result['never-existed']!.state?.latest).to.be.undefined;
+		});
+	});
+
 	describe('Suite 1: 3-node mesh, responsibilityK=1', () => {
 		let mesh: Mesh;
 

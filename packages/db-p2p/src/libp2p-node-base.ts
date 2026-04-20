@@ -393,7 +393,8 @@ export async function createLibp2pNodeBase(
 			const restorationCoordinatorV2 = new RestorationCoordinator(
 				fretAdapter,
 				{ connect: (pid, protocol) => node.dialProtocol(pid as Parameters<typeof node.dialProtocol>[0], [protocol]) },
-				`/optimystic/${options.networkName}`
+				`/optimystic/${options.networkName}`,
+				node.peerId.toString()
 			);
 
 			// Update restore callback to use new coordinator

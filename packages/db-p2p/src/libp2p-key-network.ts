@@ -12,6 +12,40 @@ interface WithFretService { services?: { fret?: FretService } }
 
 export type NetworkMode = 'forming' | 'joining';
 
+/**
+ * Error codes surfaced by {@link Libp2pKeyPeerNetwork.findCoordinator}. Callers
+ * (notably the batch-retry logic in `NetworkTransactor`) can inspect `.code`
+ * to distinguish between "transient — try again with different excludes" and
+ * "terminal — stop retrying".
+ */
+export const FIND_COORDINATOR_ERROR_CODES = {
+	/**
+	 * Last-resort self-coordination was blocked by the self-coordination guard
+	 * (e.g. partition detected, suspicious shrinkage). Retrying is unlikely to help.
+	 */
+	SELF_COORDINATION_BLOCKED: 'SELF_COORDINATION_BLOCKED',
+	/**
+	 * Self-coordination was already attempted and self is now excluded. On a solo
+	 * or bootstrap node with no other peers, this means retries are exhausted and
+	 * the original error from the prior attempt should be surfaced instead.
+	 */
+	SELF_COORDINATION_EXHAUSTED: 'SELF_COORDINATION_EXHAUSTED',
+	/** No peer (including self) is an eligible coordinator. */
+	NO_COORDINATOR_AVAILABLE: 'NO_COORDINATOR_AVAILABLE'
+} as const;
+
+export type FindCoordinatorErrorCode =
+	typeof FIND_COORDINATOR_ERROR_CODES[keyof typeof FIND_COORDINATOR_ERROR_CODES];
+
+export class FindCoordinatorError extends Error {
+	readonly code: FindCoordinatorErrorCode;
+	constructor(code: FindCoordinatorErrorCode, message: string) {
+		super(message);
+		this.name = 'FindCoordinatorError';
+		this.code = code;
+	}
+}
+
 export interface PersistedNetworkState {
 	version: 1;
 	networkHighWaterMark: number;
@@ -359,7 +393,10 @@ export class Libp2pKeyPeerNetwork implements IKeyNetwork, IPeerNetwork {
 			const decision = this.shouldAllowSelfCoordination();
 			if (!decision.allow) {
 				this.log('findCoordinator:self-coord-blocked key=%s reason=%s', keyStr, decision.reason);
-				throw new Error(`Self-coordination blocked: ${decision.reason}. No coordinator available for key.`);
+				throw new FindCoordinatorError(
+					FIND_COORDINATOR_ERROR_CODES.SELF_COORDINATION_BLOCKED,
+					`Self-coordination blocked: ${decision.reason}. No coordinator available for key.`
+				);
 			}
 			if (decision.warn) {
 				this.log('findCoordinator:self-selected-warn key=%s coordinator=%s reason=%s',
@@ -372,8 +409,24 @@ export class Libp2pKeyPeerNetwork implements IKeyNetwork, IPeerNetwork {
 			return self
 		}
 
+		// Self is excluded. On a solo/bootstrap node (HWM<=1 and no other connected/FRET peers),
+		// this means the caller already tried self and the retry has nowhere to go — surface a
+		// distinct error so retry logic stops and the original first-attempt cause is preserved.
+		const isSoloBootstrap = this.networkHighWaterMark <= 1;
+		if (isSoloBootstrap) {
+			this.log('findCoordinator:self-exhausted-solo key=%s self=%s', keyStr, self.toString().substring(0, 12))
+			throw new FindCoordinatorError(
+				FIND_COORDINATOR_ERROR_CODES.SELF_COORDINATION_EXHAUSTED,
+				'Self-coordination exhausted on solo/bootstrap node (self already attempted). ' +
+				'The original first-attempt error describes the actual failure cause.'
+			);
+		}
+
 		this.log('findCoordinator:all-excluded key=%s self=%s', keyStr, self.toString().substring(0, 12))
-		throw new Error('No coordinator available for key (all candidates excluded)')
+		throw new FindCoordinatorError(
+			FIND_COORDINATOR_ERROR_CODES.NO_COORDINATOR_AVAILABLE,
+			'No coordinator available for key (all candidates excluded)'
+		);
 	}
 
 	private getConnectedAddrsByPeer(): Record<string, string[]> {
