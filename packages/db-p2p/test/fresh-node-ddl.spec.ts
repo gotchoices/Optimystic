@@ -1,6 +1,6 @@
 import { expect } from 'chai';
-import { Tree, NetworkTransactor, type ITransactor, type IRepo, type PeerId as DbPeerId } from '@optimystic/db-core';
-import { createMesh, type Mesh } from './mesh-harness.js';
+import { Tree, type ITransactor } from '@optimystic/db-core';
+import { createMesh, buildNetworkTransactor, type Mesh } from './mesh-harness.js';
 
 // Forcing-function repro for ticket 5-chain-add-on-fresh-collection-throws-non-existent-chain.
 // Uses the real production stack (StorageRepo + CoordinatorRepo + NetworkTransactor) on a
@@ -12,23 +12,6 @@ interface TestEntry {
 	key: number;
 	value: string;
 }
-
-const buildNetworkTransactor = (mesh: Mesh): ITransactor => {
-	const repoByPeer = new Map<string, IRepo>();
-	for (const node of mesh.nodes) {
-		repoByPeer.set(node.peerId.toString(), node.coordinatorRepo as unknown as IRepo);
-	}
-	return new NetworkTransactor({
-		timeoutMs: 5_000,
-		abortOrCancelTimeoutMs: 5_000,
-		keyNetwork: mesh.keyNetwork,
-		getRepo: (peerId: DbPeerId) => {
-			const repo = repoByPeer.get(peerId.toString());
-			if (!repo) throw new Error(`Unknown peer ${peerId.toString()}`);
-			return repo;
-		}
-	});
-};
 
 describe('Fresh-node DDL (solo, real production stack)', function () {
 	// Tighter than the 10s package default: these are forcing-function repros for a

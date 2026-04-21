@@ -1,7 +1,8 @@
 import type { PeerId, PrivateKey } from '@libp2p/interface';
-import type { IKeyNetwork, ClusterPeers, ICluster, ClusterRecord, IRepo, BlockId, ActionRev, ClusterConsensusConfig } from '@optimystic/db-core';
+import type { IKeyNetwork, ClusterPeers, ICluster, ClusterRecord, IRepo, BlockId, ActionRev, ClusterConsensusConfig, ITransactor, PeerId as DbPeerId } from '@optimystic/db-core';
 import type { FindCoordinatorOptions } from '@optimystic/db-core';
 import type { IPeerNetwork } from '@optimystic/db-core';
+import { NetworkTransactor } from '@optimystic/db-core';
 import { peerIdFromPrivateKey } from '@libp2p/peer-id';
 import { generateKeyPair } from '@libp2p/crypto/keys';
 import { ClusterMember, clusterMember } from '../src/cluster/cluster-repo.js';
@@ -233,3 +234,44 @@ export async function createMesh(nodeCount: number, options: MeshOptions): Promi
 
 	return { nodes, failures, keyNetwork };
 }
+
+export interface BuildTransactorOptions {
+	timeoutMs?: number;
+	abortOrCancelTimeoutMs?: number;
+}
+
+/**
+ * Builds a NetworkTransactor over a mesh. All nodes share the same mock
+ * infrastructure so a single transactor routes to every peer via `getRepo`.
+ * Suitable for solo-mesh tests; for multi-node tests prefer
+ * `buildNetworkTransactors` to label "which node is driving".
+ */
+export const buildNetworkTransactor = (mesh: Mesh, options: BuildTransactorOptions = {}): ITransactor => {
+	const repoByPeer = new Map<string, IRepo>();
+	for (const node of mesh.nodes) {
+		repoByPeer.set(node.peerId.toString(), node.coordinatorRepo as unknown as IRepo);
+	}
+	return new NetworkTransactor({
+		timeoutMs: options.timeoutMs ?? 5_000,
+		abortOrCancelTimeoutMs: options.abortOrCancelTimeoutMs ?? 5_000,
+		keyNetwork: mesh.keyNetwork,
+		getRepo: (peerId: DbPeerId) => {
+			const repo = repoByPeer.get(peerId.toString());
+			if (!repo) throw new Error(`Unknown peer ${peerId.toString()}`);
+			return repo;
+		}
+	});
+};
+
+/**
+ * Builds one NetworkTransactor per mesh node, keyed by peer-id string. Each
+ * transactor shares the mesh's key network and peer→repo map — the separate
+ * instances exist so tests can semantically say "driven by node A".
+ */
+export const buildNetworkTransactors = (mesh: Mesh, options: BuildTransactorOptions = {}): Map<string, ITransactor> => {
+	const transactors = new Map<string, ITransactor>();
+	for (const node of mesh.nodes) {
+		transactors.set(node.peerId.toString(), buildNetworkTransactor(mesh, options));
+	}
+	return transactors;
+};
