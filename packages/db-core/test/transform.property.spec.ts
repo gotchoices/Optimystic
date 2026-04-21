@@ -133,23 +133,6 @@ const arbInitialSubset: fc.Arbitrary<TestBlock[]> = fc
   .subarray([...BLOCK_IDS])
   .map((ids) => ids.map((id) => makeBlock(id, 'src', ['seed'])))
 
-async function replay(
-  actions: Action[],
-  source: BlockSource<TestBlock>,
-): Promise<Tracker<TestBlock>> {
-  const tracker = new Tracker<TestBlock>(source)
-  for (const a of actions) {
-    if (a.kind === 'insert') tracker.insert(a.block)
-    else if (a.kind === 'update') tracker.update(a.id, a.op)
-    else if (a.kind === 'delete') tracker.delete(a.id)
-    else {
-      const block = await tracker.tryGet(a.id)
-      if (block) apply(tracker, block, a.op)
-    }
-  }
-  return tracker
-}
-
 async function runActions(
   tracker: Tracker<TestBlock>,
   actions: Action[],
@@ -163,6 +146,15 @@ async function runActions(
       if (block) apply(tracker, block, a.op)
     }
   }
+}
+
+async function replay(
+  actions: Action[],
+  source: BlockSource<TestBlock>,
+): Promise<Tracker<TestBlock>> {
+  const tracker = new Tracker<TestBlock>(source)
+  await runActions(tracker, actions)
+  return tracker
 }
 
 describe('Transform property-based tests', () => {
