@@ -29,7 +29,7 @@ describe('Schema Migration (TEST-7.4.1)', () => {
 	beforeEach(async () => {
 		db = new Database();
 		const plugin = register(db, {
-			default_transactor: 'test',
+			default_transactor: 'mesh-test',
 			default_key_network: 'test',
 			enable_cache: false,
 		});
@@ -314,7 +314,7 @@ describe('Schema Migration (TEST-7.4.1)', () => {
 		function createFreshDb() {
 			const freshDb = new Database();
 			const plugin = register(freshDb, {
-				default_transactor: 'test',
+				default_transactor: 'mesh-test',
 				default_key_network: 'test',
 				enable_cache: false,
 			});

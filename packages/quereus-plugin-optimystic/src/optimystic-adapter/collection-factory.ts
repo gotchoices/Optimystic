@@ -8,6 +8,7 @@ import {
 	BlockStorage,
 	MemoryRawStorage,
 } from '@optimystic/db-p2p';
+import { createMesh, buildNetworkTransactor } from '@optimystic/db-p2p/testing';
 import type { RowData, ParsedOptimysticOptions, TransactionState } from '../types.js';
 import type { Libp2p } from '@libp2p/interface';
 
@@ -75,6 +76,9 @@ export class CollectionFactory {
 
       case 'test':
         return await this.createTestTransactor();
+
+      case 'mesh-test':
+        return await this.createMeshTestTransactor();
 
       default:
         return await this.createCustomTransactor(options.transactor);
@@ -205,6 +209,21 @@ export class CollectionFactory {
         return await storageRepo.cancel(trxRef);
       },
     } as ITransactor;
+  }
+
+  /**
+   * Create a mesh-test transactor: real production stack (StorageRepo +
+   * CoordinatorRepo + NetworkTransactor) over a 1-node mock mesh. Used by
+   * plugin-level specs that want to exercise the full transactor→repo
+   * contract without spinning up real libp2p.
+   */
+  private async createMeshTestTransactor(): Promise<ITransactor> {
+    const mesh = await createMesh(1, {
+      responsibilityK: 1,
+      clusterSize: 1,
+      superMajorityThreshold: 0.51,
+    });
+    return buildNetworkTransactor(mesh);
   }
 
   /**

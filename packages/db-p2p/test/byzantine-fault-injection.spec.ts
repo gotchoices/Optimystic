@@ -22,7 +22,7 @@ import { base58btc } from 'multiformats/bases/base58';
 import { toString as uint8ArrayToString, fromString as uint8ArrayFromString } from 'uint8arrays';
 import { PeerReputationService } from '../src/reputation/peer-reputation.js';
 import { PenaltyReason } from '../src/reputation/types.js';
-import { createMesh, type Mesh } from './mesh-harness.js';
+import { createMesh, type Mesh } from '../src/testing/mesh-harness.js';
 
 // ─── Canonical JSON for deterministic hashing ───
 

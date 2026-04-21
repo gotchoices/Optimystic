@@ -763,15 +763,19 @@ export class OptimysticModule implements VirtualTableModule<OptimysticVirtualTab
    */
   private parseTableSchema(tableSchema: TableSchema): ParsedOptimysticOptions {
     const args = tableSchema.vtabArgs || {};
+    // Plugin-level defaults — configured via the `config` object passed to register()
+    // and surfaced on the table schema as `vtabAuxData`. Per-table `USING optimystic(...)`
+    // args override these; unset defaults fall back to production values.
+    const aux = ((tableSchema as unknown as { vtabAuxData?: Record<string, unknown> }).vtabAuxData) ?? {};
 
     // Extract collection URI from first positional argument or use default
     const collectionUri = (args['0'] as string) || `tree://default/${tableSchema.name}`;
 
     // Extract named arguments
-    const transactor = (args['transactor'] as string) || 'network';
-    const keyNetwork = (args['keyNetwork'] as string) || 'libp2p';
-    const port = typeof args['port'] === 'number' ? args['port'] : 0;
-    const networkName = (args['networkName'] as string) || 'optimystic';
+    const transactor = (args['transactor'] as string) || (aux['default_transactor'] as string) || 'network';
+    const keyNetwork = (args['keyNetwork'] as string) || (aux['default_key_network'] as string) || 'libp2p';
+    const port = typeof args['port'] === 'number' ? args['port'] : (typeof aux['default_port'] === 'number' ? aux['default_port'] as number : 0);
+    const networkName = (args['networkName'] as string) || (aux['default_network_name'] as string) || 'optimystic';
     const cache = args['cache'] !== false;
     const encoding = (args['encoding'] as 'json' | 'msgpack') || 'json';
 

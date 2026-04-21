@@ -1,6 +1,6 @@
 import { expect } from 'chai';
 import { Tree, type ITransactor } from '@optimystic/db-core';
-import { createMesh, buildNetworkTransactor, type Mesh } from './mesh-harness.js';
+import { createMesh, buildNetworkTransactor, type Mesh } from '../src/testing/mesh-harness.js';
 
 // Forcing-function repro for ticket 5-chain-add-on-fresh-collection-throws-non-existent-chain.
 // Uses the real production stack (StorageRepo + CoordinatorRepo + NetworkTransactor) on a

@@ -1,6 +1,6 @@
 import { expect } from 'chai';
 import { Tree, type ITransactor } from '@optimystic/db-core';
-import { createMesh, buildNetworkTransactors, type Mesh } from './mesh-harness.js';
+import { createMesh, buildNetworkTransactors, type Mesh } from '../src/testing/mesh-harness.js';
 
 // Phase 3 of ticket-7: multi-node cold-start coverage for the real production
 // stack (StorageRepo + CoordinatorRepo + NetworkTransactor) driving Tree/Collection.

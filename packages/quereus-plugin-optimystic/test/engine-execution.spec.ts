@@ -57,7 +57,7 @@ describe('QuereusEngine execute() (TEST-7.1.1)', () => {
 	beforeEach(async () => {
 		db = new Database();
 		const plugin = register(db, {
-			default_transactor: 'test',
+			default_transactor: 'mesh-test',
 			default_key_network: 'test',
 			enable_cache: false,
 		});

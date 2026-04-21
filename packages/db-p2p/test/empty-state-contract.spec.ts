@@ -6,7 +6,7 @@ import { NetworkTransactor, Tracker, TransactorSource, emptyTransforms } from '@
 import { BlockStorage } from '../src/storage/block-storage.js';
 import { MemoryRawStorage } from '../src/storage/memory-storage.js';
 import { StorageRepo } from '../src/storage/storage-repo.js';
-import { createMesh, type Mesh } from './mesh-harness.js';
+import { createMesh, type Mesh } from '../src/testing/mesh-harness.js';
 
 // Pins the "empty-state" contract at every layer boundary so future refactors can't
 // silently reintroduce the ticket-5 class of bug (layer drift on unknown / pending-only

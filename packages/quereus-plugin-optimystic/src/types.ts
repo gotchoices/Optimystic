@@ -9,7 +9,7 @@ export interface OptimysticOptions {
   collectionUri: string;
 
   /** Transactor type - 'network', 'test', or custom class name */
-  transactor?: 'network' | 'test' | string;
+  transactor?: 'network' | 'test' | 'mesh-test' | string;
 
   /** Key network type - 'libp2p', 'test', or custom class name */
   keyNetwork?: 'libp2p' | 'test' | string;
@@ -46,7 +46,7 @@ export interface LibP2PNodeOptions {
  */
 export interface ParsedOptimysticOptions {
   collectionUri: string;
-  transactor: 'network' | 'test' | string;
+  transactor: 'network' | 'test' | 'mesh-test' | string;
   keyNetwork: 'libp2p' | 'test' | string;
   libp2p?: Libp2p;
   libp2pOptions: LibP2PNodeOptions;

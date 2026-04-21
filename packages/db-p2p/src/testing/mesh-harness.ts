@@ -5,13 +5,13 @@ import type { IPeerNetwork } from '@optimystic/db-core';
 import { NetworkTransactor } from '@optimystic/db-core';
 import { peerIdFromPrivateKey } from '@libp2p/peer-id';
 import { generateKeyPair } from '@libp2p/crypto/keys';
-import { ClusterMember, clusterMember } from '../src/cluster/cluster-repo.js';
-import { StorageRepo } from '../src/storage/storage-repo.js';
-import { MemoryRawStorage } from '../src/storage/memory-storage.js';
-import { BlockStorage } from '../src/storage/block-storage.js';
-import { coordinatorRepo, type ClusterLatestCallback } from '../src/repo/coordinator-repo.js';
-import type { CoordinatorRepo } from '../src/repo/coordinator-repo.js';
-import { sortPeersByDistance, type KnownPeer } from '../src/routing/responsibility.js';
+import { ClusterMember, clusterMember } from '../cluster/cluster-repo.js';
+import { StorageRepo } from '../storage/storage-repo.js';
+import { MemoryRawStorage } from '../storage/memory-storage.js';
+import { BlockStorage } from '../storage/block-storage.js';
+import { coordinatorRepo, type ClusterLatestCallback } from '../repo/coordinator-repo.js';
+import type { CoordinatorRepo } from '../repo/coordinator-repo.js';
+import { sortPeersByDistance, type KnownPeer } from '../routing/responsibility.js';
 import { toString as u8ToString } from 'uint8arrays';
 
 export interface MeshNode {

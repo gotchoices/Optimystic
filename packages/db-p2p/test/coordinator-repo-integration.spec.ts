@@ -8,7 +8,7 @@
 
 import { expect } from 'chai';
 import type { BlockId, IBlock, BlockHeader, Transforms } from '@optimystic/db-core';
-import { createMesh, type Mesh } from './mesh-harness.js';
+import { createMesh, type Mesh } from '../src/testing/mesh-harness.js';
 
 const makeHeader = (id: string): BlockHeader => ({
 	id: id as BlockId,
