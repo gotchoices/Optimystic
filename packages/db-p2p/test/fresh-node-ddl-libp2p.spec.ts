@@ -18,6 +18,8 @@ interface TestEntry {
 }
 
 describe('Fresh-node DDL (real libp2p, clusterSize=1, arachnode)', function () {
+	// Real libp2p node boot + TCP listener + arachnode/ring-zulu init is the slow part;
+	// individual ops should finish in seconds but overall setup dominates the budget.
 	this.timeout(30_000);
 
 	let node: any;

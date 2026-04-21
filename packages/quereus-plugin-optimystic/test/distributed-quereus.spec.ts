@@ -29,6 +29,8 @@ interface TestNode {
 const delay = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 
 describe('Distributed Quereus Operations', function () {
+	// 3-node real libp2p mesh + convergence delay + distributed SQL round-trips;
+	// individual operations are fast but mesh boot + churn scenarios dominate.
 	this.timeout(120000);
 
 	const nodes: TestNode[] = [];

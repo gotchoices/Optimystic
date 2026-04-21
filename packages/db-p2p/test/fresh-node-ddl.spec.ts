@@ -30,7 +30,11 @@ const buildNetworkTransactor = (mesh: Mesh): ITransactor => {
 	});
 };
 
-describe('Fresh-node DDL (solo, real production stack)', () => {
+describe('Fresh-node DDL (solo, real production stack)', function () {
+	// Tighter than the 10s package default: these are forcing-function repros for a
+	// solo-node DDL hang — if any call stalls, fast-fail is the whole point.
+	this.timeout(5_000);
+
 	let mesh: Mesh;
 	let transactor: ITransactor;
 
@@ -40,7 +44,6 @@ describe('Fresh-node DDL (solo, real production stack)', () => {
 	});
 
 	it('fresh Tree.createOrOpen + tree.replace on a solo node completes without throwing', async function () {
-		this.timeout(5_000);
 		const tree = await Tree.createOrOpen<number, TestEntry>(
 			transactor,
 			'solo-test-tree',
@@ -61,7 +64,6 @@ describe('Fresh-node DDL (solo, real production stack)', () => {
 		// Mirrors quereus-plugin-optimystic's SchemaManager: getSchema opens a fresh Tree
 		// and calls tree.find (read-only) before storeSchema opens ANOTHER fresh Tree on
 		// the same id (no collection-caching outside a transaction) and calls tree.replace.
-		this.timeout(5_000);
 		const schemaTreeId = 'optimystic/schema';
 
 		// 1. getSchema-equivalent: fresh Tree, read-only find on empty btree.
@@ -90,7 +92,6 @@ describe('Fresh-node DDL (solo, real production stack)', () => {
 	it('two sequential DDLs: schema tree writes two schemas back-to-back', async function () {
 		// First table works in isolation; maybe the second one trips the chain-add bug
 		// once the schema block has a committed revision + pending metadata interaction.
-		this.timeout(5_000);
 		const schemaTreeId = 'optimystic/schema';
 
 		const tree1 = await Tree.createOrOpen<string, [string, unknown]>(

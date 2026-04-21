@@ -265,6 +265,8 @@ describe('BlockTransferCoordinator', () => {
 
 	describe('concurrency limiting', () => {
 		it('does not deadlock when all concurrent tasks retry', async function () {
+			// Tighter than the 10s package default: this test is a forcing function for a
+			// concurrency deadlock — if the pull ever hangs, we want a fast-fail signal.
 			this.timeout(5000);
 			let callCount = 0;
 			restoration.restore = async (blockId: string) => {

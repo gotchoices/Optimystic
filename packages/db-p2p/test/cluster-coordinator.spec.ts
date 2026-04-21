@@ -56,6 +56,8 @@ class MockClusterClient {
 }
 
 describe('ClusterCoordinator retry logic (TEST-5.2.1)', function () {
+	// Retry scenarios below use real setTimeout delays totaling up to ~4.5s per case;
+	// budget above the 10s package default to accommodate multiple sequential retry windows.
 	this.timeout(15000);
 
 	let peerIds: PeerId[];

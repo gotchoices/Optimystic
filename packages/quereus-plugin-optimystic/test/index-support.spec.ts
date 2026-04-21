@@ -156,6 +156,8 @@ describe('Optimystic Index Support', () => {
 
 	describe('Index optimization', () => {
 		beforeEach(async function () {
+			// Table + 3 index creation + 100 row inserts dominates; individual ops fast
+			// but cumulative setup exceeds the 10s package default.
 			this.timeout(30000);
 
 			await db.exec(`

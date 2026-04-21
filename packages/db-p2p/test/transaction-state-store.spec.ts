@@ -259,8 +259,6 @@ describe('PersistentTransactionStateStore', function () {
 // ─── Recovery scenario tests ───
 
 describe('ClusterCoordinator recovery', function () {
-	this.timeout(10000);
-
 	// We test recovery through the PersistentTransactionStateStore + MemoryKVStore
 	// since the coordinator recovery logic is tested via its stateStore integration
 
@@ -322,8 +320,6 @@ describe('ClusterCoordinator recovery', function () {
 });
 
 describe('ClusterMember recovery', function () {
-	this.timeout(10000);
-
 	let kvStore: MemoryKVStore;
 	let store: PersistentTransactionStateStore;
 

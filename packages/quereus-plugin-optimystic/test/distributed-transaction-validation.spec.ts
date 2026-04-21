@@ -33,6 +33,8 @@ interface TestNode {
 const delay = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 
 describe('Distributed Transaction Validation', function () {
+	// 3-node real libp2p mesh + filesystem-backed storage + transaction validation across peers;
+	// legitimate long budget for full end-to-end distributed scenarios.
 	this.timeout(120000);
 
 	const nodes: TestNode[] = [];
