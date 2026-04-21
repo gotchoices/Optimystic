@@ -9,6 +9,7 @@ import { ClusterMember, clusterMember } from '../cluster/cluster-repo.js';
 import { StorageRepo } from '../storage/storage-repo.js';
 import { MemoryRawStorage } from '../storage/memory-storage.js';
 import { BlockStorage } from '../storage/block-storage.js';
+import type { IRawStorage } from '../storage/i-raw-storage.js';
 import { coordinatorRepo, type ClusterLatestCallback } from '../repo/coordinator-repo.js';
 import type { CoordinatorRepo } from '../repo/coordinator-repo.js';
 import { sortPeersByDistance, type KnownPeer } from '../routing/responsibility.js';
@@ -27,6 +28,13 @@ export interface MeshOptions {
 	clusterSize?: number;
 	superMajorityThreshold?: number;
 	allowClusterDownsize?: boolean;
+	/**
+	 * Optional per-node raw-storage factory. Invoked once per node (indexed from 0)
+	 * to supply the IRawStorage that backs StorageRepo. If omitted, each node gets
+	 * a fresh `MemoryRawStorage`. Used by fault-injection tests to wrap the store
+	 * with a crashing proxy, or by restart tests to rebuild over preserved state.
+	 */
+	rawStorageFactory?: (index: number) => IRawStorage;
 }
 
 export interface MeshFailureConfig {
@@ -113,12 +121,16 @@ export async function createMesh(nodeCount: number, options: MeshOptions): Promi
 	const nodes: MeshNode[] = [];
 	const peerNetwork = new MockPeerNetwork();
 	// Map peerId → rawStorage for data sync simulation in clusterLatestCallback
-	const rawStorages = new Map<string, InstanceType<typeof MemoryRawStorage>>();
+	const rawStorages = new Map<string, IRawStorage>();
 
 	// Phase 1: create storage + cluster members
+	let nodeIndex = 0;
 	for (const { peerId, privateKey } of keyPairs) {
-		const rawStorage = new MemoryRawStorage();
+		const rawStorage = options.rawStorageFactory
+			? options.rawStorageFactory(nodeIndex)
+			: new MemoryRawStorage();
 		rawStorages.set(peerId.toString(), rawStorage);
+		nodeIndex++;
 		const storageRepo = new StorageRepo(
 			(blockId: BlockId) => new BlockStorage(blockId, rawStorage)
 		);
