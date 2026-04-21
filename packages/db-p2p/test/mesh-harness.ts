@@ -90,6 +90,7 @@ class MockMeshKeyNetwork implements IKeyNetwork {
 export interface Mesh {
 	nodes: MeshNode[];
 	failures: MeshFailureConfig;
+	keyNetwork: IKeyNetwork;
 }
 
 /**
@@ -230,5 +231,5 @@ export async function createMesh(nodeCount: number, options: MeshOptions): Promi
 		});
 	}
 
-	return { nodes, failures };
+	return { nodes, failures, keyNetwork };
 }

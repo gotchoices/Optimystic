@@ -17,7 +17,7 @@ files:
 
 ## Why
 
-All three recently-completed/pending tickets (ticket 4 solo-node deadlock, ticket 5 get-block-throws, ticket 5 chain-add-on-fresh-collection) were found by the sereus-health mobile canary running first-launch DDL, not by this repo's CI. Each fix added a narrow regression test after the fact. The next latent bug beneath ticket 5-chain is almost certainly already there.
+All three recently-completed/pending tickets (ticket solo-node deadlock, ticket get-block-throws, ticket chain-add-on-fresh-collection) were found by the sereus-health mobile canary running first-launch DDL, not by this repo's CI. Each fix added a narrow regression test after the fact. The next latent bug beneath ticket 5-chain is almost certainly already there.
 
 The root cause of the gap, in concrete terms:
 

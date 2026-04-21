@@ -73,7 +73,7 @@ describe('CoordinatorRepo proximity verification', () => {
 			// pend should work (peerCount=1 → fast path to storageRepo)
 			const pendResult = await repo.pend({
 				actionId: 'action-1' as any,
-				transforms: { [blockId]: [] as any },
+				transforms: { inserts: {}, updates: { [blockId]: [] }, deletes: [] },
 				blockIds: [blockId]
 			} as any);
 			expect(pendResult.success).to.equal(true);
@@ -102,7 +102,7 @@ describe('CoordinatorRepo proximity verification', () => {
 			// pend should succeed (peerCount=1 → fast path to storageRepo)
 			const pendResult = await repo.pend({
 				actionId: 'action-1' as any,
-				transforms: { [blockId]: [] as any },
+				transforms: { inserts: {}, updates: { [blockId]: [] }, deletes: [] },
 				blockIds: [blockId]
 			} as any);
 			expect(pendResult.success).to.equal(true);
@@ -155,7 +155,7 @@ describe('CoordinatorRepo proximity verification', () => {
 			try {
 				await repo.pend({
 					actionId: 'action-1' as any,
-					transforms: { [blockId]: [] as any },
+					transforms: { inserts: {}, updates: { [blockId]: [] }, deletes: [] },
 					blockIds: [blockId]
 				} as any);
 				expect.fail('should have thrown');
@@ -213,7 +213,7 @@ describe('CoordinatorRepo proximity verification', () => {
 			try {
 				await repo.pend({
 					actionId: 'action-1' as any,
-					transforms: { 'block-a': [] as any, 'block-b': [] as any },
+					transforms: { inserts: {}, updates: { 'block-a': [], 'block-b': [] }, deletes: [] },
 					blockIds: ['block-a', 'block-b']
 				} as any);
 				expect.fail('should have thrown');
@@ -281,7 +281,7 @@ describe('CoordinatorRepo proximity verification', () => {
 			// Write operations should also succeed on error (fail-open)
 			const pendResult = await repo.pend({
 				actionId: 'action-1' as any,
-				transforms: { [blockId]: [] as any },
+				transforms: { inserts: {}, updates: { [blockId]: [] }, deletes: [] },
 				blockIds: [blockId]
 			} as any);
 			expect(pendResult.success).to.equal(true);
@@ -320,8 +320,12 @@ describe('CoordinatorRepo proximity verification', () => {
 				await repo.pend({
 					actionId: 'action-1' as any,
 					transforms: {
-						[responsibleBlockId]: [] as any,
-						[nonResponsibleBlockId]: [] as any
+						inserts: {},
+						updates: {
+							[responsibleBlockId]: [],
+							[nonResponsibleBlockId]: []
+						},
+						deletes: []
 					},
 					blockIds: [responsibleBlockId, nonResponsibleBlockId]
 				} as any);
@@ -330,6 +334,53 @@ describe('CoordinatorRepo proximity verification', () => {
 				expect(err.message).to.include(nonResponsibleBlockId);
 				expect(err.message).to.not.include(responsibleBlockId);
 			}
+		});
+	});
+
+	describe('pend block id extraction (regression for Object.keys(transforms) bug)', () => {
+		it('uses actual block ids from transforms, not the literal keys "inserts"/"updates"/"deletes"', async () => {
+			const localPeer = await makePeerId();
+			const cluster = makeClusterPeers([localPeer]); // solo → fast path
+			const insertedBlockId = 'inserted-block';
+			const updatedBlockId = 'updated-block';
+			const deletedBlockId = 'deleted-block';
+
+			const verified: string[] = [];
+			const keyNetwork: IKeyNetwork = {
+				async findCoordinator() { throw new Error('not used'); },
+				async findCluster(key: Uint8Array) {
+					const keyStr = new TextDecoder().decode(key);
+					verified.push(keyStr);
+					return makeClusterPeers([localPeer]);
+				}
+			};
+
+			const repo = new CoordinatorRepo(
+				keyNetwork,
+				makeClusterClient,
+				makeStorageRepo(),
+				{ clusterSize: 3 },
+				undefined,
+				localPeer
+			);
+
+			const result = await repo.pend({
+				actionId: 'action-multi' as any,
+				transforms: {
+					inserts: { [insertedBlockId]: { header: { id: insertedBlockId } } as any },
+					updates: { [updatedBlockId]: [] },
+					deletes: [deletedBlockId]
+				},
+				blockIds: [insertedBlockId, updatedBlockId, deletedBlockId]
+			} as any);
+
+			expect(result.success).to.equal(true);
+			// Only real block ids should have been passed to findCluster — never the literal
+			// Transforms container keys.
+			expect(verified).to.not.include('inserts');
+			expect(verified).to.not.include('updates');
+			expect(verified).to.not.include('deletes');
+			expect(verified).to.include.members([insertedBlockId, updatedBlockId, deletedBlockId]);
 		});
 	});
 });

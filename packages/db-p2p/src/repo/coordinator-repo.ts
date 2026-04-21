@@ -1,5 +1,5 @@
 import type { PendRequest, ActionBlocks, IRepo, MessageOptions, CommitResult, GetBlockResults, PendResult, BlockGets, CommitRequest, RepoMessage, IKeyNetwork, ICluster, ClusterConsensusConfig, BlockId, ActionRev, ActionContext } from "@optimystic/db-core";
-import { LruMap } from "@optimystic/db-core";
+import { LruMap, blockIdsForTransforms } from "@optimystic/db-core";
 import { ClusterCoordinator } from "./cluster-coordinator.js";
 import type { ClusterClient } from "../cluster/client.js";
 import type { PeerId } from "@libp2p/interface";
@@ -237,7 +237,7 @@ export class CoordinatorRepo implements IRepo {
 	}
 
 	async pend(request: PendRequest, options?: MessageOptions): Promise<PendResult> {
-		const allBlockIds = Object.keys(request.transforms);
+		const allBlockIds = blockIdsForTransforms(request.transforms);
 		await this.verifyResponsibility(allBlockIds);
 		const coordinatingBlockIds = (options as any)?.coordinatingBlockIds ?? allBlockIds;
 
@@ -273,7 +273,7 @@ export class CoordinatorRepo implements IRepo {
 			return {
 				success: true,
 				pending: [],
-				blockIds: Object.keys(request.transforms)
+				blockIds: allBlockIds
 			};
 		} catch (error) {
 			log('coordinator-repo:pend-error', { actionId: request.actionId, error: (error as Error).message });

@@ -1,7 +1,8 @@
 import { expect } from 'chai'
 import type { BlockId, BlockOperation, IBlock, BlockType, BlockSource, Transforms } from '../src/index.js'
 import { Tracker } from '../src/transform/tracker.js'
-import { applyOperation, withOperation, blockIdsForTransforms, emptyTransforms, mergeTransforms, concatTransforms, transformForBlockId, applyTransformToStore, concatTransform } from '../src/index.js'
+import { applyOperation, withOperation, blockIdsForTransforms, emptyTransforms, mergeTransforms, concatTransforms, transformForBlockId, applyTransformToStore, concatTransform, copyTransforms } from '../src/index.js'
+import { apply } from '../src/blocks/index.js'
 import { TestBlockStore } from './test-block-store.js'
 
 interface TestBlock extends IBlock {
@@ -305,6 +306,53 @@ describe('Transform functionality', () => {
       // BUG: Original is silently overwritten with no warning
       const after = await store.tryGet(sharedId)
       expect((after as any).entries).to.deep.equal(['overwritten'])
+    })
+
+    it('apply-over-insert survives copyTransforms (regression for fresh-collection chain.add)', async () => {
+      // Models Collection.syncInternal: header block is inserted into the tracker, then
+      // Chain.open applies headId/tailId to it via `apply()`. copyTransforms is called
+      // to snapshot for the transact step, and a new Tracker opens another Log over the
+      // snapshot. The snapshot must surface a header with headId/tailId — otherwise
+      // Chain.open won't find the tail and chain.add throws "non-existent chain".
+      const source: BlockSource<IBlock> = {
+        tryGet: async () => undefined,
+        generateId: () => 'gen' as BlockId,
+        createBlockHeader: (type: BlockType, newId?: BlockId) => ({ id: (newId ?? 'gen') as BlockId, type, collectionId: 'c' as BlockId })
+      }
+
+      const tracker = new Tracker<IBlock>(source)
+
+      const headerId = 'hdr' as BlockId
+      const headerBlock = { header: { id: headerId, type: 'H' as BlockType, collectionId: 'c' as BlockId }, rootId: 'root' } as any
+      tracker.insert(headerBlock as IBlock)
+
+      // Chain.open's apply() pattern: two attribute ops on the already-inserted block
+      apply(tracker, headerBlock as IBlock, ['headId', 0, 0, 'tail-1'])
+      apply(tracker, headerBlock as IBlock, ['tailId', 0, 0, 'tail-1'])
+
+      // Second inserted block (the tail)
+      const tailBlock = { header: { id: 'tail-1' as BlockId, type: 'D' as BlockType, collectionId: 'c' as BlockId }, entries: [], priorId: undefined, nextId: undefined } as any
+      tracker.insert(tailBlock as IBlock)
+
+      // Take a snapshot copy, mirroring Collection.syncInternal
+      const snapshot = copyTransforms(tracker.transforms)
+      const snapshotTracker = new Tracker<IBlock>(source, snapshot)
+
+      const hdr = await snapshotTracker.tryGet(headerId) as any
+      expect(hdr).to.exist
+      expect(hdr.rootId).to.equal('root')
+      expect(hdr.headId).to.equal('tail-1')
+      expect(hdr.tailId).to.equal('tail-1')
+
+      const tail = await snapshotTracker.tryGet('tail-1' as BlockId) as any
+      expect(tail).to.exist
+      expect(tail.entries).to.deep.equal([])
+
+      // Both blocks should appear in transformedBlockIds. Since the two apply() calls
+      // went into the inserted header in-place, there should be no updates[headerId].
+      const ids = snapshotTracker.transformedBlockIds()
+      expect(ids).to.have.members([headerId as string, 'tail-1'])
+      expect(snapshot.updates?.[headerId]).to.be.undefined
     })
 
     it('should silently drop operations when concatTransform overlaps existing updates (BUG: data loss)', () => {
