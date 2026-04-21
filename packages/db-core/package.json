@@ -57,6 +57,7 @@
     "@types/node": "^25.1.0",
     "chai": "^6.2.2",
     "chai-as-promised": "^8.0.2",
+    "fast-check": "^4.7.0",
     "mocha": "^11.7.5",
     "rimraf": "^6.1.2",
     "ts-node": "^10.9.2",
