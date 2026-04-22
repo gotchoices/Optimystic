@@ -3,7 +3,7 @@ dependencies:
   - tickets/complete/5-crash-c-partial-commit-stranded-block.md (per-block idempotency in `StorageRepo.commit`; reduces the surface area where this bug manifested as a test failure by tolerating non-tail commit errors upstream)
   - tickets/complete/5-coordinator-repo-pend-blockid-extraction.md, tickets/complete/5-get-block-throws-on-pending-only-metadata.md (sibling cold-start / pending-metadata class fixes)
 files:
-  - packages/db-p2p/src/repo/coordinator-repo.ts (commit() — trust cluster consensus on local-commit failure; new private helper `clusterReachedCommitConsensus`)
+  - packages/db-p2p/src/repo/coordinator-repo.ts (commit() — trust cluster consensus on local-commit failure; new module-level helper `clusterReachedCommitConsensus`)
   - packages/db-p2p/src/testing/mesh-harness.ts (MockMeshKeyNetwork.findCoordinator honors `excludedPeers`)
   - packages/db-p2p/test/fresh-node-ddl-multi.spec.ts (Scenario B un-skipped)
 ----
@@ -53,27 +53,27 @@ This targets the exact stranded case: a peer that is the coordinator for commit 
   2. `Tree.createOrOpen` + `tree.get(42)` on node B returns the written value.
 - Runs in ~50-90ms. No "Pending action not found" `console.warn` noise from the commit path on the runs where E is picked as commit coordinator — the `coordinator-repo:commit-local-failed-cluster-succeeded` debug log fires cleanly instead.
 
-### Full run results
+### Full run results (rerun at review stage)
 
-- `packages/db-p2p`: **418 passing, 6 pending, 0 failing** (full `test/**/*.spec.ts`, ~21s).
-- `packages/db-core`: **301 passing, 0 failing**.
+- `packages/db-p2p` full suite: **418 passing, 6 pending, 0 failing** (~21s).
+- `packages/db-core` full suite: **301 passing, 0 failing**.
 - `tsc --noEmit` clean in `packages/db-p2p`.
+- `Scenario B` isolated run: 1 passing, ~80ms.
 - Key regression checks (part of the 418):
   - `mesh-sanity` Suite 2 "promise phase failure with default threshold causes transaction to fail" still rejects pend.
   - `mesh-sanity` Suite 3 "unreachable peer — coordinator handles gracefully with lower threshold" still passes.
 
+### Review notes
+
+- `clusterReachedCommitConsensus` uses `approvedCommits > peerCount / 2`, identical arithmetic to member-side `hasMajority` in `packages/db-p2p/src/cluster/cluster-repo.ts:550-552`. Keep the two in sync if either changes.
+- `CoordinatorRepo.pend` was considered for analogous treatment; it is not needed today because `StorageRepo.pend` is idempotent for new pending actions and rarely throws in the cold-start case.
+
 ### Residual read-side flakiness (pre-existing, not caused by this fix)
 
-Scenario B shows ~10% flakiness on isolated repeated runs (`--grep "Scenario B"`, 10 iterations) both before and after this fix — the failing iterations return `undefined` from `treeB.get(42)` rather than throwing from the commit path. Stashing the `coordinator-repo.ts` change and rerunning reproduces the same failure rate, so this is pre-existing. The `fresh-node-ddl-multi.spec.ts` full-suite run in CI order has been stable across multiple back-to-back executions during this ticket's work. Filing the residual flakiness as a separate follow-up is reasonable; it appears to be on the **read** path (coordinator selection / sync-on-read timing when peer E is first-picked for a block B never had), not the write path this ticket addresses.
+Scenario B shows ~10% flakiness on isolated repeated runs (`--grep "Scenario B"`, 10 iterations) both before and after this fix — the failing iterations return `undefined` from `treeB.get(42)` rather than throwing from the commit path. Stashing the `coordinator-repo.ts` change and rerunning reproduces the same failure rate, so this is pre-existing. The `fresh-node-ddl-multi.spec.ts` full-suite run in CI order has been stable across multiple back-to-back executions. The residual flakiness appears to be on the **read** path (coordinator selection / sync-on-read timing when peer E is first-picked for a block B never had), not the write path this ticket addresses — a natural follow-up ticket can start with `NetworkTransactor.get`'s retry predicate (`hasBlockInResponse`) interaction with fresh-coordinator empty-state responses, and `CoordinatorRepo.fetchBlockFromCluster` timing when the first-picked coordinator is the unreachable peer.
 
 ## Use cases / where this matters
 
 - Cold-start writes where one cluster member is unreachable at boot — the writing client does not know which peer will be picked as the commit-phase coordinator (distance-based) vs pend-phase coordinator (cluster-intersection set cover). If they diverge to an unreachable peer for commit, the cluster still commits; the lagging peer catches up via sync.
 - More generally: any scenario where `CoordinatorRepo.commit` runs on a peer that missed the pend phase (dropped during pend, freshly joined, transient partition during pend) — commit now succeeds based on cluster majority rather than erroring out on the local coordinator's missing pending-action state.
 - Mock harness behavior now matches `Libp2pKeyPeerNetwork` for the `excludedPeers` option, so retry logic under `processBatches` actually converges in tests rather than looping back to the original failing peer.
-
-## Review-stage TODO
-
-- Confirm `clusterReachedCommitConsensus`'s threshold (strict `> peerCount / 2`) matches the member-side `hasMajority` used in `cluster-repo.ts::getTransactionPhase`. It does (identical arithmetic) — keep them in sync if either changes.
-- Consider: should `CoordinatorRepo.pend` get analogous treatment? Pend's `storageRepo.pend` is idempotent for new pending actions and rarely throws in the cold-start case, so probably not needed today — but worth a pass during review.
-- File a follow-up ticket for the residual read-side Scenario B flakiness (~10% under tight-loop repetition). Good starting points: `NetworkTransactor.get`'s retry predicate (`hasBlockInResponse`) interaction with fresh-coordinator empty-state responses, and `CoordinatorRepo.fetchBlockFromCluster` timing when the first-picked coordinator is the unreachable peer.
