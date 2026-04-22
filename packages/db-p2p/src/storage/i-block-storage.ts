@@ -43,4 +43,19 @@ export interface IBlockStorage {
 
     /** Sets the latest revision information */
     setLatest(latest: ActionRev): Promise<void>;
+
+    /**
+     * Reconciles `metadata.latest` with the highest contiguous fully-promoted revision in
+     * the revisions table. Intended for post-crash recovery of the Crash-D3 gap, where
+     * `promotePendingTransaction` succeeded but `setLatest` did not: the revision and
+     * committed-log entry are durable, but `meta.latest` still points at the prior rev
+     * (or is undefined), and retry-commit is rejected because the pending record is gone.
+     *
+     * Stops at the first rev whose action is not yet in the committed log, preserving the
+     * Crash-D2 invariant that retry-commit — not recovery — owns advancement past a half-
+     * promoted state.
+     *
+     * Idempotent and monotonic (latest only advances forward).
+     */
+    recover(): Promise<{ reconciled: boolean; latest?: ActionRev }>;
 }

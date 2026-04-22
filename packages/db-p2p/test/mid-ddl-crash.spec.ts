@@ -540,21 +540,13 @@ describe('Mid-DDL crash recovery (solo node)', function () {
 	// ------------------------------------------------------------------------
 	// Crash-D3: pending promoted, saveMetadata(setLatest) throws before delegating
 	//
-	// Observed current behavior surfaces a REFERENCE-LEAK sharp-edge in
-	// MemoryRawStorage: `getMetadata` returns the stored object by reference, and
-	// `BlockStorage.setLatest` mutates `meta.latest = latest` BEFORE calling
-	// `saveMetadata`. So when the saveMetadata proxy throws `when: 'before'`, the
-	// in-memory metadata is already mutated. In RAM the state looks fully
-	// committed; in a persistent store (SQLite / file / LevelDB) the picture
-	// would differ — the saveMetadata syscall never ran, so `latest` would still
-	// be unchanged on-disk.
-	//
-	// This test documents what actually happens on MemoryRawStorage today, and
-	// flags the gap for a persistent-storage recovery path:
-	//   → tickets/fix/5-memory-storage-metadata-reference-leak.md
-	//   → tickets/fix/5-crash-d3-latest-not-updated-silent-invisible-commit.md
+	// With the MemoryRawStorage metadata-clone fix in place, this crash now matches
+	// persistent-store semantics: saveMetadata never ran, so `meta.latest` is
+	// unchanged in durable storage even though the pending was promoted and the
+	// revision was saved. Recovery is surfaced as `StorageRepo.recoverBlock`, which
+	// reconciles `meta.latest` with the highest contiguous fully-promoted revision.
 	// ------------------------------------------------------------------------
-	describe('Crash-D3: crash before setLatest (documented behavior + gap)', () => {
+	describe('Crash-D3: crash before setLatest (recoverBlock reconciles)', () => {
 		const blockA = 'crash-d3-block' as BlockId;
 		const actionId = 'action-crash-d3' as ActionId;
 
@@ -597,7 +589,7 @@ describe('Mid-DDL crash recovery (solo node)', function () {
 			expect(await raw.getPendingTransaction(blockA, actionId), 'pending removed by promote').to.equal(undefined);
 		});
 
-		it('retry-commit succeeds via idempotent no-op (leaked in-memory latest matches request)', async () => {
+		it('retry-commit fails without recovery (pending gone, latest still undefined)', async () => {
 			const raw = new MemoryRawStorage();
 			await seedPending(raw);
 
@@ -609,29 +601,27 @@ describe('Mid-DDL crash recovery (solo node)', function () {
 				rev: 1
 			} as CommitRequest);
 
-			// Recovery: retry-commit with the same (actionId, rev). On MemoryRawStorage,
-			// the reference-leak means latest was already mutated to { actionId, rev: 1 }
-			// before the saveMetadata proxy threw, so the commit's idempotency check
-			// (latest.rev === request.rev && latest.actionId === request.actionId) treats
-			// this block as already-done and short-circuits to success.
-			//
-			// In a persistent store without the reference leak, latest would still be
-			// undefined on retry — the idempotency path wouldn't fire, and the pending-
-			// missing check would throw. That residual gap is tracked by:
-			//   tickets/fix/5-memory-storage-metadata-reference-leak.md
-			//   tickets/fix/5-crash-d3-latest-not-updated-silent-invisible-commit.md
+			// With the metadata-clone fix, latest is still undefined on retry.
+			// The idempotency short-circuit can't fire (latest is undefined), and the
+			// pending-missing check throws — commit cannot recover on its own.
 			const recovered = await rebuildCleanMesh(raw);
 			const repo = recovered.nodes[0]!.storageRepo;
-			const retry = await repo.commit({
-				actionId,
-				blockIds: [blockA],
-				tailId: blockA,
-				rev: 1
-			} as CommitRequest);
-			expect(retry.success, 'retry-commit succeeds idempotently on leaked latest').to.equal(true);
+			let err: unknown;
+			try {
+				await repo.commit({
+					actionId,
+					blockIds: [blockA],
+					tailId: blockA,
+					rev: 1
+				} as CommitRequest);
+			} catch (e) {
+				err = e;
+			}
+			expect(err, 'retry-commit throws because the pending record is gone').to.be.instanceOf(Error);
+			expect((err as Error).message).to.include(`Pending action ${actionId} not found`);
 		});
 
-		it('documents MemoryRawStorage reference-leak: mutation leaks into RAM even when saveMetadata throws', async () => {
+		it('crash before setLatest leaves latest unchanged in raw storage (no reference leak)', async () => {
 			const raw = new MemoryRawStorage();
 			await seedPending(raw);
 
@@ -643,32 +633,109 @@ describe('Mid-DDL crash recovery (solo node)', function () {
 				rev: 1
 			} as CommitRequest);
 
-			// MemoryRawStorage.getMetadata returns the stored object by reference.
-			// BlockStorage.setLatest does `meta.latest = latest` BEFORE calling
-			// saveMetadata. So even though the proxy threw `before` saveMetadata was
-			// delegated, the in-memory map entry was already mutated.
-			//
-			// This is the observed current behavior on MemoryRawStorage — a persistent
-			// store with serialized writes would NOT exhibit this. Tracked by:
-			//   tickets/fix/5-memory-storage-metadata-reference-leak.md
+			// With MemoryRawStorage now cloning on get/save, the pre-crash
+			// `meta.latest = latest` mutation no longer leaks into stored state.
+			// On-disk picture matches a persistent backend.
 			const meta = await raw.getMetadata(blockA);
-			expect(meta?.latest?.rev, 'in-memory meta was mutated before the crash').to.equal(1);
+			expect(meta?.latest, 'raw latest unchanged after saveMetadata crash').to.equal(undefined);
 
-			// Consequence: a default read on MemoryRawStorage happens to "succeed"
-			// (sees rev=1), but ONLY because of the leak — not because recovery works.
+			// Consequence: a fresh default read sees empty state until recovery runs.
 			const recovered = await rebuildCleanMesh(raw);
 			const read = await recovered.nodes[0]!.storageRepo.get({ blockIds: [blockA] });
-			expect(read[blockA]?.state.latest?.rev).to.equal(1);
+			expect(read[blockA]?.state, 'default read sees empty state pre-recovery').to.deep.equal({});
 		});
 
-		it.skip('DESIRED: after fixing the reference leak, a recovery entry-point reconciles latest with max(revisions)', async () => {
-			// TODO: unskip once both follow-up fix tickets land:
-			//   tickets/fix/5-memory-storage-metadata-reference-leak.md
-			//   tickets/fix/5-crash-d3-latest-not-updated-silent-invisible-commit.md
-			// Once the leak is fixed, meta.latest will still be undefined after this crash
-			// (matching a persistent store), and the default read must see empty state.
-			// A recover entry-point (e.g. repo.recoverTransactions() or equivalent) must
-			// then reconcile metadata.latest from max(revisions) so reads see rev=1.
+		it('recoverBlock reconciles latest with max(revisions) and materializes the committed state', async () => {
+			const raw = new MemoryRawStorage();
+			await seedPending(raw);
+
+			const { mesh, proxy } = await buildCrashingMesh(raw, crashTrigger);
+			await mesh.nodes[0]!.storageRepo.commit({
+				actionId,
+				blockIds: [blockA],
+				tailId: blockA,
+				rev: 1
+			} as CommitRequest);
+			expect(proxy.fired).to.equal(true);
+
+			// Pre-recovery durable invariants.
+			const metaBefore = await raw.getMetadata(blockA);
+			expect(metaBefore?.latest, 'pre-recovery: latest still undefined on durable storage').to.equal(undefined);
+			expect(await raw.getRevision(blockA, 1), 'revision durable').to.equal(actionId);
+			expect(await raw.getTransaction(blockA, actionId), 'action in committed log').to.not.equal(undefined);
+
+			// Pre-recovery read: empty state.
+			const recovered = await rebuildCleanMesh(raw);
+			const repo = recovered.nodes[0]!.storageRepo;
+			const preRead = await repo.get({ blockIds: [blockA] });
+			expect(preRead[blockA]?.state, 'default read before recovery sees empty state').to.deep.equal({});
+
+			// Run recovery.
+			await repo.recoverBlock(blockA);
+
+			// Post-recovery durable invariants.
+			const metaAfter = await raw.getMetadata(blockA);
+			expect(metaAfter?.latest?.rev, 'recoverBlock advanced latest').to.equal(1);
+			expect(metaAfter?.latest?.actionId).to.equal(actionId);
+
+			// Default read now materializes the committed block.
+			const postRead = await repo.get({ blockIds: [blockA] });
+			expect(postRead[blockA]?.state.latest?.rev).to.equal(1);
+			expect(postRead[blockA]?.block, 'block materializes after recovery').to.not.equal(undefined);
+		});
+
+		it('recoverBlock on a block with no metadata is a safe no-op', async () => {
+			const raw = new MemoryRawStorage();
+			const mesh = await rebuildCleanMesh(raw);
+			const repo = mesh.nodes[0]!.storageRepo;
+
+			const unknownBlock = 'block-never-seen' as BlockId;
+			// Must not throw.
+			await repo.recoverBlock(unknownBlock);
+
+			// Metadata remains absent.
+			expect(await raw.getMetadata(unknownBlock)).to.equal(undefined);
+		});
+
+		it('recoverBlock does NOT advance past a Crash-D2-style state (revision durable, action not yet in committed log)', async () => {
+			// Reproduce Crash-D2 raw state: revision saved, pending NOT promoted, latest unchanged.
+			const raw = new MemoryRawStorage();
+			const pending = await rebuildCleanMesh(raw);
+			await pending.nodes[0]!.storageRepo.pend({
+				actionId,
+				transforms: makeInsertTransforms({ [blockA]: makeBlock(blockA, { items: ['d2-gap'] }) }),
+				policy: 'c'
+			});
+
+			const { mesh, proxy } = await buildCrashingMesh(raw, {
+				method: 'promotePendingTransaction',
+				when: 'before',
+				blockId: blockA,
+				actionId
+			});
+			await mesh.nodes[0]!.storageRepo.commit({
+				actionId,
+				blockIds: [blockA],
+				tailId: blockA,
+				rev: 1
+			} as CommitRequest);
+			expect(proxy.fired).to.equal(true);
+
+			// Sanity: Crash-D2 raw shape.
+			expect(await raw.getRevision(blockA, 1), 'revision durable').to.equal(actionId);
+			expect(await raw.getPendingTransaction(blockA, actionId), 'pending still present').to.not.equal(undefined);
+			expect(await raw.getTransaction(blockA, actionId), 'action NOT in committed log').to.equal(undefined);
+
+			const metaBefore = await raw.getMetadata(blockA);
+			expect(metaBefore?.latest, 'latest still undefined before recovery').to.equal(undefined);
+
+			// Recovery must NOT advance past a revision whose action is not promoted —
+			// retry-commit (the Crash-D2 path) is the canonical path for that state.
+			const recovered = await rebuildCleanMesh(raw);
+			await recovered.nodes[0]!.storageRepo.recoverBlock(blockA);
+
+			const metaAfter = await raw.getMetadata(blockA);
+			expect(metaAfter?.latest, 'recoverBlock left latest alone at Crash-D2 boundary').to.equal(undefined);
 		});
 	});
 

@@ -18,7 +18,7 @@ import { toString as u8ToString } from 'uint8arrays';
 export interface MeshNode {
 	peerId: PeerId;
 	privateKey: PrivateKey;
-	storageRepo: IRepo;
+	storageRepo: StorageRepo;
 	clusterMember: ClusterMember;
 	coordinatorRepo: CoordinatorRepo;
 }

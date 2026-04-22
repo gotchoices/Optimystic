@@ -17,12 +17,30 @@ export class MemoryRawStorage implements IRawStorage {
 		return `${blockId}:${actionId}`;
 	}
 
+	/**
+	 * Retrieves metadata for a block.
+	 *
+	 * @pitfall **MUST return a clone** - `BlockStorage.setLatest` mutates the returned
+	 * metadata in place (`meta.latest = latest`) before calling `saveMetadata`. Returning
+	 * the stored reference leaks that mutation into RAM even when a subsequent
+	 * `saveMetadata` call fails, masking mid-commit crashes that a persistent store
+	 * (file/sqlite/leveldb) would surface correctly.
+	 * @see docs/internals.md "Storage Returns References" pitfall
+	 */
 	async getMetadata(blockId: BlockId): Promise<BlockMetadata | undefined> {
-		return this.metadata.get(blockId);
+		const meta = this.metadata.get(blockId);
+		return meta ? structuredClone(meta) : undefined;
 	}
 
+	/**
+	 * Stores metadata for a block.
+	 *
+	 * @pitfall **MUST store a clone** - callers may continue mutating the metadata object
+	 * after saving; storing the reference lets those mutations corrupt persisted state.
+	 * @see docs/internals.md "Storage Returns References" pitfall
+	 */
 	async saveMetadata(blockId: BlockId, metadata: BlockMetadata): Promise<void> {
-		this.metadata.set(blockId, metadata);
+		this.metadata.set(blockId, structuredClone(metadata));
 	}
 
 	async getRevision(blockId: BlockId, rev: number): Promise<ActionId | undefined> {

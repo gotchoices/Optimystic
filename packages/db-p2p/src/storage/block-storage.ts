@@ -91,6 +91,38 @@ export class BlockStorage implements IBlockStorage {
 		await this.storage.saveMetadata(this.blockId, meta);
 	}
 
+	async recover(): Promise<{ reconciled: boolean; latest?: ActionRev }> {
+		const meta = await this.storage.getMetadata(this.blockId);
+		if (!meta) {
+			return { reconciled: false };
+		}
+
+		const currentRev = meta.latest?.rev ?? 0;
+		let maxRev = currentRev;
+		let maxActionId = meta.latest?.actionId;
+
+		// Probe forward until we hit a gap or a revision whose action is not yet
+		// in the committed log (Crash-D2 state — retry-commit owns that advance).
+		for (let next = currentRev + 1; ; next++) {
+			const actionId = await this.storage.getRevision(this.blockId, next);
+			if (actionId === undefined) break;
+			const promoted = await this.storage.getTransaction(this.blockId, actionId);
+			if (promoted === undefined) break;
+			maxRev = next;
+			maxActionId = actionId;
+		}
+
+		if (maxRev > currentRev && maxActionId !== undefined) {
+			const advanced: ActionRev = { rev: maxRev, actionId: maxActionId };
+			meta.latest = advanced;
+			await this.storage.saveMetadata(this.blockId, meta);
+			log('recover blockId=%s advanced latest from rev=%d to rev=%d', this.blockId, currentRev, maxRev);
+			return { reconciled: true, latest: advanced };
+		}
+
+		return { reconciled: false, latest: meta.latest };
+	}
+
 	private async ensureRevision(meta: BlockMetadata, rev: number): Promise<void> {
 		if (this.inRanges(rev, meta.ranges)) {
 			return;

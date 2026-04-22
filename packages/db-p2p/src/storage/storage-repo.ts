@@ -293,6 +293,19 @@ export class StorageRepo implements IRepo {
 		return { success: true };
 	}
 
+	/**
+	 * Reconciles `metadata.latest` for a single block with the highest contiguous
+	 * fully-promoted revision in durable storage. Use after a crash between
+	 * `promotePendingTransaction` and `setLatest` when retry-commit cannot help
+	 * (the pending record is already gone) but the revision and committed-log entry
+	 * are durable. Idempotent and monotonic.
+	 */
+	async recoverBlock(blockId: BlockId): Promise<void> {
+		log('recoverBlock blockId=%s', blockId);
+		const storage = this.createBlockStorage(blockId);
+		await storage.recover();
+	}
+
 	private async internalCommit(blockId: BlockId, actionId: ActionId, rev: number, storage: IBlockStorage): Promise<void> {
 		// Note: This method is called within the locked critical section of commit()
 		// So, operations like getPendingTransaction, getLatest, getBlock, saveMaterializedBlock,
