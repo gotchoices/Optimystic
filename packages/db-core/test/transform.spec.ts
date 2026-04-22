@@ -355,6 +355,33 @@ describe('Transform functionality', () => {
       expect(snapshot.updates?.[headerId]).to.be.undefined
     })
 
+    it('copyTransforms isolates inserted block objects from snapshot mutations', () => {
+      const blockId = 'iso-block' as BlockId
+      const original: Transforms = {
+        inserts: { [blockId]: { header: { id: blockId, type: 'test' as BlockType, collectionId: 'c' as BlockId }, data: 'orig', items: ['a'] } as TestBlock },
+        updates: {},
+        deletes: []
+      }
+
+      const snapshot = copyTransforms(original)
+
+      // Object identity must change — otherwise mutations leak through the shared reference.
+      expect(snapshot.inserts![blockId]).to.not.equal(original.inserts![blockId])
+
+      // A Tracker built over the snapshot mutates inserts in place via applyOperation.
+      // That mutation must not be visible in the original transform.
+      const source: BlockSource<TestBlock> = {
+        tryGet: async () => undefined,
+        generateId: () => 'gen' as BlockId,
+        createBlockHeader: (type: BlockType) => ({ id: 'gen' as BlockId, type, collectionId: 'c' as BlockId })
+      }
+      const snapshotTracker = new Tracker<TestBlock>(source, snapshot)
+      snapshotTracker.update(blockId, ['data', 0, 0, 'mutated'])
+
+      expect((snapshot.inserts![blockId] as TestBlock).data).to.equal('mutated')
+      expect((original.inserts![blockId] as TestBlock).data).to.equal('orig')
+    })
+
     it('should silently drop operations when concatTransform overlaps existing updates (BUG: data loss)', () => {
       const existingOps: BlockOperation[] = [['data', 0, 0, 'first'], ['items', 0, 0, ['a']]]
       const base: Transforms = { inserts: {}, updates: { [sharedId]: existingOps }, deletes: [] }

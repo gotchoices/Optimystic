@@ -54,16 +54,21 @@ export function emptyTransforms(): Transforms {
 /**
  * Creates a deep copy of a Transforms object.
  *
- * @pitfall Updates arrays MUST be deep cloned - a shallow copy like `{ ...transform.updates }`
- * shares array references, causing mutations in one consumer to affect others.
+ * @pitfall Both `inserts` and `updates` MUST be deep cloned. A shallow copy like
+ * `{ ...transform.updates }` or `{ ...transform.inserts }` shares references, causing
+ * mutations in one consumer to affect others. Specifically, `Tracker.update` mutates
+ * inserted block objects in place via `applyOperation`, so a shallow-cloned snapshot
+ * tracker will leak ops back into the original `Transforms.inserts`.
  * @see docs/internals.md "Shallow Copy of Transforms" pitfall
  */
 export function copyTransforms(transform: Transforms): Transforms {
-	// Deep clone updates arrays to prevent shared references
+	const inserts = transform.inserts
+		? Object.fromEntries(Object.entries(transform.inserts).map(([k, v]) => [k, structuredClone(v)]))
+		: {};
 	const updates = transform.updates
 		? Object.fromEntries(Object.entries(transform.updates).map(([k, v]) => [k, structuredClone(v)]))
 		: undefined;
-	return { inserts: { ...transform.inserts }, updates, deletes: transform.deletes ? [...transform.deletes] : undefined };
+	return { inserts, updates, deletes: transform.deletes ? [...transform.deletes] : undefined };
 }
 
 export function mergeTransforms(a: Transforms, b: Transforms): Transforms {
