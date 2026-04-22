@@ -28,6 +28,7 @@
     "typecheck": "tsc --noEmit",
     "test": "node --import ./register.mjs node_modules/mocha/bin/mocha.js \"test/**/*.spec.ts\" --colors --reporter min --exit",
     "test:verbose": "node --import ./register.mjs node_modules/mocha/bin/mocha.js \"test/**/*.spec.ts\" --colors --reporter spec --exit",
+    "test:integration": "OPTIMYSTIC_INTEGRATION=1 npm test",
     "quoomb": "npm run build && quoomb --config examples/quoomb.config.local.json",
     "quoomb:dev": "quoomb --config examples/quoomb.config.dev.json",
     "quoomb:node1": "npm run build && quoomb --config examples/quoomb.config.node1.json",
