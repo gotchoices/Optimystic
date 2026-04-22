@@ -99,7 +99,17 @@ export class Chain<TEntry> {
 	async add(...entries: TEntry[]): Promise<ChainPath<TEntry>> {
 		const path = await this.getTail();
 		if (!path) {
-			throw new Error("Cannot add to non-existent chain");
+			// [TRACE-5] Diagnostic: capture header + tailId + tryGet result when this throws.
+			const header = await this.getHeader();
+			const tailIdVal = (header as any)?.tailId;
+			const tailById = tailIdVal !== undefined ? await this.store.tryGet(tailIdVal) : undefined;
+			const headerSnapshot = header
+				? { id: (header as any).header?.id, keys: Object.keys(header), headId: (header as any).headId, tailId: tailIdVal, rootId: (header as any).rootId }
+				: null;
+			const err = new Error(
+				`Cannot add to non-existent chain [TRACE-5] chainId=${this.id} header=${JSON.stringify(headerSnapshot)} tailIdDefined=${tailIdVal !== undefined} tailResolved=${tailById !== undefined}`
+			);
+			throw err;
 		}
 
 		const { headerBlock, block: oldTail } = path;
