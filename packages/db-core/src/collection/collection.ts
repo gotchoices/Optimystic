@@ -57,13 +57,6 @@ export class Collection<TAction> implements ICollection<TAction> {
 			tracker.insert(headerBlock);
 			source.actionContext = undefined;
 			await Log.open<Action<TAction>>(tracker, id);
-			// [TRACE-5] After createOrOpen fresh path: what's in the tracker?
-			const _hdr = (tracker.transforms.inserts as any)?.[id];
-			console.log(`[TRACE-5] createOrOpen:fresh collectionId=${id}`,
-				'insertKeys=', Object.keys(tracker.transforms.inserts ?? {}),
-				'updateKeys=', Object.keys(tracker.transforms.updates ?? {}),
-				'headerTailId=', _hdr?.tailId, 'headerHeadId=', _hdr?.headId,
-				'headerKeys=', _hdr ? Object.keys(_hdr) : null);
 		}
 
 		return new Collection(id, transactor, init.modules, source, sourceCache, tracker, init.filterConflict);
@@ -165,21 +158,10 @@ export class Collection<TAction> implements ICollection<TAction> {
 			const snapshot = copyTransforms(this.tracker.transforms);
 			const tracker = new Tracker(this.sourceCache, snapshot);
 
-			// [TRACE-5] snapshot inventory: which blocks does the per-sync tracker see?
-			const _headerInsert = (snapshot.inserts as any)?.[this.id];
-			console.log(`[TRACE-5] syncInternal collectionId=${this.id} pending=${pending.length}`,
-				'insertKeys=', Object.keys(snapshot.inserts ?? {}),
-				'updateKeys=', Object.keys(snapshot.updates ?? {}),
-				'deletes=', snapshot.deletes ?? [],
-				'headerInInserts=', !!_headerInsert,
-				'headerTailId=', _headerInsert?.tailId,
-				'headerHeadId=', _headerInsert?.headId,
-				'headerKeys=', _headerInsert ? Object.keys(_headerInsert) : null);
-
 			// Add the action to the log (in local tracking space)
 			const log = await Log.open<Action<TAction>>(tracker, this.id);
 			if (!log) {
-				throw new Error(`[TRACE-5] Log not found for collection ${this.id} (Chain.open returned undefined — header missing in per-sync tracker)`);
+				throw new Error(`Log not found for collection ${this.id}`);
 			}
 			const newRev = (this.source.actionContext?.rev ?? 0) + 1;
 			const addResult = await log.addActions(pending, actionId, newRev, () => tracker.transformedBlockIds());

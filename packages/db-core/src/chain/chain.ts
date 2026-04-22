@@ -76,27 +76,16 @@ export class Chain<TEntry> {
 	static async open<TEntry>(store: BlockStore<IBlock>, id: BlockId, options?: ChainInitOptions<TEntry>): Promise<Chain<TEntry> | undefined> {
 		const headerBlock = await store.tryGet(id) as ChainHeaderNode | undefined;
 		if (!headerBlock) {
-			// [TRACE-5] Chain.open: header not found
-			console.log(`[TRACE-5] Chain.open MISS chainId=${id} — store.tryGet returned undefined`);
 			return undefined;
 		}
 
 		// If the header block is missing headId or tailId, create a tail block and update the header
 		const headerAny = headerBlock as any; // Use 'any' for easier property checking/setting
-		const needsInit = !Object.hasOwn(headerAny, 'headId') || !Object.hasOwn(headerAny, 'tailId');
-		// [TRACE-5] Chain.open entry
-		console.log(`[TRACE-5] Chain.open HIT chainId=${id} needsInit=${needsInit}`,
-			'headerKeys=', Object.keys(headerAny), 'headId=', headerAny.headId, 'tailId=', headerAny.tailId);
-		if (needsInit) {
+		if (!Object.hasOwn(headerAny, 'headId') || !Object.hasOwn(headerAny, 'tailId')) {
 			const tailBlock = Chain.createTailBlock<TEntry>(store, options);
 			store.insert(tailBlock);
 			apply(store, headerBlock, [headId$, 0, 0, tailBlock.header.id]);
 			apply(store, headerBlock, [tailId$, 0, 0, tailBlock.header.id]);
-			// [TRACE-5] After init: verify the same header is now augmented
-			const after = await store.tryGet(id) as ChainHeaderNode | undefined;
-			console.log(`[TRACE-5] Chain.open INIT-DONE chainId=${id} tailBlockId=${tailBlock.header.id}`,
-				'afterKeys=', after ? Object.keys(after as any) : null,
-				'afterTailId=', (after as any)?.tailId, 'afterHeadId=', (after as any)?.headId);
 		}
 
 		return new Chain<TEntry>(store, id, options);
@@ -110,17 +99,7 @@ export class Chain<TEntry> {
 	async add(...entries: TEntry[]): Promise<ChainPath<TEntry>> {
 		const path = await this.getTail();
 		if (!path) {
-			// [TRACE-5] Diagnostic: capture header + tailId + tryGet result when this throws.
-			const header = await this.getHeader();
-			const tailIdVal = (header as any)?.tailId;
-			const tailById = tailIdVal !== undefined ? await this.store.tryGet(tailIdVal) : undefined;
-			const headerSnapshot = header
-				? { id: (header as any).header?.id, keys: Object.keys(header), headId: (header as any).headId, tailId: tailIdVal, rootId: (header as any).rootId }
-				: null;
-			const err = new Error(
-				`Cannot add to non-existent chain [TRACE-5] chainId=${this.id} header=${JSON.stringify(headerSnapshot)} tailIdDefined=${tailIdVal !== undefined} tailResolved=${tailById !== undefined}`
-			);
-			throw err;
+			throw new Error("Cannot add to non-existent chain");
 		}
 
 		const { headerBlock, block: oldTail } = path;
@@ -323,10 +302,7 @@ export class Chain<TEntry> {
 
 	async getTail(header?: ChainHeaderNode): Promise<ChainPath<TEntry> | undefined> {
 		const headerBlock = header ?? await this.getHeader();
-		const tailIdVal = (headerBlock as any)?.tailId;
 		let tail = headerBlock ? await this.store.tryGet(headerBlock.tailId) as ChainDataNode<TEntry> : undefined;
-		// [TRACE-5] getTail diagnostic
-		console.log(`[TRACE-5] getTail chainId=${this.id} headerFound=${!!headerBlock} tailIdDefined=${tailIdVal !== undefined} tailId=${tailIdVal} tailResolvedInitially=${!!tail}`);
 		// Possible that the block has filled between reading the header and reading the block... follow nextId links to find true end
 		while (tail?.nextId) {
 			tail = await this.store.tryGet(tail.nextId) as ChainDataNode<TEntry>;
