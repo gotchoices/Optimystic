@@ -1,0 +1,51 @@
+description: Deep-clone inserts in `copyTransforms` so per-sync Tracker snapshots can't mutate the parent Collection tracker's inserted blocks in place. Root cause of "Cannot add to non-existent chain" on first writes to fresh collections under long retry loops.
+dependencies: prior ticket 5-get-block-throws-on-pending-only-metadata (complete) unmasked this
+files:
+  - packages/db-core/src/transform/helpers.ts (`copyTransforms` deep-clones inserts; docstring extended)
+  - packages/db-core/test/transform.spec.ts:358 (isolation test) and :311 (apply-over-insert regression)
+  - packages/db-core/test/transform.property.spec.ts:174 (pre-existing property test on deep independence)
+  - docs/internals.md (pitfall documented)
+----
+
+## What was built
+
+`copyTransforms` now deep-clones every insert value (and every updates ops array) via `structuredClone`, so snapshots taken for `Collection.syncInternal` cannot mutate the source tracker's inserted block objects through shared refs.
+
+```ts
+const inserts = transform.inserts
+  ? Object.fromEntries(Object.entries(transform.inserts).map(([k, v]) => [k, structuredClone(v)]))
+  : {};
+const updates = transform.updates
+  ? Object.fromEntries(Object.entries(transform.updates).map(([k, v]) => [k, structuredClone(v)]))
+  : undefined;
+return { inserts, updates, deletes: transform.deletes ? [...transform.deletes] : undefined };
+```
+
+The docstring now warns that both `inserts` and `updates` require deep clones and references the in-place mutation contract of `Tracker.update`/`applyOperation`.
+
+## Why
+
+`Tracker.update` mutates inserted block objects in place via `applyOperation` (`block[entity] = structuredClone(inserted)`). With a shallow-cloned `inserts` map, a per-sync snapshot tracker would reach into the **same block objects** held by the parent Collection's tracker. Under `Collection.syncInternal`'s retry loop on a solo-node fresh write, `chain.add` would mutate the shared tail block until overflow, then mutate the shared header's `tailId` to point at a freshly inserted tail that only existed in the snapshot tracker. On retry, the parent tracker's header pointed at an orphaned tail → "Cannot add to non-existent chain".
+
+## Key files
+
+- `packages/db-core/src/transform/helpers.ts:64` — `copyTransforms` implementation + docstring.
+- `packages/db-core/src/collection/collection.ts:158` — the only non-test caller (`Collection.syncInternal` snapshot).
+- `packages/db-core/test/transform.spec.ts:358` — `copyTransforms isolates inserted block objects from snapshot mutations` (object-identity + leak-through assertions).
+- `packages/db-core/test/transform.spec.ts:311` — `apply-over-insert survives copyTransforms (regression for fresh-collection chain.add)`.
+- `packages/db-core/test/transform.property.spec.ts:174` — property test that mutations on inserted blocks' nested fields leave the original deep-equal to a baseline.
+
+## Testing notes
+
+- `yarn workspace @optimystic/db-core test` → 302 passing.
+- `yarn workspace @optimystic/db-core build` → clean.
+- New test asserts `snapshot.inserts[id] !== original.inserts[id]` and that a `Tracker.update` over the snapshot does not leak into `original.inserts[id]`.
+
+## Usage
+
+No API change — callers of `copyTransforms` get the same `Transforms` shape with stronger isolation. The only real caller, `Collection.syncInternal`, benefits automatically.
+
+## Out of scope (follow-ups)
+
+- `Collection.syncInternal` retry-loop amplification: a solo-node first write should not iterate 32+ times. Worth a bounded attempt count + clearer error reporting. Possibly tied to `5-coordinator-repo-pend-blockid-extraction.md`.
+- `CollectionFactory` per-process cache for non-transactional `Collection` instantiation in `packages/quereus-plugin-optimystic/src/optimystic-adapter/collection-factory.ts:28-64`. Repeated `SchemaManager.getSchemaTree` calls compound sync churn with fresh trackers.
