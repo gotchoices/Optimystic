@@ -1,4 +1,4 @@
-import type { PendRequest, ActionBlocks, IRepo, MessageOptions, CommitResult, GetBlockResults, PendResult, BlockGets, CommitRequest, RepoMessage, IKeyNetwork, ICluster, ClusterConsensusConfig, BlockId, ActionRev, ActionContext } from "@optimystic/db-core";
+import type { PendRequest, ActionBlocks, IRepo, MessageOptions, CommitResult, GetBlockResults, PendResult, BlockGets, CommitRequest, RepoMessage, IKeyNetwork, ICluster, ClusterConsensusConfig, BlockId, ActionRev, ActionContext, ClusterRecord } from "@optimystic/db-core";
 import { LruMap, blockIdsForTransforms } from "@optimystic/db-core";
 import { ClusterCoordinator } from "./cluster-coordinator.js";
 import type { ClusterClient } from "../cluster/client.js";
@@ -326,16 +326,38 @@ export class CoordinatorRepo implements IRepo {
 		};
 
 		try {
-			const { localExecuted } = await this.coordinator.executeClusterTransaction(blockIds[0]!, message, options);
-			// Only call storageRepo if local cluster didn't already execute during consensus
-			if (!localExecuted) {
-				return await this.storageRepo.commit(request, options);
+			const { record, localExecuted } = await this.coordinator.executeClusterTransaction(blockIds[0]!, message, options);
+			if (localExecuted) {
+				return { success: true };
 			}
-			// Local cluster already executed - return success
-			return { success: true };
+			// Local cluster didn't execute during consensus. Attempt a local commit,
+			// but tolerate failure (e.g., "pending action not found") when the cluster
+			// already reached consensus — this coordinator was likely picked for commit
+			// after missing the pend phase (unreachable during pend, fresh join, etc.).
+			// The cluster's majority is authoritative; this peer will catch up via sync.
+			try {
+				return await this.storageRepo.commit(request, options);
+			} catch (err) {
+				if (clusterReachedCommitConsensus(record)) {
+					log('coordinator-repo:commit-local-failed-cluster-succeeded', {
+						actionId: request.actionId,
+						error: (err as Error).message
+					});
+					return { success: true };
+				}
+				throw err;
+			}
 		} catch (error) {
 			log('coordinator-repo:commit-error', { actionId: request.actionId, error: (error as Error).message });
 			throw error;
 		}
 	}
+}
+
+/** True if a simple majority of cluster peers signed an approving commit. */
+function clusterReachedCommitConsensus(record: ClusterRecord): boolean {
+	const peerCount = Object.keys(record.peers).length;
+	if (peerCount === 0) return false;
+	const approvedCommits = Object.values(record.commits).filter(s => s.type === 'approve').length;
+	return approvedCommits > peerCount / 2;
 }

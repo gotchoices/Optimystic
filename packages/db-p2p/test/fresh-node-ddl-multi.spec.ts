@@ -73,10 +73,7 @@ describe('Fresh-node DDL (multi-node, real production stack)', function () {
 		});
 	});
 
-	// Skipped pending `tickets/fix/5-multi-node-cold-start-commit-with-failing-peer.md`.
-	// Remove `.skip` once that fix lands — the repro below is the deterministic case the
-	// fix must make green.
-	describe.skip('Scenario B — 5-node cold-start with one peer down at boot', function () {
+	describe('Scenario B — 5-node cold-start with one peer down at boot', function () {
 		// 15s: 5-node consensus + super-majority math across 4 reachable peers
 		// costs more round-trips than the 3-node case.
 		this.timeout(15_000);

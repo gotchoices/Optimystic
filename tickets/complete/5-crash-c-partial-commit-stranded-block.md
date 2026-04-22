@@ -9,11 +9,11 @@ files:
 
 ## Summary
 
-Fixed the "partial commit leaves blocks stranded" gap surfaced by Crash-C. Commit chose option (a) from the ticket — per-block idempotency — as it handles the dominant retry case with minimal surface area.
+Fixed the "partial commit leaves blocks stranded" gap surfaced by Crash-C. Commit chose option (a) from the source ticket — per-block idempotency — as it handles the dominant retry case with minimal surface area.
 
 ### Behavior change
 
-`StorageRepo.commit` now partitions its input blocks into three buckets at the stale-revision gate:
+`StorageRepo.commit` now partitions its input blocks into three buckets at the stale-revision gate (`packages/db-p2p/src/storage/storage-repo.ts:221-247`):
 
 - **Already-done** (new): `latest.rev === request.rev && latest.actionId === request.actionId`. Treat as an idempotent no-op; skip the pending-check and internalCommit for this block.
 - **Stale conflict** (unchanged): `latest.rev >= request.rev` but the actionId doesn't match — caller gets `{ success: false, missing: [...] }` as before.
@@ -24,12 +24,22 @@ The pending-check and internalCommit loop only iterate over "to-commit" blocks. 
 ### Why this works for the Crash-C scenario
 
 1. Multi-block commit starts; b0,b1 complete their full internalCommit (revision + promote + setLatest).
-2. Crash on b1's setLatest is impossible here — but crash on b2's first syscall (or any point in b2/b3/...) aborts the outer loop, leaving b2 with pending present, no revision, and unchanged latest. b0,b1 are fully at rev=1.
-3. Retry-commit with same (actionId, rev): b0,b1 hit the new idempotency path and are skipped; b2 goes through normal commit path; end state is all blocks at rev=1.
+2. Crash on b2's first syscall (or any point in b2/b3/...) aborts the outer loop, leaving b2 with pending present, no revision, and unchanged latest. b0,b1 are fully at rev=1.
+3. Retry-commit with same (actionId, rev): b0,b1 hit the idempotency path and are skipped; b2 goes through normal commit path; end state is all blocks at rev=1.
+
+### Upstream retry path verified
+
+`TransactionCoordinator.commitPhase` (`packages/db-core/src/transaction/coordinator.ts:760-774`) implements a 3-retry loop on commit failure, so this idempotency fix is naturally reachable through the production commit flow. `CoordinatorRepo.commit` does not retry itself — it propagates failures, which is correct since the coordinator layer owns retry policy.
+
+### Edge-case correctness
+
+- `rev=0`: revisions start at 1, so no commit carries `request.rev = 0`. Not a live case.
+- Pending-only (no prior commit): `latest === undefined`, bypasses idempotency check, falls through to normal toCommit path.
+- Insert-after-delete: new pend has a new actionId; even if `latest.rev === request.rev`, the actionId mismatch routes to the stale-conflict bucket as before.
 
 ## Testing
 
-### Crash-C test (`packages/db-p2p/test/mid-ddl-crash.spec.ts`)
+### Crash-C test (`packages/db-p2p/test/mid-ddl-crash.spec.ts:389-473`)
 
 Assertion flipped to require the desired behavior:
 
@@ -42,17 +52,12 @@ Updated to document that the retry now succeeds on MemoryRawStorage via the new 
 
 ### Run results
 
-- `npm run test` (db-p2p): 417 passing, 7 pending, 0 failing.
+- `yarn test:db-p2p`: 418 passing, 6 pending, 0 failing.
 - All Mid-DDL crash tests pass (11 passing, 1 pending).
-- `tsc --build` across packages clean.
+- Full `yarn build` across packages clean.
 
 ## Use cases
 
 - Any multi-block commit that partially crashes on the internalCommit loop in `StorageRepo.commit`. A caller (or coordinator) retrying with the same (actionId, rev) now rolls forward automatically.
 - Safe under the existing per-block lock discipline: idempotency check and commit run inside the same critical section.
-
-## Review-stage TODO
-
-- Confirm idempotency check is correct under the `rev=0` / pending-only / insert-after-delete edge cases.
-- Verify that callers up the stack (`CoordinatorRepo`, `NetworkTransactor` commit path) surface retry opportunities naturally — i.e., that the layer above StorageRepo will actually retry on `{ success: false, reason: ... }` from a partial crash.
-- Confirm that the "startup recovery" case (option c in the source ticket) is genuinely not needed given option (a) handles the retry case; if not, file a follow-up.
+- Startup-side recovery (option c from the source ticket) is not needed for the common case given `TransactionCoordinator.commitPhase`'s 3-retry loop plus this idempotency. Persistent-storage residual gaps are tracked by the two follow-up tickets already filed under `tickets/fix/5-memory-storage-metadata-reference-leak.md` (now complete) and `tickets/fix/5-crash-d3-latest-not-updated-silent-invisible-commit.md` (now complete).
