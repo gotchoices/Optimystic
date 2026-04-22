@@ -386,7 +386,7 @@ describe('Mid-DDL crash recovery (solo node)', function () {
 		const b2 = 'crash-c-block-2' as BlockId;
 		const actionId = 'action-crash-c' as ActionId;
 
-		it('crash mid-batch commit: b0,b1 fully committed; b2 untouched; retry-commit is rejected per current contract', async () => {
+		it('crash mid-batch commit: b0,b1 fully committed; b2 untouched; retry-commit rolls b2 forward idempotently', async () => {
 			const raw = new MemoryRawStorage();
 			// Pre-seed metadata so pend-path saveMetadata doesn't fire the trigger.
 			await preSeedMetadata(raw, [b0, b1, b2]);
@@ -440,7 +440,8 @@ describe('Mid-DDL crash recovery (solo node)', function () {
 			expect(await raw.getPendingTransaction(b2, actionId), 'b2 pending still present').to.not.equal(undefined);
 			expect(await raw.getRevision(b2, 1), 'b2 has no revision').to.equal(undefined);
 
-			// Recovery: retry-commit with same actionId+rev.
+			// Recovery: retry-commit with same (actionId, rev). b0+b1 already match the request
+			// exactly, so they're treated as idempotent no-ops; b2 rolls forward to rev=1.
 			const recovered = await rebuildCleanMesh(raw);
 			const repo = recovered.nodes[0]!.storageRepo;
 
@@ -450,16 +451,25 @@ describe('Mid-DDL crash recovery (solo node)', function () {
 				tailId: b0,
 				rev: 1
 			} as CommitRequest);
-			// Current contract: b0,b1 have latest.rev >= 1 → `missing` collected (with empty
-			// transforms, since request.rev === latest.rev leaves listRevisions empty), so
-			// the whole commit short-circuits with `success: false`. b2 is NOT advanced.
-			expect(retry.success, 'retry-commit rejected because b0,b1 are already at rev=1').to.equal(false);
+			expect(retry.success, 'retry-commit succeeds — idempotent on b0,b1; advances b2').to.equal(true);
 
-			// b2 remains stranded: pending present, no committed revision. This is the
-			// "partial commit split" that the ticket flags as a candidate gap.
-			const m2AfterRetry = await raw.getMetadata(b2);
-			expect(m2AfterRetry?.latest, 'b2 still not advanced after retry-commit').to.equal(undefined);
-			expect(await raw.getPendingTransaction(b2, actionId), 'b2 pending still present after retry-commit').to.not.equal(undefined);
+			// All three blocks are now at rev=1 with the same actionId.
+			const m0After = await raw.getMetadata(b0);
+			const m1After = await raw.getMetadata(b1);
+			const m2After = await raw.getMetadata(b2);
+			expect(m0After?.latest?.rev).to.equal(1);
+			expect(m1After?.latest?.rev).to.equal(1);
+			expect(m2After?.latest?.rev, 'b2 advanced to rev=1 on retry').to.equal(1);
+			expect(m2After?.latest?.actionId).to.equal(actionId);
+
+			// b2's pending was promoted and its revision was written.
+			expect(await raw.getRevision(b2, 1), 'b2 revision written').to.equal(actionId);
+			expect(await raw.getPendingTransaction(b2, actionId), 'b2 pending promoted').to.equal(undefined);
+			expect(await raw.getTransaction(b2, actionId), 'b2 action in committed log').to.not.equal(undefined);
+
+			// Final read on b2 sees the materialized block.
+			const final = await repo.get({ blockIds: [b2] });
+			expect(final[b2]?.state.latest?.rev).to.equal(1);
 		});
 	});
 
@@ -587,7 +597,7 @@ describe('Mid-DDL crash recovery (solo node)', function () {
 			expect(await raw.getPendingTransaction(blockA, actionId), 'pending removed by promote').to.equal(undefined);
 		});
 
-		it('retry-commit is rejected because pending is already gone', async () => {
+		it('retry-commit succeeds via idempotent no-op (leaked in-memory latest matches request)', async () => {
 			const raw = new MemoryRawStorage();
 			await seedPending(raw);
 
@@ -599,25 +609,26 @@ describe('Mid-DDL crash recovery (solo node)', function () {
 				rev: 1
 			} as CommitRequest);
 
-			// Recovery: retry-commit. Per storage-repo.ts:244-253, the pending check
-			// fires BEFORE internalCommit; with pending already promoted, it throws
-			// "Pending action not found" — surfaced by commit()'s outer catch as
-			// `success: false`. No built-in recovery path reconciles the half-state.
+			// Recovery: retry-commit with the same (actionId, rev). On MemoryRawStorage,
+			// the reference-leak means latest was already mutated to { actionId, rev: 1 }
+			// before the saveMetadata proxy threw, so the commit's idempotency check
+			// (latest.rev === request.rev && latest.actionId === request.actionId) treats
+			// this block as already-done and short-circuits to success.
+			//
+			// In a persistent store without the reference leak, latest would still be
+			// undefined on retry — the idempotency path wouldn't fire, and the pending-
+			// missing check would throw. That residual gap is tracked by:
+			//   tickets/fix/5-memory-storage-metadata-reference-leak.md
+			//   tickets/fix/5-crash-d3-latest-not-updated-silent-invisible-commit.md
 			const recovered = await rebuildCleanMesh(raw);
 			const repo = recovered.nodes[0]!.storageRepo;
-			let retryOk: boolean | undefined;
-			try {
-				const retry = await repo.commit({
-					actionId,
-					blockIds: [blockA],
-					tailId: blockA,
-					rev: 1
-				} as CommitRequest);
-				retryOk = retry.success;
-			} catch {
-				retryOk = false;
-			}
-			expect(retryOk, 'retry-commit cannot complete on a promoted action').to.equal(false);
+			const retry = await repo.commit({
+				actionId,
+				blockIds: [blockA],
+				tailId: blockA,
+				rev: 1
+			} as CommitRequest);
+			expect(retry.success, 'retry-commit succeeds idempotently on leaked latest').to.equal(true);
 		});
 
 		it('documents MemoryRawStorage reference-leak: mutation leaks into RAM even when saveMetadata throws', async () => {

@@ -211,11 +211,23 @@ export class StorageRepo implements IRepo {
 				storage: this.createBlockStorage(blockId)
 			}));
 
-			// Check for stale revisions and collect missing actions
+			// Partition blocks into:
+			//   - alreadyDone: latest.rev === request.rev && latest.actionId === request.actionId
+			//     (idempotent retry — a prior commit of this same action already landed here;
+			//     skip rather than treat as a conflict. Needed to rollforward stranded blocks
+			//     after a mid-batch crash committed some but not all blocks.)
+			//   - missedCommits: latest.rev >= request.rev but not the same actionId → real stale conflict.
+			//   - toCommit: latest.rev < request.rev or no latest yet → run internalCommit.
+			const toCommit: { blockId: BlockId, storage: IBlockStorage }[] = [];
 			const missedCommits: { blockId: BlockId, transforms: ActionTransform[] }[] = [];
-			for (const { blockId, storage } of blockStorages) {
+			for (const entry of blockStorages) {
+				const { blockId, storage } = entry;
 				const latest = await storage.getLatest();
 				if (latest && latest.rev >= request.rev) {
+					if (latest.rev === request.rev && latest.actionId === request.actionId) {
+						// Idempotent no-op for this block — already committed with this exact (actionId, rev).
+						continue;
+					}
 					const transforms: ActionTransform[] = [];
 					for await (const actionRev of storage.listRevisions(request.rev, latest.rev)) {
 						const transform = await storage.getTransaction(actionRev.actionId);
@@ -229,7 +241,9 @@ export class StorageRepo implements IRepo {
 						});
 					}
 					missedCommits.push({ blockId, transforms });	// Push, even if transforms is empty, because we want to reject the older version
+					continue;
 				}
+				toCommit.push(entry);
 			}
 
 			if (missedCommits.length) {
@@ -240,9 +254,11 @@ export class StorageRepo implements IRepo {
 				};
 			}
 
-			// Check for missing pending actions
+			// Check for missing pending actions only on blocks that still need to commit.
+			// Already-done blocks will have had their pending promoted, so skipping them here
+			// is what makes the idempotent rollforward work.
 			const missingPends: { blockId: BlockId, actionId: ActionId }[] = [];
-			for (const { blockId, storage } of blockStorages) {
+			for (const { blockId, storage } of toCommit) {
 				const pendingAction = await storage.getPendingTransaction(request.actionId);
 				if (!pendingAction) {
 					missingPends.push({ blockId, actionId: request.actionId });
@@ -253,14 +269,15 @@ export class StorageRepo implements IRepo {
 				throw new Error(`Pending action ${request.actionId} not found for block(s): ${missingPends.map(p => p.blockId).join(', ')}`);
 			}
 
-			// Commit the action for each block
-			// This loop will execute atomically for all blocks due to the acquired locks
-			for (const { blockId, storage } of blockStorages) {
+			// Commit the action for each block that still needs it.
+			// This loop will execute atomically for all blocks due to the acquired locks.
+			for (const { blockId, storage } of toCommit) {
 				try {
 					// internalCommit will throw if it encounters an issue
 					await this.internalCommit(blockId, request.actionId, request.rev, storage);
 				} catch (err) {
-					// TODO: Recover as best we can. Rollback or handle partial commit? For now, return failure.
+					// Partial-commit recovery: a retry with the same (actionId, rev) will treat
+					// already-done blocks as idempotent no-ops and advance the remainder.
 					return {
 						success: false,
 						reason: err instanceof Error ? err.message : 'Unknown error during commit'
