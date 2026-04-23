@@ -1,0 +1,66 @@
+description: Phase 5 of ticket-7. Gated integration smoke test for `quereus-plugin-optimystic` exercising `CREATE TABLE → INSERT → cold-restart → SELECT` against the real production stack (`createLibp2pNode` + `NetworkTransactor` + `SchemaManager`). Closes the "real libp2p + cold-restart + DDL through the plugin" coverage gap.
+prereq:
+  - ticket-7 Phase 5 (implement + review)
+files:
+  - packages/quereus-plugin-optimystic/test/plugin-first-launch-libp2p.integration.spec.ts
+  - packages/quereus-plugin-optimystic/package.json
+----
+
+## What was built
+
+A single gated spec file `packages/quereus-plugin-optimystic/test/plugin-first-launch-libp2p.integration.spec.ts` with three `it` blocks under `describe('Plugin first-launch over real libp2p')`:
+
+1. **Happy path: CREATE TABLE, INSERT, SELECT round-trip.** Cold-boots a real libp2p node, registers the plugin against an externally-constructed `NetworkTransactor`, runs `CREATE TABLE canary ... USING optimystic('tree://canary-smoke/canary')` → `INSERT (1, 'first')` → `SELECT value WHERE id = 1`, asserts `'first'`.
+2. **Cold-restart over shared storage preserves rows.** Boots node A over a pre-constructed `MemoryRawStorage` + pre-generated `Ed25519` `PrivateKey`, creates+inserts, stops node A, boots node B over the **same** storage+identity with a fresh `Database`, re-declares the vtable, and `SELECT`s the original row.
+3. **Two sequential DDLs in one session.** Two `CREATE TABLE` + `INSERT` pairs in the same `Database`, exercising "second DDL after first DDL."
+
+Gating: `before(function () { if (!process.env.OPTIMYSTIC_INTEGRATION) this.skip(); })`.
+
+Transactor-injection route: the spec builds `NetworkTransactor` externally and registers it via `plugin.collectionFactory.registerTransactor('network:libp2p', transactor)`. The plugin's existing `CollectionFactory.getTransactorKey` produces `${options.transactor}:${options.keyNetwork}`, so the `'network:libp2p'` cache key resolves without any plugin-source changes.
+
+Package wiring: added `"test:integration": "OPTIMYSTIC_INTEGRATION=1 npm test"` to `packages/quereus-plugin-optimystic/package.json` (POSIX form, mirrors `db-p2p`). The spec's top-of-file comment documents the Windows PowerShell `$env:` alternative.
+
+## Key files
+
+- `packages/quereus-plugin-optimystic/test/plugin-first-launch-libp2p.integration.spec.ts` (new, 217 lines)
+- `packages/quereus-plugin-optimystic/package.json` (one-line script addition)
+- Read-only references (unchanged):
+  - `packages/quereus-plugin-optimystic/src/optimystic-adapter/collection-factory.ts` (`registerTransactor`, `getTransactorKey`)
+  - `packages/quereus-plugin-optimystic/src/plugin.ts`
+  - `packages/quereus-plugin-optimystic/src/optimystic-module.ts`
+  - `packages/quereus-plugin-optimystic/src/schema/schema-manager.ts`
+  - `packages/db-p2p/test/real-libp2p.integration.spec.ts` (gating pattern source)
+  - `packages/quereus-plugin-optimystic/test/fresh-node-ddl-libp2p.spec.ts` (wiring pattern source)
+
+## Testing & validation
+
+| Check                                                                     | Result                                                 |
+| ------------------------------------------------------------------------- | ------------------------------------------------------ |
+| `npm run build --workspace @optimystic/quereus-plugin-optimystic`         | Clean                                                  |
+| `npm test --workspace @optimystic/quereus-plugin-optimystic` (no gate)    | 183 passing, 4 pending (canary's 3 pending)            |
+| Spec-scoped with `OPTIMYSTIC_INTEGRATION=1`                               | 3 passing in ~0.9 s total                              |
+| Intentional-break sanity (`throw` in `SchemaManager.storeSchema`)         | Fails fast with surfaced error — no hang. Reverted.    |
+
+Per-`it` runtime: ~283–339 ms. Well under 10 s target and 15–25 s per-`it` timeouts.
+
+Pre-existing `npm run typecheck` failures in `src/schema/index-manager.ts` and `test/manual-mesh-test.ts` are unrelated and present on `main` prior to this change.
+
+## Usage
+
+```sh
+# From repo root (POSIX):
+npm run test:integration --workspace @optimystic/quereus-plugin-optimystic
+
+# Windows PowerShell:
+$env:OPTIMYSTIC_INTEGRATION=1; npm test --workspace @optimystic/quereus-plugin-optimystic
+```
+
+Note: the spec imports `../dist/plugin.js`, so `npm run build --workspace @optimystic/quereus-plugin-optimystic` must run before the integration script picks up plugin-source changes.
+
+## Review notes
+
+- **Gate semantics verified empirically:** no env → 3 pending (mocha cyan dash); `OPTIMYSTIC_INTEGRATION=1` → 3 passing.
+- **No plugin-source changes:** `git diff e5fde5f^..e5fde5f --stat` confirms only `package.json` (+1) and the new spec file (+216).
+- **Cache-key fragility is acceptable:** a rename to `CollectionFactory.getTransactorKey` surfaces a clear "custom-transactor-not-found" error, not a hang.
+- **Cleanup:** `afterEach` stops all tracked nodes via `Promise.allSettled`; the cold-restart `it` splices node A out of the tracked list post-stop so `afterEach` does not double-stop.
+- **Non-goals honored:** no React Native coverage, no multi-node mesh, not promoted to default `npm test`, no changes to `optimystic-module.ts` or `schema-manager.ts`.
