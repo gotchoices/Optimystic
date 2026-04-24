@@ -294,6 +294,39 @@ COMMIT Phase:
   Transaction commits only if all critical clusters agree
 ```
 
+## Client Synchronization
+
+The client side of a transaction is inherently optimistic: it mutates a local snapshot immediately, ships the result to the network, and retries on rejection. This section describes the local lifecycle — what blocks the client holds, how it reads them, and how it recovers from staleness. The coordinator-centric flow above assumes these mechanics are in place.
+
+### Block mirroring
+
+A client maintains a synchronized local copy of every block it touches during a transaction:
+
+1. **Header block first.** The first read for a collection fetches its header block, which points to the log tail.
+2. **Tail block second.** Reading the log tail yields the current revision and any uncheckpointed transaction IDs.
+3. **Other blocks as needed.** With the revision and outstanding action IDs in hand, subsequent reads see the current state — including pending-but-uncommitted transactions relevant to the client.
+
+All reads pass through a `Tracker` that layers local changes on top of fetched blocks. Modifications are applied to **copies**, not to the cached originals — this preserves the pre-change state so it can be replayed if a sync is needed. Every read is captured as a `ReadDependency` (`blockId`, `revision`) and carried with the transaction for later validation.
+
+### When to sync
+
+A client must re-synchronize before committing in two cases:
+
+- **Stale cache.** If significant time has passed since blocks were loaded, a sync ensures the transaction is not submitted against an obsolete revision.
+- **Post-rejection.** When PEND or COMMIT fails because of stale reads or a concurrent conflict, the client must incorporate the winning transaction before retrying.
+
+A pre-PEND sync — sometimes called the *Phase 0* optimization — is optional but avoids wasting a round-trip on a transaction that will obviously be rejected. It is particularly worthwhile after long idle periods or when the client has reason to suspect the cache is behind.
+
+### How to sync
+
+1. **Pull new log entries.** Read each affected collection's log tail forward from the client's last known revision.
+2. **Replay new transactions locally.** Starting from the unmodified cached blocks, apply the fetched log entries in order. Capture the resulting changes in fresh block copies — these represent "the world as of now," independent of the client's own pending actions.
+3. **Detect conflicts.** Compare incoming actions against the client's pending actions using the collection's `filterConflict` policy. Drop, merge, or preserve local actions per the policy.
+4. **Replay local actions on top.** Re-apply the surviving local actions to the updated blocks, producing a new set of transforms against current revisions.
+5. **Retry PEND.** Submit the newly computed transforms.
+
+The net effect is a client-side optimistic concurrency loop: the collection acts as a local working copy, the network is the source of truth, and conflicts are reconciled through deterministic replay plus an explicit `filterConflict` policy. The in-process data flow (Tracker / CacheSource / TransactorSource) that implements this is summarized in [internals.md](internals.md#data-flow); the `Collection.updateAndSync()` entry point drives the whole loop.
+
 ## Key Components
 
 ### 1. Transaction Types (db-core)

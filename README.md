@@ -13,11 +13,10 @@ Optimystic is a distributed database system built on peer-to-peer networks. It p
 
 See the following documentation:
 
-* [Technical Architecture](docs/architecture.md)
-* [Distributed Database System](docs/optimystic.md)
-* [FRET DHT System](p2p-fret docs/fret.md)
+* [Technical Architecture](docs/architecture.md) — subsystem map and mental model
+* [Building on Optimystic](docs/optimystic.md) — application developer's guide
+* [Transaction Protocol](docs/transactions.md) — lifecycle, multi-collection, client sync
 * [Storage Architecture (Arachnode)](docs/arachnode.md)
-* [Ring Zulu Integration](docs/ring-zulu-integration.md)
 * [Block Repository](docs/repository.md)
 
 ## Packages

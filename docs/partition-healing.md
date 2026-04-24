@@ -317,6 +317,89 @@ These remain relevant under CRDT sync with partition healing, but their scope na
 * The partition detector continues to flag partitions, but its consequence shifts. Rather than blocking all writes, it raises the stability threshold for pending transactions, holds `on-stable` effects longer, and surfaces a "degraded consistency" indicator to the application so UIs can show "partitioned — changes will reconcile on reconnect" rather than silently failing.
 * For invariants declared `compensatable`, a partition is no longer a fatal event — it is a period during which reconcile will have work to do when partitions heal. The protocol tracks and reports this; applications can instrument it.
 
+## Dependency on the Underlying Transaction Model
+
+A natural question once the design is on the table: how much of this framework depends on [crdt-sync.md](crdt-sync.md)? **Moderately, not deeply.** Most of the design transfers to any system that produces divergent histories and merges them deterministically — CRDT sync is one such system, probably the cleanest, but not the only one. A meaningful subset also applies to today's strict-CP Optimystic without any evolution.
+
+This section maps the design onto two concrete implementation points — today's system and the CRDT-sync evolution — so it is clear what lands where.
+
+### What the Design Actually Requires
+
+Stripped to essentials, three properties of the substrate:
+
+1. **Local progress under concurrent or partitioned execution.** Without this, reconcile never fires — there is nothing diverged to reconcile. Today's strict-CP Optimystic fails this precondition during partitions but satisfies a weaker form under concurrent-but-connected execution (the race-resolution path).
+2. **Deterministic re-execution over an ordered log.** So every node's reconcile produces identical output. Any deterministic total order works; HLC is one choice.
+3. **Append-only, content-addressed record.** So reconcile output is just another transaction through the same pipeline; audit trail is automatic.
+
+Any substrate with all three can host the full design. CRDT sync does. Event sourcing with a deterministic reducer does. Calvin-style deterministic ordering does. Smart-contract chains do. Today's strict-CP system provides #2 and #3 but not the partition-time form of #1 — so a subset applies.
+
+### Cleanly Separable From CRDT Sync
+
+These concepts stand on their own regardless of consistency model:
+
+| Concept | Why it is independent |
+|---------|----------------------|
+| Declarative invariants (`InvariantSpec`) | Richer schema; SQL `CHECK` is the degenerate case. Useful under any consistency. |
+| Escrow / reservation primitive | Uses *strong consensus* — the opposite of CRDT. Layers directly onto today's log-tail machinery. |
+| I-confluence classification | Analytical framework for reasoning about invariants. No runtime dependency. |
+| Three-kind taxonomy (`compensatable` / `reservation-required` / `externally-visible`) | Vocabulary for invariants. Transports anywhere. |
+| Conservative-vs-aggressive cascading compensation | A pattern that applies wherever compensation exists — sagas, workflows, distributed transactions. |
+| Flag-for-review, audit trail, effect gating | Workflow and observability concepts. Independent of sync mechanism. |
+
+### Actually Coupled to CRDT Sync
+
+These lean on specific properties of the evolution:
+
+| Concept | Why it is coupled |
+|---------|-------------------|
+| HLC as the deterministic total order | Generalizes to any deterministic total order, but the specific "per-tx HLC drives reconcile input ordering" shape is CRDT-sync-native. |
+| Reconcile output is *just another transaction* | Works because CRDT sync treats every transaction uniformly. In a stricter system, reconcile output may need a distinct pipeline or privilege level. |
+| Watermark stability horizons driving `effectGate` | One specific "settled enough to act on" mechanism. Stricter systems have simpler settledness (committed = settled) but less nuance around tentative effects. |
+| Merge-time reconciliation itself | Requires divergent histories to exist, which requires local progress, which requires AP semantics somewhere in the stack. |
+
+### Subset That Lands on Today's Strict-CP Optimystic
+
+Without the CRDT-sync evolution, a meaningful portion of the design still applies — it simply runs at a different point in the transaction lifecycle. Specifically:
+
+1. **Declarative invariants on collections.** Extend collection schemas to carry `InvariantSpec` with deterministic predicates. Validators enforce invariants during PEND as a natural extension of `CHECK` constraints. Invariants become part of the schema hash, inheriting the deterministic-replay property from [correctness.md](correctness.md) §Theorem 4.
+2. **Declarative resolution rules at race-resolution time.** Today's `resolveRace()` deterministically selects a winner between conflicting transactions ([correctness.md](correctness.md) §Theorem 1). Upgrade this path from the hardcoded "most promises, then highest hash" rule to an application-supplied deterministic rule per collection, keyed on the same `ReconcileSpec` shape — but running at conflict-detection time rather than at merge time. The losing transaction's compensating action is appended to the log; effects are gated through the same `on-stable` / `on-reviewed` mechanism, where "stable" means "checkpointed."
+3. **Escrow / reservation primitive.** Add as an independent feature for high-stakes operations, independent of any CRDT work. This *uses* today's strong-consensus machinery; it does not need CRDT sync at all. Declaring an invariant as `reservation-required` compiles to a reservation acquisition at BEGIN and a consumption step in the transaction body.
+4. **Structured audit trail of resolution events.** Whenever `resolveRace()` picks a winner, log the losing transaction, the resolving rule, and the outcome as a first-class record in the collection log. This is a small change with large observability payoff and does not require CRDT sync.
+5. **Effect gating via client-side outbox.** `on-stable` gating can be emulated by a client-side outbox that holds emitted effects until the transaction is checkpointed (today's stability signal). Not as uniform as the CRDT-sync version (which treats the outbox as replay-driven), but functional for the common cases.
+
+Taken together, these items already constitute a substantial upgrade to today's conflict-handling model. They subsume the *structural* benefits of partition healing — declarative rules, audit, classification, escrow — without changing consistency semantics.
+
+### What Requires CRDT Sync (or an Equivalent AP Substrate)
+
+These are the specifically divergence-dependent parts:
+
+- **Partition-time local progress on `compensatable` invariants.** The minority partition is blocked on any invariant that touches a log-tail cluster. No amount of declarative machinery changes this under strict CP.
+- **Merge-and-reconcile behavior.** Divergent histories do not exist under strict CP; there is nothing to merge. Reconcile collapses to "pick one at race-resolution time" rather than "merge concurrent histories from both partitions."
+- **Asynchronous reconcile as a signed, timestamped transaction at merge time.** The strict system's resolution is synchronous at PEND/COMMIT. Asynchronous merge-time reconcile requires deferred execution, which requires divergent histories.
+- **Nuanced effect gating beyond committed-vs-uncommitted.** The tentative → propagated → stable tri-state depends on replay-driven visibility. Strict systems have only committed-vs-not; effect gating is correspondingly simpler (and less expressive).
+
+### The Reframing
+
+The dependency is not really on CRDT as a formalism. It is on a prior question:
+
+> *Are you willing to let divergent histories exist, and commit to deterministic merge rules?*
+
+- **Yes, broadly** → CRDT sync, event-sourced reducers, Calvin-style deterministic ordering, smart-contract chains, or any other AP-with-determinism substrate. The full design applies.
+- **No** → items 1–5 above still apply, landing at race-resolution time rather than merge time. Partition-time local progress does not.
+- **Per-invariant** (the recommended stance) → declare each invariant's disposition individually. CRDT-sync collections host `compensatable` invariants with merge-time reconcile; strict-mode collections or `reservation-required` invariants continue to use today's CP machinery. Both coexist in the same network.
+
+The per-invariant stance is the honest one. It also makes both documents actionable: [crdt-sync.md](crdt-sync.md) describes the substrate for invariants that prefer availability-with-reconcile; this document describes what those reconcile rules look like; today's strict system continues to serve invariants that cannot tolerate divergence at all.
+
+### Implementation Sequencing
+
+This separability has a practical consequence: **the two evolutions can proceed independently.** A reasonable order:
+
+1. **First**: land items 1–5 above on today's strict-CP system. Low-risk, high-value, useful immediately. This delivers declarative invariants, declarative resolution, escrow, and structured audit — all with today's consistency guarantees intact.
+2. **Second**: land the CRDT-sync substrate ([crdt-sync.md](crdt-sync.md) migration path) as an opt-in per-collection mode. Strict-mode collections keep working; replay-mode collections gain partition-time availability.
+3. **Third**: extend the invariant and reconcile machinery to trigger at merge time for replay-mode collections. The `ReconcileSpec` authored for race-resolution-time in step 1 is the same shape used for merge-time in step 3; most application rules transfer directly.
+
+This means application authors can write invariant and reconcile declarations today against the current system, and those declarations become merge-time reconciles automatically when a collection is later migrated to replay mode — without application code changes.
+
 ## Operational Concerns
 
 **Reconcile resource budget.** A malicious client could craft transactions with expensive reconcile rules. Mitigation: reconcile is part of the signed transaction, so its cost is billed to the issuer (reputation, rate limits). Engines enforce a per-reconcile work budget; exceeding it is a validation failure comparable to a non-deterministic SQL function.

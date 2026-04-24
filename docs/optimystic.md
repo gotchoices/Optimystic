@@ -1,242 +1,268 @@
-# Optimystic - Distributed Database System
+# Building on Optimystic
 
-## Overview
+This guide is for developers writing applications on top of Optimystic — choosing a front-end, running a node, opening collections, making mutations, handling conflicts, and picking a deployment target. For the architectural overview see [architecture.md](architecture.md); for the transaction protocol spec see [transactions.md](transactions.md).
 
-The transaction system described here uses a logical transaction log combined with block-based storage.  This scheme can be used as a stand-alone logging system, or can be coupled with a tree or other data structure.  This design is based on the transaction system of [AliveBase](https://github.com/Digithought).
+## Two Paths In
 
-This scheme employs a logical transaction log combined with block-based storage, supporting both single-collection and cross-collection transactions. The system utilizes a multi-phase process for propagating updates, committing transactions, and checkpointing affected blocks, ensuring consistency across distributed collections while allowing for concurrent operations through conditional commits.
+You can access Optimystic through either a **native TypeScript API** or through **SQL via Quereus**. The same underlying collections back both — a Quereus table is a `Tree` with a schema-aware encoding layer.
 
-The system may experience hotspots at the log tail block, but the tail is transient so these should distribute over time.  There is also the potential for cascading failures in upstream multi-collection transactions, but subsequent transactors are always free to investigate dependencies before committing.  Overall it offers a lockless design that enables transactions to proceed after retries, providing both flexibility and efficiency. The scheme also incorporates robust failure handling mechanisms, validation processes based on atomic writes and peer communication, and optimizations such as an optional sync phase and efficient advertisement of newer block transactions.
+| | Native API | SQL via Quereus |
+|---|---|---|
+| Packages | `@optimystic/db-core` + `@optimystic/db-p2p` | add `@optimystic/quereus-plugin-optimystic` |
+| Schema | Application-defined per collection | Declared with `create table ... using optimystic(...)` |
+| Mutations | `collection.act(...)`, `tree.replace(...)` | `insert` / `update` / `delete` |
+| Reads | `tree.range(...)`, `diary.select()` | `select` with optimized primary-key lookup and range scan |
+| Multi-collection atomic | `TransactionSession` + `ActionsEngine` | `begin` / `commit` / `rollback` |
+| Good fit when | Custom data structures, per-collection conflict policies, mobile footprint | Table-shaped data, declarative constraints, SQL tooling |
 
-### Summary
+## Running a Node
 
-#### Single collection transactions:
-* Each collection maintains log of logical transactions, each with:
-  * revision, transaction ID, block IDs, logical actions
-* Logical log stored physically as linked list of blocks
-* Log header block references head and tail block IDs
-* Blocks each versioned by associated transaction ID and revision number - can read from previous revision back to history TTL
-* Phase 1 - Pend: `pend()`s are posted to all affected blocks (w/ TTLs) - these don't update the revision
-* Phase 2 - Commit: Transaction is appended to tail of the log, obtaining a new revision
-* Phase 3 - Propagate: All affected blocks' revisions are updated
-* Phase 4 - Checkpoint: Checkpoint record appended to tail block as propagation completes
-* Before reading from collection, obtain outstanding transaction ID and revisions stated by checkpoint and intervening transactions
-* Explicitly mention uncheckpointed and uncommited transactions when reading from block storage 
-  - ensures read includes uncheckpointed and uncommitted transactions
-  - reinforces commits (in case committer fails to propagate)
+Every application needs at least one Optimystic peer. Roles are orthogonal — a single node may combine them:
 
-## Collections
+* **Solo / offline.** No bootstrap peers, no listen addresses. Common for mobile first launch, unit tests, and local development.
+* **Client-only.** Dials bootstrap peers but does not accept inbound connections.
+* **Full peer.** Participates in transaction routing, consensus, and (if configured) storage.
+* **Public gateway** or **bootstrap node.** Provides a stable public address for mobile and NAT'd clients.
 
-A collection is the fundamental unit of data storage in Optimystic.  It consists of a transaction log, as well as a type-specific structure, such as a tree, all build on top of block storage.  It also represents the smallest scope of transaction processing.
+Minimal setup:
 
-Types of collections include:
-* **Diary** - an append-only list of entries
-* **Tree** - a dictionary or index like structure that stores entries in terms of a key based order
-  * **Hashed Tree** (planned) - a tree where each node contains a hash of its children or entries (Merkle tree)
+```typescript
+import { createLibp2pNode } from '@optimystic/db-p2p';
 
-Each collection has a unique identifier, which is a reference to a block ID containing the collection's header.
+const node = await createLibp2pNode({
+  networkName: 'myapp',
+  bootstrapNodes: ['/dns4/relay.example.com/tcp/443/wss/p2p/12D3...'],
+  clusterSize: 10,
+  arachnode: { enableRingZulu: true },
+});
+```
 
-For details, see [repository](repository.md).
+A **solo** configuration — zero bootstrap, zero listen — is a valid first-launch shape; `CoordinatorRepo` short-circuits cluster consensus when `clusterSize ≤ 1`:
 
-## Transactor
+```typescript
+import { webSockets } from '@libp2p/websockets';
 
-A Transactor represents transactions against block storage independent of the underlying implementation.  Logical transactions are identified by a Transaction ID, which is also mirrored in the physical block repositories. The Transactor offers four core operations: 
-- `get()` to retrieve the latest or a specific version of a set of blocks
-- `pend()` to store the given block transforms as a pending transaction
-- `cancel()` to cancel a pending transaction
-- `commit()` to commit a pending transaction
+const solo = await createLibp2pNode({
+  networkName: 'myapp',
+  bootstrapNodes: [],
+  listenAddrs: [],
+  transports: [webSockets()],
+  clusterSize: 1,
+});
+```
 
-Transactor operations, in general, apply to multiple blocks, and are split into multiple block-specific operations depending on the physical groupings of blocks.  For instance, an update transformation to both Block 1 and Block 2 may be turned into two separate update operations, one for Block 1 and one for Block 2 and sent to two separate block repositories.
+The node transitions out of solo mode automatically once FRET discovers peers. For interactive development, the [`reference-peer`](../packages/reference-peer) CLI (`optimystic-peer`) offers REPL, service, and mesh-orchestrator modes.
 
-## Transactions
+## Native API
 
-Transactions are actions scoped to one or more collections.  There are three main layers to transactions:
-* **Logical actions** - Actions applied to the collection are affected against the collection's logical structure (e.g. append to a tree), and the actions are also appended to the logical transaction log.
-* **Block transforms** - Each logical action ultimately translates to block level transforms, including the appending of the transaction log, which is stored as a chain of blocks.
-* **Cluster sub-transactions** - Peers who are in proximity to a block ID address on the network, have to coordinate the individual transaction sub-operations.
+### Wire up a transactor
 
-The transaction log is physically represented as a linked list of blocks, each containing a set of logical log entries.  The collection header block points to the tail block, and each block points to the prior block in the chain.
+A `NetworkTransactor` is the bridge between collections and the network:
 
-![Collection Log](figures/collection-log.png)
+```typescript
+import { NetworkTransactor } from '@optimystic/db-core';
 
-To apply a transaction to the blocks:
-1. The client sends `pend()` requests to all involved blocks, containing the block transforms.  This allows the transform payload to be communicated to all involved blocks, prior to commitment.
-2. The client specifically attempts to `commit()` the request to the tail block of the transaction log.  Successful commits to this block represent the "tip of the spear" for the transaction - if this commit succeeds, the transaction will ultimately succeed.
-3. The client propagates the commit to the remaining involved blocks.
-4. Once commit confirmation is received for all involved blocks, a checkpoint entry is appended to the transaction log.
+const transactor = new NetworkTransactor({
+  keyNetwork,    // Peer discovery (e.g. Libp2pKeyPeerNetwork from db-p2p)
+  peerNetwork,   // libp2p node
+  getRepo,       // Factory returning a local IRepo (StorageRepo for persistence)
+});
+```
 
-Prior to checkpointing, the transaction is still complete, but client's must not assume that all block storage clusters have received the commit, so any `get()` requests should include the transaction ID / revision information, so that the storage repository will a) be informed of the commit; and b) be sure to retrieve the committed revision.
+For tests, `TestTransactor` from `@optimystic/db-core/test-transactor.js` runs everything in-process with no network.
 
-The resulting transaction model provides optimistic concurrency control, ensuring safe and reliable ACID mutations.  If a given transaction is stale, as in it is not "based on" the latest committed revision, the transaction will fail.  If this happens, the transaction must be retried as follows:
-1. The client abandons its pending block operations
-2. The winning transaction's logical actions are loaded by the client, and any conflicts resolved
-3. The client replays its own logical actions into a new set of block transforms
-4. The client attempts to pend and commit the new set of block transforms
+### Open a collection
 
-## Distributed Transactions
+`Tree` gives indexed key/value access with range scans; `Diary` is append-only. Both use `createOrOpen` (or `create`) — the header block is content-addressed from the collection name, so every peer in the network resolves to the same collection.
 
-Distributed transactions are affected by virtue of conditional transactions.  Here is how a DT is conducted:
-* An attempt is made to appended all involved collection logs with a conditional transaction.  A promise signature is obtained from each tail maintenance cluster, indicating that this conditional transaction was successful.
-* Once all needed promise signatures are obtained, the set of promises is propagated.
-* Containing full promises, all log tails post a completion transaction.
-* In the event that any of the above fails, e.g. a collection rejects the conditional due to it being stale, a compensatory transaction is appended to all logs to which a conditional was posted.  This compensatory transaction identifies the log entry, and undoes the operation of that entry.
-* While the conditional transaction is outstanding, other transactors can choose to continue to transact, if their action doesn't conflict or depend on the final outcome, or they can wait for the outcome.
+```typescript
+import { Tree, Diary } from '@optimystic/db-core';
 
-## Network Transactor & Clustering
+const users = await Tree.createOrOpen<string, User>(
+  transactor,
+  'users',
+  user => user.id,
+  (a, b) => a.localeCompare(b)
+);
 
-The network transactor distributes a single transactional read or write operation (pend, commit, etc.) over the network of peers.  Each Block ID address is managed by a set of nearby (in hash space) peers, termed the block's *Cluster*.  There is a nested transaction scheme for transacting within each cluster; a variation of a two-phase commit (2PC) enriched with cryptographic signatures, decentralized verification, and a gossip-based finalization.  
+const events = await Diary.create<Event>(transactor, 'events');
+```
 
-![Network Transactor](figures/transactor-layers.svg)
+### Apply actions locally
 
-For each block involved in the transaction, the network transactor selects a peer from that block's cluster to act as coordinator.  The portion of the payload that applies to a given coordinator is then sent to that coordinator.  A cluster coordinator validates the operation and sends the operation request in parallel to all members of the cluster for independent validation and a promise signature.  If all, or sufficient promises are received prior to the operation expiration, the coordinator signs a commit signature and broadcasts the set of signatures back out to the cluster for commit signatures.  Once the coordinator receives a consensus of commit signatures, it can affect the operation on it's local storage, and respond the the network transactor, and propagate the consensus back out to the cluster peers.
+Actions are the unit of intent. Collection methods (`replace`, `append`, `act`) execute them immediately against a local `Tracker` — subsequent reads see the change before anything has been sent over the network.
 
-In the event that the operation's expiration arrives, any peer left in-doubt can reach out to other peers in the cluster.  Possession of a consensus of commit signatures, however gathered, constitutes proof that the transaction succeeded.  Possession of a consensus of commit rejection signatures constitutes proof of transaction failure.  Cluster peers continue to propagate signature records around to each other until the transaction goes to success or failure.  If the originator doesn't receive a response from the coordinator by the expiration, it can reach out to any other of the cluster peers for an update on the operation's status.
+```typescript
+await users.replace([
+  ['u1', { id: 'u1', name: 'Alice' }],
+  ['u2', { id: 'u2', name: 'Bob' }],
+]);
 
-When cluster peers disagree on transaction validity, the transaction is blocked and escalated through progressively wider audiences until consensus is reached. The losing side is ejected and the ring segment self-heals. For details, see [Right-is-Right](right-is-right.md).
+await events.append({ type: 'user_created', userId: 'u1' });
+```
 
-## Block Storage
+### Read
 
-Block Storage is composed of:
-* **Revisions** - a set of revisions, each of which contains:
-  * **Transform** - the changes represented by the revision
-  * **Materialized block (optional)** - materialization of the block at that revision
-* **Pending transforms** - pending transforms, which can be requested as part of a `get()` operations, and/or committed to the block
+Data-structure APIs work against the combined view (cached blocks + local pending actions):
 
-If a revision is requested that is not materialized, the block storage will materialize the block, using an older materialization and the necessary transforms.
+```typescript
+for await (const path of users.range({ from: 'u1', to: 'u9' })) {
+  const entry = users.at(path);
+  render(entry);
+}
 
-Block Storage may choose to sweep old revisions and materialized blocks to free up space.  If an older revision is needed, the storage system will attempt to retrieve it from an archive.
+for await (const event of events.select()) {
+  process(event);
+}
+```
 
-## Archival Storage & Block Restoration
+Reads are captured as `ReadDependency` records (`blockId`, `revision`) and verified at commit — this is what makes concurrent modifications safe without locks.
 
-Optimystic's archival storage system, called **Arachnode**, organizes storage nodes into concentric rings, with each ring representing progressively finer partitions of the keyspace. The outermost ring, called Ring Zulu, handles transactions and dynamic ranges based on an overlap factor rather than specific partition boundaries. Any storage nodes in the innermost ring, ring 0, would store the entire keyspace, while nodes in outer rings manage smaller, more specific portions of the keyspace. This design allows nodes to adjust their range responsibility based on storage capacity, dynamically shifting to more granular rings when needed.
+### Sync
 
-### Ring Zulu Implementation
+Local changes are not visible to other peers until they sync. `updateAndSync()` drives the PEND → COMMIT loop, reconciles with any transactions that landed in the meantime, and replays local actions on top if needed.
 
-**Ring Zulu** providing automatic block restoration from cluster peers. When a node is missing a block or specific revision:
+```typescript
+await users.updateAndSync();
+```
 
-1. The block ID is hashed to a content-addressed coordinate
-2. FRET's `assembleCohort()` identifies nearest cluster peers
-3. Peers are queried in order (connected first, closest by distance)
-4. The first peer with the block provides a `BlockArchive` for restoration
-5. If Ring Zulu peers don't have the block, the query falls back to Ring N, etc.
+The full sync lifecycle — block mirroring, when to sync, replay on rejection — is documented in [transactions.md](transactions.md#client-synchronization).
 
-This hierarchical restoration system ensures data availability and resilience while leveraging the existing FRET overlay for peer discovery. The same mechanism used for transaction coordination now enables efficient block recovery.
+### Handle conflicts
 
-Nodes in Arachnode maintain references to neighboring nodes within their ring and across adjacent inner and outer rings to facilitate data propagation and retrieval. As storage capacity reaches its limit, a node moves outward, adjusting its range and offloading excess data to nodes in the inner rings. This self-organizing system balances load across the rings, with global demand monitored through overlap factor sampling. This adaptive structure provides scalable, efficient storage management, with nodes dynamically adjusting their participation in rings to meet the system's overall storage and processing needs.
+When PEND or COMMIT is rejected (stale read, concurrent write), the client re-syncs and replays. By default, conflicting local actions are dropped. To customize, provide `filterConflict` on a custom collection:
 
-For details, see [Arachnode](arachnode.md).
+```typescript
+import { Collection } from '@optimystic/db-core';
 
-## Transaction Client
+const counter = await Collection.createOrOpen(transactor, 'counter', {
+  modules: {
+    increment: async (action, store) => {
+      /* mutate the counter block */
+    },
+  },
+  filterConflict: (local, remote) => {
+    // Sum concurrent increments instead of dropping them
+    const remoteSum = remote.reduce((n, r) => n + r.data.value, 0);
+    return { ...local, data: { ...local.data, value: local.data.value + remoteSum } };
+  },
+});
+```
 
-### Block mirroring
-* The client should read and maintain a synchronized copy of all participant blocks from the repository
-* The first read for any collection should be from the header block, which points to the tail of the logical log, which should be the second read
-* With the LSN and the uncheckpointed transaction IDs in hand, the client can read any other blocks that may be part of the collection
-* All changes to blocks should be tracked locally along with the logical log entries
-* Modifications to blocks should be made into copies, maintaining the original versions
-  
-### Synchronization
+See [`collections.md`](../packages/db-core/docs/collections.md) for the full `CollectionInitOptions` shape.
 
-#### When to sync
-* If much time has passed since the blocks were read, the client should sync before posting pending updates
-* Syncing will also be necessary if the transaction is rejected due to stale data
+## Transactions Across Collections
 
-#### How to sync
-* To sync, the client will:
-  * Load new logical log entries from the tail block
-  * Starting from unmodified cached blocks, play the read logical log entries, capturing physical changes in "unchanged" blocks
-  * Note any conflicts from the loaded logical log entries, from our list - affect our list if necessary
-  * Play our logical log entries, capturing physical changes as changed blocks and transforms
+Single-collection mutations commit via `collection.updateAndSync()`. Atomic changes spanning multiple collections — a row in a main table plus two secondary indexes, or an event log update plus a counter — go through a `TransactionSession`.
 
-![Transaction from sync to disk](figures/transaction-flow.png)
+The session opens against a `TransactionCoordinator` with a chosen execution engine:
 
-## Blocks
+```typescript
+import {
+  TransactionCoordinator,
+  TransactionSession,
+  ActionsEngine,
+} from '@optimystic/db-core';
 
-### Structures
+const coordinator = new TransactionCoordinator(transactor, collectionsById);
+const engine = new ActionsEngine(coordinator);
+const session = await TransactionSession.create(coordinator, engine);
 
-#### Log Block:
-- [**Previous Block ID**]: The ID of the prior block in the chain
-- **Starting Log Sequence Number**: A monotonically increasing number for log entries - the LSN of the first committed entry in the block.
-- **Entries**: list of:
-  - **Transaction ID**: The ID of the transaction
-  - **Operations**: A set of logical operations
+// Apply actions through the engine — each batch updates its collection's local snapshot
+await session.execute('', actionsForTable);
+await session.execute('', actionsForIndex1);
+await session.execute('', actionsForIndex2);
 
-#### Block Repository:
-- **Pending**: list of:
-  - **Transaction ID**: Used to identify the transaction while pending
-  - **Transform**: The set of physical mutations to this block
-  - **Expiration**: A time after which the transaction becomes in-doubt; this block should proactively determine resolution at this point
-- **Revisions**: list of:
-  - **LSN**: The LSN of this version
-  - **Transform**: The set of physical mutations represented by this revision
-  - [**Block**]: Materialized block for this revision - always present for current version
-  - [**Expiration**]: The time after which this revision is eligible for garbage collection - never present for current version
-  - **Conditions**: list of zero or more:
-    - **Block ID**: Other block on which this revision is conditional
-    - [**Signature**]: The signature of the other block - presence indicates that this revision is checkpointed
-- **Aborted Revisions**: list of revisions that have been aborted
+// Single atomic commit — GATHER + PEND + COMMIT across all affected collections
+await session.commit();
+```
 
-- **Commits**: corresponds to committed entries -list of:
-  - **Conditional Collection IDs**: RemainingIDs of collections that are conditionally depended on
+Two engines ship today:
 
-#### Block Transaction:
-- **Block ID**: The ID of the block
-- **Transaction ID**: The ID of the transaction - shared across blocks and collections
-- **Transform**: The set of physical mutations to the block
-- **Expiration**: A time after which the transaction becomes in-doubt; any involved node should proactively determine resolution at this point
+- **`ActionsEngine`** — takes JSON actions directly. Used by native callers and tests.
+- **`QuereusEngine`** — accepts SQL statements; used by the Quereus plugin.
 
-#### Block Repository Interface
+On commit, the coordinator identifies the log-tail cluster for every collection touched and drives one consensus round across them all. Either every collection advances or none do. Full protocol: [transactions.md](transactions.md).
 
+## SQL via Quereus
 
+Register the plugin against a Quereus database, then declare tables backed by Optimystic:
 
-#### Block Network Interface
+```typescript
+import { Database } from '@quereus/quereus';
+import { register } from '@optimystic/quereus-plugin-optimystic';
 
-- `Pend(blockTransaction, failIfPending: boolean): success<pending: blockTransaction[]> | failure<missing: blockTransaction[]>` - posts a pending transaction for the block
-  - Does not update the version of the block, but the transaction is available for explicit reading, and for committing
-  - If the transaction targets the correct version, the call succeeds, unless failIfPending and there are any pending transactions - the caller may choose to wait for pending transactions to clear rather than risk racing with them
-  - If the transaction targets an older version, the call fails, and the caller must resync using the missing transactions
-  
-- `Cancel(id): void` - cancels a pending transaction
-  - If the given transaction ID is pending, it is canceled
+const db = new Database();
+register(db);
 
-- `Commit(id): conditions | failure<missing: blockTransaction[]>`
-  - If the transaction references the current version, the pending transaction is conditionally committed
-    - The returned conditions are those uncommitted inherited from older transaction(s) - if any of those are aborted, this transaction will implicitly be aborted
-    - If the transaction mentions other collections, those are assumed conditions - returned conditions only list inherited conditions
-  - If posting from an old version, unknown transactions are returned in the failure - must resync
+await db.exec(`
+  create table users (
+    id text primary key,
+    name text not null,
+    email text null
+  ) using optimystic('tree://myapp/users', transactor='network', keyNetwork='libp2p');
+`);
 
-- `Abort(id): void` - aborts a conditional committed transaction
-  - Aborts the conditional transaction on all blocks
+await db.exec("insert into users values ('u1', 'Alice', 'alice@example.com')");
+const rows = await db.all("select * from users where id = 'u1'");
+```
 
+Transaction semantics map directly:
 
+```sql
+begin;
+update users set email = 'alice@work.com' where id = 'u1';
+select StampId();  -- stable identifier for this transaction
+commit;            -- syncs all touched collections atomically
+```
 
-#### Block
-- Block header
-- Block body
+Quereus is a distinct SQL engine — columns default to `not null`, tables are always virtual, temporal and JSON are native types, and there are no triggers. See the [plugin README](../packages/quereus-plugin-optimystic/README.md) and Quereus's [SQL Reference §11](https://github.com/nicktobey/quereus/blob/main/docs/sql.md) for the full contrast with SQLite.
 
-#### Transform
-- Set of block inserts, updates, and deletes
+For cryptographic UDFs (`digest`, `sign`, `verify`, `hash_mod`, `random_bytes`), register [`@optimystic/quereus-plugin-crypto`](../packages/quereus-plugin-crypto) alongside.
 
-#### Overall Transaction
--Set of block transforms
+## Custom Collections
 
-The logical structure of a transaction can be represented as follows:
+Build on `Collection` when `Tree` and `Diary` don't fit the access pattern. A custom collection defines:
 
-## Failure handling
+- **Action types** specific to the domain
+- **Action handlers** in `modules` that mutate blocks through the provided `BlockStore`
+- A **`filterConflict`** policy for concurrent updates
+- Optionally, composed data structures (chains, B-trees) via `BlockStore`
 
-#### Failure to propagate
-#### Failure to commit
-#### Failure to prepare
-#### Failure to checkpoint
-#### Effect on successive transactions
+Counters, append-only queues with metadata, specialized indexes, and CRDT-style mergers all fit here. See [`collections.md`](../packages/db-core/docs/collections.md) for the API, [`btree.md`](../packages/db-core/docs/btree.md) and [`chains.md`](../packages/db-core/docs/chains.md) for the primitives.
 
-## Validation
-* Block level validation is based on the distributed storage system; this system assumes a block repository with atomic writes as long as posting from most recent version
-* General pattern is that all transaction phases are dictated by TTLs; if the coordinator/client fails to notify any party by the TTL, the party is to reach out to peers to resolve
-* Each phase requires all parties to acknowledge before moving on
-* TODO: distributed, signature based validation of log tail writes, and general block writes
+## Deployment Targets
 
-## Optimizations
-* Optional Phase 0 - Sync: Read latest LSN and integrate before wasting time posting pending updates
-* Optimization - when posting pending updates, note any unknown block transactions - sync needed
+**Server / desktop (Node.js):** use `@optimystic/db-p2p-storage-fs` for disk persistence. A public-reachable node serves as a bootstrap or gateway by listening on a TCP or WebSocket port.
 
+**Mobile (React Native):** use `@optimystic/db-p2p/rn` and `@optimystic/db-p2p-storage-rn`. Hermes needs polyfills (`crypto`, `structuredClone`, `Promise.withResolvers`, `EventTarget`, …) and Metro aliases for Node built-ins (`os`, `crypto`, `stream`, `buffer`); the [db-p2p README](../packages/db-p2p/readme.md#react-native) has the full checklist. First-launch mobile apps typically start in solo mode and attach on first connectivity.
+
+**Browser:** use WebSockets and circuit-relay transports; browsers cannot accept inbound connections and usually reach the network through a public gateway.
+
+**Test harness:** `TestTransactor` runs everything in-process with no network. For multi-node integration tests, the `MeshHarness` under `packages/db-p2p/src/testing` spins up a configurable in-memory mesh.
+
+## Operational Basics
+
+**Debug logging** is controlled via the `DEBUG` environment variable ([debugging.md](debugging.md) has the full namespace list):
+
+```bash
+DEBUG='optimystic:*'                            node app.js  # everything
+DEBUG='optimystic:db-core:network-transactor'   node app.js  # client-side transactions
+DEBUG='optimystic:db-p2p:cluster*'              node app.js  # consensus
+```
+
+`OPTIMYSTIC_VERBOSE=1` enables batch and peer tracing. Correlation IDs (`trxId`, `actionId`, `messageHash`) tie log entries to specific transactions.
+
+**Development flow.** Start with a solo node + `TestTransactor`, validate the data-structure choices and action handlers, then swap in `NetworkTransactor` and bootstrap peers. The `reference-peer` CLI and `MeshHarness` help exercise multi-node scenarios before real deployment.
+
+## See Also
+
+* [architecture.md](architecture.md) — subsystem map and mental model
+* [transactions.md](transactions.md) — transaction protocol and multi-collection spec
+* [repository.md](repository.md) — block repository operations
+* [right-is-right.md](right-is-right.md) — dispute escalation and reputation
+* [arachnode.md](arachnode.md) — storage ring architecture
+* [correctness.md](correctness.md) — formal safety and liveness properties
+* [internals.md](internals.md) — invariants, mutation contracts, pitfalls
+* [debugging.md](debugging.md) — logging namespaces
+* [db-core README](../packages/db-core/README.md) · [db-p2p README](../packages/db-p2p/readme.md) · [quereus-plugin-optimystic README](../packages/quereus-plugin-optimystic/README.md)

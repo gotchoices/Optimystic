@@ -8,7 +8,7 @@ This document explores an alternative: treating the transaction log itself as a 
 
 The structural shift is modest in code but meaningful in semantics. The current system's cluster-driven sequencing is replaced by *deterministic reconstruction* — every honest node replays the same log in the same order and arrives at the same state, with no single cluster acting as sequencer. The open questions are about where this is a win, where it is a loss, and where it is simply a different point on the CAP surface.
 
-This document assumes familiarity with [optimystic.md](optimystic.md), [transactions.md](transactions.md), and [correctness.md](correctness.md). It is paired with [partition-healing.md](partition-healing.md), which builds on this model to handle partition-induced invariant violations with application-defined rules.
+This document assumes familiarity with [architecture.md](architecture.md), [transactions.md](transactions.md), and [correctness.md](correctness.md). It is paired with [partition-healing.md](partition-healing.md), which builds on this model to handle partition-induced invariant violations with application-defined rules.
 
 ## The Central Insight
 

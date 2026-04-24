@@ -272,8 +272,8 @@ Instrumentation is built on the `debug` library (see [debugging.md](debugging.md
 
 | Document | Focus |
 |----------|-------|
-| [optimystic.md](optimystic.md) | Single-collection and distributed transaction protocol |
-| [transactions.md](transactions.md) | Multi-collection transactions, pluggable engines, stamp/transaction identity |
+| [optimystic.md](optimystic.md) | Application developer's guide — setup, collections, transactions, SQL, deployment |
+| [transactions.md](transactions.md) | Transaction protocol: lifecycle, client sync, multi-collection coordination, pluggable engines |
 | [repository.md](repository.md) | Block repository operations and lifecycle |
 | [right-is-right.md](right-is-right.md) | Validity dispute escalation and reputation |
 | [arachnode.md](arachnode.md) | Concentric ring storage architecture |
@@ -314,3 +314,5 @@ Instrumentation is built on the `debug` library (see [debugging.md](debugging.md
 ## Status & Evolution
 
 Parts of the system — notably cascading dispute escalation with synchronous blocking, client-signed transactions, and full cross-collection transactions — are partially implemented. The target designs are captured in the referenced docs; the implementation tracks toward them. Current behaviour is always the authoritative reference; check the cited source files before assuming a target mechanism is in place.
+
+**Provenance.** The logical-log-plus-blocks transaction model derives from the design of [AliveBase](https://github.com/Digithought)'s transaction system. Optimystic's peer-to-peer substrate, cluster consensus, dispute escalation, and Arachnode ring hierarchy extend that foundation into a decentralized setting.
