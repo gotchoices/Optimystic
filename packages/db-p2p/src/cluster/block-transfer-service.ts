@@ -59,7 +59,7 @@ export class BlockTransferService implements Startable {
 	private readonly registrar: BlockTransferServiceComponents['registrar'];
 
 	constructor(
-		private readonly components: BlockTransferServiceComponents,
+		components: BlockTransferServiceComponents,
 		init: BlockTransferServiceInit = {}
 	) {
 		this.protocol = buildBlockTransferProtocol(init.protocolPrefix ?? '');

@@ -558,7 +558,6 @@ describe('ClusterMember', () => {
 		});
 
 		it('executes pend operations on consensus', async () => {
-			const ourId = selfKeyPair.peerId.toString();
 			const peers = makeClusterPeers([selfKeyPair]);
 
 			const record = await createClusterRecord(

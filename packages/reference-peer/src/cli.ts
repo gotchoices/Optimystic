@@ -7,7 +7,6 @@ import { Diary, NetworkTransactor, BTree, ITransactor, BlockGets, GetBlockResult
 import * as readline from 'readline';
 import * as path from 'path';
 import * as fs from 'fs';
-import { randomBytes } from 'node:crypto';
 
 const logDebug = debug('optimystic:ref-peer');
 
@@ -56,36 +55,6 @@ class PeerSession {
 			throw new Error('--storage-capacity must be a positive number of bytes');
 		}
 		return parsed;
-	}
-
-	private buildArachnodeOptions(storageCapacityBytes?: number) {
-		return {
-			enableRingZulu: true,
-			storage: {
-				totalBytes: storageCapacityBytes
-			}
-		};
-	}
-
-	private async waitForFirstConnection(node: any, timeoutMs: number): Promise<void> {
-		if (node.getConnections().length > 0) return;
-		await new Promise<void>((resolve) => {
-			const onConnect = (_evt: any) => {
-				cleanup();
-				resolve();
-			};
-			const timer = setTimeout(() => {
-				cleanup();
-				resolve();
-			}, timeoutMs);
-			const add = (node.addEventListener ?? node.connectionManager?.addEventListener)?.bind(node.addEventListener ? node : node.connectionManager);
-			const remove = (node.removeEventListener ?? node.connectionManager?.removeEventListener)?.bind(node.removeEventListener ? node : node.connectionManager);
-			const cleanup = () => {
-				clearTimeout(timer);
-				try { remove?.('peer:connect', onConnect as any); } catch { /* ignore */ }
-			};
-			try { add?.('peer:connect', onConnect as any); } catch { /* ignore */ }
-		});
 	}
 
 	private async waitForFretReady(node: any): Promise<void> {
@@ -354,13 +323,6 @@ class PeerSession {
 		// Create key network implementation using libp2p
 		const keyNetwork = new Libp2pKeyPeerNetwork(node);
 
-    // Create peer network implementation
-    const peerNetwork = {
-      async connect(peerId: any, protocol: string, options: any) {
-        return node.dialProtocol(peerId, [protocol], { ...(options ?? {}), runOnLimitedConnection: true, negotiateFully: false });
-      }
-    };
-
 		// Get the coordinated repo that includes cluster consensus
 		const coordinatedRepo = (node as any).coordinatedRepo;
 		if (!coordinatedRepo) {
@@ -518,7 +480,7 @@ class PeerSession {
 	}
 
 	async readDiary(diaryName: string): Promise<void> {
-		const session = this.requireSession();
+		this.requireSession();
 
 		const diary = await this.ensureDiary(diaryName);
 

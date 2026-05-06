@@ -3,7 +3,7 @@ import chaiAsPromised from 'chai-as-promised'
 use(chaiAsPromised)
 import { Collection, type CollectionInitOptions } from '../src/collection/index.js'
 import { TestTransactor } from './test-transactor.js'
-import type { Action, ActionHandler, BlockStore, IBlock, ITransactor, BlockGets, GetBlockResults, ActionBlocks, BlockActionStatus, PendRequest, PendResult, CommitRequest, CommitResult, BlockId } from '../src/index.js'
+import type { Action, ActionHandler, BlockStore, IBlock, ITransactor, BlockGets, GetBlockResults, ActionBlocks, BlockActionStatus, PendRequest, PendResult, CommitRequest, CommitResult } from '../src/index.js'
 
 interface TestAction {
   value: string
@@ -16,13 +16,13 @@ describe('Collection', () => {
 
   // Action handlers for testing
   const handlers: Record<string, ActionHandler<TestAction>> = {
-    'set': async (action, store) => {
+    'set': async (_action, store) => {
       const blockId = store.generateId()
       store.insert({
         header: store.createBlockHeader('TEST', blockId)
       })
     },
-    'update': async (action, store) => {
+    'update': async (_action, _store) => {
       // No-op for testing
     }
   }

@@ -37,8 +37,6 @@ import { PartitionDetector } from './cluster/partition-detector.js';
 import { PeerReputationService } from './reputation/peer-reputation.js';
 import { DisputeService } from './dispute/dispute-service.js';
 import { DisputeClient } from './dispute/client.js';
-import { disputeProtocolService } from './dispute/service.js';
-import { selectArbitrators } from './dispute/arbitrator-selection.js';
 import type { DisputeConfig } from './dispute/types.js';
 
 type Libp2pInit = NonNullable<Parameters<typeof createLibp2p>[0]>;
@@ -331,7 +329,19 @@ export async function createLibp2pNodeBase(
 	);
 
 	// Create callback for querying cluster peers for their latest block revision
-	const clusterLatestCallback: ClusterLatestCallback = async (peerId, blockId, _context?) => {
+	const clusterLatestCallback: ClusterLatestCallback = async (peerId, blockId, context?) => {
+		// Self-read short-circuit: dialling self via SyncClient is a round trip
+		// with no remote on the other end, and on nodes without listen addresses
+		// (solo WebSocket-only, bare-RN, etc.) the self-dial can hang the dial
+		// queue. Read directly from the local storage repo instead.
+		if (peerId.equals(node.peerId)) {
+			try {
+				const result = await storageRepo.get({ blockIds: [blockId], context });
+				return result[blockId]?.state?.latest;
+			} catch {
+				return undefined;
+			}
+		}
 		const syncClient = new SyncClient(peerId, keyNetwork, protocolPrefix);
 		try {
 			const response = await syncClient.requestBlock({ blockId, rev: undefined });

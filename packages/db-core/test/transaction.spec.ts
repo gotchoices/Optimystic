@@ -12,7 +12,6 @@ import {
 	TransactionValidator,
 	Tree,
 	type Transaction,
-	type TransactionStamp,
 	type CollectionActions,
 	type EngineRegistration,
 	type ValidationCoordinatorFactory,
@@ -21,9 +20,7 @@ import {
 	type ActionId,
 	type BlockId,
 	type IBlock,
-	type BlockActionState,
 } from '../src/index.js';
-import { isTransformsEmpty, blockIdsForTransforms } from '../src/transform/index.js';
 import { TestTransactor } from './test-transactor.js';
 
 describe('Transaction', () => {
@@ -2196,12 +2193,6 @@ describe('Transaction', () => {
 				tailId: blockA,
 				rev: 1,
 			});
-
-			// Simulate read dependencies: tx-a reads both blocks at rev 1
-			const txAReads = [
-				{ blockId: blockA, revision: 1 },
-				{ blockId: blockB, revision: 1 },
-			];
 
 			// Simulate read dependencies: tx-b reads both blocks at rev 1
 			const txBReads = [

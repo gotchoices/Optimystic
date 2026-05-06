@@ -1,4 +1,4 @@
-import type { CollectionId, ActionId } from "../index.js";
+import type { CollectionId } from "../index.js";
 import type { TransactionCoordinator } from "./coordinator.js";
 import type { ReadDependency, ExecutionResult } from "./transaction.js";
 import type { Action } from "../collection/action.js";

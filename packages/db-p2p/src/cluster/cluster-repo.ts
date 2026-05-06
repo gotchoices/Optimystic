@@ -96,7 +96,7 @@ export class ClusterMember implements ICluster {
 		private readonly peerId: PeerId,
 		private readonly privateKey: PrivateKey,
 		private readonly protocolPrefix?: string,
-		private readonly partitionDetector?: PartitionDetector,
+		_partitionDetector?: PartitionDetector,
 		private readonly fretService?: FretService,
 		private readonly validator?: ITransactionValidator,
 		private readonly reputation?: IPeerReputation,
@@ -713,7 +713,7 @@ export class ClusterMember implements ICluster {
 		}
 	}
 
-	private async handleRejection(record: ClusterRecord): Promise<void> {
+	private async handleRejection(_record: ClusterRecord): Promise<void> {
 		// Clean up any resources - will be cleared by shouldPersist = false in the main flow
 	}
 
@@ -873,7 +873,7 @@ export class ClusterMember implements ICluster {
 
 	private async propagateIfNeeded(record: ClusterRecord): Promise<void> {
 		const promises = [];
-		for (const [peerId, peer] of Object.entries(record.peers)) {
+		for (const peerId of Object.keys(record.peers)) {
 			if (peerId === this.peerId.toString()) continue;
 
 			try {

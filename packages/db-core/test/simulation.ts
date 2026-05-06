@@ -1,7 +1,7 @@
 import { sha256 } from 'multiformats/hashes/sha2'
 import { createEd25519PeerId } from '@libp2p/peer-id-factory';
 import { TestTransactor } from './test-transactor.js';
-import type { AbortOptions, ClusterPeers, FindCoordinatorOptions, IKeyNetwork, PeerId, Stream } from '../src/index.js';
+import type { ClusterPeers, FindCoordinatorOptions, IKeyNetwork, PeerId } from '../src/index.js';
 
 export type Scenario = {
 	nodeCount: number;
@@ -73,7 +73,7 @@ export class NetworkSimulation implements IKeyNetwork {
 		return new NetworkSimulation(nodes, { clusterSize: scenario.clusterSize });
 	}
 
-	async findCoordinator<T>(key: Uint8Array, options?: Partial<FindCoordinatorOptions>): Promise<PeerId> {
+	async findCoordinator(key: Uint8Array, options?: Partial<FindCoordinatorOptions>): Promise<PeerId> {
 		// Get the closest nodes to the key
 		const closestNodes = this.findClosestNodes(key, options?.excludedPeers);
 

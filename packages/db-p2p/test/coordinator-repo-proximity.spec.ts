@@ -340,7 +340,6 @@ describe('CoordinatorRepo proximity verification', () => {
 	describe('pend block id extraction (regression for Object.keys(transforms) bug)', () => {
 		it('uses actual block ids from transforms, not the literal keys "inserts"/"updates"/"deletes"', async () => {
 			const localPeer = await makePeerId();
-			const cluster = makeClusterPeers([localPeer]); // solo → fast path
 			const insertedBlockId = 'inserted-block';
 			const updatedBlockId = 'updated-block';
 			const deletedBlockId = 'deleted-block';

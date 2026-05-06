@@ -1,6 +1,6 @@
 import { expect } from 'chai';
 import type { IRepo, BlockGets, GetBlockResults, PendRequest, PendResult, CommitRequest, CommitResult, ActionBlocks, IBlock, BlockId, BlockHeader, IPeerNetwork } from '@optimystic/db-core';
-import type { PeerId, Stream } from '@libp2p/interface';
+import type { PeerId } from '@libp2p/interface';
 import { generateKeyPair } from '@libp2p/crypto/keys';
 import { peerIdFromPrivateKey } from '@libp2p/peer-id';
 import { PartitionDetector } from '../src/cluster/partition-detector.js';
@@ -32,10 +32,10 @@ class MockRepo implements IRepo {
 		}
 		return result;
 	}
-	async pend(request: PendRequest): Promise<PendResult> {
+	async pend(_request: PendRequest): Promise<PendResult> {
 		return { success: true, blockIds: [], pending: [] };
 	}
-	async commit(request: CommitRequest): Promise<CommitResult> {
+	async commit(_request: CommitRequest): Promise<CommitResult> {
 		return { success: true };
 	}
 	async cancel(_actionRef: ActionBlocks): Promise<void> {}
@@ -78,7 +78,7 @@ function createMockStream(response: BlockTransferResponse): any {
 	const responseBytes = new TextEncoder().encode(JSON.stringify(response));
 	let sent = false;
 	return {
-		send(chunk: any) { /* no-op in test */ },
+		send(_chunk: any) { /* no-op in test */ },
 		close: async () => {},
 		[Symbol.asyncIterator]: async function* () {
 			if (!sent) {

@@ -16,7 +16,7 @@ describe('Transform functionality', () => {
 
   beforeEach(() => {
     mockSource = {
-      tryGet: async (id: BlockId) => testBlock,
+      tryGet: async (_id: BlockId) => testBlock,
       generateId: () => 'test-id' as BlockId,
       createBlockHeader: (type: BlockType) => ({ id: 'test-id', type })
     }

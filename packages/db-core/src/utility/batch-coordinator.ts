@@ -95,7 +95,7 @@ export function* allBatches<TPayload, TResponse>(batches: CoordinatorBatch<TPayl
 /**
  * Returns a new blockId list payload with the given block id appended
  */
-export function mergeBlocks(payload: BlockId[], blockId: BlockId, mergeWithPayload: BlockId[] | undefined): BlockId[] {
+export function mergeBlocks(_payload: BlockId[], blockId: BlockId, mergeWithPayload: BlockId[] | undefined): BlockId[] {
 	return [...(mergeWithPayload ?? []), blockId];
 }
 

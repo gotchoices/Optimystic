@@ -427,7 +427,7 @@ export class NetworkTransactor implements ITransactor {
 			!(request.headerId && bid === request.headerId && !request.blockIds.includes(request.headerId))
 		);
 		if (remainingBlocks.length > 0) {
-			const { batches, error } = await this.commitBlocks({ blockIds: remainingBlocks, actionId: request.actionId, rev: request.rev });
+			const { error } = await this.commitBlocks({ blockIds: remainingBlocks, actionId: request.actionId, rev: request.rev });
 			if (error) {
 				// Non-tail block commit failures should not fail the overall action once the tail has committed.
 				// Proceed and rely on reconciliation paths (e.g. reads with context) to finalize state on lagging peers.
@@ -531,7 +531,7 @@ export class NetworkTransactor implements ITransactor {
 
 	private formatBatchStatuses<TPayload, TResponse>(
 		batches: CoordinatorBatch<TPayload, TResponse>[],
-		isSuccess: (b: CoordinatorBatch<TPayload, TResponse>) => boolean,
+		_isSuccess: (b: CoordinatorBatch<TPayload, TResponse>) => boolean,
 		formatter: (b: CoordinatorBatch<TPayload, TResponse>) => string
 	): string {
 		const incompletes = Array.from(incompleteBatches(batches))

@@ -1,5 +1,5 @@
 import { expect } from 'chai';
-import { Tree, type ITransactor, type BlockId, type ActionId, type IBlock, type BlockHeader, type Transforms, type PendRequest, type CommitRequest, type Transform, type ActionRev } from '@optimystic/db-core';
+import { Tree, type ITransactor, type BlockId, type ActionId, type IBlock, type BlockHeader, type Transforms, type PendRequest, type CommitRequest, type Transform } from '@optimystic/db-core';
 import { createMesh, buildNetworkTransactor, type Mesh, type MeshOptions } from '../src/testing/mesh-harness.js';
 import { MemoryRawStorage } from '../src/storage/memory-storage.js';
 import type { IRawStorage } from '../src/storage/i-raw-storage.js';

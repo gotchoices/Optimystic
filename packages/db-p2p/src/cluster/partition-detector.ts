@@ -82,8 +82,6 @@ export class PartitionDetector {
 	 * Returns true if sudden mass unreachability or rapid goodbye rate
 	 */
 	detectPartition(): boolean {
-		const now = Date.now();
-
 		// Count recent goodbyes
 		const recentGoodbyes = this.getRecentGoodbyes(this.rapidChurnWindow);
 

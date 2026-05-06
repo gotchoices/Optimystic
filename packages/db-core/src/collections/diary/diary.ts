@@ -11,7 +11,7 @@ export class Diary<TEntry> {
     static async create<TEntry>(network: ITransactor, id: CollectionId): Promise<Diary<TEntry>> {
         const init: CollectionInitOptions<TEntry> = {
             modules: {
-							"append": async (action, trx) => {
+							"append": async (_action, _trx) => {
 								// Append-only diary doesn't need to modify any blocks
 								// All entries are stored in the log
 							}

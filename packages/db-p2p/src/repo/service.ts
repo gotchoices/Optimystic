@@ -63,7 +63,6 @@ export class RepoService implements Startable {
 	private readonly repo: IRepo
 	private readonly components: RepoServiceComponents
 	private running: boolean
-	private readonly k: number
 	/** Responsibility K - how many peers are responsible for a key (for redirect decisions) */
 	private readonly responsibilityK: number
 
@@ -76,7 +75,6 @@ export class RepoService implements Startable {
 		this.log = components.logger.forComponent(init.logPrefix ?? 'db-p2p:repo-service')
 		this.repo = components.repo
 		this.running = false
-		this.k = init.kBucketSize ?? 10
 		this.responsibilityK = init.responsibilityK ?? 1
 	}
 

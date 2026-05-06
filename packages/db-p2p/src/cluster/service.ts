@@ -52,12 +52,6 @@ export class ClusterService implements Startable {
 	private readonly cluster: ICluster;
 	private readonly components: ClusterServiceComponents;
 	private running: boolean;
-	private readonly k: number;
-	private readonly configuredClusterSize: number;
-	private readonly allowDownsize: boolean;
-	private readonly sizeTolerance: number;
-	/** Responsibility K - how many peers are responsible for a key (for redirect decisions) */
-	private readonly responsibilityK: number;
 
 	constructor(components: ClusterServiceComponents, init: ClusterServiceInit = {}) {
 		this.components = components;
@@ -67,11 +61,6 @@ export class ClusterService implements Startable {
 		this.log = components.logger.forComponent(init.logPrefix ?? 'db-p2p:cluster');
 		this.cluster = components.cluster;
 		this.running = false;
-		this.k = init.kBucketSize ?? 10;
-		this.configuredClusterSize = init.configuredClusterSize ?? 10;
-		this.allowDownsize = init.allowClusterDownsize ?? true;
-		this.sizeTolerance = init.clusterSizeTolerance ?? 0.5;
-		this.responsibilityK = init.responsibilityK ?? 1;
 	}
 
 	readonly [Symbol.toStringTag] = '@libp2p/cluster';
@@ -110,8 +99,6 @@ export class ClusterService implements Startable {
 				// Process the operation
 				let response: any;
 					if (message.operation === 'update') {
-          // Use message.record.message as key source; this is RepoMessage carrying block IDs
-          const tailId = (message.record?.message as any)?.commit?.tailId ?? (message.record?.message as any)?.pend ? Object.keys((message.record as any).message.pend.transforms)[0] : undefined
           // TEMPORARY: Disable cluster membership check to fix empty promises issue
           // The membership check was causing peers to return redirect responses
           // instead of processing cluster updates, leading to empty promise arrays.

@@ -1,7 +1,6 @@
 import type {
 	IRepo, MessageOptions, BlockId, CommitRequest, CommitResult, GetBlockResults, PendRequest, PendResult, ActionBlocks,
 	ActionId, BlockGets, ActionPending, PendSuccess, ActionTransform, ActionTransforms,
-	Transforms,
 	GetBlockResult,
 	PendValidationHook
 } from "@optimystic/db-core";
@@ -30,7 +29,7 @@ export class StorageRepo implements IRepo {
 		this.validatePend = options?.validatePend;
 	}
 
-	async get({ blockIds, context }: BlockGets, options?: MessageOptions): Promise<GetBlockResults> {
+	async get({ blockIds, context }: BlockGets, _options?: MessageOptions): Promise<GetBlockResults> {
 		const distinctBlockIds = Array.from(new Set(blockIds));
 		log('get blockIds=%d', distinctBlockIds.length);
 		const results = await Promise.all(distinctBlockIds.map(async (blockId) => {
@@ -191,7 +190,7 @@ export class StorageRepo implements IRepo {
 		}));
 	}
 
-	async commit(request: CommitRequest, options?: MessageOptions): Promise<CommitResult> {
+	async commit(request: CommitRequest, _options?: MessageOptions): Promise<CommitResult> {
 		log('commit actionId=%s rev=%d blockIds=%d', request.actionId, request.rev, request.blockIds.length);
 		const uniqueBlockIds = Array.from(new Set(request.blockIds)).sort();
 		const releases: (() => void)[] = [];

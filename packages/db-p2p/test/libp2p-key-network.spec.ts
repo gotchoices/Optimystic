@@ -7,11 +7,9 @@ import {
 	Libp2pKeyPeerNetwork,
 	FindCoordinatorError,
 	FIND_COORDINATOR_ERROR_CODES,
-	type NetworkMode,
 	type NetworkStatePersistence,
 	type PersistedNetworkState,
-	type SelfCoordinationConfig,
-	type SelfCoordinationDecision
+	type SelfCoordinationConfig
 } from '../src/libp2p-key-network.js';
 
 const makePeerId = async (): Promise<PeerId> => {

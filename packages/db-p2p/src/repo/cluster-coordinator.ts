@@ -1,5 +1,5 @@
 import { peerIdFromString } from "@libp2p/peer-id";
-import type { ClusterRecord, IKeyNetwork, RepoMessage, BlockId, ClusterPeers, MessageOptions, Signature, ClusterConsensusConfig } from "@optimystic/db-core";
+import type { ClusterRecord, IKeyNetwork, RepoMessage, BlockId, ClusterPeers, MessageOptions, ClusterConsensusConfig } from "@optimystic/db-core";
 import { base58btc } from "multiformats/bases/base58";
 import { sha256 } from "multiformats/hashes/sha2";
 import { ClusterClient } from "../cluster/client.js";
@@ -123,7 +123,7 @@ export class ClusterCoordinator {
 	 * Initiates a 2-phase transaction for a specific block ID.
 	 * Returns the cluster record and whether the local cluster already executed the operations.
 	 */
-	async executeClusterTransaction(blockId: BlockId, message: RepoMessage, options?: MessageOptions): Promise<{
+	async executeClusterTransaction(blockId: BlockId, message: RepoMessage, _options?: MessageOptions): Promise<{
 		record: ClusterRecord;
 		localExecuted: boolean;
 	}> {
@@ -298,7 +298,7 @@ export class ClusterCoordinator {
 	 * Validate that a small cluster size is legitimate by querying remote peers
 	 * for their network size estimates. Returns true if estimates roughly agree.
 	 */
-	private async validateSmallCluster(localSize: number, peers: ClusterPeers): Promise<boolean> {
+	private async validateSmallCluster(localSize: number, _peers: ClusterPeers): Promise<boolean> {
 		// If we have FRET and it shows confident estimate
 		if (this.fretService) {
 			try {
@@ -581,7 +581,7 @@ export class ClusterCoordinator {
 		});
 	}
 
-	private scheduleCommitRetry(messageHash: string, record: ClusterRecord, missingPeers: string[]): void {
+	private scheduleCommitRetry(messageHash: string, _record: ClusterRecord, missingPeers: string[]): void {
 		const state = this.transactions.get(messageHash);
 		if (!state) {
 			return;

@@ -89,7 +89,7 @@ export class IndexManager {
 	async insertIndexEntries(
 		row: Row,
 		primaryKey: PrimaryKey,
-		transactor?: ITransactor
+		_transactor?: ITransactor
 	): Promise<void> {
 		for (const index of this.schema.indexes) {
 			const indexKey = this.createIndexKey(index, row);
@@ -112,7 +112,7 @@ export class IndexManager {
 	async deleteIndexEntries(
 		row: Row,
 		primaryKey: PrimaryKey,
-		transactor?: ITransactor
+		_transactor?: ITransactor
 	): Promise<void> {
 		for (const index of this.schema.indexes) {
 			const indexKey = this.createIndexKey(index, row);
@@ -135,7 +135,7 @@ export class IndexManager {
 		newRow: Row,
 		oldPrimaryKey: PrimaryKey,
 		newPrimaryKey: PrimaryKey,
-		transactor?: ITransactor
+		_transactor?: ITransactor
 	): Promise<void> {
 		// For each index, check if the indexed columns changed
 		for (const index of this.schema.indexes) {

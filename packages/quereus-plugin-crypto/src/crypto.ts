@@ -7,7 +7,7 @@
 
 import { sha256, sha512 } from '@noble/hashes/sha2.js';
 import { blake3 } from '@noble/hashes/blake3.js';
-import { concatBytes, randomBytes as nobleRandomBytes, utf8ToBytes } from '@noble/hashes/utils.js';
+import { randomBytes as nobleRandomBytes, utf8ToBytes } from '@noble/hashes/utils.js';
 import { secp256k1 } from '@noble/curves/secp256k1.js';
 import { p256 } from '@noble/curves/nist.js';
 import { ed25519 } from '@noble/curves/ed25519.js';

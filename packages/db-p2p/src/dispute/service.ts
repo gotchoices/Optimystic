@@ -2,7 +2,7 @@ import { pipe } from 'it-pipe';
 import { decode as lpDecode, encode as lpEncode } from 'it-length-prefixed';
 import type { Startable, Logger, Stream, Connection, StreamHandler } from '@libp2p/interface';
 import type { Uint8ArrayList } from 'uint8arraylist';
-import type { DisputeMessage, ArbitrationVote, DisputeResolution } from './types.js';
+import type { DisputeMessage } from './types.js';
 import type { DisputeService } from './dispute-service.js';
 
 interface BaseComponents {

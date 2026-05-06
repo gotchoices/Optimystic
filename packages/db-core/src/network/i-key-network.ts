@@ -13,7 +13,7 @@ export type IKeyNetwork = {
 	 * @param key The key to find coordinator for
 	 * @returns Promise resolving to ID of coordinator node
 	 */
-	findCoordinator<T>(key: Uint8Array, options?: Partial<FindCoordinatorOptions>): Promise<PeerId>;
+	findCoordinator(key: Uint8Array, options?: Partial<FindCoordinatorOptions>): Promise<PeerId>;
 
 	/**
 	 * Find the peers in the cluster responsible for a given key

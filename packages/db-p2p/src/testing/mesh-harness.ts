@@ -62,7 +62,7 @@ class MockMeshKeyNetwork implements IKeyNetwork {
 		private readonly failures: MeshFailureConfig = {}
 	) {}
 
-	async findCoordinator<T>(key: Uint8Array, options?: Partial<FindCoordinatorOptions>): Promise<PeerId> {
+	async findCoordinator(key: Uint8Array, options?: Partial<FindCoordinatorOptions>): Promise<PeerId> {
 		const excluded = new Set((options?.excludedPeers ?? []).map(p => p.toString()));
 		const sorted = this.sortedByDistance(key);
 		const pick = sorted.find(n => !excluded.has(n.peerId.toString()));

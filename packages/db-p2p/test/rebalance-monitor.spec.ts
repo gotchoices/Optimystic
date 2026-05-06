@@ -44,7 +44,6 @@ class MockLibp2p {
 
 class MockFret {
 	private cohortResults = new Map<string, string[]>();
-	private metadata: Record<string, any> = {};
 	private peerMetadata = new Map<string, Record<string, any>>();
 	assembleCohortCalls: Array<{ coord: Uint8Array; wants: number }> = [];
 
@@ -71,7 +70,7 @@ class MockFret {
 	expandCohort(): string[] { return []; }
 	async routeAct(): Promise<any> { return { v: 1, anchors: [], cohort_hint: [], estimated_cluster_size: 0, confidence: 0 }; }
 	report(): void {}
-	setMetadata(md: Record<string, any>): void { this.metadata = md; }
+	setMetadata(_md: Record<string, any>): void { /* no-op in test */ }
 	getMetadata(peerId: string): Record<string, any> | undefined { return this.peerMetadata.get(peerId); }
 	listPeers(): Array<{ id: string; metadata?: Record<string, any> }> { return []; }
 	reportNetworkSize(): void {}
@@ -80,14 +79,6 @@ class MockFret {
 	detectPartition(): boolean { return false; }
 	exportTable(): any { return { entries: [] }; }
 	importTable(): number { return 0; }
-}
-
-function makeArachnodeInfo(status: ArachnodeInfo['status'] = 'active'): ArachnodeInfo {
-	return {
-		ringDepth: 0,
-		capacity: { total: 1000, used: 100, available: 900 },
-		status
-	};
 }
 
 // --- Tests ---

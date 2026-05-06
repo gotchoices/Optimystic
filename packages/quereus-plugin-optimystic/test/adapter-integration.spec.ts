@@ -795,7 +795,7 @@ describe('Plugin Registration & Lifecycle (TEST-7.3.1)', () => {
 	});
 
 	it('should support DROP TABLE and re-CREATE with different schema', async () => {
-		const { db, plugin } = createTestEnv();
+		const { db } = createTestEnv();
 
 		await db.exec(`
 			CREATE TABLE ephemeral (

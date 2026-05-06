@@ -11,7 +11,7 @@
  */
 
 import { expect } from 'chai';
-import { ClusterMember, clusterMember } from '../src/cluster/cluster-repo.js';
+import { clusterMember } from '../src/cluster/cluster-repo.js';
 import type { IRepo, ClusterRecord, RepoMessage, Signature, BlockGets, GetBlockResults, PendRequest, PendResult, CommitRequest, CommitResult, ActionBlocks, ClusterPeers, Transforms, IBlock, BlockId, BlockHeader, ClusterConsensusConfig } from '@optimystic/db-core';
 import type { IPeerNetwork } from '@optimystic/db-core';
 import type { PeerId, PrivateKey } from '@libp2p/interface';
@@ -19,10 +19,10 @@ import { peerIdFromPrivateKey } from '@libp2p/peer-id';
 import { generateKeyPair } from '@libp2p/crypto/keys';
 import { sha256 } from 'multiformats/hashes/sha2';
 import { base58btc } from 'multiformats/bases/base58';
-import { toString as uint8ArrayToString, fromString as uint8ArrayFromString } from 'uint8arrays';
+import { toString as uint8ArrayToString } from 'uint8arrays';
 import { PeerReputationService } from '../src/reputation/peer-reputation.js';
 import { PenaltyReason } from '../src/reputation/types.js';
-import { createMesh, type Mesh } from '../src/testing/mesh-harness.js';
+import { createMesh } from '../src/testing/mesh-harness.js';
 
 // ─── Canonical JSON for deterministic hashing ───
 
@@ -108,15 +108,6 @@ const makeClusterPeers = (keyPairs: KeyPair[]): ClusterPeers => {
 const makeGetOperation = (blockIds: string[]): RepoMessage['operations'] => [
 	{ get: { blockIds } }
 ];
-
-const makePendOperation = (actionId: string, blockId: string): RepoMessage['operations'] => {
-	const transforms: Transforms = {
-		inserts: { [blockId]: makeBlock(blockId) },
-		updates: {},
-		deletes: []
-	};
-	return [{ pend: { actionId, transforms, policy: 'c' } }];
-};
 
 class MockRepo implements IRepo {
 	getCalls: BlockGets[] = [];
@@ -368,7 +359,7 @@ describe('Byzantine Fault Injection (TEST-10.4.1)', () => {
 				...record,
 				promises: { [byzantineId]: approvePromise }
 			};
-			const result1 = await member.update(withApprove);
+			await member.update(withApprove);
 
 			// Second: Byzantine tries to change their promise to reject
 			const rejectPromise = await makeSignedPromise(byzantine.privateKey, record, 'reject', 'changed-mind');
@@ -591,17 +582,8 @@ describe('Byzantine Fault Injection (TEST-10.4.1)', () => {
 
 		it('disputed record is marked when minority rejects but super-majority approves', async () => {
 			const allPeers = await Promise.all(Array.from({ length: 5 }, () => makeKeyPair()));
-			const selfKeyPair = allPeers[0]!;
 			const peers = makeClusterPeers(allPeers);
 			const byzantineId = allPeers[4]!.peerId.toString();
-
-			const member = clusterMember({
-				storageRepo: mockRepo,
-				peerNetwork: mockNetwork,
-				peerId: selfKeyPair.peerId,
-				privateKey: selfKeyPair.privateKey,
-				consensusConfig: thresholdConfig
-			});
 
 			const record = await createClusterRecord(peers, makeGetOperation(['block-1']));
 

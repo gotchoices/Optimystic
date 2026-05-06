@@ -1,6 +1,6 @@
 import { expect } from 'chai';
 import { TestTransactor } from '@optimystic/db-core/test';
-import { MessageApp, type Message } from '../src/index.js';
+import { MessageApp } from '../src/index.js';
 
 describe('MessageApp', () => {
 	let transactor: TestTransactor;

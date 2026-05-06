@@ -4,7 +4,7 @@ import { NetworkSimulation } from './simulation.js'
 import type { Scenario } from './simulation.js'
 import { randomBytes } from '@libp2p/crypto'
 import { blockIdToBytes } from '../src/utility/block-id-to-bytes.js'
-import type { BlockId, PendRequest, ActionId, BlockOperation, ClusterPeers, FindCoordinatorOptions, IKeyNetwork } from '../src/index.js'
+import type { BlockId, PendRequest, BlockOperation, ClusterPeers, FindCoordinatorOptions, IKeyNetwork } from '../src/index.js'
 import type { PeerId } from '../src/index.js'
 import { peerIdFromString } from '../src/network/types.js'
 import { toString as uint8ArrayToString } from 'uint8arrays/to-string'
@@ -249,7 +249,7 @@ describe('NetworkTransactor', () => {
   // Test network partition scenarios
   describe('network partitions', () => {
     it('should handle network partitions gracefully', async () => {
-      const { network, networkTransactor } = await setupNetworkTest({ nodeCount: 10, clusterSize: 1 })
+      const { network } = await setupNetworkTest({ nodeCount: 10, clusterSize: 1 })
 
       // Create a partition by making half the nodes only aware of themselves
       const halfNodes = network.nodes.slice(0, 5)

@@ -169,7 +169,7 @@ export class NetworkManagerService implements Startable {
 			throw new Error('FRET service not available for seeding keys');
 		}
 		const coord = await hashKey(key);
-		const _neighbors = fret.getNeighbors(coord, 'both', 1);
+		fret.getNeighbors(coord, 'both', 1);
 	}
 
 	private toCacheKey(key: Uint8Array): string {

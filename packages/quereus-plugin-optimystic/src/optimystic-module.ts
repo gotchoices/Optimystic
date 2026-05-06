@@ -35,8 +35,6 @@ export interface OptimysticModuleConfig extends BaseModuleConfig {
   encoding?: 'json' | 'msgpack';
 }
 
-let instanceCounter = 0;
-
 /**
  * Helper function to convert SqlDataType affinity to LogicalType
  */
@@ -65,7 +63,6 @@ function affinityToLogicalType(affinity: SqlDataType): LogicalType {
  * Production-grade virtual table for Optimystic tree collections
  */
 export class OptimysticVirtualTable extends VirtualTable {
-  private instanceId = ++instanceCounter;
   private collection?: Tree<string, any>;
   private isInitialized = false;
   private initializationPromise?: Promise<void>;
@@ -724,18 +721,12 @@ export class OptimysticVirtualTable extends VirtualTable {
  * Optimystic Virtual Table Module
  */
 export class OptimysticModule implements VirtualTableModule<OptimysticVirtualTable, OptimysticModuleConfig> {
-  private schemaManager: SchemaManager;
   private tables = new Map<string, OptimysticVirtualTable>();
 
   constructor(
     private collectionFactory: CollectionFactory,
     private txnBridge: TransactionBridge
-  ) {
-    // Schema manager will be created per-table with appropriate transactor settings
-    this.schemaManager = new SchemaManager(async (_transactor) => {
-      throw new Error('Schema manager not initialized - this should not be called');
-    });
-  }
+  ) {}
 
   /**
    * Create a schema manager for a specific table's transactor configuration
@@ -838,7 +829,7 @@ export class OptimysticModule implements VirtualTableModule<OptimysticVirtualTab
    * Connects to an existing virtual table definition
    */
   async connect(
-    db: Database,
+    _db: Database,
     _pAux: unknown,
     _moduleName: string,
     schemaName: string,

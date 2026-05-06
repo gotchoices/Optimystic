@@ -149,7 +149,7 @@ export class StatisticsCollector {
 	 * Update statistics based on actual data (called periodically)
 	 * This is a simplified version - a real implementation would sample the data
 	 */
-	async updateStatistics(sampleSize = 1000): Promise<void> {
+	async updateStatistics(_sampleSize = 1000): Promise<void> {
 		// TODO: Implement actual statistics collection by sampling the table
 		// For now, we just update the timestamp
 		this.stats.lastUpdated = Date.now();

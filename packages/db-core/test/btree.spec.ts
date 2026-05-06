@@ -2,7 +2,6 @@ import { use, expect } from 'chai'
 import chaiAsPromised from 'chai-as-promised'
 use(chaiAsPromised)
 import { BTree } from '../src/btree/index.js'
-import { type IBlock } from '../src/index.js'
 import { createActor } from '../src/utility/actor.js'
 import { TestBlockStore } from './test-block-store.js'
 

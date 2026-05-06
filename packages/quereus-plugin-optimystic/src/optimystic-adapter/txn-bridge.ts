@@ -1,9 +1,8 @@
-import type { ITransactor, TransactionCoordinator, ITransactionEngine } from '@optimystic/db-core';
+import type { TransactionCoordinator, ITransactionEngine } from '@optimystic/db-core';
 import { TransactionSession } from '@optimystic/db-core';
 import type { TransactionState, ParsedOptimysticOptions } from '../types.js';
 import { CollectionFactory } from './collection-factory.js';
 import { generateStampId } from '../util/generate-stamp-id.js';
-import { QUEREUS_ENGINE_ID } from '../transaction/quereus-engine.js';
 
 /**
  * Transaction bridge between Quereus and Optimystic.
@@ -240,7 +239,7 @@ export class TransactionBridge {
   /**
    * Savepoint support (if needed by Quereus)
    */
-  async savepoint(name: string): Promise<void> {
+  async savepoint(_name: string): Promise<void> {
     // Optimystic doesn't have explicit savepoint support
     // This would need to be implemented using collection snapshots
     throw new Error('Savepoints not yet implemented');
@@ -249,14 +248,14 @@ export class TransactionBridge {
   /**
    * Release savepoint
    */
-  async releaseSavepoint(name: string): Promise<void> {
+  async releaseSavepoint(_name: string): Promise<void> {
     throw new Error('Savepoints not yet implemented');
   }
 
   /**
    * Rollback to savepoint
    */
-  async rollbackToSavepoint(name: string): Promise<void> {
+  async rollbackToSavepoint(_name: string): Promise<void> {
     throw new Error('Savepoints not yet implemented');
   }
 

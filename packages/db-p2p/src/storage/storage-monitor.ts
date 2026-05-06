@@ -18,7 +18,7 @@ export interface StorageMonitorConfig {
  */
 export class StorageMonitor {
 	constructor(
-		private readonly storage: IRawStorage,
+		_storage: IRawStorage,
 		private readonly config: StorageMonitorConfig = {}
 	) {}
 

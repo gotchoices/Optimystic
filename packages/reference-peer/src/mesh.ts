@@ -20,7 +20,7 @@ async function waitForFile(file: string, timeoutMs: number) {
   throw new Error(`Timeout waiting for ${file}`)
 }
 
-function startNode({ port, bootstrap, announceFile, extraArgs = [] as string[] }: { port: number, bootstrap?: string, announceFile?: string, extraArgs?: string[] }) {
+function startNode({ port, bootstrap, announceFile, extraArgs: _extraArgs = [] as string[] }: { port: number, bootstrap?: string, announceFile?: string, extraArgs?: string[] }) {
   const args = [
     'packages/reference-peer/dist/src/cli.js',
     'service',

@@ -9,8 +9,6 @@ import type { Database } from '@quereus/quereus';
 import type {
 	TransactionCoordinator,
 	ITransactionValidator,
-	Transforms,
-	CollectionId,
 	CollectionActions,
 	BlockStateProvider,
 } from '@optimystic/db-core';

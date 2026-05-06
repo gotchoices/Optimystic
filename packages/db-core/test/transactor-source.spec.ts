@@ -5,7 +5,7 @@ import { TransactorSource } from '../src/transactor/transactor-source.js'
 import { TestTransactor } from './test-transactor.js'
 import { randomBytes } from '@libp2p/crypto'
 import { toString as uint8ArrayToString } from 'uint8arrays/to-string'
-import type { IBlock, ActionId, ActionContext, Transforms, BlockOperation, CommitRequest, PendRequest, PendResult, CommitResult } from '../src/index.js'
+import type { IBlock, ActionId, ActionContext, Transforms, BlockOperation, CommitRequest, CommitResult } from '../src/index.js'
 
 describe('TransactorSource', () => {
 	type TestBlock = IBlock & { test: string[] }

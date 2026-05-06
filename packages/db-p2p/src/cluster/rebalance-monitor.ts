@@ -1,4 +1,4 @@
-import type { Startable, Libp2p, PeerId } from '@libp2p/interface'
+import type { Startable, Libp2p } from '@libp2p/interface'
 import { hashKey } from 'p2p-fret'
 import type { FretService } from 'p2p-fret'
 import type { PartitionDetector } from './partition-detector.js'

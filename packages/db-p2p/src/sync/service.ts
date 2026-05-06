@@ -1,8 +1,7 @@
-import type { ComponentLogger, Startable, Stream } from '@libp2p/interface';
+import type { ComponentLogger, Startable } from '@libp2p/interface';
 import type { IRepo } from '@optimystic/db-core';
 import { buildSyncProtocol, type SyncRequest, type SyncResponse } from './protocol.js';
 import { pipe } from 'it-pipe';
-import { fromString as u8FromString } from 'uint8arrays/from-string';
 import { toString as u8ToString } from 'uint8arrays/to-string';
 import * as lp from 'it-length-prefixed';
 import type { Uint8ArrayList } from 'uint8arraylist';
@@ -37,7 +36,7 @@ export class SyncService implements Startable {
 	private readonly registrar: { handle: (...args: any[]) => Promise<void>, unhandle: (...args: any[]) => Promise<void> };
 
 	constructor(
-		private readonly components: SyncServiceComponents,
+		components: SyncServiceComponents,
 		init: SyncServiceInit = {}
 	) {
 		this.log = components.logger.forComponent('db-p2p:sync-service');

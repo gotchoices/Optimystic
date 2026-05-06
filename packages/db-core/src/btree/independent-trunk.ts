@@ -25,7 +25,6 @@ export class IndependentTrunk implements ITreeTrunk {
 	}
 
 	static async from(store: BlockStore<TreeBlock>, id: BlockId) {
-		const block = get(store, id);
 		return new IndependentTrunk(id, store);
 	}
 

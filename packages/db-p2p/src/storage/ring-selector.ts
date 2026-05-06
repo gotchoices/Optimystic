@@ -26,7 +26,7 @@ export interface RingSelectorConfig {
  */
 export class RingSelector {
 	constructor(
-		private readonly fretAdapter: ArachnodeFretAdapter,
+		_fretAdapter: ArachnodeFretAdapter,
 		private readonly storageMonitor: StorageMonitor,
 		private readonly config: RingSelectorConfig
 	) {}

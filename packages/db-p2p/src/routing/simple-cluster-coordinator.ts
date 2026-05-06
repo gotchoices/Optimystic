@@ -57,13 +57,13 @@ export class ModuloCoordinator implements SimpleClusterCoordinator {
  * For very small clusters, just replicate everywhere
  */
 export class FullReplicationCoordinator implements SimpleClusterCoordinator {
-  async selectCoordinator(key: Uint8Array, peers: PeerId[]): Promise<PeerId> {
+  async selectCoordinator(_key: Uint8Array, peers: PeerId[]): Promise<PeerId> {
     // Always select first peer as primary
     if (peers.length === 0) throw new Error('No peers available')
     return peers[0]!
   }
 
-  async selectReplicas(key: Uint8Array, peers: PeerId[], replicationFactor: number): Promise<PeerId[]> {
+  async selectReplicas(_key: Uint8Array, peers: PeerId[], _replicationFactor: number): Promise<PeerId[]> {
     // Replicate to all peers in small clusters
     return [...peers]
   }

@@ -5,7 +5,7 @@ import type { Collection } from "../collection/collection.js";
 import { TransactionContext } from "./context.js";
 import { ActionsEngine } from "./actions-engine.js";
 import { createActionsStatements, createTransactionStamp, createTransactionId, isTransactionExpired } from "./transaction.js";
-import { Log, blockIdsForTransforms, transformsFromTransform, hashString } from "../index.js";
+import { Log, blockIdsForTransforms, hashString } from "../index.js";
 import { createLogger } from "../logger.js";
 
 const log = createLogger('trx:coordinator');
@@ -680,7 +680,7 @@ export class TransactionCoordinator {
 			const pendResult = await this.transactor.pend(pendRequest);
 			if (!pendResult.success) {
 				// Cancel any already-pended collections before returning
-				for (const [pendedCollectionId, pendedBlockIdList] of pendedBlockIds.entries()) {
+				for (const [, pendedBlockIdList] of pendedBlockIds.entries()) {
 					await this.transactor.cancel({ actionId, blockIds: pendedBlockIdList });
 				}
 				return {

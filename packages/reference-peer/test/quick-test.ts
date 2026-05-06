@@ -8,9 +8,7 @@
 import {
 	createLibp2pNode,
 	StorageRepo,
-	BlockStorage,
 	MemoryRawStorage,
-	Libp2pKeyPeerNetwork,
 	RepoClient
 } from '@optimystic/db-p2p';
 import net from 'node:net';

@@ -187,8 +187,25 @@ export class CoordinatorRepo implements IRepo {
 	private async fetchBlockFromCluster(blockId: BlockId, context?: ActionContext): Promise<void> {
 		if (!this.clusterLatestCallback) return;
 
-		// Query cluster for the block
-		const clusterLatest = await this.queryClusterForLatest(blockId, context);
+		const blockIdBytes = new TextEncoder().encode(blockId);
+		const peers = await this.keyNetwork.findCluster(blockIdBytes);
+		const peerIds = peers ? Object.keys(peers) : [];
+		if (peerIds.length === 0) return;
+
+		// Solo-cluster short-circuit: the only responsible peer is us. There is no
+		// remote to sync from, so skip the callback entirely. Querying ourselves
+		// would dial self via SyncClient — pointless at best, and on nodes without
+		// listen addresses (e.g. solo WebSocket-only) the dial can hang.
+		if (
+			peerIds.length === 1
+			&& this.localPeerId
+			&& peerIds[0] === this.localPeerId.toString()
+		) {
+			log('cluster-fetch:solo-self-skip', { blockId });
+			return;
+		}
+
+		const clusterLatest = await this.queryClusterForLatest(peerIds, blockId, context);
 		if (clusterLatest) {
 			// Found on cluster - trigger restoration to sync the block
 			await this.storageRepo.get({ blockIds: [blockId], context: { committed: [clusterLatest], rev: clusterLatest.rev } });
@@ -199,14 +216,7 @@ export class CoordinatorRepo implements IRepo {
 	/**
 	 * Query cluster peers to find the maximum latest revision for a block.
 	 */
-	private async queryClusterForLatest(blockId: BlockId, context?: ActionContext): Promise<ActionRev | undefined> {
-		const blockIdBytes = new TextEncoder().encode(blockId);
-		const peers = await this.keyNetwork.findCluster(blockIdBytes);
-		if (!peers || Object.keys(peers).length === 0) {
-			return undefined;
-		}
-
-		const peerIds = Object.keys(peers);
+	private async queryClusterForLatest(peerIds: string[], blockId: BlockId, context?: ActionContext): Promise<ActionRev | undefined> {
 		let maxLatest: ActionRev | undefined;
 
 		// Add timeout wrapper to prevent hanging on unresponsive peers

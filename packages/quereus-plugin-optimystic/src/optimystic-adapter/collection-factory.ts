@@ -374,7 +374,7 @@ export class CollectionFactory {
   /**
    * Sync a collection (call collection.sync())
    */
-  async syncCollection(collection: Tree<string, RowData>): Promise<void> {
+  async syncCollection(_collection: Tree<string, RowData>): Promise<void> {
     // The Tree class doesn't expose sync directly, but we can call updateAndSync
     // This is a placeholder - we'd need to check the actual Tree API
     // await collection.updateAndSync();

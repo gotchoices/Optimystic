@@ -11,8 +11,8 @@
  */
 
 import { expect } from 'chai';
-import { ClusterMember, clusterMember } from '../src/cluster/cluster-repo.js';
-import type { IRepo, ClusterRecord, RepoMessage, Signature, BlockGets, GetBlockResults, PendRequest, PendResult, CommitRequest, CommitResult, ActionBlocks, ClusterPeers, ClusterConsensusConfig } from '@optimystic/db-core';
+import { clusterMember } from '../src/cluster/cluster-repo.js';
+import type { IRepo, ClusterRecord, RepoMessage, Signature, BlockGets, GetBlockResults, PendRequest, PendResult, CommitRequest, CommitResult, ActionBlocks, ClusterPeers } from '@optimystic/db-core';
 import type { IPeerNetwork } from '@optimystic/db-core';
 import type { PeerId, PrivateKey } from '@libp2p/interface';
 import { peerIdFromPrivateKey } from '@libp2p/peer-id';
@@ -22,7 +22,6 @@ import { base58btc } from 'multiformats/bases/base58';
 import { toString as uint8ArrayToString, fromString as uint8ArrayFromString } from 'uint8arrays';
 import { ed25519 } from '@noble/curves/ed25519.js';
 import { PeerReputationService } from '../src/reputation/peer-reputation.js';
-import { PenaltyReason } from '../src/reputation/types.js';
 
 /**
  * Inline SignatureValid for Ed25519 — mirrors the quereus-plugin-crypto implementation

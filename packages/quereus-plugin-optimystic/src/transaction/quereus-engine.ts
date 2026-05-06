@@ -45,7 +45,7 @@ export class QuereusEngine implements ITransactionEngine {
 
 	constructor(
 		private readonly db: Database,
-		private readonly coordinator: TransactionCoordinator
+		_coordinator: TransactionCoordinator
 	) {
 		this.unsubscribeSchema = this.db.onSchemaChange(() => this.invalidateSchemaCache());
 	}

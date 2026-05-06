@@ -16,7 +16,7 @@ import { createStampIdFunction } from './functions/transaction-id.js';
  * Plugin registration function
  * This is called by Quereus when the plugin is loaded
  */
-export default function register(db: Database, config: Record<string, SqlValue> = {}) {
+export default function register(_db: Database, config: Record<string, SqlValue> = {}) {
 	if (config.debug) {
 		console.log('Optimystic plugin loading with config:', config);
 	}

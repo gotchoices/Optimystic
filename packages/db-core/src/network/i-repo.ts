@@ -1,4 +1,4 @@
-import type { ActionBlocks, CommitResult, GetBlockResults, PendResult, PendRequest, CommitRequest, BlockGets, BlockId, ActionId } from "../index.js";
+import type { ActionBlocks, CommitResult, GetBlockResults, PendResult, PendRequest, BlockGets, BlockId, ActionId } from "../index.js";
 
 export type MessageOptions = {
 	expiration?: number;

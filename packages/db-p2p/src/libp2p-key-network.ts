@@ -1,5 +1,5 @@
 import type { AbortOptions, Libp2p, PeerId, Stream } from "@libp2p/interface";
-import { toString as u8ToString, fromString as u8FromString } from 'uint8arrays'
+import { toString as u8ToString } from 'uint8arrays'
 import type { ClusterPeers, FindCoordinatorOptions, IKeyNetwork, IPeerNetwork } from "@optimystic/db-core";
 import { peerIdFromString } from '@libp2p/peer-id'
 import { multiaddr } from '@multiformats/multiaddr'

@@ -300,7 +300,7 @@ describe('QuereusEngine execute() (TEST-7.1.1)', () => {
 
 			// Second execution of same INSERT should fail (duplicate PK)
 			const txn2 = await createTestTransaction(stmts);
-			const result2 = await engine.execute(txn2);
+			await engine.execute(txn2);
 
 			// The virtual table should detect the duplicate and either fail
 			// or silently replace. Either way, we should end up with exactly one row.

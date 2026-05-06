@@ -10,7 +10,6 @@ import type {
 	ArbitrationVote,
 	DisputeResolution,
 	DisputeConfig,
-	DisputeMessage,
 	DisputeStatus,
 } from './types.js';
 import { DEFAULT_DISPUTE_CONFIG } from './types.js';
@@ -350,7 +349,7 @@ export class DisputeService {
 	}
 
 	/** Apply reputation effects based on dispute resolution */
-	private applyReputationEffects(resolution: DisputeResolution, record: ClusterRecord): void {
+	private applyReputationEffects(resolution: DisputeResolution, _record: ClusterRecord): void {
 		if (!this.reputation) return;
 
 		for (const affected of resolution.affectedPeers) {

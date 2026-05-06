@@ -23,7 +23,7 @@ export class Tree<TKey, TEntry> {
 		let btree: BTree<TKey, TEntry> | undefined;
 		const init: CollectionInitOptions<TreeReplaceAction<TKey, TEntry>> = {
 			modules: {
-				"replace": async ({ data: actions }, trx) => {
+				"replace": async ({ data: actions }, _trx) => {
 					for (const [key, entry] of actions) {
 						if (entry) {
 							await btree!.upsert(entry);
@@ -35,7 +35,7 @@ export class Tree<TKey, TEntry> {
 			},
 			createHeaderBlock: (id: BlockId, store: BlockStore<IBlock>) => {	// Only called if the collection does not exist
 				let rootId: BlockId;
-				btree = BTree.create<TKey, TEntry>(store, (s, r) => {
+				btree = BTree.create<TKey, TEntry>(store, (_s, r) => {
 						rootId = r;
 						return new CollectionTrunk(store, id);
 					}, keyFromEntry, compare);

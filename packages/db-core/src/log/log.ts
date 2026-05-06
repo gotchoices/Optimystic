@@ -2,7 +2,7 @@ import { sha256 } from 'multiformats/hashes/sha2'
 import { Chain, entryAt } from "../index.js";
 import { nameof } from "../utility/nameof.js";
 import type { IBlock, BlockId, ActionId, CollectionId, ChainPath, ActionRev, ActionContext, ChainInitOptions, BlockStore } from "../index.js";
-import type { ChainHeaderBlockType, ChainDataNode } from '../chain/chain-nodes.js';
+import type { ChainDataNode } from '../chain/chain-nodes.js';
 import type { LogEntry, ActionEntry } from "./index.js";
 import { LogDataBlockType, LogHeaderBlockType } from "./index.js";
 import { toString as uint8ArrayToString } from 'uint8arrays/to-string'
@@ -64,12 +64,13 @@ export class Log<TAction> {
 			return undefined;
 		}
 		const checkpoint = await this.findCheckpoint(tailPath);
+		// Hermes V1 codegen bug: `[...arr, ...await asyncCall()]` evaluated as an
+		// object-literal field value silently produces the number 0 instead of an
+		// array. Extracting the await into a local variable bypasses the buggy
+		// codegen path. Keep this workaround until Hermes V1 ships a fix.
+		const additional = checkpoint ? await this.pendingFrom(checkpoint.path) : [];
 		return {
-			committed:
-				checkpoint
-
-					? [...checkpoint.pendings, ...await this.pendingFrom(checkpoint.path)]
-					: [],
+			committed: checkpoint ? [...checkpoint.pendings, ...additional] : [],
 			rev: checkpoint?.rev ?? 0,
 		};
 	}
