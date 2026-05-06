@@ -38,7 +38,7 @@ Options are passed in the `USING optimystic(...)` clause:
 | Option | Description | Default |
 |---|---|---|
 | First positional arg | Collection URI (e.g. `'tree://myapp/users'`) | `tree://default/{tableName}` |
-| `transactor` | `'network'`, `'test'`, or custom registered name | `'network'` |
+| `transactor` | `'network'`, `'local'`, `'test'`, `'mesh-test'`, or custom registered name | `'network'` |
 | `keyNetwork` | `'libp2p'`, `'test'`, or custom registered name | `'libp2p'` |
 | `port` | libp2p listen port (0 = random) | `0` |
 | `networkName` | Network identifier for protocol prefixes | `'optimystic'` |
@@ -101,6 +101,27 @@ const validator = createQuereusValidator({ db, coordinator });
 ```
 
 `createQuereusStatement()` and `createQuereusStatements()` are helpers for building the JSON statement format used in transaction records.
+
+## Plugin-Level Configuration
+
+The `register(db, config)` call accepts plugin-level defaults (consumed via the virtual table's `vtabAuxData`):
+
+| Key | Description |
+|---|---|
+| `default_transactor` | Default `transactor` when a table omits the option |
+| `default_key_network` | Default `keyNetwork` when a table omits the option |
+| `default_port`, `default_network_name` | libp2p defaults |
+| `rawStorageFactory` | `() => IRawStorage` — supplies the raw storage backing the `'local'` transactor. Defaults to in-memory `MemoryRawStorage`. Hosts can plug in persistent storage (e.g. RN/MMKV). Function-typed, so it can only be passed via `register()`, not in a `USING` clause. |
+
+```typescript
+import { register } from '@optimystic/quereus-plugin-optimystic';
+import { MyMmkvStorage } from './my-storage.js';
+
+register(db, {
+  default_transactor: 'local',
+  rawStorageFactory: () => new MyMmkvStorage(),
+});
+```
 
 ## Custom Networks and Transactors
 
