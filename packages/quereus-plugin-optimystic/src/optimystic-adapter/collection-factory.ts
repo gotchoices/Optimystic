@@ -72,7 +72,7 @@ export class CollectionFactory {
         return await this.createNetworkTransactor(options);
 
       case 'local':
-        return await this.createLocalTransactor();
+        return await this.createLocalTransactor(options);
 
       case 'test':
         return await this.createTestTransactor();
@@ -157,11 +157,13 @@ export class CollectionFactory {
   }
 
   /**
-   * Create a local transactor (in-memory, single-node, no network)
+   * Create a local transactor (single-node, no network).
+   * Uses `options.rawStorageFactory` when supplied so hosts can plug in a
+   * persistent backend; otherwise falls back to in-memory `MemoryRawStorage`.
    */
-  private async createLocalTransactor(): Promise<ITransactor> {
-    const memoryStorage = new MemoryRawStorage();
-    const storageRepo = new StorageRepo((blockId: string) => new BlockStorage(blockId, memoryStorage));
+  private async createLocalTransactor(options: ParsedOptimysticOptions): Promise<ITransactor> {
+    const rawStorage = options.rawStorageFactory?.() ?? new MemoryRawStorage();
+    const storageRepo = new StorageRepo((blockId: string) => new BlockStorage(blockId, rawStorage));
 
     // LocalTransactor implementation (simple wrapper around StorageRepo)
     return {

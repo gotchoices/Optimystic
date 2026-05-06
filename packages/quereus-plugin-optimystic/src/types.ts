@@ -1,5 +1,6 @@
 import type { Libp2p } from '@libp2p/interface';
 import type { ITransactor } from '@optimystic/db-core';
+import type { IRawStorage } from '@optimystic/db-p2p';
 
 /**
  * Configuration for the optimystic virtual table
@@ -25,6 +26,13 @@ export interface OptimysticOptions {
 
   /** Row encoding format */
   encoding?: 'json' | 'msgpack';
+
+  /**
+   * Optional factory for the raw storage backing a `'local'` transactor.
+   * Defaults to `MemoryRawStorage` when omitted. Has no effect for non-local
+   * transactor types.
+   */
+  rawStorageFactory?: () => IRawStorage;
 }
 
 /**
@@ -52,6 +60,7 @@ export interface ParsedOptimysticOptions {
   libp2pOptions: LibP2PNodeOptions;
   cache: boolean;
   encoding: 'json' | 'msgpack';
+  rawStorageFactory?: () => IRawStorage;
 }
 
 /**

@@ -9,6 +9,7 @@ import { CollectionFactory } from './optimystic-adapter/collection-factory.js';
 import { TransactionBridge } from './optimystic-adapter/txn-bridge.js';
 import { OptimysticVirtualTableConnection } from './optimystic-adapter/vtab-connection.js';
 import type { ParsedOptimysticOptions } from './types.js';
+import type { IRawStorage } from '@optimystic/db-p2p';
 import { VirtualTable } from '@quereus/quereus';
 import type { VirtualTableModule, BaseModuleConfig, Database, TableSchema, Row, FilterInfo, BestAccessPlanRequest, BestAccessPlanResult, OrderingSpec, VirtualTableConnection, TableIndexSchema as IndexSchema, UpdateArgs, UpdateResult } from '@quereus/quereus';
 import { Tree } from '@optimystic/db-core';
@@ -741,6 +742,7 @@ export class OptimysticModule implements VirtualTableModule<OptimysticVirtualTab
         libp2pOptions: tableOptions.libp2pOptions,
         cache: true,
         encoding: 'json',
+        rawStorageFactory: tableOptions.rawStorageFactory,
       };
       return await this.collectionFactory.createOrGetCollection(
         schemaOptions,
@@ -769,6 +771,10 @@ export class OptimysticModule implements VirtualTableModule<OptimysticVirtualTab
     const networkName = (args['networkName'] as string) || (aux['default_network_name'] as string) || 'optimystic';
     const cache = args['cache'] !== false;
     const encoding = (args['encoding'] as 'json' | 'msgpack') || 'json';
+    // Plugin-level only (not exposed via per-table USING args because it's a function reference).
+    const rawStorageFactory = typeof aux['rawStorageFactory'] === 'function'
+      ? (aux['rawStorageFactory'] as () => IRawStorage)
+      : undefined;
 
     const options: ParsedOptimysticOptions = {
       collectionUri,
@@ -781,6 +787,7 @@ export class OptimysticModule implements VirtualTableModule<OptimysticVirtualTab
       },
       cache,
       encoding,
+      rawStorageFactory,
     };
 
     return options;
