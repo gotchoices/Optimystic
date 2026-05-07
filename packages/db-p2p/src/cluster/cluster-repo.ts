@@ -41,6 +41,7 @@ interface ClusterMemberComponents {
 	peerId: PeerId;
 	privateKey: PrivateKey;
 	protocolPrefix?: string;
+	// Reserved for partition-healing consumers (backlog ticket 6.5-partition-healing); not yet read by ClusterMember.
 	partitionDetector?: PartitionDetector;
 	fretService?: FretService;
 	validator?: ITransactionValidator;
@@ -96,6 +97,7 @@ export class ClusterMember implements ICluster {
 		private readonly peerId: PeerId,
 		private readonly privateKey: PrivateKey,
 		private readonly protocolPrefix?: string,
+		// Reserved for partition-healing (backlog ticket 6.5-partition-healing); held but not yet consumed.
 		_partitionDetector?: PartitionDetector,
 		private readonly fretService?: FretService,
 		private readonly validator?: ITransactionValidator,
