@@ -26,10 +26,18 @@ class MockStorageMonitor {
 	}
 }
 
+type RingStat = { ringDepth: number; peerCount: number; avgCapacity: number };
+
 class MockFretAdapter implements Pick<ArachnodeFretAdapter, 'getMyArachnodeInfo' | 'getKnownRings' | 'getRingStats'> {
+	private _ringStats: RingStat[] = [];
+
+	setRingStats(stats: RingStat[]): void {
+		this._ringStats = stats;
+	}
+
 	getMyArachnodeInfo() { return undefined; }
-	getKnownRings() { return []; }
-	getRingStats() { return []; }
+	getKnownRings() { return this._ringStats.map(s => s.ringDepth); }
+	getRingStats() { return this._ringStats; }
 }
 
 describe('RingSelector', () => {
@@ -90,6 +98,70 @@ describe('RingSelector', () => {
 			const ring2 = await selector.determineRing();
 
 			expect(ring2).to.be.at.least(ring1);
+		});
+
+		it('uses observed ring stats to size network when available (single-ring)', async () => {
+			// 4 peers in one ring, each with 100MB available -> network estimate = 400MB.
+			// Local available = 100MB -> coverage = 0.25 -> ringDepth = ceil(-log2(0.25)) = 2.
+			fretAdapter.setRingStats([
+				{ ringDepth: 0, peerCount: 4, avgCapacity: 100 * 1024 * 1024 }
+			]);
+			monitor.setCapacity(100 * 1024 * 1024, 0); // 100MB available
+			const ring = await selector.determineRing();
+			expect(ring).to.equal(2);
+		});
+
+		it('aggregates capacity across multiple rings', async () => {
+			// Ring 0: 1 peer × 1GB = 1GB; Ring 4: 8 peers × 100MB = 800MB. Total ≈ 1.8GB.
+			// Local available = 100MB -> coverage ≈ 100MB / 1.8GB ≈ 0.0543 -> ceil(-log2(0.0543)) = 5.
+			fretAdapter.setRingStats([
+				{ ringDepth: 0, peerCount: 1, avgCapacity: 1024 * 1024 * 1024 },
+				{ ringDepth: 4, peerCount: 8, avgCapacity: 100 * 1024 * 1024 }
+			]);
+			monitor.setCapacity(100 * 1024 * 1024, 0);
+			const ring = await selector.determineRing();
+			expect(ring).to.equal(5);
+		});
+
+		it('ring depth grows as observed network capacity grows (more peers)', async () => {
+			// Hold local capacity fixed; increase network capacity -> ring depth must rise.
+			monitor.setCapacity(100 * 1024 * 1024, 0); // 100MB local
+
+			fretAdapter.setRingStats([
+				{ ringDepth: 0, peerCount: 2, avgCapacity: 100 * 1024 * 1024 } // 200MB network
+			]);
+			const ringSmallNetwork = await selector.determineRing();
+
+			fretAdapter.setRingStats([
+				{ ringDepth: 0, peerCount: 64, avgCapacity: 100 * 1024 * 1024 } // 6.4GB network
+			]);
+			const ringLargeNetwork = await selector.determineRing();
+
+			expect(ringLargeNetwork).to.be.greaterThan(ringSmallNetwork);
+		});
+
+		it('ring depth shrinks as observed network capacity shrinks (fewer peers)', async () => {
+			monitor.setCapacity(100 * 1024 * 1024, 0); // 100MB local
+
+			fretAdapter.setRingStats([
+				{ ringDepth: 0, peerCount: 64, avgCapacity: 100 * 1024 * 1024 } // 6.4GB network
+			]);
+			const ringLargeNetwork = await selector.determineRing();
+
+			fretAdapter.setRingStats([
+				{ ringDepth: 0, peerCount: 2, avgCapacity: 100 * 1024 * 1024 } // 200MB network
+			]);
+			const ringSmallNetwork = await selector.determineRing();
+
+			expect(ringSmallNetwork).to.be.lessThan(ringLargeNetwork);
+		});
+
+		it('falls back to constant-based estimate when no ring stats are observed (bootstrap)', async () => {
+			// Empty stats -> bootstrap: estimatedTotalData = 100MB. With 10GB local, coverage >> 1, ring = 0.
+			fretAdapter.setRingStats([]);
+			monitor.setCapacity(10 * 1024 * 1024 * 1024, 0);
+			const ring = await selector.determineRing();
+			expect(ring).to.equal(0);
 		});
 	});
 

@@ -26,7 +26,7 @@ export interface RingSelectorConfig {
  */
 export class RingSelector {
 	constructor(
-		_fretAdapter: ArachnodeFretAdapter,
+		private readonly fretAdapter: ArachnodeFretAdapter,
 		private readonly storageMonitor: StorageMonitor,
 		private readonly config: RingSelectorConfig
 	) {}
@@ -42,11 +42,32 @@ export class RingSelector {
 			return -1;
 		}
 
-		// Estimate total network size from FRET
-		// We use a simple heuristic: assume average block size and typical data distribution
-		const avgBlockSize = 100 * 1024; // 100KB typical block
-		const estimatedTotalBlocks = 1000; // Conservative estimate
-		const estimatedTotalData = estimatedTotalBlocks * avgBlockSize;
+		// Estimate total network spare capacity by aggregating observed per-ring stats.
+		// See docs/arachnode.md §"Capacity Management and Ring Adjustment": ring selection
+		// should reflect observed network demand, not a hard-coded constant. We treat
+		// Σ (peerCount × avgCapacity) over known rings as a proxy for total network spare
+		// capacity, so `coverage` becomes our share of it. More peers (or richer peers) →
+		// smaller share → higher ring depth (more specialization). On bootstrap, when no
+		// ring stats are observed yet, we fall back to a conservative fixed estimate so
+		// first-boot behavior is deterministic.
+		const ringStats = this.fretAdapter.getRingStats();
+		let estimatedTotalData: number;
+		if (ringStats.length > 0) {
+			estimatedTotalData = ringStats.reduce(
+				(sum, stat) => sum + stat.peerCount * stat.avgCapacity,
+				0
+			);
+		} else {
+			const avgBlockSize = 100 * 1024; // 100KB typical block
+			const estimatedTotalBlocks = 1000; // Conservative estimate
+			estimatedTotalData = estimatedTotalBlocks * avgBlockSize;
+		}
+
+		// Guard against pathological zero-aggregate (e.g. all peers report 0 available);
+		// fall back to local capacity so coverage = 1.0 (ring 0).
+		if (estimatedTotalData <= 0) {
+			estimatedTotalData = capacity.available;
+		}
 
 		// Calculate what fraction of keyspace we can cover
 		const coverage = capacity.available / estimatedTotalData;
