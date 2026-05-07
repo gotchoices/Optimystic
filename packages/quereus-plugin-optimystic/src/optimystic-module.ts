@@ -18,7 +18,7 @@ import { SchemaManager } from './schema/schema-manager.js';
 import { RowCodec, type EncodedRow } from './schema/row-codec.js';
 import { SqlDataType } from '@quereus/quereus';
 import { INTEGER_TYPE, REAL_TYPE, TEXT_TYPE, BLOB_TYPE, NUMERIC_TYPE, NULL_TYPE, BOOLEAN_TYPE, type LogicalType } from '@quereus/quereus';
-import { IndexManager } from './schema/index-manager.js';
+import { IndexManager, type IndexEntry } from './schema/index-manager.js';
 import { StatisticsCollector } from './schema/statistics-collector.js';
 
 
@@ -180,8 +180,7 @@ export class OptimysticVirtualTable extends VirtualTable {
           indexOptions,
           transactor ? { transactor, isActive: true, collections: new Map(), stampId: '' } : undefined
         );
-        // Index trees store string->string mappings (IndexKey->PrimaryKey)
-        return tree as unknown as Tree<string, string>;
+        return tree as unknown as Tree<string, IndexEntry>;
       });
 
       await this.indexManager.initialize(txnState?.transactor);
@@ -651,7 +650,7 @@ export class OptimysticVirtualTable extends VirtualTable {
         indexOptions,
         transactor ? { transactor, isActive: true, collections: new Map(), stampId: '' } : undefined
       );
-      return tree as unknown as Tree<string, string>;
+      return tree as unknown as Tree<string, IndexEntry>;
     };
 
     const indexTree = await indexTreeFactory(indexSchema.name, txnState?.transactor);

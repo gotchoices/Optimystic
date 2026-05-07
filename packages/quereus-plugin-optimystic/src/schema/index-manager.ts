@@ -33,13 +33,13 @@ export type IndexEntry = [IndexKey, PrimaryKey];
 export type IndexTreeFactory = (
 	indexName: string,
 	transactor?: ITransactor
-) => Promise<Tree<IndexKey, PrimaryKey>>;
+) => Promise<Tree<IndexKey, IndexEntry>>;
 
 /**
  * Manages secondary indexes for a table
  */
 export class IndexManager {
-	private indexTrees = new Map<string, Tree<IndexKey, PrimaryKey>>();
+	private indexTrees = new Map<string, Tree<IndexKey, IndexEntry>>();
 
 	constructor(
 		private schema: StoredTableSchema,
@@ -59,7 +59,7 @@ export class IndexManager {
 	/**
 	 * Get an index tree by name
 	 */
-	getIndexTree(indexName: string): Tree<IndexKey, PrimaryKey> | undefined {
+	getIndexTree(indexName: string): Tree<IndexKey, IndexEntry> | undefined {
 		return this.indexTrees.get(indexName);
 	}
 
@@ -199,14 +199,7 @@ export class IndexManager {
 
 			const entry = tree.at(path);
 			if (entry != null) {
-				// Entry format: [treeKey, primaryKey]
-				// Extract the primaryKey from the stored tuple
-				const primaryKey = Array.isArray(entry) && entry.length >= 2
-					? entry[1]
-					: (typeof entry === 'string' ? entry : null);
-				if (primaryKey != null) {
-					yield String(primaryKey);
-				}
+				yield entry[1];
 			}
 		}
 	}
@@ -243,11 +236,8 @@ export class IndexManager {
 			}
 
 			const entry = tree.at(path);
-			if (entry != null && Array.isArray(entry) && entry.length >= 2) {
-				const primaryKey = entry[1];
-				if (primaryKey != null) {
-					yield String(primaryKey);
-				}
+			if (entry != null) {
+				yield entry[1];
 			}
 		}
 	}
