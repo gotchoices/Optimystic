@@ -1,6 +1,6 @@
 {
   "name": "@optimystic/quereus-plugin-optimystic",
-  "version": "0.11.3",
+  "version": "0.12.0",
   "description": "Quereus plugin for Optimystic distributed tree collections",
   "type": "module",
   "main": "dist/index.js",
