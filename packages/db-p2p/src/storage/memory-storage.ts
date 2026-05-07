@@ -142,4 +142,32 @@ export class MemoryRawStorage implements IRawStorage {
 			this.pendingActions.delete(key);
 		}
 	}
+
+	async getApproximateBytesUsed(): Promise<number> {
+		let total = 0;
+		for (const [blockId, meta] of this.metadata) {
+			total += blockId.length + jsonByteSize(meta);
+		}
+		for (const [key, actionId] of this.revisions) {
+			total += key.length + actionId.length;
+		}
+		for (const [key, transform] of this.pendingActions) {
+			total += key.length + jsonByteSize(transform);
+		}
+		for (const [key, transform] of this.actions) {
+			total += key.length + jsonByteSize(transform);
+		}
+		for (const [key, block] of this.materializedBlocks) {
+			total += key.length + jsonByteSize(block);
+		}
+		return total;
+	}
+}
+
+function jsonByteSize(value: unknown): number {
+	try {
+		return JSON.stringify(value)?.length ?? 0;
+	} catch {
+		return 0;
+	}
 }

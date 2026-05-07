@@ -27,4 +27,14 @@ export interface IRawStorage {
 
 	// Promote a pending action to a committed action
 	promotePendingTransaction(blockId: BlockId, actionId: ActionId): Promise<void>;
+
+	/**
+	 * Approximate bytes currently stored by this backend.
+	 *
+	 * Used by `StorageMonitor` to feed real used-space figures into ring selection.
+	 * Implementations should return their best cheap estimate (e.g. on-disk size for
+	 * filesystem backends, tracked footprint for in-memory backends). The result is
+	 * advisory — `StorageMonitor` treats a missing implementation as 0.
+	 */
+	getApproximateBytesUsed?(): Promise<number>;
 }

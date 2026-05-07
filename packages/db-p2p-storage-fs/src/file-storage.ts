@@ -102,6 +102,37 @@ export class FileRawStorage implements IRawStorage {
 		}
 	}
 
+	async getApproximateBytesUsed(): Promise<number> {
+		return this.directoryByteSize(this.basePath);
+	}
+
+	private async directoryByteSize(dir: string): Promise<number> {
+		const entries = await fs.readdir(dir, { withFileTypes: true })
+			.catch((err) => {
+				if ((err as NodeJS.ErrnoException)?.code === 'ENOENT') return [];
+				log('directoryByteSize readdir failed for %s - %o', dir, err);
+				return [];
+			});
+
+		let total = 0;
+		for (const entry of entries) {
+			const entryPath = path.join(dir, entry.name);
+			if (entry.isDirectory()) {
+				total += await this.directoryByteSize(entryPath);
+			} else if (entry.isFile()) {
+				const size = await fs.stat(entryPath)
+					.then(st => st.size)
+					.catch((err) => {
+						if ((err as NodeJS.ErrnoException)?.code === 'ENOENT') return 0;
+						log('directoryByteSize stat failed for %s - %o', entryPath, err);
+						return 0;
+					});
+				total += size;
+			}
+		}
+		return total;
+	}
+
 	async promotePendingTransaction(blockId: BlockId, actionId: ActionId): Promise<void> {
 		const pendingPath = this.getPendingActionPath(blockId, actionId);
 		const actionPath = this.getActionPath(blockId, actionId);

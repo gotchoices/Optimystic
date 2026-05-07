@@ -99,6 +99,15 @@ export class MMKVRawStorage implements IRawStorage {
 		}
 	}
 
+	async getApproximateBytesUsed(): Promise<number> {
+		let total = 0;
+		for (const key of this.mmkv.getAllKeys()) {
+			if (!key.startsWith(this.prefix)) continue;
+			total += key.length + (this.mmkv.getString(key)?.length ?? 0);
+		}
+		return total;
+	}
+
 	async promotePendingTransaction(blockId: BlockId, actionId: ActionId): Promise<void> {
 		const pendingKey = this.pendingKey(blockId, actionId);
 		const content = this.mmkv.getString(pendingKey);

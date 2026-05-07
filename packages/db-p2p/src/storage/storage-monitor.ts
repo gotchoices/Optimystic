@@ -18,7 +18,7 @@ export interface StorageMonitorConfig {
  */
 export class StorageMonitor {
 	constructor(
-		_storage: IRawStorage,
+		private readonly storage: IRawStorage,
 		private readonly config: StorageMonitorConfig = {}
 	) {}
 
@@ -28,22 +28,15 @@ export class StorageMonitor {
 		const usedOverride = this.config.usedBytes;
 		const availableOverride = this.config.availableBytes;
 
-		if (
-			usedOverride !== undefined ||
-			availableOverride !== undefined ||
-			this.config.totalBytes !== undefined
-		) {
-			const used = usedOverride ?? Math.max(0, total - (availableOverride ?? total));
-			const available = availableOverride ?? Math.max(0, total - used);
-			return {
-				total,
-				used: Math.min(total, Math.max(0, used)),
-				available: Math.max(0, Math.min(total, available))
-			};
-		}
-
-		const used = await this.estimateUsedSpace();
-		const available = Math.max(0, total - used);
+		// Only short-circuit the backend when used/available is explicitly supplied;
+		// a bare `totalBytes` is just the disk-size hint and should still let the
+		// backend report actual used bytes.
+		const rawUsed = usedOverride
+			?? (availableOverride !== undefined ? total - availableOverride : await this.estimateUsedSpace());
+		const used = Math.min(total, Math.max(0, rawUsed));
+		const available = availableOverride !== undefined
+			? Math.max(0, Math.min(total, availableOverride))
+			: Math.max(0, total - used);
 
 		return {
 			total,
@@ -53,7 +46,7 @@ export class StorageMonitor {
 	}
 
 	private async estimateUsedSpace(): Promise<number> {
-		return 0; // TODO: Implement actual space calculation
+		return (await this.storage.getApproximateBytesUsed?.()) ?? 0;
 	}
 }
 
