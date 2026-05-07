@@ -15,7 +15,7 @@ import {
 	RepoClient
 } from '@optimystic/db-p2p';
 import { NetworkTransactor } from '@optimystic/db-core';
-import type { PeerId } from '@libp2p/interface';
+import type { PeerId } from '@optimystic/db-core';
 import register from '../src/plugin.js';
 
 type Row = Record<string, SqlValue>;
