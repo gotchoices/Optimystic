@@ -1087,14 +1087,18 @@ __metadata:
   dependencies:
     "@optimystic/db-core": "workspace:^"
     "@optimystic/db-p2p": "workspace:^"
+    "@types/chai": "npm:^5.2.3"
     "@types/debug": "npm:^4.1.12"
     "@types/mocha": "npm:^10.0.10"
     "@types/node": "npm:^25.1.0"
+    chai: "npm:^6.2.2"
     debug: "npm:^4.4.3"
+    mocha: "npm:^11.7.5"
     rimraf: "npm:^6.1.2"
+    ts-node: "npm:^10.9.2"
     typescript: "npm:^5.9.3"
   peerDependencies:
-    react-native-mmkv: ^3.0.0 || ^2.0.0
+    react-native-mmkv: ^4.0.0
   peerDependenciesMeta:
     react-native-mmkv:
       optional: false

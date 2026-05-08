@@ -8,7 +8,7 @@ const log = createLogger('storage:mmkv');
 export interface MMKV {
 	getString(key: string): string | undefined;
 	set(key: string, value: string): void;
-	delete(key: string): void;
+	remove(key: string): boolean;
 	getAllKeys(): string[];
 	contains(key: string): boolean;
 }
@@ -55,7 +55,7 @@ export class MMKVRawStorage implements IRawStorage {
 	}
 
 	async deletePendingTransaction(blockId: BlockId, actionId: ActionId): Promise<void> {
-		this.mmkv.delete(this.pendingKey(blockId, actionId));
+		this.mmkv.remove(this.pendingKey(blockId, actionId));
 		this.removeFromPendingIndex(blockId, actionId);
 	}
 
@@ -95,7 +95,7 @@ export class MMKVRawStorage implements IRawStorage {
 		if (block) {
 			this.setJson(key, block);
 		} else {
-			this.mmkv.delete(key);
+			this.mmkv.remove(key);
 		}
 	}
 
@@ -115,7 +115,7 @@ export class MMKVRawStorage implements IRawStorage {
 			throw new Error(`Pending action ${actionId} not found for block ${blockId}`);
 		}
 		this.mmkv.set(this.transactionKey(blockId, actionId), content);
-		this.mmkv.delete(pendingKey);
+		this.mmkv.remove(pendingKey);
 		this.removeFromPendingIndex(blockId, actionId);
 	}
 

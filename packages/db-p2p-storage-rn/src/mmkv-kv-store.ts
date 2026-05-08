@@ -14,7 +14,7 @@ export class MMKVKVStore implements IKVStore {
 	}
 
 	async delete(key: string): Promise<void> {
-		this.mmkv.delete(this.prefix + key);
+		this.mmkv.remove(this.prefix + key);
 	}
 
 	async list(prefix: string): Promise<string[]> {

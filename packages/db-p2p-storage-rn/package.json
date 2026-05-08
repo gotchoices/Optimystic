@@ -34,13 +34,19 @@
   ],
   "scripts": {
     "clean": "rimraf dist",
-    "build": "tsc"
+    "build": "tsc",
+    "test": "node --import ./register.mjs node_modules/mocha/bin/mocha.js \"test/**/*.spec.ts\" --colors --reporter min",
+    "test:verbose": "node --import ./register.mjs node_modules/mocha/bin/mocha.js \"test/**/*.spec.ts\" --colors --reporter spec"
   },
   "devDependencies": {
+    "@types/chai": "^5.2.3",
     "@types/debug": "^4.1.12",
     "@types/mocha": "^10.0.10",
     "@types/node": "^25.1.0",
+    "chai": "^6.2.2",
+    "mocha": "^11.7.5",
     "rimraf": "^6.1.2",
+    "ts-node": "^10.9.2",
     "typescript": "^5.9.3"
   },
   "dependencies": {
@@ -49,7 +55,7 @@
     "debug": "^4.4.3"
   },
   "peerDependencies": {
-    "react-native-mmkv": "^3.0.0 || ^2.0.0"
+    "react-native-mmkv": "^4.0.0"
   },
   "peerDependenciesMeta": {
     "react-native-mmkv": {
