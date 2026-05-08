@@ -1,6 +1,6 @@
 {
 	"name": "@optimystic/quereus-plugin-crypto",
-	"version": "0.12.0",
+	"version": "0.13.0",
 	"description": "Quereus plugin providing cryptographic functions (digest, sign, verify)",
 	"type": "module",
 	"main": "dist/index.js",
@@ -29,7 +29,7 @@
 		"test:verbose": "node --import ./register.mjs node_modules/mocha/bin/mocha.js \"test/**/*.spec.ts\" --colors --reporter spec"
 	},
 	"devDependencies": {
-		"@quereus/quereus": "^2.0.0",
+		"@quereus/quereus": "^2.8.0",
 		"@types/chai": "^5.2.3",
 		"@types/mocha": "^10.0.10",
 		"@types/node": "^25.2.0",
