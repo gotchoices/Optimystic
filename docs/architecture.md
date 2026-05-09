@@ -36,6 +36,7 @@ The monorepo is layered from abstract to concrete, with optional front-ends on t
 ├──────────────────────────────────────────────────────────────────┤
 │ Storage Adapters                                                 │
 │   db-p2p-storage-fs (Node fs) · db-p2p-storage-rn (MMKV)         │
+│   db-p2p-storage-web (IndexedDB)                                 │
 ├──────────────────────────────────────────────────────────────────┤
 │ Network Substrate                                                │
 │   libp2p + FRET DHT                                              │
@@ -48,6 +49,7 @@ The monorepo is layered from abstract to concrete, with optional front-ends on t
 | [`@optimystic/db-p2p`](../packages/db-p2p/readme.md) | Concrete libp2p node, cluster consensus, dispute protocol, Arachnode ring discovery |
 | `@optimystic/db-p2p-storage-fs` | Filesystem persistence (Node.js) |
 | `@optimystic/db-p2p-storage-rn` | React Native persistence via MMKV |
+| `@optimystic/db-p2p-storage-web` | Browser persistence via IndexedDB |
 | [`@optimystic/quereus-plugin-optimystic`](../packages/quereus-plugin-optimystic/README.md) | Virtual-table module binding SQL tables to Optimystic tree collections; `StampId()` UDF; `QuereusEngine` validator |
 | `@optimystic/quereus-plugin-crypto` | SQL UDFs for `digest`, `sign`, `verify`, `hash_mod`, `random_bytes` |
 | `@optimystic/reference-peer` | Interactive/batch/service CLI (`optimystic-peer`) for development, testing, and meshed experimentation |

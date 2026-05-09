@@ -239,7 +239,7 @@ Counters, append-only queues with metadata, specialized indexes, and CRDT-style 
 
 **Mobile (React Native):** use `@optimystic/db-p2p/rn` and `@optimystic/db-p2p-storage-rn`. Hermes needs polyfills (`crypto`, `structuredClone`, `Promise.withResolvers`, `EventTarget`, …) and Metro aliases for Node built-ins (`os`, `crypto`, `stream`, `buffer`); the [db-p2p README](../packages/db-p2p/readme.md#react-native) has the full checklist. First-launch mobile apps typically start in solo mode and attach on first connectivity.
 
-**Browser:** use WebSockets and circuit-relay transports; browsers cannot accept inbound connections and usually reach the network through a public gateway.
+**Browser:** use `@optimystic/db-p2p/rn` (the Node-free entrypoint, which works for browsers as well as React Native) and `@optimystic/db-p2p-storage-web` for IndexedDB-backed persistence — including a `loadOrCreateBrowserPeerKey` helper for a stable, reload-surviving libp2p identity. Use WebSockets and circuit-relay transports; browsers cannot accept inbound connections and usually reach the network through a public gateway.
 
 **Test harness:** `TestTransactor` runs everything in-process with no network. For multi-node integration tests, the `MeshHarness` under `packages/db-p2p/src/testing` spins up a configurable in-memory mesh.
 
