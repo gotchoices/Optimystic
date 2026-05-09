@@ -62,6 +62,39 @@ yarn optimystic-peer interactive \
 
 ---
 
+## Browser Bootstrap (WebSocket / WSS)
+
+Browsers (and the Sereus RN reference app) cannot dial raw TCP. Run a public bootstrap that listens on `/ws` and acts as a circuit-relay so browser peers can reach each other:
+
+```sh
+yarn optimystic-peer interactive \
+  --ws-port 9091 \
+  --relay \
+  --no-tcp \
+  --network optimystic
+```
+
+You'll see a multiaddr like `/ip4/0.0.0.0/tcp/9091/ws/p2p/<PEER_ID>`. Browsers usually need WSS (TLS-terminated WebSocket) — terminate TLS in front of the peer with a reverse proxy. Caddy makes this a one-liner:
+
+```caddy
+bootstrap.example.com {
+  reverse_proxy /* localhost:9091
+}
+```
+
+(nginx works too; the only requirement is that it forwards the `Upgrade: websocket` request to the peer.) Clients then dial:
+
+```
+/dns4/bootstrap.example.com/tcp/443/wss/p2p/<PEER_ID>
+```
+
+Notes:
+- `--relay` is what lets two browser peers (each unable to accept inbound connections) talk to each other through this node.
+- Drop `--no-tcp` if you want a single bootstrap that serves both Node-side TCP peers and browser/RN WebSocket peers.
+- You can combine `--ws-port` with `--port` — `node.getMultiaddrs()` (the "📡 Listening on:" startup line) prints all listen addresses.
+
+---
+
 ## Mesh Orchestrator (local multi-node)
 
 `packages/reference-peer/src/mesh.ts` (built to `packages/reference-peer/dist/src/mesh.js`) launches a small local mesh of headless service peers and writes their info to `.mesh/node-*.json`. Useful for testing discovery/bootstrapping and for the provided VS Code launch profiles.
@@ -146,11 +179,14 @@ yarn optimystic-peer interactive [options]
 ```
 
 Options:
-- `-p, --port <number>`: Port to listen on (default: 0 = auto)
+- `-p, --port <number>`: TCP port to listen on (default: 0 = auto)
+- `--ws-port <number>`: WebSocket port to listen on (e.g. `9091`); enables a `/ws` listen so browser and React Native peers can dial this node
+- `--ws-host <ip>`: Interface for the WS listener (default: `0.0.0.0`)
+- `--no-tcp`: Drop the default TCP listen — useful for browser-only bootstraps that listen on `/ws` only
 - `-b, --bootstrap <string>`: Comma-separated list of bootstrap multiaddrs
 - `--bootstrap-file <path>`: Path to JSON file or directory containing bootstrap addresses (supports `mesh-ready.json` and `node-*.json` formats)
 - `-i, --id <string>`: Optional peer id
-- `-r, --relay`: Enable relay service
+- `-r, --relay`: Enable relay service (required for browser-only peers to reach each other through this node)
 - `-n, --network <string>`: Network name (default: `optimystic`)
 - `--fret-profile <profile>`: FRET profile: `edge` or `core` (default: `edge`)
 - `-s, --storage <type>`: `memory` | `file` (default: `memory`)

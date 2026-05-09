@@ -170,6 +170,9 @@ class PeerSession {
 
 	async startNetwork(options: {
 		port?: string;
+		wsPort?: string;
+		wsHost?: string;
+		tcp?: boolean;
 		bootstrap?: string;
 		bootstrapFile?: string;
 		id?: string;
@@ -293,8 +296,17 @@ class PeerSession {
 			return new MemoryRawStorage();
 		};
 
+		const wsPortNum = options.wsPort !== undefined ? parseInt(options.wsPort, 10) : undefined;
+		if (wsPortNum !== undefined && (!Number.isFinite(wsPortNum) || wsPortNum < 0)) {
+			throw new Error('--ws-port must be a non-negative integer');
+		}
+		const disableTcp = options.tcp === false;
+
 		const node = await createLibp2pNode({
 			port: parseInt(options.port || '0'),
+			wsPort: wsPortNum,
+			wsHost: options.wsHost,
+			disableTcp,
 			bootstrapNodes,
 			id: options.id,
 			relay: options.relay || false,
@@ -646,6 +658,9 @@ program
 	.command('interactive')
 	.description('Start interactive mode (default behavior)')
 	.option('-p, --port <number>', 'Port to listen on', '0')
+	.option('--ws-port <number>', 'WebSocket port to listen on (e.g. 9091); enables /ws listen for browser/RN peers')
+	.option('--ws-host <ip>', 'Interface to bind the WS listener to', '0.0.0.0')
+	.option('--no-tcp', 'Disable the default TCP listen (browser-only bootstrap)')
 	.option('-b, --bootstrap <string>', 'Comma-separated list of bootstrap nodes')
 	.option('-i, --id <string>', 'Peer ID')
 	.option('-r, --relay', 'Enable relay service')
@@ -676,6 +691,9 @@ program
 	.command('service')
 	.description('Start a headless service node (no interactive prompt)')
 	.option('-p, --port <number>', 'Port to listen on', '0')
+	.option('--ws-port <number>', 'WebSocket port to listen on (e.g. 9091); enables /ws listen for browser/RN peers')
+	.option('--ws-host <ip>', 'Interface to bind the WS listener to', '0.0.0.0')
+	.option('--no-tcp', 'Disable the default TCP listen (browser-only bootstrap)')
 	.option('-b, --bootstrap <string>', 'Comma-separated list of bootstrap nodes')
 	.option('--bootstrap-file <path>', 'Path to JSON containing bootstrap multiaddrs or node list')
 	.option('-i, --id <string>', 'Peer ID')
@@ -707,6 +725,9 @@ program
 	.command('run')
 	.description('Connect to network, run a single action, optionally stay connected')
 	.option('-p, --port <number>', 'Port to listen on', '0')
+	.option('--ws-port <number>', 'WebSocket port to listen on (e.g. 9091); enables /ws listen for browser/RN peers')
+	.option('--ws-host <ip>', 'Interface to bind the WS listener to', '0.0.0.0')
+	.option('--no-tcp', 'Disable the default TCP listen (browser-only bootstrap)')
 	.option('-b, --bootstrap <string>', 'Comma-separated list of bootstrap nodes')
 	.option('-i, --id <string>', 'Peer ID')
 	.option('-r, --relay', 'Enable relay service')

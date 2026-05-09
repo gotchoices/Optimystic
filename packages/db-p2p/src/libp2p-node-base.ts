@@ -51,6 +51,21 @@ export type NodeOptions = {
 	 * For non-TCP transports (e.g. WebSockets), set `listenAddrs` explicitly.
 	 */
 	port?: number;
+	/**
+	 * WebSocket listen port. When set, the Node `createLibp2pNode` defaulting
+	 * branch adds `webSockets()` to the transports and `/ip4/<wsHost>/tcp/<wsPort>/ws`
+	 * to the listen addrs. Browsers and other WS-only peers (RN, web) can dial here.
+	 * Ignored when `transports`/`listenAddrs` are explicitly provided.
+	 */
+	wsPort?: number;
+	/** Interface to bind the WS listener to. Defaults to `0.0.0.0`. */
+	wsHost?: string;
+	/**
+	 * Drop the default TCP transport and TCP listen addr. Useful for browser-only
+	 * bootstraps that listen on `/ws` (typically fronted as `/wss`) only.
+	 * Ignored when `transports`/`listenAddrs` are explicitly provided.
+	 */
+	disableTcp?: boolean;
 	bootstrapNodes: string[];
 	networkName: string;
 	fretProfile?: 'edge' | 'core';

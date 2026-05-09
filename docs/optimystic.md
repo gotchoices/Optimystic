@@ -53,6 +53,8 @@ const solo = await createLibp2pNode({
 
 The node transitions out of solo mode automatically once FRET discovers peers. For interactive development, the [`reference-peer`](../packages/reference-peer) CLI (`optimystic-peer`) offers REPL, service, and mesh-orchestrator modes.
 
+Browsers and React Native clients cannot dial raw TCP, so a public bootstrap intended for them must listen on a WebSocket. Pass `wsPort` to `createLibp2pNode` (or `--ws-port` on the CLI) to add a `/ws` listen alongside (or instead of, with `disableTcp` / `--no-tcp`) the TCP listener; in production this is typically fronted by a TLS-terminating proxy and reached by clients as `/dns4/<host>/tcp/443/wss/p2p/<id>`. See the reference-peer [Browser Bootstrap recipe](../packages/reference-peer/README.md#browser-bootstrap-websocket--wss) for a full Caddy snippet.
+
 ## Native API
 
 ### Wire up a transactor
