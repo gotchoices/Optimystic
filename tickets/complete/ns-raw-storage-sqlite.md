@@ -1,4 +1,3 @@
-----
 description: NativeScript SQLite storage backend (`@optimystic/db-p2p-storage-ns`) — IRawStorage, IKVStore, and a libp2p identity helper for NativeScript peers
 files: packages/db-p2p-storage-ns/, root package.json, README.md, docs/architecture.md, docs/optimystic.md
 ----
@@ -24,18 +23,23 @@ A new NativeScript-only workspace package, `@optimystic/db-p2p-storage-ns`, mirr
 - `packages/db-p2p-storage-ns/test/*.spec.ts` — 25 specs.
 - `packages/db-p2p-storage-ns/README.md` — usage and persistence semantics.
 
-# Review notes
+# Review verdict
 
+Code-review pass complete. Findings:
+
+- **Interface match exact** — `SqliteRawStorage` implements all 14 required `IRawStorage` methods plus the optional `getApproximateBytesUsed`, signatures verbatim against `packages/db-p2p/src/storage/i-raw-storage.ts`. `SqliteKVStore` matches `IKVStore`'s four-method shape from `packages/db-p2p/src/storage/i-kv-store.ts`.
 - **Atomicity of `promotePendingTransaction`** — runs as `BEGIN; INSERT…; DELETE…; COMMIT;` inside `SqliteDb.transaction(fn)`. Throws `Pending action … not found for block …` on missing pending (matching MMKV/IDB wording exactly). A crash mid-promote rolls back cleanly — better than the MMKV adapter's non-atomic remove/set + pending-index update.
 - **Drained list queries** — `listRevisions` and `listPendingTransactions` issue `stmt.all(…)` and yield from the resulting array. Mirrors the IndexedDB pattern; the alternative (holding a SQLite statement live across `await`s on `node:sqlite`'s `iterate()`) introduces lifecycle hazards the IDB version explicitly avoids.
 - **Prepared statements** — bound once per `SqliteRawStorage` / `SqliteKVStore` instance, against the shared `db`. Both `node:sqlite` and the NS plugin cache parsed SQL internally; this layer just avoids the re-parse overhead and gives the storage code a clean per-method statement object.
 - **Schema** — six tables (`metadata`, `revisions`, `pending`, `transactions`, `materialized`, `kv`) mirror the IDB stores 1:1. JSON blobs in `TEXT` for everything except identity, which lives in `kv.b_val BLOB`. Composite primary keys (`block_id`, `rev` | `action_id`) give us O(log n) point lookups and prefix scans without secondary indexes.
-- **Two-column `kv` (`s_val TEXT`, `b_val BLOB`)** — lets `SqliteKVStore` and the identity helper share the table without a base64 round-trip. `SqliteKVStore.set` issues `INSERT … ON CONFLICT DO UPDATE SET s_val = excluded.s_val` (and writes `b_val = NULL`); identity-helper writes do the same on `b_val`. The `set() preserves binary identity columns on the same table` test verifies they don't clobber each other on conflict — though the current behavior on insert sets the opposite column to NULL, the identity helper writes only to a different key (`peer-private-key`), so the two never alias.
+- **Two-column `kv` (`s_val TEXT`, `b_val BLOB`)** — lets `SqliteKVStore` and the identity helper share the table without a base64 round-trip. `SqliteKVStore.set` issues `INSERT … ON CONFLICT DO UPDATE SET s_val = excluded.s_val` (and writes `b_val = NULL` on initial insert only); identity-helper writes do the same on `b_val` (with `s_val = NULL` only on initial insert). Each helper writes a distinct key (`peer-private-key` vs the prefixed KV keys), so the two never alias on the same row; the cross-row independence test verifies they don't clobber each other.
 - **Materialized-undefined deletion** — `saveMaterializedBlock(blockId, actionId, undefined)` issues a `DELETE`, matching fs/rn/web semantics.
 - **`getApproximateBytesUsed`** — `PRAGMA page_count` × `PRAGMA page_size`. Returns the SQLite database-file footprint; documented as DB-wide, not per-block. Adequate for `StorageMonitor`'s advisory ring-selection role.
 - **Pragmas** — `journal_mode = WAL`, `synchronous = NORMAL`, `foreign_keys = OFF`. Schema versioning via `PRAGMA user_version` so future migrations can branch on it (no v2 yet).
 - **Test seam (`SqliteDb`)** — package-private interface covering `exec`, `prepare`, `transaction(fn)`, `close`. Mirrors what the `@nativescript-community/sqlite` plugin needs to satisfy at the boundary and what `node:sqlite` can wrap for tests. Only `openOptimysticNSDb` and the storage/KV/identity classes are exported; the interface itself is internal.
 - **`ns-opener.ts` quarantine** — `openOptimysticNSDb` uses `await import('@nativescript-community/sqlite' as string)` so the TS compiler doesn't try to statically resolve the module. The `NSPluginDb` shape is re-declared locally with structural typing of just `execSQL`, `get`, `select`, `close`, so the plugin's `.d.ts` is not needed at typecheck time. Tests never import `ns-opener.ts`, so the native bindings never load under Mocha.
+- **Resource ownership** — `SqliteRawStorage` and `SqliteKVStore` do not close the `SqliteDb`; the caller owns the shared handle. Correct, since both consumers share one connection.
+- **Schema DDL `;`-splitting** — `NSPluginDbWrapper.exec` splits on `;` to feed the plugin one statement at a time. Safe for our fixed `SCHEMA_SQL` (no embedded `;` in strings or comments). The method is package-private; only `applySchema` calls it.
 
 # Test coverage
 
@@ -47,19 +51,19 @@ A new NativeScript-only workspace package, `@optimystic/db-p2p-storage-ns`, mirr
 
 Run with: `yarn workspace @optimystic/db-p2p-storage-ns test` (or `test:verbose`).
 
-# Validation performed
+# Validation performed at review
 
 - `yarn workspace @optimystic/db-p2p-storage-ns build` — green (TypeScript strict + `noUncheckedIndexedAccess`).
 - `yarn workspace @optimystic/db-p2p-storage-ns test:verbose` — 25 / 25 passing.
 - `yarn build` (entire monorepo) — green.
-- `yarn test` (entire monorepo) — green; sibling packages unaffected.
+- `yarn test` (entire monorepo) — green: db-core 302, db-p2p 437 (+5 pending), db-p2p-storage-ns 25, db-p2p-storage-rn 5, db-p2p-storage-web 24, quereus-crypto 50, quereus-optimystic 185 (+4 pending), reference-peer 4, demo 12.
 - Interface check confirmed `SqliteRawStorage` matches `IRawStorage` exactly and `SqliteKVStore` matches `IKVStore` exactly.
 
 # Documentation updates
 
-- `README.md` — added the new package to the package list (between `-fs` and `-rn`).
-- `docs/architecture.md` — added to both the storage-adapters block diagram and the package table.
-- `docs/optimystic.md` — added a "Mobile (NativeScript)" deployment-target bullet between RN and Browser, calling out `@optimystic/db-p2p/rn`, `@optimystic/db-p2p-storage-ns`, the `@nativescript-community/sqlite` peer dep, and `loadOrCreateNSPeerKey`.
+- `README.md` — new package listed between `-fs` and `-rn`.
+- `docs/architecture.md` — appears in both the storage-adapters block diagram and the package table.
+- `docs/optimystic.md` — "Mobile (NativeScript)" deployment-target bullet between RN and Browser, calling out `@optimystic/db-p2p/rn`, `@optimystic/db-p2p-storage-ns`, the `@nativescript-community/sqlite` peer dep, and `loadOrCreateNSPeerKey`.
 
 # Wired into root package.json
 
