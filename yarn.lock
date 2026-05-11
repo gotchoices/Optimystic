@@ -1081,6 +1081,35 @@ __metadata:
   languageName: unknown
   linkType: soft
 
+"@optimystic/db-p2p-storage-ns@workspace:packages/db-p2p-storage-ns":
+  version: 0.0.0-use.local
+  resolution: "@optimystic/db-p2p-storage-ns@workspace:packages/db-p2p-storage-ns"
+  dependencies:
+    "@libp2p/crypto": "npm:^5.1.13"
+    "@libp2p/interface": "npm:^3.1.0"
+    "@libp2p/peer-id": "npm:^6.0.4"
+    "@optimystic/db-core": "workspace:^"
+    "@optimystic/db-p2p": "workspace:^"
+    "@types/chai": "npm:^5.2.3"
+    "@types/debug": "npm:^4.1.12"
+    "@types/mocha": "npm:^10.0.10"
+    "@types/node": "npm:^25.1.0"
+    chai: "npm:^6.2.2"
+    debug: "npm:^4.4.3"
+    mocha: "npm:^11.7.5"
+    rimraf: "npm:^6.1.2"
+    ts-node: "npm:^10.9.2"
+    typescript: "npm:^5.9.3"
+  peerDependencies:
+    "@libp2p/crypto": ^5.1.13
+    "@libp2p/interface": ^3.1.0
+    "@nativescript-community/sqlite": ^3.5.0
+  peerDependenciesMeta:
+    "@nativescript-community/sqlite":
+      optional: false
+  languageName: unknown
+  linkType: soft
+
 "@optimystic/db-p2p-storage-rn@workspace:packages/db-p2p-storage-rn":
   version: 0.0.0-use.local
   resolution: "@optimystic/db-p2p-storage-rn@workspace:packages/db-p2p-storage-rn"

@@ -24,6 +24,7 @@ See the following documentation:
 * **Database Core** - packages/db-core - Database core functionality, not specific to any particular storage topology
 * **Database P2P** - packages/db-p2p - Database integration with libp2p, including Arachnode ring discovery (also exports `@optimystic/db-p2p/rn` for React Native — see below)
 * **Database P2P Storage (Filesystem)** - packages/db-p2p-storage-fs - Node.js filesystem storage backend
+* **Database P2P Storage (NativeScript)** - packages/db-p2p-storage-ns - NativeScript storage backend using SQLite
 * **Database P2P Storage (React Native)** - packages/db-p2p-storage-rn - React Native storage backend using MMKV
 * **Database P2P Storage (Web)** - packages/db-p2p-storage-web - Browser storage backend using IndexedDB
 * **Reference Peer** - packages/reference-peer - CLI for testing peer-to-peer functionality (run via `optimystic-peer`)
