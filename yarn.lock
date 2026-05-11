@@ -1114,6 +1114,9 @@ __metadata:
   version: 0.0.0-use.local
   resolution: "@optimystic/db-p2p-storage-rn@workspace:packages/db-p2p-storage-rn"
   dependencies:
+    "@libp2p/crypto": "npm:^5.1.13"
+    "@libp2p/interface": "npm:^3.1.0"
+    "@libp2p/peer-id": "npm:^6.0.4"
     "@optimystic/db-core": "workspace:^"
     "@optimystic/db-p2p": "workspace:^"
     "@types/chai": "npm:^5.2.3"
@@ -1121,15 +1124,18 @@ __metadata:
     "@types/mocha": "npm:^10.0.10"
     "@types/node": "npm:^25.1.0"
     chai: "npm:^6.2.2"
+    classic-level: "npm:^3.0.0"
     debug: "npm:^4.4.3"
     mocha: "npm:^11.7.5"
     rimraf: "npm:^6.1.2"
     ts-node: "npm:^10.9.2"
     typescript: "npm:^5.9.3"
   peerDependencies:
-    react-native-mmkv: ^4.0.0
+    "@libp2p/crypto": ^5.1.13
+    "@libp2p/interface": ^3.1.0
+    rn-leveldb: ^3.11.0
   peerDependenciesMeta:
-    react-native-mmkv:
+    rn-leveldb:
       optional: false
   languageName: unknown
   linkType: soft
@@ -1634,6 +1640,20 @@ __metadata:
   languageName: node
   linkType: hard
 
+"abstract-level@npm:^3.1.0":
+  version: 3.1.1
+  resolution: "abstract-level@npm:3.1.1"
+  dependencies:
+    buffer: "npm:^6.0.3"
+    is-buffer: "npm:^2.0.5"
+    level-supports: "npm:^6.2.0"
+    level-transcoder: "npm:^1.0.1"
+    maybe-combine-errors: "npm:^1.0.0"
+    module-error: "npm:^1.0.1"
+  checksum: 10c0/c87554397f39e90a74121c225ee46cfe83f0af3317ffd29a385f8425b3273b1aa026f3d54dd1eaa9366ced74d625832efb3a56f9cb0c1ae21a0b865ceebf2292
+  languageName: node
+  linkType: hard
+
 "acorn-walk@npm:^8.1.1":
   version: 8.3.4
   resolution: "acorn-walk@npm:8.3.4"
@@ -1970,6 +1990,19 @@ __metadata:
   version: 0.2.1
   resolution: "citty@npm:0.2.1"
   checksum: 10c0/504ac5aeb076f750bf5f25d40c730083e8ed6112eac2f00dbe341a223c46ad16893ce73dfdb55b2d0da505100b9678968ee0443637c45b21917db48daa5a6977
+  languageName: node
+  linkType: hard
+
+"classic-level@npm:^3.0.0":
+  version: 3.0.0
+  resolution: "classic-level@npm:3.0.0"
+  dependencies:
+    abstract-level: "npm:^3.1.0"
+    module-error: "npm:^1.0.1"
+    napi-macros: "npm:^2.2.2"
+    node-gyp: "npm:latest"
+    node-gyp-build: "npm:^4.3.0"
+  checksum: 10c0/124107929ae19115cff2050ca85869143d9554578863aeee06c445c39e736a3b5b7ef955d8e786193d5db332f8f4d9ba765b242db1523e19378a77346463522e
   languageName: node
   linkType: hard
 
@@ -2628,6 +2661,13 @@ __metadata:
   languageName: node
   linkType: hard
 
+"is-buffer@npm:^2.0.5":
+  version: 2.0.5
+  resolution: "is-buffer@npm:2.0.5"
+  checksum: 10c0/e603f6fced83cf94c53399cff3bda1a9f08e391b872b64a73793b0928be3e5f047f2bcece230edb7632eaea2acdbfcb56c23b33d8a20c820023b230f1485679a
+  languageName: node
+  linkType: hard
+
 "is-electron@npm:^2.2.0":
   version: 2.2.2
   resolution: "is-electron@npm:2.2.2"
@@ -2921,6 +2961,23 @@ __metadata:
   languageName: node
   linkType: hard
 
+"level-supports@npm:^6.2.0":
+  version: 6.2.0
+  resolution: "level-supports@npm:6.2.0"
+  checksum: 10c0/764d23a037a44b4a8989cf6ebc590ce129e411dba852ccedfe09da1db3bc3dc330d3c43529d0c61748d90597b2e55381811ee2c49b216f2226e7c4789de4b6dc
+  languageName: node
+  linkType: hard
+
+"level-transcoder@npm:^1.0.1":
+  version: 1.0.1
+  resolution: "level-transcoder@npm:1.0.1"
+  dependencies:
+    buffer: "npm:^6.0.3"
+    module-error: "npm:^1.0.1"
+  checksum: 10c0/25936330676325f22c5143aff5c7fe3f1db156db99f9efb07a2642045c2c6ee565fcbfccbadc0600b3abf8bbe595632cacc3dd334009214069d1857daa57987e
+  languageName: node
+  linkType: hard
+
 "libp2p@npm:^3.1.3":
   version: 3.1.3
   resolution: "libp2p@npm:3.1.3"
@@ -3056,6 +3113,13 @@ __metadata:
     promise-retry: "npm:^2.0.1"
     ssri: "npm:^13.0.0"
   checksum: 10c0/525f74915660be60b616bcbd267c4a5b59481b073ba125e45c9c3a041bb1a47a2bd0ae79d028eb6f5f95bf9851a4158423f5068539c3093621abb64027e8e461
+  languageName: node
+  linkType: hard
+
+"maybe-combine-errors@npm:^1.0.0":
+  version: 1.0.0
+  resolution: "maybe-combine-errors@npm:1.0.0"
+  checksum: 10c0/6c9be3750ae912f5083346eab8fb4f688a3781a1254f9002040d54fd6aa18d6f5a3ad3089f1ca27986a0e5d8694449b2487c75920c9549736c617332df782bca
   languageName: node
   linkType: hard
 
@@ -3204,6 +3268,13 @@ __metadata:
   languageName: node
   linkType: hard
 
+"module-error@npm:^1.0.1":
+  version: 1.0.2
+  resolution: "module-error@npm:1.0.2"
+  checksum: 10c0/584a43a1bb2720c6c6c771e257a308af4f042a17c17b1472a2c855130a1ad93ba516a82ae7ac2ce2d03062e521cc53c03ec0ce153795d895312d7747fb3bb99b
+  languageName: node
+  linkType: hard
+
 "mortice@npm:^3.3.1":
   version: 3.3.1
   resolution: "mortice@npm:3.3.1"
@@ -3263,6 +3334,13 @@ __metadata:
   languageName: node
   linkType: hard
 
+"napi-macros@npm:^2.2.2":
+  version: 2.2.2
+  resolution: "napi-macros@npm:2.2.2"
+  checksum: 10c0/cc85daaf82a4f585d30561047cef0f3e702be769b5cf2ffadc6242bc5a1033f6b8269012e54178baf66f022bd18aa9ebb619f1b530cc19c1f9b96f9689affd50
+  languageName: node
+  linkType: hard
+
 "negotiator@npm:^1.0.0":
   version: 1.0.0
   resolution: "negotiator@npm:1.0.0"
@@ -3281,6 +3359,17 @@ __metadata:
   version: 1.6.7
   resolution: "node-fetch-native@npm:1.6.7"
   checksum: 10c0/8b748300fb053d21ca4d3db9c3ff52593d5e8f8a2d9fe90cbfad159676e324b954fdaefab46aeca007b5b9edab3d150021c4846444e4e8ab1f4e44cd3807be87
+  languageName: node
+  linkType: hard
+
+"node-gyp-build@npm:^4.3.0":
+  version: 4.8.4
+  resolution: "node-gyp-build@npm:4.8.4"
+  bin:
+    node-gyp-build: bin.js
+    node-gyp-build-optional: optional.js
+    node-gyp-build-test: build-test.js
+  checksum: 10c0/444e189907ece2081fe60e75368784f7782cfddb554b60123743dfb89509df89f1f29c03bbfa16b3a3e0be3f48799a4783f487da6203245fa5bed239ba7407e1
   languageName: node
   linkType: hard
 

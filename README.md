@@ -25,7 +25,7 @@ See the following documentation:
 * **Database P2P** - packages/db-p2p - Database integration with libp2p, including Arachnode ring discovery (also exports `@optimystic/db-p2p/rn` for React Native — see below)
 * **Database P2P Storage (Filesystem)** - packages/db-p2p-storage-fs - Node.js filesystem storage backend
 * **Database P2P Storage (NativeScript)** - packages/db-p2p-storage-ns - NativeScript storage backend using SQLite
-* **Database P2P Storage (React Native)** - packages/db-p2p-storage-rn - React Native storage backend using MMKV
+* **Database P2P Storage (React Native)** - packages/db-p2p-storage-rn - React Native storage backend using LevelDB
 * **Database P2P Storage (Web)** - packages/db-p2p-storage-web - Browser storage backend using IndexedDB
 * **Reference Peer** - packages/reference-peer - CLI for testing peer-to-peer functionality (run via `optimystic-peer`)
 * **Quereus Plugin Crypto** - packages/quereus-plugin-crypto - Quereus plugin providing cryptographic functions
@@ -71,7 +71,7 @@ const node = await createLibp2pNode({
 });
 ```
 
-For persistent storage on RN, use `@optimystic/db-p2p-storage-rn` (MMKV backend).
+For persistent storage on RN, use `@optimystic/db-p2p-storage-rn` (LevelDB backend via `rn-leveldb`). It shares the same native module as `@quereus/plugin-react-native-leveldb`, so apps embedding both stacks install one binding.
 
 Hermes requires polyfills for several globals (crypto, structuredClone,
 Promise.withResolvers, EventTarget, etc.) and Metro module aliases for Node.js

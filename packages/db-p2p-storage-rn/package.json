@@ -1,8 +1,8 @@
 {
   "name": "@optimystic/db-p2p-storage-rn",
-  "version": "0.13.0",
+  "version": "0.14.0",
   "type": "module",
-  "description": "React Native storage backend for @optimystic/db-p2p using MMKV",
+  "description": "React Native LevelDB storage backend for @optimystic/db-p2p",
   "main": "dist/src/index.js",
   "types": "./dist/src/index.d.ts",
   "files": [
@@ -30,7 +30,7 @@
     "p2p",
     "storage",
     "react-native",
-    "mmkv"
+    "leveldb"
   ],
   "scripts": {
     "clean": "rimraf dist",
@@ -39,11 +39,15 @@
     "test:verbose": "node --import ./register.mjs node_modules/mocha/bin/mocha.js \"test/**/*.spec.ts\" --colors --reporter spec"
   },
   "devDependencies": {
+    "@libp2p/crypto": "^5.1.13",
+    "@libp2p/interface": "^3.1.0",
+    "@libp2p/peer-id": "^6.0.4",
     "@types/chai": "^5.2.3",
     "@types/debug": "^4.1.12",
     "@types/mocha": "^10.0.10",
     "@types/node": "^25.1.0",
     "chai": "^6.2.2",
+    "classic-level": "^3.0.0",
     "mocha": "^11.7.5",
     "rimraf": "^6.1.2",
     "ts-node": "^10.9.2",
@@ -55,10 +59,12 @@
     "debug": "^4.4.3"
   },
   "peerDependencies": {
-    "react-native-mmkv": "^4.0.0"
+    "@libp2p/crypto": "^5.1.13",
+    "@libp2p/interface": "^3.1.0",
+    "rn-leveldb": "^3.11.0"
   },
   "peerDependenciesMeta": {
-    "react-native-mmkv": {
+    "rn-leveldb": {
       "optional": false
     }
   }

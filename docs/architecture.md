@@ -35,7 +35,7 @@ The monorepo is layered from abstract to concrete, with optional front-ends on t
 │           rebalance/spread-on-churn, Arachnode adapter           │
 ├──────────────────────────────────────────────────────────────────┤
 │ Storage Adapters                                                 │
-│   db-p2p-storage-fs (Node fs) · db-p2p-storage-rn (MMKV)         │
+│   db-p2p-storage-fs (Node fs) · db-p2p-storage-rn (LevelDB)      │
 │   db-p2p-storage-web (IndexedDB) · db-p2p-storage-ns (SQLite)    │
 ├──────────────────────────────────────────────────────────────────┤
 │ Network Substrate                                                │
@@ -49,7 +49,7 @@ The monorepo is layered from abstract to concrete, with optional front-ends on t
 | [`@optimystic/db-p2p`](../packages/db-p2p/readme.md) | Concrete libp2p node, cluster consensus, dispute protocol, Arachnode ring discovery |
 | `@optimystic/db-p2p-storage-fs` | Filesystem persistence (Node.js) |
 | `@optimystic/db-p2p-storage-ns` | NativeScript persistence via SQLite |
-| `@optimystic/db-p2p-storage-rn` | React Native persistence via MMKV |
+| `@optimystic/db-p2p-storage-rn` | React Native persistence via LevelDB (`rn-leveldb`) |
 | `@optimystic/db-p2p-storage-web` | Browser persistence via IndexedDB |
 | [`@optimystic/quereus-plugin-optimystic`](../packages/quereus-plugin-optimystic/README.md) | Virtual-table module binding SQL tables to Optimystic tree collections; `StampId()` UDF; `QuereusEngine` validator |
 | `@optimystic/quereus-plugin-crypto` | SQL UDFs for `digest`, `sign`, `verify`, `hash_mod`, `random_bytes` |
