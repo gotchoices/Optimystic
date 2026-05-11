@@ -29,9 +29,7 @@ const textDecoder = new TextDecoder();
  * backends — a native iterator must not stay open across consumer awaits).
  *
  * `promotePendingTransaction` runs as a single `WriteBatch`, making the
- * pending → committed move atomic against crashes — unlike the prior MMKV
- * adapter, which had to issue a separate `set` and `remove` plus update a
- * JSON-encoded pending index.
+ * pending → committed move atomic against crashes.
  */
 export class LevelDBRawStorage implements IRawStorage {
 	constructor(private readonly db: LevelDBLike) {}
