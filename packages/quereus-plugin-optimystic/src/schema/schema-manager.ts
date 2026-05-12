@@ -6,7 +6,8 @@
  */
 
 import type { Tree } from '@optimystic/db-core';
-import type { TableSchema, ColumnSchema } from '@quereus/quereus';
+import type { TableSchema, ColumnSchema, VirtualTableModule } from '@quereus/quereus';
+import { getTypeOrDefault } from '@quereus/quereus';
 import type { ITransactor } from '@optimystic/db-core';
 
 // IndexSchema type from TableSchema.indexes
@@ -75,7 +76,13 @@ export class SchemaManager {
 		this.schemaCache.set(schema.name, stored);
 
 		const tree = await this.getSchemaTree(transactor);
-		await tree.replace([[schema.name, stored]]);
+		// The schema tree's keyExtractor (in collection-factory) treats entries
+		// as `[name, StoredTableSchema]` tuples — keying on `entry[0]`. The
+		// per-table cache and read paths (getSchema, listTables) also expect
+		// the tuple shape. Storing the bare `stored` object made `entry[0]`
+		// undefined inside the btree, so cross-instance reads (and listTables)
+		// couldn't see the entries even after a clean sync.
+		await tree.replace([[schema.name, [schema.name, stored]]]);
 	}
 
 	/**
@@ -88,8 +95,12 @@ export class SchemaManager {
 			return cached;
 		}
 
-		// Load from tree
+		// Load from tree. The btree's local state is built lazily, so a fresh
+		// SchemaManager (e.g. after process restart) sees an empty tree until
+		// we sync against storage — without this, cold-start reads silently
+		// return undefined and callers re-persist a schema that already exists.
 		const tree = await this.getSchemaTree(transactor);
+		await tree.update();
 		const path = await tree.find(tableName);
 		if (!tree.isValid(path)) {
 			return undefined;
@@ -120,6 +131,10 @@ export class SchemaManager {
 	 */
 	async listTables(transactor?: ITransactor): Promise<string[]> {
 		const tree = await this.getSchemaTree(transactor);
+		// Pull the latest tree state from storage; a fresh SchemaManager
+		// otherwise iterates an empty in-memory btree even when the underlying
+		// storage already contains the persisted schemas.
+		await tree.update();
 		const tables: string[] = [];
 
 		for await (const path of tree.range({ isAscending: true } as any)) {
@@ -141,6 +156,61 @@ export class SchemaManager {
 	 */
 	clearCache(): void {
 		this.schemaCache.clear();
+	}
+
+	/**
+	 * Build a Quereus TableSchema from a persisted StoredTableSchema. Used
+	 * during catalog hydration so Quereus's in-memory catalog can short-circuit
+	 * `apply schema` diffs against tables already present in storage.
+	 */
+	storedToTableSchema(
+		stored: StoredTableSchema,
+		vtabModule: VirtualTableModule<any, any>,
+		vtabAuxData?: unknown
+	): TableSchema {
+		const columns: ColumnSchema[] = stored.columns.map(col => ({
+			name: col.name,
+			logicalType: getTypeOrDefault(col.affinity),
+			notNull: col.notNull,
+			primaryKey: col.primaryKey,
+			pkOrder: col.pkOrder,
+			defaultValue: col.defaultValue ?? null,
+			collation: col.collation,
+			generated: col.generated,
+			pkDirection: col.pkDirection,
+		}));
+		const columnIndexMap = new Map<string, number>(
+			columns.map((col, index) => [col.name.toLowerCase(), index])
+		);
+		const primaryKeyDefinition = stored.primaryKeyDefinition.map(pk => ({
+			index: pk.index,
+			desc: pk.desc,
+			collation: pk.collation,
+		}));
+		const indexes: IndexSchema[] = stored.indexes.map(idx => ({
+			name: idx.name,
+			columns: idx.columns.map(col => ({
+				index: col.index,
+				desc: col.desc,
+				collation: col.collation,
+			})),
+		}));
+		return {
+			name: stored.name,
+			schemaName: stored.schemaName,
+			columns,
+			columnIndexMap,
+			primaryKeyDefinition,
+			checkConstraints: [],
+			vtabModule,
+			vtabAuxData,
+			vtabArgs: stored.vtabArgs,
+			vtabModuleName: stored.vtabModuleName,
+			isTemporary: stored.isTemporary,
+			isView: false,
+			indexes,
+			estimatedRows: stored.estimatedRows,
+		};
 	}
 
 	/**

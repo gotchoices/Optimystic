@@ -59,6 +59,15 @@ export default function register(_db: Database, config: Record<string, SqlValue>
 		// Expose internal components for testing and advanced usage
 		collectionFactory,
 		txnBridge,
+		/**
+		 * Hydrate Quereus's in-memory catalog from persisted Optimystic vtab
+		 * schemas. Hosts that re-open a `Database` against existing storage
+		 * should call this once after registering the plugin (and before
+		 * running `apply schema` / DDL) so Quereus sees the existing tables in
+		 * its catalog and skips re-emitting CREATE TABLE / CREATE INDEX for
+		 * each one. Idempotent.
+		 */
+		hydrate: (db: Database) => optimysticModule.hydrateCatalog(db, config, config),
 	};
 }
 

@@ -11,10 +11,11 @@ import { OptimysticVirtualTableConnection } from './optimystic-adapter/vtab-conn
 import type { ParsedOptimysticOptions } from './types.js';
 import type { IRawStorage } from '@optimystic/db-p2p';
 import { VirtualTable } from '@quereus/quereus';
-import type { VirtualTableModule, BaseModuleConfig, Database, TableSchema, Row, FilterInfo, BestAccessPlanRequest, BestAccessPlanResult, OrderingSpec, VirtualTableConnection, TableIndexSchema as IndexSchema, UpdateArgs, UpdateResult } from '@quereus/quereus';
+import type { VirtualTableModule, BaseModuleConfig, Database, TableSchema, Row, FilterInfo, BestAccessPlanRequest, BestAccessPlanResult, OrderingSpec, VirtualTableConnection, TableIndexSchema as IndexSchema, UpdateArgs, UpdateResult, SqlValue } from '@quereus/quereus';
 import { Tree } from '@optimystic/db-core';
 import { KeyRange } from '@optimystic/db-core';
 import { SchemaManager } from './schema/schema-manager.js';
+import type { StoredTableSchema } from './schema/schema-manager.js';
 import { RowCodec, type EncodedRow } from './schema/row-codec.js';
 import { SqlDataType } from '@quereus/quereus';
 import { INTEGER_TYPE, REAL_TYPE, TEXT_TYPE, BLOB_TYPE, NUMERIC_TYPE, NULL_TYPE, BOOLEAN_TYPE, type LogicalType } from '@quereus/quereus';
@@ -128,24 +129,28 @@ export class OptimysticVirtualTable extends VirtualTable {
         txnState || undefined
       );
 
-      // If this is a new table (xCreate), store the schema
-      // If connecting to existing table (xConnect), load the schema
-      let storedSchema = await this.schemaManager.getSchema(this.tableName, txnState?.transactor);
+      // Resolve which schema to honour as the table's effective shape:
+      //   - xCreate (DDL provided columns): keep the local DDL schema and
+      //     (re-)write it to storage so this node's view is what's persisted.
+      //     Multi-node hosts that intentionally re-CREATE the same table with
+      //     a different shape rely on the local DDL winning over what a peer
+      //     last wrote.
+      //   - xConnect / hydrated (no local columns): load the persisted schema
+      //     and stamp it onto the placeholder tableSchema so query planning
+      //     can see the real columns.
+      const persistedSchema = await this.schemaManager.getSchema(this.tableName, txnState?.transactor);
+      const hasLocalColumns = this.tableSchema.columns.length > 0;
+      let storedSchema: StoredTableSchema;
 
-      if (!storedSchema) {
-        // New table - store the schema
-        if (this.tableSchema.columns.length === 0) {
-          throw new Error('Cannot create table without column definitions');
-        }
+      if (hasLocalColumns) {
         await this.schemaManager.storeSchema(this.tableSchema, txnState?.transactor);
-        storedSchema = await this.schemaManager.getSchema(this.tableName, txnState?.transactor);
-        if (!storedSchema) {
+        const written = await this.schemaManager.getSchema(this.tableName, txnState?.transactor);
+        if (!written) {
           throw new Error('Failed to store and retrieve schema');
         }
-      } else {
-        // Existing table - update our tableSchema with the loaded schema
-        // This is important for connect() which creates a minimal schema
-        this.tableSchema.columns = storedSchema.columns.map((col, index) => ({
+        storedSchema = written;
+      } else if (persistedSchema) {
+        this.tableSchema.columns = persistedSchema.columns.map((col, index) => ({
           name: col.name,
           affinity: col.affinity as any,
           logicalType: affinityToLogicalType(col.affinity as any),
@@ -159,13 +164,16 @@ export class OptimysticVirtualTable extends VirtualTable {
           index,
         }));
         this.tableSchema.columnIndexMap = new Map(
-          storedSchema.columns.map((col, index) => [col.name.toLowerCase(), index])
+          persistedSchema.columns.map((col, index) => [col.name.toLowerCase(), index])
         );
-        this.tableSchema.primaryKeyDefinition = storedSchema.primaryKeyDefinition.map(pk => ({
+        this.tableSchema.primaryKeyDefinition = persistedSchema.primaryKeyDefinition.map(pk => ({
           index: pk.index,
           desc: pk.desc,
           collation: pk.collation,
         }));
+        storedSchema = persistedSchema;
+      } else {
+        throw new Error('Cannot create table without column definitions');
       }
 
       this.rowCodec = new RowCodec(storedSchema, this.options.encoding);
@@ -793,6 +801,41 @@ export class OptimysticModule implements VirtualTableModule<OptimysticVirtualTab
   }
 
   /**
+   * Build (and cache) an OptimysticVirtualTable for the given TableSchema.
+   * Shared by create() (new storage), connect() (catalog-bound after import or
+   * via runtime query), and hydrateCatalog() (catalog warm-up).
+   */
+  private async instantiateTable(
+    db: Database,
+    tableSchema: TableSchema,
+    options?: ParsedOptimysticOptions
+  ): Promise<OptimysticVirtualTable> {
+    const tableKey = `${tableSchema.schemaName}.${tableSchema.name}`.toLowerCase();
+    const existing = this.tables.get(tableKey);
+    if (existing) {
+      await existing.initialize();
+      return existing;
+    }
+
+    const tableOptions = options ?? this.parseTableSchema(tableSchema);
+    const schemaManager = this.createSchemaManager(tableOptions);
+    const table = new OptimysticVirtualTable(
+      db,
+      this,
+      tableSchema.schemaName || 'main',
+      tableSchema.name,
+      tableSchema,
+      tableOptions,
+      this.collectionFactory,
+      this.txnBridge,
+      schemaManager
+    );
+
+    this.tables.set(tableKey, table);
+    return table;
+  }
+
+  /**
    * Creates the persistent definition of a virtual table
    */
   async create(
@@ -806,22 +849,7 @@ export class OptimysticModule implements VirtualTableModule<OptimysticVirtualTab
       throw new Error(`Optimystic table '${tableSchema.name}' already exists in schema '${tableSchema.schemaName}'.`);
     }
 
-    const options = this.parseTableSchema(tableSchema);
-    const schemaManager = this.createSchemaManager(options);
-    const table = new OptimysticVirtualTable(
-      db,
-      this,
-      tableSchema.schemaName || 'main',
-      tableSchema.name,
-      tableSchema,
-      options,
-      this.collectionFactory,
-      this.txnBridge,
-      schemaManager
-    );
-
-    // Cache the table
-    this.tables.set(tableKey, table);
+    const table = await this.instantiateTable(db, tableSchema);
 
     // Initialize table and register connection before returning
     // This ensures the table is fully ready for queries and transactions
@@ -832,28 +860,124 @@ export class OptimysticModule implements VirtualTableModule<OptimysticVirtualTab
   }
 
   /**
-   * Connects to an existing virtual table definition
+   * Connects to an existing virtual table definition.
+   * If the table isn't yet cached (e.g. after catalog hydration on a fresh
+   * `Database`, or when called by Quereus's runtime against an imported
+   * schema), instantiate it from the supplied tableSchema and let
+   * initialize() bind it to the persisted storage.
    */
   async connect(
-    _db: Database,
+    db: Database,
     _pAux: unknown,
     _moduleName: string,
     schemaName: string,
     tableName: string,
-    _options: OptimysticModuleConfig
+    _options: OptimysticModuleConfig,
+    tableSchema?: TableSchema
   ): Promise<OptimysticVirtualTable> {
     const tableKey = `${schemaName}.${tableName}`.toLowerCase();
     const existingTable = this.tables.get(tableKey);
 
-    if (!existingTable) {
+    if (existingTable) {
+      await existingTable.initialize();
+      return existingTable;
+    }
+
+    const resolvedSchema = tableSchema ?? db.schemaManager.findTable(tableName, schemaName);
+    if (!resolvedSchema) {
       throw new Error(`Optimystic table definition for '${tableName}' not found. Cannot connect.`);
     }
 
-    // Ensure the table is initialized before returning
-    // (should already be initialized from create(), but this handles edge cases)
-    await existingTable.initialize();
+    const table = await this.instantiateTable(db, resolvedSchema);
+    await table.initialize();
+    await table.ensureConnectionRegistered();
 
-    return existingTable;
+    return table;
+  }
+
+  /**
+   * Hydrate Quereus's in-memory catalog from persisted vtab schemas, so a
+   * subsequent `apply schema` (or `CREATE TABLE IF NOT EXISTS`) sees existing
+   * tables and avoids re-emitting per-table CREATE/CREATE INDEX statements
+   * against storage on every cold start.
+   *
+   * Idempotent — tables already present in the catalog are skipped.
+   * Returns the count of tables and indexes added to the catalog.
+   */
+  async hydrateCatalog(
+    db: Database,
+    config: Record<string, SqlValue> = {},
+    auxData?: unknown
+  ): Promise<{ tables: number; indexes: number }> {
+    const options = this.deriveDefaultOptions(config);
+    const schemaManager = this.createSchemaManager(options);
+
+    let tableNames: string[];
+    try {
+      tableNames = await schemaManager.listTables();
+    } catch (error) {
+      // No persisted schema tree yet (cold start) — nothing to hydrate.
+      const message = error instanceof Error ? error.message : String(error);
+      if (/not found|missing|empty/i.test(message)) {
+        return { tables: 0, indexes: 0 };
+      }
+      throw error;
+    }
+
+    const targetSchemaName = db.schemaManager.getCurrentSchemaName();
+    const targetSchema = db.schemaManager.getSchemaOrFail(targetSchemaName);
+
+    let tables = 0;
+    let indexes = 0;
+    for (const tableName of tableNames) {
+      if (targetSchema.getTable(tableName)) continue;
+
+      const stored = await schemaManager.getSchema(tableName);
+      if (!stored) continue;
+
+      const tableSchema = schemaManager.storedToTableSchema(stored, this, auxData);
+      // Re-stamp the schema name in case the host's current schema differs
+      // from whatever was persisted.
+      const hydratedSchema: TableSchema = {
+        ...tableSchema,
+        schemaName: targetSchemaName,
+      };
+      targetSchema.addTable(hydratedSchema);
+      tables++;
+      indexes += hydratedSchema.indexes?.length ?? 0;
+    }
+
+    return { tables, indexes };
+  }
+
+  /**
+   * Mirror parseTableSchema's default-resolution against the plugin's
+   * registration config so hydrateCatalog can open the schema tree using the
+   * same transactor/network the tables themselves will use.
+   */
+  private deriveDefaultOptions(config: Record<string, SqlValue>): ParsedOptimysticOptions {
+    const aux = config as Record<string, unknown>;
+    const transactor = (aux['default_transactor'] as string) || 'network';
+    const keyNetwork = (aux['default_key_network'] as string) || 'libp2p';
+    const port = typeof aux['default_port'] === 'number' ? (aux['default_port'] as number) : 0;
+    const networkName = (aux['default_network_name'] as string) || 'optimystic';
+    const rawStorageFactory = typeof aux['rawStorageFactory'] === 'function'
+      ? (aux['rawStorageFactory'] as () => IRawStorage)
+      : undefined;
+
+    return {
+      collectionUri: 'tree://optimystic/schema',
+      transactor,
+      keyNetwork,
+      libp2pOptions: {
+        port,
+        networkName,
+        bootstrapNodes: [],
+      },
+      cache: true,
+      encoding: 'json',
+      rawStorageFactory,
+    };
   }
 
   /**
@@ -1090,7 +1214,9 @@ export class OptimysticModule implements VirtualTableModule<OptimysticVirtualTab
 
   /**
    * Destroys the underlying persistent representation of the virtual table.
-   * Removes the table from the internal registry so the name can be re-used.
+   * Removes the table from the internal registry so the name can be re-used,
+   * and deletes the persisted schema entry so a subsequent CREATE TABLE with
+   * the same name picks up the new shape rather than the old one.
    */
   async destroy(
     _db: Database,
@@ -1100,6 +1226,15 @@ export class OptimysticModule implements VirtualTableModule<OptimysticVirtualTab
     tableName: string
   ): Promise<void> {
     const tableKey = `${schemaName}.${tableName}`.toLowerCase();
+    const table = this.tables.get(tableKey);
+    if (table) {
+      try {
+        const txnState = (table as any).txnBridge?.getCurrentTransaction?.();
+        await (table as any).schemaManager.deleteSchema(tableName, txnState?.transactor);
+      } catch {
+        // Best-effort: a schema-tree write failure shouldn't stop teardown.
+      }
+    }
     this.tables.delete(tableKey);
   }
 }
