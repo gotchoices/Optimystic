@@ -31,6 +31,22 @@ const rows = await db.all("SELECT * FROM users WHERE id = 'u1'");
 
 See [examples/README.md](./examples/README.md) for Quoomb interactive console configs and multi-node mesh setup.
 
+## Warm Restart — `plugin.hydrate(db)`
+
+When re-opening a `Database` against storage that already contains Optimystic-backed tables, call `plugin.hydrate(db)` **before** running any `apply schema` or `CREATE TABLE IF NOT EXISTS` statements. Without hydration, Quereus diffs the new DDL against an empty in-memory catalog and re-emits a `CREATE TABLE` (and per-index `CREATE INDEX`) for every table — each one round-tripping through the schema tree even though no row data changes. After hydration the catalog already lists those tables, so the DDL diff is a no-op.
+
+```typescript
+const plugin = register(db, { default_transactor: 'local', ... });
+for (const v of plugin.vtables) db.registerModule(v.name, v.module, v.auxData);
+for (const f of plugin.functions) db.registerFunction(f.schema);
+
+await plugin.hydrate(db); // populate catalog from persisted vtab schemas
+
+await db.exec(`declare schema App { ... } apply schema App;`); // no-op after hydrate
+```
+
+`hydrate(db)` resolves to `{ tables, indexes }` (counts of newly-added catalog entries). It is idempotent and a no-op against empty storage.
+
 ## Virtual Table Options
 
 Options are passed in the `USING optimystic(...)` clause:
