@@ -1,177 +1,370 @@
-# Matchmaking Subsystem
-Rendezvous-based matchmaking in Kademlia DHT Networks
+# Matchmaking
 
-## Introduction
+Rendezvous-based peer discovery and quorum assembly for Optimystic, built as the **directory application** of the cohort-topic substrate ([cohort-topic.md](cohort-topic.md)). Matchmaking provides the discovery primitive used wherever the system needs to find peers: forming processing clusters, requesting work, locating capability-bearing nodes, and assembling voting quorums.
 
-In Optimystic's peer-to-peer (P2P) networks, efficient matchmaking between peers is crucial, especially when dealing with dynamic and varying network sizes. Optimystic's rendezvous-based matchmaking design ensures that peers can find each other efficiently, whether the network has millions of nodes or just a few, and whether the subset of nodes interested in a particular task is large or sparse. Broadly, matchmaking is used for:
-* Finding peers to collaborate on distributed tasks such as forming processing clusters
-* Requesting peers to perform work, such as coordinating changes to shared data structures
-* Discovering nodes with specific capabilities or resources
-* Load balancing work across available nodes in the network
+---
 
-## Overview of the Design
+## Overview
 
-The core idea is to have nodes "meet" at as local as possible rendezvous points. **Rendezvous keys** are derived from a combination of **local node address information** and **task-specific hashes**. Peers adjust the specificity of these keys based on the distribution of their local Kademlia buckets and the network conditions. By doing so, peers can effectively control the granularity of their search and matchmaking process.
+Matchmaking solves a single problem: given a *task* or *capability label*, find a small set of peers willing to act on it. The task might be:
 
-- **Most General Rendezvous Key**: A key that points to a single location in the DHT, the place of maximal likelihood to find other interested peers.
-- **Most Specific Rendezvous Keys**: Keys that are more widely distributed across the DHT, representing less likely places to find other interested peers.
-- **Adaptive Specificity**: Peers adjust the specificity of their rendezvous keys based on the number of matches found, scaling naturally with the network size and density of interested peers.
+- Forming a cluster to validate a transaction (engaged by the transaction coordinator).
+- Recruiting workers to perform off-chain computation.
+- Discovering peers that hold a specific capability (storage class, geographic region, hardware feature).
+- Assembling a voting quorum for a governance decision.
 
-## Generating Rendezvous Keys
+A matchmaking participant adopts one of two roles:
 
-### Steps to Generate an initial Rendezvous Key
+- **Provider** — "I am available to perform task T." Registers long-lived. Renews until work arrives or it withdraws.
+- **Seeker** — "I need peers willing to perform task T." Registers short-lived, queries existing provider registrations at the same cohort, makes its choices, and detaches.
 
-1. **Estimate Local Common Significant Bits**:
-   - Analyze the **n-nearest peer addresses** in the Kademlia routing table.
-   - Determine the number of **common significant bits** among these addresses.
-   - This common prefix represents the shared address space in the local network neighborhood.
+Both roles use the same cohort-topic registration mechanism with stable topic anchors. The walk-toward-root from `d_max`, willingness checks, promotion/demotion, primary/backup sharding, and TTL semantics are all inherited unchanged. This document specifies only the matchmaking-specific shape: anchor derivation, the provider/seeker registration payloads, the query protocol, and the voting-quorum use case.
 
-2. **Create the Rendezvous Key**:
-   - **Most Significant Bits (MSBs)**: Use the common significant bits from the local address estimation.
-   - **Least Significant Bits (LSBs)**: Use bits from the **hashed topic identifier** (e.g., `SHA-256` hash of the task type).
-   - **Combined Key**: Concatenate the MSBs and LSBs to form the initial rendezvous key.
+This replaces the earlier Kademlia `provide`/`findProviders` framing. The cohort-topic layer gives matchmaking what the original provide-based approach could not: tree growth that automatically adapts to hot tasks (without flooding), cohort-stable forwarder identity (instead of fragile per-key replication), and shared infrastructure with reactivity and future directory consumers.
 
-### Adjusting the Rendezvous Key Specificity
+---
 
-- **Insufficient Matches**:
-  - If no or too few peers are found at the current rendezvous point:
-    - **Decrease** the number of local common bits used (making the key less specific to the local address space).
-    - **Increase** the number of topic hash bits used.
-- **Too Many Matches**:
-  - If too many peers are found (overcrowding the rendezvous point):
-    - **Increase** the number of local common bits used (making the key more specific to the local address space).
-    - **Decrease** the number of topic hash bits used.
+## Goals and non-goals
 
-- **Extreme Cases**:
-  - **Very Sparse Networks**: Use the entire topic hash, resulting in a single rendezvous point.
-  - **Very Dense Networks**: Use more local common bits to narrow down the rendezvous point.
+### Goals
+- One mechanism to find peers willing to do a task, scaling from tiny networks to millions of peers.
+- Identical infrastructure for provider discovery, work matching, capability lookup, and voting-quorum assembly.
+- Anti-flood behavior under hot tasks (popular voting topics, hot capabilities) without configuration tuning.
+- Light cost on lightweight nodes: phones can be seekers freely, providers within capacity, and never forwarders.
+- Verifiable provider identity (signed registrations).
 
-## Matchmaking Process
+### Non-goals
+- Authoritative "who is the worker for X" answers — matchmaking returns a *set* of candidates; the seeker selects.
+- Cross-task atomicity. Each match is a single task; multi-task transactions belong to the coordinator layer.
+- Strict freshness. Provider registrations are TTL-bounded; queries see whatever's currently registered. Stale providers expire naturally.
+- Geographic or latency optimization. Matchmaking returns identities; the seeker dials and measures.
 
-### Steps for Active Matchers
+---
 
-1. **Generate Initial Rendezvous Key**:
-   - Follow the steps in **Generating Rendezvous Keys**.
+## Anchor: stable per-task
 
-2. **Publish Matchmaking Intent**:
-   - Use a `provide` operation to store your availability or matchmaking intent at the rendezvous key in the DHT.
+Unlike reactivity, matchmaking topics do not rotate. A task or capability label has a stable identity over its useful lifetime, and matchmaking participants benefit from the tree persisting:
 
-3. **Search for Matches**:
-   - Perform a `findProviders` operation at the rendezvous key to retrieve other peers' matchmaking intents.
+```
+topicId(task T) = H(T.kind ‖ T.label ‖ "match")
+```
 
-4. **Evaluate Matches**:
-   - If sufficient matches are found, proceed to establish connections.
-   - If not, adjust the rendezvous key specificity and repeat the process.
+Where:
+- `T.kind` is one of `"task"`, `"capability"`, `"quorum"`, `"capacity-class"`, etc. — categorizes the topic so unrelated namespaces don't collide.
+- `T.label` is application-defined. For a capability lookup, the capability name; for a voting quorum, the proposal hash; for a work task, the task type identifier.
 
-5. **Adjust Specificity as Needed**:
-   - Use the methods described in **Adjusting the Rendezvous Key Specificity**.
+The cohort-topic tier addressing proceeds normally on this stable `topicId`. Long-lived tasks (capabilities that persist across many work items) develop a tree that matures over time; short-lived tasks (a single voting proposal) form a shallow tree that demotes back to a single root cohort once the work is done.
 
-### Steps for Waiting Workers
+---
 
-1. **Generate Rendezvous Key**:
-   - Similar to active matchers, but may start with less specificity to join a broader pool.
+## Provider registration
 
-2. **Register Availability**:
-   - Store your availability at the rendezvous key with a Time-To-Live (TTL) value.
-   - **Renew TTL** periodically to maintain presence.
+A node willing to perform task `T` registers as a provider:
 
-3. **Wait for Work**:
-   - Monitor for incoming requests or work assignments from peers.
+```
+SubscribeAppPayloadV1.kind == "match-provider"
+```
 
-4. **Adjust Specificity if Overcrowded**:
-   - When renewing, if the rendezvous point becomes too crowded, increase specificity to balance the load.
+with `appPayload`:
 
-## Worker Nodes vs. Active Matchers
+```
+ProviderAppPayloadV1 {
+  kind:            "match-provider"
+  capabilities:    string[]            // application-defined attribute tags
+  capacityBudget:  number              // tasks this provider will accept concurrently
+  serviceUntil?:   number              // unix ms, soft expiry hint to seekers
+  contactHint:     string              // multiaddr or PeerId-based callback
+  signature:       string              // over capabilities + capacityBudget + topicId + correlationId
+}
+```
 
-### Worker Nodes Waiting for Work
+The registration uses cohort-topic tier `T2` (functional). TTL is the cohort-topic default for the provider's node profile — typically 90 s on a Core node, 60 s on Edge. Providers renew normally; if a provider stops renewing, its registration ages out and seekers stop seeing it.
 
-- **Objective**: Remain available for work assignments without immediate matchmaking.
-- **Approach**:
-  - **Longer TTLs**: Register at rendezvous points with longer TTLs, periodically renewing to stay available.
-  - **Load Management**: Adjust rendezvous key specificity to balance the number of workers at each point.
-  - **Wait State**: Remain at the rendezvous point until work is assigned, rather than actively searching for matches.
+Providers are not exclusive. The same node may provide for multiple `T` simultaneously, registering at each topic's tree independently. The cohort-topic per-cohort topic budget bounds how much breadth any single cohort sees.
 
-### Active Matchers Seeking Immediate Matches
+### Provider self-throttling
 
-- **Objective**: Quickly find peers to collaborate on tasks.
-- **Approach**:
-  - **Short TTLs**: Use shorter TTLs since the intent is to find matches quickly and then leave.
-  - **Aggressive Specificity Adjustment**: Rapidly adjust rendezvous key specificity if matches are not found.
-  - **Direct Connection**: Upon finding matches, establish direct peer-to-peer connections and proceed with the task.
+A provider whose `capacityBudget` is reached has two options:
 
-## Example Scenarios
+- **Withdraw** by sending a `RenewV1` with TTL = 0, evicting the registration immediately.
+- **Stay listed but signal full** by setting `capacityBudget` to 0 in subsequent renewals. Seekers can interpret this as "available but at capacity"; appropriate when a fast turnover is expected.
 
-### Scenario 1: Sparse Network Matchmaking
+Either way, the layer enforces correctness only at the registration level; the seeker is responsible for picking among current providers.
 
-- **Network Size**: 1,000,000 peers
-- **Interested Peers**: 10 peers
+---
 
-#### Steps:
+## Seeker query
 
-1. **Estimate Local Common Bits**:
-   - Assume the local common prefix is 10 bits.
+A seeker looking for providers also registers at the topic, briefly, so that:
 
-2. **Generate Rendezvous Key**:
-   - **MSBs**: 10 local common bits.
-   - **LSBs**: Remaining bits from the topic hash (e.g., 150 bits for a 160-bit keyspace).
+- Other seekers can find it (useful for collective work assembly: voting quorum members can find one another).
+- The cohort knows there's active demand for this topic, biasing willingness and promotion behavior.
 
-3. **Publish and Search**:
-   - Peers store their intent at the rendezvous key and attempt to retrieve others' intents.
+```
+SubscribeAppPayloadV1.kind == "match-seeker"
+```
 
-4. **Insufficient Matches Found**:
-   - Peers find no matches due to sparsity.
+with `appPayload`:
 
-5. **Adjust Specificity**:
-   - **Decrease** local common bits to 9.
-   - **Increase** topic hash bits by 1.
+```
+SeekerAppPayloadV1 {
+  kind:           "match-seeker"
+  wantCount:      number              // number of providers desired
+  filter:         CapabilityFilter?   // optional, see below
+  contactHint:    string              // for collective-assembly use
+  signature:      string
+}
+```
 
-6. **Repeat Steps**:
-   - Continue adjusting until matches are found, potentially ending up using the entire topic hash.
+with TTL set short — typically 5–15 s — since seekers normally don't wait long.
 
-### Scenario 2: Dense Network Matchmaking
+After registering, the seeker queries the cohort:
 
-- **Network Size**: 1,000,000 peers
-- **Interested Peers**: 500,000 peers
+```
+QueryV1 { topicId, includeProviders: true, includeSeekers: false, limit }
+QueryReplyV1 {
+  providers:  ProviderEntryV1[]       // up to limit
+  seekers?:   SeekerEntryV1[]         // when includeSeekers
+  truncated:  boolean
+  cohortEpoch: string
+}
+```
 
-#### Steps:
+The cohort returns its locally-known direct provider registrations matching `filter`. If `truncated == true`, the cohort had more matches than `limit` allowed; the seeker may re-query at a different cohort within the same tree (any cohort along the seeker's walk path, since each tier holds a disjoint shard of providers by peer-prefix). For most cases a single cohort's slice is sufficient.
 
-1. **Estimate Local Common Bits**:
-   - Assume the local common prefix is 10 bits.
+### Capability filter
 
-2. **Generate Rendezvous Key**:
-   - Start with the initial rendezvous key as above.
+```
+CapabilityFilter {
+  must:        string[]      // tags that must all be present
+  mustNot:     string[]      // tags that must not be present
+  minBudget?:  number        // skip providers whose capacityBudget is below this
+}
+```
 
-3. **Publish and Search**:
-   - Peers store their intent and retrieve others'.
+The filter is evaluated locally at the cohort. Filters are advisory: they bias which providers the cohort returns but do not constitute admission. The seeker re-validates against the returned set.
 
-4. **Too Many Matches Found**:
-   - Peers encounter overcrowding at the rendezvous point.
+### Distributing the query across the tree
 
-5. **Adjust Specificity**:
-   - **Increase** local common bits to 11.
-   - **Decrease** topic hash bits by 1.
+When a topic is hot enough that providers live across many tier-`d ≥ 1` cohorts, a seeker may want a representative sample across the ring. Two patterns:
 
-6. **Repeat Steps**:
-   - Continue adjusting until a manageable number of matches are found.
+1. **Single-cohort sample.** The seeker queries the cohort it registered with. Providers held there are sharded by peer-ID prefix; the sample is biased toward providers whose peer-ID shares the seeker's prefix. Often this is fine — geographic and latency locality often correlate with prefix locality in deployed networks.
+2. **Multi-cohort sweep.** The seeker, after registering at its natural tier, additionally queries the root cohort (tier 0). The root maintains aggregated provider counts (not individual entries, but bucketed counts per tier-1 shard) and can redirect the seeker to specific tier-1 cohorts holding many providers. The seeker then queries those directly.
 
-### Scenario 3: Worker Nodes Waiting for Work
+The multi-cohort sweep costs more RPCs and is reserved for use cases where representativeness matters more than latency (voting quorums, capability fairness audits).
 
-- **Network Size**: 1,000,000 workers
-- **Work Availability**: Limited tasks at any given time
+---
 
-#### Steps:
+## Voting-quorum assembly
 
-1. **Generate Rendezvous Key**:
-   - Workers estimate local common bits and generate the key accordingly.
+Voting is a first-class consumer of matchmaking. The voting subsystem assembles a quorum of peers to count ballots, validate eligibility, and produce a threshold-signed tally. Matchmaking provides the discovery primitive:
 
-2. **Register Availability with Longer TTLs**:
-   - Workers store their availability at the rendezvous point, renewing TTLs to stay registered.
+1. A proposal `P` defines a `topicId = H("quorum" ‖ proposalHash(P) ‖ "match")`.
+2. Eligible voters (or vote-counters, depending on the voting protocol) register as providers at this topic. Their `capabilities` field carries proof-of-eligibility tags (e.g., a signature over the proposal from a stake-bearing key).
+3. The voting coordinator registers as a seeker, queries the cohort, and receives the set of eligible registered voters.
+4. The coordinator selects a quorum from the returned set, using whatever quorum rule the voting protocol specifies (random sample, stake-weighted selection, geographic distribution, etc.).
+5. The coordinator dials the selected providers directly and runs the protocol-specific vote-collection RPCs (which are *not* part of matchmaking).
+6. When voting concludes, the topic's tree demotes naturally as providers stop renewing.
 
-3. **Load Balancing**:
-   - Workers adjust specificity to ensure that rendezvous points are not overcrowded.
+### Why this works for voting
 
-4. **Task Assignment**:
-   - Peers with work to assign search the rendezvous points to find available workers.
+- **Anti-flood under heavy participation**: a high-profile vote will produce a deep tree as registrations exceed `cap_promote`; queries shard across the tree without overloading the root cohort or any single cohort.
+- **Verifiable eligibility**: provider registrations are signed, eligibility evidence is part of `capabilities`, and the cohort's threshold-signed responses anchor the result.
+- **Bounded membership**: TTL ensures dead voters age out; the cohort never reports staler-than-TTL registrations.
+- **Resists Sybil at the matchmaking layer**: the cohort doesn't validate eligibility (that's the application's job), but the per-peer rate limits and signature requirements raise the cost of forging mass registrations.
 
-5. **Waiting State**:
-   - Workers remain at the rendezvous point until selected for work.
+The voting protocol itself — ballot privacy, tally aggregation, dispute escalation — is out of scope for this document and will be specified separately. Matchmaking only provides "find the peers."
+
+---
+
+## Walk and willingness, in matchmaking terms
+
+The cohort-topic walk-toward-root from `d_max` and reply set apply unchanged:
+
+| Reply | Meaning for matchmaking |
+|---|---|
+| `Accepted` | Provider or seeker registered at this cohort |
+| `NoState` | This cohort doesn't yet serve this topic; walk one tier toward the root |
+| `Promoted(targetTier)` | Tree has grown past this tier; register deeper using your own peer prefix |
+| `UnwillingMember` | This cohort member declines; ask a sibling member |
+| `UnwillingCohort` | No member of this cohort will serve this topic; back off in time, retry from `d_max` |
+
+`UnwillingCohort` is particularly important for matchmaking on hot topics: if every cohort along the walk path is busy with higher-tier work (T0 commits, T1 chain serving), the seeker waits rather than re-probing aggressively. The wait drains as load shifts; the seeker is not punished for participating in a popular task, but it is asked not to make the popularity worse.
+
+There is no separate "try inward and outward" exploration mode. Provider and seeker walks are the same single-direction walk that every cohort-topic application uses.
+
+---
+
+## Failure modes (matchmaking-specific)
+
+### Provider primary fails mid-renewal
+Standard cohort-topic primary handoff. The registration record is in cohort gossip, backups take over. Seekers querying during the gap may not see this provider; on the seeker's next query (or on the provider's next renewal) it reappears.
+
+### Seeker dies mid-query
+Seeker registration ages out via short TTL. Providers may notice (if they monitor seeker activity for collective assembly) but in general nothing else needs to happen.
+
+### Topic suddenly becomes hot
+A topic's tree grows by normal promotion. Seekers querying during a promotion event may receive the cohort's pre-promotion provider set; this is acceptable because matchmaking returns advisory sets — the seeker re-queries if it didn't get enough matches, which naturally happens at the next-tier cohort after the redirect.
+
+### Topic mostly empty but has stale registrations
+TTL expiry handles this. Eviction is gossiped within the cohort; queries always return the post-eviction view.
+
+### Topic root cohort overloaded by simultaneous bootstrap
+A topic that becomes hot all at once (e.g., a flash vote) has its first wave of registrations land at the root. The root accepts up to `cap_promote = 64` then fast-promotes (`cap_promote_fast = 32` under load). Subsequent registrations get `Promoted(1)` immediately. The "all at once" wave is bounded by the cohort-topic per-peer rate limit (`register_rate_per_peer = 4 / min` per cohort), which slows pathological storms structurally.
+
+---
+
+## Wire formats
+
+Matchmaking reuses `RegisterV1`, `RenewV1`, etc., from cohort-topic. The application-specific additions:
+
+### Provider registration payload
+
+```
+interface ProviderAppPayloadV1 {
+  kind:            "match-provider"
+  capabilities:    string[]
+  capacityBudget:  number
+  serviceUntil?:   number
+  contactHint:     string             // multiaddr or PeerId, application-defined format
+  signature:       string             // base64url, over (topicId, capabilities, capacityBudget, correlationId)
+}
+```
+
+### Seeker registration payload
+
+```
+interface SeekerAppPayloadV1 {
+  kind:           "match-seeker"
+  wantCount:      number
+  filter?:        CapabilityFilter
+  contactHint:    string
+  signature:      string
+}
+
+interface CapabilityFilter {
+  must:        string[]
+  mustNot:     string[]
+  minBudget?:  number
+}
+```
+
+### Query
+
+```
+interface QueryV1 {
+  v:                  1
+  topicId:            string
+  includeProviders:   boolean
+  includeSeekers:     boolean
+  filter?:            CapabilityFilter
+  limit:              number          // up to 256 entries per response
+  requesterId:        string          // PeerId
+  timestamp:          number
+  signature:          string
+}
+
+interface QueryReplyV1 {
+  v:           1
+  providers?:  ProviderEntryV1[]
+  seekers?:    SeekerEntryV1[]
+  truncated:   boolean
+  cohortEpoch: string
+  signature:   string                 // cohort primary's reply signature; not threshold
+}
+
+interface ProviderEntryV1 {
+  participantId:  string              // PeerId
+  capabilities:   string[]
+  capacityBudget: number
+  contactHint:    string
+  attachedAt:     number
+  registrationSig: string             // the provider's original signature, forwarded
+}
+
+interface SeekerEntryV1 {
+  participantId:  string
+  wantCount:      number
+  contactHint:    string
+  attachedAt:     number
+  registrationSig: string
+}
+```
+
+The query reply is signed by the cohort primary (single-member signature, not threshold) because the response is advisory: the seeker re-validates `registrationSig` on each entry to confirm provider authenticity. The cohort does not vouch for the providers; it vouches only for "these were the registrations I held."
+
+### Aggregated provider counts (root cohort, multi-cohort sweep)
+
+```
+interface AggregateCountV1 {
+  v:           1
+  topicId:     string
+  bucketCounts: {
+    targetTier:  number               // typically 1
+    prefixSlot:  number               // 0..(F − 1)
+    count:       number               // log-bucketed
+  }[]
+  signature:   string
+  cohortEpoch: string
+}
+```
+
+Returned only by promoted cohorts; cold cohorts that fall through to `NoState` don't produce this.
+
+---
+
+## Configuration
+
+### Defaults (matchmaking-specific)
+
+| Parameter | Default | Description |
+|---|---|---|
+| `provider_ttl` (Core) | 90 s | Provider registration TTL on Core nodes |
+| `provider_ttl` (Edge) | 60 s | Provider registration TTL on Edge nodes |
+| `seeker_ttl` | 10 s | Seeker registration TTL |
+| `query_limit_max` | 256 | Max entries returned in a single QueryV1 |
+| `aggregate_count_minimum_tier` | 1 | Root cohorts produce aggregate counts only when tree depth ≥ this |
+| `seeker_renew_grace` | 5 s | Time a seeker may finish querying after TTL expires (still queryable but not returned in future queries) |
+
+The cohort-topic tier for matchmaking is **T2 (functional)**; matchmaking registrations are declined freely by cohorts under T0/T1 load. The seeker's only recourse is to wait — the cohort-topic anti-flood properties prevent the seeker from making things worse by retrying aggressively.
+
+---
+
+## Worked scenarios
+
+### Capability lookup in a sparse network
+
+A node needs a peer that holds the `geocode-resolver` capability. Network has 5 000 peers, ~30 of which offer this capability.
+
+Provider side: 30 nodes have each registered at `topicId = H("capability" ‖ "geocode-resolver" ‖ "match")`. With `n_est = 5000`, `d_max = log_16(5000) − 1 ≈ 2`. Most providers walked from `d = 2` toward the root; with only 30 providers the tier-0 cohort accepts them all (well under `cap_promote = 64`).
+
+Seeker side: a node needs three resolvers. Walks from `d_max = 2`: probes `coord_2(self, topicId)` → `NoState`; `d = 1` → `NoState`; `d = 0` → `Accepted` as seeker, then issues `QueryV1{limit: 16}`. Cohort returns the 30 providers. Seeker picks three (e.g., by latency to its peer ID), dials each directly, gets work done.
+
+### Voting on a popular proposal
+
+A governance proposal has 200 000 eligible voters; topic `topicId = H("quorum" ‖ proposalHash ‖ "match")`. Within the voting window, eligible voters register as providers carrying their eligibility signatures.
+
+The tree grows to depth `⌈log_16(200000 / 64)⌉ = 3` tiers. Each tier-3 cohort holds ~50 providers from its prefix-shard.
+
+The voting coordinator (or a delegated quorum-assembler peer) registers as a seeker at the root, queries with `AggregateCountV1`, learns where the populations are, then does a multi-cohort sweep across selected tier-3 cohorts to assemble a quorum of, say, 64 random voters. Each query returns its slice of providers (with eligibility sigs included); the coordinator validates and selects.
+
+Throughout, the root cohort's load is bounded: registration storms get `Promoted(1)` quickly; only the seeker's `AggregateCountV1` and the demoted "almost everyone left" tail hit the root directly. Tier-1 and below carry the bulk of provider state.
+
+### Sparse provider, very large network
+
+A specialty capability (`zk-snark-prover-v2`) has 5 providers in a network of 10 M peers.
+
+Each provider, walking from `d_max = log_16(10M) − 1 ≈ 5`, falls through all the way to the root. Five registrations at the root cohort; far below `cap_promote`. Tree stays at depth 0.
+
+A seeker similarly walks 5 tiers toward the root, registers, queries, gets the 5 providers. Total cost: 6 RPCs (`d = 5, 4, 3, 2, 1, 0`), the cost of which is dominated by FRET routing not provider lookup. The cost-per-seek is logarithmic in network size, not linear in provider count.
+
+---
+
+## Interaction with other subsystems
+
+- **Cohort topic** ([cohort-topic.md](cohort-topic.md)) — substrate. Matchmaking is the directory application.
+- **Reactivity** ([reactivity.md](reactivity.md)) — sibling application on the same substrate. Operationally independent; matchmaking does not consume reactivity notifications and vice versa.
+- **Transaction log** ([transactions.md](transactions.md)) — provider eligibility for some matchmaking topics derives from committed state (stake, reputation, signed capability claims). The voting use case is the most explicit example.
+- **FRET** ([../../Fret/docs/fret.md](../../Fret/docs/fret.md)) — ring, cohorts, routing. Reached through cohort-topic.
+- **Reputation** (see [architecture.md](architecture.md)) — providers' reputation scores may be consumed by seekers when ranking candidates; the matchmaking layer carries the identity, the reputation subsystem provides the metric.
+- **Voting** (forthcoming doc) — first-class consumer; matchmaking provides quorum-member discovery, voting provides the ballot and tally protocols.

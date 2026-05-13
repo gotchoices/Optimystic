@@ -1,16 +1,22 @@
 # Reactivity
 
-Change-notification subscriptions for Optimystic collections, designed for high subscriber counts on mobile devices and layered on the FRET ring overlay. See [matchmaking.md](matchmaking.md) for the rendezvous concept this design extends, [fret.md](../../Fret/docs/fret.md) for the underlying ring overlay, and [transactions.md](transactions.md) for the transaction log that drives notifications.
+Push-based change notifications for Optimystic collections, layered on the cohort-topic substrate ([cohort-topic.md](cohort-topic.md)). Reactivity is the **push-tree application** of the cohort-topic layer: a rotating-anchor topic tree, with the tail block's coordinate as the anchor, used to fan out signed notifications to subscribers. See [transactions.md](transactions.md) for the transaction log that drives notifications and [fret.md](../../Fret/docs/fret.md) for the underlying ring overlay.
 
 ---
 
 ## Overview
 
-Reactivity gives clients a push-based signal when a collection's state changes, without forcing them to poll the chain. A subscriber expresses interest in a collection; some time later, when the collection commits a transaction, the subscriber receives a small notification carrying the new revision. The subscriber then decides whether to read the new state, fetch a delta, or ignore.
+Reactivity gives clients a push-based signal when a collection's state changes, without forcing them to poll the chain. A subscriber registers on the collection's topic tree; when the collection commits a transaction, the tail cohort emits a signed notification that fans out through the tree to every active subscriber. The subscriber decides whether to read the new state, fetch a delta, or ignore.
 
-The system is hint-only. The transaction log remains the sole authority for collection state. Notifications can be delayed, duplicated, or (rarely) lost without compromising correctness — they exist purely to avoid wasted bandwidth and battery on idle clients.
+The system is **hint-only**. The transaction log remains the sole authority for collection state. Notifications can be delayed, duplicated, or (rarely) lost without compromising correctness; they exist purely to avoid wasted bandwidth and battery on idle clients.
 
-Reactivity scales by building a fan-out tree over rendezvous coordinates derived deterministically from the collection's current tail block and the subscriber's own ring coordinate. Each tree node is a FRET cohort (~16–20 peers), so the tree survives individual peer churn without reconfiguration. Subscribers far apart in the ring meet only near the source; subscribers near each other share intermediate forwarders. As subscriber population grows, the tree deepens automatically; as it shrinks, intermediate cohorts demote and the tree contracts.
+All addressing, walk semantics, willingness, promotion, demotion, and primary/backup sharding are inherited from the cohort-topic layer. This document specifies only the parts unique to push notification:
+
+- **Anchor rotation** with the collection's tail block, to deny attackers a long-lived root.
+- **Threshold-signed notifications** that reuse the commit certificate from the transaction layer.
+- **Replay buffer** for backfilling subscribers that wake from sleep within the window.
+- **Per-revision dedupe** and **slow-subscriber backpressure** that keep fan-out bounded.
+- **Mobile-friendly resume** including longer-than-buffer recovery via parent checkpoint summaries.
 
 ---
 
@@ -18,262 +24,179 @@ Reactivity scales by building a fan-out tree over rendezvous coordinates derived
 
 ### Goals
 - Push-based change delivery with minimal mobile bandwidth and CPU.
-- Scale from 1 subscriber to millions per collection without redesign.
-- Survive 20%-scale cohort churn without losing subscriptions.
+- Scale from 1 subscriber to millions per collection, sharing infrastructure with matchmaking and any other cohort-topic application.
 - End-to-end authentic notifications (no per-hop trust required).
-- Mobile-friendly wake/resume: subscribers backfill missed events in one round trip when within the replay window.
-- No long-term hotspots: the rendezvous root rotates with tail block churn so no specific cohort becomes a permanent attack target.
+- Mobile-friendly wake/resume: subscribers backfill in one round trip within the replay window; within parent-checkpoint range, one extra round trip.
+- Treat push as **T3 (luxury)**: never starves transaction commit, never forces lightweight nodes into forwarder duty.
 
 ### Non-goals
 - Ordering guarantees beyond per-collection revision monotonicity.
 - Exactly-once delivery (subscribers dedupe by revision).
-- Cross-collection joins or filtered subscriptions (the subscriber re-reads the collection if it cares about specific fields).
-- Authority over collection state — that is owned by the transaction log.
+- Cross-collection joins or filtered subscriptions.
+- Authority over collection state — that belongs to the transaction log.
+- Catching subscribers up from arbitrarily old state. Beyond parent checkpoint range, subscribers fall back to a normal chain read.
 
 ---
 
-## Concepts
+## Anchor: rotating with the tail block
 
-- **Collection** — the unit of subscription. Identified by a stable `collectionId` (the genesis block hash) for topic identity, separately from its current tail.
-- **Tail block** — the latest committed block in the collection's chain. Tail rotates when a block fills (default: every 64 transactions). Its block ID `tailId` provides the *source coordinate* for the rendezvous tree.
-- **Source coordinate** `coord_T` — the FRET ring coordinate of the current tail block, `SHA-256(tailId)` truncated to B = 256 bits.
-- **Subscriber coordinate** `coord_S` — the subscriber's own ring coordinate.
-- **Rendezvous coordinate** `coord_L(S, T)` — a coordinate derived by bit-shifting between `coord_T` and `coord_S` (see Coordinate Derivation).
-- **Cohort** — the FRET two-sided cohort of size k around a coordinate. A cohort is the unit of forwarder identity: ~16 peers with quorum-signed actions.
-- **Forwarder cohort** — a cohort actively relaying notifications for one or more collections.
-- **Tail cohort** — the cohort at `coord_T`. Originates notifications.
-- **Subscription** — soft state held by 1–3 cohort members on behalf of one subscriber, refreshed by TTL pings.
-- **Revision** — the monotonic per-collection sequence number stamped on each committed transaction. Used as the notification sequence number.
-- **Replay window** — the most recent W revisions buffered by each forwarder cohort and the tail cohort, available for backfill on subscriber wake.
+Reactivity uses a rotating topic anchor so the tree's root cohort changes with the collection's transaction churn. This denies an attacker any single coordinate to attack persistently and naturally amortizes hot-spot duty across the ring.
+
+```
+topicId(collection C, tail T) = H(T.blockId ‖ "reactivity")
+```
+
+The cohort-topic layer's tier addressing then proceeds normally:
+
+```
+coord_0(_, topicId)   = H(0x00 ‖ topicId)
+coord_d(P, topicId)   = H(d ‖ prefix(P, d·log₂F) ‖ topicId)   for d ≥ 1
+```
+
+When the tail rotates (the current tail block fills and a new tail block is born), `topicId` changes. The cohort-topic layer treats the new `topicId` as an entirely new topic; reactivity manages the migration of subscribers and replay state explicitly (see [Tail rotation](#tail-rotation)).
+
+### Why not anchor on the stable `collectionId`?
+
+Stable anchoring would concentrate notification production at a single coord for the collection's lifetime, creating a permanent attack target and load hotspot. Rotation costs a periodic re-registration storm (bounded by `T_drain`; see below) in exchange for distributing the root duty across the ring over time. For collections rotating once per minute or slower, rotation traffic is a small fraction of total notification traffic.
 
 ---
 
-## Rendezvous tree
+## Subscription
 
-### Coordinate derivation
+Subscribing to collection `C` is a normal cohort-topic registration with:
 
-Rendezvous coordinates form a deterministic ladder between the source (tail) coordinate and each subscriber's coordinate. For subscriber `S` interested in collection with tail `T`:
+- `topicId` = `H(currentTailId(C) ‖ "reactivity")`
+- `tier` = `T3` (luxury)
+- `appPayload` = `SubscribeAppPayloadV1` (see [Wire formats](#wire-formats))
+- `ttl` = configured TTL (Edge default 60 s, Core default 90 s)
 
-```
-coord_L(S, T) = high (B − L) bits of coord_T  ‖  low L bits of coord_S
-```
-
-- At `L = 0`: `coord_L = coord_T`. The most specific point. All subscribers agree on this single coordinate.
-- At `L = B`: `coord_L = coord_S`. The least specific point relative to the source — the subscriber's own neighborhood.
-- At intermediate `L`: the coordinate drifts from `T` toward `S`. The high `B − L` bits anchor it near the source; the low `L` bits position it within the subscriber's region.
-
-Two subscribers with similar low-bit address share the same `coord_L` for sufficiently small `L`. Two subscribers far apart in ring distance diverge immediately and only converge when `L ≤ k_diff`, where `k_diff` is the bit-position of their first differing bit. This means subscribers naturally cluster at intermediate forwarders proportional to their ring proximity.
-
-### Level selection
-
-A subscriber chooses an initial level `L_init` from FRET's network-size estimate `n_est` and a target subscribers-per-cohort `D_target`:
-
-```
-L_init = clamp(round(log2(n_est / D_target)), L_min, L_max)
-```
-
-- `D_target` defaults to 64 (a comfortable per-cohort delivery load).
-- `L_min = 0`, `L_max = B − 16` (avoid degenerate single-bit anchoring).
-- If `n_est` confidence is below 0.3, `L_init` defaults conservatively to `L_max / 2`.
-
-The subscriber walks inward (decrementing `L`) if the cohort at `coord_L` has no existing forwarder state for the collection. The cohort at level `L` either accepts the subscription (becoming or remaining a forwarder) or redirects the subscriber to `coord_(L−1)`.
-
-### Tree topology
-
-The tree is rooted at the tail cohort and fans outward. Each forwarder cohort knows:
-
-- **Upward (one parent):** the level-`(L−1)` cohort it registered with. Pushes its subscriber-count gossip up; receives notifications down.
-- **Downward (zero or more children):** level-`(L+1)` forwarder cohorts that registered with it, plus directly-attached subscribers.
-
-Children are discovered by registration, not by the parent enumerating coordinates. The fan-out shape adapts to actual subscriber distribution: dense subscriber regions produce deeper subtrees; sparse regions produce direct attachment to the tail.
-
----
-
-## Subscription registration
-
-### Walk-inward
-
-A subscriber registers with the following algorithm:
-
-```
-L = L_init
-loop:
-  C = coord_L(self, T)
-  reply = RouteAndMaybeAct(key = C, activity = SubscribeV1{...})
-  match reply:
-    Accepted(cohort, primary, backups) → done
-    Redirect(L_inner)                  → L = L_inner; continue
-    Denied(reason)                     → backoff and retry with new L
-  if L == 0 and reply == Denied        → fail
-```
-
-The cohort at each probed coordinate decides:
-
-- **Accept** if it already serves this collection (forwarder state exists), or if its current direct-subscriber count is below `D_target`.
-- **Redirect** to `L − 1` if it has no forwarder state for the collection and is unwilling to instantiate (e.g., during cold-start denial; see Promotion).
-- **Deny** with `Retry-After` if rate-limited or in a partition-conservative mode.
-
-### Subscription record
-
-A cohort that accepts a subscription holds soft state:
-
-```
-SubscriptionRecord {
-  collectionId:    bytes
-  subscriberId:    PeerId
-  subscriberCoord: ringCoord
-  level:           uint
-  primary:         PeerId            // cohort member that delivers
-  backups:         PeerId[1..2]      // warm-failover cohort members
-  attachedAt:      timestamp
-  lastPing:        timestamp
-  ttl:             duration          // default 90s
-  lastDeliveredRev: revision
-}
-```
-
-The record is replicated across all `~k` cohort members via standard FRET cohort gossip. Only `primary` actually delivers notifications; `backups` watch and take over on primary failure. This avoids `k`-fold delivery amplification within the cohort.
-
-### TTL and renewal
-
-The subscriber pings `primary` every `ttl / 3` (default 30s). A successful ping refreshes `lastPing`. If three consecutive pings fail, the subscriber promotes a `backup` to primary (sending a re-attach RPC) and resumes. If all of `primary` and `backups` fail, the subscriber re-runs the walk-inward registration.
-
-Cohort members evict records where `now − lastPing > ttl`. The cohort gossips eviction so all members agree on the active subscriber set.
+The walk-toward-root from `d_max`, the willingness-driven member selection, the `Promoted`/`UnwillingMember`/`UnwillingCohort` reply set, and the TTL renewal protocol are all the cohort-topic standard.
 
 ### Subscriber-side state
 
-A subscriber holds, per active subscription:
-
 ```
 ActiveSubscription {
-  collectionId:    bytes
-  level:           uint              // current registration level
+  collectionId:    bytes                    // stable, for identifying the subscription
+  topicId:         bytes                    // current tail-anchored topic
+  tailIdAtAttach:  bytes                    // tail block ID at registration time
   primary:         PeerId
   backups:         PeerId[]
-  cohortHint:      PeerId[]          // small set for fast re-attach
+  cohortHint:      PeerId[]                 // for fast re-attach
+  cohortEpoch:     bytes                    // for membership-drift detection
   lastRevision:    revision
+  lastDeliveredAt: timestamp
   attachedAt:      timestamp
-  cohortEpoch:     bytes             // tail block ID at registration time
 }
 ```
 
-`cohortEpoch` lets the subscriber detect tail rotation: if a notification arrives stamped with a tail ID different from `cohortEpoch`, the subscriber knows the tree root has moved and re-registers at the new tail.
+`tailIdAtAttach` is the subscriber-side detector for tail rotation. The cohort-topic-level `cohortEpoch` already detects cohort membership churn within a topic; `tailIdAtAttach` detects the whole-tree migration triggered by tail rotation.
 
----
+### Forwarder-cohort state (per collection served)
 
-## Cohort responsibilities
-
-### Forwarder state
-
-A forwarder cohort holds, per collection it serves:
+A reactivity forwarder cohort holds the cohort-topic-standard registration records plus per-collection notification state:
 
 ```
-ForwarderState {
-  collectionId:     bytes
-  tailIdAtJoin:     bytes             // for rotation detection
-  parentCohort:     CohortRef         // level (L-1) cohort
-  parentLevel:      uint
-  childCohorts:     CohortRef[]       // level (L+1) cohorts registered with us
-  directSubscribers: SubscriptionRecord[]
-  subscriberCountBucket: uint         // log-bucketed coarse count for gossip
-  replayBuffer:     RevisionEntry[W]  // ring buffer, default W = 256
-  lastRevision:     revision
-  threshold:        thresholdSigParams
+PushState {
+  collectionId:       bytes
+  topicId:            bytes
+  tailIdAtJoin:       bytes
+  parentCohort:       CohortRef                  // tier-(d−1) cohort
+  childCohorts:       CohortRef[]                // tier-(d+1) cohorts
+  replayBuffer:       RevisionEntry[W]           // ring buffer, default W = 256
+  parentCheckpoint:   CheckpointSummary?         // see Resume beyond replay window
+  lastRevision:       revision
+  pendingDedupe:      Set<(revision, sigDigest)> // sliding 64-entry window
+  perSubscriberQueue: Map<PeerId, BoundedQueue>  // see Slow-subscriber backpressure
 }
 ```
 
-`childCohorts` and `directSubscribers` are the two delivery paths. On notification, the cohort's primary forwards to every entry in both lists.
-
-### Primary and backup selection
-
-Within the cohort of `~k` members, primary assignment for each subscriber is a deterministic hash:
-
-```
-primary(subscriberId, cohortMembers) = cohortMembers[ H(subscriberId) mod len(cohortMembers) ]
-backups(subscriberId, cohortMembers) = next 2 entries in the same hash ordering
-```
-
-This shards delivery load roughly evenly across the cohort. When cohort membership changes (FRET stabilization), primary may move; the cohort gossips the new assignment and the new primary takes over silently. Subscribers learn of changes via the next notification (which arrives from the new primary) or via heartbeat refresh.
-
-### Subscriber-count gossip
-
-Cohort members exchange a coarse subscriber count using log buckets:
-
-```
-bucket(n) = floor(log2(n + 1))   // 0, 1, 2-3, 4-7, 8-15, 16-31, ...
-```
-
-Five bits suffice. The bucketed count is included in every cohort heartbeat and in upward registrations to the parent. A parent cohort uses the sum of child buckets and its own direct-subscriber bucket to decide promotion and demotion.
-
-### Promotion (cohort grows)
-
-A cohort promotes when its direct-subscriber bucket exceeds `bucket_promote` (default = bucket(`D_target`)). Promotion means: stop accepting new direct subscriptions; redirect new subscribers outward to `L + 1`. Existing subscribers remain attached. As they renew, they may be migrated outward in batches if the load remains high.
-
-A cold cohort instantiates as a forwarder when:
-
-- It receives the first subscription registration for a collection it does not yet serve, AND
-- The walk-inward path indicates this is the chosen level (the subscriber's `L` is the current level).
-
-The newly-instantiated forwarder immediately registers up to its parent (`L − 1`).
-
-### Demotion (cohort shrinks)
-
-A cohort demotes when its total subscriber count (direct + sum of children) falls below `bucket_demote` (default = bucket(`D_target / 4`)) for at least `T_demote` (default 5 minutes). Demotion is a single cohort decision, threshold-signed by the cohort to prevent demote races:
-
-1. Cohort members reach quorum that demotion is appropriate.
-2. A threshold-signed `DemoteNotice` is sent to all direct subscribers and child cohorts.
-3. Recipients re-register at level `L − 1` (closer to source).
-4. After all recipients ack or TTL expires, the cohort tells its parent to drop it from `childCohorts`.
-5. Forwarder state is released.
-
-The hysteresis (`bucket_promote` vs `bucket_demote`, plus `T_demote`) prevents oscillation under bursty subscribe/unsubscribe.
+The direct-subscriber list is the cohort-topic layer's `RegistrationRecord` set with `appPayload.kind == "reactivity"`. Reactivity reads it but does not duplicate it.
 
 ---
 
-## Notification flow
+## Notification origination
 
-### Origination
-
-When the tail cohort commits a transaction, it produces a notification:
+When the tail cohort commits a transaction, the commit machinery in the transaction layer ([transactions.md](transactions.md)) already produces a threshold-signed commit certificate. Reactivity reuses that certificate without additional cohort signing:
 
 ```
 NotificationV1 {
   v:            1
   collectionId: bytes
-  tailId:       bytes              // tail block ID at notification time
+  tailId:       bytes
   revision:     uint64
-  digest:       bytes              // small commit summary (hash of new state, op count, etc.)
-  delta?:       bytes              // optional bounded delta payload
+  digest:       bytes                       // commit digest from the transaction layer
+  delta?:       bytes                       // optional, bounded; opt-in per collection
   timestamp:    int64
-  sig:          thresholdSig       // tail cohort's threshold signature, minSigs = k − x
+  sig:          thresholdSig                // = commit cert; signers ≥ minSigs = k − x
+  signers:      PeerId[]
+  rotationHint?: { newTailId, effectiveAtRevision }   // see Tail rotation
 }
 ```
 
-The threshold signature is the tail cohort's commit certificate (already produced by the transaction layer). Reactivity reuses it without additional cohort signing rounds.
+The `sig` field is bit-for-bit the same threshold signature the transaction layer produces. A subscriber that already trusts the transaction-layer machinery (which it must, to trust the collection at all) automatically trusts notifications without additional verifiers.
 
-### Propagation
+### Origination point
+
+The tail cohort's primary for the collection (the cohort-topic primary at `coord_0(_, topicId)`) is the notification origin. It is by definition the tail cohort because `topicId` is derived from `tailId`. When this cohort is also serving as the transaction-layer tail-cluster — which it is, since they share the same coordinate — origination is a side-effect of commit: as soon as the threshold signature on the commit is assembled, the primary emits the notification.
+
+### Delta payloads
+
+The `delta` field is optional and bounded by `delta_max` (default: 4 KB at Core profile, 0 at Edge profile — Edge subscribers reject any inbound `delta` and re-read the chain instead, since paying for the delta wire bytes when CPU is the bottleneck is the wrong tradeoff). Whether to include a delta is a per-collection configuration; collections whose typical delta is larger than `delta_max` simply omit it.
+
+---
+
+## Propagation
 
 The tail cohort's primary delivers the signed notification to:
 
-- Every entry in `directSubscribers` (using each subscriber's primary assignment).
-- Every entry in `childCohorts`, addressed to each child's primary.
+- Every direct subscriber (via each subscriber's primary assignment as held in the cohort-topic registration record).
+- Every entry in `childCohorts`, addressed to that child's primary.
 
-A receiving forwarder cohort:
+A receiving forwarder cohort's primary:
 
-1. Verifies the threshold signature against the tail cohort's known membership.
-2. Verifies `revision > lastRevision` for the collection (drop replays).
-3. Appends to its `replayBuffer`.
-4. Forwards the unmodified, unwrapped notification to its own `directSubscribers` and `childCohorts`.
+1. Verifies the threshold signature against the tail cohort's `MembershipCertV1` ([cohort-topic.md §Membership snapshots](cohort-topic.md#membership-snapshots-and-signature-verification)).
+2. Runs the dedupe check (see below).
+3. Appends to the replay buffer.
+4. Forwards the unmodified notification to its own direct subscribers and child cohorts.
 
 Forwarders never re-sign. Subscribers verify the same end-to-end signature regardless of how many hops the notification traveled. A compromised forwarder can drop or delay messages but cannot forge them; subscribers detect drops via revision gaps and re-fetch from the replay window.
 
-### Delivery
+### Per-revision dedupe (sliding-window set)
+
+A single scalar `lastRevision` is not sufficient under partition healing or transient cohort partitioning: the same revision may legitimately arrive from multiple parents during merge, and dropping all but the first based on `revision > lastRevision` discards honest retransmits the moment a subscriber needs them.
+
+Each forwarder cohort keeps a sliding `pendingDedupe` set of `(revision, sigDigest)` pairs for the last `dedupe_window` revisions (default 64). A new notification is forwarded if:
+
+- It is for the *highest revision* seen in the window (normal case), OR
+- It is for an earlier revision *and* the `(revision, sigDigest)` is not already in the set *and* it passes verification (recovery case: a retransmit closing a gap).
+
+Notifications already in the set are dropped silently. The set is gossiped within the cohort so all members agree on what has been seen.
+
+### Slow-subscriber backpressure
+
+A forwarder's primary maintains a per-subscriber bounded queue with drop-oldest semantics:
+
+```
+BoundedQueue {
+  capacity:   queue_max         // default 32 revisions
+  entries:    NotificationV1[]
+  dropped:    uint              // monotone counter
+}
+```
+
+If a subscriber's queue is full when a new notification arrives, the oldest entry is dropped and `dropped` is incremented. The subscriber learns about the gap on next delivery (revision jump) and issues a `BackfillV1` against the replay buffer.
+
+This isolates slow subscribers: one phone with a flaky connection does not stall fan-out to the rest of the cohort's attached subscribers. The queue size is small enough (a few KB per subscriber) that cohort memory is bounded by `cohort_subscribers × queue_max × notification_size`.
+
+---
+
+## Delivery
 
 A subscriber receiving a notification:
 
-1. Verifies the signature using the cached tail cohort membership.
-2. Checks `revision == lastRevision + 1`. If not, requests `BackfillV1{from: lastRevision + 1, to: revision − 1}` from primary.
-3. Updates `lastRevision`.
+1. Verifies `sig` against the cached `MembershipCertV1` for the tail cohort (with one fetch-and-retry fallback for stale-cache cases).
+2. Checks `revision == lastRevision + 1`. If not equal, requests `BackfillV1{from: lastRevision + 1, to: revision}` from `primary`.
+3. Updates `lastRevision` once revisions are contiguous.
 4. Surfaces the notification to the application layer.
 
 Subscribers dedupe by `(collectionId, revision)`; duplicates from forwarder retries are discarded.
@@ -282,15 +205,17 @@ Subscribers dedupe by `(collectionId, revision)`; duplicates from forwarder retr
 
 ## Replay window
 
-Each forwarder cohort and the tail cohort maintain a per-collection ring buffer of the last `W` notifications (default `W = 256`). The buffer is replicated across the cohort via standard FRET cohort gossip so any member can serve replay requests.
+Each forwarder cohort and the tail cohort maintain a per-collection ring buffer of the last `W` notifications (default `W = 256`). Entries are gossiped across the cohort so any member can serve replay requests if the primary is unavailable.
 
 ```
 RevisionEntry {
-  revision:  uint64
-  payload:   NotificationV1     // the full signed notification
-  receivedAt: timestamp
+  revision:    uint64
+  payload:     NotificationV1            // the full signed notification
+  receivedAt:  timestamp
 }
 ```
+
+### Resume
 
 A subscriber resuming from sleep sends:
 
@@ -298,170 +223,151 @@ A subscriber resuming from sleep sends:
 ResumeV1 { collectionId, fromRevision, latestKnownTailId }
 ```
 
-The cohort responds with one of:
+to its cached `primary` (or any cohort member if primary is stale). The cohort responds with one of:
 
-- `Backfill { entries: [...], currentRevision }` — `fromRevision` is within the window. Subscriber replays entries and is current.
-- `OutOfWindow { currentTailId, currentRevision, currentMembership }` — `fromRevision` is older than the buffer. Subscriber falls back to reading the chain directly to catch up, then resubscribes.
-- `TailRotated { newTailId, newRevisionAtRotation }` — the subscriber's `latestKnownTailId` is stale. Subscriber re-registers under the new tail.
+- `Backfill { entries, currentRevision }` — `fromRevision` is within the replay window. Subscriber replays entries, dedupes, and is current. Single round trip.
+- `CheckpointWindow { checkpoint, recentEntries }` — `fromRevision` is older than the buffer but within parent-checkpoint range (see below). Subscriber applies the checkpoint summary, then replays the recent entries.
+- `OutOfWindow { currentTailId, currentRevision, currentMembership }` — `fromRevision` is older than even the parent checkpoint. Subscriber falls back to a chain read.
+- `TailRotated { newTailId, newRevisionAtRotation }` — `latestKnownTailId` is stale. Subscriber re-registers under the new tail and replays from the new tree.
 
-`W = 256` covers roughly 4 minutes of activity at 1 commit/second per collection — long enough for typical mobile sleep gaps short of the OS killing the process.
+### Parent checkpoint summaries
+
+A 256-revision replay buffer at one commit per second covers ≈4 minutes — long enough for a backgrounded mobile app, not for a phone in a pocket overnight. To extend recoverable range without ballooning replay-buffer memory, every parent forwarder cohort (and the tail cohort) maintains a `CheckpointSummary`:
+
+```
+CheckpointSummary {
+  collectionId:        bytes
+  fromRevision:        uint64
+  toRevision:          uint64          // toRevision - fromRevision ≈ W_checkpoint, default 4096
+  mergedDigest:        bytes           // application-defined fold of digests from each entry
+  mergedDelta?:        bytes           // optional, bounded; coalesced delta if collection supports
+  bracketingSigs:      thresholdSig[2] // sigs of the entries at fromRevision and toRevision
+}
+```
+
+The checkpoint is *not* a replacement for the source-of-truth chain; it is a hint summary. The bracketing signatures let a subscriber verify the checkpoint endpoints are real committed revisions; the merged digest tells the application "here's what changed across this range." For KV-shaped collections this is enough to know whether to invalidate caches without a chain read. For collections needing exact intermediate state, the checkpoint is not sufficient and the subscriber must fall back to the chain.
+
+`W_checkpoint` defaults to 16× the replay buffer (4096 revisions ≈ 1 hour at 1 cps) and is configurable per collection. Cohorts at tier `d ≥ 1` are the primary holders of checkpoints; the tail cohort holds the current rolling checkpoint, advancing it as revisions retire from the replay buffer.
+
+### Backfill RPC
+
+```
+BackfillV1 { collectionId, fromRevision, toRevision }
+BackfillReplyV1 { entries: NotificationV1[], available: { from, to } }
+```
+
+Subscribers MAY request a sub-range smaller than `[fromRevision, toRevision]`; cohorts return the intersection with their replay buffer and indicate `available` so the subscriber knows whether to fall back further.
 
 ---
 
 ## Tail rotation
 
-Tail block ID changes when a block fills (default 64 transactions). Rotation moves `coord_T` to a new ring location, which means the entire forwarder tree is rooted somewhere new.
+Tail block ID changes when a block fills (default `block_fill_size = 64` transactions). Rotation moves the topic anchor — and hence the tree root — to a new ring coord.
 
 ### Rotation protocol
 
-When the current tail block fills and a new tail block is born:
+1. **Pre-announce.** While committing the block-filling transaction, the outgoing tail cohort embeds `rotationHint{ newTailId, effectiveAtRevision }` in the notification. The hint reaches every active subscriber via the existing tree.
 
-1. **Pre-announce.** While committing the block-filling transaction, the outgoing tail cohort includes in the notification a `RotationHintV1 { newTailId, effectiveAtRevision }`. This hint reaches every active subscriber via the existing tree.
+2. **Drain.** The outgoing tail cohort continues to accept renewals and serve replays for `T_drain` (default 60 s) after rotation. New subscriptions are rejected with a `Promoted`-shaped redirect to the new `topicId`'s tree.
 
-2. **Drain.** The outgoing tail cohort continues to accept notifications and serve replays for `T_drain` (default 60 seconds) after rotation. New subscriptions are rejected with a redirect to `newTailId`'s tree.
+3. **Subscriber re-registration with jitter.** Subscribers, on receiving the rotation hint, schedule re-registration at the new `topicId` with random jitter over `T_rejoin_jitter` (default 30 s). Re-registration carries the subscriber's existing `lastRevision`; revisions are continuous across rotations, so no replay confusion.
 
-3. **Re-register.** Subscribers, on receiving the rotation hint, re-run walk-inward at the new tail. They retain their old `lastRevision` (revisions are continuous across rotations).
+4. **Forwarder draining.** Forwarder cohorts under the old tail observe their direct-subscriber count dropping (subscribers re-registering under the new tail) and demote naturally per the cohort-topic demotion protocol. They do not migrate state to the new tree — the new tree rebuilds via re-registration.
 
-4. **Forwarder migration.** Forwarder cohorts under the old tail observe their direct-subscriber count dropping (subscribers re-registering elsewhere) and demote naturally per the standard demotion protocol. They do not migrate forwarder state to the new tree — re-registration rebuilds it under the new root.
+5. **Replay-buffer handoff to checkpoint.** As the outgoing tail cohort drains, it folds its replay buffer into a final `CheckpointSummary` covering `[lastCheckpoint.toRevision + 1, rotationRevision]` and hands it to the new tail cohort. This is the only state migration across rotations. The new tail cohort holds the old checkpoint to serve `ResumeV1` requests that span the rotation.
 
-5. **New tail bootstrapping.** The new tail cohort, on its first commit, may face a registration storm. It accepts the first `D_target` direct subscribers and redirects subsequent ones outward. The cold-start cost is bounded by `T_drain`: subscribers are draining from the old tree throughout, so the storm spreads over a minute rather than arriving instantly.
+### Anticipatory warm-up
 
-### Cost amortization
+When a tail block reaches `block_fill_size − warm_threshold` (default 56 of 64) transactions, the outgoing tail cohort opportunistically pre-dials toward the likely-successor coord. The next `tailId` is not knowable until the filling commit, so this is best-effort: the cohort biases FRET pre-dialing toward peers whose ring position is consistent with high-probability successor coords. No state is migrated until the actual rotation.
 
-Block fill rate is typically minutes-to-hours for normal collections. For very busy collections, rotation may occur every few seconds — but in that regime, the per-rotation re-registration cost is a small fraction of total notification traffic. The hot-spot rotation property is the explicit goal: no single cohort is the rendezvous root for long enough to become a persistent attack target.
+### Rotation cost
 
-### Anticipatory warm-up (optional)
-
-When a tail block is near full (e.g., > 56/64 transactions), the outgoing tail cohort may opportunistically forward subscription hints to the cohort that will own the next-tail coordinate, letting it pre-warm. This is best-effort: the next tail ID is unknown until the filling transaction commits, but the cohort can use the current cohort's own subscriber list to bias FRET pre-dialing toward likely successor regions.
+For collections with `block_fill_size = 64` and one commit per minute, rotation happens once per ~64 minutes; the per-rotation cost (one re-registration walk per subscriber, fanned over `T_rejoin_jitter`) is negligible. For very busy collections rotating every few seconds, the re-registration storm is large but still bounded: with `T_rejoin_jitter = 30 s`, the new tail sees no more than `subscribers / T_rejoin_jitter` arrivals per second, which is well within cohort-topic's normal admission rates.
 
 ---
 
 ## Authentication and integrity
 
-- **Notifications** carry the tail cohort's threshold signature. The signature covers `(collectionId, tailId, revision, digest, delta?, timestamp)`. Subscribers verify against the tail cohort's known membership; membership is itself anchored in the transaction log (cohort changes are committed events).
-- **Subscribe RPCs** are signed by the subscriber's peer key and include a fresh `correlationId` (cryptographically random) and timestamp; cohort members reject stale or replayed registrations.
-- **Demote notices** carry the demoting cohort's threshold signature.
+- **Notifications** carry the tail cohort's threshold signature, which *is* the commit certificate from the transaction layer. Signature verification uses the standard cohort-topic membership-snapshot path ([cohort-topic.md §Membership snapshots](cohort-topic.md#membership-snapshots-and-signature-verification)).
+- **Subscribe / renew / resume RPCs** are signed by the subscriber's peer key and include `correlationId` and `timestamp`; replay protection is handled by the cohort-topic layer.
 - **Rotation hints** are part of the notification payload and inherit its signature.
-- **Forwarder cohorts do not re-sign.** They pass through the original threshold signature unchanged. A forwarder can drop messages (detectable by revision gap) but cannot inject or modify.
-- **Replay buffer entries** retain the original signature. Backfill responses are verifiable end-to-end.
+- **Forwarder cohorts do not re-sign.** They pass through the original threshold signature unchanged.
+- **Replay-buffer entries** retain the original signature. Backfill responses are verifiable end-to-end.
+- **Checkpoint summaries** are signed at their endpoints by the cohorts that produced them at those revisions; the merged digest is computed deterministically from the bracketed range. A subscriber verifies the bracketing signatures and checks the digest only against application-level expectations.
 
 A subscriber needs no trust in any forwarder. The trust root is the tail cohort's membership, which derives from the transaction log.
 
 ---
 
-## Failure modes
+## Per-cohort policy
 
-### Primary delivery member fails
-The subscriber's pings to primary time out. After three failures, the subscriber promotes a backup. The backup has been gossiping with the cohort and has the current `SubscriptionRecord`, so promotion is instant from the subscriber's perspective. The new primary becomes the canonical assignment per the cohort's hash function once the cohort detects the original primary's absence via FRET stabilization.
+Reactivity is **T3 (luxury)** at the cohort-topic layer. Concretely:
 
-### Cohort partition (minority loss)
-FRET cohort gossip handles this: as long as a quorum of `k − x = 14` members remains reachable, the cohort continues to operate. Subscribers attached to evicted minority members reconnect via re-registration when their pings start failing.
-
-### Cohort fully fails
-Rare in a healthy network (~16-of-16 simultaneous failure). When it happens, all child subtrees and direct subscribers detect via heartbeat and re-register. Re-registrations walk inward; the parent cohort accepts increased load, possibly promoting itself outward to neighboring cohorts. The tree heals in `O(ttl)` time.
-
-### Mobile subscriber sleep / wake
-On wake, the subscriber sends `ResumeV1`. If within the replay window, it backfills and continues. If beyond, it reads the chain directly to catch up, then re-subscribes from the current revision. No tree-walk required — the resume RPC goes straight to the cached primary (or any cohort member if primary is stale).
-
-### Tail rotation during subscriber outage
-Subscriber wakes, sends `ResumeV1` with stale `latestKnownTailId`. Cohort responds `TailRotated`. Subscriber re-registers under the new tail. Lost notifications between rotation and wake are recoverable from the chain if they exceeded the replay window.
-
-### Network partition healing
-FRET surfaces partition-merge events. Reactivity treats them as no-ops at the protocol layer: forwarder cohorts on each side of the partition served their subscribers independently; on heal, FRET re-stabilization merges cohort memberships and the trees converge. A subscriber attached to a forwarder that survives the merge experiences no disruption; one attached to a forwarder that collapsed re-registers normally.
-
-### Subscription flood (popular collection cold-start)
-Tail cohort accepts the first `D_target` direct subscribers, redirects the rest outward. Outer cohorts each fill to `D_target` and redirect further. The tree forms in `O(log n)` cascade. The cohort denial protocol prevents any single cohort from being overwhelmed; the registration storm spreads spatially across the ring as it ramps temporally.
+- A cohort under heavy T0 load (active transaction commits) will report willingness=false for T3, causing `UnwillingCohort` responses to subscribe requests at that cohort. Subscribers back off and retry; FRET stabilization typically rotates cohort membership before T0 load fully clears.
+- Edge nodes never serve as reactivity forwarders. They register as subscribers (T3 consumer is fine; only T3 *producer* is restricted).
+- Per-cohort topic budget (`topics_max` in the layer's defaults) bounds the number of collections a single cohort serves. Reactivity does not require any additional admission policy beyond this.
 
 ---
 
-## FRET integration
+## Failure modes (push-specific)
 
-### Protocol IDs
+### Notification fan-out interrupted by primary failure
+The primary at a forwarder cohort begins fan-out, completes some recipients, then fails. The cohort detects via heartbeat, backups are gossiped the partial-delivery state, and the new primary completes fan-out using its own copy of the registration list and replay buffer. Recipients that already received the notification dedupe; those who hadn't get it from the new primary. No loss.
 
-```
-/optimystic/reactivity/1.0.0/subscribe       — Subscribe and Resume RPCs
-/optimystic/reactivity/1.0.0/notify          — Notification delivery (push)
-/optimystic/reactivity/1.0.0/cohort-gossip   — Subscriber-count and forwarder-state gossip
-/optimystic/reactivity/1.0.0/demote          — Threshold-signed demote notice
-```
+### Slow subscriber on satellite link
+Bounded per-subscriber queue (above) absorbs short bursts. Sustained backlog causes oldest-revision drop; subscriber detects via revision gap on next received notification and issues a `BackfillV1`. The cohort's replay buffer covers the gap as long as the subscriber's lag stays under `W` revisions; beyond that, `CheckpointWindow`; beyond that, chain read.
 
-### RouteAndMaybeAct usage
+### Subscriber wakes after long sleep
+- `< W` revisions of lag: one `ResumeV1`, gets `Backfill`. One round trip.
+- `< W_checkpoint` revisions of lag: one `ResumeV1`, gets `CheckpointWindow`. One round trip.
+- Older: `ResumeV1` returns `OutOfWindow`. Subscriber reads the chain to catch up to a current revision, then issues a fresh subscribe.
 
-Subscribe registration uses FRET's `RouteAndMaybeAct` pipeline directly:
+### Tail rotation during subscriber outage
+Subscriber wakes, sends `ResumeV1` with stale `latestKnownTailId`. The cohort it reaches (under the new tail) responds `TailRotated{ newTailId }`. Subscriber walks the new tree, re-registers, and resumes; replay covers as much as it covers.
 
-- `key` = `coord_L(self, T)`
-- `activity` = serialized `SubscribeV1`
-- `wantK` = cohort size for the rendezvous level
-- `minSigs` = quorum required for cohort acceptance
-- The cohort's activity callback runs the subscription-acceptance logic and returns either `Accepted`, `Redirect`, or `Denied`.
+### Cohort fully fails during steady-state operation
+Standard cohort-topic recovery. Attached subscribers detect via ping failure, re-register from `d_max`. With `T_rejoin_jitter` the post-failure registration rate is bounded.
 
-Notifications and resume requests use direct dialing to the known primary (cached from registration) and only fall back to `RouteAndMaybeAct` when the primary is unreachable.
-
-### Ring coordinate computation
-
-The bit-shift derivation operates directly on FRET's 256-bit ring coordinates. No additional hashing is required beyond the single `SHA-256(blockId)` and `SHA-256(peerId)` already performed by FRET.
-
-### Cohort assembly
-
-Reactivity uses FRET's two-sided cohort assembly without modification. The cohort at `coord_L` is whichever set of `k` peers FRET names as the cohort for that coordinate, with all the standard properties: alternating successor/predecessor walk, automatic adaptation when `n < k`, threshold signatures via `minSigs = k − x`.
+### Many subscribers, sudden interest spike
+Cohort-topic's promotion machinery handles this with `cap_promote_fast`: when the load barometer is hot, the tail cohort fast-promotes after `cap_promote_fast = 32` subscribers rather than waiting for the full `cap_promote = 64`. The tree grows faster than under normal load, spreading subscribers across deeper tiers before the tail saturates.
 
 ---
 
 ## Wire formats
 
-### Subscribe RPC (JSON, length-prefixed UTF-8)
+Reactivity reuses the cohort-topic layer's `RegisterV1`, `RenewV1`, etc., with a reactivity-specific `appPayload`:
 
 ```
-interface SubscribeV1 {
-  v:               1
-  collectionId:    string          // base64url
-  subscriberCoord: string          // base64url, 32 bytes
-  level:           number
-  ttl:             number          // ms, default 90000
-  lastKnownRev:    number          // 0 for fresh subscribe
-  timestamp:       number          // unix ms
-  correlationId:   string          // base64url, 16 bytes random
-  signature:       string          // base64url, sender peer key
-}
-
-interface SubscribeReplyV1 {
-  v:               1
-  result:          "accepted" | "redirect" | "denied"
-  // when accepted:
-  cohort?:         string[]        // PeerIds in the assigned cohort
-  primary?:        string          // PeerId
-  backups?:        string[]        // PeerIds, length 1-2
-  currentRev?:     number
-  cohortEpoch?:    string          // base64url, current tailId
-  // when redirect:
-  redirectLevel?:  number          // walk inward to this level
-  // when denied:
-  reason?:         string
-  retryAfterMs?:   number
+interface SubscribeAppPayloadV1 {
+  kind:               "reactivity"
+  collectionId:       string             // base64url
+  tailIdAtAttach:     string             // base64url
+  lastKnownRev:       number             // 0 for fresh subscribe
+  deltaMaxBytes:      number             // 0 = decline delta payloads
 }
 ```
 
-### Notification (JSON)
+### Notification
 
 ```
 interface NotificationV1 {
   v:            1
-  collectionId: string             // base64url
-  tailId:       string             // base64url
+  collectionId: string                   // base64url
+  tailId:       string                   // base64url
   revision:     number
-  digest:       string             // base64url
-  delta?:       string             // base64url, optional, bounded
+  digest:       string                   // base64url
+  delta?:       string                   // base64url, bounded
   timestamp:    number
-  sig:          string             // base64url, threshold signature
-  signers:      string[]           // PeerIds contributing to the threshold
+  sig:          string                   // threshold signature, base64url
+  signers:      string[]                 // PeerIds contributing
   rotationHint?: {
-    newTailId:          string
+    newTailId:           string
     effectiveAtRevision: number
   }
 }
 ```
 
-### Resume RPC (JSON)
+### Resume
 
 ```
 interface ResumeV1 {
@@ -476,48 +382,46 @@ interface ResumeV1 {
 
 interface ResumeReplyV1 {
   v:        1
-  result:   "backfill" | "out_of_window" | "tail_rotated"
+  result:   "backfill" | "checkpoint_window" | "out_of_window" | "tail_rotated"
   // backfill:
-  entries?:        NotificationV1[]
-  currentRevision?: number
+  entries?:           NotificationV1[]
+  currentRevision?:   number
+  // checkpoint_window:
+  checkpoint?: {
+    fromRevision:   number
+    toRevision:     number
+    mergedDigest:   string
+    mergedDelta?:   string
+    bracketingSigs: string[]            // length 2
+  }
+  recentEntries?:     NotificationV1[]
   // out_of_window:
-  currentTailId?:   string
-  currentRevision?: number
+  currentTailId?:     string
+  currentRevision?:   number
   // tail_rotated:
-  newTailId?:           string
+  newTailId?:             string
   newRevisionAtRotation?: number
 }
 ```
 
-### Demote notice (JSON)
+### Backfill
 
 ```
-interface DemoteNoticeV1 {
-  v:               1
-  collectionId:    string
-  cohortCoord:     string
-  level:           number
-  effectiveAt:     number          // unix ms
-  thresholdSig:    string          // base64url
-  signers:         string[]
+interface BackfillV1 {
+  v:             1
+  collectionId:  string
+  fromRevision:  number
+  toRevision:    number
+  signature:     string
 }
-```
 
-### Cohort gossip (JSON)
-
-```
-interface CohortGossipV1 {
-  v:                  1
-  collectionId:       string
-  level:              number
-  fromMember:         string         // PeerId
-  directSubBucket:    number         // log-bucketed
-  childCount:         number
-  childBucketSum:     number         // sum of child log-buckets
-  replayHead:         number         // highest revision in replay buffer
-  parentCohort?:      string[]       // PeerIds, when announcing
-  timestamp:          number
-  signature:          string
+interface BackfillReplyV1 {
+  v:            1
+  entries:      NotificationV1[]
+  available: {
+    fromRevision: number
+    toRevision:   number
+  }
 }
 ```
 
@@ -527,31 +431,25 @@ interface CohortGossipV1 {
 
 ### Defaults
 
+Reactivity adds the following to the cohort-topic defaults:
+
 | Parameter | Default | Description |
 |---|---|---|
-| `D_target` | 64 | Target direct subscribers per cohort |
-| `bucket_promote` | bucket(64) = 6 | Promote outward above this bucket |
-| `bucket_demote` | bucket(16) = 4 | Demote when below this bucket |
-| `T_demote` | 5 min | Hysteresis window before demotion fires |
-| `W` | 256 | Replay buffer depth (revisions) |
-| `ttl` | 90s | Subscription TTL |
-| `ping_interval` | 30s | Subscriber ping cadence (`ttl / 3`) |
-| `T_drain` | 60s | Old-tail drain time after rotation |
-| `L_max` | 240 | Cap on walk-inward starting level |
-| `confidence_min` | 0.3 | Below this, fall back to conservative `L_init` |
-| `backups_per_subscription` | 2 | Warm-failover cohort members |
+| `W` | 256 | Replay buffer depth (revisions per cohort, per collection) |
+| `W_checkpoint` | 4096 | Parent-checkpoint span (revisions) |
+| `dedupe_window` | 64 | Sliding-window dedupe set size |
+| `queue_max` | 32 | Per-subscriber bounded queue depth at a forwarder |
+| `delta_max` (Core) | 4096 | Max delta payload size in bytes; Edge = 0 |
+| `T_drain` | 60 s | Old-tail drain time after rotation |
+| `warm_threshold` | 8 | Transactions remaining in tail before anticipatory warm-up |
 | `block_fill_size` | 64 | Transactions per block (drives tail rotation) |
 
-### Edge vs Core profiles
+### Edge profile
 
-Reactivity inherits FRET's Edge/Core profile distinction. Edge subscribers (mobile) default to:
+In addition to the cohort-topic Edge overrides (TTL = 60 s, ping = 20 s, T2/T3 producer willingness off):
 
-- `ttl` = 60s (shorter, faster reclamation by cohort if app is killed)
-- `ping_interval` = 20s
-- Backups are sticky-cached even across reconnects to avoid re-walk on flap
-- `delta` field is rejected on incoming notifications above 4 KB (subscriber re-reads chain instead)
-
-Edge cohort members (rare; cohorts skew Core) refuse forwarder-promotion duties and only serve direct subscribers.
+- Subscribers reject inbound notifications carrying `delta` (`deltaMaxBytes = 0` in subscribe payload).
+- `cohortHint` is sticky-cached across reconnects so brief network flaps don't trigger re-walk.
 
 ---
 
@@ -559,40 +457,42 @@ Edge cohort members (rare; cohorts skew Core) refuse forwarder-promotion duties 
 
 ### Cold collection becomes popular
 
-`t=0`: Collection C exists with 0 subscribers. Tail block is `T0`.
+`t = 0`: collection `C` has 0 subscribers, tail block `T_0`.
 
-`t=1`: First subscriber `S_1` registers. `n_est = 1M`, `D_target = 64`, so `L_init ≈ 14`. Walks inward: outer cohorts have no state for C; eventually reaches the tail cohort at `L=0`. Tail cohort accepts (count = 1 ≪ 64).
+`t = 1`: First subscriber `S_1` registers. `n_est = 1M`, `F = 16`, so `d_max ≈ 4`. `S_1` probes `coord_4(S_1, H(T_0 ‖ "reactivity"))`; cohort there is cold, returns `NoState`. Walk toward root: `d = 3`, `d = 2`, `d = 1`, `d = 0`. The tier-0 cohort (which *is* the tail cohort) accepts; `S_1` is registered as the first subscriber.
 
-`t=10`–`t=60`: Subscribers `S_2 … S_64` arrive. Each walks inward and lands at the tail cohort. Tail cohort serves all 64 directly.
+`t = 10..60`: `S_2 … S_64` arrive. Each probes `d_max = 4` first; their tier-4 coords differ (different peer-ID prefixes), so the probes fan across the ring. All fall through to the root, which accepts up to `cap_promote = 64`.
 
-`t=61`: Subscriber `S_65` arrives. Tail cohort's bucket exceeds `bucket_promote` and redirects to `L = 1`. `S_65` recomputes `coord_1(S_65, T_0)` and registers at the level-1 cohort that coord names. The level-1 cohort instantiates as a forwarder, registers up to the tail cohort, and accepts `S_65`.
+`t = 61`: `S_65` arrives, walks to the root, gets `Promoted(1)`. Computes `coord_1(S_65, topicId)`; the tier-1 cohort at that coord instantiates as a forwarder, registers up to the tier-0 (tail) cohort, and accepts `S_65`.
 
-`t=62…`: New subscribers fill level-1 cohorts in their respective ring regions. Each level-1 cohort fills to 64, then redirects further to `L = 2`, and so on.
-
-The tree depth at steady state is `⌈log_64(N)⌉`. For `N = 1M` subscribers, depth = 4 levels.
+`t = 62 ..`: New subscribers fill tier-1 cohorts in their respective prefix-shards. Each fills to 64, then promotes to tier 2 in its shard. Steady-state depth at 1 M subscribers is `⌈log_16(1M / 64)⌉ = 4` tiers.
 
 ### Mobile subscriber wakes after 90 seconds
 
-Phone app resumes. `lastRevision = 1042`. Cached primary = `P_42`. Sends `ResumeV1{from: 1043}` to `P_42`. `P_42`'s replay buffer has revisions 950–1100. `P_42` returns `Backfill{entries: [1043..1098], currentRevision: 1098}`. Subscriber processes 56 backfilled notifications, updates `lastRevision = 1098`, resumes normal operation. Total: one round trip, no tree walk, no chain read.
+Phone app resumes. `lastRevision = 1042`. Cached `primary = P_42`. Sends `ResumeV1{from: 1043}`. `P_42`'s replay buffer has revisions 950–1100. Returns `Backfill{entries: [1043..1098], currentRevision: 1098}`. Subscriber processes 56 backfilled notifications, updates `lastRevision = 1098`, resumes. One round trip.
+
+### Mobile subscriber wakes after 20 minutes
+
+Phone app resumes. `lastRevision = 1042`, current revision is 2342. Replay buffer covers 2086–2342 (256 entries). `ResumeV1{from: 1043}` falls outside the buffer but inside the parent checkpoint `[800, 2085]`. Cohort returns `CheckpointWindow{ checkpoint: [800..2085], recentEntries: [2086..2342] }`. Subscriber applies the checkpoint's merged digest (collection-specific — for a KV collection, this is "these keys changed"), then dedupes against `lastRevision = 1042` for the `recentEntries`. One round trip.
 
 ### Tail rotation during steady-state load
 
-Collection C has 10,000 subscribers, tree depth 3. Tail block `T_5` fills at revision 5400. The notification for revision 5400 includes `rotationHint{newTailId: T_6, effectiveAtRevision: 5401}`.
+Collection `C` has 10 000 subscribers, tree depth 3. Tail block `T_5` fills at revision 5400. The notification for revision 5400 carries `rotationHint{ newTailId: T_6, effectiveAtRevision: 5401 }`.
 
-All 10,000 subscribers receive the hint via the existing tree within seconds. Each schedules re-registration with jitter over the next 30 seconds (bounded by `T_drain = 60s`). The new tail cohort at `coord(T_6)` sees an arrival rate of ~330 subscribers/second; it accepts 64, redirects the rest. Outer cohorts under `T_6` form during the same window. By `T_drain`, the new tree mirrors the old tree's shape under a different root. Forwarder cohorts under `T_5` demote naturally as their subscribers drain.
-
-Notifications for revision 5401 onward originate from the new tail cohort under `T_6`. Continuity is preserved by the monotonic revision sequence; subscribers experience the rotation as a brief pause followed by resumed delivery.
+All 10 000 subscribers receive the hint via the existing tree within a few seconds. Each schedules re-registration with random jitter over 30 s. The new tail cohort at `coord_0(_, H(T_6 ‖ "reactivity"))` sees arrival rate ≈ 333 / s; it accepts 64 directly, fast-promotes (`cap_promote_fast = 32`, load bucket hot), and starts redirecting to tier 1. Tier-1 cohorts under `T_6` form during the same window. By `T_drain = 60 s`, the new tree mirrors the old tree's shape under a different root. Forwarder cohorts under `T_5` drain and demote naturally. Continuity is preserved by the monotonic revision sequence; subscribers experience the rotation as a brief pause followed by resumed delivery from the new tree.
 
 ### Cohort failure mid-notification
 
-Tail cohort emits notification for revision 7800. Level-1 forwarder cohort `F_a` receives, forwards to its children. Mid-fanout, three of `F_a`'s 16 members crash simultaneously (e.g., shared infrastructure failure). The remaining 13 are still above quorum (`k − x = 14`); FRET stabilization kicks in and promotes successors into the cohort. During the brief instability window, `F_a`'s primary for some subscribers may be among the crashed three. Those subscribers' pings fail; they promote backups. Backups have the `SubscriptionRecord` and the replay buffer (gossiped). Subscribers issue `ResumeV1{from: 7800}`; the new primary serves from the buffer. No notifications are lost.
+Tail cohort emits notification for revision 7800. Tier-1 forwarder `F_a` receives, begins fan-out. Mid-fanout, three of `F_a`'s 16 members crash, dropping the cohort to 13 — one below quorum. FRET stabilization promotes successors into the cohort within seconds, restoring quorum; meanwhile attached subscribers whose primary was among the crashed three see ping failures and promote backups. The backups already have the registration record and replay-buffer entries from cohort gossip. Subscribers issue `BackfillV1{from: 7800}`; the new primary serves from the buffer. No notifications are lost.
 
 ---
 
 ## Interaction with other subsystems
 
-- **Transaction log** ([transactions.md](transactions.md)) — owns the canonical state. Reactivity reads commit events and tail-cohort threshold signatures. Reactivity does not affect transaction processing.
-- **FRET** ([fret.md](../../Fret/docs/fret.md)) — provides ring coordinates, cohort assembly, `RouteAndMaybeAct`, network-size estimation, and stabilization. Reactivity is a pure consumer of FRET primitives.
-- **Repository** ([repository.md](repository.md)) — supplies the collection-id and tail-id resolution and the chain-read fallback when subscribers are out of replay window.
+- **Cohort topic** ([cohort-topic.md](cohort-topic.md)) — owns addressing, walks, willingness, promotion/demotion, primary/backup sharding, membership certificates. Reactivity is one application on top.
+- **Transaction log** ([transactions.md](transactions.md)) — owns canonical state. Reactivity reuses commit certificates as notification signatures.
+- **FRET** ([../../Fret/docs/fret.md](../../Fret/docs/fret.md)) — ring coordinates, cohort assembly, stabilization. Reached through the cohort-topic layer.
+- **Repository** ([repository.md](repository.md)) — supplies the chain-read fallback when subscribers are out of even the parent-checkpoint window.
 - **Right-is-Right** ([right-is-right.md](right-is-right.md)) — the threshold-signed notification reuses the commit certificate that Right-is-Right already requires for transaction finality.
-- **Partition healing** ([partition-healing.md](partition-healing.md)) — partition-merge events surface to forwarder cohorts as a hint to re-validate `parentCohort` and `childCohorts` references; mismatched cohort epochs trigger localized re-registration.
+- **Partition healing** ([partition-healing.md](partition-healing.md)) — handled at the cohort-topic layer via `cohortEpoch` refresh; reactivity reacts by re-verifying its parent-checkpoint bracketing signatures.
+- **Matchmaking** ([matchmaking.md](matchmaking.md)) — sibling application on the same cohort-topic substrate; no direct interaction, but operational cost-sharing benefits flow from running both on the same cohort infrastructure.

@@ -230,9 +230,14 @@ Two `Startable` monitors react to `connection:open` / `connection:close` events 
 
 Both monitors are suppressed during detected network partitions (`PartitionDetector`).
 
-## Matchmaking
+## Cohort Topics, Reactivity, and Matchmaking
 
-Matchmaking pairs peers that want to collaborate — cluster formation, task distribution, resource discovery — without a central registry. Rendezvous keys combine locally-common Kademlia prefix bits (MSBs) with task-hash bits (LSBs); peers widen or narrow specificity based on how crowded the rendezvous point is. Active matchers use short TTLs and aggressive adjustment; waiting workers use long TTLs and renew. See [matchmaking.md](matchmaking.md).
+A shared **cohort-topic** substrate ([cohort-topic.md](cohort-topic.md)) provides FRET-backed topic trees for any subsystem that needs to find, attach to, or fan out from a named set of peers. Topic trees grow from a single root cohort outward in tiers, sharded by peer-ID prefix; participants walk toward the root from an estimated max tier and only follow explicit promotion redirects outward, giving anti-flood behavior by construction. The layer supplies addressing, willingness-gated admission, TTL-refreshed soft state, cohort threshold signatures, and a tier ladder (T0 essential → T3 luxury) that lets nodes prioritize transaction work over discretionary forwarding.
+
+Two applications run on the substrate today:
+
+* **Reactivity** ([reactivity.md](reactivity.md)) — push-tree mode. Notifications about collection commits fan out through a tree rooted at the tail block's coordinate (rotating, to deny attackers a persistent target). Threshold signatures reuse the commit certificate; subscribers backfill from a replay buffer at the nearest forwarder. T3 (luxury) — never starves transaction processing.
+* **Matchmaking** ([matchmaking.md](matchmaking.md)) — directory mode. Providers and seekers register at a stable per-task topic; cohorts return advisory provider sets to seekers. Used for cluster formation, task distribution, capability lookup, and voting-quorum assembly. T2 (functional).
 
 ## SQL Integration
 
@@ -280,7 +285,9 @@ Instrumentation is built on the `debug` library (see [debugging.md](debugging.md
 | [repository.md](repository.md) | Block repository operations and lifecycle |
 | [right-is-right.md](right-is-right.md) | Validity dispute escalation and reputation |
 | [arachnode.md](arachnode.md) | Concentric ring storage architecture |
-| [matchmaking.md](matchmaking.md) | Rendezvous-based peer discovery |
+| [cohort-topic.md](cohort-topic.md) | Shared topic-tree substrate for reactivity, matchmaking, and future directory services |
+| [reactivity.md](reactivity.md) | Push-based change notifications (cohort-topic push-tree application) |
+| [matchmaking.md](matchmaking.md) | Peer discovery and quorum assembly (cohort-topic directory application) |
 | [correctness.md](correctness.md) | Formal safety and liveness properties |
 | [internals.md](internals.md) | Developer guide: data flow, invariants, pitfalls |
 | [debugging.md](debugging.md) | DEBUG namespaces and logging conventions |
