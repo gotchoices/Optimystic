@@ -47,6 +47,7 @@ The layer holds *only soft state*. Authority over any underlying truth (transact
 - **Willingness** — a per-cohort-member, per-tier decision whether to personally serve a given registration. Device-specific.
 - **Registration** — soft state held by 1–3 cohort members on behalf of one participant. Refreshed by TTL pings.
 - **Capacity tier** — a system-wide priority class (T0–T3, see below) that frames admission decisions.
+- **Topic traffic** — per-(topic, cohort) flow signal (arrival rate, query rate, current count) returned on registration replies. The layer measures it; applications interpret it.
 
 ---
 
@@ -213,6 +214,28 @@ The barometer feeds two decisions:
 2. **Promotion threshold.** A cohort's promotion decision uses its bucketed direct-participant count (per-topic) and the per-tier load barometer (per-cohort). If the cohort is hot at the tier it's serving, promotion fires earlier than the strict `cap_promote` would dictate, shedding new registrations to tier `d+1` faster.
 
 The barometer is not aggregated across the tree. A parent cohort doesn't know its children's load and doesn't need to — children promote independently.
+
+---
+
+## Topic traffic signal
+
+A cohort tracks per-topic flow rates alongside the stock `directParticipants` count and returns them on registration replies. Applications use the signal to decide whether the current tier is dense enough to settle on or whether to continue walking.
+
+```
+TopicTrafficV1 {
+  windowSeconds:       number   // observation window, default 60
+  arrivalsPerMin:      number   // fresh registrations + renewals into this cohort for this topic
+  queriesPerMin:       number   // application-level queries against this topic, if any
+  directParticipants:  number   // stock count (same value that drives promotion)
+  childCohortCount:    number   // tier-(d+1) cohorts known for this topic, 0 if not promoted
+}
+```
+
+The rate is computed locally over the last `windowSeconds` and gossiped within the cohort as part of normal cohort-gossip; the reply uses the responding member's own most-recent view, which lags by at most one gossip round. The signal is advisory — neither admission, routing, nor promotion depends on it.
+
+This layer does not interpret the signal. The reactivity application ignores it (subscribers always want the tail). The matchmaking application uses it for the seeker's hang-out decision; see [matchmaking.md §Hang-out vs. continue](matchmaking.md#hang-out-vs-continue). Future applications may use it however they like.
+
+A participant that receives `NoState` at tier `d` gets no traffic signal from that cohort (it has none for this topic); the participant simply continues toward the root. A participant that receives `Promoted(d+1)` gets the outgoing cohort's traffic signal anyway, which lets it estimate whether the tier it's redirected to is likely to be hot.
 
 ---
 
@@ -458,6 +481,7 @@ interface RegisterReplyV1 {
   backups?:        string[]           // PeerIds, 1-2
   cohortEpoch?:    string             // 32 bytes
   cohortMembers?:  string[]           // PeerIds, full cohort, for client cache
+  topicTraffic?:   TopicTrafficV1     // present on accepted; also returned on promoted
   // promoted:
   targetTier?:     number             // d+1 typically; may leap
   // unwilling_member:
@@ -465,6 +489,14 @@ interface RegisterReplyV1 {
   // unwilling_cohort:
   retryAfterMs?:   number
   reason?:         string             // human-readable, optional
+}
+
+interface TopicTrafficV1 {
+  windowSeconds:       number
+  arrivalsPerMin:      number
+  queriesPerMin:       number
+  directParticipants:  number
+  childCohortCount:    number
 }
 ```
 

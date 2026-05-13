@@ -183,15 +183,87 @@ The cohort-topic walk-toward-root from `d_max` and reply set apply unchanged:
 
 | Reply | Meaning for matchmaking |
 |---|---|
-| `Accepted` | Provider or seeker registered at this cohort |
+| `Accepted` | Provider or seeker registered at this cohort. Reply carries `topicTraffic`; seekers use it to decide hang-out vs. continue (see [Hang-out vs. continue](#hang-out-vs-continue)) |
 | `NoState` | This cohort doesn't yet serve this topic; walk one tier toward the root |
-| `Promoted(targetTier)` | Tree has grown past this tier; register deeper using your own peer prefix |
+| `Promoted(targetTier)` | Tree has grown past this tier; register deeper using your own peer prefix. Reply still carries the outgoing cohort's `topicTraffic`, hinting at conditions at the target tier |
 | `UnwillingMember` | This cohort member declines; ask a sibling member |
 | `UnwillingCohort` | No member of this cohort will serve this topic; back off in time, retry from `d_max` |
 
 `UnwillingCohort` is particularly important for matchmaking on hot topics: if every cohort along the walk path is busy with higher-tier work (T0 commits, T1 chain serving), the seeker waits rather than re-probing aggressively. The wait drains as load shifts; the seeker is not punished for participating in a popular task, but it is asked not to make the popularity worse.
 
 There is no separate "try inward and outward" exploration mode. Provider and seeker walks are the same single-direction walk that every cohort-topic application uses.
+
+---
+
+## Hang-out vs. continue
+
+`Accepted` tells a seeker that this cohort is in the tree for the topic. It does not tell the seeker whether *this tier* is the right place to wait. A cohort deep in the tree (high `d`) holds only the seeker's prefix-shard of providers — a small, fast-to-query slice, but possibly too thin if `wantCount` is high or providers are sparse. A cohort near the root holds many shards merged — a much larger pool, at the cost of being one or more hops farther up.
+
+The cohort-topic `topicTraffic` field on every `Accepted` and `Promoted` reply gives the seeker enough information to choose.
+
+### Decision inputs
+
+From the reply:
+
+- `directParticipants` — providers known at this cohort right now.
+- `arrivalsPerMin` — provider registration and renewal rate; predicts how quickly new matchable providers appear here.
+- `queriesPerMin` — competing seeker activity over the same provider pool.
+- `childCohortCount` — non-zero means this tier has promoted; descending would lead to live shards, ascending would lead to broader aggregation.
+
+From the seeker:
+
+- `wantCount` — providers needed.
+- `patienceMs` — how long the seeker is willing to wait at this tier before escalating. Per-task, not per-cohort.
+- `filter` — capability filter, narrowing the matchable subset.
+
+### Decision rule
+
+After receiving `Accepted` with `topicTraffic` at tier `d`:
+
+1. **Immediate-match check.** Issue `QueryV1`. If providers matching `filter` ≥ `wantCount`, done.
+2. **Hang-out feasibility.** Estimate matchable arrivals over the remaining patience budget:
+   ```
+   expectedNewMatches ≈ arrivalsPerMin × filterAcceptRatio × (patienceMs / 60000)
+   contentionFactor   ≈ 1 + (queriesPerMin × meanWantCount) / max(arrivalsPerMin, 1)
+   ```
+   If `currentMatches + expectedNewMatches ≥ wantCount × contentionFactor`, **hang out**: keep the seeker registration alive via TTL renewals; re-query periodically (or wait for cohort-pushed updates if the application uses them) until `wantCount` matches accumulate or `patienceMs` elapses.
+   `filterAcceptRatio` starts at 1.0 and can be refined from observed query yields; `meanWantCount` is a small constant or learned from prior interactions.
+3. **Otherwise, walk toward the root.** Withdraw the seeker registration (`RenewV1` with TTL = 0; polite but optional), then re-register at `d − 1`. Repeat the decision there. The patience budget continues to drain, so each escalation step makes hang-out at the new tier slightly less attractive — which is correct, since the root is the terminal.
+
+At `d = 0`, there is nowhere further to walk: hang out for whatever patience remains, then return whatever matched (possibly fewer than `wantCount`) to the caller.
+
+### Patience budgeting
+
+`patienceMs` is per-seeker, per-task — the layer does not dictate. Indicative ranges:
+
+| Use case | `patienceMs` |
+|---|---|
+| Latency-sensitive task assignment | 1–5 s |
+| Interactive capability lookup | 5–30 s |
+| Voting-quorum assembly | 30–300 s |
+| Background work batching | minutes |
+
+A seeker is also free to split its budget — e.g., spend a quarter of `patienceMs` at each visited tier and walk on if the local rate doesn't promise a result in the slice allotted. The doc does not prescribe a strategy; only the inputs.
+
+### Why this works
+
+- **Hot topic.** Even a deep-tier prefix-shard sees enough churn that the seeker stays put. The root is bypassed entirely. This is the dominant case for popular tasks.
+- **Cold topic.** Each tier's `topicTraffic` reports a thin pool; the seeker walks all the way to the root, where the aggregated population is largest, and waits there. Cost: log-many extra RPCs in network size, identical to the existing cold-walk pattern.
+- **Borderline topic.** The seeker estimates wrong, hangs out for a while, gives up, escalates. Cost: one wasted patience-slice plus one extra register hop. Bounded.
+- **No outward probing.** The decision is always "wait here" or "walk one tier toward the root." Seekers never speculatively probe deeper than where they started; the anti-flood properties of the substrate are preserved.
+
+### Worked example
+
+A seeker needs 8 providers of `pdf-render`, `patienceMs = 10 s`. Network has 200 such providers.
+
+`d_max = 3`. Probes:
+
+- `d = 3` → `NoState`. `d = 2` → `NoState`.
+- `d = 1` → `Accepted` with `topicTraffic = { directParticipants: 6, arrivalsPerMin: 90, queriesPerMin: 4 }`.
+- Query returns 6 matching providers. Need 8. `expectedNewMatches ≈ 90 × 1.0 × (10/60) ≈ 15`. Contention factor ≈ 1.4. Threshold `8 × 1.4 = 11.2`; have `6 + 15 = 21`. Hang out.
+- Within 4 s two more renewals land; the seeker re-queries, total 8, dials.
+
+Contrast: the seeker's prefix lands it in a thinner shard with `directParticipants: 1, arrivalsPerMin: 8`. `expectedNewMatches ≈ 1.3`. Threshold not met. Withdraw, walk to `d = 0`. Root reports `directParticipants: 200, arrivalsPerMin: 600`. Query returns 8 immediately.
 
 ---
 
@@ -265,12 +337,13 @@ interface QueryV1 {
 }
 
 interface QueryReplyV1 {
-  v:           1
-  providers?:  ProviderEntryV1[]
-  seekers?:    SeekerEntryV1[]
-  truncated:   boolean
-  cohortEpoch: string
-  signature:   string                 // cohort primary's reply signature; not threshold
+  v:             1
+  providers?:    ProviderEntryV1[]
+  seekers?:      SeekerEntryV1[]
+  truncated:     boolean
+  cohortEpoch:   string
+  topicTraffic:  TopicTrafficV1        // see cohort-topic.md
+  signature:     string                // cohort primary's reply signature; not threshold
 }
 
 interface ProviderEntryV1 {
