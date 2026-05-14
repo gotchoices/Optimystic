@@ -115,4 +115,57 @@ describe('Optimystic plugin catalog hydration', function () {
 		const result = await plugin.hydrate(db);
 		expect(result).to.deep.equal({ tables: 0, indexes: 0 });
 	});
+
+	it('doInitialize skips storeSchema when local DDL matches the persisted schema', async () => {
+		// Regression guard for the doInitialize short-circuit. After hydrate
+		// populates the catalog with the persisted column shape, a subsequent
+		// connect()/initialize() must NOT re-write the byte-identical schema —
+		// the post-hydrate cold-start cost is exactly the thing being avoided.
+		const storage = new MemoryRawStorage();
+		const sharedTransactor = buildSharedLocalTransactor(storage);
+
+		const dbA = new Database();
+		registerWithSharedTransactor(dbA, sharedTransactor);
+		await dbA.exec(`
+			CREATE TABLE widgets (
+				id INTEGER PRIMARY KEY,
+				name TEXT NOT NULL,
+				price REAL
+			) USING optimystic('tree://hydrate-test/widgets')
+		`);
+
+		const dbB = new Database();
+		const pluginB = registerWithSharedTransactor(dbB, sharedTransactor);
+		await pluginB.hydrate(dbB);
+
+		// Wrap storeSchema on the shared SchemaManager so we can count calls
+		// during the post-hydrate query path. Reaching into the module's
+		// internal `schemaManagers` Map is fine here because the whole point
+		// of the change under test is that hydrate and per-table init share
+		// the same SchemaManager instance.
+		const optimysticModule = pluginB.vtables[0]!.module as unknown as {
+			schemaManagers: Map<string, { storeSchema: (...args: any[]) => Promise<void> }>;
+		};
+		const managers = [...optimysticModule.schemaManagers.values()];
+		expect(managers, 'hydrate should have populated the shared SchemaManager map').to.have.lengthOf(1);
+		const manager = managers[0]!;
+		let storeCalls = 0;
+		const originalStore = manager.storeSchema.bind(manager);
+		manager.storeSchema = async (...args: any[]) => {
+			storeCalls++;
+			return originalStore(...args);
+		};
+
+		// First query: triggers connect() → doInitialize() against the hydrated
+		// schema. The candidate StoredTableSchema built from the local columns
+		// must match the persisted bytes, so the write-then-read-back path is
+		// skipped entirely.
+		await collectRows(dbB.eval('SELECT id, name FROM widgets'));
+		expect(storeCalls, 'storeSchema should not be called when persisted schema matches').to.equal(0);
+
+		// Second query against the same table: still no writes — the table is
+		// already initialized, so doInitialize doesn't even rerun.
+		await collectRows(dbB.eval('SELECT id, name FROM widgets'));
+		expect(storeCalls, 'subsequent queries should not trigger schema writes').to.equal(0);
+	});
 });
