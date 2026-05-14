@@ -62,6 +62,29 @@ function affinityToLogicalType(affinity: SqlDataType): LogicalType {
 }
 
 /**
+ * Stable structural compare of two StoredTableSchema values. Both sides are
+ * produced by SchemaManager.tableSchemaToStored (the persisted side via a
+ * prior store + JSON round-trip), so JSON.stringify with deterministic key
+ * order yields the same byte string when the schemas are equivalent.
+ */
+function schemasEqual(a: StoredTableSchema, b: StoredTableSchema): boolean {
+  return stableStringify(a) === stableStringify(b);
+}
+
+function stableStringify(value: unknown): string {
+  return JSON.stringify(value, (_key, v) => {
+    if (v && typeof v === 'object' && !Array.isArray(v)) {
+      const sorted: Record<string, unknown> = {};
+      for (const k of Object.keys(v as Record<string, unknown>).sort()) {
+        sorted[k] = (v as Record<string, unknown>)[k];
+      }
+      return sorted;
+    }
+    return v;
+  });
+}
+
+/**
  * Production-grade virtual table for Optimystic tree collections
  */
 export class OptimysticVirtualTable extends VirtualTable {
@@ -143,12 +166,22 @@ export class OptimysticVirtualTable extends VirtualTable {
       let storedSchema: StoredTableSchema;
 
       if (hasLocalColumns) {
-        await this.schemaManager.storeSchema(this.tableSchema, txnState?.transactor);
-        const written = await this.schemaManager.getSchema(this.tableName, txnState?.transactor);
-        if (!written) {
-          throw new Error('Failed to store and retrieve schema');
+        // Build the would-be-persisted form of the local DDL and short-circuit
+        // when it matches what's already on disk. Without this, every cold-start
+        // `connect()` after `hydrate()` re-writes a byte-identical schema and
+        // re-reads it back — one transaction per table+index, which dominates
+        // post-hydrate cold-start time (see tickets/fix/hydrated-vtab-...md).
+        const candidateStored = this.schemaManager.tableSchemaToStored(this.tableSchema);
+        if (persistedSchema && schemasEqual(candidateStored, persistedSchema)) {
+          storedSchema = persistedSchema;
+        } else {
+          await this.schemaManager.storeSchema(this.tableSchema, txnState?.transactor);
+          const written = await this.schemaManager.getSchema(this.tableName, txnState?.transactor);
+          if (!written) {
+            throw new Error('Failed to store and retrieve schema');
+          }
+          storedSchema = written;
         }
-        storedSchema = written;
       } else if (persistedSchema) {
         this.tableSchema.columns = persistedSchema.columns.map((col, index) => ({
           name: col.name,
@@ -730,6 +763,13 @@ export class OptimysticVirtualTable extends VirtualTable {
  */
 export class OptimysticModule implements VirtualTableModule<OptimysticVirtualTable, OptimysticModuleConfig> {
   private tables = new Map<string, OptimysticVirtualTable>();
+  // The schema tree (`tree://optimystic/schema`) is plugin-global, so a single
+  // SchemaManager per (transactor, key-network, network-name, raw-storage-
+  // factory) tuple is enough. Sharing it means hydrateCatalog's `listTables`/
+  // `getSchema` populate the same `schemaCache` that each table's
+  // doInitialize will later consult, turning N per-table tree walks into N
+  // cache hits.
+  private schemaManagers = new Map<string, SchemaManager>();
 
   constructor(
     private collectionFactory: CollectionFactory,
@@ -740,7 +780,17 @@ export class OptimysticModule implements VirtualTableModule<OptimysticVirtualTab
    * Create a schema manager for a specific table's transactor configuration
    */
   private createSchemaManager(tableOptions: ParsedOptimysticOptions): SchemaManager {
-    return new SchemaManager(async (transactor) => {
+    const fingerprint = [
+      tableOptions.transactor ?? '',
+      tableOptions.keyNetwork ?? '',
+      tableOptions.libp2pOptions?.networkName ?? '',
+      tableOptions.libp2pOptions?.port ?? 0,
+      tableOptions.rawStorageFactory ? '1' : '0',
+    ].join('|');
+    const cached = this.schemaManagers.get(fingerprint);
+    if (cached) return cached;
+
+    const manager = new SchemaManager(async (transactor) => {
       const schemaOptions: ParsedOptimysticOptions = {
         collectionUri: 'tree://optimystic/schema',
         transactor: tableOptions.transactor,
@@ -756,6 +806,8 @@ export class OptimysticModule implements VirtualTableModule<OptimysticVirtualTab
         transactor ? { transactor, isActive: true, collections: new Map(), stampId: '' } : undefined
       );
     });
+    this.schemaManagers.set(fingerprint, manager);
+    return manager;
   }
 
   /**

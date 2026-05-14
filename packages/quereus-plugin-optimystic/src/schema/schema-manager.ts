@@ -214,9 +214,12 @@ export class SchemaManager {
 	}
 
 	/**
-	 * Convert TableSchema to storable format
+	 * Convert TableSchema to storable format. Exposed so callers can build a
+	 * candidate StoredTableSchema (e.g. to compare against the persisted one
+	 * and skip a redundant write when the in-memory shape matches what's
+	 * already on disk).
 	 */
-	private tableSchemaToStored(schema: TableSchema): StoredTableSchema {
+	tableSchemaToStored(schema: TableSchema): StoredTableSchema {
 		return {
 			name: schema.name,
 			schemaName: schema.schemaName,
