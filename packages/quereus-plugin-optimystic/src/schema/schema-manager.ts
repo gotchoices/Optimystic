@@ -72,8 +72,17 @@ export class SchemaManager {
 	 * Store a table schema
 	 */
 	async storeSchema(schema: TableSchema, transactor?: ITransactor): Promise<void> {
-		const stored = this.tableSchemaToStored(schema);
-		this.schemaCache.set(schema.name, stored);
+		await this.storeStoredSchema(this.tableSchemaToStored(schema), transactor);
+	}
+
+	/**
+	 * Store an already-converted StoredTableSchema directly. Exposed so callers
+	 * that need precise control over the persisted shape (e.g. merging
+	 * persisted indexes into a local-DDL candidate to avoid clobbering them)
+	 * can hand us the exact bytes to write.
+	 */
+	async storeStoredSchema(stored: StoredTableSchema, transactor?: ITransactor): Promise<void> {
+		this.schemaCache.set(stored.name, stored);
 
 		const tree = await this.getSchemaTree(transactor);
 		// The schema tree's keyExtractor (in collection-factory) treats entries
@@ -82,7 +91,7 @@ export class SchemaManager {
 		// the tuple shape. Storing the bare `stored` object made `entry[0]`
 		// undefined inside the btree, so cross-instance reads (and listTables)
 		// couldn't see the entries even after a clean sync.
-		await tree.replace([[schema.name, [schema.name, stored]]]);
+		await tree.replace([[stored.name, [stored.name, stored]]]);
 	}
 
 	/**

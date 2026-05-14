@@ -168,4 +168,102 @@ describe('Optimystic plugin catalog hydration', function () {
 		await collectRows(dbB.eval('SELECT id, name FROM widgets'));
 		expect(storeCalls, 'subsequent queries should not trigger schema writes').to.equal(0);
 	});
+
+	it('doInitialize preserves persisted indexes when local DDL has none', async () => {
+		// Reproduction for tickets/fix/doinitialize-shortcircuit-clobbers-persisted-indexes.md.
+		//
+		// `apply schema App;` dispatches `CREATE TABLE foo (...)` BEFORE the
+		// matching `CREATE INDEX` statements, so when xCreate/xConnect fires
+		// the local TableSchema has columns but `indexes: []`. The old
+		// short-circuit compared that against persisted (which already had
+		// indexes from a prior session), found them unequal, and fell through
+		// to `storeSchema(this.tableSchema)` — writing `indexes: []` over the
+		// persisted list. Every subsequent `addIndex()` then lost its dedupe
+		// and re-created its index tree from scratch.
+		const storage = new MemoryRawStorage();
+		const sharedTransactor = buildSharedLocalTransactor(storage);
+
+		// --- Session 1: create the table AND its index, so the persisted
+		// schema has a non-empty `indexes` array.
+		const dbA = new Database();
+		registerWithSharedTransactor(dbA, sharedTransactor);
+		await dbA.exec(`
+			CREATE TABLE gadgets (
+				id INTEGER PRIMARY KEY,
+				category TEXT NOT NULL,
+				weight REAL
+			) USING optimystic('tree://hydrate-test/gadgets')
+		`);
+		await dbA.exec(`CREATE INDEX idx_gadgets_category ON gadgets(category)`);
+
+		// --- Session 2: fresh Database, fresh plugin, shared storage. Skip
+		// hydrate() and re-execute the bare CREATE TABLE — this mirrors the
+		// `apply schema` codepath, where the differ sees an empty catalog
+		// (no hydrate) and emits CREATE TABLE before CREATE INDEX. The
+		// resulting `module.create()` constructs a vtab whose tableSchema
+		// has `indexes: []` and runs doInitialize against the persisted
+		// schema (with its index).
+		const dbB = new Database();
+		const pluginB = registerWithSharedTransactor(dbB, sharedTransactor);
+
+		const optimysticModule = pluginB.vtables[0]!.module as unknown as {
+			schemaManagers: Map<string, {
+				storeSchema: (...args: any[]) => Promise<void>;
+				storeStoredSchema: (...args: any[]) => Promise<void>;
+				getSchema: (name: string) => Promise<{ indexes: { name: string }[] } | undefined>;
+			}>;
+		};
+
+		await dbB.exec(`
+			CREATE TABLE gadgets (
+				id INTEGER PRIMARY KEY,
+				category TEXT NOT NULL,
+				weight REAL
+			) USING optimystic('tree://hydrate-test/gadgets')
+		`);
+
+		// The plugin must have used the same SchemaManager (per-fingerprint
+		// caching). Wrap both write entrypoints AFTER the CREATE TABLE has
+		// already wired up the manager, so we measure subsequent writes.
+		const managers = [...optimysticModule.schemaManagers.values()];
+		expect(managers, 'create() should have populated the shared SchemaManager map').to.have.lengthOf(1);
+		const manager = managers[0]!;
+
+		// Sanity check: the persisted schema still has the index. Without the
+		// fix, the CREATE TABLE above would already have clobbered it to [].
+		const persisted = await manager.getSchema('gadgets');
+		expect(persisted, 'persisted schema should still exist after CREATE TABLE').to.not.equal(undefined);
+		expect(
+			persisted!.indexes.map(i => i.name),
+			'persisted indexes must survive the CREATE TABLE in session 2',
+		).to.deep.equal(['idx_gadgets_category']);
+
+		// Now wrap the write entrypoints and re-issue CREATE INDEX IF NOT
+		// EXISTS — addIndex() should find the index already present (because
+		// it WASN'T clobbered) and short-circuit without writing.
+		let storeCalls = 0;
+		let storeStoredCalls = 0;
+		const originalStore = manager.storeSchema.bind(manager);
+		const originalStoreStored = manager.storeStoredSchema.bind(manager);
+		manager.storeSchema = async (...args: any[]) => {
+			storeCalls++;
+			return originalStore(...args);
+		};
+		manager.storeStoredSchema = async (...args: any[]) => {
+			storeStoredCalls++;
+			return originalStoreStored(...args);
+		};
+
+		await dbB.exec(`CREATE INDEX IF NOT EXISTS idx_gadgets_category ON gadgets(category)`);
+
+		expect(storeCalls, 'storeSchema should not fire — addIndex dedupe must hit').to.equal(0);
+		expect(storeStoredCalls, 'storeStoredSchema should not fire either').to.equal(0);
+
+		// And the persisted index list is unchanged.
+		const after = await manager.getSchema('gadgets');
+		expect(
+			after!.indexes.map(i => i.name),
+			'persisted indexes unchanged after re-issuing CREATE INDEX',
+		).to.deep.equal(['idx_gadgets_category']);
+	});
 });

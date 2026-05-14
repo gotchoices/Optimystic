@@ -171,11 +171,28 @@ export class OptimysticVirtualTable extends VirtualTable {
         // `connect()` after `hydrate()` re-writes a byte-identical schema and
         // re-reads it back — one transaction per table+index, which dominates
         // post-hydrate cold-start time (see tickets/fix/hydrated-vtab-...md).
+        //
+        // `CREATE TABLE` / `xConnect` arrives without its `CREATE INDEX`
+        // siblings — those dispatch later as separate `addIndex()` calls. So
+        // an empty `candidateStored.indexes` does NOT mean "the table has no
+        // indexes"; it means "the indexes aren't in this DDL statement." The
+        // persisted index list is authoritative whenever the local candidate
+        // has none — otherwise the short-circuit miss below would write
+        // `indexes: []`, clobbering the persisted indexes and forcing every
+        // later `addIndex()` to fail its dedupe and rebuild from scratch.
         const candidateStored = this.schemaManager.tableSchemaToStored(this.tableSchema);
-        if (persistedSchema && schemasEqual(candidateStored, persistedSchema)) {
+        const mergedCandidate: StoredTableSchema =
+          candidateStored.indexes.length === 0 && persistedSchema
+            ? { ...candidateStored, indexes: persistedSchema.indexes }
+            : candidateStored;
+
+        if (persistedSchema && schemasEqual(mergedCandidate, persistedSchema)) {
           storedSchema = persistedSchema;
         } else {
-          await this.schemaManager.storeSchema(this.tableSchema, txnState?.transactor);
+          // Structural mismatch (columns/PK/vtab args changed). Write the
+          // merged candidate so a real DDL change still wins on columns
+          // while persisted indexes survive — they're managed by addIndex().
+          await this.schemaManager.storeStoredSchema(mergedCandidate, txnState?.transactor);
           const written = await this.schemaManager.getSchema(this.tableName, txnState?.transactor);
           if (!written) {
             throw new Error('Failed to store and retrieve schema');
