@@ -669,6 +669,7 @@ program
 	.option('-s, --storage <type>', 'Storage type: memory or file', 'memory')
 	.option('--storage-path <path>', 'Path for file storage')
 	.option('--storage-capacity <bytes>', 'Override storage capacity in bytes (for ring selection)')
+	.option('--offline', 'Run as single-node LocalTransactor (no distributed consensus)')
 	.option('--bootstrap-file <path>', 'Path to JSON containing bootstrap multiaddrs or node list')
 	.option('--announce-file <path>', 'Write node info (peerId, multiaddrs) to this JSON file for mesh launchers')
 	.action(async (options) => {
@@ -703,6 +704,7 @@ program
 	.option('-s, --storage <type>', 'Storage type: memory or file', 'memory')
 	.option('--storage-path <path>', 'Path for file storage')
 	.option('--storage-capacity <bytes>', 'Override storage capacity in bytes (for ring selection)')
+	.option('--offline', 'Run as single-node LocalTransactor (no distributed consensus)')
 	.option('--announce-file <path>', 'Write node info (peerId, multiaddrs) to this JSON file for mesh launchers')
 	.action(async (options) => {
 		try {
@@ -736,6 +738,7 @@ program
 	.option('-s, --storage <type>', 'Storage type: memory or file', 'memory')
 	.option('--storage-path <path>', 'Path for file storage')
 	.option('--storage-capacity <bytes>', 'Override storage capacity in bytes (for ring selection)')
+	.option('--offline', 'Run as single-node LocalTransactor (no distributed consensus)')
 	.option('--bootstrap-file <path>', 'Path to JSON containing bootstrap multiaddrs or node list')
 	.option('--stay-connected', 'Stay connected after action completes')
 	.option('--announce-file <path>', 'Write node info (peerId, multiaddrs) to this JSON file for mesh launchers')

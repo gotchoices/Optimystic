@@ -8,7 +8,7 @@ import { bootstrap } from '@libp2p/bootstrap';
 import { circuitRelayServer } from '@libp2p/circuit-relay-v2';
 import { peerIdFromString } from '@libp2p/peer-id';
 import { generateKeyPair } from '@libp2p/crypto/keys';
-import type { PrivateKey } from '@libp2p/interface';
+import type { ConnectionGater, PrivateKey } from '@libp2p/interface';
 import { clusterService } from './cluster/service.js';
 import { repoService } from './repo/service.js';
 import { StorageRepo } from './storage/storage-repo.js';
@@ -121,6 +121,14 @@ export type NodeOptions = {
 	 * or `privateKeyFromProtobuf(...)` from `@libp2p/crypto/keys`).
 	 */
 	privateKey?: PrivateKey;
+
+	/**
+	 * Optional libp2p connection gater. The libp2p browser default denies
+	 * dialing insecure WebSockets and private/loopback addresses; callers
+	 * that need to dial local or unsecured bootstraps (web reference dev,
+	 * Playwright e2e, RN simulators) supply a permissive gater here.
+	 */
+	connectionGater?: ConnectionGater;
 };
 
 function resolveStorage(provider: RawStorageProvider | undefined): IRawStorage {
@@ -198,6 +206,7 @@ export async function createLibp2pNodeBase(
 			inboundConnectionUpgradeTimeout: 10_000,
 			dialQueue: { concurrency: 2, attempts: 2 }
 		},
+		...(options.connectionGater ? { connectionGater: options.connectionGater } : {}),
 		transports,
 		connectionEncrypters: [noise()],
 		streamMuxers: [yamux()],
