@@ -224,7 +224,7 @@ After receiving `Accepted` with `topicTraffic` at tier `d`:
 2. **Hang-out feasibility.** Estimate matchable arrivals over the remaining patience budget:
    ```
    expectedNewMatches ≈ arrivalsPerMin × filterAcceptRatio × (patienceMs / 60000)
-   contentionFactor   ≈ 1 + (queriesPerMin × meanWantCount) / max(arrivalsPerMin, 1)
+   contentionFactor   ≈ min(1 + (queriesPerMin × meanWantCount) / max(arrivalsPerMin, 1), contention_factor_cap)
    ```
    If `currentMatches + expectedNewMatches ≥ wantCount × contentionFactor`, **hang out**: keep the seeker registration alive via TTL renewals; re-query at `requery_interval_ms` (default 1 s; see §Configuration) until `wantCount` matches accumulate or `patienceMs` elapses.
    `filterAcceptRatio` starts at 1.0 and can be refined from observed query yields; `meanWantCount` is a small constant or learned from prior interactions.
@@ -302,7 +302,7 @@ A cohort-side push channel — where the cohort notifies a hanging-out seeker as
 
 ### Adversarial cohort traffic reporting
 
-`RegisterReplyV1` and `QueryReplyV1` carry `topicTraffic` under the cohort *primary's* single-member signature, not a threshold signature (see the `QueryReplyV1` note above). A malicious primary can therefore over- or under-report.
+`RegisterReplyV1` and `QueryReplyV1` carry `topicTraffic` under the cohort *primary's* single-member signature, not a threshold signature (see the `QueryReplyV1` note in §Wire formats below). A malicious primary can therefore over- or under-report.
 
 - **Over-reporting** — claiming a hot tier so the seeker hangs out — is bounded by the seeker's `patienceMs`. Worst-case outcome is wasted patience plus one extra `register → walk` hop after timeout. No spatial flood: the decision rule only walks *toward the root*, never speculatively outward, so the substrate's anti-flood guarantee is preserved.
 - **Under-reporting** — claiming a cold tier so the seeker escalates — is also bounded. The seeker takes one extra hop per affected tier and terminates at the root, where aggregated truth is hardest to fake (the root sees the union of all sub-tier providers and runs its own cohort gossip).
