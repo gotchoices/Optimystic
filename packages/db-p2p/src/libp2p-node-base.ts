@@ -5,7 +5,7 @@ import { identify } from '@libp2p/identify';
 import { ping } from '@libp2p/ping';
 import { gossipsub } from '@chainsafe/libp2p-gossipsub';
 import { bootstrap } from '@libp2p/bootstrap';
-import { circuitRelayServer } from '@libp2p/circuit-relay-v2';
+import { circuitRelayServer, type CircuitRelayServerInit } from '@libp2p/circuit-relay-v2';
 import { peerIdFromString } from '@libp2p/peer-id';
 import { generateKeyPair } from '@libp2p/crypto/keys';
 import type { ConnectionGater, PrivateKey } from '@libp2p/interface';
@@ -71,6 +71,17 @@ export type NodeOptions = {
 	fretProfile?: 'edge' | 'core';
 	id?: string; // optional peer id
 	relay?: boolean; // enable relay service
+	/**
+	 * Init passed to `circuitRelayServer(...)` when `relay` is enabled.
+	 *
+	 * `@libp2p/circuit-relay-v2` defaults to `applyDefaultLimit: true`, which
+	 * stamps every reservation with `Limit { data: 128 KiB, duration: 2 min }`
+	 * and resets the relayed stream once either cap is hit — silently killing
+	 * long-lived service↔browser circuits. Trusted local clusters (e.g. the
+	 * reference-peer service nodes) should pass
+	 * `{ reservations: { applyDefaultLimit: false } }` to lift the cap.
+	 */
+	relayServerInit?: CircuitRelayServerInit;
 	/** Storage provider - either an IRawStorage instance or a factory function. Defaults to MemoryRawStorage if not provided. */
 	storage?: RawStorageProvider;
 	clusterSize?: number; // desired cluster size per key
@@ -220,7 +231,7 @@ export async function createLibp2pNodeBase(
 				heartbeatInterval: 7000
 			}),
 			// Circuit relay server - enables this node to relay connections for other peers
-			...(options.relay ? { relay: circuitRelayServer() } : {}),
+			...(options.relay ? { relay: circuitRelayServer(options.relayServerInit) } : {}),
 
 			// Custom services - create wrapper factories that inject dependencies
 			cluster: (components: any) => {

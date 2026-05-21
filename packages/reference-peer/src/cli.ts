@@ -352,6 +352,9 @@ class PeerSession {
 		const disableTcp = options.tcp === false;
 
 		console.log(`🔁 Circuit-relay server: ${effectiveRelay ? 'on' : 'off'}`);
+		if (effectiveRelay) {
+			console.log('🔁 Circuit-relay limits: disabled (reference-peer trusted)');
+		}
 		const node = await createLibp2pNode({
 			port: parseInt(options.port || '0'),
 			wsPort: wsPortNum,
@@ -360,6 +363,12 @@ class PeerSession {
 			bootstrapNodes,
 			id: options.id,
 			relay: effectiveRelay,
+			// Reference-peer nodes are trusted local-cluster relays — lift the
+			// upstream 128 KiB / 2 min per-relayed-connection caps so service↔browser
+			// circuits survive a full e2e run. See db-p2p NodeOptions.relayServerInit.
+			relayServerInit: effectiveRelay
+				? { reservations: { applyDefaultLimit: false } }
+				: undefined,
 			networkName: options.network || 'optimystic',
 			fretProfile: options.fretProfile,
 			storage: createStorage,

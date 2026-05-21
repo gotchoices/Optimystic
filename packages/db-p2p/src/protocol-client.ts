@@ -74,7 +74,15 @@ export class ProtocolClient {
 				log('dial:timeout peer=%s protocol=%s ms=%d%s', peer, protocol, elapsed, cid ? ` cid=${cid}` : '');
 				throw dialController.signal.reason;
 			}
-			log('dial:fail peer=%s protocol=%s ms=%d%s', peer, protocol, elapsed, cid ? ` cid=${cid}` : '');
+			const errCode = (err as { code?: unknown })?.code;
+			const errMessage = err instanceof Error ? err.message : String(err);
+			const truncatedMsg = errMessage.length > 200 ? errMessage.slice(0, 200) + '…' : errMessage;
+			log('dial:fail peer=%s protocol=%s ms=%d code=%s msg=%s%s',
+				peer, protocol, elapsed,
+				typeof errCode === 'string' && errCode.length > 0 ? errCode : 'none',
+				truncatedMsg,
+				cid ? ` cid=${cid}` : ''
+			);
 			throw err;
 		} finally {
 			if (dialTimer) clearTimeout(dialTimer);

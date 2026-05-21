@@ -224,14 +224,22 @@ A cohort tracks per-topic flow rates alongside the stock `directParticipants` co
 ```
 TopicTrafficV1 {
   windowSeconds:       number   // observation window, default 60
-  arrivalsPerMin:      number   // fresh registrations + renewals into this cohort for this topic
-  queriesPerMin:       number   // application-level queries against this topic, if any
+  arrivalsPerMin:      number   // exact, combined fresh registrations + renewals over windowSeconds
+  queriesPerMin:       number   // exact, application-level queries against this topic over windowSeconds
   directParticipants:  number   // stock count (same value that drives promotion)
   childCohortCount:    number   // tier-(d+1) cohorts known for this topic, 0 if not promoted
 }
 ```
 
-The rate is computed locally over the last `windowSeconds` and gossiped within the cohort as part of normal cohort-gossip; the reply uses the responding member's own most-recent view, which lags by at most one gossip round. The signal is advisory — neither admission, routing, nor promotion depends on it.
+`arrivalsPerMin` deliberately combines fresh registrations and renewals into a single scalar: the seeker uses renewals as a proxy for active matchable supply, and the consumer-side formulas in [matchmaking.md §Hang-out vs. continue](matchmaking.md#hang-out-vs-continue) take the combined value. A separate split is not currently needed; if a future consumer wants fresh-only or renewal-only, the field can be split then.
+
+The rate is computed locally over the last `windowSeconds` and gossiped within the cohort as part of normal cohort-gossip (see §Cohort gossip below); the reply uses the responding member's own most-recent gossip-derived view — the same per-topic entry the member last gossiped — and so lags by at most one gossip round. The responder does not recompute from raw counters at reply time.
+
+Wire-format note: traffic fields are sent as **exact integers**, not log-bucketed like the load barometer in §Capacity barometer. Cohort gossip is intra-cohort and tiny, and the consumer-side formulas are numeric — bucketing would buy nothing and complicate matchmaking math. The load barometer is bucketed because it is a coarse priority signal; the traffic counts feed real arithmetic.
+
+The signal is advisory — neither admission, routing, nor promotion depends on it.
+
+Per-topic counters reset to zero on `cohortEpoch` change (see §Primary and backup sharding, [Membership rotation and primary handoff](#membership-rotation-and-primary-handoff)). The first gossip round after a rotation may therefore under-report traffic; consumers tolerate this — matchmaking's edge-case rule does not withdraw on a single zero reading without first issuing a query to confirm.
 
 This layer does not interpret the signal. The reactivity application ignores it (subscribers always want the tail). The matchmaking application uses it for the seeker's hang-out decision; see [matchmaking.md §Hang-out vs. continue](matchmaking.md#hang-out-vs-continue). Future applications may use it however they like.
 
@@ -481,7 +489,7 @@ interface RegisterReplyV1 {
   backups?:        string[]           // PeerIds, 1-2
   cohortEpoch?:    string             // 32 bytes
   cohortMembers?:  string[]           // PeerIds, full cohort, for client cache
-  topicTraffic?:   TopicTrafficV1     // present on accepted; also returned on promoted
+  topicTraffic?:   TopicTrafficV1     // present on accepted and promoted; absent on no_state, unwilling_member, unwilling_cohort
   // promoted:
   targetTier?:     number             // d+1 typically; may leap
   // unwilling_member:
@@ -561,10 +569,13 @@ interface CohortGossipV1 {
   cohortEpoch:        string
   willingnessBits:    string          // 4 bits T0..T3, hex
   loadBuckets:        number[]        // 4 entries, 0..7 per tier
+  windowSeconds:      number          // observation window for the rate fields below, cohort-wide
   topicSummaries: {
     topicId:            string
     tier:               number
     directParticipants: number        // exact, gossiped privately within cohort
+    arrivalsPerMin:     number        // exact, combined fresh + renewals over windowSeconds
+    queriesPerMin:      number        // exact, application-level queries over windowSeconds
     promoted:           boolean
     childCohortCount:   number
   }[]
