@@ -3,6 +3,16 @@ import type { ActionBlocks, CommitResult, GetBlockResults, PendResult, PendReque
 export type MessageOptions = {
 	expiration?: number;
 	signal?: AbortSignal;
+	/**
+	 * Per-peer dial deadline in ms. Bounds only the dial portion of a call, so
+	 * an unreachable peer fails fast and the caller's retry loop can re-pick
+	 * a different coordinator. Independent of `expiration` (the overall budget):
+	 * a 30s transaction with `dialTimeoutMs: 3000` can afford ten 3s dial
+	 * attempts against different peers. Once a dial succeeds, the response wait
+	 * is bound by the remaining `expiration` budget. Undefined means "do not
+	 * impose a separate dial cap; the overall budget is the cap".
+	 */
+	dialTimeoutMs?: number;
 }
 
 export type RepoCommitRequest = {

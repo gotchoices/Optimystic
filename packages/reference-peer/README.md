@@ -192,6 +192,8 @@ Options:
 - `-s, --storage <type>`: `memory` | `file` (default: `memory`)
 - `--storage-path <path>`: Required when `--storage file`
 - `--storage-capacity <bytes>`: Override storage capacity in bytes (used for ring selection / arachnode sizing)
+- `--cluster-size <number>`: Desired cluster size per key (positive integer). Overrides the `libp2p-node-base` default (10). Must match peers in the same network — e.g. browser peers built with `clusterSize: 3` need service peers started with `--cluster-size 3`. Accepted by `interactive`, `service`, and `run`.
+- `--super-majority-threshold <number>`: Super-majority threshold as a fraction in (0, 1]. Overrides the `libp2p-node-base` default (0.67). Pair with small `--cluster-size` values: `Math.ceil(3 * 0.67) = 3` demands unanimity on a 3-peer cluster, so a 3-peer mesh typically wants `--super-majority-threshold 0.51` (rounds to 2-of-3) to leave one peer of slack. Must match peers in the same network — coordinator-side approvals are counted against this value on every cluster member. Accepted by `interactive`, `service`, and `run`.
 - `--announce-file <path>`: Write node info (peerId, multiaddrs) to this JSON file for mesh launchers
 - `--offline`: Use local transactor instead of network transactor (no distributed consensus)
 

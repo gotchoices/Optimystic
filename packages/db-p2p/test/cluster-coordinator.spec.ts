@@ -19,7 +19,10 @@ const makePeerId = async (): Promise<PeerId> => {
  */
 class MockClusterClient {
 	updateCalls = 0;
+	commitPhaseCalls = 0;
 	failCommit = false;
+	/** Throw on the Nth commit-phase call (1-indexed). null = never fail this way. */
+	failOnCommitCall: number | null = null;
 	peerIdStr: string;
 
 	constructor(peerIdStr: string) {
@@ -40,8 +43,10 @@ class MockClusterClient {
 			};
 		}
 
-		// Commit phase (initial or retry)
-		if (this.failCommit) {
+		// Commit phase (initial commit, post-majority broadcast, or scheduled retry)
+		this.commitPhaseCalls++;
+		const failByCounter = this.failOnCommitCall !== null && this.commitPhaseCalls === this.failOnCommitCall;
+		if (this.failCommit || failByCounter) {
 			throw new Error(`Peer ${this.peerIdStr.substring(0, 8)} unreachable`);
 		}
 
@@ -147,14 +152,15 @@ describe('ClusterCoordinator retry logic (TEST-5.2.1)', function () {
 
 		await coordinator.executeClusterTransaction('block-1' as BlockId, makeMessage());
 
-		// Initially: 1 promise call + 1 failed commit call + 1 consensus broadcast = 3
-		expect(failingMock.updateCalls).to.equal(3);
+		// Initially: 1 promise call + 1 failed commit + 2 broadcast attempts
+		// (initial + 1 immediate in-line retry, both fail) = 4
+		expect(failingMock.updateCalls).to.equal(4);
 
-		// Wait for first retry (initial interval is 2000ms)
-		await new Promise(r => setTimeout(r, 2500));
+		// Wait for first scheduled retry (default initial interval is 250ms)
+		await new Promise(r => setTimeout(r, 500));
 
-		// Retry should have fired: at least 1 additional call
-		expect(failingMock.updateCalls).to.be.greaterThanOrEqual(3);
+		// Scheduled retry should have fired: at least 1 additional call
+		expect(failingMock.updateCalls).to.be.greaterThanOrEqual(5);
 	});
 
 	it('retry succeeds when peer recovers', async () => {
@@ -195,5 +201,110 @@ describe('ClusterCoordinator retry logic (TEST-5.2.1)', function () {
 		await new Promise(r => setTimeout(r, 4500));
 		const callsAfterSecond = failingMock.updateCalls;
 		expect(callsAfterSecond).to.be.greaterThan(callsAfterFirst);
+	});
+});
+
+describe('ClusterCoordinator broadcast in-line retry', function () {
+	this.timeout(15000);
+
+	let peerIds: PeerId[];
+	let mockClusters: Map<string, MockClusterClient>;
+
+	const baseCfg: ClusterConsensusConfig & { clusterSize: number } = {
+		clusterSize: 3,
+		superMajorityThreshold: 0.75,
+		simpleMajorityThreshold: 0.51,
+		minAbsoluteClusterSize: 2,
+		allowClusterDownsize: true,
+		clusterSizeTolerance: 0.5,
+		partitionDetectionWindow: 60000
+	};
+
+	const makeMessage = (): RepoMessage => ({
+		operations: [{ get: { blockIds: ['block-1'] } }],
+		expiration: Date.now() + 30000
+	});
+
+	const setupCluster = async (cfg: ClusterConsensusConfig & { clusterSize: number }) => {
+		peerIds = await Promise.all([makePeerId(), makePeerId(), makePeerId()]);
+		const clusterPeers: ClusterPeers = {};
+		mockClusters = new Map();
+		for (const pid of peerIds) {
+			const idStr = pid.toString();
+			clusterPeers[idStr] = {
+				multiaddrs: ['/ip4/127.0.0.1/tcp/8000'],
+				publicKey: u8ToString(pid.publicKey!.raw, 'base64url')
+			};
+			mockClusters.set(idStr, new MockClusterClient(idStr));
+		}
+		const mockKeyNetwork: IKeyNetwork = {
+			async findCoordinator() { return peerIds[0]!; },
+			async findCluster() { return { ...clusterPeers }; }
+		};
+		const createClient = (peerId: PeerId) => {
+			const mock = mockClusters.get(peerId.toString());
+			if (!mock) throw new Error(`No mock for ${peerId.toString()}`);
+			return mock;
+		};
+		return new ClusterCoordinator(mockKeyNetwork, createClient as any, cfg);
+	};
+
+	it('recovers when first broadcast attempt fails but in-line retry succeeds', async () => {
+		const coordinator = await setupCluster(baseCfg);
+		const failingId = peerIds[2]!.toString();
+		const failingMock = mockClusters.get(failingId)!;
+		// commit phase = call 1 (succeeds), broadcast attempt 1 = call 2 (fails),
+		// broadcast in-line retry = call 3 (succeeds)
+		failingMock.failOnCommitCall = 2;
+
+		const result = await coordinator.executeClusterTransaction('block-1' as BlockId, makeMessage());
+
+		expect(Object.keys(result.record.commits)).to.have.length(3);
+		expect(failingMock.commitPhaseCalls).to.equal(3);
+		// Inspect internal state: no scheduled retry timer was created for that peer
+		const txState = (coordinator as any).transactions.get(result.record.messageHash);
+		expect(txState?.retry, 'expected no scheduled retry after successful in-line retry').to.equal(undefined);
+
+		// Wait past the default 250ms initial timer; no extra calls should fire
+		const callsAfterBroadcast = failingMock.updateCalls;
+		await new Promise(r => setTimeout(r, 400));
+		expect(failingMock.updateCalls).to.equal(callsAfterBroadcast);
+	});
+
+	it('schedules a 250ms retry when both broadcast attempts fail', async () => {
+		const coordinator = await setupCluster(baseCfg);
+		const failingId = peerIds[2]!.toString();
+		const failingMock = mockClusters.get(failingId)!;
+		failingMock.failCommit = true;
+
+		const result = await coordinator.executeClusterTransaction('block-1' as BlockId, makeMessage());
+
+		// 1 promise + 1 commit-fail + 2 broadcast attempts (both fail) = 4
+		expect(failingMock.updateCalls).to.equal(4);
+
+		const txState = (coordinator as any).transactions.get(result.record.messageHash);
+		expect(txState?.retry, 'expected a scheduled retry').to.not.equal(undefined);
+		expect(txState.retry.intervalMs).to.equal(250);
+		expect(Array.from(txState.retry.pendingPeers)).to.deep.equal([failingId]);
+	});
+
+	it('honors custom commitBroadcastImmediateRetries and commitBroadcastRetryInitialMs', async () => {
+		const customCfg = {
+			...baseCfg,
+			commitBroadcastRetryInitialMs: 100,
+			commitBroadcastImmediateRetries: 2
+		};
+		const coordinator = await setupCluster(customCfg);
+		const failingId = peerIds[2]!.toString();
+		const failingMock = mockClusters.get(failingId)!;
+		failingMock.failCommit = true;
+
+		const result = await coordinator.executeClusterTransaction('block-1' as BlockId, makeMessage());
+
+		// 1 promise + 1 commit-fail + 3 broadcast attempts (initial + 2 immediate retries) = 5
+		expect(failingMock.updateCalls).to.equal(5);
+
+		const txState = (coordinator as any).transactions.get(result.record.messageHash);
+		expect(txState?.retry?.intervalMs).to.equal(100);
 	});
 });

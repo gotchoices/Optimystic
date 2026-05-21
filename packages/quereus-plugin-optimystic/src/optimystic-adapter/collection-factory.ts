@@ -151,6 +151,7 @@ export class CollectionFactory {
     return new NetworkTransactor({
       timeoutMs: 30_000,
       abortOrCancelTimeoutMs: 5_000,
+      dialTimeoutMs: 3_000,
       keyNetwork,
       getRepo,
     });

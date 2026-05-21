@@ -37,10 +37,11 @@ interface ClusterTransactionState {
 /** Manages distributed transactions across clusters */
 export class ClusterCoordinator {
 	private transactions: Map<string, ClusterTransactionState> = new Map();
-	private readonly retryInitialIntervalMs = 2000;
-	private readonly retryBackoffFactor = 2;
-	private readonly retryMaxIntervalMs = 30000;
-	private readonly retryMaxAttempts = 5;
+	private readonly retryInitialIntervalMs: number;
+	private readonly retryBackoffFactor: number;
+	private readonly retryMaxIntervalMs: number;
+	private readonly retryMaxAttempts: number;
+	private readonly commitBroadcastImmediateRetries: number;
 
 	constructor(
 		private readonly keyNetwork: IKeyNetwork,
@@ -54,7 +55,13 @@ export class ClusterCoordinator {
 		private readonly fretService?: FretService,
 		private readonly reputation?: IPeerReputation,
 		private readonly stateStore?: ITransactionStateStore
-	) { }
+	) {
+		this.retryInitialIntervalMs = cfg.commitBroadcastRetryInitialMs ?? 250;
+		this.retryBackoffFactor = cfg.commitBroadcastRetryBackoffFactor ?? 2;
+		this.retryMaxIntervalMs = cfg.commitBroadcastRetryMaxIntervalMs ?? 8000;
+		this.retryMaxAttempts = cfg.commitBroadcastRetryMaxAttempts ?? 5;
+		this.commitBroadcastImmediateRetries = cfg.commitBroadcastImmediateRetries ?? 1;
+	}
 
 	/**
 	 * Creates a base 58 BTC string hash for a message to uniquely identify a transaction
@@ -528,27 +535,7 @@ export class ClusterCoordinator {
 			// so each peer can independently reach consensus and execute the operations.
 			// Without this, only the coordinator's local cluster executes — remote peers
 			// never see enough commits to reach consensus on their own.
-			const broadcastResults = await Promise.allSettled(
-				peerIds.map(peerIdStr => {
-					const isLocal = this.localCluster && peerIdStr === this.localCluster.peerId.toString();
-					return isLocal
-						? this.localCluster!.update(record)
-						: this.createClusterClient(peerIdFromString(peerIdStr)).update(record).catch(err => {
-							log('cluster-tx:consensus-broadcast-error', { messageHash: record.messageHash, peerId: peerIdStr, error: (err as Error).message });
-							return null;
-						});
-				})
-			);
-
-			// Check for broadcast failures (excluding local)
-			const broadcastFailures: string[] = [];
-			broadcastResults.forEach((result, idx) => {
-				const peerId = peerIds[idx]!;
-				const isLocal = this.localCluster && peerId === this.localCluster.peerId.toString();
-				if (!isLocal && (result.status === 'rejected' || result.value === null)) {
-					broadcastFailures.push(peerId);
-				}
-			});
+			const { failures: broadcastFailures } = await this.broadcastMergedRecord(record, peerIds);
 			if (broadcastFailures.length > 0) {
 				this.scheduleCommitRetry(record.messageHash, record, broadcastFailures);
 			} else {
@@ -563,6 +550,59 @@ export class ClusterCoordinator {
 			}
 		}
 		return record;
+	}
+
+	/**
+	 * Broadcast the merged commit record to every peer, with `commitBroadcastImmediateRetries`
+	 * in-line re-attempts per peer before giving up. The libp2p connection used during
+	 * the prior commit phase is typically still warm, so a single immediate retry recovers
+	 * most transient stream errors without falling back to the scheduled retry timer.
+	 * Local cluster is invoked exactly once — local failures are fatal, not transient.
+	 */
+	private async broadcastMergedRecord(record: ClusterRecord, peerIds: string[]): Promise<{ failures: string[] }> {
+		const maxAttempts = 1 + Math.max(0, this.commitBroadcastImmediateRetries);
+		const results = await Promise.all(peerIds.map(async peerIdStr => {
+			const isLocal = this.localCluster && peerIdStr === this.localCluster.peerId.toString();
+			if (isLocal) {
+				try {
+					await this.localCluster!.update(record);
+					return { peerId: peerIdStr, success: true as const };
+				} catch (err) {
+					log('cluster-tx:consensus-broadcast-error', {
+						messageHash: record.messageHash,
+						peerId: peerIdStr,
+						error: (err as Error).message
+					});
+					return { peerId: peerIdStr, success: false as const };
+				}
+			}
+			let lastError: unknown;
+			for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+				try {
+					await this.createClusterClient(peerIdFromString(peerIdStr)).update(record);
+					return { peerId: peerIdStr, success: true as const };
+				} catch (err) {
+					lastError = err;
+					if (attempt < maxAttempts) {
+						log('cluster-tx:consensus-broadcast-retry', {
+							messageHash: record.messageHash,
+							peerId: peerIdStr,
+							attempt,
+							error: (err as Error).message
+						});
+					}
+				}
+			}
+			log('cluster-tx:consensus-broadcast-error', {
+				messageHash: record.messageHash,
+				peerId: peerIdStr,
+				attempts: maxAttempts,
+				error: lastError instanceof Error ? lastError.message : String(lastError)
+			});
+			return { peerId: peerIdStr, success: false as const };
+		}));
+		const failures = results.filter(r => !r.success).map(r => r.peerId);
+		return { failures };
 	}
 
 	private updateTransactionRecord(record: ClusterRecord, stage: string): void {

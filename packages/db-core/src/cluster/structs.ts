@@ -54,4 +54,14 @@ export interface ClusterConsensusConfig {
 	disputeEnabled?: boolean;
 	/** Timeout for dispute arbitration in milliseconds (default 60000) */
 	disputeArbitrationTimeoutMs?: number;
+	/** Initial scheduled-retry interval for failed commit broadcasts, ms (default 250) */
+	commitBroadcastRetryInitialMs?: number;
+	/** Backoff factor for commit-broadcast scheduled retries (default 2) */
+	commitBroadcastRetryBackoffFactor?: number;
+	/** Max scheduled-retry interval, ms (default 8000) */
+	commitBroadcastRetryMaxIntervalMs?: number;
+	/** Max scheduled retry attempts before giving up (default 5) */
+	commitBroadcastRetryMaxAttempts?: number;
+	/** Immediate in-line retries per failed peer inside the broadcast (default 1) */
+	commitBroadcastImmediateRetries?: number;
 }

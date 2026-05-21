@@ -86,7 +86,12 @@ export class CoordinatorRepo implements IRepo {
 			minAbsoluteClusterSize: cfg?.minAbsoluteClusterSize ?? 3,
 			allowClusterDownsize: cfg?.allowClusterDownsize ?? true,
 			clusterSizeTolerance: cfg?.clusterSizeTolerance ?? 0.5,
-			partitionDetectionWindow: cfg?.partitionDetectionWindow ?? 60000
+			partitionDetectionWindow: cfg?.partitionDetectionWindow ?? 60000,
+			commitBroadcastRetryInitialMs: cfg?.commitBroadcastRetryInitialMs ?? 250,
+			commitBroadcastRetryBackoffFactor: cfg?.commitBroadcastRetryBackoffFactor ?? 2,
+			commitBroadcastRetryMaxIntervalMs: cfg?.commitBroadcastRetryMaxIntervalMs ?? 8000,
+			commitBroadcastRetryMaxAttempts: cfg?.commitBroadcastRetryMaxAttempts ?? 5,
+			commitBroadcastImmediateRetries: cfg?.commitBroadcastImmediateRetries ?? 1
 		};
 		const localClusterRef = localCluster && localPeerId ? {
 			update: localCluster.update.bind(localCluster),

@@ -57,6 +57,24 @@ class PeerSession {
 		return parsed;
 	}
 
+	private parseClusterSize(options: { clusterSize?: string }): number | undefined {
+		if (options.clusterSize === undefined) return undefined;
+		const parsed = Number(options.clusterSize);
+		if (!Number.isInteger(parsed) || parsed <= 0) {
+			throw new Error('--cluster-size must be a positive integer');
+		}
+		return parsed;
+	}
+
+	private parseSuperMajorityThreshold(options: { superMajorityThreshold?: string }): number | undefined {
+		if (options.superMajorityThreshold === undefined) return undefined;
+		const parsed = Number(options.superMajorityThreshold);
+		if (!Number.isFinite(parsed) || parsed <= 0 || parsed > 1) {
+			throw new Error('--super-majority-threshold must be a number in (0, 1]');
+		}
+		return parsed;
+	}
+
 	private async waitForFretReady(node: any): Promise<void> {
 		try {
 			const fret = (node as any).services?.fret;
@@ -182,6 +200,8 @@ class PeerSession {
 		storage?: 'memory' | 'file';
 		storagePath?: string;
 		storageCapacity?: string;
+		clusterSize?: string;
+		superMajorityThreshold?: string;
 		announceFile?: string;
 		offline?: boolean;
 	}): Promise<void> {
@@ -191,6 +211,23 @@ class PeerSession {
 		}
 
 		console.log('🚀 Starting P2P node...');
+
+		const resolveEffectiveRelay = (): boolean => {
+			if (options.relay === false) return false;
+			const wsPortRaw = options.wsPort;
+			const wsPortConfigured = wsPortRaw !== undefined && wsPortRaw !== '';
+			const tcpEnabled = options.tcp !== false;
+			const hasInboundListen = tcpEnabled || wsPortConfigured;
+			return hasInboundListen;
+		};
+		const effectiveRelay = resolveEffectiveRelay();
+		logDebug('resolved relay default', {
+			explicit: options.relay,
+			tcp: options.tcp !== false,
+			wsPort: options.wsPort,
+			offline: options.offline,
+			effectiveRelay
+		});
 
 		// Validate storage options
 		if (options.storage === 'file' && !options.storagePath) {
@@ -279,12 +316,24 @@ class PeerSession {
 			console.log(`📦 Storage capacity override set to ${humanReadable}`);
 			logDebug('storage capacity override set', { bytes: storageCapacityBytes, human: humanReadable });
 		}
+		const clusterSize = this.parseClusterSize(options);
+		if (clusterSize !== undefined) {
+			console.log(`👥 Cluster size override set to ${clusterSize}`);
+			logDebug('cluster size override set', { clusterSize });
+		}
+		const superMajorityThreshold = this.parseSuperMajorityThreshold(options);
+		if (superMajorityThreshold !== undefined) {
+			console.log(`🎯 Super-majority threshold set to ${superMajorityThreshold.toString()}`);
+			logDebug('super-majority threshold override set', { superMajorityThreshold });
+		}
 		logDebug('starting libp2p node', {
 			port: options.port,
 			bootstrapCount: bootstrapNodes.length,
 			storage: options.storage,
 			storagePath: options.storagePath,
 			storageCapacityBytes,
+			clusterSize,
+			superMajorityThreshold,
 			mode: options.offline ? 'offline' : 'distributed'
 		});
 
@@ -302,6 +351,7 @@ class PeerSession {
 		}
 		const disableTcp = options.tcp === false;
 
+		console.log(`🔁 Circuit-relay server: ${effectiveRelay ? 'on' : 'off'}`);
 		const node = await createLibp2pNode({
 			port: parseInt(options.port || '0'),
 			wsPort: wsPortNum,
@@ -309,10 +359,14 @@ class PeerSession {
 			disableTcp,
 			bootstrapNodes,
 			id: options.id,
-			relay: options.relay || false,
+			relay: effectiveRelay,
 			networkName: options.network || 'optimystic',
 			fretProfile: options.fretProfile,
 			storage: createStorage,
+			clusterSize,
+			clusterPolicy: superMajorityThreshold !== undefined
+				? { superMajorityThreshold }
+				: undefined,
 			arachnode: {
 				enableRingZulu: true,
 				storage: storageCapacityBytes ? { totalBytes: storageCapacityBytes } : undefined
@@ -353,6 +407,10 @@ class PeerSession {
 			transactor = new NetworkTransactor({
 				timeoutMs: 30000,
 				abortOrCancelTimeoutMs: 10000,
+				// Per-peer dial cap: an unreachable cluster member fails fast
+				// (~3s) so the consensus retry loop can re-pick within the 30s
+				// overall budget instead of one stuck peer monopolizing it.
+				dialTimeoutMs: 3000,
 				keyNetwork,
 				getRepo: (peerId) => {
 					return peerId.toString() === node.peerId.toString()
@@ -663,12 +721,14 @@ program
 	.option('--no-tcp', 'Disable the default TCP listen (browser-only bootstrap)')
 	.option('-b, --bootstrap <string>', 'Comma-separated list of bootstrap nodes')
 	.option('-i, --id <string>', 'Peer ID')
-	.option('-r, --relay', 'Enable relay service')
+	.option('--no-relay', 'Disable circuit-relay-v2 server (default: on for peers with an inbound listen address)')
 	.option('-n, --network <string>', 'Network name', 'optimystic')
 	.option('--fret-profile <profile>', "FRET profile: 'edge' or 'core'", 'edge')
 	.option('-s, --storage <type>', 'Storage type: memory or file', 'memory')
 	.option('--storage-path <path>', 'Path for file storage')
 	.option('--storage-capacity <bytes>', 'Override storage capacity in bytes (for ring selection)')
+	.option('--cluster-size <number>', 'Desired cluster size per key (positive integer)')
+	.option('--super-majority-threshold <number>', 'Super-majority threshold as a fraction in (0, 1] (default 0.67)')
 	.option('--offline', 'Run as single-node LocalTransactor (no distributed consensus)')
 	.option('--bootstrap-file <path>', 'Path to JSON containing bootstrap multiaddrs or node list')
 	.option('--announce-file <path>', 'Write node info (peerId, multiaddrs) to this JSON file for mesh launchers')
@@ -698,12 +758,14 @@ program
 	.option('-b, --bootstrap <string>', 'Comma-separated list of bootstrap nodes')
 	.option('--bootstrap-file <path>', 'Path to JSON containing bootstrap multiaddrs or node list')
 	.option('-i, --id <string>', 'Peer ID')
-	.option('-r, --relay', 'Enable relay service')
+	.option('--no-relay', 'Disable circuit-relay-v2 server (default: on for peers with an inbound listen address)')
 	.option('-n, --network <string>', 'Network name', 'optimystic')
 	.option('--fret-profile <profile>', "FRET profile: 'edge' or 'core'", 'edge')
 	.option('-s, --storage <type>', 'Storage type: memory or file', 'memory')
 	.option('--storage-path <path>', 'Path for file storage')
 	.option('--storage-capacity <bytes>', 'Override storage capacity in bytes (for ring selection)')
+	.option('--cluster-size <number>', 'Desired cluster size per key (positive integer)')
+	.option('--super-majority-threshold <number>', 'Super-majority threshold as a fraction in (0, 1] (default 0.67)')
 	.option('--offline', 'Run as single-node LocalTransactor (no distributed consensus)')
 	.option('--announce-file <path>', 'Write node info (peerId, multiaddrs) to this JSON file for mesh launchers')
 	.action(async (options) => {
@@ -732,12 +794,14 @@ program
 	.option('--no-tcp', 'Disable the default TCP listen (browser-only bootstrap)')
 	.option('-b, --bootstrap <string>', 'Comma-separated list of bootstrap nodes')
 	.option('-i, --id <string>', 'Peer ID')
-	.option('-r, --relay', 'Enable relay service')
+	.option('--no-relay', 'Disable circuit-relay-v2 server (default: on for peers with an inbound listen address)')
 	.option('-n, --network <string>', 'Network name', 'optimystic')
 	.option('--fret-profile <profile>', "FRET profile: 'edge' or 'core'", 'edge')
 	.option('-s, --storage <type>', 'Storage type: memory or file', 'memory')
 	.option('--storage-path <path>', 'Path for file storage')
 	.option('--storage-capacity <bytes>', 'Override storage capacity in bytes (for ring selection)')
+	.option('--cluster-size <number>', 'Desired cluster size per key (positive integer)')
+	.option('--super-majority-threshold <number>', 'Super-majority threshold as a fraction in (0, 1] (default 0.67)')
 	.option('--offline', 'Run as single-node LocalTransactor (no distributed consensus)')
 	.option('--bootstrap-file <path>', 'Path to JSON containing bootstrap multiaddrs or node list')
 	.option('--stay-connected', 'Stay connected after action completes')

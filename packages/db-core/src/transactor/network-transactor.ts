@@ -14,12 +14,31 @@ type NetworkTransactorInit = {
 	abortOrCancelTimeoutMs: number;
 	keyNetwork: IKeyNetwork;
 	getRepo: (peerId: PeerId) => IRepo;
+	/**
+	 * Per-peer dial deadline in ms applied to each downstream repo call.
+	 * `timeoutMs` is the overall transaction budget; `dialTimeoutMs` caps how
+	 * long a single peer can hold that budget hostage during its dial. When a
+	 * peer is unreachable, the dial fails fast and the batch-retry loop can
+	 * re-pick a different coordinator within the remaining overall budget.
+	 * Omit to fall back to a sensible default (3s); set 0 / negative to disable.
+	 */
+	dialTimeoutMs?: number;
 }
+
+/**
+ * Default per-peer dial deadline. Chosen as a compromise between:
+ *  - long enough for a typical libp2p dial+TLS handshake on a wired LAN
+ *    (sub-second) plus reasonable WAN latency, including circuit-relay hops;
+ *  - short enough that an unreachable cluster member burns ~1/10th of a
+ *    typical 30s transaction budget before the retry loop moves on.
+ */
+const DEFAULT_DIAL_TIMEOUT_MS = 3000;
 
 export class NetworkTransactor implements ITransactor {
 	private readonly keyNetwork: IKeyNetwork;
 	private readonly timeoutMs: number;
 	private readonly abortOrCancelTimeoutMs: number;
+	private readonly dialTimeoutMs: number | undefined;
 	private readonly getRepo: (peerId: PeerId) => IRepo;
 
 	constructor(
@@ -28,6 +47,11 @@ export class NetworkTransactor implements ITransactor {
 		this.keyNetwork = init.keyNetwork;
 		this.timeoutMs = init.timeoutMs;
 		this.abortOrCancelTimeoutMs = init.abortOrCancelTimeoutMs;
+		// A user explicitly passing 0 or negative means "do not bound dials separately".
+		// Undefined falls back to the library default.
+		this.dialTimeoutMs = init.dialTimeoutMs === undefined
+			? DEFAULT_DIAL_TIMEOUT_MS
+			: (init.dialTimeoutMs > 0 ? init.dialTimeoutMs : undefined);
 		this.getRepo = init.getRepo;
 	}
 
@@ -50,7 +74,7 @@ export class NetworkTransactor implements ITransactor {
 		try {
 			await processBatches(
 				batches,
-				(batch) => this.getRepo(batch.peerId).get({ blockIds: batch.payload, context: blockGets.context }, { expiration }),
+				(batch) => this.getRepo(batch.peerId).get({ blockIds: batch.payload, context: blockGets.context }, { expiration, dialTimeoutMs: this.dialTimeoutMs }),
 				batch => batch.payload,
 				(gets, blockId, mergeWithGets) => [...(mergeWithGets ?? []), ...gets.filter(bid => bid === blockId)],
 				expiration,
@@ -99,7 +123,7 @@ export class NetworkTransactor implements ITransactor {
 						b.subsumedBy = [...(b.subsumedBy ?? []), ...retries];
 						await processBatches(
 							retries,
-							(batch) => this.getRepo(batch.peerId).get({ blockIds: batch.payload, context: blockGets.context }, { expiration }),
+							(batch) => this.getRepo(batch.peerId).get({ blockIds: batch.payload, context: blockGets.context }, { expiration, dialTimeoutMs: this.dialTimeoutMs }),
 							batch => batch.payload,
 							(gets, blockId, mergeWithGets) => [...(mergeWithGets ?? []), ...gets.filter(id => id === blockId)],
 							expiration,
@@ -313,6 +337,7 @@ export class NetworkTransactor implements ITransactor {
 					{ ...blockAction, transforms: batch.payload },
 					{
 						expiration,
+						dialTimeoutMs: this.dialTimeoutMs,
 						coordinatingBlockIds: batch.coordinatingBlockIds
 					} as any
 				),
@@ -387,7 +412,7 @@ export class NetworkTransactor implements ITransactor {
 		const expiration = Date.now() + this.abortOrCancelTimeoutMs;
 		await processBatches(
 			batches,
-			(batch) => this.getRepo(batch.peerId).cancel({ actionId: actionRef.actionId, blockIds: batch.payload }, { expiration }),
+			(batch) => this.getRepo(batch.peerId).cancel({ actionId: actionRef.actionId, blockIds: batch.payload }, { expiration, dialTimeoutMs: this.dialTimeoutMs }),
 			batch => batch.payload,
 			mergeBlocks,
 			expiration,
@@ -463,7 +488,7 @@ export class NetworkTransactor implements ITransactor {
 		try {
 			await processBatches(
 				batches,
-				(batch) => this.getRepo(batch.peerId).commit({ actionId, blockIds: batch.payload, rev }, { expiration }),
+				(batch) => this.getRepo(batch.peerId).commit({ actionId, blockIds: batch.payload, rev }, { expiration, dialTimeoutMs: this.dialTimeoutMs }),
 				batch => batch.payload,
 				mergeBlocks,
 				expiration,
@@ -521,7 +546,7 @@ export class NetworkTransactor implements ITransactor {
 		);
 		await processBatches(
 			operationBatches,
-			(batch) => this.getRepo(batch.peerId).cancel({ actionId: actionRef.actionId, blockIds: batch.payload }, { expiration }),
+			(batch) => this.getRepo(batch.peerId).cancel({ actionId: actionRef.actionId, blockIds: batch.payload }, { expiration, dialTimeoutMs: this.dialTimeoutMs }),
 			batch => batch.payload,
 			mergeBlocks,
 			expiration,

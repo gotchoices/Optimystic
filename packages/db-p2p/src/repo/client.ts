@@ -73,7 +73,11 @@ export class RepoClient extends ProtocolClient implements IRepo {
 		}
 		let response: any
 		const preferred = (this.protocolPrefix ?? '/db-p2p') + '/repo/1.0.0'
-		response = await withTimeout(() => super.processMessage<any>(message, preferred, { signal: options?.signal, correlationId }))
+		response = await withTimeout(() => super.processMessage<any>(message, preferred, {
+			signal: options?.signal,
+			correlationId,
+			dialTimeoutMs: options?.dialTimeoutMs,
+		}))
 
 		if (response?.redirect?.peers?.length) {
 			if (hop >= 2) {

@@ -291,12 +291,16 @@ export class Libp2pKeyPeerNetwork implements IKeyNetwork, IPeerNetwork {
 		return undefined
 	}
 
-	connect(peerId: PeerId, protocol: string, _options?: AbortOptions): Promise<Stream> {
+	connect(peerId: PeerId, protocol: string, options?: AbortOptions): Promise<Stream> {
 		const conns = (this.libp2p as any).getConnections?.(peerId) ?? []
 		if (Array.isArray(conns) && conns.length > 0 && typeof conns[0]?.newStream === 'function') {
-			return conns[0].newStream([protocol]) as Promise<Stream>
+			return conns[0].newStream([protocol], { signal: options?.signal }) as Promise<Stream>
 		}
-		const dialOptions = { runOnLimitedConnection: true, negotiateFully: false } as const
+		// Forward the caller's AbortSignal so a per-peer dial deadline (enforced
+		// upstream by ProtocolClient.processMessage) can actually cancel a stuck
+		// dial — without this, libp2p falls back to its built-in dial timeout
+		// (default ~30s) and the caller's tighter deadline is decorative.
+		const dialOptions = { runOnLimitedConnection: true, negotiateFully: false, signal: options?.signal } as const
 		return this.libp2p.dialProtocol(peerId, [protocol], dialOptions)
 	}
 
