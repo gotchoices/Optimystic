@@ -1,8 +1,8 @@
 import { expect } from 'chai';
 import { generateKeyPair } from '@libp2p/crypto/keys';
 import { peerIdFromPrivateKey } from '@libp2p/peer-id';
-import type { PeerId } from '@libp2p/interface';
-import type { IPeerNetwork } from '@optimystic/db-core';
+import type { PeerId, AbortOptions } from '@libp2p/interface';
+import type { IPeerNetwork, PeerId as CorePeerId } from '@optimystic/db-core';
 import { ProtocolClient, DialTimeoutError, DIAL_TIMEOUT_ERROR_CODE } from '../src/protocol-client.js';
 
 class TestProtocolClient extends ProtocolClient {
@@ -20,7 +20,7 @@ describe('ProtocolClient dial timeout', () => {
 	it('throws DialTimeoutError when dial hangs past dialTimeoutMs', async () => {
 		const peerId = await makePeerId();
 		const hangingNetwork: IPeerNetwork = {
-			async connect(_p, _proto, options) {
+			async connect(_p: CorePeerId, _proto: string, options?: AbortOptions) {
 				return new Promise<never>((_, reject) => {
 					if (options?.signal?.aborted) {
 						reject(options.signal.reason);
@@ -49,7 +49,7 @@ describe('ProtocolClient dial timeout', () => {
 		const peerId = await makePeerId();
 		let observedSignal: AbortSignal | undefined;
 		const network: IPeerNetwork = {
-			async connect(_p, _proto, options) {
+			async connect(_p: CorePeerId, _proto: string, options?: AbortOptions) {
 				observedSignal = options?.signal;
 				// resolve "successfully" with a stream-shaped stub that the
 				// response-wait path will then exercise (and fail on, which is fine
@@ -65,7 +65,7 @@ describe('ProtocolClient dial timeout', () => {
 	it('forwards parent signal abort to the dial', async () => {
 		const peerId = await makePeerId();
 		const network: IPeerNetwork = {
-			async connect(_p, _proto, options) {
+			async connect(_p: CorePeerId, _proto: string, options?: AbortOptions) {
 				return new Promise<never>((_, reject) => {
 					options?.signal?.addEventListener('abort', () => reject(options!.signal!.reason), { once: true });
 				});
