@@ -260,7 +260,7 @@ A seeker needs 8 providers of `pdf-render`, `patienceMs = 10 s`. Network has 200
 
 - `d = 3` → `NoState`. `d = 2` → `NoState`.
 - `d = 1` → `Accepted` with `topicTraffic = { directParticipants: 6, arrivalsPerMin: 90, queriesPerMin: 4 }`.
-- Query returns 6 matching providers. Need 8. `expectedNewMatches ≈ 90 × 1.0 × (10/60) ≈ 15`. Contention factor ≈ 1.4. Threshold `8 × 1.4 = 11.2`; have `6 + 15 = 21`. Hang out.
+- Query returns 6 matching providers. Need 8. `expectedNewMatches ≈ 90 × 1.0 × (10/60) ≈ 15`. `contentionFactor ≈ 1 + (4 × 3 / 90) ≈ 1.13`. Threshold `8 × 1.13 ≈ 9.05`; have `6 + 15 = 21`. Hang out.
 - Within 4 s two more renewals land; the seeker re-queries, total 8, dials.
 
 Contrast: the seeker's prefix lands it in a thinner shard with `directParticipants: 1, arrivalsPerMin: 8`. `expectedNewMatches ≈ 1.3`. Threshold not met. Withdraw, walk to `d = 0`. Root reports `directParticipants: 200, arrivalsPerMin: 600`. Query returns 8 immediately.
