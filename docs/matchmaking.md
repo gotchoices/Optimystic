@@ -226,7 +226,7 @@ After receiving `Accepted` with `topicTraffic` at tier `d`:
    expectedNewMatches ≈ arrivalsPerMin × filterAcceptRatio × (patienceMs / 60000)
    contentionFactor   ≈ 1 + (queriesPerMin × meanWantCount) / max(arrivalsPerMin, 1)
    ```
-   If `currentMatches + expectedNewMatches ≥ wantCount × contentionFactor`, **hang out**: keep the seeker registration alive via TTL renewals; re-query periodically (or wait for cohort-pushed updates if the application uses them) until `wantCount` matches accumulate or `patienceMs` elapses.
+   If `currentMatches + expectedNewMatches ≥ wantCount × contentionFactor`, **hang out**: keep the seeker registration alive via TTL renewals; re-query at `requery_interval_ms` (default 1 s; see §Configuration) until `wantCount` matches accumulate or `patienceMs` elapses.
    `filterAcceptRatio` starts at 1.0 and can be refined from observed query yields; `meanWantCount` is a small constant or learned from prior interactions.
 3. **Otherwise, walk toward the root.** Withdraw the seeker registration (`RenewV1` with TTL = 0; polite but optional), then re-register at `d − 1`. Repeat the decision there. The patience budget continues to drain, so each escalation step makes hang-out at the new tier slightly less attractive — which is correct, since the root is the terminal.
 
@@ -265,9 +265,49 @@ A seeker needs 8 providers of `pdf-render`, `patienceMs = 10 s`. Network has 200
 
 Contrast: the seeker's prefix lands it in a thinner shard with `directParticipants: 1, arrivalsPerMin: 8`. `expectedNewMatches ≈ 1.3`. Threshold not met. Withdraw, walk to `d = 0`. Root reports `directParticipants: 200, arrivalsPerMin: 600`. Query returns 8 immediately.
 
+### Edge cases
+
+The §Decision rule above is the common path. A few specific situations need explicit handling:
+
+1. **`topicTraffic` absent on the reply.** The substrate guarantees `topicTraffic` on `Accepted` and `Promoted` (see [cohort-topic.md §Topic traffic signal](cohort-topic.md#topic-traffic-signal) for the per-result presence matrix). If a reply omits the field — an older peer, a protocol mismatch, or a malformed responder — the seeker treats the cohort as zero-rate and walks one tier toward the root without hanging out. No estimation is attempted against absent inputs.
+
+2. **`arrivalsPerMin = 0` immediately after a cohort epoch change.** Per-topic counters reset on rotation (see [cohort-topic.md:242](cohort-topic.md#topic-traffic-signal)). For the first ~`windowSeconds` of a new epoch the rate under-reports — possibly to zero — even if the underlying provider population is healthy. A seeker tolerates this by **not withdrawing on a single zero reading**. Instead it issues one `QueryV1` first; if the query returns ≥ `wantCount` matchable providers, the cohort was simply quiet, not empty. The seeker escalates only when the query also yields below threshold.
+
+3. **`UnwillingCohort` before `topicTraffic` is computed.** The registration was refused at the substrate level (see the walk-reply table above); the hang-out decision is not entered at all because the seeker never received `Accepted`. Standard substrate back-off applies.
+
+4. **Filter that matches almost nothing.** As successive queries return providers that fail the seeker's `filter`, `filterAcceptRatio` decays toward zero. `expectedNewMatches` collapses with it; the threshold check fails at every tier; the seeker walks all the way to the root. This is the right outcome — a pathological filter is inherently expensive, and the root's aggregated pool gives the filter its best chance.
+
+5. **Many seekers competing simultaneously.** A burst of competing seekers drives `queriesPerMin` up, which drives `contentionFactor` up, which makes the threshold harder to meet at any given tier — so more seekers escalate toward the root, which is where aggregation lives. The multiplier is capped at `contention_factor_cap = 4.0` (see §Configuration) so a runaway query rate cannot pin every seeker to the root indefinitely. Self-balancing.
+
+### Test expectations
+
+Matchmaking has no implementation yet; the cases below are doc-as-spec. Each becomes a unit or integration test when the package lands.
+
+- *Hot topic, deep tier suffices.* Seeker stops at the first `Accepted` whose query meets `wantCount`; no walk past the tier of first match.
+- *Cold topic, walks to root.* Seeker traverses every tier from `d_max` down to `d = 0`; `wantCount` is met only at the root.
+- *Borderline topic, hangs out for full patience.* Seeker stays at the accepting tier, re-queries roughly `patienceMs / requery_interval_ms` times, and returns the partial set if still under-met when patience drains.
+- *Patience drains correctly across walked tiers.* Each escalation hop deducts elapsed time from the budget; the final hang-out at the terminal tier sees the original `patienceMs` minus all hops' elapsed time.
+- *Seeker withdraws cleanly on escalation.* An outgoing `RenewV1` with `TTL = 0` is sent before re-registering at `d − 1`; cohort gossip evicts the seeker within one round.
+- *Stale `arrivalsPerMin = 0` after epoch rotation.* Seeker first issues a `QueryV1`; if the query yields ≥ `wantCount`, no walk; otherwise the seeker walks on the next reading, matching the edge case above.
+- *`topicTraffic` missing on reply.* Seeker walks one tier toward the root without hanging out.
+- *Filter accept ratio decays across walk.* After two cohorts each return only ~10% matchable providers, `filterAcceptRatio` settles near 0.1 and subsequent `expectedNewMatches` reflects this.
+
+### Out of scope (for this section)
+
+A cohort-side push channel — where the cohort notifies a hanging-out seeker as new matchable providers arrive, replacing the polling `requery_interval_ms` — is a plausible future refinement, but its design (push transport, back-pressure, fairness across seekers) belongs in a separate ticket and is deferred until polling shows observable cost.
+
 ---
 
 ## Failure modes (matchmaking-specific)
+
+### Adversarial cohort traffic reporting
+
+`RegisterReplyV1` and `QueryReplyV1` carry `topicTraffic` under the cohort *primary's* single-member signature, not a threshold signature (see the `QueryReplyV1` note above). A malicious primary can therefore over- or under-report.
+
+- **Over-reporting** — claiming a hot tier so the seeker hangs out — is bounded by the seeker's `patienceMs`. Worst-case outcome is wasted patience plus one extra `register → walk` hop after timeout. No spatial flood: the decision rule only walks *toward the root*, never speculatively outward, so the substrate's anti-flood guarantee is preserved.
+- **Under-reporting** — claiming a cold tier so the seeker escalates — is also bounded. The seeker takes one extra hop per affected tier and terminates at the root, where aggregated truth is hardest to fake (the root sees the union of all sub-tier providers and runs its own cohort gossip).
+- **Cross-check via cohort gossip.** Other members of the same cohort can detect a primary whose reported rate diverges from the gossip-derived view that drives their own replies. Detection routes through the reputation subsystem (out of scope here; see [architecture.md](architecture.md) §Reputation).
+- **No threshold signature on the reply.** Reasonable for now: a threshold signature on every registration and query reply is expensive, and the bounded worst-case above does not justify the cost. A future ticket may revisit if observed abuse warrants it.
 
 ### Provider primary fails mid-renewal
 Standard cohort-topic primary handoff. The registration record is in cohort gossip, backups take over. Seekers querying during the gap may not see this provider; on the seeker's next query (or on the provider's next renewal) it reappears.
@@ -398,6 +438,13 @@ Returned only by promoted cohorts; cold cohorts that fall through to `NoState` d
 | `query_limit_max` | 256 | Max entries returned in a single QueryV1 |
 | `aggregate_count_minimum_tier` | 1 | Root cohorts produce aggregate counts only when tree depth ≥ this |
 | `seeker_renew_grace` | 5 s | Time a seeker may finish querying after TTL expires (still queryable but not returned in future queries) |
+| `patience_default_ms` | 10 000 | Fallback `patienceMs` when the caller does not specify it per-task |
+| `patience_per_tier_fraction` | 1.0 | Fraction of remaining patience spent at one tier before considering escalation; 1.0 means "spend it all here before walking" |
+| `filter_accept_ratio_initial` | 1.0 | Starting estimate for `filterAcceptRatio`, refined per walk from observed query yields |
+| `contention_factor_cap` | 4.0 | Upper bound on the contention multiplier; protects the hang-out decision against pathological `queriesPerMin / arrivalsPerMin` ratios |
+| `requery_interval_ms` | 1 000 | How often a hanging-out seeker re-issues `QueryV1` against its cohort |
+
+The last five rows are consumed only by the seeker — they tune the hang-out decision (see [§Hang-out vs. continue](#hang-out-vs-continue)). The cohort layer is unaware of them, so they're application-level rather than protocol-level: changing them on a seeker has no wire impact. No corresponding per-peer rate limit yet exists for `QueryV1` (only `RegisterV1` is rate-limited via `register_rate_per_peer = 4 / min`); at the default `requery_interval_ms = 1000` and `patience_default_ms = 10000` a hanging-out seeker issues at most ~10 queries per match, which is within current cohort budgets. Adding a `QueryV1` rate ceiling is out of scope here; see the matchmaking backlog.
 
 The cohort-topic tier for matchmaking is **T2 (functional)**; matchmaking registrations are declined freely by cohorts under T0/T1 load. The seeker's only recourse is to wait — the cohort-topic anti-flood properties prevent the seeker from making things worse by retrying aggressively.
 
