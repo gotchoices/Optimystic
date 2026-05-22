@@ -64,4 +64,10 @@ export interface ClusterConsensusConfig {
 	commitBroadcastRetryMaxAttempts?: number;
 	/** Immediate in-line retries per failed peer inside the broadcast (default 1) */
 	commitBroadcastImmediateRetries?: number;
+	/** Read-repair behavior: 'off' (only fetch on missing — legacy), 'lazy' (fetch when local age > window), 'paranoid' (always verify against cluster on read). Default 'lazy'. */
+	readRepairMode?: 'off' | 'lazy' | 'paranoid';
+	/** For 'lazy' mode: read-repair triggers when (now - localEntry.lastSeenCommitMs) > this. Default 10000. */
+	readRepairWindowMs?: number;
+	/** Per-read probability of triggering read-repair in 'lazy' mode even within the window (0..1). Default 0 (no random check). */
+	readRepairSampleRate?: number;
 }

@@ -429,4 +429,116 @@ describe('Libp2pKeyPeerNetwork', () => {
 			expect((network as any).networkMode).to.equal('joining');
 		});
 	});
+
+	describe('connect()', () => {
+		const PROTOCOL = '/test/1.0.0';
+		const FAKE_STREAM = { id: 'fake-stream' } as unknown;
+
+		function createLibp2pWithConnect(options: {
+			connections?: Connection[];
+			dialProtocol?: (peerId: PeerId, protocols: string[], opts?: any) => Promise<unknown>;
+		}): Libp2p {
+			return {
+				peerId: selfPeerId,
+				getConnections: (_peerId: PeerId) => options.connections ?? [],
+				getMultiaddrs: () => [],
+				addEventListener: () => {},
+				removeEventListener: () => {},
+				dialProtocol: options.dialProtocol ?? (() => Promise.reject(new Error('dialProtocol unexpectedly called'))),
+				services: {}
+			} as unknown as Libp2p;
+		}
+
+		it('passes runOnLimitedConnection: true on warm-connection reuse (limited-connection path)', async () => {
+			let observedOpts: any = undefined;
+			const mockConn = {
+				status: 'open',
+				newStream: (_protocols: string[], opts?: any) => {
+					observedOpts = opts;
+					// Mirror real libp2p: reject unless runOnLimitedConnection is true,
+					// emulating a circuit-relay (limited) connection.
+					if (!opts?.runOnLimitedConnection) {
+						return Promise.reject(new Error('limited connection requires runOnLimitedConnection'));
+					}
+					return Promise.resolve(FAKE_STREAM);
+				}
+			} as unknown as Connection;
+
+			const libp2p = createLibp2pWithConnect({ connections: [mockConn] });
+			const network = new Libp2pKeyPeerNetwork(libp2p, 16, undefined, 'forming');
+			const otherPeerId = await makePeerId();
+
+			const stream = await network.connect(otherPeerId, PROTOCOL);
+			expect(stream).to.equal(FAKE_STREAM);
+			expect(observedOpts).to.not.be.undefined;
+			expect(observedOpts.runOnLimitedConnection).to.equal(true);
+			expect(observedOpts.negotiateFully).to.equal(false);
+		});
+
+		it('skips non-open connections and falls back to dialProtocol', async () => {
+			const newStreamCalled = { called: false };
+			const closingConn = {
+				status: 'closing',
+				newStream: () => {
+					newStreamCalled.called = true;
+					return Promise.reject(new Error('should not be called'));
+				}
+			} as unknown as Connection;
+
+			let dialOpts: any = undefined;
+			const libp2p = createLibp2pWithConnect({
+				connections: [closingConn],
+				dialProtocol: (_peerId, _protocols, opts) => {
+					dialOpts = opts;
+					return Promise.resolve(FAKE_STREAM);
+				}
+			});
+			const network = new Libp2pKeyPeerNetwork(libp2p, 16, undefined, 'forming');
+			const otherPeerId = await makePeerId();
+
+			const stream = await network.connect(otherPeerId, PROTOCOL);
+			expect(stream).to.equal(FAKE_STREAM);
+			expect(newStreamCalled.called).to.be.false;
+			expect(dialOpts).to.not.be.undefined;
+			expect(dialOpts.runOnLimitedConnection).to.equal(true);
+			expect(dialOpts.negotiateFully).to.equal(false);
+		});
+
+		it('falls back to dialProtocol when no connections exist', async () => {
+			let dialOpts: any = undefined;
+			const libp2p = createLibp2pWithConnect({
+				connections: [],
+				dialProtocol: (_peerId, _protocols, opts) => {
+					dialOpts = opts;
+					return Promise.resolve(FAKE_STREAM);
+				}
+			});
+			const network = new Libp2pKeyPeerNetwork(libp2p, 16, undefined, 'forming');
+			const otherPeerId = await makePeerId();
+
+			const stream = await network.connect(otherPeerId, PROTOCOL);
+			expect(stream).to.equal(FAKE_STREAM);
+			expect(dialOpts).to.not.be.undefined;
+			expect(dialOpts.runOnLimitedConnection).to.equal(true);
+		});
+
+		it('forwards the caller AbortSignal on the reuse path', async () => {
+			let observedSignal: AbortSignal | undefined;
+			const mockConn = {
+				status: 'open',
+				newStream: (_protocols: string[], opts?: any) => {
+					observedSignal = opts?.signal;
+					return Promise.resolve(FAKE_STREAM);
+				}
+			} as unknown as Connection;
+
+			const libp2p = createLibp2pWithConnect({ connections: [mockConn] });
+			const network = new Libp2pKeyPeerNetwork(libp2p, 16, undefined, 'forming');
+			const otherPeerId = await makePeerId();
+			const controller = new AbortController();
+
+			await network.connect(otherPeerId, PROTOCOL, { signal: controller.signal });
+			expect(observedSignal).to.equal(controller.signal);
+		});
+	});
 });

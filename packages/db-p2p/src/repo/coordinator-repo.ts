@@ -65,6 +65,14 @@ export class CoordinatorRepo implements IRepo {
 	private readonly localPeerId?: PeerId;
 	private readonly responsibilityCache = new LruMap<string, { inCluster: boolean, expires: number }>(1000);
 	private static readonly RESPONSIBILITY_TTL_MS = 60_000;
+	private readonly lastSeenCommitMs = new LruMap<string, number>(1000);
+	private readonly readRepairMode: 'off' | 'lazy' | 'paranoid';
+	private readonly readRepairWindowMs: number;
+	private readonly readRepairSampleRate: number;
+	/** Test seam: overridable clock for window-based read-repair gating. */
+	now: () => number = () => Date.now();
+	/** Test seam: overridable RNG (0..1) for sample-rate gating. */
+	rand: () => number = () => Math.random();
 
 	constructor(
 		readonly keyNetwork: IKeyNetwork,
@@ -91,8 +99,14 @@ export class CoordinatorRepo implements IRepo {
 			commitBroadcastRetryBackoffFactor: cfg?.commitBroadcastRetryBackoffFactor ?? 2,
 			commitBroadcastRetryMaxIntervalMs: cfg?.commitBroadcastRetryMaxIntervalMs ?? 8000,
 			commitBroadcastRetryMaxAttempts: cfg?.commitBroadcastRetryMaxAttempts ?? 5,
-			commitBroadcastImmediateRetries: cfg?.commitBroadcastImmediateRetries ?? 1
+			commitBroadcastImmediateRetries: cfg?.commitBroadcastImmediateRetries ?? 1,
+			readRepairMode: cfg?.readRepairMode ?? 'lazy',
+			readRepairWindowMs: cfg?.readRepairWindowMs ?? 10000,
+			readRepairSampleRate: cfg?.readRepairSampleRate ?? 0
 		};
+		this.readRepairMode = policy.readRepairMode!;
+		this.readRepairWindowMs = policy.readRepairWindowMs!;
+		this.readRepairSampleRate = policy.readRepairSampleRate!;
 		const localClusterRef = localCluster && localPeerId ? {
 			update: localCluster.update.bind(localCluster),
 			peerId: localPeerId,
@@ -164,29 +178,87 @@ export class CoordinatorRepo implements IRepo {
 		// First try local storage
 		const localResult = await this.storageRepo.get(blockGets, options);
 
-		// Check for blocks that weren't found locally - try to fetch from cluster peers
-		// Skip cluster fetch if this is already a sync request (to prevent recursive queries)
+		// Decide per-block whether to consult cluster peers. Two triggers:
+		//   (a) Missing — block isn't present locally at all (legacy behavior).
+		//   (b) Stale-by-policy — block is present but read-repair policy says verify.
+		// Skip cluster fetch if this is already a sync request (to prevent recursive queries).
 		const skipClusterFetch = (options as any)?.skipClusterFetch;
 		if (this.clusterLatestCallback && !skipClusterFetch) {
 			for (const blockId of blockGets.blockIds) {
 				const localEntry = localResult[blockId];
-				// If block not found locally (no state), try cluster peers
-				if (!localEntry?.state?.latest) {
-					try {
-						await this.fetchBlockFromCluster(blockId, blockGets.context);
-						// Re-fetch after sync
-						const refreshed = await this.storageRepo.get({ blockIds: [blockId], context: blockGets.context }, options);
-						if (refreshed[blockId]) {
-							localResult[blockId] = refreshed[blockId];
-						}
-					} catch (err) {
-						log('cluster-fetch:error', { blockId, error: (err as Error).message });
+				const localRev = localEntry?.state?.latest?.rev;
+				const isMissing = !localEntry?.state?.latest;
+				const isStale = !isMissing && this.shouldReadRepair(blockId);
+				if (!isMissing && !isStale) continue;
+
+				if (isStale) {
+					log('cluster-tx:read-repair-triggered', {
+						blockId,
+						mode: this.readRepairMode,
+						ageMs: this.ageMs(blockId),
+						localRev
+					});
+				}
+
+				try {
+					await this.fetchBlockFromCluster(blockId, blockGets.context);
+					const refreshed = await this.storageRepo.get({ blockIds: [blockId], context: blockGets.context }, options);
+					const newRev = refreshed[blockId]?.state?.latest?.rev;
+					if (refreshed[blockId]) {
+						localResult[blockId] = refreshed[blockId];
 					}
+					if (isStale) {
+						if (typeof newRev === 'number' && typeof localRev === 'number' && newRev > localRev) {
+							log('cluster-tx:read-repair-applied', { blockId, oldRev: localRev, newRev });
+						} else {
+							log('cluster-tx:read-repair-noop', { blockId });
+						}
+					}
+				} catch (err) {
+					log('cluster-fetch:error', { blockId, error: (err as Error).message });
 				}
 			}
 		}
 
 		return localResult;
+	}
+
+	/** Decide whether the read-repair policy wants us to consult the cluster for a present-but-possibly-stale block. */
+	private shouldReadRepair(blockId: BlockId): boolean {
+		switch (this.readRepairMode) {
+			case 'off': return false;
+			case 'paranoid': return true;
+			case 'lazy': {
+				const lastSeen = this.lastSeenCommitMs.get(blockId);
+				if (lastSeen == null) return true;
+				if (this.now() - lastSeen > this.readRepairWindowMs) return true;
+				if (this.readRepairSampleRate > 0 && this.rand() < this.readRepairSampleRate) return true;
+				return false;
+			}
+		}
+	}
+
+	/** Milliseconds since we last marked this block fresh, or undefined if never. */
+	private ageMs(blockId: BlockId): number | undefined {
+		const lastSeen = this.lastSeenCommitMs.get(blockId);
+		return lastSeen == null ? undefined : this.now() - lastSeen;
+	}
+
+	/** Mark blocks as freshly observed from cluster authority (post-commit or post-fetch). */
+	private markBlocksSeen(blockIds: BlockId[]): void {
+		const now = this.now();
+		for (const id of blockIds) {
+			this.lastSeenCommitMs.set(id, now);
+		}
+	}
+
+	/**
+	 * Test seam: directly set the last-seen timestamp for a block. Used by read-repair
+	 * specs to simulate "the local commit happened at time T" without needing to drive
+	 * a full pend/commit cycle through the cluster coordinator.
+	 */
+	setLastSeenForTest(blockId: BlockId, ts: number): void {
+		this.lastSeenCommitMs.set(blockId, ts);
 	}
 
 	private async fetchBlockFromCluster(blockId: BlockId, context?: ActionContext): Promise<void> {
@@ -215,6 +287,7 @@ export class CoordinatorRepo implements IRepo {
 			// Found on cluster - trigger restoration to sync the block
 			await this.storageRepo.get({ blockIds: [blockId], context: { committed: [clusterLatest], rev: clusterLatest.rev } });
 			log('cluster-fetch:synced', { blockId, rev: clusterLatest.rev });
+			this.markBlocksSeen([blockId]);
 		}
 	}
 
@@ -332,7 +405,9 @@ export class CoordinatorRepo implements IRepo {
 
 		const peerCount = await this.coordinator.getClusterSize(blockIds[0]!);
 		if (peerCount <= 1) {
-			return await this.storageRepo.commit(request, options);
+			const result = await this.storageRepo.commit(request, options);
+			if (result.success) this.markBlocksSeen(blockIds);
+			return result;
 		}
 
 		const message: RepoMessage = {
@@ -343,6 +418,7 @@ export class CoordinatorRepo implements IRepo {
 		try {
 			const { record, localExecuted } = await this.coordinator.executeClusterTransaction(blockIds[0]!, message, options);
 			if (localExecuted) {
+				this.markBlocksSeen(blockIds);
 				return { success: true };
 			}
 			// Local cluster didn't execute during consensus. Attempt a local commit,
@@ -351,13 +427,16 @@ export class CoordinatorRepo implements IRepo {
 			// after missing the pend phase (unreachable during pend, fresh join, etc.).
 			// The cluster's majority is authoritative; this peer will catch up via sync.
 			try {
-				return await this.storageRepo.commit(request, options);
+				const result = await this.storageRepo.commit(request, options);
+				if (result.success) this.markBlocksSeen(blockIds);
+				return result;
 			} catch (err) {
 				if (clusterReachedCommitConsensus(record)) {
 					log('coordinator-repo:commit-local-failed-cluster-succeeded', {
 						actionId: request.actionId,
 						error: (err as Error).message
 					});
+					this.markBlocksSeen(blockIds);
 					return { success: true };
 				}
 				throw err;

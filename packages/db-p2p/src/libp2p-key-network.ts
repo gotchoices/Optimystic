@@ -1,4 +1,4 @@
-import type { AbortOptions, Libp2p, PeerId, Stream } from "@libp2p/interface";
+import type { AbortOptions, Connection, Libp2p, PeerId, Stream } from "@libp2p/interface";
 import { toString as u8ToString } from 'uint8arrays'
 import type { ClusterPeers, FindCoordinatorOptions, IKeyNetwork, IPeerNetwork } from "@optimystic/db-core";
 import { peerIdFromString } from '@libp2p/peer-id'
@@ -292,9 +292,20 @@ export class Libp2pKeyPeerNetwork implements IKeyNetwork, IPeerNetwork {
 	}
 
 	connect(peerId: PeerId, protocol: string, options?: AbortOptions): Promise<Stream> {
-		const conns = (this.libp2p as any).getConnections?.(peerId) ?? []
-		if (Array.isArray(conns) && conns.length > 0 && typeof conns[0]?.newStream === 'function') {
-			return conns[0].newStream([protocol], { signal: options?.signal }) as Promise<Stream>
+		const conns = ((this.libp2p as any).getConnections?.(peerId) ?? []) as Connection[]
+		// Filter to only-open connections so a closing/closed entry that libp2p
+		// hasn't yet evicted from its index doesn't get picked up here.
+		const open = conns.find(c => c?.status === 'open' && typeof c?.newStream === 'function')
+		if (open) {
+			// runOnLimitedConnection: true is required to open a stream over a
+			// circuit-relay (limited) connection — the steady-state path for
+			// browsers and NATed peers. Without it, the warm relay connection
+			// from a prior dialProtocol cannot be reused on subsequent RPCs.
+			return open.newStream([protocol], {
+				signal: options?.signal,
+				runOnLimitedConnection: true,
+				negotiateFully: false
+			})
 		}
 		// Forward the caller's AbortSignal so a per-peer dial deadline (enforced
 		// upstream by ProtocolClient.processMessage) can actually cancel a stuck
