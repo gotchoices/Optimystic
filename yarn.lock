@@ -1049,6 +1049,7 @@ __metadata:
     "@libp2p/peer-id-factory": "npm:^4.2.4"
     "@multiformats/multiaddr": "npm:^13.0.1"
     "@noble/hashes": "npm:^2.0.1"
+    "@types/chai": "npm:^5.2.3"
     "@types/chai-as-promised": "npm:^8.0.2"
     "@types/debug": "npm:^4.1.12"
     "@types/mocha": "npm:^10.0.10"
