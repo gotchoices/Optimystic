@@ -1,4 +1,4 @@
-import type { AbortOptions, Connection, Libp2p, PeerId, Stream } from "@libp2p/interface";
+import type { AbortOptions, Libp2p, PeerId, Stream } from "@libp2p/interface";
 import { toString as u8ToString } from 'uint8arrays'
 import type { ClusterPeers, FindCoordinatorOptions, IKeyNetwork, IPeerNetwork } from "@optimystic/db-core";
 import { peerIdFromString } from '@libp2p/peer-id'
@@ -292,7 +292,7 @@ export class Libp2pKeyPeerNetwork implements IKeyNetwork, IPeerNetwork {
 	}
 
 	connect(peerId: PeerId, protocol: string, options?: AbortOptions): Promise<Stream> {
-		const conns = ((this.libp2p as any).getConnections?.(peerId) ?? []) as Connection[]
+		const conns = this.libp2p.getConnections?.(peerId) ?? []
 		// Filter to only-open connections so a closing/closed entry that libp2p
 		// hasn't yet evicted from its index doesn't get picked up here.
 		const open = conns.find(c => c?.status === 'open' && typeof c?.newStream === 'function')
@@ -472,10 +472,17 @@ export class Libp2pKeyPeerNetwork implements IKeyNetwork, IPeerNetwork {
 		this.log('findCluster:start key=%s', keyStr);
 
 		// Include self in the cohort
-		const ids = Array.from(new Set([...cohort, this.libp2p.peerId.toString()]))
+		const selfId = this.libp2p.peerId.toString()
+		const ids = Array.from(new Set([...cohort, selfId]))
 
 		const connectedByPeer = this.getConnectedAddrsByPeer()
 		const connectedPeerIds = Object.keys(connectedByPeer)
+
+		// Backfill addresses from the peerStore for cohort members we don't have
+		// a live connection to. The cohort is keyspace-determined and can include
+		// peers we know-of but haven't dialed yet; without this backfill those
+		// would be silently dropped.
+		const peerStoreAddrs = await this.getPeerStoreAddrsByPeer(ids.filter(id => id !== selfId))
 
 		this.log('findCluster key=%s fretCohort=%d connected=%d', keyStr, cohort.length, connectedPeerIds.length)
 		if (verbose) this.log('findCluster:detail key=%s cohortPeers=%o connectedPeers=%o', keyStr, ids, connectedPeerIds)
@@ -483,19 +490,55 @@ export class Libp2pKeyPeerNetwork implements IKeyNetwork, IPeerNetwork {
 		const peers: ClusterPeers = {}
 
 		for (const idStr of ids) {
-			if (idStr === this.libp2p.peerId.toString()) {
+			if (idStr === selfId) {
 				const raw = this.libp2p.peerId.publicKey?.raw ?? new Uint8Array()
 				peers[idStr] = { multiaddrs: this.libp2p.getMultiaddrs().map(ma => ma.toString()), publicKey: u8ToString(raw, 'base64url') }
 				continue
 			}
-			const strings = connectedByPeer[idStr] ?? []
+			const connectedStrings = connectedByPeer[idStr] ?? []
+			const peerStoreStrings = peerStoreAddrs[idStr] ?? []
+			// De-duplicate while preserving connected-first ordering. The
+			// connected multiaddr is the one libp2p just used to reach this peer
+			// and is the most reliable; peerStore addrs are the fallback for
+			// cohort members we know-of but aren't currently connected to.
+			const merged = Array.from(new Set([...connectedStrings, ...peerStoreStrings]))
+			const parsed = this.parseMultiaddrs(merged)
 			const remotePeerId = peerIdFromString(idStr)
 			const raw = remotePeerId.publicKey?.raw ?? new Uint8Array()
-			peers[idStr] = { multiaddrs: this.parseMultiaddrs(strings), publicKey: u8ToString(raw, 'base64url') }
+			// Note: parsed may be empty for a cohort member we have neither a
+			// live connection to nor a peerStore entry for. The dial will then
+			// surface as `code=none msg="no valid addresses"` and the caller's
+			// retry/exclude logic takes over — we intentionally do NOT drop
+			// addressless members here, because shrinking the cohort below
+			// `clusterSize` puts consensus supermajority out of reach.
+			peers[idStr] = { multiaddrs: parsed, publicKey: u8ToString(raw, 'base64url') }
 		}
 
 		this.log('findCluster:done key=%s ms=%d peers=%d',
 			keyStr, Date.now() - t0, Object.keys(peers).length)
 		return peers
+	}
+
+	/**
+	 * Look up the libp2p peerStore for known multiaddrs of the given peer ids.
+	 * Returns a map from peer-id string to multiaddr strings — empty/missing
+	 * when the peerStore has no entry. Errors are swallowed; we'd rather fail
+	 * back to the defense-in-depth drop than throw out of findCluster.
+	 */
+	private async getPeerStoreAddrsByPeer(ids: string[]): Promise<Record<string, string[]>> {
+		const out: Record<string, string[]> = {}
+		const store = (this.libp2p as { peerStore?: { get?: (id: PeerId) => Promise<{ addresses?: Array<{ multiaddr: { toString(): string } }> }> } }).peerStore
+		if (!store?.get) return out
+		await Promise.all(ids.map(async (idStr) => {
+			try {
+				const pid = peerIdFromString(idStr)
+				const peer = await store.get!(pid)
+				const addrs = (peer?.addresses ?? []).map(a => a.multiaddr.toString())
+				if (addrs.length > 0) out[idStr] = addrs
+			} catch {
+				// Unknown peer or peerStore failure — leave out of the map.
+			}
+		}))
+		return out
 	}
 }

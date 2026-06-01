@@ -15,8 +15,8 @@
  * `RUN_LONG_TESTS=1` so the default `yarn workspace @optimystic/db-p2p test`
  * run skips it. To exercise:
  *
- *   PowerShell: $env:RUN_LONG_TESTS=1; yarn workspace @optimystic/db-p2p test --grep "circuit-relay-long-lived"
- *   bash:        RUN_LONG_TESTS=1 yarn workspace @optimystic/db-p2p test --grep "circuit-relay-long-lived"
+ *   PowerShell: $env:RUN_LONG_TESTS=1; yarn workspace @optimystic/db-p2p test --grep "Circuit-relay long-lived"
+ *   bash:        RUN_LONG_TESTS=1 yarn workspace @optimystic/db-p2p test --grep "Circuit-relay long-lived"
  *
  * To additionally run the control case that asserts the default-limit behavior
  * does reset the stream, set `RUN_LONG_TESTS_CONTROL=1` as well.
@@ -70,7 +70,7 @@ async function spawnBrowserShaped(relayAddr: Multiaddr): Promise<Libp2p> {
 		bootstrapNodes: [relayAddr.toString()],
 		relay: false,
 		transports,
-		listenAddrs: ['/p2p-circuit'],
+		listenAddrs: [`${relayAddr.toString()}/p2p-circuit`],
 		clusterSize: 1,
 		clusterPolicy: { allowDownsize: true, sizeTolerance: 1.0 },
 		arachnode: { enableRingZulu: false }

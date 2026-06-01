@@ -1,6 +1,7 @@
 import { expect } from 'chai';
 import { peerIdFromPrivateKey } from '@libp2p/peer-id';
 import { generateKeyPair } from '@libp2p/crypto/keys';
+import { multiaddr } from '@multiformats/multiaddr';
 import type { PeerId, Libp2p, Connection } from '@libp2p/interface';
 import type { SerializedTable } from 'p2p-fret';
 import {
@@ -539,6 +540,63 @@ describe('Libp2pKeyPeerNetwork', () => {
 
 			await network.connect(otherPeerId, PROTOCOL, { signal: controller.signal });
 			expect(observedSignal).to.equal(controller.signal);
+		});
+	});
+
+	describe('findCluster() — peerStore backfill', () => {
+		it('backfills cohort multiaddrs from peerStore when not currently connected', async () => {
+			const svcA = await makePeerId();
+			const svcB = await makePeerId();
+			const knownButDisconnected = await makePeerId();
+			const disconnectedMa = multiaddr(`/ip4/10.0.0.7/tcp/4001/ws/p2p/${knownButDisconnected.toString()}`);
+
+			const fret = {
+				// FRET returns a member we have no live connection to but the
+				// peerStore knows about — we should still include them with their
+				// peerStore-resolved address.
+				assembleCohort: () => [svcA.toString(), svcB.toString(), knownButDisconnected.toString()],
+				getNetworkSizeEstimate: () => ({ size_estimate: 5, confidence: 0.5 }),
+				detectPartition: () => false,
+				exportTable: () => undefined,
+				getNeighbors: () => []
+			};
+
+			const remoteConnA = {
+				remotePeer: svcA,
+				remoteAddr: { toString: () => `/ip4/10.0.0.1/tcp/4001/ws/p2p/${svcA.toString()}` }
+			} as unknown as Connection;
+			const remoteConnB = {
+				remotePeer: svcB,
+				remoteAddr: { toString: () => `/ip4/10.0.0.2/tcp/4001/ws/p2p/${svcB.toString()}` }
+			} as unknown as Connection;
+
+			const libp2p = {
+				peerId: selfPeerId,
+				getConnections: () => [remoteConnA, remoteConnB],
+				getMultiaddrs: () => [multiaddr(`/ip4/10.0.0.99/tcp/4001/ws/p2p/${selfPeerId.toString()}`)],
+				addEventListener: () => { },
+				removeEventListener: () => { },
+				peerStore: {
+					all: async () => [],
+					get: async (pid: { toString(): string }) => {
+						if (pid.toString() === knownButDisconnected.toString()) {
+							return { addresses: [{ multiaddr: disconnectedMa }] };
+						}
+						return { addresses: [] };
+					}
+				},
+				services: { fret }
+			} as unknown as Libp2p;
+
+			const network = new Libp2pKeyPeerNetwork(libp2p, 4, undefined, 'joining');
+			const key = new TextEncoder().encode('some-key');
+			const cluster = await network.findCluster(key);
+			expect(cluster[svcA.toString()]).to.exist;
+			expect(cluster[svcB.toString()]).to.exist;
+			expect(cluster[knownButDisconnected.toString()]).to.exist;
+			expect(cluster[knownButDisconnected.toString()]!.multiaddrs).to.deep.equal([
+				disconnectedMa.toString()
+			]);
 		});
 	});
 });
