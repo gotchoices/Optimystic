@@ -2,7 +2,6 @@ import { expect } from 'chai';
 import {
 	digest, hashMod, randomBytes, sign, verify,
 	generatePrivateKey, getPublicKey,
-	SignatureValid,
 } from '../dist/index.js';
 
 describe('Crypto Functions', () => {
@@ -214,78 +213,6 @@ describe('Crypto Functions', () => {
 			);
 			expect(valid).to.be.false;
 		});
-	});
-});
-
-describe('SignatureValid', () => {
-	for (const curve of ['secp256k1', 'p256', 'ed25519'] as const) {
-		describe(`${curve}`, () => {
-			let privKey: Uint8Array;
-			let pubKey: Uint8Array;
-			let message: Uint8Array;
-			let sig: Uint8Array;
-
-			beforeEach(() => {
-				privKey = generatePrivateKey(curve, 'bytes') as Uint8Array;
-				pubKey = getPublicKey(privKey, curve, 'bytes', 'bytes') as Uint8Array;
-				message = new Uint8Array(32).fill(0x42);
-				sig = sign(message, privKey, curve, 'bytes', 'bytes', 'bytes') as Uint8Array;
-			});
-
-			it('should verify a valid signature', () => {
-				const valid = SignatureValid(message, sig, pubKey, { curve });
-				expect(valid).to.be.true;
-			});
-
-			it('should reject a corrupted signature', () => {
-				const corrupted = new Uint8Array(sig);
-				corrupted[0] = (corrupted[0]! ^ 0xff);
-				expect(SignatureValid(message, corrupted, pubKey, { curve })).to.be.false;
-			});
-
-			it('should work via convenience method', () => {
-				const valid = SignatureValid[curve](message, sig, pubKey);
-				expect(valid).to.be.true;
-			});
-		});
-	}
-
-	it('should batch verify multiple signatures', () => {
-		const verifications = (['secp256k1', 'p256', 'ed25519'] as const).map(curve => {
-			const priv = generatePrivateKey(curve, 'bytes') as Uint8Array;
-			const pub = getPublicKey(priv, curve, 'bytes', 'bytes') as Uint8Array;
-			const msg = new Uint8Array(32).fill(0x99);
-			const s = sign(msg, priv, curve, 'bytes', 'bytes', 'bytes') as Uint8Array;
-			return { digest: msg, signature: s, publicKey: pub, options: { curve } };
-		});
-
-		const results = SignatureValid.batch(verifications);
-		expect(results).to.deep.equal([true, true, true]);
-	});
-
-	it('should return detailed verification info', () => {
-		const priv = generatePrivateKey('secp256k1', 'bytes') as Uint8Array;
-		const pub = getPublicKey(priv, 'secp256k1', 'bytes', 'bytes') as Uint8Array;
-		const msg = new Uint8Array(32).fill(0x01);
-		const s = sign(msg, priv, 'secp256k1', 'bytes', 'bytes', 'bytes') as Uint8Array;
-
-		const detail = SignatureValid.detailed(msg, s, pub, { curve: 'secp256k1' });
-		expect(detail.valid).to.be.true;
-		expect(detail.curve).to.equal('secp256k1');
-		expect(detail.signatureFormat).to.be.a('string');
-	});
-
-	it('should return false for completely invalid inputs', () => {
-		expect(SignatureValid(new Uint8Array(0), new Uint8Array(0), new Uint8Array(0))).to.be.false;
-	});
-
-	it('should return false for wrong curve', () => {
-		const priv = generatePrivateKey('secp256k1', 'bytes') as Uint8Array;
-		const pub = getPublicKey(priv, 'secp256k1', 'bytes', 'bytes') as Uint8Array;
-		const msg = new Uint8Array(32).fill(0x42);
-		const s = sign(msg, priv, 'secp256k1', 'bytes', 'bytes', 'bytes') as Uint8Array;
-
-		expect(SignatureValid(msg, s, pub, { curve: 'ed25519' })).to.be.false;
 	});
 });
 

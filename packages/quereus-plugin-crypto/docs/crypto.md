@@ -11,9 +11,7 @@ The crypto plugin exposes cryptographic primitives in two ways:
 
 All implementations delegate to audited libraries ([`@noble/curves`](https://github.com/paulmillr/noble-curves), [`@noble/hashes`](https://github.com/paulmillr/noble-hashes)) with no custom cryptographic code.
 
-### Legacy API
-
-The original class-based API (`Digest`, `Sign`, `SignatureValid`) remains exported for backwards compatibility. New code should use the idiomatic lowercase function exports (`digest`, `sign`, `verify`, etc.).
+Both the SQL functions and the JavaScript API share the same implementation (`crypto.ts`), so they produce byte-identical results for matching encodings. Use the lowercase function exports (`digest`, `sign`, `verify`, etc.) in application code.
 
 ---
 
@@ -140,7 +138,7 @@ All encoding parameters default to `base64url` unless otherwise specified.
 
 - **Transaction hashing**: SHA-256 via `multiformats/hashes/sha2` (not this plugin)
 - **Schema hashing**: SHA-256 (first 16 bytes, base64url) in `quereus-engine.ts`
-- **Cluster consensus**: `SignatureValid` from this plugin (see [cluster-signature-verification](../../../tickets/complete/4-cluster-signature-verification.md))
+- **Cluster consensus**: `verify` from this plugin (see [cluster-signature-verification](../../../tickets/complete/4-cluster-signature-verification.md))
 
 ---
 

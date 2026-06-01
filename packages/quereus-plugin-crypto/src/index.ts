@@ -25,9 +25,3 @@ export {
 	type Encoding,
 } from './crypto.js';
 
-// Legacy exports for backwards compatibility (if needed)
-export { Digest, type DigestInput, type DigestOptions } from './digest.js';
-export { Sign, type PrivateKeyInput, type SignOptions } from './sign.js';
-export { SignatureValid, type BytesInput, type VerifyOptions } from './signature-valid.js';
-
-
