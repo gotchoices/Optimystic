@@ -106,6 +106,81 @@ describe('Optimystic plugin catalog hydration', function () {
 		expect(rows[0]).to.deep.include({ id: 1, name: 'alice', email: 'a@x' });
 	});
 
+	it('hydrateCatalog walks the schema tree once regardless of table count', async () => {
+		// Regression guard for tickets/implement/hydrate-catalog-single-tree-scan.
+		// hydrateCatalog runs `listTables()` then one `getSchema(name)` per table.
+		// `listTables` already walks the entire schema btree via `range()`, so it
+		// seeds the per-instance schemaCache from that single pass; the follow-up
+		// getSchema calls must then hit memory and never re-walk the tree. With
+		// N=3 persisted tables this collapses 1 + N = 4 full traversals down to 1.
+		const storage = new MemoryRawStorage();
+		const sharedTransactor = buildSharedLocalTransactor(storage);
+
+		// --- Session 1: persist three tables so hydrate has N>1 to load.
+		const dbA = new Database();
+		registerWithSharedTransactor(dbA, sharedTransactor);
+		await dbA.exec(`
+			CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT NOT NULL)
+			USING optimystic('tree://hydrate-scan/users')
+		`);
+		await dbA.exec(`
+			CREATE TABLE orders (id INTEGER PRIMARY KEY, total REAL)
+			USING optimystic('tree://hydrate-scan/orders')
+		`);
+		await dbA.exec(`
+			CREATE TABLE products (id INTEGER PRIMARY KEY, sku TEXT NOT NULL)
+			USING optimystic('tree://hydrate-scan/products')
+		`);
+
+		// --- Session 2: fresh Database + plugin, shared storage. Spy on the
+		// schema tree's update() so we can count full traversals during hydrate.
+		// `createOrGetCollection` only caches collections inside an active
+		// transaction, so each un-cached getSchema call (pre-fix) would open its
+		// own schema tree and call update() on it — wrapping every schema tree
+		// returned counts all of them.
+		const dbB = new Database();
+		const pluginB = registerWithSharedTransactor(dbB, sharedTransactor);
+
+		let schemaTreeUpdateCalls = 0;
+		const factory = pluginB.collectionFactory as unknown as {
+			createOrGetCollection: (options: any, txnState?: any) => Promise<any>;
+		};
+		const originalCreate = factory.createOrGetCollection.bind(factory);
+		factory.createOrGetCollection = async (options: any, txnState?: any) => {
+			const tree = await originalCreate(options, txnState);
+			if (options?.collectionUri === 'tree://optimystic/schema') {
+				const originalUpdate = tree.update.bind(tree);
+				tree.update = async (...args: any[]) => {
+					schemaTreeUpdateCalls++;
+					return originalUpdate(...args);
+				};
+			}
+			return tree;
+		};
+
+		const result = await pluginB.hydrate(dbB);
+		expect(result.tables, 'all three persisted tables should hydrate').to.equal(3);
+
+		// One traversal for listTables(); the three getSchema calls hit the
+		// seeded cache. Pre-fix this asserted 4.
+		expect(
+			schemaTreeUpdateCalls,
+			'hydrate must walk the schema tree exactly once, not once-per-table',
+		).to.equal(1);
+
+		// And the hydrated catalog is complete — the seeded cache values equal
+		// what getSchema would have fetched, so every table lands with columns.
+		for (const [name, cols] of [
+			['users', ['id', 'name']],
+			['orders', ['id', 'total']],
+			['products', ['id', 'sku']],
+		] as const) {
+			const hydrated = dbB.schemaManager.findTable(name, 'main');
+			expect(hydrated, `${name} should be in catalog after hydrate`).to.not.equal(undefined);
+			expect(hydrated!.columns.map(c => c.name)).to.deep.equal(cols);
+		}
+	});
+
 	it('hydrate is a no-op against empty storage (cold start)', async () => {
 		const storage = new MemoryRawStorage();
 		const transactor = buildSharedLocalTransactor(storage);

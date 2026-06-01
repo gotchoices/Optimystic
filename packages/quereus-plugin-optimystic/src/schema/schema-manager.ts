@@ -151,7 +151,18 @@ export class SchemaManager {
 				continue;
 			}
 
-			const entry = tree.at(path) as [string, any];
+			const entry = tree.at(path) as [string, StoredTableSchema];
+			// Seed the per-instance cache from this single traversal so the
+			// follow-up `getSchema(name)` calls (hydrateCatalog walks one
+			// listTables + one getSchema per table) hit memory instead of
+			// re-walking the schema btree from the root. The seeded value is
+			// the same `entry[1]` shape getSchema itself caches and returns
+			// (`[name, StoredTableSchema]`). Skip tombstones — a deleted entry
+			// can surface as `entry[1] === undefined` and must not register as
+			// a cache hit.
+			if (entry && entry.length >= 2 && entry[1]) {
+				this.schemaCache.set(entry[0], entry[1]);
+			}
 			if (entry && entry.length >= 1) {
 				tables.push(entry[0]);
 			}
