@@ -702,5 +702,178 @@ describe('StorageRepo', () => {
 			expect(events[1]!.actionId).to.equal('a2');
 			expect(events[1]!.rev).to.equal(2);
 		});
+
+		it('emits one event on a get()-driven promotion and does not re-emit later (Path 1)', async () => {
+			const events: CollectionChangeEvent[] = [];
+			repo.onCollectionChange('collection-1' as BlockId, (e) => events.push(e));
+
+			// Pend an insert but never drive it through commit() — the action committed
+			// via the tail elsewhere, so a get() whose context proves it is committed
+			// promotes it (internalCommit) and that promotion is a durable landing.
+			await repo.pend({
+				actionId: 'a1' as ActionId,
+				transforms: makeInsertTransforms('block-1' as BlockId, makeBlock('block-1', { items: ['data'] })),
+				policy: 'c'
+			});
+
+			const result = await repo.get({
+				blockIds: ['block-1' as BlockId],
+				context: { committed: [{ actionId: 'a1' as ActionId, rev: 1 }], rev: 1 }
+			});
+
+			// The read both serves and promotes the block, and fires exactly one event.
+			expect(result['block-1']?.block).to.not.equal(undefined);
+			expect(events.length).to.equal(1);
+			expect(events[0]!.collectionId).to.equal('collection-1');
+			expect(events[0]!.blockIds).to.deep.equal(['block-1']);
+			expect(events[0]!.actionId).to.equal('a1');
+			expect(events[0]!.rev).to.equal(1);
+
+			// A later contextless get() finds the block already promoted — no new
+			// landing — so it must NOT re-emit.
+			await repo.get({ blockIds: ['block-1' as BlockId] });
+			expect(events.length).to.equal(1);
+		});
+
+		it('emits per durable landing across a failed partial commit and its successful retry (Path 2)', async () => {
+			// Wrap block-2's storage so its saveRevision throws exactly once across the
+			// whole test, forcing a REAL mid-loop internalCommit throw (the existing
+			// TEST-5.4.2 only hits the stale early-return, not this catch branch). The
+			// throw-once state lives in the factory closure because commit() builds a
+			// fresh BlockStorage per call.
+			let block2SaveRevisionThrown = false;
+			const failingRepo = new StorageRepo((blockId) => {
+				const storage = new BlockStorage(blockId as BlockId, rawStorage);
+				if (blockId === 'block-2') {
+					const originalSaveRevision = storage.saveRevision.bind(storage);
+					storage.saveRevision = async (rev: number, actionId: ActionId) => {
+						if (!block2SaveRevisionThrown) {
+							block2SaveRevisionThrown = true;
+							throw new Error('Simulated saveRevision failure on block-2');
+						}
+						return originalSaveRevision(rev, actionId);
+					};
+				}
+				return storage;
+			});
+
+			// Both blocks committed at rev 1 in collection-1.
+			for (const id of ['block-1', 'block-2']) {
+				const storage = new BlockStorage(id as BlockId, rawStorage);
+				const block = makeBlock(id, { items: [] });
+				await storage.savePendingTransaction('setup' as ActionId, { insert: block });
+				await storage.saveMaterializedBlock('setup' as ActionId, block);
+				await storage.saveRevision(1, 'setup' as ActionId);
+				await storage.promotePendingTransaction('setup' as ActionId);
+				await storage.setLatest({ actionId: 'setup' as ActionId, rev: 1 });
+			}
+
+			const events: CollectionChangeEvent[] = [];
+			failingRepo.onCollectionChange('collection-1' as BlockId, (e) => events.push(e));
+
+			// Pend an update to both blocks (commit loop processes them in request order).
+			const transforms: Transforms = {
+				inserts: {},
+				updates: {
+					'block-1': [['items', 0, 0, ['new-1']]],
+					'block-2': [['items', 0, 0, ['new-2']]]
+				},
+				deletes: []
+			};
+			await failingRepo.pend({ actionId: 'a1' as ActionId, transforms, policy: 'c' });
+
+			// First commit: block-1 lands durably, block-2's saveRevision throws →
+			// success:false, but exactly ONE event for the block that landed (block-1).
+			const first = await failingRepo.commit({
+				actionId: 'a1' as ActionId,
+				blockIds: ['block-1' as BlockId, 'block-2' as BlockId],
+				tailId: 'block-1' as BlockId,
+				rev: 2
+			});
+			expect(first.success).to.equal(false);
+			expect(events.length).to.equal(1);
+			expect(events[0]!.blockIds).to.deep.equal(['block-1']);
+			expect(events[0]!.actionId).to.equal('a1');
+			expect(events[0]!.rev).to.equal(2);
+
+			// Retry: block-1 is alreadyDone (no re-emit), block-2 now lands →
+			// success:true and exactly ONE further event, for block-2.
+			const second = await failingRepo.commit({
+				actionId: 'a1' as ActionId,
+				blockIds: ['block-1' as BlockId, 'block-2' as BlockId],
+				tailId: 'block-1' as BlockId,
+				rev: 2
+			});
+			expect(second.success).to.equal(true);
+			expect(events.length).to.equal(2);
+			expect(events[1]!.blockIds).to.deep.equal(['block-2']);
+			expect(events[1]!.actionId).to.equal('a1');
+			expect(events[1]!.rev).to.equal(2);
+
+			// The woken set across both attempts covers both blocks exactly once.
+			const woken = events.flatMap(e => e.blockIds).sort();
+			expect(woken).to.deep.equal(['block-1', 'block-2']);
+		});
+
+		it('wakes the landed collection on a failed partial commit spanning two collections (Path 2 variant)', async () => {
+			// block-b's saveRevision throws once; block-a (a different collection) lands
+			// first. Pre-fix, collection-A would NEVER be woken — the permanent miss.
+			let blockBSaveRevisionThrown = false;
+			const failingRepo = new StorageRepo((blockId) => {
+				const storage = new BlockStorage(blockId as BlockId, rawStorage);
+				if (blockId === 'block-b') {
+					const originalSaveRevision = storage.saveRevision.bind(storage);
+					storage.saveRevision = async (rev: number, actionId: ActionId) => {
+						if (!blockBSaveRevisionThrown) {
+							blockBSaveRevisionThrown = true;
+							throw new Error('Simulated saveRevision failure on block-b');
+						}
+						return originalSaveRevision(rev, actionId);
+					};
+				}
+				return storage;
+			});
+
+			const setup = async (id: string, collectionId: string) => {
+				const storage = new BlockStorage(id as BlockId, rawStorage);
+				const block = makeBlockInCollection(id, collectionId, { items: [] });
+				await storage.savePendingTransaction('setup' as ActionId, { insert: block });
+				await storage.saveMaterializedBlock('setup' as ActionId, block);
+				await storage.saveRevision(1, 'setup' as ActionId);
+				await storage.promotePendingTransaction('setup' as ActionId);
+				await storage.setLatest({ actionId: 'setup' as ActionId, rev: 1 });
+			};
+			await setup('block-a', 'collection-A');
+			await setup('block-b', 'collection-B');
+
+			const aEvents: CollectionChangeEvent[] = [];
+			const bEvents: CollectionChangeEvent[] = [];
+			failingRepo.onCollectionChange('collection-A' as BlockId, (e) => aEvents.push(e));
+			failingRepo.onCollectionChange('collection-B' as BlockId, (e) => bEvents.push(e));
+
+			const transforms: Transforms = {
+				inserts: {},
+				updates: {
+					'block-a': [['items', 0, 0, ['new-a']]],
+					'block-b': [['items', 0, 0, ['new-b']]]
+				},
+				deletes: []
+			};
+			await failingRepo.pend({ actionId: 'a1' as ActionId, transforms, policy: 'c' });
+
+			// Attempt 1: block-a (collection-A) lands and emits even though the overall
+			// commit fails on block-b (collection-B), which never landed this attempt.
+			const first = await failingRepo.commit({
+				actionId: 'a1' as ActionId,
+				blockIds: ['block-a' as BlockId, 'block-b' as BlockId],
+				tailId: 'block-a' as BlockId,
+				rev: 2
+			});
+			expect(first.success).to.equal(false);
+			expect(aEvents.length).to.equal(1);
+			expect(aEvents[0]!.collectionId).to.equal('collection-A');
+			expect(aEvents[0]!.blockIds).to.deep.equal(['block-a']);
+			expect(bEvents.length).to.equal(0);
+		});
 	});
 });

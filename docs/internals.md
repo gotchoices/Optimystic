@@ -46,19 +46,29 @@ StorageRepo.commit()                       # critical section (block locks held)
   → internalCommit() returns collectionId  # newBlock.header ?? priorBlock.header (delete)
   → release locks (finally)
   → emitCollectionChanges()                # one CollectionChangeEvent per distinct collection
+StorageRepo.get()                          # read-driven promotion (context proves committed)
+  → internalCommit() returns collectionId  # promotes a pending action that landed durably
+  → emitPromotions()                        # group by (actionId, rev), emit per group
 ```
 
 - Subscribe via `onCollectionChange(collectionId, listener)` → idempotent unsubscribe.
 - Events fire **after** locks release, synchronously in commit order, fire-and-forget
   (never awaited); a throwing listener is isolated + logged. Ordering across concurrent
   commits / across collections is **not** guaranteed.
-- Emitted only for blocks **newly committed** in that call on `success: true` —
-  `alreadyDone` (idempotent re-commit) and stale partitions never emit.
+- **Emission guarantee (Option A — emit eagerly):** a `CollectionChangeEvent` fires
+  once for every block that becomes **durably committed** on this node, regardless of
+  whether the enclosing `commit()` ultimately reports `success: false`, and regardless
+  of whether the landing happened on a `commit()` or on a `get()`-driven promotion.
+  Concretely this covers: (a) blocks `1..N-1` that landed before a mid-loop
+  `internalCommit` throw on block `N` (the failed attempt emits for what landed; the
+  retry rolls `N` forward and emits for it), and (b) a pending action promoted during a
+  `get()` whose `context` proves it committed. Idempotent `alreadyDone` re-landings and
+  stale partitions never emit, so each `pending → committed` transition emits exactly
+  once. The consumer does coarse whole-table invalidation, where over-firing costs only
+  a re-query but a missed wake serves a stale view indefinitely — hence the asymmetry
+  favors liveness.
 - Exposed on the node as `(node as any).blockChangeNotifier`. `NetworkTransactor`
   re-exposes it via an optional `localChangeNotifier` ctor option (no-op when absent).
-- **Known silent-drop paths** (see `tickets/`): a block promoted during a `get()`
-  read, and blocks that landed in a *failed* partial multi-block commit (the
-  successful retry treats them as `alreadyDone`), emit no event.
 
 #### Reactive Watch Bridge (Quereus vtab)
 

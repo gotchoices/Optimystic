@@ -84,6 +84,12 @@ export class StorageRepo implements IRepo, IBlockChangeNotifier, IBlockReplicaSt
 	async get({ blockIds, context }: BlockGets, _options?: MessageOptions): Promise<GetBlockResults> {
 		const distinctBlockIds = Array.from(new Set(blockIds));
 		log('get blockIds=%d', distinctBlockIds.length);
+		// Read-driven promotions that land durably here, captured so we can emit a
+		// change event per durable landing after the parallel reads complete (mirrors
+		// commit's "emit after the work" ordering). The array is shared across the
+		// parallel map closures below — safe because each push happens synchronously
+		// between awaits (single-threaded), never concurrently.
+		const promotions: { collectionId: CollectionId, blockId: BlockId, actionId: ActionId, rev: number }[] = [];
 		const results = await Promise.all(distinctBlockIds.map(async (blockId) => {
 			const blockStorage = this.createBlockStorage(blockId);
 
@@ -96,7 +102,10 @@ export class StorageRepo implements IRepo, IBlockChangeNotifier, IBlockReplicaSt
 				for (const { actionId, rev } of missing.sort((a, b) => a.rev - b.rev)) {
 					const pending = await blockStorage.getPendingTransaction(actionId);
 					if (pending) {
-						await this.internalCommit(blockId, actionId, rev, blockStorage);
+						const collectionId = await this.internalCommit(blockId, actionId, rev, blockStorage);
+						if (collectionId !== undefined) {
+							promotions.push({ collectionId, blockId, actionId, rev });
+						}
 					}
 				}
 			}
@@ -134,7 +143,40 @@ export class StorageRepo implements IRepo, IBlockChangeNotifier, IBlockReplicaSt
 				}
 			}];
 		}));
+
+		// Emit per durable read-driven landing (Option A — emit eagerly). Done after the
+		// parallel reads complete so emission stays outside the per-block work, matching
+		// commit's ordering. No-op when nothing was promoted.
+		this.emitPromotions(promotions);
+
 		return Object.fromEntries(results);
+	}
+
+	/**
+	 * Emit a {@link CollectionChangeEvent} for each read-driven promotion that landed
+	 * during a {@link get}. A single get() can promote multiple distinct actions, each
+	 * at its own `(actionId, rev)`, so group by `(actionId, rev)` and route each group
+	 * through {@link emitCollectionChanges} once.
+	 */
+	private emitPromotions(promotions: { collectionId: CollectionId, blockId: BlockId, actionId: ActionId, rev: number }[]): void {
+		if (promotions.length === 0) {
+			return;
+		}
+		const groups = new Map<string, { actionId: ActionId, rev: number, collectionBlocks: Map<CollectionId, BlockId[]> }>();
+		for (const { collectionId, blockId, actionId, rev } of promotions) {
+			const key = `${actionId} ${rev}`;
+			let group = groups.get(key);
+			if (!group) {
+				group = { actionId, rev, collectionBlocks: new Map() };
+				groups.set(key, group);
+			}
+			const list = group.collectionBlocks.get(collectionId) ?? [];
+			list.push(blockId);
+			group.collectionBlocks.set(collectionId, list);
+		}
+		for (const { actionId, rev, collectionBlocks } of groups.values()) {
+			this.emitCollectionChanges(collectionBlocks, actionId, rev);
+		}
 	}
 
 	async pend(request: PendRequest, _options?: MessageOptions): Promise<PendResult> {
@@ -247,8 +289,13 @@ export class StorageRepo implements IRepo, IBlockChangeNotifier, IBlockReplicaSt
 		const uniqueBlockIds = Array.from(new Set(request.blockIds)).sort();
 		const releases: (() => void)[] = [];
 		// Collects the blocks newly committed in this call, grouped by collection,
-		// so we can emit change events once locks are released and success is known.
+		// so we can emit change events once locks are released. Blocks that land before
+		// a mid-loop failure stay here and are still emitted (Option A — emit eagerly):
+		// they are durably committed and a retry rolls the remainder forward.
 		const collectionBlocks = new Map<CollectionId, BlockId[]>();
+		// Captured when internalCommit throws mid-loop; we break (rather than return)
+		// so locks release and accumulated landings still emit before we report failure.
+		let failure: { reason: string } | undefined;
 
 		try {
 			// Acquire locks sequentially based on sorted IDs to prevent deadlocks
@@ -335,12 +382,12 @@ export class StorageRepo implements IRepo, IBlockChangeNotifier, IBlockReplicaSt
 						collectionBlocks.set(collectionId, list);
 					}
 				} catch (err) {
-					// Partial-commit recovery: a retry with the same (actionId, rev) will treat
-					// already-done blocks as idempotent no-ops and advance the remainder.
-					return {
-						success: false,
-						reason: err instanceof Error ? err.message : 'Unknown error during commit'
-					};
+					// Partial-commit recovery: blocks already in collectionBlocks DID land
+					// durably and must still emit; a retry with the same (actionId, rev)
+					// treats them as idempotent no-ops and advances the remainder. Break
+					// instead of returning so locks release and those landings emit below.
+					failure = { reason: err instanceof Error ? err.message : 'Unknown error during commit' };
+					break;
 				}
 			}
 		}
@@ -349,11 +396,12 @@ export class StorageRepo implements IRepo, IBlockChangeNotifier, IBlockReplicaSt
 			releases.reverse().forEach(release => release());
 		}
 
-		// Notify after the critical section, only for blocks newly committed here
-		// (alreadyDone / stale partitions never reach `collectionBlocks`).
+		// Notify after the critical section, for every block newly committed here —
+		// including those that landed before a mid-loop failure (alreadyDone / stale
+		// partitions never reach `collectionBlocks`).
 		this.emitCollectionChanges(collectionBlocks, request.actionId, request.rev);
 
-		return { success: true };
+		return failure ? { success: false, reason: failure.reason } : { success: true };
 	}
 
 	/**
