@@ -220,4 +220,40 @@ describe('Reactive watch bridge (collection change → Database.watch)', functio
 			await db.close();
 		}
 	});
+
+	it('isolates a throwing/rejecting notifyExternalChange from the storage commit', async () => {
+		const { db, plugin } = setup();
+		const unhandled: unknown[] = [];
+		const onUnhandled = (reason: unknown) => { unhandled.push(reason); };
+		process.on('unhandledRejection', onUnhandled);
+		try {
+			await db.exec("create table t (id text primary key, v text) using optimystic('tree://reactive-err/t')");
+
+			// Force the bridge's notifyExternalChange to fail both ways the vtab
+			// defends against: a synchronous throw, then a rejected promise. Either
+			// must be swallowed inside handleCollectionChange — the storage commit
+			// that drove the listener must still resolve, with no unhandled rejection.
+			let mode: 'throw' | 'reject' = 'throw';
+			(db as unknown as { notifyExternalChange: Database['notifyExternalChange'] }).notifyExternalChange =
+				((_t: string, _s?: string) => {
+					if (mode === 'throw') throw new Error('boom (sync)');
+					return Promise.reject(new Error('boom (async)'));
+				}) as Database['notifyExternalChange'];
+
+			// Sync-throw path: commit resolves despite the listener throwing.
+			await externalCommit(plugin, 'tree://reactive-err/t', 'r1', 'a');
+
+			// Async-reject path: commit resolves; the .catch in handleCollectionChange
+			// consumes the rejection so it never reaches the process.
+			mode = 'reject';
+			await externalCommit(plugin, 'tree://reactive-err/t', 'r2', 'b');
+
+			// Let any (mis)handled rejection surface before asserting absence.
+			await waitUntil(() => unhandled.length > 0, 100);
+			expect(unhandled, 'no unhandled rejection escaped the bridge').to.have.length(0);
+		} finally {
+			process.removeListener('unhandledRejection', onUnhandled);
+			await db.close();
+		}
+	});
 });
