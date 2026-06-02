@@ -27,10 +27,11 @@ import type { Connection, Stream } from '@libp2p/interface';
 import { webSockets } from '@libp2p/websockets';
 import { tcp } from '@libp2p/tcp';
 import { circuitRelayTransport } from '@libp2p/circuit-relay-v2';
-import { multiaddr, type Multiaddr } from '@multiformats/multiaddr';
+import type { Multiaddr } from '@multiformats/multiaddr';
 import { pipe } from 'it-pipe';
 import { encode as lpEncode, decode as lpDecode } from 'it-length-prefixed';
 import { createLibp2pNode, type Libp2pTransports } from '../src/libp2p-node.js';
+import { spawnRelayNode, pickRelayWsAddr, waitForCircuitListen } from './util/relay-topology.js';
 
 const NETWORK = 'circuit-relay-long-lived-it';
 const TEST_PROTOCOL = '/optimystic-test/relay-traffic/1.0.0';
@@ -38,29 +39,6 @@ const TEST_PROTOCOL = '/optimystic-test/relay-traffic/1.0.0';
 /** ~2 KiB payload, well below the default 128 KiB per-circuit data cap. */
 const PAYLOAD_BYTES = 2 * 1024;
 const PAYLOAD = new Uint8Array(PAYLOAD_BYTES).fill(0x61);
-
-interface SpawnRelayOpts {
-	applyDefaultLimit?: boolean;
-}
-
-async function spawnRelayNode(opts: SpawnRelayOpts = {}): Promise<Libp2p> {
-	const transports: Libp2pTransports = [tcp(), webSockets(), circuitRelayTransport()];
-	return await createLibp2pNode({
-		port: 0,
-		wsPort: 0,
-		networkName: NETWORK,
-		bootstrapNodes: [],
-		relay: true,
-		relayServerInit: {
-			reservations: { applyDefaultLimit: opts.applyDefaultLimit ?? false }
-		},
-		transports,
-		listenAddrs: ['/ip4/127.0.0.1/tcp/0', '/ip4/127.0.0.1/tcp/0/ws'],
-		clusterSize: 1,
-		clusterPolicy: { allowDownsize: true, sizeTolerance: 1.0 },
-		arachnode: { enableRingZulu: false }
-	});
-}
 
 async function spawnBrowserShaped(relayAddr: Multiaddr): Promise<Libp2p> {
 	const transports: Libp2pTransports = [webSockets(), circuitRelayTransport()];
@@ -90,25 +68,6 @@ async function spawnServicePeer(): Promise<Libp2p> {
 		clusterPolicy: { allowDownsize: true, sizeTolerance: 1.0 },
 		arachnode: { enableRingZulu: false }
 	});
-}
-
-function pickRelayWsAddr(node: Libp2p): Multiaddr {
-	const addrs = node.getMultiaddrs().map(a => a.toString());
-	const ws = addrs.find(a => a.includes('/ws/p2p/') || a.endsWith('/ws'));
-	if (!ws) {
-		throw new Error(`No /ws multiaddr on relay node; have: ${addrs.join(', ')}`);
-	}
-	return multiaddr(ws);
-}
-
-async function waitForCircuitListen(client: Libp2p, timeoutMs: number): Promise<Multiaddr> {
-	const start = Date.now();
-	while (Date.now() - start < timeoutMs) {
-		const circuit = client.getMultiaddrs().map(a => a.toString()).find(a => a.includes('/p2p-circuit/'));
-		if (circuit) return multiaddr(circuit);
-		await new Promise(r => setTimeout(r, 100));
-	}
-	throw new Error(`Browser-shaped client never published a /p2p-circuit multiaddr (have: ${client.getMultiaddrs().map(a => a.toString()).join(', ')})`);
 }
 
 async function pushPayload(stream: Stream): Promise<void> {
@@ -174,7 +133,7 @@ describe('Circuit-relay long-lived connections', function () {
 	it('sustained ~2 KiB dials through a relay survive past the default 128 KiB cap', async function () {
 		this.timeout(120_000);
 
-		relay = await spawnRelayNode({ applyDefaultLimit: false });
+		relay = await spawnRelayNode(NETWORK, { applyDefaultLimit: false });
 		const relayWs = pickRelayWsAddr(relay);
 
 		client = await spawnBrowserShaped(relayWs);
@@ -204,7 +163,7 @@ describe('Circuit-relay long-lived connections', function () {
 		this.timeout(180_000);
 		if (process.env.RUN_LONG_TESTS_CONTROL !== '1') this.skip();
 
-		relay = await spawnRelayNode({ applyDefaultLimit: true });
+		relay = await spawnRelayNode(NETWORK, { applyDefaultLimit: true });
 		const relayWs = pickRelayWsAddr(relay);
 
 		client = await spawnBrowserShaped(relayWs);

@@ -1,4 +1,4 @@
-import type { IRepo, ClusterRecord, Signature, RepoMessage, ITransactionValidator, ClusterConsensusConfig } from "@optimystic/db-core";
+import type { IRepo, ClusterRecord, Signature, RepoMessage, ITransactionValidator, ClusterConsensusConfig, CommitResult } from "@optimystic/db-core";
 import type { ICluster } from "@optimystic/db-core";
 import type { IPeerNetwork } from "@optimystic/db-core";
 import { blockIdsForTransforms } from "@optimystic/db-core";
@@ -68,6 +68,16 @@ export function clusterMember(components: ClusterMemberComponents): ClusterMembe
 
 // How long to keep executed transaction records (10 minutes)
 const ExecutedTransactionTtlMs = 10 * 60 * 1000;
+
+/**
+ * True when a thrown storage error reports a missing pending action — i.e. this
+ * member reached commit-consensus without having seen the matching pend phase.
+ * That is recoverable local divergence (reconciled via sync / read-repair), not
+ * a transaction fault, so it must not reset the cluster stream.
+ */
+function isMissingPendingActionError(err: unknown): boolean {
+	return err instanceof Error && /pending action .+ not found/i.test(err.message);
+}
 
 /**
  * Handles cluster-side operations, managing promises and commits for cluster updates
@@ -670,41 +680,102 @@ export class ClusterMember implements ICluster {
 			.catch(err => log('cluster-member:persist-executed-error', { messageHash: record.messageHash, error: (err as Error).message }));
 
 		try {
-			// Execute the operations - check return values for failures
 			for (const operation of record.message.operations) {
-				if ('get' in operation) {
-					await this.storageRepo.get(operation.get);
-				} else if ('pend' in operation) {
-					const result = await this.storageRepo.pend(operation.pend);
-					if (!result.success) {
-						log('cluster-member:consensus-pend-failed', {
-							messageHash: record.messageHash,
-							actionId: operation.pend.actionId,
-							reason: result.reason,
-							hasMissing: !!result.missing?.length,
-							hasPending: !!result.pending?.length
-						});
-						throw new Error(`Consensus pend failed for action ${operation.pend.actionId}: ${result.reason ?? 'stale revision'}`);
-					}
-				} else if ('commit' in operation) {
-					const result = await this.storageRepo.commit(operation.commit);
-					if (!result.success) {
-						log('cluster-member:consensus-commit-failed', {
-							messageHash: record.messageHash,
-							actionId: operation.commit.actionId,
-							reason: result.reason,
-							hasMissing: !!result.missing?.length
-						});
-						throw new Error(`Consensus commit failed for action ${operation.commit.actionId}: ${result.reason ?? 'stale revision'}`);
-					}
-				} else if ('cancel' in operation) {
-					await this.storageRepo.cancel(operation.cancel.actionRef);
-				}
+				await this.applyConsensusOperation(record.messageHash, operation);
 			}
 		} catch (err) {
-			// On failure, remove from executedTransactions so it can be retried
+			// A genuinely unexpected fault (e.g. storage I/O) — roll back the executed
+			// marker so a corrected retry can re-run, and propagate so the caller learns
+			// the real cause. Recoverable local divergence is absorbed inside
+			// applyConsensusOperation and never reaches here.
 			this.executedTransactions.delete(record.messageHash);
 			throw err;
+		}
+	}
+
+	/**
+	 * Applies one consensus-approved operation to local storage.
+	 *
+	 * By the time we reach here the cluster has *already* reached consensus, so the
+	 * operation is authoritative cluster-wide. A failure applying it to THIS member's
+	 * local store therefore does not mean the operation is invalid — it means our
+	 * local state has diverged from the agreed history:
+	 *
+	 *   - **ahead**: we already hold a newer revision, so a stale pend/commit is a
+	 *     no-op for us (`storageRepo` returns `success:false` / `missing`);
+	 *   - **behind**: we missed the prior `pend` cluster-transaction (cohort drift
+	 *     between the pend and commit phases, or transient unreachability), so we lack
+	 *     the pending action — `StorageRepo.commit` *throws* "Pending action … not found".
+	 *
+	 * The *intended* recovery is the normal sync / lazy read-repair path on the next
+	 * read of these blocks (`CoordinatorRepo.get`). NOTE: that recovery is currently
+	 * incomplete — read-repair can only pull a newer revision when some reachable peer
+	 * actually holds it, so a block under-replicated by cohort drift can stay stale.
+	 * Restoring replication (active reconciliation from a cohort peer here) is tracked
+	 * by the `web-e2e-tier2-cross-tab-convergence-under-replication` follow-up. What
+	 * this guard guarantees today is only that we do NOT reset the stream: throwing here
+	 * would reset the cluster stream the coordinator is awaiting and surface as a
+	 * spurious `StreamResetError`, sinking an otherwise-successful transaction — the
+	 * exact failure this removes. A genuinely *invalid* pend can never get this far: it
+	 * is rejected during the promise phase (`validatePendOperations`, which validates
+	 * pend ops only — commits carry no promise-phase validation). So divergence is
+	 * tolerated (logged for observability); unexpected *thrown* faults still propagate.
+	 *
+	 * CAVEAT: the propagate-vs-tolerate split keys off throw-vs-return, not off the
+	 * failure's nature. A genuine `internalCommit` fault surfaces as `success:false`
+	 * (with `reason`, no `missing`) and is tolerated here like divergence, whereas the
+	 * same fault thrown would propagate. `CommitResult` already distinguishes the two
+	 * (`missing` ⇒ stale/ahead divergence; bare `reason` ⇒ genuine failure); folding
+	 * that distinction in is part of the convergence follow-up's reconciliation work.
+	 */
+	private async applyConsensusOperation(messageHash: string, operation: RepoMessage['operations'][number]): Promise<void> {
+		if ('get' in operation) {
+			await this.storageRepo.get(operation.get);
+			return;
+		}
+		if ('cancel' in operation) {
+			await this.storageRepo.cancel(operation.cancel.actionRef);
+			return;
+		}
+		if ('pend' in operation) {
+			const result = await this.storageRepo.pend(operation.pend);
+			if (!result.success) {
+				log('cluster-member:consensus-pend-diverged', {
+					messageHash,
+					actionId: operation.pend.actionId,
+					reason: result.reason,
+					hasMissing: !!result.missing?.length,
+					hasPending: !!result.pending?.length
+				});
+			}
+			return;
+		}
+		if ('commit' in operation) {
+			let result: CommitResult;
+			try {
+				result = await this.storageRepo.commit(operation.commit);
+			} catch (err) {
+				// `StorageRepo.commit` throws (rather than returning success:false) when
+				// the pending action is missing — the canonical "behind" signal.
+				if (isMissingPendingActionError(err)) {
+					log('cluster-member:consensus-commit-diverged', {
+						messageHash,
+						actionId: operation.commit.actionId,
+						reason: (err as Error).message
+					});
+					return;
+				}
+				throw err;
+			}
+			if (!result.success) {
+				log('cluster-member:consensus-commit-diverged', {
+					messageHash,
+					actionId: operation.commit.actionId,
+					reason: result.reason,
+					hasMissing: !!result.missing?.length
+				});
+			}
+			return;
 		}
 	}
 

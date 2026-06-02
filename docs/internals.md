@@ -159,6 +159,19 @@ saveMaterializedBlock(block): store(structuredClone(block));
 - `handleConsensus()` executes on ALL cluster peers, not just coordinator
 - `executedTransactions` map prevents duplicate execution (keyed by messageHash)
 - Different operations (pend vs commit) have DIFFERENT messageHashes
+- **Post-consensus local-execution failures are tolerated, not thrown.** Once
+  consensus is reached the operation is authoritative; a member that cannot apply
+  it locally (it is *ahead* — stale pend/commit returns `success:false` — or
+  *behind* — missing the prior pend, so `StorageRepo.commit` throws "Pending
+  action … not found") logs `cluster-member:consensus-{pend,commit}-diverged` and
+  defers reconciliation rather than throwing. Throwing would reset the cluster
+  stream the coordinator awaits and surface as a spurious `StreamResetError`,
+  sinking an otherwise-successful transaction. Only genuinely *thrown*,
+  non-divergence faults still propagate (`applyConsensusOperation`).
+- **Caveat:** reconciliation of a diverged member currently relies on lazy
+  read-repair, which cannot recover a block no reachable peer holds (under-
+  replication from cohort drift). Active reconciliation is tracked by the
+  `web-e2e-tier2-cross-tab-convergence-under-replication` follow-up.
 
 ### Collection Header Blocks
 - Header blockId = collection name (deterministic)
