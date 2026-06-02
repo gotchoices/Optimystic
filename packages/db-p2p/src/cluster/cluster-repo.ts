@@ -82,8 +82,6 @@ export class ClusterMember implements ICluster {
 	private cleanupQueue: string[] = [];
 	// Serialize concurrent updates for the same transaction
 	private pendingUpdates: Map<string, Promise<ClusterRecord>> = new Map();
-	// Temporarily set during validateSignatures so verifySignature can access the record
-	private currentValidationRecord?: ClusterRecord;
 	// Interval handles for periodic cleanup (stored so dispose() can clear them)
 	private readonly expirationInterval: NodeJS.Timeout;
 	private readonly cleanupInterval: NodeJS.Timeout;
@@ -440,27 +438,22 @@ export class ClusterMember implements ICluster {
 	}
 
 	private async validateSignatures(record: ClusterRecord): Promise<void> {
-		this.currentValidationRecord = record;
-		try {
-			// Validate promise signatures
-			const promiseHash = await this.computePromiseHash(record);
-			for (const [peerId, signature] of Object.entries(record.promises)) {
-				if (!await this.verifySignature(peerId, promiseHash, signature)) {
-					this.reputation?.reportPeer(peerId, PenaltyReason.InvalidSignature, `promise:${record.messageHash}`);
-					throw new Error(`Invalid promise signature from ${peerId}`);
-				}
+		// Validate promise signatures
+		const promiseHash = await this.computePromiseHash(record);
+		for (const [peerId, signature] of Object.entries(record.promises)) {
+			if (!await this.verifySignature(record, peerId, promiseHash, signature)) {
+				this.reputation?.reportPeer(peerId, PenaltyReason.InvalidSignature, `promise:${record.messageHash}`);
+				throw new Error(`Invalid promise signature from ${peerId}`);
 			}
+		}
 
-			// Validate commit signatures
-			const commitHash = await this.computeCommitHash(record);
-			for (const [peerId, signature] of Object.entries(record.commits)) {
-				if (!await this.verifySignature(peerId, commitHash, signature)) {
-					this.reputation?.reportPeer(peerId, PenaltyReason.InvalidSignature, `commit:${record.messageHash}`);
-					throw new Error(`Invalid commit signature from ${peerId}`);
-				}
+		// Validate commit signatures
+		const commitHash = await this.computeCommitHash(record);
+		for (const [peerId, signature] of Object.entries(record.commits)) {
+			if (!await this.verifySignature(record, peerId, commitHash, signature)) {
+				this.reputation?.reportPeer(peerId, PenaltyReason.InvalidSignature, `commit:${record.messageHash}`);
+				throw new Error(`Invalid commit signature from ${peerId}`);
 			}
-		} finally {
-			this.currentValidationRecord = undefined;
 		}
 	}
 
@@ -496,8 +489,8 @@ export class ClusterMember implements ICluster {
 		return uint8ArrayToString(sigBytes, 'base64url');
 	}
 
-	private async verifySignature(peerId: string, hash: string, signature: Signature): Promise<boolean> {
-		const peerInfo = this.currentValidationRecord?.peers[peerId];
+	private async verifySignature(record: ClusterRecord, peerId: string, hash: string, signature: Signature): Promise<boolean> {
+		const peerInfo = record.peers[peerId];
 		if (!peerInfo?.publicKey?.length) {
 			throw new Error(`No public key for peer ${peerId}`);
 		}
