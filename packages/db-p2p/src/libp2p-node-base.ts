@@ -100,9 +100,12 @@ export type NodeOptions = {
 	/**
 	 * Responsibility K - the replica set size for determining cluster membership.
 	 * This is distinct from kBucketSize (DHT routing) and clusterSize (consensus quorum).
-	 * When a node receives a request, it checks if it's in the top responsibilityK
-	 * peers (by XOR distance) for the key. If not, it redirects to closer peers.
-	 * Default: 1 (only the closest peer is responsible)
+	 * On the repo path, a node checks whether it is in the top responsibilityK peers
+	 * (by XOR distance) for the key and redirects to closer peers if not. On the cluster
+	 * update path it is a small-mesh bypass threshold: when the record's peer set is
+	 * smaller than this, the update is processed locally regardless of membership;
+	 * otherwise a non-member redirects to the responsible peers.
+	 * Default: 1 (only the closest/member peer is responsible)
 	 */
 	responsibilityK?: number;
 
