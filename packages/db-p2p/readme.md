@@ -93,9 +93,9 @@ graph TD
     
     %% Network communication
     B -.->|"/db-p2p/repo/1.0.0"| C
-    E -.->|"/db-p2p/cluster/1.0.0"| G1
-    E -.->|"/db-p2p/cluster/1.0.0"| G2
-    E -.->|"/db-p2p/cluster/1.0.0"| G3
+    E -.->|"/optimystic/&lt;network&gt;/cluster/1.0.0"| G1
+    E -.->|"/optimystic/&lt;network&gt;/cluster/1.0.0"| G2
+    E -.->|"/optimystic/&lt;network&gt;/cluster/1.0.0"| G3
 ```
 
 ### Repo Layer: External Client Interface
@@ -203,7 +203,7 @@ Handles incoming consensus requests from coordinators:
 
 ```typescript
 class ClusterService implements Startable {
-  // Protocol: /db-p2p/cluster/1.0.0
+  // Protocol: /optimystic/<network>/cluster/1.0.0 (built from protocolPrefix)
   // Handles ClusterRecord updates for consensus
 }
 ```
@@ -319,8 +319,8 @@ The package integrates deeply with libp2p for networking:
 // Node creation with integrated services
 const node = await createLibp2pNode({
   services: {
-    repo: repoService({ protocol: '/db-p2p/repo/1.0.0' }),
-    cluster: clusterService({ protocol: '/db-p2p/cluster/1.0.0' })
+    repo: repoService({ protocolPrefix: '/optimystic/<network>' }),
+    cluster: clusterService({ protocolPrefix: '/optimystic/<network>' })
   }
 });
 

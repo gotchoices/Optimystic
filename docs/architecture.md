@@ -149,16 +149,16 @@ If PEND detects stale reads or a conflicting concurrent transaction, the coordin
 | Protocol | Who uses it | Purpose |
 |----------|-------------|---------|
 | `/db-p2p/repo/1.0.0` | External client ↔ coordinator node | Client-facing `IRepo` operations (`get`, `pend`, `commit`, `cancel`). |
-| `/db-p2p/cluster/1.0.0` | Coordinator ↔ cluster peers | Cluster-record exchange for 2-phase commit. |
+| `/{prefix}/cluster/1.0.0` | Coordinator ↔ cluster peers | Cluster-record exchange for 2-phase commit. |
 | `/{prefix}/dispute/1.0.0` | Dissenting member ↔ enlistees | Validity dispute escalation (opt-in, see below). |
 
 ```mermaid
 graph LR
     Client[Client Process] -->|/db-p2p/repo| Coord[Coordinator Node]
     Coord --> SR1[Local StorageRepo]
-    Coord -->|/db-p2p/cluster| P1[Cluster Peer 1]
-    Coord -->|/db-p2p/cluster| P2[Cluster Peer 2]
-    Coord -->|/db-p2p/cluster| P3[Cluster Peer N]
+    Coord -->|"/{prefix}/cluster"| P1[Cluster Peer 1]
+    Coord -->|"/{prefix}/cluster"| P2[Cluster Peer 2]
+    Coord -->|"/{prefix}/cluster"| P3[Cluster Peer N]
 ```
 
 ### Two-phase commit inside a cluster

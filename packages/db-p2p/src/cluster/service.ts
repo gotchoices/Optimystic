@@ -4,6 +4,7 @@ import { peerIdFromString } from '@libp2p/peer-id';
 import type { Startable, Logger, Stream, Connection, StreamHandler, PeerId } from '@libp2p/interface';
 import type { ICluster, ClusterRecord } from '@optimystic/db-core';
 import { encodePeers, type RedirectPayload } from '../repo/redirect.js';
+import { toClusterErrorEnvelope } from './cluster-error.js';
 import type { Uint8ArrayList } from 'uint8arraylist';
 
 interface BaseComponents {
@@ -162,24 +163,43 @@ export class ClusterService implements Startable {
 		this.running = false;
 	}
 
+	/**
+	 * Run a single decoded protocol message. An application-level throw
+	 * (validation / signature / merge / consensus failure inside `cluster.update`)
+	 * propagates to the caller, which turns it into a structured error envelope;
+	 * a redirect or a successful {@link ClusterRecord} is returned as-is.
+	 */
+	private async processOperation(message: { operation: string; record: ClusterRecord }): Promise<unknown> {
+		if (message.operation === 'update') {
+			// Scope consensus to responsible peers: redirect when we are not a
+			// member of the record's authoritative peer set, otherwise process.
+			const redirect = this.checkRedirect(message.record);
+			return redirect ?? await this.cluster.update(message.record);
+		}
+		throw new Error(`Unknown operation: ${message.operation}`);
+	}
+
 	private handleIncomingStream(stream: Stream, connection: Connection): void {
 		const peerId = connection.remotePeer;
 
 		const processStream = async function* (this: ClusterService, source: AsyncIterable<Uint8ArrayList>) {
 			for await (const msg of source) {
-				// Decode the message
+				// Decode the framing. A malformed/undecodable message is a transport
+				// fault handled by the outer abort path, not an application error.
 				const decoded = new TextDecoder().decode(msg.subarray());
 				const message = JSON.parse(decoded) as { operation: string; record: ClusterRecord };
 
-				// Process the operation
-				let response: any;
-				if (message.operation === 'update') {
-					// Scope consensus to responsible peers: redirect when we are not a
-					// member of the record's authoritative peer set, otherwise process.
-					const redirect = this.checkRedirect(message.record);
-					response = redirect ?? await this.cluster.update(message.record);
-				} else {
-					throw new Error(`Unknown operation: ${message.operation}`);
+				// Application-level processing: surface any throw to the coordinator as
+				// a structured error envelope (closing the stream normally) instead of
+				// aborting, so the real cause — not an opaque StreamResetError — reaches
+				// the coordinator, which already enables debug logging. The abort path
+				// is reserved for genuinely unrecoverable framing/transport faults.
+				let response: unknown;
+				try {
+					response = await this.processOperation(message);
+				} catch (err) {
+					this.log.error('error processing cluster %s from %p - %e', message.operation, peerId, err);
+					response = toClusterErrorEnvelope(err);
 				}
 
 				// Encode and yield the response

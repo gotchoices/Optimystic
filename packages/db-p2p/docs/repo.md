@@ -193,7 +193,7 @@ export type ClusterRecord = {
 - **Response**: JSON-encoded operation results
 
 #### Cluster Protocol
-- **Protocol ID**: `/db-p2p/cluster/1.0.0`
+- **Protocol ID**: `/optimystic/<network>/cluster/1.0.0` (built from `protocolPrefix`)
 - **Transport**: libp2p streams
 - **Message Type**: `ClusterRecord` updates
 - **Phases**: Promise collection → Commit execution

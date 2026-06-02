@@ -47,7 +47,8 @@ export class ClusterClient extends ProtocolClient implements ICluster {
     
     return this.processMessage<ClusterRecord>(
       message,
-      '/db-p2p/cluster/1.0.0'
+      // Built from protocolPrefix; never the bare /db-p2p form.
+      '/optimystic/<network>/cluster/1.0.0'
     );
   }
 }
@@ -73,14 +74,14 @@ The `ClusterService` implements a libp2p service that handles incoming cluster p
 - **Error Handling**: Manages protocol-level errors and logging
 
 **Protocol Details:**
-- **Protocol ID**: `/db-p2p/cluster/1.0.0` (configurable)
+- **Protocol ID**: `/optimystic/<network>/cluster/1.0.0` (built from `protocolPrefix`; override via `protocol`)
 - **Message Format**: JSON-encoded cluster operation messages
 - **Transport**: Length-prefixed streams over libp2p
 
 **Implementation:**
 ```typescript
 export class ClusterService implements Startable {
-  private readonly protocol: string = '/db-p2p/cluster/1.0.0';
+  private readonly protocol: string = '/optimystic/<network>/cluster/1.0.0';
   
   async start(): Promise<void> {
     await this.components.registrar.handle(
@@ -517,7 +518,7 @@ const clusterMember = new ClusterMember(
 
 // Create cluster service
 const clusterService = clusterService({
-  protocol: '/db-p2p/cluster/1.0.0',
+  protocolPrefix: '/optimystic/<network>',
   maxInboundStreams: 32
 });
 
