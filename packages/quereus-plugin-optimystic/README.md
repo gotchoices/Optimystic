@@ -105,6 +105,38 @@ COMMIT;
 
 Format: 16 bytes SHA-256(peer ID) + 16 random bytes, base64url encoded. Stable within a transaction, unique across transactions and peers.
 
+## Reactive Watching
+
+Tables backed by Optimystic drive Quereus's reactive watch API. When a commit
+lands on a collection's blocks — whether authored locally or replicated from a
+remote peer — the plugin translates it into a `Database.notifyExternalChange`
+call, so `Database.watch` / subscribe consumers fire through the normal reactive
+path. No polling required.
+
+```typescript
+const scope = db.prepare('select * from users where id = ?').getChangeScope([id]);
+const sub = db.watch(scope, (event) => {
+  // A (local or remote) commit touched `users` — re-query as needed.
+});
+// ...
+sub.unsubscribe();
+```
+
+Notes:
+
+- **Coarse, whole-table invalidation.** A remote commit fires watchers as a
+  global change for the whole table (it carries no row-level diff). `full` watches
+  fire with empty hits; `rows`/`rowsByGroup` watches surface their registered key
+  literals as possibly-changed. Over-firing only costs an extra re-query — it never
+  misses a change.
+- **Host requirement.** Only nodes that **host the collection's blocks** observe
+  these commits and push invalidations. Edge/client nodes that don't host blocks
+  receive no push and continue to fetch on demand.
+- **Transactor support.** Reactive watching works with the `network` transactor
+  (the hosting node's storage drives it) and the in-process `local`/`test`
+  transactors. `mesh-test` and custom transactors that don't implement
+  `IBlockChangeNotifier` degrade gracefully to non-reactive behaviour.
+
 ## Transaction Engine
 
 The package exports a `QuereusEngine` that implements `ITransactionEngine` from `@optimystic/db-core`. It re-executes SQL statements through Quereus for transaction validation, and computes schema hashes from the database catalog.

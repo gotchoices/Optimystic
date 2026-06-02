@@ -1,5 +1,5 @@
-import type { ITransactor, IKeyNetwork, CollectionId, PeerId, IRepo } from '@optimystic/db-core';
-import { Tree, NetworkTransactor } from '@optimystic/db-core';
+import type { ITransactor, IKeyNetwork, CollectionId, PeerId, IRepo, IBlockChangeNotifier, CollectionChangeListener } from '@optimystic/db-core';
+import { Tree, NetworkTransactor, isBlockChangeNotifier } from '@optimystic/db-core';
 import {
 	createLibp2pNode,
 	Libp2pKeyPeerNetwork,
@@ -17,7 +17,7 @@ import type { Libp2p } from '@libp2p/interface';
  */
 export class CollectionFactory {
   private transactors = new Map<string, ITransactor>();
-  private libp2pNodes = new Map<string, { node: Libp2p; coordinatedRepo: IRepo }>();
+  private libp2pNodes = new Map<string, { node: Libp2p; coordinatedRepo: IRepo; blockChangeNotifier?: IBlockChangeNotifier }>();
   private customTransactorCtors = new Map<string, new (...args: any[]) => ITransactor>();
   private customKeyNetworkCtors = new Map<string, new (...args: any[]) => IKeyNetwork>();
 
@@ -101,6 +101,37 @@ export class CollectionFactory {
   }
 
   /**
+   * Subscribe to per-collection change notifications for `collectionId` on the
+   * transactor resolved from `options`, keeping the network-vs-local resolution
+   * inside the factory (where transactor construction already lives).
+   *
+   * Feature-detects {@link IBlockChangeNotifier}: a transactor that doesn't
+   * implement it (e.g. a custom transactor, or an injected test mock) yields a
+   * logged no-op with an inert unsubscribe. The `network` and `mesh-test`
+   * transactors DO implement it (via {@link NetworkTransactor}) but no-op
+   * internally when they have no co-located `localChangeNotifier` — so reactive
+   * watching degrades gracefully to the consumer's existing fetch/poll behaviour
+   * either way.
+   *
+   * Returns a promise for the (idempotent) unsubscribe handle.
+   */
+  async subscribeToCollectionChanges(
+    options: ParsedOptimysticOptions,
+    collectionId: CollectionId,
+    listener: CollectionChangeListener
+  ): Promise<() => void> {
+    const transactor = await this.getOrCreateTransactor(options);
+    if (!isBlockChangeNotifier(transactor)) {
+      console.debug(
+        `[optimystic] transactor '${options.transactor}' does not support change notifications; ` +
+        `reactive watch is a no-op for collection '${collectionId}'`
+      );
+      return () => { };
+    }
+    return transactor.onCollectionChange(collectionId, listener);
+  }
+
+  /**
    * Create a network transactor
    */
   private async createNetworkTransactor(options: ParsedOptimysticOptions): Promise<ITransactor> {
@@ -130,11 +161,17 @@ export class CollectionFactory {
         throw new Error('Failed to get coordinatedRepo from libp2p node');
       }
 
-      nodeInfo = { node, coordinatedRepo };
+      // The hosting node exposes its StorageRepo as an IBlockChangeNotifier
+      // (libp2p-node-base sets `node.blockChangeNotifier = storageRepo`). Feed it
+      // to the transactor so reactive consumers can observe commits that land on
+      // this node's storage. Absent on nodes that don't host collection blocks.
+      const blockChangeNotifier = (node as any).blockChangeNotifier as IBlockChangeNotifier | undefined;
+
+      nodeInfo = { node, coordinatedRepo, blockChangeNotifier };
       this.libp2pNodes.set(nodeKey, nodeInfo);
     }
 
-    const { node, coordinatedRepo } = nodeInfo;
+    const { node, coordinatedRepo, blockChangeNotifier } = nodeInfo;
 
     const keyNetwork = this.resolveKeyNetwork(options.keyNetwork, node);
     const protocolPrefix = `/optimystic/${options.libp2pOptions?.networkName ?? 'optimystic'}`;
@@ -154,6 +191,7 @@ export class CollectionFactory {
       dialTimeoutMs: 3_000,
       keyNetwork,
       getRepo,
+      localChangeNotifier: blockChangeNotifier,
     });
   }
 
@@ -166,8 +204,11 @@ export class CollectionFactory {
     const rawStorage = options.rawStorageFactory?.() ?? new MemoryRawStorage();
     const storageRepo = new StorageRepo((blockId: string) => new BlockStorage(blockId, rawStorage));
 
-    // LocalTransactor implementation (simple wrapper around StorageRepo)
-    return {
+    // LocalTransactor implementation (simple wrapper around StorageRepo).
+    // Also implements IBlockChangeNotifier by delegating to the StorageRepo —
+    // the same instance that emits commit notifications — so single-process,
+    // multi-collection scenarios are reactive without libp2p.
+    const transactor: ITransactor & IBlockChangeNotifier = {
       async get(blockGets) {
         return await storageRepo.get(blockGets);
       },
@@ -183,7 +224,9 @@ export class CollectionFactory {
       async cancel(trxRef) {
         return await storageRepo.cancel(trxRef);
       },
-    } as ITransactor;
+      onCollectionChange: storageRepo.onCollectionChange.bind(storageRepo),
+    };
+    return transactor;
   }
 
   /**
@@ -194,8 +237,10 @@ export class CollectionFactory {
 
     const storageRepo = new StorageRepo((blockId) => new BlockStorage(blockId, memoryStorage));
 
-    // Simple local transactor that wraps StorageRepo
-    return {
+    // Simple local transactor that wraps StorageRepo; also an IBlockChangeNotifier
+    // (delegating to the StorageRepo) so plugin-level reactive-watch specs can
+    // observe commit notifications without libp2p.
+    const transactor: ITransactor & IBlockChangeNotifier = {
       async get(blockGets) {
         return await storageRepo.get(blockGets);
       },
@@ -211,7 +256,9 @@ export class CollectionFactory {
       async cancel(trxRef) {
         return await storageRepo.cancel(trxRef);
       },
-    } as ITransactor;
+      onCollectionChange: storageRepo.onCollectionChange.bind(storageRepo),
+    };
+    return transactor;
   }
 
   /**
@@ -219,6 +266,13 @@ export class CollectionFactory {
    * CoordinatorRepo + NetworkTransactor) over a 1-node mock mesh. Used by
    * plugin-level specs that want to exercise the full transactor→repo
    * contract without spinning up real libp2p.
+   *
+   * NOTE: change notifications are NOT wired for `mesh-test`. `buildNetworkTransactor`
+   * does not pass a `localChangeNotifier`, so the resulting `NetworkTransactor`
+   * feature-detects as a notifier but its `onCollectionChange` is an inert no-op
+   * (reactive watch silently degrades to fetch/poll). Wiring it would mean
+   * threading the mesh's per-node StorageRepo through the testing harness; left
+   * unsupported pending a demonstrated need.
    */
   private async createMeshTestTransactor(): Promise<ITransactor> {
     const mesh = await createMesh(1, {
@@ -280,6 +334,18 @@ export class CollectionFactory {
       return path as unknown as CollectionId;
     }
     return uri as unknown as CollectionId;
+  }
+
+  /**
+   * Canonical collection id for an options set. This is the same id used as the
+   * collection's header block id and stamped on every block's
+   * `header.collectionId` (see {@link TransactorSource.createBlockHeader}), so it
+   * is exactly the {@link CollectionChangeEvent.collectionId} value emitted when
+   * the collection's blocks commit. Use this for both subscription matching and
+   * for asserting against emitted events.
+   */
+  getCollectionId(options: ParsedOptimysticOptions): CollectionId {
+    return this.parseCollectionId(options.collectionUri);
   }
 
   /**

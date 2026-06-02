@@ -60,6 +60,54 @@ StorageRepo.commit()                       # critical section (block locks held)
   read, and blocks that landed in a *failed* partial multi-block commit (the
   successful retry treats them as `alreadyDone`), emit no event.
 
+#### Reactive Watch Bridge (Quereus vtab)
+
+The `quereus-plugin-optimystic` virtual table bridges these notifications to
+Quereus's reactive watch API, so a (remote or local) commit wakes
+`Database.watch` / subscribe consumers without polling:
+
+```
+StorageRepo.commit → CollectionChangeEvent → transactor.onCollectionChange
+  → OptimysticVirtualTable listener → Database.notifyExternalChange(table)
+    → Quereus watchers fire (coarse, whole-table invalidation)
+```
+
+- **Transactor wiring.** `CollectionFactory` feeds the notifier into each
+  transactor: the `network` transactor receives `node.blockChangeNotifier` as
+  `localChangeNotifier`; the `local`/`test` transactors are themselves
+  `IBlockChangeNotifier`s delegating to their `StorageRepo`. `mesh-test` is
+  unwired (its `NetworkTransactor` gets no `localChangeNotifier`, so the
+  subscription is an inert no-op). A transactor that can't observe local commits
+  degrades gracefully — the consumer keeps fetching/polling.
+- **Subscription identity.** The vtab subscribes to exactly one collection id —
+  `CollectionFactory.getCollectionId(options)` = `parseCollectionId(collectionUri)`
+  = the URI path (`tree://app/users` → `app/users`). This equals the
+  `header.collectionId` stamped on every block (`TransactorSource.createBlockHeader`)
+  and therefore the `CollectionChangeEvent.collectionId`. Index sub-collections
+  (`<uri>/index/<name>`) carry their own ids and are NOT separately watched —
+  whole-table invalidation re-queries them anyway. The schema tree
+  (`tree://optimystic/schema`) is skipped (schema writes aren't data-watch events).
+- **Coarse invalidation.** `notifyExternalChange` fires every matching watcher as
+  a global whole-table change: `full` watches fire with empty hits, `rows`/
+  `rowsByGroup` watches surface their registered literals as possibly-changed.
+  Over-firing only costs an extra re-query; it never misses a change.
+- **Redundant self-wakeup (accepted in v1).** On a node that BOTH hosts AND
+  authors a write, the local Quereus commit fires watchers precisely (tuple-level)
+  via the normal post-commit path AND the storage funnel fires a coarse
+  `notifyExternalChange`. The second is redundant but harmless. v1 does not attempt
+  author-suppression; a future refinement could tag events with the authoring
+  peer/actionId and let the vtab skip events it just authored.
+- **Lifetime.** The subscription is established once after table init and released
+  in `OptimysticModule.destroy` (DROP TABLE). It is deliberately NOT released in
+  the per-statement `disconnect()` (a no-op that keeps the table initialized across
+  statements) — doing so would kill reactivity after the first scan. Closing a
+  `Database` without dropping its tables leaves the storage listener attached until
+  the `CollectionFactory` is GC'd; its dispatch becomes a logged no-op once the
+  `Database` is closed.
+- **Host requirement.** Only nodes that host the collection's blocks observe these
+  commits. Edge/client nodes that don't host blocks receive no push subscription
+  and still fetch/poll.
+
 ## Mutation Contracts
 
 ### Functions That MUTATE In-Place

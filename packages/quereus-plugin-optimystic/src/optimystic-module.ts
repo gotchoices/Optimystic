@@ -14,6 +14,7 @@ import { VirtualTable } from '@quereus/quereus';
 import type { VirtualTableModule, BaseModuleConfig, Database, TableSchema, Row, FilterInfo, BestAccessPlanRequest, BestAccessPlanResult, OrderingSpec, VirtualTableConnection, TableIndexSchema as IndexSchema, UpdateArgs, UpdateResult, SqlValue } from '@quereus/quereus';
 import { Tree } from '@optimystic/db-core';
 import { KeyRange } from '@optimystic/db-core';
+import type { CollectionChangeEvent } from '@optimystic/db-core';
 import { SchemaManager } from './schema/schema-manager.js';
 import type { StoredTableSchema } from './schema/schema-manager.js';
 import { RowCodec, type EncodedRow } from './schema/row-codec.js';
@@ -99,6 +100,10 @@ export class OptimysticVirtualTable extends VirtualTable {
   private indexManager?: IndexManager;
   private statisticsCollector?: StatisticsCollector;
   private connection?: OptimysticVirtualTableConnection;
+  /** Unsubscribe handle for the collection-change → watch bridge (set once after init). */
+  private changeUnsubscribe?: () => void;
+  /** Subscribe-once guard for the collection-change bridge across repeated initialize()/connect(). */
+  private changeSubscribed = false;
   public tableSchema: TableSchema; // Changed from private to public to match base class
 
   constructor(
@@ -247,6 +252,11 @@ export class OptimysticVirtualTable extends VirtualTable {
       this.statisticsCollector = new StatisticsCollector(storedSchema);
 
       this.isInitialized = true;
+
+      // Bridge optimystic collection-change notifications to Quereus watch
+      // invalidation so reactive consumers wake on commits without polling.
+      // Self-isolating: a wiring failure here never blocks initialization.
+      await this.ensureChangeSubscription();
     } catch (error) {
       const message = `Failed to initialize Optimystic table: ${error instanceof Error ? error.message : String(error)}`;
       this.setErrorMessage(message);
@@ -255,9 +265,104 @@ export class OptimysticVirtualTable extends VirtualTable {
   }
 
   /**
+   * Subscribe (once) to optimystic collection-change notifications for this
+   * table's collection and translate each into a coarse, whole-table Quereus
+   * watch invalidation. Idempotent across repeated initialize()/connect();
+   * failures are logged and swallowed so a missing/unsupported notifier never
+   * blocks the table.
+   *
+   * Scope decisions:
+   *   - Only the MAIN-table collection is watched. Index sub-collections
+   *     (`<uri>/index/<name>`) mutate under the same actionId but carry their
+   *     own collection id; whole-table invalidation re-queries them anyway.
+   *   - The plugin-global schema tree (`tree://optimystic/schema`) is skipped —
+   *     schema writes are not data-watch events.
+   */
+  private async ensureChangeSubscription(): Promise<void> {
+    if (this.changeSubscribed) {
+      return;
+    }
+    if (this.options.collectionUri === 'tree://optimystic/schema') {
+      return;
+    }
+    // Set the guard before awaiting so a concurrent initialize() cannot
+    // double-subscribe; reset it on failure to allow a later retry.
+    this.changeSubscribed = true;
+    try {
+      const collectionId = this.collectionFactory.getCollectionId(this.options);
+      this.changeUnsubscribe = await this.collectionFactory.subscribeToCollectionChanges(
+        this.options,
+        collectionId,
+        (event) => this.handleCollectionChange(event)
+      );
+    } catch (error) {
+      this.changeSubscribed = false;
+      console.warn(
+        `[optimystic] failed to subscribe '${this.tableName}' to collection changes: ` +
+        `${error instanceof Error ? error.message : String(error)}`
+      );
+    }
+  }
+
+  /**
+   * Translate a collection-change event into a coarse whole-table Quereus watch
+   * invalidation. Errors are isolated and logged — a watch-dispatch failure must
+   * not propagate into the synchronous storage commit callback that invoked this
+   * listener (the StorageRepo already isolates throwing listeners; this is a
+   * second line of defence and, critically, prevents an unhandled rejection from
+   * the async notifyExternalChange).
+   */
+  private handleCollectionChange(_event: CollectionChangeEvent): void {
+    try {
+      const result = this.db.notifyExternalChange(this.tableName, this.schemaName);
+      if (result && typeof (result as Promise<void>).catch === 'function') {
+        (result as Promise<void>).catch((error: unknown) => {
+          console.warn(
+            `[optimystic] notifyExternalChange failed for '${this.tableName}': ` +
+            `${error instanceof Error ? error.message : String(error)}`
+          );
+        });
+      }
+    } catch (error) {
+      console.warn(
+        `[optimystic] notifyExternalChange threw for '${this.tableName}': ` +
+        `${error instanceof Error ? error.message : String(error)}`
+      );
+    }
+  }
+
+  /**
+   * Tear down the collection-change subscription (idempotent). Called from
+   * OptimysticModule.destroy (DROP TABLE / module teardown).
+   *
+   * Deliberately NOT called from disconnect(): in this vtab, disconnect() is a
+   * per-statement no-op that intentionally keeps the table initialized across
+   * statements (see disconnect()). Unsubscribing there would silently kill
+   * reactivity after the first scan. The storage listener therefore lives for
+   * the table's lifetime and is released on destroy.
+   */
+  teardownChangeSubscription(): void {
+    if (this.changeUnsubscribe) {
+      try {
+        this.changeUnsubscribe();
+      } catch (error) {
+        console.warn(
+          `[optimystic] error tearing down change subscription for '${this.tableName}': ` +
+          `${error instanceof Error ? error.message : String(error)}`
+        );
+      }
+      this.changeUnsubscribe = undefined;
+    }
+    this.changeSubscribed = false;
+  }
+
+  /**
    * Disconnects from this virtual table connection instance
    * Note: We don't reset isInitialized or collection here because the table
-   * should remain initialized across multiple statements/connections
+   * should remain initialized across multiple statements/connections. For the
+   * same reason we do NOT release the collection-change subscription here — it
+   * is owned for the table's lifetime and torn down in destroy() (see
+   * teardownChangeSubscription).
    */
   async disconnect(): Promise<void> {
     // Don't reset state - the table should remain initialized
@@ -1297,6 +1402,9 @@ export class OptimysticModule implements VirtualTableModule<OptimysticVirtualTab
     const tableKey = `${schemaName}.${tableName}`.toLowerCase();
     const table = this.tables.get(tableKey);
     if (table) {
+      // Release the collection-change → watch bridge before forgetting the table
+      // so the storage listener doesn't leak past the table's lifetime.
+      table.teardownChangeSubscription();
       try {
         const txnState = (table as any).txnBridge?.getCurrentTransaction?.();
         await (table as any).schemaManager.deleteSchema(tableName, txnState?.transactor);
