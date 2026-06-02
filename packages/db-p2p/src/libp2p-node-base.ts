@@ -238,15 +238,26 @@ export async function createLibp2pNodeBase(
 			cluster: (components: any) => {
 				const serviceFactory = clusterService({
 					protocolPrefix: `/optimystic/${options.networkName}`,
-					configuredClusterSize: options.clusterSize ?? 10,
-					allowClusterDownsize: options.clusterPolicy?.allowDownsize ?? true,
-					clusterSizeTolerance: options.clusterPolicy?.sizeTolerance ?? 0.5,
 					responsibilityK: options.responsibilityK ?? 1
 				});
 				return serviceFactory({
 					logger: components.logger,
 					registrar: components.registrar,
-					cluster: clusterProxy
+					cluster: clusterProxy,
+					// Identity for membership scoping on the update path. peerId is a core
+					// libp2p component, available at service-construction time.
+					peerId: components.peerId,
+					// Fallback addr resolver for redirect targets whose multiaddrs are not
+					// already embedded in record.peers.
+					getConnectionAddrs: (peerId: any) => {
+						const conns = components.libp2p?.getConnections?.(peerId) ?? [];
+						const addrs: string[] = [];
+						for (const c of conns) {
+							const addr = c.remoteAddr?.toString?.();
+							if (addr) addrs.push(addr);
+						}
+						return addrs;
+					}
 				});
 			},
 
@@ -255,6 +266,15 @@ export async function createLibp2pNodeBase(
 					protocolPrefix: `/optimystic/${options.networkName}`,
 					responsibilityK: options.responsibilityK ?? 1
 				});
+				// NOTE: peerId/networkManager are intentionally NOT forwarded here, so
+				// RepoService.checkRedirect stays inert (getNetworkManager() → undefined
+				// → no redirect). Un-inerting it is deferred: RepoService.checkRedirect
+				// derives the responsible set via getCluster(sha256(blockKey)), which adds
+				// an extra sha256 step versus the coordinator's findCluster(encode(blockId))
+				// (raw bytes, no sha256). Activating it without first reconciling that
+				// key-derivation divergence risks redirecting requests the coordinator
+				// legitimately routed here — the same "empty promises" class of regression
+				// this ticket's cluster-path fix avoids by trusting record.peers.
 				return serviceFactory({
 					logger: components.logger,
 					registrar: components.registrar,
