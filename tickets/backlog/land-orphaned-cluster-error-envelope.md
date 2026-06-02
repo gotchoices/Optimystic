@@ -25,6 +25,13 @@ This is related to the cluster protocol / `optimystic-cluster-membership-check` 
 - If it was already swept into the DCUtR/AutoNAT commit by the runner, split it back out into its own commit.
 - Confirm the feature is intentional and complete: structured-error round-trip on the cluster `update` path (service serializes → client deserializes and rethrows with original message/name/code), and the `docs/architecture.md` protocol-prefix rename is consistent with the actual `protocolPrefix` used in `cluster/service.ts`.
 - Add/confirm test coverage for the envelope round-trip (error thrown server-side surfaces as a typed `Error` with the original message on the coordinator, not a `StreamResetError`), since the loose work did not arrive with an obvious dedicated spec.
+- **Document the envelope wire contract in `packages/db-p2p/docs/cluster.md`.** The "Error Handling and Monitoring → Error Conditions" section (~line 585) documents *which* errors are thrown but not *how they now propagate over the protocol*. Add that a member that throws while processing an `update` serializes the error into a structured `__clusterError` envelope and **closes the stream normally** (no longer `stream.abort`), and that the coordinator's `ClusterClient` rethrows the original `Error` preserving `name`/`code`. This is the new wire reality and is currently undocumented.
+
+## Status as of 2026-06-02 (sereus review of `web-e2e-tier2-cluster-tx-error-surface`)
+
+- The work **was** swept into commit `ba4a0df` (`ticket(review): enable-dcutr-autonat-in-libp2p-node-base`) — requirement #2 ("split it back out into its own commit") is the live action item. `cluster-error.ts`, `service.ts`, `client.ts`, and the doc protocol-prefix rename are all in that commit.
+- Test coverage **has** landed: `packages/db-p2p/test/cluster-error-propagation.spec.ts` (8 tests) covers the helper round-trip, the service producing an envelope and closing (not aborting) on a throwing `update`, and the client rethrowing. Full `db-p2p` suite green (496 passing / 8 pending / 0 failing). Requirement #4 is satisfied; verify it survives the re-attribution split.
+- The legacy `/db-p2p/cluster/1.0.0` second-dial fallback was removed from `client.ts`. Verified safe: `libp2p-node-base.ts` registers the service and dials the client under the same `/optimystic/<network>` prefix, so the bare protocol is never registered. No `ERR_PROTOCOL_SELECTION_FAILED` can originate from a cluster update anymore.
 
 ## Notes
 

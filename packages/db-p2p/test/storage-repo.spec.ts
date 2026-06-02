@@ -735,6 +735,40 @@ describe('StorageRepo', () => {
 			expect(events.length).to.equal(1);
 		});
 
+		it('aggregates a multi-block same-action get()-promotion into one event (Path 1, emitPromotions grouping)', async () => {
+			const events: CollectionChangeEvent[] = [];
+			repo.onCollectionChange('collection-1' as BlockId, (e) => events.push(e));
+
+			// One action inserts two blocks in the same collection, pended but never
+			// driven through commit(). A single get() with context proving the action
+			// committed promotes BOTH blocks — exercising emitPromotions' grouping of
+			// multiple promotions sharing one (actionId, rev) into a single event.
+			const transforms: Transforms = {
+				inserts: {
+					'block-1': makeBlock('block-1', { items: ['a'] }),
+					'block-2': makeBlock('block-2', { items: ['b'] })
+				},
+				updates: {},
+				deletes: []
+			};
+			await repo.pend({ actionId: 'a1' as ActionId, transforms, policy: 'c' });
+
+			const result = await repo.get({
+				blockIds: ['block-1' as BlockId, 'block-2' as BlockId],
+				context: { committed: [{ actionId: 'a1' as ActionId, rev: 1 }], rev: 1 }
+			});
+
+			expect(result['block-1']?.block).to.not.equal(undefined);
+			expect(result['block-2']?.block).to.not.equal(undefined);
+
+			// Exactly ONE event — both blocks grouped under the single (a1, rev:1) key.
+			expect(events.length).to.equal(1);
+			expect(events[0]!.collectionId).to.equal('collection-1');
+			expect(events[0]!.blockIds.slice().sort()).to.deep.equal(['block-1', 'block-2']);
+			expect(events[0]!.actionId).to.equal('a1');
+			expect(events[0]!.rev).to.equal(1);
+		});
+
 		it('emits per durable landing across a failed partial commit and its successful retry (Path 2)', async () => {
 			// Wrap block-2's storage so its saveRevision throws exactly once across the
 			// whole test, forcing a REAL mid-loop internalCommit throw (the existing
