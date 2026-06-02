@@ -3,6 +3,8 @@ import { noise } from '@chainsafe/libp2p-noise';
 import { yamux } from '@chainsafe/libp2p-yamux';
 import { identify } from '@libp2p/identify';
 import { ping } from '@libp2p/ping';
+import { dcutr } from '@libp2p/dcutr';
+import { autoNAT } from '@libp2p/autonat';
 import { gossipsub } from '@chainsafe/libp2p-gossipsub';
 import { bootstrap } from '@libp2p/bootstrap';
 import { circuitRelayServer, type CircuitRelayServerInit } from '@libp2p/circuit-relay-v2';
@@ -230,6 +232,13 @@ export async function createLibp2pNodeBase(
 				protocolPrefix: `/optimystic/${options.networkName}`
 			}),
 			ping: ping(),
+			// DCUtR (hole-punch) upgrades relayed node↔node connections to direct
+			// ones; AutoNAT learns this node's public reachability via peer dial-back.
+			// Both are always-on and depend on `identify` above. They are inert where
+			// the transport can't hole-punch or dial back (e.g. browser/WS-only), which
+			// is acceptable — they neither throw nor break the build in that case.
+			dcutr: dcutr(),
+			autoNAT: autoNAT(),
 			pubsub: gossipsub({
 				allowPublishToZeroTopicPeers: true,
 				heartbeatInterval: 7000
