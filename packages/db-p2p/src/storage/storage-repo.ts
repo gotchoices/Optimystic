@@ -1,7 +1,7 @@
 import type {
 	IRepo, MessageOptions, BlockId, CommitRequest, CommitResult, GetBlockResults, PendRequest, PendResult, ActionBlocks,
 	ActionId, BlockGets, ActionPending, PendSuccess, ActionTransform, ActionTransforms,
-	GetBlockResult,
+	GetBlockResult, IBlock, ActionRev,
 	PendValidationHook,
 	CollectionId, IBlockChangeNotifier, CollectionChangeListener, CollectionChangeEvent
 } from "@optimystic/db-core";
@@ -11,6 +11,7 @@ import {
 } from "@optimystic/db-core";
 import { asyncIteratorToArray } from "../it-utility.js";
 import type { IBlockStorage } from "./i-block-storage.js";
+import type { IBlockReplicaStore } from "../cluster/block-transfer-service.js";
 import { createLogger } from "../logger.js";
 
 const log = createLogger('storage-repo');
@@ -20,7 +21,7 @@ export type StorageRepoOptions = {
 	validatePend?: PendValidationHook;
 };
 
-export class StorageRepo implements IRepo, IBlockChangeNotifier {
+export class StorageRepo implements IRepo, IBlockChangeNotifier, IBlockReplicaStore {
 	private readonly validatePend?: PendValidationHook;
 	/** Per-collection change listeners; empty sets are pruned on unsubscribe. */
 	private readonly changeListeners = new Map<CollectionId, Set<CollectionChangeListener>>();
@@ -366,6 +367,18 @@ export class StorageRepo implements IRepo, IBlockChangeNotifier {
 		log('recoverBlock blockId=%s', blockId);
 		const storage = this.createBlockStorage(blockId);
 		await storage.recover();
+	}
+
+	/**
+	 * Persist a replica of a block received out-of-band (churn re-replication) into
+	 * local storage. Distinct from the {@link IRepo} commit funnel: the block arrives
+	 * already materialized from a departing owner, not as a pend/commit. See
+	 * {@link IBlockStorage.saveReplica} for the durability/monotonicity contract.
+	 */
+	async saveReplicatedBlock(blockId: BlockId, block: IBlock, source?: ActionRev): Promise<void> {
+		log('saveReplicatedBlock blockId=%s rev=%s', blockId, source?.rev);
+		const storage = this.createBlockStorage(blockId);
+		await storage.saveReplica(block, source);
 	}
 
 	private async internalCommit(blockId: BlockId, actionId: ActionId, rev: number, storage: IBlockStorage): Promise<CollectionId | undefined> {

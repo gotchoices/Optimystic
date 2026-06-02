@@ -39,6 +39,9 @@ class MockRepo implements IRepo {
 		return { success: true };
 	}
 	async cancel(_actionRef: ActionBlocks): Promise<void> {}
+	async saveReplicatedBlock(blockId: string, block: IBlock): Promise<void> {
+		this.blocks.set(blockId, block);
+	}
 }
 
 class MockRestorationCoordinator {

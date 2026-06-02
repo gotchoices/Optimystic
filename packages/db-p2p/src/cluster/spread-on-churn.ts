@@ -203,6 +203,13 @@ export class SpreadOnChurnMonitor implements Startable {
 
 			const blockData = textEncoder.encode(JSON.stringify(blockResult.block))
 
+			// Carry the source's revision metadata so the replica's `latest` matches the
+			// source instead of being fabricated as rev 1 on the receiver.
+			const latest = blockResult.state?.latest
+			const blockMeta = latest
+				? { [blockId]: { rev: latest.rev, actionId: latest.actionId } }
+				: undefined
+
 			// Push to each target
 			const succeeded: string[] = []
 			const failed: string[] = []
@@ -215,7 +222,7 @@ export class SpreadOnChurnMonitor implements Startable {
 						this.deps.peerNetwork,
 						this.deps.protocolPrefix
 					)
-					await client.pushBlocks([blockId], [blockData], 'replication')
+					await client.pushBlocks([blockId], [blockData], 'replication', blockMeta)
 					succeeded.push(targetId)
 					log('push:ok block=%s target=%s', blockId, targetId)
 				} catch (err) {

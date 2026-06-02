@@ -10,6 +10,7 @@ import { peerIdFromString } from '@libp2p/peer-id';
 import { generateKeyPair } from '@libp2p/crypto/keys';
 import type { ConnectionGater, PrivateKey } from '@libp2p/interface';
 import { clusterService } from './cluster/service.js';
+import { blockTransferService } from './cluster/block-transfer-service.js';
 import { repoService } from './repo/service.js';
 import { StorageRepo } from './storage/storage-repo.js';
 import { BlockStorage } from './storage/block-storage.js';
@@ -269,6 +270,19 @@ export async function createLibp2pNodeBase(
 					logger: components.logger,
 					registrar: components.registrar,
 					repo: repoProxy
+				});
+			},
+
+			// Block-transfer protocol handler for churn re-replication. Wired to the
+			// *local* storageRepo (not repoProxy): a pushed replica must land in this
+			// node's own storage, not be re-routed through the cluster-coordinated repo.
+			blockTransfer: (components: any) => {
+				const serviceFactory = blockTransferService({
+					protocolPrefix: `/optimystic/${options.networkName}`
+				});
+				return serviceFactory({
+					registrar: components.registrar,
+					repo: storageRepo
 				});
 			},
 

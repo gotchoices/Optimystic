@@ -1,5 +1,5 @@
 import type { Startable, Stream } from '@libp2p/interface';
-import type { IRepo, PeerId, IPeerNetwork } from '@optimystic/db-core';
+import type { IRepo, PeerId, IPeerNetwork, ActionId, ActionRev, IBlock, BlockId } from '@optimystic/db-core';
 import { pipe } from 'it-pipe';
 import * as lp from 'it-length-prefixed';
 import { fromString as u8FromString } from 'uint8arrays/from-string';
@@ -25,6 +25,13 @@ export interface BlockTransferRequest {
 	reason: 'rebalance' | 'replication' | 'recovery';
 	/** For push: base64-encoded block data per block ID */
 	blockData?: Record<string, string>;
+	/**
+	 * For push: the source's revision metadata per block ID. Carries the sender's
+	 * `state.latest` so the replica's `latest` matches the source instead of being
+	 * fabricated. Optional: an older sender omits it and the receiver falls back to a
+	 * deterministic rev-1 replica (see {@link IBlockStorage.saveReplica}).
+	 */
+	blockMeta?: Record<string, { rev: number; actionId: ActionId }>;
 }
 
 /** Response with block data */
@@ -37,13 +44,29 @@ export interface BlockTransferResponse {
 
 // --- Service (server-side handler) ---
 
+/**
+ * Repo capability the service needs: read access for `handlePull` plus a local
+ * "save replica" path for `handlePush`. The replica path must land in the node's
+ * *local* storage (not the cluster-coordinated repo), so it is a distinct method
+ * from the `IRepo` commit funnel. `StorageRepo` implements this.
+ */
+export interface IBlockReplicaStore extends IRepo {
+	/**
+	 * Persist a replica of a block received out-of-band (churn re-replication).
+	 * Seeds metadata if absent, advances `latest` monotonically, and makes the block
+	 * durably servable via `get`. Idempotent for a fixed `(rev, actionId)`; a no-op
+	 * (still durable) when an equal-or-newer revision is already present.
+	 */
+	saveReplicatedBlock(blockId: BlockId, block: IBlock, source?: ActionRev): Promise<void>;
+}
+
 export interface BlockTransferServiceInit {
 	protocolPrefix?: string;
 }
 
 export interface BlockTransferServiceComponents {
 	registrar: { handle: (...args: any[]) => Promise<void>; unhandle: (...args: any[]) => Promise<void> };
-	repo: IRepo;
+	repo: IBlockReplicaStore;
 }
 
 /**
@@ -55,7 +78,7 @@ export interface BlockTransferServiceComponents {
 export class BlockTransferService implements Startable {
 	private running = false;
 	private readonly protocol: string;
-	private readonly repo: IRepo;
+	private readonly repo: IBlockReplicaStore;
 	private readonly registrar: BlockTransferServiceComponents['registrar'];
 
 	constructor(
@@ -127,9 +150,12 @@ export class BlockTransferService implements Startable {
 		return { blocks, missing };
 	}
 
-	// TODO: handlePush validates incoming block data but does not persist it.
-	// The pushed data is a serialized IBlock, not a full BlockArchive with revisions.
-	// Persistence should be wired when RebalanceMonitor integrates with BlockStorage.saveRestored().
+	/**
+	 * Persist pushed blocks into local storage so the new owner holds a durable
+	 * replica after churn. A block is reported `accepted` only if it was both
+	 * received (parseable) AND successfully persisted; a parse or persist failure
+	 * surfaces it as `missing` so the sender does not falsely treat it as replicated.
+	 */
 	private async handlePush(request: BlockTransferRequest): Promise<BlockTransferResponse> {
 		const blocks: Record<string, string> = {};
 		const missing: string[] = [];
@@ -138,21 +164,29 @@ export class BlockTransferService implements Startable {
 			return { blocks: {}, missing: request.blockIds };
 		}
 
-		// Accept pushed blocks — for each block, validate we received parseable data
 		for (const blockId of request.blockIds) {
 			const data = request.blockData[blockId];
-			if (data) {
-				// Verify we received valid data
-				try {
-					JSON.parse(Buffer.from(data, 'base64').toString('utf8'));
-					// TODO: emit CollectionChangeEvent here once replicas persist
-					// (saveReplicatedBlock). This is a distinct landing path from the
-					// StorageRepo commit funnel, so it must originate its own event.
-					blocks[blockId] = data;
-				} catch {
-					missing.push(blockId);
-				}
-			} else {
+			if (!data) {
+				missing.push(blockId);
+				continue;
+			}
+
+			// Decode + parse the wire payload into an IBlock.
+			let block: IBlock;
+			try {
+				block = JSON.parse(Buffer.from(data, 'base64').toString('utf8')) as IBlock;
+			} catch {
+				missing.push(blockId);
+				continue;
+			}
+
+			// Persist locally. Only a received-AND-persisted block is reported accepted.
+			try {
+				const source = request.blockMeta?.[blockId];
+				await this.repo.saveReplicatedBlock(blockId, block, source);
+				blocks[blockId] = data;
+			} catch (error) {
+				log('persist:fail block=%s err=%s', blockId, (error as Error).message);
 				missing.push(blockId);
 			}
 		}
@@ -218,17 +252,24 @@ export class BlockTransferClient extends ProtocolClient {
 		return await this.processMessage<BlockTransferResponse>(request, this.protocol);
 	}
 
-	/** Push blocks to the remote peer. */
+	/**
+	 * Push blocks to the remote peer.
+	 *
+	 * @param blockMeta Optional per-block source revision metadata (the sender's
+	 *   `state.latest`). When provided, the receiver replicates at the source's
+	 *   `(rev, actionId)`; when omitted, it falls back to a deterministic rev-1 replica.
+	 */
 	async pushBlocks(
 		blockIds: string[],
 		blockDataBuffers: Uint8Array[],
-		reason: BlockTransferRequest['reason'] = 'rebalance'
+		reason: BlockTransferRequest['reason'] = 'rebalance',
+		blockMeta?: Record<string, { rev: number; actionId: ActionId }>
 	): Promise<BlockTransferResponse> {
 		const blockData: Record<string, string> = {};
 		for (let i = 0; i < blockIds.length; i++) {
 			blockData[blockIds[i]!] = Buffer.from(blockDataBuffers[i]!).toString('base64');
 		}
-		const request: BlockTransferRequest = { type: 'push', blockIds, reason, blockData };
+		const request: BlockTransferRequest = { type: 'push', blockIds, reason, blockData, ...(blockMeta ? { blockMeta } : {}) };
 		return await this.processMessage<BlockTransferResponse>(request, this.protocol);
 	}
 }

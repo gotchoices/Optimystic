@@ -1,5 +1,5 @@
 import type { BlockId, IBlock, Transform, ActionId, ActionRev } from "@optimystic/db-core";
-import { Latches, applyTransform } from "@optimystic/db-core";
+import { Latches, applyTransform, hashString } from "@optimystic/db-core";
 import type { BlockArchive, BlockMetadata, RestoreCallback, RevisionRange } from "./struct.js";
 import type { IRawStorage } from "./i-raw-storage.js";
 import { mergeRanges } from "./helpers.js";
@@ -121,6 +121,58 @@ export class BlockStorage implements IBlockStorage {
 		}
 
 		return { reconciled: false, latest: meta.latest };
+	}
+
+	async saveReplica(block: IBlock, source?: ActionRev): Promise<ActionRev> {
+		const rev = source?.rev ?? 1;
+		// Deterministic fallback id when the sender carried no revision metadata, so a
+		// re-push of the same block resolves to the same (rev, actionId) and stays
+		// idempotent. Never random/time-based — that would mint a new revision per retry.
+		const actionId = source?.actionId ?? await hashString(`${this.blockId}:${JSON.stringify(block)}`);
+
+		// Serialize the read-modify-write on this block's metadata (mirrors ensureRevision).
+		const lockId = `BlockStorage.saveReplica:${this.blockId}`;
+		const release = await Latches.acquire(lockId);
+		try {
+			let meta = await this.storage.getMetadata(this.blockId);
+
+			// Monotonic guard: an equal-or-newer revision is already held. The block is
+			// durably present; do not downgrade `latest` or rewrite the metadata.
+			if (meta?.latest && meta.latest.rev >= rev) {
+				log('replica:skip blockId=%s rev=%d held=%d', this.blockId, rev, meta.latest.rev);
+				return meta.latest;
+			}
+
+			// Write rev → actionId, the action transform, and the materialized block.
+			// `{ insert: block }` satisfies saveRestored's write invariants; on the serving
+			// path materializeBlock returns the materialized block directly (single rev), so
+			// this transform is never applied — see ticket notes.
+			const archive: BlockArchive = {
+				blockId: this.blockId,
+				revisions: {
+					[rev]: {
+						action: { actionId, rev, transform: { insert: block } },
+						block
+					}
+				},
+				range: [rev, rev + 1]
+			};
+			await this.saveRestored(archive);
+
+			// Seed metadata when absent, advance latest, and merge the covered range.
+			if (!meta) {
+				meta = { latest: undefined, ranges: [] };
+			}
+			meta.latest = { rev, actionId };
+			meta.ranges.unshift([rev, rev + 1]);
+			meta.ranges = mergeRanges(meta.ranges);
+			await this.storage.saveMetadata(this.blockId, meta);
+
+			log('replica:save blockId=%s rev=%d actionId=%s', this.blockId, rev, actionId);
+			return meta.latest;
+		} finally {
+			release();
+		}
 	}
 
 	private async ensureRevision(meta: BlockMetadata, rev: number): Promise<void> {

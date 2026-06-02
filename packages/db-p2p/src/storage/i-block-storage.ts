@@ -45,6 +45,21 @@ export interface IBlockStorage {
     setLatest(latest: ActionRev): Promise<void>;
 
     /**
+     * Persist a replica of a block received out-of-band (churn re-replication).
+     *
+     * Seeds metadata if absent, writes `rev → actionId`, the action transform, and the
+     * materialized block, merges `[rev, rev+1]` into `ranges`, and advances `latest`
+     * monotonically. When `source` is provided its `rev`/`actionId` are used; otherwise
+     * it falls back to `rev = 1` and a deterministic `actionId` derived from the block
+     * (so retries stay idempotent — never random).
+     *
+     * No-op (still durable) when an equal-or-newer revision is already present: `latest`
+     * is never downgraded. Idempotent for a fixed `(rev, actionId)`. Returns the
+     * effective latest `ActionRev`.
+     */
+    saveReplica(block: IBlock, source?: ActionRev): Promise<ActionRev>;
+
+    /**
      * Reconciles `metadata.latest` with the highest contiguous fully-promoted revision in
      * the revisions table. Intended for post-crash recovery of the Crash-D3 gap, where
      * `promotePendingTransaction` succeeded but `setLatest` did not: the revision and
