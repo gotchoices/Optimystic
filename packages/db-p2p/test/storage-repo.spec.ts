@@ -33,6 +33,12 @@ const makeUpdateTransforms = (blockId: BlockId, operations: [string, number, num
 	deletes: []
 });
 
+const makeDeleteTransforms = (blockId: BlockId): Transforms => ({
+	inserts: {},
+	updates: {},
+	deletes: [blockId]
+});
+
 describe('StorageRepo', () => {
 	let rawStorage: MemoryRawStorage;
 	let repo: StorageRepo;
@@ -666,6 +672,35 @@ describe('StorageRepo', () => {
 
 			expect(result.success).to.equal(true);
 			expect(secondFired).to.equal(true);
+		});
+
+		it('emits on a delete using the prior block\'s collectionId (newBlock is undefined)', async () => {
+			const events: CollectionChangeEvent[] = [];
+			repo.onCollectionChange('collection-1' as BlockId, (e) => events.push(e));
+
+			// Insert then delete the same block. The delete's materialized block is
+			// undefined, so internalCommit must fall back to priorBlock.header.collectionId.
+			await pendAndCommit('a1', makeBlock('block-1'), 1);
+			expect(events.length).to.equal(1);
+
+			await repo.pend({
+				actionId: 'a2' as ActionId,
+				transforms: makeDeleteTransforms('block-1' as BlockId),
+				policy: 'c'
+			});
+			const result = await repo.commit({
+				actionId: 'a2' as ActionId,
+				blockIds: ['block-1' as BlockId],
+				tailId: 'block-1' as BlockId,
+				rev: 2
+			});
+
+			expect(result.success).to.equal(true);
+			expect(events.length).to.equal(2);
+			expect(events[1]!.collectionId).to.equal('collection-1');
+			expect(events[1]!.blockIds).to.deep.equal(['block-1']);
+			expect(events[1]!.actionId).to.equal('a2');
+			expect(events[1]!.rev).to.equal(2);
 		});
 	});
 });

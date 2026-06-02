@@ -35,6 +35,31 @@ Collection.sync()
             → StorageRepo.pend/commit  # Applies to local storage
 ```
 
+### Change Notification (Reactive Wake)
+
+`StorageRepo` implements `IBlockChangeNotifier` (db-core). It is the single commit
+funnel for both the coordinated and direct paths, so it originates a per-collection
+"this collection changed" signal that lets reactive consumers wake without polling.
+
+```
+StorageRepo.commit()                       # critical section (block locks held)
+  → internalCommit() returns collectionId  # newBlock.header ?? priorBlock.header (delete)
+  → release locks (finally)
+  → emitCollectionChanges()                # one CollectionChangeEvent per distinct collection
+```
+
+- Subscribe via `onCollectionChange(collectionId, listener)` → idempotent unsubscribe.
+- Events fire **after** locks release, synchronously in commit order, fire-and-forget
+  (never awaited); a throwing listener is isolated + logged. Ordering across concurrent
+  commits / across collections is **not** guaranteed.
+- Emitted only for blocks **newly committed** in that call on `success: true` —
+  `alreadyDone` (idempotent re-commit) and stale partitions never emit.
+- Exposed on the node as `(node as any).blockChangeNotifier`. `NetworkTransactor`
+  re-exposes it via an optional `localChangeNotifier` ctor option (no-op when absent).
+- **Known silent-drop paths** (see `tickets/`): a block promoted during a `get()`
+  read, and blocks that landed in a *failed* partial multi-block commit (the
+  successful retry treats them as `alreadyDone`), emit no event.
+
 ## Mutation Contracts
 
 ### Functions That MUTATE In-Place
