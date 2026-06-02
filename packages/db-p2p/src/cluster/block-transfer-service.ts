@@ -180,6 +180,15 @@ export class BlockTransferService implements Startable {
 				continue;
 			}
 
+			// `JSON.parse` accepts `null`/primitives as valid JSON. Persisting a falsy or
+			// header-less "block" would seed metadata with no materialization, making every
+			// later `get` throw. Reject such payloads as missing rather than poison storage.
+			if (block === null || typeof block !== 'object' || (block as IBlock).header === undefined) {
+				log('push:invalid block=%s (not a structurally valid block)', blockId);
+				missing.push(blockId);
+				continue;
+			}
+
 			// Persist locally. Only a received-AND-persisted block is reported accepted.
 			try {
 				const source = request.blockMeta?.[blockId];

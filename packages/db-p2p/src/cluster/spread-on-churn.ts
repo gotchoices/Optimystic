@@ -222,9 +222,18 @@ export class SpreadOnChurnMonitor implements Startable {
 						this.deps.peerNetwork,
 						this.deps.protocolPrefix
 					)
-					await client.pushBlocks([blockId], [blockData], 'replication', blockMeta)
-					succeeded.push(targetId)
-					log('push:ok block=%s target=%s', blockId, targetId)
+					const response = await client.pushBlocks([blockId], [blockData], 'replication', blockMeta)
+					// A round-trip that does not throw still does not mean the replica
+					// landed: handlePush reports a block in `missing` when it could not
+					// parse or persist it. Treat that as a failed push so the resilience
+					// mechanism does not falsely count the new owner as holding the block.
+					if (response.missing.includes(blockId)) {
+						failed.push(targetId)
+						log('push:rejected block=%s target=%s (receiver did not persist)', blockId, targetId)
+					} else {
+						succeeded.push(targetId)
+						log('push:ok block=%s target=%s', blockId, targetId)
+					}
 				} catch (err) {
 					failed.push(targetId)
 					log('push:fail block=%s target=%s err=%s',

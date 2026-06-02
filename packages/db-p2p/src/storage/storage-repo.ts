@@ -374,11 +374,21 @@ export class StorageRepo implements IRepo, IBlockChangeNotifier, IBlockReplicaSt
 	 * local storage. Distinct from the {@link IRepo} commit funnel: the block arrives
 	 * already materialized from a departing owner, not as a pend/commit. See
 	 * {@link IBlockStorage.saveReplica} for the durability/monotonicity contract.
+	 *
+	 * Held under the same `StorageRepo.commit:<id>` latch as {@link commit} so the
+	 * replica's read-modify-write of `latest` is mutually exclusive with a concurrent
+	 * local commit on the same block — otherwise `saveReplica`'s monotonic guard could
+	 * read a stale `latest` and clobber a commit that advanced it in between.
 	 */
 	async saveReplicatedBlock(blockId: BlockId, block: IBlock, source?: ActionRev): Promise<void> {
 		log('saveReplicatedBlock blockId=%s rev=%s', blockId, source?.rev);
 		const storage = this.createBlockStorage(blockId);
-		await storage.saveReplica(block, source);
+		const release = await Latches.acquire(`StorageRepo.commit:${blockId}`);
+		try {
+			await storage.saveReplica(block, source);
+		} finally {
+			release();
+		}
 	}
 
 	private async internalCommit(blockId: BlockId, actionId: ActionId, rev: number, storage: IBlockStorage): Promise<CollectionId | undefined> {

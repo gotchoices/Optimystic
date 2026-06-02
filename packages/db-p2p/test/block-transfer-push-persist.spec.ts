@@ -149,4 +149,24 @@ describe('BlockTransferService.handlePush persistence', () => {
 		expect(response.blocks).to.not.have.property(blockId);
 		expect(response.missing).to.deep.equal([blockId]);
 	});
+
+	it('reports missing (and does not poison storage) when the payload is valid JSON but not a block', async () => {
+		const blockId = 'block-churn-null';
+		const request: BlockTransferRequest = {
+			type: 'push',
+			blockIds: [blockId],
+			reason: 'replication',
+			// `null` is valid JSON, so the parse guard alone would let it through; persisting
+			// it would seed metadata with no materialization and make every later get throw.
+			blockData: { [blockId]: Buffer.from('null', 'utf8').toString('base64') }
+		};
+
+		const response = await (service as any).handlePush(request);
+		expect(response.blocks).to.not.have.property(blockId);
+		expect(response.missing).to.deep.equal([blockId]);
+
+		// Storage was not poisoned: get returns empty rather than throwing.
+		const result = await repo.get({ blockIds: [blockId] });
+		expect(result[blockId]?.block ?? undefined).to.be.undefined;
+	});
 });

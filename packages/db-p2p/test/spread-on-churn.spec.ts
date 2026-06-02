@@ -148,7 +148,11 @@ interface PushCall {
  * Builds a mock peerNetwork that records push calls.
  * The connect() method returns a mock stream that the ProtocolClient can use.
  */
-function makeMockPeerNetwork(pushCalls: PushCall[], failTargets: Set<string> = new Set()) {
+function makeMockPeerNetwork(
+	pushCalls: PushCall[],
+	failTargets: Set<string> = new Set(),
+	rejectTargets: Map<string, string[]> = new Map()
+) {
 	return {
 		async connect(peerId: PeerId, _protocol: string) {
 			const targetId = peerId.toString();
@@ -162,15 +166,16 @@ function makeMockPeerNetwork(pushCalls: PushCall[], failTargets: Set<string> = n
 
 			// Return a mock stream that:
 			// 1. Accepts a request (sink)
-			// 2. Returns a response (source)
-			return createMockStream(targetId, failTargets);
+			// 2. Returns a response (source) — `rejectTargets` lets a target report
+			//    blocks in `missing` (a non-throwing round-trip that did not persist).
+			return createMockStream(rejectTargets.get(targetId) ?? []);
 		}
 	};
 }
 
-function createMockStream(_targetId: string, _failTargets: Set<string>) {
+function createMockStream(missing: string[] = []) {
 	// Build a varint-LP-encoded response matching BlockTransferResponse
-	const response: { blocks: Record<string, string>; missing: string[] } = { blocks: {}, missing: [] };
+	const response: { blocks: Record<string, string>; missing: string[] } = { blocks: {}, missing };
 	const payload = new TextEncoder().encode(JSON.stringify(response));
 	// Varint encode the length (works for payloads < 128 bytes)
 	const frame = new Uint8Array(1 + payload.length);
@@ -420,6 +425,32 @@ describe('SpreadOnChurnMonitor', () => {
 			expect(entry.targets).to.include(peer5Str);
 			expect(entry.succeeded).to.include(peer4Str);
 			expect(entry.failed).to.include(peer5Str);
+		});
+
+		it('records a target as failed when the receiver reports the block missing', async () => {
+			const selfStr = selfId.toString();
+			const peer4Str = peerId4.toString();
+
+			mockFret.setNeighborDistance(0);
+			mockFret.setCohort('*', [selfStr, peerId2.toString()]);
+			mockFret.setExpandResult('*', [selfStr, peerId2.toString(), peer4Str]);
+
+			// The push round-trip succeeds (no throw) but the receiver reports the block
+			// in `missing` — it could not parse/persist it. The sender must not count it
+			// as succeeded, otherwise it falsely treats the new owner as holding the block.
+			const rejectTargets = new Map([[peer4Str, ['block-1']]]);
+			const monitor = makeMonitor({
+				peerNetwork: makeMockPeerNetwork(pushCalls, new Set(), rejectTargets) as any,
+			});
+			monitor.trackBlock('block-1');
+
+			const event = await monitor.checkNow();
+			expect(event).to.not.be.null;
+
+			const entry = event!.spread[0]!;
+			expect(entry.targets).to.include(peer4Str);
+			expect(entry.failed).to.include(peer4Str);
+			expect(entry.succeeded).to.not.include(peer4Str);
 		});
 
 		it('graceful no-op when expand returns nothing new', async () => {
