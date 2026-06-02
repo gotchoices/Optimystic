@@ -2,7 +2,8 @@ import { expect } from 'chai';
 import { StorageRepo } from '../src/storage/storage-repo.js';
 import { BlockStorage } from '../src/storage/block-storage.js';
 import { MemoryRawStorage } from '../src/storage/memory-storage.js';
-import type { BlockId, ActionId, PendRequest, Transforms, IBlock, BlockHeader } from '@optimystic/db-core';
+import type { BlockId, ActionId, PendRequest, Transforms, IBlock, BlockHeader, CollectionChangeEvent } from '@optimystic/db-core';
+import { isBlockChangeNotifier } from '@optimystic/db-core';
 
 const makeHeader = (id: string): BlockHeader => ({
 	id: id as BlockId,
@@ -12,6 +13,11 @@ const makeHeader = (id: string): BlockHeader => ({
 
 const makeBlock = (id: string, data?: Record<string, unknown>): IBlock => ({
 	header: makeHeader(id),
+	...data
+});
+
+const makeBlockInCollection = (id: string, collectionId: string, data?: Record<string, unknown>): IBlock => ({
+	header: { id: id as BlockId, type: 'test', collectionId: collectionId as BlockId },
 	...data
 });
 
@@ -538,6 +544,128 @@ describe('StorageRepo', () => {
 			} catch (err) {
 				expect((err as Error).message).to.include('Pending action');
 			}
+		});
+	});
+
+	describe('change notification (IBlockChangeNotifier)', () => {
+		// Commit a freshly-pended insert at the given revision and return the result.
+		const pendAndCommit = async (actionId: string, block: IBlock, rev: number) => {
+			await repo.pend({
+				actionId: actionId as ActionId,
+				transforms: makeInsertTransforms(block.header.id, block),
+				policy: 'c'
+			});
+			return repo.commit({
+				actionId: actionId as ActionId,
+				blockIds: [block.header.id],
+				tailId: block.header.id,
+				rev
+			});
+		};
+
+		it('StorageRepo is feature-detectable as a change notifier', () => {
+			expect(isBlockChangeNotifier(repo)).to.equal(true);
+		});
+
+		it('fires exactly one event on commit with committed blockIds, actionId, rev', async () => {
+			const events: CollectionChangeEvent[] = [];
+			repo.onCollectionChange('collection-1' as BlockId, (e) => events.push(e));
+
+			const result = await pendAndCommit('a1', makeBlock('block-1'), 1);
+
+			expect(result.success).to.equal(true);
+			expect(events.length).to.equal(1);
+			expect(events[0]!.collectionId).to.equal('collection-1');
+			expect(events[0]!.blockIds).to.deep.equal(['block-1']);
+			expect(events[0]!.actionId).to.equal('a1');
+			expect(events[0]!.rev).to.equal(1);
+		});
+
+		it('does not notify a subscriber for a different collection', async () => {
+			const events: CollectionChangeEvent[] = [];
+			repo.onCollectionChange('collection-C' as BlockId, (e) => events.push(e));
+
+			// Commit a block belonging to collection D — the C subscriber must stay silent.
+			const result = await pendAndCommit('a1', makeBlockInCollection('block-d', 'collection-D'), 1);
+
+			expect(result.success).to.equal(true);
+			expect(events.length).to.equal(0);
+		});
+
+		it('routes per collection on one repo (models a remote author)', async () => {
+			// Commit directly through the repo — never through a local Database/Collection —
+			// to model the cluster-consensus path (consensus → StorageRepo.commit). A writer
+			// the local Database never drove must still emit, scoped to the right collection.
+			const aEvents: CollectionChangeEvent[] = [];
+			const bEvents: CollectionChangeEvent[] = [];
+			repo.onCollectionChange('collection-A' as BlockId, (e) => aEvents.push(e));
+			repo.onCollectionChange('collection-B' as BlockId, (e) => bEvents.push(e));
+
+			const result = await pendAndCommit('a1', makeBlockInCollection('block-a', 'collection-A'), 1);
+
+			expect(result.success).to.equal(true);
+			expect(aEvents.length).to.equal(1);
+			expect(aEvents[0]!.collectionId).to.equal('collection-A');
+			expect(aEvents[0]!.blockIds).to.deep.equal(['block-a']);
+			expect(bEvents.length).to.equal(0);
+		});
+
+		it('does not re-emit on an idempotent re-commit (rollforward path)', async () => {
+			const events: CollectionChangeEvent[] = [];
+			repo.onCollectionChange('collection-1' as BlockId, (e) => events.push(e));
+
+			await pendAndCommit('a1', makeBlock('block-1'), 1);
+			expect(events.length).to.equal(1);
+
+			// Re-commit the same (actionId, rev): hits the alreadyDone partition, no new commit.
+			const second = await repo.commit({
+				actionId: 'a1' as ActionId,
+				blockIds: ['block-1' as BlockId],
+				tailId: 'block-1' as BlockId,
+				rev: 1
+			});
+
+			expect(second.success).to.equal(true);
+			expect(events.length).to.equal(1);
+		});
+
+		it('stops events after unsubscribe and unsubscribe is idempotent', async () => {
+			const events: CollectionChangeEvent[] = [];
+			const unsub = repo.onCollectionChange('collection-1' as BlockId, (e) => events.push(e));
+
+			await pendAndCommit('a1', makeBlock('block-1'), 1);
+			expect(events.length).to.equal(1);
+
+			unsub();
+
+			// A later commit to the same block (new rev) must not reach the listener.
+			await repo.pend({
+				actionId: 'a2' as ActionId,
+				transforms: makeUpdateTransforms('block-1' as BlockId, [['items', 0, 0, ['more']]]),
+				policy: 'c'
+			});
+			await repo.commit({
+				actionId: 'a2' as ActionId,
+				blockIds: ['block-1' as BlockId],
+				tailId: 'block-1' as BlockId,
+				rev: 2
+			});
+
+			expect(events.length).to.equal(1);
+
+			// Idempotent: a second unsubscribe must not throw.
+			expect(() => unsub()).to.not.throw();
+		});
+
+		it('isolates a throwing listener so others still fire and the commit succeeds', async () => {
+			let secondFired = false;
+			repo.onCollectionChange('collection-1' as BlockId, () => { throw new Error('listener boom'); });
+			repo.onCollectionChange('collection-1' as BlockId, () => { secondFired = true; });
+
+			const result = await pendAndCommit('a1', makeBlock('block-1'), 1);
+
+			expect(result.success).to.equal(true);
+			expect(secondFired).to.equal(true);
 		});
 	});
 });

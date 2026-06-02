@@ -145,6 +145,9 @@ export class BlockTransferService implements Startable {
 				// Verify we received valid data
 				try {
 					JSON.parse(Buffer.from(data, 'base64').toString('utf8'));
+					// TODO: emit CollectionChangeEvent here once replicas persist
+					// (saveReplicatedBlock). This is a distinct landing path from the
+					// StorageRepo commit funnel, so it must originate its own event.
 					blocks[blockId] = data;
 				} catch {
 					missing.push(blockId);

@@ -2,7 +2,8 @@ import type {
 	IRepo, MessageOptions, BlockId, CommitRequest, CommitResult, GetBlockResults, PendRequest, PendResult, ActionBlocks,
 	ActionId, BlockGets, ActionPending, PendSuccess, ActionTransform, ActionTransforms,
 	GetBlockResult,
-	PendValidationHook
+	PendValidationHook,
+	CollectionId, IBlockChangeNotifier, CollectionChangeListener, CollectionChangeEvent
 } from "@optimystic/db-core";
 import {
 	Latches, transformForBlockId, applyTransform, groupBy, concatTransform, emptyTransforms,
@@ -19,14 +20,64 @@ export type StorageRepoOptions = {
 	validatePend?: PendValidationHook;
 };
 
-export class StorageRepo implements IRepo {
+export class StorageRepo implements IRepo, IBlockChangeNotifier {
 	private readonly validatePend?: PendValidationHook;
+	/** Per-collection change listeners; empty sets are pruned on unsubscribe. */
+	private readonly changeListeners = new Map<CollectionId, Set<CollectionChangeListener>>();
 
 	constructor(
 		private readonly createBlockStorage: (blockId: BlockId) => IBlockStorage,
 		options?: StorageRepoOptions
 	) {
 		this.validatePend = options?.validatePend;
+	}
+
+	/**
+	 * Subscribe to commits that mutate `collectionId`'s blocks on this node.
+	 * Returns an idempotent unsubscribe. See {@link IBlockChangeNotifier}.
+	 */
+	onCollectionChange(collectionId: CollectionId, listener: CollectionChangeListener): () => void {
+		let set = this.changeListeners.get(collectionId);
+		if (!set) {
+			set = new Set();
+			this.changeListeners.set(collectionId, set);
+		}
+		set.add(listener);
+		let unsubscribed = false;
+		return () => {
+			if (unsubscribed) return;
+			unsubscribed = true;
+			const current = this.changeListeners.get(collectionId);
+			if (current) {
+				current.delete(listener);
+				if (current.size === 0) {
+					this.changeListeners.delete(collectionId);
+				}
+			}
+		};
+	}
+
+	/**
+	 * Fire one {@link CollectionChangeEvent} per distinct collection that was
+	 * newly committed. Called AFTER the commit critical section (locks released),
+	 * fire-and-forget synchronous; a throwing listener is isolated and logged.
+	 */
+	private emitCollectionChanges(collectionBlocks: Map<CollectionId, BlockId[]>, actionId: ActionId, rev: number): void {
+		for (const [collectionId, blockIds] of collectionBlocks) {
+			const listeners = this.changeListeners.get(collectionId);
+			if (!listeners || listeners.size === 0) {
+				continue;
+			}
+			const event: CollectionChangeEvent = { collectionId, blockIds, actionId, rev };
+			// Snapshot so a listener unsubscribing (or subscribing) mid-emit is safe.
+			for (const listener of Array.from(listeners)) {
+				try {
+					listener(event);
+				} catch (err) {
+					log('onCollectionChange listener threw for collection=%s: %o', collectionId, err);
+				}
+			}
+		}
 	}
 
 	async get({ blockIds, context }: BlockGets, _options?: MessageOptions): Promise<GetBlockResults> {
@@ -194,6 +245,9 @@ export class StorageRepo implements IRepo {
 		log('commit actionId=%s rev=%d blockIds=%d', request.actionId, request.rev, request.blockIds.length);
 		const uniqueBlockIds = Array.from(new Set(request.blockIds)).sort();
 		const releases: (() => void)[] = [];
+		// Collects the blocks newly committed in this call, grouped by collection,
+		// so we can emit change events once locks are released and success is known.
+		const collectionBlocks = new Map<CollectionId, BlockId[]>();
 
 		try {
 			// Acquire locks sequentially based on sorted IDs to prevent deadlocks
@@ -273,7 +327,12 @@ export class StorageRepo implements IRepo {
 			for (const { blockId, storage } of toCommit) {
 				try {
 					// internalCommit will throw if it encounters an issue
-					await this.internalCommit(blockId, request.actionId, request.rev, storage);
+					const collectionId = await this.internalCommit(blockId, request.actionId, request.rev, storage);
+					if (collectionId !== undefined) {
+						const list = collectionBlocks.get(collectionId) ?? [];
+						list.push(blockId);
+						collectionBlocks.set(collectionId, list);
+					}
 				} catch (err) {
 					// Partial-commit recovery: a retry with the same (actionId, rev) will treat
 					// already-done blocks as idempotent no-ops and advance the remainder.
@@ -288,6 +347,10 @@ export class StorageRepo implements IRepo {
 			// Release locks in reverse order of acquisition
 			releases.reverse().forEach(release => release());
 		}
+
+		// Notify after the critical section, only for blocks newly committed here
+		// (alreadyDone / stale partitions never reach `collectionBlocks`).
+		this.emitCollectionChanges(collectionBlocks, request.actionId, request.rev);
 
 		return { success: true };
 	}
@@ -305,7 +368,7 @@ export class StorageRepo implements IRepo {
 		await storage.recover();
 	}
 
-	private async internalCommit(blockId: BlockId, actionId: ActionId, rev: number, storage: IBlockStorage): Promise<void> {
+	private async internalCommit(blockId: BlockId, actionId: ActionId, rev: number, storage: IBlockStorage): Promise<CollectionId | undefined> {
 		// Note: This method is called within the locked critical section of commit()
 		// So, operations like getPendingTransaction, getLatest, getBlock, saveMaterializedBlock,
 		// saveRevision, promotePendingTransaction, setLatest are protected against
@@ -340,6 +403,12 @@ export class StorageRepo implements IRepo {
 
 		// Update latest revision *last*
 		await storage.setLatest({ actionId, rev });
+
+		// Report the affected collection for change-event routing. For a delete the
+		// materialized block is undefined, so fall back to the prior block's header.
+		// Either may be absent only for a malformed/headerless block — return
+		// undefined so the caller skips it rather than emitting a bogus event.
+		return newBlock?.header.collectionId ?? priorBlock?.header.collectionId;
 	}
 }
 

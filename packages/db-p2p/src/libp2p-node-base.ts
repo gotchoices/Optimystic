@@ -519,6 +519,9 @@ export async function createLibp2pNodeBase(
 	// Expose coordinated repo and storage for external use
 	(node as any).coordinatedRepo = coordinatedRepo;
 	(node as any).storageRepo = storageRepo;
+	// The StorageRepo is the single commit funnel for both the coordinated and
+	// direct paths, so it is the node's per-collection change-notifier origin.
+	(node as any).blockChangeNotifier = storageRepo;
 	(node as any).keyNetwork = keyNetwork;
 	(node as any).reputation = reputation;
 	(node as any).disputeService = disputeServiceInstance;

@@ -1,6 +1,7 @@
 import { peerIdFromString } from "../network/types.js";
 import type { PeerId } from "../network/types.js";
-import type { ActionTransforms, ActionBlocks, BlockActionStatus, ITransactor, PendSuccess, StaleFailure, IKeyNetwork, BlockId, GetBlockResults, PendResult, CommitResult, PendRequest, IRepo, BlockGets, Transforms, CommitRequest, ActionId, RepoCommitRequest, ClusterNomineesResult } from "../index.js";
+import type { ActionTransforms, ActionBlocks, BlockActionStatus, ITransactor, PendSuccess, StaleFailure, IKeyNetwork, BlockId, GetBlockResults, PendResult, CommitResult, PendRequest, IRepo, BlockGets, Transforms, CommitRequest, ActionId, RepoCommitRequest, ClusterNomineesResult, CollectionId } from "../index.js";
+import type { IBlockChangeNotifier, CollectionChangeListener } from "./change-notifier.js";
 import { transformForBlockId, groupBy, concatTransforms, concatTransform, transformsFromTransform, blockIdsForTransforms } from "../index.js";
 import { blockIdToBytes } from "../utility/block-id-to-bytes.js";
 import { isRecordEmpty } from "../utility/is-record-empty.js";
@@ -23,6 +24,14 @@ type NetworkTransactorInit = {
 	 * Omit to fall back to a sensible default (3s); set 0 / negative to disable.
 	 */
 	dialTimeoutMs?: number;
+	/**
+	 * Optional local change-notifier (e.g. the hosting node's StorageRepo) used to
+	 * satisfy {@link IBlockChangeNotifier}. When supplied, `onCollectionChange`
+	 * delegates to it so consumers can feature-detect change notifications on the
+	 * transactor they already hold rather than reaching into node internals. When
+	 * absent, `onCollectionChange` is a logged no-op.
+	 */
+	localChangeNotifier?: IBlockChangeNotifier;
 }
 
 /**
@@ -34,12 +43,13 @@ type NetworkTransactorInit = {
  */
 const DEFAULT_DIAL_TIMEOUT_MS = 3000;
 
-export class NetworkTransactor implements ITransactor {
+export class NetworkTransactor implements ITransactor, IBlockChangeNotifier {
 	private readonly keyNetwork: IKeyNetwork;
 	private readonly timeoutMs: number;
 	private readonly abortOrCancelTimeoutMs: number;
 	private readonly dialTimeoutMs: number | undefined;
 	private readonly getRepo: (peerId: PeerId) => IRepo;
+	private readonly localChangeNotifier: IBlockChangeNotifier | undefined;
 
 	constructor(
 		init: NetworkTransactorInit,
@@ -53,6 +63,21 @@ export class NetworkTransactor implements ITransactor {
 			? DEFAULT_DIAL_TIMEOUT_MS
 			: (init.dialTimeoutMs > 0 ? init.dialTimeoutMs : undefined);
 		this.getRepo = init.getRepo;
+		this.localChangeNotifier = init.localChangeNotifier;
+	}
+
+	/**
+	 * Subscribe to commits landing on the local node for `collectionId`, delegating
+	 * to the `localChangeNotifier` supplied at construction. When no notifier was
+	 * supplied this is a no-op (returns an inert unsubscribe) — a NetworkTransactor
+	 * with no co-located storage cannot observe commits locally.
+	 */
+	onCollectionChange(collectionId: CollectionId, listener: CollectionChangeListener): () => void {
+		if (!this.localChangeNotifier) {
+			log('onCollectionChange: no localChangeNotifier configured; subscription is a no-op for collection=%s', collectionId);
+			return () => { };
+		}
+		return this.localChangeNotifier.onCollectionChange(collectionId, listener);
 	}
 
 	async get(blockGets: BlockGets): Promise<GetBlockResults> {
