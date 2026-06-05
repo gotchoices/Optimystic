@@ -299,12 +299,14 @@ Matchmaking has no implementation yet; the cases below are doc-as-spec. Each bec
 
 Arrival-push behavior (see [§Arrival push on provider arrival](#arrival-push-on-provider-arrival)):
 
-- *Fresh arrival pushes to longest waiters.* One fresh matchable provider with `capacityBudget = 2` and 5 matching local seekers → exactly the 2 smallest-`attachedAt` seekers receive an `ArrivalPushV1`.
+- *Fresh arrival pushes to longest waiters.* One fresh matchable provider with `capacityBudget = 2` and 5 matching local push-opted seekers → exactly the 2 smallest-`attachedAt` seekers receive an `ArrivalPushV1`.
+- *Poll-path seekers are not push targets.* With `capacityBudget = 2` and matching local seekers where the 2 longest-waiting are poll-path (`pushOnArrival` unset), the push goes to the 2 longest-waiting *push-opted* seekers, and the poll-path seekers receive no `ArrivalPushV1`.
 - *Renewal does not push.* A renewal of an already-held provider produces no `ArrivalPushV1`.
 - *`capacityBudget = 0` does not push.* A fresh arrival with budget 0 produces no push.
 - *Coalescing.* Three providers arriving within `push_coalesce_ms` yield one `ArrivalPushV1` of length 3 per selected seeker, not three pushes.
 - *Filter miss excluded.* A fresh provider failing a seeker's `filter` (including `minBudget`) does not push to that seeker and does not count toward fan-out.
 - *Missed push, final poll recovers.* With pushes suppressed (simulated drop), the hanging-out seeker still returns the provider via the mandatory final `QueryV1` before `patienceMs` drains.
+- *Push/poll overlap deduped.* A provider delivered by both an `ArrivalPushV1` and a subsequent safety poll is dialed once and counts once toward `wantCount`.
 - *Sparse safety-poll cadence.* A push-aware seeker that gets no pushes issues ≈ `patienceMs / push_safety_poll_ms` queries (≈ 2 at defaults), not `patienceMs / requery_interval_ms` (≈ 10).
 - *Promotion observed via folded topicTraffic.* After the cohort promotes, the seeker's next push (or safety poll) reports `childCohortCount > 0` and the seeker enters the descend branch.
 - *Push forgery rejected.* An `ArrivalPushV1` whose entries carry an invalid `registrationSig` is discarded; the seeker does not dial the forged provider.
@@ -334,10 +336,10 @@ Trigger source: provider registrations are replicated to every cohort member via
 
 ### Fairness — FCFS by `attachedAt`, fan-out bounded by `capacityBudget`
 
-On a fresh matchable arrival, the primary notifies the **`min(provider.capacityBudget, |matching local seekers|)` longest-waiting** matching seekers — smallest `attachedAt` first (`attachedAt` is already held per seeker; see `SeekerEntryV1` in §Wire formats). Rationale:
+On a fresh matchable arrival, the primary notifies the **`min(provider.capacityBudget, |matching local push-opted seekers|)` longest-waiting** matching seekers — smallest `attachedAt` first (`attachedAt` is already held per seeker; see `SeekerEntryV1` in §Wire formats). Only seekers that set `pushOnArrival` are notify targets and only they count toward the fan-out: a seeker on the poll path holds no push binding and self-serves via `requery_interval_ms`, so including it in the set would waste a slot on a seeker the primary cannot reach. Rationale:
 
 - The push is advisory — the cohort allocates nothing; seekers dial the provider directly and the provider enforces its own `capacityBudget`. Fan-out therefore only needs to fill the provider's real slots, not broadcast.
-- `capacityBudget` is the natural fan-out bound: a provider admitting *c* concurrent tasks justifies notifying *c* racers. Notifying more only manufactures losing dials; notifying fewer under-fills the provider. No new fan-out config is introduced — `capacityBudget` (already in `ProviderAppPayloadV1`) is the cap, itself bounded above by the `cap_promote (~64)` local-seeker ceiling.
+- `capacityBudget` is the natural fan-out bound: a provider admitting *c* concurrent tasks justifies notifying *c* racers. Notifying more only manufactures losing dials; notifying fewer under-fills the provider. No new fan-out config is introduced — `capacityBudget` (already in `ProviderAppPayloadV1`) is the per-arrival cap; the fan-out is in turn bounded by the matching-seeker count, which cannot exceed the `cap_promote (~64)` participant ceiling a cohort holds.
 - FCFS-by-`attachedAt` yields a **deterministic, defensible** winner (longest-waiting), unlike broadcast-and-race (which favors low-latency seekers arbitrarily) or random sampling (nondeterministic).
 
 A fresh arrival with `capacityBudget == 0` is skipped entirely — a "listed but full" provider ([§Provider self-throttling](#provider-self-throttling)) is not a new matchable slot.
@@ -359,6 +361,8 @@ A missed push (seeker briefly offline, primary failover mid-coalesce-window, dro
 - A seeker that receives no pushes — its cohort predates push support, or every push was lost — degrades silently to the sparse-poll cadence. **No push/no-push handshake or capability detection is needed.**
 - A withholding primary costs the seeker nothing beyond the safety-poll cadence — no worse than baseline.
 
+Because the same fresh provider can surface in both a push and a later safety/final `QueryV1`, the seeker dedups returned providers by `participantId` before counting them toward `wantCount` or dialing. This also makes a primary's re-pushes after failover (which resets the per-binding "already pushed" count) harmless.
+
 ### Edge cases & interactions
 
 - **Renewal vs. fresh arrival.** Only a *fresh* provider registration (a `participantId` not previously held for this topic at this cohort) triggers a push; a renewal of an already-known provider must not — seekers already saw it. Because `arrivalsPerMin` combines fresh registrations and renewals ([cohort-topic.md §Topic traffic signal](cohort-topic.md#topic-traffic-signal)), the trigger keys off the record set transitioning absent→present, **not** off the arrivals counter.
@@ -367,7 +371,7 @@ A missed push (seeker briefly offline, primary failover mid-coalesce-window, dro
 - **`minBudget` filter vs. fan-out.** A seeker whose `filter.minBudget` exceeds the arriving provider's `capacityBudget` is not a match — excluded from both the matching set and the FCFS fan-out count.
 - **Burst exceeding remaining need.** Several providers arriving within one coalesce window are carried in one batched push; the seeker dials up to its outstanding `wantCount`.
 - **Primary failover during the coalesce window.** The unflushed batch is lost (transient, non-gossiped); the safety/final poll recovers it. No replay buffer.
-- **`cohortEpoch` change / primary handoff.** The seeker's primary may move ([cohort-topic.md §Membership rotation and primary handoff](cohort-topic.md#membership-rotation-and-primary-handoff)). The old primary stops pushing; the new primary begins pushing future arrivals; the seeker rebinds on its next renewal. In-flight arrivals during the gap are covered by the safety poll. A push that arrives at a seeker that has since re-registered is acked `ArrivalPushAckV1{ unknown_seeker }`, and the primary drops the binding.
+- **`cohortEpoch` change / primary handoff.** The seeker's primary may move ([cohort-topic.md §Membership rotation and primary handoff](cohort-topic.md#membership-rotation-and-primary-handoff)). The old primary stops pushing; the new primary begins pushing future arrivals; the seeker rebinds on its next renewal. In-flight arrivals during the gap are covered by the safety poll. A push whose echoed `correlationId` no longer matches the seeker's current registration (the seeker re-registered) is acked `ArrivalPushAckV1{ unknown_seeker }`, and the primary drops the binding.
 - **Promotion while hanging out.** After the cohort promotes, fresh providers are redirected to tier `d+1` and stop landing here, so pushes cease. The seeker observes `childCohortCount > 0` via the folded `topicTraffic` on its last push (or via a safety poll) and re-runs the descend decision per [§Decision rule](#decision-rule). This is pre-existing polling behavior, not push-specific — the folded `topicTraffic` simply keeps the seeker informed without extra RPCs.
 - **`arrivalsPerMin = 0` right after epoch rotation.** Counters reset on rotation, but pushes are driven by record-set deltas, not the counter, so push delivery is unaffected by the stale-zero window. The existing edge-case rule (do not withdraw on a single zero reading) is unchanged.
 - **Final-poll boundary.** A provider that arrives in the last `push_coalesce_ms` before `patienceMs` expiry may not be pushed in time; the mandatory final `QueryV1` guarantees it is still seen. The final poll fires even when a push is in flight.
@@ -506,6 +510,9 @@ interface ArrivalPushV1 {
   v:            1
   topicId:      string
   cohortEpoch:  string
+  correlationId: string            // the seeker registration this push is bound to; a
+                                   //   seeker that has since re-registered under a new
+                                   //   correlationId acks unknown_seeker (see §Edge cases)
   providers:    ProviderEntryV1[]   // fresh, filter-matched, coalesced batch
   topicTraffic: TopicTrafficV1      // current snapshot — lets the seeker re-run its
                                     //   hang-out math and observe childCohortCount>0
