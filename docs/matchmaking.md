@@ -112,11 +112,14 @@ SeekerAppPayloadV1 {
   wantCount:      number              // number of providers desired
   filter:         CapabilityFilter?   // optional, see below
   contactHint:    string              // for collective-assembly use
+  pushOnArrival?: boolean             // opt into arrival pushes; default false (poll path)
   signature:      string
 }
 ```
 
-with TTL set short — typically 5–15 s — since seekers normally don't wait long.
+with TTL set short — typically 5–15 s — since seekers normally don't wait long. A
+hanging-out seeker that set `pushOnArrival` keeps its registration alive via TTL
+renewals while it waits for pushes (see [§Arrival push on provider arrival](#arrival-push-on-provider-arrival)).
 
 After registering, the seeker queries the cohort:
 
@@ -226,7 +229,9 @@ After receiving `Accepted` with `topicTraffic` at tier `d`:
    expectedNewMatches ≈ arrivalsPerMin × filterAcceptRatio × (patienceMs / 60000)
    contentionFactor   ≈ min(1 + (queriesPerMin × meanWantCount) / max(arrivalsPerMin, 1), contention_factor_cap)
    ```
-   If `currentMatches + expectedNewMatches ≥ wantCount × contentionFactor`, **hang out**: keep the seeker registration alive via TTL renewals; re-query at `requery_interval_ms` (default 1 s; see §Configuration) until `wantCount` matches accumulate or `patienceMs` elapses.
+   If `currentMatches + expectedNewMatches ≥ wantCount × contentionFactor`, **hang out**: keep the seeker registration alive via TTL renewals until `wantCount` matches accumulate or `patienceMs` elapses. How the hanging-out seeker watches for fresh arrivals depends on whether it opted into pushes:
+   - **Push path (`pushOnArrival = true`).** The seeker does not poll at `requery_interval_ms`. It waits for `ArrivalPushV1` from its assigned cohort primary, issuing a `QueryV1` only as a sparse safety poll every `push_safety_poll_ms` (default 5 s) **and once more immediately before `patienceMs` drains**. See [§Arrival push on provider arrival](#arrival-push-on-provider-arrival).
+   - **Poll path (default).** The seeker re-queries at `requery_interval_ms` (default 1 s; see §Configuration).
    `filterAcceptRatio` starts at 1.0 and can be refined from observed query yields; `meanWantCount` is a small constant or learned from prior interactions.
 3. **Otherwise, walk toward the root.** Withdraw the seeker registration (`RenewV1` with TTL = 0; polite but optional), then re-register at `d − 1`. Repeat the decision there. The patience budget continues to drain, so each escalation step makes hang-out at the new tier slightly less attractive — which is correct, since the root is the terminal.
 
@@ -292,9 +297,82 @@ Matchmaking has no implementation yet; the cases below are doc-as-spec. Each bec
 - *`topicTraffic` missing on reply.* Seeker walks one tier toward the root without hanging out.
 - *Filter accept ratio decays across walk.* After two cohorts each return only ~10% matchable providers, `filterAcceptRatio` settles near 0.1 and subsequent `expectedNewMatches` reflects this.
 
-### Out of scope (for this section)
+Arrival-push behavior (see [§Arrival push on provider arrival](#arrival-push-on-provider-arrival)):
 
-A cohort-side push channel — where the cohort notifies a hanging-out seeker as new matchable providers arrive, replacing the polling `requery_interval_ms` — is a plausible future refinement, but its design (push transport, back-pressure, fairness across seekers) belongs in a separate ticket and is deferred until polling shows observable cost.
+- *Fresh arrival pushes to longest waiters.* One fresh matchable provider with `capacityBudget = 2` and 5 matching local seekers → exactly the 2 smallest-`attachedAt` seekers receive an `ArrivalPushV1`.
+- *Renewal does not push.* A renewal of an already-held provider produces no `ArrivalPushV1`.
+- *`capacityBudget = 0` does not push.* A fresh arrival with budget 0 produces no push.
+- *Coalescing.* Three providers arriving within `push_coalesce_ms` yield one `ArrivalPushV1` of length 3 per selected seeker, not three pushes.
+- *Filter miss excluded.* A fresh provider failing a seeker's `filter` (including `minBudget`) does not push to that seeker and does not count toward fan-out.
+- *Missed push, final poll recovers.* With pushes suppressed (simulated drop), the hanging-out seeker still returns the provider via the mandatory final `QueryV1` before `patienceMs` drains.
+- *Sparse safety-poll cadence.* A push-aware seeker that gets no pushes issues ≈ `patienceMs / push_safety_poll_ms` queries (≈ 2 at defaults), not `patienceMs / requery_interval_ms` (≈ 10).
+- *Promotion observed via folded topicTraffic.* After the cohort promotes, the seeker's next push (or safety poll) reports `childCohortCount > 0` and the seeker enters the descend branch.
+- *Push forgery rejected.* An `ArrivalPushV1` whose entries carry an invalid `registrationSig` is discarded; the seeker does not dial the forged provider.
+- *Stale push acked `unknown_seeker`.* A push to a seeker that has re-registered (new `correlationId` / epoch) returns `ArrivalPushAckV1{ unknown_seeker }` and the primary drops the binding.
+
+### Replacing the poll with a push
+
+A seeker that opts in (`pushOnArrival`) replaces the polling `requery_interval_ms` loop with a cohort-side push: its assigned cohort primary notifies it as fresh matchable providers arrive. The channel, fairness, coalescing, and failure semantics are specified in [§Arrival push on provider arrival](#arrival-push-on-provider-arrival). A push-disabled seeker keeps the `requery_interval_ms` poll described above.
+
+---
+
+## Arrival push on provider arrival
+
+A hanging-out seeker that set `pushOnArrival` does not poll at `requery_interval_ms`. Instead its assigned cohort primary **pushes** a notification when a fresh matchable provider lands at the cohort. The push is a **pure optimization over the polling baseline**: correctness never depends on it (see [§Arrival push missed or primary fails mid-coalesce](#arrival-push-missed-or-primary-fails-mid-coalesce)). A seeker that opts out, predates push support, or loses every push degrades silently to a sparse safety poll — never worse than the legacy poll path.
+
+### Push channel
+
+The push is delivered by the **seeker's assigned cohort-topic primary** — the member computed by the standard `primary(participantId, cohortMembers)` slot hash. Seekers are `directParticipants` and already hold a primary, so no new assignment machinery is needed. Delivery rides a new matchmaking application protocol, addressed to the seeker's `contactHint`:
+
+```
+/optimystic/matchmaking/1.0.0/arrival-push   — cohort-primary → seeker arrival notification
+```
+
+This mirrors the pattern reactivity uses to fan `NotificationV1` to direct subscribers ([reactivity.md §Propagation](reactivity.md#propagation)): the cohort-topic layer supplies cohort identity plus primary/backup assignment; the application supplies the delivery RPC. It is **not** intra-cohort gossip — seekers are external participants, not cohort members, so gossip never reaches them — and **not** a new transport — it reuses the primary the seeker already holds.
+
+Trigger source: provider registrations are replicated to every cohort member via standard cohort gossip ([cohort-topic.md §Registration record](cohort-topic.md#registration-record)). The seeker's primary therefore observes a newly-added provider `RegistrationRecord` for this topic within ≤ one gossip round; no new cohort-topic mechanism is required. [cohort-topic.md §Application policies](cohort-topic.md#application-policies) already authorizes applications to drive per-registration behavior off the existing gossip channel, so the cohort-topic substrate needs **no** protocol change.
+
+### Fairness — FCFS by `attachedAt`, fan-out bounded by `capacityBudget`
+
+On a fresh matchable arrival, the primary notifies the **`min(provider.capacityBudget, |matching local seekers|)` longest-waiting** matching seekers — smallest `attachedAt` first (`attachedAt` is already held per seeker; see `SeekerEntryV1` in §Wire formats). Rationale:
+
+- The push is advisory — the cohort allocates nothing; seekers dial the provider directly and the provider enforces its own `capacityBudget`. Fan-out therefore only needs to fill the provider's real slots, not broadcast.
+- `capacityBudget` is the natural fan-out bound: a provider admitting *c* concurrent tasks justifies notifying *c* racers. Notifying more only manufactures losing dials; notifying fewer under-fills the provider. No new fan-out config is introduced — `capacityBudget` (already in `ProviderAppPayloadV1`) is the cap, itself bounded above by the `cap_promote (~64)` local-seeker ceiling.
+- FCFS-by-`attachedAt` yields a **deterministic, defensible** winner (longest-waiting), unlike broadcast-and-race (which favors low-latency seekers arbitrarily) or random sampling (nondeterministic).
+
+A fresh arrival with `capacityBudget == 0` is skipped entirely — a "listed but full" provider ([§Provider self-throttling](#provider-self-throttling)) is not a new matchable slot.
+
+### Coalescing — per-seeker batch over a short window
+
+The primary accumulates fresh matchable arrivals per target seeker and flushes **one** `ArrivalPushV1` carrying the batch, rather than one push per (arrival × seeker). A flush fires when either a `push_coalesce_ms` timer (default 250 ms) elapses **or** the batch reaches the seeker's outstanding need (`wantCount −` matches already pushed). This collapses an arrival burst to ≤ one push per seeker per window.
+
+The coalescing buffer is **soft, transient, non-gossiped** state held only on the current primary. On primary failover the unflushed batch is simply lost; the seeker's safety/final poll covers it. No replay buffer is added — that is reactivity's concern because reactivity must not lose committed revisions, whereas matchmaking arrivals are advisory and re-discoverable by query.
+
+### Folded `topicTraffic`
+
+Each `ArrivalPushV1` carries a current `topicTraffic` snapshot alongside the provider batch. This lets a hanging-out seeker re-run its hang-out-vs-continue math — and observe `childCohortCount > 0` (promotion → descend) — on every push without a separate poll, preserving the structural-change handling the poll loop got for free.
+
+### Failure mode — optimization-only
+
+A missed push (seeker briefly offline, primary failover mid-coalesce-window, dropped RPC) must never make the seeker worse than the polling baseline. The push-aware seeker therefore always runs, beneath the push, a **sparse safety poll** every `push_safety_poll_ms` (default 5 s) **plus one mandatory final `QueryV1` immediately before `patienceMs` drains** (catches any provider whose push was lost right at expiry). Because the safety poll is always present:
+
+- A seeker that receives no pushes — its cohort predates push support, or every push was lost — degrades silently to the sparse-poll cadence. **No push/no-push handshake or capability detection is needed.**
+- A withholding primary costs the seeker nothing beyond the safety-poll cadence — no worse than baseline.
+
+### Edge cases & interactions
+
+- **Renewal vs. fresh arrival.** Only a *fresh* provider registration (a `participantId` not previously held for this topic at this cohort) triggers a push; a renewal of an already-known provider must not — seekers already saw it. Because `arrivalsPerMin` combines fresh registrations and renewals ([cohort-topic.md §Topic traffic signal](cohort-topic.md#topic-traffic-signal)), the trigger keys off the record set transitioning absent→present, **not** off the arrivals counter.
+- **`capacityBudget == 0` arrival.** Skipped (listed-but-full is not a new slot).
+- **Filter miss.** A fresh arrival that fails a seeker's `filter` produces no push to that seeker and does not count toward fan-out.
+- **`minBudget` filter vs. fan-out.** A seeker whose `filter.minBudget` exceeds the arriving provider's `capacityBudget` is not a match — excluded from both the matching set and the FCFS fan-out count.
+- **Burst exceeding remaining need.** Several providers arriving within one coalesce window are carried in one batched push; the seeker dials up to its outstanding `wantCount`.
+- **Primary failover during the coalesce window.** The unflushed batch is lost (transient, non-gossiped); the safety/final poll recovers it. No replay buffer.
+- **`cohortEpoch` change / primary handoff.** The seeker's primary may move ([cohort-topic.md §Membership rotation and primary handoff](cohort-topic.md#membership-rotation-and-primary-handoff)). The old primary stops pushing; the new primary begins pushing future arrivals; the seeker rebinds on its next renewal. In-flight arrivals during the gap are covered by the safety poll. A push that arrives at a seeker that has since re-registered is acked `ArrivalPushAckV1{ unknown_seeker }`, and the primary drops the binding.
+- **Promotion while hanging out.** After the cohort promotes, fresh providers are redirected to tier `d+1` and stop landing here, so pushes cease. The seeker observes `childCohortCount > 0` via the folded `topicTraffic` on its last push (or via a safety poll) and re-runs the descend decision per [§Decision rule](#decision-rule). This is pre-existing polling behavior, not push-specific — the folded `topicTraffic` simply keeps the seeker informed without extra RPCs.
+- **`arrivalsPerMin = 0` right after epoch rotation.** Counters reset on rotation, but pushes are driven by record-set deltas, not the counter, so push delivery is unaffected by the stale-zero window. The existing edge-case rule (do not withdraw on a single zero reading) is unchanged.
+- **Final-poll boundary.** A provider that arrives in the last `push_coalesce_ms` before `patienceMs` expiry may not be pushed in time; the mandatory final `QueryV1` guarantees it is still seen. The final poll fires even when a push is in flight.
+- **Contention-signal interaction (beneficial).** Pushes are not `QueryV1`s, so they do not inflate `queriesPerMin`. As seekers adopt `pushOnArrival`, `queriesPerMin` falls, which lowers `contentionFactor` ([§Decision rule](#decision-rule)) for everyone — the hang-out threshold relaxes as polling load disappears. No code beyond not counting pushes as queries.
+- **Adversarial primary.** The push carries a single-member (primary) signature, not a threshold signature — the same posture as `QueryReplyV1`. A malicious primary can withhold pushes (the seeker degrades to safety poll — no worse than baseline) or push junk providers (the seeker re-validates each `ProviderEntryV1.registrationSig` and discards forgeries). Bounded; see [§Arrival push missed or primary fails mid-coalesce](#arrival-push-missed-or-primary-fails-mid-coalesce).
 
 ---
 
@@ -308,6 +386,14 @@ A cohort-side push channel — where the cohort notifies a hanging-out seeker as
 - **Under-reporting** — claiming a cold tier so the seeker escalates — is also bounded. The seeker takes one extra hop per affected tier and terminates at the root, where aggregated truth is hardest to fake (the root sees the union of all sub-tier providers and runs its own cohort gossip).
 - **Cross-check via cohort gossip.** Other members of the same cohort can detect a primary whose reported rate diverges from the gossip-derived view that drives their own replies. Detection routes through the reputation subsystem (out of scope here; see [architecture.md](architecture.md) §Reputation).
 - **No threshold signature on the reply.** Reasonable for now: a threshold signature on every registration and query reply is expensive, and the bounded worst-case above does not justify the cost. A future ticket may revisit if observed abuse warrants it.
+
+### Arrival push missed or primary fails mid-coalesce
+
+A hanging-out seeker on the push path ([§Arrival push on provider arrival](#arrival-push-on-provider-arrival)) never depends on the push for correctness. Its sparse safety poll (`push_safety_poll_ms`) plus a mandatory final `QueryV1` before `patienceMs` drains make the push a **pure optimization**: a seeker that receives no pushes returns the same providers it would have under the legacy `requery_interval_ms` poll, only at a coarser cadence.
+
+The primary's per-seeker coalescing buffer is **soft, transient, non-gossiped** state. On primary failover the unflushed batch is lost and nothing replays it — unlike reactivity's replay buffer, which exists because committed revisions must not be lost; matchmaking arrivals are advisory and re-discoverable by query. The safety/final poll recovers the lost arrivals.
+
+A withholding or forging primary is bounded exactly as [§Adversarial cohort traffic reporting](#adversarial-cohort-traffic-reporting) describes: withholding costs the seeker nothing beyond the safety-poll cadence, and a forged `ArrivalPushV1` is rejected because the seeker re-validates each entry's `registrationSig` before dialing.
 
 ### Provider primary fails mid-renewal
 Standard cohort-topic primary handoff. The registration record is in cohort gossip, backups take over. Seekers querying during the gap may not see this provider; on the seeker's next query (or on the provider's next renewal) it reappears.
@@ -351,6 +437,7 @@ interface SeekerAppPayloadV1 {
   wantCount:      number
   filter?:        CapabilityFilter
   contactHint:    string
+  pushOnArrival?: boolean             // NEW — opt into arrival pushes; default false (poll path)
   signature:      string
 }
 
@@ -406,6 +493,37 @@ interface SeekerEntryV1 {
 
 The query reply is signed by the cohort primary (single-member signature, not threshold) because the response is advisory: the seeker re-validates `registrationSig` on each entry to confirm provider authenticity. The cohort does not vouch for the providers; it vouches only for "these were the registrations I held."
 
+### Arrival push (cohort-primary → seeker)
+
+A seeker that set `pushOnArrival` receives arrival notifications over a dedicated matchmaking application protocol. Per [cohort-topic.md §Protocol IDs](cohort-topic.md#protocol-ids), application-specific protocols live under their own subsystem prefix and reuse only the cohort identity and primary/backup assignment from the substrate:
+
+```
+/optimystic/matchmaking/1.0.0/arrival-push   — cohort-primary → seeker arrival notification
+```
+
+```
+interface ArrivalPushV1 {
+  v:            1
+  topicId:      string
+  cohortEpoch:  string
+  providers:    ProviderEntryV1[]   // fresh, filter-matched, coalesced batch
+  topicTraffic: TopicTrafficV1      // current snapshot — lets the seeker re-run its
+                                    //   hang-out math and observe childCohortCount>0
+                                    //   (promotion → descend) without a separate poll
+  signature:    string             // cohort primary's single-member sig — advisory,
+                                   //   same trust model as QueryReplyV1; the seeker
+                                   //   re-validates each ProviderEntryV1.registrationSig
+}
+
+interface ArrivalPushAckV1 {
+  v:      1
+  result: "ok" | "unknown_seeker"  // unknown_seeker: primary moved / seeker re-registered;
+                                   //   primary drops the binding and stops pushing
+}
+```
+
+Folding `topicTraffic` into the push means a hanging-out seeker re-evaluates hang-out-vs-continue (and sees promotion via `childCohortCount`) on every push, so the structural-change handling the poll loop got for free is preserved. See [§Arrival push on provider arrival](#arrival-push-on-provider-arrival) for fairness, coalescing, and failure semantics.
+
 ### Aggregated provider counts (root cohort, multi-cohort sweep)
 
 ```
@@ -442,9 +560,11 @@ Returned only by promoted cohorts; cold cohorts that fall through to `NoState` d
 | `patience_per_tier_fraction` | 1.0 | Fraction of remaining patience spent at one tier before considering escalation; 1.0 means "spend it all here before walking" |
 | `filter_accept_ratio_initial` | 1.0 | Starting estimate for `filterAcceptRatio`, refined per walk from observed query yields |
 | `contention_factor_cap` | 4.0 | Upper bound on the contention multiplier; protects the hang-out decision against pathological `queriesPerMin / arrivalsPerMin` ratios |
-| `requery_interval_ms` | 1 000 | How often a hanging-out seeker re-issues `QueryV1` against its cohort |
+| `requery_interval_ms` | 1 000 | How often a hanging-out seeker re-issues `QueryV1` against its cohort on the **non-push** path (a seeker that does not set `pushOnArrival`) |
+| `push_coalesce_ms` | 250 | Window the seeker's primary batches fresh matchable arrivals before flushing one `ArrivalPushV1` (see [§Arrival push on provider arrival](#arrival-push-on-provider-arrival)) |
+| `push_safety_poll_ms` | 5 000 | Sparse fallback `QueryV1` cadence for a push-aware hanging-out seeker (replaces the 1 s `requery_interval_ms` on the push path) |
 
-The last five rows are consumed only by the seeker — they tune the hang-out decision (see [§Hang-out vs. continue](#hang-out-vs-continue)). The cohort layer is unaware of them, so they're application-level rather than protocol-level: changing them on a seeker has no wire impact. No corresponding per-peer rate limit yet exists for `QueryV1` (only `RegisterV1` is rate-limited via `register_rate_per_peer = 4 / min`); at the default `requery_interval_ms = 1000` and `patience_default_ms = 10000` a hanging-out seeker issues at most ~10 queries per match, which is within current cohort budgets. Adding a `QueryV1` rate ceiling is out of scope here; see the matchmaking backlog.
+All of these rows except `push_coalesce_ms` are consumed only by the seeker — they tune the hang-out decision and the seeker's poll/push-fallback cadence (see [§Hang-out vs. continue](#hang-out-vs-continue) and [§Arrival push on provider arrival](#arrival-push-on-provider-arrival)). The cohort-topic layer is unaware of them, so they're application-level rather than protocol-level: changing them on a seeker has no wire impact. `push_coalesce_ms` is the one cohort-side knob — it tunes the batching window on the seeker's matchmaking-app primary, not the cohort-topic substrate, so it likewise carries no cohort-topic protocol impact. No corresponding per-peer rate limit yet exists for `QueryV1` (only `RegisterV1` is rate-limited via `register_rate_per_peer = 4 / min`). On the **non-push** path, at the default `requery_interval_ms = 1000` and `patience_default_ms = 10000` a hanging-out seeker issues at most ~10 queries per match. On the **push** path it issues at most `patienceMs / push_safety_poll_ms + 1` queries (≈ 3 at defaults — the sparse safety polls plus the mandatory final poll), and zero in the common case where the first push already satisfies `wantCount`. Either way it stays within current cohort budgets. Adding a `QueryV1` rate ceiling is out of scope here; see the matchmaking backlog.
 
 The cohort-topic tier for matchmaking is **T2 (functional)**; matchmaking registrations are declined freely by cohorts under T0/T1 load. The seeker's only recourse is to wait — the cohort-topic anti-flood properties prevent the seeker from making things worse by retrying aggressively.
 

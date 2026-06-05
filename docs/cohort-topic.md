@@ -645,7 +645,7 @@ The cohort-topic layer is a substrate. An application — reactivity, matchmakin
 1. **Anchor derivation.** What `topicId` is and whether it rotates. Reactivity uses `H(tailId ‖ "push")` (rotates); matchmaking uses `H("match" ‖ taskId)` (stable).
 2. **`appPayload` contents.** What's in the per-registration application slot.
 3. **Tier choice.** Which tier this application operates at (reactivity push is T3; reactivity replay is T1; matchmaking is T2; voting is T2).
-4. **Post-registration RPCs.** Notification delivery, query, voting protocols, etc. These run between participants and their cached `primary`, with the cohort-topic layer providing only the identity.
+4. **Post-registration RPCs.** Notification delivery, query, voting protocols, etc. These run between participants and their cached `primary`, with the cohort-topic layer providing only the identity. Matchmaking's primary→seeker arrival push ([matchmaking.md §Arrival push on provider arrival](matchmaking.md#arrival-push-on-provider-arrival)) is one such RPC: it fires off the existing gossip-replicated registration records, so it needs no new substrate protocol.
 5. **Replay or caching.** If the application needs durable buffering (reactivity does, matchmaking generally doesn't), it manages that state inside the cohort using the layer's existing gossip channel.
 6. **Anchor rotation handling.** If the anchor changes (tail rotation), the application detects via its own logic and re-registers under the new `topicId`; the layer treats the new anchor as a new topic.
 
