@@ -1,0 +1,45 @@
+{
+  "name": "@optimystic/substrate-simulator",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Discrete-event virtual-clock engine for the Optimystic design simulator (mock-only, not shipped to runtime consumers)",
+  "main": "dist/src/index.js",
+  "types": "./dist/src/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/src/index.d.ts",
+      "import": "./dist/src/index.js"
+    }
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/gotchoices/optimystic.git",
+    "directory": "packages/substrate-simulator"
+  },
+  "author": "Got Choices Foundation",
+  "license": "MIT",
+  "keywords": [
+    "optimystic",
+    "simulator",
+    "discrete-event",
+    "virtual-clock",
+    "deterministic"
+  ],
+  "scripts": {
+    "clean": "rimraf dist",
+    "build": "tsc",
+    "test": "node --import ./register.mjs node_modules/mocha/bin/mocha.js \"test/**/*.spec.ts\" --colors --reporter min",
+    "test:verbose": "node --import ./register.mjs node_modules/mocha/bin/mocha.js \"test/**/*.spec.ts\" --colors --reporter spec"
+  },
+  "devDependencies": {
+    "@types/chai": "^5.2.3",
+    "@types/mocha": "^10.0.10",
+    "@types/node": "^25.1.0",
+    "chai": "^6.2.2",
+    "mocha": "^11.7.5",
+    "rimraf": "^6.1.2",
+    "ts-node": "^10.9.2",
+    "typescript": "^5.9.3"
+  }
+}

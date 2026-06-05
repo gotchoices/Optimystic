@@ -1488,6 +1488,21 @@ __metadata:
   languageName: unknown
   linkType: soft
 
+"@optimystic/substrate-simulator@workspace:packages/substrate-simulator":
+  version: 0.0.0-use.local
+  resolution: "@optimystic/substrate-simulator@workspace:packages/substrate-simulator"
+  dependencies:
+    "@types/chai": "npm:^5.2.3"
+    "@types/mocha": "npm:^10.0.10"
+    "@types/node": "npm:^25.1.0"
+    chai: "npm:^6.2.2"
+    mocha: "npm:^11.7.5"
+    rimraf: "npm:^6.1.2"
+    ts-node: "npm:^10.9.2"
+    typescript: "npm:^5.9.3"
+  languageName: unknown
+  linkType: soft
+
 "@pkgjs/parseargs@npm:^0.11.0":
   version: 0.11.0
   resolution: "@pkgjs/parseargs@npm:0.11.0"
