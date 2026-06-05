@@ -1,5 +1,5 @@
 import { expect } from 'chai';
-import { ClusterMember, clusterMember } from '../src/cluster/cluster-repo.js';
+import { ClusterMember, clusterMember, type ReconcileBlockCallback } from '../src/cluster/cluster-repo.js';
 import { StorageRepo } from '../src/storage/storage-repo.js';
 import { MemoryRawStorage } from '../src/storage/memory-storage.js';
 import { BlockStorage } from '../src/storage/block-storage.js';
@@ -284,5 +284,122 @@ describe('ClusterMember consensus-execution divergence (stream-reset root cause)
 		// stale pend. Must not throw.
 		const result = await member.update(record);
 		expect(result).to.not.equal(undefined);
+	});
+
+	it('reconciles the committed rev from a cohort peer when behind (under-replication restored)', async () => {
+		// Sibling store stands in for a cohort peer that DID see the pend + commit, so it
+		// holds block-1 @ rev 1. The behind member pulls from it via the reconcile callback.
+		const sibling = realStorageRepo();
+		await sibling.pend({ actionId: 'a-missing', transforms: { inserts: { 'block-1': makeBlock('block-1') }, updates: {}, deletes: [] }, policy: 'c' });
+		const seed = await sibling.commit({ actionId: 'a-missing', blockIds: ['block-1'], tailId: 'block-1' as BlockId, rev: 1 });
+		expect(seed.success).to.equal(true);
+
+		const storage = realStorageRepo();
+		let reconcileCalls = 0;
+		let observedCohort: string[] = [];
+		const reconcileBlock: ReconcileBlockCallback = async (blockId, committed, cohortPeerIds) => {
+			reconcileCalls++;
+			observedCohort = cohortPeerIds;
+			const got = await sibling.get({ blockIds: [blockId] });
+			const entry = got[blockId];
+			const latest = entry?.state?.latest;
+			if (latest && entry?.block && latest.rev >= committed.rev) {
+				await storage.saveReplicatedBlock(blockId, entry.block, latest);
+			}
+		};
+		member = clusterMember({ storageRepo: storage, peerNetwork: mockNetwork, peerId: self.peerId, privateKey: self.privateKey, reconcileBlock });
+
+		const record = await buildConsensusCommitRecord(self, other, makeCommitOperation('a-missing', 'block-1', 1));
+		const result = await member.update(record);
+
+		expect(result.commits[self.peerId.toString()]).to.not.equal(undefined);
+		expect(member.wasTransactionExecuted(record.messageHash)).to.equal(true);
+		// Reconciliation fired against the cohort, with self excluded...
+		expect(reconcileCalls).to.equal(1);
+		expect(observedCohort).to.include(other.peerId.toString());
+		expect(observedCohort).to.not.include(self.peerId.toString());
+		// ...and the member now durably holds the committed revision (undefined before the fix).
+		const got = await storage.get({ blockIds: ['block-1'] });
+		expect(got['block-1']?.state?.latest?.rev).to.equal(1);
+		expect(got['block-1']?.state?.latest?.actionId).to.equal('a-missing');
+	});
+
+	it('tolerates a reconcile callback that throws (best-effort: never resets the stream)', async () => {
+		// The core safety invariant: a behind member still tolerates the divergence even
+		// when active reconciliation fails. A throw out of the callback must be swallowed —
+		// re-throwing would reset the cluster stream the prereq removed.
+		const storage = realStorageRepo();
+		let reconcileCalls = 0;
+		const reconcileBlock: ReconcileBlockCallback = async () => {
+			reconcileCalls++;
+			throw new Error('cohort peer unreachable');
+		};
+		member = clusterMember({ storageRepo: storage, peerNetwork: mockNetwork, peerId: self.peerId, privateKey: self.privateKey, reconcileBlock });
+
+		const record = await buildConsensusCommitRecord(self, other, makeCommitOperation('a-missing', 'block-1', 1));
+
+		let threw: Error | undefined;
+		try {
+			await member.update(record);
+		} catch (err) {
+			threw = err as Error;
+		}
+		expect(threw, 'a failed reconcile must NOT propagate / reset the stream').to.equal(undefined);
+		expect(reconcileCalls).to.equal(1);
+		// Divergence tolerated and recorded as executed; reconcile failure was logged, not thrown.
+		expect(member.wasTransactionExecuted(record.messageHash)).to.equal(true);
+		// The block stays under-replicated (reconcile failed) — no false durability claim.
+		const got = await storage.get({ blockIds: ['block-1'] });
+		expect(got['block-1']?.state?.latest).to.equal(undefined);
+	});
+
+	it('does NOT reconcile downward when the member is already ahead of the committed rev', async () => {
+		const storage = realStorageRepo();
+		// Block already committed at rev 2 locally (member is ahead).
+		await storage.pend({ actionId: 'a-old', transforms: { inserts: { 'block-1': makeBlock('block-1') }, updates: {}, deletes: [] }, policy: 'c' });
+		const seed = await storage.commit({ actionId: 'a-old', blockIds: ['block-1'], tailId: 'block-1' as BlockId, rev: 2 });
+		expect(seed.success).to.equal(true);
+
+		let reconcileCalls = 0;
+		const reconcileBlock: ReconcileBlockCallback = async () => { reconcileCalls++; };
+		member = clusterMember({ storageRepo: storage, peerNetwork: mockNetwork, peerId: self.peerId, privateKey: self.privateKey, reconcileBlock });
+
+		// Stale commit (rev 1 < local rev 2): storage-repo returns success:false + missing.
+		const record = await buildConsensusCommitRecord(self, other, makeCommitOperation('a-stale', 'block-1', 1));
+		await member.update(record);
+
+		expect(reconcileCalls, 'ahead/stale divergence must not reconcile downward').to.equal(0);
+		// Local revision is unchanged — no downgrade.
+		const got = await storage.get({ blockIds: ['block-1'] });
+		expect(got['block-1']?.state?.latest?.rev).to.equal(2);
+		expect(got['block-1']?.state?.latest?.actionId).to.equal('a-old');
+	});
+
+	it('propagates a genuine commit failure returned as success:false + reason (no missing)', async () => {
+		// A repo whose commit RETURNS a bare-reason failure — not a divergence `missing`,
+		// not a thrown fault — must NOT be tolerated and must NOT trigger reconciliation.
+		class ReturnFailRepo implements IRepo {
+			async get(_b: BlockGets): Promise<GetBlockResults> { return {}; }
+			async pend(_r: PendRequest): Promise<PendResult> { return { success: true, blockIds: [], pending: [] }; }
+			async commit(_r: CommitRequest): Promise<CommitResult> { return { success: false, reason: 'internal commit fault' }; }
+			async cancel(_a: ActionBlocks): Promise<void> { /* no-op */ }
+		}
+		let reconcileCalls = 0;
+		const reconcileBlock: ReconcileBlockCallback = async () => { reconcileCalls++; };
+		member = clusterMember({ storageRepo: new ReturnFailRepo(), peerNetwork: mockNetwork, peerId: self.peerId, privateKey: self.privateKey, reconcileBlock });
+
+		const record = await buildConsensusCommitRecord(self, other, makeCommitOperation('a-fault', 'block-1', 1));
+
+		let threw: Error | undefined;
+		try {
+			await member.update(record);
+		} catch (err) {
+			threw = err as Error;
+		}
+		expect(threw, 'a bare-reason commit failure must propagate, not be tolerated').to.not.equal(undefined);
+		expect(threw!.message).to.include('internal commit fault');
+		// Executed marker rolled back so a corrected retry can re-run; no reconciliation.
+		expect(member.wasTransactionExecuted(record.messageHash)).to.equal(false);
+		expect(reconcileCalls).to.equal(0);
 	});
 });

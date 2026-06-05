@@ -5,7 +5,7 @@ import type { IPeerNetwork } from '@optimystic/db-core';
 import { NetworkTransactor } from '@optimystic/db-core';
 import { peerIdFromPrivateKey } from '@libp2p/peer-id';
 import { generateKeyPair } from '@libp2p/crypto/keys';
-import { ClusterMember, clusterMember } from '../cluster/cluster-repo.js';
+import { ClusterMember, clusterMember, type ReconcileBlockCallback } from '../cluster/cluster-repo.js';
 import { StorageRepo } from '../storage/storage-repo.js';
 import { MemoryRawStorage } from '../storage/memory-storage.js';
 import { BlockStorage } from '../storage/block-storage.js';
@@ -149,12 +149,32 @@ export async function createMesh(nodeCount: number, options: MeshOptions): Promi
 			partitionDetectionWindow: 60000
 		};
 
+		// Active reconciliation simulation: when a member commits a block it never
+		// pended (cohort drift), pull the committed revision from a sibling cohort node
+		// that holds it and persist it locally — the mesh analogue of the SyncClient
+		// fetch + saveReplicatedBlock path wired in `libp2p-node-base`. `nodes` is captured
+		// by reference and fully populated by the time the callback is actually invoked.
+		const reconcileBlock: ReconcileBlockCallback = async (blockId, committed, cohortPeerIds) => {
+			for (const peerIdStr of cohortPeerIds) {
+				if (peerIdStr === peerId.toString()) continue;
+				const target = nodes.find(n => n.peerId.toString() === peerIdStr);
+				if (!target) continue;
+				const result = await target.storageRepo.get({ blockIds: [blockId] }, { skipClusterFetch: true } as any);
+				const entry = result[blockId];
+				const latest = entry?.state?.latest;
+				if (!latest || !entry?.block || latest.rev < committed.rev) continue;
+				await storageRepo.saveReplicatedBlock(blockId, entry.block, latest);
+				return;
+			}
+		};
+
 		const member = clusterMember({
 			storageRepo,
 			peerNetwork,
 			peerId,
 			privateKey,
-			consensusConfig
+			consensusConfig,
+			reconcileBlock
 		});
 
 		nodes.push({

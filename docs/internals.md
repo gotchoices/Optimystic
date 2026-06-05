@@ -161,17 +161,27 @@ saveMaterializedBlock(block): store(structuredClone(block));
 - Different operations (pend vs commit) have DIFFERENT messageHashes
 - **Post-consensus local-execution failures are tolerated, not thrown.** Once
   consensus is reached the operation is authoritative; a member that cannot apply
-  it locally (it is *ahead* — stale pend/commit returns `success:false` — or
-  *behind* — missing the prior pend, so `StorageRepo.commit` throws "Pending
-  action … not found") logs `cluster-member:consensus-{pend,commit}-diverged` and
-  defers reconciliation rather than throwing. Throwing would reset the cluster
-  stream the coordinator awaits and surface as a spurious `StreamResetError`,
-  sinking an otherwise-successful transaction. Only genuinely *thrown*,
-  non-divergence faults still propagate (`applyConsensusOperation`).
-- **Caveat:** reconciliation of a diverged member currently relies on lazy
-  read-repair, which cannot recover a block no reachable peer holds (under-
-  replication from cohort drift). Active reconciliation is tracked by the
-  `web-e2e-tier2-cross-tab-convergence-under-replication` follow-up.
+  it locally (it is *ahead* — stale pend/commit returns `success:false` with
+  `missing` — or *behind* — missing the prior pend, so `StorageRepo.commit` throws
+  "Pending action … not found") logs `cluster-member:consensus-{pend,commit}-diverged`
+  and tolerates the divergence rather than throwing. Throwing would reset the
+  cluster stream the coordinator awaits and surface as a spurious `StreamResetError`,
+  sinking an otherwise-successful transaction.
+- **The commit divergence split keys off `CommitResult`, not throw-vs-return.** A
+  missing pend (thrown "not found") or a stale/ahead commit (`success:false` with
+  `missing`) is divergence and tolerated; a genuine mid-commit fault (`success:false`
+  with a bare `reason`, no `missing`) is propagated so `handleConsensus` rolls back
+  the executed marker and rethrows — same as an unexpected *thrown* fault
+  (`applyConsensusOperation`).
+- **A *behind* member actively reconciles.** It holds no revision of the committed
+  blocks, so it pulls the committed revision from a cohort peer that holds it (via
+  the injected `reconcileBlock` callback — `SyncClient` fetch + `saveReplicatedBlock`
+  in `libp2p-node-base`) and restores it locally, repairing the under-replication
+  that lazy read-repair alone cannot (no reachable peer the reader sees holds the
+  newer rev). Reconciliation is best-effort and bounded (`ReconcileTimeoutMs`):
+  failures/timeouts are logged (`cluster-member:consensus-commit-reconcile-failed`),
+  never thrown. An *ahead* member already holds ≥ the rev, so it does not reconcile
+  downward.
 
 ### Collection Header Blocks
 - Header blockId = collection name (deterministic)

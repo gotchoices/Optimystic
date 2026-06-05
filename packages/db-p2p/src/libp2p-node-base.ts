@@ -18,23 +18,24 @@ import { StorageRepo } from './storage/storage-repo.js';
 import { BlockStorage } from './storage/block-storage.js';
 import { MemoryRawStorage } from './storage/memory-storage.js';
 import type { IRawStorage } from './storage/i-raw-storage.js';
-import { clusterMember } from './cluster/cluster-repo.js';
+import { clusterMember, type ReconcileBlockCallback } from './cluster/cluster-repo.js';
 import { coordinatorRepo } from './repo/coordinator-repo.js';
 import { Libp2pKeyPeerNetwork, type NetworkMode, type NetworkStatePersistence } from './libp2p-key-network.js';
 import { ClusterClient } from './cluster/client.js';
-import type { IRepo, ICluster, ITransactionValidator } from '@optimystic/db-core';
+import type { IRepo, ICluster, ITransactionValidator, BlockId, ActionRev, IBlock } from '@optimystic/db-core';
 import type { ITransactionStateStore } from './cluster/i-transaction-state-store.js';
 import { networkManagerService } from './network/network-manager-service.js';
 import { fretService, Libp2pFretService } from 'p2p-fret';
 import { syncService } from './sync/service.js';
 import { SyncClient } from './sync/client.js';
+import type { SyncResponse } from './sync/protocol.js';
 import type { ClusterLatestCallback } from './repo/coordinator-repo.js';
 import { RestorationCoordinator } from './storage/restoration-coordinator-v2.js';
 import { RingSelector } from './storage/ring-selector.js';
 import { StorageMonitor } from './storage/storage-monitor.js';
 import type { StorageMonitorConfig } from './storage/storage-monitor.js';
 import { ArachnodeFretAdapter } from './storage/arachnode-fret-adapter.js';
-import type { RestoreCallback } from './storage/struct.js';
+import type { RestoreCallback, BlockArchive } from './storage/struct.js';
 import type { FretService } from 'p2p-fret';
 import { PartitionDetector } from './cluster/partition-detector.js';
 import { PeerReputationService } from './reputation/peer-reputation.js';
@@ -383,6 +384,60 @@ export async function createLibp2pNodeBase(
 		partitionDetectionWindow: 60000
 	};
 
+	// Fetch a block archive from one cohort peer over the sync protocol, bounded by a
+	// per-peer timeout so an unreachable peer can't stall reconciliation. Mirrors the
+	// SyncClient query in `clusterLatestCallback`, but returns the full archive (which
+	// carries the materialized block) rather than only the latest ActionRev.
+	const fetchArchiveFromPeer = async (peerIdStr: string, blockId: BlockId): Promise<BlockArchive | undefined> => {
+		let peerId: ReturnType<typeof peerIdFromString>;
+		try {
+			peerId = peerIdFromString(peerIdStr);
+		} catch {
+			return undefined;
+		}
+		if (peerId.equals(node.peerId)) return undefined;
+		const syncClient = new SyncClient(peerId, keyNetwork, protocolPrefix);
+		try {
+			const response = await Promise.race<SyncResponse>([
+				syncClient.requestBlock({ blockId, rev: undefined }),
+				new Promise<SyncResponse>(resolve => { setTimeout(() => resolve({ success: false }), 1000).unref(); })
+			]);
+			return response.success ? response.archive : undefined;
+		} catch {
+			// Peer unreachable / no data — caller falls back to the next cohort peer.
+			return undefined;
+		}
+	};
+
+	// Active reconciliation for a block this member committed without the matching pend
+	// (cohort drift). Queries the commit cohort (self already excluded) for the block,
+	// picks the highest revision that is at least the committed rev, and persists it via
+	// the churn-replication funnel so the block is no longer under-replicated.
+	const reconcileBlock: ReconcileBlockCallback = async (blockId, committed, cohortPeerIds) => {
+		const targets = cohortPeerIds.filter(id => id !== node.peerId.toString());
+		if (targets.length === 0) return;
+
+		const archives = await Promise.all(targets.map(peerIdStr => fetchArchiveFromPeer(peerIdStr, blockId)));
+
+		let best: { block: IBlock; source: ActionRev } | undefined;
+		for (const archive of archives) {
+			if (!archive) continue;
+			const revs = Object.keys(archive.revisions).map(Number);
+			if (revs.length === 0) continue;
+			const maxRev = Math.max(...revs);
+			if (maxRev < committed.rev) continue;
+			const data = archive.revisions[maxRev];
+			if (!data?.block) continue;
+			if (!best || maxRev > best.source.rev) {
+				best = { block: data.block, source: { actionId: data.action.actionId, rev: maxRev } };
+			}
+		}
+
+		if (best) {
+			await storageRepo.saveReplicatedBlock(blockId, best.block, best.source);
+		}
+	};
+
 	clusterImpl = clusterMember({
 		storageRepo,
 		peerNetwork: keyNetwork,
@@ -394,7 +449,8 @@ export async function createLibp2pNodeBase(
 		validator: options.validator,
 		reputation,
 		consensusConfig,
-		stateStore: options.transactionStateStore
+		stateStore: options.transactionStateStore,
+		reconcileBlock
 	});
 
 	const coordinatorRepoFactory = coordinatorRepo(

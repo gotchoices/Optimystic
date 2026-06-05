@@ -1,4 +1,4 @@
-import type { IRepo, ClusterRecord, Signature, RepoMessage, ITransactionValidator, ClusterConsensusConfig, CommitResult } from "@optimystic/db-core";
+import type { IRepo, ClusterRecord, Signature, RepoMessage, ITransactionValidator, ClusterConsensusConfig, CommitResult, BlockId, ActionRev, CommitRequest } from "@optimystic/db-core";
 import type { ICluster } from "@optimystic/db-core";
 import type { IPeerNetwork } from "@optimystic/db-core";
 import { blockIdsForTransforms } from "@optimystic/db-core";
@@ -35,6 +35,19 @@ interface TransactionState {
 	lastUpdate: number;
 }
 
+/**
+ * Actively reconciles a block this member committed without having seen the matching
+ * pend (cohort drift between the independent pend and commit cluster-transactions).
+ * Pulls the committed revision from a cohort peer that holds it and restores it into
+ * local storage. Injected so {@link ClusterMember} stays transport-agnostic — mirrors
+ * how `CoordinatorRepo` receives its `clusterLatestCallback`.
+ *
+ * @param blockId       the under-replicated block to restore
+ * @param committed     the committed `(actionId, rev)` agreed by consensus
+ * @param cohortPeerIds cohort members to pull from (self already excluded)
+ */
+export type ReconcileBlockCallback = (blockId: BlockId, committed: ActionRev, cohortPeerIds: string[]) => Promise<void>;
+
 interface ClusterMemberComponents {
 	storageRepo: IRepo;
 	peerNetwork: IPeerNetwork;
@@ -48,6 +61,8 @@ interface ClusterMemberComponents {
 	reputation?: IPeerReputation;
 	consensusConfig?: ClusterConsensusConfig;
 	stateStore?: ITransactionStateStore;
+	/** Restores a block under-replicated by cohort drift; see {@link ReconcileBlockCallback}. */
+	reconcileBlock?: ReconcileBlockCallback;
 }
 
 export function clusterMember(components: ClusterMemberComponents): ClusterMember {
@@ -62,12 +77,18 @@ export function clusterMember(components: ClusterMemberComponents): ClusterMembe
 		components.validator,
 		components.reputation,
 		components.consensusConfig,
-		components.stateStore
+		components.stateStore,
+		components.reconcileBlock
 	);
 }
 
 // How long to keep executed transaction records (10 minutes)
 const ExecutedTransactionTtlMs = 10 * 60 * 1000;
+
+// Upper bound on an awaited active reconciliation of a divergent commit. Bounds the
+// consensus path so a slow/unreachable cohort peer can't stall the cluster stream;
+// a timeout is logged and tolerated (never thrown — that would reset the stream).
+const ReconcileTimeoutMs = 5000;
 
 /**
  * True when a thrown storage error reports a missing pending action — i.e. this
@@ -111,7 +132,8 @@ export class ClusterMember implements ICluster {
 		private readonly validator?: ITransactionValidator,
 		private readonly reputation?: IPeerReputation,
 		consensusConfig?: ClusterConsensusConfig,
-		private readonly stateStore?: ITransactionStateStore
+		private readonly stateStore?: ITransactionStateStore,
+		private readonly reconcileBlock?: ReconcileBlockCallback
 	) {
 		this.superMajorityThreshold = consensusConfig?.superMajorityThreshold ?? 1.0;
 		// Periodically clean up expired transactions (.unref() so tests/short-lived processes can exit)
@@ -681,7 +703,7 @@ export class ClusterMember implements ICluster {
 
 		try {
 			for (const operation of record.message.operations) {
-				await this.applyConsensusOperation(record.messageHash, operation);
+				await this.applyConsensusOperation(record, operation);
 			}
 		} catch (err) {
 			// A genuinely unexpected fault (e.g. storage I/O) — roll back the executed
@@ -702,33 +724,37 @@ export class ClusterMember implements ICluster {
 	 * local state has diverged from the agreed history:
 	 *
 	 *   - **ahead**: we already hold a newer revision, so a stale pend/commit is a
-	 *     no-op for us (`storageRepo` returns `success:false` / `missing`);
+	 *     no-op for us (`StorageRepo.commit` returns `success:false` with `missing`);
 	 *   - **behind**: we missed the prior `pend` cluster-transaction (cohort drift
-	 *     between the pend and commit phases, or transient unreachability), so we lack
-	 *     the pending action — `StorageRepo.commit` *throws* "Pending action … not found".
+	 *     between the independent pend and commit phases, or transient unreachability),
+	 *     so we lack the pending action — `StorageRepo.commit` *throws* "Pending
+	 *     action … not found".
 	 *
-	 * The *intended* recovery is the normal sync / lazy read-repair path on the next
-	 * read of these blocks (`CoordinatorRepo.get`). NOTE: that recovery is currently
-	 * incomplete — read-repair can only pull a newer revision when some reachable peer
-	 * actually holds it, so a block under-replicated by cohort drift can stay stale.
-	 * Restoring replication (active reconciliation from a cohort peer here) is tracked
-	 * by the `web-e2e-tier2-cross-tab-convergence-under-replication` follow-up. What
-	 * this guard guarantees today is only that we do NOT reset the stream: throwing here
-	 * would reset the cluster stream the coordinator is awaiting and surface as a
-	 * spurious `StreamResetError`, sinking an otherwise-successful transaction — the
-	 * exact failure this removes. A genuinely *invalid* pend can never get this far: it
-	 * is rejected during the promise phase (`validatePendOperations`, which validates
-	 * pend ops only — commits carry no promise-phase validation). So divergence is
-	 * tolerated (logged for observability); unexpected *thrown* faults still propagate.
+	 * For the **behind** case we hold no revision of the committed blocks at all, so we
+	 * actively reconcile: pull the committed revision from a cohort peer that holds it
+	 * (`reconcileBlock`) and restore it locally. Lazy read-repair on a later read cannot
+	 * recover it on its own when cohort drift has left the block under-replicated (no
+	 * reachable peer the reader sees holds the newer rev), so reconciling here is what
+	 * keeps cross-cohort transactions converging. For the **ahead** case we already hold
+	 * ≥ the committed rev, so we tolerate the no-op without reconciling downward.
 	 *
-	 * CAVEAT: the propagate-vs-tolerate split keys off throw-vs-return, not off the
-	 * failure's nature. A genuine `internalCommit` fault surfaces as `success:false`
-	 * (with `reason`, no `missing`) and is tolerated here like divergence, whereas the
-	 * same fault thrown would propagate. `CommitResult` already distinguishes the two
-	 * (`missing` ⇒ stale/ahead divergence; bare `reason` ⇒ genuine failure); folding
-	 * that distinction in is part of the convergence follow-up's reconciliation work.
+	 * Whatever happens, we must NOT reset the stream: throwing here would reset the
+	 * cluster stream the coordinator is awaiting and surface as a spurious
+	 * `StreamResetError`, sinking an otherwise-successful transaction. So divergence —
+	 * and any reconciliation failure — is tolerated (logged for observability). A
+	 * genuinely *invalid* pend can never get this far: it is rejected during the promise
+	 * phase (`validatePendOperations`, which validates pend ops only — commits carry no
+	 * promise-phase validation).
+	 *
+	 * The propagate-vs-tolerate split keys off the failure's *nature* via `CommitResult`,
+	 * not throw-vs-return: a missing pend (thrown "not found") or a stale/ahead commit
+	 * (`success:false` with `missing`) is divergence and tolerated, whereas a genuine
+	 * mid-commit `internalCommit` fault (`success:false` with a bare `reason`, no
+	 * `missing`) is propagated so {@link handleConsensus} rolls back the executed marker
+	 * and rethrows — exactly like an unexpected thrown fault.
 	 */
-	private async applyConsensusOperation(messageHash: string, operation: RepoMessage['operations'][number]): Promise<void> {
+	private async applyConsensusOperation(record: ClusterRecord, operation: RepoMessage['operations'][number]): Promise<void> {
+		const messageHash = record.messageHash;
 		if ('get' in operation) {
 			await this.storageRepo.get(operation.get);
 			return;
@@ -751,32 +777,101 @@ export class ClusterMember implements ICluster {
 			return;
 		}
 		if ('commit' in operation) {
+			const commit = operation.commit;
 			let result: CommitResult;
 			try {
-				result = await this.storageRepo.commit(operation.commit);
+				result = await this.storageRepo.commit(commit);
 			} catch (err) {
 				// `StorageRepo.commit` throws (rather than returning success:false) when
-				// the pending action is missing — the canonical "behind" signal.
+				// the pending action is missing — the canonical "behind" signal: this
+				// member reached commit-consensus without the matching pend (cohort drift).
 				if (isMissingPendingActionError(err)) {
 					log('cluster-member:consensus-commit-diverged', {
 						messageHash,
-						actionId: operation.commit.actionId,
+						actionId: commit.actionId,
+						divergence: 'behind',
 						reason: (err as Error).message
 					});
+					// We hold no revision of these blocks; pull the committed revision from a
+					// cohort peer so the block is no longer under-replicated. Best-effort:
+					// failures are logged inside, never thrown (a throw would reset the stream).
+					await this.reconcileDivergentCommit(record, commit);
 					return;
 				}
 				throw err;
 			}
 			if (!result.success) {
-				log('cluster-member:consensus-commit-diverged', {
-					messageHash,
-					actionId: operation.commit.actionId,
-					reason: result.reason,
-					hasMissing: !!result.missing?.length
-				});
+				// success:false is a StaleFailure. `missing` ⇒ ahead/stale divergence
+				// (we already hold ≥ this rev): tolerate, do NOT reconcile downward. A bare
+				// `reason` with no `missing` ⇒ a genuine internalCommit fault: propagate so
+				// handleConsensus rolls back the executed marker and rethrows.
+				if (result.missing?.length) {
+					log('cluster-member:consensus-commit-diverged', {
+						messageHash,
+						actionId: commit.actionId,
+						divergence: 'ahead',
+						reason: result.reason,
+						hasMissing: true
+					});
+					return;
+				}
+				throw new Error(`Consensus commit for action ${commit.actionId} failed: ${result.reason ?? 'unknown reason'}`);
 			}
 			return;
 		}
+	}
+
+	/**
+	 * After tolerating a "behind" commit divergence, pull the committed revision of
+	 * each block from a cohort peer that holds it and restore it locally. Best-effort:
+	 * a missing callback, an empty cohort, or a per-block failure/timeout is logged and
+	 * tolerated — never thrown, since a throw out of consensus execution resets the
+	 * cluster stream.
+	 */
+	private async reconcileDivergentCommit(record: ClusterRecord, commit: CommitRequest): Promise<void> {
+		if (!this.reconcileBlock) {
+			log('cluster-member:consensus-commit-reconcile-skip', { messageHash: record.messageHash, reason: 'no-callback' });
+			return;
+		}
+		const cohortPeerIds = Object.keys(record.peers).filter(id => id !== this.peerId.toString());
+		if (cohortPeerIds.length === 0) {
+			log('cluster-member:consensus-commit-reconcile-skip', { messageHash: record.messageHash, reason: 'no-cohort-peers' });
+			return;
+		}
+		const committed: ActionRev = { actionId: commit.actionId, rev: commit.rev };
+		await Promise.all(
+			commit.blockIds.map(blockId => this.reconcileOneBlock(record.messageHash, blockId, committed, cohortPeerIds))
+		);
+	}
+
+	/** Reconcile a single block, bounding the awaited callback and swallowing failures. */
+	private async reconcileOneBlock(messageHash: string, blockId: BlockId, committed: ActionRev, cohortPeerIds: string[]): Promise<void> {
+		try {
+			await this.withReconcileTimeout(this.reconcileBlock!(blockId, committed, cohortPeerIds), blockId);
+			log('cluster-member:consensus-commit-reconciled', { messageHash, blockId, rev: committed.rev });
+		} catch (err) {
+			log('cluster-member:consensus-commit-reconcile-failed', {
+				messageHash,
+				blockId,
+				rev: committed.rev,
+				error: (err as Error).message
+			});
+		}
+	}
+
+	/** Bound an awaited reconcile so a slow/unreachable cohort peer can't stall consensus. */
+	private withReconcileTimeout<T>(promise: Promise<T>, blockId: BlockId): Promise<T> {
+		let timer: NodeJS.Timeout | undefined;
+		const timeout = new Promise<never>((_, reject) => {
+			timer = setTimeout(
+				() => reject(new Error(`reconcile for block ${blockId} timed out after ${ReconcileTimeoutMs}ms`)),
+				ReconcileTimeoutMs
+			);
+			timer.unref();
+		});
+		return Promise.race([promise, timeout]).finally(() => {
+			if (timer) clearTimeout(timer);
+		});
 	}
 
 	private async handleRejection(_record: ClusterRecord): Promise<void> {

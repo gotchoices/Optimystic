@@ -438,4 +438,50 @@ describe('CoordinatorRepo Integration (TEST-5.3.1)', () => {
 			}
 		});
 	});
+
+	describe('cross-cohort convergence via active reconciliation', () => {
+		it('reconciles a committed block on a member that missed the pend phase', async () => {
+			// responsibilityK=3 so all three peers are in every cohort; superMajorityThreshold
+			// 0.51 keeps consensus reachable (2/3) with the laggard absent.
+			const mesh = await createMesh(3, { responsibilityK: 3, superMajorityThreshold: 0.51 });
+			const coordinator = mesh.nodes[0]!;
+			const laggard = mesh.nodes[2]!;
+			const blockId = 'block-xcohort';
+
+			// Phase 1 — laggard fully unreachable: nodes 0 & 1 STABLY pend+commit rev 1
+			// while the laggard misses both phases and holds nothing. Committing on the two
+			// peers in a completed transaction first (rather than concurrently with the
+			// laggard's reconcile in a single broadcast) is what makes this deterministic:
+			// the reconcile source is already settled before the laggard pulls from it.
+			mesh.failures.failingPeers = new Set([laggard.peerId.toString()]);
+			const pendResult = await coordinator.coordinatorRepo.pend(
+				{ actionId: 'a-xc', transforms: makeTransforms(blockId), policy: 'c' }
+			);
+			expect(pendResult.success).to.equal(true);
+			const commit1 = await coordinator.coordinatorRepo.commit(
+				{ actionId: 'a-xc', tailId: blockId as BlockId, rev: 1, blockIds: [blockId] }
+			);
+			expect(commit1.success).to.equal(true);
+
+			// The laggard genuinely holds no revision (it missed the pend).
+			const before = await laggard.storageRepo.get({ blockIds: [blockId] });
+			expect(before[blockId]?.state?.latest).to.equal(undefined);
+
+			// Phase 2 — laggard reachable again, re-commit the SAME (actionId, rev). It joins
+			// the commit cohort having missed the pend, so its local commit throws
+			// "not found"; the member tolerates the divergence and actively reconciles the
+			// committed revision from a cohort peer that already (stably) holds it.
+			mesh.failures.failingPeers = undefined;
+			const commit2 = await coordinator.coordinatorRepo.commit(
+				{ actionId: 'a-xc', tailId: blockId as BlockId, rev: 1, blockIds: [blockId] }
+			);
+			expect(commit2.success).to.equal(true);
+
+			// Replication restored: the pend-missing member now holds the committed revision,
+			// so a cross-cohort transaction converges.
+			const after = await laggard.storageRepo.get({ blockIds: [blockId] });
+			expect(after[blockId]?.state?.latest?.rev).to.equal(1);
+			expect(after[blockId]?.state?.latest?.actionId).to.equal('a-xc');
+		});
+	});
 });
