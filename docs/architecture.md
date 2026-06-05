@@ -234,10 +234,24 @@ Both monitors are suppressed during detected network partitions (`PartitionDetec
 
 A shared **cohort-topic** substrate ([cohort-topic.md](cohort-topic.md)) provides FRET-backed topic trees for any subsystem that needs to find, attach to, or fan out from a named set of peers. Topic trees grow from a single root cohort outward in tiers, sharded by peer-ID prefix; participants walk toward the root from an estimated max tier and only follow explicit promotion redirects outward, giving anti-flood behavior by construction. The layer supplies addressing, willingness-gated admission, TTL-refreshed soft state, cohort threshold signatures, and a tier ladder (T0 essential → T3 luxury) that lets nodes prioritize transaction work over discretionary forwarding.
 
-Two applications run on the substrate today:
+The cohort-topic substrate and both applications below are **specified / design-only with zero implementation today** — a repo-wide search for their wire types and routing entry points returns no matches. A **simulator phase validates the design's quantitative claims before the core protocols land**; see the specs ([cohort-topic.md](cohort-topic.md), [reactivity.md](reactivity.md), [matchmaking.md](matchmaking.md)) and the per-subsystem status table below.
 
-* **Reactivity** ([reactivity.md](reactivity.md)) — push-tree mode. Notifications about collection commits fan out through a tree rooted at the tail block's coordinate (rotating, to deny attackers a persistent target). Threshold signatures reuse the commit certificate; subscribers backfill from a replay buffer at the nearest forwarder. T3 (luxury) — never starves transaction processing.
-* **Matchmaking** ([matchmaking.md](matchmaking.md)) — directory mode. Providers and seekers register at a stable per-task topic; cohorts return advisory provider sets to seekers. Used for cluster formation, task distribution, capability lookup, and voting-quorum assembly. T2 (functional).
+Two applications are designed to run on the substrate:
+
+* **Reactivity** ([reactivity.md](reactivity.md)) — push-tree mode. Notifications about collection commits are designed to fan out through a tree rooted at the tail block's coordinate (rotating, to deny attackers a persistent target). Threshold signatures reuse the commit certificate; subscribers backfill from a replay buffer at the nearest forwarder. T3 (luxury) — never starves transaction processing.
+* **Matchmaking** ([matchmaking.md](matchmaking.md)) — directory mode. Providers and seekers register at a stable per-task topic; cohorts return advisory provider sets to seekers. Designed for cluster formation, task distribution, capability lookup, and voting-quorum assembly. T2 (functional).
+
+What exists in code today is a narrower, **single-node, in-process** change-notification primitive — not the networked reactivity push-tree. The `IBlockChangeNotifier` interface (`packages/db-core/src/transactor/change-notifier.ts`) emits a `CollectionChangeEvent` when a commit's critical section completes on that node (`packages/db-p2p/src/storage/storage-repo.ts`); `network-transactor.ts` forwards it to an optional `localChangeNotifier` (else a logged no-op), and the Quereus plugin bridges that local signal into vtab reactivity. The signal only reaches listeners in the **same process** where the commit was applied — there is no cross-node delivery, no DHT, no cohort. The networked push-tree is being built **on top of** this primitive (the bridge is a separate implementation ticket, `local-change-notifier-bridge`).
+
+### Implementation / Doc Sync Status
+
+The networked cohort-topic substrate, reactivity, and matchmaking are validated and rolled out in milestones. All entries below start as `pending`; later implementation/e2e tickets — the `*-core-module-fret-integration`, `*-e2e-mock-tier`, and `substrate-e2e-real-libp2p-tier` tickets — flip these to `done` as each milestone lands.
+
+| Subsystem | Simulator validation | Mock-tier e2e | Real-libp2p e2e |
+|-----------|----------------------|---------------|-----------------|
+| cohort-topic substrate | pending | pending | pending |
+| reactivity | pending | pending | pending |
+| matchmaking | pending | pending | pending |
 
 ## SQL Integration
 
