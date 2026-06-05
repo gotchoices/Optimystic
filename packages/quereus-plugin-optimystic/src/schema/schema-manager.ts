@@ -24,7 +24,6 @@ export interface StoredTableSchema {
 	indexes: StoredIndexSchema[];
 	vtabModuleName: string;
 	vtabArgs?: Record<string, any>;
-	isTemporary?: boolean;
 	estimatedRows?: number;
 }
 
@@ -226,7 +225,6 @@ export class SchemaManager {
 			vtabAuxData,
 			vtabArgs: stored.vtabArgs,
 			vtabModuleName: stored.vtabModuleName,
-			isTemporary: stored.isTemporary,
 			isView: false,
 			indexes,
 			estimatedRows: stored.estimatedRows,
@@ -252,7 +250,6 @@ export class SchemaManager {
 			indexes: (schema.indexes || []).map(idx => this.indexSchemaToStored(idx)),
 			vtabModuleName: schema.vtabModuleName,
 			vtabArgs: schema.vtabArgs as Record<string, any>,
-			isTemporary: schema.isTemporary,
 			estimatedRows: schema.estimatedRows,
 		};
 	}

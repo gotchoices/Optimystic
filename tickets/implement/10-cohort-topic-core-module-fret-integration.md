@@ -1,5 +1,5 @@
 description: Cohesive CohortTopicNode/Service tying walk/promotion/willingness/TTL/gossip together; registers /optimystic/cohort-topic/1.0.0/* protocols on FRET.
-prereq: cohort-topic-antiflood-antidos, cohort-topic-walk-promotion-coldstart, cohort-topic-willingness-barometer-traffic, cohort-topic-gossip-membership-certs, cohort-topic-registration-storage-sharding, cohort-topic-tier-addressing-dmax
+prereq: cohort-topic-antiflood-antidos, cohort-topic-walk-promotion-coldstart, cohort-topic-willingness-barometer-traffic, cohort-topic-gossip-membership-certs, cohort-topic-registration-storage-sharding, cohort-topic-tier-addressing-dmax, cohort-topic-package-layering
 files:
   - docs/cohort-topic.md (§FRET integration L432-460, §Application policies L641-652, §Interaction L656-662)
   - docs/architecture.md (§Cohort Topics/Reactivity/Matchmaking ~L233-240, Document Map, Doc Sync Status)

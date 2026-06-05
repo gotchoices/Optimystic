@@ -1,9 +1,10 @@
 description: Cohort gossip of records/willingness/load, k-x threshold-signed notices, MembershipCertV1 publish + participant verification with one-fetch-retry.
-prereq: cohort-topic-registration-storage-sharding
+prereq: cohort-topic-registration-storage-sharding, cohort-topic-package-layering
 files:
   - docs/cohort-topic.md (§Cohort gossip wire L563-585, §Membership snapshots L317-343, §Failure modes L424-428, §FRET integration L432-460)
-  - C:/projects/Fret/packages/fret/src/service/fret-service.ts (cohort assembly, gossip, minSigs)
-  - packages/db-core/src/cohort-topic
+  - packages/db-core/src/cohort-topic (gossip-merge + cert-verify logic, behind ICohortGossipTransport/IMembershipSource)
+  - packages/db-p2p/src/cohort-topic (FRET cohort-gossip adapter + cert publisher — see cohort-topic-package-layering)
+  - C:/projects/Fret/packages/fret/src/service/fret-service.ts (reference only: the db-p2p adapter wraps cohort assembly/gossip/minSigs)
 effort: high
 ----
 
@@ -114,7 +115,7 @@ gossip + `minSigs` assembly; treat FRET read-only. Don't break existing tests.
 ## TODO
 
 ### Phase 1 — gossip
-- Implement `CohortGossipBus` in `packages/db-core/src/cohort-topic/gossip/bus.ts` adapting FRET's cohort gossip; merge inbound records/willingness/load into the registration store and willingness/load state; epoch drift detection.
+- Implement `CohortGossipBus` (merge logic) in `packages/db-core/src/cohort-topic/gossip/bus.ts` over the injected `ICohortGossipTransport` port — merge inbound records/willingness/load into the registration store and willingness/load state; epoch drift detection. The FRET cohort-gossip adapter that backs the port lives in `packages/db-p2p/src/cohort-topic/`; db-core does not import FRET. Cert verification logic is likewise db-core over `IMembershipSource`; the FRET-backed publisher/fetcher is db-p2p.
 
 ### Phase 2 — threshold sig
 - Implement `CohortSigner` (`thresholdSign`/`verifyThreshold`) wrapping FRET `minSigs` assembly in `cohort-topic/sig/threshold.ts`.

@@ -1,8 +1,8 @@
 description: JSON length-prefixed base64url codecs for RegisterV1, RegisterReplyV1, RenewV1, RenewReplyV1, PromotionNoticeV1, DemotionNoticeV1, CohortGossipV1, MembershipCertV1.
-prereq: fold-simulator-findings-into-design-docs
+prereq: fold-simulator-findings-into-design-docs, cohort-topic-package-layering
 files:
   - docs/cohort-topic.md (§Wire formats L463-600, §Configuration L604-629)
-  - packages/db-core/src/cohort-topic (new package surface)
+  - packages/db-core/src/cohort-topic (new package surface — pure layer per cohort-topic-package-layering)
 effort: medium
 ----
 
