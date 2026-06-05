@@ -288,6 +288,8 @@ Instrumentation is built on the `debug` library (see [debugging.md](debugging.md
 | [cohort-topic.md](cohort-topic.md) | Shared topic-tree substrate for reactivity, matchmaking, and future directory services |
 | [reactivity.md](reactivity.md) | Push-based change notifications (cohort-topic push-tree application) |
 | [matchmaking.md](matchmaking.md) | Peer discovery and quorum assembly (cohort-topic directory application) |
+| [crdt-sync.md](crdt-sync.md) | Convergent replicated state sync underpinning partition recovery |
+| [partition-healing.md](partition-healing.md) | Partition-induced invariant reconciliation: two-tier intent/invariant rules, deterministic application-defined merge |
 | [correctness.md](correctness.md) | Formal safety and liveness properties |
 | [internals.md](internals.md) | Developer guide: data flow, invariants, pitfalls |
 | [debugging.md](debugging.md) | DEBUG namespaces and logging conventions |
