@@ -118,6 +118,19 @@ describe('VirtualScheduler', () => {
 			expect(s.now()).to.equal(10);
 			expect(s.pending()).to.equal(1);
 		});
+
+		it('a batch is atomic across the until boundary: it fires wholly or stays wholly, never partially', () => {
+			const s = makeScheduler();
+			const fired: string[] = [];
+			// Batch whose single `at` is <= until fires entirely; batch whose `at` is > until stays whole.
+			s.scheduleBatch(20, 3, (_c, i) => fired.push(`b20#${i}`));
+			s.scheduleBatch(21, 3, (_c, i) => fired.push(`b21#${i}`));
+			const n = s.run(20);
+			expect(n).to.equal(3);
+			expect(fired).to.deep.equal(['b20#0', 'b20#1', 'b20#2']);
+			expect(s.now()).to.equal(20);
+			expect(s.pending()).to.equal(1); // the at=21 batch is untouched, still one slot
+		});
 	});
 
 	describe('empty / termination', () => {

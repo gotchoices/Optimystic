@@ -31,6 +31,7 @@ See the following documentation:
 * **Quereus Plugin Crypto** - packages/quereus-plugin-crypto - Quereus plugin providing cryptographic functions
 * **Quereus Plugin Optimystic** - packages/quereus-plugin-optimystic - Quereus plugin for Optimystic distributed tree collections
 * **Demo** - packages/demo - Hello world demo app exercising Tree and Diary collections across the full stack
+* **Substrate Simulator** - packages/substrate-simulator - Discrete-event virtual-clock engine for the design simulator (mock-only dev tooling; not shipped to runtime consumers)
 
 ## How to use:
 
