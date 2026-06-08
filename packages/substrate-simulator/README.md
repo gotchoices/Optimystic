@@ -4,7 +4,7 @@ Discrete-event virtual-clock engine that founds the Optimystic **design simulato
 advances by *event completion* rather than wall-clock, so simulation scale decouples from
 real time and ~1M logical nodes drain in seconds, **deterministically** from `(seed, config)`.
 
-Five layers ship here:
+Six layers ship here:
 
 - **The engine** — a priority-queue scheduler over a virtual clock, a seeded PRNG, and a
   pluggable latency-injection seam. No domain behaviour; everything builds on the
@@ -42,6 +42,18 @@ Five layers ship here:
   `docs/cohort-topic.md` §Anti-flood claims (fan-out, re-registration jitter bound, no speculative
   outward probe, inward-retry restart, promotion-flap cap) and to characterize lookup cost as
   `O(log_F N)`.
+- **The matchmaking seeker** (`matchmaking.ts`, `seeker-walk.ts`, `refinement-signal.ts`) — the
+  directory application's hang-out-vs-continue decision and seeker-path tracer, the modeled mirror of
+  `docs/matchmaking.md` §Hang-out vs. continue. The pure decision engine computes `expectedNewMatches`
+  / `contentionFactor` with the `contention_factor_cap = 4.0` clamp and the four edge cases
+  (missing/stale-zero traffic, pathological filter, `filterAcceptRatio` decay); the `SeekerWalk`
+  layers registration (on `ParticipantWalk`) + a `requery_interval_ms` hang-out poll + walk-toward-root
+  escalation over a modeled per-tier provider population, emitting a `SeekerTrace`. It reproduces the
+  docs worked example, the §Test-expectations cases, the `contention_factor_cap` fairness claim, and
+  the §Adversarial traffic-reporting bounds (under-report ≤ +1 hop/tier, over-report ≤ `patienceMs`
+  drain), and **measures** (without implementing) whether the deferred refinements
+  (`matchmaking-per-tier-patience-splitting`, `matchmaking-contention-from-seeker-pool`) would improve
+  the borderline regime — recorded for `fold-simulator-findings-into-design-docs`.
 
 Mock-only: it is **not** shipped to runtime consumers and depends on **no** `@optimystic/*` or
 `db-p2p` code. It depends on **`p2p-fret`** (via a `portal:` path ref to the sibling FRET repo)

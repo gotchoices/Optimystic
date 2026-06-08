@@ -270,6 +270,14 @@ A seeker needs 8 providers of `pdf-render`, `patienceMs = 10 s`. Network has 200
 
 Contrast: the seeker's prefix lands it in a thinner shard with `directParticipants: 1, arrivalsPerMin: 8`. `expectedNewMatches ≈ 1.3`. Threshold not met. Withdraw, walk to `d = 0`. Root reports `directParticipants: 200, arrivalsPerMin: 600`. Query returns 8 immediately.
 
+> **Simulator-validated** (`packages/substrate-simulator`, `simulator-matchmaking-hangout`). The
+> decision math above (`expectedNewMatches`, `contentionFactor`, the threshold), this worked
+> example (`expectedNewMatches = 15`, `contentionFactor ≈ 1.13`, decision = hang out), the
+> §Test-expectations cases (hot deep-tier suffices, cold walks to root, borderline hangs out for
+> full patience), and the `contention_factor_cap = 4.0` fairness claim (100 parallel seekers do not
+> self-inflict an escalation storm) are reproduced as assertions in the modeled seeker walk. The
+> measured figures fold back here via `fold-simulator-findings-into-design-docs`.
+
 ### Edge cases
 
 The §Decision rule above is the common path. A few specific situations need explicit handling:
@@ -390,6 +398,11 @@ Because the same fresh provider can surface in both a push and a later safety/fi
 - **Under-reporting** — claiming a cold tier so the seeker escalates — is also bounded. The seeker takes one extra hop per affected tier and terminates at the root, where aggregated truth is hardest to fake (the root sees the union of all sub-tier providers and runs its own cohort gossip).
 - **Cross-check via cohort gossip.** Other members of the same cohort can detect a primary whose reported rate diverges from the gossip-derived view that drives their own replies. Detection routes through the reputation subsystem (out of scope here; see [architecture.md](architecture.md) §Reputation).
 - **No threshold signature on the reply.** Reasonable for now: a threshold signature on every registration and query reply is expensive, and the bounded worst-case above does not justify the cost. A future ticket may revisit if observed abuse warrants it.
+
+> **Simulator-validated** (`simulator-matchmaking-hangout`). Both adversarial bounds are reproduced
+> as assertions in the modeled seeker walk: under-reporting costs **≤ one extra register hop per
+> tier** (the seeker still terminates at the root), and over-reporting costs **≤ `patienceMs` of
+> wasted hang-out drain** (no spatial flood — the walk only ever steps toward the root).
 
 ### Arrival push missed or primary fails mid-coalesce
 

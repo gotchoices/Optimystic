@@ -138,3 +138,32 @@ export {
 	outwardMovesArePromoted,
 	unwillingRetriesRestartAtDMax
 } from './walk-metrics.js';
+export {
+	type CapabilityFilter,
+	type SimProvider,
+	type MatchmakingConfig,
+	type SeekerDemand,
+	type HangOutAction,
+	type HangOutDecision,
+	DEFAULT_MATCHMAKING_CONFIG,
+	matchesFilter,
+	countMatchable,
+	expectedNewMatches,
+	contentionFactor,
+	decideHangOut,
+	FilterAcceptEstimator
+} from './matchmaking.js';
+export {
+	type SeekerTrace,
+	type TrafficReporter,
+	type TierProviderConfig,
+	type SeekerWalkOptions,
+	TierProviderModel,
+	SeekerWalk
+} from './seeker-walk.js';
+export {
+	type RefinementSignal,
+	patienceSplittingWouldHelp,
+	seekerPoolContentionWouldFlip,
+	measureRefinementSignal
+} from './refinement-signal.js';
