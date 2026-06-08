@@ -1,5 +1,5 @@
 import { expect } from 'chai';
-import { DigitreeStore, hashKey, assembleCohort } from 'p2p-fret';
+import { DigitreeStore, hashKey, assembleCohort, xorDistance } from 'p2p-fret';
 import { createRng } from '../src/rng.js';
 import { generatePeers } from '../src/peer.js';
 import { createSimWorld } from '../src/world.js';
@@ -30,6 +30,28 @@ async function referenceStore(peers: readonly PeerRef[]): Promise<DigitreeStore>
 	}
 	return store;
 }
+
+/** Big-endian bytes → bigint, mirroring RingModel.distance's own conversion. */
+function bytesToBigInt(bytes: Uint8Array): bigint {
+	let v = 0n;
+	for (const b of bytes) v = (v << 8n) | BigInt(b);
+	return v;
+}
+
+describe('RingModel — XOR distance (parity with real FRET)', () => {
+	it('matches bytesToBigInt(xorDistance), is zero to self, and is symmetric', async () => {
+		const ring = new RingModel();
+		const a = await ring.coordOf(Uint8Array.of(1));
+		const b = await ring.coordOf(Uint8Array.of(2));
+
+		// Byte-identical to a direct FRET xorDistance, presented as a bigint.
+		expect(ring.distance(a, b)).to.equal(bytesToBigInt(xorDistance(a, b)));
+		// XOR-metric invariants: identity is zero, distance is symmetric and positive for a ≠ b.
+		expect(ring.distance(a, a)).to.equal(0n);
+		expect(ring.distance(a, b)).to.equal(ring.distance(b, a));
+		expect(ring.distance(a, b) > 0n).to.equal(true);
+	});
+});
 
 describe('FretModel — size & depth (real FRET math)', () => {
 	it('n_est and d_max track an injected population across N ∈ {10,100,1k,10k,100k}', async function () {
@@ -151,5 +173,31 @@ describe('FretModel — scheduled recompute on the virtual clock', () => {
 		model.scheduleRecompute(world.scheduler, gossipRoundMs);
 		world.scheduler.run();
 		expect(model.lastEstimate!.n).to.be.below(before);
+	});
+
+	it('reflects churn-in (addPeer) only after the next scheduled recompute', async () => {
+		const gossipRoundMs = 200;
+		const world = createSimWorld({ seed: SEED, gossipRoundMs });
+		// Disjoint populations: seed 1000 starts where seed 12345's first 50 leave off.
+		const initial = generatePeers(50, createRng(SEED));
+		const arrivals = generatePeers(50, createRng(SEED + 1));
+		const model = await FretModel.create(initial, { m: M });
+
+		model.scheduleRecompute(world.scheduler, gossipRoundMs);
+		world.scheduler.run();
+		const before = model.lastEstimate!.n;
+
+		// Churn in new peers; the cached estimate is stale until the next recompute.
+		for (const p of arrivals) {
+			await model.addPeer(p);
+		}
+		expect(model.lastEstimate!.n).to.equal(before);
+		// The added peers participate in cohort assembly immediately (store is live).
+		const coord = await new RingModel().coordOf(arrivals[0]!.key);
+		expect(model.cohort.assembleIds(coord, 15)).to.include(arrivals[0]!.id);
+
+		model.scheduleRecompute(world.scheduler, gossipRoundMs);
+		world.scheduler.run();
+		expect(model.lastEstimate!.n).to.be.above(before);
 	});
 });
