@@ -161,6 +161,19 @@ For a topic with `N` active participants, the tree's steady-state depth is `⌈l
 
 The root cohort sees high traffic only in the sparse regime, where it has the capacity to serve it. Under hot load, traffic is sharded across `F^{d_max}` deep cohorts. Promotion is the mechanism that moves load from concentrated to sharded; no participant ever has to guess the right tier.
 
+> **Simulator validation.** The design simulator (`packages/substrate-simulator`,
+> `promotion-convergence.ts`) confirms the steady-state **depth law**
+> `⌈log_F(N / cap_promote)⌉` across the N sweep `N ∈ {10, 100, 1k, 10k, 100k}` (`F = 16`,
+> `cap_promote = 64`), driving a gossip-lagged growth model where promotion is decided on the
+> gossip tick rather than eagerly, so the promotion-window **overshoot** past `cap_promote` is
+> observable. It records, per N, the **convergence latency** (peak-load → depth-stabilization), the
+> **peak overshoot** (bounded by one gossip-round of arrivals — the slope-based pre-promotion of
+> §Promotion `T_promote_lookahead` drives it to ~0, strictly below a lookahead-off run on the same
+> population), and the **oscillation count** (0 — depth locks monotonically; the `cap_promote`/
+> `cap_demote` `4×` gap + `T_demote` thrash resistance is exercised in §Promotion and demotion
+> lifecycle). The measured convergence-latency and overshoot-bound numbers fold back via
+> `fold-simulator-findings-into-design-docs`.
+
 ---
 
 ## Tier ladder

@@ -497,6 +497,36 @@ export class TopicTree {
 		if (ladder.length === 0) {
 			throw new RangeError('coord ladder must have at least the root tier');
 		}
+		const d = this.walkToLanding(topicId, ladder);
+		const state = this.instantiateAndLink(topicId, ladder, d, now);
+		this.attach(state, now);
+		return d;
+	}
+
+	/**
+	 * Walk root-outward following `Promoted` redirects to the deepest non-promoted cohort on the
+	 * participant's prefix branch, then bump its count *without* evaluating promotion — the
+	 * gossip-lagged growth path the promotion-convergence tracer drives. Promotion is decided
+	 * separately on the gossip tick (`evaluatePromotion`), so a burst of arrivals can accumulate past
+	 * `cap_promote` within one round before the lagged decision lands — the overshoot the convergence
+	 * validator measures (`simulator-promotion-convergence`). Returns the landed cohort state.
+	 *
+	 * `register` is the eager counterpart (promotes the instant an arrival crosses the cap); the two
+	 * grow an identical tree shape, differing only in *when* the promotion decision fires.
+	 */
+	routeArrival(topicId: string, ladder: readonly RingCoord[], now: VTime): TopicCohortState {
+		if (ladder.length === 0) {
+			throw new RangeError('coord ladder must have at least the root tier');
+		}
+		const d = this.walkToLanding(topicId, ladder);
+		const state = this.instantiateAndLink(topicId, ladder, d, now);
+		state.arrivalsInWindow++;
+		this.setParticipants(state, state.directParticipants + 1, now);
+		return state;
+	}
+
+	/** Deepest non-promoted tier on this ladder's branch — the landing tier for a root-outward walk. */
+	private walkToLanding(topicId: string, ladder: readonly RingCoord[]): number {
 		let d = 0;
 		while (d < ladder.length - 1) {
 			const parent = this.get(topicId, bytesToHex(ladder[d]!));
@@ -506,16 +536,22 @@ export class TopicTree {
 			}
 			break;
 		}
-		const coord = bytesToHex(ladder[d]!);
-		const state = this.ensure(topicId, coord, d, now);
+		return d;
+	}
+
+	/**
+	 * Get-or-instantiate the tier-`d` cohort on this ladder and link it under its tier-(d−1) parent.
+	 * Linking is idempotent, so this covers both fresh instantiation and re-activation of a cohort
+	 * that had previously released (demoted) — the parent's `childCohortCount` rises again
+	 * symmetrically as load returns. Shared by `register`, `attachAt`, and `routeArrival` so all three
+	 * drivers grow an identical tree shape.
+	 */
+	private instantiateAndLink(topicId: string, ladder: readonly RingCoord[], d: number, now: VTime): TopicCohortState {
+		const state = this.ensure(topicId, bytesToHex(ladder[d]!), d, now);
 		if (d > 0) {
-			// Link under the tier-(d−1) parent. Idempotent, so this covers both fresh instantiation
-			// and re-activation of a cohort that had previously released (demoted) — the parent's
-			// `childCohortCount` rises again symmetrically as load returns.
 			this.linkToParent(state, bytesToHex(ladder[d - 1]!));
 		}
-		this.attach(state, now);
-		return d;
+		return state;
 	}
 
 	/**
@@ -533,11 +569,7 @@ export class TopicTree {
 		if (d < 0 || d >= ladder.length) {
 			throw new RangeError(`landing tier ${d} out of ladder range [0, ${ladder.length - 1}]`);
 		}
-		const coord = bytesToHex(ladder[d]!);
-		const state = this.ensure(topicId, coord, d, now);
-		if (d > 0) {
-			this.linkToParent(state, bytesToHex(ladder[d - 1]!));
-		}
+		const state = this.instantiateAndLink(topicId, ladder, d, now);
 		this.attach(state, now);
 		return state;
 	}

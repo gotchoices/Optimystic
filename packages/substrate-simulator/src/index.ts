@@ -167,3 +167,15 @@ export {
 	seekerPoolContentionWouldFlip,
 	measureRefinementSignal
 } from './refinement-signal.js';
+export {
+	type DepthSample,
+	type ConvergenceResult,
+	type ConvergenceOptions,
+	type OvershootComparison,
+	expectedDepth,
+	sampleDepth,
+	uniformLadder,
+	PromotionTracer,
+	runConvergence,
+	compareLookahead
+} from './promotion-convergence.js';
