@@ -357,7 +357,11 @@ The participant pings `primary` every `ttl / 3` (default 30s):
 - Three consecutive failures → participant promotes `backups[0]` to primary by sending a re-attach RPC (carries the existing record, no full re-registration). Backup verifies it sees the record in its local replica and confirms.
 - All of `primary` and `backups` fail → participant re-runs the lookup from `d_max`.
 
+> **Resolved.** Backup failover refreshes the participant's `cohortEpoch` hint **lazily** — on the *next* ping/renewal after failover (when a `primary_moved` reply carries the fresh epoch), not eagerly at failover time. Promoting `backups[0]` keeps the existing epoch hint; the new primary corrects it on the following round.
+
 Cohort members evict records where `now − lastPing > ttl`. Eviction is gossiped so all members converge on the active participant set.
+
+> **Implementation.** The local soft-state store, the deterministic `assignSlots`, the participant/cohort renewal sides, and the rotation handoff state machine live in `packages/db-core/src/cohort-topic/registration/` (peer ids are raw `Uint8Array`; the wire layer carries them as base64url). Cross-member replication of these records runs over cohort gossip (a later ticket); this layer owns the local store and the deterministic functions the gossip layer and TTL loop call.
 
 ### Cohort epoch
 
@@ -385,10 +389,10 @@ When cohort membership changes (FRET stabilization, partition heal), the slot ca
 1. New cohort membership stabilizes; all members compute the new `cohortEpoch`.
 2. Members exchange a "primary inventory" gossip listing the registrations they hold as primary.
 3. For each registration, the new computed primary either already holds the record (no-op) or pulls it from the previous holder via gossip.
-4. The previous primary continues to serve until the new primary acknowledges receipt; this prevents a delivery gap.
+4. **Resolved (dual-serve until ack).** The previous primary continues to serve until the new primary acknowledges receipt of the pulled record; this dual-serve window prevents a delivery gap. The new primary sends the ack immediately after it stores the pulled record.
 5. Participants discover the new primary on their next ping (which is forwarded by the old primary) or on the next inbound delivery (which arrives from the new primary). Subscriber-side `cohortHint` is refreshed from the cohort response on either path.
 
-The handoff is purely cohort-local; FRET is unaware of which member is primary for what.
+The handoff is purely cohort-local; FRET is unaware of which member is primary for what. The state machine (inventory → pull → dual-serve → ack) is implemented over an injected transport in `registration/handoff.ts`; on pull the new primary re-stamps the record's `primary`/`backups` to the new assignment so a subsequent rotation recognises it.
 
 ---
 
