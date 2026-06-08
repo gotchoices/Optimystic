@@ -175,6 +175,22 @@ Key points:
 - `UnwillingMember` and `UnwillingCohort` are distinct: the former routes to a sibling within the same cohort, the latter is a temporal back-off with no spatial movement.
 - The root case (`d = 0` returning `NoState`) means no cohort anywhere serves this topic. The participant treats this as an opportunity to bootstrap: it re-issues the registration at `d = 0` with a `bootstrap: true` flag, asking the root cohort to instantiate. Cold-start denial (root is unwilling) yields `UnwillingCohort` and the participant retries.
 
+> **Implementation.** The participant-side walk is
+> [`packages/db-core/src/cohort-topic/walk.ts`](../packages/db-core/src/cohort-topic/walk.ts)
+> (`WalkEngine` / `createWalkEngine`). It drives the injected `ITopicRouter` port — **not** a direct
+> FRET import — keying each probe at `coord_d(self, topicId)` (via `TierAddressing`) with
+> `wantK = k`, `minSigs = k − x`, decoding the `RegisterReplyV1` and dispatching: `no_state` → step
+> inward (`d − 1`), with the root case re-issuing once at tier 0 with `bootstrap: true`;
+> `promoted(targetTier)` → the one outward move, recomputing `coord_targetTier` and registering there
+> (or, with `followPromoted: false`, surfaced to the caller); `unwilling_member` → a direct
+> `dialMember` retry of a named sibling at the **same** coord; `unwilling_cohort` → terminate with a
+> `retry_later(afterMs)` so the caller backs off in time and a fresh `register` restarts at `d_max`
+> (never re-hitting the declined coord). Building + signing each `RegisterV1` is delegated to an
+> injected `RegisterMessageFactory` (participant identity/crypto live there). A `maxSteps` safety
+> valve bounds pathological inward/outward oscillation in a malformed tree. Spec: `walk.spec.ts`
+> (sparse-regime distinct-`coord_{d_max}` fan-out, `Promoted` outward recompute, `UnwillingCohort`
+> restart-at-`d_max`, sibling-dial retry, bootstrap re-issue).
+
 ### Why this distributes naturally
 
 For a topic with `N` active participants, the tree's steady-state depth is `⌈log_F(N / cap_promote)⌉`. Three regimes:
@@ -485,6 +501,22 @@ The cohort threshold-signs a `PromotionNoticeV1` and stores it as part of its fo
 
 A cohort may also pre-promote on observing rapid growth: if the slope of `directParticipants(T)` over a gossip window predicts crossing `cap_promote` within `T_promote_lookahead` (default 30s), promotion fires now. This avoids the gossip-lag race where a cohort over-shoots its cap before promotion can land.
 
+> **Implementation.** The promotion/demotion state machine is
+> [`packages/db-core/src/cohort-topic/promotion.ts`](../packages/db-core/src/cohort-topic/promotion.ts)
+> (`PromotionLifecycle` / `createPromotionLifecycle`), keyed by `topicId` across every topic a cohort
+> serves. `onParticipantCountChange` (called eagerly per arrival/eviction) refreshes the growth + low-load
+> clocks and fires the cap / hot-fast-path (`cap_promote_fast` at `bucket ≥ bucket_overload`) / slope
+> triggers; `maybeDemote` (called on the gossip tick) enforces the `cap_demote` floor held for
+> `T_demote`, the no-live-children requirement, the `T_promote_sticky` floor, and the root-never-demotes
+> rule. Both transitions threshold-sign their notice via the gossip ticket's `CohortSigner`
+> (`sig/threshold.ts` + `sig/payloads.ts`) over the injected `ICohortThresholdCrypto` port, so the
+> methods are `async` and **return** the signed `PromotionNoticeV1` / `DemotionNoticeV1` (a documented
+> refinement of the doc's `void`-returning sketch, since signing is asynchronous). The op-tier the load
+> barometer is indexed by is supplied through an injected `loadBucket(topicId)` resolver, keeping the
+> module tier-agnostic and FRET-free. Defaults match §Configuration. Spec: `promotion.spec.ts`
+> (cap/fast/slope triggers, no-flap within `T_promote_sticky`, demotion gated on children + `T_demote`,
+> root never demotes).
+
 ### Demotion (cohort shrinks)
 
 A cohort demotes for topic `T` when, for a quorum of members:
@@ -504,6 +536,26 @@ A cold cohort instantiates as a forwarder for `T` when:
 - A quorum of cohort members is willing to serve `T` at the registration's tier.
 
 The newly-instantiated forwarder registers itself with its tier-(d−1) parent on first opportunity; until that registration is acked, the cohort accepts participants but holds notifications/queries that would require parent involvement.
+
+> **Resolved (decided): burst at a just-promoted cohort.** A cohort that has just promoted but whose
+> tier-`(d+1)` is not yet fully instantiated, on a burst of new same-tier registrations, **bounces
+> each with `Promoted(d+1)`** (cheap single-RPC) — it does **not** buffer the registrations and does
+> **not** decline them with `UnwillingCohort`. The `T_promote_sticky` window keeps it in promoted mode
+> through the burst (see §Anti-flood properties claim 5). This is the documented resolution of the
+> prior open question.
+
+> **Implementation.** Cold-start lives in
+> [`packages/db-core/src/cohort-topic/coldstart.ts`](../packages/db-core/src/cohort-topic/coldstart.ts).
+> `shouldInstantiate({ bootstrap, followOn, quorumWilling })` is the admission gate
+> (`(bootstrap ∨ followOn) ∧ quorumWilling`) — a speculative `d_max` probe (neither flag) yields
+> `false`, so the walk gets `NoState` instead of forking a parallel branch. The `followOn` signal is
+> **not** on the wire (`RegisterV1` carries only `bootstrap`); the db-p2p cohort host determines it
+> from routing context and passes it in (a documented integration seam). `createForwarder` / the
+> `ColdStartManager` hold the link-up state machine: a deeper forwarder starts `awaiting_parent` —
+> accepting participants but holding parent-involving ops — and flips to `serving` when its
+> `ParentRegistrar.registerWithParent` acks; the root (tier 0) has no parent and serves immediately.
+> `promotedRedirectReply` builds the `Promoted(d+1)` bounce above (attaching the outgoing cohort's
+> traffic). Spec: `coldstart.spec.ts`.
 
 ### Hysteresis
 
