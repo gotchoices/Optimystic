@@ -431,6 +431,16 @@ interface BackfillReplyV1 {
 
 ### Defaults
 
+> **Simulator-validated (pending fold-back).** `W`, `W_checkpoint`, their ratio, and the
+> *adaptive-`W`* question below are validated by the design simulator
+> (`packages/substrate-simulator`, `reactivity.ts`): it measures the one-RPC backfill window (`W`),
+> the checkpoint window (`W_checkpoint`), the wall-clock coverage each gives at a commit rate
+> (`W = 256` ≈ 4 min and `W_checkpoint = 4096` ≈ 1 hour at 1 cps; `W` ≈ 2.5 s at 100 cps), and the
+> tail-rotation re-registration burst staying inside `cap_promote_fast`. The 100-cps result flags
+> that a fixed `W` is too shallow for hot collections — **`W` should likely be adaptive per measured
+> cps**. Measured coverage times and RPC-count distributions land here via
+> `fold-simulator-findings-into-design-docs`.
+
 Reactivity adds the following to the cohort-topic defaults:
 
 | Parameter | Default | Description |

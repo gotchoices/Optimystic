@@ -179,3 +179,32 @@ export {
 	runConvergence,
 	compareLookahead
 } from './promotion-convergence.js';
+export {
+	type ReactivityConfig,
+	type RevisionEntry,
+	type CheckpointWindow,
+	type IngestVerdict,
+	type ResumeKind,
+	type ResumeTrace,
+	type ResumeCost,
+	type ResumeInput,
+	type CoverageReadout,
+	type AdaptiveWFinding,
+	type ThrashReadout,
+	type RotationBurstResult,
+	DEFAULT_REACTIVITY_CONFIG,
+	DEFAULT_RESUME_COST,
+	ReplayRing,
+	RollingCheckpoint,
+	DedupeWindow,
+	CohortPushState,
+	classifyResume,
+	resumeRpcCount,
+	resumeLatency,
+	traceResume,
+	coverageSeconds,
+	measureCoverage,
+	assessAdaptiveW,
+	measureRepeatedWakeThrash,
+	simulateRotationBurst
+} from './reactivity.js';
