@@ -4,7 +4,7 @@ Discrete-event virtual-clock engine that founds the Optimystic **design simulato
 advances by *event completion* rather than wall-clock, so simulation scale decouples from
 real time and ~1M logical nodes drain in seconds, **deterministically** from `(seed, config)`.
 
-Three layers ship here:
+Five layers ship here:
 
 - **The engine** — a priority-queue scheduler over a virtual clock, a seeded PRNG, and a
   pluggable latency-injection seam. No domain behaviour; everything builds on the

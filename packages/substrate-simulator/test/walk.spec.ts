@@ -277,6 +277,91 @@ describe('ParticipantWalk — claim 4: inward retry restarts at d_max', () => {
 	});
 });
 
+describe('ParticipantWalk — member retry + give-up budgets', () => {
+	it('an UnwillingMember reply retries a sibling at the same coord until one admits', () => {
+		const world = createSimWorld({ seed: SEED, gossipRoundMs: 1000 });
+		const tree = new TopicTree({ scheduler: world.scheduler, gossipRoundMs: 1000 });
+		const topicHex = 'member-retry';
+		const ladder = ladderOf([0, 0], 0x80); // d_max = 1
+		tree.ensure(topicHex, bytesToHex(ladder[1]!), 1, 0); // d_max cohort holds state
+
+		// The first two routed members decline (UnwillingMember); the third admits.
+		let attempts = 0;
+		const admission: WalkAdmission = () => (++attempts <= 2 ? { result: 'unwilling_member' } : { result: 'accepted' });
+
+		const w = new ParticipantWalk({ scheduler: world.scheduler, tree, participant: peer(0), topicId: topicHex, ladder, admission });
+		w.start();
+		world.scheduler.run();
+		const t = w.trace();
+
+		// All retries stay at the same coord (sibling members), never stepping inward or backing off.
+		expect(t.probes.map((p) => p.tier)).to.deep.equal([1, 1, 1]);
+		expect(t.probes.map((p) => p.reply)).to.deep.equal(['unwilling_member', 'unwilling_member', 'accepted']);
+		expect(t.backoffs, 'member retries are not cohort back-offs').to.equal(0);
+		expect(t.redirects).to.equal(0);
+		expect(t.outcome).to.equal('accepted');
+		expect(t.landingTier).to.equal(1);
+	});
+
+	it('exhausting maxMemberRetries falls through to a cohort back-off (restart at d_max)', () => {
+		const world = createSimWorld({ seed: SEED, gossipRoundMs: 1000 });
+		const tree = new TopicTree({ scheduler: world.scheduler, gossipRoundMs: 1000 });
+		const topicHex = 'member-exhaust';
+		const ladder = ladderOf([0, 0], 0x81); // d_max = 1
+		tree.ensure(topicHex, bytesToHex(ladder[1]!), 1, 0);
+
+		// Every member at the d_max cohort declines forever; with the budgets below the walk should
+		// burn maxMemberRetries (2) siblings, decline the cohort, restart at d_max, exhaust again,
+		// then give up once the back-off budget (1) is spent.
+		const admission: WalkAdmission = () => ({ result: 'unwilling_member' });
+
+		const w = new ParticipantWalk({
+			scheduler: world.scheduler, tree, participant: peer(0), topicId: topicHex, ladder, admission,
+			maxMemberRetries: 2, maxBackoffs: 1
+		});
+		w.start();
+		world.scheduler.run();
+		const t = w.trace();
+
+		// Two member attempts per pass (memberAttempt 0 then 1); two passes (one back-off, one give-up).
+		expect(t.probes.map((p) => p.reply)).to.deep.equal([
+			'unwilling_member', 'unwilling_member',
+			'unwilling_member', 'unwilling_member'
+		]);
+		expect(t.probes.every((p) => p.tier === 1), 'every member retry stays at d_max').to.equal(true);
+		expect(t.backoffs, 'member-exhaustion declines the cohort, consuming the back-off budget').to.equal(2);
+		expect(t.outcome).to.equal('gave-up');
+		expect(t.landingTier).to.equal(-1);
+	});
+
+	it('a cohort that declines past maxBackoffs yields gave-up', () => {
+		const world = createSimWorld({ seed: SEED, gossipRoundMs: 1000 });
+		const tree = new TopicTree({ scheduler: world.scheduler, gossipRoundMs: 1000 });
+		const topicHex = 'cohort-giveup';
+		const ladder = ladderOf([0], 0x82); // d_max = 0 (root only)
+		tree.ensure(topicHex, bytesToHex(ladder[0]!), 0, 0);
+
+		// The root declines every attempt; the walk restarts at d_max each time until the back-off
+		// budget is spent (maxBackoffs = 2 → declined three times → give up).
+		const admission: WalkAdmission = () => ({ result: 'unwilling_cohort' });
+
+		const w = new ParticipantWalk({
+			scheduler: world.scheduler, tree, participant: peer(0), topicId: topicHex, ladder, admission,
+			maxBackoffs: 2
+		});
+		w.start();
+		world.scheduler.run();
+		const t = w.trace();
+
+		expect(t.probes.map((p) => p.reply)).to.deep.equal(['unwilling_cohort', 'unwilling_cohort', 'unwilling_cohort']);
+		expect(unwillingRetriesRestartAtDMax(t), 'each retry still restarts at d_max').to.equal(true);
+		expect(t.backoffs, 'back-off budget spent then give up').to.equal(3);
+		expect(t.outcome).to.equal('gave-up');
+		expect(t.landingTier).to.equal(-1);
+		expect(t.acceptedAt, 'a give-up never records an accept time').to.equal(undefined);
+	});
+});
+
 describe('ParticipantWalk — determinism', () => {
 	it('a burst replays byte-identically from (seed, config)', () => {
 		function run(): string {
