@@ -4,7 +4,7 @@ import { createSimWorld } from './world.js';
 import { DeterministicLatency, DEFAULT_HOP_MS } from './latency.js';
 import { generatePeers } from './peer.js';
 import { bytesToHex } from './hex.js';
-import { Metrics, type MetricsSink } from './metrics.js';
+import { Metrics } from './metrics.js';
 import { TopicTree, DEFAULT_LIFECYCLE_CONFIG } from './topic-tree.js';
 import { expectedDepth, uniformLadder } from './promotion-convergence.js';
 import {
@@ -72,7 +72,7 @@ export interface Scenario {
 	readonly seed: number;
 	setup(world: SimWorld): void;
 	run(world: SimWorld): void;
-	validate(metrics: MetricsSink): ClaimReport;
+	validate(metrics: Metrics): ClaimReport;
 }
 
 /** Build a `Claim`, deriving `pass` from a predicate over the observed value. */
@@ -186,8 +186,8 @@ export class ColdStartStormScenario implements Scenario {
 		this.metrics.counter('coldstart.distinctStartCoords', distinctStartCoords(this.traces));
 	}
 
-	validate(metrics: MetricsSink): ClaimReport {
-		const m = metrics as Metrics;
+	validate(metrics: Metrics): ClaimReport {
+		const m = metrics;
 		const rootDirect = m.counterValue('coldstart.acceptedTier0');
 		const distinct = m.counterValue('coldstart.distinctStartCoords');
 		const promotions = m.counterTotal('event.Promoted');
@@ -318,8 +318,8 @@ export class ChurnRecoveryScenario implements Scenario {
 		this.metrics.counter('churn.partitionsTotal', this.participantCount);
 	}
 
-	validate(metrics: MetricsSink): ClaimReport {
-		const m = metrics as Metrics;
+	validate(metrics: Metrics): ClaimReport {
+		const m = metrics;
 		const lost = m.counterValue('churn.lostRegistrations');
 		const backupPromotions = m.counterValue('churn.backupPromotions');
 		const reLookups = m.counterValue('churn.reLookups');
@@ -402,8 +402,8 @@ export class TailRotationScenario implements Scenario {
 		this.metrics.counter('rotation.windowContiguous', windowContiguous ? 1 : 0);
 	}
 
-	validate(metrics: MetricsSink): ClaimReport {
-		const m = metrics as Metrics;
+	validate(metrics: Metrics): ClaimReport {
+		const m = metrics;
 		const peak = m.counterValue('rotation.peakRootDirect');
 		const cap = m.counterValue('rotation.capPromoteFast');
 		const withinDrain = m.counterValue('rotation.completedWithinDrain') === 1;
@@ -468,8 +468,8 @@ export class VotingQuorumScenario implements Scenario {
 		this.metrics.counter('voting.rootDirect', rootDirect);
 	}
 
-	validate(metrics: MetricsSink): ClaimReport {
-		const m = metrics as Metrics;
+	validate(metrics: Metrics): ClaimReport {
+		const m = metrics;
 		const depth = m.counterValue('voting.steadyStateDepth');
 		const rootDirect = m.counterValue('voting.rootDirect');
 		const promotions = m.counterTotal('event.Promoted');
@@ -595,8 +595,8 @@ export class AdversarialReportingScenario implements Scenario {
 		this.metrics.counter('adv.over.matchLatency', lied.matchLatency);
 	}
 
-	validate(metrics: MetricsSink): ClaimReport {
-		const m = metrics as Metrics;
+	validate(metrics: Metrics): ClaimReport {
+		const m = metrics;
 		const honestEsc = m.counterValue('adv.under.honestEscalations');
 		const liedEsc = m.counterValue('adv.under.liedEscalations');
 		const liedTerminated = m.counterValue('adv.under.liedTerminated') === 1;

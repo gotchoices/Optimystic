@@ -4,7 +4,7 @@ Discrete-event virtual-clock engine that founds the Optimystic **design simulato
 advances by *event completion* rather than wall-clock, so simulation scale decouples from
 real time and ~1M logical nodes drain in seconds, **deterministically** from `(seed, config)`.
 
-Six layers ship here:
+Seven layers ship here:
 
 - **The engine** — a priority-queue scheduler over a virtual clock, a seeded PRNG, and a
   pluggable latency-injection seam. No domain behaviour; everything builds on the
@@ -54,6 +54,17 @@ Six layers ship here:
   drain), and **measures** (without implementing) whether the deferred refinements
   (`matchmaking-per-tier-patience-splitting`, `matchmaking-contention-from-seeker-pool`) would improve
   the borderline regime — recorded for `fold-simulator-findings-into-design-docs`.
+- **The metrics engine, scenario runner, and scale/sensitivity sweep** (`metrics.ts`, `scenarios.ts`,
+  `sweep.ts`) — the capstone that turns the model layers above into the design's quantitative answers.
+  `Metrics` is a pure in-memory accumulator (counters / histograms / timelines, JSON+CSV export) that
+  also implements `EventSink`, so the tree / walk / churn / registration models fold their event
+  streams straight into per-kind, per-tier counters. `scenarios.ts` drives five end-to-end scenarios
+  (cold-start storm, churn recovery, tail rotation, voting-quorum herd, adversarial traffic reporting)
+  on top of the existing drivers and emits a pass/fail `ClaimReport` per design claim. `sweep.ts` runs
+  the N-scale sweep (confirming the `⌈log_F(N/cap_promote)⌉` depth law and logarithmic lookup across
+  N ∈ {100 … 1M}) and the one-knob-at-a-time parameter-sensitivity sweep (`cap_promote`, `F`,
+  `d_max_cap`, `W`/`W_checkpoint`, `contention_factor_cap`). The sweep report is the input artifact
+  `fold-simulator-findings-into-design-docs` consumes.
 
 Mock-only: it is **not** shipped to runtime consumers and depends on **no** `@optimystic/*` or
 `db-p2p` code. It depends on **`p2p-fret`** (via a `portal:` path ref to the sibling FRET repo)
@@ -109,7 +120,8 @@ tree.register(topicHex, ladder, world.scheduler.now());
 
 tree.startGossip();      // traffic refresh + demotion re-eval every gossip round
 world.scheduler.run(600_000);
-// sink.byKind('Promoted'), sink.byKind('TopicTraffic'), … feed the metrics engine (ticket 6)
+// sink.byKind('Promoted'), sink.byKind('TopicTraffic'), … or wire a `Metrics` sink directly
+// (it implements EventSink) and read counters/histograms back via runScenario / runScaleSweep
 ```
 
 ## Resolved design decisions

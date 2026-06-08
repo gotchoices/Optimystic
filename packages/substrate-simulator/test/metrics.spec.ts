@@ -20,6 +20,21 @@ describe('Metrics — counters', () => {
 	it('returns 0 for an unknown counter', () => {
 		expect(new Metrics().counterValue('nope')).to.equal(0);
 	});
+
+	it('counterTotal sums every tag set sharing a name (e.g. promotions across tiers)', () => {
+		const m = new Metrics();
+		// Mirrors the EventSink path: Promoted tagged by fromTier, across distinct tiers.
+		m.counter('event.Promoted', 1, { tier: 0 });
+		m.counter('event.Promoted', 3, { tier: 1 });
+		m.counter('event.Promoted', 2, { tier: 2 });
+		// An unrelated counter must not leak into the total.
+		m.counter('event.Demoted', 9, { tier: 1 });
+		expect(m.counterTotal('event.Promoted')).to.equal(6);
+		// A per-tag read still sees only its own cell.
+		expect(m.counterValue('event.Promoted', { tier: 1 })).to.equal(3);
+		// Unknown name totals to 0, not NaN.
+		expect(m.counterTotal('event.Absent')).to.equal(0);
+	});
 });
 
 describe('Metrics — histograms', () => {
