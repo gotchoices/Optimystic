@@ -198,6 +198,28 @@ describe('SeekerWalk — adversarial traffic reporting (matchmaking.md §Adversa
 		expect(lied.hangOutDurationMs, 'the over-report did cost real drain').to.be.greaterThan(0);
 		expect(lied.matchLatency, 'terminates within patienceMs (plus the setup hops)').to.be.at.most(10_000 + 200);
 	});
+
+	it('absent topicTraffic on the reply (reporter → undefined) escalates conservatively, but the immediate-match check still resolves at the root', () => {
+		// matchmaking.md §Edge cases item 1: a reply with no topicTraffic signal yields a conservative
+		// escalate at every thin upper tier — yet the root, which already holds wantCount, still
+		// resolves because the immediate-match check runs even without a rate signal.
+		const tiers: TierProviderConfig[] = [
+			{ tier: 2, initial: [], reportedArrivalsPerMin: 90, queriesPerMin: 4 },
+			{ tier: 1, initial: [], reportedArrivalsPerMin: 90, queriesPerMin: 4 },
+			{ tier: 0, initial: providers(8, ['pdf']), reportedArrivalsPerMin: 90, queriesPerMin: 4 }
+		];
+		const model = new TierProviderModel(tiers);
+
+		// A primary that never attaches the topicTraffic snapshot — the "absent on the reply" case.
+		const absent: TrafficReporter = () => undefined;
+		const t = runSeeker({ startTier: 2, marker: 0x80, model, wantCount: 8, patienceMs: 10_000, filter: PDF, reporter: absent });
+
+		expect(t.matched, 'immediate-match check still fires at the root despite no rate signal').to.equal(true);
+		expect(t.finalTier, 'no-traffic escalates all the way to the root').to.equal(0);
+		expect(t.tiersVisited, 'queried tiers 2, 1, 0').to.equal(3);
+		expect(t.escalations, 'one escalation per thin upper tier').to.equal(2);
+		expect(t.requeries, 'absent signal never hangs out — it escalates outright').to.equal(0);
+	});
 });
 
 describe('SeekerWalk — refinement signal (recorded for fold-simulator-findings-into-design-docs)', () => {
