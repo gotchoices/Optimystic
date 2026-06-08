@@ -4,10 +4,15 @@
  * Per `docs/cohort-topic.md` §TTL and renewal and §Failure modes:
  *
  * - Participant pings `primary` every `ttl/3`. Success → primary touches `lastPing` and gossips it.
- * - Three consecutive ping failures → participant promotes `backups[0]` via a re-attach RPC that
- *   carries the existing record (no full re-registration); the backup confirms it sees the record
- *   in its local replica. **Resolved (GROUNDING):** the participant's `cohortEpoch` hint refreshes
- *   lazily — on the *next* ping/renewal after failover, not eagerly at failover time.
+ * - Three consecutive ping failures → participant promotes `backups[0]` via a re-attach RPC: a renew
+ *   carrying a **signed `reattach` flag** (no full re-registration). The backup accepts when it holds
+ *   the record locally *and* is a computed backup under the current epoch — re-stamping `primary` to
+ *   itself and serving subsequent plain pings via an epoch-scoped failover override (the unchanged
+ *   `cohortEpoch` still names the dead node as the computed primary). A re-attach answered
+ *   `primary_moved` means a real rotation moved primary to a live member: the participant adopts that
+ *   payload instead of promoting the contacted backup (ignoring a reply that points back at the dead
+ *   primary). **Resolved (GROUNDING):** the participant's `cohortEpoch` hint refreshes lazily — on the
+ *   *next* ping/renewal after failover, not eagerly at failover time.
  * - All of primary + backups fail → participant re-runs lookup from `d_max` (walk ticket, injected).
  * - Cohort-side: evict where `now − lastPing > ttl`; eviction is gossiped so members converge.
  *
@@ -17,7 +22,7 @@
 
 import { b64urlToBytes } from "../wire/codec.js";
 import type { RenewReplyV1, RenewV1 } from "../wire/types.js";
-import { bytesEqual, bytesKey } from "./bytes.js";
+import { bytesEqual, bytesKey, recordKey } from "./bytes.js";
 import type { SlotAssigner } from "./sharding.js";
 import { MAX_PING_FAILURES, pingIntervalMs } from "./types.js";
 import type { RegistrationRecord, RegistrationStore } from "./types.js";
@@ -100,13 +105,13 @@ class TtlRenewalParticipant implements RenewalParticipant {
 	}
 
 	async reattach(target: Uint8Array): Promise<RenewReplyV1> {
-		return this.deps.transport.send(target, this.buildRenew());
+		return this.deps.transport.send(target, this.buildRenew(true));
 	}
 
 	/** Send a renew, mapping an RPC rejection to `undefined` (a counted failure). */
 	private async trySend(target: Uint8Array): Promise<RenewReplyV1 | undefined> {
 		try {
-			return await this.deps.transport.send(target, this.buildRenew());
+			return await this.deps.transport.send(target, this.buildRenew(false));
 		} catch {
 			return undefined;
 		}
@@ -120,14 +125,34 @@ class TtlRenewalParticipant implements RenewalParticipant {
 		}
 	}
 
-	/** 3-fail path: try each backup in turn; on confirmation promote it, else re-run lookup. */
+	/**
+	 * 3-fail path: re-attach to each backup in turn (a signed `reattach=true` renew). An `ok` means the
+	 * backup accepted the crash-failover promotion → promote it locally. A `primary_moved` means a real
+	 * rotation moved primary to a different live member → adopt that payload (not the contacted backup),
+	 * **unless** it points back at the just-failed primary (the bounce guard) — then keep trying. All
+	 * backups exhausted → re-run lookup from `d_max`.
+	 */
 	private async failover(): Promise<void> {
+		const failedPrimary = this.current.primary;
 		for (const backup of this.current.backups) {
 			const reply = await this.tryReattach(backup);
-			if (reply !== undefined && (reply.result === "ok" || reply.result === "primary_moved")) {
+			if (reply === undefined) {
+				continue;
+			}
+			if (reply.result === "ok") {
 				this.promote(backup);
 				return;
 			}
+			if (reply.result === "primary_moved") {
+				// A genuine rotation: adopt the rotated assignment — but never re-adopt the dead primary
+				// (the defensive guard against the exact bounce crash-failover is meant to fix).
+				if (reply.newPrimary !== undefined && bytesEqual(b64(reply.newPrimary), failedPrimary)) {
+					continue;
+				}
+				this.applyPrimaryMoved(reply);
+				return;
+			}
+			// unknown_registration (replication lag) or anything else: try the next backup.
 		}
 		await this.deps.transport.relookup();
 		// relookup is a terminal recovery action (it owns re-establishing the registration out of
@@ -169,7 +194,12 @@ class TtlRenewalParticipant implements RenewalParticipant {
 		this.current = { ...this.current, ...patch };
 	}
 
-	private buildRenew(): RenewV1 {
+	/**
+	 * Build a signed renew. `reattach=true` (crash-failover) is carried inside the signed body so the
+	 * accepting member can trust the attestation; a plain ping omits the field entirely (a stray renew
+	 * can never silently usurp a live primary).
+	 */
+	private buildRenew(reattach: boolean): RenewV1 {
 		const body: UnsignedRenew = {
 			v: 1,
 			topicId: bytesKey(this.current.topicId),
@@ -177,6 +207,9 @@ class TtlRenewalParticipant implements RenewalParticipant {
 			correlationId: this.deps.correlationId,
 			timestamp: this.deps.clock(),
 		};
+		if (reattach) {
+			body.reattach = true;
+		}
 		return { ...body, signature: this.deps.sign(body) };
 	}
 }
@@ -222,6 +255,15 @@ export interface RenewalCohortSide {
 }
 
 class StoreRenewalCohortSide implements RenewalCohortSide {
+	/**
+	 * Epoch-scoped crash-failover overrides: `recordKey → cohortEpoch under which this member accepted a
+	 * promotion`. A matching entry makes a *subsequent plain ping* serve here even though the computed
+	 * primary is still the dead node, so the migrated participant stops bouncing. Cleared on epoch change
+	 * (the next rotation handoff reasserts the deterministic assignment). Sibling to the rotation
+	 * `isServing` dual-serve exception — distinct state, OR-ed into the serve decision.
+	 */
+	private readonly failoverServing = new Map<string, Uint8Array>();
+
 	constructor(private readonly deps: RenewalCohortSideDeps) {}
 
 	onRenew(msg: RenewV1, now: number): RenewReplyV1 {
@@ -233,20 +275,69 @@ class StoreRenewalCohortSide implements RenewalCohortSide {
 		}
 		const { members, cohortEpoch } = this.deps.cohort();
 		const { primary, backups } = this.deps.slots.assignSlots(participantId, cohortEpoch, members);
-		if (!bytesEqual(primary, this.deps.self) && this.deps.isServing?.(topicId, participantId) !== true) {
-			// A rotation moved this record's primary and we are not dual-serving it; redirect.
-			return {
-				v: 1,
-				result: "primary_moved",
-				newPrimary: bytesKey(primary),
-				newBackups: backups.map(bytesKey),
-				cohortEpoch: bytesKey(cohortEpoch),
-			};
+		const self = this.deps.self;
+		const key = recordKey(topicId, participantId);
+
+		if (msg.reattach === true) {
+			// Crash-failover promotion request (participant attests primary unreachable).
+			if (bytesEqual(primary, self)) {
+				// A rotation already made this member the computed primary; serve, no override needed.
+				return this.touchAndServe(rec, now);
+			}
+			if (backups.some((b) => bytesEqual(b, self))) {
+				// Legitimate backup takeover: re-stamp primary, gossip the new assignment, and record an
+				// epoch-scoped override so subsequent plain pings keep being served here.
+				const restamped: RegistrationRecord = {
+					...rec,
+					primary: self,
+					backups: rec.backups.filter((b) => !bytesEqual(b, self)),
+					lastPing: now,
+				};
+				this.deps.store.put(restamped);
+				this.failoverServing.set(key, cohortEpoch);
+				this.deps.gossip.touch(restamped);
+				return { v: 1, result: "ok" };
+			}
+			if (this.deps.isServing?.(topicId, participantId) === true) {
+				// Rotation dual-serve already covers this record here.
+				return this.touchAndServe(rec, now);
+			}
+			// Not a valid takeover target (stale participant view): redirect, do not promote.
+			return this.primaryMoved(primary, backups, cohortEpoch);
 		}
+
+		// Plain ping.
+		const isComputedPrimary = bytesEqual(primary, self);
+		const override = this.failoverServing.get(key);
+		const overrideMatches = override !== undefined && bytesEqual(override, cohortEpoch);
+		// Housekeeping: drop a now-redundant override (this member is the computed primary again) or a
+		// stale one tagged under a prior epoch (the rotation handoff governs across the epoch change).
+		if (override !== undefined && (isComputedPrimary || !overrideMatches)) {
+			this.failoverServing.delete(key);
+		}
+		const serving = isComputedPrimary || this.deps.isServing?.(topicId, participantId) === true || overrideMatches;
+		if (serving) {
+			return this.touchAndServe(rec, now);
+		}
+		return this.primaryMoved(primary, backups, cohortEpoch);
+	}
+
+	/** Existing touch path: stamp `lastPing`, gossip the touch, reply `ok`. */
+	private touchAndServe(rec: RegistrationRecord, now: number): RenewReplyV1 {
 		const touched: RegistrationRecord = { ...rec, lastPing: now };
 		this.deps.store.put(touched);
 		this.deps.gossip.touch(touched);
 		return { v: 1, result: "ok" };
+	}
+
+	private primaryMoved(primary: Uint8Array, backups: readonly Uint8Array[], cohortEpoch: Uint8Array): RenewReplyV1 {
+		return {
+			v: 1,
+			result: "primary_moved",
+			newPrimary: bytesKey(primary),
+			newBackups: backups.map(bytesKey),
+			cohortEpoch: bytesKey(cohortEpoch),
+		};
 	}
 
 	sweepStale(now: number): readonly RegistrationRecord[] {

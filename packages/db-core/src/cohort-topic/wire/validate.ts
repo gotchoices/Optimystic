@@ -229,7 +229,7 @@ export function validateRenewV1(value: unknown): RenewV1 {
 	const what = "RenewV1";
 	const obj = asObject(value, what);
 	requireV1(obj, what);
-	return {
+	const out: RenewV1 = {
 		v: 1,
 		topicId: b64urlField(reqString(obj, "topicId", what), "topicId", what),
 		participantId: reqString(obj, "participantId", what),
@@ -237,6 +237,8 @@ export function validateRenewV1(value: unknown): RenewV1 {
 		timestamp: reqFiniteNumber(obj, "timestamp", what),
 		signature: b64urlField(reqString(obj, "signature", what), "signature", what),
 	};
+	assignDefined(out, "reattach", optBool(obj, "reattach", what));
+	return out;
 }
 
 export function validateRenewReplyV1(value: unknown): RenewReplyV1 {

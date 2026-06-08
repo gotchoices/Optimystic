@@ -396,10 +396,12 @@ The record is replicated across all `~k` cohort members via standard FRET cohort
 The participant pings `primary` every `ttl / 3` (default 30s):
 
 - Success → primary updates `lastPing`, gossips the touch to the cohort.
-- Three consecutive failures → participant promotes `backups[0]` to primary by sending a re-attach RPC (carries the existing record, no full re-registration). Backup verifies it sees the record in its local replica and confirms.
+- Three consecutive failures → participant promotes `backups[0]` to primary by sending a re-attach RPC. This is a renew carrying a **signed `reattach` flag** (`reattach: true`, part of the signed body so a member can trust the attestation and a stray/MITM'd ping can never silently usurp a live primary). The backup accepts when it both holds the record in its local replica *and* is a computed backup for it under the current epoch: it re-stamps `primary` to itself, gossips the new assignment, and replies `ok`. A plain ping (no `reattach`) on a backup that holds the record is never a promotion — it replies `primary_moved`.
 - All of `primary` and `backups` fail → participant re-runs the lookup from `d_max`.
 
 > **Resolved.** Backup failover refreshes the participant's `cohortEpoch` hint **lazily** — on the *next* ping/renewal after failover (when a `primary_moved` reply carries the fresh epoch), not eagerly at failover time. Promoting `backups[0]` keeps the existing epoch hint; the new primary corrects it on the following round.
+>
+> **Resolved (crash failover ↔ deterministic assignment).** On a *crash* (no membership rotation, so `cohortEpoch` is unchanged) `assignSlots` still names the dead member as primary. To keep the participant from bouncing between the promoted backup and the corpse, the accepting backup records an **epoch-scoped failover override** (sibling to the rotation dual-serve exception) so its *subsequent plain pings* keep being served — `onRenew` serves when `self` is the computed primary **or** dual-serving **or** an override tagged with the current epoch exists. The re-stamp of `primary` drives gossip convergence and the next rotation's handoff (not the serve decision). The override is **cleared on `cohortEpoch` change**, so the next stabilization's deterministic assignment + handoff reasserts authority. If a re-attach instead returns `primary_moved` (a real rotation moved primary to a live member), the participant adopts that payload via `applyPrimaryMoved` rather than promoting the contacted backup — unless `newPrimary` is the just-failed primary, which it ignores (the bounce guard).
 
 Cohort members evict records where `now − lastPing > ttl`. Eviction is gossiped so all members converge on the active participant set.
 
@@ -691,7 +693,7 @@ The layer does not attempt to defend against unbounded Sybil attacks at the regi
 ## Failure modes
 
 ### Primary fails
-Participant's pings time out. After three failures, participant promotes `backups[0]` via re-attach RPC. The backup already has the registration record from cohort gossip; promotion is instant. The cohort gossips the new assignment and refreshes the deterministic primary calculation on the next stabilization round.
+Participant's pings time out. After three failures, participant promotes `backups[0]` via a re-attach RPC (a renew carrying the signed `reattach` flag). The backup already has the registration record from cohort gossip; promotion is instant — it re-stamps `primary` to itself, gossips the new assignment, and serves the participant's subsequent plain pings immediately via an **epoch-scoped failover override** (the unchanged `cohortEpoch` still names the dead node as the computed primary, so the override, not the deterministic calculation, is what keeps serving). The override is cleared at the next `cohortEpoch` change, when the deterministic calculation and the rotation handoff reassert authority and collapse any ambiguity (a revived dead primary receives no pings from the migrated participant and goes stale on TTL).
 
 ### Backup fails before becoming primary
 Cohort gossip notices via missed heartbeat. The cohort re-derives `backups` for affected registrations using the deterministic hash function and the new membership. No participant-facing change.
@@ -833,6 +835,7 @@ interface RenewV1 {
   participantId:   string
   correlationId:   string             // matches original RegisterV1
   timestamp:       number
+  reattach?:       boolean            // true on a crash-failover re-attach (signed; absent on a normal ping)
   signature:       string
 }
 

@@ -90,6 +90,12 @@ export interface RenewV1 {
 	/** Matches the original {@link RegisterV1}. */
 	correlationId: string;
 	timestamp: number;
+	/**
+	 * True on a crash-failover re-attach — the participant attests it could not reach its primary and
+	 * asks the contacted backup to promote itself. Absent/false on a normal ping. Signed (part of the
+	 * renew body) so a member can trust the attestation and a MITM cannot flip a ping into a promotion.
+	 */
+	reattach?: boolean;
 	signature: string;
 }
 

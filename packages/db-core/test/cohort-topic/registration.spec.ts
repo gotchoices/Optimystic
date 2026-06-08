@@ -119,10 +119,12 @@ type SendBehavior = (target: Uint8Array, msg: RenewV1) => RenewReplyV1 | 'fail';
 
 class MockParticipantTransport implements RenewalParticipantTransport {
 	public readonly sentTo: string[] = [];
+	public readonly sent: RenewV1[] = [];
 	public relookups = 0;
 	constructor(private readonly behavior: SendBehavior) {}
 	async send(target: Uint8Array, msg: RenewV1): Promise<RenewReplyV1> {
 		this.sentTo.push(bytesKey(target));
+		this.sent.push(msg);
 		const r = this.behavior(target, msg);
 		if (r === 'fail') throw new Error('rpc failed');
 		return r;
@@ -233,12 +235,119 @@ describe('cohort-topic / renewal participant', () => {
 		expect(bytesEqual(p2.cohortEpochHint!, movedEpoch), 'epoch refreshed on primary_moved').to.be.true;
 		expect(bytesEqual(p2.record.primary, newPrimary)).to.be.true;
 	});
+
+	it('sends reattach=true on the failover re-attach and a falsy reattach on a normal ping', async () => {
+		const primary = bytesKey(record().primary);
+		const t = new MockParticipantTransport((target) => (bytesKey(target) === primary ? 'fail' : okReply));
+		const p = participant(t);
+		await p.pingLoop(); // plain ping (fail 1)
+		expect(t.sent[0]!.reattach, 'plain ping carries a falsy reattach').to.not.equal(true);
+		await p.pingLoop(); // fail 2
+		await p.pingLoop(); // fail 3 → re-attach backups[0]
+		const last = t.sent[t.sent.length - 1]!;
+		expect(last.reattach, 're-attach carries the signed reattach flag').to.equal(true);
+		expect(t.sentTo[t.sentTo.length - 1], 're-attach went to backups[0]').to.equal(bytesKey(record().backups[0]!));
+	});
+
+	it('crash failover: promotes backups[0] on ok and subsequent plain pings stay on it (anti-bounce)', async () => {
+		const primary = bytesKey(record().primary);
+		const backup0 = record().backups[0]!;
+		// The dead primary always fails; the promoted backup serves every ping (plain or re-attach).
+		const t = new MockParticipantTransport((target) => (bytesKey(target) === primary ? 'fail' : okReply));
+		const p = participant(t);
+		await p.pingLoop();
+		await p.pingLoop();
+		await p.pingLoop(); // 3rd fail → re-attach backups[0] returns ok → promote
+		expect(bytesEqual(p.record.primary, backup0), 'backups[0] promoted').to.be.true;
+		// Several subsequent plain pings: they go to backup0 and it keeps serving — no bounce back.
+		const beforeRelookups = t.relookups;
+		for (let i = 0; i < 4; i++) {
+			await p.pingLoop();
+			expect(bytesEqual(p.record.primary, backup0), `still on backups[0] after subsequent ping ${i}`).to.be.true;
+		}
+		expect(t.relookups, 'no relookup once promoted backup keeps serving').to.equal(beforeRelookups);
+	});
+
+	it('failover honors primary_moved to a live member instead of blind-promoting the contacted backup', async () => {
+		const primary = bytesKey(record().primary);
+		const backup0 = record().backups[0]!;
+		const liveMember = bytes('member-live');
+		const movedEpoch = bytes('epoch-rot', 32);
+		const t = new MockParticipantTransport((target) => {
+			if (bytesKey(target) === primary) return 'fail';
+			if (bytesEqual(target, backup0)) {
+				return {
+					v: 1,
+					result: 'primary_moved',
+					newPrimary: bytesKey(liveMember),
+					newBackups: [bytesKey(bytes('member-live-b'))],
+					cohortEpoch: bytesKey(movedEpoch),
+				};
+			}
+			return okReply;
+		});
+		const p = participant(t);
+		await p.pingLoop();
+		await p.pingLoop();
+		await p.pingLoop(); // 3rd fail → re-attach backups[0] → primary_moved to a live member
+		expect(bytesEqual(p.record.primary, liveMember), 'adopts the rotated live primary').to.be.true;
+		expect(bytesEqual(p.cohortEpochHint!, movedEpoch), 'epoch hint refreshed from primary_moved').to.be.true;
+	});
+
+	it('failover ignores a primary_moved that points back at the just-failed primary (bounce guard)', async () => {
+		const deadPrimary = record().primary;
+		const primaryKey = bytesKey(deadPrimary);
+		const backup0 = record().backups[0]!;
+		const backup1 = record().backups[1]!;
+		const t = new MockParticipantTransport((target) => {
+			if (bytesKey(target) === primaryKey) return 'fail';
+			if (bytesEqual(target, backup0)) {
+				// Adversarial/stale reply pointing back at the corpse — must be ignored.
+				return { v: 1, result: 'primary_moved', newPrimary: bytesKey(deadPrimary) };
+			}
+			if (bytesEqual(target, backup1)) return okReply; // next backup accepts
+			return okReply;
+		});
+		const p = participant(t);
+		await p.pingLoop();
+		await p.pingLoop();
+		await p.pingLoop(); // 3rd fail → backups[0] bounce-guarded → backups[1] promoted
+		expect(bytesEqual(p.record.primary, deadPrimary), 'never re-adopts the dead primary').to.be.false;
+		expect(bytesEqual(p.record.primary, backup1), 'falls through to the next backup').to.be.true;
+	});
+
+	it('re-attach unknown_registration falls through to the next backup, else relookup', async () => {
+		const primaryKey = bytesKey(record().primary);
+		const backup0 = record().backups[0]!;
+		const backup1 = record().backups[1]!;
+		const t = new MockParticipantTransport((target) => {
+			if (bytesKey(target) === primaryKey) return 'fail';
+			if (bytesEqual(target, backup0)) return { v: 1, result: 'unknown_registration' };
+			if (bytesEqual(target, backup1)) return okReply;
+			return okReply;
+		});
+		const p = participant(t);
+		await p.pingLoop();
+		await p.pingLoop();
+		await p.pingLoop(); // backups[0] unknown → backups[1] ok
+		expect(bytesEqual(p.record.primary, backup1), 'promotes the backup that confirmed').to.be.true;
+
+		// All backups unknown → relookup.
+		const t2 = new MockParticipantTransport((target) =>
+			bytesKey(target) === primaryKey ? 'fail' : { v: 1, result: 'unknown_registration' },
+		);
+		const p2 = participant(t2);
+		await p2.pingLoop();
+		await p2.pingLoop();
+		await p2.pingLoop();
+		expect(t2.relookups, 'relookup when no backup confirms').to.equal(1);
+	});
 });
 
 // --- renewal: cohort side ---
 
-function renewMsg(rec: RegistrationRecord): RenewV1 {
-	return {
+function renewMsg(rec: RegistrationRecord, reattach = false): RenewV1 {
+	const msg: RenewV1 = {
 		v: 1,
 		topicId: bytesKey(rec.topicId),
 		participantId: bytesKey(rec.participantId),
@@ -246,6 +355,10 @@ function renewMsg(rec: RegistrationRecord): RenewV1 {
 		timestamp: 1,
 		signature: 's',
 	};
+	if (reattach) {
+		msg.reattach = true;
+	}
+	return msg;
 }
 
 class RecordingGossip implements RenewalGossip {
@@ -338,6 +451,112 @@ describe('cohort-topic / renewal cohort side', () => {
 		// After the ack (dual-serve ends): redirect.
 		dualServing = false;
 		expect(side.onRenew(renewMsg(record({ topicId: t, participantId: p })), 8_000).result).to.equal('primary_moved');
+	});
+
+	it('accepts a re-attach from a computed backup that holds the record, then serves subsequent plain pings', () => {
+		const t = topic('FR');
+		const p = bytes('fp1');
+		const { primary, backups } = slots.assignSlots(p, epoch, cohortMembers);
+		const self = backups[0]!; // a computed backup
+		const gossip = new RecordingGossip();
+		const { store, side } = sideAt(self, gossip);
+		store.put(record({ topicId: t, participantId: p, primary, backups, lastPing: 1_000 }));
+
+		const reattachReply = side.onRenew(renewMsg(record({ topicId: t, participantId: p }), true), 4_000);
+		expect(reattachReply.result, 're-attach accepted by computed backup').to.equal('ok');
+		const held = store.getByParticipant(t, p)!;
+		expect(held.lastPing, 'lastPing touched').to.equal(4_000);
+		expect(bytesEqual(held.primary, self), 'primary re-stamped to self').to.be.true;
+		expect(held.backups.map(bytesKey), 'self removed from backups').to.not.include(bytesKey(self));
+		expect(gossip.touched, 'gossiped the re-stamped record').to.deep.equal([bytesKey(p)]);
+
+		// Subsequent PLAIN ping under the unchanged epoch: served via the failover override, not redirected.
+		const plainReply = side.onRenew(renewMsg(record({ topicId: t, participantId: p })), 5_000);
+		expect(plainReply.result, 'override serves the subsequent plain ping').to.equal('ok');
+		expect(store.getByParticipant(t, p)!.lastPing).to.equal(5_000);
+	});
+
+	it('a plain ping on a backup that holds the record redirects (no promotion, no override)', () => {
+		const t = topic('FR');
+		const p = bytes('fp2');
+		const { primary, backups } = slots.assignSlots(p, epoch, cohortMembers);
+		const self = backups[0]!;
+		const gossip = new RecordingGossip();
+		const { store, side } = sideAt(self, gossip);
+		store.put(record({ topicId: t, participantId: p, primary, backups, lastPing: 1_000 }));
+
+		const reply = side.onRenew(renewMsg(record({ topicId: t, participantId: p })), 4_000);
+		expect(reply.result, 'plain ping never promotes').to.equal('primary_moved');
+		expect(bytesEqual(b64urlToBytes(reply.newPrimary!), primary)).to.be.true;
+		expect(store.getByParticipant(t, p)!.primary, 'record untouched by a plain ping').to.satisfy((x: Uint8Array) => bytesEqual(x, primary));
+		// No override created → a further plain ping still redirects.
+		expect(side.onRenew(renewMsg(record({ topicId: t, participantId: p })), 5_000).result).to.equal('primary_moved');
+	});
+
+	it('redirects a re-attach landing on a member that is neither primary nor a computed backup', () => {
+		const t = topic('FR');
+		const p = bytes('fp3');
+		const { primary, backups } = slots.assignSlots(p, epoch, cohortMembers);
+		const self = cohortMembers.find(
+			(m) => !bytesEqual(m, primary) && !backups.some((b) => bytesEqual(b, m)),
+		)!;
+		const gossip = new RecordingGossip();
+		const { store, side } = sideAt(self, gossip);
+		store.put(record({ topicId: t, participantId: p, primary, backups, lastPing: 1_000 }));
+
+		const reply = side.onRenew(renewMsg(record({ topicId: t, participantId: p }), true), 4_000);
+		expect(reply.result, 'non-backup re-attach is redirected, not promoted').to.equal('primary_moved');
+		expect(bytesEqual(store.getByParticipant(t, p)!.primary, primary), 'record not re-stamped').to.be.true;
+	});
+
+	it('the failover override is epoch-scoped: a rotation clears it', () => {
+		const t = topic('FR');
+		const p = bytes('fp4');
+		const epoch1 = bytes('epoch-e1', 32);
+		const epoch2 = bytes('epoch-e2', 32);
+		const a1 = slots.assignSlots(p, epoch1, cohortMembers);
+		const self = a1.backups[0]!; // computed backup under epoch-1
+		const gossip = new RecordingGossip();
+		const store = createRegistrationStore();
+		let currentEpoch = epoch1;
+		const side = createRenewalCohortSide({
+			store,
+			self,
+			slots,
+			cohort: () => ({ members: cohortMembers, cohortEpoch: currentEpoch }),
+			gossip,
+		});
+		store.put(record({ topicId: t, participantId: p, primary: a1.primary, backups: a1.backups, lastPing: 1_000 }));
+
+		// Accept the re-attach under epoch-1 → override set.
+		expect(side.onRenew(renewMsg(record({ topicId: t, participantId: p }), true), 4_000).result).to.equal('ok');
+		// Sanity: still served under epoch-1.
+		expect(side.onRenew(renewMsg(record({ topicId: t, participantId: p })), 4_100).result).to.equal('ok');
+
+		// Rotate to epoch-2; the stale override must not serve.
+		currentEpoch = epoch2;
+		const a2 = slots.assignSlots(p, epoch2, cohortMembers);
+		const reply = side.onRenew(renewMsg(record({ topicId: t, participantId: p })), 5_000);
+		if (bytesEqual(a2.primary, self)) {
+			expect(reply.result, 'serves only because self is the new computed primary').to.equal('ok');
+		} else {
+			expect(reply.result, 'stale override no longer serves across the rotation').to.equal('primary_moved');
+		}
+	});
+
+	it('accepts a re-attach where this member is already the computed primary, without a redundant override', () => {
+		const t = topic('FR');
+		const p = bytes('fp5');
+		const { primary, backups } = slots.assignSlots(p, epoch, cohortMembers);
+		const gossip = new RecordingGossip();
+		const { store, side } = sideAt(primary, gossip); // self == computed primary
+		store.put(record({ topicId: t, participantId: p, primary, backups, lastPing: 1_000 }));
+
+		const reply = side.onRenew(renewMsg(record({ topicId: t, participantId: p }), true), 4_000);
+		expect(reply.result).to.equal('ok');
+		expect(store.getByParticipant(t, p)!.lastPing).to.equal(4_000);
+		// Serves as the computed primary (not via an override); a plain ping continues to serve.
+		expect(side.onRenew(renewMsg(record({ topicId: t, participantId: p })), 4_500).result).to.equal('ok');
 	});
 
 	it('sweepStale evicts every stale record and gossips each eviction', () => {

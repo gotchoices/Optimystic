@@ -346,6 +346,24 @@ describe('cohort-topic wire', () => {
 			const decoded = decodeRenewReplyV1(encodeCohortMessage(msg));
 			expect(decoded).to.deep.equal(msg);
 		});
+
+		it('round-trips a RenewV1 carrying the signed reattach flag', () => {
+			const msg: RenewV1 = { ...sampleRenew(), reattach: true };
+			const decoded = decodeRenewV1(encodeCohortMessage(msg));
+			expect(decoded).to.deep.equal(msg);
+			expect(decoded.reattach).to.equal(true);
+		});
+
+		it('decodes a RenewV1 without reattach to an object lacking the field (back-compat plain ping)', () => {
+			const decoded = decodeRenewV1(encodeCohortMessage(sampleRenew()));
+			expect(decoded).to.not.have.property('reattach');
+		});
+
+		it('rejects a non-boolean reattach', () => {
+			const bad = { ...sampleRenew(), reattach: 'yes' };
+			const frame = encodeCohortMessage(bad as unknown as { v: 1 });
+			expect(() => decodeRenewV1(frame)).to.throw(CohortWireError, /reattach/);
+		});
 	});
 
 	describe('decoder robustness', () => {
