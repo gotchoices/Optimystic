@@ -1,4 +1,4 @@
-import { Collection, type CollectionInitOptions, type CollectionId } from "../../collection/index.js";
+import { Collection, type CollectionInitOptions, type CollectionId, type CollectionSnapshot } from "../../collection/index.js";
 import type { ITransactor, BlockId, BlockStore, IBlock } from "../../index.js";
 import { BTree, type Path, type KeyRange } from "../../btree/index.js";
 import { CollectionTrunk } from "./collection-trunk.js";
@@ -58,7 +58,7 @@ export class Tree<TKey, TEntry> {
 
 	/** Stage a mutation into the collection's tracker WITHOUT flushing it to the
 	 * transactor. Reads through this same Tree instance see the staged change;
-	 * call {@link sync} to persist it or {@link discardChanges} to drop it. This
+	 * call {@link sync} to persist it, or {@link snapshot}/{@link restore} to drop it. This
 	 * is the deferred counterpart to {@link replace}, which stages and flushes in
 	 * one step — use {@link stage} when the persist/discard decision belongs to a
 	 * surrounding transaction's commit/rollback. */
@@ -72,10 +72,18 @@ export class Tree<TKey, TEntry> {
 			await this.collection.updateAndSync();
 	}
 
-	/** Discard all staged-but-unsynced changes, reverting reads to committed
-	 * state. Counterpart to {@link stage} for transaction rollback. */
-	discardChanges(): void {
-			this.collection.discardPending();
+	/** Capture the current staged state so it can be restored via {@link restore}.
+	 * Take this BEFORE staging a unit of work that may be rolled back. The snapshot
+	 * is opaque; pass the exact value back to {@link restore}. */
+	snapshot(): CollectionSnapshot<TreeReplaceAction<TKey, TEntry>> {
+			return this.collection.snapshotPending();
+	}
+
+	/** Restore the staged state captured by {@link snapshot}, discarding mutations
+	 * staged since. Counterpart to {@link stage} for transaction rollback —
+	 * preserves a never-synced collection's header/root rather than wiping it. */
+	restore(snapshot: CollectionSnapshot<TreeReplaceAction<TKey, TEntry>>): void {
+			this.collection.restorePending(snapshot);
 	}
 
 	/**

@@ -795,7 +795,7 @@ Registration uses FRET's `RouteAndMaybeAct` pipeline directly:
 - `minSigs` = threshold `k − x` (default 14) — used only for promotion/demotion responses
 - Acceptance / redirect / willingness response runs inside the cohort's activity callback
 
-Post-registration traffic (pings, application-specific RPCs) uses direct dialing to the cached `primary` and falls back to `RouteAndMaybeAct` only when the primary is unreachable.
+Post-registration traffic (pings, application-specific RPCs) dials the cached `primary` directly and falls back to `RouteAndMaybeAct` only when the primary is unreachable.
 
 ### Cohort assembly
 

@@ -271,4 +271,60 @@ describe('Deferred-constraint rollback (local/bootstrap transactor)', function (
 
 		expect(await reopenCount(dir, 'select count(*) as c from Imm')).to.equal(1);
 	});
+
+	it('btree split during staging is reverted cleanly on a deferred-constraint rollback (in-session + reopen)', async () => {
+		const uri = 'tree://deferred/bulk';
+		const { db } = createDb(dir);
+		try {
+			await db.exec(
+				`create table Bulk (id integer primary key, v text,
+					check ((select count(*) from Bulk) <= 50))
+					using optimystic('${uri}')`,
+			);
+
+			// Stage 70 rows in one explicit transaction — well past NodeCapacity (64),
+			// so the btree splits mid-stage (new internal/leaf blocks land in the
+			// tracker). The deferred CHECK (count <= 50) rejects at commit; restoring
+			// the pre-stage snapshot must revert the entire split, not just the leaf
+			// that holds the last row.
+			await db.exec('begin');
+			for (let i = 1; i <= 70; i++) {
+				await db.exec(`insert into Bulk (id, v) values (${i}, 'r${i}')`);
+			}
+			await expectThrows(() => db.exec('commit'));
+
+			expect(await selectCount(db, 'select count(*) as c from Bulk')).to.equal(0);
+		} finally {
+			db.close();
+		}
+
+		expect(await reopenCount(dir, 'select count(*) as c from Bulk')).to.equal(0);
+	});
+
+	it('multi-row single INSERT fully rolls back when one row trips a deferred CHECK (in-session + reopen)', async () => {
+		const uri = 'tree://deferred/multi';
+		const { db } = createDb(dir);
+		try {
+			await db.exec(
+				`create table Multi (id integer primary key, v text,
+					check ((select count(*) from Multi where id >= 100) = 0))
+					using optimystic('${uri}')`,
+			);
+			await db.exec(`insert into Multi (id, v) values (1, 'a')`);
+
+			// A single INSERT statement staging several rows, one of which (id 100)
+			// trips the deferred CHECK at commit. The whole statement must roll back,
+			// not just the offending row — none of 2/3/100 may survive.
+			await expectThrows(() =>
+				db.exec(`insert into Multi (id, v) values (2, 'b'), (3, 'c'), (100, 'x')`),
+			);
+
+			expect(await selectCount(db, 'select count(*) as c from Multi')).to.equal(1);
+			expect(await selectCount(db, 'select count(*) as c from Multi where id = 1')).to.equal(1);
+		} finally {
+			db.close();
+		}
+
+		expect(await reopenCount(dir, 'select count(*) as c from Multi')).to.equal(1);
+	});
 });

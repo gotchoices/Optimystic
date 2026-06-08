@@ -5,15 +5,21 @@ import { CollectionFactory } from './collection-factory.js';
 import { generateStampId } from '../util/generate-stamp-id.js';
 
 /**
- * Minimal tree surface the bridge needs to flush (at commit) or discard (at
+ * Minimal tree surface the bridge needs to flush (at commit) or roll back (on
  * rollback) DML that was staged into the collection tracker but not yet pushed
  * to the transactor. `@optimystic/db-core`'s `Tree` satisfies this structurally,
- * so both the main-table tree and index trees can share one dirty set without
+ * so both the main-table tree and index trees can share one dirty map without
  * generic-parameter friction.
+ *
+ * Rollback restores a per-tree {@link snapshot} captured BEFORE the first stage
+ * (rather than blanket-clearing the tracker) so a brand-new collection's
+ * header/root — which live in the tracker until the first sync — survive the
+ * rollback and the collection stays readable.
  */
 export interface DirtyTree {
   sync(): Promise<void>;
-  discardChanges(): void;
+  snapshot(): unknown;
+  restore(snapshot: unknown): void;
 }
 
 /**
@@ -29,14 +35,16 @@ export class TransactionBridge {
   /** Accumulated SQL statements for the current transaction */
   private accumulatedStatements: string[] = [];
   /**
-   * Trees with DML staged this transaction (main table + touched index trees).
-   * Populated by {@link markDirty} at DML time; flushed at commit (legacy mode)
-   * or discarded at rollback. This is the authoritative set rather than
+   * Trees with DML staged this transaction (main table + touched index trees),
+   * each mapped to a snapshot of its staged state captured the first time it was
+   * marked (i.e. before its first stage). Populated by {@link markDirty} at DML
+   * time; flushed at commit (legacy mode) or restored from the snapshot at
+   * rollback. This is the authoritative set rather than
    * `currentTransaction.collections` because the vtab's main collection is
    * long-lived (created before the txn) and index trees are created with a
    * throwaway txnState, so neither reliably lands in that map.
    */
-  private dirtyTrees = new Set<DirtyTree>();
+  private dirtyTrees = new Map<DirtyTree, unknown>();
   /** Optional transaction session for distributed consensus */
   private session: TransactionSession | null = null;
   /** Optional coordinator for transaction mode */
@@ -156,9 +164,9 @@ export class TransactionBridge {
         // replaces the inline updateAndSync that Tree.replace() used to perform
         // at DML time — deferring the flush to commit is what lets a deferred
         // (subquery-bearing) CHECK rejection roll back cleanly: the constraint
-        // throws before this point, so the staged trees are discarded never
+        // throws before this point, so the staged trees are rolled back never
         // having touched storage.
-        for (const tree of this.dirtyTrees) {
+        for (const tree of this.dirtyTrees.keys()) {
           await tree.sync();
         }
       }
@@ -194,14 +202,15 @@ export class TransactionBridge {
       }
     }
 
-    // Discard staged-but-unsynced DML in BOTH modes. Quereus runs deferred row
+    // Roll back staged-but-unsynced DML in BOTH modes. Quereus runs deferred row
     // constraints BEFORE connection.commit(), so a constraint-failure rollback
-    // reaches here while every staged tree is still un-synced — dropping the
-    // tracker transforms reverts in-memory reads and leaves storage untouched,
-    // which is the actual fix for the deferred-constraint atomicity bug. Safe
-    // for already-synced/clean trees too (reset of an empty tracker is a no-op).
-    for (const tree of this.dirtyTrees) {
-      tree.discardChanges();
+    // reaches here while every staged tree is still un-synced — restoring each
+    // tree's pre-stage snapshot reverts in-memory reads and leaves storage
+    // untouched, which is the actual fix for the deferred-constraint atomicity
+    // bug. Restoring the snapshot (rather than clearing the tracker) keeps a
+    // never-synced collection's header/root intact so it stays readable.
+    for (const [tree, snapshot] of this.dirtyTrees) {
+      tree.restore(snapshot);
     }
     this.dirtyTrees.clear();
 
@@ -240,13 +249,16 @@ export class TransactionBridge {
   }
 
   /**
-   * Register a tree that has staged DML this transaction so it is flushed at
-   * commit (legacy mode) or discarded at rollback. The vtab DML path calls this
-   * for the main-table tree and each touched index tree after staging. Idempotent
-   * — repeated marks of the same tree collapse in the Set.
+   * Register a tree that is about to stage DML this transaction so it is flushed
+   * at commit (legacy mode) or rolled back at rollback. MUST be called BEFORE the
+   * tree is staged: the first mark snapshots the tree's current (pre-stage) state,
+   * which rollback restores. Repeated marks of the same tree keep the original
+   * snapshot, so a multi-statement transaction rolls back to its starting state.
    */
   markDirty(tree: DirtyTree): void {
-    this.dirtyTrees.add(tree);
+    if (!this.dirtyTrees.has(tree)) {
+      this.dirtyTrees.set(tree, tree.snapshot());
+    }
   }
 
   /**

@@ -234,9 +234,9 @@ Both monitors are suppressed during detected network partitions (`PartitionDetec
 
 ## Cohort Topics, Reactivity, and Matchmaking
 
-A shared **cohort-topic** substrate ([cohort-topic.md](cohort-topic.md)) provides FRET-backed topic trees for any subsystem that needs to find, attach to, or fan out from a named set of peers. Topic trees grow from a single root cohort outward in tiers, sharded by peer-ID prefix; participants walk toward the root from an estimated max tier and only follow explicit promotion redirects outward, giving anti-flood behavior by construction. The layer supplies addressing, willingness-gated admission, TTL-refreshed soft state, cohort threshold signatures, and a tier ladder (T0 essential → T3 luxury) that lets nodes prioritize transaction work over discretionary forwarding.
+A shared **cohort-topic** substrate ([cohort-topic.md](cohort-topic.md)) is the project's **networked change-notification primitive** — the single mechanism on which reactivity and matchmaking build, replacing the ad-hoc, per-subsystem discovery and fan-out approaches that preceded it. It provides FRET-backed topic trees for any subsystem that needs to find, attach to, or fan out from a named set of peers. Topic trees grow from a single root cohort outward in tiers, sharded by peer-ID prefix; participants walk toward the root from an estimated max tier and only follow explicit promotion redirects outward, giving anti-flood behavior by construction. The layer supplies addressing, willingness-gated admission, TTL-refreshed soft state, cohort threshold signatures, and a tier ladder (T0 essential → T3 luxury) that lets nodes prioritize transaction work over discretionary forwarding.
 
-The cohort-topic substrate and both applications below are **specified / design-only with zero implementation today** — a repo-wide search for their wire types and routing entry points returns no matches. A **simulator phase validates the design's quantitative claims before the core protocols land**; see the specs ([cohort-topic.md](cohort-topic.md), [reactivity.md](reactivity.md), [matchmaking.md](matchmaking.md)) and the per-subsystem status table below.
+The cohort-topic substrate itself is now **implemented** — its protocol-agnostic logic (walk, registration, willingness, promotion, gossip, threshold sigs, membership, traffic, anti-flood/anti-DoS, the participant-facing `CohortTopicService`, and the cohort-side `CohortMemberEngine`) lives in `packages/db-core/src/cohort-topic/`, with the FRET/libp2p host in `packages/db-p2p/src/cohort-topic/`; mock-tier end-to-end coverage is still pending. The two applications below remain **specified / design-only**. A **simulator phase validated the design's quantitative claims before the core protocols landed**; see the specs ([cohort-topic.md](cohort-topic.md), [reactivity.md](reactivity.md), [matchmaking.md](matchmaking.md)) and the per-subsystem status table below.
 
 Two applications are designed to run on the substrate:
 
@@ -251,7 +251,7 @@ The networked cohort-topic substrate, reactivity, and matchmaking are validated 
 
 | Subsystem | Simulator validation | Mock-tier e2e | Real-libp2p e2e |
 |-----------|----------------------|---------------|-----------------|
-| cohort-topic substrate | done | pending | pending |
+| cohort-topic substrate | done | implemented (mock-tier e2e pending) | pending |
 | reactivity | done | pending | pending |
 | matchmaking | done | pending | pending |
 

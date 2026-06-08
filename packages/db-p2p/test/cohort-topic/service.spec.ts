@@ -1,0 +1,259 @@
+import { expect } from 'chai';
+import { generateKeyPair } from '@libp2p/crypto/keys';
+import { peerIdFromPrivateKey } from '@libp2p/peer-id';
+import type { Connection, PeerId, Stream } from '@libp2p/interface';
+import {
+	RingHash,
+	createRegistrationStore,
+	createSlotAssigner,
+	createCohortGossipBus,
+	createWillingnessCheck,
+	createPromotionLifecycle,
+	createColdStartManager,
+	createTrafficCounters,
+	createRenewalCohortSide,
+	createCohortSigner,
+	createCohortMemberEngine,
+	createCohortTopicService,
+	createLoadBarometer,
+	createTierAddressing,
+	coreProfile,
+	bytesToB64url,
+	b64urlToBytes,
+	encodeCohortMessage,
+	decodeCohortMessage,
+	validateRegisterV1,
+	validateRenewV1,
+	type ITopicRouter,
+	type ICohortGossipTransport,
+	type ISizeEstimator,
+	type ICohortThresholdCrypto,
+	type IMembershipSource,
+	type IMembershipSourceRouter,
+	type MembershipVerifier,
+	type CohortMemberEngine,
+	type ParticipantSigner,
+	type PeerRef,
+	type RingCoord,
+	type Tier,
+} from '@optimystic/db-core';
+import { createCohortTopicHost } from '../../src/cohort-topic/host.js';
+import { DEFAULT_COHORT_TOPIC_PROTOCOLS } from '../../src/cohort-topic/protocols.js';
+
+const sha256digest = (b: Uint8Array): Uint8Array => new RingHash().H(b);
+
+/** A single-member cohort wired in memory: the participant's router runs the member engine directly. */
+function buildSingleMemberCohort(opts: { memberId: Uint8Array; capPromote: number }): { engine: CohortMemberEngine; member: Uint8Array; epoch: Uint8Array } {
+	const hash = new RingHash();
+	const member = opts.memberId;
+	const cohortEpoch = hash.H(new TextEncoder().encode('epoch:' + bytesToB64url(member)));
+	const cohort = (): { members: readonly Uint8Array[]; cohortEpoch: Uint8Array } => ({ members: [member], cohortEpoch });
+
+	const store = createRegistrationStore();
+	const slots = createSlotAssigner(hash);
+	const barometer = createLoadBarometer();
+
+	// Mock gossip transport (no peers): the bus's view/merge logic still works for a single member.
+	const gossipTransport: ICohortGossipTransport = {
+		broadcast: (): void => {},
+		onMessage: (): (() => void) => () => {},
+	};
+	const gossipBus = createCohortGossipBus({ transport: gossipTransport, store, coord: cohortEpoch, localEpoch: () => cohortEpoch });
+	const view = gossipBus.view();
+	const selfMember = bytesToB64url(member);
+
+	const crypto: ICohortThresholdCrypto = {
+		assemble: (payload: Uint8Array): Promise<{ thresholdSig: Uint8Array; signers: Uint8Array[] }> =>
+			Promise.resolve({ thresholdSig: sha256digest(payload), signers: [member] }),
+		verify: (): boolean => true,
+	};
+	// minSigs=1 so a single-member cohort can threshold-sign promotion notices in this mock tier.
+	const signer = createCohortSigner(crypto, 1);
+
+	const willingness = createWillingnessCheck({
+		barometer,
+		view,
+		selfMember,
+		primaryTopicCount: (): number => 0,
+		config: { cohortSize: 1 },
+	});
+	const traffic = createTrafficCounters({ view, store, selfMember });
+	const promotion = createPromotionLifecycle({
+		store,
+		loadBucket: (): number => 0,
+		childCohortCount: (): number => 0,
+		treeTier: (): number => 0,
+		parentCoord: (topicId: Uint8Array): Uint8Array => hash.H(topicId),
+		cohortEpoch: () => cohortEpoch,
+		signer,
+		config: { capPromote: opts.capPromote, growthWindowMs: 0 },
+	});
+	const coldStart = createColdStartManager({
+		parentRegistrar: { registerWithParent: (): Promise<void> => Promise.resolve() },
+	});
+	const renewal = createRenewalCohortSide({
+		store,
+		self: member,
+		slots,
+		cohort,
+		gossip: { touch: (): void => {}, evicted: (): void => {} },
+	});
+
+	const engine = createCohortMemberEngine({
+		self: member,
+		profile: coreProfile(),
+		hash,
+		store,
+		slots,
+		willingness,
+		promotion,
+		coldStart,
+		traffic,
+		renewal,
+		cohort,
+		quorumWilling: (): boolean => true,
+	});
+	return { engine, member, epoch: cohortEpoch };
+}
+
+/** A mock router that delivers register activity + renew dials straight to one member engine. */
+function buildMockService(engine: CohortMemberEngine, member: Uint8Array): ReturnType<typeof createCohortTopicService> {
+	const hash = new RingHash();
+	const addressing = createTierAddressing(hash);
+	const self = hash.H(new TextEncoder().encode('participant-self'));
+
+	const router: ITopicRouter = {
+		routeAndAct: async (_key: RingCoord, activity: Uint8Array): Promise<Uint8Array> => {
+			const reg = validateRegisterV1(decodeCohortMessage(activity));
+			const reply = await engine.handleRegister(reg, { followOn: reg.bootstrap === true, treeTier: reg.treeTier }, Date.now());
+			return encodeCohortMessage(reply);
+		},
+		dialMember: async (_member: PeerRef, activity: Uint8Array): Promise<Uint8Array> => {
+			const renew = validateRenewV1(decodeCohortMessage(activity));
+			return encodeCohortMessage(engine.handleRenew(renew, Date.now()));
+		},
+	};
+	const sizeEstimator: ISizeEstimator = { estimate: (): { nEst: number; confidence: number } => ({ nEst: 50, confidence: 1 }) };
+	const gossipBus = createCohortGossipBus({
+		transport: { broadcast: (): void => {}, onMessage: (): (() => void) => () => {} },
+		store: createRegistrationStore(),
+		coord: self,
+		localEpoch: () => self,
+	});
+	const noSource: IMembershipSource = { current: () => Promise.resolve(undefined), fetch: () => Promise.resolve(undefined) };
+	const membershipRouter: IMembershipSourceRouter = { for: (): IMembershipSource => noSource };
+	const crypto: ICohortThresholdCrypto = { assemble: () => Promise.resolve({ thresholdSig: new Uint8Array(), signers: [] }), verify: (): boolean => true };
+	const verifier = {
+		cache: (): void => {},
+		verifyMessage: (): Promise<'verified' | 'untrusted'> => Promise.resolve('verified'),
+	} as unknown as MembershipVerifier;
+	void membershipRouter;
+	void crypto;
+	void member;
+	const signer: ParticipantSigner = { signRegister: (): string => '', signRenew: (): string => '' };
+
+	return createCohortTopicService({ self, hash, router, sizeEstimator, signer, gossipBus, verifier });
+}
+
+describe('cohort-topic: service composition (mock transport)', () => {
+	const TOPIC = Uint8Array.from({ length: 32 }, (_v, i) => (i + 1) & 0xff);
+
+	it('register → accepted: resolves a handle pointing at the cohort primary', async () => {
+		const { engine, member } = buildSingleMemberCohort({ memberId: new TextEncoder().encode('member-A'), capPromote: 64 });
+		const service = buildMockService(engine, member);
+
+		const handle = await service.register({ topicId: TOPIC, tier: 0 as Tier });
+		expect(bytesToB64url(handle.primary)).to.equal(bytesToB64url(member));
+		expect(bytesToB64url(handle.topicId)).to.equal(bytesToB64url(TOPIC));
+		expect(handle.tier).to.equal(0);
+	});
+
+	it('renew: a ping cycle on a live handle succeeds and keeps the primary', async () => {
+		const { engine, member } = buildSingleMemberCohort({ memberId: new TextEncoder().encode('member-B'), capPromote: 64 });
+		const service = buildMockService(engine, member);
+
+		const handle = await service.register({ topicId: TOPIC, tier: 0 as Tier });
+		const before = bytesToB64url(handle.primary);
+		await service.renew(handle);
+		expect(bytesToB64url(handle.primary)).to.equal(before);
+	});
+
+	it('lookup: resolves the cohort hint for a topic/tier', async () => {
+		const { engine, member } = buildSingleMemberCohort({ memberId: new TextEncoder().encode('member-C'), capPromote: 64 });
+		const service = buildMockService(engine, member);
+
+		const hint = await service.lookup(TOPIC, 0 as Tier);
+		expect(bytesToB64url(hint.primary)).to.equal(bytesToB64url(member));
+		expect(hint.cohortMembers.map(bytesToB64url)).to.include(bytesToB64url(member));
+	});
+
+	it('promote: once direct participants cross cap_promote, new registrations are redirected onward', async () => {
+		const { engine } = buildSingleMemberCohort({ memberId: new TextEncoder().encode('member-D'), capPromote: 2 });
+
+		const mkReg = (participant: string): ReturnType<typeof validateRegisterV1> => ({
+			v: 1,
+			topicId: bytesToB64url(TOPIC),
+			tier: 0,
+			treeTier: 0,
+			participantCoord: bytesToB64url(new TextEncoder().encode(participant)),
+			ttl: 90_000,
+			bootstrap: true,
+			timestamp: Date.now(),
+			correlationId: bytesToB64url(new TextEncoder().encode('cid-' + participant)),
+			signature: '',
+		});
+
+		const r1 = await engine.handleRegister(mkReg('p1'), { followOn: true, treeTier: 0 }, Date.now());
+		expect(r1.result).to.equal('accepted');
+		const r2 = await engine.handleRegister(mkReg('p2'), { followOn: true, treeTier: 0 }, Date.now());
+		expect(r2.result).to.equal('accepted');
+		await Promise.resolve(); // flush the async promotion fired on the cap-crossing arrival
+
+		const r3 = await engine.handleRegister(mkReg('p3'), { followOn: true, treeTier: 0 }, Date.now());
+		expect(r3.result).to.equal('promoted');
+		expect(r3.targetTier).to.equal(1);
+	});
+});
+
+describe('cohort-topic: FRET host protocol handshake', () => {
+	async function makePeerId(): Promise<PeerId> {
+		const key = await generateKeyPair('Ed25519');
+		return peerIdFromPrivateKey(key);
+	}
+
+	it('registers handlers on each of the four /optimystic/cohort-topic/1.0.0/* protocols', async () => {
+		const handled = new Set<string>();
+		const peerId = await makePeerId();
+		const fakeNode = {
+			peerId,
+			handle: (protocol: string | string[]): Promise<void> => {
+				for (const p of Array.isArray(protocol) ? protocol : [protocol]) {
+					handled.add(p);
+				}
+				return Promise.resolve();
+			},
+			unhandle: (): Promise<void> => Promise.resolve(),
+			getConnections: (): Connection[] => [],
+			dialProtocol: (): Promise<Stream> => Promise.reject(new Error('no dial in handshake test')),
+		};
+		const fakeFret = {
+			assembleCohort: (): string[] => [],
+			setActivityHandler: (): void => {},
+			getNetworkSizeEstimate: (): { size_estimate: number; confidence: number; sources: number } => ({ size_estimate: 50, confidence: 1, sources: 1 }),
+			routeAct: (): Promise<{ commitCertificate: string }> => Promise.resolve({ commitCertificate: '' }),
+		};
+
+		const host = await createCohortTopicHost(fakeNode as never, fakeFret as never);
+
+		for (const protocol of [
+			DEFAULT_COHORT_TOPIC_PROTOCOLS.register,
+			DEFAULT_COHORT_TOPIC_PROTOCOLS.gossip,
+			DEFAULT_COHORT_TOPIC_PROTOCOLS.promote,
+			DEFAULT_COHORT_TOPIC_PROTOCOLS.membership,
+		]) {
+			expect(handled.has(protocol), `handler for ${protocol}`).to.equal(true);
+		}
+		expect(host.protocols).to.deep.equal(DEFAULT_COHORT_TOPIC_PROTOCOLS);
+		await host.stop();
+	});
+});

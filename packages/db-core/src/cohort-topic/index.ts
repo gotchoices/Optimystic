@@ -16,3 +16,5 @@ export * from "./promotion.js";
 export * from "./coldstart.js";
 export * from "./antiflood/index.js";
 export * from "./antidos/index.js";
+export * from "./member-engine.js";
+export * from "./service.js";

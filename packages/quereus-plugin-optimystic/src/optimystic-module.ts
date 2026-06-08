@@ -647,11 +647,13 @@ export class OptimysticVirtualTable extends VirtualTable {
 
   /**
    * Register the main collection plus every index tree as dirty on the
-   * transaction bridge after a DML statement has staged its mutations. The
-   * bridge flushes these at commit (legacy mode) and discards them on rollback,
-   * which is what makes a deferred-constraint rejection atomic. Index trees a
-   * given statement didn't actually touch carry empty pending, so their
-   * flush/discard is a no-op — marking all of them is simplest and correct.
+   * transaction bridge BEFORE a DML statement stages its mutations. The first
+   * mark snapshots each tree's pre-stage state; the bridge flushes the trees at
+   * commit (legacy mode) and restores those snapshots on rollback, which is what
+   * makes a deferred-constraint rejection atomic. Marking must precede staging so
+   * the snapshot captures the state to revert to. Index trees a given statement
+   * doesn't touch are snapshotted too — harmless: their flush is a no-op and
+   * their restore is to an identical state.
    */
   private markDirtyTrees(): void {
     if (this.collection) {
@@ -699,14 +701,15 @@ export class OptimysticVirtualTable extends VirtualTable {
             const insertKey = this.rowCodec.extractPrimaryKey(values);
             const encodedRow = this.rowCodec.encodeRow(values);
 
-            // Stage the row in the main table (flushed at commit / discarded on
-            // rollback — see stageMutation / markDirtyTrees).
-            // Entry format: [primaryKey, encodedRow]
+            // Snapshot the trees before staging so a rollback can revert exactly
+            // this mutation (flushed at commit / restored on rollback).
+            this.markDirtyTrees();
+
+            // Stage the row in the main table. Entry format: [primaryKey, encodedRow]
             await this.collection.stage([[insertKey, [insertKey, encodedRow]]]);
 
             // Stage into all indexes
             await this.indexManager.insertIndexEntries(values, insertKey, txnState?.transactor);
-            this.markDirtyTrees();
 
             // Update statistics
             this.statisticsCollector?.incrementRowCount();
@@ -726,9 +729,12 @@ export class OptimysticVirtualTable extends VirtualTable {
             const newKey = this.rowCodec.extractPrimaryKey(values);
             const encodedRow = this.rowCodec.encodeRow(values);
 
-            // Stage the main-table change (flushed at commit / discarded on
+            // Snapshot before staging so a rollback reverts exactly this change.
+            this.markDirtyTrees();
+
+            // Stage the main-table change (flushed at commit / restored on
             // rollback). A PK change is staged as delete-old + insert-new so both
-            // index halves discard together on rollback.
+            // index halves revert together on rollback.
             if (oldKey !== newKey) {
               // Key changed - delete old, insert new
               await this.collection.stage([
@@ -748,7 +754,6 @@ export class OptimysticVirtualTable extends VirtualTable {
               newKey,
               txnState?.transactor
             );
-            this.markDirtyTrees();
 
             return { status: 'ok', row: values };
           }
@@ -760,12 +765,14 @@ export class OptimysticVirtualTable extends VirtualTable {
           {
             const deleteKey = this.rowCodec.extractPrimaryKey(oldKeyValues);
 
-            // Stage the main-table delete (flushed at commit / discarded on rollback)
+            // Snapshot before staging so a rollback reverts exactly this delete.
+            this.markDirtyTrees();
+
+            // Stage the main-table delete (flushed at commit / restored on rollback)
             await this.collection.stage([[deleteKey, undefined]]);
 
             // Stage deletes from all indexes
             await this.indexManager.deleteIndexEntries(oldKeyValues, deleteKey, txnState?.transactor);
-            this.markDirtyTrees();
 
             // Update statistics
             this.statisticsCollector?.decrementRowCount();

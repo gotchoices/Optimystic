@@ -1,4 +1,4 @@
-import type { IBlock, Action, ActionType, ActionHandler, BlockId, ITransactor, BlockStore } from "../index.js";
+import type { IBlock, Action, ActionType, ActionHandler, BlockId, ITransactor, BlockStore, Transforms } from "../index.js";
 import { Log, Atomic, Tracker, copyTransforms, CacheSource, isTransformsEmpty, TransactorSource } from "../index.js";
 import type { CollectionHeaderBlock, CollectionId, ICollection } from "./index.js";
 import type { ReadDependency } from "../transaction/transaction.js";
@@ -18,6 +18,15 @@ export type CollectionInitOptions<TAction> = {
 	 * 	applied through act()), or undefined to discard this action
 	 */
 	filterConflict?: (action: Action<TAction>, potential: Action<TAction>[]) => Action<TAction> | undefined
+}
+
+/** A point-in-time copy of a collection's staged (un-synced) state, produced by
+ * {@link Collection.snapshotPending} and consumed by {@link Collection.restorePending}. */
+export interface CollectionSnapshot<TAction> {
+	/** Deep-cloned tracker transforms at snapshot time. */
+	transforms: Transforms;
+	/** Pending actions queued at snapshot time. */
+	pending: Action<TAction>[];
 }
 
 export class Collection<TAction> implements ICollection<TAction> {
@@ -136,17 +145,29 @@ export class Collection<TAction> implements ICollection<TAction> {
 		this.source.actionContext = latest?.context;
 	}
 
-	/** Discard all staged-but-unsynced changes.
+	/** Capture the current staged state — tracker transforms plus the pending
+	 * action queue — so it can be restored later via {@link restorePending}.
 	 *
-	 * Drops the queued pending actions and resets the in-memory tracker so that
-	 * reads through this collection observe committed source state again. Use to
-	 * roll back mutations that were staged via {@link act} but not yet pushed to
-	 * the transactor via {@link sync}/{@link updateAndSync}. Storage is untouched
-	 * because nothing was ever synced. Synchronous and latch-free: intended for
-	 * transaction rollback, when no concurrent act/sync is in flight. */
-	discardPending(): void {
-		this.pending = [];
-		this.tracker.reset();
+	 * Use to bracket a unit of staged DML that may need to be rolled back. Unlike
+	 * a blanket "reset to empty", restoring this snapshot preserves any structural
+	 * baseline that predates the staged DML — most importantly a brand-new
+	 * collection's header/root blocks, which live in the tracker (uncommitted)
+	 * until the first sync. Resetting such a collection to empty would leave it
+	 * unreadable; restoring the snapshot returns it to its prior (readable) state.
+	 *
+	 * The returned snapshot is deep-cloned and independent of subsequent mutations.
+	 * Synchronous and latch-free: intended to bracket transaction-scoped staging,
+	 * when no concurrent act/sync is in flight. */
+	snapshotPending(): CollectionSnapshot<TAction> {
+		return { transforms: copyTransforms(this.tracker.transforms), pending: [...this.pending] };
+	}
+
+	/** Restore the staged state captured by {@link snapshotPending}, discarding any
+	 * mutations staged since. Reads through the collection then observe exactly the
+	 * snapshot state again; storage is untouched because nothing was ever synced. */
+	restorePending(snapshot: CollectionSnapshot<TAction>): void {
+		this.tracker.reset(copyTransforms(snapshot.transforms));
+		this.pending = [...snapshot.pending];
 	}
 
 	/** Push our pending actions to the transactor */
