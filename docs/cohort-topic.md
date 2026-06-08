@@ -172,8 +172,9 @@ The root cohort sees high traffic only in the sparse regime, where it has the ca
 > gossip tick rather than eagerly, so the promotion-window **overshoot** past `cap_promote` is
 > observable. It records, per N, the **convergence latency** (peak-load → depth-stabilization), the
 > **peak overshoot** (bounded by one gossip-round of arrivals — the slope-based pre-promotion of
-> §Promotion `T_promote_lookahead` drives it to ~0, strictly below a lookahead-off run on the same
-> population), and the **oscillation count** (0 — depth locks monotonically; the `cap_promote`/
+> §Promotion `T_promote_lookahead` removes it only in the small-increment regime, not under a storm;
+> see §Promotion and demotion lifecycle), and the **oscillation count** (0 — depth locks
+> monotonically; the `cap_promote`/
 > `cap_demote` `4×` gap + `T_demote` thrash resistance is exercised in §Promotion and demotion
 > lifecycle).
 >
@@ -460,12 +461,21 @@ The newly-instantiated forwarder registers itself with its tier-(d−1) parent o
 > one round's worth of arrivals past `cap_promote` before promotion lands; the measured
 > `peakOvershoot` (excess `directParticipants` past `cap_promote` at the busiest cohort) is **0 at
 > N ≤ 1k, 36 at 10k, 436 at 100k, 4,936 at 1M** under the sweep's default ramp
-> (`arrivalsPerRound = ⌈N/200⌉`), i.e. `peakOvershoot < arrivalsPerRound`. **Pre-promotion lookahead
-> (`T_promote_lookahead`) measurably removes this overshoot only when the per-round increment is
-> comparable to `cap_promote`**: with `arrivalsPerRound = 64` (`compareLookahead`), overshoot is 0
-> both with and without lookahead; when a single round delivers far more than `cap_promote` arrivals
-> at once (the steep-storm regime), firing one round early cannot prevent the in-round pile-up, so
-> overshoot persists even with lookahead on. **Implication for implementers:** size the cohort's
+> (`arrivalsPerRound = ⌈N/200⌉`), i.e. `peakOvershoot < arrivalsPerRound`. The overshoot magnitude
+> is set by how far the *first* over-cap round lands past the cap —
+> `⌈cap_promote / arrivalsPerRound⌉ · arrivalsPerRound − cap_promote` — so it is **0 whenever the
+> per-round increment divides `cap_promote`** (`compareLookahead` at `arrivalsPerRound ∈ {16, 32, 64}`
+> → 0) and otherwise stays `< arrivalsPerRound` (R = 10 → 6, R = 50 → 36, R = 128 → 64; identical
+> across N, since it depends on the increment, not the population). **Pre-promotion lookahead
+> (`T_promote_lookahead`) does not bound this overshoot in general** — it removes the lagged overshoot
+> only in the small-increment regime the test pins (`compareLookahead` at `N = 1,000`,
+> `arrivalsPerRound = 10`: overshoot **6 without lookahead → 0 with**). Once a single round's excess
+> past the cap is larger — a moderate non-divisor (`arrivalsPerRound = 50` → 36, *unchanged* by
+> lookahead) or a steep storm (`arrivalsPerRound = 5,000` at N = 1M → 4,936) — firing one round early
+> cannot prevent the in-round pile-up, so the scale sweep's 0/0/36/436/4,936 above are the
+> **lookahead-on** figures (the sweep runs with lookahead enabled and still shows the full `< R`
+> overshoot at large N). At `arrivalsPerRound = 64` overshoot is 0 with or without lookahead simply
+> because 64 divides `cap_promote` — lookahead removes nothing there. **Implication for implementers:** size the cohort's
 > per-topic admission buffer for ~`cap_promote + (peak arrival rate × gossip round)` direct
 > participants, not a hard `cap_promote`; the `Promoted(d+1)` redirect throttles *new* walks but
 > in-flight arrivals within the lag window still land. (Evidence: `sweep.ts` scale samples,
@@ -809,10 +819,12 @@ interface MembershipCertV1 {
 >   exactly 32 direct subscribers and drains 2,000 re-registrations inside `T_drain = 60 s` at
 >   `T_rejoin_jitter = 30 s`, `block_fill_size = 64`. The fast cap absorbs the rotation tail without
 >   piling the root. Confirmed.
-> - **`T_promote_lookahead = 30 s`** — measurably removes promotion overshoot **only** when the
->   per-round arrival increment ≈ `cap_promote`; under a steep storm it does not (a full round of
->   arrivals lands past the cap regardless). Kept at 30 s, but implementers should not rely on it to
->   bound storm overshoot — it is a smoothing aid, not a hard cap. Confirmed-with-caveat.
+> - **`T_promote_lookahead = 30 s`** — measured to remove the gossip-lagged promotion overshoot **only
+>   in the small-increment regime** (`compareLookahead` at `arrivalsPerRound = 10`: 6 → 0); at a larger
+>   per-round increment (`arrivalsPerRound = 50` → overshoot 36, unchanged) or under a steep storm it
+>   does not (a full round of arrivals lands past the cap regardless). Kept at 30 s, but implementers
+>   should not rely on it to bound storm overshoot — it is a smoothing aid, not a hard cap.
+>   Confirmed-with-caveat. (See §Promotion and demotion lifecycle for the divisor relationship.)
 > - **`T_demote = 5 min`** — convergence runs show **zero depth oscillations** across N ∈ {100 … 1M};
 >   the `4×` cap gap + `T_demote` hold prevent flap. Confirmed.
 > - **`d_max_cap = 60`** — cold-lookup hop cost is exactly `d_max + 2` (sweep `d_max_cap`
