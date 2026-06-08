@@ -73,6 +73,17 @@ The hash mixes the tier number, the peer-ID prefix, and the topic ID so that:
 
 This is the only addressing scheme used by the layer. It replaces older bit-shift coord-ladder designs.
 
+> **Implementation.** `packages/db-core/src/cohort-topic/addressing.ts` (`TierAddressing` /
+> `HashTierAddressing`, default `F = 16`) implements the formula exactly: `coord_d` builds
+> `d ‖ prefix(P, d·log₂F) ‖ topicId` and hashes it through the injected `IRingHash` (db-core's own
+> SHA-256 truncated to the ring width — **not** a FRET import; the db-p2p binding makes the ring
+> width match FRET's `RING_BITS` so routing keys line up). `prefix(P, n)` extracts the `n` MSBs
+> MSB-first, left-padding when `P` is shorter than `n` bits. `coord(0, …)` dispatches to
+> `coord_0 = H(0x00 ‖ topicId)`, which equals `coord_d` with the empty tier-0 prefix.
+> **Validated:** the spec `addressing.spec.ts` ("coord_d collision rate") reproduces the
+> simulator's zero-collision result — distinct `(tier, prefix-shard, topic)` triples never alias,
+> and same-prefix peers converge — confirming no revision to the scheme.
+
 > **Simulator validation.** Coordinate distribution and `d_max` are exercised by the design
 > simulator (`packages/substrate-simulator`) against real FRET math — it wraps FRET's own
 > `hashKey`, `xorDistance`, `assembleCohort`, and `estimateSizeAndConfidence`
@@ -106,6 +117,15 @@ At `d_max`, each tier-`d_max` cohort covers `F` peers on average — roughly one
 `d_max` is recomputed lazily; participants don't need it precise. The simulator validates the
 formula and the `confidence_min` clamp against FRET's reported `(n_est, confidence)` over
 N ∈ {10, 100, 1k, 10k, 100k}; see the simulator validation note under §Tier addressing.
+
+> **Implementation.** `packages/db-core/src/cohort-topic/dmax.ts` (`makeDMaxComputer`) reads the
+> estimate lazily through the injected `ISizeEstimator` (db-p2p wraps FRET's
+> `estimateSizeAndConfidence`) and applies the clamp to `⌊d_max_cap / 2⌋` when
+> `confidence < confidence_min`. `⌊log_F(n_est)⌋` is computed with a power-of-`F` boundary
+> correction so exact powers (e.g. `16³`) don't lose a tier to floating-point error; the result is
+> capped at `d_max_cap`. Tier classes and Edge/Core profiles live in
+> `packages/db-core/src/cohort-topic/tiers.ts`. Defaults (`F = 16`, `d_max_cap = 60`,
+> `confidence_min = 0.3`) match §Configuration. Specs: `dmax.spec.ts`, `tiers.spec.ts`.
 
 ---
 
