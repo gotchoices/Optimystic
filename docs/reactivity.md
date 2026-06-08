@@ -249,6 +249,8 @@ The checkpoint is *not* a replacement for the source-of-truth chain; it is a hin
 
 `W_checkpoint` defaults to 16× the replay buffer (4096 revisions ≈ 1 hour at 1 cps) and is configurable per collection. Cohorts at tier `d ≥ 1` are the primary holders of checkpoints; the tail cohort holds the current rolling checkpoint, advancing it as revisions retire from the replay buffer.
 
+**Checkpoint span is *layered below* the replay window — this is the authoritative resume semantics.** The checkpoint always covers the `W_checkpoint` revisions immediately under the ring's low edge: `[ringLow − W_checkpoint, ringLow − 1]`, where `ringLow` is the oldest revision still in the replay buffer. The two windows therefore stack rather than overlap, and the **total recoverable range from a single round trip is `W + W_checkpoint`** (≈ 256 + 4096 = 4352 revisions ≈ 72 min at 1 cps), not `W_checkpoint`. A resume is classified by lag against the *stacked* bounds: `lag < W` → `Backfill`; `W ≤ lag < W + W_checkpoint` → `CheckpointWindow`; `lag ≥ W + W_checkpoint` → `OutOfWindow`. (§Failure modes and §Worked scenarios below use these same stacked bounds. The design simulator's `RollingCheckpoint` already implements this layered span; its `classifyResume` pure function still uses the older single-absolute-bound form (`lag < W_checkpoint`), so it classifies the in-window range one `W` shallower than this doc — a follow-up retunes it to `lag < W + W_checkpoint`. See `fix/reactivity-resume-classifier-layered-bound`.)
+
 ### Backfill RPC
 
 ```
@@ -318,9 +320,12 @@ The primary at a forwarder cohort begins fan-out, completes some recipients, the
 Bounded per-subscriber queue (above) absorbs short bursts. Sustained backlog causes oldest-revision drop; subscriber detects via revision gap on next received notification and issues a `BackfillV1`. The cohort's replay buffer covers the gap as long as the subscriber's lag stays under `W` revisions; beyond that, `CheckpointWindow`; beyond that, chain read.
 
 ### Subscriber wakes after long sleep
-- `< W` revisions of lag: one `ResumeV1`, gets `Backfill`. One round trip.
-- `< W_checkpoint` revisions of lag: one `ResumeV1`, gets `CheckpointWindow`. One round trip.
-- Older: `ResumeV1` returns `OutOfWindow`. Subscriber reads the chain to catch up to a current revision, then issues a fresh subscribe.
+Lag is measured against the *stacked* windows (§Parent checkpoint summaries): the checkpoint sits below the replay buffer, so the bounds add.
+- `lag < W` (< 256): one `ResumeV1`, gets `Backfill`. One round trip.
+- `W ≤ lag < W + W_checkpoint` (256 … 4351): one `ResumeV1`, gets `CheckpointWindow`. One round trip.
+- `lag ≥ W + W_checkpoint` (≥ 4352): `ResumeV1` returns `OutOfWindow`. Subscriber reads the chain to catch up to a current revision, then issues a fresh subscribe.
+
+(The simulator's `classifyResume` currently cuts over to `OutOfWindow` at `lag ≥ W_checkpoint = 4096` — one `W` shallower than the layered bound above. The doc's stacked form is authoritative; `fix/reactivity-resume-classifier-layered-bound` retunes the simulator to match.)
 
 ### Tail rotation during subscriber outage
 Subscriber wakes, sends `ResumeV1` with stale `latestKnownTailId`. The cohort it reaches (under the new tail) responds `TailRotated{ newTailId }`. Subscriber walks the new tree, re-registers, and resumes; replay covers as much as it covers.
@@ -431,15 +436,29 @@ interface BackfillReplyV1 {
 
 ### Defaults
 
-> **Simulator-validated (pending fold-back).** `W`, `W_checkpoint`, their ratio, and the
-> *adaptive-`W`* question below are validated by the design simulator
-> (`packages/substrate-simulator`, `reactivity.ts`): it measures the one-RPC backfill window (`W`),
-> the checkpoint window (`W_checkpoint`), the wall-clock coverage each gives at a commit rate
-> (`W = 256` ≈ 4 min and `W_checkpoint = 4096` ≈ 1 hour at 1 cps; `W` ≈ 2.5 s at 100 cps), and the
-> tail-rotation re-registration burst staying inside `cap_promote_fast`. The 100-cps result flags
-> that a fixed `W` is too shallow for hot collections — **`W` should likely be adaptive per measured
-> cps**. Measured coverage times and RPC-count distributions land here via
-> `fold-simulator-findings-into-design-docs`.
+> **Defaults validated by simulator.** `W`, `W_checkpoint`, their ratio, and the *adaptive-`W`*
+> question are measured by the design simulator (`packages/substrate-simulator`, `reactivity.ts` →
+> `measureCoverage` / `assessAdaptiveW`, and `sweep.ts` `W`/`W_checkpoint` rows). Findings:
+>
+> - **`W = 256`, `W_checkpoint = 4096`, ratio `16×` — confirmed.** Measured one-round-trip coverage
+>   (`coverageSeconds`): at **1 cps**, `W` covers **256 s (≈ 4.3 min)** and `W_checkpoint` **4,096 s
+>   (≈ 68 min ≈ 1 hr)**; combined recoverable range `W + W_checkpoint` = **4,352 s (≈ 72 min)**. The
+>   `16×` ratio is the gap between a backgrounded-app window (minutes) and an overnight-sleep window
+>   (~1 hr) without ballooning per-cohort replay memory. Kept as written.
+> - **`W` SHOULD be adaptive per measured cps — REVISED guidance (default value unchanged).** With a
+>   60 s recovery floor, fixed `W = 256` is comfortable at 1 cps (256 s, above floor) but **drops
+>   below the floor at ≥ 10 cps**: `assessAdaptiveW` flags `belowFloor` and recommends `W ≈ 600` at
+>   10 cps and **`W ≈ 6,000` at 100 cps** (where fixed `W = 256` covers only **2.56 s**). The
+>   recommendation: keep `W = 256` as the *Edge/low-rate default* but make `W` adaptive on hot
+>   collections — `W = ⌈min_coverage_seconds × cps⌉` clamped to a per-cohort memory budget. Downstream
+>   `reactivity-backfill-resume-checkpoints` should treat `W` as a per-collection computed value, not
+>   a hard constant. `W_checkpoint` scales the same way and may stay a fixed 16× multiple of the
+>   resolved `W`.
+> - **Tail-rotation burst stays inside `cap_promote_fast`** — peak new-tail root = 32, drains in
+>   29,995 ms ≤ `T_drain = 60 s` (see §Worked scenarios). Confirmed.
+>
+> (Scenarios/sweep: `scenarios.ts` TailRotation, `sweep.ts` `W`/`W_checkpoint` coverage rows,
+> `reactivity.ts` `assessAdaptiveW`.)
 
 Reactivity adds the following to the cohort-topic defaults:
 
@@ -470,8 +489,15 @@ In addition to the cohort-topic Edge overrides (TTL = 60 s, ping = 20 s, T2/T3 p
 > `reactivity.ts`'s `simulateRotationBurst` + `CohortPushState`): it validates the re-registration
 > wave stays within `cap_promote_fast` at the new tail, completes inside `T_drain`, and that the
 > monotonic revision stream stays gap-free. The parameter-sensitivity sweep (`sweep.ts`) quantifies
-> the `W` / `W_checkpoint` recovery-coverage tradeoff. Measured numbers are folded in by
-> `fold-simulator-findings-into-design-docs`.
+> the `W` / `W_checkpoint` recovery-coverage tradeoff.
+>
+> **Measured resume RPC counts + latency** (`reactivity.ts` `traceResume`, `DEFAULT_RESUME_COST`:
+> `roundTripMs = 100`, `chainReadMs = 400`, `reResolveRoundTrips = 2`, at `DEFAULT_HOP_MS = 50`):
+> a `Backfill` (lag < `W`) and a `CheckpointWindow` (`W ≤ lag < W + W_checkpoint`) each cost
+> **1 RPC ≈ 100 ms**; an `OutOfWindow` resume costs **2 RPCs ≈ 500 ms** (resume + chain read); a
+> `TailRotated` resume costs **3 RPCs ≈ 300 ms** (stale redirect + 2 re-resolve round trips). The
+> 90 s and 20 min wakes below are both single-RPC; only an overnight-plus sleep crosses into the
+> 2-RPC chain-read fallback.
 
 ### Cold collection becomes popular
 
@@ -487,17 +513,26 @@ In addition to the cohort-topic Edge overrides (TTL = 60 s, ping = 20 s, T2/T3 p
 
 ### Mobile subscriber wakes after 90 seconds
 
-Phone app resumes. `lastRevision = 1042`. Cached `primary = P_42`. Sends `ResumeV1{from: 1043}`. `P_42`'s replay buffer has revisions 950–1100. Returns `Backfill{entries: [1043..1098], currentRevision: 1098}`. Subscriber processes 56 backfilled notifications, updates `lastRevision = 1098`, resumes. One round trip.
+Phone app resumes. `lastRevision = 1042`. Cached `primary = P_42`. Sends `ResumeV1{from: 1043}`. `P_42`'s replay buffer has revisions 950–1100. Returns `Backfill{entries: [1043..1098], currentRevision: 1098}`. Subscriber processes 56 backfilled notifications, updates `lastRevision = 1098`, resumes. One round trip. **Measured: lag 55 < `W = 256` → `Backfill`, 1 RPC, ≈ 100 ms** (`classifyResume`/`traceResume`).
 
 ### Mobile subscriber wakes after 20 minutes
 
-Phone app resumes. `lastRevision = 1042`, current revision is 2342. Replay buffer covers 2086–2342 (256 entries). `ResumeV1{from: 1043}` falls outside the buffer but inside the parent checkpoint `[800, 2085]`. Cohort returns `CheckpointWindow{ checkpoint: [800..2085], recentEntries: [2086..2342] }`. Subscriber applies the checkpoint's merged digest (collection-specific — for a KV collection, this is "these keys changed"), then dedupes against `lastRevision = 1042` for the `recentEntries`. One round trip.
+Phone app resumes. `lastRevision = 1042`, current revision is 2342. Replay buffer covers 2086–2342 (256 entries). `ResumeV1{from: 1043}` falls outside the buffer but inside the parent checkpoint `[800, 2085]`. Cohort returns `CheckpointWindow{ checkpoint: [800..2085], recentEntries: [2086..2342] }`. Subscriber applies the checkpoint's merged digest (collection-specific — for a KV collection, this is "these keys changed"), then dedupes against `lastRevision = 1042` for the `recentEntries`. One round trip. **Measured: lag 1,299 falls in `[W, W + W_checkpoint) = [256, 4352)` → `CheckpointWindow`, 1 RPC, ≈ 100 ms.** (The `from = 1043` lands inside the layered checkpoint `[800, 2085]` sitting immediately below the replay ring `2086–2342`, illustrating the stacked-window semantics: `W` covers the head, the checkpoint the next `W_checkpoint` below it.)
 
 ### Tail rotation during steady-state load
 
 Collection `C` has 10 000 subscribers, tree depth 3. Tail block `T_5` fills at revision 5400. The notification for revision 5400 carries `rotationHint{ newTailId: T_6, effectiveAtRevision: 5401 }`.
 
 All 10 000 subscribers receive the hint via the existing tree within a few seconds. Each schedules re-registration with random jitter over 30 s. The new tail cohort at `coord_0(_, H(T_6 ‖ "reactivity"))` sees arrival rate ≈ 333 / s; it accepts 64 directly, fast-promotes (`cap_promote_fast = 32`, load bucket hot), and starts redirecting to tier 1. Tier-1 cohorts under `T_6` form during the same window. By `T_drain = 60 s`, the new tree mirrors the old tree's shape under a different root. Forwarder cohorts under `T_5` drain and demote naturally. Continuity is preserved by the monotonic revision sequence; subscribers experience the rotation as a brief pause followed by resumed delivery from the new tree.
+
+> **Measured (validated by simulator).** `TailRotationScenario` (`simulateRotationBurst`) drove a
+> 2,000-subscriber re-registration wave jittered over `T_rejoin_jitter = 30 s`: the new tail's
+> tier-0 cohort held a **peak of exactly `cap_promote_fast = 32`** direct subscribers (then
+> fast-promoted, fanning the rest to tier 1), the **last re-registration landed at 29,995 ms,
+> comfortably inside `T_drain = 60 s`**, and a 1,000-revision stream pushed through the replay
+> pipeline stayed **monotone and gap-free** (`CohortPushState`). The doc's "333/s" figure for 10,000
+> subscribers is the same `subscribers / T_rejoin_jitter` rate the simulator confirms stays within
+> the fast-promote bound; scaling the burst changes the tree depth absorbed, not the root cap.
 
 ### Cohort failure mid-notification
 

@@ -245,13 +245,13 @@ What exists in code today is a narrower, **single-node, in-process** change-noti
 
 ### Implementation / Doc Sync Status
 
-The networked cohort-topic substrate, reactivity, and matchmaking are validated and rolled out in milestones. All entries below start as `pending`; later implementation/e2e tickets — the `*-core-module-fret-integration`, `*-e2e-mock-tier`, and `substrate-e2e-real-libp2p-tier` tickets — flip these to `done` as each milestone lands.
+The networked cohort-topic substrate, reactivity, and matchmaking are validated and rolled out in milestones. The **Simulator validation** column is flipped to `done` by `fold-simulator-findings-into-design-docs` — the design simulator (`packages/substrate-simulator`) has measured every quantitative claim in the three specs and folded the results back (depth law confirmed at N ∈ {100 … 1M}, `coord_d` collision rate ~0, promotion overshoot/convergence characterized, replay/checkpoint coverage and the adaptive-`W` finding settled, hang-out math and `contention_factor_cap` justified). The mock-tier and real-libp2p columns stay `pending`; later implementation/e2e tickets — the `*-core-module-fret-integration`, `*-e2e-mock-tier`, and `substrate-e2e-real-libp2p-tier` tickets — flip those as each milestone lands.
 
 | Subsystem | Simulator validation | Mock-tier e2e | Real-libp2p e2e |
 |-----------|----------------------|---------------|-----------------|
-| cohort-topic substrate | pending | pending | pending |
-| reactivity | pending | pending | pending |
-| matchmaking | pending | pending | pending |
+| cohort-topic substrate | done | pending | pending |
+| reactivity | done | pending | pending |
+| matchmaking | done | pending | pending |
 
 ## SQL Integration
 

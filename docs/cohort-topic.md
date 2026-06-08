@@ -84,10 +84,14 @@ This is the only addressing scheme used by the layer. It replaces older bit-shif
 > (`topic-addressing.ts`: `coord_d = H(d ‖ prefix(P, d·log₂F) ‖ topicId)` over `hashKey`) and
 > validates its two addressing invariants — peers sharing a `d·log₂F`-bit prefix converge on one
 > tier-`d` coordinate, while coordinates stay uncorrelated across tiers and topics — by measuring
-> the cross-(tier, prefix, topic) **`coord_d` collision rate**. With 256-bit sha256 coordinates
-> the rate is ~0 (birthday bound ≈ `total² / 2²⁵⁷`, negligible); the simulator's collision test
-> records the measured figure. Measured numbers from the N-sweep and the collision rate land in
-> `fold-simulator-findings-into-design-docs`.
+> the cross-(tier, prefix, topic) **`coord_d` collision rate**.
+>
+> **Measured (validated by simulator):** the collision test enumerates 64 distinct ring positions ×
+> 4 topics × tiers 0–5 = **1,536 coordinates and observes 0 collisions** — consistent with the
+> birthday bound (≈ `total² / 2²⁵⁷`, negligible at 256-bit width). The two invariants hold as
+> written: distinct `(tier, prefix, topic)` triples never alias, and same-prefix peers do converge.
+> **No revision to the `coord_d` scheme is warranted.** (Evidence: `topic-addressing.spec.ts`
+> "coord_d collision rate".)
 
 ### Maximum useful depth
 
@@ -171,8 +175,14 @@ The root cohort sees high traffic only in the sparse regime, where it has the ca
 > §Promotion `T_promote_lookahead` drives it to ~0, strictly below a lookahead-off run on the same
 > population), and the **oscillation count** (0 — depth locks monotonically; the `cap_promote`/
 > `cap_demote` `4×` gap + `T_demote` thrash resistance is exercised in §Promotion and demotion
-> lifecycle). The measured convergence-latency and overshoot-bound numbers fold back via
-> `fold-simulator-findings-into-design-docs`.
+> lifecycle).
+>
+> **Measured (validated by simulator).** Across the scale sweep `N ∈ {100, 1k, 10k, 100k, 1M}` the
+> observed steady-state depth equals the law exactly (1, 1, 2, 3, 4), **convergence latency is 0**
+> (depth stabilizes within the load ramp), **oscillation count is 0** (monotone lock), and the
+> **peak overshoot is `< arrivalsPerRound`** (0, 0, 36, 436, 4,936 under the `⌈N/200⌉` ramp). The
+> full convergence/overshoot analysis — including when `T_promote_lookahead` does and does not remove
+> overshoot — is in §Promotion and demotion lifecycle.
 
 ---
 
@@ -223,8 +233,13 @@ The cohort gossips a coarse "willingness vector" (one bit per tier per member, r
 > and gating under a burst caps accepted/sec at the willing-quorum capacity without a cascading
 > load increase; and (b) the **~1-heartbeat willingness-gossip staleness** edge case — a member
 > that just became unwilling while a sibling still gossips it as willing yields `UnwillingMember`
-> to a seeker routed onto it, which then recovers via a sibling retry / back-off. The settled
-> back-off parameters (`base`, `factor`, cap) fold back via `fold-simulator-findings-into-design-docs`.
+> to a seeker routed onto it, which then recovers via a sibling retry / back-off.
+>
+> **Settled back-off parameters (validated by simulator).** `backoff.ts` `DEFAULT_BACKOFF_CONFIG`:
+> **`base = 1 s`, `factor = 2` (doubling), `cap = 60 s`** — `retryAfter(attempt) = min(base ·
+> 2^attempt, 60 s)`. The capped doubling bounds the rejections a participant suffers across an
+> overload window at `O(log(window/base))` (e.g. ≤ ~6 rejections to span a 60 s window vs. 60 at a
+> fixed 1 s interval). Confirmed as written; no change for downstream tickets.
 
 ### Why the caller doesn't walk on `UnwillingCohort`
 
@@ -429,8 +444,32 @@ The newly-instantiated forwarder registers itself with its tier-(d−1) parent o
 > `simulator-promotion-convergence`); (b) the **`4×` cap gap + `T_demote` hold absorb thrash** — a
 > load barometer bouncing across `bucket_overload` does not flap promotion; and (c) a cohort with
 > `childCohortCount > 0` **never demotes**, even below `cap_demote` past `T_demote`. The
-> `cap_promote`/`cap_demote`/`T_demote`/`T_promote_sticky`/`bucket_overload` values the simulator
-> settles fold back via `fold-simulator-findings-into-design-docs`.
+> `cap_promote`/`cap_demote`/`T_demote`/`T_promote_sticky`/`bucket_overload` values are settled and
+> recorded below (and confirmed unchanged in §Configuration).
+>
+> **Measured convergence + overshoot (validated by simulator).** The N-scale sweep
+> (`sweep.ts` → `runConvergence`, N ∈ {100, 1k, 10k, 100k, 1M}) confirms the depth law exactly at
+> every N: observed steady-state depth equals `⌈log_F(N/cap_promote)⌉` (= 1, 1, 2, 3, 4
+> respectively) with **zero oscillations** (monotone lock — the `4×` cap gap + `T_demote` never let
+> depth flap). **Convergence latency is 0 on the virtual clock**: depth stabilizes *within* the load
+> ramp, so there is no post-peak settling lag — the tree reaches its final depth by the time the last
+> arrival lands.
+>
+> **Promotion-window overshoot is real and scales with the per-round arrival increment**, not with
+> N directly. Because the promotion decision is gossip-lagged by one round, a cohort accrues up to
+> one round's worth of arrivals past `cap_promote` before promotion lands; the measured
+> `peakOvershoot` (excess `directParticipants` past `cap_promote` at the busiest cohort) is **0 at
+> N ≤ 1k, 36 at 10k, 436 at 100k, 4,936 at 1M** under the sweep's default ramp
+> (`arrivalsPerRound = ⌈N/200⌉`), i.e. `peakOvershoot < arrivalsPerRound`. **Pre-promotion lookahead
+> (`T_promote_lookahead`) measurably removes this overshoot only when the per-round increment is
+> comparable to `cap_promote`**: with `arrivalsPerRound = 64` (`compareLookahead`), overshoot is 0
+> both with and without lookahead; when a single round delivers far more than `cap_promote` arrivals
+> at once (the steep-storm regime), firing one round early cannot prevent the in-round pile-up, so
+> overshoot persists even with lookahead on. **Implication for implementers:** size the cohort's
+> per-topic admission buffer for ~`cap_promote + (peak arrival rate × gossip round)` direct
+> participants, not a hard `cap_promote`; the `Promoted(d+1)` redirect throttles *new* walks but
+> in-flight arrivals within the lag window still land. (Evidence: `sweep.ts` scale samples,
+> `promotion-convergence.ts` `compareLookahead`.)
 
 ---
 
@@ -462,10 +501,34 @@ A claim of "anti-flood by construction" is only meaningful if we can name the fl
 >    `cap_promote` then promotes (sticky window holds it promoted), bouncing the overflow outward
 >    with single-RPC `Promoted` redirects; no participant is starved.
 >
-> Lookup cost is also characterized: the hot regime resolves in 1 RPC (p50/p95 hops 1–2 without
-> touching the root), while the cold worst case is `d_max + 2` hops (probe every tier inward, then
-> bootstrap) — i.e. `O(log_F N)`. Measured rate/hop figures land in
-> `fold-simulator-findings-into-design-docs`.
+> **Measured per-claim (validated by simulator):**
+> 1. **Cold-start storm avoidance** — in the cold-start-storm scenario the walks start at
+>    **distinct `coord_{d_max}` for every subscriber** (distinct-start count == subscriber count,
+>    e.g. 3,000/3,000 and 10,000/10,000) and all drain to the root with **zero give-ups**, so no
+>    speculative deeper probing and no root pre-saturation.
+> 2. **Re-registration storm bound** — the tail-rotation burst (a re-registration wave *is* this
+>    flood) spreads 2,000 subscribers over `T_rejoin_jitter = 30 s`; the new tail's root holds at
+>    most `cap_promote_fast = 32` direct subscribers at peak and the whole wave lands by
+>    `t = 29,995 ms ≤ T_drain = 60 s` — the inbound rate stays inside `cap_promote / T_rejoin_jitter`.
+> 3. **No speculative outward probe** — confirmed by `outwardMovesArePromoted` over every walk trace:
+>    each outward move is preceded by a `Promoted` reply.
+> 4. **Inward retry restarts at `d_max`** — confirmed by `unwillingRetriesRestartAtDMax`: no
+>    post-`UnwillingCohort` retry re-hits the declined coord.
+> 5. **Promotion-flap prevention** — under the synchronized storm the cohort promotes (≥ 1 `Promoted`
+>    event fires) and the sticky window holds it promoted while overflow is bounced outward by
+>    single-RPC redirects.
+>
+> **Lookup cost is `O(log_F N)`, measured:** landing-walk **max hops == `d_max + 2`** wherever
+> sampled (= 4 at N ≤ 10k where the full tree is grown; the cold-bootstrap worst case in the storm
+> is 6 = `d_max + 2`). The `d_max_cap` sensitivity sweep confirms the cold worst case is exactly
+> `d_max_cap + 2` (5, 6, 7, 8 hops for `d_max_cap` = 3, 4, 5, 6). The hot regime resolves without
+> reaching the root. **One caveat, surfaced honestly:** the cold-start-storm claim
+> "root accepts ≤ `cap_promote`" is the *cumulative tier-0 acceptance*, and it is bounded only when
+> the arrival rate is moderate — at 3,000 subscribers / 5 s it stays ≤ 64, but at 10,000 / 5 s
+> (≈ 2,000/s) cumulative tier-0 acceptance reaches **122 (~2× `cap_promote`)** before promotion +
+> redirect throttle it. This is the same gossip-lag overshoot quantified under §Promotion and
+> demotion lifecycle, not a separate effect. (Evidence: `scenarios.ts` cold-start-storm &
+> tail-rotation reports, `walk-metrics.ts`, `sweep.ts` `d_max_cap` rows.)
 
 > **Simulator scenarios.** The end-to-end claims above are also exercised by the simulator's
 > scenario runner (`packages/substrate-simulator`, `scenarios.ts`) — the **cold-start storm**
@@ -474,8 +537,8 @@ A claim of "anti-flood by construction" is only meaningful if we can name the fl
 > `⌈log_F(N/cap_promote)⌉` with the root never overloaded), and **churn recovery** (20% member
 > turnover fails over with no lost registrations and heals to convergence). Each emits a pass/fail
 > `ClaimReport`; the N-scale + parameter-sensitivity sweep (`sweep.ts`) confirms the depth law and
-> quantifies each parameter's effect. The measured numbers are folded into this doc by
-> `fold-simulator-findings-into-design-docs`.
+> quantifies each parameter's effect. The measured numbers are recorded in the per-claim evidence
+> above and the §Configuration "Defaults validated by simulator" callout.
 
 ---
 
@@ -521,8 +584,14 @@ A participant verifying a threshold-signed message against an out-of-date `Membe
 > membership rotation surfaces as `primary_moved` on the next ping (within one `ttl/3` window); and
 > a partition heal reconstitutes the pre-split `cohortEpoch`, so both sides re-derive the *same*
 > deterministic primary (`hash(participantId ‖ cohortEpoch) mod k`) and subscribers converge via
-> `primary_moved` in ~one gossip round. The measured **backup-promotion window** and
-> **partition-heal convergence** latencies land in `fold-simulator-findings-into-design-docs`.
+> `primary_moved` in ~one gossip round.
+>
+> **Measured (validated by simulator).** The churn-recovery scenario (16-member cohort, 64 attached
+> participants, 20% member turnover) recorded **0 lost registrations**, **failover engaged
+> (12 backup-promotion + re-lookup events)** within the renewal window, and a split→heal where
+> **all 64 participants re-converged** on the same deterministic primary (`partition.ts`
+> `checkConvergence`). Backup promotion is bounded by one TTL (three `ttl/3` ping failures = `ttl`);
+> heal convergence is ~one gossip round. Confirmed.
 
 ---
 
@@ -723,6 +792,36 @@ interface MembershipCertV1 {
 | `topics_max` | 2048 | Max topics with forwarder state per cohort |
 | `backups_per_registration` | 2 | Warm-failover cohort members per registration |
 | `register_rate_per_peer` | 4 / min | Per-peer-per-topic rate limit at a single cohort |
+
+> **Defaults validated by simulator.** The design simulator (`packages/substrate-simulator`)
+> measured each load-bearing default; all are **confirmed as written** — no value changes for
+> downstream implementers (`cohort-topic-wire-formats`, `cohort-topic-tier-addressing-dmax`, …):
+>
+> - **`F = 16`** — sensitivity sweep (`sweep.ts`, F ∈ {4, 8, 16, 32} at N = 10k) gives steady-state
+>   depth 4, 3, 2, 2. `F = 16` sits at the knee: doubling to 32 saves no depth, halving to 8 adds a
+>   tier. Confirmed.
+> - **`cap_promote = 64`** — sweep (cap ∈ {16, 32, 64, 128}) gives depth 3, 3, 2, 2; `64` is the
+>   smallest cap that holds the 10k tree at depth 2 (the depth-law value). Its job is bounding the
+>   *root* fan-in, and the measured promotion-window **overshoot is `< arrivalsPerRound`** (see
+>   §Promotion and demotion lifecycle), so `cap_promote` is the steady-state floor, not a hard
+>   instantaneous ceiling under a storm. Confirmed.
+> - **`cap_promote_fast = 32`** — the tail-rotation burst (reactivity) caps the hot new-tail root at
+>   exactly 32 direct subscribers and drains 2,000 re-registrations inside `T_drain = 60 s` at
+>   `T_rejoin_jitter = 30 s`, `block_fill_size = 64`. The fast cap absorbs the rotation tail without
+>   piling the root. Confirmed.
+> - **`T_promote_lookahead = 30 s`** — measurably removes promotion overshoot **only** when the
+>   per-round arrival increment ≈ `cap_promote`; under a steep storm it does not (a full round of
+>   arrivals lands past the cap regardless). Kept at 30 s, but implementers should not rely on it to
+>   bound storm overshoot — it is a smoothing aid, not a hard cap. Confirmed-with-caveat.
+> - **`T_demote = 5 min`** — convergence runs show **zero depth oscillations** across N ∈ {100 … 1M};
+>   the `4×` cap gap + `T_demote` hold prevent flap. Confirmed.
+> - **`d_max_cap = 60`** — cold-lookup hop cost is exactly `d_max + 2` (sweep `d_max_cap`
+>   ∈ {3,4,5,6} → 5,6,7,8 hops), so the start tier is the sole driver of cold cost and the cap simply
+>   bounds the pathological deep probe; at realistic `d_max` (≤ 6 for N ≤ 1M) it is never the binding
+>   constraint. Confirmed.
+>
+> Scenarios: cold-start-storm, tail-rotation, voting-quorum (`scenarios.ts`); scale + sensitivity
+> sweep (`sweep.ts`).
 
 ### Per-tier overrides
 

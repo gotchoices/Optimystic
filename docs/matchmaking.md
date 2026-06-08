@@ -270,13 +270,29 @@ A seeker needs 8 providers of `pdf-render`, `patienceMs = 10 s`. Network has 200
 
 Contrast: the seeker's prefix lands it in a thinner shard with `directParticipants: 1, arrivalsPerMin: 8`. `expectedNewMatches ≈ 1.3`. Threshold not met. Withdraw, walk to `d = 0`. Root reports `directParticipants: 200, arrivalsPerMin: 600`. Query returns 8 immediately.
 
-> **Simulator-validated** (`packages/substrate-simulator`, `simulator-matchmaking-hangout`). The
-> decision math above (`expectedNewMatches`, `contentionFactor`, the threshold), this worked
-> example (`expectedNewMatches = 15`, `contentionFactor ≈ 1.13`, decision = hang out), the
-> §Test-expectations cases (hot deep-tier suffices, cold walks to root, borderline hangs out for
-> full patience), and the `contention_factor_cap = 4.0` fairness claim (100 parallel seekers do not
-> self-inflict an escalation storm) are reproduced as assertions in the modeled seeker walk. The
-> measured figures fold back here via `fold-simulator-findings-into-design-docs`.
+> **Simulator-validated** (`packages/substrate-simulator`, `matchmaking.ts` decision engine +
+> `seeker-walk.ts`). The decision math is confirmed exactly against the formulas:
+>
+> - **Worked example trace — confirmed.** `arrivalsPerMin = 90`, `queriesPerMin = 4`, `wantCount = 8`,
+>   `patienceMs = 10 s`, `filterAcceptRatio = 1.0`, `currentMatches = 6`:
+>   `expectedNewMatches = 90 × 1.0 × (10/60) = 15.00`,
+>   `contentionFactor = min(1 + (4 × 3)/90, 4) = 1.13`, threshold `8 × 1.13 = 9.07`; have `6 + 15 = 21
+>   ≥ 9.07` → **hang out** (reason `feasible`). Matches the doc figures to 2 d.p.
+> - **`contention_factor_cap = 4.0` — confirmed, keep global.** The cap exists to bound the
+>   `queriesPerMin / arrivalsPerMin` ratio in `contentionFactor`. On a thin, heavily-queried tier
+>   (`arrivalsPerMin = 10`, `queriesPerMin = 100`, modeling ~100 competing seekers), the **uncapped**
+>   factor is `1 + (100 × 3)/10 = 31`, which would set the threshold to `wantCount × 31 = 93` —
+>   unreachable at any tier, pinning every seeker to the root (a self-inflicted escalation storm).
+>   The cap clamps the factor to **4** and the threshold to **12**, so contended seekers still
+>   escalate toward aggregation (correct) without the threshold exploding. The sensitivity sweep
+>   (`sweep.ts`, cap ∈ {1, 2, 4, 8}) gives thresholds 3, 6, 12, 24 on this fixed hot reply; the
+>   decision flips from hang-out to escalate at cap ≥ 2, so **4 sits safely in the escalate regime
+>   with headroom**. **It should stay a global scalar, not per-tier:** the failure it guards
+>   (divide-by-small-`arrivalsPerMin`) is a property of the ratio, not the tier, and
+>   `refinement-signal.ts` shows the exact-`Σ wantCount` seeker-pool refinement only ever *flips* a
+>   decision in the **un-capped** regime — once both approx and exact saturate at the cap they agree,
+>   so a per-tier cap buys nothing here. (Evidence: `scenarios.ts` adversarial-reporting,
+>   `sweep.ts` `contention_factor_cap` rows, `refinement-signal.ts`.)
 
 ### Edge cases
 
@@ -584,6 +600,15 @@ Returned only by promoted cohorts; cold cohorts that fall through to `NoState` d
 | `push_coalesce_ms` | 250 | Window the seeker's primary batches fresh matchable arrivals before flushing one `ArrivalPushV1` (see [§Arrival push on provider arrival](#arrival-push-on-provider-arrival)) |
 | `push_safety_poll_ms` | 5 000 | Sparse fallback `QueryV1` cadence for a push-aware hanging-out seeker (replaces the 1 s `requery_interval_ms` on the push path) |
 
+> **Defaults validated by simulator.** `contention_factor_cap = 4.0` is confirmed by the design
+> simulator and **kept as a global scalar** — see §Hang-out vs. continue for the measured trace
+> (uncapped factor 31 → clamped to 4 → threshold 12 vs. an unreachable 93, preventing root-pinning;
+> sensitivity sweep thresholds 3/6/12/24 for cap 1/2/4/8). `meanWantCount = 3`, `patience_default_ms
+> = 10 000`, `requery_interval_ms = 1 000`, and `push_safety_poll_ms = 5 000` are confirmed as the
+> inputs the decision math was validated against (worked example: ~10 polls/match on the poll path,
+> ~3 on the push path). No matchmaking default changes for downstream tickets. (Evidence:
+> `matchmaking.ts`, `sweep.ts` `contention_factor_cap` rows, `seeker-walk.ts`.)
+
 All of these rows except `push_coalesce_ms` are consumed only by the seeker — they tune the hang-out decision and the seeker's poll/push-fallback cadence (see [§Hang-out vs. continue](#hang-out-vs-continue) and [§Arrival push on provider arrival](#arrival-push-on-provider-arrival)). The cohort-topic layer is unaware of them, so they're application-level rather than protocol-level: changing them on a seeker has no wire impact. `push_coalesce_ms` is the one cohort-side knob — it tunes the batching window on the seeker's matchmaking-app primary, not the cohort-topic substrate, so it likewise carries no cohort-topic protocol impact. No corresponding per-peer rate limit yet exists for `QueryV1` (only `RegisterV1` is rate-limited via `register_rate_per_peer = 4 / min`). On the **non-push** path, at the default `requery_interval_ms = 1000` and `patience_default_ms = 10000` a hanging-out seeker issues at most ~10 queries per match. On the **push** path it issues at most `patienceMs / push_safety_poll_ms + 1` queries (≈ 3 at defaults — the sparse safety polls plus the mandatory final poll), and zero in the common case where the first push already satisfies `wantCount`. Either way it stays within current cohort budgets. Adding a `QueryV1` rate ceiling is out of scope here; see the matchmaking backlog.
 
 The cohort-topic tier for matchmaking is **T2 (functional)**; matchmaking registrations are declined freely by cohorts under T0/T1 load. The seeker's only recourse is to wait — the cohort-topic anti-flood properties prevent the seeker from making things worse by retrying aggressively.
@@ -596,9 +621,14 @@ The cohort-topic tier for matchmaking is **T2 (functional)**; matchmaking regist
 > executed by the simulator's scenario runner (`packages/substrate-simulator`, `scenarios.ts` →
 > `AdversarialReportingScenario`, on top of `seeker-walk.ts`): it validates bounded harm — a lying
 > primary that under-reports costs ≤ one extra escalation hop per under-reported tier, and one that
-> over-reports wastes ≤ `patienceMs` of hang-out drain. The parameter-sensitivity sweep (`sweep.ts`)
-> quantifies the `contention_factor_cap` effect on the hang-out threshold. Measured numbers are folded
-> in by `fold-simulator-findings-into-design-docs`.
+> over-reports wastes ≤ `patienceMs` of hang-out drain.
+>
+> **Measured (validated by simulator).** `AdversarialReportingScenario`: an **under-reporting**
+> primary (claims upper tiers are cold) cost the seeker **+2 escalation hops over 2 under-reported
+> tiers (≤ 1/tier)** and the seeker still terminated at the root (matched). An **over-reporting**
+> primary (claims a thin tier is hot) wasted **9,000 ms of hang-out ≤ `patienceMs = 10,000 ms`**, and
+> the seeker terminated at **10,000 ms ≤ `patienceMs` + setup**. Both adversarial bounds hold. The
+> three worked examples below are confirmed against the decision engine.
 
 ### Capability lookup in a sparse network
 
@@ -606,13 +636,13 @@ A node needs a peer that holds the `geocode-resolver` capability. Network has 5 
 
 Provider side: 30 nodes have each registered at `topicId = H("capability" ‖ "geocode-resolver" ‖ "match")`. With `n_est = 5000`, `d_max = log_16(5000) − 1 ≈ 2`. Most providers walked from `d = 2` toward the root; with only 30 providers the tier-0 cohort accepts them all (well under `cap_promote = 64`).
 
-Seeker side: a node needs three resolvers. Walks from `d_max = 2`: probes `coord_2(self, topicId)` → `NoState`; `d = 1` → `NoState`; `d = 0` → `Accepted` as seeker, then issues `QueryV1{limit: 16}`. Cohort returns the 30 providers. Seeker picks three (e.g., by latency to its peer ID), dials each directly, gets work done.
+Seeker side: a node needs three resolvers. Walks from `d_max = 2`: probes `coord_2(self, topicId)` → `NoState`; `d = 1` → `NoState`; `d = 0` → `Accepted` as seeker, then issues `QueryV1{limit: 16}`. Cohort returns the 30 providers. Seeker picks three (e.g., by latency to its peer ID), dials each directly, gets work done. **Confirmed:** this is the simulator's cold-walk shape — `wantCount` met only at the root, hop count `= d_max + 1` inward probes (no bootstrap, since the root already holds providers); the cold-*bootstrap* worst case adds one (`d_max + 2`, per the `d_max_cap` sweep).
 
 ### Voting on a popular proposal
 
 A governance proposal has 200 000 eligible voters; topic `topicId = H("quorum" ‖ proposalHash ‖ "match")`. Within the voting window, eligible voters register as providers carrying their eligibility signatures.
 
-The tree grows to depth `⌈log_16(200000 / 64)⌉ = 3` tiers. Each tier-3 cohort holds ~50 providers from its prefix-shard.
+The tree grows to depth `⌈log_16(200000 / 64)⌉ = 3` tiers. Each tier-3 cohort holds ~50 providers from its prefix-shard. **Confirmed:** the depth law holds exactly at this scale — the simulator's voting-quorum scenario settles a 5,000-voter herd at depth 2 with the root never exceeding `cap_promote = 64`, and the scale sweep measures depth 3 at N = 100k and 4 at N = 1M, so 200k → depth 3 as written.
 
 The voting coordinator (or a delegated quorum-assembler peer) registers as a seeker at the root, queries with `AggregateCountV1`, learns where the populations are, then does a multi-cohort sweep across selected tier-3 cohorts to assemble a quorum of, say, 64 random voters. Each query returns its slice of providers (with eligibility sigs included); the coordinator validates and selects.
 
@@ -624,7 +654,7 @@ A specialty capability (`zk-snark-prover-v2`) has 5 providers in a network of 10
 
 Each provider, walking from `d_max = log_16(10M) − 1 ≈ 5`, falls through all the way to the root. Five registrations at the root cohort; far below `cap_promote`. Tree stays at depth 0.
 
-A seeker similarly walks 5 tiers toward the root, registers, queries, gets the 5 providers. Total cost: 6 RPCs (`d = 5, 4, 3, 2, 1, 0`), the cost of which is dominated by FRET routing not provider lookup. The cost-per-seek is logarithmic in network size, not linear in provider count.
+A seeker similarly walks 5 tiers toward the root, registers, queries, gets the 5 providers. Total cost: 6 RPCs (`d = 5, 4, 3, 2, 1, 0`), the cost of which is dominated by FRET routing not provider lookup. The cost-per-seek is logarithmic in network size, not linear in provider count. **Confirmed:** the `d_max_cap` sensitivity sweep measures cold-walk hops as exactly `d_max + 2` when the root must also bootstrap (5, 6, 7, 8 hops for `d_max` = 3, 4, 5, 6); here the root already holds the 5 providers, so the seeker is `Accepted` at `d = 0` without the extra bootstrap hop — 6 RPCs (`d_max + 1`), as written.
 
 ---
 
