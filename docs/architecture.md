@@ -58,6 +58,8 @@ The monorepo is layered from abstract to concrete, with optional front-ends on t
 
 `db-p2p` also exports an `@optimystic/db-p2p/rn` subpath that omits the Node-only TCP transport for Metro/Hermes compatibility.
 
+The **cohort-topic substrate** (and its reactivity / matchmaking applications) deliberately *spans* both layers rather than living in one. The pure logic — wire formats, tier addressing, registration/willingness/promotion state machines, gossip-merge and walk *decisions* — lives in `db-core` (`packages/db-core/src/cohort-topic`) behind transport **ports** (`ITopicRouter`, `ICohortGossipTransport`, `IMembershipSource`, `ISizeEstimator`, `IRingHash`) and depends only on a hash function and byte-array peer IDs, so **db-core stays network-free**. The concrete FRET + libp2p implementations of those ports live in `db-p2p` (`packages/db-p2p/src/cohort-topic`). A test guard (`packages/db-core/test/no-fret-import.spec.ts`) enforces that `db-core/src/**` never imports `p2p-fret` or `libp2p`.
+
 ## Core Concepts
 
 | Term | Meaning |

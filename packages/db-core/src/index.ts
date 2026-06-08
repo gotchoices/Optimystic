@@ -2,6 +2,7 @@ export * from "./blocks/index.js";
 export * from "./btree/index.js";
 export * from "./chain/index.js";
 export * from "./cluster/index.js";
+export * from "./cohort-topic/index.js";
 export * from "./collection/index.js";
 export * from "./collections/index.js";
 export * from "./log/index.js";

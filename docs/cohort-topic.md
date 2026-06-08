@@ -607,6 +607,13 @@ A participant verifying a threshold-signed message against an out-of-date `Membe
 
 ## FRET integration
 
+> **Package layering.** The transport-agnostic *ports* for this integration —
+> `ITopicRouter` (wraps `RouteAndMaybeAct`), `ICohortGossipTransport`, `IMembershipSource`,
+> `ISizeEstimator`, and `IRingHash` — are defined in **db-core**
+> (`packages/db-core/src/cohort-topic/ports.ts`); their concrete FRET + libp2p
+> implementations live in **db-p2p** (`packages/db-p2p/src/cohort-topic`). db-core supplies its
+> own SHA-256 for `coord_d` via `IRingHash` and never imports FRET or libp2p.
+
 ### Protocol IDs
 
 ```
