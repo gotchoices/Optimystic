@@ -4,13 +4,20 @@ Discrete-event virtual-clock engine that founds the Optimystic **design simulato
 advances by *event completion* rather than wall-clock, so simulation scale decouples from
 real time and ~1M logical nodes drain in seconds, **deterministically** from `(seed, config)`.
 
-This package is the **engine only** — a priority-queue scheduler over a virtual clock, a
-seeded PRNG, and a pluggable latency-injection seam. It models **no** cohort / topic /
-reactivity / matchmaking domain behaviour; that is `simulator-fret-cohort-model` and later,
-which build on the `SimWorldCore` seam exported here.
+Two layers ship here:
 
-Mock-only: it is **not** shipped to runtime consumers and depends on **no** `@optimystic/*`,
-`p2p-fret`, or `db-p2p` code. It is self-contained, dependency-free engine code.
+- **The engine** — a priority-queue scheduler over a virtual clock, a seeded PRNG, and a
+  pluggable latency-injection seam. No domain behaviour; everything builds on the
+  `SimWorldCore` seam.
+- **The FRET model** (`RingModel` / `CohortModel` / `SizeModel`, assembled by `FretModel`) — a
+  thin wrapper over **real FRET** that derives ring coordinates, cohort membership, `n_est`,
+  and `d_max` from an injected synthetic population using the *same* functions production calls
+  (`hashKey`, `xorDistance`, `assembleCohort`, `estimateSizeAndConfidence`). It reimplements
+  none of that math; the simulator is FRET's first non-libp2p consumer.
+
+Mock-only: it is **not** shipped to runtime consumers and depends on **no** `@optimystic/*` or
+`db-p2p` code. It depends on **`p2p-fret`** (via a `portal:` path ref to the sibling FRET repo)
+solely to wrap its ring/cohort/size math — see Decision 5.
 
 ## Quick start
 
@@ -23,6 +30,22 @@ world.scheduler.scheduleAt(0, ctx => {
 	ctx.scheduler.scheduleAfter(100, c => console.log('fired at', c.now));
 });
 world.scheduler.run(); // drains to empty; returns the count of logical events fired
+```
+
+```ts
+import { createSimWorld, createRng, generatePeers, FretModel, DEFAULT_DMAX_CONFIG } from '@optimystic/substrate-simulator';
+
+const world = createSimWorld({ seed: 42, gossipRoundMs: 200 });
+const peers = generatePeers(10_000, createRng(42));
+const fret = await FretModel.create(peers, { m: 8 });        // seeds a real FRET DigitreeStore
+
+const coord = await fret.ring.coordOf(peers[0]!.key);        // FRET hashKey
+const cohort = fret.cohort.assemble(coord, 15);              // FRET assembleCohort (two-sided)
+const { n, confidence } = fret.size.estimate();              // FRET estimateSizeAndConfidence
+const dMax = fret.size.dMax(DEFAULT_DMAX_CONFIG);            // max(0, ⌊log_F(n_est)⌋−1), clamped
+
+fret.scheduleRecompute(world.scheduler, 200);                // recompute n_est one gossip round out
+world.scheduler.run();
 ```
 
 ## Resolved design decisions
@@ -95,11 +118,15 @@ shared stream.
 ### Decision 5 — Peer identity & placement
 
 `PeerRef` is an opaque synthetic identity (`{ id: string; key: Uint8Array }`, a deterministic
-256-bit key for later ring math) generated from the seed via `generatePeers(count, rng)` —
-**not** a real libp2p `PeerId`/keypair (real Ed25519 keygen is far too slow at 1M). This
-package does **not** implement XOR-distance ring placement or cohort selection; that is
-`simulator-fret-cohort-model`'s `RingModel`/`CohortModel`, derived from real FRET math over
-these synthetic ids. Do **not** add a dependency on `db-p2p` or import `mesh-harness` here.
+256-bit key for ring math) generated from the seed via `generatePeers(count, rng)` —
+**not** a real libp2p `PeerId`/keypair (real Ed25519 keygen is far too slow at 1M). Ring
+placement and cohort selection are **not** reimplemented here: `RingModel`/`CohortModel`/
+`SizeModel` (assembled by `FretModel`) derive coordinates, cohorts, `n_est`, and `d_max` from
+real FRET math over these synthetic keys (`hashKey` for ring placement, since synthetic peers
+carry a key rather than a `PeerId`). `coordOf` is async — FRET hashes with sha256 — and is the
+model's only async seam; it runs at seeding time, never inside a scheduler event, so
+determinism is unaffected (sha256 is deterministic). Do **not** add a dependency on `db-p2p` or
+import `mesh-harness` here.
 
 ### Decision 6 — FRET stabilization: assume stable; model as one gossip-round latency
 

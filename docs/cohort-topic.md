@@ -73,6 +73,16 @@ The hash mixes the tier number, the peer-ID prefix, and the topic ID so that:
 
 This is the only addressing scheme used by the layer. It replaces older bit-shift coord-ladder designs.
 
+> **Simulator validation.** Coordinate distribution and `d_max` are exercised by the design
+> simulator (`packages/substrate-simulator`) against real FRET math — it wraps FRET's own
+> `hashKey`, `xorDistance`, `assembleCohort`, and `estimateSizeAndConfidence`
+> ([../../Fret/packages/fret/src/ring/hash.ts](../../Fret/packages/fret/src/ring/hash.ts),
+> [.../ring/distance.ts](../../Fret/packages/fret/src/ring/distance.ts),
+> [.../service/cohort.ts](../../Fret/packages/fret/src/service/cohort.ts),
+> [.../estimate/size-estimator.ts](../../Fret/packages/fret/src/estimate/size-estimator.ts))
+> rather than restating them here. Measured numbers from the N-sweep land in
+> `fold-simulator-findings-into-design-docs`.
+
 ### Maximum useful depth
 
 A participant computes an upper bound on tree depth from FRET's network-size estimate:
@@ -83,7 +93,9 @@ d_max = max(0, ⌊log_F(n_est)⌋ − 1)
 
 At `d_max`, each tier-`d_max` cohort covers `F` peers on average — roughly one cohort's worth. Deeper would mean tier coordinates with fewer peers than a cohort, which FRET handles but provides no fan-out benefit. If `n_est` confidence falls below `confidence_min` (default 0.3), participants clamp to `d_max = ⌊d_max_cap / 2⌋` to avoid pathological deep probes.
 
-`d_max` is recomputed lazily; participants don't need it precise.
+`d_max` is recomputed lazily; participants don't need it precise. The simulator validates the
+formula and the `confidence_min` clamp against FRET's reported `(n_est, confidence)` over
+N ∈ {10, 100, 1k, 10k, 100k}; see the simulator validation note under §Tier addressing.
 
 ---
 
