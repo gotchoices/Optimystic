@@ -29,7 +29,7 @@ const FORBIDDEN_ENGINE: ReadonlyArray<{ name: string; re: RegExp }> = [
 ];
 
 /** Files allowed to be async because they wrap FRET's async hashing. */
-const ASYNC_ALLOWED = new Set(['ring-model.ts', 'fret-model.ts']);
+const ASYNC_ALLOWED = new Set(['ring-model.ts', 'fret-model.ts', 'topic-addressing.ts']);
 
 function sourceFiles(dir: string): string[] {
 	const out: string[] = [];

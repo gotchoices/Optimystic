@@ -80,7 +80,13 @@ This is the only addressing scheme used by the layer. It replaces older bit-shif
 > [.../ring/distance.ts](../../Fret/packages/fret/src/ring/distance.ts),
 > [.../service/cohort.ts](../../Fret/packages/fret/src/service/cohort.ts),
 > [.../estimate/size-estimator.ts](../../Fret/packages/fret/src/estimate/size-estimator.ts))
-> rather than restating them here. Measured numbers from the N-sweep land in
+> rather than restating them here. The simulator also models `coord_d` directly
+> (`topic-addressing.ts`: `coord_d = H(d ‖ prefix(P, d·log₂F) ‖ topicId)` over `hashKey`) and
+> validates its two addressing invariants — peers sharing a `d·log₂F`-bit prefix converge on one
+> tier-`d` coordinate, while coordinates stay uncorrelated across tiers and topics — by measuring
+> the cross-(tier, prefix, topic) **`coord_d` collision rate**. With 256-bit sha256 coordinates
+> the rate is ~0 (birthday bound ≈ `total² / 2²⁵⁷`, negligible); the simulator's collision test
+> records the measured figure. Measured numbers from the N-sweep and the collision rate land in
 > `fold-simulator-findings-into-design-docs`.
 
 ### Maximum useful depth
@@ -391,6 +397,16 @@ The newly-instantiated forwarder registers itself with its tier-(d−1) parent o
 ### Hysteresis
 
 `cap_promote` and `cap_demote` are intentionally far apart (`4×`) to prevent oscillation under bursty load. `T_demote` adds temporal hysteresis. Together they ensure a topic doesn't thrash between tree depths.
+
+> **Simulator validation.** The design simulator (`packages/substrate-simulator`,
+> `topic-tree.ts`) models this lifecycle as scheduled virtual-clock events and validates its
+> three load-bearing properties: (a) the steady-state **depth law** `⌈log_F(N/cap_promote)⌉`
+> emerges from promotion alone (smoke check here; the full N-sweep is in
+> `simulator-promotion-convergence`); (b) the **`4×` cap gap + `T_demote` hold absorb thrash** — a
+> load barometer bouncing across `bucket_overload` does not flap promotion; and (c) a cohort with
+> `childCohortCount > 0` **never demotes**, even below `cap_demote` past `T_demote`. The
+> `cap_promote`/`cap_demote`/`T_demote`/`T_promote_sticky`/`bucket_overload` values the simulator
+> settles fold back via `fold-simulator-findings-into-design-docs`.
 
 ---
 

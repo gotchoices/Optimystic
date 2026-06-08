@@ -4,7 +4,7 @@ Discrete-event virtual-clock engine that founds the Optimystic **design simulato
 advances by *event completion* rather than wall-clock, so simulation scale decouples from
 real time and ~1M logical nodes drain in seconds, **deterministically** from `(seed, config)`.
 
-Two layers ship here:
+Three layers ship here:
 
 - **The engine** — a priority-queue scheduler over a virtual clock, a seeded PRNG, and a
   pluggable latency-injection seam. No domain behaviour; everything builds on the
@@ -14,6 +14,15 @@ Two layers ship here:
   and `d_max` from an injected synthetic population using the *same* functions production calls
   (`hashKey`, `xorDistance`, `assembleCohort`, `estimateSizeAndConfidence`). It reimplements
   none of that math; the simulator is FRET's first non-libp2p consumer.
+- **The cohort-topic tree** (`topic-addressing.ts` + `TopicTree`, with `willingness.ts` and the
+  `topic-events.ts` metrics stream) — the modeled topic tree that the production
+  `cohort-topic-*` substrate is checked against. It models tier addressing
+  (`coord_d = H(d ‖ prefix(P, d·log₂F) ‖ topicId)`), promotion/demotion with the `4×` cap gap +
+  `T_demote` hysteresis, the 3-bit load barometer, the 4-bit per-tier willingness vector
+  (Edge → T0+T1, Core → all), and the `TopicTrafficV1` flow signal — all as scheduled
+  virtual-clock events. **Modeled behaviour only**, not production code; measured parameters fold
+  back into `docs/cohort-topic.md` via `fold-simulator-findings-into-design-docs`. Coordinate
+  derivation (async sha256) lives in `topic-addressing.ts`; everything downstream is synchronous.
 
 Mock-only: it is **not** shipped to runtime consumers and depends on **no** `@optimystic/*` or
 `db-p2p` code. It depends on **`p2p-fret`** (via a `portal:` path ref to the sibling FRET repo)
@@ -46,6 +55,30 @@ const dMax = fret.size.dMax(DEFAULT_DMAX_CONFIG);            // max(0, ⌊log_F(
 
 fret.scheduleRecompute(world.scheduler, 200);                // recompute n_est one gossip round out
 world.scheduler.run();
+```
+
+```ts
+import {
+	createSimWorld, RingModel, buildCoordLadder, deriveTopicId, bytesToHex,
+	TopicTree, CollectingEventSink
+} from '@optimystic/substrate-simulator';
+
+const world = createSimWorld({ seed: 42, gossipRoundMs: 1000 });
+const sink = new CollectingEventSink();
+const tree = new TopicTree({ scheduler: world.scheduler, gossipRoundMs: 1000, sink });
+
+const ring = new RingModel();
+const topicId = deriveTopicId('my-topic');
+const topicHex = bytesToHex(topicId);
+
+// Register a participant: walk its tier-coordinate ladder, attach, grow the tree by load.
+const P = await ring.coordOf(somePeer.key);
+const ladder = await buildCoordLadder(ring, P, topicId, /* dMax */ 4);
+tree.register(topicHex, ladder, world.scheduler.now());
+
+tree.startGossip();      // traffic refresh + demotion re-eval every gossip round
+world.scheduler.run(600_000);
+// sink.byKind('Promoted'), sink.byKind('TopicTraffic'), … feed the metrics engine (ticket 6)
 ```
 
 ## Resolved design decisions
