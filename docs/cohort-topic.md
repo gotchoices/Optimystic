@@ -788,7 +788,7 @@ interface MembershipCertV1 {
   stabilizedAt:    number             // unix ms
   thresholdSig:    string             // sig of (cohortCoord, cohortEpoch, members, stabilizedAt)
   signers:         string[]
-  fretAttestation: string             // optional FRET-provided proof of stabilization
+  fretAttestation?: string            // optional FRET-provided proof of stabilization
 }
 ```
 

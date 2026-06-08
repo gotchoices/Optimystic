@@ -321,4 +321,59 @@ describe('cohort-topic wire', () => {
 			expect(decoded).to.not.have.property('fretAttestation');
 		});
 	});
+
+	describe('reply discriminant variants', () => {
+		it('round-trips a minimal no_state RegisterReply', () => {
+			const msg: RegisterReplyV1 = { v: 1, result: 'no_state' };
+			const decoded = decodeRegisterReplyV1(encodeCohortMessage(msg));
+			expect(decoded).to.deep.equal(msg);
+		});
+
+		it('round-trips an unwilling_cohort RegisterReply with retry fields', () => {
+			const msg: RegisterReplyV1 = { v: 1, result: 'unwilling_cohort', retryAfterMs: 1500, reason: 'busy' };
+			const decoded = decodeRegisterReplyV1(encodeCohortMessage(msg));
+			expect(decoded).to.deep.equal(msg);
+		});
+
+		it('round-trips an unwilling_member RegisterReply with candidates', () => {
+			const msg: RegisterReplyV1 = { v: 1, result: 'unwilling_member', candidateMembers: ['peer-c1', 'peer-c2'] };
+			const decoded = decodeRegisterReplyV1(encodeCohortMessage(msg));
+			expect(decoded).to.deep.equal(msg);
+		});
+
+		it('round-trips a minimal ok RenewReply', () => {
+			const msg: RenewReplyV1 = { v: 1, result: 'ok' };
+			const decoded = decodeRenewReplyV1(encodeCohortMessage(msg));
+			expect(decoded).to.deep.equal(msg);
+		});
+	});
+
+	describe('decoder robustness', () => {
+		it('decodes a frame that is a subarray aliasing a larger buffer', () => {
+			const frame = encodeCohortMessage(sampleRenew());
+			const backing = new Uint8Array(frame.length + 10);
+			backing.set(frame, 5);
+			const aliased = backing.subarray(5, 5 + frame.length);
+			expect(aliased.byteOffset).to.equal(5);
+			const decoded = decodeRenewV1(aliased);
+			expect(decoded).to.deep.equal(sampleRenew());
+		});
+
+		it('rejects decoding a Renew frame through the Register decoder', () => {
+			const frame = encodeCohortMessage(sampleRenew());
+			expect(() => decodeRegisterV1(frame)).to.throw(CohortWireError);
+		});
+
+		it('round-trips a gossip with an empty topicSummaries list', () => {
+			const msg: CohortGossipV1 = { ...sampleGossip(), topicSummaries: [] };
+			const decoded = decodeCohortGossipV1(encodeCohortMessage(msg));
+			expect(decoded).to.deep.equal(msg);
+		});
+
+		it('rejects willingnessBits wider than a single nibble', () => {
+			const bad = { ...sampleGossip(), willingnessBits: 'ff' };
+			const frame = encodeCohortMessage(bad);
+			expect(() => decodeCohortGossipV1(frame)).to.throw(CohortWireError, /willingnessBits/);
+		});
+	});
 });

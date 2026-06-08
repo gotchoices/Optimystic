@@ -300,15 +300,16 @@ function validateCohortTopicSummary(value: unknown): CohortTopicSummary {
 	};
 }
 
-const HEX_RE = /^[0-9a-fA-F]+$/;
+/** `willingnessBits` carries exactly 4 bits (T0..T3) as a single hex nibble. */
+const WILLINGNESS_RE = /^[0-9a-fA-F]$/;
 
 export function validateCohortGossipV1(value: unknown): CohortGossipV1 {
 	const what = "CohortGossipV1";
 	const obj = asObject(value, what);
 	requireV1(obj, what);
 	const willingnessBits = reqString(obj, "willingnessBits", what);
-	if (!HEX_RE.test(willingnessBits)) {
-		fail(`${what}: field "willingnessBits" must be hex`);
+	if (!WILLINGNESS_RE.test(willingnessBits)) {
+		fail(`${what}: field "willingnessBits" must be a single hex nibble (4 bits)`);
 	}
 	const loadBuckets = obj["loadBuckets"];
 	if (!Array.isArray(loadBuckets) || loadBuckets.length !== 4) {
