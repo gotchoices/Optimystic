@@ -31,6 +31,13 @@ export interface TopicCohortState {
 	directParticipants: number; // count attached at this cohort for this topic
 	promoted: boolean; // serving Promoted(d+1) for new registrations
 	childCohortCount: number; // >0 blocks demotion
+	// Stored parent reference (cohort-topic.md §Demotion: DemotionNoticeV1 → "drop me from your
+	// tier-(d+1) children"). `parentCoord` is the hex coord of the tier-(d−1) parent (undefined at
+	// the root); `linkedToParent` is true while this cohort is counted in that parent's
+	// `childCohortCount`. The pair closes the demotion loop the tree ticket left open: demotion
+	// decrements the parent so a deep tree can collapse, and re-growth re-links symmetrically.
+	parentCoord: string | undefined;
+	linkedToParent: boolean;
 	loadBucket: number[]; // per-tier 3-bit barometer, 0..7
 	willingness: number; // 4-bit vector, one bit per tier T0..T3
 	// The member's last-gossiped per-topic view — the reply surface (`trafficSignal`) reads this
@@ -132,6 +139,8 @@ export class TopicTree {
 			willingness: (1 << TIER_COUNT) - 1, // all tiers willing until load sheds them
 			traffic: { arrivalsPerMin: 0, queriesPerMin: 0, directParticipants: 0, childCohortCount: 0 },
 			lastGrowthSamples: [],
+			parentCoord: undefined,
+			linkedToParent: false,
 			promotedAt: undefined,
 			lowLoadSince: undefined,
 			arrivalsInWindow: 0,
@@ -280,8 +289,10 @@ export class TopicTree {
 	// --- demotion ------------------------------------------------------------
 
 	/**
-	 * Demote only when ALL hold (cohort-topic.md §Demotion + §Hysteresis):
-	 *  - cohort is promoted and has been for at least `T_promote_sticky` (sticky floor),
+	 * Demote (release forwarder state) only when ALL hold (cohort-topic.md §Demotion + §Hysteresis):
+	 *  - the cohort is an active forwarder — either promoted or linked under a parent (a leaf that
+	 *    never promoted is still a forwarder and must release so its parent can shrink),
+	 *  - if promoted, it has been for at least `T_promote_sticky` (sticky floor),
 	 *  - `directParticipants ≤ cap_demote` and that has held for `T_demote`,
 	 *  - `childCohortCount == 0` (never demote while child cohorts exist).
 	 */
@@ -294,10 +305,13 @@ export class TopicTree {
 	}
 
 	private demotionTriggered(state: TopicCohortState, now: VTime): boolean {
-		if (!state.promoted) {
+		// Nothing to release: a cohort that holds no forwarder state (cold, or already released)
+		// neither demotes nor notifies a parent. The root is never `linkedToParent`, so a root
+		// that is not promoted simply idles rather than emitting a spurious teardown.
+		if (!state.promoted && !state.linkedToParent) {
 			return false;
 		}
-		if (state.promotedAt !== undefined && now - state.promotedAt < this.cfg.tPromoteStickyMs) {
+		if (state.promoted && state.promotedAt !== undefined && now - state.promotedAt < this.cfg.tPromoteStickyMs) {
 			return false;
 		}
 		if (state.childCohortCount > 0) {
@@ -312,14 +326,56 @@ export class TopicTree {
 		return now - state.lowLoadSince >= this.cfg.tDemoteMs;
 	}
 
-	/** Leave promoted mode; emit `Demoted` (recorded for the convergence tracer). */
+	/**
+	 * Release forwarder state: leave promoted mode if promoted, and send the `DemotionNoticeV1` to
+	 * the parent — modeled as decrementing the parent's `childCohortCount` via the stored link
+	 * (cohort-topic.md §Demotion). This is what lets a deep tree collapse: each released child
+	 * frees its parent, which becomes demotion-eligible on the next tick, cascading to the root.
+	 * Emits `Demoted` for the convergence tracer. Idempotent — a cohort holding no forwarder state
+	 * is a no-op.
+	 */
 	demote(state: TopicCohortState, now: VTime): void {
-		if (!state.promoted) {
+		if (!state.promoted && !state.linkedToParent) {
 			return;
 		}
-		state.promoted = false;
-		state.promotedAt = undefined;
+		if (state.promoted) {
+			state.promoted = false;
+			state.promotedAt = undefined;
+		}
+		this.unlinkFromParent(state);
 		this.sink.record({ kind: 'Demoted', topicId: state.topicId, tier: state.tier, at: now });
+	}
+
+	/**
+	 * Link a child cohort under its tier-(d−1) parent: count it in the parent's `childCohortCount`
+	 * and record the parent coord. Idempotent (the `linkedToParent` flag guards re-entry), so the
+	 * register driver can call it on every attach without double-counting, and re-growth after a
+	 * demotion re-links symmetrically.
+	 */
+	private linkToParent(state: TopicCohortState, parentCoord: string): void {
+		if (state.linkedToParent) {
+			return;
+		}
+		state.parentCoord = parentCoord;
+		const parent = this.get(state.topicId, parentCoord);
+		if (parent) {
+			parent.childCohortCount++;
+		}
+		state.linkedToParent = true;
+	}
+
+	/** Inverse of `linkToParent`: drop this child from its parent's tier-(d+1) child set. */
+	private unlinkFromParent(state: TopicCohortState): void {
+		if (!state.linkedToParent) {
+			return;
+		}
+		if (state.parentCoord !== undefined) {
+			const parent = this.get(state.topicId, state.parentCoord);
+			if (parent) {
+				parent.childCohortCount = Math.max(0, parent.childCohortCount - 1);
+			}
+		}
+		state.linkedToParent = false;
 	}
 
 	// --- topic traffic -------------------------------------------------------
@@ -451,13 +507,12 @@ export class TopicTree {
 			break;
 		}
 		const coord = bytesToHex(ladder[d]!);
-		const fresh = !this.has(topicId, coord);
 		const state = this.ensure(topicId, coord, d, now);
-		if (fresh && d > 0) {
-			const parent = this.get(topicId, bytesToHex(ladder[d - 1]!));
-			if (parent) {
-				parent.childCohortCount++;
-			}
+		if (d > 0) {
+			// Link under the tier-(d−1) parent. Idempotent, so this covers both fresh instantiation
+			// and re-activation of a cohort that had previously released (demoted) — the parent's
+			// `childCohortCount` rises again symmetrically as load returns.
+			this.linkToParent(state, bytesToHex(ladder[d - 1]!));
 		}
 		this.attach(state, now);
 		return d;

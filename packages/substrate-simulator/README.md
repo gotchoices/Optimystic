@@ -23,6 +23,15 @@ Three layers ship here:
   virtual-clock events. **Modeled behaviour only**, not production code; measured parameters fold
   back into `docs/cohort-topic.md` via `fold-simulator-findings-into-design-docs`. Coordinate
   derivation (async sha256) lives in `topic-addressing.ts`; everything downstream is synchronous.
+- **Churn, failover, and willingness back-off** (`churn.ts`, `cohort-membership.ts`,
+  `registration.ts`, `partition.ts`, `backoff.ts`) — the population dynamics layered on the tree:
+  a churn generator (arrivals/departures at a configured `%/min` with latency jitter), TTL
+  renewal with three-failure backup promotion, deterministic primary/backup sharding
+  (`hash(participantId ‖ cohortEpoch) mod k`) with lazy `primary_moved` handoff, network
+  partition split/heal that re-converges on the pre-split epoch, and exponential `UnwillingCohort`
+  back-off with ~1-heartbeat willingness-gossip staleness. The demotion path here closes the tree
+  ticket's gap — a released cohort decrements its parent's `childCohortCount` over a stored parent
+  link, so a deep tree built by load collapses back to the root as load drains.
 
 Mock-only: it is **not** shipped to runtime consumers and depends on **no** `@optimystic/*` or
 `db-p2p` code. It depends on **`p2p-fret`** (via a `portal:` path ref to the sibling FRET repo)

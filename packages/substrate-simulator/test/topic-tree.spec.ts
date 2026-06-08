@@ -172,3 +172,75 @@ describe('TopicTree — metrics-stream event wiring', () => {
 		expect(sink.countOf('UnwillingCohort')).to.equal(1);
 	});
 });
+
+describe('TopicTree — demotion cascade collapses a deep tree to the root', () => {
+	const COLLAPSE_TOPIC = 'collapse-topic';
+
+	/**
+	 * A synthetic single-branch coord ladder of length `depth+1` — every participant shares it, so
+	 * load builds one linear chain tier-0 → tier-`depth`. Crafted bytes (not sha256) keep the test
+	 * fast and the structure exact, which is all the cascade logic needs.
+	 */
+	function sharedLadder(depth: number): Uint8Array[] {
+		const ladder: Uint8Array[] = [];
+		for (let d = 0; d <= depth; d++) {
+			const coord = new Uint8Array(32);
+			coord[0] = d; // distinct coord per tier
+			coord[1] = 0xab; // shared branch marker
+			ladder.push(coord);
+		}
+		return ladder;
+	}
+
+	/** Register `count` participants down one shared branch; returns the built tree. */
+	function buildChain(tree: TopicTree, depth: number, count: number, now: number): void {
+		const ladder = sharedLadder(depth);
+		for (let i = 0; i < count; i++) {
+			tree.register(COLLAPSE_TOPIC, ladder, now);
+		}
+	}
+
+	it('a tree grown by load collapses to the root once load drains, childCohortCount → 0 everywhere', () => {
+		const cfg = DEFAULT_LIFECYCLE_CONFIG;
+		const world = createSimWorld({ seed: SEED, gossipRoundMs: 1000 });
+		const sink = new CollectingEventSink();
+		const tree = new TopicTree({ scheduler: world.scheduler, gossipRoundMs: 1000, sink });
+
+		// Fill three tiers (cap_promote each) plus a partial leaf → a depth-3 linear chain.
+		const depth = 3;
+		buildChain(tree, depth, cfg.capPromote * depth + 10, 0);
+
+		expect(tree.maxOccupiedTier(COLLAPSE_TOPIC)).to.equal(depth);
+		const built = tree.all();
+		expect(built).to.have.lengthOf(depth + 1);
+		// Each internal tier pins exactly one child; the leaf pins none.
+		for (const s of built) {
+			expect(s.childCohortCount, `tier ${s.tier} child count`).to.equal(s.tier < depth ? 1 : 0);
+		}
+		const originalChildCounts = built.map((s) => s.childCohortCount);
+
+		// Drain every cohort to empty (TTL eviction → directParticipants → 0).
+		for (const s of tree.all()) {
+			tree.setParticipants(s, 0, 0);
+		}
+		tree.startGossip();
+
+		// Past the sticky floor + T_demote, the cascade fires bottom-up: each released child frees
+		// its parent on the next tick, rolling all the way to the root.
+		world.scheduler.run(cfg.tPromoteStickyMs + cfg.tDemoteMs + depth * 2000);
+
+		for (const s of tree.all()) {
+			expect(s.promoted, `tier ${s.tier} demoted`).to.equal(false);
+			expect(s.childCohortCount, `tier ${s.tier} child count cleared`).to.equal(0);
+			expect(s.linkedToParent, `tier ${s.tier} unlinked`).to.equal(false);
+		}
+		expect(tree.maxOccupiedTier(COLLAPSE_TOPIC)).to.equal(0);
+		// One Demoted (forwarder-state release) per cohort in the chain, root included.
+		expect(sink.countOf('Demoted')).to.equal(depth + 1);
+
+		// Re-growth re-links symmetrically: rebuilding the same load restores every child count.
+		buildChain(tree, depth, cfg.capPromote * depth + 10, world.scheduler.now());
+		expect(tree.maxOccupiedTier(COLLAPSE_TOPIC)).to.equal(depth);
+		expect(tree.all().map((s) => s.childCohortCount)).to.deep.equal(originalChildCounts);
+	});
+});

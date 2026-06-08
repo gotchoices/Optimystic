@@ -7,7 +7,10 @@ import type { VTime } from './types.js';
  * vocabulary and a minimal in-memory sink so the tree can emit and tests can assert.
  *
  * The tree emits `Promoted`, `NoState`, `UnwillingMember`, `UnwillingCohort`, `TopicTraffic`
- * (cohort-topic.md), plus `Demoted` for the convergence tracer.
+ * (cohort-topic.md), plus `Demoted` for the convergence tracer. The churn/failover layer adds
+ * `Evicted` (TTL eviction), `BackupPromoted` (three-failure backup promotion), `PrimaryMoved`
+ * (deterministic re-assignment after membership rotation / partition heal), and `Admitted`
+ * (a registration that cleared willingness gating, for back-off time-to-admit curves).
  */
 
 /** Per-(topic, cohort) flow signal, surfaced on `accepted`/`promoted` replies (cohort-topic.md §Topic traffic). */
@@ -25,7 +28,11 @@ export type SimEvent =
 	| { readonly kind: 'NoState'; readonly topicId: string; readonly tier: number; readonly at: VTime }
 	| { readonly kind: 'UnwillingMember'; readonly topicId: string; readonly tier: number; readonly at: VTime }
 	| { readonly kind: 'UnwillingCohort'; readonly topicId: string; readonly tier: number; readonly at: VTime }
-	| { readonly kind: 'TopicTraffic'; readonly topicId: string; readonly tier: number; readonly traffic: TopicTrafficV1; readonly at: VTime };
+	| { readonly kind: 'TopicTraffic'; readonly topicId: string; readonly tier: number; readonly traffic: TopicTrafficV1; readonly at: VTime }
+	| { readonly kind: 'Evicted'; readonly topicId: string; readonly participantId: string; readonly at: VTime }
+	| { readonly kind: 'BackupPromoted'; readonly topicId: string; readonly participantId: string; readonly newPrimary: string; readonly at: VTime }
+	| { readonly kind: 'PrimaryMoved'; readonly topicId: string; readonly participantId: string; readonly newPrimary: string; readonly at: VTime }
+	| { readonly kind: 'Admitted'; readonly topicId: string; readonly participantId: string; readonly tier: number; readonly at: VTime };
 
 export type SimEventKind = SimEvent['kind'];
 

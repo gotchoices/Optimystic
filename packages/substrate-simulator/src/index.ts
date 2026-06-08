@@ -81,3 +81,40 @@ export {
 	DEFAULT_LIFECYCLE_CONFIG,
 	TopicTree
 } from './topic-tree.js';
+export {
+	type PrimaryAssignment,
+	fnv1a32,
+	cohortEpochOf,
+	slotOf,
+	CohortMembership
+} from './cohort-membership.js';
+export {
+	type RegistrationRecord,
+	type RenewResult,
+	type RenewReply,
+	type TopicCohortOptions,
+	type ParticipantRenewalOptions,
+	TopicCohort,
+	ParticipantRenewal
+} from './registration.js';
+export {
+	type BackoffConfig,
+	type AdmissionGate,
+	type BackoffAdmissionOptions,
+	DEFAULT_BACKOFF_CONFIG,
+	backoffDelay,
+	BackoffAdmission,
+	WillingnessGossip
+} from './backoff.js';
+export {
+	type PartitionSpec,
+	type PartitionConvergence,
+	splitMembership,
+	healMembership,
+	checkConvergence
+} from './partition.js';
+export {
+	type ChurnConfig,
+	type ChurnGeneratorOptions,
+	ChurnGenerator
+} from './churn.js';

@@ -202,6 +202,17 @@ When a registration arrives at a cohort, FRET's `RouteAndMaybeAct` lands it on o
 
 The cohort gossips a coarse "willingness vector" (one bit per tier per member, refreshed every gossip round) so any member can answer `UnwillingMember` vs `UnwillingCohort` without polling siblings. Stale gossip is acceptable; over-reporting unwillingness costs a temporal retry, not a flood.
 
+> **Simulator validation.** The design simulator (`packages/substrate-simulator`, `backoff.ts` +
+> `willingness.ts`) drives per-member willingness under churn-induced load and validates two
+> behaviours this section relies on: (a) the **exponential `UnwillingCohort` back-off curve**
+> minimizes repeated rejections per participant (`O(log(window/base))` rather than the
+> `window/base` a fixed interval would suffer) while still admitting promptly once capacity frees,
+> and gating under a burst caps accepted/sec at the willing-quorum capacity without a cascading
+> load increase; and (b) the **~1-heartbeat willingness-gossip staleness** edge case — a member
+> that just became unwilling while a sibling still gossips it as willing yields `UnwillingMember`
+> to a seeker routed onto it, which then recovers via a sibling retry / back-off. The settled
+> back-off parameters (`base`, `factor`, cap) fold back via `fold-simulator-findings-into-design-docs`.
+
 ### Why the caller doesn't walk on `UnwillingCohort`
 
 A participant receiving `UnwillingCohort` knows two things:
@@ -454,6 +465,18 @@ FRET surfaces merge events. Each side's cohorts served their participants indepe
 
 ### Stale membership cache
 A participant verifying a threshold-signed message against an out-of-date `MembershipCertV1` may fail verification even though the message is honest. Fallback: re-fetch the certificate from any cohort member and retry verification once. If still failing, treat the message as untrusted.
+
+### Recovery time bounds
+
+> **Simulator validation.** The design simulator (`packages/substrate-simulator`,
+> `registration.ts` + `partition.ts`) models the two recovery paths above as virtual-clock events
+> and validates their shape: a crashed primary is detected after three consecutive `ttl/3` pings
+> and the participant promotes `backups[0]` via re-attach (bounded by one TTL); a deterministic
+> membership rotation surfaces as `primary_moved` on the next ping (within one `ttl/3` window); and
+> a partition heal reconstitutes the pre-split `cohortEpoch`, so both sides re-derive the *same*
+> deterministic primary (`hash(participantId ‖ cohortEpoch) mod k`) and subscribers converge via
+> `primary_moved` in ~one gossip round. The measured **backup-promotion window** and
+> **partition-heal convergence** latencies land in `fold-simulator-findings-into-design-docs`.
 
 ---
 
