@@ -150,6 +150,10 @@ class TtlRenewalParticipant implements RenewalParticipant {
 					continue;
 				}
 				this.applyPrimaryMoved(reply);
+				// We now have a fresh, live primary to ping — clear the strike count so the next single
+				// transient failure doesn't immediately re-failover (matching `promote` and the
+				// normal-ping `primary_moved` path, which both reset here).
+				this.consecutiveFailures = 0;
 				return;
 			}
 			// unknown_registration (replication lag) or anything else: try the next backup.
@@ -343,6 +347,11 @@ class StoreRenewalCohortSide implements RenewalCohortSide {
 	sweepStale(now: number): readonly RegistrationRecord[] {
 		const evicted = this.deps.store.evictStale(now);
 		for (const rec of evicted) {
+			// Drop any crash-failover override for an evicted record. Otherwise it leaks (the record gets
+			// no more pings, so the plain-ping housekeeping that would clear it never runs) and — if the
+			// same `(topic, participant)` re-registers under the unchanged epoch — could wrongly make a
+			// non-primary member keep serving via the stale override.
+			this.failoverServing.delete(recordKey(rec.topicId, rec.participantId));
 			this.deps.gossip.evicted(rec);
 		}
 		return evicted;

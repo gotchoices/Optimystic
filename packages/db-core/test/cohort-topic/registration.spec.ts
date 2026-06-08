@@ -342,6 +342,35 @@ describe('cohort-topic / renewal participant', () => {
 		await p2.pingLoop();
 		expect(t2.relookups, 'relookup when no backup confirms').to.equal(1);
 	});
+
+	it('resets the strike count after adopting a primary_moved during failover (no immediate re-failover)', async () => {
+		const deadPrimary = bytesKey(record().primary);
+		const backup0 = record().backups[0]!;
+		const liveMember = bytes('member-live');
+		const liveB = bytes('member-live-b');
+		// Dead primary fails; backup0 redirects to a (also-unreachable) live member that itself fails.
+		const t = new MockParticipantTransport((target) => {
+			if (bytesKey(target) === deadPrimary) return 'fail';
+			if (bytesEqual(target, backup0)) {
+				return { v: 1, result: 'primary_moved', newPrimary: bytesKey(liveMember), newBackups: [bytesKey(liveB)] };
+			}
+			return 'fail'; // liveMember + liveB are unreachable
+		});
+		const p = participant(t);
+		await p.pingLoop();
+		await p.pingLoop();
+		await p.pingLoop(); // 3rd fail → failover → backup0 redirects → adopt liveMember
+		expect(bytesEqual(p.record.primary, liveMember), 'adopted the moved primary').to.be.true;
+
+		// A single failed ping of the new primary must NOT immediately re-failover: the strike count
+		// was reset on adoption, so we still owe two more strikes before failover/relookup.
+		await p.pingLoop();
+		expect(t.relookups, 'one transient failure does not re-failover right after adoption').to.equal(0);
+		await p.pingLoop();
+		expect(t.relookups, 'still under the 3-strike threshold').to.equal(0);
+		await p.pingLoop(); // now the 3rd consecutive failure of the new primary → failover → relookup
+		expect(t.relookups, 'failover only after a fresh run of MAX_PING_FAILURES').to.equal(1);
+	});
 });
 
 // --- renewal: cohort side ---
@@ -557,6 +586,30 @@ describe('cohort-topic / renewal cohort side', () => {
 		expect(store.getByParticipant(t, p)!.lastPing).to.equal(4_000);
 		// Serves as the computed primary (not via an override); a plain ping continues to serve.
 		expect(side.onRenew(renewMsg(record({ topicId: t, participantId: p })), 4_500).result).to.equal('ok');
+	});
+
+	it('clears a failover override when its record is evicted (no stale serve after re-registration)', () => {
+		const t = topic('FR');
+		const p = bytes('fp6');
+		const { primary, backups } = slots.assignSlots(p, epoch, cohortMembers);
+		const self = backups[0]!; // a computed backup that will accept the takeover
+		const gossip = new RecordingGossip();
+		const { store, side } = sideAt(self, gossip);
+		store.put(record({ topicId: t, participantId: p, primary, backups, lastPing: 1_000, ttl: 100 }));
+
+		// Accept the re-attach → override recorded under the current epoch, primary re-stamped to self.
+		expect(side.onRenew(renewMsg(record({ topicId: t, participantId: p }), true), 1_050).result).to.equal('ok');
+
+		// The record goes stale and is swept; the override must be cleared with it.
+		const evicted = side.sweepStale(1_200); // 1200 - 1050 = 150 > ttl 100
+		expect(evicted.map((r) => bytesKey(r.participantId))).to.include(bytesKey(p));
+
+		// Same participant re-registers under the UNCHANGED epoch, naming the deterministic primary again.
+		store.put(record({ topicId: t, participantId: p, primary, backups, lastPing: 2_000, ttl: 100 }));
+		// A plain ping to `self` (no longer the computed primary, override gone) must redirect — not serve.
+		const reply = side.onRenew(renewMsg(record({ topicId: t, participantId: p })), 2_050);
+		expect(reply.result, 'stale override did not survive eviction').to.equal('primary_moved');
+		expect(bytesEqual(b64urlToBytes(reply.newPrimary!), primary)).to.be.true;
 	});
 
 	it('sweepStale evicts every stale record and gossips each eviction', () => {
