@@ -11,9 +11,12 @@
  * `windowMs` for each key, admits while the window holds `< ratePerWindow`, and on rejection advances
  * a per-key strike counter that indexes the back-off curve. A run of strikes decays once the source
  * has been quiet for a full window (its window empties and the strike counter resets), so a
- * well-behaved peer is never permanently penalized. Idle keys are pruned on access to bound memory —
- * the substrate does not defend against unbounded Sybil key creation (that is FRET's / the reputation
- * subsystem's concern; see §Anti-DoS closing note).
+ * well-behaved peer is never permanently penalized. Each key's accept history is trimmed to the live
+ * window whenever that key is checked, so a key's footprint stays `O(ratePerWindow)`; the map itself
+ * retains one such small entry per `(peer, topic)` ever seen — global eviction of long-idle keys is
+ * the host {@link import("../wire/types.js").RegisterV1} service's lifecycle concern, not this
+ * counter's. The substrate does not defend against unbounded Sybil key creation (that is FRET's /
+ * the reputation subsystem's concern; see §Anti-DoS closing note).
  */
 
 import { recordKey } from "../registration/bytes.js";

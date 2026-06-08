@@ -88,16 +88,35 @@ describe('cohort-topic / anti-DoS', () => {
 			expect(budget.admit(t[2]!)).to.be.true;
 			expect(budget.size).to.equal(3);
 
-			// Populate two topics; leave t[1] cold (zero participants) and least-recently used.
+			// Populate two topics; leave t[1] the only zero-participant (cold) resident.
 			budget.touch(t[0]!, 10);
 			budget.touch(t[2]!, 5);
 			budget.touch(t[1]!, 0);
 
-			// A new topic evicts the cold one (t[1]), not a populated topic.
+			// A new topic evicts the cold one (t[1]), not a populated topic — participant count is the
+			// primary eviction key, so the only zero-participant resident goes regardless of recency.
 			expect(budget.admit(t[3]!)).to.be.true;
 			expect(budget.size).to.equal(3);
 			expect(budget.has(t[1]!), 'cold topic evicted').to.be.false;
 			expect(budget.has(t[0]!)).to.be.true;
+			expect(budget.has(t[2]!)).to.be.true;
+			expect(budget.has(t[3]!)).to.be.true;
+		});
+
+		it('among several zero-participant residents, evicts the least-recently-used (lowest seq)', () => {
+			const budget = createTopicBudget({ topicsMax: 3 });
+			const t = [bytes('x'), bytes('y'), bytes('z'), bytes('w')];
+			budget.admit(t[0]!); // seq 1
+			budget.admit(t[1]!); // seq 2
+			budget.admit(t[2]!); // seq 3
+			// All three are zero-participant. Refresh recency so t[0] becomes the LRU victim:
+			// touch t[1] then t[2], leaving t[0] with the lowest seq among the cold residents.
+			budget.touch(t[1]!, 0);
+			budget.touch(t[2]!, 0);
+
+			expect(budget.admit(t[3]!)).to.be.true;
+			expect(budget.has(t[0]!), 'least-recently-used cold topic evicted').to.be.false;
+			expect(budget.has(t[1]!)).to.be.true;
 			expect(budget.has(t[2]!)).to.be.true;
 			expect(budget.has(t[3]!)).to.be.true;
 		});
@@ -142,6 +161,21 @@ describe('cohort-topic / anti-DoS', () => {
 			const guard = createCorrelationReplayGuard({ maxFutureSkewMs: 5_000 });
 			const now = 1_000_000;
 			expect(guard.accept(bytes('corr-future', 16), PEER_A, now + 5_001, now)).to.be.false;
+		});
+
+		it('re-admits a correlationId once its prior record has aged out of the window', () => {
+			// A re-used id can only re-appear with a *fresh* timestamp (a captured replay carries the old,
+			// now-stale timestamp and is rejected on age). The guard must prune the aged record so the
+			// legitimate owner is not penalized forever for a one-time id collision across windows.
+			const guard = createCorrelationReplayGuard();
+			const cid = bytes('corr-recur', 16);
+			const now = 1_000_000;
+			expect(guard.accept(cid, PEER_A, now, now)).to.be.true;
+			// Same id, fresh timestamp, a full window later → the old record has aged out and is pruned.
+			const later = now + DEFAULT_REPLAY_MAX_AGE_MS + 1;
+			expect(guard.accept(cid, PEER_A, later, later)).to.be.true;
+			// ...but an immediate exact replay at that fresh timestamp is still caught.
+			expect(guard.accept(cid, PEER_A, later, later + 1)).to.be.false;
 		});
 	});
 

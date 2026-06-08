@@ -76,8 +76,11 @@ class WindowedReplayGuard implements CorrelationReplayGuard {
 		}
 		this.maybePrune(now);
 		const key = bytesKey(correlationId);
-		if (this.seen.has(key)) {
-			log("replay-guard reject: replayed correlationId");
+		const prior = this.seen.get(key);
+		if (prior !== undefined) {
+			// Attribute the replay to the *original* accepter: the correlationId (not the peer id) is the
+			// anti-replay key, so a replayer that spoofs a different source id is still caught here.
+			log("replay-guard reject: replayed correlationId (first seen from peer=%s)", prior.peer);
 			return false; // replay
 		}
 		this.seen.set(key, { timestamp, peer: bytesKey(peerId) });
