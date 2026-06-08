@@ -1,0 +1,106 @@
+/**
+ * Cohort-topic substrate — correlation-id replay guard (anti-DoS).
+ *
+ * Transcribed from `docs/cohort-topic.md` §Anti-DoS bullet 3. Every `RegisterV1` carries a
+ * `correlationId` (16 random bytes) and a signature over `(topicId, tier, correlationId, timestamp)`.
+ * The signature (verified elsewhere — the participant-key check) proves authorship; this guard adds
+ * **freshness**: it drops a registration whose `timestamp` is outside the accepted skew window
+ * (stale, or implausibly far in the future) and drops a `correlationId` it has already seen inside the
+ * window (a captured-and-replayed registration).
+ *
+ * Because a stale registration is rejected outright, the guard only needs to remember correlation ids
+ * for one `maxAgeMs` window: an id older than that would be rejected on timestamp alone, so its record
+ * can be pruned. Pruning runs on access, bounding memory to the live window's worth of registrations.
+ */
+
+import { bytesKey } from "../registration/bytes.js";
+import { createLogger } from "../../logger.js";
+
+const log = createLogger("cohort-topic:antidos");
+
+/** Default acceptance window: a registration timestamped older than this (relative to `now`) is stale. */
+export const DEFAULT_REPLAY_MAX_AGE_MS = 60_000;
+/** Default tolerated forward clock skew: a timestamp this far past `now` is rejected as implausible. */
+export const DEFAULT_REPLAY_MAX_FUTURE_SKEW_MS = 5_000;
+
+export interface CorrelationReplayGuardConfig {
+	/** A timestamp older than `now − maxAgeMs` is stale. Default {@link DEFAULT_REPLAY_MAX_AGE_MS}. */
+	maxAgeMs?: number;
+	/** A timestamp newer than `now + maxFutureSkewMs` is rejected. Default {@link DEFAULT_REPLAY_MAX_FUTURE_SKEW_MS}. */
+	maxFutureSkewMs?: number;
+}
+
+/** Freshness + anti-replay gate over registration `correlationId`s and timestamps. */
+export interface CorrelationReplayGuard {
+	/**
+	 * Accept `correlationId` (from `peerId`, stamped `timestamp`) evaluated at `now`. Returns `false`
+	 * — and records nothing — when the timestamp is stale or implausibly future, or when this
+	 * `correlationId` was already accepted inside the window (replay). Returns `true` and remembers the
+	 * id on first sight of a fresh registration.
+	 */
+	accept(correlationId: Uint8Array, peerId: Uint8Array, timestamp: number, now: number): boolean;
+}
+
+/** A remembered acceptance, kept until its timestamp ages out of the window. */
+interface SeenEntry {
+	timestamp: number;
+	peer: string;
+}
+
+class WindowedReplayGuard implements CorrelationReplayGuard {
+	private readonly seen = new Map<string, SeenEntry>();
+	private readonly maxAgeMs: number;
+	private readonly maxFutureSkewMs: number;
+	/** `now` of the last prune, so pruning amortizes rather than scanning on every call. */
+	private lastPruneAt = -Infinity;
+
+	constructor(config: CorrelationReplayGuardConfig = {}) {
+		this.maxAgeMs = config.maxAgeMs ?? DEFAULT_REPLAY_MAX_AGE_MS;
+		if (!(this.maxAgeMs > 0)) {
+			throw new RangeError(`maxAgeMs must be > 0, got ${this.maxAgeMs}`);
+		}
+		this.maxFutureSkewMs = config.maxFutureSkewMs ?? DEFAULT_REPLAY_MAX_FUTURE_SKEW_MS;
+		if (!(this.maxFutureSkewMs >= 0)) {
+			throw new RangeError(`maxFutureSkewMs must be >= 0, got ${this.maxFutureSkewMs}`);
+		}
+	}
+
+	accept(correlationId: Uint8Array, peerId: Uint8Array, timestamp: number, now: number): boolean {
+		if (timestamp < now - this.maxAgeMs) {
+			log("replay-guard reject: stale timestamp age=%d > maxAge=%d", now - timestamp, this.maxAgeMs);
+			return false; // stale
+		}
+		if (timestamp > now + this.maxFutureSkewMs) {
+			log("replay-guard reject: future timestamp skew=%d > maxSkew=%d", timestamp - now, this.maxFutureSkewMs);
+			return false; // implausibly future
+		}
+		this.maybePrune(now);
+		const key = bytesKey(correlationId);
+		if (this.seen.has(key)) {
+			log("replay-guard reject: replayed correlationId");
+			return false; // replay
+		}
+		this.seen.set(key, { timestamp, peer: bytesKey(peerId) });
+		return true;
+	}
+
+	/** Forget ids whose timestamp has aged past the window — they would be rejected as stale anyway. */
+	private maybePrune(now: number): void {
+		// Amortize: prune at most once per window rather than scanning on every accept.
+		if (now - this.lastPruneAt < this.maxAgeMs) {
+			return;
+		}
+		this.lastPruneAt = now;
+		const cutoff = now - this.maxAgeMs;
+		for (const [key, entry] of this.seen) {
+			if (entry.timestamp < cutoff) {
+				this.seen.delete(key);
+			}
+		}
+	}
+}
+
+/** Build a {@link CorrelationReplayGuard} over the configured staleness window and forward skew. */
+export function createCorrelationReplayGuard(config: CorrelationReplayGuardConfig = {}): CorrelationReplayGuard {
+	return new WindowedReplayGuard(config);
+}

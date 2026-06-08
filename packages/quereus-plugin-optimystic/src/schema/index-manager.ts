@@ -64,6 +64,15 @@ export class IndexManager {
 	}
 
 	/**
+	 * All index trees managed for this table. Used by the vtab to register every
+	 * touched index tree as dirty (for commit-time flush / rollback-time discard)
+	 * after staging, and by addIndex to flush a freshly populated index.
+	 */
+	getIndexTrees(): Tree<IndexKey, IndexEntry>[] {
+		return [...this.indexTrees.values()];
+	}
+
+	/**
 	 * Create index key from row values
 	 */
 	createIndexKey(indexSchema: StoredIndexSchema, row: Row): IndexKey {
@@ -80,11 +89,16 @@ export class IndexManager {
 	}
 
 	/**
-	 * Insert index entries for a new row.
+	 * Stage index entries for a new row.
 	 *
 	 * Index tree keys are composites of indexKey + primaryKey to support
 	 * non-unique indexes (multiple rows with the same indexed value).
 	 * Format: indexKey\x00primaryKey -> primaryKey
+	 *
+	 * Mutations are STAGED into each index tree's tracker (not flushed). The
+	 * caller is responsible for flushing the touched trees at transaction commit
+	 * (via TransactionBridge.markDirty) or discarding them on rollback, so a
+	 * deferred-constraint rejection leaves no orphaned index entries.
 	 */
 	async insertIndexEntries(
 		row: Row,
@@ -102,12 +116,13 @@ export class IndexManager {
 			// Store as [treeKey, primaryKey] so the tree's keyExtractor (entry[0])
 			// returns the treeKey for proper sorting and range scans
 			const treeKey = `${indexKey}\x00${primaryKey}`;
-			await tree.replace([[treeKey, [treeKey, primaryKey]]]);
+			await tree.stage([[treeKey, [treeKey, primaryKey]]]);
 		}
 	}
 
 	/**
-	 * Delete index entries for a row
+	 * Stage deletion of index entries for a row (staged, not flushed — see
+	 * {@link insertIndexEntries} for the flush/discard contract).
 	 */
 	async deleteIndexEntries(
 		row: Row,
@@ -123,12 +138,13 @@ export class IndexManager {
 
 			// Composite tree key must match the format used in insertIndexEntries
 			const treeKey = `${indexKey}\x00${primaryKey}`;
-			await tree.replace([[treeKey, undefined]]);
+			await tree.stage([[treeKey, undefined]]);
 		}
 	}
 
 	/**
-	 * Update index entries when a row changes
+	 * Stage index-entry updates when a row changes (staged, not flushed — see
+	 * {@link insertIndexEntries} for the flush/discard contract).
 	 */
 	async updateIndexEntries(
 		oldRow: Row,
@@ -152,7 +168,7 @@ export class IndexManager {
 
 			if (oldTreeKey !== newTreeKey) {
 				// Index key or primary key changed - delete old, insert new
-				await tree.replace([
+				await tree.stage([
 					[oldTreeKey, undefined],
 					[newTreeKey, [newTreeKey, newPrimaryKey]]
 				]);

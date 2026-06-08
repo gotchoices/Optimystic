@@ -18,6 +18,21 @@ Logging is controlled via the `DEBUG` environment variable.
 | `batch-coordinator`   | Batch creation, retry paths, excluded peers       |
 | `cache`               | Block cache hit/miss                              |
 
+### cohort-topic sub-namespaces
+
+The cohort-topic substrate logs under `optimystic:cohort-topic:*`. Each phase of the
+walk → willingness → promotion → handoff lifecycle, plus the anti-flood / anti-DoS defenses, has
+its own sub-namespace so a single concern can be traced in isolation:
+
+| Sub-namespace                     | What it covers                                                        |
+|-----------------------------------|-----------------------------------------------------------------------|
+| `cohort-topic:walk`               | Walk-toward-root probes: per-hop tier, `no_state`/`promoted` redirects, retries |
+| `cohort-topic:promote`            | Promotion / demotion lifecycle: cap/slope triggers, sticky window, notices |
+| `cohort-topic:willingness`        | Per-member willingness decisions: quorum, load shed, budget gate, back-off |
+| `cohort-topic:handoff`            | Membership rotation primary handoff: inventory → pull → dual-serve → ack |
+| `cohort-topic:antiflood`          | Re-registration jitter: wave staggering and the `cap_promote / T_rejoin_jitter` bound |
+| `cohort-topic:antidos`            | Rate-limit / topic-budget / replay-guard / bootstrap-evidence rejections |
+
 ### db-p2p sub-namespaces
 
 | Sub-namespace              | What it covers                                         |
@@ -61,6 +76,12 @@ DEBUG='optimystic:db-core:batch-coordinator' node app.js
 
 # Routing and redirect decisions
 DEBUG='optimystic:db-p2p:repo-service' node app.js
+
+# All cohort-topic substrate logging (walk, promote, willingness, handoff, anti-flood, anti-DoS)
+DEBUG='optimystic:db-core:cohort-topic:*' node app.js
+
+# Trace a registration walk plus the anti-DoS rejections it triggers
+DEBUG='optimystic:db-core:cohort-topic:walk,optimystic:db-core:cohort-topic:antidos' node app.js
 
 # Full transaction lifecycle
 DEBUG='optimystic:db-core:network-transactor,optimystic:db-p2p:storage-repo,optimystic:db-p2p:block-storage,optimystic:db-p2p:cluster,optimystic:db-p2p:cluster-member' node app.js

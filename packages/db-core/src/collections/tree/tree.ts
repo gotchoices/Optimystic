@@ -56,6 +56,28 @@ export class Tree<TKey, TEntry> {
 			await this.collection.updateAndSync();
 	}
 
+	/** Stage a mutation into the collection's tracker WITHOUT flushing it to the
+	 * transactor. Reads through this same Tree instance see the staged change;
+	 * call {@link sync} to persist it or {@link discardChanges} to drop it. This
+	 * is the deferred counterpart to {@link replace}, which stages and flushes in
+	 * one step — use {@link stage} when the persist/discard decision belongs to a
+	 * surrounding transaction's commit/rollback. */
+	async stage(data: TreeReplaceAction<TKey, TEntry>): Promise<void> {
+			await this.collection.act({ type: "replace", data });
+	}
+
+	/** Flush all staged (and any other pending) changes to the transactor.
+	 * Equivalent to the flush half of {@link replace}. */
+	async sync(): Promise<void> {
+			await this.collection.updateAndSync();
+	}
+
+	/** Discard all staged-but-unsynced changes, reverting reads to committed
+	 * state. Counterpart to {@link stage} for transaction rollback. */
+	discardChanges(): void {
+			this.collection.discardPending();
+	}
+
 	/**
 	 * Update the local state from the network.
 	 * Call this before reading to ensure you have the latest data.

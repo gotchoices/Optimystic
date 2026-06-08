@@ -5,6 +5,18 @@ import { CollectionFactory } from './collection-factory.js';
 import { generateStampId } from '../util/generate-stamp-id.js';
 
 /**
+ * Minimal tree surface the bridge needs to flush (at commit) or discard (at
+ * rollback) DML that was staged into the collection tracker but not yet pushed
+ * to the transactor. `@optimystic/db-core`'s `Tree` satisfies this structurally,
+ * so both the main-table tree and index trees can share one dirty set without
+ * generic-parameter friction.
+ */
+export interface DirtyTree {
+  sync(): Promise<void>;
+  discardChanges(): void;
+}
+
+/**
  * Transaction bridge between Quereus and Optimystic.
  *
  * This bridge handles both:
@@ -16,6 +28,15 @@ export class TransactionBridge {
   private collectionFactory: CollectionFactory;
   /** Accumulated SQL statements for the current transaction */
   private accumulatedStatements: string[] = [];
+  /**
+   * Trees with DML staged this transaction (main table + touched index trees).
+   * Populated by {@link markDirty} at DML time; flushed at commit (legacy mode)
+   * or discarded at rollback. This is the authoritative set rather than
+   * `currentTransaction.collections` because the vtab's main collection is
+   * long-lived (created before the txn) and index trees are created with a
+   * throwaway txnState, so neither reliably lands in that map.
+   */
+  private dirtyTrees = new Set<DirtyTree>();
   /** Optional transaction session for distributed consensus */
   private session: TransactionSession | null = null;
   /** Optional coordinator for transaction mode */
@@ -74,8 +95,9 @@ export class TransactionBridge {
     const transactor = await this.collectionFactory.getOrCreateTransactor(options);
     const peerId = this.collectionFactory.getPeerId(options);
 
-    // Clear any previously accumulated statements
+    // Clear any previously accumulated statements + staged-tree tracking
     this.accumulatedStatements = [];
+    this.dirtyTrees.clear();
 
     // Create TransactionSession if transaction mode is enabled
     if (this.coordinator && this.engine && this.schemaHashProvider) {
@@ -118,21 +140,33 @@ export class TransactionBridge {
 
     try {
       if (this.session) {
-        // Transaction mode: commit through session for distributed consensus
+        // Transaction mode: commit through session for distributed consensus.
+        // The DML path now STAGES into the collection trackers (no inline sync),
+        // and the coordinator's commit() reads `tracker.transforms` directly, so
+        // we deliberately do NOT tree.sync() here — flushing would reset the
+        // trackers out from under consensus. Session-mode commit composition
+        // against the staging DML path is not yet covered by a real-DML test;
+        // see fix/optimystic-session-mode-commit-composition.
         const result = await this.session.commit();
         if (!result.success) {
           throw new Error(result.error || 'Transaction commit failed');
         }
       } else {
-        // Legacy mode: sync all collections directly
-        for (const [, collection] of this.currentTransaction.collections) {
-          await this.collectionFactory.syncCollection(collection);
+        // Legacy mode: flush every tree that staged DML this transaction. This
+        // replaces the inline updateAndSync that Tree.replace() used to perform
+        // at DML time — deferring the flush to commit is what lets a deferred
+        // (subquery-bearing) CHECK rejection roll back cleanly: the constraint
+        // throws before this point, so the staged trees are discarded never
+        // having touched storage.
+        for (const tree of this.dirtyTrees) {
+          await tree.sync();
         }
       }
 
       this.currentTransaction.isActive = false;
       this.accumulatedStatements = [];
       this.session = null;
+      this.dirtyTrees.clear();
 
     } catch (error) {
       // If commit fails, rollback
@@ -159,6 +193,17 @@ export class TransactionBridge {
         // Ignore rollback errors - we're already cleaning up
       }
     }
+
+    // Discard staged-but-unsynced DML in BOTH modes. Quereus runs deferred row
+    // constraints BEFORE connection.commit(), so a constraint-failure rollback
+    // reaches here while every staged tree is still un-synced — dropping the
+    // tracker transforms reverts in-memory reads and leaves storage untouched,
+    // which is the actual fix for the deferred-constraint atomicity bug. Safe
+    // for already-synced/clean trees too (reset of an empty tracker is a no-op).
+    for (const tree of this.dirtyTrees) {
+      tree.discardChanges();
+    }
+    this.dirtyTrees.clear();
 
     // Clean up local state
     this.currentTransaction.collections.clear();
@@ -192,6 +237,16 @@ export class TransactionBridge {
    */
   isTransactionActive(): boolean {
     return this.currentTransaction?.isActive ?? false;
+  }
+
+  /**
+   * Register a tree that has staged DML this transaction so it is flushed at
+   * commit (legacy mode) or discarded at rollback. The vtab DML path calls this
+   * for the main-table tree and each touched index tree after staging. Idempotent
+   * — repeated marks of the same tree collapse in the Set.
+   */
+  markDirty(tree: DirtyTree): void {
+    this.dirtyTrees.add(tree);
   }
 
   /**

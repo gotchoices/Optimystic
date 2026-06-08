@@ -136,6 +136,19 @@ export class Collection<TAction> implements ICollection<TAction> {
 		this.source.actionContext = latest?.context;
 	}
 
+	/** Discard all staged-but-unsynced changes.
+	 *
+	 * Drops the queued pending actions and resets the in-memory tracker so that
+	 * reads through this collection observe committed source state again. Use to
+	 * roll back mutations that were staged via {@link act} but not yet pushed to
+	 * the transactor via {@link sync}/{@link updateAndSync}. Storage is untouched
+	 * because nothing was ever synced. Synchronous and latch-free: intended for
+	 * transaction rollback, when no concurrent act/sync is in flight. */
+	discardPending(): void {
+		this.pending = [];
+		this.tracker.reset();
+	}
+
 	/** Push our pending actions to the transactor */
 	async sync() {
 		const release = await Latches.acquire(this.latchId);

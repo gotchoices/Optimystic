@@ -439,16 +439,4 @@ export class CollectionFactory {
     }
     this.libp2pNodes.clear();
   }
-
-  /**
-   * Sync a collection (call collection.sync())
-   */
-  async syncCollection(_collection: Tree<string, RowData>): Promise<void> {
-    // The Tree class doesn't expose sync directly, but we can call updateAndSync
-    // This is a placeholder - we'd need to check the actual Tree API
-    // await collection.updateAndSync();
-
-    // For now, we'll assume the sync happens as part of the replace operation
-    // which calls updateAndSync internally
-  }
 }

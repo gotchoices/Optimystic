@@ -618,6 +618,20 @@ A claim of "anti-flood by construction" is only meaningful if we can name the fl
 4. **Inward retry storm.** A participant receiving `UnwillingCohort` waits `retryAfter` (cohort-controlled) before any retry, and retries from `d_max`, not from the same coord. This decorrelates retry traffic across the ring.
 5. **Promotion feedback loop.** A cohort that has just promoted continues to receive registrations from participants in flight. Those participants are bounced with `Promoted(d+1)` — cheap, single-RPC. The cohort's promotion state is sticky for at least `T_promote_sticky` (default 60s) to avoid flapping back to accepting under transient drops.
 
+> **Implementation.** Claims 1, 3, 4 and 5 are emergent from the walk / promotion machinery
+> (`walk.ts`, `promotion.ts`) and are not re-implemented; claim 2's jitter and the centralized
+> invariant predicates live in
+> [`packages/db-core/src/cohort-topic/antiflood/`](../packages/db-core/src/cohort-topic/antiflood).
+> `RejoinJitter` (`jitter.ts`) staggers a re-registration wave so any `T_rejoin_jitter`-long window
+> holds at most `cap_promote` arrivals — the single-participant form draws a uniform offset, the
+> wave form spaces arrivals at `T_rejoin_jitter / cap_promote` for the hard bound, and the window
+> widens with the observed FRET cohort-failure rate. `invariants.ts` exposes pure predicates over a
+> recorded walk trace — `outwardMovesArePromoted` (claim 3), `inwardStepsFollowNoState` (walk
+> discipline), `retriesRestartAtDMax` (claim 4), `stickyHolds` (claim 5) — so the unit and e2e
+> suites assert the structural disciplines hold on the real engine, mirroring the simulator's
+> `walk-metrics.ts` instrumentation. `T_rejoin_jitter = 30 s` is the simulator-confirmed
+> §Configuration default. Specs: `antiflood.spec.ts`.
+
 > **Simulator validation.** The design simulator (`packages/substrate-simulator`, `walk.ts` +
 > `walk-metrics.ts`) models the `d_max`→root participant walk as scheduled per-hop RPC events and
 > instruments all five claims directly; each is quantitatively validated:
@@ -687,6 +701,27 @@ The layer relies on a small handful of structural defenses against malicious reg
 - **Bootstrap requires evidence.** A cold root accepting `bootstrap: true` requires the registration to carry one of: a small proof-of-work, a signature from a peer with a sufficient reputation score ([architecture.md](architecture.md) §Reputation), or a signed reference to a parent topic that does exist. Specifics depend on the application's tier — T0/T1 topics generally don't need PoW because they correspond to committed work; T2/T3 topics do.
 
 The layer does not attempt to defend against unbounded Sybil attacks at the registration level; those are FRET's and the reputation subsystem's concern.
+
+> **Implementation.** The four anti-DoS defenses live in
+> [`packages/db-core/src/cohort-topic/antidos/`](../packages/db-core/src/cohort-topic/antidos) as
+> transport-agnostic db-core logic: `RegisterRateLimiter` (sliding-window per `(peer, topic)`,
+> exponential `retryAfter` via the §Willingness back-off curve), `TopicBudget` (LRU by participant
+> count, zero-participant topics evicted first; populated topics never evicted for a new
+> instantiation), `CorrelationReplayGuard` (drops stale/future timestamps and replayed
+> `correlationId`s, remembering ids for one `maxAge` window), and `BootstrapEvidence` (tier policy
+> over injected PoW / reputation / parent-reference verifiers — db-core never embeds a specific
+> PoW or reputation scheme). `register_rate_per_peer = 4/min` and `topics_max = 2048` are the
+> simulator-confirmed §Configuration defaults. Specs: `antidos.spec.ts`.
+
+> **Open question — `F^d` fan-out under per-coord rate limits (not resolved here).** The per-peer
+> rate limit bounds cost *per cohort*, but a malicious peer can hit every one of the `F^d`
+> coordinates at tier `d` (e.g. `F = 16`, `d = 3` → 4,096 shards × 4/min ≈ **16K registrations/min
+> network-wide** from a single peer). Whether that aggregate fan-out is acceptable is a
+> **reputation-escalation** question, not a per-cohort one: the local rate limit is doing its job;
+> the network-wide budget is set by how fast reputation must throttle a peer that sprays the whole
+> ring. The simulator's adversarial DoS scenario (`packages/substrate-simulator`,
+> `simulator-metrics-and-scenarios`) is the intended venue for measuring whether reputation
+> escalation must be faster — deliberately left open pending those numbers.
 
 ---
 

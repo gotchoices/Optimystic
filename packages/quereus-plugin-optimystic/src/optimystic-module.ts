@@ -646,6 +646,25 @@ export class OptimysticVirtualTable extends VirtualTable {
   }
 
   /**
+   * Register the main collection plus every index tree as dirty on the
+   * transaction bridge after a DML statement has staged its mutations. The
+   * bridge flushes these at commit (legacy mode) and discards them on rollback,
+   * which is what makes a deferred-constraint rejection atomic. Index trees a
+   * given statement didn't actually touch carry empty pending, so their
+   * flush/discard is a no-op — marking all of them is simplest and correct.
+   */
+  private markDirtyTrees(): void {
+    if (this.collection) {
+      this.txnBridge.markDirty(this.collection);
+    }
+    if (this.indexManager) {
+      for (const tree of this.indexManager.getIndexTrees()) {
+        this.txnBridge.markDirty(tree);
+      }
+    }
+  }
+
+  /**
    * Performs an INSERT, UPDATE, or DELETE operation
    */
   async update(args: UpdateArgs): Promise<UpdateResult> {
@@ -680,12 +699,14 @@ export class OptimysticVirtualTable extends VirtualTable {
             const insertKey = this.rowCodec.extractPrimaryKey(values);
             const encodedRow = this.rowCodec.encodeRow(values);
 
-            // Insert into main table
+            // Stage the row in the main table (flushed at commit / discarded on
+            // rollback — see stageMutation / markDirtyTrees).
             // Entry format: [primaryKey, encodedRow]
-            await this.collection.replace([[insertKey, [insertKey, encodedRow]]]);
+            await this.collection.stage([[insertKey, [insertKey, encodedRow]]]);
 
-            // Insert into all indexes
+            // Stage into all indexes
             await this.indexManager.insertIndexEntries(values, insertKey, txnState?.transactor);
+            this.markDirtyTrees();
 
             // Update statistics
             this.statisticsCollector?.incrementRowCount();
@@ -705,19 +726,21 @@ export class OptimysticVirtualTable extends VirtualTable {
             const newKey = this.rowCodec.extractPrimaryKey(values);
             const encodedRow = this.rowCodec.encodeRow(values);
 
-            // Update main table
+            // Stage the main-table change (flushed at commit / discarded on
+            // rollback). A PK change is staged as delete-old + insert-new so both
+            // index halves discard together on rollback.
             if (oldKey !== newKey) {
               // Key changed - delete old, insert new
-              await this.collection.replace([
+              await this.collection.stage([
                 [oldKey, undefined],
                 [newKey, [newKey, encodedRow]]
               ]);
             } else {
               // Simple update
-              await this.collection.replace([[newKey, [newKey, encodedRow]]]);
+              await this.collection.stage([[newKey, [newKey, encodedRow]]]);
             }
 
-            // Update all indexes
+            // Stage all index updates
             await this.indexManager.updateIndexEntries(
               oldKeyValues,
               values,
@@ -725,6 +748,7 @@ export class OptimysticVirtualTable extends VirtualTable {
               newKey,
               txnState?.transactor
             );
+            this.markDirtyTrees();
 
             return { status: 'ok', row: values };
           }
@@ -736,11 +760,12 @@ export class OptimysticVirtualTable extends VirtualTable {
           {
             const deleteKey = this.rowCodec.extractPrimaryKey(oldKeyValues);
 
-            // Delete from main table
-            await this.collection.replace([[deleteKey, undefined]]);
+            // Stage the main-table delete (flushed at commit / discarded on rollback)
+            await this.collection.stage([[deleteKey, undefined]]);
 
-            // Delete from all indexes
+            // Stage deletes from all indexes
             await this.indexManager.deleteIndexEntries(oldKeyValues, deleteKey, txnState?.transactor);
+            this.markDirtyTrees();
 
             // Update statistics
             this.statisticsCollector?.decrementRowCount();
@@ -835,6 +860,14 @@ export class OptimysticVirtualTable extends VirtualTable {
           const primaryKey = this.rowCodec.extractPrimaryKey(row);
           await this.indexManager.insertIndexEntries(row, primaryKey, txnState?.transactor);
         }
+      }
+
+      // insertIndexEntries only STAGES now. addIndex runs outside the DML
+      // transaction's commit (and Tree.replace() used to persist inline), so
+      // flush the freshly populated index to storage here. Trees with nothing
+      // staged sync as a no-op.
+      for (const tree of this.indexManager.getIndexTrees()) {
+        await tree.sync();
       }
     }
   }
