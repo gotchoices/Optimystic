@@ -103,6 +103,16 @@ describe('cohort-topic / gossip bus', () => {
 		expect(store.getByParticipant(rec.topicId, rec.participantId)).to.be.undefined;
 	});
 
+	it('does not resurrect a record already past its TTL at merge time', () => {
+		// rec: lastPing 1_000, ttl 90_000 → expired once now − lastPing > ttl. Replication must not
+		// reintroduce a registration the owner has effectively evicted (matches store.evictStale).
+		const store = createRegistrationStore();
+		const bus = busFor(store, new FanoutTransport(), () => EPOCH);
+		const stale = record('p', 1_000);
+		bus.applyInbound(gossip('m', EPOCH, { records: [toGossipRecord(stale)] }), 200_000);
+		expect(store.getByParticipant(stale.topicId, stale.participantId), 'expired record dropped').to.be.undefined;
+	});
+
 	it('merges the per-member view (willingness/load/summaries)', () => {
 		const bus = busFor(createRegistrationStore(), new FanoutTransport(), () => EPOCH);
 		bus.applyInbound(gossip('member-X', EPOCH, { willingnessBits: 'a', loadBuckets: [1, 2, 3, 4], timestamp: 10 }), 2_000);

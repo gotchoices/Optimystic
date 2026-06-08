@@ -130,9 +130,15 @@ class TransportCohortGossipBus implements CohortGossipBus {
 		});
 	}
 
-	private mergeRecords(g: CohortGossipV1, _now: number): void {
+	private mergeRecords(g: CohortGossipV1, now: number): void {
 		for (const gr of g.records ?? []) {
 			const incoming = fromGossipRecord(gr);
+			// A record already past its TTL is dead; merging it would resurrect a registration the
+			// owner has (or soon will have) evicted. Drop it, matching `store.evictStale`'s predicate
+			// so replication can never reintroduce what local eviction removes.
+			if (now - incoming.lastPing > incoming.ttl) {
+				continue;
+			}
 			const held = this.deps.store.getByParticipant(incoming.topicId, incoming.participantId);
 			// Last-writer-wins by lastPing: a touch (newer lastPing) replaces an older replica.
 			if (held === undefined || incoming.lastPing >= held.lastPing) {

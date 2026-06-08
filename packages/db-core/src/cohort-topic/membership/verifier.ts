@@ -108,7 +108,9 @@ class CachingMembershipVerifier implements MembershipVerifier {
 
 	/** A cert is trustworthy only if its own threshold signature is a valid quorum of its members. */
 	private certIsSelfConsistent(cert: MembershipCertV1): boolean {
-		// Decode succeeds here: the cert came through the validating codec, so its byte fields are base64url.
+		// `signers` is validated only as a string array (not per-element base64url), so `b64urlToBytes`
+		// below may throw `CohortWireError` on a malformed signer — `loadFrom`'s try/catch turns that
+		// into "no cert" rather than letting it escape.
 		return this.deps.signer.verifyThreshold(
 			membershipCertSigningPayload(cert),
 			b64urlToBytes(cert.thresholdSig),
