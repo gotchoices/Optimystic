@@ -11,8 +11,24 @@ import { join } from 'node:path';
  */
 const SRC_DIR = fileURLToPath(new URL('../src', import.meta.url));
 
-/** Matches the module specifier of an `import`/`export ... from` / dynamic `import()`. */
-const IMPORT_RE = /(?:import|export)\s[^;]*?from\s*['"]([^'"]+)['"]|import\s*\(\s*['"]([^'"]+)['"]\s*\)/g;
+/**
+ * Matches the module specifier of an `import`/`export ... from`, a dynamic `import()`, or a
+ * bare side-effect import (`import 'spec';`). The side-effect form has no `from`, so it needs its
+ * own alternative — otherwise `import 'libp2p'` would slip past the guard.
+ */
+const IMPORT_RE = /(?:import|export)\s[^;]*?from\s*['"]([^'"]+)['"]|import\s*\(\s*['"]([^'"]+)['"]\s*\)|import\s+['"]([^'"]+)['"]/g;
+
+/** Extract every module specifier referenced by `text`. */
+function importSpecifiers(text: string): string[] {
+	const specs: string[] = [];
+	for (const m of text.matchAll(IMPORT_RE)) {
+		const spec = m[1] ?? m[2] ?? m[3];
+		if (spec) {
+			specs.push(spec);
+		}
+	}
+	return specs;
+}
 
 const FORBIDDEN = (spec: string): boolean =>
 	spec === 'p2p-fret' || spec.startsWith('p2p-fret/') ||
@@ -40,13 +56,45 @@ describe('db-core layering — no FRET / libp2p imports', () => {
 		const violations: string[] = [];
 		for (const file of files) {
 			const text = await readFile(file, 'utf8');
-			for (const m of text.matchAll(IMPORT_RE)) {
-				const spec = m[1] ?? m[2];
-				if (spec && FORBIDDEN(spec)) {
+			for (const spec of importSpecifiers(text)) {
+				if (FORBIDDEN(spec)) {
 					violations.push(`${file}: imports '${spec}'`);
 				}
 			}
 		}
 		expect(violations, `db-core must stay FRET/libp2p-free:\n${violations.join('\n')}`).to.deep.equal([]);
+	});
+
+	// The guard above only proves "no violations exist *today*". These cases prove the detector
+	// actually fires across every import form a violation could take — so the guard can't silently
+	// rot into a no-op.
+	it('detects forbidden specifiers in every import form', () => {
+		const forbidden = [
+			`import { foo } from 'libp2p';`,
+			`import 'libp2p';`,                       // bare side-effect import
+			`import type { T } from '@libp2p/interface';`,
+			`export * from 'p2p-fret';`,
+			`const m = await import('libp2p/dist/x.js');`,
+			`import\n\t{ a }\nfrom 'p2p-fret/sub';`,   // multi-line
+		];
+		for (const snippet of forbidden) {
+			const specs = importSpecifiers(snippet);
+			expect(specs.some(FORBIDDEN), `should flag: ${JSON.stringify(snippet)}`).to.equal(true);
+		}
+	});
+
+	it('does not flag allowed specifiers or non-imports', () => {
+		// Note: the regex is intentionally not comment-aware — a commented-out `import ... 'libp2p'`
+		// would over-match and fail the guard. That errs on the safe side (false positive, never a
+		// false negative), so we don't assert on commented imports here.
+		const allowed = [
+			`import { sha256 } from '@noble/hashes/sha2.js';`,
+			`import type { IRingHash } from './ports.js';`,
+			`const u = import.meta.url;`,              // not an import statement
+		];
+		for (const snippet of allowed) {
+			const specs = importSpecifiers(snippet);
+			expect(specs.some(FORBIDDEN), `should NOT flag: ${JSON.stringify(snippet)}`).to.equal(false);
+		}
 	});
 });

@@ -116,6 +116,7 @@ break existing tests.
 
 ### Phase 3 — tests + docs
 - `packages/db-p2p/test/cohort-topic/service.spec.ts` (mock transport, mesh-harness style): full single-topic flow register → renew → promote (push count past `cap_promote`) → lookup against FRET; protocol handshake on each of the four protocol IDs.
+- **FRET coord byte-compat assertion** (deferred from `cohort-topic-package-layering`): assert db-core's `RingHash().H(x)` equals FRET's `hashKey(x)` byte-for-byte at `RING_BITS=256`. db-core can't import FRET, so this assertion has no home until this ticket — and db-p2p is the package allowed to import both. Coords lining up on the wire depends on this; today it's asserted only by design (both are SHA-256), not by a test.
 - Doc-sync `docs/architecture.md` (cohort-topic narrative + Doc Sync Status row), `docs/internals.md` (cohort-topic subsystem section), `docs/cohort-topic.md` (§FRET integration confirmation).
 
 ## Done when
