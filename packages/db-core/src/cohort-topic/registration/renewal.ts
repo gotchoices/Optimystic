@@ -130,6 +130,10 @@ class TtlRenewalParticipant implements RenewalParticipant {
 			}
 		}
 		await this.deps.transport.relookup();
+		// relookup is a terminal recovery action (it owns re-establishing the registration out of
+		// band); reset the counter so a still-dead primary backs off to one relookup per
+		// MAX_PING_FAILURES cycles rather than re-running the d_max walk on every subsequent ping.
+		this.consecutiveFailures = 0;
 	}
 
 	private async tryReattach(target: Uint8Array): Promise<RenewReplyV1 | undefined> {

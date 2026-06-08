@@ -187,6 +187,14 @@ describe('cohort-topic / renewal participant', () => {
 		expect(t.relookups).to.equal(1);
 	});
 
+	it('backs off relookup to one per MAX_PING_FAILURES cycles when everything stays dead', async () => {
+		const t = new MockParticipantTransport(() => 'fail');
+		const p = participant(t);
+		// Six consecutive failing pings: relookup fires on the 3rd and again on the 6th, not every cycle.
+		for (let i = 0; i < 6; i++) await p.pingLoop();
+		expect(t.relookups).to.equal(2);
+	});
+
 	it('refreshes the cohortEpoch hint lazily: not at failover, but on the next primary_moved ping', async () => {
 		const primary = bytesKey(record().primary);
 		const backup0 = record().backups[0]!;
