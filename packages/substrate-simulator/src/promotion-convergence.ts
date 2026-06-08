@@ -1,6 +1,5 @@
 import type { VTime } from './types.js';
 import type { RingCoord } from './ring-model.js';
-import { bytesToHex } from './hex.js';
 import { log2F } from './topic-addressing.js';
 import { createSimWorld } from './world.js';
 import {
@@ -168,10 +167,17 @@ export class PromotionTracer implements EventSink {
  * A synthetic per-participant tier coordinate ladder with *idealized uniform* prefix sharding:
  * `ladder[d]` keys the tier-`d` cohort for bucket `index mod F^d`. Because `index mod F^d` refines
  * `index mod F^(d-1)` (`bucket_d mod F^(d-1) = bucket_{d-1}`), the ladder nests correctly into one
- * tree, and the F^d buckets at tier `d` fill perfectly evenly — so the steady-state depth is exactly
- * `⌈log_F(N / cap_promote)⌉`, isolating the promotion *law* from the prefix-distribution noise the
- * real-sha256 addressing carries. The coord packs `d` then the 32-bit bucket then a topic marker
- * into 32 bytes; distinct `(d, bucket)` ⇒ distinct coord.
+ * tree, and the F^d buckets at tier `d` fill perfectly evenly — removing the prefix-distribution
+ * noise that real-sha256 addressing carries, so the observed steady-state depth tracks
+ * `⌈log_F(N / cap_promote)⌉` without sharding skew. Note this isolates the promotion *law* but does
+ * not make observed depth *identical* to the closed form at every N: the law is itself a ±1
+ * approximation near the `N = cap_promote · F^k` boundaries, because it ignores that promoted
+ * ancestors *retain* their participants (so depth `d` actually holds slightly more than `cap · F^d`
+ * across the tier), and because slope-based lookahead can pre-promote a still-ramping root in the
+ * sparse regime (`N ≲ cap_promote` ⇒ observed depth 1, not 0). The sweep N's are chosen clear of
+ * those boundaries so observed and law coincide; the boundary-characterization spec pins the edges.
+ * The coord packs `d` then the 32-bit bucket then a topic marker into 32 bytes; distinct
+ * `(d, bucket)` ⇒ distinct coord.
  */
 export function uniformLadder(index: number, dMax: number, F: number, marker = 0xed): RingCoord[] {
 	if (!Number.isInteger(index) || index < 0) {
