@@ -132,7 +132,40 @@ export interface DemotionNoticeV1 {
 	cohortEpoch: string;
 }
 
-/** Intra-cohort gossip: willingness vector, load barometer, exact per-topic summaries. */
+/**
+ * A registration record carried in cohort gossip for cross-member replication (so any member can
+ * fail over to serving it). Byte fields are base64url; mirrors the local `RegistrationRecord`.
+ */
+export interface GossipRecordV1 {
+	/** Topic id, 32 bytes, base64url. */
+	topicId: string;
+	/** Registering participant peer id, base64url. */
+	participantId: string;
+	/** Tier 0..3. */
+	tier: number;
+	/** Assigned primary peer id, base64url. */
+	primary: string;
+	/** 1..2 warm-failover peer ids, base64url. */
+	backups: string[];
+	/** Unix ms the registration first attached. */
+	attachedAt: number;
+	/** Unix ms of the most recent ping/touch (the convergence key — newest wins). */
+	lastPing: number;
+	/** Registration TTL in ms. */
+	ttl: number;
+	/** Opaque application-defined per-registration state, base64url. */
+	appState?: string;
+}
+
+/** Reference to a single registration in an eviction delta. */
+export interface GossipRecordRefV1 {
+	/** Topic id, 32 bytes, base64url. */
+	topicId: string;
+	/** Participant peer id, base64url. */
+	participantId: string;
+}
+
+/** Intra-cohort gossip: willingness vector, load barometer, exact per-topic summaries, record deltas. */
 export interface CohortGossipV1 {
 	v: 1;
 	/** PeerId. */
@@ -145,6 +178,14 @@ export interface CohortGossipV1 {
 	/** Cohort-wide observation window for the rate fields in `topicSummaries`. */
 	windowSeconds: number;
 	topicSummaries: CohortTopicSummary[];
+	/**
+	 * Registration records this member is advertising (fresh or touched), for cross-member
+	 * replication. Absent when this gossip carries no record changes. Merge is last-writer-wins by
+	 * {@link GossipRecordV1.lastPing}.
+	 */
+	records?: GossipRecordV1[];
+	/** Registrations this member evicted (stale), so all members converge on the active set. */
+	evicted?: GossipRecordRefV1[];
 	timestamp: number;
 	signature: string;
 }

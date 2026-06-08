@@ -402,10 +402,16 @@ Cohort threshold signatures are useful only if participants can verify them. The
 
 ### Membership source
 
+> **Resolved.** Membership is read from one of two sources, dispatched by tier; the verifier never
+> writes either. **T0/T1 → transaction-log commit certificate; T2/T3 → FRET-published
+> `MembershipCertV1`.** This is implemented as the coord→source dispatch in
+> [`membership/source.ts`](../packages/db-core/src/cohort-topic/membership/source.ts)
+> (`createMembershipSourceRouter`), which the verifier consults by the message's claimed tier.
+
 Cohort memberships are anchored in the transaction log ([transactions.md](transactions.md)). Specifically:
 
 - Each block records the cohort membership for every collection whose tail it advances. This is part of the existing commit certificate.
-- The membership of *all* cohort-topic cohorts is not committed; only those that serve T0/T1 work (transaction commits, chain serving) appear in the log.
+- The membership of *all* cohort-topic cohorts is not committed; only those that serve T0/T1 work (transaction commits, chain serving) appear in the log. The verifier **reads** this committed membership (it never writes the log).
 - T2/T3 cohorts (matchmaking, push forwarding) derive their membership from current FRET state. Their threshold signatures are verifiable against FRET's signed membership advertisements (the `MembershipCertV1` that FRET cohorts publish after stabilization).
 
 ### Membership fetch
@@ -418,6 +424,21 @@ A participant verifies a notification or threshold-signed message as follows:
 4. Verify (a) the certificate is current, signed, and consistent with FRET stabilization, and (b) the signers in the message are a `≥ minSigs` subset of the certificate's members.
 
 `MembershipCertV1` is refreshed by the cohort every `T_membership_refresh` (default 5 minutes) and on any stabilization event that changes the first `k − x` members. Participants cache the latest one they've seen per coord; verification against a slightly stale cert is acceptable as long as the cert's signers overlap with the current cohort by quorum.
+
+> **Implementation.** Cohort-side publication (at stabilization, on a first-`k − x` change, and on
+> the refresh tick) is
+> [`membership/publisher.ts`](../packages/db-core/src/cohort-topic/membership/publisher.ts);
+> participant-side verification is
+> [`membership/verifier.ts`](../packages/db-core/src/cohort-topic/membership/verifier.ts). The
+> verifier checks the message's `signers` are a distinct `≥ minSigs` subset of the cert's `members`
+> and the signature verifies (the `k − x` threshold logic of
+> [`sig/threshold.ts`](../packages/db-core/src/cohort-topic/sig/threshold.ts)). On failure against a
+> cached/stale cert it re-fetches the cert from any cohort member **exactly once** and retries; still
+> failing → the message is **untrusted**. A freshly fetched cert is itself accepted only if its own
+> threshold signature is a self-consistent quorum of its members (full chain-to-genesis validation is
+> §Bootstrapping trust, below, and out of scope of the per-message check). The threshold-signature
+> primitive is reused from FRET's `minSigs = k − x` cohort-signature assembly via an injected port
+> (db-core never imports FRET).
 
 ### Bootstrapping trust
 
@@ -796,10 +817,35 @@ interface CohortGossipV1 {
     promoted:           boolean
     childCohortCount:   number
   }[]
+  records?: {                         // registration-record deltas (new/touched); base64url byte fields
+    topicId:            string
+    participantId:      string
+    tier:               number
+    primary:            string
+    backups:            string[]
+    attachedAt:         number
+    lastPing:           number        // convergence key: merge is last-writer-wins by lastPing
+    ttl:                number
+    appState?:          string
+  }[]
+  evicted?: {                         // records this member evicted (stale); converge the active set
+    topicId:            string
+    participantId:      string
+  }[]
   timestamp:          number
   signature:          string
 }
 ```
+
+The `records` / `evicted` deltas are how a registration replicates across the `~k` members so a
+backup already holds the record when the primary fails (see §Registration record). A receiving
+member merges each record last-writer-wins by `lastPing` (so a touch overwrites an older replica)
+and applies evictions, but **only when the gossip's `cohortEpoch` matches its own** — a delta under a
+foreign epoch belongs to a different membership snapshot (different slot assignments) and is dropped,
+with the mismatch surfaced as membership drift. The implementation is the gossip bus in
+[`packages/db-core/src/cohort-topic/gossip`](../packages/db-core/src/cohort-topic/gossip); the
+willingness/load/`topicSummaries` fold into a per-member view the willingness, barometer, and traffic
+layers read.
 
 ### Membership certificate
 

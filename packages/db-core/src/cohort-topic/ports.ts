@@ -56,6 +56,31 @@ export interface IMembershipSource {
 	fetch(coord: RingCoord): Promise<Uint8Array | undefined>;
 }
 
+/**
+ * Cohort threshold-signature primitive (FRET's `minSigs = k − x` cohort-signature assembly
+ * underneath). db-core defines the seam; db-p2p binds FRET's signer/verifier without modifying it.
+ * Peer ids are raw byte arrays here ({@link PeerRef}`.id`), matching the rest of the substrate; the
+ * wire layer carries them as base64url strings.
+ */
+export interface ICohortThresholdCrypto {
+	/**
+	 * Assemble a cohort threshold signature over `payload`, collecting at least `minSigs` signers.
+	 * Resolves to the combined signature and the peers that contributed.
+	 */
+	assemble(payload: Uint8Array, minSigs: number): Promise<{ thresholdSig: Uint8Array; signers: Uint8Array[] }>;
+	/** Verify `thresholdSig` is a valid cohort signature over `payload` produced by `signers`. */
+	verify(payload: Uint8Array, thresholdSig: Uint8Array, signers: readonly Uint8Array[]): boolean;
+}
+
+/**
+ * Sink the cohort uses to publish a `MembershipCertV1` (over FRET's `/membership` protocol).
+ * db-core's publisher builds + threshold-signs the cert and hands it here; db-p2p serves it.
+ */
+export interface IMembershipPublishSink {
+	/** Publish (advertise/serve) an already-signed membership certificate, encoded. */
+	publish(encodedCert: Uint8Array): void;
+}
+
 /** Network-size estimate feeding `d_max`. */
 export interface ISizeEstimator {
 	estimate(): { nEst: number; confidence: number };

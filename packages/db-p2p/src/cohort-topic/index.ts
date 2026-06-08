@@ -1,4 +1,6 @@
 export * from "./topic-router.js";
 export * from "./cohort-gossip-transport.js";
 export * from "./membership-source.js";
+export * from "./membership-publish-sink.js";
+export * from "./threshold-crypto.js";
 export * from "./size-estimator.js";

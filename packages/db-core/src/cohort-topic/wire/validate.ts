@@ -13,6 +13,8 @@ import type {
 	CohortGossipV1,
 	CohortTopicSummary,
 	DemotionNoticeV1,
+	GossipRecordRefV1,
+	GossipRecordV1,
 	MembershipCertV1,
 	PromotionNoticeV1,
 	RegisterReplyV1,
@@ -300,6 +302,35 @@ function validateCohortTopicSummary(value: unknown): CohortTopicSummary {
 	};
 }
 
+function validateGossipRecordV1(value: unknown): GossipRecordV1 {
+	const what = "GossipRecordV1";
+	const obj = asObject(value, what);
+	const out: GossipRecordV1 = {
+		topicId: b64urlField(reqString(obj, "topicId", what), "topicId", what),
+		participantId: b64urlField(reqString(obj, "participantId", what), "participantId", what),
+		tier: tier(reqFiniteNumber(obj, "tier", what), what),
+		primary: b64urlField(reqString(obj, "primary", what), "primary", what),
+		backups: reqStringArray(obj, "backups", what).map((b) => b64urlField(b, "backups", what)),
+		attachedAt: reqFiniteNumber(obj, "attachedAt", what),
+		lastPing: reqFiniteNumber(obj, "lastPing", what),
+		ttl: reqFiniteNumber(obj, "ttl", what),
+	};
+	const appState = optString(obj, "appState", what);
+	if (appState !== undefined) {
+		out.appState = b64urlField(appState, "appState", what);
+	}
+	return out;
+}
+
+function validateGossipRecordRefV1(value: unknown): GossipRecordRefV1 {
+	const what = "GossipRecordRefV1";
+	const obj = asObject(value, what);
+	return {
+		topicId: b64urlField(reqString(obj, "topicId", what), "topicId", what),
+		participantId: b64urlField(reqString(obj, "participantId", what), "participantId", what),
+	};
+}
+
 /** `willingnessBits` carries exactly 4 bits (T0..T3) as a single hex nibble. */
 const WILLINGNESS_RE = /^[0-9a-fA-F]$/;
 
@@ -324,7 +355,7 @@ export function validateCohortGossipV1(value: unknown): CohortGossipV1 {
 	if (!Array.isArray(summaries)) {
 		fail(`${what}: field "topicSummaries" must be an array`);
 	}
-	return {
+	const out: CohortGossipV1 = {
 		v: 1,
 		fromMember: reqString(obj, "fromMember", what),
 		cohortEpoch: b64urlField(reqString(obj, "cohortEpoch", what), "cohortEpoch", what),
@@ -335,6 +366,21 @@ export function validateCohortGossipV1(value: unknown): CohortGossipV1 {
 		timestamp: reqFiniteNumber(obj, "timestamp", what),
 		signature: b64urlField(reqString(obj, "signature", what), "signature", what),
 	};
+	const records = obj["records"];
+	if (records !== undefined) {
+		if (!Array.isArray(records)) {
+			fail(`${what}: field "records" must be an array when present`);
+		}
+		out.records = records.map(validateGossipRecordV1);
+	}
+	const evicted = obj["evicted"];
+	if (evicted !== undefined) {
+		if (!Array.isArray(evicted)) {
+			fail(`${what}: field "evicted" must be an array when present`);
+		}
+		out.evicted = evicted.map(validateGossipRecordRefV1);
+	}
+	return out;
 }
 
 export function validateMembershipCertV1(value: unknown): MembershipCertV1 {

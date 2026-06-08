@@ -5,3 +5,6 @@ export * from "./tiers.js";
 export * from "./dmax.js";
 export * from "./wire/index.js";
 export * from "./registration/index.js";
+export * from "./gossip/index.js";
+export * from "./sig/index.js";
+export * from "./membership/index.js";
