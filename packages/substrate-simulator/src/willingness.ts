@@ -26,7 +26,7 @@ export function profileAllows(profile: DeviceProfile, tier: number): boolean {
 	return tier <= profileMaxTier(profile);
 }
 
-export interface MemberWillinessOptions {
+export interface MemberWillingnessOptions {
 	/** Per-tier restriction overrides (default all-true); may only turn a tier *off*. */
 	readonly overrides?: Partial<Record<Tier, boolean>>;
 	/** Load bucket that trips willingness off for a tier (default 6, per cohort-topic.md). */
@@ -47,7 +47,7 @@ export interface MemberWillingness {
 
 export function makeMemberWillingness(
 	profile: DeviceProfile,
-	opts: MemberWillinessOptions = {}
+	opts: MemberWillingnessOptions = {}
 ): MemberWillingness {
 	const overrides = [true, true, true, true];
 	if (opts.overrides) {

@@ -132,12 +132,21 @@ describe('TopicTree — topic traffic signal', () => {
 
 		expect(state.traffic.arrivalsPerMin).to.equal(30);
 		expect(state.traffic.queriesPerMin).to.equal(12);
-		expect(state.traffic.participants).to.equal(30);
+		expect(state.traffic.directParticipants).to.equal(30);
 
 		const surfaced = tree.trafficSignal(state);
 		expect(surfaced.windowSeconds).to.equal(60);
 		expect(surfaced.directParticipants).to.equal(30);
 		expect(sink.countOf('TopicTraffic')).to.be.greaterThan(0);
+
+		// The reply surface reads the gossiped snapshot, never live counters: a mid-round arrival
+		// is invisible to trafficSignal until the next gossip round publishes it (one-round lag on
+		// the stock count, not just the rate fields).
+		tree.attach(state, gossip);
+		expect(state.directParticipants, 'live count moves immediately').to.equal(31);
+		expect(tree.trafficSignal(state).directParticipants, 'reply still lags one round').to.equal(30);
+		world.scheduler.run(gossip * 2);
+		expect(tree.trafficSignal(state).directParticipants, 'next round publishes the new stock').to.equal(31);
 	});
 });
 

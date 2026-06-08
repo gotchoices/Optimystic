@@ -33,7 +33,9 @@ export interface TopicCohortState {
 	childCohortCount: number; // >0 blocks demotion
 	loadBucket: number[]; // per-tier 3-bit barometer, 0..7
 	willingness: number; // 4-bit vector, one bit per tier T0..T3
-	traffic: { arrivalsPerMin: number; queriesPerMin: number; participants: number };
+	// The member's last-gossiped per-topic view — the reply surface (`trafficSignal`) reads this
+	// snapshot, never the live counters, so every field lags raw state by at most one gossip round.
+	traffic: { arrivalsPerMin: number; queriesPerMin: number; directParticipants: number; childCohortCount: number };
 	lastGrowthSamples: GrowthSample[]; // for slope-based pre-promotion
 	// --- lifecycle bookkeeping (not part of the wire model) ---
 	promotedAt: VTime | undefined; // when this cohort last entered promoted mode
@@ -128,7 +130,7 @@ export class TopicTree {
 			childCohortCount: 0,
 			loadBucket: new Array(TIER_COUNT).fill(0),
 			willingness: (1 << TIER_COUNT) - 1, // all tiers willing until load sheds them
-			traffic: { arrivalsPerMin: 0, queriesPerMin: 0, participants: 0 },
+			traffic: { arrivalsPerMin: 0, queriesPerMin: 0, directParticipants: 0, childCohortCount: 0 },
 			lastGrowthSamples: [],
 			promotedAt: undefined,
 			lowLoadSince: undefined,
@@ -328,10 +330,13 @@ export class TopicTree {
 	}
 
 	/**
-	 * Roll the traffic window: convert raw counters to per-minute rates, publish them as the
-	 * member's gossiped view (`state.traffic`), reset the window, and emit `TopicTraffic`. The
-	 * reply path reads `state.traffic`, so it lags raw counters by at most one gossip round —
-	 * exactly the staleness cohort-topic.md §Topic traffic signal describes.
+	 * Roll the traffic window: convert raw counters to per-minute rates, snapshot the stock
+	 * (`directParticipants`, `childCohortCount`) alongside them as the member's gossiped view
+	 * (`state.traffic`), reset the window, and emit `TopicTraffic`. The reply path reads
+	 * `state.traffic` exclusively — never the live counters — so the whole `TopicTrafficV1`
+	 * surface lags raw state by at most one gossip round, exactly the staleness
+	 * cohort-topic.md §Topic traffic signal describes ("does not recompute from raw counters at
+	 * reply time").
 	 */
 	refreshTraffic(state: TopicCohortState, now: VTime): void {
 		const elapsed = Math.max(1, now - state.windowStart);
@@ -339,7 +344,8 @@ export class TopicTree {
 		state.traffic = {
 			arrivalsPerMin: perMin(state.arrivalsInWindow),
 			queriesPerMin: perMin(state.queriesInWindow),
-			participants: state.directParticipants
+			directParticipants: state.directParticipants,
+			childCohortCount: state.childCohortCount
 		};
 		state.arrivalsInWindow = 0;
 		state.queriesInWindow = 0;
@@ -377,14 +383,18 @@ export class TopicTree {
 		}
 	}
 
-	/** The full `TopicTrafficV1` signal surfaced on a reply, from the last gossiped view. */
+	/**
+	 * The full `TopicTrafficV1` signal surfaced on a reply, read entirely from the last gossiped
+	 * view (`state.traffic`). Every field — including the stock counts — therefore lags the live
+	 * state by at most one gossip round; the responder never recomputes from raw counters here.
+	 */
 	trafficSignal(state: TopicCohortState): TopicTrafficV1 {
 		return {
 			windowSeconds: this.cfg.trafficWindowMs / 1000,
 			arrivalsPerMin: state.traffic.arrivalsPerMin,
 			queriesPerMin: state.traffic.queriesPerMin,
-			directParticipants: state.directParticipants,
-			childCohortCount: state.childCohortCount
+			directParticipants: state.traffic.directParticipants,
+			childCohortCount: state.traffic.childCohortCount
 		};
 	}
 

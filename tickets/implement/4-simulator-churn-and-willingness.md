@@ -34,6 +34,21 @@ interface ChurnConfig {
 
 GROUNDING-resolved behaviours to model: backup failover refreshes the `cohortEpoch` hint on the **next ping** (not eagerly); previous primary serves until the new primary acks.
 
+### Demotion cascade / tree collapse (carried over from `simulator-cohort-topic-tree` review)
+
+The tree ticket models promotion-driven *growth* and the demotion *gate* (`childCohortCount == 0`
+blocks demotion), but `TopicTree.demote()` only clears the cohort's own `promoted` flag — it does
+**not** decrement its parent's `childCohortCount`, and there is no stored parent link to do so. As a
+result a multi-tier tree can grow but never collapse: once a child demotes it leaves its parent
+pinned forever. The simplified `register` driver increments `parent.childCohortCount` on child
+creation but nothing ever decrements it. This ticket — which drives departures (TTL eviction →
+`directParticipants` drop → demotion) and must show the tree shrinking back under falling load —
+owns closing that loop: model the `DemotionNoticeV1` → parent "drop me from your tier-(d+1)
+children" path (cohort-topic.md §Demotion), including a stored parent reference on each cohort
+state and correct increment/decrement symmetry across re-promotion after demotion. Add a *Done
+when* test that a deep tree built by load **collapses to the root** once load drains, with
+`childCohortCount` returning to 0 at every tier.
+
 ## Partition heal
 
 A network partition splits a cohort into two disjoint memberships; on heal they merge. Model deterministic primary re-assignment via `hash(participantId ‖ cohortEpoch) mod k` so both sides converge to the same assignment in ~one gossip round. Measure heal latency and whether subscribers repoint within `ttl/3`.

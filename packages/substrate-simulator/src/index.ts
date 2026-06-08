@@ -52,7 +52,7 @@ export {
 	TIER_COUNT,
 	type DeviceProfile,
 	type MemberWillingness,
-	type MemberWillinessOptions,
+	type MemberWillingnessOptions,
 	type AdmissionResult,
 	type AdmissionVerdict,
 	DEFAULT_OVERLOAD_BUCKET,
