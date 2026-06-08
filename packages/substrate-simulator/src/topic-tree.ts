@@ -518,6 +518,30 @@ export class TopicTree {
 		return d;
 	}
 
+	/**
+	 * Land a participant at tier `d` of its coordinate `ladder` — the participant-walk engine's
+	 * terminal step (`simulator-participant-walk`). Unlike `register` (which discovers the landing
+	 * tier itself by walking root-outward), the walk has *already* discovered `d` by walking
+	 * `d_max`→root and following `Promoted` redirects, so this only commits the landing: instantiate
+	 * the cohort if cold (a `Promoted` follow-on or cold-root bootstrap), link it under its
+	 * tier-(d−1) parent (idempotent — a no-op for the root and for an already-linked cohort), and
+	 * attach. Returns the landed cohort state. Keeps `linkToParent` private while giving the walk the
+	 * exact same instantiation+link+attach semantics `register` uses, so both drivers grow an
+	 * identical tree shape.
+	 */
+	attachAt(topicId: string, ladder: readonly RingCoord[], d: number, now: VTime): TopicCohortState {
+		if (d < 0 || d >= ladder.length) {
+			throw new RangeError(`landing tier ${d} out of ladder range [0, ${ladder.length - 1}]`);
+		}
+		const coord = bytesToHex(ladder[d]!);
+		const state = this.ensure(topicId, coord, d, now);
+		if (d > 0) {
+			this.linkToParent(state, bytesToHex(ladder[d - 1]!));
+		}
+		this.attach(state, now);
+		return state;
+	}
+
 	/** Deepest tier currently holding participants — the observed steady-state tree depth. */
 	maxOccupiedTier(topicId: string): number {
 		let max = 0;

@@ -118,3 +118,23 @@ export {
 	type ChurnGeneratorOptions,
 	ChurnGenerator
 } from './churn.js';
+export {
+	type WalkReply,
+	type WalkProbe,
+	type WalkTrace,
+	type WalkAdmission,
+	type ParticipantWalkOptions,
+	ParticipantWalk,
+	rejoinStagger,
+	rateLimitedStagger
+} from './walk.js';
+export {
+	distinctStartCoords,
+	acceptedPerSecond,
+	peakAcceptedPerSecond,
+	peakAcceptedInWindow,
+	acceptedAtTier,
+	hopPercentile,
+	outwardMovesArePromoted,
+	unwillingRetriesRestartAtDMax
+} from './walk-metrics.js';

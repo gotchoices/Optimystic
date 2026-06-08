@@ -32,6 +32,16 @@ Three layers ship here:
   back-off with ~1-heartbeat willingness-gossip staleness. The demotion path here closes the tree
   ticket's gap — a released cohort decrements its parent's `childCohortCount` over a stored parent
   link, so a deep tree built by load collapses back to the root as load drains.
+- **The participant walk + anti-flood instrumentation** (`walk.ts`, `walk-metrics.ts`) — the full
+  `d_max`→root lookup the tree's simplified `register` driver deferred: each `ParticipantWalk`
+  probes one tier coordinate per scheduled RPC hop, walking inward on `NoState`, outward only on a
+  `Promoted` redirect (single-direction), retrying a sibling on `UnwillingMember`, backing off and
+  **restarting at `d_max`** on `UnwillingCohort`, and cold-bootstrapping the root at `d < 0`. Every
+  walk yields a `WalkTrace` (hops, latency, distinct start coord, redirect/back-off counts, per-probe
+  reply log) that the `walk-metrics` readouts aggregate to quantitatively validate the five
+  `docs/cohort-topic.md` §Anti-flood claims (fan-out, re-registration jitter bound, no speculative
+  outward probe, inward-retry restart, promotion-flap cap) and to characterize lookup cost as
+  `O(log_F N)`.
 
 Mock-only: it is **not** shipped to runtime consumers and depends on **no** `@optimystic/*` or
 `db-p2p` code. It depends on **`p2p-fret`** (via a `portal:` path ref to the sibling FRET repo)

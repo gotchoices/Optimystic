@@ -431,6 +431,29 @@ A claim of "anti-flood by construction" is only meaningful if we can name the fl
 4. **Inward retry storm.** A participant receiving `UnwillingCohort` waits `retryAfter` (cohort-controlled) before any retry, and retries from `d_max`, not from the same coord. This decorrelates retry traffic across the ring.
 5. **Promotion feedback loop.** A cohort that has just promoted continues to receive registrations from participants in flight. Those participants are bounced with `Promoted(d+1)` — cheap, single-RPC. The cohort's promotion state is sticky for at least `T_promote_sticky` (default 60s) to avoid flapping back to accepting under transient drops.
 
+> **Simulator validation.** The design simulator (`packages/substrate-simulator`, `walk.ts` +
+> `walk-metrics.ts`) models the `d_max`→root participant walk as scheduled per-hop RPC events and
+> instruments all five claims directly; each is quantitatively validated:
+> 1. **Cold-start storm avoidance** — in a sparse-regime burst (large `d_max`, `N ≪ cap_promote`)
+>    the walks start at **distinct `coord_{d_max}`** (distinct-start count ≈ participant count) and
+>    fan across the ring, all draining to the root and attaching there.
+> 2. **Re-registration storm bound** — re-registrations spread over `T_rejoin_jitter`
+>    (`rateLimitedStagger`/`rejoinStagger`) cap the recovering cohort's inbound at
+>    `cap_promote / T_rejoin_jitter` (peak accepted/sec within the bound; ≤ `cap_promote` per
+>    jitter window), where an unstaggered burst spikes the whole set into one second.
+> 3. **No speculative outward probe** — every outward move in a walk's probe log is preceded by a
+>    `Promoted` reply; no walk ever probes a deeper tier on a guess (`outwardMovesArePromoted`).
+> 4. **Inward retry restarts at `d_max`** — every post-`UnwillingCohort` retry restarts at `d_max`,
+>    never re-hitting the declined coord (`unwillingRetriesRestartAtDMax`).
+> 5. **Promotion-flap prevention** — under a synchronized burst the bursting cohort accepts at most
+>    `cap_promote` then promotes (sticky window holds it promoted), bouncing the overflow outward
+>    with single-RPC `Promoted` redirects; no participant is starved.
+>
+> Lookup cost is also characterized: the hot regime resolves in 1 RPC (p50/p95 hops 1–2 without
+> touching the root), while the cold worst case is `d_max + 2` hops (probe every tier inward, then
+> bootstrap) — i.e. `O(log_F N)`. Measured rate/hop figures land in
+> `fold-simulator-findings-into-design-docs`.
+
 ---
 
 ## Anti-DoS
