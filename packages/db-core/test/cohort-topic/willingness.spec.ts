@@ -10,6 +10,7 @@ import {
 	selfWillingnessBits,
 	tierBit,
 	packWillingnessBits,
+	willingnessBitsHex,
 	backoffRetryMs,
 	DEFAULT_BACKOFF_CONFIG,
 	defaultQuorum,
@@ -65,6 +66,28 @@ describe('cohort-topic / barometer', () => {
 		expect(utilizationBucket(4.0)).to.equal(7); // clamps at the top
 	});
 
+	it('treats NaN as idle and saturates Infinity to the top bucket', () => {
+		expect(utilizationBucket(Number.NaN), 'NaN → idle, never NaN').to.equal(0);
+		expect(utilizationBucket(Number.POSITIVE_INFINITY), 'Infinity → at/over capacity').to.equal(7);
+	});
+
+	it('rejects an out-of-range overloadBucket at construction', () => {
+		expect(() => createLoadBarometer({ overloadBucket: 0 })).to.throw(RangeError);
+		expect(() => createLoadBarometer({ overloadBucket: 8 })).to.throw(RangeError);
+		expect(() => createLoadBarometer({ overloadBucket: 3.5 })).to.throw(RangeError);
+	});
+
+	it('reading / loadBuckets expose the per-tier buckets for the gossip frame', () => {
+		const b = createLoadBarometer();
+		b.observe(Tier.T0, 1.0); // bucket 7
+		b.observe(Tier.T3, 0.25); // bucket 5
+		expect(b.reading(Tier.T0)).to.deep.equal({ tier: Tier.T0, bucket: 7 });
+		expect(b.loadBuckets()).to.deep.equal([7, 0, 0, 5]);
+		// loadBuckets returns a copy — mutating it must not corrupt the barometer.
+		b.loadBuckets()[0] = 99;
+		expect(b.bucket(Tier.T0)).to.equal(7);
+	});
+
 	it('flips the willingness bit exactly at the bucket boundary (default overload = 6)', () => {
 		const b = createLoadBarometer();
 		expect(DEFAULT_OVERLOAD_BUCKET).to.equal(6);
@@ -93,6 +116,14 @@ describe('cohort-topic / barometer', () => {
 		// Edge serves T0+T1 only regardless of (idle) load.
 		const edge = selfWillingnessBits(edgeProfile(), createLoadBarometer());
 		expect(edge).to.equal(0b0011);
+	});
+
+	it('willingnessBitsHex emits a single nibble matching the wire form', () => {
+		expect(willingnessBitsHex(packWillingnessBits(() => true))).to.equal('f'); // 0b1111
+		expect(willingnessBitsHex(0b0011)).to.equal('3');
+		expect(willingnessBitsHex(0)).to.equal('0');
+		// Only the low nibble is wire-relevant; higher bits are masked off.
+		expect(willingnessBitsHex(0b11110101)).to.equal('5');
 	});
 });
 
@@ -184,6 +215,23 @@ describe('cohort-topic / willingness check', () => {
 		expect(defaultQuorum(16)).to.equal(9);
 		expect(defaultQuorum(4)).to.equal(3);
 	});
+
+	it('declines a registration whose tier is outside T0..T3 as unwilling_cohort', () => {
+		const view = createCohortView();
+		addSibling(view, bytesToB64url(peer('sib-x1')), 0b1111);
+		addSibling(view, bytesToB64url(peer('sib-x2')), 0b1111);
+		const out = createWillingnessCheck({
+			barometer: createLoadBarometer(),
+			view,
+			selfMember: bytesToB64url(peer('self')),
+			primaryTopicCount: () => 0,
+			attempts: () => 0,
+			config: cfg,
+		}).evaluate(reg(7), coreProfile(), 5_000); // tier 7 is not a serviceable op tier
+		expect(out.kind).to.equal('unwilling_cohort');
+		if (out.kind !== 'unwilling_cohort') throw new Error('unreachable');
+		expect(out.retryAfterMs).to.equal(backoffRetryMs(0));
+	});
 });
 
 describe('cohort-topic / back-off curve (no cascade)', () => {
@@ -217,6 +265,12 @@ describe('cohort-topic / back-off curve (no cascade)', () => {
 		expect(backoffRetryMs(0)).to.equal(1_000);
 		expect(backoffRetryMs(3)).to.equal(8_000);
 		expect(backoffRetryMs(20)).to.equal(60_000); // capped
+		expect(backoffRetryMs(1_000), 'huge attempt saturates at cap, no overflow').to.equal(60_000);
+	});
+
+	it('rejects a negative or non-integer attempt', () => {
+		expect(() => backoffRetryMs(-1)).to.throw(RangeError);
+		expect(() => backoffRetryMs(1.5)).to.throw(RangeError);
 	});
 
 	it('a synchronized burst sheds offered load instead of cascading (accepted/sec ≤ capacity)', () => {

@@ -327,7 +327,7 @@ TopicTrafficV1 {
 
 `arrivalsPerMin` deliberately combines fresh registrations and renewals into a single scalar: the seeker uses renewals as a proxy for active matchable supply, and the consumer-side formulas in [matchmaking.md §Hang-out vs. continue](matchmaking.md#hang-out-vs-continue) take the combined value. A separate split is not currently needed; if a future consumer wants fresh-only or renewal-only, the field can be split then.
 
-The rate is computed locally over the last `windowSeconds` and gossiped within the cohort as part of normal cohort-gossip (see §Cohort gossip below); the reply uses the responding member's own most-recent gossip-derived view — the same per-topic entry the member last gossiped — and so lags by at most one gossip round. The responder does not recompute from raw counters at reply time.
+Each member counts only the arrivals/queries that land on it (FRET routes each registration to one member; renewals go to the primary), so a member's own count is roughly `1/k` of the cohort's flow. The rate is therefore **cohort-wide aggregated**: the responder sums its own most-recent gossiped per-topic counts with the last-gossiped counts of its siblings (exact integers; `directParticipants` comes from the replicated store, not the sum). The reply uses this gossip-derived view — never a recompute from raw counters at reply time — and so lags by at most one gossip round.
 
 Wire-format note: traffic fields are sent as **exact integers**, not log-bucketed like the load barometer in §Capacity barometer. Cohort gossip is intra-cohort and tiny, and the consumer-side formulas are numeric — bucketing would buy nothing and complicate matchmaking math. The load barometer is bucketed because it is a coarse priority signal; the traffic counts feed real arithmetic.
 
@@ -344,7 +344,10 @@ A participant that receives `NoState` at tier `d` gets no traffic signal from th
 > `RegisterReplyV1.topicTraffic` wire comment). Implemented as `attachTopicTraffic` in
 > `packages/db-core/src/cohort-topic/traffic.ts`, with the windowed exact-integer counters,
 > combined fresh+renewal arrivals, gossip-derived snapshot (lags ≤ one round, no reply-time
-> recompute), and `cohortEpoch`-change reset alongside it.
+> recompute), and `cohortEpoch`-change reset alongside it. The snapshot **sums own + sibling**
+> gossiped per-topic counts (cohort-wide flow, since arrivals shard ~`1/k` across members);
+> `directParticipants` is read from the replicated store rather than summed, and `childCohortCount`
+> takes the max across siblings (or a promotion-layer override).
 
 ---
 

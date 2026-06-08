@@ -42,6 +42,25 @@ function addSiblingSummary(view: MutableCohortView, member: string, summary: Par
 }
 
 describe('cohort-topic / traffic counters', () => {
+	it('rejects a non-positive observation window', () => {
+		expect(() => createTrafficCounters({ view: createCohortView(), store: storeStub(0), selfMember: SELF, windowSeconds: 0 })).to.throw(RangeError);
+		expect(() => createTrafficCounters({ view: createCohortView(), store: storeStub(0), selfMember: SELF, windowSeconds: -1 })).to.throw(RangeError);
+	});
+
+	it('echoes a custom observation window in the snapshot', () => {
+		const tc = createTrafficCounters({ view: createCohortView(), store: storeStub(0), selfMember: SELF, windowSeconds: 30 });
+		expect(tc.snapshot(TOPIC).windowSeconds).to.equal(30);
+	});
+
+	it('reports zeros for a topic that was never observed', () => {
+		const tc = createTrafficCounters({ view: createCohortView(), store: storeStub(0), selfMember: SELF });
+		expect(tc.published(TOPIC)).to.deep.equal({ arrivals: 0, queries: 0 });
+		const snap = tc.snapshot(TOPIC);
+		expect(snap.arrivalsPerMin).to.equal(0);
+		expect(snap.queriesPerMin).to.equal(0);
+		expect(snap.childCohortCount).to.equal(0);
+	});
+
 	it('combines fresh registrations and renewals into one arrivals scalar', () => {
 		const tc = createTrafficCounters({ view: createCohortView(), store: storeStub(0), selfMember: SELF });
 		tc.recordArrival(TOPIC, 1_000); // fresh registration
