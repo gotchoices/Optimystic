@@ -474,7 +474,7 @@ export function measureRepeatedWakeThrash(opts: {
 		const trace = traceResume(
 			{
 				subscriber: opts.subscriber,
-				fromRevision: current - opts.lag + 1,
+				fromRevision: current - opts.lag,
 				currentRevision: current,
 				currentTailId: tailId,
 				latestKnownTailId: tailId
@@ -526,9 +526,12 @@ const ROTATION_TOPIC = 'reactivity-rotation';
  * tree's root never holds more than `cap_promote_fast` direct subscribers, and that the whole wave
  * lands inside `T_drain`, across subscriber populations.
  *
- * Reuses the modeled `TopicTree` with eager promotion: re-registration is exactly a cohort-topic
- * registration, so the same promotion machinery bounds the burst. Jittered arrival *times* are on the
- * virtual clock; the eager promotion decision makes the root cap deterministic regardless of order.
+ * Reuses the modeled `TopicTree` with eager promotion and slope lookahead disabled: re-registration
+ * is exactly a cohort-topic registration, so the same promotion machinery bounds the burst. Jittered
+ * arrival *times* are on the virtual clock; with lookahead off, the root promotes exactly when it hits
+ * `cap_promote_fast`, so the peak root count is deterministically that cap regardless of arrival order
+ * (a lagged-promotion variant à la `routeArrival` would instead expose overshoot past the cap — a
+ * separate enhancement, see the burst test notes).
  */
 export function simulateRotationBurst(opts: {
 	subscriberCount: number;
@@ -542,7 +545,17 @@ export function simulateRotationBurst(opts: {
 	}
 	const gossipRoundMs = opts.gossipRoundMs ?? 1000;
 	const F = DEFAULT_LIFECYCLE_CONFIG.F;
-	const lifecycle: LifecycleConfig = { ...DEFAULT_LIFECYCLE_CONFIG, capPromoteFast: config.capPromoteFast };
+	// Slope-based pre-promotion (`T_promote_lookahead`) is disabled for this burst: under the steep
+	// re-registration ramp it would fire after the second arrival and promote the root far below
+	// `cap_promote_fast`, so the hot-bucket fast-promote at 32 — the mechanism this burst exists to
+	// validate (reactivity.md §Failure modes: many subscribers, sudden interest spike) — would never be
+	// the binding trigger. With lookahead off, the root fills to exactly `cap_promote_fast` and promotes
+	// there, making the bound a real check rather than a vacuously-satisfied one.
+	const lifecycle: LifecycleConfig = {
+		...DEFAULT_LIFECYCLE_CONFIG,
+		capPromoteFast: config.capPromoteFast,
+		tPromoteLookaheadMs: 0
+	};
 	const world = createSimWorld({ seed: opts.seed ?? 1, gossipRoundMs });
 	const tree = new TopicTree({ scheduler: world.scheduler, gossipRoundMs, config: lifecycle });
 

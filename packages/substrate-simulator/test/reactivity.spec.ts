@@ -217,8 +217,12 @@ describe('reactivity — tail-rotation re-registration burst', () => {
 	it('the wave stays within cap_promote_fast at the new root, inside T_drain, across populations', () => {
 		for (const subscriberCount of [100, 1000, 10000]) {
 			const result = simulateRotationBurst({ subscriberCount });
-			expect(result.peakRootDirect, `root ≤ cap_promote_fast (n=${subscriberCount})`)
-				.to.be.at.most(C.capPromoteFast);
+			// A population past the cap must fill the root *to* cap_promote_fast and fast-promote there
+			// — exactly the cap, not merely ≤ it. Asserting equality guards against a regression where
+			// the root promotes far below the cap (e.g. slope lookahead re-enabled), which would leave
+			// the `≤ cap` bound vacuously satisfied and the fast-promote mechanism untested.
+			expect(result.peakRootDirect, `root fills to cap_promote_fast then promotes (n=${subscriberCount})`)
+				.to.equal(C.capPromoteFast);
 			expect(result.withinCapPromoteFast, `within fast-promote bound (n=${subscriberCount})`).to.equal(true);
 			expect(result.completedWithinDrain, `all re-registered inside T_drain (n=${subscriberCount})`).to.equal(true);
 			expect(result.lastArrivalAt, `jittered over ≤ T_rejoin_jitter (n=${subscriberCount})`)

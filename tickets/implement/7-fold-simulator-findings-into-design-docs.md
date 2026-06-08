@@ -59,6 +59,7 @@ The simulator produces structured metrics (JSON/CSV) plus a per-scenario pass/fa
 ### Phase 3 — Fold into reactivity.md
 - [ ] Resolve W vs W_checkpoint ratio and the adaptive-W question in §Configuration with evidence.
 - [ ] Update §Worked scenarios with measured RPC counts/latency (90 s / 20 min wake, tail-rotation burst).
+- [ ] **Reconcile the resume-lag bound inconsistency surfaced by the simulator review** (`simulator-reactivity-replay`). §Failure modes ("Subscriber wakes after long sleep") reads the checkpoint as an *absolute* lag bound (`< W` → Backfill, `< W_checkpoint` → CheckpointWindow, else OutOfWindow), but §Parent checkpoint summaries + the "20 min wake" worked scenario layer the checkpoint *below* the replay window (recoverable ≈ `W + W_checkpoint`, checkpoint covers `[ringLow − W_checkpoint, ringLow − 1]`). The simulator's `classifyResume` implements the single-bound §Failure-modes form (so its `RollingCheckpoint.covers` actually reaches one `W` deeper than `classifyResume` will classify as in-window). Pick one semantics, state it, and make §Failure modes / §Parent checkpoint / §Worked scenarios agree; if the layered form wins, note that the simulator's resume classifier should be retuned to `lag < W + W_checkpoint` in a follow-up.
 
 ### Phase 4 — Fold into matchmaking.md
 - [ ] Add validated formula traces and contention_factor_cap justification to §Hang-out vs. continue.
