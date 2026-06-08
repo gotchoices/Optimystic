@@ -835,7 +835,7 @@ interface MembershipCertV1 {
 | `ping_interval` | 30 s | Participant ping cadence (`ttl / 3`) |
 | `T_membership_refresh` | 5 min | Default refresh interval for membership certs |
 | `d_max_cap` | 60 | Hard cap on walk-toward-root start tier |
-| `confidence_min` | 0.3 | Below this `n_est` confidence, halve `d_max` |
+| `confidence_min` | 0.3 | Below this `n_est` confidence, clamp `d_max` to ⌊d_max_cap/2⌋ |
 | `topics_max` | 2048 | Max topics with forwarder state per cohort |
 | `backups_per_registration` | 2 | Warm-failover cohort members per registration |
 | `register_rate_per_peer` | 4 / min | Per-peer-per-topic rate limit at a single cohort |
