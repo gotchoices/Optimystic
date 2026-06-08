@@ -90,6 +90,29 @@ describe('cohort-topic / cold-start manager parent registration', () => {
 		expect(fwd.servesParentOps(), 'serving after parent ack').to.be.true;
 	});
 
+	it('keeps a forwarder holding parent-ops when parent registration fails (no auto-retry)', async () => {
+		// Gap-flagged behavior: a failed parent registration is logged, not swallowed silently, and the
+		// forwarder is left accepting participants but holding parent-involving ops so a host-driven
+		// retry can complete the link-up. It must NOT spuriously flip to serving.
+		const warnings: unknown[][] = [];
+		const realWarn = console.warn;
+		console.warn = (...args: unknown[]): void => { warnings.push(args); };
+		try {
+			const registrar: ParentRegistrar = {
+				registerWithParent: async () => { throw new Error('parent unreachable'); },
+			};
+			const mgr = createColdStartManager({ parentRegistrar: registrar });
+			const fwd = mgr.instantiate(TOPIC, 1, PARENT);
+			await new Promise<void>((r) => setTimeout(r, 0)); // flush the rejected registrar promise + .catch
+			expect(fwd.acceptsParticipants(), 'still accepts participants after a failed link-up').to.be.true;
+			expect(fwd.servesParentOps(), 'does NOT serve parent-ops on a failed registration').to.be.false;
+			expect(fwd.phase()).to.equal('awaiting_parent');
+			expect(warnings.length, 'the failure is surfaced via console.warn, not swallowed').to.equal(1);
+		} finally {
+			console.warn = realWarn;
+		}
+	});
+
 	it('requires a parentCoord for a deeper-than-root forwarder', () => {
 		const registrar: ParentRegistrar = { registerWithParent: async () => {} };
 		const mgr = createColdStartManager({ parentRegistrar: registrar });

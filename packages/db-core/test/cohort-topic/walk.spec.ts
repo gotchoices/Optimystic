@@ -234,4 +234,37 @@ describe('cohort-topic / walk-toward-root', () => {
 		const outcome = await engine.register(TOPIC, 1);
 		expect(outcome.kind).to.equal('retry_later');
 	});
+
+	it('maxSteps terminates a malformed tree that alternates NoState/Promoted at the same tier', async () => {
+		// Adversarial (ticket-named): a tree that bounces a walk between an inward NoState step and an
+		// outward Promoted redirect at the same tier would otherwise spin forever. The safety valve must
+		// cap the probe count and surface a temporal back-off rather than loop or run the router dry.
+		const self = bytes('oscillating-participant');
+		const promoted1: RegisterReplyV1 = { v: 1, result: 'promoted', targetTier: 1 };
+		// d=1 → no_state (→d=0); d=0 → promoted(1) (→d=1); repeat. With maxSteps=5 the engine probes 5
+		// times then backs off on the 6th iteration (no reply consumed), so 5 scripted replies suffice.
+		const router = new ScriptedRouter([noState, promoted1, noState, promoted1, noState]);
+		const engine = createWalkEngine({
+			router,
+			addressing,
+			dmax: fixedDMax(1),
+			self,
+			factory: factoryFor(self),
+			config: { maxSteps: 5 },
+		});
+		const outcome = await engine.register(TOPIC, 1);
+		expect(outcome.kind, 'pathological oscillation backs off, never loops').to.equal('retry_later');
+		expect(router.probes.length, 'capped at exactly maxSteps probes').to.equal(5);
+	});
+
+	it('defaults a Promoted redirect with no explicit targetTier to d+1', async () => {
+		const self = bytes('default-target-participant');
+		// d=1 → promoted (NO targetTier) → engine moves outward to d+1 = 2 → accepted.
+		const router = new ScriptedRouter([{ v: 1, result: 'promoted' }, accepted]);
+		const engine = createWalkEngine({ router, addressing, dmax: fixedDMax(1), self, factory: factoryFor(self) });
+		const outcome = await engine.register(TOPIC, 1);
+		expect(outcome.kind).to.equal('accepted');
+		expect(router.probes.map((x) => x.treeTier), 'redirect with no targetTier defaults to d+1').to.deep.equal([1, 2]);
+		expect(bytesEqual(router.probes[1]!.coord!, addressing.coord(2, self, TOPIC)), 'recomputes coord at tier d+1').to.be.true;
+	});
 });
