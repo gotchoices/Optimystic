@@ -465,6 +465,14 @@ In addition to the cohort-topic Edge overrides (TTL = 60 s, ping = 20 s, T2/T3 p
 
 ## Worked scenarios
 
+> **Simulator scenarios.** The tail-rotation scenario below is executed by the simulator's scenario
+> runner (`packages/substrate-simulator`, `scenarios.ts` → `TailRotationScenario`, on top of
+> `reactivity.ts`'s `simulateRotationBurst` + `CohortPushState`): it validates the re-registration
+> wave stays within `cap_promote_fast` at the new tail, completes inside `T_drain`, and that the
+> monotonic revision stream stays gap-free. The parameter-sensitivity sweep (`sweep.ts`) quantifies
+> the `W` / `W_checkpoint` recovery-coverage tradeoff. Measured numbers are folded in by
+> `fold-simulator-findings-into-design-docs`.
+
 ### Cold collection becomes popular
 
 `t = 0`: collection `C` has 0 subscribers, tail block `T_0`.

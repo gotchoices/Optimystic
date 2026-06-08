@@ -208,3 +208,47 @@ export {
 	measureRepeatedWakeThrash,
 	simulateRotationBurst
 } from './reactivity.js';
+export {
+	type TagValue,
+	type Tags,
+	type HistogramStats,
+	type TimelinePoint,
+	type CdfPoint,
+	type MetricsSink,
+	Metrics,
+	summarize,
+	serializeTags
+} from './metrics.js';
+export {
+	type SimWorld,
+	type Claim,
+	type ClaimReport,
+	type Scenario,
+	type ScenarioFactory,
+	type ColdStartOptions,
+	type ChurnRecoveryOptions,
+	type TailRotationOptions,
+	type VotingQuorumOptions,
+	type AdversarialOptions,
+	ColdStartStormScenario,
+	ChurnRecoveryScenario,
+	TailRotationScenario,
+	VotingQuorumScenario,
+	AdversarialReportingScenario,
+	SCENARIO_FACTORIES,
+	runScenario,
+	runAllScenarios,
+	allClaimsPass
+} from './scenarios.js';
+export {
+	type ScaleSweepOptions,
+	type ScaleSample,
+	type ScaleSweepResult,
+	type SweepParameter,
+	type SensitivitySample,
+	type SensitivitySweepResult,
+	type SensitivitySweepOptions,
+	runScaleSweep,
+	runSensitivitySweep,
+	samplesFor
+} from './sweep.js';

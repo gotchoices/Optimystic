@@ -467,6 +467,16 @@ A claim of "anti-flood by construction" is only meaningful if we can name the fl
 > bootstrap) — i.e. `O(log_F N)`. Measured rate/hop figures land in
 > `fold-simulator-findings-into-design-docs`.
 
+> **Simulator scenarios.** The end-to-end claims above are also exercised by the simulator's
+> scenario runner (`packages/substrate-simulator`, `scenarios.ts`) — the **cold-start storm**
+> (root stays ≤ `cap_promote`, walks fan, promotion fires, lookup is `O(log N)`), the
+> **voting-quorum hot-proposal** herd (tree absorbs the flash registration at depth
+> `⌈log_F(N/cap_promote)⌉` with the root never overloaded), and **churn recovery** (20% member
+> turnover fails over with no lost registrations and heals to convergence). Each emits a pass/fail
+> `ClaimReport`; the N-scale + parameter-sensitivity sweep (`sweep.ts`) confirms the depth law and
+> quantifies each parameter's effect. The measured numbers are folded into this doc by
+> `fold-simulator-findings-into-design-docs`.
+
 ---
 
 ## Anti-DoS

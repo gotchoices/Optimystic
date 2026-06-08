@@ -592,6 +592,14 @@ The cohort-topic tier for matchmaking is **T2 (functional)**; matchmaking regist
 
 ## Worked scenarios
 
+> **Simulator scenarios.** The adversarial-traffic-reporting case (§Adversarial traffic reporting) is
+> executed by the simulator's scenario runner (`packages/substrate-simulator`, `scenarios.ts` →
+> `AdversarialReportingScenario`, on top of `seeker-walk.ts`): it validates bounded harm — a lying
+> primary that under-reports costs ≤ one extra escalation hop per under-reported tier, and one that
+> over-reports wastes ≤ `patienceMs` of hang-out drain. The parameter-sensitivity sweep (`sweep.ts`)
+> quantifies the `contention_factor_cap` effect on the hang-out threshold. Measured numbers are folded
+> in by `fold-simulator-findings-into-design-docs`.
+
 ### Capability lookup in a sparse network
 
 A node needs a peer that holds the `geocode-resolver` capability. Network has 5 000 peers, ~30 of which offer this capability.
