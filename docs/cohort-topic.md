@@ -246,6 +246,14 @@ When a registration arrives at a cohort, FRET's `RouteAndMaybeAct` lands it on o
 
 The cohort gossips a coarse "willingness vector" (one bit per tier per member, refreshed every gossip round) so any member can answer `UnwillingMember` vs `UnwillingCohort` without polling siblings. Stale gossip is acceptable; over-reporting unwillingness costs a temporal retry, not a flood.
 
+> **Resolved (decided).** Willingness stays at **1 bit per tier** — no finer T3 gradations (e.g.
+> subscriber-count buckets). The capacity barometer's 3-bit load bucket already supplies coarse
+> load, and finer willingness gradations buy little against the gossip cost. The gossiped bit is
+> `profile-serves-tier ∧ load-bucket < bucket_overload`; the per-tier primary-topic **budget** is a
+> finer gate applied *live* at the routed member, not folded into the gossiped bit. The reactivity
+> Edge/Core policy ticket may revisit if the simulator/e2e shows need. Implemented in
+> `packages/db-core/src/cohort-topic/willingness.ts` (`selfWillingnessBits`, `createWillingnessCheck`).
+
 > **Simulator validation.** The design simulator (`packages/substrate-simulator`, `backoff.ts` +
 > `willingness.ts`) drives per-member willingness under churn-induced load and validates two
 > behaviours this section relies on: (a) the **exponential `UnwillingCohort` back-off curve**
@@ -293,6 +301,14 @@ The barometer feeds two decisions:
 
 The barometer is not aggregated across the tree. A parent cohort doesn't know its children's load and doesn't need to — children promote independently.
 
+> **Implementation.** `packages/db-core/src/cohort-topic/load/barometer.ts` log-buckets utilization
+> as `bucket = clamp(7 + ⌊log₂(load/capacity)⌋, 0, 7)`, so each bucket spans a doubling and bucket 7
+> is at/over capacity. The willingness-flip and early-promote thresholds are the **same** bucket —
+> `bucket_overload = 6` (utilization ≥ ½ capacity), matching §Configuration and the
+> simulator-validated `DEFAULT_OVERLOAD_BUCKET`. Crossing it both flips the member's load-driven
+> willingness bit off (`loadWilling` → false) and raises the `isOverloaded` early-promote signal the
+> promotion ticket consumes.
+
 ---
 
 ## Topic traffic signal
@@ -322,6 +338,13 @@ Per-topic counters reset to zero on `cohortEpoch` change (see §Primary and back
 This layer does not interpret the signal. The reactivity application ignores it (subscribers always want the tail). The matchmaking application uses it for the seeker's hang-out decision; see [matchmaking.md §Hang-out vs. continue](matchmaking.md#hang-out-vs-continue). Future applications may use it however they like.
 
 A participant that receives `NoState` at tier `d` gets no traffic signal from that cohort (it has none for this topic); the participant simply continues toward the root. A participant that receives `Promoted(d+1)` gets the outgoing cohort's traffic signal anyway, which lets it estimate whether the tier it's redirected to is likely to be hot.
+
+> **Resolved (decided).** The traffic signal is returned **only** on `accepted` and `promoted`
+> replies; it is absent on `no_state`, `unwilling_member`, and `unwilling_cohort` (matches the
+> `RegisterReplyV1.topicTraffic` wire comment). Implemented as `attachTopicTraffic` in
+> `packages/db-core/src/cohort-topic/traffic.ts`, with the windowed exact-integer counters,
+> combined fresh+renewal arrivals, gossip-derived snapshot (lags ≤ one round, no reply-time
+> recompute), and `cohortEpoch`-change reset alongside it.
 
 ---
 
