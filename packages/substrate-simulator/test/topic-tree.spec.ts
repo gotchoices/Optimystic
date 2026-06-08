@@ -244,3 +244,74 @@ describe('TopicTree — demotion cascade collapses a deep tree to the root', () 
 		expect(tree.all().map((s) => s.childCohortCount)).to.deep.equal(originalChildCounts);
 	});
 });
+
+describe('TopicTree — demotion cascade collapses a fan-out (multi-child) parent', () => {
+	const FANOUT_TOPIC = 'fanout-topic';
+
+	/**
+	 * A two-tier ladder whose root coord is identical across branches but whose tier-1 coord differs
+	 * per `branch` — so a promoted root forwards every branch's load to a *distinct* tier-1 child.
+	 * The single-branch collapse test exercises a linear chain (one child per tier); this exercises
+	 * the orthogonal case the unlink logic must also satisfy: one parent counting several children,
+	 * each of which must release before the parent can.
+	 */
+	function branchLadder(branch: number): Uint8Array[] {
+		const root = new Uint8Array(32);
+		root[0] = 0;
+		root[1] = 0xcd; // shared root marker — same coord for every branch
+		const child = new Uint8Array(32);
+		child[0] = 1;
+		child[1] = 0xcd;
+		child[2] = branch; // tier-1 coord diverges per branch
+		return [root, child];
+	}
+
+	it('a parent pinned by N sibling children only demotes once every child has released', () => {
+		const cfg = DEFAULT_LIFECYCLE_CONFIG;
+		const world = createSimWorld({ seed: SEED, gossipRoundMs: 1000 });
+		const sink = new CollectingEventSink();
+		const tree = new TopicTree({ scheduler: world.scheduler, gossipRoundMs: 1000, sink });
+
+		// Promote the root (cap_promote participants all land at tier 0), then grow `branches`
+		// sibling tier-1 leaves under it — each a forwarder linked into the root's child count.
+		const branches = 3;
+		for (let i = 0; i < cfg.capPromote; i++) {
+			tree.register(FANOUT_TOPIC, branchLadder(0), 0);
+		}
+		for (let b = 0; b < branches; b++) {
+			for (let i = 0; i < 5; i++) {
+				tree.register(FANOUT_TOPIC, branchLadder(b), 0);
+			}
+		}
+
+		const root = tree.get(FANOUT_TOPIC, bytesToHex(branchLadder(0)[0]!))!;
+		expect(root, 'root cohort exists').to.not.equal(undefined);
+		expect(root.promoted, 'root promoted').to.equal(true);
+		expect(root.childCohortCount, 'root pins all branches').to.equal(branches);
+		expect(tree.all(), 'root + one leaf per branch').to.have.lengthOf(branches + 1);
+		// Every tier-1 child is an unpromoted-but-linked forwarder (a leaf, below cap_promote).
+		for (const s of tree.all()) {
+			if (s.tier === 1) {
+				expect(s.promoted, 'leaf unpromoted').to.equal(false);
+				expect(s.linkedToParent, 'leaf linked').to.equal(true);
+			}
+		}
+
+		// Drain everything; the children release on the first eligible tick (decrementing the root
+		// to zero across one tick), and only then — the following tick — does the root demote.
+		for (const s of tree.all()) {
+			tree.setParticipants(s, 0, 0);
+		}
+		tree.startGossip();
+		world.scheduler.run(cfg.tPromoteStickyMs + cfg.tDemoteMs + 4000);
+
+		expect(root.promoted, 'root demoted after all children released').to.equal(false);
+		expect(root.childCohortCount, 'root child count cleared').to.equal(0);
+		for (const s of tree.all()) {
+			expect(s.linkedToParent, `tier ${s.tier} unlinked`).to.equal(false);
+		}
+		// One Demoted per cohort: every branch leaf plus the root.
+		expect(sink.countOf('Demoted')).to.equal(branches + 1);
+		expect(tree.maxOccupiedTier(FANOUT_TOPIC)).to.equal(0);
+	});
+});
