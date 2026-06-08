@@ -647,6 +647,16 @@ The layer uses FRET's two-sided cohort assembly without modification: alternatin
 
 All messages are JSON, length-prefixed UTF-8, with byte fields encoded as base64url.
 
+> **Canonical codec.** The implementation lives in
+> [`packages/db-core/src/cohort-topic/wire`](../packages/db-core/src/cohort-topic/wire) — the
+> single source of truth for these shapes and their serialization. Framing is a **4-byte
+> big-endian unsigned length prefix** over the UTF-8 JSON body (so a frame is self-delimiting on a
+> stream), and a frame whose declared body length exceeds `max_message_bytes` (default 1 MiB,
+> pending an exact bound derived from `topics_max` × the cohort-gossip per-summary size) is
+> rejected before allocation. Byte fields are base64url **without padding**. Decode validates
+> structure per message type and throws a typed `CohortWireError` on any malformed or oversized
+> frame.
+
 ### Register
 
 ```

@@ -1,0 +1,13 @@
+export * from "./types.js";
+export * from "./codec.js";
+export { CohortWireError } from "./validate.js";
+export {
+	validateRegisterV1,
+	validateRegisterReplyV1,
+	validateRenewV1,
+	validateRenewReplyV1,
+	validatePromotionNoticeV1,
+	validateDemotionNoticeV1,
+	validateCohortGossipV1,
+	validateMembershipCertV1,
+} from "./validate.js";
