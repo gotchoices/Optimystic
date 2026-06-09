@@ -40,10 +40,12 @@
  * its tier-`(d − 1)` parent by routing a forwarder-link frame over the router (gap 7), staying
  * `awaiting_parent` until the ack.
  *
- * **Scope (mock-tier e2e pending).** `followOn` derivation for a promoted-redirect arrival is parked in
- * backlog (`cohort-topic-followon-derivation`); this milestone serves a **single tier-0 cohort**, so
- * `followOn` stays `false` and tier-0 bootstrap instantiation goes through the `bootstrap: true` path.
- * The behavioral substrate is validated at mock-tier by `test/cohort-topic/service.spec.ts`.
+ * **Scope.** `followOn` derivation for a promoted-redirect arrival is parked in backlog
+ * (`cohort-topic-followon-derivation`); this milestone serves a **single tier-0 cohort**, so `followOn`
+ * stays `false` and tier-0 bootstrap instantiation goes through the `bootstrap: true` path. The
+ * behavioral substrate is validated at mock-tier by `test/cohort-topic/service.spec.ts` and end-to-end
+ * across a real multi-node cohort (real Ed25519 keys, mock transport routing the five protocols + FRET
+ * `routeAct`/`assembleCohort`) by `test/cohort-topic/live-tier.spec.ts`.
  */
 
 import type { Libp2p } from "libp2p";
@@ -112,6 +114,7 @@ import {
 	type MembershipVerifier,
 	type NodeProfile,
 	type ParticipantSigner,
+	type PromotionConfig,
 	type PromotionNoticeV1,
 	type RegisterRateLimiterConfig,
 	type RegisterReplyV1,
@@ -179,6 +182,14 @@ export interface CohortTopicHostOptions {
 	 * defaults; this lets a caller (or a test) tune them. Omit for production defaults.
 	 */
 	readonly antiDos?: CohortTopicAntiDosOptions;
+	/**
+	 * Promotion / demotion lifecycle tuning (`cap_promote`, hysteresis windows, slope lookahead) applied
+	 * to every {@link CoordEngine}'s {@link PromotionLifecycle}. Omit for the production defaults
+	 * (`cap_promote = 64`, …); supply a lowered `capPromote` to drive promotion with a small participant
+	 * count (the live-tier e2e). The single-cohort milestone never overrides `childCohortCount` / `treeTier`
+	 * — those stay coord-derived — so only the count/load thresholds are tunable here.
+	 */
+	readonly promotion?: PromotionConfig;
 }
 
 /** The slice of a peer-reputation service the default bootstrap-evidence verifiers consult. */
@@ -347,6 +358,8 @@ interface CoordEngineContext {
 	};
 	/** Node-level bootstrap-evidence policy, shared by every engine (no per-coord state). */
 	readonly bootstrapEvidence: BootstrapEvidence;
+	/** Promotion-lifecycle config applied to every engine (test seam for a lowered `cap_promote`). */
+	readonly promotionConfig?: PromotionConfig;
 	/** Dial a cohort member's `/sign` RPC (the threshold-assembly collection seam). */
 	readonly dialSign: (peerIdStr: string, request: SignRequestV1) => Promise<SignReplyV1>;
 	/** FRET two-sided assembly around `coord`, self prepended + deduped, with a deterministic epoch. */
@@ -519,6 +532,7 @@ export async function createCohortTopicHost(node: Libp2p, fret: FretService, opt
 			topicBudget: options.antiDos?.topicBudget,
 		},
 		bootstrapEvidence,
+		promotionConfig: options.promotion,
 		dialSign,
 		cohortAround,
 		verifyRegisterSig,
@@ -943,7 +957,10 @@ function createCoordEngine(ctx: CoordEngineContext, servedCoord: RingCoord, tree
 		parentCoord: (topicId: Uint8Array): Uint8Array => ctx.addressing.coord(Math.max(0, treeTier - 1), participantCoord, topicId),
 		cohortEpoch: localEpoch,
 		signer: noticeSigner,
-		config: { capPromote: undefined },
+		// Production defaults (cap_promote = 64, …) unless the host was given a promotion override — the
+		// live-tier e2e lowers `capPromote` to drive promotion with a small participant count. The
+		// coord-derived inputs above (treeTier / childCohortCount / parentCoord) are never overridden.
+		config: ctx.promotionConfig ?? { capPromote: undefined },
 	});
 	// Cold-start forwarder → parent registration (gap 7). A freshly-instantiated tier-`d > 0` forwarder
 	// registers with its tier-`(d − 1)` parent cohort at `parentCoord` so the parent counts it as a child;

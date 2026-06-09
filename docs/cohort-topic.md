@@ -853,6 +853,31 @@ Post-registration traffic (pings, application-specific RPCs) dials the cached `p
 
 The layer uses FRET's two-sided cohort assembly without modification: alternating successor/predecessor walk, automatic adaptation when `n < k`, threshold signatures via `minSigs = k − x`. The cohort at any given `coord_d` is whichever set of `k` peers FRET names.
 
+### Validation
+
+The substrate is validated at two tiers. The participant ↔ cohort composition is unit-tested with a
+mock transport in [`packages/db-p2p/test/cohort-topic/service.spec.ts`](../packages/db-p2p/test/cohort-topic/service.spec.ts)
+(register / renew / withdraw / lookup / promote, plus per-coord scoping with a FRET fake that returns a
+different set per coordinate). On top of that, an **end-to-end milestone** stands up an `N ≥ minSigs`
+in-process multi-node cohort over **real Ed25519 keys** and a mock transport that routes the five
+cohort-topic protocols plus FRET `routeAct`/`assembleCohort` between the node engines —
+[`packages/db-p2p/test/cohort-topic/live-tier.spec.ts`](../packages/db-p2p/test/cohort-topic/live-tier.spec.ts).
+It proves the prereq machinery composes: a real per-coord cohort (`assembleCohort(coord_0(topic))` =
+all N nodes, computed identically everywhere), registration through the walk, a genuine collected `k − x`
+threshold-signed `MembershipCertV1` a participant verifier accepts (with a forged single-signer cert
+rejected), promotion end-to-end (the cohort threshold-signs + broadcasts a `PromotionNoticeV1`, a
+non-originating node verify-applies it, and a later walk gets `Promoted(1)` and terminates within
+`maxSteps`), gossip record replication + eviction convergence, and the sub-quorum negative case (no
+single-signer fallback when a member is unreachable). The production `minSigs = 14` path is the same
+code, just larger.
+
+**Still deferred (parked in backlog, honestly out of scope for this milestone):** multi-tier
+promoted-redirect *follow-on* instantiation (`cohort-topic-followon-derivation`) and the parent-side
+child-cohort link recording (`cohort-topic-parent-child-link`); a dedicated read-only **lookup-probe**
+RPC (today `lookup` shares the registration walk and leaves TTL-expiring soft state); an immediate
+**withdraw tombstone** (today `withdraw` stops renewing and lets the soft state TTL-expire); and the
+real-libp2p (socket) e2e tier.
+
 ---
 
 ## Wire formats
