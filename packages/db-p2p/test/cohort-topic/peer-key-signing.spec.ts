@@ -11,6 +11,9 @@ import {
 	bytesToB64url,
 	b64urlToBytes,
 	bytesEqual,
+	encodeCohortMessage,
+	decodeCohortMessage,
+	validateRegisterV1,
 	registerSigningPayload,
 	renewSigningPayload,
 	type RegisterV1,
@@ -192,5 +195,47 @@ describe('cohort-topic: reattach forgery rejection (renewal cohort side)', () =>
 		const valid: RenewV1 = { ...renewBody, signature: bytesToB64url(validSig) };
 		expect(renewal.onRenew(valid, 2_000).result, 'a correctly-signed reattach promotes the backup').to.equal('ok');
 		expect(bytesEqual(store.getByParticipant(TOPIC, participantId)!.primary, selfBytes), 'valid reattach re-stamped self as primary').to.equal(true);
+	});
+});
+
+describe('cohort-topic: register signing payload survives the codec round-trip (determinism)', () => {
+	// The host's verifier recomputes `registerSigningPayload` from the *decoded* frame, not the in-memory
+	// object the participant signed. Determinism therefore rests on the JSON encode→decode→validate
+	// round-trip reproducing the byte image exactly — including optional-field normalization
+	// (`bootstrap` absent, `appPayload` present). The other specs pass the in-memory object straight to
+	// `handleRegister`, so this is the one that exercises the actual wire path.
+	it('verifies after encode→decode→validate, with appPayload present and bootstrap absent', async () => {
+		const participantKey = await generateKeyPair('Ed25519');
+		const participantCoordBytes = peerIdToBytes(peerIdFromPrivateKey(participantKey));
+		const body: Omit<RegisterV1, 'signature'> = {
+			v: 1,
+			topicId: bytesToB64url(TOPIC),
+			tier: 0,
+			treeTier: 0,
+			participantCoord: bytesToB64url(participantCoordBytes),
+			ttl: 90_000,
+			// bootstrap deliberately omitted → normalized to `false` on both sides.
+			appPayload: bytesToB64url(new TextEncoder().encode('app-state-bytes')),
+			timestamp: 1_700_000_000_000,
+			correlationId: bytesToB64url(new TextEncoder().encode('cid-roundtrip')),
+		};
+		const sig = await signPeer(participantKey, registerSigningPayload(body));
+		const signed: RegisterV1 = { ...body, signature: bytesToB64url(sig) };
+
+		// Full wire round-trip the way an inbound frame is processed by the host.
+		const decoded = validateRegisterV1(decodeCohortMessage(encodeCohortMessage(signed), undefined));
+		expect(decoded.bootstrap, 'absent bootstrap stays absent across the wire').to.equal(undefined);
+		expect(decoded.appPayload, 'appPayload round-trips').to.equal(body.appPayload);
+		expect(
+			verifyPeerSig(b64urlToBytes(decoded.participantCoord), registerSigningPayload(decoded), b64urlToBytes(decoded.signature)),
+			'signature verifies against the decoded frame',
+		).to.equal(true);
+
+		// A post-signing tamper of any covered field (here appPayload) must break verification.
+		const tampered = validateRegisterV1(decodeCohortMessage(encodeCohortMessage({ ...signed, appPayload: bytesToB64url(new TextEncoder().encode('other')) }), undefined));
+		expect(
+			verifyPeerSig(b64urlToBytes(tampered.participantCoord), registerSigningPayload(tampered), b64urlToBytes(tampered.signature)),
+			'tampered appPayload fails verification',
+		).to.equal(false);
 	});
 });

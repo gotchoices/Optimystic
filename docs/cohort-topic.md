@@ -851,7 +851,6 @@ interface RegisterV1 {
 > tracked with the rest of the multi-tier work.
 
 ```
-
 interface RegisterReplyV1 {
   v:               1
   result:          "accepted" | "no_state" | "promoted" | "unwilling_member" | "unwilling_cohort"
@@ -889,9 +888,20 @@ interface RenewV1 {
   correlationId:   string             // matches original RegisterV1
   timestamp:       number
   reattach?:       boolean            // true on a crash-failover re-attach (signed; absent on a normal ping)
-  signature:       string
+  signature:       string             // participant peer-key signature over the body (minus signature)
 }
+```
 
+> **Participant signature.** Like `RegisterV1`, `signature` is the participant's libp2p peer-key
+> (Ed25519) signature over the deterministic body image minus the `signature` field
+> (`renewSigningPayload`). `participantId` carries the participant's **dialable peer id** (the same
+> peer-codec encoding as a reply's `primary`/`backups`), so the signer's Ed25519 key is recoverable
+> with no network lookup. A cohort member verifies it on a **`reattach`** renew — the
+> privilege-escalating path: an unverifiable `reattach` is redirected (`primary_moved`), never
+> promoted, so a stray/MITM'd ping cannot usurp a live primary. A plain ping (no `reattach`) only
+> touches `lastPing`, so it is not signature-gated.
+
+```
 interface RenewReplyV1 {
   v:               1
   result:          "ok" | "unknown_registration" | "primary_moved"

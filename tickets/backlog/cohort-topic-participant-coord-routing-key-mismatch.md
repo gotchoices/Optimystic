@@ -1,73 +1,73 @@
-description: The participant's FRET routing key (`coord_d(self, topicId)`) and the wire `participantCoord` field (`H(self)`) diverge for tier d ≥ 1, so a cohort host recomputing the served coord from a RegisterV1 assembles the wrong cohort. Benign at tier 0 (coord_0 ignores P); a correctness bug the moment multi-tier (d ≥ 1) cohorts are served. Must be reconciled before any live multi-tier work.
+description: RESOLVED-CORE / residual only. The original self-vs-H(self) routing/wire mismatch was fixed by `cohort-topic-peer-key-signing` (it adopted Option A — `participantCoord` now carries `self`, the routing coordinate, so the participant's FRET routing key and the host's recomputed served coord are equal for all `d`). What remains is a *distribution* concern, not a correctness mismatch: `P = self` is the participant's **dialable peer-id string bytes**, so `prefix(P, …)` over an Ed25519 peer id is non-uniform (every id shares the `12D3Koo…` prefix), which skews `coord_d` sharding for `d ≥ 1`. Must be reconciled before any live multi-tier work.
 prereq:
 files:
-  - packages/db-core/src/cohort-topic/service.ts (participantId = H(self) at L166; participantCoord = bytesToB64url(participantId) at L296)
+  - packages/db-core/src/cohort-topic/service.ts (participantId = deps.self at L179; participantCoord = bytesToB64url(participantId) in messageFactory)
   - packages/db-core/src/cohort-topic/walk.ts (routes with addressing.coord(d, deps.self, topicId) at L162)
   - packages/db-core/src/cohort-topic/addressing.ts (coordD: H(d ‖ prefix(P, d·log₂F) ‖ topicId))
-  - packages/db-p2p/src/cohort-topic/host.ts (dispatchRegister recomputes servedCoord = addressing.coord(reg.treeTier, participantCoord, topicId))
-  - docs/cohort-topic.md (§Tier addressing, §Wire formats — what `participantCoord` carries)
+  - packages/db-p2p/src/cohort-topic/host.ts (self = selfMemberBytes into the service; dispatchRegister recomputes servedCoord = addressing.coord(reg.treeTier, participantCoord, topicId))
+  - packages/db-p2p/src/cohort-topic/peer-sig.ts (verifyPeerSig — the signer id must be recoverable from whatever `participantCoord` carries)
+  - docs/cohort-topic.md (§Register — the participant-signature note already states this caveat; §Tier addressing)
 ----
 
-# Reconcile the participant routing key `P` with the wire `participantCoord`
+# Reconcile the `coord_d` sharding key `P` with the verifiable signer id `participantCoord`
 
-## The inconsistency
+## Status: core mismatch RESOLVED; only the `d ≥ 1` uniformity residual remains
 
-The tier-addressing spec is `coord_d(P, topicId) = H(d ‖ prefix(P, d·log₂F) ‖ topicId)` for `d ≥ 1`
-(`coord_0` ignores `P`). Two places disagree on what `P` is:
+The original bug this ticket was filed for — the participant routing on `coord_d(self, …)` while the
+host recomputed `coord_d(H(self), …)` because `participantCoord` carried `H(self)` — **no longer
+exists.** `cohort-topic-peer-key-signing` changed `service.ts` so `participantId = deps.self` and the
+wire `participantCoord` is `bytesToB64url(self)` (it had to be a recoverable peer id, since the
+cohort verifies the participant's peer-key signature against it). That is exactly "Option A" from the
+original analysis: routing (`deps.self`) and the host recompute (`participantCoord`) now use the same
+`self` bytes, so they are equal for **all** `d`, not just `d = 0`. The acceptance check below for
+routing-key equality is therefore satisfied by construction; `crossCheckCohort` no longer warns on a
+correctly-routed register.
 
-- **Routing (participant side).** `WalkEngine` routes a register to
-  `addressing.coord(d, deps.self, topicId)` — i.e. `P = self`, the participant's ring coordinate
-  (`db-core/walk.ts` L162). The host passes `self: selfCoord` into the service.
-- **Wire field.** The `RegisterV1.participantCoord` field carries
-  `bytesToB64url(this.participantId)` where `participantId = hash.H(deps.self)` — i.e. `P = H(self)`
-  (`db-core/service.ts` L166, L296). `participantId` was introduced as the **renewal/storage key**
-  (`recordKey(topicId, participantId)`) and is reused, unintentionally, as the wire `participantCoord`.
+## The residual: `prefix(P, …)` is non-uniform when `P` is a peer-id string
 
-So FRET routes a register to `coord_d(self, topicId)`, but the cohort host recomputes the served coord
-as `addressing.coord(reg.treeTier, participantCoord, topicId) = coord_d(H(self), topicId)`
-(`db-p2p/host.ts` `dispatchRegister`). For `d ≥ 1` these are different coordinates, so the host:
-
-1. instantiates / selects the wrong `CoordEngine` (keyed on the recomputed coord),
-2. assembles `assembleCohort(coord_d(H(self), …))` — **not** the cohort FRET actually routed to, and
-3. trips the host's `crossCheckCohort` warning (FRET-routed cohort ≠ recomputed assembly).
-
-**At tier 0 it is benign** — `coord_0` ignores `P`, so `coord_0(self) == coord_0(H(self))` and the
-two agree. The per-coord-scoping milestone serves only tier-0 cohorts, so nothing observable breaks
-today; this is a **latent** bug that bites the first time a `d ≥ 1` cohort is served (multi-tier
-promotion / live-tier multi-tier e2e).
+`P = self` is now the participant's **dialable peer-id string** encoded as UTF-8 bytes (the peer-codec
+form, so the embedded Ed25519 key is recoverable with no lookup). For `coord_0` this is exact —
+`coord_0` ignores `P`. But for `d ≥ 1`, `coord_d` feeds `prefix(P, d·log₂F)` into the hash, and the
+high bits of an Ed25519 peer-id string are a near-constant (`12D3Koo…`) shared by every node, so the
+tier-`d` shard prefix barely varies between participants. Sharding uniformity across the `F^d`
+tier-`d` coordinates degrades. Nothing *working* regresses today (multi-tier is non-functional:
+`cohort-topic-followon-derivation` + multi-tier promotion are still open), but this must be settled
+before a `d ≥ 1` cohort is ever served.
 
 ## What to decide
 
-Pick the single source of truth for `P` and align both sides:
+Keep the verifiable signer id and fix the sharding input independently:
 
-- **Option A — `participantCoord` carries `self` (the routing coordinate).** Stop reusing
-  `participantId` for the wire field; send `bytesToB64url(self)` as `participantCoord` and keep
-  `participantId = H(self)` purely as the local renewal/storage key. Then the host's recompute
-  `coord_d(participantCoord, topicId)` matches FRET's routing key by construction. Lowest-risk; the
-  wire field then literally means "the participant's ring coordinate", which is what `coord_d` wants.
-- **Option B — route on `H(self)`.** Make `WalkEngine` route with `coord_d(H(self), topicId)` so the
-  routing key matches the existing wire field. Changes the ring placement of every tier-`d` cohort;
-  re-validate that `prefix(H(self), …)` still distributes shards as intended.
+- **Hash `P` for the `coord_d` input only.** Feed `coord_d` a uniform value (e.g. `H(self)` or the
+  raw decoded peer-id key bytes) for the `prefix(...)` argument, while the wire `participantCoord`
+  keeps carrying the recoverable peer id the signature verifies against. Both the walk's routing call
+  and the host's recompute must apply the identical transform so they stay equal.
+- **Or add a dedicated signer field.** Carry a separate `participantSig`/signer-id field so
+  `participantCoord` can revert to a uniform ring coord while the signature still names a recoverable
+  key. Heavier (new wire field) — only if a single value can't serve both roles cleanly.
 
-Option A is the expected resolution (the wire field's name and the `coord_d` contract both say "ring
-coordinate"), but confirm against the §Tier addressing / §Wire formats intent before committing.
+Whichever is chosen, the transform must be applied in **both** `WalkEngine` (routing) and
+`host.dispatchRegister` (recompute) so the equality the peer-key-signing ticket established is
+preserved.
 
 ## Acceptance
 
-- The participant routing key and the value the host recomputes `servedCoord` from are provably equal
-  for `d ≥ 1` (not just `d = 0`). Add a db-core test that registers at `d = 1` and asserts the coord
-  the walk routes to equals `addressing.coord(1, <wire participantCoord>, topicId)`.
-- `db-p2p/host.ts` `crossCheckCohort` does not warn for a correctly-routed `d ≥ 1` register in a
-  multi-node harness.
-- `docs/cohort-topic.md` §Wire formats states unambiguously what `participantCoord` carries, and
-  §Tier addressing's `P` is cross-referenced to it.
+- For `d ≥ 1`, the participant routing key and the value the host recomputes `servedCoord` from are
+  provably equal (already true for the current `P = self`; preserve it through whatever transform is
+  chosen). Add a db-core test at `d = 1`.
+- The value fed to `prefix(P, …)` is uniformly distributed across participants (not a peer-id-string
+  prefix). Add a distribution/property test over many generated peer ids.
+- The wire `participantCoord` (or its replacement signer field) remains a value `verifyPeerSig` can
+  recover an Ed25519 key from.
+- `docs/cohort-topic.md` §Register / §Tier addressing reflect the final decision (the current note
+  already records the open caveat).
 
 ## Notes
 
-- Surfaced by the `cohort-topic-per-coord-scoping` review (gap #5 in that implement handoff). The
-  implementer flagged it explicitly and asked whether it belongs in `cohort-topic-live-tier-e2e` or a
-  dedicated fix — this is that dedicated item. It is a **prerequisite** for serving any `d ≥ 1` cohort,
-  so the multi-tier promotion / live-tier-multi-tier work should treat it as a gate.
-- Intersects `cohort-topic-peer-key-signing` (which signs the `participantCoord` body) and
-  `cohort-topic-followon-derivation` (the other multi-tier walk gap) — coordinate the wire-field
-  decision with both if they land first.
+- Surfaced first by `cohort-topic-per-coord-scoping` (gap #5) as a correctness mismatch; the
+  correctness half was resolved by `cohort-topic-peer-key-signing` (gap #1 in its handoff, and its
+  review), which intentionally chose `participantCoord = self` for signature verifiability and
+  documented this residual in `docs/cohort-topic.md` §Register.
+- Intersects `cohort-topic-followon-derivation` (the other multi-tier walk gap) — coordinate the
+  wire-field decision with it. It is a **gate** for the multi-tier promotion / live-tier-multi-tier
+  work.
