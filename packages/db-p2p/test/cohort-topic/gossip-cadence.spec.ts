@@ -121,8 +121,13 @@ const addressing = createTierAddressing(new RingHash());
 const TOPIC = Uint8Array.from({ length: 32 }, (_v, i) => (i + 3) & 0xff);
 const TOPIC2 = Uint8Array.from({ length: 32 }, (_v, i) => (i + 70) & 0xff);
 
-/** A participant-signed `RegisterV1` (live-signer mode verifies it against `participant`'s key). */
-async function signedRegister(participant: Member, topicId: Uint8Array, ttl = 90_000): Promise<RegisterV1> {
+/**
+ * A participant-signed `RegisterV1` (live-signer mode verifies it against `participant`'s key). The
+ * `timestamp` must sit inside the cohort's replay-guard freshness window relative to the `now` the
+ * register is handled at — callers that handle at real-clock `Date.now()` pass `timestamp = now`, so a
+ * synthetic stamp isn't dropped as stale.
+ */
+async function signedRegister(participant: Member, topicId: Uint8Array, ttl = 90_000, timestamp = 1_000): Promise<RegisterV1> {
 	const body: Omit<RegisterV1, 'signature'> = {
 		v: 1,
 		topicId: bytesToB64url(topicId),
@@ -131,7 +136,7 @@ async function signedRegister(participant: Member, topicId: Uint8Array, ttl = 90
 		participantCoord: bytesToB64url(participant.bytes),
 		ttl,
 		bootstrap: true,
-		timestamp: 1_000,
+		timestamp,
 		correlationId: bytesToB64url(new TextEncoder().encode('cid-reg')),
 	};
 	return { ...body, signature: bytesToB64url(await signPeer(participant.key, registerSigningPayload(body))) };
@@ -353,7 +358,7 @@ describe('cohort-topic: two-node replication via a gossip round', () => {
 		// Real-clock timestamps: the receiver merges with `Date.now()`, so a synthetic `lastPing` would look
 		// past-TTL and be dropped by the bus's anti-resurrection guard.
 		const now = Date.now();
-		expect((await eA.engine.handleRegister(await signedRegister(participant, TOPIC), { followOn: false, treeTier: 0 }, now)).result, 'A admits once a sibling is willing').to.equal('accepted');
+		expect((await eA.engine.handleRegister(await signedRegister(participant, TOPIC, 90_000, now), { followOn: false, treeTier: 0 }, now)).result, 'A admits once a sibling is willing').to.equal('accepted');
 		expect((eA.engine.handleRenew(await signedReattach(participant, TOPIC), now)).result).to.equal('ok');
 
 		const g = await eA.gossipRound(now);
@@ -399,7 +404,7 @@ describe('cohort-topic: gossip driver timer lifecycle', () => {
 		deliverGossip(node, await signedGossip(sibling, coord0, ce.cohort().cohortEpoch, { willingnessBits: 'f' }), sibling.peerId);
 		await delay(20);
 		const now = Date.now();
-		expect((await ce.engine.handleRegister(await signedRegister(participant, TOPIC), { followOn: false, treeTier: 0 }, now)).result).to.equal('accepted');
+		expect((await ce.engine.handleRegister(await signedRegister(participant, TOPIC, 90_000, now), { followOn: false, treeTier: 0 }, now)).result).to.equal('accepted');
 
 		const gossipDials = (): number => node.dialLog.filter((d) => d.protocol === DEFAULT_COHORT_TOPIC_PROTOCOLS.gossip).length;
 		await delay(120);

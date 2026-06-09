@@ -576,6 +576,16 @@ The newly-instantiated forwarder registers itself with its tier-(d−1) parent o
 > `ParentRegistrar.registerWithParent` acks; the root (tier 0) has no parent and serves immediately.
 > `promotedRedirectReply` builds the `Promoted(d+1)` bounce above (attaching the outgoing cohort's
 > traffic). Spec: `coldstart.spec.ts`.
+>
+> The db-p2p host supplies the parent-registration **transport**
+> ([`host.ts`](../packages/db-p2p/src/cohort-topic/host.ts) `registerForwarderWithParent`): a
+> cold-started tier-`d` forwarder routes a `RegisterV1`-style forwarder-link frame to its tier-`(d−1)`
+> parent coord over `ITopicRouter.routeAndAct` (riding the parent's serving tier so the parent recomputes
+> the parent coord); a resolved round-trip is the ack, a rejection leaves the forwarder `awaiting_parent`
+> for a later retry without crashing the instantiating register. The parent-side child-cohort
+> *recording* (`childCohortCount`, a dedicated signed child-link frame) is deferred
+> (`cohort-topic-parent-child-link`); the single-tier-0 milestone has no parent, so this path is covered
+> by `host-antidos-coldstart.spec.ts`, not the tier-0 e2e.
 
 ### Hysteresis
 
@@ -730,6 +740,18 @@ The layer does not attempt to defend against unbounded Sybil attacks at the regi
 > over injected PoW / reputation / parent-reference verifiers — db-core never embeds a specific
 > PoW or reputation scheme). `register_rate_per_peer = 4/min` and `topics_max = 2048` are the
 > simulator-confirmed §Configuration defaults. Specs: `antidos.spec.ts`.
+>
+> The db-p2p host wires these into each live cohort
+> ([`host.ts`](../packages/db-p2p/src/cohort-topic/host.ts)): the rate limiter, replay guard, and topic
+> budget are **per-`CoordEngine`** (they key on `(peer, topic)` / per-cohort topic state, which is
+> coord-scoped, so each served coord gets an independent set), while the `BootstrapEvidence` policy is
+> **node-level** (a tier→verifier policy with no per-coord state) and shared. The guard is verified first
+> on the inbound register so a forged/replayed/over-rate frame never pollutes downstream state. Because
+> db-core embeds no PoW/reputation scheme, the host injects the verifiers via `antiDos` options: a
+> supplied reputation view gates T0/T1 (a non-banned participant is the committed-work proxy) and the
+> T2/T3 reputation option; otherwise the verifiers are **permissive-but-logged** (a one-time warning,
+> never an undefined gate). The production PoW + committed-work-reference evidence schemes are deferred
+> (`cohort-topic-bootstrap-evidence-scheme`). Host wiring specs: `host-antidos-coldstart.spec.ts`.
 
 > **Open question — `F^d` fan-out under per-coord rate limits (not resolved here).** The per-peer
 > rate limit bounds cost *per cohort*, but a malicious peer can hit every one of the `F^d`

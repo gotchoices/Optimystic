@@ -30,6 +30,16 @@
  * {@link CoordEngine.pumpMembership} / {@link CoordEngine.onStabilized} hooks for the gossip-cadence
  * driver to call.
  *
+ * **Anti-DoS + cold-start (gaps 6–7).** Each {@link CoordEngine} is injected its own per-coord anti-DoS
+ * guards — a `RegisterRateLimiter` (4/min per peer-topic), a `CorrelationReplayGuard` (60 s freshness),
+ * and a `TopicBudget` (2048 topics, LRU) — so a budget/limit at one coord is independent of another. The
+ * node-level {@link BootstrapEvidence} policy (one tier→verifier policy, no per-coord state) is built once
+ * and shared. db-core embeds no PoW / reputation scheme, so the host supplies the verifiers via
+ * {@link CohortTopicAntiDosOptions} (reputation-backed when a view is given, else permissive-but-logged —
+ * a documented deferral, never an undefined gate). A cold-started tier-`d > 0` forwarder registers with
+ * its tier-`(d − 1)` parent by routing a forwarder-link frame over the router (gap 7), staying
+ * `awaiting_parent` until the ack.
+ *
  * **Scope (mock-tier e2e pending).** `followOn` derivation for a promoted-redirect arrival is parked in
  * backlog (`cohort-topic-followon-derivation`); this milestone serves a **single tier-0 cohort**, so
  * `followOn` stays `false` and tier-0 bootstrap instantiation goes through the `bootstrap: true` path.
@@ -58,9 +68,14 @@ import {
 	createCohortTopicService,
 	createLoadBarometer,
 	createTierAddressing,
+	createRegisterRateLimiter,
+	createCorrelationReplayGuard,
+	createTopicBudget,
+	createBootstrapEvidence,
 	coreProfile,
 	DEFAULT_MIN_SIGS,
 	DEFAULT_TRAFFIC_WINDOW_SECONDS,
+	DEFAULT_TTL_MS,
 	bytesToB64url,
 	b64urlToBytes,
 	bytesEqual,
@@ -78,6 +93,8 @@ import {
 	cohortGossipSigningPayload,
 	promotionNoticeSigningPayload,
 	demotionNoticeSigningPayload,
+	type BootstrapEvidence,
+	type BootstrapEvidenceDeps,
 	type CohortGossipV1,
 	type CohortGossipSignable,
 	type CohortTopicService,
@@ -86,13 +103,17 @@ import {
 	type CohortSnapshotView,
 	type CohortSigner,
 	type CohortView,
+	type CorrelationReplayGuardConfig,
 	type DemotionNoticeV1,
+	type Forwarder,
+	type ITopicRouter,
 	type MembershipCertPublisher,
 	type MembershipCertV1,
 	type MembershipVerifier,
 	type NodeProfile,
 	type ParticipantSigner,
 	type PromotionNoticeV1,
+	type RegisterRateLimiterConfig,
 	type RegisterReplyV1,
 	type RegisterV1,
 	type RenewReplyV1,
@@ -102,8 +123,10 @@ import {
 	type SignReplyV1,
 	type SignRequestV1,
 	type Tier,
+	type TopicBudgetConfig,
 	type IMembershipSource,
 } from "@optimystic/db-core";
+import { randomBytes } from "@libp2p/crypto";
 import { peerIdFromString } from "@libp2p/peer-id";
 import { FretTopicRouter } from "./topic-router.js";
 import { FretCohortGossipTransport, type CohortPeerResolver } from "./cohort-gossip-transport.js";
@@ -150,6 +173,50 @@ export interface CohortTopicHostOptions {
 	 * inbound participant-signature verification, so unit tests compose without a key.
 	 */
 	readonly privateKey?: PrivateKey;
+	/**
+	 * Anti-DoS guard wiring (gap 6). The per-{@link CoordEngine} guards (rate limiter, replay guard,
+	 * topic budget) and the node-level bootstrap-evidence policy are always constructed with documented
+	 * defaults; this lets a caller (or a test) tune them. Omit for production defaults.
+	 */
+	readonly antiDos?: CohortTopicAntiDosOptions;
+}
+
+/** The slice of a peer-reputation service the default bootstrap-evidence verifiers consult. */
+export interface BootstrapReputationView {
+	/** True when `peerId` (a peer-id string) is banned / excluded from operations. */
+	isBanned(peerId: string): boolean;
+}
+
+/**
+ * Anti-DoS wiring overrides for a {@link CohortTopicHost} (`docs/cohort-topic.md` §Anti-DoS).
+ *
+ * The rate limiter, replay guard, and topic budget are **per-served-coord** (they key on
+ * `(peer, topic)` / per-cohort topic state, which is coord-scoped) — one set is built per
+ * {@link CoordEngine} from these configs. The bootstrap-evidence policy is **node-level** (a
+ * tier→verifier policy with no per-coord state) and is shared by every engine.
+ */
+export interface CohortTopicAntiDosOptions {
+	/** Per-`(peer, topic)` register rate limiter. Default `register_rate_per_peer = 4 / 60 s`, exponential back-off. */
+	readonly rateLimiter?: RegisterRateLimiterConfig;
+	/** Correlation-id freshness + replay guard. Default `maxAge = 60 s`, `futureSkew = 5 s`. */
+	readonly replayGuard?: CorrelationReplayGuardConfig;
+	/** Per-cohort forwarder-state budget. Default `topics_max = 2048`, LRU by participant count. */
+	readonly topicBudget?: TopicBudgetConfig;
+	/**
+	 * Bootstrap-evidence verifiers for cold-root instantiation. db-core embeds no PoW / reputation /
+	 * committed-work scheme; inject the real checks here. Any verifier supplied wins over the defaults
+	 * below; the gate is **never** left undefined (an unset gate means cold-root bootstrap is
+	 * unauthenticated — `docs/cohort-topic.md` §Anti-DoS).
+	 */
+	readonly bootstrapEvidence?: BootstrapEvidenceDeps;
+	/**
+	 * Optional peer-reputation view backing the default T0/T1 committed-work proxy and the T2/T3
+	 * reputation evidence: a non-banned participant satisfies the evidence (these tiers correspond to
+	 * committed work). When omitted (and no `bootstrapEvidence` verifier is supplied), the default is
+	 * permissive-but-logged — the production PoW / committed-work-reference schemes are deferred (see
+	 * `tickets/backlog/cohort-topic-bootstrap-evidence-scheme`).
+	 */
+	readonly reputation?: BootstrapReputationView;
 }
 
 /**
@@ -197,6 +264,11 @@ export interface CoordEngine {
 	cohortView(): CohortView;
 	/** True iff this engine currently serves `topicId` (holds a record or a cold-start forwarder for it). */
 	servesTopic(topicId: Uint8Array): boolean;
+	/**
+	 * The cold-start {@link Forwarder} this engine instantiated for `topicId`, or `undefined` if none.
+	 * Exposes the parent-link lifecycle (`awaiting_parent` → `serving`) for the cold-start wiring (gap 7).
+	 */
+	forwarder(topicId: Uint8Array): Forwarder | undefined;
 	/** Whether `topicId` is in promoted mode here — reflects both locally-originated and remotely-applied state. */
 	isPromoted(topicId: Uint8Array): boolean;
 	/** Adopt a verified promotion notice into this cohort's local state (see {@link NoticeApplyTarget}). */
@@ -263,6 +335,16 @@ interface CoordEngineContext {
 	 * are not driven in that mode), so threshold signing is unavailable until a key is supplied.
 	 */
 	readonly privateKey?: PrivateKey;
+	/** FRET-backed router; a coord engine routes its cold-start forwarder→parent link over it (gap 7). */
+	readonly router: ITopicRouter;
+	/** Per-coord anti-DoS guard configs (one guard set is built per {@link CoordEngine}). */
+	readonly antiDos: {
+		readonly rateLimiter?: RegisterRateLimiterConfig;
+		readonly replayGuard?: CorrelationReplayGuardConfig;
+		readonly topicBudget?: TopicBudgetConfig;
+	};
+	/** Node-level bootstrap-evidence policy, shared by every engine (no per-coord state). */
+	readonly bootstrapEvidence: BootstrapEvidence;
 	/** Dial a cohort member's `/sign` RPC (the threshold-assembly collection seam). */
 	readonly dialSign: (peerIdStr: string, request: SignRequestV1) => Promise<SignReplyV1>;
 	/** FRET two-sided assembly around `coord`, self prepended + deduped, with a deterministic epoch. */
@@ -408,6 +490,13 @@ export async function createCohortTopicHost(node: Libp2p, fret: FretService, opt
 		}
 	};
 
+	// --- anti-DoS (gap 6) ---
+	// The bootstrap-evidence policy is node-level (a tier→verifier policy with no per-coord state), so it
+	// is built once and shared by every coord engine. The per-coord guards (rate limiter, replay guard,
+	// topic budget) are built per CoordEngine from `antiDos` below — they key on `(peer, topic)` /
+	// per-cohort topic state, which is coord-scoped, and must not share state across coords.
+	const bootstrapEvidence = createBootstrapEvidencePolicy(options.antiDos, log);
+
 	const ctx: CoordEngineContext = {
 		hash,
 		addressing,
@@ -421,6 +510,13 @@ export async function createCohortTopicHost(node: Libp2p, fret: FretService, opt
 		maxBytes,
 		publishSink,
 		privateKey: options.privateKey,
+		router,
+		antiDos: {
+			rateLimiter: options.antiDos?.rateLimiter,
+			replayGuard: options.antiDos?.replayGuard,
+			topicBudget: options.antiDos?.topicBudget,
+		},
+		bootstrapEvidence,
 		dialSign,
 		cohortAround,
 		verifyRegisterSig,
@@ -592,6 +688,116 @@ function createParticipantSigner(
 	};
 }
 
+// --- anti-DoS: node-level bootstrap-evidence policy (gap 6) ---
+
+/**
+ * Build the node-level {@link BootstrapEvidence} policy a cold root demands of a `bootstrap: true`
+ * registration (`docs/cohort-topic.md` §Anti-DoS bullet 4). The policy itself (tier-dependent: T0/T1
+ * need a signed parent / committed-work reference; T2/T3 accept PoW OR reputation OR a parent
+ * reference) is real db-core logic — this only supplies the **verifiers**, which db-core deliberately
+ * does not embed (no specific PoW / reputation / committed-work scheme).
+ *
+ * Resolution order per verifier: an injected `antiDos.bootstrapEvidence` verifier wins; else, when a
+ * `reputation` view is supplied, a non-banned participant is the minimal-but-real committed-work proxy
+ * (these tiers correspond to committed work); else a **permissive-but-logged** fallback. The gate is
+ * therefore *never undefined* — the engine always runs it — but absent a real verifier or reputation
+ * view it admits cold-root bootstraps after a one-time warning (the production PoW / committed-work
+ * schemes are deferred: `tickets/backlog/cohort-topic-bootstrap-evidence-scheme`). Inject a denying
+ * verifier (or a reputation view that bans the peer) to enforce the cold-root denial path.
+ */
+function createBootstrapEvidencePolicy(
+	antiDos: CohortTopicAntiDosOptions | undefined,
+	log: (formatter: string, ...args: unknown[]) => void,
+): BootstrapEvidence {
+	const overrides = antiDos?.bootstrapEvidence;
+	const reputation = antiDos?.reputation;
+
+	// A non-banned participant satisfies the T0/T1 committed-work proxy + the T2/T3 reputation option.
+	// Defensive: an unparseable participant id fails the check (deny) — it is never treated as evidence.
+	const reputationVerifier = reputation === undefined
+		? undefined
+		: (reg: RegisterV1): boolean => {
+			try {
+				return !reputation.isBanned(bytesToPeerIdString(b64urlToBytes(reg.participantCoord)));
+			} catch {
+				return false;
+			}
+		};
+
+	// Permissive-but-logged fallback (one warning total): keeps the gate defined while the production
+	// evidence schemes are unwired, instead of silently leaving cold-root bootstrap unauthenticated.
+	let warned = false;
+	const permissive = (kind: string): ((reg: RegisterV1) => boolean) => (reg: RegisterV1): boolean => {
+		void reg;
+		if (!warned) {
+			warned = true;
+			log("cohort-topic anti-DoS: bootstrap-evidence %s verifier is PERMISSIVE — no PoW/committed-work scheme wired, so cold-root bootstrap is NOT cryptographically gated (interim; inject antiDos.bootstrapEvidence/reputation, see cohort-topic-bootstrap-evidence-scheme)", kind);
+		}
+		return true;
+	};
+
+	return createBootstrapEvidence({
+		verifyParentReference: overrides?.verifyParentReference ?? reputationVerifier ?? permissive("parent-reference"),
+		verifyReputation: overrides?.verifyReputation ?? reputationVerifier ?? permissive("reputation"),
+		verifyPoW: overrides?.verifyPoW ?? permissive("proof-of-work"),
+		config: overrides?.config,
+	});
+}
+
+// --- cold-start: forwarder → parent registration transport (gap 7) ---
+
+/** Inputs to {@link registerForwarderWithParent} (captured per coord engine + per instantiating register). */
+interface ForwarderLink {
+	readonly topicId: Uint8Array;
+	/** The tier-`(d − 1)` parent cohort coord this link routes to. */
+	readonly parentCoord: Uint8Array;
+	/** The forwarder's tree tier `d` (`> 0` — the root never links to a parent). */
+	readonly treeTier: number;
+	/** The topic's capacity tier (T0–T3); stamps the link frame's `tier`. Defaults to 0 if absent. */
+	readonly opTier?: number;
+	/** The participant coord that seeded this engine — keeps the link frame's recompute consistent. */
+	readonly participantCoord: Uint8Array;
+}
+
+/**
+ * Route a forwarder→parent link to `parentCoord` and resolve on the round-trip (the parent ack).
+ *
+ * The link is a `RegisterV1`-style frame routed over {@link ITopicRouter.routeAndAct} keyed at the
+ * parent coord: it rides the parent's serving tier (`treeTier − 1`) with this engine's seed
+ * `participantCoord`, so the parent recomputes `servedCoord = coord_{d−1}(participantCoord, topicId) =
+ * parentCoord`. A fresh CSPRNG `correlationId` keeps it clear of the parent's replay guard on retry.
+ * Resolution of the route is treated as the ack (richer child-link confirmation — the parent recording
+ * `childCohortCount` over a dedicated child-link frame — is the follow-on
+ * `cohort-topic-parent-child-link`); a rejection propagates so the cold-start manager keeps the
+ * forwarder `awaiting_parent`.
+ */
+async function registerForwarderWithParent(ctx: CoordEngineContext, link: ForwarderLink): Promise<void> {
+	const frame: RegisterV1 = {
+		v: 1,
+		topicId: bytesToB64url(link.topicId),
+		tier: clampTier(link.opTier ?? 0),
+		treeTier: Math.max(0, link.treeTier - 1),
+		participantCoord: bytesToB64url(link.participantCoord),
+		ttl: DEFAULT_TTL_MS,
+		// Not a root cold-start: a follow-on link to an already-promoted parent, so no bootstrap evidence.
+		bootstrap: false,
+		timestamp: Date.now(),
+		correlationId: bytesToB64url(randomBytes(16)),
+		// Interim: the forwarder cohort cannot sign as the participant; the dedicated child-link frame
+		// (follow-on) carries the cohort threshold signature instead.
+		signature: "",
+	};
+	await ctx.router.routeAndAct(link.parentCoord, encodeCohortMessage(frame, ctx.maxBytes), { wantK: ctx.wantK, minSigs: ctx.minSigs });
+}
+
+/** Clamp an op tier to the valid T0–T3 range so the link frame validates at a (future) real parent. */
+function clampTier(tier: number): number {
+	if (!Number.isInteger(tier) || tier < 0) {
+		return 0;
+	}
+	return tier > 3 ? 3 : tier;
+}
+
 // --- registry + coord engine ---
 
 /** Build the lazy `servedCoord → CoordEngine` registry over the shared collaborators. */
@@ -727,18 +933,29 @@ function createCoordEngine(ctx: CoordEngineContext, servedCoord: RingCoord, tree
 		signer: noticeSigner,
 		config: { capPromote: undefined },
 	});
+	// Cold-start forwarder → parent registration (gap 7). A freshly-instantiated tier-`d > 0` forwarder
+	// registers with its tier-`(d − 1)` parent cohort at `parentCoord` so the parent counts it as a child;
+	// the ColdStartManager holds the forwarder in `awaiting_parent` (accepts participants, holds
+	// parent-involving ops) until this resolves. This supplies the TRANSPORT: route a forwarder-link frame
+	// to `parentCoord` over the same `RouteAndMaybeAct` path a participant register rides. A resolved
+	// round-trip is the parent ack (flip to `serving`); a rejected/timed-out route leaves the forwarder
+	// `awaiting_parent` for a later retry and never crashes the instantiating register (cold-start fires
+	// this fire-and-forget). The parent-side child-cohort RECORDING (`childCohortCount`, a dedicated
+	// child-link frame) is a follow-on (`tickets/backlog/cohort-topic-parent-child-link`); the
+	// single-tier-0 milestone has no parent (the root serves immediately), so a unit test exercises this.
 	const coldStart = createColdStartManager({
 		parentRegistrar: {
-			registerWithParent: async (topicId: Uint8Array, parentCoord: Uint8Array, tier: number): Promise<void> => {
-				// Interim: forwarder→parent registration over the router is the multi-tier promotion ticket's
-				// job. A tier-0 (root) forwarder has no parent and serves immediately, so this is a no-op for
-				// the single-cohort milestone.
-				void topicId;
-				void parentCoord;
-				void tier;
-			},
+			registerWithParent: (topicId: Uint8Array, parentCoord: Uint8Array, tier: number, opTier?: number): Promise<void> =>
+				registerForwarderWithParent(ctx, { topicId, parentCoord, treeTier: tier, opTier, participantCoord }),
 		},
 	});
+
+	// Per-coord anti-DoS guards (gap 6): each CoordEngine owns its own set — a rate-limit budget / replay
+	// window / topic budget for coord A is independent of coord B. The bootstrap-evidence policy
+	// (`ctx.bootstrapEvidence`) is node-level and shared by design.
+	const rateLimiter = createRegisterRateLimiter(ctx.antiDos.rateLimiter);
+	const replayGuard = createCorrelationReplayGuard(ctx.antiDos.replayGuard);
+	const topicBudget = createTopicBudget(ctx.antiDos.topicBudget);
 	const renewal = createRenewalCohortSide({
 		store,
 		self: ctx.selfMemberBytes,
@@ -767,6 +984,11 @@ function createCoordEngine(ctx: CoordEngineContext, servedCoord: RingCoord, tree
 		renewal,
 		cohort,
 		quorumWilling: (tier: Tier): boolean => ctx.profile.willingTiers.has(tier),
+		// Anti-DoS guards (gap 6): per-coord rate/replay/budget; node-level bootstrap-evidence policy.
+		rateLimiter,
+		replayGuard,
+		topicBudget,
+		bootstrapEvidence: ctx.bootstrapEvidence,
 		verifyRegisterSig: ctx.verifyRegisterSig,
 		// A promotion notice signed on an arrival is broadcast to the cohort around this served coord
 		// (and the parent for a demotion). The engine only knows the notice; the host adds the coord.
@@ -863,6 +1085,7 @@ function createCoordEngine(ctx: CoordEngineContext, servedCoord: RingCoord, tree
 		cohortView: (): CohortView => view,
 		servesTopic: (topicId: Uint8Array): boolean =>
 			store.directParticipants(topicId) > 0 || coldStart.get(topicId) !== undefined,
+		forwarder: (topicId: Uint8Array): Forwarder | undefined => coldStart.get(topicId),
 		isPromoted: (topicId: Uint8Array): boolean => promotion.isPromoted(topicId),
 		applyPromotionNotice: (notice, now): void => promotion.applyPromotionNotice(notice, now),
 		applyDemotionNotice: (notice, now): void => promotion.applyDemotionNotice(notice, now),

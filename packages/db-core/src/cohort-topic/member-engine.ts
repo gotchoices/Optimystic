@@ -156,7 +156,7 @@ class StoreCohortMemberEngine implements CohortMemberEngine {
 			// Forwarder-state budget is full of populated topics — decline in time.
 			return this.unwillingCohort(reg, now);
 		}
-		this.deps.coldStart.instantiate(topicId, ctx.treeTier, ctx.parentCoord);
+		this.deps.coldStart.instantiate(topicId, ctx.treeTier, ctx.parentCoord, tier);
 		return this.admitOrDecline(reg, topicId, participantId, tier, ctx, now);
 	}
 

@@ -132,8 +132,13 @@ export function promotedRedirectReply(targetTier: number, traffic?: TopicTraffic
 
 /** Registers a newly-instantiated forwarder with its tier-`(d − 1)` parent; resolves on the parent ack. */
 export interface ParentRegistrar {
-	/** Register the forwarder for `topicId` at `tier` with the cohort at `parentCoord`; resolves on ack. */
-	registerWithParent(topicId: Uint8Array, parentCoord: Uint8Array, tier: number): Promise<void>;
+	/**
+	 * Register the forwarder for `topicId` (served at tree tier `tier`, i.e. `d`) with the cohort at
+	 * `parentCoord`; resolves on ack. `opTier` is the topic's *capacity* tier (T0–T3), threaded so the
+	 * transport can stamp a well-formed forwarder-link frame; absent when the caller has no op-tier
+	 * context (the cohort host always supplies it from the instantiating `RegisterV1`).
+	 */
+	registerWithParent(topicId: Uint8Array, parentCoord: Uint8Array, tier: number, opTier?: number): Promise<void>;
 }
 
 export interface ColdStartManagerDeps {
@@ -148,11 +153,12 @@ export interface ColdStartManagerDeps {
  */
 export interface ColdStartManager {
 	/**
-	 * Instantiate (or return the existing) forwarder for `topicId` at `tier`. For a deeper-than-root
-	 * forwarder this kicks off parent registration in the background and flips the forwarder to
-	 * `serving` on ack. The returned forwarder accepts participants immediately.
+	 * Instantiate (or return the existing) forwarder for `topicId` at tree tier `tier` (`d`). For a
+	 * deeper-than-root forwarder this kicks off parent registration in the background and flips the
+	 * forwarder to `serving` on ack. The returned forwarder accepts participants immediately. `opTier`
+	 * (the topic's T0–T3 capacity tier) is forwarded to the parent registrar for the link frame.
 	 */
-	instantiate(topicId: Uint8Array, tier: number, parentCoord?: Uint8Array): Forwarder;
+	instantiate(topicId: Uint8Array, tier: number, parentCoord?: Uint8Array, opTier?: number): Forwarder;
 	/** The tracked forwarder for `topicId`, or `undefined`. */
 	get(topicId: Uint8Array): Forwarder | undefined;
 }
@@ -162,7 +168,7 @@ class TrackingColdStartManager implements ColdStartManager {
 
 	constructor(private readonly deps: ColdStartManagerDeps) {}
 
-	instantiate(topicId: Uint8Array, tier: number, parentCoord?: Uint8Array): Forwarder {
+	instantiate(topicId: Uint8Array, tier: number, parentCoord?: Uint8Array, opTier?: number): Forwarder {
 		const key = bytesKey(topicId);
 		const existing = this.forwarders.get(key);
 		if (existing !== undefined) {
@@ -178,7 +184,7 @@ class TrackingColdStartManager implements ColdStartManager {
 			// registration leaves the forwarder accepting participants but holding parent-involving ops,
 			// so a later retry (driven by the host) can complete the link-up — surfaced, not swallowed.
 			void this.deps.parentRegistrar
-				.registerWithParent(topicId, parentCoord, tier)
+				.registerWithParent(topicId, parentCoord, tier, opTier)
 				.then(() => forwarder.onParentAck())
 				.catch((err: unknown) => {
 					console.warn(`cohort-topic cold-start: parent registration for tier-${tier} forwarder failed`, err);
