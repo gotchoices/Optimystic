@@ -1,12 +1,15 @@
 /**
  * Cohort-topic libp2p protocol IDs (`docs/cohort-topic.md` §FRET integration L432-460).
  *
- * Four protocols ride the same FRET/libp2p node:
+ * Five protocols ride the same FRET/libp2p node:
  *
  * - `register`      — Register, renew, re-attach (`RegisterV1` / `RenewV1`, routed via `RouteAndMaybeAct`).
  * - `cohort-gossip` — record replication, willingness, load barometers (`CohortGossipV1`).
  * - `promote`       — threshold-signed promotion / demotion notices.
  * - `membership`    — membership certificates (`MembershipCertV1`).
+ * - `sign`          — intra-cohort per-member endorsement for `k − x` threshold-signature assembly
+ *                     (`SignRequestV1` / `SignReplyV1`); a member collecting a threshold signature dials
+ *                     each cohort member here and concatenates the returned per-member Ed25519 sigs.
  *
  * The default (network-agnostic) IDs match the doc verbatim; {@link makeCohortTopicProtocols}
  * mirrors FRET's `makeProtocols(networkName)` so a named network namespaces its cohort-topic
@@ -24,13 +27,16 @@ export const PROTOCOL_COHORT_GOSSIP = `${COHORT_TOPIC_BASE}/cohort-gossip` as co
 export const PROTOCOL_COHORT_PROMOTE = `${COHORT_TOPIC_BASE}/promote` as const;
 /** `MembershipCertV1` — membership certificates. */
 export const PROTOCOL_COHORT_MEMBERSHIP = `${COHORT_TOPIC_BASE}/membership` as const;
+/** `SignRequestV1` / `SignReplyV1` — intra-cohort per-member endorsement for threshold-signature assembly. */
+export const PROTOCOL_COHORT_SIGN = `${COHORT_TOPIC_BASE}/sign` as const;
 
-/** The four cohort-topic protocol IDs in registration order. */
+/** The five cohort-topic protocol IDs in registration order. */
 export interface CohortTopicProtocols {
 	readonly register: string;
 	readonly gossip: string;
 	readonly promote: string;
 	readonly membership: string;
+	readonly sign: string;
 }
 
 /** Default (network-agnostic) protocol IDs, matching `docs/cohort-topic.md` §FRET integration. */
@@ -39,6 +45,7 @@ export const DEFAULT_COHORT_TOPIC_PROTOCOLS: CohortTopicProtocols = {
 	gossip: PROTOCOL_COHORT_GOSSIP,
 	promote: PROTOCOL_COHORT_PROMOTE,
 	membership: PROTOCOL_COHORT_MEMBERSHIP,
+	sign: PROTOCOL_COHORT_SIGN,
 };
 
 /**
@@ -54,10 +61,11 @@ export function makeCohortTopicProtocols(networkName = "default"): CohortTopicPr
 		gossip: `${base}/cohort-gossip`,
 		promote: `${base}/promote`,
 		membership: `${base}/membership`,
+		sign: `${base}/sign`,
 	};
 }
 
-/** All four protocol IDs as an array (for `node.handle` / `unhandle` over the set). */
+/** All five protocol IDs as an array (for `node.handle` / `unhandle` over the set). */
 export function cohortTopicProtocolList(p: CohortTopicProtocols): string[] {
-	return [p.register, p.gossip, p.promote, p.membership];
+	return [p.register, p.gossip, p.promote, p.membership, p.sign];
 }

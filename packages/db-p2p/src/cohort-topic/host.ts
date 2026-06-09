@@ -13,19 +13,27 @@
  * genuinely belongs to *many* cohorts — one per coord FRET routes to it — so this host keeps a lazy
  * {@link CoordRegistry}: a `Map<servedCoord, CoordEngine>` where each {@link CoordEngine} owns the
  * per-coord slice of state (its own store, gossip bus, willingness/traffic/renewal/cold-start, a
- * {@link PromotionLifecycle} with coord-derived tier inputs, and a {@link CohortMemberEngine}) and
- * threshold-signs with the FRET cohort *around the served coord*. The node-wide collaborators
- * (`hash`, `slots`, `barometer`, the threshold signer, the FRET ports, and the participant-facing
- * service) stay singletons and are injected into each engine. The host recomputes the served coord
- * from each decoded `RegisterV1` (`addressing.coord(treeTier, participantCoord, topicId)`), so both
- * the activity callback and the direct `register` protocol handler dispatch to the right cohort.
+ * {@link PromotionLifecycle} with coord-derived tier inputs, a {@link CohortMemberEngine}, its own
+ * {@link MembershipCertPublisher}, and its own real `k − x` threshold signer) and threshold-signs with
+ * the FRET cohort *around the served coord*. The node-wide collaborators (`hash`, `slots`, `barometer`,
+ * the FRET ports, the participant-facing service, and the verify-only verifier signer) stay singletons
+ * and are injected into each engine. The host recomputes the served coord from each decoded `RegisterV1`
+ * (`addressing.coord(treeTier, participantCoord, topicId)`), so both the activity callback and the direct
+ * `register` protocol handler dispatch to the right cohort.
  *
- * **Scope (mock-tier e2e pending).** The one documented remaining interim is the `k − x` cohort
- * threshold-signature assembly (see {@link FretCohortThresholdCrypto}). `followOn` derivation for a
- * promoted-redirect arrival is parked in backlog (`cohort-topic-followon-derivation`); this milestone
- * serves a **single tier-0 cohort**, so `followOn` stays `false` and tier-0 bootstrap instantiation
- * goes through the `bootstrap: true` path. The behavioral substrate is validated at mock-tier by
- * `test/cohort-topic/service.spec.ts`.
+ * **Real threshold signatures.** Each coord engine assembles a genuine `k − x` cohort signature
+ * (a collected per-member Ed25519 multisig) over the new `/sign` protocol — see
+ * {@link FretCohortThresholdCrypto} — and drives a {@link MembershipCertPublisher}, so a remote
+ * `MembershipVerifier` can verify the served `MembershipCertV1` for real. Assembly needs the node's
+ * `options.privateKey`; key-less hosts compose but cannot threshold-sign (the publisher/promotion paths
+ * are simply not driven). The periodic membership refresh is exposed as the per-engine
+ * {@link CoordEngine.pumpMembership} / {@link CoordEngine.onStabilized} hooks for the gossip-cadence
+ * driver to call.
+ *
+ * **Scope (mock-tier e2e pending).** `followOn` derivation for a promoted-redirect arrival is parked in
+ * backlog (`cohort-topic-followon-derivation`); this milestone serves a **single tier-0 cohort**, so
+ * `followOn` stays `false` and tier-0 bootstrap instantiation goes through the `bootstrap: true` path.
+ * The behavioral substrate is validated at mock-tier by `test/cohort-topic/service.spec.ts`.
  */
 
 import type { Libp2p } from "libp2p";
@@ -44,6 +52,7 @@ import {
 	createRenewalCohortSide,
 	createMembershipVerifier,
 	createMembershipSourceRouter,
+	createMembershipCertPublisher,
 	createCohortSigner,
 	createCohortMemberEngine,
 	createCohortTopicService,
@@ -53,15 +62,22 @@ import {
 	DEFAULT_MIN_SIGS,
 	bytesToB64url,
 	b64urlToBytes,
+	bytesEqual,
 	encodeCohortMessage,
 	decodeCohortMessage,
 	validateRegisterV1,
 	validateRenewV1,
+	validateSignRequestV1,
+	validateSignReplyV1,
 	registerSigningPayload,
 	renewSigningPayload,
 	type CohortTopicService,
 	type CohortMemberEngine,
+	type CohortSnapshot,
 	type CohortSnapshotView,
+	type CohortSigner,
+	type MembershipCertPublisher,
+	type MembershipCertV1,
 	type NodeProfile,
 	type ParticipantSigner,
 	type RegisterReplyV1,
@@ -69,19 +85,23 @@ import {
 	type RenewReplyV1,
 	type RenewV1,
 	type RingCoord,
+	type SignKind,
+	type SignReplyV1,
+	type SignRequestV1,
 	type Tier,
 	type IMembershipSource,
 } from "@optimystic/db-core";
+import { peerIdFromString } from "@libp2p/peer-id";
 import { FretTopicRouter } from "./topic-router.js";
 import { FretCohortGossipTransport, type CohortPeerResolver } from "./cohort-gossip-transport.js";
 import { FretMembershipSource } from "./membership-source.js";
 import { FretMembershipPublishSink } from "./membership-publish-sink.js";
-import { FretCohortThresholdCrypto } from "./threshold-crypto.js";
+import { FretCohortThresholdCrypto, createVerifyOnlyThresholdCrypto } from "./threshold-crypto.js";
 import { FretSizeEstimator } from "./size-estimator.js";
-import { peerIdToBytes } from "./peer-codec.js";
+import { peerIdToBytes, bytesToPeerIdString } from "./peer-codec.js";
 import { signPeer, verifyPeerSig } from "./peer-sig.js";
 import { DEFAULT_COHORT_TOPIC_PROTOCOLS, cohortTopicProtocolList, type CohortTopicProtocols } from "./protocols.js";
-import { DEFAULT_STREAM_MAX_BYTES } from "./stream-util.js";
+import { requestResponse, DEFAULT_STREAM_MAX_BYTES } from "./stream-util.js";
 import { createLogger } from "../logger.js";
 
 const log = createLogger("cohort-topic");
@@ -128,6 +148,17 @@ export interface CoordEngine {
 	hasState(): boolean;
 	/** True iff this engine holds the record for `(topicId, participantId)` — the renewal lookup key. */
 	holds(topicId: Uint8Array, participantId: Uint8Array): boolean;
+	/**
+	 * Publish a fresh threshold-signed `MembershipCertV1` on a cohort-membership-change / stabilization
+	 * event (republishes only when the first `k − x` members changed). Returns the cert if published.
+	 * Resolves `undefined` if no republish was needed or the quorum was unreachable this round.
+	 */
+	onStabilized(now: number): Promise<MembershipCertV1 | undefined>;
+	/**
+	 * Periodic membership-cert refresh hook for the gossip-cadence driver to call (republishes once
+	 * `T_membership_refresh` has elapsed). Returns the cert if (re)published, else `undefined`.
+	 */
+	pumpMembership(now: number): Promise<MembershipCertV1 | undefined>;
 	/** Tear down the per-coord gossip subscription. */
 	close(): void;
 }
@@ -167,11 +198,22 @@ interface CoordEngineContext {
 	readonly addressing: ReturnType<typeof createTierAddressing>;
 	readonly slots: ReturnType<typeof createSlotAssigner>;
 	readonly barometer: ReturnType<typeof createLoadBarometer>;
-	readonly signer: ReturnType<typeof createCohortSigner>;
 	readonly transport: FretCohortGossipTransport;
 	readonly profile: NodeProfile;
 	readonly selfMemberBytes: Uint8Array;
 	readonly wantK: number;
+	readonly minSigs: number;
+	readonly maxBytes: number;
+	/** Membership-cert sink the per-coord publisher serves through (node-wide; serves this node's cohort). */
+	readonly publishSink: FretMembershipPublishSink;
+	/**
+	 * The node's libp2p key, threaded so each coord engine's threshold signer can add self's own chunk.
+	 * Absent → key-less interim mode: the per-coord signer cannot assemble (the publisher/promotion paths
+	 * are not driven in that mode), so threshold signing is unavailable until a key is supplied.
+	 */
+	readonly privateKey?: PrivateKey;
+	/** Dial a cohort member's `/sign` RPC (the threshold-assembly collection seam). */
+	readonly dialSign: (peerIdStr: string, request: SignRequestV1) => Promise<SignReplyV1>;
 	/** FRET two-sided assembly around `coord`, self prepended + deduped, with a deterministic epoch. */
 	readonly cohortAround: (coord: RingCoord) => CohortSnapshotView;
 	/** Verify an inbound `RegisterV1`'s participant peer-key signature (live-signer mode only). */
@@ -212,11 +254,19 @@ export async function createCohortTopicHost(node: Libp2p, fret: FretService, opt
 	const gossipTransport = new FretCohortGossipTransport(node, resolver, { gossipProtocol: protocols.gossip, wants: wantK, selfPeerId: selfPeerStr });
 	const membershipSource = new FretMembershipSource(node, resolver, { membershipProtocol: protocols.membership, wants: wantK, maxBytes });
 	const publishSink = new FretMembershipPublishSink();
-	const thresholdCrypto = new FretCohortThresholdCrypto(selfMemberBytes);
 
 	const slots = createSlotAssigner(hash);
-	const signer = createCohortSigner(thresholdCrypto, minSigs);
 	const barometer = createLoadBarometer();
+
+	// Participant-side verifier signer: verify-only (it never assembles), so it needs no key / dial seam.
+	// The real k − x assembly lives in each CoordEngine's own threshold signer (constructed per coord).
+	const verifyingSigner = createCohortSigner(createVerifyOnlyThresholdCrypto(), minSigs);
+
+	// Collect one cohort member's `/sign` endorsement over the new fifth protocol.
+	const dialSign = async (peerIdStr: string, request: SignRequestV1): Promise<SignReplyV1> => {
+		const reply = await requestResponse(node, peerIdFromString(peerIdStr), protocols.sign, encodeCohortMessage(request, maxBytes), maxBytes);
+		return validateSignReplyV1(decodeCohortMessage(reply, maxBytes));
+	};
 
 	/** FRET assembly around `coord`: self prepended + deduped; epoch = H(sorted member join). */
 	const cohortAround = (coord: RingCoord): CohortSnapshotView => {
@@ -251,16 +301,32 @@ export async function createCohortTopicHost(node: Libp2p, fret: FretService, opt
 		addressing,
 		slots,
 		barometer,
-		signer,
 		transport: gossipTransport,
 		profile,
 		selfMemberBytes,
 		wantK,
+		minSigs,
+		maxBytes,
+		publishSink,
+		privateKey: options.privateKey,
+		dialSign,
 		cohortAround,
 		verifyRegisterSig,
 		verifyReattachSig,
 	};
 	const registry = createCoordRegistry(ctx);
+
+	// --- intra-cohort sign endorsement (the `/sign` handler body) ---
+	// A member dials us to endorse a threshold-signed artifact; we sign the exact request payload iff we
+	// and the requester share the cohort+epoch around `coord`. Exported `handleSignRequest` is the testable
+	// core; here we bind it to this node's key + the FRET assembly around the requested coord.
+	const signEndorse = (request: SignRequestV1, fromPeerStr: string): Promise<SignReplyV1> =>
+		handleSignRequest(request, fromPeerStr, {
+			privateKey: options.privateKey,
+			selfMember: selfMemberBytes,
+			cohortMembersAround: (coord: RingCoord): string[] => cohortAround(coord).members.map(bytesToPeerIdString),
+			currentEpoch: (coord: RingCoord): Uint8Array => cohortAround(coord).cohortEpoch,
+		});
 
 	// --- participant-side composition (node scope) ---
 	// The participant service exposes a node-level gossip handle (around the node's own ring position)
@@ -274,7 +340,7 @@ export async function createCohortTopicHost(node: Libp2p, fret: FretService, opt
 	});
 	const certSource: IMembershipSource = membershipSource;
 	const membershipRouter = createMembershipSourceRouter({ committed: certSource, fret: certSource });
-	const verifier = createMembershipVerifier({ signer, router: membershipRouter, minSigs });
+	const verifier = createMembershipVerifier({ signer: verifyingSigner, router: membershipRouter, minSigs });
 	const service = createCohortTopicService({
 		// `self` is the dialable peer-id bytes (not the ring coord): db-core carries it as the
 		// participant's wire identity, so the cohort can verify its peer-key signature (see signing seam).
@@ -307,7 +373,7 @@ export async function createCohortTopicHost(node: Libp2p, fret: FretService, opt
 
 	// --- protocol handlers + activity callback ---
 	// Await registration so the host is not returned (and dialed) before the four handlers are live.
-	await registerProtocolHandlers(node, protocols, registry, dispatchRegister, gossipTransport, publishSink, membershipSource, selfCoord, maxBytes);
+	await registerProtocolHandlers(node, protocols, registry, dispatchRegister, signEndorse, gossipTransport, publishSink, membershipSource, selfCoord, maxBytes);
 	fret.setActivityHandler(async (activity: string, cohort: string[]): Promise<{ commitCertificate: string }> => {
 		const reg = validateRegisterV1(decodeCohortMessage(b64urlToBytes(activity), maxBytes));
 		const reply = await dispatchRegister(reg, cohort, Date.now());
@@ -417,6 +483,42 @@ function createCoordEngine(ctx: CoordEngineContext, servedCoord: RingCoord, tree
 	const view = bus.view();
 	const selfMember = bytesToB64url(ctx.selfMemberBytes);
 
+	// Per-coord threshold signers: each assembles a real k − x signature by signing locally and collecting
+	// the rest of the cohort around THIS served coord over the `/sign` RPC. `membership` signs the cert;
+	// `promotion` signs promote/demote notices (kind drives the dialed members' endorsement policy). In
+	// key-less interim mode there is no key to sign self's chunk, so the signer is verify-only (the
+	// publisher / promotion paths are simply not driven without a key).
+	const makeCoordSigner = (kind: SignKind): CohortSigner => {
+		if (ctx.privateKey === undefined) {
+			return createCohortSigner(createVerifyOnlyThresholdCrypto(), ctx.minSigs);
+		}
+		const crypto = new FretCohortThresholdCrypto({
+			kind,
+			privateKey: ctx.privateKey,
+			selfMember: ctx.selfMemberBytes,
+			coord: (): RingCoord => servedCoord,
+			cohortEpoch: localEpoch,
+			cohortMembers: (): string[] => cohort().members.map(bytesToPeerIdString),
+			dialSign: ctx.dialSign,
+		});
+		return createCohortSigner(crypto, ctx.minSigs);
+	};
+	const noticeSigner = makeCoordSigner("promotion");
+	const membershipSigner = makeCoordSigner("membership");
+
+	// Cohort-side membership-cert publisher: threshold-signs a MembershipCertV1 over this coord's cohort
+	// and serves it through the node's publish sink. Driven by the onStabilized / pumpMembership hooks.
+	const membershipPublisher: MembershipCertPublisher = createMembershipCertPublisher({
+		signer: membershipSigner,
+		sink: ctx.publishSink,
+		minSigs: ctx.minSigs,
+		maxMessageBytes: ctx.maxBytes,
+	});
+	const snapshotAt = (now: number): CohortSnapshot => {
+		const { members, cohortEpoch } = cohort();
+		return { coord: servedCoord, cohortEpoch, members, stabilizedAt: now };
+	};
+
 	const willingness = createWillingnessCheck({
 		barometer: ctx.barometer,
 		view,
@@ -435,7 +537,7 @@ function createCoordEngine(ctx: CoordEngineContext, servedCoord: RingCoord, tree
 		// the `d = 0` branch (clamped to `coord_0`) is a well-formed placeholder that the lifecycle skips.
 		parentCoord: (topicId: Uint8Array): Uint8Array => ctx.addressing.coord(Math.max(0, treeTier - 1), participantCoord, topicId),
 		cohortEpoch: localEpoch,
-		signer: ctx.signer,
+		signer: noticeSigner,
 		config: { capPromote: undefined },
 	});
 	const coldStart = createColdStartManager({
@@ -490,6 +592,8 @@ function createCoordEngine(ctx: CoordEngineContext, servedCoord: RingCoord, tree
 		hasState: (): boolean => store.listAll().length > 0,
 		holds: (topicId: Uint8Array, participantId: Uint8Array): boolean =>
 			store.getByParticipant(topicId, participantId) !== undefined,
+		onStabilized: (now: number): Promise<MembershipCertV1 | undefined> => membershipPublisher.onStabilized(snapshotAt(now), now),
+		pumpMembership: (now: number): Promise<MembershipCertV1 | undefined> => membershipPublisher.tick(snapshotAt(now), now),
 		close: (): void => bus.close(),
 	};
 }
@@ -509,6 +613,52 @@ export function resolveRenew(registry: CoordRegistry, renew: RenewV1, now: numbe
 		return { v: 1, result: "unknown_registration" };
 	}
 	return holder.engine.handleRenew(renew, now);
+}
+
+// --- intra-cohort sign endorsement ---
+
+/** Dependencies for the `/sign` endorsement policy ({@link handleSignRequest}). */
+export interface SignEndorsementDeps {
+	/** The node's libp2p key (signs the endorsement). Absent → every request is refused (no key to sign with). */
+	readonly privateKey: PrivateKey | undefined;
+	/** Self's dialable member id (UTF-8 peer-id string bytes). */
+	readonly selfMember: Uint8Array;
+	/** Cohort member peer-id strings around `coord` (self included). */
+	readonly cohortMembersAround: (coord: RingCoord) => string[];
+	/** Current cohort epoch (raw bytes) for `coord`. */
+	readonly currentEpoch: (coord: RingCoord) => Uint8Array;
+}
+
+/**
+ * The `/sign` endorsement policy: decide whether to endorse a {@link SignRequestV1} and, if so, return
+ * this node's Ed25519 peer-key signature over the **exact** request payload. A member endorses only when
+ * both it and the requester are members of the cohort around `coord` under the request's epoch — so it
+ * never signs for outsiders and never re-canonicalizes the bytes (it signs precisely what the assembled
+ * signature will later be verified against). One Ed25519 sign and nothing more.
+ *
+ * The kind-specific refinement for `promotion` / `demotion` (the endorser additionally requiring its own
+ * replicated `directParticipants` to be hot / cold) is deferred: it needs the per-topic binding the
+ * `(payload, minSigs)` port can't carry and the gossip record replication that is still interim. For the
+ * `membership` cert path — this milestone's deliverable — the cohort + epoch gate IS the full policy (the
+ * participant verifier independently re-checks `signers ⊆ cert.members`). See the implement handoff.
+ */
+export async function handleSignRequest(request: SignRequestV1, fromPeerStr: string, deps: SignEndorsementDeps): Promise<SignReplyV1> {
+	if (deps.privateKey === undefined) {
+		return { v: 1, refused: true, reason: "node has no signing key" };
+	}
+	const coord = b64urlToBytes(request.coord);
+	const members = deps.cohortMembersAround(coord);
+	if (!members.includes(bytesToPeerIdString(deps.selfMember))) {
+		return { v: 1, refused: true, reason: "not a cohort member for coord" };
+	}
+	if (!members.includes(fromPeerStr)) {
+		return { v: 1, refused: true, reason: "requester not in cohort" };
+	}
+	if (!bytesEqual(b64urlToBytes(request.cohortEpoch), deps.currentEpoch(coord))) {
+		return { v: 1, refused: true, reason: "cohort epoch mismatch" };
+	}
+	const signature = await signPeer(deps.privateKey, b64urlToBytes(request.payload));
+	return { v: 1, signer: bytesToB64url(deps.selfMember), signature: bytesToB64url(signature) };
 }
 
 // --- helpers ---
@@ -561,6 +711,7 @@ async function registerProtocolHandlers(
 	protocols: CohortTopicProtocols,
 	registry: CoordRegistry,
 	dispatchRegister: (reg: RegisterV1, fretCohort: readonly string[] | undefined, now: number) => Promise<RegisterReplyV1>,
+	signEndorse: (request: SignRequestV1, fromPeerStr: string) => Promise<SignReplyV1>,
 	gossipTransport: FretCohortGossipTransport,
 	publishSink: FretMembershipPublishSink,
 	membershipSource: FretMembershipSource,
@@ -600,6 +751,15 @@ async function registerProtocolHandlers(
 				membershipSource.cache(selfCoord, latest);
 			}
 			return latest ?? new Uint8Array(0);
+		}, maxBytes)),
+
+		// sign: per-member endorsement for threshold-signature assembly. Validate the request, run the
+		// endorsement policy, and reply with this node's peer-key signature over the request payload (or a
+		// refusal). One Ed25519 sign and nothing more — the cohort + epoch gate bounds who we sign for.
+		node.handle(protocols.sign, makeFrameHandler(async (frame, from): Promise<Uint8Array | undefined> => {
+			const request = validateSignRequestV1(decodeCohortMessage(frame, maxBytes));
+			const reply = await signEndorse(request, from.toString());
+			return encodeCohortMessage(reply, maxBytes);
 		}, maxBytes)),
 	]);
 }

@@ -781,7 +781,19 @@ A participant verifying a threshold-signed message against an out-of-date `Membe
 /optimystic/cohort-topic/1.0.0/cohort-gossip  — Registration replication, willingness vectors, load barometers
 /optimystic/cohort-topic/1.0.0/promote        — Threshold-signed promotion / demotion notices
 /optimystic/cohort-topic/1.0.0/membership     — Membership certificates
+/optimystic/cohort-topic/1.0.0/sign           — Per-member endorsement for k − x threshold-signature assembly
 ```
+
+The `k − x` threshold signature carried by promotion / demotion notices and membership certificates is
+a **collected Ed25519 multi-signature**: the assembling member signs the canonical payload locally and
+dials each cohort member over `/sign` (`SignRequestV1` → `SignReplyV1`), concatenating the per-member
+signatures (64 bytes each) into `thresholdSig` aligned with `signers`. A member endorses only the exact
+bytes it is sent (no re-canonicalization) and only for a cohort + epoch it shares. Verification splits
+the blob into `signers.length` chunks and checks each against its signer's embedded peer key; the
+db-core `CohortSigner.verifyThreshold` layer adds the distinct-signer / `signers ⊆ members` / `≥ minSigs`
+checks. The scheme needs no trusted setup, no new crypto dependency, and no aggregation round; it is
+O(k) in size (≤ ~14 × 64 bytes at the default `minSigs`) and swappable behind the `ICohortThresholdCrypto`
+port if a constant-size scheme is ever needed at larger `k`.
 
 Application-specific protocols (notification delivery for reactivity, query for matchmaking, etc.) live under their own subsystem prefix and reuse only the cohort identity and primary/backup assignment from this layer.
 

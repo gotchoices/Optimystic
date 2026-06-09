@@ -209,6 +209,46 @@ export interface CohortTopicSummary {
 	childCohortCount: number;
 }
 
+/** What a {@link SignRequestV1} asks a cohort member to endorse — drives the signer's endorsement policy. */
+export type SignKind = "membership" | "promotion" | "demotion";
+
+/**
+ * Intra-cohort sign request (`/optimystic/cohort-topic/1.0.0/sign`). A member assembling a `k − x`
+ * threshold signature dials each cohort member with this; the member endorses by Ed25519-signing the
+ * **exact** `payload` bytes (already canonicalized by the requester via `sig/payloads.ts`), so signer
+ * and verifier never re-canonicalize independently. `coord`/`cohortEpoch` scope the endorsement
+ * (the member checks it shares that cohort/epoch); `kind` selects the endorsement policy.
+ */
+export interface SignRequestV1 {
+	v: 1;
+	kind: SignKind;
+	/** Cohort coord the signature is for, 32 bytes, base64url. */
+	coord: string;
+	/** Cohort epoch the requester is collecting under, 32 bytes, base64url. */
+	cohortEpoch: string;
+	/** The already-canonical signing bytes (the requester's `sig/payloads.ts` image), base64url. */
+	payload: string;
+}
+
+/** A member's endorsement of a {@link SignRequestV1}: its peer-key signature over the request payload. */
+export interface SignReplyOkV1 {
+	v: 1;
+	/** The endorsing member's dialable id (UTF-8 peer-id string), base64url. */
+	signer: string;
+	/** Ed25519 signature over the request `payload`, base64url (64 bytes decoded). */
+	signature: string;
+}
+
+/** A member's refusal to endorse a {@link SignRequestV1} (not a cohort member, epoch mismatch, …). */
+export interface SignReplyRefusedV1 {
+	v: 1;
+	refused: true;
+	reason: string;
+}
+
+/** Reply to a {@link SignRequestV1}: an endorsement ({@link SignReplyOkV1}) or a refusal ({@link SignReplyRefusedV1}). */
+export type SignReplyV1 = SignReplyOkV1 | SignReplyRefusedV1;
+
 /** Membership certificate for a cohort. */
 export interface MembershipCertV1 {
 	v: 1;
@@ -234,4 +274,7 @@ export type CohortMessageV1 =
 	| PromotionNoticeV1
 	| DemotionNoticeV1
 	| CohortGossipV1
-	| MembershipCertV1;
+	| MembershipCertV1
+	| SignRequestV1
+	| SignReplyOkV1
+	| SignReplyRefusedV1;

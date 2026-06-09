@@ -20,6 +20,8 @@ import {
 	validateRegisterV1,
 	validateRenewReplyV1,
 	validateRenewV1,
+	validateSignRequestV1,
+	validateSignReplyV1,
 } from "./validate.js";
 import type {
 	CohortGossipV1,
@@ -30,6 +32,8 @@ import type {
 	RegisterV1,
 	RenewReplyV1,
 	RenewV1,
+	SignRequestV1,
+	SignReplyV1,
 } from "./types.js";
 
 /**
@@ -189,4 +193,12 @@ export function decodeCohortGossipV1(bytes: Uint8Array, maxMessageBytes?: number
 
 export function decodeMembershipCertV1(bytes: Uint8Array, maxMessageBytes?: number): MembershipCertV1 {
 	return validateMembershipCertV1(decodeCohortMessage(bytes, maxMessageBytes));
+}
+
+export function decodeSignRequestV1(bytes: Uint8Array, maxMessageBytes?: number): SignRequestV1 {
+	return validateSignRequestV1(decodeCohortMessage(bytes, maxMessageBytes));
+}
+
+export function decodeSignReplyV1(bytes: Uint8Array, maxMessageBytes?: number): SignReplyV1 {
+	return validateSignReplyV1(decodeCohortMessage(bytes, maxMessageBytes));
 }

@@ -11,4 +11,6 @@ export {
 	validateDemotionNoticeV1,
 	validateCohortGossipV1,
 	validateMembershipCertV1,
+	validateSignRequestV1,
+	validateSignReplyV1,
 } from "./validate.js";

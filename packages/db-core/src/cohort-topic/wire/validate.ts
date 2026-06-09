@@ -22,6 +22,9 @@ import type {
 	RegisterV1,
 	RenewReplyV1,
 	RenewV1,
+	SignKind,
+	SignRequestV1,
+	SignReplyV1,
 	TopicTrafficV1,
 } from "./types.js";
 
@@ -383,6 +386,39 @@ export function validateCohortGossipV1(value: unknown): CohortGossipV1 {
 		out.evicted = evicted.map(validateGossipRecordRefV1);
 	}
 	return out;
+}
+
+const SIGN_KINDS: readonly SignKind[] = ["membership", "promotion", "demotion"];
+
+export function validateSignRequestV1(value: unknown): SignRequestV1 {
+	const what = "SignRequestV1";
+	const obj = asObject(value, what);
+	requireV1(obj, what);
+	return {
+		v: 1,
+		kind: reqEnum(obj, "kind", SIGN_KINDS, what),
+		coord: b64urlField(reqString(obj, "coord", what), "coord", what),
+		cohortEpoch: b64urlField(reqString(obj, "cohortEpoch", what), "cohortEpoch", what),
+		payload: b64urlField(reqString(obj, "payload", what), "payload", what),
+	};
+}
+
+export function validateSignReplyV1(value: unknown): SignReplyV1 {
+	const what = "SignReplyV1";
+	const obj = asObject(value, what);
+	requireV1(obj, what);
+	// Discriminated by `refused`: a refusal carries a reason; an endorsement carries signer + signature.
+	if (obj["refused"] !== undefined) {
+		if (obj["refused"] !== true) {
+			fail(`${what}: field "refused" must be true when present`);
+		}
+		return { v: 1, refused: true, reason: reqString(obj, "reason", what) };
+	}
+	return {
+		v: 1,
+		signer: b64urlField(reqString(obj, "signer", what), "signer", what),
+		signature: b64urlField(reqString(obj, "signature", what), "signature", what),
+	};
 }
 
 export function validateMembershipCertV1(value: unknown): MembershipCertV1 {

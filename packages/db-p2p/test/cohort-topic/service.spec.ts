@@ -239,7 +239,7 @@ describe('cohort-topic: FRET host protocol handshake', () => {
 		return peerIdFromPrivateKey(key);
 	}
 
-	it('registers handlers on each of the four /optimystic/cohort-topic/1.0.0/* protocols', async () => {
+	it('registers handlers on each of the five /optimystic/cohort-topic/1.0.0/* protocols', async () => {
 		const handled = new Set<string>();
 		const peerId = await makePeerId();
 		const fakeNode = {
@@ -268,6 +268,7 @@ describe('cohort-topic: FRET host protocol handshake', () => {
 			DEFAULT_COHORT_TOPIC_PROTOCOLS.gossip,
 			DEFAULT_COHORT_TOPIC_PROTOCOLS.promote,
 			DEFAULT_COHORT_TOPIC_PROTOCOLS.membership,
+			DEFAULT_COHORT_TOPIC_PROTOCOLS.sign,
 		]) {
 			expect(handled.has(protocol), `handler for ${protocol}`).to.equal(true);
 		}
