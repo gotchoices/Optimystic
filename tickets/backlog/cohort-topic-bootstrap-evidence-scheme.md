@@ -11,9 +11,9 @@ The anti-DoS wiring ticket (`cohort-topic-host-antidos-coldstart`) constructed t
 `BootstrapEvidence` policy and wired it into every cohort, but db-core embeds no PoW / reputation /
 committed-work scheme, so the host injects the **verifiers**. Today those default to a
 **permissive-but-logged** fallback (one-time warning, never an undefined gate): unless the caller
-passes an `antiDos.reputation` view (which gates T0/T1 on a non-banned participant) or explicit
-`antiDos.bootstrapEvidence` verifiers, a cold-root `bootstrap: true` register is admitted without
-real cryptographic evidence.
+passes an `antiDos.reputation` view (which gates all tiers on a non-banned participant — the unwired
+PoW verifier fails closed once any gating is configured) or explicit `antiDos.bootstrapEvidence`
+verifiers, a cold-root `bootstrap: true` register is admitted without real cryptographic evidence.
 
 Per `docs/cohort-topic.md` §Anti-DoS bullet 4, a cold root must demand one of:
 

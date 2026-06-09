@@ -212,9 +212,11 @@ export interface CohortTopicAntiDosOptions {
 	/**
 	 * Optional peer-reputation view backing the default T0/T1 committed-work proxy and the T2/T3
 	 * reputation evidence: a non-banned participant satisfies the evidence (these tiers correspond to
-	 * committed work). When omitted (and no `bootstrapEvidence` verifier is supplied), the default is
-	 * permissive-but-logged — the production PoW / committed-work-reference schemes are deferred (see
-	 * `tickets/backlog/cohort-topic-bootstrap-evidence-scheme`).
+	 * committed work). Supplying it makes the gate effective at **all** tiers — the unwired PoW verifier
+	 * then fails closed (deny) rather than permissive, so a banned peer cannot slip through the T2/T3
+	 * `PoW || reputation || parent-ref` disjunction. When omitted (and no `bootstrapEvidence` verifier is
+	 * supplied), the default is permissive-but-logged — the production PoW / committed-work-reference
+	 * schemes are deferred (see `tickets/backlog/cohort-topic-bootstrap-evidence-scheme`).
 	 */
 	readonly reputation?: BootstrapReputationView;
 }
@@ -724,6 +726,14 @@ function createBootstrapEvidencePolicy(
 			}
 		};
 
+	// Once ANY real gating is configured (a reputation view or explicit verifiers), an unfilled verifier
+	// must fail **closed** (deny), not open. Otherwise, e.g., a reputation view with no PoW scheme would
+	// leave `verifyPoW` permissive, and the T2/T3 gate (`verifyPoW(reg) || verifyReputation(reg) || …`)
+	// would admit even a banned peer — silently defeating the reputation gate. The permissive-but-logged
+	// fallback below is therefore reserved for the *entirely unconfigured* interim node.
+	const configured = overrides !== undefined || reputation !== undefined;
+	const deny = (): boolean => false;
+
 	// Permissive-but-logged fallback (one warning total): keeps the gate defined while the production
 	// evidence schemes are unwired, instead of silently leaving cold-root bootstrap unauthenticated.
 	let warned = false;
@@ -735,11 +745,13 @@ function createBootstrapEvidencePolicy(
 		}
 		return true;
 	};
+	// An unconfigured verifier: deny when the policy is otherwise configured (fail closed), else permissive.
+	const fallback = (kind: string): ((reg: RegisterV1) => boolean) => configured ? deny : permissive(kind);
 
 	return createBootstrapEvidence({
-		verifyParentReference: overrides?.verifyParentReference ?? reputationVerifier ?? permissive("parent-reference"),
-		verifyReputation: overrides?.verifyReputation ?? reputationVerifier ?? permissive("reputation"),
-		verifyPoW: overrides?.verifyPoW ?? permissive("proof-of-work"),
+		verifyParentReference: overrides?.verifyParentReference ?? reputationVerifier ?? fallback("parent-reference"),
+		verifyReputation: overrides?.verifyReputation ?? reputationVerifier ?? fallback("reputation"),
+		verifyPoW: overrides?.verifyPoW ?? fallback("proof-of-work"),
 		config: overrides?.config,
 	});
 }

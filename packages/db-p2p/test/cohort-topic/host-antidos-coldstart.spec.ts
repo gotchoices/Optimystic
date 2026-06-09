@@ -173,6 +173,41 @@ describe('cohort-topic: host anti-DoS wiring (gap 6)', () => {
 		await okHost.stop();
 	});
 
+	it('bootstrap evidence gates T2/T3 too: a reputation view fails PoW closed so a banned peer cannot slip the disjunction', async () => {
+		// T2/T3 accept `PoW || reputation || parent-ref`. With a reputation view but no wired PoW scheme,
+		// the PoW verifier must fail CLOSED — otherwise a permissive PoW short-circuits the `||` to admit
+		// even a banned peer, silently defeating the reputation gate (regression for that hole).
+		const participant = await makeParticipantBytes();
+		const now = 1_000_000;
+
+		const banHost = await createCohortTopicHost(makeFakeNode(await makePeerId()) as never, makeFakeFret() as never, {
+			wantK: 1,
+			antiDos: { reputation: { isBanned: (): boolean => true } },
+		});
+		const ceBan = banHost.registry.forCoord(addressing.coord0(TOPIC), 2 as Tier, participant);
+		const bannedT2 = await ceBan.engine.handleRegister(
+			makeReg(participant, TOPIC, 'cid-t2-ban', now, { tier: 2 }),
+			{ followOn: false, treeTier: 0 },
+			now,
+		);
+		expect(bannedT2.result, 'a banned peer is denied at T2 — PoW does not slip it through').to.equal('unwilling_cohort');
+		await banHost.stop();
+
+		// A non-banned peer satisfies the T2/T3 reputation option → admitted (the gate is effective, not deny-all).
+		const okHost = await createCohortTopicHost(makeFakeNode(await makePeerId()) as never, makeFakeFret() as never, {
+			wantK: 1,
+			antiDos: { reputation: { isBanned: (): boolean => false } },
+		});
+		const ceOk = okHost.registry.forCoord(addressing.coord0(TOPIC), 2 as Tier, participant);
+		const okT2 = await ceOk.engine.handleRegister(
+			makeReg(participant, TOPIC, 'cid-t2-ok', now, { tier: 2 }),
+			{ followOn: false, treeTier: 0 },
+			now,
+		);
+		expect(okT2.result, 'a non-banned peer satisfies the T2 reputation evidence').to.equal('accepted');
+		await okHost.stop();
+	});
+
 	it('renewal is not replay-gated: a renew reusing the correlationId is served past the replay window', async () => {
 		const host = await createCohortTopicHost(makeFakeNode(await makePeerId()) as never, makeFakeFret() as never, { wantK: 1 });
 		const participant = await makeParticipantBytes();
