@@ -11,7 +11,7 @@ import {
 	DEFAULT_T_PROMOTE_STICKY_MS,
 } from '../../src/cohort-topic/promotion.js';
 import type { CohortSigner } from '../../src/cohort-topic/sig/threshold.js';
-import type { PromotionNoticeV1 } from '../../src/cohort-topic/wire/types.js';
+import type { DemotionNoticeV1, PromotionNoticeV1 } from '../../src/cohort-topic/wire/types.js';
 import { bytesToB64url } from '../../src/cohort-topic/wire/codec.js';
 
 function bytes(label: string, len = 32): Uint8Array {
@@ -172,5 +172,63 @@ describe('cohort-topic / promotion lifecycle', () => {
 		// Drive low-load clock far into the past, no children, never promoted.
 		await life.onParticipantCountChange(TOPIC, 0);
 		expect(await life.maybeDemote(TOPIC, DEFAULT_T_DEMOTE_MS * 10)).to.equal(undefined);
+	});
+});
+
+describe('cohort-topic / promotion remote-apply path', () => {
+	const promoNotice = (effectiveAt: number): PromotionNoticeV1 => ({
+		v: 1, topicId: bytesToB64url(TOPIC), fromTier: 1, toTier: 2, effectiveAt,
+		thresholdSig: '', signers: [], cohortEpoch: bytesToB64url(EPOCH),
+	});
+	const demoNotice = (effectiveAt: number): DemotionNoticeV1 => ({
+		v: 1, topicId: bytesToB64url(TOPIC), tier: 1, parentCohortCoord: bytesToB64url(PARENT), effectiveAt,
+		thresholdSig: '', signers: [], cohortEpoch: bytesToB64url(EPOCH),
+	});
+	const fresh = (): ReturnType<typeof lifecycleWith> => lifecycleWith({ count: 0, loadBucket: 0, children: 0, treeTier: 1 });
+
+	it('applyPromotionNotice flips isPromoted; applyDemotionNotice clears it (no re-sign)', () => {
+		const life = fresh();
+		expect(life.isPromoted(TOPIC), 'starts un-promoted').to.be.false;
+		life.applyPromotionNotice(promoNotice(100), 1_000);
+		expect(life.isPromoted(TOPIC), 'a verified remote promotion is adopted').to.be.true;
+		life.applyDemotionNotice(demoNotice(200), 2_000);
+		expect(life.isPromoted(TOPIC), 'a verified remote demotion is adopted').to.be.false;
+	});
+
+	it('ignores a stale (older effectiveAt) notice — a replayed promotion cannot un-demote', () => {
+		const life = fresh();
+		life.applyPromotionNotice(promoNotice(100), 1_000);
+		life.applyDemotionNotice(demoNotice(200), 2_000);
+		expect(life.isPromoted(TOPIC)).to.be.false;
+		life.applyPromotionNotice(promoNotice(100), 3_000); // replayed at-the-old-effectiveAt promotion
+		expect(life.isPromoted(TOPIC), 'a replayed promotion ≤ high-water is ignored — stays demoted').to.be.false;
+		life.applyPromotionNotice(promoNotice(50), 3_000); // even older
+		expect(life.isPromoted(TOPIC), 'an even older promotion is ignored too').to.be.false;
+	});
+
+	it('absorbs a duplicate notice (idempotent) yet still applies a strictly newer one', () => {
+		const life = fresh();
+		life.applyPromotionNotice(promoNotice(100), 1_000);
+		life.applyPromotionNotice(promoNotice(100), 1_500); // duplicate (e.g. our own echoed broadcast)
+		expect(life.isPromoted(TOPIC), 'duplicate absorbed, still promoted').to.be.true;
+		life.applyDemotionNotice(demoNotice(200), 2_000);
+		expect(life.isPromoted(TOPIC)).to.be.false;
+		life.applyPromotionNotice(promoNotice(300), 3_000); // strictly newer → re-promotes
+		expect(life.isPromoted(TOPIC), 'a transition past the high-water mark applies').to.be.true;
+	});
+
+	it('a self-originated promotion absorbs its own echoed broadcast and cannot be un-demoted by it', async () => {
+		const knobs: Knobs = { count: DEFAULT_CAP_PROMOTE, loadBucket: 0, children: 0, treeTier: 1 };
+		const life = lifecycleWith(knobs);
+		const own = await life.onParticipantCountChange(TOPIC, 500); // local promote, effectiveAt = 500
+		expect(own, 'local promotion produced a notice').to.not.equal(undefined);
+		expect(life.isPromoted(TOPIC)).to.be.true;
+		// The broadcast loops back to us: re-applying our own notice is guarded out (effectiveAt 500 ≤ 500).
+		life.applyPromotionNotice(own!, 600);
+		expect(life.isPromoted(TOPIC), 'self-broadcast changed nothing').to.be.true;
+		// After a later demotion, the same echoed promotion still cannot reopen promoted mode.
+		life.applyDemotionNotice(demoNotice(700), 800);
+		life.applyPromotionNotice(own!, 900);
+		expect(life.isPromoted(TOPIC), 'echoed self-promotion cannot un-demote').to.be.false;
 	});
 });

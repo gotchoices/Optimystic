@@ -518,6 +518,24 @@ A cohort may also pre-promote on observing rapid growth: if the slope of `direct
 > module tier-agnostic and FRET-free. Defaults match §Configuration. Spec: `promotion.spec.ts`
 > (cap/fast/slope triggers, no-flap within `T_promote_sticky`, demotion gated on children + `T_demote`,
 > root never demotes).
+>
+> **Broadcast + remote apply.** `promote()` / `demote()` set the cohort's per-topic state only on the
+> member that *originates* a notice. A member that **learns** of a transition (via the `promote` protocol
+> fan-out) adopts it through `applyPromotionNotice` / `applyDemotionNotice`, which set the same
+> `PromotionState` **without re-signing** (the notice is already a verified quorum decision — db-core is
+> crypto-free and trusts that the caller verified it). The apply path is idempotent and `effectiveAt`-
+> ordered via a monotonic per-topic high-water mark that survives demotion, so re-applying a notice
+> (including a member's own echoed broadcast) or a replayed older one is a no-op — a stale promotion can
+> never un-demote a cohort. `isPromoted` reflects remotely-applied state, so a member that learned of a
+> promotion answers `Promoted(d+1)` even though it did not originate it. On the wire (db-p2p host): a
+> freshly-signed notice surfaced on an arrival is captured via the engine's `onNotice` hook and
+> `sendOneWay`-broadcast over the `promote` protocol to the cohort around the served coord (and, for a
+> demotion, additionally the parent coord); inbound, the `promote` handler decodes the notice, resolves
+> the local coord engine serving its `(topic, tier)`, verifies the threshold signature against that
+> cohort's `MembershipCertV1` via the participant `MembershipVerifier` (signers ⊆ cert, `≥ minSigs`,
+> multisig valid), and applies it — untrusted or undeliverable notices are dropped. Specs:
+> `promotion.spec.ts` (remote-apply ordering/idempotency), db-p2p `promote-notice.spec.ts`
+> (verify + apply, forged/short-quorum + non-member rejection, no-engine drop, broadcast fan-out).
 
 ### Demotion (cohort shrinks)
 

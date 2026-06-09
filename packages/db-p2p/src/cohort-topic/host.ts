@@ -69,17 +69,24 @@ import {
 	validateRenewV1,
 	validateSignRequestV1,
 	validateSignReplyV1,
+	validatePromotionNoticeV1,
+	validateDemotionNoticeV1,
 	registerSigningPayload,
 	renewSigningPayload,
+	promotionNoticeSigningPayload,
+	demotionNoticeSigningPayload,
 	type CohortTopicService,
 	type CohortMemberEngine,
 	type CohortSnapshot,
 	type CohortSnapshotView,
 	type CohortSigner,
+	type DemotionNoticeV1,
 	type MembershipCertPublisher,
 	type MembershipCertV1,
+	type MembershipVerifier,
 	type NodeProfile,
 	type ParticipantSigner,
+	type PromotionNoticeV1,
 	type RegisterReplyV1,
 	type RegisterV1,
 	type RenewReplyV1,
@@ -159,6 +166,14 @@ export interface CoordEngine {
 	 * `T_membership_refresh` has elapsed). Returns the cert if (re)published, else `undefined`.
 	 */
 	pumpMembership(now: number): Promise<MembershipCertV1 | undefined>;
+	/** True iff this engine currently serves `topicId` (holds a record or a cold-start forwarder for it). */
+	servesTopic(topicId: Uint8Array): boolean;
+	/** Whether `topicId` is in promoted mode here — reflects both locally-originated and remotely-applied state. */
+	isPromoted(topicId: Uint8Array): boolean;
+	/** Adopt a verified promotion notice into this cohort's local state (see {@link NoticeApplyTarget}). */
+	applyPromotionNotice(notice: PromotionNoticeV1, now: number): void;
+	/** Adopt a verified demotion notice into this cohort's local state (see {@link NoticeApplyTarget}). */
+	applyDemotionNotice(notice: DemotionNoticeV1, now: number): void;
 	/** Tear down the per-coord gossip subscription. */
 	close(): void;
 }
@@ -174,6 +189,13 @@ export interface CoordRegistry {
 	forCoord(coord: RingCoord, treeTier: number, participantCoord: Uint8Array): CoordEngine;
 	/** The engine holding the record for `(topicId, participantId)`, or `undefined` (renewal dispatch). */
 	findHolder(topicId: Uint8Array, participantId: Uint8Array): CoordEngine | undefined;
+	/**
+	 * The engine serving `topicId` at `treeTier`, or `undefined` (inbound promote/demote notice dispatch).
+	 * A served coord embeds `(tier, topic)`, so at most one engine matches — the cohort the notice's
+	 * signers belong to. `undefined` means this node serves no such cohort (e.g. a demotion arriving at a
+	 * parent that does not track the child), so the notice is dropped rather than applied.
+	 */
+	findServing(topicId: Uint8Array, treeTier: number): CoordEngine | undefined;
 	/** Every live engine (stop + sweep). */
 	all(): readonly CoordEngine[];
 	/** Close every engine's gossip subscription. */
@@ -220,6 +242,18 @@ interface CoordEngineContext {
 	readonly verifyRegisterSig?: (reg: RegisterV1) => boolean;
 	/** Verify an inbound `reattach` `RenewV1`'s participant peer-key signature (live-signer mode only). */
 	readonly verifyReattachSig?: (renew: RenewV1) => boolean;
+	/**
+	 * Broadcast a freshly threshold-signed promotion/demotion notice this engine produced over the
+	 * `promote` protocol — to the cohort around `servedCoord`, plus the parent coord for a demotion.
+	 * Wired by the host; absent in key-less / unit composition.
+	 */
+	readonly broadcastNotice?: (notice: PromotionNoticeV1 | DemotionNoticeV1, servedCoord: RingCoord) => void;
+	/**
+	 * Hook a freshly published `MembershipCertV1` (from {@link CoordEngine.onStabilized} /
+	 * {@link CoordEngine.pumpMembership}) into the node's verifier cache, so this node can verify inbound
+	 * notices signed by its own cohort without a network refetch. Absent in unit composition.
+	 */
+	readonly onCertPublished?: (cert: MembershipCertV1) => void;
 }
 
 /**
@@ -296,6 +330,18 @@ export async function createCohortTopicHost(node: Libp2p, fret: FretService, opt
 			renew.signature.length > 0 &&
 			verifyPeerSig(b64urlToBytes(renew.participantId), renewSigningPayload(renew), b64urlToBytes(renew.signature));
 
+	// --- outbound notice broadcast (gap 4) ---
+	// A coord engine that threshold-signs a promotion/demotion notice hands it here; we fan it over the
+	// `promote` protocol to the cohort around the served coord (siblings adopt the state) and, for a
+	// demotion, additionally to the parent coord (childCohortCount bookkeeping). Reuses the gossip
+	// transport's cohort peer resolution.
+	const broadcastNotice = (notice: PromotionNoticeV1 | DemotionNoticeV1, servedCoord: RingCoord): void => {
+		const frame = encodeCohortMessage(notice, maxBytes);
+		for (const coord of noticeBroadcastCoords(notice, servedCoord)) {
+			gossipTransport.broadcastOver(protocols.promote, coord, frame);
+		}
+	};
+
 	const ctx: CoordEngineContext = {
 		hash,
 		addressing,
@@ -313,6 +359,11 @@ export async function createCohortTopicHost(node: Libp2p, fret: FretService, opt
 		cohortAround,
 		verifyRegisterSig,
 		verifyReattachSig,
+		broadcastNotice,
+		// Cache this node's own freshly-published cohort cert into the verifier, so an inbound notice
+		// signed by this node's cohort verifies locally without a network refetch. `verifier` is declared
+		// just below; the closure only runs on a (later) publish, after it is initialized.
+		onCertPublished: (cert: MembershipCertV1): void => verifier.cache(cert),
 	};
 	const registry = createCoordRegistry(ctx);
 
@@ -373,7 +424,7 @@ export async function createCohortTopicHost(node: Libp2p, fret: FretService, opt
 
 	// --- protocol handlers + activity callback ---
 	// Await registration so the host is not returned (and dialed) before the four handlers are live.
-	await registerProtocolHandlers(node, protocols, registry, dispatchRegister, signEndorse, gossipTransport, publishSink, membershipSource, selfCoord, maxBytes);
+	await registerProtocolHandlers(node, protocols, registry, dispatchRegister, signEndorse, verifier, gossipTransport, publishSink, membershipSource, selfCoord, maxBytes);
 	fret.setActivityHandler(async (activity: string, cohort: string[]): Promise<{ commitCertificate: string }> => {
 		const reg = validateRegisterV1(decodeCohortMessage(b64urlToBytes(activity), maxBytes));
 		const reply = await dispatchRegister(reg, cohort, Date.now());
@@ -450,6 +501,14 @@ function createCoordRegistry(ctx: CoordEngineContext): CoordRegistry {
 		findHolder(topicId: Uint8Array, participantId: Uint8Array): CoordEngine | undefined {
 			for (const engine of engines.values()) {
 				if (engine.holds(topicId, participantId)) {
+					return engine;
+				}
+			}
+			return undefined;
+		},
+		findServing(topicId: Uint8Array, treeTier: number): CoordEngine | undefined {
+			for (const engine of engines.values()) {
+				if (engine.treeTier === treeTier && engine.servesTopic(topicId)) {
 					return engine;
 				}
 			}
@@ -587,7 +646,22 @@ function createCoordEngine(ctx: CoordEngineContext, servedCoord: RingCoord, tree
 		cohort,
 		quorumWilling: (tier: Tier): boolean => ctx.profile.willingTiers.has(tier),
 		verifyRegisterSig: ctx.verifyRegisterSig,
+		// A promotion notice signed on an arrival is broadcast to the cohort around this served coord
+		// (and the parent for a demotion). The engine only knows the notice; the host adds the coord.
+		onNotice: (notice): void => ctx.broadcastNotice?.(notice, servedCoord),
+		log,
 	});
+
+	// Publish + cache: feed each freshly-published cert into the verifier so inbound notices signed by
+	// this cohort verify without a network refetch. Both hooks no-op in key-less interim mode (the
+	// verify-only per-coord signer cannot assemble — see the `canPublish` contract).
+	const publishAndCache = async (cert: Promise<MembershipCertV1 | undefined>): Promise<MembershipCertV1 | undefined> => {
+		const published = await cert;
+		if (published !== undefined) {
+			ctx.onCertPublished?.(published);
+		}
+		return published;
+	};
 
 	return {
 		servedCoord,
@@ -597,10 +671,15 @@ function createCoordEngine(ctx: CoordEngineContext, servedCoord: RingCoord, tree
 		hasState: (): boolean => store.listAll().length > 0,
 		holds: (topicId: Uint8Array, participantId: Uint8Array): boolean =>
 			store.getByParticipant(topicId, participantId) !== undefined,
+		servesTopic: (topicId: Uint8Array): boolean =>
+			store.directParticipants(topicId) > 0 || coldStart.get(topicId) !== undefined,
+		isPromoted: (topicId: Uint8Array): boolean => promotion.isPromoted(topicId),
+		applyPromotionNotice: (notice, now): void => promotion.applyPromotionNotice(notice, now),
+		applyDemotionNotice: (notice, now): void => promotion.applyDemotionNotice(notice, now),
 		onStabilized: (now: number): Promise<MembershipCertV1 | undefined> =>
-			canPublish ? membershipPublisher.onStabilized(snapshotAt(now), now) : Promise.resolve(undefined),
+			canPublish ? publishAndCache(membershipPublisher.onStabilized(snapshotAt(now), now)) : Promise.resolve(undefined),
 		pumpMembership: (now: number): Promise<MembershipCertV1 | undefined> =>
-			canPublish ? membershipPublisher.tick(snapshotAt(now), now) : Promise.resolve(undefined),
+			canPublish ? publishAndCache(membershipPublisher.tick(snapshotAt(now), now)) : Promise.resolve(undefined),
 		close: (): void => bus.close(),
 	};
 }
@@ -668,6 +747,108 @@ export async function handleSignRequest(request: SignRequestV1, fromPeerStr: str
 	return { v: 1, signer: bytesToB64url(deps.selfMember), signature: bytesToB64url(signature) };
 }
 
+// --- inbound promote-protocol notices (verify + apply) ---
+
+/** A decoded `promote`-protocol frame, tagged by which notice it is. */
+export type InboundNotice =
+	| { readonly kind: "promotion"; readonly notice: PromotionNoticeV1 }
+	| { readonly kind: "demotion"; readonly notice: DemotionNoticeV1 };
+
+/** Outcome of {@link verifyAndApplyNotice}. */
+export type NoticeOutcome = "applied" | "untrusted" | "dropped";
+
+/**
+ * The slice of a {@link CoordEngine} the inbound notice path needs: the cohort coord the signers should
+ * belong to (for verification) and the apply hooks. {@link CoordEngine} satisfies this; tests can pass a
+ * minimal stand-in.
+ */
+export interface NoticeApplyTarget {
+	readonly servedCoord: RingCoord;
+	applyPromotionNotice(notice: PromotionNoticeV1, now: number): void;
+	applyDemotionNotice(notice: DemotionNoticeV1, now: number): void;
+}
+
+/**
+ * Decode a `promote`-protocol frame as a {@link PromotionNoticeV1} or {@link DemotionNoticeV1} (try one,
+ * then the other), or `undefined` if it is neither. The two shapes are disjoint — a promotion carries
+ * `fromTier`/`toTier`, a demotion carries `parentCohortCoord` — so the structural validators cleanly
+ * discriminate.
+ */
+export function decodeInboundNotice(frame: Uint8Array, maxBytes?: number): InboundNotice | undefined {
+	const decoded = decodeCohortMessage(frame, maxBytes);
+	const promotion = tryValidate(() => validatePromotionNoticeV1(decoded));
+	if (promotion !== undefined) {
+		return { kind: "promotion", notice: promotion };
+	}
+	const demotion = tryValidate(() => validateDemotionNoticeV1(decoded));
+	if (demotion !== undefined) {
+		return { kind: "demotion", notice: demotion };
+	}
+	return undefined;
+}
+
+/**
+ * Verify an inbound notice's threshold signature against the cohort `MembershipCertV1` for
+ * `target.servedCoord` and, on success, apply it to the target's promotion lifecycle. Returns:
+ *
+ * - `"dropped"`  — no local engine serves the notice's `(topic, tier)` (e.g. a demotion arriving at a
+ *   parent that does not track the child); nothing to apply to.
+ * - `"untrusted"` — the `signers` are not a `≥ minSigs` subset of the cohort cert, or the multisig does
+ *   not verify (a forged single-signer / short-quorum notice); local state is left unchanged.
+ * - `"applied"`  — verified and applied.
+ *
+ * The payload is rebuilt with the canonical `sig/payloads` image the signer used — never re-canonicalized
+ * independently. The verifier owns the cert lookup + single stale-cert refetch; this function never
+ * re-verifies inside the apply step (db-core trusts this gate).
+ */
+export async function verifyAndApplyNotice(
+	inbound: InboundNotice,
+	target: NoticeApplyTarget | undefined,
+	verifier: MembershipVerifier,
+	now: number,
+): Promise<NoticeOutcome> {
+	if (target === undefined) {
+		return "dropped";
+	}
+	let signers: Uint8Array[];
+	let sig: Uint8Array;
+	try {
+		signers = inbound.notice.signers.map(b64urlToBytes);
+		sig = b64urlToBytes(inbound.notice.thresholdSig);
+	} catch {
+		return "untrusted"; // a signer / sig that is not valid base64url cannot verify
+	}
+	// Narrow on `inbound` (not a destructured `notice`) so the tier field and apply hook are typed per kind.
+	if (inbound.kind === "promotion") {
+		const payload = promotionNoticeSigningPayload(inbound.notice);
+		const result = await verifier.verifyMessage(signers, target.servedCoord, inbound.notice.fromTier, payload, sig);
+		if (result !== "verified") {
+			return "untrusted";
+		}
+		target.applyPromotionNotice(inbound.notice, now);
+		return "applied";
+	}
+	const payload = demotionNoticeSigningPayload(inbound.notice);
+	const result = await verifier.verifyMessage(signers, target.servedCoord, inbound.notice.tier, payload, sig);
+	if (result !== "verified") {
+		return "untrusted";
+	}
+	target.applyDemotionNotice(inbound.notice, now);
+	return "applied";
+}
+
+/**
+ * The cohort coords a notice is broadcast to over the `promote` protocol: always the cohort around
+ * `servedCoord` (siblings adopt the state); for a demotion, additionally the parent cohort coord (so the
+ * parent's `childCohortCount` bookkeeping converges). Pure — exported for testing the fan-out targets.
+ */
+export function noticeBroadcastCoords(notice: PromotionNoticeV1 | DemotionNoticeV1, servedCoord: RingCoord): RingCoord[] {
+	if ("parentCohortCoord" in notice) {
+		return [servedCoord, b64urlToBytes(notice.parentCohortCoord)];
+	}
+	return [servedCoord];
+}
+
 // --- helpers ---
 
 /**
@@ -719,6 +900,7 @@ async function registerProtocolHandlers(
 	registry: CoordRegistry,
 	dispatchRegister: (reg: RegisterV1, fretCohort: readonly string[] | undefined, now: number) => Promise<RegisterReplyV1>,
 	signEndorse: (request: SignRequestV1, fromPeerStr: string) => Promise<SignReplyV1>,
+	verifier: MembershipVerifier,
 	gossipTransport: FretCohortGossipTransport,
 	publishSink: FretMembershipPublishSink,
 	membershipSource: FretMembershipSource,
@@ -746,9 +928,24 @@ async function registerProtocolHandlers(
 			return undefined;
 		}, maxBytes)),
 
-		// promote: threshold-signed promotion/demotion notices. Interim — accepted onto the bus path; the
-		// verify-and-apply step is part of the threshold-crypto gap.
-		node.handle(protocols.promote, makeFrameHandler(async (): Promise<Uint8Array | undefined> => undefined, maxBytes)),
+		// promote: threshold-signed promotion/demotion notices (one-way, gossip-style fan-out). Decode the
+		// notice, resolve the local engine for its cohort, verify the quorum signature against that cohort's
+		// MembershipCertV1, and apply it to the engine's promotion lifecycle. Untrusted / undeliverable
+		// notices are dropped (logged) — never throw on the stream.
+		node.handle(protocols.promote, makeFrameHandler(async (frame): Promise<Uint8Array | undefined> => {
+			const inbound = decodeInboundNotice(frame, maxBytes);
+			if (inbound === undefined) {
+				log("promote: dropped an undecodable notice frame");
+				return undefined;
+			}
+			const tier = inbound.kind === "promotion" ? inbound.notice.fromTier : inbound.notice.tier;
+			const target = registry.findServing(b64urlToBytes(inbound.notice.topicId), tier);
+			const outcome = await verifyAndApplyNotice(inbound, target, verifier, Date.now());
+			if (outcome !== "applied") {
+				log("promote: %s %s notice for topic %s tier %d", outcome, inbound.kind, inbound.notice.topicId, tier);
+			}
+			return undefined; // one-way: match the gossip-style fan-out (no ack frame)
+		}, maxBytes)),
 
 		// membership: serve this node's latest published cert; cache any cert the requester returns.
 		node.handle(protocols.membership, makeFrameHandler(async (frame): Promise<Uint8Array | undefined> => {

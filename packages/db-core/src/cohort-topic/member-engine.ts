@@ -43,7 +43,7 @@ import type { TopicBudget } from "./antidos/topic-budget.js";
 import type { BootstrapEvidence } from "./antidos/bootstrap-evidence.js";
 import type { NodeProfile, Tier } from "./tiers.js";
 import { b64urlToBytes } from "./wire/codec.js";
-import type { RegisterReplyV1, RegisterV1, RenewReplyV1, RenewV1 } from "./wire/types.js";
+import type { DemotionNoticeV1, PromotionNoticeV1, RegisterReplyV1, RegisterV1, RenewReplyV1, RenewV1 } from "./wire/types.js";
 
 /** Routing context the FRET host supplies for an inbound register (db-core can't derive it). */
 export interface RegisterContext {
@@ -99,6 +99,18 @@ export interface CohortMemberEngineDeps {
 	 * forged frame never reaches (or pollutes) the replay/rate guards. Absent → the gate is skipped.
 	 */
 	readonly verifyRegisterSig?: (reg: RegisterV1) => boolean;
+	/**
+	 * Sink for a freshly threshold-signed promotion/demotion notice produced on an arrival (the `accept`
+	 * path's promotion trigger). db-p2p's host wires this to broadcast the notice over the `promote`
+	 * protocol to the cohort (and, for a demotion, the parent coord). Absent → notices are produced and
+	 * applied locally but not broadcast (unit/mock flows). Called fire-and-forget, off the reply path.
+	 */
+	readonly onNotice?: (notice: PromotionNoticeV1 | DemotionNoticeV1) => void;
+	/**
+	 * Optional logger. Used only to record a failed promotion sign/broadcast (the threshold-sign round
+	 * can reject when the cohort quorum is unreachable) rather than swallow it. Absent → silent.
+	 */
+	readonly log?: (formatter: string, ...args: unknown[]) => void;
 }
 
 /** Cohort-side register/renew handler — the body of the FRET activity callback. */
@@ -214,8 +226,9 @@ class StoreCohortMemberEngine implements CohortMemberEngine {
 		this.deps.store.put(record);
 		this.deps.traffic.recordArrival(topicId, now);
 		this.deps.topicBudget?.touch(topicId, this.deps.store.directParticipants(topicId));
-		// Promotion may fire on this arrival; the host broadcasts whatever notice comes back.
-		void this.deps.promotion.onParticipantCountChange(topicId, now);
+		// Promotion may fire on this arrival; broadcast whatever notice comes back. Fire-and-forget so the
+		// register reply is not delayed by the threshold-sign collection round.
+		void this.firePromotion(topicId, now);
 
 		const reply: RegisterReplyV1 = {
 			v: 1,
@@ -226,6 +239,21 @@ class StoreCohortMemberEngine implements CohortMemberEngine {
 			cohortMembers: members.map(bytesKey),
 		};
 		return attachTopicTraffic(reply, this.deps.traffic.snapshot(topicId));
+	}
+
+	/** Run the promotion trigger for an arrival and hand any signed notice to {@link CohortMemberEngineDeps.onNotice}. */
+	private async firePromotion(topicId: Uint8Array, now: number): Promise<void> {
+		try {
+			const notice = await this.deps.promotion.onParticipantCountChange(topicId, now);
+			if (notice !== undefined) {
+				this.deps.onNotice?.(notice);
+			}
+		} catch (err) {
+			// Threshold signing rejects when the cohort quorum is unreachable this round; the next arrival
+			// re-fires, so this is transient. Log rather than crash the register path — or leak the
+			// unhandled rejection the bare `void promotion...` did once signing became real (db-p2p ticket 1).
+			this.deps.log?.("cohort-topic: promotion sign/broadcast failed for an arrival: %o", err);
+		}
 	}
 
 	// --- guards ---

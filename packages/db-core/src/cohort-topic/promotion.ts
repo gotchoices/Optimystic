@@ -31,9 +31,20 @@
  * and unit-testable and avoids an awkward async callback. The op-tier `tier(T)` the barometer is
  * indexed by is supplied through the injected {@link PromotionDeps.loadBucket} resolver, so this
  * module never needs to know a topic's tier.
+ *
+ * **Remote apply path.** `promote()` / `demote()` set this cohort's per-topic state as a side effect of
+ * the **local** signing path — only the member that originates a notice adopts the new state that way. A
+ * member that *learns* of a promotion/demotion via gossip or a broadcast notice adopts it through
+ * {@link PromotionLifecycle.applyPromotionNotice} / {@link PromotionLifecycle.applyDemotionNotice},
+ * which set the same {@link PromotionState} **without re-signing** (the notice is already a verified
+ * quorum decision). **Precondition: the caller has already verified the notice's threshold signature**
+ * (db-p2p's `MembershipVerifier`); this module is crypto-free and trusts that gate. The apply path is
+ * idempotent and `effectiveAt`-ordered via the monotonic {@link PromotionState.lastEffectiveAt}
+ * high-water mark, so re-applying a notice (including this member's own echoed broadcast) or a replayed
+ * older notice is a no-op — a stale promotion can never un-demote a cohort that has since demoted.
  */
 
-import { bytesToB64url } from "./wire/codec.js";
+import { b64urlToBytes, bytesToB64url } from "./wire/codec.js";
 import type { CohortSigner } from "./sig/threshold.js";
 import { demotionNoticeSigningPayload, promotionNoticeSigningPayload } from "./sig/payloads.js";
 import type { DemotionNoticeV1, PromotionNoticeV1 } from "./wire/types.js";
@@ -89,6 +100,14 @@ interface PromotionState {
 	lowLoadSince?: number;
 	/** Recent growth samples within `growthWindowMs`, for slope extrapolation. */
 	samples: GrowthSample[];
+	/**
+	 * `effectiveAt` of the most recent promotion/demotion this cohort has adopted — locally originated
+	 * (`promote()` / `demote()`) or remotely applied (`applyPromotionNotice` / `applyDemotionNotice`).
+	 * Monotonic and **never cleared** (a demotion clears `promoted`/`promotedAt` but keeps this), so it
+	 * is the high-water mark the remote-apply path orders against: a notice whose `effectiveAt` is not
+	 * strictly newer is a no-op — re-applied (incl. this member's own echoed broadcast) or stale-replayed.
+	 */
+	lastEffectiveAt?: number;
 }
 
 export interface PromotionDeps {
@@ -131,6 +150,20 @@ export interface PromotionLifecycle {
 	maybeDemote(topicId: Uint8Array, now: number): Promise<DemotionNoticeV1 | undefined>;
 	/** Whether `topicId` is currently in promoted mode (new registrations get `Promoted(d+1)`). */
 	isPromoted(topicId: Uint8Array): boolean;
+	/**
+	 * Adopt a promotion this member did **not** originate (learned via a verified broadcast notice).
+	 * Sets `promoted = true` for `n.topicId` without re-signing. **Precondition: the caller has verified
+	 * `n`'s threshold signature** — this module performs no crypto. Idempotent and `effectiveAt`-ordered
+	 * (see {@link PromotionState.lastEffectiveAt}): a notice not strictly newer than the last adopted
+	 * transition is a no-op, so this member's own echoed broadcast and stale replays are absorbed.
+	 */
+	applyPromotionNotice(n: PromotionNoticeV1, now: number): void;
+	/**
+	 * Adopt a demotion this member did **not** originate (learned via a verified broadcast notice).
+	 * Clears `promoted` state for `n.topicId` without re-signing. Same precondition, idempotency, and
+	 * `effectiveAt` ordering as {@link applyPromotionNotice} — a stale promotion can never un-demote.
+	 */
+	applyDemotionNotice(n: DemotionNoticeV1, now: number): void;
 }
 
 class CohortPromotionLifecycle implements PromotionLifecycle {
@@ -185,6 +218,35 @@ class CohortPromotionLifecycle implements PromotionLifecycle {
 		return this.states.get(bytesKey(topicId))?.promoted ?? false;
 	}
 
+	// --- remote apply (verified notices this member did not originate) ---
+
+	applyPromotionNotice(n: PromotionNoticeV1, now: number): void {
+		const state = this.stateFor(b64urlToBytes(n.topicId));
+		if (!this.isNewerTransition(state, n.effectiveAt)) {
+			return; // already adopted, our own echoed broadcast, or a stale replay
+		}
+		state.promoted = true;
+		state.promotedAt = now;
+		state.lastEffectiveAt = n.effectiveAt;
+	}
+
+	applyDemotionNotice(n: DemotionNoticeV1, _now: number): void {
+		const state = this.stateFor(b64urlToBytes(n.topicId));
+		if (!this.isNewerTransition(state, n.effectiveAt)) {
+			return;
+		}
+		// Mirror the local demote() release so a later re-growth re-evaluates cleanly.
+		state.promoted = false;
+		state.promotedAt = undefined;
+		state.lowLoadSince = undefined;
+		state.lastEffectiveAt = n.effectiveAt;
+	}
+
+	/** A notice is adopted only if strictly newer than the last transition we adopted (the high-water mark). */
+	private isNewerTransition(state: PromotionState, effectiveAt: number): boolean {
+		return state.lastEffectiveAt === undefined || effectiveAt > state.lastEffectiveAt;
+	}
+
 	// --- promotion ---
 
 	private promotionTriggered(topicId: Uint8Array, state: PromotionState, count: number, now: number): boolean {
@@ -225,6 +287,7 @@ class CohortPromotionLifecycle implements PromotionLifecycle {
 		const { thresholdSig, signers } = await this.deps.signer.thresholdSign(promotionNoticeSigningPayload(signable));
 		state.promoted = true;
 		state.promotedAt = now;
+		state.lastEffectiveAt = now; // local effectiveAt — so our own echoed broadcast applies as a no-op
 		return {
 			v: 1,
 			topicId: topicB64,
@@ -273,6 +336,7 @@ class CohortPromotionLifecycle implements PromotionLifecycle {
 		state.promoted = false;
 		state.promotedAt = undefined;
 		state.lowLoadSince = undefined;
+		state.lastEffectiveAt = now; // local effectiveAt — so our own echoed broadcast applies as a no-op
 		return {
 			v: 1,
 			topicId: topicB64,

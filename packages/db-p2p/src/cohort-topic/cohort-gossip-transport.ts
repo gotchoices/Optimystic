@@ -39,12 +39,22 @@ export class FretCohortGossipTransport implements ICohortGossipTransport {
 	}
 
 	broadcast(coord: RingCoord, msg: Uint8Array): void {
+		this.broadcastOver(this.gossipProtocol, coord, msg);
+	}
+
+	/**
+	 * Fan `msg` out to the FRET-assembled cohort for `coord` over an arbitrary one-way `protocol` (self
+	 * excluded, fire-and-forget). Reuses the cohort peer resolution so the `promote` protocol's
+	 * promotion/demotion notice broadcast shares the gossip transport's wiring; a single unreachable
+	 * member is recovered by the cohort's next convergence round, so per-peer failures are swallowed.
+	 */
+	broadcastOver(protocol: string, coord: RingCoord, msg: Uint8Array): void {
 		for (const peerStr of this.resolver.cohortPeers(coord, this.wants)) {
 			if (peerStr === this.selfPeerId) {
 				continue;
 			}
-			void sendOneWay(this.node, peerIdFromString(peerStr), this.gossipProtocol, msg).catch(() => {
-				// Gossip is best-effort: a single unreachable member is recovered by the next round.
+			void sendOneWay(this.node, peerIdFromString(peerStr), protocol, msg).catch(() => {
+				// Best-effort: a single unreachable member is recovered by the next round.
 			});
 		}
 	}
