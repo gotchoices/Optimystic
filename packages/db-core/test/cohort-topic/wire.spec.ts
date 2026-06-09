@@ -111,6 +111,7 @@ const sampleDemotion = (): DemotionNoticeV1 => ({
 const sampleGossip = (): CohortGossipV1 => ({
 	v: 1,
 	fromMember: 'peer-member',
+	coord: b64(32, 23),
 	cohortEpoch: b64(32, 18),
 	willingnessBits: 'f',
 	loadBuckets: [0, 3, 6, 7],

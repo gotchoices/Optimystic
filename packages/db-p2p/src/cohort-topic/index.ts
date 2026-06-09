@@ -4,6 +4,7 @@ export * from "./peer-sig.js";
 export * from "./stream-util.js";
 export * from "./topic-router.js";
 export * from "./cohort-gossip-transport.js";
+export * from "./cohort-gossip-driver.js";
 export * from "./membership-source.js";
 export * from "./membership-publish-sink.js";
 export * from "./threshold-crypto.js";

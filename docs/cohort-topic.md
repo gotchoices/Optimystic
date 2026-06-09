@@ -978,6 +978,7 @@ interface DemotionNoticeV1 {
 interface CohortGossipV1 {
   v:                  1
   fromMember:         string          // PeerId
+  coord:              string          // 32 bytes — the cohort coord this gossip is for (inbound routing key)
   cohortEpoch:        string
   willingnessBits:    string          // 4 bits T0..T3, hex
   loadBuckets:        number[]        // 4 entries, 0..7 per tier
@@ -1020,6 +1021,25 @@ with the mismatch surfaced as membership drift. The implementation is the gossip
 [`packages/db-core/src/cohort-topic/gossip`](../packages/db-core/src/cohort-topic/gossip); the
 willingness/load/`topicSummaries` fold into a per-member view the willingness, barometer, and traffic
 layers read.
+
+**Per-coord routing.** A node serves many cohorts at once (one per coord FRET routes to it — see
+§FRET integration), and a delivered `cohort-gossip` frame is fanned to every coord engine's bus on the
+node. Each bus merges only the gossip whose `coord` names its own cohort: `cohortEpoch` alone cannot
+isolate two cohorts because they can share a member set (and therefore an epoch). In the live-signing
+path the receiver also drops any frame whose `fromMember` peer-key signature does not verify, or whose
+`fromMember` is not a member of the cohort around that coord — so willingness/load cannot be spoofed and
+forged records cannot replicate.
+
+**Cadence (host driver).** The cohort-topic host owns one repeating timer (`gossipIntervalMs`, default
+5 s — there is no dedicated `gossip_round` constant; it is a derived sub-round of `ping_interval`). On
+each tick, for every live coord engine, it TTL-sweeps stale records (gossiping each eviction), drains
+the registration-record deltas the renewal `touch`/`evicted` hooks accumulated since the last round into
+one `records`/`evicted` batch, broadcasts the signed `CohortGossipV1`, refreshes the membership
+certificate (`T_membership_refresh`, self-gated), and runs the demotion check (`T_demote`, self-gated).
+Idle engines (no resident topics, no deltas) build no frame and skip the broadcast. A freshly
+*admitted* record first replicates on its next renewal touch (the per-touch path), not at admission
+time. The driver lives in the host
+([`packages/db-p2p/src/cohort-topic`](../packages/db-p2p/src/cohort-topic)); db-core has no timer port.
 
 ### Membership certificate
 

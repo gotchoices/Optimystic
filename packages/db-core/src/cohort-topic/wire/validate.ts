@@ -363,6 +363,7 @@ export function validateCohortGossipV1(value: unknown): CohortGossipV1 {
 	const out: CohortGossipV1 = {
 		v: 1,
 		fromMember: reqString(obj, "fromMember", what),
+		coord: b64urlField(reqString(obj, "coord", what), "coord", what),
 		cohortEpoch: b64urlField(reqString(obj, "cohortEpoch", what), "cohortEpoch", what),
 		willingnessBits,
 		loadBuckets: loadBuckets as number[],

@@ -47,6 +47,7 @@ function gossip(from: string, epoch: Uint8Array, opts: Partial<CohortGossipV1> =
 	return {
 		v: 1,
 		fromMember: from,
+		coord: bytesToB64url(COORD),
 		cohortEpoch: bytesToB64url(epoch),
 		willingnessBits: 'f',
 		loadBuckets: [0, 0, 0, 0],
@@ -150,5 +151,42 @@ describe('cohort-topic / gossip bus', () => {
 		bus.onDrift(() => { fired = true; });
 		bus.applyInbound(gossip('m', EPOCH), 2_000);
 		expect(fired).to.be.false;
+	});
+
+	it('routes by coord: a gossip naming a different cohort is not merged', () => {
+		// Two coords can share a member set (hence an epoch), so epoch alone never isolates them — the
+		// bus must drop a gossip whose `coord` is not its own, record deltas and all.
+		const store = createRegistrationStore();
+		const bus = busFor(store, new FanoutTransport(), () => EPOCH);
+		const rec = record('p', 5_000);
+		const foreign = gossip('m', EPOCH, { coord: bytesToB64url(bytes('other-coord')), records: [toGossipRecord(rec)] });
+		bus.applyInbound(foreign, 2_000);
+		expect(store.getByParticipant(rec.topicId, rec.participantId), 'foreign-coord record not merged').to.be.undefined;
+		expect(bus.view().get('m'), 'foreign-coord view not merged').to.be.undefined;
+	});
+
+	it('verifyInbound drops an unauthenticated transport frame before any merge', () => {
+		// The auth gate only guards the transport path (onInbound), so drive a real broadcast through it.
+		const transport = new FanoutTransport();
+		const store = createRegistrationStore();
+		const bus = createCohortGossipBus({ transport, store, coord: COORD, localEpoch: () => EPOCH, now: () => 2_000, verifyInbound: () => false });
+		const rec = record('p', 5_000);
+		// A second bus (no gate) broadcasts a record; the gated bus receives it over the transport.
+		const sender = busFor(createRegistrationStore(), transport, () => EPOCH);
+		sender.broadcast(gossip('m', EPOCH, { records: [toGossipRecord(rec)] }));
+		expect(store.getByParticipant(rec.topicId, rec.participantId), 'rejected frame not merged').to.be.undefined;
+		expect(bus.view().get('m'), 'rejected frame view not merged').to.be.undefined;
+	});
+
+	it('verifyInbound passing a frame merges it as usual', () => {
+		const transport = new FanoutTransport();
+		const store = createRegistrationStore();
+		const seen: string[] = [];
+		createCohortGossipBus({ transport, store, coord: COORD, localEpoch: () => EPOCH, now: () => 2_000, verifyInbound: (g) => { seen.push(g.fromMember); return true; } });
+		const rec = record('p', 5_000);
+		const sender = busFor(createRegistrationStore(), transport, () => EPOCH);
+		sender.broadcast(gossip('m', EPOCH, { records: [toGossipRecord(rec)] }));
+		expect(store.getByParticipant(rec.topicId, rec.participantId)?.lastPing, 'verified frame merged').to.equal(5_000);
+		expect(seen, 'gate saw the inbound frame').to.deep.equal(['m']);
 	});
 });

@@ -60,11 +60,13 @@ import {
 	createTierAddressing,
 	coreProfile,
 	DEFAULT_MIN_SIGS,
+	DEFAULT_TRAFFIC_WINDOW_SECONDS,
 	bytesToB64url,
 	b64urlToBytes,
 	bytesEqual,
 	encodeCohortMessage,
 	decodeCohortMessage,
+	toCohortTopicSummary,
 	validateRegisterV1,
 	validateRenewV1,
 	validateSignRequestV1,
@@ -73,13 +75,17 @@ import {
 	validateDemotionNoticeV1,
 	registerSigningPayload,
 	renewSigningPayload,
+	cohortGossipSigningPayload,
 	promotionNoticeSigningPayload,
 	demotionNoticeSigningPayload,
+	type CohortGossipV1,
+	type CohortGossipSignable,
 	type CohortTopicService,
 	type CohortMemberEngine,
 	type CohortSnapshot,
 	type CohortSnapshotView,
 	type CohortSigner,
+	type CohortView,
 	type DemotionNoticeV1,
 	type MembershipCertPublisher,
 	type MembershipCertV1,
@@ -101,6 +107,7 @@ import {
 import { peerIdFromString } from "@libp2p/peer-id";
 import { FretTopicRouter } from "./topic-router.js";
 import { FretCohortGossipTransport, type CohortPeerResolver } from "./cohort-gossip-transport.js";
+import { buildCohortGossip, createPendingDeltas, DEFAULT_GOSSIP_INTERVAL_MS } from "./cohort-gossip-driver.js";
 import { FretMembershipSource } from "./membership-source.js";
 import { FretMembershipPublishSink } from "./membership-publish-sink.js";
 import { FretCohortThresholdCrypto, createVerifyOnlyThresholdCrypto } from "./threshold-crypto.js";
@@ -126,6 +133,13 @@ export interface CohortTopicHostOptions {
 	readonly fanout?: number;
 	/** Per-frame ceiling. Default {@link DEFAULT_STREAM_MAX_BYTES}. */
 	readonly maxBytes?: number;
+	/**
+	 * Gossip-round cadence in ms (the periodic driver tick). Default {@link DEFAULT_GOSSIP_INTERVAL_MS}
+	 * (~one round). Each tick drives every live {@link CoordEngine}'s gossip broadcast, TTL sweep,
+	 * membership-cert refresh, and demotion check; the refresh (5 min) and demotion hysteresis (5 min)
+	 * self-gate on elapsed time, so a fast tick is safe.
+	 */
+	readonly gossipIntervalMs?: number;
 	/**
 	 * The node's libp2p Ed25519 private key. Required for the live participant signer: register/renew
 	 * bodies are peer-key-signed over their canonical image, and inbound register/`reattach` signatures
@@ -166,6 +180,21 @@ export interface CoordEngine {
 	 * `T_membership_refresh` has elapsed). Returns the cert if (re)published, else `undefined`.
 	 */
 	pumpMembership(now: number): Promise<MembershipCertV1 | undefined>;
+	/**
+	 * One gossip round: TTL-sweep stale records (firing the `evicted` deltas), freeze the per-topic
+	 * traffic summaries, drain the accumulated record/eviction deltas, and broadcast a signed
+	 * {@link CohortGossipV1} (willingness/load/traffic + deltas) to the cohort. Returns the broadcast
+	 * frame, or `undefined` when the engine is idle (no resident topics and no deltas → nothing to send).
+	 */
+	gossipRound(now: number): Promise<CohortGossipV1 | undefined>;
+	/**
+	 * Time-driven demotion check across this engine's resident topics; broadcasts any threshold-signed
+	 * {@link DemotionNoticeV1} the lifecycle returns (root tier-0 cohorts never demote). No-op without a
+	 * signing key (the verify-only per-coord signer cannot assemble a notice).
+	 */
+	demotionTick(now: number): Promise<void>;
+	/** The merged per-member gossip view (willingness / load / per-topic summaries) for this cohort. */
+	cohortView(): CohortView;
 	/** True iff this engine currently serves `topicId` (holds a record or a cold-start forwarder for it). */
 	servesTopic(topicId: Uint8Array): boolean;
 	/** Whether `topicId` is in promoted mode here — reflects both locally-originated and remotely-applied state. */
@@ -243,6 +272,18 @@ interface CoordEngineContext {
 	/** Verify an inbound `reattach` `RenewV1`'s participant peer-key signature (live-signer mode only). */
 	readonly verifyReattachSig?: (renew: RenewV1) => boolean;
 	/**
+	 * Sign an outbound `CohortGossipV1` envelope with the node peer key over its canonical image
+	 * ({@link cohortGossipSigningPayload}). Live-signer mode only; absent → gossip ships unsigned (interim,
+	 * matching the participant signer) and the receiver's {@link verifyGossip} gate is likewise absent.
+	 */
+	readonly signGossip?: (g: CohortGossipSignable) => Promise<string>;
+	/**
+	 * Authenticate an inbound `CohortGossipV1` for a served `coord`: its `fromMember` peer-key signature
+	 * must verify over the gossip image **and** `fromMember` must be a member of the cohort around `coord`.
+	 * Live-signer mode only; absent → the bus skips the gate (key-less / unit composition).
+	 */
+	readonly verifyGossip?: (g: CohortGossipV1, coord: RingCoord) => boolean;
+	/**
 	 * Broadcast a freshly threshold-signed promotion/demotion notice this engine produced over the
 	 * `promote` protocol — to the cohort around `servedCoord`, plus the parent coord for a demotion.
 	 * Wired by the host; absent in key-less / unit composition.
@@ -268,6 +309,7 @@ export async function createCohortTopicHost(node: Libp2p, fret: FretService, opt
 	const minSigs = options.minSigs ?? DEFAULT_MIN_SIGS;
 	const fanout = options.fanout ?? 16;
 	const maxBytes = options.maxBytes ?? DEFAULT_STREAM_MAX_BYTES;
+	const gossipIntervalMs = options.gossipIntervalMs ?? DEFAULT_GOSSIP_INTERVAL_MS;
 
 	const hash = new RingHash();
 	const selfPeerStr = node.peerId.toString();
@@ -330,6 +372,30 @@ export async function createCohortTopicHost(node: Libp2p, fret: FretService, opt
 			renew.signature.length > 0 &&
 			verifyPeerSig(b64urlToBytes(renew.participantId), renewSigningPayload(renew), b64urlToBytes(renew.signature));
 
+	// --- intra-cohort gossip authenticity seam (gap 5) ---
+	// Same peer-key signing pattern as register/renew, applied to the gossip envelope: the originator
+	// signs its canonical image, and a receiver drops a frame whose `fromMember` signature does not
+	// verify or that comes from a non-cohort member (so willingness/load can't be spoofed and forged
+	// records can't replicate). Key-less mode ships/accepts unsigned gossip (documented interim), exactly
+	// like the participant signer.
+	const nodeKey = options.privateKey;
+	const signGossip = nodeKey === undefined
+		? undefined
+		: async (g: CohortGossipSignable): Promise<string> => bytesToB64url(await signPeer(nodeKey, cohortGossipSigningPayload(g)));
+	const verifyGossip = nodeKey === undefined
+		? undefined
+		: (g: CohortGossipV1, coord: RingCoord): boolean => {
+			if (g.signature.length === 0) {
+				return false;
+			}
+			const fromBytes = b64urlToBytes(g.fromMember);
+			if (!verifyPeerSig(fromBytes, cohortGossipSigningPayload(g), b64urlToBytes(g.signature))) {
+				return false;
+			}
+			const members = cohortAround(coord).members.map(bytesToPeerIdString);
+			return members.includes(bytesToPeerIdString(fromBytes));
+		};
+
 	// --- outbound notice broadcast (gap 4) ---
 	// A coord engine that threshold-signs a promotion/demotion notice hands it here; we fan it over the
 	// `promote` protocol to the cohort around the served coord (siblings adopt the state) and, for a
@@ -359,6 +425,8 @@ export async function createCohortTopicHost(node: Libp2p, fret: FretService, opt
 		cohortAround,
 		verifyRegisterSig,
 		verifyReattachSig,
+		signGossip,
+		verifyGossip,
 		broadcastNotice,
 		// Cache this node's own freshly-published cohort cert into the verifier, so an inbound notice
 		// signed by this node's cohort verifies locally without a network refetch. `verifier` is declared
@@ -388,6 +456,9 @@ export async function createCohortTopicHost(node: Libp2p, fret: FretService, opt
 		store: participantStore,
 		coord: selfCoord,
 		localEpoch: (): Uint8Array => cohortAround(selfCoord).cohortEpoch,
+		// Same per-coord auth gate as the coord engines: only a signed gossip from a member of the cohort
+		// around the node's own ring position merges here (live-signer mode); absent in key-less composition.
+		verifyInbound: verifyGossip === undefined ? undefined : (g): boolean => verifyGossip(g, selfCoord),
 	});
 	const certSource: IMembershipSource = membershipSource;
 	const membershipRouter = createMembershipSourceRouter({ committed: certSource, fret: certSource });
@@ -423,7 +494,8 @@ export async function createCohortTopicHost(node: Libp2p, fret: FretService, opt
 	};
 
 	// --- protocol handlers + activity callback ---
-	// Await registration so the host is not returned (and dialed) before the four handlers are live.
+	// Await registration so the host is not returned (and dialed) before the five handlers are live —
+	// and, crucially, before the gossip driver below starts ticking (no tick may run on a half-wired node).
 	await registerProtocolHandlers(node, protocols, registry, dispatchRegister, signEndorse, verifier, gossipTransport, publishSink, membershipSource, selfCoord, maxBytes);
 	fret.setActivityHandler(async (activity: string, cohort: string[]): Promise<{ commitCertificate: string }> => {
 		const reg = validateRegisterV1(decodeCohortMessage(b64urlToBytes(activity), maxBytes));
@@ -431,11 +503,50 @@ export async function createCohortTopicHost(node: Libp2p, fret: FretService, opt
 		return { commitCertificate: bytesToB64url(encodeCohortMessage(reply, maxBytes)) };
 	});
 
+	// --- periodic gossip-cadence driver (gap 5) ---
+	// db-core has no timer port (confirmed), so the host owns a single raw `setInterval`. Each tick drives
+	// every live coord engine's gossip round + membership refresh + demotion check; the membership-refresh
+	// (5 min) and demotion (5 min) hysteresis self-gate on elapsed time, so a fast tick is safe and cheap
+	// (idle empty engines build no frame). A re-entrancy guard skips a tick that overlaps a slow prior one;
+	// `stopped` short-circuits any tick that fires after `stop()`.
+	let stopped = false;
+	let ticking = false;
+	const driveTick = async (): Promise<void> => {
+		if (stopped || ticking) {
+			return;
+		}
+		ticking = true;
+		try {
+			const now = Date.now();
+			for (const engine of registry.all()) {
+				if (stopped) {
+					break;
+				}
+				try {
+					await engine.gossipRound(now);
+					await engine.pumpMembership(now);
+					await engine.demotionTick(now);
+				} catch (err) {
+					log("cohort-topic: gossip tick failed for a coord engine: %o", err);
+				}
+			}
+		} finally {
+			ticking = false;
+		}
+	};
+	const timer = setInterval((): void => {
+		void driveTick();
+	}, gossipIntervalMs);
+	// Node timers keep the event loop alive; cohort gossip should not pin a process that is otherwise idle.
+	(timer as { unref?: () => void }).unref?.();
+
 	return {
 		service,
 		registry,
 		protocols,
 		stop: async (): Promise<void> => {
+			stopped = true;
+			clearInterval(timer);
 			registry.close();
 			participantGossipBus.close();
 			await node.unhandle(cohortTopicProtocolList(protocols));
@@ -538,9 +649,21 @@ function createCoordEngine(ctx: CoordEngineContext, servedCoord: RingCoord, tree
 	const cohort = (): CohortSnapshotView => ctx.cohortAround(servedCoord);
 	const localEpoch = (): Uint8Array => cohort().cohortEpoch;
 
-	const bus = createCohortGossipBus({ transport: ctx.transport, store, coord: servedCoord, localEpoch });
+	// Inbound gossip is routed to this bus by its `coord`; the optional auth gate (live-signer mode) drops
+	// a frame whose `fromMember` signature is bad or who is not a member of the cohort around THIS coord.
+	const bus = createCohortGossipBus({
+		transport: ctx.transport,
+		store,
+		coord: servedCoord,
+		localEpoch,
+		verifyInbound: ctx.verifyGossip === undefined ? undefined : (g): boolean => ctx.verifyGossip!(g, servedCoord),
+	});
 	const view = bus.view();
 	const selfMember = bytesToB64url(ctx.selfMemberBytes);
+
+	// Per-touch replication delta queue: the renewal cohort side appends each served touch / TTL eviction
+	// here; the next gossip round drains the batch into the broadcast frame (one round, not one per ping).
+	const pending = createPendingDeltas();
 
 	// Per-coord threshold signers: each assembles a real k − x signature by signing locally and collecting
 	// the rest of the cohort around THIS served coord over the `/sign` RPC. `membership` signs the cert;
@@ -622,12 +745,11 @@ function createCoordEngine(ctx: CoordEngineContext, servedCoord: RingCoord, tree
 		slots: ctx.slots,
 		cohort,
 		gossip: {
-			touch: (): void => {
-				/* interim: explicit gossip rounds publish records; per-touch replication is the gossip-layer gap */
-			},
-			evicted: (): void => {
-				/* interim: see touch */
-			},
+			// Per-touch replication, batched to one gossip round: a served ping/re-attach queues the touched
+			// record; the next round drains it so cohort members converge on the active set + assignments.
+			touch: (rec): void => pending.touch(rec),
+			// A TTL sweep eviction is gossiped so siblings drop the dead record (convergence on eviction).
+			evicted: (rec): void => pending.evicted(rec),
 		},
 		verifyReattachSig: ctx.verifyReattachSig,
 	});
@@ -663,6 +785,73 @@ function createCoordEngine(ctx: CoordEngineContext, servedCoord: RingCoord, tree
 		return published;
 	};
 
+	/** Distinct topics this engine currently holds state for (the gossip-summary / demotion iteration set). */
+	const residentTopics = (): Uint8Array[] => {
+		const byKey = new Map<string, Uint8Array>();
+		for (const rec of store.listAll()) {
+			byKey.set(bytesToB64url(rec.topicId), rec.topicId);
+		}
+		return [...byKey.values()];
+	};
+
+	// One gossip round: sweep stale records (firing the `evicted` deltas), freeze each resident topic's
+	// traffic summary, drain the touch/evicted deltas, then assemble + sign + broadcast the frame. Idle
+	// empty engines (no topics, no deltas) build no frame and skip the broadcast.
+	const gossipRound = async (now: number): Promise<CohortGossipV1 | undefined> => {
+		engine.sweepStale(now);
+		const topicSummaries = residentTopics().map((topicId) =>
+			toCohortTopicSummary(topicId, traffic.publish(topicId, now), {
+				tier: tierOfTopic(store, topicId),
+				directParticipants: store.directParticipants(topicId),
+				promoted: promotion.isPromoted(topicId),
+				// Single-cohort milestone: no child cohorts tracked. Child-cohort tracking is a follow-on.
+				childCohortCount: 0,
+			}),
+		);
+		const { records, evicted } = pending.drain();
+		const g = buildCohortGossip({
+			fromMember: selfMember,
+			coord: bytesToB64url(servedCoord),
+			cohortEpoch: bytesToB64url(localEpoch()),
+			profile: ctx.profile,
+			barometer: ctx.barometer,
+			windowSeconds: DEFAULT_TRAFFIC_WINDOW_SECONDS,
+			topicSummaries,
+			records,
+			evicted,
+			timestamp: now,
+		});
+		if (g === undefined) {
+			return undefined;
+		}
+		if (ctx.signGossip !== undefined) {
+			g.signature = await ctx.signGossip(g);
+		}
+		bus.broadcast(g);
+		return g;
+	};
+
+	// Time-driven demotion across resident topics; any returned notice is broadcast to the cohort (and the
+	// parent coord) via the same path a promotion uses. Skipped without a key (verify-only signer can't
+	// assemble); for the single-cohort tier-0 milestone the lifecycle never demotes (the root has no parent).
+	const demotionTick = async (now: number): Promise<void> => {
+		if (!canPublish) {
+			return;
+		}
+		for (const topicId of residentTopics()) {
+			let notice: DemotionNoticeV1 | undefined;
+			try {
+				notice = await promotion.maybeDemote(topicId, now);
+			} catch (err) {
+				log("cohort-topic: demotion sign/broadcast failed for topic %s: %o", bytesToB64url(topicId), err);
+				continue;
+			}
+			if (notice !== undefined) {
+				ctx.broadcastNotice?.(notice, servedCoord);
+			}
+		}
+	};
+
 	return {
 		servedCoord,
 		treeTier,
@@ -671,6 +860,7 @@ function createCoordEngine(ctx: CoordEngineContext, servedCoord: RingCoord, tree
 		hasState: (): boolean => store.listAll().length > 0,
 		holds: (topicId: Uint8Array, participantId: Uint8Array): boolean =>
 			store.getByParticipant(topicId, participantId) !== undefined,
+		cohortView: (): CohortView => view,
 		servesTopic: (topicId: Uint8Array): boolean =>
 			store.directParticipants(topicId) > 0 || coldStart.get(topicId) !== undefined,
 		isPromoted: (topicId: Uint8Array): boolean => promotion.isPromoted(topicId),
@@ -680,6 +870,8 @@ function createCoordEngine(ctx: CoordEngineContext, servedCoord: RingCoord, tree
 			canPublish ? publishAndCache(membershipPublisher.onStabilized(snapshotAt(now), now)) : Promise.resolve(undefined),
 		pumpMembership: (now: number): Promise<MembershipCertV1 | undefined> =>
 			canPublish ? publishAndCache(membershipPublisher.tick(snapshotAt(now), now)) : Promise.resolve(undefined),
+		gossipRound,
+		demotionTick,
 		close: (): void => bus.close(),
 	};
 }

@@ -176,6 +176,12 @@ export interface CohortGossipV1 {
 	v: 1;
 	/** PeerId. */
 	fromMember: string;
+	/**
+	 * The cohort coord this gossip is for, 32 bytes, base64url — the inbound routing key. A node serving
+	 * many cohorts fans a delivered frame to every coord engine's bus; each bus merges only the gossip
+	 * naming its own coord, so a gossip for one cohort never pollutes a sibling cohort's store/view.
+	 */
+	coord: string;
 	cohortEpoch: string;
 	/** 4 bits T0..T3, hex. */
 	willingnessBits: string;

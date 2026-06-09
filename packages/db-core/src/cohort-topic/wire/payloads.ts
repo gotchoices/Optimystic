@@ -14,7 +14,7 @@
  * across the wire round-trip.
  */
 
-import type { RegisterV1, RenewV1 } from "./types.js";
+import type { CohortGossipV1, RegisterV1, RenewV1 } from "./types.js";
 
 const utf8 = new TextEncoder();
 
@@ -51,5 +51,52 @@ export function renewSigningPayload(body: RenewSignable): Uint8Array {
 		body.correlationId,
 		body.timestamp,
 		body.reattach ?? false,
+	]));
+}
+
+/** A `CohortGossipV1` minus its `signature` envelope — the bytes the gossiping member peer-key-signs. */
+export type CohortGossipSignable = Omit<CohortGossipV1, "signature">;
+
+/**
+ * Canonical signed byte image of a `CohortGossipV1` (every field except `signature`). Intra-cohort
+ * gossip is peer-key-signed by the originating member so a receiver can drop a frame whose `fromMember`
+ * signature does not verify or that comes from a non-cohort member (it can never spoof willingness/load
+ * or replicate forged records). Like the other payload helpers, determinism comes from an
+ * explicitly-ordered array — nested records/summaries/evictions are emitted as fixed ordered tuples so
+ * the signer and the receiver (which re-derives this image from the validated frame) agree byte-for-byte.
+ * Absent optionals (`records`/`evicted`) normalize to `[]`, and `appState` to `null`.
+ */
+export function cohortGossipSigningPayload(g: CohortGossipSignable): Uint8Array {
+	return utf8.encode(JSON.stringify([
+		"CohortGossipV1",
+		g.v,
+		g.fromMember,
+		g.coord,
+		g.cohortEpoch,
+		g.willingnessBits,
+		g.loadBuckets,
+		g.windowSeconds,
+		g.topicSummaries.map((s) => [
+			s.topicId,
+			s.tier,
+			s.directParticipants,
+			s.arrivalsPerMin,
+			s.queriesPerMin,
+			s.promoted,
+			s.childCohortCount,
+		]),
+		(g.records ?? []).map((r) => [
+			r.topicId,
+			r.participantId,
+			r.tier,
+			r.primary,
+			r.backups,
+			r.attachedAt,
+			r.lastPing,
+			r.ttl,
+			r.appState ?? null,
+		]),
+		(g.evicted ?? []).map((e) => [e.topicId, e.participantId]),
+		g.timestamp,
 	]));
 }
