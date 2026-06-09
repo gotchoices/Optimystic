@@ -46,7 +46,7 @@ export interface ProviderAppPayloadV1 {
 	serviceUntil?: number;
 	/** Multiaddr or PeerId-based callback. */
 	contactHint: string;
-	/** base64url, over `(topicId, capabilities, capacityBudget, correlationId)`. */
+	/** base64url, over `(topicId, capabilities, capacityBudget)` — see {@link providerSigningPayload}. */
 	signature: string;
 }
 
@@ -332,6 +332,27 @@ export function decodeSeekerAppPayload(bytes: Uint8Array, maxBytes: number = DEF
 	return validateSeekerAppPayloadV1(parseJsonBytes(bytes, maxBytes, "SeekerAppPayloadV1"));
 }
 
+/** Either matchmaking registration payload, discriminated by `kind`. */
+export type MatchAppPayloadV1 = ProviderAppPayloadV1 | SeekerAppPayloadV1;
+
+/**
+ * Decode an opaque `RegisterV1.appPayload` to whichever matchmaking payload it carries, dispatched on
+ * `kind` (parsed once — no exception-as-control-flow). The cohort query handler uses this to classify a
+ * registration record into a provider vs. seeker entry. Throws {@link CohortWireError} on an unknown
+ * `kind` or a malformed payload.
+ */
+export function decodeMatchAppPayload(bytes: Uint8Array, maxBytes: number = DEFAULT_MAX_APP_PAYLOAD_BYTES): MatchAppPayloadV1 {
+	const value = parseJsonBytes(bytes, maxBytes, "MatchAppPayloadV1");
+	const obj = asObject(value, "MatchAppPayloadV1");
+	if (obj["kind"] === "match-provider") {
+		return validateProviderAppPayloadV1(value);
+	}
+	if (obj["kind"] === "match-seeker") {
+		return validateSeekerAppPayloadV1(value);
+	}
+	fail(`MatchAppPayloadV1: field "kind" must be "match-provider" or "match-seeker", got ${JSON.stringify(obj["kind"])}`);
+}
+
 /** Parse opaque (non-framed) UTF-8 JSON payload bytes, rejecting oversized/invalid input. */
 function parseJsonBytes(bytes: Uint8Array, maxBytes: number, what: string): unknown {
 	if (bytes.length > maxBytes) {
@@ -497,32 +518,106 @@ export function decodeAggregateCountV1(bytes: Uint8Array, maxMessageBytes?: numb
 // --- canonical participant-signature payloads (provider/seeker registration sigs) ---
 
 /**
- * Canonical signed byte image of a provider registration — `(topicId, capabilities, capacityBudget,
- * correlationId)` per `docs/matchmaking.md` §Wire formats. Determinism comes from an
- * explicitly-ordered array (stable, unlike object key order), exactly like the cohort-topic
- * `registerSigningPayload`. `topicId`/`correlationId` are passed as raw bytes and emitted as
- * base64url so signer and verifier agree byte-for-byte.
+ * Canonical signed byte image of a provider registration — `(topicId, capabilities, capacityBudget)`
+ * per `docs/matchmaking.md` §Wire formats.
+ *
+ * **Signing scope (resolved):** the signed image deliberately excludes the matchmaking
+ * `correlationId`. The advisory trust model (matchmaking.md §Wire formats) requires a seeker to
+ * re-validate each forwarded {@link ProviderEntryV1}'s `registrationSig`, and a {@link ProviderEntryV1}
+ * carries **no** `correlationId` field — so binding the signature over `correlationId` would leave the
+ * seeker unable to reconstruct the exact signed image. Dropping it (option (b) of the implement ticket)
+ * keeps the signed image fully self-contained in the forwarded entry: `topicId` (the topic the seeker
+ * queried) + `capabilities` + `capacityBudget`. Replay-binding of the *registration* is handled
+ * independently by the cohort-topic `RegisterV1` envelope (its own `correlationId` + replay guard +
+ * peer-key signature); the matchmaking signature only attests provider authorship of the advertised
+ * capabilities, which the participant peer key (the entry's `participantId`) anchors.
+ *
+ * Determinism comes from an explicitly-ordered array (stable, unlike object key order), exactly like
+ * the cohort-topic `registerSigningPayload`. `topicId` is passed as raw bytes and emitted as base64url
+ * so signer and verifier agree byte-for-byte.
  */
-export function providerSigningPayload(topicId: Uint8Array, capabilities: readonly string[], capacityBudget: number, correlationId: Uint8Array): Uint8Array {
+export function providerSigningPayload(topicId: Uint8Array, capabilities: readonly string[], capacityBudget: number): Uint8Array {
 	return utf8Encoder.encode(JSON.stringify([
 		"ProviderAppPayloadV1",
 		bytesToB64url(topicId),
 		[...capabilities],
 		capacityBudget,
-		bytesToB64url(correlationId),
 	]));
 }
 
 /**
- * Canonical signed byte image of a seeker registration — `(topicId, wantCount, correlationId)`.
- * `docs/matchmaking.md` §Wire formats leaves the seeker signing fields unspecified; this mirrors the
- * provider scope minus the provider-only attributes, and is documented as a refinement.
+ * Canonical signed byte image of a seeker registration — `(topicId, wantCount)`. Mirrors the provider
+ * scope (option (b), see {@link providerSigningPayload}): the image excludes `correlationId` so it is
+ * fully reconstructable from a forwarded {@link SeekerEntryV1} (`participantId` + `wantCount`) for
+ * collective-assembly re-validation.
  */
-export function seekerSigningPayload(topicId: Uint8Array, wantCount: number, correlationId: Uint8Array): Uint8Array {
+export function seekerSigningPayload(topicId: Uint8Array, wantCount: number): Uint8Array {
 	return utf8Encoder.encode(JSON.stringify([
 		"SeekerAppPayloadV1",
 		bytesToB64url(topicId),
 		wantCount,
-		bytesToB64url(correlationId),
+	]));
+}
+
+// --- seeker-side entry re-validation (advisory trust model) ---
+
+/**
+ * Verifies a forwarded entry's `registrationSig`. db-core is crypto-free, so the actual peer-key check
+ * is injected (db-p2p binds it to {@link import("@optimystic/db-p2p").verifyPeerSig} over the
+ * participant's Ed25519 peer key). `signerId` is the entry's `participantId` (a peer-id string); the
+ * verifier resolves the public key from it. Returns `false` (never throws) on a malformed signature.
+ */
+export type EntrySigVerifier = (signerId: string, payload: Uint8Array, signature: Uint8Array) => boolean;
+
+/**
+ * Re-validate a forwarded {@link ProviderEntryV1} against the topic it was returned for: reconstruct the
+ * provider signing image from the entry's own fields and verify `registrationSig` against the entry's
+ * `participantId`. This is the seeker-side check the advisory trust model hinges on — the cohort vouches
+ * only for "these were the registrations I held", never for provider authenticity.
+ */
+export function verifyProviderEntry(topicId: Uint8Array, entry: ProviderEntryV1, verify: EntrySigVerifier): boolean {
+	let sig: Uint8Array;
+	try {
+		sig = b64urlToBytes(entry.registrationSig);
+	} catch {
+		return false;
+	}
+	return verify(entry.participantId, providerSigningPayload(topicId, entry.capabilities, entry.capacityBudget), sig);
+}
+
+/** Re-validate a forwarded {@link SeekerEntryV1} (collective-assembly discovery), mirroring {@link verifyProviderEntry}. */
+export function verifySeekerEntry(topicId: Uint8Array, entry: SeekerEntryV1, verify: EntrySigVerifier): boolean {
+	let sig: Uint8Array;
+	try {
+		sig = b64urlToBytes(entry.registrationSig);
+	} catch {
+		return false;
+	}
+	return verify(entry.participantId, seekerSigningPayload(topicId, entry.wantCount), sig);
+}
+
+/**
+ * Canonical signed byte image of a {@link QueryReplyV1} — the cohort **primary's** single-member
+ * signature (not threshold), per `docs/matchmaking.md` §Wire formats. The primary vouches only for the
+ * *set it held*; provider authenticity is re-validated per entry via {@link verifyProviderEntry}. The
+ * image binds the epoch, truncation flag, traffic snapshot, and the participant ids of each returned
+ * entry (order-sensitive) so a tampered reply is detectable, while staying independent of the
+ * advisory per-entry signatures.
+ */
+export function queryReplySigningPayload(reply: Omit<QueryReplyV1, "signature">): Uint8Array {
+	return utf8Encoder.encode(JSON.stringify([
+		"QueryReplyV1",
+		reply.v,
+		reply.cohortEpoch,
+		reply.truncated,
+		[
+			reply.topicTraffic.windowSeconds,
+			reply.topicTraffic.arrivalsPerMin,
+			reply.topicTraffic.queriesPerMin,
+			reply.topicTraffic.directParticipants,
+			reply.topicTraffic.childCohortCount,
+		],
+		(reply.providers ?? []).map((p) => p.participantId),
+		(reply.seekers ?? []).map((s) => s.participantId),
 	]));
 }

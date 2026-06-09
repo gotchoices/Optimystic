@@ -1,14 +1,15 @@
 /**
- * Matchmaking — seeker registration (db-core, transport-agnostic).
+ * Matchmaking — seeker registration state (db-core, transport-agnostic).
  *
- * This ticket lands **registration only**. A {@link MatchmakingSeeker} owns the short-lived seeker
- * state for one topic and builds the signed {@link SeekerAppPayloadV1} that the db-p2p
- * `seeker-manager` registers at cohort-topic tier **T2** with a short TTL (`seeker_ttl`, default 10 s
- * — `docs/matchmaking.md` §Seeker query). The seeker registers briefly so other seekers can find it
- * (collective assembly) and the cohort sees active demand.
+ * A {@link MatchmakingSeeker} owns the short-lived seeker state for one topic and builds the signed
+ * {@link SeekerAppPayloadV1} that the db-p2p `seeker-manager` registers at cohort-topic tier **T2**
+ * with a short TTL (`seeker_ttl`, default 10 s — `docs/matchmaking.md` §Seeker query). The seeker
+ * registers briefly so other seekers can find it (collective assembly) and the cohort sees active
+ * demand.
  *
- * The query issuance, capability-filter evaluation, and hang-out-vs-continue decision are **deferred**
- * to `matchmaking-query-filter-hangout`; see the stub note on {@link MatchmakingSeeker.query}.
+ * This module holds *registration* state only. The `QueryV1` issuance and the hang-out-vs-continue
+ * decision live in the pure {@link import("./seeker-walk.js").decide} engine and the db-p2p
+ * `seeker-walk-client` that drives the walk; the capability filter is {@link import("./capability-filter.js").matchesFilter}.
  *
  * Crypto-free: signing is an injected callback, matching {@link MatchmakingProvider}.
  */
@@ -30,7 +31,7 @@ export interface MatchmakingSeekerOptions {
 	readonly pushOnArrival?: boolean;
 	/** Sign the canonical registration image; resolves the base64url signature. */
 	readonly sign: (payload: Uint8Array) => Promise<string>;
-	/** 16-byte correlation binding the signature; default fresh CSPRNG bytes. */
+	/** 16-byte registration correlation id (not signature-bound); default fresh CSPRNG bytes. */
 	readonly correlationId?: Uint8Array;
 	/** CSPRNG source (injectable for deterministic tests). Default `@noble/hashes` `randomBytes`. */
 	readonly randomBytes?: (n: number) => Uint8Array;
@@ -62,7 +63,7 @@ export class MatchmakingSeeker {
 
 	/** Build the signed {@link SeekerAppPayloadV1} for this seeker's registration. */
 	async buildAppPayload(): Promise<SeekerAppPayloadV1> {
-		const signature = await this.sign(seekerSigningPayload(this.topicId, this.wantCount, this.correlationId));
+		const signature = await this.sign(seekerSigningPayload(this.topicId, this.wantCount));
 		const payload: SeekerAppPayloadV1 = {
 			kind: "match-seeker",
 			wantCount: this.wantCount,
@@ -81,17 +82,5 @@ export class MatchmakingSeeker {
 	/** Build the opaque bytes for the cohort-topic `RegisterV1.appPayload` slot. */
 	async appPayloadBytes(): Promise<Uint8Array> {
 		return encodeSeekerAppPayload(await this.buildAppPayload());
-	}
-
-	/**
-	 * Issue a `QueryV1` and evaluate the hang-out-vs-continue decision.
-	 *
-	 * Implemented in `matchmaking-query-filter-hangout` — this ticket lands seeker *registration*
-	 * only. The query protocol codecs ({@link import("./wire.js").encodeQueryV1}) and the
-	 * `QueryReplyV1` decoder already live in `wire.ts` so the next ticket's consumer can be built
-	 * against fixtures.
-	 */
-	query(): never {
-		throw new Error("MatchmakingSeeker.query is implemented in matchmaking-query-filter-hangout");
 	}
 }

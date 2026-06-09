@@ -119,11 +119,6 @@ describe('matchmaking / seeker state', () => {
 	it('rejects wantCount below 1', () => {
 		expect(() => new MatchmakingSeeker({ topicId, wantCount: 0, contactHint: 'x', sign: fakeSign })).to.throw(RangeError);
 	});
-
-	it('query() is a documented stub deferred to the next ticket', () => {
-		const seeker = new MatchmakingSeeker({ topicId, wantCount: 1, contactHint: 'x', sign: fakeSign });
-		expect(() => seeker.query()).to.throw(/matchmaking-query-filter-hangout/);
-	});
 });
 
 describe('matchmaking / profile TTLs', () => {

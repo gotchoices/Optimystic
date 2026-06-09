@@ -2,7 +2,8 @@
  * Matchmaking — provider decision/state (db-core, transport-agnostic).
  *
  * A {@link MatchmakingProvider} owns the live provider state for one topic: its capability tags, its
- * current `capacityBudget`, and the correlation id that binds its signed registration. It builds the
+ * current `capacityBudget`, and a correlation id (registration identity; not bound into the
+ * matchmaking signature — see {@link providerSigningPayload} option (b)). It builds the
  * signed {@link ProviderAppPayloadV1} (and the opaque bytes for the cohort-topic
  * `RegisterV1.appPayload` slot) that the db-p2p `provider-manager` registers at cohort-topic tier
  * **T2** (`docs/matchmaking.md` §Provider registration).
@@ -38,7 +39,7 @@ export interface MatchmakingProviderOptions {
 	readonly serviceUntil?: number;
 	/** Sign the canonical registration image; resolves the base64url signature. */
 	readonly sign: (payload: Uint8Array) => Promise<string>;
-	/** 16-byte correlation binding the signature; default fresh CSPRNG bytes. */
+	/** 16-byte registration correlation id (not signature-bound); default fresh CSPRNG bytes. */
 	readonly correlationId?: Uint8Array;
 	/** CSPRNG source (injectable for deterministic tests). Default `@noble/hashes` `randomBytes`. */
 	readonly randomBytes?: (n: number) => Uint8Array;
@@ -93,7 +94,7 @@ export class MatchmakingProvider {
 
 	/** Build the signed {@link ProviderAppPayloadV1} reflecting the current capacity. */
 	async buildAppPayload(): Promise<ProviderAppPayloadV1> {
-		const signature = await this.sign(providerSigningPayload(this.topicId, this.capabilities, this.capacity, this.correlationId));
+		const signature = await this.sign(providerSigningPayload(this.topicId, this.capabilities, this.capacity));
 		const payload: ProviderAppPayloadV1 = {
 			kind: "match-provider",
 			capabilities: [...this.capabilities],

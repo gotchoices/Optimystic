@@ -244,28 +244,33 @@ describe('matchmaking wire', () => {
 		});
 	});
 
-	describe('signing payloads', () => {
+	describe('signing payloads (option (b): correlationId excluded — image reconstructable from entry)', () => {
 		it('is deterministic for identical inputs (provider)', () => {
 			const topicId = seededBytes(32, 50);
-			const corr = seededBytes(16, 51);
-			const a = providerSigningPayload(topicId, ['x', 'y'], 4, corr);
-			const b = providerSigningPayload(topicId, ['x', 'y'], 4, corr);
+			const a = providerSigningPayload(topicId, ['x', 'y'], 4);
+			const b = providerSigningPayload(topicId, ['x', 'y'], 4);
 			expect([...a]).to.deep.equal([...b]);
 		});
 
 		it('differs when capacityBudget changes (provider re-signs on capacity change)', () => {
 			const topicId = seededBytes(32, 52);
-			const corr = seededBytes(16, 53);
-			const a = providerSigningPayload(topicId, ['x'], 4, corr);
-			const b = providerSigningPayload(topicId, ['x'], 0, corr);
+			const a = providerSigningPayload(topicId, ['x'], 4);
+			const b = providerSigningPayload(topicId, ['x'], 0);
 			expect([...a]).to.not.deep.equal([...b]);
+		});
+
+		it('is reconstructable from a forwarded ProviderEntryV1 (topicId + entry fields only)', () => {
+			const topicId = seededBytes(32, 56);
+			const signed = providerSigningPayload(topicId, ['pdf-render', 'gpu'], 2);
+			// A verifier holding only the entry (no correlationId) rebuilds the exact image.
+			const fromEntry = providerSigningPayload(topicId, ['pdf-render', 'gpu'], 2);
+			expect([...signed]).to.deep.equal([...fromEntry]);
 		});
 
 		it('is deterministic for identical inputs (seeker)', () => {
 			const topicId = seededBytes(32, 54);
-			const corr = seededBytes(16, 55);
-			const a = seekerSigningPayload(topicId, 8, corr);
-			const b = seekerSigningPayload(topicId, 8, corr);
+			const a = seekerSigningPayload(topicId, 8);
+			const b = seekerSigningPayload(topicId, 8);
 			expect([...a]).to.deep.equal([...b]);
 		});
 	});
