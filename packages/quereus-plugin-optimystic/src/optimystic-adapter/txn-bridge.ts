@@ -1,4 +1,4 @@
-import type { TransactionCoordinator, ITransactionEngine } from '@optimystic/db-core';
+import type { TransactionCoordinator, ITransactionEngine, Collection, CollectionId } from '@optimystic/db-core';
 import { TransactionSession } from '@optimystic/db-core';
 import type { TransactionState, ParsedOptimysticOptions } from '../types.js';
 import { CollectionFactory } from './collection-factory.js';
@@ -45,6 +45,24 @@ export class TransactionBridge {
    * throwaway txnState, so neither reliably lands in that map.
    */
   private dirtyTrees = new Map<DirtyTree, unknown>();
+  /**
+   * Live registry of every collection the vtab stages into (main table + each
+   * index tree), keyed by collection id. Maintained unconditionally as tables
+   * initialize — independent of transaction mode — because the coordinator a
+   * host wires via {@link configureTransactionMode} is constructed from THIS
+   * same map (see {@link getCollectionRegistry}). Sharing one live map is what
+   * makes session-mode commit correct: `coordinator.commit()` iterates its
+   * collection map and reads each `tracker.transforms`, so the trackers the vtab
+   * stages into must BE the coordinator's collections. A tree created mid-run
+   * (e.g. a new index) registers here and is therefore visible to the
+   * already-constructed coordinator before commit.
+   *
+   * Typed `Collection<any>` to mirror {@link TransactionCoordinator}'s own
+   * constructor signature (the trees registered here carry heterogeneous action
+   * types — main-table rows vs. index entries — that the coordinator treats
+   * uniformly).
+   */
+  private collectionRegistry = new Map<CollectionId, Collection<any>>();
   /** Optional transaction session for distributed consensus */
   private session: TransactionSession | null = null;
   /** Optional coordinator for transaction mode */
@@ -83,6 +101,30 @@ export class TransactionBridge {
    */
   isTransactionModeEnabled(): boolean {
     return this.coordinator !== null && this.engine !== null;
+  }
+
+  /**
+   * Register a collection the vtab stages into (main table or index tree) so a
+   * session-mode coordinator can read its staged transforms at commit and revert
+   * them at rollback. Idempotent (keyed by collection id) and mode-agnostic:
+   * always called as a table initializes, BEFORE any DML, so the collection is
+   * present when the coordinator snapshots on the transaction's first action.
+   *
+   * The registry is the live map handed to the coordinator, so registering after
+   * the coordinator was constructed still makes the collection visible to it.
+   */
+  registerCollection(collection: Collection<any>): void {
+    this.collectionRegistry.set(collection.id, collection);
+  }
+
+  /**
+   * The live collection registry. A host wiring session mode builds its
+   * {@link TransactionCoordinator} from this exact map so the coordinator and the
+   * vtab share one set of {@link Collection} instances (and thus one set of
+   * trackers). See {@link registerCollection}.
+   */
+  getCollectionRegistry(): Map<CollectionId, Collection<any>> {
+    return this.collectionRegistry;
   }
 
   /**
@@ -148,13 +190,14 @@ export class TransactionBridge {
 
     try {
       if (this.session) {
-        // Transaction mode: commit through session for distributed consensus.
-        // The DML path now STAGES into the collection trackers (no inline sync),
-        // and the coordinator's commit() reads `tracker.transforms` directly, so
-        // we deliberately do NOT tree.sync() here — flushing would reset the
-        // trackers out from under consensus. Session-mode commit composition
-        // against the staging DML path is not yet covered by a real-DML test;
-        // see fix/optimystic-session-mode-commit-composition.
+        // Transaction mode: commit through the session for distributed consensus.
+        // The DML path STAGES into the collection trackers (no inline sync), and
+        // the coordinator's commit() iterates its collection map and reads each
+        // `tracker.transforms` directly. Because that map is the SAME live
+        // registry the vtab stages into (see registerCollection /
+        // getCollectionRegistry), the staged transforms are exactly what
+        // consensus pends/commits — so we deliberately do NOT tree.sync() here;
+        // flushing would reset the trackers out from under consensus.
         const result = await this.session.commit();
         if (!result.success) {
           throw new Error(result.error || 'Transaction commit failed');
@@ -202,15 +245,25 @@ export class TransactionBridge {
       }
     }
 
-    // Roll back staged-but-unsynced DML in BOTH modes. Quereus runs deferred row
-    // constraints BEFORE connection.commit(), so a constraint-failure rollback
-    // reaches here while every staged tree is still un-synced — restoring each
-    // tree's pre-stage snapshot reverts in-memory reads and leaves storage
-    // untouched, which is the actual fix for the deferred-constraint atomicity
-    // bug. Restoring the snapshot (rather than clearing the tracker) keeps a
-    // never-synced collection's header/root intact so it stays readable.
-    for (const [tree, snapshot] of this.dirtyTrees) {
-      tree.restore(snapshot);
+    // Roll back staged-but-unsynced DML. Quereus runs deferred row constraints
+    // BEFORE connection.commit(), so a constraint-failure rollback reaches here
+    // while every staged tree is still un-synced. Tracker rollback has a single
+    // owner per mode:
+    //   - Session mode: the coordinator owns it. session.rollback() (above)
+    //     already restored every registered collection's tracker to the
+    //     pre-session snapshot (and replays any interleaved sessions). The dirty
+    //     trees ARE those registered collections, so a second per-tree restore
+    //     here would be redundant and, against a multi-session coordinator, would
+    //     clobber that careful replay. Skip it.
+    //   - Legacy mode (no coordinator): restore each dirty tree from its
+    //     pre-stage snapshot — this reverts in-memory reads and leaves storage
+    //     untouched, the actual fix for the deferred-constraint atomicity bug.
+    //     Restoring the snapshot (rather than clearing the tracker) keeps a
+    //     never-synced collection's header/root intact so it stays readable.
+    if (!this.session) {
+      for (const [tree, snapshot] of this.dirtyTrees) {
+        tree.restore(snapshot);
+      }
     }
     this.dirtyTrees.clear();
 

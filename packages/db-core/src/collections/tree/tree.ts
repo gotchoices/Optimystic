@@ -86,6 +86,17 @@ export class Tree<TKey, TEntry> {
 			this.collection.restorePending(snapshot);
 	}
 
+	/** The underlying {@link Collection} this tree stages mutations into.
+	 *
+	 * Exposed (package-internal intent) so a transaction coordinator can register
+	 * and read the very tracker this tree mutates: session-mode commit reads
+	 * `collection.tracker.transforms` directly, so the coordinator's collection
+	 * map must hold the same instance the tree stages into. Prefer this accessor
+	 * over reaching through `tree['collection']`. */
+	getCollection(): Collection<TreeReplaceAction<TKey, TEntry>> {
+			return this.collection;
+	}
+
 	/**
 	 * Update the local state from the network.
 	 * Call this before reading to ensure you have the latest data.

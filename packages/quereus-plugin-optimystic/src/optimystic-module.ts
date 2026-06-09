@@ -251,6 +251,12 @@ export class OptimysticVirtualTable extends VirtualTable {
       // Create statistics collector
       this.statisticsCollector = new StatisticsCollector(storedSchema);
 
+      // Register the main + index collections with the bridge so a session-mode
+      // coordinator shares the very trackers this vtab stages into (see
+      // registerCollections). Must happen before any DML so the coordinator's
+      // per-transaction snapshot includes them.
+      this.registerCollections();
+
       this.isInitialized = true;
 
       // Bridge optimystic collection-change notifications to Quereus watch
@@ -667,6 +673,29 @@ export class OptimysticVirtualTable extends VirtualTable {
   }
 
   /**
+   * Register this table's collections (main table + every index tree) with the
+   * transaction bridge so a session-mode coordinator can read their staged
+   * transforms at commit and revert them at rollback.
+   *
+   * Called as the table initializes — BEFORE any DML — so the collections are
+   * present in the coordinator's (shared) map when it snapshots on the
+   * transaction's first action. Distinct from {@link markDirtyTrees}, which runs
+   * per-DML and is therefore too late to seed that snapshot. Idempotent and
+   * mode-agnostic: the registry is a plain map the bridge maintains regardless of
+   * whether session mode is ever wired up.
+   */
+  private registerCollections(): void {
+    if (this.collection) {
+      this.txnBridge.registerCollection(this.collection.getCollection());
+    }
+    if (this.indexManager) {
+      for (const tree of this.indexManager.getIndexTrees()) {
+        this.txnBridge.registerCollection(tree.getCollection());
+      }
+    }
+  }
+
+  /**
    * Performs an INSERT, UPDATE, or DELETE operation
    */
   async update(args: UpdateArgs): Promise<UpdateResult> {
@@ -855,6 +884,13 @@ export class OptimysticVirtualTable extends VirtualTable {
       (this.indexManager as any).indexTrees.set(indexSchema.name, indexTree);
       (this.indexManager as any).schema = updatedSchema;
     }
+
+    // Register the new index collection so a session-mode coordinator sees it.
+    // CREATE INDEX normally runs outside a DML transaction, so the coordinator
+    // picks it up before the next transaction's snapshot. (An index created
+    // mid-transaction would miss that transaction's already-taken snapshot — a
+    // known, documented edge.)
+    this.txnBridge.registerCollection(indexTree.getCollection());
 
     // Populate the index with existing data
     if (this.collection && this.rowCodec) {
