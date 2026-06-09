@@ -34,10 +34,13 @@ import {
 	type CohortMemberEngine,
 	type ParticipantSigner,
 	type PeerRef,
+	type RegisterV1,
+	type RenewV1,
 	type RingCoord,
 	type Tier,
 } from '@optimystic/db-core';
-import { createCohortTopicHost } from '../../src/cohort-topic/host.js';
+import { createCohortTopicHost, resolveRenew } from '../../src/cohort-topic/host.js';
+import { bytesToPeerIdString } from '../../src/cohort-topic/peer-codec.js';
 import { DEFAULT_COHORT_TOPIC_PROTOCOLS } from '../../src/cohort-topic/protocols.js';
 
 const sha256digest = (b: Uint8Array): Uint8Array => new RingHash().H(b);
@@ -269,6 +272,107 @@ describe('cohort-topic: FRET host protocol handshake', () => {
 			expect(handled.has(protocol), `handler for ${protocol}`).to.equal(true);
 		}
 		expect(host.protocols).to.deep.equal(DEFAULT_COHORT_TOPIC_PROTOCOLS);
+		await host.stop();
+	});
+});
+
+describe('cohort-topic: per-served-coord scoping', () => {
+	const TOPIC = Uint8Array.from({ length: 32 }, (_v, i) => (i + 7) & 0xff);
+
+	async function makePeerId(): Promise<PeerId> {
+		const key = await generateKeyPair('Ed25519');
+		return peerIdFromPrivateKey(key);
+	}
+
+	/** A minimal libp2p stand-in: the host only handles/unhandles protocols and reads its own peer id. */
+	function makeFakeNode(peerId: PeerId): unknown {
+		return {
+			peerId,
+			handle: (): Promise<void> => Promise.resolve(),
+			unhandle: (): Promise<void> => Promise.resolve(),
+			getConnections: (): Connection[] => [],
+			dialProtocol: (): Promise<Stream> => Promise.reject(new Error('no dial in coord-scoping test')),
+		};
+	}
+
+	/** A fake FRET whose `assembleCohort` returns a different set per coordinate. */
+	function makeFakeFret(cohortFor: (coord: RingCoord) => string[]): unknown {
+		return {
+			assembleCohort: (coord: RingCoord): string[] => cohortFor(coord),
+			setActivityHandler: (): void => {},
+			getNetworkSizeEstimate: (): { size_estimate: number; confidence: number; sources: number } => ({ size_estimate: 50, confidence: 1, sources: 1 }),
+			routeAct: (): Promise<{ commitCertificate: string }> => Promise.resolve({ commitCertificate: '' }),
+		};
+	}
+
+	it('the engine serving a topic assembles its cohort around coord_0(topic), NOT the node ring neighbours', async () => {
+		// The core bug this ticket fixes: the cohort a topic is served by sits at coord_0(topic), which is
+		// unrelated to the node's own ring position. A coord engine must threshold-sign / shard with the
+		// topic-coord cohort, not the FRET assembly around `selfCoord`.
+		const peerId = await makePeerId();
+		const addressing = createTierAddressing(new RingHash());
+		const coord0Topic = addressing.coord0(TOPIC);
+		const coordKey = bytesToB64url(coord0Topic);
+		// 'topic-cohort-member' for the topic root; 'ring-neighbour' for every other coord (incl. selfCoord).
+		const fret = makeFakeFret((coord) => (bytesToB64url(coord) === coordKey ? ['topic-cohort-member'] : ['ring-neighbour']));
+		const host = await createCohortTopicHost(makeFakeNode(peerId) as never, fret as never);
+
+		const participantCoord = new TextEncoder().encode('participant-X');
+		const ce = host.registry.forCoord(coord0Topic, 0 as Tier, participantCoord);
+		const members = ce.cohort().members.map(bytesToPeerIdString);
+
+		expect(ce.treeTier, 'instantiated at the tier the coord was first served').to.equal(0);
+		expect(members, 'self is prepended to the served cohort').to.include(peerId.toString());
+		expect(members, 'cohort is assembled around coord_0(topic)').to.include('topic-cohort-member');
+		expect(members, 'NOT the node ring-position neighbours').to.not.include('ring-neighbour');
+
+		await host.stop();
+	});
+
+	it('renewal resolves to the coord engine holding the record; an unheld record replies unknown_registration', async () => {
+		// A RenewV1 carries no treeTier, so the held record — not a recomputed coord — names the cohort.
+		// wantK:1 makes a single-member cohort (self), so the willingness quorum is met and the tier-0
+		// bootstrap admits without gossiped siblings (multi-member admission awaits the willingness-gossip
+		// wiring — see the implement handoff).
+		const peerId = await makePeerId();
+		const addressing = createTierAddressing(new RingHash());
+		const coord0Topic = addressing.coord0(TOPIC);
+		const fret = makeFakeFret(() => []); // self-only cohort everywhere
+		const host = await createCohortTopicHost(makeFakeNode(peerId) as never, fret as never, { wantK: 1 });
+
+		const participantCoord = new TextEncoder().encode('participant-R');
+		const ce = host.registry.forCoord(coord0Topic, 0 as Tier, participantCoord);
+		const reg: RegisterV1 = {
+			v: 1,
+			topicId: bytesToB64url(TOPIC),
+			tier: 0,
+			treeTier: 0,
+			participantCoord: bytesToB64url(participantCoord),
+			ttl: 90_000,
+			bootstrap: true,
+			timestamp: Date.now(),
+			correlationId: bytesToB64url(new TextEncoder().encode('cid-renew')),
+			signature: '',
+		};
+		const reply = await ce.engine.handleRegister(reg, { followOn: false, treeTier: 0 }, Date.now());
+		expect(reply.result, 'single-member tier-0 bootstrap admits').to.equal('accepted');
+
+		const participantId = b64urlToBytes(reg.participantCoord);
+		expect(host.registry.findHolder(TOPIC, participantId), 'the holding coord engine is found').to.equal(ce);
+
+		const renew: RenewV1 = {
+			v: 1,
+			topicId: reg.topicId,
+			participantId: reg.participantCoord,
+			correlationId: reg.correlationId,
+			timestamp: Date.now(),
+			signature: '',
+		};
+		expect(resolveRenew(host.registry, renew, Date.now()).result, 'renewal resolves its coord and is served').to.equal('ok');
+
+		const unheld: RenewV1 = { ...renew, participantId: bytesToB64url(new TextEncoder().encode('never-registered')) };
+		expect(resolveRenew(host.registry, unheld, Date.now()).result, 'an unheld record re-looks up rather than throwing').to.equal('unknown_registration');
+
 		await host.stop();
 	});
 });

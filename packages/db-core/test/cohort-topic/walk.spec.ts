@@ -87,6 +87,31 @@ function factoryFor(self: Uint8Array): RegisterMessageFactory {
 const accepted: RegisterReplyV1 = { v: 1, result: 'accepted', primary: bytesToB64url(bytes('primary')), cohortEpoch: bytesToB64url(bytes('epoch', 32)) };
 const noState: RegisterReplyV1 = { v: 1, result: 'no_state' };
 
+/**
+ * A coord-addressed router modeling a **single tier-0 cohort that has promoted but is childless**: the
+ * one promoted coord answers `Promoted(1)`; every other coord (including the recomputed `coord_1`) is
+ * cold and answers `NoState`. With no `followOn` instantiation (out of scope for the single-cohort
+ * milestone) this is exactly the one-cohort tree the walk's safety valve must bound.
+ */
+class SingleCohortRouter implements ITopicRouter {
+	readonly probes: Probe[] = [];
+
+	constructor(private readonly promotedCoord: RingCoord) {}
+
+	async routeAndAct(key: RingCoord, activity: Uint8Array): Promise<Uint8Array> {
+		const reg = decodeRegisterV1(activity);
+		this.probes.push({ mode: 'route', coord: key, treeTier: reg.treeTier, bootstrap: reg.bootstrap === true });
+		const reply: RegisterReplyV1 = bytesEqual(key, this.promotedCoord) ? { v: 1, result: 'promoted', targetTier: 1 } : noState;
+		return encodeCohortMessage(reply);
+	}
+
+	async dialMember(member: PeerRef, activity: Uint8Array): Promise<Uint8Array> {
+		const reg = decodeRegisterV1(activity);
+		this.probes.push({ mode: 'dial', member: member.id, treeTier: reg.treeTier, bootstrap: reg.bootstrap === true });
+		return encodeCohortMessage(noState);
+	}
+}
+
 describe('cohort-topic / walk-toward-root', () => {
 	it('sparse-regime walks fan across the ring: distinct coord_{d_max} per participant, all drain to the root', async () => {
 		const dMax = 3;
@@ -255,6 +280,26 @@ describe('cohort-topic / walk-toward-root', () => {
 		const outcome = await engine.register(TOPIC, 1);
 		expect(outcome.kind, 'pathological oscillation backs off, never loops').to.equal('retry_later');
 		expect(router.probes.length, 'capped at exactly maxSteps probes').to.equal(5);
+	});
+
+	it('single tier-0 cohort, promoted but childless: the walk terminates within maxSteps (followOn instantiation out of scope)', async () => {
+		// The per-coord-scoping milestone serves one tier-0 cohort. When it promotes, a new registration
+		// gets Promoted(1); the participant recomputes coord_1 and finds it cold (NoState), walking back to
+		// 0 where it is promoted again. Without followOn instantiation this one-cohort tree cannot resolve,
+		// so the maxSteps valve must bound the oscillation and surface a temporal back-off — it terminates
+		// rather than spinning. (The mock host test sidesteps this by never promoting on the walk path.)
+		const self = bytes('single-cohort-participant');
+		const dMax = 0; // a one-cohort network: d_max collapses to the root
+		const promotedCoord = addressing.coord(0, self, TOPIC); // coord_0(topic), peer-independent
+		const maxSteps = 6;
+		const router = new SingleCohortRouter(promotedCoord);
+		const engine = createWalkEngine({ router, addressing, dmax: fixedDMax(dMax), self, factory: factoryFor(self), config: { maxSteps } });
+
+		const outcome = await engine.register(TOPIC, 0);
+		expect(outcome.kind, 'bounded back-off, never an infinite loop').to.equal('retry_later');
+		expect(router.probes.length, 'capped at exactly maxSteps probes').to.equal(maxSteps);
+		expect(new Set(router.probes.map((p) => p.treeTier)), 'oscillates only between the promoted root (0) and its empty child (1)').to.deep.equal(new Set([0, 1]));
+		expect(bytesEqual(router.probes[0]!.coord!, promotedCoord), 'the first probe lands on coord_0(topic)').to.be.true;
 	});
 
 	it('defaults a Promoted redirect with no explicit targetTier to d+1', async () => {

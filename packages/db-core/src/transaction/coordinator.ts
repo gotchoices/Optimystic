@@ -107,7 +107,7 @@ export class TransactionCoordinator {
 			throw new Error(`Transaction expired at ${transaction.stamp.expiration}`);
 		}
 
-		// Collect transforms and determine critical blocks for each affected collection
+		// Collect collections with staged (un-synced) changes.
 		const collectionData = Array.from(this.collections.entries())
 			.map(([collectionId, collection]) => ({
 				collectionId,
@@ -124,30 +124,38 @@ export class TransactionCoordinator {
 			return; // Nothing to commit
 		}
 
-		// Get critical block IDs (log tail) for each affected collection
-		// The critical block is the current log tail that must participate in consensus
+		// Append each collection's staged actions to its log, then collect the
+		// resulting transforms + critical (log-tail) block for consensus.
+		//
+		// The actions were staged directly into the trackers (Collection.act, e.g.
+		// via Tree.stage) WITHOUT first appending a log entry, so — exactly as
+		// execute()/applyActionsToCollection does — we materialise the log entry
+		// here from each collection's pending actions. Reading raw tracker
+		// transforms without a fresh log entry only ever "worked" for a
+		// collection's pristine first commit (where the initial empty log block is
+		// itself an uncommitted tracker insert); it broke for any collection with
+		// prior committed state — a pre-synced index tree, or a second commit on
+		// the same collection — whose log tail lives in storage, not the tracker.
+		const allCollectionIds = collectionData.map(({ collectionId }) => collectionId);
 		const collectionTransforms = new Map<CollectionId, Transforms>();
 		const criticalBlocks = new Map<CollectionId, BlockId>();
 
-		for (const { collectionId, collection, transforms } of collectionData) {
-			collectionTransforms.set(collectionId, transforms);
-
-			// Get the current log tail block ID (critical block)
-			const log = await Log.open(collection.tracker, collectionId);
-			if (!log) {
-				throw new Error(`Log not found for collection ${collectionId}`);
+		for (const { collectionId, collection } of collectionData) {
+			const applyResult = await this.applyActionsToCollection(
+				{ collectionId, actions: collection.getPendingActions() },
+				transaction,
+				allCollectionIds
+			);
+			if (!applyResult.success) {
+				throw new Error(`Transaction commit failed: ${applyResult.error}`);
 			}
-
-			const tailPath = await (log as unknown as { chain: { getTail: () => Promise<{ block: { header: { id: BlockId } } } | undefined> } }).chain.getTail();
-			if (tailPath) {
-				criticalBlocks.set(collectionId, tailPath.block.header.id);
-			}
+			collectionTransforms.set(collectionId, applyResult.transforms!);
+			criticalBlocks.set(collectionId, applyResult.logTailBlockId!);
 		}
 
-		// Compute hash of ALL operations across ALL collections
-		// This hash is used for validation - validators re-execute the transaction
-		// and compare their computed operations hash with this one
-		const allOperations = collectionData.flatMap(({ collectionId, transforms }) => [
+		// Compute hash of ALL operations across ALL collections (post-log-append).
+		// Validators re-execute the transaction and compare their computed hash.
+		const allOperations = Array.from(collectionTransforms.entries()).flatMap(([collectionId, transforms]) => [
 			...Object.entries(transforms.inserts ?? {}).map(([blockId, block]) =>
 				({ type: 'insert' as const, collectionId, blockId, block })
 			),
@@ -173,8 +181,14 @@ export class TransactionCoordinator {
 			throw new Error(`Transaction commit failed: ${coordResult.error}`);
 		}
 
-		// Reset trackers and update actionContext after successful commit
-		for (const { collection } of collectionData) {
+		// Advance actionContext, fold the committed transforms into each
+		// collection's read cache, reset the tracker, and drop the now-committed
+		// pending actions. Order matters: cache the committed blocks BEFORE
+		// resetting the tracker (the transforms are read live), so a collection
+		// with prior committed state (a pre-synced index, or any second commit)
+		// serves the new revision instead of the stale cached one. Clearing
+		// pending keeps a subsequent commit from re-logging these actions.
+		for (const { collectionId, collection } of collectionData) {
 			const newRev = (collection['source'].actionContext?.rev ?? 0) + 1;
 			collection['source'].actionContext = {
 				committed: [
@@ -183,7 +197,9 @@ export class TransactionCoordinator {
 				],
 				rev: newRev,
 			};
+			collection.applyCommittedToCache(collectionTransforms.get(collectionId)!);
 			collection.tracker.reset();
+			collection.clearPendingActions();
 		}
 
 		// Clean up stamp tracking data

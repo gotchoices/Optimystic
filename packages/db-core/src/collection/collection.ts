@@ -170,6 +170,38 @@ export class Collection<TAction> implements ICollection<TAction> {
 		this.pending = [...snapshot.pending];
 	}
 
+	/** The staged (not-yet-synced) actions queued by {@link act}.
+	 *
+	 * Exposed so a {@link TransactionCoordinator} can append them to the log at
+	 * commit time — mirroring what {@link sync} does internally — when the actions
+	 * were staged directly into this collection (e.g. through a Tree's stage())
+	 * rather than applied via the coordinator's own action path. */
+	getPendingActions(): Action<TAction>[] {
+		return this.pending;
+	}
+
+	/** Drop the staged actions after they have been committed through a
+	 * coordinator. Counterpart to {@link getPendingActions}; {@link sync} clears
+	 * its own pending inline, so this is only needed when commit was orchestrated
+	 * externally. */
+	clearPendingActions(): void {
+		this.pending = [];
+	}
+
+	/** Fold a just-committed set of transforms into this collection's read cache
+	 * so subsequent reads (and stages) through THIS instance observe the committed
+	 * state, mirroring what {@link sync} does inline after a successful transact.
+	 *
+	 * Needed when commit was orchestrated externally (a coordinator): the tracker
+	 * is reset to empty, but the cache still holds the pre-commit blocks. Without
+	 * this, a collection that already had committed state (e.g. a pre-synced index
+	 * tree, or any collection on its second commit) keeps serving the stale prior
+	 * revision because {@link update} sees its rev is already current and refetches
+	 * nothing. Call BEFORE resetting the tracker (the transforms are read live). */
+	applyCommittedToCache(transforms: Transforms): void {
+		this.sourceCache.transformCache(transforms);
+	}
+
 	/** Push our pending actions to the transactor */
 	async sync() {
 		const release = await Latches.acquire(this.latchId);
