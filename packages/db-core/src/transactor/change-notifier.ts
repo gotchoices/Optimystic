@@ -13,6 +13,26 @@ export type CollectionChangeEvent = {
 
 export type CollectionChangeListener = (event: CollectionChangeEvent) => void;
 
+/**
+ * The cluster-consensus commit certificate for a committed action — the **authoritative** proof
+ * that the cohort agreed the commit. It is the cross-package currency the local change-notifier
+ * bridge forwards into the cohort-topic substrate (`CohortTopicService.onLocalCommit`) so reactivity
+ * can originate notifications **without re-signing**: a notification's signature is bit-for-bit this
+ * `thresholdSig`. The bridge and every downstream consumer treat the bytes as opaque and pass them
+ * through unchanged — only the cluster layer that produced consensus ever mints one.
+ *
+ * Peer ids are carried as their string form (the cluster keys signatures by peer-id string); db-core
+ * stays cross-platform and never references a libp2p `PeerId` type here.
+ */
+export type CommitCert = {
+	/** Threshold signature bytes proving `signers` agreed the commit. Forwarded UNCHANGED; never re-signed. */
+	readonly thresholdSig: Uint8Array;
+	/** Peer-id strings whose signatures compose {@link thresholdSig} (a distinct set of size ≥ {@link minSigs}). */
+	readonly signers: readonly string[];
+	/** Threshold the signer set satisfies (the cluster super-majority / cohort `k − x`). */
+	readonly minSigs: number;
+};
+
 export interface IBlockChangeNotifier {
 	/**
 	 * Subscribe to commits that mutate the given collection. Returns an

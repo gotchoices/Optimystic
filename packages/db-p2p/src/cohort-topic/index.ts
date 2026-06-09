@@ -10,3 +10,4 @@ export * from "./membership-publish-sink.js";
 export * from "./threshold-crypto.js";
 export * from "./size-estimator.js";
 export * from "./host.js";
+export * from "./change-bridge.js";

@@ -1,5 +1,6 @@
 export * from "./cluster/client.js";
 export * from "./cluster/cluster-repo.js";
+export * from "./cluster/commit-cert.js";
 export * from "./cluster/service.js";
 export * from "./cluster/rebalance-monitor.js";
 export * from "./cluster/spread-on-churn.js";

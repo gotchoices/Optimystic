@@ -1383,6 +1383,26 @@ Accept cost of re-executing statements on cluster participants:
 - Broader validation: each participant validates entire transaction
 - Can optimize later with Merkle trees, sampling, caching
 
+### 12. Commit Certificate Is Authoritative; Reactivity Notifications Are Hints
+The cluster-consensus **commit certificate** — the set of per-member `approve` commit signatures the
+cohort produced under the GATHER-phase super-majority (`ClusterRecord.commits`, assembled in
+`cluster-repo.ts`) — is the **single authoritative** proof that a commit happened. It is the only
+thing minted by consensus, and the only thing a peer must trust to accept a revision.
+
+The cohort-topic **reactivity notifications** layered on top (see `docs/reactivity.md`,
+`docs/cohort-topic.md`) are **hints only**: a fast wake-up that a collection changed. They carry no
+new authority. A notification's signature is **bit-for-bit the commit certificate's threshold
+signature** (`CommitCert.thresholdSig`) — reactivity **reuses** it and **never re-signs**. The local
+change-notifier bridge (`local-change-notifier-bridge`) forwards the commit cert into the origination
+hook unchanged (`CommitCert { thresholdSig, signers, minSigs }`), and every forwarder relays it
+unmodified. Consequences:
+- A subscriber that misses or distrusts a notification loses nothing it cannot recover by reading the
+  authoritative committed state directly — notifications accelerate, they never gate.
+- A compromised forwarder can drop or delay a notification but **cannot forge** one: it would have to
+  produce a valid `k − x` threshold signature it does not hold.
+- Because the bytes are the commit cert's, a notification is verifiable against the same cohort
+  `MembershipCertV1` the commit cert is, with no separate signing key or trust root.
+
 ## Success Criteria
 
 1. **Multi-Collection Atomicity**: Transactions affecting multiple collections (table + indexes) commit atomically or not at all

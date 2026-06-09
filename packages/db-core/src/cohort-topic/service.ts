@@ -33,6 +33,7 @@ import type { MembershipVerifier } from "./membership/verifier.js";
 import type { Tier } from "./tiers.js";
 import { bytesToB64url, b64urlToBytes, decodeRenewReplyV1, encodeCohortMessage } from "./wire/codec.js";
 import type { RegisterReplyV1, RegisterV1, RenewReplyV1, TopicTrafficV1 } from "./wire/types.js";
+import type { CollectionChangeEvent, CommitCert } from "../transactor/change-notifier.js";
 
 /** A resolved cohort for a topic/tier — the return of {@link CohortTopicService.lookup}. */
 export interface CohortHint {
@@ -55,14 +56,16 @@ export interface RegistrationHandle extends CohortHint {
 	readonly renewal: RenewalParticipant;
 }
 
-/** Application-defined per-commit change folded into cohort gossip by the bridge ticket. */
-export interface LocalCommitChange {
-	readonly topicId: Uint8Array;
-	readonly appPayload?: Uint8Array;
-}
-
-/** Hook the reactivity / matchmaking bridge sets to fold local commits into cohort gossip. */
-export type LocalChangeHook = (change: LocalCommitChange) => void;
+/**
+ * The substrate's **origination hook**: a commit that lands on a node which is a cohort member for the
+ * collection's reactivity topic is delivered here by the local change-notifier bridge
+ * (`local-change-notifier-bridge`), carrying the raw {@link CollectionChangeEvent} and the
+ * pass-through {@link CommitCert} (extracted from cluster consensus, forwarded UNCHANGED). Reactivity
+ * (and later matchmaking) set this hook to fan the event out — reusing `commitCert.thresholdSig`
+ * directly, never re-signing. The bridge swallows + logs any throw so origination can never break the
+ * commit.
+ */
+export type LocalChangeHook = (event: CollectionChangeEvent, commitCert: CommitCert) => void;
 
 /** Thrown when the substrate cannot place a registration right now; carries the back-off delay. */
 export class CohortBackoffError extends Error {
@@ -94,7 +97,7 @@ export interface CohortTopicService {
 	lookup(topicId: Uint8Array, tier: Tier): Promise<CohortHint>;
 	/** Stop renewing `handle`; the cohort soft-state TTL-expires. */
 	withdraw(handle: RegistrationHandle): Promise<void>;
-	/** Bridge-set hook consumed by reactivity + matchmaking. */
+	/** Origination hook the change-notifier bridge invokes per local member commit; see {@link LocalChangeHook}. */
 	onLocalCommit?: LocalChangeHook;
 	/** Cohort gossip bus — applications fold app state into the existing gossip. */
 	cohortGossip(): CohortGossipBus;

@@ -118,6 +118,54 @@ StorageRepo.commit → CollectionChangeEvent → transactor.onCollectionChange
   commits. Edge/client nodes that don't host blocks receive no push subscription
   and still fetch/poll.
 
+#### Cohort-Topic Origination Bridge (networked reactivity)
+
+The same `StorageRepo` change signal is also the **origination point** for *networked*
+reactivity (and, later, matchmaking): a commit landing on a node that is a cohort
+member for the collection's reactivity topic is emitted into the cohort-topic substrate
+so notifications can fan out across the network — not just to in-process subscribers.
+
+```
+ClusterMember.handleConsensus            # consensus reached on a commit op
+  → captureCommitCert(record)            # build CommitCert from record.commits (cluster-repo.ts)
+  → onCommitCertificate(actionId, cert)  # → CommitCertStore.put  (BEFORE storageRepo.commit)
+  → storageRepo.commit(...)              # critical section; emits CollectionChangeEvent at the end
+StorageRepo.onAnyCollectionChange        # catch-all feed (every collection, not per-id)
+  → makeCohortTopicChangeNotifier        # the bridge (cohort-topic/change-bridge.ts)
+     → selfIsCohortMember(collectionId)? # non-member → no-op (no fan-out responsibility here)
+     → extractCommitCert(event)          # makeClusterCommitCertExtractor → CommitCertStore.get
+     → CohortTopicService.onLocalCommit(event, commitCert)   # reactivity originates from here
+```
+
+- **Catch-all feed.** Origination must fire for *every* member commit, but
+  `onCollectionChange(collectionId, …)` requires a known id and the bridge cannot
+  enumerate collections. So `StorageRepo` exposes `onAnyCollectionChange(listener)`,
+  fired alongside the per-collection listeners for the same `(pending → committed)`
+  transitions. The bridge subscribes to it once for the node's lifetime.
+- **Commit cert is authoritative; the notification is a hint.** The bridge forwards the
+  cluster commit certificate (`CommitCert { thresholdSig, signers, minSigs }`)
+  **unchanged** into `onLocalCommit`. Reactivity reuses `thresholdSig` bit-for-bit as a
+  notification's signature and **never re-signs** (see `docs/transactions.md` §Design
+  Decision 12). The cert is captured into a bounded TTL `CommitCertStore` *before* the
+  commit is applied, because `StorageRepo.commit` emits the change event synchronously at
+  the end of the call — so the cert must already be retained when the bridge resolves it.
+  No retained cert (e.g. an idempotent re-commit) → the bridge skips origination rather
+  than fabricating an unsigned one.
+- **Decorator, not a replacement.** `makeCohortTopicChangeNotifier` returns an
+  `IBlockChangeNotifier` that the `NetworkTransactor` takes as its `localChangeNotifier`;
+  its `onCollectionChange` delegates straight to the `StorageRepo`, so the Quereus
+  reactive-watch path above keeps working unchanged. Origination runs independently on
+  the catch-all feed, regardless of whether anyone subscribed per-collection.
+- **Wiring status.** The bridge mechanism, the `CommitCertStore`/extractor, and the
+  `onCommitCertificate` capture seam (a node-base option threaded to `ClusterMember`) are
+  in place and unit-tested. Activation is opt-in: a node assembly that runs the
+  cohort-topic substrate calls `attachCohortChangeBridge(node, …)` once a
+  `CohortTopicService` is live on the node. The production node (`libp2p-node-base.ts`)
+  does not yet construct that service, so origination is dormant there until the
+  cohort-host node-wiring lands; reactivity (`reactivity-origination-replay-delivery`) is
+  the consumer that sets `onLocalCommit` and builds `NotificationV1` from `(event,
+  commitCert)`.
+
 ## Mutation Contracts
 
 ### Functions That MUTATE In-Place

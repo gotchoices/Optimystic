@@ -25,6 +25,8 @@ export class StorageRepo implements IRepo, IBlockChangeNotifier, IBlockReplicaSt
 	private readonly validatePend?: PendValidationHook;
 	/** Per-collection change listeners; empty sets are pruned on unsubscribe. */
 	private readonly changeListeners = new Map<CollectionId, Set<CollectionChangeListener>>();
+	/** Catch-all change listeners — fire for EVERY collection's commit on this node. */
+	private readonly anyChangeListeners = new Set<CollectionChangeListener>();
 
 	constructor(
 		private readonly createBlockStorage: (blockId: BlockId) => IBlockStorage,
@@ -59,24 +61,53 @@ export class StorageRepo implements IRepo, IBlockChangeNotifier, IBlockReplicaSt
 	}
 
 	/**
+	 * Subscribe to commits mutating ANY collection on this node — the catch-all feed the
+	 * cohort-topic origination bridge consumes (it cannot enumerate collection ids ahead of time,
+	 * so a per-collection {@link onCollectionChange} subscription cannot see every commit). Fires for
+	 * the same `(pending → committed)` transitions as {@link onCollectionChange}, but across every
+	 * collection. Returns an idempotent unsubscribe; a throwing listener is isolated + logged.
+	 */
+	onAnyCollectionChange(listener: CollectionChangeListener): () => void {
+		this.anyChangeListeners.add(listener);
+		let unsubscribed = false;
+		return () => {
+			if (unsubscribed) return;
+			unsubscribed = true;
+			this.anyChangeListeners.delete(listener);
+		};
+	}
+
+	/**
 	 * Fire one {@link CollectionChangeEvent} per distinct collection that was
 	 * newly committed. Called AFTER the commit critical section (locks released),
-	 * fire-and-forget synchronous; a throwing listener is isolated and logged.
+	 * fire-and-forget synchronous; a throwing listener is isolated and logged. Each event reaches
+	 * both that collection's {@link onCollectionChange} subscribers and every
+	 * {@link onAnyCollectionChange} catch-all subscriber.
 	 */
 	private emitCollectionChanges(collectionBlocks: Map<CollectionId, BlockId[]>, actionId: ActionId, rev: number): void {
+		const hasCatchAll = this.anyChangeListeners.size > 0;
 		for (const [collectionId, blockIds] of collectionBlocks) {
 			const listeners = this.changeListeners.get(collectionId);
-			if (!listeners || listeners.size === 0) {
+			if ((!listeners || listeners.size === 0) && !hasCatchAll) {
 				continue;
 			}
 			const event: CollectionChangeEvent = { collectionId, blockIds, actionId, rev };
-			// Snapshot so a listener unsubscribing (or subscribing) mid-emit is safe.
-			for (const listener of Array.from(listeners)) {
-				try {
-					listener(event);
-				} catch (err) {
-					log('onCollectionChange listener threw for collection=%s: %o', collectionId, err);
-				}
+			if (listeners && listeners.size > 0) {
+				this.fireChangeListeners(listeners, event);
+			}
+			if (hasCatchAll) {
+				this.fireChangeListeners(this.anyChangeListeners, event);
+			}
+		}
+	}
+
+	/** Dispatch `event` to a snapshot of `listeners` (safe under mid-emit (un)subscribe), isolating + logging any throw. */
+	private fireChangeListeners(listeners: Set<CollectionChangeListener>, event: CollectionChangeEvent): void {
+		for (const listener of Array.from(listeners)) {
+			try {
+				listener(event);
+			} catch (err) {
+				log('onCollectionChange listener threw for collection=%s: %o', event.collectionId, err);
 			}
 		}
 	}

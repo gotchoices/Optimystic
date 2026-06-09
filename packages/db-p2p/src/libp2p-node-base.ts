@@ -18,7 +18,7 @@ import { StorageRepo } from './storage/storage-repo.js';
 import { BlockStorage } from './storage/block-storage.js';
 import { MemoryRawStorage } from './storage/memory-storage.js';
 import type { IRawStorage } from './storage/i-raw-storage.js';
-import { clusterMember, type ReconcileBlockCallback } from './cluster/cluster-repo.js';
+import { clusterMember, type ReconcileBlockCallback, type CommitCertificateSink } from './cluster/cluster-repo.js';
 import { coordinatorRepo } from './repo/coordinator-repo.js';
 import { Libp2pKeyPeerNetwork, type NetworkMode, type NetworkStatePersistence } from './libp2p-key-network.js';
 import { ClusterClient } from './cluster/client.js';
@@ -129,6 +129,16 @@ export type NodeOptions = {
 
 	/** Optional persistent store for 2PC transaction state (enables crash recovery) */
 	transactionStateStore?: ITransactionStateStore;
+
+	/**
+	 * Optional sink for the consensus commit certificate, fired per committed action just before the
+	 * commit is applied to local storage (see {@link CommitCertificateSink}). This is the cluster-side
+	 * half of the reactivity origination path: a caller wiring reactivity supplies a
+	 * {@link CommitCertStore}'s `put` here, then resolves it via {@link makeClusterCommitCertExtractor}
+	 * when it installs the change-notifier bridge ({@link attachCohortChangeBridge}) on the running
+	 * node. Absent → zero cost (no cert is assembled).
+	 */
+	onCommitCertificate?: CommitCertificateSink;
 
 	/**
 	 * Optional Ed25519 private key for this node. When provided, the libp2p
@@ -450,7 +460,8 @@ export async function createLibp2pNodeBase(
 		reputation,
 		consensusConfig,
 		stateStore: options.transactionStateStore,
-		reconcileBlock
+		reconcileBlock,
+		onCommitCertificate: options.onCommitCertificate
 	});
 
 	const coordinatorRepoFactory = coordinatorRepo(

@@ -1,7 +1,8 @@
-import type { IRepo, ClusterRecord, Signature, RepoMessage, ITransactionValidator, ClusterConsensusConfig, CommitResult, BlockId, ActionRev, CommitRequest } from "@optimystic/db-core";
+import type { IRepo, ClusterRecord, Signature, RepoMessage, ITransactionValidator, ClusterConsensusConfig, CommitResult, BlockId, ActionId, ActionRev, CommitRequest, CommitCert } from "@optimystic/db-core";
 import type { ICluster } from "@optimystic/db-core";
 import type { IPeerNetwork } from "@optimystic/db-core";
 import { blockIdsForTransforms } from "@optimystic/db-core";
+import { buildCommitCert } from "./commit-cert.js";
 import { ClusterClient } from "./client.js";
 import type { PeerId, PrivateKey } from "@libp2p/interface";
 import { peerIdFromString } from "@libp2p/peer-id";
@@ -48,6 +49,16 @@ interface TransactionState {
  */
 export type ReconcileBlockCallback = (blockId: BlockId, committed: ActionRev, cohortPeerIds: string[]) => Promise<void>;
 
+/**
+ * Sink for the {@link CommitCert} this member assembled at consensus, fired once per committed action
+ * **before** the commit is applied to local storage (so it is already retained when
+ * {@link StorageRepo.commit} emits the matching `CollectionChangeEvent` the reactivity bridge reads).
+ * The bytes are the cluster's own `approve` commit signatures, forwarded UNCHANGED — never re-signed.
+ * Optional; absent on nodes that do not originate reactivity notifications. A throwing sink is
+ * isolated + logged (it must never break consensus).
+ */
+export type CommitCertificateSink = (actionId: ActionId, cert: CommitCert) => void;
+
 interface ClusterMemberComponents {
 	storageRepo: IRepo;
 	peerNetwork: IPeerNetwork;
@@ -63,6 +74,8 @@ interface ClusterMemberComponents {
 	stateStore?: ITransactionStateStore;
 	/** Restores a block under-replicated by cohort drift; see {@link ReconcileBlockCallback}. */
 	reconcileBlock?: ReconcileBlockCallback;
+	/** Receives the consensus commit cert per committed action; see {@link CommitCertificateSink}. */
+	onCommitCertificate?: CommitCertificateSink;
 }
 
 export function clusterMember(components: ClusterMemberComponents): ClusterMember {
@@ -78,7 +91,8 @@ export function clusterMember(components: ClusterMemberComponents): ClusterMembe
 		components.reputation,
 		components.consensusConfig,
 		components.stateStore,
-		components.reconcileBlock
+		components.reconcileBlock,
+		components.onCommitCertificate
 	);
 }
 
@@ -133,7 +147,8 @@ export class ClusterMember implements ICluster {
 		private readonly reputation?: IPeerReputation,
 		consensusConfig?: ClusterConsensusConfig,
 		private readonly stateStore?: ITransactionStateStore,
-		private readonly reconcileBlock?: ReconcileBlockCallback
+		private readonly reconcileBlock?: ReconcileBlockCallback,
+		private readonly onCommitCertificate?: CommitCertificateSink
 	) {
 		this.superMajorityThreshold = consensusConfig?.superMajorityThreshold ?? 1.0;
 		// Periodically clean up expired transactions (.unref() so tests/short-lived processes can exit)
@@ -778,6 +793,10 @@ export class ClusterMember implements ICluster {
 		}
 		if ('commit' in operation) {
 			const commit = operation.commit;
+			// Capture the consensus commit cert BEFORE applying to storage: StorageRepo.commit emits the
+			// CollectionChangeEvent synchronously at the end of the call below, and the reactivity bridge
+			// resolves the cert from that event — so it must already be retained when commit() returns.
+			this.captureCommitCert(record, commit.actionId);
 			let result: CommitResult;
 			try {
 				result = await this.storageRepo.commit(commit);
@@ -818,6 +837,24 @@ export class ClusterMember implements ICluster {
 				throw new Error(`Consensus commit for action ${commit.actionId} failed: ${result.reason ?? 'unknown reason'}`);
 			}
 			return;
+		}
+	}
+
+	/**
+	 * Record the consensus commit cert for `actionId` into the injected {@link CommitCertificateSink},
+	 * if one is wired. The cert is built from the agreed `record.commits` (the per-member `approve`
+	 * commit signatures), forwarded UNCHANGED for reactivity to reuse. No-op (zero cost) when no sink
+	 * is configured; a throwing sink is isolated + logged so it can never break consensus.
+	 */
+	private captureCommitCert(record: ClusterRecord, actionId: ActionId): void {
+		if (!this.onCommitCertificate) {
+			return;
+		}
+		const minSigs = Math.ceil(Object.keys(record.peers).length * this.superMajorityThreshold);
+		try {
+			this.onCommitCertificate(actionId, buildCommitCert(record, minSigs));
+		} catch (err) {
+			log('cluster-member:commit-cert-sink-error', { actionId, error: (err as Error).message });
 		}
 	}
 

@@ -6,7 +6,7 @@ import { BlockStorage } from '../src/storage/block-storage.js';
 import type {
 	IRepo, ClusterRecord, RepoMessage, Signature, ClusterPeers, Transforms,
 	IBlock, BlockId, BlockHeader, BlockGets, GetBlockResults, PendRequest,
-	PendResult, CommitRequest, CommitResult, ActionBlocks
+	PendResult, CommitRequest, CommitResult, ActionBlocks, CommitCert
 } from '@optimystic/db-core';
 import type { IPeerNetwork } from '@optimystic/db-core';
 import type { PeerId, PrivateKey } from '@libp2p/interface';
@@ -401,5 +401,63 @@ describe('ClusterMember consensus-execution divergence (stream-reset root cause)
 		// Executed marker rolled back so a corrected retry can re-run; no reconciliation.
 		expect(member.wasTransactionExecuted(record.messageHash)).to.equal(false);
 		expect(reconcileCalls).to.equal(0);
+	});
+});
+
+describe('ClusterMember commit-certificate capture (reactivity origination feed)', () => {
+	let mockNetwork: MockPeerNetwork;
+	let self: KeyPair;
+	let other: KeyPair;
+	let member: ClusterMember;
+
+	beforeEach(async () => {
+		mockNetwork = new MockPeerNetwork();
+		self = await makeKeyPair();
+		other = await makeKeyPair();
+	});
+
+	afterEach(() => {
+		member?.dispose();
+	});
+
+	it('fires onCommitCertificate with the consensus commit signatures forwarded unchanged', async () => {
+		const storage = realStorageRepo();
+		// Stage the pend locally so the commit genuinely lands (and so emission semantics match production).
+		await storage.pend({ actionId: 'a1', transforms: { inserts: { 'block-1': makeBlock('block-1') }, updates: {}, deletes: [] }, policy: 'c' });
+
+		const captured: { actionId: string; cert: CommitCert }[] = [];
+		member = clusterMember({
+			storageRepo: storage,
+			peerNetwork: mockNetwork,
+			peerId: self.peerId,
+			privateKey: self.privateKey,
+			onCommitCertificate: (actionId, cert): void => { captured.push({ actionId, cert }); },
+		});
+
+		const record = await buildConsensusCommitRecord(self, other, makeCommitOperation('a1', 'block-1', 1));
+		await member.update(record);
+
+		expect(captured.length, 'cert captured once for the committed action').to.equal(1);
+		expect(captured[0]!.actionId).to.equal('a1');
+		// Default super-majority is unanimity over the 2-peer cohort → minSigs 2.
+		expect(captured[0]!.cert.minSigs).to.equal(2);
+		// Both approve-commit signers contribute (self adds its own commit during consensus, joining `other`).
+		expect(captured[0]!.cert.signers).to.include(self.peerId.toString());
+		expect(captured[0]!.cert.signers).to.include(other.peerId.toString());
+		// The threshold blob is the concatenated Ed25519 commit signatures (64 bytes each) — non-empty, never re-signed.
+		expect(captured[0]!.cert.thresholdSig.length, 'two concatenated Ed25519 commit signatures').to.equal(128);
+	});
+
+	it('does not assemble a cert when no sink is wired (zero-cost default)', async () => {
+		const storage = realStorageRepo();
+		await storage.pend({ actionId: 'a1', transforms: { inserts: { 'block-1': makeBlock('block-1') }, updates: {}, deletes: [] }, policy: 'c' });
+		member = clusterMember({ storageRepo: storage, peerNetwork: mockNetwork, peerId: self.peerId, privateKey: self.privateKey });
+
+		// No onCommitCertificate → the commit still lands; this just proves the path is a no-op, not a throw.
+		const record = await buildConsensusCommitRecord(self, other, makeCommitOperation('a1', 'block-1', 1));
+		const result = await member.update(record);
+		expect(result.commits[self.peerId.toString()], 'commit still reached consensus').to.not.equal(undefined);
+		const got = await storage.get({ blockIds: ['block-1'] });
+		expect(got['block-1']?.state?.latest?.rev).to.equal(1);
 	});
 });
