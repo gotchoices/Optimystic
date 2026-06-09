@@ -1,3 +1,10 @@
+<!-- resume-note -->
+RESUME: A prior agent run on this ticket did not complete.
+  Prior run: 2026-06-09T03:20:26.244Z (agent: claude)
+  Log file: C:\projects\optimystic\tickets\.logs\6-cohort-topic-host-antidos-coldstart.implement.2026-06-09T03-20-26-244Z.log
+Read the log to see what was done. Resume where it left off.
+If the prior run hit a timeout or repeated error, be cautious not to rush into the same situation.
+<!-- /resume-note -->
 description: Wire the anti-DoS guards (gap 6) and cold-start parent registration (gap 7) into the per-coord host. Constructs the rate limiter / replay guard / topic budget / bootstrap-evidence policy and injects them into each CoordEngine, and implements parentRegistrar.registerWithParent over the router.
 prereq: cohort-topic-per-coord-scoping
 files:
