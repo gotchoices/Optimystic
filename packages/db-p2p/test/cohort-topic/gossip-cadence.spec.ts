@@ -413,3 +413,93 @@ describe('cohort-topic: gossip driver timer lifecycle', () => {
 		expect(DEFAULT_GOSSIP_INTERVAL_MS, 'the documented default cadence is exported').to.equal(5_000);
 	});
 });
+
+describe('cohort-topic: host gossip auth gate', () => {
+	/** A live record stamped at real-clock `now` (a synthetic `lastPing` would look past-TTL and be dropped). */
+	function liveRecord(primary: Member, participant: Member): RegistrationRecord {
+		const now = Date.now();
+		return {
+			topicId: TOPIC,
+			participantId: participant.bytes,
+			tier: 0,
+			primary: primary.bytes,
+			backups: [],
+			attachedAt: now,
+			lastPing: now,
+			ttl: 90_000,
+		};
+	}
+
+	it('drops a validly-signed gossip from a non-cohort member', async () => {
+		// Cohort around coordA is {self} only; `outsider` is not a member. Its gossip carries a real
+		// self-signature, so only the membership half of the gate can reject it — proving the gate binds
+		// cohort membership, not merely signature validity.
+		const self = await makeMember();
+		const node = makeFakeNode(self.peerId);
+		const host = await createCohortTopicHost(node as never, makeFakeFret(() => []) as never, {
+			privateKey: self.key,
+			wantK: 1,
+			minSigs: 1,
+			gossipIntervalMs: 3_600_000,
+		});
+		const participant = await makeMember();
+		const coordA = addressing.coord0(TOPIC);
+		const eA = host.registry.forCoord(coordA, 0 as Tier, participant.bytes);
+
+		const outsider = await makeMember();
+		const frame = await signedGossip(outsider, coordA, eA.cohort().cohortEpoch, {
+			willingnessBits: 'f',
+			records: [toGossipRecord(liveRecord(self, participant))],
+		});
+		deliverGossip(node, frame, outsider.peerId);
+		await delay(30);
+
+		expect(eA.holds(TOPIC, participant.bytes), 'non-member record must not merge').to.equal(false);
+		expect(eA.cohortView().get(bytesToB64url(outsider.bytes)), 'non-member willingness must not merge').to.equal(undefined);
+
+		await host.stop();
+	});
+
+	it('drops a gossip from a cohort member whose signature does not verify', async () => {
+		// `sibling` IS a member of the cohort around coordA, but the frame is signed with the WRONG key, so
+		// `fromMember`'s peer-key signature fails to verify — the signature half of the gate must reject it.
+		const self = await makeMember();
+		const sibling = await makeMember();
+		const coordA = addressing.coord0(TOPIC);
+		const coordKey = bytesToB64url(coordA);
+		const cohortFor = (coord: RingCoord): string[] => (bytesToB64url(coord) === coordKey ? [self.idStr, sibling.idStr] : []);
+		const node = makeFakeNode(self.peerId);
+		const host = await createCohortTopicHost(node as never, makeFakeFret(cohortFor) as never, {
+			privateKey: self.key,
+			wantK: 2,
+			minSigs: 2,
+			gossipIntervalMs: 3_600_000,
+		});
+		const participant = await makeMember();
+		const eA = host.registry.forCoord(coordA, 0 as Tier, participant.bytes);
+
+		// Forge: claim to be `sibling` (a real member) but sign the image with an unrelated key.
+		const impostorKey = (await makeMember()).key;
+		const g: CohortGossipV1 = {
+			v: 1,
+			fromMember: bytesToB64url(sibling.bytes),
+			coord: bytesToB64url(coordA),
+			cohortEpoch: bytesToB64url(eA.cohort().cohortEpoch),
+			willingnessBits: 'f',
+			loadBuckets: [0, 0, 0, 0],
+			windowSeconds: 60,
+			topicSummaries: [],
+			records: [toGossipRecord(liveRecord(self, participant))],
+			timestamp: 3_000,
+			signature: '',
+		};
+		g.signature = bytesToB64url(await signPeer(impostorKey, cohortGossipSigningPayload(g)));
+		deliverGossip(node, encodeCohortMessage(g), sibling.peerId);
+		await delay(30);
+
+		expect(eA.holds(TOPIC, participant.bytes), 'bad-signature record must not merge').to.equal(false);
+		expect(eA.cohortView().get(bytesToB64url(sibling.bytes)), 'bad-signature willingness must not merge').to.equal(undefined);
+
+		await host.stop();
+	});
+});
