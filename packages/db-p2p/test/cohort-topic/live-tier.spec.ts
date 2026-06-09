@@ -36,7 +36,9 @@ import type { PrivateKey, PeerId } from '@libp2p/interface';
 import { hashPeerId, type RouteAndMaybeActV1, type NearAnchorV1 } from 'p2p-fret';
 import {
 	RingHash,
+	createSlotAssigner,
 	createTierAddressing,
+	bytesEqual,
 	bytesToB64url,
 	b64urlToBytes,
 	encodeCohortMessage,
@@ -401,6 +403,27 @@ async function signedReattach(participant: Member, topic: Uint8Array, now: numbe
 	return { ...body, signature: bytesToB64url(await signPeer(participant.key, renewSigningPayload(body))) };
 }
 
+const slots = createSlotAssigner(new RingHash());
+
+/**
+ * Generate a real-keyed participant whose deterministic slot-**primary** (under `engine`'s cohort epoch
+ * + member set) is `primaryNode`. The cohort-side renewal only serves a `reattach` with `ok` (the path
+ * that touches the record into the gossip deltas) when it lands on the participant's computed primary or
+ * a backup; for an arbitrary participant the node nearest `coord_0` is that primary only ~1/k of the
+ * time, so seeding/replication via a fixed deciding node was non-deterministic (~5/6 of full runs
+ * failed) without pinning the participant to it. (Slot assignment is keyed on `participantId`, not on
+ * `coord_0`, so the routed primary and the slot primary are independent in general.)
+ */
+async function participantPrimaryAt(primaryNode: HostNode, engine: CoordEngine): Promise<Member> {
+	const { members, cohortEpoch } = engine.cohort();
+	for (;;) {
+		const p = await makeMember();
+		if (bytesEqual(slots.assignSlots(p.bytes, cohortEpoch, members).primary, primaryNode.member.bytes)) {
+			return p;
+		}
+	}
+}
+
 // --- topic setup (instantiate coord-0 engines + seed willingness quorum) ---
 
 interface TopicSetup {
@@ -541,7 +564,7 @@ describe('cohort-topic: live-tier end-to-end milestone', () => {
 			// Seed one replicated record into every sibling (register + reattach to force a gossip touch, then
 			// one round broadcasts it), so a sibling *serves the topic* and can apply an inbound promotion.
 			const now = Date.now();
-			const seedP = await makeMember();
+			const seedP = await participantPrimaryAt(deciding, decidingEngine);
 			expect((await decidingEngine.engine.handleRegister(await signedRegister(seedP, TOPIC, now, 'seed'), { followOn: false, treeTier: 0 }, now)).result).to.equal('accepted');
 			expect(decidingEngine.engine.handleRenew(await signedReattach(seedP, TOPIC, now), now).result).to.equal('ok');
 			await decidingEngine.gossipRound(now);
@@ -599,7 +622,7 @@ describe('cohort-topic: live-tier end-to-end milestone', () => {
 			const sibling = mesh.nodes.find((n) => n.member.idStr !== deciding.member.idStr)!;
 			const siblingEngine = engines.get(sibling.member.idStr)!;
 
-			const participant = await makeMember();
+			const participant = await participantPrimaryAt(deciding, decidingEngine);
 			const now = Date.now();
 			expect((await decidingEngine.engine.handleRegister(await signedRegister(participant, TOPIC, now, 'repl'), { followOn: false, treeTier: 0 }, now)).result).to.equal('accepted');
 			expect(decidingEngine.engine.handleRenew(await signedReattach(participant, TOPIC, now), now).result, 'reattach touches the record').to.equal('ok');
