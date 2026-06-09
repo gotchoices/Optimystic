@@ -55,6 +55,15 @@ Where:
 
 The cohort-topic tier addressing proceeds normally on this stable `topicId`. Long-lived tasks (capabilities that persist across many work items) develop a tree that matures over time; short-lived tasks (a single voting proposal) form a shallow tree that demotes back to a single root cohort once the work is done.
 
+> **Implemented** (mock-tier e2e pending). `packages/db-core/src/matchmaking/topic-anchor.ts`
+> (`createMatchTopicAnchor` / `matchTopicId`) derives `topicId = H(kind ‖ label ‖ "match")` over the
+> **same** db-core {@link IRingHash} (256-bit SHA-256) the cohort-topic `coord_d` input uses — never a
+> FRET import — so the 32-byte anchor feeds cohort-topic tier addressing verbatim. Concatenation is
+> delimiter-free exactly as written; this is unambiguous because `MatchTopicKind` is a closed set
+> (`task` / `capability` / `quorum` / `capacity-class`) in which no member is a prefix of another, so
+> `kind ‖ label` can never alias a different `(kind, label)` pair. Spec: `topic-anchor.spec.ts`
+> (deterministic, distinct per `(kind, label)`, distinct across kinds for a shared label).
+
 ---
 
 ## Provider registration
@@ -91,6 +100,28 @@ A provider whose `capacityBudget` is reached has two options:
 
 Either way, the layer enforces correctness only at the registration level; the seeker is responsible for picking among current providers.
 
+> **Resolved (GROUNDING): polite withdrawal is an optimization, not a correctness requirement.**
+> Withdrawal (the matchmaking-doc `RenewV1` TTL = 0) only lowers the seeker's lingering footprint in
+> cohort gossip; correctness never depends on it. A non-withdrawn registration is bounded by TTL
+> eviction and worst-case yields **one stale entry** to a seeker, which the seeker re-validates
+> (`registrationSig`) and re-queries past. Worst-case eviction latency ≈ one TTL + one gossip round.
+>
+> **Implemented** (mock-tier e2e pending). Provider state/decision is
+> `packages/db-core/src/matchmaking/provider.ts` (`MatchmakingProvider`): capability tags, a live
+> `capacityBudget`, the correlation id binding its signed `ProviderAppPayloadV1`, plus `setCapacity` /
+> `signalFull` (`capacityBudget = 0`) / `markWithdrawn`. It is crypto-free — signing is an injected
+> callback (db-p2p supplies the libp2p peer key), mirroring the cohort-topic `ParticipantSigner`.
+> db-p2p wiring is `packages/db-p2p/src/matchmaking/provider-manager.ts`
+> (`MatchmakingProviderManager`): register/renew/withdraw against `CohortTopicService` at tier **T2**
+> with a profile-based TTL (Core 90 s / Edge 60 s via `providerTtlForProfile`). **Substrate mapping
+> surfaced honestly:** the cohort-topic `RenewV1` carries no `appPayload` and no `ttl`, so a capacity
+> change ("signal full") is realized by **re-registering** with the new signed payload (updating the
+> record's `appState`), not by a renewal; and immediate withdrawal (TTL = 0) has no wire realization
+> yet, so `withdraw` stops renewing and the record ages out by TTL — acceptable precisely because
+> withdrawal is an optimization (above). An immediate-tombstone renew is a documented cohort-topic
+> follow-on. Spec: `registration.spec.ts` (capacity tracking, signal-full re-sign, withdrawal intent,
+> provider-TTL renewal keeps the record alive).
+
 ---
 
 ## Seeker query
@@ -120,6 +151,17 @@ SeekerAppPayloadV1 {
 with TTL set short — typically 5–15 s — since seekers normally don't wait long. A
 hanging-out seeker that set `pushOnArrival` keeps its registration alive via TTL
 renewals while it waits for pushes (see [§Arrival push on provider arrival](#arrival-push-on-provider-arrival)).
+
+> **Implemented (registration only; query/hang-out pending).** Seeker state + the signed
+> `SeekerAppPayloadV1` builder is `packages/db-core/src/matchmaking/seeker.ts` (`MatchmakingSeeker`);
+> db-p2p wiring is `packages/db-p2p/src/matchmaking/seeker-manager.ts` (`MatchmakingSeekerManager`),
+> which registers at tier **T2** with the short `seeker_ttl` (default 10 s) and **does not renew by
+> default**, so the registration ages out by TTL — the eviction property this slice proves. The
+> `QueryV1` issuance below, the capability-filter evaluation, and the hang-out-vs-continue decision
+> are deferred to `matchmaking-query-filter-hangout`; `MatchmakingSeeker.query()` is a documented
+> stub. The query-protocol codecs (`QueryV1` / `QueryReplyV1` / `AggregateCountV1`) already live in
+> `wire.ts` so that consumer can be built against fixtures. Spec: `registration.spec.ts` (brief seeker
+> registration evicts on TTL while a renewed provider survives).
 
 After registering, the seeker queries the cohort:
 
@@ -310,7 +352,7 @@ The §Decision rule above is the common path. A few specific situations need exp
 
 ### Test expectations
 
-Matchmaking has no implementation yet; the cases below are doc-as-spec. Each becomes a unit or integration test when the package lands.
+The wire codecs, the stable topic anchor, and both registration roles (provider attach/renew/self-throttle; seeker short-TTL registration) are now implemented (see the callouts in §Anchor, §Provider registration, §Seeker query, and §Wire formats); the query/filter evaluation and the seeker hang-out engine below remain doc-as-spec, landing in `matchmaking-query-filter-hangout`. The hang-out cases below become unit/integration tests when that package lands.
 
 - *Hot topic, deep tier suffices.* Seeker stops at the first `Accepted` whose query meets `wantCount`; no walk past the tier of first match.
 - *Cold topic, walks to root.* Seeker traverses every tier from `d_max` down to `d = 0`; `wantCount` is met only at the root.
@@ -448,6 +490,19 @@ A topic that becomes hot all at once (e.g., a flash vote) has its first wave of 
 ## Wire formats
 
 Matchmaking reuses `RegisterV1`, `RenewV1`, etc., from cohort-topic. The application-specific additions:
+
+> **Implemented** (mock-tier e2e pending). Codecs + per-message validation are
+> `packages/db-core/src/matchmaking/wire.ts`, matching the cohort-topic wire conventions exactly: all
+> JSON, **timestamps unix-ms**, **byte fields base64url (no padding)** via the shared cohort-topic
+> `bytesToB64url` / `b64urlToBytes` helpers, per-message structural validation on decode, and stable
+> byte fidelity (encode→decode→encode). The provider/seeker app payloads are serialized to opaque
+> UTF-8 JSON bytes for the cohort-topic `RegisterV1.appPayload` slot (base64url-wrapped by the
+> substrate); the query-protocol messages ride the same length-prefixed framing as cohort-topic
+> messages. Validation enforced on decode: `kind` exactly matches the discriminant; `limit <=
+> query_limit_max` (256); `capacityBudget >= 0`; `wantCount >= 1`; malformed/oversized payloads
+> rejected with `CohortWireError`. The `QueryReplyV1` / `AggregateCountV1` *producers* land in later
+> tickets, but their decoders are implemented here so the seeker side is unit-testable against
+> fixtures. Spec: `wire.spec.ts`.
 
 ### Provider registration payload
 

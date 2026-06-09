@@ -34,6 +34,7 @@ export * from "./network/get-network-manager.js";
 export * from "./reputation/index.js";
 export * from "./dispute/index.js";
 export * from "./cohort-topic/index.js";
+export * from "./matchmaking/index.js";
 export * from "./cluster/i-transaction-state-store.js";
 export * from "./cluster/memory-transaction-state-store.js";
 export * from "./cluster/persistent-transaction-state-store.js";

@@ -6,6 +6,7 @@ export * from "./cohort-topic/index.js";
 export * from "./collection/index.js";
 export * from "./collections/index.js";
 export * from "./log/index.js";
+export * from "./matchmaking/index.js";
 export * from "./network/index.js";
 export * from "./transaction/index.js";
 export * from "./transactor/index.js";
