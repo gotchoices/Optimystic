@@ -333,4 +333,21 @@ describe('cohort-topic: host drives a per-coord MembershipCertPublisher', () => 
 
 		await host.stop();
 	});
+
+	it('a key-less host no-ops the publish hooks instead of rejecting (verify-only per-coord signer)', async () => {
+		// Without a private key the per-coord signer is verify-only and cannot assemble. The publish hooks
+		// must resolve `undefined` (not reject), so a future cadence driver iterating registry.all() is safe.
+		const key = await generateKeyPair('Ed25519');
+		const peerId = peerIdFromPrivateKey(key);
+		const host = await createCohortTopicHost(makeFakeNode(peerId) as never, makeFakeFret() as never, { wantK: 1, minSigs: 1 });
+
+		const addressing = createTierAddressing(new RingHash());
+		const coord0 = addressing.coord0(TOPIC);
+		const ce = host.registry.forCoord(coord0, 0, new TextEncoder().encode('participant-K'));
+
+		expect(await ce.onStabilized(4_000), 'key-less onStabilized resolves undefined').to.equal(undefined);
+		expect(await ce.pumpMembership(4_000), 'key-less pumpMembership resolves undefined').to.equal(undefined);
+
+		await host.stop();
+	});
 });

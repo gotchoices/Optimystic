@@ -518,6 +518,11 @@ function createCoordEngine(ctx: CoordEngineContext, servedCoord: RingCoord, tree
 		const { members, cohortEpoch } = cohort();
 		return { coord: servedCoord, cohortEpoch, members, stabilizedAt: now };
 	};
+	// Key-less interim mode has only a verify-only per-coord signer (its `assemble` rejects), so the
+	// publish hooks must no-op rather than surface a rejected promise — matching the documented
+	// "publisher paths are simply not driven without a key" contract. Without this guard a future
+	// gossip-cadence driver iterating `registry.all()` would reject on every key-less engine.
+	const canPublish = ctx.privateKey !== undefined;
 
 	const willingness = createWillingnessCheck({
 		barometer: ctx.barometer,
@@ -592,8 +597,10 @@ function createCoordEngine(ctx: CoordEngineContext, servedCoord: RingCoord, tree
 		hasState: (): boolean => store.listAll().length > 0,
 		holds: (topicId: Uint8Array, participantId: Uint8Array): boolean =>
 			store.getByParticipant(topicId, participantId) !== undefined,
-		onStabilized: (now: number): Promise<MembershipCertV1 | undefined> => membershipPublisher.onStabilized(snapshotAt(now), now),
-		pumpMembership: (now: number): Promise<MembershipCertV1 | undefined> => membershipPublisher.tick(snapshotAt(now), now),
+		onStabilized: (now: number): Promise<MembershipCertV1 | undefined> =>
+			canPublish ? membershipPublisher.onStabilized(snapshotAt(now), now) : Promise.resolve(undefined),
+		pumpMembership: (now: number): Promise<MembershipCertV1 | undefined> =>
+			canPublish ? membershipPublisher.tick(snapshotAt(now), now) : Promise.resolve(undefined),
 		close: (): void => bus.close(),
 	};
 }
