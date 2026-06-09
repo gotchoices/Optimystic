@@ -42,8 +42,10 @@ export const DEFAULT_COHORT_TOPIC_PROTOCOLS: CohortTopicProtocols = {
 };
 
 /**
- * Namespaced cohort-topic protocol IDs for `networkName` (mirrors FRET's `makeProtocols`). The
- * default network yields the canonical IDs in {@link DEFAULT_COHORT_TOPIC_PROTOCOLS}.
+ * Namespaced cohort-topic protocol IDs for `networkName` (mirrors FRET's `makeProtocols`, which
+ * inserts the network segment even for `"default"` → `/optimystic/default/...`). Note this does NOT
+ * equal {@link DEFAULT_COHORT_TOPIC_PROTOCOLS}: the canonical, network-agnostic IDs omit the segment
+ * entirely (`/optimystic/cohort-topic/1.0.0/...`); use those unless you need per-network namespacing.
  */
 export function makeCohortTopicProtocols(networkName = "default"): CohortTopicProtocols {
 	const base = `/optimystic/${networkName}/cohort-topic/1.0.0`;

@@ -227,7 +227,8 @@ export async function createCohortTopicHost(node: Libp2p, fret: FretService, opt
 	});
 
 	// --- protocol handlers + activity callback ---
-	registerProtocolHandlers(node, protocols, engine, gossipTransport, publishSink, membershipSource, addressing, selfCoord, maxBytes);
+	// Await registration so the host is not returned (and dialed) before the four handlers are live.
+	await registerProtocolHandlers(node, protocols, engine, gossipTransport, publishSink, membershipSource, addressing, selfCoord, maxBytes);
 	fret.setActivityHandler(async (activity: string): Promise<{ commitCertificate: string }> => {
 		const reply = await runRegisterActivity(engine, activity, addressing, selfCoord, maxBytes);
 		return { commitCertificate: bytesToB64url(reply) };
@@ -278,7 +279,7 @@ async function runRegisterActivity(
 	return encodeCohortMessage(reply, maxBytes);
 }
 
-function registerProtocolHandlers(
+async function registerProtocolHandlers(
 	node: Libp2p,
 	protocols: CohortTopicProtocols,
 	engine: CohortMemberEngine,
@@ -288,40 +289,42 @@ function registerProtocolHandlers(
 	addressing: ReturnType<typeof createTierAddressing>,
 	selfCoord: RingCoord,
 	maxBytes: number,
-): void {
-	// register: a direct dial carries either a RegisterV1 (re-attach walk fallback) or a RenewV1 (ping).
-	void node.handle(protocols.register, makeFrameHandler(async (frame): Promise<Uint8Array | undefined> => {
-		const decoded = decodeCohortMessage(frame, maxBytes);
-		const renew = tryValidate(() => validateRenewV1(decoded));
-		if (renew !== undefined) {
-			return encodeCohortMessage(engine.handleRenew(renew, Date.now()), maxBytes);
-		}
-		const reg = validateRegisterV1(decoded);
-		const topicId = b64urlToBytes(reg.topicId);
-		const parentCoord = reg.treeTier > 0 ? addressing.coord(reg.treeTier - 1, selfCoord, topicId) : undefined;
-		const reply = await engine.handleRegister(reg, { followOn: false, treeTier: reg.treeTier, parentCoord }, Date.now());
-		return encodeCohortMessage(reply, maxBytes);
-	}, maxBytes));
+): Promise<void> {
+	await Promise.all([
+		// register: a direct dial carries either a RegisterV1 (re-attach walk fallback) or a RenewV1 (ping).
+		node.handle(protocols.register, makeFrameHandler(async (frame): Promise<Uint8Array | undefined> => {
+			const decoded = decodeCohortMessage(frame, maxBytes);
+			const renew = tryValidate(() => validateRenewV1(decoded));
+			if (renew !== undefined) {
+				return encodeCohortMessage(engine.handleRenew(renew, Date.now()), maxBytes);
+			}
+			const reg = validateRegisterV1(decoded);
+			const topicId = b64urlToBytes(reg.topicId);
+			const parentCoord = reg.treeTier > 0 ? addressing.coord(reg.treeTier - 1, selfCoord, topicId) : undefined;
+			const reply = await engine.handleRegister(reg, { followOn: false, treeTier: reg.treeTier, parentCoord }, Date.now());
+			return encodeCohortMessage(reply, maxBytes);
+		}, maxBytes)),
 
-	// cohort-gossip: feed inbound gossip into the bus (one-way).
-	void node.handle(protocols.gossip, makeFrameHandler(async (frame, from): Promise<Uint8Array | undefined> => {
-		gossipTransport.deliver(from.toString(), frame);
-		return undefined;
-	}, maxBytes));
+		// cohort-gossip: feed inbound gossip into the bus (one-way).
+		node.handle(protocols.gossip, makeFrameHandler(async (frame, from): Promise<Uint8Array | undefined> => {
+			gossipTransport.deliver(from.toString(), frame);
+			return undefined;
+		}, maxBytes)),
 
-	// promote: threshold-signed promotion/demotion notices. Interim — accepted onto the bus path; the
-	// verify-and-apply step is part of the threshold-crypto gap.
-	void node.handle(protocols.promote, makeFrameHandler(async (): Promise<Uint8Array | undefined> => undefined, maxBytes));
+		// promote: threshold-signed promotion/demotion notices. Interim — accepted onto the bus path; the
+		// verify-and-apply step is part of the threshold-crypto gap.
+		node.handle(protocols.promote, makeFrameHandler(async (): Promise<Uint8Array | undefined> => undefined, maxBytes)),
 
-	// membership: serve this node's latest published cert; cache any cert the requester returns.
-	void node.handle(protocols.membership, makeFrameHandler(async (frame): Promise<Uint8Array | undefined> => {
-		void frame; // request frame is the raw coord; this node serves its own cohort cert
-		const latest = publishSink.latest();
-		if (latest !== undefined) {
-			membershipSource.cache(selfCoord, latest);
-		}
-		return latest ?? new Uint8Array(0);
-	}, maxBytes));
+		// membership: serve this node's latest published cert; cache any cert the requester returns.
+		node.handle(protocols.membership, makeFrameHandler(async (frame): Promise<Uint8Array | undefined> => {
+			void frame; // request frame is the raw coord; this node serves its own cohort cert
+			const latest = publishSink.latest();
+			if (latest !== undefined) {
+				membershipSource.cache(selfCoord, latest);
+			}
+			return latest ?? new Uint8Array(0);
+		}, maxBytes)),
+	]);
 }
 
 /** Wrap a frame handler in the read-one / reply-one libp2p stream lifecycle. */

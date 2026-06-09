@@ -18,6 +18,7 @@
  * assembled by the member engine the FRET host wires into the `RouteAndMaybeAct` activity callback.
  */
 
+import { randomBytes } from "@noble/hashes/utils.js";
 import { createTierAddressing, type TierAddressing } from "./addressing.js";
 import { makeDMaxComputer, type DMaxComputer } from "./dmax.js";
 import { DEFAULT_FANOUT } from "./addressing.js";
@@ -192,13 +193,19 @@ class WalkRegisterService implements CohortTopicService {
 	}
 
 	async renew(handle: RegistrationHandle): Promise<void> {
+		// Withdrawn handles drop out of the live set; renewing one is a no-op so withdraw() actually
+		// stops the local ping loop (rather than the app silently continuing to refresh it).
+		if (!this.renewals.has(recordKey(handle.topicId, this.participantId))) {
+			return;
+		}
 		await handle.renewal.pingLoop();
 		this.syncHandle(handle);
 	}
 
 	async withdraw(handle: RegistrationHandle): Promise<void> {
-		// No explicit withdraw RPC exists on the wire yet; ceasing renewal lets the cohort soft-state
-		// TTL-expire (§TTL and renewal). An immediate-tombstone renew is a documented follow-on.
+		// No explicit withdraw RPC exists on the wire yet; dropping the handle from the live set stops
+		// further renew() pings (see renew()), so the cohort soft-state TTL-expires (§TTL and renewal).
+		// An immediate-tombstone renew is a documented follow-on.
 		this.renewals.delete(recordKey(handle.topicId, this.participantId));
 	}
 
@@ -310,15 +317,10 @@ class WalkRegisterService implements CohortTopicService {
 		};
 	}
 
-	/** 16 random bytes, base64url. Derived from the clock + participant when no CSPRNG is injected. */
+	/** 16 fresh CSPRNG bytes, base64url. A correlation id must be unique per probe — the replay guard
+	 * keys on it — so it cannot be derived from the clock (two probes in the same ms would collide). */
 	private freshCorrelationId(): string {
-		const buf = new Uint8Array(16);
-		const seed = this.clock();
-		for (let i = 0; i < 8; i++) {
-			buf[i] = (seed >>> (i * 4)) & 0xff;
-			buf[8 + i] = this.participantId[i] ?? 0;
-		}
-		return bytesToB64url(buf);
+		return bytesToB64url(randomBytes(16));
 	}
 }
 

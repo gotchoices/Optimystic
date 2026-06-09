@@ -117,7 +117,7 @@ function buildSingleMemberCohort(opts: { memberId: Uint8Array; capPromote: numbe
 }
 
 /** A mock router that delivers register activity + renew dials straight to one member engine. */
-function buildMockService(engine: CohortMemberEngine, member: Uint8Array): ReturnType<typeof createCohortTopicService> {
+function buildMockService(engine: CohortMemberEngine, member: Uint8Array, onDial?: () => void): ReturnType<typeof createCohortTopicService> {
 	const hash = new RingHash();
 	const addressing = createTierAddressing(hash);
 	const self = hash.H(new TextEncoder().encode('participant-self'));
@@ -129,6 +129,7 @@ function buildMockService(engine: CohortMemberEngine, member: Uint8Array): Retur
 			return encodeCohortMessage(reply);
 		},
 		dialMember: async (_member: PeerRef, activity: Uint8Array): Promise<Uint8Array> => {
+			onDial?.();
 			const renew = validateRenewV1(decodeCohortMessage(activity));
 			return encodeCohortMessage(engine.handleRenew(renew, Date.now()));
 		},
@@ -176,6 +177,20 @@ describe('cohort-topic: service composition (mock transport)', () => {
 		const before = bytesToB64url(handle.primary);
 		await service.renew(handle);
 		expect(bytesToB64url(handle.primary)).to.equal(before);
+	});
+
+	it('withdraw: stops the local renewal — a post-withdraw renew is a no-op (no member dial)', async () => {
+		const { engine, member } = buildSingleMemberCohort({ memberId: new TextEncoder().encode('member-W'), capPromote: 64 });
+		let dials = 0;
+		const service = buildMockService(engine, member, () => { dials++; });
+
+		const handle = await service.register({ topicId: TOPIC, tier: 0 as Tier });
+		await service.renew(handle);
+		expect(dials, 'a live handle pings its primary').to.equal(1);
+
+		await service.withdraw(handle);
+		await service.renew(handle); // withdrawn → must not dial again
+		expect(dials, 'a withdrawn handle no longer pings').to.equal(1);
 	});
 
 	it('lookup: resolves the cohort hint for a topic/tier', async () => {
