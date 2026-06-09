@@ -67,6 +67,16 @@ describe('reactivity replay buffer', () => {
 		expect(buf.highRevision).to.equal(15);
 	});
 
+	it('intersects an arbitrarily wide range without scanning every integer', () => {
+		const buf = createReplayBuffer(256);
+		for (let rev = 10; rev <= 15; rev++) {
+			buf.append({ revision: rev, payload: note(rev), receivedAt: 1000 + rev });
+		}
+		// A backfill carries a subscriber-supplied range that may dwarf the window; the result is still
+		// just the intersection, computed without an unbounded per-integer loop.
+		expect(buf.range(0, Number.MAX_SAFE_INTEGER).map((e) => e.revision)).to.deep.equal([10, 11, 12, 13, 14, 15]);
+	});
+
 	it('replaces (does not duplicate) a retransmit at the same revision', () => {
 		const buf = createReplayBuffer(256);
 		buf.append({ revision: 10, payload: note(10), receivedAt: 1000 });

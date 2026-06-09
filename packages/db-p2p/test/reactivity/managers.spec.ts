@@ -9,6 +9,7 @@ import {
 	buildNotificationV1,
 	SUBSCRIBER_TTL_CORE_MS,
 	SUBSCRIBER_TTL_EDGE_MS,
+	DELTA_MAX_CORE_BYTES,
 	type CohortTopicService,
 	type RegisterRequest,
 	type RegistrationHandle,
@@ -105,6 +106,33 @@ describe('reactivity / subscription manager', () => {
 		await manager.register();
 		expect(service.registers[0]!.ttl).to.equal(SUBSCRIBER_TTL_EDGE_MS);
 		expect(decodeSubscribeAppPayload(service.registers[0]!.appPayload!).deltaMaxBytes).to.equal(0);
+	});
+
+	it('derives the Core delta budget from the profile when not given explicitly', async () => {
+		const service = new RecordingService();
+		const manager = new ReactivitySubscriptionManager({
+			service,
+			collectionId: COLLECTION,
+			tailIdAtAttach: TAIL,
+			deliver: () => {},
+			profile: coreProfile(),
+		});
+		await manager.register();
+		expect(decodeSubscribeAppPayload(service.registers[0]!.appPayload!).deltaMaxBytes).to.equal(DELTA_MAX_CORE_BYTES);
+	});
+
+	it('prefers an explicit deltaMaxBytes over the profile-derived budget', async () => {
+		const service = new RecordingService();
+		const manager = new ReactivitySubscriptionManager({
+			service,
+			collectionId: COLLECTION,
+			tailIdAtAttach: TAIL,
+			deliver: () => {},
+			profile: coreProfile(),
+			deltaMaxBytes: 123,
+		});
+		await manager.register();
+		expect(decodeSubscribeAppPayload(service.registers[0]!.appPayload!).deltaMaxBytes).to.equal(123);
 	});
 
 	it('prefers an explicit ttlMs over the profile-derived TTL', async () => {

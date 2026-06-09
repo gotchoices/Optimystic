@@ -15,8 +15,7 @@
  * seam is exposed for bindings that carry signers in a different encoding.
  */
 
-import { createTierAddressing } from "../cohort-topic/addressing.js";
-import { DEFAULT_FANOUT } from "../cohort-topic/addressing.js";
+import { createTierAddressing, DEFAULT_FANOUT } from "../cohort-topic/addressing.js";
 import { createRingHash } from "../cohort-topic/ring-hash.js";
 import { b64urlToBytes } from "../cohort-topic/wire/codec.js";
 import { Tier } from "../cohort-topic/tiers.js";

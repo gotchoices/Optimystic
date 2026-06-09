@@ -20,6 +20,7 @@ import {
 	reactivityTopicId,
 	subscribeAppPayloadBytes,
 	subscriberTtlForProfile,
+	deltaMaxForProfile,
 	createNotificationVerifier,
 	createReactivitySubscriber,
 	bytesToB64url,
@@ -71,7 +72,7 @@ export class ReactivitySubscriptionManager {
 		this.tailIdAtAttach = options.tailIdAtAttach;
 		this.topicId = reactivityTopicId(options.tailIdAtAttach);
 		this.ttlMs = options.ttlMs ?? (options.profile !== undefined ? subscriberTtlForProfile(options.profile) : undefined) ?? DEFAULT_SUBSCRIBER_TTL_MS;
-		this.deltaMaxBytes = options.deltaMaxBytes ?? DEFAULT_EDGE_SAFE_DELTA_MAX;
+		this.deltaMaxBytes = options.deltaMaxBytes ?? (options.profile !== undefined ? deltaMaxForProfile(options.profile) : DEFAULT_EDGE_SAFE_DELTA_MAX);
 		this.lastKnownRev = options.lastKnownRev ?? 0;
 		this.subscriber = createReactivitySubscriber({
 			collectionId: bytesToB64url(this.collectionId),

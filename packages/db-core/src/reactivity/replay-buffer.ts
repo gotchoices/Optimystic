@@ -88,14 +88,11 @@ class RingReplayBuffer implements ReplayBuffer {
 	}
 
 	range(from: number, to: number): RevisionEntry[] {
-		const out: RevisionEntry[] = [];
-		for (let rev = from; rev <= to; rev++) {
-			const entry = this.byRevision.get(rev);
-			if (entry !== undefined) {
-				out.push(entry);
-			}
-		}
-		return out;
+		// Iterate the retained entries (≤ capacity) rather than every integer in `[from, to]`: a backfill
+		// request carries a subscriber-supplied range that may be arbitrarily wide, so a per-integer scan
+		// would be an unbounded loop on attacker-controlled input. The intersection with the window is
+		// bounded by `capacity` regardless.
+		return this.entries().filter((e) => e.revision >= from && e.revision <= to);
 	}
 
 	entries(): RevisionEntry[] {
