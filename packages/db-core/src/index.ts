@@ -8,6 +8,7 @@ export * from "./collections/index.js";
 export * from "./log/index.js";
 export * from "./matchmaking/index.js";
 export * from "./network/index.js";
+export * from "./reactivity/index.js";
 export * from "./transaction/index.js";
 export * from "./transactor/index.js";
 export * from "./transform/index.js";

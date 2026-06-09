@@ -116,6 +116,17 @@ The direct-subscriber list is the cohort-topic layer's `RegistrationRecord` set 
 
 ## Notification origination
 
+> **Implemented** (`11-reactivity-origination-replay-delivery`). Origination is the pure assembler
+> `buildNotificationV1(event, commitCert, ctx)` in `packages/db-core/src/reactivity/notification.ts`,
+> reusing `commitCert.thresholdSig` **bit-for-bit** (never re-signed). The db-p2p
+> `ReactivityOriginationManager` installs it on `CohortTopicService.onLocalCommit`, fed by the
+> local-change-notifier bridge (`local-change-notifier-bridge`). The `digest` field carries the commit
+> identifier (`event.actionId`); aligning that with the exact threshold-signed commit-hash bytes so a
+> subscriber's *cryptographic* verify over `digest` succeeds against real Ed25519 is the remaining
+> cluster↔reactivity seam (`CommitCert` would expose the signed payload). This networked origination
+> **subsumes** the superseded backlog ticket `optimystic-replica-persist-change-notification` (waking
+> consumers on commit).
+
 When the tail cohort commits a transaction, the commit machinery in the transaction layer ([transactions.md](transactions.md)) already produces a threshold-signed commit certificate. Reactivity reuses that certificate without additional cohort signing:
 
 ```
@@ -191,6 +202,20 @@ This isolates slow subscribers: one phone with a flaky connection does not stall
 ---
 
 ## Delivery
+
+> **Implemented** (`11-reactivity-origination-replay-delivery`). The subscriber-side path is
+> `createReactivitySubscriber` (`packages/db-core/src/reactivity/subscriber.ts`): verify (via
+> `createNotificationVerifier` over the cohort-topic `MembershipVerifier`, which owns the **one
+> fetch-and-retry** on a stale cache), the `revision == lastRevision + 1` contiguity check, gap → the
+> `requestBackfill(from, to)` seam (the `BackfillV1` transport lands in
+> `reactivity-backfill-resume-checkpoints`), `(collectionId, revision)` dedupe, and surfacing. A fresh
+> subscribe (`lastKnownRev == 0`) adopts the first verified notification as its baseline. The forwarder
+> receive path (verify → dedupe → buffer → forward), the `W`-entry replay ring, and the sliding
+> `(revision, sigDigest)` dedupe window — all gossip-replicated so any cohort member can serve a replay —
+> are also implemented here. **Backfill/resume/checkpoints**, **tail rotation**, and **backpressure** are
+> delivered by the sibling tickets (`reactivity-backfill-resume-checkpoints`,
+> `reactivity-rotation-backpressure-policy`); the `parentCheckpoint` / `perSubscriberQueue` `PushState`
+> fields are reserved for them.
 
 A subscriber receiving a notification:
 
@@ -339,6 +364,14 @@ Cohort-topic's promotion machinery handles this with `cap_promote_fast`: when th
 ---
 
 ## Wire formats
+
+> **Implemented** (`11-reactivity-origination-replay-delivery`). `SubscribeAppPayloadV1` and
+> `NotificationV1` are implemented in `packages/db-core/src/reactivity/wire.ts` exactly as written below:
+> JSON, byte fields **base64url** (no padding), **unix-ms** timestamps, per-message structural validation
+> on decode, byte-fidelity round-trips. `SubscribeAppPayloadV1` is the opaque `RegisterV1.appPayload`
+> (the cohort-topic envelope frames it and carries the `correlationId` + `timestamp` + peer-key
+> signature, so the payload itself carries no signature); `NotificationV1` is a length-prefixed frame.
+> The `ResumeV1` / `BackfillV1` codecs below belong to `reactivity-backfill-resume-checkpoints`.
 
 Reactivity reuses the cohort-topic layer's `RegisterV1`, `RenewV1`, etc., with a reactivity-specific `appPayload`:
 
