@@ -295,11 +295,18 @@ describe('cohort-topic: per-served-coord scoping', () => {
 		};
 	}
 
-	/** A fake FRET whose `assembleCohort` returns a different set per coordinate. */
-	function makeFakeFret(cohortFor: (coord: RingCoord) => string[]): unknown {
+	/** FRET's ActivityHandler shape (the host registers a `(activity, cohort) => {commitCertificate}` callback). */
+	type ActivityHandler = (activity: string, cohort: string[]) => Promise<{ commitCertificate: string }>;
+
+	/**
+	 * A fake FRET whose `assembleCohort` returns a different set per coordinate. `onSetHandler` (when
+	 * given) captures the activity callback the host registers, so a test can drive the real FRET-routed
+	 * register dispatch end-to-end.
+	 */
+	function makeFakeFret(cohortFor: (coord: RingCoord) => string[], onSetHandler?: (h: ActivityHandler) => void): unknown {
 		return {
 			assembleCohort: (coord: RingCoord): string[] => cohortFor(coord),
-			setActivityHandler: (): void => {},
+			setActivityHandler: (h: ActivityHandler): void => { onSetHandler?.(h); },
 			getNetworkSizeEstimate: (): { size_estimate: number; confidence: number; sources: number } => ({ size_estimate: 50, confidence: 1, sources: 1 }),
 			routeAct: (): Promise<{ commitCertificate: string }> => Promise.resolve({ commitCertificate: '' }),
 		};
@@ -372,6 +379,48 @@ describe('cohort-topic: per-served-coord scoping', () => {
 
 		const unheld: RenewV1 = { ...renew, participantId: bytesToB64url(new TextEncoder().encode('never-registered')) };
 		expect(resolveRenew(host.registry, unheld, Date.now()).result, 'an unheld record re-looks up rather than throwing').to.equal('unknown_registration');
+
+		await host.stop();
+	});
+
+	it('the FRET activity callback recomputes the served coord from the frame and routes to its engine', async () => {
+		// The production dispatch path: FRET routes a RegisterV1 to this node and invokes the activity
+		// handler with NO routed key, so the host must recompute servedCoord = coord(treeTier,
+		// participantCoord, topicId) from the decoded frame and run the decision on registry.forCoord(it).
+		// The earlier tests poke registry.forCoord directly; this one drives the real callback the host
+		// installs, so the recompute + forCoord caching + handleRegister wiring is exercised end-to-end.
+		const peerId = await makePeerId();
+		const addressing = createTierAddressing(new RingHash());
+		const coord0Topic = addressing.coord0(TOPIC);
+		let activityHandler: ActivityHandler | undefined;
+		const fret = makeFakeFret(() => [], (h) => { activityHandler = h; }); // self-only cohort everywhere
+		const host = await createCohortTopicHost(makeFakeNode(peerId) as never, fret as never, { wantK: 1 });
+		expect(activityHandler, 'the host installs an activity handler').to.not.equal(undefined);
+
+		const participantCoord = new TextEncoder().encode('participant-D');
+		const reg: RegisterV1 = {
+			v: 1,
+			topicId: bytesToB64url(TOPIC),
+			tier: 0,
+			treeTier: 0,
+			participantCoord: bytesToB64url(participantCoord),
+			ttl: 90_000,
+			bootstrap: true,
+			timestamp: Date.now(),
+			correlationId: bytesToB64url(new TextEncoder().encode('cid-dispatch')),
+			signature: '',
+		};
+		const frame = bytesToB64url(encodeCohortMessage(reg));
+		const { commitCertificate } = await activityHandler!(frame, []);
+		const reply = decodeCohortMessage(b64urlToBytes(commitCertificate)) as { result: string };
+		expect(reply.result, 'the recomputed coord_0(topic) engine admits the tier-0 bootstrap').to.equal('accepted');
+
+		// The record landed on the engine bound to coord_0(topic), reachable by the renewal lookup —
+		// proving the dispatch recomputed the served coord rather than using the node ring position.
+		const participantId = b64urlToBytes(reg.participantCoord);
+		const holder = host.registry.findHolder(TOPIC, participantId);
+		expect(holder, 'the dispatched register is held by a coord engine').to.not.equal(undefined);
+		expect(bytesToB64url(holder!.servedCoord), 'served by coord_0(topic), not selfCoord').to.equal(bytesToB64url(coord0Topic));
 
 		await host.stop();
 	});
