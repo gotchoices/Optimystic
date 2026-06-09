@@ -102,12 +102,20 @@ export interface CohortTopicService {
 	verifier(): MembershipVerifier;
 }
 
-/** Signs the participant's outbound `RegisterV1` / `RenewV1` bodies (db-p2p supplies the peer key). */
+/**
+ * Signs the participant's outbound `RegisterV1` / `RenewV1` bodies (db-p2p supplies the peer key).
+ *
+ * Async because the underlying libp2p `PrivateKey.sign` is async; both call sites already `await`
+ * (`messageFactory.build` and the renewal `sign` hook). The signature is over the canonical body
+ * image ({@link import("./wire/payloads.js").registerSigningPayload} /
+ * {@link import("./wire/payloads.js").renewSigningPayload}) so a cohort member can recompute and
+ * verify it against the participant's peer key.
+ */
 export interface ParticipantSigner {
-	/** Sign a `RegisterV1` (minus its signature); returns the base64url signature. */
-	signRegister(body: Omit<RegisterV1, "signature">): string;
-	/** Sign a `RenewV1` (minus its signature); returns the base64url signature. */
-	signRenew(body: UnsignedRenew): string;
+	/** Sign a `RegisterV1` (minus its signature); resolves the base64url signature. */
+	signRegister(body: Omit<RegisterV1, "signature">): Promise<string>;
+	/** Sign a `RenewV1` (minus its signature); resolves the base64url signature. */
+	signRenew(body: UnsignedRenew): Promise<string>;
 }
 
 /** Per-service tunables (cohort size, threshold, fan-out, TTL); all optional. */
@@ -163,7 +171,12 @@ class WalkRegisterService implements CohortTopicService {
 		this.clock = deps.clock ?? ((): number => Date.now());
 		this.ttl = cfg.ttl ?? DEFAULT_TTL_MS;
 		this.maxMessageBytes = cfg.maxMessageBytes;
-		this.participantId = deps.hash.H(deps.self);
+		// The participant identity carried on the wire (`participantCoord` on register, `participantId`
+		// on renew) IS `self` — the dialable peer id db-p2p supplies via its peer-codec. It is the
+		// record key the cohort stores AND the signer id its peer-key signature verifies against, so it
+		// must round-trip back to a peer id rather than being re-hashed here (§Tier addressing names the
+		// routing coord `P = self` directly; slot assignment hashes it internally for uniformity).
+		this.participantId = deps.self;
 		this.addressing = createTierAddressing(deps.hash, fanout);
 		this.dmax = makeDMaxComputer({ estimator: deps.sizeEstimator, F: fanout });
 		this.walk = createWalkEngine({
@@ -245,7 +258,7 @@ class WalkRegisterService implements CohortTopicService {
 		const renewal = createRenewalParticipant(initial, {
 			transport,
 			clock: this.clock,
-			sign: (body: UnsignedRenew): string => this.deps.signer.signRenew(body),
+			sign: (body: UnsignedRenew): Promise<string> => this.deps.signer.signRenew(body),
 			correlationId: reply.cohortEpoch ?? bytesToB64url(this.participantId),
 			initialCohortEpoch: hint.cohortEpoch,
 		});
@@ -312,7 +325,7 @@ class WalkRegisterService implements CohortTopicService {
 				if (params.appPayload !== undefined) {
 					body.appPayload = bytesToB64url(params.appPayload);
 				}
-				return { ...body, signature: this.deps.signer.signRegister(body) };
+				return { ...body, signature: await this.deps.signer.signRegister(body) };
 			},
 		};
 	}

@@ -1,5 +1,6 @@
 export * from "./types.js";
 export * from "./codec.js";
+export * from "./payloads.js";
 export { CohortWireError } from "./validate.js";
 export {
 	validateRegisterV1,

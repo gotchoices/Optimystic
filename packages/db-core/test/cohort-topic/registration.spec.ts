@@ -140,7 +140,7 @@ function participant(transport: MockParticipantTransport, init?: Partial<Registr
 	return createRenewalParticipant(record(init), {
 		transport,
 		clock: () => 5_000,
-		sign: () => 'sig',
+		sign: () => Promise.resolve('sig'),
 		correlationId: bytesKey(bytes('corr', 16)),
 		initialCohortEpoch: bytes('epoch-1', 32),
 	});
@@ -227,7 +227,7 @@ describe('cohort-topic / renewal participant', () => {
 		const p2 = createRenewalParticipant(record({ primary: backup0 }), {
 			transport: t2,
 			clock: () => 6_000,
-			sign: () => 'sig',
+			sign: () => Promise.resolve('sig'),
 			correlationId: 'c',
 			initialCohortEpoch: bytes('epoch-1', 32),
 		});

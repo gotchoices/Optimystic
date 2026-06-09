@@ -29,7 +29,7 @@
  */
 
 import type { Libp2p } from "libp2p";
-import type { Connection, PeerId, Stream } from "@libp2p/interface";
+import type { Connection, PeerId, PrivateKey, Stream } from "@libp2p/interface";
 import type { FretService } from "p2p-fret";
 import { hashPeerId, readAllBounded } from "p2p-fret";
 import {
@@ -57,6 +57,8 @@ import {
 	decodeCohortMessage,
 	validateRegisterV1,
 	validateRenewV1,
+	registerSigningPayload,
+	renewSigningPayload,
 	type CohortTopicService,
 	type CohortMemberEngine,
 	type CohortSnapshotView,
@@ -77,6 +79,7 @@ import { FretMembershipPublishSink } from "./membership-publish-sink.js";
 import { FretCohortThresholdCrypto } from "./threshold-crypto.js";
 import { FretSizeEstimator } from "./size-estimator.js";
 import { peerIdToBytes } from "./peer-codec.js";
+import { signPeer, verifyPeerSig } from "./peer-sig.js";
 import { DEFAULT_COHORT_TOPIC_PROTOCOLS, cohortTopicProtocolList, type CohortTopicProtocols } from "./protocols.js";
 import { DEFAULT_STREAM_MAX_BYTES } from "./stream-util.js";
 import { createLogger } from "../logger.js";
@@ -96,6 +99,16 @@ export interface CohortTopicHostOptions {
 	readonly fanout?: number;
 	/** Per-frame ceiling. Default {@link DEFAULT_STREAM_MAX_BYTES}. */
 	readonly maxBytes?: number;
+	/**
+	 * The node's libp2p Ed25519 private key. Required for the live participant signer: register/renew
+	 * bodies are peer-key-signed over their canonical image, and inbound register/`reattach` signatures
+	 * are verified against the participant's claimed peer id. libp2p does not expose the key off
+	 * `node.peerId`, so it is threaded explicitly (mirrors `clusterMember` / `DisputeService`, sourced
+	 * from `options.privateKey ?? generateKeyPair('Ed25519')` in `libp2p-node-base.ts`). When omitted,
+	 * the host falls back to the interim empty-string signer (one-time warn) and does **not** enforce
+	 * inbound participant-signature verification, so unit tests compose without a key.
+	 */
+	readonly privateKey?: PrivateKey;
 }
 
 /**
@@ -161,6 +174,10 @@ interface CoordEngineContext {
 	readonly wantK: number;
 	/** FRET two-sided assembly around `coord`, self prepended + deduped, with a deterministic epoch. */
 	readonly cohortAround: (coord: RingCoord) => CohortSnapshotView;
+	/** Verify an inbound `RegisterV1`'s participant peer-key signature (live-signer mode only). */
+	readonly verifyRegisterSig?: (reg: RegisterV1) => boolean;
+	/** Verify an inbound `reattach` `RenewV1`'s participant peer-key signature (live-signer mode only). */
+	readonly verifyReattachSig?: (renew: RenewV1) => boolean;
 }
 
 /**
@@ -211,6 +228,24 @@ export async function createCohortTopicHost(node: Libp2p, fret: FretService, opt
 		return { members, cohortEpoch };
 	};
 
+	// --- participant peer-key signing seam (gap 2) ---
+	// The live signer needs the node's libp2p key (libp2p does not expose it off `node.peerId`, so it
+	// arrives via options). When absent we keep the interim empty-string signer AND skip inbound
+	// participant-signature verification, so key-less unit/mock flows still compose. The signer id is
+	// the participant's wire identity (`participantCoord` / `participantId`), which IS its dialable
+	// peer-id bytes (db-core threads `self = selfMemberBytes`), so it round-trips to a verifiable key.
+	const participantSigner = createParticipantSigner(options.privateKey, log);
+	const verifyRegisterSig = options.privateKey === undefined
+		? undefined
+		: (reg: RegisterV1): boolean =>
+			reg.signature.length > 0 &&
+			verifyPeerSig(b64urlToBytes(reg.participantCoord), registerSigningPayload(reg), b64urlToBytes(reg.signature));
+	const verifyReattachSig = options.privateKey === undefined
+		? undefined
+		: (renew: RenewV1): boolean =>
+			renew.signature.length > 0 &&
+			verifyPeerSig(b64urlToBytes(renew.participantId), renewSigningPayload(renew), b64urlToBytes(renew.signature));
+
 	const ctx: CoordEngineContext = {
 		hash,
 		addressing,
@@ -222,6 +257,8 @@ export async function createCohortTopicHost(node: Libp2p, fret: FretService, opt
 		selfMemberBytes,
 		wantK,
 		cohortAround,
+		verifyRegisterSig,
+		verifyReattachSig,
 	};
 	const registry = createCoordRegistry(ctx);
 
@@ -238,14 +275,10 @@ export async function createCohortTopicHost(node: Libp2p, fret: FretService, opt
 	const certSource: IMembershipSource = membershipSource;
 	const membershipRouter = createMembershipSourceRouter({ committed: certSource, fret: certSource });
 	const verifier = createMembershipVerifier({ signer, router: membershipRouter, minSigs });
-	const participantSigner: ParticipantSigner = {
-		// Interim: the peer-key signature binding is the threshold-crypto gap's sibling; a content-addressed
-		// stamp keeps the body well-formed for mock-tier flows.
-		signRegister: (): string => "",
-		signRenew: (): string => "",
-	};
 	const service = createCohortTopicService({
-		self: selfCoord,
+		// `self` is the dialable peer-id bytes (not the ring coord): db-core carries it as the
+		// participant's wire identity, so the cohort can verify its peer-key signature (see signing seam).
+		self: selfMemberBytes,
 		hash,
 		router,
 		sizeEstimator,
@@ -290,6 +323,44 @@ export async function createCohortTopicHost(node: Libp2p, fret: FretService, opt
 			participantGossipBus.close();
 			await node.unhandle(cohortTopicProtocolList(protocols));
 		},
+	};
+}
+
+// --- participant signing seam ---
+
+/**
+ * The participant body signer. With a node key it peer-key-signs the canonical register/renew byte
+ * image (base64url). Without one it is the interim empty-string signer with a one-time warn that the
+ * bodies are unsigned — keeping key-less mock/unit flows composable (e.g. the four-protocol handshake
+ * test). The `signRegister`/`signRenew` bodies are the wire-payload-helper inputs verbatim.
+ */
+function createParticipantSigner(
+	privateKey: PrivateKey | undefined,
+	log: (formatter: string, ...args: unknown[]) => void,
+): ParticipantSigner {
+	if (privateKey === undefined) {
+		let warned = false;
+		const warnOnce = (): void => {
+			if (warned) {
+				return;
+			}
+			warned = true;
+			log("no privateKey supplied to createCohortTopicHost; participant RegisterV1/RenewV1 bodies are UNSIGNED (interim — supply options.privateKey for peer-key signing)");
+		};
+		return {
+			signRegister: (): Promise<string> => {
+				warnOnce();
+				return Promise.resolve("");
+			},
+			signRenew: (): Promise<string> => {
+				warnOnce();
+				return Promise.resolve("");
+			},
+		};
+	}
+	return {
+		signRegister: async (body): Promise<string> => bytesToB64url(await signPeer(privateKey, registerSigningPayload(body))),
+		signRenew: async (body): Promise<string> => bytesToB64url(await signPeer(privateKey, renewSigningPayload(body))),
 	};
 }
 
@@ -392,6 +463,7 @@ function createCoordEngine(ctx: CoordEngineContext, servedCoord: RingCoord, tree
 				/* interim: see touch */
 			},
 		},
+		verifyReattachSig: ctx.verifyReattachSig,
 	});
 
 	const engine = createCohortMemberEngine({
@@ -407,6 +479,7 @@ function createCoordEngine(ctx: CoordEngineContext, servedCoord: RingCoord, tree
 		renewal,
 		cohort,
 		quorumWilling: (tier: Tier): boolean => ctx.profile.willingTiers.has(tier),
+		verifyRegisterSig: ctx.verifyRegisterSig,
 	});
 
 	return {

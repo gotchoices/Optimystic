@@ -825,14 +825,32 @@ interface RegisterV1 {
   topicId:         string             // 32 bytes
   tier:            number             // 0..3
   treeTier:        number             // current walk position d
-  participantCoord: string            // participant's ring coord, 32 bytes
+  participantCoord: string            // participant identity P (see note)
   ttl:             number             // ms, default 90000
   bootstrap?:      boolean            // true on root cold-start request
   appPayload?:     string             // opaque, application-defined
   timestamp:       number             // unix ms
   correlationId:   string             // 16 bytes random
-  signature:       string             // participant peer key
+  signature:       string             // participant peer-key signature over the body (minus signature)
 }
+```
+
+> **Participant signature.** `signature` is the participant's libp2p peer-key (Ed25519) signature over
+> the deterministic byte image of the body **minus** the `signature` field
+> (`registerSigningPayload`, an ordered-array UTF-8 encoding — the sibling of the threshold-notice
+> payloads). A cohort member recomputes that image and verifies it against the participant's peer key
+> before admitting (an unverifiable register is answered `no_state` — serve nothing, record nothing).
+> The signer's public key is read from the participant identity `participantCoord`, which the current
+> implementation carries as the participant's **dialable peer id** (the UTF-8 of the peer-id string,
+> the same peer-codec encoding as the reply's `primary`/`backups`/`cohortMembers`) so the embedded
+> Ed25519 key is recoverable with no network lookup. This `P` is also the record key and the routing
+> coordinate fed to `coord_d`. *Tier-0 caveat:* `coord_0` is participant-independent, so this is exact
+> for the single-tier milestone; multi-tier (`d ≥ 1`) sharding still wants a **uniform** ring coord
+> for `prefix(P, …)`, so reconciling the routing/sharding key with the verifiable signer id (e.g. a
+> separate signer field, or hashing `P` only for the `coord_d` input) is a documented follow-on,
+> tracked with the rest of the multi-tier work.
+
+```
 
 interface RegisterReplyV1 {
   v:               1

@@ -154,7 +154,7 @@ function buildMockService(engine: CohortMemberEngine, member: Uint8Array, onDial
 	void membershipRouter;
 	void crypto;
 	void member;
-	const signer: ParticipantSigner = { signRegister: (): string => '', signRenew: (): string => '' };
+	const signer: ParticipantSigner = { signRegister: (): Promise<string> => Promise.resolve(''), signRenew: (): Promise<string> => Promise.resolve('') };
 
 	return createCohortTopicService({ self, hash, router, sizeEstimator, signer, gossipBus, verifier });
 }

@@ -61,8 +61,8 @@ export interface RenewalParticipantDeps {
 	transport: RenewalParticipantTransport;
 	/** Monotonic-ish wall clock in unix ms (injected for deterministic tests). */
 	clock: () => number;
-	/** Signs the renew body; db-p2p supplies the peer-key signature. */
-	sign: (body: UnsignedRenew) => string;
+	/** Signs the renew body; db-p2p supplies the (async) peer-key signature. */
+	sign: (body: UnsignedRenew) => Promise<string>;
 	/** Correlation id matching the original RegisterV1, base64url. */
 	correlationId: string;
 	/** Initial cohort-epoch hint from the registration reply (refreshed lazily thereafter). */
@@ -105,13 +105,13 @@ class TtlRenewalParticipant implements RenewalParticipant {
 	}
 
 	async reattach(target: Uint8Array): Promise<RenewReplyV1> {
-		return this.deps.transport.send(target, this.buildRenew(true));
+		return this.deps.transport.send(target, await this.buildRenew(true));
 	}
 
 	/** Send a renew, mapping an RPC rejection to `undefined` (a counted failure). */
 	private async trySend(target: Uint8Array): Promise<RenewReplyV1 | undefined> {
 		try {
-			return await this.deps.transport.send(target, this.buildRenew(false));
+			return await this.deps.transport.send(target, await this.buildRenew(false));
 		} catch {
 			return undefined;
 		}
@@ -203,7 +203,7 @@ class TtlRenewalParticipant implements RenewalParticipant {
 	 * accepting member can trust the attestation; a plain ping omits the field entirely (a stray renew
 	 * can never silently usurp a live primary).
 	 */
-	private buildRenew(reattach: boolean): RenewV1 {
+	private async buildRenew(reattach: boolean): Promise<RenewV1> {
 		const body: UnsignedRenew = {
 			v: 1,
 			topicId: bytesKey(this.current.topicId),
@@ -214,7 +214,7 @@ class TtlRenewalParticipant implements RenewalParticipant {
 		if (reattach) {
 			body.reattach = true;
 		}
-		return { ...body, signature: this.deps.sign(body) };
+		return { ...body, signature: await this.deps.sign(body) };
 	}
 }
 
@@ -248,6 +248,15 @@ export interface RenewalCohortSideDeps {
 	 * when this returns `true` `onRenew` touches and serves instead of replying `primary_moved`.
 	 */
 	isServing?: (topicId: Uint8Array, participantId: Uint8Array) => boolean;
+	/**
+	 * Optional participant peer-key signature verifier (db-p2p binds it to the peer-sig primitive over
+	 * {@link import("../wire/payloads.js").renewSigningPayload}). Checked **only** on a `reattach`
+	 * renew — the privilege-escalating path: a `reattach` whose signature does not verify against the
+	 * claimed `participantId` must never promote a backup (a stray/MITM'd ping cannot usurp a live
+	 * primary, §TTL and renewal). Absent → the gate is skipped (unit tests run without peer crypto);
+	 * plain pings are not verified here (they only touch `lastPing`).
+	 */
+	verifyReattachSig?: (renew: RenewV1) => boolean;
 }
 
 /** Cohort-side TTL handling: touch on renew, redirect on rotation, sweep stale records. */
@@ -283,7 +292,12 @@ class StoreRenewalCohortSide implements RenewalCohortSide {
 		const key = recordKey(topicId, participantId);
 
 		if (msg.reattach === true) {
-			// Crash-failover promotion request (participant attests primary unreachable).
+			// Crash-failover promotion request (participant attests primary unreachable). The signed
+			// `reattach` flag is what a backup trusts to promote itself, so a missing/forged signature
+			// must never escalate: fall through to a plain redirect (never promote).
+			if (this.deps.verifyReattachSig?.(msg) === false) {
+				return this.primaryMoved(primary, backups, cohortEpoch);
+			}
 			if (bytesEqual(primary, self)) {
 				// A rotation already made this member the computed primary; serve, no override needed.
 				return this.touchAndServe(rec, now);

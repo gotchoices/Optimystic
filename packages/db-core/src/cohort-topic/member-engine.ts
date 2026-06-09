@@ -91,6 +91,14 @@ export interface CohortMemberEngineDeps {
 	readonly replayGuard?: CorrelationReplayGuard;
 	readonly topicBudget?: TopicBudget;
 	readonly bootstrapEvidence?: BootstrapEvidence;
+	/**
+	 * Optional participant peer-key signature verifier (db-p2p binds it to the peer-sig primitive over
+	 * {@link import("./wire/payloads.js").registerSigningPayload}). A `RegisterV1` whose signature does
+	 * not verify against the claimed `participantCoord` is answered `no_state` (serve nothing, record
+	 * nothing) — a cohort member cannot trust an unsigned/forged `participantCoord`. Verified first so a
+	 * forged frame never reaches (or pollutes) the replay/rate guards. Absent → the gate is skipped.
+	 */
+	readonly verifyRegisterSig?: (reg: RegisterV1) => boolean;
 }
 
 /** Cohort-side register/renew handler — the body of the FRET activity callback. */
@@ -230,6 +238,12 @@ class StoreCohortMemberEngine implements CohortMemberEngine {
 		tier: Tier,
 		now: number,
 	): RegisterReplyV1 | undefined {
+		if (this.deps.verifyRegisterSig?.(reg) === false) {
+			// Unsigned / forged participant signature: serve nothing and record nothing (the cohort
+			// cannot trust this participantCoord). Checked before the replay/rate guards so a forged
+			// frame cannot consume their state.
+			return { v: 1, result: "no_state" };
+		}
 		const correlationId = b64urlToBytes(reg.correlationId);
 		if (this.deps.replayGuard?.accept(correlationId, participantId, reg.timestamp, now) === false) {
 			// Stale / future-skewed / replayed: serve nothing and record nothing.

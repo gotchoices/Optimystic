@@ -1,5 +1,6 @@
 export * from "./protocols.js";
 export * from "./peer-codec.js";
+export * from "./peer-sig.js";
 export * from "./stream-util.js";
 export * from "./topic-router.js";
 export * from "./cohort-gossip-transport.js";
