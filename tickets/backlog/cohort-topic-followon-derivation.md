@@ -6,6 +6,7 @@ files:
   - packages/db-core/src/cohort-topic/wire/types.ts (RegisterV1 — today carries only `bootstrap`)
   - docs/cohort-topic.md (§Cold-start instantiation, §Lookup, §Wire formats)
   - packages/db-p2p/src (future: cohort-topic service host — the ITopicRouter / cold-start binding)
+difficulty: hard
 ----
 
 # Decide how `followOn` is determined for cold-start admission

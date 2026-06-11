@@ -4,6 +4,7 @@ files:
   - docs/cohort-topic.md
   - packages/substrate-simulator/src/size-model.ts
   - packages/substrate-simulator/test/fret-model.spec.ts
+difficulty: easy
 ----
 
 # d_max confidence-clamp: literal assignment vs. upper bound

@@ -4,6 +4,7 @@ files:
   - packages/db-core/src/cohort-topic/membership/verifier.ts (certIsSelfConsistent / loadFrom)
   - packages/db-core/src/cohort-topic/sig/threshold.ts
   - docs/cohort-topic.md (§Bootstrapping trust)
+difficulty: hard
 ----
 
 # Anchor MembershipCertV1 trust to a chain of attestations (chain-to-genesis)

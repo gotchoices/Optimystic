@@ -9,6 +9,7 @@ files:
   - docs/reactivity.md
   - docs/matchmaking.md
 effort: high
+difficulty: hard
 ----
 
 # E2E real-libp2p fidelity suite for cohort-topic, reactivity, and matchmaking

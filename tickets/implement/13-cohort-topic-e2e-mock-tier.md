@@ -7,6 +7,7 @@ files:
   - docs/cohort-topic.md
   - docs/architecture.md
 effort: high
+difficulty: hard
 ----
 
 # E2E mock-transport suite for cohort-topic at scale

@@ -1,5 +1,6 @@
 description: FileRawStorage (db-p2p-storage-fs) writes pend/action files named `<actionId>.json`, but db-core stamps transaction/action ids as `tx:<hash>` / `stamp:<hash>` (with a colon). On Windows a colon is illegal in a filename, so the consensus commit's pend→actions rename fails with EINVAL — making the coordinator (session/consensus) commit path unusable on Windows over FileRawStorage. POSIX is unaffected (colons are legal there). The legacy `Collection.sync()` path sidesteps this by using colon-free base64url action ids.
 files: ../optimystic/packages/db-p2p-storage-fs/src/file-storage.ts, ../optimystic/packages/db-core/src/transaction/transaction.ts
+difficulty: easy
 ----
 
 # FileRawStorage colon-in-actionId breaks consensus commit on Windows

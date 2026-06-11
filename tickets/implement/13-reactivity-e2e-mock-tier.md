@@ -6,6 +6,7 @@ files:
   - docs/reactivity.md
   - docs/architecture.md
 effort: high
+difficulty: hard
 ----
 
 # E2E mock-transport suite for reactivity

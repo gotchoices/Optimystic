@@ -1,5 +1,6 @@
 description: Retune the simulator's resume classifier to the layered (stacked) checkpoint bound — `classifyResume` cuts over to `OutOfWindow` at `lag ≥ W + W_checkpoint` (4352 at defaults), not `lag ≥ W_checkpoint` (4096), to match the authoritative `docs/reactivity.md` semantics and agree with `RollingCheckpoint.covers`.
 files: packages/substrate-simulator/src/reactivity.ts, packages/substrate-simulator/test/reactivity.spec.ts, docs/reactivity.md
+difficulty: easy
 ----
 
 ## Summary

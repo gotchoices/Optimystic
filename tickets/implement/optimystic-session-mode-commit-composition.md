@@ -13,6 +13,7 @@ files:
   - packages/db-core/src/transaction/session.ts
   - packages/db-core/src/collection/collection.ts
   - packages/db-core/src/collections/tree/tree.ts
+difficulty: hard
 ----
 
 # Verify + repair session-mode commit composition (TransactionBridge staging DML)

@@ -5,6 +5,7 @@ files:
   - packages/db-core/src/cohort-topic/wire/types.ts (PromotionNoticeV1 L113 / DemotionNoticeV1 L129 — no served-coord field)
   - packages/db-core/src/cohort-topic/sig/payloads.ts (promotion/demotion signing payloads — coord is not covered by the signature either)
   - packages/db-core/src/cohort-topic/membership/verifier.ts (verifyMessage keys the cert lookup by expectedCoord = target.servedCoord)
+difficulty: hard
 ----
 
 # Cohort-topic: the inbound promote handler cannot disambiguate which cohort a notice belongs to

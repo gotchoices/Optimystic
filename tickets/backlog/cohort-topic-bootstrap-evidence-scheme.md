@@ -3,6 +3,7 @@ files:
   - packages/db-p2p/src/cohort-topic/host.ts (createBootstrapEvidencePolicy — verifier injection seam)
   - packages/db-core/src/cohort-topic/antidos/bootstrap-evidence.ts (the tier policy; verifiers are injected, unchanged)
   - docs/cohort-topic.md (§Anti-DoS bullet 4)
+difficulty: hard
 ----
 
 # Cohort-topic: real bootstrap-evidence verifiers

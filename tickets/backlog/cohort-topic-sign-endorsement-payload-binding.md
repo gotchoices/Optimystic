@@ -5,6 +5,7 @@ files:
   - packages/db-core/src/cohort-topic/wire/types.ts (SignRequestV1 / SignKind)
   - packages/db-core/src/cohort-topic/sig/payloads.ts (canonical payload images the endorser would re-derive)
   - packages/db-p2p/src/cohort-topic/threshold-crypto.ts (FretCohortThresholdCrypto.assemble — requester side)
+difficulty: hard
 ----
 
 # Bind `/sign` endorsements to a payload the endorser independently validates
