@@ -83,7 +83,7 @@ ProviderAppPayloadV1 {
   capacityBudget:  number              // tasks this provider will accept concurrently
   serviceUntil?:   number              // unix ms, soft expiry hint to seekers
   contactHint:     string              // multiaddr or PeerId-based callback
-  signature:       string              // over capabilities + capacityBudget + topicId + correlationId
+  signature:       string              // over (topicId, capabilities, capacityBudget) — see §Wire formats
 }
 ```
 
@@ -108,7 +108,8 @@ Either way, the layer enforces correctness only at the registration level; the s
 >
 > **Implemented** (mock-tier e2e pending). Provider state/decision is
 > `packages/db-core/src/matchmaking/provider.ts` (`MatchmakingProvider`): capability tags, a live
-> `capacityBudget`, the correlation id binding its signed `ProviderAppPayloadV1`, plus `setCapacity` /
+> `capacityBudget`, the signed `ProviderAppPayloadV1` builder (signing scope
+> `(topicId, capabilities, capacityBudget)` — see the signing-scope note in §Wire formats), plus `setCapacity` /
 > `signalFull` (`capacityBudget = 0`) / `markWithdrawn`. It is crypto-free — signing is an injected
 > callback (db-p2p supplies the libp2p peer key), mirroring the cohort-topic `ParticipantSigner`.
 > db-p2p wiring is `packages/db-p2p/src/matchmaking/provider-manager.ts`
@@ -152,16 +153,15 @@ with TTL set short — typically 5–15 s — since seekers normally don't wait 
 hanging-out seeker that set `pushOnArrival` keeps its registration alive via TTL
 renewals while it waits for pushes (see [§Arrival push on provider arrival](#arrival-push-on-provider-arrival)).
 
-> **Implemented (registration only; query/hang-out pending).** Seeker state + the signed
-> `SeekerAppPayloadV1` builder is `packages/db-core/src/matchmaking/seeker.ts` (`MatchmakingSeeker`);
-> db-p2p wiring is `packages/db-p2p/src/matchmaking/seeker-manager.ts` (`MatchmakingSeekerManager`),
-> which registers at tier **T2** with the short `seeker_ttl` (default 10 s) and **does not renew by
-> default**, so the registration ages out by TTL — the eviction property this slice proves. The
-> `QueryV1` issuance below, the capability-filter evaluation, and the hang-out-vs-continue decision
-> are deferred to `matchmaking-query-filter-hangout`; `MatchmakingSeeker.query()` is a documented
-> stub. The query-protocol codecs (`QueryV1` / `QueryReplyV1` / `AggregateCountV1`) already live in
-> `wire.ts` so that consumer can be built against fixtures. Spec: `registration.spec.ts` (brief seeker
-> registration evicts on TTL while a renewed provider survives).
+> **Implemented** (mock-tier e2e pending). Seeker state + the signed `SeekerAppPayloadV1` builder
+> (signing scope `(topicId, wantCount)` — see the signing-scope note in §Wire formats) is
+> `packages/db-core/src/matchmaking/seeker.ts` (`MatchmakingSeeker`); db-p2p wiring is
+> `packages/db-p2p/src/matchmaking/seeker-manager.ts` (`MatchmakingSeekerManager`), which registers at
+> tier **T2** with the short `seeker_ttl` (default 10 s) and **does not renew by default**, so the
+> registration ages out by TTL — the eviction property the registration slice proves. The `QueryV1`
+> issuance, the capability-filter evaluation, and the hang-out-vs-continue decision below are now
+> implemented too — see the callouts under §Capability filter and §Hang-out vs. continue. Spec:
+> `registration.spec.ts` (brief seeker registration evicts on TTL while a renewed provider survives).
 
 After registering, the seeker queries the cohort:
 
@@ -188,6 +188,17 @@ CapabilityFilter {
 ```
 
 The filter is evaluated locally at the cohort. Filters are advisory: they bias which providers the cohort returns but do not constitute admission. The seeker re-validates against the returned set.
+
+> **Implemented** (mock-tier e2e pending). `matchesFilter` (must / mustNot / minBudget) is
+> `packages/db-core/src/matchmaking/capability-filter.ts`; the pure query evaluation (filter +
+> `limit` truncation + `truncated` flag + entry building, providers and seekers) is `query-eval.ts`
+> (`evaluateQuery`); the cohort-side binding that serves a `QueryV1` from the cohort's local
+> registration records and attaches `topicTraffic`, `cohortEpoch`, and the primary's reply signature
+> is `packages/db-p2p/src/matchmaking/query-handler.ts` (`handleMatchmakingQuery`). The seeker
+> re-validates each returned entry's `registrationSig` via `verifyProviderEntry` /
+> `verifySeekerEntry` (`wire.ts`) — see the signing-scope note in §Wire formats. Spec:
+> `capability-filter.spec.ts`, `query-eval.spec.ts`, `entry-verify.spec.ts` (db-core, including the
+> sign → forward → verify round trip), `query-handler.spec.ts` (db-p2p).
 
 ### Distributing the query across the tree
 
@@ -336,6 +347,20 @@ Contrast: the seeker's prefix lands it in a thinner shard with `directParticipan
 >   so a per-tier cap buys nothing here. (Evidence: `scenarios.ts` adversarial-reporting,
 >   `sweep.ts` `contention_factor_cap` rows, `refinement-signal.ts`.)
 
+> **Implemented** (mock-tier e2e pending). The pure decision engine — `decide` (immediate-match /
+> hang-out feasibility / escalate), `expectedNewMatches`, `contentionFactor`, and the running
+> `filterAcceptRatio` refinement — is `packages/db-core/src/matchmaking/seeker-walk.ts`; the walk
+> orchestration (register from `d_max`, immediate `QueryV1`, renew + requery at `requery_interval_ms`
+> on hang-out, withdraw + re-register on escalate, terminal hang-out at `d = 0`, patience draining
+> across hops via a single wall-clock deadline) is
+> `packages/db-p2p/src/matchmaking/seeker-walk-client.ts` (`SeekerWalkClient`, **poll path only** —
+> the arrival-push path is a separate slice). Future refinements tracked as backlog tickets:
+> `matchmaking-per-tier-patience-splitting` (strategies beyond the fixed
+> `patience_per_tier_fraction = 1.0` implemented here) and `matchmaking-contention-from-seeker-pool`
+> (exact `Σ wantCount` contention instead of the `meanWantCount × queriesPerMin` approximation
+> implemented here). Spec: `seeker-walk.spec.ts` (db-core — the worked-example arithmetic and edge
+> cases 2/4/5), `seeker-walk-client.spec.ts` (db-p2p — the §Test expectations hang-out bullets).
+
 ### Edge cases
 
 The §Decision rule above is the common path. A few specific situations need explicit handling:
@@ -352,7 +377,7 @@ The §Decision rule above is the common path. A few specific situations need exp
 
 ### Test expectations
 
-The wire codecs, the stable topic anchor, and both registration roles (provider attach/renew/self-throttle; seeker short-TTL registration) are now implemented (see the callouts in §Anchor, §Provider registration, §Seeker query, and §Wire formats); the query/filter evaluation and the seeker hang-out engine below remain doc-as-spec, landing in `matchmaking-query-filter-hangout`. The hang-out cases below become unit/integration tests when that package lands.
+The wire codecs, the stable topic anchor, both registration roles (provider attach/renew/self-throttle; seeker short-TTL registration), the query/filter evaluation, and the seeker hang-out engine are now implemented (see the callouts in §Anchor, §Provider registration, §Seeker query, §Capability filter, §Hang-out vs. continue, and §Wire formats). Each hang-out bullet below has a corresponding passing unit test — `seeker-walk.spec.ts` (db-core) for the decision arithmetic, `seeker-walk-client.spec.ts` (db-p2p) for the walk behavior. The arrival-push bullets remain doc-as-spec until `matchmaking-cohort-push-on-arrival` lands.
 
 - *Hot topic, deep tier suffices.* Seeker stops at the first `Accepted` whose query meets `wantCount`; no walk past the tier of first match.
 - *Cold topic, walks to root.* Seeker traverses every tier from `d_max` down to `d = 0`; `wantCount` is met only at the root.
@@ -500,9 +525,10 @@ Matchmaking reuses `RegisterV1`, `RenewV1`, etc., from cohort-topic. The applica
 > substrate); the query-protocol messages ride the same length-prefixed framing as cohort-topic
 > messages. Validation enforced on decode: `kind` exactly matches the discriminant; `limit <=
 > query_limit_max` (256); `capacityBudget >= 0`; `wantCount >= 1`; malformed/oversized payloads
-> rejected with `CohortWireError`. The `QueryReplyV1` / `AggregateCountV1` *producers* land in later
-> tickets, but their decoders are implemented here so the seeker side is unit-testable against
-> fixtures. Spec: `wire.spec.ts`.
+> rejected with `CohortWireError`. The `QueryReplyV1` *producer* is now implemented
+> (`packages/db-p2p/src/matchmaking/query-handler.ts`, signed via `queryReplySigningPayload`); the
+> `AggregateCountV1` producer lands with the multi-cohort sweep. Spec: `wire.spec.ts`,
+> `entry-verify.spec.ts`.
 
 ### Provider registration payload
 
@@ -513,7 +539,7 @@ interface ProviderAppPayloadV1 {
   capacityBudget:  number
   serviceUntil?:   number
   contactHint:     string             // multiaddr or PeerId, application-defined format
-  signature:       string             // base64url, over (topicId, capabilities, capacityBudget, correlationId)
+  signature:       string             // base64url, over (topicId, capabilities, capacityBudget) — see the signing-scope note below
 }
 ```
 
@@ -526,7 +552,7 @@ interface SeekerAppPayloadV1 {
   filter?:        CapabilityFilter
   contactHint:    string
   pushOnArrival?: boolean             // NEW — opt into arrival pushes; default false (poll path)
-  signature:      string
+  signature:      string              // base64url, over (topicId, wantCount) — see the signing-scope note below
 }
 
 interface CapabilityFilter {
@@ -580,6 +606,19 @@ interface SeekerEntryV1 {
 ```
 
 The query reply is signed by the cohort primary (single-member signature, not threshold) because the response is advisory: the seeker re-validates `registrationSig` on each entry to confirm provider authenticity. The cohort does not vouch for the providers; it vouches only for "these were the registrations I held."
+
+> **Signing scope (resolved).** The provider/seeker registration signatures cover
+> `(topicId, capabilities, capacityBudget)` and `(topicId, wantCount)` respectively — the matchmaking
+> `correlationId` is deliberately **excluded** from the signed image. A forwarded `ProviderEntryV1` /
+> `SeekerEntryV1` carries no `correlationId`, so binding the signature over it would leave the seeker
+> unable to reconstruct the exact signed image, making the re-validation above unbuildable.
+> Replay-binding of the registration itself is handled independently by the cohort-topic `RegisterV1`
+> envelope (its own per-probe `correlationId`, replay guard, and peer-key signature); the matchmaking
+> signature attests only authorship of the advertised capability/want claims, anchored to the entry's
+> `participantId`. Canonical images: `providerSigningPayload` / `seekerSigningPayload`; seeker-side
+> verification: `verifyProviderEntry` / `verifySeekerEntry`
+> (`packages/db-core/src/matchmaking/wire.ts`; spec `entry-verify.spec.ts` covers the
+> sign → forward → verify round trip and tamper rejection).
 
 ### Arrival push (cohort-primary → seeker)
 

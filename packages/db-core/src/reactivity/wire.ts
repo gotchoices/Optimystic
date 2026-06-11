@@ -23,12 +23,20 @@
  */
 
 import {
-	b64urlToBytes,
 	decodeCohortMessage,
 	encodeCohortMessage,
 	DEFAULT_MAX_MESSAGE_BYTES,
 } from "../cohort-topic/wire/codec.js";
-import { CohortWireError } from "../cohort-topic/wire/validate.js";
+import {
+	asObject,
+	b64urlField,
+	failWire as fail,
+	reqFiniteNumber,
+	reqIntInRange,
+	reqString,
+	reqStringArray,
+	requireV1,
+} from "./wire-validate.js";
 
 const utf8Encoder = new TextEncoder();
 const utf8Decoder = new TextDecoder("utf-8", { fatal: true });
@@ -84,65 +92,15 @@ export interface NotificationV1 {
 	rotationHint?: RotationHintV1;
 }
 
-// --- validation helpers (mirror cohort-topic/wire/validate.ts; local to keep reactivity DRY) ---
-
-function fail(message: string): never {
-	throw new CohortWireError(message);
-}
-
-function asObject(value: unknown, what: string): Record<string, unknown> {
-	if (typeof value !== "object" || value === null || Array.isArray(value)) {
-		fail(`${what}: expected an object`);
-	}
-	return value as Record<string, unknown>;
-}
-
-function requireV1(obj: Record<string, unknown>, what: string): void {
-	if (obj["v"] !== 1) {
-		fail(`${what}: expected v === 1, got ${JSON.stringify(obj["v"])}`);
-	}
-}
-
-function reqString(obj: Record<string, unknown>, key: string, what: string): string {
-	const value = obj[key];
-	if (typeof value !== "string") {
-		fail(`${what}: field "${key}" must be a string`);
-	}
-	return value;
-}
-
-function reqFiniteNumber(obj: Record<string, unknown>, key: string, what: string): number {
-	const value = obj[key];
-	if (typeof value !== "number" || !Number.isFinite(value)) {
-		fail(`${what}: field "${key}" must be a finite number`);
-	}
-	return value;
-}
-
-/** Assert a base64url string decodes cleanly; returns it unchanged. */
-function b64urlField(value: string, key: string, what: string): string {
-	try {
-		b64urlToBytes(value);
-	} catch {
-		fail(`${what}: field "${key}" is not valid base64url`);
-	}
-	return value;
-}
-
-/** Require an integer `>= min` (and `<= max` when supplied). */
-function reqIntInRange(value: number, key: string, what: string, min: number, max?: number): number {
-	if (!Number.isInteger(value) || value < min || (max !== undefined && value > max)) {
-		const bound = max === undefined ? `>= ${min}` : `in ${min}..${max}`;
-		fail(`${what}: field "${key}" must be an integer ${bound}, got ${value}`);
-	}
-	return value;
-}
+// --- validation helpers ---
+// Generic primitives live in ./wire-validate.js (shared across the reactivity codecs); the
+// notification-specific narrowing stays here next to the type it produces.
 
 function validateRotationHint(value: unknown, what: string): RotationHintV1 {
 	const obj = asObject(value, what);
 	return {
 		newTailId: b64urlField(reqString(obj, "newTailId", what), "newTailId", what),
-		effectiveAtRevision: reqIntInRange(reqFiniteNumber(obj, "effectiveAtRevision", what), "effectiveAtRevision", what, 0),
+		effectiveAtRevision: reqIntInRange(obj, "effectiveAtRevision", what, 0),
 	};
 }
 
@@ -159,8 +117,8 @@ export function validateSubscribeAppPayloadV1(value: unknown): SubscribeAppPaylo
 		kind: "reactivity",
 		collectionId: b64urlField(reqString(obj, "collectionId", what), "collectionId", what),
 		tailIdAtAttach: b64urlField(reqString(obj, "tailIdAtAttach", what), "tailIdAtAttach", what),
-		lastKnownRev: reqIntInRange(reqFiniteNumber(obj, "lastKnownRev", what), "lastKnownRev", what, 0),
-		deltaMaxBytes: reqIntInRange(reqFiniteNumber(obj, "deltaMaxBytes", what), "deltaMaxBytes", what, 0),
+		lastKnownRev: reqIntInRange(obj, "lastKnownRev", what, 0),
+		deltaMaxBytes: reqIntInRange(obj, "deltaMaxBytes", what, 0),
 	};
 }
 
@@ -199,19 +157,16 @@ export function validateNotificationV1(value: unknown): NotificationV1 {
 	const what = "NotificationV1";
 	const obj = asObject(value, what);
 	requireV1(obj, what);
-	const signers = obj["signers"];
-	if (!Array.isArray(signers) || signers.some((entry) => typeof entry !== "string")) {
-		fail(`${what}: field "signers" must be an array of strings`);
-	}
+	const signers = reqStringArray(obj["signers"], "signers", what);
 	const out: NotificationV1 = {
 		v: 1,
 		collectionId: b64urlField(reqString(obj, "collectionId", what), "collectionId", what),
 		tailId: b64urlField(reqString(obj, "tailId", what), "tailId", what),
-		revision: reqIntInRange(reqFiniteNumber(obj, "revision", what), "revision", what, 0),
+		revision: reqIntInRange(obj, "revision", what, 0),
 		digest: b64urlField(reqString(obj, "digest", what), "digest", what),
 		timestamp: reqFiniteNumber(obj, "timestamp", what),
 		sig: b64urlField(reqString(obj, "sig", what), "sig", what),
-		signers: (signers as string[]).map((s, i) => b64urlField(s, `signers[${i}]`, what)),
+		signers: signers.map((s, i) => b64urlField(s, `signers[${i}]`, what)),
 	};
 	if (obj["delta"] !== undefined) {
 		out.delta = b64urlField(reqString(obj, "delta", what), "delta", what);
@@ -220,6 +175,14 @@ export function validateNotificationV1(value: unknown): NotificationV1 {
 		out.rotationHint = validateRotationHint(obj["rotationHint"], `${what}.rotationHint`);
 	}
 	return out;
+}
+
+/** Validate an array of {@link NotificationV1} (the `entries`/`recentEntries` carried in backfill/resume replies). */
+export function validateNotificationArray(value: unknown, what: string): NotificationV1[] {
+	if (!Array.isArray(value)) {
+		fail(`${what}: field "entries" must be an array`);
+	}
+	return value.map((entry) => validateNotificationV1(entry));
 }
 
 /** Encode a {@link NotificationV1} as a length-prefixed UTF-8 JSON frame. */

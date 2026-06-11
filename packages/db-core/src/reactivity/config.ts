@@ -116,3 +116,24 @@ export function resolveW(opts: { cps?: number; minCoverageSeconds?: number; maxW
 	const maxW = opts.maxW ?? Number.POSITIVE_INFINITY;
 	return Math.min(Math.max(config.w, adaptive), maxW);
 }
+
+/** Default `W_checkpoint`-to-`W` ratio (`docs/reactivity.md` §Parent checkpoint summaries: 16×). */
+export const W_CHECKPOINT_RATIO = 16;
+
+/**
+ * Resolve the parent-checkpoint span `W_checkpoint` for a collection.
+ *
+ * Static default (no `cps`): the configured `config.wCheckpoint` (4096). Adaptive: `W_checkpoint`
+ * "scales the same way and may stay a fixed 16× multiple of the resolved `W`" (`docs/reactivity.md`
+ * §Configuration), so when a `cps` is supplied it tracks `W_CHECKPOINT_RATIO × resolveW(opts)`. This is
+ * the single hook the simulator fold-back ([fold-simulator-findings-into-design-docs]) retunes; the
+ * resume classifier reads it so a hot collection's stacked recovery range scales with the replay depth.
+ */
+export function resolveWCheckpoint(opts: { cps?: number; minCoverageSeconds?: number; maxW?: number; ratio?: number; config?: ReactivityConfig } = {}): number {
+	const config = opts.config ?? DEFAULT_REACTIVITY_CONFIG;
+	if (opts.cps === undefined || opts.minCoverageSeconds === undefined) {
+		return config.wCheckpoint;
+	}
+	const ratio = opts.ratio ?? W_CHECKPOINT_RATIO;
+	return resolveW(opts) * ratio;
+}
