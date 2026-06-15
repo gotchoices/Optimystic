@@ -213,6 +213,19 @@ The multi-cohort sweep costs more RPCs and is reserved for use cases where repre
 
 ## Voting-quorum assembly
 
+> **Implemented** — *discovery flow only* (mock-tier e2e pending). The discovery-side assembler that
+> composes the matchmaking surface into "assemble a quorum of eligible voters for proposal `P`" is
+> `packages/db-core/src/matchmaking/voting-quorum.ts` (`VotingQuorumAssembler`): the `quorumTopic`
+> anchor, the eligibility-proof-bearing voter registration (`registerEligibleVoter`), and the
+> coordinator/delegated-assembler `assembleQuorum` discover → verify → select pipeline (single-cohort
+> walk, hot-topic multi-cohort sweep, dedup, reply-side `registrationSig` + `verifyEligibility`
+> filtering, selection). The discovery I/O (walk + sweep) is injected as a `QuorumDiscovery` port,
+> bound in db-p2p to `MatchmakingSeeker.walk` + `multi-cohort-seeker`. Spec:
+> `voting-quorum.spec.ts`. **The voting protocol itself** — eligibility-proof *minting*, the quorum
+> *selection rule*, ballots, tally aggregation, dispute escalation, ballot privacy — is **not**
+> implemented here; it is injected (`verifyEligibility` / `select` / `reputationPrefilter`) or left to a
+> forthcoming separate voting doc. No matchmaking wire-protocol change is introduced.
+
 Voting is a first-class consumer of matchmaking. The voting subsystem assembles a quorum of peers to count ballots, validate eligibility, and produce a threshold-signed tally. Matchmaking provides the discovery primitive:
 
 1. A proposal `P` defines a `topicId = H("quorum" ‖ proposalHash(P) ‖ "match")`.
@@ -225,9 +238,18 @@ Voting is a first-class consumer of matchmaking. The voting subsystem assembles 
 ### Why this works for voting
 
 - **Anti-flood under heavy participation**: a high-profile vote will produce a deep tree as registrations exceed `cap_promote`; queries shard across the tree without overloading the root cohort or any single cohort.
-- **Verifiable eligibility**: provider registrations are signed, eligibility evidence is part of `capabilities`, and the cohort's threshold-signed responses anchor the result.
-- **Bounded membership**: TTL ensures dead voters age out; the cohort never reports staler-than-TTL registrations.
-- **Resists Sybil at the matchmaking layer**: the cohort doesn't validate eligibility (that's the application's job), but the per-peer rate limits and signature requirements raise the cost of forging mass registrations.
+- **Verifiable eligibility**: provider registrations are signed, eligibility evidence is bound into `capabilities` (so the provider's `registrationSig` attests it), and the coordinator re-validates every forwarded entry's `registrationSig` *and* its eligibility proof per entry. Signature anchoring is layered: a `QueryReplyV1` carries the cohort primary's **single-member** signature (advisory — vouches only for "the set I held"), while the multi-cohort-sweep `AggregateCountV1` is **threshold-signed** (an attested *registered*-provider count). Neither attests *eligibility* — that is the application's job, done reply-side.
+- **Bounded membership**: TTL ensures dead voters age out; the cohort never reports staler-than-TTL registrations. Because a voting window (`patienceMs` 30–300 s) can exceed `provider_ttl` (60–90 s), voters MUST renew to stay listed for the whole window, and the assembled set is a **TTL-bounded snapshot** — a voter that stops renewing may be returned-then-dead between assembly and vote-collection, so the voting layer re-validates liveness on dial. Matchmaking does not "pin" voters.
+- **Resists Sybil at the matchmaking layer**: forging mass registrations is rate-limited to `register_rate_per_peer` per cohort per peer, so cost scales with distinct peer identities, not free registrations; independently, the application's `verifyEligibility` rejects any voter without a valid stake/eligibility proof regardless of how it registered.
+
+### Resolved design decisions (discovery flow)
+
+The discovery flow's plan stage resolved four questions; the implementation reflects them and they hold for downstream voting work:
+
+1. **Eligibility filtering placement → reply-side per-entry verification is the default and required path; a client-side reputation pre-filter is optional and additive.** Voting is correctness-critical and adversarial, so coupling quorum-assembly *liveness* to reputation-subsystem *availability* is unacceptable: reputation must be an optimization (`reputationPrefilter`, applied *before* verification to trim candidates), never a dependency. Matchmaking already forwards each entry's `registrationSig` plus the proof in `capabilities`, so reply-side verification is effectively free; the bandwidth cost of discarding ineligible entries is bounded by `query_limit_max` (256) × swept-cohort-count.
+2. **Flash-vote fairness among competing coordinators → a voting-layer concern; no matchmaking signal is added.** Matchmaking is non-authoritative: it returns an advisory *candidate set*, never an allocation. Multiple coordinators sweeping the same pool all receive overlapping sets; quorum non-collision is decided by the voting protocol. The existing arrival-push FCFS-by-`attachedAt` fan-out governs only the *notification* race for scarce capacity, not quorum allocation.
+3. **No matchmaking protocol additions are needed.** Discovery is fully covered by register / query / sweep / arrival-push. A cohort-attested count of *eligible* voters is out of matchmaking's remit by construction (the cohort does not validate eligibility), so the only attested counts are `AggregateCountV1`'s threshold-signed *registered*-provider buckets; an attested *eligible*-voter count, if voting needs one, is a voting-layer aggregate computed after discovery+verification, not a matchmaking message.
+4. **Quorum-assembler delegation → the seeker role may be held by the coordinator itself or by a delegated assembler peer; whoever holds it owns `patienceMs` and the reply-side re-validation duty.** A delegated assembler returns an already-validated `ProviderEntryV1[]`; because every entry is self-checkable (`registrationSig` + the proof in `capabilities`), the coordinator MAY re-validate on receipt (trust-but-verify) by re-running the verify→select pipeline. The hand-back transport (assembler → coordinator) is a voting-layer RPC, not matchmaking.
 
 The voting protocol itself — ballot privacy, tally aggregation, dispute escalation — is out of scope for this document and will be specified separately. Matchmaking only provides "find the peers."
 
