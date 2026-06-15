@@ -220,6 +220,7 @@ describe('reactivity / origination manager', () => {
 		thresholdSig: new Uint8Array([10, 20, 30]),
 		signers: ['12D3KooWAlice', '12D3KooWBob'],
 		minSigs: 2,
+		signedPayload: new TextEncoder().encode('commit-hash-xyz:approve'),
 	};
 
 	it('installs onLocalCommit and emits a notification reusing the commit cert sig', () => {

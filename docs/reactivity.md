@@ -116,16 +116,18 @@ The direct-subscriber list is the cohort-topic layer's `RegistrationRecord` set 
 
 ## Notification origination
 
-> **Implemented** (`11-reactivity-origination-replay-delivery`). Origination is the pure assembler
+> **Implemented** (`11-reactivity-origination-replay-delivery`,
+> `12.1-reactivity-digest-commit-hash-alignment`). Origination is the pure assembler
 > `buildNotificationV1(event, commitCert, ctx)` in `packages/db-core/src/reactivity/notification.ts`,
 > reusing `commitCert.thresholdSig` **bit-for-bit** (never re-signed). The db-p2p
 > `ReactivityOriginationManager` installs it on `CohortTopicService.onLocalCommit`, fed by the
-> local-change-notifier bridge (`local-change-notifier-bridge`). The `digest` field carries the commit
-> identifier (`event.actionId`); aligning that with the exact threshold-signed commit-hash bytes so a
-> subscriber's *cryptographic* verify over `digest` succeeds against real Ed25519 is the remaining
-> cluster↔reactivity seam (`CommitCert` would expose the signed payload). This networked origination
-> **subsumes** the superseded backlog ticket `optimystic-replica-persist-change-notification` (waking
-> consumers on commit).
+> local-change-notifier bridge (`local-change-notifier-bridge`). The `digest` field carries the
+> commit-vote **signed payload** `commitCert.signedPayload` = `utf8(commitHash + ":approve")`, base64url —
+> the exact bytes each cohort member signed to produce its chunk of `thresholdSig`. A subscriber's
+> *cryptographic* threshold-verify recomputes the cohort check over `b64urlToBytes(digest)`, reproducing
+> that signed image, so it succeeds against **real** Ed25519 (no pass-crypto stub). The cluster↔reactivity
+> seam is **closed**. This networked origination **subsumes** the superseded backlog ticket
+> `optimystic-replica-persist-change-notification` (waking consumers on commit).
 
 When the tail cohort commits a transaction, the commit machinery in the transaction layer ([transactions.md](transactions.md)) already produces a threshold-signed commit certificate. Reactivity reuses that certificate without additional cohort signing:
 
@@ -135,7 +137,7 @@ NotificationV1 {
   collectionId: bytes
   tailId:       bytes
   revision:     uint64
-  digest:       bytes                       // commit digest from the transaction layer
+  digest:       bytes                       // commit-vote signed payload utf8(commitHash + ":approve"); the exact bytes sig was computed over
   delta?:       bytes                       // optional, bounded; opt-in per collection
   timestamp:    int64
   sig:          thresholdSig                // = commit cert; signers ≥ minSigs = k − x

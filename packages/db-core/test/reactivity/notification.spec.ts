@@ -16,10 +16,12 @@ const event: CollectionChangeEvent = {
 };
 
 const thresholdSig = new Uint8Array([10, 20, 30, 40, 50]);
+const signedPayload = new TextEncoder().encode('commit-hash-abc:approve');
 const cert: CommitCert = {
 	thresholdSig,
 	signers: ['12D3KooWAlice', '12D3KooWBob'],
 	minSigs: 2,
+	signedPayload,
 };
 
 const baseCtx = (over: Partial<OriginationContext> = {}): OriginationContext => ({
@@ -33,6 +35,20 @@ describe('reactivity notification origination', () => {
 	it('reuses the commit cert threshold signature bit-for-bit (never re-signs)', () => {
 		const n = buildNotificationV1(event, cert, baseCtx());
 		expect([...b64urlToBytes(n.sig)]).to.deep.equal([...thresholdSig]);
+	});
+
+	it('sets digest from the commit-vote signed payload (the bytes thresholdSig was computed over)', () => {
+		const n = buildNotificationV1(event, cert, baseCtx());
+		expect(n.digest).to.equal(bytesToB64url(signedPayload));
+		// b64urlToBytes(digest) recovers the exact signed image a subscriber threshold-verifies over.
+		expect([...b64urlToBytes(n.digest)]).to.deep.equal([...signedPayload]);
+	});
+
+	it('derives digest from signedPayload independently of event.actionId', () => {
+		const n = buildNotificationV1({ ...event, actionId: 'a-totally-different-action-id' }, cert, baseCtx());
+		// digest tracks the cert preimage, not the transaction id — the two are distinct values.
+		expect(n.digest).to.equal(bytesToB64url(signedPayload));
+		expect(n.digest).to.not.equal(bytesToB64url(new TextEncoder().encode('a-totally-different-action-id')));
 	});
 
 	it('carries collectionId, revision, and tailId from the event/context', () => {

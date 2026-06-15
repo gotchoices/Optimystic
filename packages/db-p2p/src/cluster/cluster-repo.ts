@@ -796,7 +796,16 @@ export class ClusterMember implements ICluster {
 			// Capture the consensus commit cert BEFORE applying to storage: StorageRepo.commit emits the
 			// CollectionChangeEvent synchronously at the end of the call below, and the reactivity bridge
 			// resolves the cert from that event — so it must already be retained when commit() returns.
-			this.captureCommitCert(record, commit.actionId);
+			//
+			// The commit-vote signed preimage is computed HERE, before the synchronous capture+commit
+			// sequence below: it is the exact bytes each approving signer endorsed
+			// (`utf8(commitHash + ":approve")`), reproduced from this already-validated `record` (its
+			// commit signatures were verified against the same `computeCommitHash`). Reactivity sets a
+			// notification's `digest` from it so a subscriber's threshold-verify over `digest` succeeds.
+			// The one `await` happens before `captureCommitCert` runs, so the cert is still retained
+			// synchronously before `commit()` emits its change event (do not move this past the commit).
+			const commitSignedPayload = this.computeSigningPayload(await this.computeCommitHash(record), 'approve');
+			this.captureCommitCert(record, commit.actionId, commitSignedPayload);
 			let result: CommitResult;
 			try {
 				result = await this.storageRepo.commit(commit);
@@ -843,16 +852,21 @@ export class ClusterMember implements ICluster {
 	/**
 	 * Record the consensus commit cert for `actionId` into the injected {@link CommitCertificateSink},
 	 * if one is wired. The cert is built from the agreed `record.commits` (the per-member `approve`
-	 * commit signatures), forwarded UNCHANGED for reactivity to reuse. No-op (zero cost) when no sink
-	 * is configured; a throwing sink is isolated + logged so it can never break consensus.
+	 * commit signatures), forwarded UNCHANGED for reactivity to reuse. `signedPayload` is the exact
+	 * commit-vote preimage those signatures were produced over (`utf8(commitHash + ":approve")`),
+	 * computed by the caller from the same `record` *before* the synchronous commit — reactivity sets a
+	 * notification's `digest` from it so a real threshold-verify over `digest` succeeds. Stays
+	 * **synchronous** (no `await` here) so the cert is retained before `StorageRepo.commit` emits its
+	 * change event. No-op (zero cost) when no sink is configured; a throwing sink is isolated + logged so
+	 * it can never break consensus.
 	 */
-	private captureCommitCert(record: ClusterRecord, actionId: ActionId): void {
+	private captureCommitCert(record: ClusterRecord, actionId: ActionId, signedPayload: Uint8Array): void {
 		if (!this.onCommitCertificate) {
 			return;
 		}
 		const minSigs = Math.ceil(Object.keys(record.peers).length * this.superMajorityThreshold);
 		try {
-			this.onCommitCertificate(actionId, buildCommitCert(record, minSigs));
+			this.onCommitCertificate(actionId, buildCommitCert(record, minSigs, signedPayload));
 		} catch (err) {
 			log('cluster-member:commit-cert-sink-error', { actionId, error: (err as Error).message });
 		}

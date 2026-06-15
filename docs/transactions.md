@@ -1394,8 +1394,12 @@ The cohort-topic **reactivity notifications** layered on top (see `docs/reactivi
 new authority. A notification's signature is **bit-for-bit the commit certificate's threshold
 signature** (`CommitCert.thresholdSig`) — reactivity **reuses** it and **never re-signs**. The local
 change-notifier bridge (`local-change-notifier-bridge`) forwards the commit cert into the origination
-hook unchanged (`CommitCert { thresholdSig, signers, minSigs }`), and every forwarder relays it
-unmodified. Consequences:
+hook unchanged (`CommitCert { thresholdSig, signers, minSigs, signedPayload }`), and every forwarder
+relays it unmodified. The cert also carries `signedPayload` — the exact preimage of that threshold
+signature, the per-member commit-vote bytes `utf8(commitHash + ":approve")` — and reactivity sets
+`NotificationV1.digest` to its base64url so a subscriber's threshold-verify recomputes the cohort check
+over exactly those bytes (`commitHash = base64url(sha256(messageHash ‖ canonicalJson(message) ‖
+canonicalJson(promises)))`). Consequences:
 - A subscriber that misses or distrusts a notification loses nothing it cannot recover by reading the
   authoritative committed state directly — notifications accelerate, they never gate.
 - A compromised forwarder can drop or delay a notification but **cannot forge** one: it would have to

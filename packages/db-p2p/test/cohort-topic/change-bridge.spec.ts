@@ -61,6 +61,7 @@ describe('cohort-topic: local change-notifier bridge', () => {
 		thresholdSig: Uint8Array.from([9, 8, 7, 6, 5, 4, 3, 2, 1, 0]),
 		signers: ['peer-A', 'peer-B'],
 		minSigs: 2,
+		signedPayload: new TextEncoder().encode('hash-1:approve'),
 	});
 
 	it('a commit on a cohort-member node invokes onLocalCommit with the right collectionId/rev', async () => {
@@ -124,6 +125,8 @@ describe('cohort-topic: local change-notifier bridge', () => {
 		expect(Array.from(received!.thresholdSig)).to.deep.equal(Array.from(sigCopy));
 		expect(received!.signers).to.deep.equal(['peer-A', 'peer-B']);
 		expect(received!.minSigs).to.equal(2);
+		// signedPayload (the commit-vote preimage reactivity sets digest from) also passes through unchanged.
+		expect(Array.from(received!.signedPayload)).to.deep.equal([...new TextEncoder().encode('hash-1:approve')]);
 	});
 
 	it('a throwing downstream hook does not break the commit', async () => {
@@ -220,17 +223,21 @@ describe('cohort-topic: cluster commit-cert extraction', () => {
 			'peer-C': { type: 'reject', signature: sigB64([0xCC]), rejectReason: 'nope' },
 		}, ['peer-A', 'peer-B', 'peer-C']);
 
-		const cert = buildCommitCert(record, 2);
+		const payload = new TextEncoder().encode('hash-1:approve');
+		const cert = buildCommitCert(record, 2, payload);
 
 		expect(cert.signers, 'reject excluded, ascending order').to.deep.equal(['peer-A', 'peer-B']);
 		// thresholdSig = decode(A) ++ decode(B) aligned with signers[i] ↔ chunk i.
 		expect(Array.from(cert.thresholdSig)).to.deep.equal([0xAA, 0xAA, 0xBB, 0xBB]);
 		expect(cert.minSigs).to.equal(2);
+		// The caller-supplied commit-vote preimage rides through unchanged (reactivity's digest source).
+		expect(cert.signedPayload, 'same bytes object the caller supplied').to.equal(payload);
+		expect(Array.from(cert.signedPayload)).to.deep.equal([...new TextEncoder().encode('hash-1:approve')]);
 	});
 
 	it('CommitCertStore: put/get round-trips, TTL-expires, and bounds entries', () => {
 		const store = createCommitCertStore({ ttlMs: 1_000, maxEntries: 2 });
-		const cert = (n: number): CommitCert => ({ thresholdSig: Uint8Array.from([n]), signers: [`p${n}`], minSigs: 1 });
+		const cert = (n: number): CommitCert => ({ thresholdSig: Uint8Array.from([n]), signers: [`p${n}`], minSigs: 1, signedPayload: Uint8Array.from([n]) });
 
 		store.put('a1' as ActionId, cert(1), 0);
 		expect(store.get('a1' as ActionId, 500)).to.deep.equal(cert(1));
@@ -247,7 +254,7 @@ describe('cohort-topic: cluster commit-cert extraction', () => {
 
 	it('makeClusterCommitCertExtractor: resolves the cert for a change event, undefined when absent', () => {
 		const store = createCommitCertStore();
-		const cert: CommitCert = { thresholdSig: Uint8Array.from([1, 2, 3]), signers: ['p'], minSigs: 1 };
+		const cert: CommitCert = { thresholdSig: Uint8Array.from([1, 2, 3]), signers: ['p'], minSigs: 1, signedPayload: Uint8Array.from([4, 5, 6]) };
 		store.put('a1' as ActionId, cert);
 		const extract = makeClusterCommitCertExtractor(store);
 
@@ -272,7 +279,7 @@ describe('cohort-topic: cluster commit-cert extraction', () => {
 			'peer-A': { type: 'approve', signature: sigB64([0x11, 0x22]) },
 			'peer-B': { type: 'approve', signature: sigB64([0x33, 0x44]) },
 		}, ['peer-A', 'peer-B']);
-		const expected = buildCommitCert(record, 2);
+		const expected = buildCommitCert(record, 2, new TextEncoder().encode('hash-1:approve'));
 		store.put('a1' as ActionId, expected);
 
 		const service = stubService();

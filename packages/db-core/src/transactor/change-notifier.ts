@@ -31,6 +31,14 @@ export type CommitCert = {
 	readonly signers: readonly string[];
 	/** Threshold the signer set satisfies (the cluster super-majority / cohort `k − x`). */
 	readonly minSigs: number;
+	/**
+	 * The exact byte preimage each `signers[i]` signed to produce its 64-byte chunk of
+	 * {@link thresholdSig} — the cluster's per-member commit-vote payload `utf8(commitHash + ":approve")`,
+	 * identical across all approving signers. Reactivity sets a notification's `digest` to
+	 * base64url(signedPayload) so a subscriber's threshold-verify over `digest` reproduces the exact
+	 * signed image. Opaque to db-core; minted only by the cluster layer.
+	 */
+	readonly signedPayload: Uint8Array;
 };
 
 export interface IBlockChangeNotifier {

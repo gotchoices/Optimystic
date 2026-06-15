@@ -12,15 +12,21 @@ const log = createLogger('commit-cert');
  * signer-id order, so the blob is reproducible and `signers[i]` aligns with chunk `i` (the
  * collected-multisig convention the cohort-topic verifier uses). This is the **authoritative**
  * commit cert: reactivity reuses these exact bytes as a notification's signature and never re-signs.
- * Pure.
+ *
+ * `signedPayload` is the exact byte preimage every approving member signed — the cluster commit-vote
+ * payload `utf8(commitHash + ":approve")`, identical across signers. The caller supplies it (this stays
+ * pure and does **not** recompute the commit hash, since the canonical-JSON helper that derives it is
+ * private to `ClusterMember` and duplicating it here risks drift). Reactivity sets a notification's
+ * `digest` to base64url(signedPayload) so a subscriber's threshold-verify over `digest` reproduces the
+ * exact signed image. Pure.
  */
-export function buildCommitCert(record: ClusterRecord, minSigs: number): CommitCert {
+export function buildCommitCert(record: ClusterRecord, minSigs: number, signedPayload: Uint8Array): CommitCert {
 	const approvals = Object.entries(record.commits)
 		.filter(([, sig]) => sig.type === 'approve')
 		.sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0));
 	const signers = approvals.map(([peerId]) => peerId);
 	const thresholdSig = concatBytes(approvals.map(([, sig]) => uint8ArrayFromString(sig.signature, 'base64url')));
-	return { thresholdSig, signers, minSigs };
+	return { thresholdSig, signers, minSigs, signedPayload };
 }
 
 function concatBytes(parts: readonly Uint8Array[]): Uint8Array {

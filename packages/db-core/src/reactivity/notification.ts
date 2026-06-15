@@ -48,12 +48,13 @@ export interface OriginationContext {
  * Assemble the {@link NotificationV1} for one committed change, reusing the commit cert's threshold
  * signature unchanged.
  *
- * `digest` carries the commit identifier from the transaction layer (`event.actionId`, encoded
- * base64url). The threshold signature in `commitCert` is the cluster's per-member commit votes over the
- * commit hash; aligning that signed-hash byte image with this `digest` so a subscriber's *cryptographic*
- * threshold-verify over `digest` succeeds is the cluster↔reactivity integration seam (the cluster
- * `CommitCert` would expose the signed payload). The hint-only contract holds regardless: the digest is
- * the authoritative commit identifier, deltas are advisory.
+ * `digest` carries the commit-vote **signed payload** the threshold signature was computed over —
+ * `commitCert.signedPayload`, the cluster's per-member `utf8(commitHash + ":approve")` byte image,
+ * identical across all approving signers. Because the verifier recomputes the cohort threshold check over
+ * exactly these bytes (`payload = b64urlToBytes(n.digest)`), a subscriber's **real** Ed25519
+ * threshold-verify over `digest` reproduces the signed image and succeeds — the cluster↔reactivity
+ * integration seam is **closed** (no pass-crypto stub required). The hint-only contract still holds for
+ * the optional `delta`: deltas are advisory; the digest + threshold signature are the authoritative proof.
  */
 export function buildNotificationV1(event: CollectionChangeEvent, commitCert: CommitCert, ctx: OriginationContext): NotificationV1 {
 	const encodeSigner = ctx.encodeSigner ?? ((s: string): string => s);
@@ -62,7 +63,7 @@ export function buildNotificationV1(event: CollectionChangeEvent, commitCert: Co
 		collectionId: event.collectionId,
 		tailId: ctx.tailId,
 		revision: event.rev,
-		digest: bytesToB64url(utf8.encode(event.actionId)),
+		digest: bytesToB64url(commitCert.signedPayload),
 		timestamp: ctx.timestamp,
 		sig: bytesToB64url(commitCert.thresholdSig),
 		signers: commitCert.signers.map(encodeSigner),

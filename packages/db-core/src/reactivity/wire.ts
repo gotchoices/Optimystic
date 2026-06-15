@@ -78,7 +78,11 @@ export interface NotificationV1 {
 	tailId: string;
 	/** Per-collection monotonic revision. */
 	revision: number;
-	/** Commit digest from the transaction layer, base64url. */
+	/**
+	 * The commit-vote **signed payload** `utf8(commitHash + ":approve")`, base64url — the exact bytes the
+	 * threshold signature {@link sig} was computed over. A subscriber threshold-verifies {@link sig} over
+	 * `b64urlToBytes(digest)`, so this reproduces the signed image against real Ed25519.
+	 */
 	digest: string;
 	/** Optional bounded delta, base64url; omitted when `delta_max == 0` or the collection declines it. */
 	delta?: string;

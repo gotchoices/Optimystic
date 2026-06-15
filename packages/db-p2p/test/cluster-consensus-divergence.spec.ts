@@ -446,6 +446,11 @@ describe('ClusterMember commit-certificate capture (reactivity origination feed)
 		expect(captured[0]!.cert.signers).to.include(other.peerId.toString());
 		// The threshold blob is the concatenated Ed25519 commit signatures (64 bytes each) — non-empty, never re-signed.
 		expect(captured[0]!.cert.thresholdSig.length, 'two concatenated Ed25519 commit signatures').to.equal(128);
+		// signedPayload is the exact commit-vote preimage the signers endorsed: utf8(commitHash + ":approve").
+		// computeCommitHash depends only on messageHash+message+promises (not commits), so it equals the
+		// hash `other` signed in buildConsensusCommitRecord — reactivity sets digest from these bytes.
+		const expectedSignedPayload = new TextEncoder().encode((await computeCommitHash(record)) + ':approve');
+		expect(Array.from(captured[0]!.cert.signedPayload), 'signedPayload = utf8(commitHash:approve)').to.deep.equal([...expectedSignedPayload]);
 	});
 
 	it('does not assemble a cert when no sink is wired (zero-cost default)', async () => {

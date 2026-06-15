@@ -13,13 +13,15 @@
  * resolve, decided here:
  *
  *  - **`mergedDigest` semantics (resolved → system-level deterministic fold, per-collection override).**
- *    `NotificationV1.digest` carries the transaction layer's commit identifier (see
- *    `docs/transactions.md`). The default `mergedDigest` is a deterministic running fold over the
- *    per-revision commit digests in revision order ({@link defaultDigestFold}) — every cohort member
- *    computes the same bytes, so it converges under gossip and the application can compare it against its
- *    own expectation. A collection MAY override the fold ({@link RollingCheckpointInit.fold}, e.g. a KV
- *    collection folding changed-key sets). The merged digest is **not** cryptographically verified — it
- *    is a hint; the cryptographic anchor is the bracketing endpoints (below).
+ *    `NotificationV1.digest` carries the commit-vote signed payload `utf8(commitHash + ":approve")` —
+ *    the exact bytes the commit threshold signature was computed over (see
+ *    `packages/db-core/src/reactivity/notification.ts`). It is per-revision deterministic and identical
+ *    across cohort members, so the default `mergedDigest` — a deterministic running fold over the
+ *    per-revision digests in revision order ({@link defaultDigestFold}) — converges under gossip and the
+ *    application can compare it against its own expectation. A collection MAY override the fold
+ *    ({@link RollingCheckpointInit.fold}, e.g. a KV collection folding changed-key sets). The merged
+ *    digest is **not** cryptographically verified — it is a hint; the cryptographic anchor is the
+ *    bracketing endpoints (below).
  *
  *  - **`mergedDelta` vs `delta_max` (resolved → omit when oversize, never split).** The per-revision
  *    deltas are coalesced ({@link RollingCheckpointInit.coalesceDeltas}, default concatenation) only when
