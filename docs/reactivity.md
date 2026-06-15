@@ -146,7 +146,7 @@ NotificationV1 {
 }
 ```
 
-The `sig` field is bit-for-bit the same threshold signature the transaction layer produces. A subscriber that already trusts the transaction-layer machinery (which it must, to trust the collection at all) automatically trusts notifications without additional verifiers.
+The `sig` field is bit-for-bit the same threshold signature the transaction layer produces. A subscriber cryptographically threshold-verifies it against the tail cohort's membership — the same trust root it must already accept to trust the collection at all — over `b64urlToBytes(digest)`, the exact `utf8(commitHash + ":approve")` image each cohort member signed. So notifications introduce **no new signing authority** beyond the commit certificate, yet are not trusted blindly: the verify runs against real Ed25519 (see [Authentication and integrity](#authentication-and-integrity)).
 
 ### Origination point
 

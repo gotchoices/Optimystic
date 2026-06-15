@@ -804,8 +804,12 @@ export class ClusterMember implements ICluster {
 			// notification's `digest` from it so a subscriber's threshold-verify over `digest` succeeds.
 			// The one `await` happens before `captureCommitCert` runs, so the cert is still retained
 			// synchronously before `commit()` emits its change event (do not move this past the commit).
-			const commitSignedPayload = this.computeSigningPayload(await this.computeCommitHash(record), 'approve');
-			this.captureCommitCert(record, commit.actionId, commitSignedPayload);
+			// Gated on the sink: with no reactivity wired the preimage has no consumer, so a sink-less
+			// node pays neither the extra `sha256` nor the extra microtask — the true zero-cost default.
+			if (this.onCommitCertificate) {
+				const commitSignedPayload = this.computeSigningPayload(await this.computeCommitHash(record), 'approve');
+				this.captureCommitCert(record, commit.actionId, commitSignedPayload);
+			}
 			let result: CommitResult;
 			try {
 				result = await this.storageRepo.commit(commit);
