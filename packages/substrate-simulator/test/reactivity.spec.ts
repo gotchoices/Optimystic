@@ -109,7 +109,7 @@ describe('reactivity — resume classification (one-RPC backfill)', () => {
 		expect(trace.latency).to.equal(DEFAULT_RESUME_COST.roundTripMs);
 	});
 
-	it('W ≤ lag < W_checkpoint resolves as CheckpointWindow in one RPC', () => {
+	it('W ≤ lag < W + W_checkpoint resolves as CheckpointWindow in one RPC', () => {
 		const trace = traceResume({ ...base, currentRevision: 5000, fromRevision: 5000 - C.W });
 		expect(trace.kind, 'lag == W is the checkpoint boundary').to.equal('CheckpointWindow');
 		expect(trace.rpcCount, 'one checkpoint RPC').to.equal(1);
@@ -118,8 +118,39 @@ describe('reactivity — resume classification (one-RPC backfill)', () => {
 		expect(deep.kind, 'lag just under W_checkpoint still checkpoint').to.equal('CheckpointWindow');
 	});
 
-	it('lag ≥ W_checkpoint falls to a chain read (OutOfWindow)', () => {
-		const trace = traceResume({ ...base, currentRevision: 9000, fromRevision: 9000 - C.Wcheckpoint });
+	it('classifyResume cutover aligns with RollingCheckpoint.covers at the layered bound', () => {
+		const rev = 9000;
+		// Boundary cases built from config — never hard-coded — so they track config changes.
+		const cases: Array<[number, string]> = [
+			[C.Wcheckpoint - 1, 'CheckpointWindow'],
+			[C.Wcheckpoint,     'CheckpointWindow'], // regression guard: was OutOfWindow before fix
+			[C.W + C.Wcheckpoint - 1, 'CheckpointWindow'],
+			[C.W + C.Wcheckpoint,     'OutOfWindow'],
+		];
+		for (const [lag, expected] of cases) {
+			const kind = classifyResume({ ...base, currentRevision: rev, fromRevision: rev - lag });
+			expect(kind, `lag ${lag} → ${expected}`).to.equal(expected);
+		}
+
+		// The deepest still-in-window lag (W + Wcheckpoint - 1) must equal the deepest lag that
+		// RollingCheckpoint.covers at steady state — so the two never drift apart again.
+		const state = new CohortPushState(C);
+		const total = C.W + C.Wcheckpoint + 100;
+		for (let r = 1; r <= total; r++) {
+			state.ingest(r, `d${r}`, r);
+		}
+		const ringLow = state.replay.lowestRevision()!;
+		// The checkpoint covers [ringLow - Wcheckpoint, ringLow - 1], deepest lag from ringLow + W - 1
+		// (the current head) is (ringLow + W - 1) - (ringLow - Wcheckpoint) = W + Wcheckpoint - 1.
+		const deepestCovered = state.checkpoint.covers(ringLow - C.Wcheckpoint) ? ringLow - C.Wcheckpoint : -1;
+		const currentHead = ringLow + C.W - 1;
+		const deepestLagCovered = deepestCovered >= 0 ? currentHead - deepestCovered : -1;
+		expect(deepestLagCovered, 'RollingCheckpoint deepest lag matches classifier upper bound - 1')
+			.to.equal(C.W + C.Wcheckpoint - 1);
+	});
+
+	it('lag ≥ W + W_checkpoint falls to a chain read (OutOfWindow)', () => {
+		const trace = traceResume({ ...base, currentRevision: 9000, fromRevision: 9000 - (C.W + C.Wcheckpoint) });
 		expect(trace.kind).to.equal('OutOfWindow');
 		expect(trace.rpcCount, 'resume + chain read').to.be.greaterThan(1);
 		expect(trace.latency, 'includes chain-read cost')

@@ -24,12 +24,11 @@ import { expectedDepth, uniformLadder } from './promotion-convergence.js';
  * (a reactivity forwarder cohort *is* a promoted topic cohort; rotation re-registration drives the
  * same promotion machinery) on the virtual clock.
  *
- * Modeling note — resume thresholds. `docs/reactivity.md` layers the checkpoint *span* on top of
- * the replay buffer (recoverable ≈ `W + W_checkpoint`). This model follows the ticket's
- * `ResumeKind` definition instead, which treats `W` and `W_checkpoint` as the two absolute lag
- * bounds (`lag < W` → backfill, `W ≤ lag < W_checkpoint` → checkpoint, `lag ≥ W_checkpoint` →
- * chain read). With `W_checkpoint = 4096` the difference is in the noise of the ratio question this
- * model exists to inform, and the single-bound form is what the classification tests assert.
+ * Modeling note — resume thresholds. The classifier follows the layered/stacked form from
+ * `docs/reactivity.md`: `lag < W` → Backfill (ring covers it), `W ≤ lag < W + W_checkpoint` →
+ * CheckpointWindow (parent checkpoint covers it), else OutOfWindow (chain read required). This
+ * matches `RollingCheckpoint.covers`, whose deepest in-window lag at steady state is
+ * `W + W_checkpoint − 1`.
  */
 
 // --- configuration -----------------------------------------------------------
@@ -38,7 +37,7 @@ import { expectedDepth, uniformLadder } from './promotion-convergence.js';
 export interface ReactivityConfig {
 	/** Replay ring-buffer depth, revisions per cohort per collection. */
 	readonly W: number;
-	/** Parent-checkpoint span (revisions); the absolute recoverable lag bound in this model. */
+	/** Parent-checkpoint span (revisions) layered immediately below the replay ring; the combined recoverable bound is `W + Wcheckpoint`. */
 	readonly Wcheckpoint: number;
 	/** Sliding `(revision, sigDigest)` dedupe-window size. */
 	readonly dedupeWindow: number;
@@ -324,7 +323,7 @@ export function classifyResume(input: ResumeInput, config: ReactivityConfig = DE
 	if (lag < config.W) {
 		return 'Backfill';
 	}
-	if (lag < config.Wcheckpoint) {
+	if (lag < config.W + config.Wcheckpoint) {
 		return 'CheckpointWindow';
 	}
 	return 'OutOfWindow';
