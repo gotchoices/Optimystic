@@ -457,16 +457,20 @@ export class NetworkTransactor implements ITransactor, IBlockChangeNotifier {
 		log('commit actionId=%s rev=%d blockIds=%d', request.actionId, request.rev, request.blockIds.length);
 		const allBlockIds = [...new Set([...request.blockIds, request.tailId])];
 
-		// Commit the header block if provided and not already in blockIds
+		// Commit the header block if provided and not already in blockIds.
+		// `request.tailId` is threaded into every per-block commit so the coordinator carries it into the
+		// consensus commit op → each committing node's StorageRepo.commit stamps it onto the emitted
+		// CollectionChangeEvent (the reactivity topic anchor). Without this the per-block RepoCommitRequest
+		// drops the collection tail and reactivity origination is gated off (undefined tail → non-member).
 		if (request.headerId && !request.blockIds.includes(request.headerId)) {
-			const headerResult = await this.commitBlock(request.headerId, allBlockIds, request.actionId, request.rev);
+			const headerResult = await this.commitBlock(request.headerId, allBlockIds, request.actionId, request.rev, request.tailId);
 			if (!headerResult.success) {
 				return headerResult;
 			}
 		}
 
 		// Commit the tail block
-		const tailResult = await this.commitBlock(request.tailId, allBlockIds, request.actionId, request.rev);
+		const tailResult = await this.commitBlock(request.tailId, allBlockIds, request.actionId, request.rev, request.tailId);
 		if (!tailResult.success) {
 			return tailResult;
 		}
@@ -477,7 +481,7 @@ export class NetworkTransactor implements ITransactor, IBlockChangeNotifier {
 			!(request.headerId && bid === request.headerId && !request.blockIds.includes(request.headerId))
 		);
 		if (remainingBlocks.length > 0) {
-			const { error } = await this.commitBlocks({ blockIds: remainingBlocks, actionId: request.actionId, rev: request.rev });
+			const { error } = await this.commitBlocks({ blockIds: remainingBlocks, actionId: request.actionId, rev: request.rev, tailId: request.tailId });
 			if (error) {
 				// Non-tail block commit failures should not fail the overall action once the tail has committed.
 				// Proceed and rely on reconciliation paths (e.g. reads with context) to finalize state on lagging peers.
@@ -489,8 +493,8 @@ export class NetworkTransactor implements ITransactor, IBlockChangeNotifier {
 		return { success: true };
 	}
 
-	private async commitBlock(blockId: BlockId, blockIds: BlockId[], actionId: ActionId, rev: number): Promise<CommitResult> {
-		const { batches: tailBatches, error: tailError } = await this.commitBlocks({ blockIds: [blockId], actionId, rev });
+	private async commitBlock(blockId: BlockId, blockIds: BlockId[], actionId: ActionId, rev: number, tailId?: BlockId): Promise<CommitResult> {
+		const { batches: tailBatches, error: tailError } = await this.commitBlocks({ blockIds: [blockId], actionId, rev, tailId });
 		if (tailError) {
 			// Cancel all pending actions as background microtask
 			Promise.resolve().then(() => this.cancel({ blockIds, actionId }));
@@ -505,7 +509,7 @@ export class NetworkTransactor implements ITransactor, IBlockChangeNotifier {
 	}
 
 	/** Attempts to commit a set of blocks, and handles failures and errors */
-	private async commitBlocks({ blockIds, actionId, rev }: RepoCommitRequest) {
+	private async commitBlocks({ blockIds, actionId, rev, tailId }: RepoCommitRequest) {
 		const expiration = Date.now() + this.timeoutMs;
 		const batches = await this.batchesForPayload<BlockId[], CommitResult>(blockIds, blockIds, mergeBlocks, []);
 		log('commitBlocks actionId=%s rev=%d batches=%d', actionId, rev, batches.length);
@@ -513,7 +517,7 @@ export class NetworkTransactor implements ITransactor, IBlockChangeNotifier {
 		try {
 			await processBatches(
 				batches,
-				(batch) => this.getRepo(batch.peerId).commit({ actionId, blockIds: batch.payload, rev }, { expiration, dialTimeoutMs: this.dialTimeoutMs }),
+				(batch) => this.getRepo(batch.peerId).commit({ actionId, blockIds: batch.payload, rev, tailId }, { expiration, dialTimeoutMs: this.dialTimeoutMs }),
 				batch => batch.payload,
 				mergeBlocks,
 				expiration,

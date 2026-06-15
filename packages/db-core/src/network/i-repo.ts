@@ -19,6 +19,15 @@ export type RepoCommitRequest = {
 	blockIds: BlockId[];
 	actionId: ActionId;
 	rev: number;
+	/**
+	 * The collection's chain tail block id (the {@link CommitRequest.tailId}). Optional on the per-block
+	 * repo operation: the transactor threads the committing collection's tail through every per-block
+	 * commit so the coordinator carries it into the consensus commit op, letting the committing node's
+	 * `StorageRepo.commit` stamp it onto the emitted `CollectionChangeEvent` (the reactivity topic anchor
+	 * `H(tailId ‖ "reactivity")`). Absent on bare per-block paths (e.g. churn replication), which never
+	 * originate reactivity.
+	 */
+	tailId?: BlockId;
 };
 
 export type IRepo = {

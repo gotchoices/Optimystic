@@ -83,15 +83,19 @@ export class StorageRepo implements IRepo, IBlockChangeNotifier, IBlockReplicaSt
 	 * fire-and-forget synchronous; a throwing listener is isolated and logged. Each event reaches
 	 * both that collection's {@link onCollectionChange} subscribers and every
 	 * {@link onAnyCollectionChange} catch-all subscriber.
+	 *
+	 * `tailId` is the `CommitRequest.tailId` on the commit path; `undefined` on read-driven
+	 * promotions (the get/emitPromotions path has no commit request). A single commit is for one
+	 * collection's chain in practice, so all events from one commit share the same `tailId`.
 	 */
-	private emitCollectionChanges(collectionBlocks: Map<CollectionId, BlockId[]>, actionId: ActionId, rev: number): void {
+	private emitCollectionChanges(collectionBlocks: Map<CollectionId, BlockId[]>, actionId: ActionId, rev: number, tailId?: BlockId): void {
 		const hasCatchAll = this.anyChangeListeners.size > 0;
 		for (const [collectionId, blockIds] of collectionBlocks) {
 			const listeners = this.changeListeners.get(collectionId);
 			if ((!listeners || listeners.size === 0) && !hasCatchAll) {
 				continue;
 			}
-			const event: CollectionChangeEvent = { collectionId, blockIds, actionId, rev };
+			const event: CollectionChangeEvent = { collectionId, blockIds, actionId, rev, tailId };
 			if (listeners && listeners.size > 0) {
 				this.fireChangeListeners(listeners, event);
 			}
@@ -430,7 +434,7 @@ export class StorageRepo implements IRepo, IBlockChangeNotifier, IBlockReplicaSt
 		// Notify after the critical section, for every block newly committed here —
 		// including those that landed before a mid-loop failure (alreadyDone / stale
 		// partitions never reach `collectionBlocks`).
-		this.emitCollectionChanges(collectionBlocks, request.actionId, request.rev);
+		this.emitCollectionChanges(collectionBlocks, request.actionId, request.rev, request.tailId);
 
 		return failure ? { success: false, reason: failure.reason } : { success: true };
 	}

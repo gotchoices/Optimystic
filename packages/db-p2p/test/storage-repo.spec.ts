@@ -585,6 +585,8 @@ describe('StorageRepo', () => {
 			expect(events[0]!.blockIds).to.deep.equal(['block-1']);
 			expect(events[0]!.actionId).to.equal('a1');
 			expect(events[0]!.rev).to.equal(1);
+			// Seam: the commit-path event carries the CommitRequest.tailId (anchors the reactivity topic).
+			expect(events[0]!.tailId).to.equal('block-1');
 		});
 
 		it('does not notify a subscriber for a different collection', async () => {
@@ -728,6 +730,8 @@ describe('StorageRepo', () => {
 			expect(events[0]!.blockIds).to.deep.equal(['block-1']);
 			expect(events[0]!.actionId).to.equal('a1');
 			expect(events[0]!.rev).to.equal(1);
+			// Seam: a read-driven promotion has no commit request, so the event carries no tail id.
+			expect(events[0]!.tailId).to.equal(undefined);
 
 			// A later contextless get() finds the block already promoted — no new
 			// landing — so it must NOT re-emit.

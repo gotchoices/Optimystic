@@ -3,11 +3,12 @@ import { toString as uint8ArrayToString } from 'uint8arrays';
 import { StorageRepo } from '../../src/storage/storage-repo.js';
 import { BlockStorage } from '../../src/storage/block-storage.js';
 import { MemoryRawStorage } from '../../src/storage/memory-storage.js';
-import { makeCohortTopicChangeNotifier } from '../../src/cohort-topic/change-bridge.js';
+import { makeCohortTopicChangeNotifier, attachCohortChangeBridge } from '../../src/cohort-topic/change-bridge.js';
 import { buildCommitCert, createCommitCertStore, makeClusterCommitCertExtractor } from '../../src/cluster/commit-cert.js';
 import type {
 	BlockId, ActionId, IBlock, BlockHeader, Transforms, CollectionId,
 	CollectionChangeEvent, CommitCert, CohortTopicService, ClusterRecord, ClusterPeers, Signature,
+	IBlockChangeNotifier,
 } from '@optimystic/db-core';
 
 const makeHeader = (id: string, collectionId = 'collection-1'): BlockHeader => ({
@@ -73,7 +74,7 @@ describe('cohort-topic: local change-notifier bridge', () => {
 		makeCohortTopicChangeNotifier({
 			source: repo,
 			service,
-			selfIsCohortMember: (c: CollectionId): boolean => c === ('collection-1' as CollectionId),
+			selfIsCohortMember: (e): boolean => e.collectionId === ('collection-1' as CollectionId),
 			extractCommitCert: (): CommitCert => cert,
 		});
 
@@ -84,6 +85,63 @@ describe('cohort-topic: local change-notifier bridge', () => {
 		expect(calls[0]!.event.blockIds).to.deep.equal(['block-1']);
 		expect(calls[0]!.event.actionId).to.equal('a1');
 		expect(calls[0]!.event.rev).to.equal(1);
+	});
+
+	it('gates on the whole event — the predicate receives event.tailId (the seam)', async () => {
+		const service = stubService();
+		const calls: CollectionChangeEvent[] = [];
+		service.onLocalCommit = (event): void => { calls.push(event); };
+
+		// Member only when the event carries the expected committed tail — proves the gate sees event.tailId.
+		const seenTails: (BlockId | undefined)[] = [];
+		makeCohortTopicChangeNotifier({
+			source: repo,
+			service,
+			selfIsCohortMember: (e): boolean => { seenTails.push(e.tailId); return e.tailId === ('block-1' as BlockId); },
+			extractCommitCert: (): CommitCert => sampleCert(),
+		});
+
+		await pendAndCommit('a1', makeBlock('block-1'), 1);
+
+		expect(seenTails, 'gate observed the committed tail id').to.deep.equal(['block-1']);
+		expect(calls.length, 'origination fired for the tail-matching event').to.equal(1);
+		expect(calls[0]!.tailId).to.equal('block-1');
+	});
+
+	it('attachCohortChangeBridge installs the notifier and returns a working unsubscribe', async () => {
+		const service = stubService();
+		const calls: CollectionChangeEvent[] = [];
+		service.onLocalCommit = (event): void => { calls.push(event); };
+
+		const node: { blockChangeNotifier?: IBlockChangeNotifier } = {};
+		const { notifier, unsubscribe } = attachCohortChangeBridge(node, {
+			source: repo,
+			service,
+			selfIsCohortMember: (): boolean => true,
+			extractCommitCert: (): CommitCert => sampleCert(),
+		});
+
+		// The bridge is installed on the node — the value NetworkTransactor captures as localChangeNotifier.
+		expect(node.blockChangeNotifier).to.equal(notifier);
+
+		// Per-collection delegation works through the decorator.
+		const seen: CollectionChangeEvent[] = [];
+		const unsubCollection = notifier.onCollectionChange('collection-1' as CollectionId, (e) => seen.push(e));
+
+		await pendAndCommit('a1', makeBlock('block-1'), 1);
+		expect(calls.length, 'origination fired before teardown').to.equal(1);
+		expect(seen.length, 'per-collection subscriber fired via delegation').to.equal(1);
+
+		// Tear down the catch-all origination feed: subsequent commits no longer originate...
+		unsubscribe();
+		await pendAndCommit('a2', makeBlock('block-2'), 1);
+		expect(calls.length, 'no origination after unsubscribe').to.equal(1);
+		// ...but the per-collection delegation is untouched (it lives on the StorageRepo, not the bridge).
+		expect(seen.length, 'per-collection delegation survives catch-all teardown').to.equal(2);
+
+		// Idempotent.
+		expect(() => unsubscribe()).to.not.throw();
+		unsubCollection();
 	});
 
 	it('a non-member commit is a no-op (this node owns no fan-out for the topic)', async () => {

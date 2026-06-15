@@ -132,7 +132,8 @@ ClusterMember.handleConsensus            # consensus reached on a commit op
   → storageRepo.commit(...)              # critical section; emits CollectionChangeEvent at the end
 StorageRepo.onAnyCollectionChange        # catch-all feed (every collection, not per-id)
   → makeCohortTopicChangeNotifier        # the bridge (cohort-topic/change-bridge.ts)
-     → selfIsCohortMember(collectionId)? # non-member → no-op (no fan-out responsibility here)
+     → selfIsCohortMember(event)?        # non-member / tail-less event → no-op; reads event.tailId to
+                                         #   resolve coord_0(H(tailId ‖ "reactivity")) and check FRET cohort
      → extractCommitCert(event)          # makeClusterCommitCertExtractor → CommitCertStore.get
      → CohortTopicService.onLocalCommit(event, commitCert)   # reactivity originates from here
 ```
@@ -156,15 +157,26 @@ StorageRepo.onAnyCollectionChange        # catch-all feed (every collection, not
   its `onCollectionChange` delegates straight to the `StorageRepo`, so the Quereus
   reactive-watch path above keeps working unchanged. Origination runs independently on
   the catch-all feed, regardless of whether anyone subscribed per-collection.
-- **Wiring status.** The bridge mechanism, the `CommitCertStore`/extractor, and the
-  `onCommitCertificate` capture seam (a node-base option threaded to `ClusterMember`) are
-  in place and unit-tested. Activation is opt-in: a node assembly that runs the
-  cohort-topic substrate calls `attachCohortChangeBridge(node, …)` once a
-  `CohortTopicService` is live on the node. The production node (`libp2p-node-base.ts`)
-  does not yet construct that service, so origination is dormant there until the
-  cohort-host node-wiring lands; reactivity (`reactivity-origination-replay-delivery`) is
-  the consumer that sets `onLocalCommit` and builds `NotificationV1` from `(event,
-  commitCert)`.
+- **Wiring status (live, opt-in).** `createLibp2pNodeBase` now constructs the cohort-topic
+  host and attaches the bridge when `cohortTopic.enabled` is set (default OFF). On an enabled
+  node it: creates a `CommitCertStore` and composes its `put` into the `onCommitCertificate`
+  sink threaded to `ClusterMember` (so the consensus cert is retained before the change event
+  emits); post-assembly builds the host (`createCohortTopicHost`) over the running node + FRET;
+  builds `selfIsCohortMember(event)` over real FRET membership for
+  `coord_0(H(event.tailId ‖ "reactivity"))` (db-core default hashes, byte-identical to the host
+  and the subscriber anchor; same `wantK` as the host); and installs the bridge as
+  `node.blockChangeNotifier` via `attachCohortChangeBridge` — making origination live for **all**
+  collections created on the node, since the Quereus collection-factory captures that notifier
+  once. The host is exposed as `node.cohortTopicHost`. A node **without** `cohortTopic.enabled`
+  keeps the bare `blockChangeNotifier = storageRepo` at zero cohort cost (no host, no cert store).
+  When enabled, a missing FRET service or a host-construction failure **hard-fails** node startup
+  (the operator opted in). Node teardown releases the catch-all subscription and stops the host
+  (clearing the gossip timer, unhandling the protocols) before transports close.
+  - **Still consumer-gated.** "Live" means the bridge *invokes* `onLocalCommit` whenever a
+    consumer has attached one; until the reactivity origination wiring
+    (`reactivity-origination-replay-delivery`'s `ReactivityOriginationManager` + the
+    notification-emit transport) installs `onLocalCommit` and builds `NotificationV1` from
+    `(event, commitCert)`, the bridge no-ops at its `if (!hook) return;` guard.
 
 ## Mutation Contracts
 

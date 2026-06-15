@@ -19,10 +19,11 @@ import { BlockStorage } from './storage/block-storage.js';
 import { MemoryRawStorage } from './storage/memory-storage.js';
 import type { IRawStorage } from './storage/i-raw-storage.js';
 import { clusterMember, type ReconcileBlockCallback, type CommitCertificateSink } from './cluster/cluster-repo.js';
+import { createCommitCertStore, makeClusterCommitCertExtractor, type CommitCertStore } from './cluster/commit-cert.js';
 import { coordinatorRepo } from './repo/coordinator-repo.js';
 import { Libp2pKeyPeerNetwork, type NetworkMode, type NetworkStatePersistence } from './libp2p-key-network.js';
 import { ClusterClient } from './cluster/client.js';
-import type { IRepo, ICluster, ITransactionValidator, BlockId, ActionRev, IBlock } from '@optimystic/db-core';
+import type { IRepo, ICluster, ITransactionValidator, BlockId, ActionRev, IBlock, IBlockChangeNotifier } from '@optimystic/db-core';
 import type { ITransactionStateStore } from './cluster/i-transaction-state-store.js';
 import { networkManagerService } from './network/network-manager-service.js';
 import { fretService, Libp2pFretService } from 'p2p-fret';
@@ -37,6 +38,9 @@ import type { StorageMonitorConfig } from './storage/storage-monitor.js';
 import { ArachnodeFretAdapter } from './storage/arachnode-fret-adapter.js';
 import type { RestoreCallback, BlockArchive } from './storage/struct.js';
 import type { FretService } from 'p2p-fret';
+import { createCohortTopicHost, type CohortTopicHostOptions } from './cohort-topic/host.js';
+import { attachCohortChangeBridge } from './cohort-topic/change-bridge.js';
+import { createReactivitySelfMembershipGate } from './cohort-topic/reactivity-membership-gate.js';
 import { PartitionDetector } from './cluster/partition-detector.js';
 import { PeerReputationService } from './reputation/peer-reputation.js';
 import { DisputeService } from './dispute/dispute-service.js';
@@ -141,6 +145,29 @@ export type NodeOptions = {
 	onCommitCertificate?: CommitCertificateSink;
 
 	/**
+	 * Opt-in cohort-topic substrate activation (reactivity / matchmaking origination). Default OFF →
+	 * the node keeps today's bare `blockChangeNotifier = storageRepo` behavior at zero cohort cost (no
+	 * host, no cert store; a caller-supplied {@link onCommitCertificate} is the only sink). When
+	 * `enabled`, the node-base constructs the cohort-topic host post-assembly, builds a real FRET-backed
+	 * `selfIsCohortMember` gate over `coord_0(H(tailId ‖ "reactivity"))`, and installs the change-notifier
+	 * origination bridge — making reactivity origination live for ALL collections created on the node.
+	 *
+	 * A failure to construct the host (or a missing FRET service) **hard-fails** node startup: the
+	 * operator opted in, so silently degrading to the bare notifier would hide misconfiguration.
+	 */
+	cohortTopic?: {
+		/** Master switch. Absent/`false` → dormant, zero cost. */
+		enabled: boolean;
+		/**
+		 * Requested cohort size; MUST match the host's `wantK` so the membership gate checks the same
+		 * cohort the host serves. Default 16 (the host's default).
+		 */
+		wantK?: number;
+		/** Optional pass-through host tuning (profile / minSigs / fanout / gossipIntervalMs / antiDos / promotion). */
+		host?: Omit<CohortTopicHostOptions, 'privateKey' | 'wantK'>;
+	};
+
+	/**
 	 * Optional Ed25519 private key for this node. When provided, the libp2p
 	 * node uses this identity instead of generating a fresh keypair. Use this
 	 * to persist peer identity across process restarts.
@@ -164,6 +191,26 @@ function resolveStorage(provider: RawStorageProvider | undefined): IRawStorage {
 		return new MemoryRawStorage();
 	}
 	return typeof provider === 'function' ? provider() : provider;
+}
+
+/**
+ * Resolve the full FRET engine the cohort-topic host needs.
+ *
+ * `createCohortTopicHost` consumes the complete {@link FretService} engine surface — notably
+ * `setActivityHandler` (and `routeAct`, size estimation, …). The value at `node.services.fret` is the
+ * libp2p `Libp2pFretService` *wrapper*, which re-exports only a subset (`assembleCohort`, `routeAct`, …)
+ * and keeps the real engine private behind its lazy `ensure()` accessor. By the time activation runs the
+ * engine is already initialized — the wrapper's `Startable.start()` ran during `node.start()` — and the
+ * engine and wrapper share one underlying routing store, so the host and the membership gate observe the
+ * same cohort state. Returns the engine when reachable; otherwise the value as-is (a test may inject a
+ * raw engine that needs no unwrapping).
+ */
+function resolveFretEngine(fret: FretService | undefined): FretService | undefined {
+	if (!fret) {
+		return undefined;
+	}
+	const candidate = fret as unknown as { ensure?: () => FretService };
+	return typeof candidate.ensure === 'function' ? candidate.ensure() : fret;
 }
 
 export async function createLibp2pNodeBase(
@@ -220,6 +267,19 @@ export async function createLibp2pNodeBase(
 
 	const listenAddrs = options.listenAddrs ?? defaults.listenAddrs;
 	const transports = options.transports ?? defaults.transports;
+
+	// --- cohort-topic substrate activation (opt-in; default off → today's bare behavior, zero cost) ---
+	const cohortEnabled = options.cohortTopic?.enabled === true;
+	// Resolve wantK ONCE so the post-assembly host serves and the membership gate checks the SAME cohort.
+	const cohortWantK = options.cohortTopic?.wantK ?? 16;
+	// When enabled, the cluster member records the consensus commit cert into this store synchronously,
+	// BEFORE `storageRepo.commit` emits the change event the bridge's extractor resolves it from (see
+	// cluster-repo.ts §applyConsensusOperation). Created early because the sink must be passed into
+	// `clusterMember(...)` below. Composed with any caller-supplied `onCommitCertificate` so both fire.
+	const certStore: CommitCertStore | undefined = cohortEnabled ? createCommitCertStore() : undefined;
+	const onCommitCertificate: CommitCertificateSink | undefined = certStore
+		? (actionId, cert): void => { options.onCommitCertificate?.(actionId, cert); certStore.put(actionId, cert); }
+		: options.onCommitCertificate;
 
 	const libp2pOptions: unknown = {
 		start: false,
@@ -461,7 +521,7 @@ export async function createLibp2pNodeBase(
 		consensusConfig,
 		stateStore: options.transactionStateStore,
 		reconcileBlock,
-		onCommitCertificate: options.onCommitCertificate
+		onCommitCertificate
 	});
 
 	const coordinatorRepoFactory = coordinatorRepo(
@@ -633,11 +693,74 @@ export async function createLibp2pNodeBase(
 	(node as any).coordinatedRepo = coordinatedRepo;
 	(node as any).storageRepo = storageRepo;
 	// The StorageRepo is the single commit funnel for both the coordinated and
-	// direct paths, so it is the node's per-collection change-notifier origin.
+	// direct paths, so it is the node's per-collection change-notifier origin. This is the
+	// default; the cohort-topic activation block below REPLACES it with the origination-decorating
+	// bridge notifier when the substrate is enabled.
 	(node as any).blockChangeNotifier = storageRepo;
 	(node as any).keyNetwork = keyNetwork;
 	(node as any).reputation = reputation;
 	(node as any).disputeService = disputeServiceInstance;
+
+	// --- Cohort-topic origination activation (post-node: consumes the fully-assembled node + FRET) ---
+	// This is the only place that is after the node + FRET are assembled (node.start() done, fretSvc
+	// available) yet before any caller can capture `blockChangeNotifier` — the Quereus collection-factory
+	// captures it once, immediately after createLibp2pNode returns, and reuses that reference as
+	// `localChangeNotifier` for every NetworkTransactor it builds. Installing the bridge here makes the
+	// origination path live for ALL collections created on the node.
+	if (cohortEnabled) {
+		// The host needs the full FRET engine surface; node.services.fret is the wrapper (see resolveFretEngine).
+		const fret = resolveFretEngine(fretSvc);
+		if (!fret) {
+			// Operator opted in; degrading silently to the bare notifier would hide misconfiguration.
+			throw new Error('cohortTopic enabled but the FRET service is unavailable on the node');
+		}
+
+		const host = await createCohortTopicHost(node, fret, {
+			...(options.cohortTopic!.host ?? {}),
+			privateKey: nodePrivateKey, // real k − x threshold signing
+			wantK: cohortWantK,
+		});
+
+		// selfIsCohortMember: this node owns the collection's reactivity-topic fan-out iff it is in the
+		// FRET cohort around coord_0(H(currentTailId ‖ "reactivity")). Uses db-core's default hashes
+		// (createReactivityTopicAnchor / createTierAddressing / createRingHash), byte-identical to the
+		// host's internal `new RingHash()` and the subscriber-side anchor, and the SAME cohortWantK as
+		// the host — so the coord + cohort line up across origination and subscription.
+		const selfIsCohortMember = createReactivitySelfMembershipGate({
+			fret,
+			selfPeerId: node.peerId.toString(),
+			wantK: cohortWantK,
+		});
+
+		const { unsubscribe } = attachCohortChangeBridge(
+			node as unknown as { blockChangeNotifier?: IBlockChangeNotifier },
+			{
+				source: storageRepo,
+				service: host.service,
+				selfIsCohortMember,
+				extractCommitCert: makeClusterCommitCertExtractor(certStore!),
+			},
+		);
+
+		// Expose the host so the reactivity origination wiring (and the activation test) can install
+		// `CohortTopicService.onLocalCommit`. Until a consumer attaches one, the bridge no-ops at its
+		// `if (!hook) return;` guard — "live" here means the bridge INVOKES onLocalCommit whenever a
+		// consumer is attached; installing the origination manager + emit transport is a sibling ticket.
+		(node as any).cohortTopicHost = host;
+
+		// Teardown: release the catch-all origination feed + stop the host (clears the gossip timer,
+		// unhandles the cohort-topic protocols) before the node's transports close. Composes with the
+		// existing arachnode + clusterMember stop wrappers (each calls its captured previousStop last).
+		const previousStop = node.stop.bind(node);
+		node.stop = async (): Promise<void> => {
+			try {
+				unsubscribe();
+				await host.stop();
+			} finally {
+				await previousStop();
+			}
+		};
+	}
 
 	return node;
 }

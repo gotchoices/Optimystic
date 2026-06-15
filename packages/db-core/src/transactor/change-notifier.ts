@@ -9,6 +9,13 @@ export type CollectionChangeEvent = {
 	readonly blockIds: readonly BlockId[];
 	readonly actionId: ActionId;
 	readonly rev: number;
+	/**
+	 * The collection's chain tail block id at the time of this commit (the `CommitRequest.tailId`).
+	 * Anchors the rotating reactivity topic `H(tailId ‖ "reactivity")`. Present on commit-driven
+	 * events; `undefined` on read-driven promotions (the `StorageRepo.get` path has no commit tail —
+	 * those never originate anyway, and are cert-gated out downstream).
+	 */
+	readonly tailId?: BlockId;
 };
 
 export type CollectionChangeListener = (event: CollectionChangeEvent) => void;

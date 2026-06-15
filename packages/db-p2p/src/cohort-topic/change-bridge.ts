@@ -1,4 +1,4 @@
-import type { CohortTopicService, CollectionChangeEvent, CollectionChangeListener, CollectionId, CommitCert, IBlockChangeNotifier } from "@optimystic/db-core";
+import type { CohortTopicService, CollectionChangeEvent, CollectionChangeListener, CommitCert, IBlockChangeNotifier } from "@optimystic/db-core";
 import { createLogger } from "../logger.js";
 
 const log = createLogger('cohort-change-bridge');
@@ -18,8 +18,13 @@ export interface CohortTopicChangeNotifierDeps {
 	readonly source: ChangeBridgeSource;
 	/** The cohort-topic substrate whose `onLocalCommit` origination hook receives member commits. */
 	readonly service: CohortTopicService;
-	/** True iff this node is a cohort member responsible for `collectionId`'s reactivity-topic fan-out. */
-	readonly selfIsCohortMember: (collectionId: CollectionId) => boolean;
+	/**
+	 * True iff this node is a cohort member responsible for this change event's reactivity-topic fan-out.
+	 * Receives the whole {@link CollectionChangeEvent} (not just the collection id) because the reactivity
+	 * topic is tail-anchored — `H(event.tailId ‖ "reactivity")` — so the gate needs `event.tailId` to
+	 * derive the topic's `coord_0` cohort. A tail-less event (a read-driven promotion) is never a member.
+	 */
+	readonly selfIsCohortMember: (event: CollectionChangeEvent) => boolean;
 	/** Resolve the pass-through commit cert for a change event (e.g. the cluster commit-cert store). */
 	readonly extractCommitCert: (event: CollectionChangeEvent) => CommitCert | undefined;
 }
@@ -41,20 +46,31 @@ export interface CohortTopicChangeNotifierDeps {
  * (e.g. the Quereus reactive-watch vtab) keep working — those subscriptions delegate straight to
  * `source`. Origination runs independently on the catch-all feed.
  *
- * The catch-all subscription lives for the lifetime of the returned notifier (i.e. the node); it is
- * intentionally not torn down here.
+ * `makeCohortTopicChangeNotifier` discards the catch-all unsubscribe (node-lifetime by intent) for the
+ * unit tests; the node assembly uses {@link attachCohortChangeBridge}, which returns the teardown.
  */
 export function makeCohortTopicChangeNotifier(deps: CohortTopicChangeNotifierDeps): IBlockChangeNotifier {
-	deps.source.onAnyCollectionChange((event) => originate(deps, event));
-	return {
+	return buildCohortTopicChangeBridge(deps).notifier;
+}
+
+/**
+ * Shared wiring behind both entry points: subscribe the origination handler to the source's catch-all
+ * commit feed and build the decorating {@link IBlockChangeNotifier}. Returns the notifier plus the
+ * idempotent teardown for that catch-all subscription (the underlying `onAnyCollectionChange` unsub is
+ * itself idempotent), so the node assembly can release it on node stop alongside `host.stop()`.
+ */
+function buildCohortTopicChangeBridge(deps: CohortTopicChangeNotifierDeps): { notifier: IBlockChangeNotifier; unsubscribe: () => void } {
+	const unsubscribe = deps.source.onAnyCollectionChange((event) => originate(deps, event));
+	const notifier: IBlockChangeNotifier = {
 		onCollectionChange: (collectionId, listener): (() => void) => deps.source.onCollectionChange(collectionId, listener),
 	};
+	return { notifier, unsubscribe };
 }
 
 /** Run the membership gate, cert extraction, and origination hook for one change event, isolating throws. */
 function originate(deps: CohortTopicChangeNotifierDeps, event: CollectionChangeEvent): void {
 	try {
-		if (!deps.selfIsCohortMember(event.collectionId)) {
+		if (!deps.selfIsCohortMember(event)) {
 			return; // not responsible for this topic's fan-out
 		}
 		const hook = deps.service.onLocalCommit;
@@ -75,10 +91,19 @@ function originate(deps: CohortTopicChangeNotifierDeps, event: CollectionChangeE
  * Wire the cohort-topic origination bridge as `node`'s `blockChangeNotifier` (the value the
  * `NetworkTransactor` consumes as its `localChangeNotifier`). Call this from the node assembly once a
  * {@link CohortTopicService} is running on the node, passing the node's `StorageRepo` as `source` and
- * the membership + cert-extraction seams. Returns the installed notifier.
+ * the membership + cert-extraction seams.
+ *
+ * Returns the installed `notifier` plus an idempotent `unsubscribe` that tears down the catch-all
+ * origination subscription — the node assembly calls it on node stop (alongside `host.stop()`) so the
+ * origination feed is released before the node's transports close. Tearing it down stops further
+ * origination but leaves the per-collection `onCollectionChange` delegation intact (those subscriptions
+ * live on the `source` `StorageRepo`, not on the bridge).
  */
-export function attachCohortChangeBridge(node: { blockChangeNotifier?: IBlockChangeNotifier }, deps: CohortTopicChangeNotifierDeps): IBlockChangeNotifier {
-	const notifier = makeCohortTopicChangeNotifier(deps);
-	node.blockChangeNotifier = notifier;
-	return notifier;
+export function attachCohortChangeBridge(
+	node: { blockChangeNotifier?: IBlockChangeNotifier },
+	deps: CohortTopicChangeNotifierDeps,
+): { notifier: IBlockChangeNotifier; unsubscribe: () => void } {
+	const bridge = buildCohortTopicChangeBridge(deps);
+	node.blockChangeNotifier = bridge.notifier;
+	return bridge;
 }
