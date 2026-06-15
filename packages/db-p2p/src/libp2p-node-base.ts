@@ -278,7 +278,11 @@ export async function createLibp2pNodeBase(
 	// `clusterMember(...)` below. Composed with any caller-supplied `onCommitCertificate` so both fire.
 	const certStore: CommitCertStore | undefined = cohortEnabled ? createCommitCertStore() : undefined;
 	const onCommitCertificate: CommitCertificateSink | undefined = certStore
-		? (actionId, cert): void => { options.onCommitCertificate?.(actionId, cert); certStore.put(actionId, cert); }
+		// `certStore.put` runs FIRST so origination's cert capture cannot be defeated by a throwing caller
+		// sink: the whole composed call is isolated in `ClusterMember.captureCommitCert`, so a caller sink
+		// that threw before the store was written would make that commit silently never originate. Ordering
+		// the store first keeps origination correct regardless of the caller sink (`put` never throws).
+		? (actionId, cert): void => { certStore.put(actionId, cert); options.onCommitCertificate?.(actionId, cert); }
 		: options.onCommitCertificate;
 
 	const libp2pOptions: unknown = {
@@ -712,14 +716,26 @@ export async function createLibp2pNodeBase(
 		const fret = resolveFretEngine(fretSvc);
 		if (!fret) {
 			// Operator opted in; degrading silently to the bare notifier would hide misconfiguration.
+			// The node has already started (transports open, FRET running), so tear it down before the
+			// hard-fail rather than leaking a started node + open transports on the rejection.
+			await node.stop();
 			throw new Error('cohortTopic enabled but the FRET service is unavailable on the node');
 		}
 
-		const host = await createCohortTopicHost(node, fret, {
-			...(options.cohortTopic!.host ?? {}),
-			privateKey: nodePrivateKey, // real k − x threshold signing
-			wantK: cohortWantK,
-		});
+		// A host-construction failure also hard-fails (operator opted in); stop the started node first so
+		// the rejection does not leak open transports / a running FRET service. node.stop() runs the
+		// already-installed arachnode + clusterMember teardown wrappers and closes the node's connections.
+		let host: Awaited<ReturnType<typeof createCohortTopicHost>>;
+		try {
+			host = await createCohortTopicHost(node, fret, {
+				...(options.cohortTopic!.host ?? {}),
+				privateKey: nodePrivateKey, // real k − x threshold signing
+				wantK: cohortWantK,
+			});
+		} catch (err) {
+			await node.stop();
+			throw err;
+		}
 
 		// selfIsCohortMember: this node owns the collection's reactivity-topic fan-out iff it is in the
 		// FRET cohort around coord_0(H(currentTailId ‖ "reactivity")). Uses db-core's default hashes
