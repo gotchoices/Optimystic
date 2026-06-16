@@ -20,7 +20,7 @@
 import { expect } from 'chai';
 import {
 	createRejoinJitter,
-	createTopicBudget,
+	DEFAULT_TTL_MS,
 	DEFAULT_T_REJOIN_JITTER_MS,
 	DEFAULT_REGISTER_RATE_PER_PEER,
 	outwardMovesArePromoted,
@@ -262,24 +262,51 @@ describe('cohort-topic: scale anti-flood + anti-DoS (mock-tier e2e)', function (
 			}
 		});
 
-		it('topic-budget LRU drops a zero-participant (cold) topic first and never a populated one [unit-boundary: the engine TTL sweep does not re-touch the budget]', () => {
-			// The host wires exactly this `createTopicBudget` per coord. Driving the cold-eviction THROUGH the
-			// engine is not yet reachable — the engine touches the budget up on admission but the TTL sweep does
-			// not touch it back down on eviction, so a resident never reaches participantCount 0 via the wire
-			// (a documented gap; see the review handoff). The LRU cold-eviction logic itself is asserted on the
-			// same production unit here.
-			const budget = createTopicBudget({ topicsMax: 2 });
-			const A = topic(8);
-			const B = topic(9);
-			const C = topic(10);
-			expect(budget.admit(A)).to.equal(true);
-			budget.touch(A, 5); // A is populated
-			expect(budget.admit(B)).to.equal(true); // B stays at participantCount 0 (cold)
-			// Budget full (A populated, B cold). A new topic must evict the cold one, never the populated one.
-			expect(budget.admit(C)).to.equal(true);
-			expect(budget.has(A), 'the populated topic is never evicted for a new instantiation').to.equal(true);
-			expect(budget.has(B), 'the cold zero-participant topic was dropped first').to.equal(false);
-			expect(budget.has(C), 'the new topic was admitted into the freed slot').to.equal(true);
+		it('a topic drained by the engine TTL sweep releases its budget slot, so a new topic reuses it while a still-populated topic is never evicted', async () => {
+			// Drives the LRU cold-eviction discipline THROUGH the real engine wire (not the `createTopicBudget`
+			// unit): the engine touches the budget UP on admission and now back DOWN on TTL drain, so a topic
+			// whose participants all leave falls to participantCount 0 and becomes the coldest-evictable resident
+			// again. Before the fix the budget slot leaked — a drained topic kept its stale positive count forever
+			// and the cohort refused every new topic while serving nothing.
+			const TOPIC_A = topic(8); // stays populated throughout (renewed lastPing) — must never be evicted
+			const TOPIC_B = topic(9); // drains via the TTL sweep — its slot must be released
+			const TOPIC_C = topic(10); // the new topic that should reuse B's freed slot
+			const members = await makeMembers(N);
+			const mesh = await buildMesh(members, { wantK: WANT_K, minSigs: MIN_SIGS, antiDos: { topicBudget: { topicsMax: 2 } } });
+			try {
+				const { decidingEngine } = await setupTopic(mesh, TOPIC_A);
+				const third = Math.floor(DEFAULT_TTL_MS / 3);
+
+				// Fill the topicsMax=2 budget with two populated topics. B is registered at T0; A is registered
+				// `ttl/3` later so a single sweep can drain B (older lastPing) while A survives (newer lastPing).
+				expect((await decidingEngine.engine.handleRegister(await signedRegister(await makeMember(), TOPIC_B, T0, 'b', { ttl: DEFAULT_TTL_MS }), REG, T0)).result, 'topic B instantiates').to.equal('accepted');
+				expect(decidingEngine.budgetParticipantCount(TOPIC_B), 'B is populated in the budget').to.equal(1);
+				expect((await decidingEngine.engine.handleRegister(await signedRegister(await makeMember(), TOPIC_A, T0 + third, 'a', { ttl: DEFAULT_TTL_MS }), REG, T0 + third)).result, 'topic A instantiates (budget now full)').to.equal('accepted');
+				expect(decidingEngine.budgetParticipantCount(TOPIC_A), 'A is populated in the budget').to.equal(1);
+
+				// Control: while both topics are populated the budget is genuinely saturated — a new topic is refused.
+				const refusedWhileFull = await decidingEngine.engine.handleRegister(await signedRegister(await makeMember(), TOPIC_C, T0 + third, 'c-early'), REG, T0 + third);
+				expect(refusedWhileFull.result, 'C is refused while both A and B are populated (no cold slot to free)').to.equal('unwilling_cohort');
+				expect(decidingEngine.budgetHasTopic(TOPIC_C), 'the refused topic took no budget slot').to.equal(false);
+
+				// Drain B via the engine TTL sweep: one ttl past B's only ping but within A's, so B is evicted and
+				// A survives. The new `sweepStale` re-touch must drop B to participantCount 0 in the budget.
+				const drainAt = T0 + DEFAULT_TTL_MS + 1;
+				const evicted = decidingEngine.engine.sweepStale(drainAt);
+				expect(evicted.some((r) => bytesToB64url(r.topicId) === bytesToB64url(TOPIC_B)), 'B is swept').to.equal(true);
+				expect(decidingEngine.budgetParticipantCount(TOPIC_B), 'drained B fell to participantCount 0 (cold resident) — the slot is now reclaimable').to.equal(0);
+				expect(decidingEngine.budgetParticipantCount(TOPIC_A), 'still-populated A keeps its positive budget count').to.equal(1);
+
+				// Now a new topic instantiation succeeds by reusing the cold (drained) B's slot — the leak is closed.
+				const reused = await decidingEngine.engine.handleRegister(await signedRegister(await makeMember(), TOPIC_C, drainAt, 'c'), REG, drainAt);
+				expect(reused.result, 'C now instantiates by evicting the drained-cold B from the budget').to.equal('accepted');
+				expect(decidingEngine.budgetHasTopic(TOPIC_B), 'the drained topic was dropped first — its slot was released').to.equal(false);
+				expect(decidingEngine.budgetHasTopic(TOPIC_C), 'the new topic was admitted into the freed slot').to.equal(true);
+				expect(decidingEngine.budgetParticipantCount(TOPIC_A), 'the still-populated topic is never evicted for a new instantiation').to.equal(1);
+				expect(decidingEngine.servesTopic(TOPIC_A), 'the populated topic keeps serving').to.equal(true);
+			} finally {
+				await mesh.stop();
+			}
 		});
 	});
 

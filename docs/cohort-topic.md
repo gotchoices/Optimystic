@@ -910,9 +910,6 @@ limit, topic-budget refusal, and `bootstrap: true` root instantiation.
 > - **membership-rotation primary handoff** (inventory → pull → dual-serve → ack): `registration/handoff.ts`
 >   is unit-tested in db-core but not yet wired into the FRET host, so there is no host-level rotation to
 >   observe (crash failover is the wired failover path).
-> - **topic-budget LRU cold-eviction through the engine**: the engine touches the budget *up* on admission
->   but the TTL sweep does not touch it *down* on eviction, so a resident never reaches zero participants
->   via the wire; the LRU cold-eviction logic is asserted on the same production `createTopicBudget` unit.
 
 **Real-libp2p e2e (socket tier).** [`packages/db-p2p/test/substrate-real-libp2p.integration.spec.ts`](../packages/db-p2p/test/substrate-real-libp2p.integration.spec.ts)
 (env-gated on `OPTIMYSTIC_INTEGRATION=1` / `RUN_LONG_TESTS=1`) stands up 3–16 production

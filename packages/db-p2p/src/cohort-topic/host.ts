@@ -285,6 +285,19 @@ export interface CoordEngine {
 	/** True iff this engine currently serves `topicId` (holds a record or a cold-start forwarder for it). */
 	servesTopic(topicId: Uint8Array): boolean;
 	/**
+	 * Whether `topicId` currently occupies a slot in this coord's anti-DoS topic budget. A drained topic
+	 * stays resident-but-cold (`{@link budgetParticipantCount} === 0`) until a new topic reuses its slot;
+	 * after that reuse `budgetHasTopic` is `false`. Test/diagnostic introspection over the per-coord budget
+	 * (distinct from {@link servesTopic}, which a never-demoted cold-start forwarder keeps `true`).
+	 */
+	budgetHasTopic(topicId: Uint8Array): boolean;
+	/**
+	 * The direct-participant count the topic budget last recorded for a resident `topicId` (its LRU
+	 * eviction key), or `undefined` when `topicId` holds no budget slot. A resident reporting `0` has
+	 * drained and is the next coldest-evictable candidate. Test/diagnostic introspection.
+	 */
+	budgetParticipantCount(topicId: Uint8Array): number | undefined;
+	/**
 	 * The cold-start {@link Forwarder} this engine instantiated for `topicId`, or `undefined` if none.
 	 * Exposes the parent-link lifecycle (`awaiting_parent` → `serving`) for the cold-start wiring (gap 7).
 	 */
@@ -896,6 +909,16 @@ function createCoordEngine(ctx: CoordEngineContext, servedCoord: RingCoord, tree
 		coord: servedCoord,
 		localEpoch,
 		verifyInbound: ctx.verifyGossip === undefined ? undefined : (g): boolean => ctx.verifyGossip!(g, servedCoord),
+		// Sibling-drain half of the topic-budget release: a topic whose participants are sharded onto a
+		// sibling primary drains into this store as a gossip eviction (never this member's own TTL sweep),
+		// so re-`touch` the budget down from the post-delete store count — mirroring the engine's `sweepStale`
+		// re-touch. `topicBudget` is a forward `const` here, only read when this callback fires at merge time
+		// (long after both are initialized). A no-op for a topic the budget does not hold (`touch` guards it).
+		onRecordsEvicted: (topicIds): void => {
+			for (const topicId of topicIds) {
+				topicBudget.touch(topicId, store.directParticipants(topicId));
+			}
+		},
 	});
 	const view = bus.view();
 	const selfMember = bytesToB64url(ctx.selfMemberBytes);
@@ -1122,6 +1145,8 @@ function createCoordEngine(ctx: CoordEngineContext, servedCoord: RingCoord, tree
 		cohortView: (): CohortView => view,
 		servesTopic: (topicId: Uint8Array): boolean =>
 			store.directParticipants(topicId) > 0 || coldStart.get(topicId) !== undefined,
+		budgetHasTopic: (topicId: Uint8Array): boolean => topicBudget.has(topicId),
+		budgetParticipantCount: (topicId: Uint8Array): number | undefined => topicBudget.participantCount(topicId),
 		forwarder: (topicId: Uint8Array): Forwarder | undefined => coldStart.get(topicId),
 		isPromoted: (topicId: Uint8Array): boolean => promotion.isPromoted(topicId),
 		applyPromotionNotice: (notice, now): void => promotion.applyPromotionNotice(notice, now),

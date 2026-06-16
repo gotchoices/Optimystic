@@ -44,6 +44,12 @@ export interface TopicBudget {
 	touch(topicId: Uint8Array, participantCount: number): void;
 	/** Whether `topicId` currently holds forwarder state. */
 	has(topicId: Uint8Array): boolean;
+	/**
+	 * The direct-participant count last reported for a resident `topicId` (the eviction key), or
+	 * `undefined` when the topic is not resident. A resident reporting `0` is cold/evictable. Read-only
+	 * introspection for tests/diagnostics — eviction policy reads the same field internally.
+	 */
+	participantCount(topicId: Uint8Array): number | undefined;
 	/** Number of resident topics. */
 	readonly size: number;
 }
@@ -74,6 +80,10 @@ class LruTopicBudget implements TopicBudget {
 
 	has(topicId: Uint8Array): boolean {
 		return this.residents.has(bytesKey(topicId));
+	}
+
+	participantCount(topicId: Uint8Array): number | undefined {
+		return this.residents.get(bytesKey(topicId))?.participantCount;
 	}
 
 	admit(topicId: Uint8Array): boolean {

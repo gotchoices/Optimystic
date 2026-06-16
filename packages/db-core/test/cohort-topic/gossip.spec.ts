@@ -3,6 +3,7 @@ import { sha256 } from '@noble/hashes/sha2.js';
 import { createCohortGossipBus } from '../../src/cohort-topic/gossip/bus.js';
 import { toGossipRecord } from '../../src/cohort-topic/gossip/records.js';
 import { createRegistrationStore } from '../../src/cohort-topic/registration/store.js';
+import { createTopicBudget } from '../../src/cohort-topic/antidos/topic-budget.js';
 import { bytesToB64url } from '../../src/cohort-topic/wire/codec.js';
 import type { ICohortGossipTransport, PeerRef, RingCoord } from '../../src/cohort-topic/ports.js';
 import type { RegistrationStore, RegistrationRecord } from '../../src/cohort-topic/registration/types.js';
@@ -102,6 +103,61 @@ describe('cohort-topic / gossip bus', () => {
 		const bus = busFor(store, new FanoutTransport(), () => EPOCH);
 		bus.applyInbound(gossip('m', EPOCH, { evicted: [{ topicId: bytesToB64url(rec.topicId), participantId: bytesToB64url(rec.participantId) }] }), 2_000);
 		expect(store.getByParticipant(rec.topicId, rec.participantId)).to.be.undefined;
+	});
+
+	it('re-touches the topic budget down when a gossiped eviction drains a topic (sibling-drain leak fix)', () => {
+		// A topic whose participants are sharded onto a sibling primary drains into THIS member's store as a
+		// gossip eviction (not its own TTL sweep), so the bus must re-touch the budget down via onRecordsEvicted —
+		// else the slot leaks exactly as it would on the engine TTL path.
+		const store = createRegistrationStore();
+		const budget = createTopicBudget({ topicsMax: 2 });
+		const rec = record('p', 1_000);
+		store.put(rec);
+		budget.admit(rec.topicId);
+		budget.touch(rec.topicId, store.directParticipants(rec.topicId)); // mirror accept()'s up-touch
+		expect(budget.participantCount(rec.topicId), 'admitted topic carries its participant count').to.equal(1);
+
+		const bus = createCohortGossipBus({
+			transport: new FanoutTransport(),
+			store,
+			coord: COORD,
+			localEpoch: () => EPOCH,
+			now: () => 2_000,
+			onRecordsEvicted: (topicIds) => {
+				for (const t of topicIds) budget.touch(t, store.directParticipants(t));
+			},
+		});
+		bus.applyInbound(gossip('m', EPOCH, { evicted: [{ topicId: bytesToB64url(rec.topicId), participantId: bytesToB64url(rec.participantId) }] }), 2_000);
+		expect(store.getByParticipant(rec.topicId, rec.participantId), 'the gossiped eviction removed the record').to.be.undefined;
+		expect(budget.participantCount(rec.topicId), 'the drained topic was re-touched down to 0 (slot reclaimable)').to.equal(0);
+	});
+
+	it('fires onRecordsEvicted once per distinct drained topic, and not at all without evictions', () => {
+		const store = createRegistrationStore();
+		const calls: string[][] = [];
+		const bus = createCohortGossipBus({
+			transport: new FanoutTransport(),
+			store,
+			coord: COORD,
+			localEpoch: () => EPOCH,
+			now: () => 2_000,
+			onRecordsEvicted: (topicIds) => calls.push(topicIds.map(bytesToB64url)),
+		});
+		// A records-only merge (no evictions) must not fire the hook.
+		bus.applyInbound(gossip('m', EPOCH, { records: [toGossipRecord(record('p', 5_000))] }), 2_000);
+		expect(calls.length, 'no eviction → hook not fired').to.equal(0);
+
+		// Two evictions naming the SAME topic collapse to one distinct topic id in a single hook call.
+		const r1 = record('p1', 5_000);
+		const r2 = record('p2', 5_000); // both carry topicId bytes('topic-A')
+		store.put(r1);
+		store.put(r2);
+		bus.applyInbound(gossip('m', EPOCH, { evicted: [
+			{ topicId: bytesToB64url(r1.topicId), participantId: bytesToB64url(r1.participantId) },
+			{ topicId: bytesToB64url(r2.topicId), participantId: bytesToB64url(r2.participantId) },
+		] }), 2_000);
+		expect(calls.length, 'one merge with evictions → exactly one hook call').to.equal(1);
+		expect(calls[0], 'distinct topic ids only').to.deep.equal([bytesToB64url(r1.topicId)]);
 	});
 
 	it('does not resurrect a record already past its TTL at merge time', () => {

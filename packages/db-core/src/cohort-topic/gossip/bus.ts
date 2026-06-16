@@ -192,8 +192,21 @@ class TransportCohortGossipBus implements CohortGossipBus {
 				this.deps.store.put(incoming);
 			}
 		}
+		// Collect the distinct topics a gossiped eviction drained so the budget can be re-touched *after*
+		// the deletes (the count must be post-drain). This is the sibling-drain half of the topic-budget
+		// leak fix: a topic whose participants are sharded onto a sibling primary drains into this store as
+		// a gossip eviction, never via this member's own TTL sweep, so the `onRecordsEvicted` callback must
+		// re-`touch` the budget down here too — otherwise the slot leaks for any multi-member topic.
+		let evictedTopics: Map<string, Uint8Array> | undefined;
 		for (const ref of g.evicted ?? []) {
-			this.deps.store.delete(b64urlToBytes(ref.topicId), b64urlToBytes(ref.participantId));
+			const topicId = b64urlToBytes(ref.topicId);
+			this.deps.store.delete(topicId, b64urlToBytes(ref.participantId));
+			if (this.deps.onRecordsEvicted !== undefined) {
+				(evictedTopics ??= new Map()).set(bytesKey(topicId), topicId);
+			}
+		}
+		if (evictedTopics !== undefined && evictedTopics.size > 0) {
+			this.deps.onRecordsEvicted!([...evictedTopics.values()]);
 		}
 	}
 }
