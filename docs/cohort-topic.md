@@ -871,6 +871,48 @@ non-originating node verify-applies it, and a later walk gets `Promoted(1)` and 
 single-signer fallback when a member is unreachable). The production `minSigs = 14` path is the same
 code, just larger.
 
+**Mock-tier e2e at scale.** The live-tier machinery is extracted into a reusable harness
+([`packages/db-p2p/src/testing/cohort-topic-mesh-harness.ts`](../packages/db-p2p/src/testing/cohort-topic-mesh-harness.ts))
+that stands up production-shaped cohorts (`k = 16`, `minSigs = 14`) inside 48–64-node rings, and the
+at-scale suites
+([`cohort-topic-scale-lifecycle.spec.ts`](../packages/db-p2p/test/cohort-topic/cohort-topic-scale-lifecycle.spec.ts),
+[`cohort-topic-scale-antiflood.spec.ts`](../packages/db-p2p/test/cohort-topic/cohort-topic-scale-antiflood.spec.ts))
+assert the **behavioral disciplines** the design specifies on the real `CohortMemberEngine` over the
+real FRET-routed cohort — driven by an explicit virtual clock (no wall-clock sleeps), deterministic
+across runs. Mapped, passing claims: register / `ttl/3` renewal / TTL eviction (§TTL and renewal);
+per-tier willingness admission gating (§Willingness — Edge refuses T3, Core admits); promotion firing
+at `cap_promote` + `Promoted(d+1)` redirect, sticky no-flap within `T_promote_sticky` (claim 5), and
+root-never-demote (§Promotion and demotion lifecycle); crash failover via signed `reattach` + the
+epoch-scoped override (§Failure modes); gossip record replication + eviction convergence across the
+whole `k`-member cohort; the §Anti-flood walk disciplines on real walks via the same predicates the
+simulator uses (`outwardMovesArePromoted` / `inwardStepsFollowNoState` / `retriesRestartAtDMax` —
+claims 1 *discipline*, 3, 4), the claim-2 `RejoinJitter` rate bound, and the §Anti-DoS per-peer rate
+limit, topic-budget refusal, and `bootstrap: true` root instantiation.
+
+> **Doc expectations tagged `it.skip([… DOC EXPECTATION NOT YET IMPLEMENTED …])` at this tier** (named,
+> not omitted — each cites its parking ticket):
+> - the §Anti-flood **claim-1 *fan*** (distinct `coord_{d_max}` per participant, ≈ subscriber count):
+>   the wire carries `participantCoord` as the **dialable peer-id**, and every Ed25519 libp2p id
+>   base58-encodes to a constant `"12D3KooW…"` prefix, so `prefix(P, d·log₂F)` is identical across
+>   participants and `coord_d` for `d ≥ 1` **collapses to one coordinate** instead of fanning. The
+>   single-direction walk *discipline* (probe `d_max` first, inward-only-on-`no_state`, no speculative
+>   outward) IS asserted on the real engine; the fan awaits the routing-key/signer-id reconciliation in
+>   `cohort-topic-participant-coord-routing-key-mismatch` (see §Wire formats "Tier-0 caveat"). The fan
+>   itself is simulator-validated against the uniform ring coord (`scenarios.ts` cold-start-storm).
+> - **multi-tier tree growth / depth law** `⌈log_F(N/cap_promote)⌉` over a live walk and a `Promoted`
+>   redirect instantiating a tier-1 child: the host dispatch passes `followOn: false` and only the root
+>   sets `bootstrap`, so a tier-1 cohort answers `no_state` rather than cold-starting
+>   (`cohort-topic-followon-derivation`). The depth law is simulator-owned (`promotion-convergence.ts`).
+> - **tier-(d>0) demotion-notice broadcast**: the parent-side `childCohortCount` recording is the
+>   observable effect and is parked (`cohort-topic-parent-child-link`); promotion/demotion hysteresis is
+>   unit-covered by `promotion.spec.ts`.
+> - **membership-rotation primary handoff** (inventory → pull → dual-serve → ack): `registration/handoff.ts`
+>   is unit-tested in db-core but not yet wired into the FRET host, so there is no host-level rotation to
+>   observe (crash failover is the wired failover path).
+> - **topic-budget LRU cold-eviction through the engine**: the engine touches the budget *up* on admission
+>   but the TTL sweep does not touch it *down* on eviction, so a resident never reaches zero participants
+>   via the wire; the LRU cold-eviction logic is asserted on the same production `createTopicBudget` unit.
+
 **Still deferred (parked in backlog, honestly out of scope for this milestone):** multi-tier
 promoted-redirect *follow-on* instantiation (`cohort-topic-followon-derivation`) and the parent-side
 child-cohort link recording (`cohort-topic-parent-child-link`); a dedicated read-only **lookup-probe**
