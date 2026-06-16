@@ -44,7 +44,8 @@ import type { VerifyResult } from "../cohort-topic/membership/verifier.js";
 import { W_CHECKPOINT_DEFAULT } from "./config.js";
 import type { RevisionEntry } from "./replay-buffer.js";
 import type { NotificationVerifier } from "./verify.js";
-import type { NotificationV1 } from "./wire.js";
+import { asObject, b64urlField, failWire, reqIntInRange, reqString } from "./wire-validate.js";
+import { validateNotificationV1, type NotificationV1 } from "./wire.js";
 
 /**
  * A parent checkpoint summary over `[fromRevision, toRevision]` (`docs/reactivity.md`
@@ -257,4 +258,30 @@ export async function verifyCheckpointEndpoints(summary: CheckpointSummary, veri
 	}
 	const [fromVerdict, toVerdict] = await Promise.all([verifier.verify(from), verifier.verify(to)]);
 	return fromVerdict === "verified" && toVerdict === "verified" ? "verified" : "untrusted";
+}
+
+/**
+ * Narrow an already-parsed value to {@link CheckpointSummary}, throwing on any defect. Used by the resume
+ * codec to validate a checkpoint embedded in a `checkpoint_window` reply. The two `bracketingEntries` are
+ * validated as full {@link NotificationV1}s (the verifiable anchor); `mergedDelta` is optional.
+ */
+export function validateCheckpointSummary(value: unknown, what = "CheckpointSummary"): CheckpointSummary {
+	const obj = asObject(value, what);
+	const fromRevision = reqIntInRange(obj, "fromRevision", what, 0);
+	const toRevision = reqIntInRange(obj, "toRevision", what, fromRevision);
+	const bracketing = obj["bracketingEntries"];
+	if (!Array.isArray(bracketing) || bracketing.length !== 2) {
+		failWire(`${what}: field "bracketingEntries" must be a length-2 array`);
+	}
+	const summary: CheckpointSummary = {
+		collectionId: b64urlField(reqString(obj, "collectionId", what), "collectionId", what),
+		fromRevision,
+		toRevision,
+		mergedDigest: b64urlField(reqString(obj, "mergedDigest", what), "mergedDigest", what),
+		bracketingEntries: [validateNotificationV1(bracketing[0]), validateNotificationV1(bracketing[1])],
+	};
+	if (obj["mergedDelta"] !== undefined) {
+		return { ...summary, mergedDelta: b64urlField(reqString(obj, "mergedDelta", what), "mergedDelta", what) };
+	}
+	return summary;
 }

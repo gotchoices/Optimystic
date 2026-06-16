@@ -7,6 +7,8 @@ import {
 	coreProfile,
 	edgeProfile,
 	buildNotificationV1,
+	createReplayBuffer,
+	serveBackfill,
 	SUBSCRIBER_TTL_CORE_MS,
 	SUBSCRIBER_TTL_EDGE_MS,
 	DELTA_MAX_CORE_BYTES,
@@ -16,11 +18,14 @@ import {
 	type MembershipVerifier,
 	type VerifyResult,
 	type NotificationV1,
+	type BackfillV1,
+	type ResumeV1,
+	type ResumeReplyV1,
 	type CollectionChangeEvent,
 	type CommitCert,
 } from '@optimystic/db-core';
 import { peerIdToBytes } from '../../src/cohort-topic/peer-codec.js';
-import { ReactivitySubscriptionManager } from '../../src/reactivity/subscription-manager.js';
+import { ReactivitySubscriptionManager, type ReactivitySubscriptionManagerOptions } from '../../src/reactivity/subscription-manager.js';
 import { ReactivityOriginationManager } from '../../src/reactivity/origination-manager.js';
 
 /** A membership verifier with a fixed verdict — the managers only need it to resolve a verdict. */
@@ -206,6 +211,90 @@ describe('reactivity / subscription manager', () => {
 		};
 		expect(await manager.onNotification(n)).to.equal('untrusted');
 		expect(delivered).to.have.length(0);
+	});
+
+	const noteB64 = (revision: number): NotificationV1 => ({
+		v: 1,
+		collectionId: bytesToB64url(COLLECTION),
+		tailId: bytesToB64url(TAIL),
+		revision,
+		digest: bytesToB64url(new Uint8Array([revision & 0xff])),
+		timestamp: 1_700_000_000_000 + revision,
+		sig: bytesToB64url(new Uint8Array([0xaa, revision & 0xff])),
+		signers: [bytesToB64url(new Uint8Array([8]))],
+	});
+
+	describe('backfill seam wired to the RPC', () => {
+		it('drives a BackfillV1 over the transport on a gap and replays the reply through delivery', async () => {
+			const service = new RecordingService(new FixedVerifier('verified'));
+			const buffer = createReplayBuffer(256);
+			for (let rev = 10; rev <= 14; rev++) buffer.append({ revision: rev, payload: noteB64(rev), receivedAt: 1000 + rev });
+
+			const delivered: number[] = [];
+			let resolveAll: () => void;
+			const allDelivered = new Promise<void>((r) => { resolveAll = r; });
+			const sentReqs: BackfillV1[] = [];
+			const manager = new ReactivitySubscriptionManager({
+				service,
+				collectionId: COLLECTION,
+				tailIdAtAttach: TAIL,
+				deliver: (n) => { delivered.push(n.revision); if (n.revision === 14) resolveAll(); },
+				lastKnownRev: 10,
+				signBackfill: (req) => bytesToB64url(new Uint8Array([req.fromRevision & 0xff, req.toRevision & 0xff])),
+				backfillTransport: (req) => { sentReqs.push(req); return Promise.resolve(serveBackfill(buffer, req, bytesToB64url(COLLECTION))); },
+			});
+
+			// A gap arrives (10 → 14): the manager's seam drives the backfill RPC and replays 11..14.
+			expect(await manager.onNotification(noteB64(14))).to.equal('gap');
+			await allDelivered;
+			expect(sentReqs).to.have.length(1);
+			expect(sentReqs[0]!.fromRevision).to.equal(11);
+			expect(sentReqs[0]!.signature).to.be.a('string');
+			expect(delivered).to.deep.equal([11, 12, 13, 14]);
+			expect(manager.lastRevision).to.equal(14);
+		});
+	});
+
+	describe('resume() drives the RPC and applies the reply', () => {
+		const makeManager = (over: Partial<ReactivitySubscriptionManagerOptions> = {}, delivered: number[] = []) =>
+			new ReactivitySubscriptionManager({
+				service: new RecordingService(new FixedVerifier('verified')),
+				collectionId: COLLECTION,
+				tailIdAtAttach: TAIL,
+				deliver: (n) => delivered.push(n.revision),
+				lastKnownRev: 17,
+				signResume: () => bytesToB64url(new Uint8Array([1])),
+				clock: () => 1_700_000_000_999,
+				...over,
+			});
+
+		it('throws when no resume transport/signer is configured', async () => {
+			const manager = new ReactivitySubscriptionManager({ service: new RecordingService(), collectionId: COLLECTION, tailIdAtAttach: TAIL, deliver: () => {} });
+			let threw = false;
+			try { await manager.resume(); } catch { threw = true; }
+			expect(threw).to.equal(true);
+		});
+
+		it('sends a ResumeV1 from lastRevision + 1 and replays a backfill reply', async () => {
+			const delivered: number[] = [];
+			let sent: ResumeV1 | undefined;
+			const reply: ResumeReplyV1 = { v: 1, result: 'backfill', entries: [noteB64(18), noteB64(19)], currentRevision: 19 };
+			const manager = makeManager({ resumeTransport: (req) => { sent = req; return Promise.resolve(reply); } }, delivered);
+			expect(await manager.resume()).to.equal('backfilled');
+			expect(sent!.fromRevision).to.equal(18); // lastKnownRev 17 + 1
+			expect(sent!.latestKnownTailId).to.equal(bytesToB64url(TAIL));
+			expect(delivered).to.deep.equal([18, 19]);
+		});
+
+		it('invalidates the sticky cohort-hint cache and escalates on a tail_rotated reply', async () => {
+			const rotations: Array<[string, number]> = [];
+			const reply: ResumeReplyV1 = { v: 1, result: 'tail_rotated', newTailId: bytesToB64url(new Uint8Array([7, 7, 7, 7])), newRevisionAtRotation: 50 };
+			const manager = makeManager({ resumeTransport: () => Promise.resolve(reply), onTailRotated: (t, r) => rotations.push([t, r]) });
+			manager.cohortHint.set(bytesToB64url(COLLECTION), { topicId: bytesToB64url(TAIL), primary: bytesToB64url(new Uint8Array([4])), cohortHint: [] });
+			expect(await manager.resume()).to.equal('tail_rotated');
+			expect(rotations).to.have.length(1);
+			expect(manager.cohortHint.get(bytesToB64url(COLLECTION))).to.equal(undefined); // dropped — cached primary is under the old tree
+		});
 	});
 });
 

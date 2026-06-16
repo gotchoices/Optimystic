@@ -58,12 +58,14 @@ class RingReplayBuffer implements ReplayBuffer {
 	readonly capacity: number;
 	/** revision → entry; trimmed to the highest `capacity` revisions. */
 	private readonly byRevision = new Map<number, RevisionEntry>();
+	private readonly onEvict?: (entry: RevisionEntry) => void;
 
-	constructor(capacity: number) {
+	constructor(capacity: number, onEvict?: (entry: RevisionEntry) => void) {
 		if (!Number.isInteger(capacity) || capacity < 1) {
 			throw new RangeError(`reactivity replay buffer: capacity must be an integer >= 1, got ${capacity}`);
 		}
 		this.capacity = capacity;
+		this.onEvict = onEvict;
 	}
 
 	get size(): number {
@@ -119,12 +121,21 @@ class RingReplayBuffer implements ReplayBuffer {
 	private trim(): void {
 		while (this.byRevision.size > this.capacity) {
 			const lowest = Math.min(...this.byRevision.keys());
+			const evicted = this.byRevision.get(lowest)!;
 			this.byRevision.delete(lowest);
+			// Hand the retired revision to the (optional) observer — the rolling parent checkpoint
+			// (`docs/reactivity.md` §Parent checkpoint summaries) feeds on exactly these evictions so its
+			// span tracks the window immediately below the ring's low edge.
+			this.onEvict?.(evicted);
 		}
 	}
 }
 
-/** Build a {@link ReplayBuffer} with capacity `W` (default {@link W_DEFAULT}). */
-export function createReplayBuffer(capacity: number = W_DEFAULT): ReplayBuffer {
-	return new RingReplayBuffer(capacity);
+/**
+ * Build a {@link ReplayBuffer} with capacity `W` (default {@link W_DEFAULT}). `onEvict`, when supplied, is
+ * invoked with each entry retired from the ring's low edge (the {@link PushState} wires it to the rolling
+ * checkpoint so revisions leaving the replay window roll into the parent-checkpoint summary).
+ */
+export function createReplayBuffer(capacity: number = W_DEFAULT, onEvict?: (entry: RevisionEntry) => void): ReplayBuffer {
+	return new RingReplayBuffer(capacity, onEvict);
 }

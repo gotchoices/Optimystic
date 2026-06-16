@@ -244,20 +244,39 @@ RevisionEntry {
 
 ### Resume
 
+> **Implemented** (`11.5-reactivity-backfill-resume-checkpoints`). The classifier + server are
+> `classifyResume` / `serveResume` in `packages/db-core/src/reactivity/resume.ts` (pure over a
+> `PushState` snapshot — replay ring + rolling checkpoint + current tail). The subscriber-side apply is
+> `applyResumeReply` (backfill / checkpoint-window entries re-enter through the delivery path so they are
+> verified, contiguity-checked, and deduped; a verified checkpoint advances the contiguity head via
+> `ReactivitySubscriber.rebaseline` before replaying `recentEntries`; an untrusted checkpoint or
+> out-of-window escalates to a chain read; a stale tail escalates to re-registration). db-p2p's
+> `ReactivitySubscriptionManager.resume()` drives the RPC and keeps the Edge `StickyCohortHintCache`.
+
 A subscriber resuming from sleep sends:
 
 ```
-ResumeV1 { collectionId, fromRevision, latestKnownTailId }
+ResumeV1 { v, collectionId, fromRevision, latestKnownTailId, subscriberCoord, timestamp, signature }
 ```
 
 to its cached `primary` (or any cohort member if primary is stale). The cohort responds with one of:
 
 - `Backfill { entries, currentRevision }` — `fromRevision` is within the replay window. Subscriber replays entries, dedupes, and is current. Single round trip.
-- `CheckpointWindow { checkpoint, recentEntries }` — `fromRevision` is older than the buffer but within parent-checkpoint range (see below). Subscriber applies the checkpoint summary, then replays the recent entries.
-- `OutOfWindow { currentTailId, currentRevision, currentMembership }` — `fromRevision` is older than even the parent checkpoint. Subscriber falls back to a chain read.
-- `TailRotated { newTailId, newRevisionAtRotation }` — `latestKnownTailId` is stale. Subscriber re-registers under the new tail and replays from the new tree.
+- `CheckpointWindow { checkpoint, recentEntries }` — `fromRevision` is older than the buffer but within parent-checkpoint range (see below). Subscriber verifies the checkpoint's bracketing endpoints, applies the merged digest, advances its contiguity head past the summarized range, then replays the recent entries.
+- `OutOfWindow { currentTailId, currentRevision }` — `fromRevision` is older than even the parent checkpoint. Subscriber falls back to a chain read, then a fresh subscribe.
+- `TailRotated { newTailId, newRevisionAtRotation }` — `latestKnownTailId` is stale. Subscriber re-registers under the new tail and replays from the new tree. This is classified **first**: a stale tail means the whole tree migrated, so the lag-against-windows classification is moot. (The rotation *lifecycle* is owned by [reactivity-rotation-backpressure-policy]; this resume path only *detects* the stale tail.)
+
+**Resume-on-rotation → keep the simple full walk (resolved, `11.5`).** On `TailRotated` the subscriber re-registers under the new tail via the ordinary walk from `d_max`. The Edge **sticky `cohortHint` cache** already shortcuts the *common* case — a brief flap with no rotation resumes against the cached primary in one round trip (the cache is invalidated only on an actual `TailRotated`, so a stale-tree primary is never reused). A pre-dial toward the pre-announced successor coord (from the `rotationHint`) is **deferred to the rotation ticket**: it requires rotation-side announce state (the successor coord is not knowable until the filling commit), so it belongs with the rotation lifecycle rather than the resume classifier.
 
 ### Parent checkpoint summaries
+
+> **Implemented** (`11.5-reactivity-backfill-resume-checkpoints`). The rolling checkpoint is
+> `RollingCheckpoint` in `packages/db-core/src/reactivity/checkpoint.ts`, fed by replay-ring eviction —
+> `PushState` wires `createReplayBuffer(..., onEvict)` to `RollingCheckpoint.retire`, so a revision leaving
+> the `W`-deep ring rolls into the `W_checkpoint`-span summary sitting immediately below it. `PushState.parentCheckpoint`
+> exposes the current `CheckpointSummary` (re-derived from the live rolling checkpoint). `W_checkpoint` is
+> sourced from the shared defaults table (`config.ts` `W_CHECKPOINT_DEFAULT = 4096`) and scales adaptively
+> via `resolveWCheckpoint` (a fixed `16×` multiple of the resolved `W`).
 
 A 256-revision replay buffer at one commit per second covers ≈4 minutes — long enough for a backgrounded mobile app, not for a phone in a pocket overnight. To extend recoverable range without ballooning replay-buffer memory, every parent forwarder cohort (and the tail cohort) maintains a `CheckpointSummary`:
 
@@ -265,14 +284,28 @@ A 256-revision replay buffer at one commit per second covers ≈4 minutes — lo
 CheckpointSummary {
   collectionId:        bytes
   fromRevision:        uint64
-  toRevision:          uint64          // toRevision - fromRevision ≈ W_checkpoint, default 4096
-  mergedDigest:        bytes           // application-defined fold of digests from each entry
-  mergedDelta?:        bytes           // optional, bounded; coalesced delta if collection supports
-  bracketingSigs:      thresholdSig[2] // sigs of the entries at fromRevision and toRevision
+  toRevision:          uint64               // toRevision - fromRevision ≈ W_checkpoint, default 4096
+  mergedDigest:        bytes                // system-level deterministic fold of per-revision digests (per-collection override)
+  mergedDelta?:        bytes                // optional, bounded; coalesced delta — omitted when it would exceed delta_max
+  bracketingEntries:   NotificationV1[2]    // the FULL endpoint notifications at fromRevision and toRevision
 }
 ```
 
-The checkpoint is *not* a replacement for the source-of-truth chain; it is a hint summary. The bracketing signatures let a subscriber verify the checkpoint endpoints are real committed revisions; the merged digest tells the application "here's what changed across this range." For KV-shaped collections this is enough to know whether to invalidate caches without a chain read. For collections needing exact intermediate state, the checkpoint is not sufficient and the subscriber must fall back to the chain.
+The checkpoint is *not* a replacement for the source-of-truth chain; it is a hint summary. The two **bracketing endpoints** are carried as the full endpoint notifications (not bare signatures): a bare threshold signature is not independently verifiable — to prove an endpoint is a real committed revision a subscriber needs the signed payload (the commit digest) and the signers, both of which the full `NotificationV1` carries. `verifyCheckpointEndpoints` runs the standard notification verifier over both endpoints (proving they are real committed revisions) and confirms their revisions equal `fromRevision`/`toRevision`; a forged or tampered endpoint is rejected. The merged digest tells the application "here's what changed across this range." For KV-shaped collections this is enough to know whether to invalidate caches without a chain read. For collections needing exact intermediate state, the checkpoint is not sufficient and the subscriber must fall back to the chain.
+
+**Resolved design questions** (`docs/reactivity.md` open questions, decided in `11.5`):
+
+- **`mergedDigest` semantics → system-level deterministic fold, per-collection override.** `NotificationV1.digest`
+  carries the commit-vote signed payload `utf8(commitHash + ":approve")` (see [transactions.md](transactions.md)
+  and §Notification origination) — per-revision deterministic and identical across cohort members. The default
+  `mergedDigest` is a deterministic running hash `accᵢ = H(accᵢ₋₁ ‖ digestᵢ)` over the per-revision digests in
+  revision order, so every member folds to identical bytes (gossip converges). A collection MAY override the
+  fold (e.g. a KV collection folding changed-key sets). The merged digest is **not** cryptographically verified —
+  it is a hint; the cryptographic anchor is the bracketing endpoints.
+- **`mergedDelta` vs `delta_max` → omit when oversize, never split.** Per-revision deltas are coalesced (default:
+  ordered concatenation) only when the coalesced result fits within `delta_max`; otherwise `mergedDelta` is
+  omitted entirely (the subscriber relies on `mergedDigest` + the resume's `recentEntries`, or chain-reads). A
+  checkpoint is a bounded hint — no multi-frame splitting.
 
 `W_checkpoint` defaults to 16× the replay buffer (4096 revisions ≈ 1 hour at 1 cps) and is configurable per collection. Cohorts at tier `d ≥ 1` are the primary holders of checkpoints; the tail cohort holds the current rolling checkpoint, advancing it as revisions retire from the replay buffer.
 
@@ -280,12 +313,17 @@ The checkpoint is *not* a replacement for the source-of-truth chain; it is a hin
 
 ### Backfill RPC
 
+> **Implemented** (`11.5-reactivity-backfill-resume-checkpoints`). `serveBackfill` (cohort side) and
+> `createBackfillRequester` (subscriber side, the `requestBackfill` seam ↔ RPC) live in
+> `packages/db-core/src/reactivity/backfill.ts`; db-p2p's `ReactivitySubscriptionManager` wires the
+> requester to the subscriber's gap-detection seam when a backfill transport is supplied.
+
 ```
-BackfillV1 { collectionId, fromRevision, toRevision }
-BackfillReplyV1 { entries: NotificationV1[], available: { from, to } }
+BackfillV1 { v, collectionId, fromRevision, toRevision, signature }
+BackfillReplyV1 { v, entries: NotificationV1[], available: { fromRevision, toRevision } }
 ```
 
-Subscribers MAY request a sub-range smaller than `[fromRevision, toRevision]`; cohorts return the intersection with their replay buffer and indicate `available` so the subscriber knows whether to fall back further.
+Subscribers MAY request a sub-range smaller than `[fromRevision, toRevision]`; cohorts return the intersection with their replay buffer and indicate `available` so the subscriber knows whether to fall back further. When `available.fromRevision` exceeds the requested low edge, the subscriber's lag has fallen past the ring — it escalates to a checkpoint resume or a chain read.
 
 ---
 
@@ -322,7 +360,7 @@ For collections with `block_fill_size = 64` and one commit per minute, rotation 
 - **Rotation hints** are part of the notification payload and inherit its signature.
 - **Forwarder cohorts do not re-sign.** They pass through the original threshold signature unchanged.
 - **Replay-buffer entries** retain the original signature. Backfill responses are verifiable end-to-end.
-- **Checkpoint summaries** are signed at their endpoints by the cohorts that produced them at those revisions; the merged digest is computed deterministically from the bracketed range. A subscriber verifies the bracketing signatures and checks the digest only against application-level expectations.
+- **Checkpoint summaries** carry their two endpoints as the **full** bracketing notifications (each retaining its original threshold signature), so a subscriber verifies them with the same end-to-end notification verifier it uses for live notifications — proving both endpoints are real committed revisions. The merged digest is computed deterministically from the bracketed range and is a **hint only** (checked against application-level expectations, never trusted as authority). A forged or tampered endpoint fails verification and the subscriber falls back to the chain — a checkpoint never advances state on its own.
 
 A subscriber needs no trust in any forwarder. The trust root is the tail cohort's membership, which derives from the transaction log.
 
@@ -373,7 +411,8 @@ Cohort-topic's promotion machinery handles this with `cap_promote_fast`: when th
 > on decode, byte-fidelity round-trips. `SubscribeAppPayloadV1` is the opaque `RegisterV1.appPayload`
 > (the cohort-topic envelope frames it and carries the `correlationId` + `timestamp` + peer-key
 > signature, so the payload itself carries no signature); `NotificationV1` is a length-prefixed frame.
-> The `ResumeV1` / `BackfillV1` codecs below belong to `reactivity-backfill-resume-checkpoints`.
+> The `ResumeV1` / `ResumeReplyV1` / `BackfillV1` / `BackfillReplyV1` codecs below are implemented in
+> `resume.ts` / `backfill.ts` by `11.5-reactivity-backfill-resume-checkpoints`, same conventions.
 
 Reactivity reuses the cohort-topic layer's `RegisterV1`, `RenewV1`, etc., with a reactivity-specific `appPayload`:
 
@@ -428,11 +467,12 @@ interface ResumeReplyV1 {
   currentRevision?:   number
   // checkpoint_window:
   checkpoint?: {
-    fromRevision:   number
-    toRevision:     number
-    mergedDigest:   string
-    mergedDelta?:   string
-    bracketingSigs: string[]            // length 2
+    collectionId:      string
+    fromRevision:      number
+    toRevision:        number
+    mergedDigest:      string
+    mergedDelta?:      string
+    bracketingEntries: NotificationV1[]   // length 2 — the FULL endpoint notifications (verifiable)
   }
   recentEntries?:     NotificationV1[]
   // out_of_window:
@@ -443,6 +483,12 @@ interface ResumeReplyV1 {
   newRevisionAtRotation?: number
 }
 ```
+
+> The `checkpoint` carried in a `checkpoint_window` reply is exactly the `CheckpointSummary`
+> (§Parent checkpoint summaries) — its endpoints are the **full** bracketing notifications, not bare
+> signatures, so the subscriber can verify them end-to-end. The codecs are `encode/decodeResumeV1` and
+> `encode/decodeResumeReplyV1` in `packages/db-core/src/reactivity/resume.ts` (JSON, byte fields
+> base64url, unix-ms timestamps, per-message structural validation on decode).
 
 ### Backfill
 

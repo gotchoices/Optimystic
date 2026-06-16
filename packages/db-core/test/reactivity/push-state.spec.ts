@@ -45,10 +45,25 @@ const newState = (): PushState =>
 	});
 
 describe('reactivity push state', () => {
-	it('reserves the sibling-ticket fields (parentCheckpoint / perSubscriberQueue) without populating them', () => {
+	it('exposes an empty parent checkpoint until revisions retire, and an empty backpressure map', () => {
 		const state = newState();
-		expect(state.parentCheckpoint).to.equal(undefined);
-		expect(state.perSubscriberQueue.size).to.equal(0);
+		expect(state.parentCheckpoint).to.equal(undefined); // nothing has retired from the ring yet
+		expect(state.perSubscriberQueue.size).to.equal(0); // reserved for the backpressure ticket
+	});
+
+	it('rolls evicted revisions into the parent checkpoint as the replay ring overflows', () => {
+		// Ring depth 3, checkpoint span 4: pushing 1..10 leaves the ring holding [8,9,10] and the
+		// checkpoint summarizing the next-lower span [4..7] (the window immediately below the ring).
+		const state = new PushState({ collectionId: b(1), topicId: b(3), tailIdAtJoin: b(2), w: 3, wCheckpoint: 4 });
+		for (let rev = 1; rev <= 10; rev++) {
+			state.replayBuffer.append({ revision: rev, payload: makeNotification(rev), receivedAt: 1000 + rev });
+		}
+		expect(state.replayBuffer.lowRevision).to.equal(8);
+		const checkpoint = state.parentCheckpoint;
+		expect(checkpoint?.fromRevision).to.equal(4);
+		expect(checkpoint?.toRevision).to.equal(7);
+		expect(checkpoint?.bracketingEntries[0].revision).to.equal(4);
+		expect(checkpoint?.bracketingEntries[1].revision).to.equal(7);
 	});
 
 	describe('gossip codec', () => {

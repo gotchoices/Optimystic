@@ -31,6 +31,7 @@ import {
 	requireV1,
 } from "./wire-validate.js";
 import type { ReplayBuffer } from "./replay-buffer.js";
+import type { ReactivitySubscriber } from "./subscriber.js";
 import { validateNotificationArray, validateNotificationV1, type NotificationV1 } from "./wire.js";
 
 /** A subscriber's request to replay a contiguous revision range from a cohort's buffer. */
@@ -128,4 +129,51 @@ export function serveBackfill(buffer: ReplayBuffer, req: BackfillV1, expectedCol
 		? { fromRevision: req.fromRevision, toRevision: req.fromRevision }
 		: { fromRevision: low, toRevision: high };
 	return { v: 1, entries, available };
+}
+
+// --- subscriber-side backfill requester (the `requestBackfill` seam ↔ this RPC) ---
+
+/** Sends a signed {@link BackfillV1} to the serving cohort and awaits its {@link BackfillReplyV1}. */
+export type BackfillTransport = (req: BackfillV1) => Promise<BackfillReplyV1>;
+
+/** Construction inputs for {@link createBackfillRequester}. */
+export interface BackfillRequesterDeps {
+	/** Collection this subscription tracks, base64url. */
+	readonly collectionId: string;
+	/** Sign the request over its unsigned image (the subscriber's peer key); returns the base64url sig. */
+	readonly sign: (req: Omit<BackfillV1, "signature">) => string;
+	/** Send the request and await the reply (the db-p2p reactivity application protocol supplies this). */
+	readonly transport: BackfillTransport;
+	/** Re-enter each backfilled entry through the delivery path (verify → contiguity → deliver → dedupe). */
+	readonly subscriber: ReactivitySubscriber;
+	/**
+	 * Called when the cohort's `available` window does not reach the gap's low edge (`available.fromRevision
+	 * > from`): the buffer no longer covers the gap, so the subscriber must escalate to a checkpoint resume
+	 * or a chain read (`docs/reactivity.md` §Backfill RPC, "fall back further").
+	 */
+	readonly onUnderflow?: (requested: { from: number; to: number }, available: { fromRevision: number; toRevision: number }) => void;
+}
+
+/**
+ * Build the `requestBackfill(from, to)` driver that connects the subscriber delivery path's backfill seam
+ * ([reactivity-origination-replay-delivery]) to the {@link BackfillV1} RPC. It signs and sends the request,
+ * replays the returned entries through {@link ReactivitySubscriber.onNotification} (so they close the gap,
+ * verified and deduped), and reports an underflow when the cohort's `available` window fell past the gap's
+ * low edge so the caller can fall back to a checkpoint resume or a chain read.
+ *
+ * Returns a `Promise`; the synchronous `(from, to) => void` seam wraps a call to this with `void`.
+ */
+export function createBackfillRequester(deps: BackfillRequesterDeps): (from: number, to: number) => Promise<BackfillReplyV1> {
+	return async (from: number, to: number): Promise<BackfillReplyV1> => {
+		const unsigned: Omit<BackfillV1, "signature"> = { v: 1, collectionId: deps.collectionId, fromRevision: from, toRevision: to };
+		const req: BackfillV1 = { ...unsigned, signature: deps.sign(unsigned) };
+		const reply = await deps.transport(req);
+		for (const entry of reply.entries) {
+			await deps.subscriber.onNotification(entry);
+		}
+		if (reply.available.fromRevision > from) {
+			deps.onUnderflow?.({ from, to }, reply.available);
+		}
+		return reply;
+	};
 }

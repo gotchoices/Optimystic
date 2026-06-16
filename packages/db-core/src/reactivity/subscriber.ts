@@ -56,6 +56,14 @@ export interface ReactivitySubscriber {
 	readonly lastRevision: number;
 	/** Process one inbound notification; returns the {@link DeliveryOutcome}. */
 	onNotification(n: NotificationV1): Promise<DeliveryOutcome>;
+	/**
+	 * Advance the contiguity head to `revision` because a **verified parent checkpoint** summarized every
+	 * revision up to it (`docs/reactivity.md` §Parent checkpoint summaries). The subscriber then treats
+	 * `revision + 1` as the next contiguous revision, so the checkpoint's `recentEntries` replay without a
+	 * spurious gap/backfill for the digest-covered range. Only advances — never rewinds past delivered
+	 * state. The merged digest itself is applied by the application; this just moves the contiguity head.
+	 */
+	rebaseline(revision: number): void;
 }
 
 class CollectionSubscriber implements ReactivitySubscriber {
@@ -71,6 +79,14 @@ class CollectionSubscriber implements ReactivitySubscriber {
 
 	get lastRevision(): number {
 		return this.last;
+	}
+
+	rebaseline(revision: number): void {
+		// A verified checkpoint summarized everything up to `revision`; jump the head forward (never back).
+		if (!this.initialized || revision > this.last) {
+			this.last = revision;
+			this.initialized = true;
+		}
 	}
 
 	async onNotification(n: NotificationV1): Promise<DeliveryOutcome> {

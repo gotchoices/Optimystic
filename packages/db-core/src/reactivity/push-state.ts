@@ -17,6 +17,7 @@
 import { bytesToB64url, b64urlToBytes, decodeCohortMessage, encodeCohortMessage, DEFAULT_MAX_MESSAGE_BYTES } from "../cohort-topic/wire/codec.js";
 import { CohortWireError } from "../cohort-topic/wire/validate.js";
 import { DEDUPE_WINDOW_DEFAULT, W_DEFAULT } from "./config.js";
+import { RollingCheckpoint, type CheckpointSummary, type DeltaCoalesce, type DigestFold } from "./checkpoint.js";
 import { createDedupeWindow, type DedupeStateV1, type DedupeWindow } from "./dedupe.js";
 import { createReplayBuffer, type ReplayBuffer, type ReplayBufferStateV1, type RevisionEntry } from "./replay-buffer.js";
 import { validateNotificationV1 } from "./wire.js";
@@ -27,17 +28,6 @@ export interface CohortRef {
 	readonly coord: string;
 	/** The cohort's primary member id, base64url (when known). */
 	readonly primary?: string;
-}
-
-/**
- * Parent checkpoint summary — **reserved** for [reactivity-backfill-resume-checkpoints]
- * (`docs/reactivity.md` §Parent checkpoint summaries). Declared minimally here so {@link PushState}
- * carries the field and the three tickets share one struct; the sibling ticket fills out the merged
- * digest / bracketing-signature logic.
- */
-export interface CheckpointSummary {
-	readonly fromRevision: number;
-	readonly toRevision: number;
 }
 
 /**
@@ -66,6 +56,14 @@ export interface PushStateInit {
 	readonly w?: number;
 	/** Dedupe-window span (default {@link DEDUPE_WINDOW_DEFAULT}). */
 	readonly dedupeWindow?: number;
+	/** Parent-checkpoint span `W_checkpoint` (default {@link import("./config.js").W_CHECKPOINT_DEFAULT}). */
+	readonly wCheckpoint?: number;
+	/** `delta_max` for the checkpoint's coalesced `mergedDelta`; `0` (default) ⇒ never emit a delta. */
+	readonly deltaMaxBytes?: number;
+	/** `mergedDigest` fold override (default: deterministic running hash over per-revision commit digests). */
+	readonly checkpointFold?: DigestFold;
+	/** `mergedDelta` coalescer override (default: ordered concatenation). */
+	readonly coalesceDeltas?: DeltaCoalesce;
 }
 
 /** The cohort-gossiped wire image of a {@link PushState}. */
@@ -95,8 +93,13 @@ export class PushState {
 	readonly dedupe: DedupeWindow;
 	lastRevision: number;
 
-	/** Reserved — populated by [reactivity-backfill-resume-checkpoints]. */
-	parentCheckpoint?: CheckpointSummary;
+	/**
+	 * The rolling parent checkpoint ([reactivity-backfill-resume-checkpoints], `docs/reactivity.md`
+	 * §Parent checkpoint summaries). Fed by replay-ring eviction — as revisions retire from the `W`-deep
+	 * ring they roll into this `W_checkpoint`-span summary sitting immediately below the ring, so a resume
+	 * recovers `W + W_checkpoint` revisions in one round trip (the stacked-window semantics).
+	 */
+	readonly checkpoint: RollingCheckpoint;
 	/** Reserved — populated by [reactivity-rotation-backpressure-policy]. */
 	readonly perSubscriberQueue: Map<string, BoundedQueueRef> = new Map();
 
@@ -106,9 +109,27 @@ export class PushState {
 		this.tailIdAtJoin = init.tailIdAtJoin;
 		this.parentCohort = init.parentCohort;
 		this.childCohorts = init.childCohorts ?? [];
-		this.replayBuffer = createReplayBuffer(init.w ?? W_DEFAULT);
+		this.checkpoint = new RollingCheckpoint({
+			collectionId: init.collectionId,
+			span: init.wCheckpoint,
+			deltaMaxBytes: init.deltaMaxBytes,
+			fold: init.checkpointFold,
+			coalesceDeltas: init.coalesceDeltas,
+		});
+		// Wire the ring's low-edge eviction into the rolling checkpoint: a revision leaving the replay
+		// window is exactly a revision that should roll into the parent-checkpoint summary.
+		this.replayBuffer = createReplayBuffer(init.w ?? W_DEFAULT, (evicted) => this.checkpoint.retire(evicted));
 		this.dedupe = createDedupeWindow(init.dedupeWindow ?? DEDUPE_WINDOW_DEFAULT);
 		this.lastRevision = -1;
+	}
+
+	/**
+	 * The current parent-checkpoint summary, or `undefined` until revisions have retired from the replay
+	 * ring (`docs/reactivity.md` §Parent checkpoint summaries). Re-derived from the live rolling checkpoint
+	 * on each read so it always reflects the latest retired range.
+	 */
+	get parentCheckpoint(): CheckpointSummary | undefined {
+		return this.checkpoint.summary();
 	}
 
 	/** Snapshot the gossipable slice for cohort replication. */
