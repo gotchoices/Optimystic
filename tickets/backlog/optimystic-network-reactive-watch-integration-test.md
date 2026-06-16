@@ -4,6 +4,16 @@ files: packages/quereus-plugin-optimystic/test/reactive-watch.spec.ts, packages/
 
 # optimystic reactive watch: network-path integration test
 
+> **Superseded in part** (`reactivity-e2e-mock-tier`). The *reactivity-surface* intent of this stub — a
+> commit driving notification fan-out to subscribers over a network — is now covered at scale by the
+> reactivity mock-tier e2e suites (`packages/db-p2p/test/reactivity/mesh-*.spec.ts` over
+> `src/testing/reactivity-mesh-harness.ts`): real commits flow through the real `local-change-notifier-bridge`
+> → real origination → real fan-out → real delivery, end-to-end. What remains uniquely here is the
+> **real-libp2p socket** wakeup of a **Quereus `Database.watch`** consumer (the vtab →
+> `notifyExternalChange` bridge over an actual libp2p node), which belongs to the real-libp2p tier
+> (`substrate-e2e-real-libp2p-tier`), not the mock tier. Keep this ticket for that residual real-socket
+> Quereus-bridge case; the mock tier does not duplicate it.
+
 ## Problem
 
 The `optimystic-vtab-reactive-watch-bridge` work made optimystic-backed Quereus

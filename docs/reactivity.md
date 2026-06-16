@@ -674,6 +674,51 @@ Tail cohort emits notification for revision 7800. Tier-1 forwarder `F_a` receive
 
 ---
 
+## Mock-tier e2e coverage
+
+> **Implemented** (`reactivity-e2e-mock-tier`). The reactivity hot path + recovery + rotation/backpressure
+> run end-to-end over the in-process mock mesh in `packages/db-p2p/src/testing/reactivity-mesh-harness.ts`
+> (layered on the cohort-topic mesh harness): real commits flow through the real
+> `local-change-notifier-bridge` → real origination (commit cert reused **unchanged**) → real forwarder
+> receive path (verify → dedupe → `W`-ring + rolling checkpoint) → the real `ReactivitySubscriptionManager`
+> delivery, **verified end-to-end against the tail cohort's `MembershipCertV1` with real Ed25519
+> collected-multisig crypto** (no pass-crypto stub). The harness *models* only the notification transport
+> (the application protocol that would dial each subscriber's primary / child cohort) and, like the
+> matchmaking mock tier, the **single-tier-0 reach**. This **supersedes the intent** of the superseded
+> backlog stub [`optimystic-network-reactive-watch-integration-test`] — that stub asked for a single
+> networked reactive-watch test; the suites here generalize it to the full reactivity surface at scale. The
+> residual *real-libp2p socket* wakeup of a `Database.watch` consumer (the stub's Quereus-bridge concern) is
+> the `substrate-e2e-real-libp2p-tier` ticket's, not duplicated here.
+
+Each §Worked scenario / §Failure mode maps to a named test (or a tagged-unimplemented expectation):
+
+| Doc scenario / failure mode | Mock-tier test |
+|---|---|
+| §Worked — cold collection becomes popular | `mesh-cold-to-hot.spec.ts` *cold collection gains subscribers …* (delivery to every subscriber, contiguous + verified) |
+| §Delivery / §Authentication — verify, dedupe, baseline | `mesh-cold-to-hot.spec.ts` *drops an untrusted notification* / *duplicate re-delivery deduped* / *late subscriber adopts baseline* |
+| §Worked — tree forms / depth tracks subscriber count | `mesh-cold-to-hot.spec.ts` *[mock-tier] promotion machinery fires …* — **`[unimplemented:mock-tier]`** for the multi-tier *serving* fan-out + quantitative depth regime (cohort-topic follow-ons + simulator) |
+| §Worked — mobile wakes after 90 s (`lag < W`) | `mesh-mobile-resume.spec.ts` *lag < W → one Backfill* |
+| §Worked — mobile wakes after 20 min (`W ≤ lag < W+W_checkpoint`) | `mesh-mobile-resume.spec.ts` *W ≤ lag < W+W_checkpoint → CheckpointWindow* |
+| §Failure — wakes after long sleep (`lag ≥ W+W_checkpoint`) | `mesh-mobile-resume.spec.ts` *lag ≥ W+W_checkpoint → OutOfWindow → chain read* |
+| §Failure — tail rotation during outage (stale `latestKnownTailId`) | `mesh-mobile-resume.spec.ts` *stale latestKnownTailId → TailRotated* |
+| §Tail rotation — pre-announce + jittered re-registration | `mesh-tail-rotation.spec.ts` *filling commit pre-announces …* / *wave within cap_promote_fast* |
+| §Tail rotation — handoff + continuity (no gap) | `mesh-tail-rotation.spec.ts` *delivered stream is continuous across the handoff* |
+| §Tail rotation — old-tail drain (serve renewals/replays, bounce new subs) | `mesh-tail-rotation.spec.ts` *drain gate serves renewals/replays and bounces new subscriptions* |
+| §Worked — tail rotation during steady load (10k burst, peak = 32) | **`[unimplemented:mock-tier]`** — the at-scale burst magnitude is the design simulator's (`TailRotationScenario`); the mock tier asserts the `cap_promote_fast` bound holds on a real wave |
+| §Failure — fan-out interrupted / §Interaction — partition healing | `mesh-partition-healing.spec.ts` *heals via backfill with no loss* / *duplicate deduped* / *sliding dedupe drops exact retransmit* / *forged retransmit rejected* |
+| §Failure — slow subscriber on satellite link / §Slow-subscriber backpressure | `mesh-slow-subscriber.spec.ts` *drops-oldest and backfills without stalling fast subscribers* |
+| §Per-cohort policy — Edge never forwards | `mesh-slow-subscriber.spec.ts` *Edge subscriber receives but never forwards* |
+| §Failure — cohort fully fails / cohort failure mid-notification | **`[unimplemented:mock-tier]`** — cohort crash-failover + backup-promotion is the cohort-topic layer's recovery (`cohort-topic-scale-lifecycle.spec.ts`); reactivity's no-loss-on-failover is exercised via the partition-heal backfill above |
+
+**Window / burst magnitudes are the simulator's.** `W = 256`, `W_checkpoint = 4096`, the `16×` ratio, and
+the rotation-burst bound are validated quantitatively by the design simulator (§Configuration / §Worked
+scenarios). The mock-tier resume suite drives the **classifier behavior at the stacked boundaries** with
+scaled-down `W`/`W_checkpoint` (so it needs a few dozen commits, not thousands) — the variant each lag
+produces, not the production magnitudes. Production config is imported from `config.ts`; the mesh suites
+never hard-code drifting numbers.
+
+---
+
 ## Interaction with other subsystems
 
 - **Cohort topic** ([cohort-topic.md](cohort-topic.md)) — owns addressing, walks, willingness, promotion/demotion, primary/backup sharding, membership certificates. Reactivity is one application on top.
