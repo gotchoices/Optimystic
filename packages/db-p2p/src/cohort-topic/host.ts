@@ -119,6 +119,7 @@ import {
 	type RegisterRateLimiterConfig,
 	type RegisterReplyV1,
 	type RegisterV1,
+	type RegistrationRecord,
 	type RenewReplyV1,
 	type RenewV1,
 	type RingCoord,
@@ -249,6 +250,12 @@ export interface CoordEngine {
 	hasState(): boolean;
 	/** True iff this engine holds the record for `(topicId, participantId)` — the renewal lookup key. */
 	holds(topicId: Uint8Array, participantId: Uint8Array): boolean;
+	/**
+	 * This cohort's locally-known direct registration records for `topicId` (the cohort-side read the
+	 * matchmaking `QueryV1` handler / aggregate-count producer serve from — `docs/matchmaking.md`
+	 * §Seeker query). A renewed record is live; a TTL-swept one is gone after the next `gossipRound`.
+	 */
+	records(topicId: Uint8Array): readonly RegistrationRecord[];
 	/**
 	 * Publish a fresh threshold-signed `MembershipCertV1` on a cohort-membership-change / stabilization
 	 * event (republishes only when the first `k − x` members changed). Returns the cert if published.
@@ -1111,6 +1118,7 @@ function createCoordEngine(ctx: CoordEngineContext, servedCoord: RingCoord, tree
 		hasState: (): boolean => store.listAll().length > 0,
 		holds: (topicId: Uint8Array, participantId: Uint8Array): boolean =>
 			store.getByParticipant(topicId, participantId) !== undefined,
+		records: (topicId: Uint8Array): readonly RegistrationRecord[] => store.listByTopic(topicId),
 		cohortView: (): CohortView => view,
 		servesTopic: (topicId: Uint8Array): boolean =>
 			store.directParticipants(topicId) > 0 || coldStart.get(topicId) !== undefined,

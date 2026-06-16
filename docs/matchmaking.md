@@ -22,7 +22,9 @@ Both roles use the same cohort-topic registration mechanism with stable topic an
 
 This replaces the earlier Kademlia `provide`/`findProviders` framing. The cohort-topic layer gives matchmaking what the original provide-based approach could not: tree growth that automatically adapts to hot tasks (without flooding), cohort-stable forwarder identity (instead of fragile per-key replication), and shared infrastructure with reactivity and future directory consumers.
 
-> **Implemented** (mock-tier e2e pending). The cohesive public module is
+> **Implemented** (mock-tier e2e: `db-p2p` `matchmaking/mesh-{lifecycle,walk,sweep}.spec.ts` over
+> `matchmaking-mesh-harness.ts` — see §Test expectations "Mock-tier e2e"; the per-feature callouts below
+> still read "mock-tier e2e pending" for the narrower slice each describes). The cohesive public module is
 > `packages/db-p2p/src/matchmaking/module.ts`: `MatchmakingProviderSession`
 > (`register(topic, payload)` / `renew` / `withdraw` / `setCapacity` / `signalFull`) and
 > `MatchmakingSeekerSession` (`register(topic, payload)` / `query(q)` / `walk(topic, want)` — the hang-out
@@ -430,6 +432,29 @@ The §Decision rule above is the common path. A few specific situations need exp
 
 The wire codecs, the stable topic anchor, both registration roles (provider attach/renew/self-throttle; seeker short-TTL registration), the query/filter evaluation, and the seeker hang-out engine are now implemented (see the callouts in §Anchor, §Provider registration, §Seeker query, §Capability filter, §Hang-out vs. continue, and §Wire formats). Each hang-out bullet below has a corresponding passing unit test — `seeker-walk.spec.ts` (db-core) for the decision arithmetic, `seeker-walk-client.spec.ts` (db-p2p) for the walk behavior. The arrival-push bullets remain doc-as-spec until `matchmaking-cohort-push-on-arrival` lands.
 
+> **Mock-tier e2e (implemented).** The mock-transport integration tier
+> (`packages/db-p2p/src/testing/matchmaking-mesh-harness.ts`, layered on the cohort-topic mesh harness)
+> drives the **real** provider/seeker managers, the **real** cohort `QueryV1` handler, and the **real**
+> seeker walk client over an in-process mesh on a virtual clock. The hang-out *decision math* is the
+> `seeker-walk.spec.ts` floor (above); the mesh tier proves a modeled traffic regime drives the real walk
+> over real records. Mapping of the poll bullets to mesh tests (`packages/db-p2p/test/matchmaking/`):
+>
+> - *Cold topic, walks to root* → `mesh-walk.spec.ts` "sparse/cold regime" (real `NoState` fall-through to
+>   the root, `wantCount` met there) and "sparse provider, very large network" (`d_max+1` real hops).
+> - *Hot topic, deep tier suffices* → realized **at the root** by `mesh-walk.spec.ts` "hot regime (root)"
+>   (immediate query meets `wantCount`, no walk past the accepting tier, hotness signal surfaced). The
+>   *deep* (`d ≥ 1`) variant needs a serving promoted child cohort and is tagged-unimplemented
+>   (`it.skip` → `cohort-topic-followon-derivation`).
+> - *Borderline topic, hangs out for full patience* → `mesh-walk.spec.ts` "borderline regime" (drains
+>   ≈`patienceMs` across `requery_interval_ms` polls, returns the partial set).
+> - *Patience drains correctly / withdraws cleanly / stale `arrivalsPerMin=0` / missing `topicTraffic` /
+>   filter-accept-ratio decay* → covered by `seeker-walk-client.spec.ts` (db-p2p, scripted transport) —
+>   the mesh tier does not re-assert per-hop wall-clock draining (register hops are instant on its virtual
+>   clock). The adversarial over-report bound (`docs` §Failure modes) is additionally exercised end-to-end
+>   over the real walk in `mesh-walk.spec.ts` "adversarial over-report …" (wasted hang-out ≤ `patienceMs`,
+>   no spatial flood). Provider register→query round-trip, the capability filter, capacity self-throttling
+>   / TTL-withdrawal, and the multi-cohort sweep over real records live in `mesh-{lifecycle,sweep}.spec.ts`.
+
 - *Hot topic, deep tier suffices.* Seeker stops at the first `Accepted` whose query meets `wantCount`; no walk past the tier of first match.
 - *Cold topic, walks to root.* Seeker traverses every tier from `d_max` down to `d = 0`; `wantCount` is met only at the root.
 - *Borderline topic, hangs out for full patience.* Seeker stays at the accepting tier, re-queries roughly `patienceMs / requery_interval_ms` times, and returns the partial set if still under-met when patience drains.
@@ -822,7 +847,7 @@ A node needs a peer that holds the `geocode-resolver` capability. Network has 5 
 
 Provider side: 30 nodes have each registered at `topicId = H("capability" ‖ "geocode-resolver" ‖ "match")`. With `n_est = 5000`, `d_max = log_16(5000) − 1 ≈ 2`. Most providers walked from `d = 2` toward the root; with only 30 providers the tier-0 cohort accepts them all (well under `cap_promote = 64`).
 
-Seeker side: a node needs three resolvers. Walks from `d_max = 2`: probes `coord_2(self, topicId)` → `NoState`; `d = 1` → `NoState`; `d = 0` → `Accepted` as seeker, then issues `QueryV1{limit: 16}`. Cohort returns the 30 providers. Seeker picks three (e.g., by latency to its peer ID), dials each directly, gets work done. **Confirmed:** this is the simulator's cold-walk shape — `wantCount` met only at the root, hop count `= d_max + 1` inward probes (no bootstrap, since the root already holds providers); the cold-*bootstrap* worst case adds one (`d_max + 2`, per the `d_max_cap` sweep).
+Seeker side: a node needs three resolvers. Walks from `d_max = 2`: probes `coord_2(self, topicId)` → `NoState`; `d = 1` → `NoState`; `d = 0` → `Accepted` as seeker, then issues `QueryV1{limit: 16}`. Cohort returns the 30 providers. Seeker picks three (e.g., by latency to its peer ID), dials each directly, gets work done. **Confirmed:** this is the simulator's cold-walk shape — `wantCount` met only at the root, hop count `= d_max + 1` inward probes (no bootstrap, since the root already holds providers); the cold-*bootstrap* worst case adds one (`d_max + 2`, per the `d_max_cap` sweep). **Mock-tier e2e:** `mesh-walk.spec.ts` "sparse/cold regime" reproduces this over the real seeker walk + real cohort store (`d_max + 1` real register hops, `wantCount` met at the root, every returned entry `registrationSig`-re-validated).
 
 ### Voting on a popular proposal
 
@@ -830,7 +855,7 @@ A governance proposal has 200 000 eligible voters; topic `topicId = H("quorum" �
 
 The tree grows to depth `⌈log_16(200000 / 64)⌉ = 3` tiers. Each tier-3 cohort holds ~50 providers from its prefix-shard. **Confirmed:** the depth law holds exactly at this scale — the simulator's voting-quorum scenario settles a 5,000-voter herd at depth 2 with the root never exceeding `cap_promote = 64`, and the scale sweep measures depth 3 at N = 100k and 4 at N = 1M, so 200k → depth 3 as written.
 
-The voting coordinator (or a delegated quorum-assembler peer) registers as a seeker at the root, queries with `AggregateCountV1`, learns where the populations are, then does a multi-cohort sweep across selected tier-3 cohorts to assemble a quorum of, say, 64 random voters. Each query returns its slice of providers (with eligibility sigs included); the coordinator validates and selects.
+The voting coordinator (or a delegated quorum-assembler peer) registers as a seeker at the root, queries with `AggregateCountV1`, learns where the populations are, then does a multi-cohort sweep across selected tier-3 cohorts to assemble a quorum of, say, 64 random voters. Each query returns its slice of providers (with eligibility sigs included); the coordinator validates and selects. **Mock-tier e2e:** the sweep *port-binding* — `runMultiCohortSweep` over the real `buildAggregateCount` (depth-gated, log-bucketed, threshold-signed) and real shard records, with per-entry `registrationSig` re-validation (a forged shard entry rejected) — is exercised in `mesh-sweep.spec.ts` over a single modeled tier-1 shard backed by the real cohort store. The *multi-tier topology* (a depth-3 tree with many real tier-3 shards) and real `k − x` threshold assembly remain gated on the cohort-topic promotion follow-ons; the depth law itself is simulator-confirmed (above).
 
 Throughout, the root cohort's load is bounded: registration storms get `Promoted(1)` quickly; only the seeker's `AggregateCountV1` and the demoted "almost everyone left" tail hit the root directly. Tier-1 and below carry the bulk of provider state.
 
@@ -840,7 +865,7 @@ A specialty capability (`zk-snark-prover-v2`) has 5 providers in a network of 10
 
 Each provider, walking from `d_max = log_16(10M) − 1 ≈ 5`, falls through all the way to the root. Five registrations at the root cohort; far below `cap_promote`. Tree stays at depth 0.
 
-A seeker similarly walks 5 tiers toward the root, registers, queries, gets the 5 providers. Total cost: 6 RPCs (`d = 5, 4, 3, 2, 1, 0`), the cost of which is dominated by FRET routing not provider lookup. The cost-per-seek is logarithmic in network size, not linear in provider count. **Confirmed:** the `d_max_cap` sensitivity sweep measures cold-walk hops as exactly `d_max + 2` when the root must also bootstrap (5, 6, 7, 8 hops for `d_max` = 3, 4, 5, 6); here the root already holds the 5 providers, so the seeker is `Accepted` at `d = 0` without the extra bootstrap hop — 6 RPCs (`d_max + 1`), as written.
+A seeker similarly walks 5 tiers toward the root, registers, queries, gets the 5 providers. Total cost: 6 RPCs (`d = 5, 4, 3, 2, 1, 0`), the cost of which is dominated by FRET routing not provider lookup. The cost-per-seek is logarithmic in network size, not linear in provider count. **Confirmed:** the `d_max_cap` sensitivity sweep measures cold-walk hops as exactly `d_max + 2` when the root must also bootstrap (5, 6, 7, 8 hops for `d_max` = 3, 4, 5, 6); here the root already holds the 5 providers, so the seeker is `Accepted` at `d = 0` without the extra bootstrap hop — 6 RPCs (`d_max + 1`), as written. **Mock-tier e2e:** `mesh-walk.spec.ts` "sparse provider, very large network" drives exactly this — `d_max = 5`, 5 real providers at the root, **6** real register hops (`d = 5…0`) terminating with `wantCount` met.
 
 ---
 
