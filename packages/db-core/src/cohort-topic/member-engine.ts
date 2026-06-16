@@ -170,7 +170,24 @@ class StoreCohortMemberEngine implements CohortMemberEngine {
 	}
 
 	sweepStale(now: number): readonly RegistrationRecord[] {
-		return this.deps.renewal.sweepStale(now);
+		const evicted = this.deps.renewal.sweepStale(now);
+		const budget = this.deps.topicBudget;
+		if (budget !== undefined && evicted.length > 0) {
+			// Mirror the `accept()` up-touch on the drain side: a TTL sweep that removes a topic's last
+			// direct participant must re-`touch` the budget down so the topic falls to participantCount 0
+			// and becomes the coldest-evictable resident again. Without this the budget slot leaks — a
+			// drained topic keeps its stale positive count forever and `coldestEvictable()` never picks it,
+			// so the cohort eventually refuses every new topic while serving nothing. Re-touch once per
+			// distinct affected topic from `store.directParticipants` (the source of truth, post-eviction).
+			const seen = new Set<string>();
+			for (const rec of evicted) {
+				const key = bytesKey(rec.topicId);
+				if (seen.has(key)) continue;
+				seen.add(key);
+				budget.touch(rec.topicId, this.deps.store.directParticipants(rec.topicId));
+			}
+		}
+		return evicted;
 	}
 
 	// --- admission ---

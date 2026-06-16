@@ -23,7 +23,7 @@
  * members — one {@link CohortGossipBus.applyInbound} of that gossip makes it visible locally.
  */
 
-import { bytesEqual } from "../registration/bytes.js";
+import { bytesEqual, bytesKey } from "../registration/bytes.js";
 import type { RegistrationStore } from "../registration/types.js";
 import type { ICohortGossipTransport, PeerRef, RingCoord } from "../ports.js";
 import { b64urlToBytes, decodeCohortGossipV1, encodeCohortMessage } from "../wire/codec.js";
@@ -61,6 +61,15 @@ export interface CohortGossipBusDeps {
 	 * test/internal merge entry point).
 	 */
 	verifyInbound?: GossipInboundVerifier;
+	/**
+	 * Optional hook fired after a merge that deleted one or more records via gossiped evictions, carrying
+	 * the **distinct** topic ids touched. db-p2p wires it to re-`touch` the per-cohort topic budget down
+	 * (`topicBudget.touch(t, store.directParticipants(t))`) so a topic whose participants drain on a
+	 * *sibling* (the drain arrives here as a gossip eviction, never this member's own TTL sweep) still
+	 * releases its budget slot — mirroring the engine's own `sweepStale` re-touch. Kept as a decoupled
+	 * callback so this gossip/replication module carries no anti-DoS dependency. Absent → skipped.
+	 */
+	onRecordsEvicted?: (topicIds: readonly Uint8Array[]) => void;
 }
 
 /** Intra-cohort gossip bus (merge logic over an injected transport). */
