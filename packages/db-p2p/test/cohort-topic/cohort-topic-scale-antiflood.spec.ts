@@ -57,7 +57,7 @@ function topic(seed: number): Uint8Array {
 const REG = { followOn: false as const, treeTier: 0 };
 
 /** Run one participant's real `service.register` walk in isolation and return its reconstructed trace. */
-async function walkOnce(mesh: CohortMesh, walker: HostNode, topicId: Uint8Array, dMax: number): Promise<{ trace: WalkTrace; firstKey: string; attached: boolean; backoff: boolean }> {
+async function walkOnce(mesh: CohortMesh, walker: HostNode, topicId: Uint8Array, dMax: number): Promise<{ trace: WalkTrace; attached: boolean; backoff: boolean }> {
 	mesh.clearRouteLog();
 	let attached = false;
 	let backoff = false;
@@ -73,7 +73,7 @@ async function walkOnce(mesh: CohortMesh, walker: HostNode, topicId: Uint8Array,
 	}
 	const tierMap = coordTierMap(walker.member, topicId, dMax);
 	const trace = walkTraceFrom(mesh.routeTrace, tierMap, dMax);
-	return { trace, firstKey: mesh.routeTrace[0]?.key ?? '', attached, backoff };
+	return { trace, attached, backoff };
 }
 
 describe('cohort-topic: scale anti-flood + anti-DoS (mock-tier e2e)', function () {
