@@ -2,15 +2,17 @@
  * Matchmaking **mock-transport mesh harness** — the in-process, many-logical-node substrate for the
  * matchmaking *integration* tier (`docs/matchmaking.md`), layered on the cohort-topic mesh harness
  * ({@link import("./cohort-topic-mesh-harness.js")}) rather than forking it. It drives the **real**
- * provider/seeker managers, the **real** cohort-side `QueryV1` handler, and the **real** seeker walk
+ * provider manager, the **real** cohort-side `QueryV1` handler, and the **real** seeker walk
  * client over a network of real-Ed25519-keyed {@link CohortTopicHost}s — so a matchmaking flow is
  * exercised end-to-end (register → cohort store → query → seeker re-validation) without a live libp2p
  * stack.
  *
- * **What is real vs. modeled.** Provider/seeker registration rides the real
- * {@link MatchmakingProviderManager} / {@link MatchmakingSeekerManager} → `CohortTopicService.register`
- * walk, so records land in the real cohort store and carry real peer-key signatures the seeker
- * re-validates with the real `verifyPeerSig`. The cohort `topicTraffic` barometer, however, is
+ * **What is real vs. modeled.** Provider registration rides the real {@link MatchmakingProviderManager}
+ * → `CohortTopicService.register` walk; the seeker walk drives the real {@link SeekerWalkClient} whose
+ * per-tier registrations carry the real {@link MatchmakingSeeker} payload and are dispatched through the
+ * real cohort engines (the one-shot `MatchmakingSeekerManager` wrapper is not on this path). Either way
+ * records land in the real cohort store and carry real peer-key signatures the seeker re-validates with
+ * the real `verifyPeerSig`. The cohort `topicTraffic` barometer, however, is
  * **modeled** ({@link MatchmakingMesh.setTraffic}): the hang-out decision is driven by an injected
  * `arrivalsPerMin` / `queriesPerMin` regime because generating a real arrival *rate* (90/min …)
  * deterministically over a virtual clock is infeasible — the same posture the design simulator takes.
@@ -52,10 +54,8 @@ import {
 	type TopicTrafficV1,
 } from '@optimystic/db-core';
 import type { CohortTopicHost, CoordEngine } from '../cohort-topic/host.js';
-import { bytesToPeerIdString } from '../cohort-topic/peer-codec.js';
 import { signPeer, verifyPeerSig } from '../cohort-topic/peer-sig.js';
 import { MatchmakingProviderManager } from '../matchmaking/provider-manager.js';
-import { MatchmakingSeekerManager } from '../matchmaking/seeker-manager.js';
 import { handleMatchmakingQuery } from '../matchmaking/query-handler.js';
 import { SeekerWalkClient, type SeekerProbeReply, type SeekerWalkTransport } from '../matchmaking/seeker-walk-client.js';
 import {
