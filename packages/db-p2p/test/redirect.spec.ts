@@ -1,6 +1,7 @@
 import { expect } from 'chai';
 import { peerIdFromPrivateKey } from '@libp2p/peer-id';
 import { generateKeyPair } from '@libp2p/crypto/keys';
+import { sha256 } from 'multiformats/hashes/sha2';
 import type { PeerId } from '@libp2p/interface';
 import type { IRepo, BlockGets, GetBlockResults, PendRequest, PendResult, CommitRequest, CommitResult, ActionBlocks, MessageOptions, RepoMessage } from '@optimystic/db-core';
 import { RepoService, type RepoServiceComponents, type NetworkManagerLike } from '../src/repo/service.js';
@@ -10,6 +11,25 @@ const makePeerId = async (): Promise<PeerId> => {
 	const key = await generateKeyPair('Ed25519');
 	return peerIdFromPrivateKey(key);
 };
+
+/** Stable map key for a digest byte array (the sha256 of a blockKey string). */
+const digestMapKey = (key: Uint8Array): string => Array.from(key).join(',');
+
+/** Compute the same digest `checkRedirect` hashes a blockKey string to. */
+const blockKeyDigest = async (blockKey: string): Promise<string> => {
+	const mh = await sha256.digest(new TextEncoder().encode(blockKey));
+	return digestMapKey(mh.digest);
+};
+
+/**
+ * Network manager that returns a different cluster per blockKey, so a test can assert
+ * which block a redirect was actually keyed on (e.g. blockIds[0] vs tailId for commit).
+ */
+const makeKeyedNetworkManager = (byBlockKeyDigest: Map<string, PeerId[]>, fallback: PeerId[]): NetworkManagerLike => ({
+	async getCluster(key: Uint8Array): Promise<PeerId[]> {
+		return byBlockKeyDigest.get(digestMapKey(key)) ?? fallback;
+	}
+});
 
 const makeStubRepo = (): IRepo => ({
 	async get(_blockGets: BlockGets, _options?: MessageOptions): Promise<GetBlockResults> {
@@ -209,6 +229,98 @@ describe('RepoService redirect logic', () => {
 			const message: RepoMessage = { operations: [{ cancel: { actionRef: { blockIds: ['block-1'], actionId: 'a1' } } }] };
 			const result = await service.checkRedirect('block-1', 'cancel', message);
 			expect(result).to.not.be.null;
+		});
+	});
+
+	// These exercise the per-op key DERIVATION in handleIncomingStream (extracted into
+	// deriveBlockKey), which the explicit-key checkRedirect tests above never touch.
+	describe('deriveBlockKey', () => {
+		let service: RepoService;
+
+		beforeEach(async () => {
+			const self = await makePeerId();
+			service = new RepoService(makeComponents({ repo: makeStubRepo(), peerId: self }), { responsibilityK: 1 });
+		});
+
+		it('derives get key from blockIds[0]', () => {
+			const op: RepoMessage['operations'][number] = { get: { blockIds: ['block-A', 'block-B'], context: { committed: [], rev: 0 } } } as any;
+			const { blockKey, opName } = service.deriveBlockKey(op);
+			expect(opName).to.equal('get');
+			expect(blockKey).to.equal('block-A');
+		});
+
+		it('derives pend key from the first transforms key', () => {
+			const op: RepoMessage['operations'][number] = { pend: { transforms: { 'block-A': {} }, actionId: 'a1' } } as any;
+			const { blockKey, opName } = service.deriveBlockKey(op);
+			expect(opName).to.equal('pend');
+			expect(blockKey).to.equal('block-A');
+		});
+
+		it('derives cancel key from actionRef.blockIds[0]', () => {
+			const op: RepoMessage['operations'][number] = { cancel: { actionRef: { blockIds: ['block-A'], actionId: 'a1' } } };
+			const { blockKey, opName } = service.deriveBlockKey(op);
+			expect(opName).to.equal('cancel');
+			expect(blockKey).to.equal('block-A');
+		});
+
+		it('derives undefined cancel key when blockIds is empty (handled locally, no redirect)', () => {
+			const op: RepoMessage['operations'][number] = { cancel: { actionRef: { blockIds: [], actionId: 'a1' } } };
+			const { blockKey, opName } = service.deriveBlockKey(op);
+			expect(opName).to.equal('cancel');
+			expect(blockKey).to.be.undefined;
+		});
+
+		// The bug: commit redirect was keyed on tailId, but CoordinatorRepo.commit anchors
+		// consensus + verifyResponsibility on blockIds[0]. For a non-tail commit batch
+		// (blockIds[0] !== tailId) the key must be blockIds[0], NOT tailId.
+		it('derives commit key from blockIds[0], NOT tailId (non-tail batch)', () => {
+			const op: RepoMessage['operations'][number] = { commit: { blockIds: ['block-A', 'block-B'], actionId: 'a1', tailId: 'tail-Z', rev: 1 } } as any;
+			const { blockKey, opName } = service.deriveBlockKey(op);
+			expect(opName).to.equal('commit');
+			expect(blockKey).to.equal('block-A');
+			expect(blockKey).to.not.equal('tail-Z');
+		});
+	});
+
+	// End-to-end: derive the commit key, then redirect-check it on a large multi-cluster
+	// mesh. This is the path the existing commit suite never hits — it passes the key to
+	// checkRedirect explicitly, so it cannot catch tailId-vs-blockIds[0].
+	describe('commit redirect keys on blockIds[0] (large mesh)', () => {
+		it('redirects toward blockIds[0] cluster; would NOT redirect if keyed on tailId', async () => {
+			const self = await makePeerId();
+			const blockACoordinator = await makePeerId();
+			const otherTailMember = await makePeerId();
+
+			// block-A's cluster excludes self (and is large enough to trip the redirect);
+			// tail-Z's cluster INCLUDES self (so keying on tail-Z would NOT redirect).
+			const byKey = new Map<string, PeerId[]>();
+			byKey.set(await blockKeyDigest('block-A'), [blockACoordinator, otherTailMember]); // self NOT a member
+			byKey.set(await blockKeyDigest('tail-Z'), [self, otherTailMember]);               // self IS a member
+			const nm = makeKeyedNetworkManager(byKey, [self]);
+
+			const service = new RepoService(
+				makeComponents({ repo: makeStubRepo(), peerId: self, networkManager: nm }),
+				{ responsibilityK: 2 } // cluster.length (2) >= K → not a small mesh
+			);
+
+			const message: RepoMessage = {
+				operations: [{ commit: { blockIds: ['block-A', 'block-B'], actionId: 'a1', tailId: 'tail-Z', rev: 1 } } as any]
+			};
+			const { blockKey } = service.deriveBlockKey(message.operations[0]);
+			expect(blockKey).to.equal('block-A');
+
+			const result = await service.checkRedirect(blockKey!, 'commit', message);
+
+			// Redirect MUST fire (self not in block-A's cluster) and target block-A's cluster.
+			expect(result, 'redirect should fire when keyed on blockIds[0]').to.not.be.null;
+			expect(result!.redirect.reason).to.equal('not_in_cluster');
+			const peerIds = result!.redirect.peers.map(p => p.id);
+			expect(peerIds).to.include(blockACoordinator.toString());
+			expect(peerIds).to.not.include(self.toString());
+
+			// Sanity: had it (wrongly) keyed on tailId, self IS in that cluster → no redirect.
+			const tailKeyed = await service.checkRedirect('tail-Z', 'commit', message);
+			expect(tailKeyed, 'keying on tailId would not redirect (self in tail cluster)').to.be.null;
 		});
 	});
 });

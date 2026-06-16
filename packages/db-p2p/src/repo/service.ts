@@ -132,6 +132,41 @@ export class RepoService implements Startable {
 	}
 
 	/**
+	 * Derive the redirect routing key and op name for a single operation.
+	 *
+	 * The key MUST be the block the corresponding handler actually coordinates and
+	 * verifies responsibility on, so redirect routing stays consistent with where the
+	 * op is executed:
+	 *   - get    → blockIds[0]
+	 *   - pend   → first transforms key
+	 *   - cancel → actionRef.blockIds[0]
+	 *   - commit → blockIds[0]  (CoordinatorRepo.commit anchors consensus on
+	 *     getClusterSize(blockIds[0]) / executeClusterTransaction(blockIds[0]) and guards
+	 *     with verifyResponsibility(blockIds) — NOT tailId; for a per-block commit batch
+	 *     whose blockIds[0] !== tailId, keying on tailId redirected the commit to the
+	 *     collection tail's cluster, which then fails verifyResponsibility for the non-tail block.)
+	 *
+	 * Returns blockKey === undefined when the op carries no routable key (e.g. a cancel
+	 * with an empty blockIds list), in which case the caller handles it locally without a
+	 * redirect check.
+	 */
+	deriveBlockKey(operation: RepoMessage['operations'][number]): { blockKey: string | undefined, opName: string } {
+		if ('get' in operation) {
+			return { blockKey: operation.get.blockIds[0], opName: 'get' }
+		}
+		if ('pend' in operation) {
+			return { blockKey: Object.keys(operation.pend.transforms)[0], opName: 'pend' }
+		}
+		if ('cancel' in operation) {
+			return { blockKey: operation.cancel.actionRef.blockIds[0], opName: 'cancel' }
+		}
+		if ('commit' in operation) {
+			return { blockKey: operation.commit.blockIds[0], opName: 'commit' }
+		}
+		return { blockKey: undefined, opName: 'unknown' }
+	}
+
+	/**
 	 * Check if this node should redirect the request for a given key.
 	 * Returns a RedirectPayload if not responsible, null if should handle locally.
 	 * Also attaches cluster info to the message for downstream use.
@@ -175,46 +210,25 @@ export class RepoService implements Startable {
 				const decoded = new TextDecoder().decode(msg.subarray())
 				const message = JSON.parse(decoded) as RepoMessage
 
-				// Process each operation
+				// Process each operation. Derive the redirect routing key once (keyed on the
+				// block the handler actually coordinates), redirect-check it, then dispatch.
 				const operation = message.operations[0]
-				let response: any
+				const { blockKey, opName } = this.deriveBlockKey(operation)
+				const redirect = blockKey !== undefined
+					? await this.checkRedirect(blockKey, opName, message)
+					: null
 
-				if ('get' in operation) {
-					const blockKey = operation.get.blockIds[0]!
-					const redirect = await this.checkRedirect(blockKey, 'get', message)
-					if (redirect) {
-						response = redirect
-					} else {
-						response = await this.repo.get(operation.get, { expiration: message.expiration, skipClusterFetch: true } as any)
-					}
+				let response: any
+				if (redirect) {
+					response = redirect
+				} else if ('get' in operation) {
+					response = await this.repo.get(operation.get, { expiration: message.expiration, skipClusterFetch: true } as any)
 				} else if ('pend' in operation) {
-					const blockKey = Object.keys(operation.pend.transforms)[0]!
-					const redirect = await this.checkRedirect(blockKey, 'pend', message)
-					if (redirect) {
-						response = redirect
-					} else {
-						response = await this.repo.pend(operation.pend, { expiration: message.expiration })
-					}
+					response = await this.repo.pend(operation.pend, { expiration: message.expiration })
 				} else if ('cancel' in operation) {
-					const blockKey = operation.cancel.actionRef.blockIds[0]
-					if (blockKey) {
-						const redirect = await this.checkRedirect(blockKey, 'cancel', message)
-						if (redirect) {
-							response = redirect
-						} else {
-							response = await this.repo.cancel(operation.cancel.actionRef, { expiration: message.expiration })
-						}
-					} else {
-						response = await this.repo.cancel(operation.cancel.actionRef, { expiration: message.expiration })
-					}
+					response = await this.repo.cancel(operation.cancel.actionRef, { expiration: message.expiration })
 				} else if ('commit' in operation) {
-					const blockKey = operation.commit.tailId
-					const redirect = await this.checkRedirect(blockKey, 'commit', message)
-					if (redirect) {
-						response = redirect
-					} else {
-						response = await this.repo.commit(operation.commit, { expiration: message.expiration })
-					}
+					response = await this.repo.commit(operation.commit, { expiration: message.expiration })
 				}
 
 				// Encode and yield the response
