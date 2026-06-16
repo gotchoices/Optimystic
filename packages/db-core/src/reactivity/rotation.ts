@@ -317,10 +317,14 @@ export function planReRegistration(opts: ReRegistrationTarget & { lastRevision: 
 /**
  * Plan a **whole wave** of subscribers' re-registrations at the rotated tree. Uses the
  * {@link RejoinJitter.scheduleWave} hard-bound staggering so any `T_rejoin_jitter`-long window holds at
- * most `cap_promote` (here typically `cap_promote_fast`) arrivals — the new tail never sees more than
- * `subscribers / T_rejoin_jitter` re-registrations per second, keeping the rotation burst inside the
- * fast-promote bound (`docs/reactivity.md` §Tail rotation rotation-cost). Returns one plan per subscriber,
- * ascending by `fireAt`.
+ * most the injected jitter's `capPromote` arrivals — the new tail never sees more than
+ * `capPromote / T_rejoin_jitter` re-registrations per second.
+ *
+ * **Caller contract:** rotation is governed by the *fast-promote* bound, so the host MUST build this `jitter`
+ * with `capPromote = cap_promote_fast` ({@link import("../cohort-topic/promotion.js").DEFAULT_CAP_PROMOTE_FAST}
+ * = 32), **not** the default `createRejoinJitter()` cap (the cohort-failure `cap_promote = 64`). With the
+ * default cap the wave bounds to 64/window and silently overruns the documented rotation burst ceiling
+ * (`docs/reactivity.md` §Tail rotation rotation-cost). Returns one plan per subscriber, ascending by `fireAt`.
  */
 export function planReRegistrationWave(
 	opts: ReRegistrationTarget & { subscribers: readonly { readonly lastRevision: number }[]; now: number; jitter: RejoinJitter },
