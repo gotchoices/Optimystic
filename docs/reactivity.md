@@ -717,6 +717,28 @@ scaled-down `W`/`W_checkpoint` (so it needs a few dozen commits, not thousands) 
 produces, not the production magnitudes. Production config is imported from `config.ts`; the mesh suites
 never hard-code drifting numbers.
 
+## Real-libp2p e2e coverage
+
+> **Substrate confirmed over real sockets; notification delivery transport deferred.**
+> [`packages/db-p2p/test/substrate-real-libp2p.integration.spec.ts`](../packages/db-p2p/test/substrate-real-libp2p.integration.spec.ts)
+> (env-gated) stands up 3–16 production `cohortTopic`-enabled libp2p nodes over real TCP. The **reactivity
+> origination wiring** is confirmed real: the production node installs the cohort-topic origination bridge
+> (`blockChangeNotifier` is the decorating notifier, not the bare `StorageRepo`), and the real
+> `selfIsCohortMember` gate over real FRET agrees node-for-node with `assembleCohort(coord_0(H(tailId ‖
+> "reactivity")), wantK)` — the §Anchor membership decision that gates every origination. The notification
+> **verify** path is likewise real (the cohort's threshold-signed `MembershipCertV1` is fetched over the real
+> `/membership` protocol and verified with real Ed25519 collected-multisig — see cohort-topic §Validation;
+> the digest-preimage half is `cohort-topic/reactivity-real-crypto.spec.ts`).
+>
+> **What is NOT yet real (tagged `it.skip`, not faked):** the notification **socket delivery** itself — a
+> commit on a real cohort member firing a `NotificationV1` that reaches a remote subscriber over a real
+> socket. Production registers no emit transport / subscriber-delivery protocol (the origination bridge fires
+> `onLocalCommit`, but `libp2p-node-base.ts` leaves "the origination manager + emit transport" to a sibling
+> ticket). Tracked by `12.5-reactivity-tail-rotation-transport` and the residual backlog
+> `optimystic-network-reactive-watch-integration-test` (the real-libp2p `Database.watch` wakeup). **No
+> real-network observation here contradicts the simulator** — the design (anchor derivation, cert reuse,
+> verify) is confirmed on real libp2p as far as the wired surface reaches.
+
 ---
 
 ## Interaction with other subsystems

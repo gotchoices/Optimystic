@@ -855,7 +855,8 @@ The layer uses FRET's two-sided cohort assembly without modification: alternatin
 
 ### Validation
 
-The substrate is validated at two tiers. The participant ↔ cohort composition is unit-tested with a
+The substrate is validated at three tiers (unit + mock-tier-at-scale + real-libp2p). The participant ↔
+cohort composition is unit-tested with a
 mock transport in [`packages/db-p2p/test/cohort-topic/service.spec.ts`](../packages/db-p2p/test/cohort-topic/service.spec.ts)
 (register / renew / withdraw / lookup / promote, plus per-coord scoping with a FRET fake that returns a
 different set per coordinate). On top of that, an **end-to-end milestone** stands up an `N ≥ minSigs`
@@ -913,12 +914,40 @@ limit, topic-budget refusal, and `bootstrap: true` root instantiation.
 >   but the TTL sweep does not touch it *down* on eviction, so a resident never reaches zero participants
 >   via the wire; the LRU cold-eviction logic is asserted on the same production `createTopicBudget` unit.
 
+**Real-libp2p e2e (socket tier).** [`packages/db-p2p/test/substrate-real-libp2p.integration.spec.ts`](../packages/db-p2p/test/substrate-real-libp2p.integration.spec.ts)
+(env-gated on `OPTIMYSTIC_INTEGRATION=1` / `RUN_LONG_TESTS=1`) stands up 3–16 production
+`createLibp2pNode({ cohortTopic: { enabled: true } })` nodes over **real TCP** and exercises the piece the
+mock mesh stubs — real FRET two-sided stabilization, the `/sign` threshold collection, the `/membership`
+serve+fetch, and `/cohort-gossip` replication — at `wantK = N`. Mapped, passing claims (validated at
+N ∈ {3,4,8,16}): real FRET assembles the whole-mesh tier-0 cohort with **one identical coord + epoch on
+every node** (§Cohort assembly — the determinism threshold signing depends on); a routed primary collects a
+genuine `(N−1)`-of-`N` `MembershipCertV1` over `/sign` and a remote participant verifies it end-to-end over
+`/membership`, including the **stale-cache one-fetch-and-retry** (§Membership fetch); a touched record
+replicates into a sibling store over `/cohort-gossip` (§Registration mechanics) with the sibling becoming a
+warm-failover target.
+
+> **Real-network observations (vs. the simulator / mock tier).**
+> - **Confirmed on real libp2p:** small-N stabilization + threshold-cert assembly is bounded and fast — the
+>   full suite (mesh bring-up + FRET stabilization + cert publish + all assertions) runs ~2 s at N = 4,
+>   ~4 s at N = 8, ~11 s at N = 16. Coord/epoch determinism and the membership-verify quorum behave exactly
+>   as the mock tier and simulator predict; the stale-cert refetch resolves in a single `/membership` round-trip.
+> - **Differs from the mock tier (a real-transport finding):** the `/sign` threshold collection assumes
+>   **warm connectivity to the whole cohort**. The mock tier routes in-process (connection warmth is a
+>   non-issue), but over real TCP a star topology (leaf→bootstrap only) intermittently gathered `< minSigs`
+>   because leaf↔leaf `/sign` dials resolved cold; the suite establishes a full mesh of warm connections and
+>   retries the publish past transient sub-quorum rounds. Operationally: a cohort that has not yet
+>   inter-connected can briefly fail to reach signing quorum — recovered by connection establishment + the
+>   next round, never a fabricated sub-quorum cert (the §FRET-integration sub-quorum negative still holds).
+> - **`it.skip` at this tier (production wiring not yet present, not faked):** the full FRET-routed
+>   participant `service.register` walk (kept mock-tier-deterministic to avoid small-N routing flakiness; the
+>   cohort-side admission it drives IS asserted over the real willingness quorum), and multi-tier promotion
+>   (the single-tier-0 milestone gaps above).
+
 **Still deferred (parked in backlog, honestly out of scope for this milestone):** multi-tier
 promoted-redirect *follow-on* instantiation (`cohort-topic-followon-derivation`) and the parent-side
 child-cohort link recording (`cohort-topic-parent-child-link`); a dedicated read-only **lookup-probe**
-RPC (today `lookup` shares the registration walk and leaves TTL-expiring soft state); an immediate
-**withdraw tombstone** (today `withdraw` stops renewing and lets the soft state TTL-expire); and the
-real-libp2p (socket) e2e tier.
+RPC (today `lookup` shares the registration walk and leaves TTL-expiring soft state); and an immediate
+**withdraw tombstone** (today `withdraw` stops renewing and lets the soft state TTL-expire).
 
 ---
 

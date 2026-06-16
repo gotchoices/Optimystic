@@ -859,6 +859,27 @@ The voting coordinator (or a delegated quorum-assembler peer) registers as a see
 
 Throughout, the root cohort's load is bounded: registration storms get `Promoted(1)` quickly; only the seeker's `AggregateCountV1` and the demoted "almost everyone left" tail hit the root directly. Tier-1 and below carry the bulk of provider state.
 
+### Real-libp2p e2e coverage
+
+> **Provider registration confirmed over real sockets; seeker query RPC deferred.**
+> [`packages/db-p2p/test/substrate-real-libp2p.integration.spec.ts`](../packages/db-p2p/test/substrate-real-libp2p.integration.spec.ts)
+> (env-gated) stands up 3–16 production `cohortTopic`-enabled libp2p nodes over real TCP. The **provider
+> side** is confirmed real: a provider registration at the matchmaking application tier (T2) is admitted by a
+> real cohort over the real willingness quorum, the routed primary **holds the provider record** (the read a
+> `QueryV1` serves from — `CoordEngine.records`), and the record **replicates into a sibling cohort member
+> over real `/cohort-gossip`**. This is the provider-directory half of §Seeker query end-to-end over real
+> sockets.
+>
+> **What is NOT yet real (tagged `it.skip`, not faked):** the **seeker hang-out walk converging to a match**
+> over real sockets. A production node registers no `QueryV1` RPC handler — the seeker walk's `query()` seam
+> is unbound (`handleMatchmakingQuery` has no production dialer), so a remote seeker cannot read a cohort's
+> provider set over the wire yet. The hang-out *decision* logic (hang-out-vs-continue, adversarial bounds) is
+> mock-tier-validated (`matchmaking/mesh-walk.spec.ts`) and simulator-validated (above). **No real-network
+> observation here contradicts the simulator** — the provider-directory substrate is confirmed on real libp2p
+> as far as the wired surface reaches; the seeker query transport is the documented follow-on, now tracked by
+> backlog `matchmaking-real-libp2p-query-transport` (a `/query` cohort protocol + the `SeekerWalkTransport.query`
+> binding — the socket continuation of the mock-tier sweep/walk work).
+
 ### Sparse provider, very large network
 
 A specialty capability (`zk-snark-prover-v2`) has 5 providers in a network of 10 M peers.
