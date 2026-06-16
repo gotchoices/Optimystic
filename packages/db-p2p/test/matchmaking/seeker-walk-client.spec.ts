@@ -248,6 +248,27 @@ describe('matchmaking / seeker walk client', () => {
 		expect(h.calls.filter((cl) => cl.startsWith('register'))).to.deep.equal(['register:2', 'register:3']);
 	});
 
+	it('records the hotness signal even when one hot cohort immediately meets wantCount (done path)', async () => {
+		// rootTraffic.childCohortCount = 8; the immediate query already satisfies wantCount, so the walk
+		// resolves `done` at the first tier. maxChildCohortCount must still surface the hotness so the
+		// public session / voting QuorumDiscovery binding escalates to the representative sweep.
+		const h = new Harness({ 2: { probe: accepted(rootTraffic), providers: eight } });
+		const result = await client(h, { wantCount: 8, dMax: 2, patienceMs: 10_000 }).run();
+		expect(result.metWantCount).to.equal(true);
+		expect(result.hops).to.equal(1);
+		expect(result.maxChildCohortCount).to.equal(8);
+	});
+
+	it('folds the max childCohortCount across walked tiers (hottest tier wins)', async () => {
+		const h = new Harness({
+			2: { probe: accepted(thin), providers: [entry('t0')] }, // childCohortCount 0
+			1: { probe: accepted(rootTraffic), providers: [entry('t1')] }, // childCohortCount 8
+			0: { probe: accepted(quiet), providers: eight },
+		});
+		const result = await client(h, { wantCount: 8, dMax: 2, patienceMs: 10_000 }).run();
+		expect(result.maxChildCohortCount).to.equal(8);
+	});
+
 	it('honors a configured requeryIntervalMs for the hang-out poll cadence', async () => {
 		const h = new Harness({ 0: { probe: accepted(hot), providers: eight.slice(0, 3) } });
 		const result = await client(h, {

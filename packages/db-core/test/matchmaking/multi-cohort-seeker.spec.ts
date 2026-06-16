@@ -168,6 +168,27 @@ describe('matchmaking / multi-cohort sweep — runMultiCohortSweep', () => {
 		expect(result.aggregateTrusted).to.equal(true);
 	});
 
+	it('reports aggregateTrusted=false when no verifier is injected, but still unions the providers', async () => {
+		// No `verifyAggregate` port ⇒ nothing was verified. The sweep proceeds (each entry is
+		// registrationSig-re-validated), but the trust flag must stay honest rather than claim trust.
+		const agg = aggregate([{ prefixSlot: 1, count: 16 }]);
+		const queried: SweepShardQuery[] = [];
+		const ports: MultiCohortSweepPorts = {
+			async fetchAggregate(): Promise<AggregateCountV1 | undefined> {
+				return agg;
+			},
+			async queryShard(shard: SweepShardQuery): Promise<readonly ProviderEntryV1[]> {
+				queried.push(shard);
+				return [makeEntry({ participantId: 'a' })];
+			},
+		};
+		const result = await runMultiCohortSweep(ports, { topicId: TOPIC_ID, wantCount: 5, verifyEntry: fakeVerify });
+		expect(result.aggregateAvailable).to.equal(true);
+		expect(result.aggregateTrusted).to.equal(false);
+		expect(result.providers.map((p) => p.participantId)).to.deep.equal(['a']);
+		expect(queried).to.have.length(1);
+	});
+
 	it('drops entries whose registrationSig is forged', async () => {
 		const shards = new Map<number, ProviderEntryV1[]>([[1, [makeEntry({ participantId: 'good' }), makeForgedEntry('forged')]]]);
 		const ports = new MockSweepPorts(aggregate([{ prefixSlot: 1, count: 16 }]), shards);

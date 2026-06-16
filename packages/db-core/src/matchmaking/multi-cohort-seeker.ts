@@ -161,6 +161,11 @@ export async function runMultiCohortSweep(ports: MultiCohortSweepPorts, opts: Mu
 	if (aggregate === undefined) {
 		return emptyResult(false, false);
 	}
+	// `aggregateTrusted` is asserted only when a verifier actually ran and passed. With no verifier injected
+	// the sweep still proceeds — every shard entry is `registrationSig`-re-validated below, so a forged
+	// aggregate can at worst mis-steer shard selection (wasted RPCs / a thinner sample), never inject
+	// providers — but the flag stays honest rather than claiming a trust that was never established.
+	const aggregateTrusted = ports.verifyAggregate !== undefined;
 	if (ports.verifyAggregate !== undefined && !ports.verifyAggregate(aggregate)) {
 		return emptyResult(true, false);
 	}
@@ -198,6 +203,6 @@ export async function runMultiCohortSweep(ports: MultiCohortSweepPorts, opts: Mu
 		selectedShards: selected,
 		shardsQueried,
 		aggregateAvailable: true,
-		aggregateTrusted: true,
+		aggregateTrusted,
 	};
 }

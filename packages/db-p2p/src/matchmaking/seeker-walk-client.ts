@@ -219,6 +219,15 @@ export class SeekerWalkClient {
 
 	/** Evaluate one `Accepted` tier: immediate query, then {@link decide} → done / hangOut / escalate. */
 	private async handleAccepted(d: number, traffic: SeekerProbeReply["topicTraffic"]): Promise<AcceptedOutcome> {
+		// Record the hottest tier seen as soon as this Accepted reply's traffic is available — *before* the
+		// immediate-match/done short-circuit below, so the single-cohort-vs-sweep decision (public session /
+		// voting QuorumDiscovery binding) still sees a hot topic even when one cohort's query already met
+		// wantCount. Folding it only on the `decide` path would drop the signal for a small quorum that a
+		// single hot cohort satisfies, leaving the assembler with a prefix-biased sample it should sweep.
+		if (traffic !== undefined) {
+			this.maxChildCohortCount = Math.max(this.maxChildCohortCount, traffic.childCohortCount);
+		}
+
 		// Immediate-match check runs in every case — also satisfies edge case 2 (a stale arrivalsPerMin=0
 		// cohort that actually holds enough providers resolves here rather than escalating spuriously).
 		this.collect(await this.transport.query(d));
@@ -231,9 +240,6 @@ export class SeekerWalkClient {
 		if (traffic === undefined) {
 			return d <= 0 ? "terminal" : "escalate";
 		}
-
-		// Track the hottest tier seen — drives the single-cohort-vs-sweep decision in the public session.
-		this.maxChildCohortCount = Math.max(this.maxChildCohortCount, traffic.childCohortCount);
 
 		const decision = decide(
 			{
