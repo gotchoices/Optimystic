@@ -59,6 +59,7 @@ import {
 	edgeProfile,
 	bytesToB64url,
 	DEFAULT_CAP_PROMOTE_FAST,
+	T_REJOIN_JITTER_MS,
 	WARM_THRESHOLD_DEFAULT,
 	type ActionId,
 	type BlockId,
@@ -436,6 +437,21 @@ export class ReactivityMesh {
 		return this.collection(name).rev;
 	}
 
+	/**
+	 * Drive the deciding cohort's membership stabilization (publish its `MembershipCertV1`). Promotion is
+	 * fire-and-forget off the register path; stabilizing publishes the cohort cert so a crossed-`cap_promote`
+	 * decision lands deterministically (no wall-clock wait) — the same pre-step the cohort-topic scale specs use.
+	 */
+	async stabilizeCohort(name: string): Promise<void> {
+		await this.collection(name).setup.decidingEngine.onStabilized(this.vtime);
+	}
+
+	/** Whether a collection's tier-0 cohort has promoted (its direct participants crossed `cap_promote`). */
+	isPromoted(name: string): boolean {
+		const c = this.collection(name);
+		return c.setup.decidingEngine.isPromoted(c.topicId);
+	}
+
 	/** Whether a node profile may serve as a reactivity forwarder (T3 producer) — Edge never can. */
 	mayForward(nodeIndex: number): boolean {
 		return mayServeAsReactivityForwarder(this.profileOf(nodeIndex));
@@ -686,7 +702,7 @@ export class ReactivityMesh {
 			return 0;
 		}
 		const fireAts = plans.map((p) => p.fireAt).sort((a, b) => a - b);
-		const window = 30_000; // T_rejoin_jitter span (cohort-topic default)
+		const window = T_REJOIN_JITTER_MS; // the same jitter span `createRejoinJitter` spreads the wave over
 		let peak = 0;
 		for (let i = 0; i < fireAts.length; i++) {
 			let j = i;

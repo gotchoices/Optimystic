@@ -88,24 +88,33 @@ describe('reactivity / mesh — cold-to-hot growth + delivery', () => {
 		expect(late.backfills, 'no backfill — a fresh subscriber adopts the first notification').to.equal(0);
 	});
 
-	it('[mock-tier] the promotion machinery fires once subscribers cross cap_promote (the tree begins to form)', async () => {
-		// Drive the cohort-side promotion decision directly with a lowered cap. The cohort-topic scale specs
-		// own the full multi-tier walk; here we assert reactivity subscribers crossing the cap trip promotion.
+	it('[mock-tier] the tier-0 cohort promotes once subscribers cross cap_promote (the tree begins to form), and delivery still reaches all', async () => {
+		// Drive the cohort-side promotion decision with a lowered cap. The cohort-topic scale specs own the
+		// full multi-tier walk; here we assert reactivity subscribers crossing the cap trip a *real* promotion.
 		rx = await buildReactivityMesh({ nodeCount: 16, wantK: 8, capPromote: 4 });
 		await rx.registerCollection('hot');
+		expect(rx.isPromoted('hot'), 'a cold cohort has not promoted').to.equal(false);
 
-		// The first cap_promote subscribers attach at the root; the next crosses the cap.
-		const within = await Promise.all([1, 2, 3, 4].map((n) => rx.subscribe(n, 'hot')));
-		for (const s of within) {
-			expect(s.registration!.tier, 'admitted at T3 (luxury)').to.equal(Tier.T3);
+		// More than cap_promote (4) reactivity subscribers attach at the root, crossing the threshold.
+		const subs = await Promise.all([1, 2, 3, 4, 5, 6].map((n) => rx.subscribe(n, 'hot')));
+		for (const s of subs) {
+			// Tier.T3 is the *reactivity application tier* every subscribe registers under — not a tree depth.
+			expect(s.registration!.tier, 'each reactivity subscribe admits at the reactivity tier T3').to.equal(Tier.T3);
 		}
+		expect(rx.cohortSubscriberCount('hot'), 'all subscribers landed in the tier-0 cohort store').to.equal(subs.length);
+
+		// Publish the cohort cert so the fire-and-forget promotion decision lands deterministically.
+		await rx.stabilizeCohort('hot');
+		expect(rx.isPromoted('hot'), 'the cohort promoted once direct participants crossed cap_promote').to.equal(true);
+
+		// Delivery still reaches every subscriber while the tree begins to form.
 		await rx.commit('hot', 2);
-		for (const s of within) {
+		for (const s of subs) {
 			expect(s.delivered.map((n) => n.revision)).to.deep.equal([1, 2]);
 		}
 		// NOTE [unimplemented:mock-tier]: the multi-tier *serving* fan-out (a tier-d>=1 forwarder cohort
 		// actually relaying notifications) and the quantitative depth-vs-subscriber-count regime are gated on
 		// the cohort-topic follow-ons + the design simulator; this mesh serves a single tier-0 cohort. The
-		// cold-to-hot growth claim is covered here only as: subscribers admitted at T3 + delivery to all.
+		// cold-to-hot growth claim is covered here as: the cohort's promotion decision fires + delivery to all.
 	});
 });

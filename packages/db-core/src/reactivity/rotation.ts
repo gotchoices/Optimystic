@@ -29,8 +29,11 @@
  * Coordination with [reactivity-backfill-resume-checkpoints]: that ticket owns the `ResumeReplyV1.TailRotated`
  * variant and the `latestKnownTailId`-staleness classification; this ticket produces the handoff checkpoint
  * and the rotation *condition*. The new tail's {@link PushState.inheritedCheckpoint} (set by
- * {@link applyRotationHandoff}) is the seam the resume classifier reads to answer a checkpoint-window resume
- * whose span crosses the rotation.
+ * {@link applyRotationHandoff}) is the seam the resume classifier is *intended* to consult to answer a
+ * checkpoint-window resume whose span crosses the rotation — but `classifyResume`/`serveResume` do **not**
+ * yet read it (they consult only the rolling `checkpoint`), so a cross-rotation resume currently falls to
+ * `out_of_window`. Wiring it in is the open "Handoff ↔ resume coordination" follow-on tracked by
+ * `tickets/plan/12.5-reactivity-tail-rotation-transport`.
  */
 
 import { bytesToB64url, b64urlToBytes } from "../cohort-topic/wire/codec.js";
