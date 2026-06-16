@@ -272,8 +272,11 @@ export class VotingQuorumAssembler {
 	 * Coordinator / delegated-assembler side: discover → verify → select. Drives the single-cohort walk,
 	 * escalates to the multi-cohort sweep on a hot topic (`childCohortCount > 0`) or when `preferSweep`,
 	 * dedups by `participantId`, applies the optional reputation pre-filter, re-validates each entry's
-	 * `registrationSig` **and** `verifyEligibility`, then applies the selection rule. Never blocks past
-	 * `patienceMs`; on exhaustion it returns whatever matched with `metTarget = false`.
+	 * `registrationSig` **and** `verifyEligibility`, then applies the selection rule. Passes the *draining*
+	 * patience budget to each discovery hop (walk, then sweep) — the deadline is fixed at entry and each
+	 * hop receives the remaining slice — and on exhaustion returns whatever matched with `metTarget = false`.
+	 * (Honouring that budget is the port's duty: the single-cohort walk enforces it; the multi-cohort sweep
+	 * leg is currently bounded by its shard fan-out rather than the budget — see the sweep-patience follow-up.)
 	 */
 	async assembleQuorum(req: VotingQuorumRequest): Promise<VotingQuorumResult> {
 		const discovery = this.requireDiscovery();
