@@ -1178,12 +1178,24 @@ Edge nodes (mobile profile) default to:
 
 The cohort-topic layer is a substrate. An application — reactivity, matchmaking, voting, broadcast — implements:
 
-1. **Anchor derivation.** What `topicId` is and whether it rotates. Reactivity uses `H(tailId ‖ "push")` (rotates); matchmaking uses `H("match" ‖ taskId)` (stable).
+1. **Anchor derivation.** What `topicId` is and whether it rotates. Reactivity uses `H(tailId ‖ "reactivity")` (rotates); matchmaking uses `H("match" ‖ taskId)` (stable).
 2. **`appPayload` contents.** What's in the per-registration application slot.
 3. **Tier choice.** Which tier this application operates at (reactivity push is T3; reactivity replay is T1; matchmaking is T2; voting is T2).
 4. **Post-registration RPCs.** Notification delivery, query, voting protocols, etc. These run between participants and their cached `primary`, with the cohort-topic layer providing only the identity. Matchmaking's primary→seeker arrival push ([matchmaking.md §Arrival push on provider arrival](matchmaking.md#arrival-push-on-provider-arrival)) is one such RPC: it fires off the existing gossip-replicated registration records, so it needs no new substrate protocol.
 5. **Replay or caching.** If the application needs durable buffering (reactivity does, matchmaking generally doesn't), it manages that state inside the cohort using the layer's existing gossip channel.
 6. **Anchor rotation handling.** If the anchor changes (tail rotation), the application detects via its own logic and re-registers under the new `topicId`; the layer treats the new anchor as a new topic.
+
+> **Reactivity interaction — tail rotation is a fresh topic.** When a reactivity collection's tail block
+> fills, its anchor `H(tailId ‖ "reactivity")` changes, so the new `topicId` is — from this layer's
+> perspective — an **entirely new topic**: a fresh tree at a new tier-0 ring coord, with no relationship to
+> the old one. The two trees coexist for the rotation's drain window. The **old** tree drains and shrinks
+> via the standard demotion protocol (§Promotion and demotion lifecycle): its forwarder cohorts watch their
+> direct-subscriber count fall as subscribers re-register elsewhere and demote naturally — no state is
+> migrated through this layer. The **new** tree forms via ordinary registration + promotion (§Tree growth
+> and lookup), absorbing the re-registration wave; reactivity staggers that wave over `T_rejoin_jitter` so
+> the new root stays within `cap_promote_fast` (§Configuration `cap_promote_fast = 32`). The only state
+> reactivity migrates across the rotation (a replay-buffer→checkpoint handoff) rides reactivity's own logic,
+> not this layer; see [reactivity.md §Tail rotation](reactivity.md#tail-rotation).
 
 The layer's contract to applications is: given a `topicId` and a `tier`, you will reliably find a willing primary (or fail with a clear back-off signal); registrations persist within their TTL; cohort identity and membership are verifiable. Everything else — content, ordering, durability, semantics — is the application's responsibility.
 

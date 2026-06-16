@@ -103,6 +103,66 @@ export function defaultDeltaCoalesce(deltas: readonly Uint8Array[]): Uint8Array 
 	return out;
 }
 
+/** The fold/coalesce knobs shared by the rolling checkpoint and the rotation handoff. */
+export interface CheckpointFoldOptions {
+	/** Collection id the summarized entries belong to, base64url. */
+	readonly collectionId: string;
+	/** `mergedDigest` fold over the per-revision commit digests. */
+	readonly fold: DigestFold;
+	/** `mergedDelta` coalescer over the per-revision deltas. */
+	readonly coalesceDeltas: DeltaCoalesce;
+	/** `delta_max`: omit `mergedDelta` when the coalesced size exceeds this. `0` ⇒ never emit a delta. */
+	readonly deltaMaxBytes: number;
+}
+
+/**
+ * Coalesce the per-revision deltas of `ordered`, returning the base64url result only when it fits within
+ * `deltaMaxBytes`. Omitted (`undefined`) when no entry carries a delta, when `deltaMaxBytes <= 0`, or when
+ * the coalesced size would exceed `deltaMaxBytes` (the resolved omit-when-oversize policy — never split).
+ */
+export function coalesceMergedDelta(ordered: readonly RevisionEntry[], coalesceDeltas: DeltaCoalesce, deltaMaxBytes: number): string | undefined {
+	if (deltaMaxBytes <= 0) {
+		return undefined;
+	}
+	const deltas: Uint8Array[] = [];
+	for (const e of ordered) {
+		if (e.payload.delta !== undefined) {
+			deltas.push(b64urlToBytes(e.payload.delta));
+		}
+	}
+	if (deltas.length === 0) {
+		return undefined;
+	}
+	const coalesced = coalesceDeltas(deltas);
+	return coalesced.length > deltaMaxBytes ? undefined : bytesToB64url(coalesced);
+}
+
+/**
+ * Build a {@link CheckpointSummary} over `orderedEntries` (ascending by revision) — the shared fold the
+ * rolling checkpoint and the rotation buffer-to-checkpoint handoff both use. Returns `undefined` for an
+ * empty range. The two endpoints are carried as the full notifications (the verifiable anchor); the merged
+ * digest is the deterministic fold over the per-revision commit digests; the coalesced delta is included
+ * only when it fits within `deltaMaxBytes`.
+ */
+export function buildCheckpointSummary(orderedEntries: readonly RevisionEntry[], opts: CheckpointFoldOptions): CheckpointSummary | undefined {
+	if (orderedEntries.length === 0) {
+		return undefined;
+	}
+	const digests = orderedEntries.map((e) => b64urlToBytes(e.payload.digest));
+	const mergedDigest = bytesToB64url(opts.fold(digests));
+	const first = orderedEntries[0]!.payload;
+	const last = orderedEntries[orderedEntries.length - 1]!.payload;
+	const summary: CheckpointSummary = {
+		collectionId: opts.collectionId,
+		fromRevision: first.revision,
+		toRevision: last.revision,
+		mergedDigest,
+		bracketingEntries: [first, last],
+	};
+	const mergedDelta = coalesceMergedDelta(orderedEntries, opts.coalesceDeltas, opts.deltaMaxBytes);
+	return mergedDelta !== undefined ? { ...summary, mergedDelta } : summary;
+}
+
 /** Construction inputs for a {@link RollingCheckpoint}. */
 export interface RollingCheckpointInit {
 	/** Collection id, base64url (must match the entries retired into it). */
@@ -190,53 +250,14 @@ export class RollingCheckpoint {
 		return [...this.byRevision.values()].sort((a, b) => a.revision - b.revision);
 	}
 
-	/** Build the {@link CheckpointSummary} over the currently-summarized range, or `undefined` if empty. */
-	summary(): CheckpointSummary | undefined {
-		const ordered = this.orderedEntries();
-		if (ordered.length === 0) {
-			return undefined;
-		}
-		const digests = ordered.map((e) => b64urlToBytes(e.payload.digest));
-		const mergedDigest = bytesToB64url(this.fold(digests));
-		const first = ordered[0]!.payload;
-		const last = ordered[ordered.length - 1]!.payload;
-		const summary: CheckpointSummary = {
-			collectionId: this.collectionId,
-			fromRevision: first.revision,
-			toRevision: last.revision,
-			mergedDigest,
-			bracketingEntries: [first, last],
-		};
-		const mergedDelta = this.buildMergedDelta(ordered);
-		if (mergedDelta !== undefined) {
-			return { ...summary, mergedDelta };
-		}
-		return summary;
+	/** The fold/coalesce knobs this checkpoint applies — reused by the rotation handoff for an identical fold. */
+	get foldOptions(): CheckpointFoldOptions {
+		return { collectionId: this.collectionId, fold: this.fold, coalesceDeltas: this.coalesceDeltas, deltaMaxBytes: this.deltaMaxBytes };
 	}
 
-	/**
-	 * Coalesce the per-revision deltas, returning the base64url result only when it fits within
-	 * `delta_max`. Omitted (returns `undefined`) when no entry carries a delta, when `delta_max == 0`, or
-	 * when the coalesced size would exceed `delta_max` (the resolved omit-when-oversize policy).
-	 */
-	private buildMergedDelta(ordered: readonly RevisionEntry[]): string | undefined {
-		if (this.deltaMaxBytes <= 0) {
-			return undefined;
-		}
-		const deltas: Uint8Array[] = [];
-		for (const e of ordered) {
-			if (e.payload.delta !== undefined) {
-				deltas.push(b64urlToBytes(e.payload.delta));
-			}
-		}
-		if (deltas.length === 0) {
-			return undefined;
-		}
-		const coalesced = this.coalesceDeltas(deltas);
-		if (coalesced.length > this.deltaMaxBytes) {
-			return undefined; // omit when oversize — never split
-		}
-		return bytesToB64url(coalesced);
+	/** Build the {@link CheckpointSummary} over the currently-summarized range, or `undefined` if empty. */
+	summary(): CheckpointSummary | undefined {
+		return buildCheckpointSummary(this.orderedEntries(), this.foldOptions);
 	}
 }
 

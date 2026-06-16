@@ -25,7 +25,10 @@ import {
 	createReactivitySubscriber,
 	createBackfillRequester,
 	createStickyCohortHintCache,
+	createRejoinJitter,
 	applyResumeReply,
+	detectRotation,
+	planReRegistration,
 	bytesToB64url,
 	type CohortTopicService,
 	type NodeProfile,
@@ -42,10 +45,26 @@ import {
 	type ResumeApplyOutcome,
 	type StickyCohortHintCache,
 	type CheckpointSummary,
+	type RejoinJitter,
+	type ReRegistrationPlan,
 } from "@optimystic/db-core";
 
 /** Sends a {@link ResumeV1} to the serving cohort and awaits its classified {@link ResumeReplyV1}. */
 export type ResumeTransport = (req: ResumeV1) => Promise<ResumeReplyV1>;
+
+/**
+ * A detected tail rotation surfaced to the host so it can schedule the jittered re-registration timer
+ * (`docs/reactivity.md` §Tail rotation). The manager has already invalidated the sticky cohort-hint cache
+ * (the cached primary is under the old tree).
+ */
+export interface RotationNotice {
+	/** The new tail block id the topic rotated to, base64url. */
+	readonly newTailId: string;
+	/** True iff this was a pre-announce (`rotationHint` on a still-current-tail notification). */
+	readonly preAnnounced: boolean;
+	/** The jittered re-registration plan (new topicId + `fireAt` + carried `lastRevision`) for the host to schedule. */
+	readonly plan: ReRegistrationPlan;
+}
 
 /** Construction inputs for a {@link ReactivitySubscriptionManager}. */
 export interface ReactivitySubscriptionManagerOptions {
@@ -87,6 +106,15 @@ export interface ReactivitySubscriptionManagerOptions {
 	readonly onBackfillUnderflow?: (requested: { from: number; to: number }, available: { fromRevision: number; toRevision: number }) => void;
 	/** Sticky cohort-hint cache for one-RT resume after a flap; defaults to a fresh per-manager cache (Edge). */
 	readonly cohortHintCache?: StickyCohortHintCache;
+	/**
+	 * Tail-rotation observer (`docs/reactivity.md` §Tail rotation). Fired once per successor tail when an
+	 * inbound notification reveals a rotation (delivered `tailId` differs, or a `rotationHint` pre-announce):
+	 * the manager invalidates the sticky cohort-hint cache and hands the host a jittered re-registration plan
+	 * to schedule. Absent ⇒ rotation is detected and the cache invalidated, but no plan is surfaced.
+	 */
+	readonly onRotation?: (notice: RotationNotice) => void;
+	/** Re-registration jitter for the rotation plan's `fireAt`; defaults to the `T_rejoin_jitter` curve. */
+	readonly rejoinJitter?: RejoinJitter;
 	/** Unix-ms clock for resume timestamps (injected for deterministic tests). Default `Date.now`. */
 	readonly clock?: () => number;
 	/** Last revision already held; `0` (default) for a fresh subscribe. */
@@ -114,6 +142,10 @@ export class ReactivitySubscriptionManager {
 	private readonly options: ReactivitySubscriptionManagerOptions;
 	private readonly cohortHintCache: StickyCohortHintCache;
 	private readonly clock: () => number;
+	private readonly tailIdAtAttachB64: string;
+	private readonly rejoinJitter: RejoinJitter;
+	/** The successor tail a rotation has already been surfaced for, so the notice fires once per rotation. */
+	private rotationHandledFor?: string;
 	/** Memoized db-core backfill driver (built on first gap, once `this.subscriber` is assigned). */
 	private backfillRequester?: (from: number, to: number) => Promise<BackfillReplyV1>;
 	private handle?: RegistrationHandle;
@@ -130,6 +162,8 @@ export class ReactivitySubscriptionManager {
 		this.lastKnownRev = options.lastKnownRev ?? 0;
 		this.cohortHintCache = options.cohortHintCache ?? createStickyCohortHintCache();
 		this.clock = options.clock ?? ((): number => Date.now());
+		this.tailIdAtAttachB64 = bytesToB64url(options.tailIdAtAttach);
+		this.rejoinJitter = options.rejoinJitter ?? createRejoinJitter();
 		// Verify against the tail cohort's membership cert (the verifier owns the one fetch-and-retry).
 		this.verifier = createNotificationVerifier({ verifier: this.service.verifier(), tier: Tier.T3 });
 		this.subscriber = createReactivitySubscriber({
@@ -258,9 +292,38 @@ export class ReactivitySubscriptionManager {
 		return this.cohortHintCache;
 	}
 
-	/** Run the db-core delivery path for one inbound notification. */
-	onNotification(n: NotificationV1): Promise<DeliveryOutcome> {
-		return this.subscriber.onNotification(n);
+	/**
+	 * Run the db-core delivery path for one inbound notification, then check for tail rotation
+	 * (`docs/reactivity.md` §Tail rotation): a delivered `tailId` that differs from `tailIdAtAttach`, or a
+	 * `rotationHint` pre-announce, invalidates the sticky cohort-hint cache (the cached primary is under the
+	 * old tree) and surfaces a jittered re-registration plan via {@link ReactivitySubscriptionManagerOptions.onRotation}.
+	 * Fired at most once per successor tail.
+	 */
+	async onNotification(n: NotificationV1): Promise<DeliveryOutcome> {
+		const outcome = await this.subscriber.onNotification(n);
+		this.checkRotation(n);
+		return outcome;
+	}
+
+	/** Detect a tail rotation from an inbound notification and surface it once per successor tail. */
+	private checkRotation(n: NotificationV1): void {
+		const detection = detectRotation(this.tailIdAtAttachB64, n);
+		if (!detection.rotated || detection.newTailId === undefined || detection.newTailId === this.rotationHandledFor) {
+			return;
+		}
+		this.rotationHandledFor = detection.newTailId;
+		// The cached primary is under the now-stale tree; drop it so the re-registration re-walks.
+		this.cohortHintCache.invalidate(this.collectionIdB64);
+		if (this.options.onRotation === undefined) {
+			return;
+		}
+		const plan = planReRegistration({
+			hint: { newTailId: detection.newTailId },
+			lastRevision: this.subscriber.lastRevision,
+			now: this.clock(),
+			jitter: this.rejoinJitter,
+		});
+		this.options.onRotation({ newTailId: detection.newTailId, preAnnounced: detection.preAnnounced, plan });
 	}
 }
 

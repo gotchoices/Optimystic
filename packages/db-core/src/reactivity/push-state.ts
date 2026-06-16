@@ -11,17 +11,20 @@
  * serve a backfill/replay if the primary is unavailable. This module defines the **full** struct and its
  * gossip codec so all three reactivity tickets share one definition. The rolling parent {@link checkpoint}
  * (and its derived {@link parentCheckpoint} summary) is fed by replay-ring eviction
- * ([reactivity-backfill-resume-checkpoints]); the `perSubscriberQueue` field remains **reserved** for
- * [reactivity-rotation-backpressure-policy].
+ * ([reactivity-backfill-resume-checkpoints]); the `perSubscriberQueue` field carries the primary-local
+ * per-subscriber {@link SubscriberBackpressure} ([reactivity-rotation-backpressure-policy]). The
+ * backpressure map is **primary-local fan-out state, never gossiped** — it is absent from
+ * {@link PushStateGossipV1}; a handoff rebuilds it empty and the replay buffer covers the gap.
  */
 
 import { bytesToB64url, b64urlToBytes, decodeCohortMessage, encodeCohortMessage, DEFAULT_MAX_MESSAGE_BYTES } from "../cohort-topic/wire/codec.js";
 import { CohortWireError } from "../cohort-topic/wire/validate.js";
-import { DEDUPE_WINDOW_DEFAULT, W_DEFAULT } from "./config.js";
+import { DEDUPE_WINDOW_DEFAULT, QUEUE_MAX_DEFAULT, W_DEFAULT } from "./config.js";
+import { createSubscriberBackpressure, type SubscriberBackpressure, type SubscriberEnqueueResult } from "./backpressure.js";
 import { RollingCheckpoint, type CheckpointSummary, type DeltaCoalesce, type DigestFold } from "./checkpoint.js";
 import { createDedupeWindow, type DedupeStateV1, type DedupeWindow } from "./dedupe.js";
 import { createReplayBuffer, type ReplayBuffer, type ReplayBufferStateV1, type RevisionEntry } from "./replay-buffer.js";
-import { validateNotificationV1 } from "./wire.js";
+import { validateNotificationV1, type NotificationV1 } from "./wire.js";
 
 /** A reference to a parent/child cohort in the reactivity tree (`tier-(d∓1)`). */
 export interface CohortRef {
@@ -29,16 +32,6 @@ export interface CohortRef {
 	readonly coord: string;
 	/** The cohort's primary member id, base64url (when known). */
 	readonly primary?: string;
-}
-
-/**
- * Per-subscriber bounded queue — **reserved** for [reactivity-rotation-backpressure-policy]
- * (`docs/reactivity.md` §Slow-subscriber backpressure). Declared minimally so {@link PushState} carries
- * the `perSubscriberQueue` field; the sibling ticket fills out drop-oldest semantics.
- */
-export interface BoundedQueueRef {
-	readonly capacity: number;
-	readonly dropped: number;
 }
 
 /** Construction inputs for a {@link PushState}. */
@@ -59,6 +52,8 @@ export interface PushStateInit {
 	readonly dedupeWindow?: number;
 	/** Parent-checkpoint span `W_checkpoint` (default {@link import("./config.js").W_CHECKPOINT_DEFAULT}). */
 	readonly wCheckpoint?: number;
+	/** Per-subscriber bounded-queue depth `queue_max` (default {@link QUEUE_MAX_DEFAULT}). */
+	readonly queueMax?: number;
 	/** `delta_max` for the checkpoint's coalesced `mergedDelta`; `0` (default) ⇒ never emit a delta. */
 	readonly deltaMaxBytes?: number;
 	/** `mergedDigest` fold override (default: deterministic running hash over per-revision commit digests). */
@@ -101,8 +96,20 @@ export class PushState {
 	 * recovers `W + W_checkpoint` revisions in one round trip (the stacked-window semantics).
 	 */
 	readonly checkpoint: RollingCheckpoint;
-	/** Reserved — populated by [reactivity-rotation-backpressure-policy]. */
-	readonly perSubscriberQueue: Map<string, BoundedQueueRef> = new Map();
+	/**
+	 * The forwarder primary's per-subscriber drop-oldest backpressure map
+	 * ([reactivity-rotation-backpressure-policy], `docs/reactivity.md` §Slow-subscriber backpressure).
+	 * Primary-local fan-out state — **not** gossiped, so it is absent from {@link PushStateGossipV1}.
+	 */
+	readonly perSubscriberQueue: SubscriberBackpressure;
+	/**
+	 * The checkpoint migrated from the **outgoing** tail when this cohort became the new tail across a
+	 * rotation ([reactivity-rotation-backpressure-policy], `docs/reactivity.md` §Tail rotation step 5). The
+	 * new tail "holds the old checkpoint" so a `ResumeV1` whose span crosses the rotation is recoverable;
+	 * `undefined` until a handoff lands via {@link adoptRotationCheckpoint}. Distinct from the live rolling
+	 * {@link checkpoint}, which rolls from this cohort's *own* replay-ring eviction.
+	 */
+	private inherited?: CheckpointSummary;
 
 	constructor(init: PushStateInit) {
 		this.collectionId = init.collectionId;
@@ -121,7 +128,33 @@ export class PushState {
 		// window is exactly a revision that should roll into the parent-checkpoint summary.
 		this.replayBuffer = createReplayBuffer(init.w ?? W_DEFAULT, (evicted) => this.checkpoint.retire(evicted));
 		this.dedupe = createDedupeWindow(init.dedupeWindow ?? DEDUPE_WINDOW_DEFAULT);
+		this.perSubscriberQueue = createSubscriberBackpressure(init.queueMax ?? QUEUE_MAX_DEFAULT);
 		this.lastRevision = -1;
+	}
+
+	/**
+	 * Fan one notification onto each subscriber's bounded queue (the primary's per-subscriber backpressure,
+	 * `docs/reactivity.md` §Slow-subscriber backpressure). Returns only the subscribers whose queue dropped
+	 * its oldest under pressure — a slow subscriber's drop never stalls fan-out to the rest of the cohort.
+	 */
+	enqueueForSubscribers(subscriberIds: Iterable<string>, n: NotificationV1): SubscriberEnqueueResult[] {
+		return this.perSubscriberQueue.fanOut(subscriberIds, n);
+	}
+
+	/** The checkpoint inherited from the outgoing tail on rotation, or `undefined` until a handoff lands. */
+	get inheritedCheckpoint(): CheckpointSummary | undefined {
+		return this.inherited;
+	}
+
+	/**
+	 * Land an outgoing tail's rotation handoff checkpoint on this (new tail) cohort
+	 * (`docs/reactivity.md` §Tail rotation step 5). Idempotent: a later handoff replaces only if it covers a
+	 * higher revision, so a re-delivered or older handoff never rewinds the inherited span.
+	 */
+	adoptRotationCheckpoint(summary: CheckpointSummary): void {
+		if (this.inherited === undefined || summary.toRevision > this.inherited.toRevision) {
+			this.inherited = summary;
+		}
 	}
 
 	/**

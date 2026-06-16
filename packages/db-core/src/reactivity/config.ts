@@ -6,20 +6,24 @@
  * simulator fold-back ([fold-simulator-findings-into-design-docs]) can retune `W` / `dedupe_window`
  * without touching origination, forwarding, the replay buffer, or delivery.
  *
- * **Simulator-validated-pending.** `W` (replay buffer depth) and `dedupe_window` are *provisional*
- * until [simulator-reactivity-replay] confirms them. The simulator's REVISED guidance is that `W`
- * SHOULD become adaptive per measured commit-rate on hot collections (`W ≈ ⌈min_coverage × cps⌉`);
- * the static `W = 256` is kept as the Edge/low-rate default. {@link resolveW} exposes that hook while
- * preserving the static default behavior — the backfill/resume ticket may treat `W` as a per-collection
- * computed value, this ticket keeps it constant unless a `cps` is supplied.
+ * **Simulator-validated-pending.** `W` (replay buffer depth), `dedupe_window`, `T_drain`, `queue_max`,
+ * and `block_fill_size` are *provisional* pending the design simulator ([simulator-reactivity-replay],
+ * folded back by [fold-simulator-findings-into-design-docs]). The simulator's REVISED guidance is that `W`
+ * SHOULD become adaptive per measured commit-rate on hot collections (`W ≈ ⌈min_coverage × cps⌉`); the
+ * static `W = 256` is kept as the Edge/low-rate default. {@link resolveW} exposes that hook; the
+ * simulator's tail-rotation scenario also confirms the re-registration burst stays inside
+ * `cap_promote_fast` within `T_drain`, and flags whether `queue_max` should scale with cohort size/tier
+ * ({@link resolveQueueMax} is the parallel hook for that fold-back). Sourcing every tunable from this
+ * single table is what lets the fold-back revise the values without touching the protocol code.
  *
- * `W_checkpoint`, `queue_max`, `T_drain`, `warm_threshold` are owned by the sibling tickets
- * ([reactivity-backfill-resume-checkpoints], [reactivity-rotation-backpressure-policy]); they are
- * listed here so the reactivity config surface is singular, but nothing in this ticket reads them
- * beyond carrying their defaults.
+ * Ownership: `W` / `dedupe_window` ← [reactivity-origination-replay-delivery]; `W_checkpoint` ←
+ * [reactivity-backfill-resume-checkpoints]; `queue_max` / `delta_max` / `T_drain` / `warm_threshold` /
+ * `block_fill_size` ← [reactivity-rotation-backpressure-policy] (this ticket). `T_rejoin_jitter`, TTL, and
+ * ping are inherited from the cohort-topic defaults.
  */
 
 import type { NodeProfile } from "../cohort-topic/tiers.js";
+import { DEFAULT_T_REJOIN_JITTER_MS } from "../cohort-topic/antiflood/jitter.js";
 
 /** Replay buffer depth (revisions per cohort, per collection). Simulator-validated-pending. */
 export const W_DEFAULT = 256;
@@ -27,7 +31,7 @@ export const W_DEFAULT = 256;
 export const DEDUPE_WINDOW_DEFAULT = 64;
 /** Parent-checkpoint span (revisions). Owned by the backfill/resume ticket; default carried here. */
 export const W_CHECKPOINT_DEFAULT = 4096;
-/** Per-subscriber bounded queue depth at a forwarder. Owned by the backpressure ticket. */
+/** Per-subscriber bounded queue depth at a forwarder. Simulator-validated-pending (may scale with cohort/tier). */
 export const QUEUE_MAX_DEFAULT = 32;
 /** Max delta payload size on a Core node (bytes). */
 export const DELTA_MAX_CORE_BYTES = 4096;
@@ -37,12 +41,14 @@ export const DELTA_MAX_EDGE_BYTES = 0;
 export const SUBSCRIBER_TTL_CORE_MS = 90_000;
 /** Subscriber registration TTL on an Edge node (ms), inherited from cohort-topic. */
 export const SUBSCRIBER_TTL_EDGE_MS = 60_000;
-/** Transactions per block — drives tail rotation. Owned by the rotation ticket; default carried here. */
+/** Transactions per block — drives tail rotation. Simulator-validated-pending. */
 export const BLOCK_FILL_SIZE_DEFAULT = 64;
-/** Old-tail drain time after rotation (ms). Owned by the rotation ticket. */
+/** Old-tail drain time after rotation (ms). Simulator-validated-pending. */
 export const T_DRAIN_MS = 60_000;
 /** Transactions remaining in tail before anticipatory warm-up. Owned by the rotation ticket. */
 export const WARM_THRESHOLD_DEFAULT = 8;
+/** Subscriber re-registration jitter span after a rotation hint (ms). Inherited from cohort-topic `T_rejoin_jitter`. */
+export const T_REJOIN_JITTER_MS = DEFAULT_T_REJOIN_JITTER_MS;
 
 /** The full reactivity config, with the documented defaults. */
 export interface ReactivityConfig {
@@ -62,12 +68,14 @@ export interface ReactivityConfig {
 	readonly subscriberTtlCoreMs: number;
 	/** Subscriber TTL on an Edge node (ms). */
 	readonly subscriberTtlEdgeMs: number;
-	/** Transactions per block (reserved; rotation ticket). */
+	/** Transactions per block — drives tail rotation. Simulator-validated-pending. */
 	readonly blockFillSize: number;
-	/** Old-tail drain time after rotation (ms) (reserved; rotation ticket). */
+	/** Old-tail drain time after rotation (ms). Simulator-validated-pending. */
 	readonly tDrainMs: number;
-	/** Transactions remaining before warm-up (reserved; rotation ticket). */
+	/** Transactions remaining before anticipatory warm-up. */
 	readonly warmThreshold: number;
+	/** Subscriber re-registration jitter span after a rotation (ms); inherited from cohort-topic. */
+	readonly tRejoinJitterMs: number;
 }
 
 /** The default reactivity config (`docs/reactivity.md` §Configuration). */
@@ -83,6 +91,7 @@ export const DEFAULT_REACTIVITY_CONFIG: ReactivityConfig = {
 	blockFillSize: BLOCK_FILL_SIZE_DEFAULT,
 	tDrainMs: T_DRAIN_MS,
 	warmThreshold: WARM_THRESHOLD_DEFAULT,
+	tRejoinJitterMs: T_REJOIN_JITTER_MS,
 };
 
 /** `delta_max` for a node profile: Core admits deltas up to `delta_max`, Edge declines them (`0`). */
@@ -136,4 +145,28 @@ export function resolveWCheckpoint(opts: { cps?: number; minCoverageSeconds?: nu
 	}
 	const ratio = opts.ratio ?? W_CHECKPOINT_RATIO;
 	return resolveW(opts) * ratio;
+}
+
+/**
+ * Resolve the per-subscriber bounded-queue depth `queue_max` for a cohort.
+ *
+ * Static default (no scaling input): the configured `config.queueMax` (32). The simulator flags whether
+ * `queue_max` should scale with cohort size / tier on hot collections; this is the single hook the
+ * fold-back ([fold-simulator-findings-into-design-docs]) retunes. When a `cohortSubscribers` count is
+ * supplied, the depth scales as `⌈queue_max × subscribers / scaleBaseline⌉` clamped to `[queueMax, maxQueue]`
+ * — never below the static default, optionally capped at a per-cohort memory budget. With no scaling input
+ * the hot path is unchanged (constant `queue_max`).
+ */
+export function resolveQueueMax(opts: { cohortSubscribers?: number; scaleBaseline?: number; maxQueue?: number; config?: ReactivityConfig } = {}): number {
+	const config = opts.config ?? DEFAULT_REACTIVITY_CONFIG;
+	if (opts.cohortSubscribers === undefined) {
+		return config.queueMax;
+	}
+	const baseline = opts.scaleBaseline ?? 1;
+	if (!Number.isFinite(opts.cohortSubscribers) || opts.cohortSubscribers <= 0 || !(baseline > 0)) {
+		return config.queueMax;
+	}
+	const scaled = Math.ceil((config.queueMax * opts.cohortSubscribers) / baseline);
+	const maxQueue = opts.maxQueue ?? Number.POSITIVE_INFINITY;
+	return Math.min(Math.max(config.queueMax, scaled), maxQueue);
 }

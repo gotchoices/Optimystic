@@ -48,7 +48,7 @@ describe('reactivity push state', () => {
 	it('exposes an empty parent checkpoint until revisions retire, and an empty backpressure map', () => {
 		const state = newState();
 		expect(state.parentCheckpoint).to.equal(undefined); // nothing has retired from the ring yet
-		expect(state.perSubscriberQueue.size).to.equal(0); // reserved for the backpressure ticket
+		expect(state.perSubscriberQueue.subscriberCount).to.equal(0); // no subscriber queues until fan-out
 	});
 
 	it('rolls evicted revisions into the parent checkpoint as the replay ring overflows', () => {
@@ -127,6 +127,46 @@ describe('reactivity push state', () => {
 			const sizeAfterFirst = b1.replayBuffer.size;
 			b1.mergeGossip(g);
 			expect(b1.replayBuffer.size).to.equal(sizeAfterFirst);
+		});
+	});
+
+	describe('per-subscriber backpressure (primary-local, never gossiped)', () => {
+		it('fans a notification onto each subscriber queue and reports only the droppers', () => {
+			const state = new PushState({ collectionId: b(1), topicId: b(3), tailIdAtJoin: b(2), queueMax: 2 });
+			const fast = b(10);
+			const slow = b(20);
+			// fast drains each round; slow never drains → only slow drops under sustained fan-out.
+			let drops: { subscriberId: string }[] = [];
+			for (let rev = 1; rev <= 5; rev++) {
+				drops = state.enqueueForSubscribers([fast, slow], makeNotification(rev));
+				while ((state.perSubscriberQueue.peekQueue(fast)?.size ?? 0) > 0) state.perSubscriberQueue.queue(fast).dequeue();
+			}
+			expect(drops.every((d) => d.subscriberId === slow)).to.equal(true);
+			expect(state.perSubscriberQueue.queue(slow).dropped).to.equal(3); // 5 fanned, depth 2 → 3 dropped
+		});
+
+		it('excludes the per-subscriber queue from the gossip image', () => {
+			const state = newState();
+			state.enqueueForSubscribers([b(10)], makeNotification(1));
+			expect(state.serializeGossip()).to.not.have.property('perSubscriberQueue');
+		});
+	});
+
+	describe('rotation handoff checkpoint adoption', () => {
+		it('records an inherited checkpoint only when it advances the covered range', () => {
+			const state = newState();
+			expect(state.inheritedCheckpoint).to.equal(undefined);
+			const summary = {
+				collectionId: b(1),
+				fromRevision: 3,
+				toRevision: 6,
+				mergedDigest: b(0),
+				bracketingEntries: [makeNotification(3), makeNotification(6)] as [NotificationV1, NotificationV1],
+			};
+			state.adoptRotationCheckpoint(summary);
+			expect(state.inheritedCheckpoint?.toRevision).to.equal(6);
+			state.adoptRotationCheckpoint({ ...summary, toRevision: 4 }); // older → ignored
+			expect(state.inheritedCheckpoint?.toRevision).to.equal(6);
 		});
 	});
 });

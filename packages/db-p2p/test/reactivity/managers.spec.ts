@@ -8,6 +8,7 @@ import {
 	edgeProfile,
 	buildNotificationV1,
 	createReplayBuffer,
+	createRejoinJitter,
 	serveBackfill,
 	SUBSCRIBER_TTL_CORE_MS,
 	SUBSCRIBER_TTL_EDGE_MS,
@@ -25,7 +26,7 @@ import {
 	type CommitCert,
 } from '@optimystic/db-core';
 import { peerIdToBytes } from '../../src/cohort-topic/peer-codec.js';
-import { ReactivitySubscriptionManager, type ReactivitySubscriptionManagerOptions } from '../../src/reactivity/subscription-manager.js';
+import { ReactivitySubscriptionManager, type ReactivitySubscriptionManagerOptions, type RotationNotice } from '../../src/reactivity/subscription-manager.js';
 import { ReactivityOriginationManager } from '../../src/reactivity/origination-manager.js';
 
 /** A membership verifier with a fixed verdict — the managers only need it to resolve a verdict. */
@@ -296,6 +297,60 @@ describe('reactivity / subscription manager', () => {
 			expect(manager.cohortHint.get(bytesToB64url(COLLECTION))).to.equal(undefined); // dropped — cached primary is under the old tree
 		});
 	});
+
+	describe('tail-rotation detection on delivery', () => {
+		const NEW_TAIL = new Uint8Array([6, 6, 6, 6]);
+		const makeRotationManager = (notices: RotationNotice[]) =>
+			new ReactivitySubscriptionManager({
+				service: new RecordingService(new FixedVerifier('verified')),
+				collectionId: COLLECTION,
+				tailIdAtAttach: TAIL,
+				deliver: () => {},
+				lastKnownRev: 41,
+				rejoinJitter: createRejoinJitter({ random: () => 0.5 }),
+				clock: () => 1_000,
+				onRotation: (n) => notices.push(n),
+			});
+
+		it('surfaces a pre-announce hint with a jittered re-registration plan carrying lastRevision', async () => {
+			const notices: RotationNotice[] = [];
+			const manager = makeRotationManager(notices);
+			manager.cohortHint.set(bytesToB64url(COLLECTION), { topicId: bytesToB64url(TAIL), primary: bytesToB64url(new Uint8Array([4])), cohortHint: [] });
+
+			await manager.onNotification(noteB64(42)); // ordinary delivery, no rotation
+			expect(notices).to.have.length(0);
+
+			// revision 43 carries the rotation pre-announce.
+			const announce: NotificationV1 = { ...noteB64(43), rotationHint: { newTailId: bytesToB64url(NEW_TAIL), effectiveAtRevision: 44 } };
+			await manager.onNotification(announce);
+
+			expect(notices).to.have.length(1);
+			expect(notices[0]!.preAnnounced).to.equal(true);
+			expect(notices[0]!.newTailId).to.equal(bytesToB64url(NEW_TAIL));
+			expect(notices[0]!.plan.lastRevision).to.equal(43); // continuous across the rotation
+			expect([...notices[0]!.plan.newTopicId]).to.deep.equal([...reactivityTopicId(NEW_TAIL)]);
+			// the cached primary is under the now-stale tree — dropped so re-registration re-walks.
+			expect(manager.cohortHint.get(bytesToB64url(COLLECTION))).to.equal(undefined);
+		});
+
+		it('fires the rotation notice once per successor tail', async () => {
+			const notices: RotationNotice[] = [];
+			const manager = makeRotationManager(notices);
+			const announce = (rev: number): NotificationV1 => ({ ...noteB64(rev), rotationHint: { newTailId: bytesToB64url(NEW_TAIL), effectiveAtRevision: 44 } });
+			await manager.onNotification(announce(42));
+			await manager.onNotification(announce(43));
+			expect(notices).to.have.length(1);
+		});
+
+		it('detects a hard rotation when the delivered tailId already differs', async () => {
+			const notices: RotationNotice[] = [];
+			const manager = makeRotationManager(notices);
+			const onNewTree: NotificationV1 = { ...noteB64(42), tailId: bytesToB64url(NEW_TAIL) };
+			await manager.onNotification(onNewTree);
+			expect(notices).to.have.length(1);
+			expect(notices[0]!.preAnnounced).to.equal(false);
+		});
+	});
 });
 
 describe('reactivity / origination manager', () => {
@@ -356,5 +411,22 @@ describe('reactivity / origination manager', () => {
 		manager.install();
 		service.onLocalCommit!(event, cert);
 		expect(emitted).to.have.length(0);
+	});
+
+	it('embeds the rotation pre-announce on the block-filling notification', () => {
+		const service = new RecordingService();
+		const emitted: NotificationV1[] = [];
+		const newTailId = bytesToB64url(new Uint8Array([6, 6]));
+		const manager = new ReactivityOriginationManager({
+			service,
+			// the block-fill tracker would supply this rotationHint on the filling commit (rev + 1 effective).
+			resolveContext: () => ({ tailId: TAIL, deltaMaxBytes: 0, rotationHint: { newTailId, effectiveAtRevision: event.rev + 1 } }),
+			emit: (n) => emitted.push(n),
+			clock: () => 1_700_000_000_000,
+		});
+		manager.install();
+		service.onLocalCommit!(event, cert);
+		expect(emitted).to.have.length(1);
+		expect(emitted[0]!.rotationHint).to.deep.equal({ newTailId, effectiveAtRevision: event.rev + 1 });
 	});
 });

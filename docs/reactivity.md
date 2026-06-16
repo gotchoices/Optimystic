@@ -187,6 +187,17 @@ Notifications already in the set are dropped silently. The set is gossiped withi
 
 ### Slow-subscriber backpressure
 
+> **Implemented** (`11.5-reactivity-rotation-backpressure-policy`). The per-subscriber drop-oldest queue is
+> `BoundedQueue` and its per-subscriber map `SubscriberBackpressure` in
+> `packages/db-core/src/reactivity/backpressure.ts`, wired into `PushState.perSubscriberQueue`
+> (`push-state.ts`) with `PushState.enqueueForSubscribers(subscriberIds, n)` doing the fan-out. Each
+> subscriber gets its own bounded queue (depth `queue_max`, default 32); a full queue drops its **oldest**
+> entry and bumps a monotone `dropped` counter, so a slow subscriber's drops never touch a fast peer's
+> queue (the isolation property). The map is **primary-local fan-out state — never gossiped** (absent from
+> `PushStateGossipV1`); a `cohortEpoch` handoff rebuilds it empty and the replay buffer + backfill path
+> recover the few notifications dropped at handoff. Spec: `backpressure.spec.ts` (drop-oldest + counter,
+> slow-subscriber isolation while fast subscribers stay contiguous).
+
 A forwarder's primary maintains a per-subscriber bounded queue with drop-oldest semantics:
 
 ```
@@ -329,6 +340,26 @@ Subscribers MAY request a sub-range smaller than `[fromRevision, toRevision]`; c
 
 ## Tail rotation
 
+> **Implemented** (`11.5-reactivity-rotation-backpressure-policy`). The rotation lifecycle is
+> `packages/db-core/src/reactivity/rotation.ts`. **Pre-announce**: `buildRotationHint(newTailId,
+> fillingRevision)` builds the `rotationHint{ newTailId, effectiveAtRevision = fillingRevision + 1 }`, fired
+> on the block-filling commit detected by `BlockFillTracker` (which also fires anticipatory **warm-up** at
+> `block_fill_size − warm_threshold`); origination carries it through unchanged (`OriginationContext.rotationHint`).
+> **Detection**: `detectRotation(tailIdAtAttach, n)` flags a rotation when the delivered `tailId` *or* the
+> `rotationHint.newTailId` differs from `tailIdAtAttach` (db-p2p's `ReactivitySubscriptionManager` invalidates
+> the sticky cohort-hint cache and surfaces a `RotationNotice` once per successor tail). **Drain**:
+> `TailDrainGate` serves renewals/replays for `T_drain` while bouncing new subscriptions with a
+> `Promoted`-shaped `RotationRedirectV1` to the new tree's `topicId`; after `T_drain` it reports `drained`.
+> **Jittered re-registration**: `planReRegistration` / `planReRegistrationWave` derive the new `topicId` and
+> stagger the move over `T_rejoin_jitter` via the cohort-topic `RejoinJitter` (the wave form hard-bounds the
+> new tail's inbound to `cap_promote_fast` per window), carrying the subscriber's `lastRevision` (revisions
+> continuous across rotation). **Handoff**: `buildRotationHandoffCheckpoint` folds the outgoing tail's replay
+> buffer into a final `CheckpointSummary` over `[lastCheckpoint.toRevision + 1, rotationRevision]` and
+> `applyRotationHandoff` lands it on the new tail's `PushState.inheritedCheckpoint`. Forwarder draining is
+> emergent (cohort-topic demotion). The `ResumeReplyV1.TailRotated` variant + `latestKnownTailId`-staleness
+> classification live in the backfill/resume ticket; this ticket produces the handoff + rotation condition.
+> Specs: `rotation.spec.ts`, db-p2p `managers.spec.ts` (rotation detection, rotationHint emission).
+
 Tail block ID changes when a block fills (default `block_fill_size = 64` transactions). Rotation moves the topic anchor — and hence the tree root — to a new ring coord.
 
 ### Rotation protocol
@@ -367,6 +398,18 @@ A subscriber needs no trust in any forwarder. The trust root is the tail cohort'
 ---
 
 ## Per-cohort policy
+
+> **Implemented** (`11.5-reactivity-rotation-backpressure-policy`). The reactivity producer-side policy is
+> `packages/db-core/src/reactivity/policy.ts`. `mayServeAsReactivityForwarder(profile)` is
+> `profile.willingTiers.has(Tier.T3)` — `false` on every Edge node (Edge's willing set is `{T0, T1}`) and on
+> a Core node an operator narrowed off T3. `instantiateForwarderPushState(profile, init)` is the explicit
+> gate at the point a node decides whether to become a forwarder: it returns `undefined` for a
+> subscriber-only node (the Edge node stays a pure T3 *consumer*, never instantiates a `PushState`), and
+> `requireForwarderPushState` throws `ReactivityForwarderForbiddenError` for call sites that treat an Edge
+> forwarder attempt as a programming error. `reactivityNodePolicy(profile)` bundles forwarder eligibility
+> with the **authoritative** `delta_max` plumbing (Core 4096 / Edge 0, from `config.ts` `deltaMaxForProfile`)
+> the origination ticket only consumed. The cohort-topic willingness check already declines T3 admission on
+> Edge; this gate makes the reactivity decision explicit and testable. Spec: `policy.spec.ts`.
 
 Reactivity is **T3 (luxury)** at the cohort-topic layer. Concretely:
 
@@ -553,6 +596,16 @@ Reactivity adds the following to the cohort-topic defaults:
 | `T_drain` | 60 s | Old-tail drain time after rotation |
 | `warm_threshold` | 8 | Transactions remaining in tail before anticipatory warm-up |
 | `block_fill_size` | 64 | Transactions per block (drives tail rotation) |
+
+> **Implemented** (`11.5-reactivity-rotation-backpressure-policy`). The consolidated defaults table is
+> `packages/db-core/src/reactivity/config.ts` (`DEFAULT_REACTIVITY_CONFIG` + the per-parameter constants);
+> every reactivity tunable is sourced from it so the simulator fold-back can revise a value without
+> touching protocol code. This ticket owns `queue_max` / `delta_max` / `T_drain` / `warm_threshold` /
+> `block_fill_size`; `T_rejoin_jitter` (`T_REJOIN_JITTER_MS`), TTL, and ping are inherited from the
+> cohort-topic defaults. `T_drain`, `queue_max`, and `block_fill_size` are flagged
+> **simulator-validated-pending**: `resolveQueueMax` is the adaptive hook (parallel to `resolveW`) for the
+> simulator's "should `queue_max` scale with cohort size/tier?" finding, defaulting to the static
+> `queue_max = 32` until a cohort size is wired through. Spec: `config.spec.ts`.
 
 ### Edge profile
 
