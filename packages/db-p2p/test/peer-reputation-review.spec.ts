@@ -121,8 +121,11 @@ describe('IPeerReputation contract (review)', () => {
 		svc.reportPeer(peerB, PenaltyReason.ConsensusTimeout);
 		const all = svc.getAllReputations();
 		expect(all.size).to.equal(2);
-		expect(all.get(peerA)!.effectiveScore).to.equal(svc.getScore(peerA));
-		expect(all.get(peerB)!.effectiveScore).to.equal(svc.getScore(peerB));
+		// effectiveScore decays continuously, so the snapshot taken inside
+		// getAllReputations and the later getScore call can differ by a sub-ms
+		// tick of decay; compare with tolerance rather than exact equality.
+		expect(all.get(peerA)!.effectiveScore).to.be.closeTo(svc.getScore(peerA), 0.01);
+		expect(all.get(peerB)!.effectiveScore).to.be.closeTo(svc.getScore(peerB), 0.01);
 	});
 
 	it('getAllReputations includes peers only known through recordSuccess', () => {
