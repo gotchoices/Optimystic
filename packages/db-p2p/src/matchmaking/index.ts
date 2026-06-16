@@ -13,3 +13,6 @@ export * from "./provider-manager.js";
 export * from "./seeker-manager.js";
 export * from "./query-handler.js";
 export * from "./seeker-walk-client.js";
+export * from "./aggregate-counts.js";
+export * from "./traffic-validation.js";
+export * from "./module.js";

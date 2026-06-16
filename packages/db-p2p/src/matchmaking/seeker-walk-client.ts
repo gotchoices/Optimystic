@@ -103,6 +103,13 @@ export interface SeekerWalkResult {
 	readonly terminalTier: number;
 	/** Total register hops issued (probes + escalations + descends). */
 	readonly hops: number;
+	/**
+	 * Max `topicTraffic.childCohortCount` observed across every `Accepted` reply this walk saw. `> 0`
+	 * means the topic has promoted (it is hot), so the single-cohort sample is unrepresentative — the
+	 * public seeker session / voting `QuorumDiscovery` binding uses this to decide whether to escalate to
+	 * the multi-cohort sweep (`docs/matchmaking.md` §Multi-cohort sweep).
+	 */
+	readonly maxChildCohortCount: number;
 }
 
 /** Outcome of evaluating one `Accepted` tier. */
@@ -128,6 +135,8 @@ export class SeekerWalkClient {
 	private ratioState: FilterAcceptRatioState = newFilterAcceptRatioState();
 	private deadline = 0;
 	private hops = 0;
+	/** Max `childCohortCount` seen across `Accepted` replies — the hot-topic / sweep-escalation signal. */
+	private maxChildCohortCount = 0;
 
 	constructor(deps: SeekerWalkClientDeps) {
 		this.transport = deps.transport;
@@ -223,6 +232,9 @@ export class SeekerWalkClient {
 			return d <= 0 ? "terminal" : "escalate";
 		}
 
+		// Track the hottest tier seen — drives the single-cohort-vs-sweep decision in the public session.
+		this.maxChildCohortCount = Math.max(this.maxChildCohortCount, traffic.childCohortCount);
+
 		const decision = decide(
 			{
 				currentMatches: this.matched.size,
@@ -269,6 +281,7 @@ export class SeekerWalkClient {
 			metWantCount: this.matched.size >= this.wantCount,
 			terminalTier,
 			hops: this.hops,
+			maxChildCohortCount: this.maxChildCohortCount,
 		};
 	}
 }

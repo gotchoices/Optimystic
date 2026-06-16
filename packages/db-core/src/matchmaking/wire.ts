@@ -134,15 +134,27 @@ export interface SeekerEntryV1 {
 	registrationSig: string;
 }
 
-/** Root-cohort multi-cohort-sweep summary (producer lands in the sweep ticket). */
+/**
+ * Root-cohort multi-cohort-sweep summary (`docs/matchmaking.md` §Aggregated provider counts).
+ *
+ * Unlike {@link QueryReplyV1}, this is **threshold-signed** — it attests a cohort-agreed *registered*
+ * provider count, not one primary's advisory view — so it carries the same `(thresholdSig, signers)`
+ * envelope the cohort-topic {@link import("../cohort-topic/wire/types.js").PromotionNoticeV1} uses:
+ * `signature` is the concatenated cohort multisig blob and `signers` is the distinct `>= minSigs` member
+ * subset that produced it. A verifier splits the blob by `signers` and checks the subset against the
+ * cohort membership certificate (db-p2p binds the crypto). `signers` is required precisely because a
+ * threshold blob is unverifiable without the signer set that aligns chunk `i` ↔ `signers[i]`.
+ */
 export interface AggregateCountV1 {
 	v: 1;
 	/** Topic id, base64url. */
 	topicId: string;
-	/** `count` is log-bucketed. */
+	/** `count` is log-bucketed (see {@link logBucketCount}). */
 	bucketCounts: AggregateBucketV1[];
-	/** base64url. */
+	/** Cohort threshold-signature blob over {@link aggregateCountSigningPayload}, base64url. */
 	signature: string;
+	/** PeerIds of the `>= minSigs` threshold signers, base64url (aligns the `signature` blob). */
+	signers: string[];
 	/** base64url. */
 	cohortEpoch: string;
 }
@@ -476,11 +488,16 @@ export function validateAggregateCountV1(value: unknown): AggregateCountV1 {
 	if (!Array.isArray(buckets)) {
 		fail(`${what}: field "bucketCounts" must be an array`);
 	}
+	const signers = obj["signers"];
+	if (!Array.isArray(signers) || signers.some((s) => typeof s !== "string")) {
+		fail(`${what}: field "signers" must be an array of strings`);
+	}
 	return {
 		v: 1,
 		topicId: b64urlField(reqString(obj, "topicId", what), "topicId", what),
 		bucketCounts: buckets.map(validateAggregateBucketV1),
 		signature: b64urlField(reqString(obj, "signature", what), "signature", what),
+		signers: (signers as string[]).map((s, i) => b64urlField(s, `signers[${i}]`, what)),
 		cohortEpoch: b64urlField(reqString(obj, "cohortEpoch", what), "cohortEpoch", what),
 	};
 }
@@ -619,5 +636,45 @@ export function queryReplySigningPayload(reply: Omit<QueryReplyV1, "signature">)
 		],
 		(reply.providers ?? []).map((p) => p.participantId),
 		(reply.seekers ?? []).map((s) => s.participantId),
+	]));
+}
+
+// --- aggregate-count log-bucketing + canonical threshold-signing image (multi-cohort sweep) ---
+
+/**
+ * Log-bucket a raw provider count for an {@link AggregateCountV1} bucket: the largest power of two
+ * `<= n` (and `0` for `n <= 0`). The root reports bucketed, not exact, per-shard populations
+ * (`docs/matchmaking.md` §Multi-cohort sweep) — both to compress the summary and to avoid leaking exact
+ * counts.
+ *
+ * The bucketing rounds **down** and is monotonic non-decreasing, so a consumer summing bucketed counts
+ * (`multi-cohort-seeker.selectShards`) *under*-estimates the true population. That bias is the safe
+ * direction for shard selection: the real population is always `>=` the reported one, so selecting until
+ * the bucketed sum reaches `wantCount` naturally over-provisions rather than under-selecting.
+ */
+export function logBucketCount(n: number): number {
+	if (!Number.isFinite(n) || n <= 0) {
+		return 0;
+	}
+	return 2 ** Math.floor(Math.log2(Math.floor(n)));
+}
+
+/**
+ * Canonical threshold-signed byte image of an {@link AggregateCountV1} — covers the semantic fields
+ * (`v`, `topicId`, `cohortEpoch`, and the bucket set) but never the `signature`/`signers` envelope,
+ * exactly as the cohort-topic `sig/payloads.ts` builders do for their threshold-signed notices. The
+ * bucket set is sorted by `(targetTier, prefixSlot)` so the image is independent of bucket emission
+ * order — signer and verifier recompute identical bytes.
+ */
+export function aggregateCountSigningPayload(unsigned: Omit<AggregateCountV1, "signature" | "signers">): Uint8Array {
+	const buckets = [...unsigned.bucketCounts]
+		.sort((a, b) => a.targetTier - b.targetTier || a.prefixSlot - b.prefixSlot)
+		.map((b) => [b.targetTier, b.prefixSlot, b.count]);
+	return utf8Encoder.encode(JSON.stringify([
+		"AggregateCountV1",
+		unsigned.v,
+		unsigned.topicId,
+		unsigned.cohortEpoch,
+		buckets,
 	]));
 }

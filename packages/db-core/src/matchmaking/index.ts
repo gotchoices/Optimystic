@@ -17,4 +17,5 @@ export * from "./seeker.js";
 export * from "./capability-filter.js";
 export * from "./query-eval.js";
 export * from "./seeker-walk.js";
+export * from "./multi-cohort-seeker.js";
 export * from "./voting-quorum.js";

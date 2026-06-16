@@ -22,6 +22,20 @@ Both roles use the same cohort-topic registration mechanism with stable topic an
 
 This replaces the earlier Kademlia `provide`/`findProviders` framing. The cohort-topic layer gives matchmaking what the original provide-based approach could not: tree growth that automatically adapts to hot tasks (without flooding), cohort-stable forwarder identity (instead of fragile per-key replication), and shared infrastructure with reactivity and future directory consumers.
 
+> **Implemented** (mock-tier e2e pending). The cohesive public module is
+> `packages/db-p2p/src/matchmaking/module.ts`: `MatchmakingProviderSession`
+> (`register(topic, payload)` / `renew` / `withdraw` / `setCapacity` / `signalFull`) and
+> `MatchmakingSeekerSession` (`register(topic, payload)` / `query(q)` / `walk(topic, want)` — the hang-out
+> engine escalating to the multi-cohort sweep on a hot topic), both wired to `CohortTopicService` at tier
+> **T2** via the provider/seeker managers + seeker walk client. `createMatchmakingQuorumDiscovery` binds
+> the db-core voting `QuorumDiscovery` port to walk (single-cohort) + sweep, so `VotingQuorumAssembler`
+> runs over real substrate I/O. (The `*Session` classes are the substrate-wired public entry points; the
+> same-named db-core `MatchmakingProvider` / `MatchmakingSeeker` are the transport-free state +
+> signed-payload builders they compose.) Substrate I/O — walk transport, one-shot query, `d_max`
+> estimate, sweep ports — is injected, so the module unit-tests without a live libp2p stack. Spec:
+> `module.spec.ts` (db-p2p). Config + wire types are exported from the `db-core` and `db-p2p` matchmaking
+> package indexes.
+
 ---
 
 ## Goals and non-goals
@@ -208,6 +222,21 @@ When a topic is hot enough that providers live across many tier-`d ≥ 1` cohort
 2. **Multi-cohort sweep.** The seeker, after registering at its natural tier, additionally queries the root cohort (tier 0). The root maintains aggregated provider counts (not individual entries, but bucketed counts per tier-1 shard) and can redirect the seeker to specific tier-1 cohorts holding many providers. The seeker then queries those directly.
 
 The multi-cohort sweep costs more RPCs and is reserved for use cases where representativeness matters more than latency (voting quorums, capability fairness audits).
+
+> **Implemented** (mock-tier e2e pending). The seeker-side sweep orchestration —
+> `runMultiCohortSweep` / `selectShards` (high-population tier-1 shards first, accumulating bucketed
+> counts to `wantCount`, capped at a fan-out ceiling) plus the per-shard filter + `registrationSig`
+> re-validation + dedup — is `packages/db-core/src/matchmaking/multi-cohort-seeker.ts` (pure; the root
+> aggregate fetch, per-shard query, and threshold-verify are injected as a `MultiCohortSweepPorts` port).
+> The root-side producer — log-bucketed per-tier-1-shard counts, **threshold-signed**, **gated on tree
+> depth ≥ `aggregate_count_minimum_tier`** (a cold cohort that fell through to `NoState` returns
+> `undefined`) — is `packages/db-p2p/src/matchmaking/aggregate-counts.ts` (`buildAggregateCount`;
+> per-shard counts / depth / epoch / threshold signer all injected). Counts are quantized through
+> `logBucketCount` (largest power of two `≤ n`), which rounds *down* so the consumer's shard selection
+> over-provisions rather than under-selects. The public seeker session escalates walk → sweep on a hot
+> topic (`childCohortCount > 0`) or `preferSweep`; db-p2p binds the sweep to the voting
+> `QuorumDiscovery.sweep` port. Spec: `multi-cohort-seeker.spec.ts` (db-core), `aggregate-counts.spec.ts`
+> (db-p2p).
 
 ---
 
@@ -509,6 +538,35 @@ Because the same fresh provider can surface in both a push and a later safety/fi
 > tier** (the seeker still terminates at the root), and over-reporting costs **≤ `patienceMs` of
 > wasted hang-out drain** (no spatial flood — the walk only ever steps toward the root).
 
+> **Implemented** (mock-tier e2e pending). The seeker-side bounds are
+> `packages/db-p2p/src/matchmaking/traffic-validation.ts` (`boundReportedTraffic`): `capPatienceMs =
+> max(0, patienceRemaining)` (over-report can waste at most the remaining wall-clock patience) and
+> `escalateAfterTiers = 1` (under-report costs at most one extra hop per tier). The bounds hold **by
+> construction** of the existing toward-root-only walk (`SeekerWalkClient`), so this function documents
+> + asserts them rather than changing the walk topology; `maxWalkHops(dMax) = (dMax + 1)` is the
+> total-hop ceiling. **Reputation cross-check hooks** are provided as *emission points* only:
+> `boundReportedTraffic` emits `TrafficCrossCheckSignal`s (over-/under-report suspicion, cross-checking a
+> reply's reported population against the seeker's own immediate-query yield), and `reportTrafficCrossCheck`
+> is a thin bridge into the existing `IPeerReputation` (`reportPeer` with `ProtocolViolation`); the
+> aggregation/decay/penalty policy that turns advisory signals into an actual sanction stays the
+> reputation subsystem's job (out of scope here, see [architecture.md](architecture.md) §Reputation). Spec:
+> `traffic-validation.spec.ts` (db-p2p) — the bound unit tests plus an **end-to-end adversarial walk**
+> over the real `SeekerWalkClient` asserting under-report ≤ one hop/tier (terminating at the root) and
+> over-report ≤ wasted-patience + one hop (no outward probing).
+>
+> **GROUNDING resolutions (recorded):**
+> 1. **No threshold signature is added per `QueryReplyV1`** — the cohort primary's single-member
+>    signature stands. The bounded worst-case above (patience-capped over-report; one-hop-per-tier
+>    under-report) does not justify the per-reply threshold cost. A future ticket may revisit if observed
+>    abuse warrants it. (The multi-cohort-sweep `AggregateCountV1` *is* threshold-signed — see §Wire
+>    formats — because it attests an aggregate the cohort vouches for, not one primary's advisory view.)
+> 2. **Eligibility filtering may be done either client-side via the reputation subsystem *or* via
+>    per-entry `registrationSig` verification on the query reply, and matchmaking supports both** — it
+>    carries identity + signatures (so reply-side `registrationSig` + proof verification is free), while
+>    the reputation subsystem provides the metric (an optional, additive pre-filter, never a dependency).
+>    The voting plan ticket decides the policy; the discovery flow already wires reply-side verification as
+>    the default-and-required path (§Voting-quorum, resolved decision 1).
+
 ### Arrival push missed or primary fails mid-coalesce
 
 A hanging-out seeker on the push path ([§Arrival push on provider arrival](#arrival-push-on-provider-arrival)) never depends on the push for correctness. Its sparse safety poll (`push_safety_poll_ms`) plus a mandatory final `QueryV1` before `patienceMs` drains make the push a **pure optimization**: a seeker that receives no pushes returns the same providers it would have under the legacy `requery_interval_ms` poll, only at a coarser cadence.
@@ -685,14 +743,26 @@ interface AggregateCountV1 {
   bucketCounts: {
     targetTier:  number               // typically 1
     prefixSlot:  number               // 0..(F − 1)
-    count:       number               // log-bucketed
+    count:       number               // log-bucketed: largest power of two ≤ raw count
   }[]
-  signature:   string
+  signature:   string                 // cohort THRESHOLD-signature blob (not single-member)
+  signers:     string[]               // PeerIds of the ≥ minSigs threshold signers; aligns the blob
   cohortEpoch: string
 }
 ```
 
 Returned only by promoted cohorts; cold cohorts that fall through to `NoState` don't produce this.
+
+> **Threshold-sig envelope (resolved).** Unlike `QueryReplyV1` (single-member, advisory),
+> `AggregateCountV1` is **threshold-signed** — it attests a cohort-agreed *registered*-provider count, so
+> it carries the same `(signature, signers)` envelope as the cohort-topic `PromotionNoticeV1` /
+> `DemotionNoticeV1`: `signature` is the concatenated multisig blob and `signers` is the distinct
+> `≥ minSigs` member subset that produced it (chunk `i` ↔ `signers[i]`). `signers` is required because a
+> threshold blob is unverifiable without the signer set, exactly as for the other threshold-signed
+> notices. The canonical signed image (`aggregateCountSigningPayload`) covers `v`, `topicId`,
+> `cohortEpoch`, and the bucket set sorted by `(targetTier, prefixSlot)` — order-independent so signer and
+> verifier agree. (It still attests only *registered*-provider counts, never *eligibility*; that remains
+> the application's reply-side job — see §Voting-quorum.)
 
 ---
 

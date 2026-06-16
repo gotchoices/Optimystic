@@ -103,6 +103,7 @@ const sampleAggregate = (): AggregateCountV1 => ({
 		{ targetTier: 1, prefixSlot: 3, count: 64 },
 	],
 	signature: b64(64, 10),
+	signers: [b64(38, 14), b64(38, 15)],
 	cohortEpoch: b64(32, 11),
 });
 
