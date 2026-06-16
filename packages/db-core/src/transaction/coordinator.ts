@@ -94,11 +94,15 @@ export class TransactionCoordinator {
 	}
 
 	/**
-	 * Commit a transaction (actions already applied, orchestrate PEND/COMMIT).
+	 * Commit a transaction: materialise a log entry from each collection's staged
+	 * pending actions, then orchestrate the distributed consensus (GATHER/PEND/COMMIT).
 	 *
-	 * This is called by TransactionSession.commit() after all statements have been executed.
-	 * Actions have already been applied to collections via applyActions(), so this method
-	 * just orchestrates the distributed consensus.
+	 * Called by TransactionSession.commit() after all statements have executed. The
+	 * staged mutations already live in each collection's tracker — applied either via
+	 * applyActions() (engine-driven path) or directly via Collection.act()/Tree.stage
+	 * (the vtab's deferred-DML path) — but in BOTH cases without a log entry yet, so
+	 * this method appends that entry here (see the inline note below) before pending,
+	 * and folds the committed transforms back into each collection's read cache.
 	 *
 	 * @param transaction - The transaction to commit
 	 */
