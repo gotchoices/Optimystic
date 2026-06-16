@@ -168,11 +168,18 @@ export function createBackfillRequester(deps: BackfillRequesterDeps): (from: num
 		const unsigned: Omit<BackfillV1, "signature"> = { v: 1, collectionId: deps.collectionId, fromRevision: from, toRevision: to };
 		const req: BackfillV1 = { ...unsigned, signature: deps.sign(unsigned) };
 		const reply = await deps.transport(req);
-		for (const entry of reply.entries) {
-			await deps.subscriber.onNotification(entry);
-		}
+		// Underflow: the cohort's held window does not reach the gap's low edge (`docs/reactivity.md`
+		// §Backfill RPC, "fall back further"). The returned entries all sit *above* the still-unfillable
+		// low range, so none can apply contiguously from `from`. Replaying them would only re-fire the
+		// subscriber's gap → `requestBackfill` seam (which, when wired back to this driver, recurses
+		// without bound). Escalate to a checkpoint resume / chain read instead and leave the replay to the
+		// recovery path that can actually close the low range.
 		if (reply.available.fromRevision > from) {
 			deps.onUnderflow?.({ from, to }, reply.available);
+			return reply;
+		}
+		for (const entry of reply.entries) {
+			await deps.subscriber.onNotification(entry);
 		}
 		return reply;
 	};

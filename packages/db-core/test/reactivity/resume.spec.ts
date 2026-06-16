@@ -238,6 +238,23 @@ describe('reactivity resume — subscriber-side apply', () => {
 		expect(sub.lastRevision).to.equal(11);
 	});
 
+	it('checkpoint_window: a verified-but-non-abutting checkpoint is not applied — chain-reads instead of skipping revisions', async () => {
+		// Endpoints verify (real committed revisions), but the checkpoint's low edge (100) sits far above the
+		// subscriber's head (last = 11). Rebaselining to 116 would silently skip 12..99. The guard must
+		// reject it and chain-read rather than advance the contiguity head past un-summarized revisions.
+		const verifier = realishVerifier([SIGNER_A, SIGNER_B], 2);
+		const delivered: number[] = [];
+		const chainReads: Array<[string | undefined, number | undefined]> = [];
+		const summary: CheckpointSummary = { collectionId: COLLECTION, fromRevision: 100, toRevision: 116, mergedDigest: bytesToB64url(new Uint8Array([1])), bracketingEntries: [note(100), note(116)] };
+		const reply: ResumeReplyV1 = { v: 1, result: 'checkpoint_window', checkpoint: summary, recentEntries: [note(117)], currentRevision: 117 };
+		const sub = createReactivitySubscriber({ collectionId: COLLECTION, verifier, deliver: (n) => delivered.push(n.revision), lastKnownRev: 11 });
+		const outcome = await applyResumeReply(reply, { subscriber: sub, verifier, onChainRead: (t, r) => chainReads.push([t, r]) });
+		expect(outcome).to.equal('checkpoint_untrusted');
+		expect(chainReads).to.have.length(1);
+		expect(delivered).to.have.length(0); // never advanced past the gap
+		expect(sub.lastRevision).to.equal(11);
+	});
+
 	it('out_of_window: escalates to a chain read', async () => {
 		const chainReads: Array<[string | undefined, number | undefined]> = [];
 		const sub = createReactivitySubscriber({ collectionId: COLLECTION, verifier: new FakeVerifier('verified'), deliver: () => {}, lastKnownRev: 1 });

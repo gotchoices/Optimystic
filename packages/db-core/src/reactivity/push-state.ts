@@ -9,9 +9,10 @@
  *
  * `PushState` is gossiped within the cohort (over the cohort-topic gossip channel) so any member can
  * serve a backfill/replay if the primary is unavailable. This module defines the **full** struct and its
- * gossip codec so all three reactivity tickets share one definition; the `parentCheckpoint` and
- * `perSubscriberQueue` fields are **reserved** here and populated by the sibling tickets
- * ([reactivity-backfill-resume-checkpoints], [reactivity-rotation-backpressure-policy]).
+ * gossip codec so all three reactivity tickets share one definition. The rolling parent {@link checkpoint}
+ * (and its derived {@link parentCheckpoint} summary) is fed by replay-ring eviction
+ * ([reactivity-backfill-resume-checkpoints]); the `perSubscriberQueue` field remains **reserved** for
+ * [reactivity-rotation-backpressure-policy].
  */
 
 import { bytesToB64url, b64urlToBytes, decodeCohortMessage, encodeCohortMessage, DEFAULT_MAX_MESSAGE_BYTES } from "../cohort-topic/wire/codec.js";

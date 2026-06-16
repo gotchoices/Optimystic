@@ -149,5 +149,35 @@ describe('reactivity backfill', () => {
 			expect(reply.entries.map((e) => e.revision)).to.deep.equal([10, 11, 12]);
 			expect(underflows).to.deep.equal([{ from: 5, available: { fromRevision: 10, toRevision: 15 } }]);
 		});
+
+		it('does not replay (or recurse) on underflow when the subscriber seam is wired back to the requester', async () => {
+			// Mirror the db-p2p manager wiring: the subscriber's `requestBackfill` seam drives the same
+			// requester. On an underflow the held window cannot reach the gap low edge, so replaying the
+			// (non-contiguous) entries would re-fire the gap seam and recurse without bound. The requester
+			// must escalate via `onUnderflow` and NOT replay.
+			const delivered: number[] = [];
+			let transportCalls = 0;
+			let requester!: (from: number, to: number) => Promise<BackfillReplyV1>;
+			const sub = createReactivitySubscriber({
+				collectionId: COLLECTION,
+				verifier: new FakeVerifier('verified'),
+				deliver: (n) => delivered.push(n.revision),
+				requestBackfill: (from, to) => { void requester(from, to); },
+				lastKnownRev: 4,
+			});
+			requester = createBackfillRequester({
+				collectionId: COLLECTION,
+				sign: () => SIG,
+				transport: (req) => { transportCalls++; return Promise.resolve(serveBackfill(bufferWith([10, 11, 12, 13, 14, 15]), req, COLLECTION)); },
+				subscriber: sub,
+				onUnderflow: () => {},
+			});
+
+			// Gap 5 → 12 underflows the ring (low edge 10 > 5): one RPC, no replay, no recursion.
+			await requester(5, 12);
+			expect(transportCalls).to.equal(1);
+			expect(delivered).to.have.length(0);
+			expect(sub.lastRevision).to.equal(4);
+		});
 	});
 });

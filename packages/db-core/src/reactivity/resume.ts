@@ -305,6 +305,17 @@ export async function applyResumeReply(reply: ResumeReplyV1, deps: ResumeApplyDe
 				deps.onChainRead?.(reply.currentTailId, reply.currentRevision);
 				return "checkpoint_untrusted";
 			}
+			// Endpoint verification proves the summary's bounds are *real* committed revisions, but not that
+			// its low edge connects to the subscriber's contiguity head. If the checkpoint's `fromRevision`
+			// sits above `lastRevision + 1` there is an un-summarized gap `[lastRevision + 1, fromRevision − 1]`
+			// below it; rebaselining to `toRevision` would silently skip those revisions. The honest cohort
+			// never sends such a reply (`classifyResume` only picks `checkpoint_window` when the checkpoint
+			// covers `lastRevision + 1`), so a non-abutting checkpoint is a forged/buggy reply — chain-read
+			// rather than advance past revisions the checkpoint does not cover.
+			if (summary.fromRevision > deps.subscriber.lastRevision + 1) {
+				deps.onChainRead?.(reply.currentTailId, reply.currentRevision);
+				return "checkpoint_untrusted";
+			}
 			// Apply the merged digest (application-level), then advance the contiguity head past the
 			// summarized range so the recent entries (which sit immediately above it) replay gap-free —
 			// any recent entry at/below the head dedupes (`docs/reactivity.md` §Parent checkpoint summaries).
