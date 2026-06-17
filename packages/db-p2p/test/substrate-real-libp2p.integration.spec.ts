@@ -13,14 +13,21 @@ import {
 	membershipCertSigningPayload,
 	registerSigningPayload,
 	renewSigningPayload,
+	subscribeAppPayloadBytes,
+	createNotificationVerifier,
 	bytesToB64url,
 	b64urlToBytes,
 	bytesEqual,
-	type Tier,
+	Tier,
 	type RingCoord,
 	type MembershipCertV1,
 	type RegisterV1,
 	type RenewV1,
+	type NotificationV1,
+	type CommitCert,
+	type CollectionChangeEvent,
+	type BlockId,
+	type ActionId,
 } from '@optimystic/db-core';
 import { createLibp2pNode, type NodeOptions } from '../src/libp2p-node.js';
 import { peerIdToBytes, bytesToPeerIdString } from '../src/cohort-topic/peer-codec.js';
@@ -471,12 +478,126 @@ async function memberOf(key: PrivateKey, peerId: PeerId): Promise<Member> {
 		expect(expectedMembers.size, 'reactivity tier-0 cohort = whole mesh at wantK = N').to.equal(N);
 	});
 
-	// reactivity notification *socket delivery* end-to-end is NOT wired in production: the origination bridge
-	// fires `onLocalCommit` and the NotificationV1 build + verify path is real (proven in
-	// `cohort-topic/reactivity-real-crypto.spec.ts` and the verify hop above), but no emit transport /
-	// subscriber-delivery libp2p protocol is registered. Tagged, not faked.
-	it.skip('[requires production wiring: reactivity emit transport + delivery protocol — tracked by 12.5-reactivity-tail-rotation-transport / backlog optimystic-network-reactive-watch-integration-test] a commit on a real cohort member delivers a NotificationV1 to a remote subscriber over a real socket', () => {
-		/* deferred: ReactivityOriginationManager.emit + a /reactivity/notify protocol handler are unwired in libp2p-node-base.ts */
+	// reactivity notification *socket delivery* end-to-end is now LIVE in production (12.33): the node wires
+	// ReactivityOriginationManager.emit → forwarder host → the notify protocol, and a node-level subscriber
+	// registry receives inbound frames. A committed change on a tail-cohort member fires a NotificationV1 that
+	// reaches a remote subscriber over a real socket; the subscriber verifies it with real Ed25519 against the
+	// tail cohort's membership. (Rotation-specific redirect is 12.5; the Quereus Database.watch app-bridge that
+	// CONSTRUCTS managers stays the backlog optimystic-network-reactive-watch-integration-test — here the
+	// subscriber is constructed directly against the remote node's registry.)
+	it('a commit on a real cohort member delivers a NotificationV1 to a remote subscriber over a real socket', async () => {
+		const tailBytes = reactivityTailBytes(TAIL_ID);
+		const topicId = reactivityTopicId(tailBytes);
+		const reactivityCoord = addressing.coord0(topicId);
+
+		// Instantiate every node's reactivity cohort engine + converge willingness so the primary can admit the
+		// subscriber registration (mirrors the matchmaking provider test's pre-steps).
+		engines(reactivityCoord);
+		const origin = primaryFor(reactivityCoord);
+		const originEngine = engineOf(origin, reactivityCoord);
+		expect(await quorumOn(originEngine, reactivityCoord), 'willingness converged for the reactivity topic').to.equal(true);
+
+		// The remote subscriber is a different real node; register it as a direct reactivity subscriber on the
+		// origin's cohort engine so origin's `directSubscribers(topicId)` → [remote] and origin dials it.
+		const remote = nodes.find((n) => n.idStr !== origin.idStr)!;
+		const collectionIdB64 = bytesToB64url(new TextEncoder().encode('rx-socket-collection'));
+		const now = Date.now();
+		const appPayload = subscribeAppPayloadBytes({
+			collectionId: collectionIdB64,
+			tailIdAtAttach: bytesToB64url(tailBytes),
+			lastKnownRev: 0,
+			deltaMaxBytes: 0,
+		});
+		const regBody: Omit<RegisterV1, 'signature'> = {
+			v: 1,
+			topicId: bytesToB64url(topicId),
+			tier: Tier.T3,
+			treeTier: 0,
+			participantCoord: bytesToB64url(remote.member.bytes),
+			ttl: 90_000,
+			bootstrap: true,
+			timestamp: now,
+			correlationId: bytesToB64url(new TextEncoder().encode('rx-socket-sub')),
+			appPayload: bytesToB64url(appPayload),
+		};
+		const reg: RegisterV1 = { ...regBody, signature: bytesToB64url(await signPeer(remote.member.key, registerSigningPayload(regBody))) };
+		const accept = await originEngine.engine.handleRegister(reg, { followOn: false, treeTier: 0 }, now);
+		expect(accept.result, 'the reactivity subscriber registration was admitted on the origin cohort engine').to.equal('accepted');
+		expect(
+			originEngine.records(topicId).some((r) => r.appState !== undefined && bytesEqual(r.participantId, remote.member.bytes)),
+			'origin holds the remote reactivity subscriber record (direct-subscriber read)',
+		).to.equal(true);
+
+		// Cache the tail cohort's MembershipCertV1 (whole mesh at wantK = N) into every node's verifier, so the
+		// origin's own forwarder receive AND the remote subscriber's verify are real Ed25519 against the
+		// membership (cache() trusts the membership list; the notification's own threshold sig is verified).
+		const members = nodes.map((n) => bytesToB64url(n.member.bytes));
+		const cert: MembershipCertV1 = {
+			v: 1,
+			cohortCoord: bytesToB64url(reactivityCoord),
+			cohortEpoch: bytesToB64url(new TextEncoder().encode(`rx:${TAIL_ID}`)),
+			members,
+			stabilizedAt: now,
+			thresholdSig: bytesToB64url(new Uint8Array([0])),
+			signers: members,
+		};
+		for (const n of nodes) {
+			n.host.service.verifier().cache(cert);
+		}
+
+		// Register the remote subscriber in the remote node's reactivity subscriber registry, verifying each
+		// inbound notification with the production notification verifier (real collected-multisig at T3).
+		const received: NotificationV1[] = [];
+		const verdicts: string[] = [];
+		const verifier = createNotificationVerifier({ verifier: remote.host.service.verifier(), tier: Tier.T3 });
+		const registry = (remote.node as unknown as { reactivitySubscribers: { register(topicId: Uint8Array, h: (n: NotificationV1) => void): () => void } }).reactivitySubscribers;
+		const off = registry.register(topicId, (n) => {
+			received.push(n);
+			void verifier.verify(n).then((r) => verdicts.push(r));
+		});
+
+		try {
+			// Build a REAL threshold commit cert over the cohort: every member signs utf8(commitHash+":approve")
+			// with its real Ed25519 key. signers are sorted by peer-id string so each aligns with its 64-byte
+			// chunk of the concatenated threshold sig (mirrors buildCommitCert / the mesh harness's buildTailCert).
+			const commitHash = `${collectionIdB64}:1`;
+			const signedPayload = new TextEncoder().encode(`${commitHash}:approve`);
+			const sortedSigners = [...nodes].sort((a, b) => (a.idStr < b.idStr ? -1 : a.idStr > b.idStr ? 1 : 0));
+			const chunks: Uint8Array[] = [];
+			for (const n of sortedSigners) {
+				chunks.push(await n.key.sign(signedPayload));
+			}
+			const thresholdSig = new Uint8Array(chunks.reduce((sum, c) => sum + c.length, 0));
+			let offset = 0;
+			for (const c of chunks) {
+				thresholdSig.set(c, offset);
+				offset += c.length;
+			}
+			const commitCert: CommitCert = { thresholdSig, signers: sortedSigners.map((n) => n.idStr), minSigs: MIN_SIGS, signedPayload };
+
+			// Fire origination on the origin: the production onLocalCommit hook builds the NotificationV1 and
+			// emits it → forwarder host → notify socket → the remote node's subscriber registry.
+			const event: CollectionChangeEvent = {
+				collectionId: collectionIdB64 as unknown as BlockId,
+				blockIds: [],
+				actionId: 'rx-socket-action' as ActionId,
+				rev: 1,
+				tailId: TAIL_ID as BlockId,
+			};
+			expect(typeof origin.host.service.onLocalCommit, 'origination hook installed on the origin').to.equal('function');
+			origin.host.service.onLocalCommit!(event, commitCert);
+
+			const delivered = await waitFor(() => received.length >= 1, 20_000, 150);
+			expect(delivered, 'the remote subscriber received a NotificationV1 over the real notify socket').to.equal(true);
+			expect(received[0]!.revision, 'the delivered notification carries the committed revision').to.equal(1);
+			expect(received[0]!.tailId, 'the delivered notification anchors on the committed tail').to.equal(bytesToB64url(tailBytes));
+
+			const verified = await waitFor(() => verdicts.length >= 1, 5_000, 50);
+			expect(verified, 'the subscriber ran the verify path on the delivered notification').to.equal(true);
+			expect(verdicts[0], 'the delivered notification verified end-to-end (real Ed25519 against the tail cohort)').to.equal('verified');
+		} finally {
+			off();
+		}
 	});
 
 	// --- 5. Matchmaking: a provider record lands in + replicates across a real cohort ---

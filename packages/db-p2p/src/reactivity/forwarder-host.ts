@@ -21,11 +21,12 @@
  *
  * **Subscriber-id space.** `selfPeerId`, the {@link ReactivityForwarderHostDeps.directSubscribers} output,
  * the {@link CohortRef.primary} child targets, and every {@link ReactivityNotifyTransport.send} target are
- * the **same** string space — base64url of the cohort member-id bytes (matching the `perSubscriberQueue`
- * key and the {@link reactivityDirectSubscribers} adapter). The node-wiring layer
- * ([reactivity-notification-transport]) supplies a transport whose `send` accepts that space and routes
- * inbound notify frames by topic to {@link onInbound}; this host is agnostic to the concrete encoding so
- * long as it is consistent across the four seams.
+ * the **same** string space (it is also the `perSubscriberQueue` key). This host is agnostic to the concrete
+ * encoding so long as it is consistent across all four seams; the **transport** pins which space —
+ * {@link import("./notify-transport.js").Libp2pReactivityNotifyTransport.send} calls `peerIdFromString`, so
+ * the space is the **canonical peer-id string** (NOT base64url-of-member-bytes — that would silently fail
+ * `peerIdFromString` and never dial). The {@link reactivityDirectSubscribers} adapter and the node-wiring
+ * layer ([reactivity-notification-transport]) therefore both emit peer-id strings.
  *
  * This module deliberately touches neither the libp2p node assembly ([reactivity-notification-transport])
  * nor gossip ([reactivity-pushstate-gossip]); it depends only on the transport interface + db-core logic,
@@ -228,6 +229,23 @@ export class ReactivityForwarderHost {
 	pushStateFor(topicId: Uint8Array): PushState | undefined {
 		const served = this.served.get(this.topicKey(topicId));
 		return served === undefined || served === null ? undefined : served.pushState;
+	}
+
+	/**
+	 * Every live forwarder {@link PushState} this node currently serves: the topics it has ingested at least
+	 * one notification for and instantiated state behind the Edge gate (subscriber-only `null`s and
+	 * not-yet-ingested topics are skipped). The push-state-gossip driver iterates these each round to
+	 * broadcast convergence state to each collection's cohort, so a member that missed an origin dial still
+	 * ends up holding the replay entry.
+	 */
+	livePushStates(): PushState[] {
+		const out: PushState[] = [];
+		for (const served of this.served.values()) {
+			if (served !== null) {
+				out.push(served.pushState);
+			}
+		}
+		return out;
 	}
 
 	/**

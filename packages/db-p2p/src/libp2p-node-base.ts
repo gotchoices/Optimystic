@@ -40,7 +40,27 @@ import type { RestoreCallback, BlockArchive } from './storage/struct.js';
 import type { FretService } from 'p2p-fret';
 import { createCohortTopicHost, type CohortTopicHostOptions } from './cohort-topic/host.js';
 import { attachCohortChangeBridge } from './cohort-topic/change-bridge.js';
-import { createReactivitySelfMembershipGate } from './cohort-topic/reactivity-membership-gate.js';
+import { createReactivitySelfMembershipGate, reactivityTailBytes } from './cohort-topic/reactivity-membership-gate.js';
+import { Libp2pReactivityNotifyTransport, registerNotifyHandler } from './reactivity/notify-transport.js';
+import { ReactivityForwarderHost, reactivityDirectSubscribers, reactivityNotificationTopicId } from './reactivity/forwarder-host.js';
+import { ReactivityOriginationManager } from './reactivity/origination-manager.js';
+import { ReactivityPushStateGossipDriver, registerPushStateGossipHandler, type ReactivityGossipCollection } from './reactivity/push-state-gossip.js';
+import { ReactivitySubscriberRegistry } from './reactivity/subscriber-registry.js';
+import { DEFAULT_REACTIVITY_PROTOCOLS, reactivityProtocolList } from './reactivity/protocols.js';
+import {
+	createNotificationVerifier,
+	reactivityNodePolicy,
+	createTierAddressing,
+	createRingHash,
+	Tier,
+	b64urlToBytes,
+	bytesToB64url,
+	type NotificationV1,
+	type CohortRef,
+	type PushStateGossipV1,
+	type PushStateInit,
+	type NotificationVerifier,
+} from '@optimystic/db-core';
 import { PartitionDetector } from './cluster/partition-detector.js';
 import { PeerReputationService } from './reputation/peer-reputation.js';
 import { DisputeService } from './dispute/dispute-service.js';
@@ -759,17 +779,118 @@ export async function createLibp2pNodeBase(
 		);
 
 		// Expose the host so the reactivity origination wiring (and the activation test) can install
-		// `CohortTopicService.onLocalCommit`. Until a consumer attaches one, the bridge no-ops at its
-		// `if (!hook) return;` guard — "live" here means the bridge INVOKES onLocalCommit whenever a
-		// consumer is attached; installing the origination manager + emit transport is a sibling ticket.
+		// `CohortTopicService.onLocalCommit`.
 		(node as any).cohortTopicHost = host;
 
-		// Teardown: release the catch-all origination feed + stop the host (clears the gossip timer,
-		// unhandles the cohort-topic protocols) before the node's transports close. Composes with the
-		// existing arachnode + clusterMember stop wrappers (each calls its captured previousStop last).
+		// --- Reactivity notification transport (origination → fan-out → inbound delivery → push-state gossip) ---
+		// Compose notify + forwarder-host + push-state-gossip onto the cohort-topic host so a committed change
+		// on a tail-cohort member actually reaches subscribers on OTHER nodes over real sockets. The change
+		// bridge above fires `onLocalCommit`; this is what the emitted notifications travel over.
+		// (docs/reactivity.md §Notification origination / §Propagation.) Reactivity reuses the canonical,
+		// network-agnostic protocol IDs, matching the cohort-topic family's production default.
+		const selfPeerId = node.peerId.toString();
+		const reactivityProtocols = DEFAULT_REACTIVITY_PROTOCOLS;
+		const reactivityProfile = host.profile; // Edge ⇒ subscriber-only via the policy gate; Core forwards.
+		const reactivityPolicy = reactivityNodePolicy(reactivityProfile);
+		// db-core default anchor + tier addressing, byte-identical to the host's `new RingHash()`, the
+		// origination gate, and the subscriber-side anchor — so coord_0 derivation lines up everywhere.
+		const reactivityAddressing = createTierAddressing(createRingHash());
+		// Reactivity's forwarder cohort sits at coord_0 — TREE tier 0 (peer-independent), distinct from the
+		// CAPACITY tier T3 the verifier/willingness use. `registry.findServing` keys on the engine's tree
+		// depth, so the served reactivity engine is found at tree tier 0, never at 3.
+		const REACTIVITY_FORWARDER_TREE_TIER = 0;
+
+		// Node-level subscriber registry: a constructed ReactivitySubscriptionManager registers here so a
+		// socket-delivered NotificationV1 reaches it. (The Quereus Database.watch → manager bridge that
+		// CONSTRUCTS managers stays the backlog item optimystic-network-reactive-watch-integration-test.)
+		const reactivitySubscribers = new ReactivitySubscriberRegistry();
+		(node as any).reactivitySubscribers = reactivitySubscribers;
+
+		// 1. Notify transport — unicast NotificationV1 send + inbound subscribe. selfPeerId guards self-dials.
+		const notify = new Libp2pReactivityNotifyTransport(node, { selfPeerId });
+
+		// 2. Forwarder host — turns the forward decision into live fan-out over the notify transport.
+		const forwarderHost = new ReactivityForwarderHost({
+			transport: notify,
+			selfPeerId,
+			profile: reactivityProfile,
+			pushStateInit: (topicId: Uint8Array, n: NotificationV1): PushStateInit => ({
+				collectionId: n.collectionId,
+				topicId: bytesToB64url(topicId),
+				tailIdAtJoin: n.tailId,
+				deltaMaxBytes: reactivityPolicy.deltaMaxBytes,
+			}),
+			verifierFor: (): NotificationVerifier => createNotificationVerifier({ verifier: host.service.verifier(), tier: Tier.T3 }),
+			directSubscribers: (topicId: Uint8Array): string[] => {
+				// Find the served reactivity engine at TREE tier 0 (see REACTIVITY_FORWARDER_TREE_TIER) and read
+				// its direct-subscriber records. The adapter filters to reactivity appState and maps participantId
+				// bytes → dialable peer-id strings (the transport's `peerIdFromString` space) — NOT base64url,
+				// which would silently fail to dial. `undefined` (no subscriber has registered here yet) ⇒ [].
+				const engine = host.registry.findServing(topicId, REACTIVITY_FORWARDER_TREE_TIER);
+				return engine === undefined ? [] : reactivityDirectSubscribers(engine, topicId);
+			},
+			// No childCohorts until cohort-topic-parent-child-link populates PushState.childCohorts (single
+			// tier-0 reach today); wire the resolver anyway. A child cohort's primary is the FRET-nearest member
+			// of its coord, returned as a peer-id string (the dial space).
+			resolveChildPrimary: (ref: CohortRef): string | undefined => {
+				const peers = fret.assembleCohort(b64urlToBytes(ref.coord), cohortWantK);
+				return peers.length > 0 ? peers[0] : undefined;
+			},
+			deliverLocal: (topicId: Uint8Array, n: NotificationV1): void => reactivitySubscribers.deliver(topicId, n),
+		});
+
+		// Inbound notify frames → forwarder host (subscriber role delivers in-process; forwarder role fans out).
+		registerNotifyHandler(node, reactivityProtocols.notify, notify);
+		const offInboundNotify = notify.onNotification((from, n): void => { void forwarderHost.onInbound(from, n); });
+
+		// 3. Origination emit — install onLocalCommit: a member commit builds a NotificationV1 and ingests it.
+		const origination = new ReactivityOriginationManager({
+			service: host.service,
+			resolveContext: (event) => {
+				if (event.tailId === undefined) {
+					return undefined; // tail-less (read-driven promotion) never originates (the gate also returns first)
+				}
+				return {
+					// MUST reuse the gate's `reactivityTailBytes` (utf8), NOT db-core's double-hashing
+					// blockIdToBytes — else origination derives a different coord than subscribers resolve.
+					tailId: reactivityTailBytes(event.tailId),
+					deltaMaxBytes: reactivityPolicy.deltaMaxBytes,
+					// rotationHint is reactivity-tail-rotation-transport's (12.5).
+				};
+			},
+			// reactivityNotificationTopicId(n) = reactivityTopicId(b64urlToBytes(n.tailId)); since
+			// n.tailId = b64url(reactivityTailBytes(tail)), this is the SAME topicId the gate assembled coord_0
+			// around and the subscriber/forwarder verifier derives — closing the encoding loop.
+			emit: (n): void => { void forwarderHost.ingest(reactivityNotificationTopicId(n), n); },
+		});
+		origination.install();
+
+		// 4. PushState gossip — periodic intra-cohort convergence so any member (not just the primary) can
+		// serve a replay/backfill. Rides the host's cohort gossip transport (no second transport).
+		const pushStateGossip = new ReactivityPushStateGossipDriver({
+			gossipTransport: host.gossipTransport,
+			liveCollections: (): ReactivityGossipCollection[] => forwarderHost.livePushStates().map((pushState) => ({
+				pushState,
+				cohortCoord: reactivityAddressing.coord0(b64urlToBytes(pushState.topicId)),
+			})),
+			pushStateForGossip: (g: PushStateGossipV1) => forwarderHost.pushStateFor(b64urlToBytes(g.topicId)),
+			// Authenticity gate: accept gossip only from a member of the cohort around the frame's reactivity
+			// coord (per-frame peer-sig envelope signing is deferred — reactivity-pushstate-gossip's hardening backlog).
+			isCohortMember: (fromPeerId: string, g: PushStateGossipV1): boolean =>
+				fret.assembleCohort(reactivityAddressing.coord0(b64urlToBytes(g.topicId)), cohortWantK).includes(fromPeerId),
+		});
+		registerPushStateGossipHandler(node, reactivityProtocols.pushStateGossip, pushStateGossip);
+		pushStateGossip.start();
+
+		// Teardown: release reactivity timers + protocol handlers BEFORE host.stop() (which clears the cohort
+		// gossip timer + unhandles the cohort-topic protocols) BEFORE the node's transports close (previousStop).
+		// Composes with the existing arachnode + clusterMember stop wrappers (each calls its captured previousStop last).
 		const previousStop = node.stop.bind(node);
 		node.stop = async (): Promise<void> => {
 			try {
+				pushStateGossip.stop();
+				offInboundNotify();
+				await node.unhandle(reactivityProtocolList(reactivityProtocols));
 				unsubscribe();
 				await host.stop();
 			} finally {

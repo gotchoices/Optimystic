@@ -128,6 +128,13 @@ The direct-subscriber list is the cohort-topic layer's `RegistrationRecord` set 
 > that signed image, so it succeeds against **real** Ed25519 (no pass-crypto stub). The cluster↔reactivity
 > seam is **closed**. This networked origination **subsumes** the superseded backlog ticket
 > `optimystic-replica-persist-change-notification` (waking consumers on commit).
+>
+> The manager's `emit` seam is now bound to live fan-out (`12.33-reactivity-notification-transport`): the
+> node assembly installs the hook and routes each built `NotificationV1` into `ReactivityForwarderHost.ingest`,
+> so origination travels over the notify protocol to subscribers. Origination derives the topic's `coord_0`
+> from `reactivityTailBytes(tailId) = utf8(tailId)` (NOT db-core's double-hashing `blockIdToBytes`); the
+> subscriber side MUST feed `reactivityTopicId` the **same** bytes (see §Propagation) or it resolves a
+> different coord and never receives — pinned by `topic-bytes-encoding.spec.ts`.
 
 When the tail cohort commits a transaction, the commit machinery in the transaction layer ([transactions.md](transactions.md)) already produces a threshold-signed commit certificate. Reactivity reuses that certificate without additional cohort signing:
 
@@ -169,8 +176,17 @@ The `delta` field is optional and bounded by `delta_max` (default: 4 KB at Core 
 > both the subscriber and forwarder roles for an inbound dial. It is **encoding-agnostic** over the
 > subscriber-id space and depends only on the `ReactivityNotifyTransport` interface, so it is unit-testable
 > with a fake transport; the libp2p node assembly that supplies a concrete transport and routes inbound
-> frames by topic is `reactivity-notification-transport`. Spec: `forwarder-host.spec.ts`. Building block —
-> not yet on the live commit→notify path (that wiring lands with the node-assembly ticket).
+> frames by topic is `reactivity-notification-transport`. Spec: `forwarder-host.spec.ts`.
+>
+> **Now live** (`12.33-reactivity-notification-transport`). The node assembly (`libp2p-node-base.ts`,
+> `cohortTopic`-enabled block) composes the notify transport + forwarder host + push-state-gossip driver and
+> binds origination's `emit` seam to `ReactivityForwarderHost.ingest`, so a committed change on a tail-cohort
+> member fans out over the real `/optimystic/reactivity/1.0.0/notify` protocol to remote subscribers, and
+> inbound frames route by topic to `onInbound` (forwarder role) and the node-level
+> `ReactivitySubscriberRegistry` (subscriber role). The subscriber-id / dial-target space is the canonical
+> peer-id string (the transport dials with `peerIdFromString`); `directSubscribers` maps cohort member bytes
+> with `bytesToPeerIdString`, never base64url. Specs: `node-wiring.spec.ts`, `topic-bytes-encoding.spec.ts`,
+> and the env-gated real-socket delivery in `substrate-real-libp2p.integration.spec.ts`.
 
 The tail cohort's primary delivers the signed notification to:
 
@@ -754,7 +770,7 @@ never hard-code drifting numbers.
 
 ## Real-libp2p e2e coverage
 
-> **Substrate confirmed over real sockets; notification delivery transport deferred.**
+> **Substrate AND notification socket delivery confirmed over real sockets.**
 > [`packages/db-p2p/test/substrate-real-libp2p.integration.spec.ts`](../packages/db-p2p/test/substrate-real-libp2p.integration.spec.ts)
 > (env-gated) stands up 3–16 production `cohortTopic`-enabled libp2p nodes over real TCP. The **reactivity
 > origination wiring** is confirmed real: the production node installs the cohort-topic origination bridge
@@ -765,14 +781,19 @@ never hard-code drifting numbers.
 > `/membership` protocol and verified with real Ed25519 collected-multisig — see cohort-topic §Validation;
 > the digest-preimage half is `cohort-topic/reactivity-real-crypto.spec.ts`).
 >
-> **What is NOT yet real (tagged `it.skip`, not faked):** the notification **socket delivery** itself — a
-> commit on a real cohort member firing a `NotificationV1` that reaches a remote subscriber over a real
-> socket. Production registers no emit transport / subscriber-delivery protocol (the origination bridge fires
-> `onLocalCommit`, but `libp2p-node-base.ts` leaves "the origination manager + emit transport" to a sibling
-> ticket). Tracked by `12.5-reactivity-tail-rotation-transport` and the residual backlog
-> `optimystic-network-reactive-watch-integration-test` (the real-libp2p `Database.watch` wakeup). **No
-> real-network observation here contradicts the simulator** — the design (anchor derivation, cert reuse,
-> verify) is confirmed on real libp2p as far as the wired surface reaches.
+> **Notification socket delivery is now wired and exercised** (`12.33-reactivity-notification-transport`): a
+> commit on a real tail-cohort member fires a `NotificationV1` that reaches a remote subscriber over the real
+> `/optimystic/reactivity/1.0.0/notify` socket — the subscriber is constructed against the remote node's
+> `ReactivitySubscriberRegistry`, receives the frame, and verifies it end-to-end with real Ed25519 against the
+> tail cohort's membership. `libp2p-node-base.ts` now installs the origination manager's `emit` →
+> `ReactivityForwarderHost.ingest`, registers the notify + push-state-gossip protocol handlers, and routes
+> inbound frames to the registry. **No real-network observation here contradicts the simulator** — the design
+> (anchor derivation, cert reuse, verify, socket fan-out) is confirmed on real libp2p.
+>
+> **Still deferred (tagged, not faked):** the tail-rotation-specific *redirect* on socket delivery
+> (`12.5-reactivity-tail-rotation-transport`) and the real-libp2p `Database.watch` wakeup — the Quereus
+> application bridge that *constructs* a subscription manager from a watch and registers it
+> (`optimystic-network-reactive-watch-integration-test`). 12.33 owns the transport + registry those plug into.
 
 ---
 

@@ -20,32 +20,15 @@ import {
 	type ReactivityTopicAnchor,
 	type TierAddressing,
 	type CollectionChangeEvent,
-	type BlockId,
 } from "@optimystic/db-core";
 import type { FretService } from "p2p-fret";
 
-const utf8 = new TextEncoder();
-
-/**
- * The pinned `BlockId` → raw tail bytes encoding fed into {@link ReactivityTopicAnchor.topicId}
- * (`reactivityTopicId`).
- *
- * A `BlockId` is a string and `reactivityTopicId` itself hashes `H(tailBytes ‖ "reactivity")`, so the
- * bytes here must be the tail block id's **raw** bytes — not a pre-hashed routing key. We use
- * `TextEncoder().encode(blockId)`, the same synchronous block-id→bytes convention the rest of db-p2p
- * already uses for ring hashing of tail ids (`cluster/client.ts` `recordCoordinatorForRecordIfSupported`,
- * `repo/client.ts` `extractKeyFromOperations`). db-core's async `blockIdToBytes` (which `sha256`s the
- * utf8 bytes first) is deliberately NOT used: it would (a) double-hash relative to the spec's
- * `H(tailId ‖ "reactivity")` and (b) force this synchronous gate to become async.
- *
- * Load-bearing: origination (this gate) and the subscriber side must feed `reactivityTopicId` the SAME
- * bytes for a given tail, or they resolve different coords and origination silently never reaches
- * subscribers. The subscriber-facing reactivity transport (a sibling ticket) must adopt this same
- * encoding when deriving its `tailIdAtAttach` bytes from a `BlockId`.
- */
-export function reactivityTailBytes(tailId: BlockId): Uint8Array {
-	return utf8.encode(tailId);
-}
+// The pinned `BlockId` → raw tail-bytes encoding now lives in the reactivity surface so the origination
+// gate (here) and the subscriber-side subscribe factory import the SAME function — see `reactivity/
+// topic-bytes.ts` for the load-bearing rationale. Re-exported so this module's existing callers (tests,
+// node wiring) keep importing `reactivityTailBytes` from the gate.
+export { reactivityTailBytes } from "../reactivity/topic-bytes.js";
+import { reactivityTailBytes } from "../reactivity/topic-bytes.js";
 
 /** Construction inputs for {@link createReactivitySelfMembershipGate}. */
 export interface ReactivitySelfMembershipGateDeps {

@@ -75,7 +75,17 @@ export interface ReactivitySubscriptionManagerOptions {
 	readonly service: CohortTopicService;
 	/** Stable collection identity (the collection's id block id, raw bytes). */
 	readonly collectionId: Uint8Array;
-	/** Tail block id at attach time (raw bytes); anchors the rotating topic and detects rotation. */
+	/**
+	 * Tail block id at attach time (raw bytes); anchors the rotating topic (`reactivityTopicId` is applied to
+	 * it) and detects rotation.
+	 *
+	 * **Load-bearing encoding contract.** When a production subscribe factory converts a `BlockId` tail to
+	 * these bytes it MUST use `reactivityTailBytes(tailId)` (`reactivity/topic-bytes.ts`) — the SAME function
+	 * origination's membership gate uses — NOT db-core's `blockIdToBytes` (which `sha256`s first → a double
+	 * hash). Origination derives the topic's `coord_0` cohort from `reactivityTopicId(reactivityTailBytes(
+	 * tailId))`; if this side feeds differently-encoded bytes it subscribes to a *different* coord and
+	 * origination silently never reaches it (the `topic-bytes-encoding` spec pins the coord-equality).
+	 */
 	readonly tailIdAtAttach: Uint8Array;
 	/** Surface a verified, contiguous notification to the application. */
 	readonly deliver: (n: NotificationV1) => void;

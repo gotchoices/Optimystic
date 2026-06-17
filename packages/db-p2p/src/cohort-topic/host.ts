@@ -344,6 +344,17 @@ export interface CohortTopicHost {
 	readonly registry: CoordRegistry;
 	/** The four registered protocol IDs. */
 	readonly protocols: CohortTopicProtocols;
+	/**
+	 * The node's effective {@link NodeProfile} (Edge / Core). Exposed so a layered application (reactivity)
+	 * can apply the same profile gate the host configured its engines with (e.g. Edge ⇒ subscriber-only).
+	 */
+	readonly profile: NodeProfile;
+	/**
+	 * The intra-cohort gossip transport. Exposed so a layered application (reactivity push-state gossip) can
+	 * ride its `broadcastOver` seam — the same one the promote-notice broadcast reuses — rather than standing
+	 * up a second transport with duplicate cohort peer resolution.
+	 */
+	readonly gossipTransport: FretCohortGossipTransport;
 	/** Unregister the four protocols and tear down every coord engine. */
 	stop(): Promise<void>;
 }
@@ -676,6 +687,8 @@ export async function createCohortTopicHost(node: Libp2p, fret: FretService, opt
 		service,
 		registry,
 		protocols,
+		profile,
+		gossipTransport,
 		stop: async (): Promise<void> => {
 			stopped = true;
 			clearInterval(timer);

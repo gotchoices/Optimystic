@@ -24,8 +24,11 @@
  * live {@link PushState} set, so a separate timer is the clean seam now; a future consolidation could fold
  * this into the host tick via a hook, but a separate unref'd timer cannot pin an idle process.
  *
- * This module touches neither the libp2p node assembly nor FRET cohort assembly — it depends only on the
+ * The **driver** touches neither the libp2p node assembly nor FRET cohort assembly — it depends only on the
  * `broadcastOver` seam + db-core codec, so it is unit-testable with a fake transport and real `PushState`s.
+ * The co-located {@link registerPushStateGossipHandler} (the inbound protocol-handler registration) does
+ * bind libp2p, mirroring {@link import("./notify-transport.js").registerNotifyHandler} — the driver class
+ * stays pure; only that one helper reaches the node.
  */
 
 import {
@@ -35,6 +38,9 @@ import {
 	type PushStateGossipV1,
 	type RingCoord,
 } from "@optimystic/db-core";
+import type { Libp2p } from "libp2p";
+import type { Connection, Stream } from "@libp2p/interface";
+import { readAllBounded } from "p2p-fret";
 import type { FretCohortGossipTransport } from "../cohort-topic/cohort-gossip-transport.js";
 import { DEFAULT_GOSSIP_INTERVAL_MS } from "../cohort-topic/cohort-gossip-driver.js";
 import { DEFAULT_STREAM_MAX_BYTES } from "../cohort-topic/stream-util.js";
@@ -252,4 +258,34 @@ export class ReactivityPushStateGossipDriver {
 		};
 		return encodePushStateGossipV1(sliced, NO_FRAME_LIMIT);
 	}
+}
+
+/**
+ * Register the inbound push-state-gossip protocol handler: read one bounded frame and hand it to
+ * {@link ReactivityPushStateGossipDriver.deliver} (which decodes, membership-gates, and merges), then close.
+ * One-way — no reply frame, matching the cohort-topic gossip handlers. A read error aborts the stream and
+ * {@link ReactivityPushStateGossipDriver.deliver} swallows a decode/forge/foreign failure, so the handler
+ * never throws on the stream. Mirrors {@link import("./notify-transport.js").registerNotifyHandler}.
+ */
+export function registerPushStateGossipHandler(
+	node: Libp2p,
+	protocol: string,
+	driver: Pick<ReactivityPushStateGossipDriver, "deliver">,
+	maxBytes = DEFAULT_STREAM_MAX_BYTES,
+): void {
+	void node.handle(protocol, (stream: Stream, connection: Connection) => {
+		void (async (): Promise<void> => {
+			try {
+				const frame = await readAllBounded(stream, maxBytes);
+				driver.deliver(connection.remotePeer.toString(), frame);
+				await stream.close();
+			} catch {
+				try {
+					stream.abort(new Error("reactivity push-state gossip stream handler error"));
+				} catch {
+					/* already aborted */
+				}
+			}
+		})();
+	});
 }

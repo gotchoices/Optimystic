@@ -7,6 +7,7 @@
  * `onLocalCommit` origination hook. See `docs/reactivity.md` §Subscription / §Notification origination.
  */
 
+export * from "./topic-bytes.js";
 export * from "./protocols.js";
 export * from "./notify-transport.js";
 export * from "./recover-transport.js";
@@ -14,3 +15,4 @@ export * from "./subscription-manager.js";
 export * from "./origination-manager.js";
 export * from "./forwarder-host.js";
 export * from "./push-state-gossip.js";
+export * from "./subscriber-registry.js";
