@@ -11,3 +11,4 @@ export * from "./protocols.js";
 export * from "./notify-transport.js";
 export * from "./subscription-manager.js";
 export * from "./origination-manager.js";
+export * from "./forwarder-host.js";
