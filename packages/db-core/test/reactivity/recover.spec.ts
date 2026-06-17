@@ -7,6 +7,7 @@ import {
 	decodeRecoverRequestV1,
 	encodeRecoverReplyV1,
 	decodeRecoverReplyV1,
+	RollingCheckpoint,
 	type BackfillSignable,
 	type ResumeSignable,
 	type BackfillV1,
@@ -105,6 +106,15 @@ describe('reactivity recover — RecoverRequestV1 / RecoverReplyV1 envelope', ()
 
 	it('round-trips a resume reply', () => {
 		const reply: RecoverReplyV1 = { v: 1, kind: 'resume', resumeReply: { v: 1, result: 'backfill', entries: [note(18), note(19)], currentRevision: 19 } };
+		expect(decodeRecoverReplyV1(encodeRecoverReplyV1(reply))).to.deep.equal(reply);
+	});
+
+	it('round-trips a checkpoint_window resume reply (the envelope carries the summary + recentEntries)', () => {
+		// The one inner resume variant whose extra fields (`checkpoint`, `recentEntries`) ride the envelope;
+		// the others only carry `entries`/scalars. Pins that the recover wrapper does not drop them.
+		const cp = new RollingCheckpoint({ collectionId: COLLECTION, span: 8 });
+		for (let rev = 9; rev <= 16; rev++) cp.retire({ revision: rev, payload: note(rev), receivedAt: 1000 + rev });
+		const reply: RecoverReplyV1 = { v: 1, kind: 'resume', resumeReply: { v: 1, result: 'checkpoint_window', checkpoint: cp.summary()!, recentEntries: [note(17), note(18)], currentRevision: 18 } };
 		expect(decodeRecoverReplyV1(encodeRecoverReplyV1(reply))).to.deep.equal(reply);
 	});
 
