@@ -1,3 +1,10 @@
+<!-- resume-note -->
+RESUME: A prior agent run on this ticket did not complete.
+  Prior run: 2026-06-16T23:51:51.811Z (agent: claude)
+  Log file: C:\projects\optimystic\tickets\.logs\coordinator-cache-hint-keys-wrong-block-and-encoding.implement.2026-06-16T23-51-51-811Z.log
+Read the log to see what was done. Resume where it left off.
+If the prior run hit a timeout or repeated error, be cautious not to rush into the same situation.
+<!-- /resume-note -->
 description: When the client follows a "talk to that peer instead" redirect, it tries to remember which peer handles a block so the next request can skip the lookup — but it records that note under a key that never matches how blocks are actually looked up, so the shortcut silently never helps, and for multi-block writes it even remembers the wrong block.
 prereq:
 files:
