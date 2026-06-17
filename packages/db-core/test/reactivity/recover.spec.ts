@@ -138,6 +138,23 @@ describe('reactivity recover — RecoverRequestV1 / RecoverReplyV1 envelope', ()
 		expect(() => encodeRecoverReplyV1(bad as unknown as RecoverReplyV1)).to.throw(CohortWireError, /does not match/);
 	});
 
+	it('rejects a reply whose body is the wrong branch for its declared kind', () => {
+		// Mirror of the request-side "kind carrying the wrong body": a `kind: "resume"` reply must not carry
+		// a `backfillReply` (and the absent `resumeReply` must not be silently tolerated).
+		const bad = { v: 1, kind: 'resume', backfillReply: { v: 1, entries: [], available: { fromRevision: 0, toRevision: 0 } } };
+		expect(() => encodeRecoverReplyV1(bad as unknown as RecoverReplyV1)).to.throw(CohortWireError, /does not match/);
+	});
+
+	it('rejects a reply whose declared kind has no matching body', () => {
+		const bad = { v: 1, kind: 'backfill' }; // neither branch present
+		expect(() => encodeRecoverReplyV1(bad as unknown as RecoverReplyV1)).to.throw(CohortWireError);
+	});
+
+	it('rejects a reply with an unknown kind', () => {
+		const bad = { v: 1, kind: 'rotate', backfillReply: { v: 1, entries: [], available: { fromRevision: 0, toRevision: 0 } } };
+		expect(() => encodeRecoverReplyV1(bad as unknown as RecoverReplyV1)).to.throw(CohortWireError, /kind/);
+	});
+
 	it('respects the maxMessageBytes bound like the sibling codecs', () => {
 		const req: RecoverRequestV1 = { v: 1, kind: 'backfill', backfill };
 		expect(() => encodeRecoverRequestV1(req, 8)).to.throw(CohortWireError, /max_message_bytes/);
