@@ -353,13 +353,17 @@ The checkpoint is *not* a replacement for the source-of-truth chain; it is a hin
 ### Backfill RPC
 
 > **Implemented** (`11.5-reactivity-backfill-resume-checkpoints`; wire signing + envelope by
-> `reactivity-recover-wire-signing`; live libp2p transport by `reactivity-recover-rpc-transport`).
-> `serveBackfill` (cohort side) and `createBackfillRequester` (subscriber side, the `requestBackfill`
-> seam ↔ RPC) live in `packages/db-core/src/reactivity/backfill.ts`; db-p2p's
-> `ReactivitySubscriptionManager` wires the requester to the subscriber's gap-detection seam when a
-> backfill transport is supplied. The request is peer-key-signed over `backfillSigningPayload` and the
-> live transport (`Libp2pReactivityRecoverTransport` / the recover protocol handler in
-> `packages/db-p2p/src/reactivity/recover-transport.ts`) carries it over libp2p.
+> `reactivity-recover-wire-signing`; live libp2p transport by `reactivity-recover-rpc-transport`; **node
+> wiring live** by `reactivity-recover-node-wiring`). `serveBackfill` (cohort side) and
+> `createBackfillRequester` (subscriber side, the `requestBackfill` seam ↔ RPC) live in
+> `packages/db-core/src/reactivity/backfill.ts`; db-p2p's `ReactivitySubscriptionManager` wires the
+> requester to the subscriber's gap-detection seam when a backfill transport is supplied. The request is
+> peer-key-signed over `backfillSigningPayload` and the live transport
+> (`Libp2pReactivityRecoverTransport` / the recover protocol handler in
+> `packages/db-p2p/src/reactivity/recover-transport.ts`) carries it over libp2p. The transport is now
+> **registered + exposed on the running node** (`libp2p-node-base.ts`, `cohortTopic` block): the recover
+> request-reply handler serves from the forwarder host's live `PushState`s, so a remote subscriber's
+> backfill/resume is answered over a real socket by any cohort member that holds the gossiped state.
 
 ```
 BackfillV1 { v, collectionId, fromRevision, toRevision, timestamp, signature }
@@ -421,7 +425,7 @@ For collections with `block_fill_size = 64` and one commit per minute, rotation 
 - **Notifications** carry the tail cohort's threshold signature, which *is* the commit certificate from the transaction layer. Signature verification uses the standard cohort-topic membership-snapshot path ([cohort-topic.md §Membership snapshots](cohort-topic.md#membership-snapshots-and-signature-verification)).
 - **Subscribe / renew RPCs** are signed by the subscriber's peer key and include `correlationId` and `timestamp`; replay protection is handled by the cohort-topic layer (they ride a real `RegisterV1`/`RenewV1` envelope).
 - **Recover RPCs (`BackfillV1` / `ResumeV1`)** are signed by the subscriber's peer key over a canonical signing payload (`backfillSigningPayload` / `resumeSigningPayload` — an explicitly-ordered, type-tagged JSON array, mirroring the cohort-topic `registerSigningPayload`). The serving handler verifies the signature against the **dialing peer** (the dialer's peer id *is* the signer — no signer-id field on the wire) and runs a node-level `CorrelationReplayGuard` keyed on the **signature bytes** + the request `timestamp` (the signature is a unique, authenticated token, so no separate `correlationId` is needed). A captured request cannot be replayed with a forged-fresh timestamp — the forged value invalidates the signature.
-  - **Subscriber-side signing is synchronous.** The subscription manager's `signBackfill` / `signResume` seam is `(unsigned) => string` (the db-core backfill driver builds the unsigned image internally, so a pre-signed value is impossible), but libp2p's `PrivateKey.sign` is async. The seam is fed by `createRecoverRequestSigners(privateKey)` (db-p2p `recover-transport.ts`), which signs with the synchronous `signPeerSig` (`cohort-topic/peer-sig.ts`) — `@noble/curves/ed25519` over the node's raw Ed25519 seed, the mirror of the synchronous `verifyPeerSig`. noble's RFC8032 signatures are byte-identical to libp2p's async signer for the same key + payload, so the serving handler's verify accepts them. Composing these signers + the `Libp2pReactivityRecoverTransport` into the running node rides the reactivity notification-transport node wiring (`reactivity-notification-transport`).
+  - **Subscriber-side signing is synchronous.** The subscription manager's `signBackfill` / `signResume` seam is `(unsigned) => string` (the db-core backfill driver builds the unsigned image internally, so a pre-signed value is impossible), but libp2p's `PrivateKey.sign` is async. The seam is fed by `createRecoverRequestSigners(privateKey)` (db-p2p `recover-transport.ts`), which signs with the synchronous `signPeerSig` (`cohort-topic/peer-sig.ts`) — `@noble/curves/ed25519` over the node's raw Ed25519 seed, the mirror of the synchronous `verifyPeerSig`. noble's RFC8032 signatures are byte-identical to libp2p's async signer for the same key + payload, so the serving handler's verify accepts them. These signers + the `Libp2pReactivityRecoverTransport` are composed into the running node by the recover node wiring (`reactivity-recover-node-wiring`): `libp2p-node-base.ts`'s `cohortTopic`-enabled block registers the recover request-reply handler (`registerRecoverHandler`) against the forwarder host's live `PushState`s, constructs the outbound transport over the production dialer, and exposes the transport + signers + a node-level sticky cohort-hint cache (`reactivityRecover` / `reactivityRecoverSigners` / `reactivityCohortHintCache`) for the subscribe factory that constructs managers (the deferred Quereus `Database.watch` bridge).
 - **Rotation hints** are part of the notification payload and inherit its signature.
 - **Forwarder cohorts do not re-sign.** They pass through the original threshold signature unchanged.
 - **Replay-buffer entries** retain the original signature. Backfill responses are verifiable end-to-end.
@@ -790,10 +794,22 @@ never hard-code drifting numbers.
 > inbound frames to the registry. **No real-network observation here contradicts the simulator** — the design
 > (anchor derivation, cert reuse, verify, socket fan-out) is confirmed on real libp2p.
 >
+> **Recover (resume/backfill) socket delivery is now wired and exercised** (`reactivity-recover-node-wiring`):
+> a remote subscriber that slept past the live tail's last delivered revision sends one `ResumeV1` over the real
+> `/optimystic/reactivity/1.0.0/recover` request-reply socket to a real tail-cohort member and is brought current
+> (the backfill variant) — the recovery analogue of the notification socket-delivery test. `libp2p-node-base.ts`
+> registers the recover serve handler (`registerRecoverHandler`) against the forwarder host's live `PushState`s,
+> verifying the request's peer-key signature against the dialing peer and gating it through a node-level
+> `CorrelationReplayGuard`. The subscriber's request is signed with the node's real recover signers
+> (`createRecoverRequestSigners`) and carried by the production dialer. (The test pins the recover transport to
+> the origin for determinism; the sticky-primary → cohort-walk target selection is unit-covered by
+> `reactivity/recover-transport.spec.ts`.)
+>
 > **Still deferred (tagged, not faked):** the tail-rotation-specific *redirect* on socket delivery
 > (`12.5-reactivity-tail-rotation-transport`) and the real-libp2p `Database.watch` wakeup — the Quereus
 > application bridge that *constructs* a subscription manager from a watch and registers it
-> (`optimystic-network-reactive-watch-integration-test`). 12.33 owns the transport + registry those plug into.
+> (`optimystic-network-reactive-watch-integration-test`). 12.33 + recover-node-wiring own the transport,
+> registry, and recover serve+signers those plug into.
 
 ---
 

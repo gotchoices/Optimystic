@@ -15,6 +15,7 @@ import {
 	renewSigningPayload,
 	subscribeAppPayloadBytes,
 	createNotificationVerifier,
+	createStickyCohortHintCache,
 	bytesToB64url,
 	b64urlToBytes,
 	bytesEqual,
@@ -24,6 +25,9 @@ import {
 	type RegisterV1,
 	type RenewV1,
 	type NotificationV1,
+	type ResumeV1,
+	type ResumeReplyV1,
+	type ResumeSignable,
 	type CommitCert,
 	type CollectionChangeEvent,
 	type BlockId,
@@ -36,6 +40,12 @@ import { sendOneWay } from '../src/cohort-topic/stream-util.js';
 import { DEFAULT_COHORT_TOPIC_PROTOCOLS } from '../src/cohort-topic/protocols.js';
 import { signedWillingness, type Member } from '../src/testing/cohort-topic-mesh-harness.js';
 import { createReactivitySelfMembershipGate, reactivityTailBytes } from '../src/cohort-topic/reactivity-membership-gate.js';
+import { DEFAULT_REACTIVITY_PROTOCOLS } from '../src/reactivity/protocols.js';
+import {
+	Libp2pReactivityRecoverTransport,
+	createLibp2pRecoverDialer,
+	createRecoverRequestSigners,
+} from '../src/reactivity/recover-transport.js';
 import type { CohortTopicHost, CoordEngine } from '../src/cohort-topic/host.js';
 
 /**
@@ -598,6 +608,120 @@ async function memberOf(key: PrivateKey, peerId: PeerId): Promise<Member> {
 		} finally {
 			off();
 		}
+	});
+
+	// reactivity RECOVER (resume) *socket delivery* — the pull-recovery analogue of the notify socket test
+	// above, now LIVE in production (12.42): the node registers the recover request-reply handler against the
+	// forwarder host's live PushStates. A remote subscriber that slept past the live tail's last delivered
+	// revision sends one ResumeV1 over a real `/optimystic/reactivity/1.0.0/recover` socket to a real tail-cohort
+	// member and is brought current (the backfill variant). The subscriber side is constructed directly (the
+	// Quereus Database.watch → manager factory stays the backlog optimystic-network-reactive-watch-integration-test,
+	// exactly as the notify test notes); the recover transport is pinned to the origin for determinism — the full
+	// sticky-primary → cohort-walk target selection is unit-covered by reactivity/recover-transport.spec.ts.
+	it('a remote subscriber resumes past the tail over a real recover socket and is brought current (backfill)', async () => {
+		const RESUME_TAIL = 'optimystic/collection/tail-resume-real-libp2p';
+		const tailBytes = reactivityTailBytes(RESUME_TAIL);
+		const topicId = reactivityTopicId(tailBytes);
+		const reactivityCoord = addressing.coord0(topicId);
+
+		// Instantiate every node's reactivity cohort engine + converge willingness so the origin admits + serves.
+		engines(reactivityCoord);
+		const origin = primaryFor(reactivityCoord);
+		const originEngine = engineOf(origin, reactivityCoord);
+		expect(await quorumOn(originEngine, reactivityCoord), 'willingness converged for the resume topic').to.equal(true);
+
+		const remote = nodes.find((n) => n.idStr !== origin.idStr)!;
+		const collectionIdB64 = bytesToB64url(new TextEncoder().encode('rx-resume-collection'));
+
+		// The production recover transport's cohort-walk WOULD reach the origin: at wantK = N it is in the resume
+		// topic's FRET cohort (the same coord_0 assembly `resolveReactivityCohort` uses in libp2p-node-base).
+		expect(remote.fret.assembleCohort(reactivityCoord, WANT_K), 'origin is a recover-walk target for the remote').to.include(origin.idStr);
+
+		// Cache the tail cohort's MembershipCertV1 (whole mesh at wantK = N) into every node's verifier so the
+		// origin's own forwarder receive (which buffers the originated notification into its PushState replay ring)
+		// verifies with real Ed25519 against the membership.
+		const now = Date.now();
+		const members = nodes.map((n) => bytesToB64url(n.member.bytes));
+		const cert: MembershipCertV1 = {
+			v: 1,
+			cohortCoord: bytesToB64url(reactivityCoord),
+			cohortEpoch: bytesToB64url(new TextEncoder().encode(`rx-resume:${RESUME_TAIL}`)),
+			members,
+			stabilizedAt: now,
+			thresholdSig: bytesToB64url(new Uint8Array([0])),
+			signers: members,
+		};
+		for (const n of nodes) {
+			n.host.service.verifier().cache(cert);
+		}
+
+		// Originate rev 1 on the origin: the production onLocalCommit builds a NotificationV1 and ingests it into
+		// the origin's forwarder host, filling its PushState replay ring with rev 1 — the live tail's last
+		// delivered revision the remote will resume past. Real threshold commit cert (every member signs its
+		// approve image; signers sorted by peer-id so each aligns with its 64-byte chunk of the threshold sig).
+		const commitHash = `${collectionIdB64}:1`;
+		const signedPayload = new TextEncoder().encode(`${commitHash}:approve`);
+		const sortedSigners = [...nodes].sort((a, b) => (a.idStr < b.idStr ? -1 : a.idStr > b.idStr ? 1 : 0));
+		const chunks: Uint8Array[] = [];
+		for (const n of sortedSigners) {
+			chunks.push(await n.key.sign(signedPayload));
+		}
+		const thresholdSig = new Uint8Array(chunks.reduce((sum, c) => sum + c.length, 0));
+		let offset = 0;
+		for (const c of chunks) {
+			thresholdSig.set(c, offset);
+			offset += c.length;
+		}
+		const commitCert: CommitCert = { thresholdSig, signers: sortedSigners.map((n) => n.idStr), minSigs: MIN_SIGS, signedPayload };
+		const event: CollectionChangeEvent = {
+			collectionId: collectionIdB64 as unknown as BlockId,
+			blockIds: [],
+			actionId: 'rx-resume-action' as ActionId,
+			rev: 1,
+			tailId: RESUME_TAIL as BlockId,
+		};
+		expect(typeof origin.host.service.onLocalCommit, 'origination hook installed on the origin').to.equal('function');
+		origin.host.service.onLocalCommit!(event, commitCert);
+
+		// The remote's recover transport over the real recover socket, pinned to the origin: the production dialer
+		// + the node's real recover request signers. The sticky cohort-hint cache starts empty, so target
+		// selection falls straight through to the resolved (origin) target.
+		const recover = new Libp2pReactivityRecoverTransport({
+			dialer: createLibp2pRecoverDialer(remote.node, DEFAULT_REACTIVITY_PROTOCOLS.recover),
+			selfPeerId: remote.idStr,
+			cohortHintCache: createStickyCohortHintCache(),
+			resolveCohort: () => [origin.idStr],
+		});
+		const { signResume } = createRecoverRequestSigners(remote.key);
+		const resumeTransport = recover.resumeTransport(topicId, collectionIdB64);
+
+		// The remote slept holding nothing past rev 0, so it resumes from rev 1. Poll: origination ingest is async
+		// (serialized off the emit seam), so the origin's PushState may not yet hold rev 1 on the first dial — a
+		// not-yet-served collection replies with no frame (the dial rejects). Each attempt re-stamps `timestamp`
+		// (fresh, re-signed) so the serve-side freshness/replay guard admits the retry rather than rejecting it.
+		let reply: ResumeReplyV1 | undefined;
+		const brought = await waitFor(async () => {
+			const unsigned: ResumeSignable = {
+				v: 1,
+				collectionId: collectionIdB64,
+				fromRevision: 1,
+				latestKnownTailId: bytesToB64url(tailBytes),
+				subscriberCoord: bytesToB64url(remote.member.bytes),
+				timestamp: Date.now(),
+			};
+			const req: ResumeV1 = { ...unsigned, signature: signResume(unsigned) };
+			try {
+				reply = await resumeTransport(req);
+				return reply.result === 'backfill';
+			} catch {
+				return false; // origin not yet serving the PushState (ingest pending) → dial rejected; retry
+			}
+		}, 20_000, 200);
+
+		expect(brought, 'the remote got a backfill resume reply from the real tail-cohort member over a real socket').to.equal(true);
+		expect(reply!.result, 'within the replay ring → backfill').to.equal('backfill');
+		expect(reply!.entries!.map((e) => e.revision), 'the backfill brings the remote current to the tail revision').to.deep.equal([1]);
+		expect(reply!.currentRevision, 'the reply carries the current tail revision').to.equal(1);
 	});
 
 	// --- 5. Matchmaking: a provider record lands in + replicates across a real cohort ---

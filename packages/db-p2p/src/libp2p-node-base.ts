@@ -42,6 +42,12 @@ import { createCohortTopicHost, type CohortTopicHostOptions } from './cohort-top
 import { attachCohortChangeBridge } from './cohort-topic/change-bridge.js';
 import { createReactivitySelfMembershipGate, reactivityTailBytes } from './cohort-topic/reactivity-membership-gate.js';
 import { Libp2pReactivityNotifyTransport, registerNotifyHandler } from './reactivity/notify-transport.js';
+import {
+	Libp2pReactivityRecoverTransport,
+	createLibp2pRecoverDialer,
+	registerRecoverHandler,
+	createRecoverRequestSigners,
+} from './reactivity/recover-transport.js';
 import { ReactivityForwarderHost, reactivityDirectSubscribers, reactivityNotificationTopicId } from './reactivity/forwarder-host.js';
 import { ReactivityOriginationManager } from './reactivity/origination-manager.js';
 import { ReactivityPushStateGossipDriver, registerPushStateGossipHandler, type ReactivityGossipCollection } from './reactivity/push-state-gossip.js';
@@ -49,6 +55,8 @@ import { ReactivitySubscriberRegistry } from './reactivity/subscriber-registry.j
 import { DEFAULT_REACTIVITY_PROTOCOLS, reactivityProtocolList } from './reactivity/protocols.js';
 import {
 	createNotificationVerifier,
+	createCorrelationReplayGuard,
+	createStickyCohortHintCache,
 	reactivityNodePolicy,
 	createTierAddressing,
 	createRingHash,
@@ -881,6 +889,59 @@ export async function createLibp2pNodeBase(
 		});
 		registerPushStateGossipHandler(node, reactivityProtocols.pushStateGossip, pushStateGossip);
 		pushStateGossip.start();
+
+		// 5. Recover RPC — the pull companion to notify (docs/reactivity.md §Backfill RPC / §Resume). A
+		// subscriber that detected a gap, or woke from sleep past the live tail, asks a serving cohort member
+		// "what did I miss?" and is brought current over a real request-reply socket. The SERVE side is live
+		// here: this node answers RecoverRequestV1 frames against its live forwarder PushStates. The OUTBOUND
+		// transport + signers are constructed and exposed for the subscribe factory that CONSTRUCTS managers
+		// (the Quereus Database.watch app-bridge — backlog optimystic-network-reactive-watch-integration-test);
+		// no node-internal manager calls them yet, exactly as the notify subscriber side is constructed against
+		// `reactivitySubscribers` rather than from a watch.
+		//
+		// Node-level sticky cohort-hint cache (keyed by collectionId), shared between the outbound transport's
+		// sticky-primary lookup and a future manager's rotation-invalidation so both see ONE cache. It starts
+		// empty ⇒ the transport falls through to the cohort-walk (any member holding the gossiped PushState
+		// answers); populating the sticky primary is a one-RT optimization, not a correctness need.
+		const reactivityCohortHintCache = createStickyCohortHintCache();
+		// topicId → dialable cohort member peer-id strings: the SAME FRET coord_0 assembly the push-state-gossip
+		// authenticity gate uses (`reactivityAddressing.coord0` → `fret.assembleCohort`), so a recover walk
+		// reaches exactly the cohort that holds the topic's gossiped PushState. `assembleCohort` returns peer-id
+		// strings (the recover dialer's `peerIdFromString` space), matching the notify dial-target space.
+		const resolveReactivityCohort = (topicId: Uint8Array): string[] =>
+			fret.assembleCohort(reactivityAddressing.coord0(topicId), cohortWantK);
+
+		// Outbound transport: exposes the db-core BackfillTransport / ResumeTransport seams against this node.
+		// maxBytes is omitted so the dialer + handler default to DEFAULT_STREAM_MAX_BYTES, matching the notify
+		// transport's default (constructed above without an override) — one frame ceiling across the family.
+		const recover = new Libp2pReactivityRecoverTransport({
+			dialer: createLibp2pRecoverDialer(node, reactivityProtocols.recover),
+			selfPeerId,
+			cohortHintCache: reactivityCohortHintCache,
+			resolveCohort: resolveReactivityCohort,
+		});
+
+		// Inbound serve handler: decode (bounded) → verify the dialing peer's signature → freshness/replay gate →
+		// resolve the live PushState off the forwarder host → serveBackfill/serveResume → reply (no reply on any
+		// failure; the stream aborts and the subscriber walks/chain-reads). One node-level replay guard is shared
+		// across all recover requests — a plain pruned-on-access map, so no new timer to tear down.
+		registerRecoverHandler(node, reactivityProtocols.recover, {
+			pushStateFor: forwarderHost.pushStateFor.bind(forwarderHost),
+			pushStateForCollection: forwarderHost.pushStateForCollection.bind(forwarderHost),
+			replayGuard: createCorrelationReplayGuard(),
+		});
+
+		// The subscriber's synchronous request signers over the node's Ed25519 key (resolves the recover wiring's
+		// lone design point — see recover-transport.ts §createRecoverRequestSigners). Fed to a manager by the
+		// subscribe factory alongside recover.backfillTransport(topicId, collectionId) /
+		// recover.resumeTransport(topicId, collectionId).
+		const recoverSigners = createRecoverRequestSigners(nodePrivateKey);
+
+		// Expose the recover seams so the subscribe factory wires backfill/resume RPC + signers + the shared
+		// sticky cache (mirrors `reactivitySubscribers` above).
+		(node as any).reactivityRecover = recover;
+		(node as any).reactivityRecoverSigners = recoverSigners;
+		(node as any).reactivityCohortHintCache = reactivityCohortHintCache;
 
 		// Teardown: release reactivity timers + protocol handlers BEFORE host.stop() (which clears the cohort
 		// gossip timer + unhandles the cohort-topic protocols) BEFORE the node's transports close (previousStop).
