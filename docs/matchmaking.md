@@ -237,7 +237,10 @@ The multi-cohort sweep costs more RPCs and is reserved for use cases where repre
 > `logBucketCount` (largest power of two `≤ n`), which rounds *down* so the consumer's shard selection
 > over-provisions rather than under-selects. The public seeker session escalates walk → sweep on a hot
 > topic (`childCohortCount > 0`) or `preferSweep`; db-p2p binds the sweep to the voting
-> `QuorumDiscovery.sweep` port. Spec: `multi-cohort-seeker.spec.ts` (db-core), `aggregate-counts.spec.ts`
+> `QuorumDiscovery.sweep` port. When an optional `patienceMs` budget is supplied, the sweep fixes a
+> wall-clock deadline at entry and stops *starting* new shard queries once it drains (an in-flight
+> `queryShard` is not cancelled) — mirroring the single-cohort walk's patience model; absent it, every
+> elected shard is queried. Spec: `multi-cohort-seeker.spec.ts` (db-core), `aggregate-counts.spec.ts`
 > (db-p2p).
 
 ---
