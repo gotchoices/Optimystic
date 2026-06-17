@@ -3,6 +3,7 @@ import type {
 	PendRequest, CommitRequest, BlockGets, IPeerNetwork, PeerId
 } from "@optimystic/db-core";
 import type { RepoMessage } from "@optimystic/db-core";
+import { blockIdsForTransforms } from "@optimystic/db-core";
 import { ProtocolClient } from "../protocol-client.js";
 import { peerIdFromString } from "@libp2p/peer-id";
 
@@ -105,7 +106,9 @@ export class RepoClient extends ProtocolClient implements IRepo {
 			return id ? new TextEncoder().encode(id) : undefined;
 		}
 		if ('pend' in op) {
-			const id = Object.keys(op.pend.transforms)[0];
+			// Key on a real block id the pend touches, NOT a structural transforms field
+			// name ('inserts'/'updates'/'deletes'); see RepoService.deriveBlockKey.
+			const id = blockIdsForTransforms(op.pend.transforms)[0];
 			return id ? new TextEncoder().encode(id) : undefined;
 		}
 		if ('commit' in op) {
