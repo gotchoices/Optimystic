@@ -6,7 +6,7 @@ import { encode as lpEncode } from 'it-length-prefixed';
 import type { PeerId } from '@libp2p/interface';
 import type {
 	IPeerNetwork, PeerId as CorePeerId, ClusterRecord, RepoMessage,
-	CommitRequest, PendRequest, IBlock
+	CommitRequest, PendRequest, IBlock, BlockGets, ActionBlocks
 } from '@optimystic/db-core';
 import { blockIdToBytes } from '@optimystic/db-core';
 import { RepoClient } from '../src/repo/client.js';
@@ -121,6 +121,40 @@ describe('RepoClient coordinator-cache hint key', () => {
 		expect(bytesEqual(recorded[0]!.key, expected), 'key must be blockIdToBytes(block-A)').to.equal(true);
 		expect(bytesEqual(recorded[0]!.key, new TextEncoder().encode('inserts')), 'must not key on the field name').to.equal(false);
 		expect(bytesEqual(recorded[0]!.key, await blockIdToBytes('inserts')), 'must not hash the field name').to.equal(false);
+	});
+
+	// Defect 1 (encoding) also applies to the get branch: key on blockIdToBytes(blockIds[0]),
+	// matching RepoService.deriveBlockKey('get') → blockIds[0]. Not raw utf8.
+	it('records a get under blockIdToBytes(blockIds[0]) — not raw utf8', async () => {
+		const startPeer = await makePeerId();
+		const coordinator = await makePeerId();
+		const { network, recorded } = makeRedirectNetwork(coordinator, {});
+		const client = RepoClient.create(startPeer, network, '/optimystic/test');
+
+		const gets: BlockGets = { blockIds: ['block-A', 'block-B'] };
+		await client.get(gets, soonExpiring());
+
+		expect(recorded).to.have.length(1);
+		const expected = await blockIdToBytes('block-A');
+		expect(bytesEqual(recorded[0]!.key, expected), 'key must be blockIdToBytes(blockIds[0])').to.equal(true);
+		expect(bytesEqual(recorded[0]!.key, new TextEncoder().encode('block-A')), 'must not be raw utf8').to.equal(false);
+	});
+
+	// Defect 1 (encoding) also applies to the cancel branch: key on
+	// blockIdToBytes(actionRef.blockIds[0]), matching deriveBlockKey('cancel'). Not raw utf8.
+	it('records a cancel under blockIdToBytes(actionRef.blockIds[0]) — not raw utf8', async () => {
+		const startPeer = await makePeerId();
+		const coordinator = await makePeerId();
+		const { network, recorded } = makeRedirectNetwork(coordinator, {});
+		const client = RepoClient.create(startPeer, network, '/optimystic/test');
+
+		const actionRef: ActionBlocks = { actionId: 'a1', blockIds: ['block-A', 'block-B'] };
+		await client.cancel(actionRef, soonExpiring());
+
+		expect(recorded).to.have.length(1);
+		const expected = await blockIdToBytes('block-A');
+		expect(bytesEqual(recorded[0]!.key, expected), 'key must be blockIdToBytes(actionRef.blockIds[0])').to.equal(true);
+		expect(bytesEqual(recorded[0]!.key, new TextEncoder().encode('block-A')), 'must not be raw utf8').to.equal(false);
 	});
 });
 
