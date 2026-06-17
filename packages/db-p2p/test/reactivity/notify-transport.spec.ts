@@ -193,6 +193,39 @@ describe('reactivity / notify transport', () => {
 		expect(received, 'the inbound frame was decoded and delivered').to.deep.equal([n]);
 		expect(replied, 'notify is one-way — the handler sends no reply frame').to.equal(false);
 	});
+
+	it('registerNotifyHandler aborts the stream and delivers nothing when the bounded read fails', async () => {
+		const handlers = new Map<string, (stream: unknown, connection: { remotePeer: PeerId }) => void>();
+		const handleNode = {
+			handle: (protocol: string | string[], handler: (stream: unknown, connection: { remotePeer: PeerId }) => void): Promise<void> => {
+				for (const p of (Array.isArray(protocol) ? protocol : [protocol])) handlers.set(p, handler);
+				return Promise.resolve();
+			},
+		};
+		const { node: dialNode } = makeCapturingNode();
+		const tx = new Libp2pReactivityNotifyTransport(dialNode as never);
+		let fired = 0;
+		tx.onNotification(() => { fired++; });
+		// A tiny read ceiling forces readAllBounded to reject the (larger) inbound frame.
+		registerNotifyHandler(handleNode as never, PROTOCOL_REACTIVITY_NOTIFY, tx, 4);
+
+		const handler = handlers.get(PROTOCOL_REACTIVITY_NOTIFY);
+		const fromPeer = await peerIdString();
+		const frame = encodeNotificationV1(sampleNotification(11));
+		expect(frame.length, 'the frame is larger than the read ceiling').to.be.greaterThan(4);
+		let aborted = false;
+		const stream = {
+			[Symbol.asyncIterator]: async function* (): AsyncGenerator<Uint8Array> { yield frame; },
+			send: (): void => {},
+			close: (): Promise<void> => Promise.resolve(),
+			abort: (): void => { aborted = true; },
+		};
+		handler!(stream, { remotePeer: peerIdFromString(fromPeer) });
+		await delay(20);
+
+		expect(aborted, 'a failed read aborts the stream').to.equal(true);
+		expect(fired, 'an oversized/failed read delivers nothing to subscribers').to.equal(0);
+	});
 });
 
 describe('reactivity / protocol family', () => {
