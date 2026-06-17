@@ -5,12 +5,14 @@ import { bytesToB64url } from '@optimystic/db-core';
 import { createLibp2pNode } from '../../src/libp2p-node.js';
 import { DEFAULT_REACTIVITY_PROTOCOLS } from '../../src/reactivity/protocols.js';
 import { ReactivitySubscriberRegistry } from '../../src/reactivity/subscriber-registry.js';
+import { Libp2pReactivityRecoverTransport } from '../../src/reactivity/recover-transport.js';
 import { peerIdToBytes, bytesToPeerIdString } from '../../src/cohort-topic/peer-codec.js';
 import { edgeProfile } from '@optimystic/db-core';
 import type { CohortTopicHost } from '../../src/cohort-topic/host.js';
 
 const NOTIFY = DEFAULT_REACTIVITY_PROTOCOLS.notify;
 const PUSH_STATE_GOSSIP = DEFAULT_REACTIVITY_PROTOCOLS.pushStateGossip;
+const RECOVER = DEFAULT_REACTIVITY_PROTOCOLS.recover;
 
 /**
  * **Reactivity node-wiring** (`12.33-reactivity-notification-transport`). A `cohortTopic`-enabled production
@@ -40,9 +42,19 @@ describe('reactivity / node wiring (real libp2p, solo forming node)', function (
 			const protocols: string[] = node.getProtocols();
 			expect(protocols, 'notify handler registered').to.include(NOTIFY);
 			expect(protocols, 'push-state-gossip handler registered').to.include(PUSH_STATE_GOSSIP);
+			expect(protocols, 'recover handler registered').to.include(RECOVER);
 
 			// The node-level subscriber registry is exposed so a subscribe factory can register managers.
 			expect(node.reactivitySubscribers, 'subscriber registry exposed on the node').to.be.instanceOf(ReactivitySubscriberRegistry);
+
+			// The recover seams are exposed for the deferred subscribe factory (the Quereus Database.watch bridge):
+			// the outbound transport, the request signers, and the shared sticky cohort-hint cache.
+			expect(node.reactivityRecover, 'recover transport exposed on the node').to.be.instanceOf(Libp2pReactivityRecoverTransport);
+			expect(node.reactivityRecoverSigners, 'recover request signers exposed').to.be.an('object');
+			expect(typeof node.reactivityRecoverSigners.signBackfill, 'signBackfill seam present').to.equal('function');
+			expect(typeof node.reactivityRecoverSigners.signResume, 'signResume seam present').to.equal('function');
+			expect(node.reactivityCohortHintCache, 'sticky cohort-hint cache exposed').to.be.an('object');
+			expect(typeof node.reactivityCohortHintCache.get, 'cohort-hint cache get seam present').to.equal('function');
 
 			// The origination hook is installed on the cohort-topic service (overwrites any prior onLocalCommit).
 			const host = node.cohortTopicHost as CohortTopicHost;
@@ -57,6 +69,7 @@ describe('reactivity / node wiring (real libp2p, solo forming node)', function (
 		const afterStop: string[] = node.getProtocols();
 		expect(afterStop, 'notify handler unregistered on stop').to.not.include(NOTIFY);
 		expect(afterStop, 'push-state-gossip handler unregistered on stop').to.not.include(PUSH_STATE_GOSSIP);
+		expect(afterStop, 'recover handler unregistered on stop').to.not.include(RECOVER);
 	});
 
 	it('an Edge-profile node assembles subscriber-only: notify handler present, profile is edge', async () => {
@@ -97,7 +110,11 @@ describe('reactivity / node wiring (real libp2p, solo forming node)', function (
 			const protocols: string[] = node.getProtocols();
 			expect(protocols, 'no notify handler when cohortTopic disabled').to.not.include(NOTIFY);
 			expect(protocols, 'no push-state-gossip handler when cohortTopic disabled').to.not.include(PUSH_STATE_GOSSIP);
+			expect(protocols, 'no recover handler when cohortTopic disabled').to.not.include(RECOVER);
 			expect(node.reactivitySubscribers, 'no subscriber registry when disabled').to.equal(undefined);
+			expect(node.reactivityRecover, 'no recover transport when disabled').to.equal(undefined);
+			expect(node.reactivityRecoverSigners, 'no recover signers when disabled').to.equal(undefined);
+			expect(node.reactivityCohortHintCache, 'no cohort-hint cache when disabled').to.equal(undefined);
 			expect(node.cohortTopicHost, 'no host when disabled').to.equal(undefined);
 		} finally {
 			await node.stop();
