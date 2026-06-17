@@ -50,6 +50,7 @@ import {
 	type RegistrationRecord,
 } from "@optimystic/db-core";
 import type { ReactivityNotifyTransport } from "./notify-transport.js";
+import { bytesToPeerIdString } from "../cohort-topic/peer-codec.js";
 import { createLogger } from "../logger.js";
 
 const log = createLogger("reactivity-forwarder-host");
@@ -70,12 +71,16 @@ export interface ReactivityRecordSource {
 }
 
 /**
- * The direct-subscriber participant ids (base64url) for a reactivity topic, read from a cohort's
+ * The direct-subscriber **peer-id strings** for a reactivity topic, read from a cohort's
  * {@link RegistrationRecord} set: a record carries a subscriber iff its opaque `appState` decodes to a
  * reactivity {@link import("@optimystic/db-core").SubscribeAppPayloadV1}. `record.participantId` is the
- * subscriber's dialable member id (db-core's `service` pins `participantId = self`); base64url of it is
- * both the fan-out target and the `perSubscriberQueue` key. A record whose `appState` is absent or decodes
- * to a non-reactivity payload (e.g. a matchmaking registration sharing the cohort store) is skipped.
+ * subscriber's dialable member id (db-core's `service` pins `participantId = self`), carried as
+ * `peerIdToBytes(peerId) = utf8(peerIdString)`; this decodes it back to the canonical peer-id string via
+ * {@link bytesToPeerIdString} so the value is both the `transport.send` dial target (which calls
+ * `peerIdFromString`) and the `perSubscriberQueue` key. **The whole host runs in this peer-id-string space**
+ * — `selfPeerId`, `resolveChildPrimary`, and every `send` target must agree, or a base64url-vs-peer-id
+ * mismatch is a silent no-dial. A record whose `appState` is absent or decodes to a non-reactivity payload
+ * (e.g. a matchmaking registration sharing the cohort store) is skipped.
  */
 export function reactivityDirectSubscribers(source: ReactivityRecordSource, topicId: Uint8Array): string[] {
 	const out: string[] = [];
@@ -88,7 +93,7 @@ export function reactivityDirectSubscribers(source: ReactivityRecordSource, topi
 		} catch {
 			continue; // not a reactivity subscriber — leave the record to its own application
 		}
-		out.push(bytesToB64url(record.participantId));
+		out.push(bytesToPeerIdString(record.participantId));
 	}
 	return out;
 }
@@ -109,7 +114,15 @@ export interface ReactivityForwarderHostDeps {
 	readonly directSubscribers: (topicId: Uint8Array) => string[];
 	/** Resolve a child cohort's dialable primary when {@link CohortRef.primary} is absent (e.g. a FRET resolver). */
 	readonly resolveChildPrimary?: (ref: CohortRef) => string | undefined;
-	/** Route an inbound notification to a co-located subscription manager, when this node also subscribes the topic. */
+	/**
+	 * Route an inbound notification to a co-located subscription manager, when this node also subscribes the
+	 * topic. **Must be idempotent on `(collectionId, revision)`**: on the {@link ReactivityForwarderHost.onInbound}
+	 * path a node that is both a cohort member *and* a subscriber invokes this **twice** for the same
+	 * notification — once in the subscriber role (directly) and once in the forwarder role (when `self` is in
+	 * {@link directSubscribers}, via `fanOut`'s self-delivery). The db-core subscriber's `(collectionId,
+	 * revision)` dedupe (`createReactivitySubscriber`) collapses the second call to a no-op, so a correctly
+	 * wired manager delivers exactly once; a sink without that dedupe would double-deliver.
+	 */
 	readonly deliverLocal?: (topicId: Uint8Array, n: NotificationV1) => void;
 	/** Wall clock (unix ms) stamped on `receive`. Default `Date.now`. */
 	readonly clock?: () => number;

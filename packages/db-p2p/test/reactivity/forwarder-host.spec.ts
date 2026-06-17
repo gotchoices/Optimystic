@@ -31,6 +31,9 @@ import {
 	type ReactivityForwarderHostDeps,
 } from '../../src/reactivity/forwarder-host.js';
 import type { ReactivityNotifyTransport } from '../../src/reactivity/notify-transport.js';
+import { peerIdToBytes } from '../../src/cohort-topic/peer-codec.js';
+import { generateKeyPair } from '@libp2p/crypto/keys';
+import { peerIdFromPrivateKey, peerIdFromString } from '@libp2p/peer-id';
 
 // --- fixtures ---------------------------------------------------------------
 
@@ -212,6 +215,33 @@ describe('reactivity / forwarder host', () => {
 		expect(transport.targets(), 'forwarder role: fanned out to the direct subscriber').to.deep.equal([SUB_A]);
 	});
 
+	it('onInbound for a co-located subscriber+forwarder invokes deliverLocal twice (relies on the manager\'s (collectionId,revision) dedupe)', async () => {
+		// SELF is in the direct-subscriber set: the subscriber role delivers in-process, and the forwarder
+		// role's fan-out *also* delivers to SELF (never dialed). The host deliberately relies on the
+		// downstream subscription manager's (collectionId, revision) dedupe to collapse the two to one
+		// surfaced delivery — so a raw, non-deduping sink sees both calls. Pin that contract here.
+		const rawCalls: NotificationV1[] = [];
+		const { host, transport } = makeHost({
+			directSubscribers: (): string[] => [SELF, SUB_A],
+			deliverLocal: (_topicId, n): void => { rawCalls.push(n); },
+		});
+		const n = note(1);
+		await host.onInbound({ id: new Uint8Array([0xab]) }, n);
+
+		expect(rawCalls, 'subscriber role + forwarder self-delivery both fire (manager dedupe collapses them)').to.deep.equal([n, n]);
+		expect(transport.targets(), 'self is never dialed; only the remote subscriber is').to.deep.equal([SUB_A]);
+
+		// A correctly-wired manager that dedupes by (collectionId, revision) surfaces exactly one delivery.
+		const surfaced: NotificationV1[] = [];
+		let lastRev = -1;
+		const { host: host2 } = makeHost({
+			directSubscribers: (): string[] => [SELF, SUB_A],
+			deliverLocal: (_topicId, m): void => { if (m.revision > lastRev) { lastRev = m.revision; surfaced.push(m); } },
+		});
+		await host2.onInbound({ id: new Uint8Array([0xab]) }, n);
+		expect(surfaced, 'a deduping sink yields exactly one delivery').to.deep.equal([n]);
+	});
+
 	it('a slow subscriber drops-oldest without stalling fast subscribers; its dropped counter increments', async () => {
 		const queueMax = 2;
 		const { host, transport } = makeHost({ directSubscribers: (): string[] => [SUB_A, SUB_B], queueMax });
@@ -345,10 +375,14 @@ describe('reactivity / direct-subscriber adapter', () => {
 		deltaMaxBytes: 0,
 	});
 
-	it('returns base64url participant ids only for records carrying a reactivity subscribe payload', () => {
-		const pA = new Uint8Array([0x10]);
-		const pB = new Uint8Array([0x11]);
-		const pC = new Uint8Array([0x12]);
+	it('returns dialable peer-id strings only for records carrying a reactivity subscribe payload', async () => {
+		// participantId is carried as peerIdToBytes(peerId) = utf8(peerIdString); the adapter must decode it
+		// back to the canonical peer-id string (the transport's `peerIdFromString` dial-target space), NOT
+		// base64url — a base64url target would silently fail `peerIdFromString` and never dial.
+		const peerA = peerIdFromPrivateKey(await generateKeyPair('Ed25519')).toString();
+		const pA = peerIdToBytes(peerA);
+		const pB = peerIdToBytes(peerIdFromPrivateKey(await generateKeyPair('Ed25519')).toString());
+		const pC = peerIdToBytes(peerIdFromPrivateKey(await generateKeyPair('Ed25519')).toString());
 		const records: RegistrationRecord[] = [
 			record({ participantId: pA, appState: reactivityAppState() }),
 			record({ participantId: pB, appState: undefined }), // no appState → not a reactivity subscriber
@@ -356,7 +390,10 @@ describe('reactivity / direct-subscriber adapter', () => {
 		];
 		const source = { records: (): readonly RegistrationRecord[] => records };
 
-		expect(reactivityDirectSubscribers(source, b64urlToBytes(TAIL))).to.deep.equal([bytesToB64url(pA)]);
+		const out = reactivityDirectSubscribers(source, b64urlToBytes(TAIL));
+		expect(out).to.deep.equal([peerA]);
+		// Pin the no-dial regression: the emitted target round-trips through the transport's `peerIdFromString`.
+		expect(() => peerIdFromString(out[0]!), 'the target is a valid dialable peer-id string').to.not.throw();
 	});
 
 	it('reactivityNotificationTopicId matches the verifier/origination tail-anchor derivation', () => {

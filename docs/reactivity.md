@@ -160,6 +160,18 @@ The `delta` field is optional and bounded by `delta_max` (default: 4 KB at Core 
 
 ## Propagation
 
+> **Implemented** (`12.31-reactivity-forwarder-host`). The receive→forward→fan-out orchestration is the
+> db-p2p `ReactivityForwarderHost` (`packages/db-p2p/src/reactivity/forwarder-host.ts`): `ingest(topicId, n)`
+> lazily instantiates the per-collection `PushState` + forwarder behind the Edge policy gate
+> (`instantiateForwarderPushState`), serializes ingests per topic so the replay ring + dedupe never
+> interleave, runs the db-core forwarder receive path, and on `"forward"` fans the **unmodified** frame out
+> to every direct subscriber (through `PushState.perSubscriberQueue`) and child cohort. `onInbound` drives
+> both the subscriber and forwarder roles for an inbound dial. It is **encoding-agnostic** over the
+> subscriber-id space and depends only on the `ReactivityNotifyTransport` interface, so it is unit-testable
+> with a fake transport; the libp2p node assembly that supplies a concrete transport and routes inbound
+> frames by topic is `reactivity-notification-transport`. Spec: `forwarder-host.spec.ts`. Building block —
+> not yet on the live commit→notify path (that wiring lands with the node-assembly ticket).
+
 The tail cohort's primary delivers the signed notification to:
 
 - Every direct subscriber (via each subscriber's primary assignment as held in the cohort-topic registration record).
