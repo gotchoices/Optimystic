@@ -1,4 +1,5 @@
 import type { PeerId, IPeerNetwork, ICluster, ClusterRecord } from '@optimystic/db-core';
+import { blockIdToBytes, blockIdsForTransforms } from '@optimystic/db-core';
 import { ProtocolClient } from '../protocol-client.js';
 import { peerIdFromString } from '@libp2p/peer-id';
 import { isClusterErrorEnvelope, clusterErrorFromEnvelope } from './cluster-error.js';
@@ -43,25 +44,38 @@ export class ClusterClient extends ProtocolClient implements ICluster {
 			if (next.id === currentIdStr) {
 				throw new Error('Redirect loop detected in ClusterClient (same peer)')
 			}
-			this.recordCoordinatorForRecordIfSupported(record, nextId)
+			await this.recordCoordinatorForRecordIfSupported(record, nextId)
 			const nextClient = ClusterClient.create(nextId, this.peerNetwork, this.protocolPrefix)
 			return await nextClient.update(record, hop + 1)
 		}
 		return response as ClusterRecord;
 	}
 
-  private recordCoordinatorForRecordIfSupported(record: ClusterRecord, peerId: PeerId): void {
-    const rmsg: any = (record as any)?.message
-    let tailId: string | undefined
-    if (rmsg?.commit?.tailId) tailId = rmsg.commit.tailId
-    else if (rmsg?.pend?.transforms) {
-      const keys = Object.keys(rmsg.pend.transforms)
-      if (keys.length > 0) tailId = keys[0]
-    }
-    if (tailId) {
-      const kbytes = new TextEncoder().encode(tailId)
-      const pn: any = this.peerNetwork as any
-      if (typeof pn?.recordCoordinator === 'function') pn.recordCoordinator(kbytes, peerId)
-    }
+  /**
+   * Record a coordinator-affinity hint for the block this record's op is
+   * coordinated on, so a follow-up op can dial `peerId` directly.
+   *
+   * The op lives at `record.message.operations[0]` — `record.message` is a
+   * RepoMessage `{ operations: [...] }`, NOT a bare `{ commit }`/`{ pend }`.
+   * Reading `record.message.commit`/`.pend` (the old code) always saw
+   * `undefined`, so this hint was dead code and never recorded anything.
+   *
+   * The key is `blockIdToBytes(<the coordinated block id>)` — the sha256 digest
+   * findCoordinator/recordCoordinator key the cache on — NOT raw utf8 of the id
+   * (which would never be retrieved). Commit anchors on blockIds[0] (where
+   * CoordinatorRepo runs consensus + verifyResponsibility), not tailId. Pend
+   * anchors on a real block id (blockIdsForTransforms), not a structural
+   * transforms field name. ClusterClient only ever carries commit/pend.
+   */
+  private async recordCoordinatorForRecordIfSupported(record: ClusterRecord, peerId: PeerId): Promise<void> {
+    const op = record.message.operations[0]
+    if (!op) return
+    let id: string | undefined
+    if ('commit' in op) id = op.commit.blockIds[0]
+    else if ('pend' in op) id = blockIdsForTransforms(op.pend.transforms)[0]
+    if (id == null) return
+    const kbytes = await blockIdToBytes(id)
+    const pn: any = this.peerNetwork as any
+    if (typeof pn?.recordCoordinator === 'function') pn.recordCoordinator(kbytes, peerId)
   }
 }

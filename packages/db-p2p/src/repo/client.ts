@@ -3,7 +3,7 @@ import type {
 	PendRequest, CommitRequest, BlockGets, IPeerNetwork, PeerId
 } from "@optimystic/db-core";
 import type { RepoMessage } from "@optimystic/db-core";
-import { blockIdsForTransforms } from "@optimystic/db-core";
+import { blockIdsForTransforms, blockIdToBytes } from "@optimystic/db-core";
 import { ProtocolClient } from "../protocol-client.js";
 import { peerIdFromString } from "@libp2p/peer-id";
 
@@ -90,8 +90,10 @@ export class RepoClient extends ProtocolClient implements IRepo {
 			if (next.id === currentIdStr) {
 				throw new Error('Redirect loop detected in RepoClient (same peer)')
 			}
-			// cache hint
-			this.recordCoordinatorForOpsIfSupported(operations, nextId)
+			// cache hint — await so the recorded key bytes match what findCoordinator
+			// later looks up (blockIdToBytes is async); deterministic ordering also
+			// keeps the hint testable. The redirect retry below is async anyway.
+			await this.recordCoordinatorForOpsIfSupported(operations, nextId)
 			// single-hop retry against target peer using repo protocol
 			const nextClient = RepoClient.create(nextId, this.peerNetwork, this.protocolPrefix)
 			return await nextClient.processRepoMessage<T>(operations, options, hop + 1)
@@ -99,30 +101,37 @@ export class RepoClient extends ProtocolClient implements IRepo {
 		return response as T;
 	}
 
-	private extractKeyFromOperations(ops: RepoMessage['operations']): Uint8Array | undefined {
+	private async extractKeyFromOperations(ops: RepoMessage['operations']): Promise<Uint8Array | undefined> {
 		const op = ops[0];
+		// The recorded key MUST be the sha256 digest produced by blockIdToBytes — the
+		// exact bytes findCoordinator/recordCoordinator key the coordinator cache on
+		// (NetworkTransactor passes blockIdToBytes(blockId)). Raw utf8 of the id would
+		// never match, so the hint would silently never be retrieved.
 		if ('get' in op) {
 			const id = op.get.blockIds[0];
-			return id ? new TextEncoder().encode(id) : undefined;
+			return id ? await blockIdToBytes(id) : undefined;
 		}
 		if ('pend' in op) {
 			// Key on a real block id the pend touches, NOT a structural transforms field
 			// name ('inserts'/'updates'/'deletes'); see RepoService.deriveBlockKey.
 			const id = blockIdsForTransforms(op.pend.transforms)[0];
-			return id ? new TextEncoder().encode(id) : undefined;
+			return id ? await blockIdToBytes(id) : undefined;
 		}
 		if ('commit' in op) {
-			return new TextEncoder().encode(op.commit.tailId);
+			// Anchor on blockIds[0] (where CoordinatorRepo.commit runs consensus +
+			// verifyResponsibility), NOT tailId — they differ for a non-tail batch.
+			const id = op.commit.blockIds[0];
+			return id ? await blockIdToBytes(id) : undefined;
 		}
 		if ('cancel' in op) {
 			const id = op.cancel.actionRef.blockIds[0];
-			return id ? new TextEncoder().encode(id) : undefined;
+			return id ? await blockIdToBytes(id) : undefined;
 		}
 		return undefined;
 	}
 
-	private recordCoordinatorForOpsIfSupported(ops: RepoMessage['operations'], peerId: PeerId): void {
-		const keyBytes = this.extractKeyFromOperations(ops)
+	private async recordCoordinatorForOpsIfSupported(ops: RepoMessage['operations'], peerId: PeerId): Promise<void> {
+		const keyBytes = await this.extractKeyFromOperations(ops)
 		const pn: any = this.peerNetwork as any
 		if (keyBytes != null && typeof pn?.recordCoordinator === 'function') {
 			pn.recordCoordinator(keyBytes, peerId)
