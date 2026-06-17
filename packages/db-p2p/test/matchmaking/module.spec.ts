@@ -257,4 +257,42 @@ describe('matchmaking / module — quorum discovery binding', () => {
 		expect(slice.entries.map((e) => e.participantId).sort()).to.deep.equal(['v2', 'v3']);
 		expect(slice.childCohortCount).to.equal(0);
 	});
+
+	it('sweep threads req.patienceMs — a tight budget stops querying shards early', async () => {
+		let now = 0;
+		const clock = (): number => now;
+		let shardsQueried = 0;
+		// Aggregate with 3 shards; each queryShard advances the virtual clock by 100ms.
+		// patienceMs=150 → deadline=150; after shard 1 now=100 (remaining=50>0), after shard 2 now=200 (remaining=0 → break before shard 3).
+		const tightAggregate: AggregateCountV1 = {
+			v: 1,
+			topicId: bytesToB64url(TOPIC_ID),
+			bucketCounts: [
+				{ targetTier: 1, prefixSlot: 0, count: 4 },
+				{ targetTier: 1, prefixSlot: 1, count: 8 },
+				{ targetTier: 1, prefixSlot: 2, count: 4 },
+			],
+			signature: bytesToB64url(new Uint8Array(64).fill(3)),
+			signers: [bytesToB64url(new Uint8Array(38).fill(4))],
+			cohortEpoch: bytesToB64url(new Uint8Array(32).fill(5)),
+		};
+		const discovery = createMatchmakingQuorumDiscovery({
+			verifyEntry: fakeVerify,
+			walkTransport: () => new FixedWalkTransport({ result: 'no_state' }, []),
+			estimateDMax: async () => 0,
+			sweepPorts: (): MultiCohortSweepPorts => ({
+				async fetchAggregate(): Promise<AggregateCountV1 | undefined> { return tightAggregate; },
+				async queryShard(): Promise<readonly ProviderEntryV1[]> {
+					shardsQueried++;
+					now += 100;
+					return [providerEntry(`p${shardsQueried}`)];
+				},
+			}),
+			clock,
+		});
+		const slice = await discovery.sweep({ topicId: TOPIC_ID, wantCount: 20, patienceMs: 150 });
+		expect(shardsQueried).to.equal(2);
+		expect(shardsQueried).to.be.lessThan(3);
+		expect(slice.childCohortCount).to.equal(0);
+	});
 });

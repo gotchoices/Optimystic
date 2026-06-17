@@ -212,4 +212,70 @@ describe('matchmaking / multi-cohort sweep — runMultiCohortSweep', () => {
 		});
 		expect(result.providers.map((p) => p.participantId)).to.deep.equal(['gpu']);
 	});
+
+	it('already-drained budget (patienceMs: 0) skips fetchAggregate and queries zero shards', async () => {
+		let fetchCalled = false;
+		const ports: MultiCohortSweepPorts = {
+			async fetchAggregate(): Promise<AggregateCountV1 | undefined> { fetchCalled = true; return aggregate([{ prefixSlot: 0, count: 8 }]); },
+			async queryShard(): Promise<readonly ProviderEntryV1[]> { return []; },
+		};
+		const result = await runMultiCohortSweep(ports, { topicId: TOPIC_ID, wantCount: 5, verifyEntry: fakeVerify, patienceMs: 0 });
+		expect(fetchCalled).to.equal(false);
+		expect(result.aggregateAvailable).to.equal(false);
+		expect(result.shardsQueried).to.equal(0);
+		expect(result.providers).to.have.length(0);
+	});
+
+	it('budget that drains mid-fan-out stops querying further shards', async () => {
+		let now = 0;
+		const clock = (): number => now;
+		const queriedShards: SweepShardQuery[] = [];
+		const shards = new Map<number, ProviderEntryV1[]>([
+			[0, [makeEntry({ participantId: 'slot0' })]],
+			[1, [makeEntry({ participantId: 'slot1' })]],
+			[2, [makeEntry({ participantId: 'slot2' })]],
+		]);
+		// Aggregate elects 3 shards (slot1 count=8, slot0 count=4, slot2 count=4; wantCount=20 needs all 3).
+		// Each queryShard call advances the clock by 100ms; patienceMs=150 → deadline=150.
+		// Before slot1: remaining=150>0 → query (now=100). Before slot0: remaining=50>0 → query (now=200).
+		// Before slot2: remaining=0 → break.
+		const ports: MultiCohortSweepPorts = {
+			async fetchAggregate(): Promise<AggregateCountV1 | undefined> {
+				return aggregate([{ prefixSlot: 0, count: 4 }, { prefixSlot: 1, count: 8 }, { prefixSlot: 2, count: 4 }]);
+			},
+			verifyAggregate(): boolean { return true; },
+			async queryShard(shard: SweepShardQuery): Promise<readonly ProviderEntryV1[]> {
+				queriedShards.push(shard);
+				now += 100;
+				return shards.get(shard.prefixSlot) ?? [];
+			},
+		};
+		const result = await runMultiCohortSweep(ports, { topicId: TOPIC_ID, wantCount: 20, verifyEntry: fakeVerify, patienceMs: 150, clock });
+		expect(result.shardsQueried).to.equal(2);
+		expect(result.selectedShards).to.have.length(3);
+		expect(result.providers.map((p) => p.participantId).sort()).to.deep.equal(['slot0', 'slot1']);
+	});
+
+	it('generous budget queries all selected shards (parity with today)', async () => {
+		let now = 0;
+		const clock = (): number => now;
+		const shards = new Map<number, ProviderEntryV1[]>([
+			[0, [makeEntry({ participantId: 'slot0' })]],
+			[1, [makeEntry({ participantId: 'slot1' })]],
+		]);
+		const ports: MultiCohortSweepPorts = {
+			async fetchAggregate(): Promise<AggregateCountV1 | undefined> {
+				return aggregate([{ prefixSlot: 0, count: 4 }, { prefixSlot: 1, count: 8 }]);
+			},
+			verifyAggregate(): boolean { return true; },
+			async queryShard(shard: SweepShardQuery): Promise<readonly ProviderEntryV1[]> {
+				now += 1;
+				return shards.get(shard.prefixSlot) ?? [];
+			},
+		};
+		const result = await runMultiCohortSweep(ports, { topicId: TOPIC_ID, wantCount: 20, verifyEntry: fakeVerify, patienceMs: 10_000, clock });
+		expect(result.shardsQueried).to.equal(2);
+		expect(result.shardsQueried).to.equal(result.selectedShards.length);
+		expect(result.providers.map((p) => p.participantId).sort()).to.deep.equal(['slot0', 'slot1']);
+	});
 });

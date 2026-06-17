@@ -128,6 +128,13 @@ export interface MultiCohortSweepOptions {
 	readonly maxShards?: number;
 	/** Multiplier on `wantCount`. Default {@link DEFAULT_SWEEP_OVERPROVISION}. */
 	readonly overprovision?: number;
+	/**
+	 * Patience budget (ms) for the whole sweep; drains across the shard fan-out. Omitted ⇒ unbounded
+	 * (query every selected shard, today's behaviour). Mirrors the walk leg's budget.
+	 */
+	readonly patienceMs?: number;
+	/** Wall clock (unix ms); injectable for tests. Default `Date.now`. Only consulted when `patienceMs` set. */
+	readonly clock?: () => number;
 }
 
 /** The assembled result of a multi-cohort sweep. */
@@ -155,8 +162,23 @@ function emptyResult(aggregateAvailable: boolean, aggregateTrusted: boolean): Mu
  * providers. A cold root (no aggregate) or an aggregate that fails verification yields an empty set so
  * the caller falls back to the single-cohort sample. Each shard entry is filtered and
  * `registrationSig`-re-validated before it counts — the cohort vouches only for "the set I held".
+ *
+ * When `opts.patienceMs` is supplied, a wall-clock deadline is fixed at entry and the shard fan-out
+ * stops as soon as the budget drains — mirroring the walk leg's patience model. This is
+ * "stop starting new shard queries": an in-flight `queryShard` call is not cancelled mid-flight.
+ * When `opts.patienceMs` is absent, every elected shard is queried (today's behaviour).
  */
 export async function runMultiCohortSweep(ports: MultiCohortSweepPorts, opts: MultiCohortSweepOptions): Promise<MultiCohortSweepResult> {
+	// Budget: optional wall-clock deadline mirroring the walk leg. Only consulted when patienceMs is set.
+	const clock = opts.clock ?? ((): number => Date.now());
+	const deadline = opts.patienceMs !== undefined ? clock() + opts.patienceMs : undefined;
+	const remaining = (): number => (deadline !== undefined ? Math.max(0, deadline - clock()) : Infinity);
+	// If the budget is already drained on entry, skip even the aggregate RPC — the walk already consumed
+	// all patience and there is no point spending an RPC on an aggregate we have no time to act on.
+	if (deadline !== undefined && remaining() <= 0) {
+		return emptyResult(false, false);
+	}
+
 	const aggregate = await ports.fetchAggregate();
 	if (aggregate === undefined) {
 		return emptyResult(false, false);
@@ -185,6 +207,10 @@ export async function runMultiCohortSweep(ports: MultiCohortSweepPorts, opts: Mu
 	const matched = new Map<string, ProviderEntryV1>();
 	let shardsQueried = 0;
 	for (const shard of selected) {
+		// Stop starting new shard queries once the budget has drained.
+		if (remaining() <= 0) {
+			break;
+		}
 		const entries = await ports.queryShard({ prefixSlot: shard.prefixSlot, targetTier: shard.targetTier });
 		shardsQueried++;
 		for (const entry of entries) {

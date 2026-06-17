@@ -275,8 +275,9 @@ export class VotingQuorumAssembler {
 	 * `registrationSig` **and** `verifyEligibility`, then applies the selection rule. Passes the *draining*
 	 * patience budget to each discovery hop (walk, then sweep) — the deadline is fixed at entry and each
 	 * hop receives the remaining slice — and on exhaustion returns whatever matched with `metTarget = false`.
-	 * (Honouring that budget is the port's duty: the single-cohort walk enforces it; the multi-cohort sweep
-	 * leg is currently bounded by its shard fan-out rather than the budget — see the sweep-patience follow-up.)
+	 * (Both legs honour `patienceMs`: the walk enforces a wall-clock deadline across hops and hang-out; the
+	 * sweep stops starting new shard queries once the budget drains. The residual is at most one in-flight
+	 * shard RPC — assembly never blocks materially past `patienceMs`.)
 	 */
 	async assembleQuorum(req: VotingQuorumRequest): Promise<VotingQuorumResult> {
 		const discovery = this.requireDiscovery();

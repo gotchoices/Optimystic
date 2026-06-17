@@ -275,11 +275,15 @@ export class MatchmakingSeekerSession {
 		const hot = result.maxChildCohortCount > 0;
 		const wantSweep = want.preferSweep === true || (hot && providers.size < want.wantCount);
 		if (wantSweep && this.deps.sweepPorts !== undefined) {
+			// Pass want.patienceMs as a fresh (coarser) bound — this path does not track a draining
+			// remainder (SeekerWalkClient ran on its own deadline). Still strictly better than unbounded.
 			const sweep = await runMultiCohortSweep(this.deps.sweepPorts(topicId), {
 				topicId,
 				wantCount: want.wantCount,
 				verifyEntry: this.deps.verifyEntry,
+				patienceMs: want.patienceMs,
 				...(want.filter !== undefined ? { filter: want.filter } : {}),
+				...(this.deps.clock !== undefined ? { clock: this.deps.clock } : {}),
 			});
 			for (const entry of sweep.providers) {
 				providers.set(entry.participantId, entry);
@@ -345,7 +349,9 @@ export function createMatchmakingQuorumDiscovery(deps: MatchmakingQuorumDiscover
 				topicId: req.topicId,
 				wantCount: req.wantCount,
 				verifyEntry: deps.verifyEntry,
+				patienceMs: req.patienceMs,
 				...(deps.filter !== undefined ? { filter: deps.filter } : {}),
+				...(deps.clock !== undefined ? { clock: deps.clock } : {}),
 			});
 			// The sweep hop has already crossed the ring — its childCohortCount is moot (the escalation
 			// decision is made). Report 0 so the assembler never double-escalates.
