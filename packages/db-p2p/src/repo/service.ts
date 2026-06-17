@@ -2,6 +2,7 @@ import { pipe } from 'it-pipe'
 import { decode as lpDecode, encode as lpEncode } from 'it-length-prefixed'
 import type { Startable, Logger, Stream, Connection, StreamHandler, PeerId } from '@libp2p/interface'
 import type { IRepo, RepoMessage } from '@optimystic/db-core'
+import { blockIdsForTransforms } from '@optimystic/db-core'
 import { peersEqual } from '../peer-utils.js'
 import { sha256 } from 'multiformats/hashes/sha2'
 import { encodePeers, type RedirectPayload } from './redirect.js'
@@ -138,7 +139,7 @@ export class RepoService implements Startable {
 	 * verifies responsibility on, so redirect routing stays consistent with where the
 	 * op is executed:
 	 *   - get    → blockIds[0]
-	 *   - pend   → first transforms key
+	 *   - pend   → blockIdsForTransforms(transforms)[0]
 	 *   - cancel → actionRef.blockIds[0]
 	 *   - commit → blockIds[0]  (CoordinatorRepo.commit anchors consensus on
 	 *     getClusterSize(blockIds[0]) / executeClusterTransaction(blockIds[0]) and guards
@@ -155,7 +156,7 @@ export class RepoService implements Startable {
 			return { blockKey: operation.get.blockIds[0], opName: 'get' }
 		}
 		if ('pend' in operation) {
-			return { blockKey: Object.keys(operation.pend.transforms)[0], opName: 'pend' }
+			return { blockKey: blockIdsForTransforms(operation.pend.transforms)[0], opName: 'pend' }
 		}
 		if ('cancel' in operation) {
 			return { blockKey: operation.cancel.actionRef.blockIds[0], opName: 'cancel' }

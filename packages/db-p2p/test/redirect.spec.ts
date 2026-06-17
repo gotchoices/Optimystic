@@ -3,7 +3,7 @@ import { peerIdFromPrivateKey } from '@libp2p/peer-id';
 import { generateKeyPair } from '@libp2p/crypto/keys';
 import { sha256 } from 'multiformats/hashes/sha2';
 import type { PeerId } from '@libp2p/interface';
-import type { IRepo, BlockGets, GetBlockResults, PendRequest, PendResult, CommitRequest, CommitResult, ActionBlocks, MessageOptions, RepoMessage } from '@optimystic/db-core';
+import type { IRepo, BlockGets, GetBlockResults, PendRequest, PendResult, CommitRequest, CommitResult, ActionBlocks, MessageOptions, RepoMessage, IBlock } from '@optimystic/db-core';
 import { RepoService, type RepoServiceComponents, type NetworkManagerLike } from '../src/repo/service.js';
 import type { RedirectPayload } from '../src/repo/redirect.js';
 
@@ -11,6 +11,9 @@ const makePeerId = async (): Promise<PeerId> => {
 	const key = await generateKeyPair('Ed25519');
 	return peerIdFromPrivateKey(key);
 };
+
+/** Build a minimal valid IBlock for a pend transforms fixture. */
+const makeBlock = (id: string): IBlock => ({ header: { id, type: 'test', collectionId: 'c1' } });
 
 /** Stable map key for a digest byte array (the sha256 of a blockKey string). */
 const digestMapKey = (key: Uint8Array): string => Array.from(key).join(',');
@@ -214,7 +217,7 @@ describe('RepoService redirect logic', () => {
 		});
 
 		it('redirects pend operations', async () => {
-			const message: RepoMessage = { operations: [{ pend: { transforms: { 'block-1': {} }, actionId: 'a1' } as any }] };
+			const message: RepoMessage = { operations: [{ pend: { transforms: { inserts: { 'block-1': makeBlock('block-1') }, updates: {}, deletes: [] }, actionId: 'a1' } as any }] };
 			const result = await service.checkRedirect('block-1', 'pend', message);
 			expect(result).to.not.be.null;
 		});
@@ -249,8 +252,8 @@ describe('RepoService redirect logic', () => {
 			expect(blockKey).to.equal('block-A');
 		});
 
-		it('derives pend key from the first transforms key', () => {
-			const op: RepoMessage['operations'][number] = { pend: { transforms: { 'block-A': {} }, actionId: 'a1' } } as any;
+		it('derives pend key from blockIdsForTransforms(...)[0]', () => {
+			const op: RepoMessage['operations'][number] = { pend: { transforms: { inserts: { 'block-A': makeBlock('block-A') }, updates: {}, deletes: [] }, actionId: 'a1' } } as any;
 			const { blockKey, opName } = service.deriveBlockKey(op);
 			expect(opName).to.equal('pend');
 			expect(blockKey).to.equal('block-A');
@@ -321,6 +324,50 @@ describe('RepoService redirect logic', () => {
 			// Sanity: had it (wrongly) keyed on tailId, self IS in that cluster → no redirect.
 			const tailKeyed = await service.checkRedirect('tail-Z', 'commit', message);
 			expect(tailKeyed, 'keying on tailId would not redirect (self in tail cluster)').to.be.null;
+		});
+	});
+
+	// End-to-end: derive the pend key, then redirect-check it on a large multi-cluster mesh.
+	// The bug: pend was keyed on Object.keys(transforms)[0] — a structural field name
+	// ('inserts'/'updates'/'deletes'), NOT a block id. The key must be
+	// blockIdsForTransforms(transforms)[0]. This path the existing pend suite never hits.
+	describe('pend redirect keys on blockIdsForTransforms(...)[0] (large mesh)', () => {
+		it('redirects toward block-A cluster; would NOT redirect if keyed on the structural field name', async () => {
+			const self = await makePeerId();
+			const blockACoordinator = await makePeerId();
+			const otherMember = await makePeerId();
+
+			// block-A's cluster excludes self (large enough to trip the redirect);
+			// the structural-field-name key 'inserts' falls through to the fallback cluster,
+			// which INCLUDES self (so keying on 'inserts' would NOT redirect).
+			const byKey = new Map<string, PeerId[]>();
+			byKey.set(await blockKeyDigest('block-A'), [blockACoordinator, otherMember]); // self NOT a member
+			const nm = makeKeyedNetworkManager(byKey, [self]);                            // fallback includes self
+
+			const service = new RepoService(
+				makeComponents({ repo: makeStubRepo(), peerId: self, networkManager: nm }),
+				{ responsibilityK: 2 } // cluster.length (2) >= K → not a small mesh
+			);
+
+			const message: RepoMessage = {
+				operations: [{ pend: { transforms: { inserts: { 'block-A': makeBlock('block-A') }, updates: {}, deletes: [] }, actionId: 'a1' } as any }]
+			};
+			const { blockKey } = service.deriveBlockKey(message.operations[0]);
+			expect(blockKey).to.equal('block-A');
+
+			const result = await service.checkRedirect(blockKey!, 'pend', message);
+
+			// Redirect MUST fire (self not in block-A's cluster) and target block-A's cluster.
+			expect(result, 'redirect should fire when keyed on blockIdsForTransforms(...)[0]').to.not.be.null;
+			expect(result!.redirect.reason).to.equal('not_in_cluster');
+			const peerIds = result!.redirect.peers.map(p => p.id);
+			expect(peerIds).to.include(blockACoordinator.toString());
+			expect(peerIds).to.not.include(self.toString());
+
+			// Sanity: had it (wrongly) keyed on the structural field name 'inserts', that key
+			// hits the fallback cluster which includes self → no redirect (the misroute the fix removes).
+			const fieldKeyed = await service.checkRedirect('inserts', 'pend', message);
+			expect(fieldKeyed, 'keying on the structural field name would not redirect (self in fallback cluster)').to.be.null;
 		});
 	});
 });
