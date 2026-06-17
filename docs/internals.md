@@ -172,11 +172,18 @@ StorageRepo.onAnyCollectionChange        # catch-all feed (every collection, not
   When enabled, a missing FRET service or a host-construction failure **hard-fails** node startup
   (the operator opted in). Node teardown releases the catch-all subscription and stops the host
   (clearing the gossip timer, unhandling the protocols) before transports close.
-  - **Still consumer-gated.** "Live" means the bridge *invokes* `onLocalCommit` whenever a
-    consumer has attached one; until the reactivity origination wiring
-    (`reactivity-origination-replay-delivery`'s `ReactivityOriginationManager` + the
-    notification-emit transport) installs `onLocalCommit` and builds `NotificationV1` from
-    `(event, commitCert)`, the bridge no-ops at its `if (!hook) return;` guard.
+  - **Now end-to-end live** (`reactivity-notification-transport`). The enabled block also composes
+    the reactivity notification transport onto the host: a `ReactivityOriginationManager` installs
+    `onLocalCommit` (so the bridge's invocation builds a `NotificationV1` from `(event, commitCert)`),
+    a `ReactivityForwarderHost` fans that frame out over the `/optimystic/reactivity/1.0.0/notify`
+    protocol to direct subscribers + child cohorts, inbound notify frames route by topic to a
+    node-level `ReactivitySubscriberRegistry` (exposed as `node.reactivitySubscribers`) for the
+    subscriber role, and a `ReactivityPushStateGossipDriver` rides the host's cohort gossip transport
+    for intra-cohort push-state convergence. The subscriber-id / dial-target space is the canonical
+    peer-id string (the transport dials with `peerIdFromString`). Teardown stops the gossip timer,
+    unsubscribes the inbound notify handler, and unhandles the reactivity protocols before the host
+    stops. (The Quereus `Database.watch` → subscription-manager bridge that *constructs* subscribers
+    remains the backlog `optimystic-network-reactive-watch-integration-test`.)
 
 ## Mutation Contracts
 
