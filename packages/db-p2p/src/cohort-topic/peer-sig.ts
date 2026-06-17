@@ -31,6 +31,38 @@ export async function signPeer(privateKey: PrivateKey, payload: Uint8Array): Pro
 }
 
 /**
+ * Sign `payload` with a libp2p Ed25519 peer key **synchronously** — the mirror of the synchronous
+ * {@link verifyPeerSig}. Use this where the signer seam is synchronous and the async {@link signPeer}
+ * cannot be awaited: e.g. the reactivity recover `signBackfill` / `signResume` `(unsigned) => string`
+ * ports, whose db-core driver builds the unsigned image internally (so a pre-signed value is impossible)
+ * and whose seam shape is `=> string`, not `=> Promise<string>`.
+ *
+ * libp2p's own `PrivateKey.sign` is async (Node / WebCrypto Ed25519), so this signs directly with
+ * `@noble/curves/ed25519` over the raw 32-byte seed. libp2p stores an Ed25519 private key as 64 bytes
+ * (`raw` = 32-byte seed ‖ 32-byte public key); noble's `ed25519.sign(message, secretKey)` takes the
+ * 32-byte seed. noble's signatures are RFC8032-compliant and deterministic, so both verify paths accept
+ * them: the libp2p `publicKeyFromRaw(raw).verify` (Node / WebCrypto) and the synchronous
+ * {@link verifyPeerSig} (noble, ZIP215) — symmetric with the verify direction's cross-acceptance, and
+ * byte-identical to what the async {@link signPeer} would produce for the same key + payload.
+ *
+ * Assumes an Ed25519 identity (the cohort-topic substrate's standing assumption). Throws on a
+ * non-Ed25519 key or an unexpected raw length — a programming error on the node's own key, never
+ * attacker-reachable input (the verify side, by contrast, is total and returns `false`).
+ */
+export function signPeerSig(privateKey: PrivateKey, payload: Uint8Array): Uint8Array {
+	if (privateKey.type !== "Ed25519") {
+		throw new Error(`signPeerSig: expected an Ed25519 private key, got "${privateKey.type}"`);
+	}
+	const raw = privateKey.raw;
+	// 64-byte libp2p form = seed ‖ public key; accept a bare 32-byte seed too.
+	const seed = raw.length === 64 ? raw.subarray(0, 32) : raw;
+	if (seed.length !== 32) {
+		throw new Error(`signPeerSig: expected a 32- or 64-byte Ed25519 raw key, got ${raw.length} bytes`);
+	}
+	return ed25519.sign(payload, seed);
+}
+
+/**
  * Verify an Ed25519 peer-key signature synchronously. `signer` is the cohort-wire member id — the
  * UTF-8 bytes of the peer-id string (see {@link bytesToPeerIdString}) — or that peer-id string
  * directly. Returns `false` (never throws) on a non-Ed25519 id, a missing/short key, a malformed

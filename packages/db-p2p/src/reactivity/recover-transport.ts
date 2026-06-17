@@ -33,10 +33,11 @@
  */
 
 import type { Libp2p } from "libp2p";
-import type { PeerId } from "@libp2p/interface";
+import type { PeerId, PrivateKey } from "@libp2p/interface";
 import { peerIdFromString } from "@libp2p/peer-id";
 import {
 	b64urlToBytes,
+	bytesToB64url,
 	reactivityTopicId,
 	serveBackfill,
 	serveResume,
@@ -48,7 +49,9 @@ import {
 	decodeRecoverReplyV1,
 	type BackfillV1,
 	type BackfillReplyV1,
+	type BackfillSignable,
 	type ResumeV1,
+	type ResumeSignable,
 	type RecoverKind,
 	type RecoverReplyV1,
 	type BackfillTransport,
@@ -57,7 +60,7 @@ import {
 	type CorrelationReplayGuard,
 } from "@optimystic/db-core";
 import { requestResponse, handleRequestResponse, DEFAULT_STREAM_MAX_BYTES } from "../cohort-topic/stream-util.js";
-import { verifyPeerSig } from "../cohort-topic/peer-sig.js";
+import { verifyPeerSig, signPeerSig } from "../cohort-topic/peer-sig.js";
 import { peerIdToBytes, bytesToPeerIdString } from "../cohort-topic/peer-codec.js";
 import { PROTOCOL_REACTIVITY_RECOVER } from "./protocols.js";
 import type { ResumeTransport } from "./subscription-manager.js";
@@ -72,6 +75,38 @@ const log = createLogger("reactivity-recover");
  */
 export function decodeCohortHintTarget(primary: string): string {
 	return bytesToPeerIdString(b64urlToBytes(primary));
+}
+
+// --- subscriber request signing (the manager's synchronous signer seam) ---
+
+/**
+ * The synchronous request-signing seam the production subscribe factory feeds a
+ * {@link import("./subscription-manager.js").ReactivitySubscriptionManager}: it builds a
+ * {@link BackfillV1} / {@link ResumeV1} signature (base64url) over the unsigned image.
+ */
+export interface RecoverRequestSigners {
+	/** Sign a {@link BackfillV1} over {@link backfillSigningPayload} of its unsigned image. */
+	readonly signBackfill: (unsigned: BackfillSignable) => string;
+	/** Sign a {@link ResumeV1} over {@link resumeSigningPayload} of its unsigned image. */
+	readonly signResume: (unsigned: ResumeSignable) => string;
+}
+
+/**
+ * Build the subscriber's recover request signers from the node's libp2p Ed25519 private key.
+ *
+ * This resolves the recover wiring's one design point: the subscription-manager `signBackfill` /
+ * `signResume` ports are **synchronous** (`(unsigned) => string`) — the db-core driver builds the
+ * unsigned image internally, so a pre-signed value is impossible — but libp2p `PrivateKey.sign` is
+ * **async**. Rather than make the seam (and `createBackfillRequester`'s `sign`, a db-core change) async,
+ * sign with the synchronous {@link signPeerSig} (noble, over the raw Ed25519 seed) over db-core's
+ * canonical signing payloads. The produced signature verifies on the serving side under
+ * {@link verifyPeerSig} over the same bytes (both noble, RFC8032), so the round trip is symmetric.
+ */
+export function createRecoverRequestSigners(privateKey: PrivateKey): RecoverRequestSigners {
+	return {
+		signBackfill: (unsigned: BackfillSignable): string => bytesToB64url(signPeerSig(privateKey, backfillSigningPayload(unsigned))),
+		signResume: (unsigned: ResumeSignable): string => bytesToB64url(signPeerSig(privateKey, resumeSigningPayload(unsigned))),
+	};
 }
 
 // --- outbound transport ---
