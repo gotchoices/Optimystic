@@ -275,4 +275,62 @@ describe('reactivity / push-state gossip driver', () => {
 		expect(() => driver.round()).to.not.throw();
 		expect(transport.broadcasts).to.have.length(0);
 	});
+
+	it('broadcasts every live collection in a round and isolates a per-collection failure', () => {
+		// One collection's broadcast blows up (e.g. peer resolution fails for its coord); the round must
+		// still gossip the collections before and after it, never aborting the whole tick.
+		const before = makePushState();
+		ingest(before, 1);
+		const after = makePushState();
+		ingest(after, 2);
+		const BAD_COORD: RingCoord = new Uint8Array([0xba, 0xad]);
+
+		class FlakyTransport extends FakeGossipTransport {
+			override broadcastOver(protocol: string, coord: RingCoord, frame: Uint8Array): void {
+				if (coord[0] === 0xba) {
+					throw new Error('peer resolution blew up for this coord');
+				}
+				super.broadcastOver(protocol, coord, frame);
+			}
+		}
+
+		const transport = new FlakyTransport();
+		const driver = makeDriver(transport, {
+			live: [
+				{ pushState: before, cohortCoord: COORD },
+				{ pushState: after, cohortCoord: BAD_COORD }, // throws — isolated
+				{ pushState: after, cohortCoord: COORD },
+			],
+		});
+
+		expect(() => driver.round()).to.not.throw();
+		// The failing collection is skipped; the two good coords still broadcast.
+		expect(transport.broadcasts).to.have.length(2);
+		expect(transport.broadcasts.every((b) => b.coord[0] === 0xc0)).to.equal(true);
+	});
+
+	it('stops mid-round when stop() lands during iteration (the stopped break)', () => {
+		const first = makePushState();
+		ingest(first, 1);
+		const second = makePushState();
+		ingest(second, 2);
+
+		const transport = new FakeGossipTransport();
+		let driver: ReactivityPushStateGossipDriver;
+		// A generator that stops the driver after the first collection is consumed: the loop's mid-iteration
+		// `stopped` check must then break before broadcasting the second.
+		const live = function* (): Generator<ReactivityGossipCollection> {
+			yield { pushState: first, cohortCoord: COORD };
+			driver.stop();
+			yield { pushState: second, cohortCoord: COORD };
+		};
+		driver = new ReactivityPushStateGossipDriver({
+			gossipTransport: transport,
+			liveCollections: () => live(),
+			pushStateForGossip: (): PushState | undefined => undefined,
+		});
+
+		driver.round();
+		expect(transport.broadcasts, 'only the pre-stop collection was broadcast').to.have.length(1);
+	});
 });
