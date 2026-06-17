@@ -26,6 +26,7 @@ import {
 	asObject,
 	b64urlField,
 	failWire,
+	reqFiniteNumber,
 	reqIntInRange,
 	reqString,
 	requireV1,
@@ -43,6 +44,12 @@ export interface BackfillV1 {
 	fromRevision: number;
 	/** Inclusive high edge of the requested range. */
 	toRevision: number;
+	/**
+	 * Unix ms — bound into {@link backfillSigningPayload} so the request's freshness is authenticated.
+	 * The serving handler's replay guard keys on the signature + this timestamp, so a captured request
+	 * cannot be replayed with a forged-fresh timestamp (the forged value invalidates the signature).
+	 */
+	timestamp: number;
 	/** Subscriber peer-key signature over the request. */
 	signature: string;
 }
@@ -71,8 +78,33 @@ export function validateBackfillV1(value: unknown): BackfillV1 {
 		collectionId: b64urlField(reqString(obj, "collectionId", what), "collectionId", what),
 		fromRevision,
 		toRevision,
+		timestamp: reqFiniteNumber(obj, "timestamp", what),
 		signature: b64urlField(reqString(obj, "signature", what), "signature", what),
 	};
+}
+
+const utf8 = new TextEncoder();
+
+/** A {@link BackfillV1} minus its `signature` — the canonical bytes the subscriber peer-key-signs. */
+export type BackfillSignable = Omit<BackfillV1, "signature">;
+
+/**
+ * Canonical signed byte image of a {@link BackfillV1} (every field except `signature`). Mirrors the
+ * cohort-topic `registerSigningPayload` pattern: determinism comes from encoding an explicitly-ordered,
+ * type-tagged JSON array (array order is stable; object key order is not) as UTF-8. The leading
+ * `"BackfillV1"` tag means a backfill image can never collide with the `"ResumeV1"` image even when the
+ * shared fields are identical. Signer and verifier must agree byte-for-byte — the array order is the
+ * contract (pinned by the determinism test).
+ */
+export function backfillSigningPayload(body: BackfillSignable): Uint8Array {
+	return utf8.encode(JSON.stringify([
+		"BackfillV1",
+		body.v,
+		body.collectionId,
+		body.fromRevision,
+		body.toRevision,
+		body.timestamp,
+	]));
 }
 
 /** Narrow an already-parsed value to {@link BackfillReplyV1}, throwing on any defect. */
@@ -146,6 +178,8 @@ export interface BackfillRequesterDeps {
 	readonly transport: BackfillTransport;
 	/** Re-enter each backfilled entry through the delivery path (verify → contiguity → deliver → dedupe). */
 	readonly subscriber: ReactivitySubscriber;
+	/** Unix-ms clock stamped into the signed `timestamp` (injected — db-core proper never reads an ambient clock). */
+	readonly clock: () => number;
 	/**
 	 * Called when the cohort's `available` window does not reach the gap's low edge (`available.fromRevision
 	 * > from`): the buffer no longer covers the gap, so the subscriber must escalate to a checkpoint resume
@@ -165,7 +199,7 @@ export interface BackfillRequesterDeps {
  */
 export function createBackfillRequester(deps: BackfillRequesterDeps): (from: number, to: number) => Promise<BackfillReplyV1> {
 	return async (from: number, to: number): Promise<BackfillReplyV1> => {
-		const unsigned: Omit<BackfillV1, "signature"> = { v: 1, collectionId: deps.collectionId, fromRevision: from, toRevision: to };
+		const unsigned: Omit<BackfillV1, "signature"> = { v: 1, collectionId: deps.collectionId, fromRevision: from, toRevision: to, timestamp: deps.clock() };
 		const req: BackfillV1 = { ...unsigned, signature: deps.sign(unsigned) };
 		const reply = await deps.transport(req);
 		// Underflow: the cohort's held window does not reach the gap's low edge (`docs/reactivity.md`

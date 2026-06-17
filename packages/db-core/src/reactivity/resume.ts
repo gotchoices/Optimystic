@@ -148,6 +148,32 @@ export function validateResumeReplyV1(value: unknown): ResumeReplyV1 {
 	return out;
 }
 
+// --- canonical signing payload ---
+
+const utf8 = new TextEncoder();
+
+/** A {@link ResumeV1} minus its `signature` — the canonical bytes the subscriber peer-key-signs. */
+export type ResumeSignable = Omit<ResumeV1, "signature">;
+
+/**
+ * Canonical signed byte image of a {@link ResumeV1} (every field except `signature`). Mirrors
+ * {@link import("./backfill.js").backfillSigningPayload}: an explicitly-ordered, type-tagged JSON array
+ * encoded as UTF-8. The `"ResumeV1"` tag means a resume image can never collide with the `"BackfillV1"`
+ * image. `subscriberCoord` is part of the image, so a verifier recomputes over whatever coordinate the
+ * request carries — the field order is the byte-for-byte contract between signer and verifier.
+ */
+export function resumeSigningPayload(body: ResumeSignable): Uint8Array {
+	return utf8.encode(JSON.stringify([
+		"ResumeV1",
+		body.v,
+		body.collectionId,
+		body.fromRevision,
+		body.latestKnownTailId,
+		body.subscriberCoord,
+		body.timestamp,
+	]));
+}
+
 // --- codecs (length-framed JSON, mirroring the rest of reactivity) ---
 
 /** Encode a {@link ResumeV1} as a length-prefixed UTF-8 JSON frame. */

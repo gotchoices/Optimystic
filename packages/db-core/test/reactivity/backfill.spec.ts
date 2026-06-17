@@ -20,6 +20,7 @@ import { CohortWireError } from '../../src/cohort-topic/wire/validate.js';
 const COLLECTION = bytesToB64url(new Uint8Array([1, 2, 3, 4]));
 const TAIL = bytesToB64url(new Uint8Array([2, 2, 2, 2]));
 const SIG = bytesToB64url(new Uint8Array([9, 9]));
+const TS = 1_700_000_000_500;
 
 function note(revision: number): NotificationV1 {
 	return {
@@ -52,8 +53,18 @@ class FakeVerifier implements NotificationVerifier {
 describe('reactivity backfill', () => {
 	describe('wire codecs', () => {
 		it('round-trips a BackfillV1 request', () => {
-			const req: BackfillV1 = { v: 1, collectionId: COLLECTION, fromRevision: 11, toRevision: 14, signature: SIG };
+			const req: BackfillV1 = { v: 1, collectionId: COLLECTION, fromRevision: 11, toRevision: 14, timestamp: TS, signature: SIG };
 			expect(decodeBackfillV1(encodeBackfillV1(req))).to.deep.equal(req);
+		});
+
+		it('rejects a request missing the timestamp', () => {
+			const bad = { v: 1, collectionId: COLLECTION, fromRevision: 11, toRevision: 14, signature: SIG };
+			expect(() => encodeBackfillV1(bad as BackfillV1)).to.throw(CohortWireError, /timestamp/);
+		});
+
+		it('rejects a non-finite timestamp', () => {
+			const bad = { v: 1, collectionId: COLLECTION, fromRevision: 11, toRevision: 14, timestamp: Number.NaN, signature: SIG };
+			expect(() => encodeBackfillV1(bad as BackfillV1)).to.throw(CohortWireError, /timestamp/);
 		});
 
 		it('round-trips a BackfillReplyV1 with the available window', () => {
@@ -66,39 +77,39 @@ describe('reactivity backfill', () => {
 		});
 
 		it('rejects a request whose toRevision precedes fromRevision', () => {
-			const bad = { v: 1, collectionId: COLLECTION, fromRevision: 14, toRevision: 11, signature: SIG };
+			const bad = { v: 1, collectionId: COLLECTION, fromRevision: 14, toRevision: 11, timestamp: TS, signature: SIG };
 			expect(() => encodeBackfillV1(bad as BackfillV1)).to.throw(CohortWireError, /toRevision/);
 		});
 
 		it('rejects a non-base64url collectionId', () => {
-			const bad = { v: 1, collectionId: '!!bad!!', fromRevision: 1, toRevision: 2, signature: SIG };
+			const bad = { v: 1, collectionId: '!!bad!!', fromRevision: 1, toRevision: 2, timestamp: TS, signature: SIG };
 			expect(() => encodeBackfillV1(bad as BackfillV1)).to.throw(CohortWireError, /base64url/);
 		});
 	});
 
 	describe('serveBackfill (intersection with the replay ring)', () => {
 		it('returns the full requested range when the ring covers it, reporting the held window', () => {
-			const reply = serveBackfill(bufferWith([10, 11, 12, 13, 14, 15]), { v: 1, collectionId: COLLECTION, fromRevision: 11, toRevision: 14, signature: SIG }, COLLECTION);
+			const reply = serveBackfill(bufferWith([10, 11, 12, 13, 14, 15]), { v: 1, collectionId: COLLECTION, fromRevision: 11, toRevision: 14, timestamp: TS, signature: SIG }, COLLECTION);
 			expect(reply.entries.map((e) => e.revision)).to.deep.equal([11, 12, 13, 14]);
 			expect(reply.available).to.deep.equal({ fromRevision: 10, toRevision: 15 });
 		});
 
 		it('returns only the intersection for a sub-range request that overruns the ring low edge', () => {
 			// The subscriber's lag fell past the ring's low edge: it asks [5,12] but the ring only holds [10,15].
-			const reply = serveBackfill(bufferWith([10, 11, 12, 13, 14, 15]), { v: 1, collectionId: COLLECTION, fromRevision: 5, toRevision: 12, signature: SIG }, COLLECTION);
+			const reply = serveBackfill(bufferWith([10, 11, 12, 13, 14, 15]), { v: 1, collectionId: COLLECTION, fromRevision: 5, toRevision: 12, timestamp: TS, signature: SIG }, COLLECTION);
 			expect(reply.entries.map((e) => e.revision)).to.deep.equal([10, 11, 12]);
 			// `available.fromRevision` (10) > requested.from (5) tells the subscriber to fall back further.
 			expect(reply.available).to.deep.equal({ fromRevision: 10, toRevision: 15 });
 		});
 
 		it('returns an empty intersection (and a collapsed available) for an empty ring', () => {
-			const reply = serveBackfill(createReplayBuffer(256), { v: 1, collectionId: COLLECTION, fromRevision: 11, toRevision: 14, signature: SIG }, COLLECTION);
+			const reply = serveBackfill(createReplayBuffer(256), { v: 1, collectionId: COLLECTION, fromRevision: 11, toRevision: 14, timestamp: TS, signature: SIG }, COLLECTION);
 			expect(reply.entries).to.have.length(0);
 			expect(reply.available).to.deep.equal({ fromRevision: 11, toRevision: 11 });
 		});
 
 		it('rejects a request for a different collection', () => {
-			expect(() => serveBackfill(bufferWith([10, 11]), { v: 1, collectionId: bytesToB64url(new Uint8Array([9])), fromRevision: 10, toRevision: 11, signature: SIG }, COLLECTION)).to.throw(CohortWireError, /collectionId/);
+			expect(() => serveBackfill(bufferWith([10, 11]), { v: 1, collectionId: bytesToB64url(new Uint8Array([9])), fromRevision: 10, toRevision: 11, timestamp: TS, signature: SIG }, COLLECTION)).to.throw(CohortWireError, /collectionId/);
 		});
 	});
 
@@ -122,6 +133,7 @@ describe('reactivity backfill', () => {
 					return Promise.resolve(serveBackfill(bufferWith([10, 11, 12, 13, 14]), req, COLLECTION));
 				},
 				subscriber: sub,
+				clock: () => TS,
 			});
 
 			// A gap arrives (10 → 14): the subscriber records the gap; the requester then replays 11..14.
@@ -129,6 +141,8 @@ describe('reactivity backfill', () => {
 			expect(gaps).to.deep.equal([[11, 14]]);
 			const reply = await requester(...gaps[0]!);
 			expect(sentReq?.signature).to.be.a('string');
+			expect(sentReq?.timestamp).to.equal(TS); // stamped from the injected clock into the signed image
+
 			expect(reply.entries.map((e) => e.revision)).to.deep.equal([11, 12, 13, 14]);
 			expect(delivered).to.deep.equal([11, 12, 13, 14]);
 			expect(sub.lastRevision).to.equal(14);
@@ -143,6 +157,7 @@ describe('reactivity backfill', () => {
 				// Ring only holds [10,15]; the subscriber asks from 5 → the reply underflows.
 				transport: (req) => Promise.resolve(serveBackfill(bufferWith([10, 11, 12, 13, 14, 15]), req, COLLECTION)),
 				subscriber: sub,
+				clock: () => TS,
 				onUnderflow: (requested, available) => underflows.push({ from: requested.from, available }),
 			});
 			const reply = await requester(5, 12);
@@ -170,6 +185,7 @@ describe('reactivity backfill', () => {
 				sign: () => SIG,
 				transport: (req) => { transportCalls++; return Promise.resolve(serveBackfill(bufferWith([10, 11, 12, 13, 14, 15]), req, COLLECTION)); },
 				subscriber: sub,
+				clock: () => TS,
 				onUnderflow: () => {},
 			});
 

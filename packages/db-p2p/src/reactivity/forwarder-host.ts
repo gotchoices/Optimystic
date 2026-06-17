@@ -231,6 +231,28 @@ export class ReactivityForwarderHost {
 	}
 
 	/**
+	 * The live {@link PushState} this node serves for `collectionId` (base64url), or `undefined` if none.
+	 * The served map is keyed by **topicId**, but a backfill request carries only a collectionId and a
+	 * resume that lost its tail must still resolve the collection's current tail — so this scans for the
+	 * served topic whose `PushState.collectionId` matches. Across a tail-rotation **drain window** a
+	 * collection can briefly have two served topics (the outgoing and incoming tail); the one with the
+	 * highest `lastRevision` is the current tail, so that is the one returned. (The precise drain-window
+	 * redirect choreography is `reactivity-tail-rotation-transport`'s; this picks the current tail.)
+	 */
+	pushStateForCollection(collectionId: string): PushState | undefined {
+		let best: PushState | undefined;
+		for (const served of this.served.values()) {
+			if (served === null || served.pushState.collectionId !== collectionId) {
+				continue;
+			}
+			if (best === undefined || served.pushState.lastRevision > best.lastRevision) {
+				best = served.pushState;
+			}
+		}
+		return best;
+	}
+
+	/**
 	 * Fan the unmodified frame out: reconcile (GC) departed-subscriber queues, enqueue per-subscriber
 	 * (drop-oldest under pressure), drain each queue and deliver (self in-process, others dialed, per-target
 	 * isolated), then dial each resolved child cohort. One slow/dead target never blocks the loop for the rest.

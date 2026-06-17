@@ -29,5 +29,6 @@ export * from "./subscriber.js";
 export * from "./subscription.js";
 export * from "./backfill.js";
 export * from "./resume.js";
+export * from "./recover.js";
 export * from "./rotation.js";
 export * from "./policy.js";

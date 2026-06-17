@@ -16,6 +16,7 @@ import {
 	DEFAULT_REACTIVITY_PROTOCOLS,
 	PROTOCOL_REACTIVITY_NOTIFY,
 	PROTOCOL_REACTIVITY_PUSH_STATE_GOSSIP,
+	PROTOCOL_REACTIVITY_RECOVER,
 	REACTIVITY_BASE,
 	makeReactivityProtocols,
 	reactivityProtocolList,
@@ -253,6 +254,7 @@ describe('reactivity / protocol family', () => {
 		expect(reactivityProtocolList(DEFAULT_REACTIVITY_PROTOCOLS)).to.deep.equal([
 			PROTOCOL_REACTIVITY_NOTIFY,
 			PROTOCOL_REACTIVITY_PUSH_STATE_GOSSIP,
+			PROTOCOL_REACTIVITY_RECOVER,
 		]);
 	});
 });

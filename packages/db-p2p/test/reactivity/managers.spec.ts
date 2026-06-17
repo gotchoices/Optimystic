@@ -251,8 +251,36 @@ describe('reactivity / subscription manager', () => {
 			expect(sentReqs).to.have.length(1);
 			expect(sentReqs[0]!.fromRevision).to.equal(11);
 			expect(sentReqs[0]!.signature).to.be.a('string');
+			expect(sentReqs[0]!.timestamp).to.be.a('number'); // stamped from the manager clock into the signed image
 			expect(delivered).to.deep.equal([11, 12, 13, 14]);
 			expect(manager.lastRevision).to.equal(14);
+		});
+
+		it('retries then escalates to resume() when the backfill transport keeps failing (no unhandled rejection)', async () => {
+			const service = new RecordingService(new FixedVerifier('verified'));
+			let backfillCalls = 0;
+			let resumeReqs = 0;
+			let resolveResume!: () => void;
+			const resumeCalled = new Promise<void>((r) => { resolveResume = r; });
+			const manager = new ReactivitySubscriptionManager({
+				service,
+				collectionId: COLLECTION,
+				tailIdAtAttach: TAIL,
+				deliver: () => {},
+				lastKnownRev: 10,
+				backfillMaxRetries: 1,
+				signBackfill: () => bytesToB64url(new Uint8Array([1])),
+				backfillTransport: () => { backfillCalls++; return Promise.reject(new Error('dial failed')); },
+				signResume: () => bytesToB64url(new Uint8Array([2])),
+				resumeTransport: () => { resumeReqs++; resolveResume(); return Promise.resolve({ v: 1, result: 'backfill', entries: [], currentRevision: 14 } as ResumeReplyV1); },
+				clock: () => 1_700_000_000_999,
+			});
+
+			// The gap seam never faults the delivery path even when every backfill attempt rejects.
+			expect(await manager.onNotification(noteB64(14))).to.equal('gap');
+			await resumeCalled;
+			expect(backfillCalls).to.be.greaterThan(1); // initial attempt + at least one retry before escalating
+			expect(resumeReqs).to.equal(1); // escalated to a resume once the bounded retries were exhausted
 		});
 	});
 
@@ -285,6 +313,24 @@ describe('reactivity / subscription manager', () => {
 			expect(sent!.fromRevision).to.equal(18); // lastKnownRev 17 + 1
 			expect(sent!.latestKnownTailId).to.equal(bytesToB64url(TAIL));
 			expect(delivered).to.deep.equal([18, 19]);
+		});
+
+		it('signs the supplied ring coordinate into the ResumeV1 (not the collectionId placeholder)', async () => {
+			const RING_COORD = bytesToB64url(new Uint8Array([0xc0, 0x0c]));
+			let sent: ResumeV1 | undefined;
+			const reply: ResumeReplyV1 = { v: 1, result: 'out_of_window', currentTailId: bytesToB64url(TAIL), currentRevision: 18 };
+			const manager = makeManager({ subscriberCoord: RING_COORD, resumeTransport: (req) => { sent = req; return Promise.resolve(reply); } });
+			await manager.resume();
+			expect(sent!.subscriberCoord).to.equal(RING_COORD);
+			expect(sent!.subscriberCoord).to.not.equal(bytesToB64url(COLLECTION));
+		});
+
+		it('falls back to the collectionId placeholder for subscriberCoord when none is supplied', async () => {
+			let sent: ResumeV1 | undefined;
+			const reply: ResumeReplyV1 = { v: 1, result: 'out_of_window', currentTailId: bytesToB64url(TAIL), currentRevision: 18 };
+			const manager = makeManager({ resumeTransport: (req) => { sent = req; return Promise.resolve(reply); } });
+			await manager.resume();
+			expect(sent!.subscriberCoord).to.equal(bytesToB64url(COLLECTION));
 		});
 
 		it('invalidates the sticky cohort-hint cache and escalates on a tail_rotated reply', async () => {

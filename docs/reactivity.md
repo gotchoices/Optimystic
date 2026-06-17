@@ -336,13 +336,17 @@ The checkpoint is *not* a replacement for the source-of-truth chain; it is a hin
 
 ### Backfill RPC
 
-> **Implemented** (`11.5-reactivity-backfill-resume-checkpoints`). `serveBackfill` (cohort side) and
-> `createBackfillRequester` (subscriber side, the `requestBackfill` seam ↔ RPC) live in
-> `packages/db-core/src/reactivity/backfill.ts`; db-p2p's `ReactivitySubscriptionManager` wires the
-> requester to the subscriber's gap-detection seam when a backfill transport is supplied.
+> **Implemented** (`11.5-reactivity-backfill-resume-checkpoints`; wire signing + envelope by
+> `reactivity-recover-wire-signing`; live libp2p transport by `reactivity-recover-rpc-transport`).
+> `serveBackfill` (cohort side) and `createBackfillRequester` (subscriber side, the `requestBackfill`
+> seam ↔ RPC) live in `packages/db-core/src/reactivity/backfill.ts`; db-p2p's
+> `ReactivitySubscriptionManager` wires the requester to the subscriber's gap-detection seam when a
+> backfill transport is supplied. The request is peer-key-signed over `backfillSigningPayload` and the
+> live transport (`Libp2pReactivityRecoverTransport` / the recover protocol handler in
+> `packages/db-p2p/src/reactivity/recover-transport.ts`) carries it over libp2p.
 
 ```
-BackfillV1 { v, collectionId, fromRevision, toRevision, signature }
+BackfillV1 { v, collectionId, fromRevision, toRevision, timestamp, signature }
 BackfillReplyV1 { v, entries: NotificationV1[], available: { fromRevision, toRevision } }
 ```
 
@@ -399,7 +403,8 @@ For collections with `block_fill_size = 64` and one commit per minute, rotation 
 ## Authentication and integrity
 
 - **Notifications** carry the tail cohort's threshold signature, which *is* the commit certificate from the transaction layer. Signature verification uses the standard cohort-topic membership-snapshot path ([cohort-topic.md §Membership snapshots](cohort-topic.md#membership-snapshots-and-signature-verification)).
-- **Subscribe / renew / resume RPCs** are signed by the subscriber's peer key and include `correlationId` and `timestamp`; replay protection is handled by the cohort-topic layer.
+- **Subscribe / renew RPCs** are signed by the subscriber's peer key and include `correlationId` and `timestamp`; replay protection is handled by the cohort-topic layer (they ride a real `RegisterV1`/`RenewV1` envelope).
+- **Recover RPCs (`BackfillV1` / `ResumeV1`)** are signed by the subscriber's peer key over a canonical signing payload (`backfillSigningPayload` / `resumeSigningPayload` — an explicitly-ordered, type-tagged JSON array, mirroring the cohort-topic `registerSigningPayload`). The serving handler verifies the signature against the **dialing peer** (the dialer's peer id *is* the signer — no signer-id field on the wire) and runs a node-level `CorrelationReplayGuard` keyed on the **signature bytes** + the request `timestamp` (the signature is a unique, authenticated token, so no separate `correlationId` is needed). A captured request cannot be replayed with a forged-fresh timestamp — the forged value invalidates the signature.
 - **Rotation hints** are part of the notification payload and inherit its signature.
 - **Forwarder cohorts do not re-sign.** They pass through the original threshold signature unchanged.
 - **Replay-buffer entries** retain the original signature. Backfill responses are verifiable end-to-end.
@@ -468,6 +473,9 @@ Cohort-topic's promotion machinery handles this with `cap_promote_fast`: when th
 > signature, so the payload itself carries no signature); `NotificationV1` is a length-prefixed frame.
 > The `ResumeV1` / `ResumeReplyV1` / `BackfillV1` / `BackfillReplyV1` codecs below are implemented in
 > `resume.ts` / `backfill.ts` by `11.5-reactivity-backfill-resume-checkpoints`, same conventions.
+> `reactivity-recover-wire-signing` added the `timestamp` freshness field on `BackfillV1`, the canonical
+> `backfillSigningPayload` / `resumeSigningPayload` helpers, and the `RecoverRequestV1` / `RecoverReplyV1`
+> envelope (`recover.ts`) that the live recover transport frames over the wire.
 
 Reactivity reuses the cohort-topic layer's `RegisterV1`, `RenewV1`, etc., with a reactivity-specific `appPayload`:
 
@@ -553,7 +561,8 @@ interface BackfillV1 {
   collectionId:  string
   fromRevision:  number
   toRevision:    number
-  signature:     string
+  timestamp:     number               // unix-ms, bound into backfillSigningPayload (freshness)
+  signature:     string               // peer-key sig over backfillSigningPayload(unsigned)
 }
 
 interface BackfillReplyV1 {
@@ -564,6 +573,19 @@ interface BackfillReplyV1 {
     toRevision:   number
   }
 }
+```
+
+### Recover envelope
+
+The backfill and resume exchanges share one libp2p **request-reply** protocol
+(`/optimystic/reactivity/1.0.0/recover`); a discriminated wrapper makes the kind authoritative (a
+`kind: "backfill"` frame MUST carry a `backfill` body and no `resume` body, and vice-versa). The codecs
+are `encode/decodeRecoverRequestV1` / `encode/decodeRecoverReplyV1` in
+`packages/db-core/src/reactivity/recover.ts`.
+
+```
+interface RecoverRequestV1 { v: 1, kind: "backfill" | "resume", backfill?: BackfillV1, resume?: ResumeV1 }
+interface RecoverReplyV1   { v: 1, kind: "backfill" | "resume", backfillReply?: BackfillReplyV1, resumeReply?: ResumeReplyV1 }
 ```
 
 ---

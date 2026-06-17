@@ -79,7 +79,7 @@ class FakeGossipTransport {
 
 /** The full set of revisions a push-state can serve from its replay ring (via the real `serveBackfill`). */
 function served(state: PushState, collectionId = COLLECTION): number[] {
-	const req: BackfillV1 = { v: 1, collectionId, fromRevision: 0, toRevision: 1_000_000, signature: SIG };
+	const req: BackfillV1 = { v: 1, collectionId, fromRevision: 0, toRevision: 1_000_000, timestamp: 1_700_000_000_000, signature: SIG };
 	return serveBackfill(state.replayBuffer, req, collectionId).entries.map((e) => e.revision);
 }
 

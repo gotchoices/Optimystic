@@ -48,6 +48,9 @@ import {
 	type RejoinJitter,
 	type ReRegistrationPlan,
 } from "@optimystic/db-core";
+import { createLogger } from "../logger.js";
+
+const log = createLogger("reactivity-subscription");
 
 /** Sends a {@link ResumeV1} to the serving cohort and awaits its classified {@link ResumeReplyV1}. */
 export type ResumeTransport = (req: ResumeV1) => Promise<ResumeReplyV1>;
@@ -94,8 +97,22 @@ export interface ReactivitySubscriptionManagerOptions {
 	readonly resumeTransport?: ResumeTransport;
 	/** Sign a {@link ResumeV1} over its unsigned image (subscriber peer key); base64url. */
 	readonly signResume?: (req: Omit<ResumeV1, "signature">) => string;
-	/** The subscriber's ring coordinate, base64url (carried in {@link ResumeV1} so the cohort routes the reply). */
+	/**
+	 * The subscriber's **real ring coordinate**, base64url (the `participantCoord` it registers under at the
+	 * cohort-topic tier), carried in the signed {@link ResumeV1}. The recover transport replies on the same
+	 * stream, so this is not used for reply routing today; still, the production factory should source it
+	 * correctly so the signed field is meaningful and a future out-of-band reply path is unblocked. Absent ⇒
+	 * the manager falls back to the collection id as a placeholder and logs (the signed field is then merely
+	 * a stable per-collection token, not the ring coord).
+	 */
 	readonly subscriberCoord?: string;
+	/**
+	 * Application-level re-attempts the backfill escalation makes after a **transport failure** before giving
+	 * up to a resume/chain-read (the sticky-hint dial + one cohort-walk fallback already live in the
+	 * transport, so this is a small outer retry). Default `1`. Distinct from the `available`-window underflow
+	 * path ({@link onBackfillUnderflow}), which escalates immediately without retrying.
+	 */
+	readonly backfillMaxRetries?: number;
 	/** Apply a verified checkpoint's merged digest on a `checkpoint_window` resume. */
 	readonly onCheckpointDigest?: (summary: CheckpointSummary) => void;
 	/** Chain-read + fresh subscribe fallback (out_of_window, or an untrusted checkpoint). */
@@ -144,6 +161,10 @@ export class ReactivitySubscriptionManager {
 	private readonly clock: () => number;
 	private readonly tailIdAtAttachB64: string;
 	private readonly rejoinJitter: RejoinJitter;
+	/** Resolved ring coordinate signed into a {@link ResumeV1} (real coord, or the collectionId placeholder). */
+	private readonly subscriberCoord: string;
+	/** True iff {@link subscriberCoord} fell back to the collectionId placeholder (no real coord supplied). */
+	private readonly subscriberCoordIsFallback: boolean;
 	/** The successor tail a rotation has already been surfaced for, so the notice fires once per rotation. */
 	private rotationHandledFor?: string;
 	/** Memoized db-core backfill driver (built on first gap, once `this.subscriber` is assigned). */
@@ -164,6 +185,8 @@ export class ReactivitySubscriptionManager {
 		this.clock = options.clock ?? ((): number => Date.now());
 		this.tailIdAtAttachB64 = bytesToB64url(options.tailIdAtAttach);
 		this.rejoinJitter = options.rejoinJitter ?? createRejoinJitter();
+		this.subscriberCoordIsFallback = options.subscriberCoord === undefined;
+		this.subscriberCoord = options.subscriberCoord ?? this.collectionIdB64;
 		// Verify against the tail cohort's membership cert (the verifier owns the one fetch-and-retry).
 		this.verifier = createNotificationVerifier({ verifier: this.service.verifier(), tier: Tier.T3 });
 		this.subscriber = createReactivitySubscriber({
@@ -192,15 +215,49 @@ export class ReactivitySubscriptionManager {
 					sign: signBackfill,
 					transport: backfillTransport,
 					subscriber: this.subscriber,
+					clock: this.clock,
 					onUnderflow: this.options.onBackfillUnderflow,
 				});
 			}
-			// Fire-and-forget seam; a transport failure surfaces via the unhandled-rejection path rather
-			// than being swallowed (an exception is exceptional — AGENTS.md).
-			void this.backfillRequester(from, to);
+			// Fire-and-forget off the gap seam (NOT the deliver path — backfill is hint-only and must never
+			// block or fault commit/delivery). The driver resolves (no throw) on an `available`-window
+			// underflow — that path is handled by `onBackfillUnderflow`; only a genuine **transport failure**
+			// rejects, which escalates here. `escalateBackfill` never rejects, so nothing leaks as an
+			// unhandled rejection.
+			void this.backfillRequester(from, to).catch(() => { void this.escalateBackfill(from, to); });
 			return;
 		}
 		this.options.requestBackfill?.(from, to);
+	}
+
+	/**
+	 * A backfill RPC failed at the transport (the sticky-hint dial + cohort-walk fallback inside the
+	 * transport were already exhausted). Re-attempt up to {@link ReactivitySubscriptionManagerOptions.backfillMaxRetries}
+	 * times, then escalate to {@link resume} (when a resume transport is configured) and finally to
+	 * {@link ReactivitySubscriptionManagerOptions.onChainRead}. Never rejects (it runs detached off the gap
+	 * seam) and never touches the commit/delivery path.
+	 */
+	private async escalateBackfill(from: number, to: number): Promise<void> {
+		const max = this.options.backfillMaxRetries ?? DEFAULT_BACKFILL_MAX_RETRIES;
+		for (let attempt = 1; attempt <= max; attempt++) {
+			try {
+				await this.backfillRequester!(from, to);
+				return; // a re-attempt closed (or underflow-escalated) the gap
+			} catch (err) {
+				log("backfill retry %d/%d for [%d,%d] failed: %o", attempt, max, from, to, err);
+			}
+		}
+		// Still failing after the bounded retries: fall back to a resume (a wider recovery window) when one is
+		// wired, else signal a chain read. Distinct from the underflow seam, which carries the held window.
+		if (this.options.resumeTransport !== undefined && this.options.signResume !== undefined) {
+			try {
+				await this.resume();
+				return;
+			} catch (err) {
+				log("backfill escalation to resume() failed for [%d,%d]: %o", from, to, err);
+			}
+		}
+		this.options.onChainRead?.(undefined, undefined);
 	}
 
 	/** The live registration handle, or `undefined` before the first {@link register}. */
@@ -264,12 +321,15 @@ export class ReactivitySubscriptionManager {
 		if (resumeTransport === undefined || signResume === undefined) {
 			throw new Error("ReactivitySubscriptionManager.resume: no resumeTransport/signResume configured");
 		}
+		if (this.subscriberCoordIsFallback) {
+			log("resume: no real ring coordinate supplied; signing ResumeV1 with the collectionId as a placeholder subscriberCoord (collection=%s)", this.collectionIdB64);
+		}
 		const unsigned: Omit<ResumeV1, "signature"> = {
 			v: 1,
 			collectionId: this.collectionIdB64,
 			fromRevision: this.subscriber.lastRevision + 1,
 			latestKnownTailId: bytesToB64url(this.tailIdAtAttach),
-			subscriberCoord: this.options.subscriberCoord ?? this.collectionIdB64,
+			subscriberCoord: this.subscriberCoord,
 			timestamp: this.clock(),
 		};
 		const req: ResumeV1 = { ...unsigned, signature: signResume(unsigned) };
@@ -327,6 +387,8 @@ export class ReactivitySubscriptionManager {
 	}
 }
 
+/** Default application-level backfill re-attempts after a transport failure before escalating to resume/chain. */
+const DEFAULT_BACKFILL_MAX_RETRIES = 1;
 /** Fallback subscriber TTL when neither `ttlMs` nor `profile` is supplied (Core default). */
 const DEFAULT_SUBSCRIBER_TTL_MS = 90_000;
 /** Edge-safe delta budget when neither `deltaMaxBytes` nor `profile` is supplied: decline deltas. */
