@@ -190,19 +190,54 @@ describe('reactivity resume — classification + serving (stacked windows)', () 
 });
 
 describe('reactivity resume — inherited (cross-rotation) checkpoint', () => {
-	it('classifies + serves a resume below both windows from the inherited checkpoint', async () => {
+	it('classifies + serves a resume below the rolling window from the inherited checkpoint (gap-free)', async () => {
 		const state = await fedState(20); // ring [17,18,19,20], rolling checkpoint [9,16]
-		const inherited = inheritedSummary(1, 8); // the handoff window the new tail holds, below the rolling checkpoint
-		const req = resumeReq(5); // below ringLow (17) and the rolling checkpoint low (9), but inside [1,8]
+		// Right after a rotation the new tail's ring still holds every revision since the handoff, so the
+		// inherited window abuts the ring's low edge (toRevision 16 == ringLow 17 − 1). serveResume then emits a
+		// contiguous `inherited summary + ring` reply.
+		const inherited = inheritedSummary(1, 16);
+		const req = resumeReq(5); // below ringLow (17) and the rolling checkpoint low (9), but inside [1,16]
 		// Without the inherited checkpoint this is out_of_window; with it, the new tail answers from the handoff.
 		expect(classifyResume(req, state.replayBuffer, state.checkpoint, TAIL)).to.equal('out_of_window');
 		expect(classifyResume(req, state.replayBuffer, state.checkpoint, TAIL, inherited)).to.equal('checkpoint_window');
 		const reply = serveResume(req, { ...serveDeps(state), inheritedCheckpoint: inherited });
 		expect(reply.result).to.equal('checkpoint_window');
 		expect(reply.checkpoint!.fromRevision).to.equal(1);
-		expect(reply.checkpoint!.toRevision).to.equal(8);
+		expect(reply.checkpoint!.toRevision).to.equal(16);
 		// Same shape as the rolling-checkpoint branch: the inherited summary + the live ring's recent entries.
 		expect(reply.recentEntries!.map((e) => e.revision)).to.deep.equal([17, 18, 19, 20]);
+		expect(reply.currentRevision).to.equal(20);
+	});
+
+	it('subscriber applies a gap-free inherited reply contiguously (no skipped revisions)', async () => {
+		// The end-to-end proof the serve shape is actually recoverable: a subscriber at the inherited window's
+		// low edge applies the reply and ends up current with nothing skipped.
+		const verifier = realishVerifier([SIGNER_A, SIGNER_B], 2);
+		const delivered: number[] = [];
+		const digests: CheckpointSummary[] = [];
+		const state = await fedState(20);
+		const inherited = inheritedSummary(1, 16);
+		const reply = serveResume(resumeReq(5), { ...serveDeps(state), inheritedCheckpoint: inherited });
+		const sub = createReactivitySubscriber({ collectionId: COLLECTION, verifier, deliver: (n) => delivered.push(n.revision), lastKnownRev: 4 });
+		const outcome = await applyResumeReply(reply, { subscriber: sub, verifier, onCheckpointDigest: (s) => digests.push(s) });
+		expect(outcome).to.equal('checkpoint_applied');
+		expect(digests[0]!.toRevision).to.equal(16);
+		expect(delivered).to.deep.equal([17, 18, 19, 20]); // contiguous after rebaseline to 16 — nothing skipped
+		expect(sub.lastRevision).to.equal(20);
+	});
+
+	it('falls to out_of_window when the inherited window no longer abuts the ring (cannot bridge the rolling gap)', async () => {
+		const state = await fedState(20); // ring [17,18,19,20], rolling checkpoint [9,16]
+		// A handoff whose high edge (8) sits below the ring's low edge (17) with the new tail's own rolling
+		// checkpoint [9,16] in between: serving inherited [1,8] + ring would silently skip [9,16]. A single
+		// checkpoint cannot carry all three windows, so the classifier declines (chain read) rather than emit a
+		// reply with that high-edge gap.
+		const inherited = inheritedSummary(1, 8);
+		const req = resumeReq(5);
+		expect(classifyResume(req, state.replayBuffer, state.checkpoint, TAIL, inherited)).to.equal('out_of_window');
+		const reply = serveResume(req, { ...serveDeps(state), inheritedCheckpoint: inherited });
+		expect(reply.result).to.equal('out_of_window');
+		expect(reply.currentTailId).to.equal(TAIL);
 		expect(reply.currentRevision).to.equal(20);
 	});
 

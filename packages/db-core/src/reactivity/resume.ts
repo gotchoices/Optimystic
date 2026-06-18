@@ -210,10 +210,13 @@ export function decodeResumeReplyV1(bytes: Uint8Array, maxMessageBytes?: number)
  *  3. **checkpoint_window** (rolling) — below the ring but within the rolling checkpoint's covered range.
  *  4. **checkpoint_window** (inherited) — below *both* the ring and the rolling checkpoint, but within the
  *     `inherited` cross-rotation handoff checkpoint this (new) tail holds (`docs/reactivity.md` §Tail
- *     rotation step 5 — "the new tail holds the old checkpoint"). The rolling checkpoint wins when both
- *     cover `fromRevision` (it is the fresher, narrower window); the inherited one is the deeper,
- *     last-resort window, consulted only when the rolling one misses.
- *  5. **out_of_window** — older than even the inherited checkpoint (or every window is empty/absent).
+ *     rotation step 5 — "the new tail holds the old checkpoint"), **and** the inherited window abuts the
+ *     ring's low edge so the served `inherited summary + ring` reply is gap-free (see the abut condition
+ *     below). The rolling checkpoint wins when both cover `fromRevision` (it is the fresher, narrower
+ *     window); the inherited one is the deeper, last-resort window, consulted only when the rolling one
+ *     misses and only while it still abuts the ring.
+ *  5. **out_of_window** — older than even the inherited checkpoint, or inside it but no longer abutting the
+ *     ring (a chain read), or every window is empty/absent.
  */
 export function classifyResume(
 	req: ResumeV1,
@@ -232,7 +235,21 @@ export function classifyResume(
 	if (checkpoint !== undefined && checkpoint.covers(req.fromRevision)) {
 		return "checkpoint_window";
 	}
-	if (inherited !== undefined && checkpointCovers(inherited, req.fromRevision)) {
+	// The inherited cross-rotation window is served as `inherited summary + the live ring's recentEntries`
+	// (see serveResume), so it is only gap-free when the inherited summary's high edge **abuts (or overlaps)
+	// the ring's low edge**: `inherited.toRevision >= ringLow − 1`. Right after a rotation the new tail's ring
+	// still holds every revision since the handoff (`ringLow == rotationRevision + 1 == inherited.toRevision + 1`),
+	// so it abuts. Once the new tail's *own* rolling checkpoint forms between the inherited window and the ring,
+	// a single-checkpoint reply cannot bridge all three windows; serving inherited + ring would silently skip
+	// `[inherited.toRevision + 1, ringLow − 1]`, so the request falls to `out_of_window` (an honest chain read)
+	// instead. Extending the inherited window past the new ring's first eviction is the follow-on
+	// `reactivity-rotation-inherited-window-bridge`.
+	if (
+		inherited !== undefined &&
+		low !== undefined &&
+		inherited.toRevision >= low - 1 &&
+		checkpointCovers(inherited, req.fromRevision)
+	) {
 		return "checkpoint_window";
 	}
 	return "out_of_window";
@@ -247,8 +264,10 @@ export interface ResumeServingDeps {
 	/**
 	 * The checkpoint migrated from the **outgoing** tail when this cohort became the new tail across a
 	 * rotation (the live `PushState.inheritedCheckpoint`). Consulted only when the rolling {@link checkpoint}
-	 * does not cover `fromRevision`, so a resume whose span crosses the rotation is answered from the
-	 * inherited window instead of falling to `out_of_window` (`docs/reactivity.md` §Tail rotation step 5).
+	 * does not cover `fromRevision` **and** the inherited window still abuts the ring's low edge (so the
+	 * `inherited summary + ring` reply is gap-free; see {@link classifyResume}). A resume whose span crosses
+	 * the rotation is then answered from the inherited window instead of falling to `out_of_window`
+	 * (`docs/reactivity.md` §Tail rotation step 5).
 	 */
 	readonly inheritedCheckpoint?: CheckpointSummary;
 	/** The cohort's current tail block id, base64url. */
@@ -280,7 +299,8 @@ export function serveResume(req: ResumeV1, deps: ResumeServingDeps): ResumeReply
 		case "checkpoint_window": {
 			// The rolling checkpoint wins when it covers `fromRevision` (the fresher, narrower window; its
 			// covers() being true ⇒ it is non-empty ⇒ summary() is defined). Otherwise the inherited
-			// cross-rotation handoff checkpoint covers it (classifyResume guaranteed one of the two does).
+			// cross-rotation handoff checkpoint covers it — and classifyResume only chose this branch when the
+			// inherited window abuts the ring's low edge, so `inherited summary + ring` below is contiguous.
 			const summary = deps.checkpoint !== undefined && deps.checkpoint.covers(req.fromRevision)
 				? deps.checkpoint.summary()!
 				: deps.inheritedCheckpoint!;
