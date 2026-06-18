@@ -273,3 +273,17 @@ export {
 	measureUnwillingWalks,
 	runTreeBoundaries
 } from './boundary-tree.js';
+export {
+	type KillRateOptions,
+	type KillMechanism,
+	type KillRateReadout,
+	type PartitionSeverityOptions,
+	type PartitionSeverityReadout,
+	type ChurnBoundaryOptions,
+	type ChurnBoundaryReport,
+	killRateAxis,
+	measureKillRateFailover,
+	partitionSeverityAxis,
+	measurePartitionConvergence,
+	runChurnBoundaries
+} from './boundary-churn.js';
