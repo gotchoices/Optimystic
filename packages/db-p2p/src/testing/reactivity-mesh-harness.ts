@@ -348,7 +348,7 @@ export class ReactivityMesh {
 	async registerCollection(name: string, opts: CollectionOptions = {}): Promise<void> {
 		const collectionId = utf8.encode(`reactivity:${name}`);
 		const collectionIdB64 = bytesToB64url(collectionId);
-		const tailId = utf8.encode(`${name}:tail-0`);
+		const tailId = this.pinTailToCore(`${name}:tail-0`);
 		const topicId = reactivityTopicId(tailId);
 		const coord0 = addressing.coord0(topicId);
 		const setup = await setupTopic(this.mesh, topicId);
@@ -444,6 +444,34 @@ export class ReactivityMesh {
 	private cohortMembersAround(coord: Uint8Array): Member[] {
 		const ids = new Set(this.mesh.assembleCohort(coord, this.wantK));
 		return this.members.filter((m) => ids.has(m.idStr));
+	}
+
+	/** Whether the node FRET-routes nearest to `coord` (the cohort's routed primary) is an Edge profile. */
+	private nearestIsEdge(coord: Uint8Array): boolean {
+		const nearest = this.mesh.nearest(coord);
+		const idx = this.members.findIndex((m) => m.idStr === nearest.idStr);
+		return idx >= 0 && this.profiles[idx] === "edge";
+	}
+
+	/**
+	 * Choose a reactivity tail id derived from `baseTail` whose `coord_0` routes nearest a **Core** node.
+	 * Reactivity topics serve at tier T3, and an Edge node declines a T3 cold-start by design (it serves no
+	 * forwarder duty — pinned by `cohort-topic-scale-lifecycle` "Edge serves no T3"), so a topic whose
+	 * `coord_0` routes nearest an Edge node can never instantiate its tail cohort: the routed primary returns
+	 * `no_state`, the walk exhausts, and `register` throws `CohortBackoffError`. Because {@link makeMembers}
+	 * re-randomizes the member ring layout every run, an Edge-profile mesh would otherwise *intermittently*
+	 * seat the Edge node as a collection's tail primary (~1/nodeCount of runs) and flake. In production a
+	 * reactivity tail cohort IS the Core cluster that served the tail, so pinning the primary to a Core node
+	 * models reality. A no-op (returns `utf8(baseTail)` at the first try) when the mesh has no Edge nodes —
+	 * the common case — so every all-Core suite is byte-for-byte unaffected.
+	 */
+	private pinTailToCore(baseTail: string): Uint8Array {
+		for (let nonce = 0; ; nonce++) {
+			const tailId = utf8.encode(nonce === 0 ? baseTail : `${baseTail}#${nonce}`);
+			if (!this.nearestIsEdge(addressing.coord0(reactivityTopicId(tailId)))) {
+				return tailId;
+			}
+		}
 	}
 
 	private collection(name: string): CollectionState {
@@ -752,7 +780,9 @@ export class ReactivityMesh {
 		const c = this.collection(collection);
 		const autoReattach = opts.autoReattach ?? true;
 		const rotationRevision = c.rev;
-		const newTailId = utf8.encode(`${c.name}:tail-${rotationRevision}`);
+		// Pin the rotated tail's routed primary to a Core node too (Edge nodes decline a T3 cold-start); a
+		// no-op for the all-Core rotation suites, matching the initial-tail pinning in `registerCollection`.
+		const newTailId = this.pinTailToCore(`${c.name}:tail-${rotationRevision}`);
 		const newTailIdB64 = bytesToB64url(newTailId);
 		const oldTailB64 = bytesToB64url(c.tailId);
 
