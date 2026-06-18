@@ -1,3 +1,10 @@
+<!-- resume-note -->
+RESUME: A prior agent run on this ticket did not complete.
+  Prior run: 2026-06-18T02:45:25.386Z (agent: claude)
+  Log file: C:\projects\optimystic\tickets\.logs\1-simulator-envelope-core.implement.2026-06-18T02-45-25-386Z.log
+Read the log to see what was done. Resume where it left off.
+If the prior run hit a timeout or repeated error, be cautious not to rush into the same situation.
+<!-- /resume-note -->
 description: Add a reusable "how much stress before this guarantee breaks" measurement harness to the design simulator — it drives a single worsening condition upward until a design claim stops holding, records the exact value where it broke, and reports how much slack the design had before that point.
 prereq:
 files:
