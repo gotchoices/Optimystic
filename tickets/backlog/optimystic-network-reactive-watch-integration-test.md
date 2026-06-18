@@ -54,6 +54,29 @@ specs) that:
   `localChangeNotifier`), so it cannot stand in for this — it would need the
   mesh's per-node `StorageRepo` threaded through the testing harness first.
 
+## Also lands here: reactivity tail-rotation re-registration wiring
+
+`reactivity-rotation-host-wiring-e2e` constructs and exposes a per-node
+`RotationReRegistrationScheduler` as `node.reactivityRotation`, but its
+`reRegister(plan)` move is a **logged no-op** until a subscribe factory that
+*constructs* `ReactivitySubscriptionManager`s exists — the same Quereus
+`Database.watch` bridge this ticket covers. When that factory lands it must also:
+
+- bind each constructed manager's `onRotation` observer to
+  `node.reactivityRotation.schedule(notice)` (so a surfaced `RotationNotice` arms
+  the jittered re-registration timer), and
+- implement `reRegister(plan)` to build a **fresh** `ReactivitySubscriptionManager`
+  under `plan.newTopicId` carrying `plan.lastRevision`, then swap the
+  `ReactivitySubscriberRegistry` entry **registering the NEW-topic handler BEFORE
+  unregistering the old**, so a notification arriving mid-swap is never dropped.
+
+This ordering requirement is currently spelled out only in `libp2p-node-base.ts`
+source comments (the scheduler construction site) and `docs/reactivity.md`
+§Tail rotation; it is exercised end-to-end only at the mock tier
+(`packages/db-p2p/test/reactivity/mesh-tail-rotation.spec.ts`, which plays the
+factory role via re-attach and therefore does **not** cover the registry swap).
+Capture it here so the swap ordering is not lost when the factory is implemented.
+
 ## Out of scope
 
 - Wiring `mesh-test` reactivity (separate, only if a demonstrated need appears).
