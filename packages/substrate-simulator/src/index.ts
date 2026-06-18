@@ -287,3 +287,20 @@ export {
 	measurePartitionConvergence,
 	runChurnBoundaries
 } from './boundary-churn.js';
+export {
+	type ContinuityOptions,
+	type ContinuityReadout,
+	type DrainOptions,
+	type DrainReadout,
+	type ReactivityBoundaryOptions,
+	type ReactivityBoundaryReport,
+	NOMINAL_CPS,
+	RECONNECT_GAP_SEC,
+	SHIPPED_REJOIN_DRAIN_RATIO,
+	revisionContinuityAxis,
+	measureContinuityCoverage,
+	replayOnlyEdgeCps,
+	tailDrainAxis,
+	measureRotationDrain,
+	runReactivityBoundaries
+} from './boundary-reactivity.js';

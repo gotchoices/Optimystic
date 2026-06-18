@@ -583,7 +583,15 @@ export function simulateRotationBurst(opts: {
 		});
 	}
 
-	world.scheduler.run(config.tDrainMs);
+	// Run far enough to absorb the *entire* jittered wave, even when it spreads past `T_drain`.
+	// Arrivals land in `[0, T_rejoin_jitter)`, so a horizon capped at `T_drain` would silently drop
+	// the tail of the wave whenever `T_rejoin_jitter > T_drain` — leaving `lastArrivalAt` at the last
+	// arrival that *did* fire (≤ T_drain) and making `completedWithinDrain` vacuously true. The
+	// reactivity operating-envelope harness (`boundary-reactivity.ts`) sweeps the
+	// `T_rejoin_jitter / T_drain` ratio past 1 precisely to make the drain claim *fail*, which requires
+	// observing the genuine last-arrival time. For the shipped config (jitter 30 s < drain 60 s) this
+	// max is exactly `T_drain`, so the default burst is byte-for-byte unchanged.
+	world.scheduler.run(Math.max(config.tDrainMs, config.tRejoinJitterMs));
 
 	return {
 		subscriberCount: opts.subscriberCount,
