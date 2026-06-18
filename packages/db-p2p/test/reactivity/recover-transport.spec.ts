@@ -4,6 +4,7 @@ import { peerIdFromPrivateKey, peerIdFromString } from '@libp2p/peer-id';
 import type { PeerId, PrivateKey } from '@libp2p/interface';
 import {
 	PushState,
+	RollingCheckpoint,
 	reactivityTopicId,
 	bytesToB64url,
 	b64urlToBytes,
@@ -18,6 +19,8 @@ import {
 	type ResumeSignable,
 	type ResumeV1,
 	type NotificationV1,
+	type CheckpointSummary,
+	type RotationRedirectV1,
 	type StickyCohortHintCache,
 } from '@optimystic/db-core';
 import { createStickyCohortHintCache } from '@optimystic/db-core';
@@ -28,6 +31,7 @@ import {
 	Libp2pReactivityRecoverTransport,
 	createRecoverRequestHandler,
 	decodeCohortHintTarget,
+	RotationRedirectError,
 	type RecoverDialer,
 	type RecoverServeDeps,
 } from '../../src/reactivity/recover-transport.js';
@@ -61,6 +65,39 @@ function seedPushState(revs: number[], tail = TAIL): PushState {
 	ps.lastRevision = revs.length > 0 ? revs[revs.length - 1]! : -1;
 	return ps;
 }
+
+/**
+ * A PushState fed `1..count` through a narrow ring (`w`/`wCheckpoint`), so the overflow auto-retires into the
+ * rolling checkpoint (the ring's eviction callback). With `count=20, w=4, wCheckpoint=8`: ring `[17..20]`,
+ * rolling checkpoint `[9,16]` — the same shape db-core's resume tests use to exercise the inherited branch.
+ */
+function seedFedPushState(count: number, w = 4, wCheckpoint = 8, tail = TAIL): PushState {
+	const topicId = reactivityTopicId(b64urlToBytes(tail));
+	const ps = new PushState({ collectionId: COLLECTION, topicId: bytesToB64url(topicId), tailIdAtJoin: tail, w, wCheckpoint });
+	for (let rev = 1; rev <= count; rev++) {
+		ps.replayBuffer.append({ revision: rev, payload: note(rev), receivedAt: 1000 + rev });
+	}
+	ps.lastRevision = count;
+	return ps;
+}
+
+/** A standalone {@link CheckpointSummary} over `[fromRev, toRev]` — stands in for the new tail's rotation handoff. */
+function inheritedSummary(fromRev: number, toRev: number): CheckpointSummary {
+	const cp = new RollingCheckpoint({ collectionId: COLLECTION, span: toRev - fromRev + 1 });
+	for (let rev = fromRev; rev <= toRev; rev++) cp.retire({ revision: rev, payload: note(rev), receivedAt: 1000 + rev });
+	return cp.summary()!;
+}
+
+const NEW_TAIL = bytesToB64url(new Uint8Array([6, 6, 6, 6]));
+/** The drain redirect a rotated old cohort hands back over the recover reply (`kind: "rotated"`). */
+const rotationRedirect = (over: Partial<RotationRedirectV1> = {}): RotationRedirectV1 => ({
+	v: 1,
+	result: 'rotated',
+	newTailId: NEW_TAIL,
+	newTopicId: bytesToB64url(reactivityTopicId(b64urlToBytes(NEW_TAIL))),
+	effectiveAtRevision: 5401,
+	...over,
+});
 
 /** Serve deps backed by one PushState resolved by exact topic and by collection. */
 function serveDepsFor(ps: PushState, over: Partial<RecoverServeDeps> = {}): RecoverServeDeps {
@@ -147,6 +184,70 @@ describe('reactivity recover — inbound serve handler', () => {
 		const reply = decodeRecoverReplyV1((await handler(encodeRecoverRequestV1({ v: 1, kind: 'resume', resume: req }), peerId))!);
 		expect(reply.resumeReply!.result).to.equal('tail_rotated');
 		expect(reply.resumeReply!.newTailId).to.equal(TAIL);
+	});
+
+	it('resume reaching a draining old tail is answered with the kind:"rotated" redirect (consulting the stale tail topic)', async () => {
+		const ps = seedPushState([10, 11, 12, 13, 14]);
+		const redirect = rotationRedirect();
+		let seenTopic: Uint8Array | undefined;
+		let seenNow: number | undefined;
+		const deps = serveDepsFor(ps, {
+			rotationFor: (req, now) => { seenTopic = req.topicId; seenNow = now; return redirect; },
+		});
+		const handler = createRecoverRequestHandler(deps);
+		const req = await signResume({ v: 1, collectionId: COLLECTION, fromRevision: 12, latestKnownTailId: TAIL, subscriberCoord: COLLECTION, timestamp: FIXED_NOW });
+		const reply = decodeRecoverReplyV1((await handler(encodeRecoverRequestV1({ v: 1, kind: 'resume', resume: req }), peerId))!);
+		expect(reply.kind).to.equal('rotated');
+		expect(reply.rotated).to.deep.equal(redirect);
+		// The redirect lookup is keyed by the request's stale tail topic: reactivityTopicId(latestKnownTailId).
+		expect([...seenTopic!]).to.deep.equal([...reactivityTopicId(b64urlToBytes(TAIL))]);
+		expect(seenNow).to.equal(FIXED_NOW); // consulted against the injected serve clock
+	});
+
+	it('resume across a rotation is served from the new tail inheritedCheckpoint (else out_of_window)', async () => {
+		// New-tail PushState: ring [17..20], rolling checkpoint [9,16], plus an inherited handoff [1,16].
+		const ps = seedFedPushState(20);
+		ps.adoptRotationCheckpoint(inheritedSummary(1, 16));
+		const handler = createRecoverRequestHandler(serveDepsFor(ps));
+		// fromRevision 5 is below the ring low (17) and the rolling checkpoint low (9), but inside [1,16].
+		const req = await signResume({ v: 1, collectionId: COLLECTION, fromRevision: 5, latestKnownTailId: TAIL, subscriberCoord: COLLECTION, timestamp: FIXED_NOW });
+		const reply = decodeRecoverReplyV1((await handler(encodeRecoverRequestV1({ v: 1, kind: 'resume', resume: req }), peerId))!);
+		expect(reply.kind).to.equal('resume');
+		expect(reply.resumeReply!.result, 'answered from the inherited checkpoint').to.equal('checkpoint_window');
+		expect(reply.resumeReply!.checkpoint!.fromRevision).to.equal(1);
+		expect(reply.resumeReply!.checkpoint!.toRevision).to.equal(16);
+
+		// Proof the serve actually threads ps.inheritedCheckpoint: the same request without the handoff falls to out_of_window.
+		const bare = seedFedPushState(20);
+		const bareReply = decodeRecoverReplyV1((await createRecoverRequestHandler(serveDepsFor(bare))(encodeRecoverRequestV1({ v: 1, kind: 'resume', resume: req }), peerId))!);
+		expect(bareReply.resumeReply!.result).to.equal('out_of_window');
+	});
+
+	it('backfill reaching a node serving only the draining old tail is answered with the redirect (keyed by collectionId, no topicId)', async () => {
+		const ps = seedPushState([10, 11, 12]);
+		const redirect = rotationRedirect();
+		let seenReq: { topicId?: Uint8Array; collectionId: string } | undefined;
+		const deps = serveDepsFor(ps, {
+			rotationFor: (req) => { seenReq = req; return redirect; },
+		});
+		const handler = createRecoverRequestHandler(deps);
+		// A backfill underflowing the ring (fromRevision 5 < ring low 10) — the secondary redirect path.
+		const req = await signBackfill({ v: 1, collectionId: COLLECTION, fromRevision: 5, toRevision: 8, timestamp: FIXED_NOW });
+		const reply = decodeRecoverReplyV1((await handler(encodeRecoverRequestV1({ v: 1, kind: 'backfill', backfill: req }), peerId))!);
+		expect(reply.kind).to.equal('rotated');
+		expect(reply.rotated).to.deep.equal(redirect);
+		// Backfill defers the topic resolution to the binding: it passes collectionId only, no topicId.
+		expect(seenReq!.topicId).to.equal(undefined);
+		expect(seenReq!.collectionId).to.equal(COLLECTION);
+	});
+
+	it('a non-rotated cohort (rotationFor returns undefined) serves backfill/resume as today', async () => {
+		const ps = seedPushState([10, 11, 12, 13, 14]);
+		const handler = createRecoverRequestHandler(serveDepsFor(ps, { rotationFor: () => undefined }));
+		const req = await signBackfill({ v: 1, collectionId: COLLECTION, fromRevision: 11, toRevision: 14, timestamp: FIXED_NOW });
+		const reply = decodeRecoverReplyV1((await handler(encodeRecoverRequestV1({ v: 1, kind: 'backfill', backfill: req }), peerId))!);
+		expect(reply.kind).to.equal('backfill');
+		expect(reply.backfillReply!.entries.map((e) => e.revision)).to.deep.equal([11, 12, 13, 14]);
 	});
 
 	it('rejects (no reply) a request whose signature does not verify against the dialing peer', async () => {
@@ -320,6 +421,43 @@ describe('reactivity recover — outbound transport', () => {
 		let threw = false;
 		try { await transport.backfillTransport(TOPIC, COLLECTION)(req); } catch { threw = true; }
 		expect(threw).to.equal(true);
+	});
+
+	it('surfaces a kind:"rotated" reply as a terminal RotationRedirectError (no cohort-walk fallthrough)', async () => {
+		const ps = seedPushState([10, 11, 12]);
+		const redirect = rotationRedirect();
+		const dialed: string[] = [];
+		const secondMember = peerIdFromPrivateKey(await generateKeyPair('Ed25519')).toString();
+		const handler = createRecoverRequestHandler(serveDepsFor(ps, { rotationFor: () => redirect }));
+		const transport = new Libp2pReactivityRecoverTransport({
+			dialer: handlerDialer(handler, dialed),
+			selfPeerId: 'self',
+			cohortHintCache: createStickyCohortHintCache(),
+			resolveCohort: () => [peerId.toString(), secondMember],
+		});
+		const req = await signBackfill({ v: 1, collectionId: COLLECTION, fromRevision: 11, toRevision: 12, timestamp: FIXED_NOW });
+		let caught: unknown;
+		try { await transport.backfillTransport(TOPIC, COLLECTION)(req); } catch (err) { caught = err; }
+		expect(caught, 'a rotated reply surfaces as a typed RotationRedirectError').to.be.instanceOf(RotationRedirectError);
+		expect((caught as RotationRedirectError).redirect).to.deep.equal(redirect);
+		// Terminal: the dialed member answered authoritatively, so the walk stops (NOT a dial-failure fallthrough).
+		expect(dialed, 'the redirect stopped the walk after the first member').to.have.length(1);
+	});
+
+	it('resumeTransport also surfaces the rotated redirect as a RotationRedirectError', async () => {
+		const ps = seedPushState([10, 11, 12, 13, 14]);
+		const redirect = rotationRedirect({ effectiveAtRevision: 99 });
+		const transport = new Libp2pReactivityRecoverTransport({
+			dialer: handlerDialer(createRecoverRequestHandler(serveDepsFor(ps, { rotationFor: () => redirect }))),
+			selfPeerId: 'self',
+			cohortHintCache: createStickyCohortHintCache(),
+			resolveCohort: () => [peerId.toString()],
+		});
+		const req = await signResume({ v: 1, collectionId: COLLECTION, fromRevision: 12, latestKnownTailId: TAIL, subscriberCoord: COLLECTION, timestamp: FIXED_NOW });
+		let caught: unknown;
+		try { await transport.resumeTransport(TOPIC, COLLECTION)(req); } catch (err) { caught = err; }
+		expect(caught).to.be.instanceOf(RotationRedirectError);
+		expect((caught as RotationRedirectError).redirect.effectiveAtRevision).to.equal(99);
 	});
 
 	it('uses the configured recover protocol id for the libp2p dialer default', () => {

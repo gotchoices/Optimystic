@@ -40,6 +40,7 @@ import {
 	createReactivityForwarder,
 	instantiateForwarderPushState,
 	decodeSubscribeAppPayload,
+	TailDrainGate,
 	type NotificationV1,
 	type PeerRef,
 	type NodeProfile,
@@ -49,6 +50,7 @@ import {
 	type NotificationVerifier,
 	type ReactivityForwarder,
 	type RegistrationRecord,
+	type RotationRedirectV1,
 } from "@optimystic/db-core";
 import type { ReactivityNotifyTransport } from "./notify-transport.js";
 import { bytesToPeerIdString } from "../cohort-topic/peer-codec.js";
@@ -156,6 +158,14 @@ export class ReactivityForwarderHost {
 	private readonly served = new Map<string, ServedTopic | null>();
 	/** Per-topic serialization tail: an ingest chains onto its topic's prior ingest so the ring/dedupe never interleave. */
 	private readonly ingestTails = new Map<string, Promise<void>>();
+	/**
+	 * Per **old-topic** drain gate: set by {@link markRotated} when this node observes the collection's tail
+	 * rotate, keyed by the outgoing tail's topicId (base64url). For `T_drain` after the rotation
+	 * {@link rotationRedirectFor} answers a recover request reaching the outgoing tail with the gate's
+	 * {@link RotationRedirectV1} ("this moved — go to the new tree"); once the window closes the entry is
+	 * evicted along with the topic's served `PushState`.
+	 */
+	private readonly rotationGates = new Map<string, TailDrainGate>();
 
 	constructor(deps: ReactivityForwarderHostDeps) {
 		this.transport = deps.transport;
@@ -268,6 +278,56 @@ export class ReactivityForwarderHost {
 			}
 		}
 		return best;
+	}
+
+	/**
+	 * Record that the topic anchored on `oldTopicId` has **rotated** to a successor tail, starting a
+	 * {@link TailDrainGate} so the outgoing tail bounces recover requests to the new tree for `T_drain`
+	 * (`docs/reactivity.md` §Tail rotation step 2). db-core derives the redirect's `newTopicId` internally via
+	 * `reactivityTopicId(newTailId)`. The trigger is origination observing the collection's `event.tailId`
+	 * change ({@link reactivity-rotation-host-wiring-e2e}); this seam is called directly in unit tests.
+	 *
+	 * **Idempotent / chained.** A second `markRotated` for the **same** successor is a no-op; a `markRotated`
+	 * to a **later** successor (higher `effectiveAtRevision`) replaces the gate — so a chained OLD→A→B rotation
+	 * advances the redirect to the most recent successor and restarts its drain window from `now`. An earlier
+	 * (or equal) successor leaves the existing gate untouched.
+	 */
+	markRotated(oldTopicId: Uint8Array, redirect: { newTailId: string; effectiveAtRevision: number }, now: number): void {
+		const key = this.topicKey(oldTopicId);
+		const existing = this.rotationGates.get(key);
+		if (existing !== undefined && redirect.effectiveAtRevision <= existing.rotationRedirect.effectiveAtRevision) {
+			return; // same or earlier successor — the gate already points at this-or-a-later tail.
+		}
+		this.rotationGates.set(key, new TailDrainGate({
+			rotatedAt: now,
+			newTailId: redirect.newTailId,
+			effectiveAtRevision: redirect.effectiveAtRevision,
+		}));
+	}
+
+	/**
+	 * The drain-window redirect for a recover request that reached the outgoing tail anchored on `oldTopicId`,
+	 * or `undefined` if this topic never rotated / its drain window has elapsed. While the gate is draining
+	 * (`isDraining(now)`) returns its {@link RotationRedirectV1}; once `T_drain` closes, evicts the gate **and**
+	 * the topic's served `PushState` (the old tail originates nothing further — this also reclaims the
+	 * `served` / `ingestTails` maps the 12.31 review flagged as un-evicted on rotation) and returns `undefined`,
+	 * so the next request gets no reply and the subscriber re-walks / chain-reads.
+	 */
+	rotationRedirectFor(oldTopicId: Uint8Array, now: number): RotationRedirectV1 | undefined {
+		const key = this.topicKey(oldTopicId);
+		const gate = this.rotationGates.get(key);
+		if (gate === undefined) {
+			return undefined;
+		}
+		if (gate.isDraining(now)) {
+			return gate.rotationRedirect;
+		}
+		// Drain window closed: the outgoing tail is done. Drop the gate and reclaim its served state so the
+		// per-topic maps don't leak across rotations.
+		this.rotationGates.delete(key);
+		this.served.delete(key);
+		this.ingestTails.delete(key);
+		return undefined;
 	}
 
 	/**

@@ -58,6 +58,7 @@ import {
 	type PushState,
 	type StickyCohortHintCache,
 	type CorrelationReplayGuard,
+	type RotationRedirectV1,
 } from "@optimystic/db-core";
 import { requestResponse, handleRequestResponse, DEFAULT_STREAM_MAX_BYTES } from "../cohort-topic/stream-util.js";
 import { verifyPeerSig, signPeerSig } from "../cohort-topic/peer-sig.js";
@@ -110,6 +111,26 @@ export function createRecoverRequestSigners(privateKey: PrivateKey): RecoverRequ
 }
 
 // --- outbound transport ---
+
+/**
+ * Thrown out of {@link Libp2pReactivityRecoverTransport.backfillTransport} / `resumeTransport` when the
+ * dialed cohort answered with a `kind: "rotated"` recover reply: the outgoing tail this request reached has
+ * rotated and is draining, so it bounced the request to the new tree (`docs/reactivity.md` §Tail rotation).
+ * It carries the {@link RotationRedirectV1} so the subscription manager can move itself to the successor.
+ *
+ * A `kind: "rotated"` reply is **terminal** for the cohort-walk — the dialed member spoke authoritatively for
+ * the cohort, so the transport stops rather than falling through to the next target (contrast a *dial
+ * failure*, which still falls through). The subscriber honors it like a notification-driven rotation.
+ */
+export class RotationRedirectError extends Error {
+	/** The drain-window redirect the serving cohort returned (`newTailId` / `newTopicId` / `effectiveAtRevision`). */
+	readonly redirect: RotationRedirectV1;
+	constructor(redirect: RotationRedirectV1) {
+		super(`reactivity recover: cohort rotated to tail ${redirect.newTailId} (effectiveAtRevision ${redirect.effectiveAtRevision})`);
+		this.name = "RotationRedirectError";
+		this.redirect = redirect;
+	}
+}
 
 /** The wire exchange seam: open the recover protocol to `target`, send `frame`, return the bounded reply. */
 export interface RecoverDialer {
@@ -186,8 +207,9 @@ export class Libp2pReactivityRecoverTransport {
 
 	/**
 	 * Exchange one recover frame with the first reachable target: sticky primary, then each cohort-walk
-	 * member. A **dial failure** falls through to the next candidate; a successful dial that decodes to the
-	 * wrong `kind` is terminal (a protocol error, never retried). Throws when no candidate succeeds.
+	 * member. A **dial failure** falls through to the next candidate; a successful dial is **terminal** (the
+	 * member answered for the cohort) — a `kind: "rotated"` redirect throws {@link RotationRedirectError}, and
+	 * a reply decoding to the wrong `kind` is a protocol error. Throws when no candidate succeeds.
 	 */
 	private async exchange(kind: RecoverKind, frame: Uint8Array, topicId: Uint8Array, collectionId: string): Promise<RecoverReplyV1> {
 		const targets = this.selectTargets(topicId, collectionId);
@@ -205,6 +227,11 @@ export class Libp2pReactivityRecoverTransport {
 				continue;
 			}
 			const reply = decodeRecoverReplyV1(replyFrame, this.maxBytes); // a decode failure here is terminal
+			// A rotated cohort answered authoritatively: surface the redirect and stop the walk (terminal, never
+			// a fallthrough — the dialed member spoke for the cohort).
+			if (reply.kind === "rotated") {
+				throw new RotationRedirectError(reply.rotated!);
+			}
 			if (reply.kind !== kind) {
 				throw new Error(`reactivity recover: reply kind "${reply.kind}" does not match request kind "${kind}"`);
 			}
@@ -253,6 +280,15 @@ export interface RecoverServeDeps {
 	readonly pushStateForCollection: (collectionId: string) => PushState | undefined;
 	/** Node-level freshness + anti-replay gate keyed on the request signature bytes. */
 	readonly replayGuard: CorrelationReplayGuard;
+	/**
+	 * The drain-window redirect for a request that reached an **outgoing (rotated)** tail still in its drain
+	 * window, or `undefined` if the resolved topic never rotated / has drained. The node wiring binds this to
+	 * `ReactivityForwarderHost.rotationRedirectFor`, resolving the old topic from the request: for **resume**
+	 * the request carries `topicId = reactivityTopicId(latestKnownTailId)`; for **backfill** (no `topicId`)
+	 * the binding resolves the collection's current served topic. When it returns a redirect the serve replies
+	 * `kind: "rotated"` instead of serving data, moving the subscriber to the new tree. Absent ⇒ never redirect.
+	 */
+	readonly rotationFor?: (req: { topicId?: Uint8Array; collectionId: string }, now: number) => RotationRedirectV1 | undefined;
 	/** Unix-ms clock for the replay-guard window. Default `Date.now`. */
 	readonly clock?: () => number;
 	/** Per-frame decode ceiling; default {@link DEFAULT_STREAM_MAX_BYTES}. */
@@ -278,36 +314,57 @@ function verifyAndAdmit(deps: RecoverServeDeps, signerId: string, payload: Uint8
 	return true;
 }
 
-/** Serve a backfill from the collection's current served tail, or `undefined` if this node serves none. */
-function serveBackfillReply(deps: RecoverServeDeps, req: BackfillV1): Uint8Array | undefined {
+/**
+ * Serve a backfill from the collection's current served tail, or `undefined` if this node serves none. When
+ * the node serves **only** the outgoing (draining) tail, `rotationFor` returns the drain redirect and the
+ * reply is `kind: "rotated"` instead — a best-effort secondary path (the primary mechanism for an active
+ * subscriber is notify-driven detection). Once both tails coexist `pushStateForCollection` resolves the new
+ * tail, so the redirect is emitted only while the old tail is the sole served state (see §Tail rotation).
+ */
+function serveBackfillReply(deps: RecoverServeDeps, req: BackfillV1, now: number): Uint8Array | undefined {
+	const maxBytes = deps.maxBytes ?? DEFAULT_STREAM_MAX_BYTES;
+	const redirect = deps.rotationFor?.({ collectionId: req.collectionId }, now);
+	if (redirect !== undefined) {
+		return encodeRecoverReplyV1({ v: 1, kind: "rotated", rotated: redirect }, maxBytes);
+	}
 	const ps = deps.pushStateForCollection(req.collectionId);
 	if (ps === undefined) {
 		return undefined; // not a serving member for this collection → no reply (subscriber walks/chain-reads)
 	}
 	const backfillReply = serveBackfill(ps.replayBuffer, req, ps.collectionId);
-	return encodeRecoverReplyV1({ v: 1, kind: "backfill", backfillReply }, deps.maxBytes ?? DEFAULT_STREAM_MAX_BYTES);
+	return encodeRecoverReplyV1({ v: 1, kind: "backfill", backfillReply }, maxBytes);
 }
 
 /**
- * Serve a resume against the live `PushState`: prefer the exact topic the request's `latestKnownTailId`
- * anchors (so a non-rotated subscriber classifies into backfill/checkpoint/out_of_window); if this node no
- * longer serves that tail's topic, fall back to the collection's current tail so the cohort can still answer
- * `tail_rotated` (its `currentTailId` differs from the request's stale tail). `undefined` ⇒ no served state.
+ * Serve a resume against the live `PushState`. A resume reaching the **outgoing (draining)** tail — its
+ * `latestKnownTailId` anchors a topic this node has marked rotated — is answered with the drain redirect
+ * (`kind: "rotated"`), moving the subscriber to the new tree. Otherwise prefer the exact topic the request's
+ * `latestKnownTailId` anchors (so a non-rotated subscriber classifies into backfill/checkpoint/out_of_window);
+ * if this node no longer serves that tail's topic, fall back to the collection's current tail so the cohort
+ * can still answer `tail_rotated` (its `currentTailId` differs from the request's stale tail) or, for a span
+ * that crosses a rotation, serve from the new tail's `inheritedCheckpoint`. `undefined` ⇒ no served state.
  */
-function serveResumeReply(deps: RecoverServeDeps, req: ResumeV1): Uint8Array | undefined {
-	const ps = deps.pushStateFor(reactivityTopicId(b64urlToBytes(req.latestKnownTailId))) ?? deps.pushStateForCollection(req.collectionId);
+function serveResumeReply(deps: RecoverServeDeps, req: ResumeV1, now: number): Uint8Array | undefined {
+	const maxBytes = deps.maxBytes ?? DEFAULT_STREAM_MAX_BYTES;
+	const staleTopic = reactivityTopicId(b64urlToBytes(req.latestKnownTailId));
+	const redirect = deps.rotationFor?.({ topicId: staleTopic, collectionId: req.collectionId }, now);
+	if (redirect !== undefined) {
+		return encodeRecoverReplyV1({ v: 1, kind: "rotated", rotated: redirect }, maxBytes);
+	}
+	const ps = deps.pushStateFor(staleTopic) ?? deps.pushStateForCollection(req.collectionId);
 	if (ps === undefined) {
 		return undefined;
 	}
 	const resumeReply = serveResume(req, {
 		buffer: ps.replayBuffer,
 		checkpoint: ps.checkpoint,
+		inheritedCheckpoint: ps.inheritedCheckpoint,
 		currentTailId: ps.tailIdAtJoin,
 		currentRevision: ps.lastRevision,
 		rotationRevision: ps.lastRevision,
 		expectedCollectionId: ps.collectionId,
 	});
-	return encodeRecoverReplyV1({ v: 1, kind: "resume", resumeReply }, deps.maxBytes ?? DEFAULT_STREAM_MAX_BYTES);
+	return encodeRecoverReplyV1({ v: 1, kind: "resume", resumeReply }, maxBytes);
 }
 
 /**
@@ -328,13 +385,13 @@ export function createRecoverRequestHandler(deps: RecoverServeDeps): (frame: Uin
 				if (b === undefined || !verifyAndAdmit(deps, signerId, backfillSigningPayload(b), b.signature, b.timestamp, now)) {
 					return Promise.resolve(undefined);
 				}
-				return Promise.resolve(serveBackfillReply(deps, b));
+				return Promise.resolve(serveBackfillReply(deps, b, now));
 			}
 			const r = req.resume;
 			if (r === undefined || !verifyAndAdmit(deps, signerId, resumeSigningPayload(r), r.signature, r.timestamp, now)) {
 				return Promise.resolve(undefined);
 			}
-			return Promise.resolve(serveResumeReply(deps, r));
+			return Promise.resolve(serveResumeReply(deps, r, now));
 		} catch (err) {
 			// A malformed/foreign request (decode failure, foreign collectionId from serve*) must never throw
 			// out of the stream handler: log + no reply (the stream aborts, the subscriber falls back).

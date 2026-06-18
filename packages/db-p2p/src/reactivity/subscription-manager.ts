@@ -48,6 +48,7 @@ import {
 	type RejoinJitter,
 	type ReRegistrationPlan,
 } from "@optimystic/db-core";
+import { RotationRedirectError } from "./recover-transport.js";
 import { createLogger } from "../logger.js";
 
 const log = createLogger("reactivity-subscription");
@@ -254,6 +255,11 @@ export class ReactivitySubscriptionManager {
 				await this.backfillRequester!(from, to);
 				return; // a re-attempt closed (or underflow-escalated) the gap
 			} catch (err) {
+				if (err instanceof RotationRedirectError) {
+					// The serving cohort's outgoing tail rotated: move to the new tree (no chain-read fallback).
+					this.honorRotationRedirect(err);
+					return;
+				}
 				log("backfill retry %d/%d for [%d,%d] failed: %o", attempt, max, from, to, err);
 			}
 		}
@@ -343,7 +349,19 @@ export class ReactivitySubscriptionManager {
 			timestamp: this.clock(),
 		};
 		const req: ResumeV1 = { ...unsigned, signature: signResume(unsigned) };
-		const reply = await resumeTransport(req);
+		let reply: ResumeReplyV1;
+		try {
+			reply = await resumeTransport(req);
+		} catch (err) {
+			if (err instanceof RotationRedirectError) {
+				// The resume reached the serving cohort's outgoing (draining) tail: honor the redirect (surface
+				// the rotation through onRotation, invalidate the sticky cache) and resolve as a tail rotation —
+				// never throw the redirect out to the caller / the gap seam's commit-delivery path.
+				this.honorRotationRedirect(err);
+				return "tail_rotated";
+			}
+			throw err;
+		}
 		return applyResumeReply(reply, {
 			subscriber: this.subscriber,
 			verifier: this.verifier,
@@ -378,22 +396,48 @@ export class ReactivitySubscriptionManager {
 	/** Detect a tail rotation from an inbound notification and surface it once per successor tail. */
 	private checkRotation(n: NotificationV1): void {
 		const detection = detectRotation(this.tailIdAtAttachB64, n);
-		if (!detection.rotated || detection.newTailId === undefined || detection.newTailId === this.rotationHandledFor) {
+		if (!detection.rotated || detection.newTailId === undefined) {
 			return;
 		}
-		this.rotationHandledFor = detection.newTailId;
+		this.surfaceRotation(detection.newTailId, detection.preAnnounced);
+	}
+
+	/**
+	 * Surface a rotation to the host **once per successor tail** (`docs/reactivity.md` §Tail rotation):
+	 * invalidate the sticky cohort-hint cache (the cached primary is under the now-stale tree, so a later
+	 * resume re-walks) and — when an {@link ReactivitySubscriptionManagerOptions.onRotation} observer is
+	 * configured — hand it a jittered re-registration plan carrying `lastRevision` (continuous across the
+	 * rotation). The single seam both the notification-driven detection ({@link checkRotation}) and the
+	 * recover-driven {@link RotationRedirectError} ({@link honorRotationRedirect}) end in; the
+	 * {@link rotationHandledFor} guard self-corrects across a chained OLD→A→B rotation.
+	 */
+	private surfaceRotation(newTailId: string, preAnnounced: boolean): void {
+		if (newTailId === this.rotationHandledFor) {
+			return; // already surfaced this successor
+		}
+		this.rotationHandledFor = newTailId;
 		// The cached primary is under the now-stale tree; drop it so the re-registration re-walks.
 		this.cohortHintCache.invalidate(this.collectionIdB64);
 		if (this.options.onRotation === undefined) {
 			return;
 		}
 		const plan = planReRegistration({
-			hint: { newTailId: detection.newTailId },
+			hint: { newTailId },
 			lastRevision: this.subscriber.lastRevision,
 			now: this.clock(),
 			jitter: this.rejoinJitter,
 		});
-		this.options.onRotation({ newTailId: detection.newTailId, preAnnounced: detection.preAnnounced, plan });
+		this.options.onRotation({ newTailId, preAnnounced, plan });
+	}
+
+	/**
+	 * Honor a recover-surfaced {@link RotationRedirectError}: the serving cohort's outgoing tail rotated and
+	 * bounced this request to the new tree. Route it through the **same** {@link surfaceRotation} seam a
+	 * delivered pre-announce uses (`preAnnounced: false`), so both the notify-driven and recover-driven
+	 * rotation paths converge on one `RotationNotice` for the host's re-registration scheduler to consume.
+	 */
+	private honorRotationRedirect(err: RotationRedirectError): void {
+		this.surfaceRotation(err.redirect.newTailId, false);
 	}
 }
 

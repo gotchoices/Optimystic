@@ -327,6 +327,8 @@ to its cached `primary` (or any cohort member if primary is stale). The cohort r
 
 **Resume-on-rotation → keep the simple full walk (resolved, `11.5`).** On `TailRotated` the subscriber re-registers under the new tail via the ordinary walk from `d_max`. The Edge **sticky `cohortHint` cache** already shortcuts the *common* case — a brief flap with no rotation resumes against the cached primary in one round trip (the cache is invalidated only on an actual `TailRotated`, so a stale-tree primary is never reused). A pre-dial toward the pre-announced successor coord (from the `rotationHint`) is **deferred to the rotation ticket**: it requires rotation-side announce state (the successor coord is not knowable until the filling commit), so it belongs with the rotation lifecycle rather than the resume classifier.
 
+**Resume reaching a *draining outgoing* tail → `kind: "rotated"` redirect (`12.52-reactivity-rotation-recover-redirect-drain`).** The four classifications above answer a resume reaching the cohort that still *originates* the requested tail, or — for a resume whose `latestKnownTailId` is stale — the **new** tail (which replies `TailRotated`, or serves from its inherited handoff checkpoint). A subscriber that instead reaches the **old, rotated** cohort *while it is still draining* is not lagging — its tree migrated — but that cohort's served `PushState.tailIdAtJoin` still names the old tail, so `serveResume` would classify it as an ordinary `Backfill`/`CheckpointWindow` and **never tell it to move** (it would catch up to `rotationRevision`, then go silent forever — the old tail originates nothing further). So the old cohort **records that it rotated** (`ReactivityForwarderHost.markRotated` starts a `TailDrainGate` keyed by the old `topicId`) and, while draining, its **recover** serve returns the drain `RotationRedirectV1` as a `kind: "rotated"` reply — emitted *ahead of* the windows classification for a resume whose `latestKnownTailId` anchors the old tail. The outbound transport raises that reply as a terminal `RotationRedirectError` (it does **not** fall through to the next cohort member — the dialed member answered authoritatively); the subscriber honors it through the **same** jittered `onRotation` re-registration seam a delivered pre-announce uses, so the notify-driven and recover-driven rotation paths converge on one `RotationNotice`. After `T_drain` the cohort evicts the old tail's `PushState` (`rotationRedirectFor`) → no served state → no reply → the subscriber re-walks / chain-reads. See §Tail rotation step 2.
+
 ### Parent checkpoint summaries
 
 > **Implemented** (`11.5-reactivity-backfill-resume-checkpoints`). The rolling checkpoint is
@@ -392,6 +394,8 @@ BackfillReplyV1 { v, entries: NotificationV1[], available: { fromRevision, toRev
 
 Subscribers MAY request a sub-range smaller than `[fromRevision, toRevision]`; cohorts return the intersection with their replay buffer and indicate `available` so the subscriber knows whether to fall back further. When `available.fromRevision` exceeds the requested low edge, the subscriber's lag has fallen past the ring — it escalates to a checkpoint resume or a chain read.
 
+**Backfill reaching a *draining outgoing* tail → `kind: "rotated"` redirect (best-effort, `12.52`).** Like a resume (§Resume), a backfill reaching the **old, rotated** cohort while it is still draining is answered with the drain `RotationRedirectV1` (`kind: "rotated"`) instead of stale entries, so an active subscriber that detected its gap against the old tail is moved to the new tree. This is a **secondary** path — the primary mechanism for an active subscriber is notify-driven rotation detection (§Tail rotation). Because the backfill request carries only a `collectionId`, the redirect is keyed by the collection's *current served* tail: once the new tail's `PushState` coexists, `pushStateForCollection` resolves the **new** tail (highest `lastRevision`) and the backfill is served normally — so the redirect is emitted only while the node serves **solely** the old draining tail. The subscriber honors it via the same terminal `RotationRedirectError` → `onRotation` seam the resume path uses, off the detached gap seam (it never faults the commit/delivery path).
+
 ---
 
 ## Tail rotation
@@ -406,6 +410,12 @@ Subscribers MAY request a sub-range smaller than `[fromRevision, toRevision]`; c
 > the sticky cohort-hint cache and surfaces a `RotationNotice` once per successor tail). **Drain**:
 > `TailDrainGate` serves renewals/replays for `T_drain` while bouncing new subscriptions with a
 > `Promoted`-shaped `RotationRedirectV1` to the new tree's `topicId`; after `T_drain` it reports `drained`.
+> The **live recover wiring** (`12.52-reactivity-rotation-recover-redirect-drain`) drives the gate from the
+> running node's recover serve: the old cohort's `ReactivityForwarderHost.markRotated` records the rotation
+> (idempotent; advances to a later successor on a chained OLD→A→B), `rotationRedirectFor` returns the redirect
+> as a `kind: "rotated"` recover reply while draining and then evicts the gate **and** the old tail's served
+> `PushState`, the outbound `Libp2pReactivityRecoverTransport` raises a terminal `RotationRedirectError`, and
+> the subscriber honors it through the same jittered `onRotation` re-registration seam a pre-announce uses.
 > **Jittered re-registration**: `planReRegistration` / `planReRegistrationWave` derive the new `topicId` and
 > stagger the move over `T_rejoin_jitter` via the cohort-topic `RejoinJitter` (the wave form hard-bounds the
 > new tail's inbound to `cap_promote_fast` per window), carrying the subscriber's `lastRevision` (revisions
@@ -423,6 +433,8 @@ Tail block ID changes when a block fills (default `block_fill_size = 64` transac
 1. **Pre-announce.** While committing the block-filling transaction, the outgoing tail cohort embeds `rotationHint{ newTailId, effectiveAtRevision }` in the notification. The hint reaches every active subscriber via the existing tree.
 
 2. **Drain.** The outgoing tail cohort continues to accept renewals and serve replays for `T_drain` (default 60 s) after rotation. New subscriptions are rejected with a `Promoted`-shaped redirect (`RotationRedirectV1 { v, result: "rotated", newTailId, newTopicId, effectiveAtRevision }`) to the new `topicId`'s tree. The redirect is serialized by `validateRotationRedirectV1` and **rides the recover reply envelope as `kind: "rotated"`** (`RecoverReplyV1`, §Wire formats) — the recover request-reply protocol is the only reactivity surface a subscriber reaches a serving cohort on, since a fresh subscribe rides generic cohort-topic `service.register` whose walk understands only tier-`Promoted`, never a topic redirect. A peer predating the `"rotated"` kind fails the reply closed and chain-reads (safe), so the redirect is an optimization, never a correctness dependency.
+
+   The same redirect also moves an **already-attached** subscriber that reaches the outgoing cohort over recover (`12.52-reactivity-rotation-recover-redirect-drain`). On the running node the old cohort *records that it rotated* — `ReactivityForwarderHost.markRotated(oldTopicId, { newTailId, effectiveAtRevision }, now)` starts a `TailDrainGate` keyed by the old `topicId` — driven by origination observing the collection's `event.tailId` change. While `rotationRedirectFor(oldTopicId, now)` reports the gate is draining, the recover serve returns the `kind: "rotated"` redirect for a `ResumeV1` whose `latestKnownTailId` anchors the old tail (and, on a node that serves only the draining tail, for an underflowing `BackfillV1`) **instead of** serving stale `backfill`/`checkpoint_window` data. Without this the old cohort's `serveResume` — whose `PushState.tailIdAtJoin` still names the old tail — would classify the request as an ordinary lag, feed it up to `rotationRevision`, and then go silent forever (the old tail originates nothing further), stranding the subscriber. After `T_drain` the gate's drain window closes: `rotationRedirectFor` evicts the gate **and** the served `PushState` (the forwarder demotes naturally), so the next recover request finds no served state → no reply → the subscriber re-walks/chain-reads onto the new tree.
 
 3. **Subscriber re-registration with jitter.** Subscribers, on receiving the rotation hint, schedule re-registration at the new `topicId` with random jitter over `T_rejoin_jitter` (default 30 s). Re-registration carries the subscriber's existing `lastRevision`; revisions are continuous across rotations, so no replay confusion.
 
@@ -626,8 +638,10 @@ are `encode/decodeRecoverRequestV1` / `encode/decodeRecoverReplyV1` in
 
 ```
 interface RecoverRequestV1 { v: 1, kind: "backfill" | "resume", backfill?: BackfillV1, resume?: ResumeV1 }
-interface RecoverReplyV1   { v: 1, kind: "backfill" | "resume", backfillReply?: BackfillReplyV1, resumeReply?: ResumeReplyV1 }
+interface RecoverReplyV1   { v: 1, kind: "backfill" | "resume" | "rotated", backfillReply?: BackfillReplyV1, resumeReply?: ResumeReplyV1, rotated?: RotationRedirectV1 }
 ```
+
+A subscriber only ever *asks* for `backfill`/`resume`, so the **request** discriminant stays narrow; a **reply** may additionally be `kind: "rotated"`, carrying the drain-window `RotationRedirectV1` a still-draining outgoing tail hands back (§Tail rotation step 2, §Resume, §Backfill RPC). The db-p2p outbound transport raises a `kind: "rotated"` reply as a terminal `RotationRedirectError`; a peer predating the kind fails the decode closed (fail-safe — it treats the reply as malformed and chain-reads).
 
 ---
 

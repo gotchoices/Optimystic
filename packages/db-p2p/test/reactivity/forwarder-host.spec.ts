@@ -13,6 +13,7 @@ import {
 	edgeProfile,
 	bytesToB64url,
 	b64urlToBytes,
+	T_DRAIN_MS,
 	type ICohortThresholdCrypto,
 	type IMembershipSource,
 	type MembershipCertV1,
@@ -351,6 +352,82 @@ describe('reactivity / forwarder host', () => {
 
 		await host.ingest(TOPIC, note(1)); // resolves (does not reject)
 		expect(transport.sent, 'a verifier fault drops the notification, no fan-out').to.have.length(0);
+	});
+});
+
+describe('reactivity / forwarder host — rotation drain', () => {
+	const NEW_TAIL = bytesToB64url(new Uint8Array([0x60, 0x60]));
+	const NEW_TAIL_2 = bytesToB64url(new Uint8Array([0x70, 0x70]));
+	const newTopicOf = (tail: string): string => bytesToB64url(reactivityTopicId(b64urlToBytes(tail)));
+
+	it('markRotated → rotationRedirectFor returns the redirect (derived newTopicId) throughout the drain window', () => {
+		const { host } = makeHost();
+		host.markRotated(TOPIC, { newTailId: NEW_TAIL, effectiveAtRevision: 5401 }, NOW);
+
+		const mid = host.rotationRedirectFor(TOPIC, NOW + 30_000);
+		expect(mid, 'a request mid-drain is told to move').to.not.equal(undefined);
+		expect(mid!.result).to.equal('rotated');
+		expect(mid!.newTailId).to.equal(NEW_TAIL);
+		expect(mid!.effectiveAtRevision).to.equal(5401);
+		// db-core derives newTopicId = H(newTailId ‖ "reactivity"); the host never supplies it.
+		expect(mid!.newTopicId).to.equal(newTopicOf(NEW_TAIL));
+	});
+
+	it('a topic that never rotated has no redirect', () => {
+		const { host } = makeHost();
+		expect(host.rotationRedirectFor(TOPIC, NOW)).to.equal(undefined);
+	});
+
+	it('strict drain boundary: redirect at rotatedAt + T_drain − 1, none (evicted) at exactly rotatedAt + T_drain', () => {
+		const { host } = makeHost();
+		host.markRotated(TOPIC, { newTailId: NEW_TAIL, effectiveAtRevision: 1 }, NOW);
+		expect(host.rotationRedirectFor(TOPIC, NOW + T_DRAIN_MS - 1), 'still draining just inside the window').to.not.equal(undefined);
+		expect(host.rotationRedirectFor(TOPIC, NOW + T_DRAIN_MS), 'drained at exactly the boundary (isDraining is strict <)').to.equal(undefined);
+		// The gate entry was evicted: a later in-window-relative-to-a-fresh-mark query still sees nothing.
+		expect(host.rotationRedirectFor(TOPIC, NOW + 1)).to.equal(undefined);
+	});
+
+	it('evicts the served PushState (and ingest tail) once the drain window closes', async () => {
+		const { host } = makeHost({ directSubscribers: (): string[] => [SUB_A] });
+		// Serve the outgoing tail: ingest instantiates its PushState (and its ingest-serialization tail).
+		await host.ingest(TOPIC, note(1));
+		expect(host.pushStateFor(TOPIC), 'the outgoing tail is served before rotation').to.not.equal(undefined);
+
+		host.markRotated(TOPIC, { newTailId: NEW_TAIL, effectiveAtRevision: 2 }, NOW);
+		// While draining the served state is retained (renewals/replays could still be answered by the redirect).
+		expect(host.rotationRedirectFor(TOPIC, NOW + 10_000)).to.not.equal(undefined);
+		expect(host.pushStateFor(TOPIC), 'served state retained during drain').to.not.equal(undefined);
+
+		// After the window closes the next query evicts the gate AND reclaims the served PushState (12.31 leak).
+		expect(host.rotationRedirectFor(TOPIC, NOW + T_DRAIN_MS)).to.equal(undefined);
+		expect(host.pushStateFor(TOPIC), 'served PushState reclaimed on drain-elapsed eviction').to.equal(undefined);
+		expect(host.livePushStates(), 'no live forwarder state lingers for the drained tail').to.have.length(0);
+	});
+
+	it('is idempotent for the same successor (no-op; drain window not restarted)', () => {
+		const { host } = makeHost();
+		host.markRotated(TOPIC, { newTailId: NEW_TAIL, effectiveAtRevision: 100 }, NOW);
+		// A second mark to the SAME successor (even much later) must not restart the drain window.
+		host.markRotated(TOPIC, { newTailId: NEW_TAIL, effectiveAtRevision: 100 }, NOW + 50_000);
+		// If the window had restarted, this query (NOW + T_drain) would still be draining; it must be drained.
+		expect(host.rotationRedirectFor(TOPIC, NOW + T_DRAIN_MS), 'window anchored at the first mark, not the second').to.equal(undefined);
+	});
+
+	it('advances to a later successor on a chained rotation (OLD→A→B), replacing the gate', () => {
+		const { host } = makeHost();
+		host.markRotated(TOPIC, { newTailId: NEW_TAIL, effectiveAtRevision: 100 }, NOW);
+		expect(host.rotationRedirectFor(TOPIC, NOW + 1_000)!.newTailId).to.equal(NEW_TAIL);
+
+		// A second rotation to a LATER successor (higher effectiveAtRevision) replaces the gate and restarts drain.
+		host.markRotated(TOPIC, { newTailId: NEW_TAIL_2, effectiveAtRevision: 200 }, NOW + 5_000);
+		const redirect = host.rotationRedirectFor(TOPIC, NOW + 6_000);
+		expect(redirect!.newTailId, 'redirect advanced to the later successor').to.equal(NEW_TAIL_2);
+		expect(redirect!.newTopicId).to.equal(newTopicOf(NEW_TAIL_2));
+		expect(redirect!.effectiveAtRevision).to.equal(200);
+
+		// An EARLIER successor (lower effectiveAtRevision) is ignored — the gate stays on B.
+		host.markRotated(TOPIC, { newTailId: NEW_TAIL, effectiveAtRevision: 50 }, NOW + 7_000);
+		expect(host.rotationRedirectFor(TOPIC, NOW + 8_000)!.newTailId, 'earlier successor ignored').to.equal(NEW_TAIL_2);
 	});
 });
 

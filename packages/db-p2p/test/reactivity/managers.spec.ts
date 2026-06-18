@@ -22,11 +22,13 @@ import {
 	type BackfillV1,
 	type ResumeV1,
 	type ResumeReplyV1,
+	type RotationRedirectV1,
 	type CollectionChangeEvent,
 	type CommitCert,
 } from '@optimystic/db-core';
 import { peerIdToBytes } from '../../src/cohort-topic/peer-codec.js';
 import { ReactivitySubscriptionManager, type ReactivitySubscriptionManagerOptions, type RotationNotice } from '../../src/reactivity/subscription-manager.js';
+import { RotationRedirectError } from '../../src/reactivity/recover-transport.js';
 import { ReactivityOriginationManager } from '../../src/reactivity/origination-manager.js';
 
 /** A membership verifier with a fixed verdict — the managers only need it to resolve a verdict. */
@@ -395,6 +397,104 @@ describe('reactivity / subscription manager', () => {
 			await manager.onNotification(onNewTree);
 			expect(notices).to.have.length(1);
 			expect(notices[0]!.preAnnounced).to.equal(false);
+		});
+	});
+
+	describe('rotation redirect honored over recover (RotationRedirectError)', () => {
+		const REDIRECT_TAIL = new Uint8Array([6, 6, 6, 6]);
+		const redirect = (over: Partial<RotationRedirectV1> = {}): RotationRedirectV1 => ({
+			v: 1,
+			result: 'rotated',
+			newTailId: bytesToB64url(REDIRECT_TAIL),
+			newTopicId: bytesToB64url(reactivityTopicId(REDIRECT_TAIL)),
+			effectiveAtRevision: 50,
+			...over,
+		});
+
+		it('resume() honoring a redirect fires onRotation once (plan carries lastRevision), invalidates the cache, resolves tail_rotated (no throw)', async () => {
+			const notices: RotationNotice[] = [];
+			const manager = new ReactivitySubscriptionManager({
+				service: new RecordingService(new FixedVerifier('verified')),
+				collectionId: COLLECTION,
+				tailIdAtAttach: TAIL,
+				deliver: () => {},
+				lastKnownRev: 41,
+				signResume: () => bytesToB64url(new Uint8Array([1])),
+				resumeTransport: () => Promise.reject(new RotationRedirectError(redirect())),
+				rejoinJitter: createRejoinJitter({ random: () => 0.5 }),
+				clock: () => 1_000,
+				onRotation: (n) => notices.push(n),
+			});
+			manager.cohortHint.set(bytesToB64url(COLLECTION), { topicId: bytesToB64url(TAIL), primary: bytesToB64url(new Uint8Array([4])), cohortHint: [] });
+
+			const outcome = await manager.resume();
+			expect(outcome, 'a redirect resolves resume() as a tail rotation, never throws out').to.equal('tail_rotated');
+			expect(notices).to.have.length(1);
+			expect(notices[0]!.preAnnounced, 'recover-driven, not a pre-announce').to.equal(false);
+			expect(notices[0]!.newTailId).to.equal(bytesToB64url(REDIRECT_TAIL));
+			expect(notices[0]!.plan.lastRevision, 'plan carries lastRevision (continuous across the rotation)').to.equal(41);
+			expect([...notices[0]!.plan.newTopicId], 'plan targets the new tree topic').to.deep.equal([...reactivityTopicId(REDIRECT_TAIL)]);
+			expect(manager.cohortHint.get(bytesToB64url(COLLECTION)), 'sticky cohort-hint cache invalidated').to.equal(undefined);
+		});
+
+		it('fires onRotation at most once per successor across repeated redirects', async () => {
+			const notices: RotationNotice[] = [];
+			const manager = new ReactivitySubscriptionManager({
+				service: new RecordingService(new FixedVerifier('verified')),
+				collectionId: COLLECTION,
+				tailIdAtAttach: TAIL,
+				deliver: () => {},
+				lastKnownRev: 41,
+				signResume: () => bytesToB64url(new Uint8Array([1])),
+				resumeTransport: () => Promise.reject(new RotationRedirectError(redirect())),
+				rejoinJitter: createRejoinJitter({ random: () => 0.5 }),
+				clock: () => 1_000,
+				onRotation: (n) => notices.push(n),
+			});
+			expect(await manager.resume()).to.equal('tail_rotated');
+			expect(await manager.resume()).to.equal('tail_rotated');
+			expect(notices, 'guarded once-per-successor by rotationHandledFor').to.have.length(1);
+		});
+
+		it('with no onRotation configured a redirect still invalidates the sticky cache and resolves tail_rotated', async () => {
+			const manager = new ReactivitySubscriptionManager({
+				service: new RecordingService(new FixedVerifier('verified')),
+				collectionId: COLLECTION,
+				tailIdAtAttach: TAIL,
+				deliver: () => {},
+				lastKnownRev: 41,
+				signResume: () => bytesToB64url(new Uint8Array([1])),
+				resumeTransport: () => Promise.reject(new RotationRedirectError(redirect())),
+				clock: () => 1_000,
+			});
+			manager.cohortHint.set(bytesToB64url(COLLECTION), { topicId: bytesToB64url(TAIL), primary: bytesToB64url(new Uint8Array([4])), cohortHint: [] });
+			expect(await manager.resume()).to.equal('tail_rotated');
+			expect(manager.cohortHint.get(bytesToB64url(COLLECTION)), 'cache invalidated even with no observer').to.equal(undefined);
+		});
+
+		it('a redirect off the backfill gap seam surfaces the rotation without faulting the delivery path', async () => {
+			const notices: RotationNotice[] = [];
+			let resolveNotice!: () => void;
+			const noticed = new Promise<void>((r) => { resolveNotice = r; });
+			const manager = new ReactivitySubscriptionManager({
+				service: new RecordingService(new FixedVerifier('verified')),
+				collectionId: COLLECTION,
+				tailIdAtAttach: TAIL,
+				deliver: () => {},
+				lastKnownRev: 10,
+				backfillMaxRetries: 1,
+				signBackfill: () => bytesToB64url(new Uint8Array([1])),
+				backfillTransport: () => Promise.reject(new RotationRedirectError(redirect())),
+				rejoinJitter: createRejoinJitter({ random: () => 0.5 }),
+				clock: () => 1_000,
+				onRotation: (n) => { notices.push(n); resolveNotice(); },
+			});
+			// A revision gap (10 → 14) drives the backfill RPC off the detached gap seam; the cohort redirects.
+			expect(await manager.onNotification(noteB64(14)), 'delivery still reports the gap, never throws the redirect').to.equal('gap');
+			await noticed;
+			expect(notices).to.have.length(1);
+			expect(notices[0]!.preAnnounced).to.equal(false);
+			expect(notices[0]!.plan.lastRevision, 'continuous across the rotation').to.equal(10);
 		});
 	});
 });
