@@ -13,7 +13,9 @@
  *  - **CheckpointWindow** — `fromRevision` is below the ring but within the parent checkpoint
  *    (`checkpoint.from ≤ fromRevision < ringLow`). Returns the {@link CheckpointSummary} + the ring's
  *    `recentEntries`. The subscriber applies the merged digest, then replays the recent entries deduped
- *    against `lastRevision`. One RT.
+ *    against `lastRevision`. One RT. A new tail that took over across a rotation also serves this variant
+ *    from the **inherited** handoff checkpoint when the rolling one misses but the inherited one covers
+ *    `fromRevision` (`docs/reactivity.md` §Tail rotation step 5 — "the new tail holds the old checkpoint").
  *  - **OutOfWindow** — older than even the checkpoint. Returns `currentTailId` + `currentRevision`; the
  *    subscriber falls back to a chain read, then a fresh subscribe.
  *  - **TailRotated** — the request's `latestKnownTailId` does not match the cohort's current tail (the
@@ -43,6 +45,7 @@ import {
 	requireV1,
 } from "./wire-validate.js";
 import { validateCheckpointSummary, verifyCheckpointEndpoints, type CheckpointSummary, type RollingCheckpoint } from "./checkpoint.js";
+import { checkpointCovers } from "./rotation.js";
 import type { ReplayBuffer } from "./replay-buffer.js";
 import type { ReactivitySubscriber } from "./subscriber.js";
 import type { NotificationVerifier } from "./verify.js";
@@ -204,14 +207,20 @@ export function decodeResumeReplyV1(bytes: Uint8Array, maxMessageBytes?: number)
  *  1. **tail_rotated** — `req.latestKnownTailId !== currentTailId`. A stale tail means the tree migrated,
  *     so the lag classification below is moot.
  *  2. **backfill** — `fromRevision` is at/above the replay ring's low edge (within, or already current).
- *  3. **checkpoint_window** — below the ring but within the rolling checkpoint's covered range.
- *  4. **out_of_window** — older than even the checkpoint (or both windows are empty).
+ *  3. **checkpoint_window** (rolling) — below the ring but within the rolling checkpoint's covered range.
+ *  4. **checkpoint_window** (inherited) — below *both* the ring and the rolling checkpoint, but within the
+ *     `inherited` cross-rotation handoff checkpoint this (new) tail holds (`docs/reactivity.md` §Tail
+ *     rotation step 5 — "the new tail holds the old checkpoint"). The rolling checkpoint wins when both
+ *     cover `fromRevision` (it is the fresher, narrower window); the inherited one is the deeper,
+ *     last-resort window, consulted only when the rolling one misses.
+ *  5. **out_of_window** — older than even the inherited checkpoint (or every window is empty/absent).
  */
 export function classifyResume(
 	req: ResumeV1,
 	buffer: ReplayBuffer,
 	checkpoint: RollingCheckpoint | undefined,
 	currentTailId: string,
+	inherited?: CheckpointSummary,
 ): ResumeResult {
 	if (req.latestKnownTailId !== currentTailId) {
 		return "tail_rotated";
@@ -223,6 +232,9 @@ export function classifyResume(
 	if (checkpoint !== undefined && checkpoint.covers(req.fromRevision)) {
 		return "checkpoint_window";
 	}
+	if (inherited !== undefined && checkpointCovers(inherited, req.fromRevision)) {
+		return "checkpoint_window";
+	}
 	return "out_of_window";
 }
 
@@ -232,6 +244,13 @@ export interface ResumeServingDeps {
 	readonly buffer: ReplayBuffer;
 	/** The cohort's rolling parent checkpoint (the live `PushState.checkpoint`). */
 	readonly checkpoint?: RollingCheckpoint;
+	/**
+	 * The checkpoint migrated from the **outgoing** tail when this cohort became the new tail across a
+	 * rotation (the live `PushState.inheritedCheckpoint`). Consulted only when the rolling {@link checkpoint}
+	 * does not cover `fromRevision`, so a resume whose span crosses the rotation is answered from the
+	 * inherited window instead of falling to `out_of_window` (`docs/reactivity.md` §Tail rotation step 5).
+	 */
+	readonly inheritedCheckpoint?: CheckpointSummary;
 	/** The cohort's current tail block id, base64url. */
 	readonly currentTailId: string;
 	/** Highest committed revision the cohort knows (the live `PushState.lastRevision`). */
@@ -251,7 +270,7 @@ export function serveResume(req: ResumeV1, deps: ResumeServingDeps): ResumeReply
 	if (req.collectionId !== deps.expectedCollectionId) {
 		failWire(`serveResume: request collectionId does not match this cohort's collection`);
 	}
-	const result = classifyResume(req, deps.buffer, deps.checkpoint, deps.currentTailId);
+	const result = classifyResume(req, deps.buffer, deps.checkpoint, deps.currentTailId, deps.inheritedCheckpoint);
 	switch (result) {
 		case "backfill": {
 			const high = deps.buffer.highRevision ?? deps.currentRevision;
@@ -259,8 +278,12 @@ export function serveResume(req: ResumeV1, deps: ResumeServingDeps): ResumeReply
 			return { v: 1, result, entries, currentRevision: deps.currentRevision };
 		}
 		case "checkpoint_window": {
-			// covers() was true ⇒ the rolling checkpoint is non-empty ⇒ summary() is defined.
-			const summary = deps.checkpoint!.summary()!;
+			// The rolling checkpoint wins when it covers `fromRevision` (the fresher, narrower window; its
+			// covers() being true ⇒ it is non-empty ⇒ summary() is defined). Otherwise the inherited
+			// cross-rotation handoff checkpoint covers it (classifyResume guaranteed one of the two does).
+			const summary = deps.checkpoint !== undefined && deps.checkpoint.covers(req.fromRevision)
+				? deps.checkpoint.summary()!
+				: deps.inheritedCheckpoint!;
 			const recentEntries = deps.buffer.entries().map((e) => e.payload);
 			return { v: 1, result, checkpoint: summary, recentEntries, currentRevision: deps.currentRevision };
 		}

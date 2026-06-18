@@ -29,11 +29,12 @@
  * Coordination with [reactivity-backfill-resume-checkpoints]: that ticket owns the `ResumeReplyV1.TailRotated`
  * variant and the `latestKnownTailId`-staleness classification; this ticket produces the handoff checkpoint
  * and the rotation *condition*. The new tail's {@link PushState.inheritedCheckpoint} (set by
- * {@link applyRotationHandoff}) is the seam the resume classifier is *intended* to consult to answer a
- * checkpoint-window resume whose span crosses the rotation — but `classifyResume`/`serveResume` do **not**
- * yet read it (they consult only the rolling `checkpoint`), so a cross-rotation resume currently falls to
- * `out_of_window`. Wiring it in is the open "Handoff ↔ resume coordination" follow-on tracked by
- * `tickets/plan/12.5-reactivity-tail-rotation-transport`.
+ * {@link applyRotationHandoff}) is the seam the resume classifier consults to answer a checkpoint-window
+ * resume whose span crosses the rotation: `classifyResume`/`serveResume` now read it (after the rolling
+ * `checkpoint` misses) and serve the inherited summary, so a cross-rotation resume no longer falls to
+ * `out_of_window` (`docs/reactivity.md` §Resume, §Tail rotation step 5). The drain-window redirect a new
+ * subscription receives, {@link RotationRedirectV1}, is serialized by {@link validateRotationRedirectV1} and
+ * rides the recover reply envelope as `kind: "rotated"` ({@link import("./recover.js").RecoverReplyV1}).
  */
 
 import { bytesToB64url, b64urlToBytes } from "../cohort-topic/wire/codec.js";
@@ -45,6 +46,7 @@ import { buildCheckpointSummary, type CheckpointSummary } from "./checkpoint.js"
 import { reactivityTopicId } from "./topic-anchor.js";
 import type { PushState } from "./push-state.js";
 import type { NotificationV1, RotationHintV1 } from "./wire.js";
+import { asObject, b64urlField, failWire, reqIntInRange, reqString, requireV1 } from "./wire-validate.js";
 
 // --- pre-announce + subscriber-side detection --------------------------------
 
@@ -197,6 +199,29 @@ export interface RotationRedirectV1 {
 	readonly newTopicId: string;
 	/** Revision at which the rotation took effect. */
 	readonly effectiveAtRevision: number;
+}
+
+/**
+ * Narrow an already-parsed value to a {@link RotationRedirectV1}, throwing {@link CohortWireError} on any
+ * defect. The redirect rides the recover reply envelope as `kind: "rotated"`
+ * ({@link import("./recover.js").RecoverReplyV1}); it carries no signature — like the other recover reply
+ * variants it is an unauthenticated routing hint (the subscriber re-walks and verifies the new tree on
+ * arrival), so its trust comes from the new tree, not the redirect.
+ */
+export function validateRotationRedirectV1(value: unknown): RotationRedirectV1 {
+	const what = "RotationRedirectV1";
+	const obj = asObject(value, what);
+	requireV1(obj, what);
+	if (obj["result"] !== "rotated") {
+		failWire(`${what}: field "result" must be "rotated"`);
+	}
+	return {
+		v: 1,
+		result: "rotated",
+		newTailId: b64urlField(reqString(obj, "newTailId", what), "newTailId", what),
+		newTopicId: b64urlField(reqString(obj, "newTopicId", what), "newTopicId", what),
+		effectiveAtRevision: reqIntInRange(obj, "effectiveAtRevision", what, 0),
+	};
 }
 
 /** The drain gate's decision for one inbound request. */

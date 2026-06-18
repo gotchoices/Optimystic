@@ -9,6 +9,7 @@ import {
 	buildRotationHandoffCheckpoint,
 	applyRotationHandoff,
 	checkpointCovers,
+	validateRotationRedirectV1,
 	verifyCheckpointEndpoints,
 	reactivityTopicId,
 	PushState,
@@ -21,6 +22,7 @@ import {
 } from '../../src/reactivity/index.js';
 import { createRejoinJitter } from '../../src/cohort-topic/antiflood/jitter.js';
 import { bytesToB64url, b64urlToBytes } from '../../src/cohort-topic/wire/codec.js';
+import { CohortWireError } from '../../src/cohort-topic/wire/validate.js';
 
 const b = (n: number): string => bytesToB64url(new Uint8Array([n]));
 const TAIL_OLD = b(5);
@@ -235,6 +237,48 @@ describe('reactivity tail rotation', () => {
 		it('returns undefined when the outgoing tail ring is empty (nothing to migrate)', () => {
 			const empty = new PushState({ collectionId: b(1), topicId: b(3), tailIdAtJoin: TAIL_OLD });
 			expect(buildRotationHandoffCheckpoint(empty)).to.equal(undefined);
+		});
+	});
+
+	describe('validateRotationRedirectV1 (the recover-reply redirect codec)', () => {
+		const redirect = {
+			v: 1,
+			result: 'rotated',
+			newTailId: TAIL_NEW,
+			newTopicId: bytesToB64url(reactivityTopicId(b64urlToBytes(TAIL_NEW))),
+			effectiveAtRevision: 5401,
+		};
+
+		it('accepts a well-formed redirect', () => {
+			expect(validateRotationRedirectV1(redirect)).to.deep.equal(redirect);
+		});
+
+		it('rejects a non-object', () => {
+			expect(() => validateRotationRedirectV1(null)).to.throw(CohortWireError);
+			expect(() => validateRotationRedirectV1(42)).to.throw(CohortWireError);
+		});
+
+		it('rejects a wrong version', () => {
+			expect(() => validateRotationRedirectV1({ ...redirect, v: 2 })).to.throw(CohortWireError, /v ===/);
+		});
+
+		it('rejects a wrong result discriminant', () => {
+			expect(() => validateRotationRedirectV1({ ...redirect, result: 'promoted' })).to.throw(CohortWireError, /result/);
+		});
+
+		it('rejects a malformed newTailId / newTopicId', () => {
+			expect(() => validateRotationRedirectV1({ ...redirect, newTailId: '@@@@' })).to.throw(CohortWireError, /newTailId/);
+			expect(() => validateRotationRedirectV1({ ...redirect, newTopicId: '@@@@' })).to.throw(CohortWireError, /newTopicId/);
+		});
+
+		it('rejects a missing newTailId', () => {
+			const { newTailId, ...rest } = redirect;
+			expect(() => validateRotationRedirectV1(rest)).to.throw(CohortWireError, /newTailId/);
+		});
+
+		it('rejects a negative or non-integer effectiveAtRevision', () => {
+			expect(() => validateRotationRedirectV1({ ...redirect, effectiveAtRevision: -1 })).to.throw(CohortWireError, /effectiveAtRevision/);
+			expect(() => validateRotationRedirectV1({ ...redirect, effectiveAtRevision: 1.5 })).to.throw(CohortWireError, /effectiveAtRevision/);
 		});
 	});
 });

@@ -103,6 +103,13 @@ const serveDeps = (state: PushState, currentTailId = TAIL) => ({
 	expectedCollectionId: COLLECTION,
 });
 
+/** A standalone {@link CheckpointSummary} over `[fromRev, toRev]` — stands in for the new tail's handoff. */
+function inheritedSummary(fromRev: number, toRev: number): CheckpointSummary {
+	const cp = new RollingCheckpoint({ collectionId: COLLECTION, span: toRev - fromRev + 1 });
+	for (let rev = fromRev; rev <= toRev; rev++) cp.retire({ revision: rev, payload: note(rev), receivedAt: 1000 + rev });
+	return cp.summary()!;
+}
+
 describe('reactivity resume — wire codecs', () => {
 	it('round-trips a ResumeV1', () => {
 		const req = resumeReq(1043);
@@ -179,6 +186,71 @@ describe('reactivity resume — classification + serving (stacked windows)', () 
 	it('rejects a resume for a different collection', async () => {
 		const state = await fedState(20);
 		expect(() => serveResume({ ...resumeReq(18), collectionId: bytesToB64url(new Uint8Array([9])) }, serveDeps(state))).to.throw(CohortWireError, /collectionId/);
+	});
+});
+
+describe('reactivity resume — inherited (cross-rotation) checkpoint', () => {
+	it('classifies + serves a resume below both windows from the inherited checkpoint', async () => {
+		const state = await fedState(20); // ring [17,18,19,20], rolling checkpoint [9,16]
+		const inherited = inheritedSummary(1, 8); // the handoff window the new tail holds, below the rolling checkpoint
+		const req = resumeReq(5); // below ringLow (17) and the rolling checkpoint low (9), but inside [1,8]
+		// Without the inherited checkpoint this is out_of_window; with it, the new tail answers from the handoff.
+		expect(classifyResume(req, state.replayBuffer, state.checkpoint, TAIL)).to.equal('out_of_window');
+		expect(classifyResume(req, state.replayBuffer, state.checkpoint, TAIL, inherited)).to.equal('checkpoint_window');
+		const reply = serveResume(req, { ...serveDeps(state), inheritedCheckpoint: inherited });
+		expect(reply.result).to.equal('checkpoint_window');
+		expect(reply.checkpoint!.fromRevision).to.equal(1);
+		expect(reply.checkpoint!.toRevision).to.equal(8);
+		// Same shape as the rolling-checkpoint branch: the inherited summary + the live ring's recent entries.
+		expect(reply.recentEntries!.map((e) => e.revision)).to.deep.equal([17, 18, 19, 20]);
+		expect(reply.currentRevision).to.equal(20);
+	});
+
+	it('prefers the rolling checkpoint when both it and the inherited one cover fromRevision', async () => {
+		const state = await fedState(20); // rolling checkpoint [9,16]
+		const inherited = inheritedSummary(1, 16); // overlaps the rolling window from below
+		const req = resumeReq(12); // 12 sits inside both windows → rolling wins (the fresher, narrower window)
+		expect(classifyResume(req, state.replayBuffer, state.checkpoint, TAIL, inherited)).to.equal('checkpoint_window');
+		const reply = serveResume(req, { ...serveDeps(state), inheritedCheckpoint: inherited });
+		expect(reply.checkpoint!.fromRevision).to.equal(9); // rolling, not the inherited low edge (1)
+		expect(reply.checkpoint!.toRevision).to.equal(16);
+		// A resume at exactly the rolling checkpoint's low edge still classifies rolling, not inherited.
+		const lowEdge = serveResume(resumeReq(9), { ...serveDeps(state), inheritedCheckpoint: inherited });
+		expect(lowEdge.checkpoint!.fromRevision).to.equal(9);
+	});
+
+	it('prefers the ring (backfill) over an inherited checkpoint when fromRevision is above the ring low', async () => {
+		const state = await fedState(20); // ring [17,18,19,20]
+		const inherited = inheritedSummary(1, 16);
+		const req = resumeReq(18); // inside the ring → backfill regardless of the inherited window
+		expect(classifyResume(req, state.replayBuffer, state.checkpoint, TAIL, inherited)).to.equal('backfill');
+	});
+
+	it('is unchanged (out_of_window) when no inherited checkpoint is supplied', async () => {
+		const state = await fedState(20);
+		const req = resumeReq(5);
+		expect(classifyResume(req, state.replayBuffer, state.checkpoint, TAIL, undefined)).to.equal('out_of_window');
+		const reply = serveResume(req, serveDeps(state)); // serveDeps carries no inheritedCheckpoint
+		expect(reply.result).to.equal('out_of_window');
+		expect(reply.currentTailId).to.equal(TAIL);
+		expect(reply.currentRevision).to.equal(20);
+	});
+
+	it('subscriber-side: a non-abutting inherited checkpoint reply is still rejected (chain-reads)', async () => {
+		// The serve picks the inherited branch on checkpointCovers (inclusive span), blind to the subscriber's
+		// contiguity head. The subscriber's existing guard must still fire for an inherited summary: a low edge
+		// above `lastRevision + 1` leaves an un-summarized gap, so the reply must not advance state.
+		const verifier = realishVerifier([SIGNER_A, SIGNER_B], 2);
+		const delivered: number[] = [];
+		const chainReads: Array<[string | undefined, number | undefined]> = [];
+		const inherited = inheritedSummary(100, 116); // endpoints verify, but low edge 100 ≫ head 11 + 1
+		const reply: ResumeReplyV1 = { v: 1, result: 'checkpoint_window', checkpoint: inherited, recentEntries: [note(117)], currentRevision: 117 };
+		const sub = createReactivitySubscriber({ collectionId: COLLECTION, verifier, deliver: (n) => delivered.push(n.revision), lastKnownRev: 11 });
+		const outcome = await applyResumeReply(reply, { subscriber: sub, verifier, onChainRead: (t, r) => chainReads.push([t, r]) });
+		expect(outcome).to.equal('checkpoint_untrusted');
+		expect(chainReads).to.have.length(1);
+		expect(delivered).to.have.length(0); // never advanced past the gap
+		expect(sub.lastRevision).to.equal(11);
 	});
 });
 

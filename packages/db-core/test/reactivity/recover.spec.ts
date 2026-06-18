@@ -14,6 +14,7 @@ import {
 	type ResumeV1,
 	type RecoverRequestV1,
 	type RecoverReplyV1,
+	type RotationRedirectV1,
 	type NotificationV1,
 } from '../../src/reactivity/index.js';
 import { bytesToB64url } from '../../src/cohort-topic/wire/codec.js';
@@ -30,6 +31,10 @@ const resumeSignable: ResumeSignable = { v: 1, collectionId: COLLECTION, fromRev
 
 const backfill: BackfillV1 = { ...backfillSignable, signature: SIG };
 const resume: ResumeV1 = { ...resumeSignable, signature: SIG };
+
+const NEW_TAIL = bytesToB64url(new Uint8Array([6, 6, 6, 6]));
+const NEW_TOPIC = bytesToB64url(new Uint8Array([7, 7, 7, 7]));
+const rotated: RotationRedirectV1 = { v: 1, result: 'rotated', newTailId: NEW_TAIL, newTopicId: NEW_TOPIC, effectiveAtRevision: 5401 };
 
 function note(revision: number): NotificationV1 {
 	return {
@@ -153,6 +158,46 @@ describe('reactivity recover — RecoverRequestV1 / RecoverReplyV1 envelope', ()
 	it('rejects a reply with an unknown kind', () => {
 		const bad = { v: 1, kind: 'rotate', backfillReply: { v: 1, entries: [], available: { fromRevision: 0, toRevision: 0 } } };
 		expect(() => encodeRecoverReplyV1(bad as unknown as RecoverReplyV1)).to.throw(CohortWireError, /kind/);
+	});
+
+	it('round-trips a rotated reply (the RotationRedirectV1 rides the recover reply as kind "rotated")', () => {
+		const reply: RecoverReplyV1 = { v: 1, kind: 'rotated', rotated };
+		expect(decodeRecoverReplyV1(encodeRecoverReplyV1(reply))).to.deep.equal(reply);
+	});
+
+	it('rejects a rotated reply carrying a stray resumeReply', () => {
+		const bad = { v: 1, kind: 'rotated', rotated, resumeReply: { v: 1, result: 'out_of_window', currentTailId: TAIL, currentRevision: 1 } };
+		expect(() => encodeRecoverReplyV1(bad as unknown as RecoverReplyV1)).to.throw(CohortWireError, /does not match/);
+	});
+
+	it('rejects a rotated reply carrying a stray backfillReply', () => {
+		const bad = { v: 1, kind: 'rotated', rotated, backfillReply: { v: 1, entries: [], available: { fromRevision: 0, toRevision: 0 } } };
+		expect(() => encodeRecoverReplyV1(bad as unknown as RecoverReplyV1)).to.throw(CohortWireError, /does not match/);
+	});
+
+	it('rejects a resume reply carrying a stray rotated body', () => {
+		const bad = { v: 1, kind: 'resume', resumeReply: { v: 1, result: 'out_of_window', currentTailId: TAIL, currentRevision: 1 }, rotated };
+		expect(() => encodeRecoverReplyV1(bad as unknown as RecoverReplyV1)).to.throw(CohortWireError, /does not match/);
+	});
+
+	it('rejects a backfill reply carrying a stray rotated body', () => {
+		const bad = { v: 1, kind: 'backfill', backfillReply: { v: 1, entries: [], available: { fromRevision: 0, toRevision: 0 } }, rotated };
+		expect(() => encodeRecoverReplyV1(bad as unknown as RecoverReplyV1)).to.throw(CohortWireError, /does not match/);
+	});
+
+	it('rejects a rotated reply with no rotated body', () => {
+		const bad = { v: 1, kind: 'rotated' }; // the declared kind has no matching body
+		expect(() => encodeRecoverReplyV1(bad as unknown as RecoverReplyV1)).to.throw(CohortWireError);
+	});
+
+	it('rejects a rotated reply with a malformed newTopicId', () => {
+		const bad = { v: 1, kind: 'rotated', rotated: { ...rotated, newTopicId: '@@@@' } };
+		expect(() => encodeRecoverReplyV1(bad as unknown as RecoverReplyV1)).to.throw(CohortWireError, /newTopicId/);
+	});
+
+	it('rejects a rotated reply with a negative effectiveAtRevision', () => {
+		const bad = { v: 1, kind: 'rotated', rotated: { ...rotated, effectiveAtRevision: -1 } };
+		expect(() => encodeRecoverReplyV1(bad as unknown as RecoverReplyV1)).to.throw(CohortWireError, /effectiveAtRevision/);
 	});
 
 	it('respects the maxMessageBytes bound like the sibling codecs', () => {

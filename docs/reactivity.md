@@ -291,6 +291,16 @@ RevisionEntry {
 > `ReactivitySubscriber.rebaseline` before replaying `recentEntries`; an untrusted checkpoint or
 > out-of-window escalates to a chain read; a stale tail escalates to re-registration). db-p2p's
 > `ReactivitySubscriptionManager.resume()` drives the RPC and keeps the Edge `StickyCohortHintCache`.
+>
+> **Cross-rotation resume** (`12.51-reactivity-rotation-resume-handoff-and-redirect-codec`). When a cohort
+> took over as the new tail across a rotation it holds the outgoing tail's handoff in
+> `PushState.inheritedCheckpoint` (§Tail rotation step 5). `classifyResume`/`serveResume` consult it (via the
+> optional `inherited` param / `ResumeServingDeps.inheritedCheckpoint`) **after** the rolling checkpoint
+> misses: a resume whose `fromRevision` falls below both the ring and the rolling checkpoint but inside the
+> inherited window is served as `CheckpointWindow` from the inherited summary (plus the live ring's
+> `recentEntries`) instead of falling to `OutOfWindow`. The rolling checkpoint wins when both cover
+> `fromRevision`. The subscriber-side apply is unchanged — an inherited checkpoint is a `CheckpointSummary`
+> like any other, so the existing endpoint-verification and non-abutting guards apply verbatim.
 
 A subscriber resuming from sleep sends:
 
@@ -301,8 +311,8 @@ ResumeV1 { v, collectionId, fromRevision, latestKnownTailId, subscriberCoord, ti
 to its cached `primary` (or any cohort member if primary is stale). The cohort responds with one of:
 
 - `Backfill { entries, currentRevision }` — `fromRevision` is within the replay window. Subscriber replays entries, dedupes, and is current. Single round trip.
-- `CheckpointWindow { checkpoint, recentEntries }` — `fromRevision` is older than the buffer but within parent-checkpoint range (see below). Subscriber verifies the checkpoint's bracketing endpoints, applies the merged digest, advances its contiguity head past the summarized range, then replays the recent entries.
-- `OutOfWindow { currentTailId, currentRevision }` — `fromRevision` is older than even the parent checkpoint. Subscriber falls back to a chain read, then a fresh subscribe.
+- `CheckpointWindow { checkpoint, recentEntries }` — `fromRevision` is older than the buffer but within parent-checkpoint range (see below). Subscriber verifies the checkpoint's bracketing endpoints, applies the merged digest, advances its contiguity head past the summarized range, then replays the recent entries. A cohort that took over as the new tail across a rotation also answers this from its **inherited handoff checkpoint** when the rolling one misses (§Tail rotation step 5) — the inherited window is the deeper, last-resort window; the rolling checkpoint wins when both cover `fromRevision`.
+- `OutOfWindow { currentTailId, currentRevision }` — `fromRevision` is older than even the parent checkpoint (and, on a new tail, older than the inherited handoff checkpoint too). Subscriber falls back to a chain read, then a fresh subscribe.
 - `TailRotated { newTailId, newRevisionAtRotation }` — `latestKnownTailId` is stale. Subscriber re-registers under the new tail and replays from the new tree. This is classified **first**: a stale tail means the whole tree migrated, so the lag-against-windows classification is moot. (The rotation *lifecycle* is owned by [reactivity-rotation-backpressure-policy]; this resume path only *detects* the stale tail.)
 
 **Resume-on-rotation → keep the simple full walk (resolved, `11.5`).** On `TailRotated` the subscriber re-registers under the new tail via the ordinary walk from `d_max`. The Edge **sticky `cohortHint` cache** already shortcuts the *common* case — a brief flap with no rotation resumes against the cached primary in one round trip (the cache is invalidated only on an actual `TailRotated`, so a stale-tree primary is never reused). A pre-dial toward the pre-announced successor coord (from the `rotationHint`) is **deferred to the rotation ticket**: it requires rotation-side announce state (the successor coord is not knowable until the filling commit), so it belongs with the rotation lifecycle rather than the resume classifier.
@@ -402,13 +412,13 @@ Tail block ID changes when a block fills (default `block_fill_size = 64` transac
 
 1. **Pre-announce.** While committing the block-filling transaction, the outgoing tail cohort embeds `rotationHint{ newTailId, effectiveAtRevision }` in the notification. The hint reaches every active subscriber via the existing tree.
 
-2. **Drain.** The outgoing tail cohort continues to accept renewals and serve replays for `T_drain` (default 60 s) after rotation. New subscriptions are rejected with a `Promoted`-shaped redirect to the new `topicId`'s tree.
+2. **Drain.** The outgoing tail cohort continues to accept renewals and serve replays for `T_drain` (default 60 s) after rotation. New subscriptions are rejected with a `Promoted`-shaped redirect (`RotationRedirectV1 { v, result: "rotated", newTailId, newTopicId, effectiveAtRevision }`) to the new `topicId`'s tree. The redirect is serialized by `validateRotationRedirectV1` and **rides the recover reply envelope as `kind: "rotated"`** (`RecoverReplyV1`, §Wire formats) — the recover request-reply protocol is the only reactivity surface a subscriber reaches a serving cohort on, since a fresh subscribe rides generic cohort-topic `service.register` whose walk understands only tier-`Promoted`, never a topic redirect. A peer predating the `"rotated"` kind fails the reply closed and chain-reads (safe), so the redirect is an optimization, never a correctness dependency.
 
 3. **Subscriber re-registration with jitter.** Subscribers, on receiving the rotation hint, schedule re-registration at the new `topicId` with random jitter over `T_rejoin_jitter` (default 30 s). Re-registration carries the subscriber's existing `lastRevision`; revisions are continuous across rotations, so no replay confusion.
 
 4. **Forwarder draining.** Forwarder cohorts under the old tail observe their direct-subscriber count dropping (subscribers re-registering under the new tail) and demote naturally per the cohort-topic demotion protocol. They do not migrate state to the new tree — the new tree rebuilds via re-registration.
 
-5. **Replay-buffer handoff to checkpoint.** As the outgoing tail cohort drains, it folds its replay buffer into a final `CheckpointSummary` covering `[lastCheckpoint.toRevision + 1, rotationRevision]` and hands it to the new tail cohort. This is the only state migration across rotations. The new tail cohort holds the old checkpoint to serve `ResumeV1` requests that span the rotation.
+5. **Replay-buffer handoff to checkpoint.** As the outgoing tail cohort drains, it folds its replay buffer into a final `CheckpointSummary` covering `[lastCheckpoint.toRevision + 1, rotationRevision]` and hands it to the new tail cohort (`buildRotationHandoffCheckpoint` → `applyRotationHandoff`, landing on `PushState.inheritedCheckpoint`). This is the only state migration across rotations. The new tail cohort holds the old checkpoint to serve `ResumeV1` requests that span the rotation: `classifyResume`/`serveResume` consult the inherited checkpoint after the rolling one misses (§Resume), so a cross-rotation resume is answered as `CheckpointWindow` from the inherited summary rather than `OutOfWindow`.
 
 ### Anticipatory warm-up
 
