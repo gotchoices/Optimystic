@@ -456,6 +456,38 @@ describe('reactivity / subscription manager', () => {
 			expect(notices, 'guarded once-per-successor by rotationHandledFor').to.have.length(1);
 		});
 
+		it('shares the once-per-successor seam across notify-driven and recover-driven surfacing (same successor deduped, a chained one re-fires)', async () => {
+			// The central claim of the surfaceRotation extraction: notify-driven detection and recover-driven
+			// redirects funnel through one rotationHandledFor guard, so they cross-dedup.
+			const notices: RotationNotice[] = [];
+			const manager = new ReactivitySubscriptionManager({
+				service: new RecordingService(new FixedVerifier('verified')),
+				collectionId: COLLECTION,
+				tailIdAtAttach: TAIL,
+				deliver: () => {},
+				lastKnownRev: 41,
+				signResume: () => bytesToB64url(new Uint8Array([1])),
+				resumeTransport: () => Promise.reject(new RotationRedirectError(redirect())),
+				rejoinJitter: createRejoinJitter({ random: () => 0.5 }),
+				clock: () => 1_000,
+				onRotation: (n) => notices.push(n),
+			});
+			// Notify-driven detection surfaces successor REDIRECT_TAIL first (a pre-announce on rev 42).
+			const announce: NotificationV1 = { ...noteB64(42), rotationHint: { newTailId: bytesToB64url(REDIRECT_TAIL), effectiveAtRevision: 50 } };
+			await manager.onNotification(announce);
+			expect(notices, 'notify-driven surfaced the successor').to.have.length(1);
+			expect(notices[0]!.preAnnounced).to.equal(true);
+			// A recover redirect to the SAME successor is deduped through the shared rotationHandledFor seam.
+			expect(await manager.resume()).to.equal('tail_rotated');
+			expect(notices, 'recover-driven redirect to the same successor is deduped').to.have.length(1);
+			// A genuinely chained successor (≠ the handled one) still re-fires through the same guard.
+			const CHAINED = new Uint8Array([7, 7, 7, 7]);
+			const chained: NotificationV1 = { ...noteB64(43), rotationHint: { newTailId: bytesToB64url(CHAINED), effectiveAtRevision: 60 } };
+			await manager.onNotification(chained);
+			expect(notices, 'a chained successor re-fires through the shared guard').to.have.length(2);
+			expect(notices[1]!.newTailId).to.equal(bytesToB64url(CHAINED));
+		});
+
 		it('with no onRotation configured a redirect still invalidates the sticky cache and resolves tail_rotated', async () => {
 			const manager = new ReactivitySubscriptionManager({
 				service: new RecordingService(new FixedVerifier('verified')),
