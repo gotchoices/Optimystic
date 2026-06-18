@@ -10,19 +10,23 @@
  * composition that constructs the manager + binds this scheduler to its `onRotation` observer lives in
  * `reactivity-rotation-host-wiring-e2e`; this module is the standalone, unit-testable piece.
  *
- * **!!! Load-bearing jitter contract — the composing site MUST honor this !!!**
- * The staggering that keeps the new tail from being flooded lives entirely in `plan.fireAt`, which is drawn
- * by the **manager's** `rejoinJitter` (`planReRegistration` / `planReRegistrationWave`). This scheduler only
- * *consumes* `plan.fireAt` — it never sees the jitter and so cannot enforce the bound. Wherever the manager's
- * `rejoinJitter` is constructed (the subscribe factory / `reactivity-rotation-host-wiring-e2e`) it MUST be
+ * **Where the stagger lives.** The spread that keeps the new tail from being flooded is entirely in
+ * `plan.fireAt`, drawn by the **manager's** `rejoinJitter`. This scheduler only *consumes* `plan.fireAt`; it
+ * never sees the jitter. The manager uses the *single*-subscriber planner `planReRegistration` →
+ * `RejoinJitter.scheduleRejoin`, which draws a **uniform** offset `now + ⌊U[0, T_rejoin_jitter)⌋` — so the
+ * load-bearing knob for this path is the **window** `T_rejoin_jitter` (default 30 s), not a `capPromote`. Each
+ * subscriber jitters independently, giving the new tail an inbound rate of ≈ `subscribers / T_rejoin_jitter`
+ * in expectation; the burst is absorbed on the *receiving* side by the new tail cohort's `cap_promote_fast`
+ * fast-promotion (a cohort-topic promotion mechanism — see `docs/reactivity.md` §Tail rotation rotation-cost
+ * and the Worked scenario), which is independent of the jitter's `capPromote`.
  *
- *   `createRejoinJitter({ capPromote: DEFAULT_CAP_PROMOTE_FAST })`   // cap_promote_fast = 32
- *
- * and **NOT** the default `createRejoinJitter()`, whose cap is the cohort-failure `cap_promote = 64`. The
- * rotation wave path must bound the new tail's inbound to `cap_promote_fast` (32); the default cap bounds the
- * wave to 64/window and *silently* overruns the documented rotation burst ceiling (11.5
- * `planReRegistrationWave` JSDoc; `docs/reactivity.md` §Tail rotation rotation-cost / Worked — peak = 32).
- * This JSDoc states the contract loudly so the construction site honors it and a reviewer checks it.
+ * Note that `RejoinJitter`'s `capPromote` is consulted **only** by the *wave* planner
+ * `scheduleWave` / `planReRegistrationWave` (a single host staggering a whole wave with a hard per-window
+ * ceiling — used by the mesh harness, not by the production manager). If the composing site
+ * (`reactivity-rotation-host-wiring-e2e`) ever switches the manager onto the wave planner, *then* it must
+ * build the jitter as `createRejoinJitter({ capPromote: DEFAULT_CAP_PROMOTE_FAST })` (= 32), since the default
+ * `createRejoinJitter()` cap is the cohort-failure `cap_promote = 64`. For the current single-planner path,
+ * setting `capPromote` has **no effect** on `fireAt`.
  *
  * **Determinism.** An injected `setTimer(fn, delayMs) => cancel` and `now()` clock make the scheduler
  * testable with a fake clock (no wall clock). They default to a production binding: an **unref'd**
@@ -84,8 +88,8 @@ export interface RotationReRegistrationSchedulerOptions {
  * subscription manager and bind {@link schedule} to the manager's
  * {@link import("./subscription-manager.js").ReactivitySubscriptionManagerOptions.onRotation} observer.
  *
- * See the module doc for the **load-bearing `cap_promote_fast` jitter contract** the composing site owes
- * (this scheduler consumes `plan.fireAt`; it does not draw it).
+ * See the module doc for where the re-registration stagger actually lives (the manager's `rejoinJitter`; this
+ * scheduler only consumes `plan.fireAt`, it does not draw it).
  */
 export class RotationReRegistrationScheduler {
 	private readonly reRegister: (plan: ReRegistrationPlan) => Promise<void>;
@@ -180,9 +184,10 @@ export class RotationReRegistrationScheduler {
 		}
 		// A failed move must never throw out of the timer callback — an escaping throw / unhandled rejection
 		// would surface on the host event loop. Guard BOTH a rejected promise and a (mis-implemented) seam that
-		// throws synchronously. `seen` retains the key so a duplicate notice still no-ops. No retry this pass — a
-		// missed move is recovered when the next notification re-detects the (still-current) rotation, or via the
-		// subscriber's normal recover/re-walk path.
+		// throws synchronously. `seen` retains the key so a duplicate notice still no-ops. No retry this pass —
+		// and because `seen` keeps the key, a re-notice for this *same* successor is deduped (the manager's
+		// `rotationHandledFor` already holds it too), so the recovery backstop for a failed move is the
+		// subscriber's normal recover/re-walk path, not a re-detected rotation to the same tail.
 		try {
 			void this.reRegister(plan).catch((err: unknown) => {
 				log("rotation re-registration rejected for successor topic=%s (isolated, not retried): %o", key, err);

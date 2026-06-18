@@ -287,6 +287,24 @@ describe('reactivity / rotation re-registration scheduler', () => {
 		await flush(); // a swallowed rejection must not surface as an unhandled rejection
 	});
 
+	it('a re-notice after a FAILED move stays deduped (no implicit retry to the same successor)', async () => {
+		const clock = new FakeScheduler();
+		const rec = recorder({ rejectTopics: [TOPIC_A] });
+		const sched = new RotationReRegistrationScheduler({ reRegister: rec.reRegister, setTimer: clock.setTimer, now: clock.clock });
+
+		sched.schedule(notice({ newTopicId: TOPIC_A, fireAt: 1_000 })); // will reject
+		clock.advance(1_000);
+		expect(rec.calls, 'the move was attempted once').to.have.length(1);
+		await flush(); // let the rejection settle
+
+		// The same successor re-surfaces (e.g. a later notification for the still-current rotation). Because the
+		// move failed but `seen` retains the key, this is a no-op — recovery is the recover/re-walk path, not a retry.
+		sched.schedule(notice({ newTopicId: TOPIC_A, fireAt: 2_000 }));
+		expect(sched.pendingCount, 'a failed successor is not rescheduled by a re-notice').to.equal(0);
+		clock.advance(5_000);
+		expect(rec.calls, 'still only the one (failed) attempt — no implicit retry').to.have.length(1);
+	});
+
 	it('production defaults (unref\'d setTimeout + Date.now) actually fire the move', async () => {
 		const rec = recorder();
 		const sched = new RotationReRegistrationScheduler({ reRegister: rec.reRegister }); // no injected timer/clock
