@@ -27,6 +27,7 @@ import {
 	type CommitCert,
 } from '@optimystic/db-core';
 import { peerIdToBytes } from '../../src/cohort-topic/peer-codec.js';
+import { reactivityTailBytes } from '../../src/cohort-topic/reactivity-membership-gate.js';
 import { ReactivitySubscriptionManager, type ReactivitySubscriptionManagerOptions, type RotationNotice } from '../../src/reactivity/subscription-manager.js';
 import { RotationRedirectError } from '../../src/reactivity/recover-transport.js';
 import { ReactivityOriginationManager } from '../../src/reactivity/origination-manager.js';
@@ -606,5 +607,73 @@ describe('reactivity / origination manager', () => {
 		service.onLocalCommit!(event, cert);
 		expect(emitted).to.have.length(1);
 		expect(emitted[0]!.rotationHint).to.deep.equal({ newTailId, effectiveAtRevision: event.rev + 1 });
+	});
+
+	describe('observe-rotation (markRotated fires on a tail-id change)', () => {
+		// Production-shaped resolveContext: ctx.tailId = reactivityTailBytes(event.tailId) (the membership-gate
+		// encoding), so the manager's oldTopicId is byte-identical to the topic a subscriber subscribes under.
+		const liveResolveContext = (e: CollectionChangeEvent) =>
+			e.tailId === undefined ? undefined : { tailId: reactivityTailBytes(e.tailId), deltaMaxBytes: 0 };
+		const eventOn = (tailId: string | undefined, rev: number): CollectionChangeEvent => ({
+			collectionId: bytesToB64url(COLLECTION),
+			blockIds: [bytesToB64url(new Uint8Array([5, 6]))],
+			actionId: `action-${rev}`,
+			rev,
+			tailId,
+		});
+		interface RotationCall { oldTopicId: Uint8Array; newTailId: string; effectiveAtRevision: number; now: number; }
+		const setup = () => {
+			const service = new RecordingService();
+			const calls: RotationCall[] = [];
+			const manager = new ReactivityOriginationManager({
+				service,
+				resolveContext: liveResolveContext,
+				emit: () => {},
+				clock: () => 5_000,
+				markRotated: (oldTopicId, redirect, now) => calls.push({ oldTopicId, newTailId: redirect.newTailId, effectiveAtRevision: redirect.effectiveAtRevision, now }),
+			});
+			manager.install();
+			return { service, calls };
+		};
+
+		it('records the baseline on the first commit (no rotation)', () => {
+			const { service, calls } = setup();
+			service.onLocalCommit!(eventOn('block-tail-old', 7), cert);
+			expect(calls, 'the first commit records the baseline, fires nothing').to.have.length(0);
+		});
+
+		it('fires markRotated with the correctly-encoded old topicId on a tail-id change', () => {
+			const { service, calls } = setup();
+			service.onLocalCommit!(eventOn('block-tail-old', 7), cert);
+			service.onLocalCommit!(eventOn('block-tail-new', 8), cert);
+			expect(calls, 'a tail-id change fires markRotated exactly once').to.have.length(1);
+			// The oldTopicId MUST be reactivityTopicId(reactivityTailBytes(oldTail)) — the SAME topic a subscriber
+			// subscribes under — NOT blockIdToBytes (double-hash). A mismatch would silently never redirect.
+			expect([...calls[0]!.oldTopicId], 'oldTopicId equals the topic the subscriber subscribed under').to.deep.equal([...reactivityTopicId(reactivityTailBytes('block-tail-old'))]);
+			expect(calls[0]!.newTailId, 'redirect names the new tail (reactivityTailBytes encoding)').to.equal(bytesToB64url(reactivityTailBytes('block-tail-new')));
+			expect(calls[0]!.effectiveAtRevision, 'effective at the rev the new tail first appeared').to.equal(8);
+			expect(calls[0]!.now, 'stamped from the manager clock').to.equal(5_000);
+		});
+
+		it('does not fire on same-tail commits; a tail-less commit never disturbs the retained baseline', () => {
+			const { service, calls } = setup();
+			service.onLocalCommit!(eventOn('block-tail-old', 7), cert);
+			service.onLocalCommit!(eventOn('block-tail-old', 8), cert); // same tail → no rotation
+			service.onLocalCommit!(eventOn(undefined, 9), cert); // tail-less → context undefined, never recorded/cleared
+			expect(calls, 'no rotation on same-tail or tail-less commits').to.have.length(0);
+			service.onLocalCommit!(eventOn('block-tail-new', 10), cert); // the tail changes from the retained baseline
+			expect(calls, 'the tail-less commit did not clear the baseline; the later change still fires once').to.have.length(1);
+			expect([...calls[0]!.oldTopicId]).to.deep.equal([...reactivityTopicId(reactivityTailBytes('block-tail-old'))]);
+		});
+
+		it('with markRotated absent, origination is unchanged (rotation observation is inert)', () => {
+			const service = new RecordingService();
+			const emitted: NotificationV1[] = [];
+			const manager = new ReactivityOriginationManager({ service, resolveContext: liveResolveContext, emit: (n) => emitted.push(n), clock: () => 1 });
+			manager.install();
+			service.onLocalCommit!(eventOn('block-tail-old', 7), cert);
+			service.onLocalCommit!(eventOn('block-tail-new', 8), cert);
+			expect(emitted, 'both commits still originate normally').to.have.length(2);
+		});
 	});
 });

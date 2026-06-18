@@ -1,11 +1,13 @@
 import { expect } from 'chai';
 import { generateKeyPair } from '@libp2p/crypto/keys';
 import { peerIdFromPrivateKey, peerIdFromString } from '@libp2p/peer-id';
-import { bytesToB64url } from '@optimystic/db-core';
+import { bytesToB64url, reactivityTopicId } from '@optimystic/db-core';
 import { createLibp2pNode } from '../../src/libp2p-node.js';
 import { DEFAULT_REACTIVITY_PROTOCOLS } from '../../src/reactivity/protocols.js';
 import { ReactivitySubscriberRegistry } from '../../src/reactivity/subscriber-registry.js';
 import { Libp2pReactivityRecoverTransport } from '../../src/reactivity/recover-transport.js';
+import { RotationReRegistrationScheduler } from '../../src/reactivity/rotation-rereg-scheduler.js';
+import type { RotationNotice } from '../../src/reactivity/subscription-manager.js';
 import { peerIdToBytes, bytesToPeerIdString } from '../../src/cohort-topic/peer-codec.js';
 import { edgeProfile } from '@optimystic/db-core';
 import type { CohortTopicHost } from '../../src/cohort-topic/host.js';
@@ -13,6 +15,20 @@ import type { CohortTopicHost } from '../../src/cohort-topic/host.js';
 const NOTIFY = DEFAULT_REACTIVITY_PROTOCOLS.notify;
 const PUSH_STATE_GOSSIP = DEFAULT_REACTIVITY_PROTOCOLS.pushStateGossip;
 const RECOVER = DEFAULT_REACTIVITY_PROTOCOLS.recover;
+
+/**
+ * A minimal rotation notice whose `fireAt` is ~1 hour out, used to probe the scheduler's accept/teardown
+ * state. The delay is well within setTimeout's 32-bit range (no overflow) yet far enough that the unref'd
+ * timer never actually fires during the test — we only assert it is *armed* then *cancelled by stop()*.
+ */
+function fakeRotationNotice(): RotationNotice {
+	const newTailId = new Uint8Array([1, 2, 3, 4]);
+	return {
+		newTailId: bytesToB64url(newTailId),
+		preAnnounced: false,
+		plan: { newTailId, newTopicId: reactivityTopicId(newTailId), lastRevision: 0, fireAt: Date.now() + 3_600_000 },
+	};
+}
 
 /**
  * **Reactivity node-wiring** (`12.33-reactivity-notification-transport`). A `cohortTopic`-enabled production
@@ -38,6 +54,7 @@ describe('reactivity / node wiring (real libp2p, solo forming node)', function (
 			arachnode: { enableRingZulu: false },
 			cohortTopic: { enabled: true },
 		});
+		let scheduler: RotationReRegistrationScheduler;
 		try {
 			const protocols: string[] = node.getProtocols();
 			expect(protocols, 'notify handler registered').to.include(NOTIFY);
@@ -61,6 +78,14 @@ describe('reactivity / node wiring (real libp2p, solo forming node)', function (
 			expect(host, 'cohort-topic host exposed').to.exist;
 			expect(typeof host.service.onLocalCommit, 'origination manager installed onLocalCommit').to.equal('function');
 			expect(host.profile.kind, 'default cohort profile is Core (forwards reactivity)').to.equal('core');
+
+			// The rotation re-registration scheduler is exposed (alongside reactivitySubscribers / reactivityRecover)
+			// for the deferred subscribe factory. Before teardown it accepts a notice, arming a re-registration timer
+			// (an unref'd setTimeout that never pins the process).
+			scheduler = node.reactivityRotation as RotationReRegistrationScheduler;
+			expect(scheduler, 'rotation re-registration scheduler exposed on the node').to.be.instanceOf(RotationReRegistrationScheduler);
+			scheduler.schedule(fakeRotationNotice());
+			expect(scheduler.pendingCount, 'a notice arms a re-registration timer').to.equal(1);
 		} finally {
 			await node.stop();
 		}
@@ -70,6 +95,13 @@ describe('reactivity / node wiring (real libp2p, solo forming node)', function (
 		expect(afterStop, 'notify handler unregistered on stop').to.not.include(NOTIFY);
 		expect(afterStop, 'push-state-gossip handler unregistered on stop').to.not.include(PUSH_STATE_GOSSIP);
 		expect(afterStop, 'recover handler unregistered on stop').to.not.include(RECOVER);
+
+		// node.stop() ran scheduler.stop() in its teardown wrapper: the pending timer was cancelled and further
+		// scheduling is refused, so no rotation timer pins the process after teardown (mirrors the gossip-driver
+		// teardown: the timer is released before the transports close).
+		expect(scheduler!.pendingCount, 'stop() cancelled the pending re-registration timer').to.equal(0);
+		scheduler!.schedule(fakeRotationNotice());
+		expect(scheduler!.pendingCount, 'a stopped scheduler arms no new timer (no pending timer pins the process)').to.equal(0);
 	});
 
 	it('an Edge-profile node assembles subscriber-only: notify handler present, profile is edge', async () => {
@@ -115,6 +147,7 @@ describe('reactivity / node wiring (real libp2p, solo forming node)', function (
 			expect(node.reactivityRecover, 'no recover transport when disabled').to.equal(undefined);
 			expect(node.reactivityRecoverSigners, 'no recover signers when disabled').to.equal(undefined);
 			expect(node.reactivityCohortHintCache, 'no cohort-hint cache when disabled').to.equal(undefined);
+			expect(node.reactivityRotation, 'no rotation scheduler when disabled').to.equal(undefined);
 			expect(node.cohortTopicHost, 'no host when disabled').to.equal(undefined);
 		} finally {
 			await node.stop();

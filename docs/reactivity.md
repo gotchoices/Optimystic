@@ -425,6 +425,29 @@ Subscribers MAY request a sub-range smaller than `[fromRevision, toRevision]`; c
 > emergent (cohort-topic demotion). The `ResumeReplyV1.TailRotated` variant + `latestKnownTailId`-staleness
 > classification live in the backfill/resume ticket; this ticket produces the handoff + rotation condition.
 > Specs: `rotation.spec.ts`, db-p2p `managers.spec.ts` (rotation detection, rotationHint emission).
+>
+> **Live-node rotation is observe-on-tail-id-change** (`12.54-reactivity-rotation-host-wiring-e2e`, the
+> capstone composition). On a running node the pre-announce `rotationHint{ newTailId }` **cannot** be built:
+> block ids are random (`TransactorSource.generateId() → randomBytes(32)`; deterministic derivation is the
+> blocked backlog `6.5-block-id-derivation`), so at the filling commit the host does not know the successor
+> tail id. The authoritative, observable signal on the host is therefore `event.tailId` **changing** between
+> commits — a *hard* rotation: `ReactivityOriginationManager` tracks the last-seen tail per collection and, on
+> a change, fires `markRotated(oldTopicId, { newTailId, effectiveAtRevision: event.rev }, now)` (the
+> `oldTopicId` is byte-identical to the topic a subscriber subscribed under — `reactivityTopicId(
+> reactivityTailBytes(tail))`). Active subscribers then detect the rotation via the delivered `tailId`
+> differing (`detectRotation` → `RotationNotice`, `preAnnounced: false`); a slept subscriber that resumes
+> against the old tail is redirected (`kind:"rotated"`). The pre-announce + anticipatory warm-up remain
+> exercised in the **mock-tier harness** (`mesh-tail-rotation.spec.ts`) and the design simulator (both can
+> synthesize the successor id) and are documented as gated on `6.5`; warm-up on a live node is **signal-only**
+> (logged, never fabricating a successor coord). The node composition binds origination's `markRotated` → the
+> forwarder host, the recover serve's `rotationFor` → `ReactivityForwarderHost.rotationRedirectFor`, and
+> constructs + exposes an unref'd-timer `RotationReRegistrationScheduler` (`node.reactivityRotation`); its
+> `reRegister(plan)` is driven by the subscribe factory that constructs managers (the deferred Quereus
+> `Database.watch` bridge, `optimystic-network-reactive-watch-integration-test`) — until that lands the
+> scheduler is constructed + exposed + unit/mesh-tested but not driven by a node-internal manager. Specs:
+> db-p2p `mesh-tail-rotation.spec.ts` (redirect-driven re-registration with no gap; cross-rotation resume from
+> the inherited checkpoint), `node-wiring.spec.ts` (scheduler exposed + torn down), `managers.spec.ts`
+> (`markRotated` fires on a tail-id change with the correctly-encoded `oldTopicId`).
 
 Tail block ID changes when a block fills (default `block_fill_size = 64` transactions). Rotation moves the topic anchor — and hence the tree root — to a new ring coord.
 

@@ -724,6 +724,20 @@ async function memberOf(key: PrivateKey, peerId: PeerId): Promise<Member> {
 		expect(reply!.currentRevision, 'the reply carries the current tail revision').to.equal(1);
 	});
 
+	// reactivity tail-rotation REDIRECT over a real recover socket (`reactivity-rotation-host-wiring-e2e` §D):
+	// after a tail-id change the origination manager fires `forwarderHost.markRotated(oldTopicId, …)`, so a recover
+	// dialed at the OLD cohort returns a `kind:"rotated"` frame (the outbound transport raises a terminal
+	// `RotationRedirectError`). The drain seam + the observe-on-tail-id-change wiring are exercised end-to-end at
+	// the mock tier (`reactivity/mesh-tail-rotation.spec.ts`) and unit-pinned (`managers.spec.ts` markRotated
+	// encoding, `forwarder-host.spec.ts` rotationRedirectFor). Standing up a *real* two-tail rotation here means
+	// driving two genuine tail commits through the cluster commit path on a node whose FRET has stabilized BOTH
+	// the old and the new tail's reactivity cohort — beyond an agent-runnable budget for this small-N real tier —
+	// so it is tagged pending rather than added as a flaky long-running test (mirrors the matchmaking-query and
+	// FRET-routed-walk pending tests below).
+	it.skip('[unimplemented:real-tier — tracked by reactivity-rotation-host-wiring-e2e §D] a recover dialed at the old cohort after a tail-id change returns a kind:"rotated" frame over a real socket', () => {
+		/* deferred: a real two-tail rotation needs both tails' reactivity cohorts FRET-stabilized + two real tail commits; the markRotated → rotationRedirectFor → kind:"rotated" path is mock-tier + unit covered */
+	});
+
 	// --- 5. Matchmaking: a provider record lands in + replicates across a real cohort ---
 	it('a matchmaking provider registration lands in the real cohort and replicates over /cohort-gossip', async () => {
 		const matchTopic = Uint8Array.from({ length: 32 }, (_v, i) => (i * 7 + 11) & 0xff);

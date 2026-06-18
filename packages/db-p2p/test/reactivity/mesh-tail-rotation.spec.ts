@@ -18,7 +18,7 @@
  */
 
 import { expect } from 'chai';
-import { TailDrainGate, reactivityTopicId, b64urlToBytes, bytesToB64url, DEFAULT_CAP_PROMOTE_FAST } from '@optimystic/db-core';
+import { TailDrainGate, reactivityTopicId, b64urlToBytes, bytesToB64url, DEFAULT_CAP_PROMOTE_FAST, T_REJOIN_JITTER_MS } from '@optimystic/db-core';
 import { buildReactivityMesh, type ReactivityMesh } from '../../src/testing/reactivity-mesh-harness.js';
 
 const range = (lo: number, hi: number): number[] => Array.from({ length: hi - lo + 1 }, (_v, i) => lo + i);
@@ -54,7 +54,7 @@ describe('reactivity / mesh — tail rotation continuity', () => {
 		const b = await rx.subscribe(2, 'stream');
 
 		await rx.commit('stream', 8); // fills the block at revision 8 (pre-announce rides revision 8)
-		const rotation = rx.rotateTail('stream');
+		const rotation = await rx.rotateTail('stream');
 		expect(rotation.rotationRevision).to.equal(8);
 
 		// The outgoing replay ring folded into a final handoff checkpoint, landed on the new tail.
@@ -75,7 +75,7 @@ describe('reactivity / mesh — tail rotation continuity', () => {
 		await rx.registerCollection('wave', { blockFillSize: 16 });
 		const subs = await Promise.all(range(1, 6).map((n) => rx.subscribe(n, 'wave')));
 		await rx.commit('wave', 5);
-		const rotation = rx.rotateTail('wave');
+		const rotation = await rx.rotateTail('wave');
 
 		expect(rotation.plans, 'one re-registration plan per live subscriber').to.have.length(subs.length);
 		expect(rotation.peakWindowArrivals, 'peak arrivals per T_rejoin_jitter window stays within cap_promote_fast').to.be.at.most(DEFAULT_CAP_PROMOTE_FAST);
@@ -91,7 +91,7 @@ describe('reactivity / mesh — tail rotation continuity', () => {
 		await rx.registerCollection('drain', { blockFillSize: 8 });
 		await rx.subscribe(1, 'drain');
 		await rx.commit('drain', 8);
-		const rotation = rx.rotateTail('drain');
+		const rotation = await rx.rotateTail('drain');
 
 		// The real drain gate over the harness virtual clock (T_drain default 60 s).
 		const gate = new TailDrainGate({ rotatedAt: rx.now, newTailId: rotation.newTailIdB64, effectiveAtRevision: rotation.rotationRevision + 1 });
@@ -108,6 +108,65 @@ describe('reactivity / mesh — tail rotation continuity', () => {
 		rx.advanceTime(60_001);
 		expect(gate.classify('new_subscribe', rx.now).kind).to.equal('drained');
 		expect(gate.classify('replay', rx.now).kind).to.equal('drained');
+	});
+
+	it('a recover redirect drives re-registration end-to-end with no gap (markRotated → rotated reply → onRotation → scheduler → reRegister)', async () => {
+		rx = await buildReactivityMesh({ nodeCount: 8, wantK: 4 });
+		// Default block fill (64) → no pre-announce in this short run, so the rotation is driven purely through
+		// the recover redirect path (preAnnounced: false), not a notification-driven pre-announce.
+		await rx.registerCollection('redir');
+		const s = await rx.subscribe(1, 'redir');
+		await rx.commit('redir', 8);
+		expect(s.delivered.map((n) => n.revision)).to.deep.equal(range(1, 8));
+		expect(s.rotationNotices, 'no pre-announce before the block fills').to.have.length(0);
+
+		// Rotate WITHOUT auto-migrating: the live recover serve models markRotated, so a stale resume is bounced.
+		await rx.rotateTail('redir', { autoReattach: false });
+
+		// The subscriber slept across the rotation; resuming against the OLD tail returns the kind:"rotated"
+		// redirect, which the manager honors through the SAME onRotation seam a pre-announce uses.
+		rx.sleepSubscriber(s);
+		expect(await rx.resume(s), 'the redirect resolves resume() as a tail rotation (never throws out)').to.equal('tail_rotated');
+		expect(s.rotationNotices, 'the recover redirect surfaced a rotation once').to.have.length(1);
+		expect(s.rotationNotices[0]!.preAnnounced, 'recover-driven, not a pre-announce').to.equal(false);
+		expect(s.rotationNotices[0]!.newTailId).to.equal(bytesToB64url(new TextEncoder().encode('redir:tail-8')));
+		expect(s.scheduler.pendingCount, 'the host scheduler armed the jittered re-registration timer').to.equal(1);
+
+		// Until the jittered timer fires the subscriber is still on the old tail. Advance the virtual clock past
+		// the jitter window → the scheduler fires reRegister → the subscriber re-attaches under the new tail.
+		rx.advanceTime(T_REJOIN_JITTER_MS + 1);
+		expect(s.scheduler.pendingCount, 'the re-registration timer fired over the virtual clock').to.equal(0);
+
+		// Commit on the NEW tail; the re-attached subscriber continues with NO gap across the rotation seam.
+		await rx.commit('redir', 4); // revisions 9..12 on the new tree
+		expect(s.delivered.map((n) => n.revision), 'continuous 1..12 across the redirect-driven re-registration').to.deep.equal(range(1, 12));
+		expect(s.manager.lastRevision).to.equal(12);
+	});
+
+	it('a cross-rotation resume is served from the inherited checkpoint (checkpoint_window, not out_of_window)', async () => {
+		rx = await buildReactivityMesh({ nodeCount: 8, wantK: 4 });
+		// Scaled stacked windows (ring W = 4) and default block fill (64 → no pre-announce in this short run).
+		await rx.registerCollection('inherit', { w: 4, wCheckpoint: 12 });
+		await rx.commit('inherit', 8); // old ring holds [5..8], rolling checkpoint [1..4]
+
+		const rotation = await rx.rotateTail('inherit');
+		// The outgoing replay ring folded into a final handoff checkpoint, landed on the new tail.
+		expect(rotation.handoff!.toRevision, 'handoff covers up to the rotation revision').to.equal(8);
+		expect(rx.pushStateOf('inherit').inheritedCheckpoint?.toRevision, 'new tail holds the inherited checkpoint').to.equal(8);
+
+		await rx.commit('inherit', 4); // new ring holds [9..12], low edge 9 abuts the inherited window's high edge 8
+
+		// A subscriber under the NEW tail whose resume `fromRevision` (7) is below the new ring's low edge (9) but
+		// within the inherited checkpoint [5..8]: served checkpoint_window from the inherited summary, then the
+		// ring's recent entries — NOT out_of_window.
+		const s = await rx.subscribe(2, 'inherit', { lastKnownRev: 6 });
+		rx.sleepSubscriber(s);
+		expect(await rx.resume(s), 'cross-rotation resume served from the inherited checkpoint').to.equal('checkpoint_applied');
+		expect(s.checkpointDigests, 'exactly one (inherited) checkpoint summary applied').to.have.length(1);
+		expect(s.checkpointDigests[0]!.toRevision).to.equal(8);
+		expect(s.delivered.map((n) => n.revision), 'the new ring entries replay gap-free above the inherited window').to.deep.equal([9, 10, 11, 12]);
+		expect(s.manager.lastRevision).to.equal(12);
+		expect(s.chainRead, 'a covered inherited checkpoint never forces a chain read').to.equal(false);
 	});
 });
 

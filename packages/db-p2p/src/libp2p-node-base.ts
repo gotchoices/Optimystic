@@ -51,6 +51,7 @@ import {
 import { ReactivityForwarderHost, reactivityDirectSubscribers, reactivityNotificationTopicId } from './reactivity/forwarder-host.js';
 import { ReactivityOriginationManager } from './reactivity/origination-manager.js';
 import { ReactivityPushStateGossipDriver, registerPushStateGossipHandler, type ReactivityGossipCollection } from './reactivity/push-state-gossip.js';
+import { RotationReRegistrationScheduler } from './reactivity/rotation-rereg-scheduler.js';
 import { ReactivitySubscriberRegistry } from './reactivity/subscriber-registry.js';
 import { DEFAULT_REACTIVITY_PROTOCOLS, reactivityProtocolList } from './reactivity/protocols.js';
 import {
@@ -70,6 +71,7 @@ import {
 	type NotificationVerifier,
 } from '@optimystic/db-core';
 import { PartitionDetector } from './cluster/partition-detector.js';
+import { createLogger } from './logger.js';
 import { PeerReputationService } from './reputation/peer-reputation.js';
 import { DisputeService } from './dispute/dispute-service.js';
 import { DisputeClient } from './dispute/client.js';
@@ -77,6 +79,9 @@ import type { DisputeConfig } from './dispute/types.js';
 
 type Libp2pInit = NonNullable<Parameters<typeof createLibp2p>[0]>;
 export type Libp2pTransports = NonNullable<Libp2pInit['transports']>;
+
+/** Logger for the reactivity node-wiring (origination/forwarder/recover/rotation composition). */
+const reactivityWiringLog = createLogger('reactivity-node-wiring');
 
 /** Factory function or instance for creating raw storage */
 export type RawStorageProvider = IRawStorage | (() => IRawStorage);
@@ -239,6 +244,19 @@ function resolveFretEngine(fret: FretService | undefined): FretService | undefin
 	}
 	const candidate = fret as unknown as { ensure?: () => FretService };
 	return typeof candidate.ensure === 'function' ? candidate.ensure() : fret;
+}
+
+/**
+ * The raw topic id bytes of a collection's current served reactivity {@link PushState}, or `undefined` if the
+ * node serves none. The forwarder host keys its served map by topicId, but a **backfill** recover request
+ * carries only a collectionId — so the drain-redirect binding resolves the collection's current tail topic
+ * here (the highest-`lastRevision` served PushState) before consulting `rotationRedirectFor`. While the old
+ * tail is the only served state this resolves it (and its drain gate redirects); once the new tail is served
+ * this resolves the new tail (no gate → no redirect), exactly as the recover serve's backfill path intends.
+ */
+function resolveCurrentServedTopic(forwarderHost: ReactivityForwarderHost, collectionId: string): Uint8Array | undefined {
+	const ps = forwarderHost.pushStateForCollection(collectionId);
+	return ps === undefined ? undefined : b64urlToBytes(ps.topicId);
 }
 
 export async function createLibp2pNodeBase(
@@ -863,13 +881,22 @@ export async function createLibp2pNodeBase(
 					// blockIdToBytes — else origination derives a different coord than subscribers resolve.
 					tailId: reactivityTailBytes(event.tailId),
 					deltaMaxBytes: reactivityPolicy.deltaMaxBytes,
-					// rotationHint is reactivity-tail-rotation-transport's (12.5).
+					// rotationHint stays undefined on a live node: the successor tail id is not knowable at the
+					// filling commit (random block ids; gated on 6.5-block-id-derivation). The authoritative,
+					// observable rotation signal is `event.tailId` CHANGING, which the manager observes via the
+					// `markRotated` binding below. (The pre-announce remains exercised in the mock-tier harness +
+					// the design simulator, both of which can synthesize the successor id.)
 				};
 			},
 			// reactivityNotificationTopicId(n) = reactivityTopicId(b64urlToBytes(n.tailId)); since
 			// n.tailId = b64url(reactivityTailBytes(tail)), this is the SAME topicId the gate assembled coord_0
 			// around and the subscriber/forwarder verifier derives — closing the encoding loop.
 			emit: (n): void => { void forwarderHost.ingest(reactivityNotificationTopicId(n), n); },
+			// Observe-rotation: when a collection's tail id changes between commits the OLD tail's reactivity
+			// topic has rotated. Start its drain so the recover serve begins redirecting to the new tree (the
+			// `reactivity-rotation-recover-redirect-drain` markRotated seam). `oldTopicId` is byte-identical to
+			// the topic a subscriber subscribed under (both `reactivityTopicId(reactivityTailBytes(tail))`).
+			markRotated: (oldTopicId, redirect, now): void => forwarderHost.markRotated(oldTopicId, redirect, now),
 		});
 		origination.install();
 
@@ -929,6 +956,15 @@ export async function createLibp2pNodeBase(
 			pushStateFor: forwarderHost.pushStateFor.bind(forwarderHost),
 			pushStateForCollection: forwarderHost.pushStateForCollection.bind(forwarderHost),
 			replayGuard: createCorrelationReplayGuard(),
+			rotationFor: (req, now) => {
+				// Drain-window redirect: a recover reaching an OLD (rotated, still-draining) tail is bounced to
+				// the new tree (reactivity-rotation-recover-redirect-drain). A resume carries the stale topic
+				// (topicId = reactivityTopicId(latestKnownTailId)); a backfill carries no topic, so resolve the
+				// collection's current served topic. rotationRedirectFor returns the gate's redirect while
+				// draining and undefined once drained (then evicting the gate + the old tail's served PushState).
+				const oldTopicId = req.topicId ?? resolveCurrentServedTopic(forwarderHost, req.collectionId);
+				return oldTopicId === undefined ? undefined : forwarderHost.rotationRedirectFor(oldTopicId, now);
+			},
 		});
 
 		// The subscriber's synchronous request signers over the node's Ed25519 key (resolves the recover wiring's
@@ -943,12 +979,31 @@ export async function createLibp2pNodeBase(
 		(node as any).reactivityRecoverSigners = recoverSigners;
 		(node as any).reactivityCohortHintCache = reactivityCohortHintCache;
 
+		// 6. Rotation re-registration scheduler — the host timer that moves a subscriber to the rotated tree
+		// when its manager surfaces a `RotationNotice` (`reactivity-rotation-rereg-scheduler`). Constructed with
+		// the default unref'd `setTimeout` timer so an idle re-registration never pins the process. The
+		// `reRegister(plan)` MOVE belongs to the subscribe factory that CONSTRUCTS managers (the deferred Quereus
+		// `Database.watch` bridge — backlog optimystic-network-reactive-watch-integration-test): on fire it builds
+		// a fresh `ReactivitySubscriptionManager` under `plan.newTopicId` carrying `plan.lastRevision`, registers
+		// it, and swaps the `ReactivitySubscriberRegistry` entry — registering the NEW-topic handler BEFORE
+		// unregistering the old, so a notification mid-swap is never dropped. Until that factory lands no
+		// node-internal manager drives `schedule()`, so this seam is a logged no-op — exactly as 12.33 exposed
+		// `reactivitySubscribers` / `reactivityRecover` without a live manager constructor.
+		const reactivityRotation = new RotationReRegistrationScheduler({
+			reRegister: (plan): Promise<void> => {
+				reactivityWiringLog("reactivity rotation re-registration fired for successor topic=%s (lastRevision=%d) but no subscribe factory is wired yet — deferred to optimystic-network-reactive-watch-integration-test", bytesToB64url(plan.newTopicId), plan.lastRevision);
+				return Promise.resolve();
+			},
+		});
+		(node as any).reactivityRotation = reactivityRotation;
+
 		// Teardown: release reactivity timers + protocol handlers BEFORE host.stop() (which clears the cohort
 		// gossip timer + unhandles the cohort-topic protocols) BEFORE the node's transports close (previousStop).
 		// Composes with the existing arachnode + clusterMember stop wrappers (each calls its captured previousStop last).
 		const previousStop = node.stop.bind(node);
 		node.stop = async (): Promise<void> => {
 			try {
+				reactivityRotation.stop();
 				pushStateGossip.stop();
 				offInboundNotify();
 				await node.unhandle(reactivityProtocolList(reactivityProtocols));

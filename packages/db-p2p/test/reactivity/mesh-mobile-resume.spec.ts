@@ -85,7 +85,7 @@ describe('reactivity / mesh — mobile resume windows (stacked W + W_checkpoint)
 		const s = await rx.subscribe(1, 'd', { lastKnownRev: 18 });
 		rx.sleepSubscriber(s);
 		// The tail rotates while the subscriber sleeps: its tailIdAtAttach is now stale.
-		const rotation = rx.rotateTail('d');
+		const rotation = await rx.rotateTail('d');
 		expect(await rx.resume(s)).to.equal('tail_rotated');
 		expect(s.tailRotated, 'resume reported the new tail to re-register under').to.not.equal(undefined);
 		expect(s.tailRotated![0]).to.equal(rotation.newTailIdB64);

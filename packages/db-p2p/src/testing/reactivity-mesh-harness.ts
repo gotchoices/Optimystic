@@ -49,6 +49,7 @@ import {
 	serveResume,
 	buildRotationHint,
 	BlockFillTracker,
+	TailDrainGate,
 	planReRegistrationWave,
 	buildRotationHandoffCheckpoint,
 	applyRotationHandoff,
@@ -92,6 +93,8 @@ import { makeCohortTopicChangeNotifier } from "../cohort-topic/change-bridge.js"
 import { buildCommitCert } from "../cluster/commit-cert.js";
 import { ReactivitySubscriptionManager, type RotationNotice } from "../reactivity/subscription-manager.js";
 import { ReactivityOriginationManager } from "../reactivity/origination-manager.js";
+import { RotationReRegistrationScheduler, type RotationTimerCancel } from "../reactivity/rotation-rereg-scheduler.js";
+import { RotationRedirectError } from "../reactivity/recover-transport.js";
 import {
 	addressing,
 	buildMesh,
@@ -187,6 +190,13 @@ export interface SubscriptionHandle {
 	readonly checkpointDigests: CheckpointSummary[];
 	/** Rotation notices the manager surfaced from a delivered pre-announce / hard rotation (once per successor). */
 	readonly rotationNotices: RotationNotice[];
+	/**
+	 * Per-subscriber re-registration scheduler bound to the manager's `onRotation` observer, driven over the
+	 * harness virtual clock ({@link ReactivityMesh.advanceTime}). On fire it re-attaches this subscriber under
+	 * the new tail (the production move the deferred Quereus `Database.watch` factory performs) — so the
+	 * notify/recover rotation seams run end-to-end (`reactivity-rotation-host-wiring-e2e` §C).
+	 */
+	scheduler: RotationReRegistrationScheduler;
 }
 
 /** Per-collection state the harness threads through origination, fan-out, and recovery. */
@@ -198,7 +208,8 @@ interface CollectionState {
 	topicId: Uint8Array;
 	coord0: Uint8Array;
 	tailCohort: Member[];
-	readonly setup: TopicSetup;
+	/** Cohort setup for the **current** tail; re-established (willingness re-seeded) on each {@link ReactivityMesh.rotateTail}. */
+	setup: TopicSetup;
 	readonly repo: StorageRepo;
 	readonly originationService: CohortTopicService;
 	origination?: ReactivityOriginationManager;
@@ -213,9 +224,29 @@ interface CollectionState {
 	readonly queueMax: number;
 	readonly fillTracker: BlockFillTracker;
 	rotationHint?: RotationHintV1;
+	/**
+	 * The outgoing tail's drain gate, set by a transport-driven {@link ReactivityMesh.rotateTail} (`{
+	 * autoReattach: false }`) — models the running node's `ReactivityForwarderHost.markRotated`. A resume whose
+	 * `latestKnownTailId` anchors {@link rotatedFromTailB64} is bounced to the new tree while it `isDraining`.
+	 */
+	rotationGate?: TailDrainGate;
+	/** The tail (base64url) {@link rotationGate} rotated away from — the stale tail a resume gets redirected from. */
+	rotatedFromTailB64?: string;
 	readonly subscribers: SubscriptionHandle[];
 	/** Certs cached for actionId so the synchronous bridge extractor can resolve a pre-signed real cert. */
 	readonly certByAction: Map<string, CommitCert>;
+}
+
+/** Options for {@link ReactivityMesh.rotateTail}. */
+export interface RotateTailOptions {
+	/**
+	 * When `true` (default) the harness migrates live subscribers to the new tail directly (the wave/handoff
+	 * continuity model). When `false` it instead models the running node's `ReactivityForwarderHost.markRotated`
+	 * — arming the outgoing tail's {@link TailDrainGate} — so a subscriber resuming against the old tail is
+	 * **redirected** to the new tree and re-attaches through its own `onRotation` → scheduler → reRegister path
+	 * (the transport-driven e2e proof, `reactivity-rotation-host-wiring-e2e` §C).
+	 */
+	readonly autoReattach?: boolean;
 }
 
 /** The outcome of a {@link ReactivityMesh.rotateTail} — the planned re-registration wave + handoff. */
@@ -239,6 +270,8 @@ export class ReactivityMesh {
 	private readonly collections = new Map<string, CollectionState>();
 	private vtime = 1_700_000_000_000;
 	private corr = 0;
+	/** Pending one-shot timers armed against the virtual clock (the rotation scheduler's `setTimer` binding). */
+	private readonly virtualTimers: { fireAt: number; fn: () => void; cancelled: boolean }[] = [];
 
 	private constructor(
 		readonly mesh: CohortMesh,
@@ -276,9 +309,30 @@ export class ReactivityMesh {
 		return this.vtime;
 	}
 
-	/** Advance the virtual clock by `ms` (drives `T_drain` / rotation timing deterministically). */
+	/**
+	 * Advance the virtual clock by `ms` (drives `T_drain` / rotation timing deterministically), then fire any
+	 * virtual timers now due. A fired timer may arm another (a chained rotation), so fire one-at-a-time until
+	 * the queue is quiescent — the rotation re-registration scheduler's `setTimer` binding rides this.
+	 */
 	advanceTime(ms: number): void {
 		this.vtime += ms;
+		for (;;) {
+			const idx = this.virtualTimers.findIndex((t) => !t.cancelled && t.fireAt <= this.vtime);
+			if (idx === -1) {
+				break;
+			}
+			const [timer] = this.virtualTimers.splice(idx, 1);
+			if (!timer!.cancelled) {
+				timer!.fn();
+			}
+		}
+	}
+
+	/** Arm a one-shot timer against the virtual clock; the cancel handle drops it (the scheduler's `setTimer`). */
+	private armVirtualTimer(fn: () => void, delayMs: number): RotationTimerCancel {
+		const timer = { fireAt: this.vtime + Math.max(0, delayMs), fn, cancelled: false };
+		this.virtualTimers.push(timer);
+		return (): void => { timer.cancelled = true; };
 	}
 
 	private profileOf(index: number): NodeProfile {
@@ -484,7 +538,20 @@ export class ReactivityMesh {
 			chainRead: false,
 			checkpointDigests: [],
 			rotationNotices: [],
+			scheduler: undefined as unknown as RotationReRegistrationScheduler,
 		};
+
+		// The host re-registration scheduler bound to this subscriber, driven over the harness virtual clock. On
+		// fire it re-attaches the subscriber under the rotated tail — the production move the deferred Quereus
+		// `Database.watch` factory performs (`reactivity-rotation-host-wiring-e2e` §C). The single-subscriber
+		// `planReRegistration` path draws `fireAt` over `T_rejoin_jitter`, so a `advanceTime` past that window
+		// fires it deterministically.
+		const scheduler = new RotationReRegistrationScheduler({
+			reRegister: (plan): Promise<void> => { this.reAttachToNewTail(handle, plan); return Promise.resolve(); },
+			setTimer: (fn, delayMs): RotationTimerCancel => this.armVirtualTimer(fn, delayMs),
+			now: (): number => this.vtime,
+		});
+		handle.scheduler = scheduler;
 
 		const manager = new ReactivitySubscriptionManager({
 			service,
@@ -500,19 +567,32 @@ export class ReactivityMesh {
 			// Resume RPC served from the tail cohort's stacked windows (real serveResume).
 			signResume: (): string => bytesToB64url(utf8.encode("resume")),
 			subscriberCoord: subId,
-			resumeTransport: (req: ResumeV1): Promise<ResumeReplyV1> => Promise.resolve(serveResume(req, {
-				buffer: c.pushState.replayBuffer,
-				checkpoint: c.pushState.checkpoint,
-				currentTailId: bytesToB64url(c.tailId),
-				currentRevision: c.rev,
-				expectedCollectionId: c.collectionIdB64,
-			})),
+			resumeTransport: (req: ResumeV1): Promise<ResumeReplyV1> => {
+				// Model the live recover serve's drain redirect (the running node's `markRotated` →
+				// `rotationRedirectFor` → `RotationRedirectError`): a resume whose `latestKnownTailId` anchors a
+				// rotated, still-draining tail is bounced to the new tree instead of served stale data.
+				const gate = c.rotationGate;
+				if (gate !== undefined && req.latestKnownTailId === c.rotatedFromTailB64 && gate.isDraining(this.vtime)) {
+					return Promise.reject(new RotationRedirectError(gate.rotationRedirect));
+				}
+				return Promise.resolve(serveResume(req, {
+					buffer: c.pushState.replayBuffer,
+					checkpoint: c.pushState.checkpoint,
+					// The cross-rotation inherited window the new tail holds after a handoff: a resume below the new
+					// ring but within it is served `checkpoint_window` (not `out_of_window`) while it abuts the ring.
+					inheritedCheckpoint: c.pushState.inheritedCheckpoint,
+					currentTailId: bytesToB64url(c.tailId),
+					currentRevision: c.rev,
+					rotationRevision: c.rev,
+					expectedCollectionId: c.collectionIdB64,
+				}));
+			},
 			onChainRead: (): void => { handle.chainRead = true; },
 			onTailRotated: (newTailId, rev): void => { handle.tailRotated = [newTailId, rev]; },
 			onCheckpointDigest: (summary): void => { handle.checkpointDigests.push(summary); },
 			// Surface the jittered re-registration plan from a delivered rotation pre-announce / hard rotation.
 			rejoinJitter: createRejoinJitter({ capPromote: DEFAULT_CAP_PROMOTE_FAST, random: this.deterministicRandom() }),
-			onRotation: (notice): void => { handle.rotationNotices.push(notice); },
+			onRotation: (notice): void => { handle.rotationNotices.push(notice); scheduler.schedule(notice); },
 		});
 		handle.manager = manager;
 
@@ -645,12 +725,32 @@ export class ReactivityMesh {
 	}
 
 	/**
-	 * Rotate a collection's tail: advance `tailId` → new `topicId`/coord/cohort, re-cache the tail cert,
-	 * rebuild the tail `PushState`, fold the outgoing ring into a handoff checkpoint onto the new tail, and
-	 * plan the jittered re-registration wave bounded by `cap_promote_fast`. Models §Tail rotation steps 2–5.
+	 * The re-registration move the scheduler fires on a rotation notice: re-attach the subscriber under the
+	 * rotated tail so subsequent fan-out targets it. The production factory builds a *fresh* manager under
+	 * `plan.newTopicId`; the harness keeps the same manager (its `lastRevision` is already contiguous and its
+	 * `rotationHandledFor` guard dedupes the new-tail deliveries' re-detection), so re-attaching the existing
+	 * subscriber is the equivalent move with no gap.
 	 */
-	rotateTail(collection: string): RotationResult {
+	private reAttachToNewTail(s: SubscriptionHandle, plan: ReRegistrationPlan): void {
+		const c = this.collection(s.collectionName);
+		s.attachedTailB64 = bytesToB64url(plan.newTailId);
+		// Defensive: the plan's successor must be the collection's current tail (single-rotation harness model).
+		if (s.attachedTailB64 !== bytesToB64url(c.tailId)) {
+			s.attachedTailB64 = bytesToB64url(c.tailId);
+		}
+	}
+
+	/**
+	 * Rotate a collection's tail: advance `tailId` → new `topicId`/coord/cohort, re-establish the new cohort
+	 * (re-seed willingness so a post-rotation subscribe can register), re-cache the tail cert, rebuild the tail
+	 * `PushState`, fold the outgoing ring into a handoff checkpoint onto the new tail, and plan the jittered
+	 * re-registration wave bounded by `cap_promote_fast`. Async because re-forming the new cohort is (the real
+	 * willingness convergence). With `{ autoReattach: false }` it instead models the running node's
+	 * `markRotated` (drain gate) so subscribers move via the recover-redirect path. Models §Tail rotation steps 2–5.
+	 */
+	async rotateTail(collection: string, opts: RotateTailOptions = {}): Promise<RotationResult> {
 		const c = this.collection(collection);
+		const autoReattach = opts.autoReattach ?? true;
 		const rotationRevision = c.rev;
 		const newTailId = utf8.encode(`${c.name}:tail-${rotationRevision}`);
 		const newTailIdB64 = bytesToB64url(newTailId);
@@ -674,6 +774,9 @@ export class ReactivityMesh {
 		c.topicId = reactivityTopicId(newTailId);
 		c.coord0 = addressing.coord0(c.topicId);
 		c.tailCohort = this.cohortMembersAround(c.coord0);
+		// Re-establish the new tail's cohort (re-seed willingness) so a subscriber can register under it after the
+		// rotation — the new tree forming, modeled deterministically (the real cohort-topic willingness convergence).
+		c.setup = await setupTopic(this.mesh, c.topicId);
 		this.cacheTailCert(c);
 		c.pushState = this.makePushState(c.collectionIdB64, c.topicId, c.tailId, c.w, c.wCheckpoint, c.queueMax, c.deltaMaxBytes);
 		c.forwarder = createReactivityForwarder({ state: c.pushState, verifier: this.notificationVerifierFor(c.originationService) });
@@ -681,9 +784,18 @@ export class ReactivityMesh {
 			applyRotationHandoff(c.pushState, handoff);
 		}
 
-		// Re-attach the live subscribers under the new tail so subsequent fan-out targets them.
-		for (const s of live) {
-			s.attachedTailB64 = newTailIdB64;
+		if (autoReattach) {
+			// Re-attach the live subscribers under the new tail so subsequent fan-out targets them (the
+			// continuity/handoff model — subscribers migrate directly, no redirect involved).
+			for (const s of live) {
+				s.attachedTailB64 = newTailIdB64;
+			}
+		} else {
+			// Transport-driven: model `markRotated` by arming the outgoing tail's drain gate. Live subscribers
+			// stay on the old tail until each resumes, gets the `kind:"rotated"` redirect, and re-attaches via its
+			// own onRotation → scheduler → reRegister path (§Tail rotation step 2–3).
+			c.rotationGate = new TailDrainGate({ rotatedAt: this.vtime, newTailId: newTailIdB64, effectiveAtRevision: rotationRevision + 1 });
+			c.rotatedFromTailB64 = oldTailB64;
 		}
 
 		return {
@@ -738,6 +850,13 @@ export class ReactivityMesh {
 	}
 
 	async stop(): Promise<void> {
+		// Tear down every subscriber's re-registration scheduler (drops pending virtual timers + the idempotence
+		// ledger) before stopping the mesh.
+		for (const c of this.collections.values()) {
+			for (const s of c.subscribers) {
+				s.scheduler?.stop();
+			}
+		}
 		await this.mesh.stop();
 	}
 }
