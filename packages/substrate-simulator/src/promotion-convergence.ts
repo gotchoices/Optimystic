@@ -206,6 +206,54 @@ export function uniformLadder(index: number, dMax: number, F: number, marker = 0
 	return ladder;
 }
 
+/** The single tier-`d` prefix bucket that a skewed (hot-shard) ladder funnels concentrated load into. */
+const HOT_BUCKET_INDEX = 0;
+
+/** Deterministic unit float in [0, 1) from `(seed, index)` via FNV-1a — the skew hot-shard coin. */
+function skewCoin(seed: number, index: number): number {
+	let h = 0x811c9dc5 >>> 0;
+	const mix = (byte: number): void => {
+		h ^= byte & 0xff;
+		h = Math.imul(h, 0x0100_0193);
+	};
+	const s = seed >>> 0;
+	for (let i = 0; i < 4; i++) {
+		mix((s >>> (i * 8)) & 0xff);
+	}
+	const u = index >>> 0;
+	for (let i = 0; i < 4; i++) {
+		mix((u >>> (i * 8)) & 0xff);
+	}
+	return (h >>> 0) / 0x1_0000_0000;
+}
+
+/**
+ * A prefix-sharding ladder with a tunable **hot shard**, modeling real sha256 addressing's
+ * approximate (rather than ideal) uniformity. `uniformLadder` shards perfectly evenly, so observed
+ * depth tracks `⌈log_F(N/cap_promote)⌉` exactly; a non-uniform prefix distribution concentrates
+ * participants into fewer buckets, deepening the tree past the law for the same N
+ * (`simulator-envelope-tree` Boundary 1).
+ *
+ * At `skew = s`, each participant lands in its own uniform bucket with probability `1 − s` and in
+ * the single hot shard with probability `s` (a seeded, deterministic-per-index coin). The decision
+ * switches the *whole effective index* — a hot participant is rebuilt from `HOT_BUCKET_INDEX`, so
+ * its entire ladder is the uniform ladder of the hot index. That guarantees valid nesting at every
+ * skew (the result is literally a `uniformLadder`, whose tier-`d` coord refines its tier-`(d−1)`
+ * ancestor by construction): `skew = 0` reduces to the plain uniform ladder, `skew = 1` funnels
+ * **all** participants onto one branch (maximal concentration) without corrupting the tree or
+ * throwing. More skew ⇒ more concentration ⇒ a deeper tree (monotone-in-harm).
+ */
+export function skewedLadder(index: number, dMax: number, F: number, skew: number, seed = 1): RingCoord[] {
+	if (!Number.isInteger(index) || index < 0) {
+		throw new RangeError(`index must be a non-negative integer, got ${index}`);
+	}
+	if (!(skew >= 0 && skew <= 1)) {
+		throw new RangeError(`skew must be in [0, 1], got ${skew}`);
+	}
+	const effectiveIndex = skewCoin(seed, index) < skew ? HOT_BUCKET_INDEX : index;
+	return uniformLadder(effectiveIndex, dMax, F);
+}
+
 /** A fixed opaque topic label for convergence runs (topicId is just a map key here). */
 const CONVERGENCE_TOPIC = 'promotion-convergence';
 

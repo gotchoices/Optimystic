@@ -175,6 +175,7 @@ export {
 	expectedDepth,
 	sampleDepth,
 	uniformLadder,
+	skewedLadder,
 	PromotionTracer,
 	runConvergence,
 	compareLookahead
@@ -252,3 +253,23 @@ export {
 	runSensitivitySweep,
 	samplesFor
 } from './sweep.js';
+export {
+	type EnvelopeBoundary,
+	type BoundaryAxisSpec,
+	type BoundaryReport,
+	findBoundary,
+	recordBoundary
+} from './boundary.js';
+export {
+	type TreeBoundaryOptions,
+	type TreeBoundaryReport,
+	type UnwillingBreach,
+	type ChurnReadout,
+	type UnwillingReadout,
+	prefixSkewAxis,
+	churnFlapAxis,
+	unwillingFractionAxis,
+	measureChurnFlap,
+	measureUnwillingWalks,
+	runTreeBoundaries
+} from './boundary-tree.js';
