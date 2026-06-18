@@ -168,5 +168,33 @@ describe('reactivity / mesh — tail rotation continuity', () => {
 		expect(s.manager.lastRevision).to.equal(12);
 		expect(s.chainRead, 'a covered inherited checkpoint never forces a chain read').to.equal(false);
 	});
+
+	it('a cross-rotation resume bridges the inherited + new-rolling windows when the new tail evicted past the handoff (two-link chain, one round trip)', async () => {
+		rx = await buildReactivityMesh({ nodeCount: 8, wantK: 4 });
+		// Scaled stacked windows (ring W = 4, generous W_checkpoint) and default block fill (64 → no second rotation).
+		await rx.registerCollection('bridge', { w: 4, wCheckpoint: 12 });
+		await rx.commit('bridge', 8); // old tail: ring [5..8], rolling checkpoint [1..4]
+
+		const rotation = await rx.rotateTail('bridge');
+		expect(rotation.handoff!.toRevision, 'handoff covers up to the rotation revision').to.equal(8);
+		expect(rx.pushStateOf('bridge').inheritedCheckpoint?.toRevision, 'new tail holds the inherited handoff [5,8]').to.equal(8);
+
+		// Commit ENOUGH on the new tail that its OWN rolling checkpoint forms BETWEEN the inherited window and the
+		// ring: revisions 9..16 into a W=4 ring leave the ring holding [13..16] and the new rolling checkpoint
+		// holding [9..12]. The three windows now stack inherited [5,8] → rolling [9,12] → ring [13,16] with no gap.
+		await rx.commit('bridge', 8);
+		expect(rx.pushStateOf('bridge').checkpoint.toRevision, 'new tail rolling checkpoint sits between the inherited window and the ring').to.equal(12);
+
+		// A subscriber under the NEW tail whose resume `fromRevision` (7) is inside the inherited window [5,8] —
+		// below BOTH the new rolling checkpoint [9,12] and the ring [13,16]. Pre-bridge this was out_of_window (a
+		// single-checkpoint reply could not carry all three windows); now it is answered with the two-link chain.
+		const s = await rx.subscribe(2, 'bridge', { lastKnownRev: 6 });
+		rx.sleepSubscriber(s);
+		expect(await rx.resume(s), 'the bridge recovers the full cross-rotation span in one round trip').to.equal('checkpoint_applied');
+		expect(s.checkpointDigests.map((d) => d.toRevision), 'both links applied in order: inherited [.,8] then rolling [.,12]').to.deep.equal([8, 12]);
+		expect(s.delivered.map((n) => n.revision), 'the ring entries replay gap-free above the bridged chain').to.deep.equal([13, 14, 15, 16]);
+		expect(s.manager.lastRevision).to.equal(16);
+		expect(s.chainRead, 'the bridge never forces a chain read').to.equal(false);
+	});
 });
 

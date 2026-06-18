@@ -214,8 +214,8 @@ describe('reactivity recover — inbound serve handler', () => {
 		const reply = decodeRecoverReplyV1((await handler(encodeRecoverRequestV1({ v: 1, kind: 'resume', resume: req }), peerId))!);
 		expect(reply.kind).to.equal('resume');
 		expect(reply.resumeReply!.result, 'answered from the inherited checkpoint').to.equal('checkpoint_window');
-		expect(reply.resumeReply!.checkpoint!.fromRevision).to.equal(1);
-		expect(reply.resumeReply!.checkpoint!.toRevision).to.equal(16);
+		expect(reply.resumeReply!.checkpoints![0]!.fromRevision).to.equal(1);
+		expect(reply.resumeReply!.checkpoints![0]!.toRevision).to.equal(16);
 
 		// Proof the serve actually threads ps.inheritedCheckpoint: the same request without the handoff falls to out_of_window.
 		const bare = seedFedPushState(20);

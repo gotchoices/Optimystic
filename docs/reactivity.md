@@ -292,25 +292,31 @@ RevisionEntry {
 > out-of-window escalates to a chain read; a stale tail escalates to re-registration). db-p2p's
 > `ReactivitySubscriptionManager.resume()` drives the RPC and keeps the Edge `StickyCohortHintCache`.
 >
-> **Cross-rotation resume** (`12.51-reactivity-rotation-resume-handoff-and-redirect-codec`). When a cohort
-> took over as the new tail across a rotation it holds the outgoing tail's handoff in
-> `PushState.inheritedCheckpoint` (§Tail rotation step 5). `classifyResume`/`serveResume` consult it (via the
-> optional `inherited` param / `ResumeServingDeps.inheritedCheckpoint`) **after** the rolling checkpoint
-> misses: a resume whose `fromRevision` falls below both the ring and the rolling checkpoint but inside the
-> inherited window is served as `CheckpointWindow` from the inherited summary (plus the live ring's
-> `recentEntries`) instead of falling to `OutOfWindow`. The rolling checkpoint wins when both cover
-> `fromRevision`. The subscriber-side apply is unchanged — an inherited checkpoint is a `CheckpointSummary`
-> like any other, so the existing endpoint-verification and non-abutting guards apply verbatim.
+> **Cross-rotation resume** (`12.51-reactivity-rotation-resume-handoff-and-redirect-codec`, extended to the
+> stacked checkpoint chain by `reactivity-rotation-inherited-window-bridge`). When a cohort took over as the
+> new tail across a rotation it holds the outgoing tail's handoff in `PushState.inheritedCheckpoint` (§Tail
+> rotation step 5). `classifyResume`/`serveResume` consult it (via the optional `inherited` param /
+> `ResumeServingDeps.inheritedCheckpoint`) when the rolling checkpoint misses: a resume whose `fromRevision`
+> falls below both the ring and the rolling checkpoint but inside the inherited window is served as
+> `CheckpointWindow` instead of falling to `OutOfWindow`. The rolling checkpoint wins when both cover
+> `fromRevision`.
 >
-> **Single-checkpoint reply ⇒ abut requirement (current limitation).** The reply carries **one** checkpoint
-> summary, so the inherited window is only serveable while it still **abuts the new ring's low edge**
-> (`inherited.toRevision ≥ ringLow − 1`) — i.e. while the new tail has not yet evicted any post-rotation
-> revision into its *own* rolling checkpoint. Once that rolling checkpoint forms *between* the inherited
-> window and the ring, serving inherited + ring would skip the in-between revisions, so `classifyResume`
-> declines (returns `OutOfWindow`, an honest chain read) rather than emit a gapped reply. In practice the
-> inherited window therefore covers cross-rotation resumes only for the first ≈`W` revisions after a
-> rotation, not the full `W_checkpoint`. Bridging all three windows (inherited + new-rolling + ring) in one
-> reply is the follow-on `reactivity-rotation-inherited-window-bridge`.
+> **Stacked checkpoint chain ⇒ the full cross-rotation range recovers in one reply.** The `CheckpointWindow`
+> reply carries an ordered, contiguous **chain** of `CheckpointSummary`s (`checkpoints`, low→high), not a
+> single summary. The serving cohort builds the **shortest** gap-free chain that both covers `fromRevision`
+> and abuts the ring's low edge (`resumeCheckpointChain`): the rolling checkpoint alone (steady state), the
+> inherited handoff alone (right after a rotation, while it still abuts the ring), or the two-link
+> `[inherited, rolling]` **bridge** once the new tail has evicted post-rotation revisions into its *own*
+> rolling checkpoint sitting between the inherited window and the ring. So a cross-rotation resume recovers
+> the full stacked `W + W_checkpoint` range in one round trip regardless of where the new tail's rolling
+> checkpoint has formed — there is no rotation-specific shortfall. The subscriber verifies **every** link's
+> bracketing endpoints before applying anything (a single forged link rejects the whole reply, no partial
+> advance), then applies each link's merged digest and rebaselines through the chain. Because each link keeps
+> its **own already-correct** merged digest and is applied independently, nothing is ever re-folded across
+> windows — a per-collection `fold` override composes identically to the default fold. A peer predating the
+> chain field fails the reply closed and chain-reads (safe). Only a genuinely unbridgeable gap (the inherited
+> window's high edge sits below the rolling checkpoint's low edge — the new tail evicted past the handoff
+> seam, so the request is > `W + W_checkpoint` behind) falls to `OutOfWindow`.
 
 A subscriber resuming from sleep sends:
 
@@ -321,7 +327,7 @@ ResumeV1 { v, collectionId, fromRevision, latestKnownTailId, subscriberCoord, ti
 to its cached `primary` (or any cohort member if primary is stale). The cohort responds with one of:
 
 - `Backfill { entries, currentRevision }` — `fromRevision` is within the replay window. Subscriber replays entries, dedupes, and is current. Single round trip.
-- `CheckpointWindow { checkpoint, recentEntries }` — `fromRevision` is older than the buffer but within parent-checkpoint range (see below). Subscriber verifies the checkpoint's bracketing endpoints, applies the merged digest, advances its contiguity head past the summarized range, then replays the recent entries. A cohort that took over as the new tail across a rotation also answers this from its **inherited handoff checkpoint** when the rolling one misses *and the inherited window still abuts the live ring* (§Tail rotation step 5, and the single-checkpoint abut limitation noted above) — the inherited window is the deeper, last-resort window; the rolling checkpoint wins when both cover `fromRevision`.
+- `CheckpointWindow { checkpoints, recentEntries }` — `fromRevision` is older than the buffer but within parent-checkpoint range (see below). The reply carries an ordered, contiguous **chain** of checkpoint summaries (`checkpoints`, low→high); the subscriber verifies every link's bracketing endpoints, applies each link's merged digest, advances its contiguity head past the whole chain, then replays the recent entries. The chain is a single link in steady state. A cohort that took over as the new tail across a rotation answers from its **inherited handoff checkpoint** when the rolling one misses — either as a single inherited link (it abuts the live ring) or as the two-link `[inherited, rolling]` **bridge** once the new tail's own rolling checkpoint has formed between the inherited window and the ring (§Tail rotation step 5) — so the full cross-rotation range recovers in one reply. The rolling checkpoint wins when both cover `fromRevision`.
 - `OutOfWindow { currentTailId, currentRevision }` — `fromRevision` is older than even the parent checkpoint (and, on a new tail, older than the inherited handoff checkpoint too). Subscriber falls back to a chain read, then a fresh subscribe.
 - `TailRotated { newTailId, newRevisionAtRotation }` — `latestKnownTailId` is stale. Subscriber re-registers under the new tail and replays from the new tree. This is classified **first**: a stale tail means the whole tree migrated, so the lag-against-windows classification is moot. (The rotation *lifecycle* is owned by [reactivity-rotation-backpressure-policy]; this resume path only *detects* the stale tail.)
 
@@ -465,7 +471,7 @@ Tail block ID changes when a block fills (default `block_fill_size = 64` transac
 
 4. **Forwarder draining.** Forwarder cohorts under the old tail observe their direct-subscriber count dropping (subscribers re-registering under the new tail) and demote naturally per the cohort-topic demotion protocol. They do not migrate state to the new tree — the new tree rebuilds via re-registration.
 
-5. **Replay-buffer handoff to checkpoint.** As the outgoing tail cohort drains, it folds its replay buffer into a final `CheckpointSummary` covering `[lastCheckpoint.toRevision + 1, rotationRevision]` and hands it to the new tail cohort (`buildRotationHandoffCheckpoint` → `applyRotationHandoff`, landing on `PushState.inheritedCheckpoint`). This is the only state migration across rotations. The new tail cohort holds the old checkpoint to serve `ResumeV1` requests that span the rotation: `classifyResume`/`serveResume` consult the inherited checkpoint after the rolling one misses (§Resume), so a cross-rotation resume is answered as `CheckpointWindow` from the inherited summary rather than `OutOfWindow` — while the inherited window still abuts the new ring's low edge (the single-checkpoint reply cannot bridge the new tail's own rolling checkpoint once it forms in between; see §Resume's abut-limitation note and the follow-on `reactivity-rotation-inherited-window-bridge`).
+5. **Replay-buffer handoff to checkpoint.** As the outgoing tail cohort drains, it folds its replay buffer into a final `CheckpointSummary` covering `[lastCheckpoint.toRevision + 1, rotationRevision]` and hands it to the new tail cohort (`buildRotationHandoffCheckpoint` → `applyRotationHandoff`, landing on `PushState.inheritedCheckpoint`). This is the only state migration across rotations. The new tail cohort holds the old checkpoint to serve `ResumeV1` requests that span the rotation: `classifyResume`/`serveResume` consult the inherited checkpoint after the rolling one misses (§Resume), so a cross-rotation resume is answered as `CheckpointWindow` rather than `OutOfWindow`. The reply carries an ordered checkpoint chain, so the new tail serves the inherited handoff alone (while it still abuts the new ring) **or** the two-link `[inherited, rolling]` bridge once the new tail's own rolling checkpoint has formed between the inherited window and the ring — recovering the full cross-rotation range in one round trip regardless (see §Resume).
 
 ### Anticipatory warm-up
 
@@ -531,7 +537,7 @@ Lag is measured against the *stacked* windows (§Parent checkpoint summaries): t
 (The simulator's `classifyResume` cuts over to `OutOfWindow` at `lag ≥ W + W_checkpoint = 4352`, matching the layered bound above — guarded by the `classifyResume cutover aligns with RollingCheckpoint.covers` test.)
 
 ### Tail rotation during subscriber outage
-Subscriber wakes, sends `ResumeV1` with stale `latestKnownTailId`. The cohort it reaches (under the new tail) responds `TailRotated{ newTailId }`. Subscriber walks the new tree, re-registers, and resumes; replay covers as much as it covers.
+Subscriber wakes, sends `ResumeV1` with stale `latestKnownTailId`. The cohort it reaches (under the new tail) responds `TailRotated{ newTailId }`. Subscriber walks the new tree, re-registers, and resumes against the new tail. That resume is classified against the new tail's stacked windows *plus* the inherited handoff checkpoint it holds, served as an ordered checkpoint chain (the inherited handoff alone, or the `[inherited, rolling]` bridge), so a cross-rotation resume within `W + W_checkpoint` recovers in one round trip — no rotation-specific shortfall (§Resume, §Tail rotation step 5).
 
 ### Cohort fully fails during steady-state operation
 Standard cohort-topic recovery. Attached subscribers detect via ping failure, re-register from `d_max`. With `T_rejoin_jitter` the post-failure registration rate is bounded.
@@ -607,14 +613,14 @@ interface ResumeReplyV1 {
   entries?:           NotificationV1[]
   currentRevision?:   number
   // checkpoint_window:
-  checkpoint?: {
+  checkpoints?: {                          // ordered low→high, contiguous chain (1 link steady state, 2 for the cross-rotation bridge)
     collectionId:      string
     fromRevision:      number
     toRevision:        number
     mergedDigest:      string
     mergedDelta?:      string
     bracketingEntries: NotificationV1[]   // length 2 — the FULL endpoint notifications (verifiable)
-  }
+  }[]
   recentEntries?:     NotificationV1[]
   // out_of_window:
   currentTailId?:     string
@@ -625,11 +631,14 @@ interface ResumeReplyV1 {
 }
 ```
 
-> The `checkpoint` carried in a `checkpoint_window` reply is exactly the `CheckpointSummary`
-> (§Parent checkpoint summaries) — its endpoints are the **full** bracketing notifications, not bare
-> signatures, so the subscriber can verify them end-to-end. The codecs are `encode/decodeResumeV1` and
-> `encode/decodeResumeReplyV1` in `packages/db-core/src/reactivity/resume.ts` (JSON, byte fields
-> base64url, unix-ms timestamps, per-message structural validation on decode).
+> The `checkpoints` carried in a `checkpoint_window` reply are an ordered, contiguous chain of
+> `CheckpointSummary`s (§Parent checkpoint summaries) — each `checkpoints[i].fromRevision ===
+> checkpoints[i-1].toRevision + 1`, validated on decode. Each link's endpoints are the **full** bracketing
+> notifications, not bare signatures, so the subscriber can verify every link end-to-end. The chain is a
+> single link in steady state and the two-link `[inherited, rolling]` bridge for a cross-rotation resume
+> (§Resume, §Tail rotation step 5). The codecs are `encode/decodeResumeV1` and `encode/decodeResumeReplyV1`
+> in `packages/db-core/src/reactivity/resume.ts` (JSON, byte fields base64url, unix-ms timestamps,
+> per-message structural validation on decode).
 
 ### Backfill
 
@@ -765,7 +774,7 @@ Phone app resumes. `lastRevision = 1042`. Cached `primary = P_42`. Sends `Resume
 
 ### Mobile subscriber wakes after 20 minutes
 
-Phone app resumes. `lastRevision = 1042`, current revision is 2342. Replay buffer covers 2086–2342 (256 entries). `ResumeV1{from: 1043}` falls outside the buffer but inside the parent checkpoint `[800, 2085]`. Cohort returns `CheckpointWindow{ checkpoint: [800..2085], recentEntries: [2086..2342] }`. Subscriber applies the checkpoint's merged digest (collection-specific — for a KV collection, this is "these keys changed"), then dedupes against `lastRevision = 1042` for the `recentEntries`. One round trip. **Measured: lag 1,299 falls in `[W, W + W_checkpoint) = [256, 4352)` → `CheckpointWindow`, 1 RPC, ≈ 100 ms.** (The `from = 1043` lands inside the layered checkpoint `[800, 2085]` sitting immediately below the replay ring `2086–2342`, illustrating the stacked-window semantics: `W` covers the head, the checkpoint the next `W_checkpoint` below it.)
+Phone app resumes. `lastRevision = 1042`, current revision is 2342. Replay buffer covers 2086–2342 (256 entries). `ResumeV1{from: 1043}` falls outside the buffer but inside the parent checkpoint `[800, 2085]`. Cohort returns `CheckpointWindow{ checkpoints: [[800..2085]], recentEntries: [2086..2342] }` (a single-link chain in steady state). Subscriber applies the checkpoint's merged digest (collection-specific — for a KV collection, this is "these keys changed"), then dedupes against `lastRevision = 1042` for the `recentEntries`. One round trip. **Measured: lag 1,299 falls in `[W, W + W_checkpoint) = [256, 4352)` → `CheckpointWindow`, 1 RPC, ≈ 100 ms.** (The `from = 1043` lands inside the layered checkpoint `[800, 2085]` sitting immediately below the replay ring `2086–2342`, illustrating the stacked-window semantics: `W` covers the head, the checkpoint the next `W_checkpoint` below it.)
 
 ### Tail rotation during steady-state load
 

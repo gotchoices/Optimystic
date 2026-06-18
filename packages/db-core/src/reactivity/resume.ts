@@ -10,12 +10,16 @@
  *
  *  - **Backfill** — `fromRevision` is within the replay ring (`fromRevision ≥ ringLow`). Returns the
  *    `[fromRevision, currentRevision]` slice + `currentRevision`. One RT.
- *  - **CheckpointWindow** — `fromRevision` is below the ring but within the parent checkpoint
- *    (`checkpoint.from ≤ fromRevision < ringLow`). Returns the {@link CheckpointSummary} + the ring's
- *    `recentEntries`. The subscriber applies the merged digest, then replays the recent entries deduped
- *    against `lastRevision`. One RT. A new tail that took over across a rotation also serves this variant
- *    from the **inherited** handoff checkpoint when the rolling one misses but the inherited one covers
- *    `fromRevision` (`docs/reactivity.md` §Tail rotation step 5 — "the new tail holds the old checkpoint").
+ *  - **CheckpointWindow** — `fromRevision` is below the ring but within the parent checkpoint span
+ *    (`chain low ≤ fromRevision < ringLow`). Returns an ordered, contiguous **chain** of
+ *    {@link CheckpointSummary}s (`checkpoints`, low→high) + the ring's `recentEntries`. The subscriber
+ *    verifies every link's endpoints, applies each link's merged digest, advances its contiguity head past
+ *    the whole chain, then replays the recent entries deduped against `lastRevision`. One RT. The chain is a
+ *    single link in steady state; a new tail that took over across a rotation serves a **two-link**
+ *    `[inherited, rolling]` chain when a `fromRevision` below both the ring and the rolling checkpoint falls
+ *    inside the inherited handoff window — so the full stacked range recovers in one reply regardless of
+ *    where the new tail's own rolling checkpoint has formed (`docs/reactivity.md` §Tail rotation step 5 —
+ *    "the new tail holds the old checkpoint").
  *  - **OutOfWindow** — older than even the checkpoint. Returns `currentTailId` + `currentRevision`; the
  *    subscriber falls back to a chain read, then a fresh subscribe.
  *  - **TailRotated** — the request's `latestKnownTailId` does not match the cohort's current tail (the
@@ -81,9 +85,14 @@ export interface ResumeReplyV1 {
 	/** Highest committed revision the serving cohort knows (backfill / checkpoint_window / out_of_window). */
 	currentRevision?: number;
 	// --- checkpoint_window ---
-	/** The parent-checkpoint summary spanning `[checkpoint.from, ringLow − 1]` (checkpoint_window). */
-	checkpoint?: CheckpointSummary;
-	/** The replay ring's entries, replayed deduped against `lastRevision` after the digest applies. */
+	/**
+	 * The parent-checkpoint chain spanning `[chain[0].fromRevision, ringLow − 1]` (checkpoint_window), ordered
+	 * low→high and **contiguous**: each `checkpoints[i].fromRevision === checkpoints[i-1].toRevision + 1`. A
+	 * single link in steady state; a cross-rotation resume carries the two-link `[inherited, rolling]` bridge.
+	 * The subscriber verifies and applies every link in sequence (see {@link applyResumeReply}).
+	 */
+	checkpoints?: CheckpointSummary[];
+	/** The replay ring's entries, replayed deduped against `lastRevision` after the digests apply. */
 	recentEntries?: NotificationV1[];
 	// --- out_of_window ---
 	/** Current tail block id, base64url — the subscriber re-subscribes after a chain read (out_of_window). */
@@ -130,7 +139,7 @@ export function validateResumeReplyV1(value: unknown): ResumeReplyV1 {
 			break;
 		}
 		case "checkpoint_window": {
-			out.checkpoint = validateCheckpointSummary(obj["checkpoint"], `${what}.checkpoint`);
+			out.checkpoints = validateCheckpointChain(obj["checkpoints"], `${what}.checkpoints`);
 			out.recentEntries = validateNotificationArray(obj["recentEntries"], what);
 			if (obj["currentRevision"] !== undefined) {
 				out.currentRevision = reqIntInRange(obj, "currentRevision", what, 0);
@@ -149,6 +158,30 @@ export function validateResumeReplyV1(value: unknown): ResumeReplyV1 {
 		}
 	}
 	return out;
+}
+
+/**
+ * Validate a `checkpoint_window` reply's checkpoint chain: a **non-empty**, **ascending**, internally
+ * **contiguous** list of {@link CheckpointSummary}s sharing one `collectionId`. Each link is validated via
+ * {@link validateCheckpointSummary}, and for `i ≥ 1` the chain must satisfy
+ * `checkpoints[i].fromRevision === checkpoints[i-1].toRevision + 1` (a gapped, overlapping, or misordered
+ * chain is rejected). Runs on decode, so a malformed chain never reaches {@link applyResumeReply} over the
+ * wire.
+ */
+function validateCheckpointChain(value: unknown, what: string): CheckpointSummary[] {
+	if (!Array.isArray(value) || value.length === 0) {
+		failWire(`${what}: must be a non-empty array of checkpoint summaries`);
+	}
+	const chain = value.map((el, i) => validateCheckpointSummary(el, `${what}[${i}]`));
+	for (let i = 0; i < chain.length; i++) {
+		if (chain[i]!.collectionId !== chain[0]!.collectionId) {
+			failWire(`${what}: all checkpoints must share one collectionId`);
+		}
+		if (i >= 1 && chain[i]!.fromRevision !== chain[i - 1]!.toRevision + 1) {
+			failWire(`${what}: chain must be ascending and contiguous (checkpoints[${i}].fromRevision must equal checkpoints[${i - 1}].toRevision + 1)`);
+		}
+	}
+	return chain;
 }
 
 // --- canonical signing payload ---
@@ -201,21 +234,81 @@ export function decodeResumeReplyV1(bytes: Uint8Array, maxMessageBytes?: number)
 
 // --- serving-cohort classification ---
 
+/** The rolling checkpoint's summary; non-undefined because the caller already proved it abuts the ring (so non-empty). */
+function requireRollingSummary(rolling: RollingCheckpoint): CheckpointSummary {
+	const summary = rolling.summary();
+	if (summary === undefined) {
+		throw new Error("resumeCheckpointChain: rolling checkpoint abuts the ring yet produced no summary (invariant violation)");
+	}
+	return summary;
+}
+
+/**
+ * Build the served checkpoint chain for a `checkpoint_window` resume: the **shortest** contiguous low→high
+ * chain of {@link CheckpointSummary}s that both covers `fromRevision` and **abuts the ring's low edge**
+ * (`top.toRevision === ringLow − 1`), or `undefined` when no gap-free chain exists. Shared by
+ * {@link classifyResume} and {@link serveResume} so they cannot disagree about the served shape.
+ *
+ * Cases are evaluated in precedence order (this ordering preserves every existing classification test):
+ *
+ *  - **A — rolling wins.** The rolling checkpoint abuts the ring (it is fed by ring eviction, so it always
+ *    does) and covers `fromRevision`: the fresher, narrower single link `[rolling]`.
+ *  - **B1 — inherited abuts the ring directly.** No new-tail rolling checkpoint has formed between the
+ *    inherited handoff and the ring yet (the `12.51` abut case): the single link `[inherited]`.
+ *  - **B2 — the bridge.** The inherited handoff abuts the new tail's rolling checkpoint, which abuts the
+ *    ring: the two-link `[inherited, rolling]` chain spans inherited → rolling → ring with no gap.
+ *
+ * Any other shape (a gap below `fromRevision`, or a gap between the windows) returns `undefined` → the
+ * request falls to `out_of_window` (an honest chain read). `ringLow === undefined` (no live ring to abut /
+ * no `recentEntries`) also returns `undefined`.
+ */
+function resumeCheckpointChain(
+	fromRevision: number,
+	ringLow: number | undefined,
+	rolling: RollingCheckpoint | undefined,
+	inherited: CheckpointSummary | undefined,
+): CheckpointSummary[] | undefined {
+	if (ringLow === undefined) {
+		return undefined;
+	}
+	const ringAbut = ringLow - 1;
+
+	// Case A — the rolling checkpoint wins (fresher, narrower). `toRevision === ringAbut` implies it is
+	// non-empty, so the summary is defined (asserted in requireRollingSummary).
+	if (rolling !== undefined && rolling.toRevision === ringAbut && rolling.covers(fromRevision)) {
+		return [requireRollingSummary(rolling)];
+	}
+	// Case B1 — the inherited handoff abuts the ring directly (the 12.51 abut case): a single link.
+	if (inherited !== undefined && inherited.toRevision === ringAbut && checkpointCovers(inherited, fromRevision)) {
+		return [inherited];
+	}
+	// Case B2 — the bridge: inherited abuts the rolling checkpoint, which abuts the ring. The two-link chain
+	// carries inherited → rolling → ring with no gap, and each link keeps its own already-correct merged
+	// digest (nothing is re-folded, so a per-collection override fold composes trivially).
+	if (
+		inherited !== undefined &&
+		rolling !== undefined &&
+		rolling.toRevision === ringAbut &&
+		inherited.toRevision + 1 === rolling.fromRevision &&
+		checkpointCovers(inherited, fromRevision)
+	) {
+		return [inherited, requireRollingSummary(rolling)];
+	}
+	return undefined;
+}
+
 /**
  * Classify a resume request against the serving cohort's stacked windows. The decision order is:
  *
  *  1. **tail_rotated** — `req.latestKnownTailId !== currentTailId`. A stale tail means the tree migrated,
  *     so the lag classification below is moot.
  *  2. **backfill** — `fromRevision` is at/above the replay ring's low edge (within, or already current).
- *  3. **checkpoint_window** (rolling) — below the ring but within the rolling checkpoint's covered range.
- *  4. **checkpoint_window** (inherited) — below *both* the ring and the rolling checkpoint, but within the
- *     `inherited` cross-rotation handoff checkpoint this (new) tail holds (`docs/reactivity.md` §Tail
- *     rotation step 5 — "the new tail holds the old checkpoint"), **and** the inherited window abuts the
- *     ring's low edge so the served `inherited summary + ring` reply is gap-free (see the abut condition
- *     below). The rolling checkpoint wins when both cover `fromRevision` (it is the fresher, narrower
- *     window); the inherited one is the deeper, last-resort window, consulted only when the rolling one
- *     misses and only while it still abuts the ring.
- *  5. **out_of_window** — older than even the inherited checkpoint, or inside it but no longer abutting the
+ *  3. **checkpoint_window** — below the ring but a gap-free {@link resumeCheckpointChain} covers it: the
+ *     rolling checkpoint (steady state), the inherited cross-rotation handoff (`docs/reactivity.md` §Tail
+ *     rotation step 5 — "the new tail holds the old checkpoint"), or the two-link `[inherited, rolling]`
+ *     bridge spanning both when the new tail's own rolling checkpoint has formed between the handoff and the
+ *     ring.
+ *  4. **out_of_window** — older than even the deepest window, or a gap leaves no contiguous chain to the
  *     ring (a chain read), or every window is empty/absent.
  */
 export function classifyResume(
@@ -232,27 +325,9 @@ export function classifyResume(
 	if (low !== undefined && req.fromRevision >= low) {
 		return "backfill";
 	}
-	if (checkpoint !== undefined && checkpoint.covers(req.fromRevision)) {
-		return "checkpoint_window";
-	}
-	// The inherited cross-rotation window is served as `inherited summary + the live ring's recentEntries`
-	// (see serveResume), so it is only gap-free when the inherited summary's high edge **abuts (or overlaps)
-	// the ring's low edge**: `inherited.toRevision >= ringLow − 1`. Right after a rotation the new tail's ring
-	// still holds every revision since the handoff (`ringLow == rotationRevision + 1 == inherited.toRevision + 1`),
-	// so it abuts. Once the new tail's *own* rolling checkpoint forms between the inherited window and the ring,
-	// a single-checkpoint reply cannot bridge all three windows; serving inherited + ring would silently skip
-	// `[inherited.toRevision + 1, ringLow − 1]`, so the request falls to `out_of_window` (an honest chain read)
-	// instead. Extending the inherited window past the new ring's first eviction is the follow-on
-	// `reactivity-rotation-inherited-window-bridge`.
-	if (
-		inherited !== undefined &&
-		low !== undefined &&
-		inherited.toRevision >= low - 1 &&
-		checkpointCovers(inherited, req.fromRevision)
-	) {
-		return "checkpoint_window";
-	}
-	return "out_of_window";
+	return resumeCheckpointChain(req.fromRevision, low, checkpoint, inherited) !== undefined
+		? "checkpoint_window"
+		: "out_of_window";
 }
 
 /** Construction inputs for {@link serveResume}. */
@@ -263,11 +338,12 @@ export interface ResumeServingDeps {
 	readonly checkpoint?: RollingCheckpoint;
 	/**
 	 * The checkpoint migrated from the **outgoing** tail when this cohort became the new tail across a
-	 * rotation (the live `PushState.inheritedCheckpoint`). Consulted only when the rolling {@link checkpoint}
-	 * does not cover `fromRevision` **and** the inherited window still abuts the ring's low edge (so the
-	 * `inherited summary + ring` reply is gap-free; see {@link classifyResume}). A resume whose span crosses
-	 * the rotation is then answered from the inherited window instead of falling to `out_of_window`
-	 * (`docs/reactivity.md` §Tail rotation step 5).
+	 * rotation (the live `PushState.inheritedCheckpoint`). Consulted when the rolling {@link checkpoint} does
+	 * not cover `fromRevision`: a resume whose span crosses the rotation is answered from the inherited window
+	 * — either alone (it abuts the ring directly) or as the lower link of the two-link `[inherited, rolling]`
+	 * bridge when the new tail's own rolling checkpoint has formed between the handoff and the ring (see
+	 * {@link resumeCheckpointChain}) — instead of falling to `out_of_window` (`docs/reactivity.md` §Tail
+	 * rotation step 5).
 	 */
 	readonly inheritedCheckpoint?: CheckpointSummary;
 	/** The cohort's current tail block id, base64url. */
@@ -297,15 +373,15 @@ export function serveResume(req: ResumeV1, deps: ResumeServingDeps): ResumeReply
 			return { v: 1, result, entries, currentRevision: deps.currentRevision };
 		}
 		case "checkpoint_window": {
-			// The rolling checkpoint wins when it covers `fromRevision` (the fresher, narrower window; its
-			// covers() being true ⇒ it is non-empty ⇒ summary() is defined). Otherwise the inherited
-			// cross-rotation handoff checkpoint covers it — and classifyResume only chose this branch when the
-			// inherited window abuts the ring's low edge, so `inherited summary + ring` below is contiguous.
-			const summary = deps.checkpoint !== undefined && deps.checkpoint.covers(req.fromRevision)
-				? deps.checkpoint.summary()!
-				: deps.inheritedCheckpoint!;
+			// The contiguous chain the helper built — rolling alone, inherited alone, or the two-link bridge.
+			// classifyResume returned checkpoint_window iff this chain is present, so it is non-undefined here
+			// (the two calls share inputs, so they cannot disagree).
+			const chain = resumeCheckpointChain(req.fromRevision, deps.buffer.lowRevision, deps.checkpoint, deps.inheritedCheckpoint);
+			if (chain === undefined) {
+				throw new Error("serveResume: checkpoint_window classification produced no checkpoint chain (invariant violation)");
+			}
 			const recentEntries = deps.buffer.entries().map((e) => e.payload);
-			return { v: 1, result, checkpoint: summary, recentEntries, currentRevision: deps.currentRevision };
+			return { v: 1, result, checkpoints: chain, recentEntries, currentRevision: deps.currentRevision };
 		}
 		case "out_of_window":
 			return { v: 1, result, currentTailId: deps.currentTailId, currentRevision: deps.currentRevision };
@@ -364,32 +440,45 @@ export async function applyResumeReply(reply: ResumeReplyV1, deps: ResumeApplyDe
 			return "backfilled";
 		}
 		case "checkpoint_window": {
-			const summary = reply.checkpoint;
-			if (summary === undefined) {
-				failWire(`applyResumeReply: checkpoint_window reply is missing its checkpoint summary`);
+			const summaries = reply.checkpoints;
+			if (summaries === undefined || summaries.length === 0) {
+				failWire(`applyResumeReply: checkpoint_window reply is missing its checkpoint chain`);
 			}
-			const verdict = await verifyCheckpointEndpoints(summary, deps.verifier);
-			if (verdict !== "verified") {
-				// A forged/tampered checkpoint must not advance state — fall back to the authoritative chain.
+			// Low-edge guard on the **lowest** link: endpoint verification proves each link's bounds are *real*
+			// committed revisions, but not that the chain connects to the subscriber's contiguity head. If the
+			// lowest `fromRevision` sits above `lastRevision + 1` there is an un-summarized gap below the chain;
+			// rebaselining would silently skip those revisions. The honest cohort never sends such a reply
+			// (`classifyResume` only picks `checkpoint_window` when the chain covers `lastRevision + 1`), so a
+			// non-abutting low edge is a forged/buggy reply — chain-read rather than advance past a gap.
+			if (summaries[0]!.fromRevision > deps.subscriber.lastRevision + 1) {
 				deps.onChainRead?.(reply.currentTailId, reply.currentRevision);
 				return "checkpoint_untrusted";
 			}
-			// Endpoint verification proves the summary's bounds are *real* committed revisions, but not that
-			// its low edge connects to the subscriber's contiguity head. If the checkpoint's `fromRevision`
-			// sits above `lastRevision + 1` there is an un-summarized gap `[lastRevision + 1, fromRevision − 1]`
-			// below it; rebaselining to `toRevision` would silently skip those revisions. The honest cohort
-			// never sends such a reply (`classifyResume` only picks `checkpoint_window` when the checkpoint
-			// covers `lastRevision + 1`), so a non-abutting checkpoint is a forged/buggy reply — chain-read
-			// rather than advance past revisions the checkpoint does not cover.
-			if (summary.fromRevision > deps.subscriber.lastRevision + 1) {
-				deps.onChainRead?.(reply.currentTailId, reply.currentRevision);
-				return "checkpoint_untrusted";
+			// Intra-chain contiguity (defense in depth: the codec already checks every *decoded* reply, but an
+			// in-process reply may bypass the codec). A gap/overlap between links would skip or double revisions.
+			for (let i = 1; i < summaries.length; i++) {
+				if (summaries[i]!.fromRevision !== summaries[i - 1]!.toRevision + 1) {
+					deps.onChainRead?.(reply.currentTailId, reply.currentRevision);
+					return "checkpoint_untrusted";
+				}
 			}
-			// Apply the merged digest (application-level), then advance the contiguity head past the
-			// summarized range so the recent entries (which sit immediately above it) replay gap-free —
-			// any recent entry at/below the head dedupes (`docs/reactivity.md` §Parent checkpoint summaries).
-			deps.onCheckpointDigest?.(summary);
-			deps.subscriber.rebaseline(summary.toRevision);
+			// Verify EVERY link's bracketing endpoints **before applying anything** — a single forged link kills
+			// the whole reply, so nothing is delivered and `lastRevision` is unchanged (no partial advance).
+			for (const summary of summaries) {
+				const verdict = await verifyCheckpointEndpoints(summary, deps.verifier);
+				if (verdict !== "verified") {
+					deps.onChainRead?.(reply.currentTailId, reply.currentRevision);
+					return "checkpoint_untrusted";
+				}
+			}
+			// Apply in order: the application sees each link's merged-digest hint, then the contiguity head
+			// advances past that link. `rebaseline` is monotone, so the head lands at the top link's
+			// `toRevision`; the recent entries (immediately above it) then replay gap-free — any recent entry
+			// at/below the head dedupes (`docs/reactivity.md` §Parent checkpoint summaries).
+			for (const summary of summaries) {
+				deps.onCheckpointDigest?.(summary);
+				deps.subscriber.rebaseline(summary.toRevision);
+			}
 			for (const n of reply.recentEntries ?? []) {
 				await deps.subscriber.onNotification(n);
 			}
