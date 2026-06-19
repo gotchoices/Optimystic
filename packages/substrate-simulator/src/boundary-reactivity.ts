@@ -382,14 +382,14 @@ export function runReactivityBoundaries(opts: ReactivityBoundaryOptions = {}): R
 	recordBoundary(metrics, continuityBoundary);
 	boundaries.push(continuityBoundary);
 	const atEdge = evalContinuity(clampToRange(continuityBoundary.criticalValue, cp.cpsFloor, cp.cpsCeiling), cp);
-	const pastEdge = evalContinuity(probePastEdge(continuityBoundary, cp.cpsFloor, cp.cpsCeiling, false), cp);
+	const pastEdge = evalContinuity(probePastEdge(continuityBoundary, cp.cpsFloor, cp.cpsCeiling), cp);
 
 	// Boundary 2 — completes-within-drain vs rejoin/drain ratio (seeded burst).
 	const drainBoundary = findBoundary(tailDrainAxis(drainOpts));
 	recordBoundary(metrics, drainBoundary);
 	boundaries.push(drainBoundary);
 	const designDrain = evalDrain(dp.designRatio, dp);
-	const drainPastEdge = evalDrain(probePastEdge(drainBoundary, dp.ratioFloor, dp.ratioCeiling, false), dp);
+	const drainPastEdge = evalDrain(probePastEdge(drainBoundary, dp.ratioFloor, dp.ratioCeiling), dp);
 
 	return {
 		boundaries,
@@ -409,14 +409,15 @@ function clampToRange(v: number, lo: number, hi: number): number {
 }
 
 /**
- * A probe value just past a located edge (one harm-tolerance step deeper into the failing region),
- * clamped to `[lo, hi]`. Real axes step by a small fraction of the range; when no finite edge was found
- * the critical value already sits at the ceiling, so the probe is the ceiling itself.
+ * A probe value just past a located edge (one small step deeper into the failing region), clamped to
+ * `[lo, hi]`. Both reactivity axes are real-valued, so the step is a small fraction of the range; when
+ * no finite edge was found the critical value already sits at the ceiling, so the probe is the ceiling
+ * itself.
  */
-function probePastEdge(b: EnvelopeBoundary, lo: number, hi: number, integer: boolean): number {
+function probePastEdge(b: EnvelopeBoundary, lo: number, hi: number): number {
 	if (!b.boundaryFound) {
 		return clampToRange(b.criticalValue, lo, hi);
 	}
-	const step = integer ? 1 : (hi - lo) * 1e-3;
+	const step = (hi - lo) * 1e-3;
 	return clampToRange(b.criticalValue + step, lo, hi);
 }

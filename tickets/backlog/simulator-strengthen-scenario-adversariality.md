@@ -32,12 +32,28 @@ teeth where it currently does not. None of this blocks `fold-simulator-findings-
   `deadline`, so `≤ patienceMs` is near-tautological. Consider a reporter that flips its lie
   per-query (so the seeker cannot settle), and assert the harm is still bounded.
 
-- **`tail-rotation-under-load / completes-within-drain`** — `withinDrain` can never be false: arrivals
-  jitter over `T_rejoin_jitter` (30 s) which is hardcoded **smaller** than `T_drain` (60 s), so
-  `lastArrivalAt ≤ T_drain` always holds regardless of system behavior. Either drive a jitter window
-  that can plausibly exceed `T_drain` (and assert the wave still drains via promotion fan-out, not via
-  the window being trivially short), or replace the claim with one that measures the *drain* dynamics
-  (old-tail forwarding tail-off) rather than just the arrival-window bound.
+- **`tail-rotation-under-load / completes-within-drain`** — `withinDrain` can never be false at the
+  default config: arrivals jitter over `T_rejoin_jitter` (30 s), hardcoded **smaller** than `T_drain`
+  (60 s), so `lastArrivalAt ≤ T_drain` always holds regardless of system behavior. Either drive a
+  jitter window that can plausibly exceed `T_drain` (and assert the wave still drains via promotion
+  fan-out, not via the window being trivially short), or replace the claim with one that measures the
+  *drain* dynamics (old-tail forwarding tail-off) rather than just the arrival-window bound.
+
+  **Partially landed — read before starting.** `simulator-envelope-reactivity` (now in `complete/`)
+  built a `boundary-reactivity.ts` harness that already drives the `T_rejoin_jitter / T_drain` ratio
+  past 1 and asserts the wave still drains via fast-promote fan-out (the first alternative above), so
+  the *boundary*-mode coverage of this gap exists. Two consequences for this ticket:
+  - **The horizon bug is already fixed.** `simulateRotationBurst` previously also capped its run at
+    `world.scheduler.run(T_drain)`, so any arrival scheduled past `T_drain` never fired — a *second*,
+    independent reason `completedWithinDrain` could never be false once jitter exceeded drain. That run
+    horizon is now `max(T_drain, T_rejoin_jitter)`, so the genuine last-arrival time is observed. Do
+    **not** re-fix it; if you touch that line, expect a clean no-op rather than a conflict (the
+    shipped-config horizon is still exactly `T_drain`, so the default burst is byte-unchanged).
+  - **Remaining scope here is the *scenario* claim, not the boundary.** The `TailRotationScenario`
+    claim in `scenarios.ts` still runs at the default config and is still tautological. The
+    higher-value remaining work is the *second* alternative — make the scenario claim measure real
+    drain dynamics (per-arrival absorption / old-tail forwarding tail-off / queue depth at the new
+    tail) rather than the arrival-window bound, which would also lower the boundary's `ratio*`.
 
 ## Unvalidated lookahead-ON cold-start path
 
