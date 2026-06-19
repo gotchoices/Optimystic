@@ -209,7 +209,7 @@ All encoding parameters default to `base64url` unless otherwise specified.
 |---------|---------|---------|
 | `@noble/curves` | ^2.0.1 | ECC: secp256k1, P-256, Ed25519 |
 | `@noble/hashes` | ^2.0.1 | SHA-256, SHA-512, BLAKE3 |
-| `multiformats` | ^14.0.0 | CID / multihash / multibase / multicodec framing |
+| `multiformats` | ^13.4.2 | CID / multihash / multibase / multicodec framing |
 | `uint8arrays` | ^5.1.0 | Encoding conversion utilities |
 
 No native modules required. Compatible with Node.js, browsers, and React Native (with `crypto.getRandomValues` polyfill). The `multiformats` CID/multihash/base modules used here carry no Node-only assumptions.

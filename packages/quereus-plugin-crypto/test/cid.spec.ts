@@ -110,6 +110,18 @@ describe('CID Functions', () => {
 			expect(() => cidDecode('')).to.throw();
 			expect(() => cidDecode('zzzzz!!!!')).to.throw();
 		});
+
+		it('decodes a legacy CIDv0 (Qm…), reporting unknown codec as a raw number', () => {
+			// A realistic value already living in a downstream `Cid` column. CIDv0 is
+			// implicitly dag-pb (0x70) / sha2-256 / base58btc — our codec map does not
+			// list dag-pb, so it must surface as the raw number rather than throwing.
+			const v0 = 'QmYwAPJzv5CZsnA625s3Xf2nemtYgPpHdWEz79ojWnPbdG';
+			const parts = cidDecode(v0);
+			expect(parts.version).to.equal(0);
+			expect(parts.codec).to.equal(0x70); // dag-pb, not in MULTICODEC_NAMES → numeric
+			expect(parts.hashCode).to.equal('sha2-256');
+			expect(parts.digest).to.be.instanceOf(Uint8Array).with.length(32);
+		});
 	});
 
 	describe('plugin registration (SQL surface)', () => {
@@ -168,6 +180,17 @@ describe('CID Functions', () => {
 		it('cid_decode() SQL throws on garbage input', () => {
 			const impl = getFn('cid_decode').implementation;
 			expect(() => impl('not-a-cid')).to.throw();
+		});
+
+		it('cid() / cid_v1() SQL reject a non-base64url TEXT argument (no silent mis-decode)', () => {
+			// The TEXT path is base64url, not raw content — a string with a space is
+			// invalid base64url and must throw rather than decode to surprise bytes.
+			const cidImpl = getFn('cid').implementation;
+			const cidV1Impl = getFn('cid_v1').implementation;
+			expect(() => cidImpl('hello world')).to.throw();
+			expect(() => cidV1Impl('hello world', 'sha2-256')).to.throw();
+			// A non-TEXT, non-BLOB argument (e.g. an INTEGER) is also rejected.
+			expect(() => cidImpl(123 as any)).to.throw(/BLOB or base64url/);
 		});
 	});
 });
