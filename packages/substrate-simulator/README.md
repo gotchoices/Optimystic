@@ -66,7 +66,7 @@ Seven layers ship here:
   `d_max_cap`, `W`/`W_checkpoint`, `contention_factor_cap`). The sweep report is the input artifact
   `fold-simulator-findings-into-design-docs` consumes.
 - **The validity-envelope finder** (`boundary.ts`, `boundary-reference.ts`, `boundary-tree.ts`,
-  `boundary-churn.ts`, `boundary-reactivity.ts`) — the third validation mode alongside the scenario
+  `boundary-churn.ts`, `boundary-reactivity.ts`, `boundary-matchmaking.ts`) — the third validation mode alongside the scenario
   claims and the sweep. Where a scenario answers *"does the claim hold at the nominal point"* and the
   sweep answers *"which way does this knob move the metric"*, `findBoundary` answers *"how far can a
   worsening condition be pushed before a claim flips pass→fail, and how much margin is there to the
@@ -81,7 +81,12 @@ Seven layers ship here:
   `no-lost-registrations` vs sustained member-kill rate and `heal-convergence` vs partition severity,
   both driving the real `TopicCohort`/`ParticipantRenewal` failover loop so the edge reflects the
   `ttl/3` renewal cadence rather than a structural identity; `boundary-reactivity.ts`
-  (`runReactivityBoundaries`) the replay-window / rotation-drain axes. Boundaries fold into the same
+  (`runReactivityBoundaries`) the replay-window / rotation-drain axes; `boundary-matchmaking.ts`
+  (`runMatchmakingBoundaries`) the two matchmaking axes — `bounded-harm` vs the fraction of
+  per-query-flip lying cohort reporters (seeded seeker walks, positive margin), and
+  `hang-out-fairness` vs the seeker-pool contention ratio (a pure function of the decision math whose
+  edge sits *below* the cap-saturation point, a deliberately negative margin signalling the
+  exact-`Σ wantCount` refinement is warranted). Boundaries fold into the same
   `Metrics` sink, keyed by `(claim, axis)`.
 
 Mock-only: it is **not** shipped to runtime consumers and depends on **no** `@optimystic/*` or

@@ -6,6 +6,7 @@ import {
 	seekerContentionAxis,
 	measureSeekerContention,
 	contentionRatioAtCap,
+	findBoundary,
 	BOUNDED_HARM_DESIGN_FRACTION,
 	DEFAULT_MATCHMAKING_CONFIG,
 	type EnvelopeBoundary,
@@ -91,6 +92,26 @@ describe('envelope-matchmaking — Boundary 1: bounded-harm vs lying-reporter fr
 		const a = measureBoundedHarm(2 / START_TIER, { seed: SEED }, 'per-query-flip');
 		const b = measureBoundedHarm(2 / START_TIER, { seed: SEED }, 'per-query-flip');
 		expect(a).to.deep.equal(b);
+	});
+
+	it('the edge is the patience_per_tier_fraction = 1.0 fragility, not a tier-model artifact', () => {
+		// The headline finding is that an over-report drains the *whole* patience budget at a
+		// provider-less tier because patience_per_tier_fraction = 1.0 commits it all to one tier. If that
+		// is the genuine mechanism (and not an over-tuned tier model), splitting the budget across tiers
+		// must move the edge out — the seeker escalates past the over-reporting tier and matches at the
+		// root, so harm becomes graded escalation rather than instant match failure. This is exactly the
+		// fragility matchmaking-per-tier-patience-splitting would fix.
+		for (const frac of [0.5, 0.25]) {
+			const config = { ...DEFAULT_MATCHMAKING_CONFIG, patiencePerTierFraction: frac };
+			const split = findBoundary(lyingFractionAxis({ seed: SEED, config }));
+			expect(split.boundaryFound, `split budget (frac=${frac}) keeps harm bounded across [0,1]`).to.equal(false);
+			const atCeiling = measureBoundedHarm(1, { seed: SEED, config }, 'per-query-flip');
+			expect(atCeiling.liedMatched, `split budget (frac=${frac}) still matches even at f = 1`).to.equal(true);
+			expect(atCeiling.harmMechanism, `split budget (frac=${frac}) stays within bounds`).to.equal('within-bounds');
+		}
+		// Control: at the shipped 1.0 fraction the edge is finite and well inside [0,1].
+		const shipped = findBoundary(lyingFractionAxis({ seed: SEED }));
+		expect(shipped.boundaryFound, 'the default 1.0 fraction does flip pass→fail inside [0,1]').to.equal(true);
 	});
 });
 
