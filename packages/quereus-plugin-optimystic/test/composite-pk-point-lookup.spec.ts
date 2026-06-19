@@ -101,4 +101,50 @@ describe('composite-PK point-lookup key assembly', function () {
 			db.close();
 		}
 	});
+
+	it('finds the row when the WHERE predicates are written in non-PK column order', async () => {
+		// The fix relies on Quereus delivering seek args in PK-definition order
+		// (seekColumnIndexes = [...pkColumns]) regardless of the textual order of the
+		// WHERE predicates. createPrimaryKey maps args positionally to the PK columns,
+		// so if that contract ever changed the assembled key would silently flip to
+		// "P1\x00M1" and miss. This locks the contract in.
+		const { db } = createDb(dir);
+		try {
+			await db.exec(
+				`create table MemberPeer (MemberKey text, PeerId text, note text,
+					primary key (MemberKey, PeerId))
+					using optimystic('tree://test/memberpeer-rev')`,
+			);
+			await db.exec(`insert into MemberPeer (MemberKey, PeerId, note) values ('M1', 'P1', 'hello')`);
+
+			// PeerId listed before MemberKey — opposite of PK definition order.
+			expect(
+				await selectScalar(db, `select note from MemberPeer where PeerId = 'P1' and MemberKey = 'M1'`),
+			).to.equal('hello');
+		} finally {
+			db.close();
+		}
+	});
+
+	it('finds a row by a three-column composite primary key', async () => {
+		const { db } = createDb(dir);
+		try {
+			await db.exec(
+				`create table Triple (a text, b text, c text, note text,
+					primary key (a, b, c))
+					using optimystic('tree://test/triple')`,
+			);
+			await db.exec(`insert into Triple (a, b, c, note) values ('A', 'B', 'C', 'tri')`);
+			await db.exec(`insert into Triple (a, b, c, note) values ('A', 'B', 'X', 'other')`);
+
+			expect(await selectCount(db, 'select count(1) from Triple')).to.equal(2);
+			// Full three-column seek must isolate exactly the matching row, not its
+			// shared-prefix sibling ('A','B','X').
+			expect(
+				await selectScalar(db, `select note from Triple where a = 'A' and b = 'B' and c = 'C'`),
+			).to.equal('tri');
+		} finally {
+			db.close();
+		}
+	});
 });
