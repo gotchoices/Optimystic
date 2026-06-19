@@ -11,7 +11,7 @@ import { OptimysticVirtualTableConnection } from './optimystic-adapter/vtab-conn
 import type { ParsedOptimysticOptions } from './types.js';
 import type { IRawStorage } from '@optimystic/db-p2p';
 import { VirtualTable } from '@quereus/quereus';
-import { ConstraintError, ConflictResolution, QuereusError, StatusCode } from '@quereus/quereus';
+import { ConflictResolution, QuereusError } from '@quereus/quereus';
 import type { VirtualTableModule, BaseModuleConfig, Database, TableSchema, Row, FilterInfo, BestAccessPlanRequest, BestAccessPlanResult, OrderingSpec, VirtualTableConnection, TableIndexSchema as IndexSchema, UpdateArgs, UpdateResult, SqlValue } from '@quereus/quereus';
 import { Tree } from '@optimystic/db-core';
 import { KeyRange } from '@optimystic/db-core';
@@ -836,23 +836,83 @@ export class OptimysticVirtualTable extends VirtualTable {
             // rollback). A PK change is staged as delete-old + insert-new so both
             // index halves revert together on rollback.
             if (oldKey !== newKey) {
-              // Staging is an upsert, so check for a collision before touching
-              // any trees. A positive get() means a *different* row occupies
-              // newKey (oldKey !== newKey guarantees it). Throw before
-              // markDirtyTrees so a rejected move stages nothing and leaves the
-              // snapshot untouched.
-              const existing = await this.collection.get(newKey);
+              // Staging is an upsert, so a pre-stage get() is the only thing
+              // that notices the moving row is about to land on a key a
+              // *different* row already occupies (oldKey !== newKey guarantees
+              // it is a different row). On a hit we RETURN a structured
+              // constraint/ok result (never throw) so the engine can apply SQL
+              // conflict semantics — IGNORE, REPLACE, or upsert — exactly as
+              // the INSERT path does.
+              const existing = await this.collection.get(newKey) as [string, EncodedRow] | undefined;
               if (existing !== undefined) {
-                throw new ConstraintError(
-                  `UNIQUE constraint failed: ${this.tableName} primary key '${newKey}'`,
-                  StatusCode.CONSTRAINT,
-                );
+                // Decode the displaced row once from the entry value [pk, encoded].
+                const existingRow = this.rowCodec.decodeRow(existing[1]);
+                // No per-constraint default in optimystic, so the fallback for
+                // an absent statement-level OR clause is plain ABORT.
+                const onConflict = args.onConflict ?? ConflictResolution.ABORT;
+
+                if (onConflict === ConflictResolution.IGNORE) {
+                  // UPDATE OR IGNORE: leave both rows put — the moving row stays
+                  // at oldKey, the row at newKey is untouched. Stage nothing and
+                  // skip markDirtyTrees so the ignored move costs nothing.
+                  return { status: 'ok' };
+                }
+
+                if (onConflict === ConflictResolution.REPLACE) {
+                  // UPDATE OR REPLACE: displace the row at newKey and move the
+                  // moving row there. The main-table staging is identical to the
+                  // non-collision move — staging undefined at oldKey clears the
+                  // old slot and the upsert at newKey overwrites the displaced
+                  // row in one shot, so no separate displaced-row delete is
+                  // needed here.
+                  this.markDirtyTrees();
+                  await this.collection.stage([
+                    [oldKey, undefined],
+                    [newKey, [newKey, encodedRow]]
+                  ]);
+
+                  // Index maintenance needs both stagings, in this order: first
+                  // remove the DISPLACED row's entries (treeKeys
+                  // <displacedIdx>\x00<newKey>), THEN transition the MOVING
+                  // row's entries (<oldIdx>\x00<oldKey> -> <newIdx>\x00<newKey>).
+                  // When both rows share an indexed value they touch the
+                  // identical tree key <idx>\x00<newKey>; deleting first then
+                  // re-inserting leaves the surviving (moving-row) entry in
+                  // place. The reverse order would insert then delete, wrongly
+                  // dropping the entry.
+                  await this.indexManager.deleteIndexEntries(existingRow, newKey, txnState?.transactor);
+                  await this.indexManager.updateIndexEntries(
+                    oldKeyValues,
+                    values,
+                    oldKey,
+                    newKey,
+                    txnState?.transactor
+                  );
+
+                  // The displaced row is gone, so the net row count drops by one
+                  // — the one UPDATE that is not count-neutral, mirroring the
+                  // delete path's decrementRowCount().
+                  this.statisticsCollector?.decrementRowCount();
+
+                  return { status: 'ok', row: values, replacedRow: existingRow };
+                }
+
+                // ABORT (default) / FAIL / ROLLBACK: reject the move
+                // structurally. Stage nothing and touch no trees; the engine's
+                // translateConflictError maps this to the right subclass for
+                // FAIL/ROLLBACK. The vtab no longer throws for these modes.
+                return {
+                  status: 'constraint',
+                  constraint: 'unique',
+                  message: this.uniqueConstraintMessage(),
+                  existingRow,
+                };
               }
 
               // Snapshot before staging so a rollback reverts exactly this change.
               this.markDirtyTrees();
 
-              // Key changed - delete old, insert new
+              // Key changed, no collision - delete old, insert new
               await this.collection.stage([
                 [oldKey, undefined],
                 [newKey, [newKey, encodedRow]]
@@ -903,8 +963,10 @@ export class OptimysticVirtualTable extends VirtualTable {
           throw new Error(`Unsupported operation: ${operation}`);
       }
     } catch (error) {
-      // Rethrow QuereusErrors verbatim (e.g. the uniqueness ConstraintError) so
-      // the engine keeps the constraint classification; wrapping would mask it.
+      // Rethrow QuereusErrors verbatim (e.g. a constraint violation surfaced by
+      // an inner operation) so the engine keeps the error classification;
+      // wrapping would mask it. Duplicate-key conflicts no longer reach here —
+      // the INSERT and UPDATE paths return structured UpdateResults instead.
       if (error instanceof QuereusError) {
         throw error;
       }

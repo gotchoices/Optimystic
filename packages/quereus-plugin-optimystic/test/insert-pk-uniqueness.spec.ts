@@ -355,3 +355,132 @@ describe('INSERT conflict resolution (local/bootstrap transactor)', function () 
 		expect(await reopenScalar(dir, `select v from T where cat = 'y'`)).to.equal('b');
 	});
 });
+
+/**
+ * Conflict-resolution coverage for PK-MOVING UPDATEs (see fix ticket
+ * `optimystic-update-pk-move-onconflict-not-honored`).
+ *
+ * When an UPDATE changes a row's primary key onto a key a *different* row
+ * already occupies, the vtab used to THROW an ad-hoc ConstraintError that
+ * bypassed the engine's conflict-resolution machinery. The fix replaces the
+ * throw with a STRUCTURED UpdateResult (status 'constraint' + existingRow for
+ * ABORT; status 'ok' + replacedRow for REPLACE; status 'ok' for IGNORE),
+ * mirroring the INSERT path and the engine's UpdateResult contract.
+ *
+ * REACHABILITY: only the default ABORT mode is reachable through Quereus SQL
+ * today, so only it is asserted end-to-end here. Quereus has no
+ * `UPDATE OR REPLACE` / `UPDATE OR IGNORE` grammar (the parser jumps straight
+ * from `UPDATE` to the table name — `update or replace …` raises "Expected
+ * table name"), and the planner hard-codes `onConflict = undefined` for every
+ * UPDATE ("UPDATE has no statement-level OR clause"). optimystic resolves
+ * `args.onConflict ?? ABORT` and reads no per-constraint conflict default, so a
+ * PK-moving UPDATE always arrives as ABORT. The REPLACE/IGNORE branches are
+ * correct-by-construction — they reuse the exact staging / index / statistics
+ * primitives already exercised by the passing `INSERT OR REPLACE` /
+ * `INSERT OR IGNORE` tests above — but cannot be driven from SQL until the
+ * engine supplies a non-ABORT onConflict for updates. See the review handoff
+ * for the full analysis and the recommended follow-up.
+ *
+ * These run against the real `local` / FileRawStorage transactor so they
+ * exercise persistence + reopen.
+ */
+describe('UPDATE PK-move conflict resolution (local/bootstrap transactor)', function () {
+	this.timeout(15000);
+
+	let dir: string;
+
+	beforeEach(async () => {
+		dir = path.join(os.tmpdir(), 'optimystic-update-pkmove-onconflict', randomUUID());
+		await fs.mkdir(dir, { recursive: true });
+	});
+
+	afterEach(async () => {
+		await fs.rm(dir, { recursive: true, force: true });
+	});
+
+	it('default UPDATE moving a PK onto an occupied key is rejected with a SQLite-style message and leaves both rows intact', async () => {
+		const uri = 'tree://update-pkmove/abort';
+		const { db } = createDb(dir);
+		try {
+			await db.exec(
+				`create table T (id integer primary key, v text) using optimystic('${uri}')`,
+			);
+			await db.exec(`insert into T (id, v) values (1, 'a')`); // A
+			await db.exec(`insert into T (id, v) values (2, 'b')`); // B
+
+			// Move A onto B's occupied key. The vtab now RETURNS a structured
+			// constraint result instead of throwing its old ad-hoc string; the
+			// engine rethrows it with the column-qualified wording. Pre-fix the
+			// message was `… primary key '2'`, so asserting `T.id` is a genuine
+			// regression guard that the new structured path is in effect.
+			const message = await captureThrowMessage(() =>
+				db.exec(`update T set id = 2 where id = 1`),
+			);
+			expect(message).to.contain('UNIQUE constraint failed: T.id');
+
+			// The rejected move staged nothing — both original rows are intact.
+			expect(await selectCount(db, 'select count(*) as c from T')).to.equal(2);
+			expect(await selectScalar(db, 'select v from T where id = 1')).to.equal('a');
+			expect(await selectScalar(db, 'select v from T where id = 2')).to.equal('b');
+		} finally {
+			db.close();
+		}
+
+		// Nothing reached storage; both rows survive a reopen.
+		expect(await reopenScalar(dir, 'select count(*) as c from T')).to.equal(2);
+		expect(await reopenScalar(dir, 'select v from T where id = 1')).to.equal('a');
+	});
+
+	it('a default UPDATE PK-move onto an UNOCCUPIED key still succeeds (control: only the collision branch changed)', async () => {
+		// Guards that the non-collision PK-move path is untouched — it falls
+		// through to the shared delete-old/insert-new + updateIndexEntries
+		// staging exactly as before the fix.
+		const uri = 'tree://update-pkmove/no-collision';
+		const { db } = createDb(dir);
+		try {
+			await db.exec(
+				`create table T (id integer primary key, v text) using optimystic('${uri}')`,
+			);
+			await db.exec(`insert into T (id, v) values (1, 'a')`);
+
+			// id=2 is unoccupied, so the move resolves normally.
+			await db.exec(`update T set id = 2 where id = 1`);
+
+			expect(await selectCount(db, 'select count(*) as c from T')).to.equal(1);
+			expect(await selectCount(db, 'select count(*) as c from T where id = 1')).to.equal(0);
+			expect(await selectScalar(db, 'select v from T where id = 2')).to.equal('a');
+		} finally {
+			db.close();
+		}
+
+		expect(await reopenScalar(dir, 'select v from T where id = 2')).to.equal('a');
+	});
+
+	it('a default UPDATE PK-move collision with a secondary index rejects and leaves the index intact', async () => {
+		// The collision is rejected before any index staging, so the displaced
+		// row's index entry must still resolve and no entry should appear at the
+		// would-be-moved value.
+		const uri = 'tree://update-pkmove/abort-index';
+		const { db } = createDb(dir);
+		try {
+			await db.exec(
+				`create table T (id integer primary key, cat text) using optimystic('${uri}')`,
+			);
+			await db.exec(`create index idx_cat on T (cat)`);
+			await db.exec(`insert into T (id, cat) values (1, 'x')`); // A
+			await db.exec(`insert into T (id, cat) values (2, 'y')`); // B
+
+			await expectThrows(() => db.exec(`update T set id = 2 where id = 1`));
+
+			expect(await selectCount(db, 'select count(*) as c from T')).to.equal(2);
+			// Both index entries still resolve to their original rows.
+			expect(await selectScalar(db, `select id from T where cat = 'x'`)).to.equal(1);
+			expect(await selectScalar(db, `select id from T where cat = 'y'`)).to.equal(2);
+		} finally {
+			db.close();
+		}
+
+		expect(await reopenScalar(dir, `select id from T where cat = 'x'`)).to.equal(1);
+		expect(await reopenScalar(dir, `select id from T where cat = 'y'`)).to.equal(2);
+	});
+});
