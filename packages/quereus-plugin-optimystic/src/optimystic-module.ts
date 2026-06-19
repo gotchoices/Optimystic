@@ -782,19 +782,35 @@ export class OptimysticVirtualTable extends VirtualTable {
             const newKey = this.rowCodec.extractPrimaryKey(values);
             const encodedRow = this.rowCodec.encodeRow(values);
 
-            // Snapshot before staging so a rollback reverts exactly this change.
-            this.markDirtyTrees();
-
             // Stage the main-table change (flushed at commit / restored on
             // rollback). A PK change is staged as delete-old + insert-new so both
             // index halves revert together on rollback.
             if (oldKey !== newKey) {
+              // Staging is an upsert, so check for a collision before touching
+              // any trees. A positive get() means a *different* row occupies
+              // newKey (oldKey !== newKey guarantees it). Throw before
+              // markDirtyTrees so a rejected move stages nothing and leaves the
+              // snapshot untouched.
+              const existing = await this.collection.get(newKey);
+              if (existing !== undefined) {
+                throw new ConstraintError(
+                  `UNIQUE constraint failed: ${this.tableName} primary key '${newKey}'`,
+                  StatusCode.CONSTRAINT,
+                );
+              }
+
+              // Snapshot before staging so a rollback reverts exactly this change.
+              this.markDirtyTrees();
+
               // Key changed - delete old, insert new
               await this.collection.stage([
                 [oldKey, undefined],
                 [newKey, [newKey, encodedRow]]
               ]);
             } else {
+              // Snapshot before staging so a rollback reverts exactly this change.
+              this.markDirtyTrees();
+
               // Simple update
               await this.collection.stage([[newKey, [newKey, encodedRow]]]);
             }
