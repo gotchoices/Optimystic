@@ -827,6 +827,40 @@ All of these rows except `push_coalesce_ms` are consumed only by the seeker — 
 
 The cohort-topic tier for matchmaking is **T2 (functional)**; matchmaking registrations are declined freely by cohorts under T0/T1 load. The seeker's only recourse is to wait — the cohort-topic anti-flood properties prevent the seeker from making things worse by retrying aggressively.
 
+### Operating envelope
+
+> **Operating envelope (measured).** The validity-envelope finder (`packages/substrate-simulator`,
+> `boundary.ts` + `boundary-matchmaking.ts`) measures, per matchmaking claim, the **edge** at which it
+> flips pass→fail along a monotone-in-harm axis and the **margin** to the design's operating point —
+> re-derived from the committed simulator (`findBoundary` per axis, deterministic from `(seed, config)`).
+> One claim sits inside its envelope; the other has a **negative margin**, stated plainly below.
+>
+> - **`bounded-harm` vs lying-reporter fraction `f`** (§Adversarial cohort traffic reporting; justifies
+>   `patience_default_ms` and the `+1 hop / tier` escalation structure). A lying cohort reporter is
+>   claimed to cost the seeker `≤ +1` hop per under-reported tier and `≤ patienceMs` of drain while the
+>   seeker **still matches**. Against a **per-query-flip** adversary (which the seeker cannot settle
+>   against, since the lie flips each query), holds for **`f < 0.187`** (margin **+0.187** to the
+>   all-honest design point `f = 0`). Past the edge — once ~2 path tiers flip — the seeker fails to
+>   **match at all** (`harmMechanism = match-failure`), because `patience_per_tier_fraction = 1.0`
+>   commits the whole patience budget to a single lied-about (provider-less) tier. The **static**
+>   under-report control still holds at `f = 1`, so the margin is the flip adversary's, not vacuous.
+>   This `f*` is the principled measure of the need for `matchmaking-per-tier-patience-splitting` —
+>   per-tier patience budgets would raise it. (`patienceMs = 10 s`, 8-tier path, `wantCount = 8`.)
+> - **`hang-out-fairness` vs seeker:provider ratio `ρ` — negative margin (known operating-point
+>   caveat)** (§Hang-out vs. continue → Decision rule, §Configuration `contention_factor_cap`). The
+>   shipped capped-approximation hang-out decision is claimed to track the exact `Σ wantCount` decision.
+>   It holds only for **`ρ < 2.5`**, which is **below** `ρ = 3 = cap − 1` — the ratio at which the exact
+>   contention `1 + ρ` saturates `contention_factor_cap = 4`, the design's assumed worst-case
+>   contention. The margin is therefore **−0.5** (`designInsideEnvelope = false`): the approximation
+>   **misfires before** contention even reaches the cap (exact contention at the edge is 3.5 < 4), so a
+>   seeker hangs out where the exact-sum rule says escalate. This negative margin is the principled
+>   signal that the deferred exact-sum refinement (`matchmaking-contention-from-seeker-pool`) **is**
+>   warranted, to preserve the hang-out decision across the `2.5 ≤ ρ < 3` divergence window. It does
+>   **not** contradict the §Worked example finding that the cap should stay a *global scalar*: that
+>   concerns the divide-by-small-`arrivalsPerMin` protection and the un-capped flip regime (the flip at
+>   `ρ* = 2.5` is itself in the regime where the exact contention 3.5 is still below the cap), so the
+>   global cap and the exact-sum refinement address different questions.
+
 ---
 
 ## Worked scenarios

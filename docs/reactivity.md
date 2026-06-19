@@ -730,6 +730,39 @@ Reactivity adds the following to the cohort-topic defaults:
 > simulator's "should `queue_max` scale with cohort size/tier?" finding, defaulting to the static
 > `queue_max = 32` until a cohort size is wired through. Spec: `config.spec.ts`.
 
+### Operating envelope
+
+> **Operating envelope (measured).** The validity-envelope finder (`packages/substrate-simulator`,
+> `boundary.ts` + `boundary-reactivity.ts`) measures, per reactivity claim, the **edge** at which it
+> flips pass→fail along a monotone-in-harm axis and the **margin** to the design's operating point —
+> re-derived from the committed simulator (`findBoundary` per axis, deterministic from `(seed, config)`).
+> Both reactivity claims sit **inside** their envelope.
+>
+> - **`revision-continuity` vs commit rate `cps`** (§Replay window, §Resume; justifies `W` and the
+>   adaptive-`W` recommendation). A reconnecting subscriber must resume from inside the recovery window
+>   for a 60 s reconnect gap. Holds for **`cps < 72.5`** against the **layered** window
+>   `W + W_checkpoint = 256 + 4096 = 4352` (margin **+62.5** to the nominal 10 cps, ≈ 7.25×). At the
+>   edge the layered window covers ≈ 60 s — exactly the reconnect gap — and just past it the resume
+>   classifies `OutOfWindow`.
+>   - **Layered-bound consistency.** This `cps*` is stated against the **layered** `W + W_checkpoint`
+>     bound that §Parent checkpoint summaries is authoritative on (the windows stack), and the simulator
+>     path **agrees**: `classifyResume` cuts over to `OutOfWindow` at `lag ≥ W + W_checkpoint`
+>     (`reactivity.ts`), so the measured edge (`cps* · 60 ≈ 4351` revisions, just under 4352) is the
+>     layered edge. The far more conservative **replay-only** edge (single `W = 256` buffer) is
+>     `cps ≈ 4.27` — *below* the nominal 10 cps — so a fixed `W = 256` alone cannot cover the 60 s
+>     recovery floor at the nominal rate. That gap is exactly the **adaptive-`W`** finding above: the
+>     stacked checkpoint window carries continuity to ≈ 72.5 cps; the single replay buffer does not, so
+>     hot collections need `W = ⌈min_coverage_seconds × cps⌉`.
+> - **tail-rotation drain (`completes-within-drain`) vs `T_rejoin_jitter / T_drain` ratio** (§Tail
+>   rotation; justifies `T_drain`). The re-registration wave must land before the old tail stops
+>   forwarding. Holds for ratio **`< 1.0`** (margin **+0.5** to the shipped ratio
+>   `30 s / 60 s = 0.5`, i.e. 2× slack). At the shipped ratio the wave drains via fast-promote fan-out
+>   (the new root fills to `cap_promote_fast = 32` and the tree spreads — `viaPromotionFanout`), so the
+>   pass is a real margin, not the tautology that arrivals in `[0, T_rejoin_jitter)` always precede
+>   `T_drain`. Just past ratio 1.0 the wave's last arrival (≈ 60,105 ms) outlasts the `T_drain = 60 s`
+>   forwarding window. `T_drain = 60 s` is what buys the 2× margin against a wider rejoin spread.
+>   (2,000 subscribers.)
+
 ### Edge profile
 
 In addition to the cohort-topic Edge overrides (TTL = 60 s, ping = 20 s, T2/T3 producer willingness off):

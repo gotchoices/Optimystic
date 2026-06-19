@@ -1231,6 +1231,60 @@ interface MembershipCertV1 {
 > Scenarios: cold-start-storm, tail-rotation, voting-quorum (`scenarios.ts`); scale + sensitivity
 > sweep (`sweep.ts`).
 
+### Operating envelope
+
+> **Operating envelope (measured).** Beyond confirming each default's *value*, the design simulator's
+> validity-envelope finder (`packages/substrate-simulator`, `boundary.ts` + `boundary-reference.ts` /
+> `boundary-tree.ts` / `boundary-churn.ts`) measures, per load-bearing claim, the **edge** at which it
+> flips pass→fail along a monotone-in-harm stress axis and the **margin** from that edge to the
+> operating point the design assumes. Each margin is the principled justification for the default it
+> bounds. Every edge below is re-derived from the committed simulator (`findBoundary` per axis,
+> deterministic from `(seed, config)`); every cohort-topic claim sits **inside** its envelope (positive
+> margin). `marginRatio` is omitted where the design assumption is 0 — the absolute margin is the
+> meaningful quantity there.
+>
+> - **`root-not-overloaded` / depth law vs arrivals-per-gossip-round `R`** (§Why this distributes
+>   naturally, §Promotion and demotion lifecycle; bounds `cap_promote`). Holds for **`R < 666`**
+>   (margin **+602** to the `cap_promote = 64` reference, ≈ 10.4×). The edge is where one gossip-lagged
+>   round of arrivals piles on the still-cold root before promotion cascades, dropping the tree below
+>   its closed-form depth `⌈log_F(N / cap)⌉`. (N = 2,000, F = 16; `lookahead` off so the lag — and the
+>   overshoot — is real.)
+> - **depth law vs prefix skew `s`** (§Tier addressing, §Why this distributes naturally; bounds the
+>   `sha256` sharding assumption). Holds for **`s < 0.042`** (margin **+0.042** to the
+>   uniform-sharding assumption `s = 0`). This is a deliberately *thin* margin and an honest caveat:
+>   concentrating only ~4% of registrations into one hot prefix shard is enough to push observed depth
+>   past the law. In practice peer-ID prefixes are ~uniform, so the operating point sits at `s ≈ 0`;
+>   the margin says the depth law is **not** robust to adversarial or pathological prefix concentration.
+>   (N = 2,000.)
+> - **promotion/demotion stability vs per-round churn `r`** (§Hysteresis, §Promotion and demotion
+>   lifecycle; bounds the `4×` cap gap + `T_demote`). Holds for **`r < 0.499`** (margin **+0.499**):
+>   up to ~50% of a cohort held near `cap_promote` can drain-and-refill each round before observed
+>   depth oscillates. `T_demote`'s temporal hysteresis buys this margin — the boundary shortens
+>   `T_demote` to one gossip round so the demotion is genuinely *reachable* inside the flap window (a
+>   positive demotion-count witness), so the margin is real, not structurally zero.
+> - **walk `no-give-ups` ∧ `≤ d_max + 2` hop bound vs unwilling-member fraction `f`** (§Willingness,
+>   §Anti-flood properties; bounds the willingness-retry budget). Holds for **`f < 0.479`**
+>   (margin **+0.479**). The binding sub-condition at the edge is the **hop bound**, not actual give-ups
+>   (`unwillingBreach = hop-bound`): each unwilling member costs a sibling-retry hop, so the `d_max + 2`
+>   budget is exhausted before a walk truly gives up. Up to ~48% of members replying unwilling is
+>   tolerated before a landing walk breaches the bound. (N = 2,000, 100 sampled walks.)
+> - **`no-lost-registrations` vs sustained member-kill rate `k`** (§Failure modes → Recovery time
+>   bounds; bounds `backups_per_registration` + `ttl`). Holds for **`k < 0.249`** per renewal window
+>   (margin **+0.249**), with kills staggered into the worst phase just after the renewal tick. Past
+>   the edge the failure mode is **backup-exhaustion** — the cohort runs out of reachable coverage, not
+>   a transient renewal race (`killMechanism = backup-exhaustion`). This is what
+>   `backups_per_registration = 2` + the `ttl/3` ping cadence buys against sustained crashes.
+>   (20-member cohort, 80 participants, `ttl = 90 s`.)
+> - **`heal-convergence` vs partition severity `σ`** (§Failure modes → Network partition healing,
+>   Recovery time bounds; bounds the one-window repoint). One-window repoint to the healed deterministic
+>   primary holds for **`σ < 0.312`** (margin **+0.312**, where `σ` scales concurrent per-side
+>   membership churn during the split). Just past the edge 87.5% still converge in one window and the
+>   healed membership genuinely differs from the pre-split set (`healedEpoch ≠ preEpoch`), so the margin
+>   is the real lazy-repoint timing, not the structurally-trivial `merge(a, b).epoch == pre.epoch`
+>   identity. A participant whose served primary is *removed* by the concurrent churn must run a
+>   multi-window backup-promotion failover and so misses the one-window bound. (16-member cohort, 64
+>   participants.)
+
 ### Per-tier overrides
 
 Edge nodes (mobile profile) default to:
