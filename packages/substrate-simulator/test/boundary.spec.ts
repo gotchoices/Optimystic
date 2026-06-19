@@ -204,4 +204,20 @@ describe('runReferenceBoundary — root-not-overloaded × arrivalsPerRound (refe
 		expect(boundaries).to.have.lengthOf(0);
 		expect(metrics.counterValue('boundary.skipped', { axis: 'arrivalsPerRound' })).to.equal(1);
 	});
+
+	// The default-config test above pins the axis at one point (N=2000). A second config guards against
+	// the axis being config-specific — in particular that the located edge stays above the cap and the
+	// non-monotone interleaving dip (an isolated single-R depth drop well below the edge) stays off the
+	// geometric scan/bisection probes here too, so `monotoneViolated` does not flip on a different N.
+	it('finds a clean edge at a second config (N=10000) — the result is not config-specific', function () {
+		this.timeout(60_000);
+		const { boundaries } = runReferenceBoundary({ N: 10_000 });
+		expect(boundaries).to.have.lengthOf(1);
+		const b = boundaries[0]!;
+		expect(b.boundaryFound, 'a finite R* was bracketed at N=10000').to.equal(true);
+		expect(b.monotoneViolated, 'the dip stays off the probes at N=10000 too').to.equal(false);
+		expect(b.criticalValue, 'edge sits above the cap at N=10000').to.be.greaterThan(CAP);
+		expect(b.margin).to.equal(b.criticalValue - CAP);
+		expect(b.designInsideEnvelope).to.equal(true);
+	});
 });
