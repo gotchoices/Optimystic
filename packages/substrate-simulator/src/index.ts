@@ -310,3 +310,20 @@ export {
 	measureRotationDrain,
 	runReactivityBoundaries
 } from './boundary-reactivity.js';
+export {
+	type LyingReporterMode,
+	type HarmMechanism,
+	type BoundedHarmOptions,
+	type BoundedHarmReadout,
+	type SeekerContentionOptions,
+	type SeekerContentionReadout,
+	type MatchmakingBoundaryOptions,
+	type MatchmakingBoundaryReport,
+	BOUNDED_HARM_DESIGN_FRACTION,
+	lyingFractionAxis,
+	measureBoundedHarm,
+	seekerContentionAxis,
+	measureSeekerContention,
+	contentionRatioAtCap,
+	runMatchmakingBoundaries
+} from './boundary-matchmaking.js';
