@@ -7,7 +7,7 @@
 
 import { sha256, sha512 } from '@noble/hashes/sha2.js';
 import { blake3 } from '@noble/hashes/blake3.js';
-import { randomBytes as nobleRandomBytes, utf8ToBytes } from '@noble/hashes/utils.js';
+import { randomBytes as nobleRandomBytes, utf8ToBytes, concatBytes } from '@noble/hashes/utils.js';
 import { secp256k1 } from '@noble/curves/secp256k1.js';
 import { p256 } from '@noble/curves/nist.js';
 import { ed25519 } from '@noble/curves/ed25519.js';
@@ -18,6 +18,27 @@ import { toString as uint8ArrayToString, fromString as uint8ArrayFromString } fr
 export type HashAlgorithm = 'sha256' | 'sha512' | 'blake3';
 export type CurveType = 'secp256k1' | 'p256' | 'ed25519';
 export type Encoding = 'base64url' | 'base64' | 'hex' | 'utf8' | 'bytes';
+
+/** Encodings valid for hash *output* (no 'utf8' — a digest is not UTF-8 text). */
+export type OutputEncoding = 'base64url' | 'base64' | 'hex' | 'bytes';
+
+/** A single value in a multi-field digest. Mirrors the SQL value space. */
+export type DigestField =
+	| string
+	| number
+	| bigint
+	| boolean
+	| Uint8Array
+	| null
+	| undefined
+	| { readonly [key: string]: unknown }
+	| readonly unknown[];
+
+/** A resolved hash function: raw bytes in, digest bytes out. */
+export type DigestHasher = (input: Uint8Array) => Uint8Array;
+
+/** A resolved output encoder: digest bytes in, encoded form out. */
+export type OutputEncoder = (bytes: Uint8Array) => string | Uint8Array;
 
 /**
  * Convert input to Uint8Array, handling various encodings
@@ -69,51 +90,192 @@ function fromBytes(bytes: Uint8Array, encoding: Encoding = 'base64url'): string 
 	}
 }
 
+// --- Algorithm / encoding resolution (done once, no per-call switching) --- //
+
+/** Hash algorithm → noble hasher. Keyed lookup so the digest hot path never branches. */
+const HASHERS: Record<HashAlgorithm, DigestHasher> = {
+	sha256,
+	sha512,
+	blake3,
+};
+
+/** Output encoding → encoder closure. */
+const OUTPUT_ENCODERS: Record<OutputEncoding, OutputEncoder> = {
+	base64url: (bytes) => uint8ArrayToString(bytes, 'base64url'),
+	base64: (bytes) => uint8ArrayToString(bytes, 'base64'),
+	hex: (bytes) => bytesToHex(bytes),
+	bytes: (bytes) => bytes,
+};
+
 /**
- * Compute hash digest of input data
+ * Resolve a hash algorithm name to its hasher. Throws on unknown algorithm.
+ * Call once (e.g. at plugin registration) and capture the result so the digest
+ * hot path performs no per-call algorithm branching.
+ */
+export function resolveHasher(algorithm: HashAlgorithm): DigestHasher {
+	const hasher = HASHERS[algorithm];
+	if (!hasher) {
+		throw new Error(`Unsupported hash algorithm: ${algorithm}`);
+	}
+	return hasher;
+}
+
+/**
+ * Resolve an output encoding name to its encoder. Throws on unknown encoding.
+ */
+export function resolveOutputEncoder(encoding: OutputEncoding): OutputEncoder {
+	const encoder = OUTPUT_ENCODERS[encoding];
+	if (!encoder) {
+		throw new Error(`Unsupported output encoding: ${encoding}`);
+	}
+	return encoder;
+}
+
+// --- Canonical, injective multi-field encoding --- //
+
+/**
+ * Format version for {@link encodeFields}. Prepended to every encoding so the
+ * framing can evolve, and so a framed digest is domain-separated from a bare
+ * hash of the same bytes. Bump only with a deliberate, breaking format change.
+ */
+const DIGEST_FORMAT_V1 = 0x01;
+
+// Per-field type tags. Distinct tags keep distinct SQL types from colliding
+// (e.g. INTEGER 123 vs TEXT '123' vs REAL 123.0 vs BOOL true).
+const TAG_NULL = 0x00; // bare tag, no length/payload
+const TAG_INT = 0x01;  // payload: decimal string (unifies number-integer & bigint)
+const TAG_REAL = 0x02; // payload: ECMAScript Number::toString
+const TAG_TEXT = 0x03; // payload: UTF-8 bytes
+const TAG_BOOL = 0x04; // payload: single 0x00/0x01 byte
+const TAG_BLOB = 0x05; // payload: raw bytes
+const TAG_JSON = 0x06; // payload: UTF-8 of key-sorted canonical JSON
+
+/** Append an unsigned LEB128 varint (safe for lengths up to MAX_SAFE_INTEGER). */
+function writeVarint(out: number[], value: number): void {
+	if (!Number.isInteger(value) || value < 0) {
+		throw new Error(`varint expects a non-negative integer, got ${value}`);
+	}
+	let v = value;
+	while (v >= 0x80) {
+		out.push((v & 0x7f) | 0x80);
+		v = Math.floor(v / 128);
+	}
+	out.push(v);
+}
+
+/** tag ‖ varint(len) ‖ payload */
+function framed(tag: number, payload: Uint8Array): Uint8Array {
+	const header: number[] = [tag];
+	writeVarint(header, payload.length);
+	return concatBytes(Uint8Array.from(header), payload);
+}
+
+/** Deterministic JSON: object keys recursively sorted, no incidental whitespace. */
+function stableStringify(value: unknown): string {
+	if (value === null || typeof value !== 'object') {
+		return JSON.stringify(value) ?? 'null';
+	}
+	if (Array.isArray(value)) {
+		return `[${value.map(stableStringify).join(',')}]`;
+	}
+	const obj = value as Record<string, unknown>;
+	const keys = Object.keys(obj).sort();
+	return `{${keys.map(k => `${JSON.stringify(k)}:${stableStringify(obj[k])}`).join(',')}}`;
+}
+
+/** Encode one field as tag (‖ length ‖ payload). NULL/undefined is a bare tag. */
+function encodeField(field: DigestField): Uint8Array {
+	if (field === null || field === undefined) {
+		return Uint8Array.of(TAG_NULL);
+	}
+	switch (typeof field) {
+		case 'boolean':
+			return Uint8Array.of(TAG_BOOL, field ? 1 : 0);
+		case 'bigint':
+			return framed(TAG_INT, utf8ToBytes(field.toString()));
+		case 'number':
+			if (!Number.isFinite(field)) {
+				throw new Error('digest: cannot encode a non-finite number');
+			}
+			return Number.isInteger(field)
+				? framed(TAG_INT, utf8ToBytes(field.toString()))
+				: framed(TAG_REAL, utf8ToBytes(field.toString()));
+		case 'string':
+			return framed(TAG_TEXT, utf8ToBytes(field));
+		case 'object':
+			if (field instanceof Uint8Array) {
+				return framed(TAG_BLOB, field);
+			}
+			return framed(TAG_JSON, utf8ToBytes(stableStringify(field)));
+		default:
+			throw new Error(`digest: unsupported field type '${typeof field}'`);
+	}
+}
+
+/**
+ * Canonically encode an ordered tuple of fields into bytes such that distinct
+ * tuples never collide (injective framing).
  *
- * @param data - Data to hash (base64url string or Uint8Array)
+ * Layout: `version ‖ field*` where each field is `tag ‖ varint(len) ‖ payload`
+ * (NULL is a bare tag). Properties:
+ * - order-preserving and arity-safe (self-delimiting fields → uniquely decodable),
+ * - NULL distinguishable from empty string,
+ * - type distinguishable (INTEGER 123 ≠ TEXT '123' ≠ REAL ≠ BOOL),
+ * - delimiter-safe (a separator inside a string is just payload under its length).
+ *
+ * Replicability note: integer `number` and `bigint` of equal value encode
+ * identically; REAL uses ECMAScript `Number::toString` (deterministic across JS
+ * engines, but not guaranteed across other languages).
+ */
+export function encodeFields(fields: readonly DigestField[]): Uint8Array {
+	const chunks: Uint8Array[] = [Uint8Array.of(DIGEST_FORMAT_V1)];
+	for (const field of fields) {
+		chunks.push(encodeField(field));
+	}
+	return concatBytes(...chunks);
+}
+
+/**
+ * Low-level multi-field digest: canonically encode the fields, then hash and
+ * encode with the supplied (pre-resolved) hasher/encoder. No per-call branching
+ * on algorithm or encoding — resolve once via {@link resolveHasher} /
+ * {@link resolveOutputEncoder} and reuse.
+ */
+export function digestFields(
+	fields: readonly DigestField[],
+	hasher: DigestHasher,
+	encode: OutputEncoder
+): string | Uint8Array {
+	return encode(hasher(encodeFields(fields)));
+}
+
+/**
+ * Compute an injective digest over an ordered tuple of fields.
+ *
+ * @param fields - Ordered tuple of values to hash (any SQL value type)
  * @param algorithm - Hash algorithm (default: 'sha256')
- * @param inputEncoding - Encoding of input string (default: 'base64url')
- * @param outputEncoding - Encoding of output (default: 'base64url')
- * @returns Hash digest in specified encoding
+ * @param encoding - Output encoding (default: 'base64url')
+ * @returns Hash digest in the specified encoding
  *
  * @example
  * ```typescript
- * // Hash UTF-8 text, output as base64url
- * const hash = digest('hello world', 'sha256', 'utf8');
+ * // Hash a tuple of fields — distinct tuples never collide
+ * const h = digest(['alice', 42, null, true]);
  *
- * // Hash base64url data with SHA-512
- * const hash2 = digest('SGVsbG8', 'sha512');
- *
- * // Get raw bytes
- * const bytes = digest('data', 'blake3', 'utf8', 'bytes');
+ * // Pick algorithm / output encoding
+ * const h512 = digest(['a', 'b'], 'sha512', 'hex');
  * ```
+ *
+ * Note: this is a *framed* digest, not a bare hash of raw bytes —
+ * `digest(['hello'])` is not `sha256("hello")`. Use `hashMod` for sharding a
+ * single value.
  */
 export function digest(
-	data: string | Uint8Array,
+	fields: readonly DigestField[],
 	algorithm: HashAlgorithm = 'sha256',
-	inputEncoding: Encoding = 'base64url',
-	outputEncoding: Encoding = 'base64url'
+	encoding: OutputEncoding = 'base64url'
 ): string | Uint8Array {
-	const bytes = toBytes(data, inputEncoding);
-
-	let hashBytes: Uint8Array;
-	switch (algorithm) {
-		case 'sha256':
-			hashBytes = sha256(bytes);
-			break;
-		case 'sha512':
-			hashBytes = sha512(bytes);
-			break;
-		case 'blake3':
-			hashBytes = blake3(bytes);
-			break;
-		default:
-			throw new Error(`Unsupported hash algorithm: ${algorithm}`);
-	}
-
-	return fromBytes(hashBytes, outputEncoding);
+	return digestFields(fields, resolveHasher(algorithm), resolveOutputEncoder(encoding));
 }
 
 /**
@@ -145,7 +307,8 @@ export function hashMod(
 		throw new Error('Bits must be between 1 and 53 (JavaScript safe integer limit)');
 	}
 
-	const hashBytes = toBytes(digest(data, algorithm, inputEncoding, 'base64url') as string, 'base64url');
+	// Single-blob hash for sharding (not the field-framed digest).
+	const hashBytes = resolveHasher(algorithm)(toBytes(data, inputEncoding));
 
 	// Take first 8 bytes and convert to number
 	const view = new DataView(hashBytes.buffer, hashBytes.byteOffset, Math.min(8, hashBytes.length));

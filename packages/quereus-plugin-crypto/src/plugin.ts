@@ -7,7 +7,31 @@
 
 import type { Database, SqlValue } from '@quereus/quereus';
 import { FunctionFlags, TEXT_TYPE, INTEGER_TYPE, BOOLEAN_TYPE } from '@quereus/quereus';
-import { digest, sign, verify, hashMod, randomBytes } from './crypto.js';
+import {
+	sign, verify, hashMod, randomBytes,
+	digestFields, resolveHasher, resolveOutputEncoder,
+	type HashAlgorithm, type OutputEncoding, type DigestField,
+} from './crypto.js';
+
+const DIGEST_ALGORITHMS: readonly HashAlgorithm[] = ['sha256', 'sha512', 'blake3'];
+// SQL digest returns TEXT, so only text-producing encodings are valid here ('bytes' is JS-only).
+const DIGEST_TEXT_ENCODINGS: readonly OutputEncoding[] = ['base64url', 'base64', 'hex'];
+
+function configAlgorithm(config: Record<string, SqlValue>): HashAlgorithm {
+	const value = config.algorithm == null ? 'sha256' : String(config.algorithm);
+	if (!DIGEST_ALGORITHMS.includes(value as HashAlgorithm)) {
+		throw new Error(`crypto plugin: unsupported digest algorithm '${value}' (expected one of ${DIGEST_ALGORITHMS.join(', ')})`);
+	}
+	return value as HashAlgorithm;
+}
+
+function configEncoding(config: Record<string, SqlValue>): OutputEncoding {
+	const value = config.encoding == null ? 'base64url' : String(config.encoding);
+	if (!DIGEST_TEXT_ENCODINGS.includes(value as OutputEncoding)) {
+		throw new Error(`crypto plugin: unsupported digest encoding '${value}' (expected one of ${DIGEST_TEXT_ENCODINGS.join(', ')})`);
+	}
+	return value as OutputEncoding;
+}
 
 // Flags for deterministic functions (UTF8 + DETERMINISTIC)
 const DETERMINISTIC_FLAGS = FunctionFlags.UTF8 | FunctionFlags.DETERMINISTIC;
@@ -18,19 +42,26 @@ const NON_DETERMINISTIC_FLAGS = FunctionFlags.UTF8;
  * Plugin registration function
  * This is called by Quereus when the plugin is loaded
  */
-export default function register(_db: Database, _config: Record<string, SqlValue> = {}) {
+export default function register(_db: Database, config: Record<string, SqlValue> = {}) {
+	// Resolve the digest algorithm + output encoding ONCE, at registration, from
+	// load-time config — so the per-call path never branches on them, and so the
+	// digest is stable for the lifetime of the database (a precondition for
+	// `replicable`: every peer that loads the plugin with the same config agrees).
+	const digestHasher = resolveHasher(configAlgorithm(config));
+	const digestEncoder = resolveOutputEncoder(configEncoding(config));
+
 	// Register crypto functions with Quereus
 	const functions = [
 		{
 			schema: {
 				name: 'digest',
-				numArgs: -1, // Variable arguments: data, algorithm?, inputEncoding?, outputEncoding?
+				numArgs: -1, // Variadic over data fields: digest(f1, f2, ..., fN)
 				flags: DETERMINISTIC_FLAGS, // digest is deterministic
+				// Bit-identical across peers/platforms — these digests are signed and persisted.
+				replicable: true,
 				returnType: { typeClass: 'scalar' as const, logicalType: TEXT_TYPE, nullable: false },
-				implementation: (...args: SqlValue[]) => {
-					const [data, algorithm = 'sha256', inputEncoding = 'base64url', outputEncoding = 'base64url'] = args;
-					return digest(data as string, algorithm as any, inputEncoding as any, outputEncoding as any);
-				},
+				implementation: (...fields: SqlValue[]) =>
+					digestFields(fields as DigestField[], digestHasher, digestEncoder) as string,
 			},
 		},
 		{

@@ -84,6 +84,21 @@
 			"vtables": [],
 			"collations": []
 		},
-		"settings": []
+		"settings": [
+			{
+				"key": "algorithm",
+				"label": "Digest Algorithm",
+				"type": "string",
+				"default": "sha256",
+				"help": "Hash algorithm for digest(): 'sha256', 'sha512', or 'blake3'. Bound at load time."
+			},
+			{
+				"key": "encoding",
+				"label": "Digest Output Encoding",
+				"type": "string",
+				"default": "base64url",
+				"help": "Output encoding for digest(): 'base64url', 'base64', or 'hex'. Bound at load time."
+			}
+		]
 	}
 }

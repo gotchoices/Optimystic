@@ -1,57 +1,150 @@
 import { expect } from 'chai';
 import {
-	digest, hashMod, randomBytes, sign, verify,
+	digest, encodeFields, hashMod, randomBytes, sign, verify,
 	generatePrivateKey, getPublicKey,
 } from '../dist/index.js';
+import registerCryptoPlugin from '../dist/plugin.js';
+
+const hex = (fields: readonly any[], algo?: any) => digest(fields, algo, 'hex') as string;
 
 describe('Crypto Functions', () => {
-	describe('digest()', () => {
-		it('should produce consistent SHA-256 hashes for the same input', () => {
-			const hash1 = digest('hello', 'sha256', 'utf8');
-			const hash2 = digest('hello', 'sha256', 'utf8');
-			expect(hash1).to.equal(hash2);
+	describe('digest() — variadic multi-field', () => {
+		it('should produce consistent hashes for the same tuple', () => {
+			expect(digest(['hello', 'world'])).to.equal(digest(['hello', 'world']));
 		});
 
-		it('should produce different hashes for different inputs', () => {
-			const hash1 = digest('hello', 'sha256', 'utf8');
-			const hash2 = digest('world', 'sha256', 'utf8');
-			expect(hash1).to.not.equal(hash2);
+		it('should produce different hashes for different tuples', () => {
+			expect(digest(['hello'])).to.not.equal(digest(['world']));
 		});
 
 		it('should support SHA-512', () => {
-			const hash = digest('test', 'sha512', 'utf8', 'hex') as string;
-			expect(hash).to.be.a('string');
+			const hash = digest(['test'], 'sha512', 'hex') as string;
 			expect(hash).to.have.length(128); // 64 bytes = 128 hex chars
 		});
 
 		it('should support BLAKE3', () => {
-			const hash = digest('test', 'blake3', 'utf8', 'hex') as string;
-			expect(hash).to.be.a('string');
+			const hash = digest(['test'], 'blake3', 'hex') as string;
 			expect(hash).to.have.length(64); // 32 bytes = 64 hex chars
 		});
 
 		it('should return raw bytes with bytes encoding', () => {
-			const hash = digest('test', 'sha256', 'utf8', 'bytes');
+			const hash = digest(['test'], 'sha256', 'bytes');
 			expect(hash).to.be.instanceOf(Uint8Array);
 			expect(hash).to.have.length(32);
 		});
 
 		it('should return base64url string by default', () => {
-			const hash = digest('test', 'sha256', 'utf8') as string;
+			const hash = digest(['test']) as string;
 			expect(hash).to.be.a('string');
 			expect(hash).to.not.contain('+');
 			expect(hash).to.not.contain('/');
 		});
 
-		it('should accept Uint8Array input', () => {
-			const bytes = new Uint8Array([104, 101, 108, 108, 111]); // "hello"
-			const hash = digest(bytes, 'sha256', 'bytes', 'hex');
-			const strHash = digest('hello', 'sha256', 'utf8', 'hex');
-			expect(hash).to.equal(strHash);
+		it('should throw for unsupported algorithm', () => {
+			expect(() => digest(['test'], 'md5' as any)).to.throw();
 		});
 
-		it('should throw for unsupported algorithm', () => {
-			expect(() => digest('test', 'md5' as any, 'utf8')).to.throw();
+		it('should throw for a non-finite number field', () => {
+			expect(() => digest([Number.NaN])).to.throw();
+			expect(() => digest([Number.POSITIVE_INFINITY])).to.throw();
+		});
+
+		it('should accept a Uint8Array (blob) field', () => {
+			const a = digest([new Uint8Array([1, 2, 3])]);
+			const b = digest([new Uint8Array([1, 2, 3])]);
+			expect(a).to.equal(b);
+		});
+	});
+
+	describe('digest() — injectivity', () => {
+		it('distinguishes field boundaries (no delimiter collision)', () => {
+			// The classic concat/delimiter-join footgun: these must NOT collide.
+			expect(hex(['a', 'bc'])).to.not.equal(hex(['ab', 'c']));
+			expect(hex(['a|b', 'c'])).to.not.equal(hex(['a', 'b|c']));
+			expect(hex(['a', 'b', 'c'])).to.not.equal(hex(['a|b|c']));
+		});
+
+		it('distinguishes NULL from empty string from absent', () => {
+			expect(hex([null])).to.not.equal(hex(['']));
+			expect(hex([null])).to.not.equal(hex([]));
+			expect(hex(['x', null])).to.not.equal(hex(['x', '']));
+		});
+
+		it('distinguishes integer from its text form', () => {
+			expect(hex([123])).to.not.equal(hex(['123']));
+		});
+
+		it('distinguishes boolean from its text form', () => {
+			expect(hex([true])).to.not.equal(hex(['true']));
+			expect(hex([true])).to.not.equal(hex([1]));
+			expect(hex([true])).to.not.equal(hex([false]));
+		});
+
+		it('treats equal integer number and bigint identically', () => {
+			expect(hex([123])).to.equal(hex([123n]));
+		});
+
+		it('distinguishes differing arity', () => {
+			expect(hex(['a'])).to.not.equal(hex(['a', '']));
+			expect(hex([])).to.not.equal(hex([null]));
+		});
+
+		it('is order-sensitive', () => {
+			expect(hex(['a', 'b'])).to.not.equal(hex(['b', 'a']));
+		});
+
+		it('canonicalizes JSON object key order', () => {
+			expect(hex([{ a: 1, b: 2 }])).to.equal(hex([{ b: 2, a: 1 }]));
+			expect(hex([{ a: 1 }])).to.not.equal(hex([{ a: 2 }]));
+		});
+	});
+
+	describe('encodeFields()', () => {
+		it('prepends a format version byte', () => {
+			const enc = encodeFields([]);
+			expect(enc).to.be.instanceOf(Uint8Array);
+			expect(enc[0]).to.equal(0x01);
+		});
+
+		it('encodes NULL as a bare tag (no length/payload)', () => {
+			expect(Array.from(encodeFields([null]))).to.deep.equal([0x01, 0x00]);
+		});
+
+		it('encodes empty string as TEXT tag with zero length', () => {
+			expect(Array.from(encodeFields(['']))).to.deep.equal([0x01, 0x03, 0x00]);
+		});
+	});
+
+	describe('plugin registration (load-time config)', () => {
+		const getDigest = (config?: Record<string, any>): any => {
+			const { functions } = registerCryptoPlugin({} as any, config);
+			const fn = functions.find((f: any) => f.schema.name === 'digest');
+			if (!fn) throw new Error('digest not registered');
+			return fn.schema;
+		};
+
+		it('registers digest as variadic and replicable', () => {
+			const schema = getDigest();
+			expect(schema.numArgs).to.equal(-1);
+			expect(schema.replicable).to.equal(true);
+		});
+
+		it('defaults to sha256/base64url', () => {
+			const impl = getDigest().implementation;
+			expect(impl('a', 'b')).to.equal(digest(['a', 'b'], 'sha256', 'base64url'));
+		});
+
+		it('honors load-time algorithm + encoding config', () => {
+			const impl = getDigest({ algorithm: 'sha512', encoding: 'hex' }).implementation;
+			expect(impl('a', 'b')).to.equal(digest(['a', 'b'], 'sha512', 'hex'));
+		});
+
+		it('throws at registration on an unknown algorithm', () => {
+			expect(() => getDigest({ algorithm: 'md5' })).to.throw();
+		});
+
+		it('throws at registration on a non-text encoding', () => {
+			expect(() => getDigest({ encoding: 'bytes' })).to.throw();
 		});
 	});
 

@@ -28,6 +28,13 @@ import { loadPlugin } from '@quereus/quereus/util/plugin-loader.js';
 
 const db = new Database();
 await loadPlugin('npm:@optimystic/quereus-plugin-crypto', db);
+
+// Or configure the digest algorithm / output encoding once, at load time
+// (see "Digest configuration" below):
+await loadPlugin('npm:@optimystic/quereus-plugin-crypto', db, {
+  algorithm: 'sha256',     // 'sha256' (default) | 'sha512' | 'blake3'
+  encoding: 'base64url',   // 'base64url' (default) | 'base64' | 'hex'
+});
 ```
 
 ### Direct Import (for JavaScript/TypeScript code)
@@ -45,8 +52,8 @@ import {
   getPublicKey
 } from '@optimystic/quereus-plugin-crypto';
 
-// Hash data (base64url by default)
-const hash = digest('hello world', 'sha256', 'utf8', 'base64url');
+// Hash an ordered tuple of fields (injective — distinct tuples never collide)
+const hash = digest(['hello world', 42, null], 'sha256', 'base64url');
 
 // Get a 16-bit hash for sharding
 const shard = hashMod('user@example.com', 16, 'sha256', 'utf8');
@@ -68,23 +75,31 @@ const isValid = verify(hash, signature, publicKey, 'secp256k1', 'base64url', 'ba
 
 All SQL functions use **base64url encoding by default** for inputs and outputs. This is URL-safe and SQL-friendly.
 
-### digest(data, algorithm?, inputEncoding?, outputEncoding?)
+### digest(field1, field2, ..., fieldN)
 
-Hash data using SHA-256 (default), SHA-512, or BLAKE3.
+Hash an **ordered tuple of fields** into a single digest. `digest` is variadic over
+*data* — every argument is a field, not a configuration option. The algorithm and
+output encoding are chosen once, at load time (see [Digest configuration](#digest-configuration)),
+so they never have to be passed per call.
 
 ```sql
--- Hash base64url data (default)
-SELECT digest('aGVsbG8gd29ybGQ') as hash;
+-- Hash a single value
+SELECT digest(Id) as hash;
 
--- Hash UTF-8 text
-SELECT digest('hello world', 'sha256', 'utf8', 'base64url') as hash;
-
--- Hash with SHA-512
-SELECT digest('data', 'sha512', 'utf8', 'base64url') as sha512_hash;
-
--- Hash with BLAKE3, output as hex
-SELECT digest('data', 'blake3', 'utf8', 'hex') as blake3_hex;
+-- Hash a tuple of columns — distinct tuples never collide,
+-- NULL is distinguished from '', and 123 from '123'
+SELECT digest(Tid, Name, ImageRef, NumberRequiredTSAs) as commitment;
 ```
+
+**Why variadic + injective?** Hashing several fields by joining them
+(`a || '|' || b`) or by `String()`-concatenation is not injective: `('a|b','c')`
+collides with `('a','b|c')`, `NULL` collides with `''`, and `123` collides with
+`'123'`. `digest` instead applies a canonical, length-prefixed, type-tagged framing
+to each field, so distinct tuples always produce distinct digests. This matters when
+the digest is signed or persisted as a commitment.
+
+The framing is also why `digest(x)` is **not** a bare `sha256(x)` — it is a framed
+digest of a one-element tuple. For sharding a single value, use `hash_mod`.
 
 ### hash_mod(data, bits, algorithm?, inputEncoding?)
 
@@ -152,6 +167,34 @@ SELECT verify('hello', 'c2lnbmF0dXJl', 'cHVibGljS2V5', 'secp256k1', 'utf8') as i
 SELECT verify('data', 'c2lnbmF0dXJl', 'cHVibGljS2V5', 'p256', 'utf8') as is_valid;
 ```
 
+## Digest configuration
+
+Because `digest` is variadic over data, its **algorithm** and **output encoding** are
+not call arguments — they are bound once when the plugin is loaded, via the plugin
+config object:
+
+```ts
+import { registerPlugin } from '@quereus/quereus';
+import cryptoPlugin from '@optimystic/quereus-plugin-crypto/plugin';
+
+await registerPlugin(db, cryptoPlugin, {
+  algorithm: 'sha256',   // 'sha256' (default) | 'sha512' | 'blake3'
+  encoding: 'base64url', // 'base64url' (default) | 'base64' | 'hex'
+});
+```
+
+An unknown `algorithm` or a non-text `encoding` throws at registration (fail fast),
+and the algorithm/encoding are resolved once so the per-call path does no branching.
+
+**Why load-time and not per-connection?** The SQL `digest` is registered as
+`replicable` — its output must be bit-identical across peers, platforms, and app
+versions, because these digests are signed and persisted as commitments. That holds
+only if the configuration is fixed for every peer. *Mutable* per-connection
+configuration (e.g. a runtime `SET`/PRAGMA) would let two peers disagree and silently
+break signature validation, so it is intentionally not offered for this function. If a
+single database genuinely needs two digest configurations, register the plugin twice
+(or expose named variants) rather than flipping mutable session state.
+
 ## Supported Algorithms
 
 ### Hash Algorithms
@@ -216,7 +259,7 @@ const privateKey = generatePrivateKey('secp256k1', 'base64url');
 const publicKey = getPublicKey(privateKey);
 
 const message = 'Hello, World!';
-const hash = digest(message, 'sha256', 'utf8', 'base64url');
+const hash = digest([message], 'sha256', 'base64url') as string;
 const signature = sign(hash, privateKey);
 const isValid = verify(hash, signature, publicKey);
 
@@ -229,9 +272,13 @@ console.log('Random nonce:', nonce);
 
 ## JavaScript API Reference
 
-### digest(data, algorithm?, inputEncoding?, outputEncoding?)
-Hash data using SHA-256, SHA-512, or BLAKE3.
-- **Returns**: Hash as string (or Uint8Array if encoding is 'bytes')
+### digest(fields, algorithm?, encoding?)
+Injective digest over an ordered tuple of fields. `fields` is an array of values
+(any SQL value type). `algorithm` defaults to `'sha256'`, `encoding` to `'base64url'`.
+- **Returns**: Hash as string (or Uint8Array if encoding is `'bytes'`)
+- **Related**: `encodeFields(fields)` returns the canonical pre-hash byte framing;
+  `digestFields(fields, hasher, encode)` / `resolveHasher` / `resolveOutputEncoder`
+  are the building blocks the SQL function composes (resolve once, no per-call branching).
 
 ### hashMod(data, bits, algorithm?, inputEncoding?)
 Hash data and return modulo 2^bits for fixed-size hash values.
