@@ -579,7 +579,7 @@ __metadata:
   languageName: node
   linkType: hard
 
-"@libp2p/interface@npm:^2.0.0, @libp2p/interface@npm:^2.10.5, @libp2p/interface@npm:^2.11.0":
+"@libp2p/interface@npm:^2.0.0, @libp2p/interface@npm:^2.11.0":
   version: 2.11.0
   resolution: "@libp2p/interface@npm:2.11.0"
   dependencies:
@@ -634,6 +634,20 @@ __metadata:
     progress-events: "npm:^1.1.0"
     uint8arraylist: "npm:^2.4.8"
   checksum: 10c0/a38dc3acc79156a2bf0695acb4772b640a5361b6abb3266e340e1e35b0067a7168ac0d8d884506caf2f576277e081987990b1119c01990496b613aef137b0c06
+  languageName: node
+  linkType: hard
+
+"@libp2p/interface@npm:^3.2.4":
+  version: 3.2.4
+  resolution: "@libp2p/interface@npm:3.2.4"
+  dependencies:
+    "@multiformats/dns": "npm:^1.0.6"
+    "@multiformats/multiaddr": "npm:^13.0.3"
+    main-event: "npm:^1.0.1"
+    multiformats: "npm:^14.0.0"
+    progress-events: "npm:^1.1.0"
+    uint8arraylist: "npm:^3.0.2"
+  checksum: 10c0/195d473be79caeec42a14f852b6ac2d3d394ab545938af0dba169f62df4c8dc79d46b642faf02c9fa6c9443fd9abcda18d950fcc8173179d30b4bf5875c553b9
   languageName: node
   linkType: hard
 
@@ -1211,7 +1225,7 @@ __metadata:
   resolution: "@optimystic/db-core@workspace:packages/db-core"
   dependencies:
     "@libp2p/crypto": "npm:^5.1.13"
-    "@libp2p/interface": "npm:^3.1.0"
+    "@libp2p/interface": "npm:^3.2.4"
     "@libp2p/peer-id": "npm:^6.0.4"
     "@libp2p/peer-id-factory": "npm:^4.2.4"
     "@multiformats/multiaddr": "npm:^13.0.1"
@@ -1254,7 +1268,7 @@ __metadata:
   resolution: "@optimystic/db-p2p-storage-ns@workspace:packages/db-p2p-storage-ns"
   dependencies:
     "@libp2p/crypto": "npm:^5.1.13"
-    "@libp2p/interface": "npm:^3.1.0"
+    "@libp2p/interface": "npm:^3.2.4"
     "@libp2p/peer-id": "npm:^6.0.4"
     "@optimystic/db-core": "workspace:^"
     "@optimystic/db-p2p": "workspace:^"
@@ -1283,7 +1297,7 @@ __metadata:
   resolution: "@optimystic/db-p2p-storage-rn@workspace:packages/db-p2p-storage-rn"
   dependencies:
     "@libp2p/crypto": "npm:^5.1.13"
-    "@libp2p/interface": "npm:^3.1.0"
+    "@libp2p/interface": "npm:^3.2.4"
     "@libp2p/peer-id": "npm:^6.0.4"
     "@optimystic/db-core": "workspace:^"
     "@optimystic/db-p2p": "workspace:^"
@@ -1313,7 +1327,7 @@ __metadata:
   resolution: "@optimystic/db-p2p-storage-web@workspace:packages/db-p2p-storage-web"
   dependencies:
     "@libp2p/crypto": "npm:^5.1.13"
-    "@libp2p/interface": "npm:^3.1.0"
+    "@libp2p/interface": "npm:^3.2.4"
     "@libp2p/peer-id": "npm:^6.0.4"
     "@optimystic/db-core": "workspace:^"
     "@optimystic/db-p2p": "workspace:^"
@@ -1345,10 +1359,10 @@ __metadata:
     "@libp2p/autonat": "npm:^3.0.21"
     "@libp2p/bootstrap": "npm:^12.0.11"
     "@libp2p/circuit-relay-v2": "npm:^4.1.3"
-    "@libp2p/crypto": "npm:^5.1.13"
+    "@libp2p/crypto": "npm:^5.1.19"
     "@libp2p/dcutr": "npm:^3.0.21"
     "@libp2p/identify": "npm:^4.0.10"
-    "@libp2p/interface": "npm:^3.1.0"
+    "@libp2p/interface": "npm:^3.2.4"
     "@libp2p/kad-dht": "npm:^16.1.3"
     "@libp2p/peer-id": "npm:^6.0.4"
     "@libp2p/ping": "npm:^3.0.10"
@@ -1371,6 +1385,7 @@ __metadata:
     mocha: "npm:^11.7.5"
     multiformats: "npm:^13.4.2"
     p2p-fret: "npm:^0.4.0"
+    protons-runtime: "npm:^6.0.0"
     rimraf: "npm:^6.1.2"
     ts-node: "npm:^10.9.2"
     typescript: "npm:^5.9.3"
@@ -1436,7 +1451,7 @@ __metadata:
     "@libp2p/bootstrap": "npm:^12.0.11"
     "@libp2p/crypto": "npm:^5.1.13"
     "@libp2p/identify": "npm:^4.0.10"
-    "@libp2p/interface": "npm:^3.1.0"
+    "@libp2p/interface": "npm:^3.2.4"
     "@libp2p/kad-dht": "npm:^16.1.3"
     "@libp2p/noise": "npm:^1.0.1"
     "@libp2p/tcp": "npm:^11.0.10"
@@ -1466,7 +1481,7 @@ __metadata:
   version: 0.0.0-use.local
   resolution: "@optimystic/reference-peer@workspace:packages/reference-peer"
   dependencies:
-    "@libp2p/interface": "npm:^2.10.5"
+    "@libp2p/interface": "npm:^3.2.4"
     "@libp2p/peer-id": "npm:^5.1.8"
     "@optimystic/db-core": "workspace:^"
     "@optimystic/db-p2p": "workspace:^"
@@ -1517,10 +1532,10 @@ __metadata:
   dependencies:
     debug: "npm:^4.4.3"
     fast-json-patch: "npm:^3.1.1"
-    inheritree: "npm:^0.3.4"
+    inheritree: "npm:^0.4.0"
     moat-maker: "npm:^2.2.0"
     temporal-polyfill: "npm:^0.3.0"
-    uint8arrays: "npm:^5.1.0"
+    uint8arrays: "npm:^6.1.1"
   languageName: node
   linkType: soft
 
@@ -2808,10 +2823,10 @@ __metadata:
   languageName: node
   linkType: hard
 
-"inheritree@npm:^0.3.4":
-  version: 0.3.4
-  resolution: "inheritree@npm:0.3.4"
-  checksum: 10c0/31c3791c5d140a04c952ccd9ca8db05bc5a5cfbc89cd6b966f483e5548819f084a9d1776a4f8e2d31c5da5f627c383a8ef62a5ae228ee3625fb3889811c97c27
+"inheritree@npm:^0.4.0":
+  version: 0.4.0
+  resolution: "inheritree@npm:0.4.0"
+  checksum: 10c0/d96011ee4ac3b07724fb3cfb59af16c9e53ea9b614db40da26fa5b2ba84b1cb51459213c3ac8fb703edd744d18b46c6f01f7134c1a6098832af1acade2fb5e12
   languageName: node
   linkType: hard
 
@@ -3918,18 +3933,7 @@ __metadata:
   languageName: node
   linkType: hard
 
-"protons-runtime@npm:^5.4.0, protons-runtime@npm:^5.5.0, protons-runtime@npm:^5.6.0":
-  version: 5.6.0
-  resolution: "protons-runtime@npm:5.6.0"
-  dependencies:
-    uint8-varint: "npm:^2.0.2"
-    uint8arraylist: "npm:^2.4.3"
-    uint8arrays: "npm:^5.0.1"
-  checksum: 10c0/f6961e0ce30d7018b6bf35183384fdf540e58db4b3051342d616bb6a5ffefec0aaca168c5356ce6cf0d6b92cb736149c30f42a7558a76cbb8da9a5ba90827892
-  languageName: node
-  linkType: hard
-
-"protons-runtime@npm:^6.0.1":
+"protons-runtime@npm:^6.0.0":
   version: 6.0.2
   resolution: "protons-runtime@npm:6.0.2"
   dependencies:
@@ -4546,7 +4550,7 @@ __metadata:
   languageName: node
   linkType: hard
 
-"uint8-varint@npm:^2.0.1, uint8-varint@npm:^2.0.2, uint8-varint@npm:^2.0.4":
+"uint8-varint@npm:^2.0.1, uint8-varint@npm:^2.0.4":
   version: 2.0.4
   resolution: "uint8-varint@npm:2.0.4"
   dependencies:
@@ -4566,7 +4570,7 @@ __metadata:
   languageName: node
   linkType: hard
 
-"uint8arraylist@npm:^2.0.0, uint8arraylist@npm:^2.4.3, uint8arraylist@npm:^2.4.8":
+"uint8arraylist@npm:^2.0.0, uint8arraylist@npm:^2.4.8":
   version: 2.4.8
   resolution: "uint8arraylist@npm:2.4.8"
   dependencies:
@@ -4575,7 +4579,7 @@ __metadata:
   languageName: node
   linkType: hard
 
-"uint8arraylist@npm:^3.0.1":
+"uint8arraylist@npm:^3.0.1, uint8arraylist@npm:^3.0.2":
   version: 3.0.2
   resolution: "uint8arraylist@npm:3.0.2"
   dependencies:
