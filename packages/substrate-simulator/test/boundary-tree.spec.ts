@@ -105,6 +105,15 @@ describe('envelope-tree — Boundary 3: walk no-give-ups / hop bound vs unwillin
 		expect(report.unwillingBreach, 'the conjunction is diagnosable, not "none"').to.not.equal('none');
 	});
 
+	it('folds the breach into the metrics sink so the offline export is not read as a give-up edge', () => {
+		// The `no-give-ups` claim edge actually reflects whichever sub-condition flips first; the export
+		// must carry that, not just the in-memory report, since the export is what downstream consumes.
+		expect(
+			report.metrics.counterValue('boundary.unwillingBreach', { axis: 'unwillingFraction', breach: report.unwillingBreach }),
+			'breach folded into the sink under its own tag'
+		).to.equal(1);
+	});
+
 	it('positive control: all-willing succeeds within the hop bound; near-total unwillingness makes walks give up', () => {
 		const axis = unwillingFractionAxis({ N, F: 16, capPromote: 64, seed: SEED, walkSamples: 100 });
 		expect(axis.holds(0), 'no unwilling members ⇒ no give-ups, hops bounded').to.equal(true);

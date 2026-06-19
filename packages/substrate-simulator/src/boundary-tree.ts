@@ -395,6 +395,11 @@ export function runTreeBoundaries(opts: TreeBoundaryOptions = {}): TreeBoundaryR
 		recordBoundary(metrics, b);
 		boundaries.push(b);
 		unwillingBreach = diagnoseUnwillingBreach(b, N, F, capPromote, seed, walkSamples);
+		// Fold the breach into the sink too: the `no-give-ups` claim edge actually reflects whichever
+		// sub-condition (give-up vs the `≤ d_max + 2` hop bound) flips first — at these defaults the hop
+		// bound, not give-ups. Without this the offline JSON/CSV export (the artifact
+		// `fold-simulator-findings-into-design-docs` consumes) would read the edge as a give-up edge.
+		metrics.counter('boundary.unwillingBreach', 1, { axis: 'unwillingFraction', breach: unwillingBreach });
 	}
 
 	return { boundaries, metrics, skipped, unwillingBreach };
