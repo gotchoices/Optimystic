@@ -14,6 +14,35 @@ Collection.selectLog()
           → materializeBlock()     # Finds materialized block + applies transforms
 ```
 
+#### Quereus vtab read path — pull-on-read is shape-independent
+
+`OptimysticVirtualTable.query()` is the single read entry point for the
+`quereus-plugin-optimystic` virtual table, and **every** read it serves first
+reconciles to the latest committed network state by calling `collection.update()`
+(`Tree.update` → `Collection.update` → `log.getFrom(rev)`) before yielding rows.
+This holds for all three read methods — `executeTableScan`, `executePointLookup`,
+`executeIndexScan` — and therefore for **all** SQL read shapes, **including
+`count(*)` / aggregates**. Quereus answers an aggregate by streaming rows from an
+ordinary scan (there is no row-count vtab API), so a bare `select count(*)` plans
+as a `fullscan` → `executeTableScan` → `collection.update()` pull, byte-for-byte
+the same access path as `select <col>`; a `count(*)` carrying a primary-key
+predicate routes through `executePointLookup`, which also pulls.
+
+Convergence is consequently **pull-on-read and shape-independent**: a peer observes
+another peer's committed appends on its next read of *any* shape. There is no
+background write-propagation in the default (cohort-topic-disabled) config (the
+reactive-watch / cohort-topic push paths below are opt-in), so a *write-only* peer
+must read — e.g. poll `count(*)` — to converge; that polling is the intended
+pattern, not a workaround.
+
+A suspected gap — that `count(*)` alone skipped the pull and so a count-only
+consumer never saw a peer's appends — was investigated and **empirically
+disproven** by `packages/quereus-plugin-optimystic/test/read-pull-mechanism.spec.ts`,
+which spies on `query()` / the execute* methods / `Tree.update` and confirms that
+(a) every `count(*)` shape reaches `query()` and issues a pull, and (b) a second
+writer's committed rows are visible to a count-only reader after that pull. No read
+shape is served from the local materialized tree without first reconciling.
+
 ### Write Path (Local Changes)
 ```
 Collection.act(action)
@@ -498,6 +527,10 @@ Quereus is **not** SQLite. It is a distinct SQL engine aligned with [The Third M
 1. Verify `restoreCallback` is configured
 2. Check if header block is shared (same blockId)
 3. Verify cluster fetch mechanism in `CoordinatorRepo.get()`
+4. If a write-only peer "never sees" another peer's rows: this is **by design** —
+   sync is pull-on-read (see *Quereus vtab read path* above). The peer must issue a
+   read to converge; the read shape is irrelevant (`count(*)` pulls like any scan).
+   There is no background propagation unless cohort-topic reactivity is enabled.
 
 ### Consensus Timeouts
 1. Check for latch deadlocks (concurrent access to same block)
