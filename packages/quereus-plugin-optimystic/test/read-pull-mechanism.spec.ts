@@ -314,4 +314,69 @@ describe('Read-path pull mechanism (single node, harness-independent)', function
 			peerA.db.close();
 		}
 	});
+
+	it('adversarial shapes (empty table, secondary-index predicate, distinct/sum/group-by) all pull', async () => {
+		// The shapes the ticket flagged as the most likely places a pull could be
+		// skipped: an empty table (a fast-path could short-circuit the cursor), a
+		// count routed through executeIndexScan rather than executeTableScan, and
+		// non-count aggregates. Each must still reach query() and issue a pull —
+		// otherwise the "pull-on-read is shape-independent" invariant is false.
+
+		// (a) empty-table count(*) — no fast path may bypass query()/update().
+		{
+			const { db } = createDb(dir);
+			try {
+				await db.exec(`create table E (id integer primary key, v text) using optimystic('tree://read-pull/empty')`);
+				probe.reset();
+				const c = await evalCount(db, 'select count(*) as c from E');
+				// eslint-disable-next-line no-console
+				console.log('[adversarial] empty count =', c, JSON.stringify({ ...probe, plans: [...probe.plans] }));
+				expect(c, 'empty count is 0').to.equal(0);
+				expect(probe.query, 'empty count reaches query()').to.be.greaterThan(0);
+				expect(probe.treeUpdate, 'empty count pulls').to.be.greaterThan(0);
+			} finally {
+				db.close();
+			}
+		}
+
+		// (b) count routed through a secondary index, plus non-count aggregates.
+		{
+			const { db } = createDb(dir);
+			try {
+				await db.exec(`create table A (id integer primary key, cat text, n integer) using optimystic('tree://read-pull/agg')`);
+				await db.exec(`create index idx_cat on A (cat)`);
+				for (let i = 1; i <= 6; i++) {
+					await db.exec(`insert into A (id, cat, n) values (${i}, '${i % 2 === 0 ? 'even' : 'odd'}', ${i})`);
+				}
+
+				// count(*) with a secondary-index predicate → executeIndexScan, which pulls.
+				probe.reset();
+				const secCount = await evalCount(db, `select count(*) as c from A where cat = 'even'`);
+				// eslint-disable-next-line no-console
+				console.log('[adversarial] count where cat=even =', secCount, JSON.stringify({ ...probe, plans: [...probe.plans] }));
+				expect(secCount, 'count over secondary index').to.equal(3);
+				expect(probe.query, 'secondary count reaches query()').to.be.greaterThan(0);
+				expect(probe.indexScan, 'secondary count routes through index scan').to.be.greaterThan(0);
+				expect(probe.treeUpdate, 'secondary count pulls').to.be.greaterThan(0);
+
+				// Non-count aggregates stream from the same fullscan source, so they pull too.
+				for (const sql of [
+					'select count(distinct cat) as c from A',
+					'select sum(n) as c from A',
+					'select cat, count(*) as c from A group by cat',
+				]) {
+					probe.reset();
+					let rows = 0;
+					for await (const _row of db.eval(sql)) rows++;
+					// eslint-disable-next-line no-console
+					console.log('[adversarial] agg', JSON.stringify(sql), 'rows=', rows, JSON.stringify({ query: probe.query, tableScan: probe.tableScan, treeUpdate: probe.treeUpdate }));
+					expect(rows, `${sql} yielded rows`).to.be.greaterThan(0);
+					expect(probe.query, `${sql} reaches query()`).to.be.greaterThan(0);
+					expect(probe.treeUpdate, `${sql} pulls`).to.be.greaterThan(0);
+				}
+			} finally {
+				db.close();
+			}
+		}
+	});
 });
