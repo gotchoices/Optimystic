@@ -11,7 +11,8 @@
   },
   "resolutions": {
     "@quereus/quereus": "portal:../quereus/packages/quereus",
-    "protons-runtime": "^6.0.0"
+    "protons-runtime": "^6.0.0",
+    "uint8arrays": "^6.1.1"
   },
   "scripts": {
     "clean": "yarn clean:db-core && yarn clean:db-p2p && yarn clean:db-p2p-storage-fs && yarn clean:db-p2p-storage-ns && yarn clean:db-p2p-storage-rn && yarn clean:db-p2p-storage-web && yarn clean:quereus-crypto && yarn clean:quereus-optimystic && yarn clean:reference-peer && yarn clean:demo && yarn clean:substrate-simulator",

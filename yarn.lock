@@ -4588,16 +4588,7 @@ __metadata:
   languageName: node
   linkType: hard
 
-"uint8arrays@npm:^5.0.0, uint8arrays@npm:^5.0.1, uint8arrays@npm:^5.0.2, uint8arrays@npm:^5.1.0":
-  version: 5.1.0
-  resolution: "uint8arrays@npm:5.1.0"
-  dependencies:
-    multiformats: "npm:^13.0.0"
-  checksum: 10c0/e7587f97d03a17a608becd01b3ca52aa6db43e7ee6156c18b278c715a62f4f9e62ef2fe9432a3cd02791b6222a17578476a20b8e3ea37dd3b5ce454c6a8782a9
-  languageName: node
-  linkType: hard
-
-"uint8arrays@npm:^6.0.0, uint8arrays@npm:^6.1.0, uint8arrays@npm:^6.1.1":
+"uint8arrays@npm:^6.1.1":
   version: 6.1.1
   resolution: "uint8arrays@npm:6.1.1"
   dependencies:
