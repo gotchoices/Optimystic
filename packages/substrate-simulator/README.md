@@ -65,19 +65,24 @@ Seven layers ship here:
   N ∈ {100 … 1M}) and the one-knob-at-a-time parameter-sensitivity sweep (`cap_promote`, `F`,
   `d_max_cap`, `W`/`W_checkpoint`, `contention_factor_cap`). The sweep report is the input artifact
   `fold-simulator-findings-into-design-docs` consumes.
-- **The validity-envelope finder** (`boundary.ts`, `boundary-tree.ts`, `boundary-churn.ts`) — the
-  third validation mode alongside the scenario claims and the sweep. Where a scenario answers *"does
-  the claim hold at the nominal point"* and the sweep answers *"which way does this knob move the
-  metric"*, `findBoundary` answers *"how far can a worsening condition be pushed before a claim flips
-  pass→fail, and how much margin is there to the design's operating point"*: it drives one
-  monotone-in-harm stress axis, brackets the first pass→fail transition, bisects to the edge, and
-  reports the **margin** (`EnvelopeBoundary`), every evaluation a fresh `(seed, config, axisValue)`
-  run on the virtual clock. `boundary-tree.ts` (`runTreeBoundaries`) supplies the tree-claim axes;
-  `boundary-churn.ts` (`runChurnBoundaries`) supplies the two cohort-topic failure-mode axes —
+- **The validity-envelope finder** (`boundary.ts`, `boundary-reference.ts`, `boundary-tree.ts`,
+  `boundary-churn.ts`, `boundary-reactivity.ts`) — the third validation mode alongside the scenario
+  claims and the sweep. Where a scenario answers *"does the claim hold at the nominal point"* and the
+  sweep answers *"which way does this knob move the metric"*, `findBoundary` answers *"how far can a
+  worsening condition be pushed before a claim flips pass→fail, and how much margin is there to the
+  design's operating point"*: it drives one monotone-in-harm stress axis, brackets the first pass→fail
+  transition, bisects to the edge, and reports the **margin** (`EnvelopeBoundary`), every evaluation a
+  fresh `(seed, config, axisValue)` run on the virtual clock. `boundary.ts` is the generic harness —
+  the `holds(value)` callback is its only subsystem-specific extension point. `boundary-reference.ts`
+  (`runReferenceBoundary`) supplies the cheap, self-validating reference axis — `root-not-overloaded`
+  vs arrivals-per-gossip-round `R*`, driven by `runConvergence` (no full-tree growth) with the margin
+  taken against `cap_promote`. `boundary-tree.ts` (`runTreeBoundaries`) supplies the heavier tree-claim
+  axes; `boundary-churn.ts` (`runChurnBoundaries`) the two cohort-topic failure-mode axes —
   `no-lost-registrations` vs sustained member-kill rate and `heal-convergence` vs partition severity,
   both driving the real `TopicCohort`/`ParticipantRenewal` failover loop so the edge reflects the
-  `ttl/3` renewal cadence rather than a structural identity. Boundaries fold into the same `Metrics`
-  sink, keyed by `(claim, axis)`.
+  `ttl/3` renewal cadence rather than a structural identity; `boundary-reactivity.ts`
+  (`runReactivityBoundaries`) the replay-window / rotation-drain axes. Boundaries fold into the same
+  `Metrics` sink, keyed by `(claim, axis)`.
 
 Mock-only: it is **not** shipped to runtime consumers and depends on **no** `@optimystic/*` or
 `db-p2p` code. It depends on **`p2p-fret`** (via a `portal:` path ref to the sibling FRET repo)

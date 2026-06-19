@@ -261,6 +261,12 @@ export {
 	recordBoundary
 } from './boundary.js';
 export {
+	type ReferenceBoundaryOptions,
+	type ReferenceBoundaryReport,
+	rootOverloadAxis,
+	runReferenceBoundary
+} from './boundary-reference.js';
+export {
 	type TreeBoundaryOptions,
 	type TreeBoundaryReport,
 	type UnwillingBreach,
