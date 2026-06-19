@@ -442,13 +442,13 @@ export class OptimysticVirtualTable extends VirtualTable {
         yield* this.executeIndexScan(indexName, filterInfo.args);
       } else if (planType === 2 && filterInfo.args.length > 0) {
         // Primary key equality seek (plan=2)
-        yield* this.executePointLookup(String(filterInfo.args[0]));
+        yield* this.executePointLookup(filterInfo.args);
       } else if (planType === 3) {
         // Range query on primary key (plan=3)
         yield* this.executeRangeQuery(filterInfo);
       } else if (filterInfo.idxNum === 1) {
         // Legacy: Point lookup on primary key
-        yield* this.executePointLookup(filterInfo.args[0] ? String(filterInfo.args[0]) : '');
+        yield* this.executePointLookup(filterInfo.args);
       } else if (filterInfo.idxNum === 2) {
         // Legacy: Range query on primary key
         yield* this.executeRangeQuery(filterInfo);
@@ -493,8 +493,14 @@ export class OptimysticVirtualTable extends VirtualTable {
   /**
    * Execute a point lookup query
    */
-  private async* executePointLookup(key: string): AsyncIterable<Row> {
+  private async* executePointLookup(args: readonly unknown[]): AsyncIterable<Row> {
     if (!this.collection || !this.rowCodec) return;
+
+    // Assemble the full (possibly composite) primary key from ALL seek args using
+    // the SAME encoding the row codec uses to store keys (extractPrimaryKey).
+    // Using only args[0] silently drops every PK column past the first, so a
+    // composite-PK point lookup builds a key that can never match a stored row.
+    const key = this.rowCodec.createPrimaryKey(args as SqlValue[]);
 
     // Update from network to get latest data
     await this.collection.update();
