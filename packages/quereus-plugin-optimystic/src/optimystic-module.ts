@@ -11,7 +11,7 @@ import { OptimysticVirtualTableConnection } from './optimystic-adapter/vtab-conn
 import type { ParsedOptimysticOptions } from './types.js';
 import type { IRawStorage } from '@optimystic/db-p2p';
 import { VirtualTable } from '@quereus/quereus';
-import { ConstraintError, QuereusError, StatusCode } from '@quereus/quereus';
+import { ConstraintError, ConflictResolution, QuereusError, StatusCode } from '@quereus/quereus';
 import type { VirtualTableModule, BaseModuleConfig, Database, TableSchema, Row, FilterInfo, BestAccessPlanRequest, BestAccessPlanResult, OrderingSpec, VirtualTableConnection, TableIndexSchema as IndexSchema, UpdateArgs, UpdateResult, SqlValue } from '@quereus/quereus';
 import { Tree } from '@optimystic/db-core';
 import { KeyRange } from '@optimystic/db-core';
@@ -703,6 +703,20 @@ export class OptimysticVirtualTable extends VirtualTable {
   }
 
   /**
+   * Render a SQLite-style UNIQUE-constraint message naming the PK columns:
+   *   `UNIQUE constraint failed: <table>.<pkCol>[, <table>.<pkCol>…]`
+   * This is the value clients see on a rejected duplicate-key INSERT, so it
+   * tracks SQLite's wording for compatibility. Optimystic enforces only the PK,
+   * so the columns listed are exactly the primary-key columns.
+   */
+  private uniqueConstraintMessage(): string {
+    const cols = this.tableSchema.primaryKeyDefinition
+      .map(pk => `${this.tableName}.${this.tableSchema.columns[pk.index]?.name ?? `col${pk.index}`}`)
+      .join(', ');
+    return `UNIQUE constraint failed: ${cols}`;
+  }
+
+  /**
    * Performs an INSERT, UPDATE, or DELETE operation
    */
   async update(args: UpdateArgs): Promise<UpdateResult> {
@@ -737,19 +751,55 @@ export class OptimysticVirtualTable extends VirtualTable {
             const insertKey = this.rowCodec.extractPrimaryKey(values);
 
             // Staging is an upsert, so a pre-stage get() is the only thing that
-            // rejects a duplicate key instead of silently overwriting it. The get
-            // sees rows staged earlier in this transaction and rows committed by
-            // prior ones. Throwing before markDirtyTrees/stage leaves this row
-            // unstaged; rows staged earlier roll back via the deferred snapshot.
-            const existing = await this.collection.get(insertKey);
+            // notices a duplicate key before it would silently overwrite the
+            // existing entry. The get sees rows staged earlier in this
+            // transaction and rows committed by prior ones. On a hit we RETURN a
+            // structured constraint/ok result (never throw) so the engine can
+            // apply SQL conflict semantics — IGNORE, REPLACE, or ON CONFLICT
+            // upsert — per the contract in dml-executor's processInsertRow.
+            const existing = await this.collection.get(insertKey) as [string, EncodedRow] | undefined;
             if (existing !== undefined) {
-              // ConstraintError (not plain Error) so the engine applies SQL
-              // conflict semantics; the catch below rethrows QuereusErrors verbatim
-              // so the type survives.
-              throw new ConstraintError(
-                `UNIQUE constraint failed: ${this.tableName} primary key '${insertKey}'`,
-                StatusCode.CONSTRAINT,
-              );
+              // Decode the displaced row once from the entry value [pk, encoded];
+              // reuse the entry already fetched above — do not re-read.
+              const existingRow = this.rowCodec.decodeRow(existing[1]);
+              // No per-constraint default in optimystic, so the fallback for an
+              // absent statement-level OR clause is plain ABORT.
+              const onConflict = args.onConflict ?? ConflictResolution.ABORT;
+
+              if (onConflict === ConflictResolution.IGNORE) {
+                // INSERT OR IGNORE / ON CONFLICT DO NOTHING: preserve the
+                // original row, stage nothing, leave the row count unchanged.
+                return { status: 'ok' };
+              }
+
+              if (onConflict === ConflictResolution.REPLACE) {
+                // INSERT OR REPLACE: overwrite the row in place. Same PK, so the
+                // row count is unchanged (no statistics bump) and only changed
+                // indexed columns restage via updateIndexEntries.
+                const replacementEncoded = this.rowCodec.encodeRow(values);
+                this.markDirtyTrees();
+                await this.collection.stage([[insertKey, [insertKey, replacementEncoded]]]);
+                await this.indexManager.updateIndexEntries(
+                  existingRow,
+                  values,
+                  insertKey,
+                  insertKey,
+                  txnState?.transactor,
+                );
+                return { status: 'ok', row: values, replacedRow: existingRow };
+              }
+
+              // ABORT (default) / FAIL / ROLLBACK: report the violation
+              // structurally. The engine's translateConflictError maps it to the
+              // right subclass for FAIL/ROLLBACK, and when an ON CONFLICT (pk) DO
+              // UPDATE/NOTHING clause is present it drives the upsert from
+              // existingRow. The vtab no longer throws for these modes.
+              return {
+                status: 'constraint',
+                constraint: 'unique',
+                message: this.uniqueConstraintMessage(),
+                existingRow,
+              };
             }
 
             const encodedRow = this.rowCodec.encodeRow(values);

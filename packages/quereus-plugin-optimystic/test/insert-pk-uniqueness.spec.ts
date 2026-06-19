@@ -162,3 +162,141 @@ describe('INSERT primary-key uniqueness (local/bootstrap transactor)', function 
 		}
 	});
 });
+
+/**
+ * Conflict-resolution coverage (see fix ticket
+ * `optimystic-vtab-onconflict-not-honored`).
+ *
+ * The vtab's INSERT path used to THROW a ConstraintError on a duplicate PK,
+ * which bypassed the engine's conflict-resolution branches: every one of
+ * `INSERT OR IGNORE`, `INSERT OR REPLACE`, `ON CONFLICT DO NOTHING`, and
+ * `ON CONFLICT DO UPDATE` errored instead of doing what the SQL asked. The fix
+ * returns a STRUCTURED UpdateResult (status 'ok' for IGNORE/REPLACE, status
+ * 'constraint' + existingRow for ABORT/upsert) so the engine drives the right
+ * behavior. These run against the real `local` / FileRawStorage transactor.
+ */
+describe('INSERT conflict resolution (local/bootstrap transactor)', function () {
+	this.timeout(15000);
+
+	let dir: string;
+
+	beforeEach(async () => {
+		dir = path.join(os.tmpdir(), 'optimystic-insert-onconflict', randomUUID());
+		await fs.mkdir(dir, { recursive: true });
+	});
+
+	afterEach(async () => {
+		await fs.rm(dir, { recursive: true, force: true });
+	});
+
+	it('INSERT OR IGNORE on a duplicate key skips the row and preserves the original', async () => {
+		const uri = 'tree://onconflict/ignore';
+		const { db } = createDb(dir);
+		try {
+			await db.exec(
+				`create table T (id integer primary key, v text) using optimystic('${uri}')`,
+			);
+			await db.exec(`insert into T (id, v) values (1, 'a')`);
+
+			// Must NOT throw and must NOT overwrite — the original 'a' survives.
+			await db.exec(`insert or ignore into T (id, v) values (1, 'b')`);
+
+			expect(await selectCount(db, 'select count(*) as c from T')).to.equal(1);
+			expect(await selectScalar(db, 'select v from T where id = 1')).to.equal('a');
+		} finally {
+			db.close();
+		}
+
+		expect(await reopenScalar(dir, 'select v from T where id = 1')).to.equal('a');
+	});
+
+	it('INSERT OR REPLACE on a duplicate key overwrites the row and persists across reopen', async () => {
+		const uri = 'tree://onconflict/replace';
+		const { db } = createDb(dir);
+		try {
+			await db.exec(
+				`create table T (id integer primary key, v text) using optimystic('${uri}')`,
+			);
+			await db.exec(`insert into T (id, v) values (1, 'a')`);
+
+			// Must NOT throw and must overwrite — the new 'b' wins, still one row.
+			await db.exec(`insert or replace into T (id, v) values (1, 'b')`);
+
+			expect(await selectCount(db, 'select count(*) as c from T')).to.equal(1);
+			expect(await selectScalar(db, 'select v from T where id = 1')).to.equal('b');
+		} finally {
+			db.close();
+		}
+
+		// The overwrite reached storage.
+		expect(await reopenScalar(dir, 'select v from T where id = 1')).to.equal('b');
+	});
+
+	it('ON CONFLICT (pk) DO NOTHING preserves the original row without throwing', async () => {
+		const uri = 'tree://onconflict/donothing';
+		const { db } = createDb(dir);
+		try {
+			await db.exec(
+				`create table T (id integer primary key, v text) using optimystic('${uri}')`,
+			);
+			await db.exec(`insert into T (id, v) values (1, 'a')`);
+
+			await db.exec(
+				`insert into T (id, v) values (1, 'b') on conflict (id) do nothing`,
+			);
+
+			expect(await selectCount(db, 'select count(*) as c from T')).to.equal(1);
+			expect(await selectScalar(db, 'select v from T where id = 1')).to.equal('a');
+		} finally {
+			db.close();
+		}
+
+		expect(await reopenScalar(dir, 'select v from T where id = 1')).to.equal('a');
+	});
+
+	it('ON CONFLICT (pk) DO UPDATE applies the update clause to the existing row', async () => {
+		const uri = 'tree://onconflict/doupdate';
+		const { db } = createDb(dir);
+		try {
+			await db.exec(
+				`create table T (id integer primary key, v text) using optimystic('${uri}')`,
+			);
+			await db.exec(`insert into T (id, v) values (1, 'a')`);
+
+			await db.exec(
+				`insert into T (id, v) values (1, 'b') on conflict (id) do update set v = 'updated'`,
+			);
+
+			expect(await selectCount(db, 'select count(*) as c from T')).to.equal(1);
+			expect(await selectScalar(db, 'select v from T where id = 1')).to.equal('updated');
+		} finally {
+			db.close();
+		}
+
+		expect(await reopenScalar(dir, 'select v from T where id = 1')).to.equal('updated');
+	});
+
+	it('INSERT OR REPLACE keeps a secondary index consistent (indexed lookup returns the new value)', async () => {
+		const uri = 'tree://onconflict/replace-index';
+		const { db } = createDb(dir);
+		try {
+			await db.exec(
+				`create table T (id integer primary key, cat text, v text) using optimystic('${uri}')`,
+			);
+			await db.exec(`create index idx_cat on T (cat)`);
+			await db.exec(`insert into T (id, cat, v) values (1, 'x', 'a')`);
+
+			// Replace moves the indexed column from 'x' to 'y' and changes v.
+			await db.exec(`insert or replace into T (id, cat, v) values (1, 'y', 'b')`);
+
+			expect(await selectCount(db, 'select count(*) as c from T')).to.equal(1);
+			// Old index key 'x' no longer resolves; new key 'y' returns the new row.
+			expect(await selectCount(db, `select count(*) as c from T where cat = 'x'`)).to.equal(0);
+			expect(await selectScalar(db, `select v from T where cat = 'y'`)).to.equal('b');
+		} finally {
+			db.close();
+		}
+
+		expect(await reopenScalar(dir, `select v from T where cat = 'y'`)).to.equal('b');
+	});
+});
