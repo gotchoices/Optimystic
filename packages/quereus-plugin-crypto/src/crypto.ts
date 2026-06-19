@@ -141,10 +141,16 @@ export function resolveOutputEncoder(encoding: OutputEncoding): OutputEncoder {
 const DIGEST_FORMAT_V1 = 0x01;
 
 // Per-field type tags. Distinct tags keep distinct SQL types from colliding
-// (e.g. INTEGER 123 vs TEXT '123' vs REAL 123.0 vs BOOL true).
+// (e.g. INTEGER 123 vs TEXT '123' vs BOOL true).
+//
+// Note on INT vs REAL: the tag is derived from the JS value, not from SQL
+// affinity (a scalar function does not receive affinity). An integer-VALUED
+// number — including a REAL like 2.0, which reaches JS as the number 2 — is
+// encoded as INTEGER. So INTEGER 2 and REAL 2.0 produce the same digest. This is
+// replicable (every peer sees the same JS value) but not int/real-distinguishing.
 const TAG_NULL = 0x00; // bare tag, no length/payload
-const TAG_INT = 0x01;  // payload: decimal string (unifies number-integer & bigint)
-const TAG_REAL = 0x02; // payload: ECMAScript Number::toString
+const TAG_INT = 0x01;  // payload: canonical decimal string (number-integer & bigint unified via BigInt)
+const TAG_REAL = 0x02; // payload: ECMAScript Number::toString (non-integer numbers only)
 const TAG_TEXT = 0x03; // payload: UTF-8 bytes
 const TAG_BOOL = 0x04; // payload: single 0x00/0x01 byte
 const TAG_BLOB = 0x05; // payload: raw bytes
@@ -170,17 +176,50 @@ function framed(tag: number, payload: Uint8Array): Uint8Array {
 	return concatBytes(Uint8Array.from(header), payload);
 }
 
-/** Deterministic JSON: object keys recursively sorted, no incidental whitespace. */
-function stableStringify(value: unknown): string {
-	if (value === null || typeof value !== 'object') {
-		return JSON.stringify(value) ?? 'null';
+/**
+ * Strict, deterministic JSON canonicalization for a native object/array field:
+ * object keys recursively sorted, no incidental whitespace. Unlike `JSON.stringify`,
+ * it THROWS rather than silently collapsing non-JSON inputs (`undefined`, non-finite
+ * numbers, `bigint`, non-plain objects like `Date`/`Map`) — silent collapse would
+ * break injectivity (`{a:undefined}` vs `{}`, `NaN` vs `null`, `new Date(0)` vs `{}`).
+ */
+function canonicalJson(value: unknown): string {
+	if (value === null) return 'null';
+	const t = typeof value;
+	if (t === 'string') return JSON.stringify(value);
+	if (t === 'boolean') return value ? 'true' : 'false';
+	if (t === 'number') {
+		if (!Number.isFinite(value)) {
+			throw new Error('digest: cannot encode a non-finite number inside a JSON field');
+		}
+		return JSON.stringify(value) as string; // deterministic Number::toString
+	}
+	if (t === 'bigint') {
+		throw new Error('digest: bigint is not representable inside a JSON field');
 	}
 	if (Array.isArray(value)) {
-		return `[${value.map(stableStringify).join(',')}]`;
+		return `[${value.map((el) => {
+			if (el === undefined) {
+				throw new Error('digest: undefined / sparse element inside a JSON field');
+			}
+			return canonicalJson(el);
+		}).join(',')}]`;
 	}
-	const obj = value as Record<string, unknown>;
-	const keys = Object.keys(obj).sort();
-	return `{${keys.map(k => `${JSON.stringify(k)}:${stableStringify(obj[k])}`).join(',')}}`;
+	if (t === 'object') {
+		const proto = Object.getPrototypeOf(value);
+		if (proto !== Object.prototype && proto !== null) {
+			throw new Error('digest: only plain objects are allowed inside a JSON field');
+		}
+		const obj = value as Record<string, unknown>;
+		const keys = Object.keys(obj).sort();
+		return `{${keys.map((k) => {
+			if (obj[k] === undefined) {
+				throw new Error(`digest: undefined value for JSON key '${k}'`);
+			}
+			return `${JSON.stringify(k)}:${canonicalJson(obj[k])}`;
+		}).join(',')}}`;
+	}
+	throw new Error(`digest: unsupported value of type '${t}' inside a JSON field`);
 }
 
 /** Encode one field as tag (‖ length ‖ payload). NULL/undefined is a bare tag. */
@@ -197,8 +236,10 @@ function encodeField(field: DigestField): Uint8Array {
 			if (!Number.isFinite(field)) {
 				throw new Error('digest: cannot encode a non-finite number');
 			}
+			// Integer-valued numbers go through BigInt so they encode identically to
+			// the equal-valued bigint (e.g. 1e21 → full digits, not "1e+21").
 			return Number.isInteger(field)
-				? framed(TAG_INT, utf8ToBytes(field.toString()))
+				? framed(TAG_INT, utf8ToBytes(BigInt(field).toString()))
 				: framed(TAG_REAL, utf8ToBytes(field.toString()));
 		case 'string':
 			return framed(TAG_TEXT, utf8ToBytes(field));
@@ -206,7 +247,7 @@ function encodeField(field: DigestField): Uint8Array {
 			if (field instanceof Uint8Array) {
 				return framed(TAG_BLOB, field);
 			}
-			return framed(TAG_JSON, utf8ToBytes(stableStringify(field)));
+			return framed(TAG_JSON, utf8ToBytes(canonicalJson(field)));
 		default:
 			throw new Error(`digest: unsupported field type '${typeof field}'`);
 	}
@@ -220,12 +261,17 @@ function encodeField(field: DigestField): Uint8Array {
  * (NULL is a bare tag). Properties:
  * - order-preserving and arity-safe (self-delimiting fields → uniquely decodable),
  * - NULL distinguishable from empty string,
- * - type distinguishable (INTEGER 123 ≠ TEXT '123' ≠ REAL ≠ BOOL),
+ * - type distinguishable (INTEGER 123 ≠ TEXT '123' ≠ BOOL true ≠ BLOB),
  * - delimiter-safe (a separator inside a string is just payload under its length).
  *
- * Replicability note: integer `number` and `bigint` of equal value encode
- * identically; REAL uses ECMAScript `Number::toString` (deterministic across JS
- * engines, but not guaranteed across other languages).
+ * Replicability notes:
+ * - Integer `number` and `bigint` of equal value encode identically (both via
+ *   `BigInt(...).toString()`); a non-integer REAL uses ECMAScript `Number::toString`
+ *   (deterministic across JS engines, but not guaranteed across other languages).
+ * - INT vs REAL is derived from the JS value, not SQL affinity: an integer-valued
+ *   REAL (e.g. 2.0 → number 2) encodes as INTEGER, so INTEGER 2 and REAL 2.0 collide.
+ * - A native JSON object/array field must contain only valid JSON (no `undefined`,
+ *   non-finite numbers, `bigint`, or non-plain objects) — otherwise it throws.
  */
 export function encodeFields(fields: readonly DigestField[]): Uint8Array {
 	const chunks: Uint8Array[] = [Uint8Array.of(DIGEST_FORMAT_V1)];

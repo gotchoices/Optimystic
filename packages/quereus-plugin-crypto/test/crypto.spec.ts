@@ -115,6 +115,46 @@ describe('Crypto Functions', () => {
 		});
 	});
 
+	describe('digest() — replicability & cross-type', () => {
+		it('treats large integer number and bigint identically', () => {
+			expect(hex([1e21])).to.equal(hex([10n ** 21n]));
+		});
+
+		it('treats integer-valued REAL the same as INTEGER (documented collision)', () => {
+			expect(hex([2.0])).to.equal(hex([2]));
+			expect(hex([-0])).to.equal(hex([0]));
+		});
+
+		it('distinguishes a non-integer REAL from text', () => {
+			expect(hex([1.5])).to.not.equal(hex(['1.5']));
+		});
+
+		it('distinguishes a blob from a JSON array of the same numbers', () => {
+			expect(hex([new Uint8Array([1, 2, 3])])).to.not.equal(hex([[1, 2, 3]]));
+		});
+
+		it('throws on non-JSON values inside a JSON field', () => {
+			expect(() => digest([{ a: undefined }])).to.throw();
+			expect(() => digest([[undefined]])).to.throw();
+			expect(() => digest([{ a: Number.NaN }])).to.throw();
+			expect(() => digest([{ a: 1n }])).to.throw();
+			expect(() => digest([new Date(0) as any])).to.throw();
+		});
+
+		// Known-answer vectors: lock the wire format so a silent encoding change
+		// (which would break every signed commitment) fails loudly. sha256/hex.
+		it('matches golden known-answer vectors', () => {
+			expect(hex([])).to.equal('4bf5122f344554c53bde2ebb8cd2b7e3d1600ad631c385a5d7cce23c7785459a');
+			expect(hex(['hello'])).to.equal('8c63cb01ffa849168efebba19cba5a30df610da1de4c765ccec0b671de21e731');
+			expect(hex(['alice', 42, null, true])).to.equal('f435dc1ab21023c091234b678f96f175efed048f5ea61f7b604e54bb7ff498cf');
+		});
+
+		it('matches the golden encodeFields byte layout', () => {
+			const enc = Buffer.from(encodeFields(['alice', 42, null, true])).toString('hex');
+			expect(enc).to.equal('010305616c69636501023432000401');
+		});
+	});
+
 	describe('plugin registration (load-time config)', () => {
 		const getDigest = (config?: Record<string, any>): any => {
 			const { functions } = registerCryptoPlugin({} as any, config);
