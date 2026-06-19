@@ -1432,6 +1432,7 @@ __metadata:
     "@types/node": "npm:^25.2.0"
     chai: "npm:^6.2.2"
     mocha: "npm:^11.7.5"
+    multiformats: "npm:^14.0.0"
     rimraf: "npm:^6.1.2"
     ts-node: "npm:^10.9.2"
     tsup: "npm:^8.5.1"

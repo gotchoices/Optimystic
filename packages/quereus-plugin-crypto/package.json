@@ -43,6 +43,7 @@
 	"dependencies": {
 		"@noble/curves": "^2.0.1",
 		"@noble/hashes": "^2.0.1",
+		"multiformats": "^14.0.0",
 		"uint8arrays": "^5.1.0"
 	},
 	"peerDependencies": {
@@ -58,6 +59,11 @@
 		"cryptography",
 		"digest",
 		"hash",
+		"cid",
+		"ipfs",
+		"ipld",
+		"multiformats",
+		"multihash",
 		"signature",
 		"sign",
 		"verify",
@@ -76,6 +82,9 @@
 		"provides": {
 			"functions": [
 				"digest",
+				"cid",
+				"cid_v1",
+				"cid_decode",
 				"sign",
 				"verify",
 				"hash_mod",

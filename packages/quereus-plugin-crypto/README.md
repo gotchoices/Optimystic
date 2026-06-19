@@ -5,6 +5,7 @@ Quereus plugin providing cryptographic functions for SQL queries with base64url 
 ## Features
 
 - **Hash Functions**: SHA-256, SHA-512, BLAKE3 hashing with base64url output
+- **Content Identifiers (CIDv1)**: Self-describing, interoperable IPFS/IPLD content addresses
 - **Hash Modulo**: Fixed-size hash values (16-bit, 32-bit, etc.) for sharding and partitioning
 - **Random Bytes**: Generate cryptographically secure random bytes (default: 256 bits)
 - **Signature Functions**: secp256k1, P-256, Ed25519 signing with base64url encoding
@@ -100,6 +101,62 @@ the digest is signed or persisted as a commitment.
 
 The framing is also why `digest(x)` is **not** a bare `sha256(x)` — it is a framed
 digest of a one-element tuple. For sharding a single value, use `hash_mod`.
+
+### cid(data, codec?, hash?, base?) / cid_v1(digest, hash, codec?, base?) / cid_decode(cid)
+
+`digest` returns a **bare** hash — raw digest bytes in some text encoding, with no
+record of which base, content type, or hash algorithm produced it. `cid` instead
+produces a **self-describing CIDv1**, the same interoperable content address an
+IPFS/IPLD store computes for the same bytes:
+
+```
+CIDv1     = multibase( version ‖ multicodec(content-type) ‖ multihash )
+multihash = hashFnCode ‖ digestLength ‖ digestBytes
+```
+
+Because the multibase, content codec, and hash code all travel *inside* the value,
+a consumer can validate it without out-of-band knowledge, and an algorithm
+migration (e.g. sha2-256 → another hash) is unambiguous rather than a silent
+reinterpretation. The framing comes entirely from the audited
+[`multiformats`](https://github.com/multiformats/js-multiformats) library.
+
+```sql
+-- Hash a blob and frame it as the canonical raw/sha2-256/base32 CID
+-- (== the CID IPFS shows for the same bytes)
+SELECT cid(SomeBlob) AS Cid;
+
+-- Pick content codec / hash / base
+SELECT cid(SomeBlob, 'dag-cbor', 'sha2-512', 'base58btc') AS Cid;
+
+-- A self-describing content address over a field tuple: digest() canonically
+-- frames + hashes the fields; cid_v1() wraps that exact digest as a CIDv1
+-- (no double-hash). The asserted hash must match digest()'s configured algorithm.
+SELECT cid_v1(digest(ColA, ColB, ColC), 'sha2-256') AS Cid;
+
+-- Validate / inspect a stored CID (returns JSON: { version, codec, hashCode, digest })
+SELECT cid_decode(Cid) ->> 'codec' AS codec FROM T;
+```
+
+- **`cid(data, codec?, hash?, base?)`** — hash `data` then frame. `data` is a BLOB,
+  or a base64url-encoded TEXT digest/blob (the plugin's canonical text encoding).
+  Defaults: `codec='raw'`, `hash='sha2-256'`, `base='base32'`.
+- **`cid_v1(digest, hash, codec?, base?)`** — wrap an **already-computed** digest
+  without re-hashing. `hash` is required and asserts which algorithm produced the
+  digest; the digest length is checked against it (sha2-256/blake3 = 32 bytes,
+  sha2-512 = 64) and a mismatch is rejected.
+- **`cid_decode(cid) → JSON`** — parse a CID back to `{ version, codec, hashCode,
+  digest }` (digest as base64url). Throws cleanly on malformed input.
+
+Selectable values: `codec` ∈ `raw`, `dag-cbor`; `hash` ∈ `sha2-256`, `sha2-512`,
+`blake3`; `base` ∈ `base32` (default), `base58btc`, `base64url`, `base16`.
+
+**Why `base32` by default?** A CID's whole purpose is to match what an external
+content-addressed store computes, and IPFS renders CIDv1 canonically in base32 (the
+`b…` prefix). This is deliberately different from the plugin's `digest`/`random_bytes`
+default of base64url: base64url is compact for *internal* values that live in memory,
+on the wire, or in JSON, whereas base32 is case-insensitive and DNS/URL/filename-safe
+where interoperable addresses are copied and read. Two audiences, two defaults — pass
+`'base64url'` explicitly if you want the compact form.
 
 ### hash_mod(data, bits, algorithm?, inputEncoding?)
 
@@ -279,6 +336,24 @@ Injective digest over an ordered tuple of fields. `fields` is an array of values
 - **Related**: `encodeFields(fields)` returns the canonical pre-hash byte framing;
   `digestFields(fields, hasher, encode)` / `resolveHasher` / `resolveOutputEncoder`
   are the building blocks the SQL function composes (resolve once, no per-call branching).
+
+### cid(data, codec?, hash?, base?)
+Hash `data` (a `Uint8Array`) and frame it as a self-describing CIDv1 string. Defaults:
+`codec='raw'`, `hash='sha2-256'`, `base='base32'`. Byte-identical to the CID an IPFS/IPLD
+store computes for the same bytes.
+- **Returns**: CIDv1 string
+
+### cidV1(digest, hash, codec?, base?)
+Frame an **already-computed** `digest` (a `Uint8Array`) as a CIDv1 without re-hashing.
+`hash` asserts which algorithm produced the digest; the digest length is validated
+against it. Use to turn a `digest(...)` result into a CID: `cidV1(digest(fields, 'sha256', 'bytes'), 'sha2-256')`.
+- **Returns**: CIDv1 string
+
+### cidDecode(cid)
+Parse a CID string into `{ version, codec, hashCode, digest }` for validation/migration.
+Recognized codec/hash codes are returned as names, otherwise as numbers; `digest` is a
+`Uint8Array`. Throws on malformed input.
+- **Returns**: `{ version: number, codec: Multicodec | number, hashCode: MultihashCode | number, digest: Uint8Array }`
 
 ### hashMod(data, bits, algorithm?, inputEncoding?)
 Hash data and return modulo 2^bits for fixed-size hash values.

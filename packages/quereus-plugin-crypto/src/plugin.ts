@@ -7,11 +7,16 @@
 
 import type { Database, SqlValue } from '@quereus/quereus';
 import { FunctionFlags, TEXT_TYPE, INTEGER_TYPE, BOOLEAN_TYPE } from '@quereus/quereus';
+import { fromString as uint8ArrayFromString, toString as uint8ArrayToString } from 'uint8arrays';
 import {
 	sign, verify, hashMod, randomBytes,
 	digestFields, resolveHasher, resolveOutputEncoder,
 	type HashAlgorithm, type OutputEncoding, type DigestField,
 } from './crypto.js';
+import {
+	cid, cidV1, cidDecode,
+	type Multicodec, type MultihashCode, type Multibase,
+} from './cid.js';
 
 const DIGEST_ALGORITHMS: readonly HashAlgorithm[] = ['sha256', 'sha512', 'blake3'];
 // SQL digest returns TEXT, so only text-producing encodings are valid here ('bytes' is JS-only).
@@ -31,6 +36,22 @@ function configEncoding(config: Record<string, SqlValue>): OutputEncoding {
 		throw new Error(`crypto plugin: unsupported digest encoding '${value}' (expected one of ${DIGEST_TEXT_ENCODINGS.join(', ')})`);
 	}
 	return value as OutputEncoding;
+}
+
+/**
+ * Coerce a SQL `data`/`digest` argument to raw bytes. A BLOB arrives as a
+ * Uint8Array and is used directly; TEXT is interpreted as base64url — the
+ * plugin's canonical text encoding — so `cid_v1(digest(...))` composes with the
+ * base64url string `digest` returns, with no extra round-trip.
+ */
+function toContentBytes(value: SqlValue | undefined, fnName: string): Uint8Array {
+	if (value instanceof Uint8Array) {
+		return value;
+	}
+	if (typeof value === 'string') {
+		return uint8ArrayFromString(value, 'base64url');
+	}
+	throw new Error(`${fnName}: expected a BLOB or base64url TEXT argument, got ${value == null ? 'NULL' : typeof value}`);
 }
 
 // Flags for deterministic functions (UTF8 + DETERMINISTIC)
@@ -62,6 +83,55 @@ export default function register(_db: Database, config: Record<string, SqlValue>
 				returnType: { typeClass: 'scalar' as const, logicalType: TEXT_TYPE, nullable: false },
 				implementation: (...fields: SqlValue[]) =>
 					digestFields(fields as DigestField[], digestHasher, digestEncoder) as string,
+			},
+		},
+		{
+			schema: {
+				name: 'cid',
+				numArgs: -1, // cid(data, codec?, hash?, base?) — trailing args optional
+				flags: DETERMINISTIC_FLAGS,
+				// Self-describing content address; signed/persisted, so byte-identical across peers.
+				replicable: true,
+				returnType: { typeClass: 'scalar' as const, logicalType: TEXT_TYPE, nullable: false },
+				implementation: (...args: SqlValue[]) => {
+					const [data, codec = 'raw', hash = 'sha2-256', base = 'base32'] = args;
+					return cid(toContentBytes(data, 'cid'), codec as Multicodec, hash as MultihashCode, base as Multibase);
+				},
+			},
+		},
+		{
+			schema: {
+				name: 'cid_v1',
+				numArgs: -1, // cid_v1(digest, hash, codec?, base?) — hash required, trailing args optional
+				flags: DETERMINISTIC_FLAGS,
+				replicable: true,
+				returnType: { typeClass: 'scalar' as const, logicalType: TEXT_TYPE, nullable: false },
+				implementation: (...args: SqlValue[]) => {
+					const [digest, hash, codec = 'raw', base = 'base32'] = args;
+					if (hash == null) {
+						throw new Error("cid_v1: 'hash' argument is required (the multihash code asserting which algorithm produced the digest)");
+					}
+					return cidV1(toContentBytes(digest, 'cid_v1'), hash as MultihashCode, codec as Multicodec, base as Multibase);
+				},
+			},
+		},
+		{
+			schema: {
+				name: 'cid_decode',
+				numArgs: 1, // cid_decode(cid) -> JSON text { version, codec, hashCode, digest }
+				flags: DETERMINISTIC_FLAGS,
+				replicable: true,
+				returnType: { typeClass: 'scalar' as const, logicalType: TEXT_TYPE, nullable: false },
+				implementation: (value: SqlValue) => {
+					const parts = cidDecode(value as string);
+					// JSON object (Quereus has native JSON); digest is base64url, the plugin's canonical text encoding.
+					return JSON.stringify({
+						version: parts.version,
+						codec: parts.codec,
+						hashCode: parts.hashCode,
+						digest: uint8ArrayToString(parts.digest, 'base64url'),
+					});
+				},
 			},
 		},
 		{

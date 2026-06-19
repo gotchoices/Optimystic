@@ -31,6 +31,67 @@ All hash functions are deterministic and collision-resistant. They accept arbitr
 
 ---
 
+## Content Identifiers (CIDv1)
+
+`digest` emits a **bare** hash; `cid` emits a **self-describing** CIDv1 — the
+interoperable content address an IPFS/IPLD store computes for the same bytes:
+
+```
+CIDv1     = multibase( version ‖ multicodec(content-type) ‖ multihash )
+multihash = hashFnCode ‖ digestLength ‖ digestBytes
+```
+
+The multibase, content codec, and hash code travel inside the value, so it can be
+validated without out-of-band context and an algorithm migration is unambiguous.
+All framing/parsing is delegated to [`multiformats`](https://github.com/multiformats/js-multiformats);
+the hashing reuses the plugin's synchronous `@noble/hashes` functions, so the
+output is byte-identical to multiformats' own (async) hasher path — there is no
+bespoke byte-pushing or parsing.
+
+### Selectable parameters
+
+| Parameter | Values | Code(s) | Default |
+|-----------|--------|---------|---------|
+| `codec` (content type) | `raw`, `dag-cbor` | `0x55`, `0x71` | `raw` |
+| `hash` (multihash) | `sha2-256`, `sha2-512`, `blake3` | `0x12`, `0x13`, `0x1e` | `sha2-256` |
+| `base` (multibase) | `base32`, `base58btc`, `base64url`, `base16` | `b`, `z`, `u`, `f` | `base32` |
+
+`base32` is the default because IPFS renders CIDv1 canonically in base32 — interop
+is the point. This intentionally differs from `digest`/`random_bytes`, whose
+base64url default suits compact *internal* values. Two audiences, two defaults.
+
+**blake3 is not built into `multiformats`.** Core `multiformats` ships sha2-256/512
+hashers and the base32/58/64/16 bases, but not blake3. This plugin sidesteps that by
+computing every digest with `@noble/hashes` and framing the result with the registered
+blake3 multihash code (`0x1e`) via `multiformats/hashes/digest`, so no `MultihashHasher`
+wrapper is needed. blake3 digests are pinned to 32 bytes for replicability.
+
+### `cid(data, codec?, hash?, base?) → TEXT`
+
+- **Deterministic / replicable**: Yes
+- **`data`**: BLOB, or base64url-encoded TEXT (decoded to bytes before hashing)
+- **Defaults**: `codec='raw'`, `hash='sha2-256'`, `base='base32'`
+
+### `cid_v1(digest, hash, codec?, base?) → TEXT`
+
+- **Deterministic / replicable**: Yes
+- **`digest`**: BLOB, or base64url-encoded TEXT — wrapped **without re-hashing**
+- **`hash`**: required; asserts the algorithm. Digest length is validated against it
+  (sha2-256/blake3 = 32 bytes, sha2-512 = 64) and a mismatch throws.
+- **Composition**: `cid_v1(digest(a, b, c), 'sha2-256')` makes one self-describing CID
+  over a field tuple — `digest` does the canonical multi-field framing + hashing, `cid_v1`
+  adds the multihash/CIDv1/multibase envelope. The asserted hash must match the algorithm
+  `digest` was configured with at load time.
+
+### `cid_decode(cid) → JSON (TEXT)`
+
+- **Deterministic**: Yes
+- **Returns**: `{ version, codec, hashCode, digest }` — codec/hash as names when
+  recognized else numbers; `digest` as base64url TEXT
+- **Errors**: throws cleanly on malformed input (no silent mis-framing)
+
+---
+
 ## Elliptic Curves
 
 | Curve | Algorithm | Key Size | Signature Size | Library |
@@ -148,6 +209,7 @@ All encoding parameters default to `base64url` unless otherwise specified.
 |---------|---------|---------|
 | `@noble/curves` | ^2.0.1 | ECC: secp256k1, P-256, Ed25519 |
 | `@noble/hashes` | ^2.0.1 | SHA-256, SHA-512, BLAKE3 |
+| `multiformats` | ^14.0.0 | CID / multihash / multibase / multicodec framing |
 | `uint8arrays` | ^5.1.0 | Encoding conversion utilities |
 
-No native modules required. Compatible with Node.js, browsers, and React Native (with `crypto.getRandomValues` polyfill).
+No native modules required. Compatible with Node.js, browsers, and React Native (with `crypto.getRandomValues` polyfill). The `multiformats` CID/multihash/base modules used here carry no Node-only assumptions.

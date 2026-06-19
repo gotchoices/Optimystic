@@ -64,7 +64,7 @@ The **cohort-topic substrate** (and its reactivity / matchmaking applications) d
 
 | Term | Meaning |
 |------|---------|
-| **Block** | Immutable, versioned unit of storage; content-addressed by a base32 `BlockId`. |
+| **Block** | Versioned storage unit identified by a stable base64url `BlockId` (random for data blocks, derived from the collection name for header blocks). Its revisions are immutable and content-addressed; the `BlockId` itself is not a content hash, since a block's content changes across revisions. |
 | **Operation** | Splice-style mutation on one block: `[entity, index, deleteCount, inserted]`. |
 | **Transform** | A set of inserts/updates/deletes applied to a single block. |
 | **Action** | A logical mutation scoped to one *collection*, realized as one or more operations. |
@@ -319,7 +319,7 @@ Instrumentation is built on the `debug` library (see [debugging.md](debugging.md
 * **Action** — logical mutation to one collection; compiles to one or more operations. Carries a stamp ID.
 * **Arachnode** — the concentric-ring storage architecture layered over FRET.
 * **Authority** — an entity controlling specific collections or operations at the application layer.
-* **Block** — immutable, versioned storage unit; content-addressed by `BlockId`.
+* **Block** — versioned storage unit with a stable base64url `BlockId` (random for data blocks, name-derived for collection headers); its revisions are immutable and content-addressed, but the `BlockId` is not a content hash.
 * **Cluster** — the peers responsible for a block, selected by FRET ring distance.
 * **Coordinator** — the peer orchestrating a transaction round with a cluster.
 * **Collection** — a named group of blocks with a header, data structure, and transaction log.
