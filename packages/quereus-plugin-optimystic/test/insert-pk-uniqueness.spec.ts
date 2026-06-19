@@ -66,6 +66,16 @@ async function expectThrows(fn: () => Promise<unknown>): Promise<void> {
 	throw new Error('expected operation to throw, but it resolved');
 }
 
+/** Assert that `fn` rejects and return the thrown error's message for inspection. */
+async function captureThrowMessage(fn: () => Promise<unknown>): Promise<string> {
+	try {
+		await fn();
+	} catch (err) {
+		return err instanceof Error ? err.message : String(err);
+	}
+	throw new Error('expected operation to throw, but it resolved');
+}
+
 async function reopenScalar(dir: string, sql: string): Promise<SqlValue> {
 	const { db, plugin } = createDb(dir);
 	try {
@@ -274,6 +284,51 @@ describe('INSERT conflict resolution (local/bootstrap transactor)', function () 
 		}
 
 		expect(await reopenScalar(dir, 'select v from T where id = 1')).to.equal('updated');
+	});
+
+	it('ON CONFLICT (pk) DO UPDATE can reference the proposed row via excluded.*', async () => {
+		const uri = 'tree://onconflict/excluded';
+		const { db } = createDb(dir);
+		try {
+			await db.exec(
+				`create table T (id integer primary key, v text) using optimystic('${uri}')`,
+			);
+			await db.exec(`insert into T (id, v) values (1, 'a')`);
+
+			// `excluded.v` is the value of the row that failed to insert ('b').
+			// The vtab only hands the engine `existingRow`; the engine resolves
+			// `excluded` from the proposed row, so this proves the interplay.
+			await db.exec(
+				`insert into T (id, v) values (1, 'b') on conflict (id) do update set v = excluded.v`,
+			);
+
+			expect(await selectCount(db, 'select count(*) as c from T')).to.equal(1);
+			expect(await selectScalar(db, 'select v from T where id = 1')).to.equal('b');
+		} finally {
+			db.close();
+		}
+
+		expect(await reopenScalar(dir, 'select v from T where id = 1')).to.equal('b');
+	});
+
+	it('surfaces a SQLite-style "UNIQUE constraint failed: <table>.<pkCol>" message on a default-ABORT duplicate', async () => {
+		const uri = 'tree://onconflict/message';
+		const { db } = createDb(dir);
+		try {
+			await db.exec(
+				`create table T (id integer primary key, v text) using optimystic('${uri}')`,
+			);
+			await db.exec(`insert into T (id, v) values (1, 'a')`);
+
+			// The structured constraint result's `message` is what the engine
+			// rethrows; assert the column-qualified wording reaches the client.
+			const message = await captureThrowMessage(() =>
+				db.exec(`insert into T (id, v) values (1, 'b')`),
+			);
+			expect(message).to.contain('UNIQUE constraint failed: T.id');
+		} finally {
+			db.close();
+		}
 	});
 
 	it('INSERT OR REPLACE keeps a secondary index consistent (indexed lookup returns the new value)', async () => {
