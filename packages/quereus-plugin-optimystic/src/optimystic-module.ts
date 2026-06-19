@@ -730,24 +730,16 @@ export class OptimysticVirtualTable extends VirtualTable {
           {
             const insertKey = this.rowCodec.extractPrimaryKey(values);
 
-            // Enforce primary-key uniqueness. Staging `[insertKey, ...]` into the
-            // collection B-tree is an upsert — a key that already exists would be
-            // silently OVERWRITTEN rather than rejected, breaking single-use /
-            // anti-replay semantics that rely on PK uniqueness (see fix ticket
-            // optimystic-insert-pk-uniqueness-not-enforced). A `get` through this
-            // same tree sees both rows staged earlier in this transaction and
-            // rows committed by prior transactions, so it catches duplicates in
-            // every case. Throwing here (before markDirtyTrees/stage) leaves this
-            // row unstaged; any rows staged earlier in the statement/transaction
-            // are reverted by the deferred-rollback snapshot on the engine's
-            // rollback.
+            // Staging is an upsert, so a pre-stage get() is the only thing that
+            // rejects a duplicate key instead of silently overwriting it. The get
+            // sees rows staged earlier in this transaction and rows committed by
+            // prior ones. Throwing before markDirtyTrees/stage leaves this row
+            // unstaged; rows staged earlier roll back via the deferred snapshot.
             const existing = await this.collection.get(insertKey);
             if (existing !== undefined) {
-              // ConstraintError (not a plain Error) so Quereus classifies this as
-              // a constraint violation and applies SQL conflict semantics (default
-              // OR ABORT: the offending statement is undone, the surrounding
-              // transaction continues). The catch below rethrows QuereusErrors
-              // unwrapped so this type/code survives to the engine.
+              // ConstraintError (not plain Error) so the engine applies SQL
+              // conflict semantics; the catch below rethrows QuereusErrors verbatim
+              // so the type survives.
               throw new ConstraintError(
                 `UNIQUE constraint failed: ${this.tableName} primary key '${insertKey}'`,
                 StatusCode.CONSTRAINT,
@@ -839,10 +831,8 @@ export class OptimysticVirtualTable extends VirtualTable {
           throw new Error(`Unsupported operation: ${operation}`);
       }
     } catch (error) {
-      // Preserve QuereusErrors (e.g. the uniqueness ConstraintError raised above)
-      // verbatim so the engine sees the real type/code and applies SQL conflict
-      // semantics; wrapping them in a plain Error would downgrade them to an
-      // opaque failure and mask the constraint classification.
+      // Rethrow QuereusErrors verbatim (e.g. the uniqueness ConstraintError) so
+      // the engine keeps the constraint classification; wrapping would mask it.
       if (error instanceof QuereusError) {
         throw error;
       }
