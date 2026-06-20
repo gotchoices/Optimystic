@@ -363,4 +363,37 @@ describe('reactivity / rotation re-registration scheduler', () => {
 		clock.advance(5_000);
 		expect(rec.calls, 'each pending successor fired exactly once').to.have.length(total);
 	});
+
+	it('with eviction active, a within-cap fired successor is still deduped while an evicted (oldest) one degrades to one re-register', () => {
+		const clock = new FakeScheduler();
+		const rec = recorder();
+		const sched = new RotationReRegistrationScheduler({ reRegister: rec.reRegister, setTimer: clock.setTimer, now: clock.clock });
+
+		// Drive enough sequential schedule→fire rotations that eviction is active: `seen` is pinned at the cap and
+		// holds only the `SEEN_LEDGER_CAP` most-recently-added keys, so index 0 has long since been evicted but the
+		// last `SEEN_LEDGER_CAP` indices remain in the ledger.
+		const total = SEEN_LEDGER_CAP + 200;
+		for (let i = 0; i < total; i++) {
+			sched.schedule(notice({ newTopicId: topicForIndex(i), fireAt: clock.now + 1_000 }));
+			clock.advance(1_000);
+		}
+		expect(sched.pendingCount, 'all fired — nothing pending').to.equal(0);
+		expect(sched.seenCount, 'ledger pinned at the cap').to.equal(SEEN_LEDGER_CAP);
+		const movesAfterDrain = rec.calls.length;
+
+		// The most-recently-fired successor (last index) is still in `seen` → a re-surface within the cap window is
+		// still a no-op: no new timer, no extra move. This is the "within-cap re-surface stays deduped" guarantee
+		// holding even though eviction has been running.
+		sched.schedule(notice({ newTopicId: topicForIndex(total - 1), fireAt: clock.now + 1_000 }));
+		expect(sched.pendingCount, 'a within-cap fired successor re-surface is still deduped').to.equal(0);
+		expect(rec.calls, 'no extra re-register for the still-remembered successor').to.have.length(movesAfterDrain);
+
+		// The oldest successor (index 0) was evicted long ago → its re-surface is no longer remembered and degrades
+		// to exactly one harmless idempotent re-register (the documented acceptable behavior past the cap window).
+		sched.schedule(notice({ newTopicId: topicForIndex(0), fireAt: clock.now + 1_000 }));
+		expect(sched.pendingCount, 'an evicted successor re-surface reschedules (one timer)').to.equal(1);
+		clock.advance(1_000);
+		expect(rec.calls, 'exactly one extra re-register for the evicted successor — no more').to.have.length(movesAfterDrain + 1);
+		expect(sched.seenCount, 'still bounded after the degraded re-register').to.be.at.most(SEEN_LEDGER_CAP);
+	});
 });
