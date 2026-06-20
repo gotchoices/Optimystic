@@ -1062,6 +1062,10 @@ function createCoordEngine(ctx: CoordEngineContext, servedCoord: RingCoord, tree
 		topicBudget,
 		bootstrapEvidence: ctx.bootstrapEvidence,
 		verifyRegisterSig: ctx.verifyRegisterSig,
+		// Admission-time replication: enqueue the just-admitted record so siblings hold a replica before the
+		// participant's first renewal touch (closes the accept→first-touch durability window). Same queue +
+		// last-writer-wins as the renewal `gossip.touch`.
+		onAdmit: (rec): void => pending.touch(rec),
 		// A promotion notice signed on an arrival is broadcast to the cohort around this served coord
 		// (and the parent for a demotion). The engine only knows the notice; the host adds the coord.
 		onNotice: (notice): void => ctx.broadcastNotice?.(notice, servedCoord),

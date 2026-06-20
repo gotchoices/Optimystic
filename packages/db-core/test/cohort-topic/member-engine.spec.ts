@@ -6,9 +6,11 @@ import { createRenewalCohortSide } from '../../src/cohort-topic/registration/ren
 import { createTopicBudget } from '../../src/cohort-topic/antidos/topic-budget.js';
 import { createSlotAssigner } from '../../src/cohort-topic/registration/sharding.js';
 import { createRingHash } from '../../src/cohort-topic/ring-hash.js';
-import { bytesEqual } from '../../src/cohort-topic/registration/bytes.js';
+import { bytesEqual, bytesKey } from '../../src/cohort-topic/registration/bytes.js';
 import { DEFAULT_TTL_MS } from '../../src/cohort-topic/registration/types.js';
 import type { RegistrationRecord } from '../../src/cohort-topic/registration/types.js';
+import { createColdStartManager } from '../../src/cohort-topic/coldstart.js';
+import type { RegisterV1 } from '../../src/cohort-topic/wire/types.js';
 
 function bytes(label: string, len = 32): Uint8Array {
 	return sha256(new TextEncoder().encode(label)).slice(0, len);
@@ -132,5 +134,110 @@ describe('cohort-topic / member-engine sweepStale → topic-budget release', () 
 		// Must not throw with no budget to re-touch.
 		const evicted = engine.sweepStale(1_000 + DEFAULT_TTL_MS + 1);
 		expect(evicted.length).to.equal(1);
+	});
+});
+
+describe('cohort-topic / member-engine: onAdmit fires on accept', () => {
+	const hash = createRingHash();
+	const slots = createSlotAssigner(hash);
+	const self = bytes('self-onadmit', 16);
+	const cohortEpoch = bytes('epoch-onadmit', 32);
+	const members = [self];
+	const cohort = (): { members: readonly Uint8Array[]; cohortEpoch: Uint8Array } => ({ members, cohortEpoch });
+
+	/** Minimal stub coldStart: never serves (no forwarder), instantiate is a no-op at tier 0. */
+	const coldStart = createColdStartManager({
+		parentRegistrar: { registerWithParent: (): Promise<void> => Promise.resolve() },
+	});
+
+	it('calls onAdmit with the admitted record when a registration is accepted', async () => {
+		const store = createRegistrationStore();
+		let admittedRecord: RegistrationRecord | undefined;
+
+		const engine = createCohortMemberEngine({
+			self,
+			profile: {} as never,
+			hash,
+			store,
+			slots,
+			willingness: { evaluate: (): { kind: 'accepted' } => ({ kind: 'accepted' }) },
+			promotion: {
+				onParticipantCountChange: (): Promise<undefined> => Promise.resolve(undefined),
+				maybeDemote: (): Promise<undefined> => Promise.resolve(undefined),
+				isPromoted: (): boolean => false,
+				applyPromotionNotice: (): void => {},
+				applyDemotionNotice: (): void => {},
+			},
+			coldStart,
+			traffic: {
+				recordArrival: (): void => {},
+				snapshot: (): { arrivalsPerMin: number; queriesPerMin: number; directParticipants: number } =>
+					({ arrivalsPerMin: 0, queriesPerMin: 0, directParticipants: 0 }),
+			} as never,
+			renewal: unused('renewal'),
+			cohort,
+			quorumWilling: (): boolean => true,
+			onAdmit: (rec): void => { admittedRecord = rec; },
+		});
+
+		const topicId = bytes('onadmit-topic');
+		const participant = bytes('onadmit-participant', 16);
+		const reg: RegisterV1 = {
+			v: 1,
+			topicId: bytesKey(topicId),
+			tier: 0,
+			treeTier: 0,
+			participantCoord: bytesKey(participant),
+			ttl: 90_000,
+			bootstrap: true,
+			timestamp: 1_000,
+			correlationId: bytesKey(bytes('cid-onadmit')),
+			signature: '',
+		};
+
+		const result = await engine.handleRegister(reg, { followOn: false, treeTier: 0 }, 1_000);
+		expect(result.result, 'registration accepted').to.equal('accepted');
+		expect(admittedRecord, 'onAdmit fired with the record').to.not.equal(undefined);
+		expect(admittedRecord!.participantId, 'onAdmit record has the correct participantId').to.deep.equal(participant);
+	});
+
+	it('does not call onAdmit when willingness declines the registration', async () => {
+		const store = createRegistrationStore();
+		let admitCalled = false;
+
+		const engine = createCohortMemberEngine({
+			self,
+			profile: {} as never,
+			hash,
+			store,
+			slots,
+			willingness: { evaluate: (): { kind: 'unwilling_cohort'; retryAfterMs: number } => ({ kind: 'unwilling_cohort', retryAfterMs: 1_000 }) },
+			promotion: unused('promotion'),
+			coldStart,
+			traffic: { recordArrival: (): void => {} } as never,
+			renewal: unused('renewal'),
+			cohort,
+			quorumWilling: (): boolean => true,
+			onAdmit: (): void => { admitCalled = true; },
+		});
+
+		const topicId = bytes('onadmit-reject-topic');
+		const participant = bytes('onadmit-reject-participant', 16);
+		const reg: RegisterV1 = {
+			v: 1,
+			topicId: bytesKey(topicId),
+			tier: 0,
+			treeTier: 0,
+			participantCoord: bytesKey(participant),
+			ttl: 90_000,
+			bootstrap: true,
+			timestamp: 1_000,
+			correlationId: bytesKey(bytes('cid-onadmit-reject')),
+			signature: '',
+		};
+
+		const result = await engine.handleRegister(reg, { followOn: false, treeTier: 0 }, 1_000);
+		expect(result.result, 'registration declined').to.equal('unwilling_cohort');
+		expect(admitCalled, 'onAdmit must not fire on rejection').to.equal(false);
 	});
 });

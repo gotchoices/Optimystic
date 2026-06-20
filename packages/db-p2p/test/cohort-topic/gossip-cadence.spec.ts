@@ -343,6 +343,39 @@ describe('cohort-topic: two-node replication via a gossip round', () => {
 		return { a: { host: hostA, node: nodeA, member: a }, b: { host: hostB, node: nodeB, member: b }, coord0 };
 	}
 
+	it('an admitted record replicates to a sibling in one gossip round with no intervening renewal touch', async () => {
+		// This test exercises the admission-time `onAdmit` hook: a record admitted on A must appear on B
+		// after one gossip round even if no `handleRenew`/reattach fires first.
+		const { a, b, coord0 } = await twoNodeCohort();
+		const participant = await makeMember();
+		const eA = a.host.registry.forCoord(coord0, 0 as Tier, participant.bytes);
+		const eB = b.host.registry.forCoord(coord0, 0 as Tier, participant.bytes);
+		const epoch = eA.cohort().cohortEpoch;
+
+		// Seed A's view with B's willingness so the 2-of-2 quorum is met and A can admit.
+		deliverGossip(a.node, await signedGossip(b.member, coord0, epoch, { willingnessBits: 'f' }), b.member.peerId);
+		await delay(30);
+
+		const now = Date.now();
+		const result = await eA.engine.handleRegister(
+			await signedRegister(participant, TOPIC, 90_000, now),
+			{ followOn: false, treeTier: 0 },
+			now,
+		);
+		expect(result.result, 'A admits the registration').to.equal('accepted');
+		// No handleRenew — that is the whole point: the onAdmit hook, not renewal, must queue the delta.
+
+		const g = await eA.gossipRound(now);
+		expect(g?.records?.length, 'the admitted record was drained from the queue with no renewal').to.equal(1);
+		deliverGossip(b.node, encodeCohortMessage(g!), a.member.peerId);
+		await delay(30);
+
+		expect(eB.holds(TOPIC, participant.bytes), 'B replicated the record via admission-time gossip, not renewal').to.equal(true);
+
+		await a.host.stop();
+		await b.host.stop();
+	});
+
 	it('a touched record + willingness propagate from node A to node B in one gossip round; an eviction converges', async () => {
 		const { a, b, coord0 } = await twoNodeCohort();
 		const participant = await makeMember();

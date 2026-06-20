@@ -111,6 +111,16 @@ export interface CohortMemberEngineDeps {
 	 * can reject when the cohort quorum is unreachable) rather than swallow it. Absent → silent.
 	 */
 	readonly log?: (formatter: string, ...args: unknown[]) => void;
+	/**
+	 * Sink for a freshly-admitted registration record (the `accept` path), symmetric to the renewal
+	 * `gossip.touch` hook. db-p2p wires this to the same per-coord gossip delta queue the renewal side
+	 * appends to, so an admitted record is replicated to the cohort at the next gossip round — closing the
+	 * durability window between admission and the participant's first renewal touch. A queue append, not a
+	 * synchronous broadcast: admission must not block on a round, and last-writer-wins by `lastPing` dedupes
+	 * an admit-then-touch landing in the same round. Absent → no admission-time replication (unit/mock flows
+	 * that don't exercise gossip).
+	 */
+	readonly onAdmit?: (rec: RegistrationRecord) => void;
 }
 
 /** Cohort-side register/renew handler — the body of the FRET activity callback. */
@@ -241,6 +251,7 @@ class StoreCohortMemberEngine implements CohortMemberEngine {
 			appState: reg.appPayload === undefined ? undefined : b64urlToBytes(reg.appPayload),
 		};
 		this.deps.store.put(record);
+		this.deps.onAdmit?.(record);
 		this.deps.traffic.recordArrival(topicId, now);
 		this.deps.topicBudget?.touch(topicId, this.deps.store.directParticipants(topicId));
 		// Promotion may fire on this arrival; broadcast whatever notice comes back. Fire-and-forget so the
