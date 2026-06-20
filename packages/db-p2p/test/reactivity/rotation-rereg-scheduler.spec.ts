@@ -1,6 +1,6 @@
 import { expect } from 'chai';
 import { bytesToB64url, type ReRegistrationPlan } from '@optimystic/db-core';
-import { RotationReRegistrationScheduler, type RotationTimerCancel } from '../../src/reactivity/rotation-rereg-scheduler.js';
+import { RotationReRegistrationScheduler, SEEN_LEDGER_CAP, type RotationTimerCancel } from '../../src/reactivity/rotation-rereg-scheduler.js';
 import type { RotationNotice } from '../../src/reactivity/subscription-manager.js';
 
 // --- fixtures ---------------------------------------------------------------
@@ -105,6 +105,9 @@ function recorder(opts: { rejectTopics?: Uint8Array[]; throwTopics?: Uint8Array[
 
 /** Flush the microtask + macrotask queue so a swallowed rejection settles before the assertion. */
 const flush = (): Promise<void> => new Promise((resolve) => setTimeout(resolve, 0));
+
+/** A distinct 2-byte successor topic for index `i` (little-endian) — 65 536 distinct values, plenty for ≥10k. */
+const topicForIndex = (i: number): Uint8Array => new Uint8Array([i & 0xff, (i >> 8) & 0xff]);
 
 // --- tests ------------------------------------------------------------------
 
@@ -314,5 +317,50 @@ describe('reactivity / rotation re-registration scheduler', () => {
 		await flush();
 		expect(rec.calls, 'the default setTimeout binding fired the move').to.have.length(1);
 		sched.stop();
+	});
+
+	it('bounds the de-dupe ledger under unbounded sequential rotations (schedule→fire 10k distinct successors)', () => {
+		const clock = new FakeScheduler();
+		const rec = recorder();
+		const sched = new RotationReRegistrationScheduler({ reRegister: rec.reRegister, setTimer: clock.setTimer, now: clock.clock });
+
+		const ROTATIONS = 10_000;
+		for (let i = 0; i < ROTATIONS; i++) {
+			// Each successor schedules, then its timer fires before the next — the realistic long-lived shape where
+			// `pending` drops back to ~0 between successors, so the bound is purely `SEEN_LEDGER_CAP`.
+			sched.schedule(notice({ newTopicId: topicForIndex(i), fireAt: clock.now + 1_000 }));
+			expect(sched.pendingCount, 'exactly one pending timer between fires').to.equal(1);
+			clock.advance(1_000); // fire this successor's timer before scheduling the next
+			expect(sched.pendingCount, 'pending drops back to 0 after the fire').to.equal(0);
+			expect(sched.seenCount, 'ledger never exceeds the cap').to.be.at.most(SEEN_LEDGER_CAP);
+		}
+
+		expect(rec.calls, 'every distinct successor moved exactly once').to.have.length(ROTATIONS);
+		expect(sched.seenCount, 'ledger pinned at the cap once well past it').to.equal(SEEN_LEDGER_CAP);
+	});
+
+	it('never evicts a still-pending successor: a duplicate notice for the oldest pending key is a no-op', () => {
+		const clock = new FakeScheduler();
+		const rec = recorder();
+		const sched = new RotationReRegistrationScheduler({ reRegister: rec.reRegister, setTimer: clock.setTimer, now: clock.clock });
+
+		// Schedule more than a cap's worth of successors WITHOUT firing any — all stay pending, so eviction must
+		// skip every one of them and the ledger is allowed to grow with `pending` past the cap.
+		const total = SEEN_LEDGER_CAP + 50;
+		for (let i = 0; i < total; i++) {
+			sched.schedule(notice({ newTopicId: topicForIndex(i), fireAt: 5_000 }));
+		}
+		expect(sched.pendingCount, 'all successors are still pending (none fired)').to.equal(total);
+		expect(sched.seenCount, 'ledger grew with pending rather than evicting a live key').to.equal(total);
+		expect(clock.delays, 'one timer armed per distinct successor').to.have.length(total);
+
+		// Re-issue a duplicate notice for the FIRST (oldest) successor — if it had been evicted from `seen`, this
+		// would pass the `seen.has` check and arm a SECOND timer over the live one. It must instead be a no-op.
+		sched.schedule(notice({ newTopicId: topicForIndex(0), fireAt: 9_999 }));
+		expect(sched.pendingCount, 'the oldest pending key was not evicted → duplicate is a no-op').to.equal(total);
+		expect(clock.delays, 'no second timer armed for the oldest pending successor').to.have.length(total);
+
+		clock.advance(5_000);
+		expect(rec.calls, 'each pending successor fired exactly once').to.have.length(total);
 	});
 });

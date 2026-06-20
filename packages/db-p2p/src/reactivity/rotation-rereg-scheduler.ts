@@ -37,7 +37,13 @@
  * **Idempotence.** De-duped by successor `newTopicId` (base64url): a second notice for a successor already
  * scheduled or fired is ignored. The manager already fires once per successor (its `rotationHandledFor`
  * guard), but a redirect and a pre-announce can surface the **same** successor near-simultaneously, so the
- * scheduler is independently idempotent.
+ * scheduler is independently idempotent. The de-dupe ledger (`seen`) survives the timer fire (so a late
+ * re-surface of an already-fired successor stays a no-op), which on the normal schedule→fire path would let it
+ * grow without bound across a long-lived, fast-rotating subscription. It is therefore **bounded**: capped at
+ * `SEEN_LEDGER_CAP` entries with oldest-first eviction (insertion order), and eviction **never** drops a key
+ * still in `pending` — that would break the "every pending key ∈ `seen`" invariant and could let a duplicate
+ * notice for a pending successor arm a second timer over the live one. A re-surface older than the cap (≥ cap
+ * distinct successors later) degrades to at most one harmless, idempotent re-register.
  *
  * **Chained rotation OLD→A→B** before A's timer fires → A and B are distinct successors → two independent
  * timers; **both may fire**. Re-registering at A and then immediately rotating A→B is self-correcting via the
@@ -50,6 +56,15 @@ import type { RotationNotice } from "./subscription-manager.js";
 import { createLogger } from "../logger.js";
 
 const log = createLogger("reactivity-rotation-rereg");
+
+/**
+ * Upper bound on the idempotence ledger (`seen`). Far above any realistic count of *concurrently-pending*
+ * successors (single digits: 1 in the normal case, a handful across a chained rotation), so it never evicts a
+ * still-live entry in practice while keeping the ledger's memory to tens of KB of short base64url strings at the
+ * ceiling. Tunable — raising it widens the late-re-surface de-dupe window at a proportional memory cost.
+ * Exported for the regression test that asserts the bound; production callers don't read it.
+ */
+export const SEEN_LEDGER_CAP = 1024;
 
 /** Cancel handle returned by an injected timer; cancels a not-yet-fired timer (safe no-op after fire/cancel). */
 export type RotationTimerCancel = () => void;
@@ -98,7 +113,11 @@ export class RotationReRegistrationScheduler {
 
 	/** Successors with a still-pending timer, keyed by base64url `newTopicId` → its cancel handle. */
 	private readonly pending = new Map<string, RotationTimerCancel>();
-	/** Successors ever scheduled (pending **or** already fired) — the idempotence ledger that survives fire. */
+	/**
+	 * Successors recently scheduled (pending **or** already fired) — the idempotence ledger that survives fire.
+	 * Insertion-ordered and **bounded** at {@link SEEN_LEDGER_CAP}: {@link evictSeenOverCap} drops the oldest
+	 * non-pending entries once over cap (never a still-pending key — see that method's doc).
+	 */
 	private readonly seen = new Set<string>();
 	private stopped = false;
 
@@ -111,6 +130,14 @@ export class RotationReRegistrationScheduler {
 	/** Successors with a timer still pending (not yet fired/cancelled). Diagnostic / test seam. */
 	get pendingCount(): number {
 		return this.pending.size;
+	}
+
+	/**
+	 * Size of the idempotence ledger (pending + recently-fired-and-retained). Diagnostic / test seam; the
+	 * regression test asserts this stays ≤ {@link SEEN_LEDGER_CAP} under unbounded sequential rotations.
+	 */
+	get seenCount(): number {
+		return this.seen.size;
 	}
 
 	/**
@@ -135,6 +162,11 @@ export class RotationReRegistrationScheduler {
 			this.fire(key, plan);
 		}, delayMs);
 		this.pending.set(key, cancel);
+		// Bound `seen` only AFTER the new key is in `pending`, so eviction sees it as live and never drops it (the
+		// "every pending key ∈ seen" invariant). Were this run before `pending.set`, the just-added key would be the
+		// one non-pending candidate whenever `pending` is at the cap, and would be wrongly evicted then immediately
+		// re-added to `pending` — a pending key absent from `seen`, which a duplicate notice could then re-arm over.
+		this.evictSeenOverCap();
 		log("scheduled rotation re-registration for successor topic=%s in %dms (preAnnounced=%s)", key, delayMs, notice.preAnnounced);
 	}
 
@@ -174,6 +206,31 @@ export class RotationReRegistrationScheduler {
 		}
 		this.pending.clear();
 		this.seen.clear();
+	}
+
+	/**
+	 * Bound the idempotence ledger: evict the oldest entries (insertion order) that are **not** still pending,
+	 * until back within {@link SEEN_LEDGER_CAP}. Never evicts a pending key — that would break the "every pending
+	 * key ∈ `seen`" invariant and could double-fire a successor whose later duplicate notice then re-armed a timer
+	 * over the live one. If every over-cap entry is somehow still pending (`pending.size > cap` — not reachable in
+	 * practice, since pending successors are the most recently scheduled), the loop bails and the ledger is left to
+	 * grow with `pending` this round; it returns within cap as soon as those timers fire and a later schedule runs.
+	 */
+	private evictSeenOverCap(): void {
+		while (this.seen.size > SEEN_LEDGER_CAP) {
+			let evicted = false;
+			for (const key of this.seen) { // insertion order: oldest first
+				if (!this.pending.has(key)) {
+					this.seen.delete(key);
+					log("rotation re-registration ledger at cap (%d) — evicted oldest fired successor topic=%s", SEEN_LEDGER_CAP, key);
+					evicted = true;
+					break;
+				}
+			}
+			if (!evicted) {
+				break;
+			}
+		}
 	}
 
 	/** Timer callback: drop the pending entry, then invoke the isolated re-registration (unless stopped). */
