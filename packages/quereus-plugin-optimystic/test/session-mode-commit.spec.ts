@@ -312,14 +312,12 @@ describe('Session-mode commit/rollback composition (real consensus, in-memory)',
 
 /**
  * On-disk durability across a full reopen (fresh Database + factory + transactor)
- * through the consensus path. SKIPPED on win32 because db-p2p-storage-fs names
- * pend/action files `<actionId>.json` and the coordinator's `tx:<hash>` action
- * ids contain a colon — illegal in a Windows filename (EINVAL on the pend→actions
- * rename). Tracked by backlog `optimystic-filestorage-colon-actionid-windows`.
- * Runs on POSIX, where it is the strongest persistence proof.
+ * through the consensus path. Previously skipped on win32 because db-p2p-storage-fs
+ * was writing raw `tx:<hash>.json` filenames (colon illegal on Windows). Fixed by
+ * percent-encoding colons in `FileRawStorage` path helpers.
  */
-const reopenIt = process.platform === 'win32' ? it.skip : it;
-describe('Session-mode commit reopen durability (local/FileRawStorage, POSIX only)', function () {
+const reopenIt = it;
+describe('Session-mode commit reopen durability (local/FileRawStorage, all platforms)', function () {
 	this.timeout(20000);
 
 	let dir: string;

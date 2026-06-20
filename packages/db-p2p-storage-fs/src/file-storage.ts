@@ -6,6 +6,16 @@ import { createLogger } from './logger.js';
 
 const log = createLogger('storage:file');
 
+// Colons are illegal in Windows filenames; encode them so action ids like
+// `tx:<hash>` and `stamp:<hash>` round-trip safely on all platforms.
+function encodeActionIdForFilename(actionId: ActionId): string {
+	return actionId.replace(/:/g, '%3A');
+}
+
+function decodeFilenameToActionId(filename: string): ActionId {
+	return filename.replace(/%3A/g, ':') as ActionId;
+}
+
 export class FileRawStorage implements IRawStorage {
 	constructor(private readonly basePath: string) {
 		// TODO: use https://www.npmjs.com/package/proper-lockfile to take a lock on the basePath, also introduce explicit dispose pattern
@@ -58,9 +68,10 @@ export class FileRawStorage implements IRawStorage {
 		const files = await fs.readdir(pendingPath).catch((err) => { log('listPendingTransactions readdir failed for %s - %o', blockId, err); return [] as string[]; });
 		for (const file of files) {
 			if (!file.endsWith('.json')) continue;
-			const rawActionId = file.slice(0, -5);
-			if (!/^[\w\d]+-[\w\d]+-[\w\d]+-[\w\d]+-[\w\d]+$/.test(rawActionId)) continue;
-			yield rawActionId as ActionId;
+			const actionId = decodeFilenameToActionId(file.slice(0, -5));
+			// Accept legacy base64url UUID format and consensus tx:/stamp: format.
+			if (!/^(?:[\w\d]+-[\w\d]+-[\w\d]+-[\w\d]+-[\w\d]+|(?:tx|stamp):[0-9a-f]+)$/.test(actionId)) continue;
+			yield actionId;
 		}
 	}
 
@@ -162,15 +173,15 @@ export class FileRawStorage implements IRawStorage {
 	}
 
 	private getPendingActionPath(blockId: BlockId, actionId: ActionId): string {
-		return path.join(this.getBlockPath(blockId), 'pend', `${actionId}.json`);
+		return path.join(this.getBlockPath(blockId), 'pend', `${encodeActionIdForFilename(actionId)}.json`);
 	}
 
 	private getActionPath(blockId: BlockId, actionId: ActionId): string {
-		return path.join(this.getBlockPath(blockId), 'actions', `${actionId}.json`);
+		return path.join(this.getBlockPath(blockId), 'actions', `${encodeActionIdForFilename(actionId)}.json`);
 	}
 
 	private getMaterializedPath(blockId: BlockId, actionId: ActionId): string {
-		return path.join(this.getBlockPath(blockId), 'blocks', `${actionId}.json`);
+		return path.join(this.getBlockPath(blockId), 'blocks', `${encodeActionIdForFilename(actionId)}.json`);
 	}
 
 	private async readIfExists<T>(filePath: string): Promise<T | undefined> {
