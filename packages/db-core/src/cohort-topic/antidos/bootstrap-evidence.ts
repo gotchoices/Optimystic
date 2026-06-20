@@ -14,8 +14,11 @@
  * This module is the *policy* — which evidence kinds satisfy which tier. The cryptographic checks
  * themselves (verifying a PoW, a reputation signature, a parent-topic reference) are injected, keeping
  * db-core free of any specific PoW/reputation scheme (the same injection discipline as the threshold
- * crypto port). The evidence travels in the registration's opaque `appPayload`; the injected verifiers
- * decode and check it. A registration that is not a bootstrap needs no evidence and is admitted.
+ * crypto port). The evidence travels in the registration's dedicated, signature-covered
+ * `bootstrapEvidence` field — a versioned `BootstrapEvidenceEnvelopeV1`
+ * (`./bootstrap-evidence-envelope.js`), parsed crypto-free here and checked by the injected verifiers;
+ * NOT the opaque `appPayload` slot (which the cohort copies verbatim into the registration's appState).
+ * A registration that is not a bootstrap needs no evidence and is admitted.
  */
 
 import type { RegisterV1 } from "../wire/types.js";

@@ -66,7 +66,10 @@ export type WalkOutcome = AcceptedWalkOutcome | PromotedWalkOutcome | RetryLater
 export interface RegisterMessageFactory {
 	/**
 	 * Produce a signed `RegisterV1` for this participant at walk position `treeTier`. `bootstrap` is
-	 * set only on the root cold-start re-issue. `appPayload` is the opaque application slot.
+	 * set only on the root cold-start re-issue. `appPayload` is the opaque application slot. On the
+	 * bootstrap re-issue the factory may additionally mint and attach the signed `bootstrapEvidence`
+	 * envelope (§Anti-DoS) via the injected builder seam before signing — keyed off `bootstrap`, so no
+	 * extra build parameter is needed (the walk decides `bootstrap` internally, not the application).
 	 */
 	build(params: {
 		topicId: Uint8Array;

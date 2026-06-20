@@ -745,7 +745,7 @@ The layer relies on a small handful of structural defenses against malicious reg
 - **Per-peer rate limits per cohort.** Cohort members track inbound `RegisterV1` rate per source `PeerId`. Default ceiling is 4 per minute per peer per topic at any single cohort. Exceeded → `UnwillingCohort(retryAfter)` with exponential `retryAfter`.
 - **Per-cohort topic budget.** A cohort holds at most `topics_max` (default 2048) topics with forwarder state. When the budget is exhausted, new topic instantiations are refused with `UnwillingCohort`; existing topics continue. Eviction within the budget is LRU by participant count; topics with zero recent registrations are dropped first.
 - **Signed registrations.** Every `RegisterV1` carries a `correlationId` (16 random bytes) and a signature from the participant's peer key over `(topicId, tier, correlationId, timestamp)`. Stale-timestamp or replayed-correlationId messages are dropped.
-- **Bootstrap requires evidence.** A cold root accepting `bootstrap: true` requires the registration to carry one of: a small proof-of-work, a signature from a peer with a sufficient reputation score ([architecture.md](architecture.md) §Reputation), or a signed reference to a parent topic that does exist. Specifics depend on the application's tier — T0/T1 topics generally don't need PoW because they correspond to committed work; T2/T3 topics do.
+- **Bootstrap requires evidence.** A cold root accepting `bootstrap: true` requires the registration to carry one of: a small proof-of-work, a signature from a peer with a sufficient reputation score ([architecture.md](architecture.md) §Reputation), or a signed reference to a parent topic that does exist. Specifics depend on the application's tier — T0/T1 topics generally don't need PoW because they correspond to committed work; T2/T3 topics do. The evidence rides in a **dedicated, signature-covered** `RegisterV1.bootstrapEvidence` field — a versioned `BootstrapEvidenceEnvelopeV1` (`{ v, pow?, parentRef?, reputation? }`), base64url-encoded — **not** in the opaque `appPayload` slot (which the cohort copies verbatim into the registration's `appState` and replicates cluster-wide; overloading it would displace the real appState on the very register that needs it). Every kind binds the same canonical `(topicId, tier, participantCoord, timestamp)` tuple so a captured proof cannot be replayed for a different topic, tier, peer, or (within the replay window) time. The envelope format and the PoW preimage/difficulty are db-core (`antidos/bootstrap-evidence-envelope.ts`, crypto-free); the actual hashing and signature checks are db-p2p-injected.
 
 The layer does not attempt to defend against unbounded Sybil attacks at the registration level; those are FRET's and the reputation subsystem's concern.
 
@@ -1004,11 +1004,25 @@ interface RegisterV1 {
   ttl:             number             // ms, default 90000
   bootstrap?:      boolean            // true on root cold-start request
   appPayload?:     string             // opaque, application-defined
+  bootstrapEvidence?: string          // cold-start evidence envelope, base64url (see note); only on bootstrap
   timestamp:       number             // unix ms
   correlationId:   string             // 16 bytes random
   signature:       string             // participant peer-key signature over the body (minus signature)
 }
 ```
+
+> **Bootstrap evidence.** `bootstrapEvidence` is a **dedicated, signed** field (not `appPayload`) carrying
+> the cold-start anti-DoS proof a root demands when `bootstrap: true` (§Anti-DoS). It is the base64url
+> encoding of a versioned `BootstrapEvidenceEnvelopeV1` — `{ v: 1, pow?: { nonce }, parentRef?:
+> { parentTopicId, sig }, reputation?: { referee, sig } }`, each kind's bytes base64url — and is **covered
+> by `signature`** (a fixed slot in `registerSigningPayload`, normalized to `null` when absent, with an
+> empty string treated as absent), so a MITM cannot strip or swap it and the cohort never stores it as
+> appState. PoW binds `hash(boundImage ‖ nonce)` having ≥ difficulty leading zero bits; `parentRef` /
+> `reputation` sign the bound image directly. The bound image is the canonical tuple
+> `["BootstrapEvidenceV1", topicId, tier, participantCoord, timestamp]` (UTF-8 JSON array), so evidence is
+> non-replayable across topic / tier / peer / time. The envelope + bound image + PoW preimage/difficulty
+> are crypto-free db-core (`antidos/bootstrap-evidence-envelope.ts`); db-p2p binds the hashing and the
+> PoW / reputation / parent-reference verifiers.
 
 > **Participant signature.** `signature` is the participant's libp2p peer-key (Ed25519) signature over
 > the deterministic byte image of the body **minus** the `signature` field

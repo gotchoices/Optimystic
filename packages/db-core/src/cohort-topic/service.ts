@@ -152,6 +152,22 @@ export interface CohortTopicServiceDeps {
 	readonly verifier: MembershipVerifier;
 	/** Monotonic-ish wall clock (unix ms); injectable for tests. Default `Date.now`. */
 	readonly clock?: () => number;
+	/**
+	 * Optional cold-start bootstrap-evidence builder (db-p2p supplies it). Invoked **only** on the
+	 * bootstrap re-issue (when the walk sets `bootstrap: true`), with the register's own canonical
+	 * fields — the same `(topicId, tier, participantCoord, timestamp)` tuple a verifier binds via
+	 * `bootstrapBoundImage`. It returns the serialized `BootstrapEvidenceEnvelopeV1` bytes (or
+	 * `undefined` to attach none); the bytes are set on `RegisterV1.bootstrapEvidence` **before** the
+	 * body is signed, so the participant signature covers them and a MITM cannot strip or swap the proof.
+	 * Absent (default) → no evidence is attached, exactly today's behavior. The minting logic (PoW
+	 * search, reputation/parent-ref signing) is the db-p2p follow-on.
+	 */
+	readonly buildBootstrapEvidence?: (params: {
+		readonly topicId: string;
+		readonly tier: number;
+		readonly participantCoord: string;
+		readonly timestamp: number;
+	}) => Promise<Uint8Array | undefined>;
 	readonly config?: CohortServiceConfig;
 }
 
@@ -324,6 +340,17 @@ class WalkRegisterService implements CohortTopicService {
 				};
 				if (params.bootstrap) {
 					body.bootstrap = true;
+					// Attach cold-start evidence BEFORE signing (so the signature covers it). Bind the
+					// builder to the body's own canonical fields — the exact tuple a verifier reconstructs.
+					const evidence = await this.deps.buildBootstrapEvidence?.({
+						topicId: body.topicId,
+						tier: body.tier,
+						participantCoord: body.participantCoord,
+						timestamp: body.timestamp,
+					});
+					if (evidence !== undefined && evidence.length > 0) {
+						body.bootstrapEvidence = bytesToB64url(evidence);
+					}
 				}
 				if (params.appPayload !== undefined) {
 					body.appPayload = bytesToB64url(params.appPayload);

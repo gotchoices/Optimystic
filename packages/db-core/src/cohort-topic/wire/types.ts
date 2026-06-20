@@ -30,6 +30,17 @@ export interface RegisterV1 {
 	bootstrap?: boolean;
 	/** Opaque application-defined bytes, base64url. */
 	appPayload?: string;
+	/**
+	 * Cold-start bootstrap-evidence envelope, base64url (a `BootstrapEvidenceEnvelopeV1` — see
+	 * `../antidos/bootstrap-evidence-envelope.js`). Present only on a `bootstrap: true` root register;
+	 * carries the tier-dependent proof a cold root demands (proof-of-work / reputation endorsement /
+	 * signed parent reference — §Anti-DoS). This is a **dedicated** field, NOT `appPayload`: the cohort
+	 * copies `appPayload` verbatim into the registration's `appState` and replicates it cluster-wide,
+	 * whereas the bootstrap evidence is parsed-and-checked by the substrate, **covered by `signature`**
+	 * (so a MITM cannot strip or swap it), and never stored as appState. Empty string is treated as
+	 * absent (it normalizes to the same signed-image placeholder as an absent field).
+	 */
+	bootstrapEvidence?: string;
 	/** Unix ms. */
 	timestamp: number;
 	/** 16 random bytes, base64url. */

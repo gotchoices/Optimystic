@@ -10,8 +10,8 @@
  * for the threshold-signed notices, determinism comes from encoding an explicitly-ordered JSON
  * array (array order is stable, unlike object key order) as UTF-8 — never the `signature` envelope.
  * Optional fields are normalized to a fixed placeholder (`bootstrap`→`false`, `appPayload`→`null`,
- * `reattach`→`false`) so an absent optional and a present-but-default optional can never disagree
- * across the wire round-trip.
+ * `bootstrapEvidence`→`null` with an empty string treated as absent, `reattach`→`false`) so an
+ * absent optional and a present-but-default optional can never disagree across the wire round-trip.
  */
 
 import type { CohortGossipV1, RegisterV1, RenewV1 } from "./types.js";
@@ -23,6 +23,11 @@ export type RegisterSignable = Omit<RegisterV1, "signature">;
 
 /** A `RenewV1` minus its `signature` envelope — the bytes the participant peer-key-signs. */
 export type RenewSignable = Omit<RenewV1, "signature">;
+
+/** Normalize the optional bootstrap-evidence slot: absent and empty-string both map to `null`. */
+function normalizeEvidence(bootstrapEvidence: string | undefined): string | null {
+	return bootstrapEvidence === undefined || bootstrapEvidence === "" ? null : bootstrapEvidence;
+}
 
 /** Canonical signed byte image of a `RegisterV1` body (every field except `signature`). */
 export function registerSigningPayload(body: RegisterSignable): Uint8Array {
@@ -36,6 +41,7 @@ export function registerSigningPayload(body: RegisterSignable): Uint8Array {
 		body.ttl,
 		body.bootstrap ?? false,
 		body.appPayload ?? null,
+		normalizeEvidence(body.bootstrapEvidence),
 		body.timestamp,
 		body.correlationId,
 	]));

@@ -188,6 +188,13 @@ export function validateRegisterV1(value: unknown): RegisterV1 {
 	if (appPayload !== undefined) {
 		out.appPayload = b64urlField(appPayload, "appPayload", what);
 	}
+	// Bootstrap-evidence envelope (base64url; present only on a `bootstrap: true` register). A non-string
+	// is rejected as malformed; an empty string is treated as absent so it normalizes to the same signed
+	// image placeholder as a missing field (see `registerSigningPayload`'s `normalizeEvidence`).
+	const bootstrapEvidence = optString(obj, "bootstrapEvidence", what);
+	if (bootstrapEvidence !== undefined && bootstrapEvidence !== "") {
+		out.bootstrapEvidence = b64urlField(bootstrapEvidence, "bootstrapEvidence", what);
+	}
 	return out;
 }
 
