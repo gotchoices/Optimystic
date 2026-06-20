@@ -832,6 +832,15 @@ export class OptimysticVirtualTable extends VirtualTable {
             const newKey = this.rowCodec.extractPrimaryKey(values);
             const encodedRow = this.rowCodec.encodeRow(values);
 
+            // Fetch the actual old row before any staging. collection.get() reads
+            // staged-this-tx + committed state, giving the correct old image even
+            // for chained updates within a single transaction. Must precede any
+            // collection.stage() call, which would clear or overwrite the old slot.
+            // Fallback to oldKeyValues (PK-only; index key may be wrong) if the
+            // row is unexpectedly absent — should not happen in valid DML.
+            const oldEntry = await this.collection.get(oldKey) as [string, EncodedRow] | undefined;
+            const oldRow: Row = oldEntry ? this.rowCodec.decodeRow(oldEntry[1]) : (oldKeyValues as Row);
+
             // Stage the main-table change (flushed at commit / restored on
             // rollback). A PK change is staged as delete-old + insert-new so both
             // index halves revert together on rollback.
@@ -882,7 +891,7 @@ export class OptimysticVirtualTable extends VirtualTable {
                   // dropping the entry.
                   await this.indexManager.deleteIndexEntries(existingRow, newKey, txnState?.transactor);
                   await this.indexManager.updateIndexEntries(
-                    oldKeyValues,
+                    oldRow,
                     values,
                     oldKey,
                     newKey,
@@ -927,7 +936,7 @@ export class OptimysticVirtualTable extends VirtualTable {
 
             // Stage all index updates
             await this.indexManager.updateIndexEntries(
-              oldKeyValues,
+              oldRow,
               values,
               oldKey,
               newKey,
@@ -944,6 +953,12 @@ export class OptimysticVirtualTable extends VirtualTable {
           {
             const deleteKey = this.rowCodec.extractPrimaryKey(oldKeyValues);
 
+            // Fetch the actual old row before staging. Staging clears the slot,
+            // so a fetch-after would return nothing. Fallback to oldKeyValues
+            // (PK-only; index key may be wrong) if unexpectedly absent.
+            const delEntry = await this.collection.get(deleteKey) as [string, EncodedRow] | undefined;
+            const oldRow: Row = delEntry ? this.rowCodec.decodeRow(delEntry[1]) : (oldKeyValues as Row);
+
             // Snapshot before staging so a rollback reverts exactly this delete.
             this.markDirtyTrees();
 
@@ -951,7 +966,7 @@ export class OptimysticVirtualTable extends VirtualTable {
             await this.collection.stage([[deleteKey, undefined]]);
 
             // Stage deletes from all indexes
-            await this.indexManager.deleteIndexEntries(oldKeyValues, deleteKey, txnState?.transactor);
+            await this.indexManager.deleteIndexEntries(oldRow, deleteKey, txnState?.transactor);
 
             // Update statistics
             this.statisticsCollector?.decrementRowCount();

@@ -5,9 +5,34 @@
 import { expect } from 'chai';
 import { Database } from '@quereus/quereus';
 import type { SqlValue } from '@quereus/quereus';
+import { KeyRange } from '@optimystic/db-core';
 import register from '../dist/plugin.js';
 
 type Row = Record<string, SqlValue>;
+type Plugin = ReturnType<typeof register>;
+
+const memOptions = () => ({
+	collectionUri: 'tree://unused',
+	transactor: 'test' as const,
+	keyNetwork: 'test' as const,
+	libp2pOptions: {},
+	cache: false,
+	encoding: 'json' as const,
+});
+
+/** Scan a fresh tree and collect all composite tree keys (entry[0]). */
+async function scanIndexKeys(plugin: Plugin, collectionUri: string): Promise<string[]> {
+	const tree = await plugin.collectionFactory.createOrGetCollection({ ...memOptions(), collectionUri });
+	await tree.update();
+	const keys: string[] = [];
+	for await (const treePath of tree.range(new KeyRange<string>(undefined, undefined, true))) {
+		if (tree.isValid(treePath)) {
+			const entry = tree.at(treePath);
+			if (entry) keys.push(entry[0] as string);
+		}
+	}
+	return keys;
+}
 
 const collectRows = async (iter: AsyncIterable<Row>): Promise<Row[]> => {
 	const rows: Row[] = [];
@@ -19,10 +44,11 @@ const collectRows = async (iter: AsyncIterable<Row>): Promise<Row[]> => {
 
 describe('Optimystic Index Support', () => {
 	let db: Database;
+	let plugin: Plugin;
 
 	beforeEach(async () => {
 		db = new Database();
-		const plugin = register(db, {
+		plugin = register(db, {
 			default_transactor: 'test',
 			default_key_network: 'test',
 			enable_cache: false,
@@ -283,6 +309,51 @@ describe('Optimystic Index Support', () => {
 
 			const result = await collectRows(db.eval("SELECT * FROM test_table WHERE value = 'duplicate'"));
 			expect(result).to.have.lengthOf(3);
+		});
+	});
+
+	describe('Index orphan regression (UPDATE/DELETE must not leave stale index entries)', () => {
+		it('UPDATE that changes an indexed column leaves no orphan', async () => {
+			await db.exec(`
+				CREATE TABLE orphan_upd (
+					id INTEGER PRIMARY KEY,
+					cat TEXT
+				) USING optimystic('tree://test/orphan_upd')
+			`);
+			await db.exec(`CREATE INDEX idx_orphan_upd_cat ON orphan_upd(cat)`);
+
+			await db.exec(`INSERT INTO orphan_upd (id, cat) VALUES (1, 'a'), (2, 'b'), (3, 'c')`);
+
+			// Change row 2's indexed column from 'b' to 'z'.
+			await db.exec(`UPDATE orphan_upd SET cat = 'z' WHERE id = 2`);
+
+			// Scan the actual index tree (bypasses the vtab's tracker) — must contain
+			// exactly the three live composite keys: a/1, c/3, z/2.
+			const keys = await scanIndexKeys(plugin, 'tree://test/orphan_upd/index/idx_orphan_upd_cat');
+			expect(keys.length, 'index entry count after UPDATE').to.equal(3);
+			// Old entry for 'b'/id=2 must be gone (was the orphan before the fix).
+			expect(keys.some(k => k.startsWith('b\x00')), "stale 'b' entry is absent").to.be.false;
+			// New entry for 'z'/id=2 must be present.
+			expect(keys.some(k => k.startsWith('z\x00')), "new 'z' entry is present").to.be.true;
+		});
+
+		it('DELETE leaves no orphan index entry', async () => {
+			await db.exec(`
+				CREATE TABLE orphan_del (
+					id INTEGER PRIMARY KEY,
+					cat TEXT
+				) USING optimystic('tree://test/orphan_del')
+			`);
+			await db.exec(`CREATE INDEX idx_orphan_del_cat ON orphan_del(cat)`);
+
+			await db.exec(`INSERT INTO orphan_del (id, cat) VALUES (1, 'a'), (2, 'b'), (3, 'c')`);
+
+			// Delete row 3 — its index entry for 'c' must be removed.
+			await db.exec(`DELETE FROM orphan_del WHERE id = 3`);
+
+			const keys = await scanIndexKeys(plugin, 'tree://test/orphan_del/index/idx_orphan_del_cat');
+			expect(keys.length, 'index entry count after DELETE').to.equal(2);
+			expect(keys.some(k => k.startsWith('c\x00')), "deleted 'c' entry is absent").to.be.false;
 		});
 	});
 });

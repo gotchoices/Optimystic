@@ -200,12 +200,8 @@ describe('Session-mode commit/rollback composition (real consensus, in-memory)',
 			await db.exec(`update Mut set cat = 'z' where id = 2`);
 			await db.exec(`delete from Mut where id = 3`);
 
-			// Main-table state + index-routed queries are correct. (Index queries
-			// re-lookup the main row and Quereus re-checks the predicate, so a
-			// committed update/delete reports correctly even though the index tree
-			// retains an orphan entry for the old value — a PRE-EXISTING index-
-			// maintenance gap reproducible identically in legacy mode, out of scope
-			// here; tracked by backlog `optimystic-index-orphan-on-update-delete`.)
+			// Main-table state and index-routed queries must be correct after
+			// committed update + delete.
 			expect(await selectCount(db, 'select count(*) as c from Mut')).to.equal(2);
 			expect(await selectCount(db, `select count(*) as c from Mut where cat = 'a'`)).to.equal(1);
 			expect(await selectCount(db, `select count(*) as c from Mut where cat = 'z'`)).to.equal(1);
@@ -213,6 +209,12 @@ describe('Session-mode commit/rollback composition (real consensus, in-memory)',
 			expect(await selectCount(db, `select count(*) as c from Mut where cat = 'c'`)).to.equal(0);
 
 			expect(await countTreeEntries(plugin, uri), 'main rows reflect update + delete').to.equal(2);
+			// Index must contain exactly 2 live entries (a/1, z/2) — no orphans
+			// for the old 'b' (updated to 'z') or 'c' (deleted) values.
+			expect(
+				await countTreeEntries(plugin, `${uri}/index/idx_mut_cat`),
+				'index entries match live rows after update + delete',
+			).to.equal(2);
 		} finally {
 			dispose?.();
 			db.close();
