@@ -116,6 +116,7 @@ import {
 	type ParticipantSigner,
 	type PromotionConfig,
 	type PromotionNoticeV1,
+	type RegisterRateLimiter,
 	type RegisterRateLimiterConfig,
 	type RegisterReplyV1,
 	type RegisterV1,
@@ -543,6 +544,12 @@ export async function createCohortTopicHost(node: Libp2p, fret: FretService, opt
 	// per-cohort topic state, which is coord-scoped, and must not share state across coords.
 	const bootstrapEvidence = createBootstrapEvidencePolicy(options.antiDos, log);
 
+	// Node-level `promote`-handler anti-abuse gate (`cohort-topic-promote-handler-verify-amplification`):
+	// a per-(peer, topic) rate limiter (own instance — the register-path limiter is per-coord inside each
+	// engine; this handler is node-level) plus the per-(topic, tier) effectiveAt high-water. Defaults to
+	// `register_rate_per_peer` (4 / min / peer / topic) with exponential back-off.
+	const promoteGate = createPromoteGate(options.antiDos?.rateLimiter);
+
 	const ctx: CoordEngineContext = {
 		hash,
 		addressing,
@@ -639,7 +646,7 @@ export async function createCohortTopicHost(node: Libp2p, fret: FretService, opt
 	// --- protocol handlers + activity callback ---
 	// Await registration so the host is not returned (and dialed) before the five handlers are live —
 	// and, crucially, before the gossip driver below starts ticking (no tick may run on a half-wired node).
-	await registerProtocolHandlers(node, protocols, registry, dispatchRegister, signEndorse, verifier, gossipTransport, publishSink, membershipSource, selfCoord, maxBytes);
+	await registerProtocolHandlers(node, protocols, registry, dispatchRegister, signEndorse, verifier, promoteGate, gossipTransport, publishSink, membershipSource, selfCoord, maxBytes);
 	fret.setActivityHandler(async (activity: string, cohort: string[]): Promise<{ commitCertificate: string }> => {
 		const reg = validateRegisterV1(decodeCohortMessage(b64urlToBytes(activity), maxBytes));
 		const reply = await dispatchRegister(reg, cohort, Date.now());
@@ -1252,6 +1259,42 @@ export type InboundNotice =
 export type NoticeOutcome = "applied" | "untrusted" | "dropped";
 
 /**
+ * Outcome of {@link handleInboundNotice} — the {@link NoticeOutcome}s plus the cheap pre-verify drops the
+ * anti-abuse gate adds before any signature work runs:
+ *
+ * - `"undecodable"`  — the frame is neither a promotion nor a demotion notice.
+ * - `"rate-limited"` — the dialing `(peer, topic)` is over its `register_rate_per_peer` ceiling.
+ * - `"stale"`        — the notice's `effectiveAt` is at or below the last *applied* notice for its
+ *   `(topic, tier)` (a replay / out-of-order frame); dropped before `verifyMessage`.
+ */
+export type InboundNoticeResult = NoticeOutcome | "undecodable" | "rate-limited" | "stale";
+
+/**
+ * Node-level anti-abuse state for the `promote` handler (`cohort-topic-promote-handler-verify-amplification`).
+ * The handler is node-level (one per node, not per coord), so unlike the per-{@link CoordEngine} register-path
+ * guards it owns its own instances here.
+ */
+export interface PromoteGate {
+	/**
+	 * Per-`(peer, topic)` inbound-notice rate limiter (reuses the register-path limiter). A peer streaming
+	 * forged notices at one topic is dropped once it exceeds the ceiling, before any verify / membership work.
+	 */
+	readonly rateLimiter: RegisterRateLimiter;
+	/**
+	 * Per-`(topicId, tier)` high-water of the last *applied* notice's `effectiveAt`. A notice at or below the
+	 * water is a replay / out-of-order frame and is dropped before verification. Updated **only** on an
+	 * `"applied"` outcome (never on an unverified frame), so a forged notice carrying `effectiveAt = Infinity`
+	 * cannot poison the water and lock out legitimate notices.
+	 */
+	readonly highWater: Map<string, number>;
+}
+
+/** Build the default {@link PromoteGate} from the (optional) anti-DoS rate-limiter config. */
+export function createPromoteGate(rateLimiterConfig?: RegisterRateLimiterConfig): PromoteGate {
+	return { rateLimiter: createRegisterRateLimiter(rateLimiterConfig), highWater: new Map<string, number>() };
+}
+
+/**
  * The slice of a {@link CoordEngine} the inbound notice path needs: the cohort coord the signers should
  * belong to (for verification) and the apply hooks. {@link CoordEngine} satisfies this; tests can pass a
  * minimal stand-in.
@@ -1282,6 +1325,14 @@ export function decodeInboundNotice(frame: Uint8Array, maxBytes?: number): Inbou
 }
 
 /**
+ * Per-coord minimum interval (ms) between membership refetches on the inbound `promote` path. Caps the
+ * amplification a flood of forged notices can drive: a stream of verify-misses triggers at most one
+ * `source.fetch()` per coord per this window, while a cold cache / membership rotation still re-fetches
+ * once it elapses (eventual refetch preserved). 60 s mirrors the anti-DoS rate window.
+ */
+export const PROMOTE_REFETCH_MIN_INTERVAL_MS = 60_000;
+
+/**
  * Verify an inbound notice's threshold signature against the cohort `MembershipCertV1` for
  * `target.servedCoord` and, on success, apply it to the target's promotion lifecycle. Returns:
  *
@@ -1292,8 +1343,16 @@ export function decodeInboundNotice(frame: Uint8Array, maxBytes?: number): Inbou
  * - `"applied"`  — verified and applied.
  *
  * The payload is rebuilt with the canonical `sig/payloads` image the signer used — never re-canonicalized
- * independently. The verifier owns the cert lookup + single stale-cert refetch; this function never
- * re-verifies inside the apply step (db-core trusts this gate).
+ * independently. The verifier owns the cert lookup; this function never re-verifies inside the apply step
+ * (db-core trusts this gate).
+ *
+ * **Bounded refetch (anti-amplification).** Both verify calls pass a {@link PROMOTE_REFETCH_MIN_INTERVAL_MS}
+ * refetch bound, so a stream of forged notices drives at most **one** membership `source.fetch()` per coord
+ * per interval rather than one dial per message. Eventual refetch is preserved (full suppression was
+ * rejected: a legitimate sibling-adopt / demotion-to-parent notice whose cohort cert is not yet locally
+ * cached must still be able to fetch it once — see `live-tier.spec.ts` test 4). A node that has cached its
+ * own cohort cert via `onCertPublished` verifies a sibling-adopt notice from cache with zero fetches; a
+ * cold-cache receiver pays one bounded fetch. Per `cohort-topic-promote-handler-verify-amplification`.
  */
 export async function verifyAndApplyNotice(
 	inbound: InboundNotice,
@@ -1315,7 +1374,7 @@ export async function verifyAndApplyNotice(
 	// Narrow on `inbound` (not a destructured `notice`) so the tier field and apply hook are typed per kind.
 	if (inbound.kind === "promotion") {
 		const payload = promotionNoticeSigningPayload(inbound.notice);
-		const result = await verifier.verifyMessage(signers, target.servedCoord, inbound.notice.fromTier, payload, sig);
+		const result = await verifier.verifyMessage(signers, target.servedCoord, inbound.notice.fromTier, payload, sig, { minRefetchIntervalMs: PROMOTE_REFETCH_MIN_INTERVAL_MS, now });
 		if (result !== "verified") {
 			return "untrusted";
 		}
@@ -1323,12 +1382,83 @@ export async function verifyAndApplyNotice(
 		return "applied";
 	}
 	const payload = demotionNoticeSigningPayload(inbound.notice);
-	const result = await verifier.verifyMessage(signers, target.servedCoord, inbound.notice.tier, payload, sig);
+	const result = await verifier.verifyMessage(signers, target.servedCoord, inbound.notice.tier, payload, sig, { minRefetchIntervalMs: PROMOTE_REFETCH_MIN_INTERVAL_MS, now });
 	if (result !== "verified") {
 		return "untrusted";
 	}
 	target.applyDemotionNotice(inbound.notice, now);
 	return "applied";
+}
+
+/**
+ * Full inbound `promote`-frame pipeline with the anti-abuse gate, exported so it is unit-testable without a
+ * live node (`cohort-topic-promote-handler-verify-amplification`). Runs the cheapest checks first — each
+ * step strictly cheaper than the next — so a flood of forged frames is shed before any signature / network
+ * work:
+ *
+ * ```
+ *   decode → per-(peer,topic) rate limit → findServing → effectiveAt high-water → verify+apply
+ * ```
+ *
+ * - **Rate limit** (`gate.rateLimiter`) keys on `(from, topicId)`; an over-rate peer is dropped before the
+ *   `findServing` map scan and the verify, so a peer cannot amplify junk into verify/network work.
+ * - **High-water** (`gate.highWater`, per `(topicId, tier)`) drops a notice whose `effectiveAt` is at or
+ *   below the last *applied* one — a replay / out-of-order frame — before `verifyMessage`. It is advanced
+ *   **only** on an `"applied"` outcome, so a forged frame (which never verifies) cannot poison it.
+ * - The receiver-side `cohortEpoch` is intentionally **not** gated on: the epoch rotates on every
+ *   membership change, so a legitimately in-flight notice can briefly carry the prior epoch right after a
+ *   rotation — making an epoch check a brittle, false-positive-prone filter. The rate limiter + high-water
+ *   are the load-bearing defenses; the bounded refetch (in {@link verifyAndApplyNotice}) caps the network
+ *   amplification on the verify itself.
+ *
+ * `from` is the dialing peer's substrate bytes ({@link peerIdToBytes}); the node handler converts the
+ * libp2p `PeerId` before calling. One-way contract: the caller sends no ack regardless of outcome.
+ */
+export async function handleInboundNotice(
+	frame: Uint8Array,
+	from: Uint8Array,
+	registry: CoordRegistry,
+	verifier: MembershipVerifier,
+	gate: PromoteGate,
+	now: number,
+	maxBytes?: number,
+): Promise<InboundNoticeResult> {
+	const inbound = decodeInboundNotice(frame, maxBytes);
+	if (inbound === undefined) {
+		log("promote: dropped an undecodable notice frame");
+		return "undecodable";
+	}
+	const tier = inbound.kind === "promotion" ? inbound.notice.fromTier : inbound.notice.tier;
+	const topicId = b64urlToBytes(inbound.notice.topicId);
+
+	// Per-(peer, topic) rate limit — before the findServing scan and the verify.
+	if (gate.rateLimiter.check(from, topicId, now).ok === false) {
+		log("promote: rate-limited %s notice for topic %s tier %d", inbound.kind, inbound.notice.topicId, tier);
+		return "rate-limited";
+	}
+
+	const target = registry.findServing(topicId, tier);
+	if (target === undefined) {
+		log("promote: dropped %s notice for topic %s tier %d (no serving engine)", inbound.kind, inbound.notice.topicId, tier);
+		return "dropped";
+	}
+
+	// Freshness / replay gate: drop an at-or-below-high-water notice before the expensive verify.
+	const waterKey = `${inbound.notice.topicId}|${tier}`;
+	const water = gate.highWater.get(waterKey);
+	if (water !== undefined && inbound.notice.effectiveAt <= water) {
+		log("promote: stale %s notice for topic %s tier %d (effectiveAt %d <= high-water %d)", inbound.kind, inbound.notice.topicId, tier, inbound.notice.effectiveAt, water);
+		return "stale";
+	}
+
+	const outcome = await verifyAndApplyNotice(inbound, target, verifier, now);
+	if (outcome === "applied") {
+		// Advance the high-water only on a *verified-and-applied* notice, so a forged frame cannot poison it.
+		gate.highWater.set(waterKey, inbound.notice.effectiveAt);
+	} else {
+		log("promote: %s %s notice for topic %s tier %d", outcome, inbound.kind, inbound.notice.topicId, tier);
+	}
+	return outcome;
 }
 
 /**
@@ -1395,6 +1525,7 @@ async function registerProtocolHandlers(
 	dispatchRegister: (reg: RegisterV1, fretCohort: readonly string[] | undefined, now: number) => Promise<RegisterReplyV1>,
 	signEndorse: (request: SignRequestV1, fromPeerStr: string) => Promise<SignReplyV1>,
 	verifier: MembershipVerifier,
+	promoteGate: PromoteGate,
 	gossipTransport: FretCohortGossipTransport,
 	publishSink: FretMembershipPublishSink,
 	membershipSource: FretMembershipSource,
@@ -1422,22 +1553,12 @@ async function registerProtocolHandlers(
 			return undefined;
 		}, maxBytes)),
 
-		// promote: threshold-signed promotion/demotion notices (one-way, gossip-style fan-out). Decode the
-		// notice, resolve the local engine for its cohort, verify the quorum signature against that cohort's
-		// MembershipCertV1, and apply it to the engine's promotion lifecycle. Untrusted / undeliverable
-		// notices are dropped (logged) — never throw on the stream.
-		node.handle(protocols.promote, makeFrameHandler(async (frame): Promise<Uint8Array | undefined> => {
-			const inbound = decodeInboundNotice(frame, maxBytes);
-			if (inbound === undefined) {
-				log("promote: dropped an undecodable notice frame");
-				return undefined;
-			}
-			const tier = inbound.kind === "promotion" ? inbound.notice.fromTier : inbound.notice.tier;
-			const target = registry.findServing(b64urlToBytes(inbound.notice.topicId), tier);
-			const outcome = await verifyAndApplyNotice(inbound, target, verifier, Date.now());
-			if (outcome !== "applied") {
-				log("promote: %s %s notice for topic %s tier %d", outcome, inbound.kind, inbound.notice.topicId, tier);
-			}
+		// promote: threshold-signed promotion/demotion notices (one-way, gossip-style fan-out). The dialing
+		// peer arrives as `from`, so the handler can gate per-(peer, topic) before any expensive work. The
+		// full pipeline (rate limit → findServing → effectiveAt high-water → verify+apply, bounded
+		// refetch) lives in the exported `handleInboundNotice`; it logs and never throws on the stream.
+		node.handle(protocols.promote, makeFrameHandler(async (frame, from): Promise<Uint8Array | undefined> => {
+			await handleInboundNotice(frame, peerIdToBytes(from), registry, verifier, promoteGate, Date.now(), maxBytes);
 			return undefined; // one-way: match the gossip-style fan-out (no ack frame)
 		}, maxBytes)),
 

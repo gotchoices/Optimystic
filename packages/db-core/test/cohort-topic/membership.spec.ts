@@ -93,6 +93,35 @@ describe('cohort-topic / membership verification', () => {
 		expect(source.fetchCalls, 'still exactly one refetch').to.equal(1);
 	});
 
+	it('a refetch bound rate-limits the stale-cert refetch to one per coord per interval', async () => {
+		const source = new MockSource(undefined, encodeCohortMessage(buildCert(STALE_MEMBERS))); // refetch never satisfies
+		const { v } = verifier(source);
+		v.cache(buildCert(STALE_MEMBERS)); // cached cert lacks the message signers → every attempt misses
+		const bound = { minRefetchIntervalMs: 60_000, now: 1_000 };
+
+		// First miss within the window refetches exactly once.
+		expect(await v.verifyMessage(MESSAGE_SIGNERS, COORD, 2, PAYLOAD, SIG, bound)).to.equal('untrusted');
+		expect(source.fetchCalls, 'first miss refetches once').to.equal(1);
+
+		// A flood of further misses inside the interval drives no additional refetch.
+		for (let i = 0; i < 20; i++) {
+			expect(await v.verifyMessage(MESSAGE_SIGNERS, COORD, 2, PAYLOAD, SIG, { minRefetchIntervalMs: 60_000, now: 1_000 + i })).to.equal('untrusted');
+		}
+		expect(source.fetchCalls, 'further misses inside the interval are suppressed').to.equal(1);
+
+		// Past the interval, one more refetch is permitted.
+		expect(await v.verifyMessage(MESSAGE_SIGNERS, COORD, 2, PAYLOAD, SIG, { minRefetchIntervalMs: 60_000, now: 61_001 })).to.equal('untrusted');
+		expect(source.fetchCalls, 'a refetch is allowed again after the interval').to.equal(2);
+	});
+
+	it('a refetch bound still refetches once on a cold cache (eventual refetch preserved)', async () => {
+		const source = new MockSource(undefined, encodeCohortMessage(GOOD)); // no current seed; refetch returns GOOD
+		const { v } = verifier(source);
+		const r = await v.verifyMessage(MESSAGE_SIGNERS, COORD, 2, PAYLOAD, SIG, { minRefetchIntervalMs: 60_000, now: 1_000 });
+		expect(r, 'the bounded refetch still fetches the cert and verifies').to.equal('verified');
+		expect(source.fetchCalls, 'a cold cache pays exactly one bounded refetch').to.equal(1);
+	});
+
 	it('with no cached cert, consults current() before forcing a fetch', async () => {
 		const source = new MockSource(encodeCohortMessage(GOOD), undefined);
 		const { v } = verifier(source);

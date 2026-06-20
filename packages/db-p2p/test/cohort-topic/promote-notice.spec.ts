@@ -32,7 +32,11 @@ import {
 	decodeInboundNotice,
 	verifyAndApplyNotice,
 	noticeBroadcastCoords,
+	handleInboundNotice,
+	createPromoteGate,
 	type NoticeApplyTarget,
+	type InboundNoticeResult,
+	type CoordRegistry,
 } from '../../src/cohort-topic/host.js';
 import { peerIdToBytes } from '../../src/cohort-topic/peer-codec.js';
 import { signPeer } from '../../src/cohort-topic/peer-sig.js';
@@ -84,16 +88,26 @@ function assemblerFor(self: Member, members: Member[], byId: Map<string, Member>
 	});
 }
 
-/** A participant-side verifier seeded (via its source) with the cohort's real, threshold-signed cert. */
-async function verifierOver(members: Member[], byId: Map<string, Member>, minSigs: number): Promise<MembershipVerifier> {
+/** Build the cohort's real, threshold-signed encoded `MembershipCertV1` over `members`. */
+async function encodedCertOver(members: Member[], byId: Map<string, Member>, minSigs: number): Promise<Uint8Array> {
 	const sink = new FretMembershipPublishSink();
 	const signer = createCohortSigner(assemblerFor(members[0]!, members, byId, 'membership'), minSigs);
 	const publisher = createMembershipCertPublisher({ signer, sink, minSigs });
 	await publisher.onStabilized({ coord: COORD, cohortEpoch: EPOCH, members: members.map((m) => m.bytes), stabilizedAt: 1_000 }, 1_000);
-	const encoded = sink.latest()!;
-	const source: IMembershipSource = { current: () => Promise.resolve(encoded), fetch: () => Promise.resolve(encoded) };
+	return sink.latest()!;
+}
+
+/** A participant-side verify-only verifier reading cohort membership from `source`. */
+function verifierFromSource(source: IMembershipSource, minSigs: number): MembershipVerifier {
 	const router: IMembershipSourceRouter = { for: (): IMembershipSource => source };
 	return createMembershipVerifier({ signer: createCohortSigner(createVerifyOnlyThresholdCrypto(), minSigs), router, minSigs });
+}
+
+/** A participant-side verifier seeded (via its source) with the cohort's real, threshold-signed cert. */
+async function verifierOver(members: Member[], byId: Map<string, Member>, minSigs: number): Promise<MembershipVerifier> {
+	const encoded = await encodedCertOver(members, byId, minSigs);
+	const source: IMembershipSource = { current: () => Promise.resolve(encoded), fetch: () => Promise.resolve(encoded) };
+	return verifierFromSource(source, minSigs);
 }
 
 /** A remote member's promotion lifecycle wrapped as the inbound-notice apply target around COORD. */
@@ -225,5 +239,174 @@ describe('cohort-topic: notice broadcast fan-out targets', () => {
 		};
 		expect(noticeBroadcastCoords(demo, COORD).map(bytesToB64url), 'demotion → served cohort + parent coord')
 			.to.deep.equal([bytesToB64url(COORD), bytesToB64url(PARENT)]);
+	});
+});
+
+// --- inbound promote-handler anti-abuse gate (cohort-topic-promote-handler-verify-amplification) ---
+
+/** A counting membership source: `current()` is the cheap local seed, `fetch()` is the amplified dial. */
+function countingSource(encoded: Uint8Array): { source: IMembershipSource; fetches: () => number } {
+	let fetches = 0;
+	const source: IMembershipSource = {
+		current: () => Promise.resolve(encoded),
+		fetch: () => { fetches++; return Promise.resolve(encoded); },
+	};
+	return { source, fetches: () => fetches };
+}
+
+/** Wrap a verifier so the test can count how many notices actually reached `verifyMessage`. */
+function countingVerifier(inner: MembershipVerifier): { verifier: MembershipVerifier; calls: () => number } {
+	let calls = 0;
+	const verifier: MembershipVerifier = {
+		cache: (cert) => inner.cache(cert),
+		verifyMessage: (signers, coord, tier, payload, sig, opts) => {
+			calls++;
+			return inner.verifyMessage(signers, coord, tier, payload, sig, opts);
+		},
+	};
+	return { verifier, calls: () => calls };
+}
+
+/** A minimal {@link CoordRegistry} whose `findServing` always resolves to `target` (or nothing). */
+function servingRegistry(target: NoticeApplyTarget | undefined): CoordRegistry {
+	return { findServing: (): NoticeApplyTarget | undefined => target } as unknown as CoordRegistry;
+}
+
+/** A forged single-signer promotion notice (signers ⊄ a `minSigs ≥ 2` quorum) — always "untrusted". */
+async function forgedPromotionNotice(members: Member[], effectiveAt: number): Promise<PromotionNoticeV1> {
+	const signable = { topicId: bytesToB64url(TOPIC), fromTier: 1, toTier: 2, effectiveAt, cohortEpoch: bytesToB64url(EPOCH) };
+	const sig = await signPeer(members[0]!.key, promotionNoticeSigningPayload(signable));
+	return { v: 1, ...signable, thresholdSig: bytesToB64url(sig), signers: [bytesToB64url(members[0]!.bytes)] };
+}
+
+describe('cohort-topic: inbound promote-handler anti-abuse gate', () => {
+	const minSigs = 3;
+
+	it('a flood of forged promote notices drives a bounded membership refetch (one per coord per interval, not N)', async () => {
+		const members = await makeMembers(4);
+		const byId = new Map(members.map((m) => [m.idStr, m]));
+		const encoded = await encodedCertOver(members, byId, minSigs);
+		const { source, fetches } = countingSource(encoded);
+		const verifier = verifierFromSource(source, minSigs);
+		const { target } = remoteTarget(minSigs);
+		const registry = servingRegistry(target);
+		// Generous ceiling so the rate limiter does not shadow the refetch-count assertion (distinct peers too).
+		const gate = createPromoteGate({ ratePerWindow: 10_000 });
+
+		const N = 50;
+		for (let i = 0; i < N; i++) {
+			const forged = await forgedPromotionNotice(members, 1_000 + i);
+			const from = peerIdToBytes(`attacker-${i}`);
+			// Same `now` for all N so they fall inside one refetch interval for the served coord.
+			const result = await handleInboundNotice(encodeCohortMessage(forged), from, registry, verifier, gate, 2_000);
+			expect(result, 'each forged notice is untrusted').to.equal('untrusted');
+		}
+		// The pre-fix amplification was one refetch per frame (N); the bound caps it at one per coord/interval.
+		expect(fetches(), `${N} forged notices drive at most one membership refetch (not ${N})`).to.be.at.most(1);
+	});
+
+	it('a single peer over the rate ceiling is dropped before the verifier runs', async () => {
+		const members = await makeMembers(4);
+		const byId = new Map(members.map((m) => [m.idStr, m]));
+		const encoded = await encodedCertOver(members, byId, minSigs);
+		const { source } = countingSource(encoded);
+		const { verifier, calls } = countingVerifier(verifierFromSource(source, minSigs));
+		const { target } = remoteTarget(minSigs);
+		const registry = servingRegistry(target);
+		const ratePerWindow = 4;
+		const gate = createPromoteGate({ ratePerWindow });
+		const from = peerIdToBytes('flooder');
+
+		const results: InboundNoticeResult[] = [];
+		for (let i = 0; i < 10; i++) {
+			const forged = await forgedPromotionNotice(members, 1_000 + i);
+			// Same `now` for all 10 so the sliding window does not drain between calls.
+			results.push(await handleInboundNotice(encodeCohortMessage(forged), from, registry, verifier, gate, 2_000));
+		}
+
+		const reached = results.filter((r) => r === 'untrusted').length;
+		const limited = results.filter((r) => r === 'rate-limited').length;
+		expect(reached, 'only the first `ratePerWindow` frames reach the verifier').to.equal(ratePerWindow);
+		expect(limited, 'the remainder are rate-limited').to.equal(10 - ratePerWindow);
+		expect(calls(), 'the verifier ran only for the admitted frames').to.equal(ratePerWindow);
+	});
+
+	it('a notice at or below the (topic, tier) high-water is dropped before the verifier (replay)', async () => {
+		const members = await makeMembers(4);
+		const byId = new Map(members.map((m) => [m.idStr, m]));
+		const encoded = await encodedCertOver(members, byId, minSigs);
+		const { source } = countingSource(encoded);
+		const { verifier, calls } = countingVerifier(verifierFromSource(source, minSigs));
+		const { life, target } = remoteTarget(minSigs);
+		const registry = servingRegistry(target);
+		const gate = createPromoteGate({ ratePerWindow: 10_000 });
+		const from = peerIdToBytes('honest');
+
+		// A real promotion at effectiveAt = 5_000 verifies, applies, and sets the high-water.
+		const promo = await realPromotionNotice(members, byId, minSigs, 5_000);
+		expect(await handleInboundNotice(encodeCohortMessage(promo), from, registry, verifier, gate, 6_000)).to.equal('applied');
+		expect(life.isPromoted(TOPIC), 'the fresh promotion applied').to.be.true;
+		const afterApply = calls();
+
+		// A replay at the same effectiveAt, and an older one, are both dropped before the verifier runs.
+		const replay = await realPromotionNotice(members, byId, minSigs, 5_000);
+		expect(await handleInboundNotice(encodeCohortMessage(replay), from, registry, verifier, gate, 7_000)).to.equal('stale');
+		const older = await realPromotionNotice(members, byId, minSigs, 4_000);
+		expect(await handleInboundNotice(encodeCohortMessage(older), from, registry, verifier, gate, 8_000)).to.equal('stale');
+		expect(calls(), 'neither stale notice reached the verifier').to.equal(afterApply);
+	});
+
+	it('a fresh legit notice above the high-water still applies, and advances the water', async () => {
+		const members = await makeMembers(4);
+		const byId = new Map(members.map((m) => [m.idStr, m]));
+		const encoded = await encodedCertOver(members, byId, minSigs);
+		const { source } = countingSource(encoded);
+		const verifier = verifierFromSource(source, minSigs);
+		const { life, target } = remoteTarget(minSigs);
+		const registry = servingRegistry(target);
+		const gate = createPromoteGate({ ratePerWindow: 10_000 });
+		const from = peerIdToBytes('honest');
+
+		const first = await realPromotionNotice(members, byId, minSigs, 5_000);
+		expect(await handleInboundNotice(encodeCohortMessage(first), from, registry, verifier, gate, 6_000)).to.equal('applied');
+
+		// A later, genuinely fresh notice (effectiveAt 9_000 > 5_000) still verifies and applies.
+		const fresh = await realPromotionNotice(members, byId, minSigs, 9_000);
+		expect(await handleInboundNotice(encodeCohortMessage(fresh), from, registry, verifier, gate, 10_000)).to.equal('applied');
+		expect(life.isPromoted(TOPIC), 'the fresh promotion applied').to.be.true;
+
+		// The water advanced to 9_000: a replay at 9_000 is now stale.
+		const replay = await realPromotionNotice(members, byId, minSigs, 9_000);
+		expect(await handleInboundNotice(encodeCohortMessage(replay), from, registry, verifier, gate, 11_000)).to.equal('stale');
+	});
+
+	it('an undecodable promote frame is reported as such (no throw, no verify)', async () => {
+		const members = await makeMembers(4);
+		const byId = new Map(members.map((m) => [m.idStr, m]));
+		const encoded = await encodedCertOver(members, byId, minSigs);
+		const { source } = countingSource(encoded);
+		const { verifier, calls } = countingVerifier(verifierFromSource(source, minSigs));
+		const { target } = remoteTarget(minSigs);
+		const gate = createPromoteGate();
+		const result = await handleInboundNotice(
+			encodeCohortMessage({ v: 1 } as never), peerIdToBytes('x'), servingRegistry(target), verifier, gate, 1_000,
+		);
+		expect(result, 'neither a promotion nor a demotion').to.equal('undecodable');
+		expect(calls(), 'an undecodable frame never reaches the verifier').to.equal(0);
+	});
+
+	it('a notice with no serving engine is dropped before the verifier', async () => {
+		const members = await makeMembers(4);
+		const byId = new Map(members.map((m) => [m.idStr, m]));
+		const encoded = await encodedCertOver(members, byId, minSigs);
+		const { source } = countingSource(encoded);
+		const { verifier, calls } = countingVerifier(verifierFromSource(source, minSigs));
+		const gate = createPromoteGate({ ratePerWindow: 10_000 });
+		const notice = await realPromotionNotice(members, byId, minSigs, 1_000);
+		const result = await handleInboundNotice(
+			encodeCohortMessage(notice), peerIdToBytes('honest'), servingRegistry(undefined), verifier, gate, 2_000,
+		);
+		expect(result, 'no engine serves (topic, tier) → dropped').to.equal('dropped');
+		expect(calls(), 'a dropped notice never reaches the verifier').to.equal(0);
 	});
 });
