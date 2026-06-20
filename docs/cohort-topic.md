@@ -530,12 +530,23 @@ A cohort may also pre-promote on observing rapid growth: if the slope of `direct
 > promotion answers `Promoted(d+1)` even though it did not originate it. On the wire (db-p2p host): a
 > freshly-signed notice surfaced on an arrival is captured via the engine's `onNotice` hook and
 > `sendOneWay`-broadcast over the `promote` protocol to the cohort around the served coord (and, for a
-> demotion, additionally the parent coord); inbound, the `promote` handler decodes the notice, resolves
-> the local coord engine serving its `(topic, tier)`, verifies the threshold signature against that
-> cohort's `MembershipCertV1` via the participant `MembershipVerifier` (signers ⊆ cert, `≥ minSigs`,
-> multisig valid), and applies it — untrusted or undeliverable notices are dropped. Specs:
-> `promotion.spec.ts` (remote-apply ordering/idempotency), db-p2p `promote-notice.spec.ts`
-> (verify + apply, forged/short-quorum + non-member rejection, no-engine drop, broadcast fan-out).
+> demotion, additionally the parent coord); inbound, the `promote` handler (`handleInboundNotice`) runs a
+> cheapest-first anti-abuse gate before any signature/network work — `decode → per-(peer, topic) rate
+> limit → findServing → effectiveAt high-water → verify+apply` — so a peer streaming junk over the
+> protocol cannot amplify into per-message signature verification or membership dials. The rate limiter
+> is the same `register_rate_per_peer` sliding-window limiter (its own node-level instance, since the
+> handler is node-level); the per-`(topic, tier)` `effectiveAt` high-water drops a replay/out-of-order
+> notice before `verifyMessage` and is advanced **only** on a verified-and-applied notice (so a forged
+> frame cannot poison it); and the verify itself passes a `PROMOTE_REFETCH_MIN_INTERVAL_MS` (60 s)
+> bound that rate-limits the stale-cert refetch to one `source.fetch()` per coord per interval (eventual
+> refetch preserved — a cold cache / membership rotation still re-fetches once it elapses). It then
+> resolves the local coord engine serving the notice's `(topic, tier)`, verifies the threshold signature
+> against that cohort's `MembershipCertV1` via the participant `MembershipVerifier` (signers ⊆ cert,
+> `≥ minSigs`, multisig valid), and applies it — undecodable / rate-limited / stale / untrusted /
+> undeliverable notices are dropped (never throws on the stream). Specs: `promotion.spec.ts`
+> (remote-apply ordering/idempotency), db-p2p `promote-notice.spec.ts` (verify + apply, forged/short-quorum
+> + non-member rejection, no-engine drop, broadcast fan-out, anti-abuse gate: flood-bounded refetch /
+> rate-limit drop / high-water replay drop), db-core `membership.spec.ts` (bounded-refetch rate limit).
 
 ### Demotion (cohort shrinks)
 
@@ -760,6 +771,17 @@ The layer does not attempt to defend against unbounded Sybil attacks at the regi
 > T2/T3 reputation option; otherwise the verifiers are **permissive-but-logged** (a one-time warning,
 > never an undefined gate). The production PoW + committed-work-reference evidence schemes are deferred
 > (`cohort-topic-bootstrap-evidence-scheme`). Host wiring specs: `host-antidos-coldstart.spec.ts`.
+>
+> **Promote-handler gate (`promote` protocol, not registration).** The four defenses above guard the
+> *register* path; the inbound `promote`-notice handler (§Promotion and demotion lifecycle) reuses the
+> same primitives against verify/refetch amplification: a **node-level** `RegisterRateLimiter` keyed on
+> `(peer, topicId)` sheds an over-rate peer before the `findServing` scan, a per-`(topic, tier)`
+> `effectiveAt` high-water drops replays before the signature verify, and the verify passes a 60 s
+> per-coord refetch bound (`PROMOTE_REFETCH_MIN_INTERVAL_MS`) so a flood drives a *bounded* membership
+> refetch rate rather than one dial per frame. The rate-limiter and high-water maps share the
+> register-path limiter's "retain one small entry per key, global eviction is the host service's
+> lifecycle concern" property (a slow leak for a long-lived node serving many topics; bounded eviction
+> is deferred — `cohort-topic-promote-gate-map-eviction`).
 
 > **Open question — `F^d` fan-out under per-coord rate limits (not resolved here).** The per-peer
 > rate limit bounds cost *per cohort*, but a malicious peer can hit every one of the `F^d`
