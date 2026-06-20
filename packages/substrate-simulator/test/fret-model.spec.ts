@@ -79,24 +79,28 @@ describe('FretModel — size & depth (real FRET math)', () => {
 });
 
 describe('FretModel — confidence clamp on d_max', () => {
-	it('clamps d_max to ⌊d_max_cap/2⌋ when confidence < confidence_min (pure)', () => {
+	it('caps d_max at ⌊d_max_cap/2⌋ as upper bound when confidence < confidence_min (pure)', () => {
 		const cfg = DEFAULT_DMAX_CONFIG;
-		const clamped = Math.floor(cfg.dMaxCap / 2);
-		// Below the floor: clamp engages regardless of n_est.
-		expect(computeDMax(100000, cfg.confidenceMin - 0.01, cfg)).to.equal(clamped);
-		expect(computeDMax(10, 0, cfg)).to.equal(clamped);
-		// At/above the floor: the formula governs.
+		// Use a tight config so the cap fires at testable n_est values.
+		// floor(6/2) = 3; for n = 16^6, formula = 5 > 3, so cap fires: min(5, 3) = 3.
+		const tightCfg = { ...cfg, dMaxCap: 6 };
+		expect(computeDMax(16 ** 6, cfg.confidenceMin - 0.01, tightCfg)).to.equal(3);
+		// Small n_est + low confidence: formula (0) is below cap (30), so formula wins — NOT inflated.
+		expect(computeDMax(10, 0, cfg)).to.equal(dMaxFormula(10, cfg.F));
+		expect(computeDMax(10, 0, cfg)).to.equal(0);
+		// At/above the confidence floor: the formula governs.
 		expect(computeDMax(100000, cfg.confidenceMin, cfg)).to.equal(dMaxFormula(100000, cfg.F));
 		expect(computeDMax(100000, 0.5, cfg)).to.equal(dMaxFormula(100000, cfg.F));
 	});
 
-	it('clamp engages with real FRET output for a degenerate (single-peer) population', async () => {
+	it('low-confidence small population uses formula value, not inflated to cap', async () => {
 		const peers = generatePeers(1, createRng(SEED));
 		const model = await FretModel.create(peers, { m: M });
-		const { confidence } = model.size.estimate();
-		// FRET reports confidence 0.2 for a single-peer store — below confidence_min.
+		const { n, confidence } = model.size.estimate();
+		// FRET reports confidence < confidence_min for a single-peer store.
 		expect(confidence).to.be.below(DEFAULT_DMAX_CONFIG.confidenceMin);
-		expect(model.size.dMax(DEFAULT_DMAX_CONFIG)).to.equal(Math.floor(DEFAULT_DMAX_CONFIG.dMaxCap / 2));
+		// Cap semantics: min(formula, floor(dMaxCap/2)). For tiny n, formula is tiny.
+		expect(model.size.dMax(DEFAULT_DMAX_CONFIG)).to.equal(dMaxFormula(n, DEFAULT_DMAX_CONFIG.F));
 	});
 });
 

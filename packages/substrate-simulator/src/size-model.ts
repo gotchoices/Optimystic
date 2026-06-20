@@ -13,7 +13,7 @@ export interface DMaxConfig {
 	readonly capPromote: number;
 	/** Hard cap on walk-toward-root start tier (default 60). */
 	readonly dMaxCap: number;
-	/** Below this n_est confidence, clamp d_max to ⌊dMaxCap/2⌋ (default 0.3). */
+	/** Below this n_est confidence, cap d_max at ⌊dMaxCap/2⌋ as an upper bound (default 0.3). */
 	readonly confidenceMin: number;
 }
 
@@ -26,18 +26,21 @@ export const DEFAULT_DMAX_CONFIG: DMaxConfig = {
 };
 
 /**
- * `d_max = max(0, ⌊log_F(n_est)⌋ − 1)`, clamped to `⌊dMaxCap/2⌋` when `confidence < confidenceMin`.
- * Pure so the clamp can be exercised directly with forced `(n_est, confidence)` pairs.
+ * `d_max = max(0, ⌊log_F(n_est)⌋ − 1)`, capped at `⌊dMaxCap/2⌋` as an upper bound when
+ * `confidence < confidenceMin` — i.e. `min(formula, ⌊dMaxCap/2⌋)` — to avoid deep probes
+ * from an over-estimated population. Small/low-confidence populations stay at their formula value.
+ * Pure so the cap can be exercised directly with forced `(n_est, confidence)` pairs.
  */
 export function computeDMax(nEst: number, confidence: number, cfg: DMaxConfig): number {
-	if (confidence < cfg.confidenceMin) {
-		return Math.floor(cfg.dMaxCap / 2);
-	}
 	if (nEst <= 0) {
 		return 0;
 	}
 	const logF = Math.log(nEst) / Math.log(cfg.F);
-	return Math.max(0, Math.floor(logF) - 1);
+	const formula = Math.max(0, Math.floor(logF) - 1);
+	if (confidence < cfg.confidenceMin) {
+		return Math.min(formula, Math.floor(cfg.dMaxCap / 2));
+	}
+	return formula;
 }
 
 /**

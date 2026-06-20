@@ -112,16 +112,16 @@ A participant computes an upper bound on tree depth from FRET's network-size est
 d_max = max(0, ⌊log_F(n_est)⌋ − 1)
 ```
 
-At `d_max`, each tier-`d_max` cohort covers `F` peers on average — roughly one cohort's worth. Deeper would mean tier coordinates with fewer peers than a cohort, which FRET handles but provides no fan-out benefit. If `n_est` confidence falls below `confidence_min` (default 0.3), participants clamp to `d_max = ⌊d_max_cap / 2⌋` to avoid pathological deep probes.
+At `d_max`, each tier-`d_max` cohort covers `F` peers on average — roughly one cohort's worth. Deeper would mean tier coordinates with fewer peers than a cohort, which FRET handles but provides no fan-out benefit. If `n_est` confidence falls below `confidence_min` (default 0.3), participants cap `d_max` at `⌊d_max_cap / 2⌋` — i.e. `d_max = min(formula, ⌊d_max_cap / 2⌋)` — to avoid pathological deep probes from an over-estimated population. Small or sparse populations (where the formula already yields a small value) are unaffected.
 
 `d_max` is recomputed lazily; participants don't need it precise. The simulator validates the
-formula and the `confidence_min` clamp against FRET's reported `(n_est, confidence)` over
+formula and the `confidence_min` cap against FRET's reported `(n_est, confidence)` over
 N ∈ {10, 100, 1k, 10k, 100k}; see the simulator validation note under §Tier addressing.
 
 > **Implementation.** `packages/db-core/src/cohort-topic/dmax.ts` (`makeDMaxComputer`) reads the
 > estimate lazily through the injected `ISizeEstimator` (db-p2p wraps FRET's
-> `estimateSizeAndConfidence`) and applies the clamp to `⌊d_max_cap / 2⌋` when
-> `confidence < confidence_min`. `⌊log_F(n_est)⌋` is computed with a power-of-`F` boundary
+> `estimateSizeAndConfidence`) and caps the formula result at `⌊d_max_cap / 2⌋` (upper bound, not
+> a set-to) when `confidence < confidence_min` — i.e. `min(formula, ⌊d_max_cap / 2⌋)`. `⌊log_F(n_est)⌋` is computed with a power-of-`F` boundary
 > correction so exact powers (e.g. `16³`) don't lose a tier to floating-point error; the result is
 > capped at `d_max_cap`. Tier classes and Edge/Core profiles live in
 > `packages/db-core/src/cohort-topic/tiers.ts`. Defaults (`F = 16`, `d_max_cap = 60`,
