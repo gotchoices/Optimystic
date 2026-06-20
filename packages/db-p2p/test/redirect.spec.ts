@@ -1,7 +1,6 @@
 import { expect } from 'chai';
 import { peerIdFromPrivateKey } from '@libp2p/peer-id';
 import { generateKeyPair } from '@libp2p/crypto/keys';
-import { sha256 } from 'multiformats/hashes/sha2';
 import type { PeerId } from '@libp2p/interface';
 import type { IRepo, BlockGets, GetBlockResults, PendRequest, PendResult, CommitRequest, CommitResult, ActionBlocks, MessageOptions, RepoMessage, IBlock } from '@optimystic/db-core';
 import { RepoService, type RepoServiceComponents, type NetworkManagerLike } from '../src/repo/service.js';
@@ -15,22 +14,23 @@ const makePeerId = async (): Promise<PeerId> => {
 /** Build a minimal valid IBlock for a pend transforms fixture. */
 const makeBlock = (id: string): IBlock => ({ header: { id, type: 'test', collectionId: 'c1' } });
 
-/** Stable map key for a digest byte array (the sha256 of a blockKey string). */
-const digestMapKey = (key: Uint8Array): string => Array.from(key).join(',');
+/** Stable map key for a byte array. */
+const mapKey = (key: Uint8Array): string => Array.from(key).join(',');
 
-/** Compute the same digest `checkRedirect` hashes a blockKey string to. */
-const blockKeyDigest = async (blockKey: string): Promise<string> => {
-	const mh = await sha256.digest(new TextEncoder().encode(blockKey));
-	return digestMapKey(mh.digest);
-};
+/**
+ * Compute the map key for the bytes `checkRedirect` actually passes to getCluster.
+ * After the key-derivation fix the redirect path passes the RAW encoded blockKey
+ * (no pre-hash), matching the coordinator's findCluster(encode(blockId)).
+ */
+const blockKeyMapKey = (blockKey: string): string => mapKey(new TextEncoder().encode(blockKey));
 
 /**
  * Network manager that returns a different cluster per blockKey, so a test can assert
  * which block a redirect was actually keyed on (e.g. blockIds[0] vs tailId for commit).
  */
-const makeKeyedNetworkManager = (byBlockKeyDigest: Map<string, PeerId[]>, fallback: PeerId[]): NetworkManagerLike => ({
+const makeKeyedNetworkManager = (byBlockKey: Map<string, PeerId[]>, fallback: PeerId[]): NetworkManagerLike => ({
 	async getCluster(key: Uint8Array): Promise<PeerId[]> {
-		return byBlockKeyDigest.get(digestMapKey(key)) ?? fallback;
+		return byBlockKey.get(mapKey(key)) ?? fallback;
 	}
 });
 
@@ -297,8 +297,8 @@ describe('RepoService redirect logic', () => {
 			// block-A's cluster excludes self (and is large enough to trip the redirect);
 			// tail-Z's cluster INCLUDES self (so keying on tail-Z would NOT redirect).
 			const byKey = new Map<string, PeerId[]>();
-			byKey.set(await blockKeyDigest('block-A'), [blockACoordinator, otherTailMember]); // self NOT a member
-			byKey.set(await blockKeyDigest('tail-Z'), [self, otherTailMember]);               // self IS a member
+			byKey.set(blockKeyMapKey('block-A'), [blockACoordinator, otherTailMember]); // self NOT a member
+			byKey.set(blockKeyMapKey('tail-Z'), [self, otherTailMember]);               // self IS a member
 			const nm = makeKeyedNetworkManager(byKey, [self]);
 
 			const service = new RepoService(
@@ -341,8 +341,8 @@ describe('RepoService redirect logic', () => {
 			// the structural-field-name key 'inserts' falls through to the fallback cluster,
 			// which INCLUDES self (so keying on 'inserts' would NOT redirect).
 			const byKey = new Map<string, PeerId[]>();
-			byKey.set(await blockKeyDigest('block-A'), [blockACoordinator, otherMember]); // self NOT a member
-			const nm = makeKeyedNetworkManager(byKey, [self]);                            // fallback includes self
+			byKey.set(blockKeyMapKey('block-A'), [blockACoordinator, otherMember]); // self NOT a member
+			const nm = makeKeyedNetworkManager(byKey, [self]);                      // fallback includes self
 
 			const service = new RepoService(
 				makeComponents({ repo: makeStubRepo(), peerId: self, networkManager: nm }),

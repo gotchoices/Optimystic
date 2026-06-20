@@ -399,15 +399,15 @@ export async function createLibp2pNodeBase(
 					protocolPrefix: `/optimystic/${options.networkName}`,
 					responsibilityK: options.responsibilityK ?? 1
 				});
-				// NOTE: peerId/networkManager are intentionally NOT forwarded here, so
-				// RepoService.checkRedirect stays inert (getNetworkManager() → undefined
-				// → no redirect). Un-inerting it is deferred: RepoService.checkRedirect
-				// derives the responsible set via getCluster(sha256(blockKey)), which adds
-				// an extra sha256 step versus the coordinator's findCluster(encode(blockId))
-				// (raw bytes, no sha256). Activating it without first reconciling that
-				// key-derivation divergence risks redirecting requests the coordinator
-				// legitimately routed here — the same "empty promises" class of regression
-				// this ticket's cluster-path fix avoids by trusting record.peers.
+				// RepoService.checkRedirect needs the running node (network manager for the
+				// responsible-set computation, self id for the membership check, connection
+				// addrs for redirect targets). The libp2p components.libp2p proxy does NOT
+				// reliably resolve from inside a service at request time, so the node is
+				// injected explicitly post-construction via setLibp2p(node) below — the same
+				// mechanism networkManager/fret use — rather than forwarded here. checkRedirect
+				// keys the responsible set on the RAW encoded block id
+				// (getCluster(encode(blockKey)) → hashKey(encode(...))), matching the
+				// coordinator's findCluster(encode(blockId)) — same cohort, no spurious redirect.
 				return serviceFactory({
 					logger: components.logger,
 					registrar: components.registrar,
@@ -475,6 +475,11 @@ export async function createLibp2pNodeBase(
 	// Inject libp2p reference into services that need it before start
 	try { ((node as any).services?.fret as any)?.setLibp2p?.(node); } catch { }
 	try { ((node as any).services?.networkManager as any)?.setLibp2p?.(node); } catch { }
+	// RepoService.checkRedirect resolves the network manager / self id / connection
+	// addrs through this injected node (the components.libp2p proxy is unreliable
+	// from inside a service at request time). Done before start() so the protocol
+	// handler is live with a resolvable node from its first request.
+	try { ((node as any).services?.repo as any)?.setLibp2p?.(node); } catch { }
 
 	await node.start();
 

@@ -1,10 +1,9 @@
 import { pipe } from 'it-pipe'
 import { decode as lpDecode, encode as lpEncode } from 'it-length-prefixed'
-import type { Startable, Logger, Stream, Connection, StreamHandler, PeerId } from '@libp2p/interface'
+import type { Startable, Logger, Stream, Connection, StreamHandler, PeerId, Libp2p } from '@libp2p/interface'
 import type { IRepo, RepoMessage } from '@optimystic/db-core'
 import { blockIdsForTransforms } from '@optimystic/db-core'
 import { peersEqual } from '../peer-utils.js'
-import { sha256 } from 'multiformats/hashes/sha2'
 import { encodePeers, type RedirectPayload } from './redirect.js'
 import type { Uint8ArrayList } from 'uint8arraylist'
 import { createLogger } from '../logger.js'
@@ -29,6 +28,13 @@ export type RepoServiceComponents = BaseComponents & {
 	networkManager?: NetworkManagerLike
 	peerId?: PeerId
 	getConnectionAddrs?: (peerId: PeerId) => string[]
+	/**
+	 * Optional libp2p node. The production wiring injects the node post-construction
+	 * via {@link RepoService.setLibp2p} (the `components.libp2p` proxy does not
+	 * reliably resolve from inside a service at request time); this field is a
+	 * best-effort fallback resolver used only when no node has been injected.
+	 */
+	libp2p?: Libp2p
 }
 
 export type RepoServiceInit = {
@@ -66,6 +72,14 @@ export class RepoService implements Startable {
 	private running: boolean
 	/** Responsibility K - how many peers are responsible for a key (for redirect decisions) */
 	private readonly responsibilityK: number
+	/**
+	 * The libp2p node, injected post-construction by the node wiring (see
+	 * libp2p-node-base.ts, mirroring how `networkManager`/`fret` receive theirs).
+	 * The libp2p `components.libp2p` proxy does NOT reliably resolve from inside a
+	 * service at request time, so the redirect path resolves the network manager,
+	 * self identity, and connection addrs through this explicitly-set reference.
+	 */
+	private libp2pRef: Libp2p | undefined
 
 	constructor(components: RepoServiceComponents, init: RepoServiceInit = {}) {
 		this.components = components
@@ -80,6 +94,19 @@ export class RepoService implements Startable {
 	}
 
 	readonly [Symbol.toStringTag] = '@libp2p/repo-service'
+
+	/**
+	 * Inject the running libp2p node. Called once post-construction by the node
+	 * wiring so the redirect path can resolve the network manager / self id / addrs.
+	 */
+	setLibp2p(libp2p: Libp2p): void {
+		this.libp2pRef = libp2p
+	}
+
+	/** Resolve the libp2p node: the injected ref first, then the (best-effort) components proxy. */
+	private getLibp2p(): Libp2p | undefined {
+		return this.libp2pRef ?? (this.components as any).libp2p
+	}
 
 	/**
 	 * Start the service
@@ -111,17 +138,17 @@ export class RepoService implements Startable {
 
 	private getNetworkManager(): NetworkManagerLike | undefined {
 		if (this.components.networkManager) return this.components.networkManager
-		return (this.components as any).libp2p?.services?.networkManager as NetworkManagerLike | undefined
+		return (this.getLibp2p() as any)?.services?.networkManager as NetworkManagerLike | undefined
 	}
 
 	private getSelfId(): PeerId | undefined {
 		if (this.components.peerId) return this.components.peerId
-		return (this.components as any).libp2p?.peerId as PeerId | undefined
+		return this.getLibp2p()?.peerId as PeerId | undefined
 	}
 
 	private getPeerAddrs(peerId: PeerId): string[] {
 		if (this.components.getConnectionAddrs) return this.components.getConnectionAddrs(peerId)
-		const libp2p = (this.components as any).libp2p
+		const libp2p = this.getLibp2p() as any
 		if (!libp2p?.getConnections) return []
 		const conns: any[] = libp2p.getConnections(peerId) ?? []
 		const addrs: string[] = []
@@ -176,8 +203,14 @@ export class RepoService implements Startable {
 		const nm = this.getNetworkManager()
 		if (!nm) return null
 
-		const mh = await sha256.digest(new TextEncoder().encode(blockKey))
-		const key = mh.digest
+		// Pass the RAW encoded block-key bytes to getCluster. getCluster hashes
+		// internally (hashKey == sha256), so the responsible-set coordinate becomes
+		// hashKey(encode(blockKey)) — identical to how the cluster coordinator
+		// derives it (ClusterCoordinator.getClusterForBlock → findCluster(encode(blockId))).
+		// Pre-hashing here would double-hash (hashKey(sha256(encode(blockKey)))), placing
+		// the cohort at an unrelated ring coordinate and redirecting requests the
+		// coordinator legitimately routed to this peer.
+		const key = new TextEncoder().encode(blockKey)
 		const cluster = await nm.getCluster(key)
 		;(message as any).cluster = cluster.map((p: PeerId) => p.toString?.() ?? String(p))
 

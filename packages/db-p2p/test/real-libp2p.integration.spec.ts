@@ -2,8 +2,11 @@ import { expect } from 'chai';
 import type { Libp2p } from 'libp2p';
 import type { BlockId, IBlock, BlockHeader, Transforms, IRepo } from '@optimystic/db-core';
 import { generateKeyPair } from '@libp2p/crypto/keys';
+import { multiaddr } from '@multiformats/multiaddr';
+import { hashKey } from 'p2p-fret';
 import { createLibp2pNode, type NodeOptions } from '../src/libp2p-node.js';
 import { MemoryRawStorage } from '../src/storage/memory-storage.js';
+import { RepoClient } from '../src/repo/client.js';
 
 // Real-libp2p integration smoke tests. Exercises the production transport wiring
 // (createLibp2pNode + RestorationCoordinator + Libp2pKeyPeerNetwork) end-to-end
@@ -83,6 +86,29 @@ async function waitForPeers(node: Libp2p, minPeers: number, timeoutMs: number): 
 		};
 		node.addEventListener('peer:connect', check);
 	});
+}
+
+const delay = (ms: number): Promise<void> => new Promise(resolve => setTimeout(resolve, ms));
+
+/** Poll `predicate` until truthy or `timeoutMs` elapses (bounded async settle, no fixed sleeps). */
+async function waitFor(predicate: () => boolean | Promise<boolean>, timeoutMs: number, intervalMs = 250): Promise<boolean> {
+	const deadline = Date.now() + timeoutMs;
+	for (;;) {
+		if (await predicate()) return true;
+		if (Date.now() >= deadline) return false;
+		await delay(intervalMs);
+	}
+}
+
+/** Establish a full mesh of warm connections: every node dials every other node's TCP addr. */
+async function fullMeshDial(meshNodes: Libp2p[]): Promise<void> {
+	const addrs = meshNodes.map(pickLocalTcpMultiaddr);
+	for (let i = 0; i < meshNodes.length; i++) {
+		for (let j = 0; j < meshNodes.length; j++) {
+			if (i === j) continue;
+			try { await meshNodes[i]!.dial(multiaddr(addrs[j]!)); } catch { /* a reciprocal dial covers this edge */ }
+		}
+	}
 }
 
 describe('Real libp2p integration', function () {
@@ -276,5 +302,106 @@ describe('Real libp2p integration', function () {
 
 		const result = await repo2.get({ blockIds: [blockId as BlockId] });
 		expect(result[blockId]?.block?.header.id, 'post-restart get').to.equal(blockId);
+	});
+
+	// Running-mesh repo-redirect round trip (optimystic-repo-redirect-key-derivation).
+	// Proves the un-inerted RepoService.checkRedirect path end-to-end over real TCP:
+	//   1. A repo `get` is dialed to a node E that is NOT in the block's responsible set.
+	//   2. E's RepoService.checkRedirect — keyed on the RAW encoded block id, the same
+	//      coordinate the cluster coordinator's findCluster(encode(blockId)) derives —
+	//      computes the cohort, finds itself absent, and returns a RedirectPayload.
+	//   3. The RepoClient follows the redirect (client.ts max-2-hop) to the responsible
+	//      peer R, which IS a member and serves the committed block.
+	// The driver node D (≠ E, ≠ R) issues the client so neither hop is a self-dial.
+	//
+	// Block selection is FRET-derived, not hard-coded: after the 3-node ring stabilizes
+	// we probe E's NetworkManagerService.getCluster (the exact call checkRedirect makes)
+	// for a block id whose size-1 cohort excludes E — guaranteeing a real redirect fires.
+	it('redirect round-trip: a repo op to a non-responsible node redirects and completes on the responsible peer', async function () {
+		this.timeout(90_000);
+
+		// clusterSize 1 → getCluster's cohort is the single FRET-nearest peer, so for any
+		// block exactly one node is responsible and the other two are non-members.
+		const a = await spawnNode({ clusterSize: 1 });
+		const bootstrapAddr = pickLocalTcpMultiaddr(a);
+		const b = await spawnNode({ bootstrapNodes: [bootstrapAddr], fretProfile: 'core', clusterSize: 1 });
+		const c = await spawnNode({ bootstrapNodes: [bootstrapAddr], fretProfile: 'core', clusterSize: 1 });
+		const mesh = [a, b, c];
+
+		await fullMeshDial(mesh);
+		const connected = await waitFor(() => mesh.every(n => n.getPeers().length >= 2), 30_000, 250);
+		expect(connected, 'the 3-node mesh fully connected').to.equal(true);
+
+		// Wait for real FRET two-sided stabilization: every node must rank the same whole
+		// ring (assembleCohort is not cached, so this is a clean readiness probe).
+		const fretOf = (n: Libp2p): { assembleCohort(coord: Uint8Array, wants: number): string[] } =>
+			(n as any).services.fret;
+		const probeCoord = await hashKey(new TextEncoder().encode('redirect-rt-fret-probe'));
+		const stabilized = await waitFor(() => {
+			const ref = new Set(fretOf(a).assembleCohort(probeCoord, mesh.length));
+			if (ref.size !== mesh.length) return false;
+			for (const n of mesh) {
+				const seen = new Set(fretOf(n).assembleCohort(probeCoord, mesh.length));
+				if (seen.size !== mesh.length) return false;
+				for (const id of ref) if (!seen.has(id)) return false;
+			}
+			return true;
+		}, 60_000, 500);
+		expect(stabilized, 'FRET stabilized the 3-node ring (every node knows every peer)').to.equal(true);
+
+		// Probe for a block whose responsible peer is a REMOTE node (entry E = a is excluded).
+		// Fresh ids each iteration so getCluster's per-key cache never serves a pre-stable result.
+		const entry = a;
+		const entryNM: { getCluster(key: Uint8Array): Promise<Array<{ toString(): string }>> } =
+			(entry as any).services.networkManager;
+		let chosen: { blockId: string; responsible: Libp2p; driver: Libp2p } | undefined;
+		for (let i = 0; i < 200; i++) {
+			const blockId = `redirect-rt-block-${i}`;
+			const cohort = await entryNM.getCluster(new TextEncoder().encode(blockId));
+			const ids = cohort.map(p => p.toString());
+			if (ids.length >= 1 && !ids.includes(entry.peerId.toString())) {
+				const responsible = mesh.find(n => n !== entry && n.peerId.toString() === ids[0]);
+				if (responsible) {
+					const driver = mesh.find(n => n !== entry && n !== responsible)!;
+					chosen = { blockId, responsible, driver };
+					break;
+				}
+			}
+		}
+		expect(chosen, 'found a block whose responsible peer is a remote node (a redirect will fire)').to.exist;
+		const { blockId, responsible, driver } = chosen!;
+
+		// Commit the block on the responsible node so it holds it locally (K=1 self-bypass fast path).
+		const rRepo = (responsible as any).coordinatedRepo as IRepo;
+		const pend = await rRepo.pend({ actionId: 'rt-a1', transforms: makeTransforms(blockId), policy: 'c' });
+		expect(pend.success, 'responsible-node pend').to.equal(true);
+		const commit = await rRepo.commit({ actionId: 'rt-a1', tailId: blockId as BlockId, rev: 1, blockIds: [blockId as BlockId] } as any);
+		expect(commit.success, 'responsible-node commit').to.equal(true);
+
+		// Precondition: the entry node does NOT hold the block locally, so a successful client
+		// read can only have come from following the redirect to the responsible peer.
+		const entryLocal = await (entry as any).storageRepo.get({ blockIds: [blockId] }, { skipClusterFetch: true });
+		expect(entryLocal[blockId]?.block, 'entry node has no local copy of the block').to.be.undefined;
+
+		// White-box: the entry node's RepoService decides to redirect this op to the responsible
+		// peer (and not to itself) — the un-inerted checkRedirect, keyed on the same coordinate
+		// the cluster coordinator uses.
+		const entryRepoSvc = (entry as any).services.repo;
+		const probeMsg = { operations: [{ get: { blockIds: [blockId], context: { committed: [], rev: 0 } } }] };
+		const decision = await entryRepoSvc.checkRedirect(blockId, 'get', probeMsg);
+		expect(decision, 'entry RepoService returns a redirect for a block it is not responsible for').to.not.be.null;
+		const redirectIds = decision.redirect.peers.map((p: any) => p.id);
+		expect(redirectIds, 'redirect targets the responsible peer').to.include(responsible.peerId.toString());
+		expect(redirectIds, 'redirect excludes the entry node itself').to.not.include(entry.peerId.toString());
+
+		// Black-box end-to-end: drive a RepoClient from D, dialing the non-responsible entry E.
+		// E redirects → the client follows the redirect (client.ts max-2-hop) to R, which serves
+		// the committed block. D ≠ E and D ≠ R, so neither hop is a self-dial.
+		const protocolPrefix = `/optimystic/${NETWORK_NAME}`;
+		const driverKeyNetwork = (driver as any).keyNetwork;
+		const client = RepoClient.create(entry.peerId as any, driverKeyNetwork, protocolPrefix);
+		const res = await client.get({ blockIds: [blockId as BlockId] }, { expiration: Date.now() + 20_000 } as any);
+
+		expect(res[blockId]?.block?.header.id, 'redirected get reached the responsible peer and returned the committed block').to.equal(blockId);
 	});
 });
