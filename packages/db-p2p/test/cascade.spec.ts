@@ -11,6 +11,9 @@ import { MemoryRawStorage } from '../src/storage/memory-storage.js';
 import {
 	buildDisputeResolutionProof,
 	computeTargetHash,
+	computeArbitratorSetHash,
+	voteSigningPayload,
+	arbitratorSetSigningPayload,
 	applyInvalidation,
 	cascadeInvalidate,
 	type CertificateTarget,
@@ -31,10 +34,11 @@ async function makeArb(): Promise<Arb> {
 	return { peerId: peerIdFromPrivateKey(privateKey), privateKey };
 }
 
-async function makeVote(arb: Arb, disputeId: string, vote: ArbitrationVote['vote'], computedHash: string, targetHash: string): Promise<ArbitrationVote> {
-	const sig = await arb.privateKey.sign(new TextEncoder().encode(`v2:${disputeId}:${vote}:${computedHash}:${targetHash}`));
+// A target- and set-bound (v3) vote: the signature commits to BOTH targetHash and setHash.
+async function makeVote(arb: Arb, disputeId: string, vote: ArbitrationVote['vote'], computedHash: string, targetHash: string, setHash: string): Promise<ArbitrationVote> {
+	const sig = await arb.privateKey.sign(voteSigningPayload(disputeId, vote, computedHash, targetHash, setHash));
 	return {
-		version: 'v2', disputeId, arbitratorPeerId: arb.peerId.toString(), vote,
+		version: 'v3', disputeId, arbitratorPeerId: arb.peerId.toString(), vote,
 		evidence: { computedHash, engineId: 'engine', schemaHash: 'schema', blockStateHashes: {} },
 		signature: uint8ArrayToString(sig, 'base64url'),
 	};
@@ -43,14 +47,20 @@ async function makeVote(arb: Arb, disputeId: string, vote: ArbitrationVote['vote
 /**
  * A challenger-wins proof bound to the ROOT's target. The cascade reuses this proof to authorize every
  * child (verifying it against the root's target, not the child's), so the binding here is the root's
- * `(invalidatedActionId, blockIds)` — defaulting to the common single-block 'tinv'/['A'] root.
+ * `(invalidatedActionId, blockIds)` — defaulting to the common single-block 'tinv'/['A'] root. The proof
+ * carries the legitimately-selected arbitrator set (#1), with each vote bound to it and the challenger
+ * signing the set; applyInvalidation (no recompute) accepts it on layer 1.
  */
 async function challengerWinsProof(disputeId: string, target: CertificateTarget = { invalidatedActionId: 'tinv', blockIds: ['A'] }): Promise<DisputeResolutionProof> {
+	const challenger = await makeArb();
 	const arbs = await Promise.all([makeArb(), makeArb(), makeArb()]);
+	const arbitratorSet = arbs.map(a => a.peerId.toString());
 	const targetHash = await computeTargetHash('msg-1', target);
-	const votes = await Promise.all(arbs.map(a => makeVote(a, disputeId, 'agree-with-challenger', 'h', targetHash)));
+	const setHash = await computeArbitratorSetHash(arbitratorSet);
+	const votes = await Promise.all(arbs.map(a => makeVote(a, disputeId, 'agree-with-challenger', 'h', targetHash, setHash)));
 	const resolution: DisputeResolution = { disputeId, outcome: 'challenger-wins', votes, affectedPeers: [], timestamp: 1 };
-	return buildDisputeResolutionProof(resolution, 'msg-1');
+	const arbitratorSetSignature = uint8ArrayToString(await challenger.privateKey.sign(arbitratorSetSigningPayload(disputeId, targetHash, setHash)), 'base64url');
+	return buildDisputeResolutionProof(resolution, 'msg-1', { arbitratorSet, challengerPeerId: challenger.peerId.toString(), arbitratorSetSignature });
 }
 
 // ─── In-memory log store (Chain BlockStore for a collection Log) ───

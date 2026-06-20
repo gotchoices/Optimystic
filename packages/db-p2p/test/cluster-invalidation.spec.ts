@@ -13,7 +13,7 @@ import type {
 import type { IPeerNetwork } from '@optimystic/db-core';
 import { clusterMember, type ClusterMember } from '../src/cluster/cluster-repo.js';
 import { invalidationActionId } from '../src/cluster/commit-cert.js';
-import { buildDisputeResolutionProof, computeTargetHash } from '../src/dispute/invalidation.js';
+import { buildDisputeResolutionProof, computeTargetHash, computeArbitratorSetHash, voteSigningPayload, arbitratorSetSigningPayload, type ArbitratorSetRecompute } from '../src/dispute/invalidation.js';
 import type { ArbitrationVote, DisputeResolution } from '../src/dispute/types.js';
 
 // ─── Crypto / record helpers (mirrors cluster-repo.spec.ts) ───
@@ -84,30 +84,37 @@ async function makeConsensusRecord(self: KeyPair, operations: RepoMessage['opera
 const PROOF_MSG = 'msg-hash';
 const PROOF_TARGET = { invalidatedActionId: 'a-inv', blockIds: ['B'] };
 
-async function makeVote(arb: KeyPair, disputeId: string, vote: ArbitrationVote['vote'], targetHash: string): Promise<ArbitrationVote> {
+async function makeVote(arb: KeyPair, disputeId: string, vote: ArbitrationVote['vote'], targetHash: string, setHash: string): Promise<ArbitrationVote> {
 	const computedHash = 'h';
-	const sig = await arb.privateKey.sign(new TextEncoder().encode(`v2:${disputeId}:${vote}:${computedHash}:${targetHash}`));
+	const sig = await arb.privateKey.sign(voteSigningPayload(disputeId, vote, computedHash, targetHash, setHash));
 	return {
-		version: 'v2', disputeId, arbitratorPeerId: arb.peerId.toString(), vote,
+		version: 'v3', disputeId, arbitratorPeerId: arb.peerId.toString(), vote,
 		evidence: { computedHash, engineId: 'e', schemaHash: 's', blockStateHashes: {} },
 		signature: uint8ArrayToString(sig, 'base64url'),
 	};
 }
 
-async function challengerWinsProof(disputeId: string): Promise<DisputeResolutionProof> {
-	const arbs = await Promise.all([makeKeyPair(), makeKeyPair(), makeKeyPair()]);
+// Build a v3 proof: arbs cast `verdict` bound to (PROOF_TARGET, set-of-arbs); a fresh challenger signs
+// the set. Returns the proof plus the genuine arbitrator-set strings (for recompute assertions).
+async function makeProof(disputeId: string, outcome: DisputeResolution['outcome'], verdict: ArbitrationVote['vote'], arbCount: number): Promise<{ proof: DisputeResolutionProof; arbitratorSet: string[] }> {
+	const challenger = await makeKeyPair();
+	const arbs = await Promise.all(Array.from({ length: arbCount }, () => makeKeyPair()));
+	const arbitratorSet = arbs.map(a => a.peerId.toString());
 	const targetHash = await computeTargetHash(PROOF_MSG, PROOF_TARGET);
-	const votes = await Promise.all(arbs.map(a => makeVote(a, disputeId, 'agree-with-challenger', targetHash)));
-	const resolution: DisputeResolution = { disputeId, outcome: 'challenger-wins', votes, affectedPeers: [], timestamp: 1 };
-	return buildDisputeResolutionProof(resolution, PROOF_MSG);
+	const setHash = await computeArbitratorSetHash(arbitratorSet);
+	const votes = await Promise.all(arbs.map(a => makeVote(a, disputeId, verdict, targetHash, setHash)));
+	const resolution: DisputeResolution = { disputeId, outcome, votes, affectedPeers: [], timestamp: 1 };
+	const arbitratorSetSignature = uint8ArrayToString(await challenger.privateKey.sign(arbitratorSetSigningPayload(disputeId, targetHash, setHash)), 'base64url');
+	const proof = buildDisputeResolutionProof(resolution, PROOF_MSG, { arbitratorSet, challengerPeerId: challenger.peerId.toString(), arbitratorSetSignature });
+	return { proof, arbitratorSet };
+}
+
+async function challengerWinsProof(disputeId: string): Promise<DisputeResolutionProof> {
+	return (await makeProof(disputeId, 'challenger-wins', 'agree-with-challenger', 3)).proof;
 }
 
 async function majorityWinsProof(disputeId: string): Promise<DisputeResolutionProof> {
-	const arbs = await Promise.all([makeKeyPair(), makeKeyPair()]);
-	const targetHash = await computeTargetHash(PROOF_MSG, PROOF_TARGET);
-	const votes = await Promise.all(arbs.map(a => makeVote(a, disputeId, 'agree-with-majority', targetHash)));
-	const resolution: DisputeResolution = { disputeId, outcome: 'majority-wins', votes, affectedPeers: [], timestamp: 1 };
-	return buildDisputeResolutionProof(resolution, PROOF_MSG);
+	return (await makeProof(disputeId, 'majority-wins', 'agree-with-majority', 2)).proof;
 }
 
 function invalidateOp(resolution: DisputeResolutionProof, actionId = 'a-inv'): RepoMessage['operations'] {
@@ -282,5 +289,63 @@ describe('ClusterMember invalidation apply path', () => {
 		await member.update(r2); // retry under a new messageHash → applies
 
 		expect(calls).to.equal(2);
+	});
+
+	it('rejects the certificate (no sink) when the injected recompute judges the arbitrator set illegitimate (#1 layer 2)', async () => {
+		const received: InvalidateRequest[] = [];
+		// A recompute that reconstructs a DIFFERENT genuine set → the carried set is not legitimate → reject,
+		// even though the certificate is layer-1-consistent. This is the malicious-challenger closure.
+		const recomputeArbitratorSet: ArbitratorSetRecompute = async () => ({ feasible: true, legitimate: false });
+		member = clusterMember({
+			storageRepo: new MockRepo(), peerNetwork: new MockNetwork(),
+			peerId: self.peerId, privateKey: self.privateKey,
+			onInvalidate: async (req) => { received.push(req); },
+			recomputeArbitratorSet,
+		});
+
+		const proof = await challengerWinsProof('d1');
+		const record = await makeConsensusRecord(self, invalidateOp(proof), Date.now() + 30000);
+		await member.update(record);
+
+		expect(received).to.have.lengthOf(0);
+	});
+
+	it('applies the certificate when the injected recompute anchors the arbitrator set (#1 layer 2)', async () => {
+		const received: InvalidateRequest[] = [];
+		// A recompute that confirms the carried set matches the recomputed eligible set → fully anchored.
+		const recomputeArbitratorSet: ArbitratorSetRecompute = async (ctx) => ({
+			feasible: true,
+			legitimate: ctx.arbitratorSet.length === 3,
+		});
+		member = clusterMember({
+			storageRepo: new MockRepo(), peerNetwork: new MockNetwork(),
+			peerId: self.peerId, privateKey: self.privateKey,
+			onInvalidate: async (req) => { received.push(req); },
+			recomputeArbitratorSet,
+		});
+
+		const proof = await challengerWinsProof('d1');
+		const record = await makeConsensusRecord(self, invalidateOp(proof), Date.now() + 30000);
+		await member.update(record);
+
+		expect(received).to.have.lengthOf(1);
+		expect(received[0]!.resolution.disputeId).to.equal('d1');
+	});
+
+	it('applies a layer-1-valid certificate with no recompute capability (degradation posture)', async () => {
+		// No `recomputeArbitratorSet` wired → the member accepts on the challenger-bound set + membership +
+		// dedup and logs the residual anchoring gap (the documented interim behavior). The sink still fires.
+		const received: InvalidateRequest[] = [];
+		member = clusterMember({
+			storageRepo: new MockRepo(), peerNetwork: new MockNetwork(),
+			peerId: self.peerId, privateKey: self.privateKey,
+			onInvalidate: async (req) => { received.push(req); },
+		});
+
+		const proof = await challengerWinsProof('d1');
+		const record = await makeConsensusRecord(self, invalidateOp(proof), Date.now() + 30000);
+		await member.update(record);
+
+		expect(received).to.have.lengthOf(1);
 	});
 });

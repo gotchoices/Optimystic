@@ -577,6 +577,12 @@ export async function createLibp2pNodeBase(
 		stateStore: options.transactionStateStore,
 		reconcileBlock,
 		onCommitCertificate
+		// `recomputeArbitratorSet` (invalidation layer-2) is intentionally NOT wired here yet: a live FRET
+		// recompute needs a churn-tolerance window so it does not false-reject legitimate certificates from
+		// late-joiners (a liveness regression). Until that is tuned against live topology — and the
+		// cohort-topic membership-cert trust anchor (layer 3) lands — invalidation verification runs on the
+		// challenger-bound set + membership + dedup (layer 1) and LOGS the residual anchoring gap. See
+		// `verifyInvalidationCertificate` and `tickets/plan/cohort-topic-membership-cert-trust-anchoring.md`.
 	});
 
 	const coordinatorRepoFactory = coordinatorRepo(

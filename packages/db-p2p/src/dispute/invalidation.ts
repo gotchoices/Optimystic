@@ -12,11 +12,11 @@ import { createLogger } from '../logger.js';
 const log = createLogger('invalidation');
 
 /**
- * Accepted arbitration-vote wire-format version. The signed payload is target-bound (binds the votes
- * to the specific reversed transaction); v1 (unbound) votes are rejected, never accepted-by-default.
- * The follow-up arbitrator-set ticket bumps this additively.
+ * Accepted arbitration-vote wire-format version. The v3 signed payload binds each vote to BOTH the
+ * specific reversed transaction (`targetHash`, #2) and the legitimately-selected arbitrator set
+ * (`setHash`, #1); v1/v2 (un-set-bound) votes are rejected, never accepted-by-default.
  */
-export const VOTE_VERSION = 'v2' as const;
+export const VOTE_VERSION = 'v3' as const;
 
 /**
  * The transaction an invalidation certificate's votes are bound to — the committed action being
@@ -42,6 +42,87 @@ export async function computeTargetHash(messageHash: string, target: Certificate
 }
 
 /**
+ * Digest of the legitimately-selected arbitrator set (#1) — `hashString(sortedArbitratorSet.join(','))`.
+ * Peer-ids are lexically sorted so the digest is independent of the order any party happens to list the
+ * set in, and every member (arbitrators signing votes, the challenger signing the set, the verifier)
+ * recomputes an identical `setHash`.
+ */
+export async function computeArbitratorSetHash(arbitratorSet: ReadonlyArray<string>): Promise<string> {
+	return await hashString([...arbitratorSet].sort().join(','));
+}
+
+/**
+ * The exact bytes an arbitrator signs for a v3 vote — `utf8(`v3:${disputeId}:${vote}:${computedHash}:${targetHash}:${setHash}`)`.
+ * Shared by the origination path ({@link makeVote in dispute-service}) and {@link verifyVoteSignature}
+ * so the signed and verified preimages can never drift.
+ */
+export function voteSigningPayload(disputeId: string, vote: string, computedHash: string, targetHash: string, setHash: string): Uint8Array {
+	return new TextEncoder().encode(`${VOTE_VERSION}:${disputeId}:${vote}:${computedHash}:${targetHash}:${setHash}`);
+}
+
+/**
+ * The exact bytes the **challenger** signs to bind `(disputeId, target, arbitratorSet)` —
+ * `utf8(`v3set:${disputeId}:${targetHash}:${setHash}`)`. Verified against the challenger's embedded key
+ * ({@link DisputeResolutionProof.challengerPeerId}); shared with the origination path so it can never drift.
+ */
+export function arbitratorSetSigningPayload(disputeId: string, targetHash: string, setHash: string): Uint8Array {
+	return new TextEncoder().encode(`v3set:${disputeId}:${targetHash}:${setHash}`);
+}
+
+/**
+ * Context handed to an {@link ArbitratorSetRecompute} capability: everything it needs to re-derive the
+ * legitimate arbitrator set from the verifying member's own topology and judge the carried set against it.
+ */
+export type ArbitratorSetRecomputeContext = {
+	readonly disputeId: string;
+	readonly messageHash: string;
+	readonly invalidatedActionId: ActionId;
+	readonly blockIds: ReadonlyArray<BlockId>;
+	/** The carried set being judged (peer-id strings). */
+	readonly arbitratorSet: ReadonlyArray<string>;
+};
+
+/**
+ * Verdict from an {@link ArbitratorSetRecompute}:
+ *  - `{ feasible: false }` — the member could not reconstruct the historical selection (late-joiner,
+ *    churned DHT view); the verifier falls through to the degradation posture (layer-1 accept + log).
+ *  - `{ feasible: true, legitimate }` — it recomputed the eligible set and judged whether the carried
+ *    `arbitratorSet` matches it (within whatever churn tolerance the capability applies).
+ */
+export type ArbitratorSetVerdict =
+	| { readonly feasible: false }
+	| { readonly feasible: true; readonly legitimate: boolean };
+
+/**
+ * Injected **layer-2** capability: re-derives the legitimately-selected arbitrator set from the verifying
+ * member's topology view (it has `peerNetwork` / FRET routing) and judges the carried set. Supplied by
+ * callers that hold a network (e.g. `ClusterMember.applyConsensusInvalidation`); the pure
+ * {@link verifyInvalidationCertificate} stays usable without it (layer-1 + degradation). Closing the
+ * fully-malicious-challenger vector requires this layer (or the layer-3 trust anchor).
+ */
+export type ArbitratorSetRecompute = (ctx: ArbitratorSetRecomputeContext) => Promise<ArbitratorSetVerdict>;
+
+/** Reported when a certificate is accepted on layer-1 alone — see {@link VerifyCertificateOptions.onUnanchored}. */
+export type UnanchoredAcceptanceInfo = {
+	readonly disputeId: string;
+	readonly arbitratorSet: ReadonlyArray<string>;
+	/** Why the stronger layers did not apply. */
+	readonly reason: 'no-recompute-capability' | 'recompute-infeasible';
+};
+
+/** Optional capabilities a caller threads into {@link verifyInvalidationCertificate} when it has a network. */
+export type VerifyCertificateOptions = {
+	/** Layer-2 recompute capability; omitted → pure layer-1 verification with the documented degradation. */
+	readonly recomputeArbitratorSet?: ArbitratorSetRecompute;
+	/**
+	 * Invoked when the certificate is accepted on the challenger-bound set + membership + dedup ALONE —
+	 * the interim posture when neither recompute (layer 2) nor a trust anchor (layer 3) resolved the set.
+	 * Lets a caller surface "applied an invalidation it could not fully anchor" alongside the internal log.
+	 */
+	readonly onUnanchored?: (info: UnanchoredAcceptanceInfo) => void;
+};
+
+/**
  * Marks a `reverted` block whose as-if-`T_inv`-absent state is a *deletion* (T_inv created the
  * block, so there is no prior content to restore). The single-collection core does not yet
  * physically remove such blocks — it records and logs them; the cascade ticket completes the
@@ -52,16 +133,32 @@ export const DEFERRED_DELETE_RESTORE = 'deferred:block-creation-reversal';
 // ─── DisputeResolution → DisputeResolutionProof ───
 
 /**
- * Projects a db-p2p {@link DisputeResolution} onto the db-core {@link DisputeResolutionProof} —
- * the independently-verifiable subset (outcome + signed votes) that an {@link InvalidationEntry}
- * carries. `messageHash` is the original transaction's hash (from the challenge), the anchor the
- * proof pins the reversal to.
+ * The arbitrator-set binding a proof carries (#1): the legitimately-selected set, the challenger that
+ * selected it, and the challenger's signature over `(disputeId, target, arbitratorSet)`. Assembled by
+ * the originator ({@link DisputeService.maybeInvalidate}), which holds the selected set from
+ * `initiateDispute` and signs it with the challenger's key.
  */
-export function buildDisputeResolutionProof(resolution: DisputeResolution, messageHash: string): DisputeResolutionProof {
+export type ArbitratorSetBinding = {
+	readonly arbitratorSet: ReadonlyArray<string>;
+	readonly challengerPeerId: string;
+	readonly arbitratorSetSignature: string;
+};
+
+/**
+ * Projects a db-p2p {@link DisputeResolution} onto the db-core {@link DisputeResolutionProof} —
+ * the independently-verifiable subset (outcome + signed votes + arbitrator-set binding) that an
+ * {@link InvalidationEntry} carries. `messageHash` is the original transaction's hash (from the
+ * challenge), the anchor the proof pins the reversal to; `binding` carries the legitimately-selected
+ * arbitrator set and the challenger's signature over it (#1).
+ */
+export function buildDisputeResolutionProof(resolution: DisputeResolution, messageHash: string, binding: ArbitratorSetBinding): DisputeResolutionProof {
 	return {
 		disputeId: resolution.disputeId,
 		messageHash,
 		outcome: resolution.outcome,
+		challengerPeerId: binding.challengerPeerId,
+		arbitratorSet: binding.arbitratorSet,
+		arbitratorSetSignature: binding.arbitratorSetSignature,
 		votes: resolution.votes.map(toVoteProof),
 	};
 }
@@ -80,43 +177,73 @@ function toVoteProof(vote: ArbitrationVote): ArbitrationVoteProof {
 
 /**
  * Verifies that a {@link DisputeResolutionProof} is a valid invalidation certificate — the reversal
- * analogue of the commit certificate. A member accepts an invalidation **only** if this returns true:
- *
- *  - the claimed `outcome` is `challenger-wins`, AND
- *  - recomputing from the *cryptographically valid, deduped* votes alone, the `agree-with-challenger`
- *    votes meet the 2/3 super-majority of decisive votes (mirrors `DisputeService.resolveDispute`).
+ * analogue of the commit certificate. A member accepts an invalidation **only** if this returns true.
+ * Defense-in-depth, strongest-available-layer-wins:
  *
  * **Target binding (#2).** `target` is the transaction actually being reverted; the verifier recomputes
- * `targetHash` from `proof.messageHash` + `target` and checks each vote's signature over the v2 payload
- * `v2:${disputeId}:${vote}:${computedHash}:${targetHash}`. Because the arbitrators signed the *real*
- * transaction's `targetHash`, feeding any other target (a replay against an innocent transaction) makes
- * every signature fail. A vote whose version is absent/unrecognized (legacy/v1) is rejected before
- * counting — never accepted-by-default.
+ * `targetHash` from `proof.messageHash` + `target` and checks each vote's signature over the v3 payload
+ * `v3:${disputeId}:${vote}:${computedHash}:${targetHash}:${setHash}`. Because the arbitrators signed the
+ * *real* transaction's `targetHash`, feeding any other target (a replay against an innocent transaction)
+ * makes every signature fail. A vote whose version is absent/unrecognized (legacy/v1/v2) is rejected
+ * before counting — never accepted-by-default.
  *
- * **Per-arbitrator dedup (#3).** Decisive votes are tallied at most once per `arbitratorPeerId`:
- *  - a repeated *identical* decisive vote counts once (so one vote replicated N× cannot manufacture a
- *    super-majority);
- *  - an arbitrator that appears twice with *different* decisive votes (equivocation) is dropped entirely
- *    — counted on neither side — so a forger cannot place one peer on both sides.
- * `inconclusive` votes are valid but non-decisive and never tallied.
+ * **Arbitrator-set binding (#1) — layer 1 (always).** The proof carries `arbitratorSet` (the K peer-ids
+ * the challenger selected) and `arbitratorSetSignature` (the challenger's signature over
+ * `(disputeId, target, arbitratorSet)`, verified against `challengerPeerId`'s embedded key). The verifier:
+ *  - rejects a proof missing the set / challenger fields;
+ *  - rejects a proof whose challenger signature does not validate over the recomputed `(targetHash, setHash)`
+ *    — so tampering with the set (adding sybils) breaks the certificate;
+ *  - counts only votes whose `arbitratorPeerId` ∈ `arbitratorSet` (a signature-valid vote from a peer
+ *    outside the set is dropped), and whose vote payload also commits to the same `setHash`.
+ * This closes the third-party-relay / originator sybil vector and binds the originator. It does NOT by
+ * itself stop a *fully-malicious* challenger (who legitimately holds its own key and signs a sybil set it
+ * minted) — that needs layer 2 or 3.
  *
- * **Not yet bound (#1).** This does NOT yet check that the counted arbitrators are the legitimately
- * selected set; a peer that can mint Ed25519 keypairs can still present a synthetic cohort. That is the
- * follow-up `invalidation-cert-arbitrator-set-binding`; the dedup here is designed to compose with the
- * set-membership check it adds.
+ * **Per-arbitrator dedup (#3).** Among the in-set votes, decisive verdicts are tallied at most once per
+ * `arbitratorPeerId`: a repeated identical decisive vote counts once; an arbitrator with conflicting
+ * decisive votes (equivocation) is dropped from both sides. `inconclusive` votes are non-decisive.
+ *
+ * **Recompute — layer 2 (best effort).** When `options.recomputeArbitratorSet` is supplied (the caller
+ * holds a topology view), the carried set is re-derived and judged. A `{feasible:true, legitimate:false}`
+ * verdict rejects the certificate even though layer 1 passed — closing the malicious-challenger vector.
+ * `{feasible:false}` (member can't reconstruct the historical topology) falls through to degradation.
+ *
+ * **Degradation (layer 3 / none-available).** With no recompute capability (or an infeasible recompute)
+ * and no trust anchor yet, a layer-1-valid certificate is **accepted and logged** as not-fully-anchored
+ * (and `options.onUnanchored` is invoked) — never a silent accept-by-default, and never a false reject
+ * that would break liveness for late-joiners. This is the interim posture until the cohort-topic
+ * membership-cert trust-anchor chain lands (`tickets/plan/cohort-topic-membership-cert-trust-anchoring.md`),
+ * at which point it is upgraded to a hard gate.
  */
-export async function verifyInvalidationCertificate(proof: DisputeResolutionProof, target: CertificateTarget): Promise<boolean> {
+export async function verifyInvalidationCertificate(proof: DisputeResolutionProof, target: CertificateTarget, options: VerifyCertificateOptions = {}): Promise<boolean> {
 	if (proof.outcome !== 'challenger-wins') {
 		return false;
 	}
 
-	const targetHash = await computeTargetHash(proof.messageHash, target);
+	// Structural: a v3 certificate must carry the arbitrator-set binding. Absent → reject (never accept a
+	// pre-set-binding proof by default).
+	if (!proof.arbitratorSet?.length || !proof.challengerPeerId || !proof.arbitratorSetSignature) {
+		return false;
+	}
 
-	// Decisive verdict per arbitrator, deduped and equivocation-dropped (see doc-comment).
+	const targetHash = await computeTargetHash(proof.messageHash, target);
+	const setHash = await computeArbitratorSetHash(proof.arbitratorSet);
+
+	// Layer 1a: challenger binds (disputeId, target, arbitratorSet). A tampered set breaks this signature.
+	if (!(await verifyChallengerSetSignature(proof, targetHash, setHash))) {
+		log('verify-reject-challenger-set-signature disputeId=%s challenger=%s', proof.disputeId, proof.challengerPeerId);
+		return false;
+	}
+
+	// Layer 1b: count only signature-valid, target+set-bound, in-set votes — deduped/equivocation-dropped.
+	const arbitratorSet = new Set(proof.arbitratorSet);
 	type Decisive = 'agree-with-challenger' | 'agree-with-majority';
 	const decisiveByArbitrator = new Map<string, Decisive | 'equivocated'>();
 	for (const vote of proof.votes) {
-		if (!(await verifyVoteSignature(proof.disputeId, vote, targetHash))) {
+		if (!arbitratorSet.has(vote.arbitratorPeerId)) {
+			continue; // not a legitimately-selected arbitrator → never counted (#1)
+		}
+		if (!(await verifyVoteSignature(proof.disputeId, vote, targetHash, setHash))) {
 			continue;
 		}
 		if (vote.vote !== 'agree-with-challenger' && vote.vote !== 'agree-with-majority') {
@@ -147,15 +274,76 @@ export async function verifyInvalidationCertificate(proof: DisputeResolutionProo
 		return false;
 	}
 	const superMajorityThreshold = Math.ceil(totalDecisive * 2 / 3);
-	return challengerVotes >= superMajorityThreshold;
+	if (challengerVotes < superMajorityThreshold) {
+		return false;
+	}
+
+	// Layer 2: re-derive the eligible set from the member's own topology when it can — closes a
+	// fully-malicious challenger that self-signed a sybil set that passed layer 1.
+	if (options.recomputeArbitratorSet) {
+		const verdict = await options.recomputeArbitratorSet({
+			disputeId: proof.disputeId,
+			messageHash: proof.messageHash,
+			invalidatedActionId: target.invalidatedActionId,
+			blockIds: target.blockIds,
+			arbitratorSet: proof.arbitratorSet,
+		});
+		if (verdict.feasible) {
+			if (!verdict.legitimate) {
+				log('verify-reject-recompute-mismatch disputeId=%s', proof.disputeId);
+				return false;
+			}
+			return true; // fully anchored to the recomputed topology
+		}
+		// infeasible → fall through to the documented degradation posture
+		return acceptUnanchored(proof, 'recompute-infeasible', options);
+	}
+
+	// Layer 3 / none-available: accept on layer 1 alone, but never silently — log + surface the residual.
+	return acceptUnanchored(proof, 'no-recompute-capability', options);
+}
+
+/**
+ * Accept-and-log a layer-1-valid certificate that could not be fully anchored (no recompute capability
+ * or an infeasible recompute, and no trust anchor yet). Documented interim posture — never a silent
+ * accept. Returns true.
+ */
+function acceptUnanchored(proof: DisputeResolutionProof, reason: UnanchoredAcceptanceInfo['reason'], options: VerifyCertificateOptions): boolean {
+	log('verify-accept-unanchored disputeId=%s reason=%s setSize=%d', proof.disputeId, reason, proof.arbitratorSet.length);
+	try {
+		options.onUnanchored?.({ disputeId: proof.disputeId, arbitratorSet: proof.arbitratorSet, reason });
+	} catch (err) {
+		log('verify-onUnanchored-error disputeId=%s error=%o', proof.disputeId, err);
+	}
+	return true;
+}
+
+/**
+ * Verify the challenger's signature binding `(disputeId, target, arbitratorSet)` against the embedded
+ * Ed25519 key in `proof.challengerPeerId`. Closes the third-party-relay sybil vector: a relay cannot
+ * swap the carried set without the challenger's key.
+ */
+async function verifyChallengerSetSignature(proof: DisputeResolutionProof, targetHash: string, setHash: string): Promise<boolean> {
+	try {
+		const publicKey = peerIdFromString(proof.challengerPeerId).publicKey;
+		if (!publicKey) {
+			return false;
+		}
+		const payload = arbitratorSetSigningPayload(proof.disputeId, targetHash, setHash);
+		const sigBytes = uint8ArrayFromString(proof.arbitratorSetSignature, 'base64url');
+		return await publicKey.verify(payload, sigBytes);
+	} catch (err) {
+		log('challenger-set-signature-verify-error challenger=%s error=%o', proof.challengerPeerId, err);
+		return false;
+	}
 }
 
 /**
  * Verify one arbitration vote's Ed25519 signature against its arbitrator peer id's embedded key, over
- * the **target-bound v2 payload**. Rejects any vote that is not the v2 format before trusting it, so a
- * legacy/unversioned vote can never slip through.
+ * the **target- and set-bound v3 payload**. Rejects any vote that is not the v3 format before trusting
+ * it, so a legacy/unversioned (v1/v2) vote can never slip through.
  */
-async function verifyVoteSignature(disputeId: string, vote: ArbitrationVoteProof, targetHash: string): Promise<boolean> {
+async function verifyVoteSignature(disputeId: string, vote: ArbitrationVoteProof, targetHash: string, setHash: string): Promise<boolean> {
 	// Runtime gate: `vote` arrives off the wire, so its `version` may not match the declared type.
 	if (vote.version !== VOTE_VERSION) {
 		return false;
@@ -165,7 +353,7 @@ async function verifyVoteSignature(disputeId: string, vote: ArbitrationVoteProof
 		if (!publicKey) {
 			return false;
 		}
-		const payload = new TextEncoder().encode(`${VOTE_VERSION}:${disputeId}:${vote.vote}:${vote.computedHash}:${targetHash}`);
+		const payload = voteSigningPayload(disputeId, vote.vote, vote.computedHash, targetHash, setHash);
 		const sigBytes = uint8ArrayFromString(vote.signature, 'base64url');
 		return await publicKey.verify(payload, sigBytes);
 	} catch (err) {

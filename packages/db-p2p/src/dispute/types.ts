@@ -32,16 +32,24 @@ export type DisputeChallenge = {
 	timestamp: number;
 	/** TTL for arbitration (default: 2 × transaction TTL) */
 	expiration: number;
+	/**
+	 * The legitimately-selected arbitrator set (peer-id strings) the challenger computed for this dispute
+	 * — the next K peers beyond the original cluster. Carried on the challenge so each arbitrator folds its
+	 * digest (`setHash`) into the v3 vote it signs, binding the votes to the set (#1). Absent only on a
+	 * pre-v3 challenger; such votes will not verify against a v3 proof. The originator independently carries
+	 * the same set on {@link DisputeResolutionProof.arbitratorSet}.
+	 */
+	arbitratorSet?: string[];
 };
 
 /** An arbitrator's independent assessment */
 export type ArbitrationVote = {
 	/**
-	 * Wire-format version of the signed vote payload (target-bound). Mirrors
+	 * Wire-format version of the signed vote payload (target- and arbitrator-set-bound). Mirrors
 	 * {@link ArbitrationVoteProof.version}; kept in lock-step so origination and the proof projection
-	 * agree. Only `'v2'` is produced/accepted today.
+	 * agree. Only `'v3'` is produced/accepted today.
 	 */
-	version: 'v2';
+	version: 'v3';
 	/** Dispute being voted on */
 	disputeId: string;
 	/** Peer ID of the arbitrator */

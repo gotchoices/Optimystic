@@ -2,7 +2,7 @@ import type { IRepo, ClusterRecord, Signature, RepoMessage, ITransactionValidato
 import type { ICluster } from "@optimystic/db-core";
 import type { IPeerNetwork } from "@optimystic/db-core";
 import { blockIdsForTransforms } from "@optimystic/db-core";
-import { verifyInvalidationCertificate } from "../dispute/invalidation.js";
+import { verifyInvalidationCertificate, type ArbitratorSetRecompute } from "../dispute/invalidation.js";
 import { buildCommitCert, invalidationActionId } from "./commit-cert.js";
 import { ClusterClient } from "./client.js";
 import type { PeerId, PrivateKey } from "@libp2p/interface";
@@ -74,6 +74,17 @@ export type CommitCertificateSink = (actionId: ActionId, cert: CommitCert) => vo
  */
 export type InvalidationApplySink = (request: InvalidateRequest) => Promise<void>;
 
+/**
+ * Optional **layer-2** capability for invalidation-certificate verification: re-derives the
+ * legitimately-selected arbitrator set from this member's topology view and judges the carried set
+ * (see {@link ArbitratorSetRecompute}). Injected so {@link ClusterMember} stays network-agnostic; the
+ * composition root supplies it from FRET when available. When absent (or when the member cannot
+ * reconstruct the historical topology), {@link applyConsensusInvalidation} accepts a layer-1-valid
+ * certificate and logs that it applied an invalidation it could not fully anchor — the documented
+ * interim posture (see `tickets/plan/cohort-topic-membership-cert-trust-anchoring.md`).
+ */
+export type RecomputeArbitratorSetCapability = ArbitratorSetRecompute;
+
 interface ClusterMemberComponents {
 	storageRepo: IRepo;
 	peerNetwork: IPeerNetwork;
@@ -93,6 +104,8 @@ interface ClusterMemberComponents {
 	onCommitCertificate?: CommitCertificateSink;
 	/** Applies a consensus-ordered invalidation to local storage; see {@link InvalidationApplySink}. */
 	onInvalidate?: InvalidationApplySink;
+	/** Layer-2 arbitrator-set recompute for invalidation verification; see {@link RecomputeArbitratorSetCapability}. */
+	recomputeArbitratorSet?: RecomputeArbitratorSetCapability;
 }
 
 export function clusterMember(components: ClusterMemberComponents): ClusterMember {
@@ -110,7 +123,8 @@ export function clusterMember(components: ClusterMemberComponents): ClusterMembe
 		components.stateStore,
 		components.reconcileBlock,
 		components.onCommitCertificate,
-		components.onInvalidate
+		components.onInvalidate,
+		components.recomputeArbitratorSet
 	);
 }
 
@@ -172,7 +186,8 @@ export class ClusterMember implements ICluster {
 		private readonly stateStore?: ITransactionStateStore,
 		private readonly reconcileBlock?: ReconcileBlockCallback,
 		private readonly onCommitCertificate?: CommitCertificateSink,
-		private readonly onInvalidate?: InvalidationApplySink
+		private readonly onInvalidate?: InvalidationApplySink,
+		private readonly recomputeArbitratorSet?: RecomputeArbitratorSetCapability
 	) {
 		this.superMajorityThreshold = consensusConfig?.superMajorityThreshold ?? 1.0;
 		// Periodically clean up expired transactions (.unref() so tests/short-lived processes can exit)
@@ -903,8 +918,26 @@ export class ClusterMember implements ICluster {
 		// Certificate verification BEFORE apply — never trust the originator's say-so. Verify the proof
 		// against THIS request's own target: the votes are bound to the transaction the dispute resolved,
 		// so a genuine proof carried in a request that points at a different (innocent) action/blocks fails
-		// here. This is the network-facing replay boundary (#2) — it never reuses a different target.
-		if (!await verifyInvalidationCertificate(request.resolution, { invalidatedActionId: request.invalidatedActionId, blockIds: request.blockIds })) {
+		// here (the network-facing replay boundary, #2). The proof is also bound to the legitimately-selected
+		// arbitrator set (#1): membership + the challenger's set signature gate it (layer 1), and when a
+		// recompute capability is wired we re-derive the eligible set from our topology and reject a forged
+		// one (layer 2). When we cannot reconstruct the historical topology, we accept on layer 1 and LOG
+		// that the invalidation was applied without full anchoring — the documented interim posture.
+		const certified = await verifyInvalidationCertificate(
+			request.resolution,
+			{ invalidatedActionId: request.invalidatedActionId, blockIds: request.blockIds },
+			{
+				recomputeArbitratorSet: this.recomputeArbitratorSet,
+				onUnanchored: (info) => log('cluster-member:consensus-invalidate-unanchored', {
+					messageHash,
+					invalidatedActionId: request.invalidatedActionId,
+					disputeId: info.disputeId,
+					reason: info.reason,
+					arbitratorSetSize: info.arbitratorSet.length
+				})
+			}
+		);
+		if (!certified) {
 			log('cluster-member:consensus-invalidate-reject-certificate', {
 				messageHash,
 				invalidatedActionId: request.invalidatedActionId,

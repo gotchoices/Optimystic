@@ -1,6 +1,6 @@
 import type { ClusterRecord, ITransactionValidator, InvalidateRequest, CommitRequest, PendRequest, CollectionId } from '@optimystic/db-core';
 import { blockIdsForTransforms } from '@optimystic/db-core';
-import { buildDisputeResolutionProof, computeTargetHash, VOTE_VERSION, type CertificateTarget } from './invalidation.js';
+import { buildDisputeResolutionProof, computeTargetHash, computeArbitratorSetHash, voteSigningPayload, arbitratorSetSigningPayload, VOTE_VERSION, type CertificateTarget } from './invalidation.js';
 import type { PeerId, PrivateKey } from '@libp2p/interface';
 import { sha256 } from 'multiformats/hashes/sha2';
 import { base58btc } from 'multiformats/bases/base58';
@@ -156,21 +156,8 @@ export class DisputeService {
 			: this.config.disputeArbitrationTimeoutMs * 2;
 		const expiration = timestamp + Math.max(defaultTtl, this.config.disputeArbitrationTimeoutMs);
 
-		const challenge: DisputeChallenge = {
-			disputeId,
-			originalMessageHash: record.messageHash,
-			originalRecord: record,
-			challengerPeerId: this.peerId.toString(),
-			challengerEvidence: evidence,
-			signature,
-			timestamp,
-			expiration,
-		};
-
-		this.activeDisputes.set(disputeId, challenge);
-		log('dispute-initiated', { disputeId, messageHash: record.messageHash });
-
-		// Select arbitrators and collect votes
+		// Select the arbitrator set FIRST so the challenge can carry it: each arbitrator folds the set's
+		// digest into the v3 vote it signs, binding every vote to the legitimately-selected set (#1).
 		const blockIds = record.coordinatingBlockIds ?? [];
 		const blockId = blockIds[0] ?? record.messageHash;
 		const originalPeers = Object.keys(record.peers);
@@ -181,15 +168,30 @@ export class DisputeService {
 			arbitrators = await this.selectArbitrators(blockId, originalPeers, arbitratorCount);
 		} catch (err) {
 			log('dispute-arbitrator-selection-failed', { disputeId, error: err instanceof Error ? err.message : String(err) });
-			this.activeDisputes.delete(disputeId);
 			return undefined;
 		}
 
 		if (arbitrators.length === 0) {
 			log('dispute-no-arbitrators', { disputeId });
-			this.activeDisputes.delete(disputeId);
 			return undefined;
 		}
+
+		const arbitratorSet = arbitrators.map(a => a.toString());
+
+		const challenge: DisputeChallenge = {
+			disputeId,
+			originalMessageHash: record.messageHash,
+			originalRecord: record,
+			challengerPeerId: this.peerId.toString(),
+			challengerEvidence: evidence,
+			signature,
+			timestamp,
+			expiration,
+			arbitratorSet,
+		};
+
+		this.activeDisputes.set(disputeId, challenge);
+		log('dispute-initiated', { disputeId, messageHash: record.messageHash });
 
 		// Send challenge to all arbitrators and collect votes
 		const votes = await this.collectVotes(challenge, arbitrators);
@@ -202,8 +204,9 @@ export class DisputeService {
 		// Apply reputation effects
 		this.applyReputationEffects(resolution, record);
 
-		// On a proven-invalid transaction, originate the durable reversal through the cluster.
-		await this.maybeInvalidate(resolution, record);
+		// On a proven-invalid transaction, originate the durable reversal through the cluster. The
+		// challenger-selected `arbitratorSet` is bound into the proof (#1).
+		await this.maybeInvalidate(resolution, record, arbitratorSet);
 
 		// Broadcast resolution
 		await this.broadcastResolution(resolution, arbitrators, originalPeers);
@@ -225,9 +228,11 @@ export class DisputeService {
 	async handleChallenge(challenge: DisputeChallenge): Promise<ArbitrationVote> {
 		log('dispute-handle-challenge', { disputeId: challenge.disputeId });
 
-		// Bind every vote to the disputed transaction: derive the reversal target the same way the
-		// originator/apply path does (so the verifier recomputes an identical targetHash), and sign over it.
+		// Bind every vote to the disputed transaction AND the legitimately-selected arbitrator set: derive
+		// the reversal target the same way the originator/apply path does (so the verifier recomputes an
+		// identical targetHash), digest the set the challenger carried, and sign over both (#1, #2).
 		const targetHash = await this.computeChallengeTargetHash(challenge);
+		const setHash = await computeArbitratorSetHash(challenge.arbitratorSet ?? []);
 
 		// Verify the challenge signature
 		const validSignature = await this.verifyDisputeSignature(
@@ -243,7 +248,7 @@ export class DisputeService {
 				engineId: 'unknown',
 				schemaHash: '',
 				blockStateHashes: {},
-			}, targetHash);
+			}, targetHash, setHash);
 		}
 
 		// Re-execute the transaction to produce our own evidence
@@ -266,7 +271,7 @@ export class DisputeService {
 				engineId: 'unknown',
 				schemaHash: '',
 				blockStateHashes: {},
-			}, targetHash);
+			}, targetHash, setHash);
 		}
 
 		// Compare our evidence with the challenger's
@@ -279,7 +284,7 @@ export class DisputeService {
 			vote = 'agree-with-majority';
 		}
 
-		return this.makeVote(challenge.disputeId, vote, evidence, targetHash);
+		return this.makeVote(challenge.disputeId, vote, evidence, targetHash, setHash);
 	}
 
 	/**
@@ -417,7 +422,7 @@ export class DisputeService {
 	 * drives it through the critical cluster). Fires at most once per disputed transaction. A no-op
 	 * when no originator is wired (the in-memory status still flips via {@link getDisputeStatus}).
 	 */
-	private async maybeInvalidate(resolution: DisputeResolution, record: ClusterRecord): Promise<void> {
+	private async maybeInvalidate(resolution: DisputeResolution, record: ClusterRecord, arbitratorSet: string[]): Promise<void> {
 		if (resolution.outcome !== 'challenger-wins' || !this.onInvalidation) {
 			return;
 		}
@@ -431,13 +436,24 @@ export class DisputeService {
 			return;
 		}
 
+		// Bind the legitimately-selected arbitrator set (#1): the challenger signs (disputeId, target, set)
+		// so a third-party relay cannot swap in its own cohort. Same target derivation as the apply path.
+		const certTarget: CertificateTarget = { invalidatedActionId: target.actionId, blockIds: target.blockIds };
+		const targetHash = await computeTargetHash(record.messageHash, certTarget);
+		const setHash = await computeArbitratorSetHash(arbitratorSet);
+		const arbitratorSetSignature = await this.signArbitratorSet(resolution.disputeId, targetHash, setHash);
+
 		this.invalidatedTransactions.add(record.messageHash);
 		const request: InvalidateRequest = {
 			invalidatedActionId: target.actionId,
 			invalidatedRev: target.rev,
 			blockIds: target.blockIds,
 			collectionId: target.collectionId,
-			resolution: buildDisputeResolutionProof(resolution, record.messageHash),
+			resolution: buildDisputeResolutionProof(resolution, record.messageHash, {
+				arbitratorSet,
+				challengerPeerId: this.peerId.toString(),
+				arbitratorSetSignature,
+			}),
 		};
 
 		try {
@@ -522,12 +538,13 @@ export class DisputeService {
 		disputeId: string,
 		vote: ArbitrationVote['vote'],
 		evidence: ValidationEvidence,
-		targetHash: string
+		targetHash: string,
+		setHash: string
 	): Promise<ArbitrationVote> {
-		// Target-bound v2 payload: binds the vote to the specific transaction being reversed so a genuine
-		// vote cannot be replayed against an unrelated transaction.
-		const payload = `${VOTE_VERSION}:${disputeId}:${vote}:${evidence.computedHash}:${targetHash}`;
-		const payloadBytes = new TextEncoder().encode(payload);
+		// Target- and set-bound v3 payload: binds the vote to the specific transaction being reversed (#2)
+		// AND the legitimately-selected arbitrator set (#1) so a genuine vote can neither be replayed against
+		// an unrelated transaction nor presented under a swapped cohort.
+		const payloadBytes = voteSigningPayload(disputeId, vote, evidence.computedHash, targetHash, setHash);
 		const sigBytes = await this.privateKey.sign(payloadBytes);
 
 		return {
@@ -550,6 +567,16 @@ export class DisputeService {
 	private async signDispute(disputeId: string): Promise<string> {
 		const payload = new TextEncoder().encode(disputeId);
 		const sigBytes = await this.privateKey.sign(payload);
+		return uint8ArrayToString(sigBytes, 'base64url');
+	}
+
+	/**
+	 * Sign the arbitrator-set binding `(disputeId, target, arbitratorSet)` with the challenger's key.
+	 * Carried on the proof as {@link DisputeResolutionProof.arbitratorSetSignature}; a verifier validates
+	 * it against this peer's embedded key (`challengerPeerId`), so a relay cannot substitute its own cohort.
+	 */
+	private async signArbitratorSet(disputeId: string, targetHash: string, setHash: string): Promise<string> {
+		const sigBytes = await this.privateKey.sign(arbitratorSetSigningPayload(disputeId, targetHash, setHash));
 		return uint8ArrayToString(sigBytes, 'base64url');
 	}
 

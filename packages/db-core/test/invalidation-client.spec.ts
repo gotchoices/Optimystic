@@ -59,13 +59,18 @@ const initOptions = {
 }
 
 function makeProof(disputeId: string): DisputeResolutionProof {
+	// A structurally-complete v3 proof (these tests exercise client notification, not crypto verification —
+	// signatures are placeholders).
 	return {
 		disputeId,
 		messageHash: `msg-${disputeId}`,
 		outcome: 'challenger-wins',
+		challengerPeerId: 'challenger-1',
+		arbitratorSet: ['arb-1', 'arb-2'],
+		arbitratorSetSignature: 'set-sig',
 		votes: [
-			{ version: 'v2', arbitratorPeerId: 'arb-1', vote: 'agree-with-challenger', computedHash: 'h', signature: 'sig-1' },
-			{ version: 'v2', arbitratorPeerId: 'arb-2', vote: 'agree-with-challenger', computedHash: 'h', signature: 'sig-2' },
+			{ version: 'v3', arbitratorPeerId: 'arb-1', vote: 'agree-with-challenger', computedHash: 'h', signature: 'sig-1' },
+			{ version: 'v3', arbitratorPeerId: 'arb-2', vote: 'agree-with-challenger', computedHash: 'h', signature: 'sig-2' },
 		],
 	}
 }

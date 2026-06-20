@@ -44,24 +44,27 @@ export type ActionEntry<TAction> = {
  * it independently. The Ed25519 public key that verifies {@link signature} is embedded in
  * {@link arbitratorPeerId} (a libp2p Ed25519 peer id).
  *
- * The signed payload is **target-bound** (v2): `utf8(`v2:${disputeId}:${vote}:${computedHash}:${targetHash}`)`,
- * where `targetHash = hashString(`${messageHash}|${invalidatedActionId}|${sortedBlockIds.join(',')}`)`
- * commits the vote to the *specific* transaction being reversed. A verifier recomputes `targetHash`
- * from the {@link DisputeResolutionProof.messageHash} plus the apply-path target, so a genuine proof
- * cannot be replayed against an unrelated transaction. v1 (unbound) votes are rejected, not
- * accepted-by-default; the {@link version} marker is required and the follow-up arbitrator-set ticket
- * bumps it additively (`invalidation-cert-arbitrator-set-binding`).
+ * The signed payload is **target- and arbitrator-set-bound** (v3):
+ * `utf8(`v3:${disputeId}:${vote}:${computedHash}:${targetHash}:${setHash}`)`, where
+ *  - `targetHash = hashString(`${messageHash}|${invalidatedActionId}|${sortedBlockIds.join(',')}`)`
+ *    commits the vote to the *specific* transaction being reversed (#2), and
+ *  - `setHash = hashString(sortedArbitratorSet.join(','))` commits it to the *legitimately-selected
+ *    arbitrator set* (#1) carried on {@link DisputeResolutionProof.arbitratorSet}.
+ *
+ * A verifier recomputes both digests from the proof plus the apply-path target, so a genuine vote can
+ * neither be replayed against an unrelated transaction nor presented under a swapped cohort. v1/v2
+ * (un-set-bound) votes are rejected, not accepted-by-default; the {@link version} marker is required.
  */
 export type ArbitrationVoteProof = {
-	/** Wire-format version of the signed payload. Only `'v2'` is accepted; absent/unrecognized → rejected. */
-	readonly version: 'v2';
+	/** Wire-format version of the signed payload. Only `'v3'` is accepted; absent/unrecognized → rejected. */
+	readonly version: 'v3';
 	/** Peer id of the arbitrator; its embedded Ed25519 public key verifies {@link signature}. */
 	readonly arbitratorPeerId: string;
 	/** The arbitrator's verdict. */
 	readonly vote: 'agree-with-challenger' | 'agree-with-majority' | 'inconclusive';
 	/** The operations hash the arbitrator computed (part of the signed payload). */
 	readonly computedHash: string;
-	/** Base64url-encoded Ed25519 signature over `v2:${disputeId}:${vote}:${computedHash}:${targetHash}`. */
+	/** Base64url-encoded Ed25519 signature over `v3:${disputeId}:${vote}:${computedHash}:${targetHash}:${setHash}`. */
 	readonly signature: string;
 };
 
@@ -73,15 +76,21 @@ export type ArbitrationVoteProof = {
  * layer's richer `DisputeResolution` maps *onto* this proof rather than this proof importing it.
  * A member treats the proof as a reversal certificate — `outcome === 'challenger-wins'` with a
  * 2/3 super-majority of decisive votes agreeing with the challenger (each signature verifiable
- * against its arbitrator's embedded key, each vote target-bound and counted at most once per
- * arbitrator).
+ * against its arbitrator's embedded key, each vote target-bound, drawn from the legitimately-selected
+ * {@link arbitratorSet}, and counted at most once per arbitrator).
  *
- * **Unforgeability (partial).** The {@link messageHash} plus the apply-path target now bind the votes
- * to the specific reversed transaction (no cross-target replay), and per-arbitrator dedup prevents one
- * vote manufacturing a majority. A compromised peer still cannot forge a reversal for a *different*
- * transaction. The remaining gap — binding the votes to the *legitimately-selected arbitrator set* (so
- * a peer that can mint Ed25519 keypairs cannot stuff a synthetic cohort) — is closed by the follow-up
- * ticket `invalidation-cert-arbitrator-set-binding`; until it lands, "cannot forge" is not yet absolute.
+ * **Unforgeability.** Votes are bound to the reversed transaction (`targetHash`, #2), counted at most
+ * once per arbitrator (#3), and bound to the legitimately-selected arbitrator set (#1):
+ * {@link arbitratorSet} carries the K peer-ids the challenger selected, every counted vote must be a
+ * member of it, and {@link arbitratorSetSignature} — the challenger's Ed25519 signature (verified
+ * against {@link challengerPeerId}) over `(disputeId, target, arbitratorSet)` — binds the set to the
+ * originator so a third-party relay cannot swap in its own sybils. A verifying member additionally
+ * re-derives the eligible set from its own topology when it can (an injected recompute capability),
+ * closing even a fully-malicious challenger; when it cannot (late-joiner / churned DHT view) it accepts
+ * on the challenger-bound set + membership + dedup and *logs* the residual topology-anchoring gap rather
+ * than silently accepting — a gap closed in full by the cohort-topic membership-cert trust-anchor chain
+ * (`tickets/plan/cohort-topic-membership-cert-trust-anchoring.md`). Net: a compromised peer can withhold
+ * an invalidation but cannot forge one.
  */
 export type DisputeResolutionProof = {
 	/** Identifies the dispute these votes resolved. */
@@ -90,6 +99,25 @@ export type DisputeResolutionProof = {
 	readonly messageHash: string;
 	/** Resolution outcome; only `challenger-wins` authorizes an invalidation. */
 	readonly outcome: 'challenger-wins' | 'majority-wins' | 'inconclusive';
+	/**
+	 * Peer-id of the challenger (dissent coordinator) that selected the arbitrator set and produced
+	 * {@link arbitratorSetSignature}; its embedded Ed25519 key verifies that signature.
+	 */
+	readonly challengerPeerId: string;
+	/**
+	 * The legitimately-selected arbitrator set — the K peer-ids the challenger computed via
+	 * `selectArbitrators` (the next K peers beyond the original cluster by XOR distance to the disputed
+	 * block). Every counted vote's `arbitratorPeerId` must be a member; the set is bound to the originator
+	 * by {@link arbitratorSetSignature} and, when feasible, re-derived from the verifying member's topology.
+	 */
+	readonly arbitratorSet: ReadonlyArray<string>;
+	/**
+	 * The challenger's base64url Ed25519 signature (verified against {@link challengerPeerId}'s embedded
+	 * key) over `utf8(`v3set:${disputeId}:${targetHash}:${setHash}`)` — binds `(disputeId, target,
+	 * arbitratorSet)` to the originator so a relay cannot substitute its own cohort. Tampering with
+	 * {@link arbitratorSet} (e.g. adding sybils) invalidates this signature.
+	 */
+	readonly arbitratorSetSignature: string;
 	/** Signed arbitrator votes. */
 	readonly votes: ReadonlyArray<ArbitrationVoteProof>;
 };

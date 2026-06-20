@@ -534,9 +534,9 @@ describe('DisputeService', () => {
 			};
 
 			const votes: ArbitrationVote[] = [
-				{ version: 'v2', disputeId: 'test-resolve-1', arbitratorPeerId: 'arb-1', vote: 'agree-with-challenger', evidence: makeEvidence(), signature: 's1' },
-				{ version: 'v2', disputeId: 'test-resolve-1', arbitratorPeerId: 'arb-2', vote: 'agree-with-challenger', evidence: makeEvidence(), signature: 's2' },
-				{ version: 'v2', disputeId: 'test-resolve-1', arbitratorPeerId: 'arb-3', vote: 'agree-with-majority', evidence: makeEvidence(), signature: 's3' },
+				{ version: 'v3', disputeId: 'test-resolve-1', arbitratorPeerId: 'arb-1', vote: 'agree-with-challenger', evidence: makeEvidence(), signature: 's1' },
+				{ version: 'v3', disputeId: 'test-resolve-1', arbitratorPeerId: 'arb-2', vote: 'agree-with-challenger', evidence: makeEvidence(), signature: 's2' },
+				{ version: 'v3', disputeId: 'test-resolve-1', arbitratorPeerId: 'arb-3', vote: 'agree-with-majority', evidence: makeEvidence(), signature: 's3' },
 			];
 
 			const resolution = svc.resolveDispute(challenge, votes);
@@ -564,9 +564,9 @@ describe('DisputeService', () => {
 			};
 
 			const votes: ArbitrationVote[] = [
-				{ version: 'v2', disputeId: 'test-resolve-2', arbitratorPeerId: 'arb-1', vote: 'agree-with-majority', evidence: makeEvidence(), signature: 's1' },
-				{ version: 'v2', disputeId: 'test-resolve-2', arbitratorPeerId: 'arb-2', vote: 'agree-with-majority', evidence: makeEvidence(), signature: 's2' },
-				{ version: 'v2', disputeId: 'test-resolve-2', arbitratorPeerId: 'arb-3', vote: 'agree-with-challenger', evidence: makeEvidence(), signature: 's3' },
+				{ version: 'v3', disputeId: 'test-resolve-2', arbitratorPeerId: 'arb-1', vote: 'agree-with-majority', evidence: makeEvidence(), signature: 's1' },
+				{ version: 'v3', disputeId: 'test-resolve-2', arbitratorPeerId: 'arb-2', vote: 'agree-with-majority', evidence: makeEvidence(), signature: 's2' },
+				{ version: 'v3', disputeId: 'test-resolve-2', arbitratorPeerId: 'arb-3', vote: 'agree-with-challenger', evidence: makeEvidence(), signature: 's3' },
 			];
 
 			const resolution = svc.resolveDispute(challenge, votes);
@@ -595,9 +595,9 @@ describe('DisputeService', () => {
 			};
 
 			const votes: ArbitrationVote[] = [
-				{ version: 'v2', disputeId: 'test-resolve-3', arbitratorPeerId: 'arb-1', vote: 'agree-with-challenger', evidence: makeEvidence(), signature: 's1' },
-				{ version: 'v2', disputeId: 'test-resolve-3', arbitratorPeerId: 'arb-2', vote: 'agree-with-majority', evidence: makeEvidence(), signature: 's2' },
-				{ version: 'v2', disputeId: 'test-resolve-3', arbitratorPeerId: 'arb-3', vote: 'inconclusive', evidence: makeEvidence(), signature: 's3' },
+				{ version: 'v3', disputeId: 'test-resolve-3', arbitratorPeerId: 'arb-1', vote: 'agree-with-challenger', evidence: makeEvidence(), signature: 's1' },
+				{ version: 'v3', disputeId: 'test-resolve-3', arbitratorPeerId: 'arb-2', vote: 'agree-with-majority', evidence: makeEvidence(), signature: 's2' },
+				{ version: 'v3', disputeId: 'test-resolve-3', arbitratorPeerId: 'arb-3', vote: 'inconclusive', evidence: makeEvidence(), signature: 's3' },
 			];
 
 			const resolution = svc.resolveDispute(challenge, votes);
@@ -624,8 +624,8 @@ describe('DisputeService', () => {
 			};
 
 			const votes: ArbitrationVote[] = [
-				{ version: 'v2', disputeId: 'test-resolve-4', arbitratorPeerId: 'arb-1', vote: 'inconclusive', evidence: makeEvidence(), signature: 's1' },
-				{ version: 'v2', disputeId: 'test-resolve-4', arbitratorPeerId: 'arb-2', vote: 'inconclusive', evidence: makeEvidence(), signature: 's2' },
+				{ version: 'v3', disputeId: 'test-resolve-4', arbitratorPeerId: 'arb-1', vote: 'inconclusive', evidence: makeEvidence(), signature: 's1' },
+				{ version: 'v3', disputeId: 'test-resolve-4', arbitratorPeerId: 'arb-2', vote: 'inconclusive', evidence: makeEvidence(), signature: 's2' },
 			];
 
 			const resolution = svc.resolveDispute(challenge, votes);
