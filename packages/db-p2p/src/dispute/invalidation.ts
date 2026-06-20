@@ -64,9 +64,11 @@ export function voteSigningPayload(disputeId: string, vote: string, computedHash
  * The exact bytes the **challenger** signs to bind `(disputeId, target, arbitratorSet)` —
  * `utf8(`v3set:${disputeId}:${targetHash}:${setHash}`)`. Verified against the challenger's embedded key
  * ({@link DisputeResolutionProof.challengerPeerId}); shared with the origination path so it can never drift.
+ * The version marker is derived from {@link VOTE_VERSION} (currently `v3` → `v3set`) so a future format
+ * bump moves the vote and set preimages together — a proof is wholly one wire version, never a mix.
  */
 export function arbitratorSetSigningPayload(disputeId: string, targetHash: string, setHash: string): Uint8Array {
-	return new TextEncoder().encode(`v3set:${disputeId}:${targetHash}:${setHash}`);
+	return new TextEncoder().encode(`${VOTE_VERSION}set:${disputeId}:${targetHash}:${setHash}`);
 }
 
 /**
