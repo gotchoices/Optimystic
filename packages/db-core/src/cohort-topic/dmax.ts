@@ -7,8 +7,10 @@
  * d_max = max(0, ⌊log_F(n_est)⌋ − 1)
  * ```
  *
- * If `n_est` confidence falls below `confidence_min` (default 0.3) the computation clamps to
- * `d_max = ⌊d_max_cap / 2⌋` (`d_max_cap` default 60) to avoid pathological deep probes.
+ * If `n_est` confidence falls below `confidence_min` (default 0.3) the computation caps `d_max` at
+ * `⌊d_max_cap / 2⌋` (`d_max_cap` default 60) as an upper bound — i.e. `min(formula, ⌊d_max_cap / 2⌋)` —
+ * to avoid pathological deep probes from an over-estimated population. Small/sparse populations
+ * (where the formula already yields a small value) are unaffected.
  *
  * `d_max` is the start tier of the walk-toward-root and is recomputed **lazily** — participants
  * don't need it precise. The size estimate is read through the injected {@link ISizeEstimator}
@@ -19,11 +21,11 @@ import type { ISizeEstimator } from "./ports.js";
 
 /** Lazily computes the walk start tier `d_max` from the current network-size estimate. */
 export interface DMaxComputer {
-	/** Reads the size estimate, applies the low-confidence clamp, returns `d_max`. */
+	/** Reads the size estimate, applies the low-confidence cap, returns `d_max`. */
 	dMax(): number;
 }
 
-/** Default below which `n_est` confidence triggers the `d_max` clamp. */
+/** Default below which `n_est` confidence triggers the `d_max` cap. */
 export const DEFAULT_CONFIDENCE_MIN = 0.3;
 /** Default hard cap on the walk-toward-root start tier. */
 export const DEFAULT_D_MAX_CAP = 60;
@@ -33,9 +35,9 @@ export interface DMaxConfig {
 	estimator: ISizeEstimator;
 	/** Fan-out per tier (the `F` in `log_F`). */
 	F: number;
-	/** Confidence floor; below it `d_max` clamps to `⌊d_max_cap / 2⌋`. Default 0.3. */
+	/** Confidence floor; below it `d_max` is capped at `⌊d_max_cap / 2⌋` (upper bound). Default 0.3. */
 	confidenceMin?: number;
-	/** Hard cap on `d_max`; also drives the low-confidence clamp value. Default 60. */
+	/** Hard cap on `d_max`; also drives the low-confidence cap value. Default 60. */
 	dMaxCap?: number;
 }
 
@@ -68,16 +70,19 @@ export function makeDMaxComputer(config: DMaxConfig): DMaxComputer {
 	if (!Number.isInteger(dMaxCap) || dMaxCap < 0) {
 		throw new RangeError(`d_max_cap must be a non-negative integer, got ${dMaxCap}`);
 	}
-	const clampValue = Math.floor(dMaxCap / 2);
+	const capValue = Math.floor(dMaxCap / 2);
 
 	return {
 		dMax(): number {
 			const { nEst, confidence } = estimator.estimate();
+			const formula = Math.min(Math.max(0, floorLogF(nEst, F) - 1), dMaxCap);
+			// Low confidence caps d_max as an upper bound (not a set-to): an over-estimated
+			// population can't push the walk deeper than ⌊d_max_cap / 2⌋, while small
+			// populations keep their (smaller) formula value.
 			if (confidence < confidenceMin) {
-				return Math.min(clampValue, dMaxCap);
+				return Math.min(formula, capValue);
 			}
-			const d = Math.max(0, floorLogF(nEst, F) - 1);
-			return Math.min(d, dMaxCap);
+			return formula;
 		},
 	};
 }

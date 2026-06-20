@@ -3,7 +3,6 @@ import type { ISizeEstimator } from '../../src/cohort-topic/ports.js';
 import {
 	makeDMaxComputer,
 	DEFAULT_CONFIDENCE_MIN,
-	DEFAULT_D_MAX_CAP,
 } from '../../src/cohort-topic/dmax.js';
 
 function fixedEstimator(nEst: number, confidence: number): ISizeEstimator {
@@ -36,28 +35,39 @@ describe('cohort-topic / d_max', () => {
 		expect(makeDMaxComputer({ estimator: fixedEstimator(15, 0.9), F: 16 }).dMax()).to.equal(0);
 	});
 
-	it('clamps to floor(d_max_cap / 2) when confidence < confidence_min', () => {
-		// Large network that would otherwise give a deep d_max, but low confidence forces the clamp.
+	it('caps d_max at floor(d_max_cap / 2) (upper bound) when confidence < confidence_min', () => {
+		// Tight cap so the bound fires at a testable n_est: dMaxCap=6 → cap=3.
+		// n=16^6 → floor(log_16)=6 → formula=5 > 3, so min(5, 3) = 3.
 		const c = makeDMaxComputer({
-			estimator: fixedEstimator(1_000_000, DEFAULT_CONFIDENCE_MIN - 0.05),
+			estimator: fixedEstimator(16 ** 6, DEFAULT_CONFIDENCE_MIN - 0.05),
 			F: 16,
+			dMaxCap: 6,
 		});
-		expect(c.dMax()).to.equal(Math.floor(DEFAULT_D_MAX_CAP / 2));
+		expect(c.dMax()).to.equal(3);
 	});
 
-	it('does not clamp exactly at confidence_min', () => {
+	it('low confidence does NOT inflate a small population to the cap', () => {
+		// Small network + low confidence: formula (0) is below the cap (30), so formula wins.
+		const c = makeDMaxComputer({
+			estimator: fixedEstimator(10, 0),
+			F: 16,
+		});
+		expect(c.dMax()).to.equal(0);
+	});
+
+	it('does not cap exactly at confidence_min', () => {
 		const c = makeDMaxComputer({ estimator: fixedEstimator(100, DEFAULT_CONFIDENCE_MIN), F: 16 });
-		expect(c.dMax()).to.equal(0); // computed, not clamped
+		expect(c.dMax()).to.equal(0); // computed, not capped
 	});
 
 	it('honors custom confidenceMin and dMaxCap', () => {
 		const c = makeDMaxComputer({
-			estimator: fixedEstimator(1_000_000, 0.4),
+			estimator: fixedEstimator(16 ** 8, 0.4),
 			F: 16,
 			confidenceMin: 0.5,
 			dMaxCap: 10,
 		});
-		// confidence 0.4 < 0.5 → clamp to floor(10/2) = 5.
+		// confidence 0.4 < 0.5; formula = floor(log_16(16^8)) − 1 = 7 > cap floor(10/2)=5 → min(7, 5) = 5.
 		expect(c.dMax()).to.equal(5);
 	});
 
