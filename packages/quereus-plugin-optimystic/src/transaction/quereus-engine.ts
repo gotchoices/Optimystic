@@ -39,6 +39,13 @@ export type QuereusStatement = {
  * re-execution (validators verifying transaction).
  */
 export class QuereusEngine implements ITransactionEngine {
+	/**
+	 * Cached schema hash. Set on a successful idle compute; cleared by
+	 * {@link invalidateSchemaCache} whenever the schema changes. While warm, it is
+	 * what the session-mode provider returns at `begin` WITHOUT re-entering the db —
+	 * which is the whole point: keeping this warm out of band is how a host avoids
+	 * the in-`begin` re-entrant query that would deadlock (see {@link getSchemaHash}).
+	 */
 	private schemaHashCache: string | undefined;
 	private schemaVersion: number = 0;
 	private unsubscribeSchema: (() => void) | undefined;
@@ -47,6 +54,13 @@ export class QuereusEngine implements ITransactionEngine {
 		private readonly db: Database,
 		_coordinator: TransactionCoordinator
 	) {
+		// Invalidate the cached hash on every schema change. We deliberately do NOT
+		// eagerly recompute here: recomputing issues `db.eval`, which acquires the
+		// exec mutex and so flips `db._isExecuting()` true for the duration — and a
+		// background recompute racing a host statement (or the validator, or a direct
+		// getSchemaHash) makes those callers observe "executing" at surprising times
+		// and mis-route. Recompute happens lazily on the next IDLE getSchemaHash; the
+		// host keeps the hash warm out of band (see configureTransactionMode).
 		this.unsubscribeSchema = this.db.onSchemaChange(() => this.invalidateSchemaCache());
 	}
 
@@ -105,17 +119,70 @@ export class QuereusEngine implements ITransactionEngine {
 	 * The schema hash is used for validation - all participants must have
 	 * matching schema hashes for a transaction to be valid.
 	 *
-	 * Uses caching to avoid recomputing if schema hasn't changed.
+	 * ## Non-re-entrancy contract (read before wiring session mode)
+	 *
+	 * Session mode wires this method as the `schemaHashProvider` that
+	 * {@link TransactionBridge.beginTransaction} awaits — and `begin` runs INSIDE a
+	 * statement's exec (the host's `db.exec('insert …')`, `db.exec('begin')`, even a
+	 * `create table`/`create index` all hold Quereus's exec mutex when the vtab's
+	 * transaction opens). Computing a COLD hash here issues
+	 * `db.eval('select … from schema()')`, which tries to re-acquire that SAME mutex
+	 * → circular wait → permanent hang. So this method NEVER runs a re-entrant query:
+	 *
+	 *   1. Warm cache → return it (the common path: no db access, no re-entrancy).
+	 *   2. Cold cache while a statement is in flight (`db._isExecuting()` — Quereus's
+	 *      sanctioned re-entrancy signal, `execMutexDepth > 0`) → THROW an actionable
+	 *      error. A loud, immediate throw is strictly better than the silent deadlock
+	 *      this replaces: it names the fix (warm the hash out of band) instead of
+	 *      hanging the process.
+	 *   3. Cold cache while idle → safe to compute, cache, and return.
+	 *
+	 * The cache is invalidated on every schema change (see the constructor), so after
+	 * any DDL the next IDLE call recomputes. A host running session mode must keep the
+	 * hash warm OUT OF BAND — call `getSchemaHash()` once, outside any statement, after
+	 * its DDL and before the first transaction (and again after any later schema change
+	 * it makes while session mode is live). That single idle call populates the cache,
+	 * so every subsequent in-`begin` call takes path 1. If a host skips that and a
+	 * transaction's `begin` hits a cold cache, it gets the path-2 throw — a clear
+	 * signal to add the warm-up — rather than a hung node.
+	 *
+	 * NOTE: we deliberately do NOT auto-recompute in the background on schema change,
+	 * and do NOT serve a stale "last known" hash as an in-`begin` fallback. Both were
+	 * considered (see ticket `optimystic-session-schemahash-reentrancy`) and rejected:
+	 * a background `db.eval` flips `db._isExecuting()` true at unpredictable times and
+	 * derails OTHER callers (the re-validation path, direct hash reads), and a stale
+	 * fallback silently signs a transaction with the wrong schema hash. Fail-fast +
+	 * out-of-band warm keeps the re-entrancy signal honest and the hash correct.
 	 */
 	async getSchemaHash(): Promise<string> {
-		// Check if we have a cached hash
+		// 1. Warm cache hit — the common path; no db access, so no re-entrancy.
 		if (this.schemaHashCache !== undefined) {
 			return this.schemaHashCache;
 		}
 
-		// Compute and cache the schema hash
-		this.schemaHashCache = await this.computeSchemaHash();
-		return this.schemaHashCache;
+		// 2. Cold cache while a statement is in flight: computing would issue a
+		//    nested db.eval that re-acquires the exec mutex this call is transitively
+		//    holding → deadlock. Fail fast with an actionable error instead of hanging.
+		if (this.db._isExecuting()) {
+			throw new Error(
+				'QuereusEngine.getSchemaHash: schema hash is cold and cannot be computed '
+				+ 'while a statement is in flight — a re-entrant schema() query would '
+				+ 'deadlock on Quereus\'s exec mutex. Warm the hash out of band: call '
+				+ 'getSchemaHash() once OUTSIDE any statement (after your DDL and before '
+				+ 'the first transaction, and again after any later schema change made '
+				+ 'while session mode is live). See QuereusEngine.getSchemaHash docs.'
+			);
+		}
+
+		// 3. Cold cache and idle: safe to compute. Guard the cache write with the
+		//    schema version so a concurrent invalidation (a later schema change)
+		//    wins rather than being clobbered by this now-stale result.
+		const version = this.schemaVersion;
+		const hash = await this.computeSchemaHash();
+		if (version === this.schemaVersion) {
+			this.schemaHashCache = hash;
+		}
+		return hash;
 	}
 
 	/**

@@ -82,9 +82,32 @@ export class TransactionBridge {
    * When configured, transactions will use TransactionSession for
    * coordinated commit with validation.
    *
+   * ## `schemaHashProvider` MUST be non-re-entrant, and the hash MUST be kept warm
+   *
+   * {@link beginTransaction} awaits this provider, and `begin` runs INSIDE a
+   * statement's exec — the host's `db.exec(…)` (DML, an explicit `begin`, even a
+   * `create table`/`create index`) is holding Quereus's exec mutex when the vtab's
+   * transaction opens. A provider that re-enters the same `Database` to compute its
+   * value (e.g. runs `db.eval('select … from schema()')`) would try to re-acquire
+   * that mutex → circular wait → permanent hang. Quereus exposes
+   * `Database._isExecuting()` as the sanctioned re-entrancy signal for exactly this.
+   *
+   * The intended wiring is `() => engine.getSchemaHash()` on a {@link QuereusEngine}.
+   * That engine NEVER re-enters the db from `begin`: it serves a cached hash, and if
+   * the cache is cold while a statement is in flight it THROWS an actionable error
+   * rather than deadlocking. The flip side of that safety is a host obligation: keep
+   * the hash warm OUT OF BAND. After your DDL (and after any later schema change made
+   * while session mode is live), call `engine.getSchemaHash()` once outside any
+   * statement to populate the cache before the next transaction. The engine
+   * invalidates the cache on schema change but does NOT auto-recompute (a background
+   * recompute would pollute `_isExecuting()` for other callers — see
+   * {@link QuereusEngine.getSchemaHash}). Any custom provider passed here must offer
+   * the same guarantee: resolve from a warm cache, never by re-entering the db while
+   * a statement is in flight.
+   *
    * @param coordinator - The transaction coordinator
    * @param engine - The transaction engine (e.g., QuereusEngine)
-   * @param schemaHashProvider - Function to get the current schema hash
+   * @param schemaHashProvider - Non-re-entrant function to get the current schema hash
    */
   configureTransactionMode(
     coordinator: TransactionCoordinator,

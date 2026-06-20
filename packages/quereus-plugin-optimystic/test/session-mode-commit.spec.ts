@@ -31,13 +31,17 @@
  * reopen test below exercises `local`/`FileRawStorage` durability on ALL
  * platforms.
  *
- * A second composition hazard this suite exercises and documents: a host must
- * supply a NON-re-entrant schema-hash provider. `TransactionBridge.beginTransaction`
- * awaits the provider, and `QuereusEngine.getSchemaHash()` lazily runs
- * `select … from schema()` against the SAME db — issuing that nested query while
- * a statement's implicit BEGIN is in flight deadlocks. The fix is to keep the
- * engine's hash cache warm out of band (it already invalidates on schema change);
- * `enableSessionMode` below pre-warms it after DDL and never recomputes mid-DML.
+ * A second composition hazard this suite exercises and documents: the schema-hash
+ * provider must be NON-re-entrant, and the host must keep the hash warm. `Transaction
+ * Bridge.beginTransaction` awaits the provider while a statement's implicit BEGIN
+ * holds Quereus's exec mutex, and computing a cold hash runs `select … from schema()`
+ * against the SAME db — that nested query would re-acquire the held mutex and
+ * deadlock. `QuereusEngine.getSchemaHash` closes the deadlock door: it serves a
+ * cached hash and, asked for a COLD hash mid-statement, THROWS an actionable error
+ * instead of hanging. The flip side is a host obligation — warm the cache out of
+ * band (`enableSessionMode` calls `getSchemaHash()` once after DDL). The
+ * `naive-wiring` test below pins the failure mode for a host that forgets: an
+ * immediate, actionable throw, never a silent deadlock.
  */
 
 import { expect } from 'chai';
@@ -92,9 +96,15 @@ function createDb(): { db: Database; plugin: Plugin } {
  * (so the coordinator and vtab share one set of `Collection` instances) plus a
  * `QuereusEngine`, and hand them to `configureTransactionMode`.
  *
- * Pre-warms the engine's schema-hash cache AFTER all DDL so that the provider
- * `beginTransaction` awaits never triggers a re-entrant `db.eval` (which would
- * deadlock — see file header). Returns a disposer for the engine subscription.
+ * The explicit `await engine.getSchemaHash()` below pre-warms the hash cache after
+ * DDL, OUTSIDE any statement. This is REQUIRED, not optional: the provider
+ * `beginTransaction` awaits runs inside a statement's exec, and `QuereusEngine`
+ * refuses to compute a cold hash there (a re-entrant `db.eval` would deadlock on
+ * the exec mutex). With a warm cache the provider just returns it; without the
+ * warm-up the first transaction's `begin` would hit the engine's fail-fast THROW.
+ * The engine fails loudly rather than hanging — the `naive-wiring` regression test
+ * below pins exactly that (no manual warm ⇒ actionable throw, never a deadlock).
+ * Returns a disposer for the engine subscription.
  *
  * Call AFTER the table (+ indexes) exist so the shared transactor is cached and
  * the main/index collections are registered.
@@ -304,6 +314,56 @@ describe('Session-mode commit/rollback composition (real consensus, in-memory)',
 			expect(await countTreeEntries(plugin, uri), 'only the pre-rollback row persisted').to.equal(1);
 		} finally {
 			dispose?.();
+			db.close();
+		}
+	});
+
+	it('naive wiring without an out-of-band warm-up fails fast (no deadlock)', async () => {
+		// The landmine: a host wires `() => engine.getSchemaHash()` but forgets the
+		// out-of-band warm-up enableSessionMode performs. The first transaction's
+		// `begin` then asks for the hash while the insert holds the exec mutex with a
+		// COLD cache. The OLD behaviour was a silent permanent deadlock (the provider's
+		// nested schema() query waits on the mutex the insert holds). The fix turns
+		// that into an immediate, actionable throw. The suite's 20s timeout is the
+		// regression guard: a return to the deadlock would surface here as a timeout,
+		// not a pass.
+		const uri = 'tree://session/naive';
+		const { db, plugin } = createDb();
+		let engine: QuereusEngine | undefined;
+		try {
+			// DDL runs BEFORE session mode is wired (provider still null), so the table
+			// + index create without ever calling the provider — the cold cache is only
+			// exposed by the first DML below.
+			await db.exec(`create table Naive (id integer primary key, v text) using optimystic('${uri}')`);
+			await db.exec(`create index idx_naive_v on Naive (v)`);
+
+			const transactor = await plugin.collectionFactory.getOrCreateTransactor(memOptions());
+			const coordinator = new TransactionCoordinator(transactor, plugin.txnBridge.getCollectionRegistry());
+			engine = new QuereusEngine(db, coordinator);
+			// NAIVE: wire the provider with NO preceding `await engine.getSchemaHash()`.
+			plugin.txnBridge.configureTransactionMode(coordinator, engine, () => engine!.getSchemaHash());
+
+			let message: string | undefined;
+			try {
+				await db.exec(`insert into Naive (id, v) values (1, 'a')`);
+			} catch (err) {
+				message = err instanceof Error ? err.message : String(err);
+			}
+			expect(message, 'cold naive wiring must reject — not hang, not silently succeed').to.be.a('string');
+			expect(message, 'the throw must name the out-of-band warm-up fix').to.match(
+				/schema hash is cold|warm the hash out of band/i,
+			);
+
+			// And the sanctioned fix works in the same wiring: warm once OUTSIDE any
+			// statement, after which the identical provider drives real DML to a durable
+			// commit. Proves the throw is a missing-warm-up signal, not a dead path.
+			await engine.getSchemaHash();
+			await db.exec(`insert into Naive (id, v) values (1, 'a')`);
+			await db.exec(`insert into Naive (id, v) values (2, 'b')`);
+			expect(await selectCount(db, 'select count(*) as c from Naive')).to.equal(2);
+			expect(await countTreeEntries(plugin, uri), 'rows persist via consensus once warmed').to.equal(2);
+		} finally {
+			engine?.dispose();
 			db.close();
 		}
 	});
