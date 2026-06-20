@@ -182,6 +182,20 @@ describe('Selective-disclosure set commitment', () => {
 			expect(setVerify(other, setDisclose(leaves, ['first']))).to.be.false;
 		});
 
+		it('rejects a duplicated disclosed leaf (multiset/count binding)', () => {
+			// Holder presents the same genuine leaf twice — count becomes N+1, root mismatch.
+			const d = setDisclose(leaves, ['first']);
+			const doubled: SetDisclosure = { disclosed: [d.disclosed[0]!, d.disclosed[0]!], hidden: d.hidden };
+			expect(setVerify(root, doubled)).to.be.false;
+		});
+
+		it('rejects a disclosed leaf that is also re-listed among the hidden digests', () => {
+			// Same leaf counted as both disclosed AND hidden double-counts → root mismatch.
+			const d = setDisclose(leaves, ['first']);
+			const dupHidden = toBase64url(leafDigest(d.disclosed[0]!, sha256));
+			expect(setVerify(root, { disclosed: d.disclosed, hidden: [...d.hidden, dupHidden] })).to.be.false;
+		});
+
 		it('returns false (does not throw) on malformed disclosure input', () => {
 			expect(setVerify(root, null as any)).to.be.false;
 			expect(setVerify(root, { disclosed: undefined as any, hidden: [] })).to.be.false;
@@ -310,6 +324,33 @@ describe('Selective-disclosure set commitment', () => {
 			// tampered disclosed value
 			const bad = JSON.stringify([['first', 'mallory', SALT1_B64]]);
 			expect(verifyImpl(root, bad, JSON.stringify(hidden))).to.be.false;
+		});
+
+		it('set_verify() SQL round-trips under a non-default (hex) encoding config', () => {
+			// The root is hex but hidden digests are always base64url internally; verify must
+			// reconstruct correctly regardless of the configured output encoding.
+			const commit = getFn('set_commit', { encoding: 'hex' }).implementation;
+			const verifyImpl = getFn('set_verify', { encoding: 'hex' }).implementation;
+			const root = commit(leavesJson);
+			expect(root).to.have.length(64); // sha256 hex
+			const disclosed = JSON.stringify([['first', 'alice', SALT1_B64]]);
+			const { hidden } = setDisclose([
+				{ name: 'first', value: 'alice', salt: SALT1_B64 },
+				{ name: 'age', value: 42, salt: SALT2_B64 },
+				{ name: 'citizen', value: true, salt: SALT1_B64 },
+			], ['first']);
+			expect(verifyImpl(root, disclosed, JSON.stringify(hidden))).to.be.true;
+			expect(verifyImpl(root, JSON.stringify([['first', 'mallory', SALT1_B64]]), JSON.stringify(hidden))).to.be.false;
+		});
+
+		it('set_commit() SQL requires an explicit value key in object-form leaves', () => {
+			const impl = getFn('set_commit').implementation;
+			// Missing value key throws (symmetric with the array form requiring [name, value, salt])...
+			expect(() => impl(JSON.stringify([{ name: 'x', salt: SALT1_B64 }]))).to.throw(/value/);
+			// ...but an explicit null value is accepted and equals the array form's null.
+			const obj = impl(JSON.stringify([{ name: 'x', value: null, salt: SALT1_B64 }]));
+			const arr = impl(JSON.stringify([['x', null, SALT1_B64]]));
+			expect(obj).to.equal(arr);
 		});
 
 		it('set_verify() SQL returns false (never throws) on malformed input', () => {

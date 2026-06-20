@@ -83,6 +83,12 @@ function leafFromJson(entry: unknown, fnName: string): SaltedLeaf {
 		if (typeof o.name !== 'string') {
 			throw new Error(`${fnName}: leaf name must be a string`);
 		}
+		// Require an explicit `value` key (symmetric with the array form, which demands all
+		// three positions): a silently-absent value would commit NULL and mask a malformed
+		// leaf. To commit a null-valued attribute, pass `value: null` explicitly.
+		if (!('value' in o)) {
+			throw new Error(`${fnName}: leaf '${o.name}' is missing a value (pass value: null for a null-valued attribute)`);
+		}
 		return { name: o.name, value: o.value as DigestField, salt: o.salt as string };
 	}
 	throw new Error(`${fnName}: each leaf must be a [name, value, salt] array or { name, value, salt } object`);

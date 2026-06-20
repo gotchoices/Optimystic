@@ -206,9 +206,11 @@ SELECT set_verify(root, disclosed_json, hidden_json) AS ok;
 - **`set_commit(leaves_json) → TEXT`** — `leaves_json` is a JSON array; each element is a
   leaf `[name, value, salt]` *or* `{ "name", "value", "salt" }`. Values follow `digest`'s
   rules as parsed from JSON (INTEGER vs REAL by JS value, TEXT, BOOL, null, nested
-  object/array). The salt is base64url TEXT (e.g. from `random_bytes`). **THROWS** on a
-  duplicate name, a missing/empty salt, or unparseable/non-array JSON (invalid states made
-  impossible). `replicable` — the root is signed and persisted, same bar as `digest`.
+  object/array). Each leaf must carry all three fields — a missing `value` (object form) or
+  a `[name, value]` array (under three elements) throws; pass `value: null` for a null-valued
+  attribute. The salt is base64url TEXT (e.g. from `random_bytes`). **THROWS** on a duplicate
+  name, a missing value, a missing/empty salt, or unparseable/non-array JSON (invalid states
+  made impossible). `replicable` — the root is signed and persisted, same bar as `digest`.
 - **`set_verify(root, disclosed_json, hidden_json) → BOOLEAN`** — `disclosed_json` is the
   opened triples (same leaf shape), `hidden_json` a JSON array of the withheld leaves'
   opaque base64url digests. Reconstructs the **entire** root and compares — so the holder

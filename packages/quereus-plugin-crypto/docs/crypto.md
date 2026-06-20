@@ -134,8 +134,10 @@ malformed input returns `false` (forgiving, like `verify`) rather than throwing.
 - **Deterministic / replicable**: Yes (root is signed and persisted)
 - **`leaves_json`**: JSON array of `[name, value, salt]` arrays or `{ name, value, salt }`
   objects. Value follows `digest`'s JSON→field mapping (INTEGER vs REAL by JS value, TEXT,
-  BOOL, null, nested object/array → JSON). Salt is base64url TEXT.
-- **Errors**: throws on a duplicate name, a missing/empty salt, or unparseable/non-array JSON.
+  BOOL, null, nested object/array → JSON). Each leaf must carry all three fields. Salt is
+  base64url TEXT.
+- **Errors**: throws on a duplicate name, a missing value (pass `value: null` for a
+  null-valued attribute), a missing/empty salt, or unparseable/non-array JSON.
 - **Composition**: pair with `cid` for the persisted/signed column shape —
   `cid(set_commit(SelectiveDetails))` — so the value adopts self-describing CIDv1 framing
   from the start rather than freezing a bare hash.
@@ -249,7 +251,7 @@ All encoding parameters default to `base64url` unless otherwise specified.
 
 - **Deterministic / replicable**: Yes
 - **Input**: JSON array of `[name, value, salt]` / `{ name, value, salt }` leaves
-- **Errors**: throws on duplicate name, missing/empty salt, or unparseable/non-array JSON
+- **Errors**: throws on duplicate name, missing value, missing/empty salt, or unparseable/non-array JSON
 
 ### `set_verify(root, disclosed_json, hidden_json) → BOOLEAN`
 
