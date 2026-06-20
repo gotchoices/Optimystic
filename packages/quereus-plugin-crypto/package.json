@@ -85,6 +85,8 @@
 				"cid",
 				"cid_v1",
 				"cid_decode",
+				"set_commit",
+				"set_verify",
 				"sign",
 				"verify",
 				"hash_mod",

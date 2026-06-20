@@ -6,6 +6,7 @@ Quereus plugin providing cryptographic functions for SQL queries with base64url 
 
 - **Hash Functions**: SHA-256, SHA-512, BLAKE3 hashing with base64url output
 - **Content Identifiers (CIDv1)**: Self-describing, interoperable IPFS/IPLD content addresses
+- **Selective Disclosure**: Salted-leaf set commitment — commit to a whole attribute set with one value, later reveal only a chosen subset with proof of authenticity
 - **Hash Modulo**: Fixed-size hash values (16-bit, 32-bit, etc.) for sharding and partitioning
 - **Random Bytes**: Generate cryptographically secure random bytes (default: 256 bits)
 - **Signature Functions**: secp256k1, P-256, Ed25519 signing with base64url encoding
@@ -157,6 +158,80 @@ default of base64url: base64url is compact for *internal* values that live in me
 on the wire, or in JSON, whereas base32 is case-insensitive and DNS/URL/filename-safe
 where interoperable addresses are copied and read. Two audiences, two defaults — pass
 `'base64url'` explicitly if you want the compact form.
+
+### set_commit(leaves_json) / set_verify(root, disclosed_json, hidden_json)
+
+**Per-attribute selective disclosure.** An authority commits to a registrant's whole
+attribute set as a single root (which it signs / persists), then later reveals only a
+chosen *subset* to a recipient — with a proof the revealed values are genuinely the
+committed ones — **without** leaking the withheld attribute values. A flat
+`digest(whole set)` can't do this (verifying one field needs the whole pre-image, so
+it's all-or-nothing); `set_commit` supports *partial opening*.
+
+Each attribute becomes a salted leaf, and the root is the digest of all leaf digests in
+canonical (sort-by-leaf-digest-bytes) order:
+
+```
+leafDigest = digest([SD_LEAF_DOMAIN_V1, name, value, salt])   -- raw digest bytes
+root       = digest([SD_SET_DOMAIN_V1, sortedLeaf_0, sortedLeaf_1, ...])
+```
+
+This is the same flat salted-hash shape the IETF SD-JWT standard
+(`draft-ietf-oauth-selective-disclosure-jwt`) settled on rather than a Merkle tree —
+cited as conceptual precedent only; the framing here is Optimystic's own `digest`
+`encodeFields` (not SD-JWT wire-compatible). The `name` is hashed into the leaf so a
+`(value, salt)` proof can't be replayed under another attribute; the `salt` is per-leaf
+and **mandatory** (low-entropy values like a DOB or a boolean are brute-forceable from a
+bare hash, and independent salts defeat cross-registrant correlation).
+
+```sql
+-- Commit to a JSON array of [name, value, salt] leaves -> single root.
+-- Pair with cid() for the self-describing persisted/signed column representation:
+SELECT cid(set_commit(SelectiveDetails)) AS SelectiveCid;
+
+-- A schema CHECK makes a forged root impossible to store: the root is recomputed from
+-- the stored attribute triples, so SelectiveCid must equal the genuine commitment.
+CREATE TABLE Registrant (
+  ...,
+  SelectiveDetails TEXT,   -- JSON array of [name, value, salt] triples
+  SelectiveCid     TEXT,
+  CHECK (SelectiveCid = cid(set_commit(SelectiveDetails)))
+);
+
+-- A recipient verifies a disclosure: the disclosed [name, value, salt] triples plus
+-- the opaque leaf digests of the withheld leaves reconstruct the entire root.
+SELECT set_verify(root, disclosed_json, hidden_json) AS ok;
+```
+
+- **`set_commit(leaves_json) → TEXT`** — `leaves_json` is a JSON array; each element is a
+  leaf `[name, value, salt]` *or* `{ "name", "value", "salt" }`. Values follow `digest`'s
+  rules as parsed from JSON (INTEGER vs REAL by JS value, TEXT, BOOL, null, nested
+  object/array). The salt is base64url TEXT (e.g. from `random_bytes`). **THROWS** on a
+  duplicate name, a missing/empty salt, or unparseable/non-array JSON (invalid states made
+  impossible). `replicable` — the root is signed and persisted, same bar as `digest`.
+- **`set_verify(root, disclosed_json, hidden_json) → BOOLEAN`** — `disclosed_json` is the
+  opened triples (same leaf shape), `hidden_json` a JSON array of the withheld leaves'
+  opaque base64url digests. Reconstructs the **entire** root and compares — so the holder
+  cannot add, drop, or swap a leaf. Returns `false` on any mismatch or malformed input
+  (forgiving, like `verify`).
+
+> **Disclosure generation is JS-only** (`setDisclose`, below) — there's no SQL
+> `set_disclose`, because building a disclosure requires the full attribute set including
+> the secret salts, which lives engine-side, not in a query.
+
+**BLOB-valued attributes via SQL:** JSON has no blob type, so a blob attribute passed
+through `set_commit` is committed as its base64url TEXT. Callers needing a *true* BLOB
+value (committed as a BLOB field, `TAG_BLOB`) must use the JS `setCommit` with a
+`Uint8Array` value.
+
+**Privacy note:** a fixed commitment disclosed to two audiences exposes the same hidden
+digests and field count to both, so they can correlate that it's the same record.
+Re-randomizing per disclosure would require fresh salts → a new root → a new signature
+(out of scope here).
+
+**Framing coupling:** leaf and root reuse `digest`'s `encodeFields`, so a future digest
+framing-version bump changes `set_commit` output too — intentional (one canonical
+framing), but it means the pinned set-commitment vectors move with the digest vectors.
 
 ### hash_mod(data, bits, algorithm?, inputEncoding?)
 
@@ -354,6 +429,34 @@ Parse a CID string into `{ version, codec, hashCode, digest }` for validation/mi
 Recognized codec/hash codes are returned as names, otherwise as numbers; `digest` is a
 `Uint8Array`. Throws on malformed input.
 - **Returns**: `{ version: number, codec: Multicodec | number, hashCode: MultihashCode | number, digest: Uint8Array }`
+
+### setCommit(leaves, hasher?, encode?) / setDisclose(leaves, revealNames, hasher?) / setVerify(root, disclosure, hasher?, encode?)
+Salted-leaf set commitment for selective disclosure. `leaves` is an array of
+`{ name, value, salt }` (`salt` a base64url string or `Uint8Array`).
+- **`setCommit`** → the root (`string`, or `Uint8Array` with a bytes encoder). Throws on a
+  duplicate name or a missing/empty salt; the empty set is well-defined, not an error.
+- **`setDisclose`** → `{ disclosed, hidden }`: the revealed `{ name, value, salt }` triples
+  plus the opaque base64url leaf digests of the withheld leaves (withheld values/salts never
+  appear). This is the engine-side generator with no SQL equivalent.
+- **`setVerify`** → `boolean`: reconstructs the entire root from `disclosure` and compares to
+  `root`. `false` on mismatch or malformed input. `encode` is how the signed root is rendered
+  (default base64url); a `Uint8Array` root is compared by raw bytes.
+- **`leafDigest(leaf, hasher)`** → raw leaf digest bytes (the low-level building block).
+
+```typescript
+import { setCommit, setDisclose, setVerify, randomBytes } from '@optimystic/quereus-plugin-crypto';
+
+const leaves = [
+  { name: 'name',    value: 'Alice',     salt: randomBytes(256) as string },
+  { name: 'over18',  value: true,        salt: randomBytes(256) as string },
+  { name: 'zip',     value: '90210',     salt: randomBytes(256) as string },
+];
+const root = setCommit(leaves);                 // sign / persist this (often as cid(root))
+
+// Recipient gets only `over18`, with proof it belongs to the committed set:
+const disclosure = setDisclose(leaves, ['over18']);
+const ok = setVerify(root, disclosure);          // true — withheld values never left the engine
+```
 
 ### hashMod(data, bits, algorithm?, inputEncoding?)
 Hash data and return modulo 2^bits for fixed-size hash values.

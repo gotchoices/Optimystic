@@ -92,6 +92,81 @@ wrapper is needed. blake3 digests are pinned to 32 bytes for replicability.
 
 ---
 
+## Selective Disclosure (Salted-Leaf Set Commitment)
+
+`digest` commits to a tuple all-or-nothing; **`set_commit`** commits to a *set* of named
+attributes so that a chosen subset can later be revealed with proof, without exposing the
+rest. An authority commits to the whole set as one root (signed/persisted), discloses a
+subset to a recipient, and the recipient reconstructs the entire root to confirm the
+revealed values belong to exactly that committed set.
+
+```
+leafDigest = digest([SD_LEAF_DOMAIN_V1, name, value, salt])   // raw digest bytes
+root       = digest([SD_SET_DOMAIN_V1, sortedLeaf_0, sortedLeaf_1, ...])
+```
+
+Both layers compose on the same canonical `encodeFields` framing as `digest` (injective,
+type-tagged, length-prefixed, replicable), so the primitive is generic *and* fully
+DB-enforceable. This is the flat salted-hash shape of the IETF SD-JWT standard
+(`draft-ietf-oauth-selective-disclosure-jwt`), **not** a Merkle tree — cited as precedent
+only; the framing is Optimystic's own, not SD-JWT wire-compatible.
+
+### Design decisions (do not "tidy")
+
+| Decision | Rationale |
+|----------|-----------|
+| **Flat set, not a Merkle tree** | Voter field sets are small (handful to a few dozen), so a tree's only win — O(log n) proofs — is marginal, while a tree adds footguns to hand-roll and pin: arity, odd-node handling (the CVE-2012-2459 duplicate-leaf forgery class), leaf-vs-internal domain separation, and a separate audit-path proof format. |
+| **`name` hashed into the leaf** | A disclosed `(value, salt)` proof cannot be replayed under another attribute slot (e.g. an `over18=true` proof presented as `citizen`). |
+| **Per-leaf mandatory salt** | Low-entropy attributes (DOB, booleans, ZIP) are brute-forceable from a bare hash; independent salts also defeat cross-registrant equality correlation. Recommend ≥128 bits (default 256). A missing/empty salt throws. |
+| **Order by raw leaf-digest bytes (forced)** | In a disclosure the verifier learns the *names* of disclosed leaves only; withheld leaves arrive as opaque digests with no name. The only ordering key it holds for *every* leaf is the leaf digest itself. Sorting by name would be unverifiable for hidden leaves. Sort is over raw bytes, never encoded strings (encoding-dependent order would break cross-peer agreement). |
+| **Two distinct domain constants** | `SD_LEAF_DOMAIN_V1` ≠ `SD_SET_DOMAIN_V1` (leading string fields) guarantee a leaf hash can never equal a root hash. Pinned exactly like `DIGEST_FORMAT_V1`; changing either is a breaking change that moves every committed root and signature. |
+| **Empty set is valid** | `set_commit([])` = `digest([SD_SET_DOMAIN_V1])`, a well-defined empty-set commitment, not an error. |
+
+### Verification reconstructs the *whole* root
+
+`set_verify` recomputes the disclosed leaves' digests, unions them with the supplied hidden
+digests, sorts by bytes, recomputes the root, and compares. Because the entire root is
+rebuilt (leaf count included), the holder cannot add, drop, or swap a leaf. Any mismatch or
+malformed input returns `false` (forgiving, like `verify`) rather than throwing.
+
+### `set_commit(leaves_json) → TEXT`
+
+- **Deterministic / replicable**: Yes (root is signed and persisted)
+- **`leaves_json`**: JSON array of `[name, value, salt]` arrays or `{ name, value, salt }`
+  objects. Value follows `digest`'s JSON→field mapping (INTEGER vs REAL by JS value, TEXT,
+  BOOL, null, nested object/array → JSON). Salt is base64url TEXT.
+- **Errors**: throws on a duplicate name, a missing/empty salt, or unparseable/non-array JSON.
+- **Composition**: pair with `cid` for the persisted/signed column shape —
+  `cid(set_commit(SelectiveDetails))` — so the value adopts self-describing CIDv1 framing
+  from the start rather than freezing a bare hash.
+- **BLOB limitation**: a blob attribute is committed as its base64url TEXT (JSON has no blob
+  type); a true BLOB-valued leaf (`TAG_BLOB`) requires the JS `setCommit` with a `Uint8Array`.
+
+### `set_verify(root, disclosed_json, hidden_json) → BOOLEAN`
+
+- **Deterministic**: Yes (pure — not `replicable`, matching `verify`)
+- **`disclosed_json`**: JSON array of opened leaves (same shape as `set_commit`)
+- **`hidden_json`**: JSON array of the withheld leaves' opaque base64url digests
+- **Returns**: `true` if the disclosure reconstructs `root`, else `false` (incl. malformed input)
+
+### Disclosure generation is JS-only
+
+There is no SQL `set_disclose`: building a disclosure needs the full attribute set including
+the secret salts (engine-side state), not query inputs. Use the JS `setDisclose(leaves,
+revealNames)` → `{ disclosed, hidden }`; feed its `disclosed`/`hidden` to SQL `set_verify`
+or JS `setVerify` on the (often DB-less) recipient.
+
+### Privacy & coupling notes
+
+- A fixed commitment shown to two audiences exposes the same hidden digests and field count,
+  so they can correlate it is the same record. Per-disclosure re-randomization would need
+  fresh salts → new root → new signature (out of scope).
+- Leaf and root reuse `encodeFields`, so a future digest framing-version bump changes
+  `set_commit` output too — intentional single canonical framing; pinned set-commitment
+  golden vectors move together with the digest vectors.
+
+---
+
 ## Elliptic Curves
 
 | Curve | Algorithm | Key Size | Signature Size | Library |
@@ -169,6 +244,17 @@ All encoding parameters default to `base64url` unless otherwise specified.
 - **Deterministic**: Yes
 - **Returns**: `true` if valid, `false` for any error (prevents info leakage)
 - **Default curve**: `secp256k1`
+
+### `set_commit(leaves_json) → TEXT`
+
+- **Deterministic / replicable**: Yes
+- **Input**: JSON array of `[name, value, salt]` / `{ name, value, salt }` leaves
+- **Errors**: throws on duplicate name, missing/empty salt, or unparseable/non-array JSON
+
+### `set_verify(root, disclosed_json, hidden_json) → BOOLEAN`
+
+- **Deterministic**: Yes (not `replicable` — pure verification, like `verify`)
+- **Returns**: `true` if the disclosure reconstructs `root`, `false` on mismatch or malformed input
 
 ### `hash_mod(data, bits, algorithm?, inputEncoding?) → INTEGER`
 

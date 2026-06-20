@@ -17,6 +17,10 @@ import {
 	cid, cidV1, cidDecode,
 	type Multicodec, type MultihashCode, type Multibase,
 } from './cid.js';
+import {
+	setCommit, setVerify,
+	type SaltedLeaf,
+} from './sd.js';
 
 const DIGEST_ALGORITHMS: readonly HashAlgorithm[] = ['sha256', 'sha512', 'blake3'];
 // SQL digest returns TEXT, so only text-producing encodings are valid here ('bytes' is JS-only).
@@ -52,6 +56,45 @@ function toContentBytes(value: SqlValue | undefined, fnName: string): Uint8Array
 		return uint8ArrayFromString(value, 'base64url');
 	}
 	throw new Error(`${fnName}: expected a BLOB or base64url TEXT argument, got ${value == null ? 'NULL' : typeof value}`);
+}
+
+/**
+ * Parse one JSON leaf — either `[name, value, salt]` or `{ name, value, salt }` —
+ * into a {@link SaltedLeaf}. The JSON value maps directly to the `encodeFields` value
+ * space (INTEGER vs REAL by JS value, TEXT, BOOL, null, nested object/array → JSON).
+ *
+ * Note: a BLOB-valued attribute is passed as its base64url TEXT and committed AS TEXT
+ * (JSON has no blob type); callers needing a true BLOB value must use the JS API with a
+ * `Uint8Array`. The salt is likewise base64url TEXT (decoded to bytes by `set_commit`).
+ */
+function leafFromJson(entry: unknown, fnName: string): SaltedLeaf {
+	if (Array.isArray(entry)) {
+		if (entry.length < 3) {
+			throw new Error(`${fnName}: a leaf array must be [name, value, salt]`);
+		}
+		const [name, value, salt] = entry;
+		if (typeof name !== 'string') {
+			throw new Error(`${fnName}: leaf name must be a string`);
+		}
+		return { name, value: value as DigestField, salt: salt as string };
+	}
+	if (entry !== null && typeof entry === 'object') {
+		const o = entry as Record<string, unknown>;
+		if (typeof o.name !== 'string') {
+			throw new Error(`${fnName}: leaf name must be a string`);
+		}
+		return { name: o.name, value: o.value as DigestField, salt: o.salt as string };
+	}
+	throw new Error(`${fnName}: each leaf must be a [name, value, salt] array or { name, value, salt } object`);
+}
+
+/** Parse a JSON array of leaves. Throws on unparseable / non-array input. */
+function parseLeaves(json: string, fnName: string): SaltedLeaf[] {
+	const parsed = JSON.parse(json);
+	if (!Array.isArray(parsed)) {
+		throw new Error(`${fnName}: expected a JSON array of leaves`);
+	}
+	return parsed.map((entry) => leafFromJson(entry, fnName));
 }
 
 // Flags for deterministic functions (UTF8 + DETERMINISTIC)
@@ -131,6 +174,44 @@ export default function register(_db: Database, config: Record<string, SqlValue>
 						hashCode: parts.hashCode,
 						digest: uint8ArrayToString(parts.digest, 'base64url'),
 					});
+				},
+			},
+		},
+		{
+			schema: {
+				name: 'set_commit',
+				numArgs: 1, // set_commit(leaves_json) -> root over a JSON array of [name, value, salt] leaves
+				flags: DETERMINISTIC_FLAGS,
+				// The root is signed and persisted as a commitment, same bar as `digest`.
+				replicable: true,
+				returnType: { typeClass: 'scalar' as const, logicalType: TEXT_TYPE, nullable: false },
+				implementation: (leavesJson: SqlValue) => {
+					if (typeof leavesJson !== 'string') {
+						throw new Error('set_commit: expected a JSON TEXT array of [name, value, salt] leaves');
+					}
+					const leaves = parseLeaves(leavesJson, 'set_commit');
+					return setCommit(leaves, digestHasher, digestEncoder) as string;
+				},
+			},
+		},
+		{
+			schema: {
+				name: 'set_verify',
+				numArgs: 3, // set_verify(root, disclosed_json, hidden_json) -> BOOLEAN
+				flags: DETERMINISTIC_FLAGS, // pure, not persisted — matches `verify` (no `replicable`)
+				returnType: { typeClass: 'scalar' as const, logicalType: BOOLEAN_TYPE, nullable: false },
+				implementation: (root: SqlValue, disclosedJson: SqlValue, hiddenJson: SqlValue) => {
+					// Forgiving contract (mirrors `verify`): any malformed input → false, never throw.
+					try {
+						if (typeof root !== 'string' && !(root instanceof Uint8Array)) return false;
+						if (typeof disclosedJson !== 'string' || typeof hiddenJson !== 'string') return false;
+						const disclosed = parseLeaves(disclosedJson, 'set_verify');
+						const hidden = JSON.parse(hiddenJson);
+						if (!Array.isArray(hidden) || !hidden.every((h) => typeof h === 'string')) return false;
+						return setVerify(root, { disclosed, hidden: hidden as string[] }, digestHasher, digestEncoder);
+					} catch {
+						return false;
+					}
 				},
 			},
 		},
