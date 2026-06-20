@@ -42,7 +42,7 @@ export type PendRequest = ActionTransforms & {
 };
 
 export type BlockActionStatus = ActionBlocks & {
-	statuses: ('pending' | 'committed' | 'checkpointed' | 'aborted')[];
+	statuses: ('pending' | 'committed' | 'checkpointed' | 'aborted' | 'committed-invalidated')[];
 };
 
 export type PendSuccess = {

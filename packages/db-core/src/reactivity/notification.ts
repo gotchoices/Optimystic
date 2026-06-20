@@ -74,6 +74,15 @@ export function buildNotificationV1(event: CollectionChangeEvent, commitCert: Co
 	if (ctx.rotationHint !== undefined) {
 		notification.rotationHint = ctx.rotationHint;
 	}
+	// An invalidation change event carries a typed marker the subscriber uses to distinguish a reversal
+	// from an ordinary commit (drop derived results + resubmit, vs. refresh). It rides the same path and
+	// reuses the invalidation's commit cert as `sig` — see {@link CollectionChangeEvent.invalidation}.
+	if (event.invalidation) {
+		notification.invalidation = true;
+		if (event.invalidatedActionId !== undefined) {
+			notification.invalidatedActionId = event.invalidatedActionId;
+		}
+	}
 	return notification;
 }
 
@@ -89,4 +98,26 @@ export function sigDigest(sig: string, hash: IRingHash = createRingHash()): stri
 /** The dedupe-set key for a notification: `${revision}:${sigDigest(sig)}`. */
 export function dedupeKey(revision: number, sig: string, hash?: IRingHash): string {
 	return `${revision}:${sigDigest(sig, hash)}`;
+}
+
+/**
+ * Collapse a batch of inbound notifications to the distinct **invalidated action ids** a client must act
+ * on, in first-seen order. A single dispute can fan out several invalidation notifications — one per
+ * cascade child (`docs/right-is-right.md` §Read-Dependency Cascade) — and a client holding dependents of
+ * several may receive several; coalescing by `invalidatedActionId` lets it drop + resubmit each affected
+ * unit exactly once instead of once per notification. Notifications that are not invalidations (ordinary
+ * commits) and invalidations missing an `invalidatedActionId` are ignored here — the former drive a plain
+ * refresh, the latter still surface the reverted state on the next authoritative read. A hint-layer helper:
+ * the client still verifies against committed state.
+ */
+export function coalesceInvalidatedActionIds(notifications: Iterable<NotificationV1>): string[] {
+	const seen = new Set<string>();
+	const ordered: string[] = [];
+	for (const n of notifications) {
+		if (n.invalidation && n.invalidatedActionId !== undefined && !seen.has(n.invalidatedActionId)) {
+			seen.add(n.invalidatedActionId);
+			ordered.push(n.invalidatedActionId);
+		}
+	}
+	return ordered;
 }

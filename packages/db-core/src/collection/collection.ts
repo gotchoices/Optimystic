@@ -136,6 +136,21 @@ export class Collection<TAction> implements ICollection<TAction> {
 			anyConflicts = anyConflicts || this.tracker.conflicts(new Set(entry.blockIds)).length > 0;
 		}
 
+		// React to durable invalidations that landed since we last synced. getFrom intentionally skips
+		// invalidation entries (they are not pending/committed actions), so surface them separately: an
+		// invalidation reverted committed content this client may have read, so treat it like a stale
+		// read — drop the reverted blocks from the read cache and replay pending work against the reverted
+		// base (docs/right-is-right.md §Client notification). De-duped across cascade children by reverted
+		// block; over-inclusive by design (over-invalidation just resubmits — it never wrongly retains).
+		const invalidations = log ? await log.getInvalidationsFrom(actionContext?.rev ?? 0) : [];
+		if (invalidations.length > 0) {
+			const revertedBlockIds = [...new Set(invalidations.flatMap(inv => inv.reverted.map(r => r.blockId)))];
+			this.sourceCache.clear(revertedBlockIds);
+			if (this.pending.length > 0) {
+				anyConflicts = true;
+			}
+		}
+
 		// On conflicts, clear related caching and block-tracking and replay logical operations
 		if (anyConflicts) {
 			await this.replayActions();

@@ -3,7 +3,7 @@ import type { ICluster } from "@optimystic/db-core";
 import type { IPeerNetwork } from "@optimystic/db-core";
 import { blockIdsForTransforms } from "@optimystic/db-core";
 import { verifyInvalidationCertificate } from "../dispute/invalidation.js";
-import { buildCommitCert } from "./commit-cert.js";
+import { buildCommitCert, invalidationActionId } from "./commit-cert.js";
 import { ClusterClient } from "./client.js";
 import type { PeerId, PrivateKey } from "@libp2p/interface";
 import { peerIdFromString } from "@libp2p/peer-id";
@@ -876,14 +876,15 @@ export class ClusterMember implements ICluster {
 			return;
 		}
 		if ('invalidate' in operation) {
-			await this.applyConsensusInvalidation(messageHash, operation.invalidate);
+			await this.applyConsensusInvalidation(record, operation.invalidate);
 			return;
 		}
 	}
 
 	/**
 	 * Applies a consensus-ordered invalidation on this member: dedup → certificate verification →
-	 * delegate the compensating write + durable log append to the injected {@link InvalidationApplySink}.
+	 * capture the invalidation's commit cert (for reactivity reuse) → delegate the compensating write +
+	 * durable log append to the injected {@link InvalidationApplySink}.
 	 *
 	 * Like every other branch of {@link applyConsensusOperation}, a failure here is tolerated rather
 	 * than thrown — a throw would reset the cluster stream. A forged/sub-threshold certificate is
@@ -891,7 +892,8 @@ export class ClusterMember implements ICluster {
 	 * so a re-broadcast can retry. The durable, authoritative dedup is the invalidation log entry the
 	 * sink consults; the in-memory map is only a fast path.
 	 */
-	private async applyConsensusInvalidation(messageHash: string, request: InvalidateRequest): Promise<void> {
+	private async applyConsensusInvalidation(record: ClusterRecord, request: InvalidateRequest): Promise<void> {
+		const messageHash = record.messageHash;
 		const dedupKey = `${request.invalidatedActionId}:${request.resolution.disputeId}`;
 		if (this.appliedInvalidations.has(dedupKey)) {
 			log('cluster-member:consensus-invalidate-duplicate', { messageHash, dedupKey });
@@ -908,6 +910,17 @@ export class ClusterMember implements ICluster {
 				outcome: request.resolution.outcome
 			});
 			return;
+		}
+
+		// Capture the invalidation's own commit cert — the threshold signature the cohort produced for
+		// THIS consensus-ordered `invalidate` op (over `computeCommitHash(record)`), the reversal analogue
+		// of the commit-cert capture in {@link applyConsensusOperation}. Reactivity reuses it bit-for-bit
+		// as the invalidation notification's `sig` (never re-signed). Keyed on the deterministic
+		// {@link invalidationActionId} the invalidation's change event also carries, so the bridge's
+		// cert extractor resolves it. Gated on the sink — a node with no reactivity wired pays nothing.
+		if (this.onCommitCertificate) {
+			const invSignedPayload = this.computeSigningPayload(await this.computeCommitHash(record), 'approve');
+			this.captureCommitCert(record, invalidationActionId(request.invalidatedActionId, request.resolution.disputeId), invSignedPayload);
 		}
 
 		if (!this.onInvalidate) {

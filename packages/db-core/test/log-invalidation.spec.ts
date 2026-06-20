@@ -120,6 +120,32 @@ describe('Log invalidation entries', () => {
 		expect(context?.committed.map(c => c.actionId)).to.include(id3)
 	})
 
+	it('getInvalidationsFrom surfaces only invalidations after the given rev (newest-first)', async () => {
+		const log = await Log.create<string>(store)
+		const id1 = generateNumericActionId(1)
+		const id2 = generateNumericActionId(2)
+
+		await log.addActions(['a1'], id1, 1, () => [])
+		await log.addActions(['a2'], id2, 2, () => [])
+		// Two invalidations at rev 3 and 4.
+		await log.addInvalidation(id1, 1, makeProof('d1', 'm'), [{ blockId: 'block-A', fromRev: 2, restoredContentHash: 'h1' }], 3)
+		await log.addInvalidation(id2, 2, makeProof('d2', 'm'), [{ blockId: 'block-B', fromRev: 2, restoredContentHash: 'h2' }], 4)
+
+		// A client synced through rev 2 sees both reversals; getFrom (actions only) sees none of them.
+		const sinceRev2 = await log.getInvalidationsFrom(2)
+		expect(sinceRev2.map(i => i.invalidatedActionId)).to.deep.equal([id2, id1])
+
+		// A client already synced through rev 3 sees only the later reversal.
+		const sinceRev3 = await log.getInvalidationsFrom(3)
+		expect(sinceRev3.map(i => i.invalidatedActionId)).to.deep.equal([id2])
+
+		// Up to date — nothing to react to.
+		expect(await log.getInvalidationsFrom(4)).to.deep.equal([])
+
+		// undefined start ⇒ all invalidations in the log.
+		expect((await log.getInvalidationsFrom(undefined)).map(i => i.invalidatedActionId)).to.deep.equal([id2, id1])
+	})
+
 	it('returns the most recent invalidation when an action is invalidated more than once', async () => {
 		// Defensive: cascade re-invalidation could append a second entry for the same action.
 		const log = await Log.create<string>(store)

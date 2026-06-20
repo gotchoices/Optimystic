@@ -155,6 +155,15 @@ NotificationV1 {
 
 The `sig` field is bit-for-bit the same threshold signature the transaction layer produces. A subscriber cryptographically threshold-verifies it against the tail cohort's membership — the same trust root it must already accept to trust the collection at all — over `b64urlToBytes(digest)`, the exact `utf8(commitHash + ":approve")` image each cohort member signed. So notifications introduce **no new signing authority** beyond the commit certificate, yet are not trusted blindly: the verify runs against real Ed25519 (see [Authentication and integrity](#authentication-and-integrity)).
 
+### Notification kinds: commit vs. invalidation
+
+A notification announces one of two committed changes, distinguished by an optional typed marker:
+
+- a **commit** (the marker is absent) — the subscriber refreshes to the new revision;
+- an **invalidation** (`invalidation: true`, plus `invalidatedActionId`) — a durable reversal of a previously-committed action proven invalid by dispute (`docs/right-is-right.md` §Durable Invalidation, §Client Notification). An invalidation is a committed collection change like any other, so it rides this same path and reuses the **invalidation's** own commit cert as `sig`, verified by the subscriber exactly like a commit notification (a forwarder can drop it but cannot forge one — it lacks the `k − x` threshold signature).
+
+The marker is a **hint, not a gate** — the same contract the `delta` field already carries. It lets an invalidation-aware client *react* (drop derived results and resubmit through the optimistic loop) rather than merely refresh, and lets it coalesce the several notifications one dispute's cascade can emit by `invalidatedActionId`. A subscriber that ignores the marker still converges: it re-reads the authoritative reverted state, and the durable `committed-invalidated` status is always available on a pull (`NetworkTransactor.getStatus`). Correctness never depends on the push arriving. The marker round-trips through the wire codec (`NotificationV1.invalidation` / `invalidatedActionId`); `buildNotificationV1` sets it from the `CollectionChangeEvent`.
+
 ### Origination point
 
 The tail cohort's primary for the collection (the cohort-topic primary at `coord_0(_, topicId)`) is the notification origin. It is by definition the tail cohort because `topicId` is derived from `tailId`. When this cohort is also serving as the transaction-layer tail-cluster — which it is, since they share the same coordinate — origination is a side-effect of commit: as soon as the threshold signature on the commit is assembled, the primary emits the notification.

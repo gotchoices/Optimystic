@@ -29,6 +29,20 @@ export function buildCommitCert(record: ClusterRecord, minSigs: number, signedPa
 	return { thresholdSig, signers, minSigs, signedPayload };
 }
 
+/**
+ * The deterministic change-event/notification `actionId` for a durable invalidation, derived from the
+ * `(invalidatedActionId, disputeId)` pair that uniquely identifies the reversal. An invalidation has no
+ * transaction `actionId` of its own (it reverses one), but reactivity keys both the captured commit cert
+ * and the emitted {@link CollectionChangeEvent} by an `actionId` so the bridge's cert extractor can
+ * resolve the reused cert. Both the cluster member's cert capture and the invalidation-apply sink that
+ * emits the change event derive this same id from the same pair, closing the loop. Distinct from the
+ * per-block deterministic revert `actionId` in `dispute/invalidation.ts` (which also carries blockId+rev);
+ * this is the single transaction-level id for the whole reversal.
+ */
+export function invalidationActionId(invalidatedActionId: ActionId, disputeId: string): ActionId {
+	return `inv:${invalidatedActionId}:${disputeId}`;
+}
+
 function concatBytes(parts: readonly Uint8Array[]): Uint8Array {
 	const total = parts.reduce((n, p) => n + p.length, 0);
 	const out = new Uint8Array(total);

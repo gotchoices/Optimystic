@@ -3,7 +3,9 @@ import {
 	buildNotificationV1,
 	sigDigest,
 	dedupeKey,
+	coalesceInvalidatedActionIds,
 	type OriginationContext,
+	type NotificationV1,
 } from '../../src/reactivity/index.js';
 import type { CollectionChangeEvent, CommitCert } from '../../src/transactor/change-notifier.js';
 import { bytesToB64url, b64urlToBytes } from '../../src/cohort-topic/wire/codec.js';
@@ -90,6 +92,51 @@ describe('reactivity notification origination', () => {
 		const rotationHint = { newTailId: bytesToB64url(new Uint8Array([7, 7])), effectiveAtRevision: 8 };
 		const n = buildNotificationV1(event, cert, baseCtx({ rotationHint }));
 		expect(n.rotationHint).to.deep.equal(rotationHint);
+	});
+
+	describe('invalidation marker', () => {
+		it('threads the invalidation flag + invalidatedActionId from the change event', () => {
+			const n = buildNotificationV1({ ...event, invalidation: true, invalidatedActionId: 'reversed-action-1' }, cert, baseCtx());
+			expect(n.invalidation).to.equal(true);
+			expect(n.invalidatedActionId).to.equal('reversed-action-1');
+		});
+
+		it('reuses the (invalidation) commit cert sig bit-for-bit, exactly like a commit notification', () => {
+			const n = buildNotificationV1({ ...event, invalidation: true, invalidatedActionId: 'reversed-action-1' }, cert, baseCtx());
+			expect([...b64urlToBytes(n.sig)]).to.deep.equal([...thresholdSig]);
+			expect(n.digest).to.equal(bytesToB64url(signedPayload));
+		});
+
+		it('omits the marker on an ordinary commit (distinct from an invalidation)', () => {
+			const n = buildNotificationV1(event, cert, baseCtx());
+			expect(n).to.not.have.property('invalidation');
+			expect(n).to.not.have.property('invalidatedActionId');
+		});
+
+		it('does not set invalidatedActionId when the flag is absent', () => {
+			const n = buildNotificationV1({ ...event, invalidatedActionId: 'should-be-ignored' }, cert, baseCtx());
+			expect(n).to.not.have.property('invalidation');
+			expect(n).to.not.have.property('invalidatedActionId');
+		});
+	});
+
+	describe('coalesceInvalidatedActionIds', () => {
+		const inv = (invalidatedActionId: string): NotificationV1 =>
+			buildNotificationV1({ ...event, invalidation: true, invalidatedActionId }, cert, baseCtx());
+		const commit = (): NotificationV1 => buildNotificationV1(event, cert, baseCtx());
+
+		it('collapses several cascade notifications by invalidatedActionId, first-seen order', () => {
+			expect(coalesceInvalidatedActionIds([inv('a'), inv('b'), inv('a'), inv('c'), inv('b')]))
+				.to.deep.equal(['a', 'b', 'c']);
+		});
+
+		it('ignores ordinary commit notifications', () => {
+			expect(coalesceInvalidatedActionIds([commit(), inv('a'), commit()])).to.deep.equal(['a']);
+		});
+
+		it('is empty for a batch with no invalidations', () => {
+			expect(coalesceInvalidatedActionIds([commit(), commit()])).to.deep.equal([]);
+		});
 	});
 
 	describe('dedupe key', () => {

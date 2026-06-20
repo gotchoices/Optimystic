@@ -16,6 +16,23 @@ export type CollectionChangeEvent = {
 	 * those never originate anyway, and are cert-gated out downstream).
 	 */
 	readonly tailId?: BlockId;
+	/**
+	 * `true` iff this change event is a durable **invalidation** — a compensating revision + appended
+	 * `InvalidationEntry` reversing a previously-committed action proven invalid by dispute
+	 * (`docs/right-is-right.md` §Durable Invalidation), rather than an ordinary commit. An invalidation
+	 * is a committed collection change like any other, so it flows through the same notification path;
+	 * this flag lets a subscriber distinguish it (drop derived results + resubmit) from a plain commit
+	 * (refresh). A hint only — correctness never depends on it: the subscriber always re-reads the
+	 * authoritative reverted state. Absent (falsy) on ordinary commits.
+	 */
+	readonly invalidation?: boolean;
+	/**
+	 * When {@link invalidation} is set, the `actionId` of the original committed action that was
+	 * reversed (the `InvalidationEntry.invalidatedActionId`). Lets an invalidation-aware client
+	 * dedup/coalesce multiple cascade notifications by the action they reverse, and resubmit exactly
+	 * the affected work. Absent on ordinary commits.
+	 */
+	readonly invalidatedActionId?: ActionId;
 };
 
 export type CollectionChangeListener = (event: CollectionChangeEvent) => void;

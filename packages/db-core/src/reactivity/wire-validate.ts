@@ -40,6 +40,15 @@ export function reqString(obj: Record<string, unknown>, key: string, what: strin
 	return value;
 }
 
+/** Require `obj[key]` to be a boolean; returns it. */
+export function reqBoolean(obj: Record<string, unknown>, key: string, what: string): boolean {
+	const value = obj[key];
+	if (typeof value !== "boolean") {
+		failWire(`${what}: field "${key}" must be a boolean`);
+	}
+	return value;
+}
+
 /** Require `obj[key]` to be a finite number; returns it. */
 export function reqFiniteNumber(obj: Record<string, unknown>, key: string, what: string): number {
 	const value = obj[key];

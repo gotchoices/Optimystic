@@ -31,6 +31,7 @@ import {
 	asObject,
 	b64urlField,
 	failWire as fail,
+	reqBoolean,
 	reqFiniteNumber,
 	reqIntInRange,
 	reqString,
@@ -94,6 +95,23 @@ export interface NotificationV1 {
 	signers: string[];
 	/** Tail-rotation pre-announce, when this notification carries one (rotation ticket fills it). */
 	rotationHint?: RotationHintV1;
+	/**
+	 * `true` iff this notification announces a durable **invalidation** (a reversal of a previously
+	 * committed action proven invalid by dispute) rather than an ordinary commit
+	 * (`docs/reactivity.md` §Notification origination, `docs/right-is-right.md` §Durable Invalidation).
+	 * An invalidation is a committed collection change like any other and rides the same notification
+	 * path, reusing the **invalidation's** commit cert as {@link sig} (never re-signed) — so it verifies
+	 * against the tail cohort exactly like a commit notification. The flag is a hint that lets a
+	 * subscriber react (drop derived results + resubmit) rather than merely refresh; a subscriber that
+	 * ignores it still re-reads the authoritative reverted state. Omitted (falsy) on commit notifications.
+	 */
+	invalidation?: boolean;
+	/**
+	 * When {@link invalidation} is set, the original action id that was reversed
+	 * (`InvalidationEntry.invalidatedActionId`). Lets a client dedup/coalesce the several cascade
+	 * notifications a single dispute can produce by the action they reverse. Omitted on commits.
+	 */
+	invalidatedActionId?: string;
 }
 
 // --- validation helpers ---
@@ -177,6 +195,12 @@ export function validateNotificationV1(value: unknown): NotificationV1 {
 	}
 	if (obj["rotationHint"] !== undefined) {
 		out.rotationHint = validateRotationHint(obj["rotationHint"], `${what}.rotationHint`);
+	}
+	if (obj["invalidation"] !== undefined) {
+		out.invalidation = reqBoolean(obj, "invalidation", what);
+	}
+	if (obj["invalidatedActionId"] !== undefined) {
+		out.invalidatedActionId = reqString(obj, "invalidatedActionId", what);
 	}
 	return out;
 }

@@ -107,6 +107,30 @@ export class Log<TAction> {
 		return undefined;
 	}
 
+	/**
+	 * Returns the invalidation entries appended after `startRev` (exclusive), newest-first. Used by
+	 * {@link import("../collection/collection.js").Collection} on `update` to discover reversals that
+	 * landed since the client last synced: a client holding a result derived from now-reverted content
+	 * drops it and replays against the reverted base — the same "your base moved, re-sync and retry"
+	 * path a stale read triggers (`docs/right-is-right.md` §Client notification). Unlike {@link getFrom}
+	 * (which skips invalidation entries — they are not pending/committed actions), this surfaces exactly
+	 * the invalidations. Scans newest→oldest and stops once at/below `startRev` (revs are monotonic), so
+	 * the walk is bounded to the unsynced tail.
+	 */
+	async getInvalidationsFrom(startRev: number | undefined): Promise<InvalidationEntry[]> {
+		const invalidations: InvalidationEntry[] = [];
+		for await (const path of this.chain.select(undefined, false)) {
+			const entry = entryAt<LogEntry<TAction>>(path)!;
+			if (startRev !== undefined && entry.rev <= startRev) {
+				break;
+			}
+			if (entry.invalidation) {
+				invalidations.push(entry.invalidation);
+			}
+		}
+		return invalidations;
+	}
+
 	/** Gets the action context of the log. */
 	async getActionContext(): Promise<ActionContext | undefined> {
 		const tailPath = await this.chain.getTail();

@@ -8,10 +8,11 @@ import { toString as uint8ArrayToString } from 'uint8arrays/to-string';
 import type {
 	IRepo, ClusterRecord, RepoMessage, Signature, ClusterPeers,
 	BlockGets, GetBlockResults, PendRequest, PendResult, CommitRequest, CommitResult, ActionBlocks,
-	InvalidateRequest, DisputeResolutionProof,
+	InvalidateRequest, DisputeResolutionProof, CommitCert, ActionId,
 } from '@optimystic/db-core';
 import type { IPeerNetwork } from '@optimystic/db-core';
 import { clusterMember, type ClusterMember } from '../src/cluster/cluster-repo.js';
+import { invalidationActionId } from '../src/cluster/commit-cert.js';
 import { buildDisputeResolutionProof } from '../src/dispute/invalidation.js';
 import type { ArbitrationVote, DisputeResolution } from '../src/dispute/types.js';
 
@@ -147,6 +148,47 @@ describe('ClusterMember invalidation apply path', () => {
 		expect(received).to.have.lengthOf(1);
 		expect(received[0]!.invalidatedActionId).to.equal('a-inv');
 		expect(received[0]!.resolution.disputeId).to.equal('d1');
+	});
+
+	it('captures the invalidation commit cert (for reactivity reuse) keyed by invalidationActionId', async () => {
+		const certs = new Map<ActionId, CommitCert>();
+		member = clusterMember({
+			storageRepo: new MockRepo(), peerNetwork: new MockNetwork(),
+			peerId: self.peerId, privateKey: self.privateKey,
+			onInvalidate: async () => { /* applied */ },
+			onCommitCertificate: (actionId, cert) => { certs.set(actionId, cert); },
+		});
+
+		const proof = await challengerWinsProof('d1');
+		const record = await makeConsensusRecord(self, invalidateOp(proof, 'a-inv'), Date.now() + 30000);
+		await member.update(record);
+
+		// The cert is captured under the deterministic invalidation action id (NOT the original action id),
+		// so the reactivity bridge's extractor resolves it when the invalidation's change event is emitted.
+		const key = invalidationActionId('a-inv', 'd1');
+		const cert = certs.get(key);
+		expect(cert, 'invalidation commit cert was captured').to.not.be.undefined;
+		expect(cert!.signers).to.include(self.peerId.toString());
+		expect(cert!.thresholdSig.length).to.be.greaterThan(0);
+		expect(cert!.signedPayload.length).to.be.greaterThan(0);
+		// It is NOT captured under the original (reversed) action id — that id has its own commit cert.
+		expect(certs.get('a-inv' as ActionId)).to.be.undefined;
+	});
+
+	it('does not capture an invalidation cert when the certificate is rejected', async () => {
+		const certs = new Map<ActionId, CommitCert>();
+		member = clusterMember({
+			storageRepo: new MockRepo(), peerNetwork: new MockNetwork(),
+			peerId: self.peerId, privateKey: self.privateKey,
+			onInvalidate: async () => { /* applied */ },
+			onCommitCertificate: (actionId, cert) => { certs.set(actionId, cert); },
+		});
+
+		const proof = await majorityWinsProof('d1'); // not a valid invalidation certificate
+		const record = await makeConsensusRecord(self, invalidateOp(proof, 'a-inv'), Date.now() + 30000);
+		await member.update(record);
+
+		expect(certs.size).to.equal(0);
 	});
 
 	it('rejects a sub-threshold/forged certificate without invoking the sink', async () => {

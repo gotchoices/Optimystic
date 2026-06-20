@@ -1,8 +1,8 @@
 import { peerIdFromString } from "../network/types.js";
 import type { PeerId } from "../network/types.js";
-import type { ActionTransforms, ActionBlocks, BlockActionStatus, ITransactor, PendSuccess, StaleFailure, IKeyNetwork, BlockId, GetBlockResults, PendResult, CommitResult, PendRequest, IRepo, BlockGets, Transforms, CommitRequest, ActionId, RepoCommitRequest, ClusterNomineesResult, CollectionId } from "../index.js";
+import type { ActionTransforms, ActionBlocks, BlockActionStatus, ITransactor, PendSuccess, StaleFailure, IKeyNetwork, BlockId, GetBlockResults, PendResult, CommitResult, PendRequest, IRepo, BlockGets, Transforms, CommitRequest, ActionId, RepoCommitRequest, ClusterNomineesResult, CollectionId, IBlock } from "../index.js";
 import type { IBlockChangeNotifier, CollectionChangeListener } from "./change-notifier.js";
-import { transformForBlockId, groupBy, concatTransforms, concatTransform, transformsFromTransform, blockIdsForTransforms } from "../index.js";
+import { transformForBlockId, groupBy, concatTransforms, concatTransform, transformsFromTransform, blockIdsForTransforms, Log, Tracker, CacheSource, TransactorSource } from "../index.js";
 import { blockIdToBytes } from "../utility/block-id-to-bytes.js";
 import { isRecordEmpty } from "../utility/is-record-empty.js";
 import { type CoordinatorBatch, makeBatchesByPeer, incompleteBatches, everyBatch, allBatches, mergeBlocks, processBatches, createBatchesForPayload } from "../utility/batch-coordinator.js";
@@ -213,7 +213,7 @@ export class NetworkTransactor implements ITransactor, IBlockChangeNotifier {
 		const blockStates = await this.get({ blockIds: allBlockIds });
 
 		// Determine status for each action ref
-		return blockActions.map(ref => ({
+		const results: BlockActionStatus[] = blockActions.map(ref => ({
 			...ref,
 			statuses: ref.blockIds.map(blockId => {
 				const result = blockStates[blockId];
@@ -227,12 +227,85 @@ export class NetworkTransactor implements ITransactor, IBlockChangeNotifier {
 				if (state.latest?.actionId === ref.actionId) {
 					return 'committed';
 				}
-				// Action is neither pending nor the latest committed - consider it aborted
-				// Note: This doesn't check historical commits; a more complete implementation
-				// would need to query the revision history
+				// Neither pending nor the latest committed. Block state alone calls this `aborted`, but a
+				// committed action that was later durably **invalidated** also presents this way — the
+				// compensating revision is now the block's latest, so the original action is no longer it.
+				// The `refineInvalidatedStatuses` pass below disambiguates from the authoritative log.
 				return 'aborted';
 			})
 		}));
+
+		// Authoritative `committed-invalidated` from durable state: consult each affected collection's
+		// log for an InvalidationEntry against the queried action (survives a node restart — the in-memory
+		// dispute map is only a fast cache; the log is the source of truth). Only `aborted` slots are
+		// ambiguous, so this is a no-op for ordinary pending/committed queries.
+		await this.refineInvalidatedStatuses(results, blockStates);
+		return results;
+	}
+
+	/**
+	 * Refine the otherwise-`aborted` statuses to `committed-invalidated` for any queried action that has a
+	 * durable {@link import("../log/struct.js").InvalidationEntry} against it. Reads the collection log via
+	 * {@link Log.findInvalidation} — the durable, restart-surviving source of truth (`docs/right-is-right.md`
+	 * §Durable Invalidation) — rather than the per-node, in-memory dispute map. A `pending` slot is left
+	 * untouched: a still-pending transaction whose base was invalidated will be rejected on its own
+	 * validation ("pending → will-be-rejected"), which is not the same as `committed-invalidated`.
+	 *
+	 * Best-effort and isolated: a log-open/read fault leaves the slot `aborted` (logged) rather than
+	 * failing the whole status query. The per-call caches keep one log open and one lookup per
+	 * `(collection, action)` even when many refs share a collection.
+	 */
+	private async refineInvalidatedStatuses(results: BlockActionStatus[], blockStates: GetBlockResults): Promise<void> {
+		const logByCollection = new Map<CollectionId, Log<unknown> | undefined>();
+		const invalidatedByKey = new Map<string, boolean>();
+
+		for (const ref of results) {
+			if (!ref.statuses.some(status => status === 'aborted')) {
+				continue; // no ambiguous slot — an invalidation could not change this ref's answer
+			}
+			const collectionId = collectionIdForRef(ref, blockStates);
+			if (collectionId === undefined) {
+				continue; // genuinely aborted: no fetched block to anchor a collection log on
+			}
+			const key = `${collectionId} ${ref.actionId}`;
+			let invalidated = invalidatedByKey.get(key);
+			if (invalidated === undefined) {
+				invalidated = await this.hasDurableInvalidation(collectionId, ref.actionId, logByCollection);
+				invalidatedByKey.set(key, invalidated);
+			}
+			if (!invalidated) {
+				continue;
+			}
+			for (let i = 0; i < ref.statuses.length; i++) {
+				if (ref.statuses[i] === 'aborted') {
+					ref.statuses[i] = 'committed-invalidated';
+				}
+			}
+		}
+	}
+
+	/** Whether `actionId` has a durable invalidation entry in `collectionId`'s log (opened once, cached). */
+	private async hasDurableInvalidation(
+		collectionId: CollectionId,
+		actionId: ActionId,
+		logByCollection: Map<CollectionId, Log<unknown> | undefined>,
+	): Promise<boolean> {
+		try {
+			let collectionLog = logByCollection.get(collectionId);
+			if (!logByCollection.has(collectionId)) {
+				const source = new TransactorSource<IBlock>(collectionId, this, undefined);
+				const tracker = new Tracker<IBlock>(new CacheSource<IBlock>(source));
+				collectionLog = await Log.open<unknown>(tracker, collectionId);
+				logByCollection.set(collectionId, collectionLog);
+			}
+			if (!collectionLog) {
+				return false;
+			}
+			return (await collectionLog.findInvalidation(actionId)) !== undefined;
+		} catch (err) {
+			log('getStatus: durable invalidation lookup failed collection=%s action=%s: %o', collectionId, actionId, err);
+			return false;
+		}
 	}
 
 	private async consolidateCoordinators(
@@ -597,6 +670,22 @@ export class NetworkTransactor implements ITransactor, IBlockChangeNotifier {
 	}
 }
 
+
+/**
+ * The owning collection id for an action ref, read from any fetched block's header. A
+ * committed-then-invalidated action still has a materialized (compensating) block whose header carries
+ * the collection id; a genuinely-aborted action has no fetched block, so this returns `undefined` and
+ * the status stays `aborted`.
+ */
+function collectionIdForRef(ref: ActionBlocks, blockStates: GetBlockResults): CollectionId | undefined {
+	for (const blockId of ref.blockIds) {
+		const collectionId = blockStates[blockId]?.block?.header.collectionId;
+		if (collectionId !== undefined) {
+			return collectionId;
+		}
+	}
+	return undefined;
+}
 
 /** Returns a readable message for an unknown error value. */
 function errorMessage(err: unknown): string {

@@ -134,5 +134,29 @@ describe('reactivity wire', () => {
 		it('rejects a frame whose body exceeds the supplied ceiling', () => {
 			expect(() => encodeNotificationV1(sampleNotification(), 16)).to.throw(CohortWireError, /max_message_bytes/);
 		});
+
+		it('round-trips the invalidation marker (flag + invalidatedActionId)', () => {
+			const inv: NotificationV1 = { ...sampleNotification(), invalidation: true, invalidatedActionId: 'action-being-reversed' };
+			const decoded = decodeNotificationV1(encodeNotificationV1(inv));
+			expect(decoded.invalidation).to.equal(true);
+			expect(decoded.invalidatedActionId).to.equal('action-being-reversed');
+			expect(decoded).to.deep.equal(inv);
+		});
+
+		it('omits the invalidation marker on an ordinary commit notification', () => {
+			const decoded = decodeNotificationV1(encodeNotificationV1(sampleNotification()));
+			expect(decoded).to.not.have.property('invalidation');
+			expect(decoded).to.not.have.property('invalidatedActionId');
+		});
+
+		it('rejects a non-boolean invalidation flag', () => {
+			const bad = { ...sampleNotification(), invalidation: 'yes' };
+			expect(() => encodeNotificationV1(bad as unknown as NotificationV1)).to.throw(CohortWireError, /invalidation/);
+		});
+
+		it('rejects a non-string invalidatedActionId', () => {
+			const bad = { ...sampleNotification(), invalidatedActionId: 123 };
+			expect(() => encodeNotificationV1(bad as unknown as NotificationV1)).to.throw(CohortWireError, /invalidatedActionId/);
+		});
 	});
 });
