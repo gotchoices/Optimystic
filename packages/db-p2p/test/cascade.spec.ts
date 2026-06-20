@@ -337,4 +337,95 @@ describe('Invalidation cascade', () => {
 		}
 		expect(threw).to.equal(true);
 	});
+
+	it('reverts a multi-collection dependent in every collection it wrote (not just one)', async () => {
+		const a = await makeCollection('A');
+		const b = await makeCollection('B');
+		// Collection A: genesis seeds X (the root's block) and P (t2's A-block, so its revert restores).
+		await a.seed({ actionId: 'genA', rev: 1, writes: [{ blockId: 'X', value: 'x0' }, { blockId: 'P', value: 'p0' }], reads: [] });
+		await a.seed({ actionId: 'tinv', rev: 2, writes: [{ blockId: 'X', value: 'x-tinv' }], reads: [] });
+		// Collection B: genesis seeds Q (t2's B-block).
+		await b.seed({ actionId: 'genB', rev: 1, writes: [{ blockId: 'Q', value: 'q0' }], reads: [] });
+		// t2 is ONE transaction spanning both collections: same actionId, same read set, distinct
+		// per-collection entry (P@3 in A, Q@2 in B). Both read the root's invalidated X@2.
+		await a.seed({ actionId: 't2', rev: 3, writes: [{ blockId: 'P', value: 'p-t2' }], reads: [{ blockId: 'X', revision: 2 }] });
+		await b.seed({ actionId: 't2', rev: 2, writes: [{ blockId: 'Q', value: 'q-t2' }], reads: [{ blockId: 'X', revision: 2 }] });
+
+		const proof = await challengerWinsProof('d1');
+		const seed = await applyRoot(a, 'tinv', 2, ['X'], proof);
+
+		const result = await cascadeInvalidate({ rootActionId: 'tinv', proof, seed, envs: [a, b] });
+
+		// The regression: t2 is reverted in BOTH collections, not just the lower-rev one.
+		const reverted = result.invalidated.map(c => `${c.collectionId}:${c.actionId}`).sort();
+		expect(reverted).to.deep.equal(['A:t2', 'B:t2']);
+		expect((await a.log.findInvalidation('t2'))?.cascadeRoot).to.equal('tinv');
+		expect((await b.log.findInvalidation('t2'))?.cascadeRoot).to.equal('tinv');
+		expect(await countInvalidationEntries(a)).to.equal(2); // root tinv + t2
+		expect(await countInvalidationEntries(b)).to.equal(1); // t2
+		expect(result.escalation).to.equal(undefined);
+	});
+
+	it('is idempotent for a multi-collection dependent: re-running adds no duplicate entries in either collection', async () => {
+		const a = await makeCollection('A');
+		const b = await makeCollection('B');
+		await a.seed({ actionId: 'genA', rev: 1, writes: [{ blockId: 'X', value: 'x0' }, { blockId: 'P', value: 'p0' }], reads: [] });
+		await a.seed({ actionId: 'tinv', rev: 2, writes: [{ blockId: 'X', value: 'x-tinv' }], reads: [] });
+		await b.seed({ actionId: 'genB', rev: 1, writes: [{ blockId: 'Q', value: 'q0' }], reads: [] });
+		await a.seed({ actionId: 't2', rev: 3, writes: [{ blockId: 'P', value: 'p-t2' }], reads: [{ blockId: 'X', revision: 2 }] });
+		await b.seed({ actionId: 't2', rev: 2, writes: [{ blockId: 'Q', value: 'q-t2' }], reads: [{ blockId: 'X', revision: 2 }] });
+
+		const proof = await challengerWinsProof('d1');
+		const seed = await applyRoot(a, 'tinv', 2, ['X'], proof);
+
+		const first = await cascadeInvalidate({ rootActionId: 'tinv', proof, seed, envs: [a, b] });
+		expect(first.invalidated.map(c => `${c.collectionId}:${c.actionId}`).sort()).to.deep.equal(['A:t2', 'B:t2']);
+		expect(await countInvalidationEntries(a)).to.equal(2);
+		expect(await countInvalidationEntries(b)).to.equal(1);
+
+		// Restart from the same root: each collection-entry dedups (already-applied), still reported.
+		const second = await cascadeInvalidate({ rootActionId: 'tinv', proof, seed, envs: [a, b] });
+		expect(second.invalidated.map(c => `${c.collectionId}:${c.actionId}`).sort()).to.deep.equal(['A:t2', 'B:t2']);
+		// No duplicate child entries from the re-run.
+		expect(await countInvalidationEntries(a)).to.equal(2);
+		expect(await countInvalidationEntries(b)).to.equal(1);
+	});
+
+	it('counts a multi-collection dependent once at maxCascadeTransactions (all-or-nothing, never split)', async () => {
+		const a = await makeCollection('A');
+		const b = await makeCollection('B');
+		// A: X (root), P (t2's A-block), R (the independent t3's block).
+		await a.seed({ actionId: 'genA', rev: 1, writes: [{ blockId: 'X', value: 'x0' }, { blockId: 'P', value: 'p0' }, { blockId: 'R', value: 'r0' }], reads: [] });
+		await a.seed({ actionId: 'tinv', rev: 2, writes: [{ blockId: 'X', value: 'x-tinv' }], reads: [] });
+		await b.seed({ actionId: 'genB', rev: 1, writes: [{ blockId: 'Q', value: 'q0' }], reads: [] });
+		// t2: one transaction, two collection-entries — must count as a single transaction.
+		await a.seed({ actionId: 't2', rev: 3, writes: [{ blockId: 'P', value: 'p-t2' }], reads: [{ blockId: 'X', revision: 2 }] });
+		await b.seed({ actionId: 't2', rev: 2, writes: [{ blockId: 'Q', value: 'q-t2' }], reads: [{ blockId: 'X', revision: 2 }] });
+		// t3: a second, INDEPENDENT dependent (distinct actionId) — the one that must be escalated.
+		await a.seed({ actionId: 't3', rev: 4, writes: [{ blockId: 'R', value: 'r-t3' }], reads: [{ blockId: 'X', revision: 2 }] });
+
+		const proof = await challengerWinsProof('d1');
+		const seed = await applyRoot(a, 'tinv', 2, ['X'], proof);
+
+		const escalations: CascadeEscalation[] = [];
+		// Budget = root + 1 transaction. t2 (one transaction across both collections) must land in BOTH;
+		// t3 (the second transaction) is escalated. If t2 were counted per-collection-entry it would
+		// trip the horizon mid-transaction — the partial reversal this fix closes.
+		const result = await cascadeInvalidate({
+			rootActionId: 'tinv', proof, seed, envs: [a, b],
+			config: { maxCascadeDepth: 32, maxCascadeTransactions: 2 },
+			onEscalation: (e) => escalations.push(e),
+		});
+
+		expect(result.invalidated.map(c => `${c.collectionId}:${c.actionId}`).sort()).to.deep.equal(['A:t2', 'B:t2']);
+		expect(result.escalation?.reason).to.equal('max-transactions');
+		expect(result.escalation?.remainder.map(r => r.actionId)).to.include('t3');
+		expect(escalations).to.have.lengthOf(1);
+		// t2 reverted durably in both collections; the independent t3 was not applied.
+		expect(await a.log.findInvalidation('t2')).to.not.equal(undefined);
+		expect(await b.log.findInvalidation('t2')).to.not.equal(undefined);
+		expect(await a.log.findInvalidation('t3')).to.equal(undefined);
+		expect(await countInvalidationEntries(a)).to.equal(2); // root tinv + t2 (t3 escalated)
+		expect(await countInvalidationEntries(b)).to.equal(1); // t2
+	});
 });
