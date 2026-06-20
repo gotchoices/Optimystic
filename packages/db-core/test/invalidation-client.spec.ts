@@ -64,8 +64,8 @@ function makeProof(disputeId: string): DisputeResolutionProof {
 		messageHash: `msg-${disputeId}`,
 		outcome: 'challenger-wins',
 		votes: [
-			{ arbitratorPeerId: 'arb-1', vote: 'agree-with-challenger', computedHash: 'h', signature: 'sig-1' },
-			{ arbitratorPeerId: 'arb-2', vote: 'agree-with-challenger', computedHash: 'h', signature: 'sig-2' },
+			{ version: 'v2', arbitratorPeerId: 'arb-1', vote: 'agree-with-challenger', computedHash: 'h', signature: 'sig-1' },
+			{ version: 'v2', arbitratorPeerId: 'arb-2', vote: 'agree-with-challenger', computedHash: 'h', signature: 'sig-2' },
 		],
 	}
 }

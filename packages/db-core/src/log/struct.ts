@@ -42,17 +42,26 @@ export type ActionEntry<TAction> = {
 /**
  * One arbitrator's signed verdict — the minimal subset of a dispute vote needed to re-verify
  * it independently. The Ed25519 public key that verifies {@link signature} is embedded in
- * {@link arbitratorPeerId} (a libp2p Ed25519 peer id). The signed payload mirrors the dispute
- * layer's vote signature: `utf8(`${disputeId}:${vote}:${computedHash}`)`.
+ * {@link arbitratorPeerId} (a libp2p Ed25519 peer id).
+ *
+ * The signed payload is **target-bound** (v2): `utf8(`v2:${disputeId}:${vote}:${computedHash}:${targetHash}`)`,
+ * where `targetHash = hashString(`${messageHash}|${invalidatedActionId}|${sortedBlockIds.join(',')}`)`
+ * commits the vote to the *specific* transaction being reversed. A verifier recomputes `targetHash`
+ * from the {@link DisputeResolutionProof.messageHash} plus the apply-path target, so a genuine proof
+ * cannot be replayed against an unrelated transaction. v1 (unbound) votes are rejected, not
+ * accepted-by-default; the {@link version} marker is required and the follow-up arbitrator-set ticket
+ * bumps it additively (`invalidation-cert-arbitrator-set-binding`).
  */
 export type ArbitrationVoteProof = {
+	/** Wire-format version of the signed payload. Only `'v2'` is accepted; absent/unrecognized → rejected. */
+	readonly version: 'v2';
 	/** Peer id of the arbitrator; its embedded Ed25519 public key verifies {@link signature}. */
 	readonly arbitratorPeerId: string;
 	/** The arbitrator's verdict. */
 	readonly vote: 'agree-with-challenger' | 'agree-with-majority' | 'inconclusive';
 	/** The operations hash the arbitrator computed (part of the signed payload). */
 	readonly computedHash: string;
-	/** Base64url-encoded Ed25519 signature over `${disputeId}:${vote}:${computedHash}`. */
+	/** Base64url-encoded Ed25519 signature over `v2:${disputeId}:${vote}:${computedHash}:${targetHash}`. */
 	readonly signature: string;
 };
 
@@ -64,8 +73,15 @@ export type ArbitrationVoteProof = {
  * layer's richer `DisputeResolution` maps *onto* this proof rather than this proof importing it.
  * A member treats the proof as a reversal certificate — `outcome === 'challenger-wins'` with a
  * 2/3 super-majority of decisive votes agreeing with the challenger (each signature verifiable
- * against its arbitrator's embedded key). A compromised peer can withhold an invalidation but
- * cannot forge one.
+ * against its arbitrator's embedded key, each vote target-bound and counted at most once per
+ * arbitrator).
+ *
+ * **Unforgeability (partial).** The {@link messageHash} plus the apply-path target now bind the votes
+ * to the specific reversed transaction (no cross-target replay), and per-arbitrator dedup prevents one
+ * vote manufacturing a majority. A compromised peer still cannot forge a reversal for a *different*
+ * transaction. The remaining gap — binding the votes to the *legitimately-selected arbitrator set* (so
+ * a peer that can mint Ed25519 keypairs cannot stuff a synthetic cohort) — is closed by the follow-up
+ * ticket `invalidation-cert-arbitrator-set-binding`; until it lands, "cannot forge" is not yet absolute.
  */
 export type DisputeResolutionProof = {
 	/** Identifies the dispute these votes resolved. */

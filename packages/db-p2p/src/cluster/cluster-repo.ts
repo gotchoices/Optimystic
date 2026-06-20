@@ -900,9 +900,11 @@ export class ClusterMember implements ICluster {
 			return;
 		}
 
-		// Certificate verification BEFORE apply — never trust the originator's say-so. A compromised
-		// peer can withhold an invalidation but cannot forge one.
-		if (!await verifyInvalidationCertificate(request.resolution)) {
+		// Certificate verification BEFORE apply — never trust the originator's say-so. Verify the proof
+		// against THIS request's own target: the votes are bound to the transaction the dispute resolved,
+		// so a genuine proof carried in a request that points at a different (innocent) action/blocks fails
+		// here. This is the network-facing replay boundary (#2) — it never reuses a different target.
+		if (!await verifyInvalidationCertificate(request.resolution, { invalidatedActionId: request.invalidatedActionId, blockIds: request.blockIds })) {
 			log('cluster-member:consensus-invalidate-reject-certificate', {
 				messageHash,
 				invalidatedActionId: request.invalidatedActionId,

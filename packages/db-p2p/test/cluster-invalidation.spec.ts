@@ -13,7 +13,7 @@ import type {
 import type { IPeerNetwork } from '@optimystic/db-core';
 import { clusterMember, type ClusterMember } from '../src/cluster/cluster-repo.js';
 import { invalidationActionId } from '../src/cluster/commit-cert.js';
-import { buildDisputeResolutionProof } from '../src/dispute/invalidation.js';
+import { buildDisputeResolutionProof, computeTargetHash } from '../src/dispute/invalidation.js';
 import type { ArbitrationVote, DisputeResolution } from '../src/dispute/types.js';
 
 // ─── Crypto / record helpers (mirrors cluster-repo.spec.ts) ───
@@ -78,11 +78,17 @@ async function makeConsensusRecord(self: KeyPair, operations: RepoMessage['opera
 
 // ─── Dispute proof helpers ───
 
-async function makeVote(arb: KeyPair, disputeId: string, vote: ArbitrationVote['vote']): Promise<ArbitrationVote> {
+// The invalidation request these tests drive through consensus always reverts action 'a-inv' / block
+// 'B' under messageHash 'msg-hash'; the v2 votes are bound to exactly that target so the cluster's
+// apply-path verification (against the request's own target) succeeds.
+const PROOF_MSG = 'msg-hash';
+const PROOF_TARGET = { invalidatedActionId: 'a-inv', blockIds: ['B'] };
+
+async function makeVote(arb: KeyPair, disputeId: string, vote: ArbitrationVote['vote'], targetHash: string): Promise<ArbitrationVote> {
 	const computedHash = 'h';
-	const sig = await arb.privateKey.sign(new TextEncoder().encode(`${disputeId}:${vote}:${computedHash}`));
+	const sig = await arb.privateKey.sign(new TextEncoder().encode(`v2:${disputeId}:${vote}:${computedHash}:${targetHash}`));
 	return {
-		disputeId, arbitratorPeerId: arb.peerId.toString(), vote,
+		version: 'v2', disputeId, arbitratorPeerId: arb.peerId.toString(), vote,
 		evidence: { computedHash, engineId: 'e', schemaHash: 's', blockStateHashes: {} },
 		signature: uint8ArrayToString(sig, 'base64url'),
 	};
@@ -90,16 +96,18 @@ async function makeVote(arb: KeyPair, disputeId: string, vote: ArbitrationVote['
 
 async function challengerWinsProof(disputeId: string): Promise<DisputeResolutionProof> {
 	const arbs = await Promise.all([makeKeyPair(), makeKeyPair(), makeKeyPair()]);
-	const votes = await Promise.all(arbs.map(a => makeVote(a, disputeId, 'agree-with-challenger')));
+	const targetHash = await computeTargetHash(PROOF_MSG, PROOF_TARGET);
+	const votes = await Promise.all(arbs.map(a => makeVote(a, disputeId, 'agree-with-challenger', targetHash)));
 	const resolution: DisputeResolution = { disputeId, outcome: 'challenger-wins', votes, affectedPeers: [], timestamp: 1 };
-	return buildDisputeResolutionProof(resolution, 'msg-hash');
+	return buildDisputeResolutionProof(resolution, PROOF_MSG);
 }
 
 async function majorityWinsProof(disputeId: string): Promise<DisputeResolutionProof> {
 	const arbs = await Promise.all([makeKeyPair(), makeKeyPair()]);
-	const votes = await Promise.all(arbs.map(a => makeVote(a, disputeId, 'agree-with-majority')));
+	const targetHash = await computeTargetHash(PROOF_MSG, PROOF_TARGET);
+	const votes = await Promise.all(arbs.map(a => makeVote(a, disputeId, 'agree-with-majority', targetHash)));
 	const resolution: DisputeResolution = { disputeId, outcome: 'majority-wins', votes, affectedPeers: [], timestamp: 1 };
-	return buildDisputeResolutionProof(resolution, 'msg-hash');
+	return buildDisputeResolutionProof(resolution, PROOF_MSG);
 }
 
 function invalidateOp(resolution: DisputeResolutionProof, actionId = 'a-inv'): RepoMessage['operations'] {
@@ -201,6 +209,24 @@ describe('ClusterMember invalidation apply path', () => {
 
 		const proof = await majorityWinsProof('d1'); // not a valid invalidation certificate
 		const record = await makeConsensusRecord(self, invalidateOp(proof), Date.now() + 30000);
+		await member.update(record);
+
+		expect(received).to.have.lengthOf(0);
+	});
+
+	it('rejects a genuine proof replayed against a different target without invoking the sink (#2)', async () => {
+		const received: InvalidateRequest[] = [];
+		member = clusterMember({
+			storageRepo: new MockRepo(), peerNetwork: new MockNetwork(),
+			peerId: self.peerId, privateKey: self.privateKey,
+			onInvalidate: async (req) => { received.push(req); },
+		});
+
+		// A genuine challenger-wins proof bound to action 'a-inv' / block 'B' …
+		const proof = await challengerWinsProof('d1');
+		// … carried in a request that points at a DIFFERENT (innocent) action 'innocent'. The cluster
+		// verifies the proof against the request's own target, which no longer matches the votes' binding.
+		const record = await makeConsensusRecord(self, invalidateOp(proof, 'innocent'), Date.now() + 30000);
 		await member.update(record);
 
 		expect(received).to.have.lengthOf(0);

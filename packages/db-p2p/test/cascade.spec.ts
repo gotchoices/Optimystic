@@ -10,8 +10,10 @@ import { BlockStorage } from '../src/storage/block-storage.js';
 import { MemoryRawStorage } from '../src/storage/memory-storage.js';
 import {
 	buildDisputeResolutionProof,
+	computeTargetHash,
 	applyInvalidation,
 	cascadeInvalidate,
+	type CertificateTarget,
 	type CollectionEnv,
 	type CascadeSeed,
 	type CascadeEscalation,
@@ -29,18 +31,24 @@ async function makeArb(): Promise<Arb> {
 	return { peerId: peerIdFromPrivateKey(privateKey), privateKey };
 }
 
-async function makeVote(arb: Arb, disputeId: string, vote: ArbitrationVote['vote'], computedHash: string): Promise<ArbitrationVote> {
-	const sig = await arb.privateKey.sign(new TextEncoder().encode(`${disputeId}:${vote}:${computedHash}`));
+async function makeVote(arb: Arb, disputeId: string, vote: ArbitrationVote['vote'], computedHash: string, targetHash: string): Promise<ArbitrationVote> {
+	const sig = await arb.privateKey.sign(new TextEncoder().encode(`v2:${disputeId}:${vote}:${computedHash}:${targetHash}`));
 	return {
-		disputeId, arbitratorPeerId: arb.peerId.toString(), vote,
+		version: 'v2', disputeId, arbitratorPeerId: arb.peerId.toString(), vote,
 		evidence: { computedHash, engineId: 'engine', schemaHash: 'schema', blockStateHashes: {} },
 		signature: uint8ArrayToString(sig, 'base64url'),
 	};
 }
 
-async function challengerWinsProof(disputeId: string): Promise<DisputeResolutionProof> {
+/**
+ * A challenger-wins proof bound to the ROOT's target. The cascade reuses this proof to authorize every
+ * child (verifying it against the root's target, not the child's), so the binding here is the root's
+ * `(invalidatedActionId, blockIds)` — defaulting to the common single-block 'tinv'/['A'] root.
+ */
+async function challengerWinsProof(disputeId: string, target: CertificateTarget = { invalidatedActionId: 'tinv', blockIds: ['A'] }): Promise<DisputeResolutionProof> {
 	const arbs = await Promise.all([makeArb(), makeArb(), makeArb()]);
-	const votes = await Promise.all(arbs.map(a => makeVote(a, disputeId, 'agree-with-challenger', 'h')));
+	const targetHash = await computeTargetHash('msg-1', target);
+	const votes = await Promise.all(arbs.map(a => makeVote(a, disputeId, 'agree-with-challenger', 'h', targetHash)));
 	const resolution: DisputeResolution = { disputeId, outcome: 'challenger-wins', votes, affectedPeers: [], timestamp: 1 };
 	return buildDisputeResolutionProof(resolution, 'msg-1');
 }
@@ -196,7 +204,7 @@ describe('Invalidation cascade', () => {
 		await b.seed({ actionId: 'genB', rev: 1, writes: [{ blockId: 'Y', value: 'y0' }], reads: [] });
 		await b.seed({ actionId: 't2', rev: 2, writes: [{ blockId: 'Y', value: 'y-t2' }], reads: [{ blockId: 'X', revision: 2 }] });
 
-		const proof = await challengerWinsProof('d1');
+		const proof = await challengerWinsProof('d1', { invalidatedActionId: 'tinv', blockIds: ['X'] });
 		const seed = await applyRoot(a, 'tinv', 2, ['X'], proof);
 
 		const result = await cascadeInvalidate({ rootActionId: 'tinv', proof, seed, envs: [a, b] });
@@ -305,7 +313,7 @@ describe('Invalidation cascade', () => {
 		// T2 read only the structural block S (not the value A that actually changed).
 		await c.seed({ actionId: 't2', rev: 3, writes: [{ blockId: 'B', value: 'b-t2' }], reads: [{ blockId: 'S', revision: 2 }] });
 
-		const proof = await challengerWinsProof('d1');
+		const proof = await challengerWinsProof('d1', { invalidatedActionId: 'tinv', blockIds: ['S', 'A'] });
 		const seed = await applyRoot(c, 'tinv', 2, ['S', 'A'], proof);
 
 		const result = await cascadeInvalidate({ rootActionId: 'tinv', proof, seed, envs: [c] });
@@ -351,7 +359,7 @@ describe('Invalidation cascade', () => {
 		await a.seed({ actionId: 't2', rev: 3, writes: [{ blockId: 'P', value: 'p-t2' }], reads: [{ blockId: 'X', revision: 2 }] });
 		await b.seed({ actionId: 't2', rev: 2, writes: [{ blockId: 'Q', value: 'q-t2' }], reads: [{ blockId: 'X', revision: 2 }] });
 
-		const proof = await challengerWinsProof('d1');
+		const proof = await challengerWinsProof('d1', { invalidatedActionId: 'tinv', blockIds: ['X'] });
 		const seed = await applyRoot(a, 'tinv', 2, ['X'], proof);
 
 		const result = await cascadeInvalidate({ rootActionId: 'tinv', proof, seed, envs: [a, b] });
@@ -375,7 +383,7 @@ describe('Invalidation cascade', () => {
 		await a.seed({ actionId: 't2', rev: 3, writes: [{ blockId: 'P', value: 'p-t2' }], reads: [{ blockId: 'X', revision: 2 }] });
 		await b.seed({ actionId: 't2', rev: 2, writes: [{ blockId: 'Q', value: 'q-t2' }], reads: [{ blockId: 'X', revision: 2 }] });
 
-		const proof = await challengerWinsProof('d1');
+		const proof = await challengerWinsProof('d1', { invalidatedActionId: 'tinv', blockIds: ['X'] });
 		const seed = await applyRoot(a, 'tinv', 2, ['X'], proof);
 
 		const first = await cascadeInvalidate({ rootActionId: 'tinv', proof, seed, envs: [a, b] });
@@ -404,7 +412,7 @@ describe('Invalidation cascade', () => {
 		// t3: a second, INDEPENDENT dependent (distinct actionId) — the one that must be escalated.
 		await a.seed({ actionId: 't3', rev: 4, writes: [{ blockId: 'R', value: 'r-t3' }], reads: [{ blockId: 'X', revision: 2 }] });
 
-		const proof = await challengerWinsProof('d1');
+		const proof = await challengerWinsProof('d1', { invalidatedActionId: 'tinv', blockIds: ['X'] });
 		const seed = await applyRoot(a, 'tinv', 2, ['X'], proof);
 
 		const escalations: CascadeEscalation[] = [];
@@ -442,7 +450,7 @@ describe('Invalidation cascade', () => {
 		await a.seed({ actionId: 'tN', rev: 4, writes: [{ blockId: 'R', value: 'r-tN' }], reads: [{ blockId: 'X', revision: 2 }] });
 		await b.seed({ actionId: 't2', rev: 5, writes: [{ blockId: 'Q', value: 'q-t2' }], reads: [{ blockId: 'X', revision: 2 }] });
 
-		const proof = await challengerWinsProof('d1');
+		const proof = await challengerWinsProof('d1', { invalidatedActionId: 'tinv', blockIds: ['X'] });
 		const seed = await applyRoot(a, 'tinv', 2, ['X'], proof);
 
 		const escalations: CascadeEscalation[] = [];

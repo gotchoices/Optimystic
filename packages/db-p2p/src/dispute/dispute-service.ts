@@ -1,6 +1,6 @@
 import type { ClusterRecord, ITransactionValidator, InvalidateRequest, CommitRequest, PendRequest, CollectionId } from '@optimystic/db-core';
 import { blockIdsForTransforms } from '@optimystic/db-core';
-import { buildDisputeResolutionProof } from './invalidation.js';
+import { buildDisputeResolutionProof, computeTargetHash, VOTE_VERSION, type CertificateTarget } from './invalidation.js';
 import type { PeerId, PrivateKey } from '@libp2p/interface';
 import { sha256 } from 'multiformats/hashes/sha2';
 import { base58btc } from 'multiformats/bases/base58';
@@ -225,6 +225,10 @@ export class DisputeService {
 	async handleChallenge(challenge: DisputeChallenge): Promise<ArbitrationVote> {
 		log('dispute-handle-challenge', { disputeId: challenge.disputeId });
 
+		// Bind every vote to the disputed transaction: derive the reversal target the same way the
+		// originator/apply path does (so the verifier recomputes an identical targetHash), and sign over it.
+		const targetHash = await this.computeChallengeTargetHash(challenge);
+
 		// Verify the challenge signature
 		const validSignature = await this.verifyDisputeSignature(
 			challenge.disputeId,
@@ -239,7 +243,7 @@ export class DisputeService {
 				engineId: 'unknown',
 				schemaHash: '',
 				blockStateHashes: {},
-			});
+			}, targetHash);
 		}
 
 		// Re-execute the transaction to produce our own evidence
@@ -262,7 +266,7 @@ export class DisputeService {
 				engineId: 'unknown',
 				schemaHash: '',
 				blockStateHashes: {},
-			});
+			}, targetHash);
 		}
 
 		// Compare our evidence with the challenger's
@@ -275,7 +279,22 @@ export class DisputeService {
 			vote = 'agree-with-majority';
 		}
 
-		return this.makeVote(challenge.disputeId, vote, evidence);
+		return this.makeVote(challenge.disputeId, vote, evidence, targetHash);
+	}
+
+	/**
+	 * Derives the v2 target hash binding a vote to the disputed transaction: its `messageHash` plus the
+	 * reversal target (the committed action being reversed and the blocks it wrote), extracted from the
+	 * challenge's `originalRecord` exactly as {@link extractInvalidationTarget} does on the originate/apply
+	 * side. A record with no extractable target yields an empty target — the resulting vote still verifies
+	 * self-consistently but will not match a real reversal, which is correct (no real reversal exists).
+	 */
+	private async computeChallengeTargetHash(challenge: DisputeChallenge): Promise<string> {
+		const target = DisputeService.extractInvalidationTarget(challenge.originalRecord);
+		const certTarget: CertificateTarget = target
+			? { invalidatedActionId: target.actionId, blockIds: target.blockIds }
+			: { invalidatedActionId: '', blockIds: [] };
+		return computeTargetHash(challenge.originalRecord.messageHash, certTarget);
 	}
 
 	/**
@@ -502,13 +521,17 @@ export class DisputeService {
 	private async makeVote(
 		disputeId: string,
 		vote: ArbitrationVote['vote'],
-		evidence: ValidationEvidence
+		evidence: ValidationEvidence,
+		targetHash: string
 	): Promise<ArbitrationVote> {
-		const payload = `${disputeId}:${vote}:${evidence.computedHash}`;
+		// Target-bound v2 payload: binds the vote to the specific transaction being reversed so a genuine
+		// vote cannot be replayed against an unrelated transaction.
+		const payload = `${VOTE_VERSION}:${disputeId}:${vote}:${evidence.computedHash}:${targetHash}`;
 		const payloadBytes = new TextEncoder().encode(payload);
 		const sigBytes = await this.privateKey.sign(payloadBytes);
 
 		return {
+			version: VOTE_VERSION,
 			disputeId,
 			arbitratorPeerId: this.peerId.toString(),
 			vote,

@@ -12,6 +12,36 @@ import { createLogger } from '../logger.js';
 const log = createLogger('invalidation');
 
 /**
+ * Accepted arbitration-vote wire-format version. The signed payload is target-bound (binds the votes
+ * to the specific reversed transaction); v1 (unbound) votes are rejected, never accepted-by-default.
+ * The follow-up arbitrator-set ticket bumps this additively.
+ */
+export const VOTE_VERSION = 'v2' as const;
+
+/**
+ * The transaction an invalidation certificate's votes are bound to — the committed action being
+ * reversed and the blocks it wrote. Threaded into {@link verifyInvalidationCertificate} so a genuine
+ * `challenger-wins` proof for transaction X cannot be replayed to revert an unrelated transaction Y:
+ * the arbitrators signed over X's `targetHash`, so verifying against any other target makes every
+ * signature fail → 0 decisive votes → reject.
+ */
+export type CertificateTarget = {
+	readonly invalidatedActionId: ActionId;
+	readonly blockIds: ReadonlyArray<BlockId>;
+};
+
+/**
+ * Binds a vote to its reversal target: `hashString(`${messageHash}|${invalidatedActionId}|${sortedBlockIds}`)`.
+ * `blockIds` are lexically sorted so the binding is independent of the order a member happens to list
+ * them, and {@link hashString} is the same db-core helper the compensating-state computation uses, so
+ * every member recomputes an identical `targetHash`.
+ */
+export async function computeTargetHash(messageHash: string, target: CertificateTarget): Promise<string> {
+	const sortedBlockIds = [...target.blockIds].sort();
+	return await hashString(`${messageHash}|${target.invalidatedActionId}|${sortedBlockIds.join(',')}`);
+}
+
+/**
  * Marks a `reverted` block whose as-if-`T_inv`-absent state is a *deletion* (T_inv created the
  * block, so there is no prior content to restore). The single-collection core does not yet
  * physically remove such blocks — it records and logs them; the cascade ticket completes the
@@ -38,6 +68,7 @@ export function buildDisputeResolutionProof(resolution: DisputeResolution, messa
 
 function toVoteProof(vote: ArbitrationVote): ArbitrationVoteProof {
 	return {
+		version: vote.version,
 		arbitratorPeerId: vote.arbitratorPeerId,
 		vote: vote.vote,
 		computedHash: vote.evidence.computedHash,
@@ -52,31 +83,63 @@ function toVoteProof(vote: ArbitrationVote): ArbitrationVoteProof {
  * analogue of the commit certificate. A member accepts an invalidation **only** if this returns true:
  *
  *  - the claimed `outcome` is `challenger-wins`, AND
- *  - recomputing from the *cryptographically valid* votes alone, the `agree-with-challenger` votes
- *    meet the 2/3 super-majority of decisive votes (mirrors `DisputeService.resolveDispute`).
+ *  - recomputing from the *cryptographically valid, deduped* votes alone, the `agree-with-challenger`
+ *    votes meet the 2/3 super-majority of decisive votes (mirrors `DisputeService.resolveDispute`).
  *
- * Each vote's signature is verified against the Ed25519 public key embedded in its arbitrator's
- * peer id, over the exact payload the arbitrator signed (`${disputeId}:${vote}:${computedHash}`).
- * Votes with bad/forged/unparseable signatures are dropped before counting, so a single peer cannot
- * forge an invalidation by fabricating votes.
+ * **Target binding (#2).** `target` is the transaction actually being reverted; the verifier recomputes
+ * `targetHash` from `proof.messageHash` + `target` and checks each vote's signature over the v2 payload
+ * `v2:${disputeId}:${vote}:${computedHash}:${targetHash}`. Because the arbitrators signed the *real*
+ * transaction's `targetHash`, feeding any other target (a replay against an innocent transaction) makes
+ * every signature fail. A vote whose version is absent/unrecognized (legacy/v1) is rejected before
+ * counting — never accepted-by-default.
+ *
+ * **Per-arbitrator dedup (#3).** Decisive votes are tallied at most once per `arbitratorPeerId`:
+ *  - a repeated *identical* decisive vote counts once (so one vote replicated N× cannot manufacture a
+ *    super-majority);
+ *  - an arbitrator that appears twice with *different* decisive votes (equivocation) is dropped entirely
+ *    — counted on neither side — so a forger cannot place one peer on both sides.
+ * `inconclusive` votes are valid but non-decisive and never tallied.
+ *
+ * **Not yet bound (#1).** This does NOT yet check that the counted arbitrators are the legitimately
+ * selected set; a peer that can mint Ed25519 keypairs can still present a synthetic cohort. That is the
+ * follow-up `invalidation-cert-arbitrator-set-binding`; the dedup here is designed to compose with the
+ * set-membership check it adds.
  */
-export async function verifyInvalidationCertificate(proof: DisputeResolutionProof): Promise<boolean> {
+export async function verifyInvalidationCertificate(proof: DisputeResolutionProof, target: CertificateTarget): Promise<boolean> {
 	if (proof.outcome !== 'challenger-wins') {
 		return false;
 	}
 
-	let challengerVotes = 0;
-	let majorityVotes = 0;
+	const targetHash = await computeTargetHash(proof.messageHash, target);
+
+	// Decisive verdict per arbitrator, deduped and equivocation-dropped (see doc-comment).
+	type Decisive = 'agree-with-challenger' | 'agree-with-majority';
+	const decisiveByArbitrator = new Map<string, Decisive | 'equivocated'>();
 	for (const vote of proof.votes) {
-		if (!(await verifyVoteSignature(proof.disputeId, vote))) {
+		if (!(await verifyVoteSignature(proof.disputeId, vote, targetHash))) {
 			continue;
 		}
-		if (vote.vote === 'agree-with-challenger') {
+		if (vote.vote !== 'agree-with-challenger' && vote.vote !== 'agree-with-majority') {
+			continue; // 'inconclusive' — valid but not decisive
+		}
+		const prior = decisiveByArbitrator.get(vote.arbitratorPeerId);
+		if (prior === undefined) {
+			decisiveByArbitrator.set(vote.arbitratorPeerId, vote.vote);
+		} else if (prior !== 'equivocated' && prior !== vote.vote) {
+			// Same arbitrator, conflicting decisive votes → drop entirely (do not let one peer be on both sides).
+			decisiveByArbitrator.set(vote.arbitratorPeerId, 'equivocated');
+		}
+		// prior === vote.vote (duplicate) or already 'equivocated': counted at most once, no change.
+	}
+
+	let challengerVotes = 0;
+	let majorityVotes = 0;
+	for (const decision of decisiveByArbitrator.values()) {
+		if (decision === 'agree-with-challenger') {
 			challengerVotes++;
-		} else if (vote.vote === 'agree-with-majority') {
+		} else if (decision === 'agree-with-majority') {
 			majorityVotes++;
 		}
-		// 'inconclusive' votes are valid but not decisive.
 	}
 
 	const totalDecisive = challengerVotes + majorityVotes;
@@ -87,14 +150,22 @@ export async function verifyInvalidationCertificate(proof: DisputeResolutionProo
 	return challengerVotes >= superMajorityThreshold;
 }
 
-/** Verify one arbitration vote's Ed25519 signature against its arbitrator peer id's embedded key. */
-async function verifyVoteSignature(disputeId: string, vote: ArbitrationVoteProof): Promise<boolean> {
+/**
+ * Verify one arbitration vote's Ed25519 signature against its arbitrator peer id's embedded key, over
+ * the **target-bound v2 payload**. Rejects any vote that is not the v2 format before trusting it, so a
+ * legacy/unversioned vote can never slip through.
+ */
+async function verifyVoteSignature(disputeId: string, vote: ArbitrationVoteProof, targetHash: string): Promise<boolean> {
+	// Runtime gate: `vote` arrives off the wire, so its `version` may not match the declared type.
+	if (vote.version !== VOTE_VERSION) {
+		return false;
+	}
 	try {
 		const publicKey = peerIdFromString(vote.arbitratorPeerId).publicKey;
 		if (!publicKey) {
 			return false;
 		}
-		const payload = new TextEncoder().encode(`${disputeId}:${vote.vote}:${vote.computedHash}`);
+		const payload = new TextEncoder().encode(`${VOTE_VERSION}:${disputeId}:${vote.vote}:${vote.computedHash}:${targetHash}`);
 		const sigBytes = uint8ArrayFromString(vote.signature, 'base64url');
 		return await publicKey.verify(payload, sigBytes);
 	} catch (err) {
@@ -202,6 +273,17 @@ export type ApplyInvalidationParams = {
 	 * logical cascade event. Absent for a root invalidation.
 	 */
 	readonly cascadeRoot?: ActionId;
+	/**
+	 * The target the proof's votes are bound to — the transaction the dispute actually resolved. For a
+	 * **root** invalidation this equals this call's own `(invalidatedActionId, blockIds)` and may be
+	 * omitted (defaulted below). A **cascade child** reuses the *root's* proof to authorize reverting a
+	 * read-dependent whose own target differs, so it MUST pass the root's target here: the votes were
+	 * signed over the root's `targetHash`, not the child's. The child-specific justification is the
+	 * deterministic cascade derivation every member replays — not the certificate, which only attests
+	 * the root is invalid. (The network-facing apply path `applyConsensusInvalidation` never sets this:
+	 * it verifies against the request's *own* target, which is the replay boundary this ticket closes.)
+	 */
+	readonly certificateTarget?: CertificateTarget;
 	readonly timestamp?: number;
 };
 
@@ -236,8 +318,14 @@ export async function applyInvalidation(ctx: InvalidationContext, params: ApplyI
 		return { applied: false, reason: 'already-applied', reverted: [...existing.reverted] };
 	}
 
-	// 2. Certificate verification — never trust a single peer's say-so.
-	if (!(await verifyInvalidationCertificate(proof))) {
+	// 2. Certificate verification — never trust a single peer's say-so. The proof's votes are bound to
+	//    a specific target; verify against the target they were signed over. For a root invalidation
+	//    that is this call's own target; a cascade child passes the root's target via `certificateTarget`
+	//    (the child-target justification is the deterministic cascade, not the certificate). A mismatched
+	//    target (a genuine proof replayed against an innocent transaction) fails every signature here, so
+	//    no compensating revision or log entry is ever written for it.
+	const certificateTarget = params.certificateTarget ?? { invalidatedActionId, blockIds };
+	if (!(await verifyInvalidationCertificate(proof, certificateTarget))) {
 		log('apply-reject-certificate actionId=%s disputeId=%s outcome=%s', invalidatedActionId, proof.disputeId, proof.outcome);
 		return { applied: false, reason: 'invalid-certificate', reverted: [] };
 	}

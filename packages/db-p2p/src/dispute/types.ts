@@ -36,6 +36,12 @@ export type DisputeChallenge = {
 
 /** An arbitrator's independent assessment */
 export type ArbitrationVote = {
+	/**
+	 * Wire-format version of the signed vote payload (target-bound). Mirrors
+	 * {@link ArbitrationVoteProof.version}; kept in lock-step so origination and the proof projection
+	 * agree. Only `'v2'` is produced/accepted today.
+	 */
+	version: 'v2';
 	/** Dispute being voted on */
 	disputeId: string;
 	/** Peer ID of the arbitrator */
