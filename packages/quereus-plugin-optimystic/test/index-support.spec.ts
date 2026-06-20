@@ -355,5 +355,53 @@ describe('Optimystic Index Support', () => {
 			expect(keys.length, 'index entry count after DELETE').to.equal(2);
 			expect(keys.some(k => k.startsWith('c\x00')), "deleted 'c' entry is absent").to.be.false;
 		});
+
+		it('UPDATE that leaves the indexed column unchanged neither drops nor duplicates the entry', async () => {
+			// The new old-row fetch + restage must be a no-op for the index when
+			// only a non-indexed column changes: updateIndexEntries sees an
+			// unchanged tree key and early-returns, so the entry count is stable.
+			await db.exec(`
+				CREATE TABLE orphan_noop (
+					id INTEGER PRIMARY KEY,
+					cat TEXT,
+					note TEXT
+				) USING optimystic('tree://test/orphan_noop')
+			`);
+			await db.exec(`CREATE INDEX idx_orphan_noop_cat ON orphan_noop(cat)`);
+
+			await db.exec(`INSERT INTO orphan_noop (id, cat, note) VALUES (1, 'a', 'x'), (2, 'b', 'y')`);
+
+			// Change only the non-indexed `note` column of row 2.
+			await db.exec(`UPDATE orphan_noop SET note = 'z' WHERE id = 2`);
+
+			const keys = await scanIndexKeys(plugin, 'tree://test/orphan_noop/index/idx_orphan_noop_cat');
+			expect(keys.length, 'index entry count after no-op-index UPDATE').to.equal(2);
+			expect(keys.some(k => k.startsWith('a\x00')), "row 1's 'a' entry intact").to.be.true;
+			expect(keys.some(k => k.startsWith('b\x00')), "row 2's 'b' entry intact").to.be.true;
+		});
+
+		it("UPDATE on a non-unique index removes only the moved row's entry, not a sibling sharing the old value", async () => {
+			// Rows 1 and 2 both have cat='b'; their composite index keys differ
+			// only by primary key (b\x001 vs b\x002). Moving row 2 to 'z' must
+			// delete exactly b\x002 and leave row 1's b\x001 entry in place.
+			await db.exec(`
+				CREATE TABLE orphan_dup (
+					id INTEGER PRIMARY KEY,
+					cat TEXT
+				) USING optimystic('tree://test/orphan_dup')
+			`);
+			await db.exec(`CREATE INDEX idx_orphan_dup_cat ON orphan_dup(cat)`);
+
+			await db.exec(`INSERT INTO orphan_dup (id, cat) VALUES (1, 'b'), (2, 'b'), (3, 'c')`);
+
+			await db.exec(`UPDATE orphan_dup SET cat = 'z' WHERE id = 2`);
+
+			const keys = await scanIndexKeys(plugin, 'tree://test/orphan_dup/index/idx_orphan_dup_cat');
+			expect(keys.length, 'index entry count after sibling-sharing UPDATE').to.equal(3);
+			// Row 1's shared 'b' entry survives; only row 2's 'b' entry is gone.
+			expect(keys, "row 1's b\\x001 entry intact").to.include('b\x001');
+			expect(keys, "row 2's b\\x002 entry removed").to.not.include('b\x002');
+			expect(keys, "row 2's new z\\x002 entry present").to.include('z\x002');
+		});
 	});
 });
