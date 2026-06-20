@@ -978,6 +978,16 @@ export class OptimysticVirtualTable extends VirtualTable {
               };
             }
 
+            // PK is clear; now enforce any SECONDARY UNIQUE constraints (the tree only
+            // guards the PK). A hit returns a structured constraint result the same way
+            // the PK path does — e.g. the control schema's single-use StampId column.
+            const uniqueConflict = await this.resolveUniqueConflict(
+              values, args.onConflict ?? ConflictResolution.ABORT,
+            );
+            if (uniqueConflict) {
+              return uniqueConflict;
+            }
+
             const encodedRow = this.rowCodec.encodeRow(values);
 
             // Snapshot the trees before staging so a rollback can revert exactly
@@ -1016,6 +1026,18 @@ export class OptimysticVirtualTable extends VirtualTable {
             // row is unexpectedly absent — should not happen in valid DML.
             const oldEntry = await this.collection.get(oldKey) as [string, EncodedRow] | undefined;
             const oldRow: Row = oldEntry ? this.rowCodec.decodeRow(oldEntry[1]) : (oldKeyValues as Row);
+
+            // Enforce SECONDARY UNIQUE constraints against the post-update values,
+            // excluding the row being updated (its own PK), before any staging. A
+            // collision with a DIFFERENT row returns a structured constraint result,
+            // mirroring the INSERT path. (PK collisions on a key change are handled
+            // separately below.)
+            const uniqueConflict = await this.resolveUniqueConflict(
+              values, args.onConflict ?? ConflictResolution.ABORT, oldKey,
+            );
+            if (uniqueConflict) {
+              return uniqueConflict;
+            }
 
             // Stage the main-table change (flushed at commit / restored on
             // rollback). A PK change is staged as delete-old + insert-new so both
