@@ -156,9 +156,11 @@ export interface CohortTopicServiceDeps {
 	 * Optional cold-start bootstrap-evidence builder (db-p2p supplies it). Invoked **only** on the
 	 * bootstrap re-issue (when the walk sets `bootstrap: true`), with the register's own canonical
 	 * fields — the same `(topicId, tier, participantCoord, timestamp)` tuple a verifier binds via
-	 * `bootstrapBoundImage`. It returns the serialized `BootstrapEvidenceEnvelopeV1` bytes (or
-	 * `undefined` to attach none); the bytes are set on `RegisterV1.bootstrapEvidence` **before** the
-	 * body is signed, so the participant signature covers them and a MITM cannot strip or swap the proof.
+	 * `bootstrapBoundImage`. It returns the **raw** envelope JSON bytes — `utf8(JSON.stringify(env))`,
+	 * NOT the already-base64url string from `serializeBootstrapEvidenceEnvelope` — or `undefined` to
+	 * attach none; the service base64url-encodes those bytes into `RegisterV1.bootstrapEvidence`
+	 * **before** the body is signed, so the participant signature covers them and a MITM cannot strip or
+	 * swap the proof. (Returning the `serialize()` string's bytes would double-encode the field.)
 	 * Absent (default) → no evidence is attached, exactly today's behavior. The minting logic (PoW
 	 * search, reputation/parent-ref signing) is the db-p2p follow-on.
 	 */
