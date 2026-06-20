@@ -39,8 +39,11 @@ describe('Distributed Transaction Validation', function () {
 
 	const nodes: TestNode[] = [];
 	const MESH_SIZE = 3;
-	// Use a random port range to avoid conflicts with other tests
-	const BASE_PORT = 9300 + Math.floor(Math.random() * 100);
+	// Use ephemeral ports (0) so the OS assigns free TCP ports. Fixed ports
+	// risk EADDRINUSE collisions with leftover/concurrent nodes; the mesh's
+	// bootstrap addresses are derived from each node's actual getMultiaddrs()
+	// after start, so the concrete port numbers don't need to be predetermined.
+	const EPHEMERAL_PORT = 0;
 	const NETWORK_NAME = 'test-trx-validation-' + Date.now();
 	let testTempDir: string;
 
@@ -51,15 +54,14 @@ describe('Distributed Transaction Validation', function () {
 		console.log(`🚀 Starting ${MESH_SIZE}-node mesh with file storage...\n`);
 
 		// Start first node (bootstrap)
-		const node1 = await createNode(BASE_PORT, [], 0);
+		const node1 = await createNode(EPHEMERAL_PORT, [], 0);
 		nodes.push(node1);
 		console.log(`✅ Node 1: ${node1.peerId.slice(0, 12)}... (${node1.storagePath})`);
 
 		const bootstrapAddrs = node1.node.getMultiaddrs().map((ma: any) => ma.toString());
 
 		for (let i = 1; i < MESH_SIZE; i++) {
-			const port = BASE_PORT + i;
-			const node = await createNode(port, bootstrapAddrs, i);
+			const node = await createNode(EPHEMERAL_PORT, bootstrapAddrs, i);
 			nodes.push(node);
 			console.log(`✅ Node ${i + 1}: ${node.peerId.slice(0, 12)}... (${node.storagePath})`);
 		}
