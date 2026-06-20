@@ -69,8 +69,10 @@ export class FileRawStorage implements IRawStorage {
 		for (const file of files) {
 			if (!file.endsWith('.json')) continue;
 			const actionId = decodeFilenameToActionId(file.slice(0, -5));
-			// Accept legacy base64url UUID format and consensus tx:/stamp: format.
-			if (!/^(?:[\w\d]+-[\w\d]+-[\w\d]+-[\w\d]+-[\w\d]+|(?:tx|stamp):[0-9a-f]+)$/.test(actionId)) continue;
+			// Accept legacy UUID format and consensus tx:/stamp: format. The
+			// consensus hash is base64url-encoded SHA-256 (see db-core hashString),
+			// so its alphabet is [A-Za-z0-9_-] — NOT lowercase hex.
+			if (!/^(?:[\w\d]+-[\w\d]+-[\w\d]+-[\w\d]+-[\w\d]+|(?:tx|stamp):[A-Za-z0-9_-]+)$/.test(actionId)) continue;
 			yield actionId;
 		}
 	}

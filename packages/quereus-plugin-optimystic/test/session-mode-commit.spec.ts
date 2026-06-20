@@ -23,16 +23,13 @@
  *
  * Transactor choice: these tests drive the REAL coordinator GATHER/PEND/COMMIT
  * consensus path through the StorageRepo of the in-memory `test` transactor.
- * In-memory (not `local`/`FileRawStorage`) is deliberate and cross-platform:
- * db-core stamps transaction ids as `tx:<hash>` / `stamp:<hash>` and
- * db-p2p-storage-fs writes pend/action files named `<actionId>.json`, so on
- * WINDOWS the colon makes an illegal filename and the consensus commit's
- * pend→actions rename fails with EINVAL. That is a pre-existing, POSIX-only-safe
- * storage-layer limitation orthogonal to the wiring fixed here (the legacy sync
- * path sidesteps it by using colon-free base64url action ids). The single
- * on-disk reopen test below covers `local`/`FileRawStorage` durability and is
- * therefore skipped on win32; see the backlog ticket
- * `optimystic-filestorage-colon-actionid-windows`.
+ * In-memory (not `local`/`FileRawStorage`) keeps this suite fast and dependency-
+ * free; db-core stamps transaction ids as `tx:<hash>` / `stamp:<hash>`, whose
+ * colon was once illegal in a db-p2p-storage-fs filename on Windows. That is now
+ * fixed (FileRawStorage percent-encodes the colon — ticket
+ * `optimystic-filestorage-colon-actionid-windows`), and the single on-disk
+ * reopen test below exercises `local`/`FileRawStorage` durability on ALL
+ * platforms.
  *
  * A second composition hazard this suite exercises and documents: a host must
  * supply a NON-re-entrant schema-hash provider. `TransactionBridge.beginTransaction`
