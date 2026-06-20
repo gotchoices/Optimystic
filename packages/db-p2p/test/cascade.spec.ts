@@ -428,4 +428,43 @@ describe('Invalidation cascade', () => {
 		expect(await countInvalidationEntries(a)).to.equal(2); // root tinv + t2 (t3 escalated)
 		expect(await countInvalidationEntries(b)).to.equal(1); // t2
 	});
+
+	it('reverts a multi-collection dependent all-or-nothing even when an over-budget txn interleaves at the horizon', async () => {
+		const a = await makeCollection('A');
+		const b = await makeCollection('B');
+		// A: X (root), P (t2's A-block), R (the independent over-budget tN's block).
+		await a.seed({ actionId: 'genA', rev: 1, writes: [{ blockId: 'X', value: 'x0' }, { blockId: 'P', value: 'p0' }, { blockId: 'R', value: 'r0' }], reads: [] });
+		await a.seed({ actionId: 'tinv', rev: 2, writes: [{ blockId: 'X', value: 'x-tinv' }], reads: [] });
+		await b.seed({ actionId: 'genB', rev: 1, writes: [{ blockId: 'Q', value: 'q0' }], reads: [] });
+		// t2 is ONE transaction: A:P@3 and B:Q@5. tN is a second, INDEPENDENT transaction at rev 4 —
+		// so by the cascade's (rev, collectionId) ordering it sorts BETWEEN t2's two entries.
+		await a.seed({ actionId: 't2', rev: 3, writes: [{ blockId: 'P', value: 'p-t2' }], reads: [{ blockId: 'X', revision: 2 }] });
+		await a.seed({ actionId: 'tN', rev: 4, writes: [{ blockId: 'R', value: 'r-tN' }], reads: [{ blockId: 'X', revision: 2 }] });
+		await b.seed({ actionId: 't2', rev: 5, writes: [{ blockId: 'Q', value: 'q-t2' }], reads: [{ blockId: 'X', revision: 2 }] });
+
+		const proof = await challengerWinsProof('d1');
+		const seed = await applyRoot(a, 'tinv', 2, ['X'], proof);
+
+		const escalations: CascadeEscalation[] = [];
+		// Budget = root + 1 transaction. Once t2 is counted (its A-entry), the budget is full, so the
+		// interleaving tN trips the horizon mid-round. The cascade must NOT abandon t2's still-pending
+		// B-entry: t2 is reverted all-or-nothing in BOTH collections, and tN — the genuinely-new
+		// transaction — is the one escalated. (Regression: a horizon `break` would split t2.)
+		const result = await cascadeInvalidate({
+			rootActionId: 'tinv', proof, seed, envs: [a, b],
+			config: { maxCascadeDepth: 32, maxCascadeTransactions: 2 },
+			onEscalation: (e) => escalations.push(e),
+		});
+
+		expect(result.invalidated.map(c => `${c.collectionId}:${c.actionId}`).sort()).to.deep.equal(['A:t2', 'B:t2']);
+		expect(result.escalation?.reason).to.equal('max-transactions');
+		expect(result.escalation?.remainder.map(r => r.actionId)).to.deep.equal(['tN']);
+		expect(escalations).to.have.lengthOf(1);
+		// t2 reverted durably in both collections; the independent over-budget tN was not applied.
+		expect(await a.log.findInvalidation('t2')).to.not.equal(undefined);
+		expect(await b.log.findInvalidation('t2')).to.not.equal(undefined);
+		expect(await a.log.findInvalidation('tN')).to.equal(undefined);
+		expect(await countInvalidationEntries(a)).to.equal(2); // root tinv + t2 (tN escalated)
+		expect(await countInvalidationEntries(b)).to.equal(1); // t2
+	});
 });
