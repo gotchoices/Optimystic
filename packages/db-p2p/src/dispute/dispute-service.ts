@@ -1,4 +1,6 @@
-import type { ClusterRecord, ITransactionValidator } from '@optimystic/db-core';
+import type { ClusterRecord, ITransactionValidator, InvalidateRequest, CommitRequest, PendRequest, CollectionId } from '@optimystic/db-core';
+import { blockIdsForTransforms } from '@optimystic/db-core';
+import { buildDisputeResolutionProof } from './invalidation.js';
 import type { PeerId, PrivateKey } from '@libp2p/interface';
 import { sha256 } from 'multiformats/hashes/sha2';
 import { base58btc } from 'multiformats/bases/base58';
@@ -39,6 +41,15 @@ export interface DisputeServiceInit {
 	config?: Partial<DisputeConfig>;
 	/** Select arbitrators for a dispute (next K peers beyond the original cluster) */
 	selectArbitrators: (blockId: string, excludePeers: string[], count: number) => Promise<PeerId[]>;
+	/**
+	 * Originates the durable reversal when a dispute resolves `challenger-wins`. The dissent
+	 * coordinator (the node that initiated the dispute, holding the original record) builds the
+	 * {@link InvalidateRequest} and hands it here to be driven through the critical cluster as a
+	 * consensus-ordered invalidation; every member then applies it deterministically. Absent on
+	 * nodes not wired to originate invalidations (today's default) — the in-memory status still flips,
+	 * but nothing durable is written until this is supplied.
+	 */
+	onInvalidation?: (request: InvalidateRequest) => Promise<void> | void;
 }
 
 /**
@@ -57,6 +68,7 @@ export class DisputeService {
 	private readonly config: DisputeConfig;
 	private readonly engineHealth: EngineHealthMonitor;
 	private readonly selectArbitrators: DisputeServiceInit['selectArbitrators'];
+	private readonly onInvalidation?: DisputeServiceInit['onInvalidation'];
 
 	/** Active disputes initiated by this node */
 	private activeDisputes: Map<string, DisputeChallenge> = new Map();
@@ -66,6 +78,8 @@ export class DisputeService {
 	private resolvedChallenges: Map<string, DisputeChallenge> = new Map();
 	/** Track which transactions we've already disputed (prevent spam) */
 	private disputedTransactions: Set<string> = new Set();
+	/** Track which transactions we've already originated an invalidation for (fire once per messageHash) */
+	private invalidatedTransactions: Set<string> = new Set();
 
 	constructor(init: DisputeServiceInit) {
 		this.peerId = init.peerId;
@@ -76,6 +90,7 @@ export class DisputeService {
 		this.config = { ...DEFAULT_DISPUTE_CONFIG, ...init.config };
 		this.engineHealth = new EngineHealthMonitor(this.config);
 		this.selectArbitrators = init.selectArbitrators;
+		this.onInvalidation = init.onInvalidation;
 	}
 
 	/** Get the engine health monitor */
@@ -186,6 +201,9 @@ export class DisputeService {
 
 		// Apply reputation effects
 		this.applyReputationEffects(resolution, record);
+
+		// On a proven-invalid transaction, originate the durable reversal through the cluster.
+		await this.maybeInvalidate(resolution, record);
 
 		// Broadcast resolution
 		await this.broadcastResolution(resolution, arbitrators, originalPeers);
@@ -371,6 +389,85 @@ export class DisputeService {
 				this.engineHealth.recordDisputeLoss();
 			}
 		}
+	}
+
+	/**
+	 * When a dispute resolves `challenger-wins`, originate the durable invalidation. Builds the
+	 * independently-verifiable {@link buildDisputeResolutionProof proof} and the {@link InvalidateRequest}
+	 * from the disputed transaction, then hands it to the injected `onInvalidation` originator (which
+	 * drives it through the critical cluster). Fires at most once per disputed transaction. A no-op
+	 * when no originator is wired (the in-memory status still flips via {@link getDisputeStatus}).
+	 */
+	private async maybeInvalidate(resolution: DisputeResolution, record: ClusterRecord): Promise<void> {
+		if (resolution.outcome !== 'challenger-wins' || !this.onInvalidation) {
+			return;
+		}
+		if (this.invalidatedTransactions.has(record.messageHash)) {
+			return;
+		}
+
+		const target = DisputeService.extractInvalidationTarget(record);
+		if (!target) {
+			log('dispute-invalidation-no-target', { disputeId: resolution.disputeId, messageHash: record.messageHash });
+			return;
+		}
+
+		this.invalidatedTransactions.add(record.messageHash);
+		const request: InvalidateRequest = {
+			invalidatedActionId: target.actionId,
+			invalidatedRev: target.rev,
+			blockIds: target.blockIds,
+			collectionId: target.collectionId,
+			resolution: buildDisputeResolutionProof(resolution, record.messageHash),
+		};
+
+		try {
+			await this.onInvalidation(request);
+			log('dispute-invalidation-originated', {
+				disputeId: resolution.disputeId,
+				invalidatedActionId: target.actionId,
+				blockCount: target.blockIds.length,
+			});
+		} catch (err) {
+			// Roll back the once-guard so a retry can re-originate.
+			this.invalidatedTransactions.delete(record.messageHash);
+			log('dispute-invalidation-originate-failed', {
+				disputeId: resolution.disputeId,
+				error: err instanceof Error ? err.message : String(err),
+			});
+		}
+	}
+
+	/**
+	 * Derives the invalidation target — the committed action, its revision, the blocks it wrote, and
+	 * its owning collection — from the disputed record. Prefers the commit operation (the disputed
+	 * transaction is committed); falls back to the pend operation defensively.
+	 */
+	private static extractInvalidationTarget(record: ClusterRecord): { actionId: string; rev: number; blockIds: string[]; collectionId: CollectionId } | undefined {
+		for (const operation of record.message.operations) {
+			if ('commit' in operation) {
+				const commit = operation.commit as CommitRequest;
+				return {
+					actionId: commit.actionId,
+					rev: commit.rev,
+					blockIds: commit.blockIds,
+					collectionId: commit.headerId ?? record.coordinatingBlockIds?.[0] ?? commit.blockIds[0]!,
+				};
+			}
+		}
+		for (const operation of record.message.operations) {
+			if ('pend' in operation) {
+				const pend = operation.pend as PendRequest;
+				const blockIds = blockIdsForTransforms(pend.transforms);
+				return {
+					actionId: pend.actionId,
+					rev: pend.rev ?? 0,
+					blockIds,
+					collectionId: record.coordinatingBlockIds?.[0] ?? blockIds[0]!,
+				};
+			}
+		}
+		return undefined;
 	}
 
 	/** Broadcast resolution to all interested parties */

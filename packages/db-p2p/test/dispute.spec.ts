@@ -2,7 +2,7 @@ import { expect } from 'chai';
 import { generateKeyPair } from '@libp2p/crypto/keys';
 import { peerIdFromPrivateKey } from '@libp2p/peer-id';
 import type { PeerId, PrivateKey } from '@libp2p/interface';
-import type { ClusterRecord, IPeerNetwork } from '@optimystic/db-core';
+import type { ClusterRecord, IPeerNetwork, InvalidateRequest } from '@optimystic/db-core';
 import { sha256 } from 'multiformats/hashes/sha2';
 import { base58btc } from 'multiformats/bases/base58';
 import { toString as uint8ArrayToString } from 'uint8arrays';
@@ -219,6 +219,7 @@ describe('DisputeService', () => {
 		options?: {
 			evidenceHash?: string;
 			enabled?: boolean;
+			onInvalidation?: (request: InvalidateRequest) => Promise<void> | void;
 		}
 	): DisputeService {
 		const clientFactory = createMockClientFactory(allServices);
@@ -228,6 +229,7 @@ describe('DisputeService', () => {
 			peerNetwork: new MockPeerNetwork(),
 			createDisputeClient: clientFactory as any,
 			reputation: new PeerReputationService(),
+			onInvalidation: options?.onInvalidation,
 			config: {
 				disputeEnabled: options?.enabled ?? true,
 				disputeArbitrationTimeoutMs: 5000,
@@ -360,6 +362,55 @@ describe('DisputeService', () => {
 			expect(result).to.not.be.undefined;
 			expect(result!.outcome).to.equal('inconclusive');
 			expect(result!.affectedPeers.length).to.equal(0);
+		});
+	});
+
+	describe('invalidation origination', () => {
+		it('originates an invalidation with a challenger-wins proof when the challenger wins', async () => {
+			const challenger = clusterPeers[0]!;
+			const originated: InvalidateRequest[] = [];
+			const svc = createDisputeService(challenger, {
+				evidenceHash: 'hash-A',
+				onInvalidation: async (req) => { originated.push(req); },
+			});
+			for (const arb of arbitratorPeers) {
+				createDisputeService(arb, { evidenceHash: 'hash-A' });
+			}
+
+			const record = await makeClusterRecord(clusterPeers, 'block-1', {
+				rejectPeers: new Set([challenger.peerId.toString()]),
+			});
+
+			const result = await svc.initiateDispute(record, makeEvidence('hash-A'));
+			expect(result!.outcome).to.equal('challenger-wins');
+
+			expect(originated).to.have.lengthOf(1);
+			const request = originated[0]!;
+			expect(request.invalidatedActionId).to.equal('action-1');
+			expect(request.resolution.outcome).to.equal('challenger-wins');
+			expect(request.resolution.messageHash).to.equal(record.messageHash);
+			// The proof carries the signed arbitrator votes for independent re-verification.
+			expect(request.resolution.votes.length).to.be.greaterThan(0);
+		});
+
+		it('does not originate an invalidation when the majority wins', async () => {
+			const challenger = clusterPeers[0]!;
+			const originated: InvalidateRequest[] = [];
+			const svc = createDisputeService(challenger, {
+				evidenceHash: 'hash-A',
+				onInvalidation: async (req) => { originated.push(req); },
+			});
+			for (const arb of arbitratorPeers) {
+				createDisputeService(arb, { evidenceHash: 'hash-B' });
+			}
+
+			const record = await makeClusterRecord(clusterPeers, 'block-1', {
+				rejectPeers: new Set([challenger.peerId.toString()]),
+			});
+
+			const result = await svc.initiateDispute(record, makeEvidence('hash-A'));
+			expect(result!.outcome).to.equal('majority-wins');
+			expect(originated).to.have.lengthOf(0);
 		});
 	});
 

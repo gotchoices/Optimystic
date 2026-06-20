@@ -3,7 +3,7 @@ import { Chain, entryAt } from "../index.js";
 import { nameof } from "../utility/nameof.js";
 import type { IBlock, BlockId, ActionId, CollectionId, ChainPath, ActionRev, ActionContext, ChainInitOptions, BlockStore } from "../index.js";
 import type { ChainDataNode } from '../chain/chain-nodes.js';
-import type { LogEntry, ActionEntry } from "./index.js";
+import type { LogEntry, ActionEntry, DisputeResolutionProof, InvalidationEntry, RevertedBlock } from "./index.js";
 import { LogDataBlockType, LogHeaderBlockType } from "./index.js";
 import { toString as uint8ArrayToString } from 'uint8arrays/to-string'
 import type { GetFromResult } from './struct.js';
@@ -57,6 +57,46 @@ export class Log<TAction> {
 		return { entry, tailPath };
 	}
 
+	/**
+	 * Appends a compensating invalidation entry that reverses a previously-committed action proven
+	 * invalid by dispute. The committed history is never rewritten — this is a new, append-only,
+	 * prior-hash-linked entry, recoverable on sync exactly like a commit. The caller has already
+	 * verified `resolution` is a challenger-wins certificate and computed the per-block `reverted`
+	 * targets (the new revisions restoring the as-if-`T_inv`-absent content).
+	 */
+	async addInvalidation(
+		invalidatedActionId: ActionId,
+		invalidatedRev: number,
+		resolution: DisputeResolutionProof,
+		reverted: ReadonlyArray<RevertedBlock>,
+		rev: number,
+		cascadeRoot?: ActionId,
+		timestamp: number = Date.now()
+	) {
+		const invalidation: InvalidationEntry = cascadeRoot !== undefined
+			? { invalidatedActionId, invalidatedRev, resolution, reverted, cascadeRoot }
+			: { invalidatedActionId, invalidatedRev, resolution, reverted };
+		const entry = { timestamp, rev, invalidation } as LogEntry<TAction>;
+		const tailPath = await this.chain.add(entry);
+		return { entry, tailPath };
+	}
+
+	/**
+	 * Finds the most recent invalidation entry that reverses the given committed action, if any.
+	 * This is the durable source of truth for `committed-invalidated` status — once the entry has
+	 * landed in the log, the reversal is recoverable on sync independent of any in-memory cache.
+	 * Scans newest→oldest (O(n) over the chain, matching {@link getFrom}); returns the first match.
+	 */
+	async findInvalidation(invalidatedActionId: ActionId): Promise<InvalidationEntry | undefined> {
+		for await (const path of this.chain.select(undefined, false)) {
+			const invalidation = entryAt<LogEntry<TAction>>(path)!.invalidation;
+			if (invalidation && invalidation.invalidatedActionId === invalidatedActionId) {
+				return invalidation;
+			}
+		}
+		return undefined;
+	}
+
 	/** Gets the action context of the log. */
 	async getActionContext(): Promise<ActionContext | undefined> {
 		const tailPath = await this.chain.getTail();
@@ -90,9 +130,14 @@ export class Log<TAction> {
 				pendings.unshift(...entry.checkpoint.pendings);
 				break;
 			}
-			pendings.unshift({ actionId: entry.action!.actionId, rev: entry.rev });
+			// Invalidation entries take a rev slot but are not pending actions — skip them in
+			// the committed/pending set (the reversal is surfaced via findInvalidation instead).
+			if (!entry.action) {
+				continue;
+			}
+			pendings.unshift({ actionId: entry.action.actionId, rev: entry.rev });
 			if (startRev !== undefined && entry.rev > startRev) {
-				entries.unshift(entry.action!);
+				entries.unshift(entry.action);
 			}	// Can't stop at rev, because we need to collect all pending actions for the context
 		}
 		// Continue stepping past the checkpoint until the given rev is reached

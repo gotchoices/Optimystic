@@ -15,3 +15,14 @@ export {
 	DEFAULT_DISPUTE_CONFIG,
 } from './types.js';
 export { selectArbitrators } from './arbitrator-selection.js';
+export {
+	buildDisputeResolutionProof,
+	verifyInvalidationCertificate,
+	computeRevertedBlock,
+	applyInvalidation,
+	DEFERRED_DELETE_RESTORE,
+	type RevertedComputation,
+	type InvalidationContext,
+	type ApplyInvalidationParams,
+	type ApplyInvalidationResult,
+} from './invalidation.js';

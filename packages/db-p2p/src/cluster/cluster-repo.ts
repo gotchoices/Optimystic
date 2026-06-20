@@ -1,7 +1,8 @@
-import type { IRepo, ClusterRecord, Signature, RepoMessage, ITransactionValidator, ClusterConsensusConfig, CommitResult, BlockId, ActionId, ActionRev, CommitRequest, CommitCert } from "@optimystic/db-core";
+import type { IRepo, ClusterRecord, Signature, RepoMessage, ITransactionValidator, ClusterConsensusConfig, CommitResult, BlockId, ActionId, ActionRev, CommitRequest, CommitCert, InvalidateRequest } from "@optimystic/db-core";
 import type { ICluster } from "@optimystic/db-core";
 import type { IPeerNetwork } from "@optimystic/db-core";
 import { blockIdsForTransforms } from "@optimystic/db-core";
+import { verifyInvalidationCertificate } from "../dispute/invalidation.js";
 import { buildCommitCert } from "./commit-cert.js";
 import { ClusterClient } from "./client.js";
 import type { PeerId, PrivateKey } from "@libp2p/interface";
@@ -59,6 +60,20 @@ export type ReconcileBlockCallback = (blockId: BlockId, committed: ActionRev, co
  */
 export type CommitCertificateSink = (actionId: ActionId, cert: CommitCert) => void;
 
+/**
+ * Applies a consensus-ordered {@link InvalidateRequest} to local storage — the deterministic
+ * reversal every member runs once consensus on the invalidation is reached. The implementation
+ * recomputes the per-block as-if-`T_inv`-absent content, writes the compensating revisions, and
+ * appends the durable invalidation log entry (see `applyInvalidation` in the dispute module). It
+ * is injected so {@link ClusterMember} stays storage/log-agnostic (mirrors {@link ReconcileBlockCallback}).
+ *
+ * The certificate is verified by {@link ClusterMember} *before* the sink is invoked, so a sink
+ * implementation may assume `request.resolution` is already a valid challenger-wins certificate.
+ * A throwing sink is logged and tolerated (never resets the cluster stream); the in-memory dedup
+ * marker is rolled back so a re-broadcast can retry.
+ */
+export type InvalidationApplySink = (request: InvalidateRequest) => Promise<void>;
+
 interface ClusterMemberComponents {
 	storageRepo: IRepo;
 	peerNetwork: IPeerNetwork;
@@ -76,6 +91,8 @@ interface ClusterMemberComponents {
 	reconcileBlock?: ReconcileBlockCallback;
 	/** Receives the consensus commit cert per committed action; see {@link CommitCertificateSink}. */
 	onCommitCertificate?: CommitCertificateSink;
+	/** Applies a consensus-ordered invalidation to local storage; see {@link InvalidationApplySink}. */
+	onInvalidate?: InvalidationApplySink;
 }
 
 export function clusterMember(components: ClusterMemberComponents): ClusterMember {
@@ -92,7 +109,8 @@ export function clusterMember(components: ClusterMemberComponents): ClusterMembe
 		components.consensusConfig,
 		components.stateStore,
 		components.reconcileBlock,
-		components.onCommitCertificate
+		components.onCommitCertificate,
+		components.onInvalidate
 	);
 }
 
@@ -123,6 +141,11 @@ export class ClusterMember implements ICluster {
 	private activeTransactions: Map<string, TransactionState> = new Map();
 	// Track executed consensus transactions to prevent duplicate execution (messageHash -> executedAt timestamp)
 	private executedTransactions: Map<string, number> = new Map();
+	// Fast in-memory dedup for applied invalidations, keyed `${invalidatedActionId}:${disputeId}`.
+	// The durable source of truth is the invalidation log entry (Log.findInvalidation, re-checked
+	// inside the sink); this map only spares redundant work when the same invalidation reaches
+	// consensus twice (rebroadcast / sync) under different message hashes. (-> appliedAt timestamp)
+	private appliedInvalidations: Map<string, number> = new Map();
 	// Queue of transactions to clean up
 	private cleanupQueue: string[] = [];
 	// Serialize concurrent updates for the same transaction
@@ -148,7 +171,8 @@ export class ClusterMember implements ICluster {
 		consensusConfig?: ClusterConsensusConfig,
 		private readonly stateStore?: ITransactionStateStore,
 		private readonly reconcileBlock?: ReconcileBlockCallback,
-		private readonly onCommitCertificate?: CommitCertificateSink
+		private readonly onCommitCertificate?: CommitCertificateSink,
+		private readonly onInvalidate?: InvalidationApplySink
 	) {
 		this.superMajorityThreshold = consensusConfig?.superMajorityThreshold ?? 1.0;
 		// Periodically clean up expired transactions (.unref() so tests/short-lived processes can exit)
@@ -851,6 +875,60 @@ export class ClusterMember implements ICluster {
 			}
 			return;
 		}
+		if ('invalidate' in operation) {
+			await this.applyConsensusInvalidation(messageHash, operation.invalidate);
+			return;
+		}
+	}
+
+	/**
+	 * Applies a consensus-ordered invalidation on this member: dedup → certificate verification →
+	 * delegate the compensating write + durable log append to the injected {@link InvalidationApplySink}.
+	 *
+	 * Like every other branch of {@link applyConsensusOperation}, a failure here is tolerated rather
+	 * than thrown — a throw would reset the cluster stream. A forged/sub-threshold certificate is
+	 * rejected (and never reaches the sink); a sink fault is logged and its dedup marker rolled back
+	 * so a re-broadcast can retry. The durable, authoritative dedup is the invalidation log entry the
+	 * sink consults; the in-memory map is only a fast path.
+	 */
+	private async applyConsensusInvalidation(messageHash: string, request: InvalidateRequest): Promise<void> {
+		const dedupKey = `${request.invalidatedActionId}:${request.resolution.disputeId}`;
+		if (this.appliedInvalidations.has(dedupKey)) {
+			log('cluster-member:consensus-invalidate-duplicate', { messageHash, dedupKey });
+			return;
+		}
+
+		// Certificate verification BEFORE apply — never trust the originator's say-so. A compromised
+		// peer can withhold an invalidation but cannot forge one.
+		if (!await verifyInvalidationCertificate(request.resolution)) {
+			log('cluster-member:consensus-invalidate-reject-certificate', {
+				messageHash,
+				invalidatedActionId: request.invalidatedActionId,
+				disputeId: request.resolution.disputeId,
+				outcome: request.resolution.outcome
+			});
+			return;
+		}
+
+		if (!this.onInvalidate) {
+			log('cluster-member:consensus-invalidate-no-sink', { messageHash, dedupKey });
+			return;
+		}
+
+		this.appliedInvalidations.set(dedupKey, Date.now());
+		try {
+			await this.onInvalidate(request);
+			log('cluster-member:consensus-invalidate-applied', {
+				messageHash,
+				invalidatedActionId: request.invalidatedActionId,
+				disputeId: request.resolution.disputeId,
+				blockCount: request.blockIds.length
+			});
+		} catch (err) {
+			// Tolerate (don't reset the stream); roll back the marker so a re-broadcast retries.
+			this.appliedInvalidations.delete(dedupKey);
+			log('cluster-member:consensus-invalidate-sink-error', { messageHash, dedupKey, error: (err as Error).message });
+		}
 	}
 
 	/**
@@ -1081,6 +1159,10 @@ export class ClusterMember implements ICluster {
 				operation.commit.blockIds.forEach(id => blockIds.add(id));
 			} else if ('cancel' in operation) {
 				operation.cancel.actionRef.blockIds.forEach(id => blockIds.add(id));
+			} else if ('invalidate' in operation) {
+				// The invalidation writes compensating revisions to these blocks; surfacing them lets
+				// conflict detection serialize a concurrent commit racing the invalidation on a block.
+				operation.invalidate.blockIds.forEach(id => blockIds.add(id));
 			}
 		}
 
@@ -1151,6 +1233,12 @@ export class ClusterMember implements ICluster {
 		for (const [messageHash, executedAt] of Array.from(this.executedTransactions.entries())) {
 			if (executedAt < expirationThreshold) {
 				this.executedTransactions.delete(messageHash);
+			}
+		}
+		// Prune old applied-invalidation dedup markers on the same TTL.
+		for (const [dedupKey, appliedAt] of Array.from(this.appliedInvalidations.entries())) {
+			if (appliedAt < expirationThreshold) {
+				this.appliedInvalidations.delete(dedupKey);
 			}
 		}
 		this.stateStore?.pruneExecuted(expirationThreshold)

@@ -163,6 +163,24 @@ Currently, disputes run asynchronously — the transaction commits first, then t
 
 **Target change**: disputes will be synchronous (block the transaction) with cascading escalation.
 
+### Durable Invalidation (Reversing a Proven-Invalid Commit)
+
+When a dispute resolves `challenger-wins`, the committed transaction `T_inv` has been **proven invalid**. The reversal is durable, replicated, and audit-preserving — it is *not* an in-memory status flip.
+
+**Compensating entry, never rewrite.** The collection log is an append-only, prior-hash-linked chain; entries are immutable once committed. So the reversal is represented as a new **`InvalidationEntry`** appended to the log (a third arm alongside `action` and `checkpoint`), carrying:
+
+- `invalidatedActionId` / `invalidatedRev` — the action being reversed and the revision it pins;
+- `resolution` — a `DisputeResolutionProof` (the independently-verifiable subset of the resolution: outcome, `messageHash`, and the signed arbitrator votes);
+- `reverted[]` — per-block `{ blockId, fromRev, restoredContentHash }` recording the compensating revision each block received.
+
+**Append-forward reversal.** Block revisions are monotonic and prior revisions are retained. The invalidation does not delete `T_inv`'s revisions; for each block `T_inv` wrote it writes a **new** revision whose content equals the block's state *as if `T_inv` had not committed* — `materializeBlock(invalidatedRev − 1)` with any surviving later actions replayed on top. The content is recomputed from stored revisions only (never by re-running the engine), so `restoredContentHash` is deterministic across members.
+
+**Consensus path.** The invalidation is an `invalidate` operation carried through the **same critical-cluster machinery** as any transaction (`ClusterMember.applyConsensusOperation`): it takes a revision slot, serializes against concurrent commits, and is applied deterministically on every member — no new global lock.
+
+**Invalidation certificate.** A member applies an `InvalidationEntry` only if its `resolution` is a valid certificate — `outcome === 'challenger-wins'` and the `agree-with-challenger` votes meet the 2/3 decisive-vote threshold, each Ed25519 signature verified against its arbitrator's embedded key. This is the reversal analogue of the commit certificate: a compromised peer can withhold an invalidation but **cannot forge** one. Application is idempotent, keyed on `(invalidatedActionId, disputeId)`.
+
+**Scope.** This mechanism is the single-collection / single-transaction core. Walking read-dependents, spanning multiple collections, and notifying clients are handled by the invalidation-cascade and client-notification follow-ups. Delete-restore (reversing a block-*creating* `T_inv`) is recorded but deferred to the cascade work. See `db-core/src/log/struct.ts` (`InvalidationEntry`, `DisputeResolutionProof`), `db-core/src/log/log.ts` (`addInvalidation` / `findInvalidation`), and `db-p2p/src/dispute/invalidation.ts` (proof builder, certificate verifier, compensating computation, deterministic applier).
+
 ### Dissent Coordinator
 
 **Target addition**: deterministic selection of a dissent coordinator from the disagreeing members, based on FRET distance to the block ID.
@@ -202,13 +220,23 @@ Defined in `db-p2p/src/dispute/types.ts`:
 | `EngineHealthState` | Node-local health tracking state |
 | `DisputeStatus` | Transaction query status: `committed-disputed`, `committed-validated`, `committed-invalidated` |
 
+Reversal types (defined in `db-core` so the log layer never imports `db-p2p`):
+
+| Type | Purpose |
+|------|---------|
+| `InvalidationEntry` | Compensating log entry reversing a proven-invalid action (`db-core/src/log/struct.ts`) |
+| `DisputeResolutionProof` | Independently-verifiable subset of a resolution carried in the entry (outcome + signed votes) |
+| `InvalidateRequest` | The `invalidate` consensus operation that drives a reversal through the critical cluster (`db-core/src/network/struct.ts`) |
+
 ### File Map
 
 | File | Role |
 |------|------|
 | `db-core/src/cluster/structs.ts` | `ClusterRecord.disputed`, `disputeEvidence` fields; `ClusterConsensusConfig` extensions |
 | `db-p2p/src/dispute/types.ts` | All dispute type definitions |
-| `db-p2p/src/dispute/dispute-service.ts` | Core dispute orchestration |
+| `db-p2p/src/dispute/dispute-service.ts` | Core dispute orchestration; originates the durable invalidation on `challenger-wins` |
+| `db-p2p/src/dispute/invalidation.ts` | Proof builder, certificate verifier, compensating-state computation, deterministic applier |
+| `db-core/src/log/struct.ts` / `log.ts` | `InvalidationEntry` / `DisputeResolutionProof` types; `Log.addInvalidation` / `findInvalidation` |
 | `db-p2p/src/dispute/client.ts` | Network client for sending challenges and receiving votes |
 | `db-p2p/src/dispute/service.ts` | libp2p protocol handler for incoming dispute messages |
 | `db-p2p/src/dispute/engine-health-monitor.ts` | Rolling-window dispute loss tracking and health flagging |

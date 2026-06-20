@@ -1,6 +1,7 @@
 import type { CollectionId, BlockId, IBlock, ActionId, Transform, Transforms } from "../index.js";
 import type { ActionContext, ActionRev } from "../collection/action.js";
 import type { Transaction } from "../transaction/transaction.js";
+import type { DisputeResolutionProof } from "../log/struct.js";
 import type { PeerId } from "./types.js";
 
 export type ActionBlocks = {
@@ -71,6 +72,28 @@ export type CommitRequest = ActionBlocks & {
 	tailId: BlockId;
 	/** The new revision for the committed action */
 	rev: number;
+};
+
+/**
+ * Originates a compensating invalidation through the same critical-cluster consensus as any
+ * transaction: it takes a revision slot and serializes against concurrent commits. Each member
+ * applies it deterministically — verifying {@link resolution} as an invalidation certificate, then
+ * writing the per-block compensating revisions and appending the durable invalidation log entry.
+ *
+ * Carries everything a member needs to apply the reversal without trusting the originator: the
+ * target action, the blocks it wrote, the owning collection's log, and the signed proof.
+ */
+export type InvalidateRequest = {
+	/** actionId of the committed action being reversed. */
+	invalidatedActionId: ActionId;
+	/** rev of the invalidated entry — pins which block revisions to roll back. */
+	invalidatedRev: number;
+	/** Blocks the invalidated action wrote (its commit's blockIds). */
+	blockIds: BlockId[];
+	/** The collection (log) the invalidated action belongs to — where the compensating entry lands. */
+	collectionId: CollectionId;
+	/** The invalidation certificate (challenger-wins + signed 2/3 decisive arbitrator votes). */
+	resolution: DisputeResolutionProof;
 };
 
 export type CommitResult = CommitSuccess | StaleFailure;

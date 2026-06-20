@@ -406,7 +406,7 @@ During a partition, the minority partition is unavailable for writes. Read-only 
 **Healing.** When partitions heal, divergent state is reconciled:
 - *Behind*: normal sync catches up.
 - *Ahead*: tentative transactions are validated against the canonical chain.
-- *Forked*: conflicting commits trigger transaction invalidation cascade — the transaction with fewer confirmations is reversed and its dependents are re-evaluated.
+- *Forked*: conflicting commits trigger transaction invalidation cascade — the transaction with fewer confirmations is reversed and its dependents are re-evaluated. The reversal is durable and audit-preserving: rather than rewriting the prior-hash-linked log, a compensating **`InvalidationEntry`** is appended that restores each affected block's as-if-absent content via a new monotonic revision, gated on a `challenger-wins` dispute certificate and applied deterministically on every member through the critical cluster (see `docs/right-is-right.md` § Durable Invalidation). The single-collection reversal primitive is implemented; walking read-dependents across collections is the invalidation-cascade follow-up.
 
 **Bound.** Partition healing requires connectivity restoration and is bounded by sync round-trip time plus conflict resolution time.
 
