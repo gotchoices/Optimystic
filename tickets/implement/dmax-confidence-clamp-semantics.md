@@ -57,3 +57,5 @@ compute `d_max` from the same doc. Whichever reading is correct, three artifacts
 The simulator wrapper faithfully implements the doc as written today, so this is parked for a
 design call rather than fixed inline. No production code path consumes the simulator, so there is
 no live regression — only a latent ambiguity to resolve before the formula is wired into FRET.
+
+** Human decision: ** Should be a cap

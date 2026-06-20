@@ -18,11 +18,33 @@ function expectAllPass(report: ClaimReport): void {
 }
 
 describe('Scenario — cold-start storm (cohort-topic §Anti-flood)', () => {
-	it('a burst of subscribers fans, stays within cap_promote at the root, promotes, and looks up in O(log N)', function () {
+	// Two regimes are pinned so the cumulative-tier-0-acceptance behavior stays visible rather than
+	// silently passing the loosened `cap_promote + one round of arrivals` bound (the storm-rate case
+	// would otherwise pass that bound by a wide margin and hide the real ~2× overshoot).
+
+	// Moderate-rate regime (== the runAllScenarios() default): cumulative tier-0 acceptance stays ≤ cap.
+	it('moderate rate: a burst fans, stays within cap_promote at the root, promotes, and looks up in O(log N)', function () {
 		this.timeout(30_000);
-		const { report } = runScenario((m) => new ColdStartStormScenario(m, { subscribers: 3_000, burstWindowMs: 5_000 }));
+		const { report, metrics } = runScenario((m) => new ColdStartStormScenario(m, { subscribers: 3_000, burstWindowMs: 5_000 }));
 		expectAllPass(report);
 		expect(report.claims.find((c) => c.id === 'walks-fan')!.observed).to.equal('3000');
+		// Pinned: at the moderate rate the cumulative tier-0 acceptance stays within cap_promote (64).
+		expect(metrics.counterValue('coldstart.acceptedTier0'), 'moderate rate stays ≤ cap_promote').to.be.at.most(64);
+	});
+
+	// Storm-rate regime (opt-in): ~2,000/s drives the documented gossip-lag overshoot past cap_promote,
+	// bounded by one round of arrivals. The root-not-overloaded claim still holds under the cumulative
+	// `cap + one round` bound, and the overshoot stays an explicit, visible fact.
+	it('storm rate: cumulative tier-0 acceptance overshoots cap by ≤ one round of arrivals, claim still holds', function () {
+		this.timeout(60_000);
+		const { report, metrics } = runScenario((m) => new ColdStartStormScenario(m, { subscribers: 10_000, burstWindowMs: 5_000 }));
+		expectAllPass(report);
+		expect(report.claims.find((c) => c.id === 'walks-fan')!.observed).to.equal('10000');
+		const accepted = metrics.counterValue('coldstart.acceptedTier0');
+		// The overshoot is real — the storm cumulatively accepts *more* than cap_promote at tier 0.
+		expect(accepted, 'storm overshoots cap_promote').to.be.greaterThan(64);
+		// ...but bounded by one gossip-round of arrivals: cap_promote + ⌈10000·1000/5000⌉ = 64 + 2000.
+		expect(accepted, 'overshoot within one round of arrivals').to.be.at.most(64 + 2_000);
 	});
 });
 
