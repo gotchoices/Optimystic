@@ -150,6 +150,31 @@ const validator = createQuereusValidator({ db, coordinator });
 
 `createQuereusStatement()` and `createQuereusStatements()` are helpers for building the JSON statement format used in transaction records.
 
+### Schema hash: keep it warm out of band (session mode)
+
+`configureTransactionMode()` takes a `schemaHashProvider` that `beginTransaction`
+awaits — and `begin` runs *inside* a statement's exec, while Quereus's exec mutex
+is held. The provider therefore **must not re-enter the database**: computing a
+schema hash with `db.eval('select … from schema()')` while a statement is in
+flight would re-acquire that same mutex and deadlock.
+
+The intended provider is `() => engine.getSchemaHash()`. That engine never
+re-enters the db from `begin`: it serves a **cached** hash, and if the cache is
+cold while a statement is in flight it **throws an actionable error** instead of
+hanging. The flip side is a host obligation — **keep the hash warm out of band**:
+
+```typescript
+const engine = new QuereusEngine(db, coordinator);
+await engine.getSchemaHash();                       // warm the cache (idle, no statement in flight)
+bridge.configureTransactionMode(coordinator, engine, () => engine.getSchemaHash());
+```
+
+Call `engine.getSchemaHash()` once **outside any statement** after your DDL (and
+again after any later schema change made while session mode is live, since the
+engine invalidates — but does not auto-recompute — the cache on schema change).
+Skip the warm-up and the first transaction's `begin` throws rather than
+completing. See `QuereusEngine.getSchemaHash` for the full contract.
+
 ## Plugin-Level Configuration
 
 The `register(db, config)` call accepts plugin-level defaults (consumed via the virtual table's `vtabAuxData`):
