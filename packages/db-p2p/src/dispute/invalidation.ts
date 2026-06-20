@@ -157,8 +157,19 @@ export async function computeRevertedBlock(blockStorage: IBlockStorage, invalida
 	if (!block) {
 		return { kind: 'delete', fromRev };
 	}
-	const restoredContentHash = await hashString(stableStringify(block));
+	const restoredContentHash = await hashBlockContent(block);
 	return { kind: 'restore', block, restoredContentHash, fromRev, laterActions };
+}
+
+/**
+ * Deterministic content hash for a materialized block — the single hashing convention shared by
+ * the compensating-state computation ({@link computeRevertedBlock}) and the cascade re-evaluator
+ * (`db-p2p/src/dispute/cascade.ts`). Both must agree byte-for-byte: the cascade decides whether a
+ * read-dependent still holds by comparing the hash of the content it *observed* against the
+ * `restoredContentHash` an invalidation recorded — so the two hashes have to be produced the same way.
+ */
+export async function hashBlockContent(block: IBlock): Promise<string> {
+	return await hashString(stableStringify(block));
 }
 
 // ─── Deterministic apply ───
@@ -184,6 +195,13 @@ export type ApplyInvalidationParams = {
 	 * local/single-node apply uses; the consensus path passes the agreed slot.
 	 */
 	readonly rev?: number;
+	/**
+	 * When this invalidation is a cascade step (a read-dependent of an already-invalidated root being
+	 * reverted), the `actionId` of the root invalidation that triggered the cascade. Recorded on the
+	 * resulting {@link InvalidationEntry} (`cascadeRoot`) so the reversal is auditable as part of one
+	 * logical cascade event. Absent for a root invalidation.
+	 */
+	readonly cascadeRoot?: ActionId;
 	readonly timestamp?: number;
 };
 
@@ -254,7 +272,8 @@ export async function applyInvalidation(ctx: InvalidationContext, params: ApplyI
 	}
 
 	// 4. Durable, append-only invalidation entry (the source of truth for committed-invalidated).
-	await ctx.log.addInvalidation(invalidatedActionId, invalidatedRev, proof, reverted, rev, undefined, params.timestamp);
+	//    `cascadeRoot` is set when this is a cascade step (a reverted read-dependent), undefined for a root.
+	await ctx.log.addInvalidation(invalidatedActionId, invalidatedRev, proof, reverted, rev, params.cascadeRoot, params.timestamp);
 	log('apply-complete actionId=%s disputeId=%s rev=%d blocks=%d', invalidatedActionId, proof.disputeId, rev, reverted.length);
 
 	return { applied: true, rev, reverted };

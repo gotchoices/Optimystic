@@ -1,7 +1,7 @@
 import { sha256 } from 'multiformats/hashes/sha2'
 import { Chain, entryAt } from "../index.js";
 import { nameof } from "../utility/nameof.js";
-import type { IBlock, BlockId, ActionId, CollectionId, ChainPath, ActionRev, ActionContext, ChainInitOptions, BlockStore } from "../index.js";
+import type { IBlock, BlockId, ActionId, CollectionId, ChainPath, ActionRev, ActionContext, ChainInitOptions, BlockStore, ReadDependency } from "../index.js";
 import type { ChainDataNode } from '../chain/chain-nodes.js';
 import type { LogEntry, ActionEntry, DisputeResolutionProof, InvalidationEntry, RevertedBlock } from "./index.js";
 import { LogDataBlockType, LogHeaderBlockType } from "./index.js";
@@ -41,9 +41,19 @@ export class Log<TAction> {
 		}));
 	}
 
-	/** Adds a new entry to the log. */
-	async addActions(actions: TAction[], actionId: ActionId, rev: number, getBlockIds: () => BlockId[], collectionIds: CollectionId[] = [], timestamp: number = Date.now()) {
-		const entry = { timestamp, rev, action: { actionId, actions, blockIds: [], collectionIds } } as LogEntry<TAction>;
+	/**
+	 * Adds a new action entry to the log.
+	 *
+	 * `reads` is the transaction's `(blockId, revision)` read set, persisted on the entry so the
+	 * invalidation cascade can later discover this action's read-dependents (see
+	 * {@link ActionEntry.reads}). Omit it (or pass `undefined`) on the low-level direct-commit path
+	 * that carries no `Transaction`; the cascade then treats the entry as an unknown dependency.
+	 */
+	async addActions(actions: TAction[], actionId: ActionId, rev: number, getBlockIds: () => BlockId[], collectionIds: CollectionId[] = [], reads?: ReadDependency[], timestamp: number = Date.now()) {
+		const action = reads !== undefined
+			? { actionId, actions, blockIds: [], collectionIds, reads }
+			: { actionId, actions, blockIds: [], collectionIds };
+		const entry = { timestamp, rev, action } as LogEntry<TAction>;
 		const tailPath = await this.chain.add(entry);
 		const entryWithBlockIds = { ...entry, action: { ...entry.action!, blockIds: getBlockIds() } };
 		this.chain.updateAt(tailPath, entryWithBlockIds);

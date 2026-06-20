@@ -214,6 +214,20 @@ Each round ejects the losing side, so the honest fraction of active nodes *incre
 
 **Depends on:** Global honest majority, deterministic arbitrator selection by FRET distance, ejection of losing peers, dispute timeout per round.
 
+### Theorem 8b: Invalidation-Cascade Termination & Convergence
+
+**Statement.** When a proven-invalid `T_inv` is reversed, the re-evaluation of its transitive read-dependents terminates and converges to the same end state on every honest member.
+
+**Proof sketch.**
+
+*Termination.* A read dependency records the revision a transaction observed, which is the revision of an *earlier* committed write (Theorem 5). So within a collection a dependent's revision strictly exceeds the invalidated revision it depends on: the dependency graph is a forward DAG, never a cycle (a same-collection back-edge is treated as corruption and errors). The cascade processes candidates in revision order, deduped by `actionId`, marking each invalidated action permanently and re-examining only retained candidates against a monotonically growing invalidated frontier. Each round either invalidates ≥1 fresh action or makes no progress (fixpoint) — and the candidate population is finite (the recent log suffix bounded by the dispute TTL), so the number of progressing rounds is bounded by the number of dependents. Two hard horizons (`maxCascadeDepth`, `maxCascadeTransactions`) cap it absolutely; on overflow the cascade halts with the applied children durable and the remainder flagged for operator re-sync — it never loops and never silently truncates.
+
+*Convergence.* Each child invalidation is the same deterministic, content-addressed primitive as the root (compensating revisions recomputed from stored revisions, not engine replay) and is idempotent on `(invalidatedActionId, disputeId)`. With a deterministic re-evaluator, every member replaying the same seed + logs produces the same children in the same order, reaching the same state — so no per-child consensus round is required. Re-running a partially-applied cascade re-derives the frontier from the durable log and skips already-applied children, so a crash mid-cascade is restartable and reconverges without duplicate entries.
+
+**Bound.** Re-evaluation is conservative at block granularity (Theorem 5's structural-block false positives carry over): it may invalidate a dependent that read an unchanged field of a changed block. This is a performance concern (the dependent is resubmitted), not a correctness one — over-invalidation never retains a genuinely-dependent transaction.
+
+**Depends on:** Read-dependency capture and persistence (`ActionEntry.reads`), revision monotonicity (Theorem 5/6), deterministic content-addressed reversal, idempotent invalidation entries, cascade horizons.
+
 ### Theorem 9: Progress Under Contention
 
 **Statement.** Under contention, at least one of the conflicting transactions commits per conflict cycle.

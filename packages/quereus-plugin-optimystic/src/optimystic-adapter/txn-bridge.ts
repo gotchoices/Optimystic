@@ -338,6 +338,21 @@ export class TransactionBridge {
   }
 
   /**
+   * The pre-transaction snapshot captured for `tree` by {@link markDirty} this
+   * transaction, or undefined when the tree has not been staged this transaction.
+   *
+   * This is the committed (pre-stage) state a `_readCommitted` scan must read from:
+   * a dirtied tree's live tracker holds this transaction's in-flight inserts, while
+   * the captured snapshot excludes them. A clean tree (undefined here) has no staged
+   * changes this transaction, so its live state already IS the committed state and
+   * the caller can read it directly. The snapshot is opaque; pass it back to the
+   * originating tree's `readView` to materialise the committed view.
+   */
+  getDirtySnapshot(tree: DirtyTree): unknown | undefined {
+    return this.dirtyTrees.get(tree);
+  }
+
+  /**
    * Add a SQL statement to the accumulated statements for the current transaction.
    * Statements are only accumulated when a transaction is active.
    *

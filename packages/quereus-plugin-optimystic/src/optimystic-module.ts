@@ -8,14 +8,14 @@
 import { CollectionFactory } from './optimystic-adapter/collection-factory.js';
 import { TransactionBridge } from './optimystic-adapter/txn-bridge.js';
 import { OptimysticVirtualTableConnection } from './optimystic-adapter/vtab-connection.js';
-import type { ParsedOptimysticOptions } from './types.js';
+import type { ParsedOptimysticOptions, RowData } from './types.js';
 import type { IRawStorage } from '@optimystic/db-p2p';
 import { VirtualTable } from '@quereus/quereus';
-import { ConflictResolution, QuereusError } from '@quereus/quereus';
+import { ConflictResolution, QuereusError, StatusCode } from '@quereus/quereus';
 import type { VirtualTableModule, BaseModuleConfig, Database, TableSchema, Row, FilterInfo, BestAccessPlanRequest, BestAccessPlanResult, OrderingSpec, VirtualTableConnection, TableIndexSchema as IndexSchema, UpdateArgs, UpdateResult, SqlValue } from '@quereus/quereus';
 import { Tree } from '@optimystic/db-core';
 import { KeyRange } from '@optimystic/db-core';
-import type { CollectionChangeEvent } from '@optimystic/db-core';
+import type { CollectionChangeEvent, TreeReadView } from '@optimystic/db-core';
 import { SchemaManager } from './schema/schema-manager.js';
 import type { StoredTableSchema } from './schema/schema-manager.js';
 import { RowCodec, type EncodedRow } from './schema/row-codec.js';
@@ -412,9 +412,39 @@ export class OptimysticVirtualTable extends VirtualTable {
   }
 
   /**
-   * Opens a direct data stream for this virtual table based on filter criteria
+   * Opens a direct data stream for this virtual table based on filter criteria.
+   * Reads the LIVE collection — sees rows committed by prior transactions plus any
+   * staged by THIS transaction (the tracker merges staged inserts over committed
+   * data).
    */
   async* query(filterInfo: FilterInfo): AsyncIterable<Row> {
+    yield* this.runQuery(filterInfo, false);
+  }
+
+  /**
+   * Opens a direct data stream that reads the COMMITTED (pre-transaction) snapshot,
+   * excluding any rows the in-flight transaction has staged. This honours Quereus's
+   * `_readCommitted` connect flag — the contract a `committed.<Table>` reference in a
+   * deferred CHECK relies on (e.g. `FormationUsage.Monotonic`'s
+   * `max(UseNumber) from committed.FormationUsage`, which must NOT count the row being
+   * inserted). Mirrors the in-memory vtab's committed-snapshot connection.
+   *
+   * Invoked via the per-scan {@link OptimysticCommittedTable} wrapper returned from
+   * {@link OptimysticModule.connect} so the committed view never mutates the shared,
+   * cached table instance — a concurrent live scan of the same table during deferred
+   * -constraint drain must keep seeing the live view.
+   */
+  async* queryCommitted(filterInfo: FilterInfo): AsyncIterable<Row> {
+    yield* this.runQuery(filterInfo, true);
+  }
+
+  /**
+   * Shared query dispatch for live and committed reads. The access-strategy parse is
+   * identical for both; only the read SOURCE differs — `committed` routes each read
+   * shape (full scan, point lookup, index seek) to a pre-transaction view of the
+   * relevant tree (see {@link committedTreeView}).
+   */
+  private async* runQuery(filterInfo: FilterInfo, committed: boolean): AsyncIterable<Row> {
     // Ensure connection is registered
     await this.ensureConnectionRegistered();
 
@@ -428,6 +458,11 @@ export class OptimysticVirtualTable extends VirtualTable {
     }
 
     try {
+      // Resolve the main-table read source once. Live reads refresh from the network
+      // first; committed reads read the captured pre-transaction snapshot as-is (a
+      // mid-constraint network pull would defeat the point of reading committed state).
+      const mainRead = await this.resolveMainRead(committed);
+
       // Parse idxStr to determine access strategy
       // Quereus uses idxStr like 'idx=_primary_(0);plan=2' for equality seeks
       // or 'idx=idx_category(0);plan=2' for secondary index seeks
@@ -439,35 +474,64 @@ export class OptimysticVirtualTable extends VirtualTable {
 
       if (isSecondaryIndex && filterInfo.args.length > 0) {
         // Secondary index seek - route to index scan
-        yield* this.executeIndexScan(indexName, filterInfo.args);
+        yield* this.executeIndexScan(mainRead, indexName, filterInfo.args, committed);
       } else if (planType === 2 && filterInfo.args.length > 0) {
         // Primary key equality seek (plan=2)
-        yield* this.executePointLookup(filterInfo.args);
+        yield* this.executePointLookup(mainRead, filterInfo.args);
       } else if (planType === 3) {
         // Range query on primary key (plan=3)
-        yield* this.executeRangeQuery(filterInfo);
+        yield* this.executeRangeQuery(mainRead, filterInfo);
       } else if (filterInfo.idxNum === 1) {
         // Legacy: Point lookup on primary key
-        yield* this.executePointLookup(filterInfo.args);
+        yield* this.executePointLookup(mainRead, filterInfo.args);
       } else if (filterInfo.idxNum === 2) {
         // Legacy: Range query on primary key
-        yield* this.executeRangeQuery(filterInfo);
+        yield* this.executeRangeQuery(mainRead, filterInfo);
       } else if (filterInfo.idxNum >= 10) {
         // Legacy: Index-based scan
         const idxName = filterInfo.idxStr;
         if (!idxName || typeof idxName !== 'string') {
           throw new Error('Index name not provided for index scan');
         }
-        yield* this.executeIndexScan(idxName, filterInfo.args);
+        yield* this.executeIndexScan(mainRead, idxName, filterInfo.args, committed);
       } else {
         // Full table scan
-        yield* this.executeTableScan();
+        yield* this.executeTableScan(mainRead);
       }
     } catch (error) {
       const message = `Query failed: ${error instanceof Error ? error.message : String(error)}`;
       this.setErrorMessage(message);
       throw new Error(message);
     }
+  }
+
+  /**
+   * Resolve the main-table read source for the current read mode. Live → the live
+   * collection, refreshed from the network. Committed → the pre-transaction view of
+   * the collection ({@link committedTreeView}).
+   */
+  private async resolveMainRead(committed: boolean): Promise<TreeReadView<string, RowData>> {
+    const collection = this.collection as unknown as Tree<string, RowData>;
+    if (committed) {
+      return this.committedTreeView(collection);
+    }
+    await collection.update();
+    return collection;
+  }
+
+  /**
+   * The committed (pre-transaction) read view of `tree`: when the tree was staged
+   * this transaction, a view built from the txn-bridge's captured snapshot (which
+   * excludes the in-flight mutations); otherwise the live tree itself, since a tree
+   * with nothing staged this transaction already reflects committed state. The view
+   * is per-scan and never mutates the live tree, so concurrent live scans of the same
+   * table are unaffected.
+   */
+  private committedTreeView<TKey, TEntry>(tree: Tree<TKey, TEntry>): TreeReadView<TKey, TEntry> {
+    const snapshot = this.txnBridge.getDirtySnapshot(tree);
+    return snapshot !== undefined
+      ? tree.readView(snapshot as Parameters<Tree<TKey, TEntry>['readView']>[0])
+      : tree;
   }
 
   /**
@@ -491,10 +555,15 @@ export class OptimysticVirtualTable extends VirtualTable {
   }
 
   /**
-   * Execute a point lookup query
+   * Execute a point lookup query against the supplied read source (live collection
+   * or a committed view). The read source is already network-refreshed (live) or a
+   * static snapshot (committed); this method never refreshes it.
    */
-  private async* executePointLookup(args: readonly unknown[]): AsyncIterable<Row> {
-    if (!this.collection || !this.rowCodec) return;
+  private async* executePointLookup(
+    read: TreeReadView<string, RowData>,
+    args: readonly unknown[],
+  ): AsyncIterable<Row> {
+    if (!this.rowCodec) return;
 
     // Assemble the full (possibly composite) primary key from ALL seek args using
     // the SAME encoding the row codec uses to store keys (extractPrimaryKey).
@@ -502,15 +571,12 @@ export class OptimysticVirtualTable extends VirtualTable {
     // composite-PK point lookup builds a key that can never match a stored row.
     const key = this.rowCodec.createPrimaryKey(args as SqlValue[]);
 
-    // Update from network to get latest data
-    await this.collection.update();
-
-    const path = await this.collection.find(key);
-    if (!this.collection.isValid(path)) {
+    const path = await read.find(key);
+    if (!read.isValid(path)) {
       return;
     }
 
-    const entry = this.collection.at(path) as [string, EncodedRow] | undefined;
+    const entry = read.at(path) as [string, EncodedRow] | undefined;
     if (entry && entry.length >= 2) {
       const encodedRow = entry[1];
       const row = this.rowCodec.decodeRow(encodedRow);
@@ -521,27 +587,47 @@ export class OptimysticVirtualTable extends VirtualTable {
   /**
    * Execute a range query
    */
-  private async* executeRangeQuery(_filterInfo: FilterInfo): AsyncIterable<Row> {
-    if (!this.collection) return;
-
+  private async* executeRangeQuery(
+    read: TreeReadView<string, RowData>,
+    _filterInfo: FilterInfo,
+  ): AsyncIterable<Row> {
     // For now, fall back to full scan
     // TODO: Implement proper range queries based on filter args
-    yield* this.executeTableScan();
+    yield* this.executeTableScan(read);
   }
 
   /**
-   * Execute an index-based scan
+   * Execute an index-based scan. The main-table rows are fetched through `mainRead`
+   * (live or committed); the index tree is read through a matching source so a
+   * committed seek excludes index entries staged by the in-flight transaction.
    */
-  private async* executeIndexScan(indexName: string, args: readonly unknown[]): AsyncIterable<Row> {
-    if (!this.collection || !this.rowCodec || !this.indexManager) return;
+  private async* executeIndexScan(
+    mainRead: TreeReadView<string, RowData>,
+    indexName: string,
+    args: readonly unknown[],
+    committed: boolean,
+  ): AsyncIterable<Row> {
+    if (!this.rowCodec || !this.indexManager) return;
 
     const indexSchema = this.indexManager.getIndexSchema(indexName);
     if (!indexSchema) {
       throw new Error(`Index not found: ${indexName}`);
     }
 
-    // Update collection to get latest data
-    await this.collection.update();
+    const indexTree = this.indexManager.getIndexTree(indexName);
+    if (!indexTree) {
+      throw new Error(`Index tree not found: ${indexName}`);
+    }
+
+    // Resolve the index-tree read source to match the main read mode. Live → refresh
+    // from the network; committed → the pre-transaction view of the index tree.
+    let indexRead: TreeReadView<string, IndexEntry>;
+    if (committed) {
+      indexRead = this.committedTreeView(indexTree);
+    } else {
+      await indexTree.update();
+      indexRead = indexTree;
+    }
 
     // Build index key from constraint values
     // args contains the values for the matched constraints in order
@@ -553,15 +639,15 @@ export class OptimysticVirtualTable extends VirtualTable {
 
     const indexKey = indexKeyParts.join('\x00');
 
-    // Look up primary keys using the index
-    for await (const primaryKey of this.indexManager.findByIndex(indexName, indexKey)) {
+    // Look up primary keys using the index read source
+    for await (const primaryKey of this.indexManager.findByIndexIn(indexRead, indexKey)) {
       // Fetch the row from the main table using the primary key
-      const path = await this.collection.find(primaryKey);
-      if (!this.collection.isValid(path)) {
+      const path = await mainRead.find(primaryKey);
+      if (!mainRead.isValid(path)) {
         continue;
       }
 
-      const entry = this.collection.at(path) as [string, any];
+      const entry = mainRead.at(path) as [string, any];
       if (entry && entry.length >= 2) {
         const encodedRow = entry[1];
         const row = this.rowCodec.decodeRow(encodedRow);
@@ -593,15 +679,15 @@ export class OptimysticVirtualTable extends VirtualTable {
   }
 
   /**
-   * Execute a full table scan with retry on path invalidation
-   * In a distributed system, incoming replicated changes can mutate the tree during iteration.
-   * This method handles path invalidation by restarting from the last known key.
+   * Execute a full table scan against the supplied read source with retry on path
+   * invalidation. In a distributed system, incoming replicated changes can mutate a
+   * LIVE tree during iteration; this handles path invalidation by restarting from the
+   * last known key. A committed read view is a static snapshot, so the retry path is
+   * simply never exercised for it (harmless). The read source is already
+   * network-refreshed (live) or a snapshot (committed); this method never refreshes it.
    */
-  private async* executeTableScan(): AsyncIterable<Row> {
-    if (!this.collection || !this.rowCodec) return;
-
-    // Update from network to get latest data
-    await this.collection.update();
+  private async* executeTableScan(read: TreeReadView<string, RowData>): AsyncIterable<Row> {
+    if (!this.rowCodec) return;
 
     const maxRetries = 5;
     let retryCount = 0;
@@ -615,14 +701,14 @@ export class OptimysticVirtualTable extends VirtualTable {
           ? new KeyRange<string>({ key: lastKey, inclusive: false }, undefined, true)
           : new KeyRange<string>(undefined, undefined, true);
 
-        const iterator = this.collection.range(range);
+        const iterator = read.range(range);
 
         for await (const path of iterator) {
-          if (!this.collection.isValid(path)) {
+          if (!read.isValid(path)) {
             continue;
           }
 
-          const entry = this.collection.at(path);
+          const entry = read.at(path);
           if (entry && Array.isArray(entry) && entry.length >= 2) {
             const key = entry[0] as string;
             // Skip if we've already yielded this key (shouldn't happen but safety check)
@@ -703,17 +789,107 @@ export class OptimysticVirtualTable extends VirtualTable {
   }
 
   /**
-   * Render a SQLite-style UNIQUE-constraint message naming the PK columns:
-   *   `UNIQUE constraint failed: <table>.<pkCol>[, <table>.<pkCol>…]`
-   * This is the value clients see on a rejected duplicate-key INSERT, so it
-   * tracks SQLite's wording for compatibility. Optimystic enforces only the PK,
-   * so the columns listed are exactly the primary-key columns.
+   * Render a SQLite-style UNIQUE-constraint message naming the offending columns:
+   *   `UNIQUE constraint failed: <table>.<col>[, <table>.<col>…]`
+   * This is the value clients see on a rejected duplicate, so it tracks SQLite's
+   * wording for compatibility. With no argument it names the PRIMARY KEY columns (the
+   * tree-key collision); pass the violated constraint's column indices for a secondary
+   * UNIQUE violation.
    */
-  private uniqueConstraintMessage(): string {
-    const cols = this.tableSchema.primaryKeyDefinition
-      .map(pk => `${this.tableName}.${this.tableSchema.columns[pk.index]?.name ?? `col${pk.index}`}`)
+  private uniqueConstraintMessage(columnIndices?: readonly number[]): string {
+    const indices = columnIndices
+      ?? this.tableSchema.primaryKeyDefinition.map(pk => pk.index);
+    const cols = indices
+      .map(i => `${this.tableName}.${this.tableSchema.columns[i]?.name ?? `col${i}`}`)
       .join(', ');
     return `UNIQUE constraint failed: ${cols}`;
+  }
+
+  /** Serialized composite key for a set of column indices, using the SAME per-value
+   *  encoding the secondary-index layer keys on (see {@link serializeValueForIndex}),
+   *  so a uniqueness comparison agrees byte-for-byte with how the index would key it. */
+  private uniqueKeyFor(columns: readonly number[], row: Row): string {
+    return columns.map(ci => this.serializeValueForIndex(row[ci])).join('\x00');
+  }
+
+  /**
+   * Probe for an existing row that a secondary UNIQUE constraint would collide with if
+   * `values` were written, returning the conflicting row plus the violated
+   * constraint's columns, or null when there is no conflict.
+   *
+   * Optimystic enforces only the PRIMARY KEY structurally (it is the tree key); every
+   * other declared UNIQUE constraint must be checked here, mirroring the in-memory
+   * vtab. The control schema's single-use `StampId` (and nullable `MemberPrivateKey`)
+   * anti-replay columns depend on this enforcement. The probe reads the LIVE collection
+   * — committed rows plus rows staged earlier in THIS transaction — so two writes
+   * sharing a unique value within one transaction collide exactly as a cross
+   * -transaction duplicate does (the same immediate semantics PK uniqueness has, and
+   * the reason it does NOT read the committed snapshot).
+   *
+   * SQL semantics honoured: a partial UNIQUE (carrying a `predicate`, synthesized from
+   * `CREATE UNIQUE INDEX … WHERE …`) is skipped, and a row is exempt from a constraint
+   * when ANY of that constraint's columns is NULL (multiple NULLs are allowed).
+   * `excludeKey`, when given, is the primary key of the row being updated, so the row
+   * does not conflict with itself.
+   *
+   * Cost: O(rows) per probe — no index backs the unique columns. Fine for the small
+   * control tables this targets; large tables with secondary UNIQUE constraints want an
+   * index-backed probe (tracked separately as a follow-up optimization).
+   */
+  private async checkUniqueConstraints(
+    values: Row,
+    excludeKey?: string,
+  ): Promise<{ row: Row; columns: readonly number[] } | null> {
+    const constraints = this.tableSchema.uniqueConstraints;
+    if (!constraints || constraints.length === 0) return null;
+    if (!this.collection || !this.rowCodec) return null;
+
+    // Only the constraints that actually bind THIS row: non-partial, every column
+    // present and non-null. Precompute each one's serialized key for the new row.
+    const active = constraints
+      .filter(uc => uc.predicate === undefined && uc.columns.length > 0
+        && uc.columns.every(ci => values[ci] !== null && values[ci] !== undefined))
+      .map(uc => ({ columns: uc.columns, key: this.uniqueKeyFor(uc.columns, values) }));
+    if (active.length === 0) return null;
+
+    // One live scan; compare every existing row against each active constraint.
+    for await (const path of this.collection.range(new KeyRange<string>(undefined, undefined, true))) {
+      if (!this.collection.isValid(path)) continue;
+      const entry = this.collection.at(path) as [string, EncodedRow] | undefined;
+      if (!entry || entry.length < 2) continue;
+      if (excludeKey !== undefined && entry[0] === excludeKey) continue;
+      const existing = this.rowCodec.decodeRow(entry[1]);
+      for (const a of active) {
+        if (this.uniqueKeyFor(a.columns, existing) === a.key) {
+          return { row: existing, columns: a.columns };
+        }
+      }
+    }
+    return null;
+  }
+
+  /**
+   * Resolve a secondary-UNIQUE collision into an {@link UpdateResult}, mirroring the PK
+   * conflict path: IGNORE swallows the write; every other mode returns a structured
+   * constraint result (with `existingRow`) for the engine to map to ABORT/FAIL/ROLLBACK
+   * or drive an ON CONFLICT resolution. Returns null when there is no collision.
+   */
+  private async resolveUniqueConflict(
+    values: Row,
+    onConflict: ConflictResolution,
+    excludeKey?: string,
+  ): Promise<UpdateResult | null> {
+    const hit = await this.checkUniqueConstraints(values, excludeKey);
+    if (!hit) return null;
+    if (onConflict === ConflictResolution.IGNORE) {
+      return { status: 'ok' };
+    }
+    return {
+      status: 'constraint',
+      constraint: 'unique',
+      message: this.uniqueConstraintMessage(hit.columns),
+      existingRow: hit.row,
+    };
   }
 
   /**
@@ -1129,9 +1305,48 @@ export class OptimysticVirtualTable extends VirtualTable {
 }
 
 /**
+ * Per-scan read-only wrapper exposing the COMMITTED (pre-transaction) view of an
+ * already-initialized {@link OptimysticVirtualTable}.
+ *
+ * Returned by {@link OptimysticModule.connect} when Quereus passes
+ * `_readCommitted: true` — the signal that this connection backs a `committed.<Table>`
+ * reference inside a deferred CHECK (e.g. `FormationUsage.Monotonic`'s
+ * `select max(UseNumber) from committed.FormationUsage`). Such a read MUST exclude the
+ * rows the in-flight transaction has staged.
+ *
+ * Why a separate object rather than a flag on the shared table: `connect()` resolves to
+ * a cached singleton per `schema.table`, and during deferred-constraint drain the engine
+ * may scan the SAME table both live (e.g. `Strand.Authorized`'s `from FormationUsage`)
+ * and committed. Storing committed-ness on the singleton would let one scan corrupt the
+ * other's view. This wrapper is created per connect call and holds no mutable state — the
+ * per-scan committed tracker is built and discarded inside the shared table's
+ * {@link OptimysticVirtualTable.queryCommitted}. Mirrors the in-memory vtab's
+ * unregistered committed-snapshot connection.
+ */
+class OptimysticCommittedTable extends VirtualTable {
+  constructor(private readonly inner: OptimysticVirtualTable) {
+    super(inner.db, inner.module, inner.schemaName, inner.tableName);
+    this.tableSchema = inner.tableSchema;
+  }
+
+  async* query(filterInfo: FilterInfo): AsyncIterable<Row> {
+    yield* this.inner.queryCommitted(filterInfo);
+  }
+
+  async update(): Promise<UpdateResult> {
+    throw new QuereusError('Cannot modify committed-state snapshot', StatusCode.ERROR);
+  }
+
+  async disconnect(): Promise<void> {
+    // No-op: the committed view shares the inner table's lifetime and owns no
+    // resources (its per-scan read tracker is created and dropped inside query()).
+  }
+}
+
+/**
  * Optimystic Virtual Table Module
  */
-export class OptimysticModule implements VirtualTableModule<OptimysticVirtualTable, OptimysticModuleConfig> {
+export class OptimysticModule implements VirtualTableModule<VirtualTable, OptimysticModuleConfig> {
   private tables = new Map<string, OptimysticVirtualTable>();
   // The schema tree (`tree://optimystic/schema`) is plugin-global, so a single
   // SchemaManager per (transactor, key-network, network-name, raw-storage-
@@ -1287,6 +1502,11 @@ export class OptimysticModule implements VirtualTableModule<OptimysticVirtualTab
    * `Database`, or when called by Quereus's runtime against an imported
    * schema), instantiate it from the supplied tableSchema and let
    * initialize() bind it to the persisted storage.
+   *
+   * When Quereus passes `_readCommitted: true` (a `committed.<Table>` reference in a
+   * deferred CHECK), wrap the resolved table in a per-scan {@link OptimysticCommittedTable}
+   * that reads the pre-transaction snapshot — see that class for why the committed view is
+   * a distinct object rather than a flag on the cached singleton.
    */
   async connect(
     db: Database,
@@ -1294,7 +1514,28 @@ export class OptimysticModule implements VirtualTableModule<OptimysticVirtualTab
     _moduleName: string,
     schemaName: string,
     tableName: string,
-    _options: OptimysticModuleConfig,
+    options: OptimysticModuleConfig,
+    tableSchema?: TableSchema
+  ): Promise<VirtualTable> {
+    const baseTable = await this.resolveConnectedTable(db, schemaName, tableName, tableSchema);
+
+    // Honour the committed-read flag with a per-scan read-only view; the shared table
+    // is unchanged, so a concurrent live scan of it keeps its live view.
+    if (options?._readCommitted) {
+      return new OptimysticCommittedTable(baseTable);
+    }
+    return baseTable;
+  }
+
+  /**
+   * Resolve (and initialize) the cached {@link OptimysticVirtualTable} for a
+   * schema.table, instantiating it from the supplied/looked-up schema on first
+   * connect. Shared by {@link connect} for both the live and committed-read paths.
+   */
+  private async resolveConnectedTable(
+    db: Database,
+    schemaName: string,
+    tableName: string,
     tableSchema?: TableSchema
   ): Promise<OptimysticVirtualTable> {
     const tableKey = `${schemaName}.${tableName}`.toLowerCase();

@@ -532,13 +532,19 @@ export class TransactionCoordinator {
 		const actionId = transaction.id;
 		const newRev = (collection['source'].actionContext?.rev ?? 0) + 1;
 
-		// Add actions to log (this updates the tracker with log block changes)
+		// Add actions to log (this updates the tracker with log block changes).
+		// Persist the transaction's read set on the entry so a later invalidation cascade can
+		// discover this action's read-dependents (see ActionEntry.reads). The whole transaction's
+		// reads are recorded on every collection's entry: a read may target a block in another
+		// collection, and the cascade matches read-dependents by (blockId, revision) regardless of
+		// which collection's log the dependent landed in.
 		const addResult = await log.addActions(
 			collectionActions.actions,
 			actionId,
 			newRev,
 			() => blockIdsForTransforms(transforms),
-			allCollectionIds
+			allCollectionIds,
+			transaction.reads
 		);
 
 		// Return the transforms and log tail block ID

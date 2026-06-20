@@ -20,9 +20,28 @@ export {
 	verifyInvalidationCertificate,
 	computeRevertedBlock,
 	applyInvalidation,
+	hashBlockContent,
 	DEFERRED_DELETE_RESTORE,
 	type RevertedComputation,
 	type InvalidationContext,
 	type ApplyInvalidationParams,
 	type ApplyInvalidationResult,
 } from './invalidation.js';
+
+export {
+	cascadeInvalidate,
+	contentEqualityReevaluator,
+	DEFAULT_CASCADE_CONFIG,
+	type CascadeConfig,
+	type CollectionEnv,
+	type InvalidatedPair,
+	type CascadeCandidate,
+	type CascadeVerdict,
+	type Reevaluate,
+	type CascadeSeed,
+	type CascadeInput,
+	type CascadeChild,
+	type CascadeStanding,
+	type CascadeEscalation,
+	type CascadeResult,
+} from './cascade.js';

@@ -54,6 +54,19 @@ export interface ClusterConsensusConfig {
 	disputeEnabled?: boolean;
 	/** Timeout for dispute arbitration in milliseconds (default 60000) */
 	disputeArbitrationTimeoutMs?: number;
+	/**
+	 * Hard horizon on an invalidation cascade: maximum number of recursive re-evaluation rounds
+	 * (dependency-graph depth) before the cascade stops and escalates the affected collection(s)
+	 * for operator full re-sync (default 32). Bounds unbounded automatic reversal.
+	 */
+	maxCascadeDepth?: number;
+	/**
+	 * Hard horizon on an invalidation cascade: maximum number of transactions (including the root)
+	 * the cascade may invalidate before it stops and escalates for operator full re-sync
+	 * (default 1000). On overflow the already-applied invalidations stand; the remainder is flagged,
+	 * never silently dropped.
+	 */
+	maxCascadeTransactions?: number;
 	/** Initial scheduled-retry interval for failed commit broadcasts, ms (default 250) */
 	commitBroadcastRetryInitialMs?: number;
 	/** Backoff factor for commit-broadcast scheduled retries (default 2) */

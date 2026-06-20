@@ -6,7 +6,7 @@
  * of indexed column values.
  */
 
-import type { Tree } from '@optimystic/db-core';
+import type { Tree, TreeReadView } from '@optimystic/db-core';
 import { KeyRange } from '@optimystic/db-core';
 import type { ITransactor } from '@optimystic/db-core';
 import type { Row, SqlValue } from '@quereus/quereus';
@@ -193,9 +193,23 @@ export class IndexManager {
 			throw new Error(`Index tree not found: ${indexName}`);
 		}
 
-		// Update tree to get latest data
+		// Update tree to get latest data, then scan the live tree.
 		await tree.update();
+		yield* this.findByIndexIn(tree, indexKey);
+	}
 
+	/**
+	 * Range-scan a supplied index read source for all primary keys whose entry matches
+	 * `indexKey`. The caller chooses the source: {@link findByIndex} passes the live
+	 * index tree (after refreshing it); a committed-read seek passes a pre-transaction
+	 * view of the index tree so it excludes index entries staged by the in-flight
+	 * transaction. Shared composite-key range logic for both paths — the read source
+	 * is assumed already current (this method never refreshes it).
+	 */
+	async* findByIndexIn(
+		read: TreeReadView<IndexKey, IndexEntry>,
+		indexKey: IndexKey
+	): AsyncIterable<PrimaryKey> {
 		// Range scan for all entries with this index key prefix
 		// Tree keys are formatted as: indexKey\x00primaryKey
 		// Scan from indexKey\x00 (inclusive) to indexKey\x01 (exclusive)
@@ -208,12 +222,12 @@ export class IndexManager {
 			true // ascending
 		);
 
-		for await (const path of tree.range(range)) {
-			if (!tree.isValid(path)) {
+		for await (const path of read.range(range)) {
+			if (!read.isValid(path)) {
 				continue;
 			}
 
-			const entry = tree.at(path);
+			const entry = read.at(path);
 			if (entry != null) {
 				yield entry[1];
 			}

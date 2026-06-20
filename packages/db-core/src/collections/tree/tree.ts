@@ -4,11 +4,30 @@ import { BTree, type Path, type KeyRange } from "../../btree/index.js";
 import { CollectionTrunk } from "./collection-trunk.js";
 import { TreeHeaderBlockType, type TreeReplaceAction } from "./struct.js";
 
-export class Tree<TKey, TEntry> {
+/**
+ * Read-only surface of a tree: every navigation/lookup method a reader needs, with
+ * none of the mutation (stage/sync) or network-refresh (update) entry points. Both
+ * the live {@link Tree} and the committed view returned by {@link Tree.readView}
+ * structurally satisfy this, so a consumer can read through either uniformly.
+ */
+export interface TreeReadView<TKey, TEntry> {
+	first(): Promise<Path<TKey, TEntry>>;
+	find(key: TKey): Promise<Path<TKey, TEntry>>;
+	get(key: TKey): Promise<TEntry | undefined>;
+	at(path: Path<TKey, TEntry>): TEntry | undefined;
+	range(range: KeyRange<TKey>): AsyncIterableIterator<Path<TKey, TEntry>>;
+	ascending(path: Path<TKey, TEntry>): AsyncIterableIterator<Path<TKey, TEntry>>;
+	isValid(path: Path<TKey, TEntry>): boolean;
+}
+
+export class Tree<TKey, TEntry> implements TreeReadView<TKey, TEntry> {
 
 	private constructor(
 		private readonly collection: Collection<TreeReplaceAction<TKey, TEntry>>,
 		private readonly btree: BTree<TKey, TEntry>,
+		/** Captured so {@link readView} can rebuild a BTree over a committed tracker. */
+		private readonly keyFromEntry: (entry: TEntry) => TKey,
+		private readonly compare: (a: TKey, b: TKey) => number,
 	) {
 	}
 
@@ -48,7 +67,7 @@ export class Tree<TKey, TEntry> {
 
 		const collection = await Collection.createOrOpen<TreeReplaceAction<TKey, TEntry>>(network, id, init);
 		btree = btree ?? new BTree<TKey, TEntry>(collection.tracker, new CollectionTrunk(collection.tracker, collection.id), keyFromEntry, compare);
-		return new Tree<TKey, TEntry>(collection, btree);
+		return new Tree<TKey, TEntry>(collection, btree, keyFromEntry, compare);
 	}
 
 	async replace(data: TreeReplaceAction<TKey, TEntry>): Promise<void> {
@@ -84,6 +103,27 @@ export class Tree<TKey, TEntry> {
 	 * preserves a never-synced collection's header/root rather than wiping it. */
 	restore(snapshot: CollectionSnapshot<TreeReplaceAction<TKey, TEntry>>): void {
 			this.collection.restorePending(snapshot);
+	}
+
+	/** Build a read-only view of this tree as captured by an earlier {@link snapshot}
+	 * — typically the pre-transaction state recorded before any DML was staged. The
+	 * view reads through a FRESH tracker seeded with the snapshot's transforms over
+	 * the SAME committed source cache, so it observes exactly the snapshot's state:
+	 * it never sees mutations staged into the live tree after the snapshot, and it
+	 * does not disturb the live tree (reads are latch-free and tracker-isolated). This
+	 * is how a `committed.*` scan reads the pre-transaction snapshot while the live
+	 * tree still holds this transaction's in-flight inserts.
+	 *
+	 * `snapshot` is the opaque value returned by {@link snapshot}; pass it back
+	 * verbatim. */
+	readView(snapshot: CollectionSnapshot<TreeReplaceAction<TKey, TEntry>>): TreeReadView<TKey, TEntry> {
+			const tracker = this.collection.createReadTracker(snapshot.transforms);
+			return new BTree<TKey, TEntry>(
+				tracker,
+				new CollectionTrunk(tracker, this.collection.id),
+				this.keyFromEntry,
+				this.compare,
+			);
 	}
 
 	/** The underlying {@link Collection} this tree stages mutations into.

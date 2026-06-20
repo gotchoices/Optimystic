@@ -1,4 +1,4 @@
-import type { BlockId, CollectionId, ActionContext, ActionId, ActionRev } from "../index.js";
+import type { BlockId, CollectionId, ActionContext, ActionId, ActionRev, ReadDependency } from "../index.js";
 
 /** A log entry - an action, a checkpoint, or an invalidation */
 export type LogEntry<TAction> = {
@@ -22,6 +22,21 @@ export type ActionEntry<TAction> = {
 	blockIds: BlockId[]; // NOTE: this is updated after being generated to include the log-related block transforms
 	/** Other collection ids affected by the action - this action is conditional on successful commit in all of these collections */
 	readonly collectionIds?: CollectionId[];
+	/**
+	 * The `(blockId, revision)` reads this transaction observed during execution — the same
+	 * read set the {@link Transaction} carried in its PEND request (see `Transaction.reads`).
+	 *
+	 * Persisted so a later invalidation cascade can discover this action's read-dependents:
+	 * a committed action is a read-dependent of an invalidated one iff its read set contains a
+	 * `(blockId, revision)` that the invalidated action produced.
+	 *
+	 * **Format / back-compat:** added by the invalidation-cascade work (ActionEntry v2). An entry
+	 * written before this field existed (or by a path that does not carry a `Transaction`, e.g. the
+	 * low-level `Collection.sync` direct-commit) has `reads === undefined` — treated by the cascade
+	 * as an *unknown dependency* (conservatively re-evaluated, never silently assumed independent).
+	 * `reads === []` is distinct: a transaction that genuinely read nothing.
+	 */
+	readonly reads?: ReadDependency[];
 };
 
 /**

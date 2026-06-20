@@ -170,6 +170,17 @@ export class Collection<TAction> implements ICollection<TAction> {
 		this.pending = [...snapshot.pending];
 	}
 
+	/** A read-only {@link Tracker} over this collection's committed source cache,
+	 * seeded with a (deep-copied) set of pre-transaction transforms. Reads through it
+	 * observe committed state plus exactly those transforms — and crucially NOT the
+	 * mutations staged into this collection's live tracker afterward. Used to build a
+	 * committed read view (see {@link Tree.readView}) that excludes a transaction's
+	 * own in-flight rows. The returned tracker shares the source cache (committed
+	 * blocks) but has its own independent transform set; it is never sync()'d. */
+	createReadTracker(transforms: Transforms): Tracker<IBlock> {
+		return new Tracker(this.sourceCache, copyTransforms(transforms));
+	}
+
 	/** The staged (not-yet-synced) actions queued by {@link act}.
 	 *
 	 * Exposed so a {@link TransactionCoordinator} can append them to the log at
