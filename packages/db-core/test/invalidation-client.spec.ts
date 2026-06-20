@@ -186,12 +186,45 @@ describe('invalidation — client notification (pull + reaction)', () => {
 			await appendInvalidation(nt, collectionId, actionA, 1, FIXED_BLOCK)
 			await revertBlock(nt, store, FIXED_BLOCK, 'v0')
 
-			// The reader has pending work and updates: the invalidation drives a cache drop + replay, so a
-			// re-read now observes the reverted base rather than the stale cached "v2".
+			// update() drives the invalidation reaction with no pending of its own: the reverted block is
+			// dropped from the read cache (unconditionally), so a re-read observes the reverted base ("v0")
+			// rather than the stale cached "v2". Asserting `equal('v0')` — not merely `!= 'v2'` — is what
+			// actually proves the drop happened: without it the reader keeps serving the cached "v2".
+			await reader.update()
+			const observed = await reader.tracker.tryGet(FIXED_BLOCK) as unknown as { value: string } | undefined
+			expect(observed?.value).to.equal('v0')
+		})
+
+		it('replays pending work against the reverted base and resubmits successfully', async () => {
+			const store = new TestTransactor()
+			const nt = makeNetworkTransactor(store)
+
+			// Commit A (B="v1"), then C (B="v2").
+			const writer = await Collection.createOrOpen<TestAction>(nt, collectionId, initOptions)
+			await writer.act({ type: 'create', data: { value: 'v1' } })
+			await writer.updateAndSync()
+			await writer.act({ type: 'bump', data: { value: 'v2' } })
+			await writer.updateAndSync()
+			const actionA = (await committedActionIds(store as unknown as IRepo, collectionId))[0]!
+
+			const reader = await Collection.createOrOpen<TestAction>(nt, collectionId, initOptions)
+			expect((await reader.tracker.tryGet(FIXED_BLOCK) as unknown as { value: string } | undefined)?.value).to.equal('v2')
+
+			// A reversal of A lands AND the block is reverted to "v0" out-of-band (compensating revision).
+			await appendInvalidation(nt, collectionId, actionA, 1, FIXED_BLOCK)
+			await revertBlock(nt, store, FIXED_BLOCK, 'v0')
+
+			// The reader has pending work: the landed invalidation flags a conflict (pending present), so
+			// updateAndSync drops the reverted block, replays the pending action against the reverted base,
+			// and the resubmit commits. The resubmit is a distinct, durably-committed action past the
+			// reversal — proven by a new log action entry — and the collection reads its own result.
 			await reader.act({ type: 'bump', data: { value: 'v3' } })
 			await reader.updateAndSync()
+
+			const committed = await committedActionIds(store as unknown as IRepo, collectionId)
+			expect(committed.length).to.equal(3) // create + writer bump + reader's resubmitted bump
 			const observed = await reader.tracker.tryGet(FIXED_BLOCK) as unknown as { value: string } | undefined
-			expect(observed?.value).to.not.equal('v2')
+			expect(observed?.value).to.equal('v3')
 		})
 	})
 })
