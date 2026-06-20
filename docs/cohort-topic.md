@@ -1148,12 +1148,13 @@ forged records cannot replicate.
 **Cadence (host driver).** The cohort-topic host owns one repeating timer (`gossipIntervalMs`, default
 5 s — there is no dedicated `gossip_round` constant; it is a derived sub-round of `ping_interval`). On
 each tick, for every live coord engine, it TTL-sweeps stale records (gossiping each eviction), drains
-the registration-record deltas the renewal `touch`/`evicted` hooks accumulated since the last round into
-one `records`/`evicted` batch, broadcasts the signed `CohortGossipV1`, refreshes the membership
-certificate (`T_membership_refresh`, self-gated), and runs the demotion check (`T_demote`, self-gated).
-Idle engines (no resident topics, no deltas) build no frame and skip the broadcast. A freshly
-*admitted* record first replicates on its next renewal touch (the per-touch path), not at admission
-time. The driver lives in the host
+the registration-record deltas the admission `onAdmit` and renewal `touch`/`evicted` hooks accumulated
+since the last round into one `records`/`evicted` batch, broadcasts the signed `CohortGossipV1`, refreshes
+the membership certificate (`T_membership_refresh`, self-gated), and runs the demotion check (`T_demote`,
+self-gated). Idle engines (no resident topics, no deltas) build no frame and skip the broadcast. A freshly
+*admitted* record is enqueued at admission time (the `onAdmit` hook), so it replicates on the next gossip
+round without waiting for the participant's first renewal touch — closing the durability window between
+`accept` and that first touch. The driver lives in the host
 ([`packages/db-p2p/src/cohort-topic`](../packages/db-p2p/src/cohort-topic)); db-core has no timer port.
 
 ### Membership certificate

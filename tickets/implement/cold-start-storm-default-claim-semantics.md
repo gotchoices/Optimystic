@@ -43,6 +43,8 @@ Whichever is chosen, keep cohort-topic.md §Anti-flood in sync (it currently rec
 as the honest caveat) and keep a pinned test for both the moderate-rate (≤ cap) and storm-rate
 (overshoot) regimes so the behavior stays visible rather than silently passing.
 
+** Human Decision: **: Both
+
 ## Out of scope
 
 - The gossip-lag overshoot mechanism itself (correct and intended; see §Promotion and demotion
