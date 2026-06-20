@@ -7,6 +7,7 @@ import { sha256 } from 'multiformats/hashes/sha2';
 import { base58btc } from 'multiformats/bases/base58';
 import { toString as uint8ArrayToString } from 'uint8arrays';
 import { DisputeService } from '../src/dispute/dispute-service.js';
+import { verifyInvalidationCertificate } from '../src/dispute/invalidation.js';
 import { EngineHealthMonitor } from '../src/dispute/engine-health-monitor.js';
 import type { ValidationEvidence, ArbitrationVote, DisputeChallenge, DisputeResolution } from '../src/dispute/types.js';
 import { PeerReputationService } from '../src/reputation/peer-reputation.js';
@@ -391,6 +392,20 @@ describe('DisputeService', () => {
 			expect(request.resolution.messageHash).to.equal(record.messageHash);
 			// The proof carries the signed arbitrator votes for independent re-verification.
 			expect(request.resolution.votes.length).to.be.greaterThan(0);
+
+			// End-to-end target binding (#2): the real arbitrator-produced votes (signed over the target the
+			// arbitrators derived from the challenge's originalRecord) verify against the target the
+			// originator put on THIS request — the same consistency the network apply path relies on.
+			expect(await verifyInvalidationCertificate(request.resolution, {
+				invalidatedActionId: request.invalidatedActionId,
+				blockIds: request.blockIds,
+			})).to.equal(true);
+			// …and the same genuine proof does NOT verify against an unrelated (innocent) target — so it
+			// cannot be replayed to revert a different transaction.
+			expect(await verifyInvalidationCertificate(request.resolution, {
+				invalidatedActionId: 'innocent-action',
+				blockIds: request.blockIds,
+			})).to.equal(false);
 		});
 
 		it('does not originate an invalidation when the majority wins', async () => {
