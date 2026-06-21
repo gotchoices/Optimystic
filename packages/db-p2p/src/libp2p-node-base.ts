@@ -786,6 +786,11 @@ export async function createLibp2pNodeBase(
 		try {
 			host = await createCohortTopicHost(node, fret, {
 				...(options.cohortTopic!.host ?? {}),
+				// Wire the node's reputation service in as the production backing for the bootstrap-evidence
+				// referee verifier (the `{ isBanned, getScore }` view `PeerReputationService` satisfies), so a
+				// configured cohort genuinely gates cold-root `bootstrap: true` (PoW always; reputation when a
+				// referee endorsement is offered). Caller-supplied `antiDos` overrides are preserved.
+				antiDos: { ...(options.cohortTopic!.host?.antiDos), reputation },
 				privateKey: nodePrivateKey, // real k − x threshold signing
 				wantK: cohortWantK,
 			});

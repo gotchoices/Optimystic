@@ -164,7 +164,7 @@ describe('cohort-topic: scale anti-flood + anti-DoS (mock-tier e2e)', function (
 			const mesh = await buildMesh(members, {
 				wantK: WANT_K,
 				minSigs: MIN_SIGS,
-				antiDos: { reputation: { isBanned: (): boolean => true } },
+				antiDos: { reputation: { isBanned: (): boolean => true, getScore: (): number => 0 } },
 			});
 			try {
 				await setupTopic(mesh, TOPIC);

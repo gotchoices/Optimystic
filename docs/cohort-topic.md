@@ -766,11 +766,37 @@ The layer does not attempt to defend against unbounded Sybil attacks at the regi
 > coord-scoped, so each served coord gets an independent set), while the `BootstrapEvidence` policy is
 > **node-level** (a tier→verifier policy with no per-coord state) and shared. The guard is verified first
 > on the inbound register so a forged/replayed/over-rate frame never pollutes downstream state. Because
-> db-core embeds no PoW/reputation scheme, the host injects the verifiers via `antiDos` options: a
-> supplied reputation view gates T0/T1 (a non-banned participant is the committed-work proxy) and the
-> T2/T3 reputation option; otherwise the verifiers are **permissive-but-logged** (a one-time warning,
-> never an undefined gate). The production PoW + committed-work-reference evidence schemes are deferred
-> (`cohort-topic-bootstrap-evidence-scheme`). Host wiring specs: `host-antidos-coldstart.spec.ts`.
+> db-core embeds no PoW/reputation scheme, the host supplies the verifiers
+> ([`bootstrap-evidence-verifiers.ts`](../packages/db-p2p/src/cohort-topic/bootstrap-evidence-verifiers.ts))
+> and the participant-side minter
+> ([`bootstrap-evidence-builder.ts`](../packages/db-p2p/src/cohort-topic/bootstrap-evidence-builder.ts)),
+> reading the signed `BootstrapEvidenceEnvelopeV1`:
+>
+> - **Proof-of-work (real, T2/T3).** `verifyPoW` hashes `RingHash.H(powPreimage(reg, nonce))` and checks
+>   it against `meetsDifficulty(·, powDifficultyBits)` — self-contained, one hash, bound to
+>   `(topicId, tier, participantCoord, timestamp)` so a PoW minted for one topic/peer/time cannot
+>   bootstrap another. The participant builder mints it (nonce search ≈ `2^bits` hashes; capped so the
+>   register path never hangs). Whenever the gate is *configured*, this real PoW path runs (no longer a
+>   fail-closed deny).
+> - **Reputation endorsement (real verifier, T2/T3 + the interim T0/T1 stand-in).** `verifyReputation`
+>   checks a *referee* peer-key signature over the bound image **and** that the referee is sufficiently
+>   reputable in the node's local `PeerReputationService` view (not banned **and** `getScore <
+>   deprioritize`, stronger than mere non-ban). The referee MAY equal the participant (a reputable
+>   participant self-vouches). `libp2p-node-base.ts` wires the node's reputation service in as the
+>   production backing. Until the committed-parent-reference verifier lands, this referee verifier also
+>   stands in for the T0/T1 `verifyParentReference` path. The participant-side *minting* of an endorsement
+>   is not wired into the host yet (the builder exposes an `endorse` self-vouch seam, but origination at
+>   T0/T1 is the parent-reference follow-on) — so today an endorsement is supplied cohort-side (tests) or
+>   by a future originator, not auto-minted on every register.
+> - **Parent reference (still deferred).** The real committed-parent-topic verifier is the follow-on
+>   `cohort-topic-bootstrap-parent-reference`; until then T0/T1 is covered by the referee stand-in above,
+>   and a T0/T1 cold bootstrap that carries no evidence is denied by a configured cohort.
+>
+> Once any reputation view or explicit verifier is configured, an unfilled verifier fails **closed** so a
+> banned/low-rep referee cannot slip the T2/T3 `PoW || reputation || parent-ref` disjunction; an
+> *entirely unconfigured* host stays **permissive-but-logged** (a one-time warning, never an undefined
+> gate), preserving the db-core/mock-tier flows that bootstrap tier-0 without evidence. Specs:
+> `host-antidos-coldstart.spec.ts`, `bootstrap-evidence-verifiers.spec.ts`.
 >
 > **Promote-handler gate (`promote` protocol, not registration).** The four defenses above guard the
 > *register* path; the inbound `promote`-notice handler (§Promotion and demotion lifecycle) reuses the

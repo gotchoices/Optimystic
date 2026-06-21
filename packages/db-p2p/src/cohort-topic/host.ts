@@ -34,9 +34,11 @@
  * guards — a `RegisterRateLimiter` (4/min per peer-topic), a `CorrelationReplayGuard` (60 s freshness),
  * and a `TopicBudget` (2048 topics, LRU) — so a budget/limit at one coord is independent of another. The
  * node-level {@link BootstrapEvidence} policy (one tier→verifier policy, no per-coord state) is built once
- * and shared. db-core embeds no PoW / reputation scheme, so the host supplies the verifiers via
- * {@link CohortTopicAntiDosOptions} (reputation-backed when a view is given, else permissive-but-logged —
- * a documented deferral, never an undefined gate). A cold-started tier-`d > 0` forwarder registers with
+ * and shared. db-core embeds no PoW / reputation scheme, so the host supplies the real verifiers
+ * ({@link createPoWVerifier} / {@link createReputationVerifier}) and the participant-side PoW minter
+ * ({@link createBootstrapEvidenceBuilder}): once configured, a node genuinely gates cold-root
+ * `bootstrap: true` (real PoW always; a referee reputation endorsement when offered), and an entirely
+ * unconfigured host stays permissive-but-logged (never an undefined gate). A cold-started tier-`d > 0` forwarder registers with
  * its tier-`(d − 1)` parent by routing a forwarder-link frame over the router (gap 7), staying
  * `awaiting_parent` until the ack.
  *
@@ -142,6 +144,8 @@ import { FretCohortThresholdCrypto, createVerifyOnlyThresholdCrypto } from "./th
 import { FretSizeEstimator } from "./size-estimator.js";
 import { peerIdToBytes, bytesToPeerIdString } from "./peer-codec.js";
 import { signPeer, verifyPeerSig } from "./peer-sig.js";
+import { createPoWVerifier, createReputationVerifier, type BootstrapReputationView } from "./bootstrap-evidence-verifiers.js";
+import { createBootstrapEvidenceBuilder } from "./bootstrap-evidence-builder.js";
 import { DEFAULT_COHORT_TOPIC_PROTOCOLS, cohortTopicProtocolList, type CohortTopicProtocols } from "./protocols.js";
 import { requestResponse, DEFAULT_STREAM_MAX_BYTES } from "./stream-util.js";
 import { createLogger } from "../logger.js";
@@ -194,11 +198,10 @@ export interface CohortTopicHostOptions {
 	readonly promotion?: PromotionConfig;
 }
 
-/** The slice of a peer-reputation service the default bootstrap-evidence verifiers consult. */
-export interface BootstrapReputationView {
-	/** True when `peerId` (a peer-id string) is banned / excluded from operations. */
-	isBanned(peerId: string): boolean;
-}
+// The reputation-view shape the bootstrap-evidence referee verifier consults — `{ isBanned, getScore }`
+// (a subset of `IPeerReputation`; `PeerReputationService` satisfies it directly). Defined with the
+// verifier it backs and re-exported here so existing importers keep resolving it off the host module.
+export type { BootstrapReputationView } from "./bootstrap-evidence-verifiers.js";
 
 /**
  * Anti-DoS wiring overrides for a {@link CohortTopicHost} (`docs/cohort-topic.md` §Anti-DoS).
@@ -223,15 +226,28 @@ export interface CohortTopicAntiDosOptions {
 	 */
 	readonly bootstrapEvidence?: BootstrapEvidenceDeps;
 	/**
-	 * Optional peer-reputation view backing the default T0/T1 committed-work proxy and the T2/T3
-	 * reputation evidence: a non-banned participant satisfies the evidence (these tiers correspond to
-	 * committed work). Supplying it makes the gate effective at **all** tiers — the unwired PoW verifier
-	 * then fails closed (deny) rather than permissive, so a banned peer cannot slip through the T2/T3
-	 * `PoW || reputation || parent-ref` disjunction. When omitted (and no `bootstrapEvidence` verifier is
-	 * supplied), the default is permissive-but-logged — the production PoW / committed-work-reference
-	 * schemes are deferred (see `tickets/backlog/cohort-topic-bootstrap-evidence-scheme`).
+	 * Optional peer-reputation view backing the **reputation-endorsement** evidence path: a *referee*
+	 * peer-key-signs the bootstrap bound image, and the cohort admits it iff the signature verifies and
+	 * the referee is sufficiently reputable here (not banned **and** below the deprioritize threshold).
+	 * `PeerReputationService` satisfies this `{ isBanned, getScore }` shape directly. Supplying it (or any
+	 * `bootstrapEvidence` override) makes the gate **configured**: the real PoW verifier runs, the referee
+	 * verifier backs the reputation + (interim) parent-reference paths, and any unfilled verifier fails
+	 * closed — so a banned/low-rep referee cannot slip the T2/T3 `PoW || reputation || parent-ref`
+	 * disjunction. When omitted (and no `bootstrapEvidence` verifier is supplied), the gate is
+	 * permissive-but-logged (the entirely-unconfigured interim node).
 	 */
 	readonly reputation?: BootstrapReputationView;
+	/**
+	 * Proof-of-work difficulty (leading zero bits) the real PoW verifier requires. Default the db-core
+	 * `DEFAULT_POW_DIFFICULTY_BITS`. A low value (e.g. `0`) keeps minting fast/deterministic in tests.
+	 * Applies to both the cohort-side PoW verifier and this node's participant-side PoW builder.
+	 */
+	readonly powDifficultyBits?: number;
+	/**
+	 * Strict "sufficient reputation" cutoff for a bootstrap referee — a referee with `getScore < this` is
+	 * accepted. Default the reputation service's `deprioritize` threshold.
+	 */
+	readonly deprioritizeThreshold?: number;
 }
 
 /**
@@ -542,7 +558,7 @@ export async function createCohortTopicHost(node: Libp2p, fret: FretService, opt
 	// is built once and shared by every coord engine. The per-coord guards (rate limiter, replay guard,
 	// topic budget) are built per CoordEngine from `antiDos` below — they key on `(peer, topic)` /
 	// per-cohort topic state, which is coord-scoped, and must not share state across coords.
-	const bootstrapEvidence = createBootstrapEvidencePolicy(options.antiDos, log);
+	const bootstrapEvidence = createBootstrapEvidencePolicy(options.antiDos, hash, log);
 
 	// Node-level `promote`-handler anti-abuse gate (`cohort-topic-promote-handler-verify-amplification`):
 	// a per-(peer, topic) rate limiter (own instance — the register-path limiter is per-coord inside each
@@ -613,6 +629,18 @@ export async function createCohortTopicHost(node: Libp2p, fret: FretService, opt
 	const certSource: IMembershipSource = membershipSource;
 	const membershipRouter = createMembershipSourceRouter({ committed: certSource, fret: certSource });
 	const verifier = createMembershipVerifier({ signer: verifyingSigner, router: membershipRouter, minSigs });
+	// --- participant-side cold-start evidence builder (gap 6) ---
+	// Mints the evidence the participant attaches on a cold-root `bootstrap: true` re-issue. PoW (T2/T3) is
+	// keyless, so even a key-less host can bootstrap those tiers; the proof is bound to the register's own
+	// (topicId, tier, participantCoord, timestamp) tuple so a verifier reconstructs the same image. T0/T1
+	// carries no evidence here (the builder supports an `endorse` self-vouch seam — see
+	// `bootstrap-evidence-builder.ts` — but origination at those tiers is the committed-parent-reference
+	// follow-on `cohort-topic-bootstrap-parent-reference`, so it is intentionally left unwired for now).
+	const buildBootstrapEvidence = createBootstrapEvidenceBuilder({
+		hash,
+		bits: options.antiDos?.powDifficultyBits,
+	});
+
 	const service = createCohortTopicService({
 		// `self` is the dialable peer-id bytes (not the ring coord): db-core carries it as the
 		// participant's wire identity, so the cohort can verify its peer-key signature (see signing seam).
@@ -623,6 +651,7 @@ export async function createCohortTopicHost(node: Libp2p, fret: FretService, opt
 		signer: participantSigner,
 		gossipBus: participantGossipBus,
 		verifier,
+		buildBootstrapEvidence,
 		config: { fanout, wantK, minSigs, maxMessageBytes: maxBytes },
 	});
 
@@ -749,43 +778,49 @@ function createParticipantSigner(
 /**
  * Build the node-level {@link BootstrapEvidence} policy a cold root demands of a `bootstrap: true`
  * registration (`docs/cohort-topic.md` §Anti-DoS bullet 4). The policy itself (tier-dependent: T0/T1
- * need a signed parent / committed-work reference; T2/T3 accept PoW OR reputation OR a parent
- * reference) is real db-core logic — this only supplies the **verifiers**, which db-core deliberately
- * does not embed (no specific PoW / reputation / committed-work scheme).
+ * need a signed parent reference; T2/T3 accept PoW OR reputation OR a parent reference) is real db-core
+ * logic — this only supplies the **verifiers**, which db-core deliberately does not embed (no specific
+ * PoW / reputation / committed-work scheme).
  *
- * Resolution order per verifier: an injected `antiDos.bootstrapEvidence` verifier wins; else, when a
- * `reputation` view is supplied, a non-banned participant is the minimal-but-real committed-work proxy
- * (these tiers correspond to committed work); else a **permissive-but-logged** fallback. The gate is
- * therefore *never undefined* — the engine always runs it — but absent a real verifier or reputation
- * view it admits cold-root bootstraps after a one-time warning (the production PoW / committed-work
- * schemes are deferred: `tickets/backlog/cohort-topic-bootstrap-evidence-scheme`). Inject a denying
- * verifier (or a reputation view that bans the peer) to enforce the cold-root denial path.
+ * Resolution per verifier (an injected `antiDos.bootstrapEvidence` override always wins — the test seam):
+ *
+ * - `verifyPoW` — when **configured**, the real {@link createPoWVerifier} (self-contained: one hash over
+ *   the bound preimage). This is a working PoW path, not deny.
+ * - `verifyReputation` — when a reputation **view** is supplied, the real {@link createReputationVerifier}
+ *   (a referee peer-key-signs the bound image; the cohort checks the signature + the referee's local
+ *   reputation). Else (configured, no view) fail closed.
+ * - `verifyParentReference` — the interim **reputation stand-in**: the referee verifier when a view is
+ *   supplied (so a reputable referee covers the T0/T1 path until the real committed-parent-reference
+ *   verifier lands in `cohort-topic-bootstrap-parent-reference`), else fail closed.
+ *
+ * "Configured" = any reputation view or explicit `bootstrapEvidence` override is set; once configured, an
+ * unfilled verifier fails **closed** so a banned/low-rep referee cannot slip the T2/T3
+ * `verifyPoW || verifyReputation || verifyParentReference` disjunction. The permissive-but-logged
+ * fallback is reserved for the *entirely unconfigured* interim node (a one-time warning, never an
+ * undefined gate) so the db-core/mock-tier flows that bootstrap tier-0 without evidence still pass.
  */
 function createBootstrapEvidencePolicy(
 	antiDos: CohortTopicAntiDosOptions | undefined,
+	hash: RingHash,
 	log: (formatter: string, ...args: unknown[]) => void,
 ): BootstrapEvidence {
 	const overrides = antiDos?.bootstrapEvidence;
 	const reputation = antiDos?.reputation;
 
-	// A non-banned participant satisfies the T0/T1 committed-work proxy + the T2/T3 reputation option.
-	// Defensive: an unparseable participant id fails the check (deny) — it is never treated as evidence.
-	const reputationVerifier = reputation === undefined
-		? undefined
-		: (reg: RegisterV1): boolean => {
-			try {
-				return !reputation.isBanned(bytesToPeerIdString(b64urlToBytes(reg.participantCoord)));
-			} catch {
-				return false;
-			}
-		};
-
 	// Once ANY real gating is configured (a reputation view or explicit verifiers), an unfilled verifier
-	// must fail **closed** (deny), not open. Otherwise, e.g., a reputation view with no PoW scheme would
-	// leave `verifyPoW` permissive, and the T2/T3 gate (`verifyPoW(reg) || verifyReputation(reg) || …`)
-	// would admit even a banned peer — silently defeating the reputation gate. The permissive-but-logged
-	// fallback below is therefore reserved for the *entirely unconfigured* interim node.
+	// must fail **closed** (deny), not open — otherwise a permissive verifier short-circuits the T2/T3
+	// `||` disjunction and admits even a banned peer. The permissive-but-logged fallback below is
+	// therefore reserved for the *entirely unconfigured* interim node.
 	const configured = overrides !== undefined || reputation !== undefined;
+
+	// The real, self-contained PoW verifier — available whenever configured (no view / subsystem needed).
+	const realPoW = createPoWVerifier({ hash, bits: antiDos?.powDifficultyBits });
+	// The real referee verifier — only when a reputation view is supplied. Backs both the reputation path
+	// and (as the interim stand-in) the parent-reference path.
+	const realReputation = reputation === undefined
+		? undefined
+		: createReputationVerifier({ reputation, deprioritizeThreshold: antiDos?.deprioritizeThreshold });
+
 	const deny = (): boolean => false;
 
 	// Permissive-but-logged fallback (one warning total): keeps the gate defined while the production
@@ -795,7 +830,7 @@ function createBootstrapEvidencePolicy(
 		void reg;
 		if (!warned) {
 			warned = true;
-			log("cohort-topic anti-DoS: bootstrap-evidence %s verifier is PERMISSIVE — no PoW/committed-work scheme wired, so cold-root bootstrap is NOT cryptographically gated (interim; inject antiDos.bootstrapEvidence/reputation, see cohort-topic-bootstrap-evidence-scheme)", kind);
+			log("cohort-topic anti-DoS: bootstrap-evidence %s verifier is PERMISSIVE — no PoW/reputation view wired, so cold-root bootstrap is NOT cryptographically gated (interim; inject antiDos.bootstrapEvidence/reputation, see cohort-topic-bootstrap-evidence-scheme)", kind);
 		}
 		return true;
 	};
@@ -803,9 +838,12 @@ function createBootstrapEvidencePolicy(
 	const fallback = (kind: string): ((reg: RegisterV1) => boolean) => configured ? deny : permissive(kind);
 
 	return createBootstrapEvidence({
-		verifyParentReference: overrides?.verifyParentReference ?? reputationVerifier ?? fallback("parent-reference"),
-		verifyReputation: overrides?.verifyReputation ?? reputationVerifier ?? fallback("reputation"),
-		verifyPoW: overrides?.verifyPoW ?? fallback("proof-of-work"),
+		// Configured ⇒ the real PoW path; unconfigured ⇒ permissive (preserves the bare-host tier-0 flows).
+		verifyPoW: overrides?.verifyPoW ?? (configured ? realPoW : fallback("proof-of-work")),
+		verifyReputation: overrides?.verifyReputation ?? realReputation ?? fallback("reputation"),
+		// Interim: the referee verifier stands in for the committed-parent-reference path until the
+		// follow-on `cohort-topic-bootstrap-parent-reference` replaces it.
+		verifyParentReference: overrides?.verifyParentReference ?? realReputation ?? fallback("parent-reference"),
 		config: overrides?.config,
 	});
 }

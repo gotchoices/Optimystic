@@ -1,7 +1,7 @@
 import { expect } from 'chai';
 import { generateKeyPair } from '@libp2p/crypto/keys';
 import { peerIdFromPrivateKey } from '@libp2p/peer-id';
-import type { Connection, PeerId, Stream } from '@libp2p/interface';
+import type { Connection, PeerId, PrivateKey, Stream } from '@libp2p/interface';
 import {
 	RingHash,
 	createTierAddressing,
@@ -9,6 +9,8 @@ import {
 	b64urlToBytes,
 	encodeCohortMessage,
 	decodeCohortMessage,
+	serializeBootstrapEvidenceEnvelope,
+	bootstrapBoundImage,
 	DEFAULT_RATE_WINDOW_MS,
 	DEFAULT_REPLAY_MAX_AGE_MS,
 	validateRegisterV1,
@@ -19,6 +21,27 @@ import {
 } from '@optimystic/db-core';
 import { createCohortTopicHost, resolveRenew } from '../../src/cohort-topic/host.js';
 import { peerIdToBytes } from '../../src/cohort-topic/peer-codec.js';
+import { signPeerSig } from '../../src/cohort-topic/peer-sig.js';
+
+/** A non-banned, clean reputation view (the `{ isBanned, getScore }` shape the referee verifier needs). */
+const cleanReputation = { isBanned: (): boolean => false, getScore: (): number => 0 };
+
+/** A real keypair → dialable peer-id bytes (a valid `participantCoord` / `referee`). */
+async function makeParticipant(): Promise<{ key: PrivateKey; bytes: Uint8Array }> {
+	const key = await generateKeyPair('Ed25519');
+	return { key, bytes: peerIdToBytes(peerIdFromPrivateKey(key)) };
+}
+
+/** A PoW evidence field (the nonce is irrelevant when the host runs `powDifficultyBits: 0`). */
+function powEvidence(nonce: Uint8Array = Uint8Array.from([0, 0, 0, 0])): string {
+	return serializeBootstrapEvidenceEnvelope({ v: 1, pow: { nonce: bytesToB64url(nonce) } });
+}
+
+/** A referee endorsement field: `refereeKey` peer-key-signs `reg`'s bound image, referee = `refereeBytes`. */
+function refereeEvidence(reg: RegisterV1, refereeBytes: Uint8Array, refereeKey: PrivateKey): string {
+	const sig = signPeerSig(refereeKey, bootstrapBoundImage(reg));
+	return serializeBootstrapEvidenceEnvelope({ v: 1, reputation: { referee: bytesToB64url(refereeBytes), sig: bytesToB64url(sig) } });
+}
 
 const delay = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -148,64 +171,99 @@ describe('cohort-topic: host anti-DoS wiring (gap 6)', () => {
 		await host.stop();
 	});
 
-	it('bootstrap evidence: a cold-root bootstrap is denied without evidence and admitted with it', async () => {
-		const participant = await makeParticipantBytes();
+	it('bootstrap evidence: a configured host denies a T2 bootstrap with no evidence and admits one carrying a valid PoW', async () => {
+		const { bytes: participant } = await makeParticipant();
 		const now = 1_000_000;
-
-		// A reputation view that bans the peer → the T0 committed-work proxy fails → cold-root denial.
-		const denyHost = await createCohortTopicHost(makeFakeNode(await makePeerId()) as never, makeFakeFret() as never, {
+		const host = await createCohortTopicHost(makeFakeNode(await makePeerId()) as never, makeFakeFret() as never, {
 			wantK: 1,
-			antiDos: { reputation: { isBanned: (): boolean => true } },
+			antiDos: { reputation: cleanReputation, powDifficultyBits: 0 },
 		});
-		const ceDeny = denyHost.registry.forCoord(addressing.coord0(TOPIC), 0 as Tier, participant);
-		const denied = await ceDeny.engine.handleRegister(makeReg(participant, TOPIC, 'cid-noev', now), { followOn: false, treeTier: 0 }, now);
-		expect(denied.result, 'cold-root bootstrap without evidence is unwilling_cohort, not a silent accept').to.equal('unwilling_cohort');
-		await denyHost.stop();
 
-		// A non-banned peer satisfies the evidence → admitted.
-		const okHost = await createCohortTopicHost(makeFakeNode(await makePeerId()) as never, makeFakeFret() as never, {
-			wantK: 1,
-			antiDos: { reputation: { isBanned: (): boolean => false } },
-		});
-		const ceOk = okHost.registry.forCoord(addressing.coord0(TOPIC), 0 as Tier, participant);
-		const admitted = await ceOk.engine.handleRegister(makeReg(participant, TOPIC, 'cid-ev', now), { followOn: false, treeTier: 0 }, now);
-		expect(admitted.result, 'a non-banned peer carries acceptable evidence').to.equal('accepted');
-		await okHost.stop();
+		// No evidence at all → verifyPoW / verifyReputation / verifyParentReference all fail closed → denied.
+		const ceNo = host.registry.forCoord(addressing.coord0(TOPIC), 0 as Tier, participant);
+		const denied = await ceNo.engine.handleRegister(makeReg(participant, TOPIC, 'cid-noev', now, { tier: 2 }), { followOn: false, treeTier: 0 }, now);
+		expect(denied.result, 'a configured cohort denies a T2 bootstrap with no evidence').to.equal('unwilling_cohort');
+
+		// A valid PoW alone admits a T2 bootstrap even with no reputation endorsement (the `||` disjunction).
+		const ceOk = host.registry.forCoord(addressing.coord0(TOPIC2), 0 as Tier, participant);
+		const reg = makeReg(participant, TOPIC2, 'cid-pow', now, { tier: 2, bootstrapEvidence: powEvidence() });
+		const admitted = await ceOk.engine.handleRegister(reg, { followOn: false, treeTier: 0 }, now);
+		expect(admitted.result, 'a valid PoW alone admits a T2 bootstrap').to.equal('accepted');
+
+		await host.stop();
 	});
 
-	it('bootstrap evidence gates T2/T3 too: a reputation view fails PoW closed so a banned peer cannot slip the disjunction', async () => {
-		// T2/T3 accept `PoW || reputation || parent-ref`. With a reputation view but no wired PoW scheme,
-		// the PoW verifier must fail CLOSED — otherwise a permissive PoW short-circuits the `||` to admit
-		// even a banned peer, silently defeating the reputation gate (regression for that hole).
-		const participant = await makeParticipantBytes();
+	it('bootstrap evidence: a T0 bootstrap is admitted with a reputable referee endorsement and denied with a banned one', async () => {
+		const now = 1_000_000;
+
+		// Reputable referee (here a self-vouch: referee == participant) → admitted via the referee stand-in
+		// for the (still-deferred) parent-reference path.
+		const okHost = await createCohortTopicHost(makeFakeNode(await makePeerId()) as never, makeFakeFret() as never, {
+			wantK: 1,
+			antiDos: { reputation: cleanReputation },
+		});
+		const { key: okKey, bytes: okParticipant } = await makeParticipant();
+		const okReg = makeReg(okParticipant, TOPIC, 'cid-t0-ok', now);
+		okReg.bootstrapEvidence = refereeEvidence(okReg, okParticipant, okKey);
+		const ceOk = okHost.registry.forCoord(addressing.coord0(TOPIC), 0 as Tier, okParticipant);
+		const admitted = await ceOk.engine.handleRegister(okReg, { followOn: false, treeTier: 0 }, now);
+		expect(admitted.result, 'a T0 bootstrap with a reputable referee endorsement is admitted').to.equal('accepted');
+		await okHost.stop();
+
+		// A banned referee → the endorsement is rejected → unwilling_cohort.
+		const banHost = await createCohortTopicHost(makeFakeNode(await makePeerId()) as never, makeFakeFret() as never, {
+			wantK: 1,
+			antiDos: { reputation: { isBanned: (): boolean => true, getScore: (): number => 0 } },
+		});
+		const { key: banKey, bytes: banParticipant } = await makeParticipant();
+		const banReg = makeReg(banParticipant, TOPIC, 'cid-t0-ban', now);
+		banReg.bootstrapEvidence = refereeEvidence(banReg, banParticipant, banKey);
+		const ceBan = banHost.registry.forCoord(addressing.coord0(TOPIC), 0 as Tier, banParticipant);
+		const denied = await ceBan.engine.handleRegister(banReg, { followOn: false, treeTier: 0 }, now);
+		expect(denied.result, 'a banned referee endorsement is denied').to.equal('unwilling_cohort');
+		await banHost.stop();
+	});
+
+	it('bootstrap evidence gates T2/T3 too: a banned referee cannot slip the disjunction (a valid PoW alone still admits)', async () => {
+		// T2/T3 accept `PoW || reputation || parent-ref`. A banned referee (no PoW offered) must yield
+		// unwilling_cohort — verifyPoW returns false on an absent pow (not permissive), so the banned
+		// referee verifier is not slipped. A valid PoW alone still admits (the gate is effective, not deny-all).
 		const now = 1_000_000;
 
 		const banHost = await createCohortTopicHost(makeFakeNode(await makePeerId()) as never, makeFakeFret() as never, {
 			wantK: 1,
-			antiDos: { reputation: { isBanned: (): boolean => true } },
+			antiDos: { reputation: { isBanned: (): boolean => true, getScore: (): number => 0 }, powDifficultyBits: 0 },
 		});
-		const ceBan = banHost.registry.forCoord(addressing.coord0(TOPIC), 2 as Tier, participant);
-		const bannedT2 = await ceBan.engine.handleRegister(
-			makeReg(participant, TOPIC, 'cid-t2-ban', now, { tier: 2 }),
-			{ followOn: false, treeTier: 0 },
-			now,
-		);
-		expect(bannedT2.result, 'a banned peer is denied at T2 — PoW does not slip it through').to.equal('unwilling_cohort');
+		const { key: banKey, bytes: banParticipant } = await makeParticipant();
+		const banReg = makeReg(banParticipant, TOPIC, 'cid-t2-ban', now, { tier: 2 });
+		banReg.bootstrapEvidence = refereeEvidence(banReg, banParticipant, banKey); // a referee endorsement, no PoW
+		const ceBan = banHost.registry.forCoord(addressing.coord0(TOPIC), 0 as Tier, banParticipant);
+		const bannedT2 = await ceBan.engine.handleRegister(banReg, { followOn: false, treeTier: 0 }, now);
+		expect(bannedT2.result, 'a banned referee is denied at T2 — PoW does not slip it through').to.equal('unwilling_cohort');
 		await banHost.stop();
 
-		// A non-banned peer satisfies the T2/T3 reputation option → admitted (the gate is effective, not deny-all).
 		const okHost = await createCohortTopicHost(makeFakeNode(await makePeerId()) as never, makeFakeFret() as never, {
 			wantK: 1,
-			antiDos: { reputation: { isBanned: (): boolean => false } },
+			antiDos: { reputation: { isBanned: (): boolean => true, getScore: (): number => 0 }, powDifficultyBits: 0 },
 		});
-		const ceOk = okHost.registry.forCoord(addressing.coord0(TOPIC), 2 as Tier, participant);
-		const okT2 = await ceOk.engine.handleRegister(
-			makeReg(participant, TOPIC, 'cid-t2-ok', now, { tier: 2 }),
-			{ followOn: false, treeTier: 0 },
-			now,
-		);
-		expect(okT2.result, 'a non-banned peer satisfies the T2 reputation evidence').to.equal('accepted');
+		const { bytes: okParticipant } = await makeParticipant();
+		const okReg = makeReg(okParticipant, TOPIC2, 'cid-t2-ok', now, { tier: 2, bootstrapEvidence: powEvidence() });
+		const ceOk = okHost.registry.forCoord(addressing.coord0(TOPIC2), 0 as Tier, okParticipant);
+		const okT2 = await ceOk.engine.handleRegister(okReg, { followOn: false, treeTier: 0 }, now);
+		expect(okT2.result, 'a valid PoW alone admits a T2 bootstrap even with a banning reputation view').to.equal('accepted');
 		await okHost.stop();
+	});
+
+	it('bootstrap evidence: an entirely unconfigured host stays permissive (a tier-0 bootstrap with no evidence is admitted)', async () => {
+		// No `antiDos` at all → the permissive-but-logged fallback fires (one-time warning), preserving the
+		// db-core/mock-tier flows that bootstrap tier-0 without evidence (service.spec / live-tier / scale suites).
+		const { bytes: participant } = await makeParticipant();
+		const now = 1_000_000;
+		const host = await createCohortTopicHost(makeFakeNode(await makePeerId()) as never, makeFakeFret() as never, { wantK: 1 });
+		const ce = host.registry.forCoord(addressing.coord0(TOPIC), 0 as Tier, participant);
+		const admitted = await ce.engine.handleRegister(makeReg(participant, TOPIC, 'cid-bare', now), { followOn: false, treeTier: 0 }, now);
+		expect(admitted.result, 'a bare host admits a tier-0 bootstrap with no evidence').to.equal('accepted');
+		await host.stop();
 	});
 
 	it('renewal is not replay-gated: a renew reusing the correlationId is served past the replay window', async () => {
