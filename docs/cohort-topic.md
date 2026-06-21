@@ -926,10 +926,17 @@ The layer does not attempt to defend against unbounded Sybil attacks at the regi
 > `(peer, topicId)` sheds an over-rate peer before the `findServing` scan, a per-`(topic, tier)`
 > `effectiveAt` high-water drops replays before the signature verify, and the verify passes a 60 s
 > per-coord refetch bound (`PROMOTE_REFETCH_MIN_INTERVAL_MS`) so a flood drives a *bounded* membership
-> refetch rate rather than one dial per frame. The rate-limiter and high-water maps share the
-> register-path limiter's "retain one small entry per key, global eviction is the host service's
-> lifecycle concern" property (a slow leak for a long-lived node serving many topics; bounded eviction
-> is deferred — `cohort-topic-promote-gate-map-eviction`).
+> refetch rate rather than one dial per frame. Both maps are bounded for a long-lived node
+> (`cohort-topic-promote-gate-map-eviction`): the limiter — the attacker-growable one, since the rate
+> check runs before `findServing` so a forged notice for an unserved `topicId` still allocates a
+> `(peer, topic)` entry — carries the register-path limiter's inline `maxKeys` LRU hard cap plus an
+> idle-TTL `sweep` driven on the host's gossip cadence; the high-water is an `LruMap` capped at
+> `PROMOTE_HIGHWATER_MAX_KEYS = 8192` and is written **only** on a verified `applied` outcome (so it
+> is *not* attacker-growable and never evicts under legitimate load). Evicting a high-water entry is
+> safe: the high-water is a strictly-weaker early-drop optimization, not the idempotency authority —
+> the engine's `PromotionLifecycle` is independently idempotent and `effectiveAt`-ordered
+> (`PromotionState.lastEffectiveAt`), so an evicted-then-replayed stale notice re-verifies once (itself
+> rate-capped) and then no-ops at the engine rather than (re-)applying.
 
 > **Open question — `F^d` fan-out under per-coord rate limits (not resolved here).** The per-peer
 > rate limit bounds cost *per cohort*, but a malicious peer can hit every one of the `F^d`
