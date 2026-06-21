@@ -16,6 +16,7 @@ import {
 	arbitratorSetSigningPayload,
 	applyInvalidation,
 	cascadeInvalidate,
+	DELETED_BLOCK_RESTORE,
 	type CertificateTarget,
 	type CollectionEnv,
 	type CascadeSeed,
@@ -484,5 +485,35 @@ describe('Invalidation cascade', () => {
 		expect(await a.log.findInvalidation('tN')).to.equal(undefined);
 		expect(await countInvalidationEntries(a)).to.equal(2); // root tinv + t2 (tN escalated)
 		expect(await countInvalidationEntries(b)).to.equal(1); // t2
+	});
+
+	it('reverts a read-dependent that created a fresh block at rev > 1 and cascades via the deleted-block sentinel', async () => {
+		const c = await makeCollection('C');
+		// A created @1; tinv (root) updates A @2. t2 reads the invalidated A@2 and CREATES a fresh block
+		// B @3 (no genesis pre-creation — the path the old code threw on). t3 reads t2's created B@3.
+		await c.seed({ actionId: 'gen', rev: 1, writes: [{ blockId: 'A', value: 'a0' }], reads: [] });
+		await c.seed({ actionId: 'tinv', rev: 2, writes: [{ blockId: 'A', value: 'a-tinv' }], reads: [] });
+		await c.seed({ actionId: 't2', rev: 3, writes: [{ blockId: 'B', value: 'b-t2' }], reads: [{ blockId: 'A', revision: 2 }] });
+		await c.seed({ actionId: 't3', rev: 4, writes: [{ blockId: 'D', value: 'd-t3' }], reads: [{ blockId: 'B', revision: 3 }] });
+
+		const proof = await challengerWinsProof('d1');
+		const seed = await applyRoot(c, 'tinv', 2, ['A'], proof);
+
+		const result = await cascadeInvalidate({ rootActionId: 'tinv', proof, seed, envs: [c] });
+
+		// Both the block-creating dependent and its downstream are reverted — the previously-throwing path,
+		// end-to-end, with no genesis pre-creation papering over the creation-at-rev>2 case.
+		expect(invalidatedIds(result)).to.deep.equal(['t2', 't3']);
+		expect(result.escalation).to.equal(undefined);
+		// t2's reverted creation carries the deleted-block sentinel (its observed content no longer exists),
+		// which is exactly what flips t3 to invalidate.
+		const t2Child = result.invalidated.find(ch => ch.actionId === 't2');
+		expect(t2Child?.reverted[0]?.restoredContentHash).to.equal(DELETED_BLOCK_RESTORE);
+		// The created blocks are physically gone — getBlock() reads back as absent.
+		expect(await c.createBlockStorage('B').getBlock()).to.equal(undefined);
+		expect(await c.createBlockStorage('D').getBlock()).to.equal(undefined);
+		expect((await c.log.findInvalidation('t2'))?.cascadeRoot).to.equal('tinv');
+		expect((await c.log.findInvalidation('t3'))?.cascadeRoot).to.equal('tinv');
+		expect(await countInvalidationEntries(c)).to.equal(3); // root + t2 + t3
 	});
 });

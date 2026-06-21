@@ -3,7 +3,7 @@ import type {
 	DisputeResolutionProof, RevertedBlock, ReadDependency,
 } from '@optimystic/db-core';
 import type { IBlockStorage } from '../storage/i-block-storage.js';
-import { applyInvalidation, hashBlockContent, DEFERRED_DELETE_RESTORE, type CertificateTarget } from './invalidation.js';
+import { applyInvalidation, hashBlockContent, DELETED_BLOCK_RESTORE, type CertificateTarget } from './invalidation.js';
 import { createLogger } from '../logger.js';
 
 const log = createLogger('cascade');
@@ -113,7 +113,7 @@ export type Reevaluate = (candidate: CascadeCandidate) => Promise<CascadeVerdict
  * candidate *observed* (the immutable historical revision `blockId@rev`) against the `restoredContentHash`
  * the invalidation recorded (the as-if-absent value):
  *  - any read whose observed content differs from the restored content ⇒ the read no longer holds ⇒ **invalidate**;
- *  - a writer that *created* the block (delete-restore sentinel) ⇒ the observed content no longer exists ⇒ **invalidate**;
+ *  - a writer that *created* the block (deleted-block sentinel) ⇒ the observed content no longer exists ⇒ **invalidate**;
  *  - all intersecting reads unchanged ⇒ **retain** (e.g. a structural-block false dependent whose content the
  *    revert did not actually alter, or a redundant write that reverted to the same bytes).
  *  - a legacy entry (no persisted reads) ⇒ **unevaluable** (escalate, never guess independent).
@@ -134,7 +134,7 @@ export function contentEqualityReevaluator(): Reevaluate {
 			return 'retain';
 		}
 		for (const pair of candidate.matched) {
-			if (pair.restoredContentHash === DEFERRED_DELETE_RESTORE) {
+			if (pair.restoredContentHash === DELETED_BLOCK_RESTORE) {
 				return 'invalidate';
 			}
 			const observed = await pair.createBlockStorage(pair.blockId).getBlock(pair.rev);

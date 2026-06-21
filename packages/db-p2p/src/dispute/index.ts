@@ -25,7 +25,7 @@ export {
 	arbitratorSetSigningPayload,
 	applyInvalidation,
 	hashBlockContent,
-	DEFERRED_DELETE_RESTORE,
+	DELETED_BLOCK_RESTORE,
 	VOTE_VERSION,
 	type CertificateTarget,
 	type ArbitratorSetBinding,

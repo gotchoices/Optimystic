@@ -17,7 +17,7 @@ import {
 	voteSigningPayload,
 	arbitratorSetSigningPayload,
 	applyInvalidation,
-	DEFERRED_DELETE_RESTORE,
+	DELETED_BLOCK_RESTORE,
 	type CertificateTarget,
 	type ArbitratorSetRecompute,
 	type UnanchoredAcceptanceInfo,
@@ -100,6 +100,26 @@ async function seedBlock(raw: MemoryRawStorage, blockId: BlockId, revisions: { a
 		await repo.pend({ actionId, transforms, rev } as Parameters<StorageRepo['pend']>[0]);
 		await repo.commit({ actionId, rev, blockIds: [blockId], tailId: 'log' });
 		first = false;
+	}
+	return { repo, createBlockStorage };
+}
+
+/**
+ * Seeds arbitrary per-revision writes across possibly-different blocks through the real StorageRepo
+ * commit path: each step inserts a block the first time its id is written and updates it thereafter.
+ * Lets a test create one block at rev 1 and a DIFFERENT block fresh at rev 2 (the case-2 repro).
+ */
+async function seedWrites(raw: MemoryRawStorage, steps: { actionId: string; rev: number; blockId: BlockId; value: string }[]) {
+	const createBlockStorage = (id: BlockId) => new BlockStorage(id, raw);
+	const repo = new StorageRepo(createBlockStorage);
+	const seen = new Set<BlockId>();
+	for (const { actionId, rev, blockId, value } of steps) {
+		const transforms = seen.has(blockId)
+			? { updates: { [blockId]: [['value', 0, 0, value] as BlockOperation] } }
+			: { inserts: { [blockId]: valueBlock(blockId, value) } };
+		await repo.pend({ actionId, transforms, rev } as Parameters<StorageRepo['pend']>[0]);
+		await repo.commit({ actionId, rev, blockIds: [blockId], tailId: 'log' });
+		seen.add(blockId);
 	}
 	return { repo, createBlockStorage };
 }
@@ -410,6 +430,38 @@ describe('Compensating-state computation', () => {
 		const result = await computeRevertedBlock(createBlockStorage('B'), 1);
 		expect(result.kind).to.equal('delete');
 	});
+
+	it('reports a deletion (no throw) when T_inv created the block at rev > 1', async () => {
+		// The case-2 repro: A created at rev 1, then B created FRESH at rev 2 (B has no rev-1 content).
+		// Previously this threw `Failed to find materialized block B for revision 1`.
+		const raw = new MemoryRawStorage();
+		const { createBlockStorage } = await seedWrites(raw, [
+			{ actionId: 'a1', rev: 1, blockId: 'A', value: 'a' },
+			{ actionId: 'a2', rev: 2, blockId: 'B', value: 'b-created' },
+		]);
+		const result = await computeRevertedBlock(createBlockStorage('B'), 2);
+		expect(result.kind).to.equal('delete');
+	});
+
+	it('handles sparse revisions: restore to the highest prior rev, or delete at the creation rev', async () => {
+		const raw = new MemoryRawStorage();
+		// B created at rev 2, updated at rev 5 (revs 1, 3, 4 are absent for B).
+		const { createBlockStorage } = await seedBlock(raw, 'B', [
+			{ actionId: 'a2', value: 'created', rev: 2 },
+			{ actionId: 'a5', value: 'updated', rev: 5 },
+		]);
+
+		// Invalidate the update @5 → roll back to the created content at the highest prior rev (2).
+		const restored = await computeRevertedBlock(createBlockStorage('B'), 5);
+		expect(restored.kind).to.equal('restore');
+		if (restored.kind === 'restore') {
+			expect((restored.block as ValueBlock).value).to.equal('created');
+		}
+
+		// Invalidate the creation @2 → no prior revision → delete (later actions are NOT replayed).
+		const deleted = await computeRevertedBlock(createBlockStorage('B'), 2);
+		expect(deleted.kind).to.equal('delete');
+	});
 });
 
 describe('applyInvalidation', () => {
@@ -537,7 +589,7 @@ describe('applyInvalidation', () => {
 		expect(((await createBlockStorage('B').getBlock())!.block as ValueBlock).value).to.equal('tinv');
 	});
 
-	it('records a deferred sentinel when T_inv created the block (delete-restore)', async () => {
+	it('physically removes the block when T_inv created it at rev <= 1 (delete-restore)', async () => {
 		const raw = new MemoryRawStorage();
 		const { createBlockStorage } = await seedBlock(raw, 'B', [
 			{ actionId: 'a1', value: 'created-by-tinv', rev: 1 },
@@ -550,7 +602,81 @@ describe('applyInvalidation', () => {
 		});
 
 		expect(result.applied).to.equal(true);
-		expect(result.reverted[0]?.restoredContentHash).to.equal(DEFERRED_DELETE_RESTORE);
+		expect(result.reverted[0]?.restoredContentHash).to.equal(DELETED_BLOCK_RESTORE);
+		// The created block is physically gone — getBlock() reads back as absent (not a placeholder).
+		expect(await createBlockStorage('B').getBlock()).to.equal(undefined);
+		// Durable invalidation entry recorded.
+		expect((await log.findInvalidation('a1'))?.resolution.disputeId).to.equal('d1');
+	});
+
+	it('physically removes a block created at rev > 1 (delete-restore, no throw)', async () => {
+		// The previously-throwing path: A created @1, B created FRESH @2; reverting B's creation deletes it.
+		const raw = new MemoryRawStorage();
+		const { createBlockStorage } = await seedWrites(raw, [
+			{ actionId: 'a1', rev: 1, blockId: 'A', value: 'a' },
+			{ actionId: 'a2', rev: 2, blockId: 'B', value: 'b-created' },
+		]);
+		const log = await Log.create<unknown>(new MemLogStore());
+		const proof = await challengerWinsProof('d1', 'msg-1', { invalidatedActionId: 'a2', blockIds: ['B'] });
+
+		const result = await applyInvalidation({ log, createBlockStorage }, {
+			invalidatedActionId: 'a2', invalidatedRev: 2, blockIds: ['B'], proof,
+		});
+
+		expect(result.applied).to.equal(true);
+		expect(result.reverted[0]?.restoredContentHash).to.equal(DELETED_BLOCK_RESTORE);
+		expect(await createBlockStorage('B').getBlock()).to.equal(undefined);
+		// Block A (created by an unrelated action) is untouched.
+		expect(((await createBlockStorage('A').getBlock())!.block as ValueBlock).value).to.equal('a');
+	});
+
+	it('is idempotent for a creation reversal: one entry, one tombstone revision', async () => {
+		const raw = new MemoryRawStorage();
+		const { createBlockStorage } = await seedBlock(raw, 'B', [
+			{ actionId: 'a1', value: 'created-by-tinv', rev: 1 },
+		]);
+		const log = await Log.create<unknown>(new MemLogStore());
+		const proof = await challengerWinsProof('d1', 'msg-1', { invalidatedActionId: 'a1', blockIds: ['B'] });
+		const ctx = { log, createBlockStorage };
+		const params = { invalidatedActionId: 'a1', invalidatedRev: 1, blockIds: ['B'], proof } as const;
+
+		const first = await applyInvalidation(ctx, params);
+		const second = await applyInvalidation(ctx, params);
+
+		expect(first.applied).to.equal(true);
+		expect(second.applied).to.equal(false);
+		expect(second.reason).to.equal('already-applied');
+
+		let invCount = 0;
+		for await (const entry of log.select()) {
+			if (entry.invalidation) invCount++;
+		}
+		expect(invCount).to.equal(1);
+		// Exactly one tombstone revision: latest does not advance on the re-apply, block stays absent.
+		expect((await createBlockStorage('B').getLatest())!.rev).to.equal(2);
+		expect(await createBlockStorage('B').getBlock()).to.equal(undefined);
+	});
+
+	it('converges: two members reverting the same creation write identical tombstones', async () => {
+		const proof = await challengerWinsProof('d1', 'msg-1', { invalidatedActionId: 'a1', blockIds: ['B'] });
+
+		async function applyOnMember() {
+			const raw = new MemoryRawStorage();
+			const { createBlockStorage } = await seedBlock(raw, 'B', [
+				{ actionId: 'a1', value: 'created-by-tinv', rev: 1 },
+			]);
+			const log = await Log.create<unknown>(new MemLogStore());
+			const result = await applyInvalidation({ log, createBlockStorage }, {
+				invalidatedActionId: 'a1', invalidatedRev: 1, blockIds: ['B'], proof,
+			});
+			return { result, latest: await createBlockStorage('B').getLatest() };
+		}
+
+		const [m1, m2] = await Promise.all([applyOnMember(), applyOnMember()]);
+		expect(m1.result.rev).to.equal(m2.result.rev);
+		// Identical (rev, actionId) tombstone on both members (deterministic revertActionId).
+		expect(m1.latest).to.deep.equal(m2.latest);
+		expect(m1.result.reverted[0]?.restoredContentHash).to.equal(DELETED_BLOCK_RESTORE);
 	});
 
 	it('converges: independent members compute the same restored hash and revision', async () => {
@@ -573,6 +699,35 @@ describe('applyInvalidation', () => {
 		const [m1, m2] = await Promise.all([applyOnMember(), applyOnMember()]);
 		expect(m1.rev).to.equal(m2.rev);
 		expect(m1.reverted[0]?.restoredContentHash).to.equal(m2.reverted[0]?.restoredContentHash);
-		expect(m1.reverted[0]?.restoredContentHash).to.be.a('string').and.not.equal(DEFERRED_DELETE_RESTORE);
+		expect(m1.reverted[0]?.restoredContentHash).to.be.a('string').and.not.equal(DELETED_BLOCK_RESTORE);
+	});
+});
+
+describe('BlockStorage.saveDeletion (tombstone write path)', () => {
+	it('reads back absent while preserving historical content; monotonic + idempotent', async () => {
+		const raw = new MemoryRawStorage();
+		// B created @1, updated @2.
+		const { createBlockStorage } = await seedBlock(raw, 'B', [
+			{ actionId: 'a1', value: 'created', rev: 1 },
+			{ actionId: 'a2', value: 'updated', rev: 2 },
+		]);
+		const storage = createBlockStorage('B');
+
+		// Tombstone the block at rev 3.
+		const latest = await storage.saveDeletion({ rev: 3, actionId: 'tomb' });
+		expect(latest).to.deep.equal({ rev: 3, actionId: 'tomb' });
+
+		// getBlock() (latest) and getBlock(tombstoneRev) both read as absent — no throw, no placeholder.
+		expect(await storage.getBlock()).to.equal(undefined);
+		expect(await storage.getBlock(3)).to.equal(undefined);
+
+		// Historical revisions still materialize the content that existed then.
+		expect(((await storage.getBlock(1))!.block as ValueBlock).value).to.equal('created');
+		expect(((await storage.getBlock(2))!.block as ValueBlock).value).to.equal('updated');
+
+		// Idempotent for a fixed (rev, actionId); monotonic — a stale lower-rev tombstone is a no-op.
+		expect(await storage.saveDeletion({ rev: 3, actionId: 'tomb' })).to.deep.equal({ rev: 3, actionId: 'tomb' });
+		expect(await storage.saveDeletion({ rev: 2, actionId: 'stale' })).to.deep.equal({ rev: 3, actionId: 'tomb' });
+		expect((await storage.getLatest())!.rev).to.equal(3);
 	});
 });

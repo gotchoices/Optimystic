@@ -60,6 +60,18 @@ export interface IBlockStorage {
     saveReplica(block: IBlock, source?: ActionRev): Promise<ActionRev>;
 
     /**
+     * Writes a forward TOMBSTONE revision that reverses a block creation: persists `rev → actionId`,
+     * a `{ delete: true }` transform, and NO materialized block, then merges `[rev, rev+1]` into
+     * `ranges` and advances `latest` monotonically. The reverse-apply path treats the absent
+     * materialization as a deletion, so a `getBlock()` after a tombstone reads back as *absent*
+     * (`undefined`) while a historical `getBlock(creationRev)` still materializes the created content.
+     *
+     * Idempotent for a fixed `(rev, actionId)`; never downgrades `latest` (a no-op — still durable —
+     * when an equal-or-newer revision is already present). Returns the effective latest `ActionRev`.
+     */
+    saveDeletion(source: ActionRev): Promise<ActionRev>;
+
+    /**
      * Reconciles `metadata.latest` with the highest contiguous fully-promoted revision in
      * the revisions table. Intended for post-crash recovery of the Crash-D3 gap, where
      * `promotePendingTransaction` succeeded but `setLatest` did not: the revision and

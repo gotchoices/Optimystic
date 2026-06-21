@@ -126,11 +126,13 @@ export type VerifyCertificateOptions = {
 
 /**
  * Marks a `reverted` block whose as-if-`T_inv`-absent state is a *deletion* (T_inv created the
- * block, so there is no prior content to restore). The single-collection core does not yet
- * physically remove such blocks — it records and logs them; the cascade ticket completes the
- * delete-restore path. Greppable sentinel so the deferral is never mistaken for a real hash.
+ * block, so there is no prior content to restore). {@link applyInvalidation} now physically removes
+ * such blocks (a forward tombstone via {@link IBlockStorage.saveDeletion}); this sentinel is the
+ * `restoredContentHash` it records for the deleted block, telling read-dependents "the observed
+ * content no longer exists → invalidate" (a created block can never equal "absent"). Greppable so it
+ * is never mistaken for a real content hash.
  */
-export const DEFERRED_DELETE_RESTORE = 'deferred:block-creation-reversal';
+export const DELETED_BLOCK_RESTORE = 'deleted:block-creation-reverted';
 
 // ─── DisputeResolution → DisputeResolutionProof ───
 
@@ -370,8 +372,8 @@ async function verifyVoteSignature(disputeId: string, vote: ArbitrationVoteProof
  * The recomputed "as-if-`T_inv`-never-committed" state for a single block.
  *  - `restore`: the block existed before `T_inv`; `block` is its recomputed content (the revision
  *    immediately before `T_inv`, with any surviving later actions replayed on top).
- *  - `delete`: `T_inv` created the block, so the as-if-absent state is a deletion (deferred — see
- *    {@link DEFERRED_DELETE_RESTORE}).
+ *  - `delete`: `T_inv` created the block, so the as-if-absent state is a deletion (physically removed
+ *    by {@link applyInvalidation} via a tombstone — see {@link DELETED_BLOCK_RESTORE}).
  */
 export type RevertedComputation =
 	| { kind: 'restore'; block: IBlock; restoredContentHash: string; fromRev: number; laterActions: number }
@@ -381,20 +383,35 @@ export type RevertedComputation =
  * Reconstructs the compensating content for one block from stored revisions only (never by re-running
  * the engine — so it does not depend on engine availability and stays deterministic across members).
  *
- * Base = the block's content at `invalidatedRev - 1`. In the single-collection/no-cascade core,
- * "surviving later actions" = every committed action after `T_inv` on this block, replayed verbatim
- * on the rolled-back base (the cascade ticket replaces this blind replay with re-evaluation of true
- * read-dependents). Genuinely read-dependent successors are left as-is and logged.
+ * Base = the block's content at the highest stored revision strictly before `T_inv` (no such revision
+ * ⇒ `T_inv` created the block ⇒ a deletion). In the single-collection/no-cascade core, "surviving later
+ * actions" = every committed action after `T_inv` on this block, replayed verbatim on the rolled-back
+ * base (the cascade ticket replaces this blind replay with re-evaluation of true read-dependents).
+ * Genuinely read-dependent successors are left as-is and logged.
  */
 export async function computeRevertedBlock(blockStorage: IBlockStorage, invalidatedRev: number): Promise<RevertedComputation> {
 	const latest = await blockStorage.getLatest();
 	const fromRev = latest?.rev ?? invalidatedRev;
 
-	// T_inv created this block (no prior revision) → as-if-absent is a deletion.
-	if (invalidatedRev <= 1) {
+	// Find the highest stored revision strictly before T_inv — the base to roll back to. A descending
+	// listRevisions(invalidatedRev - 1, 1) yields it first (same descending-scan pattern materializeBlock
+	// uses, so no new cost class). No such revision ⇒ T_inv CREATED this block ⇒ the as-if-absent state is
+	// a deletion — at ANY rev, without throwing (the previous `invalidatedRev <= 1` special-case folds into
+	// this: at rev <= 1 the probe is skipped and priorRev stays undefined). We intentionally do NOT replay
+	// surviving later actions onto an absent base: replaying an update on `undefined` stays `undefined`, and
+	// any later writer of a created-then-reverted block is itself a read-dependent the cascade re-evaluates
+	// and reverts.
+	let priorRev: number | undefined;
+	if (invalidatedRev > 1) {
+		for await (const ar of blockStorage.listRevisions(invalidatedRev - 1, 1)) {
+			priorRev = ar.rev;
+			break;
+		}
+	}
+	if (priorRev === undefined) {
 		return { kind: 'delete', fromRev };
 	}
-	const base = await blockStorage.getBlock(invalidatedRev - 1);
+	const base = await blockStorage.getBlock(priorRev);
 	if (!base) {
 		return { kind: 'delete', fromRev };
 	}
@@ -532,19 +549,22 @@ export async function applyInvalidation(ctx: InvalidationContext, params: ApplyI
 
 	const reverted: RevertedBlock[] = [];
 	for (const { blockId, storage, computation } of computations) {
+		// Deterministic compensating-revision actionId — identical on every member, so all converge on
+		// the same (rev, actionId) for both the restore and the tombstone path.
+		const revertActionId = await hashString(`inv:${invalidatedActionId}:${proof.disputeId}:${blockId}:${rev}`);
 		if (computation.kind === 'delete') {
-			// Block-creation reversal (delete-restore) is deferred to the cascade ticket — record + log,
-			// do not physically remove. Never silently drop: surface it so the deferral is auditable.
-			log('apply-defer-delete-restore blockId=%s invalidatedRev=%d', blockId, invalidatedRev);
-			reverted.push({ blockId, fromRev: computation.fromRev, restoredContentHash: DEFERRED_DELETE_RESTORE });
+			// Block-creation reversal: physically remove the created block by writing a forward tombstone
+			// revision. The `restoredContentHash` is the DELETED_BLOCK_RESTORE sentinel — a deleted block
+			// has no content hash, and the sentinel tells dependents "observed content is gone → invalidate".
+			await storage.saveDeletion({ rev, actionId: revertActionId });
+			log('apply-delete-restore blockId=%s invalidatedRev=%d rev=%d', blockId, invalidatedRev, rev);
+			reverted.push({ blockId, fromRev: computation.fromRev, restoredContentHash: DELETED_BLOCK_RESTORE });
 			continue;
 		}
 		if (computation.laterActions > 0) {
 			// Surviving later actions were replayed verbatim; true read-dependents are out of scope here.
 			log('apply-replayed-later-actions blockId=%s count=%d', blockId, computation.laterActions);
 		}
-		// Deterministic compensating-revision actionId — identical on every member.
-		const revertActionId = await hashString(`inv:${invalidatedActionId}:${proof.disputeId}:${blockId}:${rev}`);
 		await storage.saveReplica(computation.block, { rev, actionId: revertActionId });
 		reverted.push({ blockId, fromRev: computation.fromRev, restoredContentHash: computation.restoredContentHash });
 	}

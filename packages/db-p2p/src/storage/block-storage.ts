@@ -175,6 +175,53 @@ export class BlockStorage implements IBlockStorage {
 		}
 	}
 
+	async saveDeletion(source: ActionRev): Promise<ActionRev> {
+		const { rev, actionId } = source;
+
+		// Share the saveReplica latch: both do a read-modify-write of `meta.latest`, so they must be
+		// mutually exclusive on this block to keep the monotonic guard sound.
+		const lockId = `BlockStorage.saveReplica:${this.blockId}`;
+		const release = await Latches.acquire(lockId);
+		try {
+			let meta = await this.storage.getMetadata(this.blockId);
+
+			// Monotonic guard: an equal-or-newer revision is already held. Do not downgrade `latest`
+			// or rewrite metadata — the tombstone (or a later revision) is already durable.
+			if (meta?.latest && meta.latest.rev >= rev) {
+				log('deletion:skip blockId=%s rev=%d held=%d', this.blockId, rev, meta.latest.rev);
+				return meta.latest;
+			}
+
+			// Forward tombstone: a `{ delete: true }` transform and NO materialized block. saveRestored
+			// skips materialization when `block` is absent, so the reverse-apply in materializeBlock
+			// resolves this revision to an absent block (read-back as undefined).
+			const archive: BlockArchive = {
+				blockId: this.blockId,
+				revisions: {
+					[rev]: {
+						action: { actionId, rev, transform: { delete: true } }
+					}
+				},
+				range: [rev, rev + 1]
+			};
+			await this.saveRestored(archive);
+
+			// Seed metadata when absent, advance latest, and merge the covered range.
+			if (!meta) {
+				meta = { latest: undefined, ranges: [] };
+			}
+			meta.latest = { rev, actionId };
+			meta.ranges.unshift([rev, rev + 1]);
+			meta.ranges = mergeRanges(meta.ranges);
+			await this.storage.saveMetadata(this.blockId, meta);
+
+			log('deletion:save blockId=%s rev=%d actionId=%s', this.blockId, rev, actionId);
+			return meta.latest;
+		} finally {
+			release();
+		}
+	}
+
 	private async ensureRevision(meta: BlockMetadata, rev: number): Promise<void> {
 		if (this.inRanges(rev, meta.ranges)) {
 			return;
@@ -206,7 +253,7 @@ export class BlockStorage implements IBlockStorage {
 		}
 	}
 
-	private async materializeBlock(_meta: BlockMetadata, targetRev: number): Promise<{ block: IBlock, actionRev: ActionRev }> {
+	private async materializeBlock(_meta: BlockMetadata, targetRev: number): Promise<{ block: IBlock, actionRev: ActionRev } | undefined> {
 		let block: IBlock | undefined;
 		let materializedActionRev: ActionRev | undefined;
 		const actions: ActionRev[] = [];
@@ -239,7 +286,11 @@ export class BlockStorage implements IBlockStorage {
 		}
 
 		if (!block) {
-			throw new Error(`Block ${this.blockId} has been deleted`);
+			// The reverse-apply collapsed to a tombstone (a `{ delete: true }` revision) — the block
+			// is absent at this revision, not corrupt. Read it back as undefined (matching getBlock's
+			// "no materialized content" contract) rather than throwing. The genuine-truncation throw
+			// ("Failed to find materialized block") above still fires when no materialization exists.
+			return undefined;
 		}
 		if (actions.length) {
 			await this.storage.saveMaterializedBlock(this.blockId, actions[0]!.actionId, block);
