@@ -16,7 +16,10 @@ import { buildReactivityMesh, delay, type ReactivityMesh } from '../../src/testi
 
 const range = (lo: number, hi: number): number[] => Array.from({ length: hi - lo + 1 }, (_v, i) => lo + i);
 
-describe('reactivity / mesh — slow-subscriber isolation', () => {
+describe('reactivity / mesh — slow-subscriber isolation', function () {
+	// Real-Ed25519 multi-cohort mesh: setup + round-trips are CPU-bound and run several seconds; give
+	// generous headroom over the 10s default so machine load doesn't tip a passing test into a timeout.
+	this.timeout(30_000);
 	let rx: ReactivityMesh;
 	afterEach(async () => {
 		await rx?.stop();

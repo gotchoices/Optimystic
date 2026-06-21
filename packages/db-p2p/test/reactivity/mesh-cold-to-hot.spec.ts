@@ -23,7 +23,10 @@ import { expect } from 'chai';
 import { Tier, bytesToB64url } from '@optimystic/db-core';
 import { buildReactivityMesh, type ReactivityMesh } from '../../src/testing/reactivity-mesh-harness.js';
 
-describe('reactivity / mesh — cold-to-hot growth + delivery', () => {
+describe('reactivity / mesh — cold-to-hot growth + delivery', function () {
+	// Real-Ed25519 multi-cohort mesh: setup + round-trips are CPU-bound and run several seconds; give
+	// generous headroom over the 10s default so machine load doesn't tip a passing test into a timeout.
+	this.timeout(30_000);
 	let rx: ReactivityMesh;
 	afterEach(async () => {
 		await rx?.stop();

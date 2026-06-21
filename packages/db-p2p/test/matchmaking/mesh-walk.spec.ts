@@ -18,7 +18,10 @@
 import { expect } from 'chai';
 import { buildMatchmakingMesh, type MatchmakingMesh } from '../../src/testing/matchmaking-mesh-harness.js';
 
-describe('matchmaking / mesh — seeker walk regimes', () => {
+describe('matchmaking / mesh — seeker walk regimes', function () {
+	// Real-Ed25519 multi-cohort mesh: setup + round-trips are CPU-bound and run several seconds; give
+	// generous headroom over the 10s default so machine load doesn't tip a passing test into a timeout.
+	this.timeout(30_000);
 	let mm: MatchmakingMesh;
 	afterEach(async () => {
 		await mm?.stop();

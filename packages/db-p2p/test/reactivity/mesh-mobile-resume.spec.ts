@@ -27,7 +27,10 @@ const W = 4;
 const W_CHECKPOINT = 12;
 const COLLECTION_OPTS = { w: W, wCheckpoint: W_CHECKPOINT } as const;
 
-describe('reactivity / mesh — mobile resume windows (stacked W + W_checkpoint)', () => {
+describe('reactivity / mesh — mobile resume windows (stacked W + W_checkpoint)', function () {
+	// Real-Ed25519 multi-cohort mesh: setup + round-trips are CPU-bound and run several seconds; give
+	// generous headroom over the 10s default so machine load doesn't tip a passing test into a timeout.
+	this.timeout(30_000);
 	let rx: ReactivityMesh;
 	afterEach(async () => {
 		await rx?.stop();

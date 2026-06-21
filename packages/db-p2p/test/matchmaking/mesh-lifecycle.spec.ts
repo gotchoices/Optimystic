@@ -15,7 +15,10 @@
 import { expect } from 'chai';
 import { buildMatchmakingMesh, type MatchmakingMesh } from '../../src/testing/matchmaking-mesh-harness.js';
 
-describe('matchmaking / mesh — provider registration + query round-trip', () => {
+describe('matchmaking / mesh — provider registration + query round-trip', function () {
+	// Real-Ed25519 multi-cohort mesh: setup + round-trips are CPU-bound and run several seconds; give
+	// generous headroom over the 10s default so machine load doesn't tip a passing test into a timeout.
+	this.timeout(30_000);
 	let mm: MatchmakingMesh;
 	afterEach(async () => {
 		await mm?.stop();
@@ -64,7 +67,10 @@ describe('matchmaking / mesh — provider registration + query round-trip', () =
 	});
 });
 
-describe('matchmaking / mesh — provider self-throttling + withdrawal', () => {
+describe('matchmaking / mesh — provider self-throttling + withdrawal', function () {
+	// Real-Ed25519 multi-cohort mesh: setup + round-trips are CPU-bound and run several seconds; give
+	// generous headroom over the 10s default so machine load doesn't tip a passing test into a timeout.
+	this.timeout(30_000);
 	let mm: MatchmakingMesh;
 	afterEach(async () => {
 		await mm?.stop();

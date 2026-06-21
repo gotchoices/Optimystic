@@ -59,7 +59,10 @@ function realRecordSweepPorts(mm: MatchmakingMesh, requesterIndex: number, opts:
 	};
 }
 
-describe('matchmaking / mesh — multi-cohort sweep over real records', () => {
+describe('matchmaking / mesh — multi-cohort sweep over real records', function () {
+	// Real-Ed25519 multi-cohort mesh: setup + round-trips are CPU-bound and run several seconds; give
+	// generous headroom over the 10s default so machine load doesn't tip a passing test into a timeout.
+	this.timeout(30_000);
 	let mm: MatchmakingMesh;
 	afterEach(async () => {
 		await mm?.stop();
