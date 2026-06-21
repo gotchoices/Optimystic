@@ -16,9 +16,11 @@ import { expect } from 'chai';
 import { buildMatchmakingMesh, type MatchmakingMesh } from '../../src/testing/matchmaking-mesh-harness.js';
 
 describe('matchmaking / mesh — provider registration + query round-trip', function () {
-	// Real-Ed25519 multi-cohort mesh: setup + round-trips are CPU-bound and run several seconds; give
-	// generous headroom over the 10s default so machine load doesn't tip a passing test into a timeout.
-	this.timeout(30_000);
+	// Real-Ed25519 multi-cohort mesh: setup + round-trips are CPU-bound and individual tests baseline at
+	// 18-24s even in isolation, so a 30s budget left near-zero margin and tipped to timeout under the
+	// accumulated load of the full db-p2p suite. Match the identical-profile sibling suite
+	// (reactivity/mesh-tail-rotation, also 60s) so machine load does not tip a passing test into a timeout.
+	this.timeout(60_000);
 	let mm: MatchmakingMesh;
 	afterEach(async () => {
 		await mm?.stop();
@@ -68,9 +70,11 @@ describe('matchmaking / mesh — provider registration + query round-trip', func
 });
 
 describe('matchmaking / mesh — provider self-throttling + withdrawal', function () {
-	// Real-Ed25519 multi-cohort mesh: setup + round-trips are CPU-bound and run several seconds; give
-	// generous headroom over the 10s default so machine load doesn't tip a passing test into a timeout.
-	this.timeout(30_000);
+	// Real-Ed25519 multi-cohort mesh: setup + round-trips are CPU-bound and individual tests baseline at
+	// 18-24s even in isolation, so a 30s budget left near-zero margin and tipped to timeout under the
+	// accumulated load of the full db-p2p suite. Match the identical-profile sibling suite
+	// (reactivity/mesh-tail-rotation, also 60s) so machine load does not tip a passing test into a timeout.
+	this.timeout(60_000);
 	let mm: MatchmakingMesh;
 	afterEach(async () => {
 		await mm?.stop();
