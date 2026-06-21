@@ -942,4 +942,104 @@ describe('StorageRepo', () => {
 			expect(bEvents.length).to.equal(0);
 		});
 	});
+
+	describe('change notification on replica-persist', () => {
+		it('fresh replica fires exactly one event with correct fields and no tailId', async () => {
+			const events: CollectionChangeEvent[] = [];
+			repo.onCollectionChange('collection-1' as BlockId, (e) => events.push(e));
+
+			await repo.saveReplicatedBlock('block-1' as BlockId, makeBlock('block-1'),
+				{ actionId: 'a1' as ActionId, rev: 5 });
+
+			expect(events.length).to.equal(1);
+			expect(events[0]!.collectionId).to.equal('collection-1');
+			expect(events[0]!.blockIds).to.deep.equal(['block-1']);
+			expect(events[0]!.actionId).to.equal('a1');
+			expect(events[0]!.rev).to.equal(5);
+			// Seam: no commit tail on the replica path.
+			expect(events[0]!.tailId).to.equal(undefined);
+		});
+
+		it('idempotent re-push fires no additional event', async () => {
+			const events: CollectionChangeEvent[] = [];
+			repo.onCollectionChange('collection-1' as BlockId, (e) => events.push(e));
+
+			await repo.saveReplicatedBlock('block-1' as BlockId, makeBlock('block-1'),
+				{ actionId: 'a1' as ActionId, rev: 5 });
+			expect(events.length).to.equal(1);
+
+			// Same (actionId, rev) again — monotonic no-op.
+			await repo.saveReplicatedBlock('block-1' as BlockId, makeBlock('block-1'),
+				{ actionId: 'a1' as ActionId, rev: 5 });
+			expect(events.length).to.equal(1);
+		});
+
+		it('older-rev re-push after a newer replica fires no event', async () => {
+			const events: CollectionChangeEvent[] = [];
+			repo.onCollectionChange('collection-1' as BlockId, (e) => events.push(e));
+
+			await repo.saveReplicatedBlock('block-1' as BlockId, makeBlock('block-1'),
+				{ actionId: 'a1' as ActionId, rev: 5 });
+			expect(events.length).to.equal(1);
+
+			// Older rev — monotonic guard drops it.
+			await repo.saveReplicatedBlock('block-1' as BlockId, makeBlock('block-1'),
+				{ actionId: 'a0' as ActionId, rev: 3 });
+			expect(events.length).to.equal(1);
+		});
+
+		it('distinct collection subscriber stays silent when a different collection block is replicated', async () => {
+			const col1Events: CollectionChangeEvent[] = [];
+			const col2Events: CollectionChangeEvent[] = [];
+			repo.onCollectionChange('collection-1' as BlockId, (e) => col1Events.push(e));
+			repo.onCollectionChange('collection-2' as BlockId, (e) => col2Events.push(e));
+
+			await repo.saveReplicatedBlock('block-1' as BlockId,
+				makeBlockInCollection('block-1', 'collection-1'),
+				{ actionId: 'a1' as ActionId, rev: 1 });
+
+			expect(col1Events.length).to.equal(1);
+			expect(col2Events.length).to.equal(0);
+		});
+
+		it('no event when block already current via commit (equal rev)', async () => {
+			// Commit block-1@1 through the normal path, then replica-push at rev 1 — no-op.
+			await repo.pend({
+				actionId: 'a1' as ActionId,
+				transforms: makeInsertTransforms('block-1' as BlockId, makeBlock('block-1')),
+				policy: 'c'
+			});
+			await repo.commit({
+				actionId: 'a1' as ActionId,
+				blockIds: ['block-1' as BlockId],
+				tailId: 'block-1' as BlockId,
+				rev: 1
+			});
+
+			const events: CollectionChangeEvent[] = [];
+			repo.onCollectionChange('collection-1' as BlockId, (e) => events.push(e));
+
+			await repo.saveReplicatedBlock('block-1' as BlockId, makeBlock('block-1'),
+				{ actionId: 'a1' as ActionId, rev: 1 });
+
+			expect(events.length).to.equal(0);
+		});
+
+		it('catch-all feed also receives the fresh-replica event exactly once', async () => {
+			const anyEvents: CollectionChangeEvent[] = [];
+			repo.onAnyCollectionChange((e) => anyEvents.push(e));
+
+			await repo.saveReplicatedBlock('block-1' as BlockId, makeBlock('block-1'),
+				{ actionId: 'a1' as ActionId, rev: 5 });
+
+			expect(anyEvents.length).to.equal(1);
+			expect(anyEvents[0]!.collectionId).to.equal('collection-1');
+			expect(anyEvents[0]!.tailId).to.equal(undefined);
+
+			// No second event on idempotent re-push.
+			await repo.saveReplicatedBlock('block-1' as BlockId, makeBlock('block-1'),
+				{ actionId: 'a1' as ActionId, rev: 5 });
+			expect(anyEvents.length).to.equal(1);
+		});
+	});
 });

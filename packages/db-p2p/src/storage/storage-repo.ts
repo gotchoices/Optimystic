@@ -467,10 +467,31 @@ export class StorageRepo implements IRepo, IBlockChangeNotifier, IBlockReplicaSt
 		log('saveReplicatedBlock blockId=%s rev=%s', blockId, source?.rev);
 		const storage = this.createBlockStorage(blockId);
 		const release = await Latches.acquire(`StorageRepo.commit:${blockId}`);
+		// Captured under the latch; emitted after release to match commit's ordering.
+		let landed: { collectionId: CollectionId, actionId: ActionId, rev: number } | undefined;
 		try {
-			await storage.saveReplica(block, source);
+			const priorLatest = await storage.getLatest();
+			const effective = await storage.saveReplica(block, source);
+			// Advanced iff there was no prior revision or the effective rev moved past it. On the
+			// monotonic no-op, saveReplica returns the held latest unchanged → effective.rev === priorLatest.rev.
+			const advanced = priorLatest === undefined || effective.rev > priorLatest.rev;
+			const collectionId = block.header?.collectionId;
+			if (advanced && collectionId !== undefined) {
+				landed = { collectionId, actionId: effective.actionId, rev: effective.rev };
+			}
 		} finally {
 			release();
+		}
+		// Replica-persist has no CommitRequest, hence no tailId — like a read-driven promotion,
+		// this wakes local onCollectionChange watchers but is cert-gated out of cohort-topic
+		// re-origination downstream (change-bridge selfIsCohortMember treats a tail-less event as
+		// never a member).
+		if (landed) {
+			this.emitCollectionChanges(
+				new Map([[landed.collectionId, [blockId]]]),
+				landed.actionId,
+				landed.rev,
+			);
 		}
 	}
 
