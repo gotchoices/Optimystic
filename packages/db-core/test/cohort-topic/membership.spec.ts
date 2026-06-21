@@ -347,6 +347,24 @@ describe('cohort-topic / membership trust anchoring', () => {
 		expect(r).to.equal('verified');
 	});
 
+	it('threads the verifying cert and the router tier into the direct anchor', async () => {
+		// A recording anchor proves the gate consults `directAnchor` with the *same* cert it is deciding on
+		// and the *same* tier the router dispatched (the binding is tier-scoped). Use T3 (FRET) so a stray
+		// default tier would be observable.
+		const calls: Array<{ cohortCoord: string; cohortEpoch: string; tier: number }> = [];
+		const recordingAnchor: IMembershipTrustAnchor = {
+			directAnchor: (cert, tier) => {
+				calls.push({ cohortCoord: cert.cohortCoord, cohortEpoch: cert.cohortEpoch, tier });
+				return 'anchored';
+			},
+		};
+		const source = new MockSource(encodeCohortMessage(GOOD));
+		const v = makeVerifier(source, { anchor: recordingAnchor });
+		expect(await v.verifyMessage(MESSAGE_SIGNERS, COORD, 3, PAYLOAD, SIG)).to.equal('verified');
+		expect(calls, 'the anchor is consulted exactly once for the loaded cert').to.have.length(1);
+		expect(calls[0]).to.deep.equal({ cohortCoord: bytesToB64url(COORD), cohortEpoch: bytesToB64url(EPOCH), tier: 3 });
+	});
+
 	it('TOFU-accepts a self-consistent cert on an "unknown" coord (no regression where nothing can anchor)', async () => {
 		const source = new MockSource(encodeCohortMessage(GOOD));
 		const v = makeVerifier(source, { anchor: constAnchor('unknown') });
