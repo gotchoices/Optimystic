@@ -7,7 +7,7 @@ import { createMembershipSourceRouter } from '../../src/cohort-topic/membership/
 import { createMembershipCertPublisher } from '../../src/cohort-topic/membership/publisher.js';
 import { bytesToB64url, encodeCohortMessage, decodeMembershipCertV1 } from '../../src/cohort-topic/wire/codec.js';
 import { bytesEqual } from '../../src/cohort-topic/registration/bytes.js';
-import type { ICohortThresholdCrypto, IMembershipSource, RingCoord } from '../../src/cohort-topic/ports.js';
+import type { ICohortThresholdCrypto, IMembershipSource, IMembershipTrustAnchor, RingCoord, TrustAnchorVerdict, TrustRoot } from '../../src/cohort-topic/ports.js';
 import type { MembershipCertV1 } from '../../src/cohort-topic/wire/types.js';
 
 const sigFor = (payload: Uint8Array): Uint8Array => sha256(payload).slice(0, 16);
@@ -75,13 +75,16 @@ describe('cohort-topic / membership verification', () => {
 	});
 
 	it('stale cached cert triggers exactly one refetch, then succeeds', async () => {
-		const source = new MockSource(undefined, encodeCohortMessage(GOOD));
+		// The stale cert is observed from the source (TOFU-cached, not self-published), so a later refetch of
+		// the current cert can replace it. (Under the trust gate, a cert the node itself published via `cache`
+		// is *trusted* and would NOT be silently overwritten by an un-anchored refetch — see the trust-anchor
+		// suite below for that distinction.)
+		const source = new MockSource(encodeCohortMessage(buildCert(STALE_MEMBERS)), encodeCohortMessage(GOOD));
 		const { v } = verifier(source);
-		v.cache(buildCert(STALE_MEMBERS)); // cached cert lacks the message signers
 		const r = await v.verifyMessage(MESSAGE_SIGNERS, COORD, 2, PAYLOAD, SIG);
 		expect(r).to.equal('verified');
+		expect(source.currentCalls, 'consulted current() for the stale cert').to.equal(1);
 		expect(source.fetchCalls, 'exactly one refetch').to.equal(1);
-		expect(source.currentCalls, 'current() skipped when a cert is already cached').to.equal(0);
 	});
 
 	it('returns untrusted when the refetched cert still does not verify (no second fetch)', async () => {
@@ -224,5 +227,236 @@ describe('cohort-topic / membership cert publication', () => {
 
 		expect(await pub.tick(snapshot(members), 11_000), 'refresh interval elapsed').to.not.be.undefined;
 		expect(published).to.have.length(2);
+	});
+
+	it('attaches a rotation attestation when given one; the default publish emits no rotation fields', async () => {
+		const { published, sink } = capturingSink();
+		const pub = createMembershipCertPublisher({ signer, sink, minSigs: 2 });
+
+		// Default path (no rotation arg): the cert carries none of the rotation fields.
+		await pub.onStabilized(snapshot([mkMember(0), mkMember(1), mkMember(2), mkMember(3)]), 1_000);
+		expect(published[0]).to.not.have.property('prevEpoch');
+		expect(published[0]).to.not.have.property('rotationSig');
+		expect(published[0]).to.not.have.property('rotationSigners');
+
+		// With a rotation attestation: it is attached verbatim (the threshold sig still covers only the
+		// non-rotation signing image, so the cert stays self-consistent — exercised by the verifier suite).
+		const prevEpoch = new Uint8Array(32).fill(7);
+		const rotationSig = new Uint8Array(16).fill(9);
+		const rotationSigners = [mkMember(0), mkMember(1)];
+		const rotated = [mkMember(5), mkMember(6), mkMember(2), mkMember(3)]; // first k − x changes → republish
+		const cert = await pub.onStabilized(snapshot(rotated), 1_100, { prevEpoch, rotationSig, rotationSigners });
+		expect(cert, 'republished on a first-(k − x) change').to.not.be.undefined;
+		expect(published).to.have.length(2);
+		expect(published[1]!.prevEpoch).to.equal(bytesToB64url(prevEpoch));
+		expect(published[1]!.rotationSig).to.equal(bytesToB64url(rotationSig));
+		expect(published[1]!.rotationSigners).to.deep.equal(rotationSigners.map(bytesToB64url));
+	});
+});
+
+// --- Trust anchoring: a self-consistent cert must also be anchored (trust root / direct anchor / chain) ---
+
+/** Adversary keyset — a self-consistent cert over these proves nothing about who owns the coord. */
+const ADV = Array.from({ length: 16 }, (_, i) => sha256(new TextEncoder().encode(`adversary-${i}`)).slice(0, 16));
+/** A second legitimate keyset, used as the *successor* cohort in an epoch rotation. */
+const ROTATED = Array.from({ length: 16 }, (_, i) => sha256(new TextEncoder().encode(`rotated-${i}`)).slice(0, 16));
+const EPOCH_N = sha256(new TextEncoder().encode('epoch-n')).slice(0, 32);
+const EPOCH_N1 = sha256(new TextEncoder().encode('epoch-n+1')).slice(0, 32);
+
+/** Build a self-consistent cert over an explicit coord/epoch/member set, optionally carrying a rotation attestation. */
+function buildCertOver(opts: {
+	coord?: Uint8Array;
+	epoch: Uint8Array;
+	members: Uint8Array[];
+	stabilizedAt?: number;
+	rotation?: { prevEpoch: Uint8Array; rotationSig: Uint8Array; rotationSigners: Uint8Array[] };
+}): MembershipCertV1 {
+	const membersB64 = opts.members.map(bytesToB64url);
+	const signable = {
+		cohortCoord: bytesToB64url(opts.coord ?? COORD),
+		cohortEpoch: bytesToB64url(opts.epoch),
+		members: membersB64,
+		stabilizedAt: opts.stabilizedAt ?? 1_000,
+	};
+	const cert: MembershipCertV1 = {
+		v: 1,
+		...signable,
+		thresholdSig: bytesToB64url(sigFor(membershipCertSigningPayload(signable))),
+		signers: membersB64.slice(0, MIN_SIGS),
+	};
+	if (opts.rotation !== undefined) {
+		cert.prevEpoch = bytesToB64url(opts.rotation.prevEpoch);
+		cert.rotationSig = bytesToB64url(opts.rotation.rotationSig);
+		cert.rotationSigners = opts.rotation.rotationSigners.map(bytesToB64url);
+	}
+	return cert;
+}
+
+/** A predecessor cohort's threshold signature over the successor cert's signing payload (the rotation proof). */
+function rotationSigOver(successor: MembershipCertV1): Uint8Array {
+	const { v: _v, thresholdSig: _t, signers: _s, prevEpoch: _p, rotationSig: _r, rotationSigners: _rs, ...signable } = successor;
+	return sigFor(membershipCertSigningPayload(signable));
+}
+
+/** A constant-verdict trust anchor (models a node with / without local authority for the coord). */
+function constAnchor(verdict: TrustAnchorVerdict): IMembershipTrustAnchor {
+	return { directAnchor: () => verdict };
+}
+
+/** A membership source whose `fetch()` returns a fixed sequence of encoded certs (for multi-refetch tests). */
+class QueueSource implements IMembershipSource {
+	currentCalls = 0;
+	fetchCalls = 0;
+	constructor(private readonly fetches: Array<Uint8Array | undefined>) {}
+	async current(_coord: RingCoord): Promise<Uint8Array | undefined> {
+		this.currentCalls++;
+		return undefined;
+	}
+	async fetch(_coord: RingCoord): Promise<Uint8Array | undefined> {
+		this.fetchCalls++;
+		return this.fetches.shift();
+	}
+}
+
+const sign = (payload: Uint8Array): Uint8Array => sigFor(payload);
+const advSignersFirstKx = ADV.slice(0, MIN_SIGS);
+/** A generic message payload; the cohort binding is carried by the `signers`, not this payload. */
+const MSG = new TextEncoder().encode('cohort-message');
+
+describe('cohort-topic / membership trust anchoring', () => {
+	const signer = createCohortSigner(crypto());
+
+	function makeVerifier(source: MockSource, extra?: { anchor?: IMembershipTrustAnchor; trustRoots?: readonly TrustRoot[] }) {
+		const router = createMembershipSourceRouter({ committed: source, fret: source });
+		return createMembershipVerifier({ signer, router, anchor: extra?.anchor, trustRoots: extra?.trustRoots });
+	}
+
+	it('rejects a forged unrelated-keyset cert when the direct anchor says "rejected" (headline security property)', async () => {
+		const forged = buildCertOver({ epoch: EPOCH, members: ADV }); // self-consistent over an adversary keyset
+		const source = new MockSource(encodeCohortMessage(forged), encodeCohortMessage(forged));
+		const v = makeVerifier(source, { anchor: constAnchor('rejected') });
+		// The message is genuinely signed by the forged cohort — it would pass were the cert believed.
+		const r = await v.verifyMessage(advSignersFirstKx, COORD, 2, MSG, sign(MSG));
+		expect(r).to.equal('untrusted');
+	});
+
+	it('accepts a cert the direct anchor vouches for ("anchored")', async () => {
+		const source = new MockSource(encodeCohortMessage(GOOD));
+		const v = makeVerifier(source, { anchor: constAnchor('anchored') });
+		const r = await v.verifyMessage(MESSAGE_SIGNERS, COORD, 2, PAYLOAD, SIG);
+		expect(r).to.equal('verified');
+	});
+
+	it('TOFU-accepts a self-consistent cert on an "unknown" coord (no regression where nothing can anchor)', async () => {
+		const source = new MockSource(encodeCohortMessage(GOOD));
+		const v = makeVerifier(source, { anchor: constAnchor('unknown') });
+		const r = await v.verifyMessage(MESSAGE_SIGNERS, COORD, 2, PAYLOAD, SIG);
+		expect(r).to.equal('verified');
+	});
+
+	it('a "rejected" verdict overrides the TOFU fallback that an "unknown" verdict would allow', async () => {
+		const forged = buildCertOver({ epoch: EPOCH, members: ADV });
+		// Same forged cert + same forged-but-valid message; only the anchor verdict differs.
+		const tofu = makeVerifier(new MockSource(encodeCohortMessage(forged)), { anchor: constAnchor('unknown') });
+		expect(await tofu.verifyMessage(advSignersFirstKx, COORD, 2, MSG, sign(MSG)), 'unknown → TOFU accepts').to.equal('verified');
+
+		const rejected = makeVerifier(new MockSource(encodeCohortMessage(forged), encodeCohortMessage(forged)), { anchor: constAnchor('rejected') });
+		expect(await rejected.verifyMessage(advSignersFirstKx, COORD, 2, MSG, sign(MSG)), 'rejected → forgery dropped').to.equal('untrusted');
+	});
+
+	it('a legit epoch rotation inherits trust via the attestation chain (anchor "unknown")', async () => {
+		const predecessor = buildCertOver({ epoch: EPOCH_N, members: MEMBERS });
+		const successor = buildCertOver({ epoch: EPOCH_N1, members: ROTATED, rotation: { prevEpoch: EPOCH_N, rotationSig: new Uint8Array(0), rotationSigners: MEMBERS.slice(0, MIN_SIGS) } });
+		// The predecessor cohort signs the successor's payload — the proof a real rotation carries.
+		successor.rotationSig = bytesToB64url(rotationSigOver(successor));
+
+		const source = new MockSource(undefined, encodeCohortMessage(successor));
+		const v = makeVerifier(source, { anchor: constAnchor('unknown') });
+		v.cache(predecessor); // the node trusts a cert it itself published → a valid chain anchor
+
+		const rotatedSigners = ROTATED.slice(0, MIN_SIGS);
+		const r = await v.verifyMessage(rotatedSigners, COORD, 2, MSG, sign(MSG));
+		expect(r).to.equal('verified');
+	});
+
+	it('rejects a forged rotation whose attestation is signed by the wrong (non-predecessor) keys', async () => {
+		const predecessor = buildCertOver({ epoch: EPOCH_N, members: MEMBERS });
+		// Adversary mints a successor over its own keyset, signing the attestation with its OWN keys (∉ predecessor).
+		const forged = buildCertOver({ epoch: EPOCH_N1, members: ADV, rotation: { prevEpoch: EPOCH_N, rotationSig: new Uint8Array(0), rotationSigners: ADV.slice(0, MIN_SIGS) } });
+		forged.rotationSig = bytesToB64url(rotationSigOver(forged));
+
+		const source = new MockSource(undefined, encodeCohortMessage(forged));
+		const v = makeVerifier(source, { anchor: constAnchor('unknown') });
+		v.cache(predecessor); // trusted predecessor → the coord is trust-established, so TOFU cannot rescue the forgery
+
+		const r = await v.verifyMessage(advSignersFirstKx, COORD, 2, MSG, sign(MSG));
+		expect(r).to.equal('untrusted');
+	});
+
+	it('the chain requires a *trusted* predecessor: a merely TOFU-cached predecessor cannot anchor a successor', async () => {
+		// Same forged successor as above, but the predecessor reaches the cache via TOFU (source), not `cache`.
+		const predecessor = buildCertOver({ epoch: EPOCH_N, members: MEMBERS });
+		const forged = buildCertOver({ epoch: EPOCH_N1, members: ADV, rotation: { prevEpoch: EPOCH_N, rotationSig: new Uint8Array(0), rotationSigners: ADV.slice(0, MIN_SIGS) } });
+		forged.rotationSig = bytesToB64url(rotationSigOver(forged));
+
+		const source = new MockSource(encodeCohortMessage(predecessor), encodeCohortMessage(forged));
+		const v = makeVerifier(source, { anchor: constAnchor('unknown') });
+
+		// First, the predecessor is observed from the source → TOFU-cached (NOT trusted).
+		expect(await v.verifyMessage(MESSAGE_SIGNERS, COORD, 2, PAYLOAD, SIG), 'predecessor TOFU-accepted').to.equal('verified');
+
+		// The forged successor's chain step is rejected (predecessor not trusted); because the coord was only
+		// ever TOFU'd (never trust-established), it stays in the interim-TOFU regime — the documented limit —
+		// rather than being trust-locked. Contrast the previous test, where a *trusted* predecessor causes the
+		// identical forgery to be rejected. The trust-anchor binding (db-p2p) is what closes this TOFU gap.
+		expect(await v.verifyMessage(advSignersFirstKx, COORD, 2, MSG, sign(MSG)), 'forgery not chain-trusted; coord stays TOFU').to.equal('verified');
+	});
+
+	it('a chain-trusted successor itself becomes a trusted anchor for the next rotation', async () => {
+		const predecessor = buildCertOver({ epoch: EPOCH_N, members: MEMBERS });
+		const successor = buildCertOver({ epoch: EPOCH_N1, members: ROTATED, rotation: { prevEpoch: EPOCH_N, rotationSig: new Uint8Array(0), rotationSigners: MEMBERS.slice(0, MIN_SIGS) } });
+		successor.rotationSig = bytesToB64url(rotationSigOver(successor));
+		// A forged grandchild claiming to rotate from the (now trusted) successor, but signed by adversary keys.
+		const forgedGrandchild = buildCertOver({ epoch: EPOCH, members: ADV, rotation: { prevEpoch: EPOCH_N1, rotationSig: new Uint8Array(0), rotationSigners: ADV.slice(0, MIN_SIGS) } });
+		forgedGrandchild.rotationSig = bytesToB64url(rotationSigOver(forgedGrandchild));
+
+		// fetch() yields the successor on the first refetch, then the forged grandchild on the second.
+		const source = new QueueSource([encodeCohortMessage(successor), encodeCohortMessage(forgedGrandchild)]);
+		const v = makeVerifier(source, { anchor: constAnchor('unknown') });
+		v.cache(predecessor);
+
+		const rotatedSigners = ROTATED.slice(0, MIN_SIGS);
+		expect(await v.verifyMessage(rotatedSigners, COORD, 2, MSG, sign(MSG)), 'successor chain-verified').to.equal('verified');
+
+		// The successor is now trusted-cached, so the coord is trust-established: the forged grandchild's bad
+		// attestation cannot launder it in (its signers are not the successor's, and the locked coord refuses
+		// the un-anchored TOFU downgrade).
+		expect(await v.verifyMessage(advSignersFirstKx, COORD, 2, MSG, sign(MSG)), 'grandchild rejected — successor became a trusted anchor').to.equal('untrusted');
+	});
+
+	it('trust-root match is by (coord, epoch, member-set) and is checked before the direct anchor', async () => {
+		const roots: TrustRoot[] = [{ coord: COORD, epoch: EPOCH, members: MEMBERS }];
+		// A genesis cert matching the root is trusted even though the anchor would "reject" it (root precedes anchor).
+		const genesis = buildCertOver({ epoch: EPOCH, members: MEMBERS });
+		const v1 = makeVerifier(new MockSource(encodeCohortMessage(genesis)), { anchor: constAnchor('rejected'), trustRoots: roots });
+		expect(await v1.verifyMessage(MESSAGE_SIGNERS, COORD, 2, PAYLOAD, SIG), 'root cert trusted ahead of the anchor').to.equal('verified');
+
+		// Same genesis coord+epoch but a swapped keyset is NOT a root → the "rejected" anchor drops it.
+		const swapped = buildCertOver({ epoch: EPOCH, members: ADV });
+		const v2 = makeVerifier(new MockSource(encodeCohortMessage(swapped), encodeCohortMessage(swapped)), { anchor: constAnchor('rejected'), trustRoots: roots });
+		expect(await v2.verifyMessage(advSignersFirstKx, COORD, 2, MSG, sign(MSG)), 'swapped keyset is not a root').to.equal('untrusted');
+	});
+
+	it('rejects a self-referential rotation (prevEpoch === cohortEpoch)', async () => {
+		const predecessor = buildCertOver({ epoch: EPOCH_N, members: MEMBERS });
+		const selfRef = buildCertOver({ epoch: EPOCH_N1, members: ADV, rotation: { prevEpoch: EPOCH_N1, rotationSig: new Uint8Array(0), rotationSigners: ADV.slice(0, MIN_SIGS) } });
+		selfRef.rotationSig = bytesToB64url(rotationSigOver(selfRef));
+
+		const source = new MockSource(undefined, encodeCohortMessage(selfRef));
+		const v = makeVerifier(source, { anchor: constAnchor('unknown') });
+		v.cache(predecessor); // trust-established coord → a cert that cannot rotate from itself is rejected
+
+		const r = await v.verifyMessage(advSignersFirstKx, COORD, 2, MSG, sign(MSG));
+		expect(r).to.equal('untrusted');
 	});
 });

@@ -446,5 +446,28 @@ export function validateMembershipCertV1(value: unknown): MembershipCertV1 {
 	if (attestation !== undefined) {
 		out.fretAttestation = b64urlField(attestation, "fretAttestation", what);
 	}
+	validateRotationAttestation(obj, out, what);
 	return out;
+}
+
+/**
+ * Validate the optional rotation attestation as an all-or-nothing group: either all three of
+ * `prevEpoch`/`rotationSig`/`rotationSigners` are present (and well-formed) or all are absent. A
+ * partial set is a {@link CohortWireError}. `rotationSigners` is validated only as a string array (its
+ * elements are decoded per-element later, mirroring `signers`).
+ */
+function validateRotationAttestation(obj: Record<string, unknown>, out: MembershipCertV1, what: string): void {
+	const prevEpoch = optString(obj, "prevEpoch", what);
+	const rotationSig = optString(obj, "rotationSig", what);
+	const rotationSigners = optStringArray(obj, "rotationSigners", what);
+	const presentCount = [prevEpoch, rotationSig, rotationSigners].filter((v) => v !== undefined).length;
+	if (presentCount === 0) {
+		return;
+	}
+	if (presentCount !== 3) {
+		fail(`${what}: rotation attestation requires all of prevEpoch, rotationSig, rotationSigners — or none`);
+	}
+	out.prevEpoch = b64urlField(prevEpoch!, "prevEpoch", what);
+	out.rotationSig = b64urlField(rotationSig!, "rotationSig", what);
+	out.rotationSigners = rotationSigners!;
 }

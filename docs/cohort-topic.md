@@ -489,15 +489,33 @@ A participant verifies a notification or threshold-signed message as follows:
 > and the signature verifies (the `k − x` threshold logic of
 > [`sig/threshold.ts`](../packages/db-core/src/cohort-topic/sig/threshold.ts)). On failure against a
 > cached/stale cert it re-fetches the cert from any cohort member **exactly once** and retries; still
-> failing → the message is **untrusted**. A freshly fetched cert is itself accepted only if its own
-> threshold signature is a self-consistent quorum of its members (full chain-to-genesis validation is
-> §Bootstrapping trust, below, and out of scope of the per-message check). The threshold-signature
-> primitive is reused from FRET's `minSigs = k − x` cohort-signature assembly via an injected port
-> (db-core never imports FRET).
+> failing → the message is **untrusted**. A freshly fetched cert is accepted only if it is
+> self-consistent (its own threshold signature is a quorum of its members) **and** trust-anchored — see
+> §Bootstrapping trust, below, for the trust gate that distinguishes a legitimate cohort from a
+> self-consistent forgery. The threshold-signature primitive is reused from FRET's `minSigs = k − x`
+> cohort-signature assembly via an injected port (db-core never imports FRET).
 
 ### Bootstrapping trust
 
 A participant joining the network gets its initial trust roots (the cohorts responsible for genesis-block-related topics) from any peer it dials, validated against the genesis block hash known out-of-band. From there, membership certificates form a chain of attestations.
+
+**Why self-consistency is not enough.** A `MembershipCertV1` carries its own threshold signature over its own members, so "self-consistent" proves only that some `≥ minSigs` key set signed the cert — *not* that that key set is the legitimate cohort for the coord. An adversary controlling `k − x` keys could mint a self-consistent cert over a coord it does not own and have it pass per-message verification. The trust gate closes that gap: a (re)fetched cert is believed only if it is self-consistent **and** anchored.
+
+**The trust gate (implemented in [`membership/verifier.ts`](../packages/db-core/src/cohort-topic/membership/verifier.ts)).** A cert's `coord → members` binding earns trust by **any one** of:
+
+1. **Trust root** — `(coord, epoch, member-set)` is in the out-of-band-seeded `TrustRoot` set (the genesis cohorts, validated against the genesis block hash before seeding). The base case of every chain; checked before the direct anchor, so a configured root is authoritative.
+2. **Direct anchor** — an injected `IMembershipTrustAnchor` (`ports.ts`) judges, from a source the node *directly* trusts, whether the members are authoritative for the coord at that tier. The verdict is three-valued: `"anchored"` (vouched → trusted), `"rejected"` (contradicted → **forgery, fatal even if self-consistent**), or `"unknown"` (no local authority → fall through). The direct anchor is tier/transport-specific (FRET ring agreement for T2/T3, the tx-log commit certificate for T0/T1) and is bound in db-p2p — **db-core never imports FRET**. The db-core default `noAuthorityTrustAnchor` returns `"unknown"` for every coord.
+3. **Attestation chain (epoch rotation)** — a cert may carry a rotation attestation (`prevEpoch` / `rotationSig` / `rotationSigners`, all three or none): the *predecessor* cohort's threshold signature over **this** cert's signing payload. If the node already holds a **trusted** cert for the same coord whose epoch is `prevEpoch`, and that predecessor's members form a `≥ minSigs` quorum over the successor payload, the successor inherits trust. This is what distinguishes a legitimate rotation (the prior cohort signed off) from a forgery. Only a *trusted* cert may anchor a successor — a cert that only reached the cache via the TOFU fallback (below) never launders trust into a rotation. The attestation is **not** part of `membershipCertSigningPayload` (it signs *over* it), so legacy certs without it still decode.
+
+> **Why no monotonic-epoch / rollback gate.** `cohortEpoch = H(sorted members)` is content-derived, not an ordered counter, so epochs are unorderable hash ids and the chain is a hash-linked attestation DAG (`prevEpoch` is a hash pointer), not a height-ordered ledger. Replaying an older legitimately-signed cert is a **freshness** concern (stale membership), already covered by `stabilizedAt` + the one-refetch tolerance — not a trust-gate concern.
+
+**Interim TOFU fallback and its documented limits.** For a coord the node cannot anchor — the direct anchor returns `"unknown"`, there is no trust root, and no valid chain — and that holds **no trusted cert yet**, the verifier falls back to trust-on-first-use of any self-consistent cert. This is identical to the pre-gate behavior, so there is **strictly no regression** on coords no node can verify today. The security improvement is bounded and explicit:
+
+- **FRET-covered coords** (the host / `promote`-handler path, which verifies against a coord the node serves): once db-p2p binds the FRET-ring anchor, a forged cert from an unrelated keyset is **`"rejected"`** — closing the amplification-exposed attack. (Binding: `cohort-topic-trust-anchor-fret-binding`.)
+- **Epoch rotations**: once a coord holds a *trusted* cert, the attestation chain governs its successors. An un-anchored cert for an already-trusted coord is rejected (no silent TOFU downgrade), so a forged rotation off a trusted predecessor is dropped. A coord that was only ever TOFU'd stays in the TOFU regime (a TOFU predecessor confers no trust), which is the documented limit until the direct anchor covers it.
+- **Distant first-sight T2/T3** and **all T0/T1** remain TOFU for now — there is no transferable FRET stabilization proof (tracked in `cohort-topic-trust-anchor-fret-stabilization-proof`) and the committed-index binding does not exist yet (`cohort-topic-trust-anchor-txlog-committed-binding`).
+
+There is deliberately **no** hard "reject on `"unknown"`" mode: the three-valued verdict already gives FRET-covered nodes their teeth (`"rejected"`) without a global flag that would break distant verifiers.
 
 ---
 

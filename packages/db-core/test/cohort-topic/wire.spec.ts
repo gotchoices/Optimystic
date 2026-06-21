@@ -323,6 +323,55 @@ describe('cohort-topic wire', () => {
 		});
 	});
 
+	describe('MembershipCert rotation attestation', () => {
+		const withRotation = (): MembershipCertV1 => ({
+			...sampleMembershipCert(),
+			prevEpoch: b64(32, 30),
+			rotationSig: b64(64, 31),
+			rotationSigners: ['peer-a', 'peer-b'],
+		});
+
+		it('round-trips a cert carrying a full rotation attestation', () => {
+			const msg = withRotation();
+			const decoded = decodeMembershipCertV1(encodeCohortMessage(msg));
+			expect(decoded).to.deep.equal(msg);
+		});
+
+		it('decodes a legacy cert (no rotation fields) to an object lacking them', () => {
+			const decoded = decodeMembershipCertV1(encodeCohortMessage(sampleMembershipCert()));
+			expect(decoded).to.not.have.property('prevEpoch');
+			expect(decoded).to.not.have.property('rotationSig');
+			expect(decoded).to.not.have.property('rotationSigners');
+		});
+
+		it('rejects a partial rotation attestation (all-or-nothing)', () => {
+			const partials: Array<Partial<MembershipCertV1>> = [
+				{ prevEpoch: b64(32, 30) },
+				{ rotationSig: b64(64, 31) },
+				{ rotationSigners: ['peer-a', 'peer-b'] },
+				{ prevEpoch: b64(32, 30), rotationSig: b64(64, 31) }, // missing rotationSigners
+				{ prevEpoch: b64(32, 30), rotationSigners: ['peer-a'] }, // missing rotationSig
+				{ rotationSig: b64(64, 31), rotationSigners: ['peer-a'] }, // missing prevEpoch
+			];
+			for (const partial of partials) {
+				const frame = encodeCohortMessage({ ...sampleMembershipCert(), ...partial });
+				expect(() => decodeMembershipCertV1(frame), JSON.stringify(Object.keys(partial))).to.throw(CohortWireError, /rotation attestation/);
+			}
+		});
+
+		it('rejects a non-base64url prevEpoch / rotationSig', () => {
+			const badPrev = encodeCohortMessage({ ...withRotation(), prevEpoch: 'not base64url!!' });
+			expect(() => decodeMembershipCertV1(badPrev)).to.throw(CohortWireError, /base64url/);
+			const badSig = encodeCohortMessage({ ...withRotation(), rotationSig: 'not base64url!!' });
+			expect(() => decodeMembershipCertV1(badSig)).to.throw(CohortWireError, /base64url/);
+		});
+
+		it('rejects a non-array rotationSigners', () => {
+			const bad = encodeCohortMessage({ ...withRotation(), rotationSigners: 'peer-a' } as unknown as { v: 1 });
+			expect(() => decodeMembershipCertV1(bad)).to.throw(CohortWireError, /rotationSigners/);
+		});
+	});
+
 	describe('reply discriminant variants', () => {
 		it('round-trips a minimal no_state RegisterReply', () => {
 			const msg: RegisterReplyV1 = { v: 1, result: 'no_state' };

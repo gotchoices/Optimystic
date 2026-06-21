@@ -37,18 +37,36 @@ export interface CohortSnapshot {
 	fretAttestation?: Uint8Array;
 }
 
+/**
+ * A predecessor-cohort rotation attestation to attach to a fresh cert (an epoch rotation). The
+ * predecessor cohort threshold-signs the **successor** cert's `membershipCertSigningPayload`; that
+ * `(prevEpoch, rotationSig, rotationSigners)` triple lets a participant holding a trusted predecessor
+ * verify the rotation is legitimate. Producing this triple is the db-p2p ticket
+ * `cohort-topic-trust-anchor-rotation-production`; the publisher only attaches a provided one.
+ */
+export interface RotationAttestation {
+	/** Predecessor cohort epoch this cert rotates from (32 bytes). */
+	prevEpoch: Uint8Array;
+	/** Predecessor cohort's threshold signature over the successor cert's signing payload. */
+	rotationSig: Uint8Array;
+	/** Predecessor cohort signers that produced {@link rotationSig}; `>= minSigs`. */
+	rotationSigners: readonly Uint8Array[];
+}
+
 /** Cohort-side membership-cert publisher. */
 export interface MembershipCertPublisher {
 	/**
 	 * Drive publication on a stabilization event. Publishes (and returns the cert) when the first
 	 * `k − x` members changed since the last publish, or on the first call; otherwise returns `undefined`.
+	 * Pass `rotation` to attach a predecessor-cohort rotation attestation (an epoch rotation); omit it for
+	 * the default non-rotation publish (no rotation fields are emitted).
 	 */
-	onStabilized(snapshot: CohortSnapshot, now: number): Promise<MembershipCertV1 | undefined>;
+	onStabilized(snapshot: CohortSnapshot, now: number, rotation?: RotationAttestation): Promise<MembershipCertV1 | undefined>;
 	/**
 	 * Periodic tick. Re-publishes (and returns the cert) when `T_membership_refresh` has elapsed since
-	 * the last publish; otherwise returns `undefined`.
+	 * the last publish; otherwise returns `undefined`. Pass `rotation` to attach a rotation attestation.
 	 */
-	tick(snapshot: CohortSnapshot, now: number): Promise<MembershipCertV1 | undefined>;
+	tick(snapshot: CohortSnapshot, now: number, rotation?: RotationAttestation): Promise<MembershipCertV1 | undefined>;
 }
 
 export interface MembershipCertPublisherDeps {
@@ -71,27 +89,27 @@ class SigningMembershipCertPublisher implements MembershipCertPublisher {
 		this.minSigs = deps.minSigs ?? DEFAULT_MIN_SIGS;
 	}
 
-	async onStabilized(snapshot: CohortSnapshot, now: number): Promise<MembershipCertV1 | undefined> {
+	async onStabilized(snapshot: CohortSnapshot, now: number, rotation?: RotationAttestation): Promise<MembershipCertV1 | undefined> {
 		const sorted = this.sortedMembers(snapshot.members);
 		const firstKx = sorted.slice(0, this.minSigs).map(bytesToB64url);
 		if (this.lastFirstKx !== undefined && sameOrder(this.lastFirstKx, firstKx)) {
 			return undefined; // first k − x unchanged — no republish needed
 		}
-		return this.publish(snapshot, sorted, now);
+		return this.publish(snapshot, sorted, now, rotation);
 	}
 
-	async tick(snapshot: CohortSnapshot, now: number): Promise<MembershipCertV1 | undefined> {
+	async tick(snapshot: CohortSnapshot, now: number, rotation?: RotationAttestation): Promise<MembershipCertV1 | undefined> {
 		if (this.lastPublishedAt !== undefined && now - this.lastPublishedAt < this.refreshMs) {
 			return undefined;
 		}
-		return this.publish(snapshot, this.sortedMembers(snapshot.members), now);
+		return this.publish(snapshot, this.sortedMembers(snapshot.members), now, rotation);
 	}
 
 	private sortedMembers(members: readonly Uint8Array[]): Uint8Array[] {
 		return [...members].sort(compareBytes);
 	}
 
-	private async publish(snapshot: CohortSnapshot, sorted: Uint8Array[], now: number): Promise<MembershipCertV1> {
+	private async publish(snapshot: CohortSnapshot, sorted: Uint8Array[], now: number, rotation?: RotationAttestation): Promise<MembershipCertV1> {
 		const signable = {
 			cohortCoord: bytesToB64url(snapshot.coord),
 			cohortEpoch: bytesToB64url(snapshot.cohortEpoch),
@@ -107,6 +125,13 @@ class SigningMembershipCertPublisher implements MembershipCertPublisher {
 		};
 		if (snapshot.fretAttestation !== undefined) {
 			cert.fretAttestation = bytesToB64url(snapshot.fretAttestation);
+		}
+		// A rotation attestation (when given) signs *over* the cert's signing payload, so it is attached to the
+		// envelope after signing and is not part of `membershipCertSigningPayload`. Omitted → no rotation fields.
+		if (rotation !== undefined) {
+			cert.prevEpoch = bytesToB64url(rotation.prevEpoch);
+			cert.rotationSig = bytesToB64url(rotation.rotationSig);
+			cert.rotationSigners = rotation.rotationSigners.map(bytesToB64url);
 		}
 		this.deps.sink.publish(encodeCohortMessage(cert, this.deps.maxMessageBytes));
 		this.lastFirstKx = signable.members.slice(0, this.minSigs);

@@ -13,6 +13,8 @@
  * `cohort-topic-package-layering` for the authoritative layering rule.
  */
 
+import type { MembershipCertV1 } from "./wire/types.js";
+
 /**
  * Ring coordinate — SHA-256 truncated to the ring width `B` (see {@link IRingHash}). db-core
  * owns this type; db-p2p maps it onto FRET's coordinate type, ensuring the byte representation
@@ -85,6 +87,62 @@ export interface IMembershipPublishSink {
 export interface ISizeEstimator {
 	estimate(): { nEst: number; confidence: number };
 }
+
+/**
+ * Verdict on whether a {@link MembershipCertV1}'s `(cohortCoord → members)` binding is vouched by a
+ * source the verifying node *directly* trusts.
+ *
+ * - `"anchored"`  — the binding is vouched (e.g. matches FRET `assembleCohort(coord)`, or the
+ *   tx-log commit certificate). The cert is trusted on this basis.
+ * - `"rejected"`  — the binding is contradicted (a known-different keyset owns this coord). A
+ *   `"rejected"` verdict is **fatal**: the cert is a forgery and is rejected even if it is
+ *   internally self-consistent, overriding the interim TOFU fallback.
+ * - `"unknown"`   — this node has no local authority over the coord, so it cannot judge. The
+ *   verifier falls through to the attestation chain / interim TOFU fallback.
+ */
+export type TrustAnchorVerdict = "anchored" | "rejected" | "unknown";
+
+/**
+ * Direct (base-case) trust anchor for a {@link MembershipCertV1}'s `coord → keyset` binding.
+ *
+ * db-core owns the chain-of-attestations and trust-root logic; the **direct** anchor is
+ * tier/transport-specific (FRET ring agreement for T2/T3, tx-log commit certificate for T0/T1) and
+ * is therefore delegated through this port. db-p2p binds it; **db-core never imports FRET**. A node
+ * with no local authority for the coord returns `"unknown"` so the verifier falls through to the
+ * chain / interim fallback instead of breaking distant verification. See {@link noAuthorityTrustAnchor}
+ * for the db-core default (every coord `"unknown"`).
+ */
+export interface IMembershipTrustAnchor {
+	/** Judge, from a directly-trusted source, whether `cert.members` is authoritative for `cert.cohortCoord` at `tier`. */
+	directAnchor(cert: MembershipCertV1, tier: number): TrustAnchorVerdict;
+}
+
+/**
+ * An out-of-band-seeded trust root: the genesis-block-related cohorts a joining participant is told
+ * to trust (validated against the genesis block hash by the caller before seeding). A trust root is
+ * the base case of every attestation chain — a cert matching a root by `(coord, epoch, member-set)`
+ * is trusted directly. Byte fields are raw (the verifier compares them against the cert's base64url
+ * form internally).
+ */
+export interface TrustRoot {
+	/** Cohort coord (32 bytes). */
+	readonly coord: Uint8Array;
+	/** Cohort epoch (32 bytes) — required so a cert reusing a genesis coord with a swapped keyset is not a root. */
+	readonly epoch: Uint8Array;
+	/** Authoritative cohort members (any order; matched as a set). */
+	readonly members: readonly Uint8Array[];
+}
+
+/**
+ * The db-core default {@link IMembershipTrustAnchor}: it has no local authority over any coord, so it
+ * returns `"unknown"` for every cert. Existing verifier callers that inject no anchor get this, keeping
+ * the interim TOFU behavior (no regression) until db-p2p binds a real anchor.
+ */
+export const noAuthorityTrustAnchor: IMembershipTrustAnchor = {
+	directAnchor(_cert: MembershipCertV1, _tier: number): TrustAnchorVerdict {
+		return "unknown";
+	},
+};
 
 /**
  * Hash + ring math. db-core supplies its OWN SHA-256 (it already hashes logs and block ids);

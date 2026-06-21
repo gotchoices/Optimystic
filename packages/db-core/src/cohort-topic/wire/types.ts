@@ -280,6 +280,21 @@ export interface MembershipCertV1 {
 	signers: string[];
 	/** Optional FRET stabilization proof, base64url. */
 	fretAttestation?: string;
+	/**
+	 * Rotation attestation (epoch rotation). The three fields below are an all-or-nothing group: a cert
+	 * either carries a full attestation (all three present) or none (all absent). They let a successor
+	 * cohort inherit trust from its predecessor: the predecessor cohort threshold-signs **this** cert's
+	 * `membershipCertSigningPayload`, so a verifier holding a trusted predecessor at {@link prevEpoch} can
+	 * confirm the rotation is legitimate (the prior cohort signed off) rather than a forgery. The
+	 * attestation is **not** part of `membershipCertSigningPayload` (it signs *over* that payload), so the
+	 * signed image is unchanged and legacy certs (no rotation fields) still decode.
+	 */
+	/** Predecessor cohort epoch this cert rotates from (32 bytes, base64url). Present only on a rotation. */
+	prevEpoch?: string;
+	/** Predecessor cohort's threshold signature over THIS cert's `membershipCertSigningPayload`, base64url. */
+	rotationSig?: string;
+	/** Predecessor cohort signers (PeerIds, base64url) that produced {@link rotationSig}; `>= minSigs`. */
+	rotationSigners?: string[];
 }
 
 /** Discriminated union over every V1 message carried by the cohort-topic protocols. */
