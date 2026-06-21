@@ -24,9 +24,11 @@ import { buildReactivityMesh, type ReactivityMesh } from '../../src/testing/reac
 const range = (lo: number, hi: number): number[] => Array.from({ length: hi - lo + 1 }, (_v, i) => lo + i);
 
 describe('reactivity / mesh — tail rotation continuity', function () {
-	// Real-Ed25519 multi-cohort mesh: setup + round-trips are CPU-bound and run several seconds; give
+	// Real-Ed25519 multi-cohort mesh: setup + round-trips are CPU-bound. The first registration against a
+	// freshly-built mesh carries a large one-time cost (single-digit seconds in isolation) that grows as a
+	// full suite run accumulates load, so a single test can spend 10s+ in its opening subscribe alone. Give
 	// generous headroom over the 10s default so machine load doesn't tip a passing test into a timeout.
-	this.timeout(30_000);
+	this.timeout(60_000);
 	let rx: ReactivityMesh;
 	afterEach(async () => {
 		await rx?.stop();

@@ -24,9 +24,11 @@ import { Tier, bytesToB64url } from '@optimystic/db-core';
 import { buildReactivityMesh, type ReactivityMesh } from '../../src/testing/reactivity-mesh-harness.js';
 
 describe('reactivity / mesh — cold-to-hot growth + delivery', function () {
-	// Real-Ed25519 multi-cohort mesh: setup + round-trips are CPU-bound and run several seconds; give
+	// Real-Ed25519 multi-cohort mesh: setup + round-trips are CPU-bound. The first registration against a
+	// freshly-built mesh carries a large one-time cost (single-digit seconds in isolation) that grows as a
+	// full suite run accumulates load, so a single test can spend 10s+ in its opening subscribe alone. Give
 	// generous headroom over the 10s default so machine load doesn't tip a passing test into a timeout.
-	this.timeout(30_000);
+	this.timeout(60_000);
 	let rx: ReactivityMesh;
 	afterEach(async () => {
 		await rx?.stop();
@@ -93,13 +95,21 @@ describe('reactivity / mesh — cold-to-hot growth + delivery', function () {
 
 	it('[mock-tier] the tier-0 cohort promotes once subscribers cross cap_promote (the tree begins to form), and delivery still reaches all', async () => {
 		// Drive the cohort-side promotion decision with a lowered cap. The cohort-topic scale specs own the
-		// full multi-tier walk; here we assert reactivity subscribers crossing the cap trip a *real* promotion.
-		rx = await buildReactivityMesh({ nodeCount: 16, wantK: 8, capPromote: 4 });
+		// full multi-tier walk; here we assert reactivity subscribers reaching the cap trip a *real* promotion.
+		// The cap equals the subscriber count so the **last** subscriber to land is the one that crosses
+		// `cap_promote`: every subscribe is evaluated while the cohort is still cold (`isPromoted === false` is a
+		// synchronous read taken before that final accept fires the fire-and-forget promotion), so all of them
+		// admit at tier-0. A cap *below* the batch size cannot serve this milestone — once the cohort promotes
+		// mid-batch it answers `Promoted(d+1)` and the surplus subscribers walk toward a tier-1 forwarder cohort
+		// the single-tier-0 mesh never instantiates (they would `CohortBackoff`). The post-promotion redirect of
+		// *surplus* arrivals is the cohort-topic scale spec's concern (`cohort-topic-scale-lifecycle`).
+		const SUBSCRIBERS = [1, 2, 3, 4, 5, 6];
+		rx = await buildReactivityMesh({ nodeCount: 16, wantK: 8, capPromote: SUBSCRIBERS.length });
 		await rx.registerCollection('hot');
 		expect(rx.isPromoted('hot'), 'a cold cohort has not promoted').to.equal(false);
 
-		// More than cap_promote (4) reactivity subscribers attach at the root, crossing the threshold.
-		const subs = await Promise.all([1, 2, 3, 4, 5, 6].map((n) => rx.subscribe(n, 'hot')));
+		// Subscribers attach at the root until the count reaches `cap_promote`, crossing the threshold.
+		const subs = await Promise.all(SUBSCRIBERS.map((n) => rx.subscribe(n, 'hot')));
 		for (const s of subs) {
 			// Tier.T3 is the *reactivity application tier* every subscribe registers under — not a tree depth.
 			expect(s.registration!.tier, 'each reactivity subscribe admits at the reactivity tier T3').to.equal(Tier.T3);

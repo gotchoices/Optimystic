@@ -41,6 +41,7 @@ import {
 	renewSigningPayload,
 	type CohortGossipV1,
 	type NodeProfile,
+	type PromotionConfig,
 	type RegisterResult,
 	type RegisterV1,
 	type RenewV1,
@@ -245,6 +246,12 @@ export interface MeshOptions {
 	readonly minSigs: number;
 	/** Lowered `cap_promote` to drive promotion with a small participant count (live-tier / promotion suites). */
 	readonly capPromote?: number;
+	/**
+	 * Extra {@link PromotionConfig} fields merged onto every node's lifecycle (alongside {@link capPromote}).
+	 * Lets a virtual-time harness neutralise the wall-clock-rate heuristics (e.g. `tPromoteLookaheadMs: 0`
+	 * to disable slope-based pre-promotion, which is meaningless when `now` is a fixed virtual instant).
+	 */
+	readonly promotion?: Partial<PromotionConfig>;
 	/** Peers that reject inbound dials (crash / unreachable). They stay in FRET assembly (epoch unchanged). */
 	readonly downNodes?: readonly string[];
 	/** FRET network-size estimate (drives the walk start tier `d_max`). Default 256 → `d_max = 1`. */
@@ -396,7 +403,9 @@ export async function buildMesh(members: Member[], opts: MeshOptions): Promise<C
 			profile: profileAt(opts.profiles, index),
 			// Park the periodic driver by default; tests pump gossip / membership / promotion deterministically.
 			gossipIntervalMs: opts.gossipIntervalMs ?? 3_600_000,
-			...(opts.capPromote === undefined ? {} : { promotion: { capPromote: opts.capPromote } }),
+			...((opts.capPromote === undefined && opts.promotion === undefined)
+				? {}
+				: { promotion: { ...(opts.capPromote === undefined ? {} : { capPromote: opts.capPromote }), ...(opts.promotion ?? {}) } }),
 			...(opts.antiDos === undefined ? {} : { antiDos: opts.antiDos }),
 		});
 		mesh.nodes.push({ member, node, host });

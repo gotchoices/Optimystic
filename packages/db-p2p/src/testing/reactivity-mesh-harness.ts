@@ -295,6 +295,14 @@ export class ReactivityMesh {
 			// Single-tier-0 by default (same rationale as the matchmaking harness): test artifacts register
 			// many subscribers within a few ms, which would otherwise trip the pre-promotion slope predictor.
 			capPromote: opts.capPromote ?? 1_000_000,
+			// This mesh is virtual-time: a subscribe batch lands at one fixed virtual instant, but the cohort
+			// host stamps each register with real `Date.now()`. The growth-slope pre-promotion is a
+			// wall-clock-rate heuristic, so those real-time-separated samples make it fire *before* the
+			// `cap_promote` count is reached (redirecting the rest of the batch up a tier-1 tree the
+			// single-tier-0 milestone never instantiates). Disable slope here so promotion is driven purely by
+			// the count threshold — the same posture the cohort-topic scale specs get by stamping a constant
+			// `now` on every `handleRegister`. The slope heuristic itself is covered by the promotion unit specs.
+			promotion: { tPromoteLookaheadMs: 0 },
 			// Permissive register ceiling — the harness re-probes a cohort across many subscribes/commits.
 			antiDos: { rateLimiter: { ratePerWindow: 1_000_000 } },
 			...(opts.profiles === undefined ? {} : { profiles: opts.profiles }),
