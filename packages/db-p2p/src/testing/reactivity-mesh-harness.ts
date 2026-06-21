@@ -304,7 +304,16 @@ export class ReactivityMesh {
 			// `now` on every `handleRegister`. The slope heuristic itself is covered by the promotion unit specs.
 			promotion: { tPromoteLookaheadMs: 0 },
 			// Permissive register ceiling — the harness re-probes a cohort across many subscribes/commits.
-			antiDos: { rateLimiter: { ratePerWindow: 1_000_000 } },
+			// Also widen the replay-guard freshness window. The cohort host stamps each register with real
+			// `Date.now()` and evaluates the anti-DoS freshness gate against real `Date.now()` at processing
+			// time, but this mesh drives the real participant walk in-process: under full-suite CPU load the
+			// event loop can stall for far longer than the production 60 s staleness window between a register
+			// being stamped and the deciding cohort processing it. A stalled-but-legitimate register then
+			// trips the freshness gate (`no_state`), the cold-start bootstrap walk exhausts, and `register`
+			// throws `CohortBackoffError` — a pure load-induced harness flake. The wall-clock freshness
+			// defense is meaningless here (same posture as the disabled rate limiter above), so make the
+			// window effectively unbounded so test-induced stalls never read as stale/future replays.
+			antiDos: { rateLimiter: { ratePerWindow: 1_000_000 }, replayGuard: { maxAgeMs: 86_400_000, maxFutureSkewMs: 86_400_000 } },
 			...(opts.profiles === undefined ? {} : { profiles: opts.profiles }),
 		};
 		const mesh = await buildMesh(members, meshOpts);
