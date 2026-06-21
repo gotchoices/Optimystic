@@ -261,10 +261,13 @@ export interface CohortTopicAntiDosOptions {
 	readonly deprioritizeThreshold?: number;
 	/**
 	 * Existence view backing the **signed parent-reference** evidence path (`verifyParentReference`). A test
-	 * seam: when supplied it overrides the host default (built from the FRET membership cache + addressing +
-	 * the optional {@link CohortTopicHostOptions.committedParentTopicReader}). Supplying it (or any other
-	 * `bootstrapEvidence`/`reputation` override) makes the gate **configured**, so the real parent-reference
-	 * verifier runs. See {@link createDefaultParentTopicView} / {@link createParentReferenceVerifier}.
+	 * seam: when supplied it overrides *which* existence view the real verifier consults (the host default is
+	 * built from the FRET membership cache + addressing + the optional
+	 * {@link CohortTopicHostOptions.committedParentTopicReader}). It does **not** by itself make the gate
+	 * "configured" — only a `reputation` view or a `bootstrapEvidence` override flips that (see
+	 * {@link createBootstrapEvidencePolicy}); an unconfigured host stays permissive and never consults this
+	 * view. Pair it with `reputation`/`bootstrapEvidence` to exercise the real parent-reference verifier. See
+	 * {@link createDefaultParentTopicView} / {@link createParentReferenceVerifier}.
 	 */
 	readonly parentTopicView?: BootstrapParentTopicView;
 }

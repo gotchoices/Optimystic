@@ -2,6 +2,7 @@ import { expect } from 'chai';
 import { sha256 } from '@noble/hashes/sha2.js';
 import {
 	bootstrapBoundImage,
+	parentRefSigningImage,
 	powPreimage,
 	meetsDifficulty,
 	DEFAULT_POW_DIFFICULTY_BITS,
@@ -137,6 +138,35 @@ describe('cohort-topic / bootstrap-evidence envelope', () => {
 		it('emits the documented canonical array shape', () => {
 			const arr = JSON.parse(td.decode(bootstrapBoundImage(boundBase)));
 			expect(arr).to.deep.equal(['BootstrapEvidenceV1', boundBase.topicId, boundBase.tier, boundBase.participantCoord, boundBase.timestamp]);
+		});
+	});
+
+	describe('parentRefSigningImage (signed parent-reference binding)', () => {
+		const PARENT = bytesToB64url(bytes('bee-parent', 32));
+		const PARENT2 = bytesToB64url(bytes('bee-parent-2', 32));
+		const image = (f: BootstrapBoundFields, parent: string): string => bytesToB64url(parentRefSigningImage(f, parent));
+
+		it('is stable for the same tuple + parent', () => {
+			expect(image(boundBase, PARENT)).to.equal(image({ ...boundBase }, PARENT));
+		});
+
+		it('differs across topicId / tier / participantCoord / timestamp / parentTopicId', () => {
+			const base = image(boundBase, PARENT);
+			expect(image({ ...boundBase, topicId: bytesToB64url(TOPIC2) }, PARENT), 'topicId').to.not.equal(base);
+			expect(image({ ...boundBase, tier: 1 }, PARENT), 'tier').to.not.equal(base);
+			expect(image({ ...boundBase, participantCoord: bytesToB64url(COORD2) }, PARENT), 'participantCoord').to.not.equal(base);
+			expect(image({ ...boundBase, timestamp: boundBase.timestamp + 1 }, PARENT), 'timestamp').to.not.equal(base);
+			expect(image(boundBase, PARENT2), 'parentTopicId').to.not.equal(base);
+		});
+
+		it('is domain-separated from bootstrapBoundImage (distinct tag) so neither signature can be replayed onto the other path', () => {
+			expect(bytesToB64url(parentRefSigningImage(boundBase, PARENT)))
+				.to.not.equal(bytesToB64url(bootstrapBoundImage(boundBase)));
+		});
+
+		it('emits the documented canonical array shape', () => {
+			const arr = JSON.parse(td.decode(parentRefSigningImage(boundBase, PARENT)));
+			expect(arr).to.deep.equal(['BootstrapParentRefV1', boundBase.topicId, boundBase.tier, boundBase.participantCoord, boundBase.timestamp, PARENT]);
 		});
 	});
 

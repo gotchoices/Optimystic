@@ -29,11 +29,11 @@ export interface PowEvidenceV1 {
 	nonce: string;
 }
 
-/** Signed parent-topic reference (all tiers). Both base64url; `sig` is over {@link bootstrapBoundImage}. */
+/** Signed parent-topic reference (all tiers). Both base64url; `sig` is over {@link parentRefSigningImage}. */
 export interface ParentRefEvidenceV1 {
 	/** The committed parent topic id, base64url. */
 	parentTopicId: string;
-	/** Signature over the bound image, base64url. */
+	/** Participant peer-key signature over {@link parentRefSigningImage} (the bound tuple extended with `parentTopicId`), base64url. */
 	sig: string;
 }
 
