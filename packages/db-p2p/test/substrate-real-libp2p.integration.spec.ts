@@ -4,7 +4,7 @@ import type { PrivateKey, PeerId } from '@libp2p/interface';
 import { generateKeyPair } from '@libp2p/crypto/keys';
 import { peerIdFromPrivateKey } from '@libp2p/peer-id';
 import { multiaddr } from '@multiformats/multiaddr';
-import { hashPeerId } from 'p2p-fret';
+import { hashPeerId, type FretService } from 'p2p-fret';
 import {
 	createTierAddressing,
 	createSlotAssigner,
@@ -47,6 +47,8 @@ import { signPeer, verifyPeerSig } from '../src/cohort-topic/peer-sig.js';
 import { sendOneWay, requestResponse, DEFAULT_STREAM_MAX_BYTES } from '../src/cohort-topic/stream-util.js';
 import { DEFAULT_COHORT_TOPIC_PROTOCOLS } from '../src/cohort-topic/protocols.js';
 import { DEFAULT_MATCHMAKING_PROTOCOLS } from '../src/matchmaking/protocols.js';
+import { createLibp2pMatchmakingTransport } from '../src/matchmaking/query-transport.js';
+import { SeekerWalkClient, type SeekerWalkResult } from '../src/matchmaking/seeker-walk-client.js';
 import { signedWillingness, type Member } from '../src/testing/cohort-topic-mesh-harness.js';
 import { createReactivitySelfMembershipGate, reactivityTailBytes } from '../src/cohort-topic/reactivity-membership-gate.js';
 import { DEFAULT_REACTIVITY_PROTOCOLS } from '../src/reactivity/protocols.js';
@@ -826,7 +828,7 @@ async function memberOf(key: PrivateKey, peerId: PeerId): Promise<Member> {
 	// `/optimystic/matchmaking/1.0.0/query` over the host's CoordRegistry. A remote node dials the routed primary
 	// with an encoded QueryV1 and the decoded QueryReplyV1 carries the provider entry (with a forwardable
 	// `registrationSig` the seeker re-validates) and the cohort's topicTraffic snapshot. The OUTBOUND seeker walk
-	// (target selection + hang-out loop) is the prereq follow-on `matchmaking-query-rpc-seeker-walk`.
+	// (target selection + hang-out loop) driving this serve RPC is exercised end-to-end in §5c below.
 	it('a remote node reads a cohort\'s provider set over the real matchmaking QueryV1 RPC', async () => {
 		const matchTopic = Uint8Array.from({ length: 32 }, (_v, i) => (i * 3 + 19) & 0xff);
 		const matchCoord = addressing.coord0(matchTopic);
@@ -899,12 +901,108 @@ async function memberOf(key: PrivateKey, peerId: PeerId): Promise<Member> {
 		expect(noReply.length, 'a query for an unserved topic yields no reply frame (no engine instantiated)').to.equal(0);
 	});
 
-	// The matchmaking hang-out walk *converging to a match* over real sockets needs the OUTBOUND seeker walk
-	// client (target selection across tiers + the hang-out poll loop); the QueryV1 serve RPC it queries IS now
-	// registered in production (test 5b above), but the walk's `query()`/`register()` driver is the prereq
-	// follow-on. The hang-out *decision* logic is mock-tier-validated (`matchmaking/mesh-walk.spec.ts`). Tagged, not faked.
-	it.skip('[requires the outbound seeker walk client — tracked by matchmaking-query-rpc-seeker-walk] a seeker hang-out walk queries real cohorts over real sockets and converges to a match', () => {
-		/* deferred: the QueryV1 serve handler is live (5b), but no production seeker walk client drives the multi-tier walk + hang-out loop */
+	// --- 5c. Matchmaking: a remote seeker walk converges to a match over real sockets (this ticket) ---
+	// The OUTBOUND seeker walk client is now LIVE in production (matchmaking-query-rpc-seeker-walk): a remote
+	// node builds `createLibp2pMatchmakingTransport`, dials the FRET-routed primary's cohort-topic `/register`
+	// (a signed, self-vouched seeker frame) and its matchmaking `/query`, then re-validates + dedupes the
+	// returned providers. The hang-out *decision* math stays mock-tier-validated (`matchmaking/mesh-walk.spec.ts`);
+	// this proves the real-socket walk converges and that the seeker drops a forged forwarded entry the cohort served.
+	it('a seeker hang-out walk queries real cohorts over real sockets and converges to a match (forged entries dropped)', async () => {
+		const matchTopic = Uint8Array.from({ length: 32 }, (_v, i) => (i * 5 + 23) & 0xff);
+		const matchCoord = addressing.coord0(matchTopic);
+		// Instantiate + stabilize willingness for this topic's cohort (whole mesh at wantK = N).
+		engines(matchCoord);
+		const matchPrimary = primaryFor(matchCoord);
+		const matchPrimaryEngine = engineOf(matchPrimary, matchCoord);
+		expect(await quorumOn(matchPrimaryEngine, matchCoord), 'willingness converged for the walk topic').to.equal(true);
+
+		// A genuine matchmaking provider: a decodable matchmaking appState whose `registrationSig` is over the
+		// REAL topic, so it re-validates seeker-side. T2 bootstrap self-vouches to clear the gate (mirrors §5/§5b).
+		const provider = await participantPrimaryAt(matchPrimaryEngine, matchCoord);
+		const capabilities = ['transcode', 'gpu'];
+		const capacityBudget = 4;
+		const providerSig = bytesToB64url(await signPeer(provider.key, providerSigningPayload(matchTopic, capabilities, capacityBudget)));
+		const providerPayload = encodeProviderAppPayload({ kind: 'match-provider', capabilities, capacityBudget, contactHint: `/ip4/127.0.0.1/tcp/4001/p2p/${provider.idStr}`, signature: providerSig });
+		const now = Date.now();
+		const providerReg = await signedRegister(provider, matchTopic, now, 'mm-walk-provider', { tier: 2, selfVouch: true, appPayload: providerPayload });
+		expect((await matchPrimaryEngine.engine.handleRegister(providerReg, { followOn: false, treeTier: 0 }, now)).result, 'the genuine provider was admitted').to.equal('accepted');
+
+		// A SECOND "provider" whose matchmaking app-payload signature is forged (signed over a DIFFERENT topic).
+		// The cohort still admits + serves it (the RegisterV1 envelope sig is valid — the cohort never verifies
+		// app-payload authorship), but the seeker's `verifyProviderEntry` re-validation drops it. This is the
+		// advisory-trust contract: the cohort vouches only for "what I held", never provider authenticity.
+		const forged = await participantPrimaryAt(matchPrimaryEngine, matchCoord);
+		const wrongTopic = Uint8Array.from({ length: 32 }, (_v, i) => (i * 5 + 99) & 0xff);
+		const forgedSig = bytesToB64url(await signPeer(forged.key, providerSigningPayload(wrongTopic, capabilities, capacityBudget)));
+		const forgedPayload = encodeProviderAppPayload({ kind: 'match-provider', capabilities, capacityBudget, contactHint: `/ip4/127.0.0.1/tcp/4002/p2p/${forged.idStr}`, signature: forgedSig });
+		const forgedReg = await signedRegister(forged, matchTopic, now, 'mm-walk-forged', { tier: 2, selfVouch: true, appPayload: forgedPayload });
+		expect((await matchPrimaryEngine.engine.handleRegister(forgedReg, { followOn: false, treeTier: 0 }, now)).result, 'the forged-payload provider was also admitted (cohort does not verify app-payload authorship)').to.equal('accepted');
+
+		// Touch + gossip so any sibling also holds the records (the routed primary holds them regardless — the walk dials it).
+		expect(matchPrimaryEngine.engine.handleRenew(await signedReattach(provider, matchTopic, now), now).result).to.equal('ok');
+		await matchPrimaryEngine.gossipRound(now);
+
+		// A REMOTE seeker node (!= the routed primary, so the tier-0 register/query never self-dials) drives the
+		// real walk over real sockets via the production transport.
+		const seeker = nodes.find((n) => n.idStr !== matchPrimary.idStr)!;
+		const transport = createLibp2pMatchmakingTransport({
+			node: seeker.node,
+			fret: seeker.fret as unknown as FretService,
+			selfPeerId: seeker.idStr,
+			key: seeker.key,
+			wantK: WANT_K,
+		});
+
+		// The small-N FRET size estimate yields a shallow d_max (single-tier-0 milestone — the walk registers +
+		// queries at the root). Exercise the estimator, then drive the walk from the root: at this N the remote
+		// seeker is deliberately not the tier-0 primary, so register(0)/query(0) dial the remote matchPrimary.
+		const dMaxEstimate = await transport.estimateDMax(matchTopic);
+		expect(dMaxEstimate, 'small-N FRET estimate yields a shallow d_max').to.be.at.most(3);
+
+		// Assert convergence (not an exact hop count), with bounded polling (replication/admission settle on real
+		// sockets). Each attempt is a fresh single-deadline walk; the provider is already on the dialed primary's
+		// engine, so the first walk normally converges — the retry just absorbs a transient real-socket hiccup.
+		let result: SeekerWalkResult | undefined;
+		const converged = await waitFor(async () => {
+			try {
+				const client = new SeekerWalkClient({
+					transport: transport.walkTransport(matchTopic),
+					topicId: matchTopic,
+					wantCount: 1,
+					dMax: 0,
+					patienceMs: 10_000,
+					verifyEntry: transport.verifyEntry,
+				});
+				result = await client.run();
+				return result.metWantCount;
+			} catch {
+				return false; // transient real-socket failure; retry within the bound
+			}
+		}, 60_000, 500);
+		expect(converged, 'the seeker walk converged to a match over real sockets').to.equal(true);
+		expect(result!.providers.length, 'at least one provider matched').to.be.at.least(1);
+		const matchedIds = result!.providers.map((p) => p.participantId);
+		expect(matchedIds, 'the genuine provider is in the matched set').to.include(provider.idStr);
+		expect(matchedIds, 'the forged-payload provider was dropped by the seeker re-validation').to.not.include(forged.idStr);
+
+		// Confirm the drop is the SEEKER's re-validation, not the cohort withholding the record: a raw `/query`
+		// (like §5b) served by the cohort lists BOTH participants, yet `verifyProviderEntry` rejects the forged one.
+		const rawReplyFrame = await requestResponse(
+			seeker.node,
+			matchPrimary.peerId,
+			DEFAULT_MATCHMAKING_PROTOCOLS.query,
+			encodeQueryV1({ v: 1, topicId: bytesToB64url(matchTopic), includeProviders: true, includeSeekers: false, limit: 256, requesterId: seeker.idStr, timestamp: Date.now(), signature: 'AA' }),
+			DEFAULT_STREAM_MAX_BYTES,
+		);
+		const rawReply = decodeQueryReplyV1(rawReplyFrame, DEFAULT_STREAM_MAX_BYTES);
+		const rawIds = (rawReply.providers ?? []).map((p) => p.participantId);
+		expect(rawIds, 'the raw cohort reply served the genuine provider').to.include(provider.idStr);
+		expect(rawIds, 'the raw cohort reply ALSO served the forged-payload provider (cohort forwards verbatim)').to.include(forged.idStr);
+		const forgedEntry = rawReply.providers!.find((p) => p.participantId === forged.idStr)!;
+		expect(
+			verifyProviderEntry(matchTopic, forgedEntry, (id, payload, sig) => verifyPeerSig(id, payload, sig)),
+			'verifyProviderEntry rejects the forged entry seeker-side',
+		).to.equal(false);
 	});
 
 	// --- 6. Cluster-formation / same-FRET-ring consistency ---
