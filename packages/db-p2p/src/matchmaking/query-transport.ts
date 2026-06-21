@@ -74,57 +74,60 @@ export interface MatchmakingQueryServeDeps {
 /**
  * Build the matchmaking query serve callback for {@link handleRequestResponse}: decode (bounded) → resolve
  * the serving tier-0 engine → build + sign the reply, or `undefined` for **no reply** (a decode failure, a
- * gate rejection, or no serving engine). It never throws out of the stream handler — a malformed frame is
- * logged and dropped, mirroring the cohort-topic / reactivity serve handlers.
+ * gate rejection, no serving engine, or any build/sign/encode error). It never throws out of the stream
+ * handler — every failure is logged and dropped to a clean no-reply, mirroring the cohort-topic / reactivity
+ * serve handlers (which wrap the whole serve body, not just the decode).
  */
 export function createMatchmakingQueryHandler(
 	deps: MatchmakingQueryServeDeps,
 ): (frame: Uint8Array, from: PeerId) => Promise<Uint8Array | undefined> {
 	const maxBytes = deps.maxBytes ?? DEFAULT_STREAM_MAX_BYTES;
 	return async (frame: Uint8Array, from: PeerId): Promise<Uint8Array | undefined> => {
-		let query;
 		try {
 			// `decodeQueryV1` = `validateQueryV1(decodeCohortMessage(...))` — bounds `limit` to QUERY_LIMIT_MAX,
 			// so the handler passes `query` through unchanged (never re-clamps `limit`).
-			query = decodeQueryV1(frame, maxBytes);
+			const query = decodeQueryV1(frame, maxBytes);
+			const topicId = b64urlToBytes(query.topicId);
+
+			// Anti-DoS rate-limit seam (matchmaking-query-rate-limit). Default-allow; gate on the connection's
+			// verified `from` peer, never the self-asserted `query.requesterId`.
+			if (deps.gate !== undefined && !deps.gate(from, topicId)) {
+				log("matchmaking query serve: rate-limited query from %s (no reply)", from.toString());
+				return undefined;
+			}
+
+			// Resolve the serving tier-0 engine. `findServing(topicId, 0)` keys on `treeTier === 0 &&
+			// servesTopic(topicId)` (true on the routed primary once it has admitted/replicated a registration);
+			// `findByCoord(coord_0)` is the fallback for an instantiated-but-currently-recordless engine. We never
+			// `forCoord` here — instantiating a CoordEngine from an inbound query would be a DoS amplifier.
+			const coord0 = deps.addressing.coord0(topicId);
+			const engine = deps.registry.findServing(topicId, 0) ?? deps.registry.findByCoord(coord0);
+			if (engine === undefined) {
+				// No serving engine on this node (seeker dialed a non-primary / pre-replication). No reply; the
+				// seeker side treats this as an empty advisory result.
+				return undefined;
+			}
+
+			// Build the reply from a single synchronous read (records + traffic + epoch) so a concurrent gossip
+			// round cannot tear the snapshot between read and sign. `handleMatchmakingQuery` forwards each record's
+			// fields verbatim through the pure `evaluateQuery` (capability filter + limit truncation + entry
+			// building, including each provider's `registrationSig`) and single-member-signs the canonical reply.
+			const reply = await handleMatchmakingQuery(query, {
+				records: engine.records(topicId),
+				topicTraffic: engine.topicTraffic(topicId),
+				cohortEpoch: engine.cohort().cohortEpoch,
+				sign: deps.sign,
+				log,
+			});
+			return encodeQueryReplyV1(reply, maxBytes);
 		} catch (err) {
-			// A malformed / foreign query must never throw out of the stream handler: log + no reply.
-			log("matchmaking query serve: dropping undecodable query (no reply): %o", err);
+			// Any failure — a malformed/foreign query (decode), an oversize reply (encode), or a transient
+			// `sign` rejection — must never throw out of the stream handler: log + no reply. The outer
+			// `handleRequestResponse` would otherwise abort the stream; a clean no-reply lets the seeker treat
+			// it as a benign empty advisory result. Mirrors the reactivity recover serve handler exactly.
+			log("matchmaking query serve: dropping query (no reply): %o", err);
 			return undefined;
 		}
-		const topicId = b64urlToBytes(query.topicId);
-
-		// Anti-DoS rate-limit seam (matchmaking-query-rate-limit). Default-allow; gate on the connection's
-		// verified `from` peer, never the self-asserted `query.requesterId`.
-		if (deps.gate !== undefined && !deps.gate(from, topicId)) {
-			log("matchmaking query serve: rate-limited query from %s (no reply)", from.toString());
-			return undefined;
-		}
-
-		// Resolve the serving tier-0 engine. `findServing(topicId, 0)` keys on `treeTier === 0 &&
-		// servesTopic(topicId)` (true on the routed primary once it has admitted/replicated a registration);
-		// `findByCoord(coord_0)` is the fallback for an instantiated-but-currently-recordless engine. We never
-		// `forCoord` here — instantiating a CoordEngine from an inbound query would be a DoS amplifier.
-		const coord0 = deps.addressing.coord0(topicId);
-		const engine = deps.registry.findServing(topicId, 0) ?? deps.registry.findByCoord(coord0);
-		if (engine === undefined) {
-			// No serving engine on this node (seeker dialed a non-primary / pre-replication). No reply; the
-			// seeker side treats this as an empty advisory result.
-			return undefined;
-		}
-
-		// Build the reply from a single synchronous read (records + traffic + epoch) so a concurrent gossip
-		// round cannot tear the snapshot between read and sign. `handleMatchmakingQuery` forwards each record's
-		// fields verbatim through the pure `evaluateQuery` (capability filter + limit truncation + entry
-		// building, including each provider's `registrationSig`) and single-member-signs the canonical reply.
-		const reply = await handleMatchmakingQuery(query, {
-			records: engine.records(topicId),
-			topicTraffic: engine.topicTraffic(topicId),
-			cohortEpoch: engine.cohort().cohortEpoch,
-			sign: deps.sign,
-			log,
-		});
-		return encodeQueryReplyV1(reply, maxBytes);
 	};
 }
 

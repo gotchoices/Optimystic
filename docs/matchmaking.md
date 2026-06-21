@@ -205,16 +205,22 @@ CapabilityFilter {
 
 The filter is evaluated locally at the cohort. Filters are advisory: they bias which providers the cohort returns but do not constitute admission. The seeker re-validates against the returned set.
 
-> **Implemented** (mock-tier e2e pending). `matchesFilter` (must / mustNot / minBudget) is
+> **Implemented**, serve side live over real libp2p. `matchesFilter` (must / mustNot / minBudget) is
 > `packages/db-core/src/matchmaking/capability-filter.ts`; the pure query evaluation (filter +
 > `limit` truncation + `truncated` flag + entry building, providers and seekers) is `query-eval.ts`
 > (`evaluateQuery`); the cohort-side binding that serves a `QueryV1` from the cohort's local
 > registration records and attaches `topicTraffic`, `cohortEpoch`, and the primary's reply signature
-> is `packages/db-p2p/src/matchmaking/query-handler.ts` (`handleMatchmakingQuery`). The seeker
-> re-validates each returned entry's `registrationSig` via `verifyProviderEntry` /
-> `verifySeekerEntry` (`wire.ts`) — see the signing-scope note in §Wire formats. Spec:
-> `capability-filter.spec.ts`, `query-eval.spec.ts`, `entry-verify.spec.ts` (db-core, including the
-> sign → forward → verify round trip), `query-handler.spec.ts` (db-p2p).
+> is `packages/db-p2p/src/matchmaking/query-handler.ts` (`handleMatchmakingQuery`). The production
+> transport that resolves the serving tier-0 engine off the live `CoordRegistry` and rides the
+> request-reply stream is `packages/db-p2p/src/matchmaking/query-transport.ts`
+> (`registerMatchmakingQueryHandler` over `/optimystic/matchmaking/1.0.0/query`), wired at the
+> composition root (`libp2p-node-base.ts`); a topic the node serves no engine for gets **no reply**
+> (the handler never instantiates an engine — DoS guard). The seeker re-validates each returned entry's
+> `registrationSig` via `verifyProviderEntry` / `verifySeekerEntry` (`wire.ts`) — see the signing-scope
+> note in §Wire formats. Spec: `capability-filter.spec.ts`, `query-eval.spec.ts`, `entry-verify.spec.ts`
+> (db-core, including the sign → forward → verify round trip), `query-handler.spec.ts` +
+> `query-transport.spec.ts` (db-p2p), and the gated real-socket §5b in `substrate-real-libp2p`. The
+> **outbound** seeker walk client remains the follow-on (`matchmaking-query-rpc-seeker-walk`).
 
 ### Distributing the query across the tree
 
@@ -898,24 +904,32 @@ Throughout, the root cohort's load is bounded: registration storms get `Promoted
 
 ### Real-libp2p e2e coverage
 
-> **Provider registration confirmed over real sockets; seeker query RPC deferred.**
+> **Provider registration AND the seeker query RPC serve side confirmed over real sockets; the outbound
+> seeker walk client deferred.**
 > [`packages/db-p2p/test/substrate-real-libp2p.integration.spec.ts`](../packages/db-p2p/test/substrate-real-libp2p.integration.spec.ts)
 > (env-gated) stands up 3–16 production `cohortTopic`-enabled libp2p nodes over real TCP. The **provider
 > side** is confirmed real: a provider registration at the matchmaking application tier (T2) is admitted by a
 > real cohort over the real willingness quorum, the routed primary **holds the provider record** (the read a
 > `QueryV1` serves from — `CoordEngine.records`), and the record **replicates into a sibling cohort member
-> over real `/cohort-gossip`**. This is the provider-directory half of §Seeker query end-to-end over real
-> sockets.
+> over real `/cohort-gossip`**.
+>
+> The **seeker query RPC serve side is now live in production** (`matchmaking/query-transport.ts`, registered
+> at the composition root over `/optimystic/matchmaking/1.0.0/query`): test 5b has a **remote** node dial the
+> routed primary with an encoded `QueryV1` and asserts the decoded `QueryReplyV1` carries the provider entry
+> (with a forwardable `registrationSig` re-validated end-to-end via `verifyProviderEntry`), the cohort's
+> `topicTraffic` snapshot, and the node's single-member reply signature — plus the **no-reply** (0-byte frame)
+> DoS-guard path for a topic the dialed node serves no engine for. This completes the provider-directory half
+> of §Seeker query end-to-end over real sockets.
 >
 > **What is NOT yet real (tagged `it.skip`, not faked):** the **seeker hang-out walk converging to a match**
-> over real sockets. A production node registers no `QueryV1` RPC handler — the seeker walk's `query()` seam
-> is unbound (`handleMatchmakingQuery` has no production dialer), so a remote seeker cannot read a cohort's
-> provider set over the wire yet. The hang-out *decision* logic (hang-out-vs-continue, adversarial bounds) is
-> mock-tier-validated (`matchmaking/mesh-walk.spec.ts`) and simulator-validated (above). **No real-network
-> observation here contradicts the simulator** — the provider-directory substrate is confirmed on real libp2p
-> as far as the wired surface reaches; the seeker query transport is the documented follow-on, now tracked by
-> backlog `matchmaking-real-libp2p-query-transport` (a `/query` cohort protocol + the `SeekerWalkTransport.query`
-> binding — the socket continuation of the mock-tier sweep/walk work).
+> over real sockets. The serve RPC it queries is live (5b), but no production *client* drives the outbound
+> multi-tier walk + hang-out poll loop — the seeker walk's `query()` / `register()` driver is unbound. The
+> hang-out *decision* logic (hang-out-vs-continue, adversarial bounds) is mock-tier-validated
+> (`matchmaking/mesh-walk.spec.ts`) and simulator-validated (above). **No real-network observation here
+> contradicts the simulator** — the provider-directory substrate plus the query serve RPC are confirmed on
+> real libp2p; the outbound seeker walk client is the documented follow-on, tracked by
+> `matchmaking-query-rpc-seeker-walk` (the `SeekerWalkTransport.query` socket binding — the continuation of
+> the mock-tier sweep/walk work).
 
 ### Sparse provider, very large network
 
