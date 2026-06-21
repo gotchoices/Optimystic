@@ -34,6 +34,7 @@ import {
 	noticeBroadcastCoords,
 	handleInboundNotice,
 	createPromoteGate,
+	PROMOTE_HIGHWATER_MAX_KEYS,
 	type NoticeApplyTarget,
 	type InboundNoticeResult,
 	type CoordRegistry,
@@ -408,5 +409,112 @@ describe('cohort-topic: inbound promote-handler anti-abuse gate', () => {
 		);
 		expect(result, 'no engine serves (topic, tier) → dropped').to.equal('dropped');
 		expect(calls(), 'a dropped notice never reaches the verifier').to.equal(0);
+	});
+});
+
+// --- promote-gate bounded memory (cohort-topic-promote-gate-map-eviction) ---
+
+/** A structurally-valid forged promotion notice for an arbitrary `topicId` (dummy sig — always untrusted). */
+const DUMMY_SIG = bytesToB64url(Uint8Array.from({ length: 64 }, () => 7));
+function forgedNoticeForTopic(member: Member, topicId: Uint8Array, effectiveAt: number): PromotionNoticeV1 {
+	return {
+		v: 1,
+		topicId: bytesToB64url(topicId),
+		fromTier: 1,
+		toTier: 2,
+		effectiveAt,
+		thresholdSig: DUMMY_SIG,
+		signers: [bytesToB64url(member.bytes)],
+		cohortEpoch: bytesToB64url(EPOCH),
+	};
+}
+
+describe('cohort-topic: promote-gate bounded memory', () => {
+	const minSigs = 3;
+
+	it('a distinct-topicId flood holds the limiter at maxKeys, not unbounded', async () => {
+		// The core acceptance criterion: one peer spraying notices with distinct attacker-chosen topicIds (each
+		// allocating a `(peer, topic)` limiter key *before* findServing) must hold the limiter at its cap, not
+		// grow it without bound. The prereq's inline `maxKeys` LRU cap enforces this in `check()`.
+		const members = await makeMembers(4);
+		const byId = new Map(members.map((m) => [m.idStr, m]));
+		const verifier = await verifierOver(members, byId, minSigs);
+		const { target } = remoteTarget(minSigs);
+		const registry = servingRegistry(target);
+		const maxKeys = 8;
+		const gate = createPromoteGate({ ratePerWindow: 10_000, maxKeys });
+		const from = peerIdToBytes('topic-sprayer');
+
+		const N = 50;
+		for (let i = 0; i < N; i++) {
+			const topicId = Uint8Array.from({ length: 32 }, (_v, j) => (j + i * 13 + 1) & 0xff);
+			const forged = forgedNoticeForTopic(members[0]!, topicId, 1_000 + i);
+			await handleInboundNotice(encodeCohortMessage(forged), from, registry, verifier, gate, 2_000);
+		}
+		expect(gate.rateLimiter.size, `${N} distinct forged topicIds stay capped at maxKeys`).to.be.at.most(maxKeys);
+		expect(gate.rateLimiter.size, 'the cap is actually reached (flood >> maxKeys)').to.equal(maxKeys);
+	});
+
+	it('highWater is an LRU map capped at PROMOTE_HIGHWATER_MAX_KEYS; the least-recently-set entry is evicted', () => {
+		const gate = createPromoteGate();
+		const overflow = 10;
+		for (let i = 0; i < PROMOTE_HIGHWATER_MAX_KEYS + overflow; i++) {
+			gate.highWater.set(`topic-${i}|0`, 1_000 + i);
+		}
+		expect(gate.highWater.size, 'capped at the max').to.equal(PROMOTE_HIGHWATER_MAX_KEYS);
+		// The first `overflow` keys are the least-recently-set → evicted; the most recent survive.
+		expect(gate.highWater.has('topic-0|0'), 'the oldest entry was evicted').to.equal(false);
+		expect(gate.highWater.has(`topic-${overflow - 1}|0`), 'the (overflow)-th oldest was also evicted').to.equal(false);
+		expect(gate.highWater.has(`topic-${overflow}|0`), 'the oldest surviving entry').to.equal(true);
+		expect(gate.highWater.has(`topic-${PROMOTE_HIGHWATER_MAX_KEYS + overflow - 1}|0`), 'the newest entry survives').to.equal(true);
+	});
+
+	it('an evicted high-water lets a stale replay re-verify but the engine idempotently no-ops it (no regression)', async () => {
+		// The headline safety test for `highWater` eviction. The gate's high-water is a strictly-weaker
+		// early-drop optimization; the engine's PromotionLifecycle is the idempotency authority (lastEffectiveAt).
+		// Evicting a water therefore only trades a tiny re-verify for memory — it can never let a stale notice
+		// (re-)apply, because the engine no-ops any notice whose effectiveAt <= lastEffectiveAt.
+		const members = await makeMembers(4);
+		const byId = new Map(members.map((m) => [m.idStr, m]));
+		const verifier = await verifierOver(members, byId, minSigs);
+		const { life, target } = remoteTarget(minSigs);
+		const registry = servingRegistry(target);
+		const gate = createPromoteGate({ ratePerWindow: 10_000 });
+		const from = peerIdToBytes('honest');
+
+		// Apply a real promotion at effectiveAt = 10_000 → promoted, lastEffectiveAt = 10_000, water set.
+		const promo = await realPromotionNotice(members, byId, minSigs, 10_000);
+		expect(await handleInboundNotice(encodeCohortMessage(promo), from, registry, verifier, gate, 11_000)).to.equal('applied');
+		expect(life.isPromoted(TOPIC), 'the promotion applied').to.be.true;
+
+		// Evict the (TOPIC, tier) water by overflowing the LruMap cap with unrelated entries. The applied water
+		// is the only — hence least-recently-set — entry, so the overflow pushes exactly it out.
+		for (let i = 0; i < PROMOTE_HIGHWATER_MAX_KEYS; i++) {
+			gate.highWater.set(`filler-${i}|9`, i);
+		}
+
+		// A *stale* demotion (effectiveAt 8_000 < 10_000) now passes the absent water gate and re-verifies —
+		// but the engine no-ops it (8_000 <= lastEffectiveAt 10_000), so the promotion does NOT regress.
+		const staleDemo = await realDemotionNotice(members, byId, minSigs, 8_000);
+		const result = await handleInboundNotice(encodeCohortMessage(staleDemo), from, registry, verifier, gate, 12_000);
+		expect(result, 'the eviction re-opened the gate (re-verified, not dropped as stale)').to.equal('applied');
+		expect(life.isPromoted(TOPIC), 'the engine idempotently ignored the stale demotion — no regression').to.be.true;
+	});
+
+	it('a flood of forged (never-applied) notices leaves highWater empty — only verified applies write it', async () => {
+		const members = await makeMembers(4);
+		const byId = new Map(members.map((m) => [m.idStr, m]));
+		const verifier = await verifierOver(members, byId, minSigs);
+		const { target } = remoteTarget(minSigs);
+		const registry = servingRegistry(target);
+		const gate = createPromoteGate({ ratePerWindow: 10_000 });
+		const from = peerIdToBytes('forger');
+
+		for (let i = 0; i < 40; i++) {
+			const forged = forgedNoticeForTopic(members[0]!, TOPIC, 1_000 + i);
+			const r = await handleInboundNotice(encodeCohortMessage(forged), from, registry, verifier, gate, 2_000);
+			expect(r, 'a forged single-signer notice is untrusted').to.equal('untrusted');
+		}
+		expect(gate.highWater.size, 'no forged notice wrote the high-water (only an `applied` outcome does)').to.equal(0);
 	});
 });

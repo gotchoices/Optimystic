@@ -392,6 +392,26 @@ describe('cohort-topic: host anti-DoS wiring (gap 6)', () => {
 
 		await host.stop();
 	});
+
+	it('the gossip tick sweeps idle node-level promote-gate limiter keys (cohort-topic-promote-gate-map-eviction)', async () => {
+		// The driveTick → promoteGate.rateLimiter.sweep wiring. The node-level promote-gate limiter is reclaimed
+		// on the same gossip cadence the per-coord limiters sweep on. A tiny idleTtlMs + fast tick reclaims an
+		// idle `(peer, topic)` key. The node-gate limiter is swept *only* by driveTick (the per-coord limiters
+		// are distinct instances), so this fails if the sweep call is missing or scoped outside the tick.
+		const host = await createCohortTopicHost(makeFakeNode(await makePeerId()) as never, makeFakeFret() as never, {
+			wantK: 1,
+			gossipIntervalMs: 5,
+			antiDos: { rateLimiter: { idleTtlMs: 10 } },
+		});
+		// Allocate one node-gate limiter key (exactly as an inbound promote notice would), then let ticks reclaim it.
+		host.promoteGate.rateLimiter.check(await makeParticipantBytes(), TOPIC, Date.now());
+		expect(host.promoteGate.rateLimiter.size, 'the key was allocated').to.equal(1);
+
+		await delay(80); // several 5ms ticks past the 10ms idle TTL
+		expect(host.promoteGate.rateLimiter.size, 'the gossip tick swept the idle key').to.equal(0);
+
+		await host.stop();
+	});
 });
 
 describe('cohort-topic: host cold-start parent registration (gap 7)', () => {

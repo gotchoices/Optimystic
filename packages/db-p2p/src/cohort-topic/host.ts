@@ -79,6 +79,7 @@ import {
 	createCorrelationReplayGuard,
 	createTopicBudget,
 	createBootstrapEvidence,
+	LruMap,
 	coreProfile,
 	DEFAULT_MIN_SIGS,
 	DEFAULT_MAX_NO_POW_TIER,
@@ -444,6 +445,12 @@ export interface CohortTopicHost {
 	 * up a second transport with duplicate cohort peer resolution.
 	 */
 	readonly gossipTransport: FretCohortGossipTransport;
+	/**
+	 * The node-level `promote`-handler anti-abuse gate (per-`(peer, topic)` rate limiter + per-`(topic, tier)`
+	 * `effectiveAt` high-water). Exposed for test/diagnostic introspection over its bounded-memory state — the
+	 * limiter's `size` and the `highWater` `LruMap` — and so the gossip-cadence sweep wiring is observable.
+	 */
+	readonly promoteGate: PromoteGate;
 	/** Unregister the four protocols and tear down every coord engine. */
 	stop(): Promise<void>;
 }
@@ -834,6 +841,11 @@ export async function createCohortTopicHost(node: Libp2p, fret: FretService, opt
 					log("cohort-topic: gossip tick failed for a coord engine: %o", err);
 				}
 			}
+			// Proactive idle reclaim of the node-level promote-gate limiter on the same cadence the per-coord
+			// limiters sweep on. The limiter's inline `maxKeys` cap is the hard worst-case bound; this sweep is
+			// the steady-state reclaim of idle `(peer, topic)` keys. Runs after the per-engine loop, inside the
+			// `ticking` guard and `stopped` short-circuit, so it is single-threaded with no race on `stop()`.
+			promoteGate.rateLimiter.sweep(now);
 		} finally {
 			ticking = false;
 		}
@@ -850,6 +862,7 @@ export async function createCohortTopicHost(node: Libp2p, fret: FretService, opt
 		protocols,
 		profile,
 		gossipTransport,
+		promoteGate,
 		stop: async (): Promise<void> => {
 			stopped = true;
 			clearInterval(timer);
@@ -1789,13 +1802,29 @@ export interface PromoteGate {
 	 * water is a replay / out-of-order frame and is dropped before verification. Updated **only** on an
 	 * `"applied"` outcome (never on an unverified frame), so a forged notice carrying `effectiveAt = Infinity`
 	 * cannot poison the water and lock out legitimate notices.
+	 *
+	 * **Bounded.** An {@link LruMap} capped at {@link PROMOTE_HIGHWATER_MAX_KEYS} so the retain-forever shape
+	 * cannot leak on a long-lived node. Unlike the limiter this is *not* attacker-growable (it is written only
+	 * on an `"applied"` outcome, which needs a verified `≥ minSigs` cohort signature — reads of forged
+	 * `topicId`s via `.get` create nothing), so it never evicts under legitimate load; the cap is the
+	 * belt-and-suspenders bound. Evicting an entry is safe: the engine's {@link PromotionLifecycle} is
+	 * independently idempotent and `effectiveAt`-ordered (`PromotionState.lastEffectiveAt`), so an
+	 * evicted-then-replayed older notice re-verifies (one bounded, rate-capped `verifyMessage`) and then
+	 * **no-ops at the engine** rather than (re-)applying. Water absence only *opens* the gate, never closes it.
 	 */
-	readonly highWater: Map<string, number>;
+	readonly highWater: LruMap<string, number>;
 }
+
+/**
+ * Hard cap on tracked `(topicId, tier)` high-water entries; the least-recently-touched are evicted beyond
+ * this. A modest bound is plenty — only verified applies grow the map, so it never evicts under legitimate
+ * load — but it caps the otherwise retain-forever shape on a long-lived node.
+ */
+export const PROMOTE_HIGHWATER_MAX_KEYS = 8192;
 
 /** Build the default {@link PromoteGate} from the (optional) anti-DoS rate-limiter config. */
 export function createPromoteGate(rateLimiterConfig?: RegisterRateLimiterConfig): PromoteGate {
-	return { rateLimiter: createRegisterRateLimiter(rateLimiterConfig), highWater: new Map<string, number>() };
+	return { rateLimiter: createRegisterRateLimiter(rateLimiterConfig), highWater: new LruMap<string, number>(PROMOTE_HIGHWATER_MAX_KEYS) };
 }
 
 /**
