@@ -280,6 +280,85 @@ describe('cohort-topic: /sign endorsement policy', () => {
 	});
 });
 
+describe('cohort-topic: /sign rotation endorsement gate (prior-epoch membership)', () => {
+	// A rotation request carries the PRIOR epoch as `cohortEpoch`; the gate checks prior-epoch membership
+	// (via `priorCohortMembersAt`) rather than the CURRENT cohort, so the genuinely outgoing cohort co-signs
+	// the hand-off. These cover the four branches of the rotation gate the live-tier mesh tests do not isolate.
+	const rotReq: SignRequestV1 = {
+		v: 1,
+		kind: 'rotation',
+		coord: bytesToB64url(COORD),
+		cohortEpoch: bytesToB64url(EPOCH), // EPOCH is the prevEpoch the endorser must have been a member at
+		payload: bytesToB64url(PAYLOAD),
+	};
+
+	it('endorses a hand-off when self + requester were both members of the prior cohort — even when neither is in the CURRENT cohort', async () => {
+		const [self, requester] = await makeMembers(2);
+		const reply = await handleSignRequest(rotReq, requester!.idStr, {
+			privateKey: self!.key,
+			selfMember: self!.bytes,
+			// The current cohort is deliberately EMPTY: a rotation endorsement must consult prior, not current,
+			// membership — so this stub must never be the basis of the decision.
+			cohortMembersAround: (): string[] => [],
+			currentEpoch: (): Uint8Array => Uint8Array.from({ length: 32 }, () => 0xff),
+			priorCohortMembersAt: (): readonly string[] => [self!.idStr, requester!.idStr],
+		});
+		expect('signer' in reply, 'an endorsement, not a refusal').to.equal(true);
+		if ('signer' in reply) {
+			expect(verifyPeerSig(b64urlToBytes(reply.signer), PAYLOAD, b64urlToBytes(reply.signature)), 'signature verifies against the endorser key').to.equal(true);
+			expect(bytesToPeerIdString(b64urlToBytes(reply.signer)), 'signer id is self').to.equal(self!.idStr);
+		}
+	});
+
+	it('refuses when this node has no prior-epoch history for the coord (cold restart / never assembled at prevEpoch)', async () => {
+		const [self, requester] = await makeMembers(2);
+		const reply = await handleSignRequest(rotReq, requester!.idStr, {
+			privateKey: self!.key,
+			selfMember: self!.bytes,
+			cohortMembersAround: (): string[] => [self!.idStr, requester!.idStr],
+			currentEpoch: (): Uint8Array => EPOCH,
+			priorCohortMembersAt: (): undefined => undefined, // no tracked identity at prevEpoch
+		});
+		expect('refused' in reply && reply.refused, 'no prior history → refused').to.equal(true);
+	});
+
+	it('refuses when self was not a member of the prior cohort', async () => {
+		const [self, requester] = await makeMembers(2);
+		const reply = await handleSignRequest(rotReq, requester!.idStr, {
+			privateKey: self!.key,
+			selfMember: self!.bytes,
+			cohortMembersAround: (): string[] => [self!.idStr, requester!.idStr],
+			currentEpoch: (): Uint8Array => EPOCH,
+			priorCohortMembersAt: (): readonly string[] => [requester!.idStr], // prior cohort excludes self
+		});
+		expect('refused' in reply && reply.refused, 'self ∉ prior cohort → refused').to.equal(true);
+	});
+
+	it('refuses when the requester was not a member of the prior cohort', async () => {
+		const [self, requester] = await makeMembers(2);
+		const reply = await handleSignRequest(rotReq, requester!.idStr, {
+			privateKey: self!.key,
+			selfMember: self!.bytes,
+			cohortMembersAround: (): string[] => [self!.idStr, requester!.idStr],
+			currentEpoch: (): Uint8Array => EPOCH,
+			priorCohortMembersAt: (): readonly string[] => [self!.idStr], // prior cohort excludes the requester
+		});
+		expect('refused' in reply && reply.refused, 'requester ∉ prior cohort → refused').to.equal(true);
+	});
+
+	it('refuses a key-less node before any prior-membership work', async () => {
+		const [self, requester] = await makeMembers(2);
+		const reply = await handleSignRequest(rotReq, requester!.idStr, {
+			privateKey: undefined,
+			selfMember: self!.bytes,
+			cohortMembersAround: (): string[] => [self!.idStr, requester!.idStr],
+			currentEpoch: (): Uint8Array => EPOCH,
+			priorCohortMembersAt: (): readonly string[] => [self!.idStr, requester!.idStr],
+		});
+		expect('refused' in reply && reply.refused, 'key-less node refuses').to.equal(true);
+	});
+});
+
 describe('cohort-topic: host drives a per-coord MembershipCertPublisher', () => {
 	const TOPIC = Uint8Array.from({ length: 32 }, (_v, i) => (i + 11) & 0xff);
 
