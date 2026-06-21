@@ -240,6 +240,12 @@ class StoreCohortMemberEngine implements CohortMemberEngine {
 	}
 
 	sweepStale(now: number): readonly RegistrationRecord[] {
+		// Reclaim idle (peer, topic) rate-limiter keys on the existing gossip cadence. The limiters' own
+		// hard LRU cap already bounds worst-case footprint; this sweep adds proactive steady-state reclaim
+		// of long-quiet keys so a long-running coord does not hold register/probe state for departed peers.
+		this.deps.rateLimiter?.sweep(now);
+		this.deps.probeRateLimiter?.sweep(now);
+
 		const evicted = this.deps.renewal.sweepStale(now);
 		const budget = this.deps.topicBudget;
 		if (budget !== undefined && evicted.length > 0) {

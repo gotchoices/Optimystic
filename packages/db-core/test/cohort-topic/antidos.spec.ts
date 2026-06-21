@@ -4,6 +4,8 @@ import {
 	createRegisterRateLimiter,
 	DEFAULT_REGISTER_RATE_PER_PEER,
 	DEFAULT_RATE_WINDOW_MS,
+	DEFAULT_RATE_LIMITER_MAX_KEYS,
+	DEFAULT_RATE_LIMITER_IDLE_TTL_MS,
 	createTopicBudget,
 	DEFAULT_TOPICS_MAX,
 	createCorrelationReplayGuard,
@@ -72,6 +74,103 @@ describe('cohort-topic / anti-DoS', () => {
 			const later = DEFAULT_RATE_WINDOW_MS + 1;
 			const r = limiter.check(PEER_A, TOPIC_1, later);
 			expect(r.ok).to.be.true;
+		});
+
+		it('exposes the LRU-cap + idle-TTL defaults', () => {
+			expect(DEFAULT_RATE_LIMITER_MAX_KEYS).to.equal(100_000);
+			expect(DEFAULT_RATE_LIMITER_IDLE_TTL_MS).to.equal(DEFAULT_RATE_WINDOW_MS);
+		});
+
+		it('caps tracked keys at maxKeys, evicting the least-recently-checked', () => {
+			// ratePerWindow 1 → a single check saturates a key, so "fresh vs retained" is observable as
+			// admit-vs-reject on the next same-window check. Here check order == recency order.
+			const limiter = createRegisterRateLimiter({ maxKeys: 3, ratePerWindow: 1 });
+			const T = [bytes('cap-0'), bytes('cap-1'), bytes('cap-2'), bytes('cap-3')];
+			expect(limiter.check(PEER_A, T[0]!, 10).ok).to.be.true; // saturates T0; recency [T0]
+			expect(limiter.check(PEER_A, T[1]!, 11).ok).to.be.true; // [T0, T1]
+			expect(limiter.check(PEER_A, T[2]!, 12).ok).to.be.true; // [T0, T1, T2]
+			expect(limiter.size, 'at cap').to.equal(3);
+
+			// A fourth distinct key evicts the least-recently-checked (T0). Size holds at the cap.
+			expect(limiter.check(PEER_A, T[3]!, 13).ok).to.be.true; // evicts T0 → [T1, T2, T3]
+			expect(limiter.size, 'still capped after the flood key').to.equal(3);
+
+			// A survivor (T2) is still saturated → rejected; the evicted T0 returns fresh → admitted.
+			// (Probe T2 before re-inserting T0, whose fresh insert would evict the next-oldest key.)
+			expect(limiter.check(PEER_A, T[2]!, 14).ok, 'a recently-checked key survived with its state').to.be.false;
+			expect(limiter.check(PEER_A, T[0]!, 15).ok, 'the evicted key returns fresh').to.be.true;
+		});
+
+		it('sweep() evicts keys idle >= idleTtlMs and keeps keys still inside the window', () => {
+			const limiter = createRegisterRateLimiter({ idleTtlMs: 1_000 });
+			limiter.check(PEER_A, TOPIC_1, 0); // lastSeen 0
+			limiter.check(PEER_B, TOPIC_1, 0); // lastSeen 0
+			limiter.check(PEER_A, TOPIC_2, 0); // lastSeen 0
+			// Refresh one key just inside the TTL so it survives the sweep.
+			limiter.check(PEER_B, TOPIC_1, 1); // lastSeen 1
+			expect(limiter.size).to.equal(3);
+
+			// At t = 1000: the two keys last seen at 0 are idle exactly idleTtlMs (>= → swept); the
+			// refreshed key (age 999 < 1000) is still inside its window and is kept.
+			expect(limiter.sweep(1_000), 'two idle keys swept').to.equal(2);
+			expect(limiter.size, 'only the refreshed key remains').to.equal(1);
+			// The survivor is still tracked: a later sweep well past its TTL drops it too.
+			expect(limiter.sweep(2_000)).to.equal(1);
+			expect(limiter.size).to.equal(0);
+		});
+
+		it('an evicted/idle key returns fresh — full ratePerWindow allowance, strikes reset', () => {
+			const limiter = createRegisterRateLimiter({ maxKeys: 1, ratePerWindow: DEFAULT_REGISTER_RATE_PER_PEER });
+			// Saturate (A, T1) and drive it over-rate to accumulate a strike.
+			for (let i = 0; i < DEFAULT_REGISTER_RATE_PER_PEER; i++) limiter.check(PEER_A, TOPIC_1, i);
+			expect(limiter.check(PEER_A, TOPIC_1, 5).ok, 'over rate before eviction').to.be.false;
+
+			// A distinct key floods past the cap (maxKeys 1) → (A, T1) is evicted.
+			limiter.check(PEER_B, TOPIC_2, 6);
+			expect(limiter.size).to.equal(1);
+
+			// (A, T1) re-appears: fresh key, the full allowance again, no inherited strikes.
+			for (let i = 0; i < DEFAULT_REGISTER_RATE_PER_PEER; i++) {
+				expect(limiter.check(PEER_A, TOPIC_1, 10 + i).ok, `fresh admit ${i}`).to.be.true;
+			}
+		});
+
+		it('a sustained attacker survives a distinct-key flood — back-off keeps escalating, not reset', () => {
+			const limiter = createRegisterRateLimiter({ maxKeys: 4, ratePerWindow: DEFAULT_REGISTER_RATE_PER_PEER });
+			// Saturate (A, T1) within the window.
+			for (let i = 0; i < DEFAULT_REGISTER_RATE_PER_PEER; i++) limiter.check(PEER_A, TOPIC_1, i);
+			// Drive it over-rate twice to build strikes — back-off climbs (attempt 0 → 1).
+			const r1 = limiter.check(PEER_A, TOPIC_1, 5);
+			const r2 = limiter.check(PEER_A, TOPIC_1, 6);
+			expect(r1.ok).to.be.false;
+			expect(r2.ok).to.be.false;
+			if (r1.ok === false && r2.ok === false) {
+				expect(r1.retryAfterMs).to.equal(backoffRetryMs(0));
+				expect(r2.retryAfterMs).to.equal(backoffRetryMs(1));
+			}
+
+			// Interleave a flood of distinct (A, Tn) keys far exceeding maxKeys, re-checking (A, T1)
+			// between each — that refresh keeps the attacker at the MRU end, never the eviction victim.
+			for (let n = 0; n < 20; n++) {
+				limiter.check(PEER_A, bytes(`flood-${n}`), 7 + n);
+				limiter.check(PEER_A, TOPIC_1, 7 + n);
+			}
+			expect(limiter.size, 'the cap held during the flood').to.equal(4);
+
+			// (A, T1) is still over-rate AND its back-off has kept escalating — it was NOT evicted/reset.
+			const after = limiter.check(PEER_A, TOPIC_1, 100);
+			expect(after.ok, 'the sustained attacker is still rejected').to.be.false;
+			if (after.ok === false) {
+				expect(after.retryAfterMs, 'strikes accumulated through the flood, not reset to the floor').to.be.greaterThan(backoffRetryMs(1));
+			}
+		});
+
+		it('rejects invalid maxKeys / idleTtlMs at construction', () => {
+			expect(() => createRegisterRateLimiter({ maxKeys: 0 })).to.throw(RangeError);
+			expect(() => createRegisterRateLimiter({ maxKeys: 2.5 })).to.throw(RangeError);
+			expect(() => createRegisterRateLimiter({ maxKeys: -1 })).to.throw(RangeError);
+			expect(() => createRegisterRateLimiter({ idleTtlMs: 0 })).to.throw(RangeError);
+			expect(() => createRegisterRateLimiter({ idleTtlMs: -1 })).to.throw(RangeError);
 		});
 	});
 

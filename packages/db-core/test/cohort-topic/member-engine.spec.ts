@@ -4,6 +4,7 @@ import { createCohortMemberEngine } from '../../src/cohort-topic/member-engine.j
 import { createRegistrationStore } from '../../src/cohort-topic/registration/store.js';
 import { createRenewalCohortSide } from '../../src/cohort-topic/registration/renewal.js';
 import { createTopicBudget } from '../../src/cohort-topic/antidos/topic-budget.js';
+import { createRegisterRateLimiter } from '../../src/cohort-topic/antidos/rate-limiter.js';
 import { createSlotAssigner } from '../../src/cohort-topic/registration/sharding.js';
 import { createRingHash } from '../../src/cohort-topic/ring-hash.js';
 import { bytesEqual, bytesKey } from '../../src/cohort-topic/registration/bytes.js';
@@ -411,5 +412,71 @@ describe('cohort-topic / member-engine: handleProbe (read-only lookup)', () => {
 		const reply = await engine.handleRegister(mkProbe(TOPIC, bytes('p', 16), 'cid-budget'), { followOn: false, treeTier: 0 }, 2_000);
 		expect(reply.result).to.equal('accepted');
 		expect(calls, 'the probe path consulted its own rate limiter').to.equal(1);
+	});
+});
+
+describe('cohort-topic / member-engine: sweepStale reclaims idle rate-limiter keys', () => {
+	const hash = createRingHash();
+	const slots = createSlotAssigner(hash);
+	const self = bytes('rl-self', 16);
+	const cohortEpoch = bytes('rl-epoch', 32);
+	const members = [self];
+	const cohort = (): { members: readonly Uint8Array[]; cohortEpoch: Uint8Array } => ({ members, cohortEpoch });
+
+	// A cold cohort: never serves a forwarder, so a register lands no_state — but runGuards has already
+	// consulted the rate limiter and allocated its (peer, topic) key by then.
+	const coldStart = { get: (): undefined => undefined, instantiate: (): never => { throw new Error('sweep test must not instantiate'); } } as never;
+
+	function mkReg(topic: Uint8Array, participant: Uint8Array, cid: string, ts: number, probe = false): RegisterV1 {
+		return {
+			v: 1,
+			topicId: bytesKey(topic),
+			tier: 1,
+			treeTier: 0,
+			participantCoord: bytesKey(participant),
+			ttl: 90_000,
+			bootstrap: false,
+			probe,
+			timestamp: ts,
+			correlationId: bytesKey(bytes(cid)),
+			signature: '',
+		};
+	}
+
+	it('drives a register + probe to allocate keys, then sweepStale reclaims both once idle', async () => {
+		const store = createRegistrationStore();
+		const renewal = createRenewalCohortSide({ store, self, slots, cohort, gossip: { touch: (): void => {}, evicted: (): void => {} } });
+		const rateLimiter = createRegisterRateLimiter({ idleTtlMs: 1_000 });
+		const probeRateLimiter = createRegisterRateLimiter({ idleTtlMs: 1_000 });
+		const engine = createCohortMemberEngine({
+			self,
+			profile: unused('profile'),
+			hash,
+			store,
+			slots,
+			willingness: unused('willingness'),
+			promotion: unused('promotion'),
+			coldStart,
+			traffic: unused('traffic'),
+			renewal,
+			cohort,
+			quorumWilling: (): boolean => false, // cold → no_state, but the rate gate ran first
+			rateLimiter,
+			probeRateLimiter,
+		});
+
+		const topic = bytes('rl-topic');
+		const peer = bytes('rl-peer', 16);
+		const reg = await engine.handleRegister(mkReg(topic, peer, 'rl-cid', 1_000), { followOn: false, treeTier: 0 }, 1_000);
+		const probe = await engine.handleRegister(mkReg(topic, peer, 'rl-probe-cid', 1_000, true), { followOn: false, treeTier: 0 }, 1_000);
+		expect(reg.result).to.equal('no_state');
+		expect(probe.result).to.equal('no_state');
+		expect(rateLimiter.size, 'the register allocated a rate-limiter key').to.equal(1);
+		expect(probeRateLimiter.size, 'the probe allocated a probe rate-limiter key').to.equal(1);
+
+		// A gossip-round sweep one idle-TTL past the checks reclaims both keys.
+		engine.sweepStale(1_000 + 1_000);
+		expect(rateLimiter.size, 'the idle register key was reclaimed on the gossip cadence').to.equal(0);
+		expect(probeRateLimiter.size, 'the idle probe key was reclaimed on the gossip cadence').to.equal(0);
 	});
 });
