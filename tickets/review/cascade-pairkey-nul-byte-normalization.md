@@ -15,11 +15,10 @@ NUL bytes so git classifies it as text and future diffs are readable.
 
 ## Verification
 
-- `git diff` still shows "Binary files … differ" for this commit's diff (expected: the *before* side in the index
-  still has the NUL), but future changes to this file will produce normal text diffs.
+- Commit `539173b` contains the fix; the file at HEAD has `\0` escape on line 67.
 - `yarn build` in `packages/db-p2p` exits 0.
 - `yarn test` in `packages/db-p2p` exits 0: 970 passing, 30 pending.
 
-## TODO
+## Known gaps
 
-- [ ] Move to review/
+None — this is a single-character normalization with no logic change.
