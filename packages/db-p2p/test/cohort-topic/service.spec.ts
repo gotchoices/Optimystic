@@ -183,18 +183,29 @@ describe('cohort-topic: service composition (mock transport)', () => {
 		expect(bytesToB64url(handle.primary)).to.equal(before);
 	});
 
-	it('withdraw: stops the local renewal — a post-withdraw renew is a no-op (no member dial)', async () => {
-		const { engine, member } = buildSingleMemberCohort({ memberId: new TextEncoder().encode('member-W'), capPromote: 64 });
+	it('withdraw: sends one signed tombstone that evicts the cohort record immediately, then renew no-ops', async () => {
+		const { engine, member, store } = buildSingleMemberCohort({ memberId: new TextEncoder().encode('member-W'), capPromote: 64 });
 		let dials = 0;
 		const service = buildMockService(engine, member, () => { dials++; });
 
 		const handle = await service.register({ topicId: TOPIC, tier: 0 as Tier });
 		await service.renew(handle);
 		expect(dials, 'a live handle pings its primary').to.equal(1);
+		expect(store.directParticipants(TOPIC), 'the registration is resident before withdraw').to.equal(1);
 
+		// The remote half: withdraw dials the primary once with a tombstone, which evicts the record
+		// immediately (instead of waiting out the TTL).
 		await service.withdraw(handle);
+		expect(dials, 'withdraw sends exactly one tombstone dial').to.equal(2);
+		expect(store.directParticipants(TOPIC), 'the tombstone freed the cohort record immediately').to.equal(0);
+
+		// The local half: the handle dropped out of the live set, so a subsequent renew is a no-op.
 		await service.renew(handle); // withdrawn → must not dial again
-		expect(dials, 'a withdrawn handle no longer pings').to.equal(1);
+		expect(dials, 'a withdrawn handle no longer pings').to.equal(2);
+
+		// Idempotent: a second withdraw finds no live renewal and dials nothing.
+		await service.withdraw(handle);
+		expect(dials, 'a second withdraw is a no-op').to.equal(2);
 	});
 
 	it('lookup: a read-only probe resolves a warmed topic without admitting (no new soft-state)', async () => {

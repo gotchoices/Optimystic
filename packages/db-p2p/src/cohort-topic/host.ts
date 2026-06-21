@@ -493,8 +493,9 @@ interface CoordEngineContext {
 	readonly cohortAround: (coord: RingCoord) => CohortSnapshotView;
 	/** Verify an inbound `RegisterV1`'s participant peer-key signature (live-signer mode only). */
 	readonly verifyRegisterSig?: (reg: RegisterV1) => boolean;
-	/** Verify an inbound `reattach` `RenewV1`'s participant peer-key signature (live-signer mode only). */
-	readonly verifyReattachSig?: (renew: RenewV1) => boolean;
+	/** Verify a privileged `RenewV1`'s participant peer-key signature — gates both the `reattach`
+	 * promotion and the `withdraw` eviction (live-signer mode only). */
+	readonly verifyParticipantSig?: (renew: RenewV1) => boolean;
 	/**
 	 * Sign an outbound `CohortGossipV1` envelope with the node peer key over its canonical image
 	 * ({@link cohortGossipSigningPayload}). Live-signer mode only; absent → gossip ships unsigned (interim,
@@ -590,7 +591,7 @@ export async function createCohortTopicHost(node: Libp2p, fret: FretService, opt
 		: (reg: RegisterV1): boolean =>
 			reg.signature.length > 0 &&
 			verifyPeerSig(b64urlToBytes(reg.participantCoord), registerSigningPayload(reg), b64urlToBytes(reg.signature));
-	const verifyReattachSig = options.privateKey === undefined
+	const verifyParticipantSig = options.privateKey === undefined
 		? undefined
 		: (renew: RenewV1): boolean =>
 			renew.signature.length > 0 &&
@@ -686,7 +687,7 @@ export async function createCohortTopicHost(node: Libp2p, fret: FretService, opt
 		dialSign,
 		cohortAround,
 		verifyRegisterSig,
-		verifyReattachSig,
+		verifyParticipantSig,
 		signGossip,
 		verifyGossip,
 		broadcastNotice,
@@ -1423,7 +1424,7 @@ function createCoordEngine(ctx: CoordEngineContext, servedCoord: RingCoord, tree
 			// A TTL sweep eviction is gossiped so siblings drop the dead record (convergence on eviction).
 			evicted: (rec): void => pending.evicted(rec),
 		},
-		verifyReattachSig: ctx.verifyReattachSig,
+		verifyParticipantSig: ctx.verifyParticipantSig,
 	});
 
 	const engine = createCohortMemberEngine({

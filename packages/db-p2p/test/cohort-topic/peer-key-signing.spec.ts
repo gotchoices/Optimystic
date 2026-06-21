@@ -145,7 +145,7 @@ describe('cohort-topic: reattach forgery rejection (renewal cohort side)', () =>
 		expect(cohortEpoch, 'found an epoch where self is a backup (so a valid reattach can promote it)').to.not.equal(undefined);
 		const epoch = cohortEpoch!;
 
-		const verifyReattachSig = (renew: RenewV1): boolean =>
+		const verifyParticipantSig = (renew: RenewV1): boolean =>
 			renew.signature.length > 0 &&
 			verifyPeerSig(b64urlToBytes(renew.participantId), renewSigningPayload(renew), b64urlToBytes(renew.signature));
 
@@ -155,7 +155,7 @@ describe('cohort-topic: reattach forgery rejection (renewal cohort side)', () =>
 			slots,
 			cohort: () => ({ members, cohortEpoch: epoch }),
 			gossip: { touch: (): void => {}, evicted: (): void => {} },
-			verifyReattachSig,
+			verifyParticipantSig,
 		});
 
 		const rec: RegistrationRecord = {
@@ -195,6 +195,85 @@ describe('cohort-topic: reattach forgery rejection (renewal cohort side)', () =>
 		const valid: RenewV1 = { ...renewBody, signature: bytesToB64url(validSig) };
 		expect(renewal.onRenew(valid, 2_000).result, 'a correctly-signed reattach promotes the backup').to.equal('ok');
 		expect(bytesEqual(store.getByParticipant(TOPIC, participantId)!.primary, selfBytes), 'valid reattach re-stamped self as primary').to.equal(true);
+	});
+});
+
+describe('cohort-topic: withdraw forgery rejection (renewal cohort side)', () => {
+	it('evicts only on a correctly-signed withdraw; a forged or unsigned withdraw never evicts', async () => {
+		const hash = new RingHash();
+		const store = createRegistrationStore();
+		const slots = createSlotAssigner(hash);
+
+		// `self` is any holder of the record — a withdraw needs no slot/primary check, so the assignment
+		// here is irrelevant to whether the eviction is honored (only the signature gate is).
+		const selfBytes = new TextEncoder().encode('cohort-self-wd');
+		const otherBytes = new TextEncoder().encode('cohort-other-wd');
+		const members = [selfBytes, otherBytes];
+		const epoch = hash.H(new TextEncoder().encode('epoch-wd'));
+
+		const participantKey = await generateKeyPair('Ed25519');
+		const participantId = peerIdToBytes(peerIdFromPrivateKey(participantKey));
+
+		const verifyParticipantSig = (renew: RenewV1): boolean =>
+			renew.signature.length > 0 &&
+			verifyPeerSig(b64urlToBytes(renew.participantId), renewSigningPayload(renew), b64urlToBytes(renew.signature));
+
+		let evictedCount = 0;
+		const renewal = createRenewalCohortSide({
+			store,
+			self: selfBytes,
+			slots,
+			cohort: () => ({ members, cohortEpoch: epoch }),
+			gossip: { touch: (): void => {}, evicted: (): void => { evictedCount++; } },
+			verifyParticipantSig,
+		});
+
+		const seedRecord = (): void => {
+			store.put({
+				topicId: TOPIC,
+				participantId,
+				tier: 0,
+				primary: otherBytes,
+				backups: [selfBytes],
+				attachedAt: 0,
+				lastPing: 0,
+				ttl: 90_000,
+			});
+		};
+		seedRecord();
+
+		const withdrawBody: Omit<RenewV1, 'signature'> = {
+			v: 1,
+			topicId: bytesToB64url(TOPIC),
+			participantId: bytesToB64url(participantId),
+			correlationId: bytesToB64url(new TextEncoder().encode('cid-withdraw')),
+			timestamp: 1_000,
+			withdraw: true,
+		};
+
+		// Forged (signed by a different key) → ignored: record stays, no eviction gossiped, opaque reply.
+		const forgedSig = await signPeer(await generateKeyPair('Ed25519'), renewSigningPayload(withdrawBody));
+		const forged: RenewV1 = { ...withdrawBody, signature: bytesToB64url(forgedSig) };
+		expect(renewal.onRenew(forged, 2_000).result, 'forged withdraw reveals nothing').to.equal('unknown_registration');
+		expect(store.getByParticipant(TOPIC, participantId), 'forged withdraw did not evict').to.not.equal(undefined);
+		expect(evictedCount, 'forged withdraw gossiped no eviction').to.equal(0);
+
+		// Unsigned → ignored.
+		const unsigned: RenewV1 = { ...withdrawBody, signature: '' };
+		expect(renewal.onRenew(unsigned, 2_000).result, 'unsigned withdraw reveals nothing').to.equal('unknown_registration');
+		expect(store.getByParticipant(TOPIC, participantId), 'unsigned withdraw did not evict').to.not.equal(undefined);
+		expect(evictedCount).to.equal(0);
+
+		// Correctly signed by the participant → evicts + gossips exactly once.
+		const validSig = await signPeer(participantKey, renewSigningPayload(withdrawBody));
+		const valid: RenewV1 = { ...withdrawBody, signature: bytesToB64url(validSig) };
+		expect(renewal.onRenew(valid, 2_000).result, 'a correctly-signed withdraw evicts').to.equal('withdrawn');
+		expect(store.getByParticipant(TOPIC, participantId), 'valid withdraw removed the record').to.equal(undefined);
+		expect(evictedCount, 'valid withdraw gossiped exactly one eviction').to.equal(1);
+
+		// Idempotent: a second withdraw of the now-gone record is the opaque unknown_registration, no gossip.
+		expect(renewal.onRenew(valid, 2_100).result, 'double withdraw is idempotent').to.equal('unknown_registration');
+		expect(evictedCount, 'no second eviction gossiped').to.equal(1);
 	});
 });
 

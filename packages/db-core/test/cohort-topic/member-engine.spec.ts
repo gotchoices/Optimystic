@@ -11,7 +11,7 @@ import { bytesEqual, bytesKey } from '../../src/cohort-topic/registration/bytes.
 import { DEFAULT_TTL_MS } from '../../src/cohort-topic/registration/types.js';
 import type { RegistrationRecord } from '../../src/cohort-topic/registration/types.js';
 import { createColdStartManager } from '../../src/cohort-topic/coldstart.js';
-import type { RegisterV1 } from '../../src/cohort-topic/wire/types.js';
+import type { RegisterV1, RenewV1 } from '../../src/cohort-topic/wire/types.js';
 
 function bytes(label: string, len = 32): Uint8Array {
 	return sha256(new TextEncoder().encode(label)).slice(0, len);
@@ -135,6 +135,30 @@ describe('cohort-topic / member-engine sweepStale → topic-budget release', () 
 		// Must not throw with no budget to re-touch.
 		const evicted = engine.sweepStale(1_000 + DEFAULT_TTL_MS + 1);
 		expect(evicted.length).to.equal(1);
+	});
+
+	it('a withdraw via handleRenew releases the topic budget to 0 and records no arrival', () => {
+		// `makeEngine` stubs `traffic` with the `unused` proxy, so the withdraw path failing into
+		// `recordArrival` (the `ok` branch) would throw — this simultaneously asserts "no arrival recorded".
+		const { engine, store, budget } = makeEngine();
+		const TOPIC = bytes('withdraw-topic');
+		const p = bytes('p', 16);
+		admit(store, budget, TOPIC, p, 1_000);
+		expect(budget.participantCount(TOPIC), 'admitted topic carries its participant count').to.equal(1);
+
+		const withdraw: RenewV1 = {
+			v: 1,
+			topicId: bytesKey(TOPIC),
+			participantId: bytesKey(p),
+			correlationId: bytesKey(bytes('cid-withdraw')),
+			timestamp: 2_000,
+			withdraw: true,
+			signature: '',
+		};
+		const reply = engine.handleRenew(withdraw, 2_000);
+		expect(reply.result, 'the holder accepted the withdraw').to.equal('withdrawn');
+		expect(store.getByParticipant(TOPIC, p), 'the record was evicted').to.equal(undefined);
+		expect(budget.participantCount(TOPIC), 'the freed slot was released to 0 (no leak)').to.equal(0);
 	});
 });
 

@@ -35,6 +35,13 @@ export interface RenewalParticipant {
 	pingLoop(): Promise<void>;
 	/** Re-attach to `target` (a backup), carrying the existing record; resolves with the reply. */
 	reattach(target: Uint8Array): Promise<RenewReplyV1>;
+	/**
+	 * Best-effort remote tombstone: send a signed withdraw renew to the current primary so the cohort
+	 * frees the registration immediately rather than holding it for a full TTL. Swallows any transport
+	 * failure (TTL expiry remains the fallback) and does NOT touch the failure counters or trigger
+	 * failover — withdraw is one-shot and fire-and-forget.
+	 */
+	withdraw(): Promise<void>;
 	/** `ttl/3` cadence the scheduler should call {@link pingLoop} at. */
 	readonly pingIntervalMs: number;
 	/** The participant's current view of its registration (primary/backups). */
@@ -105,13 +112,24 @@ class TtlRenewalParticipant implements RenewalParticipant {
 	}
 
 	async reattach(target: Uint8Array): Promise<RenewReplyV1> {
-		return this.deps.transport.send(target, await this.buildRenew(true));
+		return this.deps.transport.send(target, await this.buildRenew({ reattach: true }));
+	}
+
+	async withdraw(): Promise<void> {
+		// Fire-and-forget signed tombstone to the current primary. A send failure is swallowed — the
+		// record TTL-expires as it does today (the local-half fallback) — and crucially we never bump
+		// `consecutiveFailures` or fail over: the participant is leaving, not recovering.
+		try {
+			await this.deps.transport.send(this.current.primary, await this.buildRenew({ withdraw: true }));
+		} catch {
+			/* best-effort; the cohort TTL bounds the leak */
+		}
 	}
 
 	/** Send a renew, mapping an RPC rejection to `undefined` (a counted failure). */
 	private async trySend(target: Uint8Array): Promise<RenewReplyV1 | undefined> {
 		try {
-			return await this.deps.transport.send(target, await this.buildRenew(false));
+			return await this.deps.transport.send(target, await this.buildRenew({}));
 		} catch {
 			return undefined;
 		}
@@ -199,11 +217,12 @@ class TtlRenewalParticipant implements RenewalParticipant {
 	}
 
 	/**
-	 * Build a signed renew. `reattach=true` (crash-failover) is carried inside the signed body so the
-	 * accepting member can trust the attestation; a plain ping omits the field entirely (a stray renew
-	 * can never silently usurp a live primary).
+	 * Build a signed renew. The `reattach=true` (crash-failover) / `withdraw=true` (leave tombstone)
+	 * flags are carried inside the signed body so the accepting member can trust the attestation; a plain
+	 * ping omits both fields entirely (a stray renew can never silently usurp a live primary or evict a
+	 * registration). Each flag is set only when true, matching the current plain-ping wire shape.
 	 */
-	private async buildRenew(reattach: boolean): Promise<RenewV1> {
+	private async buildRenew(opts: { reattach?: boolean; withdraw?: boolean }): Promise<RenewV1> {
 		const body: UnsignedRenew = {
 			v: 1,
 			topicId: bytesKey(this.current.topicId),
@@ -211,8 +230,11 @@ class TtlRenewalParticipant implements RenewalParticipant {
 			correlationId: this.deps.correlationId,
 			timestamp: this.deps.clock(),
 		};
-		if (reattach) {
+		if (opts.reattach === true) {
 			body.reattach = true;
+		}
+		if (opts.withdraw === true) {
+			body.withdraw = true;
 		}
 		return { ...body, signature: await this.deps.sign(body) };
 	}
@@ -250,13 +272,14 @@ export interface RenewalCohortSideDeps {
 	isServing?: (topicId: Uint8Array, participantId: Uint8Array) => boolean;
 	/**
 	 * Optional participant peer-key signature verifier (db-p2p binds it to the peer-sig primitive over
-	 * {@link import("../wire/payloads.js").renewSigningPayload}). Checked **only** on a `reattach`
-	 * renew — the privilege-escalating path: a `reattach` whose signature does not verify against the
-	 * claimed `participantId` must never promote a backup (a stray/MITM'd ping cannot usurp a live
-	 * primary, §TTL and renewal). Absent → the gate is skipped (unit tests run without peer crypto);
-	 * plain pings are not verified here (they only touch `lastPing`).
+	 * {@link import("../wire/payloads.js").renewSigningPayload}). It gates the two privileged
+	 * participant-attested paths: a `reattach` promotion and a `withdraw` eviction. A renew on either path
+	 * whose signature does not verify against the claimed `participantId` must never act — a stray/MITM'd
+	 * ping cannot usurp a live primary or evict someone else's registration (§TTL and renewal). Absent →
+	 * the gate is skipped (unit tests run without peer crypto); plain pings are never verified here (they
+	 * only touch `lastPing`).
 	 */
-	verifyReattachSig?: (renew: RenewV1) => boolean;
+	verifyParticipantSig?: (renew: RenewV1) => boolean;
 }
 
 /** Cohort-side TTL handling: touch on renew, redirect on rotation, sweep stale records. */
@@ -286,16 +309,33 @@ class StoreRenewalCohortSide implements RenewalCohortSide {
 		if (rec === undefined) {
 			return { v: 1, result: "unknown_registration" };
 		}
+		const key = recordKey(topicId, participantId);
+
+		if (msg.withdraw === true) {
+			// Signed leave attestation. A forged/missing signature must never evict someone else's
+			// registration → ignore, revealing nothing (`unknown_registration`, the same opaque answer a
+			// non-existent record gets). The gate is absent in key-less unit mode, matching reattach.
+			// `withdraw` is checked before the slot/primary computation: a withdraw needs no slot or
+			// primary check (any holder evicts its replica), and it takes precedence over a (malformed)
+			// co-set `reattach` — a record being withdrawn is gone regardless of a promotion request.
+			if (this.deps.verifyParticipantSig?.(msg) === false) {
+				return { v: 1, result: "unknown_registration" };
+			}
+			this.deps.store.delete(topicId, participantId);
+			this.failoverServing.delete(key); // mirror sweepStale: drop any crash-failover override
+			this.deps.gossip.evicted(rec);
+			return { v: 1, result: "withdrawn" };
+		}
+
 		const { members, cohortEpoch } = this.deps.cohort();
 		const { primary, backups } = this.deps.slots.assignSlots(participantId, cohortEpoch, members);
 		const self = this.deps.self;
-		const key = recordKey(topicId, participantId);
 
 		if (msg.reattach === true) {
 			// Crash-failover promotion request (participant attests primary unreachable). The signed
 			// `reattach` flag is what a backup trusts to promote itself, so a missing/forged signature
 			// must never escalate: fall through to a plain redirect (never promote).
-			if (this.deps.verifyReattachSig?.(msg) === false) {
+			if (this.deps.verifyParticipantSig?.(msg) === false) {
 				return this.primaryMoved(primary, backups, cohortEpoch);
 			}
 			if (bytesEqual(primary, self)) {

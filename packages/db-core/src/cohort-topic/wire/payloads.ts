@@ -11,8 +11,8 @@
  * array (array order is stable, unlike object key order) as UTF-8 — never the `signature` envelope.
  * Optional fields are normalized to a fixed placeholder (`bootstrap`→`false`, `probe`→`false`,
  * `appPayload`→`null`, `bootstrapEvidence`→`null` with an empty string treated as absent,
- * `reattach`→`false`) so an absent optional and a present-but-default optional can never disagree
- * across the wire round-trip.
+ * `reattach`→`false`, `withdraw`→`false`) so an absent optional and a present-but-default optional can
+ * never disagree across the wire round-trip.
  */
 
 import type { CohortGossipV1, RegisterV1, RenewV1 } from "./types.js";
@@ -61,6 +61,11 @@ export function renewSigningPayload(body: RenewSignable): Uint8Array {
 		body.correlationId,
 		body.timestamp,
 		body.reattach ?? false,
+		// A withdraw tombstone signs `withdraw: true`, a ping/reattach signs `false`. Strictly appended
+		// (array length 7→8) so the reattach-vs-ping distinction is preserved and a third party cannot
+		// evict someone else's registration. Signer (participant) + verifier (db-p2p) move together; no
+		// signatures are persisted, so there is no cross-version concern.
+		body.withdraw ?? false,
 	]));
 }
 

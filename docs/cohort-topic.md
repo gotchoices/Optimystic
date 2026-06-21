@@ -1127,14 +1127,21 @@ warm-failover target.
 
 **Still deferred (parked in backlog, honestly out of scope for this milestone):** multi-tier
 promoted-redirect *follow-on* instantiation (`cohort-topic-followon-derivation`) and the parent-side
-child-cohort link recording (`cohort-topic-parent-child-link`); and an immediate
-**withdraw tombstone** (today `withdraw` stops renewing and lets the soft state TTL-expire).
+child-cohort link recording (`cohort-topic-parent-child-link`).
 
 > **Landed since:** the read-only **lookup-probe** RPC — `lookup` now drives the walk with
 > `RegisterV1.probe: true`, classifying the terminal cohort and returning the same snapshot a register
 > would **without admitting anything** (no soft-state record, no arrival, no promotion trigger, no
 > topic-budget touch, and never a cold-start instantiation), so a lookup leaves no TTL-expiring
 > registration behind. See §Lookup and §Wire formats (`RegisterV1.probe`).
+>
+> **Landed since:** the immediate **withdraw tombstone** — `withdraw` now both stops the local ping loop
+> AND sends a best-effort signed `RenewV1.withdraw: true` to the current primary, which evicts the record
+> and gossips the eviction so the cohort frees the slot immediately rather than holding it for up to a
+> full TTL. The signature (over the renew body, sibling to `reattach`) stops a third party evicting
+> someone else's registration; a forged/unsigned withdraw is answered `unknown_registration` and evicts
+> nothing. If the primary is unreachable the send is swallowed and TTL expiry remains the fallback. See
+> §TTL and renewal and §Wire formats (`RenewV1.withdraw`, `RenewReplyV1` result `withdrawn`).
 
 ---
 

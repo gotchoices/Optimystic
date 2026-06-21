@@ -235,6 +235,12 @@ class StoreCohortMemberEngine implements CohortMemberEngine {
 		if (reply.result === "ok") {
 			// A renewal is an arrival proxy for the traffic barometer (§Topic traffic signal).
 			this.deps.traffic.recordArrival(b64urlToBytes(msg.topicId), now);
+		} else if (reply.result === "withdrawn") {
+			// A withdraw evicted a direct participant: re-touch the topic budget DOWN (mirrors the
+			// sweepStale drain release below) so the freed slot does not leak. Never an arrival — it is a
+			// departure, so the traffic barometer is deliberately not touched.
+			const topicId = b64urlToBytes(msg.topicId);
+			this.deps.topicBudget?.touch(topicId, this.deps.store.directParticipants(topicId));
 		}
 		return reply;
 	}

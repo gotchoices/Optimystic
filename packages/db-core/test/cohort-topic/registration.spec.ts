@@ -375,7 +375,7 @@ describe('cohort-topic / renewal participant', () => {
 
 // --- renewal: cohort side ---
 
-function renewMsg(rec: RegistrationRecord, reattach = false): RenewV1 {
+function renewMsg(rec: RegistrationRecord, reattach = false, withdraw = false): RenewV1 {
 	const msg: RenewV1 = {
 		v: 1,
 		topicId: bytesKey(rec.topicId),
@@ -386,6 +386,9 @@ function renewMsg(rec: RegistrationRecord, reattach = false): RenewV1 {
 	};
 	if (reattach) {
 		msg.reattach = true;
+	}
+	if (withdraw) {
+		msg.withdraw = true;
 	}
 	return msg;
 }
@@ -623,6 +626,102 @@ describe('cohort-topic / renewal cohort side', () => {
 		expect(evicted).to.have.length(2);
 		expect(gossip.evictedKeys.sort()).to.deep.equal([bytesKey(bytes('s1')), bytesKey(bytes('s2'))].sort());
 		expect(store.directParticipants(t)).to.equal(1);
+	});
+
+	// --- withdraw tombstone (remote half) ---
+
+	/** A cohort side with an explicit participant-sig gate (the privileged-path verifier). */
+	function sideWithGate(self: Uint8Array, gossip: RecordingGossip, verifyParticipantSig: (renew: RenewV1) => boolean, store = createRegistrationStore()) {
+		return {
+			store,
+			side: createRenewalCohortSide({
+				store,
+				self,
+				slots,
+				cohort: () => ({ members: cohortMembers, cohortEpoch: epoch }),
+				gossip,
+				verifyParticipantSig,
+			}),
+		};
+	}
+
+	it('evicts a held record on a withdraw and gossips the eviction (gate absent → unit mode)', () => {
+		const t = topic('W');
+		const p = bytes('wp1');
+		const { primary, backups } = slots.assignSlots(p, epoch, cohortMembers);
+		const gossip = new RecordingGossip();
+		// `self` is a backup, NOT the computed primary — any holder evicts on a withdraw (no slot check).
+		const { store, side } = sideAt(backups[0]!, gossip);
+		store.put(record({ topicId: t, participantId: p, primary, backups, lastPing: 1_000 }));
+
+		const reply = side.onRenew(renewMsg(record({ topicId: t, participantId: p }), false, true), 5_000);
+		expect(reply.result, 'withdraw accepted').to.equal('withdrawn');
+		expect(store.getByParticipant(t, p), 'record removed from the store').to.equal(undefined);
+		expect(gossip.evictedKeys, 'eviction gossiped exactly once').to.deep.equal([bytesKey(p)]);
+	});
+
+	it('a withdraw whose signature fails verification reveals nothing and never evicts', () => {
+		const t = topic('W');
+		const p = bytes('wp2');
+		const { primary, backups } = slots.assignSlots(p, epoch, cohortMembers);
+		const gossip = new RecordingGossip();
+		const { store, side } = sideWithGate(backups[0]!, gossip, () => false);
+		store.put(record({ topicId: t, participantId: p, primary, backups, lastPing: 1_000 }));
+
+		const reply = side.onRenew(renewMsg(record({ topicId: t, participantId: p }), false, true), 5_000);
+		expect(reply.result, 'forged withdraw is opaque').to.equal('unknown_registration');
+		expect(store.getByParticipant(t, p), 'record still present').to.not.equal(undefined);
+		expect(gossip.evictedKeys, 'no eviction gossiped').to.deep.equal([]);
+	});
+
+	it('a withdraw whose signature verifies (gate present) evicts', () => {
+		const t = topic('W');
+		const p = bytes('wp3');
+		const { primary, backups } = slots.assignSlots(p, epoch, cohortMembers);
+		const gossip = new RecordingGossip();
+		const { store, side } = sideWithGate(backups[0]!, gossip, () => true);
+		store.put(record({ topicId: t, participantId: p, primary, backups, lastPing: 1_000 }));
+
+		expect(side.onRenew(renewMsg(record({ topicId: t, participantId: p }), false, true), 5_000).result).to.equal('withdrawn');
+		expect(store.getByParticipant(t, p)).to.equal(undefined);
+		expect(gossip.evictedKeys).to.deep.equal([bytesKey(p)]);
+	});
+
+	it('a double withdraw is idempotent: the second finds no record (unknown_registration), no second gossip', () => {
+		const t = topic('W');
+		const p = bytes('wp4');
+		const { primary, backups } = slots.assignSlots(p, epoch, cohortMembers);
+		const gossip = new RecordingGossip();
+		const { store, side } = sideAt(backups[0]!, gossip);
+		store.put(record({ topicId: t, participantId: p, primary, backups, lastPing: 1_000 }));
+
+		expect(side.onRenew(renewMsg(record({ topicId: t, participantId: p }), false, true), 5_000).result).to.equal('withdrawn');
+		const second = side.onRenew(renewMsg(record({ topicId: t, participantId: p }), false, true), 5_100);
+		expect(second.result, 'second withdraw is opaque').to.equal('unknown_registration');
+		expect(gossip.evictedKeys, 'only one eviction gossiped total').to.deep.equal([bytesKey(p)]);
+	});
+
+	it('a withdraw clears a prior crash-failover override (no stale serve afterward)', () => {
+		const t = topic('W');
+		const p = bytes('wp5');
+		const { primary, backups } = slots.assignSlots(p, epoch, cohortMembers);
+		const self = backups[0]!; // a computed backup that accepts the takeover
+		const gossip = new RecordingGossip();
+		const { store, side } = sideAt(self, gossip);
+		store.put(record({ topicId: t, participantId: p, primary, backups, lastPing: 1_000 }));
+
+		// Accept a reattach → failover override recorded under the current epoch, primary re-stamped to self.
+		expect(side.onRenew(renewMsg(record({ topicId: t, participantId: p }), true), 2_000).result).to.equal('ok');
+		// Withdraw → evicts AND clears the override.
+		expect(side.onRenew(renewMsg(record({ topicId: t, participantId: p }), false, true), 3_000).result).to.equal('withdrawn');
+		expect(store.getByParticipant(t, p)).to.equal(undefined);
+
+		// Re-register under the UNCHANGED epoch naming the deterministic primary again; a plain ping to
+		// `self` (no longer the computed primary, override gone) must redirect — not serve via a stale override.
+		store.put(record({ topicId: t, participantId: p, primary, backups, lastPing: 4_000 }));
+		const reply = side.onRenew(renewMsg(record({ topicId: t, participantId: p })), 4_100);
+		expect(reply.result, 'stale override did not survive the withdraw').to.equal('primary_moved');
+		expect(bytesEqual(b64urlToBytes(reply.newPrimary!), primary)).to.be.true;
 	});
 });
 

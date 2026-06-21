@@ -13,6 +13,7 @@ import {
 	decodeCohortGossipV1,
 	decodeMembershipCertV1,
 	registerSigningPayload,
+	renewSigningPayload,
 	CohortWireError,
 	DEFAULT_MAX_MESSAGE_BYTES,
 } from '../../src/cohort-topic/wire/index.js';
@@ -444,6 +445,41 @@ describe('cohort-topic wire', () => {
 			const bad = { ...sampleRenew(), reattach: 'yes' };
 			const frame = encodeCohortMessage(bad as unknown as { v: 1 });
 			expect(() => decodeRenewV1(frame)).to.throw(CohortWireError, /reattach/);
+		});
+
+		it('round-trips a RenewV1 carrying the signed withdraw flag', () => {
+			const msg: RenewV1 = { ...sampleRenew(), withdraw: true };
+			const decoded = decodeRenewV1(encodeCohortMessage(msg));
+			expect(decoded).to.deep.equal(msg);
+			expect(decoded.withdraw).to.equal(true);
+		});
+
+		it('decodes a RenewV1 without withdraw to an object lacking the field (back-compat plain ping)', () => {
+			const decoded = decodeRenewV1(encodeCohortMessage(sampleRenew()));
+			expect(decoded).to.not.have.property('withdraw');
+		});
+
+		it('rejects a non-boolean withdraw', () => {
+			const bad = { ...sampleRenew(), withdraw: 'yes' };
+			const frame = encodeCohortMessage(bad as unknown as { v: 1 });
+			expect(() => decodeRenewV1(frame)).to.throw(CohortWireError, /withdraw/);
+		});
+
+		it('round-trips a RenewReply carrying the withdrawn result', () => {
+			const msg: RenewReplyV1 = { v: 1, result: 'withdrawn' };
+			const decoded = decodeRenewReplyV1(encodeCohortMessage(msg));
+			expect(decoded).to.deep.equal(msg);
+		});
+
+		it('the renew signing image distinguishes withdraw, reattach, and a plain ping over the same fields', () => {
+			const base = sampleRenew();
+			const plain = bytesToB64url(renewSigningPayload(base));
+			const withdraw = bytesToB64url(renewSigningPayload({ ...base, withdraw: true }));
+			const reattach = bytesToB64url(renewSigningPayload({ ...base, reattach: true }));
+			expect(withdraw, 'withdraw signs a distinct image from a plain ping').to.not.equal(plain);
+			expect(withdraw, 'withdraw signs a distinct image from a reattach').to.not.equal(reattach);
+			// An absent flag and an explicit-false flag normalize to the same image (no signature ambiguity).
+			expect(bytesToB64url(renewSigningPayload({ ...base, withdraw: false })), 'withdraw:false === absent').to.equal(plain);
 		});
 	});
 

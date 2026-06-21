@@ -252,6 +252,7 @@ export function validateRenewV1(value: unknown): RenewV1 {
 		signature: b64urlField(reqString(obj, "signature", what), "signature", what),
 	};
 	assignDefined(out, "reattach", optBool(obj, "reattach", what));
+	assignDefined(out, "withdraw", optBool(obj, "withdraw", what));
 	return out;
 }
 
@@ -261,7 +262,7 @@ export function validateRenewReplyV1(value: unknown): RenewReplyV1 {
 	requireV1(obj, what);
 	const out: RenewReplyV1 = {
 		v: 1,
-		result: reqEnum(obj, "result", ["ok", "unknown_registration", "primary_moved"] as const, what),
+		result: reqEnum(obj, "result", ["ok", "unknown_registration", "primary_moved", "withdrawn"] as const, what),
 	};
 	assignDefined(out, "newPrimary", optString(obj, "newPrimary", what));
 	assignDefined(out, "newBackups", optStringArray(obj, "newBackups", what));

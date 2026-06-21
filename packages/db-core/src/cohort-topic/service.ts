@@ -95,7 +95,8 @@ export interface CohortTopicService {
 	renew(handle: RegistrationHandle): Promise<void>;
 	/** Resolve the cohort for `topicId` at `tier` without keeping a live registration. */
 	lookup(topicId: Uint8Array, tier: Tier): Promise<CohortHint>;
-	/** Stop renewing `handle`; the cohort soft-state TTL-expires. */
+	/** Stop renewing `handle` and send a best-effort signed withdraw tombstone so the cohort frees the
+	 * record immediately (TTL expiry remains the fallback if the primary is unreachable). */
 	withdraw(handle: RegistrationHandle): Promise<void>;
 	/** Origination hook the change-notifier bridge invokes per local member commit; see {@link LocalChangeHook}. */
 	onLocalCommit?: LocalChangeHook;
@@ -239,10 +240,17 @@ class WalkRegisterService implements CohortTopicService {
 	}
 
 	async withdraw(handle: RegistrationHandle): Promise<void> {
-		// No explicit withdraw RPC exists on the wire yet; dropping the handle from the live set stops
-		// further renew() pings (see renew()), so the cohort soft-state TTL-expires (§TTL and renewal).
-		// An immediate-tombstone renew is a documented follow-on.
-		this.renewals.delete(recordKey(handle.topicId, this.participantId));
+		// Two halves: (1) drop the handle from the live set so further renew() pings no-op (see renew()),
+		// stopping the local ping loop; (2) fire a best-effort signed withdraw tombstone to the current
+		// primary so the cohort frees the record immediately instead of holding it for up to a full TTL.
+		// The delete happens FIRST so a concurrent renew() already no-ops before the tombstone is sent. If
+		// the tombstone send fails (primary unreachable), the cohort soft-state TTL-expires as the
+		// fallback — withdraw never throws on a transport failure. Idempotent: a second withdraw finds
+		// `renewal === undefined` and no-ops.
+		const key = recordKey(handle.topicId, this.participantId);
+		const renewal = this.renewals.get(key);
+		this.renewals.delete(key);
+		await renewal?.withdraw();
 	}
 
 	cohortGossip(): CohortGossipBus {

@@ -117,13 +117,26 @@ export interface RenewV1 {
 	 * renew body) so a member can trust the attestation and a MITM cannot flip a ping into a promotion.
 	 */
 	reattach?: boolean;
+	/**
+	 * True on a withdraw tombstone — the participant attests it is leaving; the holder evicts the
+	 * record immediately and gossips the eviction (freeing the cohort slot rather than holding it for a
+	 * full TTL). Absent/false on a ping or reattach. Signed (part of the renew body) so a third party
+	 * cannot evict someone else's registration. Mutually exclusive with {@link reattach} (the participant
+	 * never sets both; on a malformed frame that sets both, the cohort side honors `withdraw`).
+	 */
+	withdraw?: boolean;
 	signature: string;
 }
 
 /** Renewal reply. */
 export interface RenewReplyV1 {
 	v: 1;
-	result: "ok" | "unknown_registration" | "primary_moved";
+	/**
+	 * `withdrawn` answers a {@link RenewV1.withdraw} tombstone the holder accepted (record evicted +
+	 * gossiped); the participant ignores it (it is leaving), but the distinct result lets the cohort
+	 * side branch unambiguously (re-touch the topic budget down, never count an arrival).
+	 */
+	result: "ok" | "unknown_registration" | "primary_moved" | "withdrawn";
 	// primary_moved:
 	newPrimary?: string;
 	newBackups?: string[];
