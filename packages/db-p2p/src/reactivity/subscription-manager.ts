@@ -311,7 +311,8 @@ export class ReactivitySubscriptionManager {
 		await this.service.renew(this.handle);
 	}
 
-	/** Withdraw: stop renewing so the registration TTL-expires. */
+	/** Withdraw: stop renewing and send a best-effort signed tombstone so the cohort frees the
+	 * registration immediately (TTL expiry remains the fallback if the primary is unreachable). */
 	async withdraw(): Promise<void> {
 		if (this.handle !== undefined) {
 			await this.service.withdraw(this.handle);

@@ -54,7 +54,8 @@ export class MatchmakingSeekerManager {
 		return this.handle;
 	}
 
-	/** Drop the seeker registration (stop any renewal); the cohort soft-state TTL-expires. */
+	/** Drop the seeker registration: stop renewing and send a best-effort signed tombstone so the
+	 * cohort frees the record immediately (TTL expiry is the fallback if the primary is unreachable). */
 	async withdraw(): Promise<void> {
 		if (this.handle !== undefined) {
 			await this.service.withdraw(this.handle);

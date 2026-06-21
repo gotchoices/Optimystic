@@ -138,7 +138,8 @@ export class MatchmakingProviderSession {
 		await this.requireManager().signalFull();
 	}
 
-	/** Withdraw (`RenewV1` TTL = 0 — an optimization; the record otherwise TTL-expires). No-op before register. */
+	/** Withdraw: sends a best-effort signed `RenewV1.withdraw` tombstone so the cohort frees the record
+	 * immediately (an optimization; the record otherwise TTL-expires). No-op before register. */
 	async withdraw(): Promise<void> {
 		await this.manager?.withdraw();
 	}
@@ -238,7 +239,8 @@ export class MatchmakingSeekerSession {
 		await this.manager.register();
 	}
 
-	/** Drop the seeker registration (the cohort soft-state TTL-expires). No-op before register. */
+	/** Drop the seeker registration: sends a best-effort tombstone so the cohort frees the record
+	 * immediately (the record otherwise TTL-expires). No-op before register. */
 	async withdraw(): Promise<void> {
 		await this.manager?.withdraw();
 	}

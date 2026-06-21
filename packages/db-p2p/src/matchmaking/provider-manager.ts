@@ -81,7 +81,8 @@ export class MatchmakingProviderManager {
 		return this.register();
 	}
 
-	/** Withdraw: stop renewing so the record TTL-expires (optimization, not correctness). */
+	/** Withdraw: stop renewing and send a best-effort signed tombstone so the cohort frees the record
+	 * immediately; TTL expiry is the fallback (the immediate tombstone is an optimization, not correctness). */
 	async withdraw(): Promise<void> {
 		this.provider.markWithdrawn();
 		if (this.handle !== undefined) {
