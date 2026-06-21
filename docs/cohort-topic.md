@@ -180,8 +180,14 @@ Key points:
 > `UnwillingCohort`), but the terminal cohort **classifies** rather than admits — returning the same
 > `Accepted` / `Promoted` / `NoState` reply without persisting a record, counting an arrival, firing a
 > promotion trigger, touching the topic budget, or instantiating anything. It diverges from a register at
-> exactly one point: the root `NoState` case **backs off** (`CohortBackoffError`) instead of re-issuing
-> `bootstrap: true` — a probe never instantiates a cold root.
+> two points: (1) the root `NoState` case **backs off** (`CohortBackoffError`) instead of re-issuing
+> `bootstrap: true` — a probe never instantiates a cold root; (2) after following a `Promoted` redirect
+> outward, if the promoted child answers `NoState`, the probe **backs off immediately** (`CohortBackoffError`)
+> rather than walking inward to the promoting ancestor — the responsible child shard is not yet
+> instantiated; a probe never instantiates it. Walking back to the ancestor would just re-trigger the
+> `Promoted` redirect and loop. The "resolve the nearest served ancestor" alternative is deferred: the
+> `Promoted` reply carries only `targetTier`, not the ancestor's `primary`/`backups`/`cohortEpoch`, so
+> a richer ancestor hint requires a protocol extension.
 
 > **Implementation.** The participant-side walk is
 > [`packages/db-core/src/cohort-topic/walk.ts`](../packages/db-core/src/cohort-topic/walk.ts)

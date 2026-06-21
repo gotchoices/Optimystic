@@ -156,6 +156,7 @@ class RouterWalkEngine implements WalkEngine {
 		let memberAttempts = 0;
 		let dialTarget: PeerRef | undefined;
 		let steps = 0;
+		let probeFollowedPromoted = false;
 
 		for (;;) {
 			if (++steps > maxSteps) {
@@ -182,6 +183,12 @@ class RouterWalkEngine implements WalkEngine {
 					// Step toward the root. The cohort served nothing here; no spatial sibling state.
 					dialTarget = undefined;
 					memberAttempts = 0;
+					if (probe && probeFollowedPromoted) {
+						// The promoted child is cold (not yet instantiated). A probe never instantiates it,
+						// so back off immediately — walking inward to the promoting ancestor would just
+						// re-trigger the Promoted redirect and loop.
+						return { kind: "retry_later", afterMs: backoffRetryMs(0) };
+					}
 					const next = d - 1;
 					if (next < 0) {
 						if (bootstrap) {
@@ -208,6 +215,9 @@ class RouterWalkEngine implements WalkEngine {
 					memberAttempts = 0;
 					bootstrap = false;
 					const targetTier = reply.targetTier ?? d + 1;
+					if (probe) {
+						probeFollowedPromoted = true;
+					}
 					if (!this.followPromoted) {
 						return { kind: "promoted", targetTier };
 					}

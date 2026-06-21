@@ -341,4 +341,36 @@ describe('cohort-topic / walk-toward-root', () => {
 		expect(router.probes.map((x) => x.treeTier), 'redirect with no targetTier defaults to d+1').to.deep.equal([1, 2]);
 		expect(bytesEqual(router.probes[1]!.coord!, addressing.coord(2, self, TOPIC)), 'recomputes coord at tier d+1').to.be.true;
 	});
+
+	it('probe: livelock bound — promoted-but-cold child resolves to retry_later in ≤ d_max+3 RPCs', async () => {
+		// Repro of the walk-layer livelock: a busy-but-unsharded topic where tier 0 answers Promoted(1)
+		// and tier 1 (the cold child) answers no_state. Without the fix this oscillates for 36 RPCs
+		// (maxSteps); with the fix it terminates after exactly d_max+2 = 6 RPCs.
+		const self = bytes('probe-livelock-participant');
+		const dMax = 4;
+		const promotedCoord = addressing.coord(0, self, TOPIC); // coord_0 is peer-independent
+		// Router: tier 0 always Promoted(1); everything else no_state.
+		const router = new SingleCohortRouter(promotedCoord);
+		const engine = createWalkEngine({ router, addressing, dmax: fixedDMax(dMax), self, factory: factoryFor(self) });
+
+		const outcome = await engine.register(TOPIC, 1, undefined, { probe: true });
+		expect(outcome.kind, 'probe of promoted-but-cold topic resolves to retry_later').to.equal('retry_later');
+		// d_max + 2: inward 4→3→2→1→0 (5 RPCs) + one Promoted follow (RPC 6) + immediate exit = 6 total.
+		expect(router.probes.length, 'terminates well within d_max+3').to.be.lessThanOrEqual(dMax + 3);
+	});
+
+	it('probe: happy path — probe accepted after following a Promoted redirect to a live child', async () => {
+		// Guard against over-eager short-circuiting: a probe that walks inward through no_state, follows
+		// one Promoted outward, and gets accepted at the target tier still returns accepted.
+		const self = bytes('probe-happy-participant');
+		const dMax = 2;
+		// d=2 no_state → d=1 no_state → d=0 Promoted(1) → d=1 accepted.
+		const router = new ScriptedRouter([noState, noState, { v: 1, result: 'promoted', targetTier: 1 }, accepted]);
+		const engine = createWalkEngine({ router, addressing, dmax: fixedDMax(dMax), self, factory: factoryFor(self) });
+
+		const outcome = await engine.register(TOPIC, 1, undefined, { probe: true });
+		expect(outcome.kind, 'probe resolves to accepted when the promoted child is live').to.equal('accepted');
+		expect(router.probes.map((x) => x.treeTier), 'walks inward then follows redirect outward').to.deep.equal([2, 1, 0, 1]);
+		expect(router.probes.every((p) => p.probe), 'all frames carry probe:true').to.equal(true);
+	});
 });
