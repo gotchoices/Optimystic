@@ -148,4 +148,21 @@ describe('cohort-topic / FretTrustAnchor (FRET-ring direct anchor)', () => {
 		cert.signers = [badSigner, ...cert.signers];
 		expect(anchorOver(coveredRing()).directAnchor(cert, FRET_TIER)).to.equal('unknown');
 	});
+
+	it('returns "unknown" for an empty signing quorum (defensive — nothing to judge), never "rejected"', () => {
+		// A cert with no signers cannot pass self-consistency upstream, but the anchor must still be total: an
+		// empty quorum is neither a subset nor wholly disjoint, so the guard short-circuits to "unknown".
+		const cert = certOver(COVERED, []);
+		expect(anchorOver(coveredRing()).directAnchor(cert, FRET_TIER)).to.equal('unknown');
+	});
+
+	it('applies the default churn slack and committed-tier when options omit them', () => {
+		// Construct with neither churnSlack nor maxCommittedTier so the `?? DEFAULT_*` fallbacks are exercised:
+		// the default slack (2) still anchors a k+1 stabilization skew, and the default committed tier (1)
+		// still defers T0/T1 while judging T2.
+		const anchor = new FretTrustAnchor(coveredRing(), { k: K, selfPeerId: SELF });
+		expect(anchor.directAnchor(certOver(COVERED, ['p0', 'p1', 'p2', 'p4']), FRET_TIER), 'default slack anchors a k+1 skew').to.equal('anchored');
+		expect(anchor.directAnchor(certOver(COVERED, ['adv0', 'adv1', 'adv2', 'adv3']), 1), 'default committed tier defers T1').to.equal('unknown');
+		expect(anchor.directAnchor(certOver(COVERED, ['adv0', 'adv1', 'adv2', 'adv3']), FRET_TIER), 'default still rejects a disjoint quorum at T2').to.equal('rejected');
+	});
 });
