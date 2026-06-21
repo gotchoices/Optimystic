@@ -789,8 +789,10 @@ export async function createLibp2pNodeBase(
 				// Wire the node's reputation service in as the production backing for the bootstrap-evidence
 				// referee verifier (the `{ isBanned, getScore }` view `PeerReputationService` satisfies), so a
 				// configured cohort genuinely gates cold-root `bootstrap: true` (PoW always; reputation when a
-				// referee endorsement is offered). Caller-supplied `antiDos` overrides are preserved.
-				antiDos: { ...(options.cohortTopic!.host?.antiDos), reputation },
+				// referee endorsement is offered). The node service is the *default* backing — a caller that
+				// supplies its own `antiDos.reputation` (or any other `antiDos` override) still wins, since the
+				// caller spread comes last.
+				antiDos: { reputation, ...(options.cohortTopic!.host?.antiDos) },
 				privateKey: nodePrivateKey, // real k − x threshold signing
 				wantK: cohortWantK,
 			});
