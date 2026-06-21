@@ -1612,17 +1612,13 @@ function decodeSignableImage(payloadB64: string): unknown[] | undefined {
 	}
 }
 
-/** Deep-equal of an unknown payload field against the endorser's own ascending-sorted base64url member list. */
+/**
+ * Deep-equal of an unknown payload field against the endorser's own ascending-sorted base64url member
+ * list. Guards the `unknown` (a non-array payload field → not a match) before delegating to the shared
+ * ordered-string-array equality; element-wise `!==` makes a non-string entry a mismatch.
+ */
 function sameMemberList(image: unknown, expected: readonly string[]): boolean {
-	if (!Array.isArray(image) || image.length !== expected.length) {
-		return false;
-	}
-	for (let i = 0; i < image.length; i++) {
-		if (image[i] !== expected[i]) {
-			return false;
-		}
-	}
-	return true;
+	return Array.isArray(image) && sameStringOrder(image, expected);
 }
 
 /**
