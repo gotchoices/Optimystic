@@ -10,7 +10,9 @@ import {
 	RingHash,
 	bytesToB64url,
 	b64urlToBytes,
+	membershipCertSignable,
 	membershipCertSigningPayload,
+	promotionNoticeSigningPayload,
 	type IMembershipSource,
 	type IMembershipSourceRouter,
 	type MembershipCertV1,
@@ -25,7 +27,7 @@ import {
 	ED25519_SIG_BYTES,
 } from '../../src/cohort-topic/threshold-crypto.js';
 import { FretMembershipPublishSink } from '../../src/cohort-topic/membership-publish-sink.js';
-import { createCohortTopicHost, handleSignRequest } from '../../src/cohort-topic/host.js';
+import { createCohortTopicHost, handleSignRequest, type SignEndorsementDeps } from '../../src/cohort-topic/host.js';
 import { peerIdToBytes, bytesToPeerIdString } from '../../src/cohort-topic/peer-codec.js';
 import { signPeer, verifyPeerSig } from '../../src/cohort-topic/peer-sig.js';
 
@@ -88,6 +90,39 @@ function certOver(members: Member[], thresholdSig: Uint8Array, signers: Uint8Arr
 		stabilizedAt: 1_000,
 		thresholdSig: bytesToB64url(thresholdSig),
 		signers: signers.map(bytesToB64url),
+	};
+}
+
+/** Mirror the host's `cohortAround` epoch derivation: H(ascending-sorted base64url members joined by '|'). */
+function epochOf(members: Uint8Array[]): Uint8Array {
+	const hash = new RingHash();
+	const input = members.map(bytesToB64url).sort().join('|');
+	return hash.H(new TextEncoder().encode(input));
+}
+
+/** The endorser's own re-derived membership fields for COORD, as `expectedMembershipFields` returns them. */
+function expectedFields(members: Uint8Array[], epoch: Uint8Array): { cohortCoord: string; cohortEpoch: string; members: string[] } {
+	const { cohortCoord, cohortEpoch, members: m } = membershipCertSignable({ coord: COORD, cohortEpoch: epoch, members, stabilizedAt: 0 });
+	return { cohortCoord, cohortEpoch, members: m };
+}
+
+/** A real `MembershipCertV1` signing image over COORD for `(members, epoch, stabilizedAt)`. */
+function membershipImage(members: Uint8Array[], epoch: Uint8Array, stabilizedAt: number): Uint8Array {
+	return membershipCertSigningPayload(membershipCertSignable({ coord: COORD, cohortEpoch: epoch, members, stabilizedAt }));
+}
+
+/**
+ * The `/sign` endorsement deps for `self` over cohort `members` at `epoch`, with the membership-binding dep
+ * wired to the endorser's own re-derived fields `exp` and a fixed clock. Mirrors the host `signEndorse` wiring.
+ */
+function depsFor(self: Member, members: Member[], epoch: Uint8Array, exp: { cohortCoord: string; cohortEpoch: string; members: string[] }, now = 10_000): SignEndorsementDeps {
+	return {
+		privateKey: self.key,
+		selfMember: self.bytes,
+		cohortMembersAround: (): string[] => members.map((m) => m.idStr),
+		currentEpoch: (): Uint8Array => epoch,
+		expectedMembershipFields: (): { cohortCoord: string; cohortEpoch: string; members: string[] } => exp,
+		now: (): number => now,
 	};
 }
 
@@ -244,19 +279,104 @@ describe('cohort-topic: /sign endorsement policy', () => {
 		payload: bytesToB64url(PAYLOAD),
 	};
 
-	it('endorses with a verifiable peer-key signature when self + requester share the cohort + epoch', async () => {
+	it('endorses a real membership cert image that matches the endorser view, with a verifiable signature', async () => {
 		const [self, requester] = await makeMembers(2);
-		const reply = await handleSignRequest(baseReq, requester!.idStr, {
+		const realMembers = [self!.bytes, requester!.bytes];
+		const epoch = epochOf(realMembers);
+		const exp = expectedFields(realMembers, epoch);
+		const payload = membershipImage(realMembers, epoch, 1_000);
+		const req: SignRequestV1 = { v: 1, kind: 'membership', coord: bytesToB64url(COORD), cohortEpoch: bytesToB64url(epoch), payload: bytesToB64url(payload) };
+
+		const reply = await handleSignRequest(req, requester!.idStr, depsFor(self!, [self!, requester!], epoch, exp));
+		expect('signer' in reply, 'an endorsement, not a refusal').to.equal(true);
+		if ('signer' in reply) {
+			expect(verifyPeerSig(b64urlToBytes(reply.signer), payload, b64urlToBytes(reply.signature)), 'signature verifies against the endorser key').to.equal(true);
+			expect(bytesToPeerIdString(b64urlToBytes(reply.signer)), 'signer id is self').to.equal(self!.idStr);
+		}
+	});
+
+	it('refuses a membership payload whose members do not match the endorser view (falsified cert)', async () => {
+		// The core attack: SAME honest epoch field, but an INFLATED members list. Currently the OLD policy would
+		// sign it (the wire-field epoch gate never binds the payload-internal members) — this asserts it is refused.
+		const [self, requester, ...rest] = await makeMembers(5);
+		const realMembers = [self!.bytes, requester!.bytes];
+		const honestEpoch = epochOf(realMembers);
+		const exp = expectedFields(realMembers, honestEpoch);
+		const forged = membershipImage([self!, requester!, ...rest].map((m) => m.bytes), honestEpoch, 1_000);
+		const req: SignRequestV1 = {
+			v: 1, kind: 'membership', coord: bytesToB64url(COORD),
+			cohortEpoch: bytesToB64url(honestEpoch), // honest wire epoch — passes the cohort + wire-epoch gate
+			payload: bytesToB64url(forged),
+		};
+
+		const reply = await handleSignRequest(req, requester!.idStr, depsFor(self!, [self!, requester!], honestEpoch, exp));
+		expect('refused' in reply, 'falsified-members payload must be refused').to.equal(true);
+	});
+
+	it('refuses a promotion-image payload smuggled under kind: membership (kind/tag mismatch)', async () => {
+		const [self, requester] = await makeMembers(2);
+		const realMembers = [self!.bytes, requester!.bytes];
+		const epoch = epochOf(realMembers);
+		const exp = expectedFields(realMembers, epoch);
+		// A PromotionNoticeV1 image (tag mismatch) carried under kind: 'membership'.
+		const promoImage = promotionNoticeSigningPayload({ topicId: bytesToB64url(COORD), fromTier: 0, toTier: 1, effectiveAt: 1_000, cohortEpoch: bytesToB64url(epoch) });
+		const req: SignRequestV1 = { v: 1, kind: 'membership', coord: bytesToB64url(COORD), cohortEpoch: bytesToB64url(epoch), payload: bytesToB64url(promoImage) };
+
+		const reply = await handleSignRequest(req, requester!.idStr, depsFor(self!, [self!, requester!], epoch, exp));
+		expect('refused' in reply, 'kind/tag mismatch refused').to.equal(true);
+	});
+
+	it('refuses a membership payload whose embedded cohortEpoch differs from the endorser current epoch', async () => {
+		const [self, requester] = await makeMembers(2);
+		const realMembers = [self!.bytes, requester!.bytes];
+		const epoch = epochOf(realMembers);
+		const exp = expectedFields(realMembers, epoch);
+		const wrongEpoch = Uint8Array.from({ length: 32 }, () => 0xbb);
+		// Honest wire epoch (passes the wire-field gate), but the payload-internal epoch is forged.
+		const payload = membershipImage(realMembers, wrongEpoch, 1_000);
+		const req: SignRequestV1 = { v: 1, kind: 'membership', coord: bytesToB64url(COORD), cohortEpoch: bytesToB64url(epoch), payload: bytesToB64url(payload) };
+
+		const reply = await handleSignRequest(req, requester!.idStr, depsFor(self!, [self!, requester!], epoch, exp));
+		expect('refused' in reply, 'internal-epoch mismatch refused').to.equal(true);
+	});
+
+	it('refuses a membership payload with a far-future stabilizedAt', async () => {
+		const [self, requester] = await makeMembers(2);
+		const realMembers = [self!.bytes, requester!.bytes];
+		const epoch = epochOf(realMembers);
+		const exp = expectedFields(realMembers, epoch);
+		const payload = membershipImage(realMembers, epoch, 1_000_000_000); // far beyond now + skew
+		const req: SignRequestV1 = { v: 1, kind: 'membership', coord: bytesToB64url(COORD), cohortEpoch: bytesToB64url(epoch), payload: bytesToB64url(payload) };
+
+		const reply = await handleSignRequest(req, requester!.idStr, depsFor(self!, [self!, requester!], epoch, exp, 10_000));
+		expect('refused' in reply, 'far-future stabilizedAt refused').to.equal(true);
+	});
+
+	it('refuses an undecodable membership payload', async () => {
+		const [self, requester] = await makeMembers(2);
+		const realMembers = [self!.bytes, requester!.bytes];
+		const epoch = epochOf(realMembers);
+		const exp = expectedFields(realMembers, epoch);
+		const req: SignRequestV1 = { v: 1, kind: 'membership', coord: bytesToB64url(COORD), cohortEpoch: bytesToB64url(epoch), payload: bytesToB64url(new TextEncoder().encode('not-json')) };
+
+		const reply = await handleSignRequest(req, requester!.idStr, depsFor(self!, [self!, requester!], epoch, exp));
+		expect('refused' in reply, 'undecodable payload refused').to.equal(true);
+	});
+
+	it('refuses a membership request when no membership view is wired to bind against', async () => {
+		const [self, requester] = await makeMembers(2);
+		const realMembers = [self!.bytes, requester!.bytes];
+		const epoch = epochOf(realMembers);
+		const payload = membershipImage(realMembers, epoch, 1_000);
+		const req: SignRequestV1 = { v: 1, kind: 'membership', coord: bytesToB64url(COORD), cohortEpoch: bytesToB64url(epoch), payload: bytesToB64url(payload) };
+		// No `expectedMembershipFields` dep → the endorser has no independent view, so it must refuse rather than sign.
+		const reply = await handleSignRequest(req, requester!.idStr, {
 			privateKey: self!.key,
 			selfMember: self!.bytes,
 			cohortMembersAround: (): string[] => [self!.idStr, requester!.idStr],
-			currentEpoch: (): Uint8Array => EPOCH,
+			currentEpoch: (): Uint8Array => epoch,
 		});
-		expect('signer' in reply, 'an endorsement, not a refusal').to.equal(true);
-		if ('signer' in reply) {
-			expect(verifyPeerSig(b64urlToBytes(reply.signer), PAYLOAD, b64urlToBytes(reply.signature)), 'signature verifies against the endorser key').to.equal(true);
-			expect(bytesToPeerIdString(b64urlToBytes(reply.signer)), 'signer id is self').to.equal(self!.idStr);
-		}
+		expect('refused' in reply, 'no membership view → refused').to.equal(true);
 	});
 
 	it('refuses a requester outside the cohort, an epoch mismatch, and a key-less node', async () => {
@@ -284,12 +404,20 @@ describe('cohort-topic: /sign rotation endorsement gate (prior-epoch membership)
 	// A rotation request carries the PRIOR epoch as `cohortEpoch`; the gate checks prior-epoch membership
 	// (via `priorCohortMembersAt`) rather than the CURRENT cohort, so the genuinely outgoing cohort co-signs
 	// the hand-off. These cover the four branches of the rotation gate the live-tier mesh tests do not isolate.
+	// A rotation request carries the SUCCESSOR cert image (a MembershipCertV1 signable), not arbitrary bytes —
+	// the gate now structurally requires that tag. The rotation gate checks prior-epoch membership, not cert
+	// fields, so a constant image (members/epoch not bound to any endorser view) suffices.
+	const ROT_MEMBERS = [
+		Uint8Array.from({ length: 8 }, (_v, i) => (i + 1) & 0xff),
+		Uint8Array.from({ length: 8 }, (_v, i) => (i + 9) & 0xff),
+	];
+	const ROT_PAYLOAD = membershipImage(ROT_MEMBERS, EPOCH, 1_000);
 	const rotReq: SignRequestV1 = {
 		v: 1,
 		kind: 'rotation',
 		coord: bytesToB64url(COORD),
 		cohortEpoch: bytesToB64url(EPOCH), // EPOCH is the prevEpoch the endorser must have been a member at
-		payload: bytesToB64url(PAYLOAD),
+		payload: bytesToB64url(ROT_PAYLOAD),
 	};
 
 	it('endorses a hand-off when self + requester were both members of the prior cohort — even when neither is in the CURRENT cohort', async () => {
@@ -305,9 +433,22 @@ describe('cohort-topic: /sign rotation endorsement gate (prior-epoch membership)
 		});
 		expect('signer' in reply, 'an endorsement, not a refusal').to.equal(true);
 		if ('signer' in reply) {
-			expect(verifyPeerSig(b64urlToBytes(reply.signer), PAYLOAD, b64urlToBytes(reply.signature)), 'signature verifies against the endorser key').to.equal(true);
+			expect(verifyPeerSig(b64urlToBytes(reply.signer), ROT_PAYLOAD, b64urlToBytes(reply.signature)), 'signature verifies against the endorser key').to.equal(true);
 			expect(bytesToPeerIdString(b64urlToBytes(reply.signer)), 'signer id is self').to.equal(self!.idStr);
 		}
+	});
+
+	it('refuses a rotation payload that is not a MembershipCertV1 image (structural sanity)', async () => {
+		const [self, requester] = await makeMembers(2);
+		const badRot: SignRequestV1 = { ...rotReq, payload: bytesToB64url(new TextEncoder().encode('not-a-cert')) };
+		const reply = await handleSignRequest(badRot, requester!.idStr, {
+			privateKey: self!.key,
+			selfMember: self!.bytes,
+			cohortMembersAround: (): string[] => [self!.idStr, requester!.idStr],
+			currentEpoch: (): Uint8Array => EPOCH,
+			priorCohortMembersAt: (): readonly string[] => [self!.idStr, requester!.idStr],
+		});
+		expect('refused' in reply && reply.refused, 'non-cert rotation payload refused').to.equal(true);
 	});
 
 	it('refuses when this node has no prior-epoch history for the coord (cold restart / never assembled at prevEpoch)', async () => {

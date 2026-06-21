@@ -231,6 +231,15 @@ export interface CohortTopicHostOptions {
 	 * a network with no genesis cohort configured is never broken. Do **not** seed fake roots here.
 	 */
 	readonly genesisTrustRoots?: readonly TrustRoot[];
+	/**
+	 * Wall clock (ms) the `/sign` membership endorser uses for its `stabilizedAt` far-future sanity bound
+	 * (a member refuses to co-sign a cert whose `stabilizedAt` is more than a few seconds ahead of its own
+	 * clock — `cohort-topic-sign-endorsement-payload-binding`). Defaults to {@link Date.now}, the right
+	 * choice for a production node. A **virtual-time** test harness (which drives publish `stabilizedAt`
+	 * from arbitrary explicit timestamps rather than wall clock) injects a clock that does not trip the
+	 * bound — e.g. `() => Number.POSITIVE_INFINITY` — so its synthetic future timestamps are not rejected.
+	 */
+	readonly now?: () => number;
 }
 
 // The reputation-view shape the bootstrap-evidence referee verifier consults — `{ isBanned, getScore }`
@@ -695,6 +704,23 @@ export async function createCohortTopicHost(node: Libp2p, fret: FretService, opt
 			// this node does not serve has no engine, so the hand-off is refused (no spurious instantiation).
 			priorCohortMembersAt: (coord: RingCoord, epoch: Uint8Array): readonly string[] | undefined =>
 				registry.findByCoord(coord)?.cohortIdentityAt(epoch),
+			// Membership binding: re-derive our own canonical cert fields from the SAME `cohortAround` snapshot
+			// the per-coord publisher signs over, so a falsified `members` / `cohortCoord` / internal-epoch
+			// payload is refused. `stabilizedAt: 0` — the endorser ignores it (it only bounds the value
+			// far-future via `now`), matching the dep contract (cohort-topic-sign-endorsement-payload-binding).
+			expectedMembershipFields: (coord: RingCoord): { cohortCoord: string; cohortEpoch: string; members: string[] } => {
+				const snap = cohortAround(coord);
+				const { cohortCoord, cohortEpoch, members } = membershipCertSignable({
+					coord,
+					cohortEpoch: snap.cohortEpoch,
+					members: snap.members,
+					stabilizedAt: 0,
+				});
+				return { cohortCoord, cohortEpoch, members };
+			},
+			// Wall clock for the `stabilizedAt` far-future bound. Production: Date.now. A virtual-time harness
+			// injects a non-tripping clock (its publish `stabilizedAt` is synthetic, not wall-clock).
+			now: options.now ?? ((): number => Date.now()),
 		});
 
 	// --- participant-side composition (node scope) ---
@@ -1543,20 +1569,87 @@ export interface SignEndorsementDeps {
 	 * endorsement is unavailable (a node with no per-coord rotation history refuses the hand-off).
 	 */
 	readonly priorCohortMembersAt?: (coord: RingCoord, epoch: Uint8Array) => readonly string[] | undefined;
+	/**
+	 * The endorser's own canonical `MembershipCertV1` signable fields for `coord` at its **current** epoch,
+	 * re-derived from its own cohort snapshot ({@link membershipCertSignable} with `stabilizedAt`
+	 * omitted/ignored). Binds a `membership` endorsement to the endorser's independent view so a cohort
+	 * insider cannot collect honest signatures over a cert the cohort never agreed to (falsified `members`
+	 * or `cohortCoord`). `cohortEpoch` here MUST equal `bytesToB64url(currentEpoch(coord))`; `members` is the
+	 * ascending-sorted base64url cohort set (the cert / sharding order). Absent → a `membership` request is
+	 * refused (no view to bind the cert against). See `cohort-topic-sign-endorsement-payload-binding`.
+	 */
+	readonly expectedMembershipFields?: (coord: RingCoord) => { cohortCoord: string; cohortEpoch: string; members: string[] };
+	/**
+	 * Wall clock (ms) for the `stabilizedAt` far-future sanity bound on a `membership` payload. The host
+	 * wires {@link Date.now}; tests inject a fixed clock. Absent → the far-future bound is skipped (only
+	 * finiteness is enforced), keeping minimal / key-less composition working.
+	 */
+	readonly now?: () => number;
+}
+
+/** Tolerated future skew (ms) for a `membership` payload's `stabilizedAt` — a value beyond this is refused. */
+const SIGN_STABILIZED_AT_SKEW_MS = 5_000;
+
+/** The canonical signable-image tag a non-`rotation` {@link SignKind} must carry (binds tag ↔ kind). */
+const SIGNABLE_IMAGE_TAG: Record<Exclude<SignKind, "rotation">, string> = {
+	membership: "MembershipCertV1",
+	promotion: "PromotionNoticeV1",
+	demotion: "DemotionNoticeV1",
+};
+
+/**
+ * Decode a `/sign` payload's canonical signable array image — `utf8(JSON.stringify([...]))` produced by
+ * `sig/payloads.ts`. Returns the decoded array, or `undefined` when the bytes are not base64url of a JSON
+ * array. NOTE: the payload is a raw signable image, **not** a `CohortMessageV1`, so it is decoded with
+ * `JSON.parse`, never `decodeCohortMessage`.
+ */
+function decodeSignableImage(payloadB64: string): unknown[] | undefined {
+	try {
+		const decoded = JSON.parse(new TextDecoder().decode(b64urlToBytes(payloadB64))) as unknown;
+		return Array.isArray(decoded) ? decoded : undefined;
+	} catch {
+		return undefined;
+	}
+}
+
+/** Deep-equal of an unknown payload field against the endorser's own ascending-sorted base64url member list. */
+function sameMemberList(image: unknown, expected: readonly string[]): boolean {
+	if (!Array.isArray(image) || image.length !== expected.length) {
+		return false;
+	}
+	for (let i = 0; i < image.length; i++) {
+		if (image[i] !== expected[i]) {
+			return false;
+		}
+	}
+	return true;
 }
 
 /**
  * The `/sign` endorsement policy: decide whether to endorse a {@link SignRequestV1} and, if so, return
  * this node's Ed25519 peer-key signature over the **exact** request payload. A member endorses only when
- * both it and the requester are members of the cohort around `coord` under the request's epoch — so it
- * never signs for outsiders and never re-canonicalizes the bytes (it signs precisely what the assembled
- * signature will later be verified against). One Ed25519 sign and nothing more.
+ * both it and the requester are members of the cohort around `coord` under the request's epoch, **and**
+ * the payload bytes re-derive to something this node independently agrees to attest — so it never signs
+ * for outsiders and never blindly signs requester-supplied bytes. It still signs the exact image (no
+ * re-canonicalization), so the assembled signature verifies against what the requester collected.
  *
- * The kind-specific refinement for `promotion` / `demotion` (the endorser additionally requiring its own
- * replicated `directParticipants` to be hot / cold) is deferred: it needs the per-topic binding the
- * `(payload, minSigs)` port can't carry and the gossip record replication that is still interim. For the
- * `membership` cert path — this milestone's deliverable — the cohort + epoch gate IS the full policy (the
- * participant verifier independently re-checks `signers ⊆ cert.members`). See the implement handoff.
+ * **Payload binding (cohort-topic-sign-endorsement-payload-binding).** The cohort + wire-epoch gates never
+ * inspect `request.payload`; without binding it an insider could collect honest signatures over a cert the
+ * cohort never agreed to. After those gates the endorser decodes the canonical signable image
+ * (`sig/payloads.ts` — a `JSON.parse`d array, NOT a `CohortMessageV1`) and refuses unless:
+ *
+ * - **all kinds** — the image tag matches the kind (`membership`→`MembershipCertV1`, etc.) and the
+ *   payload-internal `cohortEpoch` equals this node's current epoch for `coord`; and
+ * - **`membership`** — `cohortCoord`, the full `members` list (deep-equal to the endorser's own ascending
+ *   re-derived set), and a finite, not-far-future `stabilizedAt` all match its independent view
+ *   ({@link SignEndorsementDeps.expectedMembershipFields}). Because epoch = H(members) in this host, the
+ *   members and internal-epoch checks are mutually reinforcing: a forged member list cannot also carry the
+ *   honest epoch. The participant verifier still independently re-checks `signers ⊆ cert.members`.
+ *
+ * The kind-specific **hot/cold** refinement for `promotion` / `demotion` (the endorser additionally
+ * requiring its own replicated `directParticipants` to be hot / cold) remains deferred: it needs a
+ * per-topic binding the `(payload, minSigs)` port can't carry and gossip record replication that is still
+ * interim. Parked in `cohort-topic-sign-endorsement-hotcold-refinement` (backlog).
  *
  * **`"rotation"` (epoch hand-off).** A rotation request carries the **prior** epoch as `cohortEpoch` and
  * asks the outgoing cohort to sign the *successor* cert. The gate therefore checks **prior**-epoch
@@ -1586,6 +1679,14 @@ export async function handleSignRequest(request: SignRequestV1, fromPeerStr: str
 		if (!priorMembers.includes(fromPeerStr)) {
 			return { v: 1, refused: true, reason: "requester not in the prior cohort" };
 		}
+		// Structural sanity only: a rotation carries the SUCCESSOR cert image. Full successor re-derivation is
+		// out of scope here (the endorser is the OUTGOING cohort and may not know the successor member set), so
+		// the prior-epoch gate stays the trust check — but reject a payload that is not even a MembershipCertV1
+		// image so the gate cannot be tricked into signing junk bytes. See the rotation follow-on note.
+		const rotImage = decodeSignableImage(request.payload);
+		if (rotImage === undefined || rotImage[0] !== SIGNABLE_IMAGE_TAG.membership) {
+			return { v: 1, refused: true, reason: "rotation payload is not a MembershipCertV1 image" };
+		}
 		const signature = await signPeer(deps.privateKey, b64urlToBytes(request.payload));
 		return { v: 1, signer: bytesToB64url(deps.selfMember), signature: bytesToB64url(signature) };
 	}
@@ -1600,6 +1701,52 @@ export async function handleSignRequest(request: SignRequestV1, fromPeerStr: str
 	if (!bytesEqual(b64urlToBytes(request.cohortEpoch), deps.currentEpoch(coord))) {
 		return { v: 1, refused: true, reason: "cohort epoch mismatch" };
 	}
+
+	// --- payload binding: re-derive what we are willing to attest and refuse anything that does not match ---
+	// The wire-field gates above never inspect `request.payload`; without this an insider could collect honest
+	// signatures over a cert the cohort never agreed to (falsified members / kind-mismatched bytes).
+	const image = decodeSignableImage(request.payload);
+	if (image === undefined) {
+		return { v: 1, refused: true, reason: "payload is not a decodable signable image" };
+	}
+	// All kinds — bind tag ↔ kind (a `membership` request must carry a MembershipCertV1 image, closing the
+	// kind-mismatch hole where a kind-agnostic threshold blob verifies for whatever the bytes decode to).
+	const expectedTag = SIGNABLE_IMAGE_TAG[request.kind];
+	if (image[0] !== expectedTag) {
+		return { v: 1, refused: true, reason: `payload kind tag mismatch (expected ${expectedTag})` };
+	}
+	// All kinds — bind the payload-internal `cohortEpoch` to our own current epoch (closes the falsified-internal
+	// -epoch hole, for promotion / demotion too). It is `image[2]` for a MembershipCertV1 image and the last
+	// element for promotion / demotion (see `sig/payloads.ts`).
+	const currentEpochB64 = bytesToB64url(deps.currentEpoch(coord));
+	const embeddedEpoch = request.kind === "membership" ? image[2] : image[image.length - 1];
+	if (embeddedEpoch !== currentEpochB64) {
+		return { v: 1, refused: true, reason: "payload cohortEpoch does not match endorser view" };
+	}
+
+	if (request.kind === "membership") {
+		// The core fix: bind coord + members + stabilizedAt to the endorser's independently re-derived view.
+		// Because epoch = H(members) in this host, a forged member list cannot also carry the honest epoch — the
+		// embedded-epoch gate above and this members gate are mutually reinforcing.
+		const expected = deps.expectedMembershipFields?.(coord);
+		if (expected === undefined) {
+			return { v: 1, refused: true, reason: "no membership view to bind the cert against" };
+		}
+		if (image[1] !== expected.cohortCoord) {
+			return { v: 1, refused: true, reason: "payload cohortCoord does not match endorser view" };
+		}
+		if (!sameMemberList(image[3], expected.members)) {
+			return { v: 1, refused: true, reason: "payload members do not match endorser view" };
+		}
+		const stabilizedAt = image[4];
+		if (typeof stabilizedAt !== "number" || !Number.isFinite(stabilizedAt)) {
+			return { v: 1, refused: true, reason: "payload stabilizedAt is not a finite number" };
+		}
+		if (deps.now !== undefined && stabilizedAt > deps.now() + SIGN_STABILIZED_AT_SKEW_MS) {
+			return { v: 1, refused: true, reason: "payload stabilizedAt is far-future" };
+		}
+	}
+
 	const signature = await signPeer(deps.privateKey, b64urlToBytes(request.payload));
 	return { v: 1, signer: bytesToB64url(deps.selfMember), signature: bytesToB64url(signature) };
 }

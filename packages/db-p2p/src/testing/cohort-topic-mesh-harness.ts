@@ -420,6 +420,10 @@ export async function buildMesh(members: Member[], opts: MeshOptions): Promise<C
 			profile: profileAt(opts.profiles, index),
 			// Park the periodic driver by default; tests pump gossip / membership / promotion deterministically.
 			gossipIntervalMs: opts.gossipIntervalMs ?? 3_600_000,
+			// Virtual time: tests drive publish `stabilizedAt` from explicit (often future-advanced) timestamps,
+			// not wall clock, so the `/sign` membership endorser's far-future `stabilizedAt` bound must not trip
+			// on them. An infinite clock disables that bound while leaving the finiteness check intact.
+			now: (): number => Number.POSITIVE_INFINITY,
 			...((opts.capPromote === undefined && opts.promotion === undefined)
 				? {}
 				: { promotion: { ...(opts.capPromote === undefined ? {} : { capPromote: opts.capPromote }), ...(opts.promotion ?? {}) } }),
