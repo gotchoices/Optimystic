@@ -54,6 +54,9 @@ import { ReactivityPushStateGossipDriver, registerPushStateGossipHandler, type R
 import { RotationReRegistrationScheduler } from './reactivity/rotation-rereg-scheduler.js';
 import { ReactivitySubscriberRegistry } from './reactivity/subscriber-registry.js';
 import { DEFAULT_REACTIVITY_PROTOCOLS, reactivityProtocolList } from './reactivity/protocols.js';
+import { registerMatchmakingQueryHandler } from './matchmaking/query-transport.js';
+import { DEFAULT_MATCHMAKING_PROTOCOLS, matchmakingProtocolList } from './matchmaking/protocols.js';
+import { signPeer } from './cohort-topic/peer-sig.js';
 import {
 	createNotificationVerifier,
 	createCorrelationReplayGuard,
@@ -1022,6 +1025,27 @@ export async function createLibp2pNodeBase(
 		});
 		(node as any).reactivityRotation = reactivityRotation;
 
+		// --- Matchmaking QueryV1 RPC — cohort serve side (docs/matchmaking.md §Seeker query) ---
+		// The server half of the seeker query transport: a remote seeker dials `/optimystic/matchmaking/1.0.0/query`
+		// and this node answers with its cohort's locally-held provider/seeker registrations, signed by the node
+		// peer key. Matchmaking is layered ABOVE the cohort-topic substrate, so it owns its own protocol family
+		// and is wired here (the composition root) over the host's PUBLIC surface only — mirroring the reactivity
+		// registration above; nothing reaches into host.ts internals. The OUTBOUND seeker walk client is the
+		// prereq follow-on `matchmaking-query-rpc-seeker-walk`; only the serve side is live here.
+		const matchmakingProtocols = DEFAULT_MATCHMAKING_PROTOCOLS;
+		registerMatchmakingQueryHandler(node, matchmakingProtocols.query, {
+			registry: host.registry,
+			// Reuse the reactivity addressing: createTierAddressing(createRingHash()) is byte-identical to the
+			// host's internal addressing for the tier-0 coord (peer- and fanout-independent), and the handler
+			// only ever derives coord_0(topicId).
+			addressing: reactivityAddressing,
+			// Single-member reply signature over the node peer key (same pattern reactivity uses for its signers).
+			sign: async (payload: Uint8Array): Promise<string> => bytesToB64url(await signPeer(nodePrivateKey, payload)),
+			// Anti-DoS rate-limit seam (backlog matchmaking-query-rate-limit) intentionally left unwired here:
+			// default-allow. When that ticket lands it passes a `gate: (from, topicId) => boolean` that limits on
+			// the connection's verified `from` peer (NOT the self-asserted query.requesterId).
+		});
+
 		// Teardown: release reactivity timers + protocol handlers BEFORE host.stop() (which clears the cohort
 		// gossip timer + unhandles the cohort-topic protocols) BEFORE the node's transports close (previousStop).
 		// Composes with the existing arachnode + clusterMember stop wrappers (each calls its captured previousStop last).
@@ -1032,6 +1056,7 @@ export async function createLibp2pNodeBase(
 				pushStateGossip.stop();
 				offInboundNotify();
 				await node.unhandle(reactivityProtocolList(reactivityProtocols));
+				await node.unhandle(matchmakingProtocolList(matchmakingProtocols));
 				unsubscribe();
 				await host.stop();
 			} finally {

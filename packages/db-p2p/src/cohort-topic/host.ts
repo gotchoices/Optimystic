@@ -140,6 +140,7 @@ import {
 	type SignRequestV1,
 	type Tier,
 	type TopicBudgetConfig,
+	type TopicTrafficV1,
 	type IMembershipSource,
 	type TrustRoot,
 } from "@optimystic/db-core";
@@ -339,6 +340,14 @@ export interface CoordEngine {
 	 * §Seeker query). A renewed record is live; a TTL-swept one is gone after the next `gossipRound`.
 	 */
 	records(topicId: Uint8Array): readonly RegistrationRecord[];
+	/**
+	 * This cohort's current gossip-derived traffic barometer for `topicId` (own last-published counts +
+	 * siblings' last-gossiped summaries + `directParticipants` from the store). The matchmaking `QueryV1`
+	 * reply attaches it and the seeker hang-out decision consumes it (`docs/matchmaking.md` §Hang-out vs.
+	 * continue). Non-mutating — a synchronous read over the same in-memory state a `gossipRound` mutates,
+	 * lagging at most one gossip round (it reflects the last frozen summaries, never raw mid-round counts).
+	 */
+	topicTraffic(topicId: Uint8Array): TopicTrafficV1;
 	/**
 	 * Publish a fresh threshold-signed `MembershipCertV1` on a cohort-membership-change / stabilization
 	 * event (republishes only when the first `k − x` members changed). Returns the cert if published.
@@ -1535,6 +1544,7 @@ function createCoordEngine(ctx: CoordEngineContext, servedCoord: RingCoord, tree
 		holds: (topicId: Uint8Array, participantId: Uint8Array): boolean =>
 			store.getByParticipant(topicId, participantId) !== undefined,
 		records: (topicId: Uint8Array): readonly RegistrationRecord[] => store.listByTopic(topicId),
+		topicTraffic: (topicId: Uint8Array): TopicTrafficV1 => traffic.snapshot(topicId),
 		cohortView: (): CohortView => view,
 		servesTopic: (topicId: Uint8Array): boolean =>
 			store.directParticipants(topicId) > 0 || coldStart.get(topicId) !== undefined,

@@ -9,9 +9,11 @@
  * §Hang-out vs. continue.
  */
 
+export * from "./protocols.js";
 export * from "./provider-manager.js";
 export * from "./seeker-manager.js";
 export * from "./query-handler.js";
+export * from "./query-transport.js";
 export * from "./seeker-walk-client.js";
 export * from "./aggregate-counts.js";
 export * from "./traffic-validation.js";

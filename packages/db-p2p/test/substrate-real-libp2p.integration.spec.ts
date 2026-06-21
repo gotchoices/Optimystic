@@ -18,6 +18,11 @@ import {
 	subscribeAppPayloadBytes,
 	createNotificationVerifier,
 	createStickyCohortHintCache,
+	encodeQueryV1,
+	decodeQueryReplyV1,
+	encodeProviderAppPayload,
+	providerSigningPayload,
+	verifyProviderEntry,
 	bytesToB64url,
 	b64urlToBytes,
 	bytesEqual,
@@ -34,12 +39,14 @@ import {
 	type CollectionChangeEvent,
 	type BlockId,
 	type ActionId,
+	type QueryV1,
 } from '@optimystic/db-core';
 import { createLibp2pNode, type NodeOptions } from '../src/libp2p-node.js';
 import { peerIdToBytes, bytesToPeerIdString } from '../src/cohort-topic/peer-codec.js';
-import { signPeer } from '../src/cohort-topic/peer-sig.js';
-import { sendOneWay } from '../src/cohort-topic/stream-util.js';
+import { signPeer, verifyPeerSig } from '../src/cohort-topic/peer-sig.js';
+import { sendOneWay, requestResponse, DEFAULT_STREAM_MAX_BYTES } from '../src/cohort-topic/stream-util.js';
 import { DEFAULT_COHORT_TOPIC_PROTOCOLS } from '../src/cohort-topic/protocols.js';
+import { DEFAULT_MATCHMAKING_PROTOCOLS } from '../src/matchmaking/protocols.js';
 import { signedWillingness, type Member } from '../src/testing/cohort-topic-mesh-harness.js';
 import { createReactivitySelfMembershipGate, reactivityTailBytes } from '../src/cohort-topic/reactivity-membership-gate.js';
 import { DEFAULT_REACTIVITY_PROTOCOLS } from '../src/reactivity/protocols.js';
@@ -146,6 +153,12 @@ interface SignedRegisterOptions {
 	 * (`cohort-topic-bootstrap-coldstart-origination-regression` keeps only T0/T1 permissive).
 	 */
 	readonly selfVouch?: boolean;
+	/**
+	 * Opaque app-payload bytes for `RegisterV1.appPayload` (e.g. a matchmaking provider/seeker payload).
+	 * `bootstrapBoundImage` binds only (topicId, tier, participantCoord, timestamp), so a self-vouch is
+	 * unaffected; `registerSigningPayload` covers it, so it is attached before the final register sign.
+	 */
+	readonly appPayload?: Uint8Array;
 }
 
 // Signed register/renew builders for real participants (mirror the mock harness's, but kept local so the
@@ -161,6 +174,7 @@ async function signedRegister(participant: Member, topic: Uint8Array, now: numbe
 		bootstrap: opts.bootstrap ?? true,
 		timestamp: now,
 		correlationId: bytesToB64url(new TextEncoder().encode(correlationId)),
+		...(opts.appPayload !== undefined ? { appPayload: bytesToB64url(opts.appPayload) } : {}),
 	};
 	// `bootstrapBoundImage` binds only (topicId, tier, participantCoord, timestamp), so the self-vouch
 	// endorsement is identical on `baseBody` and the evidence-bearing body; attach it BEFORE the final
@@ -807,11 +821,90 @@ async function memberOf(key: PrivateKey, peerId: PeerId): Promise<Member> {
 		expect(replicated, 'the provider record replicated to a sibling cohort member over real /cohort-gossip').to.equal(true);
 	});
 
-	// The matchmaking hang-out walk *converging to a match* over real sockets needs the QueryV1 RPC handler,
-	// which is not registered on a production node (the seeker walk's `query()` seam is unbound). The hang-out
-	// *decision* logic is mock-tier-validated (`matchmaking/mesh-walk.spec.ts`). Tagged, not faked.
-	it.skip('[requires production wiring: matchmaking QueryV1 RPC handler — tracked by backlog matchmaking-real-libp2p-query-transport] a seeker hang-out walk queries real cohorts over real sockets and converges to a match', () => {
-		/* deferred: no /matchmaking/query protocol handler is registered; handleMatchmakingQuery has no production dialer (seeker walk query() seam unbound) */
+	// --- 5b. Matchmaking: a remote seeker reads a cohort's provider set over the real QueryV1 RPC ---
+	// The serve half of the seeker query transport is now LIVE in production (this ticket): the node registers
+	// `/optimystic/matchmaking/1.0.0/query` over the host's CoordRegistry. A remote node dials the routed primary
+	// with an encoded QueryV1 and the decoded QueryReplyV1 carries the provider entry (with a forwardable
+	// `registrationSig` the seeker re-validates) and the cohort's topicTraffic snapshot. The OUTBOUND seeker walk
+	// (target selection + hang-out loop) is the prereq follow-on `matchmaking-query-rpc-seeker-walk`.
+	it('a remote node reads a cohort\'s provider set over the real matchmaking QueryV1 RPC', async () => {
+		const matchTopic = Uint8Array.from({ length: 32 }, (_v, i) => (i * 3 + 19) & 0xff);
+		const matchCoord = addressing.coord0(matchTopic);
+		// Instantiate + stabilize willingness for this topic's cohort (whole mesh at wantK = N).
+		engines(matchCoord);
+		const matchPrimary = primaryFor(matchCoord);
+		const matchPrimaryEngine = engineOf(matchPrimary, matchCoord);
+		expect(await quorumOn(matchPrimaryEngine, matchCoord), 'willingness converged for the query topic').to.equal(true);
+
+		// A provider whose deterministic slot-primary is the routed primary, registered with a REAL matchmaking
+		// provider app payload so the served record classifies as a provider (its `appState` decodes via
+		// `decodeMatchAppPayload`). The payload's signature is over `providerSigningPayload(topicId, caps, budget)`
+		// — exactly what the forwarded entry's `registrationSig` is, so the seeker can re-validate it.
+		const provider = await participantPrimaryAt(matchPrimaryEngine, matchCoord);
+		const capabilities = ['transcode', 'gpu'];
+		const capacityBudget = 4;
+		const contactHint = `/ip4/127.0.0.1/tcp/4001/p2p/${provider.idStr}`;
+		const providerSig = bytesToB64url(await signPeer(provider.key, providerSigningPayload(matchTopic, capabilities, capacityBudget)));
+		const appPayload = encodeProviderAppPayload({ kind: 'match-provider', capabilities, capacityBudget, contactHint, signature: providerSig });
+		const now = Date.now();
+		// T2 bootstrap stays gated on the configured production node (only T0/T1 permissive), so the provider
+		// self-vouches to clear the `PoW || reputation || parent-ref` disjunction (mirrors §5).
+		const reg = await signedRegister(provider, matchTopic, now, 'mm-query-provider', { tier: 2, selfVouch: true, appPayload });
+		const accept = await matchPrimaryEngine.engine.handleRegister(reg, { followOn: false, treeTier: 0 }, now);
+		expect(accept.result, 'the cohort admitted the matchmaking provider registration').to.equal('accepted');
+		expect(
+			matchPrimaryEngine.records(matchTopic).some((r) => r.appState !== undefined && bytesEqual(r.participantId, provider.bytes)),
+			'the primary holds the provider record with a decodable matchmaking appState',
+		).to.equal(true);
+
+		// A *different* real node dials the routed primary's `/query` protocol over a real socket with an encoded
+		// QueryV1 (built like the mock harness `queryCohort`: includeProviders, signature 'AA'). The reply is the
+		// real cohort serve: real records, real topicTraffic snapshot, real node-key reply signature.
+		const remote = nodes.find((n) => n.idStr !== matchPrimary.idStr)!;
+		const query: QueryV1 = {
+			v: 1,
+			topicId: bytesToB64url(matchTopic),
+			includeProviders: true,
+			includeSeekers: false,
+			limit: 256,
+			requesterId: remote.idStr,
+			timestamp: Date.now(),
+			signature: 'AA',
+		};
+		const replyFrame = await requestResponse(remote.node, matchPrimary.peerId, DEFAULT_MATCHMAKING_PROTOCOLS.query, encodeQueryV1(query), DEFAULT_STREAM_MAX_BYTES);
+		const reply = decodeQueryReplyV1(replyFrame, DEFAULT_STREAM_MAX_BYTES);
+
+		expect(reply.providers, 'the reply carries a providers array').to.not.equal(undefined);
+		const entry = reply.providers!.find((p) => p.participantId === provider.idStr);
+		expect(entry, 'the reply includes the registered provider entry').to.not.equal(undefined);
+		expect(entry!.capabilities, 'the entry forwards the provider capabilities').to.deep.equal(capabilities);
+		expect(entry!.capacityBudget, 'the entry forwards the capacity budget').to.equal(capacityBudget);
+		// The forwarded `registrationSig` re-validates seeker-side (the advisory trust model's hinge): reconstruct
+		// the provider signing image from the entry's own fields and verify against its `participantId` peer key.
+		expect(
+			verifyProviderEntry(matchTopic, entry!, (id, payload, sig) => verifyPeerSig(id, payload, sig)),
+			'the forwarded registrationSig re-validates against the provider peer key (forwardable)',
+		).to.equal(true);
+		// The cohort's gossip-derived traffic barometer is attached and reflects the real store population.
+		expect(reply.topicTraffic, 'the reply attaches a topicTraffic snapshot').to.not.equal(undefined);
+		expect(reply.topicTraffic.directParticipants, 'topicTraffic reflects the real direct-participant count').to.be.at.least(1);
+		// The reply is single-member-signed over the canonical image by the serving node's peer key.
+		expect(reply.signature.length, 'the reply carries the cohort primary single-member signature').to.be.greaterThan(0);
+
+		// A query for a topic this node serves no engine for gets NO reply (the handler never instantiates an
+		// engine from an inbound query — DoS guard); requestResponse resolves the empty read as a 0-byte frame.
+		const unknownTopic = Uint8Array.from({ length: 32 }, (_v, i) => (i * 31 + 7) & 0xff);
+		const unknownQuery: QueryV1 = { ...query, topicId: bytesToB64url(unknownTopic) };
+		const noReply = await requestResponse(remote.node, matchPrimary.peerId, DEFAULT_MATCHMAKING_PROTOCOLS.query, encodeQueryV1(unknownQuery), DEFAULT_STREAM_MAX_BYTES);
+		expect(noReply.length, 'a query for an unserved topic yields no reply frame (no engine instantiated)').to.equal(0);
+	});
+
+	// The matchmaking hang-out walk *converging to a match* over real sockets needs the OUTBOUND seeker walk
+	// client (target selection across tiers + the hang-out poll loop); the QueryV1 serve RPC it queries IS now
+	// registered in production (test 5b above), but the walk's `query()`/`register()` driver is the prereq
+	// follow-on. The hang-out *decision* logic is mock-tier-validated (`matchmaking/mesh-walk.spec.ts`). Tagged, not faked.
+	it.skip('[requires the outbound seeker walk client — tracked by matchmaking-query-rpc-seeker-walk] a seeker hang-out walk queries real cohorts over real sockets and converges to a match', () => {
+		/* deferred: the QueryV1 serve handler is live (5b), but no production seeker walk client drives the multi-tier walk + hang-out loop */
 	});
 
 	// --- 6. Cluster-formation / same-FRET-ring consistency ---
