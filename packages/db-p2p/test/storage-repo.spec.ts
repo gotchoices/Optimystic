@@ -283,6 +283,34 @@ describe('StorageRepo', () => {
 			expect(result['block-1']!.state).to.deep.equal({});
 		});
 
+		it('returns empty state for a committed-then-deleted block (reads back as absent, not a throw)', async () => {
+			// Insert block-1 @1, then commit a delete @2. The delete revision is tombstone-shaped
+			// (a `{ delete: true }` transform, no materialized block), so materializeBlock's reverse-apply
+			// collapses to `undefined`. Reading the deleted block must surface as empty state — the
+			// documented "undefined => empty" get() contract — NOT the old `Block ... has been deleted` throw.
+			await repo.pend({
+				actionId: 'a1' as ActionId,
+				transforms: makeInsertTransforms('block-1' as BlockId, makeBlock('block-1')),
+				policy: 'c'
+			});
+			await repo.commit({ actionId: 'a1' as ActionId, blockIds: ['block-1' as BlockId], tailId: 'block-1' as BlockId, rev: 1 });
+
+			await repo.pend({
+				actionId: 'a2' as ActionId,
+				transforms: makeDeleteTransforms('block-1' as BlockId),
+				policy: 'c'
+			});
+			await repo.commit({ actionId: 'a2' as ActionId, blockIds: ['block-1' as BlockId], tailId: 'block-1' as BlockId, rev: 2 });
+
+			const result = await repo.get({ blockIds: ['block-1' as BlockId] });
+			expect('block-1' in result).to.equal(true);
+			expect(result['block-1']!.block).to.equal(undefined);
+			expect(result['block-1']!.state).to.deep.equal({});
+			// The historical (pre-delete) revision still materializes its content.
+			const historical = await new BlockStorage('block-1' as BlockId, rawStorage).getBlock(1);
+			expect(historical?.block.header.id).to.equal('block-1');
+		});
+
 		it('lists pending transactions in state', async () => {
 			// Create block first
 			const blockStorage = new BlockStorage('block-1' as BlockId, rawStorage);

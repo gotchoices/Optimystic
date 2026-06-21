@@ -386,8 +386,8 @@ export type RevertedComputation =
  * Base = the block's content at the highest stored revision strictly before `T_inv` (no such revision
  * ⇒ `T_inv` created the block ⇒ a deletion). In the single-collection/no-cascade core, "surviving later
  * actions" = every committed action after `T_inv` on this block, replayed verbatim on the rolled-back
- * base (the cascade ticket replaces this blind replay with re-evaluation of true read-dependents).
- * Genuinely read-dependent successors are left as-is and logged.
+ * base. The cascade (see `cascade.ts`) layers true read-dependent re-evaluation on top of this blind
+ * replay — it reverts the genuine successors this primitive leaves as-is and logs.
  */
 export async function computeRevertedBlock(blockStorage: IBlockStorage, invalidatedRev: number): Promise<RevertedComputation> {
 	const latest = await blockStorage.getLatest();
@@ -399,8 +399,8 @@ export async function computeRevertedBlock(blockStorage: IBlockStorage, invalida
 	// a deletion — at ANY rev, without throwing (the previous `invalidatedRev <= 1` special-case folds into
 	// this: at rev <= 1 the probe is skipped and priorRev stays undefined). We intentionally do NOT replay
 	// surviving later actions onto an absent base: replaying an update on `undefined` stays `undefined`, and
-	// any later writer of a created-then-reverted block is itself a read-dependent the cascade re-evaluates
-	// and reverts.
+	// any later writer of a created-then-reverted block is itself a read-dependent the cascade (`cascade.ts`)
+	// re-evaluates and reverts.
 	let priorRev: number | undefined;
 	if (invalidatedRev > 1) {
 		for await (const ar of blockStorage.listRevisions(invalidatedRev - 1, 1)) {
