@@ -28,6 +28,16 @@ export interface RegisterV1 {
 	ttl: number;
 	/** True on a root cold-start request. */
 	bootstrap?: boolean;
+	/**
+	 * Read-only lookup probe: classify + return the cohort snapshot without admitting (no record, no
+	 * arrival, no promotion trigger, no topic-budget touch, and **never** a cold-start instantiation /
+	 * `bootstrap`). A probe walks to the responsible cohort exactly as a register does and resolves the
+	 * same {@link RegisterReplyV1} (`no_state` cold, `promoted` redirected, `accepted` snapshot served),
+	 * but the terminal member action is the read-only {@link RegisterReplyV1} classify rather than an
+	 * admission. Drives {@link import("../service.js").CohortTopicService.lookup}. Mutually exclusive with
+	 * `bootstrap` (the walk never sets `bootstrap` on a probe).
+	 */
+	probe?: boolean;
 	/** Opaque application-defined bytes, base64url. */
 	appPayload?: string;
 	/**

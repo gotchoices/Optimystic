@@ -18,6 +18,7 @@ import {
 	createLoadBarometer,
 	createTierAddressing,
 	coreProfile,
+	CohortBackoffError,
 	bytesToB64url,
 	b64urlToBytes,
 	encodeCohortMessage,
@@ -46,7 +47,7 @@ import { DEFAULT_COHORT_TOPIC_PROTOCOLS } from '../../src/cohort-topic/protocols
 const sha256digest = (b: Uint8Array): Uint8Array => new RingHash().H(b);
 
 /** A single-member cohort wired in memory: the participant's router runs the member engine directly. */
-function buildSingleMemberCohort(opts: { memberId: Uint8Array; capPromote: number }): { engine: CohortMemberEngine; member: Uint8Array; epoch: Uint8Array } {
+function buildSingleMemberCohort(opts: { memberId: Uint8Array; capPromote: number }): { engine: CohortMemberEngine; member: Uint8Array; epoch: Uint8Array; store: ReturnType<typeof createRegistrationStore> } {
 	const hash = new RingHash();
 	const member = opts.memberId;
 	const cohortEpoch = hash.H(new TextEncoder().encode('epoch:' + bytesToB64url(member)));
@@ -116,7 +117,7 @@ function buildSingleMemberCohort(opts: { memberId: Uint8Array; capPromote: numbe
 		cohort,
 		quorumWilling: (): boolean => true,
 	});
-	return { engine, member, epoch: cohortEpoch };
+	return { engine, member, epoch: cohortEpoch, store };
 }
 
 /** A mock router that delivers register activity + renew dials straight to one member engine. */
@@ -196,13 +197,37 @@ describe('cohort-topic: service composition (mock transport)', () => {
 		expect(dials, 'a withdrawn handle no longer pings').to.equal(1);
 	});
 
-	it('lookup: resolves the cohort hint for a topic/tier', async () => {
-		const { engine, member } = buildSingleMemberCohort({ memberId: new TextEncoder().encode('member-C'), capPromote: 64 });
+	it('lookup: a read-only probe resolves a warmed topic without admitting (no new soft-state)', async () => {
+		const { engine, member, store } = buildSingleMemberCohort({ memberId: new TextEncoder().encode('member-C'), capPromote: 64 });
 		const service = buildMockService(engine, member);
+
+		// Warm the topic with a real registration first; lookup is now a read-only probe, not a register.
+		await service.register({ topicId: TOPIC, tier: 0 as Tier });
+		const before = store.directParticipants(TOPIC);
+		expect(before, 'the warming registration is resident').to.equal(1);
 
 		const hint = await service.lookup(TOPIC, 0 as Tier);
 		expect(bytesToB64url(hint.primary)).to.equal(bytesToB64url(member));
 		expect(hint.cohortMembers.map(bytesToB64url)).to.include(bytesToB64url(member));
+
+		// Read-only: the probe added no participant — the direct-participant count is unchanged.
+		expect(store.directParticipants(TOPIC), 'the probe left no throwaway registration behind').to.equal(before);
+	});
+
+	it('lookup: a never-warmed (cold) topic rejects with CohortBackoffError — no cold-root instantiation', async () => {
+		const { engine, member, store } = buildSingleMemberCohort({ memberId: new TextEncoder().encode('member-C2'), capPromote: 64 });
+		const service = buildMockService(engine, member);
+
+		const COLD = Uint8Array.from({ length: 32 }, (_v, i) => (i + 100) & 0xff);
+		let caught: unknown;
+		try {
+			await service.lookup(COLD, 0 as Tier);
+		} catch (err) {
+			caught = err;
+		}
+		expect(caught, 'a cold lookup backs off rather than registering').to.be.instanceOf(CohortBackoffError);
+		// The probe walked to the root and backed off without ever instantiating a forwarder / record.
+		expect(store.directParticipants(COLD), 'a cold probe persists nothing').to.equal(0);
 	});
 
 	it('promote: once direct participants cross cap_promote, new registrations are redirected onward', async () => {

@@ -1393,6 +1393,9 @@ function createCoordEngine(ctx: CoordEngineContext, servedCoord: RingCoord, tree
 	// window / topic budget for coord A is independent of coord B. The bootstrap-evidence policy
 	// (`ctx.bootstrapEvidence`) is node-level and shared by design.
 	const rateLimiter = createRegisterRateLimiter(ctx.antiDos.rateLimiter);
+	// The read-only lookup-probe path gets its OWN per-coord rate limiter (same config, separate budget),
+	// so a probe flood cannot exhaust a participant's register budget at this coord, or vice-versa.
+	const probeRateLimiter = createRegisterRateLimiter(ctx.antiDos.rateLimiter);
 	const replayGuard = createCorrelationReplayGuard(ctx.antiDos.replayGuard);
 	const topicBudget = createTopicBudget(ctx.antiDos.topicBudget);
 	const renewal = createRenewalCohortSide({
@@ -1425,6 +1428,8 @@ function createCoordEngine(ctx: CoordEngineContext, servedCoord: RingCoord, tree
 		quorumWilling: (tier: Tier): boolean => ctx.profile.willingTiers.has(tier),
 		// Anti-DoS guards (gap 6): per-coord rate/replay/budget; node-level bootstrap-evidence policy.
 		rateLimiter,
+		// Dedicated probe-path rate limiter (independent budget from `rateLimiter`).
+		probeRateLimiter,
 		replayGuard,
 		topicBudget,
 		bootstrapEvidence: ctx.bootstrapEvidence,

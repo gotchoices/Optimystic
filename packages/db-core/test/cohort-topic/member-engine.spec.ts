@@ -241,3 +241,175 @@ describe('cohort-topic / member-engine: onAdmit fires on accept', () => {
 		expect(admitCalled, 'onAdmit must not fire on rejection').to.equal(false);
 	});
 });
+
+describe('cohort-topic / member-engine: handleProbe (read-only lookup)', () => {
+	const hash = createRingHash();
+	const slots = createSlotAssigner(hash);
+	const self = bytes('probe-self', 16);
+	const cohortEpoch = bytes('probe-epoch', 32);
+	const members = [self];
+	const cohort = (): { members: readonly Uint8Array[]; cohortEpoch: Uint8Array } => ({ members, cohortEpoch });
+
+	interface ProbeSpies {
+		arrivals: number;
+		promotionFired: number;
+		instantiated: number;
+	}
+
+	/**
+	 * Compose the minimal engine the probe path needs. `willingness` / `renewal` / `profile` are the
+	 * `unused` proxy: a probe must NEVER touch the admission pipeline, so any access fails the test loudly.
+	 * The traffic / promotion / cold-start collaborators are spies asserting the probe records / fires /
+	 * instantiates nothing.
+	 */
+	function makeProbeEngine(opts?: {
+		isPromoted?: boolean;
+		served?: boolean;
+		verifyRegisterSig?: (reg: RegisterV1) => boolean;
+		probeRateLimiter?: { check: () => { ok: true } | { ok: false; retryAfterMs: number } };
+	}): { engine: ReturnType<typeof createCohortMemberEngine>; store: ReturnType<typeof createRegistrationStore>; spies: ProbeSpies } {
+		const store = createRegistrationStore();
+		const spies: ProbeSpies = { arrivals: 0, promotionFired: 0, instantiated: 0 };
+		const traffic = {
+			recordArrival: (): void => { spies.arrivals++; },
+			recordQuery: (): void => {},
+			snapshot: (topicId: Uint8Array): { windowSeconds: number; arrivalsPerMin: number; queriesPerMin: number; directParticipants: number; childCohortCount: number } =>
+				({ windowSeconds: 60, arrivalsPerMin: 0, queriesPerMin: 0, directParticipants: store.directParticipants(topicId), childCohortCount: 0 }),
+		} as never;
+		const promotion = {
+			onParticipantCountChange: (): Promise<undefined> => { spies.promotionFired++; return Promise.resolve(undefined); },
+			maybeDemote: (): Promise<undefined> => Promise.resolve(undefined),
+			isPromoted: (): boolean => opts?.isPromoted === true,
+			applyPromotionNotice: (): void => {},
+			applyDemotionNotice: (): void => {},
+		};
+		const coldStart = {
+			// A probe must never instantiate; if it does, fail loudly.
+			instantiate: (): never => { spies.instantiated++; throw new Error('handleProbe must not instantiate a cold-start forwarder'); },
+			get: (): undefined => undefined, // never serves via a forwarder in these tests; `served` seeds the store instead
+		} as never;
+		const engine = createCohortMemberEngine({
+			self,
+			profile: unused('profile'),
+			hash,
+			store,
+			slots,
+			willingness: unused('willingness'),
+			promotion,
+			coldStart,
+			traffic,
+			renewal: unused('renewal'),
+			cohort,
+			quorumWilling: (): boolean => true,
+			verifyRegisterSig: opts?.verifyRegisterSig,
+			probeRateLimiter: opts?.probeRateLimiter as never,
+		});
+		return { engine, store, spies };
+	}
+
+	/** Seed a soft-state record so `serves(topicId)` is true (a register had admitted `participant`). */
+	function seed(store: ReturnType<typeof createRegistrationStore>, topic: Uint8Array, participant: Uint8Array): void {
+		const { primary, backups } = slots.assignSlots(participant, cohortEpoch, members);
+		store.put({ topicId: topic, participantId: participant, tier: 0, primary, backups, attachedAt: 1_000, lastPing: 1_000, ttl: DEFAULT_TTL_MS });
+	}
+
+	function mkProbe(topic: Uint8Array, participant: Uint8Array, cid: string): RegisterV1 {
+		return {
+			v: 1,
+			topicId: bytesKey(topic),
+			tier: 0,
+			treeTier: 0,
+			participantCoord: bytesKey(participant),
+			ttl: 90_000,
+			probe: true,
+			timestamp: 1_000,
+			correlationId: bytesKey(bytes(cid)),
+			signature: '',
+		};
+	}
+
+	it('served topic → accepted with the participant-specific slots, leaving the store unchanged (read-only)', async () => {
+		const { engine, store, spies } = makeProbeEngine();
+		const TOPIC = bytes('probe-served');
+		const seedParticipant = bytes('seed-participant', 16);
+		seed(store, TOPIC, seedParticipant); // a prior registration → topic is served
+		expect(store.directParticipants(TOPIC), 'one resident participant before the probe').to.equal(1);
+
+		const prober = bytes('prober', 16);
+		const reply = await engine.handleRegister(mkProbe(TOPIC, prober, 'cid-served'), { followOn: false, treeTier: 0 }, 2_000);
+
+		expect(reply.result).to.equal('accepted');
+		// The probe resolves the SAME primary/backups a register would (assignSlots is pure, per-participant).
+		const expected = slots.assignSlots(prober, cohortEpoch, members);
+		expect(reply.primary).to.equal(bytesKey(expected.primary));
+		expect(reply.backups).to.deep.equal(expected.backups.map(bytesKey));
+		expect(reply.cohortEpoch).to.equal(bytesKey(cohortEpoch));
+		expect(reply.cohortMembers).to.deep.equal(members.map(bytesKey));
+		expect(reply.topicTraffic, 'the read-only traffic snapshot is attached').to.not.equal(undefined);
+
+		// Read-only: nothing admitted, counted, or promoted.
+		expect(store.directParticipants(TOPIC), 'no new record was persisted').to.equal(1);
+		expect(spies.arrivals, 'no arrival counted').to.equal(0);
+		expect(spies.promotionFired, 'no promotion trigger fired').to.equal(0);
+		expect(spies.instantiated, 'no cold-start instantiation').to.equal(0);
+	});
+
+	it('cold topic → no_state, store stays empty, no cold-start instantiation', async () => {
+		const { engine, store, spies } = makeProbeEngine();
+		const TOPIC = bytes('probe-cold');
+		const reply = await engine.handleRegister(mkProbe(TOPIC, bytes('p', 16), 'cid-cold'), { followOn: false, treeTier: 0 }, 2_000);
+		expect(reply.result).to.equal('no_state');
+		expect(store.directParticipants(TOPIC), 'a cold probe persists nothing').to.equal(0);
+		expect(spies.instantiated, 'no instantiation on a cold probe').to.equal(0);
+		expect(spies.arrivals).to.equal(0);
+	});
+
+	it('promoted topic → promoted with targetTier === ctx.treeTier + 1', async () => {
+		const { engine, store } = makeProbeEngine({ isPromoted: true });
+		const TOPIC = bytes('probe-promoted');
+		seed(store, TOPIC, bytes('seed-promoted', 16)); // served, and promotion.isPromoted → true
+		const reply = await engine.handleRegister(mkProbe(TOPIC, bytes('p', 16), 'cid-promoted'), { followOn: false, treeTier: 2 }, 2_000);
+		expect(reply.result).to.equal('promoted');
+		expect(reply.targetTier).to.equal(3);
+	});
+
+	it('never fires the promotion trigger, even when a register at the same point would', async () => {
+		// A probe of a served topic classifies and returns; it must not call promotion.onParticipantCountChange
+		// (the spy throws-by-count): a real register's `accept` path is what fires that trigger, never a probe.
+		const { engine, store, spies } = makeProbeEngine();
+		const TOPIC = bytes('probe-no-promote');
+		seed(store, TOPIC, bytes('seed-no-promote', 16));
+		await engine.handleRegister(mkProbe(TOPIC, bytes('p', 16), 'cid-no-promote'), { followOn: false, treeTier: 0 }, 2_000);
+		expect(spies.promotionFired, 'the promotion trigger never fires on a probe').to.equal(0);
+	});
+
+	it('over-rate probe → unwilling_cohort with the limiter retryAfterMs', async () => {
+		const { engine, store } = makeProbeEngine({ probeRateLimiter: { check: () => ({ ok: false, retryAfterMs: 4_321 }) } });
+		const TOPIC = bytes('probe-rate');
+		seed(store, TOPIC, bytes('seed-rate', 16)); // served — but the rate gate short-circuits before classify
+		const reply = await engine.handleRegister(mkProbe(TOPIC, bytes('p', 16), 'cid-rate'), { followOn: false, treeTier: 0 }, 2_000);
+		expect(reply.result).to.equal('unwilling_cohort');
+		expect(reply.retryAfterMs).to.equal(4_321);
+	});
+
+	it('forged participant signature → no_state (serve nothing), even for a served topic', async () => {
+		const { engine, store } = makeProbeEngine({ verifyRegisterSig: () => false });
+		const TOPIC = bytes('probe-forged');
+		seed(store, TOPIC, bytes('seed-forged', 16));
+		const reply = await engine.handleRegister(mkProbe(TOPIC, bytes('p', 16), 'cid-forged'), { followOn: false, treeTier: 0 }, 2_000);
+		expect(reply.result, 'a forged-sig probe never resolves a cohort snapshot').to.equal('no_state');
+	});
+
+	it('an independent probe rate-limit budget: over-rate probe does not consume the engine register path', async () => {
+		// The probe limiter is its own instance; an over-rate probe answers unwilling_cohort but leaves the
+		// (absent here) register limiter untouched — asserted structurally by the separate `probeRateLimiter`
+		// dep. A served topic still classifies read-only once the probe limiter admits.
+		let calls = 0;
+		const { engine, store } = makeProbeEngine({ probeRateLimiter: { check: () => { calls++; return { ok: true }; } } });
+		const TOPIC = bytes('probe-budget');
+		seed(store, TOPIC, bytes('seed-budget', 16));
+		const reply = await engine.handleRegister(mkProbe(TOPIC, bytes('p', 16), 'cid-budget'), { followOn: false, treeTier: 0 }, 2_000);
+		expect(reply.result).to.equal('accepted');
+		expect(calls, 'the probe path consulted its own rate limiter').to.equal(1);
+	});
+});

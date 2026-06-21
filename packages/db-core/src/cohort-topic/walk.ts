@@ -76,6 +76,8 @@ export interface RegisterMessageFactory {
 		tier: number;
 		treeTier: number;
 		bootstrap: boolean;
+		/** Read-only lookup probe: the factory stamps `RegisterV1.probe` and never mints bootstrap evidence. */
+		probe: boolean;
 		appPayload?: Uint8Array;
 	}): Promise<RegisterV1>;
 }
@@ -118,9 +120,12 @@ export interface WalkEngineDeps {
 export interface WalkEngine {
 	/**
 	 * Walk from `d_max` toward the root registering for `topicId` at op `tier`, following `Promoted`
-	 * redirects outward. Resolves with the terminal {@link WalkOutcome}.
+	 * redirects outward. Resolves with the terminal {@link WalkOutcome}. With `opts.probe` the walk is a
+	 * **read-only lookup**: identical routing discipline, but the terminal cohort classifies rather than
+	 * admits and the root `no_state` branch backs off instead of issuing a `bootstrap: true` cold-start
+	 * (a probe never instantiates a cold root).
 	 */
-	register(topicId: Uint8Array, tier: number, appPayload?: Uint8Array): Promise<WalkOutcome>;
+	register(topicId: Uint8Array, tier: number, appPayload?: Uint8Array, opts?: { probe?: boolean }): Promise<WalkOutcome>;
 }
 
 class RouterWalkEngine implements WalkEngine {
@@ -141,9 +146,10 @@ class RouterWalkEngine implements WalkEngine {
 		this.maxMessageBytes = cfg.maxMessageBytes;
 	}
 
-	async register(topicId: Uint8Array, tier: number, appPayload?: Uint8Array): Promise<WalkOutcome> {
+	async register(topicId: Uint8Array, tier: number, appPayload?: Uint8Array, opts?: { probe?: boolean }): Promise<WalkOutcome> {
 		const dMax = this.deps.dmax.dMax();
 		const maxSteps = this.configuredMaxSteps ?? 2 * (dMax + 2) + this.maxMemberRetries + 8;
+		const probe = opts?.probe ?? false;
 
 		let d = dMax;
 		let bootstrap = false;
@@ -158,7 +164,7 @@ class RouterWalkEngine implements WalkEngine {
 				return { kind: "retry_later", afterMs: backoffRetryMs(0) };
 			}
 
-			const reg = await this.deps.factory.build({ topicId, tier, treeTier: d, bootstrap, appPayload });
+			const reg = await this.deps.factory.build({ topicId, tier, treeTier: d, bootstrap, probe, appPayload });
 			const activity = encodeCohortMessage(reg, this.maxMessageBytes);
 			const raw = dialTarget !== undefined
 				? await this.deps.router.dialMember(dialTarget, activity)
@@ -181,6 +187,11 @@ class RouterWalkEngine implements WalkEngine {
 						if (bootstrap) {
 							// Already re-issued at the root as a bootstrap and still nothing — no cohort
 							// anywhere will instantiate right now. Back off in time.
+							return { kind: "retry_later", afterMs: backoffRetryMs(0) };
+						}
+						if (probe) {
+							// A read-only probe never instantiates a cold root: the topic exists nowhere, so
+							// resolve "not found / back off" rather than re-issuing with bootstrap:true.
 							return { kind: "retry_later", afterMs: backoffRetryMs(0) };
 						}
 						// Root returned NoState → cold-start: re-issue once at tier 0 with bootstrap:true.

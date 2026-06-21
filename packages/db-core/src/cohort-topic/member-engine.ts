@@ -88,6 +88,14 @@ export interface CohortMemberEngineDeps {
 	readonly quorumWilling: (tier: Tier) => boolean;
 	// --- anti-DoS guards (all optional; absent = that gate is skipped) ---
 	readonly rateLimiter?: RegisterRateLimiter;
+	/**
+	 * Dedicated per-(peer, topic) rate limiter for the read-only {@link CohortMemberEngine.handleRegister}
+	 * **probe** path — its own budget, separate from {@link rateLimiter}, so a probe flood cannot exhaust a
+	 * participant's register budget (or vice-versa). An over-rate probe answers `unwilling_cohort`
+	 * (walk → `retry_later` → `CohortBackoffError`). Absent → the probe rate gate is skipped (the read-only
+	 * classify still runs), keeping key-less / unit / mock flows composing.
+	 */
+	readonly probeRateLimiter?: RegisterRateLimiter;
 	readonly replayGuard?: CorrelationReplayGuard;
 	readonly topicBudget?: TopicBudget;
 	readonly bootstrapEvidence?: BootstrapEvidence;
@@ -141,6 +149,13 @@ class StoreCohortMemberEngine implements CohortMemberEngine {
 		const participantId = b64urlToBytes(reg.participantCoord);
 		const tier = reg.tier as Tier;
 
+		// 0. Read-only lookup probe: classify + return the cohort snapshot without admitting anything.
+		//    Branches before the admission pipeline (and the durable-state anti-DoS guards), so even a
+		//    hand-crafted `probe: true, bootstrap: true` frame can never instantiate — defense in depth.
+		if (reg.probe === true) {
+			return this.handleProbe(reg, topicId, participantId, ctx, now);
+		}
+
 		// 1. Anti-DoS gates. A replay/stale frame is answered with NoState (serve nothing, record
 		//    nothing); an over-rate source or missing bootstrap evidence backs off in time.
 		const guard = this.runGuards(reg, topicId, participantId, tier, now);
@@ -168,6 +183,51 @@ class StoreCohortMemberEngine implements CohortMemberEngine {
 		}
 		this.deps.coldStart.instantiate(topicId, ctx.treeTier, ctx.parentCoord, tier);
 		return this.admitOrDecline(reg, topicId, participantId, tier, ctx, now);
+	}
+
+	/**
+	 * Read-only resolution of the cohort for a topic (the `lookup` probe). It walks the same path a
+	 * register does (the walk loop is byte-for-byte identical) but the **terminal** member action is a
+	 * classify, never an admission: it persists **no** record, counts **no** arrival, fires **no**
+	 * promotion trigger, touches **no** topic budget, and **never** instantiates a cold-start forwarder.
+	 *
+	 * DoS posture (`docs/cohort-topic.md` §Anti-DoS): a probe still runs the stateless participant-sig gate
+	 * (forged → `no_state`) and a dedicated probe rate limiter (over-rate → `unwilling_cohort`), but skips
+	 * the replay guard, the bootstrap-evidence gate, and the topic budget — an idempotent read records
+	 * nothing, so it is strictly cheaper than the register it replaces.
+	 *
+	 * Classification mirrors a register's terminal cases so the walk's existing branches drive a probe
+	 * unchanged: a served-and-promoted topic answers `promoted(treeTier + 1)` (the walk follows it), a
+	 * served topic answers `accepted` with the participant-specific slot assignment + read-only traffic
+	 * snapshot, and a topic this cohort does not serve answers `no_state` (the walk steps inward).
+	 */
+	private handleProbe(reg: RegisterV1, topicId: Uint8Array, participantId: Uint8Array, ctx: RegisterContext, now: number): RegisterReplyV1 {
+		if (this.deps.verifyRegisterSig?.(reg) === false) {
+			// Unsigned / forged participant signature: serve nothing, exactly like the register path — a
+			// cohort member never resolves a cohort snapshot for an untrusted `participantCoord`.
+			return { v: 1, result: "no_state" };
+		}
+		const rate = this.deps.probeRateLimiter?.check(participantId, topicId, now);
+		if (rate !== undefined && rate.ok === false) {
+			return { v: 1, result: "unwilling_cohort", retryAfterMs: rate.retryAfterMs };
+		}
+		if (this.serves(topicId)) {
+			if (this.deps.promotion.isPromoted(topicId)) {
+				return promotedRedirectReply(ctx.treeTier + 1, this.deps.traffic.snapshot(topicId));
+			}
+			const { members, cohortEpoch } = this.deps.cohort();
+			const { primary, backups } = this.deps.slots.assignSlots(participantId, cohortEpoch, members);
+			const reply: RegisterReplyV1 = {
+				v: 1,
+				result: "accepted",
+				primary: bytesKey(primary),
+				backups: backups.map(bytesKey),
+				cohortEpoch: bytesKey(cohortEpoch),
+				cohortMembers: members.map(bytesKey),
+			};
+			return attachTopicTraffic(reply, this.deps.traffic.snapshot(topicId));
+		}
+		return { v: 1, result: "no_state" };
 	}
 
 	handleRenew(msg: RenewV1, now: number): RenewReplyV1 {

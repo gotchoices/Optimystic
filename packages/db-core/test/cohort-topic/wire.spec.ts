@@ -12,6 +12,7 @@ import {
 	decodeDemotionNoticeV1,
 	decodeCohortGossipV1,
 	decodeMembershipCertV1,
+	registerSigningPayload,
 	CohortWireError,
 	DEFAULT_MAX_MESSAGE_BYTES,
 } from '../../src/cohort-topic/wire/index.js';
@@ -320,6 +321,36 @@ describe('cohort-topic wire', () => {
 			const { fretAttestation: _f, ...minimal } = sampleMembershipCert();
 			const decoded = decodeMembershipCertV1(encodeCohortMessage(minimal as MembershipCertV1));
 			expect(decoded).to.not.have.property('fretAttestation');
+		});
+	});
+
+	describe('lookup probe flag', () => {
+		it('round-trips a RegisterV1 carrying probe: true', () => {
+			const msg: RegisterV1 = { ...sampleRegister(), bootstrap: false, probe: true };
+			const decoded = decodeRegisterV1(encodeCohortMessage(msg));
+			expect(decoded).to.deep.equal(msg);
+			expect(decoded.probe).to.equal(true);
+		});
+
+		it('omits an absent probe on Register round-trip', () => {
+			const { bootstrap: _b, probe: _p, ...minimal } = sampleRegister() as RegisterV1 & { probe?: boolean };
+			const decoded = decodeRegisterV1(encodeCohortMessage(minimal as RegisterV1));
+			expect(decoded).to.not.have.property('probe');
+		});
+
+		it('rejects a non-boolean probe', () => {
+			const bad = { ...sampleRegister(), probe: 'yes' };
+			const frame = encodeCohortMessage(bad as unknown as { v: 1 });
+			expect(() => decodeRegisterV1(frame)).to.throw(CohortWireError, /probe/);
+		});
+
+		it('registerSigningPayload differs between probe:true and probe:false/absent', () => {
+			const base = sampleRegister();
+			const probeImage = registerSigningPayload({ ...base, probe: true });
+			const falseImage = registerSigningPayload({ ...base, probe: false });
+			const absentImage = registerSigningPayload(base); // probe absent
+			expect([...probeImage], 'a probe signs a distinct image').to.not.deep.equal([...falseImage]);
+			expect([...falseImage], 'probe:false and absent normalize to the same signed image').to.deep.equal([...absentImage]);
 		});
 	});
 

@@ -9,9 +9,10 @@
  * Signer and verifier must agree byte-for-byte. Exactly like {@link import("../sig/payloads.js")}
  * for the threshold-signed notices, determinism comes from encoding an explicitly-ordered JSON
  * array (array order is stable, unlike object key order) as UTF-8 — never the `signature` envelope.
- * Optional fields are normalized to a fixed placeholder (`bootstrap`→`false`, `appPayload`→`null`,
- * `bootstrapEvidence`→`null` with an empty string treated as absent, `reattach`→`false`) so an
- * absent optional and a present-but-default optional can never disagree across the wire round-trip.
+ * Optional fields are normalized to a fixed placeholder (`bootstrap`→`false`, `probe`→`false`,
+ * `appPayload`→`null`, `bootstrapEvidence`→`null` with an empty string treated as absent,
+ * `reattach`→`false`) so an absent optional and a present-but-default optional can never disagree
+ * across the wire round-trip.
  */
 
 import type { CohortGossipV1, RegisterV1, RenewV1 } from "./types.js";
@@ -44,6 +45,9 @@ export function registerSigningPayload(body: RegisterSignable): Uint8Array {
 		normalizeEvidence(body.bootstrapEvidence),
 		body.timestamp,
 		body.correlationId,
+		// A read-only probe signs `probe: true`; a normal register signs `false`. Both sides recompute
+		// this image identically, so a probe and a register over the same fields produce distinct signatures.
+		body.probe ?? false,
 	]));
 }
 

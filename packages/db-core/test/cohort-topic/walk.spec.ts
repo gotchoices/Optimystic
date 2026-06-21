@@ -27,6 +27,7 @@ interface Probe {
 	readonly member?: Uint8Array;
 	readonly treeTier: number;
 	readonly bootstrap: boolean;
+	readonly probe: boolean;
 }
 
 /**
@@ -41,13 +42,13 @@ class ScriptedRouter implements ITopicRouter {
 
 	async routeAndAct(key: RingCoord, activity: Uint8Array): Promise<Uint8Array> {
 		const reg = decodeRegisterV1(activity);
-		this.probes.push({ mode: 'route', coord: key, treeTier: reg.treeTier, bootstrap: reg.bootstrap === true });
+		this.probes.push({ mode: 'route', coord: key, treeTier: reg.treeTier, bootstrap: reg.bootstrap === true, probe: reg.probe === true });
 		return encodeCohortMessage(this.next());
 	}
 
 	async dialMember(member: PeerRef, activity: Uint8Array): Promise<Uint8Array> {
 		const reg = decodeRegisterV1(activity);
-		this.probes.push({ mode: 'dial', member: member.id, treeTier: reg.treeTier, bootstrap: reg.bootstrap === true });
+		this.probes.push({ mode: 'dial', member: member.id, treeTier: reg.treeTier, bootstrap: reg.bootstrap === true, probe: reg.probe === true });
 		return encodeCohortMessage(this.next());
 	}
 
@@ -68,7 +69,7 @@ function fixedDMax(d: number): DMaxComputer {
 /** A factory that emits a deterministic signed-shaped RegisterV1 (signature/crypto are out of scope here). */
 function factoryFor(self: Uint8Array): RegisterMessageFactory {
 	return {
-		build: async ({ topicId, tier, treeTier, bootstrap, appPayload }) => ({
+		build: async ({ topicId, tier, treeTier, bootstrap, probe, appPayload }) => ({
 			v: 1,
 			topicId: bytesToB64url(topicId),
 			tier,
@@ -76,6 +77,7 @@ function factoryFor(self: Uint8Array): RegisterMessageFactory {
 			participantCoord: bytesToB64url(self),
 			ttl: 90_000,
 			...(bootstrap ? { bootstrap: true } : {}),
+			...(probe ? { probe: true } : {}),
 			...(appPayload ? { appPayload: bytesToB64url(appPayload) } : {}),
 			timestamp: 1_000,
 			correlationId: bytesToB64url(bytes('corr')),
@@ -100,14 +102,14 @@ class SingleCohortRouter implements ITopicRouter {
 
 	async routeAndAct(key: RingCoord, activity: Uint8Array): Promise<Uint8Array> {
 		const reg = decodeRegisterV1(activity);
-		this.probes.push({ mode: 'route', coord: key, treeTier: reg.treeTier, bootstrap: reg.bootstrap === true });
+		this.probes.push({ mode: 'route', coord: key, treeTier: reg.treeTier, bootstrap: reg.bootstrap === true, probe: reg.probe === true });
 		const reply: RegisterReplyV1 = bytesEqual(key, this.promotedCoord) ? { v: 1, result: 'promoted', targetTier: 1 } : noState;
 		return encodeCohortMessage(reply);
 	}
 
 	async dialMember(member: PeerRef, activity: Uint8Array): Promise<Uint8Array> {
 		const reg = decodeRegisterV1(activity);
-		this.probes.push({ mode: 'dial', member: member.id, treeTier: reg.treeTier, bootstrap: reg.bootstrap === true });
+		this.probes.push({ mode: 'dial', member: member.id, treeTier: reg.treeTier, bootstrap: reg.bootstrap === true, probe: reg.probe === true });
 		return encodeCohortMessage(noState);
 	}
 }
@@ -258,6 +260,33 @@ describe('cohort-topic / walk-toward-root', () => {
 		const engine = createWalkEngine({ router, addressing, dmax: fixedDMax(1), self, factory: factoryFor(self) });
 		const outcome = await engine.register(TOPIC, 1);
 		expect(outcome.kind).to.equal('retry_later');
+	});
+
+	it('a probe of a cold topic backs off at the root and NEVER emits a bootstrap:true frame', async () => {
+		const self = bytes('probe-cold-participant');
+		const dMax = 1;
+		// d=1 no_state → d=0 (root) no_state → a probe backs off (a register would re-issue bootstrap here).
+		// Only two probes are consumed: the bootstrap re-issue is suppressed, so two replies suffice.
+		const router = new ScriptedRouter([noState, noState]);
+		const engine = createWalkEngine({ router, addressing, dmax: fixedDMax(dMax), self, factory: factoryFor(self) });
+
+		const outcome = await engine.register(TOPIC, 1, undefined, { probe: true });
+		expect(outcome.kind, 'a cold probe resolves to a temporal back-off, never a cold-root instantiation').to.equal('retry_later');
+		expect(router.probes.map((x) => x.treeTier), 'walks inward to the root then stops — no bootstrap re-issue').to.deep.equal([1, 0]);
+		expect(router.probes.every((p) => p.probe), 'every emitted frame carries probe:true').to.equal(true);
+		expect(router.probes.some((p) => p.bootstrap), 'a probe never emits a bootstrap:true frame').to.equal(false);
+	});
+
+	it('the non-probe walk still re-issues bootstrap:true at the root (probe-flag does not change the register path)', async () => {
+		const self = bytes('non-probe-bootstrap-participant');
+		const router = new ScriptedRouter([noState, noState, accepted]); // d=1, root no_state, bootstrap re-issue accepted
+		const engine = createWalkEngine({ router, addressing, dmax: fixedDMax(1), self, factory: factoryFor(self) });
+
+		const outcome = await engine.register(TOPIC, 1); // no probe opts
+		expect(outcome.kind).to.equal('accepted');
+		expect(router.probes.map((x) => x.treeTier)).to.deep.equal([1, 0, 0]);
+		expect(router.probes[2]!.bootstrap, 'the register path re-issues bootstrap at the root').to.equal(true);
+		expect(router.probes.some((p) => p.probe), 'no probe frame on the register path').to.equal(false);
 	});
 
 	it('maxSteps terminates a malformed tree that alternates NoState/Promoted at the same tier', async () => {

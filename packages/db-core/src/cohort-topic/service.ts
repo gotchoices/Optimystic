@@ -216,10 +216,12 @@ class WalkRegisterService implements CohortTopicService {
 	}
 
 	async lookup(topicId: Uint8Array, tier: Tier): Promise<CohortHint> {
-		// Resolution shares the registration walk: the accepted reply carries the cohort fields. The
-		// soft-state it leaves TTL-expires if never renewed (a dedicated read-only probe RPC is a
-		// documented follow-on — see the implement handoff).
-		const outcome = await this.walk.register(topicId, tier);
+		// A read-only probe: it walks to the responsible cohort exactly as a register would and returns the
+		// same cohort snapshot, but admits NOTHING — no soft-state record, no arrival, no promotion trigger,
+		// no topic-budget touch, and never a cold-start instantiation. A topic served nowhere resolves to a
+		// `CohortBackoffError` (the probe never bootstraps a cold root), so a lookup leaves no throwaway
+		// registration behind to TTL-expire (§Application policies; the lookup-as-register interim is gone).
+		const outcome = await this.walk.register(topicId, tier, undefined, { probe: true });
 		if (outcome.kind !== "accepted") {
 			throw new CohortBackoffError(outcome.kind === "retry_later" ? outcome.afterMs : 0);
 		}
@@ -340,6 +342,11 @@ class WalkRegisterService implements CohortTopicService {
 					timestamp: this.clock(),
 					correlationId: this.freshCorrelationId(),
 				};
+				if (params.probe) {
+					// A read-only lookup probe. Mutually exclusive with bootstrap (the walk never sets
+					// `bootstrap` on a probe), so the cold-start-evidence branch below cannot run for a probe.
+					body.probe = true;
+				}
 				if (params.bootstrap) {
 					body.bootstrap = true;
 					// Attach cold-start evidence BEFORE signing (so the signature covers it). Bind the

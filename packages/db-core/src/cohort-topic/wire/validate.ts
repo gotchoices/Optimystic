@@ -184,6 +184,10 @@ export function validateRegisterV1(value: unknown): RegisterV1 {
 	if (bootstrap !== undefined) {
 		out.bootstrap = bootstrap;
 	}
+	const probe = optBool(obj, "probe", what);
+	if (probe !== undefined) {
+		out.probe = probe;
+	}
 	const appPayload = optString(obj, "appPayload", what);
 	if (appPayload !== undefined) {
 		out.appPayload = b64urlField(appPayload, "appPayload", what);
