@@ -24,11 +24,13 @@ import { Tier, bytesToB64url } from '@optimystic/db-core';
 import { buildReactivityMesh, type ReactivityMesh } from '../../src/testing/reactivity-mesh-harness.js';
 
 describe('reactivity / mesh — cold-to-hot growth + delivery', function () {
-	// Real-Ed25519 multi-cohort mesh: setup + round-trips are CPU-bound. The first registration against a
-	// freshly-built mesh carries a large one-time cost (single-digit seconds in isolation) that grows as a
-	// full suite run accumulates load, so a single test can spend 10s+ in its opening subscribe alone. Give
-	// generous headroom over the 10s default so machine load doesn't tip a passing test into a timeout.
-	this.timeout(60_000);
+	// Real-Ed25519 multi-cohort mesh: setup + round-trips are CPU-bound. The first test against a
+	// freshly-built mesh carries a large one-time cost — JIT warm-up of the Ed25519 hot path on top of the
+	// real registration/commit walk — measured at 40s+ even in isolation (it runs slower than later cases
+	// with larger node/cohort counts purely because it pays this warm-up). Full-suite CPU contention then
+	// stacks on top, so a 60s ceiling tips a genuinely-passing test into a timeout flake. Give generous
+	// headroom over the warm-isolation cost so machine load alone never fails this test.
+	this.timeout(120_000);
 	let rx: ReactivityMesh;
 	afterEach(async () => {
 		await rx?.stop();
