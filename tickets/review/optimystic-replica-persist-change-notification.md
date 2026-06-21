@@ -1,3 +1,10 @@
+<!-- resume-note -->
+RESUME: A prior agent run on this ticket did not complete.
+  Prior run: 2026-06-21T13:53:17.913Z (agent: claude)
+  Log file: C:\projects\optimystic\tickets\.logs\optimystic-replica-persist-change-notification.review.2026-06-21T13-53-17-913Z.log
+Read the log to see what was done. Resume where it left off.
+If the prior run hit a timeout or repeated error, be cautious not to rush into the same situation.
+<!-- /resume-note -->
 description: Review the change that emits a CollectionChangeEvent when a block lands on a node via churn re-replication, so reactive watchers on the new owner are woken.
 prereq:
 files: packages/db-p2p/src/storage/storage-repo.ts, packages/db-p2p/test/storage-repo.spec.ts
