@@ -112,14 +112,18 @@ describe('matchmaking / mesh — provider self-throttling + withdrawal', functio
 		await mm.registerTopic('capability', 'zk-prover');
 		const p = await mm.provide(0, 'capability', 'zk-prover', ['zk'], 2);
 
+		// Withdraw stops renewing and fires a best-effort signed tombstone (cohort-topic-withdraw-tombstone):
+		// the tombstone is routed directly to the registration's slot primary. In this single-tier-0 mock
+		// mesh the record is not gossip-replicated, so the queryable copy lives only on the bootstrap-routed
+		// node (nearest coord_0); whether that coincides with the slot primary depends on the per-run member
+		// keys, so immediate tombstone eviction is opportunistic. TTL expiry is the correctness fallback —
+		// that is what this round-trip pins.
 		await p.manager.withdraw();
-		// Withdrawal is an optimization, not a wire tombstone: the record lingers until TTL eviction.
-		let present = (await mm.query(1, 'capability', 'zk-prover')).providers?.some((e) => e.participantId === p.member.idStr);
-		expect(present, 'right after withdraw the record still lingers (ages out by TTL)').to.equal(true);
 
-		// Advance past the provider TTL and sweep — the cohort drops it and the seeker stops matching.
+		// Advance past the provider TTL and sweep — the cohort drops the record and the seeker stops matching
+		// it, whether or not the best-effort tombstone already freed it.
 		mm.sweepTopic('capability', 'zk-prover', Date.now() + mm.providerTtlMs(0) + 1);
-		present = (await mm.query(1, 'capability', 'zk-prover')).providers?.some((e) => e.participantId === p.member.idStr);
+		const present = (await mm.query(1, 'capability', 'zk-prover')).providers?.some((e) => e.participantId === p.member.idStr);
 		expect(present, 'after TTL sweep the withdrawn provider is gone').to.equal(false);
 	});
 });
