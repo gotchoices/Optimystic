@@ -13,6 +13,8 @@ import {
 	membershipCertSigningPayload,
 	registerSigningPayload,
 	renewSigningPayload,
+	serializeBootstrapEvidenceEnvelope,
+	bootstrapBoundImage,
 	subscribeAppPayloadBytes,
 	createNotificationVerifier,
 	createStickyCohortHintCache,
@@ -451,6 +453,10 @@ async function memberOf(key: PrivateKey, peerId: PeerId): Promise<Member> {
 		// touches the record into the gossip deltas (an arbitrary participant lands on the primary only ~1/k).
 		const participant = await participantPrimaryAt(primaryEngine, coord0);
 		const now = Date.now();
+		// This is a T0 (`tier: 0`, default) `bootstrap: true` register carrying no evidence. The production node
+		// is *configured* (node-base wires `antiDos.reputation`) but has no committed-existence backing
+		// (`committedParentTopicReader` unwired, no `parentTopicView` override), so T0/T1 bootstrap stays
+		// permissive-but-logged (cohort-topic-bootstrap-coldstart-origination-regression) and this admits.
 		const accept = await primaryEngine.engine.handleRegister(await signedRegister(participant, TOPIC, now, 'real-repl'), { followOn: false, treeTier: 0 }, now);
 		expect(accept.result, 'the cohort admitted the registration over the real willingness quorum').to.equal('accepted');
 		expect(primaryEngine.engine.handleRenew(await signedReattach(participant, TOPIC, now), now).result, 'reattach touches the record').to.equal('ok');
@@ -530,7 +536,20 @@ async function memberOf(key: PrivateKey, peerId: PeerId): Promise<Member> {
 			correlationId: bytesToB64url(new TextEncoder().encode('rx-socket-sub')),
 			appPayload: bytesToB64url(appPayload),
 		};
-		const reg: RegisterV1 = { ...regBody, signature: bytesToB64url(await signPeer(remote.member.key, registerSigningPayload(regBody))) };
+		// T3 (`tier > maxNoPowTier`) bootstrap is always gated on the production node (cohort-topic-bootstrap-
+		// coldstart-origination-regression keeps only T0/T1 permissive). Attach a self-vouch reputation
+		// endorsement: the registrant peer-key-signs its own bootstrapBoundImage as the referee, and the origin's
+		// reputation view sees an unseen, non-banned peer (score 0 < deprioritize) → admitted via the
+		// `PoW || reputation || parent-ref` disjunction. bootstrapBoundImage binds only (topicId, tier,
+		// participantCoord, timestamp), so it is identical on regBody and the evidence-bearing body; attach the
+		// evidence to the body BEFORE the final register sign (registerSigningPayload covers bootstrapEvidence).
+		const repSig = await signPeer(remote.member.key, bootstrapBoundImage(regBody));
+		const evidence = serializeBootstrapEvidenceEnvelope({
+			v: 1,
+			reputation: { referee: bytesToB64url(remote.member.bytes), sig: bytesToB64url(repSig) },
+		});
+		const regBodyWithEv: Omit<RegisterV1, 'signature'> = { ...regBody, bootstrapEvidence: evidence };
+		const reg: RegisterV1 = { ...regBodyWithEv, signature: bytesToB64url(await signPeer(remote.member.key, registerSigningPayload(regBodyWithEv))) };
 		const accept = await originEngine.engine.handleRegister(reg, { followOn: false, treeTier: 0 }, now);
 		expect(accept.result, 'the reactivity subscriber registration was admitted on the origin cohort engine').to.equal('accepted');
 		expect(

@@ -320,6 +320,33 @@ describe('cohort-topic: host anti-DoS wiring (gap 6)', () => {
 		await host.stop();
 	});
 
+	it('cold-start origination: a configured host with no committed backing admits a T0 bootstrap with no evidence but still denies a T2 one', async () => {
+		// The cold-start-origination regression guard (cohort-topic-bootstrap-coldstart-origination-regression).
+		// A real production node wires a reputation view (so the policy is *configured*) but, today, no
+		// committed-existence backing — no `antiDos.parentTopicView` override and no `committedParentTopicReader`.
+		// A brand-new T0 root has no parent to reference and the default view fails T0 closed, so at T0/T1 the
+		// policy (which consults ONLY verifyParentReference there) stays permissive-but-logged: an evidence-less
+		// T0 bootstrap is admitted. The fix is scoped to T0/T1 — a T2 bootstrap with no evidence is still denied
+		// (verifyPoW / verifyReputation / verifyParentReference all fail closed), proving T2/T3 gating is intact.
+		const now = 1_000_000;
+		const host = await createCohortTopicHost(makeFakeNode(await makePeerId()) as never, makeFakeFret() as never, {
+			wantK: 1,
+			antiDos: { reputation: cleanReputation, powDifficultyBits: 0 },
+		});
+
+		const { bytes: t0Participant } = await makeParticipant();
+		const ceT0 = host.registry.forCoord(addressing.coord0(TOPIC), 0 as Tier, t0Participant);
+		const t0 = await ceT0.engine.handleRegister(makeReg(t0Participant, TOPIC, 'cid-coldstart-t0', now), { followOn: false, treeTier: 0 }, now);
+		expect(t0.result, 'a configured host with no committed backing admits an evidence-less T0 bootstrap').to.equal('accepted');
+
+		const { bytes: t2Participant } = await makeParticipant();
+		const ceT2 = host.registry.forCoord(addressing.coord0(TOPIC2), 0 as Tier, t2Participant);
+		const t2 = await ceT2.engine.handleRegister(makeReg(t2Participant, TOPIC2, 'cid-coldstart-t2', now, { tier: 2 }), { followOn: false, treeTier: 0 }, now);
+		expect(t2.result, 'the fix is scoped to T0/T1 — a configured host still denies an evidence-less T2 bootstrap').to.equal('unwilling_cohort');
+
+		await host.stop();
+	});
+
 	it('renewal is not replay-gated: a renew reusing the correlationId is served past the replay window', async () => {
 		const host = await createCohortTopicHost(makeFakeNode(await makePeerId()) as never, makeFakeFret() as never, { wantK: 1 });
 		const participant = await makeParticipantBytes();

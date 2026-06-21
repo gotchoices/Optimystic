@@ -159,12 +159,19 @@ describe('cohort-topic: scale anti-flood + anti-DoS (mock-tier e2e)', function (
 			const TOPIC = topic(3);
 			const dMax = 1;
 			const members = await makeMembers(N);
-			// A reputation view that bans every participant → the cold-root bootstrap is denied with
-			// UnwillingCohort, so the walk terminates in a temporal back-off and the caller must restart.
+			// A *configured* host (a reputation view) plus a committed-existence backing that knows no parents
+			// (`parentTopicView.exists → false`) → the evidence-less cold-root T0 bootstrap fails the REAL
+			// parent-reference verifier closed → UnwillingCohort, so the walk terminates in a temporal back-off
+			// and the caller must restart. The `parentTopicView` is required because T0/T1 stays *permissive*
+			// when configured-but-without a committed backing (cohort-topic-bootstrap-coldstart-origination-
+			// regression keeps brand-new low-tier origination open); supplying one re-enables the real T0 gate.
 			const mesh = await buildMesh(members, {
 				wantK: WANT_K,
 				minSigs: MIN_SIGS,
-				antiDos: { reputation: { isBanned: (): boolean => true, getScore: (): number => 0 } },
+				antiDos: {
+					reputation: { isBanned: (): boolean => true, getScore: (): number => 0 },
+					parentTopicView: { exists: (): boolean => false },
+				},
 			});
 			try {
 				await setupTopic(mesh, TOPIC);

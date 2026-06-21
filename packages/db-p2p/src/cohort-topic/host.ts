@@ -78,6 +78,7 @@ import {
 	createBootstrapEvidence,
 	coreProfile,
 	DEFAULT_MIN_SIGS,
+	DEFAULT_MAX_NO_POW_TIER,
 	DEFAULT_TRAFFIC_WINDOW_SECONDS,
 	DEFAULT_TTL_MS,
 	bytesToB64url,
@@ -242,10 +243,12 @@ export interface CohortTopicAntiDosOptions {
 	 * the referee is sufficiently reputable here (not banned **and** below the deprioritize threshold).
 	 * `PeerReputationService` satisfies this `{ isBanned, getScore }` shape directly. Supplying it (or any
 	 * `bootstrapEvidence` override) makes the gate **configured**: the real PoW verifier runs, the referee
-	 * verifier backs the reputation + (interim) parent-reference paths, and any unfilled verifier fails
-	 * closed — so a banned/low-rep referee cannot slip the T2/T3 `PoW || reputation || parent-ref`
-	 * disjunction. When omitted (and no `bootstrapEvidence` verifier is supplied), the gate is
-	 * permissive-but-logged (the entirely-unconfigured interim node).
+	 * verifier backs the reputation path, the real signed-parent-reference verifier backs the parent-ref path
+	 * (permissive-but-logged only at T0/T1 when this host has no committed-existence backing — see
+	 * {@link createBootstrapEvidencePolicy}), and any otherwise-unfilled verifier fails closed — so a
+	 * banned/low-rep referee cannot slip the T2/T3 `PoW || reputation || parent-ref` disjunction. When omitted
+	 * (and no `bootstrapEvidence` verifier is supplied), the gate is permissive-but-logged (the
+	 * entirely-unconfigured interim node).
 	 */
 	readonly reputation?: BootstrapReputationView;
 	/**
@@ -589,7 +592,15 @@ export async function createCohortTopicHost(node: Libp2p, fret: FretService, opt
 		addressing,
 		committedReader: options.committedParentTopicReader,
 	});
-	const bootstrapEvidence = createBootstrapEvidencePolicy(options.antiDos, hash, log, parentTopicView);
+	// Does this host actually have a committed-existence backing to gate T0/T1 parent-refs against? Only an
+	// explicit `parentTopicView` override (the test seam / future production index) or a wired
+	// `committedParentTopicReader` provides one. Absent both (today's production node), a T0/T1 root cannot
+	// mint any acceptable parent-ref — a root has no parent and the default view fails T0/T1 closed — so the
+	// policy keeps T0/T1 permissive-but-logged rather than regressing cold-start origination. See
+	// {@link createBootstrapEvidencePolicy}.
+	const hasCommittedParentBacking =
+		options.antiDos?.parentTopicView !== undefined || options.committedParentTopicReader !== undefined;
+	const bootstrapEvidence = createBootstrapEvidencePolicy(options.antiDos, hash, log, parentTopicView, hasCommittedParentBacking);
 
 	// Node-level `promote`-handler anti-abuse gate (`cohort-topic-promote-handler-verify-amplification`):
 	// a per-(peer, topic) rate limiter (own instance — the register-path limiter is per-coord inside each
@@ -824,19 +835,37 @@ function createParticipantSigner(
  *   participant-signed reference to a parent topic that the node locally knows exists (committed/membership
  *   state). It is the *only* accepted evidence for T0/T1 and the third T2/T3 option. The view is always
  *   available (the host builds a default from the membership cache + addressing), so this is the real
- *   verifier whenever configured — the interim reputation stand-in is gone.
+ *   verifier at T2/T3 and at T0/T1 **once a committed backing is wired**.
+ *
+ * **T0/T1 without a committed backing (the cold-start-origination interim posture).** A real production
+ * node wires a reputation view (so it is *configured*) but, today, no committed-existence backing
+ * (`hasCommittedParentBacking === false`): there is no coord-keyed committed-membership index yet, so the
+ * default `parentTopicView` fails T0/T1 closed, and the participant-side builder mints no parentRef for a
+ * brand-new root (a root has no parent to reference). At those tiers the policy consults *only*
+ * `verifyParentReference`, so a real, unfilled T0/T1 parent-ref gate would make cold-start origination
+ * impossible. While that backing does not exist we therefore keep T0/T1 **permissive-but-logged** when
+ * `hasCommittedParentBacking` is false, and run the real verifier otherwise — i.e. at T2/T3 always, and at
+ * T0/T1 once a committed backing IS supplied (the test seam `antiDos.parentTopicView`, or a future
+ * production `committedParentTopicReader`). This is the documented refinement of the parent-reference work,
+ * narrowed so it does not regress the just-landed real T0/T1 gating exercised with an explicit view.
  *
  * "Configured" = any reputation view or explicit `bootstrapEvidence` override is set; once configured, an
  * unfilled verifier fails **closed** so a banned/low-rep referee cannot slip the T2/T3
  * `verifyPoW || verifyReputation || verifyParentReference` disjunction. The permissive-but-logged
- * fallback is reserved for the *entirely unconfigured* interim node (a one-time warning, never an
- * undefined gate) so the db-core/mock-tier flows that bootstrap tier-0 without evidence still pass.
+ * fallback is reserved for the *entirely unconfigured* interim node (and the configured-but-no-committed-
+ * backing T0/T1 origination path above) — a one-time warning, never an undefined gate — so the
+ * db-core/mock-tier flows that bootstrap tier-0 without evidence still pass.
+ *
+ * @param hasCommittedParentBacking Whether this host has a committed-existence backing to gate T0/T1
+ *   parent-refs against (an explicit `antiDos.parentTopicView` override or a wired
+ *   `committedParentTopicReader`). False on today's production node, where T0/T1 stays permissive.
  */
 function createBootstrapEvidencePolicy(
 	antiDos: CohortTopicAntiDosOptions | undefined,
 	hash: RingHash,
 	log: (formatter: string, ...args: unknown[]) => void,
 	parentTopicView: BootstrapParentTopicView,
+	hasCommittedParentBacking: boolean,
 ): BootstrapEvidence {
 	const overrides = antiDos?.bootstrapEvidence;
 	const reputation = antiDos?.reputation;
@@ -846,6 +875,9 @@ function createBootstrapEvidencePolicy(
 	// `||` disjunction and admits even a banned peer. The permissive-but-logged fallback below is
 	// therefore reserved for the *entirely unconfigured* interim node.
 	const configured = overrides !== undefined || reputation !== undefined;
+	// Mirror the db-core policy's tier split (an override config wins, else the default) so the T0/T1 branch
+	// of the parent-reference gate below matches the tiers at which the policy consults it exclusively.
+	const maxNoPowTier = overrides?.config?.maxNoPowTier ?? DEFAULT_MAX_NO_POW_TIER;
 
 	// The real, self-contained PoW verifier — available whenever configured (no view / subsystem needed).
 	const realPoW = createPoWVerifier({ hash, bits: antiDos?.powDifficultyBits });
@@ -853,8 +885,8 @@ function createBootstrapEvidencePolicy(
 	const realReputation = reputation === undefined
 		? undefined
 		: createReputationVerifier({ reputation, deprioritizeThreshold: antiDos?.deprioritizeThreshold });
-	// The real signed-parent-reference verifier over the (always-available) existence view. Replaces the
-	// interim reputation stand-in: T0/T1 and the T2/T3 third option now demand a real, existing parent.
+	// The real signed-parent-reference verifier over the existence view (T2/T3 always; T0/T1 once a committed
+	// backing is wired). Replaces the interim reputation stand-in: it demands a real, existing parent.
 	const realParentReference = createParentReferenceVerifier({ parentTopicView });
 
 	const deny = (): boolean => false;
@@ -873,13 +905,27 @@ function createBootstrapEvidencePolicy(
 	// An unconfigured verifier: deny when the policy is otherwise configured (fail closed), else permissive.
 	const fallback = (kind: string): ((reg: RegisterV1) => boolean) => configured ? deny : permissive(kind);
 
+	// The configured parent-reference gate. At T0/T1 (`reg.tier <= maxNoPowTier`) with NO committed backing,
+	// a brand-new root cannot mint any acceptable parent-ref (it has no parent; the default view fails closed)
+	// and the policy consults only this verifier there — so admit permissively-but-logged rather than regress
+	// cold-start origination. At T2/T3, and at T0/T1 once a committed backing IS wired (the test seam / future
+	// production index), run the real verifier.
+	const permissiveT0T1 = permissive("parent-reference (T0/T1, no committed backing)");
+	const parentReferenceGate = (reg: RegisterV1): boolean => {
+		if (reg.tier <= maxNoPowTier && !hasCommittedParentBacking) {
+			return permissiveT0T1(reg);
+		}
+		return realParentReference(reg);
+	};
+
 	return createBootstrapEvidence({
 		// Configured ⇒ the real PoW path; unconfigured ⇒ permissive (preserves the bare-host tier-0 flows).
 		verifyPoW: overrides?.verifyPoW ?? (configured ? realPoW : fallback("proof-of-work")),
 		verifyReputation: overrides?.verifyReputation ?? realReputation ?? fallback("reputation"),
-		// The real signed-parent-reference verifier when configured (an explicit override still wins);
-		// unconfigured ⇒ permissive (preserves the bare-host tier-0 flows). No longer the reputation stand-in.
-		verifyParentReference: overrides?.verifyParentReference ?? (configured ? realParentReference : fallback("parent-reference")),
+		// The real signed-parent-reference verifier when configured (an explicit override still wins), gated so
+		// T0/T1-without-committed-backing stays permissive; unconfigured ⇒ permissive (preserves the bare-host
+		// tier-0 flows). No longer the reputation stand-in.
+		verifyParentReference: overrides?.verifyParentReference ?? (configured ? parentReferenceGate : fallback("parent-reference")),
 		config: overrides?.config,
 	});
 }
