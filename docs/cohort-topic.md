@@ -175,6 +175,14 @@ Key points:
 - `UnwillingMember` and `UnwillingCohort` are distinct: the former routes to a sibling within the same cohort, the latter is a temporal back-off with no spatial movement.
 - The root case (`d = 0` returning `NoState`) means no cohort anywhere serves this topic. The participant treats this as an opportunity to bootstrap: it re-issues the registration at `d = 0` with a `bootstrap: true` flag, asking the root cohort to instantiate. Cold-start denial (root is unwilling) yields `UnwillingCohort` and the participant retries.
 
+> **Read-only lookup (`probe: true`).** `service.lookup` walks this *same* path with `RegisterV1.probe`
+> set: identical routing discipline (inward on `NoState`, follow `Promoted` outward, back off on
+> `UnwillingCohort`), but the terminal cohort **classifies** rather than admits — returning the same
+> `Accepted` / `Promoted` / `NoState` reply without persisting a record, counting an arrival, firing a
+> promotion trigger, touching the topic budget, or instantiating anything. It diverges from a register at
+> exactly one point: the root `NoState` case **backs off** (`CohortBackoffError`) instead of re-issuing
+> `bootstrap: true` — a probe never instantiates a cold root.
+
 > **Implementation.** The participant-side walk is
 > [`packages/db-core/src/cohort-topic/walk.ts`](../packages/db-core/src/cohort-topic/walk.ts)
 > (`WalkEngine` / `createWalkEngine`). It drives the injected `ITopicRouter` port — **not** a direct
@@ -1103,9 +1111,14 @@ warm-failover target.
 
 **Still deferred (parked in backlog, honestly out of scope for this milestone):** multi-tier
 promoted-redirect *follow-on* instantiation (`cohort-topic-followon-derivation`) and the parent-side
-child-cohort link recording (`cohort-topic-parent-child-link`); a dedicated read-only **lookup-probe**
-RPC (today `lookup` shares the registration walk and leaves TTL-expiring soft state); and an immediate
+child-cohort link recording (`cohort-topic-parent-child-link`); and an immediate
 **withdraw tombstone** (today `withdraw` stops renewing and lets the soft state TTL-expire).
+
+> **Landed since:** the read-only **lookup-probe** RPC — `lookup` now drives the walk with
+> `RegisterV1.probe: true`, classifying the terminal cohort and returning the same snapshot a register
+> would **without admitting anything** (no soft-state record, no arrival, no promotion trigger, no
+> topic-budget touch, and never a cold-start instantiation), so a lookup leaves no TTL-expiring
+> registration behind. See §Lookup and §Wire formats (`RegisterV1.probe`).
 
 ---
 
@@ -1134,6 +1147,7 @@ interface RegisterV1 {
   participantCoord: string            // participant identity P (see note)
   ttl:             number             // ms, default 90000
   bootstrap?:      boolean            // true on root cold-start request
+  probe?:          boolean            // read-only lookup: classify + return the cohort snapshot, admit nothing (mutually exclusive with bootstrap)
   appPayload?:     string             // opaque, application-defined
   bootstrapEvidence?: string          // cold-start evidence envelope, base64url (see note); only on bootstrap
   timestamp:       number             // unix ms
