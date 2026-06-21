@@ -18,10 +18,28 @@ import { bytesToB64url, encodeCohortMessage } from "../wire/codec.js";
 import type { MembershipCertV1 } from "../wire/types.js";
 import { compareBytes } from "../registration/bytes.js";
 import { DEFAULT_MIN_SIGS, type CohortSigner } from "../sig/threshold.js";
-import { membershipCertSigningPayload } from "../sig/payloads.js";
+import { membershipCertSigningPayload, type MembershipCertSignable } from "../sig/payloads.js";
 
 /** Default membership-cert refresh interval (`T_membership_refresh`). */
 export const DEFAULT_T_MEMBERSHIP_REFRESH_MS = 5 * 60_000;
+
+/**
+ * The canonical {@link MembershipCertSignable} for a stabilized snapshot: members sorted ascending (the
+ * cert / sharding order), byte fields base64url-encoded, over exactly the threshold-signed fields. The
+ * publisher signs `membershipCertSigningPayload` of this; a rotation-attestation **producer** (db-p2p,
+ * `cohort-topic-trust-anchor-rotation-production`) signs the *successor* cert's image through the SAME
+ * helper, so signer and verifier never canonicalize the cert independently (signature-image agreement —
+ * a mismatch makes the db-core chain check fail).
+ */
+export function membershipCertSignable(snapshot: CohortSnapshot): MembershipCertSignable {
+	const sorted = [...snapshot.members].sort(compareBytes);
+	return {
+		cohortCoord: bytesToB64url(snapshot.coord),
+		cohortEpoch: bytesToB64url(snapshot.cohortEpoch),
+		members: sorted.map(bytesToB64url),
+		stabilizedAt: snapshot.stabilizedAt,
+	};
+}
 
 /** A stabilized cohort snapshot the publisher attests. */
 export interface CohortSnapshot {
@@ -90,32 +108,27 @@ class SigningMembershipCertPublisher implements MembershipCertPublisher {
 	}
 
 	async onStabilized(snapshot: CohortSnapshot, now: number, rotation?: RotationAttestation): Promise<MembershipCertV1 | undefined> {
-		const sorted = this.sortedMembers(snapshot.members);
-		const firstKx = sorted.slice(0, this.minSigs).map(bytesToB64url);
+		const firstKx = this.firstKx(snapshot.members);
 		if (this.lastFirstKx !== undefined && sameOrder(this.lastFirstKx, firstKx)) {
 			return undefined; // first k − x unchanged — no republish needed
 		}
-		return this.publish(snapshot, sorted, now, rotation);
+		return this.publish(snapshot, now, rotation);
 	}
 
 	async tick(snapshot: CohortSnapshot, now: number, rotation?: RotationAttestation): Promise<MembershipCertV1 | undefined> {
 		if (this.lastPublishedAt !== undefined && now - this.lastPublishedAt < this.refreshMs) {
 			return undefined;
 		}
-		return this.publish(snapshot, this.sortedMembers(snapshot.members), now, rotation);
+		return this.publish(snapshot, now, rotation);
 	}
 
-	private sortedMembers(members: readonly Uint8Array[]): Uint8Array[] {
-		return [...members].sort(compareBytes);
+	/** The first `minSigs` members of the cert's ascending order, base64url — the republish-change key. */
+	private firstKx(members: readonly Uint8Array[]): string[] {
+		return [...members].sort(compareBytes).slice(0, this.minSigs).map(bytesToB64url);
 	}
 
-	private async publish(snapshot: CohortSnapshot, sorted: Uint8Array[], now: number, rotation?: RotationAttestation): Promise<MembershipCertV1> {
-		const signable = {
-			cohortCoord: bytesToB64url(snapshot.coord),
-			cohortEpoch: bytesToB64url(snapshot.cohortEpoch),
-			members: sorted.map(bytesToB64url),
-			stabilizedAt: snapshot.stabilizedAt,
-		};
+	private async publish(snapshot: CohortSnapshot, now: number, rotation?: RotationAttestation): Promise<MembershipCertV1> {
+		const signable = membershipCertSignable(snapshot);
 		const { thresholdSig, signers } = await this.deps.signer.thresholdSign(membershipCertSigningPayload(signable));
 		const cert: MembershipCertV1 = {
 			v: 1,

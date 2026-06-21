@@ -396,7 +396,7 @@ export function validateCohortGossipV1(value: unknown): CohortGossipV1 {
 	return out;
 }
 
-const SIGN_KINDS: readonly SignKind[] = ["membership", "promotion", "demotion"];
+const SIGN_KINDS: readonly SignKind[] = ["membership", "promotion", "demotion", "rotation"];
 
 export function validateSignRequestV1(value: unknown): SignRequestV1 {
 	const what = "SignRequestV1";

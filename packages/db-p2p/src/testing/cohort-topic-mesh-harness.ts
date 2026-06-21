@@ -279,14 +279,31 @@ export class CohortMesh {
 	private readonly registry = new Map<string, MockNode>();
 	private readonly activity = new Map<string, (activity: string, cohort: string[], minSigs: number, correlationId: string) => Promise<{ commitCertificate: string }>>();
 	private readonly down: Set<string>;
+	/** Members removed from FRET assembly (a membership change for rotation tests). They stay dialable. */
+	private readonly excluded = new Set<string>();
 
 	constructor(private readonly members: Member[], private readonly sizeEstimate: number, down: readonly string[]) {
 		this.down = new Set(down);
 	}
 
-	/** Deterministic FRET assembly: all members sorted by XOR distance of their ring position to `coord`. */
+	/**
+	 * Drop `idStr` from FRET cohort assembly — the cohort serving any coord that included it now resolves to
+	 * a different member set (a new `cohortEpoch`), which is the membership change that drives an epoch
+	 * rotation. Unlike {@link crashNode}, the node stays dialable (it still answers `/sign`), so the outgoing
+	 * cohort can co-sign the hand-off. Used by the rotation-attestation tests.
+	 */
+	excludeFromAssembly(idStr: string): void {
+		this.excluded.add(idStr);
+	}
+
+	/** Restore `idStr` to FRET cohort assembly. */
+	includeInAssembly(idStr: string): void {
+		this.excluded.delete(idStr);
+	}
+
+	/** Deterministic FRET assembly: live (non-excluded) members sorted by XOR distance of ring position to `coord`. */
 	private sortedByDistance(coord: Uint8Array): Member[] {
-		return [...this.members].sort((a, b) => xorCompare(a.ringPos, b.ringPos, coord));
+		return [...this.members].filter((m) => !this.excluded.has(m.idStr)).sort((a, b) => xorCompare(a.ringPos, b.ringPos, coord));
 	}
 
 	assembleCohort(coord: Uint8Array, wants: number): string[] {

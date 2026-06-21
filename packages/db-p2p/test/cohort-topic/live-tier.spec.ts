@@ -353,4 +353,153 @@ describe('cohort-topic: live-tier end-to-end milestone', () => {
 			await mesh.stop();
 		}
 	});
+
+	// --- rotation attestation production (cohort-topic-trust-anchor-rotation-production) ---
+	// These use wantK = 4 over N = 5 with minSigs = 4 (= wantK), so the cohort is a strict subset of the
+	// network and any single membership swap changes the FULL first-`k − x` set → a guaranteed rotation. The
+	// outgoing cohort co-signs the successor cert; the db-core verifier accepts it as a chain extension.
+	const ROT_N = 5;
+	const ROT_WANT_K = 4;
+	const ROT_MIN_SIGS = 4; // = wantK so a member swap always changes the first k − x (whole-cohort) set
+	const ROT_FRET_TIER = 2; // a FRET tier → the membership-source router owns the binding (no tx-log)
+
+	/** A no-direct-anchor verifier (chain is the only trust path beyond TOFU) over a fixed cert source. */
+	function chainVerifier(serve: MembershipCertV1) {
+		const encoded = encodeCohortMessage(serve);
+		const source: IMembershipSource = { current: () => Promise.resolve(encoded), fetch: () => Promise.resolve(encoded) };
+		const router = createMembershipSourceRouter({ committed: source, fret: source });
+		const signer = createCohortSigner(createVerifyOnlyThresholdCrypto(), ROT_MIN_SIGS);
+		return createMembershipVerifier({ signer, router, minSigs: ROT_MIN_SIGS });
+	}
+
+	/** Resolve the {@link Member} for a base64url-encoded dialable member id (a cert member / signer). */
+	function memberOf(members: readonly Member[], b64: string): Member {
+		const m = members.find((x) => bytesToB64url(x.bytes) === b64);
+		if (m === undefined) {
+			throw new Error(`no member for ${b64}`);
+		}
+		return m;
+	}
+
+	it('8. (rotation) an epoch rotation carries a predecessor-cohort rotationSig the db-core verifier accepts as a chain extension', async () => {
+		const members = await makeMembers(ROT_N);
+		const mesh = await buildMesh(members, { wantK: ROT_WANT_K, minSigs: ROT_MIN_SIGS });
+		try {
+			const { coord0, decidingEngine, deciding, cohortIds } = await setupTopic(mesh, TOPIC, addressing);
+			const now = Date.now();
+
+			// Epoch N: the first publish carries no rotation attestation (its trust is the direct anchor / root).
+			const certN = await decidingEngine.onStabilized(now);
+			expect(certN, 'epoch-N cert published').to.not.equal(undefined);
+			expect(certN!.prevEpoch, 'a first publish carries no rotation attestation').to.equal(undefined);
+
+			// Membership change: drop one OLD member (not the routed primary) from FRET assembly → epoch N+1.
+			const victim = cohortIds.find((id) => id !== deciding.member.idStr)!;
+			mesh.excludeFromAssembly(victim);
+
+			// Epoch N+1: the first k − x changed, so the cohort threshold-signs a rotation attestation over the
+			// new cert under the PRIOR cohort identity — the outgoing members co-sign the hand-off.
+			const certN1 = await decidingEngine.onStabilized(now);
+			expect(certN1, 'epoch-(N+1) cert published').to.not.equal(undefined);
+			expect(certN1!.prevEpoch, 'the rotation cert names the predecessor epoch').to.equal(certN!.cohortEpoch);
+			expect(certN1!.rotationSig, 'carries a rotation signature').to.be.a('string');
+			expect(certN1!.rotationSigners!.length, 'a >= minSigs predecessor quorum signed').to.be.at.least(ROT_MIN_SIGS);
+			const priorMembers = new Set(certN!.members);
+			expect(certN1!.rotationSigners!.every((s) => priorMembers.has(s)), 'every rotation signer is a PRIOR-cohort member').to.equal(true);
+			expect(certN1!.members.some((m) => !priorMembers.has(m)), 'the new cohort genuinely has a fresh member').to.equal(true);
+
+			// A participant trusting cert N now trusts cert N+1 via the chain — no fresh direct anchor needed.
+			const verifier = chainVerifier(certN1!);
+			verifier.cache(certN!); // the trusted predecessor (blocks TOFU, so only the chain can admit N+1)
+			const verdict = await verifier.verifyMessage(
+				certN1!.signers.map(b64urlToBytes), coord0, ROT_FRET_TIER,
+				membershipCertSigningPayload(certN1!), b64urlToBytes(certN1!.thresholdSig),
+			);
+			expect(verdict, 'the rotation cert is accepted as a chain extension from the trusted predecessor').to.equal('verified');
+		} finally {
+			await mesh.stop();
+		}
+	});
+
+	it('9. (rotation) a forged rotation signed by non-prior members is rejected end-to-end', async () => {
+		const members = await makeMembers(ROT_N);
+		const mesh = await buildMesh(members, { wantK: ROT_WANT_K, minSigs: ROT_MIN_SIGS });
+		try {
+			const { coord0, decidingEngine, deciding, cohortIds } = await setupTopic(mesh, TOPIC, addressing);
+			const now = Date.now();
+			const certN = await decidingEngine.onStabilized(now);
+			const victim = cohortIds.find((id) => id !== deciding.member.idStr)!;
+			mesh.excludeFromAssembly(victim);
+			const certN1 = await decidingEngine.onStabilized(now);
+			expect(certN1!.rotationSig, 'a legit rotation was produced (baseline)').to.be.a('string');
+
+			// Forge: keep the self-consistent cert, but replace the attestation with one signed by the NEW
+			// cohort — which includes a member NOT in the predecessor cert (the swapped-in node). A single
+			// non-prior signer must break the chain (signers ⊄ predecessor.members).
+			const newCohort = certN1!.members.map((b) => memberOf(members, b));
+			const forgedSig = await collectedMultisig(newCohort, membershipCertSigningPayload(certN1!));
+			const forged: MembershipCertV1 = {
+				...certN1!,
+				rotationSig: bytesToB64url(forgedSig.sig),
+				rotationSigners: forgedSig.signers.map(bytesToB64url),
+			};
+			expect(forged.rotationSigners!.some((s) => !certN!.members.includes(s)), 'the forged signers include a non-prior member').to.equal(true);
+
+			const verifier = chainVerifier(forged);
+			verifier.cache(certN!); // already-trusted predecessor → a failed rotation is rejected, not TOFU'd
+			const verdict = await verifier.verifyMessage(
+				forged.signers.map(b64urlToBytes), coord0, ROT_FRET_TIER,
+				membershipCertSigningPayload(forged), b64urlToBytes(forged.thresholdSig),
+			);
+			expect(verdict, 'a rotation whose signers are not a prior-cohort quorum is untrusted').to.equal('untrusted');
+		} finally {
+			await mesh.stop();
+		}
+	});
+
+	it('10. (rotation) when the predecessor quorum is unreachable the cert publishes WITHOUT an attestation (clean fallback)', async () => {
+		const members = await makeMembers(ROT_N);
+		const mesh = await buildMesh(members, { wantK: ROT_WANT_K, minSigs: ROT_MIN_SIGS });
+		try {
+			const { decidingEngine, deciding, cohortIds } = await setupTopic(mesh, TOPIC, addressing);
+			const now = Date.now();
+			const certN = await decidingEngine.onStabilized(now);
+			expect(certN, 'epoch-N cert published').to.not.equal(undefined);
+
+			// Drop the victim from assembly AND crash it: the new cohort (with the 5th node) still reaches its
+			// own minSigs, but the OUTGOING cohort can no longer (the victim is unreachable for the /sign round).
+			const victim = cohortIds.find((id) => id !== deciding.member.idStr)!;
+			mesh.excludeFromAssembly(victim);
+			mesh.crashNode(victim);
+
+			const certN1 = await decidingEngine.onStabilized(now);
+			expect(certN1, 'the rotation cert still publishes (its own quorum is intact)').to.not.equal(undefined);
+			expect(certN1!.prevEpoch, 'but with NO rotation attestation (predecessor quorum unreachable)').to.equal(undefined);
+			expect(certN1!.rotationSig, 'and no rotation signature').to.equal(undefined);
+			expect(certN1!.rotationSigners, 'and no rotation signers').to.equal(undefined);
+		} finally {
+			await mesh.stop();
+		}
+	});
+
+	it('11. (rotation) a non-rotation republish (periodic refresh, unchanged membership) emits no rotation fields', async () => {
+		const members = await makeMembers(ROT_N);
+		const mesh = await buildMesh(members, { wantK: ROT_WANT_K, minSigs: ROT_MIN_SIGS });
+		try {
+			const { decidingEngine } = await setupTopic(mesh, TOPIC, addressing);
+			const now = Date.now();
+			const certN = await decidingEngine.onStabilized(now);
+			expect(certN, 'first publish').to.not.equal(undefined);
+
+			// A periodic refresh past T_membership_refresh with NO membership change → a republish, but not a
+			// rotation (the first k − x did not change), so it must carry no rotation fields.
+			const refreshed = await decidingEngine.pumpMembership(now + 5 * 60_000 + 1);
+			expect(refreshed, 'the refresh republished the cert').to.not.equal(undefined);
+			expect(refreshed!.cohortEpoch, 'same membership → same epoch').to.equal(certN!.cohortEpoch);
+			expect(refreshed!.prevEpoch, 'a non-rotation refresh emits no rotation attestation').to.equal(undefined);
+			expect(refreshed!.rotationSig, 'and no rotation signature').to.equal(undefined);
+		} finally {
+			await mesh.stop();
+		}
+	});
 });

@@ -87,8 +87,11 @@ import {
 	bytesToB64url,
 	b64urlToBytes,
 	bytesEqual,
+	compareBytes,
 	encodeCohortMessage,
 	decodeCohortMessage,
+	membershipCertSignable,
+	membershipCertSigningPayload,
 	toCohortTopicSummary,
 	validateRegisterV1,
 	validateRenewV1,
@@ -130,6 +133,7 @@ import {
 	type RenewReplyV1,
 	type RenewV1,
 	type RingCoord,
+	type RotationAttestation,
 	type SignKind,
 	type SignReplyV1,
 	type SignRequestV1,
@@ -307,6 +311,14 @@ export interface CoordEngine {
 	readonly engine: CohortMemberEngine;
 	/** The FRET-assembled cohort around {@link servedCoord} (self prepended, deduped) + epoch. */
 	cohort(): CohortSnapshotView;
+	/**
+	 * The cohort member peer-id strings this engine served under `epoch` (the **current** or the
+	 * immediately-**prior** observed epoch), or `undefined` if it tracked no such epoch. Drives the `/sign`
+	 * `"rotation"` endorsement gate: a member endorses a hand-off from `prevEpoch` only when it was a member
+	 * of the cohort at that epoch. Returns `undefined` past the two-deep history (a rapid double rotation —
+	 * the requester then re-anchors). See `cohort-topic-trust-anchor-rotation-production`.
+	 */
+	cohortIdentityAt(epoch: Uint8Array): readonly string[] | undefined;
 	/** True iff this engine currently holds any registration record (a cold probe leaves it empty). */
 	hasState(): boolean;
 	/** True iff this engine holds the record for `(topicId, participantId)` — the renewal lookup key. */
@@ -384,6 +396,13 @@ export interface CoordRegistry {
 	forCoord(coord: RingCoord, treeTier: number, participantCoord: Uint8Array): CoordEngine;
 	/** The engine holding the record for `(topicId, participantId)`, or `undefined` (renewal dispatch). */
 	findHolder(topicId: Uint8Array, participantId: Uint8Array): CoordEngine | undefined;
+	/**
+	 * The already-instantiated engine for `coord`, or `undefined` — a pure lookup that (unlike
+	 * {@link forCoord}) never creates one. The `/sign` `"rotation"` endorsement gate uses it to consult this
+	 * node's prior-epoch membership for the requested coord without spuriously instantiating a cohort it
+	 * does not serve.
+	 */
+	findByCoord(coord: RingCoord): CoordEngine | undefined;
 	/**
 	 * The engine serving `topicId` at `treeTier`, or `undefined` (inbound promote/demote notice dispatch).
 	 * A served coord embeds `(tier, topic)`, so at most one engine matches — the cohort the notice's
@@ -672,6 +691,10 @@ export async function createCohortTopicHost(node: Libp2p, fret: FretService, opt
 			selfMember: selfMemberBytes,
 			cohortMembersAround: (coord: RingCoord): string[] => cohortAround(coord).members.map(bytesToPeerIdString),
 			currentEpoch: (coord: RingCoord): Uint8Array => cohortAround(coord).cohortEpoch,
+			// Rotation endorsement consults the served coord engine's prior-epoch membership history; a coord
+			// this node does not serve has no engine, so the hand-off is refused (no spurious instantiation).
+			priorCohortMembersAt: (coord: RingCoord, epoch: Uint8Array): readonly string[] | undefined =>
+				registry.findByCoord(coord)?.cohortIdentityAt(epoch),
 		});
 
 	// --- participant-side composition (node scope) ---
@@ -1035,6 +1058,9 @@ function createCoordRegistry(ctx: CoordEngineContext): CoordRegistry {
 			}
 			return engine;
 		},
+		findByCoord(coord: RingCoord): CoordEngine | undefined {
+			return engines.get(bytesToB64url(coord));
+		},
 		findHolder(topicId: Uint8Array, participantId: Uint8Array): CoordEngine | undefined {
 			for (const engine of engines.values()) {
 				if (engine.holds(topicId, participantId)) {
@@ -1064,6 +1090,73 @@ function createCoordRegistry(ctx: CoordEngineContext): CoordRegistry {
 }
 
 /**
+ * One observed cohort identity for a served coord: the deterministic epoch (`H(sorted member set)`),
+ * its base64url key, and the member set in both byte and peer-id-string form. The epoch is a pure
+ * function of the member set, so an epoch match implies a member-set match.
+ */
+interface CohortIdentity {
+	readonly epoch: Uint8Array;
+	readonly epochKey: string;
+	readonly memberBytes: readonly Uint8Array[];
+	readonly memberStrs: readonly string[];
+}
+
+/**
+ * Per-{@link CoordEngine} epoch-rotation bookkeeping (`cohort-topic-trust-anchor-rotation-production`).
+ * Two roles, one small object:
+ *
+ * - **Producer** — {@link predecessor} is the identity of the *last published* cert; a publish whose
+ *   first `k − x` differ from it is a rotation, and the predecessor identity scopes the rotation `/sign`
+ *   round (its epoch is `prevEpoch`, its members are the outgoing cohort to collect from).
+ * - **Endorser** — {@link membersAt} answers "was I a member of the cohort at `epoch`?" over a two-deep
+ *   observed-epoch history ({@link current} + {@link prior}), kept fresh by {@link observe} on every
+ *   cohort assembly. A request for an epoch past that window is refused (the rapid-double-rotation gap).
+ *
+ * The observed history (for endorsing) is distinct from `lastPublished` (for producing): a non-deciding
+ * member endorses rotations it never published, so it cannot rely on its own publish history alone.
+ */
+class RotationState {
+	private current: CohortIdentity | undefined;
+	private prior: CohortIdentity | undefined;
+	private lastPublished: CohortIdentity | undefined;
+
+	/**
+	 * Record the engine's current cohort identity, shifting the previous current into {@link prior} on an
+	 * epoch change. Cheap on the hot path: `build` is only invoked when `epochKey` actually changes (the
+	 * member set is unchanged within an epoch, so there is nothing to refresh).
+	 */
+	observe(epochKey: string, build: () => CohortIdentity): void {
+		if (this.current?.epochKey === epochKey) {
+			return;
+		}
+		const next = build();
+		this.prior = this.current;
+		this.current = next;
+	}
+
+	/** Mark `identity` as the most recently published cert's identity (the rotation chain predecessor). */
+	recordPublished(identity: CohortIdentity): void {
+		this.lastPublished = identity;
+	}
+
+	/** The last-published identity (the predecessor a fresh rotation attests from), or `undefined`. */
+	predecessor(): CohortIdentity | undefined {
+		return this.lastPublished;
+	}
+
+	/** The member peer-id strings observed under `epochKey` (current or prior), or `undefined`. */
+	membersAt(epochKey: string): readonly string[] | undefined {
+		if (this.current?.epochKey === epochKey) {
+			return this.current.memberStrs;
+		}
+		if (this.prior?.epochKey === epochKey) {
+			return this.prior.memberStrs;
+		}
+		return undefined;
+	}
+}
+
+/**
  * Compose one {@link CoordEngine} bound to `servedCoord`. The cohort it threshold-signs / shards with
  * is the FRET assembly around `servedCoord` (not the node's own ring position). The promotion tier
  * inputs are coord-derived: `treeTier` is fixed at instantiation; `parentCoord` is
@@ -1072,7 +1165,23 @@ function createCoordRegistry(ctx: CoordEngineContext): CoordRegistry {
  */
 function createCoordEngine(ctx: CoordEngineContext, servedCoord: RingCoord, treeTier: number, participantCoord: Uint8Array): CoordEngine {
 	const store = createRegistrationStore();
-	const cohort = (): CohortSnapshotView => ctx.cohortAround(servedCoord);
+	// Epoch-rotation bookkeeping. `cohort()` observes every assembly so the endorser history stays fresh
+	// (the gossip-cadence driver assembles each round); the producer reads `predecessor()` on publish.
+	const rotationState = new RotationState();
+	const identityOf = (view: { members: readonly Uint8Array[]; cohortEpoch: Uint8Array }): CohortIdentity => {
+		const memberBytes = [...view.members];
+		return {
+			epoch: view.cohortEpoch,
+			epochKey: bytesToB64url(view.cohortEpoch),
+			memberBytes,
+			memberStrs: memberBytes.map(bytesToPeerIdString),
+		};
+	};
+	const cohort = (): CohortSnapshotView => {
+		const view = ctx.cohortAround(servedCoord);
+		rotationState.observe(bytesToB64url(view.cohortEpoch), () => identityOf(view));
+		return view;
+	};
 	const localEpoch = (): Uint8Array => cohort().cohortEpoch;
 
 	// Inbound gossip is routed to this bus by its `coord`; the optional auth gate (live-signer mode) drops
@@ -1141,6 +1250,77 @@ function createCoordEngine(ctx: CoordEngineContext, servedCoord: RingCoord, tree
 	// "publisher paths are simply not driven without a key" contract. Without this guard a future
 	// gossip-cadence driver iterating `registry.all()` would reject on every key-less engine.
 	const canPublish = ctx.privateKey !== undefined;
+
+	// --- epoch-rotation attestation production (cohort-topic-trust-anchor-rotation-production) ---
+	// The first `k − x` members of the cert's ascending order; a change across a publish is a rotation
+	// (mirrors the publisher's own republish gate — same inputs, so the two agree on what is a rotation).
+	const firstKx = (members: readonly Uint8Array[]): string[] =>
+		[...members].sort(compareBytes).slice(0, ctx.minSigs).map(bytesToB64url);
+	const firstKxChanged = (a: CohortIdentity, b: CohortIdentity): boolean =>
+		!sameStringOrder(firstKx(a.memberBytes), firstKx(b.memberBytes));
+
+	/**
+	 * Threshold-sign the new cert's canonical payload under the **predecessor** cohort identity, producing the
+	 * `{ prevEpoch, rotationSig, rotationSigners }` attestation — or `undefined` if the predecessor quorum is
+	 * unreachable (mass churn / partition), in which case the caller publishes the rotation cert WITHOUT an
+	 * attestation (trust falls to the direct anchor / TOFU, no worse than a non-rotation publish). The `/sign`
+	 * round is scoped to the prior epoch's members (`kind: "rotation"`), so the endorsers are the genuinely
+	 * outgoing cohort. The payload is built through the SAME `membershipCertSignable` the publisher signs, so
+	 * the signature image matches exactly (the db-core chain check verifies `rotationSig` over it).
+	 */
+	const produceRotation = async (snapshot: CohortSnapshot, predecessor: CohortIdentity): Promise<RotationAttestation | undefined> => {
+		const payload = membershipCertSigningPayload(membershipCertSignable(snapshot));
+		const selfStr = bytesToPeerIdString(ctx.selfMemberBytes);
+		const crypto = new FretCohortThresholdCrypto({
+			kind: "rotation",
+			privateKey: ctx.privateKey!, // canPublish guard: rotation only runs from a publish, which no-ops key-less
+			selfMember: ctx.selfMemberBytes,
+			coord: (): RingCoord => servedCoord,
+			cohortEpoch: (): Uint8Array => predecessor.epoch, // prevEpoch — scopes the endorsement to the prior epoch
+			cohortMembers: (): string[] => [...predecessor.memberStrs], // dial the OUTGOING cohort
+			dialSign: ctx.dialSign,
+			selfEligible: (): boolean => predecessor.memberStrs.includes(selfStr),
+		});
+		const signer = createCohortSigner(crypto, ctx.minSigs);
+		try {
+			const { thresholdSig, signers } = await signer.thresholdSign(payload);
+			return { prevEpoch: predecessor.epoch, rotationSig: thresholdSig, rotationSigners: signers };
+		} catch (err) {
+			log("cohort-topic: rotation attestation skipped at coord %s — predecessor quorum unavailable: %o", bytesToB64url(servedCoord), err);
+			return undefined;
+		}
+	};
+
+	/**
+	 * Publish (or refresh) this cohort's membership cert, attaching a rotation attestation when the first
+	 * `k − x` changed since the last publish. `refresh` selects the publisher path: `false` for a
+	 * stabilization event ({@link CoordEngine.onStabilized}), `true` for the periodic refresh
+	 * ({@link CoordEngine.pumpMembership}). A first-`k − x` change is a stabilization regardless of which hook
+	 * fired, so it routes through `onStabilized` (which republishes promptly on the change) carrying the
+	 * attestation; the `/sign` round runs only on that change, so it costs one round per rotation, never per
+	 * tick. Key-less interim mode no-ops (the verify-only signer cannot assemble).
+	 */
+	const publishMembership = async (now: number, refresh: boolean): Promise<MembershipCertV1 | undefined> => {
+		if (!canPublish) {
+			return undefined;
+		}
+		const snapshot = snapshotAt(now); // also observes the current identity (snapshotAt → cohort())
+		const current = identityOf(snapshot);
+		const predecessor = rotationState.predecessor();
+		const rotating = predecessor !== undefined && firstKxChanged(predecessor, current);
+		let published: MembershipCertV1 | undefined;
+		if (rotating) {
+			const rotation = await produceRotation(snapshot, predecessor!);
+			published = await membershipPublisher.onStabilized(snapshot, now, rotation);
+		} else {
+			published = await (refresh ? membershipPublisher.tick(snapshot, now) : membershipPublisher.onStabilized(snapshot, now));
+		}
+		if (published !== undefined) {
+			rotationState.recordPublished(current);
+			ctx.onCertPublished?.(published);
+		}
+		return published;
+	};
 
 	const willingness = createWillingnessCheck({
 		barometer: ctx.barometer,
@@ -1233,17 +1413,6 @@ function createCoordEngine(ctx: CoordEngineContext, servedCoord: RingCoord, tree
 		log,
 	});
 
-	// Publish + cache: feed each freshly-published cert into the verifier so inbound notices signed by
-	// this cohort verify without a network refetch. Both hooks no-op in key-less interim mode (the
-	// verify-only per-coord signer cannot assemble — see the `canPublish` contract).
-	const publishAndCache = async (cert: Promise<MembershipCertV1 | undefined>): Promise<MembershipCertV1 | undefined> => {
-		const published = await cert;
-		if (published !== undefined) {
-			ctx.onCertPublished?.(published);
-		}
-		return published;
-	};
-
 	/** Distinct topics this engine currently holds state for (the gossip-summary / demotion iteration set). */
 	const residentTopics = (): Uint8Array[] => {
 		const byKey = new Map<string, Uint8Array>();
@@ -1316,6 +1485,7 @@ function createCoordEngine(ctx: CoordEngineContext, servedCoord: RingCoord, tree
 		treeTier,
 		engine,
 		cohort,
+		cohortIdentityAt: (epoch: Uint8Array): readonly string[] | undefined => rotationState.membersAt(bytesToB64url(epoch)),
 		hasState: (): boolean => store.listAll().length > 0,
 		holds: (topicId: Uint8Array, participantId: Uint8Array): boolean =>
 			store.getByParticipant(topicId, participantId) !== undefined,
@@ -1329,10 +1499,8 @@ function createCoordEngine(ctx: CoordEngineContext, servedCoord: RingCoord, tree
 		isPromoted: (topicId: Uint8Array): boolean => promotion.isPromoted(topicId),
 		applyPromotionNotice: (notice, now): void => promotion.applyPromotionNotice(notice, now),
 		applyDemotionNotice: (notice, now): void => promotion.applyDemotionNotice(notice, now),
-		onStabilized: (now: number): Promise<MembershipCertV1 | undefined> =>
-			canPublish ? publishAndCache(membershipPublisher.onStabilized(snapshotAt(now), now)) : Promise.resolve(undefined),
-		pumpMembership: (now: number): Promise<MembershipCertV1 | undefined> =>
-			canPublish ? publishAndCache(membershipPublisher.tick(snapshotAt(now), now)) : Promise.resolve(undefined),
+		onStabilized: (now: number): Promise<MembershipCertV1 | undefined> => publishMembership(now, false),
+		pumpMembership: (now: number): Promise<MembershipCertV1 | undefined> => publishMembership(now, true),
 		gossipRound,
 		demotionTick,
 		close: (): void => bus.close(),
@@ -1368,6 +1536,13 @@ export interface SignEndorsementDeps {
 	readonly cohortMembersAround: (coord: RingCoord) => string[];
 	/** Current cohort epoch (raw bytes) for `coord`. */
 	readonly currentEpoch: (coord: RingCoord) => Uint8Array;
+	/**
+	 * For a `"rotation"` request: the cohort member peer-id strings this node served under `epoch` (the
+	 * predecessor epoch carried as `request.cohortEpoch`), or `undefined` if it tracked no such epoch. The
+	 * host wires it to the served coord's {@link CoordEngine.cohortIdentityAt}; absent → rotation
+	 * endorsement is unavailable (a node with no per-coord rotation history refuses the hand-off).
+	 */
+	readonly priorCohortMembersAt?: (coord: RingCoord, epoch: Uint8Array) => readonly string[] | undefined;
 }
 
 /**
@@ -1382,14 +1557,41 @@ export interface SignEndorsementDeps {
  * `(payload, minSigs)` port can't carry and the gossip record replication that is still interim. For the
  * `membership` cert path — this milestone's deliverable — the cohort + epoch gate IS the full policy (the
  * participant verifier independently re-checks `signers ⊆ cert.members`). See the implement handoff.
+ *
+ * **`"rotation"` (epoch hand-off).** A rotation request carries the **prior** epoch as `cohortEpoch` and
+ * asks the outgoing cohort to sign the *successor* cert. The gate therefore checks **prior**-epoch
+ * membership instead of current: the endorser must have served the cohort at `prevEpoch`, and the
+ * requester must have been a member of that prior cohort too (the genuinely outgoing set). The verifier
+ * still independently re-checks `rotationSigners ⊆ predecessor-cert.members`, so this gate is the
+ * load-shedding sanity check, not the trust root. See `cohort-topic-trust-anchor-rotation-production`.
  */
 export async function handleSignRequest(request: SignRequestV1, fromPeerStr: string, deps: SignEndorsementDeps): Promise<SignReplyV1> {
 	if (deps.privateKey === undefined) {
 		return { v: 1, refused: true, reason: "node has no signing key" };
 	}
 	const coord = b64urlToBytes(request.coord);
+	const selfStr = bytesToPeerIdString(deps.selfMember);
+
+	if (request.kind === "rotation") {
+		// Prior-epoch gate: endorse a hand-off only from an epoch THIS node was a member of, and only for a
+		// requester that was a member of that same prior cohort. `request.cohortEpoch` IS the prevEpoch.
+		const prevEpoch = b64urlToBytes(request.cohortEpoch);
+		const priorMembers = deps.priorCohortMembersAt?.(coord, prevEpoch);
+		if (priorMembers === undefined) {
+			return { v: 1, refused: true, reason: "not a member of the prior cohort at prevEpoch" };
+		}
+		if (!priorMembers.includes(selfStr)) {
+			return { v: 1, refused: true, reason: "self not in the prior cohort" };
+		}
+		if (!priorMembers.includes(fromPeerStr)) {
+			return { v: 1, refused: true, reason: "requester not in the prior cohort" };
+		}
+		const signature = await signPeer(deps.privateKey, b64urlToBytes(request.payload));
+		return { v: 1, signer: bytesToB64url(deps.selfMember), signature: bytesToB64url(signature) };
+	}
+
 	const members = deps.cohortMembersAround(coord);
-	if (!members.includes(bytesToPeerIdString(deps.selfMember))) {
+	if (!members.includes(selfStr)) {
 		return { v: 1, refused: true, reason: "not a cohort member for coord" };
 	}
 	if (!members.includes(fromPeerStr)) {
@@ -1644,6 +1846,19 @@ function crossCheckCohort(fret: FretService, wantK: number, servedCoord: RingCoo
 			assembled,
 		);
 	}
+}
+
+/** Positional equality over two string lists (the first-`k − x` rotation-change check). */
+function sameStringOrder(a: readonly string[], b: readonly string[]): boolean {
+	if (a.length !== b.length) {
+		return false;
+	}
+	for (let i = 0; i < a.length; i++) {
+		if (a[i] !== b[i]) {
+			return false;
+		}
+	}
+	return true;
 }
 
 /** Set equality over two peer-id-string lists (order-independent). */

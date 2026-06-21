@@ -538,6 +538,28 @@ A participant joining the network gets its initial trust roots (the cohorts resp
    > short of `k`, or `detectPartition()`) — never `"rejected"` during bootstrap/partition.
 3. **Attestation chain (epoch rotation)** — a cert may carry a rotation attestation (`prevEpoch` / `rotationSig` / `rotationSigners`, all three or none): the *predecessor* cohort's threshold signature over **this** cert's signing payload. If the node already holds a **trusted** cert for the same coord whose epoch is `prevEpoch`, and that predecessor's members form a `≥ minSigs` quorum over the successor payload, the successor inherits trust. This is what distinguishes a legitimate rotation (the prior cohort signed off) from a forgery. Only a *trusted* cert may anchor a successor — a cert that only reached the cache via the TOFU fallback (below) never launders trust into a rotation. The attestation is **not** part of `membershipCertSigningPayload` (it signs *over* it), so legacy certs without it still decode.
 
+   > **Producing the attestation (db-p2p host, `cohort-topic-trust-anchor-rotation-production`).** Each
+   > served `CoordEngine` tracks its last-published cohort identity. When a publish changes the first
+   > `k − x` members (the publisher's own republish trigger), the host threshold-signs the **new** cert's
+   > `membershipCertSignable` image under the **predecessor** cohort identity — a `/sign` round with a new
+   > `"rotation"` `SignKind`, `cohortEpoch = prevEpoch`, dialing the *outgoing* members — and attaches the
+   > `{ prevEpoch, rotationSig, rotationSigners }` via the publisher's `rotation` arg. Because rotation is
+   > incremental, a `≥ minSigs` quorum of the prior cohort is normally still online, so this reuses the
+   > existing endorsement transport, just gated on **prior**-epoch membership: a member endorses a
+   > `"rotation"` request only if it (and the requester) were members at `prevEpoch` (a two-deep observed-epoch
+   > history per coord). Self contributes its own chunk only when it was itself a prior member, so the quorum
+   > is genuinely the outgoing cohort. The signed image is the *same* `membershipCertSignable` the publisher
+   > emits, so the db-core chain check verifies `rotationSig` over an exactly-matching payload. **First-ever
+   > publish** for a coord emits no attestation (its trust is the direct anchor / root, not a chain link).
+   >
+   > **Fallbacks (each → publish without an attestation, never blocking the cert).** *Predecessor quorum
+   > unavailable* (mass churn / partition drops the prior cohort below `minSigs`): the rotation `/sign` round
+   > throws, the host logs it and republishes the new cert with no attestation — trust falls to the direct
+   > anchor / TOFU, no worse than a non-rotation publish. *Rapid double rotation* (N → N+1 → N+2 within one
+   > observe window): each publish attests only its immediate predecessor, so a participant cached at N that
+   > receives N+2 sees a gap and re-anchors — no multi-hop attestation is attempted. *Refresh republish*
+   > (periodic, first `k − x` unchanged) is not a rotation and carries no rotation fields.
+
 > **Why no monotonic-epoch / rollback gate.** `cohortEpoch = H(sorted members)` is content-derived, not an ordered counter, so epochs are unorderable hash ids and the chain is a hash-linked attestation DAG (`prevEpoch` is a hash pointer), not a height-ordered ledger. Replaying an older legitimately-signed cert is a **freshness** concern (stale membership), already covered by `stabilizedAt` + the one-refetch tolerance — not a trust-gate concern.
 
 **Interim TOFU fallback and its documented limits.** For a coord the node cannot anchor — the direct anchor returns `"unknown"`, there is no trust root, and no valid chain — and that holds **no trusted cert yet**, the verifier falls back to trust-on-first-use of any self-consistent cert. This is identical to the pre-gate behavior, so there is **strictly no regression** on coords no node can verify today. The security improvement is bounded and explicit:

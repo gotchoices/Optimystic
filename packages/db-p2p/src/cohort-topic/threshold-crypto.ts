@@ -79,6 +79,15 @@ export interface CohortThresholdCryptoDeps {
 	readonly dialSign: (peerIdStr: string, request: SignRequestV1) => Promise<SignReplyV1>;
 	/** Per-round collection deadline (ms). Default {@link DEFAULT_SIGN_COLLECT_TIMEOUT_MS}. */
 	readonly collectTimeoutMs?: number;
+	/**
+	 * Whether self may contribute its own signature to this assembly. Default `true` (self is always a
+	 * member of the cohort it signs over). The **rotation** producer scopes the assembly to the
+	 * *predecessor* cohort (`cohortMembers` = the prior epoch's members); when self was not a member of
+	 * that prior cohort it must NOT self-sign — its chunk would be dropped by the verifier (a signer not in
+	 * the predecessor cert's `members`), desyncing the count from what the verifier accepts. Returning
+	 * `false` then makes the quorum genuinely the outgoing cohort. See `cohort-topic-trust-anchor-rotation-production`.
+	 */
+	readonly selfEligible?: () => boolean;
 }
 
 /** A collected, verified per-member signature awaiting concatenation. */
@@ -99,17 +108,21 @@ export class FretCohortThresholdCrypto implements ICohortThresholdCrypto {
 
 	async assemble(payload: Uint8Array, minSigs: number): Promise<{ thresholdSig: Uint8Array; signers: Uint8Array[] }> {
 		const collected = new Map<string, CollectedSig>();
+		const selfStr = bytesToPeerIdString(this.deps.selfMember);
 
-		// Self is always a signer — it is the acting member, even if a stale table omits it from its own
-		// assembly. Sign locally (no RPC to self).
-		const selfSig = await signPeer(this.deps.privateKey, payload);
-		if (selfSig.length !== ED25519_SIG_BYTES) {
-			throw new Error(`cohort threshold sign: self produced a ${selfSig.length}-byte signature (expected ${ED25519_SIG_BYTES}); non-Ed25519 identity?`);
+		// Self is normally a signer — it is the acting member, even if a stale table omits it from its own
+		// assembly. Sign locally (no RPC to self). A rotation producer that was NOT in the predecessor cohort
+		// (`selfEligible` → false) skips this: its chunk would be dropped by the verifier (signer ∉ predecessor
+		// cert members), so it must collect a quorum purely from the outgoing cohort instead.
+		if (this.deps.selfEligible?.() ?? true) {
+			const selfSig = await signPeer(this.deps.privateKey, payload);
+			if (selfSig.length !== ED25519_SIG_BYTES) {
+				throw new Error(`cohort threshold sign: self produced a ${selfSig.length}-byte signature (expected ${ED25519_SIG_BYTES}); non-Ed25519 identity?`);
+			}
+			collected.set(bytesToB64url(this.deps.selfMember), { signer: this.deps.selfMember, sig: selfSig });
 		}
-		collected.set(bytesToB64url(this.deps.selfMember), { signer: this.deps.selfMember, sig: selfSig });
 
 		// Concurrently collect endorsements from the rest of the cohort, up to the deadline.
-		const selfStr = bytesToPeerIdString(this.deps.selfMember);
 		const others = this.deps.cohortMembers().filter((m) => m !== selfStr);
 		if (others.length > 0 && collected.size < minSigs) {
 			const request: SignRequestV1 = {

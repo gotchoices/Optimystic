@@ -226,8 +226,16 @@ export interface CohortTopicSummary {
 	childCohortCount: number;
 }
 
-/** What a {@link SignRequestV1} asks a cohort member to endorse — drives the signer's endorsement policy. */
-export type SignKind = "membership" | "promotion" | "demotion";
+/**
+ * What a {@link SignRequestV1} asks a cohort member to endorse — drives the signer's endorsement policy.
+ *
+ * - `membership` / `promotion` / `demotion` — the requester and endorser must share the **current**
+ *   cohort + epoch around `coord`.
+ * - `rotation` — an epoch hand-off: the endorser attests it was a member of the cohort at the **prior**
+ *   epoch carried as `cohortEpoch` (the predecessor cohort threshold-signs the successor cert's payload),
+ *   so the gate checks *prior*-epoch membership rather than current. See `cohort-topic-trust-anchor-rotation-production`.
+ */
+export type SignKind = "membership" | "promotion" | "demotion" | "rotation";
 
 /**
  * Intra-cohort sign request (`/optimystic/cohort-topic/1.0.0/sign`). A member assembling a `k − x`
