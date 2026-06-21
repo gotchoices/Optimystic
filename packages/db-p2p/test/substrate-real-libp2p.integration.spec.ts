@@ -138,12 +138,20 @@ interface SignedRegisterOptions {
 	readonly treeTier?: number;
 	readonly bootstrap?: boolean;
 	readonly ttl?: number;
+	/**
+	 * Attach a self-vouch reputation endorsement: the participant peer-key-signs its own
+	 * `bootstrapBoundImage` as the referee, so a *configured* production node admits a T2/T3 `bootstrap`
+	 * register via the `PoW || reputation || parent-ref` disjunction (the origin's reputation view scores an
+	 * unseen, non-banned peer below the deprioritize threshold). Needed because T2/T3 bootstrap stays gated
+	 * (`cohort-topic-bootstrap-coldstart-origination-regression` keeps only T0/T1 permissive).
+	 */
+	readonly selfVouch?: boolean;
 }
 
 // Signed register/renew builders for real participants (mirror the mock harness's, but kept local so the
 // real-transport spec does not pull the whole mock-mesh surface — `buildMesh`, `MockNode`, … — into scope).
 async function signedRegister(participant: Member, topic: Uint8Array, now: number, correlationId: string, opts: SignedRegisterOptions = {}): Promise<RegisterV1> {
-	const body: Omit<RegisterV1, 'signature'> = {
+	const baseBody: Omit<RegisterV1, 'signature'> = {
 		v: 1,
 		topicId: bytesToB64url(topic),
 		tier: opts.tier ?? 0,
@@ -154,6 +162,18 @@ async function signedRegister(participant: Member, topic: Uint8Array, now: numbe
 		timestamp: now,
 		correlationId: bytesToB64url(new TextEncoder().encode(correlationId)),
 	};
+	// `bootstrapBoundImage` binds only (topicId, tier, participantCoord, timestamp), so the self-vouch
+	// endorsement is identical on `baseBody` and the evidence-bearing body; attach it BEFORE the final
+	// register sign (registerSigningPayload covers `bootstrapEvidence`).
+	const body: Omit<RegisterV1, 'signature'> = opts.selfVouch === true
+		? {
+			...baseBody,
+			bootstrapEvidence: serializeBootstrapEvidenceEnvelope({
+				v: 1,
+				reputation: { referee: bytesToB64url(participant.bytes), sig: bytesToB64url(await signPeer(participant.key, bootstrapBoundImage(baseBody))) },
+			}),
+		}
+		: baseBody;
 	return { ...body, signature: bytesToB64url(await signPeer(participant.key, registerSigningPayload(body))) };
 }
 
@@ -770,7 +790,10 @@ async function memberOf(key: PrivateKey, peerId: PeerId): Promise<Member> {
 		const provider = await participantPrimaryAt(matchPrimaryEngine, matchCoord);
 		const now = Date.now();
 		// A matchmaking provider rides the cohort-topic register at the matchmaking application tier (T2).
-		const accept = await matchPrimaryEngine.engine.handleRegister(await signedRegister(provider, matchTopic, now, 'mm-provider', { tier: 2 }), { followOn: false, treeTier: 0 }, now);
+		// T2 bootstrap stays gated on the configured production node (cohort-topic-bootstrap-coldstart-
+		// origination-regression keeps only T0/T1 permissive), so the provider self-vouches to clear the
+		// `PoW || reputation || parent-ref` disjunction (origin scores it as an unseen, non-banned peer).
+		const accept = await matchPrimaryEngine.engine.handleRegister(await signedRegister(provider, matchTopic, now, 'mm-provider', { tier: 2, selfVouch: true }), { followOn: false, treeTier: 0 }, now);
 		expect(accept.result, 'the cohort admitted the provider registration over real transport').to.equal('accepted');
 		expect(matchPrimaryEngine.records(matchTopic).length, 'the primary holds the provider record (the matchmaking QueryV1 read)').to.be.at.least(1);
 

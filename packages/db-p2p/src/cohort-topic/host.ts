@@ -36,9 +36,12 @@
  * node-level {@link BootstrapEvidence} policy (one tier→verifier policy, no per-coord state) is built once
  * and shared. db-core embeds no PoW / reputation scheme, so the host supplies the real verifiers
  * ({@link createPoWVerifier} / {@link createReputationVerifier}) and the participant-side PoW minter
- * ({@link createBootstrapEvidenceBuilder}): once configured, a node genuinely gates cold-root
- * `bootstrap: true` (real PoW always; a referee reputation endorsement when offered), and an entirely
- * unconfigured host stays permissive-but-logged (never an undefined gate). A cold-started tier-`d > 0` forwarder registers with
+ * ({@link createBootstrapEvidenceBuilder}): once configured, a node gates cold-root `bootstrap: true` at
+ * T2/T3 (PoW, or a referee reputation endorsement when offered, or a signed parent reference) and at T0/T1
+ * once a committed-existence backing is wired (a signed parent reference); a configured node with no such
+ * backing keeps T0/T1 permissive-but-logged so cold-root origination is not blocked
+ * (`cohort-topic-bootstrap-coldstart-origination-regression`), and an entirely unconfigured host stays
+ * permissive-but-logged at every tier (never an undefined gate). A cold-started tier-`d > 0` forwarder registers with
  * its tier-`(d − 1)` parent by routing a forwarder-link frame over the router (gap 7), staying
  * `awaiting_parent` until the ack.
  *

@@ -808,10 +808,16 @@ The layer does not attempt to defend against unbounded Sybil attacks at the regi
 >   self-referential `parentTopicId == topicId` is rejected. The view is tier-routed like the membership
 >   source: **T2/T3** consult the FRET membership cache (`FretMembershipSource.has(coord_0(parentTopicId))`
 >   — a cached `MembershipCertV1` means a cohort genuinely serves the parent); **T0/T1** consult the
->   committed backing and **fail closed without one** (a FRET-cached cert must not vouch for committed-tier
->   existence — committed-tier integrity). **Limitation (interim):** no coord-keyed committed-membership
->   index exists yet (the tx-log commit certificate is keyed by action, not by `coord_0`), so a node wires
->   no committed reader today and T0/T1 parent-ref existence fails closed; T2/T3 parent-ref is fully real.
+>   committed backing and the verifier **fails closed without one** (a FRET-cached cert must not vouch for
+>   committed-tier existence — committed-tier integrity). **Limitation (interim):** no coord-keyed
+>   committed-membership index exists yet (the tx-log commit certificate is keyed by action, not by
+>   `coord_0`), so a node wires no committed reader today and the T0/T1 existence check would fail closed for
+>   *every* parent. Because a brand-new root has no parent to reference, routing T0/T1 through that
+>   fail-closed verifier would make cold-root **origination** impossible
+>   (`cohort-topic-bootstrap-coldstart-origination-regression`). The host policy therefore keeps T0/T1
+>   **permissive-but-logged** while no committed backing is wired (an explicit `antiDos.parentTopicView` or a
+>   future `committedParentTopicReader`), and runs the real fail-closed verifier at T0/T1 only once such a
+>   backing exists; T2/T3 parent-ref is fully real throughout.
 >   A node admits a parent-ref only for a parent it has *locally cached* — acceptable for a gate
 >   (fail-closed when unknown → the participant retries / uses PoW for T2/T3; a genuinely-new committed
 >   T0/T1 topic is bootstrapped by nodes already serving the parent's committed work, which hold its cert).
@@ -819,9 +825,11 @@ The layer does not attempt to defend against unbounded Sybil attacks at the regi
 >   `cohort-topic-parent-ref-tx-log-content`.
 >
 > Once any reputation view or explicit verifier is configured, an unfilled verifier fails **closed** so a
-> banned/low-rep referee cannot slip the T2/T3 `PoW || reputation || parent-ref` disjunction; an
-> *entirely unconfigured* host stays **permissive-but-logged** (a one-time warning, never an undefined
-> gate), preserving the db-core/mock-tier flows that bootstrap tier-0 without evidence. Specs:
+> banned/low-rep referee cannot slip the T2/T3 `PoW || reputation || parent-ref` disjunction — **except**
+> that T0/T1 stays **permissive-but-logged** until a committed backing is wired (above), so cold-root
+> origination is not blocked. An *entirely unconfigured* host stays permissive-but-logged at every tier (a
+> one-time warning, never an undefined gate), preserving the db-core/mock-tier flows that bootstrap tier-0
+> without evidence. Specs:
 > `host-antidos-coldstart.spec.ts`, `bootstrap-evidence-verifiers.spec.ts`.
 >
 > **Promote-handler gate (`promote` protocol, not registration).** The four defenses above guard the

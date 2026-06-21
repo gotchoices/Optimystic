@@ -33,3 +33,15 @@ gap where a participant references an unrelated-but-existing parent topic to sat
 - A cold-root T0/T1 bootstrap whose parent-reference names a parent topic whose committed record does
   **not** reference this child → denied (today: admitted if the parent merely exists).
 - The check stays synchronous and local (no network round-trip in the admission path).
+
+## Also re-closes the T0/T1 cold-start anti-DoS opening
+
+`cohort-topic-bootstrap-coldstart-origination-regression` made a *configured* production node (a
+reputation view but no committed backing) **permissive-but-logged at T0/T1** so it can still originate a
+brand-new root topic (a root has no parent to reference, and no coord-keyed committed index is wired
+today). That deliberately leaves a real node admitting **any** evidence-less T0/T1 cold-root
+`bootstrap: true`. The committed-read API this ticket introduces is exactly the missing
+`committedParentTopicReader` backing: when it lands, **`libp2p-node-base.ts` must wire it** into
+`createCohortTopicHost({ committedParentTopicReader })`, which flips the host's `hasCommittedParentBacking`
+to `true` and re-enables the real T0/T1 parent-reference gate with no further host change. Wiring that
+reader is part of *this* work — don't land the content check without re-closing the T0/T1 gate.
