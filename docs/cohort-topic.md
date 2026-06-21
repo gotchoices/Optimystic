@@ -848,7 +848,10 @@ The layer does not attempt to defend against unbounded Sybil attacks at the regi
 > **Implementation.** The four anti-DoS defenses live in
 > [`packages/db-core/src/cohort-topic/antidos/`](../packages/db-core/src/cohort-topic/antidos) as
 > transport-agnostic db-core logic: `RegisterRateLimiter` (sliding-window per `(peer, topic)`,
-> exponential `retryAfter` via the §Willingness back-off curve), `TopicBudget` (LRU by participant
+> exponential `retryAfter` via the §Willingness back-off curve; its key map is memory-bounded by a hard
+> LRU cap that evicts the least-recently-checked keys — an active source stays hot, so its back-off is
+> never reset — plus an idle-TTL `sweep` driven on the gossip cadence so departed peers' keys are
+> reclaimed), `TopicBudget` (LRU by participant
 > count, zero-participant topics evicted first; populated topics never evicted for a new
 > instantiation), `CorrelationReplayGuard` (drops stale/future timestamps and replayed
 > `correlationId`s, remembering ids for one `maxAge` window), and `BootstrapEvidence` (tier policy

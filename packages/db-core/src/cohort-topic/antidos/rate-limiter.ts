@@ -27,10 +27,15 @@
  *   within `idleTtlMs`. Driver-called on the host's gossip cadence, it reclaims steady-state footprint
  *   proportional to *active* keys.
  *
- * Eviction is penalty-free: the window logic already forgives a source quiet for a full window (its
- * accepts age out and `strikes` resets), so dropping an idle key and re-allocating a fresh
- * `{ accepts:[now], strikes:0 }` on its return is observationally identical to keeping it — just an
- * earlier reclaim. The substrate does not defend against unbounded Sybil key creation (that is FRET's /
+ * Eviction is penalty-free when a key is dropped only after a full window of quiet: the window logic
+ * already forgives a source quiet for a full window (its accepts age out and `strikes` resets), so
+ * dropping such a key and re-allocating a fresh `{ accepts:[now], strikes:0 }` on its return is
+ * observationally identical to keeping it — just an earlier reclaim. This holds for the LRU cap (a
+ * mid-attack key is refreshed to the hot end on every check, so only genuinely idle keys are evicted)
+ * and for the default `idleTtlMs` (`== windowMs`). A configured `idleTtlMs < windowMs` reclaims more
+ * aggressively: `sweep` may then drop a key whose accepts have *not* fully aged out, forgiving its
+ * accumulated `strikes` sooner than the window alone would — an accepted footprint/strike-accounting
+ * tradeoff, not an identity. The substrate does not defend against unbounded Sybil key creation (that is FRET's /
  * the reputation subsystem's concern; see §Anti-DoS closing note).
  */
 
@@ -58,7 +63,12 @@ export interface RegisterRateLimiterConfig {
 	backoff?: BackoffConfig;
 	/** Hard cap on tracked `(peer, topic)` keys; least-recently-checked evicted beyond this. Default {@link DEFAULT_RATE_LIMITER_MAX_KEYS}. */
 	maxKeys?: number;
-	/** A key not checked within this many ms is evictable by {@link RegisterRateLimiter.sweep}. Default {@link DEFAULT_RATE_LIMITER_IDLE_TTL_MS}. */
+	/**
+	 * A key not checked within this many ms is evictable by {@link RegisterRateLimiter.sweep}. Default
+	 * {@link DEFAULT_RATE_LIMITER_IDLE_TTL_MS} (`== windowMs`). Keep `>= windowMs` to preserve the
+	 * penalty-free invariant; a smaller value reclaims sooner but may forgive an idle source's strikes
+	 * before its window would (see the class doc comment).
+	 */
 	idleTtlMs?: number;
 }
 
