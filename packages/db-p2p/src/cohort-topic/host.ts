@@ -136,6 +136,7 @@ import {
 	type Tier,
 	type TopicBudgetConfig,
 	type IMembershipSource,
+	type TrustRoot,
 } from "@optimystic/db-core";
 import { randomBytes } from "@libp2p/crypto";
 import { peerIdFromString } from "@libp2p/peer-id";
@@ -145,6 +146,7 @@ import { buildCohortGossip, createPendingDeltas, DEFAULT_GOSSIP_INTERVAL_MS } fr
 import { FretMembershipSource } from "./membership-source.js";
 import { FretMembershipPublishSink } from "./membership-publish-sink.js";
 import { FretCohortThresholdCrypto, createVerifyOnlyThresholdCrypto } from "./threshold-crypto.js";
+import { FretTrustAnchor } from "./fret-trust-anchor.js";
 import { FretSizeEstimator } from "./size-estimator.js";
 import { peerIdToBytes, bytesToPeerIdString } from "./peer-codec.js";
 import { signPeer, verifyPeerSig } from "./peer-sig.js";
@@ -211,6 +213,20 @@ export interface CohortTopicHostOptions {
 	 * {@link createDefaultParentTopicView}.
 	 */
 	readonly committedParentTopicReader?: (coord: RingCoord) => boolean;
+	/**
+	 * The participant's initial trust roots: the genesis-block-related cohorts, validated against the
+	 * genesis block hash **out-of-band by the caller before seeding** (`docs/cohort-topic.md`
+	 * §Bootstrapping trust). They are the base case of every attestation chain — a cert matching a root by
+	 * `(coord, epoch, member-set)` is trusted directly, ahead of the FRET-ring direct anchor — so a forged
+	 * cert for a genesis cohort is rejected even before the ring is consulted. Threaded straight into
+	 * `createMembershipVerifier({ trustRoots })`.
+	 *
+	 * **Network-config, empty by default.** The concrete genesis-cohort set is a property of a specific
+	 * network's genesis block; this is the typed seam, not a fabricated value. Omitted (the default `[]`)
+	 * the verifier behaves exactly as with no roots — the chain bottoms out at the direct anchor / TOFU, so
+	 * a network with no genesis cohort configured is never broken. Do **not** seed fake roots here.
+	 */
+	readonly genesisTrustRoots?: readonly TrustRoot[];
 }
 
 // The reputation-view shape the bootstrap-evidence referee verifier consults — `{ isBanned, getScore }`
@@ -673,7 +689,22 @@ export async function createCohortTopicHost(node: Libp2p, fret: FretService, opt
 	});
 	const certSource: IMembershipSource = membershipSource;
 	const membershipRouter = createMembershipSourceRouter({ committed: certSource, fret: certSource });
-	const verifier = createMembershipVerifier({ signer: verifyingSigner, router: membershipRouter, minSigs });
+	// --- direct trust anchor (cohort-topic-trust-anchor-fret-binding) ---
+	// Bind the db-core trust gate's direct anchor to the FRET ring: for a coord this node serves (a covered,
+	// non-partitioned T2/T3 coord whose cohort includes self), the cert's signing quorum is checked against
+	// the ring's two-sided assembly — a forged unrelated keyset is `"rejected"`, a legit (slack-tolerant)
+	// cohort `"anchored"`, everything else `"unknown"` (→ chain / TOFU). Committed tiers (T0/T1) stay
+	// `"unknown"` here so this composes with the future tx-log anchor rather than fighting it. `wantK` matches
+	// the cohort size `cohortAround` publishes certs over; `selfPeerStr` is the coverage handle.
+	const trustAnchor = new FretTrustAnchor(fret, { k: wantK, selfPeerId: selfPeerStr });
+	const verifier = createMembershipVerifier({
+		signer: verifyingSigner,
+		router: membershipRouter,
+		minSigs,
+		anchor: trustAnchor,
+		// Genesis trust roots (network-config; empty by default → no roots, identical to pre-seam behavior).
+		trustRoots: options.genesisTrustRoots ?? [],
+	});
 	// --- participant-side cold-start evidence builder (gap 6) ---
 	// Mints the evidence the participant attaches on a cold-root `bootstrap: true` re-issue. PoW (T2/T3) is
 	// keyless, so even a key-less host can bootstrap those tiers; the proof is bound to the register's own

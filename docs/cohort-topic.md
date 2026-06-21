@@ -458,6 +458,14 @@ Cohort memberships are anchored in the transaction log ([transactions.md](transa
 - The membership of *all* cohort-topic cohorts is not committed; only those that serve T0/T1 work (transaction commits, chain serving) appear in the log. The verifier **reads** this committed membership (it never writes the log).
 - T2/T3 cohorts (matchmaking, push forwarding) derive their membership from current FRET state. Their threshold signatures are verifiable against FRET's signed membership advertisements (the `MembershipCertV1` that FRET cohorts publish after stabilization).
 
+> **T2/T3 cert trust = FRET ring agreement (db-p2p `FretTrustAnchor`).** A FRET-published `MembershipCertV1`
+> is *self-signed* by its cohort, so trusting it requires anchoring the `coord → keyset` binding (§Bootstrapping
+> trust). The T2/T3 direct anchor is the node's own FRET cohort assembly: for a coord the node **covers** (a
+> populated neighborhood it serves), the cert's signing quorum must agree with `assembleCohort(coord)` within a
+> small churn slack, else the cert is rejected as a forgery. For a coord the node does **not** cover (a distant
+> reactivity-tail coord), the anchor abstains (`"unknown"`) and verification falls back to TOFU — there is no
+> transferable stabilization proof a non-covering node could check, so distant T2/T3 first-sight stays TOFU.
+
 > **Reused by the parent-reference anti-DoS gate.** The same tier-routed membership state backs the
 > synchronous local "does this parent topic exist?" check the `verifyParentReference` bootstrap-evidence
 > verifier consults (§Anti-DoS). A node only knows a parent topic exists if it has *locally cached* a
@@ -499,21 +507,44 @@ A participant verifies a notification or threshold-signed message as follows:
 
 A participant joining the network gets its initial trust roots (the cohorts responsible for genesis-block-related topics) from any peer it dials, validated against the genesis block hash known out-of-band. From there, membership certificates form a chain of attestations.
 
+> **Genesis-root seam (db-p2p host).** The trust roots are seeded into the verifier through the
+> `createCohortTopicHost({ genesisTrustRoots })` option (threaded straight into
+> `createMembershipVerifier({ trustRoots })`). It is the typed plumbing point, **empty by default** — the
+> concrete genesis-cohort set is a property of a specific network's genesis block, validated out-of-band by
+> the caller *before* seeding; the host fabricates no roots. With none configured the chain simply bottoms
+> out at the direct anchor / TOFU, so a network with no genesis cohort defined is never broken.
+
 **Why self-consistency is not enough.** A `MembershipCertV1` carries its own threshold signature over its own members, so "self-consistent" proves only that some `≥ minSigs` key set signed the cert — *not* that that key set is the legitimate cohort for the coord. An adversary controlling `k − x` keys could mint a self-consistent cert over a coord it does not own and have it pass per-message verification. The trust gate closes that gap: a (re)fetched cert is believed only if it is self-consistent **and** anchored.
 
 **The trust gate (implemented in [`membership/verifier.ts`](../packages/db-core/src/cohort-topic/membership/verifier.ts)).** A cert's `coord → members` binding earns trust by **any one** of:
 
 1. **Trust root** — `(coord, epoch, member-set)` is in the out-of-band-seeded `TrustRoot` set (the genesis cohorts, validated against the genesis block hash before seeding). The base case of every chain; checked before the direct anchor, so a configured root is authoritative.
 2. **Direct anchor** — an injected `IMembershipTrustAnchor` (`ports.ts`) judges, from a source the node *directly* trusts, whether the members are authoritative for the coord at that tier. The verdict is three-valued: `"anchored"` (vouched → trusted), `"rejected"` (contradicted → **forgery, fatal even if self-consistent**), or `"unknown"` (no local authority → fall through). The direct anchor is tier/transport-specific (FRET ring agreement for T2/T3, the tx-log commit certificate for T0/T1) and is bound in db-p2p — **db-core never imports FRET**. The db-core default `noAuthorityTrustAnchor` returns `"unknown"` for every coord.
+
+   > **FRET-ring binding (db-p2p `FretTrustAnchor`, `cohort-topic-trust-anchor-fret-binding`).** The T2/T3
+   > direct anchor is bound to FRET's local two-sided cohort assembly, the only coord→keyset authority
+   > p2p-fret 0.5.0 exposes (there is **no transferable stabilization proof** — the cert's `fretAttestation`
+   > is never populated). For a **covered** coord — a populated, non-partitioned neighborhood the node is
+   > itself part of, i.e. a coord it serves (the amplification-exposed `promote`-handler shape) — the anchor
+   > compares the cert's **signing quorum** (`cert.signers`) against `assembleCohort(coord)`, widened by a
+   > small `churn_slack` (≈ 2) for stabilization skew: a quorum that is a subset of the slack-widened ring →
+   > `"anchored"`; a quorum **wholly disjoint** from the ring (a different keyset owns this coord) →
+   > `"rejected"`; partial overlap beyond the slack → `"unknown"` (ambiguous churn — don't over-reject).
+   > Anchoring on the *quorum* (not exact member-set equality) is sound because a forged cert must sign with
+   > adversary-controlled keys, which are not in the ring → disjoint → rejected. **Limits (all → `"unknown"`,
+   > so no regression):** the **committed tiers T0/T1** (the tx-log anchor's job, composed-with not
+   > fought — binding tracked in `cohort-topic-trust-anchor-txlog-committed-binding`); a **distant** coord
+   > the node does not cover (no local authority); and a **cold / partitioned** table (`assembleCohort`
+   > short of `k`, or `detectPartition()`) — never `"rejected"` during bootstrap/partition.
 3. **Attestation chain (epoch rotation)** — a cert may carry a rotation attestation (`prevEpoch` / `rotationSig` / `rotationSigners`, all three or none): the *predecessor* cohort's threshold signature over **this** cert's signing payload. If the node already holds a **trusted** cert for the same coord whose epoch is `prevEpoch`, and that predecessor's members form a `≥ minSigs` quorum over the successor payload, the successor inherits trust. This is what distinguishes a legitimate rotation (the prior cohort signed off) from a forgery. Only a *trusted* cert may anchor a successor — a cert that only reached the cache via the TOFU fallback (below) never launders trust into a rotation. The attestation is **not** part of `membershipCertSigningPayload` (it signs *over* it), so legacy certs without it still decode.
 
 > **Why no monotonic-epoch / rollback gate.** `cohortEpoch = H(sorted members)` is content-derived, not an ordered counter, so epochs are unorderable hash ids and the chain is a hash-linked attestation DAG (`prevEpoch` is a hash pointer), not a height-ordered ledger. Replaying an older legitimately-signed cert is a **freshness** concern (stale membership), already covered by `stabilizedAt` + the one-refetch tolerance — not a trust-gate concern.
 
 **Interim TOFU fallback and its documented limits.** For a coord the node cannot anchor — the direct anchor returns `"unknown"`, there is no trust root, and no valid chain — and that holds **no trusted cert yet**, the verifier falls back to trust-on-first-use of any self-consistent cert. This is identical to the pre-gate behavior, so there is **strictly no regression** on coords no node can verify today. The security improvement is bounded and explicit:
 
-- **FRET-covered coords** (the host / `promote`-handler path, which verifies against a coord the node serves): once db-p2p binds the FRET-ring anchor, a forged cert from an unrelated keyset is **`"rejected"`** — closing the amplification-exposed attack. (Binding: `cohort-topic-trust-anchor-fret-binding`.)
+- **FRET-covered coords** (the host / `promote`-handler path, which verifies against a coord the node serves): db-p2p binds the FRET-ring anchor (`FretTrustAnchor`, above), so a forged cert from an unrelated keyset for a covered T2/T3 coord is **`"rejected"`** — **closing the amplification-exposed attack**. (Binding landed: `cohort-topic-trust-anchor-fret-binding`.)
 - **Epoch rotations**: once a coord holds a *trusted* cert, the attestation chain governs its successors. An un-anchored cert for an already-trusted coord is rejected (no silent TOFU downgrade), so a forged rotation off a trusted predecessor is dropped. A coord that was only ever TOFU'd stays in the TOFU regime (a TOFU predecessor confers no trust), which is the documented limit until the direct anchor covers it.
-- **Distant first-sight T2/T3** and **all T0/T1** remain TOFU for now — there is no transferable FRET stabilization proof (tracked in `cohort-topic-trust-anchor-fret-stabilization-proof`) and the committed-index binding does not exist yet (`cohort-topic-trust-anchor-txlog-committed-binding`).
+- **Distant first-sight T2/T3** (a reactivity-tail coord the node does not cover) and **all T0/T1** remain TOFU for now — the FRET ring anchor returns `"unknown"` for a coord outside its routing-table coverage (there is no transferable FRET stabilization proof a *non-covering* node could check — tracked in `cohort-topic-trust-anchor-fret-stabilization-proof`), and the committed-index binding does not exist yet (`cohort-topic-trust-anchor-txlog-committed-binding`).
 
 There is deliberately **no** hard "reject on `"unknown"`" mode: the three-valued verdict already gives FRET-covered nodes their teeth (`"rejected"`) without a global flag that would break distant verifiers.
 

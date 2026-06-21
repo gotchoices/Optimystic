@@ -37,12 +37,24 @@ import {
 	bytesEqual,
 	bytesToB64url,
 	b64urlToBytes,
+	compareBytes,
+	encodeCohortMessage,
 	membershipCertSigningPayload,
+	promotionNoticeSigningPayload,
+	createMembershipVerifier,
+	createMembershipSourceRouter,
+	createCohortSigner,
 	CohortBackoffError,
+	type IMembershipSource,
+	type MembershipCertV1,
+	type PromotionNoticeV1,
 	type Tier,
 } from '@optimystic/db-core';
 import { bytesToPeerIdString } from '../../src/cohort-topic/peer-codec.js';
 import { signPeer } from '../../src/cohort-topic/peer-sig.js';
+import { FretTrustAnchor, type FretRingView } from '../../src/cohort-topic/fret-trust-anchor.js';
+import { createVerifyOnlyThresholdCrypto } from '../../src/cohort-topic/threshold-crypto.js';
+import { verifyAndApplyNotice, type NoticeApplyTarget } from '../../src/cohort-topic/host.js';
 import {
 	addressing,
 	buildMesh,
@@ -54,7 +66,23 @@ import {
 	signedRegister,
 	signedReattach,
 	waitFor,
+	type Member,
 } from '../../src/testing/cohort-topic-mesh-harness.js';
+
+/**
+ * A collected Ed25519 multisig over `payload` by `quorum`, plus the aligned `signers` (sorted ascending so
+ * `signers[i]` lines up with chunk `i`, exactly as {@link FretCohortThresholdCrypto} assembles and the db-core
+ * verifier checks). Models a self-consistent threshold signature an adversary cohort can produce over its own
+ * keyset.
+ */
+async function collectedMultisig(quorum: readonly Member[], payload: Uint8Array): Promise<{ sig: Uint8Array; signers: Uint8Array[] }> {
+	const ordered = [...quorum].sort((a, b) => compareBytes(a.bytes, b.bytes));
+	const sig = new Uint8Array(ordered.length * 64);
+	for (let i = 0; i < ordered.length; i++) {
+		sig.set(await signPeer(ordered[i]!.key, payload), i * 64);
+	}
+	return { sig, signers: ordered.map((m) => m.bytes) };
+}
 
 const TOPIC = Uint8Array.from({ length: 32 }, (_v, i) => (i * 9 + 5) & 0xff);
 const N = 5;
@@ -254,6 +282,73 @@ describe('cohort-topic: live-tier end-to-end milestone', () => {
 				threw = true;
 			}
 			expect(threw, 'sub-quorum assembly throws rather than fabricating a single-signer cert').to.equal(true);
+		} finally {
+			await mesh.stop();
+		}
+	});
+
+	it('7. (trust anchor) a forged unrelated-keyset cert for a coord the node serves is rejected by verifyAndApplyNotice — the FRET anchor, on the promote path', async () => {
+		const members = await makeMembers(N);
+		const mesh = await buildMesh(members, { wantK: WANT_K, minSigs: MIN_SIGS });
+		try {
+			// The verifying node serves the topic's tier-0 coord (wantK = N → every node is in every cohort), so its
+			// FRET ring has authority over `coord` — the amplification-exposed `promote`-handler shape. A FRET tier
+			// (T2) so the membership-source router + this anchor (not the tx-log) own the binding.
+			const verifying = mesh.nodes[0]!;
+			const coord = addressing.coord0(TOPIC);
+			const FRET_TIER = 2;
+			const now = Date.now();
+			const epoch = Uint8Array.from({ length: 32 }, (_v, i) => (i * 7 + 1) & 0xff);
+
+			// An adversary cohort of fresh keys — none of them are mesh nodes, so the ring says a wholly different
+			// keyset owns `coord`. The forged cert is internally self-consistent (a real k − x multisig over the
+			// adversary keyset) so ONLY the trust anchor — not self-consistency — can stop it.
+			const advs = await makeMembers(N);
+			const quorum = [...advs].sort((a, b) => compareBytes(a.bytes, b.bytes)).slice(0, MIN_SIGS);
+
+			const certSignable = {
+				cohortCoord: bytesToB64url(coord),
+				cohortEpoch: bytesToB64url(epoch),
+				members: advs.map((a) => bytesToB64url(a.bytes)),
+				stabilizedAt: now,
+			};
+			const certMulti = await collectedMultisig(quorum, membershipCertSigningPayload(certSignable));
+			const forgedCert: MembershipCertV1 = { v: 1, ...certSignable, thresholdSig: bytesToB64url(certMulti.sig), signers: certMulti.signers.map(bytesToB64url) };
+
+			// A forged T2 promotion notice the adversary cohort genuinely threshold-signed (self-consistent against
+			// the forged cert): it would verify-and-apply were the cert believed.
+			const noticeSignable = { topicId: bytesToB64url(TOPIC), fromTier: FRET_TIER, toTier: FRET_TIER + 1, effectiveAt: now, cohortEpoch: bytesToB64url(epoch) };
+			const noticeMulti = await collectedMultisig(quorum, promotionNoticeSigningPayload(noticeSignable));
+			const notice: PromotionNoticeV1 = { v: 1, ...noticeSignable, thresholdSig: bytesToB64url(noticeMulti.sig), signers: noticeMulti.signers.map(bytesToB64url) };
+
+			// Wire a verifier exactly as the host does: the FRET-ring anchor over the verifying node's ring view +
+			// the verify-only collected-multisig signer + a membership source serving the forged cert (the attack:
+			// a forged cert returned over `/membership`).
+			const fret = mesh.fretFor(verifying.member.idStr) as unknown as FretRingView;
+			const anchor = new FretTrustAnchor(fret, { k: WANT_K, selfPeerId: verifying.member.idStr });
+			const encoded = encodeCohortMessage(forgedCert);
+			const forgedSource: IMembershipSource = { current: () => Promise.resolve(encoded), fetch: () => Promise.resolve(encoded) };
+			const router = createMembershipSourceRouter({ committed: forgedSource, fret: forgedSource });
+			const signer = createCohortSigner(createVerifyOnlyThresholdCrypto(), MIN_SIGS);
+			const anchoredVerifier = createMembershipVerifier({ signer, router, minSigs: MIN_SIGS, anchor });
+
+			// Headline: the forged notice is dropped — the anchor `"rejected"`s the cert, so verifyMessage is
+			// `"untrusted"` and the promotion is never applied.
+			let applied = false;
+			const target: NoticeApplyTarget = { servedCoord: coord, applyPromotionNotice: () => { applied = true; }, applyDemotionNotice: () => undefined };
+			const outcome = await verifyAndApplyNotice({ kind: 'promotion', notice }, target, anchoredVerifier, now);
+			expect(outcome, 'the FRET anchor rejects the forged cert → the promote notice is untrusted').to.equal('untrusted');
+			expect(applied, 'the forged promotion was not applied to local state').to.equal(false);
+
+			// Control: the SAME forged cert + notice through a verifier with NO direct anchor (db-core default
+			// `noAuthorityTrustAnchor`) is trust-on-first-use ACCEPTED — proving the rejection above is the FRET
+			// anchor's doing, not a generic signature failure.
+			const tofuVerifier = createMembershipVerifier({ signer, router, minSigs: MIN_SIGS });
+			let tofuApplied = false;
+			const tofuTarget: NoticeApplyTarget = { servedCoord: coord, applyPromotionNotice: () => { tofuApplied = true; }, applyDemotionNotice: () => undefined };
+			const tofuOutcome = await verifyAndApplyNotice({ kind: 'promotion', notice }, tofuTarget, tofuVerifier, now);
+			expect(tofuOutcome, 'without the FRET anchor the self-consistent forgery is TOFU-accepted (no regression baseline)').to.equal('applied');
+			expect(tofuApplied, 'the control verifier applied the forged promotion — the gap the anchor closes').to.equal(true);
 		} finally {
 			await mesh.stop();
 		}
