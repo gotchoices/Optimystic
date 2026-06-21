@@ -458,6 +458,17 @@ Cohort memberships are anchored in the transaction log ([transactions.md](transa
 - The membership of *all* cohort-topic cohorts is not committed; only those that serve T0/T1 work (transaction commits, chain serving) appear in the log. The verifier **reads** this committed membership (it never writes the log).
 - T2/T3 cohorts (matchmaking, push forwarding) derive their membership from current FRET state. Their threshold signatures are verifiable against FRET's signed membership advertisements (the `MembershipCertV1` that FRET cohorts publish after stabilization).
 
+> **Reused by the parent-reference anti-DoS gate.** The same tier-routed membership state backs the
+> synchronous local "does this parent topic exist?" check the `verifyParentReference` bootstrap-evidence
+> verifier consults (§Anti-DoS). A node only knows a parent topic exists if it has *locally cached* a
+> cert/commit for `coord_0(parentTopicId)` — so the gate is **fail-closed when the parent is unknown**:
+> the FRET membership cache (`FretMembershipSource.has`) genuinely answers existence for **T2/T3**, while
+> **T0/T1** existence needs a committed-state backing distinct from the FRET cache (committed-tier
+> integrity). No coord-keyed committed-membership index exists yet (the tx-log commit certificate is
+> keyed by action, not by `coord_0`), so T0/T1 parent-ref existence fails closed today; the dedicated
+> committed backing — and the stronger "the parent's committed record names *this* child" check — is the
+> follow-on `cohort-topic-parent-ref-tx-log-content`.
+
 ### Membership fetch
 
 A participant verifies a notification or threshold-signed message as follows:
@@ -778,19 +789,34 @@ The layer does not attempt to defend against unbounded Sybil attacks at the regi
 >   bootstrap another. The participant builder mints it (nonce search ≈ `2^bits` hashes; capped so the
 >   register path never hangs). Whenever the gate is *configured*, this real PoW path runs (no longer a
 >   fail-closed deny).
-> - **Reputation endorsement (real verifier, T2/T3 + the interim T0/T1 stand-in).** `verifyReputation`
->   checks a *referee* peer-key signature over the bound image **and** that the referee is sufficiently
->   reputable in the node's local `PeerReputationService` view (not banned **and** `getScore <
->   deprioritize`, stronger than mere non-ban). The referee MAY equal the participant (a reputable
->   participant self-vouches). `libp2p-node-base.ts` wires the node's reputation service in as the
->   production backing. Until the committed-parent-reference verifier lands, this referee verifier also
->   stands in for the T0/T1 `verifyParentReference` path. The participant-side *minting* of an endorsement
->   is not wired into the host yet (the builder exposes an `endorse` self-vouch seam, but origination at
->   T0/T1 is the parent-reference follow-on) — so today an endorsement is supplied cohort-side (tests) or
->   by a future originator, not auto-minted on every register.
-> - **Parent reference (still deferred).** The real committed-parent-topic verifier is the follow-on
->   `cohort-topic-bootstrap-parent-reference`; until then T0/T1 is covered by the referee stand-in above,
->   and a T0/T1 cold bootstrap that carries no evidence is denied by a configured cohort.
+> - **Reputation endorsement (real verifier, T2/T3).** `verifyReputation` checks a *referee* peer-key
+>   signature over the bound image **and** that the referee is sufficiently reputable in the node's local
+>   `PeerReputationService` view (not banned **and** `getScore < deprioritize`, stronger than mere
+>   non-ban). The referee MAY equal the participant (a reputable participant self-vouches).
+>   `libp2p-node-base.ts` wires the node's reputation service in as the production backing. The
+>   participant-side *minting* of an endorsement is not wired into the host yet (the builder exposes an
+>   `endorse` self-vouch seam) — so today an endorsement is supplied cohort-side (tests) or by a future
+>   originator, not auto-minted on every register.
+> - **Parent reference (real, all tiers — the only T0/T1 evidence).** `verifyParentReference`
+>   ([`bootstrap-parent-reference.ts`](../packages/db-p2p/src/cohort-topic/bootstrap-parent-reference.ts))
+>   accepts a `parentRef = { parentTopicId, sig }` only when **both** (1) the participant peer-key-signed
+>   the `parentRefSigningImage` — the bound tuple extended with `parentTopicId` (domain-separated by a
+>   distinct tag), so a reference minted for one `(topic, tier, peer, time, parent)` cannot be lifted onto
+>   another register — **and** (2) the parent topic exists in locally-available committed/membership state,
+>   via a **synchronous** injectable `BootstrapParentTopicView` (an admission gate never dials —
+>   `createDefaultParentTopicView` reads only the in-memory caches the node already holds). A
+>   self-referential `parentTopicId == topicId` is rejected. The view is tier-routed like the membership
+>   source: **T2/T3** consult the FRET membership cache (`FretMembershipSource.has(coord_0(parentTopicId))`
+>   — a cached `MembershipCertV1` means a cohort genuinely serves the parent); **T0/T1** consult the
+>   committed backing and **fail closed without one** (a FRET-cached cert must not vouch for committed-tier
+>   existence — committed-tier integrity). **Limitation (interim):** no coord-keyed committed-membership
+>   index exists yet (the tx-log commit certificate is keyed by action, not by `coord_0`), so a node wires
+>   no committed reader today and T0/T1 parent-ref existence fails closed; T2/T3 parent-ref is fully real.
+>   A node admits a parent-ref only for a parent it has *locally cached* — acceptable for a gate
+>   (fail-closed when unknown → the participant retries / uses PoW for T2/T3; a genuinely-new committed
+>   T0/T1 topic is bootstrapped by nodes already serving the parent's committed work, which hold its cert).
+>   A *richer* check — that the parent's commit certificate names *this* child topic — is the follow-on
+>   `cohort-topic-parent-ref-tx-log-content`.
 >
 > Once any reputation view or explicit verifier is configured, an unfilled verifier fails **closed** so a
 > banned/low-rep referee cannot slip the T2/T3 `PoW || reputation || parent-ref` disjunction; an

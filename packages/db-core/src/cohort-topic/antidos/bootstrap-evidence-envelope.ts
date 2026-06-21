@@ -89,6 +89,27 @@ export function bootstrapBoundImage(reg: BootstrapBoundFields): Uint8Array {
 }
 
 /**
+ * The canonical bytes a **signed parent-topic reference** binds: the {@link bootstrapBoundImage} tuple
+ * `(topicId, tier, participantCoord, timestamp)` **extended with the referenced `parentTopicId`**, under a
+ * distinct discriminator tag (`"BootstrapParentRefV1"`). Extending the image with `parentTopicId` means a
+ * reference minted for one `(topic, tier, peer, time, parent)` cannot be lifted onto another register —
+ * including onto a register naming a *different* parent; the distinct tag keeps it from colliding with a
+ * {@link bootstrapBoundImage} reputation/PoW signature (domain separation). `topicId`/`participantCoord`/
+ * `parentTopicId` are bound as their base64url wire strings verbatim, like {@link bootstrapBoundImage}, so
+ * the participant who *signs* the reference and the cohort that *verifies* it never re-canonicalize bytes.
+ */
+export function parentRefSigningImage(reg: BootstrapBoundFields, parentTopicId: string): Uint8Array {
+	return utf8.encode(JSON.stringify([
+		"BootstrapParentRefV1",
+		reg.topicId,
+		reg.tier,
+		reg.participantCoord,
+		reg.timestamp,
+		parentTopicId,
+	]));
+}
+
+/**
  * The proof-of-work hash preimage: {@link bootstrapBoundImage} concatenated with `nonce`. db-p2p hashes
  * this (via the node's `RingHash`) and checks the digest against {@link meetsDifficulty}. Bound to the
  * register tuple ⇒ no cross-topic / cross-peer replay; cheap to verify (one hash + bit check), tunably

@@ -36,6 +36,15 @@ export class FretMembershipSource implements IMembershipSource {
 		return Promise.resolve(this.byCoord.get(bytesToB64url(coord)));
 	}
 
+	/**
+	 * Synchronous local existence read over the in-memory cache: true iff a `MembershipCertV1` is cached for
+	 * `coord` (no network I/O). The parent-reference bootstrap-evidence verifier's existence view consults
+	 * this — an admission gate must never dial — so it reads the same `byCoord` map `current()` resolves from.
+	 */
+	has(coord: RingCoord): boolean {
+		return this.byCoord.has(bytesToB64url(coord));
+	}
+
 	async fetch(coord: RingCoord): Promise<Uint8Array | undefined> {
 		const request = coord; // the membership request frame is the raw coord bytes
 		for (const peerStr of this.resolver.cohortPeers(coord, this.wants)) {

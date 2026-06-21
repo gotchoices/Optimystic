@@ -789,10 +789,17 @@ export async function createLibp2pNodeBase(
 				// Wire the node's reputation service in as the production backing for the bootstrap-evidence
 				// referee verifier (the `{ isBanned, getScore }` view `PeerReputationService` satisfies), so a
 				// configured cohort genuinely gates cold-root `bootstrap: true` (PoW always; reputation when a
-				// referee endorsement is offered). The node service is the *default* backing — a caller that
-				// supplies its own `antiDos.reputation` (or any other `antiDos` override) still wins, since the
-				// caller spread comes last.
+				// referee endorsement is offered; a signed reference to an existing parent topic on any tier).
+				// The node service is the *default* backing — a caller that supplies its own `antiDos.reputation`
+				// (or any other `antiDos` override) still wins, since the caller spread comes last.
 				antiDos: { reputation, ...(options.cohortTopic!.host?.antiDos) },
+				// committedParentTopicReader (the T0/T1 committed-tier parent-reference existence backing) is
+				// intentionally left unwired: no coord-keyed committed-membership index exists yet (the
+				// transaction-log commit certificate is keyed by action, not by coord_0). So the host default
+				// fails T0/T1 parent-ref existence closed — a FRET-cached cert must not vouch for committed-tier
+				// existence (committed-tier integrity) — while T2/T3 parent-ref consults the FRET membership cache
+				// for real. The dedicated committed backing is the follow-on `cohort-topic-parent-ref-tx-log-content`;
+				// an operator may still pass one via cohortTopic.host.committedParentTopicReader.
 				privateKey: nodePrivateKey, // real k − x threshold signing
 				wantK: cohortWantK,
 			});

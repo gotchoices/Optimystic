@@ -11,6 +11,7 @@ import {
 	decodeCohortMessage,
 	serializeBootstrapEvidenceEnvelope,
 	bootstrapBoundImage,
+	parentRefSigningImage,
 	DEFAULT_RATE_WINDOW_MS,
 	DEFAULT_REPLAY_MAX_AGE_MS,
 	validateRegisterV1,
@@ -20,6 +21,7 @@ import {
 	type Tier,
 } from '@optimystic/db-core';
 import { createCohortTopicHost, resolveRenew } from '../../src/cohort-topic/host.js';
+import type { BootstrapParentTopicView } from '../../src/cohort-topic/bootstrap-parent-reference.js';
 import { peerIdToBytes } from '../../src/cohort-topic/peer-codec.js';
 import { signPeerSig } from '../../src/cohort-topic/peer-sig.js';
 
@@ -42,6 +44,22 @@ function refereeEvidence(reg: RegisterV1, refereeBytes: Uint8Array, refereeKey: 
 	const sig = signPeerSig(refereeKey, bootstrapBoundImage(reg));
 	return serializeBootstrapEvidenceEnvelope({ v: 1, reputation: { referee: bytesToB64url(refereeBytes), sig: bytesToB64url(sig) } });
 }
+
+/** A signed parent-reference field: the participant peer-key-signs the parentRef image binding `reg` + `parentTopicId`. */
+function parentRefEvidence(reg: RegisterV1, parentTopicId: Uint8Array, participantKey: PrivateKey): string {
+	const sig = signPeerSig(participantKey, parentRefSigningImage(reg, bytesToB64url(parentTopicId)));
+	return serializeBootstrapEvidenceEnvelope({ v: 1, parentRef: { parentTopicId: bytesToB64url(parentTopicId), sig: bytesToB64url(sig) } });
+}
+
+/** An existence view that knows exactly the parent topics in `known` (the `antiDos.parentTopicView` test seam). */
+function viewKnowing(known: Uint8Array[]): BootstrapParentTopicView {
+	const set = new Set(known.map(bytesToB64url));
+	return { exists: (parentTopicId): boolean => set.has(bytesToB64url(parentTopicId)) };
+}
+
+/** A stand-in "existing committed parent topic" and a parent the node has never cached. */
+const KNOWN_PARENT = Uint8Array.from({ length: 32 }, (_v, i) => (i + 130) & 0xff);
+const UNKNOWN_PARENT = Uint8Array.from({ length: 32 }, (_v, i) => (i + 200) & 0xff);
 
 const delay = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -193,35 +211,71 @@ describe('cohort-topic: host anti-DoS wiring (gap 6)', () => {
 		await host.stop();
 	});
 
-	it('bootstrap evidence: a T0 bootstrap is admitted with a reputable referee endorsement and denied with a banned one', async () => {
+	it('bootstrap evidence: a configured host admits a T0 bootstrap with a valid parent-ref to a known parent and denies an unknown one', async () => {
 		const now = 1_000_000;
-
-		// Reputable referee (here a self-vouch: referee == participant) → admitted via the referee stand-in
-		// for the (still-deferred) parent-reference path.
-		const okHost = await createCohortTopicHost(makeFakeNode(await makePeerId()) as never, makeFakeFret() as never, {
+		// The committed-tier (T0) path now demands a real signed parent reference to a parent the node knows
+		// exists. Inject the existence view (the host default fails T0 closed without a committed reader).
+		const host = await createCohortTopicHost(makeFakeNode(await makePeerId()) as never, makeFakeFret() as never, {
 			wantK: 1,
-			antiDos: { reputation: cleanReputation },
+			antiDos: { reputation: cleanReputation, parentTopicView: viewKnowing([KNOWN_PARENT]) },
 		});
+
+		// A valid parent-ref to the known parent → admitted.
 		const { key: okKey, bytes: okParticipant } = await makeParticipant();
-		const okReg = makeReg(okParticipant, TOPIC, 'cid-t0-ok', now);
-		okReg.bootstrapEvidence = refereeEvidence(okReg, okParticipant, okKey);
-		const ceOk = okHost.registry.forCoord(addressing.coord0(TOPIC), 0 as Tier, okParticipant);
-		const admitted = await ceOk.engine.handleRegister(okReg, { followOn: false, treeTier: 0 }, now);
-		expect(admitted.result, 'a T0 bootstrap with a reputable referee endorsement is admitted').to.equal('accepted');
-		await okHost.stop();
+		const okReg = makeReg(okParticipant, TOPIC, 'cid-t0-pref-ok', now);
+		okReg.bootstrapEvidence = parentRefEvidence(okReg, KNOWN_PARENT, okKey);
+		const ceOk = host.registry.forCoord(addressing.coord0(TOPIC), 0 as Tier, okParticipant);
+		expect((await ceOk.engine.handleRegister(okReg, { followOn: false, treeTier: 0 }, now)).result, 'T0 parent-ref to a known parent is admitted').to.equal('accepted');
 
-		// A banned referee → the endorsement is rejected → unwilling_cohort.
-		const banHost = await createCohortTopicHost(makeFakeNode(await makePeerId()) as never, makeFakeFret() as never, {
+		// A valid signature but to a parent the node has never cached → denied (fail closed).
+		const { key: noKey, bytes: noParticipant } = await makeParticipant();
+		const unknownReg = makeReg(noParticipant, TOPIC2, 'cid-t0-pref-unknown', now);
+		unknownReg.bootstrapEvidence = parentRefEvidence(unknownReg, UNKNOWN_PARENT, noKey);
+		const ceUnknown = host.registry.forCoord(addressing.coord0(TOPIC2), 0 as Tier, noParticipant);
+		expect((await ceUnknown.engine.handleRegister(unknownReg, { followOn: false, treeTier: 0 }, now)).result, 'T0 parent-ref to an unknown parent is denied').to.equal('unwilling_cohort');
+
+		await host.stop();
+	});
+
+	it('bootstrap evidence: a configured host denies a T0 bootstrap whose parent-ref signature is bad', async () => {
+		const now = 1_000_000;
+		const host = await createCohortTopicHost(makeFakeNode(await makePeerId()) as never, makeFakeFret() as never, {
 			wantK: 1,
-			antiDos: { reputation: { isBanned: (): boolean => true, getScore: (): number => 0 } },
+			antiDos: { reputation: cleanReputation, parentTopicView: viewKnowing([KNOWN_PARENT]) },
 		});
-		const { key: banKey, bytes: banParticipant } = await makeParticipant();
-		const banReg = makeReg(banParticipant, TOPIC, 'cid-t0-ban', now);
-		banReg.bootstrapEvidence = refereeEvidence(banReg, banParticipant, banKey);
-		const ceBan = banHost.registry.forCoord(addressing.coord0(TOPIC), 0 as Tier, banParticipant);
-		const denied = await ceBan.engine.handleRegister(banReg, { followOn: false, treeTier: 0 }, now);
-		expect(denied.result, 'a banned referee endorsement is denied').to.equal('unwilling_cohort');
-		await banHost.stop();
+		// A parent-ref to a KNOWN parent but signed by a different key (not the participant) → rejected even
+		// though the parent exists: the existence check never runs without a valid binding signature.
+		const { bytes: participant } = await makeParticipant();
+		const { key: otherKey } = await makeParticipant();
+		const reg = makeReg(participant, TOPIC, 'cid-t0-pref-badsig', now);
+		reg.bootstrapEvidence = parentRefEvidence(reg, KNOWN_PARENT, otherKey);
+		const ce = host.registry.forCoord(addressing.coord0(TOPIC), 0 as Tier, participant);
+		expect((await ce.engine.handleRegister(reg, { followOn: false, treeTier: 0 }, now)).result, 'a bad parent-ref signature is denied').to.equal('unwilling_cohort');
+		await host.stop();
+	});
+
+	it('bootstrap evidence: a T2 bootstrap is admitted via a valid parent-ref alone (the PoW || reputation || parent-ref disjunction)', async () => {
+		const now = 1_000_000;
+		// A banning reputation view and no PoW offered → only the parent-ref can carry the disjunction.
+		const host = await createCohortTopicHost(makeFakeNode(await makePeerId()) as never, makeFakeFret() as never, {
+			wantK: 1,
+			antiDos: { reputation: { isBanned: (): boolean => true, getScore: (): number => 0 }, powDifficultyBits: 0, parentTopicView: viewKnowing([KNOWN_PARENT]) },
+		});
+
+		const { key: okKey, bytes: okParticipant } = await makeParticipant();
+		const okReg = makeReg(okParticipant, TOPIC, 'cid-t2-pref', now, { tier: 2 });
+		okReg.bootstrapEvidence = parentRefEvidence(okReg, KNOWN_PARENT, okKey);
+		const ceOk = host.registry.forCoord(addressing.coord0(TOPIC), 0 as Tier, okParticipant);
+		expect((await ceOk.engine.handleRegister(okReg, { followOn: false, treeTier: 0 }, now)).result, 'a valid parent-ref alone admits a T2 bootstrap').to.equal('accepted');
+
+		// An unknown parent → parent-ref fails, PoW absent, reputation banned → the whole disjunction fails.
+		const { key: badKey, bytes: badParticipant } = await makeParticipant();
+		const badReg = makeReg(badParticipant, TOPIC2, 'cid-t2-pref-bad', now, { tier: 2 });
+		badReg.bootstrapEvidence = parentRefEvidence(badReg, UNKNOWN_PARENT, badKey);
+		const ceBad = host.registry.forCoord(addressing.coord0(TOPIC2), 0 as Tier, badParticipant);
+		expect((await ceBad.engine.handleRegister(badReg, { followOn: false, treeTier: 0 }, now)).result, 'an unknown parent-ref falls through to denial').to.equal('unwilling_cohort');
+
+		await host.stop();
 	});
 
 	it('bootstrap evidence gates T2/T3 too: a banned referee cannot slip the disjunction (a valid PoW alone still admits)', async () => {

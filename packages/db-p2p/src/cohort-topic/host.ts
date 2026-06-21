@@ -145,6 +145,7 @@ import { FretSizeEstimator } from "./size-estimator.js";
 import { peerIdToBytes, bytesToPeerIdString } from "./peer-codec.js";
 import { signPeer, verifyPeerSig } from "./peer-sig.js";
 import { createPoWVerifier, createReputationVerifier, type BootstrapReputationView } from "./bootstrap-evidence-verifiers.js";
+import { createParentReferenceVerifier, createDefaultParentTopicView, type BootstrapParentTopicView } from "./bootstrap-parent-reference.js";
 import { createBootstrapEvidenceBuilder } from "./bootstrap-evidence-builder.js";
 import { DEFAULT_COHORT_TOPIC_PROTOCOLS, cohortTopicProtocolList, type CohortTopicProtocols } from "./protocols.js";
 import { requestResponse, DEFAULT_STREAM_MAX_BYTES } from "./stream-util.js";
@@ -196,6 +197,16 @@ export interface CohortTopicHostOptions {
 	 * — those stay coord-derived — so only the count/load thresholds are tunable here.
 	 */
 	readonly promotion?: PromotionConfig;
+	/**
+	 * Optional committed-state existence reader backing the **committed-tier (T0/T1)** parent-reference
+	 * bootstrap-evidence check (`cohort-topic-bootstrap-parent-reference`). Given `coord_0(parentTopicId)`,
+	 * returns whether the node locally knows the parent topic's committed cohort exists. Threaded from
+	 * node-base when a coord-keyed committed-membership index is available; when omitted, T0/T1 parent-ref
+	 * existence fails closed (a FRET-cached cert must not vouch for committed-tier existence — committed-tier
+	 * integrity) while T2/T3 parent-ref still consults the FRET membership cache. See
+	 * {@link createDefaultParentTopicView}.
+	 */
+	readonly committedParentTopicReader?: (coord: RingCoord) => boolean;
 }
 
 // The reputation-view shape the bootstrap-evidence referee verifier consults — `{ isBanned, getScore }`
@@ -248,6 +259,14 @@ export interface CohortTopicAntiDosOptions {
 	 * accepted. Default the reputation service's `deprioritize` threshold.
 	 */
 	readonly deprioritizeThreshold?: number;
+	/**
+	 * Existence view backing the **signed parent-reference** evidence path (`verifyParentReference`). A test
+	 * seam: when supplied it overrides the host default (built from the FRET membership cache + addressing +
+	 * the optional {@link CohortTopicHostOptions.committedParentTopicReader}). Supplying it (or any other
+	 * `bootstrapEvidence`/`reputation` override) makes the gate **configured**, so the real parent-reference
+	 * verifier runs. See {@link createDefaultParentTopicView} / {@link createParentReferenceVerifier}.
+	 */
+	readonly parentTopicView?: BootstrapParentTopicView;
 }
 
 /**
@@ -558,7 +577,16 @@ export async function createCohortTopicHost(node: Libp2p, fret: FretService, opt
 	// is built once and shared by every coord engine. The per-coord guards (rate limiter, replay guard,
 	// topic budget) are built per CoordEngine from `antiDos` below — they key on `(peer, topic)` /
 	// per-cohort topic state, which is coord-scoped, and must not share state across coords.
-	const bootstrapEvidence = createBootstrapEvidencePolicy(options.antiDos, hash, log);
+	// The signed-parent-reference existence view (cohort-topic-bootstrap-parent-reference). A test override
+	// (`antiDos.parentTopicView`) wins; otherwise the host default, tier-routed over the FRET membership
+	// cache (T2/T3) and the optional committed reader (T0/T1 — fail-closed without one, committed-tier
+	// integrity). Synchronous + local: it reads the in-memory caches the node already holds, never a dial.
+	const parentTopicView = options.antiDos?.parentTopicView ?? createDefaultParentTopicView({
+		membershipSource,
+		addressing,
+		committedReader: options.committedParentTopicReader,
+	});
+	const bootstrapEvidence = createBootstrapEvidencePolicy(options.antiDos, hash, log, parentTopicView);
 
 	// Node-level `promote`-handler anti-abuse gate (`cohort-topic-promote-handler-verify-amplification`):
 	// a per-(peer, topic) rate limiter (own instance — the register-path limiter is per-coord inside each
@@ -789,9 +817,11 @@ function createParticipantSigner(
  * - `verifyReputation` — when a reputation **view** is supplied, the real {@link createReputationVerifier}
  *   (a referee peer-key-signs the bound image; the cohort checks the signature + the referee's local
  *   reputation). Else (configured, no view) fail closed.
- * - `verifyParentReference` — the interim **reputation stand-in**: the referee verifier when a view is
- *   supplied (so a reputable referee covers the T0/T1 path until the real committed-parent-reference
- *   verifier lands in `cohort-topic-bootstrap-parent-reference`), else fail closed.
+ * - `verifyParentReference` — the real {@link createParentReferenceVerifier} over `parentTopicView`: a
+ *   participant-signed reference to a parent topic that the node locally knows exists (committed/membership
+ *   state). It is the *only* accepted evidence for T0/T1 and the third T2/T3 option. The view is always
+ *   available (the host builds a default from the membership cache + addressing), so this is the real
+ *   verifier whenever configured — the interim reputation stand-in is gone.
  *
  * "Configured" = any reputation view or explicit `bootstrapEvidence` override is set; once configured, an
  * unfilled verifier fails **closed** so a banned/low-rep referee cannot slip the T2/T3
@@ -803,6 +833,7 @@ function createBootstrapEvidencePolicy(
 	antiDos: CohortTopicAntiDosOptions | undefined,
 	hash: RingHash,
 	log: (formatter: string, ...args: unknown[]) => void,
+	parentTopicView: BootstrapParentTopicView,
 ): BootstrapEvidence {
 	const overrides = antiDos?.bootstrapEvidence;
 	const reputation = antiDos?.reputation;
@@ -815,11 +846,13 @@ function createBootstrapEvidencePolicy(
 
 	// The real, self-contained PoW verifier — available whenever configured (no view / subsystem needed).
 	const realPoW = createPoWVerifier({ hash, bits: antiDos?.powDifficultyBits });
-	// The real referee verifier — only when a reputation view is supplied. Backs both the reputation path
-	// and (as the interim stand-in) the parent-reference path.
+	// The real referee verifier — only when a reputation view is supplied (the T2/T3 reputation path).
 	const realReputation = reputation === undefined
 		? undefined
 		: createReputationVerifier({ reputation, deprioritizeThreshold: antiDos?.deprioritizeThreshold });
+	// The real signed-parent-reference verifier over the (always-available) existence view. Replaces the
+	// interim reputation stand-in: T0/T1 and the T2/T3 third option now demand a real, existing parent.
+	const realParentReference = createParentReferenceVerifier({ parentTopicView });
 
 	const deny = (): boolean => false;
 
@@ -841,9 +874,9 @@ function createBootstrapEvidencePolicy(
 		// Configured ⇒ the real PoW path; unconfigured ⇒ permissive (preserves the bare-host tier-0 flows).
 		verifyPoW: overrides?.verifyPoW ?? (configured ? realPoW : fallback("proof-of-work")),
 		verifyReputation: overrides?.verifyReputation ?? realReputation ?? fallback("reputation"),
-		// Interim: the referee verifier stands in for the committed-parent-reference path until the
-		// follow-on `cohort-topic-bootstrap-parent-reference` replaces it.
-		verifyParentReference: overrides?.verifyParentReference ?? realReputation ?? fallback("parent-reference"),
+		// The real signed-parent-reference verifier when configured (an explicit override still wins);
+		// unconfigured ⇒ permissive (preserves the bare-host tier-0 flows). No longer the reputation stand-in.
+		verifyParentReference: overrides?.verifyParentReference ?? (configured ? realParentReference : fallback("parent-reference")),
 		config: overrides?.config,
 	});
 }
