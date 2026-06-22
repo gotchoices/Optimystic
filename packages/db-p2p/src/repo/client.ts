@@ -65,20 +65,39 @@ export class RepoClient extends ProtocolClient implements IRepo {
 		};
 		const correlationId = this.extractCorrelationId(operations);
 		const deadline = options.expiration ?? (Date.now() + 30_000)
-		const msLeft = Math.max(1, deadline - Date.now())
-		const withTimeout = async <U>(fn: () => Promise<U>): Promise<U> => {
-			return await Promise.race<U>([
-				fn(),
-				new Promise<never>((_, reject) => setTimeout(() => reject(new Error('RepoClient timeout')), msLeft))
-			])
-		}
-		let response: any
+		const deadlineMs = Math.max(1, deadline - Date.now())
 		const preferred = (this.protocolPrefix ?? '/db-p2p') + '/repo/1.0.0'
-		response = await withTimeout(() => super.processMessage<any>(message, preferred, {
-			signal: options?.signal,
-			correlationId,
-			dialTimeoutMs: options?.dialTimeoutMs,
-		}))
+
+		// Drive the remaining `expiration` budget through an AbortController whose
+		// abort *reason* is the caller-facing `'RepoClient timeout'` Error, combined
+		// with any caller signal. processMessage forwards `signal` to both the dial
+		// and the response-read and calls `stream.abort(signal.reason)` on abort, so —
+		// unlike the old `Promise.race`, whose losing branch left the inner read
+		// running and leaked a pending read + stream on every timed-out RPC to a silent
+		// peer — the deadline now genuinely cancels the inner read while the caller
+		// still observes an error whose `.message === 'RepoClient timeout'`.
+		//
+		// Intentionally no `responseTimeoutMs`: the combined signal already bounds the
+		// read at `deadlineMs`. A second, shorter cap would surface as
+		// ResponseTimeoutError and mask the caller-facing 'RepoClient timeout' message.
+		const deadlineController = new AbortController()
+		const timer = setTimeout(
+			() => deadlineController.abort(new Error('RepoClient timeout')),
+			deadlineMs
+		)
+		const combinedSignal = options?.signal
+			? AbortSignal.any([options.signal, deadlineController.signal])
+			: deadlineController.signal
+		let response: any
+		try {
+			response = await super.processMessage<any>(message, preferred, {
+				signal: combinedSignal,
+				correlationId,
+				dialTimeoutMs: options?.dialTimeoutMs,
+			})
+		} finally {
+			clearTimeout(timer)
+		}
 
 		if (response?.redirect?.peers?.length) {
 			if (hop >= 2) {

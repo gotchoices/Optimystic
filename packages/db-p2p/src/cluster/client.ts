@@ -3,6 +3,7 @@ import { blockIdToBytes, blockIdsForTransforms } from '@optimystic/db-core';
 import { ProtocolClient } from '../protocol-client.js';
 import { peerIdFromString } from '@libp2p/peer-id';
 import { isClusterErrorEnvelope, clusterErrorFromEnvelope } from './cluster-error.js';
+import { withRpcDeadlineDefaults, type RpcDeadlineOptions } from '../rpc-deadline.js';
 
 export class ClusterClient extends ProtocolClient implements ICluster {
 	private constructor(peerId: PeerId, peerNetwork: IPeerNetwork, readonly protocolPrefix?: string) {
@@ -14,7 +15,7 @@ export class ClusterClient extends ProtocolClient implements ICluster {
 		return new ClusterClient(peerId, peerNetwork, protocolPrefix);
 	}
 
-	async update(record: ClusterRecord, hop: number = 0): Promise<ClusterRecord> {
+	async update(record: ClusterRecord, hop: number = 0, options?: RpcDeadlineOptions): Promise<ClusterRecord> {
 		const message = {
 			operation: 'update',
 			record
@@ -24,7 +25,9 @@ export class ClusterClient extends ProtocolClient implements ICluster {
 		// `/db-p2p/cluster/1.0.0` is never registered, so there is no legacy
 		// fallback to attempt — a single dial whose error propagates directly.
 		const protocol = (this.protocolPrefix ?? '/db-p2p') + '/cluster/1.0.0';
-		const response = await this.processMessage<unknown>(message, protocol);
+		// Apply the client-level dial/response deadline so a silent cluster peer
+		// can't hang the coordinator forever; an explicit caller override wins.
+		const response = await this.processMessage<unknown>(message, protocol, withRpcDeadlineDefaults(options));
 
 		// A member that threw inside `update` replies with a structured error
 		// envelope rather than aborting the stream; rethrow the server's real
@@ -46,7 +49,9 @@ export class ClusterClient extends ProtocolClient implements ICluster {
 			}
 			await this.recordCoordinatorForRecordIfSupported(record, nextId)
 			const nextClient = ClusterClient.create(nextId, this.peerNetwork, this.protocolPrefix)
-			return await nextClient.update(record, hop + 1)
+			// Thread the caller's *original* options through the redirect hop (the
+			// recursive call re-applies its own defaults) so the deadline survives a redirect.
+			return await nextClient.update(record, hop + 1, options)
 		}
 		return response as ClusterRecord;
 	}
