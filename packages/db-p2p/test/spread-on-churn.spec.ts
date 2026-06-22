@@ -9,6 +9,7 @@ import {
 	type SpreadEvent
 } from '../src/cluster/spread-on-churn.js';
 import { PartitionDetector } from '../src/cluster/partition-detector.js';
+import { buildBlockTransferProtocol } from '../src/cluster/block-transfer-service.js';
 import type { FretService } from 'p2p-fret';
 
 // --- Helpers ---
@@ -140,6 +141,8 @@ function makeMockRepo(blocks: Record<string, any> = {}) {
 /** Tracks pushBlocks calls for verification. */
 interface PushCall {
 	peerId: string;
+	/** The dialed protocol id (asserts the configured protocolPrefix flows through). */
+	protocol: string;
 	blockIds: string[];
 	reason: string;
 }
@@ -154,7 +157,7 @@ function makeMockPeerNetwork(
 	rejectTargets: Map<string, string[]> = new Map()
 ) {
 	return {
-		async connect(peerId: PeerId, _protocol: string) {
+		async connect(peerId: PeerId, protocol: string) {
 			const targetId = peerId.toString();
 			if (failTargets.has(targetId)) {
 				throw new Error(`Connection refused: ${targetId}`);
@@ -162,7 +165,7 @@ function makeMockPeerNetwork(
 			// Record the push and return a mock stream
 			// The ProtocolClient will pipe data through this stream.
 			// We need to simulate the stream protocol (length-prefixed JSON).
-			pushCalls.push({ peerId: targetId, blockIds: [], reason: 'replication' });
+			pushCalls.push({ peerId: targetId, protocol, blockIds: [], reason: 'replication' });
 
 			// Return a mock stream that:
 			// 1. Accepts a request (sink)
@@ -725,7 +728,7 @@ describe('SpreadOnChurnMonitor', () => {
 			expect(event).to.be.null;
 		});
 
-		it('returns null when block not in local repo', async () => {
+		it('returns null when block not in local repo (and self-prunes the missing block)', async () => {
 			const selfStr = selfId.toString();
 			const peer4Str = peerId4.toString();
 
@@ -736,9 +739,36 @@ describe('SpreadOnChurnMonitor', () => {
 			// Track a block that doesn't exist in repo
 			const monitor = makeMonitor({ repo: makeMockRepo({}) as any });
 			monitor.trackBlock('nonexistent-block');
+			expect(monitor.getTrackedBlockCount(), 'tracked before spread').to.equal(1);
 
 			const event = await monitor.checkNow();
 			expect(event).to.be.null;
+			// performSpread reached repo.get for the eligible block, found no local data, and
+			// self-pruned it so the tracked set stays bounded to blocks actually held locally.
+			expect(monitor.getTrackedBlockCount(), 'self-pruned the missing block').to.equal(0);
+		});
+	});
+
+	// ── Protocol prefix ──────────────────────────────────────────────
+
+	describe('protocol prefix', () => {
+		it('dials the block-transfer protocol under the configured protocolPrefix', async () => {
+			const selfStr = selfId.toString();
+			const peer4Str = peerId4.toString();
+
+			mockFret.setNeighborDistance(0);
+			mockFret.setCohort('*', [selfStr, peerId2.toString()]);
+			mockFret.setExpandResult('*', [selfStr, peerId2.toString(), peer4Str]);
+
+			// The monitor must dial buildBlockTransferProtocol(protocolPrefix); a dropped prefix
+			// would dial the empty-prefix protocol and every real push would fail to connect.
+			const monitor = makeMonitor({ protocolPrefix: '/optimystic/x' });
+			monitor.trackBlock('block-1');
+
+			const event = await monitor.checkNow();
+			expect(event).to.not.be.null;
+			expect(pushCalls.length, 'a push was dialed').to.be.greaterThan(0);
+			expect(pushCalls[0]!.protocol).to.equal(buildBlockTransferProtocol('/optimystic/x'));
 		});
 	});
 });

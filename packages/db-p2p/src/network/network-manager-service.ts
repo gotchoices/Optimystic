@@ -92,13 +92,16 @@ export class NetworkManagerService implements Startable {
 
 	/**
 	 * Initialize the spread-on-churn monitor. Call after libp2p, FRET are available.
-	 * Caller provides repo and peerNetwork (not held by NetworkManagerService directly).
+	 * Caller provides repo and peerNetwork (not held by NetworkManagerService directly),
+	 * plus the node's protocolPrefix (/optimystic/<networkName>) so churn pushes dial the
+	 * same block-transfer protocol the node registers its handler under.
 	 */
 	initSpreadOnChurnMonitor(
 		partitionDetector: PartitionDetector,
 		repo: SpreadOnChurnDeps['repo'],
 		peerNetwork: SpreadOnChurnDeps['peerNetwork'],
 		clusterSize: number,
+		protocolPrefix: string,
 		config?: Partial<SpreadOnChurnConfig>
 	): SpreadOnChurnMonitor {
 		const libp2p = this.getLibp2p()
@@ -106,8 +109,12 @@ export class NetworkManagerService implements Startable {
 		if (!libp2p || !fret) {
 			throw new Error('Cannot init SpreadOnChurnMonitor: libp2p or FRET not available')
 		}
+		// protocolPrefix MUST flow into SpreadOnChurnDeps: performSpread builds its
+		// BlockTransferClient with it, and the receiving node registers the block-transfer
+		// handler under /optimystic/<networkName>. A missing/empty prefix dials the wrong
+		// protocol and every churn push fails to connect.
 		this.spreadOnChurnMonitor = new SpreadOnChurnMonitor(
-			{ libp2p, fret, partitionDetector, repo, peerNetwork, clusterSize },
+			{ libp2p, fret, partitionDetector, repo, peerNetwork, clusterSize, protocolPrefix },
 			config
 		)
 		return this.spreadOnChurnMonitor

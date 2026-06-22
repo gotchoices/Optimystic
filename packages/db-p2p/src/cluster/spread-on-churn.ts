@@ -197,7 +197,12 @@ export class SpreadOnChurnMonitor implements Startable {
 			const result = await this.deps.repo.get({ blockIds: [blockId] })
 			const blockResult = result[blockId]
 			if (!blockResult?.block) {
-				log('no-local-data block=%s', blockId)
+				// The block has left local storage. No deletion event exists today to evict it
+				// from the tracked set, so prune here. Deleting the current element of a Set mid
+				// for...of is safe - it does not disturb the rest of the iteration. A later
+				// re-commit re-adds the block via the owned-block feed.
+				log('no-local-data block=%s (untracking)', blockId)
+				this.trackedBlocks.delete(blockId)
 				continue
 			}
 

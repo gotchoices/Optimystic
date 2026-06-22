@@ -556,4 +556,99 @@ describe('Real libp2p integration', function () {
 			}
 		}
 	});
+
+	// Churn re-replication end-to-end (optimystic-spread-on-churn-monitor-wiring). Proves the
+	// SENDING side wired into the node actually re-pushes an owned block to expansion-cohort peers
+	// over real sockets, and the receiver durably persists it:
+	//   1. A block is committed on a 2-member cohort, so both members hold it; the two non-members do not.
+	//   2. A member's owned-block feed (storageRepo.onAnyCollectionChange) tracked the block.
+	//   3. The member's SpreadOnChurnMonitor.checkNow() (bypassing the departure debounce timer to keep
+	//      wall-clock low) re-pushes to the expansion peers (the non-members).
+	//   4. An expansion peer then serves the block from its OWN local storage (the replica landed via
+	//      handlePush → saveReplicatedBlock).
+	//
+	// Scoped to checkNow() rather than a real connection:close + departureDebounceMs wait, per the
+	// ticket: this keeps the test deterministic against live FRET topology and well under the idle window.
+	it('churn re-replication: a middle peer re-pushes an owned block to an expansion peer that then serves it', async function () {
+		this.timeout(90_000);
+
+		const clusterPolicy = { allowDownsize: true, sizeTolerance: 1.0, superMajorityThreshold: 0.51 };
+		const a = await spawnNode({ clusterSize: 2, clusterPolicy });
+		const bootstrapAddr = pickLocalTcpMultiaddr(a);
+		const b = await spawnNode({ bootstrapNodes: [bootstrapAddr], fretProfile: 'core', clusterSize: 2, clusterPolicy });
+		const c = await spawnNode({ bootstrapNodes: [bootstrapAddr], fretProfile: 'core', clusterSize: 2, clusterPolicy });
+		const d = await spawnNode({ bootstrapNodes: [bootstrapAddr], fretProfile: 'core', clusterSize: 2, clusterPolicy });
+		const mesh = [a, b, c, d];
+
+		await fullMeshDial(mesh);
+		const connected = await waitFor(() => mesh.every(n => n.getPeers().length >= 3), 30_000, 250);
+		expect(connected, 'the 4-node mesh fully connected').to.equal(true);
+
+		const fretOf = (n: Libp2p): { assembleCohort(coord: Uint8Array, wants: number): string[] } =>
+			(n as any).services.fret;
+		const probeCoord = await hashKey(new TextEncoder().encode('spread-churn-fret-probe'));
+		const stabilized = await waitFor(() => {
+			const ref = new Set(fretOf(a).assembleCohort(probeCoord, mesh.length));
+			if (ref.size !== mesh.length) return false;
+			for (const n of mesh) {
+				const seen = new Set(fretOf(n).assembleCohort(probeCoord, mesh.length));
+				if (seen.size !== mesh.length) return false;
+				for (const id of ref) if (!seen.has(id)) return false;
+			}
+			return true;
+		}, 60_000, 500);
+		expect(stabilized, 'FRET stabilized the 4-node ring (every node knows every peer)').to.equal(true);
+
+		// Find a block whose 2-peer cohort is a proper subset of the ring. The cohort nodes are the
+		// owners; the other two are the expansion-cohort non-members the spread must reach.
+		const entryNM: { getCluster(key: Uint8Array): Promise<Array<{ toString(): string }>> } =
+			(a as any).services.networkManager;
+		let chosen: { blockId: string; owner: Libp2p; nonMembers: Libp2p[] } | undefined;
+		for (let i = 0; i < 200; i++) {
+			const blockId = `spread-churn-block-${i}`;
+			const cohort = await entryNM.getCluster(new TextEncoder().encode(blockId));
+			const ids = cohort.map(p => p.toString());
+			if (ids.length !== 2) continue;
+			const owners = mesh.filter(n => ids.includes(n.peerId.toString()));
+			if (owners.length !== 2) continue;
+			const nonMembers = mesh.filter(n => !ids.includes(n.peerId.toString()));
+			if (nonMembers.length !== 2) continue;
+			chosen = { blockId, owner: owners[0]!, nonMembers };
+			break;
+		}
+		expect(chosen, 'found a block whose 2-peer cohort excludes two ring members').to.exist;
+		const { blockId, owner, nonMembers } = chosen!;
+
+		// Commit on an owner so it holds the block locally; precondition: the non-members do not.
+		const ownerRepo = (owner as any).coordinatedRepo as IRepo;
+		const pend = await ownerRepo.pend({ actionId: 'spread-churn-a1', transforms: makeTransforms(blockId), policy: 'c' });
+		expect(pend.success, 'owner pend').to.equal(true);
+		const commit = await ownerRepo.commit({ actionId: 'spread-churn-a1', tailId: blockId as BlockId, rev: 1, blockIds: [blockId as BlockId] } as any);
+		expect(commit.success, 'owner commit (2-member consensus)').to.equal(true);
+
+		for (const nm of nonMembers) {
+			const local = await (nm as any).storageRepo.get({ blockIds: [blockId] }, { skipClusterFetch: true });
+			expect(local[blockId]?.block, 'non-member has no local copy before the spread').to.be.undefined;
+		}
+
+		// The owned-block feed must have tracked the committed block on the owner's monitor.
+		const monitor = (owner as any).spreadOnChurnMonitor;
+		expect(monitor, 'owner has a live spread monitor').to.exist;
+		const tracked = await waitFor(() => monitor.getTrackedBlockCount() >= 1, 10_000, 100);
+		expect(tracked, 'the owner tracked the committed block via the owned-block feed').to.equal(true);
+
+		// Trigger the spread directly (no real departure / debounce needed for the assertion).
+		const event = await monitor.checkNow();
+		expect(event, 'the spread produced an event (the owner is an eligible middle peer with expansion targets)').to.not.be.null;
+
+		// An expansion peer now serves the block from its OWN local storage (replica landed).
+		const replicated = await waitFor(async () => {
+			for (const nm of nonMembers) {
+				const local = await (nm as any).storageRepo.get({ blockIds: [blockId] }, { skipClusterFetch: true });
+				if (local[blockId]?.block?.header.id === blockId) return true;
+			}
+			return false;
+		}, 15_000, 250);
+		expect(replicated, 'an expansion-cohort peer durably holds the re-pushed block').to.equal(true);
+	});
 });

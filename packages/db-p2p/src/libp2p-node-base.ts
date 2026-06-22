@@ -25,7 +25,8 @@ import { Libp2pKeyPeerNetwork, type NetworkMode, type NetworkStatePersistence } 
 import { ClusterClient } from './cluster/client.js';
 import type { IRepo, ICluster, ITransactionValidator, BlockId, ActionRev, IBlock, IBlockChangeNotifier } from '@optimystic/db-core';
 import type { ITransactionStateStore } from './cluster/i-transaction-state-store.js';
-import { networkManagerService } from './network/network-manager-service.js';
+import { networkManagerService, type NetworkManagerService } from './network/network-manager-service.js';
+import type { SpreadOnChurnConfig, SpreadOnChurnMonitor } from './cluster/spread-on-churn.js';
 import { fretService, Libp2pFretService } from 'p2p-fret';
 import { syncService } from './sync/service.js';
 import { SyncClient } from './sync/client.js';
@@ -157,6 +158,12 @@ export type NodeOptions = {
 		enableRingZulu?: boolean; // default: true
 		storage?: StorageMonitorConfig;
 	};
+
+	/**
+	 * Churn-resilient spread protocol tuning. Absent -> enabled with defaults
+	 * (see SpreadOnChurnConfig). Set { enabled: false } to disable spread on this node.
+	 */
+	spreadOnChurn?: Partial<SpreadOnChurnConfig>;
 
 	/** Transaction validator for cluster consensus */
 	validator?: ITransactionValidator;
@@ -644,6 +651,65 @@ export async function createLibp2pNodeBase(
 	if (options.transactionStateStore) {
 		await (clusterImpl as import('./cluster/cluster-repo.js').ClusterMember).recoverTransactions();
 		await (coordinatedRepo as import('./repo/coordinator-repo.js').CoordinatorRepo).recoverTransactions();
+	}
+
+	// --- Churn-resilient spread: drive SpreadOnChurnMonitor on a live node ---
+	// Nothing previously activated the SENDING side of the churn-resilient spread protocol on a
+	// real node. Here we init + start the monitor and feed it the blocks this node physically
+	// holds, so a debounced connection:close re-pushes them to expansion-cohort peers (the
+	// receiver durably persists each push via saveReplicatedBlock).
+	const networkManager = (node as any).services?.networkManager as NetworkManagerService | undefined;
+	let spreadMonitor: SpreadOnChurnMonitor | undefined;
+	let offOwnedBlockFeed: (() => void) | undefined;
+	if (networkManager && (options.spreadOnChurn?.enabled ?? true) !== false) {
+		try {
+			spreadMonitor = networkManager.initSpreadOnChurnMonitor(
+				partitionDetector,
+				storageRepo,
+				keyNetwork,
+				options.clusterSize ?? 10,
+				protocolPrefix,
+				options.spreadOnChurn,
+			);
+			await spreadMonitor.start();
+			// Feed owned blocks: every block this node commits OR receives as a replica fires
+			// storageRepo.onAnyCollectionChange. Subscribe to storageRepo DIRECTLY (not
+			// node.blockChangeNotifier): the cohort-topic activation block below may replace
+			// blockChangeNotifier with a decorating bridge, but storageRepo keeps emitting on its
+			// own surface regardless of that opt-in. NOTE: blocks already durable from a previous
+			// run are NOT re-emitted on startup, so they are not tracked until next touched -
+			// acceptable here (churn re-replication re-derives over time); an initial-scan is a
+			// follow-on enhancement.
+			const monitor = spreadMonitor;
+			offOwnedBlockFeed = storageRepo.onAnyCollectionChange((e) => {
+				for (const blockId of e.blockIds) monitor.trackBlock(blockId);
+			});
+		} catch (err) {
+			// Spread is a resilience optimization, not a correctness requirement - a wiring
+			// failure (e.g. FRET briefly unavailable) must NOT hard-fail node startup, unlike the
+			// operator-opted-in cohortTopic block. Log and continue with spread inert.
+			((node as any).logger?.forComponent?.('db-p2p:spread-on-churn'))?.('init failed: %o', err);
+		}
+	}
+
+	// Expose for tests/diagnostics (mirrors node.keyNetwork / node.reputation).
+	(node as any).spreadOnChurnMonitor = spreadMonitor;
+
+	// Disposal: release the owned-block subscription + stop the monitor deterministically
+	// before the transports close. Composes with the arachnode / clusterMember / cohort-topic
+	// stop wrappers (each calls its captured previousStop last). Both steps are idempotent (the
+	// unsubscribe is flag-guarded; SpreadOnChurnMonitor.stop early-returns when not running), so
+	// a double node.stop() does not throw.
+	{
+		const previousStop = node.stop.bind(node);
+		node.stop = async () => {
+			try {
+				offOwnedBlockFeed?.();
+				if (spreadMonitor) await spreadMonitor.stop();
+			} finally {
+				await previousStop();
+			}
+		};
 	}
 
 	// Initialize Arachnode ring membership and restoration
