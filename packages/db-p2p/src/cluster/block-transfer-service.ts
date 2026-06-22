@@ -93,7 +93,14 @@ export class BlockTransferService implements Startable {
 	async start(): Promise<void> {
 		if (this.running) return;
 		await this.registrar.handle(this.protocol, async (data: any) => {
-			await this.handleRequest(data.stream);
+			// libp2p invokes the stream handler with the Stream as the FIRST positional argument
+			// (see cluster/repo/dispute services, which all use `(stream, connection)`). The block-
+			// transfer handler previously read `data.stream`, which is `undefined` for the positional
+			// shape — so `readRequest` ran `pipe(undefined, ...)` → "Empty pipeline", the receiver
+			// never replied, and every push/pull dialled this service hung with no response. Unwrap
+			// defensively (older shape passed `{ stream }`), mirroring sync/service.ts.
+			const stream = data?.stream ?? data;
+			await this.handleRequest(stream);
 		});
 		this.running = true;
 		log('started on %s', this.protocol);
@@ -107,28 +114,45 @@ export class BlockTransferService implements Startable {
 	}
 
 	private async handleRequest(stream: Stream): Promise<void> {
+		const self = this;
 		try {
-			const request = await this.readRequest(stream);
-			log('request type=%s blocks=%d reason=%s', request.type, request.blockIds.length, request.reason);
-
-			let response: BlockTransferResponse;
-			if (request.type === 'pull') {
-				response = await this.handlePull(request);
-			} else {
-				response = await this.handlePush(request);
+			// Read the request, process it, and write the response on ONE continuous duplex
+			// pipe (mirrors cluster/repo/dispute services). The earlier read-to-end-then-write
+			// design deadlocked over a real stream: the client sends one length-prefixed request
+			// and holds its write side open awaiting the reply, so a receiver that drained the
+			// source until end-of-stream blocked forever — and the reply, written only after
+			// teardown, hit a closed stream. Yielding the response as soon as the request is read
+			// keeps both sides live.
+			const responses = pipe(
+				stream,
+				(source) => lp.decode(source),
+				async function* (source) {
+					for await (const msg of source) {
+						const request = JSON.parse(u8ToString(msg.subarray(), 'utf8')) as BlockTransferRequest;
+						log('request type=%s blocks=%d reason=%s', request.type, request.blockIds.length, request.reason);
+						let response: BlockTransferResponse;
+						try {
+							response = request.type === 'pull'
+								? await self.handlePull(request)
+								: await self.handlePush(request);
+						} catch (error) {
+							log('error: %s', (error as Error).message);
+							response = { blocks: {}, missing: [] };
+						}
+						log('response blocks=%d missing=%d', Object.keys(response.blocks).length, response.missing.length);
+						yield u8FromString(JSON.stringify(response), 'utf8');
+						return; // one request → one response per stream
+					}
+				},
+				(source) => lp.encode(source)
+			);
+			for await (const chunk of responses) {
+				stream.send(chunk);
 			}
-
-			await this.sendResponse(stream, response);
-			log('response blocks=%d missing=%d', Object.keys(response.blocks).length, response.missing.length);
-		} catch (error) {
-			log('error: %s', (error as Error).message);
-			try {
-				await this.sendResponse(stream, { blocks: {}, missing: [] });
-			} catch {
-				// ignore send errors
-			}
-		} finally {
-			try { await stream.close(); } catch { /* ignore */ }
+			await stream.close();
+		} catch (err) {
+			log('error: %s', (err as Error).message);
+			try { stream.abort(err instanceof Error ? err : new Error(String(err))); } catch { /* ignore */ }
 		}
 	}
 
@@ -201,33 +225,6 @@ export class BlockTransferService implements Startable {
 		}
 
 		return { blocks, missing };
-	}
-
-	private async readRequest(stream: Stream): Promise<BlockTransferRequest> {
-		const messages: Uint8Array[] = [];
-		await pipe(
-			stream,
-			lp.decode,
-			async (source) => {
-				for await (const msg of source) {
-					messages.push(msg.subarray());
-				}
-			}
-		);
-
-		if (messages.length === 0) {
-			throw new Error('No request received');
-		}
-
-		return JSON.parse(u8ToString(messages[0]!, 'utf8')) as BlockTransferRequest;
-	}
-
-	private async sendResponse(stream: Stream, response: BlockTransferResponse): Promise<void> {
-		const bytes = u8FromString(JSON.stringify(response), 'utf8');
-		const encoded = pipe([bytes], lp.encode);
-		for await (const chunk of encoded) {
-			stream.send(chunk);
-		}
 	}
 }
 
