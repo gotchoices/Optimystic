@@ -23,6 +23,23 @@ export class DialTimeoutError extends Error {
 	}
 }
 
+/**
+ * Thrown when a peer dialed successfully but the response-read deadline expired
+ * before it wrote a reply (it connected, then went silent). Distinct from
+ * {@link DialTimeoutError} (never connected) and from a parent cancellation
+ * (`options.signal`), so callers/diagnostics can tell "peer went quiet" apart
+ * from "peer was unreachable" and "we cancelled". `.code === RESPONSE_TIMEOUT_ERROR_CODE`.
+ */
+export const RESPONSE_TIMEOUT_ERROR_CODE = 'RESPONSE_TIMEOUT';
+
+export class ResponseTimeoutError extends Error {
+	readonly code = RESPONSE_TIMEOUT_ERROR_CODE;
+	constructor(peer: string, protocol: string, ms: number) {
+		super(`response timeout: peer=${peer} protocol=${protocol} after ${ms}ms`);
+		this.name = 'ResponseTimeoutError';
+	}
+}
+
 /** Base class for clients that communicate via a libp2p protocol */
 export class ProtocolClient {
 	constructor(
@@ -33,7 +50,7 @@ export class ProtocolClient {
 	protected async processMessage<T>(
 		message: unknown,
 		protocol: string,
-		options?: { signal?: AbortSignal; correlationId?: string; dialTimeoutMs?: number }
+		options?: { signal?: AbortSignal; correlationId?: string; dialTimeoutMs?: number; responseTimeoutMs?: number }
 	): Promise<T> {
 		const peer = this.peerId.toString();
 		const cid = options?.correlationId;
@@ -90,7 +107,34 @@ export class ProtocolClient {
 		}
 		log('dial:ok peer=%s ms=%d%s', peer, Date.now() - t0, cid ? ` cid=${cid}` : '');
 
+		// Per-peer response deadline. The dial controller is already cleared once a
+		// stream is established, so a peer that connects but then never writes a frame
+		// (and never closes the stream) would hang the `first(...)` read below forever.
+		// Setting a timer alone is not enough — the underlying `for await` over the
+		// libp2p stream keeps awaiting regardless. The decisive action is to actively
+		// `stream.abort(...)`, which rejects the stream's async iterator and unblocks
+		// the read. A parent `options.signal` abort is forwarded the same way so a
+		// cancelled caller tears the stream down rather than leaking it. When neither
+		// `responseTimeoutMs` nor `signal` is supplied, no cap is imposed — preserving
+		// every existing caller (mirrors how omitting `dialTimeoutMs` imposes no dial cap).
+		const responseTimeoutMs = options?.responseTimeoutMs;
+		let responseTimer: ReturnType<typeof setTimeout> | undefined;
+		let responseTimeoutError: ResponseTimeoutError | undefined;
+		const onParentAbortResponse = () => {
+			try { stream.abort(options?.signal?.reason ?? new Error('aborted')); } catch { /* already torn down */ }
+		};
 		try {
+			if (responseTimeoutMs && responseTimeoutMs > 0) {
+				responseTimer = setTimeout(() => {
+					responseTimeoutError = new ResponseTimeoutError(peer, protocol, responseTimeoutMs);
+					try { stream.abort(responseTimeoutError); } catch { /* already torn down */ }
+				}, responseTimeoutMs);
+			}
+			if (options?.signal) {
+				if (options.signal.aborted) onParentAbortResponse();
+				else options.signal.addEventListener('abort', onParentAbortResponse, { once: true });
+			}
+
 			// Send the request using length-prefixed encoding
 			const encoded = pipe(
 				[new TextEncoder().encode(JSON.stringify(message))],
@@ -118,11 +162,28 @@ export class ProtocolClient {
 				}
 			) as AsyncIterable<T>;
 
-			const result = await first(() => source, () => { throw new Error('No response received') });
+			let result: T;
+			try {
+				result = await first(() => source, () => { throw new Error('No response received') });
+			} catch (err) {
+				// Aborting the stream (our timer or a parent abort) surfaces here as an
+				// iterator error. Translate it so callers see why the read ended.
+				if (responseTimeoutError) {
+					log('response:timeout peer=%s protocol=%s ms=%d%s', peer, protocol, Date.now() - t0, cid ? ` cid=${cid}` : '');
+					throw responseTimeoutError;
+				}
+				if (options?.signal?.aborted) {
+					throw options.signal.reason;
+				}
+				throw err;
+			}
 			log('response peer=%s protocol=%s ms=%d%s', peer, protocol, Date.now() - t0, cid ? ` cid=${cid}` : '');
 			return result;
 		} finally {
-			await stream.close();
+			if (responseTimer) clearTimeout(responseTimer);
+			if (options?.signal) options.signal.removeEventListener('abort', onParentAbortResponse);
+			// Closing an already-aborted stream must be safe.
+			try { await stream.close(); } catch { /* already torn down */ }
 		}
 	}
 }

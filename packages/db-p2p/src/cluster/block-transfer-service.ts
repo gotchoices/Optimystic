@@ -249,13 +249,21 @@ export class BlockTransferClient extends ProtocolClient {
 		this.protocol = buildBlockTransferProtocol(protocolPrefix);
 	}
 
-	/** Pull blocks from the remote peer. */
+	/**
+	 * Pull blocks from the remote peer.
+	 *
+	 * @param options Optional per-call deadlines/cancellation forwarded to the
+	 *   underlying request. `dialTimeoutMs` bounds connecting; `responseTimeoutMs`
+	 *   bounds waiting for the reply once connected; `signal` cancels the whole
+	 *   request. Omitting all of them preserves the previous uncapped behavior.
+	 */
 	async pullBlocks(
 		blockIds: string[],
-		reason: BlockTransferRequest['reason'] = 'rebalance'
+		reason: BlockTransferRequest['reason'] = 'rebalance',
+		options?: { signal?: AbortSignal; dialTimeoutMs?: number; responseTimeoutMs?: number }
 	): Promise<BlockTransferResponse> {
 		const request: BlockTransferRequest = { type: 'pull', blockIds, reason };
-		return await this.processMessage<BlockTransferResponse>(request, this.protocol);
+		return await this.processMessage<BlockTransferResponse>(request, this.protocol, options);
 	}
 
 	/**
@@ -264,18 +272,25 @@ export class BlockTransferClient extends ProtocolClient {
 	 * @param blockMeta Optional per-block source revision metadata (the sender's
 	 *   `state.latest`). When provided, the receiver replicates at the source's
 	 *   `(rev, actionId)`; when omitted, it falls back to a deterministic rev-1 replica.
+	 * @param options Optional per-call deadlines/cancellation forwarded to the
+	 *   underlying request. `dialTimeoutMs` bounds connecting; `responseTimeoutMs`
+	 *   bounds waiting for the reply once connected (so a peer that connects but goes
+	 *   silent throws {@link ResponseTimeoutError} instead of hanging); `signal`
+	 *   cancels the whole request. Omitting all of them preserves the previous
+	 *   uncapped behavior.
 	 */
 	async pushBlocks(
 		blockIds: string[],
 		blockDataBuffers: Uint8Array[],
 		reason: BlockTransferRequest['reason'] = 'rebalance',
-		blockMeta?: Record<string, { rev: number; actionId: ActionId }>
+		blockMeta?: Record<string, { rev: number; actionId: ActionId }>,
+		options?: { signal?: AbortSignal; dialTimeoutMs?: number; responseTimeoutMs?: number }
 	): Promise<BlockTransferResponse> {
 		const blockData: Record<string, string> = {};
 		for (let i = 0; i < blockIds.length; i++) {
 			blockData[blockIds[i]!] = Buffer.from(blockDataBuffers[i]!).toString('base64');
 		}
 		const request: BlockTransferRequest = { type: 'push', blockIds, reason, blockData, ...(blockMeta ? { blockMeta } : {}) };
-		return await this.processMessage<BlockTransferResponse>(request, this.protocol);
+		return await this.processMessage<BlockTransferResponse>(request, this.protocol, options);
 	}
 }

@@ -206,6 +206,50 @@ function createMockStream(missing: string[] = []) {
 	};
 }
 
+/**
+ * A stream that connects (dial resolves) but whose source never yields and never
+ * closes — a peer that accepts the connection then goes silent. `abort(err)` rejects
+ * the blocked read so the ProtocolClient response deadline can actually interrupt it
+ * (mirrors a real libp2p stream rejecting its async iterator on abort).
+ */
+function createSilentStream() {
+	let rejectRead: ((err?: Error) => void) | undefined;
+	return {
+		send: (_data: any) => {},
+		close: async () => {},
+		closeRead: () => {},
+		closeWrite: () => {},
+		abort: (err?: Error) => { rejectRead?.(err); },
+		reset: () => {},
+		id: 'silent-mock-stream',
+		direction: 'outbound' as const,
+		timeline: { open: Date.now() },
+		metadata: {},
+		status: 'open',
+		readStatus: 'ready',
+		writeStatus: 'ready',
+		log: { enabled: false, trace: () => {}, error: () => {} },
+		async *[Symbol.asyncIterator]() {
+			await new Promise<void>((_, reject) => { rejectRead = (err?: Error) => reject(err ?? new Error('aborted')); });
+		},
+	};
+}
+
+/**
+ * peerNetwork whose `silentTargets` dial OK but never reply (see createSilentStream);
+ * every other target replies normally. Lets a test assert the response deadline records
+ * a never-replying target as failed without stalling the sequential spread pass.
+ */
+function makeSilentPeerNetwork(pushCalls: PushCall[], silentTargets: Set<string>) {
+	return {
+		async connect(peerId: PeerId, protocol: string) {
+			const targetId = peerId.toString();
+			pushCalls.push({ peerId: targetId, protocol, blockIds: [], reason: 'replication' });
+			return silentTargets.has(targetId) ? createSilentStream() : createMockStream();
+		}
+	};
+}
+
 // --- Tests ---
 
 describe('SpreadOnChurnMonitor', () => {
@@ -470,6 +514,66 @@ describe('SpreadOnChurnMonitor', () => {
 
 			const event = await monitor.checkNow();
 			expect(event).to.be.null;
+		});
+	});
+
+	// ── Response deadline ────────────────────────────────────────────
+
+	describe('response deadline', () => {
+		it('records a target that dials OK but never replies as failed (bounded, no hang)', async function () {
+			// Tight mocha timeout so a regression (no response deadline) fails fast
+			// instead of hanging the whole sequential pass.
+			this.timeout(2000);
+			const selfStr = selfId.toString();
+			const peer4Str = peerId4.toString();
+
+			mockFret.setNeighborDistance(0);
+			mockFret.setCohort('*', [selfStr, peerId2.toString()]);
+			mockFret.setExpandResult('*', [selfStr, peerId2.toString(), peer4Str]);
+
+			// peer4 dials OK but never replies. With a short pushResponseTimeoutMs the push
+			// throws ResponseTimeoutError, which the spread loop's catch records as failed.
+			const monitor = makeMonitor(
+				{ peerNetwork: makeSilentPeerNetwork(pushCalls, new Set([peer4Str])) as any },
+				{ pushResponseTimeoutMs: 80 }
+			);
+			monitor.trackBlock('block-1');
+
+			const t0 = Date.now();
+			const event = await monitor.checkNow();
+			const elapsed = Date.now() - t0;
+
+			expect(event).to.not.be.null;
+			const entry = event!.spread[0]!;
+			expect(entry.targets, 'peer4 was targeted').to.include(peer4Str);
+			expect(entry.failed, 'silent peer recorded as failed').to.include(peer4Str);
+			expect(entry.succeeded, 'silent peer not counted as a replica holder').to.not.include(peer4Str);
+			// Bounded by the response deadline, not by the mocha timeout.
+			expect(elapsed).to.be.lessThan(1500);
+		});
+
+		it('a silent target does not block spreading to later targets', async function () {
+			this.timeout(2000);
+			const selfStr = selfId.toString();
+			const peer4Str = peerId4.toString();
+			const peer5Str = peerId5.toString();
+
+			mockFret.setNeighborDistance(0);
+			mockFret.setCohort('*', [selfStr, peerId2.toString()]);
+			// peer4 is silent (times out), peer5 replies normally and must still succeed.
+			mockFret.setExpandResult('*', [selfStr, peerId2.toString(), peer4Str, peer5Str]);
+
+			const monitor = makeMonitor(
+				{ peerNetwork: makeSilentPeerNetwork(pushCalls, new Set([peer4Str])) as any },
+				{ pushResponseTimeoutMs: 80 }
+			);
+			monitor.trackBlock('block-1');
+
+			const event = await monitor.checkNow();
+			expect(event).to.not.be.null;
+			const entry = event!.spread[0]!;
+			expect(entry.failed, 'silent peer4 failed').to.include(peer4Str);
+			expect(entry.succeeded, 'healthy peer5 still reached after the silent one').to.include(peer5Str);
 		});
 	});
 

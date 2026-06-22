@@ -3,12 +3,29 @@ import { generateKeyPair } from '@libp2p/crypto/keys';
 import { peerIdFromPrivateKey } from '@libp2p/peer-id';
 import type { PeerId, AbortOptions } from '@libp2p/interface';
 import type { IPeerNetwork, PeerId as CorePeerId } from '@optimystic/db-core';
-import { ProtocolClient, DialTimeoutError, DIAL_TIMEOUT_ERROR_CODE } from '../src/protocol-client.js';
+import { ProtocolClient, DialTimeoutError, DIAL_TIMEOUT_ERROR_CODE, ResponseTimeoutError, RESPONSE_TIMEOUT_ERROR_CODE } from '../src/protocol-client.js';
 
 class TestProtocolClient extends ProtocolClient {
-	async dial(message: unknown, protocol: string, options?: { signal?: AbortSignal; dialTimeoutMs?: number }) {
+	async dial(message: unknown, protocol: string, options?: { signal?: AbortSignal; dialTimeoutMs?: number; responseTimeoutMs?: number }) {
 		return this.processMessage<unknown>(message, protocol, options);
 	}
+}
+
+/**
+ * A stream that dials OK but whose source never yields and never closes. `abort(err)`
+ * ends the (never-fed) read so a deadline-driven `stream.abort(...)` can interrupt the
+ * otherwise-blocked read — exactly what a real libp2p stream does on abort.
+ */
+function silentStream() {
+	let endRead: ((err?: Error) => void) | undefined;
+	return {
+		send: () => {},
+		close: async () => {},
+		abort: (err?: Error) => { endRead?.(err); },
+		async *[Symbol.asyncIterator]() {
+			await new Promise<void>((_, reject) => { endRead = (err?: Error) => reject(err ?? new Error('aborted')); });
+		},
+	};
 }
 
 async function makePeerId(): Promise<PeerId> {
@@ -81,5 +98,77 @@ describe('ProtocolClient dial timeout', () => {
 		} catch (e) { caught = e; }
 		// Parent abort surfaces (not a dial-timeout) because the timer didn't fire.
 		expect(caught).to.equal(sentinel);
+	});
+});
+
+describe('ProtocolClient response timeout', () => {
+	it('throws ResponseTimeoutError when the dialed stream never yields', async () => {
+		const peerId = await makePeerId();
+		const network: IPeerNetwork = {
+			async connect() {
+				// Dial succeeds; the response-read phase is what must be bounded.
+				return silentStream() as any;
+			}
+		} as unknown as IPeerNetwork;
+
+		const client = new TestProtocolClient(peerId, network);
+		const t0 = Date.now();
+		let caught: unknown;
+		try {
+			await client.dial({ ping: true }, '/test/1.0.0', { responseTimeoutMs: 100 });
+		} catch (e) {
+			caught = e;
+		}
+		const elapsed = Date.now() - t0;
+		expect(caught).to.be.instanceOf(ResponseTimeoutError);
+		expect((caught as ResponseTimeoutError).code).to.equal(RESPONSE_TIMEOUT_ERROR_CODE);
+		expect(elapsed).to.be.lessThan(1000); // bounded by the deadline, not a hang
+	});
+
+	it('surfaces the parent reason (not a response-timeout) when the parent signal aborts the read', async () => {
+		const peerId = await makePeerId();
+		const network: IPeerNetwork = {
+			async connect() {
+				return silentStream() as any;
+			}
+		} as unknown as IPeerNetwork;
+
+		const client = new TestProtocolClient(peerId, network);
+		const parent = new AbortController();
+		const sentinel = new Error('parent aborted read');
+		setTimeout(() => parent.abort(sentinel), 30);
+		let caught: unknown;
+		try {
+			// No response timer (responseTimeoutMs omitted); only the parent signal can end the read.
+			await client.dial({ ping: true }, '/test/1.0.0', { signal: parent.signal });
+		} catch (e) {
+			caught = e;
+		}
+		expect(caught).to.equal(sentinel);
+	});
+
+	it('does not impose a response cap when neither responseTimeoutMs nor signal is supplied', async () => {
+		const peerId = await makePeerId();
+		// A stream that immediately ends its source (no frame) — first(...) hits onEmpty and
+		// throws 'No response received', proving no deadline machinery interfered.
+		const network: IPeerNetwork = {
+			async connect() {
+				return {
+					send: () => {},
+					close: async () => {},
+					abort: () => {},
+					[Symbol.asyncIterator]() { return { next: async () => ({ done: true, value: undefined }) }; },
+				} as any;
+			}
+		} as unknown as IPeerNetwork;
+		const client = new TestProtocolClient(peerId, network);
+		let caught: unknown;
+		try {
+			await client.dial({ ping: true }, '/test/1.0.0', {});
+		} catch (e) {
+			caught = e;
+		}
+		expect(caught).to.be.instanceOf(Error);
+		expect((caught as Error).message).to.equal('No response received');
 	});
 });

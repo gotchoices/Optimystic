@@ -25,6 +25,19 @@ export interface SpreadOnChurnConfig {
 	departureDebounceMs: number
 	/** Number of peers beyond cluster boundary to target. Default: 4 */
 	expansionStep: number
+	/**
+	 * Per-target dial deadline (ms) for churn pushes. A target that never accepts
+	 * the connection fails fast instead of stalling the sequential spread pass.
+	 * Default: 3000 (matches the codebase's other dial caps).
+	 */
+	pushDialTimeoutMs: number
+	/**
+	 * Per-target response deadline (ms) for churn pushes. A target that dials OK but
+	 * never replies (connects, then goes silent) is given up on — the push throws
+	 * `ResponseTimeoutError`, is recorded as failed, and the loop continues to the
+	 * next target/block rather than hanging the whole pass. Default: 10000.
+	 */
+	pushResponseTimeoutMs: number
 }
 
 export interface SpreadOnChurnDeps {
@@ -62,6 +75,8 @@ const DEFAULT_CONFIG: SpreadOnChurnConfig = {
 	healthThreshold: 0.6,
 	departureDebounceMs: 5000,
 	expansionStep: 4,
+	pushDialTimeoutMs: 3000,
+	pushResponseTimeoutMs: 10000,
 }
 
 // ── Monitor ──────────────────────────────────────────────────────────
@@ -227,7 +242,14 @@ export class SpreadOnChurnMonitor implements Startable {
 						this.deps.peerNetwork,
 						this.deps.protocolPrefix
 					)
-					const response = await client.pushBlocks([blockId], [blockData], 'replication', blockMeta)
+					// Bound both the dial and the response read. A target that connects but
+					// never replies would otherwise hang this sequential loop forever during
+					// churn (exactly when slow/dying peers are common); the deadline makes the
+					// push throw, which the catch below records as `failed` so the pass advances.
+					const response = await client.pushBlocks([blockId], [blockData], 'replication', blockMeta, {
+						dialTimeoutMs: this.config.pushDialTimeoutMs,
+						responseTimeoutMs: this.config.pushResponseTimeoutMs,
+					})
 					// A round-trip that does not throw still does not mean the replica
 					// landed: handlePush reports a block in `missing` when it could not
 					// parse or persist it. Treat that as a failed push so the resilience
