@@ -313,7 +313,15 @@ export class ReactivityMesh {
 			// throws `CohortBackoffError` — a pure load-induced harness flake. The wall-clock freshness
 			// defense is meaningless here (same posture as the disabled rate limiter above), so make the
 			// window effectively unbounded so test-induced stalls never read as stale/future replays.
-			antiDos: { rateLimiter: { ratePerWindow: 1_000_000 }, replayGuard: { maxAgeMs: 86_400_000, maxFutureSkewMs: 86_400_000 } },
+			// Disable the cold-start proof-of-work cost. Reactivity subscribers register at tier T3, so the
+			// participant-side bootstrap-evidence builder mints a PoW puzzle (default 20 bits ≈ 1 M hashes) on
+			// *every* register/re-probe — by far the dominant cost in this mesh (a 6-subscriber promotion test
+			// burns ~60-100 s almost entirely in `randomFillSync`/SHA-256 minting nonces). The cohort's
+			// bootstrap-evidence policy is unconfigured here, so the evidence is never even required; minting it
+			// is pure wasted work. `bits: 0` solves on the first nonce (the documented test escape hatch in
+			// `meetsDifficulty`) — same posture as the neutralized rate limiter / replay guard above, and it
+			// removes the timing-sensitivity that tips these tests into a timeout under full-suite load.
+			antiDos: { rateLimiter: { ratePerWindow: 1_000_000 }, replayGuard: { maxAgeMs: 86_400_000, maxFutureSkewMs: 86_400_000 }, powDifficultyBits: 0 },
 			...(opts.profiles === undefined ? {} : { profiles: opts.profiles }),
 		};
 		const mesh = await buildMesh(members, meshOpts);

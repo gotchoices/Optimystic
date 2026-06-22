@@ -186,7 +186,14 @@ export class MatchmakingMesh {
 			// 4/min would rate-limit repeated probes from one node. Leaving `bootstrapEvidence`/`reputation`
 			// unset keeps cold-root instantiation permissive (the policy is "configured" only when one of
 			// those is supplied — see `createBootstrapEvidencePolicy`).
-			antiDos: { rateLimiter: { ratePerWindow: 1_000_000 } },
+			//
+			// `powDifficultyBits: 0` disables the cold-start proof-of-work cost. Providers/seekers register at
+			// the matchmaking tier (≥ T2), so the participant-side bootstrap-evidence builder otherwise mints a
+			// PoW puzzle (default 20 bits ≈ 1 M hashes) on every register/re-probe — the dominant cost in this
+			// mesh under full-suite load (~25-30 s sweep/walk cases run right at the mocha ceiling). Since the
+			// cohort policy is unconfigured (above) the evidence is never required, so minting it is pure waste;
+			// `bits: 0` solves on the first nonce (the documented test escape hatch in `meetsDifficulty`).
+			antiDos: { rateLimiter: { ratePerWindow: 1_000_000 }, powDifficultyBits: 0 },
 			...(opts.profiles === undefined ? {} : { profiles: opts.profiles }),
 		};
 		const mesh = await buildMesh(members, meshOpts);
