@@ -1,6 +1,6 @@
 {
   "name": "@optimystic/db-p2p-storage-web",
-  "version": "0.13.5",
+  "version": "0.14.0",
   "type": "module",
   "description": "Browser IndexedDB storage backend for @optimystic/db-p2p",
   "main": "dist/src/index.js",
