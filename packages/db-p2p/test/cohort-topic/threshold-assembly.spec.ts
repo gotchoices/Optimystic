@@ -10,6 +10,7 @@ import {
 	RingHash,
 	bytesToB64url,
 	b64urlToBytes,
+	compareBytes,
 	membershipCertSignable,
 	membershipCertSigningPayload,
 	promotionNoticeSigningPayload,
@@ -139,9 +140,13 @@ describe('cohort-topic: real k − x threshold-signature assembly', () => {
 		expect(thresholdSig.length, 'blob is signers.length × 64 bytes').to.equal(signers.length * ED25519_SIG_BYTES);
 		// Self is always one of the signers (the acting member).
 		expect(signers.some((s) => bytesToB64url(s) === bytesToB64url(members[0]!.bytes)), 'self is included').to.equal(true);
-		// Signers are deterministically ordered (ascending) so the blob is reproducible.
+		// Signers are deterministically ordered (ascending by canonical raw-byte order — the same
+		// `compareBytes` the assembler uses to align signers[i] ↔ chunk i) so the blob is reproducible.
+		// NOTE: compare against the raw-byte sort, NOT a base64url-string `.sort()` — base64url character
+		// ordering does not match raw-byte ordering, so a string sort disagrees on ~0.8% of random key sets.
 		const ordered = [...signers].map(bytesToB64url);
-		expect(ordered, 'signers are ascending').to.deep.equal([...ordered].sort());
+		const canonical = [...signers].sort(compareBytes).map(bytesToB64url);
+		expect(ordered, 'signers are ascending (canonical raw-byte order)').to.deep.equal(canonical);
 
 		expect(crypto.verify(PAYLOAD, thresholdSig, signers), 'crypto.verify accepts the real multisig').to.equal(true);
 		expect(verifyCollectedMultisig(PAYLOAD, thresholdSig, signers), 'pure verify accepts it').to.equal(true);
