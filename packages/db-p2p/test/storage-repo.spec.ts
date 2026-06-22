@@ -1025,6 +1025,45 @@ describe('StorageRepo', () => {
 			expect(events.length).to.equal(0);
 		});
 
+		it('replica advancing over an older held rev fires a second event', async () => {
+			// The churn scenario: a node already holds an older replica when a newer one lands.
+			// Exercises the advanced-over-defined-prior branch (priorLatest !== undefined && effective.rev > priorLatest.rev).
+			const events: CollectionChangeEvent[] = [];
+			repo.onCollectionChange('collection-1' as BlockId, (e) => events.push(e));
+
+			await repo.saveReplicatedBlock('block-1' as BlockId, makeBlock('block-1'),
+				{ actionId: 'a3' as ActionId, rev: 3 });
+			expect(events.length).to.equal(1);
+			expect(events[0]!.rev).to.equal(3);
+
+			// Newer rev lands over the held one — advances, so fires again.
+			await repo.saveReplicatedBlock('block-1' as BlockId, makeBlock('block-1'),
+				{ actionId: 'a5' as ActionId, rev: 5 });
+			expect(events.length).to.equal(2);
+			expect(events[1]!.actionId).to.equal('a5');
+			expect(events[1]!.rev).to.equal(5);
+			expect(events[1]!.tailId).to.equal(undefined);
+		});
+
+		it('source-less replica uses hash-fallback actionId and stays idempotent', async () => {
+			// No ActionRev carried: saveReplica defaults rev=1 and derives a deterministic
+			// hash actionId. First push fires once at rev 1; an identical re-push is a no-op.
+			const events: CollectionChangeEvent[] = [];
+			repo.onCollectionChange('collection-1' as BlockId, (e) => events.push(e));
+
+			await repo.saveReplicatedBlock('block-1' as BlockId, makeBlock('block-1'));
+			expect(events.length).to.equal(1);
+			expect(events[0]!.rev).to.equal(1);
+			expect(events[0]!.tailId).to.equal(undefined);
+			// Deterministic fallback id (not nil) so re-push resolves identically.
+			expect(events[0]!.actionId).to.be.a('string');
+			const fallbackActionId = events[0]!.actionId;
+
+			await repo.saveReplicatedBlock('block-1' as BlockId, makeBlock('block-1'));
+			expect(events.length).to.equal(1);
+			expect(fallbackActionId).to.not.equal(undefined);
+		});
+
 		it('catch-all feed also receives the fresh-replica event exactly once', async () => {
 			const anyEvents: CollectionChangeEvent[] = [];
 			repo.onAnyCollectionChange((e) => anyEvents.push(e));
