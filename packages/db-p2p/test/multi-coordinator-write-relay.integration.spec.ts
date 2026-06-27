@@ -122,7 +122,6 @@ describe('Multi-coordinator write over a relay (limited inter-coordinator stream
 		// the old precondition bimodally `this.skip()`. The keyspace search loop below
 		// already handles per-probe cohort-membership variance by trying many block ids.
 		const fretOf = (n: Libp2p): {
-			assembleCohort(coord: Uint8Array, wants: number): string[];
 			exportTable(): { entries: Array<{ id: string }> };
 		} => (n as any).services.fret;
 		const stabilized = await waitFor(() => {
