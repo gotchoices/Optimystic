@@ -116,31 +116,61 @@ describe('Multi-coordinator write over a relay (limited inter-coordinator stream
 			}
 			return true;
 		}, 40_000, 500);
-		// KNOWN HARNESS GAP (implement TODO): FRET cohort assembly between two
-		// relay-only ("browser-shaped") peers does not reliably converge in-process
-		// within the timeout, so the actual 2-of-2-over-relay write below is not yet
-		// exercised. Skip rather than red-fail until the relay-FRET bring-up is sorted
-		// (see the implement ticket's "Phase 1 — finish the relay reproduction"). The
-		// direct-TCP sibling spec already proves the non-relay path works.
+		// FRET converges here TRANSITIVELY through the relay: A↔relay and B↔relay are
+		// direct (WS) connections over which FRET neighbor gossip flows, so A learns B's
+		// coordinate (and vice-versa) even though the A↔B link itself is relay-only. The
+		// direct A↔B FRET exchange does NOT happen — `p2p-fret`'s wire RPCs open streams
+		// without `runOnLimitedConnection: true`, so they cannot run over the limited A↔B
+		// connection (see fix/p2p-fret-rpc-over-limited-connection) — but the relay, being
+		// a full FRET participant directly connected to both, relays the routing state and
+		// `assembleCohort` ends up ranking both. If FRET does not stabilize within budget,
+		// skip rather than red-fail (the DETERMINISTIC specs are the authoritative guard:
+		// cluster-coordinator-promise-retry.spec.ts + libp2p-key-network.spec.ts
+		// "prefers a DIRECT connection").
 		if (!stabilized) {
 			this.skip();
 			return;
 		}
 
-		const blockId = 'mcw-relay-block';
-		const aCohort = Object.keys(await (a as any).keyNetwork.findCluster(new TextEncoder().encode(blockId)));
-		expect(aCohort.length, "A's cohort for the block has both coordinators").to.equal(2);
+		// The relay node is itself in the FRET keyspace, so a block's cohort is drawn
+		// from {A, B, relay}. Find a block whose cohort (from A) actually includes B, so
+		// collecting B's promise genuinely crosses the relayed (limited) A↔B connection
+		// (A↔relay is direct). Peer ids are random per run, so which keyspace places B in
+		// the cohort varies — probe a handful of block ids and take the first that does.
+		const bId = b!.peerId.toString();
+		let blockId: string | undefined;
+		let aCohort: string[] = [];
+		for (let i = 0; i < 24; i++) {
+			const candidate = `mcw-relay-block-${i}`;
+			const cohort = Object.keys(await (a as any).keyNetwork.findCluster(new TextEncoder().encode(candidate)));
+			if (cohort.length > 1 && cohort.includes(bId)) {
+				blockId = candidate;
+				aCohort = cohort;
+				break;
+			}
+		}
+		// No probed keyspace placed the relay-only coordinator B in A's cohort — the
+		// relayed inter-coordinator promise wouldn't be exercised, so there is nothing
+		// for this spec to assert. Skip rather than assert a vacuous all-direct write.
+		if (!blockId) {
+			this.skip();
+			return;
+		}
+		expect(aCohort.length, "A's cohort spans multiple coordinators").to.be.greaterThan(1);
+		expect(aCohort, "A's cohort includes the relay-only coordinator B").to.include(bId);
 
 		const aRepo = (a as any).coordinatedRepo as IRepo;
 
-		// THE REPRODUCER: the coordinator must collect B's promise over the relayed
-		// (limited) connection. On the buggy build this fails the super-majority check.
+		// THE REPRODUCER SURFACE: the coordinator must collect B's promise over the
+		// relayed (limited) connection. With the fix (connect() prefer-direct +
+		// collectPromises immediate-retry) the relayed promise is collected and the write
+		// reaches super-majority.
 		const pendResult = await aRepo.pend({
 			actionId: 'mcw-relay-a1',
 			transforms: makeTransforms(blockId),
 			policy: 'c'
 		});
-		expect(pendResult.success, 'A.pend reaches 2-of-2 super-majority across the relay').to.equal(true);
+		expect(pendResult.success, "A.pend reaches super-majority with B's promise crossing the relay").to.equal(true);
 
 		const commitResult = await aRepo.commit({
 			actionId: 'mcw-relay-a1',

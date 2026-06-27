@@ -100,6 +100,7 @@ export class CoordinatorRepo implements IRepo {
 			commitBroadcastRetryMaxIntervalMs: cfg?.commitBroadcastRetryMaxIntervalMs ?? 8000,
 			commitBroadcastRetryMaxAttempts: cfg?.commitBroadcastRetryMaxAttempts ?? 5,
 			commitBroadcastImmediateRetries: cfg?.commitBroadcastImmediateRetries ?? 1,
+			promiseImmediateRetries: cfg?.promiseImmediateRetries ?? 1,
 			readRepairMode: cfg?.readRepairMode ?? 'lazy',
 			readRepairWindowMs: cfg?.readRepairWindowMs ?? 10000,
 			readRepairSampleRate: cfg?.readRepairSampleRate ?? 0

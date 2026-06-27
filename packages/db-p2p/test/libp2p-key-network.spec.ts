@@ -523,6 +523,85 @@ describe('Libp2pKeyPeerNetwork', () => {
 			expect(dialOpts.runOnLimitedConnection).to.equal(true);
 		});
 
+		it('prefers a DIRECT connection over a limited (circuit-relay) one', async () => {
+			const calls: string[] = [];
+			// Listed first so a naive `find(open)` would pick the relayed connection.
+			const limitedConn = {
+				status: 'open',
+				limits: { bytes: 128n * 1024n },
+				remoteAddr: { toString: () => '/ip4/1.2.3.4/tcp/4001/p2p/QmRelay/p2p-circuit' },
+				newStream: (_protocols: string[], _opts?: any) => {
+					calls.push('limited');
+					return Promise.resolve({ id: 'limited-stream' } as unknown);
+				}
+			} as unknown as Connection;
+			const directConn = {
+				status: 'open',
+				remoteAddr: { toString: () => '/ip4/5.6.7.8/tcp/4002' },
+				newStream: (_protocols: string[], _opts?: any) => {
+					calls.push('direct');
+					return Promise.resolve(FAKE_STREAM);
+				}
+			} as unknown as Connection;
+
+			const libp2p = createLibp2pWithConnect({ connections: [limitedConn, directConn] });
+			const network = new Libp2pKeyPeerNetwork(libp2p, 16, undefined, 'forming');
+			const otherPeerId = await makePeerId();
+
+			const stream = await network.connect(otherPeerId, PROTOCOL);
+			expect(stream).to.equal(FAKE_STREAM);
+			expect(calls).to.deep.equal(['direct']);
+		});
+
+		it('detects a limited connection by /p2p-circuit addr even without a `limits` field', async () => {
+			const calls: string[] = [];
+			const circuitConn = {
+				status: 'open',
+				remoteAddr: { toString: () => '/ip4/1.2.3.4/tcp/4001/p2p/QmRelay/p2p-circuit/p2p/QmTarget' },
+				newStream: (_protocols: string[], _opts?: any) => {
+					calls.push('circuit');
+					return Promise.resolve({ id: 'circuit-stream' } as unknown);
+				}
+			} as unknown as Connection;
+			const directConn = {
+				status: 'open',
+				remoteAddr: { toString: () => '/ip4/5.6.7.8/tcp/4002/p2p/QmTarget' },
+				newStream: (_protocols: string[], _opts?: any) => {
+					calls.push('direct');
+					return Promise.resolve(FAKE_STREAM);
+				}
+			} as unknown as Connection;
+
+			const libp2p = createLibp2pWithConnect({ connections: [circuitConn, directConn] });
+			const network = new Libp2pKeyPeerNetwork(libp2p, 16, undefined, 'forming');
+			const otherPeerId = await makePeerId();
+
+			const stream = await network.connect(otherPeerId, PROTOCOL);
+			expect(stream).to.equal(FAKE_STREAM);
+			expect(calls).to.deep.equal(['direct']);
+		});
+
+		it('falls back to the limited connection when it is the only open path', async () => {
+			let observedOpts: any = undefined;
+			const limitedOnly = {
+				status: 'open',
+				limits: { bytes: 128n * 1024n },
+				remoteAddr: { toString: () => '/ip4/1.2.3.4/tcp/4001/p2p/QmRelay/p2p-circuit' },
+				newStream: (_protocols: string[], opts?: any) => {
+					observedOpts = opts;
+					return Promise.resolve(FAKE_STREAM);
+				}
+			} as unknown as Connection;
+
+			const libp2p = createLibp2pWithConnect({ connections: [limitedOnly] });
+			const network = new Libp2pKeyPeerNetwork(libp2p, 16, undefined, 'forming');
+			const otherPeerId = await makePeerId();
+
+			const stream = await network.connect(otherPeerId, PROTOCOL);
+			expect(stream).to.equal(FAKE_STREAM);
+			expect(observedOpts?.runOnLimitedConnection).to.equal(true);
+		});
+
 		it('forwards the caller AbortSignal on the reuse path', async () => {
 			let observedSignal: AbortSignal | undefined;
 			const mockConn = {

@@ -42,6 +42,7 @@ export class ClusterCoordinator {
 	private readonly retryMaxIntervalMs: number;
 	private readonly retryMaxAttempts: number;
 	private readonly commitBroadcastImmediateRetries: number;
+	private readonly promiseImmediateRetries: number;
 
 	constructor(
 		private readonly keyNetwork: IKeyNetwork,
@@ -61,6 +62,44 @@ export class ClusterCoordinator {
 		this.retryMaxIntervalMs = cfg.commitBroadcastRetryMaxIntervalMs ?? 8000;
 		this.retryMaxAttempts = cfg.commitBroadcastRetryMaxAttempts ?? 5;
 		this.commitBroadcastImmediateRetries = cfg.commitBroadcastImmediateRetries ?? 1;
+		this.promiseImmediateRetries = cfg.promiseImmediateRetries ?? 1;
+	}
+
+	/**
+	 * Invoke one cluster member's `update`, retrying transient REMOTE failures up to
+	 * `immediateRetries` times before surfacing the error. The local cluster is invoked
+	 * exactly once — a local throw is a real fault (validation / merge / consensus), not a
+	 * transient transport blip. A remote call rides a libp2p stream that a circuit-relay
+	 * ("limited") connection can reset once a per-circuit cap or reservation lapses, which
+	 * surfaces as a StreamResetError; an immediate retry on the (usually still-warm)
+	 * connection recovers most of those without escalating the peer to a failure. Shared by
+	 * the promise-collection, commit-collection, and commit-broadcast phases so all three
+	 * react to a relayed reset the same way.
+	 */
+	private async updateMember(peerIdStr: string, record: ClusterRecord, immediateRetries: number, phase: string): Promise<ClusterRecord> {
+		const isLocal = this.localCluster && peerIdStr === this.localCluster.peerId.toString();
+		if (isLocal) {
+			return await this.localCluster!.update(record);
+		}
+		const maxAttempts = 1 + Math.max(0, immediateRetries);
+		let lastError: unknown;
+		for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+			try {
+				return await this.createClusterClient(peerIdFromString(peerIdStr)).update(record);
+			} catch (err) {
+				lastError = err;
+				if (attempt < maxAttempts) {
+					log('cluster-tx:member-update-retry', {
+						messageHash: record.messageHash,
+						peerId: peerIdStr,
+						phase,
+						attempt,
+						error: err instanceof Error ? err.message : String(err)
+					});
+				}
+			}
+		}
+		throw lastError;
 	}
 
 	/**
@@ -353,14 +392,15 @@ export class ClusterCoordinator {
 			}));
 			log('cluster-tx:promise-peers', { messageHash: record.messageHash, peers: peerDetail });
 		}
-		// For each peer, create a client and request a promise
+		// For each peer, create a client and request a promise. A remote promise rides
+		// a libp2p stream that a relayed (limited) connection can reset transiently, so
+		// each remote request gets `promiseImmediateRetries` in-line re-attempts before
+		// it counts as a failure — without this a single relayed reset drops the peer and
+		// sinks super-majority (the commit broadcast already has the same guard).
 		const promiseRequests = peerIds.map(peerIdStr => {
 			const isLocal = this.localCluster && peerIdStr === this.localCluster.peerId.toString();
 			log('cluster-tx:promise-request', { messageHash: record.messageHash, peerId: peerIdStr, isLocal });
-			const promise = isLocal
-				? this.localCluster!.update(record)
-				: this.createClusterClient(peerIdFromString(peerIdStr)).update(record);
-			return new Pending(promise);
+			return new Pending(this.updateMember(peerIdStr, record, this.promiseImmediateRetries, 'promise'));
 		});
 
 		// Wait for all promises to complete
@@ -455,6 +495,10 @@ export class ClusterCoordinator {
 		const commitPayload = {
 			...record
 		};
+		// No per-peer immediate retry here: a commit-collection failure is recovered
+		// downstream by broadcastMergedRecord's in-line retry and the scheduled
+		// commit-retry timer. (The promise phase has no such backstop, which is why
+		// collectPromises gets the immediate retry instead.)
 		const commitRequests = peerIds.map(peerIdStr => {
 			const isLocal = this.localCluster && peerIdStr === this.localCluster.peerId.toString();
 			log('cluster-tx:commit-request', { messageHash: record.messageHash, peerId: peerIdStr, isLocal });
@@ -560,46 +604,18 @@ export class ClusterCoordinator {
 	 * Local cluster is invoked exactly once — local failures are fatal, not transient.
 	 */
 	private async broadcastMergedRecord(record: ClusterRecord, peerIds: string[]): Promise<{ failures: string[] }> {
-		const maxAttempts = 1 + Math.max(0, this.commitBroadcastImmediateRetries);
 		const results = await Promise.all(peerIds.map(async peerIdStr => {
-			const isLocal = this.localCluster && peerIdStr === this.localCluster.peerId.toString();
-			if (isLocal) {
-				try {
-					await this.localCluster!.update(record);
-					return { peerId: peerIdStr, success: true as const };
-				} catch (err) {
-					log('cluster-tx:consensus-broadcast-error', {
-						messageHash: record.messageHash,
-						peerId: peerIdStr,
-						error: (err as Error).message
-					});
-					return { peerId: peerIdStr, success: false as const };
-				}
+			try {
+				await this.updateMember(peerIdStr, record, this.commitBroadcastImmediateRetries, 'commit-broadcast');
+				return { peerId: peerIdStr, success: true as const };
+			} catch (err) {
+				log('cluster-tx:consensus-broadcast-error', {
+					messageHash: record.messageHash,
+					peerId: peerIdStr,
+					error: err instanceof Error ? err.message : String(err)
+				});
+				return { peerId: peerIdStr, success: false as const };
 			}
-			let lastError: unknown;
-			for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-				try {
-					await this.createClusterClient(peerIdFromString(peerIdStr)).update(record);
-					return { peerId: peerIdStr, success: true as const };
-				} catch (err) {
-					lastError = err;
-					if (attempt < maxAttempts) {
-						log('cluster-tx:consensus-broadcast-retry', {
-							messageHash: record.messageHash,
-							peerId: peerIdStr,
-							attempt,
-							error: (err as Error).message
-						});
-					}
-				}
-			}
-			log('cluster-tx:consensus-broadcast-error', {
-				messageHash: record.messageHash,
-				peerId: peerIdStr,
-				attempts: maxAttempts,
-				error: lastError instanceof Error ? lastError.message : String(lastError)
-			});
-			return { peerId: peerIdStr, success: false as const };
 		}));
 		const failures = results.filter(r => !r.success).map(r => r.peerId);
 		return { failures };

@@ -77,6 +77,15 @@ export interface ClusterConsensusConfig {
 	commitBroadcastRetryMaxAttempts?: number;
 	/** Immediate in-line retries per failed peer inside the broadcast (default 1) */
 	commitBroadcastImmediateRetries?: number;
+	/**
+	 * Immediate in-line retries per peer while collecting promises (default 1).
+	 * The promise phase rides the same libp2p stream the commit broadcast does;
+	 * a circuit-relay ("limited") connection can reset that stream once a
+	 * per-circuit cap is hit, surfacing to the coordinator as a StreamResetError.
+	 * Unlike the commit broadcast there is no follow-up scheduled retry, so a
+	 * single reset here would otherwise drop the peer and sink super-majority.
+	 */
+	promiseImmediateRetries?: number;
 	/** Read-repair behavior: 'off' (only fetch on missing — legacy), 'lazy' (fetch when local age > window), 'paranoid' (always verify against cluster on read). Default 'lazy'. */
 	readRepairMode?: 'off' | 'lazy' | 'paranoid';
 	/** For 'lazy' mode: read-repair triggers when (now - localEntry.lastSeenCommitMs) > this. Default 10000. */

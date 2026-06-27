@@ -1,4 +1,4 @@
-import type { AbortOptions, Libp2p, PeerId, Stream } from "@libp2p/interface";
+import type { AbortOptions, Connection, Libp2p, PeerId, Stream } from "@libp2p/interface";
 import { toString as u8ToString } from 'uint8arrays'
 import type { ClusterPeers, FindCoordinatorOptions, IKeyNetwork, IPeerNetwork } from "@optimystic/db-core";
 import { peerIdFromString } from '@libp2p/peer-id'
@@ -291,17 +291,39 @@ export class Libp2pKeyPeerNetwork implements IKeyNetwork, IPeerNetwork {
 		return undefined
 	}
 
+	/**
+	 * True for a circuit-relay ("limited") connection. libp2p stamps a relayed
+	 * connection with `limits` (per-circuit data/duration caps); we additionally
+	 * sniff the multiaddr for `/p2p-circuit` as a fallback for transports/versions
+	 * that don't populate `limits`.
+	 */
+	private isLimitedConnection(c: Connection): boolean {
+		if ((c as { limits?: unknown }).limits != null) return true
+		const addr = c.remoteAddr?.toString?.()
+		return addr != null && addr.includes('/p2p-circuit')
+	}
+
 	connect(peerId: PeerId, protocol: string, options?: AbortOptions): Promise<Stream> {
 		const conns = this.libp2p.getConnections?.(peerId) ?? []
 		// Filter to only-open connections so a closing/closed entry that libp2p
 		// hasn't yet evicted from its index doesn't get picked up here.
-		const open = conns.find(c => c?.status === 'open' && typeof c?.newStream === 'function')
-		if (open) {
+		const open = conns.filter(c => c?.status === 'open' && typeof c?.newStream === 'function')
+		// Prefer a DIRECT connection over a limited (circuit-relay) one for the RPC.
+		// A relayed/limited connection can be reset by the relay once a per-circuit
+		// cap or reservation lapses (@libp2p/circuit-relay-v2), surfacing to the
+		// coordinator as a StreamResetError that fails consensus. After DCUtR upgrades
+		// a relayed link to direct, both connections briefly coexist — picking the
+		// direct one avoids riding the soon-to-be-reset circuit. We only fall back to
+		// the limited connection (with runOnLimitedConnection) when it is the only open
+		// path — the steady state for browsers and NATed peers before any upgrade.
+		const chosen = open.find(c => !this.isLimitedConnection(c)) ?? open[0]
+		if (chosen) {
 			// runOnLimitedConnection: true is required to open a stream over a
 			// circuit-relay (limited) connection — the steady-state path for
 			// browsers and NATed peers. Without it, the warm relay connection
-			// from a prior dialProtocol cannot be reused on subsequent RPCs.
-			return open.newStream([protocol], {
+			// from a prior dialProtocol cannot be reused on subsequent RPCs. It is
+			// a harmless no-op on the preferred direct connection.
+			return chosen.newStream([protocol], {
 				signal: options?.signal,
 				runOnLimitedConnection: true,
 				negotiateFully: false
