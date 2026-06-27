@@ -22,6 +22,7 @@ const makePeerId = async (): Promise<PeerId> => {
 function createMockLibp2p(peerId: PeerId, options?: {
 	connections?: Connection[];
 	fret?: any;
+	peerStore?: any;
 }): Libp2p {
 	const listeners: Map<string, Set<Function>> = new Map();
 	return {
@@ -33,6 +34,7 @@ function createMockLibp2p(peerId: PeerId, options?: {
 			listeners.get(event)!.add(handler);
 		},
 		removeEventListener: () => {},
+		...(options?.peerStore ? { peerStore: options.peerStore } : {}),
 		services: {
 			fret: options?.fret
 		}
@@ -676,6 +678,167 @@ describe('Libp2pKeyPeerNetwork', () => {
 			expect(cluster[knownButDisconnected.toString()]!.multiaddrs).to.deep.equal([
 				disconnectedMa.toString()
 			]);
+		});
+	});
+
+	// --- Cross-network coordinator/cohort scoping ---------------------------------
+	// When two networks share physical nodes/bootstraps, a network-B peer can land in
+	// network-A's peerStore but its network-namespaced identify never completes, so its
+	// protocol list stays empty ('unknown') forever — whereas a same-network peer's list
+	// contains `${prefix}/cluster|repo/1.0.0` ('serves'). Selection must prefer 'serves',
+	// never pick 'foreign', and only fall back to 'unknown' when nothing serving exists.
+	describe('network-membership scoping (protocolPrefix)', () => {
+		const PREFIX = '/optimystic/netA';
+		const servesProto = (prefix: string): string[] => [`${prefix}/cluster/1.0.0`, `${prefix}/repo/1.0.0`];
+
+		function connTo(peerId: PeerId): Connection {
+			return {
+				remotePeer: peerId,
+				status: 'open',
+				remoteAddr: { toString: () => `/ip4/10.0.0.1/tcp/4001/p2p/${peerId.toString()}` }
+			} as unknown as Connection;
+		}
+
+		function peerStoreOf(entries: Record<string, { protocols?: string[]; addresses?: string[] }>): any {
+			return {
+				all: async () => [],
+				get: async (pid: { toString(): string }) => {
+					const e = entries[pid.toString()];
+					return {
+						protocols: e?.protocols ?? [],
+						addresses: (e?.addresses ?? []).map(a => ({ multiaddr: multiaddr(a) }))
+					};
+				}
+			};
+		}
+
+		const baseFret = (extra: Record<string, unknown>): any => ({
+			getNetworkSizeEstimate: () => ({ size_estimate: 5, confidence: 0.5 }),
+			detectPartition: () => false,
+			exportTable: () => undefined,
+			getNeighbors: () => [],
+			assembleCohort: () => [],
+			...extra
+		});
+
+		it('findCoordinator never returns a cross-network peer when a same-network peer is available', async () => {
+			const sameNet = await makePeerId();
+			const crossNet = await makePeerId();
+			// cross-network listed FIRST so a naive pick would choose it
+			const fret = baseFret({ getNeighbors: () => [crossNet.toString(), sameNet.toString()] });
+			const peerStore = peerStoreOf({
+				[sameNet.toString()]: { protocols: servesProto(PREFIX) },
+				[crossNet.toString()]: { protocols: [] } // identify never completed across networks
+			});
+			const libp2p = createMockLibp2p(selfPeerId, { connections: [connTo(crossNet), connTo(sameNet)], fret, peerStore });
+			const network = new Libp2pKeyPeerNetwork(libp2p, 16, undefined, 'forming', undefined, undefined, PREFIX);
+			const result = await network.findCoordinator(new TextEncoder().encode('block-near-crossnet'));
+			expect(result.toString()).to.equal(sameNet.toString());
+		});
+
+		it('findCoordinator prefers self (serves) over a not-yet-identified cross-network peer', async () => {
+			const crossNet = await makePeerId();
+			const fret = baseFret({ getNeighbors: () => [crossNet.toString(), selfPeerId.toString()] });
+			const peerStore = peerStoreOf({ [crossNet.toString()]: { protocols: [] } });
+			const libp2p = createMockLibp2p(selfPeerId, { connections: [connTo(crossNet)], fret, peerStore });
+			const network = new Libp2pKeyPeerNetwork(libp2p, 16, undefined, 'forming', undefined, undefined, PREFIX);
+			const result = await network.findCoordinator(new TextEncoder().encode('block-near-crossnet'));
+			expect(result.toString()).to.equal(selfPeerId.toString());
+		});
+
+		it('findCoordinator throws NO_NETWORK_COORDINATOR when the only candidate serves a different network and self is excluded', async () => {
+			const foreign = await makePeerId();
+			// HWM>1 so this is NOT the solo-bootstrap exhausted case
+			const persistence = new MemoryPersistence({
+				version: 1,
+				networkHighWaterMark: 5,
+				lastConnectedTimestamp: Date.now(),
+				consecutiveIsolatedSessions: 0
+			});
+			const fret = baseFret({ getNeighbors: () => [foreign.toString()] });
+			const peerStore = peerStoreOf({ [foreign.toString()]: { protocols: ['/optimystic/netB/cluster/1.0.0'] } });
+			const libp2p = createMockLibp2p(selfPeerId, { connections: [connTo(foreign)], fret, peerStore });
+			const network = new Libp2pKeyPeerNetwork(libp2p, 16, undefined, 'forming', persistence, undefined, PREFIX);
+			await network.initFromPersistedState();
+
+			let caught: unknown;
+			try {
+				await network.findCoordinator(new TextEncoder().encode('block-near-foreign'), { excludedPeers: [selfPeerId] });
+				expect.fail('Expected findCoordinator to throw NO_NETWORK_COORDINATOR');
+			} catch (err) {
+				caught = err;
+			}
+			expect(caught).to.be.instanceOf(FindCoordinatorError);
+			expect((caught as FindCoordinatorError).code).to.equal(FIND_COORDINATOR_ERROR_CODES.NO_NETWORK_COORDINATOR);
+		});
+
+		it('findCluster excludes a cross-network cohort member when a serving cohort already exists', async () => {
+			const sameNet = await makePeerId();
+			const crossNet = await makePeerId();
+			const fret = baseFret({ assembleCohort: () => [sameNet.toString(), crossNet.toString()] });
+			const peerStore = peerStoreOf({
+				[sameNet.toString()]: { protocols: servesProto(PREFIX), addresses: [`/ip4/10.0.0.2/tcp/4001/p2p/${sameNet.toString()}`] },
+				[crossNet.toString()]: { protocols: [], addresses: [`/ip4/10.0.0.3/tcp/4001/p2p/${crossNet.toString()}`] }
+			});
+			const libp2p = createMockLibp2p(selfPeerId, { fret, peerStore });
+			// clusterSize 2 → floor min(2,2)=2; self+sameNet(serves)=2, so crossNet(unknown) is excluded.
+			const network = new Libp2pKeyPeerNetwork(libp2p, 2, undefined, 'joining', undefined, undefined, PREFIX);
+			const cluster = await network.findCluster(new TextEncoder().encode('some-key'));
+			expect(cluster[selfPeerId.toString()], 'self is always kept').to.exist;
+			expect(cluster[sameNet.toString()], 'serving peer kept').to.exist;
+			expect(cluster[crossNet.toString()], 'cross-network peer excluded').to.not.exist;
+		});
+
+		it('findCluster always drops a foreign cohort member, even below the viability floor', async () => {
+			const foreign = await makePeerId();
+			const fret = baseFret({ assembleCohort: () => [foreign.toString()] });
+			const peerStore = peerStoreOf({
+				[foreign.toString()]: { protocols: ['/optimystic/netB/cluster/1.0.0'], addresses: [`/ip4/10.0.0.9/tcp/4001/p2p/${foreign.toString()}`] }
+			});
+			const libp2p = createMockLibp2p(selfPeerId, { fret, peerStore });
+			const network = new Libp2pKeyPeerNetwork(libp2p, 2, undefined, 'joining', undefined, undefined, PREFIX);
+			const cluster = await network.findCluster(new TextEncoder().encode('k'));
+			expect(Object.keys(cluster)).to.deep.equal([selfPeerId.toString()]);
+		});
+
+		it('findCluster backfills not-yet-identified members when no serving peer exists (fresh mesh not starved)', async () => {
+			const freshA = await makePeerId();
+			const freshB = await makePeerId();
+			const fret = baseFret({ assembleCohort: () => [freshA.toString(), freshB.toString()] });
+			const peerStore = peerStoreOf({
+				[freshA.toString()]: { protocols: [], addresses: [`/ip4/10.0.0.4/tcp/4001/p2p/${freshA.toString()}`] },
+				[freshB.toString()]: { protocols: [], addresses: [`/ip4/10.0.0.5/tcp/4001/p2p/${freshB.toString()}`] }
+			});
+			const libp2p = createMockLibp2p(selfPeerId, { fret, peerStore });
+			// clusterSize 3 → floor min(2,3)=2; self+serves(0)=1 < 2, so both 'unknown' members are kept.
+			const network = new Libp2pKeyPeerNetwork(libp2p, 3, undefined, 'joining', undefined, undefined, PREFIX);
+			const cluster = await network.findCluster(new TextEncoder().encode('k'));
+			expect(cluster[selfPeerId.toString()]).to.exist;
+			expect(cluster[freshA.toString()]).to.exist;
+			expect(cluster[freshB.toString()]).to.exist;
+		});
+
+		it('with protocolPrefix ABSENT, findCluster retains a cross-network member (filter disabled — regression guard)', async () => {
+			const crossNet = await makePeerId();
+			const fret = baseFret({ assembleCohort: () => [crossNet.toString()] });
+			const peerStore = peerStoreOf({
+				[crossNet.toString()]: { protocols: [], addresses: [`/ip4/10.0.0.6/tcp/4001/p2p/${crossNet.toString()}`] }
+			});
+			const libp2p = createMockLibp2p(selfPeerId, { fret, peerStore });
+			// No protocolPrefix → membership filter is a no-op → member retained as before.
+			const network = new Libp2pKeyPeerNetwork(libp2p, 2, undefined, 'joining');
+			const cluster = await network.findCluster(new TextEncoder().encode('k'));
+			expect(cluster[crossNet.toString()]).to.exist;
+		});
+
+		it('with protocolPrefix ABSENT, findCoordinator still returns a connected FRET neighbor (filter disabled — regression guard)', async () => {
+			const peerA = await makePeerId();
+			const fret = baseFret({ getNeighbors: () => [peerA.toString()] });
+			const peerStore = peerStoreOf({ [peerA.toString()]: { protocols: [] } });
+			const libp2p = createMockLibp2p(selfPeerId, { connections: [connTo(peerA)], fret, peerStore });
+			const network = new Libp2pKeyPeerNetwork(libp2p, 16, undefined, 'forming');
+			const result = await network.findCoordinator(new TextEncoder().encode('k'));
+			expect(result.toString()).to.equal(peerA.toString());
 		});
 	});
 });

@@ -498,9 +498,14 @@ export async function createLibp2pNodeBase(
 
 	// Initialize cluster coordination components
 	const networkMode: NetworkMode = (options.bootstrapNodes?.length ?? 0) > 0 ? 'joining' : 'forming';
-	const keyNetwork = new Libp2pKeyPeerNetwork(node, options.clusterSize, undefined, networkMode, options.persistence, reputation);
-	await keyNetwork.initFromPersistedState();
+	// Network-namespaced protocol prefix, threaded into the key network so coordinator/
+	// cohort selection is scoped to peers that serve THIS network's cluster/repo protocol.
+	// A peer that only belongs to another network sharing the same physical nodes/
+	// bootstraps registers a different (network-namespaced) identify protocol, so it is
+	// never selected and can't drag this network's super-majority below quorum.
 	const protocolPrefix = `/optimystic/${options.networkName}`;
+	const keyNetwork = new Libp2pKeyPeerNetwork(node, options.clusterSize, undefined, networkMode, options.persistence, reputation, protocolPrefix);
+	await keyNetwork.initFromPersistedState();
 	const createClusterClient = (peerId: any) => ClusterClient.create(peerId, keyNetwork, protocolPrefix);
 
 	// Inject reputation into NetworkManagerService
