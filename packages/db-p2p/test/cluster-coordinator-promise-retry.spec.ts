@@ -144,6 +144,48 @@ describe('ClusterCoordinator promise-phase immediate retry (multi-coordinator-wr
 		expect(flaky.callCount).to.be.greaterThan(1);
 	});
 
+	it('does NOT retry the LOCAL cluster on a throw — a local fault is fatal, not transient', async () => {
+		// peer[0] is the local cluster; its update throws once. If updateMember treated the
+		// local member like a remote one it would retry (retries=1) and recover to 2-of-2.
+		// The documented contract is the opposite: the local cluster is invoked exactly once
+		// because a local throw is a real fault (validation / merge / consensus), not transport
+		// churn — so the throw drops peer[0], leaving 1/2 and failing super-majority.
+		let localCalls = 0;
+		const mockKeyNetwork: IKeyNetwork = {
+			async findCoordinator() { return peerIds[0]!; },
+			async findCluster() { return { ...clusterPeers }; }
+		};
+		const remote = new ApprovingClusterClient(peerIds[1]!.toString());
+		const createClient = (peerId: PeerId) => {
+			if (peerId.toString() === peerIds[1]!.toString()) return remote;
+			throw new Error(`unexpected remote dial for ${peerId.toString()} — local member should not be dialed`);
+		};
+		const localCluster = {
+			peerId: peerIds[0]!,
+			async update(_record: ClusterRecord): Promise<ClusterRecord> {
+				localCalls++;
+				throw new Error('local merge failure');
+			}
+		};
+		const coordinator = new ClusterCoordinator(
+			mockKeyNetwork,
+			createClient as any,
+			{ ...baseCfg, promiseImmediateRetries: 1 },
+			localCluster
+		);
+
+		let caught: Error | null = null;
+		try {
+			await coordinator.executeClusterTransaction('block-1' as BlockId, makeMessage());
+		} catch (err) {
+			caught = err as Error;
+		}
+		expect(caught, 'expected a super-majority failure').to.be.instanceOf(Error);
+		expect(caught!.message).to.match(/super-majority/i);
+		// The decisive assertion: the local cluster was invoked exactly ONCE despite retries=1.
+		expect(localCalls, 'local cluster must not be retried in the promise phase').to.equal(1);
+	});
+
 	it('fails super-majority on the same reset when the immediate retry is disabled (retries=0 — the bug)', async () => {
 		const flaky = new FlakyResetClusterClient(peerIds[1]!.toString(), 1);
 		const coordinator = makeCoordinator(0, flaky);
