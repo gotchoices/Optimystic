@@ -495,19 +495,19 @@ export class Libp2pKeyPeerNetwork implements IKeyNetwork, IPeerNetwork {
 		}
 
 		// Self is excluded and selection found no eligible peer. If the membership filter is
-			// the reason the candidate set emptied (the only other peers serve a DIFFERENT
-			// network), surface a distinct, accurate cause instead of the generic codes below.
-			if (droppedForeignAnyAttempt) {
-				this.log('findCoordinator:no-network-coordinator key=%s prefix=%s self=%s',
-					keyStr, this.protocolPrefix ?? '?', self.toString().substring(0, 12))
-				throw new FindCoordinatorError(
-					FIND_COORDINATOR_ERROR_CODES.NO_NETWORK_COORDINATOR,
-					`No coordinator available for key on network ${this.protocolPrefix ?? '?'}: ` +
-					`the remaining candidate peer(s) do not serve this network's cluster/repo protocol.`
-				);
-			}
+		// the reason the candidate set emptied (the only other peers serve a DIFFERENT
+		// network), surface a distinct, accurate cause instead of the generic codes below.
+		if (droppedForeignAnyAttempt) {
+			this.log('findCoordinator:no-network-coordinator key=%s prefix=%s self=%s',
+				keyStr, this.protocolPrefix ?? '?', self.toString().substring(0, 12))
+			throw new FindCoordinatorError(
+				FIND_COORDINATOR_ERROR_CODES.NO_NETWORK_COORDINATOR,
+				`No coordinator available for key on network ${this.protocolPrefix ?? '?'}: ` +
+				`the remaining candidate peer(s) do not serve this network's cluster/repo protocol.`
+			);
+		}
 
-			// Self is excluded. On a solo/bootstrap node (HWM<=1 and no other connected/FRET peers),
+		// Self is excluded. On a solo/bootstrap node (HWM<=1 and no other connected/FRET peers),
 		// this means the caller already tried self and the retry has nowhere to go — surface a
 		// distinct error so retry logic stops and the original first-attempt cause is preserved.
 		const isSoloBootstrap = this.networkHighWaterMark <= 1;
@@ -585,20 +585,26 @@ export class Libp2pKeyPeerNetwork implements IKeyNetwork, IPeerNetwork {
 				else if (m === 'unknown') unknown.push(id)
 				else foreignDropped++
 			}
-			// Take the nearest `clusterSize` SERVING peers (self is always added below, so a
-			// healthy same-network cohort lands at ~clusterSize members and excludes the
-			// permanently-'unknown' cross-network peer that displaced a real one from the
-			// nearest window). Backfill with the nearest 'unknown' peers ONLY while the serving
+			// Take the nearest `clusterSize - 1` SERVING peers. Self is ALWAYS added below and
+			// counts toward `clusterSize` (matching the unscoped path, where `assembleCohort`
+			// returns the nearest `clusterSize` peers INCLUDING self when self is near the key —
+			// the coordinator case), so reserving a slot for self keeps a healthy same-network
+			// cohort at exactly `clusterSize` members rather than `clusterSize + 1`. Over-sizing
+			// would inflate the super-majority promise count (ceil(peerCount * threshold)) above
+			// what the configured `clusterSize` intends and hurt write availability. The
+			// permanently-'unknown' cross-network peer that displaced a real one from the nearest
+			// window is excluded. Backfill with the nearest 'unknown' peers ONLY while the serving
 			// cohort (incl. self) is below the viability floor min(2, clusterSize): as soon as
 			// ONE other serving peer is known we stop admitting unknowns (and thus the cross-
 			// network contaminant); when self is otherwise alone we still admit unknowns so a
 			// just-formed legitimate mesh can reach quorum before all members complete identify.
 			// A still-unidentified legitimate peer that is transiently dropped flips to 'serves'
 			// once identify completes and is re-included on the caller's retry.
+			const nonSelfTarget = Math.max(0, this.clusterSize - 1)
 			const viabilityFloor = Math.min(2, this.clusterSize)
-			let others = serves.slice(0, this.clusterSize)
+			let others = serves.slice(0, nonSelfTarget)
 			if ((others.length + 1) < viabilityFloor) {
-				others = [...others, ...unknown.slice(0, this.clusterSize - others.length)]
+				others = [...others, ...unknown.slice(0, nonSelfTarget - others.length)]
 			}
 			ids = Array.from(new Set([selfId, ...others]))
 			this.log('findCluster:membership key=%s serves=%d unknown=%d foreignDropped=%d kept=%d',
@@ -695,12 +701,6 @@ export class Libp2pKeyPeerNetwork implements IKeyNetwork, IPeerNetwork {
 	}
 
 	/**
-	 * Classify a peer's network membership from its advertised protocols. Self always
-	 * `serves` (it trivially serves its own network). When no `protocolPrefix` is
-	 * configured the filter is disabled and EVERY peer is reported `serves`, so all
-	 * callers behave exactly as before this scoping was added.
-	 */
-	/**
 	 * Over-fetch width for network-membership scoping. A cross-network peer can sit
 	 * NEARER the key than a legitimate same-network peer and displace it from the
 	 * nearest-`clusterSize` window, so when scoping is active we ask FRET for a wider
@@ -712,6 +712,12 @@ export class Libp2pKeyPeerNetwork implements IKeyNetwork, IPeerNetwork {
 		return Math.max(this.clusterSize * 4, this.clusterSize + 16)
 	}
 
+	/**
+	 * Classify a peer's network membership from its advertised protocols. Self always
+	 * `serves` (it trivially serves its own network). When no `protocolPrefix` is
+	 * configured the filter is disabled and EVERY peer is reported `serves`, so all
+	 * callers behave exactly as before this scoping was added.
+	 */
 	private membershipOf(idStr: string, protocols: string[] | undefined): NetworkMembership {
 		if (this.protocolPrefix == null) return 'serves'
 		if (idStr === this.libp2p.peerId.toString()) return 'serves'

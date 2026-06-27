@@ -789,6 +789,30 @@ describe('Libp2pKeyPeerNetwork', () => {
 			expect(cluster[crossNet.toString()], 'cross-network peer excluded').to.not.exist;
 		});
 
+		it('findCluster sizes the cohort to clusterSize (self counts toward it) when more serving peers are available', async () => {
+			// Regression for the cohort off-by-one: self is ALWAYS added, so the cohort must
+			// reserve a slot for it and keep only (clusterSize - 1) serving non-self peers —
+			// otherwise a populated network produces clusterSize+1-member cohorts, which raises
+			// the super-majority promise count (ceil((clusterSize+1)*threshold)) above what the
+			// configured clusterSize intends and hurts write availability.
+			const s1 = await makePeerId();
+			const s2 = await makePeerId();
+			const s3 = await makePeerId();
+			// All three serve netA and sit nearer the key than clusterSize=2 would admit.
+			const fret = baseFret({ assembleCohort: () => [s1.toString(), s2.toString(), s3.toString()] });
+			const peerStore = peerStoreOf({
+				[s1.toString()]: { protocols: servesProto(PREFIX), addresses: [`/ip4/10.0.0.11/tcp/4001/p2p/${s1.toString()}`] },
+				[s2.toString()]: { protocols: servesProto(PREFIX), addresses: [`/ip4/10.0.0.12/tcp/4001/p2p/${s2.toString()}`] },
+				[s3.toString()]: { protocols: servesProto(PREFIX), addresses: [`/ip4/10.0.0.13/tcp/4001/p2p/${s3.toString()}`] }
+			});
+			const libp2p = createMockLibp2p(selfPeerId, { fret, peerStore });
+			const network = new Libp2pKeyPeerNetwork(libp2p, 2, undefined, 'joining', undefined, undefined, PREFIX);
+			const cluster = await network.findCluster(new TextEncoder().encode('populated-key'));
+			expect(Object.keys(cluster).length, 'cohort is exactly clusterSize (self + clusterSize-1 serving peers)').to.equal(2);
+			expect(cluster[selfPeerId.toString()], 'self is always kept').to.exist;
+			expect(cluster[s1.toString()], 'nearest serving peer kept').to.exist;
+		});
+
 		it('findCluster always drops a foreign cohort member, even below the viability floor', async () => {
 			const foreign = await makePeerId();
 			const fret = baseFret({ assembleCohort: () => [foreign.toString()] });
