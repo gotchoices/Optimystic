@@ -22,7 +22,7 @@ export type SqliteRow = Record<string, SqliteParam>;
  *
  * Both `node:sqlite` and `@nativescript-community/sqlite` cache parsed SQL
  * internally, so re-binding a prepared statement is cheaper than re-parsing a
- * raw `execSQL`. The storage classes prepare each query once per instance.
+ * raw `execute`. The storage classes prepare each query once per instance.
  */
 export interface SqliteStatement {
 	/** Execute with the given bind parameters, ignoring any returned rows. */
@@ -108,8 +108,8 @@ CREATE TABLE IF NOT EXISTS kv (
 );
 `;
 
+// Assignment-form pragmas return no rows, so they go through exec()/execute().
 const PRAGMAS_SQL = `
-PRAGMA journal_mode = WAL;
 PRAGMA synchronous = NORMAL;
 PRAGMA foreign_keys = OFF;
 `;
@@ -119,6 +119,12 @@ PRAGMA foreign_keys = OFF;
  * migrations can branch on it. Idempotent — safe to call on every open.
  */
 export async function applySchema(db: SqliteDb, version: number = DEFAULT_DB_VERSION): Promise<void> {
+	// `PRAGMA journal_mode = WAL` returns the resulting mode as a row. The NS
+	// Android plugin maps exec()→execSQL, which rejects row-returning statements
+	// ("Queries can be performed using ... query or rawQuery methods only"), so
+	// this pragma must run through a query method. prepare().get() does that on
+	// every driver (NS plugin → get()/rawQuery; node:sqlite/better-sqlite3 → get()).
+	await db.prepare('PRAGMA journal_mode = WAL').get();
 	await db.exec(PRAGMAS_SQL);
 	await db.exec(SCHEMA_SQL);
 	await db.exec(`PRAGMA user_version = ${version}`);

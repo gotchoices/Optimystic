@@ -7,7 +7,7 @@ import { applySchema, DEFAULT_DB_NAME, DEFAULT_DB_VERSION, type OptimysticNSDBHa
  * at typecheck time on non-NativeScript consumers).
  */
 interface NSPluginDb {
-	execSQL(sql: string, params?: ReadonlyArray<unknown>): unknown;
+	execute(sql: string, params?: ReadonlyArray<unknown>): unknown;
 	get(sql: string, params?: ReadonlyArray<unknown>): Promise<Record<string, unknown> | null | undefined> | Record<string, unknown> | null | undefined;
 	select(sql: string, params?: ReadonlyArray<unknown>): Promise<Array<Record<string, unknown>>> | Array<Record<string, unknown>>;
 	close(): void | Promise<void>;
@@ -56,14 +56,14 @@ class NSPluginDbWrapper implements SqliteDb {
 	constructor(private readonly raw: NSPluginDb) {}
 
 	async exec(sql: string): Promise<void> {
-		// The plugin's execSQL accepts a single statement; split semicolon-
+		// The plugin's execute accepts a single statement; split semicolon-
 		// separated DDL so callers can pass the full schema in one go.
 		const statements = sql
 			.split(';')
 			.map(s => s.trim())
 			.filter(s => s.length > 0);
 		for (const statement of statements) {
-			await this.raw.execSQL(statement);
+			await this.raw.execute(statement);
 		}
 	}
 
@@ -72,14 +72,14 @@ class NSPluginDbWrapper implements SqliteDb {
 	}
 
 	async transaction<T>(fn: () => Promise<T>): Promise<T> {
-		await this.raw.execSQL('BEGIN');
+		await this.raw.execute('BEGIN');
 		try {
 			const result = await fn();
-			await this.raw.execSQL('COMMIT');
+			await this.raw.execute('COMMIT');
 			return result;
 		} catch (err) {
 			try {
-				await this.raw.execSQL('ROLLBACK');
+				await this.raw.execute('ROLLBACK');
 			} catch {
 				// Swallow rollback failures so we surface the original error.
 			}
@@ -96,7 +96,7 @@ class NSPluginStatement implements SqliteStatement {
 	constructor(private readonly raw: NSPluginDb, private readonly sql: string) {}
 
 	async run(...params: SqliteParam[]): Promise<void> {
-		await this.raw.execSQL(this.sql, params);
+		await this.raw.execute(this.sql, params);
 	}
 
 	async get(...params: SqliteParam[]): Promise<SqliteRow | undefined> {
