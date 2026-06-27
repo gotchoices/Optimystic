@@ -4,7 +4,6 @@ import type { BlockId, IBlock, BlockHeader, Transforms, IRepo } from '@optimysti
 import { webSockets } from '@libp2p/websockets';
 import { circuitRelayTransport } from '@libp2p/circuit-relay-v2';
 import { multiaddr, type Multiaddr } from '@multiformats/multiaddr';
-import { hashKey } from 'p2p-fret';
 import { createLibp2pNode, type Libp2pTransports } from '../src/libp2p-node.js';
 import { spawnRelayNode, pickRelayWsAddr, waitForCircuitListen } from './util/relay-topology.js';
 
@@ -105,32 +104,36 @@ describe('Multi-coordinator write over a relay (limited inter-coordinator stream
 		const connected = await waitFor(() => a!.getPeers().some(p => p.toString() === b!.peerId.toString()), 20_000, 250);
 		expect(connected, 'A and B connected to each other via the relay').to.equal(true);
 
-		// FRET must rank both storage nodes so findCluster returns the {A,B} cohort.
-		const fretOf = (n: Libp2p): { assembleCohort(coord: Uint8Array, wants: number): string[] } => (n as any).services.fret;
-		const probe = await hashKey(new TextEncoder().encode('mcw-relay-probe'));
+		// FRET must converge so A and B each hold the OTHER's coordinate in their ring —
+		// the real precondition for findCluster to return a cohort that can span both.
+		//
+		// With the limited-connection RPC fix (fix/p2p-fret-rpc-over-limited-connection)
+		// the A↔B FRET wire exchange now runs DIRECTLY over the relayed (limited)
+		// connection — `p2p-fret`'s RPCs open their stream with
+		// `runOnLimitedConnection: true` — on top of the transitive path through the
+		// relay (A↔relay and B↔relay are direct WS links, and `peer:connect` upserts the
+		// peer on the relayed A↔B link too). Convergence is therefore reliable.
+		//
+		// We deliberately do NOT gate on `assembleCohort(probe, 2)` containing both A and
+		// B for a single fixed probe: the relay is itself a FRET participant in the
+		// keyspace, so for a large fraction of random per-run peer-id layouts it ranks
+		// within the top-2 for any fixed probe and crowds a storage node out of the
+		// size-2 cohort — even when the ring is fully converged. That false-negative made
+		// the old precondition bimodally `this.skip()`. The keyspace search loop below
+		// already handles per-probe cohort-membership variance by trying many block ids.
+		const fretOf = (n: Libp2p): {
+			assembleCohort(coord: Uint8Array, wants: number): string[];
+			exportTable(): { entries: Array<{ id: string }> };
+		} => (n as any).services.fret;
 		const stabilized = await waitFor(() => {
-			const want = new Set([a!.peerId.toString(), b!.peerId.toString()]);
+			const want = [a!.peerId.toString(), b!.peerId.toString()];
 			for (const n of [a!, b!]) {
-				const seen = new Set(fretOf(n).assembleCohort(probe, 2));
-				for (const id of want) if (!seen.has(id)) return false;
+				const ringIds = new Set(fretOf(n).exportTable().entries.map(e => e.id));
+				for (const id of want) if (!ringIds.has(id)) return false;
 			}
 			return true;
 		}, 40_000, 500);
-		// FRET converges here TRANSITIVELY through the relay: A↔relay and B↔relay are
-		// direct (WS) connections over which FRET neighbor gossip flows, so A learns B's
-		// coordinate (and vice-versa) even though the A↔B link itself is relay-only. The
-		// direct A↔B FRET exchange does NOT happen — `p2p-fret`'s wire RPCs open streams
-		// without `runOnLimitedConnection: true`, so they cannot run over the limited A↔B
-		// connection (see fix/p2p-fret-rpc-over-limited-connection) — but the relay, being
-		// a full FRET participant directly connected to both, relays the routing state and
-		// `assembleCohort` ends up ranking both. If FRET does not stabilize within budget,
-		// skip rather than red-fail (the DETERMINISTIC specs are the authoritative guard:
-		// cluster-coordinator-promise-retry.spec.ts + libp2p-key-network.spec.ts
-		// "prefers a DIRECT connection").
-		if (!stabilized) {
-			this.skip();
-			return;
-		}
+		expect(stabilized, 'A and B converge FRET state over the relay (both rings hold both peers)').to.equal(true);
 
 		// The relay node is itself in the FRET keyspace, so a block's cohort is drawn
 		// from {A, B, relay}. Find a block whose cohort (from A) actually includes B, so

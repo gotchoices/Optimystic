@@ -11,6 +11,7 @@
   },
   "resolutions": {
     "@quereus/quereus": "portal:../quereus/packages/quereus",
+    "p2p-fret": "portal:../Fret/packages/fret",
     "protons-runtime": "^6.0.0",
     "uint8arrays": "^6.1.1"
   },
