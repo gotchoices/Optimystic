@@ -27,6 +27,8 @@ import type { IRepo, ICluster, ITransactionValidator, BlockId, ActionRev, IBlock
 import type { ITransactionStateStore } from './cluster/i-transaction-state-store.js';
 import { networkManagerService, type NetworkManagerService } from './network/network-manager-service.js';
 import type { SpreadOnChurnConfig, SpreadOnChurnMonitor } from './cluster/spread-on-churn.js';
+import { BlockTransferCoordinator } from './cluster/block-transfer.js';
+import type { RebalanceMonitorConfig } from './cluster/rebalance-monitor.js';
 import { fretService, Libp2pFretService } from 'p2p-fret';
 import { syncService } from './sync/service.js';
 import { SyncClient } from './sync/client.js';
@@ -164,6 +166,16 @@ export type NodeOptions = {
 	 * (see SpreadOnChurnConfig). Set { enabled: false } to disable spread on this node.
 	 */
 	spreadOnChurn?: Partial<SpreadOnChurnConfig>;
+
+	/**
+	 * Rebalance reaction tuning. Drives the RebalanceMonitor + BlockTransferCoordinator pull-gained/
+	 * push-lost path when arachnode/FRET are available (the only place fretAdapter + restoration
+	 * coordinator exist). Absent -> enabled with defaults (see RebalanceMonitorConfig). Set
+	 * { enabled: false } to disable the rebalance reaction on this node. When arachnode is disabled
+	 * or FRET is absent the rebalance path stays inert regardless of this flag (rebalance is a
+	 * resilience optimization, not a correctness requirement).
+	 */
+	rebalance?: Partial<RebalanceMonitorConfig> & { enabled?: boolean };
 
 	/** Transaction validator for cluster consensus */
 	validator?: ITransactionValidator;
@@ -767,6 +779,77 @@ export async function createLibp2pNodeBase(
 			// Replace the restore callback (this is a bit hacky, but works for now)
 			(storageRepo as any).createBlockStorage = (blockId: string) =>
 				new BlockStorage(blockId, rawStorage, newRestoreCallback);
+
+			// --- Rebalance reaction: drive RebalanceMonitor + react via BlockTransferCoordinator ---
+			// Nothing previously activated the rebalance path on a real node: initRebalanceMonitor was
+			// never called, the monitor was never start()ed, and BlockTransferCoordinator (the
+			// pull-gained / push-lost reaction primitive) was never constructed in src. This block lives
+			// inside the arachnode `if (fret)` gate because both dependencies only exist here — the
+			// fretAdapter and the RestorationCoordinator. When arachnode is disabled or FRET is absent the
+			// rebalance path stays inert (acceptable: rebalance is a resilience optimization). A wiring
+			// failure here is non-fatal (log + continue), unlike the operator-opted-in cohortTopic block.
+			if (networkManager && (options.rebalance?.enabled ?? true) !== false) {
+				try {
+					// repo → the LOCAL storageRepo (not repoProxy/coordinatedRepo): a pulled/pushed replica
+					// must land in / be read from this node's own storage, same reasoning as the
+					// blockTransfer service handler registration. protocolPrefix (/optimystic/<networkName>)
+					// MUST match the prefix the node registers its block-transfer handler under, or every
+					// lost-block push dials the wrong protocol and fails to connect.
+					const coordinator = new BlockTransferCoordinator(
+						storageRepo,
+						keyNetwork,
+						restorationCoordinatorV2,
+						partitionDetector,
+						protocolPrefix,
+					);
+
+					const rebalanceMonitor = networkManager.initRebalanceMonitor(
+						partitionDetector,
+						fretAdapter,
+						options.rebalance,
+					);
+					await rebalanceMonitor.start();
+
+					// onRebalance fires synchronously from the monitor's debounced check; the coordinator's
+					// reaction (pull gained / push lost, each partition-guarded) is async, so hop it off the
+					// handler with `void` rather than blocking the monitor's emit loop.
+					rebalanceMonitor.onRebalance((event) => { void coordinator.handleRebalanceEvent(event); });
+
+					// Feed owned blocks from the SAME storageRepo.onAnyCollectionChange feed that drives
+					// spread (every commit / received replica fires it). A SEPARATE subscription for this
+					// ticket; unify-monitor-tracked-block-set collapses the two monitors onto one shared set.
+					// NOTE: blocks already durable from a previous run are NOT re-emitted on startup, so they
+					// are not tracked until next touched - same caveat the spread block documents (see
+					// optimystic-owned-block-initial-scan-seed for the deferred initial-scan seed).
+					const monitor = rebalanceMonitor;
+					const offRebalanceOwnedBlockFeed = storageRepo.onAnyCollectionChange((e) => {
+						for (const blockId of e.blockIds) monitor.trackBlock(blockId);
+					});
+
+					// Expose for tests/diagnostics (mirrors node.spreadOnChurnMonitor).
+					(node as any).rebalanceMonitor = rebalanceMonitor;
+					(node as any).blockTransferCoordinator = coordinator;
+
+					// Disposal: release the owned-block subscription + stop the monitor before transports
+					// close. Composes with the other stop wrappers (each calls its captured previousStop
+					// last). Both steps are idempotent — the unsubscribe is a plain off(), and
+					// RebalanceMonitor.stop() early-returns when not running (NetworkManagerService.stop()
+					// also stops it) — so a double node.stop() does not throw.
+					const previousStop = node.stop.bind(node);
+					node.stop = async () => {
+						try {
+							offRebalanceOwnedBlockFeed?.();
+							await rebalanceMonitor.stop();
+						} finally {
+							await previousStop();
+						}
+					};
+				} catch (err) {
+					// Rebalance is a resilience optimization, not a correctness requirement - a wiring
+					// failure (e.g. FRET briefly unavailable) must NOT hard-fail node startup.
+					log?.('rebalance wiring init failed: %o', err);
+				}
+			}
 
 			// Monitor capacity and adjust ring periodically
 			const monitorInterval = setInterval(async () => {
