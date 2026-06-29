@@ -16,11 +16,11 @@ import { expect } from 'chai';
 import { buildMatchmakingMesh, type MatchmakingMesh } from '../../src/testing/matchmaking-mesh-harness.js';
 
 describe('matchmaking / mesh — provider registration + query round-trip', function () {
-	// Real-Ed25519 multi-cohort mesh: setup + round-trips are CPU-bound and individual tests baseline at
-	// 18-24s even in isolation, so a 30s budget left near-zero margin and tipped to timeout under the
-	// accumulated load of the full db-p2p suite. Match the identical-profile sibling suite
-	// (reactivity/mesh-tail-rotation, also 60s) so machine load does not tip a passing test into a timeout.
-	this.timeout(60_000);
+	// Real-Ed25519 multi-cohort mesh: setup + round-trips are CPU-bound. The suite runs serially in a single
+	// ~7-minute Node process, so tests near the back face large GC-pressured heaps and wall-clock variance
+	// stacks on top of the isolation cost — machine load, not a defect, threatens the clock. 120s is the
+	// uniform ceiling across the full real-Ed25519 mesh e2e class so no member becomes the next timeout victim.
+	this.timeout(120_000);
 	let mm: MatchmakingMesh;
 	afterEach(async () => {
 		await mm?.stop();
@@ -70,11 +70,11 @@ describe('matchmaking / mesh — provider registration + query round-trip', func
 });
 
 describe('matchmaking / mesh — provider self-throttling + withdrawal', function () {
-	// Real-Ed25519 multi-cohort mesh: setup + round-trips are CPU-bound and individual tests baseline at
-	// 18-24s even in isolation, so a 30s budget left near-zero margin and tipped to timeout under the
-	// accumulated load of the full db-p2p suite. Match the identical-profile sibling suite
-	// (reactivity/mesh-tail-rotation, also 60s) so machine load does not tip a passing test into a timeout.
-	this.timeout(60_000);
+	// Real-Ed25519 multi-cohort mesh: setup + round-trips are CPU-bound. The suite runs serially in a single
+	// ~7-minute Node process, so tests near the back face large GC-pressured heaps and wall-clock variance
+	// stacks on top of the isolation cost — machine load, not a defect, threatens the clock. 120s is the
+	// uniform ceiling across the full real-Ed25519 mesh e2e class so no member becomes the next timeout victim.
+	this.timeout(120_000);
 	let mm: MatchmakingMesh;
 	afterEach(async () => {
 		await mm?.stop();

@@ -77,7 +77,9 @@ async function walkOnce(mesh: CohortMesh, walker: HostNode, topicId: Uint8Array,
 }
 
 describe('cohort-topic: scale anti-flood + anti-DoS (mock-tier e2e)', function () {
-	this.timeout(60_000);
+	// Real-Ed25519 single-process suite: raised to 120s to match the uniform mesh e2e class ceiling as
+	// insurance — these tests use virtual time but still do real Ed25519 in the same heap as the mesh specs.
+	this.timeout(120_000);
 
 	describe('§Anti-flood claim 1 — cold-start storm avoidance', () => {
 		it('a burst of registrations each probes d_max FIRST and walks single-direction toward the root (no speculative deeper probing); all attach with no root give-up', async () => {

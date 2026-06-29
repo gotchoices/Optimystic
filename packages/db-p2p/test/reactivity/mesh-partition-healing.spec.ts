@@ -25,13 +25,11 @@ import { buildReactivityMesh, type ReactivityMesh } from '../../src/testing/reac
 const range = (lo: number, hi: number): number[] => Array.from({ length: hi - lo + 1 }, (_v, i) => lo + i);
 
 describe('reactivity / mesh — partition healing (no loss, no double-delivery)', function () {
-	// Real-Ed25519 multi-cohort mesh: setup + round-trips are CPU-bound and run several seconds; give
-	// generous headroom over the 10s default so machine load doesn't tip a passing test into a timeout.
-	// Each case builds a fresh 6–8 node real-crypto mesh, so this suite sits in the same heavy tier as the
-	// `mesh-cold-to-hot` / `mesh-tail-rotation` suites — under full-suite load a single build can approach
-	// the old 30s budget and trip a timeout, so match those suites' 60s headroom (an earlier 10s→30s bump
-	// proved marginal: the first case's 8-node build is the heaviest setup here).
-	this.timeout(60_000);
+	// Real-Ed25519 multi-cohort mesh: setup + round-trips are CPU-bound. The suite runs serially in a single
+	// ~7-minute Node process, so tests near the back face large GC-pressured heaps and wall-clock variance
+	// stacks on top of the isolation cost — machine load, not a defect, threatens the clock. 120s is the
+	// uniform ceiling across the full real-Ed25519 mesh e2e class so no member becomes the next timeout victim.
+	this.timeout(120_000);
 	let rx: ReactivityMesh;
 	afterEach(async () => {
 		await rx?.stop();

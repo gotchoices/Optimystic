@@ -65,7 +65,9 @@ function topic(seed: number): Uint8Array {
 const REG = { followOn: false as const, treeTier: 0 };
 
 describe('cohort-topic: scale lifecycle (mock-tier e2e, N=48 ring / k=16 cohort)', function () {
-	this.timeout(30_000);
+	// Real-Ed25519 single-process suite: raised to 120s to match the uniform mesh e2e class ceiling as
+	// insurance — these tests use virtual time but still do real Ed25519 in the same heap as the mesh specs.
+	this.timeout(120_000);
 
 	describe('§Registration mechanics + §TTL and renewal', () => {
 		it('register → accepted; ttl/3 pings keep the record alive; stopping pings evicts it after ttl', async () => {
