@@ -321,6 +321,15 @@ export function digest(
 	algorithm: HashAlgorithm = 'sha256',
 	encoding: OutputEncoding = 'base64url'
 ): string | Uint8Array {
+	if (!Array.isArray(fields)) {
+		throw new Error(
+			`digest(fields, algorithm?, encoding?): 'fields' must be an array of values. ` +
+			`The digest API changed in v0.14: it is now variadic/injective over fields, ` +
+			`the per-call inputEncoding was removed, and algorithm + output encoding are bound at plugin load time. ` +
+			`Migrate digest(value, algo, inputEncoding, outputEncoding) → digest([value], algo, outputEncoding) — ` +
+			`note the result is now a *framed* digest, not a bare hash of the bytes.`
+		);
+	}
 	return digestFields(fields, resolveHasher(algorithm), resolveOutputEncoder(encoding));
 }
 

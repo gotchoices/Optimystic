@@ -301,6 +301,12 @@ SELECT verify('hello', 'c2lnbmF0dXJl', 'cHVibGljS2V5', 'secp256k1', 'utf8') as i
 SELECT verify('data', 'c2lnbmF0dXJl', 'cHVibGljS2V5', 'p256', 'utf8') as is_valid;
 ```
 
+## Migration (v0.14 breaking change)
+
+The `digest()` JS/TypeScript API changed significantly in v0.14. See [CHANGELOG.md](CHANGELOG.md) for the
+full migration guide, including old → new call-site examples, what changed in the SQL function, and
+the open bare-hash-helper question.
+
 ## Digest configuration
 
 Because `digest` is variadic over data, its **algorithm** and **output encoding** are

@@ -49,6 +49,21 @@ describe('Crypto Functions', () => {
 			expect(() => digest([Number.POSITIVE_INFINITY])).to.throw();
 		});
 
+		it('old-style string arg throws migration error (not "Unsupported output encoding")', () => {
+			expect(() => digest('hello' as any, 'sha256', 'utf8' as any))
+				.to.throw(/digest API changed in v0\.14/);
+		});
+
+		it('bare-string arg throws (guards silent char-iteration corruption)', () => {
+			expect(() => digest('hello' as any))
+				.to.throw(/digest API changed in v0\.14/);
+		});
+
+		it('Uint8Array arg throws (guards silent byte-iteration corruption)', () => {
+			expect(() => digest(new Uint8Array([1, 2, 3]) as any))
+				.to.throw(/digest API changed in v0\.14/);
+		});
+
 		it('should accept a Uint8Array (blob) field', () => {
 			const a = digest([new Uint8Array([1, 2, 3])]);
 			const b = digest([new Uint8Array([1, 2, 3])]);
