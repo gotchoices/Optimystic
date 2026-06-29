@@ -458,6 +458,16 @@ export type InvalidationContext = {
 	readonly log: Log<unknown>;
 	/** Resolves a block's storage so the compensating revision can be written. */
 	readonly createBlockStorage: (blockId: BlockId) => IBlockStorage;
+	/**
+	 * Runs `fn` while holding the same per-block commit latch `StorageRepo.commit` and
+	 * `saveReplicatedBlock` hold, so the compensating `saveReplica`/`saveDeletion` read-modify-write of
+	 * `meta.latest` is mutually exclusive with a concurrent local commit on that block. Without it, an
+	 * invalidation advancing `latest` outside that latch is invisible to commit's staleness guard, so a
+	 * commit that read a stale `latest` can clobber it back down — a lost-update / non-monotonic
+	 * regression. Optional: when omitted (unit tests / non-`StorageRepo` hosts) the write runs unlatched,
+	 * preserving today's behavior. The host supplies `StorageRepo`'s `withBlockCommitLatch`.
+	 */
+	readonly withBlockCommitLatch?: <T>(blockId: BlockId, fn: () => Promise<T>) => Promise<T>;
 };
 
 export type ApplyInvalidationParams = {
@@ -552,11 +562,19 @@ export async function applyInvalidation(ctx: InvalidationContext, params: ApplyI
 		// Deterministic compensating-revision actionId — identical on every member, so all converge on
 		// the same (rev, actionId) for both the restore and the tombstone path.
 		const revertActionId = await hashString(`inv:${invalidatedActionId}:${proof.disputeId}:${blockId}:${rev}`);
+		// Hold the per-block commit latch around ONLY the compensating write (matching saveReplicatedBlock's
+		// scope): the monotonic guard inside saveReplica/saveDeletion then runs under the same latch a
+		// concurrent commit holds, so the two RMW of meta.latest serialize and latest stays monotonic.
+		// Acquire per block, one at a time — invalidation never holds two block latches, so it cannot
+		// deadlock against commit's sorted multi-latch acquisition. When no runner is injected, the write
+		// runs unlatched (today's behavior).
+		const runLatched = <T>(fn: () => Promise<T>): Promise<T> =>
+			ctx.withBlockCommitLatch ? ctx.withBlockCommitLatch(blockId, fn) : fn();
 		if (computation.kind === 'delete') {
 			// Block-creation reversal: physically remove the created block by writing a forward tombstone
 			// revision. The `restoredContentHash` is the DELETED_BLOCK_RESTORE sentinel — a deleted block
 			// has no content hash, and the sentinel tells dependents "observed content is gone → invalidate".
-			await storage.saveDeletion({ rev, actionId: revertActionId });
+			await runLatched(() => storage.saveDeletion({ rev, actionId: revertActionId }));
 			log('apply-delete-restore blockId=%s invalidatedRev=%d rev=%d', blockId, invalidatedRev, rev);
 			reverted.push({ blockId, fromRev: computation.fromRev, restoredContentHash: DELETED_BLOCK_RESTORE });
 			continue;
@@ -565,7 +583,7 @@ export async function applyInvalidation(ctx: InvalidationContext, params: ApplyI
 			// Surviving later actions were replayed verbatim; true read-dependents are out of scope here.
 			log('apply-replayed-later-actions blockId=%s count=%d', blockId, computation.laterActions);
 		}
-		await storage.saveReplica(computation.block, { rev, actionId: revertActionId });
+		await runLatched(() => storage.saveReplica(computation.block, { rev, actionId: revertActionId }));
 		reverted.push({ blockId, fromRev: computation.fromRev, restoredContentHash: computation.restoredContentHash });
 	}
 

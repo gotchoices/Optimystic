@@ -16,6 +16,34 @@ import { createLogger } from "../logger.js";
 
 const log = createLogger('storage-repo');
 
+/**
+ * Single source of truth for the per-block commit latch key. Held by {@link StorageRepo.commit} and
+ * {@link StorageRepo.saveReplicatedBlock}, and — through an injected runner ({@link withBlockCommitLatch})
+ * — by the invalidation-apply path. Every out-of-band writer of a block's `meta.latest` must serialize
+ * on this key against a concurrent local commit on the same block; keeping all call sites on this helper
+ * is what prevents the key from drifting between them.
+ */
+export const commitLatchKey = (blockId: BlockId): string => `StorageRepo.commit:${blockId}`;
+
+/**
+ * Runs `fn` while holding the per-block commit latch {@link commitLatchKey}. This is the capability the
+ * dispute module's `applyInvalidation` is handed (through its context) so its compensating
+ * `saveReplica`/`saveDeletion` read-modify-write of `meta.latest` is mutually exclusive with a concurrent
+ * {@link StorageRepo.commit} on the same block — otherwise an invalidation advancing `latest` outside
+ * that latch is invisible to commit's staleness guard and can be clobbered (a non-monotonic regression).
+ *
+ * Acquire/release is per call, so a caller holds at most one block latch at any instant and cannot
+ * deadlock against commit's sorted, up-front multi-latch acquisition.
+ */
+export async function withBlockCommitLatch<T>(blockId: BlockId, fn: () => Promise<T>): Promise<T> {
+	const release = await Latches.acquire(commitLatchKey(blockId));
+	try {
+		return await fn();
+	} finally {
+		release();
+	}
+}
+
 export type StorageRepoOptions = {
 	/** Optional hook to validate transactions in PendRequests */
 	validatePend?: PendValidationHook;
@@ -335,7 +363,7 @@ export class StorageRepo implements IRepo, IBlockChangeNotifier, IBlockReplicaSt
 		try {
 			// Acquire locks sequentially based on sorted IDs to prevent deadlocks
 			for (const id of uniqueBlockIds) {
-				const lockId = `StorageRepo.commit:${id}`;
+				const lockId = commitLatchKey(id);
 				const release = await Latches.acquire(lockId);
 				releases.push(release);
 			}
@@ -466,7 +494,7 @@ export class StorageRepo implements IRepo, IBlockChangeNotifier, IBlockReplicaSt
 	async saveReplicatedBlock(blockId: BlockId, block: IBlock, source?: ActionRev): Promise<void> {
 		log('saveReplicatedBlock blockId=%s rev=%s', blockId, source?.rev);
 		const storage = this.createBlockStorage(blockId);
-		const release = await Latches.acquire(`StorageRepo.commit:${blockId}`);
+		const release = await Latches.acquire(commitLatchKey(blockId));
 		// Captured under the latch; emitted after release to match commit's ordering.
 		let landed: { collectionId: CollectionId, actionId: ActionId, rev: number } | undefined;
 		try {

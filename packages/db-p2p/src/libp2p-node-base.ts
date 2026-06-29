@@ -14,7 +14,7 @@ import type { ConnectionGater, PrivateKey } from '@libp2p/interface';
 import { clusterService } from './cluster/service.js';
 import { blockTransferService } from './cluster/block-transfer-service.js';
 import { repoService } from './repo/service.js';
-import { StorageRepo } from './storage/storage-repo.js';
+import { StorageRepo, withBlockCommitLatch } from './storage/storage-repo.js';
 import { BlockStorage } from './storage/block-storage.js';
 import { MemoryRawStorage } from './storage/memory-storage.js';
 import type { IRawStorage } from './storage/i-raw-storage.js';
@@ -287,6 +287,15 @@ export async function createLibp2pNodeBase(
 	const storageRepo = new StorageRepo((blockId) =>
 		new BlockStorage(blockId, rawStorage, restoreCallback)
 	);
+
+	// Per-block commit-latch runner, ready to thread into the invalidation-apply sink (`onInvalidate`)
+	// passed to `clusterMember(...)` and into each cascade `CollectionEnv`, the instant either is wired
+	// here. Sharing the `StorageRepo.commit:<blockId>` latch makes a compensating saveReplica/saveDeletion
+	// RMW of `meta.latest` mutually exclusive with a concurrent commit on the same block. It is unused
+	// today only because no `onInvalidate`/cascade driver is wired in the live node (see review handoff);
+	// it is bound here so that wiring is a one-liner and cannot reach for a divergent latch key.
+	const blockCommitLatch = withBlockCommitLatch;
+	void blockCommitLatch;
 
 	let clusterImpl: ICluster | undefined;
 	let coordinatedRepo: IRepo | undefined;
