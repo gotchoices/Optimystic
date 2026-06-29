@@ -821,6 +821,42 @@ describe('Libp2pKeyPeerNetwork', () => {
 			expect((caught as FindCoordinatorError).code).to.equal(FIND_COORDINATOR_ERROR_CODES.NO_NETWORK_COORDINATOR);
 		});
 
+		it('findCoordinator selects a peer once it flips from unknown to serves within the retry window', async () => {
+			// The load-bearing claim of this design: an 'unknown' peer is NOT gambled on, but it
+			// is NOT permanently barred either — filterByMembership re-reads the peerStore on every
+			// retry attempt, so a genuine same-network peer that completes `identify` mid-loop flips
+			// to 'serves' and is selected on that attempt. Self is EXCLUDED here so the only way to
+			// return a non-error result is to select the flipped peer (proving the flip path, not
+			// self-coordination). The peerStore reports empty protocols on the first attempt's reads
+			// and the serving protocols thereafter; each attempt issues 2 reads (FRET path + connected
+			// fallback), so the >2 threshold lands the flip on attempt 1's first read.
+			const flipPeer = await makePeerId();
+			let getCount = 0;
+			const fret = baseFret({ getNeighbors: () => [flipPeer.toString()] });
+			const peerStore: any = {
+				all: async () => [],
+				get: async (pid: { toString(): string }) => {
+					if (pid.toString() === flipPeer.toString()) {
+						getCount++;
+						return { protocols: getCount > 2 ? servesProto(PREFIX) : [], addresses: [] };
+					}
+					return { protocols: [], addresses: [] };
+				}
+			};
+			// HWM>1 so this is not the solo-bootstrap path; self excluded so it can't mask the flip.
+			const persistence = new MemoryPersistence({
+				version: 1,
+				networkHighWaterMark: 5,
+				lastConnectedTimestamp: Date.now(),
+				consecutiveIsolatedSessions: 0
+			});
+			const libp2p = createMockLibp2p(selfPeerId, { connections: [connTo(flipPeer)], fret, peerStore });
+			const network = new Libp2pKeyPeerNetwork(libp2p, 16, undefined, 'forming', persistence, undefined, PREFIX);
+			await network.initFromPersistedState();
+			const result = await network.findCoordinator(new TextEncoder().encode('block-flip'), { excludedPeers: [selfPeerId] });
+			expect(result.toString(), 'selects the same-network peer once it flips to serves').to.equal(flipPeer.toString());
+		});
+
 		it('findCluster excludes a cross-network cohort member when a serving cohort already exists', async () => {
 			const sameNet = await makePeerId();
 			const crossNet = await makePeerId();
