@@ -44,7 +44,10 @@ export class FileRawStorage implements IRawStorage {
 	}
 
 	async getPendingTransaction(blockId: BlockId, actionId: ActionId): Promise<Transform | undefined> {
-		return this.readIfExists<Transform>(this.getPendingActionPath(blockId, actionId));
+		return this.readActionScopedFile<Transform>(
+			this.getPendingActionPath(blockId, actionId),
+			this.getPendingActionPath(blockId, actionId, false)
+		);
 	}
 
 	async savePendingTransaction(blockId: BlockId, actionId: ActionId, transform: Transform): Promise<void> {
@@ -78,7 +81,10 @@ export class FileRawStorage implements IRawStorage {
 	}
 
 	async getTransaction(blockId: BlockId, actionId: ActionId): Promise<Transform | undefined> {
-		return this.readIfExists<Transform>(this.getActionPath(blockId, actionId));
+		return this.readActionScopedFile<Transform>(
+			this.getActionPath(blockId, actionId),
+			this.getActionPath(blockId, actionId, false)
+		);
 	}
 
 	async *listRevisions(blockId: BlockId, startRev: number, endRev: number): AsyncIterable<ActionRev> {
@@ -98,7 +104,10 @@ export class FileRawStorage implements IRawStorage {
 	}
 
 	async getMaterializedBlock(blockId: BlockId, actionId: ActionId): Promise<IBlock | undefined> {
-		return this.readIfExists<IBlock>(this.getMaterializedPath(blockId, actionId));
+		return this.readActionScopedFile<IBlock>(
+			this.getMaterializedPath(blockId, actionId),
+			this.getMaterializedPath(blockId, actionId, false)
+		);
 	}
 
 	async saveMaterializedBlock(blockId: BlockId, actionId: ActionId, block?: IBlock): Promise<void> {
@@ -174,16 +183,47 @@ export class FileRawStorage implements IRawStorage {
 		return path.join(this.getBlockPath(blockId), 'revs', `${rev}.json`);
 	}
 
-	private getPendingActionPath(blockId: BlockId, actionId: ActionId): string {
-		return path.join(this.getBlockPath(blockId), 'pend', `${encodeActionIdForFilename(actionId)}.json`);
+	// `encoded` controls colon handling: writes and canonical reads use the
+	// percent-encoded filename (encoded = true); the legacy raw-colon fallback
+	// (see readActionScopedFile) passes encoded = false to reach pre-encode
+	// POSIX files like `actions/tx:<hash>.json`.
+	private getPendingActionPath(blockId: BlockId, actionId: ActionId, encoded = true): string {
+		const filename = encoded ? encodeActionIdForFilename(actionId) : actionId;
+		return path.join(this.getBlockPath(blockId), 'pend', `${filename}.json`);
 	}
 
-	private getActionPath(blockId: BlockId, actionId: ActionId): string {
-		return path.join(this.getBlockPath(blockId), 'actions', `${encodeActionIdForFilename(actionId)}.json`);
+	private getActionPath(blockId: BlockId, actionId: ActionId, encoded = true): string {
+		const filename = encoded ? encodeActionIdForFilename(actionId) : actionId;
+		return path.join(this.getBlockPath(blockId), 'actions', `${filename}.json`);
 	}
 
-	private getMaterializedPath(blockId: BlockId, actionId: ActionId): string {
-		return path.join(this.getBlockPath(blockId), 'blocks', `${encodeActionIdForFilename(actionId)}.json`);
+	private getMaterializedPath(blockId: BlockId, actionId: ActionId, encoded = true): string {
+		const filename = encoded ? encodeActionIdForFilename(actionId) : actionId;
+		return path.join(this.getBlockPath(blockId), 'blocks', `${filename}.json`);
+	}
+
+	// Reads an action-id-keyed file by its canonical (percent-encoded) path,
+	// falling back on a miss to the legacy raw-colon path written by pre-encode
+	// nodes (e.g. POSIX files literally named `actions/tx:<hash>.json`).
+	//
+	// Tradeoff: this reads legacy files in place and never renames them, so a
+	// store upgraded from a pre-encode node keeps mixed naming on disk. That is
+	// acceptable pre-1.0; a future migration sweep can normalize if desired. We
+	// deliberately do NOT migrate-on-read here — reads stay side-effect-free.
+	//
+	// win32 guard: a raw-colon path is not a benign miss on Windows — the colon
+	// is parsed as an NTFS alternate-data-stream separator and a read there can
+	// throw a non-ENOENT error rather than cleanly missing. Raw-colon files
+	// cannot have been written on win32 anyway, so we skip the fallback there
+	// (losing nothing) and swallow ALL fallback errors elsewhere, guaranteeing
+	// the fallback never surfaces a new throw to callers.
+	private async readActionScopedFile<T>(encodedPath: string, rawPath: string): Promise<T | undefined> {
+		const hit = await this.readIfExists<T>(encodedPath);
+		if (hit !== undefined) return hit;
+		if (process.platform === 'win32' || rawPath === encodedPath) return undefined;
+		return fs.readFile(rawPath, 'utf-8')
+			.then(content => JSON.parse(content) as T)
+			.catch(() => undefined);
 	}
 
 	private async readIfExists<T>(filePath: string): Promise<T | undefined> {

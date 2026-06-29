@@ -94,3 +94,85 @@ describe('FileRawStorage action-id filename encoding (colon / base64url consensu
 		expect(await storage.getMaterializedBlock(BLOCK_ID, STAMP_ACTION_ID)).to.deep.equal(block);
 	});
 });
+
+/**
+ * Legacy raw-colon read fallback (ticket
+ * `filestorage-posix-colon-actionid-migration`).
+ *
+ * Pre-encode nodes wrote action-id-keyed files with the raw colon verbatim
+ * (`actions/tx:<hash>.json`). On POSIX the colon is a legal filename char, so
+ * those durable files exist on disk; after the Windows-compat encode fix the
+ * read helpers compute the encoded path (`actions/tx%3A<hash>.json`) and would
+ * miss them. `FileRawStorage` now falls back to the raw-colon path on an
+ * encoded-path miss.
+ *
+ * A raw-colon filename cannot be created on win32 (the colon is an NTFS ADS
+ * separator), so the fallback only matters — and is only tested — on POSIX.
+ * These tests would FAIL before the fallback landed (encoded miss → undefined).
+ */
+describe('FileRawStorage legacy raw-colon read fallback (POSIX-only)', function () {
+	this.timeout(20000);
+
+	before(function () {
+		if (process.platform === 'win32') this.skip();
+	});
+
+	let dir: string;
+	let storage: FileRawStorage;
+
+	beforeEach(async () => {
+		dir = path.join(os.tmpdir(), 'optimystic-fs-actionid-legacy', randomUUID());
+		await fs.mkdir(dir, { recursive: true });
+		storage = new FileRawStorage(dir);
+	});
+	afterEach(async () => {
+		await fs.rm(dir, { recursive: true, force: true });
+	});
+
+	// Writes a file at the pre-encode raw-colon path, bypassing the API entirely
+	// (the API only ever writes the encoded name now).
+	async function writeRawColonFile(scope: string, actionId: string, value: unknown): Promise<string> {
+		const scopeDir = path.join(dir, BLOCK_ID, scope);
+		await fs.mkdir(scopeDir, { recursive: true });
+		const filePath = path.join(scopeDir, `${actionId}.json`);
+		await fs.writeFile(filePath, JSON.stringify(value));
+		return filePath;
+	}
+
+	it('getTransaction reads a legacy raw-colon actions/tx:<hash>.json file', async () => {
+		const transform = makeTransform('legacy-tx');
+		await writeRawColonFile('actions', TX_ACTION_ID, transform);
+
+		expect(await storage.getTransaction(BLOCK_ID, TX_ACTION_ID)).to.deep.equal(transform);
+	});
+
+	it('getMaterializedBlock reads a legacy raw-colon blocks/stamp:<hash>.json file', async () => {
+		const block: IBlock = { header: { id: 'legacy-mat' as BlockId, type: 'TST', collectionId: BLOCK_ID } };
+		await writeRawColonFile('blocks', STAMP_ACTION_ID, block);
+
+		expect(await storage.getMaterializedBlock(BLOCK_ID, STAMP_ACTION_ID)).to.deep.equal(block);
+	});
+
+	it('getPendingTransaction reads a legacy raw-colon pend/tx:<hash>.json file', async () => {
+		const transform = makeTransform('legacy-pend');
+		await writeRawColonFile('pend', TX_ACTION_ID, transform);
+
+		expect(await storage.getPendingTransaction(BLOCK_ID, TX_ACTION_ID)).to.deep.equal(transform);
+	});
+
+	it('returns undefined for a genuinely-absent id (fallback must not invent data)', async () => {
+		const absent = 'tx:ZZZ_absent-0000000000000000000000000000000000' as ActionId;
+		expect(await storage.getTransaction(BLOCK_ID, absent)).to.equal(undefined);
+		expect(await storage.getMaterializedBlock(BLOCK_ID, absent)).to.equal(undefined);
+		expect(await storage.getPendingTransaction(BLOCK_ID, absent)).to.equal(undefined);
+	});
+
+	it('prefers the encoded file when both encoded and raw-colon files exist', async () => {
+		// Canonical (encoded) write via the API, plus a stale raw-colon file on disk.
+		const encoded = makeTransform('encoded-wins');
+		await storage.saveTransaction(BLOCK_ID, TX_ACTION_ID, encoded);
+		await writeRawColonFile('actions', TX_ACTION_ID, makeTransform('stale-raw'));
+
+		expect(await storage.getTransaction(BLOCK_ID, TX_ACTION_ID)).to.deep.equal(encoded);
+	});
+});
