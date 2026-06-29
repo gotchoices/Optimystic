@@ -384,11 +384,12 @@ export class Libp2pKeyPeerNetwork implements IKeyNetwork, IPeerNetwork {
 		const t0 = Date.now();
 		const excludedSet = new Set<string>((_options?.excludedPeers ?? []).map(p => p.toString()))
 		const keyStr = this.toCacheKey(key).substring(0, 12);
-		// Tracks whether the network-membership filter excluded a cross-network peer
-		// during any attempt. If selection ultimately fails with self unavailable, this
-		// lets us surface NO_NETWORK_COORDINATOR (the real cause) instead of the generic
-		// NO_COORDINATOR_AVAILABLE.
-		let droppedForeignAnyAttempt = false;
+		// Tracks whether the network-membership filter excluded an UNCONFIRMED candidate
+		// — `foreign` (another network) OR `unknown` (not yet confirmed to serve this
+		// network) — during any attempt. If selection ultimately fails with self
+		// unavailable, this lets us surface NO_NETWORK_COORDINATOR (the real cause)
+		// instead of the generic NO_COORDINATOR_AVAILABLE.
+		let droppedUnconfirmedAnyAttempt = false;
 
 		this.log('findCoordinator:start key=%s excluded=%o', keyStr, Array.from(excludedSet).map(s => s.substring(0, 12)))
 
@@ -424,14 +425,16 @@ export class Libp2pKeyPeerNetwork implements IKeyNetwork, IPeerNetwork {
 					.sort((a, b) => (this.reputation?.getScore(a) ?? 0) - (this.reputation?.getScore(b) ?? 0))
 				this.log('findCoordinator:fret-connected key=%s count=%d peers=%o', keyStr, connectedFretIds.length, connectedFretIds.map(s => s.substring(0, 12)))
 
-				// Network-membership scoping (no-op when protocolPrefix is unset): never select a
-				// peer serving a DIFFERENT network, preferring positively-serving peers over
-				// not-yet-identified ('unknown') ones. A cross-network peer is permanently
-				// 'unknown' (its namespaced identify never completes), so over the 3×500ms
-				// retry window a real same-network peer (which flips to 'serves') wins; self
-				// is always eligible.
-				const { ranked, droppedForeign } = await this.filterByMembership(connectedFretIds)
-				if (droppedForeign) droppedForeignAnyAttempt = true
+				// Network-membership scoping (no-op when protocolPrefix is unset): only a peer
+				// CONFIRMED to serve this network ('serves') is eligible — both `foreign`
+				// (another network) and `unknown` (not yet identified) peers are excluded
+				// from selection. A cross-network peer is permanently 'unknown' (its
+				// namespaced identify never completes), so it is never gambled on; over the
+				// 3×500ms retry window a genuine same-network peer flips to 'serves' on a
+				// re-read of the peerStore and is selected normally on that attempt. Self
+				// always classifies as 'serves' and stays eligible.
+				const { ranked, droppedUnconfirmed } = await this.filterByMembership(connectedFretIds)
+				if (droppedUnconfirmed) droppedUnconfirmedAnyAttempt = true
 				const pick = ranked[0]
 				if (pick) {
 					const pid = peerIdFromString(pick)
@@ -444,13 +447,16 @@ export class Libp2pKeyPeerNetwork implements IKeyNetwork, IPeerNetwork {
 			}
 
 			// fallback: prefer any existing connected peer that's not excluded or banned,
-			// scoped to this network's serving peers (a foreign peer is never picked).
+			// scoped to this network's serving peers (a `foreign` or not-yet-confirmed
+			// `unknown` peer is never picked). Note this candidate set is built from
+			// connected REMOTE peers and never includes self, so when no serving peer is
+			// present selection falls through to the last-resort self-coordination block.
 			const connectedCandidates = connected
 				.filter(p => !excludedSet.has(p.toString()) && !(this.reputation?.isBanned(p.toString())))
 				.sort((a, b) => (this.reputation?.getScore(a.toString()) ?? 0) - (this.reputation?.getScore(b.toString()) ?? 0))
 				.map(p => p.toString())
-			const { ranked: connRanked, droppedForeign: connDroppedForeign } = await this.filterByMembership(connectedCandidates)
-			if (connDroppedForeign) droppedForeignAnyAttempt = true
+			const { ranked: connRanked, droppedUnconfirmed: connDroppedUnconfirmed } = await this.filterByMembership(connectedCandidates)
+			if (connDroppedUnconfirmed) droppedUnconfirmedAnyAttempt = true
 			const connectedPick = connRanked[0]
 			if (connectedPick) {
 				const pid = peerIdFromString(connectedPick)
@@ -495,15 +501,16 @@ export class Libp2pKeyPeerNetwork implements IKeyNetwork, IPeerNetwork {
 		}
 
 		// Self is excluded and selection found no eligible peer. If the membership filter is
-		// the reason the candidate set emptied (the only other peers serve a DIFFERENT
-		// network), surface a distinct, accurate cause instead of the generic codes below.
-		if (droppedForeignAnyAttempt) {
+		// the reason the candidate set emptied (the only other peers are `foreign` — serving
+		// a DIFFERENT network — or `unknown` — not yet confirmed to serve this network),
+		// surface a distinct, accurate cause instead of the generic codes below.
+		if (droppedUnconfirmedAnyAttempt) {
 			this.log('findCoordinator:no-network-coordinator key=%s prefix=%s self=%s',
 				keyStr, this.protocolPrefix ?? '?', self.toString().substring(0, 12))
 			throw new FindCoordinatorError(
 				FIND_COORDINATOR_ERROR_CODES.NO_NETWORK_COORDINATOR,
 				`No coordinator available for key on network ${this.protocolPrefix ?? '?'}: ` +
-				`the remaining candidate peer(s) do not serve this network's cluster/repo protocol.`
+				`the remaining candidate peer(s) are foreign or not-yet-confirmed to serve this network's cluster/repo protocol.`
 			);
 		}
 
@@ -727,28 +734,34 @@ export class Libp2pKeyPeerNetwork implements IKeyNetwork, IPeerNetwork {
 	}
 
 	/**
-	 * Scope a reputation-ordered candidate id list to this network: drop `foreign`
-	 * peers entirely, then rank `serves` ahead of `unknown` while preserving the
-	 * incoming (reputation) order WITHIN each tier. A no-op (returns the input
-	 * unchanged) when `protocolPrefix` is unset or the list is empty.
+	 * Scope a reputation-ordered candidate id list to this network for COORDINATOR
+	 * selection: keep ONLY peers confirmed to serve this network (`serves`, which always
+	 * includes self), dropping both `foreign` peers (serving another network) and
+	 * `unknown` peers (peerStore protocol list empty — not yet confirmed). Incoming
+	 * (reputation) order is preserved among the surviving `serves` peers. A no-op
+	 * (returns the input unchanged, no drops) when `protocolPrefix` is unset or the list
+	 * is empty — the membership-disabled path is therefore untouched.
 	 *
-	 * `droppedForeign` reports whether any candidate was excluded for serving a
-	 * different network, so the caller can surface a distinct "no network coordinator"
-	 * failure rather than a generic one.
+	 * `droppedUnconfirmed` reports whether any candidate was excluded because it was not
+	 * confirmed to serve this network — `foreign` OR `unknown` under scoping — so the
+	 * caller can surface a distinct "no network coordinator" failure rather than a generic
+	 * one. An `unknown` peer is not gambled on as coordinator: a permanent cross-network
+	 * contaminant and a fresh same-network peer mid-identify are indistinguishable at an
+	 * instant, but the filter re-reads the peerStore on every retry attempt, so a genuine
+	 * same-network peer that completes `identify` within the retry window flips to `serves`
+	 * and is selected normally on that attempt.
 	 */
-	private async filterByMembership(ids: string[]): Promise<{ ranked: string[]; droppedForeign: boolean }> {
-		if (this.protocolPrefix == null || ids.length === 0) return { ranked: ids, droppedForeign: false }
+	private async filterByMembership(ids: string[]): Promise<{ ranked: string[]; droppedUnconfirmed: boolean }> {
+		if (this.protocolPrefix == null || ids.length === 0) return { ranked: ids, droppedUnconfirmed: false }
 		const selfStr = this.libp2p.peerId.toString()
 		const protocolsByPeer = await this.getPeerStoreProtocolsByPeer(ids.filter(id => id !== selfStr))
 		const serves: string[] = []
-		const unknown: string[] = []
-		let droppedForeign = false
+		let droppedUnconfirmed = false
 		for (const id of ids) {
 			const m = this.membershipOf(id, protocolsByPeer[id])
 			if (m === 'serves') serves.push(id)
-			else if (m === 'unknown') unknown.push(id)
-			else droppedForeign = true
+			else droppedUnconfirmed = true
 		}
-		return { ranked: [...serves, ...unknown], droppedForeign }
+		return { ranked: serves, droppedUnconfirmed }
 	}
 }

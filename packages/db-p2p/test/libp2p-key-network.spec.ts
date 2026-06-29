@@ -685,10 +685,12 @@ describe('Libp2pKeyPeerNetwork', () => {
 	// When two networks share physical nodes/bootstraps, a network-B peer can land in
 	// network-A's peerStore but its network-namespaced identify never completes, so its
 	// protocol list stays empty ('unknown') forever — whereas a same-network peer's list
-	// contains `${prefix}/cluster|repo/1.0.0` ('serves'). Selection must prefer 'serves' and
-	// never pick 'foreign'. `findCoordinator` falls back to 'unknown' when nothing serving
-	// exists (a single coordinator can be retried); `findCluster` NEVER admits 'unknown' (a
-	// cross-network contaminant in the cohort sinks the whole write — see tests below).
+	// contains `${prefix}/cluster|repo/1.0.0` ('serves'). Selection must keep only 'serves'
+	// peers (self always 'serves') and never pick 'foreign' OR 'unknown'. Neither
+	// `findCoordinator` nor `findCluster` gambles on an 'unknown' (possibly cross-network)
+	// peer: a genuine same-network peer becomes selectable only once it flips to 'serves'
+	// within the retry window; otherwise selection falls to self-coordination, and
+	// `findCoordinator` surfaces NO_NETWORK_COORDINATOR when self is excluded (see tests).
 	describe('network-membership scoping (protocolPrefix)', () => {
 		const PREFIX = '/optimystic/netA';
 		const servesProto = (prefix: string): string[] => [`${prefix}/cluster/1.0.0`, `${prefix}/repo/1.0.0`];
@@ -766,6 +768,51 @@ describe('Libp2pKeyPeerNetwork', () => {
 			let caught: unknown;
 			try {
 				await network.findCoordinator(new TextEncoder().encode('block-near-foreign'), { excludedPeers: [selfPeerId] });
+				expect.fail('Expected findCoordinator to throw NO_NETWORK_COORDINATOR');
+			} catch (err) {
+				caught = err;
+			}
+			expect(caught).to.be.instanceOf(FindCoordinatorError);
+			expect((caught as FindCoordinatorError).code).to.equal(FIND_COORDINATOR_ERROR_CODES.NO_NETWORK_COORDINATOR);
+		});
+
+		it('findCoordinator falls back to self-coordination when self is not near the key and only a connected cross-network peer remains', async () => {
+			// Self is NOT a FRET neighbor of the key (getNeighbors omits self), so it is not in
+			// the FRET-path candidate set; the only connected peer is a permanently cross-network
+			// 'unknown' (empty peerStore protocol list). Selection must NOT gamble on that peer —
+			// it falls through to last-resort self-coordination (a correct single-coordinator
+			// write under downsize), never returning the cross-network 'unknown'.
+			const crossNet = await makePeerId();
+			const fret = baseFret({ getNeighbors: () => [crossNet.toString()] });
+			const peerStore = peerStoreOf({ [crossNet.toString()]: { protocols: [] } });
+			const libp2p = createMockLibp2p(selfPeerId, { connections: [connTo(crossNet)], fret, peerStore });
+			// 'forming' + default HWM<=1 → self-coordination allowed (bootstrap-node); self NOT excluded.
+			const network = new Libp2pKeyPeerNetwork(libp2p, 16, undefined, 'forming', undefined, undefined, PREFIX);
+			const result = await network.findCoordinator(new TextEncoder().encode('block-near-crossnet'));
+			expect(result.toString(), 'self-coordinates rather than picking the cross-network peer').to.equal(selfPeerId.toString());
+		});
+
+		it('findCoordinator throws NO_NETWORK_COORDINATOR when the only candidate is a not-yet-confirmed cross-network peer and self is excluded', async () => {
+			// Companion to the foreign-peer case above: a cross-network peer is 'unknown' (empty
+			// protocol list), not 'foreign', yet selection must still fail fast with the accurate
+			// NO_NETWORK_COORDINATOR code rather than a generic no-coordinator/super-majority error.
+			const crossNet = await makePeerId();
+			// HWM>1 so this is NOT the solo-bootstrap exhausted case
+			const persistence = new MemoryPersistence({
+				version: 1,
+				networkHighWaterMark: 5,
+				lastConnectedTimestamp: Date.now(),
+				consecutiveIsolatedSessions: 0
+			});
+			const fret = baseFret({ getNeighbors: () => [crossNet.toString()] });
+			const peerStore = peerStoreOf({ [crossNet.toString()]: { protocols: [] } }); // identify never completed across networks
+			const libp2p = createMockLibp2p(selfPeerId, { connections: [connTo(crossNet)], fret, peerStore });
+			const network = new Libp2pKeyPeerNetwork(libp2p, 16, undefined, 'forming', persistence, undefined, PREFIX);
+			await network.initFromPersistedState();
+
+			let caught: unknown;
+			try {
+				await network.findCoordinator(new TextEncoder().encode('block-near-crossnet'), { excludedPeers: [selfPeerId] });
 				expect.fail('Expected findCoordinator to throw NO_NETWORK_COORDINATOR');
 			} catch (err) {
 				caught = err;
