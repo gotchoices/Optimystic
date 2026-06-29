@@ -825,7 +825,13 @@ describe('Libp2pKeyPeerNetwork', () => {
 			expect(Object.keys(cluster)).to.deep.equal([selfPeerId.toString()]);
 		});
 
-		it('findCluster backfills not-yet-identified members when no serving peer exists (fresh mesh not starved)', async () => {
+		it('findCluster does NOT backfill not-yet-identified members (self-only cohort)', async () => {
+			// An 'unknown' peer (empty peerStore protocol list) is indistinguishable between a
+			// permanently cross-network contaminant and a fresh same-network peer mid-identify.
+			// findCluster therefore never admits one on a viability floor: the cohort is self-only.
+			// A genuine fresh mesh is not starved — the write completes self-only under
+			// allowClusterDownsize (the default) and the peer is re-included as 'serves' on the
+			// caller's retry once identify completes.
 			const freshA = await makePeerId();
 			const freshB = await makePeerId();
 			const fret = baseFret({ assembleCohort: () => [freshA.toString(), freshB.toString()] });
@@ -834,12 +840,31 @@ describe('Libp2pKeyPeerNetwork', () => {
 				[freshB.toString()]: { protocols: [], addresses: [`/ip4/10.0.0.5/tcp/4001/p2p/${freshB.toString()}`] }
 			});
 			const libp2p = createMockLibp2p(selfPeerId, { fret, peerStore });
-			// clusterSize 3 → floor min(2,3)=2; self+serves(0)=1 < 2, so both 'unknown' members are kept.
+			// clusterSize 3, no serving peers → cohort is self-only; both 'unknown' members excluded.
 			const network = new Libp2pKeyPeerNetwork(libp2p, 3, undefined, 'joining', undefined, undefined, PREFIX);
 			const cluster = await network.findCluster(new TextEncoder().encode('k'));
-			expect(cluster[selfPeerId.toString()]).to.exist;
-			expect(cluster[freshA.toString()]).to.exist;
-			expect(cluster[freshB.toString()]).to.exist;
+			expect(Object.keys(cluster)).to.deep.equal([selfPeerId.toString()]);
+			expect(cluster[freshA.toString()], 'not-yet-identified peer excluded').to.not.exist;
+			expect(cluster[freshB.toString()], 'not-yet-identified peer excluded').to.not.exist;
+		});
+
+		it('findCluster keeps a self-only cohort when self is the sole serving peer and a cross-network peer sits nearer the key', async () => {
+			// Core regression: the writer is the only serving member present, and a permanently
+			// cross-network peer ('unknown', empty protocol list) sits nearer the key. The old
+			// viability-floor backfill admitted that peer, and the coordinator's repo dial then
+			// failed with `could not negotiate /optimystic/<other-network>/repo/1.0.0`, sinking
+			// the whole write. The cohort must now be self-only — the cross-network peer is never
+			// placed in it, so that negotiation is never even attempted.
+			const crossNet = await makePeerId();
+			const fret = baseFret({ assembleCohort: () => [crossNet.toString()] });
+			const peerStore = peerStoreOf({
+				[crossNet.toString()]: { protocols: [], addresses: [`/ip4/10.0.0.7/tcp/4001/p2p/${crossNet.toString()}`] }
+			});
+			const libp2p = createMockLibp2p(selfPeerId, { fret, peerStore });
+			const network = new Libp2pKeyPeerNetwork(libp2p, 2, undefined, 'joining', undefined, undefined, PREFIX);
+			const cluster = await network.findCluster(new TextEncoder().encode('k'));
+			expect(Object.keys(cluster)).to.deep.equal([selfPeerId.toString()]);
+			expect(cluster[crossNet.toString()], 'cross-network peer excluded').to.not.exist;
 		});
 
 		it('with protocolPrefix ABSENT, findCluster retains a cross-network member (filter disabled — regression guard)', async () => {

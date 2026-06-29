@@ -566,11 +566,15 @@ export class Libp2pKeyPeerNetwork implements IKeyNetwork, IPeerNetwork {
 		// member that serves a DIFFERENT network's protocol can never negotiate THIS
 		// network's cluster/repo dial, so it guarantees a super-majority failure rather
 		// than contributing a promise. Drop such 'foreign' members; build the cohort from
-		// positively-'serves' members first and backfill not-yet-identified ('unknown')
-		// members only while the serving cohort (incl. self) is below a small viability
-		// floor — so a freshly-formed single-network mesh whose members haven't all
-		// completed identify is never starved below quorum, while a steady-state healthy
-		// cohort (all 'serves') simply excludes the permanently-'unknown' cross-network peer.
+		// positively-'serves' members only and NEVER admit a not-yet-identified ('unknown')
+		// member. A permanently cross-network peer and a freshly-discovered same-network
+		// peer mid-identify are indistinguishable while 'unknown' (both have an empty
+		// peerStore protocol list), so admitting an 'unknown' on the strength of a viability
+		// floor risks pulling a cross-network contaminant into the cohort — its repo dial
+		// then negotiates a different network's protocol and the whole write fails. A fresh
+		// same-network peer is not starved: it flips to 'serves' once identify completes and
+		// is re-included on the caller's retry, and in the meantime a self-only cohort still
+		// completes the write under allowClusterDownsize (the default).
 		if (this.protocolPrefix != null) {
 			// `cohort` is the over-fetched nearest-first band. Classify each non-self
 			// member, preserving proximity order within each tier.
@@ -591,21 +595,16 @@ export class Libp2pKeyPeerNetwork implements IKeyNetwork, IPeerNetwork {
 			// the coordinator case), so reserving a slot for self keeps a healthy same-network
 			// cohort at exactly `clusterSize` members rather than `clusterSize + 1`. Over-sizing
 			// would inflate the super-majority promise count (ceil(peerCount * threshold)) above
-			// what the configured `clusterSize` intends and hurt write availability. The
-			// permanently-'unknown' cross-network peer that displaced a real one from the nearest
-			// window is excluded. Backfill with the nearest 'unknown' peers ONLY while the serving
-			// cohort (incl. self) is below the viability floor min(2, clusterSize): as soon as
-			// ONE other serving peer is known we stop admitting unknowns (and thus the cross-
-			// network contaminant); when self is otherwise alone we still admit unknowns so a
-			// just-formed legitimate mesh can reach quorum before all members complete identify.
-			// A still-unidentified legitimate peer that is transiently dropped flips to 'serves'
-			// once identify completes and is re-included on the caller's retry.
+			// what the configured `clusterSize` intends and hurt write availability. 'unknown'
+			// members are never backfilled: an 'unknown' peer may be a permanently cross-network
+			// contaminant whose repo dial cannot negotiate this network's protocol, and a fresh
+			// same-network peer mid-identify is indistinguishable from it. We therefore admit
+			// only positively-'serves' peers; when self is the sole serving member the cohort is
+			// self-only, which completes the write under allowClusterDownsize (the default) and
+			// re-includes any legitimate peer as 'serves' on the caller's retry once identify
+			// completes. `unknown.length` is still computed above for the diagnostic log line.
 			const nonSelfTarget = Math.max(0, this.clusterSize - 1)
-			const viabilityFloor = Math.min(2, this.clusterSize)
-			let others = serves.slice(0, nonSelfTarget)
-			if ((others.length + 1) < viabilityFloor) {
-				others = [...others, ...unknown.slice(0, nonSelfTarget - others.length)]
-			}
+			const others = serves.slice(0, nonSelfTarget)
 			ids = Array.from(new Set([selfId, ...others]))
 			this.log('findCluster:membership key=%s serves=%d unknown=%d foreignDropped=%d kept=%d',
 				keyStr, serves.length, unknown.length, foreignDropped, ids.length)
