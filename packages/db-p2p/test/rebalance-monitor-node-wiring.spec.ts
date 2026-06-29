@@ -140,4 +140,31 @@ describe('rebalance-monitor / node wiring (real libp2p, solo arachnode node)', f
 			await node.stop();
 		}
 	});
+
+	it('spreadOnChurn disabled: rebalance-only node still gets the single owned-block feed + clean teardown', async () => {
+		// Unified tracked set (5.2): the single owned-block feed (storageRepo.onAnyCollectionChange →
+		// shared ownedBlocks) is registered lazily by whichever monitor wires first. With spread
+		// DISABLED but rebalance ENABLED, the rebalance block must register the feed itself (its
+		// ensureOwnedBlockFeed() call) — otherwise a rebalance-only node would never track its blocks.
+		// This is the rebalance-only path the spread node-wiring assertion can't exercise.
+		const networkName = 'rebalance-wiring-spreadoff';
+		const node: any = await spawn(networkName, { spreadOnChurn: { enabled: false } });
+		try {
+			expect(node.spreadOnChurnMonitor, 'spread monitor not wired when disabled').to.equal(undefined);
+			const monitor = node.rebalanceMonitor as RebalanceMonitor;
+			expect(monitor, 'rebalance monitor still wired').to.exist;
+			expect((monitor as any).running, 'rebalance monitor started').to.equal(true);
+
+			expect(monitor.getTrackedBlockCount(), 'nothing tracked before any commit').to.equal(0);
+			// A commit fires the single owned-block feed that the rebalance block registered (no spread
+			// monitor exists to have registered it), so the shared set — and thus the monitor — tracks it.
+			const repo = node.coordinatedRepo as IRepo;
+			await pendCommit(repo, 'spreadoff-owned-block', 'rebalance-coll', 'spreadoff-a1', 1);
+			expect(monitor.getTrackedBlockCount(), 'rebalance-registered feed tracked the committed block').to.be.greaterThan(0);
+		} finally {
+			// The up-front feed-teardown wrapper unsubscribes regardless of which monitor registered the
+			// feed; a hang/throw here would mean the rebalance-only path leaked or mis-wired the teardown.
+			await node.stop();
+		}
+	});
 });
