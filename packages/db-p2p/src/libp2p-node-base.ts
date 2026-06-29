@@ -812,8 +812,15 @@ export async function createLibp2pNodeBase(
 
 					// onRebalance fires synchronously from the monitor's debounced check; the coordinator's
 					// reaction (pull gained / push lost, each partition-guarded) is async, so hop it off the
-					// handler with `void` rather than blocking the monitor's emit loop.
-					rebalanceMonitor.onRebalance((event) => { void coordinator.handleRebalanceEvent(event); });
+					// handler rather than blocking the monitor's emit loop. handleRebalanceEvent can REJECT
+					// (e.g. RestorationCoordinator.restore() throws while pulling a gained block) and a bare
+					// `void` would surface that as an unhandled rejection (process-fatal on Node >=15); the
+					// reaction is a resilience optimization, so swallow + log instead.
+					rebalanceMonitor.onRebalance((event) => {
+						coordinator.handleRebalanceEvent(event).catch((err) => {
+							log?.('rebalance reaction failed: %o', err);
+						});
+					});
 
 					// Feed owned blocks from the SAME storageRepo.onAnyCollectionChange feed that drives
 					// spread (every commit / received replica fires it). A SEPARATE subscription for this

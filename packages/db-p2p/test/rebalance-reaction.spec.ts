@@ -167,8 +167,9 @@ describe('RebalanceMonitor → BlockTransferCoordinator reaction wiring', () => 
 			''
 		);
 		const events: RebalanceEvent[] = [];
-		// Exactly the connection the node-base installs.
-		monitor.onRebalance((event) => { events.push(event); void coordinator.handleRebalanceEvent(event); });
+		// Exactly the connection the node-base installs (async reaction hopped off the emit loop, with
+		// its rejection swallowed so a restore/push failure cannot surface as an unhandled rejection).
+		monitor.onRebalance((event) => { events.push(event); coordinator.handleRebalanceEvent(event).catch(() => {}); });
 		return { monitor, coordinator, events };
 	}
 
