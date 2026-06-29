@@ -685,8 +685,10 @@ describe('Libp2pKeyPeerNetwork', () => {
 	// When two networks share physical nodes/bootstraps, a network-B peer can land in
 	// network-A's peerStore but its network-namespaced identify never completes, so its
 	// protocol list stays empty ('unknown') forever — whereas a same-network peer's list
-	// contains `${prefix}/cluster|repo/1.0.0` ('serves'). Selection must prefer 'serves',
-	// never pick 'foreign', and only fall back to 'unknown' when nothing serving exists.
+	// contains `${prefix}/cluster|repo/1.0.0` ('serves'). Selection must prefer 'serves' and
+	// never pick 'foreign'. `findCoordinator` falls back to 'unknown' when nothing serving
+	// exists (a single coordinator can be retried); `findCluster` NEVER admits 'unknown' (a
+	// cross-network contaminant in the cohort sinks the whole write — see tests below).
 	describe('network-membership scoping (protocolPrefix)', () => {
 		const PREFIX = '/optimystic/netA';
 		const servesProto = (prefix: string): string[] => [`${prefix}/cluster/1.0.0`, `${prefix}/repo/1.0.0`];
@@ -781,7 +783,7 @@ describe('Libp2pKeyPeerNetwork', () => {
 				[crossNet.toString()]: { protocols: [], addresses: [`/ip4/10.0.0.3/tcp/4001/p2p/${crossNet.toString()}`] }
 			});
 			const libp2p = createMockLibp2p(selfPeerId, { fret, peerStore });
-			// clusterSize 2 → floor min(2,2)=2; self+sameNet(serves)=2, so crossNet(unknown) is excluded.
+			// clusterSize 2 → self + nearest serving peer (sameNet) fills the cohort; crossNet ('unknown') is never admitted.
 			const network = new Libp2pKeyPeerNetwork(libp2p, 2, undefined, 'joining', undefined, undefined, PREFIX);
 			const cluster = await network.findCluster(new TextEncoder().encode('some-key'));
 			expect(cluster[selfPeerId.toString()], 'self is always kept').to.exist;
@@ -813,7 +815,7 @@ describe('Libp2pKeyPeerNetwork', () => {
 			expect(cluster[s1.toString()], 'nearest serving peer kept').to.exist;
 		});
 
-		it('findCluster always drops a foreign cohort member, even below the viability floor', async () => {
+		it('findCluster always drops a foreign cohort member (self-only cohort)', async () => {
 			const foreign = await makePeerId();
 			const fret = baseFret({ assembleCohort: () => [foreign.toString()] });
 			const peerStore = peerStoreOf({
@@ -865,6 +867,21 @@ describe('Libp2pKeyPeerNetwork', () => {
 			const cluster = await network.findCluster(new TextEncoder().encode('k'));
 			expect(Object.keys(cluster)).to.deep.equal([selfPeerId.toString()]);
 			expect(cluster[crossNet.toString()], 'cross-network peer excluded').to.not.exist;
+		});
+
+		it('findCluster with clusterSize 1 yields a self-only cohort even when serving peers are nearer the key', async () => {
+			// nonSelfTarget = max(0, clusterSize - 1) = 0, so no non-self member is admitted —
+			// not even a positively-serving one. The cohort is exactly self.
+			const sameNet = await makePeerId();
+			const fret = baseFret({ assembleCohort: () => [sameNet.toString()] });
+			const peerStore = peerStoreOf({
+				[sameNet.toString()]: { protocols: servesProto(PREFIX), addresses: [`/ip4/10.0.0.8/tcp/4001/p2p/${sameNet.toString()}`] }
+			});
+			const libp2p = createMockLibp2p(selfPeerId, { fret, peerStore });
+			const network = new Libp2pKeyPeerNetwork(libp2p, 1, undefined, 'joining', undefined, undefined, PREFIX);
+			const cluster = await network.findCluster(new TextEncoder().encode('k'));
+			expect(Object.keys(cluster)).to.deep.equal([selfPeerId.toString()]);
+			expect(cluster[sameNet.toString()], 'no slot for non-self members at clusterSize 1').to.not.exist;
 		});
 
 		it('with protocolPrefix ABSENT, findCluster retains a cross-network member (filter disabled — regression guard)', async () => {
