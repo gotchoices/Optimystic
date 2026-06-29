@@ -26,6 +26,7 @@ import {
 	bytesToB64url,
 	b64urlToBytes,
 	bytesEqual,
+	encodeCohortMessage,
 	Tier,
 	type RingCoord,
 	type MembershipCertV1,
@@ -447,16 +448,20 @@ async function memberOf(key: PrivateKey, peerId: PeerId): Promise<Member> {
 		expect(forged, 'a forged single-signer cert is untrusted').to.equal('untrusted');
 	});
 
-	it('the verifier does a one-fetch-and-retry over /membership when its cached cert is stale', async () => {
+	it('a stale cert in the membership source forces one real /membership refetch, then verifies', async () => {
 		const primary = primaryFor(coord0);
 		const cert = coord0Cert;
 
-		const participant = nodes.find((n) => n.idStr !== primary.idStr)!;
-		const verifier = participant.host.service.verifier();
+		// Use a node that has NOT yet cached coord_0's cert via the verifier (i.e. not the participant from
+		// test 1, which already TOFU-cached it). With N ≥ 3 there is always at least one such fresh node.
+		const firstNonPrimary = nodes.find((n) => n.idStr !== primary.idStr)!;
+		const freshParticipant = nodes.find((n) => n.idStr !== primary.idStr && n.idStr !== firstNonPrimary.idStr)!;
 
-		// Prime the verifier with a STALE cert for coord_0: a different member set, so the real message's
-		// signers are not a subset of it → the cached-cert attempt fails and forces exactly one real
-		// `/membership` refetch, which returns the fresh cohort cert and verifies.
+		// Seed the membership SOURCE (not the verifier) with a fabricated stale cert: a non-self-consistent
+		// member set, so the verifier's cached-cert check fails and forces exactly one real `/membership`
+		// refetch. Because the source feeds TOFU-cached entries (not trusted ones), the refetch's genuine
+		// cert is permitted to replace it — the trust gate allows this path (unlike `verifier.cache()`, which
+		// marks the cert trusted and blocks silent overwrites by un-anchored refetches).
 		const stale = [bytesToB64url(staleMemberBytes())];
 		const staleCert: MembershipCertV1 = {
 			v: 1,
@@ -467,11 +472,11 @@ async function memberOf(key: PrivateKey, peerId: PeerId): Promise<Member> {
 			thresholdSig: bytesToB64url(new Uint8Array([0])),
 			signers: stale,
 		};
-		verifier.cache(staleCert);
+		freshParticipant.host.membershipSource.cache(coord0, encodeCohortMessage(staleCert));
 
 		const certPayload = membershipCertSigningPayload(cert);
-		const verdict = await verifier.verifyMessage(cert.signers.map(b64urlToBytes), coord0, 0, certPayload, b64urlToBytes(cert.thresholdSig));
-		expect(verdict, 'a stale cached cert triggers one /membership refetch, then verifies').to.equal('verified');
+		const verdict = await freshParticipant.host.service.verifier().verifyMessage(cert.signers.map(b64urlToBytes), coord0, 0, certPayload, b64urlToBytes(cert.thresholdSig));
+		expect(verdict, 'a stale source cert forces one real /membership refetch, then verifies').to.equal('verified');
 	});
 
 	// --- 3. Cohort-gossip record replication + handoff readiness over real /cohort-gossip ---

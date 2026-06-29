@@ -460,6 +460,12 @@ export interface CohortTopicHost {
 	 * limiter's `size` and the `highWater` `LruMap` — and so the gossip-cadence sweep wiring is observable.
 	 */
 	readonly promoteGate: PromoteGate;
+	/**
+	 * The node's local membership-cert cache. Exposed for test/diagnostic introspection: seed an entry via
+	 * `cache(coord, encoded)` to prime the verifier's stale-refetch path over the real `/membership` protocol
+	 * without marking it trusted (unlike `verifier.cache()`, which records the cert as self-published).
+	 */
+	readonly membershipSource: { cache(coord: RingCoord, encoded: Uint8Array): void };
 	/** Unregister the four protocols and tear down every coord engine. */
 	stop(): Promise<void>;
 }
@@ -873,6 +879,7 @@ export async function createCohortTopicHost(node: Libp2p, fret: FretService, opt
 		profile,
 		gossipTransport,
 		promoteGate,
+		membershipSource,
 		stop: async (): Promise<void> => {
 			stopped = true;
 			clearInterval(timer);
