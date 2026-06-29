@@ -679,14 +679,50 @@ export async function createLibp2pNodeBase(
 		await (coordinatedRepo as import('./repo/coordinator-repo.js').CoordinatorRepo).recoverTransactions();
 	}
 
+	// --- Shared owned-block set for the resilience monitors ---
+	// SpreadOnChurnMonitor (sender) and RebalanceMonitor (responsibility tracker) both act on "the
+	// blocks this node physically holds". They share ONE Set so the two can never drift: a single
+	// owned-block feed populates it, and the rebalance responsibility-loss signal evicts from it
+	// (in the rebalance block below). Both monitors take this exact instance via deps.trackedBlocks.
+	const networkManager = (node as any).services?.networkManager as NetworkManagerService | undefined;
+	const ownedBlocks = new Set<string>();
+	// Single owned-block feed: every block this node commits OR receives as a replica fires
+	// storageRepo.onAnyCollectionChange. Subscribe to storageRepo DIRECTLY (not
+	// node.blockChangeNotifier): the cohort-topic activation block below may replace
+	// blockChangeNotifier with a decorating bridge, but storageRepo keeps emitting on its own
+	// surface regardless of that opt-in. NOTE: blocks already durable from a previous run are NOT
+	// re-emitted on startup, so they are not tracked until next touched - acceptable here (churn
+	// re-replication / rebalance re-derive over time); an initial-scan seed is a follow-on
+	// enhancement (optimystic-owned-block-initial-scan-seed). Registered lazily the first time a
+	// monitor that reads ownedBlocks is wired, so when BOTH monitors are disabled no subscription
+	// leaks; torn down exactly once in the stop wrapper below.
+	let offOwnedBlockFeed: (() => void) | undefined;
+	const ensureOwnedBlockFeed = (): void => {
+		if (offOwnedBlockFeed) return;
+		offOwnedBlockFeed = storageRepo.onAnyCollectionChange((e) => {
+			for (const blockId of e.blockIds) ownedBlocks.add(blockId);
+		});
+	};
+	// Single owned-block-feed teardown. Registered up front (before either monitor's own stop
+	// wrapper) so it runs regardless of WHICH monitor subscribed the feed - including the
+	// spread-disabled / rebalance-only case. Idempotent: offOwnedBlockFeed is undefined-guarded.
+	{
+		const previousStop = node.stop.bind(node);
+		node.stop = async () => {
+			try {
+				offOwnedBlockFeed?.();
+			} finally {
+				await previousStop();
+			}
+		};
+	}
+
 	// --- Churn-resilient spread: drive SpreadOnChurnMonitor on a live node ---
 	// Nothing previously activated the SENDING side of the churn-resilient spread protocol on a
-	// real node. Here we init + start the monitor and feed it the blocks this node physically
-	// holds, so a debounced connection:close re-pushes them to expansion-cohort peers (the
-	// receiver durably persists each push via saveReplicatedBlock).
-	const networkManager = (node as any).services?.networkManager as NetworkManagerService | undefined;
+	// real node. Here we init + start the monitor (sharing ownedBlocks) and ensure the single
+	// owned-block feed is live, so a debounced connection:close re-pushes the node's blocks to
+	// expansion-cohort peers (the receiver durably persists each push via saveReplicatedBlock).
 	let spreadMonitor: SpreadOnChurnMonitor | undefined;
-	let offOwnedBlockFeed: (() => void) | undefined;
 	if (networkManager && (options.spreadOnChurn?.enabled ?? true) !== false) {
 		try {
 			spreadMonitor = networkManager.initSpreadOnChurnMonitor(
@@ -695,21 +731,11 @@ export async function createLibp2pNodeBase(
 				keyNetwork,
 				options.clusterSize ?? 10,
 				protocolPrefix,
+				ownedBlocks,
 				options.spreadOnChurn,
 			);
 			await spreadMonitor.start();
-			// Feed owned blocks: every block this node commits OR receives as a replica fires
-			// storageRepo.onAnyCollectionChange. Subscribe to storageRepo DIRECTLY (not
-			// node.blockChangeNotifier): the cohort-topic activation block below may replace
-			// blockChangeNotifier with a decorating bridge, but storageRepo keeps emitting on its
-			// own surface regardless of that opt-in. NOTE: blocks already durable from a previous
-			// run are NOT re-emitted on startup, so they are not tracked until next touched -
-			// acceptable here (churn re-replication re-derives over time); an initial-scan is a
-			// follow-on enhancement.
-			const monitor = spreadMonitor;
-			offOwnedBlockFeed = storageRepo.onAnyCollectionChange((e) => {
-				for (const blockId of e.blockIds) monitor.trackBlock(blockId);
-			});
+			ensureOwnedBlockFeed();
 		} catch (err) {
 			// Spread is a resilience optimization, not a correctness requirement - a wiring
 			// failure (e.g. FRET briefly unavailable) must NOT hard-fail node startup, unlike the
@@ -721,16 +747,15 @@ export async function createLibp2pNodeBase(
 	// Expose for tests/diagnostics (mirrors node.keyNetwork / node.reputation).
 	(node as any).spreadOnChurnMonitor = spreadMonitor;
 
-	// Disposal: release the owned-block subscription + stop the monitor deterministically
-	// before the transports close. Composes with the arachnode / clusterMember / cohort-topic
-	// stop wrappers (each calls its captured previousStop last). Both steps are idempotent (the
-	// unsubscribe is flag-guarded; SpreadOnChurnMonitor.stop early-returns when not running), so
-	// a double node.stop() does not throw.
+	// Disposal: stop the spread monitor deterministically before the transports close. Composes
+	// with the arachnode / clusterMember / cohort-topic stop wrappers (each calls its captured
+	// previousStop last). Idempotent (SpreadOnChurnMonitor.stop early-returns when not running), so
+	// a double node.stop() does not throw. The owned-block feed teardown is the separate up-front
+	// wrapper above (shared across both monitors).
 	{
 		const previousStop = node.stop.bind(node);
 		node.stop = async () => {
 			try {
-				offOwnedBlockFeed?.();
 				if (spreadMonitor) await spreadMonitor.stop();
 			} finally {
 				await previousStop();
@@ -806,6 +831,7 @@ export async function createLibp2pNodeBase(
 					const rebalanceMonitor = networkManager.initRebalanceMonitor(
 						partitionDetector,
 						fretAdapter,
+						ownedBlocks,
 						options.rebalance,
 					);
 					await rebalanceMonitor.start();
@@ -816,36 +842,43 @@ export async function createLibp2pNodeBase(
 					// (e.g. RestorationCoordinator.restore() throws while pulling a gained block) and a bare
 					// `void` would surface that as an unhandled rejection (process-fatal on Node >=15); the
 					// reaction is a resilience optimization, so swallow + log instead.
+					//
+					// ALONGSIDE dispatching to the coordinator, drive the shared owned-block set off this
+					// authoritative responsibility signal: a LOST block is evicted (so spread stops
+					// re-pushing a block this node no longer owns — the authoritative untrack that
+					// complements spread's lazy no-local-data self-prune) and its stale was-responsible
+					// snapshot entry cleared, both via untrackBlock; a GAINED block is added so it is tracked
+					// even before its next commit/replica touches the feed. Ordering vs the coordinator does
+					// not matter for correctness — the coordinator reads `event`, not the set.
+					//
+					// Best-effort iteration safety: this eviction can mutate ownedBlocks while
+					// SpreadOnChurnMonitor (or this monitor) is mid for...of over the same Set inside an
+					// async loop. Adding/deleting a Set entry during iteration does not throw in JS — entries
+					// are visited best-effort — which is acceptable for a resilience mechanism, so we
+					// document it here rather than add locking.
 					rebalanceMonitor.onRebalance((event) => {
+						for (const blockId of event.gained) ownedBlocks.add(blockId);
+						for (const blockId of event.lost) rebalanceMonitor.untrackBlock(blockId);
 						coordinator.handleRebalanceEvent(event).catch((err) => {
 							log?.('rebalance reaction failed: %o', err);
 						});
 					});
 
-					// Feed owned blocks from the SAME storageRepo.onAnyCollectionChange feed that drives
-					// spread (every commit / received replica fires it). A SEPARATE subscription for this
-					// ticket; unify-monitor-tracked-block-set collapses the two monitors onto one shared set.
-					// NOTE: blocks already durable from a previous run are NOT re-emitted on startup, so they
-					// are not tracked until next touched - same caveat the spread block documents (see
-					// optimystic-owned-block-initial-scan-seed for the deferred initial-scan seed).
-					const monitor = rebalanceMonitor;
-					const offRebalanceOwnedBlockFeed = storageRepo.onAnyCollectionChange((e) => {
-						for (const blockId of e.blockIds) monitor.trackBlock(blockId);
-					});
+					// Feed owned blocks via the SINGLE shared feed (idempotent — already live if the spread
+					// block above wired it). Both monitors read the same ownedBlocks set this populates.
+					ensureOwnedBlockFeed();
 
 					// Expose for tests/diagnostics (mirrors node.spreadOnChurnMonitor).
 					(node as any).rebalanceMonitor = rebalanceMonitor;
 					(node as any).blockTransferCoordinator = coordinator;
 
-					// Disposal: release the owned-block subscription + stop the monitor before transports
-					// close. Composes with the other stop wrappers (each calls its captured previousStop
-					// last). Both steps are idempotent — the unsubscribe is a plain off(), and
-					// RebalanceMonitor.stop() early-returns when not running (NetworkManagerService.stop()
-					// also stops it) — so a double node.stop() does not throw.
+					// Disposal: stop the monitor before transports close. Composes with the other stop
+					// wrappers (each calls its captured previousStop last). Idempotent — RebalanceMonitor.stop()
+					// early-returns when not running (NetworkManagerService.stop() also stops it). The shared
+					// owned-block feed teardown is the separate up-front wrapper (not duplicated here).
 					const previousStop = node.stop.bind(node);
 					node.stop = async () => {
 						try {
-							offRebalanceOwnedBlockFeed?.();
 							await rebalanceMonitor.stop();
 						} finally {
 							await previousStop();

@@ -33,13 +33,27 @@ export interface RebalanceMonitorDeps {
 	fret: FretService
 	partitionDetector: PartitionDetector
 	fretAdapter: ArachnodeFretAdapter
+	/**
+	 * The owned-block tracked set. When provided (e.g. the shared `ownedBlocks` set wired in
+	 * `libp2p-node-base`), the monitor references this exact `Set` instead of constructing its own,
+	 * so it stays in lock-step with the `SpreadOnChurnMonitor` that shares it. Omit for standalone
+	 * construction (unit tests) — a fresh private `Set` preserves all existing behavior. Note: only
+	 * `trackedBlocks` is shared; `responsibilitySnapshot` stays per-monitor (it is rebalance's own
+	 * was-responsible memory, not owned-block tracking).
+	 */
+	trackedBlocks?: Set<string>
 }
 
 type RebalanceHandler = (event: RebalanceEvent) => void
 
 export class RebalanceMonitor implements Startable {
 	private running = false
-	private readonly trackedBlocks = new Set<string>()
+	private readonly trackedBlocks: Set<string>
+	// Per-monitor was-responsible memory (NOT shared, unlike trackedBlocks). When the shared
+	// trackedBlocks set is mutated externally — spread's no-local-data self-prune, or the node's
+	// responsibility-loss eviction going through untrackBlock — a snapshot entry for a since-removed
+	// block may linger here. That is acceptable: performRebalanceCheck only iterates trackedBlocks, so
+	// a lingering entry is inert; if the block is later re-fed, its responsibility is simply re-derived.
 	private readonly responsibilitySnapshot = new Map<string, boolean>()
 	private readonly handlers: RebalanceHandler[] = []
 	private debounceTimer: ReturnType<typeof setTimeout> | null = null
@@ -58,6 +72,10 @@ export class RebalanceMonitor implements Startable {
 		private readonly deps: RebalanceMonitorDeps,
 		config: RebalanceMonitorConfig = {}
 	) {
+		// Share the injected owned-block set when present (so spread + rebalance never drift);
+		// otherwise own a private set (standalone construction / unit tests). Only trackedBlocks is
+		// shared — responsibilitySnapshot stays per-monitor.
+		this.trackedBlocks = deps.trackedBlocks ?? new Set<string>()
 		this.debounceMs = config.debounceMs ?? 5000
 		this.minRebalanceIntervalMs = config.minRebalanceIntervalMs ?? 60000
 		this.suppressDuringPartition = config.suppressDuringPartition ?? true

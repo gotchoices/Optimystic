@@ -78,10 +78,19 @@ describe('rebalance-monitor / node wiring (real libp2p, solo arachnode node)', f
 			expect(monitor.getTrackedBlockCount(), 'no blocks tracked before any commit').to.equal(0);
 
 			// A commit through the coordinated repo lands in the local storageRepo, which emits
-			// onAnyCollectionChange → trackBlock. (clusterSize 1 → self-only consensus.)
+			// onAnyCollectionChange → the single shared owned-block feed. (clusterSize 1 → self-only.)
 			const repo = node.coordinatedRepo as IRepo;
 			await pendCommit(repo, 'rebalance-owned-block', 'rebalance-coll', 'rebalance-a1', 1);
 			expect(monitor.getTrackedBlockCount(), 'the owned-block feed tracked the committed block').to.be.greaterThan(0);
+
+			// Unified tracked set (5.2-unify-monitor-tracked-block-set): on an arachnode node BOTH the
+			// rebalance and spread monitors are wired against ONE shared owned-block Set fed by a single
+			// onAnyCollectionChange subscription, so after the commit they report the SAME non-zero count
+			// (a drift here means the two monitors are back on separate sets).
+			const spreadMonitor = node.spreadOnChurnMonitor;
+			expect(spreadMonitor, 'spread monitor also wired on the arachnode node').to.exist;
+			expect(spreadMonitor.getTrackedBlockCount(), 'both monitors agree on the shared tracked-block count')
+				.to.equal(monitor.getTrackedBlockCount());
 		} finally {
 			await node.stop();
 		}

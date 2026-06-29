@@ -48,6 +48,13 @@ export interface SpreadOnChurnDeps {
 	peerNetwork: IPeerNetwork
 	clusterSize: number
 	protocolPrefix?: string
+	/**
+	 * The owned-block tracked set. When provided (e.g. the shared `ownedBlocks` set wired in
+	 * `libp2p-node-base`), the monitor references this exact `Set` instead of constructing its own,
+	 * so it stays in lock-step with the `RebalanceMonitor` that shares it. Omit for standalone
+	 * construction (unit tests) — a fresh private `Set` preserves all existing behavior.
+	 */
+	trackedBlocks?: Set<string>
 }
 
 export interface SpreadEvent {
@@ -83,7 +90,7 @@ const DEFAULT_CONFIG: SpreadOnChurnConfig = {
 
 export class SpreadOnChurnMonitor implements Startable {
 	private running = false
-	private readonly trackedBlocks = new Set<string>()
+	private readonly trackedBlocks: Set<string>
 	private readonly handlers: SpreadHandler[] = []
 	private debounceTimer: ReturnType<typeof setTimeout> | null = null
 	private departureTimestamps: number[] = []
@@ -96,6 +103,9 @@ export class SpreadOnChurnMonitor implements Startable {
 		private readonly deps: SpreadOnChurnDeps,
 		config: Partial<SpreadOnChurnConfig> = {}
 	) {
+		// Share the injected owned-block set when present (so spread + rebalance never drift);
+		// otherwise own a private set (standalone construction / unit tests).
+		this.trackedBlocks = deps.trackedBlocks ?? new Set<string>()
 		this.config = { ...DEFAULT_CONFIG, ...config }
 		this.onConnectionClose = () => this.handleDeparture()
 	}

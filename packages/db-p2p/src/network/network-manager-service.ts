@@ -72,6 +72,7 @@ export class NetworkManagerService implements Startable {
 	initRebalanceMonitor(
 		partitionDetector: PartitionDetector,
 		fretAdapter: ArachnodeFretAdapter,
+		trackedBlocks: Set<string>,
 		config?: RebalanceMonitorConfig
 	): RebalanceMonitor {
 		const libp2p = this.getLibp2p()
@@ -79,8 +80,10 @@ export class NetworkManagerService implements Startable {
 		if (!libp2p || !fret) {
 			throw new Error('Cannot init RebalanceMonitor: libp2p or FRET not available')
 		}
+		// trackedBlocks is the shared owned-block set: the node passes the SAME Set instance into
+		// both monitor inits so spread and rebalance act on one source of truth and never drift.
 		this.rebalanceMonitor = new RebalanceMonitor(
-			{ libp2p, fret, partitionDetector, fretAdapter },
+			{ libp2p, fret, partitionDetector, fretAdapter, trackedBlocks },
 			config
 		)
 		return this.rebalanceMonitor
@@ -102,6 +105,7 @@ export class NetworkManagerService implements Startable {
 		peerNetwork: SpreadOnChurnDeps['peerNetwork'],
 		clusterSize: number,
 		protocolPrefix: string,
+		trackedBlocks: Set<string>,
 		config?: Partial<SpreadOnChurnConfig>
 	): SpreadOnChurnMonitor {
 		const libp2p = this.getLibp2p()
@@ -113,8 +117,10 @@ export class NetworkManagerService implements Startable {
 		// BlockTransferClient with it, and the receiving node registers the block-transfer
 		// handler under /optimystic/<networkName>. A missing/empty prefix dials the wrong
 		// protocol and every churn push fails to connect.
+		// trackedBlocks is the shared owned-block set: the node passes the SAME Set instance into
+		// both monitor inits so spread and rebalance act on one source of truth and never drift.
 		this.spreadOnChurnMonitor = new SpreadOnChurnMonitor(
-			{ libp2p, fret, partitionDetector, repo, peerNetwork, clusterSize, protocolPrefix },
+			{ libp2p, fret, partitionDetector, repo, peerNetwork, clusterSize, protocolPrefix, trackedBlocks },
 			config
 		)
 		return this.spreadOnChurnMonitor
