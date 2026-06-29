@@ -463,9 +463,10 @@ export interface CohortTopicHost {
 	/**
 	 * The node's local membership-cert cache. Exposed for test/diagnostic introspection: seed an entry via
 	 * `cache(coord, encoded)` to prime the verifier's stale-refetch path over the real `/membership` protocol
-	 * without marking it trusted (unlike `verifier.cache()`, which records the cert as self-published).
+	 * without marking it trusted (unlike `verifier.cache()`, which records the cert as self-published), and
+	 * read it back via `current(coord)` to observe that a `/membership` refetch replaced a stale cached view.
 	 */
-	readonly membershipSource: { cache(coord: RingCoord, encoded: Uint8Array): void };
+	readonly membershipSource: { cache(coord: RingCoord, encoded: Uint8Array): void; current(coord: RingCoord): Promise<Uint8Array | undefined> };
 	/** Unregister the four protocols and tear down every coord engine. */
 	stop(): Promise<void>;
 }

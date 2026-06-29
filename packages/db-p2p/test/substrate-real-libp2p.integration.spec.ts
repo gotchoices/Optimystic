@@ -472,11 +472,21 @@ async function memberOf(key: PrivateKey, peerId: PeerId): Promise<Member> {
 			thresholdSig: bytesToB64url(new Uint8Array([0])),
 			signers: stale,
 		};
-		freshParticipant.host.membershipSource.cache(coord0, encodeCohortMessage(staleCert));
+		const staleEncoded = encodeCohortMessage(staleCert);
+		freshParticipant.host.membershipSource.cache(coord0, staleEncoded);
+		expect(bytesEqual(staleEncoded, (await freshParticipant.host.membershipSource.current(coord0))!), 'the stale cert is the cached view before the verify').to.equal(true);
 
 		const certPayload = membershipCertSigningPayload(cert);
 		const verdict = await freshParticipant.host.service.verifier().verifyMessage(cert.signers.map(b64urlToBytes), coord0, 0, certPayload, b64urlToBytes(cert.thresholdSig));
 		expect(verdict, 'a stale source cert forces one real /membership refetch, then verifies').to.equal('verified');
+
+		// Prove the refetch actually fired and replaced the unusable cached view: `FretMembershipSource.fetch()`
+		// re-caches the genuine `/membership` reply, so the source's `current()` for coord_0 must no longer be the
+		// seeded stale bytes. Without the refetch the verdict could not have been `'verified'`, but this also pins
+		// the *one-fetch-replaces-stale* behavior at the integration layer (exact fetch-count is unit-covered at
+		// db-core membership.spec.ts:77).
+		const afterRefetch = await freshParticipant.host.membershipSource.current(coord0);
+		expect(afterRefetch !== undefined && !bytesEqual(staleEncoded, afterRefetch), 'the real /membership refetch replaced the stale cached cert').to.equal(true);
 	});
 
 	// --- 3. Cohort-gossip record replication + handoff readiness over real /cohort-gossip ---
