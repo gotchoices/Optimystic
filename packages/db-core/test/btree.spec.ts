@@ -582,4 +582,25 @@ describe('BTree', () => {
       expect(await btree.get(100)).to.equal(100);
     })
   })
+
+  // Regression: branchInsert was not persisting newBranch, causing "Missing block"
+  // on first lookup after a branch node itself split (3-level tree, ~2081st sequential insert).
+  it('should insert 2200 sequential values without Missing block error', async () => {
+    const count = 2200;
+    for (let i = 0; i < count; i++) {
+      await btree.insert(i);
+    }
+
+    for (let i = 0; i < count; i++) {
+      expect(await btree.get(i)).to.equal(i, `get(${i}) failed`);
+    }
+
+    const collected: number[] = [];
+    const path = await btree.first();
+    while (path.on) {
+      collected.push(btree.at(path)!);
+      await btree.moveNext(path);
+    }
+    expect(collected).to.deep.equal(Array.from({ length: count }, (_, i) => i));
+  })
 })

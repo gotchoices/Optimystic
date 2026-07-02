@@ -414,7 +414,7 @@ export class BTree<TKey, TEntry> {
 				path.branches.splice(-popCount, popCount);
 				const branch = path.branches.at(-1)!;
 				++branch.index;
-				this.moveToFirst(await get(this.store, branch.node.nodes[branch.index]!), path);
+				await this.moveToFirst(await get(this.store, branch.node.nodes[branch.index]!), path);
 			}
 		}
 		else {
@@ -629,6 +629,7 @@ export class BTree<TKey, TEntry> {
 			newNodes.splice(pathBranch.index + 1, 0, split.right.header.id);
 		}
 		const newBranch = newBranchNode(this.store, newPartitions, newNodes);
+		this.store.insert(newBranch);
 
 		// Delete partitions and nodes
 		const newPartition = node.partitions[midIndex - 1]!;
