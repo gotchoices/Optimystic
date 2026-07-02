@@ -370,6 +370,52 @@ describe('cohort-topic wire', () => {
 		});
 	});
 
+	describe('follow-on cold-start flag', () => {
+		it('round-trips a RegisterV1 carrying followOn: true (treeTier >= 1)', () => {
+			// sampleRegister has treeTier: 3; drop bootstrap (mutually exclusive) and set followOn.
+			const msg: RegisterV1 = { ...sampleRegister(), bootstrap: false, followOn: true };
+			const decoded = decodeRegisterV1(encodeCohortMessage(msg));
+			expect(decoded).to.deep.equal(msg);
+			expect(decoded.followOn).to.equal(true);
+		});
+
+		it('omits an absent followOn on Register round-trip', () => {
+			const { bootstrap: _b, followOn: _f, ...minimal } = sampleRegister() as RegisterV1 & { followOn?: boolean };
+			const decoded = decodeRegisterV1(encodeCohortMessage(minimal as RegisterV1));
+			expect(decoded).to.not.have.property('followOn');
+		});
+
+		it('rejects a non-boolean followOn', () => {
+			const bad = { ...sampleRegister(), bootstrap: false, followOn: 'yes' };
+			const frame = encodeCohortMessage(bad as unknown as { v: 1 });
+			expect(() => decodeRegisterV1(frame)).to.throw(CohortWireError, /followOn/);
+		});
+
+		it('rejects a frame that sets more than one of {bootstrap, followOn, probe}', () => {
+			const both = { ...sampleRegister(), bootstrap: true, followOn: true };
+			expect(() => decodeRegisterV1(encodeCohortMessage(both as unknown as { v: 1 })))
+				.to.throw(CohortWireError, /at most one of bootstrap, followOn, probe/);
+			const followProbe = { ...sampleRegister(), bootstrap: false, followOn: true, probe: true };
+			expect(() => decodeRegisterV1(encodeCohortMessage(followProbe as unknown as { v: 1 })))
+				.to.throw(CohortWireError, /at most one of bootstrap, followOn, probe/);
+		});
+
+		it('rejects followOn: true at the root (treeTier < 1)', () => {
+			const rootFollowOn = { ...sampleRegister(), bootstrap: false, followOn: true, treeTier: 0 };
+			expect(() => decodeRegisterV1(encodeCohortMessage(rootFollowOn as unknown as { v: 1 })))
+				.to.throw(CohortWireError, /followOn requires treeTier >= 1/);
+		});
+
+		it('registerSigningPayload differs between followOn:true and followOn:false/absent', () => {
+			const base = { ...sampleRegister(), bootstrap: false };
+			const followImage = registerSigningPayload({ ...base, followOn: true });
+			const falseImage = registerSigningPayload({ ...base, followOn: false });
+			const absentImage = registerSigningPayload(base); // followOn absent
+			expect([...followImage], 'a follow-on signs a distinct image').to.not.deep.equal([...falseImage]);
+			expect([...falseImage], 'followOn:false and absent normalize to the same signed image').to.deep.equal([...absentImage]);
+		});
+	});
+
 	describe('MembershipCert rotation attestation', () => {
 		const withRotation = (): MembershipCertV1 => ({
 			...sampleMembershipCert(),

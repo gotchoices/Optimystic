@@ -10,7 +10,12 @@
  * Reply handling (§Lookup):
  * - **`accepted`** → done; return the reply (carries `primary`/`backups`/`cohortEpoch` to cache).
  * - **`no_state`** at tier `d` → step one tier toward the root (`d − 1`); no traffic signal. At the
- *   root (`d − 1 < 0`) re-issue once at tier 0 with `bootstrap: true` (cold-start request).
+ *   root (`d − 1 < 0`) re-issue once at tier 0 with `bootstrap: true` (cold-start request). **If this
+ *   `no_state` is the redirect target of a `Promoted` this walk just followed** (`followedPromoted`),
+ *   the deeper child is cold: a register re-issues **once** at the same tier with `followOn: true` (a
+ *   deeper-tier cold-start, gated by the same evidence a `bootstrap` pays), then backs off if that too
+ *   returns `no_state`; a probe never instantiates, so it backs off immediately. This is what lets a
+ *   join that lands on a freshly-promoted-but-not-yet-grown branch converge instead of oscillating.
  * - **`promoted(targetTier)`** → recompute `coord_targetTier(self, topicId)` and register there — the
  *   one outward move, taken only on this explicit redirect.
  * - **`unwilling_member(candidates)`** → retry the **same** coord at a named alternative member
@@ -65,18 +70,22 @@ export type WalkOutcome = AcceptedWalkOutcome | PromotedWalkOutcome | RetryLater
 /** Builds (and signs) the {@link RegisterV1} for one probe; owns participant identity + crypto. */
 export interface RegisterMessageFactory {
 	/**
-	 * Produce a signed `RegisterV1` for this participant at walk position `treeTier`. `bootstrap` is
-	 * set only on the root cold-start re-issue. `appPayload` is the opaque application slot. On the
-	 * bootstrap re-issue the factory may additionally mint and attach the signed `bootstrapEvidence`
-	 * envelope (§Anti-DoS) via the injected builder seam before signing — keyed off `bootstrap`, so no
-	 * extra build parameter is needed (the walk decides `bootstrap` internally, not the application).
+	 * Produce a signed `RegisterV1` for this participant at walk position `treeTier`. `bootstrap` is set
+	 * only on the root cold-start re-issue; `followOn` only on the dedicated re-issue after a `Promoted`
+	 * redirect target answered `NoState` (§Cold-start). `appPayload` is the opaque application slot. On
+	 * either cold-start re-issue the factory mints and attaches the signed `bootstrapEvidence` envelope
+	 * (§Anti-DoS — a follow-on is gated identically to a bootstrap) via the injected builder seam before
+	 * signing — keyed off `bootstrap`/`followOn`, so no extra parameter is needed (the walk decides both
+	 * internally, not the application). `bootstrap`, `followOn`, and `probe` are mutually exclusive.
 	 */
 	build(params: {
 		topicId: Uint8Array;
 		tier: number;
 		treeTier: number;
 		bootstrap: boolean;
-		/** Read-only lookup probe: the factory stamps `RegisterV1.probe` and never mints bootstrap evidence. */
+		/** Follow-on cold-start re-issue after a `Promoted` redirect target answered `NoState` (`treeTier >= 1`). */
+		followOn: boolean;
+		/** Read-only lookup probe: the factory stamps `RegisterV1.probe` and never mints cold-start evidence. */
 		probe: boolean;
 		appPayload?: Uint8Array;
 	}): Promise<RegisterV1>;
@@ -153,10 +162,16 @@ class RouterWalkEngine implements WalkEngine {
 
 		let d = dMax;
 		let bootstrap = false;
+		let followOn = false;
 		let memberAttempts = 0;
 		let dialTarget: PeerRef | undefined;
 		let steps = 0;
-		let probeFollowedPromoted = false;
+		// True once this walk has followed a `Promoted` redirect outward (either mode). On a subsequent
+		// `NoState` the redirect target is cold: a probe backs off (never instantiates), a register
+		// re-issues once with `followOn: true` to instantiate the child, then backs off.
+		let followedPromoted = false;
+		// True once the register path has spent its single `followOn: true` re-issue at the cold child.
+		let followOnReissued = false;
 
 		for (;;) {
 			if (++steps > maxSteps) {
@@ -165,7 +180,7 @@ class RouterWalkEngine implements WalkEngine {
 				return { kind: "retry_later", afterMs: backoffRetryMs(0) };
 			}
 
-			const reg = await this.deps.factory.build({ topicId, tier, treeTier: d, bootstrap, probe, appPayload });
+			const reg = await this.deps.factory.build({ topicId, tier, treeTier: d, bootstrap, followOn, probe, appPayload });
 			const activity = encodeCohortMessage(reg, this.maxMessageBytes);
 			const raw = dialTarget !== undefined
 				? await this.deps.router.dialMember(dialTarget, activity)
@@ -183,10 +198,22 @@ class RouterWalkEngine implements WalkEngine {
 					// Step toward the root. The cohort served nothing here; no spatial sibling state.
 					dialTarget = undefined;
 					memberAttempts = 0;
-					if (probe && probeFollowedPromoted) {
-						// The promoted child is cold (not yet instantiated). A probe never instantiates it,
-						// so back off immediately — walking inward to the promoting ancestor would just
-						// re-trigger the Promoted redirect and loop.
+					if (followedPromoted) {
+						// The `Promoted` redirect target is cold (not yet instantiated). Walking inward to the
+						// promoting ancestor would just re-trigger the redirect and oscillate, so handle it here.
+						if (probe) {
+							// A probe never instantiates — back off immediately (mirror of the register re-issue).
+							return { kind: "retry_later", afterMs: backoffRetryMs(0) };
+						}
+						if (!followOnReissued) {
+							// Re-issue ONCE at the SAME child tier as a follow-on cold-start: RegisterV1{ followOn:
+							// true } + minted evidence. The mirror of the root NoState → bootstrap:true re-issue.
+							followOn = true;
+							followOnReissued = true;
+							break; // re-register at the same coord/tier, now carrying followOn
+						}
+						// The follow-on re-issue still got NoState → the cold child's quorum is unwilling to
+						// instantiate. Back off in time; do NOT loop inward.
 						return { kind: "retry_later", afterMs: backoffRetryMs(0) };
 					}
 					const next = d - 1;
@@ -215,9 +242,13 @@ class RouterWalkEngine implements WalkEngine {
 					memberAttempts = 0;
 					bootstrap = false;
 					const targetTier = reply.targetTier ?? d + 1;
-					if (probe) {
-						probeFollowedPromoted = true;
-					}
+					// Following a (fresh) redirect: mark it, and reset the follow-on latch so a cold child at
+					// THIS target gets its own single follow-on re-issue. The honest flow re-registers the
+					// child with a PLAIN frame first (followOn false) and only escalates to followOn on its
+					// NoState — so clear the flag here; the NoState branch re-arms it.
+					followedPromoted = true;
+					followOn = false;
+					followOnReissued = false;
 					if (!this.followPromoted) {
 						return { kind: "promoted", targetTier };
 					}

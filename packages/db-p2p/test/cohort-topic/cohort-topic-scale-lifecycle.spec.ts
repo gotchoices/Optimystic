@@ -14,11 +14,13 @@
  * literal that could drift from the doc.
  *
  * **Honestly out of scope at this tier** (tagged `it.skip` with the parking ticket, not silently
- * omitted): live multi-tier tree growth and the `⌈log_F(N/cap_promote)⌉` depth law (the live
- * `Promoted`-redirect follow-on instantiation is parked — `cohort-topic-followon-derivation`); tier-(d>0)
- * demotion-notice broadcast (parent child-link recording parked — `cohort-topic-parent-child-link`); and
- * membership-rotation primary handoff (the `registration/handoff.ts` dual-serve state machine is not yet
- * wired into the FRET host).
+ * omitted): the full live multi-tier `⌈log_F(N/cap_promote)⌉` depth law over a live walk — `followOn`
+ * cold-start derivation has now landed (`cohort-topic-followon-derivation`; a cold tier-(d+1) child
+ * instantiates via followOn, asserted in `cohort-topic-scale-antiflood.spec.ts`), but the parent-side
+ * child recording it would assert against is still parked (`cohort-topic-parent-child-link`); tier-(d>0)
+ * demotion-notice broadcast (same parent child-link recording parked — `cohort-topic-parent-child-link`);
+ * and membership-rotation primary handoff (the `registration/handoff.ts` dual-serve state machine is not
+ * yet wired into the FRET host).
  */
 
 import { expect } from 'chai';
@@ -220,13 +222,14 @@ describe('cohort-topic: scale lifecycle (mock-tier e2e, N=48 ring / k=16 cohort)
 			}
 		});
 
-		it.skip('multi-tier tree grows to depth ⌈log_F(N/cap_promote)⌉ via live Promoted-redirect follow-on [DOC EXPECTATION NOT YET IMPLEMENTED — followOn instantiation parked: cohort-topic-followon-derivation]', () => {
-			// A live walk that draws Promoted(1) recomputes coord_1 and registers there, but the host hardcodes
-			// `followOn: false` and only the root sets `bootstrap`, so a tier-1 cohort answers `no_state` rather
-			// than instantiating (see host.ts dispatchRegister + coldstart shouldInstantiate). Real multi-tier
+		it.skip('multi-tier tree grows to depth ⌈log_F(N/cap_promote)⌉ via live Promoted-redirect follow-on [DOC EXPECTATION NOT YET IMPLEMENTED — parent-side child recording parked: cohort-topic-parent-child-link]', () => {
+			// followOn cold-start derivation HAS landed (cohort-topic-followon-derivation): the host derives
+			// `followOn` from the wire flag and a redirect follow-on instantiates a cold tier-(d+1) child (see the
+			// cold-child-instantiates-via-followOn assertion in cohort-topic-scale-antiflood.spec.ts). Real multi-tier
 			// depth — and therefore the simulator's ⌈log_F(N/cap_promote)⌉ depth law over the live engine — is
-			// unreachable until follow-on derivation lands. The depth law itself is validated by the simulator
-			// (promotion-convergence.ts); this placeholder marks the e2e gap rather than omitting the claim.
+			// unreachable until the parent-side child recording lands (`childCohortCount`, the signed child-link
+			// frame — cohort-topic-parent-child-link): without it there is no observable multi-tier parent state to
+			// assert the depth against. The depth law itself is validated by the simulator (promotion-convergence.ts).
 		});
 
 		it.skip('tier-(d>0) demotion threshold-signs a DemotionNoticeV1 to the parent cohort [DOC EXPECTATION NOT YET IMPLEMENTED at e2e — parent child-link recording parked: cohort-topic-parent-child-link]', () => {

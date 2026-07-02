@@ -317,4 +317,39 @@ describe('cohort-topic: register signing payload survives the codec round-trip (
 			'tampered appPayload fails verification',
 		).to.equal(false);
 	});
+
+	it('covers followOn in the signature: a follow-on register verifies, and a stripped/flipped followOn does not', async () => {
+		// A follow-on cold-start re-issue sets followOn:true (treeTier >= 1) and must be covered by the
+		// participant signature so a MITM cannot strip it (downgrading the child cold-start) or flip a plain
+		// register into one. The signer + verifier recompute registerSigningPayload identically.
+		const participantKey = await generateKeyPair('Ed25519');
+		const participantCoordBytes = peerIdToBytes(peerIdFromPrivateKey(participantKey));
+		const body: Omit<RegisterV1, 'signature'> = {
+			v: 1,
+			topicId: bytesToB64url(TOPIC),
+			tier: 0,
+			treeTier: 1, // a follow-on is a deeper-than-root growth point
+			participantCoord: bytesToB64url(participantCoordBytes),
+			ttl: 90_000,
+			followOn: true,
+			timestamp: 1_700_000_000_000,
+			correlationId: bytesToB64url(new TextEncoder().encode('cid-followon')),
+		};
+		const sig = await signPeer(participantKey, registerSigningPayload(body));
+		const signed: RegisterV1 = { ...body, signature: bytesToB64url(sig) };
+
+		const decoded = validateRegisterV1(decodeCohortMessage(encodeCohortMessage(signed), undefined));
+		expect(decoded.followOn, 'followOn round-trips').to.equal(true);
+		expect(
+			verifyPeerSig(b64urlToBytes(decoded.participantCoord), registerSigningPayload(decoded), b64urlToBytes(decoded.signature)),
+			'the follow-on signature verifies against the decoded frame',
+		).to.equal(true);
+
+		// Strip followOn (leaving the same signature): the recomputed image differs → verification fails.
+		const { followOn: _dropped, ...withoutFollowOn } = decoded;
+		expect(
+			verifyPeerSig(b64urlToBytes(decoded.participantCoord), registerSigningPayload(withoutFollowOn as RegisterV1), b64urlToBytes(decoded.signature)),
+			'a stripped followOn no longer verifies',
+		).to.equal(false);
+	});
 });

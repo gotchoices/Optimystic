@@ -1,9 +1,14 @@
 /**
  * Cohort-topic substrate — bootstrap evidence policy (anti-DoS).
  *
- * Transcribed from `docs/cohort-topic.md` §Anti-DoS bullet 4. A cold root that accepts a
- * `bootstrap: true` registration must demand evidence, so a cold topic cannot be instantiated for
- * free by an attacker. The accepted evidence is **tier-dependent**:
+ * Transcribed from `docs/cohort-topic.md` §Anti-DoS bullet 4. A cold cohort that accepts a cold-start
+ * registration must demand evidence, so a cold topic cannot be instantiated for free by an attacker.
+ * **A follow-on cold-start (`followOn: true`) is gated identically to a root bootstrap
+ * (`bootstrap: true`)**: the cold tier-`(d+1)` child a `Promoted` redirect points at is participant-
+ * asserted (the child cannot infer the redirect — the routing key decorrelates tiers and it holds no
+ * breadcrumb of where the participant came from), so its safety cannot rest on provenance; it rests on
+ * this gate paying the same anti-abuse cost the root already pays. The accepted evidence is
+ * **tier-dependent**:
  *
  * - **T0 / T1** — generally no proof-of-work, because these tiers correspond to committed work; a
  *   *signed reference to a committed parent topic that does exist* is sufficient.
@@ -18,7 +23,7 @@
  * `bootstrapEvidence` field — a versioned `BootstrapEvidenceEnvelopeV1`
  * (`./bootstrap-evidence-envelope.js`), parsed crypto-free here and checked by the injected verifiers;
  * NOT the opaque `appPayload` slot (which the cohort copies verbatim into the registration's appState).
- * A registration that is not a bootstrap needs no evidence and is admitted.
+ * A registration that is neither a bootstrap nor a follow-on cold-start needs no evidence and is admitted.
  */
 
 import type { RegisterV1 } from "../wire/types.js";
@@ -47,9 +52,10 @@ export interface BootstrapEvidenceConfig {
 /** Tier-dependent bootstrap-evidence gate for cold-root registrations. */
 export interface BootstrapEvidence {
 	/**
-	 * Whether `reg` carries acceptable bootstrap evidence for `tier`. A non-bootstrap registration is
-	 * always acceptable (nothing to prove). For a bootstrap: T0/T1 require a signed parent reference;
-	 * T2/T3 accept proof-of-work OR a reputation signature OR a signed parent reference.
+	 * Whether `reg` carries acceptable cold-start evidence for `tier`. A registration that is neither a
+	 * `bootstrap` nor a `followOn` is always acceptable (nothing to prove). For a cold-start (either flag):
+	 * T0/T1 require a signed parent reference; T2/T3 accept proof-of-work OR a reputation signature OR a
+	 * signed parent reference.
 	 */
 	verify(reg: RegisterV1, tier: number): boolean;
 }
@@ -68,8 +74,14 @@ class TieredBootstrapEvidence implements BootstrapEvidence {
 	}
 
 	verify(reg: RegisterV1, tier: number): boolean {
-		if (reg.bootstrap !== true) {
-			return true; // only a cold-root bootstrap must carry evidence
+		// A follow-on cold-start is gated identically to a root bootstrap — both must carry evidence.
+		// NOTE: follow-on cold-start is PoW-gated exactly like a root bootstrap; if a spoofed, PoW-paid
+		// follow-on instantiation ever shows up as real abuse, upgrade to a parent-vouched redirect —
+		// echo the parent cohort's threshold-signed PromotionNoticeV1 on the follow-on and verify it
+		// against the parent's MembershipCertV1 (needs a RegisterReplyV1 field + admission-path membership
+		// verify). See docs/cohort-topic.md §Anti-DoS "follow-on hardening".
+		if (reg.bootstrap !== true && reg.followOn !== true) {
+			return true; // only a cold-start (bootstrap or follow-on) must carry evidence
 		}
 		if (tier <= this.maxNoPowTier) {
 			// T0/T1: a signed reference to a committed parent topic is sufficient (no PoW expected).

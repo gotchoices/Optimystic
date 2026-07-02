@@ -188,6 +188,21 @@ export function validateRegisterV1(value: unknown): RegisterV1 {
 	if (probe !== undefined) {
 		out.probe = probe;
 	}
+	const followOn = optBool(obj, "followOn", what);
+	if (followOn !== undefined) {
+		out.followOn = followOn;
+	}
+	// `bootstrap`, `followOn`, and `probe` are pairwise mutually exclusive — the walk sets at most one
+	// (bootstrap only at the tier-0 root re-issue, followOn only at a `treeTier >= 1` redirect target,
+	// probe never instantiates). A frame that sets more than one is malformed / adversarial.
+	if ([bootstrap, followOn, probe].filter((flag) => flag === true).length > 1) {
+		fail(`${what}: at most one of bootstrap, followOn, probe may be set`);
+	}
+	// A follow-on is by definition a deeper-than-root growth point, so `treeTier >= 1`. A `followOn: true`
+	// at the root (treeTier 0) would be a bootstrap, not a follow-on — reject it as malformed.
+	if (followOn === true && out.treeTier < 1) {
+		fail(`${what}: followOn requires treeTier >= 1, got ${out.treeTier}`);
+	}
 	const appPayload = optString(obj, "appPayload", what);
 	if (appPayload !== undefined) {
 		out.appPayload = b64urlField(appPayload, "appPayload", what);

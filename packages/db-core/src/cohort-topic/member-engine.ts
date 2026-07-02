@@ -5,8 +5,9 @@
  * on it (the activity callback in `docs/cohort-topic.md` §FRET integration). It is the cohort-facing
  * half of the substrate, composed from the prereq tickets' pure modules — the participant-facing half
  * lives in {@link import("./service.js").CohortTopicService}. db-p2p's FRET host decodes an inbound
- * frame, supplies the routing context this module can't see (`followOn`, the quorum-willing tally),
- * and serializes whatever reply this returns back over the wire. db-core never imports FRET here.
+ * frame, supplies the routing context this module can't see (`followOn` — derived from the wire
+ * `RegisterV1.followOn` flag, evidence-gated in step 1 — plus the quorum-willing tally), and serializes
+ * whatever reply this returns back over the wire. db-core never imports FRET here.
  *
  * Inbound `RegisterV1` decision pipeline (§Registration mechanics, §Willingness, §Cold-start):
  *
@@ -47,7 +48,13 @@ import type { DemotionNoticeV1, PromotionNoticeV1, RegisterReplyV1, RegisterV1, 
 
 /** Routing context the FRET host supplies for an inbound register (db-core can't derive it). */
 export interface RegisterContext {
-	/** Did this register arrive as a follow-on to a parent cohort's `Promoted` redirect? */
+	/**
+	 * Did this register arrive as a follow-on to a parent cohort's `Promoted` redirect? The host derives
+	 * this from the wire `RegisterV1.followOn` flag (`followOn: reg.followOn === true`). It is participant-
+	 * asserted and therefore evidence-gated: `runGuards` (step 1) already ran `bootstrapEvidence.verify`,
+	 * which demands the same proof for `followOn: true` as for `bootstrap: true`, so an unbacked follow-on
+	 * never reaches this instantiation decision (it short-circuited to `unwilling_cohort`).
+	 */
 	readonly followOn: boolean;
 	/** Tree tier `d` this cohort serves the topic at (the walk position the register landed on). */
 	readonly treeTier: number;
@@ -172,7 +179,10 @@ class StoreCohortMemberEngine implements CohortMemberEngine {
 			return this.admitOrDecline(reg, topicId, participantId, tier, ctx, now);
 		}
 
-		// 3. Cold path: instantiate only at a legitimate growth point with a willing quorum.
+		// 3. Cold path: instantiate only at a legitimate growth point with a willing quorum. `ctx.followOn`
+		//    mirrors the wire `reg.followOn` flag (the host derives it), and by the time we reach here the
+		//    step-1 bootstrap-evidence gate has already verified a `followOn: true` carries the same proof a
+		//    `bootstrap: true` root cold-start carries — so this branch never instantiates an unbacked follow-on.
 		const quorumWilling = this.deps.quorumWilling(tier);
 		if (!shouldInstantiate({ bootstrap: reg.bootstrap === true, followOn: ctx.followOn, quorumWilling })) {
 			return { v: 1, result: "no_state" };

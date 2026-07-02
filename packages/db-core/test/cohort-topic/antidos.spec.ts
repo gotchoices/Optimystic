@@ -316,5 +316,25 @@ describe('cohort-topic / anti-DoS', () => {
 			// No verifier injected → no evidence satisfiable → refused.
 			expect(createBootstrapEvidence({}).verify(reg(3, true), 3)).to.be.false;
 		});
+
+		// A follow-on cold-start (`followOn: true`) is gated identically to a root bootstrap: it must carry
+		// the same tier-dependent evidence, and a register that is neither flag needs none.
+		function followOnReg(tier: number): RegisterV1 {
+			return { ...reg(tier, false), treeTier: 1, followOn: true };
+		}
+
+		it('gates a followOn registration exactly like a bootstrap (evidence required)', () => {
+			// T2 follow-on with PoW → admitted; without any verifier → refused (same truth-table as bootstrap).
+			expect(createBootstrapEvidence({ verifyPoW: () => true }).verify(followOnReg(2), 2)).to.be.true;
+			expect(createBootstrapEvidence({}).verify(followOnReg(2), 2)).to.be.false;
+			// T1 follow-on needs a signed parent reference, not PoW (mirrors the bootstrap T0/T1 policy).
+			expect(createBootstrapEvidence({ verifyParentReference: () => true }).verify(followOnReg(1), 1)).to.be.true;
+			expect(createBootstrapEvidence({ verifyPoW: () => true }).verify(followOnReg(1), 1)).to.be.false;
+		});
+
+		it('admits a register that is neither bootstrap nor followOn without evidence', () => {
+			const ev = createBootstrapEvidence({}); // no verifiers → evidence never satisfiable
+			expect(ev.verify(reg(3, false), 3), 'a plain register needs no evidence').to.be.true;
+		});
 	});
 });

@@ -265,6 +265,7 @@ describe('cohort-topic / bootstrap-evidence envelope', () => {
 				body.timestamp,
 				body.correlationId,
 				false, // probe absent (read-only lookup flag) — appended at the end of the signed image
+				false, // followOn absent (follow-on cold-start flag) — appended after probe
 			]);
 		});
 

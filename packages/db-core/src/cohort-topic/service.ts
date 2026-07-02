@@ -154,9 +154,10 @@ export interface CohortTopicServiceDeps {
 	/** Monotonic-ish wall clock (unix ms); injectable for tests. Default `Date.now`. */
 	readonly clock?: () => number;
 	/**
-	 * Optional cold-start bootstrap-evidence builder (db-p2p supplies it). Invoked **only** on the
-	 * bootstrap re-issue (when the walk sets `bootstrap: true`), with the register's own canonical
-	 * fields — the same `(topicId, tier, participantCoord, timestamp)` tuple a verifier binds via
+	 * Optional cold-start bootstrap-evidence builder (db-p2p supplies it). Invoked on **either** cold-start
+	 * re-issue — the root `bootstrap: true` or the deeper-tier `followOn: true` (both gated by the same
+	 * evidence policy) — with the register's own canonical fields, the same
+	 * `(topicId, tier, participantCoord, timestamp)` tuple a verifier binds via
 	 * `bootstrapBoundImage`. It returns the **raw** envelope JSON bytes — `utf8(JSON.stringify(env))`,
 	 * NOT the already-base64url string from `serializeBootstrapEvidenceEnvelope` — or `undefined` to
 	 * attach none; the service base64url-encodes those bytes into `RegisterV1.bootstrapEvidence`
@@ -351,12 +352,19 @@ class WalkRegisterService implements CohortTopicService {
 					correlationId: this.freshCorrelationId(),
 				};
 				if (params.probe) {
-					// A read-only lookup probe. Mutually exclusive with bootstrap (the walk never sets
-					// `bootstrap` on a probe), so the cold-start-evidence branch below cannot run for a probe.
+					// A read-only lookup probe. Mutually exclusive with bootstrap/followOn (the walk never sets
+					// either on a probe), so the cold-start-evidence branch below cannot run for a probe.
 					body.probe = true;
 				}
-				if (params.bootstrap) {
-					body.bootstrap = true;
+				// A cold-start re-issue — root (`bootstrap`) or deeper-tier follow-on (`followOn`). Both are
+				// gated by the identical evidence policy (§Anti-DoS), so both mint and attach the same envelope
+				// bound to the body's own canonical fields. Mutually exclusive with each other and with probe.
+				if (params.bootstrap || params.followOn) {
+					if (params.followOn) {
+						body.followOn = true;
+					} else {
+						body.bootstrap = true;
+					}
 					// Attach cold-start evidence BEFORE signing (so the signature covers it). Bind the
 					// builder to the body's own canonical fields — the exact tuple a verifier reconstructs.
 					const evidence = await this.deps.buildBootstrapEvidence?.({

@@ -10,9 +10,9 @@
  * for the threshold-signed notices, determinism comes from encoding an explicitly-ordered JSON
  * array (array order is stable, unlike object key order) as UTF-8 — never the `signature` envelope.
  * Optional fields are normalized to a fixed placeholder (`bootstrap`→`false`, `probe`→`false`,
- * `appPayload`→`null`, `bootstrapEvidence`→`null` with an empty string treated as absent,
- * `reattach`→`false`, `withdraw`→`false`) so an absent optional and a present-but-default optional can
- * never disagree across the wire round-trip.
+ * `followOn`→`false`, `appPayload`→`null`, `bootstrapEvidence`→`null` with an empty string treated as
+ * absent, `reattach`→`false`, `withdraw`→`false`) so an absent optional and a present-but-default
+ * optional can never disagree across the wire round-trip.
  */
 
 import type { CohortGossipV1, RegisterV1, RenewV1 } from "./types.js";
@@ -48,6 +48,11 @@ export function registerSigningPayload(body: RegisterSignable): Uint8Array {
 		// A read-only probe signs `probe: true`; a normal register signs `false`. Both sides recompute
 		// this image identically, so a probe and a register over the same fields produce distinct signatures.
 		body.probe ?? false,
+		// A follow-on cold-start re-issue signs `followOn: true`, everything else `false`. Strictly appended
+		// (sibling to `probe`/`withdraw`) so a MITM cannot strip or flip the follow-on assertion and the
+		// signer (participant) + verifier (db-p2p cohort) agree byte-for-byte. Safe to append: no register
+		// signatures are persisted (each is recomputed per verify), so there is no cross-version image concern.
+		body.followOn ?? false,
 	]));
 }
 

@@ -268,6 +268,13 @@ export interface MeshOptions {
 export interface RouteTraceEntry {
 	readonly key: string;
 	readonly result: RegisterResult;
+	/**
+	 * Whether the routed frame carried a participant signature. A participant's own walk probes are always
+	 * signed; the cold-start forwarder→parent link frame is unsigned (`signature: ""`, the interim gap the
+	 * `cohort-topic-parent-child-link` follow-on closes). {@link walkTraceFrom} keeps only signed entries so
+	 * a follow-on instantiation's background parent-link RPC does not pollute a walk's reconstructed trace.
+	 */
+	readonly signed: boolean;
 }
 
 export class CohortMesh {
@@ -337,17 +344,18 @@ export class CohortMesh {
 	private async routeAct(msg: RouteAndMaybeActV1): Promise<NearAnchorV1 | { commitCertificate: string }> {
 		const key = b64urlToBytes(msg.key);
 		this.routeKeys.push(msg.key);
+		const signed = routedFrameIsSigned(msg.activity);
 		const target = this.nearest(key);
 		const handler = this.activity.get(target.idStr);
 		if (handler === undefined || this.down.has(target.idStr)) {
 			// No in-cluster activity to run (cold / unreachable target) → a bare anchor hint; the walk
 			// treats it as `no_state`.
-			this.routeTrace.push({ key: msg.key, result: 'no_state' });
+			this.routeTrace.push({ key: msg.key, result: 'no_state', signed });
 			return { v: 1, anchors: [], cohort_hint: [], estimated_cluster_size: this.members.length, confidence: 1 };
 		}
 		const cohort = this.assembleCohort(key, msg.want_k);
 		const reply = await handler(msg.activity ?? '', cohort, msg.min_sigs, msg.correlation_id);
-		this.routeTrace.push({ key: msg.key, result: replyResult(reply) });
+		this.routeTrace.push({ key: msg.key, result: replyResult(reply), signed });
 		return reply;
 	}
 
@@ -376,6 +384,24 @@ export class CohortMesh {
 
 	async stop(): Promise<void> {
 		await Promise.all(this.nodes.map((n) => n.host.stop()));
+	}
+}
+
+/**
+ * Whether the routed `RegisterV1` frame carries a participant signature. Decodes the activity best-effort
+ * (an undecodable / absent frame is treated as signed, so only a genuinely unsigned frame — the cold-start
+ * forwarder→parent link — is flagged). Lets {@link walkTraceFrom} drop the background parent-link RPC a
+ * `followOn` instantiation fires, which would otherwise alias a walk's own probe coord.
+ */
+function routedFrameIsSigned(activity: string | undefined): boolean {
+	if (activity === undefined || activity === '') {
+		return true;
+	}
+	try {
+		const frame = decodeCohortMessage(b64urlToBytes(activity)) as { signature?: unknown };
+		return typeof frame.signature !== 'string' || frame.signature.length > 0;
+	} catch {
+		return true;
 	}
 }
 
@@ -459,6 +485,8 @@ export interface SignedRegisterOptions {
 	readonly tier?: number;
 	readonly treeTier?: number;
 	readonly bootstrap?: boolean;
+	/** Follow-on cold-start re-issue (treeTier >= 1); mutually exclusive with bootstrap, so pass `bootstrap: false`. */
+	readonly followOn?: boolean;
 	readonly ttl?: number;
 }
 
@@ -471,6 +499,7 @@ export async function signedRegister(participant: Member, topic: Uint8Array, now
 		participantCoord: bytesToB64url(participant.bytes),
 		ttl: opts.ttl ?? 90_000,
 		bootstrap: opts.bootstrap ?? true,
+		...(opts.followOn ? { followOn: true } : {}),
 		timestamp: now,
 		correlationId: bytesToB64url(new TextEncoder().encode(correlationId)),
 	};
@@ -523,10 +552,16 @@ export function coordTierMap(participant: Member, topic: Uint8Array, dMax: numbe
 	return map;
 }
 
-/** Reconstruct a {@link WalkTrace} from the mesh's recorded `routeTrace`, keeping only this walk's coords. */
+/**
+ * Reconstruct a {@link WalkTrace} from the mesh's recorded `routeTrace`, keeping only this walk's coords.
+ * Unsigned frames are excluded: a `followOn` cold-start instantiates a child whose background
+ * forwarder→parent link RPC routes to the (participant-independent) `coord_0` this walk also probes, so
+ * without the filter that link's `no_state` would alias the walk's own root probe and fabricate a spurious
+ * inward/outward move. Only the participant's own signed probes belong to the walk trace.
+ */
 export function walkTraceFrom(routeTrace: readonly RouteTraceEntry[], tierMap: Map<string, number>, dMax: number): WalkTrace {
 	const probes = routeTrace
-		.filter((e) => tierMap.has(e.key))
+		.filter((e) => tierMap.has(e.key) && e.signed)
 		.map((e) => ({ treeTier: tierMap.get(e.key)!, result: e.result }));
 	return { dMax, probes };
 }

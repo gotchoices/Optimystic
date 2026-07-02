@@ -27,6 +27,7 @@ interface Probe {
 	readonly member?: Uint8Array;
 	readonly treeTier: number;
 	readonly bootstrap: boolean;
+	readonly followOn: boolean;
 	readonly probe: boolean;
 }
 
@@ -42,13 +43,13 @@ class ScriptedRouter implements ITopicRouter {
 
 	async routeAndAct(key: RingCoord, activity: Uint8Array): Promise<Uint8Array> {
 		const reg = decodeRegisterV1(activity);
-		this.probes.push({ mode: 'route', coord: key, treeTier: reg.treeTier, bootstrap: reg.bootstrap === true, probe: reg.probe === true });
+		this.probes.push({ mode: 'route', coord: key, treeTier: reg.treeTier, bootstrap: reg.bootstrap === true, followOn: reg.followOn === true, probe: reg.probe === true });
 		return encodeCohortMessage(this.next());
 	}
 
 	async dialMember(member: PeerRef, activity: Uint8Array): Promise<Uint8Array> {
 		const reg = decodeRegisterV1(activity);
-		this.probes.push({ mode: 'dial', member: member.id, treeTier: reg.treeTier, bootstrap: reg.bootstrap === true, probe: reg.probe === true });
+		this.probes.push({ mode: 'dial', member: member.id, treeTier: reg.treeTier, bootstrap: reg.bootstrap === true, followOn: reg.followOn === true, probe: reg.probe === true });
 		return encodeCohortMessage(this.next());
 	}
 
@@ -69,7 +70,7 @@ function fixedDMax(d: number): DMaxComputer {
 /** A factory that emits a deterministic signed-shaped RegisterV1 (signature/crypto are out of scope here). */
 function factoryFor(self: Uint8Array): RegisterMessageFactory {
 	return {
-		build: async ({ topicId, tier, treeTier, bootstrap, probe, appPayload }) => ({
+		build: async ({ topicId, tier, treeTier, bootstrap, followOn, probe, appPayload }) => ({
 			v: 1,
 			topicId: bytesToB64url(topicId),
 			tier,
@@ -77,6 +78,7 @@ function factoryFor(self: Uint8Array): RegisterMessageFactory {
 			participantCoord: bytesToB64url(self),
 			ttl: 90_000,
 			...(bootstrap ? { bootstrap: true } : {}),
+			...(followOn ? { followOn: true } : {}),
 			...(probe ? { probe: true } : {}),
 			...(appPayload ? { appPayload: bytesToB64url(appPayload) } : {}),
 			timestamp: 1_000,
@@ -90,10 +92,12 @@ const accepted: RegisterReplyV1 = { v: 1, result: 'accepted', primary: bytesToB6
 const noState: RegisterReplyV1 = { v: 1, result: 'no_state' };
 
 /**
- * A coord-addressed router modeling a **single tier-0 cohort that has promoted but is childless**: the
- * one promoted coord answers `Promoted(1)`; every other coord (including the recomputed `coord_1`) is
- * cold and answers `NoState`. With no `followOn` instantiation (out of scope for the single-cohort
- * milestone) this is exactly the one-cohort tree the walk's safety valve must bound.
+ * A coord-addressed router modeling a **single tier-0 cohort that has promoted but is childless, and
+ * whose cold child refuses to instantiate**: the one promoted coord answers `Promoted(1)`; every other
+ * coord (including the recomputed `coord_1`) answers `NoState` regardless of `followOn` — i.e. the cold
+ * child's quorum is unwilling. The register walk therefore follows the redirect, re-issues once with
+ * `followOn: true`, gets `NoState` again, and backs off (rather than oscillating); a probe backs off
+ * immediately. This is the one-cohort tree the walk's termination discipline must bound.
  */
 class SingleCohortRouter implements ITopicRouter {
 	readonly probes: Probe[] = [];
@@ -102,14 +106,14 @@ class SingleCohortRouter implements ITopicRouter {
 
 	async routeAndAct(key: RingCoord, activity: Uint8Array): Promise<Uint8Array> {
 		const reg = decodeRegisterV1(activity);
-		this.probes.push({ mode: 'route', coord: key, treeTier: reg.treeTier, bootstrap: reg.bootstrap === true, probe: reg.probe === true });
+		this.probes.push({ mode: 'route', coord: key, treeTier: reg.treeTier, bootstrap: reg.bootstrap === true, followOn: reg.followOn === true, probe: reg.probe === true });
 		const reply: RegisterReplyV1 = bytesEqual(key, this.promotedCoord) ? { v: 1, result: 'promoted', targetTier: 1 } : noState;
 		return encodeCohortMessage(reply);
 	}
 
 	async dialMember(member: PeerRef, activity: Uint8Array): Promise<Uint8Array> {
 		const reg = decodeRegisterV1(activity);
-		this.probes.push({ mode: 'dial', member: member.id, treeTier: reg.treeTier, bootstrap: reg.bootstrap === true, probe: reg.probe === true });
+		this.probes.push({ mode: 'dial', member: member.id, treeTier: reg.treeTier, bootstrap: reg.bootstrap === true, followOn: reg.followOn === true, probe: reg.probe === true });
 		return encodeCohortMessage(noState);
 	}
 }
@@ -311,12 +315,12 @@ describe('cohort-topic / walk-toward-root', () => {
 		expect(router.probes.length, 'capped at exactly maxSteps probes').to.equal(5);
 	});
 
-	it('single tier-0 cohort, promoted but childless: the walk terminates within maxSteps (followOn instantiation out of scope)', async () => {
-		// The per-coord-scoping milestone serves one tier-0 cohort. When it promotes, a new registration
-		// gets Promoted(1); the participant recomputes coord_1 and finds it cold (NoState), walking back to
-		// 0 where it is promoted again. Without followOn instantiation this one-cohort tree cannot resolve,
-		// so the maxSteps valve must bound the oscillation and surface a temporal back-off — it terminates
-		// rather than spinning. (The mock host test sidesteps this by never promoting on the walk path.)
+	it('single tier-0 cohort, promoted but childless with an unwilling cold child: re-issues followOn once then backs off (no oscillation)', async () => {
+		// The tier-0 cohort has promoted; a new registration gets Promoted(1) and recomputes coord_1, which
+		// is cold. The register path re-issues ONCE at coord_1 with followOn:true (the deeper-tier cold-start
+		// request). Here the cold child's quorum is unwilling (the router keeps answering NoState), so the
+		// walk backs off in time — it does NOT step back inward to the promoting root and oscillate. The
+		// follow-on re-issue happens exactly once (bounded by the followOnReissued latch), well within maxSteps.
 		const self = bytes('single-cohort-participant');
 		const dMax = 0; // a one-cohort network: d_max collapses to the root
 		const promotedCoord = addressing.coord(0, self, TOPIC); // coord_0(topic), peer-independent
@@ -325,10 +329,33 @@ describe('cohort-topic / walk-toward-root', () => {
 		const engine = createWalkEngine({ router, addressing, dmax: fixedDMax(dMax), self, factory: factoryFor(self), config: { maxSteps } });
 
 		const outcome = await engine.register(TOPIC, 0);
-		expect(outcome.kind, 'bounded back-off, never an infinite loop').to.equal('retry_later');
-		expect(router.probes.length, 'capped at exactly maxSteps probes').to.equal(maxSteps);
-		expect(new Set(router.probes.map((p) => p.treeTier)), 'oscillates only between the promoted root (0) and its empty child (1)').to.deep.equal(new Set([0, 1]));
+		expect(outcome.kind, 'unwilling cold child → bounded back-off, never an infinite loop').to.equal('retry_later');
+		// Exactly three probes: coord_0 (Promoted), coord_1 plain (NoState), coord_1 followOn (NoState).
+		expect(router.probes.map((p) => p.treeTier), 'follows the redirect then re-issues at the child — no inward oscillation').to.deep.equal([0, 1, 1]);
+		expect(router.probes.length, 'terminates well within maxSteps, not by exhausting it').to.be.lessThan(maxSteps);
+		expect(router.probes.filter((p) => p.followOn).length, 'exactly one follow-on re-issue').to.equal(1);
+		const followOnProbe = router.probes.find((p) => p.followOn)!;
+		expect(followOnProbe.treeTier, 'the follow-on re-issue is at the child tier (>= 1)').to.equal(1);
 		expect(bytesEqual(router.probes[0]!.coord!, promotedCoord), 'the first probe lands on coord_0(topic)').to.be.true;
+	});
+
+	it('promoted parent + willing cold child: the register re-issues followOn once and the child instantiates → accepted', async () => {
+		// The positive counterpart: the cold tier-1 child DOES instantiate on the follow-on. The walk follows
+		// Promoted(1), re-registers the child plain (NoState — the cold child served nothing to the first
+		// frame), then re-issues once with followOn:true, and the now-instantiated child answers accepted.
+		const self = bytes('followon-happy-participant');
+		const dMax = 0;
+		// d=0 → Promoted(1); coord_1 plain → NoState; coord_1 followOn → accepted (child cold-started).
+		const router = new ScriptedRouter([{ v: 1, result: 'promoted', targetTier: 1 }, noState, accepted]);
+		const engine = createWalkEngine({ router, addressing, dmax: fixedDMax(dMax), self, factory: factoryFor(self) });
+
+		const outcome = await engine.register(TOPIC, 0);
+		expect(outcome.kind, 'the willing cold child instantiates via the follow-on path').to.equal('accepted');
+		expect(router.probes.map((p) => p.treeTier), 'follow redirect (0), plain child (1), follow-on child (1) — no inward step').to.deep.equal([0, 1, 1]);
+		expect(router.probes.filter((p) => p.followOn).length, 'exactly one follow-on re-issue, not a flood').to.equal(1);
+		expect(router.probes[1]!.followOn, 'the FIRST child register is plain (no follow-on yet)').to.equal(false);
+		expect(router.probes[2]!.followOn, 'the re-issue after the child NoState carries followOn').to.equal(true);
+		expect(router.probes.some((p) => p.bootstrap), 'a follow-on cold-start never sets bootstrap').to.equal(false);
 	});
 
 	it('defaults a Promoted redirect with no explicit targetTier to d+1', async () => {
@@ -357,6 +384,7 @@ describe('cohort-topic / walk-toward-root', () => {
 		expect(outcome.kind, 'probe of promoted-but-cold topic resolves to retry_later').to.equal('retry_later');
 		// d_max + 2: inward 4→3→2→1→0 (5 RPCs) + one Promoted follow (RPC 6) + immediate exit = 6 total.
 		expect(router.probes.length, 'terminates well within d_max+3').to.be.lessThanOrEqual(dMax + 3);
+		expect(router.probes.some((p) => p.followOn), 'a probe never instantiates, so never emits a followOn frame').to.equal(false);
 	});
 
 	it('probe: happy path — probe accepted after following a Promoted redirect to a live child', async () => {

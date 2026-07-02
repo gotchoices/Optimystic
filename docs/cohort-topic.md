@@ -174,6 +174,7 @@ Key points:
 - `Promoted(targetTier)` is the only signal that moves the walk outward (away from the root). It is authoritative: the cohort returning it is part of the tree and reports the next live tier.
 - `UnwillingMember` and `UnwillingCohort` are distinct: the former routes to a sibling within the same cohort, the latter is a temporal back-off with no spatial movement.
 - The root case (`d = 0` returning `NoState`) means no cohort anywhere serves this topic. The participant treats this as an opportunity to bootstrap: it re-issues the registration at `d = 0` with a `bootstrap: true` flag, asking the root cohort to instantiate. Cold-start denial (root is unwilling) yields `UnwillingCohort` and the participant retries.
+- **Follow-on cold-start (deeper-tier growth).** When a walk follows a `Promoted(d+1)` redirect and the tier-`(d+1)` child answers `NoState`, that child shard does not exist yet. Stepping inward would return to the promoting parent and be redirected again — an oscillation. Instead the **register** path re-issues **once** at that same child tier with a `followOn: true` flag, asking the cold child to instantiate (the deeper-tier analogue of the root's `bootstrap: true`). If the follow-on also returns `NoState` (the child's quorum is unwilling), the walk backs off in time rather than looping. This is what lets a join that lands on a freshly-promoted-but-not-yet-grown branch converge. `followOn` is participant-asserted on the wire, so it is gated by the **same** anti-DoS evidence a `bootstrap` cold-start pays (§Anti-DoS). A read-only `probe` never instantiates, so it backs off immediately instead of setting `followOn`.
 
 > **Read-only lookup (`probe: true`).** `service.lookup` walks this *same* path with `RegisterV1.probe`
 > set: identical routing discipline (inward on `NoState`, follow `Promoted` outward, back off on
@@ -194,16 +195,20 @@ Key points:
 > (`WalkEngine` / `createWalkEngine`). It drives the injected `ITopicRouter` port — **not** a direct
 > FRET import — keying each probe at `coord_d(self, topicId)` (via `TierAddressing`) with
 > `wantK = k`, `minSigs = k − x`, decoding the `RegisterReplyV1` and dispatching: `no_state` → step
-> inward (`d − 1`), with the root case re-issuing once at tier 0 with `bootstrap: true`;
-> `promoted(targetTier)` → the one outward move, recomputing `coord_targetTier` and registering there
-> (or, with `followPromoted: false`, surfaced to the caller); `unwilling_member` → a direct
-> `dialMember` retry of a named sibling at the **same** coord; `unwilling_cohort` → terminate with a
-> `retry_later(afterMs)` so the caller backs off in time and a fresh `register` restarts at `d_max`
-> (never re-hitting the declined coord). Building + signing each `RegisterV1` is delegated to an
-> injected `RegisterMessageFactory` (participant identity/crypto live there). A `maxSteps` safety
-> valve bounds pathological inward/outward oscillation in a malformed tree. Spec: `walk.spec.ts`
-> (sparse-regime distinct-`coord_{d_max}` fan-out, `Promoted` outward recompute, `UnwillingCohort`
-> restart-at-`d_max`, sibling-dial retry, bootstrap re-issue).
+> inward (`d − 1`), with the root case re-issuing once at tier 0 with `bootstrap: true`, **and the
+> after-a-`Promoted`-redirect case re-issuing once at the same child tier with `followOn: true`** (then
+> backing off if that too returns `no_state`); `promoted(targetTier)` → the one outward move, recomputing
+> `coord_targetTier` and registering there (or, with `followPromoted: false`, surfaced to the caller);
+> `unwilling_member` → a direct `dialMember` retry of a named sibling at the **same** coord;
+> `unwilling_cohort` → terminate with a `retry_later(afterMs)` so the caller backs off in time and a fresh
+> `register` restarts at `d_max` (never re-hitting the declined coord). Building + signing each
+> `RegisterV1` is delegated to an injected `RegisterMessageFactory` (participant identity/crypto live
+> there); it mints the same signed `bootstrapEvidence` envelope on a `followOn` re-issue as on a
+> `bootstrap` re-issue. A `maxSteps` safety valve remains as a backstop against a malformed tree, but the
+> `followOn`-then-backoff path — not `maxSteps` — is now the primary terminator for a promoted-but-cold
+> branch. Spec: `walk.spec.ts` (sparse-regime distinct-`coord_{d_max}` fan-out, `Promoted` outward
+> recompute, `UnwillingCohort` restart-at-`d_max`, sibling-dial retry, bootstrap re-issue, follow-on
+> re-issue → willing child accepted / unwilling child backs off).
 
 ### Why this distributes naturally
 
@@ -687,9 +692,14 @@ The newly-instantiated forwarder registers itself with its tier-(d−1) parent o
 > [`packages/db-core/src/cohort-topic/coldstart.ts`](../packages/db-core/src/cohort-topic/coldstart.ts).
 > `shouldInstantiate({ bootstrap, followOn, quorumWilling })` is the admission gate
 > (`(bootstrap ∨ followOn) ∧ quorumWilling`) — a speculative `d_max` probe (neither flag) yields
-> `false`, so the walk gets `NoState` instead of forking a parallel branch. The `followOn` signal is
-> **not** on the wire (`RegisterV1` carries only `bootstrap`); the db-p2p cohort host determines it
-> from routing context and passes it in (a documented integration seam). `createForwarder` / the
+> `false`, so the walk gets `NoState` instead of forking a parallel branch. `followOn` **is a signed wire
+> flag** on `RegisterV1`: the child cohort a `Promoted` redirect points at is at an *uncorrelated* ring
+> coord from the promoting parent (the tier-addressing hash decorrelates tiers) and FRET delivers the
+> register with no breadcrumb of the redirect, so the child genuinely cannot infer `followOn` locally — it
+> must be carried on the frame. The db-p2p host derives `ctx.followOn = reg.followOn === true` in
+> `dispatchRegister`. Because a wire flag is participant-forgeable, safety comes not from provenance but
+> from the anti-DoS gate: a `followOn: true` cold-start is evidence-gated identically to a `bootstrap: true`
+> cold-start (§Anti-DoS), so it pays the same proof-of-work / reputation / parent-reference cost. `createForwarder` / the
 > `ColdStartManager` hold the link-up state machine: a deeper forwarder starts `awaiting_parent` —
 > accepting participants but holding parent-involving ops — and flips to `serving` when its
 > `ParentRegistrar.registerWithParent` acks; the root (tier 0) has no parent and serves immediately.
@@ -912,7 +922,18 @@ The layer relies on a small handful of structural defenses against malicious reg
 - **Per-peer rate limits per cohort.** Cohort members track inbound `RegisterV1` rate per source `PeerId`. Default ceiling is 4 per minute per peer per topic at any single cohort. Exceeded → `UnwillingCohort(retryAfter)` with exponential `retryAfter`.
 - **Per-cohort topic budget.** A cohort holds at most `topics_max` (default 2048) topics with forwarder state. When the budget is exhausted, new topic instantiations are refused with `UnwillingCohort`; existing topics continue. Eviction within the budget is LRU by participant count; topics with zero recent registrations are dropped first.
 - **Signed registrations.** Every `RegisterV1` carries a `correlationId` (16 random bytes) and a signature from the participant's peer key over `(topicId, tier, correlationId, timestamp)`. Stale-timestamp or replayed-correlationId messages are dropped.
-- **Bootstrap requires evidence.** A cold root accepting `bootstrap: true` requires the registration to carry one of: a small proof-of-work, a signature from a peer with a sufficient reputation score ([architecture.md](architecture.md) §Reputation), or a signed reference to a parent topic that does exist. Specifics depend on the application's tier — T0/T1 topics generally don't need PoW because they correspond to committed work; T2/T3 topics do. The evidence rides in a **dedicated, signature-covered** `RegisterV1.bootstrapEvidence` field — a versioned `BootstrapEvidenceEnvelopeV1` (`{ v, pow?, parentRef?, reputation? }`), base64url-encoded — **not** in the opaque `appPayload` slot (which the cohort copies verbatim into the registration's `appState` and replicates cluster-wide; overloading it would displace the real appState on the very register that needs it). Every kind binds the same canonical `(topicId, tier, participantCoord, timestamp)` tuple so a captured proof cannot be replayed for a different topic, tier, peer, or (within the replay window) time. The envelope format and the PoW preimage/difficulty are db-core (`antidos/bootstrap-evidence-envelope.ts`, crypto-free); the actual hashing and signature checks are db-p2p-injected.
+- **Cold-start requires evidence (bootstrap *and* follow-on).** A cold cohort accepting a cold-start register requires the registration to carry one of: a small proof-of-work, a signature from a peer with a sufficient reputation score ([architecture.md](architecture.md) §Reputation), or a signed reference to a parent topic that does exist. This gate fires on **both** cold-start flags: a `bootstrap: true` root register *and* a `followOn: true` deeper-tier register (the redirect-target instantiation) are gated identically — a follow-on is participant-asserted on the wire (the cold child cannot infer it; §Cold-start instantiation), so its safety rests on paying the same anti-abuse cost, not on provenance. Specifics depend on the application's tier — T0/T1 topics generally don't need PoW because they correspond to committed work; T2/T3 topics do. The evidence rides in a **dedicated, signature-covered** `RegisterV1.bootstrapEvidence` field — a versioned `BootstrapEvidenceEnvelopeV1` (`{ v, pow?, parentRef?, reputation? }`), base64url-encoded — **not** in the opaque `appPayload` slot (which the cohort copies verbatim into the registration's `appState` and replicates cluster-wide; overloading it would displace the real appState on the very register that needs it). Every kind binds the same canonical `(topicId, tier, participantCoord, timestamp)` tuple so a captured proof cannot be replayed for a different topic, tier, peer, or (within the replay window) time. The envelope format and the PoW preimage/difficulty are db-core (`antidos/bootstrap-evidence-envelope.ts`, crypto-free); the actual hashing and signature checks are db-p2p-injected.
+
+> **Follow-on hardening (deferred, tripwire — not a queued ticket).** PoW-gating a follow-on makes a
+> redirect-target cold-start exactly as costly as a root bootstrap, which is sufficient today. It is
+> *not* proof the participant was genuinely redirected — a peer that pays the PoW can instantiate a
+> tier-`(d+1)` child for a topic whose parent never promoted. If spoofed, PoW-paid follow-on
+> instantiation ever shows up as real abuse, upgrade to a **parent-vouched** redirect: echo the parent
+> cohort's threshold-signed `PromotionNoticeV1` on the follow-on register and verify it against the
+> parent cohort's `MembershipCertV1` on the child's admission path (a new `RegisterReplyV1` field to
+> carry the notice + an admission-path membership verify). The natural voucher already exists (the
+> parent's `PromotionNoticeV1`), so the upgrade path is clean. Tagged `NOTE:` at
+> `antidos/bootstrap-evidence.ts`.
 
 The layer does not attempt to defend against unbounded Sybil attacks at the registration level; those are FRET's and the reputation subsystem's concern.
 
@@ -1156,10 +1177,13 @@ limit, topic-budget refusal, and `bootstrap: true` root instantiation.
 >   outward) IS asserted on the real engine; the fan awaits the routing-key/signer-id reconciliation in
 >   `cohort-topic-participant-coord-routing-key-mismatch` (see §Wire formats "Tier-0 caveat"). The fan
 >   itself is simulator-validated against the uniform ring coord (`scenarios.ts` cold-start-storm).
-> - **multi-tier tree growth / depth law** `⌈log_F(N/cap_promote)⌉` over a live walk and a `Promoted`
->   redirect instantiating a tier-1 child: the host dispatch passes `followOn: false` and only the root
->   sets `bootstrap`, so a tier-1 cohort answers `no_state` rather than cold-starting
->   (`cohort-topic-followon-derivation`). The depth law is simulator-owned (`promotion-convergence.ts`).
+> - **multi-tier tree growth / depth law** `⌈log_F(N/cap_promote)⌉` over a live walk: `followOn` cold-start
+>   derivation has now landed (`cohort-topic-followon-derivation`) — the host derives `followOn` from the
+>   wire flag and a `Promoted`-redirect follow-on instantiates a cold tier-`(d+1)` child (asserted directly
+>   at the engine, §Cold-start instantiation). The remaining gap for a full **depth-law e2e over a live
+>   walk** is the parent-side child recording (`childCohortCount`, the signed child-link frame,
+>   `cohort-topic-parent-child-link`), without which there is no observable multi-tier parent state to
+>   assert the depth against. The depth law itself is simulator-owned (`promotion-convergence.ts`).
 > - **tier-(d>0) demotion-notice broadcast**: the parent-side `childCohortCount` recording is the
 >   observable effect and is parked (`cohort-topic-parent-child-link`); promotion/demotion hysteresis is
 >   unit-covered by `promotion.spec.ts`.
@@ -1196,15 +1220,21 @@ warm-failover target.
 >   cohort-side admission it drives IS asserted over the real willingness quorum), and multi-tier promotion
 >   (the single-tier-0 milestone gaps above).
 
-**Still deferred (parked in backlog, honestly out of scope for this milestone):** multi-tier
-promoted-redirect *follow-on* instantiation (`cohort-topic-followon-derivation`) and the parent-side
-child-cohort link recording (`cohort-topic-parent-child-link`).
+**Still deferred (parked in backlog, honestly out of scope for this milestone):** the parent-side
+child-cohort link recording (`cohort-topic-parent-child-link`) — without which a full multi-tier
+depth-law e2e over a live walk has no observable parent state to assert against.
 
 > **Landed since:** the read-only **lookup-probe** RPC — `lookup` now drives the walk with
 > `RegisterV1.probe: true`, classifying the terminal cohort and returning the same snapshot a register
 > would **without admitting anything** (no soft-state record, no arrival, no promotion trigger, no
 > topic-budget touch, and never a cold-start instantiation), so a lookup leaves no TTL-expiring
 > registration behind. See §Lookup and §Wire formats (`RegisterV1.probe`).
+>
+> **Landed since:** **follow-on cold-start derivation** (`cohort-topic-followon-derivation`) — `followOn`
+> is now a signed `RegisterV1` wire flag; the register walk re-issues it once at a promoted-but-cold child
+> tier (instead of oscillating), the host derives `ctx.followOn` from it, and the cold child instantiates
+> under the same anti-DoS evidence a `bootstrap` cold-start pays. See §Lookup, §Cold-start instantiation,
+> §Anti-DoS, and §Wire formats (`RegisterV1.followOn`).
 >
 > **Landed since:** the immediate **withdraw tombstone** — `withdraw` now both stops the local ping loop
 > AND sends a best-effort signed `RenewV1.withdraw: true` to the current primary, which evicts the record
@@ -1241,17 +1271,29 @@ interface RegisterV1 {
   participantCoord: string            // participant identity P (see note)
   ttl:             number             // ms, default 90000
   bootstrap?:      boolean            // true on root cold-start request
-  probe?:          boolean            // read-only lookup: classify + return the cohort snapshot, admit nothing (mutually exclusive with bootstrap)
+  followOn?:       boolean            // true on the re-issue after a Promoted redirect target answered NoState (treeTier >= 1); deeper-tier cold-start
+  probe?:          boolean            // read-only lookup: classify + return the cohort snapshot, admit nothing
   appPayload?:     string             // opaque, application-defined
-  bootstrapEvidence?: string          // cold-start evidence envelope, base64url (see note); only on bootstrap
+  bootstrapEvidence?: string          // cold-start evidence envelope, base64url (see note); on bootstrap OR followOn
   timestamp:       number             // unix ms
   correlationId:   string             // 16 bytes random
   signature:       string             // participant peer-key signature over the body (minus signature)
 }
 ```
 
-> **Bootstrap evidence.** `bootstrapEvidence` is a **dedicated, signed** field (not `appPayload`) carrying
-> the cold-start anti-DoS proof a root demands when `bootstrap: true` (§Anti-DoS). It is the base64url
+> **Follow-on cold-start (`followOn`).** `followOn` marks the dedicated re-issue a participant sends after
+> a `Promoted(d+1)` redirect target answers `NoState` — the deeper-tier analogue of `bootstrap`, asking a
+> cold tier-`(d+1)` child to instantiate (§Lookup, §Cold-start instantiation). It is **always
+> `treeTier >= 1`** and **mutually exclusive** with `bootstrap` and `probe` (the walk sets at most one; the
+> validator rejects a frame that sets more than one, and rejects `followOn: true` with `treeTier < 1`). It
+> is **covered by `signature`** (appended to `registerSigningPayload`, normalized to `false` when absent),
+> so a MITM cannot strip or flip it. Because it is participant-asserted and forgeable, a `followOn`
+> cold-start is evidence-gated identically to a `bootstrap` cold-start — it carries the same
+> `bootstrapEvidence` and pays the same anti-DoS cost (§Anti-DoS). The db-p2p host derives
+> `ctx.followOn = reg.followOn === true` in `dispatchRegister`.
+>
+> **Bootstrap / follow-on evidence.** `bootstrapEvidence` is a **dedicated, signed** field (not `appPayload`) carrying
+> the cold-start anti-DoS proof a cold cohort demands when `bootstrap: true` **or** `followOn: true` (§Anti-DoS). It is the base64url
 > encoding of a versioned `BootstrapEvidenceEnvelopeV1` — `{ v: 1, pow?: { nonce }, parentRef?:
 > { parentTopicId, sig }, reputation?: { referee, sig } }`, each kind's bytes base64url — and is **covered
 > by `signature`** (a fixed slot in `registerSigningPayload`, normalized to `null` when absent, with an

@@ -267,6 +267,109 @@ describe('cohort-topic / member-engine: onAdmit fires on accept', () => {
 	});
 });
 
+describe('cohort-topic / member-engine: followOn cold-start admission', () => {
+	const hash = createRingHash();
+	const slots = createSlotAssigner(hash);
+	const self = bytes('followon-self', 16);
+	const cohortEpoch = bytes('followon-epoch', 32);
+	const members = [self];
+	const cohort = (): { members: readonly Uint8Array[]; cohortEpoch: Uint8Array } => ({ members, cohortEpoch });
+	const parentCoord = bytes('followon-parent', 32);
+	// The routing context the host derives from a `followOn: true` frame (ctx.followOn mirrors reg.followOn).
+	const ctx = { followOn: true, treeTier: 1, parentCoord };
+
+	/**
+	 * Compose a member engine whose cold-start manager is real (so `serves` flips true once a forwarder
+	 * instantiates) and whose bootstrap-evidence gate returns `evidenceOk` (undefined → gate not wired). A
+	 * background `registerWithParent` counter proves the instantiated tier-1 child links to its parent.
+	 */
+	function makeEngine(opts: { evidenceOk?: boolean }): {
+		engine: ReturnType<typeof createCohortMemberEngine>;
+		store: ReturnType<typeof createRegistrationStore>;
+		coldStart: ReturnType<typeof createColdStartManager>;
+		parentCalls: () => number;
+	} {
+		const store = createRegistrationStore();
+		let parentCalls = 0;
+		const coldStart = createColdStartManager({
+			parentRegistrar: { registerWithParent: async (): Promise<void> => { parentCalls++; } },
+		});
+		const engine = createCohortMemberEngine({
+			self,
+			profile: {} as never,
+			hash,
+			store,
+			slots,
+			willingness: { evaluate: (): { kind: 'accepted' } => ({ kind: 'accepted' }) },
+			promotion: {
+				onParticipantCountChange: (): Promise<undefined> => Promise.resolve(undefined),
+				maybeDemote: (): Promise<undefined> => Promise.resolve(undefined),
+				isPromoted: (): boolean => false,
+				applyPromotionNotice: (): void => {},
+				applyDemotionNotice: (): void => {},
+			},
+			coldStart,
+			traffic: {
+				recordArrival: (): void => {},
+				snapshot: (): { windowSeconds: number; arrivalsPerMin: number; queriesPerMin: number; directParticipants: number; childCohortCount: number } =>
+					({ windowSeconds: 60, arrivalsPerMin: 0, queriesPerMin: 0, directParticipants: 0, childCohortCount: 0 }),
+			} as never,
+			renewal: unused('renewal'),
+			cohort,
+			quorumWilling: (): boolean => true,
+			bootstrapEvidence: opts.evidenceOk === undefined ? undefined : { verify: (): boolean => opts.evidenceOk! },
+		});
+		return { engine, store, coldStart, parentCalls: (): number => parentCalls };
+	}
+
+	function followOnReg(topic: Uint8Array, participant: Uint8Array, cid: string): RegisterV1 {
+		return {
+			v: 1,
+			topicId: bytesKey(topic),
+			tier: 2, // a T2 topic → the evidence gate demands PoW/reputation/parent-ref, same as a bootstrap
+			treeTier: 1, // a follow-on is a deeper-than-root growth point
+			participantCoord: bytesKey(participant),
+			ttl: 90_000,
+			followOn: true,
+			timestamp: 1_000,
+			correlationId: bytesKey(bytes(cid)),
+			signature: '',
+		};
+	}
+
+	it('a followOn cold register with valid evidence instantiates the child and admits', async () => {
+		const { engine, coldStart, parentCalls } = makeEngine({ evidenceOk: true });
+		const TOPIC = bytes('followon-cold');
+		const reply = await engine.handleRegister(followOnReg(TOPIC, bytes('followon-p', 16), 'cid-cold'), ctx, 1_000);
+		expect(reply.result, 'the follow-on instantiates the cold child and admits').to.equal('accepted');
+		const fwd = coldStart.get(TOPIC);
+		expect(fwd, 'the child forwarder was instantiated').to.not.equal(undefined);
+		expect(fwd!.tier, 'instantiated at the child tree tier (d = 1)').to.equal(1);
+		await new Promise<void>((r) => setTimeout(r, 0)); // flush the background parent registration
+		expect(parentCalls(), 'the tier-1 child kicks off registration with its tier-0 parent').to.equal(1);
+	});
+
+	it('a followOn register with bad evidence is refused (unwilling_cohort) and never instantiates', async () => {
+		const { engine, coldStart } = makeEngine({ evidenceOk: false });
+		const TOPIC = bytes('followon-badevidence');
+		const reply = await engine.handleRegister(followOnReg(TOPIC, bytes('p', 16), 'cid-bad'), ctx, 1_000);
+		expect(reply.result, 'the evidence gate rejects before the cold-start decision').to.equal('unwilling_cohort');
+		expect(coldStart.get(TOPIC), 'no forwarder instantiated on a rejected follow-on').to.equal(undefined);
+	});
+
+	it('a followOn register on an already-hot child admits via the normal path (no re-instantiation)', async () => {
+		const { engine, store, coldStart } = makeEngine({ evidenceOk: true });
+		const TOPIC = bytes('followon-hot');
+		// Seed a resident participant so the child is already hot (serves(topic) true) without a forwarder.
+		const seedP = bytes('seed-hot', 16);
+		const { primary, backups } = slots.assignSlots(seedP, cohortEpoch, members);
+		store.put({ topicId: TOPIC, participantId: seedP, tier: 2, primary, backups, attachedAt: 1_000, lastPing: 1_000, ttl: DEFAULT_TTL_MS });
+		const reply = await engine.handleRegister(followOnReg(TOPIC, bytes('p', 16), 'cid-hot'), ctx, 2_000);
+		expect(reply.result, 'a hot child admits the follow-on via the normal admission path').to.equal('accepted');
+		expect(coldStart.get(TOPIC), 'the hot path never instantiates a forwarder').to.equal(undefined);
+	});
+});
+
 describe('cohort-topic / member-engine: handleProbe (read-only lookup)', () => {
 	const hash = createRingHash();
 	const slots = createSlotAssigner(hash);

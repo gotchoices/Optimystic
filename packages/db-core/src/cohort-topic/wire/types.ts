@@ -29,6 +29,20 @@ export interface RegisterV1 {
 	/** True on a root cold-start request. */
 	bootstrap?: boolean;
 	/**
+	 * Follow-on cold-start request: set on the **dedicated re-issue** the participant sends after a
+	 * `Promoted` redirect target answered {@link RegisterResult} `no_state` (the redirect points at a
+	 * tier-`(d+1)` child cohort that does not exist yet). It tells that cold child "I am here because
+	 * your parent redirected me — instantiate", which drives the cold-start gate
+	 * (`shouldInstantiate({ followOn, … })`) exactly as `bootstrap` drives it at the root. Constraints:
+	 * always `treeTier >= 1` (a follow-on is a deeper-than-root growth point, never the root); mutually
+	 * exclusive with {@link bootstrap} and {@link probe} (the walk sets at most one). Because a wire flag is
+	 * participant-forgeable, safety does NOT come from its provenance: a `followOn: true` register is gated
+	 * by the **same** `bootstrapEvidence` policy a `bootstrap: true` cold-root register passes (§Anti-DoS),
+	 * so it carries the identical proof in {@link bootstrapEvidence} and pays the identical anti-abuse cost.
+	 * Covered by `signature` (appended to `registerSigningPayload`) so a MITM cannot strip or flip it.
+	 */
+	followOn?: boolean;
+	/**
 	 * Read-only lookup probe: classify + return the cohort snapshot without admitting (no record, no
 	 * arrival, no promotion trigger, no topic-budget touch, and **never** a cold-start instantiation /
 	 * `bootstrap`). A probe walks to the responsible cohort exactly as a register does and resolves the
@@ -42,9 +56,11 @@ export interface RegisterV1 {
 	appPayload?: string;
 	/**
 	 * Cold-start bootstrap-evidence envelope, base64url (a `BootstrapEvidenceEnvelopeV1` — see
-	 * `../antidos/bootstrap-evidence-envelope.js`). Present only on a `bootstrap: true` root register;
-	 * carries the tier-dependent proof a cold root demands (proof-of-work / reputation endorsement /
-	 * signed parent reference — §Anti-DoS). This is a **dedicated** field, NOT `appPayload`: the cohort
+	 * `../antidos/bootstrap-evidence-envelope.js`). Present on a `bootstrap: true` root register **or** a
+	 * `followOn: true` deeper-tier re-issue — both are cold-start requests gated by the identical evidence
+	 * policy (§Anti-DoS), so both carry this proof; carries the tier-dependent proof a cold cohort demands
+	 * (proof-of-work / reputation endorsement / signed parent reference — §Anti-DoS). This is a
+	 * **dedicated** field, NOT `appPayload`: the cohort
 	 * copies `appPayload` verbatim into the registration's `appState` and replicates it cluster-wide,
 	 * whereas the bootstrap evidence is parsed-and-checked by the substrate, **covered by `signature`**
 	 * (so a MITM cannot strip or swap it), and never stored as appState. Empty string is treated as

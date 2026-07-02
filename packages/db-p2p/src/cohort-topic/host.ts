@@ -904,7 +904,13 @@ export async function createCohortTopicHost(node: Libp2p, fret: FretService, opt
 		}
 		// `parentCoord` for a cold-start forwarder's parent registration; undefined at the root.
 		const parentCoord = reg.treeTier > 0 ? addressing.coord(reg.treeTier - 1, participantCoord, topicId) : undefined;
-		return coordEngine.engine.handleRegister(reg, { followOn: false, treeTier: reg.treeTier, parentCoord }, now);
+		// Derive `followOn` straight from the participant-asserted wire flag. This is the information the
+		// child cohort genuinely cannot infer locally (the tier-addressing hash decorrelates parent/child
+		// coords, and FRET carries no breadcrumb of the redirect), so it must be carried on the frame. It is
+		// forgeable, so the engine's step-1 bootstrap-evidence gate — which demands the same proof for
+		// `followOn: true` as for a `bootstrap: true` cold-root — is what keeps it honest (§Anti-DoS).
+		const followOn = reg.followOn === true;
+		return coordEngine.engine.handleRegister(reg, { followOn, treeTier: reg.treeTier, parentCoord }, now);
 	};
 
 	// --- protocol handlers + activity callback ---

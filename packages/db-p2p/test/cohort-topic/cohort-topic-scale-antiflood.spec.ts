@@ -32,6 +32,7 @@ import {
 	type WalkTrace,
 } from '@optimystic/db-core';
 import {
+	addressing,
 	buildMesh,
 	coordTierMap,
 	delay,
@@ -141,10 +142,15 @@ describe('cohort-topic: scale anti-flood + anti-DoS (mock-tier e2e)', function (
 				expect(await waitFor(() => decidingEngine.isPromoted(TOPIC), 8_000), 'the root cohort promoted').to.equal(true);
 
 				// A fresh walk now: coord_1 → no_state → coord_0 → Promoted(1) → coord_1 (the one outward move) →
-				// no_state → coord_0 → Promoted(1) → … until maxSteps → temporal back-off.
+				// no_state → coord_1 followOn re-issue (the deeper-tier cold-start, same coord/tier — NOT an
+				// inward step). The re-issue then resolves terminally (the child instantiates and admits/declines,
+				// or backs off) instead of oscillating inward-then-outward forever. Either way the walk discipline
+				// holds: the single outward move (0 → 1) is the Promoted redirect, and no inward step follows a
+				// non-no_state reply. (The child's background forwarder→parent link RPC is unsigned, so
+				// walkTraceFrom filters it out of this reconstruction.)
 				const walker = mesh.nodes[N - 1]!;
-				const { trace, backoff } = await walkOnce(mesh, walker, TOPIC, dMax);
-				expect(backoff, 'the post-promotion walk terminates in a temporal back-off (single-cohort tree)').to.equal(true);
+				const { trace, attached, backoff } = await walkOnce(mesh, walker, TOPIC, dMax);
+				expect(attached || backoff, 'the post-promotion walk terminates (accepts at the grown child or backs off), never spins').to.equal(true);
 
 				const hasOutwardMove = trace.probes.some((p, i) => i > 0 && p.treeTier > trace.probes[i - 1]!.treeTier);
 				expect(hasOutwardMove, 'the walk actually moved outward (so the invariant is not vacuous)').to.equal(true);
@@ -341,12 +347,31 @@ describe('cohort-topic: scale anti-flood + anti-DoS (mock-tier e2e)', function (
 			}
 		});
 
-		it.skip('a Promoted redirect instantiates a tier-1 child that registers with its tier-0 parent on first opportunity [DOC EXPECTATION NOT YET IMPLEMENTED at e2e — live followOn instantiation parked: cohort-topic-followon-derivation]', () => {
-			// A live walk drawing Promoted(1) recomputes coord_1 and registers there, but the host dispatch
-			// passes `followOn: false` and only the root sets `bootstrap`, so the tier-1 cohort answers no_state
-			// rather than cold-starting a child. The forwarder→parent link transport itself (gap 7) IS wired and
-			// unit-covered by host-antidos-coldstart.spec.ts ('a tier-1 forwarder links to its tier-0 parent…');
-			// what is missing for the e2e is the host deriving followOn from a Promoted-redirect arrival.
+		it('a followOn register instantiates a cold tier-1 child under a willing quorum (cold-child-instantiates-via-followOn)', async () => {
+			// followOn cold-start derivation (cohort-topic-followon-derivation): a participant redirected to a
+			// not-yet-created tier-(d+1) child re-issues with followOn:true, and the cold child instantiates —
+			// the deeper-tier analogue of the bootstrap root cold-start above. We drive the instantiation at a
+			// willing cohort engine with the routing context the host derives from the wire flag: ctx.followOn
+			// from reg.followOn, treeTier=1, and the tier-0 parent coord. Op-tier 0 keeps the same permissive
+			// evidence path the bootstrap test uses. The parent-side child RECORDING (childCohortCount) stays
+			// parked (cohort-topic-parent-child-link); this asserts only that the child cold-starts via followOn.
+			const TOPIC = topic(12);
+			const members = await makeMembers(N);
+			const mesh = await buildMesh(members, { wantK: WANT_K, minSigs: MIN_SIGS });
+			try {
+				const { decidingEngine } = await setupTopic(mesh, TOPIC);
+				expect(decidingEngine.servesTopic(TOPIC), 'cold before any registration').to.equal(false);
+
+				const participant = await makeMember();
+				const parentCoord = addressing.coord(0, participant.bytes, TOPIC); // the tier-0 parent of a tier-1 child
+				const reg = await signedRegister(participant, TOPIC, T0, 'followon', { bootstrap: false, followOn: true, treeTier: 1, tier: 0 });
+				const reply = await decidingEngine.engine.handleRegister(reg, { followOn: true, treeTier: 1, parentCoord }, T0);
+
+				expect(reply.result, 'the follow-on instantiates the cold tier-1 child and is accepted').to.equal('accepted');
+				expect(decidingEngine.servesTopic(TOPIC), 'the child forwarder is now instantiated via followOn').to.equal(true);
+			} finally {
+				await mesh.stop();
+			}
 		});
 	});
 });
