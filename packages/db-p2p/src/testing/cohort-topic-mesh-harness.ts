@@ -443,6 +443,7 @@ export async function signedWillingness(from: Member, coord: Uint8Array, epoch: 
 		fromMember: bytesToB64url(from.bytes),
 		coord: bytesToB64url(coord),
 		cohortEpoch: bytesToB64url(epoch),
+		treeTier: 0,
 		willingnessBits, // default 'f' → willing at every tier
 		loadBuckets: [0, 0, 0, 0],
 		windowSeconds: 60,
@@ -585,6 +586,20 @@ export interface TopicSetup {
  * registration needs a seed. Operating on the cohort (not all `N` nodes) keeps setup `O(wantK²)` at
  * scale; for a whole-network cohort (`wantK = N`) it covers every node, matching the live-tier milestone.
  */
+/**
+ * Pump one gossip round on **every live coord engine across every node**, then let the async inbound
+ * `/cohort-gossip` handlers settle. This is the cold-bootstrap counterpart to {@link setupTopic}'s manual
+ * willingness pre-seed: with no seed, the idle-but-willing willingness heartbeat (change A) plus cold-sibling
+ * engine instantiation (change B) must carry a fresh cohort from cold to a willingness quorum on their own,
+ * and this drives the rounds that make that happen. Call it repeatedly — each call is one "wave": engines a
+ * previous wave's heartbeats just instantiated on siblings only get pumped (and so reciprocate their own
+ * willingness) on the next wave.
+ */
+export async function pumpMeshGossip(mesh: CohortMesh, now: number, settleMs = 30): Promise<void> {
+	await Promise.all(mesh.nodes.flatMap((n) => n.host.registry.all().map((e) => e.gossipRound(now))));
+	await delay(settleMs);
+}
+
 export async function setupTopic(mesh: CohortMesh, topic: Uint8Array, tierAddr = addressing): Promise<TopicSetup> {
 	const coord0 = tierAddr.coord0(topic);
 	const seedParticipant = mesh.nodes[0]!.member.bytes; // dummy participantCoord (unused at tier 0)

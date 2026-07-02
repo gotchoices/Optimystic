@@ -372,11 +372,16 @@ export function validateCohortGossipV1(value: unknown): CohortGossipV1 {
 	if (!Array.isArray(summaries)) {
 		fail(`${what}: field "topicSummaries" must be an array`);
 	}
+	const treeTier = reqFiniteNumber(obj, "treeTier", what);
+	if (!Number.isInteger(treeTier) || treeTier < 0) {
+		fail(`${what}: field "treeTier" must be a non-negative integer, got ${treeTier}`);
+	}
 	const out: CohortGossipV1 = {
 		v: 1,
 		fromMember: reqString(obj, "fromMember", what),
 		coord: b64urlField(reqString(obj, "coord", what), "coord", what),
 		cohortEpoch: b64urlField(reqString(obj, "cohortEpoch", what), "cohortEpoch", what),
+		treeTier,
 		willingnessBits,
 		loadBuckets: loadBuckets as number[],
 		windowSeconds: reqFiniteNumber(obj, "windowSeconds", what),

@@ -162,6 +162,7 @@ async function signedGossip(from: Member, coord: Uint8Array, epoch: Uint8Array, 
 		fromMember: bytesToB64url(from.bytes),
 		coord: bytesToB64url(coord),
 		cohortEpoch: bytesToB64url(epoch),
+		treeTier: 0,
 		willingnessBits: 'f',
 		loadBuckets: [0, 0, 0, 0],
 		windowSeconds: 60,
@@ -220,20 +221,35 @@ describe('cohort-topic: gossip-cadence driver helpers', () => {
 		expect(d.evicted.length, 'eviction queued').to.equal(1);
 	});
 
-	it('buildCohortGossip skips an idle engine (no topics, no deltas) and packs willingness otherwise', () => {
+	it('buildCohortGossip skips an idle non-heartbeat engine, emits a willingness-only heartbeat when idle+willing, and packs deltas otherwise', () => {
 		const barometer = createLoadBarometer();
 		const base = {
 			fromMember: 'self',
 			coord: bytesToB64url(TOPIC),
 			cohortEpoch: bytesToB64url(TOPIC2),
+			treeTier: 0,
 			profile: coreProfile(),
 			barometer,
 			windowSeconds: 60,
 			timestamp: 9_000,
 		};
-		expect(buildCohortGossip({ ...base, topicSummaries: [], records: [], evicted: [] }), 'idle → no frame').to.equal(undefined);
+		expect(buildCohortGossip({ ...base, heartbeat: false, topicSummaries: [], records: [], evicted: [] }), 'idle, no heartbeat → no frame').to.equal(undefined);
 
-		const withDelta = buildCohortGossip({ ...base, topicSummaries: [], records: [toGossipRecord(record('p', 5_000))], evicted: [] });
+		// Idle + heartbeat + willing (coreProfile serves every tier) → a willingness-only frame: no summaries,
+		// no record/eviction deltas, but the willingness vector + tree tier are carried so a cold sibling can
+		// instantiate off it and reciprocate.
+		const hb = buildCohortGossip({ ...base, heartbeat: true, topicSummaries: [], records: [], evicted: [] });
+		expect(hb, 'idle + heartbeat + willing → a willingness-only frame').to.not.equal(undefined);
+		expect(hb!.treeTier, 'the heartbeat carries the tree tier for cold-sibling instantiation').to.equal(0);
+		expect(hb!.topicSummaries, 'no topic summaries on a heartbeat').to.deep.equal([]);
+		expect(hb!.records ?? [], 'no record delta on a heartbeat').to.deep.equal([]);
+		expect(hb!.willingnessBits).to.equal(willingnessBitsHex(selfWillingnessBits(coreProfile(), barometer)));
+
+		// An idle engine that is willing for NOTHING stays silent even on a heartbeat (nothing to bootstrap).
+		const noTiers = { ...coreProfile(), willingTiers: new Set<Tier>() };
+		expect(buildCohortGossip({ ...base, profile: noTiers, heartbeat: true, topicSummaries: [], records: [], evicted: [] }), 'idle + heartbeat but unwilling → no frame').to.equal(undefined);
+
+		const withDelta = buildCohortGossip({ ...base, heartbeat: false, topicSummaries: [], records: [toGossipRecord(record('p', 5_000))], evicted: [] });
 		expect(withDelta, 'a pending delta makes it non-idle').to.not.equal(undefined);
 		expect(withDelta!.willingnessBits).to.equal(willingnessBitsHex(selfWillingnessBits(coreProfile(), barometer)));
 		expect(withDelta!.loadBuckets).to.deep.equal([0, 0, 0, 0]);
@@ -255,7 +271,13 @@ describe('cohort-topic: host gossip round', () => {
 		const participant = await makeMember();
 		const ce = host.registry.forCoord(coord0, 0 as Tier, participant.bytes);
 
-		expect(await ce.gossipRound(5_000), 'an empty engine builds no frame').to.equal(undefined);
+		// An idle-but-willing engine's first idle round emits a willingness-only heartbeat (empty summaries /
+		// no record deltas) so a cold cohort can bootstrap — not `undefined`.
+		const hb = await ce.gossipRound(5_000);
+		expect(hb, 'an idle-but-willing engine emits a willingness heartbeat on its first idle round').to.not.equal(undefined);
+		expect(hb!.topicSummaries, 'the heartbeat carries no topic summaries').to.deep.equal([]);
+		expect(hb!.records ?? [], 'the heartbeat carries no record delta').to.deep.equal([]);
+		expect(hb!.treeTier, 'the heartbeat carries the tree tier').to.equal(0);
 
 		expect((await ce.engine.handleRegister(await signedRegister(participant, TOPIC), { followOn: false, treeTier: 0 }, 5_000)).result).to.equal('accepted');
 		// A re-attach forces a cohort-side touch → the record lands in the pending-delta queue.
@@ -523,6 +545,7 @@ describe('cohort-topic: host gossip auth gate', () => {
 			fromMember: bytesToB64url(sibling.bytes),
 			coord: bytesToB64url(coordA),
 			cohortEpoch: bytesToB64url(eA.cohort().cohortEpoch),
+			treeTier: 0,
 			willingnessBits: 'f',
 			loadBuckets: [0, 0, 0, 0],
 			windowSeconds: 60,

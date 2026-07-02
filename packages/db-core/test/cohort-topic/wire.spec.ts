@@ -115,6 +115,7 @@ const sampleGossip = (): CohortGossipV1 => ({
 	fromMember: 'peer-member',
 	coord: b64(32, 23),
 	cohortEpoch: b64(32, 18),
+	treeTier: 0,
 	willingnessBits: 'f',
 	loadBuckets: [0, 3, 6, 7],
 	windowSeconds: 30,

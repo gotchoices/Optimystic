@@ -50,6 +50,7 @@ function gossip(from: string, epoch: Uint8Array, opts: Partial<CohortGossipV1> =
 		fromMember: from,
 		coord: bytesToB64url(COORD),
 		cohortEpoch: bytesToB64url(epoch),
+		treeTier: 0,
 		willingnessBits: 'f',
 		loadBuckets: [0, 0, 0, 0],
 		windowSeconds: 30,

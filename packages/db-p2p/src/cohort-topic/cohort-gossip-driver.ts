@@ -36,6 +36,20 @@ import {
 export const DEFAULT_GOSSIP_INTERVAL_MS = 5_000;
 
 /**
+ * Default `T_willingness_heartbeat` (ms): how often a genuinely-**idle** but **willing** engine re-broadcasts
+ * a willingness-only heartbeat so a cold cohort can bootstrap (siblings hear it, instantiate, and reciprocate
+ * their own willingness) without waiting on a first registration that can never be admitted while the view is
+ * empty. See `docs/cohort-topic.md` §Cold-start instantiation / §Configuration.
+ *
+ * On the order of the ping interval (~30 s, `ttl/3` Core) — a few gossip rounds at the 5 s cadence. A
+ * record-carrying (non-idle) round already ships willingness every round and resets this clock, so the
+ * throttle governs only engines with nothing else to say. The very first idle round after an engine is
+ * created emits immediately (no wait), so bootstrap converges in ~2 rounds; the throttle only paces the
+ * steady-state re-broadcast of an idle willing cohort.
+ */
+export const DEFAULT_WILLINGNESS_HEARTBEAT_MS = 30_000;
+
+/**
  * Per-`CoordEngine` queue of registration-record deltas accumulated between gossip rounds. The renewal
  * cohort side calls {@link PendingDeltas.touch} on every served ping/re-attach and
  * {@link PendingDeltas.evicted} on every TTL sweep; the next round {@link PendingDeltas.drain}s the
@@ -96,6 +110,16 @@ export interface GossipFrameInputs {
 	readonly coord: string;
 	/** This cohort's epoch, base64url. */
 	readonly cohortEpoch: string;
+	/** This cohort's tree tier `d` — carried on the frame so a cold sibling instantiates at the right tier. */
+	readonly treeTier: number;
+	/**
+	 * True to emit a **willingness-only heartbeat** even when this engine is idle (no resident topics, no
+	 * pending deltas) — provided the node is actually willing for some tier. Lets an idle-but-willing engine
+	 * still tell siblings it will serve, so a cold cohort can bootstrap (§Cold-start instantiation). The caller
+	 * (the gossip round) sets this from the per-engine heartbeat clock; a non-idle round ignores it (it already
+	 * ships willingness).
+	 */
+	readonly heartbeat: boolean;
 	/** This node's tier profile (the `∧` half of the willingness vector). */
 	readonly profile: NodeProfile;
 	/** This member's load barometer (load buckets + the load-shed half of willingness). */
@@ -113,13 +137,19 @@ export interface GossipFrameInputs {
 }
 
 /**
- * Assemble one round's {@link CohortGossipV1}, or `undefined` when this engine is **idle** — no resident
- * topics and no pending deltas, so it has nothing for siblings and the host skips the broadcast (idle
- * empty engines cost no gossip). `willingnessBits` is `profile ∧ load` ({@link selfWillingnessBits}); the
+ * Assemble one round's {@link CohortGossipV1}, or `undefined` when this engine has nothing to say. An engine
+ * is **idle** when it holds no resident topics and no pending deltas. An idle engine normally builds no frame
+ * (idle empty engines cost no gossip) — **except** on a willingness heartbeat ({@link GossipFrameInputs.heartbeat}),
+ * where an idle engine that is willing for at least one tier (`selfWillingnessBits !== 0`) still emits a
+ * willingness/load-only frame (empty `topicSummaries`, no `records`/`evicted`) so siblings can hear it and a
+ * cold cohort can bootstrap (§Cold-start instantiation). An idle-and-unwilling engine stays silent even on a
+ * heartbeat (nothing to bootstrap). `willingnessBits` is `profile ∧ load` ({@link selfWillingnessBits}); the
  * `signature` slot is left empty for the host's peer-key signer to fill before broadcast.
  */
 export function buildCohortGossip(i: GossipFrameInputs): CohortGossipV1 | undefined {
-	if (i.topicSummaries.length === 0 && i.records.length === 0 && i.evicted.length === 0) {
+	const willingness = selfWillingnessBits(i.profile, i.barometer);
+	const idle = i.topicSummaries.length === 0 && i.records.length === 0 && i.evicted.length === 0;
+	if (idle && !(i.heartbeat && willingness !== 0)) {
 		return undefined;
 	}
 	const g: CohortGossipV1 = {
@@ -127,7 +157,8 @@ export function buildCohortGossip(i: GossipFrameInputs): CohortGossipV1 | undefi
 		fromMember: i.fromMember,
 		coord: i.coord,
 		cohortEpoch: i.cohortEpoch,
-		willingnessBits: willingnessBitsHex(selfWillingnessBits(i.profile, i.barometer)),
+		treeTier: i.treeTier,
+		willingnessBits: willingnessBitsHex(willingness),
 		loadBuckets: i.barometer.loadBuckets(),
 		windowSeconds: i.windowSeconds,
 		topicSummaries: i.topicSummaries,

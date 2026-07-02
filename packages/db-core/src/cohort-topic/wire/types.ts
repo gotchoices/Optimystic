@@ -217,6 +217,14 @@ export interface CohortGossipV1 {
 	 */
 	coord: string;
 	cohortEpoch: string;
+	/**
+	 * The tree tier `d` the originating cohort sits at (the coord encodes the tier-shard, but a coord is a
+	 * hash and cannot be inverted to recover `d`). Carried so a cold sibling that instantiates its engine
+	 * off a co-member's frame (§Cold-start instantiation) adopts the right tier. Always well-defined: the
+	 * only members that originate a frame already know their `treeTier`, and every member of a coord shares
+	 * one `treeTier` by construction. Covered by {@link signature} so it cannot be spoofed.
+	 */
+	treeTier: number;
 	/** 4 bits T0..T3, hex. */
 	willingnessBits: string;
 	/** 4 entries, 0..7 per tier. */

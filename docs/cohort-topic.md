@@ -276,6 +276,8 @@ When a registration arrives at a cohort, FRET's `RouteAndMaybeAct` lands it on o
 
 The cohort gossips a coarse "willingness vector" (one bit per tier per member, refreshed every gossip round) so any member can answer `UnwillingMember` vs `UnwillingCohort` without polling siblings. Stale gossip is acceptable; over-reporting unwillingness costs a temporal retry, not a flood.
 
+An **idle** member — one holding no registrations — still advertises its willingness on a slow heartbeat (§Cold-start instantiation → *Bootstrapping a cold multi-node cohort*), rather than going silent. Without this a brand-new all-idle cohort could never reach a willingness quorum, so its first registration would be declined forever.
+
 > **Resolved (decided).** Willingness stays at **1 bit per tier** — no finer T3 gradations (e.g.
 > subscriber-count buckets). The capacity barometer's 3-bit load bucket already supplies coarse
 > load, and finer willingness gradations buy little against the gossip cost. The gossiped bit is
@@ -693,6 +695,65 @@ The newly-instantiated forwarder registers itself with its tier-(d−1) parent o
 > *recording* (`childCohortCount`, a dedicated signed child-link frame) is deferred
 > (`cohort-topic-parent-child-link`); the single-tier-0 milestone has no parent, so this path is covered
 > by `host-antidos-coldstart.spec.ts`, not the tier-0 e2e.
+
+#### Bootstrapping a cold multi-node cohort (willingness heartbeat + cold-sibling instantiation)
+
+The gate above (`(bootstrap ∨ followOn) ∧ quorumWilling`) assumes the routed member can actually *see* a
+willing quorum. A brand-new multi-node cohort — every member freshly brought up and holding no
+registrations (**idle**) — cannot: the willingness quorum is read from gossiped sibling willingness
+(§Willingness), and an idle engine that holds no registrations otherwise builds no gossip frame. So nobody
+advertises willingness, the routed member counts only itself, its self-willingness never reaches a quorum,
+and the first registration is declined `UnwillingCohort` forever. Because FRET routes every registration
+for a coord to the *same* nearest member, the siblings are never independently woken either — the cohort
+never gets off the ground.
+
+Two coordinated mechanisms break this deadlock. Both are scoped to the single **tier-0** cohort this
+milestone serves; tier-`d > 0` bootstrap needs the topic/`participantCoord` context a bare willingness
+frame lacks and is deferred to the parent-child link work (`cohort-topic-parent-child-link`).
+
+1. **Idle-but-willing willingness heartbeat.** An idle engine that is willing for at least one tier
+   (`selfWillingnessBits ≠ 0`) still emits a *willingness/load-only* gossip frame (empty `topicSummaries`,
+   no record/eviction deltas) so siblings hear that it will serve. It emits **immediately on the first idle
+   round after the engine is created** (so bootstrap converges in ≈ 2 rounds) and thereafter at most once
+   per `T_willingness_heartbeat` (§Configuration). A record-carrying (non-idle) round already ships
+   willingness every round and resets that clock, so the throttle governs only genuinely-idle engines; an
+   engine willing for *nothing* stays silent (it has nothing to bootstrap).
+
+2. **Cold-sibling engine instantiation.** When a node receives a `/cohort-gossip` frame (e.g. the heartbeat
+   above) for a coord it holds **no engine** for, it instantiates that engine so it joins the cohort's
+   gossip and its next heartbeat reciprocates. This is gated on the **same co-member authenticity check the
+   gossip bus already applies** — `fromMember`'s peer-key signature verifies **and** `fromMember` is in
+   `cohortAround(coord).members` — so a peer can only make you instantiate an engine for a coord FRET
+   assembly agrees you both serve. This bounds the DoS surface; without it, cold siblings would materialise
+   only when independently routed to, which never happens.
+
+Convergence: the routed member's first idle round heartbeats → each sibling instantiates its own coord
+engine and merges the willingness → the siblings' next heartbeat fills the routed member's view → the
+retried registration meets the quorum and is admitted **through the existing quorum gate** (no
+admission-policy relaxation) → the admitted record replicates to the now-materialised siblings, restoring
+real warm replicas and failover.
+
+> **Implementation.** The heartbeat is the `heartbeat` branch of `buildCohortGossip`
+> ([`cohort-gossip-driver.ts`](../packages/db-p2p/src/cohort-topic/cohort-gossip-driver.ts)), driven by a
+> per-`CoordEngine` heartbeat clock in `CoordEngine.gossipRound`
+> ([`host.ts`](../packages/db-p2p/src/cohort-topic/host.ts)). Cold-sibling instantiation is
+> `maybeInstantiateColdSibling` in the host's `/cohort-gossip` handler, run **before** the frame is
+> delivered (so the freshly-subscribed bus merges the very frame that woke it) and **only in live-signer
+> mode** (the co-member gate needs keys; key-less/interim mode keeps today's drop-gossip-for-an-unknown-coord
+> behaviour, since unauthenticated engine creation would be a DoS vector). The originating cohort's
+> `treeTier` rides `CohortGossipV1` — a coord is a hash and cannot be inverted to recover its tier, and every
+> member of a coord shares one `treeTier` by construction — and is **covered by the frame signature** so it
+> cannot be spoofed; instantiation is gated to `treeTier === 0` (a tier-`d > 0` frame for an unknown coord
+> falls through to today's drop). Specs: `gossip-cadence.spec.ts` (the willingness-only heartbeat frame),
+> `live-tier.spec.ts` 5b (cold-bootstrap end-to-end: cold cohort declines, heartbeats propagate, a sibling
+> instantiates, register-once → `accepted`, and the record replicates).
+>
+> **Cost (tripwires).** Engines are never reclaimed today (`createCoordRegistry` has no eviction), so
+> cold-sibling instantiation is a *permanent* per-co-member-coord engine cost — bounded by real FRET
+> co-membership, but if idle engines ever accumulate, add an LRU / idle-reclaim over gossip-instantiated
+> engines. And the heartbeat re-broadcasts willingness for every idle-but-willing cohort every
+> `T_willingness_heartbeat`; the throttle plus the willing-for-something gate are the mitigations, but a node
+> serving very many idle cohorts may need to batch heartbeats or lengthen the interval.
 
 ### Hysteresis
 
@@ -1406,6 +1467,7 @@ interface MembershipCertV1 {
 | `ttl` | 90 s | Default registration TTL |
 | `ping_interval` | 30 s | Participant ping cadence (`ttl / 3`) |
 | `T_membership_refresh` | 5 min | Default refresh interval for membership certs |
+| `T_willingness_heartbeat` | 30 s | Slow re-broadcast interval for an idle-but-willing engine's willingness heartbeat (§Cold-start instantiation). First idle round emits immediately; a record-carrying round resets the clock. Cost/latency tradeoff: shorter converges a cold cohort faster but re-broadcasts willingness for every idle willing cohort more often. |
 | `d_max_cap` | 60 | Hard cap on walk-toward-root start tier |
 | `confidence_min` | 0.3 | Below this `n_est` confidence, cap `d_max` at ⌊d_max_cap/2⌋ (upper bound) |
 | `topics_max` | 2048 | Max topics with forwarder state per cohort |

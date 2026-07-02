@@ -88,6 +88,7 @@ export function cohortGossipSigningPayload(g: CohortGossipSignable): Uint8Array 
 		g.fromMember,
 		g.coord,
 		g.cohortEpoch,
+		g.treeTier,
 		g.willingnessBits,
 		g.loadBuckets,
 		g.windowSeconds,
