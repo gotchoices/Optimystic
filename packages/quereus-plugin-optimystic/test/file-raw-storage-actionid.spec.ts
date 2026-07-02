@@ -197,4 +197,16 @@ describe('FileRawStorage legacy raw-colon read fallback (POSIX-only)', function 
 
 		expect(await storage.getMaterializedBlock(BLOCK_ID, STAMP_ACTION_ID)).to.equal(undefined);
 	});
+
+	it('deletePendingTransaction removes BOTH encoded and legacy raw-colon pend files', async () => {
+		// Realistic upgrade state: a new node wrote the encoded file while a stale
+		// raw-colon file lingers from a pre-encode node. Deleting only the encoded
+		// file would let the read fallback resurrect the raw-colon value.
+		await storage.savePendingTransaction(BLOCK_ID, TX_ACTION_ID, makeTransform('encoded-live'));
+		await writeRawColonFile('pend', TX_ACTION_ID, makeTransform('raw-stale'));
+
+		await storage.deletePendingTransaction(BLOCK_ID, TX_ACTION_ID);
+
+		expect(await storage.getPendingTransaction(BLOCK_ID, TX_ACTION_ID)).to.equal(undefined);
+	});
 });
