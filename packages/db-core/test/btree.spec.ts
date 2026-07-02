@@ -2,6 +2,8 @@ import { use, expect } from 'chai'
 import chaiAsPromised from 'chai-as-promised'
 use(chaiAsPromised)
 import { BTree } from '../src/btree/index.js'
+import type { BranchNode } from '../src/btree/nodes.js'
+import { TreeBranchBlockType } from '../src/btree/nodes.js'
 import { createActor } from '../src/utility/actor.js'
 import { TestBlockStore } from './test-block-store.js'
 
@@ -611,5 +613,68 @@ describe('BTree', () => {
       await btree.movePrior(rpath);
     }
     expect(descending).to.deep.equal(Array.from({ length: count }, (_, i) => count - 1 - i));
+  })
+
+  // Regression: rebalanceBranch "merge right sibling into self" wrongly overwrote an
+  // ancestor separator with pNode.partitions[0] — the separator to the merged child's
+  // NEXT sibling, which is strictly greater than the merged subtree's minimum key —
+  // corrupting a routing key higher up and making [subtreeMin, corruptedSeparator)
+  // unreachable. An internal merge never changes a subtree's minimum, so no ancestor
+  // update is needed; the offending block was removed. Only manifests when the merged
+  // branch sits at path-depth >= 2 (its parent is a non-root branch), i.e. a 4-level
+  // tree, which sequential inserts first reach at ~66k entries. Below that the block
+  // was a harmless no-op, which is why smaller specs never caught it.
+  it('should not corrupt separators on left-edge internal branch merge (4-level tree)', async function () {
+    this.timeout(180000);
+    const N = 70000;
+    for (let i = 0; i < N; i++) {
+      await btree.insert(i);
+    }
+
+    // Root of a 4-level tree is a branch; partitions[0] is the boundary B (minimum
+    // key of the right mid-subtree). Deleting a contiguous range from B forces a
+    // left-edge (pIndex===0) internal merge inside that subtree.
+    const root = await btree.trunk.get() as unknown as BranchNode<number>;
+    expect(root.partitions.length).to.be.greaterThan(0, 'expected a branch root');
+    const B = root.partitions[0]!;
+
+    // The bug only manifests when the merged branch sits at path-depth >= 2, which
+    // requires a 4-level tree (>= 3 branch levels above the leaves). Assert we
+    // actually reached that depth — otherwise the test would pass trivially without
+    // exercising the merge (e.g. if NodeCapacity grows and 70k no longer suffices).
+    let branchLevels = 0;
+    let node: any = root;
+    while (node && node.header.type === TreeBranchBlockType) {
+      branchLevels++;
+      node = await store.tryGet(node.nodes[0]!);
+    }
+    expect(branchLevels).to.be.at.least(3, `expected a 4-level tree; got ${branchLevels} branch levels`);
+
+    const deleted = new Set<number>();
+    for (let k = B; k < B + 3000; k++) {
+      const path = await btree.find(k);
+      expect(path.on).to.be.true;
+      await btree.deleteAt(path);
+      deleted.add(k);
+    }
+
+    // Every non-deleted key must remain reachable via point lookup; deleted keys gone.
+    for (let i = 0; i < N; i++) {
+      if (deleted.has(i)) {
+        expect(await btree.get(i)).to.be.undefined;
+      } else {
+        expect(await btree.get(i)).to.equal(i, `get(${i}) unreachable after merge`);
+      }
+    }
+
+    // Full scan must return the complete remaining set in order.
+    const expected = Array.from({ length: N }, (_, i) => i).filter(i => !deleted.has(i));
+    const collected: number[] = [];
+    const path = await btree.first();
+    while (path.on) {
+      collected.push(btree.at(path)!);
+      await btree.moveNext(path);
+    }
+    expect(collected).to.deep.equal(expected);
   })
 })

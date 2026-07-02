@@ -739,9 +739,6 @@ export class BTree<TKey, TEntry> {
 			apply(this.store, branch, [partitions$, branch.partitions.length, 0, [pKey]]);
 			apply(this.store, branch, [partitions$, branch.partitions.length, 0, rightSib.partitions]);
 			apply(this.store, branch, [nodes$, branch.nodes.length, 0, rightSib.nodes]);
-			if (pIndex === 0 && pNode.partitions.length > 0) {	// if parent is left edge, new right sibling is now the first partition
-				this.updatePartition(pIndex, path, depth - 1, pNode.partitions[0]!);
-			}
 			this.store.delete(rightSib.header.id);
 			return this.rebalanceBranch(path, depth - 1);
 		}
