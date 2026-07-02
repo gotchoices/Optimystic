@@ -304,6 +304,31 @@ describe('cohort-topic: host gossip round', () => {
 
 		await host.stop();
 	});
+
+	it('an idle-but-willing engine throttles its willingness heartbeat to T_willingness_heartbeat after the first round', async () => {
+		const self = await makeMember();
+		const host = await createCohortTopicHost(makeFakeNode(self.peerId) as never, makeFakeFret(() => []) as never, {
+			privateKey: self.key,
+			wantK: 1,
+			minSigs: 1,
+			gossipIntervalMs: 3_600_000, // park the timer; drive the rounds by hand
+			willingnessHeartbeatMs: 10_000,
+		});
+		const ce = host.registry.forCoord(addressing.coord0(TOPIC), 0 as Tier, self.bytes);
+
+		// First idle round emits immediately (anchors the heartbeat clock at now = 1_000).
+		expect(await ce.gossipRound(1_000), 'first idle round emits a heartbeat').to.not.equal(undefined);
+		// Still idle, but inside the throttle window → silent (no re-broadcast every round).
+		expect(await ce.gossipRound(5_000), 'a heartbeat inside the throttle window is suppressed').to.equal(undefined);
+		expect(await ce.gossipRound(10_999), 'still suppressed one ms shy of the interval').to.equal(undefined);
+		// The throttle interval has elapsed → re-broadcast the steady-state willingness heartbeat.
+		const reHb = await ce.gossipRound(11_000);
+		expect(reHb, 'a heartbeat re-broadcasts once T_willingness_heartbeat elapses').to.not.equal(undefined);
+		expect(reHb!.topicSummaries, 'the re-broadcast carries no topic summaries').to.deep.equal([]);
+		expect(reHb!.records ?? [], 'the re-broadcast carries no record delta').to.deep.equal([]);
+
+		await host.stop();
+	});
 });
 
 describe('cohort-topic: two-coord inbound routing isolation', () => {

@@ -309,6 +309,18 @@ describe('cohort-topic wire', () => {
 			const frame = encodeCohortMessage(bad);
 			expect(() => decodeCohortGossipV1(frame)).to.throw(CohortWireError, /willingnessBits/);
 		});
+
+		it('rejects a negative treeTier', () => {
+			const bad = { ...sampleGossip(), treeTier: -1 };
+			const frame = encodeCohortMessage(bad);
+			expect(() => decodeCohortGossipV1(frame)).to.throw(CohortWireError, /treeTier/);
+		});
+
+		it('rejects a non-integer treeTier', () => {
+			const bad = { ...sampleGossip(), treeTier: 1.5 };
+			const frame = encodeCohortMessage(bad);
+			expect(() => decodeCohortGossipV1(frame)).to.throw(CohortWireError, /treeTier/);
+		});
 	});
 
 	describe('optional fields', () => {
