@@ -11,13 +11,16 @@
  *   cold-start case) **or** it arrived as a follow-on to a parent cohort's `Promoted` redirect, AND
  * - a quorum of cohort members is willing to serve `T` at the registration's tier.
  *
- * The `followOn` signal is **not** carried on the wire (`RegisterV1` has only `bootstrap`); a cold
- * high-tier cohort returns `NoState` to a *speculative* `d_max` probe, but the single-direction walk
- * means the only registrations that reach a cold tier-`(d+1)` cohort are those that followed the
- * parent's `Promoted` redirect. Determining `followOn` for a given inbound register therefore belongs
- * to the db-p2p cohort host (it has the routing context); db-core takes it as an explicit input to
- * {@link shouldInstantiate}, keeping this module FRET-free. (See the implement handoff for the wiring
- * gap this leaves for the db-p2p binding.)
+ * The `followOn` signal **is** carried on the wire (`RegisterV1.followOn`), set only on the dedicated
+ * re-issue a participant sends after a parent cohort's `Promoted` redirect target answered `NoState`
+ * (the deeper child is cold). A cold high-tier cohort still returns `NoState` to a *speculative* `d_max`
+ * probe (neither flag set), but the single-direction walk means the only registrations that reach a cold
+ * tier-`(d+1)` cohort carrying `followOn: true` are those that followed the parent's `Promoted` redirect.
+ * The db-p2p cohort host derives `ctx.followOn` from the wire flag (`followOn: reg.followOn === true`) and
+ * db-core takes it as an explicit input to {@link shouldInstantiate}, keeping this module FRET-free. Because
+ * the flag is participant-forgeable, a `followOn: true` register is gated by the **same** tier-dependent
+ * bootstrap-evidence policy a `bootstrap: true` cold-root register passes (§Anti-DoS), so an unbacked
+ * follow-on never reaches this instantiation decision.
  *
  * Once instantiated, the new forwarder **registers itself with its tier-`(d − 1)` parent at first
  * opportunity**; until that registration is acked it {@link Forwarder.acceptsParticipants | accepts
