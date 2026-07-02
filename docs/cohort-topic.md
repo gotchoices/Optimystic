@@ -358,7 +358,7 @@ TopicTrafficV1 {
   arrivalsPerMin:      number   // exact, combined fresh registrations + renewals over windowSeconds
   queriesPerMin:       number   // exact, application-level queries against this topic over windowSeconds
   directParticipants:  number   // stock count (same value that drives promotion)
-  childCohortCount:    number   // tier-(d+1) cohorts known for this topic, 0 if not promoted
+  childCohortCount:    number   // tier-(d+1) child cohorts recorded for this topic, 0 if not promoted
 }
 ```
 
@@ -383,8 +383,12 @@ A participant that receives `NoState` at tier `d` gets no traffic signal from th
 > combined fresh+renewal arrivals, gossip-derived snapshot (lags ≤ one round, no reply-time
 > recompute), and `cohortEpoch`-change reset alongside it. The snapshot **sums own + sibling**
 > gossiped per-topic counts (cohort-wide flow, since arrivals shard ~`1/k` across members);
-> `directParticipants` is read from the replicated store rather than summed, and `childCohortCount`
-> takes the max across siblings (or a promotion-layer override).
+> `directParticipants` is read from the replicated store rather than summed. `childCohortCount` is the
+> **recording engine's real child count** (the per-engine child registry populated by `dispatchChildLink`),
+> supplied as the promotion-layer override; it is exact on the parent member the child-link routed to and
+> `0` on siblings until the replication follow-on (`cohort-topic-child-link-replicate-unlink`) converges it
+> cohort-wide. (The snapshot still takes the max of siblings' gossiped counts as a floor, but the override
+> is authoritative on the recording member.)
 
 ---
 
@@ -679,7 +683,7 @@ A cold cohort instantiates as a forwarder for `T` when:
 - The registering participant's `bootstrap: true` flag is set (root case) or the registration arrives as a follow-on to a parent's `Promoted` redirect, AND
 - A quorum of cohort members is willing to serve `T` at the registration's tier.
 
-The newly-instantiated forwarder registers itself with its tier-(d−1) parent on first opportunity; until that registration is acked, the cohort accepts participants but holds notifications/queries that would require parent involvement.
+The newly-instantiated forwarder registers itself with its tier-(d−1) parent on first opportunity by sending a **child-link** the parent authenticates and records; until that link is acked (`linked`), the cohort accepts participants but holds notifications/queries that would require parent involvement.
 
 > **Resolved (decided): burst at a just-promoted cohort.** A cohort that has just promoted but whose
 > tier-`(d+1)` is not yet fully instantiated, on a burst of new same-tier registrations, **bounces
@@ -706,15 +710,29 @@ The newly-instantiated forwarder registers itself with its tier-(d−1) parent o
 > `promotedRedirectReply` builds the `Promoted(d+1)` bounce above (attaching the outgoing cohort's
 > traffic). Spec: `coldstart.spec.ts`.
 >
-> The db-p2p host supplies the parent-registration **transport**
-> ([`host.ts`](../packages/db-p2p/src/cohort-topic/host.ts) `registerForwarderWithParent`): a
-> cold-started tier-`d` forwarder routes a `RegisterV1`-style forwarder-link frame to its tier-`(d−1)`
-> parent coord over `ITopicRouter.routeAndAct` (riding the parent's serving tier so the parent recomputes
-> the parent coord); a resolved round-trip is the ack, a rejection leaves the forwarder `awaiting_parent`
-> for a later retry without crashing the instantiating register. The parent-side child-cohort
-> *recording* (`childCohortCount`, a dedicated signed child-link frame) is deferred
-> (`cohort-topic-parent-child-link`); the single-tier-0 milestone has no parent, so this path is covered
-> by `host-antidos-coldstart.spec.ts`, not the tier-0 e2e.
+> The db-p2p host supplies the parent-registration **transport + recording**
+> ([`host.ts`](../packages/db-p2p/src/cohort-topic/host.ts) `registerForwarderWithParent` +
+> `dispatchChildLink`): a cold-started tier-`d` forwarder routes a dedicated **`ChildLinkV1`** frame to its
+> tier-`(d−1)` parent coord over `ITopicRouter.routeAndAct`. The frame carries the child's served coord
+> (`childCohortCoord`) and its seed `childParticipantCoord`; in live-key mode the child cohort
+> **threshold-signs** it over its own coord at its current epoch (the new `"childlink"` `/sign` kind),
+> key-less it ships unsigned. The routed parent member **binds** the relationship — it reject-unless
+> `coord_childTier(childParticipantCoord, topicId) == childCohortCoord` **and**
+> `coord_(childTier−1)(…)` is its own served coord — **verifies** the child cohort's threshold signature
+> against the child cohort cert (permissive in key-less mode; a live parent never records an unsigned
+> link), **records** the child in a per-engine registry (freshness-ordered, idempotent), and replies
+> `ChildLinkReplyV1 { result: "linked" }`. The forwarder flips to `serving` only on a `linked` ack; a
+> `rejected` reply / unreachable parent leaves it `awaiting_parent` for a later retry without crashing the
+> instantiating register.
+>
+> The recorded count is the real input to the demotion gate, the gossip topic summary, and the traffic
+> snapshot (all three were hardcoded `0` before). **Single-member scope:** FRET routes the link to *one*
+> parent member, so only that member records the child; sibling parent members read `0`. Cohort-wide
+> convergence (gossip-replicate the child set so every parent member agrees) and the **unlink** on child
+> demotion are the follow-on `cohort-topic-child-link-replicate-unlink`. Consequence within this milestone:
+> a parent that has recorded a child never sees the count drop, so it will not demote once it has parented
+> a child (acceptable intermediate). Specs: `host-antidos-coldstart.spec.ts` (record + reject),
+> `threshold-assembly.spec.ts` (`/sign` `childlink` endorsement), `wire.spec.ts` (frame + payload).
 
 #### Bootstrapping a cold multi-node cohort (willingness heartbeat + cold-sibling instantiation)
 
@@ -1178,15 +1196,18 @@ limit, topic-budget refusal, and `bootstrap: true` root instantiation.
 >   `cohort-topic-participant-coord-routing-key-mismatch` (see §Wire formats "Tier-0 caveat"). The fan
 >   itself is simulator-validated against the uniform ring coord (`scenarios.ts` cold-start-storm).
 > - **multi-tier tree growth / depth law** `⌈log_F(N/cap_promote)⌉` over a live walk: `followOn` cold-start
->   derivation has now landed (`cohort-topic-followon-derivation`) — the host derives `followOn` from the
->   wire flag and a `Promoted`-redirect follow-on instantiates a cold tier-`(d+1)` child (asserted directly
->   at the engine, §Cold-start instantiation). The remaining gap for a full **depth-law e2e over a live
->   walk** is the parent-side child recording (`childCohortCount`, the signed child-link frame,
->   `cohort-topic-parent-child-link`), without which there is no observable multi-tier parent state to
->   assert the depth against. The depth law itself is simulator-owned (`promotion-convergence.ts`).
-> - **tier-(d>0) demotion-notice broadcast**: the parent-side `childCohortCount` recording is the
->   observable effect and is parked (`cohort-topic-parent-child-link`); promotion/demotion hysteresis is
->   unit-covered by `promotion.spec.ts`.
+>   derivation (`cohort-topic-followon-derivation`) and the parent-side child recording
+>   (`cohort-topic-parent-child-link` — the signed `ChildLinkV1`, verify, and per-engine `childCohortCount`)
+>   have both landed. A `Promoted`-redirect follow-on instantiates a cold tier-`(d+1)` child, which links to
+>   its parent; the routed parent member records it and its `childCohortCount` reads ≥ 1 (asserted at the
+>   engine, §Cold-start instantiation). The remaining gap for a full **depth-law e2e over a live walk** is
+>   the **cohort-wide** convergence of that count — today only the FRET-routed parent member records the
+>   child, so a sibling reads `0` (`cohort-topic-child-link-replicate-unlink`). The depth law itself is
+>   simulator-owned (`promotion-convergence.ts`).
+> - **tier-(d>0) demotion-notice broadcast**: the parent-side `childCohortCount` recording now blocks
+>   demotion on the recording member (a parent with a linked child does not demote); the **unlink** on child
+>   demotion that would release it is the follow-on (`cohort-topic-child-link-replicate-unlink`).
+>   Promotion/demotion hysteresis is unit-covered by `promotion.spec.ts`.
 > - **membership-rotation primary handoff** (inventory → pull → dual-serve → ack): `registration/handoff.ts`
 >   is unit-tested in db-core but not yet wired into the FRET host, so there is no host-level rotation to
 >   observe (crash failover is the wired failover path).
@@ -1381,6 +1402,44 @@ interface RenewReplyV1 {
   cohortEpoch?:    string
 }
 ```
+
+### Child link
+
+Sent by a freshly cold-started tier-`d` (`d ≥ 1`) forwarder to its tier-`(d−1)` parent cohort, routed the
+same way a participant register is (`routeAndAct` to the parent coord). The parent authenticates + records
+the child (§Cold-start instantiation), so the parent's `childCohortCount` reflects a real child rather than
+a placeholder.
+
+```
+interface ChildLinkV1 {
+  v:                     1
+  topicId:               string     // 32 bytes
+  childCohortCoord:      string     // 32 bytes — the child cohort's served coord coord_d(childParticipantCoord, topicId); the verify key
+  childParticipantCoord: string     // a representative participant coord in the child's prefix-shard (binds the parent-child pair)
+  childTier:             number     // child tree tier d (≥ 1 — the root never links). Parent serves d − 1
+  tier:                  number     // op capacity tier T0..T3
+  effectiveAt:           number     // unix ms; the parent's per-child freshness/ordering key (strictly-newer wins)
+  thresholdSig:          string     // child cohort threshold sig over childLinkSigningPayload (empty in key-less interim)
+  signers:               string[]   // PeerIds, ≥ minSigs (empty in key-less interim)
+  cohortEpoch:           string     // 32 bytes — the child cohort epoch the sig was collected under (LAST in the signing image)
+}
+
+interface ChildLinkReplyV1 {
+  v:               1
+  result:          "linked" | "rejected"   // linked flips the child awaiting_parent → serving
+  reason?:         string                   // human-readable, optional
+}
+```
+
+> **Binding + verification.** The parent recomputes `coord_childTier(childParticipantCoord, topicId)` and
+> rejects unless it equals the signed `childCohortCoord`, and `coord_(childTier−1)(…)` is its own served
+> coord — so an attacker cannot point the link at an unrelated parent without a `childParticipantCoord` that
+> also hashes to the signed child coord (which it cannot, absent the prefix-class membership). It then
+> verifies `thresholdSig` against the **child** cohort's `MembershipCertV1` (same bounded-refetch discipline
+> as a promotion notice), permissive only in the key-less interim; a live parent rejects an unsigned link
+> rather than silently record it. The signing image (`childLinkSigningPayload`) keeps `cohortEpoch` **last**
+> so the `/sign` endorser (kind `"childlink"`) reads the embedded epoch positionally, exactly like a
+> promotion / demotion notice.
 
 ### Promotion notice
 

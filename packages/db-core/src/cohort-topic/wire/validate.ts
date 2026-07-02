@@ -10,6 +10,8 @@
 
 import { b64urlToBytes } from "./codec.js";
 import type {
+	ChildLinkReplyV1,
+	ChildLinkV1,
 	CohortGossipV1,
 	CohortTopicSummary,
 	DemotionNoticeV1,
@@ -145,6 +147,20 @@ function b64urlField(value: string, key: string, what: string): string {
 		b64urlToBytes(value);
 	} catch {
 		fail(`${what}: field "${key}" is not valid base64url`);
+	}
+	return value;
+}
+
+/** Assert a base64url string decodes cleanly to exactly `len` bytes; returns it unchanged. */
+function b64urlFixedLen(value: string, key: string, len: number, what: string): string {
+	let bytes: Uint8Array;
+	try {
+		bytes = b64urlToBytes(value);
+	} catch {
+		return fail(`${what}: field "${key}" is not valid base64url`);
+	}
+	if (bytes.length !== len) {
+		fail(`${what}: field "${key}" must decode to ${len} bytes, got ${bytes.length}`);
 	}
 	return value;
 }
@@ -322,6 +338,59 @@ export function validateDemotionNoticeV1(value: unknown): DemotionNoticeV1 {
 	};
 }
 
+/** Ring-coord / topic-id / epoch byte width (SHA-256 truncated to the ring width). */
+const COORD_BYTES = 32;
+
+/**
+ * Validate a {@link ChildLinkV1}. Enforces `childTier >= 1` (the root never links), `tier` in 0..3, and
+ * well-formed base64url on every byte field. The hash-derived coords (`childCohortCoord` / `cohortEpoch`)
+ * are additionally length-checked to exactly 32 bytes (a ring coord / epoch is a SHA-256 truncation); the
+ * `topicId` and `childParticipantCoord` follow the lenient `RegisterV1` convention (base64url only — a
+ * participant coord is not always 32 raw bytes, e.g. a multihash-encoded peer id in tests). When `minSigs`
+ * is supplied AND the frame carries a threshold signature (`thresholdSig` non-empty), `signers.length` must
+ * be `>= minSigs`; a key-less-interim frame carries neither, so that cross-field bound is skipped. `minSigs`
+ * is optional so a bare structural decode (no quorum context) still narrows the frame.
+ */
+export function validateChildLinkV1(value: unknown, minSigs?: number): ChildLinkV1 {
+	const what = "ChildLinkV1";
+	const obj = asObject(value, what);
+	requireV1(obj, what);
+	const childTier = reqFiniteNumber(obj, "childTier", what);
+	if (!Number.isInteger(childTier) || childTier < 1) {
+		fail(`${what}: childTier must be an integer >= 1, got ${childTier}`);
+	}
+	const thresholdSig = b64urlField(reqString(obj, "thresholdSig", what), "thresholdSig", what);
+	const signers = reqStringArray(obj, "signers", what).map((s) => b64urlField(s, "signers", what));
+	if (minSigs !== undefined && thresholdSig.length > 0 && signers.length < minSigs) {
+		fail(`${what}: a signed child-link needs signers.length >= ${minSigs}, got ${signers.length}`);
+	}
+	return {
+		v: 1,
+		topicId: b64urlField(reqString(obj, "topicId", what), "topicId", what),
+		childCohortCoord: b64urlFixedLen(reqString(obj, "childCohortCoord", what), "childCohortCoord", COORD_BYTES, what),
+		childParticipantCoord: b64urlField(reqString(obj, "childParticipantCoord", what), "childParticipantCoord", what),
+		childTier,
+		tier: tier(reqFiniteNumber(obj, "tier", what), what),
+		effectiveAt: reqFiniteNumber(obj, "effectiveAt", what),
+		thresholdSig,
+		signers,
+		cohortEpoch: b64urlFixedLen(reqString(obj, "cohortEpoch", what), "cohortEpoch", COORD_BYTES, what),
+	};
+}
+
+/** Validate a {@link ChildLinkReplyV1}: `result` in `linked | rejected`, optional human-readable `reason`. */
+export function validateChildLinkReplyV1(value: unknown): ChildLinkReplyV1 {
+	const what = "ChildLinkReplyV1";
+	const obj = asObject(value, what);
+	requireV1(obj, what);
+	const out: ChildLinkReplyV1 = {
+		v: 1,
+		result: reqEnum(obj, "result", ["linked", "rejected"] as const, what),
+	};
+	assignDefined(out, "reason", optString(obj, "reason", what));
+	return out;
+}
+
 function validateCohortTopicSummary(value: unknown): CohortTopicSummary {
 	const what = "CohortTopicSummary";
 	const obj = asObject(value, what);
@@ -423,7 +492,7 @@ export function validateCohortGossipV1(value: unknown): CohortGossipV1 {
 	return out;
 }
 
-const SIGN_KINDS: readonly SignKind[] = ["membership", "promotion", "demotion", "rotation"];
+const SIGN_KINDS: readonly SignKind[] = ["membership", "promotion", "demotion", "rotation", "childlink"];
 
 export function validateSignRequestV1(value: unknown): SignRequestV1 {
 	const what = "SignRequestV1";

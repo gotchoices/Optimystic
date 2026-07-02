@@ -14,6 +14,7 @@ import {
 	membershipCertSignable,
 	membershipCertSigningPayload,
 	promotionNoticeSigningPayload,
+	childLinkSigningPayload,
 	type IMembershipSource,
 	type IMembershipSourceRouter,
 	type MembershipCertV1,
@@ -402,6 +403,66 @@ describe('cohort-topic: /sign endorsement policy', () => {
 
 		const keyless = await handleSignRequest(baseReq, requester!.idStr, { ...deps, privateKey: undefined });
 		expect('refused' in keyless && keyless.refused, 'key-less node refuses').to.equal(true);
+	});
+});
+
+describe('cohort-topic: /sign childlink endorsement (generic non-rotation path)', () => {
+	/** A child-link signing image over COORD at `epoch` (childCohortCoord = COORD; other coords are fillers). */
+	function childLinkImage(epoch: Uint8Array): Uint8Array {
+		return childLinkSigningPayload({
+			topicId: bytesToB64url(COORD),
+			childCohortCoord: bytesToB64url(COORD),
+			childParticipantCoord: bytesToB64url(Uint8Array.from({ length: 32 }, (_v, i) => (i + 7) & 0xff)),
+			childTier: 1,
+			tier: 0,
+			effectiveAt: 1_000,
+			cohortEpoch: bytesToB64url(epoch),
+		});
+	}
+
+	/** The generic (non-membership) endorsement deps: cohort + epoch gate only, no membership binding. */
+	function childLinkDeps(self: Member, members: Member[], epoch: Uint8Array): SignEndorsementDeps {
+		return {
+			privateKey: self.key,
+			selfMember: self.bytes,
+			cohortMembersAround: (): string[] => members.map((m) => m.idStr),
+			currentEpoch: (): Uint8Array => epoch,
+		};
+	}
+
+	it('endorses a childlink image with the matching tag + current epoch from a cohort member', async () => {
+		const [self, requester] = await makeMembers(2);
+		const epoch = epochOf([self!.bytes, requester!.bytes]);
+		const payload = childLinkImage(epoch);
+		const req: SignRequestV1 = { v: 1, kind: 'childlink', coord: bytesToB64url(COORD), cohortEpoch: bytesToB64url(epoch), payload: bytesToB64url(payload) };
+
+		const reply = await handleSignRequest(req, requester!.idStr, childLinkDeps(self!, [self!, requester!], epoch));
+		expect('signer' in reply, 'a childlink endorsement, not a refusal').to.equal(true);
+		if ('signer' in reply) {
+			expect(verifyPeerSig(b64urlToBytes(reply.signer), payload, b64urlToBytes(reply.signature)), 'signature verifies over the exact image').to.equal(true);
+		}
+	});
+
+	it('refuses a promotion image smuggled under kind: childlink (kind/tag mismatch)', async () => {
+		const [self, requester] = await makeMembers(2);
+		const epoch = epochOf([self!.bytes, requester!.bytes]);
+		const promoImage = promotionNoticeSigningPayload({ topicId: bytesToB64url(COORD), fromTier: 0, toTier: 1, effectiveAt: 1_000, cohortEpoch: bytesToB64url(epoch), cohortCoord: bytesToB64url(COORD) });
+		const req: SignRequestV1 = { v: 1, kind: 'childlink', coord: bytesToB64url(COORD), cohortEpoch: bytesToB64url(epoch), payload: bytesToB64url(promoImage) };
+
+		const reply = await handleSignRequest(req, requester!.idStr, childLinkDeps(self!, [self!, requester!], epoch));
+		expect('refused' in reply, 'a tag mismatch is refused').to.equal(true);
+	});
+
+	it('refuses a childlink image whose embedded cohortEpoch differs from the endorser current epoch', async () => {
+		const [self, requester] = await makeMembers(2);
+		const epoch = epochOf([self!.bytes, requester!.bytes]);
+		const wrongEpoch = Uint8Array.from({ length: 32 }, () => 0xcc);
+		// Honest wire epoch (passes the wire-field gate); the payload-internal (last-element) epoch is forged.
+		const payload = childLinkImage(wrongEpoch);
+		const req: SignRequestV1 = { v: 1, kind: 'childlink', coord: bytesToB64url(COORD), cohortEpoch: bytesToB64url(epoch), payload: bytesToB64url(payload) };
+
+		const reply = await handleSignRequest(req, requester!.idStr, childLinkDeps(self!, [self!, requester!], epoch));
+		expect('refused' in reply, 'the embedded-epoch mismatch is refused').to.equal(true);
 	});
 });
 

@@ -8,20 +8,26 @@ import {
 	decodeRegisterReplyV1,
 	decodeRenewV1,
 	decodeRenewReplyV1,
+	decodeChildLinkV1,
+	decodeChildLinkReplyV1,
 	decodePromotionNoticeV1,
 	decodeDemotionNoticeV1,
 	decodeCohortGossipV1,
 	decodeMembershipCertV1,
+	validateChildLinkV1,
 	registerSigningPayload,
 	renewSigningPayload,
 	CohortWireError,
 	DEFAULT_MAX_MESSAGE_BYTES,
 } from '../../src/cohort-topic/wire/index.js';
+import { childLinkSigningPayload } from '../../src/cohort-topic/sig/index.js';
 import type {
 	RegisterV1,
 	RegisterReplyV1,
 	RenewV1,
 	RenewReplyV1,
+	ChildLinkV1,
+	ChildLinkReplyV1,
 	PromotionNoticeV1,
 	DemotionNoticeV1,
 	CohortGossipV1,
@@ -86,6 +92,24 @@ const sampleRenewReply = (): RenewReplyV1 => ({
 	newPrimary: 'peer-new',
 	newBackups: ['peer-nb'],
 	cohortEpoch: b64(32, 10),
+});
+
+const sampleChildLink = (): ChildLinkV1 => ({
+	v: 1,
+	topicId: b64(32, 30),
+	childCohortCoord: b64(32, 31),
+	childParticipantCoord: b64(32, 32),
+	childTier: 1,
+	tier: 2,
+	effectiveAt: 1_700_000_006_000,
+	thresholdSig: b64(64 * 3, 33),
+	signers: ['peer-c1', 'peer-c2', 'peer-c3'],
+	cohortEpoch: b64(32, 34),
+});
+
+const sampleChildLinkReply = (): ChildLinkReplyV1 => ({
+	v: 1,
+	result: 'linked',
 });
 
 const samplePromotion = (): PromotionNoticeV1 => ({
@@ -229,6 +253,8 @@ describe('cohort-topic wire', () => {
 			['RegisterReplyV1', sampleRegisterReply, decodeRegisterReplyV1],
 			['RenewV1', sampleRenew, decodeRenewV1],
 			['RenewReplyV1', sampleRenewReply, decodeRenewReplyV1],
+			['ChildLinkV1', sampleChildLink, (b: Uint8Array) => decodeChildLinkV1(b)],
+			['ChildLinkReplyV1', sampleChildLinkReply, decodeChildLinkReplyV1],
 			['PromotionNoticeV1', samplePromotion, decodePromotionNoticeV1],
 			['DemotionNoticeV1', sampleDemotion, decodeDemotionNoticeV1],
 			['CohortGossipV1', sampleGossip, decodeCohortGossipV1],
@@ -322,6 +348,56 @@ describe('cohort-topic wire', () => {
 			const bad = { ...sampleGossip(), treeTier: 1.5 };
 			const frame = encodeCohortMessage(bad);
 			expect(() => decodeCohortGossipV1(frame)).to.throw(CohortWireError, /treeTier/);
+		});
+	});
+
+	describe('ChildLinkV1 validation + signing payload', () => {
+		const MIN_SIGS = 3;
+
+		it('accepts a well-formed signed child-link (signers >= minSigs)', () => {
+			expect(() => validateChildLinkV1(sampleChildLink(), MIN_SIGS)).to.not.throw();
+		});
+
+		it('accepts an UNSIGNED (key-less interim) child-link even with a minSigs bound', () => {
+			const keyless = { ...sampleChildLink(), thresholdSig: '', signers: [] };
+			expect(() => validateChildLinkV1(keyless, MIN_SIGS)).to.not.throw();
+		});
+
+		it('rejects childTier < 1 (the root never links)', () => {
+			const bad = { ...sampleChildLink(), childTier: 0 };
+			expect(() => validateChildLinkV1(bad)).to.throw(CohortWireError, /childTier/);
+		});
+
+		it('rejects a non-32-byte coord field', () => {
+			const bad = { ...sampleChildLink(), childCohortCoord: b64(16, 40) };
+			expect(() => validateChildLinkV1(bad)).to.throw(CohortWireError, /childCohortCoord/);
+		});
+
+		it('rejects tier out of 0..3', () => {
+			const bad = { ...sampleChildLink(), tier: 5 };
+			expect(() => validateChildLinkV1(bad)).to.throw(CohortWireError, /tier/);
+		});
+
+		it('rejects a signed child-link whose signers.length < minSigs', () => {
+			const bad = { ...sampleChildLink(), signers: [b64(32, 50)] };
+			expect(() => validateChildLinkV1(bad, MIN_SIGS)).to.throw(CohortWireError, /signers\.length/);
+		});
+
+		it('childLinkSigningPayload keeps cohortEpoch as the last array element (the /sign positional read)', () => {
+			const link = sampleChildLink();
+			const image = JSON.parse(new TextDecoder().decode(childLinkSigningPayload(link))) as unknown[];
+			expect(image[0]).to.equal('ChildLinkV1');
+			expect(image[image.length - 1]).to.equal(link.cohortEpoch);
+		});
+
+		it('childLinkSigningPayload is deterministic and covers only the signable fields (not the sig envelope)', () => {
+			const link = sampleChildLink();
+			const a = childLinkSigningPayload(link);
+			const b = childLinkSigningPayload(link);
+			expect([...a]).to.deep.equal([...b]);
+			// Changing only the threshold-sig envelope must NOT change the signed image.
+			const reSigned = { ...link, thresholdSig: b64(64, 99), signers: ['x', 'y'] };
+			expect([...childLinkSigningPayload(reSigned)]).to.deep.equal([...a]);
 		});
 	});
 

@@ -23,9 +23,10 @@
  * follow-on never reaches this instantiation decision.
  *
  * Once instantiated, the new forwarder **registers itself with its tier-`(d − 1)` parent at first
- * opportunity**; until that registration is acked it {@link Forwarder.acceptsParticipants | accepts
- * participants} but {@link Forwarder.servesParentOps | holds} notifications/queries that need parent
- * involvement. The root (tree tier 0) has no parent and is serving immediately.
+ * opportunity** by sending a child-link the parent authenticates + records; until that link is acked
+ * (`linked`) it {@link Forwarder.acceptsParticipants | accepts participants} but
+ * {@link Forwarder.servesParentOps | holds} notifications/queries that need parent involvement. The root
+ * (tree tier 0) has no parent and is serving immediately.
  *
  * **Just-promoted burst (GROUNDING-resolved: bounce, don't buffer).** A cohort that has just promoted
  * but whose tier-`(d+1)` isn't fully instantiated yet, on a burst of new same-tier registrations,
@@ -133,13 +134,18 @@ export function promotedRedirectReply(targetTier: number, traffic?: TopicTraffic
 	return traffic !== undefined ? attachTopicTraffic(reply, traffic) : reply;
 }
 
-/** Registers a newly-instantiated forwarder with its tier-`(d − 1)` parent; resolves on the parent ack. */
+/**
+ * Registers a newly-instantiated forwarder with its tier-`(d − 1)` parent; resolves only when the parent
+ * authenticates + records the child and returns a `linked` ack. A `rejected` reply (bad coord binding /
+ * failed threshold verify) or an unreachable parent rejects the promise, so the forwarder stays
+ * `awaiting_parent` for a later retry.
+ */
 export interface ParentRegistrar {
 	/**
 	 * Register the forwarder for `topicId` (served at tree tier `tier`, i.e. `d`) with the cohort at
-	 * `parentCoord`; resolves on ack. `opTier` is the topic's *capacity* tier (T0–T3), threaded so the
-	 * transport can stamp a well-formed forwarder-link frame; absent when the caller has no op-tier
-	 * context (the cohort host always supplies it from the instantiating `RegisterV1`).
+	 * `parentCoord`; resolves on a `linked` ack. `opTier` is the topic's *capacity* tier (T0–T3), threaded so
+	 * the transport can stamp a well-formed child-link frame; absent when the caller has no op-tier context
+	 * (the cohort host always supplies it from the instantiating `RegisterV1`).
 	 */
 	registerWithParent(topicId: Uint8Array, parentCoord: Uint8Array, tier: number, opTier?: number): Promise<void>;
 }

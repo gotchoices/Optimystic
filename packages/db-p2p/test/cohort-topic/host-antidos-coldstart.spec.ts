@@ -14,13 +14,14 @@ import {
 	parentRefSigningImage,
 	DEFAULT_RATE_WINDOW_MS,
 	DEFAULT_REPLAY_MAX_AGE_MS,
-	validateRegisterV1,
+	validateChildLinkV1,
+	type ChildLinkV1,
 	type RegisterV1,
 	type RenewV1,
 	type RingCoord,
 	type Tier,
 } from '@optimystic/db-core';
-import { createCohortTopicHost, resolveRenew } from '../../src/cohort-topic/host.js';
+import { createCohortTopicHost, dispatchChildLink, resolveRenew, type DispatchChildLinkDeps } from '../../src/cohort-topic/host.js';
 import type { BootstrapParentTopicView } from '../../src/cohort-topic/bootstrap-parent-reference.js';
 import { peerIdToBytes } from '../../src/cohort-topic/peer-codec.js';
 import { signPeerSig } from '../../src/cohort-topic/peer-sig.js';
@@ -90,28 +91,41 @@ function makeFakeNode(peerId: PeerId): unknown {
 /** A `RouteAndMaybeAct`-shaped message the router hands FRET's `routeAct`. */
 interface RouteActMsg { key: string; activity: string }
 
+/** The activity-handler shape the host installs via `setActivityHandler`. */
+type ActivityHandler = (activity: string, cohort: string[]) => Promise<{ commitCertificate: string }>;
+
 /**
  * A fake FRET. `assembleCohort` returns `cohortFor(coord)` (host prepends self + dedupes). `routeAct`
- * records each call (so a test can assert what coord a forwarder→parent link routed to) and resolves
- * with `routeActReply` — or rejects when `routeActReject` is set (the parent-registration failure path).
+ * records each call (so a test can assert what coord a forwarder→parent link routed to). When
+ * `invokeActivity` is set it faithfully drives the host's captured activity handler with the routed frame
+ * (so a routed child-link actually reaches the parent engine's dispatch and its real
+ * {@link ChildLinkReplyV1} comes back); otherwise it returns a canned `linked` ack. `routeActReject` makes
+ * every route reject (the parent-registration failure path).
  */
 function makeFakeFret(opts: {
 	cohortFor?: (coord: RingCoord) => string[];
 	routeActCalls?: RouteActMsg[];
 	routeActReject?: boolean;
+	invokeActivity?: boolean;
 } = {}): unknown {
 	const cohortFor = opts.cohortFor ?? ((): string[] => []);
+	let activityHandler: ActivityHandler | undefined;
 	return {
 		assembleCohort: (coord: RingCoord): string[] => cohortFor(coord),
-		setActivityHandler: (): void => {},
+		setActivityHandler: (h: ActivityHandler): void => { activityHandler = h; },
 		getNetworkSizeEstimate: (): { size_estimate: number; confidence: number; sources: number } => ({ size_estimate: 50, confidence: 1, sources: 1 }),
-		routeAct: (msg: RouteActMsg): Promise<{ commitCertificate: string }> => {
+		routeAct: async (msg: RouteActMsg): Promise<{ commitCertificate: string }> => {
 			opts.routeActCalls?.push({ key: msg.key, activity: msg.activity });
 			if (opts.routeActReject === true) {
 				return Promise.reject(new Error('parent unreachable'));
 			}
-			// A resolved round-trip is the parent ack; the body is not interpreted this milestone.
-			return Promise.resolve({ commitCertificate: bytesToB64url(encodeCohortMessage({ v: 1, result: 'accepted' })) });
+			// Faithful path: run the host's activity handler on the routed frame (so a child-link reaches the
+			// parent engine's dispatch and records the child), returning its real reply.
+			if (opts.invokeActivity === true && activityHandler !== undefined) {
+				return activityHandler(msg.activity, cohortFor(b64urlToBytes(msg.key)));
+			}
+			// Canned ack: a `linked` ChildLinkReplyV1 (the child-link's success-ack shape).
+			return Promise.resolve({ commitCertificate: bytesToB64url(encodeCohortMessage({ v: 1, result: 'linked' })) });
 		},
 	};
 }
@@ -416,7 +430,7 @@ describe('cohort-topic: host anti-DoS wiring (gap 6)', () => {
 
 describe('cohort-topic: host cold-start parent registration (gap 7)', () => {
 	/** Build a host + the tier-1 served/parent coords for TOPIC under `participantCoord`. */
-	async function tier1Setup(routeActCalls?: RouteActMsg[], routeActReject?: boolean): Promise<{
+	async function tier1Setup(routeActCalls?: RouteActMsg[], routeActReject?: boolean, invokeActivity?: boolean): Promise<{
 		host: Awaited<ReturnType<typeof createCohortTopicHost>>;
 		participantCoord: Uint8Array;
 		servedCoord: RingCoord;
@@ -427,15 +441,16 @@ describe('cohort-topic: host cold-start parent registration (gap 7)', () => {
 		const parentCoord = addressing.coord(0, participantCoord, TOPIC);
 		const host = await createCohortTopicHost(
 			makeFakeNode(await makePeerId()) as never,
-			makeFakeFret({ routeActCalls, routeActReject }) as never,
+			makeFakeFret({ routeActCalls, routeActReject, invokeActivity }) as never,
 			{ wantK: 1 },
 		);
 		return { host, participantCoord, servedCoord, parentCoord };
 	}
 
-	it('a tier-1 forwarder links to its tier-0 parent and flips to serving on the ack', async () => {
+	it('a tier-1 forwarder links to its tier-0 parent (child-link frame) and flips to serving on the linked ack', async () => {
 		const routeActCalls: RouteActMsg[] = [];
-		const { host, participantCoord, servedCoord, parentCoord } = await tier1Setup(routeActCalls);
+		// invokeActivity: route the child-link into the SAME host's parent engine so the real dispatch records it.
+		const { host, participantCoord, servedCoord, parentCoord } = await tier1Setup(routeActCalls, false, true);
 		const ce = host.registry.forCoord(servedCoord, 1 as Tier, participantCoord);
 		const now = 1_000_000;
 
@@ -450,16 +465,50 @@ describe('cohort-topic: host cold-start parent registration (gap 7)', () => {
 
 		await delay(30); // let the parent-link round-trip resolve
 
-		expect(ce.forwarder(TOPIC)!.phase(), 'the forwarder flips to serving on the parent ack').to.equal('serving');
+		expect(ce.forwarder(TOPIC)!.phase(), 'the forwarder flips to serving on the parent linked ack').to.equal('serving');
 		expect(ce.forwarder(TOPIC)!.servesParentOps()).to.equal(true);
 
-		// It routed the link to the CORRECT parent coordinate (coord_0(topic)), not the served coord.
+		// It routed a ChildLinkV1 to the CORRECT parent coordinate (coord_0(topic)), not the served coord.
 		const linkCall = routeActCalls.find((c) => c.key === bytesToB64url(parentCoord));
 		expect(linkCall, 'the link routed to coord_{d-1}(participant, topic)').to.not.equal(undefined);
 		expect(routeActCalls.some((c) => c.key === bytesToB64url(servedCoord)), 'it did NOT route to the served coord').to.equal(false);
-		const linked = validateRegisterV1(decodeCohortMessage(b64urlToBytes(linkCall!.activity)));
-		expect(linked.treeTier, 'the link rides the parent serving tier (d-1)').to.equal(0);
+		const linked = validateChildLinkV1(decodeCohortMessage(b64urlToBytes(linkCall!.activity)));
+		expect(linked.childTier, 'the frame is a child-link stamped at the child tree tier (d)').to.equal(1);
 		expect(linked.topicId).to.equal(bytesToB64url(TOPIC));
+		expect(linked.childCohortCoord, 'childCohortCoord is the child engine served coord').to.equal(bytesToB64url(servedCoord));
+		expect(linked.childParticipantCoord).to.equal(bytesToB64url(participantCoord));
+		expect(linked.thresholdSig, 'key-less interim: the link is unsigned').to.equal('');
+
+		// The parent engine recorded the child, and the count is wired into its traffic snapshot.
+		const parentEngine = host.registry.forCoord(parentCoord, 0 as Tier, participantCoord);
+		expect(parentEngine.childCohortCount(TOPIC), 'the routed parent recorded the child').to.equal(1);
+		expect(parentEngine.topicTraffic(TOPIC).childCohortCount, 'the count feeds the traffic snapshot').to.equal(1);
+
+		await host.stop();
+	});
+
+	it('the recorded child count feeds the parent gossip summary and the demotion gate resolver', async () => {
+		const routeActCalls: RouteActMsg[] = [];
+		const { host, participantCoord, servedCoord, parentCoord } = await tier1Setup(routeActCalls, false, true);
+		const ce = host.registry.forCoord(servedCoord, 1 as Tier, participantCoord);
+		const now = 1_000_000;
+
+		// The parent cohort holds a direct participant for TOPIC (so it is resident + appears in the summary).
+		const parentEngine = host.registry.forCoord(parentCoord, 0 as Tier, participantCoord);
+		await parentEngine.engine.handleRegister(makeReg(participantCoord, TOPIC, 'cid-parent-direct', now), { followOn: false, treeTier: 0 }, now);
+
+		// The child links to the parent → the parent records it.
+		await ce.engine.handleRegister(makeReg(participantCoord, TOPIC, 'cid-fwd2', now, { tier: 1, treeTier: 1 }), { followOn: false, treeTier: 1, parentCoord }, now);
+		await delay(30);
+
+		expect(parentEngine.childCohortCount(TOPIC), 'parent recorded exactly one child').to.equal(1);
+
+		// The gossip summary for TOPIC now carries the real childCohortCount (was hardcoded 0).
+		const frame = await parentEngine.gossipRound(now);
+		expect(frame, 'the resident parent emits a gossip frame').to.not.equal(undefined);
+		const summary = frame!.topicSummaries.find((s) => s.topicId === bytesToB64url(TOPIC));
+		expect(summary, 'the summary includes TOPIC').to.not.equal(undefined);
+		expect(summary!.childCohortCount, 'the gossip summary carries the real child count').to.equal(1);
 
 		await host.stop();
 	});
@@ -482,6 +531,86 @@ describe('cohort-topic: host cold-start parent registration (gap 7)', () => {
 		expect(fwd!.phase()).to.equal('awaiting_parent');
 
 		await host.stop();
+	});
+});
+
+describe('cohort-topic: parent-side child-link dispatch (record + reject)', () => {
+	/** A 32-byte epoch filler for a well-formed frame. */
+	const EPOCH = Uint8Array.from({ length: 32 }, (_v, i) => (i + 90) & 0xff);
+	/** A forged child coord that will not recompute from any real participant coord. */
+	const FORGED_COORD = Uint8Array.from({ length: 32 }, (_v, i) => (i + 250) & 0xff);
+
+	/** Build the dispatch deps with a spy `recordChild`; `verify` selects key-less-permissive / live-key. */
+	function deps(verify?: (link: ChildLinkV1, now: number) => Promise<boolean>): { deps: DispatchChildLinkDeps; recorded: Array<{ topic: string; child: string; at: number }> } {
+		const recorded: Array<{ topic: string; child: string; at: number }> = [];
+		return {
+			recorded,
+			deps: {
+				coord: (tier, pc, topicId): RingCoord => addressing.coord(tier, pc, topicId),
+				resolveParent: () => ({
+					recordChild: (topicId: Uint8Array, childCohortCoord: Uint8Array, effectiveAt: number): void => {
+						recorded.push({ topic: bytesToB64url(topicId), child: bytesToB64url(childCohortCoord), at: effectiveAt });
+					},
+				}),
+				verifyChildLinkSig: verify,
+			},
+		};
+	}
+
+	/** A well-formed child-link whose coords recompute consistently for `participantCoord`. */
+	function wellFormedLink(participantCoord: Uint8Array, overrides: Partial<ChildLinkV1> = {}): ChildLinkV1 {
+		return {
+			v: 1,
+			topicId: bytesToB64url(TOPIC),
+			childCohortCoord: bytesToB64url(addressing.coord(1, participantCoord, TOPIC)),
+			childParticipantCoord: bytesToB64url(participantCoord),
+			childTier: 1,
+			tier: 0,
+			effectiveAt: 1_000,
+			thresholdSig: '',
+			signers: [],
+			cohortEpoch: bytesToB64url(EPOCH),
+			...overrides,
+		};
+	}
+
+	it('key-less-permissive: a well-formed link with matching coords is recorded and acked linked', async () => {
+		const participantCoord = await makeParticipantBytes();
+		const { deps: d, recorded } = deps(undefined);
+		const reply = await dispatchChildLink(wellFormedLink(participantCoord), d, 2_000);
+		expect(reply.result).to.equal('linked');
+		expect(recorded).to.have.length(1);
+		expect(recorded[0]!.topic).to.equal(bytesToB64url(TOPIC));
+		expect(recorded[0]!.child).to.equal(bytesToB64url(addressing.coord(1, participantCoord, TOPIC)));
+		expect(recorded[0]!.at).to.equal(1_000);
+	});
+
+	it('live-key: a verified signature is recorded and acked linked', async () => {
+		const participantCoord = await makeParticipantBytes();
+		const { deps: d, recorded } = deps(async () => true);
+		const reply = await dispatchChildLink(wellFormedLink(participantCoord, { thresholdSig: bytesToB64url(FORGED_COORD), signers: [bytesToB64url(participantCoord)] }), d, 2_000);
+		expect(reply.result).to.equal('linked');
+		expect(recorded).to.have.length(1);
+	});
+
+	it('coord mismatch: a childParticipantCoord that does not recompute to childCohortCoord is rejected, not recorded', async () => {
+		const participantCoord = await makeParticipantBytes();
+		// A forged childCohortCoord that cannot equal coord_1(participantCoord, TOPIC).
+		const link = wellFormedLink(participantCoord, { childCohortCoord: bytesToB64url(FORGED_COORD) });
+		const { deps: d, recorded } = deps(undefined);
+		const reply = await dispatchChildLink(link, d, 2_000);
+		expect(reply.result).to.equal('rejected');
+		expect(reply.reason ?? '').to.match(/coord mismatch/);
+		expect(recorded, 'a mismatched link records nothing').to.have.length(0);
+	});
+
+	it('live-key forged/under-quorum sig: a coord-consistent link that fails verify is rejected, not recorded', async () => {
+		const participantCoord = await makeParticipantBytes();
+		const { deps: d, recorded } = deps(async () => false);
+		const reply = await dispatchChildLink(wellFormedLink(participantCoord, { thresholdSig: bytesToB64url(FORGED_COORD), signers: [bytesToB64url(participantCoord)] }), d, 2_000);
+		expect(reply.result).to.equal('rejected');
+		expect(reply.reason ?? '').to.match(/signature/);
+		expect(recorded, 'an unverified link records nothing').to.have.length(0);
 	});
 });
 

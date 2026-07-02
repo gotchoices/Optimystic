@@ -42,8 +42,8 @@
  * backing keeps T0/T1 permissive-but-logged so cold-root origination is not blocked
  * (`cohort-topic-bootstrap-coldstart-origination-regression`), and an entirely unconfigured host stays
  * permissive-but-logged at every tier (never an undefined gate). A cold-started tier-`d > 0` forwarder registers with
- * its tier-`(d − 1)` parent by routing a forwarder-link frame over the router (gap 7), staying
- * `awaiting_parent` until the ack.
+ * its tier-`(d − 1)` parent by routing a (child-cohort-signed) {@link ChildLinkV1} over the router; the parent
+ * authenticates + records the child and acks, and the forwarder stays `awaiting_parent` until that `linked` ack.
  *
  * **Scope.** `followOn` derivation for a promoted-redirect arrival is parked in backlog
  * (`cohort-topic-followon-derivation`); this milestone serves a **single tier-0 cohort**, so `followOn`
@@ -84,7 +84,6 @@ import {
 	DEFAULT_MIN_SIGS,
 	DEFAULT_MAX_NO_POW_TIER,
 	DEFAULT_TRAFFIC_WINDOW_SECONDS,
-	DEFAULT_TTL_MS,
 	bytesToB64url,
 	b64urlToBytes,
 	bytesEqual,
@@ -96,6 +95,8 @@ import {
 	toCohortTopicSummary,
 	validateRegisterV1,
 	validateRenewV1,
+	validateChildLinkV1,
+	validateChildLinkReplyV1,
 	validateSignRequestV1,
 	validateSignReplyV1,
 	validatePromotionNoticeV1,
@@ -105,8 +106,11 @@ import {
 	cohortGossipSigningPayload,
 	promotionNoticeSigningPayload,
 	demotionNoticeSigningPayload,
+	childLinkSigningPayload,
 	type BootstrapEvidence,
 	type BootstrapEvidenceDeps,
+	type ChildLinkV1,
+	type ChildLinkReplyV1,
 	type CohortGossipV1,
 	type CohortGossipSignable,
 	type CohortTopicService,
@@ -144,7 +148,6 @@ import {
 	type IMembershipSource,
 	type TrustRoot,
 } from "@optimystic/db-core";
-import { randomBytes } from "@libp2p/crypto";
 import { peerIdFromString } from "@libp2p/peer-id";
 import { FretTopicRouter } from "./topic-router.js";
 import { FretCohortGossipTransport, type CohortPeerResolver } from "./cohort-gossip-transport.js";
@@ -405,6 +408,15 @@ export interface CoordEngine {
 	 * Exposes the parent-link lifecycle (`awaiting_parent` → `serving`) for the cold-start wiring (gap 7).
 	 */
 	forwarder(topicId: Uint8Array): Forwarder | undefined;
+	/**
+	 * Record a verified child cohort (served at `childCohortCoord`) as this cohort's child for `topicId`.
+	 * Freshness-ordered per child coord (a stale replay cannot flip a newer state) and idempotent (re-linking
+	 * an already-linked coord is a no-op). Driven by the parent-side child-link dispatch. See
+	 * {@link CoordEngine.childCohortCount}.
+	 */
+	recordChild(topicId: Uint8Array, childCohortCoord: Uint8Array, effectiveAt: number): void;
+	/** Count of distinct linked child cohorts this engine parents for `topicId` (the demotion-gate input). */
+	childCohortCount(topicId: Uint8Array): number;
 	/** Whether `topicId` is in promoted mode here — reflects both locally-originated and remotely-applied state. */
 	isPromoted(topicId: Uint8Array): boolean;
 	/** Adopt a verified promotion notice into this cohort's local state (see {@link NoticeApplyTarget}). */
@@ -913,13 +925,59 @@ export async function createCohortTopicHost(node: Libp2p, fret: FretService, opt
 		return coordEngine.engine.handleRegister(reg, { followOn, treeTier: reg.treeTier, parentCoord }, now);
 	};
 
+	// --- child-link dispatch: verify + record a child cohort (parent side) ---
+	// A routed `ChildLinkV1` reaches this node's parent engine through the SAME two entry points a register
+	// uses (the FRET activity handler + the direct-dial `register` handler). Live-key mode verifies the child
+	// cohort's threshold signature against the child cohort's cert; key-less mode is permissive (mirrors the
+	// `verifyRegisterSig` fallback) so unit/mock flows still link + record.
+	const verifyChildLinkSig = options.privateKey === undefined
+		? undefined
+		: async (link: ChildLinkV1, at: number): Promise<boolean> => {
+			// Live-key: an UNSIGNED link (misconfigured mixed mode) is never permissive-accepted — reject it,
+			// never a silent record.
+			if (link.thresholdSig.length === 0) {
+				return false;
+			}
+			let signers: Uint8Array[];
+			let sig: Uint8Array;
+			try {
+				signers = link.signers.map(b64urlToBytes);
+				sig = b64urlToBytes(link.thresholdSig);
+			} catch {
+				return false; // a signer / sig that is not valid base64url cannot verify
+			}
+			// Verify against the CHILD cohort's cert at the child coord/tier — identical to the notice verify at
+			// `verifyAndApplyNotice`, with the same bounded refetch so a link flood cannot amplify into dials.
+			const result = await verifier.verifyMessage(
+				signers,
+				b64urlToBytes(link.childCohortCoord),
+				link.childTier,
+				childLinkSigningPayload(link),
+				sig,
+				{ minRefetchIntervalMs: PROMOTE_REFETCH_MIN_INTERVAL_MS, now: at },
+			);
+			return result === "verified";
+		};
+	const childLinkDeps: DispatchChildLinkDeps = {
+		coord: (tier: number, pc: Uint8Array, topicId: Uint8Array): RingCoord => addressing.coord(tier, pc, topicId),
+		resolveParent: (parentServedCoord: RingCoord, parentTier: number, childParticipantCoord: Uint8Array): CoordEngine =>
+			registry.forCoord(parentServedCoord, parentTier, childParticipantCoord),
+		verifyChildLinkSig,
+	};
+
 	// --- protocol handlers + activity callback ---
 	// Await registration so the host is not returned (and dialed) before the five handlers are live —
 	// and, crucially, before the gossip driver below starts ticking (no tick may run on a half-wired node).
-	await registerProtocolHandlers(node, protocols, registry, dispatchRegister, signEndorse, verifier, promoteGate, gossipTransport, maybeInstantiateColdSibling, publishSink, membershipSource, selfCoord, maxBytes);
+	await registerProtocolHandlers(node, protocols, registry, dispatchRegister, childLinkDeps, minSigs, signEndorse, verifier, promoteGate, gossipTransport, maybeInstantiateColdSibling, publishSink, membershipSource, selfCoord, maxBytes);
 	fret.setActivityHandler(async (activity: string, cohort: string[]): Promise<{ commitCertificate: string }> => {
-		const reg = validateRegisterV1(decodeCohortMessage(b64urlToBytes(activity), maxBytes));
-		const reply = await dispatchRegister(reg, cohort, Date.now());
+		const decoded = decodeCohortMessage(b64urlToBytes(activity), maxBytes);
+		// Decode-and-branch: a `ChildLinkV1` (a child cohort registering with this parent) runs the child-link
+		// dispatch; everything else is an ordinary participant `RegisterV1`. The two shapes are disjoint (a
+		// child-link has no `treeTier`/`signature`; a register has no `childCohortCoord`/`childTier`).
+		const link = tryValidate(() => validateChildLinkV1(decoded, minSigs));
+		const reply = link !== undefined
+			? await dispatchChildLink(link, childLinkDeps, Date.now())
+			: await dispatchRegister(validateRegisterV1(decoded), cohort, Date.now());
 		return { commitCertificate: bytesToB64url(encodeCohortMessage(reply, maxBytes)) };
 	});
 
@@ -1147,39 +1205,57 @@ interface ForwarderLink {
 	readonly treeTier: number;
 	/** The topic's capacity tier (T0–T3); stamps the link frame's `tier`. Defaults to 0 if absent. */
 	readonly opTier?: number;
-	/** The participant coord that seeded this engine — keeps the link frame's recompute consistent. */
+	/** The participant coord that seeded this engine — the child-link's `childParticipantCoord`. */
 	readonly participantCoord: Uint8Array;
+	/** This child engine's served coord `coord_d(participantCoord, topicId)` — the link's `childCohortCoord`. */
+	readonly childCohortCoord: Uint8Array;
+	/** The child cohort's current epoch (raw bytes), stamped + signed into the link. */
+	readonly cohortEpoch: () => Uint8Array;
+	/**
+	 * The child cohort's `"childlink"` threshold signer, or `undefined` in the key-less interim (the link then
+	 * ships unsigned and the parent permissive-accepts it).
+	 */
+	readonly signChildLink?: CohortSigner;
 }
 
 /**
- * Route a forwarder→parent link to `parentCoord` and resolve on the round-trip (the parent ack).
+ * Route a child-cohort→parent link to `parentCoord` and resolve **only on a `linked` ack**.
  *
- * The link is a `RegisterV1`-style frame routed over {@link ITopicRouter.routeAndAct} keyed at the
- * parent coord: it rides the parent's serving tier (`treeTier − 1`) with this engine's seed
- * `participantCoord`, so the parent recomputes `servedCoord = coord_{d−1}(participantCoord, topicId) =
- * parentCoord`. A fresh CSPRNG `correlationId` keeps it clear of the parent's replay guard on retry.
- * Resolution of the route is treated as the ack (richer child-link confirmation — the parent recording
- * `childCohortCount` over a dedicated child-link frame — is the follow-on
- * `cohort-topic-parent-child-link`); a rejection propagates so the cold-start manager keeps the
- * forwarder `awaiting_parent`.
+ * The frame is a dedicated {@link ChildLinkV1} (not a participant `RegisterV1`) routed over
+ * {@link ITopicRouter.routeAndAct} keyed at the parent coord: it carries the child's served coord
+ * (`childCohortCoord`) and its seed `childParticipantCoord`, so the parent recomputes
+ * `coord_{d−1}(childParticipantCoord, topicId) == parentCoord` and `coord_d(...) == childCohortCoord`,
+ * binding the relationship. In live-key mode the child cohort threshold-signs the link over its own coord
+ * at its current epoch; key-less it ships unsigned (empty `thresholdSig`/`signers`). The parent authenticates
+ * + records the child and replies {@link ChildLinkReplyV1}; a `rejected` (or unreachable) reply propagates as
+ * a throw so the cold-start manager keeps the forwarder `awaiting_parent` for a later retry.
  */
 async function registerForwarderWithParent(ctx: CoordEngineContext, link: ForwarderLink): Promise<void> {
-	const frame: RegisterV1 = {
+	const childTier = link.treeTier;
+	const frame: ChildLinkV1 = {
 		v: 1,
 		topicId: bytesToB64url(link.topicId),
+		childCohortCoord: bytesToB64url(link.childCohortCoord),
+		childParticipantCoord: bytesToB64url(link.participantCoord),
+		childTier,
 		tier: clampTier(link.opTier ?? 0),
-		treeTier: Math.max(0, link.treeTier - 1),
-		participantCoord: bytesToB64url(link.participantCoord),
-		ttl: DEFAULT_TTL_MS,
-		// Not a root cold-start: a follow-on link to an already-promoted parent, so no bootstrap evidence.
-		bootstrap: false,
-		timestamp: Date.now(),
-		correlationId: bytesToB64url(randomBytes(16)),
-		// Interim: the forwarder cohort cannot sign as the participant; the dedicated child-link frame
-		// (follow-on) carries the cohort threshold signature instead.
-		signature: "",
+		effectiveAt: Date.now(),
+		thresholdSig: "",
+		signers: [],
+		cohortEpoch: bytesToB64url(link.cohortEpoch()),
 	};
-	await ctx.router.routeAndAct(link.parentCoord, encodeCohortMessage(frame, ctx.maxBytes), { wantK: ctx.wantK, minSigs: ctx.minSigs });
+	// Live-key: threshold-sign over the canonical child-link image (signature covers only the signable fields,
+	// so filling `thresholdSig`/`signers` after does not alter what was signed). Key-less: leave it unsigned.
+	if (link.signChildLink !== undefined) {
+		const { thresholdSig, signers } = await link.signChildLink.thresholdSign(childLinkSigningPayload(frame));
+		frame.thresholdSig = bytesToB64url(thresholdSig);
+		frame.signers = signers.map(bytesToB64url);
+	}
+	const replyBytes = await ctx.router.routeAndAct(link.parentCoord, encodeCohortMessage(frame, ctx.maxBytes), { wantK: ctx.wantK, minSigs: ctx.minSigs });
+	const reply = validateChildLinkReplyV1(decodeCohortMessage(replyBytes, ctx.maxBytes));
+	if (reply.result !== "linked") {
+		throw new Error(`cohort-topic child-link rejected by parent${reply.reason !== undefined ? `: ${reply.reason}` : ""}`);
+	}
 }
 
 /** Clamp an op tier to the valid T0–T3 range so the link frame validates at a (future) real parent. */
@@ -1307,6 +1383,67 @@ class RotationState {
 }
 
 /**
+ * A per-{@link CoordEngine} registry of the child cohorts this cohort parents, keyed by topic then by child
+ * served coord. `recordChild` is freshness-ordered per child coord (a stale replay cannot flip a newer state)
+ * and idempotent (re-linking an already-linked coord is a no-op), mirroring `PromotionState.lastEffectiveAt`.
+ * `count` feeds the demotion gate / gossip summary / traffic snapshot.
+ *
+ * NOTE: single-member. FRET routes a child-link to ONE parent member, so only that member's registry records
+ * the child; sibling parent members read `count == 0`. Cohort-wide convergence (gossip-replicate the child
+ * set) and the unlink-on-demotion are the follow-on `cohort-topic-child-link-replicate-unlink`. Do NOT paper
+ * over the single-member gap with a max-across-siblings count — the child set is sharded across parent members
+ * (different child coords route to different members), so a max undercounts; a converged union is required.
+ */
+interface ChildRegistry {
+	recordChild(topicId: Uint8Array, childCohortCoord: Uint8Array, effectiveAt: number): void;
+	count(topicId: Uint8Array): number;
+}
+
+interface ChildEntry {
+	linked: boolean;
+	lastEffectiveAt: number;
+}
+
+function createChildRegistry(): ChildRegistry {
+	const byTopic = new Map<string, Map<string, ChildEntry>>();
+	return {
+		recordChild(topicId: Uint8Array, childCohortCoord: Uint8Array, effectiveAt: number): void {
+			const topicKey = bytesToB64url(topicId);
+			let children = byTopic.get(topicKey);
+			if (children === undefined) {
+				children = new Map<string, ChildEntry>();
+				byTopic.set(topicKey, children);
+			}
+			const childKey = bytesToB64url(childCohortCoord);
+			const existing = children.get(childKey);
+			if (existing === undefined) {
+				children.set(childKey, { linked: true, lastEffectiveAt: effectiveAt });
+				return;
+			}
+			// Freshness-ordered: only a strictly-newer effectiveAt advances the state, so a stale/out-of-order
+			// replay is dropped and an idempotent re-link is a no-op (never a double count).
+			if (effectiveAt > existing.lastEffectiveAt) {
+				existing.linked = true;
+				existing.lastEffectiveAt = effectiveAt;
+			}
+		},
+		count(topicId: Uint8Array): number {
+			const children = byTopic.get(bytesToB64url(topicId));
+			if (children === undefined) {
+				return 0;
+			}
+			let n = 0;
+			for (const entry of children.values()) {
+				if (entry.linked) {
+					n++;
+				}
+			}
+			return n;
+		},
+	};
+}
+
+/**
  * Compose one {@link CoordEngine} bound to `servedCoord`. The cohort it threshold-signs / shards with
  * is the FRET assembly around `servedCoord` (not the node's own ring position). The promotion tier
  * inputs are coord-derived: `treeTier` is fixed at instantiation; `parentCoord` is
@@ -1315,6 +1452,9 @@ class RotationState {
  */
 function createCoordEngine(ctx: CoordEngineContext, servedCoord: RingCoord, treeTier: number, participantCoord: Uint8Array): CoordEngine {
 	const store = createRegistrationStore();
+	// The child cohorts this cohort parents (recorded by the parent-side child-link dispatch). Its `count`
+	// feeds the demotion gate, the gossip summary, and the traffic snapshot below (was hardcoded 0).
+	const childRegistry = createChildRegistry();
 	// Epoch-rotation bookkeeping. `cohort()` observes every assembly so the endorser history stays fresh
 	// (the gossip-cadence driver assembles each round); the producer reads `predecessor()` on publish.
 	const rotationState = new RotationState();
@@ -1382,6 +1522,10 @@ function createCoordEngine(ctx: CoordEngineContext, servedCoord: RingCoord, tree
 	};
 	const noticeSigner = makeCoordSigner("promotion");
 	const membershipSigner = makeCoordSigner("membership");
+	// The child cohort threshold-signs its own child-link exactly as it signs a promotion notice — over its
+	// own served coord at its current epoch (a sibling of `noticeSigner`). Verify-only key-less (the child
+	// then emits an UNSIGNED link and the parent permissive-accepts it, matching the register-sig fallback).
+	const childLinkSigner = makeCoordSigner("childlink");
 
 	// Cohort-side membership-cert publisher: threshold-signs a MembershipCertV1 over this coord's cohort
 	// and serves it through the node's publish sink. Driven by the onStabilized / pumpMembership hooks.
@@ -1483,12 +1627,14 @@ function createCoordEngine(ctx: CoordEngineContext, servedCoord: RingCoord, tree
 		primaryTopicCount: (tier: Tier): number => countPrimaryTopics(store, ctx.selfMemberBytes, tier),
 		config: { cohortSize: ctx.wantK },
 	});
-	const traffic = createTrafficCounters({ view, store, selfMember });
+	const traffic = createTrafficCounters({ view, store, selfMember, childCohortCount: (topicId: Uint8Array): number => childRegistry.count(topicId) });
 	const promotion = createPromotionLifecycle({
 		store,
 		loadBucket: (topicId: Uint8Array): number => ctx.barometer.bucket(tierOfTopic(store, topicId)),
-		// Single-cohort milestone: a tier-0 cohort with no children. Child-cohort tracking is a follow-on.
-		childCohortCount: (): number => 0,
+		// Real child count off this engine's local registry (recorded by the parent-side child-link dispatch).
+		// Single-member on the recording engine this milestone; cohort-wide convergence is the replication
+		// follow-on. Blocks demotion while a child is linked (`promotion.ts` demotionTriggered).
+		childCohortCount: (topicId: Uint8Array): number => childRegistry.count(topicId),
 		treeTier: (): number => treeTier,
 		// `coord_{d-1}(P, topicId)`; never invoked at the root (demotion is gated on `treeTier > 0`), so
 		// the `d = 0` branch (clamped to `coord_0`) is a well-formed placeholder that the lifecycle skips.
@@ -1516,7 +1662,20 @@ function createCoordEngine(ctx: CoordEngineContext, servedCoord: RingCoord, tree
 	const coldStart = createColdStartManager({
 		parentRegistrar: {
 			registerWithParent: (topicId: Uint8Array, parentCoord: Uint8Array, tier: number, opTier?: number): Promise<void> =>
-				registerForwarderWithParent(ctx, { topicId, parentCoord, treeTier: tier, opTier, participantCoord }),
+				registerForwarderWithParent(ctx, {
+					topicId,
+					parentCoord,
+					treeTier: tier,
+					opTier,
+					participantCoord,
+					// This engine's served coord IS `coord_d(participantCoord, topicId)` — the child cohort coord the
+					// parent verifies + records against.
+					childCohortCoord: servedCoord,
+					cohortEpoch: localEpoch,
+					// Live-key: the child threshold-signs the link over its own coord/epoch. Key-less interim: no
+					// signer, so the link ships unsigned and the parent permissive-accepts it.
+					signChildLink: canPublish ? childLinkSigner : undefined,
+				}),
 		},
 	});
 
@@ -1604,8 +1763,9 @@ function createCoordEngine(ctx: CoordEngineContext, servedCoord: RingCoord, tree
 				tier: tierOfTopic(store, topicId),
 				directParticipants: store.directParticipants(topicId),
 				promoted: promotion.isPromoted(topicId),
-				// Single-cohort milestone: no child cohorts tracked. Child-cohort tracking is a follow-on.
-				childCohortCount: 0,
+				// Real child count off this engine's local registry (single-member on the recording engine this
+				// milestone; the replication follow-on makes it converge cohort-wide).
+				childCohortCount: childRegistry.count(topicId),
 			}),
 		);
 		const { records, evicted } = pending.drain();
@@ -1674,6 +1834,8 @@ function createCoordEngine(ctx: CoordEngineContext, servedCoord: RingCoord, tree
 		budgetHasTopic: (topicId: Uint8Array): boolean => topicBudget.has(topicId),
 		budgetParticipantCount: (topicId: Uint8Array): number | undefined => topicBudget.participantCount(topicId),
 		forwarder: (topicId: Uint8Array): Forwarder | undefined => coldStart.get(topicId),
+		recordChild: (topicId: Uint8Array, childCohortCoord: Uint8Array, effectiveAt: number): void => childRegistry.recordChild(topicId, childCohortCoord, effectiveAt),
+		childCohortCount: (topicId: Uint8Array): number => childRegistry.count(topicId),
 		isPromoted: (topicId: Uint8Array): boolean => promotion.isPromoted(topicId),
 		applyPromotionNotice: (notice, now): void => promotion.applyPromotionNotice(notice, now),
 		applyDemotionNotice: (notice, now): void => promotion.applyDemotionNotice(notice, now),
@@ -1700,6 +1862,66 @@ export function resolveRenew(registry: CoordRegistry, renew: RenewV1, now: numbe
 		return { v: 1, result: "unknown_registration" };
 	}
 	return holder.engine.handleRenew(renew, now);
+}
+
+// --- parent-side child-link dispatch (record a verified child cohort) ---
+
+/**
+ * Dependencies for {@link dispatchChildLink}. Small seam so the parent-side child-link handling is unit-
+ * testable without a live node (mirrors {@link handleSignRequest} / {@link verifyAndApplyNotice}).
+ */
+export interface DispatchChildLinkDeps {
+	/** Recompute a served coord for a tier — `addressing.coord(tier, participantCoord, topicId)`. */
+	readonly coord: (tier: number, participantCoord: Uint8Array, topicId: Uint8Array) => RingCoord;
+	/**
+	 * Resolve (creating if absent) the parent {@link CoordEngine} for its served coord — `registry.forCoord`.
+	 * Only its {@link CoordEngine.recordChild} is used.
+	 */
+	readonly resolveParent: (parentServedCoord: RingCoord, parentTier: number, childParticipantCoord: Uint8Array) => Pick<CoordEngine, "recordChild">;
+	/**
+	 * Verify the child cohort threshold signature against the child cohort's cert (live-key mode). `undefined`
+	 * → key-less-permissive: the link is recorded without a signature check (matching the register-sig
+	 * fallback). A live-key host supplies this, and an unsigned link then fails it (never a silent record).
+	 */
+	readonly verifyChildLinkSig?: (link: ChildLinkV1, now: number) => Promise<boolean>;
+}
+
+/**
+ * Parent-side handling of an inbound {@link ChildLinkV1}: bind the parent-child relationship, verify the
+ * child cohort's threshold signature, record the child, and ack. Steps:
+ *
+ * 1. **Bind.** Recompute `coord_childTier(childParticipantCoord, topicId)` and reject unless it equals the
+ *    signed `childCohortCoord`; `coord_(childTier−1)(...)` is this parent's served coord. An attacker cannot
+ *    point the link at an unrelated parent without a `childParticipantCoord` that also hashes to the signed
+ *    child coord (which it cannot, absent the prefix-class membership).
+ * 2. **Verify** (live-key) the child cohort threshold sig against the child cohort's cert; key-less-permissive
+ *    short-circuits it. A non-verified result → `rejected`.
+ * 3. **Record** the child on the parent engine (freshness-ordered, idempotent).
+ * 4. Reply `linked`.
+ */
+export async function dispatchChildLink(link: ChildLinkV1, deps: DispatchChildLinkDeps, now: number): Promise<ChildLinkReplyV1> {
+	const topicId = b64urlToBytes(link.topicId);
+	const childParticipantCoord = b64urlToBytes(link.childParticipantCoord);
+	const childCohortCoord = b64urlToBytes(link.childCohortCoord);
+	// Step 1 — bind the relationship. `validateChildLinkV1` already enforced `childTier >= 1`, so `childTier − 1`
+	// is a well-formed parent tier.
+	const recomputedChild = deps.coord(link.childTier, childParticipantCoord, topicId);
+	if (!bytesEqual(recomputedChild, childCohortCoord)) {
+		return { v: 1, result: "rejected", reason: "coord mismatch" };
+	}
+	const parentServedCoord = deps.coord(link.childTier - 1, childParticipantCoord, topicId);
+	// Step 2 — verify the child cohort threshold signature (live-key). Key-less-permissive short-circuits.
+	if (deps.verifyChildLinkSig !== undefined) {
+		const verified = await deps.verifyChildLinkSig(link, now);
+		if (!verified) {
+			return { v: 1, result: "rejected", reason: "child cohort signature not verified" };
+		}
+	}
+	// Step 3 — record on the parent engine (resolving it by its served coord).
+	const parent = deps.resolveParent(parentServedCoord, link.childTier - 1, childParticipantCoord);
+	parent.recordChild(topicId, childCohortCoord, link.effectiveAt);
+	// Step 4 — ack.
+	return { v: 1, result: "linked" };
 }
 
 // --- intra-cohort sign endorsement ---
@@ -1747,6 +1969,7 @@ const SIGNABLE_IMAGE_TAG: Record<Exclude<SignKind, "rotation">, string> = {
 	membership: "MembershipCertV1",
 	promotion: "PromotionNoticeV1",
 	demotion: "DemotionNoticeV1",
+	childlink: "ChildLinkV1",
 };
 
 /**
@@ -2221,6 +2444,9 @@ async function registerProtocolHandlers(
 	protocols: CohortTopicProtocols,
 	registry: CoordRegistry,
 	dispatchRegister: (reg: RegisterV1, fretCohort: readonly string[] | undefined, now: number) => Promise<RegisterReplyV1>,
+	/** Parent-side child-link dispatch deps + the quorum bound used to structurally validate an inbound link. */
+	childLinkDeps: DispatchChildLinkDeps,
+	minSigs: number,
 	signEndorse: (request: SignRequestV1, fromPeerStr: string) => Promise<SignReplyV1>,
 	verifier: MembershipVerifier,
 	promoteGate: PromoteGate,
@@ -2233,12 +2459,17 @@ async function registerProtocolHandlers(
 	maxBytes: number,
 ): Promise<void> {
 	await Promise.all([
-		// register: a direct dial carries either a RegisterV1 (re-attach walk fallback) or a RenewV1 (ping).
+		// register: a direct dial carries a RenewV1 (ping), a ChildLinkV1 (a child cohort registering with this
+		// parent), or a RegisterV1 (re-attach walk fallback). The three shapes are disjoint, so try each in turn.
 		node.handle(protocols.register, makeFrameHandler(async (frame): Promise<Uint8Array | undefined> => {
 			const decoded = decodeCohortMessage(frame, maxBytes);
 			const renew = tryValidate(() => validateRenewV1(decoded));
 			if (renew !== undefined) {
 				return encodeCohortMessage(resolveRenew(registry, renew, Date.now()), maxBytes);
+			}
+			const link = tryValidate(() => validateChildLinkV1(decoded, minSigs));
+			if (link !== undefined) {
+				return encodeCohortMessage(await dispatchChildLink(link, childLinkDeps, Date.now()), maxBytes);
 			}
 			const reg = validateRegisterV1(decoded);
 			// Direct dial (not FRET-routed): no cohort member list to cross-check against.

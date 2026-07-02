@@ -3,8 +3,8 @@
  *
  * A threshold signature is only verifiable if signer and verifier agree on the exact bytes signed.
  * These builders produce that deterministic byte image for each threshold-signed message
- * (`MembershipCertV1`, `PromotionNoticeV1`, `DemotionNoticeV1`), covering exactly the semantic
- * fields per `docs/cohort-topic.md` §Wire formats — never the `thresholdSig`/`signers` envelope.
+ * (`MembershipCertV1`, `PromotionNoticeV1`, `DemotionNoticeV1`, `ChildLinkV1`), covering exactly the
+ * semantic fields per `docs/cohort-topic.md` §Wire formats — never the `thresholdSig`/`signers` envelope.
  *
  * Determinism comes from encoding an explicitly-ordered JSON array (array order is stable, unlike
  * object key order) as UTF-8. The publisher signs this image; the verifier recomputes and checks it.
@@ -18,7 +18,7 @@
  * version to negotiate).
  */
 
-import type { DemotionNoticeV1, MembershipCertV1, PromotionNoticeV1 } from "../wire/types.js";
+import type { ChildLinkV1, DemotionNoticeV1, MembershipCertV1, PromotionNoticeV1 } from "../wire/types.js";
 
 const utf8 = new TextEncoder();
 
@@ -44,4 +44,16 @@ export type DemotionSignable = Pick<DemotionNoticeV1, "topicId" | "tier" | "pare
 /** Canonical signed byte image of a demotion notice. `cohortEpoch` stays last (the `/sign` endorser reads it positionally). */
 export function demotionNoticeSigningPayload(n: DemotionSignable): Uint8Array {
 	return utf8.encode(JSON.stringify(["DemotionNoticeV1", n.topicId, n.tier, n.parentCohortCoord, n.effectiveAt, n.cohortCoord, n.cohortEpoch]));
+}
+
+/** Fields of a `ChildLinkV1` covered by the child cohort's threshold signature. */
+export type ChildLinkSignable = Pick<ChildLinkV1, "topicId" | "childCohortCoord" | "childParticipantCoord" | "childTier" | "tier" | "effectiveAt" | "cohortEpoch">;
+
+/**
+ * Canonical signed byte image of a child-link frame. `cohortEpoch` stays **last** so the `/sign` endorser
+ * (`handleSignRequest`) reads the embedded epoch positionally as `image[image.length - 1]`, exactly as it
+ * does for a promotion / demotion notice.
+ */
+export function childLinkSigningPayload(n: ChildLinkSignable): Uint8Array {
+	return utf8.encode(JSON.stringify(["ChildLinkV1", n.topicId, n.childCohortCoord, n.childParticipantCoord, n.childTier, n.tier, n.effectiveAt, n.cohortEpoch]));
 }

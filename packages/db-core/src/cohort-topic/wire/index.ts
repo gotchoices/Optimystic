@@ -7,6 +7,8 @@ export {
 	validateRegisterReplyV1,
 	validateRenewV1,
 	validateRenewReplyV1,
+	validateChildLinkV1,
+	validateChildLinkReplyV1,
 	validatePromotionNoticeV1,
 	validateDemotionNoticeV1,
 	validateCohortGossipV1,

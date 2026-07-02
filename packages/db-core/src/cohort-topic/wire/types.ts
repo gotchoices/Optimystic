@@ -159,6 +159,53 @@ export interface RenewReplyV1 {
 	cohortEpoch?: string;
 }
 
+/**
+ * Child cohort → parent cohort link: "I am the tier-`d` cohort at {@link childCohortCoord}; record me as
+ * your child." A freshly cold-started deeper forwarder sends this to its tier-`(d − 1)` parent (routed the
+ * same way a participant register is, over `routeAndAct` to the parent coord) so the parent authenticates,
+ * records the child, and acks — replacing the interim plain participant-register the child used to send.
+ */
+export interface ChildLinkV1 {
+	v: 1;
+	/** Topic id, 32 bytes, base64url. */
+	topicId: string;
+	/**
+	 * The child cohort's served coord `coord_d(childParticipantCoord, topicId)`, 32 bytes base64url — the
+	 * coord the parent verifies the threshold signature against (it looks up the child cohort's
+	 * {@link MembershipCertV1} at this coord).
+	 */
+	childCohortCoord: string;
+	/**
+	 * A representative participant coord in the child's prefix-shard (the seed the child engine was
+	 * instantiated at). Lets the parent *deterministically bind the parent-child relationship*: it recomputes
+	 * `coord_childTier(childParticipantCoord, topicId) == childCohortCoord` AND
+	 * `coord_(childTier-1)(childParticipantCoord, topicId) == this parent's served coord`. Any participant
+	 * sharing the child's `d·log₂F`-bit prefix yields the same pair, so it is a representative, not an
+	 * identity. 32 bytes base64url.
+	 */
+	childParticipantCoord: string;
+	/** Child tree tier `d` (always ≥ 1 — the root has no parent to link to). Parent serves `d − 1`. */
+	childTier: number;
+	/** Op capacity tier T0..T3 (stamped so a real parent validates the frame's tier). */
+	tier: number;
+	/** Unix ms; the parent's per-child freshness/ordering key (strictly-newer wins). */
+	effectiveAt: number;
+	/** Child cohort threshold signature over `childLinkSigningPayload`, base64url. Empty in the key-less interim. */
+	thresholdSig: string;
+	/** Signing members' PeerIds, `>= minSigs`, base64url. Empty in the key-less interim. */
+	signers: string[];
+	/** Child cohort epoch, 32 bytes base64url (the epoch the threshold sig was collected under). */
+	cohortEpoch: string;
+}
+
+/** Parent → child ack. `linked` flips the child `awaiting_parent → serving`; `rejected` keeps it awaiting. */
+export interface ChildLinkReplyV1 {
+	v: 1;
+	result: "linked" | "rejected";
+	/** Human-readable, optional. */
+	reason?: string;
+}
+
 /** Threshold-signed promotion notice. */
 export interface PromotionNoticeV1 {
 	v: 1;
@@ -297,8 +344,11 @@ export interface CohortTopicSummary {
  * - `rotation` — an epoch hand-off: the endorser attests it was a member of the cohort at the **prior**
  *   epoch carried as `cohortEpoch` (the predecessor cohort threshold-signs the successor cert's payload),
  *   so the gate checks *prior*-epoch membership rather than current. See `cohort-topic-trust-anchor-rotation-production`.
+ * - `childlink` — a child cohort signs a {@link ChildLinkV1} over its **own** served coord at its current
+ *   epoch (identical endorsement shape to `promotion`/`demotion`: share the current cohort + epoch around
+ *   `coord`); the parent verifies it against the child cohort's cert before recording the child.
  */
-export type SignKind = "membership" | "promotion" | "demotion" | "rotation";
+export type SignKind = "membership" | "promotion" | "demotion" | "rotation" | "childlink";
 
 /**
  * Intra-cohort sign request (`/optimystic/cohort-topic/1.0.0/sign`). A member assembling a `k − x`
@@ -374,6 +424,8 @@ export type CohortMessageV1 =
 	| RegisterReplyV1
 	| RenewV1
 	| RenewReplyV1
+	| ChildLinkV1
+	| ChildLinkReplyV1
 	| PromotionNoticeV1
 	| DemotionNoticeV1
 	| CohortGossipV1

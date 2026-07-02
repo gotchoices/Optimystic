@@ -12,6 +12,8 @@
 
 import { CohortWireError } from "./validate.js";
 import {
+	validateChildLinkReplyV1,
+	validateChildLinkV1,
 	validateCohortGossipV1,
 	validateDemotionNoticeV1,
 	validateMembershipCertV1,
@@ -24,6 +26,8 @@ import {
 	validateSignReplyV1,
 } from "./validate.js";
 import type {
+	ChildLinkReplyV1,
+	ChildLinkV1,
 	CohortGossipV1,
 	DemotionNoticeV1,
 	MembershipCertV1,
@@ -177,6 +181,14 @@ export function decodeRenewV1(bytes: Uint8Array, maxMessageBytes?: number): Rene
 
 export function decodeRenewReplyV1(bytes: Uint8Array, maxMessageBytes?: number): RenewReplyV1 {
 	return validateRenewReplyV1(decodeCohortMessage(bytes, maxMessageBytes));
+}
+
+export function decodeChildLinkV1(bytes: Uint8Array, maxMessageBytes?: number, minSigs?: number): ChildLinkV1 {
+	return validateChildLinkV1(decodeCohortMessage(bytes, maxMessageBytes), minSigs);
+}
+
+export function decodeChildLinkReplyV1(bytes: Uint8Array, maxMessageBytes?: number): ChildLinkReplyV1 {
+	return validateChildLinkReplyV1(decodeCohortMessage(bytes, maxMessageBytes));
 }
 
 export function decodePromotionNoticeV1(bytes: Uint8Array, maxMessageBytes?: number): PromotionNoticeV1 {
