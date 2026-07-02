@@ -628,4 +628,16 @@ describe('cohort-topic / membership stale trust-lock recovery', () => {
 		expect(await v.verifyMessage(rotatedSignersFirstKx, COORD, 2, MSG, sign(MSG)), 'fresh strike 2').to.equal('untrusted');
 		expect(await v.verifyMessage(rotatedSignersFirstKx, COORD, 2, MSG, sign(MSG)), 'fresh strike 3 recovers').to.equal('verified');
 	});
+
+	it('with recovery disabled (staleGapRecoveryStrikes = 0) a stale-locked coord never self-heals', async () => {
+		// The documented "0 (or negative) disables recovery — which re-opens the stale-lock liveness bug"
+		// contract: the `> 0` gate in staleGapRecovery must short-circuit so even a genuine gap never strikes.
+		const gap = gapCertN2();
+		const source = new QueueSource(Array.from({ length: 8 }, () => encodeCohortMessage(gap)));
+		const v = makeVerifier(source, { anchor: constAnchor('unknown'), staleGapRecoveryStrikes: 0 });
+		lockedAtN(v);
+		for (let i = 0; i < 8; i++) {
+			expect(await v.verifyMessage(rotatedSignersFirstKx, COORD, 2, MSG, sign(MSG)), `disabled: attempt ${i} stays locked`).to.equal('untrusted');
+		}
+	});
 });
