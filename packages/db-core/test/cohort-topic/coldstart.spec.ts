@@ -126,6 +126,37 @@ describe('cohort-topic / cold-start manager parent registration', () => {
 		const b = mgr.instantiate(TOPIC, 0);
 		expect(a).to.equal(b);
 	});
+
+	it('remove() drops the forwarder so the topic is no longer tracked', () => {
+		const registrar: ParentRegistrar = { registerWithParent: async () => {} };
+		const mgr = createColdStartManager({ parentRegistrar: registrar });
+		mgr.instantiate(TOPIC, 0);
+		expect(mgr.get(TOPIC), 'tracked after instantiate').to.not.equal(undefined);
+		mgr.remove(TOPIC);
+		expect(mgr.get(TOPIC), 'gone after remove — cohort no longer serves via cold-start state').to.equal(undefined);
+	});
+
+	it('remove() is idempotent and safe on an absent topic', () => {
+		const registrar: ParentRegistrar = { registerWithParent: async () => {} };
+		const mgr = createColdStartManager({ parentRegistrar: registrar });
+		// Never instantiated → a no-op, no throw.
+		expect(() => mgr.remove(TOPIC)).to.not.throw();
+		mgr.instantiate(TOPIC, 0);
+		mgr.remove(TOPIC);
+		// A second remove of the now-absent topic is still a safe no-op.
+		expect(() => mgr.remove(TOPIC)).to.not.throw();
+		expect(mgr.get(TOPIC)).to.equal(undefined);
+	});
+
+	it('a re-instantiate after remove creates a fresh forwarder (not the removed one)', () => {
+		const registrar: ParentRegistrar = { registerWithParent: async () => {} };
+		const mgr = createColdStartManager({ parentRegistrar: registrar });
+		const first = mgr.instantiate(TOPIC, 0);
+		mgr.remove(TOPIC);
+		const second = mgr.instantiate(TOPIC, 0);
+		expect(second, 'a new forwarder, since the prior one was removed').to.not.equal(first);
+		expect(mgr.get(TOPIC)).to.equal(second);
+	});
 });
 
 describe('cohort-topic / just-promoted burst', () => {

@@ -70,6 +70,12 @@ export interface TrafficCounters {
 	snapshot(topicId: Uint8Array): TopicTrafficV1;
 	/** Reset all counters to zero (call on `cohortEpoch` change). */
 	reset(): void;
+	/**
+	 * Drop all local windowed counts and the last-published summary for `topicId` (the cohort no longer
+	 * serves it — budget eviction / teardown). Idempotent; a no-op if never observed. Siblings' gossiped
+	 * contributions age out of {@link snapshot} on their own as their summaries stop naming the topic.
+	 */
+	forget(topicId: Uint8Array): void;
 }
 
 export interface TrafficCountersDeps {
@@ -153,6 +159,14 @@ class WindowedTrafficCounters implements TrafficCounters {
 	reset(): void {
 		this.windows.clear();
 		this.lastPublished.clear();
+	}
+
+	forget(topicId: Uint8Array): void {
+		// Idempotent: `Map.delete` on an absent key is a safe no-op. Clears both the raw windowed events
+		// and the frozen last-published summary so a re-instantiated topic starts from zero.
+		const key = bytesKey(topicId);
+		this.windows.delete(key);
+		this.lastPublished.delete(key);
 	}
 
 	private windowFor(topicId: Uint8Array): TopicWindow {

@@ -343,6 +343,13 @@ class CohortPromotionLifecycle implements PromotionLifecycle {
 		const { thresholdSig, signers } = await this.deps.signer.thresholdSign(demotionNoticeSigningPayload(signable));
 		// Release forwarder state: a demoted cohort leaves promoted mode and resets its clocks so a
 		// later re-growth re-evaluates cleanly.
+		// NOTE: demotion currently resets only the promoted-bounce clocks; it does NOT stop the node serving
+		// the topic — the cold-start forwarder, the direct-participant records, and the budget slot all stay,
+		// and the cohort keeps serving at tier d. If demotion is ever made to actually collapse local tier
+		// state, it must reassign or drain the topic's records FIRST, then `coldStart.remove` + release the
+		// budget slot + `traffic.forget`, in that order — removing the forwarder while records remain re-creates
+		// the off-budget-serving drift fixed in `cohort-topic-coldstart-forwarder-reconcile` (the budget stops
+		// bounding the served-topic set). The eviction path already reconciles all three via `TopicBudget.onEvict`.
 		state.promoted = false;
 		state.promotedAt = undefined;
 		state.lowLoadSince = undefined;

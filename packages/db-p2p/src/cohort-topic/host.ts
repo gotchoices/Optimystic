@@ -1734,7 +1734,19 @@ function createCoordEngine(ctx: CoordEngineContext, servedCoord: RingCoord, tree
 	// so a probe flood cannot exhaust a participant's register budget at this coord, or vice-versa.
 	const probeRateLimiter = createRegisterRateLimiter(ctx.antiDos.rateLimiter);
 	const replayGuard = createCorrelationReplayGuard(ctx.antiDos.replayGuard);
-	const topicBudget = createTopicBudget(ctx.antiDos.topicBudget);
+	// Reconcile the cold-start forwarder set + traffic window with the topic budget on eviction. When the
+	// budget is full and evicts the coldest (zero-participant) resident to make room for a new topic, tear
+	// down the evicted topic's forwarder and traffic counters too — otherwise `servesTopic` stays true off
+	// the leftover forwarder, the topic is served forever with no budget slot, and the forwarder map grows
+	// unbounded. `coldStart` (declared above at the createColdStartManager call) and `traffic` are both
+	// initialized before this point, so the callback closes over live instances.
+	const topicBudget = createTopicBudget({
+		...ctx.antiDos.topicBudget,
+		onEvict: (topicId: Uint8Array): void => {
+			coldStart.remove(topicId);
+			traffic.forget(topicId);
+		},
+	});
 	const renewal = createRenewalCohortSide({
 		store,
 		self: ctx.selfMemberBytes,

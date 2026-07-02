@@ -235,6 +235,52 @@ describe('cohort-topic / anti-DoS', () => {
 			expect(budget.admit(t[0]!)).to.be.true;
 			expect(budget.has(t[1]!)).to.be.true;
 		});
+
+		describe('onEvict teardown hook', () => {
+			it('fires exactly once with the evicted topic bytes on a full-budget eviction', () => {
+				const evicted: Uint8Array[] = [];
+				const budget = createTopicBudget({ topicsMax: 2, onEvict: (id) => { evicted.push(id); } });
+				const t = [bytes('e0'), bytes('e1'), bytes('e2')];
+				budget.admit(t[0]!); // seq 1, count 0 — the LRU-coldest resident
+				budget.admit(t[1]!); // seq 2, count 0
+				// Full: admitting a new topic evicts the coldest zero-participant resident (t0).
+				expect(budget.admit(t[2]!)).to.be.true;
+				expect(evicted.length, 'onEvict fired once').to.equal(1);
+				// Handed the victim's real bytes (not a string key), so the caller can drive byte-keyed teardown.
+				expect(evicted[0]).to.deep.equal(t[0]!);
+				expect(budget.has(t[0]!), 'the evicted topic is gone').to.be.false;
+			});
+
+			it('does NOT fire on a plain admit into free space', () => {
+				const evicted: Uint8Array[] = [];
+				const budget = createTopicBudget({ topicsMax: 3, onEvict: (id) => { evicted.push(id); } });
+				budget.admit(bytes('f0'));
+				budget.admit(bytes('f1'));
+				expect(evicted.length, 'no eviction while the budget has room').to.equal(0);
+			});
+
+			it('does NOT fire on an already-resident re-admit', () => {
+				const evicted: Uint8Array[] = [];
+				const budget = createTopicBudget({ topicsMax: 2, onEvict: (id) => { evicted.push(id); } });
+				const t0 = bytes('r0');
+				budget.admit(t0);
+				budget.admit(t0); // re-admit the same topic — refreshes recency, evicts nothing
+				expect(evicted.length).to.equal(0);
+			});
+
+			it('does NOT fire on a refusal (full of populated topics — nothing evictable)', () => {
+				const evicted: Uint8Array[] = [];
+				const budget = createTopicBudget({ topicsMax: 2, onEvict: (id) => { evicted.push(id); } });
+				const t = [bytes('x0'), bytes('x1'), bytes('x2')];
+				budget.admit(t[0]!);
+				budget.admit(t[1]!);
+				budget.touch(t[0]!, 1);
+				budget.touch(t[1]!, 1);
+				// Every resident is populated → the new topic is refused, and no victim is torn down.
+				expect(budget.admit(t[2]!)).to.be.false;
+				expect(evicted.length, 'a refusal evicts nothing').to.equal(0);
+			});
+		});
 	});
 
 	describe('correlation-id replay guard', () => {

@@ -26,6 +26,13 @@ export const DEFAULT_TOPICS_MAX = 2048;
 export interface TopicBudgetConfig {
 	/** Max topics with forwarder state. Default {@link DEFAULT_TOPICS_MAX}. */
 	topicsMax?: number;
+	/**
+	 * Called with the evicted topic's id just before its slot is freed in {@link TopicBudget.admit}, so
+	 * the caller can tear down the now-unbacked forwarder + traffic window that outlives the slot. Fires
+	 * only for a genuine eviction (a zero-participant victim), never for a plain admit, an already-resident
+	 * re-admit, or a refusal. Absent → no teardown hook.
+	 */
+	onEvict?: (topicId: Uint8Array) => void;
 }
 
 /** Per-cohort cap on the number of topics with forwarder state, with LRU eviction of cold topics. */
@@ -60,11 +67,14 @@ interface ResidentState {
 	participantCount: number;
 	/** Monotonic access sequence (LRU tiebreaker; lower = least-recently used). */
 	seq: number;
+	/** The original topic-id bytes, captured on admit so `onEvict` can be handed real bytes (residents key by string). */
+	topicId: Uint8Array;
 }
 
 class LruTopicBudget implements TopicBudget {
 	private readonly residents = new Map<string, ResidentState>();
 	private readonly topicsMax: number;
+	private readonly onEvict?: (topicId: Uint8Array) => void;
 	private seqCounter = 0;
 
 	constructor(config: TopicBudgetConfig = {}) {
@@ -72,6 +82,7 @@ class LruTopicBudget implements TopicBudget {
 		if (!Number.isInteger(this.topicsMax) || this.topicsMax <= 0) {
 			throw new RangeError(`topicsMax must be a positive integer, got ${this.topicsMax}`);
 		}
+		this.onEvict = config.onEvict;
 	}
 
 	get size(): number {
@@ -94,7 +105,7 @@ class LruTopicBudget implements TopicBudget {
 			return true;
 		}
 		if (this.residents.size < this.topicsMax) {
-			this.residents.set(key, { participantCount: 0, seq: ++this.seqCounter });
+			this.residents.set(key, { participantCount: 0, seq: ++this.seqCounter, topicId });
 			return true;
 		}
 		// Full: only a zero-participant resident may be evicted to make room for a new topic.
@@ -103,8 +114,12 @@ class LruTopicBudget implements TopicBudget {
 			log("topic-budget full size=%d max=%d — refuse new topic", this.residents.size, this.topicsMax);
 			return false;
 		}
+		// Fire the teardown hook with the victim's real bytes BEFORE freeing the slot, so the callback
+		// (drop the now-unbacked forwarder + traffic window) sees a coherent state. Only a genuine
+		// eviction reaches here — `coldestEvictable()` already refused a full-of-populated budget above.
+		this.onEvict?.(this.residents.get(victim)!.topicId);
 		this.residents.delete(victim);
-		this.residents.set(key, { participantCount: 0, seq: ++this.seqCounter });
+		this.residents.set(key, { participantCount: 0, seq: ++this.seqCounter, topicId });
 		log("topic-budget evicted cold topic to admit new (size=%d max=%d)", this.residents.size, this.topicsMax);
 		return true;
 	}

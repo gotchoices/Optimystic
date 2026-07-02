@@ -11,6 +11,8 @@ import { bytesEqual, bytesKey } from '../../src/cohort-topic/registration/bytes.
 import { DEFAULT_TTL_MS } from '../../src/cohort-topic/registration/types.js';
 import type { RegistrationRecord } from '../../src/cohort-topic/registration/types.js';
 import { createColdStartManager } from '../../src/cohort-topic/coldstart.js';
+import { createTrafficCounters } from '../../src/cohort-topic/traffic.js';
+import { createCohortView } from '../../src/cohort-topic/gossip/view.js';
 import type { RegisterV1, RenewV1 } from '../../src/cohort-topic/wire/types.js';
 
 function bytes(label: string, len = 32): Uint8Array {
@@ -605,5 +607,129 @@ describe('cohort-topic / member-engine: sweepStale reclaims idle rate-limiter ke
 		engine.sweepStale(1_000 + 1_000);
 		expect(rateLimiter.size, 'the idle register key was reclaimed on the gossip cadence').to.equal(0);
 		expect(probeRateLimiter.size, 'the idle probe key was reclaimed on the gossip cadence').to.equal(0);
+	});
+});
+
+describe('cohort-topic / member-engine: topic-budget eviction reconciles the forwarder set', () => {
+	// The end-to-end reproduction through the engine: a full budget that evicts the coldest resident to
+	// admit a new topic must ALSO tear down the evicted topic's cold-start forwarder (via the `onEvict`
+	// hook the host wires to `coldStart.remove` + `traffic.forget`). Otherwise `serves()` stays true off
+	// the leftover forwarder, the topic is served with no budget slot, and the forwarder map grows unbounded.
+	const hash = createRingHash();
+	const slots = createSlotAssigner(hash);
+	const self = bytes('evict-self', 16);
+	const cohortEpoch = bytes('evict-epoch', 32);
+	const members = [self];
+	const cohort = (): { members: readonly Uint8Array[]; cohortEpoch: Uint8Array } => ({ members, cohortEpoch });
+
+	/** A cold bootstrap register at the root tier — drives the engine's cold path (instantiate → admit). */
+	function coldReg(topic: Uint8Array, participant: Uint8Array, cid: string): RegisterV1 {
+		return {
+			v: 1,
+			topicId: bytesKey(topic),
+			tier: 0,
+			treeTier: 0,
+			participantCoord: bytesKey(participant),
+			ttl: 90_000,
+			bootstrap: true,
+			timestamp: 1_000,
+			correlationId: bytesKey(bytes(cid)),
+			signature: '',
+		};
+	}
+
+	interface Harness {
+		engine: ReturnType<typeof createCohortMemberEngine>;
+		coldStart: ReturnType<typeof createColdStartManager>;
+		admitCalls: () => Uint8Array[];
+	}
+
+	/**
+	 * Compose an engine over a real cold-start manager + traffic + budget (topicsMax 2). `willingness`
+	 * DECLINES every register (`unwilling_member`), so a cold register instantiates the forwarder and
+	 * takes a budget slot but adds NO direct participant — leaving each resident at participantCount 0,
+	 * i.e. evictable. When `onEvict` is true the budget is wired to the reconciliation the host uses.
+	 */
+	function makeHarness(opts: { onEvict: boolean }): Harness {
+		const store = createRegistrationStore();
+		const coldStart = createColdStartManager({
+			parentRegistrar: { registerWithParent: async (): Promise<void> => {} },
+		});
+		const traffic = createTrafficCounters({ view: createCohortView(), store, selfMember: 'evict-self' });
+		const admitCalls: Uint8Array[] = [];
+		const real = createTopicBudget({
+			topicsMax: 2,
+			onEvict: opts.onEvict ? (id: Uint8Array): void => { coldStart.remove(id); traffic.forget(id); } : undefined,
+		});
+		// Wrap the real budget only to observe `admit` calls (proving a re-register re-consults it).
+		const topicBudget = {
+			admit: (id: Uint8Array): boolean => { admitCalls.push(id); return real.admit(id); },
+			touch: (id: Uint8Array, c: number): void => real.touch(id, c),
+			has: (id: Uint8Array): boolean => real.has(id),
+			participantCount: (id: Uint8Array): number | undefined => real.participantCount(id),
+			get size(): number { return real.size; },
+		};
+		const engine = createCohortMemberEngine({
+			self,
+			profile: {} as never,
+			hash,
+			store,
+			slots,
+			willingness: { evaluate: (): { kind: 'unwilling_member'; candidateMembers: Uint8Array[] } => ({ kind: 'unwilling_member', candidateMembers: [] }) },
+			promotion: {
+				onParticipantCountChange: (): Promise<undefined> => Promise.resolve(undefined),
+				maybeDemote: (): Promise<undefined> => Promise.resolve(undefined),
+				isPromoted: (): boolean => false,
+				applyPromotionNotice: (): void => {},
+				applyDemotionNotice: (): void => {},
+			},
+			coldStart,
+			traffic: traffic as never,
+			renewal: unused('renewal'),
+			cohort,
+			quorumWilling: (): boolean => true,
+			topicBudget: topicBudget as never,
+		});
+		return { engine, coldStart, admitCalls: (): Uint8Array[] => admitCalls };
+	}
+
+	const A = bytes('evict-A');
+	const B = bytes('evict-B');
+	const C = bytes('evict-C');
+
+	/** Cold-register A then B (budget full at {A:0, B:0}), then C — forcing eviction of the coldest (A). */
+	async function fillToCapAndEvict(h: Harness): Promise<void> {
+		await h.engine.handleRegister(coldReg(A, bytes('pA', 16), 'cid-A'), { followOn: false, treeTier: 0 }, 1_000);
+		await h.engine.handleRegister(coldReg(B, bytes('pB', 16), 'cid-B'), { followOn: false, treeTier: 0 }, 1_000);
+		await h.engine.handleRegister(coldReg(C, bytes('pC', 16), 'cid-C'), { followOn: false, treeTier: 0 }, 1_000);
+	}
+
+	it('WITHOUT the onEvict hook, the evicted topic\'s forwarder leaks — it keeps being served off no budget slot (the bug)', async () => {
+		const h = makeHarness({ onEvict: false });
+		await fillToCapAndEvict(h);
+		// A's budget slot was freed to admit C, but its forwarder survives → `serves(A)` stays true off the
+		// leftover forwarder. This is exactly the residency mismatch the fix closes.
+		expect(h.coldStart.get(A), 'the forwarder leaks past its budget slot — the defect').to.not.equal(undefined);
+	});
+
+	it('WITH onEvict → remove + forget, eviction tears down the forwarder, re-enters the cold path, and stays bounded', async () => {
+		const h = makeHarness({ onEvict: true });
+		await fillToCapAndEvict(h);
+
+		// (a) the evicted topic's forwarder is gone; the survivors remain served.
+		expect(h.coldStart.get(A), 'evicted forwarder removed').to.equal(undefined);
+		expect(h.coldStart.get(B), 'survivor B still served').to.not.equal(undefined);
+		expect(h.coldStart.get(C), 'newly-admitted C served').to.not.equal(undefined);
+
+		// (c) the forwarder set stays bounded by topicsMax (2) — exactly the two survivors, not three.
+		const survivors = [A, B, C].filter((t) => h.coldStart.get(t) !== undefined);
+		expect(survivors.length, 'forwarder set bounded by topicsMax').to.equal(2);
+
+		// (b) `serves(A)` is now false, so a re-register for A takes the COLD path and re-consults the budget
+		// (`admit` is called again) — the hot-path short-circuit off the leftover forwarder is gone.
+		const before = h.admitCalls().length;
+		await h.engine.handleRegister(coldReg(A, bytes('pA2', 16), 'cid-A2'), { followOn: false, treeTier: 0 }, 2_000);
+		const readmitsForA = h.admitCalls().slice(before).filter((id) => bytesEqual(id, A));
+		expect(readmitsForA.length, 're-register of the evicted topic re-enters admit (cold path)').to.equal(1);
 	});
 });

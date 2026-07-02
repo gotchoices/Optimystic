@@ -170,6 +170,12 @@ export interface ColdStartManager {
 	instantiate(topicId: Uint8Array, tier: number, parentCoord?: Uint8Array, opTier?: number): Forwarder;
 	/** The tracked forwarder for `topicId`, or `undefined`. */
 	get(topicId: Uint8Array): Forwarder | undefined;
+	/**
+	 * Drop the forwarder for `topicId` (budget eviction / teardown). Idempotent; a no-op if the topic is
+	 * not tracked. After this, {@link get} returns `undefined` for `topicId`, so the cohort no longer
+	 * reports serving it via cold-start state.
+	 */
+	remove(topicId: Uint8Array): void;
 }
 
 class TrackingColdStartManager implements ColdStartManager {
@@ -204,6 +210,12 @@ class TrackingColdStartManager implements ColdStartManager {
 
 	get(topicId: Uint8Array): Forwarder | undefined {
 		return this.forwarders.get(bytesKey(topicId));
+	}
+
+	remove(topicId: Uint8Array): void {
+		// Idempotent: `Map.delete` on an absent key is a safe no-op, so a double-remove (or a remove of a
+		// never-instantiated topic) does nothing.
+		this.forwarders.delete(bytesKey(topicId));
 	}
 }
 

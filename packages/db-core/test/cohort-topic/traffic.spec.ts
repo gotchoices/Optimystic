@@ -140,6 +140,41 @@ describe('cohort-topic / traffic counters', () => {
 		const tc = createTrafficCounters({ view, store: storeStub(0), selfMember: SELF, childCohortCount: () => 16 });
 		expect(tc.snapshot(TOPIC).childCohortCount).to.equal(16);
 	});
+
+	it('forget() clears the windowed + last-published counts for a topic', () => {
+		const tc = createTrafficCounters({ view: createCohortView(), store: storeStub(0), selfMember: SELF });
+		tc.recordArrival(TOPIC, 1_000);
+		tc.recordQuery(TOPIC, 1_100);
+		tc.publish(TOPIC, 1_200);
+		expect(tc.published(TOPIC), 'counts accumulated before forget').to.deep.equal({ arrivals: 1, queries: 1 });
+
+		tc.forget(TOPIC); // topic no longer served (budget eviction)
+
+		// The last-published summary is gone: a fresh publish (no re-recorded events) freezes zeros.
+		expect(tc.published(TOPIC), 'last-published cleared').to.deep.equal({ arrivals: 0, queries: 0 });
+		const refrozen = tc.publish(TOPIC, 1_300);
+		expect(refrozen, 'the windowed events were cleared too — nothing to re-freeze').to.deep.equal({ arrivals: 0, queries: 0 });
+	});
+
+	it('after forget(), the snapshot no longer includes the forgotten local contribution', () => {
+		const view = createCohortView();
+		addSiblingSummary(view, 'sib', { arrivalsPerMin: 5 }); // a sibling still names the topic
+		const tc = createTrafficCounters({ view, store: storeStub(0), selfMember: SELF });
+		tc.recordArrival(TOPIC, 1_000);
+		tc.recordArrival(TOPIC, 1_100);
+		tc.publish(TOPIC, 1_200); // own contribution: arrivals 2
+		expect(tc.snapshot(TOPIC).arrivalsPerMin, 'own 2 + sibling 5').to.equal(7);
+
+		tc.forget(TOPIC);
+		// Own contribution is gone; only the sibling's still-gossiped summary remains (it ages out on its own).
+		expect(tc.snapshot(TOPIC).arrivalsPerMin, 'only the sibling contribution survives forget').to.equal(5);
+	});
+
+	it('forget() is idempotent and safe on a never-observed topic', () => {
+		const tc = createTrafficCounters({ view: createCohortView(), store: storeStub(0), selfMember: SELF });
+		expect(() => tc.forget(TOPIC)).to.not.throw();
+		expect(tc.published(TOPIC)).to.deep.equal({ arrivals: 0, queries: 0 });
+	});
 });
 
 describe('cohort-topic / traffic reply wiring', () => {
