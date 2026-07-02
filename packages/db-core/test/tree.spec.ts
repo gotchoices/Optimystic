@@ -314,6 +314,40 @@ describe('Tree', () => {
     expect(retrieved2).to.deep.equal(entry2)
   })
 
+  it('prior() should cross leaf boundary correctly', async () => {
+    // NodeCapacity = 64; inserting 65 entries forces a leaf split so key 65 is on leaf 2
+    for (let i = 1; i <= 65; i++) {
+      await tree.replace([[i, { key: i, value: `Value ${i}` }]])
+    }
+
+    const pathAt65 = await tree.find(65)
+    expect(pathAt65.on).to.be.true
+
+    const pathAt64 = await tree.prior(pathAt65)
+    expect(pathAt64.on).to.be.true
+    expect(tree.at(pathAt64)?.key).to.equal(64)
+  })
+
+  it('key-changing update should complete delete before re-find', async () => {
+    // 70 entries spans multiple leaves; updating key 35 → 1000 exercises internalUpdate delete-then-reinsert
+    for (let i = 1; i <= 70; i++) {
+      await tree.replace([[i, { key: i, value: `Value ${i}` }]])
+    }
+
+    const btree = (tree as any).btree
+    const path35 = await btree.find(35)
+    expect(path35.on).to.be.true
+    await btree.updateAt(path35, { key: 1000, value: 'Value 35 moved' })
+
+    expect(await tree.get(35)).to.be.undefined
+    expect((await tree.get(1000))?.value).to.equal('Value 35 moved')
+
+    // Verify surrounding keys survived
+    expect(await tree.get(34)).to.deep.equal({ key: 34, value: 'Value 34' })
+    expect(await tree.get(36)).to.deep.equal({ key: 36, value: 'Value 36' })
+    expect(await tree.get(70)).to.deep.equal({ key: 70, value: 'Value 70' })
+  })
+
   describe('concurrent creation', () => {
     it('should resolve concurrent Tree creation and allow post-recovery operations', async () => {
       const tree1 = await Tree.createOrOpen<number, TestEntry>(network, 'concurrent-tree', e => e.key)

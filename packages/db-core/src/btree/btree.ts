@@ -277,7 +277,7 @@ export class BTree<TKey, TEntry> {
 	/** @returns a path one step backward.  on will be true if the path hasn't hit the end. */
 	async prior(path: Path<TKey, TEntry>): Promise<Path<TKey, TEntry>> {
 		const newPath = path.clone();
-		this.movePrior(newPath);
+		await this.movePrior(newPath);
 		return newPath;
 	}
 
@@ -460,7 +460,7 @@ export class BTree<TKey, TEntry> {
 			if (this.compare(oldKey, newKey) !== 0) {	// if key changed, delete and re-insert
 				let newPath = await this.internalInsert(newEntry)
 				if (newPath.on) {	// insert succeeded
-					this.internalDelete(await this.find(oldKey));	// Re-find - the prior insert invalidated the path
+					await this.internalDelete(await this.find(oldKey));	// Re-find - the prior insert invalidated the path
 					newPath = await this.find(newKey);	// Re-find- delete invalidated path
 				}
 				return [newPath, false];
