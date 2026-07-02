@@ -84,7 +84,8 @@ export type CohortGossipSignable = Omit<CohortGossipV1, "signature">;
  * or replicate forged records). Like the other payload helpers, determinism comes from an
  * explicitly-ordered array — nested records/summaries/evictions are emitted as fixed ordered tuples so
  * the signer and the receiver (which re-derives this image from the validated frame) agree byte-for-byte.
- * Absent optionals (`records`/`evicted`) normalize to `[]`, and `appState` to `null`.
+ * Absent optionals (`records`/`evicted`/`childLinks`/`childUnlinks`) normalize to `[]`, and `appState` to
+ * `null`. `childLinks`/`childUnlinks` are covered so a MITM cannot strip or inject a child link/unlink.
  */
 export function cohortGossipSigningPayload(g: CohortGossipSignable): Uint8Array {
 	return utf8.encode(JSON.stringify([
@@ -118,6 +119,8 @@ export function cohortGossipSigningPayload(g: CohortGossipSignable): Uint8Array 
 			r.appState ?? null,
 		]),
 		(g.evicted ?? []).map((e) => [e.topicId, e.participantId]),
+		(g.childLinks ?? []).map((c) => [c.topicId, c.childCohortCoord, c.effectiveAt]),
+		(g.childUnlinks ?? []).map((c) => [c.topicId, c.childCohortCoord, c.effectiveAt]),
 		g.timestamp,
 	]));
 }

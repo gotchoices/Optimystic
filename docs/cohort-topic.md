@@ -383,15 +383,18 @@ A participant that receives `NoState` at tier `d` gets no traffic signal from th
 > combined fresh+renewal arrivals, gossip-derived snapshot (lags ≤ one round, no reply-time
 > recompute), and `cohortEpoch`-change reset alongside it. The snapshot **sums own + sibling**
 > gossiped per-topic counts (cohort-wide flow, since arrivals shard ~`1/k` across members);
-> `directParticipants` is read from the replicated store rather than summed. `childCohortCount` is the
-> **recording engine's real child count** (the per-engine child registry populated by `dispatchChildLink`),
-> supplied as the promotion-layer override; it is exact on the parent member the child-link routed to and
-> `0` on siblings until the replication follow-on (`cohort-topic-child-link-replicate-unlink`) converges it
-> cohort-wide. (The override is *always* authoritative when wired — it returns a number, `0` included, so
-> the nullish-coalescing `childOverride ?? maxOfSiblings` never falls through to the gossiped max. That
-> max-of-siblings computation is therefore dormant while the registry override is wired, and becomes the
-> effective value only if the override is ever unwired; the replication follow-on converges siblings by
-> populating each engine's registry, not by relying on that max.)
+> `directParticipants` is read from the replicated store rather than summed. `childCohortCount` is a
+> **converged union** of the child cohorts this parent parents — not a max-of-siblings. The child set is
+> sharded across parent members (FRET routes a child-link to one member, so different child coords land on
+> different members), so a per-member count is a shard, not the total. Each member gossips its own child
+> link/unlink deltas (`CohortGossipV1.childLinks` / `childUnlinks`) and merges inbound ones straight into its
+> per-engine child registry (last-writer-wins by `effectiveAt`, keyed by child coord — **not** the parent
+> epoch, so a parent rotation never drops the set), so after one gossip round every parent member holds the
+> full union and `childCohortCount` is consistent cohort-wide (`cohort-topic-child-link-replicate-unlink`). It
+> is supplied to the traffic snapshot as the promotion-layer override. (The override is *always* authoritative
+> when wired — it returns a number, `0` included, so the nullish-coalescing `childOverride ?? maxOfSiblings`
+> never falls through to the gossiped max; that max-of-siblings computation is dormant while the registry
+> override is wired, correct now that the override itself converges cohort-wide.)
 
 ---
 
@@ -676,7 +679,7 @@ A cohort demotes for topic `T` when, for a quorum of members:
 - The above has held for at least `T_demote` (default 5 minutes), AND
 - The cohort has no live `childCohorts` for `T`.
 
-Demotion threshold-signs a `DemotionNoticeV1` sent to the parent cohort (registers as "drop me from your tier-(d+1) children"). The cohort releases all forwarder state for `T`.
+Demotion threshold-signs a `DemotionNoticeV1` and fans it to **two** targets: the demoting cohort's own served coord (siblings adopt `promoted = false`) **and** its `parentCohortCoord`. At the parent, the notice is a second, independent apply — the parent verifies it against the **child** cohort cert (the same threshold verify a sibling runs) and, on success, **unrecords the child** from its per-engine child registry ("drop me from your tier-(d+1) children"). That release gossips across the parent cohort exactly as the link does (last-writer-wins by `effectiveAt`), so every parent member's `childCohortCount` falls; once the last child is gone the parent's own demotion gate (`childCohortCount > 0` no longer blocks) can fire in turn. The demoting cohort releases all forwarder state for `T`. (A node that serves *both* the demoting child coord and the parent coord applies both semantics from one notice; the parent-unlink runs independently of the sibling-adopt replay high-water, ordered by the child registry's own per-child freshness — see `cohort-topic-child-link-replicate-unlink`.)
 
 ### Cold-start instantiation
 
@@ -1199,18 +1202,24 @@ limit, topic-budget refusal, and `bootstrap: true` root instantiation.
 >   `cohort-topic-participant-coord-routing-key-mismatch` (see §Wire formats "Tier-0 caveat"). The fan
 >   itself is simulator-validated against the uniform ring coord (`scenarios.ts` cold-start-storm).
 > - **multi-tier tree growth / depth law** `⌈log_F(N/cap_promote)⌉` over a live walk: `followOn` cold-start
->   derivation (`cohort-topic-followon-derivation`) and the parent-side child recording
->   (`cohort-topic-parent-child-link` — the signed `ChildLinkV1`, verify, and per-engine `childCohortCount`)
->   have both landed. A `Promoted`-redirect follow-on instantiates a cold tier-`(d+1)` child, which links to
->   its parent; the routed parent member records it and its `childCohortCount` reads ≥ 1 (asserted at the
->   engine, §Cold-start instantiation). The remaining gap for a full **depth-law e2e over a live walk** is
->   the **cohort-wide** convergence of that count — today only the FRET-routed parent member records the
->   child, so a sibling reads `0` (`cohort-topic-child-link-replicate-unlink`). The depth law itself is
+>   derivation (`cohort-topic-followon-derivation`), the parent-side child recording
+>   (`cohort-topic-parent-child-link` — the signed `ChildLinkV1`, verify, and per-engine `childCohortCount`),
+>   and the **cohort-wide convergence + unlink** of that count (`cohort-topic-child-link-replicate-unlink`)
+>   have all landed. A `Promoted`-redirect follow-on instantiates a cold tier-`(d+1)` child, which links to
+>   its parent; the routed parent member records it, gossips a `childLinks` delta, and every parent member
+>   converges on the same child **union** (`childCohortCount` consistent cohort-wide, not a single-member
+>   shard). The remaining gap for a full **depth-law e2e over a live walk** is only the live multi-tier mesh
+>   instantiation (driving real promotion past `cap_promote` so a real tier-1 child completes a live-key
+>   child-link RPC) — not reliably driveable in the mock mesh (the routed member often cannot yet resolve the
+>   child cohort cert), so it is deferred to the real-libp2p tier / CI. The depth law itself is
 >   simulator-owned (`promotion-convergence.ts`).
-> - **tier-(d>0) demotion-notice broadcast**: the parent-side `childCohortCount` recording now blocks
->   demotion on the recording member (a parent with a linked child does not demote); the **unlink** on child
->   demotion that would release it is the follow-on (`cohort-topic-child-link-replicate-unlink`).
->   Promotion/demotion hysteresis is unit-covered by `promotion.spec.ts`.
+> - **tier-(d>0) demotion-notice broadcast**: the parent-side `childCohortCount` blocks demotion while a
+>   child is linked (cohort-wide, converged via gossip), and the demotion notice fanned to the parent coord
+>   **unlinks** the child so the count falls and the parent can shrink in turn
+>   (`cohort-topic-child-link-replicate-unlink`). The parent-unlink (verify against the child cohort cert →
+>   `unrecordChild`), the dual-role node, the forged-rejected, and the high-water-independence cases are
+>   unit-covered (`promote-notice.spec.ts`); the two-member child-union + unlink convergence is covered by
+>   `gossip-cadence.spec.ts`. Promotion/demotion hysteresis is unit-covered by `promotion.spec.ts`.
 > - **membership-rotation primary handoff** (inventory → pull → dual-serve → ack): `registration/handoff.ts`
 >   is unit-tested in db-core but not yet wired into the FRET host, so there is no host-level rotation to
 >   observe (crash failover is the wired failover path).
@@ -1511,6 +1520,16 @@ interface CohortGossipV1 {
     topicId:            string
     participantId:      string
   }[]
+  childLinks?: {                      // child cohorts this member recorded — converge the child SET (union)
+    topicId:            string
+    childCohortCoord:   string        // 32 bytes — the child cohort's served coord
+    effectiveAt:        number        // convergence key: last-writer-wins per (topic, childCohortCoord)
+  }[]
+  childUnlinks?: {                    // child cohorts this member released (a demoted child); same key + LWW
+    topicId:            string
+    childCohortCoord:   string
+    effectiveAt:        number
+  }[]
   timestamp:          number
   signature:          string
 }
@@ -1525,6 +1544,15 @@ with the mismatch surfaced as membership drift. The implementation is the gossip
 [`packages/db-core/src/cohort-topic/gossip`](../packages/db-core/src/cohort-topic/gossip); the
 willingness/load/`topicSummaries` fold into a per-member view the willingness, barometer, and traffic
 layers read.
+
+The `childLinks` / `childUnlinks` deltas converge the **child set** a parent cohort parents. FRET routes a
+`ChildLinkV1` to a single parent member, so its recording is a shard; gossiping the link (and, on child
+demotion, the unlink) replicates it to every parent member, which merges it straight into its per-engine
+child registry (last-writer-wins by `effectiveAt` per `(topic, childCohortCoord)`). Unlike record deltas,
+these merge **regardless of `cohortEpoch`** — the child set is keyed by child coord, not the parent's
+membership snapshot, so a parent rotation does not drop it and a rotated-in member converges via gossip.
+A merged delta is a direct registry write, never re-gossiped (one broadcast reaches the whole cohort). All
+four delta arrays are covered by the gossip `signature`, so a MITM cannot strip or inject one.
 
 **Per-coord routing.** A node serves many cohorts at once (one per coord FRET routes to it — see
 §FRET integration), and a delivered `cohort-gossip` frame is fanned to every coord engine's bus on the

@@ -109,6 +109,7 @@ import {
 	childLinkSigningPayload,
 	type BootstrapEvidence,
 	type BootstrapEvidenceDeps,
+	type ChildLinkRefV1,
 	type ChildLinkV1,
 	type ChildLinkReplyV1,
 	type CohortGossipV1,
@@ -415,6 +416,15 @@ export interface CoordEngine {
 	 * {@link CoordEngine.childCohortCount}.
 	 */
 	recordChild(topicId: Uint8Array, childCohortCoord: Uint8Array, effectiveAt: number): void;
+	/**
+	 * Release a child cohort (served at `childCohortCoord`) this cohort parented — driven by the demoting
+	 * child's threshold-signed demotion notice fanned to the parent coord. Freshness-ordered per child coord
+	 * and idempotent (a stale/duplicate release is a no-op); unrecording a never-seen child writes a
+	 * `linked = false` tombstone (never a negative count) so a later stale link cannot resurrect it. The child
+	 * set converges across the parent cohort via gossip, so once the last child is released the parent's
+	 * `childCohortCount` falls to 0 and it can demote in turn. See {@link CoordEngine.childCohortCount}.
+	 */
+	unrecordChild(topicId: Uint8Array, childCohortCoord: Uint8Array, effectiveAt: number): void;
 	/** Count of distinct linked child cohorts this engine parents for `topicId` (the demotion-gate input). */
 	childCohortCount(topicId: Uint8Array): number;
 	/** Whether `topicId` is in promoted mode here — reflects both locally-originated and remotely-applied state. */
@@ -676,13 +686,12 @@ export async function createCohortTopicHost(node: Libp2p, fret: FretService, opt
 	// transport's cohort peer resolution.
 	const broadcastNotice = (notice: PromotionNoticeV1 | DemotionNoticeV1, servedCoord: RingCoord): void => {
 		const frame = encodeCohortMessage(notice, maxBytes);
-		// NOTE: a demotion also fans to the parent coord for childCohortCount bookkeeping. Since the inbound
-		// path now routes by the notice's `cohortCoord` (the demoting CHILD's served coord), a parent-only node
-		// receiving this frame does not serve that coord → findByCoord → undefined → dropped (a no-op apply).
-		// That matches this milestone: childCohortCount is 0 and the parent-side decrement is not yet wired
-		// through applyDemotionNotice. A node that serves BOTH the parent and the child coord still adopts (it
-		// serves the child coord as a child sibling). Wiring the real parent decrement is follow-on work owned
-		// by `cohort-topic-followon-derivation`.
+		// A demotion fans to BOTH the demoting child's served coord (siblings adopt `promoted = false` via the
+		// `cohortCoord`-routed apply) and the parent coord (the parent unrecords the child). `handleInboundNotice`
+		// runs both apply semantics independently: the `cohortCoord` target does the sibling-adopt, and a demotion
+		// additionally resolves `parentCohortCoord` and — on the same threshold verify against the child cohort
+		// cert — calls `parent.unrecordChild(...)`. A parent-only node applies only the unlink; a node serving
+		// both coords applies both. See `noticeBroadcastCoords` / `handleInboundNotice`.
 		for (const coord of noticeBroadcastCoords(notice, servedCoord)) {
 			gossipTransport.broadcastOver(protocols.promote, coord, frame);
 		}
@@ -1384,18 +1393,28 @@ class RotationState {
 
 /**
  * A per-{@link CoordEngine} registry of the child cohorts this cohort parents, keyed by topic then by child
- * served coord. `recordChild` is freshness-ordered per child coord (a stale replay cannot flip a newer state)
- * and idempotent (re-linking an already-linked coord is a no-op), mirroring `PromotionState.lastEffectiveAt`.
- * `count` feeds the demotion gate / gossip summary / traffic snapshot.
+ * served coord. Both mutators are freshness-ordered per child coord (a stale/out-of-order replay cannot flip a
+ * newer state) and idempotent (re-applying the same state is a no-op), mirroring `PromotionState.lastEffectiveAt`:
+ * `recordChild` links, `unrecordChild` releases (on a child demotion). Each returns whether it actually changed
+ * state, so the caller re-gossips only real changes. `count` feeds the demotion gate / gossip summary / traffic
+ * snapshot.
  *
- * NOTE: single-member. FRET routes a child-link to ONE parent member, so only that member's registry records
- * the child; sibling parent members read `count == 0`. Cohort-wide convergence (gossip-replicate the child
- * set) and the unlink-on-demotion are the follow-on `cohort-topic-child-link-replicate-unlink`. Do NOT paper
- * over the single-member gap with a max-across-siblings count — the child set is sharded across parent members
- * (different child coords route to different members), so a max undercounts; a converged union is required.
+ * **Cohort-wide convergence.** FRET routes a child-link to ONE parent member, so a per-member count is a shard,
+ * not the total. Every member gossips its own link/unlink deltas ({@link CohortGossipV1.childLinks} /
+ * `childUnlinks`) and merges inbound ones straight into this registry (via the gossip bus `onChildDeltas`
+ * callback), so after a round every parent member holds the same **converged union** and `count` is consistent
+ * cohort-wide. Because merge is last-writer-wins by `effectiveAt`, a link and a later unlink converge in any
+ * arrival order, and a never-seen unlink writes a `linked = false` tombstone that a subsequently-arriving stale
+ * link cannot resurrect. The union is keyed by child coord, never the parent epoch, so a parent membership
+ * rotation does not reset it. NOTE: a link/unlink is broadcast once (drained from the pending delta queue);
+ * a parent member that joins the cohort *after* the delta drained (rotation cold-start) learns the child set
+ * only on the next local record/unrecord for that child — see `debt-cohort-topic-child-set-late-joiner-resync`.
  */
 interface ChildRegistry {
-	recordChild(topicId: Uint8Array, childCohortCoord: Uint8Array, effectiveAt: number): void;
+	/** Link the child; returns true iff this advanced the state (a fresh link or a strictly-newer effectiveAt). */
+	recordChild(topicId: Uint8Array, childCohortCoord: Uint8Array, effectiveAt: number): boolean;
+	/** Release the child (linked = false); returns true iff this advanced the state. A never-seen child writes a tombstone. */
+	unrecordChild(topicId: Uint8Array, childCohortCoord: Uint8Array, effectiveAt: number): boolean;
 	count(topicId: Uint8Array): number;
 }
 
@@ -1406,26 +1425,38 @@ interface ChildEntry {
 
 function createChildRegistry(): ChildRegistry {
 	const byTopic = new Map<string, Map<string, ChildEntry>>();
+	// Freshness-ordered write shared by link/unlink: apply `linked` only if `effectiveAt` is strictly newer than
+	// the entry's high-water (or the entry is new), so a stale/out-of-order replay is dropped and an idempotent
+	// re-apply is a no-op. Returns whether the state actually advanced (so the caller re-gossips only real changes).
+	const apply = (topicId: Uint8Array, childCohortCoord: Uint8Array, effectiveAt: number, linked: boolean): boolean => {
+		const topicKey = bytesToB64url(topicId);
+		let children = byTopic.get(topicKey);
+		if (children === undefined) {
+			children = new Map<string, ChildEntry>();
+			byTopic.set(topicKey, children);
+		}
+		const childKey = bytesToB64url(childCohortCoord);
+		const existing = children.get(childKey);
+		if (existing === undefined) {
+			// A never-seen unlink writes a `linked = false` tombstone (never a negative count), so a later stale
+			// link with an earlier effectiveAt cannot resurrect a demoted child.
+			children.set(childKey, { linked, lastEffectiveAt: effectiveAt });
+			return true;
+		}
+		if (effectiveAt <= existing.lastEffectiveAt) {
+			return false;
+		}
+		const changed = existing.linked !== linked;
+		existing.linked = linked;
+		existing.lastEffectiveAt = effectiveAt;
+		return changed;
+	};
 	return {
-		recordChild(topicId: Uint8Array, childCohortCoord: Uint8Array, effectiveAt: number): void {
-			const topicKey = bytesToB64url(topicId);
-			let children = byTopic.get(topicKey);
-			if (children === undefined) {
-				children = new Map<string, ChildEntry>();
-				byTopic.set(topicKey, children);
-			}
-			const childKey = bytesToB64url(childCohortCoord);
-			const existing = children.get(childKey);
-			if (existing === undefined) {
-				children.set(childKey, { linked: true, lastEffectiveAt: effectiveAt });
-				return;
-			}
-			// Freshness-ordered: only a strictly-newer effectiveAt advances the state, so a stale/out-of-order
-			// replay is dropped and an idempotent re-link is a no-op (never a double count).
-			if (effectiveAt > existing.lastEffectiveAt) {
-				existing.linked = true;
-				existing.lastEffectiveAt = effectiveAt;
-			}
+		recordChild(topicId: Uint8Array, childCohortCoord: Uint8Array, effectiveAt: number): boolean {
+			return apply(topicId, childCohortCoord, effectiveAt, true);
+		},
+		unrecordChild(topicId: Uint8Array, childCohortCoord: Uint8Array, effectiveAt: number): boolean {
+			return apply(topicId, childCohortCoord, effectiveAt, false);
 		},
 		count(topicId: Uint8Array): number {
 			const children = byTopic.get(bytesToB64url(topicId));
@@ -1448,7 +1479,8 @@ function createChildRegistry(): ChildRegistry {
  * is the FRET assembly around `servedCoord` (not the node's own ring position). The promotion tier
  * inputs are coord-derived: `treeTier` is fixed at instantiation; `parentCoord` is
  * `coord_{d-1}(participantCoord, topicId)` (the shard's parent shares the prefix, so any participant
- * routed here yields the same parent); `childCohortCount` is `0` for the single-cohort milestone.
+ * routed here yields the same parent); `childCohortCount` is the converged union of recorded child cohorts
+ * (per-cohort child registry, gossip-replicated), `0` until this cohort parents a child.
  */
 function createCoordEngine(ctx: CoordEngineContext, servedCoord: RingCoord, treeTier: number, participantCoord: Uint8Array): CoordEngine {
 	const store = createRegistrationStore();
@@ -1490,6 +1522,19 @@ function createCoordEngine(ctx: CoordEngineContext, servedCoord: RingCoord, tree
 		onRecordsEvicted: (topicIds): void => {
 			for (const topicId of topicIds) {
 				topicBudget.touch(topicId, store.directParticipants(topicId));
+			}
+		},
+		// Cross-member child-set convergence: merge inbound child link/unlink deltas straight into this engine's
+		// child registry (last-writer-wins by effectiveAt), so every parent member reads the same converged union
+		// — not only the FRET-routed member that recorded the child. A direct write (no re-enqueue) so a received
+		// delta is not re-gossiped; one broadcast already reaches the whole cohort. (`childRegistry` is declared
+		// just above, so it is fully initialized by the time this callback fires on an inbound merge.)
+		onChildDeltas: (childLinks: readonly ChildLinkRefV1[], childUnlinks: readonly ChildLinkRefV1[]): void => {
+			for (const ref of childLinks) {
+				childRegistry.recordChild(b64urlToBytes(ref.topicId), b64urlToBytes(ref.childCohortCoord), ref.effectiveAt);
+			}
+			for (const ref of childUnlinks) {
+				childRegistry.unrecordChild(b64urlToBytes(ref.topicId), b64urlToBytes(ref.childCohortCoord), ref.effectiveAt);
 			}
 		},
 	});
@@ -1631,9 +1676,11 @@ function createCoordEngine(ctx: CoordEngineContext, servedCoord: RingCoord, tree
 	const promotion = createPromotionLifecycle({
 		store,
 		loadBucket: (topicId: Uint8Array): number => ctx.barometer.bucket(tierOfTopic(store, topicId)),
-		// Real child count off this engine's local registry (recorded by the parent-side child-link dispatch).
-		// Single-member on the recording engine this milestone; cohort-wide convergence is the replication
-		// follow-on. Blocks demotion while a child is linked (`promotion.ts` demotionTriggered).
+		// Real child count off this engine's local registry — a converged union across the parent cohort (the
+		// FRET-routed member that records a child gossips a child-link delta; every member merges inbound ones),
+		// so this count is consistent cohort-wide. Blocks demotion while any child is linked; once the last
+		// child demotes (its notice unlinks it here and cohort-wide) the count falls to 0 and the parent can
+		// demote in turn (`promotion.ts` demotionTriggered).
 		childCohortCount: (topicId: Uint8Array): number => childRegistry.count(topicId),
 		treeTier: (): number => treeTier,
 		// `coord_{d-1}(P, topicId)`; never invoked at the root (demotion is gated on `treeTier > 0`), so
@@ -1763,13 +1810,15 @@ function createCoordEngine(ctx: CoordEngineContext, servedCoord: RingCoord, tree
 				tier: tierOfTopic(store, topicId),
 				directParticipants: store.directParticipants(topicId),
 				promoted: promotion.isPromoted(topicId),
-				// Real child count off this engine's local registry (single-member on the recording engine this
-				// milestone; the replication follow-on makes it converge cohort-wide).
+				// Real child count off this engine's local registry — a converged union across the parent cohort
+				// (every member gossips its child link/unlink deltas; inbound ones merge here), so this is
+				// consistent cohort-wide, not a single-member shard.
 				childCohortCount: childRegistry.count(topicId),
 			}),
 		);
-		const { records, evicted } = pending.drain();
-		const idle = topicSummaries.length === 0 && records.length === 0 && evicted.length === 0;
+		const { records, evicted, childLinks, childUnlinks } = pending.drain();
+		const idle = topicSummaries.length === 0 && records.length === 0 && evicted.length === 0
+			&& childLinks.length === 0 && childUnlinks.length === 0;
 		const heartbeat = idle && (lastGossipAt === undefined || now - lastGossipAt >= ctx.willingnessHeartbeatMs);
 		const g = buildCohortGossip({
 			fromMember: selfMember,
@@ -1783,6 +1832,8 @@ function createCoordEngine(ctx: CoordEngineContext, servedCoord: RingCoord, tree
 			topicSummaries,
 			records,
 			evicted,
+			childLinks,
+			childUnlinks,
 			timestamp: now,
 		});
 		if (g === undefined) {
@@ -1834,7 +1885,20 @@ function createCoordEngine(ctx: CoordEngineContext, servedCoord: RingCoord, tree
 		budgetHasTopic: (topicId: Uint8Array): boolean => topicBudget.has(topicId),
 		budgetParticipantCount: (topicId: Uint8Array): number | undefined => topicBudget.participantCount(topicId),
 		forwarder: (topicId: Uint8Array): Forwarder | undefined => coldStart.get(topicId),
-		recordChild: (topicId: Uint8Array, childCohortCoord: Uint8Array, effectiveAt: number): void => childRegistry.recordChild(topicId, childCohortCoord, effectiveAt),
+		// A local record/unrecord (parent-side child-link dispatch / demotion-notice unlink) also enqueues the
+		// corresponding gossip delta on a real state change, so the child set converges across the parent cohort.
+		// A gossip-merged delta writes the registry directly (via the bus `onChildDeltas` callback) and is NOT
+		// re-enqueued here — one broadcast reaches the whole cohort.
+		recordChild: (topicId: Uint8Array, childCohortCoord: Uint8Array, effectiveAt: number): void => {
+			if (childRegistry.recordChild(topicId, childCohortCoord, effectiveAt)) {
+				pending.childLink(topicId, childCohortCoord, effectiveAt);
+			}
+		},
+		unrecordChild: (topicId: Uint8Array, childCohortCoord: Uint8Array, effectiveAt: number): void => {
+			if (childRegistry.unrecordChild(topicId, childCohortCoord, effectiveAt)) {
+				pending.childUnlink(topicId, childCohortCoord, effectiveAt);
+			}
+		},
 		childCohortCount: (topicId: Uint8Array): number => childRegistry.count(topicId),
 		isPromoted: (topicId: Uint8Array): boolean => promotion.isPromoted(topicId),
 		applyPromotionNotice: (notice, now): void => promotion.applyPromotionNotice(notice, now),
@@ -2143,8 +2207,11 @@ export type NoticeOutcome = "applied" | "untrusted" | "dropped";
  * - `"rate-limited"` — the dialing `(peer, topic)` is over its `register_rate_per_peer` ceiling.
  * - `"stale"`        — the notice's `effectiveAt` is at or below the last *applied* notice for its served
  *   cohort coord (a replay / out-of-order frame); dropped before `verifyMessage`.
+ * - `"unlinked"`     — a demotion notice that did not sibling-adopt on this node (no local child-coord engine,
+ *   or that path was stale) but **did** verify + unrecord the demoting child at its parent cohort here (the
+ *   parent-unlink path). Distinct from `"applied"` (a sibling-adopt) so a test can assert the parent-only case.
  */
-export type InboundNoticeResult = NoticeOutcome | "undecodable" | "rate-limited" | "stale";
+export type InboundNoticeResult = NoticeOutcome | "undecodable" | "rate-limited" | "stale" | "unlinked";
 
 /**
  * Node-level anti-abuse state for the `promote` handler (`cohort-topic-promote-handler-verify-amplification`).
@@ -2191,13 +2258,15 @@ export function createPromoteGate(rateLimiterConfig?: RegisterRateLimiterConfig)
 
 /**
  * The slice of a {@link CoordEngine} the inbound notice path needs: the cohort coord the signers should
- * belong to (for verification) and the apply hooks. {@link CoordEngine} satisfies this; tests can pass a
- * minimal stand-in.
+ * belong to (for verification), the sibling-adopt apply hooks, and — for the demotion parent-unlink path
+ * ({@link applyDemotionUnlinkAtParent}) — {@link CoordEngine.unrecordChild}. {@link CoordEngine} satisfies
+ * this; tests can pass a minimal stand-in.
  */
 export interface NoticeApplyTarget {
 	readonly servedCoord: RingCoord;
 	applyPromotionNotice(notice: PromotionNoticeV1, now: number): void;
 	applyDemotionNotice(notice: DemotionNoticeV1, now: number): void;
+	unrecordChild(topicId: Uint8Array, childCohortCoord: Uint8Array, effectiveAt: number): void;
 }
 
 /**
@@ -2285,6 +2354,60 @@ export async function verifyAndApplyNotice(
 	return "applied";
 }
 
+/** Outcome of {@link applyDemotionUnlinkAtParent}. */
+export type ParentUnlinkOutcome = "unlinked" | "no-parent" | "untrusted";
+
+/**
+ * Parent-side apply of a demotion notice: release (unrecord) the demoting child at its parent cohort. A
+ * demoting child threshold-signs its {@link DemotionNoticeV1} and fans it to **both** its own served coord
+ * (siblings adopt `promoted = false` via {@link verifyAndApplyNotice}) and its `parentCohortCoord`. This is the
+ * second, independent apply semantics at the parent: resolve the parent engine at `parentCohortCoord`, verify
+ * the notice's threshold signature against the **child** cohort cert (identical verify to the sibling-adopt —
+ * signers ⊆ the child cohort cert at the notice's `tier`, keyed by the child's `cohortCoord`), and on
+ * `verified` call `parent.unrecordChild(topicId, cohortCoord, effectiveAt)`.
+ *
+ * Returns:
+ * - `"no-parent"` — this node does not serve `parentCohortCoord`; nothing to unrecord (a pure sibling-adopt node).
+ * - `"untrusted"` — the signature does not verify against the child cohort cert (a forged / under-quorum notice).
+ * - `"unlinked"`  — verified; the child was unrecorded (or was already released — the child registry's own
+ *   per-`(topic, childCoord)` freshness makes a replay an idempotent no-op).
+ *
+ * **Freshness is the child registry's, not the promote-gate high-water.** The sibling-adopt high-water is keyed
+ * by the child coord and advanced only on a sibling-adopt `"applied"`; the unlink is ordered independently by
+ * the child registry's per-child `lastEffectiveAt`, so a demotion that is a stale no-op for the sibling-adopt
+ * target still applies the unlink at the parent, and vice-versa. The verify carries the same
+ * {@link PROMOTE_REFETCH_MIN_INTERVAL_MS} bound as the sibling-adopt, so it cannot amplify into dials.
+ */
+export async function applyDemotionUnlinkAtParent(
+	notice: DemotionNoticeV1,
+	registry: CoordRegistry,
+	verifier: MembershipVerifier,
+	now: number,
+): Promise<ParentUnlinkOutcome> {
+	const parent = registry.findByCoord(b64urlToBytes(notice.parentCohortCoord));
+	if (parent === undefined) {
+		return "no-parent";
+	}
+	let signers: Uint8Array[];
+	let sig: Uint8Array;
+	try {
+		signers = notice.signers.map(b64urlToBytes);
+		sig = b64urlToBytes(notice.thresholdSig);
+	} catch {
+		return "untrusted"; // a signer / sig that is not valid base64url cannot verify
+	}
+	// Verify against the CHILD cohort cert (the demoting cohort's served coord `notice.cohortCoord`), NOT the
+	// parent's — the demotion is threshold-signed by the child cohort. Same bounded refetch as the sibling-adopt.
+	const payload = demotionNoticeSigningPayload(notice);
+	const result = await verifier.verifyMessage(signers, b64urlToBytes(notice.cohortCoord), notice.tier, payload, sig, { minRefetchIntervalMs: PROMOTE_REFETCH_MIN_INTERVAL_MS, now });
+	if (result !== "verified") {
+		return "untrusted";
+	}
+	// `cohortCoord` is the child's served coord — the key the parent recorded the child under.
+	parent.unrecordChild(b64urlToBytes(notice.topicId), b64urlToBytes(notice.cohortCoord), notice.effectiveAt);
+	return "unlinked";
+}
+
 /**
  * Full inbound `promote`-frame pipeline with the anti-abuse gate, exported so it is unit-testable without a
  * live node (`cohort-topic-promote-handler-verify-amplification`). Runs the cheapest checks first — each
@@ -2293,7 +2416,15 @@ export async function verifyAndApplyNotice(
  *
  * ```
  *   decode → per-(peer,topic) rate limit → resolve engine by carried cohortCoord → effectiveAt high-water → verify+apply
+ *                                                                                                          ↘ (demotion) parent-unlink at parentCohortCoord
  * ```
+ *
+ * A **demotion** carries a second, independent apply semantics: beyond the sibling-adopt above, it also
+ * releases the demoting child at its parent cohort ({@link applyDemotionUnlinkAtParent}). Both paths may fire
+ * on one node (one that serves both the child coord and the parent coord). The parent-unlink runs OUTSIDE the
+ * sibling-adopt high-water (which is keyed by the child coord and would otherwise stale-drop the parent-coord
+ * frame after the child-coord frame advanced it); its freshness is the child registry's own per-child key.
+ * `"unlinked"` is returned when the unlink fired but the sibling-adopt did not (a parent-only node).
  *
  * - **Rate limit** (`gate.rateLimiter`) keys on `(from, topicId)`; an over-rate peer is dropped before the
  *   coord lookup and the verify, so a peer cannot amplify junk into verify/network work.
@@ -2337,36 +2468,62 @@ export async function handleInboundNotice(
 		return "rate-limited";
 	}
 
+	// --- Sibling-adopt path: apply to the cohort that produced the notice (its signed `cohortCoord`). ---
 	// Route by the notice's signed `cohortCoord` — the exact served coord the deciding cohort sits at. A node
 	// serving several sibling cohorts for one `(topic, tier)` (possible at `d ≥ 1`) thus applies the notice to
 	// the cohort that produced it, and `verifyAndApplyNotice` verifies against that same coord's cert. The coord
 	// is covered by the threshold signature, so it cannot be rewritten to hijack a sibling. A coord this node
-	// does not serve → dropped (e.g. a demotion fanned to a parent-only node — see `noticeBroadcastCoords`).
+	// does not serve → `dropped` here (e.g. a demotion fanned to a parent-only node — the parent-unlink path
+	// below still runs).
 	const target = registry.findByCoord(b64urlToBytes(inbound.notice.cohortCoord));
+	let siblingOutcome: InboundNoticeResult;
 	if (target === undefined) {
-		log("promote: dropped %s notice for topic %s tier %d (no engine at coord %s)", inbound.kind, inbound.notice.topicId, tier, inbound.notice.cohortCoord);
-		return "dropped";
-	}
-
-	// Freshness / replay gate: drop an at-or-below-high-water notice before the expensive verify. Keyed by the
-	// served coord (which uniquely identifies the cohort) so two sibling cohorts on one node do not share a
-	// high-water — an applied notice for cohort A must not stale-drop a legitimate cohort-B notice. `tier` is
-	// kept in the key only for readability.
-	const waterKey = `${inbound.notice.cohortCoord}|${tier}`;
-	const water = gate.highWater.get(waterKey);
-	if (water !== undefined && inbound.notice.effectiveAt <= water) {
-		log("promote: stale %s notice for topic %s tier %d (effectiveAt %d <= high-water %d)", inbound.kind, inbound.notice.topicId, tier, inbound.notice.effectiveAt, water);
-		return "stale";
-	}
-
-	const outcome = await verifyAndApplyNotice(inbound, target, verifier, now);
-	if (outcome === "applied") {
-		// Advance the high-water only on a *verified-and-applied* notice, so a forged frame cannot poison it.
-		gate.highWater.set(waterKey, inbound.notice.effectiveAt);
+		siblingOutcome = "dropped";
 	} else {
-		log("promote: %s %s notice for topic %s tier %d", outcome, inbound.kind, inbound.notice.topicId, tier);
+		// Freshness / replay gate: drop an at-or-below-high-water notice before the expensive verify. Keyed by the
+		// served coord (which uniquely identifies the cohort) so two sibling cohorts on one node do not share a
+		// high-water — an applied notice for cohort A must not stale-drop a legitimate cohort-B notice. `tier` is
+		// kept in the key only for readability.
+		const waterKey = `${inbound.notice.cohortCoord}|${tier}`;
+		const water = gate.highWater.get(waterKey);
+		if (water !== undefined && inbound.notice.effectiveAt <= water) {
+			log("promote: stale %s notice for topic %s tier %d (effectiveAt %d <= high-water %d)", inbound.kind, inbound.notice.topicId, tier, inbound.notice.effectiveAt, water);
+			siblingOutcome = "stale";
+		} else {
+			siblingOutcome = await verifyAndApplyNotice(inbound, target, verifier, now);
+			if (siblingOutcome === "applied") {
+				// Advance the high-water only on a *verified-and-applied* notice, so a forged frame cannot poison it.
+				gate.highWater.set(waterKey, inbound.notice.effectiveAt);
+			} else {
+				log("promote: %s %s notice for topic %s tier %d", siblingOutcome, inbound.kind, inbound.notice.topicId, tier);
+			}
+		}
 	}
-	return outcome;
+
+	if (inbound.kind !== "demotion") {
+		return siblingOutcome;
+	}
+
+	// --- Parent-unlink path (demotion only): additionally release the demoting child at its parent cohort. ---
+	// A demotion is fanned to BOTH the child coord (sibling-adopt, above) and the parent coord (this unlink),
+	// arriving as two independent frames. This path is deliberately OUTSIDE the sibling-adopt high-water: that
+	// water is keyed by the child coord and advanced only on a sibling-adopt apply, so — on a node serving both
+	// coords — the child-coord frame would advance the water and stale-drop the parent-coord frame before it
+	// could unrecord. The child registry's own per-`(topic, childCoord)` freshness orders the unlink instead, so
+	// a replay is an idempotent no-op. The verify is against the child cohort cert (same as the sibling-adopt),
+	// so a forged demotion cannot unrecord.
+	const unlink = await applyDemotionUnlinkAtParent(inbound.notice, registry, verifier, now);
+	if (siblingOutcome === "applied") {
+		return "applied"; // a node serving both coords: the sibling-adopt is the primary reported outcome
+	}
+	if (unlink === "unlinked") {
+		return "unlinked";
+	}
+	if (unlink === "untrusted") {
+		log("promote: untrusted demotion notice at parent for topic %s tier %d", inbound.notice.topicId, tier);
+		return "untrusted";
+	}
+	return siblingOutcome;
 }
 
 /**

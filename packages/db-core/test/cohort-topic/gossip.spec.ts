@@ -4,10 +4,10 @@ import { createCohortGossipBus } from '../../src/cohort-topic/gossip/bus.js';
 import { toGossipRecord } from '../../src/cohort-topic/gossip/records.js';
 import { createRegistrationStore } from '../../src/cohort-topic/registration/store.js';
 import { createTopicBudget } from '../../src/cohort-topic/antidos/topic-budget.js';
-import { bytesToB64url } from '../../src/cohort-topic/wire/codec.js';
+import { bytesToB64url, encodeCohortMessage } from '../../src/cohort-topic/wire/codec.js';
 import type { ICohortGossipTransport, PeerRef, RingCoord } from '../../src/cohort-topic/ports.js';
 import type { RegistrationStore, RegistrationRecord } from '../../src/cohort-topic/registration/types.js';
-import type { CohortGossipV1 } from '../../src/cohort-topic/wire/types.js';
+import type { ChildLinkRefV1, CohortGossipV1 } from '../../src/cohort-topic/wire/types.js';
 
 function bytes(label: string, len = 32): Uint8Array {
 	return sha256(new TextEncoder().encode(label)).slice(0, len);
@@ -85,6 +85,38 @@ describe('cohort-topic / gossip bus', () => {
 			expect(got, 'record visible after one round').to.not.be.undefined;
 			expect(got!.lastPing).to.equal(5_000);
 		}
+	});
+
+	it('fires onChildDeltas for our-coord child links/unlinks — regardless of epoch — and skips other coords / empty deltas', () => {
+		const transport = new FanoutTransport();
+		const captured: Array<{ links: ChildLinkRefV1[]; unlinks: ChildLinkRefV1[] }> = [];
+		createCohortGossipBus({
+			transport, store: createRegistrationStore(), coord: COORD, localEpoch: () => EPOCH, now: () => 2_000,
+			onChildDeltas: (links, unlinks): void => { captured.push({ links: [...links], unlinks: [...unlinks] }); },
+		});
+		const link: ChildLinkRefV1 = { topicId: bytesToB64url(bytes('topic-A')), childCohortCoord: bytesToB64url(bytes('child-1')), effectiveAt: 5_000 };
+		const unlink: ChildLinkRefV1 = { topicId: bytesToB64url(bytes('topic-A')), childCohortCoord: bytesToB64url(bytes('child-2')), effectiveAt: 6_000 };
+
+		// A frame for OUR coord with child deltas → the callback fires with both arrays.
+		transport.broadcast(COORD, encodeCohortMessage(gossip('member-B', EPOCH, { childLinks: [link], childUnlinks: [unlink] })));
+		expect(captured.length, 'fired once for our coord').to.equal(1);
+		expect(captured[0]!.links).to.deep.equal([link]);
+		expect(captured[0]!.unlinks).to.deep.equal([unlink]);
+
+		// A frame under a DIFFERENT epoch (a parent rotation) STILL merges the child deltas — the child set is
+		// keyed by child coord, not the parent epoch, so it is not epoch-gated the way record deltas are.
+		transport.broadcast(COORD, encodeCohortMessage(gossip('member-B', EPOCH2, { childLinks: [link] })));
+		expect(captured.length, 'child deltas merge even under an epoch drift').to.equal(2);
+
+		// A frame with no child deltas → the callback does not fire.
+		transport.broadcast(COORD, encodeCohortMessage(gossip('member-B', EPOCH, { records: [] })));
+		expect(captured.length, 'no child deltas → callback not fired').to.equal(2);
+
+		// A frame naming a DIFFERENT coord → dropped by the coord-routing check before any merge.
+		const foreign = gossip('member-B', EPOCH, { childLinks: [link] });
+		foreign.coord = bytesToB64url(bytes('other-coord'));
+		transport.broadcast(COORD, encodeCohortMessage(foreign));
+		expect(captured.length, 'a foreign-coord frame does not fire our callback').to.equal(2);
 	});
 
 	it('merges record deltas last-writer-wins by lastPing', () => {

@@ -232,11 +232,21 @@ describe('cohort-topic: scale lifecycle (mock-tier e2e, N=48 ring / k=16 cohort)
 			// assert the depth against. The depth law itself is validated by the simulator (promotion-convergence.ts).
 		});
 
-		it.skip('tier-(d>0) demotion threshold-signs a DemotionNoticeV1 to the parent cohort [DOC EXPECTATION NOT YET IMPLEMENTED at e2e — parent child-link recording parked: cohort-topic-parent-child-link]', () => {
-			// demotionTick at a tier-d>0 engine can threshold-sign + broadcast a DemotionNoticeV1, but the
-			// parent-side childCohortCount recording (the observable effect, "drop me from your children") is
-			// parked, so there is no end-to-end parent state to assert against. Promotion/demotion hysteresis
-			// and the no-children/T_demote gate are covered at unit level by db-core promotion.spec.ts.
+		it.skip('tier-(d>0) demotion threshold-signs a DemotionNoticeV1 to the parent cohort [e2e deferred — live multi-tier mesh instantiation not driveable in-agent]', () => {
+			// The mechanism this asserted for is now IMPLEMENTED and unit-covered: the parent records a child
+			// (cohort-topic-parent-child-link), the child set converges across the parent cohort via gossip, and a
+			// demotion notice fanned to the parent coord unrecords the child so `childCohortCount` falls
+			// (cohort-topic-child-link-replicate-unlink). Those are exercised directly by:
+			//   • gossip-cadence.spec.ts — two real parent members converge on a child UNION, and an unlink drops
+			//     every member's childCohortCount back to 0 (real registry + real gossip bus);
+			//   • promote-notice.spec.ts — a demotion notice fanned to the parent coord verifies + unrecords the
+			//     child (parent-only, dual-role, forged-rejected, high-water-independent).
+			// What stays deferred is only the FULL live path: driving real promotion past cap_promote so a real
+			// tier-1 child instantiates and completes a live-key child-link RPC over the mock mesh, then demotes to
+			// release itself. That link RPC frequently stays `awaiting_parent` in the mock mesh (the routed parent
+			// member cannot yet resolve the child cohort cert — see cohort-topic-parent-child-link), so it is not a
+			// reliable in-agent e2e; it belongs to the real-libp2p tier / CI. Promotion/demotion hysteresis and the
+			// no-children/T_demote gate are covered at unit level by db-core promotion.spec.ts.
 		});
 	});
 

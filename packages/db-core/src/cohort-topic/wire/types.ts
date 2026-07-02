@@ -284,6 +284,26 @@ export interface GossipRecordRefV1 {
 	participantId: string;
 }
 
+/**
+ * A child-cohort link/unlink advertised in cohort gossip, for cross-member convergence of the child set.
+ *
+ * FRET routes a {@link ChildLinkV1} to a **single** parent member, so only that member's child registry
+ * records the child; siblings would read `childCohortCount == 0`. Gossiping the child **set** (a converged
+ * union) closes that gap: a `childLinks` ref replicates a recorded child to every parent member, and a
+ * `childUnlinks` ref replicates a released (demoted) child. Merge is **last-writer-wins by
+ * {@link effectiveAt}** per `(topicId, childCohortCoord)` — a link and a later unlink converge regardless of
+ * arrival order, and re-delivery is idempotent. The child set is keyed by child coord, not the parent's
+ * epoch, so a parent membership rotation never drops it.
+ */
+export interface ChildLinkRefV1 {
+	/** Topic id, 32 bytes, base64url. */
+	topicId: string;
+	/** The child cohort's served coord, 32 bytes, base64url. */
+	childCohortCoord: string;
+	/** Unix ms — the link/unlink effectiveAt; last-writer-wins per `(topicId, childCohortCoord)`. */
+	effectiveAt: number;
+}
+
 /** Intra-cohort gossip: willingness vector, load barometer, exact per-topic summaries, record deltas. */
 export interface CohortGossipV1 {
 	v: 1;
@@ -319,6 +339,19 @@ export interface CohortGossipV1 {
 	records?: GossipRecordV1[];
 	/** Registrations this member evicted (stale), so all members converge on the active set. */
 	evicted?: GossipRecordRefV1[];
+	/**
+	 * Child cohorts this member freshly recorded (links), replicated so every parent member converges on the
+	 * same child set. Absent when this gossip carries no child-link changes. Merge is last-writer-wins by
+	 * {@link ChildLinkRefV1.effectiveAt} per `(topicId, childCohortCoord)`; a link sets the child linked.
+	 */
+	childLinks?: ChildLinkRefV1[];
+	/**
+	 * Child cohorts this member released (a demoted child unrecorded), replicated so every parent member drops
+	 * it and can shrink in turn. Absent when this gossip carries no child-unlink changes. Same last-writer-wins
+	 * merge as {@link childLinks}; an unlink sets the child unlinked. A link@t1 then unlink@t2 (t2 > t1)
+	 * converges to unlinked regardless of arrival order.
+	 */
+	childUnlinks?: ChildLinkRefV1[];
 	timestamp: number;
 	signature: string;
 }

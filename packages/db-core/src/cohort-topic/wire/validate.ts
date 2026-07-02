@@ -10,6 +10,7 @@
 
 import { b64urlToBytes } from "./codec.js";
 import type {
+	ChildLinkRefV1,
 	ChildLinkReplyV1,
 	ChildLinkV1,
 	CohortGossipV1,
@@ -434,6 +435,16 @@ function validateGossipRecordRefV1(value: unknown): GossipRecordRefV1 {
 	};
 }
 
+function validateChildLinkRefV1(value: unknown): ChildLinkRefV1 {
+	const what = "ChildLinkRefV1";
+	const obj = asObject(value, what);
+	return {
+		topicId: b64urlField(reqString(obj, "topicId", what), "topicId", what),
+		childCohortCoord: b64urlField(reqString(obj, "childCohortCoord", what), "childCohortCoord", what),
+		effectiveAt: reqFiniteNumber(obj, "effectiveAt", what),
+	};
+}
+
 /** `willingnessBits` carries exactly 4 bits (T0..T3) as a single hex nibble. */
 const WILLINGNESS_RE = /^[0-9a-fA-F]$/;
 
@@ -488,6 +499,20 @@ export function validateCohortGossipV1(value: unknown): CohortGossipV1 {
 			fail(`${what}: field "evicted" must be an array when present`);
 		}
 		out.evicted = evicted.map(validateGossipRecordRefV1);
+	}
+	const childLinks = obj["childLinks"];
+	if (childLinks !== undefined) {
+		if (!Array.isArray(childLinks)) {
+			fail(`${what}: field "childLinks" must be an array when present`);
+		}
+		out.childLinks = childLinks.map(validateChildLinkRefV1);
+	}
+	const childUnlinks = obj["childUnlinks"];
+	if (childUnlinks !== undefined) {
+		if (!Array.isArray(childUnlinks)) {
+			fail(`${what}: field "childUnlinks" must be an array when present`);
+		}
+		out.childUnlinks = childUnlinks.map(validateChildLinkRefV1);
 	}
 	return out;
 }

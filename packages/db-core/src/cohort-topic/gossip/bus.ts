@@ -27,7 +27,7 @@ import { bytesEqual, bytesKey } from "../registration/bytes.js";
 import type { RegistrationStore } from "../registration/types.js";
 import type { ICohortGossipTransport, PeerRef, RingCoord } from "../ports.js";
 import { b64urlToBytes, decodeCohortGossipV1, encodeCohortMessage } from "../wire/codec.js";
-import type { CohortGossipV1 } from "../wire/types.js";
+import type { ChildLinkRefV1, CohortGossipV1 } from "../wire/types.js";
 import { fromGossipRecord } from "./records.js";
 import { createCohortView, type CohortView, type MutableCohortView } from "./view.js";
 
@@ -70,6 +70,17 @@ export interface CohortGossipBusDeps {
 	 * callback so this gossip/replication module carries no anti-DoS dependency. Absent → skipped.
 	 */
 	onRecordsEvicted?: (topicIds: readonly Uint8Array[]) => void;
+	/**
+	 * Optional hook fired for the child-cohort link/unlink deltas on an inbound frame (db-p2p merges them into
+	 * this coord's child registry, last-writer-wins by `effectiveAt`), so every parent member converges on the
+	 * same child set — not only the FRET-routed member that recorded the child. Fired for **our-coord** frames
+	 * regardless of epoch match: the child set is keyed by child coord, not the parent's epoch, so a parent
+	 * membership rotation (an epoch drift) must not skip the merge (unlike record deltas, whose slot
+	 * assignments are epoch-scoped). The merge is a direct registry write — it does **not** re-enqueue the
+	 * delta, so a received link/unlink is not re-gossiped (one broadcast reaches the whole cohort). Kept as a
+	 * decoupled callback so this module carries no child-registry dependency. Absent → skipped.
+	 */
+	onChildDeltas?: (childLinks: readonly ChildLinkRefV1[], childUnlinks: readonly ChildLinkRefV1[]) => void;
 }
 
 /** Intra-cohort gossip bus (merge logic over an injected transport). */
@@ -133,6 +144,14 @@ class TransportCohortGossipBus implements CohortGossipBus {
 		this.mergeView(g, inboundEpoch);
 		if (epochMatches) {
 			this.mergeRecords(g, now);
+		}
+		// Child link/unlink deltas merge regardless of epoch match: the child set is keyed by child coord, not
+		// the parent's epoch, so a rotation (epoch drift) must not drop it. Freshness (last-writer-wins by
+		// effectiveAt) lives in the registry the callback writes.
+		const childLinks = g.childLinks ?? [];
+		const childUnlinks = g.childUnlinks ?? [];
+		if (this.deps.onChildDeltas !== undefined && (childLinks.length > 0 || childUnlinks.length > 0)) {
+			this.deps.onChildDeltas(childLinks, childUnlinks);
 		}
 	}
 

@@ -16,6 +16,7 @@ import {
 	registerSigningPayload,
 	renewSigningPayload,
 	cohortGossipSigningPayload,
+	type ChildLinkRefV1,
 	type CohortGossipV1,
 	type RegisterV1,
 	type RenewV1,
@@ -221,6 +222,42 @@ describe('cohort-topic: gossip-cadence driver helpers', () => {
 		expect(d.evicted.length, 'eviction queued').to.equal(1);
 	});
 
+	it('pending deltas: child link/unlink queue (last-writer-wins by effectiveAt); drain partitions link vs unlink', () => {
+		const pending = createPendingDeltas();
+		const c1 = Uint8Array.from({ length: 32 }, (_v, i) => (i + 1) & 0xff);
+		const c2 = Uint8Array.from({ length: 32 }, (_v, i) => (i + 2) & 0xff);
+		pending.childLink(TOPIC, c1, 1_000);
+		pending.childLink(TOPIC, c1, 500); // an older link for the same child is ignored (last-writer-wins)
+		pending.childLink(TOPIC, c2, 1_000);
+		pending.childUnlink(TOPIC, c2, 2_000); // a newer unlink for c2 supersedes its queued link (one drained delta)
+		expect(pending.isEmpty()).to.equal(false);
+
+		const d = pending.drain();
+		expect(d.childLinks.length, 'c1 stays a link').to.equal(1);
+		expect(d.childLinks[0]!.childCohortCoord).to.equal(bytesToB64url(c1));
+		expect(d.childLinks[0]!.effectiveAt, 'kept the newer link effectiveAt').to.equal(1_000);
+		expect(d.childUnlinks.length, 'c2 collapsed to its newer unlink').to.equal(1);
+		expect(d.childUnlinks[0]!.childCohortCoord).to.equal(bytesToB64url(c2));
+		expect(pending.isEmpty(), 'drain clears the child deltas too').to.equal(true);
+	});
+
+	it('buildCohortGossip packs child link/unlink deltas and treats them as non-idle', () => {
+		const barometer = createLoadBarometer();
+		const base = {
+			fromMember: 'self', coord: bytesToB64url(TOPIC), cohortEpoch: bytesToB64url(TOPIC2), treeTier: 0,
+			profile: coreProfile(), barometer, windowSeconds: 60, timestamp: 9_000,
+			heartbeat: false, topicSummaries: [], records: [], evicted: [],
+		};
+		const c1: ChildLinkRefV1 = { topicId: bytesToB64url(TOPIC), childCohortCoord: bytesToB64url(TOPIC2), effectiveAt: 1_000 };
+		const linked = buildCohortGossip({ ...base, childLinks: [c1], childUnlinks: [] });
+		expect(linked, 'a child-link delta makes an otherwise-idle engine non-idle').to.not.equal(undefined);
+		expect(linked!.childLinks, 'the child link is packed').to.deep.equal([c1]);
+		expect(linked!.childUnlinks, 'no unlink field when empty').to.equal(undefined);
+		const unlinked = buildCohortGossip({ ...base, childLinks: [], childUnlinks: [c1] });
+		expect(unlinked!.childUnlinks, 'the child unlink is packed').to.deep.equal([c1]);
+		expect(unlinked!.childLinks, 'no link field when empty').to.equal(undefined);
+	});
+
 	it('buildCohortGossip skips an idle non-heartbeat engine, emits a willingness-only heartbeat when idle+willing, and packs deltas otherwise', () => {
 		const barometer = createLoadBarometer();
 		const base = {
@@ -231,6 +268,8 @@ describe('cohort-topic: gossip-cadence driver helpers', () => {
 			profile: coreProfile(),
 			barometer,
 			windowSeconds: 60,
+			childLinks: [],
+			childUnlinks: [],
 			timestamp: 9_000,
 		};
 		expect(buildCohortGossip({ ...base, heartbeat: false, topicSummaries: [], records: [], evicted: [] }), 'idle, no heartbeat → no frame').to.equal(undefined);
@@ -460,6 +499,118 @@ describe('cohort-topic: two-node replication via a gossip round', () => {
 		deliverGossip(b.node, encodeCohortMessage(gEvict!), a.member.peerId);
 		await delay(30);
 		expect(eB.holds(TOPIC, participant.bytes), 'B converged on the eviction').to.equal(false);
+
+		await a.host.stop();
+		await b.host.stop();
+	});
+
+	// --- child-set replication + unlink convergence (cohort-topic-child-link-replicate-unlink) ---
+	const childCoord = (seed: number): Uint8Array => Uint8Array.from({ length: 32 }, (_v, i) => (i * seed + seed) & 0xff);
+
+	it('the sharded child set converges to a UNION across the parent cohort (two children, two routed members)', async () => {
+		// Two children route (via FRET) to two DIFFERENT parent members — the single-member recording. Each
+		// member records only its own child locally; after exchanging one gossip round each way, BOTH members
+		// hold BOTH children. count == 2 everywhere — the bug a naive max-across-siblings (which would read 1)
+		// would hide.
+		const { a, b, coord0 } = await twoNodeCohort();
+		const eA = a.host.registry.forCoord(coord0, 0 as Tier, a.member.bytes);
+		const eB = b.host.registry.forCoord(coord0, 0 as Tier, b.member.bytes);
+		const c1 = childCoord(7);
+		const c2 = childCoord(13);
+
+		eA.recordChild(TOPIC, c1, 1_000); // child C1 routed to parent member A
+		eB.recordChild(TOPIC, c2, 1_000); // child C2 routed to parent member B
+		expect(eA.childCohortCount(TOPIC), 'A holds only its own shard before gossip').to.equal(1);
+		expect(eB.childCohortCount(TOPIC), 'B holds only its own shard before gossip').to.equal(1);
+
+		const gA = await eA.gossipRound(1_500);
+		const gB = await eB.gossipRound(1_500);
+		expect(gA?.childLinks?.length, 'A drained its child-link delta into the frame').to.equal(1);
+		expect(gB?.childLinks?.length, 'B drained its child-link delta into the frame').to.equal(1);
+
+		deliverGossip(b.node, encodeCohortMessage(gA!), a.member.peerId);
+		deliverGossip(a.node, encodeCohortMessage(gB!), b.member.peerId);
+		await delay(30);
+
+		expect(eA.childCohortCount(TOPIC), 'A converged on the union {C1, C2}').to.equal(2);
+		expect(eB.childCohortCount(TOPIC), 'B converged on the union {C1, C2}').to.equal(2);
+
+		// A received delta is a direct registry write, NOT re-gossiped — A's next round carries no child deltas.
+		const gA2 = await eA.gossipRound(2_000);
+		expect(gA2?.childLinks ?? [], 'a merged child link is not re-gossiped').to.deep.equal([]);
+
+		await a.host.stop();
+		await b.host.stop();
+	});
+
+	it('a child unlink converges across the parent cohort, dropping every member’s childCohortCount', async () => {
+		const { a, b, coord0 } = await twoNodeCohort();
+		const eA = a.host.registry.forCoord(coord0, 0 as Tier, a.member.bytes);
+		const eB = b.host.registry.forCoord(coord0, 0 as Tier, b.member.bytes);
+		const c1 = childCoord(7);
+
+		// Link on A, converge to B.
+		eA.recordChild(TOPIC, c1, 1_000);
+		deliverGossip(b.node, encodeCohortMessage((await eA.gossipRound(1_500))!), a.member.peerId);
+		await delay(30);
+		expect(eB.childCohortCount(TOPIC), 'B learned the child via replication').to.equal(1);
+
+		// The child demotes → A unrecords it (effectiveAt 2_000 > 1_000) → gossips the unlink → B converges to 0.
+		eA.unrecordChild(TOPIC, c1, 2_000);
+		expect(eA.childCohortCount(TOPIC), 'A released the child').to.equal(0);
+		const gU = await eA.gossipRound(2_500);
+		expect(gU?.childUnlinks?.length, 'A drained the child-unlink delta').to.equal(1);
+		deliverGossip(b.node, encodeCohortMessage(gU!), a.member.peerId);
+		await delay(30);
+		// count == 0 cohort-wide is the demotion-gate input (`promotion.ts` blocks demotion while count > 0);
+		// the gate firing on a real tier-1 parent is exercised by the multi-tier lifecycle spec.
+		expect(eB.childCohortCount(TOPIC), 'B converged on the release — the demotion-gate input is 0').to.equal(0);
+
+		await a.host.stop();
+		await b.host.stop();
+	});
+
+	it('child registry link/unlink converge by last-writer-wins in either order; a stale link is a no-op; a never-seen unlink tombstones', async () => {
+		const { a, coord0 } = await twoNodeCohort();
+		const e = a.host.registry.forCoord(coord0, 0 as Tier, a.member.bytes);
+		const c1 = childCoord(7);
+		const c2 = childCoord(13);
+
+		// Order 1 — link@1000 then unlink@2000 → released.
+		e.recordChild(TOPIC, c1, 1_000);
+		e.unrecordChild(TOPIC, c1, 2_000);
+		expect(e.childCohortCount(TOPIC), 'link, then a newer unlink → released').to.equal(0);
+		// A stale link below the 2_000 high-water cannot resurrect it.
+		e.recordChild(TOPIC, c1, 1_500);
+		expect(e.childCohortCount(TOPIC), 'a stale link below the high-water is a no-op').to.equal(0);
+
+		// Order 2 (reversed arrival) — unlink@2000 lands FIRST (a tombstone), then the older link@1000.
+		e.unrecordChild(TOPIC, c2, 2_000);
+		expect(e.childCohortCount(TOPIC), 'a never-seen unlink writes a tombstone, never a negative count').to.equal(0);
+		e.recordChild(TOPIC, c2, 1_000);
+		expect(e.childCohortCount(TOPIC), 'the older link is dropped — the tombstone wins').to.equal(0);
+		// A link strictly newer than the tombstone genuinely re-links.
+		e.recordChild(TOPIC, c2, 3_000);
+		expect(e.childCohortCount(TOPIC), 'a link newer than the tombstone re-links').to.equal(1);
+
+		await a.host.stop();
+	});
+
+	it('child deltas converge even under a parent-epoch drift (the child set is keyed by child coord, not epoch)', async () => {
+		// A frame carrying a child link merges its child delta even when its cohortEpoch differs from the
+		// receiver's (a rotation): record deltas are epoch-gated, the child set is not.
+		const { a, b, coord0 } = await twoNodeCohort();
+		const eA = a.host.registry.forCoord(coord0, 0 as Tier, a.member.bytes);
+		const eB = b.host.registry.forCoord(coord0, 0 as Tier, b.member.bytes);
+		const c1 = childCoord(7);
+		// A hand-built frame from B (a real cohort member so the auth gate passes) under a DIFFERENT epoch.
+		const foreignEpoch = Uint8Array.from({ length: 32 }, (_v, i) => (i * 31 + 5) & 0xff);
+		const link: ChildLinkRefV1 = { topicId: bytesToB64url(TOPIC), childCohortCoord: bytesToB64url(c1), effectiveAt: 1_000 };
+		const frame = await signedGossip(b.member, coord0, foreignEpoch, { childLinks: [link] });
+		deliverGossip(a.node, frame, b.member.peerId);
+		await delay(30);
+		expect(eA.childCohortCount(TOPIC), 'the child link merged despite the epoch drift').to.equal(1);
+		void eB; // (B is only constructed to mirror the cohort; the assertion is on A)
 
 		await a.host.stop();
 		await b.host.stop();

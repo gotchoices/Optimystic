@@ -390,7 +390,7 @@ describe('cohort-topic: live-tier end-to-end milestone', () => {
 			// Headline: the forged notice is dropped — the anchor `"rejected"`s the cert, so verifyMessage is
 			// `"untrusted"` and the promotion is never applied.
 			let applied = false;
-			const target: NoticeApplyTarget = { servedCoord: coord, applyPromotionNotice: () => { applied = true; }, applyDemotionNotice: () => undefined };
+			const target: NoticeApplyTarget = { servedCoord: coord, applyPromotionNotice: () => { applied = true; }, applyDemotionNotice: () => undefined, unrecordChild: () => undefined };
 			const outcome = await verifyAndApplyNotice({ kind: 'promotion', notice }, target, anchoredVerifier, now);
 			expect(outcome, 'the FRET anchor rejects the forged cert → the promote notice is untrusted').to.equal('untrusted');
 			expect(applied, 'the forged promotion was not applied to local state').to.equal(false);
@@ -400,7 +400,7 @@ describe('cohort-topic: live-tier end-to-end milestone', () => {
 			// anchor's doing, not a generic signature failure.
 			const tofuVerifier = createMembershipVerifier({ signer, router, minSigs: MIN_SIGS });
 			let tofuApplied = false;
-			const tofuTarget: NoticeApplyTarget = { servedCoord: coord, applyPromotionNotice: () => { tofuApplied = true; }, applyDemotionNotice: () => undefined };
+			const tofuTarget: NoticeApplyTarget = { servedCoord: coord, applyPromotionNotice: () => { tofuApplied = true; }, applyDemotionNotice: () => undefined, unrecordChild: () => undefined };
 			const tofuOutcome = await verifyAndApplyNotice({ kind: 'promotion', notice }, tofuTarget, tofuVerifier, now);
 			expect(tofuOutcome, 'without the FRET anchor the self-consistent forgery is TOFU-accepted (no regression baseline)').to.equal('applied');
 			expect(tofuApplied, 'the control verifier applied the forged promotion — the gap the anchor closes').to.equal(true);

@@ -15,8 +15,10 @@ import {
 	decodeCohortGossipV1,
 	decodeMembershipCertV1,
 	validateChildLinkV1,
+	validateCohortGossipV1,
 	registerSigningPayload,
 	renewSigningPayload,
+	cohortGossipSigningPayload,
 	CohortWireError,
 	DEFAULT_MAX_MESSAGE_BYTES,
 } from '../../src/cohort-topic/wire/index.js';
@@ -28,6 +30,7 @@ import type {
 	RenewReplyV1,
 	ChildLinkV1,
 	ChildLinkReplyV1,
+	ChildLinkRefV1,
 	PromotionNoticeV1,
 	DemotionNoticeV1,
 	CohortGossipV1,
@@ -348,6 +351,35 @@ describe('cohort-topic wire', () => {
 			const bad = { ...sampleGossip(), treeTier: 1.5 };
 			const frame = encodeCohortMessage(bad);
 			expect(() => decodeCohortGossipV1(frame)).to.throw(CohortWireError, /treeTier/);
+		});
+
+		it('round-trips childLinks/childUnlinks and validates the ChildLinkRefV1 shape', () => {
+			const link: ChildLinkRefV1 = { topicId: b64(32, 91), childCohortCoord: b64(32, 92), effectiveAt: 1_700_000_010_000 };
+			const unlink: ChildLinkRefV1 = { topicId: b64(32, 91), childCohortCoord: b64(32, 93), effectiveAt: 1_700_000_020_000 };
+			const msg: CohortGossipV1 = { ...sampleGossip(), childLinks: [link], childUnlinks: [unlink] };
+			const decoded = decodeCohortGossipV1(encodeCohortMessage(msg));
+			expect(decoded.childLinks, 'childLinks survive the round-trip').to.deep.equal([link]);
+			expect(decoded.childUnlinks, 'childUnlinks survive the round-trip').to.deep.equal([unlink]);
+
+			const badCoord = { ...sampleGossip(), childLinks: [{ ...link, childCohortCoord: 'not base64url!!' }] };
+			expect(() => decodeCohortGossipV1(encodeCohortMessage(badCoord)), 'a non-base64url child coord is rejected').to.throw(CohortWireError, /childCohortCoord/);
+
+			const badArray = { ...sampleGossip(), childUnlinks: 'nope' as unknown as ChildLinkRefV1[] };
+			expect(() => validateCohortGossipV1(badArray), 'childUnlinks must be an array when present').to.throw(CohortWireError, /childUnlinks/);
+		});
+
+		it('the gossip signing payload covers childLinks and childUnlinks (a MITM cannot strip or inject one)', () => {
+			const base = sampleGossip();
+			const link: ChildLinkRefV1 = { topicId: b64(32, 91), childCohortCoord: b64(32, 92), effectiveAt: 42 };
+			const withLink = cohortGossipSigningPayload({ ...base, childLinks: [link] });
+			const withUnlink = cohortGossipSigningPayload({ ...base, childUnlinks: [link] });
+			const withNone = cohortGossipSigningPayload(base);
+			// A link vs no-link, and a link vs the same ref as an unlink, must all produce distinct signed images.
+			expect(bytesToB64url(withLink)).to.not.equal(bytesToB64url(withNone));
+			expect(bytesToB64url(withUnlink)).to.not.equal(bytesToB64url(withNone));
+			expect(bytesToB64url(withLink)).to.not.equal(bytesToB64url(withUnlink));
+			// Absent vs present-empty normalize identically (an empty delta cannot disagree across the wire).
+			expect(bytesToB64url(cohortGossipSigningPayload({ ...base, childLinks: [], childUnlinks: [] }))).to.equal(bytesToB64url(withNone));
 		});
 	});
 

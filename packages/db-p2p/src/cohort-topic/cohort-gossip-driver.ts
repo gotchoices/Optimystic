@@ -16,6 +16,7 @@ import {
 	toGossipRecord,
 	willingnessBitsHex,
 	selfWillingnessBits,
+	type ChildLinkRefV1,
 	type CohortGossipV1,
 	type CohortTopicSummary,
 	type GossipRecordRefV1,
@@ -60,18 +61,46 @@ export interface PendingDeltas {
 	touch(rec: RegistrationRecord): void;
 	/** Queue an eviction ref and drop any pending record for the same key (a stale record can't also re-advertise). */
 	evicted(rec: RegistrationRecord): void;
+	/**
+	 * Queue a child-cohort **link** for replication (keyed by `(topicId, childCohortCoord)`; last write wins on
+	 * `effectiveAt`). Enqueued by the parent engine only when the local child registry actually changed, so a
+	 * stale/no-op record is not re-gossiped. A link and a later unlink for the same child in one round collapse
+	 * to whichever carries the newer `effectiveAt`.
+	 */
+	childLink(topicId: Uint8Array, childCohortCoord: Uint8Array, effectiveAt: number): void;
+	/** Queue a child-cohort **unlink** (a released/demoted child) for replication; same key + last-writer-wins as {@link childLink}. */
+	childUnlink(topicId: Uint8Array, childCohortCoord: Uint8Array, effectiveAt: number): void;
 	/** True iff nothing is queued. */
 	isEmpty(): boolean;
 	/** Drain the queue into wire-shaped deltas, clearing it. */
-	drain(): { records: GossipRecordV1[]; evicted: GossipRecordRefV1[] };
+	drain(): { records: GossipRecordV1[]; evicted: GossipRecordRefV1[]; childLinks: ChildLinkRefV1[]; childUnlinks: ChildLinkRefV1[] };
+}
+
+/** A queued child link/unlink: the wire ref plus whether it is a link (`true`) or an unlink (`false`). */
+interface PendingChildDelta {
+	ref: ChildLinkRefV1;
+	linked: boolean;
 }
 
 /** Build an empty {@link PendingDeltas} queue. */
 export function createPendingDeltas(): PendingDeltas {
 	const records = new Map<string, RegistrationRecord>();
 	const evicted = new Map<string, GossipRecordRefV1>();
+	const childDeltas = new Map<string, PendingChildDelta>();
 	const keyOf = (topicId: Uint8Array, participantId: Uint8Array): string =>
 		`${bytesToB64url(topicId)}|${bytesToB64url(participantId)}`;
+	// A child delta and its later opposite (link→unlink) share one key so the round drains only the newest.
+	const childKeyOf = (topicId: Uint8Array, childCohortCoord: Uint8Array): string =>
+		`${bytesToB64url(topicId)}|${bytesToB64url(childCohortCoord)}`;
+	const queueChild = (topicId: Uint8Array, childCohortCoord: Uint8Array, effectiveAt: number, linked: boolean): void => {
+		const key = childKeyOf(topicId, childCohortCoord);
+		const held = childDeltas.get(key);
+		// Last-writer-wins on effectiveAt: never let an older link/unlink shadow a newer one queued the same round.
+		if (held !== undefined && effectiveAt < held.ref.effectiveAt) {
+			return;
+		}
+		childDeltas.set(key, { ref: { topicId: bytesToB64url(topicId), childCohortCoord: bytesToB64url(childCohortCoord), effectiveAt }, linked });
+	};
 	return {
 		touch(rec: RegistrationRecord): void {
 			const key = keyOf(rec.topicId, rec.participantId);
@@ -87,16 +116,30 @@ export function createPendingDeltas(): PendingDeltas {
 			evicted.set(key, { topicId: bytesToB64url(rec.topicId), participantId: bytesToB64url(rec.participantId) });
 			records.delete(key);
 		},
-		isEmpty(): boolean {
-			return records.size === 0 && evicted.size === 0;
+		childLink(topicId: Uint8Array, childCohortCoord: Uint8Array, effectiveAt: number): void {
+			queueChild(topicId, childCohortCoord, effectiveAt, true);
 		},
-		drain(): { records: GossipRecordV1[]; evicted: GossipRecordRefV1[] } {
+		childUnlink(topicId: Uint8Array, childCohortCoord: Uint8Array, effectiveAt: number): void {
+			queueChild(topicId, childCohortCoord, effectiveAt, false);
+		},
+		isEmpty(): boolean {
+			return records.size === 0 && evicted.size === 0 && childDeltas.size === 0;
+		},
+		drain(): { records: GossipRecordV1[]; evicted: GossipRecordRefV1[]; childLinks: ChildLinkRefV1[]; childUnlinks: ChildLinkRefV1[] } {
+			const childLinks: ChildLinkRefV1[] = [];
+			const childUnlinks: ChildLinkRefV1[] = [];
+			for (const delta of childDeltas.values()) {
+				(delta.linked ? childLinks : childUnlinks).push(delta.ref);
+			}
 			const out = {
 				records: [...records.values()].map(toGossipRecord),
 				evicted: [...evicted.values()],
+				childLinks,
+				childUnlinks,
 			};
 			records.clear();
 			evicted.clear();
+			childDeltas.clear();
 			return out;
 		},
 	};
@@ -132,6 +175,10 @@ export interface GossipFrameInputs {
 	readonly records: GossipRecordV1[];
 	/** Drained eviction refs for this round. */
 	readonly evicted: GossipRecordRefV1[];
+	/** Drained child-cohort link refs for this round (cross-member child-set convergence). */
+	readonly childLinks: ChildLinkRefV1[];
+	/** Drained child-cohort unlink refs for this round (a released/demoted child). */
+	readonly childUnlinks: ChildLinkRefV1[];
 	/** Round timestamp, unix ms. */
 	readonly timestamp: number;
 }
@@ -148,7 +195,8 @@ export interface GossipFrameInputs {
  */
 export function buildCohortGossip(i: GossipFrameInputs): CohortGossipV1 | undefined {
 	const willingness = selfWillingnessBits(i.profile, i.barometer);
-	const idle = i.topicSummaries.length === 0 && i.records.length === 0 && i.evicted.length === 0;
+	const idle = i.topicSummaries.length === 0 && i.records.length === 0 && i.evicted.length === 0
+		&& i.childLinks.length === 0 && i.childUnlinks.length === 0;
 	if (idle && !(i.heartbeat && willingness !== 0)) {
 		return undefined;
 	}
@@ -170,6 +218,12 @@ export function buildCohortGossip(i: GossipFrameInputs): CohortGossipV1 | undefi
 	}
 	if (i.evicted.length > 0) {
 		g.evicted = i.evicted;
+	}
+	if (i.childLinks.length > 0) {
+		g.childLinks = i.childLinks;
+	}
+	if (i.childUnlinks.length > 0) {
+		g.childUnlinks = i.childUnlinks;
 	}
 	return g;
 }

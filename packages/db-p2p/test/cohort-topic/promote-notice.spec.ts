@@ -31,6 +31,7 @@ import { FretMembershipPublishSink } from '../../src/cohort-topic/membership-pub
 import {
 	decodeInboundNotice,
 	verifyAndApplyNotice,
+	applyDemotionUnlinkAtParent,
 	noticeBroadcastCoords,
 	handleInboundNotice,
 	createPromoteGate,
@@ -130,6 +131,9 @@ function remoteTargetAt(coord: RingCoord, minSigs: number): { life: PromotionLif
 		servedCoord: coord,
 		applyPromotionNotice: (n, now): void => life.applyPromotionNotice(n, now),
 		applyDemotionNotice: (n, now): void => life.applyDemotionNotice(n, now),
+		// This lifecycle-only stand-in parents no children; the parent-unlink path (which resolves a target for
+		// the notice's parentCohortCoord) is a no-op here. The child-tracking parent double covers the real unlink.
+		unrecordChild: (): void => undefined,
 	};
 	return { life, target };
 }
@@ -601,5 +605,128 @@ describe('cohort-topic: promote-gate bounded memory', () => {
 			expect(r, 'a forged single-signer notice is untrusted').to.equal('untrusted');
 		}
 		expect(gate.highWater.size, 'no forged notice wrote the high-water (only an `applied` outcome does)').to.equal(0);
+	});
+});
+
+// --- parent-side child unlink on demotion (cohort-topic-child-link-replicate-unlink) ---
+
+/**
+ * A parent-cohort {@link CoordEngine} stand-in that tracks its child set (freshness-ordered per child coord,
+ * mirroring the real child registry). Only `unrecordChild` is exercised by the parent-unlink path; `recordChild`
+ * seeds a pre-existing child, `childCohortCount` reads the demotion-gate input. It also satisfies
+ * {@link NoticeApplyTarget} so it can double as the sibling-adopt target on a dual-role node.
+ */
+function childTrackingParent(coord: RingCoord): NoticeApplyTarget & {
+	recordChild: (t: Uint8Array, c: Uint8Array, e: number) => void;
+	unrecordChild: (t: Uint8Array, c: Uint8Array, e: number) => void;
+	childCohortCount: (t: Uint8Array) => number;
+} {
+	const entries = new Map<string, { linked: boolean; at: number }>();
+	const key = (t: Uint8Array, c: Uint8Array): string => `${bytesToB64url(t)}|${bytesToB64url(c)}`;
+	const apply = (t: Uint8Array, c: Uint8Array, e: number, linked: boolean): void => {
+		const k = key(t, c);
+		const held = entries.get(k);
+		if (held === undefined || e > held.at) {
+			entries.set(k, { linked, at: e });
+		}
+	};
+	return {
+		servedCoord: coord,
+		recordChild: (t, c, e): void => apply(t, c, e, true),
+		unrecordChild: (t, c, e): void => apply(t, c, e, false),
+		childCohortCount: (t): number => {
+			const prefix = `${bytesToB64url(t)}|`;
+			let n = 0;
+			for (const [k, v] of entries) {
+				if (k.startsWith(prefix) && v.linked) n++;
+			}
+			return n;
+		},
+		applyPromotionNotice: (): void => undefined,
+		applyDemotionNotice: (): void => undefined,
+	};
+}
+
+describe('cohort-topic: demotion notice unlinks the child at its parent cohort', () => {
+	const minSigs = 3;
+
+	it('a parent-only node unrecords the demoting child and reports "unlinked" (no sibling-adopt engine)', async () => {
+		const members = await makeMembers(4);
+		const byId = new Map(members.map((m) => [m.idStr, m]));
+		// The verifier is seeded with the CHILD cohort cert (over COORD) — the demotion is child-signed at COORD.
+		const verifier = await verifierOver(members, byId, minSigs);
+		const gate = createPromoteGate({ ratePerWindow: 10_000 });
+
+		// The node serves ONLY the parent coord (PARENT); it does not serve the child coord (COORD).
+		const parent = childTrackingParent(PARENT);
+		parent.recordChild(TOPIC, COORD, 500); // the parent had recorded this child earlier
+		expect(parent.childCohortCount(TOPIC), 'the parent holds one child before the demotion').to.equal(1);
+		const registry = coordRegistry(parent);
+
+		const demo = await realDemotionNotice(members, byId, minSigs, 1_000); // cohortCoord = COORD, parentCohortCoord = PARENT
+		const result = await handleInboundNotice(encodeCohortMessage(demo), peerIdToBytes('honest'), registry, verifier, gate, 2_000);
+		expect(result, 'sibling-adopt dropped (no child engine) but the parent-unlink applied').to.equal('unlinked');
+		expect(parent.childCohortCount(TOPIC), 'the demoting child was released at the parent').to.equal(0);
+	});
+
+	it('a forged (under-quorum) demotion does NOT unrecord the child at the parent', async () => {
+		const members = await makeMembers(4);
+		const byId = new Map(members.map((m) => [m.idStr, m]));
+		const verifier = await verifierOver(members, byId, minSigs);
+		const gate = createPromoteGate({ ratePerWindow: 10_000 });
+		const parent = childTrackingParent(PARENT);
+		parent.recordChild(TOPIC, COORD, 500);
+		const registry = coordRegistry(parent);
+
+		// A single-signer demotion at the child coord — the same forge the sibling-adopt path rejects.
+		const signable = { topicId: bytesToB64url(TOPIC), tier: 1, parentCohortCoord: bytesToB64url(PARENT), effectiveAt: 1_000, cohortEpoch: bytesToB64url(EPOCH), cohortCoord: bytesToB64url(COORD) };
+		const sig = await signPeer(members[0]!.key, demotionNoticeSigningPayload(signable));
+		const forged: DemotionNoticeV1 = { v: 1, ...signable, thresholdSig: bytesToB64url(sig), signers: [bytesToB64url(members[0]!.bytes)] };
+
+		const result = await handleInboundNotice(encodeCohortMessage(forged), peerIdToBytes('honest'), registry, verifier, gate, 2_000);
+		expect(result, 'a forged demotion is untrusted at the parent').to.equal('untrusted');
+		expect(parent.childCohortCount(TOPIC), 'the child was NOT released by an unverified demotion').to.equal(1);
+	});
+
+	it('applyDemotionUnlinkAtParent returns "no-parent" when this node does not serve the parent coord', async () => {
+		const members = await makeMembers(4);
+		const byId = new Map(members.map((m) => [m.idStr, m]));
+		const verifier = await verifierOver(members, byId, minSigs);
+		// The registry serves the child coord but NOT the parent coord.
+		const { target: childOnly } = remoteTargetAt(COORD, minSigs);
+		const registry = coordRegistry(childOnly);
+		const demo = await realDemotionNotice(members, byId, minSigs, 1_000);
+		expect(await applyDemotionUnlinkAtParent(demo, registry, verifier, 2_000), 'no parent engine here → no-parent').to.equal('no-parent');
+	});
+
+	it('a dual-role node (serves BOTH the child and the parent coord) applies the sibling-adopt AND the parent-unlink from one demotion', async () => {
+		const members = await makeMembers(4);
+		const byId = new Map(members.map((m) => [m.idStr, m]));
+		const verifier = await verifierOver(members, byId, minSigs);
+		const gate = createPromoteGate({ ratePerWindow: 10_000 });
+
+		// The child-sibling engine (at COORD) — promote it first so the demotion has something to clear.
+		const child = remoteTargetAt(COORD, minSigs);
+		const parent = childTrackingParent(PARENT);
+		parent.recordChild(TOPIC, COORD, 500);
+		const registry = coordRegistry(child.target, parent);
+		const from = peerIdToBytes('honest');
+
+		const promo = await realPromotionNotice(members, byId, minSigs, 900, COORD);
+		expect(await handleInboundNotice(encodeCohortMessage(promo), from, registry, verifier, gate, 950)).to.equal('applied');
+		expect(child.life.isPromoted(TOPIC), 'the child sibling is promoted').to.be.true;
+
+		// One demotion frame: the sibling-adopt clears `promoted` at COORD; the parent-unlink releases the child.
+		const demo = await realDemotionNotice(members, byId, minSigs, 1_000, COORD);
+		const result = await handleInboundNotice(encodeCohortMessage(demo), from, registry, verifier, gate, 2_000);
+		expect(result, 'the sibling-adopt is the reported outcome on a dual-role node').to.equal('applied');
+		expect(child.life.isPromoted(TOPIC), 'the sibling-adopt cleared promoted').to.be.false;
+		expect(parent.childCohortCount(TOPIC), 'the parent-unlink released the child — neither path shadows the other').to.equal(0);
+
+		// The sibling-adopt advanced the COORD high-water to 1_000; a replay of the SAME frame stale-drops the
+		// sibling path but the parent-unlink still runs (independent freshness) — a registry no-op, no throw.
+		const replay = await handleInboundNotice(encodeCohortMessage(demo), from, registry, verifier, gate, 3_000);
+		expect(result === 'applied' && replay === 'unlinked', 'the replay: sibling stale, parent-unlink still runs').to.be.true;
+		expect(parent.childCohortCount(TOPIC), 'the child stays released across the replay').to.equal(0);
 	});
 });
