@@ -518,6 +518,35 @@ describe('BTree', () => {
       expect(collected).to.deep.equal(Array.from({ length: 64 }, (_, i) => i + 1));
     })
 
+    it('should find borrowed entry after borrow-from-left rebalance', async () => {
+      // NodeCapacity=64, half=32. Insert 0..64 → leaf1=[0..31](32), leaf2=[32..64](33).
+      // Insert -1 → leaf1=[-1..31](33); leaf2 still [32..64], partition still [32].
+      // Delete 64 then 63 → leaf2 drops to 31 → rightmost leaf, no right sibling →
+      //   borrow from left: entry 31 moves to front of leaf2.
+      // Correct new separator: 31. A wrong separator would misroute get(31)/get(30).
+      for (let i = 0; i < 65; i++) {
+        await btree.insert(i);
+      }
+      await btree.insert(-1);
+
+      await btree.deleteAt(await btree.find(64));
+      await btree.deleteAt(await btree.find(63));
+
+      // Borrowed entry (now first of right leaf) and its left neighbour must both resolve
+      expect(await btree.get(31)).to.equal(31);
+      expect(await btree.get(30)).to.equal(30);
+      expect(await btree.get(32)).to.equal(32);
+
+      // Full scan must return every remaining key: -1, 0..62
+      const collected: number[] = [];
+      const path = await btree.first();
+      while (path.on) {
+        collected.push(btree.at(path)!);
+        await btree.moveNext(path);
+      }
+      expect(collected).to.deep.equal([-1, ...Array.from({ length: 63 }, (_, i) => i)]);
+    })
+
     it('should roll back partial delete when rebalance read fails', async () => {
       // Insert 65 values to force one split:
       //   leaf1: [0..31], leaf2: [32..64], root branch
