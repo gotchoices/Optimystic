@@ -602,5 +602,14 @@ describe('BTree', () => {
       await btree.moveNext(path);
     }
     expect(collected).to.deep.equal(Array.from({ length: count }, (_, i) => i));
+
+    // Symmetric descending scan over the same 3-level tree exercises internalPrior at depth.
+    const descending: number[] = [];
+    const rpath = await btree.last();
+    while (rpath.on) {
+      descending.push(btree.at(rpath)!);
+      await btree.movePrior(rpath);
+    }
+    expect(descending).to.deep.equal(Array.from({ length: count }, (_, i) => count - 1 - i));
   })
 })
