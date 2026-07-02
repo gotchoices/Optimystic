@@ -4,20 +4,21 @@
  * Per `docs/cohort-topic.md` §Membership snapshots: the cohort publishes a threshold-signed
  * `MembershipCertV1`
  *
- * - at stabilization, and on any change to the first `k − x` members ({@link MembershipCertPublisher.onStabilized});
+ * - at stabilization, and on any change to the cohort identity — the epoch `H(sorted all members)`,
+ *   so *any* member change (head or tail) forces a fresh publish ({@link MembershipCertPublisher.onStabilized});
  * - refreshed every `T_membership_refresh` (default 5 min) ({@link MembershipCertPublisher.tick}).
  *
  * The publisher is db-core logic over the {@link CohortSigner} (threshold sign) and the
  * {@link IMembershipPublishSink} (serve/advertise). It never imports FRET. Members are sorted
- * ascending for the cert (matching the sharding order) and the first `minSigs` (= `k − x`) of that
- * order are the "first `k − x`" whose change forces a fresh publish.
+ * ascending for the cert (matching the sharding order); the snapshot's `cohortEpoch` is the full
+ * cohort identity, and a change to it across a publish forces a fresh publish.
  */
 
 import type { IMembershipPublishSink } from "../ports.js";
 import { bytesToB64url, encodeCohortMessage } from "../wire/codec.js";
 import type { MembershipCertV1 } from "../wire/types.js";
 import { compareBytes } from "../registration/bytes.js";
-import { DEFAULT_MIN_SIGS, type CohortSigner } from "../sig/threshold.js";
+import { type CohortSigner } from "../sig/threshold.js";
 import { membershipCertSigningPayload, type MembershipCertSignable } from "../sig/payloads.js";
 
 /** Default membership-cert refresh interval (`T_membership_refresh`). */
@@ -74,10 +75,11 @@ export interface RotationAttestation {
 /** Cohort-side membership-cert publisher. */
 export interface MembershipCertPublisher {
 	/**
-	 * Drive publication on a stabilization event. Publishes (and returns the cert) when the first
-	 * `k − x` members changed since the last publish, or on the first call; otherwise returns `undefined`.
-	 * Pass `rotation` to attach a predecessor-cohort rotation attestation (an epoch rotation); omit it for
-	 * the default non-rotation publish (no rotation fields are emitted).
+	 * Drive publication on a stabilization event. Publishes (and returns the cert) when the cohort identity
+	 * (`cohortEpoch = H(sorted members)`) changed since the last publish — i.e. on **any** member change,
+	 * head or tail — or on the first call; otherwise returns `undefined`. Pass `rotation` to attach a
+	 * predecessor-cohort rotation attestation (an epoch rotation); omit it for the default non-rotation
+	 * publish (no rotation fields are emitted).
 	 */
 	onStabilized(snapshot: CohortSnapshot, now: number, rotation?: RotationAttestation): Promise<MembershipCertV1 | undefined>;
 	/**
@@ -91,26 +93,33 @@ export interface MembershipCertPublisherDeps {
 	signer: CohortSigner;
 	sink: IMembershipPublishSink;
 	refreshMs?: number;
+	/**
+	 * Accepted for call-site compatibility but no longer read by the publisher: the republish gate now keys
+	 * on the full `cohortEpoch`, not the first `k − x` members, and the threshold-sign quorum lives in the
+	 * {@link CohortSigner}. Kept so existing callers (host + db-p2p tests) compile unchanged.
+	 */
 	minSigs?: number;
 	maxMessageBytes?: number;
 }
 
 class SigningMembershipCertPublisher implements MembershipCertPublisher {
 	private readonly refreshMs: number;
-	private readonly minSigs: number;
-	/** base64url of the first `minSigs` members of the last published snapshot. */
-	private lastFirstKx: string[] | undefined;
+	/** base64url of the last published snapshot's `cohortEpoch` — the full cohort-identity republish key. */
+	private lastEpoch: string | undefined;
 	private lastPublishedAt: number | undefined;
 
 	constructor(private readonly deps: MembershipCertPublisherDeps) {
 		this.refreshMs = deps.refreshMs ?? DEFAULT_T_MEMBERSHIP_REFRESH_MS;
-		this.minSigs = deps.minSigs ?? DEFAULT_MIN_SIGS;
 	}
 
 	async onStabilized(snapshot: CohortSnapshot, now: number, rotation?: RotationAttestation): Promise<MembershipCertV1 | undefined> {
-		const firstKx = this.firstKx(snapshot.members);
-		if (this.lastFirstKx !== undefined && sameOrder(this.lastFirstKx, firstKx)) {
-			return undefined; // first k − x unchanged — no republish needed
+		// NOTE: republish (and the caller's rotation attestation) now fire on ANY epoch change — any member
+		// change, head or tail — not just first-(k − x) churn. Gated on an actual epoch change, never per
+		// tick, so cost is bounded by real churn. If a high-churn cohort ever shows excess `/sign` or publish
+		// load, reconsider a short debounce / batching here.
+		const epoch = bytesToB64url(snapshot.cohortEpoch);
+		if (this.lastEpoch !== undefined && this.lastEpoch === epoch) {
+			return undefined; // cohort identity unchanged — no republish needed
 		}
 		return this.publish(snapshot, now, rotation);
 	}
@@ -120,11 +129,6 @@ class SigningMembershipCertPublisher implements MembershipCertPublisher {
 			return undefined;
 		}
 		return this.publish(snapshot, now, rotation);
-	}
-
-	/** The first `minSigs` members of the cert's ascending order, base64url — the republish-change key. */
-	private firstKx(members: readonly Uint8Array[]): string[] {
-		return [...members].sort(compareBytes).slice(0, this.minSigs).map(bytesToB64url);
 	}
 
 	private async publish(snapshot: CohortSnapshot, now: number, rotation?: RotationAttestation): Promise<MembershipCertV1> {
@@ -147,22 +151,10 @@ class SigningMembershipCertPublisher implements MembershipCertPublisher {
 			cert.rotationSigners = rotation.rotationSigners.map(bytesToB64url);
 		}
 		this.deps.sink.publish(encodeCohortMessage(cert, this.deps.maxMessageBytes));
-		this.lastFirstKx = signable.members.slice(0, this.minSigs);
+		this.lastEpoch = bytesToB64url(snapshot.cohortEpoch);
 		this.lastPublishedAt = now;
 		return cert;
 	}
-}
-
-function sameOrder(a: readonly string[], b: readonly string[]): boolean {
-	if (a.length !== b.length) {
-		return false;
-	}
-	for (let i = 0; i < a.length; i++) {
-		if (a[i] !== b[i]) {
-			return false;
-		}
-	}
-	return true;
 }
 
 /** Build a cohort-side {@link MembershipCertPublisher}. */

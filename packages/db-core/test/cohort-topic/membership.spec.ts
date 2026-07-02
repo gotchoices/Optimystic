@@ -6,7 +6,7 @@ import { createMembershipVerifier } from '../../src/cohort-topic/membership/veri
 import { createMembershipSourceRouter } from '../../src/cohort-topic/membership/source.js';
 import { createMembershipCertPublisher } from '../../src/cohort-topic/membership/publisher.js';
 import { bytesToB64url, encodeCohortMessage, decodeMembershipCertV1 } from '../../src/cohort-topic/wire/codec.js';
-import { bytesEqual } from '../../src/cohort-topic/registration/bytes.js';
+import { bytesEqual, compareBytes } from '../../src/cohort-topic/registration/bytes.js';
 import type { ICohortThresholdCrypto, IMembershipSource, IMembershipTrustAnchor, RingCoord, TrustAnchorVerdict, TrustRoot } from '../../src/cohort-topic/ports.js';
 import type { MembershipCertV1 } from '../../src/cohort-topic/wire/types.js';
 
@@ -183,13 +183,21 @@ describe('cohort-topic / membership cert publication', () => {
 		return { published, sink: { publish: (encoded: Uint8Array) => { published.push(decodeMembershipCertV1(encoded)); } } };
 	}
 
+	// The cohort epoch is a pure function of the sorted member SET (production: `cohortEpoch = H(sorted all
+	// members)`), so ANY member change — head or tail — yields a distinct epoch, while reordering the same
+	// set does not. Deriving it here (rather than a constant `EPOCH`) is what lets these tests exercise the
+	// publisher's real republish signal; a constant epoch masked the post-firstKx (tail) change entirely.
+	function epochOf(members: Uint8Array[]): Uint8Array {
+		const joined = new TextEncoder().encode([...members].sort(compareBytes).map(bytesToB64url).join('|'));
+		return sha256(joined).slice(0, 32);
+	}
 	function snapshot(members: Uint8Array[], stabilizedAt = 1_000) {
-		return { coord: COORD, cohortEpoch: EPOCH, members, stabilizedAt };
+		return { coord: COORD, cohortEpoch: epochOf(members), members, stabilizedAt };
 	}
 
 	it('publishes a signed cert at first stabilization', async () => {
 		const { published, sink } = capturingSink();
-		const pub = createMembershipCertPublisher({ signer, sink, minSigs: 2 });
+		const pub = createMembershipCertPublisher({ signer, sink });
 		const cert = await pub.onStabilized(snapshot([mkMember(0), mkMember(1), mkMember(2), mkMember(3)]), 1_000);
 		expect(cert, 'cert returned').to.not.be.undefined;
 		expect(published).to.have.length(1);
@@ -198,26 +206,41 @@ describe('cohort-topic / membership cert publication', () => {
 		expect(published[0]!.members).to.deep.equal([mkMember(0), mkMember(1), mkMember(2), mkMember(3)].map(bytesToB64url));
 	});
 
-	it('republishes when the first k − x members change, not when only the tail changes', async () => {
+	it('republishes on any member change — head OR tail — since the epoch tracks the whole member set', async () => {
 		const { published, sink } = capturingSink();
-		const pub = createMembershipCertPublisher({ signer, sink, minSigs: 2 });
+		const pub = createMembershipCertPublisher({ signer, sink });
 		await pub.onStabilized(snapshot([mkMember(0), mkMember(1), mkMember(2), mkMember(3)]), 1_000);
 		expect(published).to.have.length(1);
 
-		// Only positions 2,3 (beyond the first k − x = 2) change → no republish.
-		const tail = await pub.onStabilized(snapshot([mkMember(0), mkMember(1), mkMember(20), mkMember(21)]), 1_100);
-		expect(tail, 'tail-only change is not republished').to.be.undefined;
+		// A TAIL-only change (positions beyond a first-`k − x` core are what the OLD firstKx gate ignored) now
+		// rotates the epoch → prompt republish. This is the regression this fix closes: the first two members
+		// (0,1) are unchanged, only the tail (2,3 → 2,20) moves, yet a fresh cert is served.
+		const tail = await pub.onStabilized(snapshot([mkMember(0), mkMember(1), mkMember(2), mkMember(20)]), 1_100);
+		expect(tail, 'tail-only change now republishes (epoch changed)').to.not.be.undefined;
+		expect(published).to.have.length(2);
+
+		// A head change of course republishes too.
+		const head = await pub.onStabilized(snapshot([mkMember(9), mkMember(1), mkMember(2), mkMember(20)]), 1_200);
+		expect(head, 'head change republishes').to.not.be.undefined;
+		expect(published).to.have.length(3);
+	});
+
+	it('does not republish when the member set (epoch) is unchanged', async () => {
+		const { published, sink } = capturingSink();
+		const pub = createMembershipCertPublisher({ signer, sink });
+		const members = [mkMember(0), mkMember(1), mkMember(2), mkMember(3)];
+		await pub.onStabilized(snapshot(members), 1_000);
 		expect(published).to.have.length(1);
 
-		// The first k − x set changes → republish.
-		const head = await pub.onStabilized(snapshot([mkMember(1), mkMember(2), mkMember(3), mkMember(5)]), 1_200);
-		expect(head, 'first k − x change republishes').to.not.be.undefined;
-		expect(published).to.have.length(2);
+		// Same set (a different order, a later stabilizedAt) → same epoch → no spurious republish.
+		const same = await pub.onStabilized(snapshot([mkMember(3), mkMember(2), mkMember(1), mkMember(0)], 1_100), 1_100);
+		expect(same, 'unchanged identity is not republished').to.be.undefined;
+		expect(published).to.have.length(1);
 	});
 
 	it('refreshes on tick only after T_membership_refresh elapses', async () => {
 		const { published, sink } = capturingSink();
-		const pub = createMembershipCertPublisher({ signer, sink, minSigs: 2, refreshMs: 1_000 });
+		const pub = createMembershipCertPublisher({ signer, sink, refreshMs: 1_000 });
 		const members = [mkMember(0), mkMember(1), mkMember(2), mkMember(3)];
 		await pub.onStabilized(snapshot(members), 10_000);
 		expect(published).to.have.length(1);
@@ -229,9 +252,9 @@ describe('cohort-topic / membership cert publication', () => {
 		expect(published).to.have.length(2);
 	});
 
-	it('attaches a rotation attestation when given one; the default publish emits no rotation fields', async () => {
+	it('attaches a rotation attestation on a tail-only change; the default publish emits no rotation fields', async () => {
 		const { published, sink } = capturingSink();
-		const pub = createMembershipCertPublisher({ signer, sink, minSigs: 2 });
+		const pub = createMembershipCertPublisher({ signer, sink });
 
 		// Default path (no rotation arg): the cert carries none of the rotation fields.
 		await pub.onStabilized(snapshot([mkMember(0), mkMember(1), mkMember(2), mkMember(3)]), 1_000);
@@ -239,14 +262,16 @@ describe('cohort-topic / membership cert publication', () => {
 		expect(published[0]).to.not.have.property('rotationSig');
 		expect(published[0]).to.not.have.property('rotationSigners');
 
-		// With a rotation attestation: it is attached verbatim (the threshold sig still covers only the
-		// non-rotation signing image, so the cert stays self-consistent — exercised by the verifier suite).
+		// A TAIL-only change (the first two members are unchanged, so the OLD firstKx gate would NOT have
+		// republished or attested) now rotates the epoch and carries the attestation verbatim — the host
+		// attaches a rotation on any epoch change, mirroring this republish gate. The threshold sig still
+		// covers only the non-rotation signing image, so the cert stays self-consistent (verifier suite).
 		const prevEpoch = new Uint8Array(32).fill(7);
 		const rotationSig = new Uint8Array(16).fill(9);
 		const rotationSigners = [mkMember(0), mkMember(1)];
-		const rotated = [mkMember(5), mkMember(6), mkMember(2), mkMember(3)]; // first k − x changes → republish
+		const rotated = [mkMember(0), mkMember(1), mkMember(2), mkMember(30)]; // tail change → epoch rotates, first two unchanged
 		const cert = await pub.onStabilized(snapshot(rotated), 1_100, { prevEpoch, rotationSig, rotationSigners });
-		expect(cert, 'republished on a first-(k − x) change').to.not.be.undefined;
+		expect(cert, 'republished on a tail-only (epoch) change').to.not.be.undefined;
 		expect(published).to.have.length(2);
 		expect(published[1]!.prevEpoch).to.equal(bytesToB64url(prevEpoch));
 		expect(published[1]!.rotationSig).to.equal(bytesToB64url(rotationSig));

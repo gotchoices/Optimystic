@@ -88,7 +88,6 @@ import {
 	bytesToB64url,
 	b64urlToBytes,
 	bytesEqual,
-	compareBytes,
 	encodeCohortMessage,
 	decodeCohortMessage,
 	decodeCohortGossipV1,
@@ -1385,12 +1384,16 @@ function createCoordEngine(ctx: CoordEngineContext, servedCoord: RingCoord, tree
 	const canPublish = ctx.privateKey !== undefined;
 
 	// --- epoch-rotation attestation production (cohort-topic-trust-anchor-rotation-production) ---
-	// The first `k − x` members of the cert's ascending order; a change across a publish is a rotation
-	// (mirrors the publisher's own republish gate — same inputs, so the two agree on what is a rotation).
-	const firstKx = (members: readonly Uint8Array[]): string[] =>
-		[...members].sort(compareBytes).slice(0, ctx.minSigs).map(bytesToB64url);
-	const firstKxChanged = (a: CohortIdentity, b: CohortIdentity): boolean =>
-		!sameStringOrder(firstKx(a.memberBytes), firstKx(b.memberBytes));
+	// Any change to the cohort identity (`epochKey = H(sorted members)`) is a rotation — head OR tail
+	// (mirrors the publisher's own republish gate — both now key on the epoch, so the two agree on what is
+	// a rotation).
+	// NOTE: the `/sign` "rotation" endorsement gate remembers only the current + immediately-prior observed
+	// epoch (RotationState.membersAt). That two-deep bound is orthogonal to attesting on any epoch change —
+	// RotationState.observe already shifts on every observed epoch change (any member change rotates the
+	// epoch), so rapid churn could age a predecessor epoch out of the window regardless. If rapid multi-step
+	// churn ever makes rotation attestations frequently unproducible, that is a history-depth concern in
+	// RotationState, not this trigger.
+	const epochChanged = (a: CohortIdentity, b: CohortIdentity): boolean => a.epochKey !== b.epochKey;
 
 	/**
 	 * Threshold-sign the new cert's canonical payload under the **predecessor** cohort identity, producing the
@@ -1425,10 +1428,10 @@ function createCoordEngine(ctx: CoordEngineContext, servedCoord: RingCoord, tree
 	};
 
 	/**
-	 * Publish (or refresh) this cohort's membership cert, attaching a rotation attestation when the first
-	 * `k − x` changed since the last publish. `refresh` selects the publisher path: `false` for a
+	 * Publish (or refresh) this cohort's membership cert, attaching a rotation attestation when the cohort
+	 * identity (epoch) changed since the last publish. `refresh` selects the publisher path: `false` for a
 	 * stabilization event ({@link CoordEngine.onStabilized}), `true` for the periodic refresh
-	 * ({@link CoordEngine.pumpMembership}). A first-`k − x` change is a stabilization regardless of which hook
+	 * ({@link CoordEngine.pumpMembership}). An epoch change is a stabilization regardless of which hook
 	 * fired, so it routes through `onStabilized` (which republishes promptly on the change) carrying the
 	 * attestation; the `/sign` round runs only on that change, so it costs one round per rotation, never per
 	 * tick. Key-less interim mode no-ops (the verify-only signer cannot assemble).
@@ -1440,7 +1443,7 @@ function createCoordEngine(ctx: CoordEngineContext, servedCoord: RingCoord, tree
 		const snapshot = snapshotAt(now); // also observes the current identity (snapshotAt → cohort())
 		const current = identityOf(snapshot);
 		const predecessor = rotationState.predecessor();
-		const rotating = predecessor !== undefined && firstKxChanged(predecessor, current);
+		const rotating = predecessor !== undefined && epochChanged(predecessor, current);
 		let published: MembershipCertV1 | undefined;
 		if (rotating) {
 			const rotation = await produceRotation(snapshot, predecessor!);

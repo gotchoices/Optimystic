@@ -410,12 +410,13 @@ describe('cohort-topic: live-tier end-to-end milestone', () => {
 	});
 
 	// --- rotation attestation production (cohort-topic-trust-anchor-rotation-production) ---
-	// These use wantK = 4 over N = 5 with minSigs = 4 (= wantK), so the cohort is a strict subset of the
-	// network and any single membership swap changes the FULL first-`k − x` set → a guaranteed rotation. The
-	// outgoing cohort co-signs the successor cert; the db-core verifier accepts it as a chain extension.
+	// These use wantK = 4 over N = 5, so the cohort is a strict subset of the network and any single
+	// membership swap changes the member set → a new epoch → a guaranteed rotation (the host attests on any
+	// epoch change). The outgoing cohort co-signs the successor cert; the db-core verifier accepts it as a
+	// chain extension.
 	const ROT_N = 5;
 	const ROT_WANT_K = 4;
-	const ROT_MIN_SIGS = 4; // = wantK so a member swap always changes the first k − x (whole-cohort) set
+	const ROT_MIN_SIGS = 4; // any member swap changes the member set → a new epoch → a rotation
 	const ROT_FRET_TIER = 2; // a FRET tier → the membership-source router owns the binding (no tx-log)
 
 	/** A no-direct-anchor verifier (chain is the only trust path beyond TOFU) over a fixed cert source. */
@@ -547,7 +548,7 @@ describe('cohort-topic: live-tier end-to-end milestone', () => {
 			expect(certN, 'first publish').to.not.equal(undefined);
 
 			// A periodic refresh past T_membership_refresh with NO membership change → a republish, but not a
-			// rotation (the first k − x did not change), so it must carry no rotation fields.
+			// rotation (the epoch did not change), so it must carry no rotation fields.
 			const refreshed = await decidingEngine.pumpMembership(now + 5 * 60_000 + 1);
 			expect(refreshed, 'the refresh republished the cert').to.not.equal(undefined);
 			expect(refreshed!.cohortEpoch, 'same membership → same epoch').to.equal(certN!.cohortEpoch);
