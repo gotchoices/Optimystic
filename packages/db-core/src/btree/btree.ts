@@ -392,34 +392,35 @@ export class BTree<TKey, TEntry> {
 		if (!path.on) {	// Attempt to move off of crack
 			path.on = path.branches.every(branch => branch.index >= 0 && branch.index < branch.node.nodes.length)
 				&& path.leafIndex >= 0 && path.leafIndex < path.leafNode.entries.length;
-			if (path.on) {
-				return;
+			if (path.on || path.leafIndex < path.leafNode.entries.length) {
+				return;	// got on an entry, or an interior crack — nothing to advance into
 			}
-		} else if (path.leafIndex >= path.leafNode.entries.length - 1) {
-			let popCount = 0;
-			let found = false;
-			const last = path.branches.length - 1;
-			while (popCount <= last && !found) {
-				const branch = path.branches[last - popCount]!;
-				if (branch.index === branch.node.partitions.length)	// last node in branch
-					++popCount;
-				else
-					found = true;
-			}
-
-			if (!found) {
-				path.leafIndex = path.leafNode.entries.length;	// after last row = end crack
-				path.on = false;
-			} else {
-				path.branches.splice(-popCount, popCount);
-				const branch = path.branches.at(-1)!;
-				++branch.index;
-				await this.moveToFirst(await get(this.store, branch.node.nodes[branch.index]!), path);
-			}
-		}
-		else {
+			// end-of-leaf crack (leafIndex === entries.length): fall through to branch-popping leaf-advance
+		} else if (path.leafIndex < path.leafNode.entries.length - 1) {
 			++path.leafIndex;
 			path.on = true;
+			return;
+		}
+		// on the last entry of the leaf, or off an end-of-leaf crack: advance into the next leaf
+		let popCount = 0;
+		let found = false;
+		const last = path.branches.length - 1;
+		while (popCount <= last && !found) {
+			const branch = path.branches[last - popCount]!;
+			if (branch.index === branch.node.partitions.length)	// last node in branch
+				++popCount;
+			else
+				found = true;
+		}
+
+		if (!found) {
+			path.leafIndex = path.leafNode.entries.length;	// after last row = end crack
+			path.on = false;
+		} else {
+			path.branches.splice(-popCount, popCount);
+			const branch = path.branches.at(-1)!;
+			++branch.index;
+			await this.moveToFirst(await get(this.store, branch.node.nodes[branch.index]!), path);
 		}
 	}
 

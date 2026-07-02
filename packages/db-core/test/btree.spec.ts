@@ -4,6 +4,7 @@ use(chaiAsPromised)
 import { BTree } from '../src/btree/index.js'
 import type { BranchNode } from '../src/btree/nodes.js'
 import { TreeBranchBlockType } from '../src/btree/nodes.js'
+import { KeyBound, KeyRange } from '../src/btree/key-range.js'
 import { createActor } from '../src/utility/actor.js'
 import { TestBlockStore } from './test-block-store.js'
 
@@ -584,6 +585,60 @@ describe('BTree', () => {
       expect(await btree.get(100)).to.equal(100);
     })
   })
+
+  // Regression: range scan stalled when starting key landed on end-of-leaf crack
+  // (leafIndex === entries.length after find), producing zero results instead of
+  // walking into the next leaf.
+  describe('range scan end-of-leaf crack (btree-range-scan-stops-at-leaf-boundary)', () => {
+    async function collectRange(r: KeyRange<number>): Promise<number[]> {
+      const results: number[] = [];
+      for await (const path of btree.range(r)) {
+        results.push(btree.at(path)!);
+      }
+      return results;
+    }
+
+    it('should return entries after fractional key on end-of-leaf crack', async () => {
+      // Insert 200 values forcing a multi-leaf tree (first leaf holds ~32 entries).
+      for (let i = 0; i < 200; i++) {
+        await btree.insert(i);
+      }
+      // Discover first-leaf max by reading the first path's leaf entries.
+      const firstPath = await btree.first();
+      const leafMax = firstPath.leafNode.entries[firstPath.leafNode.entries.length - 1]!;
+
+      // A key of leafMax + 0.5 lands strictly between leafMax and leafMax+1,
+      // placing the cursor at leafIndex === entries.length (end-of-leaf crack).
+      const crackKey = leafMax + 0.5;
+      const results = await collectRange(new KeyRange(new KeyBound(crackKey, true), undefined, true));
+
+      const expectedFirst = leafMax + 1;
+      expect(results.length).to.equal(200 - expectedFirst, `expected ${200 - expectedFirst} results`);
+      expect(results[0]).to.equal(expectedFirst, 'first result should be entry right after leaf max');
+    });
+
+    it('should return entries after delete-driven end-of-leaf crack', async () => {
+      // Insert 65 values → leaf1=[0..31], leaf2=[32..64].
+      for (let i = 0; i < 65; i++) {
+        await btree.insert(i);
+      }
+      // Discover first-leaf max.
+      const firstPath = await btree.first();
+      const leafMax = firstPath.leafNode.entries[firstPath.leafNode.entries.length - 1]!;
+
+      // Delete the first-leaf max. The parent separator becomes stale, so
+      // find(leafMax) now routes into leaf1 and lands on end-of-leaf crack.
+      await btree.deleteAt(await btree.find(leafMax));
+
+      // range starting at the deleted key must return all subsequent entries.
+      const results = await collectRange(new KeyRange(new KeyBound(leafMax, true), undefined, true));
+
+      const expectedFirst = leafMax + 1;
+      const expectedCount = 65 - leafMax - 1;  // entries after leafMax in original range [0..64]
+      expect(results.length).to.equal(expectedCount, `expected ${expectedCount} results`);
+      expect(results[0]).to.equal(expectedFirst, 'first result should be entry right after deleted leaf max');
+    });
+  });
 
   // Regression: branchInsert was not persisting newBranch, causing "Missing block"
   // on first lookup after a branch node itself split (3-level tree, ~2081st sequential insert).
