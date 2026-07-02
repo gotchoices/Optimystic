@@ -738,6 +738,16 @@ export async function createCohortTopicHost(node: Libp2p, fret: FretService, opt
 		// Cache this node's own freshly-published cohort cert into the verifier, so an inbound notice
 		// signed by this node's cohort verifies locally without a network refetch. `verifier` is declared
 		// just below; the closure only runs on a (later) publish, after it is initialized.
+		//
+		// NOTE (stale trust-lock, drop-the-lock-on-demotion): `verifier.cache()` marks this coord *trusted*,
+		// which trust-LOCKS it (no un-anchored refetch can downgrade it). If this node later leaves the coord's
+		// cohort it stops republishing and its anchor goes `"unknown"`, so it can be stranded distrusting the
+		// coord's later-epoch messages. The verifier self-heals via bounded re-TOFU on a demonstrated chain gap
+		// (`staleGapRecoveryStrikes`, see `db-core/.../membership/verifier.ts` + `docs/cohort-topic.md`
+		// §Bootstrapping trust). The *root-cause* fix is for the host to drop the lock here on demotion, but
+		// that needs an engine-reclaim / demotion signal the host does not emit today (`createCoordRegistry`
+		// never evicts — see the NOTE below). When engine reclaim lands, add a `verifier.forget(coord)` /
+		// downgrade call on demotion and prefer it over (or alongside) the strike-counter heuristic.
 		onCertPublished: (cert: MembershipCertV1): void => verifier.cache(cert),
 	};
 	const registry = createCoordRegistry(ctx);

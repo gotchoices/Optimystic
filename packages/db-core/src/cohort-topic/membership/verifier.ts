@@ -99,6 +99,26 @@ export interface MembershipVerifierDeps {
 	anchor?: IMembershipTrustAnchor;
 	/** Out-of-band-seeded genesis trust roots (the base case of every attestation chain). Defaults to `[]`. */
 	trustRoots?: readonly TrustRoot[];
+	/**
+	 * Number of **consecutive** gap-signalled refetches after which a **trust-locked** coord whose direct
+	 * anchor has gone `"unknown"` re-enters the interim TOFU regime — the exit from a stale trust-lock a
+	 * former cohort member would otherwise be stranded in until the host process restarts.
+	 *
+	 * The lock (a coord holding a *trusted* cached cert refuses any un-anchored refetch — no TOFU downgrade)
+	 * has no other exit: a node that served coord `C`, self-published its cert (locking `C`), then left `C`'s
+	 * cohort keeps distrusting every later-epoch message from `C` if it missed an intermediate rotation, since
+	 * the refetched cert's `prevEpoch` no longer matches the stale cached epoch and the anchor no longer
+	 * vouches for `C`. Recovery counts **only** refetched certs presenting an *explicit chain gap* — a full
+	 * rotation attestation whose `prevEpoch ≠` the cached trusted epoch (the network provably rotated past the
+	 * cached epoch through an epoch this node never witnessed). A forged rotation off the *current* cached
+	 * predecessor (`prevEpoch == cachedEpoch`) never counts as a strike, so the lock's headline invariant
+	 * (un-anchored successor of a matching predecessor stays rejected) is preserved.
+	 *
+	 * Defaults to `3`. Setting it to `0` (or a negative) **disables** recovery — which re-opens the stale-lock
+	 * liveness bug, so leave it on unless a caller has an independent lock-drop mechanism (see the
+	 * drop-the-lock-on-demotion tripwire in the ticket).
+	 */
+	staleGapRecoveryStrikes?: number;
 }
 
 /** Result of the trust gate: accept as a trusted anchor, accept as interim TOFU, or reject outright. */
@@ -122,14 +142,22 @@ class CachingMembershipVerifier implements MembershipVerifier {
 	private readonly byCoord = new Map<string, CachedCert>();
 	/** Per-coord timestamp of the last `source.fetch()` attempt (the rate-limit clock for {@link RefetchBound}). */
 	private readonly lastFetchAt = new Map<string, number>();
+	/**
+	 * Per-coord count of *consecutive* gap-signalled refetches against a trust-locked coord (base64url key).
+	 * Reset to zero whenever a message verifies for the coord (see {@link verifyMessage}); at
+	 * {@link staleGapRecoveryStrikes} the lock is released back to TOFU (see {@link staleGapRecovery}).
+	 */
+	private readonly staleGapStrikes = new Map<string, number>();
 	private readonly minSigs: number;
 	private readonly anchor: IMembershipTrustAnchor;
 	private readonly trustRoots: readonly NormalizedTrustRoot[];
+	private readonly staleGapRecoveryStrikes: number;
 
 	constructor(private readonly deps: MembershipVerifierDeps) {
 		this.minSigs = deps.minSigs ?? DEFAULT_MIN_SIGS;
 		this.anchor = deps.anchor ?? noAuthorityTrustAnchor;
 		this.trustRoots = (deps.trustRoots ?? []).map(normalizeTrustRoot);
+		this.staleGapRecoveryStrikes = deps.staleGapRecoveryStrikes ?? 3;
 	}
 
 	cache(cert: MembershipCertV1): void {
@@ -149,6 +177,7 @@ class CachingMembershipVerifier implements MembershipVerifier {
 			cert = await this.loadFrom(source.current(expectedCoord), tier);
 		}
 		if (cert !== undefined && this.messageVerifies(cert, signers, payload, sig)) {
+			this.staleGapStrikes.delete(coordKey); // a verify resets the consecutive stale-gap strike count
 			return "verified";
 		}
 
@@ -162,6 +191,7 @@ class CachingMembershipVerifier implements MembershipVerifier {
 		}
 		const refreshed = await this.loadFrom(source.fetch(expectedCoord), tier);
 		if (refreshed !== undefined && this.messageVerifies(refreshed, signers, payload, sig)) {
+			this.staleGapStrikes.delete(coordKey); // a verify resets the consecutive stale-gap strike count
 			return "verified";
 		}
 		return "untrusted";
@@ -242,7 +272,61 @@ class CachingMembershipVerifier implements MembershipVerifier {
 		if (this.hasRotationAttestation(cert) && this.chainGrantsTrust(cert)) {
 			return "trusted";
 		}
-		return this.fallbackTrust(cert);
+		const fallback = this.fallbackTrust(cert);
+		if (fallback !== "reject") {
+			return fallback; // first-use TOFU (coord not locked): no stale lock to recover from
+		}
+		// fallback === "reject" ⟺ the coord is trust-locked (holds a *trusted* cert) and this un-anchored cert
+		// did not chain-verify — the state that strands a former cohort member forever. Consult the stale-gap
+		// recovery counter, which releases the lock only on a demonstrated chain gap (never a forged rotation
+		// off the current predecessor). See {@link staleGapRecovery}.
+		return this.staleGapRecovery(cert);
+	}
+
+	/**
+	 * Bounded re-TOFU recovery for a coord that is **trust-locked at a stale epoch it can no longer anchor**.
+	 * Reached from {@link certIsTrusted} only when the coord already holds a *trusted* cached cert (locked),
+	 * the direct anchor said `"unknown"`, and `cert` did not chain-verify — i.e. {@link fallbackTrust} would
+	 * otherwise reject it forever. Runs on the *refetch* load only: a locked coord always holds a cached cert,
+	 * so `verifyMessage` never routes it through the `source.current()` seed path, and the strike logic keys on
+	 * "coord is locked", so `current()` never accrues a strike.
+	 *
+	 * NOTE: recovery fires **only** on a demonstrated chain gap — a full rotation attestation whose
+	 * `prevEpoch ≠` the cached trusted epoch (proof the network rotated past the cached epoch through at least
+	 * one epoch this node never witnessed). A forged rotation off the *current* cached predecessor
+	 * (`prevEpoch == cachedEpoch`) is NOT a gap, never counts as a strike, and stays rejected no matter how
+	 * often it is presented — that is the lock's headline invariant. After
+	 * {@link staleGapRecoveryStrikes} *consecutive* gap-signalled strikes the lock is released back to TOFU
+	 * (returns `"tofu"`, so {@link loadFrom} re-caches the cert as **untrusted** — a re-TOFU'd cert must never
+	 * launder trust into a rotation), which is no weaker than the documented TOFU baseline: a former member
+	 * returns to the same regime a never-member is already in. Strikes accrue only on refetches that actually
+	 * reach the source, so a {@link RefetchBound}-suppressed refetch observes no cert and recovery paces itself
+	 * with the (bounded) refetch rate — intended, do not "fix" that pacing.
+	 */
+	private staleGapRecovery(cert: MembershipCertV1): CertTrust {
+		const coordKey = cert.cohortCoord;
+		const locked = this.byCoord.get(coordKey);
+		// Recovery-eligible only on an explicit rotation gap: a full attestation whose prevEpoch is neither the
+		// cert's own epoch (a self-referential rotation) nor the cached trusted epoch (a forgery off the current
+		// predecessor — the case the lock exists to reject).
+		const isGap =
+			this.staleGapRecoveryStrikes > 0 &&
+			locked !== undefined &&
+			this.hasRotationAttestation(cert) &&
+			cert.prevEpoch !== cert.cohortEpoch &&
+			cert.prevEpoch !== locked.cert.cohortEpoch;
+		if (!isGap) {
+			return "reject"; // not a recovery-eligible gap → stay locked, exactly as before
+		}
+		const strikes = (this.staleGapStrikes.get(coordKey) ?? 0) + 1;
+		if (strikes < this.staleGapRecoveryStrikes) {
+			this.staleGapStrikes.set(coordKey, strikes);
+			return "reject"; // below threshold: keep rejecting; the inbound message stays untrusted
+		}
+		// Threshold reached: release the lock. `loadFrom` re-caches this cert as untrusted (`trusted: false`),
+		// and the message-verify retry runs against it, so the inbound later-epoch message finally verifies.
+		this.staleGapStrikes.delete(coordKey);
+		return "tofu";
 	}
 
 	/**

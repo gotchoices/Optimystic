@@ -287,6 +287,8 @@ const ADV = Array.from({ length: 16 }, (_, i) => sha256(new TextEncoder().encode
 const ROTATED = Array.from({ length: 16 }, (_, i) => sha256(new TextEncoder().encode(`rotated-${i}`)).slice(0, 16));
 const EPOCH_N = sha256(new TextEncoder().encode('epoch-n')).slice(0, 32);
 const EPOCH_N1 = sha256(new TextEncoder().encode('epoch-n+1')).slice(0, 32);
+/** A *second* rotation past N+1 — the epoch a node that missed the intermediate N+1 rotation lands on. */
+const EPOCH_N2 = sha256(new TextEncoder().encode('epoch-n+2')).slice(0, 32);
 
 /** Build a self-consistent cert over an explicit coord/epoch/member set, optionally carrying a rotation attestation. */
 function buildCertOver(opts: {
@@ -501,5 +503,129 @@ describe('cohort-topic / membership trust anchoring', () => {
 
 		const r = await v.verifyMessage(advSignersFirstKx, COORD, 2, MSG, sign(MSG));
 		expect(r).to.equal('untrusted');
+	});
+});
+
+// --- Stale trust-lock recovery: a former cohort member self-heals a lock it can no longer anchor ---
+//
+// A node that served coord C, self-published its cert (trust-LOCKING C at epoch N), then left C's cohort keeps
+// distrusting every later-epoch message from C: the anchor now says "unknown" for C, and if the node missed an
+// intermediate rotation the refetched later cert's prevEpoch (N+1) no longer matches the cached N, so the chain
+// gap keeps it rejected. Bounded re-TOFU on a *demonstrated gap* is the exit. The N+2 cert whose prevEpoch is
+// N+1 (≠ the cached N) is the "gap" signal; ROTATED is C's cohort at N+2.
+
+/** The gap cert a node cached at N sees after C rotated N → N+1 → N+2 without it: epoch N+2, prevEpoch N+1. */
+function gapCertN2(): MembershipCertV1 {
+	// The rotationSig is never decoded here — chainGrantsTrust bails on the prevEpoch/predecessor epoch mismatch
+	// (cached N ≠ prevEpoch N+1) before verifying it — so a filler is fine; only its *presence* matters.
+	return buildCertOver({ epoch: EPOCH_N2, members: ROTATED, rotation: { prevEpoch: EPOCH_N1, rotationSig: new Uint8Array(16).fill(3), rotationSigners: ROTATED.slice(0, MIN_SIGS) } });
+}
+const rotatedSignersFirstKx = ROTATED.slice(0, MIN_SIGS);
+const memberSignersFirstKx = MEMBERS.slice(0, MIN_SIGS);
+
+describe('cohort-topic / membership stale trust-lock recovery', () => {
+	const signer = createCohortSigner(crypto());
+
+	function makeVerifier(source: IMembershipSource, extra?: { anchor?: IMembershipTrustAnchor; staleGapRecoveryStrikes?: number }) {
+		const router = createMembershipSourceRouter({ committed: source, fret: source });
+		return createMembershipVerifier({ signer, router, anchor: extra?.anchor, staleGapRecoveryStrikes: extra?.staleGapRecoveryStrikes });
+	}
+
+	/** Trust-lock COORD at epoch N (self-publish the N cert), mirroring the demoted former-member start state. */
+	function lockedAtN(v: ReturnType<typeof makeVerifier>): void {
+		v.cache(buildCertOver({ epoch: EPOCH_N, members: MEMBERS }));
+	}
+
+	it('recovers a stale-locked coord after N consecutive gap-signalled refetches, then verifies from cache', async () => {
+		const gap = gapCertN2();
+		// The refetch keeps returning the same N+2 gap cert (prevEpoch N+1 ≠ the cached N → an explicit gap).
+		const source = new QueueSource([encodeCohortMessage(gap), encodeCohortMessage(gap), encodeCohortMessage(gap)]);
+		const v = makeVerifier(source, { anchor: constAnchor('unknown') }); // default threshold = 3
+		lockedAtN(v);
+
+		// The first two gap-signalled misses stay untrusted — the lock holds...
+		expect(await v.verifyMessage(rotatedSignersFirstKx, COORD, 2, MSG, sign(MSG)), 'strike 1 stays locked').to.equal('untrusted');
+		expect(await v.verifyMessage(rotatedSignersFirstKx, COORD, 2, MSG, sign(MSG)), 'strike 2 stays locked').to.equal('untrusted');
+		// ...the third strike releases the lock back to TOFU and the N+2 message finally verifies.
+		expect(await v.verifyMessage(rotatedSignersFirstKx, COORD, 2, MSG, sign(MSG)), 'strike 3 recovers').to.equal('verified');
+		expect(source.fetchCalls, 'recovery paid exactly one refetch per strike').to.equal(3);
+
+		// The lock is now replaced by the N+2 cert (cached), so subsequent messages verify with no further refetch.
+		expect(await v.verifyMessage(rotatedSignersFirstKx, COORD, 2, MSG, sign(MSG)), 'stays recovered').to.equal('verified');
+		expect(source.fetchCalls, 'a recovered coord verifies from cache — no extra refetch').to.equal(3);
+	});
+
+	it('a forged rotation off the current predecessor never strikes: it stays untrusted and cannot recover on its own', async () => {
+		// Forged N+1 cert over an adversary keyset claiming prevEpoch == N (the cached epoch) — NOT a gap.
+		const forged = buildCertOver({ epoch: EPOCH_N1, members: ADV, rotation: { prevEpoch: EPOCH_N, rotationSig: new Uint8Array(0), rotationSigners: ADV.slice(0, MIN_SIGS) } });
+		forged.rotationSig = bytesToB64url(rotationSigOver(forged));
+		const gap = gapCertN2();
+		// 12 forged refetches, then the 3 genuine gap refetches.
+		const fetches = [...Array.from({ length: 12 }, () => encodeCohortMessage(forged)), encodeCohortMessage(gap), encodeCohortMessage(gap), encodeCohortMessage(gap)];
+		const source = new QueueSource(fetches);
+		const v = makeVerifier(source, { anchor: constAnchor('unknown') });
+		lockedAtN(v);
+
+		// The forged cert, presented far more than the threshold, never counts as a strike → always untrusted.
+		for (let i = 0; i < 12; i++) {
+			expect(await v.verifyMessage(advSignersFirstKx, COORD, 2, MSG, sign(MSG)), `forged attempt ${i} stays locked`).to.equal('untrusted');
+		}
+		// The genuine gap cert still needs its full 3 *consecutive* strikes (the forged ones accrued nothing).
+		expect(await v.verifyMessage(rotatedSignersFirstKx, COORD, 2, MSG, sign(MSG)), 'gap strike 1').to.equal('untrusted');
+		expect(await v.verifyMessage(rotatedSignersFirstKx, COORD, 2, MSG, sign(MSG)), 'gap strike 2').to.equal('untrusted');
+		expect(await v.verifyMessage(rotatedSignersFirstKx, COORD, 2, MSG, sign(MSG)), 'gap strike 3 recovers').to.equal('verified');
+	});
+
+	it('a forged-off-predecessor cert interleaved with the real gap cert stays untrusted and neither blocks nor accelerates recovery', async () => {
+		const forged = buildCertOver({ epoch: EPOCH_N1, members: ADV, rotation: { prevEpoch: EPOCH_N, rotationSig: new Uint8Array(0), rotationSigners: ADV.slice(0, MIN_SIGS) } });
+		forged.rotationSig = bytesToB64url(rotationSigOver(forged));
+		const gap = gapCertN2();
+		// Alternate gap / forged / gap / forged / gap. The forged calls neither reset (they never verify) nor
+		// strike (not a gap), so the real gap's consecutive count is 1 → 2 → 3 across its own three refetches.
+		const source = new QueueSource([encodeCohortMessage(gap), encodeCohortMessage(forged), encodeCohortMessage(gap), encodeCohortMessage(forged), encodeCohortMessage(gap)]);
+		const v = makeVerifier(source, { anchor: constAnchor('unknown') });
+		lockedAtN(v);
+
+		expect(await v.verifyMessage(rotatedSignersFirstKx, COORD, 2, MSG, sign(MSG)), 'gap strike 1').to.equal('untrusted');
+		expect(await v.verifyMessage(advSignersFirstKx, COORD, 2, MSG, sign(MSG)), 'interleaved forged stays untrusted').to.equal('untrusted');
+		expect(await v.verifyMessage(rotatedSignersFirstKx, COORD, 2, MSG, sign(MSG)), 'gap strike 2').to.equal('untrusted');
+		expect(await v.verifyMessage(advSignersFirstKx, COORD, 2, MSG, sign(MSG)), 'interleaved forged stays untrusted').to.equal('untrusted');
+		expect(await v.verifyMessage(rotatedSignersFirstKx, COORD, 2, MSG, sign(MSG)), 'gap strike 3 recovers on its own count').to.equal('verified');
+	});
+
+	it('a gap cert whose direct anchor says "rejected" is dropped regardless of strike count', async () => {
+		const gap = gapCertN2();
+		const source = new QueueSource(Array.from({ length: 6 }, () => encodeCohortMessage(gap)));
+		const v = makeVerifier(source, { anchor: constAnchor('rejected') }); // a "rejected" verdict is fatal, pre-empts recovery
+		lockedAtN(v);
+		for (let i = 0; i < 6; i++) {
+			expect(await v.verifyMessage(rotatedSignersFirstKx, COORD, 2, MSG, sign(MSG)), `rejected-anchor attempt ${i}`).to.equal('untrusted');
+		}
+	});
+
+	it('does not recover below the configured strike threshold', async () => {
+		const gap = gapCertN2();
+		const source = new QueueSource(Array.from({ length: 4 }, () => encodeCohortMessage(gap)));
+		const v = makeVerifier(source, { anchor: constAnchor('unknown'), staleGapRecoveryStrikes: 5 }); // 4 strikes is one short
+		lockedAtN(v);
+		for (let i = 0; i < 4; i++) {
+			expect(await v.verifyMessage(rotatedSignersFirstKx, COORD, 2, MSG, sign(MSG)), `strike ${i + 1} < 5, still locked`).to.equal('untrusted');
+		}
+	});
+
+	it('a successful verify between strikes resets the consecutive counter', async () => {
+		const gap = gapCertN2();
+		// gap (strike 1) → an N-cohort message (verifies from the still-cached N cert, resets) → three fresh gaps.
+		const source = new QueueSource(Array.from({ length: 4 }, () => encodeCohortMessage(gap)));
+		const v = makeVerifier(source, { anchor: constAnchor('unknown') }); // default threshold = 3
+		lockedAtN(v);
+
+		expect(await v.verifyMessage(rotatedSignersFirstKx, COORD, 2, MSG, sign(MSG)), 'gap strike 1').to.equal('untrusted');
+		// A legit message still signed by the cached N cohort verifies from cache → resets the consecutive count.
+		expect(await v.verifyMessage(memberSignersFirstKx, COORD, 2, MSG, sign(MSG)), 'N-cohort message verifies (resets)').to.equal('verified');
+		// The counter is back to zero, so three fresh consecutive gap strikes are required again.
+		expect(await v.verifyMessage(rotatedSignersFirstKx, COORD, 2, MSG, sign(MSG)), 'fresh strike 1').to.equal('untrusted');
+		expect(await v.verifyMessage(rotatedSignersFirstKx, COORD, 2, MSG, sign(MSG)), 'fresh strike 2').to.equal('untrusted');
+		expect(await v.verifyMessage(rotatedSignersFirstKx, COORD, 2, MSG, sign(MSG)), 'fresh strike 3 recovers').to.equal('verified');
 	});
 });
