@@ -502,10 +502,10 @@ A participant verifies a notification or threshold-signed message as follows:
 3. Look up the most recent `MembershipCertV1` for that coord, cached locally or fetched from any cohort member.
 4. Verify (a) the certificate is current, signed, and consistent with FRET stabilization, and (b) the signers in the message are a `≥ minSigs` subset of the certificate's members.
 
-`MembershipCertV1` is refreshed by the cohort every `T_membership_refresh` (default 5 minutes) and on any stabilization event that changes the first `k − x` members. Participants cache the latest one they've seen per coord; verification against a slightly stale cert is acceptable as long as the cert's signers overlap with the current cohort by quorum.
+`MembershipCertV1` is refreshed by the cohort every `T_membership_refresh` (default 5 minutes) and on any stabilization event that changes the cohort membership — i.e. any change to the epoch `H(sorted members)`, head or tail. Participants cache the latest one they've seen per coord; verification against a slightly stale cert is acceptable as long as the cert's signers overlap with the current cohort by quorum.
 
-> **Implementation.** Cohort-side publication (at stabilization, on a first-`k − x` change, and on
-> the refresh tick) is
+> **Implementation.** Cohort-side publication (at stabilization, on any epoch change — any member
+> change, head or tail — and on the refresh tick) is
 > [`membership/publisher.ts`](../packages/db-core/src/cohort-topic/membership/publisher.ts);
 > participant-side verification is
 > [`membership/verifier.ts`](../packages/db-core/src/cohort-topic/membership/verifier.ts). The
@@ -555,8 +555,9 @@ A participant joining the network gets its initial trust roots (the cohorts resp
 3. **Attestation chain (epoch rotation)** — a cert may carry a rotation attestation (`prevEpoch` / `rotationSig` / `rotationSigners`, all three or none): the *predecessor* cohort's threshold signature over **this** cert's signing payload. If the node already holds a **trusted** cert for the same coord whose epoch is `prevEpoch`, and that predecessor's members form a `≥ minSigs` quorum over the successor payload, the successor inherits trust. This is what distinguishes a legitimate rotation (the prior cohort signed off) from a forgery. Only a *trusted* cert may anchor a successor — a cert that only reached the cache via the TOFU fallback (below) never launders trust into a rotation. The attestation is **not** part of `membershipCertSigningPayload` (it signs *over* it), so legacy certs without it still decode.
 
    > **Producing the attestation (db-p2p host, `cohort-topic-trust-anchor-rotation-production`).** Each
-   > served `CoordEngine` tracks its last-published cohort identity. When a publish changes the first
-   > `k − x` members (the publisher's own republish trigger), the host threshold-signs the **new** cert's
+   > served `CoordEngine` tracks its last-published cohort identity. When a publish changes the cohort
+   > epoch — any member change, head or tail (the publisher's own republish trigger) — the host
+   > threshold-signs the **new** cert's
    > `membershipCertSignable` image under the **predecessor** cohort identity — a `/sign` round with a new
    > `"rotation"` `SignKind`, `cohortEpoch = prevEpoch`, dialing the *outgoing* members — and attaches the
    > `{ prevEpoch, rotationSig, rotationSigners }` via the publisher's `rotation` arg. Because rotation is
@@ -574,7 +575,7 @@ A participant joining the network gets its initial trust roots (the cohorts resp
    > anchor / TOFU, no worse than a non-rotation publish. *Rapid double rotation* (N → N+1 → N+2 within one
    > observe window): each publish attests only its immediate predecessor, so a participant cached at N that
    > receives N+2 sees a gap and re-anchors — no multi-hop attestation is attempted. *Refresh republish*
-   > (periodic, first `k − x` unchanged) is not a rotation and carries no rotation fields.
+   > (periodic, epoch unchanged) is not a rotation and carries no rotation fields.
 
 > **Why no monotonic-epoch / rollback gate.** `cohortEpoch = H(sorted members)` is content-derived, not an ordered counter, so epochs are unorderable hash ids and the chain is a hash-linked attestation DAG (`prevEpoch` is a hash pointer), not a height-ordered ledger. Replaying an older legitimately-signed cert is a **freshness** concern (stale membership), already covered by `stabilizedAt` + the one-refetch tolerance — not a trust-gate concern.
 

@@ -360,7 +360,8 @@ export interface CoordEngine {
 	topicTraffic(topicId: Uint8Array): TopicTrafficV1;
 	/**
 	 * Publish a fresh threshold-signed `MembershipCertV1` on a cohort-membership-change / stabilization
-	 * event (republishes only when the first `k − x` members changed). Returns the cert if published.
+	 * event (republishes only when the cohort epoch — `H(sorted members)` — changed, i.e. on any member
+	 * change, head or tail). Returns the cert if published.
 	 * Resolves `undefined` if no republish was needed or the quorum was unreachable this round.
 	 */
 	onStabilized(now: number): Promise<MembershipCertV1 | undefined>;
@@ -1238,8 +1239,9 @@ interface CohortIdentity {
  * Two roles, one small object:
  *
  * - **Producer** — {@link predecessor} is the identity of the *last published* cert; a publish whose
- *   first `k − x` differ from it is a rotation, and the predecessor identity scopes the rotation `/sign`
- *   round (its epoch is `prevEpoch`, its members are the outgoing cohort to collect from).
+ *   epoch (`H(sorted members)`) differs from it is a rotation — any member change, head or tail — and the
+ *   predecessor identity scopes the rotation `/sign` round (its epoch is `prevEpoch`, its members are the
+ *   outgoing cohort to collect from).
  * - **Endorser** — {@link membersAt} answers "was I a member of the cohort at `epoch`?" over a two-deep
  *   observed-epoch history ({@link current} + {@link prior}), kept fresh by {@link observe} on every
  *   cohort assembly. A request for an epoch past that window is refused (the rapid-double-rotation gap).
@@ -2159,7 +2161,7 @@ function crossCheckCohort(fret: FretService, wantK: number, servedCoord: RingCoo
 	}
 }
 
-/** Positional equality over two string lists (the first-`k − x` rotation-change check). */
+/** Positional equality over two string lists (the endorser's sorted-member-list image check). */
 function sameStringOrder(a: readonly string[], b: readonly string[]): boolean {
 	if (a.length !== b.length) {
 		return false;
