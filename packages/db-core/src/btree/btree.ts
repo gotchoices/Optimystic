@@ -659,7 +659,7 @@ export class BTree<TKey, TEntry> {
 			const entry = rightSib.entries[0]!;
 			apply(this.store, rightSib, [entries$, 0, 1, []]);
 			apply(this.store, leaf, [entries$, leaf.entries.length, 0, [entry]]);
-			this.updatePartition(pIndex + 1, path, depth - 1, this.keyFromEntry(entry));
+			this.updatePartition(pIndex + 1, path, depth - 1, this.keyFromEntry(rightSib.entries[0]!));
 			return undefined;
 		}
 

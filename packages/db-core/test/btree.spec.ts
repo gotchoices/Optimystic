@@ -494,6 +494,30 @@ describe('BTree', () => {
       expect(after).to.deep.equal(before);
     })
 
+    it('should find borrowed entry after borrow-from-right rebalance', async () => {
+      // NodeCapacity=64, half=32. Insert 65 values → leaf1=[0..31](32), leaf2=[32..64](33).
+      // Delete 0 → leaf1 drops to 31 → borrow from right: entry 32 moves to leaf1.
+      // Correct new separator: 33. Bug: separator stays 32, making get(32) descend into leaf2.
+      for (let i = 0; i < 65; i++) {
+        await btree.insert(i);
+      }
+
+      const path0 = await btree.find(0);
+      await btree.deleteAt(path0);
+
+      // Borrowed entry must be reachable via point lookup
+      expect(await btree.get(32)).to.equal(32);
+
+      // Full scan must return every remaining key [1..64]
+      const collected: number[] = [];
+      const path = await btree.first();
+      while (path.on) {
+        collected.push(btree.at(path)!);
+        await btree.moveNext(path);
+      }
+      expect(collected).to.deep.equal(Array.from({ length: 64 }, (_, i) => i + 1));
+    })
+
     it('should roll back partial delete when rebalance read fails', async () => {
       // Insert 65 values to force one split:
       //   leaf1: [0..31], leaf2: [32..64], root branch
