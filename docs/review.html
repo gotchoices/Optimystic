@@ -1,0 +1,733 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Optimystic Code &amp; Design Review — July 2026</title>
+<style>
+  :root {
+    --high: #c0392b; --high-bg: #fdf0ee;
+    --med: #b9770e; --med-bg: #fdf6ec;
+    --low: #5d6d7e; --low-bg: #f2f4f6;
+    --good: #1e8449; --good-bg: #edf7f0;
+    --ink: #1c2733; --muted: #5c6b7a; --line: #dde4ea;
+    --code-bg: #f0f3f6; --accent: #2c5f8a;
+  }
+  * { box-sizing: border-box; }
+  body {
+    font-family: -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    color: var(--ink); margin: 0; padding: 0 1.5rem 5rem;
+    line-height: 1.55; background: #fff;
+  }
+  main { max-width: 1000px; margin: 0 auto; }
+  h1 { font-size: 1.9rem; margin: 2.2rem 0 0.3rem; }
+  h2 { font-size: 1.45rem; margin: 3rem 0 0.8rem; padding-top: 0.8rem; border-top: 2px solid var(--line); }
+  h3 { font-size: 1.12rem; margin: 1.8rem 0 0.5rem; }
+  p, li { max-width: 78ch; }
+  .subtitle { color: var(--muted); margin: 0 0 1.2rem; }
+  code {
+    font-family: ui-monospace, "Cascadia Code", Consolas, monospace;
+    font-size: 0.86em; background: var(--code-bg);
+    padding: 0.08em 0.35em; border-radius: 4px; word-break: break-word;
+  }
+  a { color: var(--accent); }
+  table { border-collapse: collapse; width: 100%; margin: 1rem 0; font-size: 0.93rem; }
+  th, td { border: 1px solid var(--line); padding: 0.45rem 0.65rem; text-align: left; vertical-align: top; }
+  th { background: #f6f8fa; }
+  .statgrid { display: flex; flex-wrap: wrap; gap: 0.8rem; margin: 1.2rem 0; }
+  .stat {
+    flex: 1 1 130px; border: 1px solid var(--line); border-radius: 8px;
+    padding: 0.7rem 0.9rem; text-align: center;
+  }
+  .stat .n { font-size: 1.6rem; font-weight: 700; display: block; }
+  .stat .l { font-size: 0.8rem; color: var(--muted); }
+  .stat.sev-high .n { color: var(--high); }
+  .stat.sev-med .n { color: var(--med); }
+  .stat.sev-low .n { color: var(--low); }
+  .badge {
+    display: inline-block; font-size: 0.7rem; font-weight: 700; letter-spacing: 0.04em;
+    padding: 0.12em 0.55em; border-radius: 10px; color: #fff; vertical-align: 1px; margin-right: 0.5em;
+  }
+  .badge.high { background: var(--high); }
+  .badge.med  { background: var(--med); }
+  .badge.low  { background: var(--low); }
+  .badge.good { background: var(--good); }
+  .cat { font-size: 0.74rem; color: var(--muted); text-transform: uppercase; letter-spacing: 0.05em; margin-left: 0.4em; }
+  details.f {
+    border: 1px solid var(--line); border-left-width: 4px; border-radius: 6px;
+    margin: 0.6rem 0; padding: 0.15rem 0.9rem;
+  }
+  details.f.high { border-left-color: var(--high); background: var(--high-bg); }
+  details.f.med  { border-left-color: var(--med);  background: var(--med-bg); }
+  details.f.low  { border-left-color: var(--low);  background: var(--low-bg); }
+  details.f summary {
+    cursor: pointer; font-weight: 600; padding: 0.45rem 0; list-style-position: outside;
+  }
+  details.f summary code { background: rgba(0,0,0,0.06); font-weight: 400; }
+  details.f p { margin: 0.4rem 0 0.7rem; }
+  .fix { border-top: 1px dashed rgba(0,0,0,0.15); padding-top: 0.45rem; }
+  .fix::before { content: "Suggested fix — "; font-weight: 700; }
+  .verdict {
+    border: 1px solid var(--line); border-left: 4px solid var(--accent);
+    border-radius: 6px; background: #f6f9fc; padding: 0.9rem 1.1rem; margin: 1.2rem 0;
+  }
+  .strength {
+    border: 1px solid var(--line); border-left: 4px solid var(--good);
+    border-radius: 6px; background: var(--good-bg); padding: 0.7rem 1rem; margin: 0.6rem 0;
+  }
+  nav.toc {
+    border: 1px solid var(--line); border-radius: 8px; padding: 0.8rem 1.2rem; margin: 1.5rem 0;
+    background: #fafbfc; columns: 2; column-gap: 2rem; font-size: 0.93rem;
+  }
+  nav.toc ol { margin: 0; padding-left: 1.2rem; }
+  nav.toc li { margin: 0.2rem 0; }
+  .assess {
+    font-size: 0.95rem; color: var(--muted); border-top: 1px dashed var(--line);
+    margin-top: 1.2rem; padding-top: 0.8rem;
+  }
+  .assess strong { color: var(--ink); }
+  .prio td:first-child { white-space: nowrap; font-weight: 700; }
+  .meta { font-size: 0.86rem; color: var(--muted); }
+  @media (max-width: 720px) { nav.toc { columns: 1; } }
+</style>
+</head>
+<body>
+<main>
+
+<h1>Optimystic — Code &amp; Design Review</h1>
+<p class="subtitle">Full-codebase review · July 2, 2026 · branch <code>main</code> (be63206 + working changes)</p>
+
+<p class="meta"><strong>Method.</strong> Eight parallel deep-review passes over the monorepo (~48k lines of TypeScript across 11 packages): six subsystem code reviews (db-core foundations; transaction layer; cohort-topic/matchmaking/reactivity; db-p2p network &amp; consensus; storage + adapters; SQL plugins &amp; apps), one distributed-systems design review checking the docs' claims against the implementation, and one cross-cutting engineering-health review. Every finding below was verified against actual source with file:line references — none are speculation from names or docs.</p>
+
+<nav class="toc">
+<ol>
+  <li><a href="#exec">Executive summary</a></li>
+  <li><a href="#design">Design-level review</a></li>
+  <li><a href="#foundations">db-core foundations</a></li>
+  <li><a href="#txn">Transaction layer</a></li>
+  <li><a href="#cohort">Cohort-topic substrate</a></li>
+  <li><a href="#p2p">P2P network &amp; consensus</a></li>
+  <li><a href="#storage">Storage &amp; adapters</a></li>
+  <li><a href="#sql">SQL integration &amp; apps</a></li>
+  <li><a href="#health">Engineering health</a></li>
+  <li><a href="#strengths">What's genuinely good</a></li>
+  <li><a href="#prio">Prioritized recommendations</a></li>
+</ol>
+</nav>
+
+<!-- ============================================================ -->
+<h2 id="exec">1. Executive summary</h2>
+
+<div class="verdict">
+<p><strong>Verdict.</strong> Optimystic's core primitives are well-chosen and, on the happy path, well-built: content-addressed versioned blocks, deterministic-replay validation, Ed25519-signed two-phase commit, a genuinely transport-free <code>db-core</code>, and unusually honest, high-quality documentation. The maturity gap is systematic and predictable: <em>failure paths, adversarial paths, and rarely-exercised branches are markedly less sound than the happy path</em>. The most serious issues cluster at trust boundaries (signatures verified against unbound keys, unverified peer claims driving restoration), at protocol seams (cluster membership never agreed upon, multi-collection commit not atomic, read dependencies lost on cache hits), and in rare-branch logic (B-tree rebalancing). None of these require a redesign — but several must land before the system faces churn, crashes, or adversaries.</p>
+</div>
+
+<div class="statgrid">
+  <div class="stat"><span class="n">11</span><span class="l">packages</span></div>
+  <div class="stat"><span class="n">~48k</span><span class="l">lines of src TS</span></div>
+  <div class="stat"><span class="n">~112</span><span class="l">verified findings</span></div>
+  <div class="stat sev-high"><span class="n">32</span><span class="l">HIGH</span></div>
+  <div class="stat sev-med"><span class="n">51</span><span class="l">MEDIUM</span></div>
+  <div class="stat sev-low"><span class="n">29</span><span class="l">LOW</span></div>
+</div>
+
+<h3>The ten findings that matter most</h3>
+<ol>
+  <li><strong>Consensus signatures aren't bound to peer identities.</strong> Cluster vote signatures are verified against public keys carried <em>inside the record itself</em>, never checked against the peer ID. A malicious coordinator can invent a cohort, sign all the votes itself, and every honest member accepts a forged super-majority. <a href="#p2p-1">→ P2P #1</a></li>
+  <li><strong>Cluster membership is a per-coordinator local view, not an agreed set</strong> — and <code>record.peers</code> is not in the message hash. Every safety theorem quantifies over "the cluster," but nothing agrees on who the cluster is; churn produces spurious <code>Peers mismatch</code> aborts at best and split quorums at worst. <a href="#d-h1">→ Design H1</a></li>
+  <li><strong>Snapshot isolation is porous: cache hits record no read dependency.</strong> Reads served from <code>CacheSource</code> never reach <code>TransactorSource</code>, the only place a <code>ReadDependency</code> is recorded — so OCC validation never sees them. <a href="#tx-1">→ Txn #1</a></li>
+  <li><strong>The B-tree has four real corruption/wrong-result bugs in rebalance and iteration edge cases</strong> (borrow-from-right partition key, ancestor separator corruption on deep merges, end-of-leaf crack returning empty range scans, missing <code>await</code>s). A property/fuzz test would have caught all of them. <a href="#fo-1">→ Foundations #1–5</a></li>
+  <li><strong>Multi-collection transactions can half-commit and report failure.</strong> Commits run sequentially per collection with no cross-collection 2PC journal; on mid-loop failure the already-committed collections stand while the client is told the transaction failed. <a href="#tx-3">→ Txn #3</a>, <a href="#d-h4">Design H4</a></li>
+  <li><strong>Byzantine <em>tolerance</em> is actually Byzantine <em>detection</em>.</strong> Dispute escalation is disabled by default, single-round, post-commit, and never wired into the live node; arbitrators are selected from the same XOR-neighborhood an attacker would capture. <a href="#d-h2">→ Design H2/H3</a>, <a href="#p2p-3">P2P #3</a></li>
+  <li><strong>Storage can silently diverge or permanently corrupt.</strong> <code>get()</code>-driven promotion bypasses the per-block commit latch; commits accept non-contiguous revisions on stale bases; pends seed an open-ended <code>ranges: [[0]]</code> that disables restoration; the fs adapter's non-atomic writes make one crash permanently unreadable. <a href="#st-1">→ Storage #1–4</a></li>
+  <li><strong>The SQL layer returns wrong results.</strong> PK range filters are claimed as handled but never applied (<code>WHERE pk &gt; x</code> returns every row); the tree comparator is raw lexicographic so INTEGER/DESC/collated PKs mis-sort — while the correct comparator exists as dead code. <a href="#sq-1">→ SQL #1–2</a></li>
+  <li><strong>The cohort-topic renew path has no replay protection, and wire numerics are unbounded.</strong> A captured signed <code>withdraw</code> is valid forever; unvalidated <code>treeTier</code>/<code>ttl</code> allow unbounded attacker-keyed engine creation and unevictable topics. <a href="#ct-1">→ Cohort #1–4</a></li>
+  <li><strong>Session-built transactions can't validate remotely, and a transient apply fault drops a transaction forever.</strong> <code>engineId: 'unknown'</code> means every validating node would reject session transactions; and the persistent "executed" marker is never rolled back after an apply failure, so redelivery is skipped permanently. <a href="#tx-7">→ Txn #7</a>, <a href="#p2p-2">P2P #2</a></li>
+</ol>
+
+<h3>Cross-cutting themes</h3>
+<ul>
+  <li><strong>Happy path ≫ failure path.</strong> Coordinators, trackers, and stores handle the main line carefully; the crash, retry, partial-failure, and adversarial branches contain most of the HIGH findings. The pattern repeats in every subsystem.</li>
+  <li><strong>Advertised guarantees run ahead of the implementation.</strong> <code>correctness.md</code>'s theorems describe target mechanisms (dispute cascade, multi-collection recovery, client signatures) that are unimplemented or disabled by default. <code>architecture.md</code> §Status is honest about this; <code>correctness.md</code> is not annotated the same way and over-credits the shipping system.</li>
+  <li><strong>The bugs live where the type system was turned off.</strong> The seam files — <code>libp2p-node-base.ts</code> (28 <code>as any</code>, six empty <code>catch {}</code>) and <code>network-transactor.ts</code> (13 <code>as any</code>) — are exactly where load-bearing wiring silently fails.</li>
+  <li><strong>Duplication that must-stay-identical has already drifted.</strong> Wire validators exist in three copies; the index-value serializer in two (and the drift is finding <a href="#sq-3">SQL #3</a>); operations hashing is duplicated between coordinator and validator with no canonical ordering; four storage adapters are ~150-line near-clones.</li>
+  <li><strong>Unbounded growth in several ledgers.</strong> No sweep/archival exists (storage grows O(revisions) forever); tracker op-lists grow unboundedly per hot block; several attacker-keyed maps (replay guard, membership verifier, cold-start forwarders) have no caps.</li>
+</ul>
+
+<!-- ============================================================ -->
+<h2 id="design">2. Design-level review (distributed-systems assessment)</h2>
+<p class="meta">Docs reviewed: architecture, transactions, correctness, right-is-right, arachnode, repository, crdt-sync, partition-healing, cohort-topic — each spot-checked against the implementation. "Design flaw" = unsound even if built as written; "drift" = docs promise what code doesn't do.</p>
+
+<details class="f high" open id="d-h1">
+<summary><span class="badge high">HIGH</span>Cluster membership is a unilateral coordinator view — the foundation of every safety theorem is unagreed <span class="cat">design flaw</span></summary>
+<p><code>correctness.md</code> §2 and Theorem 1 assume "the cluster responsible for B" is a well-defined set with an honest majority. In code, the set is whatever the coordinator's own <code>findCluster(blockId)</code> returns at transaction start (<code>packages/db-p2p/src/repo/cluster-coordinator.ts:126-166</code>), frozen into <code>record.peers</code>. The message hash covers <code>record.message</code> only — <strong>not <code>record.peers</code></strong> (<code>createMessageHash</code>, :117-121). Two coordinators (or one, before/after churn) can drive the same <code>messageHash</code> with different peer sets; <code>ClusterMember.mergeRecords</code> hard-throws <code>'Peers mismatch'</code> on divergence (<code>cluster/cluster-repo.ts:438-440</code>), so honest members reject each other rather than converge. Under partition, a minority re-derives a smaller local cluster and can reach 75% of <em>that</em> — Theorem 2's arithmetic assumes a shared K that nothing enforces, and the <code>validateSmallCluster</code> backstop fails open when FRET confidence is low (:375-379), precisely the condition a partition induces.</p>
+<p class="fix">Make membership part of what is agreed: fold a membership epoch/hash into the consensus record (include <code>record.peers</code> in the signed message hash), or anchor cluster identity on the threshold-signed <code>MembershipCertV1</code> machinery that already exists in cohort-topic. Treat this as the highest-priority design item — the dispute cascade is meaningless if the base cluster set isn't agreed.</p>
+</details>
+
+<details class="f high" open id="d-h2">
+<summary><span class="badge high">HIGH</span>Byzantine tolerance is detection-only; the escalation that would upgrade it is off by default, single-round, and post-hoc <span class="cat">drift + design</span></summary>
+<p>The docs promise "any validity disagreement blocks the transaction and triggers cascading geometric escalation." The code does the opposite: with a minority rejection, <code>ClusterCoordinator.executeTransaction</code> commits anyway at 75% super-majority and merely sets <code>record.disputed = true</code> (<code>cluster-coordinator.ts:299-332</code>). The dispute service defaults to <code>disputeEnabled: false</code> (<code>dispute/types.ts:124</code>); even when enabled, <code>dispute-service.ts:160-222</code> selects one ring of arbitrators, votes once, and resolves — no recursion, no geometric widening, and it runs <em>after</em> commit. The Adaptive-BFT cost model (Theorems 8, 10) describes a mechanism that is not implemented. Today's real guarantee is "Byzantine-detectable within a cluster that has an honest super-majority" — strictly weaker than the advertised f&lt;N/2 tolerance.</p>
+<p class="fix">Short term: annotate <code>correctness.md</code> theorem-by-theorem with target-vs-current (as <code>architecture.md</code> §Status already does) so the formal claims aren't over-read. Long term: implement the synchronous, cascading escalation — but only after <a href="#d-h1">H1</a>, since the cascade inherits the membership problem.</p>
+</details>
+
+<details class="f high" open id="d-h3">
+<summary><span class="badge high">HIGH</span>Arbitrator independence is defeated by ID-proximity selection <span class="cat">design flaw</span></summary>
+<p><code>dispute/arbitrator-selection.ts:10-28</code> picks arbitrators as ring positions K+1…2K by XOR distance to the block ID — the peers immediately adjacent to the (possibly captured) cluster. An attacker who can place node IDs near a block to capture its cluster (the Sybil vector <code>correctness.md</code> §7.1 admits) captures the next ring just as cheaply. Geometric widening only helps if each wider ring samples a more representative population; concentric XOR-neighbors walk through the attacker's owned region first.</p>
+<p class="fix">Sample escalation audiences from an unpredictable, non-local population — e.g. hash(blockId ‖ escalation-round ‖ epoch) → pseudo-random ring coordinates — so each round's audience is drawn from the whole keyspace rather than the attacker's neighborhood.</p>
+</details>
+
+<details class="f high" open id="d-h4">
+<summary><span class="badge high">HIGH</span>Multi-collection atomicity (Theorem 3) is not realized — sequential commits, no un-commit, no recovery journal <span class="cat">drift</span></summary>
+<p><code>TransactionCoordinator.commitPhase</code> (<code>packages/db-core/src/transaction/coordinator.ts:732-804</code>) loops over collections calling <code>transactor.commit</code> one at a time; on mid-loop failure, <code>cancelPhase</code> excludes already-committed collections (:604-610, 812-821) — those commits stand. Commit can genuinely fail after successful PEND (a racing transaction advances the log tail between prepare and commit), so partial commit is reachable in normal operation. The persisted-state recovery Theorem 3 relies on lives per-<em>cluster</em> in <code>cluster-coordinator.ts</code> and only resumes the <code>broadcasting</code> phase (:775-805); there is no multi-collection 2PC journal at all.</p>
+<p class="fix">Either give the coordinator a durable cross-collection decision record (real 2PC over the supercluster), or explicitly downgrade Theorem 3 to "atomic-intent, eventual-visibility" per the <code>crdt-sync.md</code> direction — which is the more honest framing of what the code does. Either way, surface <code>committedCollections</code> in the failure result so callers know reconciliation is required.</p>
+</details>
+
+<details class="f med" id="d-m1">
+<summary><span class="badge med">MEDIUM</span>Hot log-tail is a structural per-collection throughput ceiling <span class="cat">design limit</span></summary>
+<p>Every write to a collection funnels through one critical cluster; conflict losers are rejected outright (<code>resolveRace</code>, <code>cluster-repo.ts:1142-1156</code>). The acknowledged fix (<code>crdt-sync.md</code> HLC redesign) is entirely unimplemented. A correct CP tradeoff, but there is no throughput story for a hot collection today beyond "shard into more collections."</p>
+<p class="fix">Document the sharding guidance for application authors now; sequence the crdt-sync migration stages when contention becomes real.</p>
+</details>
+
+<details class="f med" id="d-m2">
+<summary><span class="badge med">MEDIUM</span>OCC starvation is real and systematically biased against large transactions <span class="cat">design limit</span></summary>
+<p>Theorem 9 admits no deterministic starvation prevention. Block-granular read-dependency capture (including B-tree interior and log-chain nodes) makes large transactions structurally more likely to observe stale reads and lose races indefinitely to short ones — a fairness inversion, honestly flagged, with no fence primitive built.</p>
+<p class="fix">Ship a coordinator-side exponential backoff-with-priority-aging default rather than deferring entirely to applications; consider excluding purely structural (interior-node) reads from the conflict set where safe.</p>
+</details>
+
+<details class="f med" id="d-m3">
+<summary><span class="badge med">MEDIUM</span>Arachnode ring-shifting omits the hard part: safe responsibility handoff <span class="cat">design gap</span></summary>
+<p><code>arachnode.md</code> describes nodes shifting rings on capacity/demand but no protocol for atomic responsibility transfer — a node moving outward sheds half its keyspace, and if inward/outward references haven't loaded that slice elsewhere, those keys lose a replica. <code>ringDepth = ceil(-log2(capacity/demand))</code> is an undamped reactive control loop — a classic thrashing setup near ring boundaries. Mostly not-yet-implemented, but the design itself doesn't address handoff.</p>
+<p class="fix">Specify a two-phase handoff (advertise-new-ring → confirm-replication → release-old-range) and add hysteresis/damping to the ring-depth signal before building the migration machinery.</p>
+</details>
+
+<details class="f med" id="d-m5">
+<summary><span class="badge med">MEDIUM</span>Clients are unauthenticated; transactions carry no client signature <span class="cat">drift</span></summary>
+<p><code>right-is-right.md</code> §Client Signatures and the recovery scenarios assume client-signed transactions; <code>TransactionStamp</code> has <code>peerId</code> but no signature field, and no client-signature verification exists on the pend/commit path. Until this lands, the "bad client gets isolated" story and Theorem 13's recovery anchoring are incomplete. Flagged as target in the docs.</p>
+<p class="fix">Add a signature over the stamp + statements to <code>TransactionStamp</code> and verify at pend; this also unblocks the dispute-recovery paths that need to authenticate the original transaction.</p>
+</details>
+
+<details class="f low" id="d-l1">
+<summary><span class="badge low">LOW</span>Assorted design notes <span class="cat">design</span></summary>
+<p><strong>Operations-hash spec:</strong> validator agreement rests on identical hashing, but <code>transactions.md:792-801</code> shows a non-cryptographic 32-bit example hash; the canonical operation serialization should be specified and versioned with <code>engineId</code> (the implementation-level ordering bug is <a href="#tx-10">Txn #10</a>). <strong>Threshold defaults diverge:</strong> <code>ClusterMember.superMajorityThreshold</code> defaults to 1.0 (<code>cluster-repo.ts:192</code>) while the coordinator policy defaults to 0.75 (<code>coordinator-repo.ts:92</code>) — a latent phase-disagreement misconfiguration; enforce config coupling. <strong>Reads are soft:</strong> non-responsible reads warn and serve anyway with a 10 s lazy read-repair window — fine per Theorem 15, a footgun for app authors who haven't read it. <strong>Ejection is local:</strong> reputation lives per-node with decay; an "ejected" peer reconnecting to fresh nodes carries no scarlet letter (<code>right-is-right.md</code> asks this open question itself).</p>
+</details>
+
+<p class="assess"><strong>Design assessment.</strong> Taken as "a CP, log-tail-ordered, optimistic-concurrency database with Byzantine <em>detection</em> inside honest-majority clusters," Optimystic delivers, and the code backs the claim — deterministic-replay validation, verified vote signatures (modulo <a href="#p2p-1">P2P #1</a>), and real equivocation detection. The weaknesses concentrate where the design leans on assumptions it doesn't enforce: cluster identity (H1) and the tolerance-vs-detection gap (H2/H3). Recommendation: fix membership agreement first, then either implement or honestly downgrade the multi-collection atomicity claim, and annotate <code>correctness.md</code> with target-vs-current so its theorems aren't read as descriptions of the shipping system.</p>
+
+<!-- ============================================================ -->
+<h2 id="foundations">3. db-core foundations <span class="meta">(blocks · btree · chain · transform · log · collections · utility)</span></h2>
+
+<details class="f high" open id="fo-1">
+<summary><span class="badge high">HIGH</span>B-tree borrow-from-right writes the wrong partition key — borrowed entry becomes unreachable <span class="cat">bug</span> <code>btree/btree.ts:658-664</code></summary>
+<p>In <code>rebalanceLeaf</code>, borrowing the right sibling's first entry updates the parent separator with the key of the entry that was <em>moved out</em>, not the right sibling's <em>new</em> first key. Since <code>indexOfKey</code> sends <code>key === partition</code> to the right child (:381), a subsequent <code>find(borrowedKey)</code> descends into the right sibling — where the entry no longer lives — and misses. The branch-level borrow (:714-721) does it correctly, confirming the leaf case is the anomaly. Current tests merge rather than borrow, so this is untested territory.</p>
+<p class="fix">After the two <code>apply</code> calls, use <code>this.keyFromEntry(rightSib.entries[0]!)</code> (the sibling's post-shift first entry) as the new partition key.</p>
+</details>
+
+<details class="f high" open id="fo-2">
+<summary><span class="badge high">HIGH</span><code>rebalanceBranch</code> right-merge corrupts an ancestor separator when merging at index 0 <span class="cat">bug</span> <code>btree/btree.ts:741-743</code></summary>
+<p>After merging the right sibling into a branch at <code>pIndex === 0</code>, the code writes <code>pNode.partitions[0]</code> (post-delete: the separator to the merged child's <em>next</em> sibling — strictly greater than the merged subtree's minimum) into the nearest ancestor separator. Any key in <code>[subtreeMin, pNode.partitions[0])</code> then routes into the wrong subtree and is unreachable. The subtree minimum is unchanged by an internal merge, so no update is needed at all. Requires a 3+ level tree (~2K+ entries) under delete load — beyond current test sizes.</p>
+<p class="fix">Delete the <code>if (pIndex === 0 …) updatePartition(...)</code> block.</p>
+</details>
+
+<details class="f high" open id="fo-3">
+<summary><span class="badge high">HIGH</span><code>internalNext</code> can't advance off an end-of-leaf crack — range scans silently return nothing <span class="cat">bug</span> <code>btree/btree.ts:391-397</code></summary>
+<p>For an off path, <code>internalNext</code> only tries to "get on" at the current position; when <code>leafIndex === entries.length</code> it returns without falling through to the leaf-advance logic. Such a crack is routinely produced by <code>find(key)</code> where the key falls between a leaf's last entry and the parent partition (e.g. a just-deleted leaf-max value). Consequence: <code>range({ first: &lt;missing key at leaf end&gt; })</code> yields <strong>zero</strong> results even though later entries exist in the right sibling. <code>internalPrior</code> handles the symmetric crack correctly (:428, :450-453).</p>
+<p class="fix">When the get-on attempt fails and <code>leafIndex &gt;= entries.length</code>, fall through to the branch-popping advance instead of returning.</p>
+</details>
+
+<details class="f high" open id="fo-4">
+<summary><span class="badge high">HIGH</span>Two missing <code>await</code>s: <code>prior()</code> returns an un-moved path; <code>internalUpdate</code> fire-and-forgets a structural delete <span class="cat">bug</span> <code>btree/btree.ts:278-282, 463</code></summary>
+<p><code>prior()</code> calls <code>this.movePrior(newPath)</code> without await (compare <code>next()</code> at :265-269): it "works" mid-leaf because the decrement is synchronous, but crossing a leaf boundary awaits a store read — the caller receives the path before it moves, and it then mutates underneath them. Exposed publicly via <code>Tree.prior</code>. Separately, <code>internalUpdate</code>'s key-changing path runs <code>this.internalDelete(await this.find(oldKey))</code> un-awaited — the delete's async rebalance interleaves with the immediately following <code>find(newKey)</code> on the same nodes, and any rebalance error becomes an unhandled rejection that also defeats <code>AtomicProxy</code> rollback.</p>
+<p class="fix">Add both <code>await</code>s.</p>
+</details>
+
+<details class="f high" open id="fo-6">
+<summary><span class="badge high">HIGH</span><code>filterConflict</code> replacement actions are silently discarded <span class="cat">bug</span> <code>collection/collection.ts:133-134, 327-338</code></summary>
+<p><code>doFilterConflict</code> queues a replacement by pushing onto <code>this.pending</code> — but it is invoked from inside <code>this.pending.map(...)</code>, whose result is then assigned back to <code>this.pending</code>. The push landed on the old array beyond <code>map</code>'s fixed range and is dropped by the reassignment. Any collection relying on <code>filterConflict</code> returning a rewritten action loses that action entirely — this is the documented conflict-merge extension point.</p>
+<p class="fix">Collect replacements into a local array (return <code>{keep, replacement}</code> from the filter) and append them to the new <code>this.pending</code> after the map completes.</p>
+</details>
+
+<details class="f med" id="fo-7">
+<summary><span class="badge med">MEDIUM</span><code>Chain.add</code> passes the wrong predecessor to <code>newBlock</code> — Log <code>priorHash</code> breaks across multi-block appends <span class="cat">bug</span> <code>chain/chain.ts:124</code> + <code>log/log.ts:231-236</code></summary>
+<p>Inside the append loop every new block gets <code>newBlock?.(newTail, oldTail)</code> — always the original tail — instead of the running predecessor. A single variadic <code>add(...entries)</code> spanning two+ blocks hashes the wrong predecessor, silently breaking the hash chain (latent today since Log appends one entry at a time). Additionally the hash is computed before <code>nextId</code> is applied to the predecessor, so stored bytes never match hashed content unless verifiers strip link fields — undocumented.</p>
+<p class="fix">Pass the loop-local <code>tail</code>; specify a canonical hash payload excluding mutable link fields.</p>
+</details>
+
+<details class="f med" id="fo-8">
+<summary><span class="badge med">MEDIUM</span><code>syncInternal</code> can spin forever on persistent stale failures, holding the collection latch <span class="cat">robustness</span> <code>collection/collection.ts:245-281</code></summary>
+<p>The retry loop has no attempt cap, no growing backoff (fixed 100 ms, and only when <code>staleFailure.pending</code>), and no abort signal. A transactor that persistently rejects turns <code>sync()</code> into a hot infinite loop that starves all <code>act()</code>/<code>update()</code> callers.</p>
+<p class="fix">Bounded retry budget (count or deadline) with exponential backoff; surface a typed error when exhausted.</p>
+</details>
+
+<details class="f med" id="fo-9">
+<summary><span class="badge med">MEDIUM</span><code>Tracker.tryGet</code> gives source blocks precedence over tracked inserts — delete-then-reinsert reads stale content <span class="cat">bug</span> <code>transform/tracker.ts:14-27</code></summary>
+<p>The <code>inserts</code> map is consulted only on source miss. If a block exists in the source, is <code>delete()</code>d, then re-<code>insert()</code>ed, <code>tryGet</code> returns the source block, ignoring the inserted replacement and any ops routed into it — contradicting the transform semantics (<code>struct.ts:4-5</code>: insert wins).</p>
+<p class="fix">Check <code>transforms.inserts</code> before falling back to the source.</p>
+</details>
+
+<details class="f med" id="fo-10">
+<summary><span class="badge med">MEDIUM</span>Reopened trees have weaker atomicity than freshly created ones <span class="cat">design</span> <code>collections/tree/tree.ts:45-54, 69-70</code></summary>
+<p><code>Collection.internalTransact</code> hands each action handler an <code>Atomic</code> precisely so failures leave no partial state — but the tree's <code>"replace"</code> handler ignores it and mutates through the captured outer <code>btree</code>. The reopen path constructs <code>new BTree(collection.tracker, …)</code> without an <code>AtomicProxy</code> (only <code>BTree.create</code> installs one), so on an existing collection a mid-action failure leaves half-applied node mutations staged with no rollback.</p>
+<p class="fix">Construct the reopened BTree over an <code>AtomicProxy(collection.tracker)</code>, or make the handler operate through the passed <code>_trx</code> store.</p>
+</details>
+
+<details class="f med" id="fo-11">
+<summary><span class="badge med">MEDIUM</span><code>mergeTransforms</code> clobbers instead of merging per-block ops; <code>AtomicProxy</code> breaks under interleaved <code>atomic()</code> calls; branch left-merge path index off by merged length <span class="cat">bug/design</span></summary>
+<p>(a) <code>transform/helpers.ts:74-80</code>: <code>updates: { ...a.updates, ...b.updates }</code> replaces a block's whole op array rather than concatenating; safe for the current per-block-disjoint caller, but the general-sounding helper silently loses ops for any future overlapping use. (b) <code>transform/atomic-proxy.ts:32-48</code>: re-entrancy detection (<code>_active !== _base</code>) can't distinguish nesting from a second concurrent <code>atomic()</code>; two overlapping un-awaited inserts on a bare BTree share one <code>Atomic</code>, and the first commit flushes the second's half-finished mutations (class advertises "re-entrant safe"). (c) <code>btree/btree.ts:751-755</code>: the branch left-merge adjusts <code>pathBranch.index</code> <em>after</em> the merge already appended nodes, shifting the index by the merged length; the leaf-level equivalent (:688-690) gets the order right.</p>
+<p class="fix">(a) Merge per block id and dedupe deletes. (b) Serialize <code>atomic()</code> behind a promise-queue mutex or throw on foreign overlap. (c) Capture <code>leftSib.nodes.length</code> before the <code>apply</code> calls.</p>
+</details>
+
+<details class="f med" id="fo-13">
+<summary><span class="badge med">MEDIUM</span>Read path replays the full accumulated op log and deep-clones on every <code>tryGet</code> <span class="cat">perf</span> <code>transform/tracker.ts:16-18</code>, <code>transform/cache-source.ts:33</code></summary>
+<p>Every tracked read <code>structuredClone</code>s the block, then re-applies <em>all</em> ops ever recorded for it (each op cloned again in <code>applyOperation</code>). Hot blocks updated once per operation — the collection header, the log tail — accumulate unbounded op lists in a long-lived tracker: each read is O(ops), a session O(ops²), multiplied by tree depth on descents.</p>
+<p class="fix">Compact per-block ops on write (materialize into a shadow updated-block cache past a threshold), or memoize the transformed block per id and invalidate on new ops.</p>
+</details>
+
+<details class="f low" id="fo-15">
+<summary><span class="badge low">LOW</span>Assorted polish <span class="cat">cleanliness</span></summary>
+<p><code>utility/pending.ts:7-9</code> — <code>isResponse</code> uses <code>response !== undefined</code>, so a <code>Promise&lt;void&gt;</code> never reads complete (affects <code>incompleteBatches</code>); track settlement with a flag. <code>btree.ts:186</code> awaits a sync callback; <code>:514</code> vs <code>:594</code> inconsistently await a void <code>insert</code>; <code>:656/666/712</code> non-null-assert legitimately-undefined edge values. <code>tracker.ts:70-72</code> double-wraps an already-deduped Set. <code>log/log.ts:164-183</code> per-entry <code>unshift</code> is O(n²) over the unsynced tail — push then reverse. <code>collection.ts:301</code> reverses an array in place where <code>toReversed()</code> is clearer.</p>
+</details>
+
+<p class="assess"><strong>Subsystem assessment.</strong> Thoughtfully engineered layering with unusually good doc comments; solid coverage of the B-tree's common paths. The weak spot is exactly where testing thins: rare rebalance branches and iteration cracks hold four real correctness bugs, and two missing <code>await</code>s undermine an otherwise careful atomicity story. <strong>Highest-leverage single action: a property/fuzz test (random insert/delete/find/range vs a reference sorted map, at multiple tree heights) — it would have mechanically caught findings #1, #2, #3, and the merge-index bug.</strong></p>
+
+<!-- ============================================================ -->
+<h2 id="txn">4. Transaction layer <span class="meta">(db-core transaction · transactor · network · cluster)</span></h2>
+
+<details class="f high" open id="tx-1">
+<summary><span class="badge high">HIGH</span>Read-dependency capture misses all cache hits — a snapshot-isolation hole <span class="cat">bug</span> <code>transactor/transactor-source.ts:33</code> + <code>transform/cache-source.ts:20-34</code></summary>
+<p><code>TransactorSource.tryGet</code> is the only place a <code>ReadDependency</code> is recorded, but reads flow Tracker → CacheSource → TransactorSource, and <code>CacheSource</code> returns cached blocks without calling the underlying source. Any block served from cache (read in a prior transaction on the same Collection instance, or refreshed via <code>applyCommittedToCache</code>) produces no read dependency — the validator's stale-read check never sees it, so a transaction can read stale cached state and still pass OCC validation. Snapshot isolation is currently enforced by luck of cache misses.</p>
+<p class="fix">Record read dependencies above the cache: have <code>CacheSource</code> report every read (id + cached rev) to a listener, or capture deps in <code>Collection</code>/<code>Tracker.tryGet</code>.</p>
+</details>
+
+<details class="f high" open id="tx-2">
+<summary><span class="badge high">HIGH</span><code>pendPhase</code> leaks pended actions when <code>transactor.pend</code> throws <span class="cat">bug</span> <code>transaction/coordinator.ts:706-716</code></summary>
+<p>Cleanup of already-pended collections runs only when <code>pend</code> returns <code>{success:false}</code> — but <code>NetworkTransactor.pend</code> <em>throws</em> on non-stale failures (<code>network-transactor.ts:489</code>), and <code>pendPhase</code> has no try/catch. Earlier collections' successful pends are never cancelled and block other writers until TTL expiry.</p>
+<p class="fix">Wrap the per-collection pend loop in try/catch and run the same cancel-already-pended cleanup on throw before rethrowing.</p>
+</details>
+
+<details class="f high" open id="tx-3">
+<summary><span class="badge high">HIGH</span>Multi-collection commit half-commits, then cancels the rest and reports failure <span class="cat">design</span> <code>transaction/coordinator.ts:604-612, 745-801</code></summary>
+<p><code>commitPhase</code> commits collections one at a time; if collection N fails after three attempts, <code>coordinateTransaction</code> cancels only the <em>un</em>-committed collections and reports the transaction failed — while earlier collections' commits are durable. The GATHER supercluster nominees are threaded into pend but play no role in making tail commits atomic. The client is told "failed" for a transaction that half-committed. (Design-level counterpart: <a href="#d-h4">Design H4</a>.)</p>
+<p class="fix">Real 2PC over the supercluster (all tails commit or none, durable decision record), or at minimum return <code>committedCollections</code> in the error so callers know reconciliation is required instead of assuming a clean abort.</p>
+</details>
+
+<details class="f high" open id="tx-4">
+<summary><span class="badge high">HIGH</span><code>TransactionSession.execute</code> double-applies actions on the engine-translation path <span class="cat">bug</span> <code>transaction/session.ts:90-98</code> + <code>transaction/actions-engine.ts:51</code></summary>
+<p>When no pre-computed actions are passed, <code>session.execute</code> calls <code>engine.execute(tempTransaction)</code> and then applies the returned actions again via <code>coordinator.applyActions</code> — but <code>ActionsEngine.execute</code> already applies each statement's actions through the coordinator itself. Every statement executed via a session + ActionsEngine without explicit actions is applied twice. All tests pass explicit actions, so the path is untested and broken; the same tension exists in the deprecated <code>TransactionContext.addAction</code> path.</p>
+<p class="fix">Make engines side-effect-free translators (return actions; application belongs solely to the session/coordinator); bind the engine to the isolated validation coordinator on the validator path.</p>
+</details>
+
+<details class="f high" open id="tx-5">
+<summary><span class="badge high">HIGH</span>Fire-and-forget cancel can crash the process on rejection <span class="cat">bug</span> <code>transactor/network-transactor.ts:573, 480</code></summary>
+<p><code>Promise.resolve().then(() =&gt; this.cancel({...}))</code> has no <code>.catch</code>; <code>cancel()</code> calls <code>findCoordinator</code>, which rejects exactly when commit just failed (peers unreachable) → unhandled promise rejection, fatal in modern Node. The analogous <code>void Promise.resolve().then(() =&gt; this.cancelBatch(...))</code> at :480 has the same shape.</p>
+<p class="fix">Append <code>.catch(e =&gt; log('cancel failed: %o', e))</code> to both.</p>
+</details>
+
+<details class="f med" id="tx-6">
+<summary><span class="badge med">MEDIUM</span><code>commitBlock</code> non-null-asserts optional <code>missing</code> — TypeError masks the real stale failure <span class="cat">bug</span> <code>transactor/network-transactor.ts:577</code></summary>
+<p><code>.flatMap(b =&gt; (b.request!.response! as StaleFailure).missing!)</code> — but <code>StaleFailure.missing</code> is optional (<code>network/struct.ts:61</code>). A reason-only stale failure yields undefined elements and <code>distinctBlockActionTransforms</code> destructures them → TypeError. The pend path already filters (:486); commit doesn't.</p>
+<p class="fix">Add the same <code>.filter((x): x is ActionTransforms =&gt; x !== undefined)</code>.</p>
+</details>
+
+<details class="f med" id="tx-7">
+<summary><span class="badge med">MEDIUM</span>Session transactions carry <code>engineId: 'unknown'</code> — remote validation is dead on arrival <span class="cat">bug</span> <code>transaction/session.ts:53</code> + <code>transaction/validator.ts:70-75</code></summary>
+<p><code>TransactionSession.create</code> hardcodes <code>'unknown'</code> (marked TODO), but validators resolve engines by <code>stamp.engineId</code> and <code>pendPhase</code> always attaches the transaction to the <code>PendRequest</code>. Any validating cluster node will reject every session-built transaction with "Unknown engine: unknown". It only works today because storage-only nodes skip validation — the security/validation path can never engage. Related placeholders: <code>coordinator.ts:354-358</code> (<code>'local'</code>, <code>''</code>).</p>
+<p class="fix">Expose <code>id</code> on <code>ITransactionEngine</code>, require it in <code>createTransactionStamp</code>, and remove the placeholder defaults.</p>
+</details>
+
+<details class="f med" id="tx-8">
+<summary><span class="badge med">MEDIUM</span>Failed <code>commit()</code> leaves the staged log entry; retry double-logs; rollback can no-op <span class="cat">bug</span> <code>transaction/coordinator.ts:147-158, 223-224</code></summary>
+<p><code>commit()</code> appends a log entry into each collection's tracker <em>before</em> consensus; on failure it throws without undoing the append, and a legal retry of <code>session.commit()</code> appends a second entry for the same actions. For direct-staged trees, <code>rollback(stampId)</code> finds no <code>stampData</code> and returns immediately, leaving poisoned tracker state with no cleanup path.</p>
+<p class="fix">Snapshot tracker state before the log-append loop and restore it on any failure path.</p>
+</details>
+
+<details class="f med" id="tx-9">
+<summary><span class="badge med">MEDIUM</span><code>commitPhase</code> retries a commit the transactor already auto-cancelled <span class="cat">bug</span> <code>transaction/coordinator.ts:786-800</code> + <code>network-transactor.ts:573</code></summary>
+<p>On failed commit, <code>NetworkTransactor.commitBlock</code> immediately fires <code>cancel(...)</code> for the whole action — yet <code>commitPhase</code> retries the same request up to three times, racing against (or following) the cancel of the very pend it needs. Stale failures are also permanent, making blind identical retries wrong in both cases.</p>
+<p class="fix">Retry only thrown/transient errors; suppress the transactor's internal auto-cancel while a coordinator-level retry policy is active (or own retries in exactly one layer).</p>
+</details>
+
+<details class="f med" id="tx-10">
+<summary><span class="badge med">MEDIUM</span>Operations hash is non-canonical — honest validators can diverge <span class="cat">design</span> <code>transaction/coordinator.ts:162-174</code> vs <code>transaction/validator.ts:149-170</code></summary>
+<p>The hash is <code>JSON.stringify</code> over ops in Map-insertion order: sender iterates action/collection-data order, validator iterates its own collection-registration order. Nothing canonicalizes collection order, per-collection block order, or key order — an honest re-execution can produce a different hash → spurious "Operations hash mismatch" rejections. The collect/hash logic is also duplicated verbatim between the two files, guaranteeing eventual drift.</p>
+<p class="fix">Sort operations by (collectionId, blockId, type), use canonical JSON, and extract one shared hashing module used by both coordinator and validator.</p>
+</details>
+
+<details class="f med" id="tx-11">
+<summary><span class="badge med">MEDIUM</span>Perf: authoritative "not found" triggers a full serial retry round; per-collection phases are serial; per-block <code>findCluster</code> uncached <span class="cat">perf</span> <code>network-transactor.ts:118-158, 325-332</code>, <code>coordinator.ts:685-801</code></summary>
+<p>(a) <code>hasBlockInResponse</code> demands a materialized block, so a valid "block doesn't exist" response (normal for <code>createOrOpen</code> probing) is treated as retryable — a second full round of <code>findCoordinator</code> + <code>get</code>, serial per batch. (b) <code>pendPhase</code>/<code>commitPhase</code> await collections sequentially though pends are independent. (c) Every pend does per-block <code>findCluster</code> with no caching; commit re-resolves the same blocks, relying on a duck-typed <code>as any</code> hint to avoid re-routing.</p>
+<p class="fix">Distinguish authoritative-absent from no-response; parallelize per-batch retries and per-collection pends (<code>Promise.allSettled</code> + cancel-all-on-failure); cache cluster lookups for the pend→commit window keyed by block id.</p>
+</details>
+
+<details class="f low" id="tx-13">
+<summary><span class="badge low">LOW</span>Assorted: PeerId dedup by object identity; private-state pokes; dead deprecated path <span class="cat">cleanliness</span></summary>
+<p><code>gatherPhase</code> merges nominees into a <code>Set&lt;PeerId&gt;</code> but each is a fresh object from <code>peerIdFromString</code> — duplicates flow into every <code>PendRequest</code> (<code>coordinator.ts:648-659</code>); key by <code>toString()</code>. Coordinator reaches into <code>Collection</code>'s private <code>source</code> via bracket access in five places, duplicating rev-bump logic; <code>NetworkTransactor</code> smuggles <code>coordinatingBlockIds</code> and <code>recordCoordinator</code> through <code>as any</code> (<code>network-transactor.ts:434-455</code>) — add the typed members. The deprecated <code>TransactionContext</code>/<code>commitTransaction</code> path (placeholder stamps, double-apply) is unused by production callers — delete or quarantine it. <code>TransactorSource.tryGet</code>'s <code>result[id]!</code> TypeErrors on sparse results from non-Network transactors (<code>transactor-source.ts:29-31</code>).</p>
+</details>
+
+<p class="assess"><strong>Subsystem assessment.</strong> The batch/retry machinery is careful about root-cause preservation, and the tail-first commit protocol is correctly threaded. But the distributed failure paths lag the happy path badly: pends leak on throw, multi-collection commit half-commits, cleanup is fire-and-forget without rejection handling, and failed commits poison local staged state. Most critically, the headline guarantee is porous — read deps vanish on cache hits (#1) and the validation path is unreachable for session transactions (#7). There's also a two-generations-of-API smell (TransactionContext vs TransactionSession, duplicated hashing) worth consolidating before hardening, since several bugs live in those seams.</p>
+
+<!-- ============================================================ -->
+<h2 id="cohort">5. Cohort-topic substrate <span class="meta">(+ matchmaking · reactivity, db-core side)</span></h2>
+
+<details class="f high" open id="ct-1">
+<summary><span class="badge high">HIGH</span>The renew path has no freshness or replay protection — a captured <code>withdraw</code> is valid forever <span class="cat">security</span> <code>cohort-topic/member-engine.ts:243</code>, <code>registration/renewal.ts:305-381</code></summary>
+<p><code>handleRenew</code> verifies the participant signature on privileged <code>withdraw</code>/<code>reattach</code> renews but never checks <code>msg.timestamp</code>; the register path's <code>CorrelationReplayGuard</code> is not applied (confirmed in db-p2p's <code>resolveRenew</code>, <code>host.ts:1695-1703</code>). Replay a captured signed <code>withdraw</code> tombstone after the victim re-registers and the record is evicted and the eviction gossiped; a captured <code>reattach</code> can repeatedly force bogus primary re-stamps.</p>
+<p class="fix">Enforce the same skew window on privileged renews (reject <code>|now − timestamp| &gt; maxAge</code>) and/or require <code>timestamp &gt; rec.lastPing</code> monotonically before acting.</p>
+</details>
+
+<details class="f high" open id="ct-2">
+<summary><span class="badge high">HIGH</span><code>treeTier</code> validated only as "finite number" — remote RangeError + unbounded attacker-keyed engine creation <span class="cat">security</span> <code>cohort-topic/wire/validate.ts:176</code>, <code>db-p2p/src/cohort-topic/host.ts:900-901</code></summary>
+<p>A fractional/negative/&gt;255 <code>treeTier</code> makes <code>addressing.coord()</code> throw inside register dispatch. Worse: for each valid integer 0..255 × arbitrary <code>topicId</code>, <code>registry.forCoord(...)</code> creates and caches a new CoordEngine (own store, rate limiter, replay guard, budget) <em>before any anti-DoS gate runs</em> — engine creation itself is unbounded and attacker-keyed.</p>
+<p class="fix">Validate <code>treeTier</code> as an integer in <code>0..DEFAULT_D_MAX_CAP</code>; cap/LRU the coord-engine registry in the host.</p>
+</details>
+
+<details class="f high" open id="ct-3">
+<summary><span class="badge high">HIGH</span>Unbounded <code>ttl</code> creates never-expiring records that wedge the topic budget <span class="cat">security</span> <code>wire/validate.ts:178</code>, <code>member-engine.ts:323</code>, <code>registration/store.ts:65</code></summary>
+<p><code>accept()</code> takes <code>reg.ttl &gt; 0 ? reg.ttl : DEFAULT_TTL</code> with no upper bound — one register with <code>ttl: 1e15</code> never expires, permanently pins <code>directParticipants(topic) &gt; 0</code>, and thus makes the topic never evictable from the budget (<code>coldestEvictable</code> skips populated topics). A handful of such registers wedge the cohort's <code>topics_max</code> while serving nothing; gossip replicates the poisoned TTL cohort-wide.</p>
+<p class="fix">Clamp <code>ttl</code> at validation/admission to a sane range (e.g. <code>[10s, 10 × DEFAULT_TTL_MS]</code>).</p>
+</details>
+
+<details class="f high" open id="ct-4">
+<summary><span class="badge high">HIGH</span>Topic budget and cold-start forwarders never reconcile — the budget bounds neither memory nor served topics <span class="cat">bug/security</span> <code>cohort-topic/coldstart.ts:166-199</code>, <code>antidos/topic-budget.ts:100-109</code>, <code>member-engine.ts:400-402</code></summary>
+<p><code>TrackingColdStartManager</code> has no removal API — its forwarders map only grows; neither budget eviction, demotion, nor TTL drain deletes entries. And when <code>admit()</code> evicts a cold victim, the victim's forwarder stays resident, so <code>serves()</code> still answers true — registers for the evicted topic take the hot path and bypass <code>topicBudget.admit</code> forever.</p>
+<p class="fix">Give <code>TopicBudget</code> an eviction callback that tears down the victim's cold-start forwarder and traffic window, or derive <code>serves()</code> residency from the budget itself.</p>
+</details>
+
+<details class="f med" id="ct-5">
+<summary><span class="badge med">MEDIUM</span>Promotion/demotion notices validate tree tiers with the 0..3 capacity-tier validator — broadcast breaks at depth ≥ 3 <span class="cat">bug</span> <code>wire/validate.ts:298-315</code> vs <code>promotion.ts:290-342</code></summary>
+<p><code>fromTier</code>/<code>toTier</code> carry <em>tree</em> tiers (design depth up to <code>d_max_cap</code> = 60), but are clamped by the capacity-tier <code>tier()</code> validator (0..3). Any promotion at tree tier ≥ 3 emits <code>toTier = 4</code>, rejected as malformed by every receiver — promotion silently breaks once the network is deep enough (n ≥ F⁴). The gossip validator gets the same concept right.</p>
+<p class="fix">Validate notice tiers as non-negative integers (optionally require <code>toTier === fromTier + 1</code>).</p>
+</details>
+
+<details class="f med" id="ct-6">
+<summary><span class="badge med">MEDIUM</span>Replay guard is uncapped and runs before rate limiting — memory grows at attack line-rate <span class="cat">security</span> <code>antidos/replay-guard.ts:86</code>, <code>member-engine.ts:386-393</code></summary>
+<p>The guard's <code>seen</code> map has no size cap (unlike the rate limiter's <code>maxKeys</code>), and <code>runGuards</code> records the correlation id before <code>rateLimiter.check</code> — every spam frame with a fresh CSPRNG correlation id inserts an entry even when then rate-limited away.</p>
+<p class="fix">Hard LRU cap on the guard, or rate-limit before recording.</p>
+</details>
+
+<details class="f med" id="ct-7">
+<summary><span class="badge med">MEDIUM</span>Gossiped evictions delete unconditionally — stale eviction deltas kill fresh records <span class="cat">bug</span> <code>gossip/bus.ts:201-203</code></summary>
+<p>Record merges are correctly LWW by <code>lastPing</code>, but <code>GossipRecordRefV1</code> evictions carry only <code>(topicId, participantId)</code> and delete whatever is held — a slow member's stale eviction arriving after a re-registration deletes the newer record. Self-heals via the next renew → failover, but breaks the replication invariant and causes spurious failovers under reordering.</p>
+<p class="fix">Carry the evicted record's <code>lastPing</code> in the ref; delete only when <code>held.lastPing &lt;= ref.lastPing</code>.</p>
+</details>
+
+<details class="f med" id="ct-8">
+<summary><span class="badge med">MEDIUM</span>Stale registration handles alias the live one — <code>withdraw(oldHandle)</code> kills the new registration <span class="cat">bug</span> <code>cohort-topic/service.ts:233-254, 297</code></summary>
+<p><code>renewals</code> is keyed by <code>(topicId, participantId)</code>; a second <code>register()</code> silently replaces the entry, but <code>renew(oldHandle)</code> still drives the old <code>RenewalParticipant</code>, and <code>withdraw(oldHandle)</code> deletes the key — killing the new registration's renewal loop and evicting the new remote record (same key). The live registration then silently TTL-expires.</p>
+<p class="fix">In <code>renew</code>/<code>withdraw</code>, act only if <code>this.renewals.get(key) === handle.renewal</code>.</p>
+</details>
+
+<details class="f med" id="ct-9">
+<summary><span class="badge med">MEDIUM</span>Walk adopts unbounded <code>targetTier</code> from promotion replies; wire byte-fields have no length bounds; validator primitives copy-pasted ×3 <span class="cat">security/cleanliness</span></summary>
+<p>(a) <code>walk.ts:244-255</code>: a malicious cohort replying <code>targetTier: 2.5 / -1 / 300</code> makes <code>addressing.coord()</code> throw an unclassified exception out of <code>register()</code>/<code>lookup()</code> — clamp and return <code>retry_later</code>. (b) <code>validate.ts:174-181</code> and siblings check byte fields only as valid base64url — a ~1 MiB <code>topicId</code> becomes a map key in store/budget/limiter/guard; add exact-length checks (32/16 bytes) the doc comments already pin. (c) The identical validation primitive set exists in <code>cohort-topic/wire/validate.ts</code>, <code>matchmaking/wire.ts:170-266</code>, and <code>reactivity/wire-validate.ts</code>, already diverging — hoist one shared module (reactivity's is closest).</p>
+</details>
+
+<details class="f low" id="ct-12">
+<summary><span class="badge low">LOW</span>Assorted: renew correlationId mismatch; unbounded verifier maps; O(members×summaries) traffic snapshot; walk retry skips candidates <span class="cat">bug/perf</span></summary>
+<p><code>service.ts:294</code> stamps <code>RenewV1.correlationId</code> with the cohort epoch instead of the original register's correlation id (documented otherwise; poisons any future renew replay-guard). <code>membership/verifier.ts:142-216</code>: <code>byCoord</code>/<code>lastFetchAt</code>/<code>staleGapStrikes</code> are unbounded maps keyed by attacker-derivable coords — LRU-cap them. <code>traffic.ts:129-137</code>: <code>snapshot()</code> does O(members × summaries) linear <code>find</code>s per register reply (~32k comparisons at scale) — index summaries by topicId at merge time. <code>walk.ts:260-268</code>: <code>memberAttempts % candidates.length</code> persists across replies, permanently skipping each fresh list's first (best) candidate — track tried members in a Set.</p>
+</details>
+
+<p class="assess"><strong>Subsystem assessment.</strong> Unusually well-documented and well-factored: the port-based layering is consistently enforced, signing payloads are canonicalized with real care, and the anti-DoS design is thought through. The weaknesses are at the seams: the renew path escaped the replay/freshness regime the register path got, wire validation trusts numerics the rest of the system assumes are bounded, and the three resource ledgers that must agree (budget, forwarders, store) can drift apart permanently. None require redesign — targeted clamps, one freshness gate, one eviction callback — but #1–4 should land before this substrate faces adversarial traffic. Matchmaking and reactivity are in noticeably better shape. (Note: an eslint-suppressed <code>console.error("WALKDBG", …)</code> in <code>walk.ts</code> vanished mid-review — the working tree is being edited concurrently; re-run a diff review before committing.)</p>
+
+<!-- ============================================================ -->
+<h2 id="p2p">6. P2P network &amp; consensus <span class="meta">(db-p2p: libp2p wiring · cluster 2PC · dispute · repo · reputation · sync)</span></h2>
+
+<details class="f high" open id="p2p-1">
+<summary><span class="badge high">HIGH</span>Cluster vote signatures are verified against an unbound, attacker-supplied public key <span class="cat">security</span> <code>cluster/cluster-repo.ts:578-589</code></summary>
+<p><code>verifySignature</code> reads the signing key from <code>record.peers[peerId].publicKey</code> — data carried in the record itself — and never checks that the key corresponds to <code>peerId</code>. For libp2p Ed25519 identities the peer id <em>is</em> the multihash of the public key, so the binding is trivially checkable and is the entire basis of the scheme. Without it, a malicious coordinator can fabricate a cohort: invent N peer ids, attach keys it minted, sign every promise/commit itself — every honest member's <code>validateSignatures</code> passes and the member applies the operation as consensus-approved. It also enables reputation poisoning: forged equivocating records make honest nodes penalize honest peers (<code>cluster-repo.ts:483-487</code>, <code>dispute-service.ts:394-407</code> key penalties on self-asserted ids).</p>
+<p class="fix">In <code>verifySignature</code>, require the key to derive the peer id — compare <code>peerIdFromString(peerId).publicKey?.raw</code> (or derived multihash) to the embedded key bytes and reject on mismatch. This single check restores the meaning of every downstream signature and reputation decision.</p>
+</details>
+
+<details class="f high" open id="p2p-2">
+<summary><span class="badge high">HIGH</span>Persistent "executed" marker is never rolled back — a transient apply fault permanently drops the transaction on that member <span class="cat">bug</span> <code>cluster/cluster-repo.ts:753-768</code></summary>
+<p><code>handleConsensus</code> fires <code>stateStore.markExecuted(...)</code> (fire-and-forget) then applies operations. On an unexpected throw it rolls back only the in-memory marker — the interface has no <code>unmarkExecuted</code>. On redelivery, <code>wasTransactionExecutedAsync</code> hits the durable marker → the member skips <code>handleConsensus</code> forever. The operation is silently dropped even though the rollback was written specifically to allow retry.</p>
+<p class="fix">Add <code>unmarkExecuted(messageHash)</code> and call it in the catch — or persist the marker only <em>after</em> <code>applyConsensusOperation</code> succeeds (the synchronous in-memory guard already covers the apply-window race).</p>
+</details>
+
+<details class="f med" id="p2p-3">
+<summary><span class="badge med">MEDIUM</span>The dispute subsystem is entirely inert in the live node <span class="cat">design</span> <code>libp2p-node-base.ts:382-497</code>, <code>dispute/dispute-service.ts:130</code></summary>
+<p><code>DisputeService</code> is constructed, but the <code>/dispute/1.0.0</code> inbound handler (<code>DisputeProtocolService</code>) is never registered in the node's services, and <code>initiateDispute</code> is never called from the cluster path (only tests). No node answers arbitration challenges and none ever starts one — the elaborate v3 vote/set-binding verification in <code>invalidation.ts</code> guards an unreachable path.</p>
+<p class="fix">Register the dispute protocol handler when <code>disputeEnabled</code>, and invoke <code>initiateDispute</code> from the coordinator's disputed-record path (<code>cluster-coordinator.ts:312-332</code> already computes the evidence). If deliberately staged, say so at both wiring sites.</p>
+</details>
+
+<details class="f med" id="p2p-4">
+<summary><span class="badge med">MEDIUM</span>No message-size or frame-count caps on inbound consensus protocols <span class="cat">security</span> <code>protocol-client.ts:149-163</code>; <code>cluster/service.ts:210-221</code>; <code>repo/service.ts:273-284</code>; <code>sync/service.ts:115-124</code>; <code>dispute/service.ts:101-112</code></summary>
+<p>Every handler decodes with bare <code>lpDecode(source)</code> — no <code>maxDataLength</code> — and loops <code>for await</code> with no per-stream frame cap, then <code>JSON.parse</code>s each frame. An inbound peer can stream many ~4 MB frames of attacker-controlled JSON, multiplied by <code>maxInboundStreams</code> (32).</p>
+<p class="fix"><code>lpDecode({ maxDataLength })</code> sized to the real payload; enforce one-request-per-stream on the request handlers (sync and block-transfer already do this — extend to cluster/repo/dispute).</p>
+</details>
+
+<details class="f med" id="p2p-5">
+<summary><span class="badge med">MEDIUM</span>Read-repair and reconcile trust unverified peer claims to drive restoration <span class="cat">security</span> <code>repo/coordinator-repo.ts:265-326</code>, <code>libp2p-node-base.ts:577-600</code></summary>
+<p><code>queryClusterForLatest</code> takes the max <code>ActionRev</code> any peer reports — no signature or commit-cert check — and <code>fetchBlockFromCluster</code> restores against it; a single lying peer steers spurious restoration and content acceptance. <code>reconcileBlock</code> likewise picks <code>Math.max(revs)</code> from cohort archives and <code>saveReplicatedBlock</code>s without content verification — a malicious cohort member can seed bogus replicas.</p>
+<p class="fix">Verify reported latest against a commit certificate (the <code>CommitCert</code> machinery exists) before restoring, or require multi-peer agreement plus content-hash validation against the committed <code>actionId</code>.</p>
+</details>
+
+<details class="f med" id="p2p-6">
+<summary><span class="badge med">MEDIUM</span><code>validateSmallCluster</code> fails open; hot-path double peerStore reads <span class="cat">correctness/perf</span> <code>repo/cluster-coordinator.ts:347-380</code>, <code>libp2p-key-network.ts:589, 627</code></summary>
+<p>(a) When FRET has no confident estimate, the fallback returns <code>true</code> — any sub-minimum cluster proceeds to consensus; the "development/testing" carve-out is the default production path whenever confidence ≤ 0.5. Gate it behind an explicit config flag, default off. (b) <code>findCluster</code> fetches each cohort member from the peerStore twice (protocols, then addresses) on the per-pend/commit hot path — one <code>store.get(pid)</code> serves both.</p>
+</details>
+
+<details class="f low" id="p2p-8">
+<summary><span class="badge low">LOW</span>Assorted: untyped composition root; order-sensitive record equality; dead abort-signal plumbing <span class="cat">cleanliness</span></summary>
+<p><code>libp2p-node-base.ts:402-513</code>: service factories typed <code>(components: any)</code>, <code>setLibp2p</code> injections wrapped in empty <code>catch {}</code> — failures invisible exactly where lifecycle bugs live; type the components and log failures. <code>cluster-repo.ts:435-439</code>: <code>JSON.stringify</code> equality on <code>peers</code>/<code>message</code> throws "mismatch" on key-order differences — the class already has <code>canonicalJson</code>; use it (or compare <code>messageHash</code>). <code>it-utility.ts:1-17</code>: <code>first()</code> builds an AbortController its main caller ignores — wire it or drop it. <code>cluster-repo.ts:334-361</code>: both <code>OurCommitNeeded</code>/<code>Consensus</code> call sites independently await the async dedup check — fold it into <code>handleConsensus</code>.</p>
+</details>
+
+<p class="assess"><strong>Subsystem assessment.</strong> The consensus, timeout/deadline, and stream-teardown engineering is unusually careful — <code>ProtocolClient</code> aborts streams on timeout rather than racing a timer, timers are <code>.unref()</code>'d, the coordinator's retry/idempotency handling is thorough. The dominant concern is trust boundaries: signatures verified against unbound keys (#1) undermine the Byzantine guarantees the whole signature-and-reputation apparatus exists to provide, and read-repair acts on unverified claims (#5). Fix the peer-id/key binding and the executed-marker rollback before relying on this layer under adversarial conditions.</p>
+
+<!-- ============================================================ -->
+<h2 id="storage">7. Storage &amp; adapters <span class="meta">(db-p2p/storage · storage-fs · storage-ns · storage-rn · storage-web)</span></h2>
+
+<details class="f high" open id="st-1">
+<summary><span class="badge high">HIGH</span>Read-driven promotion bypasses the per-block commit latch <span class="cat">bug</span> <code>db-p2p/src/storage/storage-repo.ts:168</code></summary>
+<p><code>get()</code> promotion calls <code>internalCommit</code> without the latch that <code>commit()</code>, <code>saveReplicatedBlock</code>, and the dispute path all hold — <code>internalCommit</code>'s own comment asserts it runs "within the locked critical section of commit()". A promotion racing a concurrent commit interleaves two <code>getLatest → save → promote → setLatest</code> sequences: <code>setLatest</code> can regress non-monotonically and the writers can cross-write <code>revs/&lt;N&gt;</code> for different actionIds.</p>
+<p class="fix">Wrap the promotion loop body in <code>withBlockCommitLatch(blockId, ...)</code> (already exported) and re-check the pending inside the latch.</p>
+</details>
+
+<details class="f high" open id="st-2">
+<summary><span class="badge high">HIGH</span>fs adapter writes are non-atomic — one crash permanently corrupts a block <span class="cat">integrity</span> <code>db-p2p-storage-fs/src/file-storage.ts:251-254</code>, <code>file-kv-store.ts:18-22</code></summary>
+<p><code>ensureAndWriteFile</code> is truncate-then-write, no temp-file+rename, no fsync. <code>meta.json</code> is rewritten on every commit; a crash mid-write leaves a truncated file, and <code>readIfExists</code> rethrows the JSON parse error (only ENOENT maps to undefined) — <code>getMetadata</code> throws forever, and the block becomes permanently unreadable <em>including by <code>recover()</code></em>, which reads metadata first.</p>
+<p class="fix">Write to <code>&lt;path&gt;.tmp</code> then <code>fs.rename</code> (atomic on POSIX and NTFS), fsync for metadata; treat JSON parse failure as corrupt-but-recoverable instead of throwing indefinitely.</p>
+</details>
+
+<details class="f high" open id="st-3">
+<summary><span class="badge high">HIGH</span>Commit accepts non-contiguous revisions — divergent materializations served silently <span class="cat">integrity</span> <code>storage-repo.ts:385-411, 540-550</code></summary>
+<p><code>commit()</code> only rejects <code>latest.rev &gt;= request.rev</code>, never checks contiguity. A replica that missed intermediate commits accepts the pend and materializes the rev-N transform on top of its stale local base — a divergent materialization then served to readers and cached as rev N. Because pends seed <code>ranges: [[0]]</code> (next finding), the gap is also invisible to restoration.</p>
+<p class="fix">Treat <code>latest.rev &lt; request.rev − 1</code> as a gap: trigger <code>ensureRevision</code>/restore for the predecessor or fail the commit with a distinct "behind" result.</p>
+</details>
+
+<details class="f high" open id="st-4">
+<summary><span class="badge high">HIGH</span>Pend seeds an open-ended <code>ranges: [[0]]</code> — an honest-coverage lie that disables restoration <span class="cat">bug</span> <code>db-p2p/src/storage/block-storage.ts:57</code></summary>
+<p><code>savePendingTransaction</code> claims every revision from 0 onward is locally present. Consequences: (a) <code>ensureRevision</code>'s <code>inRanges</code> is always true, so the restore callback never fires — <code>getBlock(rev)</code> throws or silently serves an older revision; (b) it's the only thing making commits look "in range," since <code>internalCommit</code> never merges committed revs into <code>meta.ranges</code>. Contrast <code>saveReplica</code>/<code>saveDeletion</code>, which correctly seed <code>[]</code> and merge closed ranges.</p>
+<p class="fix">Seed <code>ranges: []</code> at pend; merge <code>[rev, rev+1]</code> at commit (<code>setLatest</code>/<code>internalCommit</code>) so ranges stay an honest statement of what is locally reconstructible.</p>
+</details>
+
+<details class="f med" id="st-5">
+<summary><span class="badge med">MEDIUM</span>NativeScript SQLite transactions can nest and cross-rollback — no mutex on the shared connection <span class="cat">integrity</span> <code>db-p2p-storage-ns/src/ns-opener.ts:74-88</code></summary>
+<p><code>transaction()</code> issues <code>BEGIN</code>/<code>COMMIT</code> on the single shared connection with no mutex, while <code>StorageRepo</code> allows concurrent commits on disjoint blocks. Two concurrent promotions nest BEGINs: the second errors, its catch runs <code>ROLLBACK</code> — rolling back the <em>first</em> transaction's writes; concurrent plain statements get swept into an open transaction and discarded with its rollback.</p>
+<p class="fix">Serialize <code>transaction()</code> (and ideally all writes) behind an async mutex, or use <code>BEGIN IMMEDIATE</code> with a queued executor.</p>
+</details>
+
+<details class="f med" id="st-6">
+<summary><span class="badge med">MEDIUM</span>Restoration filters by the wrong coordinate space — "hash the block ID" doesn't hash <span class="cat">bug</span> <code>storage/restoration-coordinator-v2.ts:136-153</code></summary>
+<p><code>extractBlockPrefix</code> copies raw first bytes of the blockId string, but cohort assembly uses <code>hashKey(blockIdBytes)</code> and ring partitions are computed from hashed peer coordinates. <code>filterByPartition</code> therefore compares a raw-byte prefix against hashed-coordinate partitions — the entire inner-ring fallback path queries non-responsible peers and filters out responsible ones.</p>
+<p class="fix">Compute the prefix from <code>hashKey(encode(blockId))</code> — the same coordinate used for cohort assembly.</p>
+</details>
+
+<details class="f med" id="st-7">
+<summary><span class="badge med">MEDIUM</span><code>recoverBlock</code> has no production caller — the crash state it repairs permanently wedges the block <span class="cat">bug</span> <code>storage-repo.ts:477-481</code></summary>
+<p>In the promote-landed-but-<code>setLatest</code>-lost crash state, a retry-commit hits "Pending action not found" (the pend was already promoted; the idempotent partition doesn't catch it since <code>latest.rev &lt; request.rev</code>) — wedged until someone manually calls <code>recover()</code>, which only tests do.</p>
+<p class="fix">In <code>commit()</code>, when the pend is missing but <code>getRevision(request.rev)</code> + <code>getTransaction</code> show the action durably promoted, call <code>storage.recover()</code> and re-partition — or run <code>recover()</code> lazily on first post-startup access.</p>
+</details>
+
+<details class="f med" id="st-8">
+<summary><span class="badge med">MEDIUM</span>No sweep/archival exists — storage grows O(revisions × block size) forever; capacity checks full-scan the store <span class="cat">perf</span> <code>storage-repo.ts:550</code>; <code>leveldb-storage.ts:122-140</code>; <code>file-storage.ts:129-158</code></summary>
+<p>Every commit persists the full materialized block <em>and</em> the transform, and nothing prunes — <code>docs/repository.md</code> promises archival "based on resource pressure" that isn't implemented. Meanwhile <code>getApproximateBytesUsed</code> is a full-database scan (LevelDB iterates every key and value; fs stats the whole tree), and <code>RingSelector</code> triggers it repeatedly (twice in <code>createArachnodeInfo</code> alone).</p>
+<p class="fix">Implement checkpoint-cadence materialization sweeping (the transform chain already supports replay); cache the byte estimate with a TTL or maintain an incremental counter.</p>
+</details>
+
+<details class="f med" id="st-10">
+<summary><span class="badge med">MEDIUM</span>Four adapters are ~150-line near-clones — extract a shared ordered-KV kernel <span class="cat">design</span> all four adapter packages</summary>
+<p>Same JSON (de)serialization, key scheme, drain-before-yield iteration, and promote semantics, differing only in the KV primitive. The <code>LevelDBLike</code> interface (<code>db-p2p-storage-rn/src/leveldb-like.ts</code>) is already exactly the needed kernel surface (get/put/delete/range-scan/atomic-batch). Also fold the ~90% duplicated <code>saveReplica</code>/<code>saveDeletion</code> bodies (<code>block-storage.ts:126-223</code>) into one helper.</p>
+<p class="fix">Ship a <code>KvRawStorage</code> in db-p2p over a minimal ordered-KV+batch interface; each package keeps only its ~100-line driver.</p>
+</details>
+
+<details class="f low" id="st-11">
+<summary><span class="badge low">LOW</span>Assorted: in-place sort of caller state; missing clone; dead metrics; error-swallowing readdir <span class="cat">bug/cleanliness</span></summary>
+<p><code>storage-repo.ts:162-165</code>: <code>missing</code> aliases <code>context.committed</code> and <code>.sort()</code> mutates the caller's shared request context — copy first. <code>memory-storage.ts:102-104</code>: <code>saveTransaction</code> stores the caller's reference without <code>structuredClone</code>, violating the store's own documented clone invariants. <code>restoration-coordinator-v2.ts:23,188,196-203</code>: <code>failureByRing</code> never incremented; bare <code>console.log</code>; <code>getMetrics</code> leaks shared Map instances. <code>arachnode-fret-adapter.ts:59</code> / <code>ring-selector.ts:95</code>: <code>as any</code> pokes into FRET internals and a fabricated fake PeerId. <code>file-storage.ts:72,79</code>: <code>listPendingTransactions</code> swallows all readdir errors as "no pendings" (skipping conflict detection on transient EACCES) and regex-filters action-ids so a future id scheme silently vanishes — map only ENOENT to empty.</p>
+</details>
+
+<p class="assess"><strong>Subsystem assessment.</strong> The core design is sound and unusually well-annotated — the pend/commit/cancel machine is careful about crash windows, and the memory adapter's clone pitfalls read like hard-won lessons. The gaps: (1) enforcement of the invariants the comments describe (promotion escapes the latch, <code>recover()</code> unwired, non-contiguous commits accepted); (2) the honesty of <code>meta.ranges</code> — the <code>[[0]]</code> seed quietly disables the restoration machinery the whole reconstructive model depends on; (3) durability at the adapter floor — fs non-atomic writes are the one place a single crash destroys committed data rather than delaying it. Findings 1–4 are localized, low-risk fixes that bring the implementation up to its own documentation's standard.</p>
+
+<!-- ============================================================ -->
+<h2 id="sql">8. SQL integration &amp; apps <span class="meta">(quereus-plugin-optimystic · quereus-plugin-crypto · reference-peer · demo · substrate-simulator)</span></h2>
+
+<details class="f high" open id="sq-1">
+<summary><span class="badge high">HIGH</span>PK range filters are claimed as handled but never applied — <code>WHERE pk &gt; x</code> returns every row <span class="cat">bug</span> <code>quereus-plugin-optimystic/src/optimystic-module.ts:1765, 590-597</code></summary>
+<p><code>getBestAccessPlan</code> marks a PK range filter as handled, but <code>executeRangeQuery</code> is a stub that falls back to full scan and ignores <code>_filterInfo</code> entirely. Per the Quereus contract, handled filters are not re-applied by the engine — so the predicate is simply lost.</p>
+<p class="fix">Until real range seeks exist, return <code>handledFilters</code> all-false (and no <code>providesOrdering</code>) for range ops so Quereus applies the predicate; then implement the range via <code>KeyRange</code> from <code>filterInfo.args</code>.</p>
+</details>
+
+<details class="f high" open id="sq-2">
+<summary><span class="badge high">HIGH</span>Tree comparator is raw lexicographic — INTEGER/DESC/collated PKs mis-sort; the correct comparator is dead code <span class="cat">bug</span> <code>optimystic-adapter/collection-factory.ts:43</code>, <code>schema/row-codec.ts:155-184, 243-292</code></summary>
+<p><code>getBestAccessPlan</code> claims <code>providesOrdering</code> for PK ranges and index matches (including DESC), but tree iteration is plain ascending string order: an INTEGER PK yields "1, 10, 2"; DESC yields ascending; non-BINARY collations are ignored. The README says "primary keys must be TEXT" but nothing enforces it — numeric PKs silently mis-sort instead of erroring. <code>RowCodec.createPrimaryKeyComparator</code> exists but is referenced only by tests, never passed to <code>Tree.createOrOpen</code> (and its <code>deserializeKeyPart</code> mis-classifies numeric-looking TEXT like <code>'123'</code>).</p>
+<p class="fix">Wire the comparator in (after fixing its type-sniffing) or move to an order-preserving key encoding; at minimum reject non-TEXT/DESC/collated PKs at <code>create()</code> and stop claiming <code>providesOrdering</code> beyond ASC BINARY TEXT.</p>
+</details>
+
+<details class="f high" open id="sq-3">
+<summary><span class="badge high">HIGH</span>Index-key serialization is JS-type-sensitive — bigint round-trips orphan index entries <span class="cat">bug</span> <code>schema/index-manager.ts:285-306</code> + <code>schema/row-codec.ts:189-197</code></summary>
+<p>On INSERT, index keys are built from the raw Quereus row (bigint 5 → <code>"5"</code>); the stored row is normalized to number 5, so a later UPDATE/DELETE recomputes the old index key as <code>"5.000000000000000e+0"</code> — the delete misses, leaving a stale index entry that index scans then resurrect. The same mismatch makes index seeks with differently-typed args miss valid rows. The serializer is also duplicated byte-for-byte in <code>optimystic-module.ts:662-679</code> with comments admitting they must agree exactly.</p>
+<p class="fix">Canonicalize values (the same <code>normalizeValue</code>/decode transform) before serializing index keys everywhere; export one shared <code>serializeIndexValue()</code>; add a bigint round-trip index test.</p>
+</details>
+
+<details class="f med" id="sq-4">
+<summary><span class="badge med">MEDIUM</span>Unescaped <code>\x00</code> separators and NULL markers corrupt composite keys and index ranges <span class="cat">bug</span> <code>schema/row-codec.ts:100-102, 155-158</code>; <code>schema/index-manager.ts:88, 118, 216-217</code></summary>
+<p>Composite PKs join parts with <code>\x00</code>; index entry keys are <code>indexKey\x00pk</code> with prefix ranges <code>[key\x00, key\x01)</code>; NULL is the literal <code>'\x01NULL\x01'</code>/<code>'\x01'</code>. A TEXT value containing <code>\x00</code> shifts part boundaries and breaks the range invariant; a value equal to the NULL marker collides with SQL NULL — all reachable with ordinary strings.</p>
+<p class="fix">Length-prefix or escape key parts — the crypto package's <code>encodeFields</code> already solves exactly this injective-framing problem; reuse it.</p>
+</details>
+
+<details class="f med" id="sq-5">
+<summary><span class="badge med">MEDIUM</span>Legacy-mode commit is not atomic across trees; savepoints are silent no-ops <span class="cat">bug</span> <code>optimystic-adapter/txn-bridge.ts:235-249, 400-418</code>; <code>optimystic-adapter/vtab-connection.ts:50-65</code></summary>
+<p>Legacy (default) commit flushes each dirty tree with a separate <code>await tree.sync()</code>; if sync N+1 fails, the rollback only restores in-memory snapshots — already-synced trees stay persisted, so a table and its indexes (or two tables in one SQL transaction) diverge durably. Separately, the connection's <code>createSavepoint/releaseSavepoint/rollbackToSavepoint</code> are empty no-ops — <code>ROLLBACK TO</code> succeeds while discarding nothing (silent corruption), while the bridge's own savepoint methods throw but are dead code.</p>
+<p class="fix">Route multi-tree commits through the coordinator path even locally (one pend/commit covering all trees), or document the limitation loudly. Make savepoint methods throw until implemented via the existing tree <code>snapshot()/restore()</code> mechanism; delete the dead bridge methods.</p>
+</details>
+
+<details class="f med" id="sq-7">
+<summary><span class="badge med">MEDIUM</span>Fire-and-forget <code>session.execute</code> can drop statements from the replicated transaction record <span class="cat">bug</span> <code>optimystic-adapter/txn-bridge.ts:374-379</code> + <code>db-core/src/transaction/session.ts:69-110</code></summary>
+<p><code>addStatement</code> does <code>void this.session.execute(statement, [])</code> with a comment claiming statement tracking is synchronous — it isn't: <code>session.execute</code> awaits <code>applyActions</code> before pushing the statement, and its failure results are discarded. A statement can be silently missing from the Transaction validators re-execute — divergent operations hash at best, undetected divergence at worst.</p>
+<p class="fix">Add a synchronous <code>session.recordStatement(sql)</code>, or await the promise in the DML path and propagate failure.</p>
+</details>
+
+<details class="f med" id="sq-8">
+<summary><span class="badge med">MEDIUM</span>Hardcoded engine ID has drifted from the actual Quereus version — version fencing is fiction <span class="cat">design</span> <code>transaction/quereus-engine.ts:17</code></summary>
+<p><code>QUEREUS_ENGINE_ID = 'quereus@0.15.1'</code> vs peer dep <code>^0.16.2</code> (installed dev: 4.3.0). Validators dispatch re-execution by exact engine-ID match — peers on genuinely different Quereus versions (different SQL semantics) still match, defeating the fence's purpose.</p>
+<p class="fix">Generate the constant from <code>@quereus/quereus</code>'s package.json at build time, CI-checked against the lockfile.</p>
+</details>
+
+<details class="f med" id="sq-9">
+<summary><span class="badge med">MEDIUM</span>Private keys in SQL literals are captured into the replicated transaction record <span class="cat">security</span> <code>quereus-plugin-crypto/src/plugin.ts:224-235</code> + <code>optimystic-module.ts:914-916</code>, <code>txn-bridge.ts:369-379</code></summary>
+<p>A DML statement embedding <code>sign(..., '&lt;privkey&gt;')</code> as a literal is persisted verbatim in the transaction record and shipped to validators for re-execution — key material leaves the node. The crypto code itself is sound (noble-curves prehash defaults, RFC6979 nonces, lowS, CSPRNG); this is an integration-level exposure.</p>
+<p class="fix">Document that <code>sign()</code> requires parameter-bound keys outside replicated mutation statements, and/or redact/reject mutation statements containing non-replicable function calls before accumulating them.</p>
+</details>
+
+<details class="f med" id="sq-10">
+<summary><span class="badge med">MEDIUM</span>UNIQUE enforcement is a full table scan per DML row; planner statistics are dead machinery <span class="cat">perf</span> <code>optimystic-module.ts:839-869, 1696-1698</code>; <code>schema/statistics-collector.ts</code></summary>
+<p><code>checkUniqueConstraints</code> scans the whole collection per row (bulk insert into a UNIQUE-constrained table is O(n²)), while <code>getBestAccessPlan</code> uses hardcoded defaults and the 173-line <code>StatisticsCollector</code> is consulted by nothing.</p>
+<p class="fix">Probe UNIQUE via the existing index trees (<code>findByIndexIn</code> point range); wire the statistics collector into planning or delete it.</p>
+</details>
+
+<details class="f low" id="sq-11">
+<summary><span class="badge low">LOW</span>Assorted: <code>as any</code> private-member pokes; reference-peer storage comment lies; triplicated CLI options <span class="cat">cleanliness</span></summary>
+<p><code>optimystic-module.ts:1254-1255, 1920-1921, 387-394</code>: mutating IndexManager private state, reaching into table internals, and casting <code>this.db</code> — add typed accessors. <code>reference-peer/src/cli.ts:394-396</code>: comment claims the LocalTransactor "uses same storage as node" but <code>createStorage()</code> runs a second time creating separate storage (offline data invisible to the node); <code>listDiaries</code> lists only the in-process map; ~20 commander options are triplicated across three commands.</p>
+</details>
+
+<p class="assess"><strong>Subsystem assessment.</strong> The transaction bridge, deferred-constraint snapshot/rollback machinery, and committed-read views are thoughtfully engineered, with exemplary comments (the schema-hash re-entrancy analysis). <code>quereus-plugin-crypto</code> is genuinely strong — injective framing, domain separation, mandatory salts, correct noble usage; no signature-weakening defects found. <code>substrate-simulator</code> is cleanly quarantined (private, deterministic RNG, no production imports). The weak spot is the storage-facing edge of the vtab: the key/index encoding is neither order-preserving nor injective, and the planner advertises capabilities the executor doesn't deliver — the class of bug that silently returns wrong SQL results rather than erroring. Prioritize #1–3 (wrong results), then #5–7 (transaction-record integrity).</p>
+
+<!-- ============================================================ -->
+<h2 id="health">9. Cross-cutting engineering health</h2>
+
+<table>
+<tr><th>Metric</th><th>Value</th></tr>
+<tr><td>tsconfig strictness</td><td><code>strict</code> + <code>noUncheckedIndexedAccess</code> in all 11 packages; <code>exactOptionalPropertyTypes</code> in none</td></tr>
+<tr><td><code>as any</code> (src / test)</td><td>103 / 299 — db-p2p src 58 (28 in <code>libp2p-node-base.ts</code>); db-p2p tests alone 215</td></tr>
+<tr><td><code>@ts-ignore</code>/<code>@ts-expect-error</code></td><td><strong>0</strong> (excellent)</td></tr>
+<tr><td>Test cases</td><td>db-core 1,009 · db-p2p 1,102 · plus simulator/plugin suites; property-based tests present (fast-check)</td></tr>
+<tr><td>Wall-clock sleeps in tests</td><td>~70 sites across 29 files (virtual clocks in only ~6); worst: 2.5–4.5 s sleeps in <code>cluster-coordinator.spec.ts</code></td></tr>
+<tr><td>Skipped tests</td><td>13 — 12 exemplary (ticket-annotated doc expectations), 1 stray unannotated</td></tr>
+<tr><td>Circular package deps</td><td>None — clean DAG (core → p2p → adapters → apps)</td></tr>
+</table>
+
+<details class="f high" open id="eh-1">
+<summary><span class="badge high">HIGH</span><code>portal:</code> resolutions make the repo non-installable without sibling checkouts <span class="cat">build</span> root <code>package.json:12-16</code></summary>
+<p><code>@quereus/quereus: portal:../quereus/...</code> and <code>p2p-fret: portal:../Fret/...</code> (also directly in substrate-simulator). A fresh clone or CI cannot <code>yarn install</code> without <code>../quereus</code> and <code>../Fret</code> checked out at compatible versions; the lockfile pins local disk state.</p>
+<p class="fix">Consume published/tagged versions by default; keep portals in an opt-in local overlay, and document the sibling layout.</p>
+</details>
+
+<details class="f high" open id="eh-2">
+<summary><span class="badge high">HIGH</span>db-core publishes a broken <code>./test</code> subpath export <span class="cat">packaging</span> <code>db-core/package.json:19-22</code></summary>
+<p>The <code>"./test"</code> export points at <code>dist/test/test-transactor.js</code>, but <code>files</code> contains <code>"!dist/test"</code> — the published tarball omits exactly what the export points to. <code>demo/src/run.ts:1</code> imports it; works via workspace linking, breaks for every npm consumer.</p>
+<p class="fix">Move <code>TestTransactor</code> to <code>src/testing/</code> so it ships under <code>dist/src</code>, or stop excluding <code>dist/test</code>.</p>
+</details>
+
+<details class="f high" open id="eh-4">
+<summary><span class="badge high">HIGH</span>The load-bearing service wiring swallows every failure <span class="cat">robustness</span> <code>db-p2p/src/libp2p-node-base.ts:481-533</code></summary>
+<p>All six of the repo's empty <code>catch { }</code> blocks live here, wrapping <code>setLibp2p</code> injections the file's own comments call load-bearing ("done before start() so the protocol handler is live"). A failure surfaces later as mysterious routing/consensus misbehavior. <code>createLibp2p(libp2pOptions as any)</code> also defeats libp2p's config typing.</p>
+<p class="fix">Define a typed <code>SetLibp2pCapable</code> interface, type the services record, and at minimum log every swallowed wiring failure.</p>
+</details>
+
+<details class="f high" open id="eh-7">
+<summary><span class="badge high">HIGH</span>The fs persistence adapter: zero tests, no README, no lockfile, excluded from the root test chain <span class="cat">coverage</span> <code>packages/db-p2p-storage-fs</code></summary>
+<p>No <code>test/</code> directory exists; the root <code>test</code> script skips the package — yet it's the durable store used by reference-peer and the SQL plugin, and <code>file-storage.ts:21</code> carries the repo's scariest TODO ("use proper-lockfile to take a lock on the basePath") — known unguarded concurrent-process access, untested. Its three siblings each have specs including a shared <code>identity.spec.ts</code>.</p>
+<p class="fix">Port the identity/kv-store/storage spec trio (tmp-dir backed), add the package to the root test chain, land or ticket the lockfile TODO — and fix the non-atomic writes (<a href="#st-2">Storage #2</a>).</p>
+</details>
+
+<details class="f med" id="eh-3">
+<summary><span class="badge med">MEDIUM</span>Test determinism, dependency drift, config duplication, logging split <span class="cat">hygiene</span></summary>
+<p><strong>Sleeps:</strong> ~70 wall-clock sleeps (some 2.5–4.5 s) across 29 test files — standardize on the fake-clock pattern already proven in the cohort-topic scale suites, or condition-polling helpers. <strong>Deps:</strong> reference-peer pins <code>@libp2p/peer-id ^5</code> vs <code>^6</code> everywhere else (dual-instance classes fail <code>instanceof</code> at runtime); assorted minor drift — adopt <code>yarn constraints</code>. <strong>tsconfig:</strong> 11 copy-pasted configs with visible drift (missing <code>downlevelIteration</code> in storage-fs, NodeNext vs Node16, BOM in db-core's) — add a <code>tsconfig.base.json</code>; consider <code>verbatimModuleSyntax</code> and <code>exactOptionalPropertyTypes</code>. <strong>Logging:</strong> ~16 stray <code>console.*</code> in library code (network-transactor, cluster-repo, restoration-coordinator-v2, libp2p-key-network, optimystic-module) — sweep to the per-package <code>debug</code> loggers; the root <code>lint</code> script is a stub (<code>echo 'Lint not configured'</code>) — configure ESLint with <code>no-console</code> + CLI overrides.</p>
+</details>
+
+<details class="f low" id="eh-11">
+<summary><span class="badge low">LOW</span>Assorted: placeholder metadata; stale README claims; <code>-v2</code> naming; hand-rolled script chains <span class="cat">polish</span></summary>
+<p><code>transaction/coordinator.ts:355-357</code> placeholder <code>'local'</code>/<code>''</code> metadata and <code>:555</code> unconditional <code>results: []</code> (see <a href="#tx-7">Txn #7</a>). db-p2p README still claims filesystem storage that moved to its own package; three packages lack READMEs entirely. <code>restoration-coordinator-v2.ts</code> has no v1 — rename. Root scripts are ~50 hand-chained <code>cd &amp;&amp; yarn</code> commands that already silently dropped storage-fs — use <code>yarn workspaces foreach -At</code>. One unannotated <code>it.skip</code> (<code>distributed-transaction-validation.spec.ts:253</code>, multi-collection coordination) looks like a real functional gap — ticket it like the other twelve.</p>
+</details>
+
+<p class="assess"><strong>Engineering-health assessment.</strong> Good-to-strong core with distribution-layer edges fraying. Type-system posture (zero ts-ignores, strict everywhere), layering, error conventions (seven purpose-built error classes, no thrown strings), and db-core test depth are well above average. The risks cluster in: reproducibility (portals), the seam files where the type system is switched off exactly where a database can least afford it, and the persistence adapter being simultaneously untested, undocumented, lock-free, and out of CI.</p>
+
+<!-- ============================================================ -->
+<h2 id="strengths">10. What's genuinely good</h2>
+
+<div class="strength"><strong>Real, enforced layering.</strong> <code>db-core</code> is genuinely transport-free — enforced by a test guard (<code>no-fret-import.spec.ts</code>) — with cohort-topic logic behind injectable ports. The package graph is a clean DAG. This makes the consensus logic testable in-process, and the project actually exploits that (mesh harnesses, virtual clocks).</div>
+<div class="strength"><strong>The right BFT primitive, actually implemented.</strong> Every cluster member independently re-executes transactions and compares an operations hash; vote signatures are verified (modulo the key-binding fix); equivocation detection is real, first-seen-wins, with ban-weight penalties. Theorem 13's coordinator-innocuity holds on the implemented path.</div>
+<div class="strength"><strong>Commit-cert-as-authority, notifications-as-hints.</strong> Reactivity reuses the commit certificate's threshold signature — a compromised forwarder can drop but never fabricate. Exactly the right trust posture for a notification layer.</div>
+<div class="strength"><strong>Anti-flood by construction.</strong> The cohort-topic walk-toward-root / follow-redirects-only discipline gives structural DoS resistance; the simulator measured the design's quantitative claims (depth law, collision rates, operating envelopes) before the protocols landed — including one honestly-reported negative margin.</div>
+<div class="strength"><strong>Sound crypto where it counts.</strong> quereus-plugin-crypto: injective field framing, domain separation, mandatory salts, correct noble-curves usage (prehash, lowS, RFC6979), CSPRNG randomness — no signature-weakening defects found. Cohort-topic signing payloads are canonicalized with explicit ordered arrays and domain tags.</div>
+<div class="strength"><strong>Documentation and test discipline far above average.</strong> Doc comments that read like design documents (storage clone pitfalls, schema-hash re-entrancy analysis); target-vs-current honesty in <code>architecture.md</code>; ticket-annotated <code>it.skip</code>s; env-gated integration suites; property-based tests with fast-check; 2,100+ test cases with zero <code>@ts-ignore</code>.</div>
+
+<!-- ============================================================ -->
+<h2 id="prio">11. Prioritized recommendations</h2>
+
+<table class="prio">
+<tr><th>Tier</th><th>Theme</th><th>Items</th></tr>
+<tr>
+  <td>P0</td>
+  <td>Correctness &amp; security fixes — small, localized, high payoff</td>
+  <td>
+    Bind vote-signature keys to peer IDs (<a href="#p2p-1">P2P #1</a>).
+    Record read deps above the cache (<a href="#tx-1">Txn #1</a>).
+    Fix the four B-tree rebalance/iteration bugs + two missing <code>await</code>s, and add a B-tree property/fuzz test (<a href="#fo-1">Foundations #1–5</a>).
+    Atomic writes in the fs adapter (<a href="#st-2">Storage #2</a>).
+    Latch the <code>get()</code> promotion path; reject non-contiguous commits; honest <code>ranges</code> seeding (<a href="#st-1">Storage #1, #3, #4</a>).
+    Stop claiming unhandled SQL filters; wire the PK comparator; canonicalize index-key serialization (<a href="#sq-1">SQL #1–3</a>).
+    Freshness-gate cohort renews; clamp <code>treeTier</code>/<code>ttl</code>; reconcile budget↔forwarders (<a href="#ct-1">Cohort #1–4</a>).
+    Roll back the executed marker on apply failure (<a href="#p2p-2">P2P #2</a>).
+    Catch the fire-and-forget cancels (<a href="#tx-5">Txn #5</a>).
+  </td>
+</tr>
+<tr>
+  <td>P1</td>
+  <td>Protocol integrity — the design-level seams</td>
+  <td>
+    Agree on cluster membership: include <code>record.peers</code> (or a membership epoch/cert) in the signed message hash (<a href="#d-h1">Design H1</a>).
+    Multi-collection atomicity: durable 2PC journal, or honestly downgrade Theorem 3 and surface <code>committedCollections</code> (<a href="#d-h4">Design H4</a>, <a href="#tx-3">Txn #3</a>).
+    Thread real <code>engineId</code> through sessions (<a href="#tx-7">Txn #7</a>); generate it from the installed Quereus version (<a href="#sq-8">SQL #8</a>).
+    Canonicalize + share the operations hash (<a href="#tx-10">Txn #10</a>).
+    Clean up pend leaks and the retry-vs-auto-cancel conflict (<a href="#tx-2">Txn #2</a>, <a href="#tx-9">#9</a>).
+    Make SQL savepoints throw instead of silently no-op; fix legacy multi-tree commit atomicity (<a href="#sq-5">SQL #5</a>).
+    Wire the dispute protocol handler (or annotate the staging) (<a href="#p2p-3">P2P #3</a>).
+    Annotate <code>correctness.md</code> target-vs-current.
+  </td>
+</tr>
+<tr>
+  <td>P2</td>
+  <td>Robustness &amp; performance under load</td>
+  <td>
+    Message-size/frame caps on all inbound protocols (<a href="#p2p-4">P2P #4</a>).
+    Verify read-repair/reconcile against commit certs (<a href="#p2p-5">P2P #5</a>).
+    Implement sweeping/archival; cache capacity estimates (<a href="#st-8">Storage #8</a>).
+    Compact tracker op-logs (<a href="#fo-13">Foundations #13</a>).
+    Bound <code>syncInternal</code> retries (<a href="#fo-8">Foundations #8</a>).
+    UNIQUE via index probes (<a href="#sq-10">SQL #10</a>).
+    Cap the replay-guard/verifier maps (<a href="#ct-6">Cohort #6</a>, <a href="#ct-12">#12</a>).
+    Parallelize per-collection pends and batch retries; cache cluster lookups (<a href="#tx-11">Txn #11</a>).
+    Fix restoration's coordinate-space mismatch and wire <code>recover()</code> (<a href="#st-6">Storage #6, #7</a>).
+    Escalation-audience sampling from the whole keyspace (<a href="#d-h3">Design H3</a>).
+  </td>
+</tr>
+<tr>
+  <td>P3</td>
+  <td>Engineering health &amp; velocity</td>
+  <td>
+    Replace <code>portal:</code> deps with published versions (<a href="#eh-1">EH #1</a>); fix the <code>./test</code> export (<a href="#eh-2">EH #2</a>).
+    Test + document the fs adapter; add it to CI (<a href="#eh-7">EH #7</a>).
+    Type the composition root; log swallowed wiring failures (<a href="#eh-4">EH #4</a>).
+    Shared <code>tsconfig.base.json</code>; <code>yarn constraints</code>; <code>yarn workspaces foreach</code>; configure ESLint.
+    Extract the shared KV storage kernel (<a href="#st-10">Storage #10</a>) and the shared wire-validation module (<a href="#ct-9">Cohort #9c</a>).
+    Replace wall-clock test sleeps with the proven fake-clock pattern.
+    Delete the deprecated TransactionContext path; rename <code>restoration-coordinator-v2</code>; fix stale READMEs.
+  </td>
+</tr>
+</table>
+
+<p class="meta" style="margin-top:2.5rem">Generated by an eight-agent parallel review (six subsystem code reviews, one distributed-systems design review, one engineering-health review) on 2026-07-02. All findings verified against source at <code>main</code> be63206 + working-tree changes; line numbers may drift as the tree evolves.</p>
+
+</main>
+</body>
+</html>
