@@ -324,7 +324,7 @@ describe('cohort-topic: /sign endorsement policy', () => {
 		const epoch = epochOf(realMembers);
 		const exp = expectedFields(realMembers, epoch);
 		// A PromotionNoticeV1 image (tag mismatch) carried under kind: 'membership'.
-		const promoImage = promotionNoticeSigningPayload({ topicId: bytesToB64url(COORD), fromTier: 0, toTier: 1, effectiveAt: 1_000, cohortEpoch: bytesToB64url(epoch) });
+		const promoImage = promotionNoticeSigningPayload({ topicId: bytesToB64url(COORD), fromTier: 0, toTier: 1, effectiveAt: 1_000, cohortEpoch: bytesToB64url(epoch), cohortCoord: bytesToB64url(COORD) });
 		const req: SignRequestV1 = { v: 1, kind: 'membership', coord: bytesToB64url(COORD), cohortEpoch: bytesToB64url(epoch), payload: bytesToB64url(promoImage) };
 
 		const reply = await handleSignRequest(req, requester!.idStr, depsFor(self!, [self!, requester!], epoch, exp));

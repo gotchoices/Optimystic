@@ -434,10 +434,16 @@ export interface CoordRegistry {
 	 */
 	findByCoord(coord: RingCoord): CoordEngine | undefined;
 	/**
-	 * The engine serving `topicId` at `treeTier`, or `undefined` (inbound promote/demote notice dispatch).
-	 * A served coord embeds `(tier, topic)`, so at most one engine matches — the cohort the notice's
-	 * signers belong to. `undefined` means this node serves no such cohort (e.g. a demotion arriving at a
-	 * parent that does not track the child), so the notice is dropped rather than applied.
+	 * The **first** engine serving `topicId` at `treeTier`, or `undefined`. Used by the tier-0 read paths —
+	 * matchmaking query serve and the reactivity direct-subscriber lookup — that resolve a served engine by
+	 * `(topic, tier)` rather than by an exact coord.
+	 *
+	 * **First-match caveat.** At `d ≥ 1` a node can serve several sibling cohorts for one `(topic, tier)` under
+	 * distinct served coords, and this returns whichever iterates first — exact at the single-cohort / tier-0
+	 * milestone, but not a coord-precise lookup. The promote/demote notice path deliberately does **not** use
+	 * this: it routes by the notice's signed `cohortCoord` via {@link findByCoord} so a multi-cohort node
+	 * applies each notice to the cohort that produced it. Reconciling these tier-0 readers with multi-cohort
+	 * serving is follow-on work (`cohort-topic-followon-derivation`).
 	 */
 	findServing(topicId: Uint8Array, treeTier: number): CoordEngine | undefined;
 	/** Every live engine (stop + sweep). */
@@ -658,6 +664,13 @@ export async function createCohortTopicHost(node: Libp2p, fret: FretService, opt
 	// transport's cohort peer resolution.
 	const broadcastNotice = (notice: PromotionNoticeV1 | DemotionNoticeV1, servedCoord: RingCoord): void => {
 		const frame = encodeCohortMessage(notice, maxBytes);
+		// NOTE: a demotion also fans to the parent coord for childCohortCount bookkeeping. Since the inbound
+		// path now routes by the notice's `cohortCoord` (the demoting CHILD's served coord), a parent-only node
+		// receiving this frame does not serve that coord → findByCoord → undefined → dropped (a no-op apply).
+		// That matches this milestone: childCohortCount is 0 and the parent-side decrement is not yet wired
+		// through applyDemotionNotice. A node that serves BOTH the parent and the child coord still adopts (it
+		// serves the child coord as a child sibling). Wiring the real parent decrement is follow-on work owned
+		// by `cohort-topic-followon-derivation`.
 		for (const coord of noticeBroadcastCoords(notice, servedCoord)) {
 			gossipTransport.broadcastOver(protocols.promote, coord, frame);
 		}
@@ -1459,6 +1472,9 @@ function createCoordEngine(ctx: CoordEngineContext, servedCoord: RingCoord, tree
 		// `coord_{d-1}(P, topicId)`; never invoked at the root (demotion is gated on `treeTier > 0`), so
 		// the `d = 0` branch (clamped to `coord_0`) is a well-formed placeholder that the lifecycle skips.
 		parentCoord: (topicId: Uint8Array): Uint8Array => ctx.addressing.coord(Math.max(0, treeTier - 1), participantCoord, topicId),
+		// The served coord this engine was instantiated at — stamped on every notice as `cohortCoord` and
+		// covered by its threshold signature, so a receiver routes + verifies the notice by exactly this coord.
+		cohortCoord: (): Uint8Array => servedCoord,
 		cohortEpoch: localEpoch,
 		signer: noticeSigner,
 		// Production defaults (cap_promote = 64, …) unless the host was given a promotion override — the
@@ -1829,6 +1845,9 @@ export async function handleSignRequest(request: SignRequestV1, fromPeerStr: str
 	// All kinds — bind the payload-internal `cohortEpoch` to our own current epoch (closes the falsified-internal
 	// -epoch hole, for promotion / demotion too). It is `image[2]` for a MembershipCertV1 image and the last
 	// element for promotion / demotion (see `sig/payloads.ts`).
+	// NOTE: this reads the notice epoch positionally as the LAST element — `sig/payloads.ts` deliberately keeps
+	// `cohortEpoch` last (with the newer `cohortCoord` inserted just before it) to preserve this. Do not append
+	// a field after `cohortEpoch` in those images without updating this read.
 	const currentEpochB64 = bytesToB64url(deps.currentEpoch(coord));
 	const embeddedEpoch = request.kind === "membership" ? image[2] : image[image.length - 1];
 	if (embeddedEpoch !== currentEpochB64) {
@@ -1878,8 +1897,8 @@ export type NoticeOutcome = "applied" | "untrusted" | "dropped";
  *
  * - `"undecodable"`  — the frame is neither a promotion nor a demotion notice.
  * - `"rate-limited"` — the dialing `(peer, topic)` is over its `register_rate_per_peer` ceiling.
- * - `"stale"`        — the notice's `effectiveAt` is at or below the last *applied* notice for its
- *   `(topic, tier)` (a replay / out-of-order frame); dropped before `verifyMessage`.
+ * - `"stale"`        — the notice's `effectiveAt` is at or below the last *applied* notice for its served
+ *   cohort coord (a replay / out-of-order frame); dropped before `verifyMessage`.
  */
 export type InboundNoticeResult = NoticeOutcome | "undecodable" | "rate-limited" | "stale";
 
@@ -1895,10 +1914,12 @@ export interface PromoteGate {
 	 */
 	readonly rateLimiter: RegisterRateLimiter;
 	/**
-	 * Per-`(topicId, tier)` high-water of the last *applied* notice's `effectiveAt`. A notice at or below the
-	 * water is a replay / out-of-order frame and is dropped before verification. Updated **only** on an
-	 * `"applied"` outcome (never on an unverified frame), so a forged notice carrying `effectiveAt = Infinity`
-	 * cannot poison the water and lock out legitimate notices.
+	 * Per-served-coord high-water (key: `` `${cohortCoord}|${tier}` ``) of the last *applied* notice's
+	 * `effectiveAt`. A notice at or below the water is a replay / out-of-order frame and is dropped before
+	 * verification. Keyed by the served coord — not `(topic, tier)` — so two sibling cohorts a node serves for
+	 * one `(topic, tier)` do not share an entry (an applied notice for one must not stale-drop a legitimate
+	 * notice for the other). Updated **only** on an `"applied"` outcome (never on an unverified frame), so a
+	 * forged notice carrying `effectiveAt = Infinity` cannot poison the water and lock out legitimate notices.
 	 *
 	 * **Bounded.** An {@link LruMap} capped at {@link PROMOTE_HIGHWATER_MAX_KEYS} so the retain-forever shape
 	 * cannot leak on a long-lived node. Unlike the limiter this is *not* attacker-growable (it is written only
@@ -1913,7 +1934,7 @@ export interface PromoteGate {
 }
 
 /**
- * Hard cap on tracked `(topicId, tier)` high-water entries; the least-recently-touched are evicted beyond
+ * Hard cap on tracked per-served-coord high-water entries; the least-recently-touched are evicted beyond
  * this. A modest bound is plenty — only verified applies grow the map, so it never evicts under legitimate
  * load — but it caps the otherwise retain-forever shape on a long-lived node.
  */
@@ -1966,8 +1987,8 @@ export const PROMOTE_REFETCH_MIN_INTERVAL_MS = 60_000;
  * Verify an inbound notice's threshold signature against the cohort `MembershipCertV1` for
  * `target.servedCoord` and, on success, apply it to the target's promotion lifecycle. Returns:
  *
- * - `"dropped"`  — no local engine serves the notice's `(topic, tier)` (e.g. a demotion arriving at a
- *   parent that does not track the child); nothing to apply to.
+ * - `"dropped"`  — no local engine serves the notice's carried `cohortCoord` (e.g. a demotion arriving at a
+ *   parent-only node that does not serve the demoting child's coord); nothing to apply to.
  * - `"untrusted"` — the `signers` are not a `≥ minSigs` subset of the cohort cert, or the multisig does
  *   not verify (a forged single-signer / short-quorum notice); local state is left unchanged.
  * - `"applied"`  — verified and applied.
@@ -2027,14 +2048,19 @@ export async function verifyAndApplyNotice(
  * work:
  *
  * ```
- *   decode → per-(peer,topic) rate limit → findServing → effectiveAt high-water → verify+apply
+ *   decode → per-(peer,topic) rate limit → resolve engine by carried cohortCoord → effectiveAt high-water → verify+apply
  * ```
  *
  * - **Rate limit** (`gate.rateLimiter`) keys on `(from, topicId)`; an over-rate peer is dropped before the
- *   `findServing` map scan and the verify, so a peer cannot amplify junk into verify/network work.
- * - **High-water** (`gate.highWater`, per `(topicId, tier)`) drops a notice whose `effectiveAt` is at or
- *   below the last *applied* one — a replay / out-of-order frame — before `verifyMessage`. It is advanced
- *   **only** on an `"applied"` outcome, so a forged frame (which never verifies) cannot poison it.
+ *   coord lookup and the verify, so a peer cannot amplify junk into verify/network work.
+ * - **Resolve engine by `cohortCoord`** ({@link CoordRegistry.findByCoord}) — the exact served coord the
+ *   notice was decided for, covered by its signature. A node serving several sibling cohorts for one
+ *   `(topic, tier)` applies the notice to the cohort that produced it, never a first-match `(topic, tier)`
+ *   scan; a coord this node does not serve is dropped.
+ * - **High-water** (`gate.highWater`, keyed per served `cohortCoord`) drops a notice whose `effectiveAt` is
+ *   at or below the last *applied* one — a replay / out-of-order frame — before `verifyMessage`. It is
+ *   advanced **only** on an `"applied"` outcome, so a forged frame (which never verifies) cannot poison it.
+ *   Keying by coord (not `(topic, tier)`) keeps two sibling cohorts on one node from sharing a water.
  * - The receiver-side `cohortEpoch` is intentionally **not** gated on: the epoch rotates on every
  *   membership change, so a legitimately in-flight notice can briefly carry the prior epoch right after a
  *   rotation — making an epoch check a brittle, false-positive-prone filter. The rate limiter + high-water
@@ -2061,20 +2087,28 @@ export async function handleInboundNotice(
 	const tier = inbound.kind === "promotion" ? inbound.notice.fromTier : inbound.notice.tier;
 	const topicId = b64urlToBytes(inbound.notice.topicId);
 
-	// Per-(peer, topic) rate limit — before the findServing scan and the verify.
+	// Per-(peer, topic) rate limit — before the coord lookup and the verify.
 	if (gate.rateLimiter.check(from, topicId, now).ok === false) {
 		log("promote: rate-limited %s notice for topic %s tier %d", inbound.kind, inbound.notice.topicId, tier);
 		return "rate-limited";
 	}
 
-	const target = registry.findServing(topicId, tier);
+	// Route by the notice's signed `cohortCoord` — the exact served coord the deciding cohort sits at. A node
+	// serving several sibling cohorts for one `(topic, tier)` (possible at `d ≥ 1`) thus applies the notice to
+	// the cohort that produced it, and `verifyAndApplyNotice` verifies against that same coord's cert. The coord
+	// is covered by the threshold signature, so it cannot be rewritten to hijack a sibling. A coord this node
+	// does not serve → dropped (e.g. a demotion fanned to a parent-only node — see `noticeBroadcastCoords`).
+	const target = registry.findByCoord(b64urlToBytes(inbound.notice.cohortCoord));
 	if (target === undefined) {
-		log("promote: dropped %s notice for topic %s tier %d (no serving engine)", inbound.kind, inbound.notice.topicId, tier);
+		log("promote: dropped %s notice for topic %s tier %d (no engine at coord %s)", inbound.kind, inbound.notice.topicId, tier, inbound.notice.cohortCoord);
 		return "dropped";
 	}
 
-	// Freshness / replay gate: drop an at-or-below-high-water notice before the expensive verify.
-	const waterKey = `${inbound.notice.topicId}|${tier}`;
+	// Freshness / replay gate: drop an at-or-below-high-water notice before the expensive verify. Keyed by the
+	// served coord (which uniquely identifies the cohort) so two sibling cohorts on one node do not share a
+	// high-water — an applied notice for cohort A must not stale-drop a legitimate cohort-B notice. `tier` is
+	// kept in the key only for readability.
+	const waterKey = `${inbound.notice.cohortCoord}|${tier}`;
 	const water = gate.highWater.get(waterKey);
 	if (water !== undefined && inbound.notice.effectiveAt <= water) {
 		log("promote: stale %s notice for topic %s tier %d (effectiveAt %d <= high-water %d)", inbound.kind, inbound.notice.topicId, tier, inbound.notice.effectiveAt, water);

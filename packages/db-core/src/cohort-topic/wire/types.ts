@@ -150,6 +150,15 @@ export interface PromotionNoticeV1 {
 	fromTier: number;
 	/** Typically `fromTier + 1`. */
 	toTier: number;
+	/**
+	 * The served coord `coord_d(participantCoord, topicId)` the deciding cohort sits at, 32 bytes, base64url
+	 * — the same value as that cohort's {@link MembershipCertV1.cohortCoord}, which the threshold signature
+	 * verifies against. The receiver routes the notice to the local engine for exactly this coord rather than
+	 * scanning for the first engine matching `(topic, tier)`, so a node serving several sibling cohorts for
+	 * one `(topic, tier)` (possible at `d ≥ 1`, where each cohort has its own served coord) applies the notice
+	 * to the cohort that actually produced it. Covered by the threshold signature — rewriting it breaks verification.
+	 */
+	cohortCoord: string;
 	/** Unix ms. */
 	effectiveAt: number;
 	/** Cohort threshold signature, base64url. */
@@ -166,6 +175,13 @@ export interface DemotionNoticeV1 {
 	tier: number;
 	/** 32 bytes, base64url. */
 	parentCohortCoord: string;
+	/**
+	 * The served coord `coord_d(participantCoord, topicId)` the deciding cohort sits at, 32 bytes, base64url —
+	 * the same served-coord concept as {@link PromotionNoticeV1.cohortCoord}. Distinct from
+	 * {@link parentCohortCoord} (the tier-`(d − 1)` parent this demotion hands off to): `cohortCoord` names the
+	 * *demoting* cohort and is what the receiver routes + verifies by. Covered by the threshold signature.
+	 */
+	cohortCoord: string;
 	effectiveAt: number;
 	thresholdSig: string;
 	signers: string[];

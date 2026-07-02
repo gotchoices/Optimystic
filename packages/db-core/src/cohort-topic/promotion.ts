@@ -124,6 +124,13 @@ export interface PromotionDeps {
 	treeTier: (topicId: Uint8Array) => number;
 	/** The tier-`(d − 1)` parent cohort coord, target of a {@link DemotionNoticeV1}. */
 	parentCoord: (topicId: Uint8Array) => Uint8Array;
+	/**
+	 * The served coord `coord_d(participantCoord, topicId)` this cohort sits at (raw bytes) — stamped on
+	 * every notice as `cohortCoord` and covered by its threshold signature, so a receiver routes the notice
+	 * to exactly this cohort's engine and verifies it against exactly this cohort's cert. Constant for the
+	 * engine's lifetime (the engine is instantiated at one served coord).
+	 */
+	cohortCoord: () => Uint8Array;
 	/** Cohort epoch (raw bytes) the notices are signed under. */
 	cohortEpoch: () => Uint8Array;
 	/** Threshold signer (the gossip ticket's `k − x` cohort signer). */
@@ -283,7 +290,8 @@ class CohortPromotionLifecycle implements PromotionLifecycle {
 		const fromTier = this.deps.treeTier(topicId);
 		const topicB64 = bytesToB64url(topicId);
 		const epochB64 = bytesToB64url(this.deps.cohortEpoch());
-		const signable = { topicId: topicB64, fromTier, toTier: fromTier + 1, effectiveAt: now, cohortEpoch: epochB64 };
+		const cohortB64 = bytesToB64url(this.deps.cohortCoord());
+		const signable = { topicId: topicB64, fromTier, toTier: fromTier + 1, effectiveAt: now, cohortEpoch: epochB64, cohortCoord: cohortB64 };
 		const { thresholdSig, signers } = await this.deps.signer.thresholdSign(promotionNoticeSigningPayload(signable));
 		state.promoted = true;
 		state.promotedAt = now;
@@ -293,6 +301,7 @@ class CohortPromotionLifecycle implements PromotionLifecycle {
 			topicId: topicB64,
 			fromTier,
 			toTier: fromTier + 1,
+			cohortCoord: cohortB64,
 			effectiveAt: now,
 			thresholdSig: bytesToB64url(thresholdSig),
 			signers: signers.map(bytesToB64url),
@@ -329,7 +338,8 @@ class CohortPromotionLifecycle implements PromotionLifecycle {
 		const topicB64 = bytesToB64url(topicId);
 		const epochB64 = bytesToB64url(this.deps.cohortEpoch());
 		const parentB64 = bytesToB64url(this.deps.parentCoord(topicId));
-		const signable = { topicId: topicB64, tier, parentCohortCoord: parentB64, effectiveAt: now, cohortEpoch: epochB64 };
+		const cohortB64 = bytesToB64url(this.deps.cohortCoord());
+		const signable = { topicId: topicB64, tier, parentCohortCoord: parentB64, effectiveAt: now, cohortEpoch: epochB64, cohortCoord: cohortB64 };
 		const { thresholdSig, signers } = await this.deps.signer.thresholdSign(demotionNoticeSigningPayload(signable));
 		// Release forwarder state: a demoted cohort leaves promoted mode and resets its clocks so a
 		// later re-growth re-evaluates cleanly.
@@ -342,6 +352,7 @@ class CohortPromotionLifecycle implements PromotionLifecycle {
 			topicId: topicB64,
 			tier,
 			parentCohortCoord: parentB64,
+			cohortCoord: cohortB64,
 			effectiveAt: now,
 			thresholdSig: bytesToB64url(thresholdSig),
 			signers: signers.map(bytesToB64url),

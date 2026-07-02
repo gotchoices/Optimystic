@@ -60,6 +60,8 @@ async function makeMembers(n: number): Promise<Member[]> {
 }
 
 const COORD: RingCoord = Uint8Array.from({ length: 32 }, (_v, i) => (i * 7 + 1) & 0xff);
+/** A second served coord for the same `(topic, tier)` — a sibling cohort a multi-cohort node also serves. */
+const OTHER_COORD: RingCoord = Uint8Array.from({ length: 32 }, (_v, i) => (i * 11 + 3) & 0xff);
 const EPOCH = Uint8Array.from({ length: 32 }, (_v, i) => (i * 3 + 9) & 0xff);
 const PARENT: RingCoord = Uint8Array.from({ length: 32 }, (_v, i) => (i * 5 + 2) & 0xff);
 const TOPIC = Uint8Array.from({ length: 32 }, (_v, i) => (i + 11) & 0xff);
@@ -111,36 +113,41 @@ async function verifierOver(members: Member[], byId: Map<string, Member>, minSig
 	return verifierFromSource(source, minSigs);
 }
 
-/** A remote member's promotion lifecycle wrapped as the inbound-notice apply target around COORD. */
-function remoteTarget(minSigs: number): { life: PromotionLifecycle; target: NoticeApplyTarget } {
+/** A remote member's promotion lifecycle wrapped as the inbound-notice apply target around `coord` (default COORD). */
+function remoteTargetAt(coord: RingCoord, minSigs: number): { life: PromotionLifecycle; target: NoticeApplyTarget } {
 	const life = createPromotionLifecycle({
 		store: { directParticipants: (): number => 0 },
 		loadBucket: (): number => 0,
 		childCohortCount: (): number => 0,
 		treeTier: (): number => 1,
 		parentCoord: (): Uint8Array => PARENT,
+		cohortCoord: (): Uint8Array => coord,
 		cohortEpoch: (): Uint8Array => EPOCH,
 		// Apply never re-signs, so a verify-only signer is sufficient for the target.
 		signer: createCohortSigner(createVerifyOnlyThresholdCrypto(), minSigs),
 	});
 	const target: NoticeApplyTarget = {
-		servedCoord: COORD,
+		servedCoord: coord,
 		applyPromotionNotice: (n, now): void => life.applyPromotionNotice(n, now),
 		applyDemotionNotice: (n, now): void => life.applyDemotionNotice(n, now),
 	};
 	return { life, target };
 }
 
-/** Build a real, threshold-signed promotion notice over `members`. */
-async function realPromotionNotice(members: Member[], byId: Map<string, Member>, minSigs: number, effectiveAt: number): Promise<PromotionNoticeV1> {
-	const signable = { topicId: bytesToB64url(TOPIC), fromTier: 1, toTier: 2, effectiveAt, cohortEpoch: bytesToB64url(EPOCH) };
+function remoteTarget(minSigs: number): { life: PromotionLifecycle; target: NoticeApplyTarget } {
+	return remoteTargetAt(COORD, minSigs);
+}
+
+/** Build a real, threshold-signed promotion notice over `members`, decided at `coord` (default COORD). */
+async function realPromotionNotice(members: Member[], byId: Map<string, Member>, minSigs: number, effectiveAt: number, coord: RingCoord = COORD): Promise<PromotionNoticeV1> {
+	const signable = { topicId: bytesToB64url(TOPIC), fromTier: 1, toTier: 2, effectiveAt, cohortEpoch: bytesToB64url(EPOCH), cohortCoord: bytesToB64url(coord) };
 	const { thresholdSig, signers } = await assemblerFor(members[0]!, members, byId, 'promotion').assemble(promotionNoticeSigningPayload(signable), minSigs);
 	return { v: 1, ...signable, thresholdSig: bytesToB64url(thresholdSig), signers: signers.map(bytesToB64url) };
 }
 
-/** Build a real, threshold-signed demotion notice over `members`. */
-async function realDemotionNotice(members: Member[], byId: Map<string, Member>, minSigs: number, effectiveAt: number): Promise<DemotionNoticeV1> {
-	const signable = { topicId: bytesToB64url(TOPIC), tier: 1, parentCohortCoord: bytesToB64url(PARENT), effectiveAt, cohortEpoch: bytesToB64url(EPOCH) };
+/** Build a real, threshold-signed demotion notice over `members`, decided at `coord` (default COORD). */
+async function realDemotionNotice(members: Member[], byId: Map<string, Member>, minSigs: number, effectiveAt: number, coord: RingCoord = COORD): Promise<DemotionNoticeV1> {
+	const signable = { topicId: bytesToB64url(TOPIC), tier: 1, parentCohortCoord: bytesToB64url(PARENT), effectiveAt, cohortEpoch: bytesToB64url(EPOCH), cohortCoord: bytesToB64url(coord) };
 	const { thresholdSig, signers } = await assemblerFor(members[0]!, members, byId, 'demotion').assemble(demotionNoticeSigningPayload(signable), minSigs);
 	return { v: 1, ...signable, thresholdSig: bytesToB64url(thresholdSig), signers: signers.map(bytesToB64url) };
 }
@@ -186,7 +193,7 @@ describe('cohort-topic: inbound promote-protocol notice verify + apply', () => {
 		const { life, target } = remoteTarget(minSigs);
 
 		// One member signs alone — the interim-style sig that minSigs = 3 must now reject.
-		const signable = { topicId: bytesToB64url(TOPIC), fromTier: 1, toTier: 2, effectiveAt: 1_000, cohortEpoch: bytesToB64url(EPOCH) };
+		const signable = { topicId: bytesToB64url(TOPIC), fromTier: 1, toTier: 2, effectiveAt: 1_000, cohortEpoch: bytesToB64url(EPOCH), cohortCoord: bytesToB64url(COORD) };
 		const sig = await signPeer(members[0]!.key, promotionNoticeSigningPayload(signable));
 		const forged: PromotionNoticeV1 = { v: 1, ...signable, thresholdSig: bytesToB64url(sig), signers: [bytesToB64url(members[0]!.bytes)] };
 
@@ -210,14 +217,31 @@ describe('cohort-topic: inbound promote-protocol notice verify + apply', () => {
 		expect(life.isPromoted(TOPIC)).to.be.false;
 	});
 
-	it('a notice with no local engine serving its (topic, tier) is dropped (a demotion at a parent with no child engine never throws)', async () => {
+	it('a notice with no local engine serving its coord is dropped (a demotion at a parent with no child engine never throws)', async () => {
 		const members = await makeMembers(4);
 		const byId = new Map(members.map((m) => [m.idStr, m]));
 		const verifier = await verifierOver(members, byId, minSigs);
 		const demo = await realDemotionNotice(members, byId, minSigs, 1_000);
 		const inbound = decodeInboundNotice(encodeCohortMessage(demo))!;
-		// `undefined` target models registry.findServing returning nothing (no engine for this child cohort).
+		// `undefined` target models registry.findByCoord returning nothing (no engine at the notice's coord).
 		expect(await verifyAndApplyNotice(inbound, undefined, verifier, 2_000), 'no target → dropped, no throw').to.equal('dropped');
+	});
+
+	it('rewriting cohortCoord on a validly-signed notice makes it fail verification (the coord is covered by the signature)', async () => {
+		const members = await makeMembers(4);
+		const byId = new Map(members.map((m) => [m.idStr, m]));
+		const verifier = await verifierOver(members, byId, minSigs);
+		const { life, target } = remoteTarget(minSigs); // servedCoord = COORD, cert over COORD
+
+		const notice = await realPromotionNotice(members, byId, minSigs, 1_000); // threshold-signed at COORD
+		expect(notice.cohortCoord, 'signed at COORD').to.equal(bytesToB64url(COORD));
+
+		// Rewrite the carried coord to a sibling's: the signed image covers `cohortCoord`, so the receiver's
+		// recomputed image no longer matches what the cohort signed → the multisig fails to verify.
+		const tampered: PromotionNoticeV1 = { ...notice, cohortCoord: bytesToB64url(OTHER_COORD) };
+		const inbound = decodeInboundNotice(encodeCohortMessage(tampered))!;
+		expect(await verifyAndApplyNotice(inbound, target, verifier, 2_000), 'tampered coord → untrusted').to.equal('untrusted');
+		expect(life.isPromoted(TOPIC), 'the tampered notice never applied').to.be.false;
 	});
 
 	it('decodeInboundNotice returns undefined for a frame that is neither notice', () => {
@@ -228,14 +252,14 @@ describe('cohort-topic: inbound promote-protocol notice verify + apply', () => {
 describe('cohort-topic: notice broadcast fan-out targets', () => {
 	it('a promotion broadcasts only to the served cohort; a demotion also targets the parent coord', () => {
 		const promo: PromotionNoticeV1 = {
-			v: 1, topicId: bytesToB64url(TOPIC), fromTier: 1, toTier: 2, effectiveAt: 1_000,
+			v: 1, topicId: bytesToB64url(TOPIC), fromTier: 1, toTier: 2, cohortCoord: bytesToB64url(COORD), effectiveAt: 1_000,
 			thresholdSig: '', signers: [], cohortEpoch: bytesToB64url(EPOCH),
 		};
 		expect(noticeBroadcastCoords(promo, COORD).map(bytesToB64url), 'promotion → served cohort only')
 			.to.deep.equal([bytesToB64url(COORD)]);
 
 		const demo: DemotionNoticeV1 = {
-			v: 1, topicId: bytesToB64url(TOPIC), tier: 1, parentCohortCoord: bytesToB64url(PARENT), effectiveAt: 1_000,
+			v: 1, topicId: bytesToB64url(TOPIC), tier: 1, parentCohortCoord: bytesToB64url(PARENT), cohortCoord: bytesToB64url(COORD), effectiveAt: 1_000,
 			thresholdSig: '', signers: [], cohortEpoch: bytesToB64url(EPOCH),
 		};
 		expect(noticeBroadcastCoords(demo, COORD).map(bytesToB64url), 'demotion → served cohort + parent coord')
@@ -268,14 +292,39 @@ function countingVerifier(inner: MembershipVerifier): { verifier: MembershipVeri
 	return { verifier, calls: () => calls };
 }
 
-/** A minimal {@link CoordRegistry} whose `findServing` always resolves to `target` (or nothing). */
+/** A minimal {@link CoordRegistry} whose `findByCoord` always resolves to `target` (or nothing) — the
+ * single-cohort node the pre-existing gate tests model (routing is not what they exercise). */
 function servingRegistry(target: NoticeApplyTarget | undefined): CoordRegistry {
-	return { findServing: (): NoticeApplyTarget | undefined => target } as unknown as CoordRegistry;
+	return { findByCoord: (): NoticeApplyTarget | undefined => target } as unknown as CoordRegistry;
+}
+
+/** A {@link CoordRegistry} that routes a notice to the target whose `servedCoord` matches the queried coord —
+ * the multi-cohort node the disambiguation tests exercise. A coord no target serves resolves to `undefined`. */
+function coordRegistry(...targets: NoticeApplyTarget[]): CoordRegistry {
+	return {
+		findByCoord: (coord: RingCoord): NoticeApplyTarget | undefined =>
+			targets.find((t) => bytesToB64url(t.servedCoord) === bytesToB64url(coord)),
+	} as unknown as CoordRegistry;
+}
+
+/** A verifier that trusts every notice — isolates the ROUTING / high-water behavior under test from crypto
+ * (the signature binding is covered separately by the coord-tamper test with real threshold signatures). */
+const trustAllVerifier: MembershipVerifier = {
+	cache: (): void => undefined,
+	verifyMessage: (): Promise<'verified'> => Promise.resolve('verified'),
+};
+
+/** A structurally-valid promotion notice decided at `coord` (dummy sig — only used with {@link trustAllVerifier}). */
+function promotionNoticeAtCoord(coord: RingCoord, effectiveAt: number): PromotionNoticeV1 {
+	return {
+		v: 1, topicId: bytesToB64url(TOPIC), fromTier: 1, toTier: 2, cohortCoord: bytesToB64url(coord), effectiveAt,
+		thresholdSig: DUMMY_SIG, signers: [bytesToB64url(TOPIC)], cohortEpoch: bytesToB64url(EPOCH),
+	};
 }
 
 /** A forged single-signer promotion notice (signers ⊄ a `minSigs ≥ 2` quorum) — always "untrusted". */
 async function forgedPromotionNotice(members: Member[], effectiveAt: number): Promise<PromotionNoticeV1> {
-	const signable = { topicId: bytesToB64url(TOPIC), fromTier: 1, toTier: 2, effectiveAt, cohortEpoch: bytesToB64url(EPOCH) };
+	const signable = { topicId: bytesToB64url(TOPIC), fromTier: 1, toTier: 2, effectiveAt, cohortEpoch: bytesToB64url(EPOCH), cohortCoord: bytesToB64url(COORD) };
 	const sig = await signPeer(members[0]!.key, promotionNoticeSigningPayload(signable));
 	return { v: 1, ...signable, thresholdSig: bytesToB64url(sig), signers: [bytesToB64url(members[0]!.bytes)] };
 }
@@ -396,19 +445,54 @@ describe('cohort-topic: inbound promote-handler anti-abuse gate', () => {
 		expect(calls(), 'an undecodable frame never reaches the verifier').to.equal(0);
 	});
 
-	it('a notice with no serving engine is dropped before the verifier', async () => {
+	it('a notice whose coord this node does not serve is dropped before the verifier (coord miss)', async () => {
 		const members = await makeMembers(4);
 		const byId = new Map(members.map((m) => [m.idStr, m]));
 		const encoded = await encodedCertOver(members, byId, minSigs);
 		const { source } = countingSource(encoded);
 		const { verifier, calls } = countingVerifier(verifierFromSource(source, minSigs));
 		const gate = createPromoteGate({ ratePerWindow: 10_000 });
-		const notice = await realPromotionNotice(members, byId, minSigs, 1_000);
+		// The node serves only OTHER_COORD; the notice is decided at COORD → findByCoord miss → dropped.
+		const { target: otherTarget } = remoteTargetAt(OTHER_COORD, minSigs);
+		const notice = await realPromotionNotice(members, byId, minSigs, 1_000, COORD);
 		const result = await handleInboundNotice(
-			encodeCohortMessage(notice), peerIdToBytes('honest'), servingRegistry(undefined), verifier, gate, 2_000,
+			encodeCohortMessage(notice), peerIdToBytes('honest'), coordRegistry(otherTarget), verifier, gate, 2_000,
 		);
-		expect(result, 'no engine serves (topic, tier) → dropped').to.equal('dropped');
+		expect(result, 'no engine at the notice’s coord → dropped').to.equal('dropped');
 		expect(calls(), 'a dropped notice never reaches the verifier').to.equal(0);
+	});
+
+	it('routes a notice to the engine for its carried coord, leaving a sibling cohort at a different coord unchanged', async () => {
+		// Two cohorts this one node serves for the SAME (topic, tier) under distinct coords — the multi-cohort
+		// case the coord routing exists for. Routing is what is under test, so a trust-all verifier isolates it.
+		const a = remoteTargetAt(COORD, minSigs);
+		const b = remoteTargetAt(OTHER_COORD, minSigs);
+		const registry = coordRegistry(a.target, b.target);
+		const gate = createPromoteGate({ ratePerWindow: 10_000 });
+		const from = peerIdToBytes('honest');
+
+		const noticeA = promotionNoticeAtCoord(COORD, 1_000);
+		expect(await handleInboundNotice(encodeCohortMessage(noticeA), from, registry, trustAllVerifier, gate, 2_000)).to.equal('applied');
+		expect(a.life.isPromoted(TOPIC), 'target A (the notice’s coord) adopted it').to.be.true;
+		expect(b.life.isPromoted(TOPIC), 'sibling target B at a different coord is untouched').to.be.false;
+	});
+
+	it('a notice for cohort A does not advance or stale-drop cohort B (per-coord high-water)', async () => {
+		// Pre-fix, both cohorts shared a `${topicId}|${tier}` high-water, so A applying at effectiveAt = t would
+		// stale-drop a legitimate B notice at the same t. Per-coord keying keeps their waters independent.
+		const a = remoteTargetAt(COORD, minSigs);
+		const b = remoteTargetAt(OTHER_COORD, minSigs);
+		const registry = coordRegistry(a.target, b.target);
+		const gate = createPromoteGate({ ratePerWindow: 10_000 });
+		const from = peerIdToBytes('honest');
+
+		// A applies at effectiveAt = 5_000 → advances ONLY A's water.
+		expect(await handleInboundNotice(encodeCohortMessage(promotionNoticeAtCoord(COORD, 5_000)), from, registry, trustAllVerifier, gate, 6_000)).to.equal('applied');
+		// B's own notice at the SAME effectiveAt must still apply — B's water was never touched by A.
+		expect(await handleInboundNotice(encodeCohortMessage(promotionNoticeAtCoord(OTHER_COORD, 5_000)), from, registry, trustAllVerifier, gate, 7_000)).to.equal('applied');
+		expect(b.life.isPromoted(TOPIC), 'B adopted its own notice despite an equal effectiveAt to A').to.be.true;
+		// Sanity: an A replay at 5_000 IS stale — A's own per-coord water sits at 5_000.
+		expect(await handleInboundNotice(encodeCohortMessage(promotionNoticeAtCoord(COORD, 5_000)), from, registry, trustAllVerifier, gate, 8_000)).to.equal('stale');
 	});
 });
 
@@ -422,6 +506,7 @@ function forgedNoticeForTopic(member: Member, topicId: Uint8Array, effectiveAt: 
 		topicId: bytesToB64url(topicId),
 		fromTier: 1,
 		toTier: 2,
+		cohortCoord: bytesToB64url(COORD),
 		effectiveAt,
 		thresholdSig: DUMMY_SIG,
 		signers: [bytesToB64url(member.bytes)],

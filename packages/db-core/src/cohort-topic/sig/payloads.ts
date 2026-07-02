@@ -8,6 +8,14 @@
  *
  * Determinism comes from encoding an explicitly-ordered JSON array (array order is stable, unlike
  * object key order) as UTF-8. The publisher signs this image; the verifier recomputes and checks it.
+ *
+ * The notice images carry `cohortCoord` (the served coord the deciding cohort sits at) so the coord the
+ * receiver routes by is bound into the signed bytes — rewriting it to hijack a sibling cohort breaks
+ * verification. It is inserted **just before the trailing `cohortEpoch`**, deliberately keeping `cohortEpoch`
+ * the LAST element: the `/sign` endorser (`handleSignRequest`) reads a notice's embedded epoch positionally
+ * as `image[image.length - 1]`, so `cohortEpoch` must stay last. This is a hard, coordinated change to the
+ * canonical signed bytes, acceptable pre-release (no deployed nodes speak this protocol, so there is no
+ * version to negotiate).
  */
 
 import type { DemotionNoticeV1, MembershipCertV1, PromotionNoticeV1 } from "../wire/types.js";
@@ -23,17 +31,17 @@ export function membershipCertSigningPayload(cert: MembershipCertSignable): Uint
 }
 
 /** Fields of a `PromotionNoticeV1` covered by its threshold signature. */
-export type PromotionSignable = Pick<PromotionNoticeV1, "topicId" | "fromTier" | "toTier" | "effectiveAt" | "cohortEpoch">;
+export type PromotionSignable = Pick<PromotionNoticeV1, "topicId" | "fromTier" | "toTier" | "effectiveAt" | "cohortEpoch" | "cohortCoord">;
 
-/** Canonical signed byte image of a promotion notice. */
+/** Canonical signed byte image of a promotion notice. `cohortEpoch` stays last (the `/sign` endorser reads it positionally). */
 export function promotionNoticeSigningPayload(n: PromotionSignable): Uint8Array {
-	return utf8.encode(JSON.stringify(["PromotionNoticeV1", n.topicId, n.fromTier, n.toTier, n.effectiveAt, n.cohortEpoch]));
+	return utf8.encode(JSON.stringify(["PromotionNoticeV1", n.topicId, n.fromTier, n.toTier, n.effectiveAt, n.cohortCoord, n.cohortEpoch]));
 }
 
 /** Fields of a `DemotionNoticeV1` covered by its threshold signature. */
-export type DemotionSignable = Pick<DemotionNoticeV1, "topicId" | "tier" | "parentCohortCoord" | "effectiveAt" | "cohortEpoch">;
+export type DemotionSignable = Pick<DemotionNoticeV1, "topicId" | "tier" | "parentCohortCoord" | "effectiveAt" | "cohortEpoch" | "cohortCoord">;
 
-/** Canonical signed byte image of a demotion notice. */
+/** Canonical signed byte image of a demotion notice. `cohortEpoch` stays last (the `/sign` endorser reads it positionally). */
 export function demotionNoticeSigningPayload(n: DemotionSignable): Uint8Array {
-	return utf8.encode(JSON.stringify(["DemotionNoticeV1", n.topicId, n.tier, n.parentCohortCoord, n.effectiveAt, n.cohortEpoch]));
+	return utf8.encode(JSON.stringify(["DemotionNoticeV1", n.topicId, n.tier, n.parentCohortCoord, n.effectiveAt, n.cohortCoord, n.cohortEpoch]));
 }

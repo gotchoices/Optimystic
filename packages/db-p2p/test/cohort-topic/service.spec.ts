@@ -88,6 +88,8 @@ function buildSingleMemberCohort(opts: { memberId: Uint8Array; capPromote: numbe
 		childCohortCount: (): number => 0,
 		treeTier: (): number => 0,
 		parentCoord: (topicId: Uint8Array): Uint8Array => hash.H(topicId),
+		// This mock's single-member cohort is served at `cohortEpoch` (the bus coord above).
+		cohortCoord: () => cohortEpoch,
 		cohortEpoch: () => cohortEpoch,
 		signer,
 		config: { capPromote: opts.capPromote, growthWindowMs: 0 },

@@ -630,18 +630,23 @@ A cohort may also pre-promote on observing rapid growth: if the slope of `direct
 > `sendOneWay`-broadcast over the `promote` protocol to the cohort around the served coord (and, for a
 > demotion, additionally the parent coord); inbound, the `promote` handler (`handleInboundNotice`) runs a
 > cheapest-first anti-abuse gate before any signature/network work — `decode → per-(peer, topic) rate
-> limit → findServing → effectiveAt high-water → verify+apply` — so a peer streaming junk over the
+> limit → resolve engine by carried cohortCoord → high-water → verify+apply` — so a peer streaming junk over the
 > protocol cannot amplify into per-message signature verification or membership dials. The rate limiter
 > is the same `register_rate_per_peer` sliding-window limiter (its own node-level instance, since the
-> handler is node-level); the per-`(topic, tier)` `effectiveAt` high-water drops a replay/out-of-order
+> handler is node-level); the per-served-coord `effectiveAt` high-water drops a replay/out-of-order
 > notice before `verifyMessage` and is advanced **only** on a verified-and-applied notice (so a forged
 > frame cannot poison it); and the verify itself passes a `PROMOTE_REFETCH_MIN_INTERVAL_MS` (60 s)
 > bound that rate-limits the stale-cert refetch to one `source.fetch()` per coord per interval (eventual
-> refetch preserved — a cold cache / membership rotation still re-fetches once it elapses). It then
-> resolves the local coord engine serving the notice's `(topic, tier)`, verifies the threshold signature
-> against that cohort's `MembershipCertV1` via the participant `MembershipVerifier` (signers ⊆ cert,
-> `≥ minSigs`, multisig valid), and applies it — undecodable / rate-limited / stale / untrusted /
-> undeliverable notices are dropped (never throws on the stream). Specs: `promotion.spec.ts`
+> refetch preserved — a cold cache / membership rotation still re-fetches once it elapses). It resolves the
+> target cohort by the notice's **signed `cohortCoord`** (the exact served coord the decision was made for)
+> rather than by a first-match `(topic, tier)` scan: a node serving several sibling cohorts for one
+> `(topic, tier)` — possible at `d ≥ 1` — thus routes the notice to the cohort that produced it, and keys
+> the high-water by that coord so one cohort's notice can neither mis-apply to nor stale-drop a sibling's.
+> It then verifies the threshold signature against that cohort's `MembershipCertV1` via the participant
+> `MembershipVerifier` (signers ⊆ cert, `≥ minSigs`, multisig valid — `cohortCoord` is covered by the
+> signature, so rewriting it to hijack a sibling breaks verification), and applies it — a notice for a coord
+> this node does not serve, or undecodable / rate-limited / stale / untrusted ones, are dropped (never throws
+> on the stream). Specs: `promotion.spec.ts`
 > (remote-apply ordering/idempotency), db-p2p `promote-notice.spec.ts` (verify + apply, forged/short-quorum
 > + non-member rejection, no-engine drop, broadcast fan-out, anti-abuse gate: flood-bounded refetch /
 > rate-limit drop / high-water replay drop), db-core `membership.spec.ts` (bounded-refetch rate limit).
@@ -1338,8 +1343,9 @@ interface PromotionNoticeV1 {
   topicId:         string
   fromTier:        number
   toTier:          number             // typically fromTier + 1
+  cohortCoord:     string             // 32 bytes — the served coord the deciding cohort sits at (routing + verify key)
   effectiveAt:     number             // unix ms
-  thresholdSig:    string             // cohort threshold sig
+  thresholdSig:    string             // cohort threshold sig (covers cohortCoord)
   signers:         string[]           // PeerIds, ≥ minSigs
   cohortEpoch:     string
 }
@@ -1352,9 +1358,10 @@ interface DemotionNoticeV1 {
   v:               1
   topicId:         string
   tier:            number
-  parentCohortCoord: string
+  parentCohortCoord: string           // 32 bytes — the tier-(d−1) parent this demotion hands off to
+  cohortCoord:     string             // 32 bytes — the served coord of the DEMOTING cohort (routing + verify key)
   effectiveAt:     number
-  thresholdSig:    string
+  thresholdSig:    string             // covers cohortCoord
   signers:         string[]
   cohortEpoch:     string
 }

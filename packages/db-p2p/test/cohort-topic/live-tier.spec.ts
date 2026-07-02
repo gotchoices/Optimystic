@@ -372,7 +372,7 @@ describe('cohort-topic: live-tier end-to-end milestone', () => {
 
 			// A forged T2 promotion notice the adversary cohort genuinely threshold-signed (self-consistent against
 			// the forged cert): it would verify-and-apply were the cert believed.
-			const noticeSignable = { topicId: bytesToB64url(TOPIC), fromTier: FRET_TIER, toTier: FRET_TIER + 1, effectiveAt: now, cohortEpoch: bytesToB64url(epoch) };
+			const noticeSignable = { topicId: bytesToB64url(TOPIC), fromTier: FRET_TIER, toTier: FRET_TIER + 1, effectiveAt: now, cohortEpoch: bytesToB64url(epoch), cohortCoord: bytesToB64url(coord) };
 			const noticeMulti = await collectedMultisig(quorum, promotionNoticeSigningPayload(noticeSignable));
 			const notice: PromotionNoticeV1 = { v: 1, ...noticeSignable, thresholdSig: bytesToB64url(noticeMulti.sig), signers: noticeMulti.signers.map(bytesToB64url) };
 

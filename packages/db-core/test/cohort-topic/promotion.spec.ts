@@ -13,6 +13,7 @@ import {
 import type { CohortSigner } from '../../src/cohort-topic/sig/threshold.js';
 import type { DemotionNoticeV1, PromotionNoticeV1 } from '../../src/cohort-topic/wire/types.js';
 import { bytesToB64url } from '../../src/cohort-topic/wire/codec.js';
+import { promotionNoticeSigningPayload, demotionNoticeSigningPayload } from '../../src/cohort-topic/sig/payloads.js';
 
 function bytes(label: string, len = 32): Uint8Array {
 	return sha256(new TextEncoder().encode(label)).slice(0, len);
@@ -21,6 +22,8 @@ function bytes(label: string, len = 32): Uint8Array {
 const TOPIC = bytes('promo-topic');
 const EPOCH = bytes('promo-epoch');
 const PARENT = bytes('parent-coord');
+/** The served coord this cohort sits at — stamped on every notice as `cohortCoord`. */
+const COORD = bytes('cohort-coord');
 const SIGNERS = Array.from({ length: 14 }, (_, i) => bytes(`signer-${i}`, 16));
 
 /** Deterministic threshold signer stub: sig = sha256(payload); 14 fixed signers. */
@@ -44,6 +47,7 @@ function lifecycleWith(knobs: Knobs, config?: PromotionDeps['config']) {
 		childCohortCount: () => knobs.children,
 		treeTier: () => knobs.treeTier,
 		parentCoord: () => PARENT,
+		cohortCoord: () => COORD,
 		cohortEpoch: () => EPOCH,
 		signer,
 		config,
@@ -88,6 +92,11 @@ describe('cohort-topic / promotion lifecycle', () => {
 		expect(notice!.topicId).to.equal(bytesToB64url(TOPIC));
 		expect(notice!.cohortEpoch).to.equal(bytesToB64url(EPOCH));
 		expect(notice!.signers).to.have.length(14);
+		// The notice carries the served coord, and it is covered by the signed image (so a receiver can both
+		// route + verify by it, and rewriting it breaks the signature).
+		expect(notice!.cohortCoord, 'promotion notice carries the served coord').to.equal(bytesToB64url(COORD));
+		const promoImage = new TextDecoder().decode(promotionNoticeSigningPayload(notice!));
+		expect(promoImage, 'cohortCoord is inside the promotion signing image').to.contain(bytesToB64url(COORD));
 	});
 
 	it('does not promote below the cap when load is cold', async () => {
@@ -163,6 +172,10 @@ describe('cohort-topic / promotion lifecycle', () => {
 		expect(notice!.tier).to.equal(1);
 		expect(notice!.parentCohortCoord).to.equal(bytesToB64url(PARENT));
 		expect(notice!.signers).to.have.length(14);
+		// The demotion carries + covers the demoting cohort's served coord (distinct from parentCohortCoord).
+		expect(notice!.cohortCoord, 'demotion notice carries the served coord').to.equal(bytesToB64url(COORD));
+		const demoImage = new TextDecoder().decode(demotionNoticeSigningPayload(notice!));
+		expect(demoImage, 'cohortCoord is inside the demotion signing image').to.contain(bytesToB64url(COORD));
 		expect(life.isPromoted(TOPIC), 'demotion releases promoted state').to.be.false;
 	});
 
@@ -177,11 +190,11 @@ describe('cohort-topic / promotion lifecycle', () => {
 
 describe('cohort-topic / promotion remote-apply path', () => {
 	const promoNotice = (effectiveAt: number): PromotionNoticeV1 => ({
-		v: 1, topicId: bytesToB64url(TOPIC), fromTier: 1, toTier: 2, effectiveAt,
+		v: 1, topicId: bytesToB64url(TOPIC), fromTier: 1, toTier: 2, cohortCoord: bytesToB64url(COORD), effectiveAt,
 		thresholdSig: '', signers: [], cohortEpoch: bytesToB64url(EPOCH),
 	});
 	const demoNotice = (effectiveAt: number): DemotionNoticeV1 => ({
-		v: 1, topicId: bytesToB64url(TOPIC), tier: 1, parentCohortCoord: bytesToB64url(PARENT), effectiveAt,
+		v: 1, topicId: bytesToB64url(TOPIC), tier: 1, parentCohortCoord: bytesToB64url(PARENT), cohortCoord: bytesToB64url(COORD), effectiveAt,
 		thresholdSig: '', signers: [], cohortEpoch: bytesToB64url(EPOCH),
 	});
 	const fresh = (): ReturnType<typeof lifecycleWith> => lifecycleWith({ count: 0, loadBucket: 0, children: 0, treeTier: 1 });
