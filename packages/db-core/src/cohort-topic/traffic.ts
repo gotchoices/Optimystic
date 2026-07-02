@@ -136,6 +136,10 @@ class WindowedTrafficCounters implements TrafficCounters {
 				childCohortCount = summary.childCohortCount;
 			}
 		}
+		// NOTE: `childCohortCount` (the max of siblings' gossiped counts above) is dormant whenever the
+		// registry override is wired — the override returns a number (0 included), so `?? childCohortCount`
+		// never falls through. It becomes the effective value only if the override is unwired; the child-set
+		// replication follow-on converges siblings by populating each engine's registry, not via this max.
 		const childOverride = this.deps.childCohortCount?.(topicId);
 		return {
 			windowSeconds: this.windowMs / 1000,

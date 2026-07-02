@@ -387,8 +387,11 @@ A participant that receives `NoState` at tier `d` gets no traffic signal from th
 > **recording engine's real child count** (the per-engine child registry populated by `dispatchChildLink`),
 > supplied as the promotion-layer override; it is exact on the parent member the child-link routed to and
 > `0` on siblings until the replication follow-on (`cohort-topic-child-link-replicate-unlink`) converges it
-> cohort-wide. (The snapshot still takes the max of siblings' gossiped counts as a floor, but the override
-> is authoritative on the recording member.)
+> cohort-wide. (The override is *always* authoritative when wired — it returns a number, `0` included, so
+> the nullish-coalescing `childOverride ?? maxOfSiblings` never falls through to the gossiped max. That
+> max-of-siblings computation is therefore dormant while the registry override is wired, and becomes the
+> effective value only if the override is ever unwired; the replication follow-on converges siblings by
+> populating each engine's registry, not by relying on that max.)
 
 ---
 
