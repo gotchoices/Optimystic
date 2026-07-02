@@ -175,4 +175,26 @@ describe('FileRawStorage legacy raw-colon read fallback (POSIX-only)', function 
 
 		expect(await storage.getTransaction(BLOCK_ID, TX_ACTION_ID)).to.deep.equal(encoded);
 	});
+
+	it('deletePendingTransaction removes legacy raw-colon pend file', async () => {
+		const transform = makeTransform('delete-pend-legacy');
+		await writeRawColonFile('pend', TX_ACTION_ID, transform);
+
+		// No encoded file exists; the encoded unlink silently gets ENOENT, then
+		// unlinkRawColon removes the raw-colon file.
+		await storage.deletePendingTransaction(BLOCK_ID, TX_ACTION_ID);
+
+		expect(await storage.getPendingTransaction(BLOCK_ID, TX_ACTION_ID)).to.equal(undefined);
+	});
+
+	it('saveMaterializedBlock tombstone removes legacy raw-colon blocks file', async () => {
+		const block: IBlock = { header: { id: 'tombstone-mat' as BlockId, type: 'TST', collectionId: BLOCK_ID } };
+		await writeRawColonFile('blocks', STAMP_ACTION_ID, block);
+
+		// Tombstone call (undefined block): encoded unlink gets ENOENT, then
+		// unlinkRawColon removes the raw-colon file.
+		await storage.saveMaterializedBlock(BLOCK_ID, STAMP_ACTION_ID, undefined);
+
+		expect(await storage.getMaterializedBlock(BLOCK_ID, STAMP_ACTION_ID)).to.equal(undefined);
+	});
 });

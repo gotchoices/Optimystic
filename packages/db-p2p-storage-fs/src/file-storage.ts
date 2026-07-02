@@ -63,6 +63,7 @@ export class FileRawStorage implements IRawStorage {
 			.catch((err) => {
 				if ((err as NodeJS.ErrnoException)?.code !== 'ENOENT') log('deletePendingTransaction unlink failed for %s/%s - %o', blockId, actionId, err);
 			});
+		await this.unlinkRawColon(pendingPath, this.getPendingActionPath(blockId, actionId, false));
 	}
 
 	async *listPendingTransactions(blockId: BlockId): AsyncIterable<ActionId> {
@@ -121,6 +122,7 @@ export class FileRawStorage implements IRawStorage {
 				.catch((err) => {
 					if ((err as NodeJS.ErrnoException)?.code !== 'ENOENT') log('saveMaterializedBlock unlink failed for %s/%s - %o', blockId, actionId, err);
 				});
+			await this.unlinkRawColon(this.getMaterializedPath(blockId, actionId), this.getMaterializedPath(blockId, actionId, false));
 		}
 	}
 
@@ -200,6 +202,17 @@ export class FileRawStorage implements IRawStorage {
 	private getMaterializedPath(blockId: BlockId, actionId: ActionId, encoded = true): string {
 		const filename = encoded ? encodeActionIdForFilename(actionId) : actionId;
 		return path.join(this.getBlockPath(blockId), 'blocks', `${filename}.json`);
+	}
+
+	// Best-effort removal of a pre-encode raw-colon file after the encoded delete,
+	// so a deleted item cannot resurface via the read fallback in readActionScopedFile.
+	// Skipped on win32 (raw-colon files cannot exist there) and when paths are identical
+	// (action id contains no colon — only one syscall needed). ENOENT is silently ignored.
+	private async unlinkRawColon(encodedPath: string, rawPath: string): Promise<void> {
+		if (process.platform === 'win32' || rawPath === encodedPath) return;
+		await fs.unlink(rawPath).catch((err) => {
+			if ((err as NodeJS.ErrnoException)?.code !== 'ENOENT') log('unlinkRawColon failed for %s - %o', rawPath, err);
+		});
 	}
 
 	// Reads an action-id-keyed file by its canonical (percent-encoded) path,
