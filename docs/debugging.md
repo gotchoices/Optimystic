@@ -5,10 +5,11 @@ Logging is controlled via the `DEBUG` environment variable.
 
 ## Namespaces
 
-| Package    | Base namespace        |
-|------------|-----------------------|
-| `db-core`  | `optimystic:db-core`  |
-| `db-p2p`   | `optimystic:db-p2p`   |
+| Package                      | Base namespace                 |
+|------------------------------|--------------------------------|
+| `db-core`                    | `optimystic:db-core`           |
+| `db-p2p`                     | `optimystic:db-p2p`            |
+| `quereus-plugin-optimystic`  | `optimystic:quereus-plugin`    |
 
 ### db-core sub-namespaces
 
@@ -32,6 +33,7 @@ its own sub-namespace so a single concern can be traced in isolation:
 | `cohort-topic:handoff`            | Membership rotation primary handoff: inventory → pull → dual-serve → ack |
 | `cohort-topic:antiflood`          | Re-registration jitter: wave staggering and the `cap_promote / T_rejoin_jitter` bound |
 | `cohort-topic:antidos`            | Rate-limit / topic-budget / replay-guard / bootstrap-evidence rejections |
+| `cohort-topic:coldstart`          | Cold-start admission gate: parent-registration forwarder failures     |
 
 ### db-p2p sub-namespaces
 
@@ -46,6 +48,14 @@ its own sub-namespace so a single concern can be traced in isolation:
 | `coordinator-repo`         | CoordinatorRepo operations                             |
 | `storage:restoration`      | Block restoration coordination                         |
 | `libp2p-key-network`       | Key network operations                                 |
+
+### quereus-plugin sub-namespaces
+
+| Sub-namespace         | What it covers                                                       |
+|-----------------------|---------------------------------------------------------------------|
+| `plugin`              | Plugin registration (config dump when `debug` option set)           |
+| `module`              | Virtual table change-subscription lifecycle: subscribe/notify/teardown |
+| `collection-factory`  | Collection watch no-op notices and libp2p node shutdown             |
 
 ## Common DEBUG patterns
 
@@ -99,6 +109,11 @@ log('operation key=%s count=%d', key, count);
 
 // In db-p2p
 import { createLogger } from '../logger.js';
+const log = createLogger('my-module');
+log('operation key=%s count=%d', key, count);
+
+// In quereus-plugin-optimystic
+import { createLogger } from './logger.js';
 const log = createLogger('my-module');
 log('operation key=%s count=%d', key, count);
 ```

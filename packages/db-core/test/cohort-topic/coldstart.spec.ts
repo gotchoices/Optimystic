@@ -1,4 +1,5 @@
 import { expect } from 'chai';
+import debug from 'debug';
 import { sha256 } from '@noble/hashes/sha2.js';
 import {
 	shouldInstantiate,
@@ -94,9 +95,15 @@ describe('cohort-topic / cold-start manager parent registration', () => {
 		// Gap-flagged behavior: a failed parent registration is logged, not swallowed silently, and the
 		// forwarder is left accepting participants but holding parent-involving ops so a host-driven
 		// retry can complete the link-up. It must NOT spuriously flip to serving.
-		const warnings: unknown[][] = [];
-		const realWarn = console.warn;
-		console.warn = (...args: unknown[]): void => { warnings.push(args); };
+		//
+		// The failure is surfaced through the package `debug` logger (silent unless the namespace is
+		// enabled), not console.warn — so enable the coldstart namespace and capture debug's output
+		// sink to prove the message is emitted rather than swallowed.
+		const logs: unknown[][] = [];
+		const prevNamespaces = debug.disable();
+		const realLog = debug.log;
+		debug.enable('optimystic:db-core:cohort-topic:coldstart');
+		debug.log = (...args: unknown[]): void => { logs.push(args); };
 		try {
 			const registrar: ParentRegistrar = {
 				registerWithParent: async () => { throw new Error('parent unreachable'); },
@@ -107,9 +114,11 @@ describe('cohort-topic / cold-start manager parent registration', () => {
 			expect(fwd.acceptsParticipants(), 'still accepts participants after a failed link-up').to.be.true;
 			expect(fwd.servesParentOps(), 'does NOT serve parent-ops on a failed registration').to.be.false;
 			expect(fwd.phase()).to.equal('awaiting_parent');
-			expect(warnings.length, 'the failure is surfaced via console.warn, not swallowed').to.equal(1);
+			expect(logs.length, 'the failure is surfaced via the debug logger, not swallowed').to.equal(1);
 		} finally {
-			console.warn = realWarn;
+			debug.log = realLog;
+			debug.disable();
+			if (prevNamespaces) debug.enable(prevNamespaces);
 		}
 	});
 
