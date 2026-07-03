@@ -300,6 +300,11 @@ class WalkRegisterService implements CohortTopicService {
 			correlationId: reply.cohortEpoch ?? bytesToB64url(this.participantId),
 			initialCohortEpoch: hint.cohortEpoch,
 		});
+		// NOTE: a second register() for the same (topicId, participantId) overwrites the map entry here,
+		// orphaning the prior renewal. renew()/withdraw() on the stale handle now no-op (identity guard),
+		// but no tombstone is sent for the superseded record — the cohort frees it via TTL expiry. Harmless
+		// for occasional re-registers; if callers ever churn-register the same pair, send a withdraw for the
+		// displaced renewal here so the cohort reclaims immediately instead of holding up to a full TTL.
 		this.renewals.set(recordKey(req.topicId, this.participantId), renewal);
 		return renewal;
 	}

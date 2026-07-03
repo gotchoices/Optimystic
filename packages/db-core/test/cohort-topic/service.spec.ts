@@ -92,4 +92,52 @@ describe('CohortTopicService / stale handle isolation', () => {
 		await service.renew(handleB);
 		expect(dialCallCount, 'live renew must call dialMember').to.equal(1);
 	});
+
+	it('a second withdraw of the same live handle is idempotent (no second tombstone)', async () => {
+		let dialCallCount = 0;
+		const router: ITopicRouter = {
+			routeAndAct: async (_key: RingCoord, _activity: Uint8Array, _opts: { wantK: number; minSigs: number }) =>
+				encodeCohortMessage(acceptedReply),
+			dialMember: async (_peer: PeerRef, _activity: Uint8Array) => {
+				dialCallCount++;
+				return encodeCohortMessage({ v: 1, result: 'ok' } as RenewReplyV1);
+			},
+		};
+
+		const service = makeService(router);
+		const handle = await service.register({ topicId: TOPIC, tier: 1 });
+
+		await service.withdraw(handle);
+		expect(dialCallCount, 'first withdraw sends one tombstone').to.equal(1);
+
+		// After the map entry is gone, `renewals.get(key)` is undefined ≠ handle.renewal → no-op.
+		await service.withdraw(handle);
+		expect(dialCallCount, 'second withdraw must not send another tombstone').to.equal(1);
+	});
+
+	it('renew after withdraw is a no-op (the handle left the live set)', async () => {
+		let renewCount = 0;
+		let withdrawCount = 0;
+		const router: ITopicRouter = {
+			routeAndAct: async (_key: RingCoord, _activity: Uint8Array, _opts: { wantK: number; minSigs: number }) =>
+				encodeCohortMessage(acceptedReply),
+			dialMember: async (_peer: PeerRef, activity: Uint8Array) => {
+				// The withdraw tombstone and a renew both go through dialMember; the count that matters is
+				// that no renew ping fires after withdraw. Decode is unnecessary — just tally the total.
+				void activity;
+				withdrawCount++;
+				return encodeCohortMessage({ v: 1, result: 'ok' } as RenewReplyV1);
+			},
+		};
+
+		const service = makeService(router);
+		const handle = await service.register({ topicId: TOPIC, tier: 1 });
+
+		await service.withdraw(handle);
+		const afterWithdraw = withdrawCount;
+
+		await service.renew(handle);
+		renewCount = withdrawCount - afterWithdraw;
+		expect(renewCount, 'renew after withdraw must not ping').to.equal(0);
+	});
 });
