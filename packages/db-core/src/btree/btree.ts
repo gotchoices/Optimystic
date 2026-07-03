@@ -193,7 +193,7 @@ export class BTree<TKey, TEntry> {
 	 * If getUpdated callback returns a row that is already present, the resulting path will not be on. */
 	async merge(newEntry: TEntry, getUpdated: (existing: TEntry) => TEntry): Promise<[path: Path<TKey, TEntry>, wasUpdate: boolean]> {
 		return this.atomic(async (scope) => {
-			const newKey = await this.keyFromEntry(newEntry);
+			const newKey = this.keyFromEntry(newEntry);
 			const path = await this.find(newKey);
 			if (path.on) {
 				// Thread this scope into updateAt so the nested call joins this atomic batch
@@ -525,7 +525,7 @@ export class BTree<TKey, TEntry> {
 		}
 		if (split) {
 			const newBranch = newBranchNode(this.store, [split.key], [await this.trunk.getId(), split.right.header.id]);
-			await this.store.insert(newBranch);
+			this.store.insert(newBranch);
 			await this.trunk.set(newBranch);
 			path.branches.unshift(new PathBranch(newBranch, split.indexDelta));
 		}
@@ -667,7 +667,7 @@ export class BTree<TKey, TEntry> {
 		const pIndex = parent.index;
 		const pNode = parent.node;
 
-		const rightSibId = pNode.nodes[pIndex + 1]!;
+		const rightSibId = pNode.nodes[pIndex + 1];
 		const rightSib = rightSibId ? (await get(this.store, rightSibId)) as LeafNode<TEntry> : undefined;
 		if (rightSib && rightSib.entries.length > (this.nodeCapacity >>> 1)) {   // Attempt to borrow from right sibling
 			const entry = rightSib.entries[0]!;
@@ -677,7 +677,7 @@ export class BTree<TKey, TEntry> {
 			return undefined;
 		}
 
-		const leftSibId = pNode.nodes[pIndex - 1]!;
+		const leftSibId = pNode.nodes[pIndex - 1];
 		const leftSib = leftSibId ? (await get(this.store, leftSibId)) as LeafNode<TEntry> : undefined;
 		if (leftSib && leftSib.entries.length > (this.nodeCapacity >>> 1)) {   // Attempt to borrow from left sibling
 			const entry = leftSib.entries[leftSib.entries.length - 1]!;
@@ -728,7 +728,7 @@ export class BTree<TKey, TEntry> {
 		const pIndex = parent.index;
 		const pNode = parent.node;
 
-		const rightSibId = pNode.nodes[pIndex + 1]!;
+		const rightSibId = pNode.nodes[pIndex + 1];
 		const rightSib = rightSibId ? (await get(this.store, rightSibId)) as BranchNode<TKey> : undefined;
 		if (rightSib && rightSib.nodes.length > (this.nodeCapacity >>> 1)) {   // Attempt to borrow from right sibling
 			const node = rightSib.nodes[0]!;

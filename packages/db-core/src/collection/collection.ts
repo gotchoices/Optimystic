@@ -375,7 +375,7 @@ export class Collection<TAction> implements ICollection<TAction> {
 		}
 		for await (const entry of log.select(undefined, forward)) {
 			if (entry.action) {
-				yield* forward ? entry.action.actions : entry.action.actions.reverse();
+				yield* forward ? entry.action.actions : [...entry.action.actions].reverse();
 			}
 		}
 	}

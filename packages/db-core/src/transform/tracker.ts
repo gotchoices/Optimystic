@@ -76,7 +76,7 @@ export class Tracker<T extends IBlock> implements IBlockStore<T> {
 	}
 
 	transformedBlockIds(): BlockId[] {
-		return Array.from(new Set(blockIdsForTransforms(this.transforms)));
+		return blockIdsForTransforms(this.transforms);
 	}
 
 	conflicts(blockIds: Set<BlockId>) {

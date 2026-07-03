@@ -171,8 +171,9 @@ export class Log<TAction> {
 
 	/** Gets the actions from startRev (exclusive), to latest in the log. */
 	async getFrom(startRev: number | undefined): Promise<GetFromResult<TAction>> {
-		const entries: ActionEntry<TAction>[] = [];
-		const pendings: ActionRev[] = [];
+		const entriesFromTail: ActionEntry<TAction>[] = [];
+		const pendingActions: ActionRev[] = [];
+		let checkpointPendings: ActionRev[] = [];
 		let rev: number | undefined;
 		let checkpointPath: ChainPath<LogEntry<TAction>> | undefined;
 		// Step through collecting both pending and entries until a checkpoint is found
@@ -181,7 +182,7 @@ export class Log<TAction> {
 			rev = rev ?? entry.rev;
 			if (entry.checkpoint) {
 				checkpointPath = path;
-				pendings.unshift(...entry.checkpoint.pendings);
+				checkpointPendings = entry.checkpoint.pendings;
 				break;
 			}
 			// Invalidation entries take a rev slot but are not pending actions — skip them in
@@ -189,24 +190,27 @@ export class Log<TAction> {
 			if (!entry.action) {
 				continue;
 			}
-			pendings.unshift({ actionId: entry.action.actionId, rev: entry.rev });
+			pendingActions.push({ actionId: entry.action.actionId, rev: entry.rev });
 			if (startRev !== undefined && entry.rev > startRev) {
-				entries.unshift(entry.action);
+				entriesFromTail.push(entry.action);
 			}	// Can't stop at rev, because we need to collect all pending actions for the context
 		}
 		// Continue stepping past the checkpoint until the given rev is reached
+		const entriesFromCheckpoint: ActionEntry<TAction>[] = [];
 		if (checkpointPath) {
 			for await (const path of this.chain.select(checkpointPath, false)) {
 				const entry = entryAt<LogEntry<TAction>>(path)!;
 				if (startRev !== undefined && entry.rev > startRev) {
 					if (entry.action) {
-						entries.unshift(entry.action!);
+						entriesFromCheckpoint.push(entry.action);
 					}
 				} else {
 					break;
 				}
 			}
 		}
+		const pendings = [...checkpointPendings, ...pendingActions.reverse()];
+		const entries = [...entriesFromCheckpoint.reverse(), ...entriesFromTail.reverse()];
 		return { context: rev ? { committed: pendings, rev } : undefined, entries };
 	}
 
