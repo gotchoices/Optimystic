@@ -4,7 +4,7 @@ import { apply, get } from "../blocks/index.js";
 import { TreeLeafBlockType, TreeBranchBlockType, entries$, nodes$, partitions$ } from "./nodes.js";
 import type { BranchNode, ITreeNode, LeafNode } from "./nodes.js";
 import type { TreeBlock } from "./tree-block.js";
-import { AtomicProxy } from "../transform/atomic-proxy.js";
+import { AtomicProxy, type AtomicScope } from "../transform/atomic-proxy.js";
 
 export const NodeCapacity = 64;
 
@@ -31,8 +31,8 @@ export class BTree<TKey, TEntry> {
 	) {
 	}
 
-	private atomic<T>(fn: () => Promise<T>): Promise<T> {
-		return this._proxy ? this._proxy.atomic(fn) : fn();
+	private atomic<T>(fn: (scope?: AtomicScope) => Promise<T>, parent?: AtomicScope): Promise<T> {
+		return this._proxy ? this._proxy.atomic(fn, parent) : fn(parent);
 	}
 
 	static createRoot(
@@ -155,7 +155,7 @@ export class BTree<TKey, TEntry> {
 	 * 	* on = false if update/insert failed.
 	 * 		* wasUpdate = true, given path is not on an entry
 	 * 		* else newEntry's new key already present; returned path is "near" existing entry */
-	async updateAt(path: Path<TKey, TEntry>, newEntry: TEntry): Promise<[path: Path<TKey, TEntry>, wasUpdate: boolean]> {
+	async updateAt(path: Path<TKey, TEntry>, newEntry: TEntry, parent?: AtomicScope): Promise<[path: Path<TKey, TEntry>, wasUpdate: boolean]> {
 		return this.atomic(async () => {
 			this.validatePath(path);
 			if (path.on) {
@@ -166,7 +166,7 @@ export class BTree<TKey, TEntry> {
 				result[0].version = ++this._version;
 			}
 			return result;
-		});
+		}, parent);
 	}
 
 	/** Inserts the entry if it doesn't exist, or updates it if it does.
@@ -192,11 +192,13 @@ export class BTree<TKey, TEntry> {
 	 * @returns path to new entry and whether an update or insert attempted.
 	 * If getUpdated callback returns a row that is already present, the resulting path will not be on. */
 	async merge(newEntry: TEntry, getUpdated: (existing: TEntry) => TEntry): Promise<[path: Path<TKey, TEntry>, wasUpdate: boolean]> {
-		return this.atomic(async () => {
+		return this.atomic(async (scope) => {
 			const newKey = await this.keyFromEntry(newEntry);
 			const path = await this.find(newKey);
 			if (path.on) {
-				const result = await this.updateAt(path, getUpdated(this.getEntry(path)));	// Don't use internalUpdate - need to freeze and check for mutation
+				// Thread this scope into updateAt so the nested call joins this atomic batch
+				// (reuses the tracker) rather than opening/committing a second scope.
+				const result = await this.updateAt(path, getUpdated(this.getEntry(path)), scope);	// Don't use internalUpdate - need to freeze and check for mutation
 				// Note: updateAt already increments version, so don't double-increment here
 				return result;
 			} else {
@@ -755,13 +757,14 @@ export class BTree<TKey, TEntry> {
 		}
 
 		if (leftSib && leftSib.nodes.length + branch.nodes.length <= this.nodeCapacity) {   // Attempt to merge self into left sibling
+			const leftLen = leftSib.nodes.length;	// capture BEFORE the appends below shift it (see leaf path at rebalanceLeaf)
 			const pKey = pNode.partitions[pIndex - 1]!;
 			this.deletePartition(pNode, pIndex - 1);
 			apply(this.store, leftSib, [partitions$, leftSib.partitions.length, 0, [pKey]]);
 			apply(this.store, leftSib, [partitions$, leftSib.partitions.length, 0, branch.partitions]);
 			apply(this.store, leftSib, [nodes$, leftSib.nodes.length, 0, branch.nodes]);
 			pathBranch.node = leftSib;
-			pathBranch.index += leftSib.nodes.length;
+			pathBranch.index += leftLen;	// branch's children now sit after leftSib's original children
 			this.store.delete(branch.header.id);
 			return this.rebalanceBranch(path, depth - 1);
 		}

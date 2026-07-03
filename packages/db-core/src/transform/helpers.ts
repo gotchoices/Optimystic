@@ -72,10 +72,16 @@ export function copyTransforms(transform: Transforms): Transforms {
 }
 
 export function mergeTransforms(a: Transforms, b: Transforms): Transforms {
+	// updates: for a block id present in both sides, concatenate a's ops then b's ops
+	// (order-preserving) rather than letting b's array replace a's. inserts stay last-wins.
+	const updates: { [blockId: BlockId]: BlockOperation[] } = { ...a.updates };
+	for (const [id, ops] of Object.entries(b.updates ?? {})) {
+		updates[id] = updates[id] ? [...updates[id], ...ops] : ops;
+	}
 	return {
 		inserts: { ...a.inserts, ...b.inserts },
-		updates: { ...a.updates, ...b.updates },
-		deletes: [...(a.deletes ?? []), ...(b.deletes ?? [])]
+		updates,
+		deletes: [...new Set([...(a.deletes ?? []), ...(b.deletes ?? [])])]
 	};
 }
 

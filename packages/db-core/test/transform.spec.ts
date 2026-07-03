@@ -191,7 +191,7 @@ describe('Transform functionality', () => {
   describe('Block ID Collision and Overlap Tests (TEST-1.1.1)', () => {
     const sharedId = 'shared-block' as BlockId
 
-    it('should silently drop updates from first transform when mergeTransforms has overlapping block IDs (BUG: data loss)', () => {
+    it('should concatenate update operations from both transforms when mergeTransforms has overlapping block IDs', () => {
       const op1: BlockOperation = ['data', 0, 0, 'from-a']
       const op2: BlockOperation = ['items', 0, 1, ['replaced']]
       const op3: BlockOperation = ['data', 0, 0, 'from-b']
@@ -201,9 +201,8 @@ describe('Transform functionality', () => {
 
       const merged = mergeTransforms(a, b)
 
-      // BUG: a's two operations are silently dropped - only b's single operation survives
-      expect(merged.updates![sharedId]).to.deep.equal([op3])
-      expect(merged.updates![sharedId]).to.not.deep.equal([op1, op2, op3])
+      // a's ops precede b's ops - no operation is dropped
+      expect(merged.updates![sharedId]).to.deep.equal([op1, op2, op3])
     })
 
     it('should silently drop insert from first transform when mergeTransforms has overlapping block IDs (BUG: data loss)', () => {
@@ -219,14 +218,14 @@ describe('Transform functionality', () => {
       expect((merged.inserts![sharedId] as TestBlock).data).to.equal('version-b')
     })
 
-    it('should accumulate duplicate block IDs in deletes array from mergeTransforms', () => {
+    it('should dedupe duplicate block IDs in deletes array from mergeTransforms', () => {
       const a: Transforms = { inserts: {}, updates: {}, deletes: [sharedId] }
       const b: Transforms = { inserts: {}, updates: {}, deletes: [sharedId] }
 
       const merged = mergeTransforms(a, b)
 
-      // Deletes array has the same ID twice - not deduplicated
-      expect(merged.deletes!.filter(id => id === sharedId)).to.have.lengthOf(2)
+      // Deletes array holds the ID once - duplicates are collapsed to a unique set
+      expect(merged.deletes!.filter(id => id === sharedId)).to.have.lengthOf(1)
     })
 
     it('should return Tracker insert when source already has block with same ID (insert takes precedence)', async () => {

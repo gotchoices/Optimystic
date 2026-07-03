@@ -732,4 +732,123 @@ describe('BTree', () => {
     }
     expect(collected).to.deep.equal(expected);
   })
+
+  // Regression: AtomicProxy concurrency / re-entrancy (transform-merge-and-atomic-concurrency, part b).
+  describe('atomic scope concurrency (transform-merge-and-atomic-concurrency)', () => {
+    it('serializes overlapping un-awaited inserts instead of sharing one atomic scope', async () => {
+      // Fire two mutations without awaiting the first. AtomicProxy must give each its own
+      // tracker (serialized), not let the second run against the first's in-flight scope —
+      // otherwise the first's commit flushes the second's half-applied state and an insert is
+      // lost. Uses the bare btree (no actor wrapper) so this hits AtomicProxy directly.
+      const p1 = btree.insert(1)
+      const p2 = btree.insert(2)
+      await Promise.all([p1, p2])
+
+      expect(await btree.get(1)).to.equal(1, 'first insert must survive')
+      expect(await btree.get(2)).to.equal(2, 'second insert must survive')
+      expect(await btree.getCount()).to.equal(2, 'both inserts land exactly once')
+    })
+
+    it('handles a burst of overlapping un-awaited inserts without losing any', async () => {
+      const keys = Array.from({ length: 25 }, (_, i) => i)
+      await Promise.all(keys.map(k => btree.insert(k)))   // all fired before any awaited
+
+      expect(await btree.getCount()).to.equal(keys.length)
+      for (const k of keys) {
+        expect(await btree.get(k)).to.equal(k, `key ${k} lost to a shared/overwritten scope`)
+      }
+    })
+
+    it('supports genuine nesting: merge -> updateAt joins one scope (no deadlock / double-commit)', async () => {
+      // merge() opens an atomic scope and calls updateAt() from inside it; updateAt must reuse
+      // the enclosing scope rather than open (and separately commit) a second one, and must not
+      // deadlock waiting on the scope it is already inside.
+      await btree.insert(5)
+      await btree.merge(5, (existing) => existing + 100)   // key 5 updated to 105 via nested updateAt
+
+      expect(await btree.get(5)).to.be.undefined
+      expect(await btree.get(105)).to.equal(105)
+      expect(await btree.getCount()).to.equal(1)
+    })
+  })
+
+  // Regression: rebalanceBranch "merge self into left sibling" read leftSib.nodes.length AFTER
+  // appending branch.nodes, so the path's branch index overshot the merged child by
+  // branch.nodes.length (transform-merge-and-atomic-concurrency, part c).
+  //
+  // The corrupt index is on the path returned by deleteAt, which the code deliberately treats
+  // as invalid (version-bumped, not refreshed) and never re-reads within the same delete — so
+  // the defect is latent (no current consumer) and end-to-end scans can't observe it; a
+  // post-delete path already carries other intentionally-stale indexes from rebalanceLeaf.
+  // We therefore assert the invariant white-box, scoped to rebalanceBranch itself: rebalancing
+  // at a given depth must preserve the child block that the path descends into at that depth.
+  // The buggy left-merge drives that index out of bounds (child becomes undefined); the fix keeps
+  // it pointed at the same child. This guards the invariant for any future path-reuse consumer.
+  it('rebalanceBranch left-merge shifts the path index by the sibling original length', async () => {
+    const cap = 4   // small fan-out so branch-level (not just leaf) merges fire on a modest tree
+    const s = new TestBlockStore()
+    const t = BTree.create<number, number>(
+      s,
+      (st, rootId) => {
+        let storedRootId = rootId
+        return {
+          get: async () => (await st.tryGet(storedRootId))!,
+          set: async (node) => { storedRootId = node.header.id },
+          getId: async () => storedRootId,
+        }
+      },
+      undefined, undefined, cap,
+    )
+
+    // When a branch merges itself into its LEFT sibling, its children are appended AFTER the
+    // sibling's original children, so the path index into that branch must shift right by the
+    // sibling's ORIGINAL length (leftLen) to keep addressing the same child. The bug shifted by
+    // the sibling's POST-append length (leftLen + branch.nodes.length) instead. We check the
+    // applied shift (idxOut - idxIn), which is robust to the path index being stale on entry
+    // (it always is by the time a branch underflows) — the bug is purely in the shift amount.
+    const orig = (t as any).rebalanceBranch.bind(t)
+    let leftMerges = 0
+    const mismatches: string[] = []
+    ;(t as any).rebalanceBranch = async (path: any, depth: number) => {
+      const pb = path.branches[depth]
+      const nodeBefore = pb ? pb.node : undefined
+      const indexIn = pb ? pb.index : undefined
+      const branchLenIn = pb ? pb.node.nodes.length : undefined   // children of the (to-be-merged) branch
+      const res = await orig(path, depth)
+      const pbAfter = path.branches[depth]
+      if (pbAfter && nodeBefore && indexIn !== undefined && branchLenIn !== undefined && pbAfter.node !== nodeBefore) {
+        leftMerges++   // node reassigned => "merge self into left sibling" fired at this depth
+        const mergedLen = pbAfter.node.nodes.length           // leftLen + branchLenIn
+        const expectedShift = mergedLen - branchLenIn         // leftLen (sibling's ORIGINAL length)
+        const actualShift = pbAfter.index - indexIn
+        if (actualShift !== expectedShift) {
+          mismatches.push(`depth ${depth}: index shifted by ${actualShift}, expected ${expectedShift} (leftLen); off by ${actualShift - expectedShift}`)
+        }
+      }
+      return res
+    }
+
+    const N = 60
+    for (let i = 0; i < N; i++) await t.insert(i)
+
+    // Need a >=3-level tree so a *non-root* branch can underflow and merge into its left sibling.
+    const heightOf = async () => {
+      let h = 1
+      let node: any = await t.trunk.get()
+      while (node && node.header.type === TreeBranchBlockType) { h++; node = await s.tryGet(node.nodes[0]!) }
+      return h
+    }
+    expect(await heightOf()).to.be.at.least(3, 'expected a 3-level tree to exercise a branch merge')
+
+    // Delete from the high end: the rightmost branch has no right sibling, so its underflow forces
+    // a left-merge (rebalanceBranch "merge self into left sibling").
+    for (let k = N - 1; k >= 0; k--) {
+      const path = await t.find(k)
+      expect(path.on).to.be.true
+      await t.deleteAt(path)
+    }
+
+    expect(leftMerges).to.be.greaterThan(0, 'test did not exercise a branch left-merge; adjust N/capacity')
+    expect(mismatches, `branch left-merge shifted the path index by the wrong amount:\n${mismatches.join('\n')}`).to.be.empty
+  })
 })
