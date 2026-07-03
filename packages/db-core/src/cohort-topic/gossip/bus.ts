@@ -25,6 +25,7 @@
 
 import { bytesEqual, bytesKey } from "../registration/bytes.js";
 import type { RegistrationStore } from "../registration/types.js";
+import { clampTtl } from "../registration/types.js";
 import type { ICohortGossipTransport, PeerRef, RingCoord } from "../ports.js";
 import { b64urlToBytes, decodeCohortGossipV1, encodeCohortMessage } from "../wire/codec.js";
 import type { ChildLinkRefV1, CohortGossipV1 } from "../wire/types.js";
@@ -199,6 +200,11 @@ class TransportCohortGossipBus implements CohortGossipBus {
 	private mergeRecords(g: CohortGossipV1, now: number): void {
 		for (const gr of g.records ?? []) {
 			const incoming = fromGossipRecord(gr);
+			// Gossip is a second admission path into the store — a peer (buggy, unpatched, or hostile)
+			// can replicate a record whose TTL never passed local `accept()`'s clamp. Re-clamp here so
+			// no replica can hold an unbounded lifetime that wedges the topic budget. Clamp BEFORE the
+			// dead-check below so a poison TTL cannot dodge staleness eviction.
+			incoming.ttl = clampTtl(incoming.ttl);
 			// A record already past its TTL is dead; merging it would resurrect a registration the
 			// owner has (or soon will have) evicted. Drop it, matching `store.evictStale`'s predicate
 			// so replication can never reintroduce what local eviction removes.

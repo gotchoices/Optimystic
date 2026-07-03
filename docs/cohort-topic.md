@@ -436,6 +436,8 @@ The participant pings `primary` every `ttl / 3` (default 30s):
 
 Cohort members evict records where `now − lastPing > ttl`. Eviction is gossiped so all members converge on the active participant set.
 
+> **TTL is clamped at admission.** A requested `ttl` is forced into `[MIN_TTL_MS, MAX_TTL_MS]` (10 s … 15 min = `10 × DEFAULT_TTL_MS`) by the single `clampTtl` policy gate in `registration/types.ts`. Both admission paths run through it: local `accept()` and — because gossip is a *second* path into the store — the `mergeRecords` step of the gossip bus, so a peer that never clamped (unpatched, buggy, or hostile) cannot replicate an unbounded lifetime that would pin a `topics_max` budget slot forever. Non-positive requests fall to `DEFAULT_TTL_MS` first. The wire validator stays a pure structural decoder; out-of-range TTLs are policy-adjusted, not rejected.
+
 > **Implementation.** The local soft-state store, the deterministic `assignSlots`, the participant/cohort renewal sides, and the rotation handoff state machine live in `packages/db-core/src/cohort-topic/registration/` (peer ids are raw `Uint8Array`; the wire layer carries them as base64url). Cross-member replication of these records runs over cohort gossip (a later ticket); this layer owns the local store and the deterministic functions the gossip layer and TTL loop call.
 
 ### Cohort epoch

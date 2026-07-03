@@ -7,6 +7,7 @@ import { createTopicBudget } from '../../src/cohort-topic/antidos/topic-budget.j
 import { bytesToB64url, encodeCohortMessage } from '../../src/cohort-topic/wire/codec.js';
 import type { ICohortGossipTransport, PeerRef, RingCoord } from '../../src/cohort-topic/ports.js';
 import type { RegistrationStore, RegistrationRecord } from '../../src/cohort-topic/registration/types.js';
+import { MAX_TTL_MS } from '../../src/cohort-topic/registration/types.js';
 import type { ChildLinkRefV1, CohortGossipV1 } from '../../src/cohort-topic/wire/types.js';
 
 function bytes(label: string, len = 32): Uint8Array {
@@ -201,6 +202,19 @@ describe('cohort-topic / gossip bus', () => {
 		const stale = record('p', 1_000);
 		bus.applyInbound(gossip('m', EPOCH, { records: [toGossipRecord(stale)] }), 200_000);
 		expect(store.getByParticipant(stale.topicId, stale.participantId), 'expired record dropped').to.be.undefined;
+	});
+
+	it('clamps a poison TTL on a replicated record so gossip cannot wedge the topic budget', () => {
+		// Gossip is a second admission path: a peer that never ran accept()'s clamp (unpatched, buggy,
+		// or hostile) replicates a record with an unbounded TTL. The merge must re-clamp to MAX_TTL_MS so
+		// the replica still expires within the intended horizon rather than pinning a budget slot forever.
+		const store = createRegistrationStore();
+		const bus = busFor(store, new FanoutTransport(), () => EPOCH);
+		const poison: RegistrationRecord = { ...record('p', 1_000), ttl: 1e15 };
+		bus.applyInbound(gossip('m', EPOCH, { records: [toGossipRecord(poison)] }), 2_000);
+		const got = store.getByParticipant(poison.topicId, poison.participantId);
+		expect(got, 'record merged').to.not.be.undefined;
+		expect(got!.ttl, 'replicated TTL clamped to MAX_TTL_MS').to.equal(MAX_TTL_MS);
 	});
 
 	it('merges the per-member view (willingness/load/summaries)', () => {

@@ -75,6 +75,16 @@ export const MAX_TTL_MS = 10 * DEFAULT_TTL_MS;
 /** Consecutive ping failures before a participant promotes `backups[0]`. */
 export const MAX_PING_FAILURES = 3;
 
+/**
+ * Clamp a requested or replicated TTL into the accepted `[MIN_TTL_MS, MAX_TTL_MS]` window.
+ * Non-positive input falls to {@link DEFAULT_TTL_MS} first. This is the single TTL policy gate:
+ * both local admission (`accept()`) and gossip replication (`mergeRecords`) run every TTL through
+ * it, so no store — local or replica — can ever hold a record whose lifetime dodges the cap.
+ */
+export function clampTtl(ttl: number): number {
+	return Math.min(Math.max(ttl > 0 ? ttl : DEFAULT_TTL_MS, MIN_TTL_MS), MAX_TTL_MS);
+}
+
 /** `ping_interval = ttl / 3` (default 30s Core, 20s Edge), floored to whole ms. */
 export function pingIntervalMs(ttl: number): number {
 	return Math.floor(ttl / 3);
