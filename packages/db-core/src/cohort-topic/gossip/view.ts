@@ -21,6 +21,14 @@ export interface MemberContribution {
 	readonly windowSeconds: number;
 	/** Exact per-topic summaries this member last reported. */
 	readonly topicSummaries: readonly CohortTopicSummary[];
+	/**
+	 * `topicId` (base64url) → summary, derived from {@link topicSummaries} at {@link MutableCohortView.merge}
+	 * so a per-topic reader (traffic `snapshot`) does an O(1) lookup instead of an O(summaries) `.find` per
+	 * member per reply. First occurrence wins on a duplicate `topicId` (matching `Array.prototype.find`).
+	 * Populated by `merge`; a contribution built without going through `merge` may omit it, in which case
+	 * consumers fall back to scanning {@link topicSummaries}.
+	 */
+	readonly topicIndex?: ReadonlyMap<string, CohortTopicSummary>;
 	/** Gossip timestamp (unix ms) — the last-writer-wins key. */
 	readonly timestamp: number;
 }
@@ -55,9 +63,26 @@ class MapCohortView implements MutableCohortView {
 		if (held !== undefined && c.timestamp < held.timestamp) {
 			return false; // stale; keep the newer contribution
 		}
-		this.byMember.set(member, c);
+		// Derive the per-topic index once, at write time, so per-topic readers never rescan the flat
+		// `topicSummaries` array per reply. A writer pays O(summaries) once per merge (gossip round).
+		this.byMember.set(member, { ...c, topicIndex: indexTopics(c.topicSummaries) });
 		return true;
 	}
+}
+
+/**
+ * Index a member's flat topic summaries by `topicId` (base64url). First occurrence wins on a duplicate
+ * `topicId`, exactly matching the `Array.prototype.find` scan this replaces — so a snapshot over the index
+ * returns identical numbers to one over the array.
+ */
+function indexTopics(summaries: readonly CohortTopicSummary[]): ReadonlyMap<string, CohortTopicSummary> {
+	const index = new Map<string, CohortTopicSummary>();
+	for (const s of summaries) {
+		if (!index.has(s.topicId)) {
+			index.set(s.topicId, s);
+		}
+	}
+	return index;
 }
 
 /** Construct an empty {@link MutableCohortView}. */

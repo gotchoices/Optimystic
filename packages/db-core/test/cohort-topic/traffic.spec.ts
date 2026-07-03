@@ -108,6 +108,30 @@ describe('cohort-topic / traffic counters', () => {
 		expect(snap.childCohortCount, 'max child-cohort count across the cohort').to.equal(2);
 	});
 
+	it('snapshot reads the merge-time topic index; duplicate topicIds keep the first (matching a .find scan)', () => {
+		// `merge` derives a per-topic index so `snapshot` does an O(1) lookup instead of an O(summaries) `.find`
+		// per member. The index keeps the FIRST occurrence of a duplicated topicId — exactly what `Array.find`
+		// returned — so numbers are unchanged. A member gossiping the same topic twice pins that equivalence.
+		const view = createCohortView();
+		view.merge('dup-sib', {
+			cohortEpoch: EPOCH,
+			willingness: 0b1111,
+			loadBuckets: [0, 0, 0, 0],
+			windowSeconds: 60,
+			topicSummaries: [
+				{ topicId: TOPIC_B64, tier: 1, directParticipants: 0, arrivalsPerMin: 3, queriesPerMin: 1, promoted: false, childCohortCount: 0 },
+				{ topicId: TOPIC_B64, tier: 1, directParticipants: 0, arrivalsPerMin: 99, queriesPerMin: 99, promoted: false, childCohortCount: 0 },
+			],
+			timestamp: 1_000,
+		});
+		expect(view.get('dup-sib')?.topicIndex, 'merge derives the per-topic index').to.not.be.undefined;
+
+		const tc = createTrafficCounters({ view, store: storeStub(0), selfMember: SELF });
+		const snap = tc.snapshot(TOPIC);
+		expect(snap.arrivalsPerMin, 'first summary wins (3), the duplicate 99 is ignored').to.equal(3);
+		expect(snap.queriesPerMin, 'first summary wins (1)').to.equal(1);
+	});
+
 	it('does not double-count its own gossiped summary if echoed back into the view', () => {
 		const view = createCohortView();
 		// Self appears in the view (e.g. a fan-out transport echoes own broadcast) — must be skipped.

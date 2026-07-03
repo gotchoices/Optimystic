@@ -43,6 +43,12 @@ import type { RegisterReplyV1, RegisterV1 } from "./wire/types.js";
 export interface AcceptedWalkOutcome {
 	readonly kind: "accepted";
 	readonly reply: RegisterReplyV1;
+	/**
+	 * The accepted register probe's own `correlationId`. The participant echoes it on every renew for this
+	 * registration so `RenewV1.correlationId` "matches original `RegisterV1`" (docs §Wire, RenewV1). Each
+	 * probe carries a distinct correlationId; this is the one the cohort admitted.
+	 */
+	readonly correlationId: string;
 }
 
 /**
@@ -174,7 +180,10 @@ class RouterWalkEngine implements WalkEngine {
 		let d = dMax;
 		let bootstrap = false;
 		let followOn = false;
-		let memberAttempts = 0;
+		// Member ids (base64url) already dialed on this walk's `unwilling_member` retries. Tracking WHICH
+		// members were tried — not a positional counter — lets each fresh candidate list be consumed from
+		// its best (index-0) member; a counter would permanently skip index 0 of every list after the first.
+		const triedMembers = new Set<string>();
 		let dialTarget: PeerRef | undefined;
 		let steps = 0;
 		// True once this walk has followed a `Promoted` redirect outward (either mode). On a subsequent
@@ -203,12 +212,14 @@ class RouterWalkEngine implements WalkEngine {
 
 			switch (reply.result) {
 				case "accepted": {
-					return { kind: "accepted", reply };
+					// Surface the accepted probe's correlationId so the participant's renewals can echo it
+					// (RenewV1 correlationId "matches original RegisterV1"). `reg` is the frame just admitted.
+					return { kind: "accepted", reply, correlationId: reg.correlationId };
 				}
 				case "no_state": {
 					// Step toward the root. The cohort served nothing here; no spatial sibling state.
 					dialTarget = undefined;
-					memberAttempts = 0;
+					triedMembers.clear(); // a spatial move to a new coord starts sibling retries fresh
 					if (followedPromoted) {
 						// The `Promoted` redirect target is cold (not yet instantiated). Walking inward to the
 						// promoting ancestor would just re-trigger the redirect and oscillate, so handle it here.
@@ -250,7 +261,7 @@ class RouterWalkEngine implements WalkEngine {
 				}
 				case "promoted": {
 					dialTarget = undefined;
-					memberAttempts = 0;
+					triedMembers.clear(); // spatial move to the redirect target: sibling retries start fresh
 					bootstrap = false;
 					const targetTier = reply.targetTier ?? d + 1;
 					// The cohort names the tier to jump outward to. When it supplied `targetTier` EXPLICITLY it is
@@ -282,14 +293,18 @@ class RouterWalkEngine implements WalkEngine {
 				}
 				case "unwilling_member": {
 					const candidates = reply.candidateMembers ?? [];
-					if (candidates.length === 0 || memberAttempts >= this.maxMemberRetries) {
-						// Exhausted the named siblings (or none offered) → fall through to a cohort-level
-						// temporal back-off, restarting at d_max on the caller's retry.
+					// Consume this (possibly fresh) list from its best (index-0) member: pick the FIRST
+					// candidate not already dialed on this walk. A positional `memberAttempts % len` offset
+					// would skip index 0 of every list after the first, permanently starving the best member.
+					const next = candidates.find((c) => !triedMembers.has(c));
+					if (next === undefined || triedMembers.size >= this.maxMemberRetries) {
+						// No untried candidate offered (or the retry cap is spent) → fall through to a
+						// cohort-level temporal back-off, restarting at d_max on the caller's retry.
 						return { kind: "retry_later", afterMs: backoffRetryMs(0) };
 					}
 					// Retry the SAME coord at a named alternative member (spatial move within the cohort).
-					dialTarget = { id: b64urlToBytes(candidates[memberAttempts % candidates.length]!) };
-					memberAttempts++;
+					triedMembers.add(next);
+					dialTarget = { id: b64urlToBytes(next) };
 					break;
 				}
 				case "unwilling_cohort": {

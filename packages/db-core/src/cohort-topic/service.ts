@@ -275,11 +275,11 @@ class WalkRegisterService implements CohortTopicService {
 			throw new CohortBackoffError(outcome.kind === "retry_later" ? outcome.afterMs : 0);
 		}
 		const hint = this.hintFromReply(req.topicId, req.tier, outcome.reply);
-		const renewal = this.startRenewal(req, hint);
+		const renewal = this.startRenewal(req, hint, outcome.correlationId);
 		return { ...hint, renewal };
 	}
 
-	private startRenewal(req: RegisterRequest, hint: CohortHint): RenewalParticipant {
+	private startRenewal(req: RegisterRequest, hint: CohortHint, correlationId: string): RenewalParticipant {
 		const ttl = req.ttl ?? this.ttl;
 		const initial: RegistrationRecord = {
 			topicId: req.topicId,
@@ -297,11 +297,14 @@ class WalkRegisterService implements CohortTopicService {
 			transport,
 			clock: this.clock,
 			sign: (body: UnsignedRenew): Promise<string> => this.deps.signer.signRenew(body),
-			// A renew's correlationId is a 16-byte nonce (the wire codec pins the field — see
-			// validateRenewV1). It is never read on the cohort side (renew is keyed by (topicId,
-			// participant)), so a per-registration fresh nonce satisfies the contract; the cohort epoch
-			// travels separately as `initialCohortEpoch` below.
-			correlationId: this.freshCorrelationId(),
+			// Echo the accepted RegisterV1's correlationId: RenewV1 `correlationId` "matches original
+			// RegisterV1" (docs §Wire, RenewV1), so a future renew-path freshness/replay guard can correlate
+			// a renew back to the registration it renews.
+			// NOTE: every periodic renew for this registration shares this ONE correlationId (as it always
+			// has — this only makes the shared id equal the register's, not an independent nonce). A future
+			// renew replay guard must therefore key renews by (correlationId, timestamp-window), NOT "drop
+			// any repeated correlationId" — else it would reject the 2nd+ legitimate renew.
+			correlationId,
 			initialCohortEpoch: hint.cohortEpoch,
 		});
 		// NOTE: a second register() for the same (topicId, participantId) overwrites the map entry here,

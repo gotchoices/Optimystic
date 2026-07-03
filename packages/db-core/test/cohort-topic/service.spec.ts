@@ -3,7 +3,7 @@ import { sha256 } from '@noble/hashes/sha2.js';
 import { createCohortTopicService } from '../../src/cohort-topic/service.js';
 import { createRingHash } from '../../src/cohort-topic/ring-hash.js';
 import type { ITopicRouter, ISizeEstimator, PeerRef, RingCoord } from '../../src/cohort-topic/ports.js';
-import { bytesToB64url, encodeCohortMessage } from '../../src/cohort-topic/wire/codec.js';
+import { bytesToB64url, encodeCohortMessage, decodeRegisterV1, decodeRenewV1 } from '../../src/cohort-topic/wire/codec.js';
 import type { RegisterReplyV1, RenewReplyV1 } from '../../src/cohort-topic/wire/types.js';
 import type { CohortGossipBus } from '../../src/cohort-topic/gossip/bus.js';
 import type { MembershipVerifier } from '../../src/cohort-topic/membership/verifier.js';
@@ -139,5 +139,30 @@ describe('CohortTopicService / stale handle isolation', () => {
 		await service.renew(handle);
 		renewCount = withdrawCount - afterWithdraw;
 		expect(renewCount, 'renew after withdraw must not ping').to.equal(0);
+	});
+});
+
+describe('CohortTopicService / renew echoes the register correlationId', () => {
+	it('a renew ping carries the accepted RegisterV1\'s correlationId (RenewV1 matches original RegisterV1)', async () => {
+		let registerCorrelationId: string | undefined;
+		let renewCorrelationId: string | undefined;
+		const router: ITopicRouter = {
+			routeAndAct: async (_key: RingCoord, activity: Uint8Array, _opts: { wantK: number; minSigs: number }) => {
+				// The register walk builds a fresh correlationId per probe; capture the one the cohort admits.
+				registerCorrelationId = decodeRegisterV1(activity).correlationId;
+				return encodeCohortMessage(acceptedReply);
+			},
+			dialMember: async (_peer: PeerRef, activity: Uint8Array) => {
+				renewCorrelationId = decodeRenewV1(activity).correlationId;
+				return encodeCohortMessage({ v: 1, result: 'ok' } as RenewReplyV1);
+			},
+		};
+
+		const service = makeService(router);
+		const handle = await service.register({ topicId: TOPIC, tier: 1 });
+		await service.renew(handle);
+
+		expect(registerCorrelationId, 'the register stamped a correlationId').to.be.a('string');
+		expect(renewCorrelationId, 'the renew echoes the accepted register\'s correlationId').to.equal(registerCorrelationId);
 	});
 });

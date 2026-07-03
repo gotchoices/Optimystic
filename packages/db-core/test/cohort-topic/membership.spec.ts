@@ -641,3 +641,66 @@ describe('cohort-topic / membership stale trust-lock recovery', () => {
 		}
 	});
 });
+
+// --- Per-coord map caps (anti-DoS): byCoord / lastFetchAt / staleGapStrikes are LRU-bounded ---
+//
+// The three per-coord verifier maps are keyed by `coordKey` (base64url of an attacker-derivable RingCoord).
+// Under a flood of verify-misses against attacker-chosen coords they must not grow without bound. They share
+// the reusable `LruMap` (its own eviction is unit-tested in `test/lru-map.spec.ts`); these tests pin the
+// verifier-level contract: the positive-integer `maxCoords` guard, and that `byCoord` actually evicts.
+
+describe('cohort-topic / membership verifier map caps', () => {
+	const signer = createCohortSigner(crypto());
+
+	it('rejects a non-positive-integer maxCoords (mirrors the sibling anti-DoS maxKeys guard)', () => {
+		const router = createMembershipSourceRouter({ committed: new MockSource(), fret: new MockSource() });
+		for (const bad of [0, -1, 2.5, Number.NaN]) {
+			expect(() => createMembershipVerifier({ signer, router, maxCoords: bad }), `maxCoords=${bad}`).to.throw(RangeError);
+		}
+	});
+
+	it('LRU-caps byCoord: an attacker-coord burst evicts an earlier trust-locked entry (best-effort trust lock)', async () => {
+		// A per-coord source so byCoord (keyed by cert.cohortCoord) grows one entry per distinct coord.
+		const coordFor = (label: string): RingCoord => sha256(new TextEncoder().encode(label)).slice(0, 32);
+		const certs = new Map<string, Uint8Array>();
+		const certOverCoord = (coord: RingCoord): Uint8Array => encodeCohortMessage(buildCertOver({ coord, epoch: EPOCH, members: MEMBERS }));
+		const coordA = coordFor('cap-coord-A');
+		certs.set(bytesToB64url(coordA), certOverCoord(coordA));
+		const floodCoords = ['B', 'C', 'D', 'E'].map((s) => coordFor(`cap-coord-${s}`));
+		for (const c of floodCoords) certs.set(bytesToB64url(c), certOverCoord(c));
+
+		class PerCoordSource implements IMembershipSource {
+			readonly currentCalls = new Map<string, number>();
+			readonly fetchCalls = new Map<string, number>();
+			async current(coord: RingCoord): Promise<Uint8Array | undefined> {
+				const k = bytesToB64url(coord);
+				this.currentCalls.set(k, (this.currentCalls.get(k) ?? 0) + 1);
+				return certs.get(k);
+			}
+			async fetch(coord: RingCoord): Promise<Uint8Array | undefined> {
+				const k = bytesToB64url(coord);
+				this.fetchCalls.set(k, (this.fetchCalls.get(k) ?? 0) + 1);
+				return certs.get(k);
+			}
+		}
+		const source = new PerCoordSource();
+		const router = createMembershipSourceRouter({ committed: source, fret: source });
+		const v = createMembershipVerifier({ signer, router, anchor: constAnchor('unknown'), maxCoords: 4 });
+		const keyA = bytesToB64url(coordA);
+
+		// coordA is self-published → trust-locked and cached; its message verifies straight from cache (no source).
+		v.cache(buildCertOver({ coord: coordA, epoch: EPOCH, members: MEMBERS }));
+		expect(await v.verifyMessage(MESSAGE_SIGNERS, coordA, 2, PAYLOAD, SIG)).to.equal('verified');
+		expect(source.currentCalls.get(keyA) ?? 0, 'coordA served from the trusted cache — no source call').to.equal(0);
+
+		// Flood four distinct attacker coords (cap = 4). Each TOFU-caches, LRU-evicting the coldest — coordA.
+		for (const c of floodCoords) {
+			expect(await v.verifyMessage(MESSAGE_SIGNERS, c, 2, PAYLOAD, SIG), `flood coord ${bytesToB64url(c)}`).to.equal('verified');
+		}
+
+		// coordA's trusted entry was evicted under the flood: verifying it now MISSES the cache and must consult
+		// the source (re-TOFU) — proving byCoord is bounded, and that the trust lock is best-effort under pressure.
+		expect(await v.verifyMessage(MESSAGE_SIGNERS, coordA, 2, PAYLOAD, SIG)).to.equal('verified');
+		expect(source.currentCalls.get(keyA) ?? 0, 'coordA was evicted → forced back to the source').to.equal(1);
+	});
+});

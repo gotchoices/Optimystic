@@ -52,6 +52,15 @@ import type { MembershipCertV1 } from "../wire/types.js";
 import { DEFAULT_MIN_SIGS, type CohortSigner } from "../sig/threshold.js";
 import { membershipCertSigningPayload } from "../sig/payloads.js";
 import type { IMembershipSourceRouter } from "./source.js";
+import { LruMap } from "../../utility/lru-map.js";
+
+/**
+ * Default hard cap on distinct coords the verifier's per-coord maps retain (`byCoord`, `lastFetchAt`,
+ * `staleGapStrikes`). Beyond it the least-recently-used coord is evicted — bounding memory under a flood
+ * of verify-misses against attacker-chosen coords. Same 100k ballpark as the sibling anti-DoS caps
+ * ({@link import("../antidos/replay-guard.js").DEFAULT_REPLAY_GUARD_MAX_KEYS}).
+ */
+export const DEFAULT_MEMBERSHIP_VERIFIER_MAX_COORDS = 100_000;
 
 /** Outcome of verifying a threshold-signed message against cohort membership. */
 export type VerifyResult = "verified" | "untrusted";
@@ -119,6 +128,14 @@ export interface MembershipVerifierDeps {
 	 * drop-the-lock-on-demotion tripwire in the ticket).
 	 */
 	staleGapRecoveryStrikes?: number;
+	/**
+	 * Hard LRU cap on distinct coords retained across the verifier's per-coord maps (`byCoord`,
+	 * `lastFetchAt`, `staleGapStrikes`); the least-recently-used coord is evicted beyond it. Bounds memory
+	 * under a flood of verify-misses against attacker-chosen coords. Defaults to
+	 * {@link DEFAULT_MEMBERSHIP_VERIFIER_MAX_COORDS}; must be a positive integer (mirrors the sibling
+	 * anti-DoS `maxKeys` guard).
+	 */
+	maxCoords?: number;
 }
 
 /** Result of the trust gate: accept as a trusted anchor, accept as interim TOFU, or reject outright. */
@@ -139,15 +156,23 @@ interface NormalizedTrustRoot {
 }
 
 class CachingMembershipVerifier implements MembershipVerifier {
-	private readonly byCoord = new Map<string, CachedCert>();
+	// LRU-capped so a flood of verify-misses against attacker-chosen coords cannot grow these maps without
+	// bound (coordKey is base64url of an attacker-derivable RingCoord). Each is capped INDEPENDENTLY: the
+	// aux maps may briefly retain a coord `byCoord` already evicted — harmless (a stale `lastFetchAt` at
+	// worst permits one extra refetch; a stale strike count is itself bounded).
+	// NOTE: `byCoord` also holds this node's OWN `cache()`-published trusted cert (the trust lock). Under an
+	// attacker-coord flood the LRU can evict a trusted self-published entry, re-opening that coord to TOFU on
+	// next sight — the trust lock is best-effort under memory pressure. This mirrors the documented penalty
+	// tradeoff on the replay-guard cap and is acceptable; do not file it as a separate ticket.
+	private readonly byCoord: LruMap<string, CachedCert>;
 	/** Per-coord timestamp of the last `source.fetch()` attempt (the rate-limit clock for {@link RefetchBound}). */
-	private readonly lastFetchAt = new Map<string, number>();
+	private readonly lastFetchAt: LruMap<string, number>;
 	/**
 	 * Per-coord count of *consecutive* gap-signalled refetches against a trust-locked coord (base64url key).
 	 * Reset to zero whenever a message verifies for the coord (see {@link verifyMessage}); at
 	 * {@link staleGapRecoveryStrikes} the lock is released back to TOFU (see {@link staleGapRecovery}).
 	 */
-	private readonly staleGapStrikes = new Map<string, number>();
+	private readonly staleGapStrikes: LruMap<string, number>;
 	private readonly minSigs: number;
 	private readonly anchor: IMembershipTrustAnchor;
 	private readonly trustRoots: readonly NormalizedTrustRoot[];
@@ -158,6 +183,13 @@ class CachingMembershipVerifier implements MembershipVerifier {
 		this.anchor = deps.anchor ?? noAuthorityTrustAnchor;
 		this.trustRoots = (deps.trustRoots ?? []).map(normalizeTrustRoot);
 		this.staleGapRecoveryStrikes = deps.staleGapRecoveryStrikes ?? 3;
+		const maxCoords = deps.maxCoords ?? DEFAULT_MEMBERSHIP_VERIFIER_MAX_COORDS;
+		if (!Number.isInteger(maxCoords) || maxCoords <= 0) {
+			throw new RangeError(`maxCoords must be a positive integer, got ${maxCoords}`);
+		}
+		this.byCoord = new LruMap(maxCoords);
+		this.lastFetchAt = new LruMap(maxCoords);
+		this.staleGapStrikes = new LruMap(maxCoords);
 	}
 
 	cache(cert: MembershipCertV1): void {

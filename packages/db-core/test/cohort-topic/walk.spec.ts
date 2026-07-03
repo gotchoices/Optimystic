@@ -422,4 +422,64 @@ describe('cohort-topic / walk-toward-root', () => {
 		expect(router.probes.map((x) => x.treeTier), 'walks inward then follows redirect outward').to.deep.equal([2, 1, 0, 1]);
 		expect(router.probes.every((p) => p.probe), 'all frames carry probe:true').to.equal(true);
 	});
+
+	it('accepted outcome surfaces the accepted register probe\'s correlationId (RenewV1 matches original RegisterV1)', async () => {
+		// The participant echoes this id on every renew for the registration, per docs §Wire (RenewV1
+		// correlationId "matches original RegisterV1"). `factoryFor` stamps every probe with b64url(bytes('corr')).
+		const self = bytes('corr-outcome-participant');
+		const router = new ScriptedRouter([accepted]);
+		const engine = createWalkEngine({ router, addressing, dmax: fixedDMax(0), self, factory: factoryFor(self) });
+		const outcome = await engine.register(TOPIC, 1);
+		expect(outcome.kind).to.equal('accepted');
+		if (outcome.kind !== 'accepted') throw new Error('unreachable');
+		expect(outcome.correlationId, 'the accepted probe\'s correlationId surfaces on the outcome').to.equal(bytesToB64url(bytes('corr')));
+	});
+
+	it('unwilling_member: each fresh candidate list is dialed from its index-0 (best) member, never skipped', async () => {
+		// Regression for the positional-counter bug: after dialing candidates[0] of the first list and getting a
+		// FRESH list back, a `memberAttempts % len` offset would dial index 1, then 2 — permanently skipping the
+		// best (index-0) candidate of every subsequent list. The tried-member Set consumes each list from index 0.
+		const self = bytes('fresh-list-participant');
+		const A = ['A1', 'A2', 'A3'].map((l) => bytes(l));
+		const B = ['B1', 'B2', 'B3'].map((l) => bytes(l));
+		const C = ['C1', 'C2', 'C3'].map((l) => bytes(l));
+		const um = (members: Uint8Array[]): RegisterReplyV1 => ({ v: 1, result: 'unwilling_member', candidateMembers: members.map(bytesToB64url) });
+		const router = new ScriptedRouter([um(A), um(B), um(C), accepted]);
+		const engine = createWalkEngine({ router, addressing, dmax: fixedDMax(0), self, factory: factoryFor(self) });
+		const outcome = await engine.register(TOPIC, 1);
+
+		expect(outcome.kind).to.equal('accepted');
+		expect(router.probes[0]!.mode, 'first probe routes by coord').to.equal('route');
+		expect(router.probes[1]!.mode, 'sibling retries are direct dials').to.equal('dial');
+		expect(bytesEqual(router.probes[1]!.member!, A[0]!), 'first list → index-0 (A1)').to.be.true;
+		expect(bytesEqual(router.probes[2]!.member!, B[0]!), 'second FRESH list → index-0 (B1), not the skipped B2').to.be.true;
+		expect(bytesEqual(router.probes[3]!.member!, C[0]!), 'third FRESH list → index-0 (C1), not the skipped C3').to.be.true;
+	});
+
+	it('unwilling_member: the retry cap still terminates a walk fed endless fresh candidates', async () => {
+		// Every reply is a fresh list naming a brand-new member, so the tried-set grows by one per dial; with
+		// maxMemberRetries=2 the walk backs off once the tried-set reaches the cap (the fall-through is unchanged).
+		const self = bytes('cap-participant');
+		const um = (i: number): RegisterReplyV1 => ({ v: 1, result: 'unwilling_member', candidateMembers: [bytesToB64url(bytes(`m-${i}`))] });
+		const router = new ScriptedRouter([um(0), um(1), um(2), um(3)]);
+		const engine = createWalkEngine({ router, addressing, dmax: fixedDMax(0), self, factory: factoryFor(self), config: { maxMemberRetries: 2 } });
+		const outcome = await engine.register(TOPIC, 1);
+		expect(outcome.kind, 'the retry cap terminates the walk with a temporal back-off').to.equal('retry_later');
+	});
+
+	it('unwilling_member: a list offering only already-tried members backs off (does not re-dial the same member)', async () => {
+		// A single sibling offered repeatedly is dialed ONCE; the next list (same lone member) has no untried
+		// candidate → fall through to a temporal back-off, rather than pointlessly re-dialing it.
+		const self = bytes('all-tried-participant');
+		const sib = bytesToB64url(bytes('lone-sibling'));
+		const router = new ScriptedRouter([
+			{ v: 1, result: 'unwilling_member', candidateMembers: [sib] },
+			{ v: 1, result: 'unwilling_member', candidateMembers: [sib] },
+		]);
+		const engine = createWalkEngine({ router, addressing, dmax: fixedDMax(0), self, factory: factoryFor(self) });
+		const outcome = await engine.register(TOPIC, 1);
+		expect(outcome.kind, 'no untried candidate → temporal back-off').to.equal('retry_later');
+		// Exactly one dial (the sibling, once); the second reply finds it already tried and backs off.
+		expect(router.probes.filter((p) => p.mode === 'dial').length, 'the lone sibling is dialed exactly once').to.equal(1);
+	});
 });

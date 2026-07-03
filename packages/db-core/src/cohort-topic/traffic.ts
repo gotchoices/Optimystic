@@ -134,7 +134,11 @@ class WindowedTrafficCounters implements TrafficCounters {
 		let childCohortCount = 0;
 		for (const [member, contribution] of this.deps.view.all()) {
 			if (member === this.deps.selfMember) continue; // own contribution comes from lastPublished
-			const summary = contribution.topicSummaries.find((s) => s.topicId === topicB64);
+			// O(1) per-topic lookup via the merge-time index; fall back to a scan only for a contribution
+			// not built through `merge` (which populates `topicIndex`). Net: snapshot is O(members + summaries).
+			const summary = contribution.topicIndex !== undefined
+				? contribution.topicIndex.get(topicB64)
+				: contribution.topicSummaries.find((s) => s.topicId === topicB64);
 			if (summary === undefined) continue;
 			arrivals += summary.arrivalsPerMin;
 			queries += summary.queriesPerMin;
