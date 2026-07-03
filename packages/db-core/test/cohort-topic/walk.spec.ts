@@ -358,15 +358,16 @@ describe('cohort-topic / walk-toward-root', () => {
 		expect(router.probes.some((p) => p.bootstrap), 'a follow-on cold-start never sets bootstrap').to.equal(false);
 	});
 
-	it('bounds an out-of-range promoted targetTier: 2.5 / -1 / 300 back off, never crash with a RangeError', async () => {
+	it('bounds an out-of-range promoted targetTier: 2.5 / -1 / 61 / 300 back off, never crash with a RangeError', async () => {
 		// A malicious cohort replies `promoted` naming a targetTier that is a non-integer, negative, or above
 		// the substrate walk-depth ceiling (DEFAULT_D_MAX_CAP = 60). Left unchecked it reaches
 		// addressing.coord() → coordD, which throws a raw RangeError out of register()/lookup(). The walk must
 		// instead surface a clean retry_later. Cover BOTH followPromoted modes (the self-driven caller surface
-		// and the internal follow) since the guard sits before both adoption sites.
+		// and the internal follow) since the guard sits before both adoption sites. `61` pins the exact
+		// ceiling+1 boundary (the coarse `300` case does not localize it).
 		const self = bytes('bad-target-participant');
 		for (const followPromoted of [true, false]) {
-			for (const targetTier of [2.5, -1, 300]) {
+			for (const targetTier of [2.5, -1, 61, 300]) {
 				const router = new ScriptedRouter([{ v: 1, result: 'promoted', targetTier }]);
 				const engine = createWalkEngine({
 					router, addressing, dmax: fixedDMax(1), self, factory: factoryFor(self),

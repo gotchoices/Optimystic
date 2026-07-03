@@ -287,8 +287,9 @@ export function validateRegisterReplyV1(value: unknown): RegisterReplyV1 {
 	assignDefined(out, "backups", optStringArray(obj, "backups", what));
 	const cohortEpoch = optString(obj, "cohortEpoch", what);
 	if (cohortEpoch !== undefined) {
-		// NOTE: cohortEpoch is NOT length-pinned — `test/reactivity/subscriber.spec.ts` feeds a 1-byte
-		// synthetic epoch, so an epoch is not reliably 32 bytes across current paths. See b64urlField's note.
+		// NOTE: cohortEpoch is NOT length-pinned though real epochs are a 32-byte SHA-256 — several
+		// test fixtures (db-core reactivity + db-p2p) feed 1-byte synthetic epochs. Pinning is tracked
+		// by debt-cohort-topic-pin-cohort-epoch. See b64urlField's note.
 		out.cohortEpoch = b64urlField(cohortEpoch, "cohortEpoch", what);
 	}
 	assignDefined(out, "cohortMembers", optStringArray(obj, "cohortMembers", what));
@@ -333,8 +334,8 @@ export function validateRenewReplyV1(value: unknown): RenewReplyV1 {
 	assignDefined(out, "newBackups", optStringArray(obj, "newBackups", what));
 	const cohortEpoch = optString(obj, "cohortEpoch", what);
 	if (cohortEpoch !== undefined) {
-		// NOTE: cohortEpoch is NOT length-pinned — `test/reactivity/subscriber.spec.ts` feeds a 1-byte
-		// synthetic epoch, so an epoch is not reliably 32 bytes across current paths. See b64urlField's note.
+		// NOTE: cohortEpoch is NOT length-pinned — see validateRegisterReplyV1's note and
+		// debt-cohort-topic-pin-cohort-epoch.
 		out.cohortEpoch = b64urlField(cohortEpoch, "cohortEpoch", what);
 	}
 	return out;
@@ -412,7 +413,7 @@ export function validateChildLinkV1(value: unknown, minSigs?: number): ChildLink
 		effectiveAt: reqFiniteNumber(obj, "effectiveAt", what),
 		thresholdSig,
 		signers,
-		cohortEpoch: b64urlFixedLen(reqString(obj, "cohortEpoch", what), "cohortEpoch", COORD_BYTES, what),
+		cohortEpoch: b64urlField(reqString(obj, "cohortEpoch", what), "cohortEpoch", what),
 	};
 }
 
@@ -626,7 +627,8 @@ function validateRotationAttestation(obj: Record<string, unknown>, out: Membersh
 	if (presentCount !== 3) {
 		fail(`${what}: rotation attestation requires all of prevEpoch, rotationSig, rotationSigners — or none`);
 	}
-	// prevEpoch is a prior cohortEpoch, so it inherits cohortEpoch's leniency (see the b64urlField note).
+	// prevEpoch is a prior cohortEpoch, so it inherits cohortEpoch's leniency (see the b64urlField note
+	// and debt-cohort-topic-pin-cohort-epoch).
 	out.prevEpoch = b64urlField(prevEpoch!, "prevEpoch", what);
 	out.rotationSig = b64urlField(rotationSig!, "rotationSig", what);
 	out.rotationSigners = rotationSigners!;

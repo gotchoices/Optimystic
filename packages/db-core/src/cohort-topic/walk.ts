@@ -257,7 +257,13 @@ class RouterWalkEngine implements WalkEngine {
 					// untrusted: an out-of-range value would reach `coord()` → `coordD` and throw a raw RangeError,
 					// an unclassified crash out of register()/lookup() rather than a clean outcome. Bound it before
 					// BOTH adoption sites (the followPromoted-false surface below and the `d = targetTier` hop) and
-					// back off in time instead. The `d + 1` fallback is always in range (`d` is walk-bounded).
+					// back off in time instead. Only the EXPLICIT attacker value is the hazard; the `d + 1`
+					// fallback is left unchecked because `d` is walk-bounded to `dMax + maxSteps` (≈190 under the
+					// default `maxSteps`), comfortably under coordD's 255 range.
+					// NOTE: `maxSteps` is operator-configurable — a value above ~195 plus an adversarial chain of
+					// no-`targetTier` `promoted` replies (each bumps `d` by +1) could push the `d + 1` fallback
+					// past coordD's range and reintroduce the RangeError. If maxSteps is ever raised that high,
+					// bound the fallback here too.
 					if (reply.targetTier !== undefined && !isValidTreeTier(targetTier)) {
 						return { kind: "retry_later", afterMs: backoffRetryMs(0) };
 					}
