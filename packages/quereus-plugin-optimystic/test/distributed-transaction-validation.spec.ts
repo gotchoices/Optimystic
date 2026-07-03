@@ -250,7 +250,7 @@ describe('Distributed Transaction Validation', function () {
 		console.log('✅ StampId replicated to all nodes');
 	});
 
-	it.skip('should coordinate multi-collection transactions (table + index)', async () => {
+	it('should coordinate multi-collection transactions (table + index)', async () => {
 		const tableName = 'indexed_orders_' + Date.now();
 		const collectionUri = `tree://test/${tableName}`;
 
