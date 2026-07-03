@@ -13,6 +13,57 @@ import type { Row, SqlValue } from '@quereus/quereus';
 import type { StoredTableSchema, StoredIndexSchema } from './schema-manager.js';
 
 /**
+ * Serialize a single value for use in a secondary-index key.
+ *
+ * MUST be type-insensitive for numeric equality: an INSERT keys off the raw Quereus
+ * row while a later UPDATE/DELETE re-keys off the DECODED stored row, and those two
+ * can disagree on JS type for the same logical integer. RowCodec normalizes a small
+ * `bigint` to `Number` on encode and decodes it back as `number`, so a value staged
+ * as `5n` reappears as `5`. Both branches therefore unify onto the SAME
+ * `toExponential(15)` form so `5n` and `5` produce a byte-identical key — otherwise
+ * the delete-of-old-key misses and a stale index entry orphans, and an index seek
+ * whose argument arrives with the other type misses valid rows.
+ *
+ * (As of the pinned @quereus/quereus, integer literals reach this function as
+ * `number` on every path, so the mismatch is latent rather than live — but any
+ * `bigint` input, e.g. a bound BigInt parameter or a future Quereus that emits
+ * integer literals as bigint, would trip it. The unify keeps it correct either way.)
+ *
+ * Do NOT canonicalize via RowCodec.normalizeValue first: it maps large bigints to a
+ * tagged `{ $bigint }` object, which has no branch here and collapses to
+ * `"[object Object]"` — merging every large integer into one key. And do NOT emit a
+ * plain integer string: range bounds against REAL columns rely on the lexicographic
+ * `toExponential` form (a plain "20" sorts wrong against a stored "2.999…e+1").
+ *
+ * NOTE: `Number(bigint).toExponential(15)` is lossy for integers beyond
+ * Number.MAX_SAFE_INTEGER — the same precision ceiling REAL columns already have. It
+ * stays self-consistent (insert and the decoded old row round-trip to the same lossy
+ * string, so no orphan), but two distinct huge integers can collide into one key.
+ */
+export function serializeIndexValue(value: SqlValue): string {
+	if (value === null || value === undefined) {
+		return '\x01'; // Special marker for NULL
+	}
+	if (typeof value === 'string') {
+		return value;
+	}
+	// Unify bigint onto the number branch so 5n and 5 serialize identically.
+	if (typeof value === 'bigint') {
+		return Number(value).toExponential(15);
+	}
+	if (typeof value === 'number') {
+		// Pad numbers for lexicographic sorting via fixed-precision scientific notation
+		return value.toExponential(15);
+	}
+	if (value instanceof Uint8Array) {
+		// Convert to base64 for string representation
+		return btoa(String.fromCharCode(...value));
+	}
+	// Fallback
+	return String(value);
+}
+
+/**
  * Index key format: composite of indexed column values joined with separator
  */
 export type IndexKey = string;
@@ -80,7 +131,7 @@ export class IndexManager {
 
 		for (const indexCol of indexSchema.columns) {
 			const value = row[indexCol.index];
-			const stringValue = this.serializeValue(value ?? null);
+			const stringValue = serializeIndexValue(value ?? null);
 			keyParts.push(stringValue);
 		}
 
@@ -277,32 +328,6 @@ export class IndexManager {
 	 */
 	getIndexSchema(indexName: string): StoredIndexSchema | undefined {
 		return this.schema.indexes.find(idx => idx.name === indexName);
-	}
-
-	/**
-	 * Serialize a value for use in index key
-	 */
-	private serializeValue(value: SqlValue): string {
-		if (value === null || value === undefined) {
-			return '\x01'; // Special marker for NULL
-		}
-		if (typeof value === 'string') {
-			return value;
-		}
-		if (typeof value === 'number') {
-			// Pad numbers for lexicographic sorting
-			// Use scientific notation with fixed precision
-			return value.toExponential(15);
-		}
-		if (typeof value === 'bigint') {
-			return value.toString();
-		}
-		if (value instanceof Uint8Array) {
-			// Convert to base64 for string representation
-			return btoa(String.fromCharCode(...value));
-		}
-		// Fallback
-		return String(value);
 	}
 }
 

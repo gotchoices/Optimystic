@@ -403,5 +403,54 @@ describe('Optimystic Index Support', () => {
 			expect(keys, "row 2's b\\x002 entry removed").to.not.include('b\x002');
 			expect(keys, "row 2's new z\\x002 entry present").to.include('z\x002');
 		});
+
+		it('UPDATE/DELETE on an INTEGER-typed indexed column leaves no orphan and seeks correctly', async () => {
+			// Black-box guard for the numeric-index path (all prior orphan tests use a
+			// TEXT column and never exercise it). NOTE: with the installed @quereus/quereus,
+			// integer literals arrive as JS `number` on BOTH the insert and the
+			// update/delete side, so this does NOT by itself reproduce the bigint-vs-number
+			// serializer mismatch — the direct reproduction is in
+			// index-serialize-value.spec.ts. This test guarantees end-to-end correctness of
+			// the unified serializer for integer columns and would also catch a regression
+			// if a future Quereus ever emitted integer literals as bigint.
+			await db.exec(`
+				CREATE TABLE orphan_int (
+					id INTEGER PRIMARY KEY,
+					n INTEGER
+				) USING optimystic('tree://test/orphan_int')
+			`);
+			await db.exec(`CREATE INDEX idx_orphan_int_n ON orphan_int(n)`);
+
+			await db.exec(`INSERT INTO orphan_int (id, n) VALUES (1, 10), (2, 20), (3, 30)`);
+
+			// Move row 2's indexed integer from 20 -> 25, and delete row 3 (n=30).
+			await db.exec(`UPDATE orphan_int SET n = 25 WHERE id = 2`);
+			await db.exec(`DELETE FROM orphan_int WHERE id = 3`);
+
+			// Index tree must hold exactly the live composite keys: 10/1, 25/2.
+			// Old 20/2 and deleted 30/3 keys must be gone.
+			const keys = await scanIndexKeys(plugin, 'tree://test/orphan_int/index/idx_orphan_int_n');
+			expect(keys.length, 'index entry count after INTEGER UPDATE+DELETE').to.equal(2);
+			const key20 = `${(20).toExponential(15)}\x00`;
+			const key30 = `${(30).toExponential(15)}\x00`;
+			const key25 = `${(25).toExponential(15)}\x00`;
+			const key10 = `${(10).toExponential(15)}\x00`;
+			expect(keys.some(k => k.startsWith(key20)), 'stale old n=20 entry is absent').to.be.false;
+			expect(keys.some(k => k.startsWith(key30)), 'deleted n=30 entry is absent').to.be.false;
+			expect(keys.some(k => k.startsWith(key10)), 'live n=10 entry present').to.be.true;
+			expect(keys.some(k => k.startsWith(key25)), 'moved n=25 entry present').to.be.true;
+
+			// Seek side: equality query must find exactly the live matching rows.
+			const at25 = await collectRows(db.eval('SELECT * FROM orphan_int WHERE n = 25'));
+			expect(at25, 'seek n=25 returns exactly the moved row').to.have.lengthOf(1);
+			expect(at25[0]!.id).to.equal(2);
+
+			const at20 = await collectRows(db.eval('SELECT * FROM orphan_int WHERE n = 20'));
+			expect(at20, 'seek old n=20 returns nothing (row moved)').to.have.lengthOf(0);
+
+			const at10 = await collectRows(db.eval('SELECT * FROM orphan_int WHERE n = 10'));
+			expect(at10, 'seek n=10 returns the untouched row').to.have.lengthOf(1);
+			expect(at10[0]!.id).to.equal(1);
+		});
 	});
 });

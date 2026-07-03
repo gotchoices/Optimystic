@@ -21,7 +21,7 @@ import type { StoredTableSchema } from './schema/schema-manager.js';
 import { RowCodec, type EncodedRow } from './schema/row-codec.js';
 import { SqlDataType } from '@quereus/quereus';
 import { INTEGER_TYPE, REAL_TYPE, TEXT_TYPE, BLOB_TYPE, NUMERIC_TYPE, NULL_TYPE, BOOLEAN_TYPE, type LogicalType } from '@quereus/quereus';
-import { IndexManager, type IndexEntry } from './schema/index-manager.js';
+import { IndexManager, serializeIndexValue, type IndexEntry } from './schema/index-manager.js';
 import { StatisticsCollector } from './schema/statistics-collector.js';
 import { createLogger } from './logger.js';
 
@@ -637,7 +637,7 @@ export class OptimysticVirtualTable extends VirtualTable {
     const indexKeyParts: string[] = [];
     for (let i = 0; i < args.length && i < indexSchema.columns.length; i++) {
       const value = args[i];
-      indexKeyParts.push(this.serializeValueForIndex(value));
+      indexKeyParts.push(serializeIndexValue(value as SqlValue));
     }
 
     const indexKey = indexKeyParts.join('\x00');
@@ -657,28 +657,6 @@ export class OptimysticVirtualTable extends VirtualTable {
         yield row;
       }
     }
-  }
-
-  /**
-   * Serialize a value for use in index key (helper for executeIndexScan)
-   */
-  private serializeValueForIndex(value: unknown): string {
-    if (value === null || value === undefined) {
-      return '\x01'; // Special marker for NULL
-    }
-    if (typeof value === 'string') {
-      return value;
-    }
-    if (typeof value === 'number') {
-      return value.toExponential(15);
-    }
-    if (typeof value === 'bigint') {
-      return value.toString();
-    }
-    if (value instanceof Uint8Array) {
-      return btoa(String.fromCharCode(...value));
-    }
-    return String(value);
   }
 
   /**
@@ -809,10 +787,10 @@ export class OptimysticVirtualTable extends VirtualTable {
   }
 
   /** Serialized composite key for a set of column indices, using the SAME per-value
-   *  encoding the secondary-index layer keys on (see {@link serializeValueForIndex}),
+   *  encoding the secondary-index layer keys on (see {@link serializeIndexValue}),
    *  so a uniqueness comparison agrees byte-for-byte with how the index would key it. */
   private uniqueKeyFor(columns: readonly number[], row: Row): string {
-    return columns.map(ci => this.serializeValueForIndex(row[ci])).join('\x00');
+    return columns.map(ci => serializeIndexValue(row[ci] ?? null)).join('\x00');
   }
 
   /**
