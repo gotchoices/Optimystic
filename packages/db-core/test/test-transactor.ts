@@ -408,6 +408,41 @@ export class TestTransactor implements ITransactor {
 	queryClusterNominees?: (blockId: BlockId) => Promise<ClusterNomineesResult>;
 }
 
+/**
+ * Wraps a {@link TestTransactor} and forces its commit phase to fail a bounded (or unbounded)
+ * number of times before delegating, so tests can exercise the sync retry / backoff / give-up
+ * path deterministically. pend/get/getStatus/cancel delegate unchanged, so the pend→commit→cancel
+ * round-trip runs exactly as in production.
+ */
+export class FlakyCommitTransactor implements ITransactor {
+	/** Number of commit() calls observed so far (across success and forced failure). */
+	commitAttempts = 0;
+
+	/**
+	 * @param inner delegate transactor
+	 * @param failFirstN number of initial commit() calls to fail; Infinity to always fail
+	 * @param reason the StaleFailure.reason returned on a forced failure
+	 */
+	constructor(
+		private readonly inner: TestTransactor,
+		private readonly failFirstN: number,
+		private readonly reason = 'forced stale',
+	) {}
+
+	get(b: BlockGets): Promise<GetBlockResults> { return this.inner.get(b); }
+	getStatus(a: ActionBlocks[]): Promise<BlockActionStatus[]> { return this.inner.getStatus(a); }
+	pend(r: PendRequest): Promise<PendResult> { return this.inner.pend(r); }
+	cancel(a: ActionBlocks): Promise<void> { return this.inner.cancel(a); }
+
+	async commit(request: CommitRequest): Promise<CommitResult> {
+		this.commitAttempts++;
+		if (this.commitAttempts <= this.failFirstN) {
+			return { success: false, reason: this.reason };
+		}
+		return this.inner.commit(request);
+	}
+}
+
 function newBlockState(): BlockState {
 	return {
 		materializedBlocks: new Map(),

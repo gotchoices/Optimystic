@@ -1,12 +1,18 @@
 import type { IBlock, Action, ActionType, ActionHandler, BlockId, ITransactor, BlockStore, Transforms } from "../index.js";
 import { Log, Atomic, Tracker, copyTransforms, CacheSource, isTransformsEmpty, TransactorSource } from "../index.js";
-import type { CollectionHeaderBlock, CollectionId, ICollection } from "./index.js";
+import type { CollectionHeaderBlock, CollectionId, ICollection, SyncOptions } from "./index.js";
+import { SyncRetryExhaustedError } from "./index.js";
 import type { ReadDependency } from "../transaction/transaction.js";
 import { randomBytes } from '@noble/hashes/utils.js';
 import { toString as uint8ArrayToString } from 'uint8arrays/to-string';
 import { Latches } from "../utility/latches.js";
 
+/** Default base backoff (and historical fixed delay) between sync retries, in ms. */
 const PendingRetryDelayMs = 100;
+/** Default max consecutive no-progress stale-failure retries before {@link Collection.sync} gives up. */
+const DefaultMaxAttempts = 10;
+/** Default ceiling on a single exponential-backoff sleep, in ms. */
+const DefaultMaxBackoffMs = 5000;
 
 export type CollectionInitOptions<TAction> = {
 	modules: Record<ActionType, ActionHandler<TAction>>;
@@ -241,20 +247,41 @@ export class Collection<TAction> implements ICollection<TAction> {
 	}
 
 	/** Push our pending actions to the transactor */
-	async sync() {
+	async sync(options?: SyncOptions) {
 		const release = await Latches.acquire(this.latchId);
 		try {
-			await this.syncInternal();
+			await this.syncInternal(options);
 		} finally {
 			release();
 		}
 	}
 
-	private async syncInternal() {
+	private async syncInternal(options?: SyncOptions) {
 		const bytes = randomBytes(16);
 		const actionId = uint8ArrayToString(bytes, 'base64url');
 
+		const maxAttempts = options?.maxAttempts ?? DefaultMaxAttempts;
+		const baseBackoffMs = options?.baseBackoffMs ?? PendingRetryDelayMs;
+		const maxBackoffMs = options?.maxBackoffMs ?? DefaultMaxBackoffMs;
+		const deadlineMs = options?.deadlineMs;
+		const signal = options?.signal;
+		const startedAt = Date.now();
+
+		// Count of consecutive stale failures that made no forward progress. Reset to 0 on every
+		// successful transact, so the cap bounds only a persistently-failing sync — a legitimate
+		// large multi-batch sync (which iterates many times committing progress) never trips it.
+		let consecutiveFailures = 0;
+		let lastReason: string | undefined;
+
 		while (this.pending.length || !isTransformsEmpty(this.tracker.transforms)) {
+			if (signal?.aborted) {
+				throw makeAbortError(signal);
+			}
+			// Progress-agnostic ceiling: give up if the wall-clock deadline passed.
+			if (deadlineMs !== undefined && Date.now() - startedAt >= deadlineMs) {
+				throw new SyncRetryExhaustedError(this.id, consecutiveFailures, lastReason ?? 'deadline exceeded');
+			}
+
 			// Snapshot the pending actions so that any new actions aren't assumed to be part of this action
 			const pending = [...this.pending];
 
@@ -273,13 +300,28 @@ export class Collection<TAction> implements ICollection<TAction> {
 			// Commit the action to the transactor
 			const staleFailure = await this.source.transact(tracker.transforms, actionId, newRev, this.id, addResult.tailPath.block.header.id);
 			if (staleFailure) {
-				if (staleFailure.pending) {
-					// Wait for short time to allow the pending actions to commit (bounded backoff)
-					await new Promise(resolve => setTimeout(resolve, PendingRetryDelayMs));
+				consecutiveFailures++;
+				lastReason = staleFailure.reason ?? lastReason;
+				// Give up once the consecutive no-progress budget is exhausted, so a transactor that
+				// persistently rejects the sync can no longer hold the collection latch forever.
+				if (consecutiveFailures >= maxAttempts) {
+					throw new SyncRetryExhaustedError(this.id, consecutiveFailures, lastReason);
 				}
+				// Back off before every retry (any stale failure — reason/missing/pending), growing
+				// exponentially from the base delay up to the cap. The abortable sleep lets an aborted
+				// sync reject promptly instead of finishing the sleep.
+				// NOTE: the `missing`/`reason` conflict paths now pay this backoff too (they previously
+				// retried with zero delay); that is what stops the persistent-`reason` hot spin. If a
+				// high-contention workload ever shows this base delay as recovery latency, lower
+				// baseBackoffMs for that caller rather than reintroducing the zero-delay retry.
+				const delay = Math.min(baseBackoffMs * 2 ** (consecutiveFailures - 1), maxBackoffMs);
+				await this.backoffSleep(delay, signal);
 				// Fetch latest state - updateInternal() will call replayActions() if there are conflicts
 				await this.updateInternal();
 			} else {
+				// Forward progress: reset the no-progress budget.
+				consecutiveFailures = 0;
+				lastReason = undefined;
 				// Clear the pending actions that were part of this action
 				this.pending = this.pending.slice(pending.length);
 				// Reset cache and replay any actions that were added during the action
@@ -293,11 +335,30 @@ export class Collection<TAction> implements ICollection<TAction> {
 		}
 	}
 
-	async updateAndSync() {
+	/** Sleep for {@link ms}, resolving early (rejecting with an AbortError) if {@link signal} aborts. */
+	private backoffSleep(ms: number, signal?: AbortSignal): Promise<void> {
+		return new Promise<void>((resolve, reject) => {
+			if (signal?.aborted) {
+				reject(makeAbortError(signal));
+				return;
+			}
+			const onAbort = () => {
+				clearTimeout(timer);
+				reject(makeAbortError(signal!));
+			};
+			const timer = setTimeout(() => {
+				signal?.removeEventListener('abort', onAbort);
+				resolve();
+			}, ms);
+			signal?.addEventListener('abort', onAbort, { once: true });
+		});
+	}
+
+	async updateAndSync(options?: SyncOptions) {
 		const release = await Latches.acquire(this.latchId);
 		try {
 			await this.updateInternal();
-			await this.syncInternal();
+			await this.syncInternal(options);
 		} finally {
 			release();
 		}
@@ -364,4 +425,15 @@ export class Collection<TAction> implements ICollection<TAction> {
 			}
 		}
 	}
+}
+
+/** Build an AbortError for a cooperatively-aborted sync. Prefers the signal's own reason when it is
+ * an Error (so callers who passed a custom abort reason see it), otherwise a name='AbortError' Error. */
+function makeAbortError(signal?: AbortSignal): Error {
+	if (signal && signal.reason instanceof Error) {
+		return signal.reason;
+	}
+	const err = new Error('The sync operation was aborted');
+	err.name = 'AbortError';
+	return err;
 }

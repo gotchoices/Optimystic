@@ -1,8 +1,8 @@
 import { use, expect } from 'chai'
 import chaiAsPromised from 'chai-as-promised'
 use(chaiAsPromised)
-import { Collection, type CollectionInitOptions } from '../src/collection/index.js'
-import { TestTransactor } from './test-transactor.js'
+import { Collection, SyncRetryExhaustedError, type CollectionInitOptions } from '../src/collection/index.js'
+import { TestTransactor, FlakyCommitTransactor } from './test-transactor.js'
 import type { Action, ActionHandler, BlockStore, IBlock, ITransactor, BlockGets, GetBlockResults, ActionBlocks, BlockActionStatus, PendRequest, PendResult, CommitRequest, CommitResult } from '../src/index.js'
 
 interface TestAction {
@@ -756,6 +756,107 @@ describe('Collection', () => {
         actions.push(a)
       }
       expect(actions).to.have.lengthOf(1)
+    })
+  })
+
+  // Bounded sync retry (collection-sync-infinite-retry)
+  describe('bounded sync retry', () => {
+    it('should give up with SyncRetryExhaustedError after maxAttempts consecutive stale failures', async () => {
+      // A transactor whose commit ALWAYS fails would spin sync() forever before the fix.
+      const inner = new TestTransactor()
+      const flaky = new FlakyCommitTransactor(inner, Infinity, 'always stale')
+      const collection = await Collection.createOrOpen<TestAction>(flaky, collectionId, initOptions)
+
+      await collection.act({ type: 'set', data: { value: 'never-commits', timestamp: 1 } })
+
+      const maxAttempts = 3
+      const syncPromise = collection.sync({ maxAttempts, baseBackoffMs: 1, maxBackoffMs: 5 })
+      syncPromise.catch(() => { /* asserted below - avoid unhandled rejection */ })
+
+      await expect(syncPromise).to.be.rejectedWith(SyncRetryExhaustedError)
+      const err = await syncPromise.catch(e => e) as SyncRetryExhaustedError
+      expect(err.collectionId).to.equal(collectionId)
+      expect(err.attempts).to.equal(maxAttempts)
+      expect(err.lastReason).to.equal('always stale')
+
+      // Bounded: the transactor saw exactly maxAttempts commit attempts, not an unbounded number.
+      expect(flaky.commitAttempts).to.equal(maxAttempts)
+
+      // Latch was released by sync()'s finally — a subsequent latched op must not hang.
+      await collection.update()
+    })
+
+    it('should reject promptly with an AbortError when the signal aborts mid-retry', async () => {
+      const inner = new TestTransactor()
+      const flaky = new FlakyCommitTransactor(inner, Infinity)
+      const collection = await Collection.createOrOpen<TestAction>(flaky, collectionId, initOptions)
+
+      await collection.act({ type: 'set', data: { value: 'aborted', timestamp: 1 } })
+
+      const controller = new AbortController()
+      // Large backoff + high attempt budget: without abort this would sit in the backoff sleep.
+      const syncPromise = collection.sync({
+        signal: controller.signal,
+        maxAttempts: 1000,
+        baseBackoffMs: 60_000,
+        maxBackoffMs: 60_000,
+      })
+      syncPromise.catch(() => { /* asserted below */ })
+
+      // Let sync reach the (long) backoff sleep, then abort.
+      await new Promise(resolve => setTimeout(resolve, 25))
+      controller.abort()
+
+      const err = await syncPromise.catch(e => e) as Error
+      expect(err).to.be.instanceOf(Error)
+      expect(err).to.not.be.instanceOf(SyncRetryExhaustedError)
+      expect(err.name).to.equal('AbortError')
+
+      // Latch released despite the abort.
+      await collection.update()
+    })
+
+    it('should recover from transient stale failures within the attempt budget', async () => {
+      // Fails the first two commits, then delegates — proves the counter resets on progress and
+      // that a transient failure recovers rather than exhausting a modest budget.
+      const inner = new TestTransactor()
+      const flaky = new FlakyCommitTransactor(inner, 2)
+      const collection = await Collection.createOrOpen<TestAction>(flaky, collectionId, initOptions)
+
+      await collection.act({ type: 'set', data: { value: 'eventually-commits', timestamp: 1 } })
+      await collection.sync({ maxAttempts: 5, baseBackoffMs: 1, maxBackoffMs: 5 })
+
+      const actions: Action<TestAction>[] = []
+      for await (const a of collection.selectLog()) {
+        actions.push(a)
+      }
+      expect(actions).to.have.lengthOf(1)
+      expect(actions[0]?.data.value).to.equal('eventually-commits')
+    })
+
+    it('should complete a healthy multi-batch sync under a tiny maxAttempts (cap is on consecutive failures)', async () => {
+      // A naive "max N loop iterations" cap would trip on a large sync; the real cap counts only
+      // consecutive no-progress failures, so a healthy multi-batch sync passes with maxAttempts: 2.
+      const collection = await Collection.createOrOpen<TestAction>(transactor, collectionId, initOptions)
+
+      const actionCount = 100
+      const actions: Action<TestAction>[] = Array(actionCount).fill(0).map((_, i) => ({
+        type: 'set',
+        data: { value: `value ${i + 1}`, timestamp: Date.now() + i }
+      }))
+
+      const batchSize = 10
+      for (let i = 0; i < actions.length; i += batchSize) {
+        await collection.act(...actions.slice(i, i + batchSize))
+        await collection.updateAndSync({ maxAttempts: 2, baseBackoffMs: 1 })
+      }
+
+      const logActions: Action<TestAction>[] = []
+      for await (const a of collection.selectLog()) {
+        logActions.push(a)
+      }
+      expect(logActions).to.have.lengthOf(actionCount)
+      expect(logActions.map(a => a.data.value)).to.deep.equal(actions.map(a => a.data.value))
     })
   })
 })
