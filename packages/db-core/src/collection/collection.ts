@@ -304,6 +304,10 @@ export class Collection<TAction> implements ICollection<TAction> {
 				lastReason = staleFailure.reason ?? lastReason;
 				// Give up once the consecutive no-progress budget is exhausted, so a transactor that
 				// persistently rejects the sync can no longer hold the collection latch forever.
+				// NOTE: this also bounds the legitimate `pending`-wait case (retrying the same action
+				// while another commit is in flight), which used to retry indefinitely. Default 10
+				// attempts ≈ 21s of exponential backoff. If a high-contention workload legitimately
+				// needs to wait longer for a pending commit to clear, raise maxAttempts for that caller.
 				if (consecutiveFailures >= maxAttempts) {
 					throw new SyncRetryExhaustedError(this.id, consecutiveFailures, lastReason);
 				}

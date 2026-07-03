@@ -834,6 +834,35 @@ describe('Collection', () => {
       expect(actions[0]?.data.value).to.equal('eventually-commits')
     })
 
+    it('should give up with SyncRetryExhaustedError when the wall-clock deadline is exceeded', async () => {
+      // Always-fail transactor with a fast backoff and a huge attempt budget: the ONLY thing that
+      // can stop this loop is the deadline, so reaching SyncRetryExhaustedError proves deadlineMs works
+      // independently of maxAttempts.
+      const inner = new TestTransactor()
+      const flaky = new FlakyCommitTransactor(inner, Infinity, 'deadline test stale')
+      const collection = await Collection.createOrOpen<TestAction>(flaky, collectionId, initOptions)
+
+      await collection.act({ type: 'set', data: { value: 'deadline', timestamp: 1 } })
+
+      const syncPromise = collection.sync({
+        deadlineMs: 30,
+        maxAttempts: 1_000_000, // effectively unreachable within the deadline window
+        baseBackoffMs: 1,
+        maxBackoffMs: 1,
+      })
+      syncPromise.catch(() => { /* asserted below */ })
+
+      const err = await syncPromise.catch(e => e) as SyncRetryExhaustedError
+      expect(err).to.be.instanceOf(SyncRetryExhaustedError)
+      expect(err.collectionId).to.equal(collectionId)
+      // Stopped by the deadline, not the (unreachable) attempt cap.
+      expect(err.attempts).to.be.lessThan(1_000_000)
+      expect(flaky.commitAttempts).to.be.lessThan(1_000_000)
+
+      // Latch released by sync()'s finally.
+      await collection.update()
+    })
+
     it('should complete a healthy multi-batch sync under a tiny maxAttempts (cap is on consecutive failures)', async () => {
       // A naive "max N loop iterations" cap would trip on a large sync; the real cap counts only
       // consecutive no-progress failures, so a healthy multi-batch sync passes with maxAttempts: 2.

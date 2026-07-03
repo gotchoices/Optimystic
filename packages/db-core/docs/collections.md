@@ -197,15 +197,23 @@ async sync() {
       );
 
       if (staleFailure) {
-        // 5a. Stale failure - remote state has changed
-        if (staleFailure.pending) {
-          // Wait for pending transactions to complete
-          await new Promise(resolve => setTimeout(resolve, PendingRetryDelayMs));
+        // 5a. Stale failure - remote state has changed.
+        // Bound the retry so a transactor that persistently rejects the sync cannot hold the
+        // collection latch forever. consecutiveFailures counts *no-progress* failures and resets
+        // to 0 on every success (5b), so a legitimate large multi-batch sync is never tripped.
+        consecutiveFailures++;
+        if (consecutiveFailures >= maxAttempts) {
+          throw new SyncRetryExhaustedError(this.id, consecutiveFailures, staleFailure.reason);
         }
+        // Exponential backoff before every retry (any stale failure — reason/missing/pending),
+        // abortable via an optional signal and capped by an optional wall-clock deadline.
+        await this.backoffSleep(
+          Math.min(baseBackoffMs * 2 ** (consecutiveFailures - 1), maxBackoffMs), signal);
         // Refresh snapshot and retry
         await this.update();
       } else {
-        // 5b. Success - update local state
+        // 5b. Success - reset the no-progress budget and update local state
+        consecutiveFailures = 0;
         this.pending = this.pending.slice(pending.length);
         const transforms = tracker.reset();
         await this.replayActions();
@@ -227,7 +235,11 @@ Key aspects of the sync process:
 - **Atomic batching**: Groups multiple actions into a single transaction
 - **Optimistic concurrency**: Assumes success but handles failures gracefully
 - **Stale detection**: Retries when remote state has changed during sync
-- **Pending management**: Waits for conflicting transactions to complete
+- **Bounded retry**: A persistent stale failure gives up after `maxAttempts` consecutive no-progress
+  attempts (default 10), throwing `SyncRetryExhaustedError` instead of spinning the latch forever.
+  Configure via `SyncOptions` (`maxAttempts`, `deadlineMs`, `baseBackoffMs`, `maxBackoffMs`, `signal`)
+  passed to `sync()` / `updateAndSync()`.
+- **Pending management**: Waits (with exponential backoff) for conflicting transactions to complete
 - **State consistency**: Maintains proper revision tracking and cache coherence
 
 ## Conflict Resolution
