@@ -71,7 +71,7 @@ const transactor = new NetworkTransactor({
 });
 ```
 
-For tests, `TestTransactor` from `@optimystic/db-core/test-transactor.js` runs everything in-process with no network.
+For tests, `TestTransactor` from `@optimystic/db-core/test` runs everything in-process with no network.
 
 ### Open a collection
 
