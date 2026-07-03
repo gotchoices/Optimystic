@@ -272,7 +272,8 @@ export type MatchAppPayloadV1 = ProviderAppPayloadV1 | SeekerAppPayloadV1;
 /**
  * Decode an opaque `RegisterV1.appPayload` to whichever matchmaking payload it carries, dispatched on
  * `kind` (parsed once — no exception-as-control-flow). The cohort query handler uses this to classify a
- * registration record into a provider vs. seeker entry. Throws {@link CohortWireError} on an unknown
+ * registration record into a provider vs. seeker entry. Throws
+ * {@link import("../cohort-topic/wire/primitives.js").CohortWireError} on an unknown
  * `kind` or a malformed payload.
  */
 export function decodeMatchAppPayload(bytes: Uint8Array, maxBytes: number = DEFAULT_MAX_APP_PAYLOAD_BYTES): MatchAppPayloadV1 {
