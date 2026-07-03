@@ -917,6 +917,10 @@ export class OptimysticVirtualTable extends VirtualTable {
     // Await so recording lands in the session's statement array BEFORE any
     // collection.stage below (deterministic snapshot timing) and so a recording
     // failure aborts this DML instead of committing a record missing a statement.
+    // NOTE: this await must stay ABOVE every collection.stage in this method. The
+    // first addStatement per transaction is what makes coordinator.applyActions
+    // snapshot pre-stage tracker state for rollback; reordering a stage above it
+    // reopens the non-deterministic-snapshot race and breaks session-mode rollback.
     if (mutationStatement) {
       await this.txnBridge.addStatement(mutationStatement);
     }
