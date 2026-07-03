@@ -229,7 +229,7 @@ describe('Transform functionality', () => {
       expect(merged.deletes!.filter(id => id === sharedId)).to.have.lengthOf(2)
     })
 
-    it('should ignore Tracker insert when source already has block with same ID (BUG: silent shadow)', async () => {
+    it('should return Tracker insert when source already has block with same ID (insert takes precedence)', async () => {
       const sourceBlock: TestBlock = {
         header: { id: sharedId, type: 'test', collectionId: 'c' },
         data: 'from-source', items: ['original']
@@ -251,10 +251,34 @@ describe('Transform functionality', () => {
       // The insert IS stored in transforms
       expect(tracker.transforms.inserts![sharedId]).to.exist
 
-      // BUG: tryGet returns the SOURCE block, not the inserted block
+      // Insert takes precedence over source
       const result = await tracker.tryGet(sharedId) as TestBlock
-      expect(result.data).to.equal('from-source')
-      expect(result.data).to.not.equal('from-insert')
+      expect(result.data).to.equal('from-insert')
+    })
+
+    it('should return reinserted block after delete-then-reinsert in same transaction', async () => {
+      const sourceBlock: TestBlock = {
+        header: { id: sharedId, type: 'test', collectionId: 'c' },
+        data: 'from-source', items: ['original']
+      }
+      const reinsertedBlock: TestBlock = {
+        header: { id: sharedId, type: 'test', collectionId: 'c' },
+        data: 'reinserted', items: ['new']
+      }
+
+      const source: BlockSource<TestBlock> = {
+        tryGet: async (id: BlockId) => id === sharedId ? structuredClone(sourceBlock) : undefined,
+        generateId: () => 'gen' as BlockId,
+        createBlockHeader: (type: BlockType) => ({ id: 'gen' as BlockId, type, collectionId: 'c' as BlockId })
+      }
+
+      const tracker = new Tracker(source)
+      tracker.delete(sharedId)
+      tracker.insert(reinsertedBlock)
+
+      const result = await tracker.tryGet(sharedId) as TestBlock
+      expect(result).to.exist
+      expect(result.data).to.equal('reinserted')
     })
 
     it('should leave block in deletes after double-delete then re-insert (BUG: phantom delete)', async () => {

@@ -12,17 +12,17 @@ export class Tracker<T extends IBlock> implements IBlockStore<T> {
 	) { }
 
 	async tryGet(id: BlockId): Promise<T | undefined> {
+		if (this.transforms.inserts && Object.hasOwn(this.transforms.inserts, id)) {
+			return structuredClone(this.transforms.inserts[id]) as T;
+		}
+		if (this.transforms.deletes?.includes(id)) {
+			return undefined;
+		}
 		const block = await this.source.tryGet(id);
 		if (block) {
 			const ops = this.transforms.updates?.[id] ?? [];
 			ops.forEach(op => applyOperation(block!, op));
-			if (this.transforms.deletes?.includes(id)) {
-				return undefined;
-			}
-		} else if (this.transforms.inserts && Object.hasOwn(this.transforms.inserts, id)) {
-			return structuredClone(this.transforms.inserts[id]) as T;
 		}
-
 		return block;
 	}
 
