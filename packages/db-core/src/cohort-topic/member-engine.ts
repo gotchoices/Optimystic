@@ -27,7 +27,7 @@
 import type { IRingHash } from "./ports.js";
 import { bytesEqual, bytesKey } from "./registration/bytes.js";
 import type { RegistrationRecord, RegistrationStore } from "./registration/types.js";
-import { DEFAULT_TTL_MS } from "./registration/types.js";
+import { DEFAULT_TTL_MS, MIN_TTL_MS, MAX_TTL_MS } from "./registration/types.js";
 import type { SlotAssigner } from "./registration/sharding.js";
 import type { RenewalCohortSide } from "./registration/renewal.js";
 import type { WillingnessCheck } from "./willingness.js";
@@ -320,7 +320,7 @@ class StoreCohortMemberEngine implements CohortMemberEngine {
 	): Promise<RegisterReplyV1> {
 		const { members, cohortEpoch } = this.deps.cohort();
 		const { primary, backups } = this.deps.slots.assignSlots(participantId, cohortEpoch, members);
-		const ttl = reg.ttl > 0 ? reg.ttl : DEFAULT_TTL_MS;
+		const ttl = Math.min(Math.max(reg.ttl > 0 ? reg.ttl : DEFAULT_TTL_MS, MIN_TTL_MS), MAX_TTL_MS);
 		const record: RegistrationRecord = {
 			topicId,
 			participantId,

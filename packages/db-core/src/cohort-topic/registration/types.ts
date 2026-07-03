@@ -67,6 +67,11 @@ export interface RegistrationStore {
 export const DEFAULT_TTL_MS = 90_000;
 /** Edge-tier default registration TTL (ms). */
 export const EDGE_TTL_MS = 60_000;
+/** Minimum accepted registration TTL (ms). Requests below this are clamped up. */
+export const MIN_TTL_MS = 10_000;
+/** Maximum accepted registration TTL (ms). Requests above this are clamped down.
+ *  10 × DEFAULT_TTL_MS keeps the window predictable; prevents a wedged budget slot from a poison TTL. */
+export const MAX_TTL_MS = 10 * DEFAULT_TTL_MS;
 /** Consecutive ping failures before a participant promotes `backups[0]`. */
 export const MAX_PING_FAILURES = 3;
 

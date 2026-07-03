@@ -8,7 +8,7 @@ import { createRegisterRateLimiter } from '../../src/cohort-topic/antidos/rate-l
 import { createSlotAssigner } from '../../src/cohort-topic/registration/sharding.js';
 import { createRingHash } from '../../src/cohort-topic/ring-hash.js';
 import { bytesEqual, bytesKey } from '../../src/cohort-topic/registration/bytes.js';
-import { DEFAULT_TTL_MS } from '../../src/cohort-topic/registration/types.js';
+import { DEFAULT_TTL_MS, MIN_TTL_MS, MAX_TTL_MS } from '../../src/cohort-topic/registration/types.js';
 import type { RegistrationRecord } from '../../src/cohort-topic/registration/types.js';
 import { createColdStartManager } from '../../src/cohort-topic/coldstart.js';
 import { createTrafficCounters } from '../../src/cohort-topic/traffic.js';
@@ -731,5 +731,96 @@ describe('cohort-topic / member-engine: topic-budget eviction reconciles the for
 		await h.engine.handleRegister(coldReg(A, bytes('pA2', 16), 'cid-A2'), { followOn: false, treeTier: 0 }, 2_000);
 		const readmitsForA = h.admitCalls().slice(before).filter((id) => bytesEqual(id, A));
 		expect(readmitsForA.length, 're-register of the evicted topic re-enters admit (cold path)').to.equal(1);
+	});
+});
+
+describe('cohort-topic / member-engine: TTL clamping in accept()', () => {
+	const hash = createRingHash();
+	const slots = createSlotAssigner(hash);
+	const self = bytes('ttl-self', 16);
+	const cohortEpoch = bytes('ttl-epoch', 32);
+	const members = [self];
+	const cohort = (): { members: readonly Uint8Array[]; cohortEpoch: Uint8Array } => ({ members, cohortEpoch });
+	const coldStart = createColdStartManager({
+		parentRegistrar: { registerWithParent: (): Promise<void> => Promise.resolve() },
+	});
+
+	/** Build a minimal engine that always accepts and returns the admitted record via onAdmit. */
+	function makeEngine(): { engine: ReturnType<typeof createCohortMemberEngine>; lastAdmit: () => RegistrationRecord | undefined } {
+		const store = createRegistrationStore();
+		let lastAdmit: RegistrationRecord | undefined;
+		const engine = createCohortMemberEngine({
+			self,
+			profile: {} as never,
+			hash,
+			store,
+			slots,
+			willingness: { evaluate: (): { kind: 'accepted' } => ({ kind: 'accepted' }) },
+			promotion: {
+				onParticipantCountChange: (): Promise<undefined> => Promise.resolve(undefined),
+				maybeDemote: (): Promise<undefined> => Promise.resolve(undefined),
+				isPromoted: (): boolean => false,
+				applyPromotionNotice: (): void => {},
+				applyDemotionNotice: (): void => {},
+			},
+			coldStart,
+			traffic: {
+				recordArrival: (): void => {},
+				snapshot: (): { arrivalsPerMin: number; queriesPerMin: number; directParticipants: number } =>
+					({ arrivalsPerMin: 0, queriesPerMin: 0, directParticipants: 0 }),
+			} as never,
+			renewal: unused('renewal'),
+			cohort,
+			quorumWilling: (): boolean => true,
+			onAdmit: (rec): void => { lastAdmit = rec; },
+		});
+		return { engine, lastAdmit: (): RegistrationRecord | undefined => lastAdmit };
+	}
+
+	function reg(topic: Uint8Array, participant: Uint8Array, ttl: number, cid: string): RegisterV1 {
+		return {
+			v: 1,
+			topicId: bytesKey(topic),
+			tier: 0,
+			treeTier: 0,
+			participantCoord: bytesKey(participant),
+			ttl,
+			bootstrap: true,
+			timestamp: 1_000,
+			correlationId: bytesKey(bytes(cid)),
+			signature: '',
+		};
+	}
+
+	it('ttl: 1e15 (far above MAX_TTL_MS) is clamped down to MAX_TTL_MS', async () => {
+		const { engine, lastAdmit } = makeEngine();
+		const topic = bytes('ttl-huge');
+		const result = await engine.handleRegister(reg(topic, bytes('p', 16), 1e15, 'cid-huge'), { followOn: false, treeTier: 0 }, 1_000);
+		expect(result.result).to.equal('accepted');
+		expect(lastAdmit()!.ttl, 'huge TTL clamped to MAX_TTL_MS').to.equal(MAX_TTL_MS);
+	});
+
+	it('ttl: 1 (positive but below MIN_TTL_MS) is clamped up to MIN_TTL_MS', async () => {
+		const { engine, lastAdmit } = makeEngine();
+		const topic = bytes('ttl-tiny');
+		const result = await engine.handleRegister(reg(topic, bytes('p', 16), 1, 'cid-tiny'), { followOn: false, treeTier: 0 }, 1_000);
+		expect(result.result).to.equal('accepted');
+		expect(lastAdmit()!.ttl, 'tiny TTL clamped to MIN_TTL_MS').to.equal(MIN_TTL_MS);
+	});
+
+	it('ttl: 0 falls back to DEFAULT_TTL_MS which is within [MIN_TTL_MS, MAX_TTL_MS]', async () => {
+		const { engine, lastAdmit } = makeEngine();
+		const topic = bytes('ttl-zero');
+		const result = await engine.handleRegister(reg(topic, bytes('p', 16), 0, 'cid-zero'), { followOn: false, treeTier: 0 }, 1_000);
+		expect(result.result).to.equal('accepted');
+		expect(lastAdmit()!.ttl, 'zero TTL falls to DEFAULT_TTL_MS (in range, unchanged)').to.equal(DEFAULT_TTL_MS);
+	});
+
+	it('ttl: DEFAULT_TTL_MS is in range and passes through unchanged', async () => {
+		const { engine, lastAdmit } = makeEngine();
+		const topic = bytes('ttl-default');
+		const result = await engine.handleRegister(reg(topic, bytes('p', 16), DEFAULT_TTL_MS, 'cid-default'), { followOn: false, treeTier: 0 }, 1_000);
+		expect(result.result).to.equal('accepted');
+		expect(lastAdmit()!.ttl, 'in-range TTL passes through unchanged').to.equal(DEFAULT_TTL_MS);
 	});
 });
