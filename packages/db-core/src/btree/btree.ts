@@ -124,6 +124,14 @@ export class BTree<TKey, TEntry> {
 		return path.version === this._version;
 	}
 
+	/** Bump the version so every Path handed out before now reports invalid (see {@link isValid}).
+	 * Needed when the tree's data was mutated through a DIFFERENT store binding than this instance —
+	 * e.g. the tree collection's action handler writes through a per-action Atomic store, so this
+	 * read-side btree never sees the mutation and must be told to invalidate outstanding paths. */
+	invalidatePaths() {
+		++this._version;
+	}
+
 	/**
 	 * Adds a value to the tree.  Be sure to check the result, as the tree does not allow duplicate keys.
 	 * Added entries are frozen to ensure immutability

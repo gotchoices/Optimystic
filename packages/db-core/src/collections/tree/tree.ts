@@ -42,14 +42,30 @@ export class Tree<TKey, TEntry> implements TreeReadView<TKey, TEntry> {
 		let btree: BTree<TKey, TEntry> | undefined;
 		const init: CollectionInitOptions<TreeReplaceAction<TKey, TEntry>> = {
 			modules: {
-				"replace": async ({ data: actions }, _trx) => {
+				"replace": async ({ data: actions }, trx) => {
+					// Write through the Atomic store the handler is handed (`trx`), NOT the captured
+					// read btree, so `internalTransact`'s all-or-nothing wrapper actually governs this
+					// action: if any entry throws, `atomic.commit()` is skipped and every staged node
+					// write from this action is discarded (whole-action rollback) — identically for
+					// freshly created and reopened trees. Binding a throwaway BTree to `trx` reuses the
+					// public constructor; no btree API change needed.
+					const actionTree = new BTree<TKey, TEntry>(
+						trx,
+						new CollectionTrunk(trx, id),
+						keyFromEntry,
+						compare,
+					);
 					for (const [key, entry] of actions) {
 						if (entry) {
-							await btree!.upsert(entry);
+							await actionTree.upsert(entry);
 						} else {
-							await btree!.deleteAt((await btree!.find(key)));
+							await actionTree.deleteAt((await actionTree.find(key)));
 						}
 					}
+					// Mutations landed in `trx`, not the read btree, so its version counter never moved.
+					// Bump it to invalidate any Path a caller still holds — preserving the path-invalidation
+					// the previous in-place handler gave for free.
+					btree?.invalidatePaths();
 				}
 			},
 			createHeaderBlock: (id: BlockId, store: BlockStore<IBlock>) => {	// Only called if the collection does not exist

@@ -2,6 +2,7 @@ import { expect } from 'chai'
 import { Tree } from '../src/collections/tree/index.js'
 import { TestTransactor } from './test-transactor.js'
 import { KeyRange, KeyBound } from '../src/btree/index.js'
+import { isTransformsEmpty, copyTransforms } from '../src/index.js'
 
 interface TestEntry {
   key: number
@@ -346,6 +347,73 @@ describe('Tree', () => {
     expect(await tree.get(34)).to.deep.equal({ key: 34, value: 'Value 34' })
     expect(await tree.get(36)).to.deep.equal({ key: 36, value: 'Value 36' })
     expect(await tree.get(70)).to.deep.equal({ key: 70, value: 'Value 70' })
+  })
+
+  describe('atomic rollback of a failed replace', () => {
+    // keyFromEntry that throws when it meets a poison marker, so the SECOND entry of a two-entry
+    // replace fails only after the first has been fully processed. It is shared by the whole tree,
+    // so each test uses a fresh collectionId to keep the throwing extractor from touching other cases.
+    const poisonKeyFromEntry = (entry: TestEntry) => {
+      if (entry.value === 'POISON') throw new Error('boom')
+      return entry.key
+    }
+
+    it('reopened tree leaves no partial staged mutations when a replace fails midway', async () => {
+      const net = new TestTransactor()
+      const id = 'rollback-reopen'
+
+      // Create + commit a seed entry so a header exists to reopen against.
+      const created = await Tree.createOrOpen<number, TestEntry>(net, id, poisonKeyFromEntry)
+      await created.replace([[10, { key: 10, value: 'seed' }]])
+
+      // Reopen: exercises the `new BTree(collection.tracker, …)` reopen path.
+      const reopened = await Tree.createOrOpen<number, TestEntry>(net, id, poisonKeyFromEntry)
+      const trk = reopened.getCollection().tracker
+      // Reopen only reads — nothing is staged yet.
+      expect(isTransformsEmpty(trk.transforms)).to.be.true
+
+      // Two-entry replace: entry 1 is good, entry 2 poisons keyFromEntry and throws before any commit.
+      let threw = false
+      try {
+        await reopened.replace([
+          [1, { key: 1, value: 'good' }],
+          [2, { key: 2, value: 'POISON' }],
+        ])
+      } catch {
+        threw = true
+      }
+      expect(threw, 'replace should have thrown').to.be.true
+
+      // Whole-action rollback: entry 1's node writes went to the discarded Atomic, so nothing is
+      // staged in the collection tracker and no pending action was queued.
+      expect(isTransformsEmpty(trk.transforms), 'no partial mutations should remain staged').to.be.true
+      expect(reopened.getCollection().getPendingActions()).to.be.empty
+    })
+
+    it('freshly created tree rolls back a failed replace identically (create/reopen parity)', async () => {
+      const net = new TestTransactor()
+      const id = 'rollback-create'
+
+      // Create but do NOT sync — the header/root blocks live uncommitted in the tracker.
+      const fresh = await Tree.createOrOpen<number, TestEntry>(net, id, poisonKeyFromEntry)
+      const trk = fresh.getCollection().tracker
+      const before = copyTransforms(trk.transforms)
+
+      let threw = false
+      try {
+        await fresh.replace([
+          [1, { key: 1, value: 'good' }],
+          [2, { key: 2, value: 'POISON' }],
+        ])
+      } catch {
+        threw = true
+      }
+      expect(threw, 'replace should have thrown').to.be.true
+
+      // Staged state is exactly what it was before the failed replace: entry 1 was discarded too.
+      expect(copyTransforms(trk.transforms)).to.deep.equal(before)
+      expect(fresh.getCollection().getPendingActions()).to.be.empty
+    })
   })
 
   describe('concurrent creation', () => {
