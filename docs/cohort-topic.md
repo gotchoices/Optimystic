@@ -530,7 +530,11 @@ A participant verifies a notification or threshold-signed message as follows:
 > and the signature verifies (the `k − x` threshold logic of
 > [`sig/threshold.ts`](../packages/db-core/src/cohort-topic/sig/threshold.ts)). On failure against a
 > cached/stale cert it re-fetches the cert from any cohort member **exactly once** and retries; still
-> failing → the message is **untrusted**. A freshly fetched cert is accepted only if it is
+> failing → the message is **untrusted**. Its per-coord caches (`byCoord`, the refetch-rate clock, and
+> the stale-gap strike counter) are each an `LruMap` hard-capped at `maxCoords` (default 100 000, the
+> replay-guard ballpark), so a flood of verify-misses against attacker-chosen coords cannot grow verifier
+> memory without bound — the least-recently-used coord is evicted (best-effort against the self-published
+> trust lock; see the eviction `NOTE:` in `verifier.ts`). A freshly fetched cert is accepted only if it is
 > self-consistent (its own threshold signature is a quorum of its members) **and** trust-anchored — see
 > §Bootstrapping trust, below, for the trust gate that distinguishes a legitimate cohort from a
 > self-consistent forgery. The threshold-signature primitive is reused from FRET's `minSigs = k − x`
