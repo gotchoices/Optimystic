@@ -98,11 +98,15 @@ interface SetReputationCapable {
 }
 
 /**
- * The custom services that receive post-assembly dependency injection. Accessing them through this
- * typed record (rather than `(node as any).services`) makes the compiler check the injection calls,
- * so a renamed/removed service or a `setLibp2p`/`setReputation` that changes shape fails the build
- * instead of being silently skipped by optional-chaining. All three are unconditionally present in
- * the `services` config below, so a runtime throw here is a genuine wiring bug, not a missing service.
+ * The custom services that receive post-assembly dependency injection. Reaching them through this
+ * typed record (rather than `(node as any).services?.fret?.setLibp2p?.(...)`) removes the silent
+ * optional-chaining skips: a call like `wired.fret.setLibp2p(node)` is checked against these
+ * interfaces at build time (a caller-side typo or wrong-arity call fails tsc), and if the service is
+ * absent at runtime the property access throws (fail-fast) instead of being quietly no-op'd. Note the
+ * config-side `services` map is itself cast (see the comment at its declaration), so a service RENAME
+ * is caught here at runtime, not by tsc, and a signature change on the real service is caught only at
+ * that service's own definition. All three services are unconditionally present in that config, so a
+ * throw here is a genuine wiring bug, not a missing service.
  */
 type WiredServices = {
 	fret: SetLibp2pCapable;
