@@ -548,7 +548,7 @@ export class Libp2pKeyPeerNetwork implements IKeyNetwork, IPeerNetwork {
 	private parseMultiaddrs(addrs: string[]): string[] {
 		const out: string[] = []
 		for (const a of addrs) {
-			try { multiaddr(a); out.push(a) } catch (err) { console.warn('invalid multiaddr from connection', a, err) }
+			try { multiaddr(a); out.push(a) } catch (err) { this.log('WARN: invalid multiaddr from connection %s %o', a, err) }
 		}
 		return out
 	}

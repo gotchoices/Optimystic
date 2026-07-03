@@ -42,7 +42,7 @@
     "build:quereus-optimystic": "cd packages/quereus-plugin-optimystic && yarn build",
     "build:reference-peer": "cd packages/reference-peer && yarn build",
     "build:demo": "cd packages/demo && yarn build",
-    "lint": "echo 'Lint not configured for all packages'",
+    "lint": "eslint .",
     "test": "yarn test:db-core && yarn test:db-p2p && yarn test:db-p2p-storage-ns && yarn test:db-p2p-storage-rn && yarn test:db-p2p-storage-web && yarn test:quereus-crypto && yarn test:quereus-optimystic && yarn test:reference-peer && yarn test:demo && yarn test:substrate-simulator",
     "test:db-core": "cd packages/db-core && yarn test",
     "test:substrate-simulator": "cd packages/substrate-simulator && yarn test",
@@ -78,8 +78,12 @@
     "upgrade:quereus": "ncu -u --workspaces --filter '@quereus/*'"
   },
   "devDependencies": {
+    "@eslint/js": "^9.18.0",
     "@types/node": "^22.13.10",
     "bumpp": "^10.4.0",
-    "prettier": "^3.6.2"
+    "eslint": "^9.18.0",
+    "prettier": "^3.6.2",
+    "typescript": "^5.9.3",
+    "typescript-eslint": "^8.20.0"
   }
 }

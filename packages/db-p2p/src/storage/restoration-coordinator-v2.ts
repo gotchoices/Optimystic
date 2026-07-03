@@ -185,9 +185,7 @@ export class RestorationCoordinator {
 		const prevTotal = this.metrics.averageDurationMs * (totalSuccesses - 1);
 		this.metrics.averageDurationMs = (prevTotal + durationMs) / totalSuccesses;
 
-		console.log(
-			`[Ring ${ringDepth}] Successfully restored block ${blockId} in ${durationMs}ms`
-		);
+		this.log('[Ring %d] Successfully restored block %s in %dms', ringDepth, blockId, durationMs);
 	}
 
 	/**

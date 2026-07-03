@@ -452,7 +452,7 @@ export class NetworkTransactor implements ITransactor, IBlockChangeNotifier {
 						pn.recordCoordinator(await blockIdToBytes(b.blockId), b.peerId);
 					}
 				}
-			} catch (e) { console.warn('Failed to record coordinator hint', e); }
+			} catch (e) { log('WARN: Failed to record coordinator hint %o', e); }
 		} catch (e) {
 			error = e as Error;
 		}
@@ -558,7 +558,7 @@ export class NetworkTransactor implements ITransactor, IBlockChangeNotifier {
 			if (error) {
 				// Non-tail block commit failures should not fail the overall action once the tail has committed.
 				// Proceed and rely on reconciliation paths (e.g. reads with context) to finalize state on lagging peers.
-				try { console.warn('[NetworkTransactor] non-tail commit had errors; proceeding after tail commit:', error.message); } catch { /* ignore */ }
+				try { log('WARN: non-tail commit had errors; proceeding after tail commit: %s', error.message); } catch { /* ignore */ }
 			}
 		}
 

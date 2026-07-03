@@ -23,6 +23,9 @@ import { SqlDataType } from '@quereus/quereus';
 import { INTEGER_TYPE, REAL_TYPE, TEXT_TYPE, BLOB_TYPE, NUMERIC_TYPE, NULL_TYPE, BOOLEAN_TYPE, type LogicalType } from '@quereus/quereus';
 import { IndexManager, type IndexEntry } from './schema/index-manager.js';
 import { StatisticsCollector } from './schema/statistics-collector.js';
+import { createLogger } from './logger.js';
+
+const log = createLogger('module');
 
 
 
@@ -304,8 +307,8 @@ export class OptimysticVirtualTable extends VirtualTable {
       );
     } catch (error) {
       this.changeSubscribed = false;
-      console.warn(
-        `[optimystic] failed to subscribe '${this.tableName}' to collection changes: ` +
+      log(
+        `WARN: failed to subscribe '${this.tableName}' to collection changes: ` +
         `${error instanceof Error ? error.message : String(error)}`
       );
     }
@@ -324,15 +327,15 @@ export class OptimysticVirtualTable extends VirtualTable {
       const result = this.db.notifyExternalChange(this.tableName, this.schemaName);
       if (result && typeof (result as Promise<void>).catch === 'function') {
         (result as Promise<void>).catch((error: unknown) => {
-          console.warn(
-            `[optimystic] notifyExternalChange failed for '${this.tableName}': ` +
+          log(
+            `WARN: notifyExternalChange failed for '${this.tableName}': ` +
             `${error instanceof Error ? error.message : String(error)}`
           );
         });
       }
     } catch (error) {
-      console.warn(
-        `[optimystic] notifyExternalChange threw for '${this.tableName}': ` +
+      log(
+        `WARN: notifyExternalChange threw for '${this.tableName}': ` +
         `${error instanceof Error ? error.message : String(error)}`
       );
     }
@@ -353,8 +356,8 @@ export class OptimysticVirtualTable extends VirtualTable {
       try {
         this.changeUnsubscribe();
       } catch (error) {
-        console.warn(
-          `[optimystic] error tearing down change subscription for '${this.tableName}': ` +
+        log(
+          `WARN: error tearing down change subscription for '${this.tableName}': ` +
           `${error instanceof Error ? error.message : String(error)}`
         );
       }

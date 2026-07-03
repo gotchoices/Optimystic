@@ -11,6 +11,9 @@ import { CollectionFactory } from './optimystic-adapter/collection-factory.js';
 import { TransactionBridge } from './optimystic-adapter/txn-bridge.js';
 import { OptimysticModule } from './optimystic-module.js';
 import { createStampIdFunction } from './functions/transaction-id.js';
+import { createLogger } from './logger.js';
+
+const log = createLogger('plugin');
 
 /**
  * Plugin registration function
@@ -18,7 +21,7 @@ import { createStampIdFunction } from './functions/transaction-id.js';
  */
 export default function register(_db: Database, config: Record<string, SqlValue> = {}) {
 	if (config.debug) {
-		console.log('Optimystic plugin loading with config:', config);
+		log('Optimystic plugin loading with config: %o', config);
 	}
 
 	// Global factory instances

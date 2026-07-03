@@ -38,6 +38,9 @@
 import { attachTopicTraffic } from "./traffic.js";
 import { bytesKey } from "./registration/bytes.js";
 import type { RegisterReplyV1, TopicTrafficV1 } from "./wire/types.js";
+import { createLogger } from "../logger.js";
+
+const log = createLogger('cohort-topic:coldstart');
 
 /** Inputs to the cold-start admission gate. */
 export interface ColdStartTrigger {
@@ -207,7 +210,7 @@ class TrackingColdStartManager implements ColdStartManager {
 				.registerWithParent(topicId, parentCoord, tier, opTier)
 				.then(() => forwarder.onParentAck())
 				.catch((err: unknown) => {
-					console.warn(`cohort-topic cold-start: parent registration for tier-${tier} forwarder failed`, err);
+					log('WARN: parent registration for tier-%s forwarder failed %o', tier, err);
 				});
 		}
 		return forwarder;

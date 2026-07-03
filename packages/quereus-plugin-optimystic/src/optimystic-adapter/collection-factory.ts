@@ -11,6 +11,9 @@ import {
 import { createMesh, buildNetworkTransactor } from '@optimystic/db-p2p/testing';
 import type { RowData, ParsedOptimysticOptions, TransactionState } from '../types.js';
 import type { Libp2p } from '@libp2p/interface';
+import { createLogger } from '../logger.js';
+
+const log = createLogger('collection-factory');
 
 /**
  * Factory for creating and managing tree collections
@@ -122,7 +125,7 @@ export class CollectionFactory {
   ): Promise<() => void> {
     const transactor = await this.getOrCreateTransactor(options);
     if (!isBlockChangeNotifier(transactor)) {
-      console.debug(
+      log(
         `[optimystic] transactor '${options.transactor}' does not support change notifications; ` +
         `reactive watch is a no-op for collection '${collectionId}'`
       );
@@ -434,7 +437,7 @@ export class CollectionFactory {
    */
   async shutdown(): Promise<void> {
     for (const [key, { node }] of this.libp2pNodes.entries()) {
-      console.log(`Stopping libp2p node: ${key}`);
+      log('Stopping libp2p node: %s', key);
       await node.stop();
     }
     this.libp2pNodes.clear();

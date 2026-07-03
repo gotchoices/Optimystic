@@ -1226,7 +1226,7 @@ export class ClusterMember implements ICluster {
 				const client = ClusterClient.create(peerIdFromString(peerId), this.peerNetwork, this.protocolPrefix);
 				promises.push(client.update(record));
 			} catch (error) {
-				console.error(`Failed to propagate to peer ${peerId}:`, error);
+				log('ERROR: Failed to propagate to peer %s: %o', peerId, error);
 			}
 		}
 		await Promise.allSettled(promises);
