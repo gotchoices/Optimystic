@@ -288,6 +288,9 @@ class CohortPromotionLifecycle implements PromotionLifecycle {
 
 	private async promote(topicId: Uint8Array, state: PromotionState, now: number): Promise<PromotionNoticeV1> {
 		const fromTier = this.deps.treeTier(topicId);
+		// NOTE: no guard here against fromTier === DEFAULT_D_MAX_CAP (60). At that depth toTier = 61 exceeds the
+		// tree-tier ceiling, so validatePromotionNoticeV1 rejects the notice on every receiver. Unreachable today
+		// (tree tier 60 is pathological); if the tree can ever reach the cap, gate promotion below the cap here.
 		const topicB64 = bytesToB64url(topicId);
 		const epochB64 = bytesToB64url(this.deps.cohortEpoch());
 		const cohortB64 = bytesToB64url(this.deps.cohortCoord());

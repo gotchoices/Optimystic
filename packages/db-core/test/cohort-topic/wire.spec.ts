@@ -351,6 +351,46 @@ describe('cohort-topic wire', () => {
 			}
 		});
 
+		it('accepts a promotion notice at deep tree tiers (> the 0..3 capacity range)', () => {
+			// The bug this fixes: fromTier/toTier are tree tiers (0..DEFAULT_D_MAX_CAP), not capacity tiers (0..3).
+			const msg = { ...samplePromotion(), fromTier: 4, toTier: 5 };
+			const decoded = decodePromotionNoticeV1(encodeCohortMessage(msg));
+			expect(decoded.fromTier).to.equal(4);
+			expect(decoded.toTier).to.equal(5);
+		});
+
+		it('accepts a promotion notice at the DEFAULT_D_MAX_CAP - 1 -> cap boundary', () => {
+			const msg = { ...samplePromotion(), fromTier: DEFAULT_D_MAX_CAP - 1, toTier: DEFAULT_D_MAX_CAP };
+			const decoded = decodePromotionNoticeV1(encodeCohortMessage(msg));
+			expect(decoded.toTier).to.equal(DEFAULT_D_MAX_CAP);
+		});
+
+		it('rejects a promotion notice whose toTier is not fromTier + 1', () => {
+			const bad = { ...samplePromotion(), fromTier: 0, toTier: 2 };
+			expect(() => decodePromotionNoticeV1(encodeCohortMessage(bad))).to.throw(CohortWireError, /toTier must equal fromTier \+ 1/);
+		});
+
+		it('rejects a promotion notice whose toTier exceeds DEFAULT_D_MAX_CAP', () => {
+			const bad = { ...samplePromotion(), fromTier: DEFAULT_D_MAX_CAP, toTier: DEFAULT_D_MAX_CAP + 1 };
+			expect(() => decodePromotionNoticeV1(encodeCohortMessage(bad))).to.throw(CohortWireError, /treeTier/);
+		});
+
+		it('rejects a promotion notice with a non-integer tree tier', () => {
+			const bad = { ...samplePromotion(), fromTier: 1.5, toTier: 2.5 };
+			expect(() => decodePromotionNoticeV1(encodeCohortMessage(bad))).to.throw(CohortWireError, /treeTier/);
+		});
+
+		it('accepts a demotion notice at a deep tree tier (> the 0..3 capacity range)', () => {
+			const msg = { ...sampleDemotion(), tier: 10 };
+			const decoded = decodeDemotionNoticeV1(encodeCohortMessage(msg));
+			expect(decoded.tier).to.equal(10);
+		});
+
+		it('rejects a demotion notice whose tier exceeds DEFAULT_D_MAX_CAP', () => {
+			const bad = { ...sampleDemotion(), tier: DEFAULT_D_MAX_CAP + 1 };
+			expect(() => decodeDemotionNoticeV1(encodeCohortMessage(bad))).to.throw(CohortWireError, /treeTier/);
+		});
+
 		it('rejects loadBuckets of wrong length', () => {
 			const bad = { ...sampleGossip(), loadBuckets: [1, 2, 3] };
 			const frame = encodeCohortMessage(bad);
