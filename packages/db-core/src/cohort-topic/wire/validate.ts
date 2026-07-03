@@ -324,11 +324,16 @@ export function validatePromotionNoticeV1(value: unknown): PromotionNoticeV1 {
 	const what = "PromotionNoticeV1";
 	const obj = asObject(value, what);
 	requireV1(obj, what);
+	const fromTier = treeTier(reqFiniteNumber(obj, "fromTier", what), what);
+	const toTier = treeTier(reqFiniteNumber(obj, "toTier", what), what);
+	if (toTier !== fromTier + 1) {
+		fail(`${what}: toTier must equal fromTier + 1, got fromTier=${fromTier} toTier=${toTier}`);
+	}
 	return {
 		v: 1,
 		topicId: b64urlField(reqString(obj, "topicId", what), "topicId", what),
-		fromTier: tier(reqFiniteNumber(obj, "fromTier", what), what),
-		toTier: tier(reqFiniteNumber(obj, "toTier", what), what),
+		fromTier,
+		toTier,
 		cohortCoord: b64urlField(reqString(obj, "cohortCoord", what), "cohortCoord", what),
 		effectiveAt: reqFiniteNumber(obj, "effectiveAt", what),
 		thresholdSig: b64urlField(reqString(obj, "thresholdSig", what), "thresholdSig", what),
@@ -344,7 +349,7 @@ export function validateDemotionNoticeV1(value: unknown): DemotionNoticeV1 {
 	return {
 		v: 1,
 		topicId: b64urlField(reqString(obj, "topicId", what), "topicId", what),
-		tier: tier(reqFiniteNumber(obj, "tier", what), what),
+		tier: treeTier(reqFiniteNumber(obj, "tier", what), what),
 		parentCohortCoord: b64urlField(reqString(obj, "parentCohortCoord", what), "parentCohortCoord", what),
 		cohortCoord: b64urlField(reqString(obj, "cohortCoord", what), "cohortCoord", what),
 		effectiveAt: reqFiniteNumber(obj, "effectiveAt", what),
