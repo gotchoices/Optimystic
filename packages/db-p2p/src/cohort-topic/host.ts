@@ -1760,6 +1760,10 @@ function createCoordEngine(ctx: CoordEngineContext, servedCoord: RingCoord, tree
 			evicted: (rec): void => pending.evicted(rec),
 		},
 		verifyParticipantSig: ctx.verifyParticipantSig,
+		// Freshness gate for the privileged withdraw/reattach paths. Share the register path's skew config
+		// (`ctx.antiDos.replayGuard`, the same `{ maxAgeMs, maxFutureSkewMs }` `createCorrelationReplayGuard`
+		// consumes above) so an operator tuning the window moves the register and renew paths together.
+		freshness: ctx.antiDos.replayGuard,
 	});
 
 	const engine = createCohortMemberEngine({

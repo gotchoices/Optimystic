@@ -144,13 +144,15 @@ async function signedRegister(participant: Member, topicId: Uint8Array, ttl = 90
 }
 
 /** A participant-signed crash-failover `reattach` `RenewV1` (forces a `gossip.touch` at the cohort member). */
-async function signedReattach(participant: Member, topicId: Uint8Array): Promise<RenewV1> {
+// `timestamp` must be strictly newer than the record's server-side `lastPing` (set to the register's
+// handling `now`), or the renewal freshness gate rejects the privileged reattach as a stale replay.
+async function signedReattach(participant: Member, topicId: Uint8Array, timestamp = 2_000): Promise<RenewV1> {
 	const body: Omit<RenewV1, 'signature'> = {
 		v: 1,
 		topicId: bytesToB64url(topicId),
 		participantId: bytesToB64url(participant.bytes),
 		correlationId: bytesToB64url(new TextEncoder().encode('cid-reg')),
-		timestamp: 2_000,
+		timestamp,
 		reattach: true,
 	};
 	return { ...body, signature: bytesToB64url(await signPeer(participant.key, renewSigningPayload(body))) };
@@ -319,8 +321,9 @@ describe('cohort-topic: host gossip round', () => {
 		expect(hb!.treeTier, 'the heartbeat carries the tree tier').to.equal(0);
 
 		expect((await ce.engine.handleRegister(await signedRegister(participant, TOPIC), { followOn: false, treeTier: 0 }, 5_000)).result).to.equal('accepted');
-		// A re-attach forces a cohort-side touch → the record lands in the pending-delta queue.
-		expect((ce.engine.handleRenew(await signedReattach(participant, TOPIC), 6_000)).result).to.equal('ok');
+		// A re-attach forces a cohort-side touch → the record lands in the pending-delta queue. Stamp it
+		// after the register's `lastPing` (handled at 5_000) so the freshness gate accepts it.
+		expect((ce.engine.handleRenew(await signedReattach(participant, TOPIC, 6_000), 6_000)).result).to.equal('ok');
 
 		const g = await ce.gossipRound(7_000);
 		expect(g, 'a touched record makes the round non-idle').to.not.equal(undefined);
@@ -478,7 +481,8 @@ describe('cohort-topic: two-node replication via a gossip round', () => {
 		// past-TTL and be dropped by the bus's anti-resurrection guard.
 		const now = Date.now();
 		expect((await eA.engine.handleRegister(await signedRegister(participant, TOPIC, 90_000, now), { followOn: false, treeTier: 0 }, now)).result, 'A admits once a sibling is willing').to.equal('accepted');
-		expect((eA.engine.handleRenew(await signedReattach(participant, TOPIC), now)).result).to.equal('ok');
+		// Stamp the reattach after the register's `lastPing` (= now) so the freshness gate accepts it.
+		expect((eA.engine.handleRenew(await signedReattach(participant, TOPIC, now + 1), now)).result).to.equal('ok');
 
 		const g = await eA.gossipRound(now);
 		expect(g?.records?.length, 'A’s round carries the touched record').to.equal(1);

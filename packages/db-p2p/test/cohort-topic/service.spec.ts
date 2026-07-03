@@ -122,8 +122,13 @@ function buildSingleMemberCohort(opts: { memberId: Uint8Array; capPromote: numbe
 	return { engine, member, epoch: cohortEpoch, store };
 }
 
-/** A mock router that delivers register activity + renew dials straight to one member engine. */
-function buildMockService(engine: CohortMemberEngine, member: Uint8Array, onDial?: () => void): ReturnType<typeof createCohortTopicService> {
+/**
+ * A mock router that delivers register activity + renew dials straight to one member engine. `clock`
+ * drives BOTH the server-side handling `now` and the participant's renew timestamps, so a test can make
+ * time advance deterministically — the renewal freshness gate needs a privileged withdraw/reattach to be
+ * stamped strictly after the record's last touch, which a fixed `Date.now()` in a single tick cannot show.
+ */
+function buildMockService(engine: CohortMemberEngine, member: Uint8Array, onDial?: () => void, clock: () => number = () => Date.now()): ReturnType<typeof createCohortTopicService> {
 	const hash = new RingHash();
 	const addressing = createTierAddressing(hash);
 	const self = hash.H(new TextEncoder().encode('participant-self'));
@@ -131,13 +136,13 @@ function buildMockService(engine: CohortMemberEngine, member: Uint8Array, onDial
 	const router: ITopicRouter = {
 		routeAndAct: async (_key: RingCoord, activity: Uint8Array): Promise<Uint8Array> => {
 			const reg = validateRegisterV1(decodeCohortMessage(activity));
-			const reply = await engine.handleRegister(reg, { followOn: reg.bootstrap === true, treeTier: reg.treeTier }, Date.now());
+			const reply = await engine.handleRegister(reg, { followOn: reg.bootstrap === true, treeTier: reg.treeTier }, clock());
 			return encodeCohortMessage(reply);
 		},
 		dialMember: async (_member: PeerRef, activity: Uint8Array): Promise<Uint8Array> => {
 			onDial?.();
 			const renew = validateRenewV1(decodeCohortMessage(activity));
-			return encodeCohortMessage(engine.handleRenew(renew, Date.now()));
+			return encodeCohortMessage(engine.handleRenew(renew, clock()));
 		},
 	};
 	const sizeEstimator: ISizeEstimator = { estimate: (): { nEst: number; confidence: number } => ({ nEst: 50, confidence: 1 }) };
@@ -159,7 +164,7 @@ function buildMockService(engine: CohortMemberEngine, member: Uint8Array, onDial
 	void member;
 	const signer: ParticipantSigner = { signRegister: (): Promise<string> => Promise.resolve(''), signRenew: (): Promise<string> => Promise.resolve('') };
 
-	return createCohortTopicService({ self, hash, router, sizeEstimator, signer, gossipBus, verifier });
+	return createCohortTopicService({ self, hash, router, sizeEstimator, signer, gossipBus, verifier, clock });
 }
 
 describe('cohort-topic: service composition (mock transport)', () => {
@@ -188,7 +193,11 @@ describe('cohort-topic: service composition (mock transport)', () => {
 	it('withdraw: sends one signed tombstone that evicts the cohort record immediately, then renew no-ops', async () => {
 		const { engine, member, store } = buildSingleMemberCohort({ memberId: new TextEncoder().encode('member-W'), capPromote: 64 });
 		let dials = 0;
-		const service = buildMockService(engine, member, () => { dials++; });
+		// A deterministic clock that advances between the ping and the withdraw: the withdraw tombstone is
+		// stamped strictly after the record's last touch, so the renewal freshness gate accepts it (a real
+		// leave always post-dates the last successful ping).
+		let clock = 1_000;
+		const service = buildMockService(engine, member, () => { dials++; }, () => clock);
 
 		const handle = await service.register({ topicId: TOPIC, tier: 0 as Tier });
 		await service.renew(handle);
@@ -197,6 +206,7 @@ describe('cohort-topic: service composition (mock transport)', () => {
 
 		// The remote half: withdraw dials the primary once with a tombstone, which evicts the record
 		// immediately (instead of waiting out the TTL).
+		clock = 2_000; // the leave happens after the last ping
 		await service.withdraw(handle);
 		expect(dials, 'withdraw sends exactly one tombstone dial').to.equal(2);
 		expect(store.directParticipants(TOPIC), 'the tombstone freed the cohort record immediately').to.equal(0);

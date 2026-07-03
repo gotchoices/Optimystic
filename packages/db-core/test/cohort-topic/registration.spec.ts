@@ -25,6 +25,10 @@ import {
 	DEFAULT_TTL_MS,
 	pingIntervalMs,
 } from '../../src/cohort-topic/registration/types.js';
+import {
+	DEFAULT_REPLAY_MAX_AGE_MS,
+	DEFAULT_REPLAY_MAX_FUTURE_SKEW_MS,
+} from '../../src/cohort-topic/antidos/replay-guard.js';
 import type { RegistrationRecord } from '../../src/cohort-topic/registration/types.js';
 import type { RenewReplyV1, RenewV1 } from '../../src/cohort-topic/wire/index.js';
 import { b64urlToBytes } from '../../src/cohort-topic/wire/index.js';
@@ -375,13 +379,13 @@ describe('cohort-topic / renewal participant', () => {
 
 // --- renewal: cohort side ---
 
-function renewMsg(rec: RegistrationRecord, reattach = false, withdraw = false): RenewV1 {
+function renewMsg(rec: RegistrationRecord, reattach = false, withdraw = false, timestamp = 1): RenewV1 {
 	const msg: RenewV1 = {
 		v: 1,
 		topicId: bytesKey(rec.topicId),
 		participantId: bytesKey(rec.participantId),
 		correlationId: 'c',
-		timestamp: 1,
+		timestamp,
 		signature: 's',
 	};
 	if (reattach) {
@@ -494,7 +498,7 @@ describe('cohort-topic / renewal cohort side', () => {
 		const { store, side } = sideAt(self, gossip);
 		store.put(record({ topicId: t, participantId: p, primary, backups, lastPing: 1_000 }));
 
-		const reattachReply = side.onRenew(renewMsg(record({ topicId: t, participantId: p }), true), 4_000);
+		const reattachReply = side.onRenew(renewMsg(record({ topicId: t, participantId: p }), true, false, 3_990), 4_000);
 		expect(reattachReply.result, 're-attach accepted by computed backup').to.equal('ok');
 		const held = store.getByParticipant(t, p)!;
 		expect(held.lastPing, 'lastPing touched').to.equal(4_000);
@@ -536,7 +540,7 @@ describe('cohort-topic / renewal cohort side', () => {
 		const { store, side } = sideAt(self, gossip);
 		store.put(record({ topicId: t, participantId: p, primary, backups, lastPing: 1_000 }));
 
-		const reply = side.onRenew(renewMsg(record({ topicId: t, participantId: p }), true), 4_000);
+		const reply = side.onRenew(renewMsg(record({ topicId: t, participantId: p }), true, false, 3_990), 4_000);
 		expect(reply.result, 'non-backup re-attach is redirected, not promoted').to.equal('primary_moved');
 		expect(bytesEqual(store.getByParticipant(t, p)!.primary, primary), 'record not re-stamped').to.be.true;
 	});
@@ -561,7 +565,7 @@ describe('cohort-topic / renewal cohort side', () => {
 		store.put(record({ topicId: t, participantId: p, primary: a1.primary, backups: a1.backups, lastPing: 1_000 }));
 
 		// Accept the re-attach under epoch-1 → override set.
-		expect(side.onRenew(renewMsg(record({ topicId: t, participantId: p }), true), 4_000).result).to.equal('ok');
+		expect(side.onRenew(renewMsg(record({ topicId: t, participantId: p }), true, false, 3_990), 4_000).result).to.equal('ok');
 		// Sanity: still served under epoch-1.
 		expect(side.onRenew(renewMsg(record({ topicId: t, participantId: p })), 4_100).result).to.equal('ok');
 
@@ -584,7 +588,7 @@ describe('cohort-topic / renewal cohort side', () => {
 		const { store, side } = sideAt(primary, gossip); // self == computed primary
 		store.put(record({ topicId: t, participantId: p, primary, backups, lastPing: 1_000 }));
 
-		const reply = side.onRenew(renewMsg(record({ topicId: t, participantId: p }), true), 4_000);
+		const reply = side.onRenew(renewMsg(record({ topicId: t, participantId: p }), true, false, 3_990), 4_000);
 		expect(reply.result).to.equal('ok');
 		expect(store.getByParticipant(t, p)!.lastPing).to.equal(4_000);
 		// Serves as the computed primary (not via an override); a plain ping continues to serve.
@@ -601,7 +605,7 @@ describe('cohort-topic / renewal cohort side', () => {
 		store.put(record({ topicId: t, participantId: p, primary, backups, lastPing: 1_000, ttl: 100 }));
 
 		// Accept the re-attach → override recorded under the current epoch, primary re-stamped to self.
-		expect(side.onRenew(renewMsg(record({ topicId: t, participantId: p }), true), 1_050).result).to.equal('ok');
+		expect(side.onRenew(renewMsg(record({ topicId: t, participantId: p }), true, false, 1_040), 1_050).result).to.equal('ok');
 
 		// The record goes stale and is swept; the override must be cleared with it.
 		const evicted = side.sweepStale(1_200); // 1200 - 1050 = 150 > ttl 100
@@ -654,7 +658,7 @@ describe('cohort-topic / renewal cohort side', () => {
 		const { store, side } = sideAt(backups[0]!, gossip);
 		store.put(record({ topicId: t, participantId: p, primary, backups, lastPing: 1_000 }));
 
-		const reply = side.onRenew(renewMsg(record({ topicId: t, participantId: p }), false, true), 5_000);
+		const reply = side.onRenew(renewMsg(record({ topicId: t, participantId: p }), false, true, 4_990), 5_000);
 		expect(reply.result, 'withdraw accepted').to.equal('withdrawn');
 		expect(store.getByParticipant(t, p), 'record removed from the store').to.equal(undefined);
 		expect(gossip.evictedKeys, 'eviction gossiped exactly once').to.deep.equal([bytesKey(p)]);
@@ -682,7 +686,7 @@ describe('cohort-topic / renewal cohort side', () => {
 		const { store, side } = sideWithGate(backups[0]!, gossip, () => true);
 		store.put(record({ topicId: t, participantId: p, primary, backups, lastPing: 1_000 }));
 
-		expect(side.onRenew(renewMsg(record({ topicId: t, participantId: p }), false, true), 5_000).result).to.equal('withdrawn');
+		expect(side.onRenew(renewMsg(record({ topicId: t, participantId: p }), false, true, 4_990), 5_000).result).to.equal('withdrawn');
 		expect(store.getByParticipant(t, p)).to.equal(undefined);
 		expect(gossip.evictedKeys).to.deep.equal([bytesKey(p)]);
 	});
@@ -695,8 +699,8 @@ describe('cohort-topic / renewal cohort side', () => {
 		const { store, side } = sideAt(backups[0]!, gossip);
 		store.put(record({ topicId: t, participantId: p, primary, backups, lastPing: 1_000 }));
 
-		expect(side.onRenew(renewMsg(record({ topicId: t, participantId: p }), false, true), 5_000).result).to.equal('withdrawn');
-		const second = side.onRenew(renewMsg(record({ topicId: t, participantId: p }), false, true), 5_100);
+		expect(side.onRenew(renewMsg(record({ topicId: t, participantId: p }), false, true, 4_990), 5_000).result).to.equal('withdrawn');
+		const second = side.onRenew(renewMsg(record({ topicId: t, participantId: p }), false, true, 5_090), 5_100);
 		expect(second.result, 'second withdraw is opaque').to.equal('unknown_registration');
 		expect(gossip.evictedKeys, 'only one eviction gossiped total').to.deep.equal([bytesKey(p)]);
 	});
@@ -711,9 +715,9 @@ describe('cohort-topic / renewal cohort side', () => {
 		store.put(record({ topicId: t, participantId: p, primary, backups, lastPing: 1_000 }));
 
 		// Accept a reattach → failover override recorded under the current epoch, primary re-stamped to self.
-		expect(side.onRenew(renewMsg(record({ topicId: t, participantId: p }), true), 2_000).result).to.equal('ok');
+		expect(side.onRenew(renewMsg(record({ topicId: t, participantId: p }), true, false, 1_990), 2_000).result).to.equal('ok');
 		// Withdraw → evicts AND clears the override.
-		expect(side.onRenew(renewMsg(record({ topicId: t, participantId: p }), false, true), 3_000).result).to.equal('withdrawn');
+		expect(side.onRenew(renewMsg(record({ topicId: t, participantId: p }), false, true, 2_990), 3_000).result).to.equal('withdrawn');
 		expect(store.getByParticipant(t, p)).to.equal(undefined);
 
 		// Re-register under the UNCHANGED epoch naming the deterministic primary again; a plain ping to
@@ -722,6 +726,99 @@ describe('cohort-topic / renewal cohort side', () => {
 		const reply = side.onRenew(renewMsg(record({ topicId: t, participantId: p })), 4_100);
 		expect(reply.result, 'stale override did not survive the withdraw').to.equal('primary_moved');
 		expect(bytesEqual(b64urlToBytes(reply.newPrimary!), primary)).to.be.true;
+	});
+
+	// --- privileged-path freshness / anti-replay ---
+	// The withdraw/reattach frames are signed but the signature binds `timestamp`, so a captured frame can
+	// only be replayed byte-for-byte. A timestamp gate (skew window + per-record monotonicity) is therefore a
+	// complete freshness regime: it rejects an old capture and a fast in-window replay against the live record.
+
+	it('rejects a stale withdraw (older than the skew window) and keeps the live record', () => {
+		const t = topic('WF');
+		const p = bytes('wf1');
+		const { primary, backups } = slots.assignSlots(p, epoch, cohortMembers);
+		const gossip = new RecordingGossip();
+		const { store, side } = sideAt(backups[0]!, gossip);
+		// Record last touched at 500; a withdraw stamped at 1_000 is fresh vs lastPing (monotonic passes)…
+		store.put(record({ topicId: t, participantId: p, primary, backups, lastPing: 500 }));
+		// …but delivered a full maxAge window later it is stale on the skew check alone.
+		const now = 1_000 + DEFAULT_REPLAY_MAX_AGE_MS + 1;
+		const reply = side.onRenew(renewMsg(record({ topicId: t, participantId: p }), false, true, 1_000), now);
+		expect(reply.result, 'stale withdraw is opaque').to.equal('unknown_registration');
+		expect(store.getByParticipant(t, p), 'live record survives a stale withdraw').to.not.equal(undefined);
+		expect(gossip.evictedKeys, 'no eviction gossiped for a stale withdraw').to.deep.equal([]);
+	});
+
+	it('rejects a withdraw replayed after re-registration via the per-record monotonic check', () => {
+		const t = topic('WF');
+		const p = bytes('wf2');
+		const { primary, backups } = slots.assignSlots(p, epoch, cohortMembers);
+		const gossip = new RecordingGossip();
+		const { store, side } = sideAt(backups[0]!, gossip);
+		// Original registration (lastPing = t0); attacker captures a withdraw stamped at t0.
+		const t0 = 1_000;
+		store.put(record({ topicId: t, participantId: p, primary, backups, lastPing: t0 }));
+		const captured = renewMsg(record({ topicId: t, participantId: p }), false, true, t0);
+		// The record TTL-expires and the participant re-registers: lastPing jumps forward to t2 > t0.
+		const t2 = 20_000;
+		store.put(record({ topicId: t, participantId: p, primary, backups, lastPing: t2 }));
+		// Replay the captured withdraw INSIDE the skew window (whole sequence < maxAge). Skew alone would miss
+		// it (age t2+10 − t0 < maxAge); the monotonic `timestamp <= lastPing` check rejects it.
+		const now = t2 + 10;
+		expect(now - t0, 'the replay lands inside the skew window').to.be.lessThan(DEFAULT_REPLAY_MAX_AGE_MS);
+		const reply = side.onRenew(captured, now);
+		expect(reply.result, 'replayed withdraw is opaque').to.equal('unknown_registration');
+		expect(store.getByParticipant(t, p), 'fresh re-registered record survives the replay').to.not.equal(undefined);
+		expect(gossip.evictedKeys, 'no eviction gossiped for a replayed withdraw').to.deep.equal([]);
+	});
+
+	it('rejects an identical reattach replayed after the first re-stamped lastPing', () => {
+		const t = topic('FRF');
+		const p = bytes('frf1');
+		const { primary, backups } = slots.assignSlots(p, epoch, cohortMembers);
+		const self = backups[0]!; // a computed backup that accepts the takeover
+		const gossip = new RecordingGossip();
+		const { store, side } = sideAt(self, gossip);
+		store.put(record({ topicId: t, participantId: p, primary, backups, lastPing: 1_000 }));
+		const frame = renewMsg(record({ topicId: t, participantId: p }), true, false, 1_500);
+		// First reattach at now=2_000 is fresh (1_500 > lastPing 1_000) → accepted, re-stamps lastPing=2_000.
+		expect(side.onRenew(frame, 2_000).result, 'first reattach accepted').to.equal('ok');
+		expect(store.getByParticipant(t, p)!.lastPing).to.equal(2_000);
+		expect(gossip.touched, 'first reattach gossiped a touch').to.deep.equal([bytesKey(p)]);
+		// Replay the identical frame: 1_500 <= re-stamped lastPing 2_000 → monotonic reject → redirect only.
+		const replay = side.onRenew(frame, 2_100);
+		expect(replay.result, 'replayed reattach is redirected, not re-stamped').to.equal('primary_moved');
+		expect(gossip.touched, 'no second touch gossiped for the replay').to.deep.equal([bytesKey(p)]);
+	});
+
+	it('a fresh privileged frame inside the window still acts: withdraw evicts, reattach promotes', () => {
+		const t = topic('WFH');
+		// Fresh withdraw (timestamp > lastPing, inside window) still evicts.
+		const pw = bytes('wfh-w');
+		const aw = slots.assignSlots(pw, epoch, cohortMembers);
+		const gW = new RecordingGossip();
+		const { store: sW, side: dW } = sideAt(aw.backups[0]!, gW);
+		sW.put(record({ topicId: t, participantId: pw, primary: aw.primary, backups: aw.backups, lastPing: 1_000 }));
+		expect(dW.onRenew(renewMsg(record({ topicId: t, participantId: pw }), false, true, 2_000), 2_100).result, 'fresh withdraw evicts').to.equal('withdrawn');
+		expect(sW.getByParticipant(t, pw)).to.equal(undefined);
+		expect(gW.evictedKeys).to.deep.equal([bytesKey(pw)]);
+		// Fresh reattach (timestamp > lastPing, inside window) still promotes the computed backup.
+		const pr = bytes('wfh-r');
+		const ar = slots.assignSlots(pr, epoch, cohortMembers);
+		const gR = new RecordingGossip();
+		const { store: sR, side: dR } = sideAt(ar.backups[0]!, gR);
+		sR.put(record({ topicId: t, participantId: pr, primary: ar.primary, backups: ar.backups, lastPing: 1_000 }));
+		expect(dR.onRenew(renewMsg(record({ topicId: t, participantId: pr }), true, false, 2_000), 2_100).result, 'fresh reattach promotes').to.equal('ok');
+		expect(bytesEqual(sR.getByParticipant(t, pr)!.primary, ar.backups[0]!), 'promoted the computed backup').to.be.true;
+		// A future-skewed privileged frame (beyond the tolerated forward skew) is also rejected.
+		const pf = bytes('wfh-f');
+		const af = slots.assignSlots(pf, epoch, cohortMembers);
+		const gF = new RecordingGossip();
+		const { store: sF, side: dF } = sideAt(af.backups[0]!, gF);
+		sF.put(record({ topicId: t, participantId: pf, primary: af.primary, backups: af.backups, lastPing: 1_000 }));
+		const future = 2_100 + DEFAULT_REPLAY_MAX_FUTURE_SKEW_MS + 1;
+		expect(dF.onRenew(renewMsg(record({ topicId: t, participantId: pf }), false, true, future), 2_100).result, 'implausibly-future withdraw is opaque').to.equal('unknown_registration');
+		expect(sF.getByParticipant(t, pf), 'future-skewed withdraw does not evict').to.not.equal(undefined);
 	});
 });
 

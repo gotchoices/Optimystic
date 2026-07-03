@@ -510,7 +510,8 @@ async function memberOf(key: PrivateKey, peerId: PeerId): Promise<Member> {
 		// permissive-but-logged (cohort-topic-bootstrap-coldstart-origination-regression) and this admits.
 		const accept = await primaryEngine.engine.handleRegister(await signedRegister(participant, TOPIC, now, 'real-repl'), { followOn: false, treeTier: 0 }, now);
 		expect(accept.result, 'the cohort admitted the registration over the real willingness quorum').to.equal('accepted');
-		expect(primaryEngine.engine.handleRenew(await signedReattach(participant, TOPIC, now), now).result, 'reattach touches the record').to.equal('ok');
+		// Stamp the reattach after the register's `lastPing` (= now) so the freshness gate accepts it.
+		expect(primaryEngine.engine.handleRenew(await signedReattach(participant, TOPIC, now + 1), now).result, 'reattach touches the record').to.equal('ok');
 
 		// One gossip round broadcasts the touched record to the cohort over real `/cohort-gossip`.
 		const g = await primaryEngine.gossipRound(now);
@@ -830,7 +831,8 @@ async function memberOf(key: PrivateKey, peerId: PeerId): Promise<Member> {
 
 		// Touch + gossip so a sibling replicates the provider record (the cohort-side read a remote seeker query
 		// would serve from). The seeker *walk* over real sockets needs the unwired QueryV1 RPC (next test).
-		expect(matchPrimaryEngine.engine.handleRenew(await signedReattach(provider, matchTopic, now), now).result).to.equal('ok');
+		// Stamp the reattach after the register's `lastPing` (= now) so the freshness gate accepts it.
+		expect(matchPrimaryEngine.engine.handleRenew(await signedReattach(provider, matchTopic, now + 1), now).result).to.equal('ok');
 		await matchPrimaryEngine.gossipRound(now);
 		const sibling = nodes.find((n) => n.idStr !== matchPrimary.idStr)!;
 		const siblingEngine = engineOf(sibling, matchCoord);
@@ -954,7 +956,8 @@ async function memberOf(key: PrivateKey, peerId: PeerId): Promise<Member> {
 		expect((await matchPrimaryEngine.engine.handleRegister(forgedReg, { followOn: false, treeTier: 0 }, now)).result, 'the forged-payload provider was also admitted (cohort does not verify app-payload authorship)').to.equal('accepted');
 
 		// Touch + gossip so any sibling also holds the records (the routed primary holds them regardless — the walk dials it).
-		expect(matchPrimaryEngine.engine.handleRenew(await signedReattach(provider, matchTopic, now), now).result).to.equal('ok');
+		// Stamp the reattach after the register's `lastPing` (= now) so the freshness gate accepts it.
+		expect(matchPrimaryEngine.engine.handleRenew(await signedReattach(provider, matchTopic, now + 1), now).result).to.equal('ok');
 		await matchPrimaryEngine.gossipRound(now);
 
 		// A REMOTE seeker node (!= the routed primary, so the tier-0 register/query never self-dials) drives the

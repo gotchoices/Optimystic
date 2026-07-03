@@ -187,7 +187,8 @@ describe('cohort-topic: live-tier end-to-end milestone', () => {
 			const now = Date.now();
 			const seedP = await participantPrimaryAt(deciding, decidingEngine);
 			expect((await decidingEngine.engine.handleRegister(await signedRegister(seedP, TOPIC, now, 'seed'), { followOn: false, treeTier: 0 }, now)).result).to.equal('accepted');
-			expect(decidingEngine.engine.handleRenew(await signedReattach(seedP, TOPIC, now), now).result).to.equal('ok');
+			// Stamp the reattach after the register's `lastPing` (= now) so the freshness gate accepts it.
+			expect(decidingEngine.engine.handleRenew(await signedReattach(seedP, TOPIC, now + 1), now).result).to.equal('ok');
 			await decidingEngine.gossipRound(now);
 			await delay(30);
 			const sibling = mesh.nodes.find((n) => n.member.idStr !== deciding.member.idStr)!;
@@ -246,7 +247,8 @@ describe('cohort-topic: live-tier end-to-end milestone', () => {
 			const participant = await participantPrimaryAt(deciding, decidingEngine);
 			const now = Date.now();
 			expect((await decidingEngine.engine.handleRegister(await signedRegister(participant, TOPIC, now, 'repl'), { followOn: false, treeTier: 0 }, now)).result).to.equal('accepted');
-			expect(decidingEngine.engine.handleRenew(await signedReattach(participant, TOPIC, now), now).result, 'reattach touches the record').to.equal('ok');
+			// Stamp the reattach after the register's `lastPing` (= now) so the freshness gate accepts it.
+			expect(decidingEngine.engine.handleRenew(await signedReattach(participant, TOPIC, now + 1), now).result, 'reattach touches the record').to.equal('ok');
 
 			// One gossip round broadcasts the touched record to the cohort over the `cohort-gossip` protocol.
 			const g = await decidingEngine.gossipRound(now);

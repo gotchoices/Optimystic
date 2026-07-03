@@ -20,6 +20,7 @@
  * in isolation; db-core never imports FRET or libp2p here.
  */
 
+import { DEFAULT_REPLAY_MAX_AGE_MS, DEFAULT_REPLAY_MAX_FUTURE_SKEW_MS } from "../antidos/replay-guard.js";
 import { b64urlToBytes } from "../wire/codec.js";
 import type { RenewReplyV1, RenewV1 } from "../wire/types.js";
 import { bytesEqual, bytesKey, recordKey } from "./bytes.js";
@@ -280,6 +281,21 @@ export interface RenewalCohortSideDeps {
 	 * only touch `lastPing`).
 	 */
 	verifyParticipantSig?: (renew: RenewV1) => boolean;
+	/**
+	 * Optional freshness window for the two privileged, participant-attested paths (`withdraw` eviction and
+	 * `reattach` promotion). The renew signature already binds `timestamp` (see
+	 * {@link import("../wire/payloads.js").renewSigningPayload}), so an attacker cannot forge a fresher
+	 * timestamp onto a captured frame — replay is exact-frame only. A timestamp gate is therefore a
+	 * complete freshness regime for these frames: it rejects a stale/implausibly-future `timestamp`, and a
+	 * per-record monotonic check (`timestamp <= rec.lastPing`) closes the sub-`maxAge` fast-replay window
+	 * using state already on the record. Defaults to the register-path skew constants
+	 * ({@link DEFAULT_REPLAY_MAX_AGE_MS} / {@link DEFAULT_REPLAY_MAX_FUTURE_SKEW_MS}); db-p2p wires the same
+	 * `{ maxAgeMs, maxFutureSkewMs }` config the register path's replay guard consumes so an operator tuning
+	 * the skew window moves both paths together. Absent → defaults (key-less unit tests and callers work
+	 * unchanged, matching how {@link verifyParticipantSig} is optional). Plain pings are NOT gated (a
+	 * replayed ping is low-harm — it only re-touches `lastPing`).
+	 */
+	freshness?: { maxAgeMs?: number; maxFutureSkewMs?: number };
 }
 
 /** Cohort-side TTL handling: touch on renew, redirect on rotation, sweep stale records. */
@@ -300,7 +316,37 @@ class StoreRenewalCohortSide implements RenewalCohortSide {
 	 */
 	private readonly failoverServing = new Map<string, Uint8Array>();
 
-	constructor(private readonly deps: RenewalCohortSideDeps) {}
+	/** Resolved staleness window / forward-skew tolerance for the privileged freshness gate. */
+	private readonly maxAgeMs: number;
+	private readonly maxFutureSkewMs: number;
+
+	constructor(private readonly deps: RenewalCohortSideDeps) {
+		this.maxAgeMs = deps.freshness?.maxAgeMs ?? DEFAULT_REPLAY_MAX_AGE_MS;
+		this.maxFutureSkewMs = deps.freshness?.maxFutureSkewMs ?? DEFAULT_REPLAY_MAX_FUTURE_SKEW_MS;
+	}
+
+	/**
+	 * Freshness gate for the two privileged, participant-attested branches (`withdraw`, `reattach`). Returns
+	 * `false` — reject — when `msg.timestamp` is stale (older than `now − maxAgeMs`), implausibly future
+	 * (newer than `now + maxFutureSkewMs`), or not strictly newer than the record's `lastPing`. The signed
+	 * timestamp is immutable to a replayer, so this fully bounds a captured privileged frame: the skew
+	 * window catches an old capture, and the `<= rec.lastPing` monotonic check catches a fast replay that
+	 * still fits inside the window (e.g. a `withdraw` captured at `t0` replayed after the record was
+	 * re-registered at `t_reregister > t0`, or a `reattach` replayed after its own accepted re-stamp
+	 * already advanced `lastPing`).
+	 */
+	private isFreshPrivileged(msg: RenewV1, rec: RegistrationRecord, now: number): boolean {
+		if (msg.timestamp < now - this.maxAgeMs) {
+			return false; // stale
+		}
+		if (msg.timestamp > now + this.maxFutureSkewMs) {
+			return false; // implausibly future
+		}
+		if (msg.timestamp <= rec.lastPing) {
+			return false; // replay / non-monotonic against the live record
+		}
+		return true;
+	}
 
 	onRenew(msg: RenewV1, now: number): RenewReplyV1 {
 		const topicId = b64(msg.topicId);
@@ -321,6 +367,13 @@ class StoreRenewalCohortSide implements RenewalCohortSide {
 			if (this.deps.verifyParticipantSig?.(msg) === false) {
 				return { v: 1, result: "unknown_registration" };
 			}
+			// Freshness gate: a signed withdraw is valid forever without this, so a captured one could be
+			// replayed after the victim's record TTL-expires and re-registers, evicting the *fresh* record.
+			// Reject a stale/replayed frame with the same opaque `unknown_registration` the forged-sig branch
+			// returns above — indistinguishable from an untrusted frame — and never delete.
+			if (!this.isFreshPrivileged(msg, rec, now)) {
+				return { v: 1, result: "unknown_registration" };
+			}
 			this.deps.store.delete(topicId, participantId);
 			this.failoverServing.delete(key); // mirror sweepStale: drop any crash-failover override
 			this.deps.gossip.evicted(rec);
@@ -336,6 +389,12 @@ class StoreRenewalCohortSide implements RenewalCohortSide {
 			// `reattach` flag is what a backup trusts to promote itself, so a missing/forged signature
 			// must never escalate: fall through to a plain redirect (never promote).
 			if (this.deps.verifyParticipantSig?.(msg) === false) {
+				return this.primaryMoved(primary, backups, cohortEpoch);
+			}
+			// Freshness gate: a signed reattach is valid forever without this, so a captured one could be
+			// replayed to force bogus primary re-stamps. Reject a stale/replayed frame with the same redirect
+			// the forged-sig branch returns above — revealing nothing — and never promote.
+			if (!this.isFreshPrivileged(msg, rec, now)) {
 				return this.primaryMoved(primary, backups, cohortEpoch);
 			}
 			if (bytesEqual(primary, self)) {
@@ -365,6 +424,11 @@ class StoreRenewalCohortSide implements RenewalCohortSide {
 		}
 
 		// Plain ping.
+		// NOTE: plain pings are deliberately NOT run through the privileged freshness gate (isFreshPrivileged).
+		// A replayed ping is low-harm — it can only re-touch a record's `lastPing`, never delete or usurp — and
+		// the strict `timestamp <= lastPing` monotonic check would risk rejecting a legitimate ping that arrives
+		// slightly out of order or under minor participant-clock non-monotonicity. If plain-ping replay ever
+		// becomes a concern (e.g. touch-driven traffic accounting is abused), gate it here too.
 		const isComputedPrimary = bytesEqual(primary, self);
 		const override = this.failoverServing.get(key);
 		const overrideMatches = override !== undefined && bytesEqual(override, cohortEpoch);
