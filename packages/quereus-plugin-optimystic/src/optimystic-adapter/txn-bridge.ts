@@ -382,6 +382,16 @@ export class TransactionBridge {
         // Partial persistence. Restore only the trees that never synced; the
         // failed tree itself is among them (its sync cancelled its own pend, so it
         // never reached storage) and reverts cleanly.
+        //
+        // NOTE: this treats the failing tree as fully unpersisted. That holds while
+        // a single tree's flush is all-or-nothing (a conflict/stale rejection
+        // cancels its pend before any block commits). It stops holding if one
+        // tree's OWN commit spans multiple block commits and fails mid-loop —
+        // StorageRepo.commit emits per-block eagerly ("blocks that land before a
+        // mid-loop failure stay durably committed"), so that tree would itself be
+        // split and restoring its memory reintroduces divergence FOR THAT TREE. If
+        // large single-collection commits ever fail mid-block-loop in practice,
+        // classify a partially-committed failing tree as persisted here.
         const unsynced = trees.filter(t => !synced.includes(t));
         for (const t of unsynced) {
           t.restore(this.dirtyTrees.get(t));
