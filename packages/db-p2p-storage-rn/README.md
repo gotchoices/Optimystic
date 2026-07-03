@@ -37,10 +37,10 @@ import {
 } from '@optimystic/db-p2p-storage-rn';
 import { LevelDB, LevelDBWriteBatch } from 'rn-leveldb';
 
-const db = await openOptimysticRNDb({
+const db = openOptimysticRNDb({
   openFn: (name, createIfMissing, errorIfExists) =>
     new LevelDB(name, createIfMissing, errorIfExists),
-  writeBatchCtor: LevelDBWriteBatch,
+  WriteBatch: LevelDBWriteBatch,
 });
 const rawStorage = new LevelDBRawStorage(db);   // → IRawStorage
 const kvStore = new LevelDBKVStore(db);         // → IKVStore (txn recovery)
