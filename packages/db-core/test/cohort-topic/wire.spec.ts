@@ -23,6 +23,7 @@ import {
 	DEFAULT_MAX_MESSAGE_BYTES,
 } from '../../src/cohort-topic/wire/index.js';
 import { childLinkSigningPayload } from '../../src/cohort-topic/sig/index.js';
+import { DEFAULT_D_MAX_CAP } from '../../src/cohort-topic/dmax.js';
 import type {
 	RegisterV1,
 	RegisterReplyV1,
@@ -321,6 +322,32 @@ describe('cohort-topic wire', () => {
 			const bad = { ...sampleRegister(), topicId: 'not valid base64url!!' };
 			const frame = encodeCohortMessage(bad);
 			expect(() => decodeRegisterV1(frame)).to.throw(CohortWireError, /base64url/);
+		});
+
+		it('rejects a non-integer treeTier', () => {
+			const bad = { ...sampleRegister(), treeTier: 2.5 };
+			const frame = encodeCohortMessage(bad);
+			expect(() => decodeRegisterV1(frame)).to.throw(CohortWireError, /treeTier/);
+		});
+
+		it('rejects a negative treeTier', () => {
+			const bad = { ...sampleRegister(), treeTier: -1 };
+			const frame = encodeCohortMessage(bad);
+			expect(() => decodeRegisterV1(frame)).to.throw(CohortWireError, /treeTier/);
+		});
+
+		it('rejects a treeTier above DEFAULT_D_MAX_CAP', () => {
+			const bad = { ...sampleRegister(), treeTier: 300 };
+			const frame = encodeCohortMessage(bad);
+			expect(() => decodeRegisterV1(frame)).to.throw(CohortWireError, /treeTier/);
+		});
+
+		it('accepts treeTier at the 0 and DEFAULT_D_MAX_CAP bounds', () => {
+			// sampleRegister leaves followOn unset, so treeTier 0 does not trip the followOn>=1 cross-check.
+			for (const value of [0, DEFAULT_D_MAX_CAP]) {
+				const decoded = decodeRegisterV1(encodeCohortMessage({ ...sampleRegister(), treeTier: value }));
+				expect(decoded.treeTier, `treeTier ${value} is accepted`).to.equal(value);
+			}
 		});
 
 		it('rejects loadBuckets of wrong length', () => {

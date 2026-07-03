@@ -9,6 +9,7 @@
  */
 
 import { b64urlToBytes } from "./codec.js";
+import { DEFAULT_D_MAX_CAP } from "../dmax.js";
 import type {
 	ChildLinkRefV1,
 	ChildLinkReplyV1,
@@ -142,6 +143,20 @@ function tier(value: number, what: string): number {
 	return value;
 }
 
+/**
+ * Validate a `treeTier` (the walk-toward-root start tier `d` a register/redirect targets): an integer in
+ * `0..DEFAULT_D_MAX_CAP`. `d_max_cap` (60) is the substrate's own ceiling on useful walk depth, so a
+ * `treeTier` above it cannot correspond to a real walk position. Rejecting here keeps an out-of-range value
+ * from reaching `addressing.coord()` downstream — whose `coordD` throws a raw `RangeError` for a
+ * non-integer / negative / `> 255` tier, an unclassified crash rather than a clean malformed-frame rejection.
+ */
+function treeTier(value: number, what: string): number {
+	if (!Number.isInteger(value) || value < 0 || value > DEFAULT_D_MAX_CAP) {
+		fail(`${what}: treeTier must be an integer in 0..${DEFAULT_D_MAX_CAP}, got ${value}`);
+	}
+	return value;
+}
+
 /** Assert a base64url string decodes cleanly; returns it unchanged. */
 function b64urlField(value: string, key: string, what: string): string {
 	try {
@@ -190,7 +205,7 @@ export function validateRegisterV1(value: unknown): RegisterV1 {
 		v: 1,
 		topicId: b64urlField(reqString(obj, "topicId", what), "topicId", what),
 		tier: tier(reqFiniteNumber(obj, "tier", what), what),
-		treeTier: reqFiniteNumber(obj, "treeTier", what),
+		treeTier: treeTier(reqFiniteNumber(obj, "treeTier", what), what),
 		participantCoord: b64urlField(reqString(obj, "participantCoord", what), "participantCoord", what),
 		ttl: reqFiniteNumber(obj, "ttl", what),
 		timestamp: reqFiniteNumber(obj, "timestamp", what),

@@ -9,6 +9,7 @@ import {
 	b64urlToBytes,
 	encodeCohortMessage,
 	decodeCohortMessage,
+	decodeRegisterReplyV1,
 	serializeBootstrapEvidenceEnvelope,
 	bootstrapBoundImage,
 	parentRefSigningImage,
@@ -21,7 +22,7 @@ import {
 	type RingCoord,
 	type Tier,
 } from '@optimystic/db-core';
-import { createCohortTopicHost, dispatchChildLink, resolveRenew, type DispatchChildLinkDeps } from '../../src/cohort-topic/host.js';
+import { createCohortTopicHost, dispatchChildLink, resolveRenew, DEFAULT_COORD_ENGINES_MAX, CoordEngineRegistryFullError, type DispatchChildLinkDeps } from '../../src/cohort-topic/host.js';
 import type { BootstrapParentTopicView } from '../../src/cohort-topic/bootstrap-parent-reference.js';
 import { peerIdToBytes } from '../../src/cohort-topic/peer-codec.js';
 import { signPeerSig } from '../../src/cohort-topic/peer-sig.js';
@@ -126,6 +127,15 @@ function makeFakeFret(opts: {
 			}
 			// Canned ack: a `linked` ChildLinkReplyV1 (the child-link's success-ack shape).
 			return Promise.resolve({ commitCertificate: bytesToB64url(encodeCohortMessage({ v: 1, result: 'linked' })) });
+		},
+		// Test hook: drive the host's installed activity handler directly (the FRET-routed register path), so a
+		// register that must be refused by the coord-engine registry cap flows through the real `dispatchRegister`
+		// and its refusal→reply mapping rather than being poked at the engine level.
+		runActivity: (activity: string, cohort: string[]): Promise<{ commitCertificate: string }> => {
+			if (activityHandler === undefined) {
+				throw new Error('no activity handler installed');
+			}
+			return activityHandler(activity, cohort);
 		},
 	};
 }
@@ -618,5 +628,123 @@ describe('cohort-topic: parent-side child-link dispatch (record + reject)', () =
 describe('cohort-topic: anti-DoS defaults', () => {
 	it('exposes the simulator-confirmed rate window', () => {
 		expect(DEFAULT_RATE_WINDOW_MS).to.equal(60_000);
+	});
+
+	it('exposes the documented default coord-engine cap', () => {
+		expect(DEFAULT_COORD_ENGINES_MAX).to.equal(2048);
+	});
+});
+
+describe('cohort-topic: coord-engine registry cap (attacker-keyed engine creation bound)', () => {
+	/** A distinct 32-byte topic id per index → a distinct served coord0 (H(0x00 ‖ topicId)). */
+	function topicAt(i: number): Uint8Array {
+		return Uint8Array.from({ length: 32 }, (_v, j) => (i * 31 + j * 7 + 1) & 0xff);
+	}
+
+	it('spraying distinct coords stays bounded at the cap and tears evicted engines down', async () => {
+		const CAP = 8;
+		const host = await createCohortTopicHost(makeFakeNode(await makePeerId()) as never, makeFakeFret() as never, {
+			wantK: 1,
+			antiDos: { coordEnginesMax: CAP },
+		});
+		const participant = await makeParticipantBytes();
+		// Baseline gossip-transport subscriptions with zero coord engines (the node-level participant bus).
+		const base = host.gossipTransport.subscriberCount;
+
+		// Spray 5×CAP distinct served coords. Each creates an IDLE engine (no handleRegister → no record /
+		// forwarder), exactly the attacker's cold-coord spray.
+		const coords: RingCoord[] = [];
+		for (let i = 0; i < 5 * CAP; i++) {
+			const coord = addressing.coord0(topicAt(i));
+			coords.push(coord);
+			host.registry.forCoord(coord, 0 as Tier, participant);
+		}
+
+		// Live-engine count never exceeds the cap...
+		expect(host.registry.all().length, 'registry is bounded by the cap').to.equal(CAP);
+		// ...and each eviction closed its engine (dropped its gossip subscription): one subscription per live
+		// engine, none leaked. Were close() skipped, subscriberCount would be base + 5×CAP.
+		expect(host.gossipTransport.subscriberCount, 'evicted engines were close()d — no leaked subscriptions').to.equal(base + CAP);
+
+		// LRU discipline: the earliest-sprayed (least-recently-used) coord was evicted; the most-recent CAP survive.
+		expect(host.registry.findByCoord(coords[0]!), 'the least-recently-used coord was evicted').to.equal(undefined);
+		for (const coord of coords.slice(coords.length - CAP)) {
+			expect(host.registry.findByCoord(coord), 'the most-recent CAP coords survive').to.not.equal(undefined);
+		}
+
+		await host.stop();
+	});
+
+	it('a hot (recently-used) engine survives eviction while cold ones are reclaimed', async () => {
+		const CAP = 4;
+		const host = await createCohortTopicHost(makeFakeNode(await makePeerId()) as never, makeFakeFret() as never, {
+			wantK: 1,
+			antiDos: { coordEnginesMax: CAP },
+		});
+		const participant = await makeParticipantBytes();
+		const hotCoord = addressing.coord0(topicAt(0));
+		host.registry.forCoord(hotCoord, 0 as Tier, participant); // the coord we keep touching
+
+		// Spray past the cap, re-touching the hot coord before each new creation so it stays most-recently-used.
+		for (let i = 1; i < 5 * CAP; i++) {
+			host.registry.findByCoord(hotCoord); // bump recency
+			host.registry.forCoord(addressing.coord0(topicAt(i)), 0 as Tier, participant);
+		}
+
+		expect(host.registry.all().length, 'still bounded by the cap').to.equal(CAP);
+		expect(host.registry.findByCoord(hotCoord), 'the continually-touched engine is never evicted').to.not.equal(undefined);
+
+		await host.stop();
+	});
+
+	it('a full-of-live registry refuses a new coord and keeps the live cohorts (multi-cohort node unaffected)', async () => {
+		const CAP = 2;
+		const host = await createCohortTopicHost(makeFakeNode(await makePeerId()) as never, makeFakeFret() as never, {
+			wantK: 1,
+			antiDos: { coordEnginesMax: CAP },
+		});
+		const participant = await makeParticipantBytes();
+		const now = 1_000_000;
+
+		// Fill the cap with LIVE engines: each holds an admitted record (hasState() === true).
+		const ce1 = host.registry.forCoord(addressing.coord0(TOPIC), 0 as Tier, participant);
+		const ce2 = host.registry.forCoord(addressing.coord0(TOPIC2), 0 as Tier, participant);
+		expect((await ce1.engine.handleRegister(makeReg(participant, TOPIC, 'cid-1', now), { followOn: false, treeTier: 0 }, now)).result, 'first cohort admits').to.equal('accepted');
+		expect((await ce2.engine.handleRegister(makeReg(participant, TOPIC2, 'cid-2', now), { followOn: false, treeTier: 0 }, now)).result, 'second cohort admits').to.equal('accepted');
+		expect(ce1.hasState() && ce2.hasState(), 'both engines hold live state').to.equal(true);
+
+		// A third distinct coord cannot be created — every slot holds a live cohort, so nothing is idle-evictable.
+		const newCoord = addressing.coord0(topicAt(99));
+		expect(() => host.registry.forCoord(newCoord, 0 as Tier, participant), 'refuses a new coord when full of live cohorts').to.throw(CoordEngineRegistryFullError);
+		expect(host.registry.all().length, 'the live cohorts are untouched').to.equal(CAP);
+		expect(host.registry.findByCoord(newCoord), 'the refused coord created no engine').to.equal(undefined);
+		// The existing live cohorts keep serving.
+		expect(ce1.servesTopic(TOPIC) && ce2.servesTopic(TOPIC2), 'both live cohorts keep serving').to.equal(true);
+
+		await host.stop();
+	});
+
+	it('register dispatch over a full-of-live registry replies unwilling_cohort (no unhandled throw)', async () => {
+		const fret = makeFakeFret() as { runActivity: (activity: string, cohort: string[]) => Promise<{ commitCertificate: string }> };
+		const host = await createCohortTopicHost(makeFakeNode(await makePeerId()) as never, fret as never, {
+			wantK: 1,
+			antiDos: { coordEnginesMax: 1 },
+		});
+		const participant = await makeParticipantBytes();
+		const now = 1_000_000;
+
+		// Fill the single slot with a live cohort.
+		const ce = host.registry.forCoord(addressing.coord0(TOPIC), 0 as Tier, participant);
+		expect((await ce.engine.handleRegister(makeReg(participant, TOPIC, 'cid-live', now), { followOn: false, treeTier: 0 }, now)).result).to.equal('accepted');
+
+		// Drive a register for a DISTINCT topic through the real FRET activity-handler → dispatchRegister path.
+		const reg = makeReg(participant, TOPIC2, 'cid-refused', now);
+		const { commitCertificate } = await fret.runActivity(bytesToB64url(encodeCohortMessage(reg)), []);
+		const reply = decodeRegisterReplyV1(b64urlToBytes(commitCertificate));
+		expect(reply.result, 'a register the cap refuses is a clean unwilling_cohort — never an unhandled throw').to.equal('unwilling_cohort');
+		expect((reply.retryAfterMs ?? 0) > 0, 'carries a back-off so the walk retries in time').to.equal(true);
+		expect(host.registry.all().length, 'the refused register created no engine').to.equal(1);
+
+		await host.stop();
 	});
 });

@@ -176,6 +176,11 @@ export interface ColdStartManager {
 	 * reports serving it via cold-start state.
 	 */
 	remove(topicId: Uint8Array): void;
+	/**
+	 * Whether this manager currently tracks any forwarder. The host's idle-engine eviction reads this to
+	 * avoid reclaiming a cohort that holds a live (possibly `awaiting_parent`) cold-start forwarder.
+	 */
+	hasForwarders(): boolean;
 }
 
 class TrackingColdStartManager implements ColdStartManager {
@@ -216,6 +221,10 @@ class TrackingColdStartManager implements ColdStartManager {
 		// Idempotent: `Map.delete` on an absent key is a safe no-op, so a double-remove (or a remove of a
 		// never-instantiated topic) does nothing.
 		this.forwarders.delete(bytesKey(topicId));
+	}
+
+	hasForwarders(): boolean {
+		return this.forwarders.size > 0;
 	}
 }
 

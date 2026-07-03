@@ -792,10 +792,13 @@ real warm replicas and failover.
 > `live-tier.spec.ts` 5b (cold-bootstrap end-to-end: cold cohort declines, heartbeats propagate, a sibling
 > instantiates, register-once → `accepted`, and the record replicates).
 >
-> **Cost (tripwires).** Engines are never reclaimed today (`createCoordRegistry` has no eviction), so
-> cold-sibling instantiation is a *permanent* per-co-member-coord engine cost — bounded by real FRET
-> co-membership, but if idle engines ever accumulate, add an LRU / idle-reclaim over gossip-instantiated
-> engines. And the heartbeat re-broadcasts willingness for every idle-but-willing cohort every
+> **Cost (tripwires).** The coord-engine registry is hard-capped (`createCoordRegistry`,
+> `coordEnginesMax`, default 2048) with LRU eviction of *idle* engines (no records, no cold-start
+> forwarder), so cold-sibling instantiation is no longer a permanent per-co-member-coord cost: an idle
+> gossip-instantiated engine is reclaimed under memory pressure, and a creation over a full-of-live registry
+> is refused (`CoordEngineRegistryFullError`, surfaced as `unwilling_cohort` / `rejected` / a dropped
+> cold-sibling). Eviction is idle-only, so it never strands a verifier trust-lock (an idle engine never
+> published a cert). The heartbeat re-broadcasts willingness for every idle-but-willing cohort every
 > `T_willingness_heartbeat`; the throttle plus the willing-for-something gate are the mitigations, but a node
 > serving very many idle cohorts may need to batch heartbeats or lengthen the interval.
 
@@ -980,7 +983,11 @@ The layer does not attempt to defend against unbounded Sybil attacks at the regi
 > budget are **per-`CoordEngine`** (they key on `(peer, topic)` / per-cohort topic state, which is
 > coord-scoped, so each served coord gets an independent set), while the `BootstrapEvidence` policy is
 > **node-level** (a tier→verifier policy with no per-coord state) and shared. The guard is verified first
-> on the inbound register so a forged/replayed/over-rate frame never pollutes downstream state. Because
+> on the inbound register so a forged/replayed/over-rate frame never pollutes downstream state. Wrapping all
+> of these is a host-level bound on the *number* of `CoordEngine`s: the served coord is a hash over
+> attacker-chosen inputs and an engine is created **before** its per-coord guards run, so the registry is
+> hard-capped (`coordEnginesMax`, default 2048) with LRU eviction of idle engines (no records, no cold-start
+> forwarder) — one peer spraying distinct coords can no longer force unbounded engine allocation. Because
 > db-core embeds no PoW/reputation scheme, the host supplies the verifiers
 > ([`bootstrap-evidence-verifiers.ts`](../packages/db-p2p/src/cohort-topic/bootstrap-evidence-verifiers.ts))
 > and the participant-side minter

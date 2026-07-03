@@ -64,6 +64,16 @@ export class FretCohortGossipTransport implements ICohortGossipTransport {
 		return () => this.handlers.delete(handler);
 	}
 
+	/**
+	 * Number of live inbound subscriptions (one per subscribed gossip bus). Test/diagnostic introspection:
+	 * each {@link CoordEngine}'s bus subscribes via {@link onMessage} and drops its subscription on `close()`,
+	 * so this tracks the number of live coord engines (+ the node-level participant bus) — used to observe that
+	 * the coord-engine registry's LRU eviction actually tears evicted engines down (no leaked subscriptions).
+	 */
+	get subscriberCount(): number {
+		return this.handlers.size;
+	}
+
 	/** Feed an inbound gossip frame (called by the host's `/cohort-gossip` protocol handler). */
 	deliver(fromPeerId: string, msg: Uint8Array): void {
 		const from: PeerRef = { id: peerIdToBytes(fromPeerId) };

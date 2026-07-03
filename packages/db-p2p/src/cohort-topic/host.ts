@@ -76,6 +76,7 @@ import {
 	createLoadBarometer,
 	createTierAddressing,
 	createRegisterRateLimiter,
+	DEFAULT_RATE_WINDOW_MS,
 	createCorrelationReplayGuard,
 	createTopicBudget,
 	createBootstrapEvidence,
@@ -279,6 +280,15 @@ export interface CohortTopicAntiDosOptions {
 	/** Per-cohort forwarder-state budget. Default `topics_max = 2048`, LRU by participant count. */
 	readonly topicBudget?: TopicBudgetConfig;
 	/**
+	 * Hard cap on the number of live per-coord cohort engines this node keeps. The served coord is a hash
+	 * over attacker-chosen `(treeTier, participantCoord, topicId)`, and an engine is created **before** the
+	 * per-coord anti-DoS gates run, so without this cap one peer spraying distinct coords forces unbounded
+	 * engine allocation. On overflow the registry evicts the least-recently-used **idle** engine (no records,
+	 * no cold-start forwarder) and tears it down; if every slot holds a live cohort it refuses the new coord.
+	 * Default {@link DEFAULT_COORD_ENGINES_MAX}.
+	 */
+	readonly coordEnginesMax?: number;
+	/**
 	 * Bootstrap-evidence verifiers for cold-root instantiation. db-core embeds no PoW / reputation /
 	 * committed-work scheme; inject the real checks here. Any verifier supplied wins over the defaults
 	 * below; the gate is **never** left undefined (an unset gate means cold-root bootstrap is
@@ -346,6 +356,13 @@ export interface CoordEngine {
 	cohortIdentityAt(epoch: Uint8Array): readonly string[] | undefined;
 	/** True iff this engine currently holds any registration record (a cold probe leaves it empty). */
 	hasState(): boolean;
+	/**
+	 * True iff this engine currently holds any cold-start forwarder (possibly `awaiting_parent`). Together
+	 * with {@link hasState}, this is the "engine is idle / safe to reclaim" predicate the coord-engine
+	 * registry's LRU eviction reads: an engine with neither a record nor a forwarder is a throwaway (an
+	 * attacker-sprayed cold coord), an engine with either holds genuine cohort state and is never evicted.
+	 */
+	hasForwarders(): boolean;
 	/** True iff this engine holds the record for `(topicId, participantId)` — the renewal lookup key. */
 	holds(topicId: Uint8Array, participantId: Uint8Array): boolean;
 	/**
@@ -444,6 +461,12 @@ export interface CoordRegistry {
 	 * `participantCoord` seed a freshly-created engine's coord-derived tier inputs (ignored if the
 	 * engine already exists). Synchronous, so concurrent activity callbacks for the same coord share
 	 * one engine without a second being constructed.
+	 *
+	 * **Capacity.** The registry is hard-capped (see {@link CohortTopicAntiDosOptions.coordEnginesMax}). A
+	 * lookup that returns an already-resident engine always succeeds. A *creation* over a full registry
+	 * first evicts the least-recently-used idle engine; when every slot holds a live cohort it throws
+	 * {@link CoordEngineRegistryFullError} rather than growing unbounded — callers on the register /
+	 * child-link / cold-sibling paths catch it and answer a clean capacity refusal.
 	 */
 	forCoord(coord: RingCoord, treeTier: number, participantCoord: Uint8Array): CoordEngine;
 	/** The engine holding the record for `(topicId, participantId)`, or `undefined` (renewal dispatch). */
@@ -766,12 +789,14 @@ export async function createCohortTopicHost(node: Libp2p, fret: FretService, opt
 		// coord's later-epoch messages. The verifier self-heals via bounded re-TOFU on a demonstrated chain gap
 		// (`staleGapRecoveryStrikes`, see `db-core/.../membership/verifier.ts` + `docs/cohort-topic.md`
 		// §Bootstrapping trust). The *root-cause* fix is for the host to drop the lock here on demotion, but
-		// that needs an engine-reclaim / demotion signal the host does not emit today (`createCoordRegistry`
-		// never evicts — see the NOTE below). When engine reclaim lands, add a `verifier.forget(coord)` /
-		// downgrade call on demotion and prefer it over (or alongside) the strike-counter heuristic.
+		// that needs an engine-reclaim / demotion signal the host does not emit today. `createCoordRegistry`
+		// now evicts, but only IDLE engines (no records → never published a cert), so it never strands a
+		// trust-lock and does not resolve this on its own (see the NOTE at `evictOneIdle`). When a demotion /
+		// cert-publishing-engine reclaim signal lands, add a `verifier.forget(coord)` / downgrade call on
+		// demotion and prefer it over (or alongside) the strike-counter heuristic.
 		onCertPublished: (cert: MembershipCertV1): void => verifier.cache(cert),
 	};
-	const registry = createCoordRegistry(ctx);
+	const registry = createCoordRegistry(ctx, options.antiDos?.coordEnginesMax);
 
 	// --- cold-sibling engine instantiation on a verified co-member gossip frame (§Cold-start instantiation) ---
 	// A brand-new multi-node cohort deadlocks otherwise: FRET lands every register for a coord on the ONE
@@ -793,9 +818,10 @@ export async function createCohortTopicHost(node: Libp2p, fret: FretService, opt
 	// link work — so a tier-`d > 0` frame for an unknown coord falls through to today's drop (the bus has no
 	// engine subscribed to it). See `docs/cohort-topic.md` §Cold-start instantiation.
 	//
-	// NOTE: engines are never reclaimed today (`createCoordRegistry` has no eviction), so a gossip-instantiated
-	// engine is a permanent per-co-member-coord cost. Bounded by real FRET co-membership, but if idle engines
-	// ever accumulate, add an LRU / idle-reclaim over gossip-instantiated engines.
+	// The registry is hard-capped with LRU eviction of idle engines (`createCoordRegistry`), so a
+	// gossip-instantiated cold sibling is no longer a permanent per-co-member-coord cost: an idle one is
+	// reclaimed under memory pressure like any other cold engine, and a creation over a full-of-live registry
+	// is refused (`CoordEngineRegistryFullError`) and dropped here rather than crashing the gossip handler.
 	const maybeInstantiateColdSibling = (frame: Uint8Array): void => {
 		if (verifyGossip === undefined) {
 			return; // key-less / interim mode: no co-member gate, so never auto-instantiate
@@ -818,7 +844,14 @@ export async function createCohortTopicHost(node: Libp2p, fret: FretService, opt
 		}
 		// The dummy `participantCoord` seeds only the tier-`d > 0` parent-coord derivation, which a tier-0
 		// engine never exercises (demotion is gated on `treeTier > 0`); self's member bytes are a safe filler.
-		registry.forCoord(coord, g.treeTier, selfMemberBytes);
+		try {
+			registry.forCoord(coord, g.treeTier, selfMemberBytes);
+		} catch (err) {
+			if (err instanceof CoordEngineRegistryFullError) {
+				return; // registry full of live cohorts — drop the cold-sibling instantiation (same as any drop)
+			}
+			throw err;
+		}
 	};
 
 	// --- intra-cohort sign endorsement (the `/sign` handler body) ---
@@ -919,7 +952,19 @@ export async function createCohortTopicHost(node: Libp2p, fret: FretService, opt
 		// `d` this equals the participant's `coord_d(self, topicId)` routing key by construction, i.e. the
 		// coordinate FRET routed to (§Tier addressing).
 		const servedCoord = addressing.coord(reg.treeTier, participantCoord, topicId);
-		const coordEngine = registry.forCoord(servedCoord, reg.treeTier, participantCoord);
+		let coordEngine: CoordEngine;
+		try {
+			coordEngine = registry.forCoord(servedCoord, reg.treeTier, participantCoord);
+		} catch (err) {
+			if (err instanceof CoordEngineRegistryFullError) {
+				// Every engine slot holds a live cohort — refuse this new coord cleanly. `unwilling_cohort`
+				// with a back-off is the walk's "retry in time / restart at d_max" signal (§Capacity barometer),
+				// the same shape the per-coord topic budget answers when full-of-populated.
+				log("cohort-topic: register refused — coord-engine registry full");
+				return { v: 1, result: "unwilling_cohort", retryAfterMs: DEFAULT_RATE_WINDOW_MS, reason: "coord-engine registry full" };
+			}
+			throw err;
+		}
 		if (fretCohort !== undefined) {
 			crossCheckCohort(fret, wantK, servedCoord, fretCohort);
 		}
@@ -1277,9 +1322,87 @@ function clampTier(tier: number): number {
 
 // --- registry + coord engine ---
 
-/** Build the lazy `servedCoord → CoordEngine` registry over the shared collaborators. */
-function createCoordRegistry(ctx: CoordEngineContext): CoordRegistry {
+/**
+ * Default hard cap on the number of live per-coord cohort engines (see
+ * {@link CohortTopicAntiDosOptions.coordEnginesMax}). Aligned in order of magnitude with the topic-budget
+ * `topics_max` (2048): the same "this many distinct served units before an anti-abuse ceiling bites" scale.
+ */
+export const DEFAULT_COORD_ENGINES_MAX = 2048;
+
+/**
+ * Thrown by {@link CoordRegistry.forCoord} when it must create a new engine but the registry is full of
+ * **live** cohorts (every slot holds records or a cold-start forwarder, so nothing is idle-evictable).
+ * Signals a capacity refusal, not a bug — the register / child-link / cold-sibling dispatch paths catch it
+ * and answer a clean refusal (`unwilling_cohort` / `rejected` / drop) rather than letting it escape.
+ */
+export class CoordEngineRegistryFullError extends Error {
+	constructor(maxEngines: number) {
+		super(`cohort-topic coord-engine registry full (max=${maxEngines}) — every slot holds a live cohort`);
+		this.name = "CoordEngineRegistryFullError";
+	}
+}
+
+/**
+ * Build the lazy `servedCoord → CoordEngine` registry over the shared collaborators, hard-capped at
+ * `maxEngines` with least-recently-used eviction of **idle** engines.
+ *
+ * The served coord is a hash over attacker-chosen `(treeTier, participantCoord, topicId)`, and `forCoord`
+ * runs on the register hot path **before** the per-coord anti-DoS gates — so, uncapped, one peer spraying
+ * distinct coords drives unbounded engine allocation (each engine owns a store, gossip bus, rate limiter,
+ * replay guard, topic budget, …). The cap bounds that: on a creation over a full registry we evict the
+ * least-recently-used **idle** engine (no records, no cold-start forwarder — a throwaway cold coord) and
+ * tear it down; when every slot holds a live cohort we refuse the new coord ({@link CoordEngineRegistryFullError})
+ * so a legitimate multi-cohort node keeps working while attacker-driven cold engines cannot pile up.
+ *
+ * Recency is bumped on every lookup that hands back an engine (`forCoord` / `findByCoord` / `findHolder` /
+ * `findServing`), so a hot cohort under load is never the eviction victim.
+ */
+function createCoordRegistry(ctx: CoordEngineContext, maxEngines: number = DEFAULT_COORD_ENGINES_MAX): CoordRegistry {
+	if (!Number.isInteger(maxEngines) || maxEngines <= 0) {
+		throw new RangeError(`coordEnginesMax must be a positive integer, got ${maxEngines}`);
+	}
 	const engines = new Map<string, CoordEngine>();
+	// LRU recency by engine key: a monotonic touch sequence (higher = more recently used). Every engine in
+	// `engines` has an entry; entries are dropped alongside their engine on eviction / close.
+	const recency = new Map<string, number>();
+	let seq = 0;
+	const touch = (key: string): void => { recency.set(key, ++seq); };
+
+	// An engine is idle-evictable iff it holds no registration record AND no cold-start forwarder — i.e. no
+	// genuine cohort state to lose. A live engine (records or a forwarder) is never a throwaway.
+	const isIdle = (engine: CoordEngine): boolean => !engine.hasState() && !engine.hasForwarders();
+
+	// Evict the least-recently-used idle engine to free a slot; returns true iff one was freed. Tears the
+	// victim down (`close()` drops its gossip-bus subscription) so eviction does not leak the subscription.
+	//
+	// NOTE (verifier trust-lock, cohort-topic-treetier-bound-engine-cap): only IDLE engines are evicted here,
+	// and an idle engine (`hasState() === false`) has never published a membership cert — so there is no
+	// verifier trust-lock (`onCertPublished` → `verifier.cache`, above) to drop for its coord. If this policy
+	// is ever widened to evict a cert-publishing engine, add a `verifier.forget(coord)` / downgrade here:
+	// otherwise the stale trust-lock strands the coord's later-epoch messages (the drop-the-lock tripwire the
+	// `onCertPublished` NOTE describes). Do NOT widen without that.
+	const evictOneIdle = (): boolean => {
+		let victimKey: string | undefined;
+		let victimSeq = Infinity;
+		for (const [key, engine] of engines) {
+			if (!isIdle(engine)) {
+				continue; // live cohort (records) or mid-link cold-start forwarder — never evicted
+			}
+			const s = recency.get(key) ?? 0;
+			if (s < victimSeq) {
+				victimSeq = s;
+				victimKey = key;
+			}
+		}
+		if (victimKey === undefined) {
+			return false;
+		}
+		engines.get(victimKey)!.close();
+		engines.delete(victimKey);
+		recency.delete(victimKey);
+		return true;
+	};
+
 	return {
 		forCoord(coord: RingCoord, treeTier: number, participantCoord: Uint8Array): CoordEngine {
 			const key = bytesToB64url(coord);
@@ -1287,25 +1410,39 @@ function createCoordRegistry(ctx: CoordEngineContext): CoordRegistry {
 			// share one engine rather than racing to construct a second.
 			let engine = engines.get(key);
 			if (engine === undefined) {
+				if (engines.size >= maxEngines && !evictOneIdle()) {
+					// Full of live cohorts — refuse rather than grow unbounded. Callers turn this into a clean
+					// capacity reply/drop (see the paths listed on `CoordEngineRegistryFullError`).
+					log("cohort-topic: coord-engine registry full (max=%d) — refusing new coord %s", maxEngines, key);
+					throw new CoordEngineRegistryFullError(maxEngines);
+				}
 				engine = createCoordEngine(ctx, coord, treeTier, participantCoord);
 				engines.set(key, engine);
 			}
+			touch(key);
 			return engine;
 		},
 		findByCoord(coord: RingCoord): CoordEngine | undefined {
-			return engines.get(bytesToB64url(coord));
+			const key = bytesToB64url(coord);
+			const engine = engines.get(key);
+			if (engine !== undefined) {
+				touch(key);
+			}
+			return engine;
 		},
 		findHolder(topicId: Uint8Array, participantId: Uint8Array): CoordEngine | undefined {
-			for (const engine of engines.values()) {
+			for (const [key, engine] of engines) {
 				if (engine.holds(topicId, participantId)) {
+					touch(key);
 					return engine;
 				}
 			}
 			return undefined;
 		},
 		findServing(topicId: Uint8Array, treeTier: number): CoordEngine | undefined {
-			for (const engine of engines.values()) {
+			for (const [key, engine] of engines) {
 				if (engine.treeTier === treeTier && engine.servesTopic(topicId)) {
+					touch(key);
 					return engine;
 				}
 			}
@@ -1319,6 +1456,7 @@ function createCoordRegistry(ctx: CoordEngineContext): CoordRegistry {
 				engine.close();
 			}
 			engines.clear();
+			recency.clear();
 		},
 	};
 }
@@ -1891,6 +2029,7 @@ function createCoordEngine(ctx: CoordEngineContext, servedCoord: RingCoord, tree
 		cohort,
 		cohortIdentityAt: (epoch: Uint8Array): readonly string[] | undefined => rotationState.membersAt(bytesToB64url(epoch)),
 		hasState: (): boolean => store.listAll().length > 0,
+		hasForwarders: (): boolean => coldStart.hasForwarders(),
 		holds: (topicId: Uint8Array, participantId: Uint8Array): boolean =>
 			store.getByParticipant(topicId, participantId) !== undefined,
 		records: (topicId: Uint8Array): readonly RegistrationRecord[] => store.listByTopic(topicId),
@@ -1955,7 +2094,8 @@ export interface DispatchChildLinkDeps {
 	readonly coord: (tier: number, participantCoord: Uint8Array, topicId: Uint8Array) => RingCoord;
 	/**
 	 * Resolve (creating if absent) the parent {@link CoordEngine} for its served coord — `registry.forCoord`.
-	 * Only its {@link CoordEngine.recordChild} is used.
+	 * Only its {@link CoordEngine.recordChild} is used. May throw {@link CoordEngineRegistryFullError} when
+	 * creating over a full-of-live registry; {@link dispatchChildLink} catches it and replies `rejected`.
 	 */
 	readonly resolveParent: (parentServedCoord: RingCoord, parentTier: number, childParticipantCoord: Uint8Array) => Pick<CoordEngine, "recordChild">;
 	/**
@@ -1997,8 +2137,19 @@ export async function dispatchChildLink(link: ChildLinkV1, deps: DispatchChildLi
 			return { v: 1, result: "rejected", reason: "child cohort signature not verified" };
 		}
 	}
-	// Step 3 — record on the parent engine (resolving it by its served coord).
-	const parent = deps.resolveParent(parentServedCoord, link.childTier - 1, childParticipantCoord);
+	// Step 3 — record on the parent engine (resolving it by its served coord). Resolving may create the parent
+	// engine, so it can hit the registry cap: a full-of-live registry refuses, which we turn into a clean
+	// `rejected` (the child re-links on a later round / after the cohort drains an idle engine) rather than an
+	// unhandled throw on the stream.
+	let parent: Pick<CoordEngine, "recordChild">;
+	try {
+		parent = deps.resolveParent(parentServedCoord, link.childTier - 1, childParticipantCoord);
+	} catch (err) {
+		if (err instanceof CoordEngineRegistryFullError) {
+			return { v: 1, result: "rejected", reason: "parent cohort capacity" };
+		}
+		throw err;
+	}
 	parent.recordChild(topicId, childCohortCoord, link.effectiveAt);
 	// Step 4 — ack.
 	return { v: 1, result: "linked" };
