@@ -46,22 +46,25 @@ export class OptimysticVirtualTableConnection implements VirtualTableConnection 
 		await this.txnBridge.rollbackTransaction();
 	}
 
-	/** Creates a savepoint with the given index */
-	createSavepoint(_index: number): void {
-		// Optimystic doesn't currently support savepoints
-		// This is a no-op for now
+	/**
+	 * Savepoint lifecycle. Quereus broadcasts these (by numeric depth) to every
+	 * connection for statement-, row-, and user-level atomicity; each connection
+	 * delegates to the shared {@link TransactionBridge}, which does the actual
+	 * snapshot/restore once (idempotent per depth). Synchronous: the underlying
+	 * collection snapshot/restore are in-memory ops.
+	 */
+	createSavepoint(index: number): void {
+		this.txnBridge.createSavepoint(index);
 	}
 
-	/** Releases a savepoint with the given index */
-	releaseSavepoint(_index: number): void {
-		// Optimystic doesn't currently support savepoints
-		// This is a no-op for now
+	/** Releases a savepoint with the given index (see {@link createSavepoint}) */
+	releaseSavepoint(index: number): void {
+		this.txnBridge.releaseSavepoint(index);
 	}
 
-	/** Rolls back to a savepoint with the given index */
-	rollbackToSavepoint(_index: number): void {
-		// Optimystic doesn't currently support savepoints
-		// This is a no-op for now
+	/** Rolls back to a savepoint with the given index (see {@link createSavepoint}) */
+	rollbackToSavepoint(index: number): void {
+		this.txnBridge.rollbackToSavepoint(index);
 	}
 
 	/** Disconnects and cleans up this connection */

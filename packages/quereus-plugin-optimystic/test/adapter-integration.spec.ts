@@ -478,31 +478,22 @@ describe('TransactionBridge (TEST-7.3.1)', () => {
 		});
 	});
 
-	describe('savepoint errors', () => {
-		it('should throw on savepoint operations (not yet implemented)', async () => {
+	describe('savepoint operations', () => {
+		it('depth-keyed savepoint methods are idempotent no-throws on a bare bridge', () => {
 			const { plugin } = createTestEnv();
 			const bridge = plugin.txnBridge;
 
-			try {
-				await bridge.savepoint('sp1');
-				expect.fail('Should have thrown');
-			} catch (e: any) {
-				expect(e.message).to.include('not yet implemented');
-			}
-
-			try {
-				await bridge.releaseSavepoint('sp1');
-				expect.fail('Should have thrown');
-			} catch (e: any) {
-				expect(e.message).to.include('not yet implemented');
-			}
-
-			try {
-				await bridge.rollbackToSavepoint('sp1');
-				expect.fail('Should have thrown');
-			} catch (e: any) {
-				expect(e.message).to.include('not yet implemented');
-			}
+			// With no collections registered and no active session, the depth-keyed
+			// savepoint operations reduce to no-ops. They must be safe (and
+			// idempotent — the shared bridge is broadcast to once per connection).
+			expect(() => bridge.createSavepoint(0)).to.not.throw();
+			expect(() => bridge.createSavepoint(0)).to.not.throw();
+			expect(() => bridge.rollbackToSavepoint(0)).to.not.throw();
+			expect(() => bridge.rollbackToSavepoint(0)).to.not.throw();
+			expect(() => bridge.releaseSavepoint(0)).to.not.throw();
+			// Rolling back / releasing an absent depth is a clean no-op.
+			expect(() => bridge.rollbackToSavepoint(5)).to.not.throw();
+			expect(() => bridge.releaseSavepoint(5)).to.not.throw();
 		});
 	});
 });

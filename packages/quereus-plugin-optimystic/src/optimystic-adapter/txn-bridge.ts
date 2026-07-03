@@ -63,6 +63,38 @@ export class TransactionBridge {
    * uniformly).
    */
   private collectionRegistry = new Map<CollectionId, Collection<any>>();
+  /**
+   * Depth-indexed savepoint snapshots for LEGACY (staged-tracker) mode. Each
+   * entry captures the staged state of EVERY registered collection (main table +
+   * all index trees) at the moment the savepoint was created, keyed by the
+   * numeric depth Quereus broadcasts (a stack index). {@link rollbackToSavepoint}
+   * restores from the captured snapshots to discard exactly the DML staged since;
+   * {@link releaseSavepoint} drops the snapshots without restoring.
+   *
+   * Snapshotting the full {@link collectionRegistry} — rather than only the trees
+   * marked dirty so far — is what covers "the tree set the bridge could flush":
+   * a tree still clean at create time but dirtied within the savepoint captures
+   * its clean staged state here, so rollback returns it to clean. (A tree
+   * *created* after the savepoint, e.g. a brand-new index mid-statement, is not in
+   * that create-time set — an accepted edge case, unreachable via the DML
+   * executor's per-statement savepoints since schema is stable within a statement.)
+   *
+   * Empty in session mode: there the coordinator owns tracker rollback (see
+   * {@link rollbackTransaction}), so a statement-level savepoint rollback is NOT
+   * applied to the coordinator's staged transforms — a documented gap. The
+   * primary bug this fixes (a failed/aborted statement flushing its partial rows
+   * at commit) is a legacy / staged-tracker concern; session mode routes rollback
+   * through the coordinator's own snapshot replay instead, and closing the
+   * statement-level gap there means teaching the coordinator per-statement
+   * checkpoints — out of scope here. See {@link createSavepoint}.
+   *
+   * NOTE: each savepoint re-snapshots every registered collection; the DML
+   * executor opens a statement-level savepoint around every non-FAIL statement, so
+   * this is O(collections × staged-transforms) per statement. Fine at current
+   * scale; if a schema with many indexes shows savepoint overhead, capture only
+   * the dirty set plus copy-on-first-dirty into open savepoints instead.
+   */
+  private savepoints = new Map<number, Map<Collection<any>, unknown>>();
   /** Optional transaction session for distributed consensus */
   private session: TransactionSession | null = null;
   /** Optional coordinator for transaction mode */
@@ -171,6 +203,7 @@ export class TransactionBridge {
     // Clear any previously accumulated statements + staged-tree tracking
     this.accumulatedStatements = [];
     this.dirtyTrees.clear();
+    this.savepoints.clear();
 
     // Create TransactionSession if transaction mode is enabled
     if (this.coordinator && this.engine && this.schemaHashProvider) {
@@ -241,6 +274,7 @@ export class TransactionBridge {
       this.accumulatedStatements = [];
       this.session = null;
       this.dirtyTrees.clear();
+      this.savepoints.clear();
 
     } catch (error) {
       // If commit fails, rollback
@@ -289,6 +323,7 @@ export class TransactionBridge {
       }
     }
     this.dirtyTrees.clear();
+    this.savepoints.clear();
 
     // Clean up local state
     this.currentTransaction.collections.clear();
@@ -405,26 +440,71 @@ export class TransactionBridge {
   }
 
   /**
-   * Savepoint support (if needed by Quereus)
+   * Create a savepoint at the numeric `depth` Quereus broadcasts (a stack index).
+   *
+   * Captures the staged state of every registered collection so
+   * {@link rollbackToSavepoint} can revert exactly the DML staged since. Quereus
+   * wraps every non-FAIL DML statement (and every OR FAIL row) in an internal
+   * savepoint and rolls back to it on a mid-statement violation, so this is what
+   * makes an ordinary failed/aborted statement actually discard its partial rows
+   * rather than leaving them staged to flush at the next commit.
+   *
+   * Idempotent per depth: ONE bridge is shared across every table connection and
+   * Quereus broadcasts createSavepoint(depth) once per connection, so the bridge
+   * sees the same depth N times — only the first capture is kept.
+   *
+   * Legacy (staged-tracker) mode only — see {@link savepoints}.
    */
-  async savepoint(_name: string): Promise<void> {
-    // Optimystic doesn't have explicit savepoint support
-    // This would need to be implemented using collection snapshots
-    throw new Error('Savepoints not yet implemented');
+  createSavepoint(depth: number): void {
+    if (this.session) {
+      return;
+    }
+    if (this.savepoints.has(depth)) {
+      return;
+    }
+    const snapshots = new Map<Collection<any>, unknown>();
+    for (const collection of this.collectionRegistry.values()) {
+      snapshots.set(collection, collection.snapshotPending());
+    }
+    this.savepoints.set(depth, snapshots);
   }
 
   /**
-   * Release savepoint
+   * Roll back to the savepoint at `depth`, restoring every collection to the
+   * staged state captured at create time and discarding savepoints nested ABOVE
+   * `depth`. The target itself is PRESERVED (SQL standard: it can be rolled back
+   * to again), mirroring Quereus's own memory-layer connection.
+   *
+   * Idempotent / no-op when `depth` is absent (session mode, or already released).
+   * `restorePending` is itself idempotent, so the repeated per-connection
+   * broadcast restores to the same state each time.
    */
-  async releaseSavepoint(_name: string): Promise<void> {
-    throw new Error('Savepoints not yet implemented');
+  rollbackToSavepoint(depth: number): void {
+    const snapshots = this.savepoints.get(depth);
+    if (!snapshots) {
+      return;
+    }
+    for (const [collection, snapshot] of snapshots) {
+      collection.restorePending(snapshot as Parameters<Collection<any>['restorePending']>[0]);
+    }
+    for (const openDepth of this.savepoints.keys()) {
+      if (openDepth > depth) {
+        this.savepoints.delete(openDepth);
+      }
+    }
   }
 
   /**
-   * Rollback to savepoint
+   * Release the savepoint at `depth` and every savepoint nested above it WITHOUT
+   * restoring — the staged changes are absorbed into the enclosing scope and stay
+   * staged (flushed at commit). Never flushes. Idempotent / no-op when absent.
    */
-  async rollbackToSavepoint(_name: string): Promise<void> {
-    throw new Error('Savepoints not yet implemented');
+  releaseSavepoint(depth: number): void {
+    for (const openDepth of this.savepoints.keys()) {
+      if (openDepth >= depth) {
+        this.savepoints.delete(openDepth);
+      }
+    }
   }
 
   /**
