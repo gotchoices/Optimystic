@@ -1744,24 +1744,21 @@ export class OptimysticModule implements VirtualTableModule<VirtualTable, Optimy
           bestExplains = `Partial primary key scan (cost: ${partialPkCost.toFixed(2)})`;
         }
       } else if (isPkColumn && ['>', '>=', '<', '<='].includes(filter.op)) {
-        // Primary key range scan: O(log n + k)
-        const selectivity = 0.25; // Heuristic for range queries
+        // NOTE: Range seek deliberately not pushed down. RowCodec encodes numbers as toString()
+        // (not order-preserving) and the tree uses a raw lexicographic comparator, so a seek span
+        // would return wrong results for numeric/DESC keys. Let Quereus apply the predicate over a
+        // full scan instead. Revisit when debt-optimystic-pk-range-seek lands (prereq:
+        // optimystic-tree-comparator-lexicographic-missort).
+        const selectivity = 0.25;
         const rangeCost = Math.log2(Math.max(2, tableRowCount)) * 2 + tableRowCount * selectivity;
         const rangeRows = Math.floor(tableRowCount * selectivity);
 
         if (rangeCost < bestCost) {
           bestCost = rangeCost;
           bestRows = rangeRows;
-          bestHandledFilters = request.filters.map((_, idx) => idx === i);
-          bestIsSet = false;
-          bestIndexName = '_primary_';
-          bestSeekColumnIndexes = [...pkColumns];
+          bestHandledFilters = request.filters.map(() => false); // NOT handled — engine applies predicate
           bestExplains = `Primary key range scan (selectivity: ${selectivity.toFixed(2)}, cost: ${rangeCost.toFixed(2)})`;
-
-          // Check if ORDER BY matches primary key order
-          if (request.requiredOrdering && this.orderingMatchesPrimaryKey(request.requiredOrdering, tableInfo)) {
-            bestOrdering = [...request.requiredOrdering];
-          }
+          // No bestIndexName / bestSeekColumnIndexes / bestOrdering — no seek until comparator is correct
         }
       }
     }

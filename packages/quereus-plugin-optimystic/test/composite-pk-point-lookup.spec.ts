@@ -126,6 +126,27 @@ describe('composite-PK point-lookup key assembly', function () {
 		}
 	});
 
+	it('pk-range-filter: range predicate on TEXT PK returns matching subset, not full table', async () => {
+		const { db } = createDb(dir);
+		try {
+			await db.exec(
+				`create table R (id text primary key, v text) using optimystic('tree://test/pkrange')`,
+			);
+			for (const k of ['a', 'b', 'c', 'd', 'e']) {
+				await db.exec(`insert into R (id, v) values ('${k}', 'val-${k}')`);
+			}
+			expect(await selectCount(db, 'select count(1) from R')).to.equal(5);
+
+			// id > 'c' → 'd', 'e' → 2 rows
+			expect(await selectCount(db, `select count(1) from R where id > 'c'`)).to.equal(2);
+
+			// id > 'a' AND id < 'e' → 'b', 'c', 'd' → 3 rows
+			expect(await selectCount(db, `select count(1) from R where id > 'a' and id < 'e'`)).to.equal(3);
+		} finally {
+			db.close();
+		}
+	});
+
 	it('finds a row by a three-column composite primary key', async () => {
 		const { db } = createDb(dir);
 		try {
