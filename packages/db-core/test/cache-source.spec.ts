@@ -178,6 +178,43 @@ describe('CacheSource', () => {
 		});
 	});
 
+	describe('getGeneration', () => {
+		it('should start at 0 for an unseen id', () => {
+			expect(cache.getGeneration('a' as BlockId)).to.equal(0);
+		});
+
+		it('should advance on miss-load', async () => {
+			const before = cache.getGeneration('a' as BlockId);
+			await cache.tryGet('a' as BlockId);
+			expect(cache.getGeneration('a' as BlockId)).to.be.greaterThan(before);
+		});
+
+		it('should be stable across pure cache hits', async () => {
+			await cache.tryGet('a' as BlockId);
+			const gen = cache.getGeneration('a' as BlockId);
+			await cache.tryGet('a' as BlockId);
+			await cache.tryGet('a' as BlockId);
+			expect(cache.getGeneration('a' as BlockId)).to.equal(gen);
+		});
+
+		it('should advance when transformCache updates a cached block', async () => {
+			await cache.tryGet('a' as BlockId);
+			const gen = cache.getGeneration('a' as BlockId);
+
+			const op: BlockOperation = ['data', 0, 0, 'updated'];
+			cache.transformCache({ updates: { a: [op] } });
+
+			expect(cache.getGeneration('a' as BlockId)).to.be.greaterThan(gen);
+		});
+
+		it('should advance on clear', async () => {
+			await cache.tryGet('a' as BlockId);
+			const gen = cache.getGeneration('a' as BlockId);
+			cache.clear(['a' as BlockId]);
+			expect(cache.getGeneration('a' as BlockId)).to.be.greaterThan(gen);
+		});
+	});
+
 	describe('LRU eviction', () => {
 		it('should evict oldest entry when maxSize exceeded', async () => {
 			const smallCache = new CacheSource(source, 2);
