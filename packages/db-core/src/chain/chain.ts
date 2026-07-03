@@ -121,7 +121,9 @@ export class Chain<TEntry> {
 				priorId: tail.header.id,
 				nextId: undefined,
 			} as ChainDataNode<TEntry>;
-			await this.options?.newBlock?.(newTail, oldTail);
+			// Predecessor is the running `tail` (immediately preceding block), NOT the original
+			// `oldTail`: across a multi-block append each new block links to the one before it.
+			await this.options?.newBlock?.(newTail, tail);
 			trx.insert(newTail);
 			apply(trx, tail, [nextId$, 0, 0, newTail.header.id]);
 			tail = newTail;

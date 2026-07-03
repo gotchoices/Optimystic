@@ -1,6 +1,10 @@
 import { expect } from 'chai'
-import { Log } from '../src/log/index.js'
+import { sha256 } from 'multiformats/hashes/sha2'
+import { toString as uint8ArrayToString } from 'uint8arrays/to-string'
+import { Log, logBlockHashPayload } from '../src/log/index.js'
 import type { LogBlock } from '../src/log/index.js'
+import type { LogEntry } from '../src/log/index.js'
+import { Chain } from '../src/chain/chain.js'
 import { TestLogStore } from './test-log-store.js'
 import type { ActionId, ActionRev } from '../src/index.js'
 import { generateNumericActionId } from './generate-numeric-action-id.js'
@@ -164,6 +168,45 @@ describe('Log', () => {
     expect(typeof secondBlock.priorHash).to.equal('string')
     // First block should not have nextHash since nothing points to it
     expect(firstBlock.priorHash).to.be.undefined
+  })
+
+  it('should link the priorHash chain end to end across a single multi-block Chain.add', async () => {
+    // Drive a raw Chain through the Log's real chain options (block factories + priorHash hook),
+    // appending enough entries in ONE add() to create three blocks. Then re-derive every block's
+    // priorHash from the canonical payload of its predecessor and compare to the stored value.
+    // Fails on the pre-fix code (wrong predecessor + raw-block hash); passes after the fix.
+    const chainStore = new TestLogStore()
+    const chain = await Chain.create<LogEntry<string>>(chainStore, Log.getChainOptions<string>(chainStore))
+
+    const originalTailId = (await chain.getTail())!.block.header.id
+
+    // 32 entries fill the tail; the next 64 create two new blocks -> three blocks total.
+    const entries: LogEntry<string>[] = Array.from({ length: 32 * 3 }, (_, i) => ({
+      timestamp: 0,
+      rev: i + 1,
+      action: { actionId: generateNumericActionId(i + 1), actions: [`a${i}`], blockIds: [] },
+    }))
+    await chain.add(...entries)
+
+    // Walk head -> tail via nextId to collect the blocks in order.
+    const blocks: LogBlock<string>[] = []
+    let block: LogBlock<string> | undefined = await chainStore.tryGet(originalTailId) as LogBlock<string>
+    while (block) {
+      blocks.push(block)
+      block = block.nextId ? await chainStore.tryGet(block.nextId) as LogBlock<string> : undefined
+    }
+    expect(blocks).to.have.length(3)
+
+    // Head block has no predecessor, so no priorHash.
+    expect(blocks[0]!.priorHash).to.be.undefined
+
+    // Every subsequent block's stored priorHash must equal a fresh hash of its predecessor's
+    // canonical payload (this is exactly what a verifier would recompute).
+    for (let i = 1; i < blocks.length; i++) {
+      const digest = await sha256.digest(new TextEncoder().encode(JSON.stringify(logBlockHashPayload(blocks[i - 1]!))))
+      const expected = uint8ArrayToString(digest.digest, 'base64url')
+      expect(blocks[i]!.priorHash, `priorHash mismatch at block ${i}`).to.equal(expected)
+    }
   })
 
   it('should handle empty log operations', async () => {

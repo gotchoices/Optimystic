@@ -16,6 +16,26 @@ export type LogBlock<TAction> = ChainDataNode<LogEntry<TAction>>
 
 export const priorHash$ = nameof<LogBlock<any>>("priorHash");
 
+/**
+ * Canonical byte payload covered by {@link LogBlock.priorHash}: every field of a log block EXCEPT
+ * the mutable structural links (`nextId`/`priorId`). Those links are rewritten *after* the hash is
+ * taken — `nextId` when the following block is appended ({@link Chain.add}), and `priorId`/`nextId`
+ * when blocks are removed ({@link Chain.pop}/{@link Chain.dequeue}) — so hashing the raw block would
+ * not match the bytes that end up stored. The content-bearing fields (`header`, `entries`,
+ * `priorHash`) are covered. Any verifier that re-hashes a stored block to check `priorHash` MUST
+ * reproduce exactly this payload (strip `nextId` and `priorId`; hash the rest).
+ *
+ * NOTE: the caller hashes `JSON.stringify` of this object, which is key-order dependent and not a
+ * canonical encoding. Fine today (blocks are built with a stable key order and the in-process store
+ * preserves it), but if a block is ever re-serialized by a store/codec that reorders keys or drops
+ * `undefined`s differently, a re-hash won't match the recorded priorHash — switch to a canonical
+ * encoding (sorted keys / dag-cbor) before that happens.
+ */
+export function logBlockHashPayload<TAction>(block: LogBlock<TAction>) {
+	const { nextId, priorId, ...covered } = block;
+	return covered;
+}
+
 export class Log<TAction> {
 	protected constructor(
 		private readonly chain: Chain<LogEntry<TAction>>,
@@ -224,13 +244,17 @@ export class Log<TAction> {
 		return pendings;
 	}
 
-	private static getChainOptions<TAction>(store: BlockStore<IBlock>) {
+	/** Chain options used by every log: block type factories plus the priorHash `newBlock` hook.
+	 *  Exposed (not private) so tests can drive a raw {@link Chain} through the exact same hook. */
+	static getChainOptions<TAction>(store: BlockStore<IBlock>) {
 		return {
 			createDataBlock: () => ({ header: store.createBlockHeader(LogDataBlockType) }),
 			createHeaderBlock: (id?: BlockId) => ({ header: store.createBlockHeader(LogHeaderBlockType, id) }),
 			newBlock: async (newTail: LogBlock<TAction>, oldTail: LogBlock<TAction> | undefined) => {
 				if (oldTail) {
-					const hash = await sha256.digest(new TextEncoder().encode(JSON.stringify(oldTail)));
+					// Hash the canonical payload (excludes the mutable nextId/priorId links) so the
+					// recorded priorHash matches a later re-hash of the stored predecessor block.
+					const hash = await sha256.digest(new TextEncoder().encode(JSON.stringify(logBlockHashPayload(oldTail))));
 					newTail.priorHash = uint8ArrayToString(hash.digest, 'base64url');
 				}
 			},

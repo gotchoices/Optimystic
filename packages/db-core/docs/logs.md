@@ -45,6 +45,29 @@ type LogBlock<TAction> = ChainDataNode<LogEntry<TAction>> & {
 };
 ```
 
+#### Canonical `priorHash` payload
+
+`priorHash` is the base64url SHA-256 of a **canonical payload** of the predecessor block, not of its
+raw serialized form. The payload **covers** the content-bearing fields and **excludes** the mutable
+structural link fields:
+
+| Field       | Covered by `priorHash`? | Why |
+| ----------- | ----------------------- | --- |
+| `header`    | yes                     | block identity/type |
+| `entries`   | yes                     | the log content |
+| `priorHash` | yes                     | chains each block's hash to the one before it |
+| `nextId`    | **no**                  | assigned *after* the hash is taken (when the following block is appended) and cleared by `dequeue` |
+| `priorId`   | **no**                  | cleared by `pop` when the head block is removed |
+
+The link fields are rewritten by append/`pop`/`dequeue` *after* the hash is computed, so hashing the
+raw block would record bytes that no longer match what is stored. Excluding them keeps the hashed
+bytes equal to the stored bytes.
+
+The single source of truth for this payload is `logBlockHashPayload(block)` in
+`src/log/log.ts` (it strips `nextId`/`priorId`). **Any future verifier that re-hashes a stored block
+to check `priorHash` MUST reproduce exactly this payload** — hash `logBlockHashPayload(predecessor)`
+and compare to the successor's recorded `priorHash`.
+
 ## Log APIs
 
 ### Creation and Access

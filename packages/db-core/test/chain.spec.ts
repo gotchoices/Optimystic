@@ -131,6 +131,40 @@ describe('Chain', () => {
             expect(tailBlock.entries).to.deep.equal(['test1', 'test2', 'test3']);
         });
 
+        it('should pass the running predecessor to newBlock across multiple new blocks', async () => {
+            // Regression for: a single add() spanning >=3 blocks told every new block its
+            // predecessor was the ORIGINAL tail, instead of the immediately preceding new block.
+            const trackingStore = new TestBlockStore();
+            const calls: Array<{ newId: string; oldId: string | undefined }> = [];
+            const trackingChain = await Chain.create<string>(trackingStore, {
+                newBlock: async (newTail, oldTail) => {
+                    calls.push({ newId: newTail.header.id, oldId: oldTail?.header.id });
+                },
+            });
+
+            const originalTail = (await trackingChain.getTail())!.block as ChainDataNode<string>;
+
+            // 32 entries fill the tail; the next 64 create two new blocks -> two newBlock calls.
+            const entries = Array.from({ length: EntriesPerBlock * 3 }, (_, i) => `e${i}`);
+            await trackingChain.add(...entries);
+
+            expect(calls).to.have.length(2);
+            // First new block's predecessor is the original tail.
+            expect(calls[0]!.oldId).to.equal(originalTail.header.id);
+            // Second new block's predecessor is the FIRST new block, not the original tail.
+            expect(calls[1]!.oldId).to.equal(calls[0]!.newId);
+            expect(calls[1]!.oldId).to.not.equal(originalTail.header.id);
+
+            // priorId block-pointer links remain correct end to end (block3 -> block2 -> tail).
+            const block3 = (await trackingChain.getTail())!.block as ChainDataNode<string>;
+            expect(block3.header.id).to.equal(calls[1]!.newId);
+            const block2 = await trackingStore.tryGet(block3.priorId!) as ChainDataNode<string>;
+            expect(block2.header.id).to.equal(calls[0]!.newId);
+            expect(block2.priorId).to.equal(originalTail.header.id);
+            const block1 = await trackingStore.tryGet(block2.priorId!) as ChainDataNode<string>;
+            expect(block1.priorId).to.be.undefined;
+        });
+
         it('should create new block when current block is full', async () => {
             const entries = Array.from({ length: EntriesPerBlock + 1 }, (_, i) => `test${i}`);
             await chain.add(...entries);
