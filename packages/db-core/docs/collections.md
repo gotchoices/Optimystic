@@ -133,14 +133,18 @@ async update() {
   // 3. Process remote actions and detect conflicts
   let anyConflicts = false;
   for (const entry of latest?.entries ?? []) {
-    // Filter pending actions that conflict with remote actions
-    this.pending = this.pending.map(p => 
-      this.doFilterConflict(p, entry.actions) ? p : undefined
-    ).filter(Boolean) as Action<TAction>[];
-    
-    // Invalidate cache for affected blocks
+    // Map each pending action to its effective form: the original, a replacement,
+    // or dropped (undefined). A rewritten or discarded action mutates the pending set.
+    const before = this.pending;
+    const after = before
+      .map(p => this.doFilterConflict(p, entry.actions))
+      .filter((a): a is Action<TAction> => a !== undefined);
+    const mutated = after.length !== before.length || after.some((a, i) => a !== before[i]);
+    this.pending = after;
+
+    // Invalidate cache for affected blocks; force a replay when filtering mutated pending
     this.sourceCache.clear(entry.blockIds);
-    anyConflicts = anyConflicts || tracker.conflicts(new Set(entry.blockIds)).length > 0;
+    anyConflicts = anyConflicts || mutated || tracker.conflicts(new Set(entry.blockIds)).length > 0;
   }
   
   // 4. If conflicts detected, replay local actions on updated state

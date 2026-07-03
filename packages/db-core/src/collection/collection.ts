@@ -129,11 +129,22 @@ export class Collection<TAction> implements ICollection<TAction> {
 		// Process the entries and track the blocks they affect
 		let anyConflicts = false;
 		for (const entry of latest?.entries ?? []) {
-			// Filter any pending actions that conflict with the remote actions
-			this.pending = this.pending.map(p => this.doFilterConflict(p, entry.actions) ? p : undefined)
-				.filter(Boolean) as Action<TAction>[];
+			// Filter any pending actions that conflict with the remote actions. Each pending
+			// action maps to its effective form: the original, a replacement, or dropped.
+			const before = this.pending;
+			const after = before
+				.map(p => this.doFilterConflict(p, entry.actions))
+				.filter((a): a is Action<TAction> => a !== undefined);
+			// A replacement or a discard changes the pending set; the tracker still holds the
+			// pre-filter transforms, so force a replay to re-stage against the effective actions.
+			// Identity comparison per the contract: keep => same instance, replace => new instance.
+			// NOTE: a filterConflict hook that always allocates a fresh (but equal) instance instead
+			// of returning the same one forces a replay on every update — if that ever shows up as a
+			// hot path, compare by value/id here instead of by reference.
+			const mutated = after.length !== before.length || after.some((a, i) => a !== before[i]);
+			this.pending = after;
 			this.sourceCache.clear(entry.blockIds);
-			anyConflicts = anyConflicts || this.tracker.conflicts(new Set(entry.blockIds)).length > 0;
+			anyConflicts = anyConflicts || mutated || this.tracker.conflicts(new Set(entry.blockIds)).length > 0;
 		}
 
 		// React to durable invalidations that landed since we last synced. getFrom intentionally skips
@@ -321,20 +332,12 @@ export class Collection<TAction> implements ICollection<TAction> {
 
 	/** Called for each local action that may be in conflict with a remote action (always called under latch).
 	 * @param action - The local action to check
-	 * @param potential - The remote action that is potentially in conflict
-	 * @returns true if the action should be kept, false to discard it
+	 * @param potential - The remote actions that are potentially in conflict
+	 * @returns The effective action to keep: the original (unchanged), a replacement
+	 * 	instance (applied instead of the original), or undefined to discard it.
 	 */
-	protected doFilterConflict(action: Action<TAction>, potential: Action<TAction>[]) {
-		if (this.filterConflict) {
-			const replacement = this.filterConflict(action, potential);
-			if (!replacement) {
-				return false;
-			} else if (replacement !== action) {
-				// Queue replacement - it will be applied in replayActions()
-				this.pending.push(replacement);
-			}
-		}
-		return true;
+	protected doFilterConflict(action: Action<TAction>, potential: Action<TAction>[]): Action<TAction> | undefined {
+		return this.filterConflict ? this.filterConflict(action, potential) : action;
 	}
 
 	/** Bootstrap ActionContext from the committed tail block's state.
