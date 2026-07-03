@@ -171,6 +171,28 @@ describe('Tracker read-path memo', () => {
 			expect(second!.items).to.deep.equal(['op', 'base']); // op re-applied over the new base
 		});
 
+		it('an update after external source drift does not mask the stale base (gen is not refreshed)', async () => {
+			// Guards the crux of the change: update() folds the new op into the memo block but must
+			// leave memo.gen at the base-content generation. If update() instead refreshed gen to the
+			// current source generation, the post-drift read below would find gen === memo.gen and serve
+			// the stale (pre-drift) base with ops folded on top, silently returning wrong data.
+			const src = new FakeSource();
+			src.set('h', makeBlock('h', 'orig', [])); // gen 1
+			const tracker = new Tracker<TestBlock>(src);
+			tracker.update('h' as BlockId, appendOp('op'));
+
+			const first = await tracker.tryGet('h' as BlockId); // materialize, memo.gen = 1
+			expect(first!.data).to.equal('orig');
+
+			src.set('h', makeBlock('h', 'changed', ['base'])); // external drift, gen 2
+			tracker.update('h' as BlockId, appendOp('op2'));   // folds into memo; must NOT refresh gen
+
+			const second = await tracker.tryGet('h' as BlockId);
+			// Drift detected (gen 2 !== memo.gen 1) => reload new base, replay BOTH ops over it.
+			expect(second!.data).to.equal('changed');
+			expect(second!.items).to.deep.equal(['op2', 'op', 'base']);
+		});
+
 		it('invalidates the memo on delete and reset', async () => {
 			const src = new FakeSource();
 			src.set('h', makeBlock('h', 'base', []));
