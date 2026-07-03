@@ -13,9 +13,10 @@ export type CollectionInitOptions<TAction> = {
 	createHeaderBlock: (id: BlockId, store: BlockStore<IBlock>) => IBlock;
 	/** Called for each local action that is potentially in conflict with a remote action.
 	 * @param action - The local action to check
-	 * @param potential - The remote action that is potentially in conflict
-	 * @returns The original action, a replacement action (return a new instance; will be
-	 * 	applied through act()), or undefined to discard this action
+	 * @param potential - The remote actions that are potentially in conflict
+	 * @returns The original action (return the same instance to keep it as-is), a replacement
+	 * 	action (return a new instance to apply instead of the original — it is re-staged via
+	 * 	the conflict replay), or undefined to discard this action
 	 */
 	filterConflict?: (action: Action<TAction>, potential: Action<TAction>[]) => Action<TAction> | undefined
 }

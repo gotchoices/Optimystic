@@ -1,3 +1,10 @@
+<!-- resume-note -->
+RESUME: A prior agent run on this ticket did not complete.
+  Prior run: 2026-07-03T01:00:52.463Z (agent: claude)
+  Log file: C:\projects\optimystic\tickets\.logs\1-collection-conflict-replacement-discarded.review.2026-07-03T01-00-52-463Z.log
+Read the log to see what was done. Resume where it left off.
+If the prior run hit a timeout or repeated error, be cautious not to rush into the same situation.
+<!-- /resume-note -->
 ----
 description: A collection's conflict-merge hook could rewrite a pending change, but the rewrite was thrown away and the un-merged original kept instead — now fixed so the rewrite actually replaces the original and takes effect.
 files: packages/db-core/src/collection/collection.ts, packages/db-core/test/collection.spec.ts, packages/db-core/docs/collections.md
