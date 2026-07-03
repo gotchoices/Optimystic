@@ -2,7 +2,7 @@ import { use, expect } from 'chai'
 import chaiAsPromised from 'chai-as-promised'
 use(chaiAsPromised)
 import { Collection, SyncRetryExhaustedError, type CollectionInitOptions } from '../src/collection/index.js'
-import { TestTransactor, FlakyCommitTransactor } from './test-transactor.js'
+import { TestTransactor, FlakyCommitTransactor } from '../src/testing/test-transactor.js'
 import type { Action, ActionHandler, BlockStore, IBlock, ITransactor, BlockGets, GetBlockResults, ActionBlocks, BlockActionStatus, PendRequest, PendResult, CommitRequest, CommitResult } from '../src/index.js'
 
 interface TestAction {

@@ -5,7 +5,7 @@ import {
 } from '../src/index.js'
 import { DiaryHeaderBlockType } from '../src/collections/diary/struct.js'
 import { TreeHeaderBlockType } from '../src/collections/tree/struct.js'
-import { TestTransactor } from './test-transactor.js'
+import { TestTransactor } from '../src/testing/test-transactor.js'
 
 // Import diary and tree to trigger their side-effect registrations
 import '../src/collections/diary/diary.js'

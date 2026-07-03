@@ -1,6 +1,6 @@
 import { expect } from 'chai'
 import { Tree } from '../src/collections/tree/index.js'
-import { TestTransactor } from './test-transactor.js'
+import { TestTransactor } from '../src/testing/test-transactor.js'
 import { KeyRange, KeyBound } from '../src/btree/index.js'
 import { isTransformsEmpty, copyTransforms } from '../src/index.js'
 

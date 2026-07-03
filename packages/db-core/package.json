@@ -17,8 +17,8 @@
       "import": "./dist/src/index.js"
     },
     "./test": {
-      "types": "./dist/test/test-transactor.d.ts",
-      "import": "./dist/test/test-transactor.js"
+      "types": "./dist/src/testing/test-transactor.d.ts",
+      "import": "./dist/src/testing/test-transactor.js"
     }
   },
   "repository": {

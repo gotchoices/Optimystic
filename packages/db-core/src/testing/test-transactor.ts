@@ -1,5 +1,5 @@
-import { type ITransactor, type GetBlockResults, type ActionBlocks, type BlockActionStatus, type PendResult, type CommitResult, type PendRequest, type BlockId, type CommitRequest, type BlockGets, type IBlock, type ActionId, type ActionTransforms, type Transform, type Transforms, ensuredMap, Latches, type ClusterNomineesResult } from "../src/index.js";
-import { applyTransform, blockIdsForTransforms, transformForBlockId, emptyTransforms, concatTransform, transformsFromTransform } from "../src/transform/index.js";
+import { type ITransactor, type GetBlockResults, type ActionBlocks, type BlockActionStatus, type PendResult, type CommitResult, type PendRequest, type BlockId, type CommitRequest, type BlockGets, type IBlock, type ActionId, type ActionTransforms, type Transform, type Transforms, ensuredMap, Latches, type ClusterNomineesResult } from "../index.js";
+import { applyTransform, blockIdsForTransforms, transformForBlockId, emptyTransforms, concatTransform, transformsFromTransform } from "../transform/index.js";
 
 type RevisionNumber = number;
 

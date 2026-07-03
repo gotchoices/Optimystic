@@ -1,6 +1,6 @@
 import { sha256 } from 'multiformats/hashes/sha2'
 import { createEd25519PeerId } from '@libp2p/peer-id-factory';
-import { TestTransactor } from './test-transactor.js';
+import { TestTransactor } from '../src/testing/test-transactor.js';
 import type { ClusterPeers, FindCoordinatorOptions, IKeyNetwork, PeerId } from '../src/index.js';
 
 export type Scenario = {

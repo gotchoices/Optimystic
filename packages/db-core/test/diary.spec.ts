@@ -1,6 +1,6 @@
 import { expect } from 'chai'
 import { Diary } from '../src/collections/diary/index.js'
-import { TestTransactor } from './test-transactor.js'
+import { TestTransactor } from '../src/testing/test-transactor.js'
 
 interface TestEntry {
   id: number

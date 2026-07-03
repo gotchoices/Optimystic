@@ -21,7 +21,7 @@ import {
 	type BlockId,
 	type IBlock,
 } from '../src/index.js';
-import { TestTransactor } from './test-transactor.js';
+import { TestTransactor } from '../src/testing/test-transactor.js';
 
 describe('Transaction', () => {
 	describe('Transaction Structure', () => {

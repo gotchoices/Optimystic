@@ -9,7 +9,7 @@ import type { PeerId } from '../src/index.js'
 import { peerIdFromString } from '../src/network/types.js'
 import { toString as uint8ArrayToString } from 'uint8arrays/to-string'
 import { generateRandomActionId } from './generate-random-action-id.js'
-import { TestTransactor } from './test-transactor.js'
+import { TestTransactor } from '../src/testing/test-transactor.js'
 
 describe('NetworkTransactor', () => {
   // Helper to generate block IDs

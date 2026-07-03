@@ -2,7 +2,7 @@ import { use, expect } from 'chai'
 import chaiAsPromised from 'chai-as-promised'
 use(chaiAsPromised)
 import { TransactorSource } from '../src/transactor/transactor-source.js'
-import { TestTransactor } from './test-transactor.js'
+import { TestTransactor } from '../src/testing/test-transactor.js'
 import { randomBytes } from '@libp2p/crypto'
 import { toString as uint8ArrayToString } from 'uint8arrays/to-string'
 import type { IBlock, ActionId, ActionContext, Transforms, BlockOperation, CommitRequest, CommitResult } from '../src/index.js'

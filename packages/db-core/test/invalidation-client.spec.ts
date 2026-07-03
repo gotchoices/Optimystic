@@ -8,7 +8,7 @@ import { Tracker } from '../src/transform/tracker.js'
 import { CacheSource } from '../src/transform/cache-source.js'
 import { TransactorSource } from '../src/transactor/transactor-source.js'
 import { peerIdFromString } from '../src/network/types.js'
-import { TestTransactor } from './test-transactor.js'
+import { TestTransactor } from '../src/testing/test-transactor.js'
 import type {
 	Action, ActionHandler, BlockStore, IBlock, IRepo, BlockId, CollectionId, ActionId,
 	IKeyNetwork, ClusterPeers, FindCoordinatorOptions, PeerId, DisputeResolutionProof, RevertedBlock,
