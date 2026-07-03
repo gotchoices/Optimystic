@@ -527,6 +527,59 @@ describe('Collection', () => {
       expect(values).to.not.include('local')
     })
 
+    it('should commit the replacement block effects, not the original', async () => {
+      // Regression guard for the load-bearing replay. The plain-log replacement test above
+      // passes even without the forced replay, because the map assigns the replacement into
+      // `pending` directly. The real bug is block-level: without a replay the tracker still
+      // holds the ORIGINAL action's block transform while `pending` reflects the replacement,
+      // so the committed blocks diverge from the committed log. This handler embeds the action
+      // value into the inserted block so committed block content is observable; the assertions
+      // fail if `mutated`-forced replay is removed (committed blocks would carry 'local', and
+      // never 'merged').
+      const valueModules: Record<string, ActionHandler<TestAction>> = {
+        'set': async (action, store) => {
+          const blockId = store.generateId()
+          store.insert({
+            header: store.createBlockHeader('TEST', blockId),
+            value: action.data.value
+          } as IBlock)
+        },
+        'update': async () => { /* no-op */ }
+      }
+      const optionsWithFilter: CollectionInitOptions<TestAction> = {
+        ...initOptions,
+        modules: valueModules,
+        filterConflict: (action, _potential) =>
+          action.data.value === 'local'
+            ? { type: 'set', data: { value: 'merged', timestamp: action.data.timestamp } }
+            : action
+      }
+
+      const collection1 = await Collection.createOrOpen<TestAction>(transactor, collectionId, optionsWithFilter)
+      const collection2 = await Collection.createOrOpen<TestAction>(transactor, collectionId, optionsWithFilter)
+
+      await collection1.updateAndSync()
+      await collection2.update()
+
+      await collection1.act({ type: 'set', data: { value: 'remote', timestamp: 1 } })
+      await collection1.sync()
+
+      await collection2.act({ type: 'set', data: { value: 'local', timestamp: 2 } })
+      await collection2.updateAndSync()
+
+      // Collect the `value` of every committed inserted block.
+      const committedValues = new Set<string>()
+      for (const [, at] of transactor.getCommittedActions()) {
+        for (const block of Object.values(at.transforms.inserts ?? {})) {
+          const value = (block as { value?: string }).value
+          if (value !== undefined) committedValues.add(value)
+        }
+      }
+      // The rewritten action's block effect is committed; the original's is not.
+      expect(committedValues.has('merged'), 'replacement block effect must be committed').to.equal(true)
+      expect(committedValues.has('local'), 'original block effect must not survive the rewrite').to.equal(false)
+    })
+
     it('should keep pending when no filterConflict provided', async () => {
       const collection1 = await Collection.createOrOpen<TestAction>(transactor, collectionId, initOptions)
       const collection2 = await Collection.createOrOpen<TestAction>(transactor, collectionId, initOptions)
