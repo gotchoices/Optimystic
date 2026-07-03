@@ -76,7 +76,8 @@ export interface ColumnDefinition {
 /**
  * Row data as stored in the tree
  * Format: [primaryKey, encodedRow]
- * - primaryKey: string representation of the primary key (composite keys are joined with \x00)
+ * - primaryKey: string representation of the primary key (composite keys are framed via
+ *   key-encoding's injective tuple encoding, not a raw \x00 join)
  * - encodedRow: JSON-encoded row data
  */
 export type RowData = [string, string];

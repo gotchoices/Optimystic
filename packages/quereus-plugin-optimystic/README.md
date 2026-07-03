@@ -77,7 +77,7 @@ CREATE TABLE products (
 
 ## Data Model
 
-You define your own schema — the plugin supports arbitrary columns and types. The primary key is serialized as the tree key (composite keys are joined with `\x00`). Non-key columns are JSON-encoded as the tree value.
+You define your own schema — the plugin supports arbitrary columns and types. The primary key is serialized as the tree key using an order-preserving, injective tuple framing (see `src/schema/key-encoding.ts`) so composite keys and values containing control bytes never collide or mis-sort. Non-key columns are JSON-encoded as the tree value.
 
 Primary keys must be TEXT (tree keys are strings). Standard SQL operations (SELECT, INSERT, UPDATE, DELETE) all work. Point lookups on the primary key and range scans are optimized; other predicates require a full scan.
 

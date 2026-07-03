@@ -293,7 +293,11 @@ export class IndexManager {
 	}
 
 	/**
-	 * Scan index range
+	 * Scan index range.
+	 *
+	 * NOTE: no production caller today (only findByIndexIn is wired to query planning);
+	 * its framed-prefix brackets are kept consistent with findByIndexIn but are not
+	 * covered by a direct test. If this becomes live, add start/end range coverage.
 	 */
 	async* scanIndexRange(
 		indexName: string,

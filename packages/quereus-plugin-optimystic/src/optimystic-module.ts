@@ -1070,10 +1070,10 @@ export class OptimysticVirtualTable extends VirtualTable {
 
                   // Index maintenance needs both stagings, in this order: first
                   // remove the DISPLACED row's entries (treeKeys
-                  // <displacedIdx>\x00<newKey>), THEN transition the MOVING
-                  // row's entries (<oldIdx>\x00<oldKey> -> <newIdx>\x00<newKey>).
+                  // frame(displacedIdx)‖frame(newKey)), THEN transition the MOVING
+                  // row's entries (frame(oldIdx)‖frame(oldKey) -> frame(newIdx)‖frame(newKey)).
                   // When both rows share an indexed value they touch the
-                  // identical tree key <idx>\x00<newKey>; deleting first then
+                  // identical tree key frame(idx)‖frame(newKey); deleting first then
                   // re-inserting leaves the surviving (moving-row) entry in
                   // place. The reverse order would insert then delete, wrongly
                   // dropping the entry.
