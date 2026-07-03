@@ -482,6 +482,51 @@ describe('Collection', () => {
       expect(actions.map(a => a.data.value)).to.include('local')
     })
 
+    it('should apply the replacement action when filterConflict returns a rewritten action', async () => {
+      // filterConflict rewrites the local 'local' action into a 'merged' action.
+      // The rewritten action must end up in pending (and thus the committed log),
+      // replacing the original — not be silently dropped.
+      const optionsWithFilter: CollectionInitOptions<TestAction> = {
+        ...initOptions,
+        filterConflict: (action, _potential) =>
+          action.data.value === 'local'
+            ? { type: 'set', data: { value: 'merged', timestamp: action.data.timestamp } }
+            : action
+      }
+
+      const collection1 = await Collection.createOrOpen<TestAction>(transactor, collectionId, optionsWithFilter)
+      const collection2 = await Collection.createOrOpen<TestAction>(transactor, collectionId, optionsWithFilter)
+
+      await collection1.updateAndSync()
+      await collection2.update()
+
+      const remoteAction: Action<TestAction> = {
+        type: 'set',
+        data: { value: 'remote', timestamp: 1 }
+      }
+      await collection1.act(remoteAction)
+      await collection1.sync()
+
+      const localAction: Action<TestAction> = {
+        type: 'set',
+        data: { value: 'local', timestamp: 2 }
+      }
+      await collection2.act(localAction)
+
+      // Update+sync collection2 - filterConflict rewrites 'local' -> 'merged'
+      await collection2.updateAndSync()
+
+      const actions: Action<TestAction>[] = []
+      for await (const a of collection2.selectLog()) {
+        actions.push(a)
+      }
+      const values = actions.map(a => a.data.value)
+      // Remote survives; the rewritten action replaces the original local action
+      expect(values).to.include('remote')
+      expect(values).to.include('merged')
+      expect(values).to.not.include('local')
+    })
+
     it('should keep pending when no filterConflict provided', async () => {
       const collection1 = await Collection.createOrOpen<TestAction>(transactor, collectionId, initOptions)
       const collection2 = await Collection.createOrOpen<TestAction>(transactor, collectionId, initOptions)
