@@ -414,6 +414,25 @@ describe('Tree', () => {
       expect(copyTransforms(trk.transforms)).to.deep.equal(before)
       expect(fresh.getCollection().getPendingActions()).to.be.empty
     })
+
+    it('reopened tree observes a successful replace on read-back', async () => {
+      // Happy-path companion to the rollback tests: pins the commit-fold + re-read path on the
+      // reopen branch specifically — a successful replace routed through the per-action Atomic
+      // store must be visible through the reopened read btree (which never mutated in place).
+      const net = new TestTransactor()
+      const id = 'reopen-readback'
+
+      const created = await Tree.createOrOpen<number, TestEntry>(net, id, e => e.key)
+      await created.replace([[10, { key: 10, value: 'seed' }]])
+
+      const reopened = await Tree.createOrOpen<number, TestEntry>(net, id, e => e.key)
+      await reopened.replace([[20, { key: 20, value: 'twenty' }]])
+
+      // New entry written through `trx` is folded into the tracker and read back.
+      expect(await reopened.get(20)).to.deep.equal({ key: 20, value: 'twenty' })
+      // Pre-existing committed seed still visible through the reopened read btree.
+      expect(await reopened.get(10)).to.deep.equal({ key: 10, value: 'seed' })
+    })
   })
 
   describe('concurrent creation', () => {
