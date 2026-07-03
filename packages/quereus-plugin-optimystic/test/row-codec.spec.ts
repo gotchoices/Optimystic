@@ -1,5 +1,5 @@
 import { expect } from 'chai';
-import { RowCodec, type StoredTableSchema } from '../dist/index.js';
+import { RowCodec, encodeKeyTuple, type StoredTableSchema } from '../dist/index.js';
 
 /**
  * Helper to build a minimal StoredTableSchema for testing
@@ -130,15 +130,17 @@ describe('RowCodec', () => {
 	});
 
 	describe('primary key extraction', () => {
-		it('should extract a single-column primary key', () => {
+		it('should extract a single-column primary key (framed)', () => {
 			const schema = makeSchema([{ name: 'id', affinity: 'TEXT' }, { name: 'name', affinity: 'TEXT' }]);
 			const codec = new RowCodec(schema);
 
+			// Single-column keys are framed too (no raw short-circuit), so a value that
+			// contains the old separator can never shift boundaries.
 			const pk = codec.extractPrimaryKey(['abc', 'Alice']);
-			expect(pk).to.equal('abc');
+			expect(pk).to.equal(encodeKeyTuple(['abc']));
 		});
 
-		it('should extract a composite primary key joined with \\x00', () => {
+		it('should extract a composite primary key as framed elements', () => {
 			const schema = makeSchema(
 				[{ name: 'a', affinity: 'TEXT' }, { name: 'b', affinity: 'TEXT' }, { name: 'val', affinity: 'TEXT' }],
 				[0, 1]
@@ -146,23 +148,26 @@ describe('RowCodec', () => {
 			const codec = new RowCodec(schema);
 
 			const pk = codec.extractPrimaryKey(['foo', 'bar', 'data']);
-			expect(pk).to.equal('foo\x00bar');
+			expect(pk).to.equal(encodeKeyTuple(['foo', 'bar']));
 		});
 
-		it('should represent NULL in keys as \\x01NULL\\x01', () => {
+		it('should represent NULL in keys as the distinct framing NULL tag', () => {
 			const schema = makeSchema([{ name: 'id', affinity: 'TEXT' }]);
 			const codec = new RowCodec(schema);
 
 			const pk = codec.extractPrimaryKey([null]);
-			expect(pk).to.equal('\x01NULL\x01');
+			expect(pk).to.equal(encodeKeyTuple([null]));
+			// ...and NULL is distinct from every present value, including the old sentinel.
+			expect(pk).to.not.equal(codec.extractPrimaryKey(['\x01NULL\x01']));
+			expect(pk).to.not.equal(codec.extractPrimaryKey(['']));
 		});
 
-		it('should serialize numeric key parts as strings', () => {
+		it('should serialize numeric key parts through the framing', () => {
 			const schema = makeSchema([{ name: 'id', affinity: 'INTEGER' }]);
 			const codec = new RowCodec(schema);
 
 			const pk = codec.extractPrimaryKey([42]);
-			expect(pk).to.equal('42');
+			expect(pk).to.equal(encodeKeyTuple(['42']));
 		});
 	});
 
@@ -175,7 +180,9 @@ describe('RowCodec', () => {
 			const codec = new RowCodec(schema);
 
 			const pk = codec.createPrimaryKey(['x', 'y']);
-			expect(pk).to.equal('x\x00y');
+			expect(pk).to.equal(encodeKeyTuple(['x', 'y']));
+			// Must match extractPrimaryKey byte-for-byte (insert vs point-lookup parity).
+			expect(pk).to.equal(codec.extractPrimaryKey(['x', 'y']));
 		});
 
 		it('should throw when value count mismatches PK definition', () => {
@@ -214,9 +221,11 @@ describe('RowCodec', () => {
 			const codec = new RowCodec(schema);
 			const cmp = codec.createPrimaryKeyComparator();
 
-			expect(cmp('\x01NULL\x01', 'abc')).to.be.below(0);
-			expect(cmp('abc', '\x01NULL\x01')).to.be.above(0);
-			expect(cmp('\x01NULL\x01', '\x01NULL\x01')).to.equal(0);
+			const nullKey = codec.createPrimaryKey([null]);
+			const abcKey = codec.createPrimaryKey(['abc']);
+			expect(cmp(nullKey, abcKey)).to.be.below(0);
+			expect(cmp(abcKey, nullKey)).to.be.above(0);
+			expect(cmp(nullKey, nullKey)).to.equal(0);
 		});
 
 		it('should return 0 for empty PK definition (singleton table)', () => {
@@ -236,9 +245,9 @@ describe('RowCodec', () => {
 	});
 
 	describe('key serialization edge cases', () => {
-		it('should collide when key contains \\x00 separator (known bug)', () => {
-			// BUG: Composite keys using \x00 as separator have no escaping.
-			// A key value containing \x00 causes collision during comparison.
+		it('should NOT collide when a key value contains the \\x00 separator (framing fix)', () => {
+			// Regression guard: composite keys are framed and every payload \x00 is
+			// escaped, so an embedded separator can no longer shift element boundaries.
 			const schema = makeSchema(
 				[{ name: 'a', affinity: 'TEXT' }, { name: 'b', affinity: 'TEXT' }],
 				[0, 1]
@@ -246,13 +255,12 @@ describe('RowCodec', () => {
 			const codec = new RowCodec(schema);
 			const cmp = codec.createPrimaryKeyComparator();
 
-			// ('foo\x00bar', 'baz') serializes to 'foo\x00bar\x00baz'
-			// ('foo', 'bar') serializes to 'foo\x00bar'
-			// On split, the first becomes ['foo', 'bar', 'baz'] — 3 parts for a 2-part key
+			// ('foo\x00bar', 'baz') and ('foo', 'bar') are distinct 2-column tuples and
+			// must frame to distinct, non-colliding keys.
 			const pk1 = codec.extractPrimaryKey(['foo\x00bar', 'baz']);
 			const pk2 = codec.extractPrimaryKey(['foo', 'bar']);
-			// These are different rows but collide after the first 2 parts are compared
-			expect(cmp(pk1, pk2)).to.equal(0); // BUG: should not be equal
+			expect(pk1).to.not.equal(pk2);
+			expect(cmp(pk1, pk2)).to.not.equal(0);
 		});
 
 		it('should lose text affinity for numeric-looking strings (known bug)', () => {
@@ -288,11 +296,9 @@ describe('RowCodec', () => {
 			const schema = makeSchema([{ name: 'id', affinity: 'REAL' }]);
 			const codec = new RowCodec(schema);
 
-			// NaN.toString() === "NaN"
-			// deserializeKeyPart("NaN") → Number("NaN") is NaN, isNaN(NaN) is true
-			// so it falls through to string — type confusion
+			// NaN.toString() === "NaN"; the payload is framed like any present value.
 			const pk = codec.extractPrimaryKey([NaN]);
-			expect(pk).to.equal('NaN');
+			expect(pk).to.equal(encodeKeyTuple(['NaN']));
 
 			// But comparator should handle NaN keys consistently
 			const cmp = codec.createPrimaryKeyComparator();
@@ -307,8 +313,8 @@ describe('RowCodec', () => {
 			const posPk = codec.extractPrimaryKey([Infinity]);
 			const negPk = codec.extractPrimaryKey([-Infinity]);
 
-			expect(posPk).to.equal('Infinity');
-			expect(negPk).to.equal('-Infinity');
+			expect(posPk).to.equal(encodeKeyTuple(['Infinity']));
+			expect(negPk).to.equal(encodeKeyTuple(['-Infinity']));
 
 			// deserializeKeyPart("Infinity") → Number("Infinity") → Infinity (a number)
 			// This actually works for comparison, but let's verify
@@ -322,12 +328,10 @@ describe('RowCodec', () => {
 			const schema = makeSchema([{ name: 'id', affinity: 'TEXT' }]);
 			const codec = new RowCodec(schema);
 
-			// Empty string key — serializeKeyPart returns ""
-			// deserializeKeyPart("") → Number("") is 0, isNaN(0) is false, "" !== ""... wait
-			// Actually: Number("") === 0, isNaN(0) === false, but serialized !== '' check:
-			// the condition is `!isNaN(num) && serialized !== ''` — so empty string stays as string
+			// Empty string frames to a present element (distinct from NULL's bare tag).
 			const pk = codec.extractPrimaryKey(['']);
-			expect(pk).to.equal('');
+			expect(pk).to.equal(encodeKeyTuple(['']));
+			expect(pk).to.not.equal(codec.extractPrimaryKey([null]));
 		});
 
 		it('should handle empty string in composite key without confusing split', () => {
@@ -355,15 +359,17 @@ describe('RowCodec', () => {
 			expect(cmp(' ', '0')).to.equal(0); // BUG: space becomes number 0
 		});
 
-		it('should collide \\x01NULL\\x01 literal with actual null (known bug)', () => {
-			// BUG: The NULL sentinel '\x01NULL\x01' has no escaping mechanism.
-			// A literal string value of '\x01NULL\x01' is indistinguishable from null.
+		it('should NOT collide a \\x01NULL\\x01 literal with an actual null (framing fix)', () => {
+			// Regression guard: SQL NULL is a bare framing tag, not an in-band sentinel
+			// string, so a real value equal to the old sentinel is distinct from NULL.
 			const schema = makeSchema([{ name: 'id', affinity: 'TEXT' }]);
 			const codec = new RowCodec(schema);
+			const cmp = codec.createPrimaryKeyComparator();
 
 			const nullPk = codec.extractPrimaryKey([null]);
 			const literalPk = codec.extractPrimaryKey(['\x01NULL\x01']);
-			expect(nullPk).to.equal(literalPk); // BUG: collision
+			expect(nullPk).to.not.equal(literalPk);
+			expect(cmp(nullPk, literalPk)).to.not.equal(0);
 		});
 
 		it('should treat scientific notation "1e2" as number 100 (known bug)', () => {

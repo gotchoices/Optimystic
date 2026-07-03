@@ -7,6 +7,21 @@ import { Database } from '@quereus/quereus';
 import type { SqlValue } from '@quereus/quereus';
 import { KeyRange } from '@optimystic/db-core';
 import register from '../dist/plugin.js';
+import { encodeKeyElement } from '../src/schema/key-encoding.js';
+import { serializeIndexValue } from '../src/schema/index-manager.js';
+
+/**
+ * Framed single-column index prefix for value `v` — the leading frame(indexValue)
+ * portion every composite tree key `frame(indexVal) ‖ frame(pk)` begins with.
+ */
+const idxPrefix = (v: SqlValue): string => encodeKeyElement(serializeIndexValue(v));
+
+/**
+ * Full framed composite tree key for a single-column index value `v` and an INTEGER
+ * primary key `pkId`. The PK part is framed from its `toString()` payload (row-codec's
+ * per-part serialization), NOT the index-value `toExponential` form.
+ */
+const idxKey = (v: SqlValue, pkId: number): string => idxPrefix(v) + encodeKeyElement(String(pkId));
 
 type Row = Record<string, SqlValue>;
 type Plugin = ReturnType<typeof register>;
@@ -310,6 +325,26 @@ describe('Optimystic Index Support', () => {
 			const result = await collectRows(db.eval("SELECT * FROM test_table WHERE value = 'duplicate'"));
 			expect(result).to.have.lengthOf(3);
 		});
+
+		it('isolates an index value from another that has it as a prefix (framed prefix range)', async () => {
+			// End-to-end exercise of the findByIndexIn prefix-range brackets: a point
+			// lookup for 'a' must not spill into rows whose indexed value merely begins
+			// with 'a' ('aa', 'ab'). The framed range's upper bound (KEY_PREFIX_END) is
+			// what keeps these distinct index tuples out of each other's scan.
+			await db.exec(`
+				INSERT INTO test_table (id, value) VALUES
+					(1, 'a'),
+					(2, 'aa'),
+					(3, 'ab'),
+					(4, 'a')
+			`);
+
+			const a = await collectRows(db.eval("SELECT * FROM test_table WHERE value = 'a'"));
+			expect(a.map(r => r.id).sort(), "lookup 'a' returns only the exact 'a' rows").to.deep.equal([1, 4]);
+
+			const aa = await collectRows(db.eval("SELECT * FROM test_table WHERE value = 'aa'"));
+			expect(aa.map(r => r.id), "lookup 'aa' returns only the 'aa' row").to.deep.equal([2]);
+		});
 	});
 
 	describe('Index orphan regression (UPDATE/DELETE must not leave stale index entries)', () => {
@@ -332,9 +367,9 @@ describe('Optimystic Index Support', () => {
 			const keys = await scanIndexKeys(plugin, 'tree://test/orphan_upd/index/idx_orphan_upd_cat');
 			expect(keys.length, 'index entry count after UPDATE').to.equal(3);
 			// Old entry for 'b'/id=2 must be gone (was the orphan before the fix).
-			expect(keys.some(k => k.startsWith('b\x00')), "stale 'b' entry is absent").to.be.false;
+			expect(keys.some(k => k.startsWith(idxPrefix('b'))), "stale 'b' entry is absent").to.be.false;
 			// New entry for 'z'/id=2 must be present.
-			expect(keys.some(k => k.startsWith('z\x00')), "new 'z' entry is present").to.be.true;
+			expect(keys.some(k => k.startsWith(idxPrefix('z'))), "new 'z' entry is present").to.be.true;
 		});
 
 		it('DELETE leaves no orphan index entry', async () => {
@@ -353,7 +388,7 @@ describe('Optimystic Index Support', () => {
 
 			const keys = await scanIndexKeys(plugin, 'tree://test/orphan_del/index/idx_orphan_del_cat');
 			expect(keys.length, 'index entry count after DELETE').to.equal(2);
-			expect(keys.some(k => k.startsWith('c\x00')), "deleted 'c' entry is absent").to.be.false;
+			expect(keys.some(k => k.startsWith(idxPrefix('c'))), "deleted 'c' entry is absent").to.be.false;
 		});
 
 		it('UPDATE that leaves the indexed column unchanged neither drops nor duplicates the entry', async () => {
@@ -376,14 +411,14 @@ describe('Optimystic Index Support', () => {
 
 			const keys = await scanIndexKeys(plugin, 'tree://test/orphan_noop/index/idx_orphan_noop_cat');
 			expect(keys.length, 'index entry count after no-op-index UPDATE').to.equal(2);
-			expect(keys.some(k => k.startsWith('a\x00')), "row 1's 'a' entry intact").to.be.true;
-			expect(keys.some(k => k.startsWith('b\x00')), "row 2's 'b' entry intact").to.be.true;
+			expect(keys.some(k => k.startsWith(idxPrefix('a'))), "row 1's 'a' entry intact").to.be.true;
+			expect(keys.some(k => k.startsWith(idxPrefix('b'))), "row 2's 'b' entry intact").to.be.true;
 		});
 
 		it("UPDATE on a non-unique index removes only the moved row's entry, not a sibling sharing the old value", async () => {
 			// Rows 1 and 2 both have cat='b'; their composite index keys differ
-			// only by primary key (b\x001 vs b\x002). Moving row 2 to 'z' must
-			// delete exactly b\x002 and leave row 1's b\x001 entry in place.
+			// only by primary key (idxKey('b',1) vs idxKey('b',2)). Moving row 2 to 'z'
+			// must delete exactly row 2's 'b' entry and leave row 1's in place.
 			await db.exec(`
 				CREATE TABLE orphan_dup (
 					id INTEGER PRIMARY KEY,
@@ -399,9 +434,9 @@ describe('Optimystic Index Support', () => {
 			const keys = await scanIndexKeys(plugin, 'tree://test/orphan_dup/index/idx_orphan_dup_cat');
 			expect(keys.length, 'index entry count after sibling-sharing UPDATE').to.equal(3);
 			// Row 1's shared 'b' entry survives; only row 2's 'b' entry is gone.
-			expect(keys, "row 1's b\\x001 entry intact").to.include('b\x001');
-			expect(keys, "row 2's b\\x002 entry removed").to.not.include('b\x002');
-			expect(keys, "row 2's new z\\x002 entry present").to.include('z\x002');
+			expect(keys, "row 1's b/id=1 entry intact").to.include(idxKey('b', 1));
+			expect(keys, "row 2's b/id=2 entry removed").to.not.include(idxKey('b', 2));
+			expect(keys, "row 2's new z/id=2 entry present").to.include(idxKey('z', 2));
 		});
 
 		it('UPDATE/DELETE on an INTEGER-typed indexed column leaves no orphan and seeks correctly', async () => {
@@ -431,10 +466,11 @@ describe('Optimystic Index Support', () => {
 			// Old 20/2 and deleted 30/3 keys must be gone.
 			const keys = await scanIndexKeys(plugin, 'tree://test/orphan_int/index/idx_orphan_int_n');
 			expect(keys.length, 'index entry count after INTEGER UPDATE+DELETE').to.equal(2);
-			const key20 = `${(20).toExponential(15)}\x00`;
-			const key30 = `${(30).toExponential(15)}\x00`;
-			const key25 = `${(25).toExponential(15)}\x00`;
-			const key10 = `${(10).toExponential(15)}\x00`;
+			// Framed prefixes over the toExponential(15) index-value payload.
+			const key20 = idxPrefix(20);
+			const key30 = idxPrefix(30);
+			const key25 = idxPrefix(25);
+			const key10 = idxPrefix(10);
 			expect(keys.some(k => k.startsWith(key20)), 'stale old n=20 entry is absent').to.be.false;
 			expect(keys.some(k => k.startsWith(key30)), 'deleted n=30 entry is absent').to.be.false;
 			expect(keys.some(k => k.startsWith(key10)), 'live n=10 entry present').to.be.true;

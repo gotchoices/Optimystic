@@ -22,6 +22,16 @@ export { OptimysticModule, OptimysticVirtualTable } from './optimystic-module.js
 export { RowCodec, type EncodedRow, type PrimaryKeyValue, type EncodingFormat } from './schema/row-codec.js';
 export type { StoredTableSchema, StoredColumnSchema, StoredPrimaryKeyColumn } from './schema/schema-manager.js';
 
+// Export the order-preserving, injective key-framing primitives (shared by the
+// primary-key and secondary-index encoders).
+export {
+	encodeKeyElement,
+	encodeKeyTuple,
+	splitKeyTuple,
+	KEY_PREFIX_END,
+	type DecodedKeyElement,
+} from './schema/key-encoding.js';
+
 // Export types for TypeScript users
 export type {
 	OptimysticOptions as OptimysticTreeOptions,

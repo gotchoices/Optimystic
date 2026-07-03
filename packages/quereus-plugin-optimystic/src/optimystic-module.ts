@@ -22,6 +22,7 @@ import { RowCodec, type EncodedRow } from './schema/row-codec.js';
 import { SqlDataType } from '@quereus/quereus';
 import { INTEGER_TYPE, REAL_TYPE, TEXT_TYPE, BLOB_TYPE, NUMERIC_TYPE, NULL_TYPE, BOOLEAN_TYPE, type LogicalType } from '@quereus/quereus';
 import { IndexManager, serializeIndexValue, type IndexEntry } from './schema/index-manager.js';
+import { encodeKeyTuple } from './schema/key-encoding.js';
 import { StatisticsCollector } from './schema/statistics-collector.js';
 import { createLogger } from './logger.js';
 
@@ -632,15 +633,16 @@ export class OptimysticVirtualTable extends VirtualTable {
       indexRead = indexTree;
     }
 
-    // Build index key from constraint values
-    // args contains the values for the matched constraints in order
-    const indexKeyParts: string[] = [];
+    // Build the (possibly partial) framed index key from constraint values. Must use
+    // the SAME framing IndexManager.createIndexKey stores under, so the prefix range in
+    // findByIndexIn brackets exactly this tuple. A partial key (fewer args than index
+    // columns) frames only the provided leading columns and prefix-matches the rest.
+    const indexKeyPayloads: Array<string | null> = [];
     for (let i = 0; i < args.length && i < indexSchema.columns.length; i++) {
-      const value = args[i];
-      indexKeyParts.push(serializeIndexValue(value as SqlValue));
+      indexKeyPayloads.push(serializeIndexValue(args[i] as SqlValue));
     }
 
-    const indexKey = indexKeyParts.join('\x00');
+    const indexKey = encodeKeyTuple(indexKeyPayloads);
 
     // Look up primary keys using the index read source
     for await (const primaryKey of this.indexManager.findByIndexIn(indexRead, indexKey)) {
@@ -790,7 +792,7 @@ export class OptimysticVirtualTable extends VirtualTable {
    *  encoding the secondary-index layer keys on (see {@link serializeIndexValue}),
    *  so a uniqueness comparison agrees byte-for-byte with how the index would key it. */
   private uniqueKeyFor(columns: readonly number[], row: Row): string {
-    return columns.map(ci => serializeIndexValue(row[ci] ?? null)).join('\x00');
+    return encodeKeyTuple(columns.map(ci => serializeIndexValue(row[ci] ?? null)));
   }
 
   /**

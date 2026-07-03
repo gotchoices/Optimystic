@@ -10,6 +10,7 @@ import { resolveCollation, compareSqlValues, type CollationFunction } from '@que
 import { toString as uint8ToString } from 'uint8arrays/to-string';
 import { fromString as uint8FromString } from 'uint8arrays/from-string';
 import type { StoredTableSchema, StoredColumnSchema } from './schema-manager.js';
+import { encodeKeyTuple, splitKeyTuple, type DecodedKeyElement } from './key-encoding.js';
 
 /**
  * Encoding format for row data
@@ -85,25 +86,21 @@ export class RowCodec {
 	 * Extract primary key value from a row
 	 */
 	extractPrimaryKey(row: Row): PrimaryKeyValue {
-		const pkParts: string[] = [];
-
-		for (const pkCol of this.schema.primaryKeyDefinition) {
-			const value = row[pkCol.index];
-			pkParts.push(this.serializeKeyPart(value ?? null));
-		}
-
-		// For single-column keys, return the value directly
-		if (pkParts.length === 1 && pkParts[0]) {
-			return pkParts[0];
-		}
-
-		// For composite keys, join with a separator
-		// Use a separator that's unlikely to appear in data
-		return pkParts.join('\x00');
+		// Frame every part (including single-column keys) through the shared, injective
+		// tuple encoding so a value containing the old raw `\x00` separator — or equal to
+		// the old NULL sentinel — can never shift boundaries or collide. See key-encoding.
+		const payloads = this.schema.primaryKeyDefinition.map(
+			pkCol => this.serializeKeyPart(row[pkCol.index] ?? null)
+		);
+		return encodeKeyTuple(payloads);
 	}
 
 	/**
-	 * Create a primary key from individual column values
+	 * Create a primary key from individual column values.
+	 *
+	 * Must produce byte-identical output to {@link extractPrimaryKey} for the same
+	 * logical key: inserts key off the extracted row while point lookups key off these
+	 * seek-arg values, and the two are compared by exact tree-key match.
 	 */
 	createPrimaryKey(values: SqlValue[]): PrimaryKeyValue {
 		if (values.length !== this.schema.primaryKeyDefinition.length) {
@@ -112,13 +109,7 @@ export class RowCodec {
 			);
 		}
 
-		const pkParts = values.map(v => this.serializeKeyPart(v ?? null));
-
-		if (pkParts.length === 1 && pkParts[0]) {
-			return pkParts[0];
-		}
-
-		return pkParts.join('\x00');
+		return encodeKeyTuple(values.map(v => this.serializeKeyPart(v ?? null)));
 	}
 
 	/**
@@ -150,11 +141,15 @@ export class RowCodec {
 	}
 
 	/**
-	 * Serialize a single key part to string
+	 * Serialize a single key part to its payload string, or `null` for SQL NULL.
+	 *
+	 * NULL is signalled by returning `null` (the framing layer emits a distinct bare
+	 * tag for it) rather than an in-band sentinel string, so a real value can never be
+	 * mistaken for NULL. Present-value payload forms are unchanged.
 	 */
-	private serializeKeyPart(value: SqlValue): string {
+	private serializeKeyPart(value: SqlValue): string | null {
 		if (value === null || value === undefined) {
-			return '\x01NULL\x01';
+			return null;
 		}
 
 		if (typeof value === 'string') {
@@ -248,37 +243,20 @@ export class RowCodec {
 			return () => 0;
 		}
 
-		// For single-column primary key
-		if (pkDef.length === 1) {
-			const collationName = pkDef[0]?.collation || 'BINARY';
-			const collationFunc = resolveCollation(collationName);
-			const desc = pkDef[0]?.desc || false;
-			const multiplier = desc ? -1 : 1;
-
-			return (a: string, b: string): -1 | 0 | 1 => {
-				// Deserialize the key parts
-				const valueA = this.deserializeKeyPart(a);
-				const valueB = this.deserializeKeyPart(b);
-
-				// Compare using the appropriate collation
-				const result = this.compareValues(valueA, valueB, collationFunc);
-				return (result * multiplier) as -1 | 0 | 1;
-			};
-		}
-
-		// For composite primary key
 		const collationFuncs = pkDef.map(def => resolveCollation(def.collation || 'BINARY'));
 		const descFlags = pkDef.map(def => def.desc || false);
 
+		// NOTE: this comparator is currently dead code — the tree is opened with a raw
+		// lexicographic string comparator (collection-factory.ts), which the injective
+		// framing keeps correct on its own. sq-2 wires this up and reworks the per-part
+		// type-sniffing/collation logic; it inherits framing-aware decode from here.
 		return (a: string, b: string): -1 | 0 | 1 => {
-			// Split composite keys
-			const partsA = a.split('\x00');
-			const partsB = b.split('\x00');
+			const partsA = this.decodeKeyForCompare(a);
+			const partsB = this.decodeKeyForCompare(b);
 
-			// Compare each part in order
 			for (let i = 0; i < pkDef.length; i++) {
-				const valueA = this.deserializeKeyPart(partsA[i] || '');
-				const valueB = this.deserializeKeyPart(partsB[i] || '');
+				const valueA = this.keyElementToValue(partsA[i]);
+				const valueB = this.keyElementToValue(partsB[i]);
 
 				const result = this.compareValues(valueA, valueB, collationFuncs[i]!);
 				if (result !== 0) {
@@ -292,13 +270,38 @@ export class RowCodec {
 	}
 
 	/**
-	 * Deserialize a key part back to its original value
+	 * Decode a tree key into its framed elements for comparison.
+	 *
+	 * A key produced by {@link encodeKeyTuple} begins with a structural tag; it is
+	 * split element-by-element. A key that does not begin with a tag is a bare/legacy
+	 * value (as fed by some low-level comparator unit tests) and is treated as one raw
+	 * present element. sq-2 owns the eventual full decode and can drop this fallback.
+	 */
+	private decodeKeyForCompare(key: string): DecodedKeyElement[] {
+		// NOTE: legacy/raw fallback for un-framed keys, live only via low-level comparator
+		// unit tests while this comparator is dead code. sq-2 (which wires the comparator
+		// into the tree) should update those tests to feed framed keys and drop this branch.
+		const lead = key[0];
+		if (lead === '\x00' || lead === '\x02') {
+			return splitKeyTuple(key);
+		}
+		return [{ isNull: false, payload: key }];
+	}
+
+	/** Map a decoded key element to its SQL value (missing element or NULL tag -> null). */
+	private keyElementToValue(element: DecodedKeyElement | undefined): SqlValue {
+		if (!element || element.isNull) return null;
+		return this.deserializeKeyPart(element.payload);
+	}
+
+	/**
+	 * Deserialize a present key-part payload back to its original value.
+	 *
+	 * NULL is no longer represented in-band (the framing carries it), so there is no
+	 * NULL sentinel here — this only ever sees present payloads. The numeric type-sniff
+	 * is sq-2's to fix; left as-is.
 	 */
 	private deserializeKeyPart(serialized: string): SqlValue {
-		if (serialized === '\x01NULL\x01') {
-			return null;
-		}
-
 		// Try to parse as number
 		const num = Number(serialized);
 		if (!isNaN(num) && serialized !== '') {

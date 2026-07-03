@@ -35,9 +35,12 @@ describe('serializeIndexValue', () => {
 		expect(serializeIndexValue(29.99)).to.equal((29.99).toExponential(15));
 	});
 
-	it('maps NULL and undefined to the same NULL marker', () => {
-		expect(serializeIndexValue(null)).to.equal('\x01');
-		expect(serializeIndexValue(undefined as unknown as null)).to.equal('\x01');
+	it('maps NULL and undefined to the null payload (framing emits the distinct NULL tag)', () => {
+		// serializeIndexValue no longer returns an in-band sentinel string for NULL (a
+		// real value could equal it); it returns JS null and the composition layer frames
+		// it as a bare NULL tag distinct from every present value. See key-encoding.
+		expect(serializeIndexValue(null)).to.equal(null);
+		expect(serializeIndexValue(undefined as unknown as null)).to.equal(null);
 	});
 
 	it('passes strings through verbatim', () => {

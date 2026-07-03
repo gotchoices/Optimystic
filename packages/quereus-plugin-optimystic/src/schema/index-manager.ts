@@ -11,6 +11,7 @@ import { KeyRange } from '@optimystic/db-core';
 import type { ITransactor } from '@optimystic/db-core';
 import type { Row, SqlValue } from '@quereus/quereus';
 import type { StoredTableSchema, StoredIndexSchema } from './schema-manager.js';
+import { encodeKeyTuple, KEY_PREFIX_END } from './key-encoding.js';
 
 /**
  * Serialize a single value for use in a secondary-index key.
@@ -39,10 +40,16 @@ import type { StoredTableSchema, StoredIndexSchema } from './schema-manager.js';
  * Number.MAX_SAFE_INTEGER — the same precision ceiling REAL columns already have. It
  * stays self-consistent (insert and the decoded old row round-trip to the same lossy
  * string, so no orphan), but two distinct huge integers can collide into one key.
+ *
+ * Returns the per-value PAYLOAD for present values, or `null` for SQL NULL. NULL is no
+ * longer an in-band sentinel string (which a real value could equal); the composition
+ * layer (createIndexKey / the module's seek + unique-key builders) frames each payload
+ * via {@link encodeKeyTuple}, which emits a distinct bare tag for NULL. Present-value
+ * payload forms are unchanged so REAL range-bound ordering is preserved.
  */
-export function serializeIndexValue(value: SqlValue): string {
+export function serializeIndexValue(value: SqlValue): string | null {
 	if (value === null || value === undefined) {
-		return '\x01'; // Special marker for NULL
+		return null;
 	}
 	if (typeof value === 'string') {
 		return value;
@@ -127,16 +134,12 @@ export class IndexManager {
 	 * Create index key from row values
 	 */
 	createIndexKey(indexSchema: StoredIndexSchema, row: Row): IndexKey {
-		const keyParts: string[] = [];
-
-		for (const indexCol of indexSchema.columns) {
-			const value = row[indexCol.index];
-			const stringValue = serializeIndexValue(value ?? null);
-			keyParts.push(stringValue);
-		}
-
-		// Join with null separator (same as primary key encoding)
-		return keyParts.join('\x00');
+		// Frame each column payload through the shared injective tuple encoding so an
+		// indexed value containing the old raw `\x00` separator can neither shift
+		// element boundaries nor break the prefix-range brackets below.
+		return encodeKeyTuple(
+			indexSchema.columns.map(indexCol => serializeIndexValue(row[indexCol.index] ?? null))
+		);
 	}
 
 	/**
@@ -144,7 +147,8 @@ export class IndexManager {
 	 *
 	 * Index tree keys are composites of indexKey + primaryKey to support
 	 * non-unique indexes (multiple rows with the same indexed value).
-	 * Format: indexKey\x00primaryKey -> primaryKey
+	 * Both are already framed tuples (self-delimiting), so the tree key is their plain
+	 * concatenation: frame(indexCols) ‖ frame(pk) -> primaryKey. No separator is needed.
 	 *
 	 * Mutations are STAGED into each index tree's tracker (not flushed). The
 	 * caller is responsible for flushing the touched trees at transaction commit
@@ -163,10 +167,10 @@ export class IndexManager {
 				throw new Error(`Index tree not found: ${index.name}`);
 			}
 
-			// Composite tree key: indexKey + primaryKey ensures uniqueness
-			// Store as [treeKey, primaryKey] so the tree's keyExtractor (entry[0])
-			// returns the treeKey for proper sorting and range scans
-			const treeKey = `${indexKey}\x00${primaryKey}`;
+			// Composite tree key: indexKey + primaryKey ensures uniqueness (both framed,
+			// so plain concatenation is unambiguous). Store as [treeKey, primaryKey] so the
+			// tree's keyExtractor (entry[0]) returns the treeKey for sorting and range scans.
+			const treeKey = indexKey + primaryKey;
 			await tree.stage([[treeKey, [treeKey, primaryKey]]]);
 		}
 	}
@@ -188,7 +192,7 @@ export class IndexManager {
 			}
 
 			// Composite tree key must match the format used in insertIndexEntries
-			const treeKey = `${indexKey}\x00${primaryKey}`;
+			const treeKey = indexKey + primaryKey;
 			await tree.stage([[treeKey, undefined]]);
 		}
 	}
@@ -214,8 +218,8 @@ export class IndexManager {
 				throw new Error(`Index tree not found: ${index.name}`);
 			}
 
-			const oldTreeKey = `${oldIndexKey}\x00${oldPrimaryKey}`;
-			const newTreeKey = `${newIndexKey}\x00${newPrimaryKey}`;
+			const oldTreeKey = oldIndexKey + oldPrimaryKey;
+			const newTreeKey = newIndexKey + newPrimaryKey;
 
 			if (oldTreeKey !== newTreeKey) {
 				// Index key or primary key changed - delete old, insert new
@@ -231,9 +235,9 @@ export class IndexManager {
 	/**
 	 * Find rows using an index.
 	 *
-	 * Since index tree keys are composites of indexKey\x00primaryKey,
-	 * we do a range scan from indexKey\x00 (inclusive) to indexKey\x01 (exclusive)
-	 * to find all entries matching the given index key.
+	 * Since index tree keys are framed composites of indexKey ‖ primaryKey, we do a
+	 * range scan over the framed-prefix `indexKey`: from `indexKey` (inclusive) to
+	 * `indexKey + KEY_PREFIX_END` (exclusive) to find all entries matching it.
 	 */
 	async* findByIndex(
 		indexName: string,
@@ -261,11 +265,14 @@ export class IndexManager {
 		read: TreeReadView<IndexKey, IndexEntry>,
 		indexKey: IndexKey
 	): AsyncIterable<PrimaryKey> {
-		// Range scan for all entries with this index key prefix
-		// Tree keys are formatted as: indexKey\x00primaryKey
-		// Scan from indexKey\x00 (inclusive) to indexKey\x01 (exclusive)
-		const startKey = `${indexKey}\x00`;
-		const endKey = `${indexKey}\x01`; // \x01 > \x00, so this is the exclusive upper bound
+		// Range scan for all entries whose framed index tuple equals `indexKey`.
+		// Tree keys are `indexKey ‖ framedPrimaryKey`, so every match begins with the
+		// complete framed prefix `indexKey`. Scan from `indexKey` (inclusive) to
+		// `indexKey + KEY_PREFIX_END` (exclusive) — see KEY_PREFIX_END for why the
+		// terminator-successor `\x01` would wrongly also match a longer value whose
+		// escape happens to continue past the prefix.
+		const startKey = indexKey;
+		const endKey = indexKey + KEY_PREFIX_END;
 
 		const range = new KeyRange<string>(
 			{ key: startKey, inclusive: true },
@@ -301,12 +308,15 @@ export class IndexManager {
 
 		await tree.update();
 
-		// Build range using the composite key format
+		// Build range over the framed composite keys. `startKey`/`endKey` are framed
+		// index tuples; the lower bound is inclusive from the framed prefix, and the
+		// upper bound uses the framed-prefix successor so entries whose tuple equals
+		// `endKey` are included (see KEY_PREFIX_END).
 		const rangeStart = startKey !== undefined
-			? { key: `${startKey}\x00`, inclusive: true }
+			? { key: startKey, inclusive: true }
 			: undefined;
 		const rangeEnd = endKey !== undefined
-			? { key: `${endKey}\x01`, inclusive: false }
+			? { key: endKey + KEY_PREFIX_END, inclusive: false }
 			: undefined;
 
 		const range = new KeyRange<string>(rangeStart, rangeEnd, ascending);
