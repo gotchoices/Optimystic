@@ -34,6 +34,7 @@
 import type { ITopicRouter, PeerRef } from "./ports.js";
 import type { TierAddressing } from "./addressing.js";
 import type { DMaxComputer } from "./dmax.js";
+import { DEFAULT_D_MAX_CAP } from "./dmax.js";
 import { backoffRetryMs } from "./willingness.js";
 import { b64urlToBytes, decodeRegisterReplyV1, encodeCohortMessage } from "./wire/codec.js";
 import type { RegisterReplyV1, RegisterV1 } from "./wire/types.js";
@@ -135,6 +136,16 @@ export interface WalkEngine {
 	 * (a probe never instantiates a cold root).
 	 */
 	register(topicId: Uint8Array, tier: number, appPayload?: Uint8Array, opts?: { probe?: boolean }): Promise<WalkOutcome>;
+}
+
+/**
+ * A walk tier is valid iff it is an integer in `0..DEFAULT_D_MAX_CAP` — the substrate's own walk-depth
+ * ceiling. A `promoted` reply's explicit `targetTier` is untrusted: an out-of-range value (non-integer,
+ * negative, or above the ceiling) cannot name a real cohort and would reach `addressing.coord()` →
+ * `coordD`, which throws a raw `RangeError`. Matches the range the wire `treeTier` validator enforces.
+ */
+function isValidTreeTier(value: number): boolean {
+	return Number.isInteger(value) && value >= 0 && value <= DEFAULT_D_MAX_CAP;
 }
 
 class RouterWalkEngine implements WalkEngine {
@@ -242,6 +253,14 @@ class RouterWalkEngine implements WalkEngine {
 					memberAttempts = 0;
 					bootstrap = false;
 					const targetTier = reply.targetTier ?? d + 1;
+					// The cohort names the tier to jump outward to. When it supplied `targetTier` EXPLICITLY it is
+					// untrusted: an out-of-range value would reach `coord()` → `coordD` and throw a raw RangeError,
+					// an unclassified crash out of register()/lookup() rather than a clean outcome. Bound it before
+					// BOTH adoption sites (the followPromoted-false surface below and the `d = targetTier` hop) and
+					// back off in time instead. The `d + 1` fallback is always in range (`d` is walk-bounded).
+					if (reply.targetTier !== undefined && !isValidTreeTier(targetTier)) {
+						return { kind: "retry_later", afterMs: backoffRetryMs(0) };
+					}
 					// Following a (fresh) redirect: mark it, and reset the follow-on latch so a cold child at
 					// THIS target gets its own single follow-on re-issue. The honest flow re-registers the
 					// child with a PLAIN frame first (followOn false) and only escalates to followOn on its

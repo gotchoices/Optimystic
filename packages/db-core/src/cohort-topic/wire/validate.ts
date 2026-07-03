@@ -157,7 +157,21 @@ function treeTier(value: number, what: string): number {
 	return value;
 }
 
-/** Assert a base64url string decodes cleanly; returns it unchanged. */
+/** Ring-coord / topic-id / epoch byte width (SHA-256 truncated to the ring width). */
+const COORD_BYTES = 32;
+/** Correlation-id byte width (a 16-byte nonce minted per walk probe / renew). */
+const CORRELATION_BYTES = 16;
+
+/**
+ * Assert a base64url string decodes cleanly; returns it unchanged. Used for variable-width fields —
+ * peer ids (multihash-encoded, not 32 raw bytes), signatures, and opaque application payloads.
+ *
+ * NOTE: no max-length bound here. A hostile peer can still bloat one of these variable-width fields
+ * (e.g. `participantCoord`, a signature) into a large map key in the store / rate limiter / replay
+ * guard. Their widths aren't pinned by the spec, so a ceiling would be a chosen policy value rather
+ * than a decode of the format. If a bloated one is ever seen as a map key in practice, add a
+ * `b64urlMaxLen` ceiling here. (Fixed-width hash-derived fields go through `b64urlFixedLen` instead.)
+ */
 function b64urlField(value: string, key: string, what: string): string {
 	try {
 		b64urlToBytes(value);
@@ -203,13 +217,13 @@ export function validateRegisterV1(value: unknown): RegisterV1 {
 	requireV1(obj, what);
 	const out: RegisterV1 = {
 		v: 1,
-		topicId: b64urlField(reqString(obj, "topicId", what), "topicId", what),
+		topicId: b64urlFixedLen(reqString(obj, "topicId", what), "topicId", COORD_BYTES, what),
 		tier: tier(reqFiniteNumber(obj, "tier", what), what),
 		treeTier: treeTier(reqFiniteNumber(obj, "treeTier", what), what),
 		participantCoord: b64urlField(reqString(obj, "participantCoord", what), "participantCoord", what),
 		ttl: reqFiniteNumber(obj, "ttl", what),
 		timestamp: reqFiniteNumber(obj, "timestamp", what),
-		correlationId: b64urlField(reqString(obj, "correlationId", what), "correlationId", what),
+		correlationId: b64urlFixedLen(reqString(obj, "correlationId", what), "correlationId", CORRELATION_BYTES, what),
 		signature: b64urlField(reqString(obj, "signature", what), "signature", what),
 	};
 	const bootstrap = optBool(obj, "bootstrap", what);
@@ -273,12 +287,16 @@ export function validateRegisterReplyV1(value: unknown): RegisterReplyV1 {
 	assignDefined(out, "backups", optStringArray(obj, "backups", what));
 	const cohortEpoch = optString(obj, "cohortEpoch", what);
 	if (cohortEpoch !== undefined) {
+		// NOTE: cohortEpoch is NOT length-pinned — `test/reactivity/subscriber.spec.ts` feeds a 1-byte
+		// synthetic epoch, so an epoch is not reliably 32 bytes across current paths. See b64urlField's note.
 		out.cohortEpoch = b64urlField(cohortEpoch, "cohortEpoch", what);
 	}
 	assignDefined(out, "cohortMembers", optStringArray(obj, "cohortMembers", what));
 	if (obj["topicTraffic"] !== undefined) {
 		out.topicTraffic = validateTopicTrafficV1(obj["topicTraffic"]);
 	}
+	// NOTE: `targetTier` is range-checked in the walk loop (walk.ts, case "promoted"), not here — an
+	// out-of-range redirect must surface as a `retry_later` outcome, not a decode-time throw.
 	assignDefined(out, "targetTier", optFiniteNumber(obj, "targetTier", what));
 	assignDefined(out, "candidateMembers", optStringArray(obj, "candidateMembers", what));
 	assignDefined(out, "retryAfterMs", optFiniteNumber(obj, "retryAfterMs", what));
@@ -292,9 +310,9 @@ export function validateRenewV1(value: unknown): RenewV1 {
 	requireV1(obj, what);
 	const out: RenewV1 = {
 		v: 1,
-		topicId: b64urlField(reqString(obj, "topicId", what), "topicId", what),
+		topicId: b64urlFixedLen(reqString(obj, "topicId", what), "topicId", COORD_BYTES, what),
 		participantId: reqString(obj, "participantId", what),
-		correlationId: b64urlField(reqString(obj, "correlationId", what), "correlationId", what),
+		correlationId: b64urlFixedLen(reqString(obj, "correlationId", what), "correlationId", CORRELATION_BYTES, what),
 		timestamp: reqFiniteNumber(obj, "timestamp", what),
 		signature: b64urlField(reqString(obj, "signature", what), "signature", what),
 	};
@@ -315,6 +333,8 @@ export function validateRenewReplyV1(value: unknown): RenewReplyV1 {
 	assignDefined(out, "newBackups", optStringArray(obj, "newBackups", what));
 	const cohortEpoch = optString(obj, "cohortEpoch", what);
 	if (cohortEpoch !== undefined) {
+		// NOTE: cohortEpoch is NOT length-pinned — `test/reactivity/subscriber.spec.ts` feeds a 1-byte
+		// synthetic epoch, so an epoch is not reliably 32 bytes across current paths. See b64urlField's note.
 		out.cohortEpoch = b64urlField(cohortEpoch, "cohortEpoch", what);
 	}
 	return out;
@@ -331,10 +351,10 @@ export function validatePromotionNoticeV1(value: unknown): PromotionNoticeV1 {
 	}
 	return {
 		v: 1,
-		topicId: b64urlField(reqString(obj, "topicId", what), "topicId", what),
+		topicId: b64urlFixedLen(reqString(obj, "topicId", what), "topicId", COORD_BYTES, what),
 		fromTier,
 		toTier,
-		cohortCoord: b64urlField(reqString(obj, "cohortCoord", what), "cohortCoord", what),
+		cohortCoord: b64urlFixedLen(reqString(obj, "cohortCoord", what), "cohortCoord", COORD_BYTES, what),
 		effectiveAt: reqFiniteNumber(obj, "effectiveAt", what),
 		thresholdSig: b64urlField(reqString(obj, "thresholdSig", what), "thresholdSig", what),
 		signers: reqStringArray(obj, "signers", what),
@@ -348,10 +368,10 @@ export function validateDemotionNoticeV1(value: unknown): DemotionNoticeV1 {
 	requireV1(obj, what);
 	return {
 		v: 1,
-		topicId: b64urlField(reqString(obj, "topicId", what), "topicId", what),
+		topicId: b64urlFixedLen(reqString(obj, "topicId", what), "topicId", COORD_BYTES, what),
 		tier: treeTier(reqFiniteNumber(obj, "tier", what), what),
-		parentCohortCoord: b64urlField(reqString(obj, "parentCohortCoord", what), "parentCohortCoord", what),
-		cohortCoord: b64urlField(reqString(obj, "cohortCoord", what), "cohortCoord", what),
+		parentCohortCoord: b64urlFixedLen(reqString(obj, "parentCohortCoord", what), "parentCohortCoord", COORD_BYTES, what),
+		cohortCoord: b64urlFixedLen(reqString(obj, "cohortCoord", what), "cohortCoord", COORD_BYTES, what),
 		effectiveAt: reqFiniteNumber(obj, "effectiveAt", what),
 		thresholdSig: b64urlField(reqString(obj, "thresholdSig", what), "thresholdSig", what),
 		signers: reqStringArray(obj, "signers", what),
@@ -359,15 +379,12 @@ export function validateDemotionNoticeV1(value: unknown): DemotionNoticeV1 {
 	};
 }
 
-/** Ring-coord / topic-id / epoch byte width (SHA-256 truncated to the ring width). */
-const COORD_BYTES = 32;
-
 /**
  * Validate a {@link ChildLinkV1}. Enforces `childTier >= 1` (the root never links), `tier` in 0..3, and
- * well-formed base64url on every byte field. The hash-derived coords (`childCohortCoord` / `cohortEpoch`)
- * are additionally length-checked to exactly 32 bytes (a ring coord / epoch is a SHA-256 truncation); the
- * `topicId` and `childParticipantCoord` follow the lenient `RegisterV1` convention (base64url only — a
- * participant coord is not always 32 raw bytes, e.g. a multihash-encoded peer id in tests). When `minSigs`
+ * well-formed base64url on every byte field. The hash-derived fields (`topicId` / `childCohortCoord` /
+ * `cohortEpoch`) are additionally length-checked to exactly 32 bytes (each is a SHA-256 truncation); the
+ * `childParticipantCoord` follows the lenient `RegisterV1` convention (base64url only — a participant
+ * coord is not always 32 raw bytes, e.g. a multihash-encoded peer id in tests). When `minSigs`
  * is supplied AND the frame carries a threshold signature (`thresholdSig` non-empty), `signers.length` must
  * be `>= minSigs`; a key-less-interim frame carries neither, so that cross-field bound is skipped. `minSigs`
  * is optional so a bare structural decode (no quorum context) still narrows the frame.
@@ -387,7 +404,7 @@ export function validateChildLinkV1(value: unknown, minSigs?: number): ChildLink
 	}
 	return {
 		v: 1,
-		topicId: b64urlField(reqString(obj, "topicId", what), "topicId", what),
+		topicId: b64urlFixedLen(reqString(obj, "topicId", what), "topicId", COORD_BYTES, what),
 		childCohortCoord: b64urlFixedLen(reqString(obj, "childCohortCoord", what), "childCohortCoord", COORD_BYTES, what),
 		childParticipantCoord: b64urlField(reqString(obj, "childParticipantCoord", what), "childParticipantCoord", what),
 		childTier,
@@ -430,7 +447,7 @@ function validateGossipRecordV1(value: unknown): GossipRecordV1 {
 	const what = "GossipRecordV1";
 	const obj = asObject(value, what);
 	const out: GossipRecordV1 = {
-		topicId: b64urlField(reqString(obj, "topicId", what), "topicId", what),
+		topicId: b64urlFixedLen(reqString(obj, "topicId", what), "topicId", COORD_BYTES, what),
 		participantId: b64urlField(reqString(obj, "participantId", what), "participantId", what),
 		tier: tier(reqFiniteNumber(obj, "tier", what), what),
 		primary: b64urlField(reqString(obj, "primary", what), "primary", what),
@@ -450,7 +467,7 @@ function validateGossipRecordRefV1(value: unknown): GossipRecordRefV1 {
 	const what = "GossipRecordRefV1";
 	const obj = asObject(value, what);
 	return {
-		topicId: b64urlField(reqString(obj, "topicId", what), "topicId", what),
+		topicId: b64urlFixedLen(reqString(obj, "topicId", what), "topicId", COORD_BYTES, what),
 		participantId: b64urlField(reqString(obj, "participantId", what), "participantId", what),
 		lastPing: reqFiniteNumber(obj, "lastPing", what),
 	};
@@ -460,7 +477,7 @@ function validateChildLinkRefV1(value: unknown): ChildLinkRefV1 {
 	const what = "ChildLinkRefV1";
 	const obj = asObject(value, what);
 	return {
-		topicId: b64urlField(reqString(obj, "topicId", what), "topicId", what),
+		topicId: b64urlFixedLen(reqString(obj, "topicId", what), "topicId", COORD_BYTES, what),
 		childCohortCoord: b64urlField(reqString(obj, "childCohortCoord", what), "childCohortCoord", what),
 		effectiveAt: reqFiniteNumber(obj, "effectiveAt", what),
 	};
@@ -497,7 +514,7 @@ export function validateCohortGossipV1(value: unknown): CohortGossipV1 {
 	const out: CohortGossipV1 = {
 		v: 1,
 		fromMember: reqString(obj, "fromMember", what),
-		coord: b64urlField(reqString(obj, "coord", what), "coord", what),
+		coord: b64urlFixedLen(reqString(obj, "coord", what), "coord", COORD_BYTES, what),
 		cohortEpoch: b64urlField(reqString(obj, "cohortEpoch", what), "cohortEpoch", what),
 		treeTier,
 		willingnessBits,
@@ -547,7 +564,7 @@ export function validateSignRequestV1(value: unknown): SignRequestV1 {
 	return {
 		v: 1,
 		kind: reqEnum(obj, "kind", SIGN_KINDS, what),
-		coord: b64urlField(reqString(obj, "coord", what), "coord", what),
+		coord: b64urlFixedLen(reqString(obj, "coord", what), "coord", COORD_BYTES, what),
 		cohortEpoch: b64urlField(reqString(obj, "cohortEpoch", what), "cohortEpoch", what),
 		payload: b64urlField(reqString(obj, "payload", what), "payload", what),
 	};
@@ -577,7 +594,7 @@ export function validateMembershipCertV1(value: unknown): MembershipCertV1 {
 	requireV1(obj, what);
 	const out: MembershipCertV1 = {
 		v: 1,
-		cohortCoord: b64urlField(reqString(obj, "cohortCoord", what), "cohortCoord", what),
+		cohortCoord: b64urlFixedLen(reqString(obj, "cohortCoord", what), "cohortCoord", COORD_BYTES, what),
 		cohortEpoch: b64urlField(reqString(obj, "cohortEpoch", what), "cohortEpoch", what),
 		members: reqStringArray(obj, "members", what),
 		stabilizedAt: reqFiniteNumber(obj, "stabilizedAt", what),
@@ -609,6 +626,7 @@ function validateRotationAttestation(obj: Record<string, unknown>, out: Membersh
 	if (presentCount !== 3) {
 		fail(`${what}: rotation attestation requires all of prevEpoch, rotationSig, rotationSigners — or none`);
 	}
+	// prevEpoch is a prior cohortEpoch, so it inherits cohortEpoch's leniency (see the b64urlField note).
 	out.prevEpoch = b64urlField(prevEpoch!, "prevEpoch", what);
 	out.rotationSig = b64urlField(rotationSig!, "rotationSig", what);
 	out.rotationSigners = rotationSigners!;

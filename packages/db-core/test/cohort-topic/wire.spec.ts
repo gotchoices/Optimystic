@@ -331,6 +331,18 @@ describe('cohort-topic wire', () => {
 			expect(() => decodeRegisterV1(frame)).to.throw(CohortWireError, /treeTier/);
 		});
 
+		it('rejects an over-length topicId (a fixed 32-byte field cannot become a bloated map key)', () => {
+			// A ~1 MiB topicId is the real hazard (it becomes a store / rate-limiter / replay-guard map key);
+			// 64 bytes suffices to prove the length gate fires while staying under the message-size ceiling.
+			const bad = { ...sampleRegister(), topicId: bytesToB64url(seededBytes(64, 1)) };
+			expect(() => decodeRegisterV1(encodeCohortMessage(bad))).to.throw(CohortWireError, /topicId/);
+		});
+
+		it('rejects an over-length correlationId (a fixed 16-byte field cannot become a bloated replay-guard key)', () => {
+			const bad = { ...sampleRegister(), correlationId: bytesToB64url(seededBytes(64, 2)) };
+			expect(() => decodeRegisterV1(encodeCohortMessage(bad))).to.throw(CohortWireError, /correlationId/);
+		});
+
 		it('rejects a negative treeTier', () => {
 			const bad = { ...sampleRegister(), treeTier: -1 };
 			const frame = encodeCohortMessage(bad);
