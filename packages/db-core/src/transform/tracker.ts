@@ -12,6 +12,14 @@ export class Tracker<T extends IBlock> implements IBlockStore<T> {
 	) { }
 
 	async tryGet(id: BlockId): Promise<T | undefined> {
+		// NOTE: precedence here is insert > delete > source+updates. In a well-formed transform an id is
+		// never in both `inserts` and `deletes` (insert/delete each clear the other), so order is moot. It
+		// only diverges from the canonical `applyTransform` (delete-last-wins, see struct.ts / helpers.ts:132)
+		// in the malformed insert+delete state reachable via the phantom-delete bug (double-delete then
+		// reinsert). Likewise the insert path intentionally skips `updates[id]` — inserted blocks bake ops
+		// in-place via update(); a stale pre-insert `updates[id]` is discarded here but would be re-applied
+		// on commit. Both are read-vs-commit inconsistencies confined to malformed states; fix the source
+		// bug (phantom delete / stale updates) rather than papering over it here.
 		if (this.transforms.inserts && Object.hasOwn(this.transforms.inserts, id)) {
 			return structuredClone(this.transforms.inserts[id]) as T;
 		}

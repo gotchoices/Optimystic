@@ -281,6 +281,45 @@ describe('Transform functionality', () => {
       expect(result.data).to.equal('reinserted')
     })
 
+    it('should return undefined for a source block that is pending-delete (delete shadows source)', async () => {
+      const sourceBlock: TestBlock = {
+        header: { id: sharedId, type: 'test', collectionId: 'c' },
+        data: 'from-source', items: ['original']
+      }
+      const source: BlockSource<TestBlock> = {
+        tryGet: async (id: BlockId) => id === sharedId ? structuredClone(sourceBlock) : undefined,
+        generateId: () => 'gen' as BlockId,
+        createBlockHeader: (type: BlockType) => ({ id: 'gen' as BlockId, type, collectionId: 'c' as BlockId })
+      }
+
+      const tracker = new Tracker(source)
+      tracker.delete(sharedId)
+
+      expect(await tracker.tryGet(sharedId)).to.be.undefined
+    })
+
+    it('should reflect an update applied after insert on the same id (insert path bakes ops in-place)', async () => {
+      const insertedBlock: TestBlock = {
+        header: { id: sharedId, type: 'test', collectionId: 'c' },
+        data: 'from-insert', items: ['a']
+      }
+      const source: BlockSource<TestBlock> = {
+        tryGet: async () => undefined,
+        generateId: () => 'gen' as BlockId,
+        createBlockHeader: (type: BlockType) => ({ id: 'gen' as BlockId, type, collectionId: 'c' as BlockId })
+      }
+
+      const tracker = new Tracker(source)
+      tracker.insert(insertedBlock)
+      // Scalar set op: overwrite `data`. update() applies it in-place on the stored insert.
+      tracker.update(sharedId, ['data', 0, 0, 'updated'] as BlockOperation)
+
+      // update() bakes into inserts, not transforms.updates
+      expect(tracker.transforms.updates?.[sharedId]).to.be.undefined
+      const result = await tracker.tryGet(sharedId) as TestBlock
+      expect(result.data).to.equal('updated')
+    })
+
     it('should leave block in deletes after double-delete then re-insert (BUG: phantom delete)', async () => {
       const source: BlockSource<TestBlock> = {
         tryGet: async () => undefined,
