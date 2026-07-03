@@ -10,7 +10,7 @@ import type { GetFromResult } from './struct.js';
 
 export type LogBlock<TAction> = ChainDataNode<LogEntry<TAction>>
 	& {
-		/** Base64url encoded Sha256 hash of the next block - present on every block except the head */
+		/** Base64url encoded Sha256 hash of the prior (predecessor) block - present on every block except the head */
 		priorHash?: string,
 	};
 
