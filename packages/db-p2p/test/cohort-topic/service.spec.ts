@@ -46,6 +46,13 @@ import { DEFAULT_COHORT_TOPIC_PROTOCOLS } from '../../src/cohort-topic/protocols
 
 const sha256digest = (b: Uint8Array): Uint8Array => new RingHash().H(b);
 
+/** A 16-byte correlationId seeded from a label — the wire codec pins the field to exactly 16 bytes. */
+const cid16 = (label: string): string => {
+	const buf = new Uint8Array(16);
+	new TextEncoder().encodeInto(label, buf);
+	return bytesToB64url(buf);
+};
+
 /** A single-member cohort wired in memory: the participant's router runs the member engine directly. */
 function buildSingleMemberCohort(opts: { memberId: Uint8Array; capPromote: number }): { engine: CohortMemberEngine; member: Uint8Array; epoch: Uint8Array; store: ReturnType<typeof createRegistrationStore> } {
 	const hash = new RingHash();
@@ -456,7 +463,7 @@ describe('cohort-topic: per-served-coord scoping', () => {
 			ttl: 90_000,
 			bootstrap: true,
 			timestamp: Date.now(),
-			correlationId: bytesToB64url(new TextEncoder().encode('cid-dispatch')),
+			correlationId: cid16('cid-dispatch'),
 			signature: '',
 		};
 		const frame = bytesToB64url(encodeCohortMessage(reg));

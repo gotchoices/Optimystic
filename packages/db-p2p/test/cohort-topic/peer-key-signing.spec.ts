@@ -28,6 +28,13 @@ import { signPeer, verifyPeerSig } from '../../src/cohort-topic/peer-sig.js';
 
 const TOPIC = Uint8Array.from({ length: 32 }, (_v, i) => (i + 3) & 0xff);
 
+/** A 16-byte correlationId seeded from a label — the wire codec pins the field to exactly 16 bytes. */
+const cid16 = (label: string): string => {
+	const buf = new Uint8Array(16);
+	new TextEncoder().encodeInto(label, buf);
+	return bytesToB64url(buf);
+};
+
 /** A minimal libp2p stand-in: the host only handles/unhandles protocols and reads its own peer id. */
 function makeFakeNode(peerId: PeerId): unknown {
 	return {
@@ -296,7 +303,7 @@ describe('cohort-topic: register signing payload survives the codec round-trip (
 			// bootstrap deliberately omitted → normalized to `false` on both sides.
 			appPayload: bytesToB64url(new TextEncoder().encode('app-state-bytes')),
 			timestamp: 1_700_000_000_000,
-			correlationId: bytesToB64url(new TextEncoder().encode('cid-roundtrip')),
+			correlationId: cid16('cid-roundtrip'),
 		};
 		const sig = await signPeer(participantKey, registerSigningPayload(body));
 		const signed: RegisterV1 = { ...body, signature: bytesToB64url(sig) };
@@ -333,7 +340,7 @@ describe('cohort-topic: register signing payload survives the codec round-trip (
 			ttl: 90_000,
 			followOn: true,
 			timestamp: 1_700_000_000_000,
-			correlationId: bytesToB64url(new TextEncoder().encode('cid-followon')),
+			correlationId: cid16('cid-followon'),
 		};
 		const sig = await signPeer(participantKey, registerSigningPayload(body));
 		const signed: RegisterV1 = { ...body, signature: bytesToB64url(sig) };

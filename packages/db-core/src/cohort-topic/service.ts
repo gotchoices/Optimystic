@@ -275,11 +275,11 @@ class WalkRegisterService implements CohortTopicService {
 			throw new CohortBackoffError(outcome.kind === "retry_later" ? outcome.afterMs : 0);
 		}
 		const hint = this.hintFromReply(req.topicId, req.tier, outcome.reply);
-		const renewal = this.startRenewal(req, hint, outcome.reply);
+		const renewal = this.startRenewal(req, hint);
 		return { ...hint, renewal };
 	}
 
-	private startRenewal(req: RegisterRequest, hint: CohortHint, reply: RegisterReplyV1): RenewalParticipant {
+	private startRenewal(req: RegisterRequest, hint: CohortHint): RenewalParticipant {
 		const ttl = req.ttl ?? this.ttl;
 		const initial: RegistrationRecord = {
 			topicId: req.topicId,
@@ -297,7 +297,11 @@ class WalkRegisterService implements CohortTopicService {
 			transport,
 			clock: this.clock,
 			sign: (body: UnsignedRenew): Promise<string> => this.deps.signer.signRenew(body),
-			correlationId: reply.cohortEpoch ?? bytesToB64url(this.participantId),
+			// A renew's correlationId is a 16-byte nonce (the wire codec pins the field — see
+			// validateRenewV1). It is never read on the cohort side (renew is keyed by (topicId,
+			// participant)), so a per-registration fresh nonce satisfies the contract; the cohort epoch
+			// travels separately as `initialCohortEpoch` below.
+			correlationId: this.freshCorrelationId(),
 			initialCohortEpoch: hint.cohortEpoch,
 		});
 		// NOTE: a second register() for the same (topicId, participantId) overwrites the map entry here,

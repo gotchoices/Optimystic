@@ -30,6 +30,13 @@ import { signPeerSig } from '../../src/cohort-topic/peer-sig.js';
 /** A non-banned, clean reputation view (the `{ isBanned, getScore }` shape the referee verifier needs). */
 const cleanReputation = { isBanned: (): boolean => false, getScore: (): number => 0 };
 
+/** A 16-byte correlationId seeded from a label — the wire codec pins the field to exactly 16 bytes. */
+const cid16 = (label: string): string => {
+	const buf = new Uint8Array(16);
+	new TextEncoder().encodeInto(label, buf);
+	return bytesToB64url(buf);
+};
+
 /** A real keypair → dialable peer-id bytes (a valid `participantCoord` / `referee`). */
 async function makeParticipant(): Promise<{ key: PrivateKey; bytes: Uint8Array }> {
 	const key = await generateKeyPair('Ed25519');
@@ -151,7 +158,7 @@ function makeReg(participantCoord: Uint8Array, topicId: Uint8Array, correlationI
 		ttl: 90_000,
 		bootstrap: true,
 		timestamp,
-		correlationId: bytesToB64url(new TextEncoder().encode(correlationId)),
+		correlationId: cid16(correlationId),
 		signature: '',
 		...extra,
 	};
