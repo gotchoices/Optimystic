@@ -231,9 +231,10 @@ class WalkRegisterService implements CohortTopicService {
 	}
 
 	async renew(handle: RegistrationHandle): Promise<void> {
-		// Withdrawn handles drop out of the live set; renewing one is a no-op so withdraw() actually
-		// stops the local ping loop (rather than the app silently continuing to refresh it).
-		if (!this.renewals.has(recordKey(handle.topicId, this.participantId))) {
+		// Act only if this handle is still the live entry. A stale handle (superseded by a second
+		// register() for the same pair) must not drive the new registration's ping loop, and a
+		// withdrawn handle must not silently re-start it.
+		if (this.renewals.get(recordKey(handle.topicId, this.participantId)) !== handle.renewal) {
 			return;
 		}
 		await handle.renewal.pingLoop();
@@ -247,11 +248,16 @@ class WalkRegisterService implements CohortTopicService {
 		// The delete happens FIRST so a concurrent renew() already no-ops before the tombstone is sent. If
 		// the tombstone send fails (primary unreachable), the cohort soft-state TTL-expires as the
 		// fallback — withdraw never throws on a transport failure. Idempotent: a second withdraw finds
-		// `renewal === undefined` and no-ops.
+		// `renewal !== handle.renewal` (undefined ≠ any object) and no-ops.
+		// Guard: act only if this handle is still the live entry. A stale handle must not evict the
+		// new registration or send a tombstone on its behalf.
 		const key = recordKey(handle.topicId, this.participantId);
 		const renewal = this.renewals.get(key);
+		if (renewal !== handle.renewal) {
+			return;
+		}
 		this.renewals.delete(key);
-		await renewal?.withdraw();
+		await renewal.withdraw();
 	}
 
 	cohortGossip(): CohortGossipBus {
