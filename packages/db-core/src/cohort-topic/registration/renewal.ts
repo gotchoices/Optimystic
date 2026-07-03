@@ -342,6 +342,14 @@ class StoreRenewalCohortSide implements RenewalCohortSide {
 		if (msg.timestamp > now + this.maxFutureSkewMs) {
 			return false; // implausibly future
 		}
+		// NOTE: condition (3) compares a participant-supplied `msg.timestamp` against a server-maintained
+		// `rec.lastPing` (set from whichever cohort member last touched the record, using its own clock) — two
+		// different machines' clocks. In normal operation a genuine leave/failover post-dates the last ping, so
+		// `timestamp > lastPing` holds. If a participant's clock lags the server that set `lastPing`, a
+		// legitimate reattach can be rejected; the failure is soft (returns `primary_moved`, so the failover
+		// loop tries the next backup / re-runs the d_max lookup — a delayed failover, not data loss). If
+		// cross-node skew is ever observed to stall failovers, relax (3) to strict `<` (accept `timestamp ==
+		// lastPing`); the `maxAge` window still backstops the replay-after-re-registration attack.
 		if (msg.timestamp <= rec.lastPing) {
 			return false; // replay / non-monotonic against the live record
 		}

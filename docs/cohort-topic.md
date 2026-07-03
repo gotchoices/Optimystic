@@ -1403,6 +1403,18 @@ interface RenewV1 {
 > privilege-escalating path: an unverifiable `reattach` is redirected (`primary_moved`), never
 > promoted, so a stray/MITM'd ping cannot usurp a live primary. A plain ping (no `reattach`) only
 > touches `lastPing`, so it is not signature-gated.
+>
+> **Privileged-path freshness (anti-replay).** The signature binds `timestamp` (`renewSigningPayload`),
+> so a captured `withdraw`/`reattach` frame can only be replayed byte-for-byte — never re-stamped fresher.
+> Both privileged paths therefore also run a freshness gate (`isFreshPrivileged` in `renewal.ts`) that
+> rejects a `timestamp` that is stale (older than `now − maxAgeMs`), implausibly future (newer than
+> `now + maxFutureSkewMs`), or not strictly newer than the record's `lastPing`. The monotonic
+> `timestamp <= lastPing` check closes a fast in-window replay against the live record — e.g. a `withdraw`
+> captured before the record TTL-expired and re-registered, replayed to evict the *fresh* record. A rejected
+> frame returns the same opaque answer as a forged one (`unknown_registration` / `primary_moved`), leaking
+> nothing. The window reuses the register path's replay-guard config (`ctx.antiDos.replayGuard`), so tuning
+> the skew window moves both paths together. Plain pings are **not** gated (a replayed ping only re-touches
+> `lastPing`). See the fix ticket `cohort-topic-renew-freshness-replay`.
 
 ```
 interface RenewReplyV1 {
