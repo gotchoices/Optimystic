@@ -222,6 +222,7 @@ describe('cohort-topic: gossip-cadence driver helpers', () => {
 		d = pending.drain();
 		expect(d.records.length, 'record dropped by the later eviction').to.equal(0);
 		expect(d.evicted.length, 'eviction queued').to.equal(1);
+		expect(d.evicted[0]!.lastPing, 'the drained eviction stamps the record lastPing (the receiver freshness key)').to.equal(1_000);
 	});
 
 	it('pending deltas: child link/unlink queue (last-writer-wins by effectiveAt); drain partitions link vs unlink', () => {
@@ -503,6 +504,56 @@ describe('cohort-topic: two-node replication via a gossip round', () => {
 		deliverGossip(b.node, encodeCohortMessage(gEvict!), a.member.peerId);
 		await delay(30);
 		expect(eB.holds(TOPIC, participant.bytes), 'B converged on the eviction').to.equal(false);
+
+		await a.host.stop();
+		await b.host.stop();
+	});
+
+	it('a stale eviction reordered AFTER a re-registration does not delete the fresh record on a sibling', async () => {
+		// The whole-path proof of the freshness guard: register → replicate → re-register (newer lastPing) →
+		// replicate, then deliver a slow member's eviction stamped at the OLD lastPing. Without the guard this
+		// reordered delta would delete the fresher record; with it, the sibling keeps the live registration.
+		const { a, b, coord0 } = await twoNodeCohort();
+		const participant = await makeMember();
+		const eA = a.host.registry.forCoord(coord0, 0 as Tier, participant.bytes);
+		const eB = b.host.registry.forCoord(coord0, 0 as Tier, participant.bytes);
+		const epoch = eA.cohort().cohortEpoch;
+
+		// Seed A's view with B's willingness so the 2-of-2 quorum is met and A can admit.
+		deliverGossip(a.node, await signedGossip(b.member, coord0, epoch, { willingnessBits: 'f' }), b.member.peerId);
+		await delay(30);
+
+		// R1: participant registers on A at real-clock t1; the record replicates to B.
+		const t1 = Date.now();
+		expect((await eA.engine.handleRegister(await signedRegister(participant, TOPIC, 90_000, t1), { followOn: false, treeTier: 0 }, t1)).result, 'A admits R1').to.equal('accepted');
+		deliverGossip(b.node, encodeCohortMessage((await eA.gossipRound(t1))!), a.member.peerId);
+		await delay(30);
+		expect(eB.holds(TOPIC, participant.bytes), 'B holds R1 after the first round').to.equal(true);
+
+		// R2: the participant re-registers with a newer lastPing (t2 > t1); A gossips the fresher record to B.
+		const t2 = t1 + 10_000;
+		expect((eA.engine.handleRenew(await signedReattach(participant, TOPIC, t2), t2)).result, 'A touches R2').to.equal('ok');
+		const gR2 = await eA.gossipRound(t2);
+		expect(gR2?.records?.length, 'A drained the re-registration record').to.equal(1);
+		deliverGossip(b.node, encodeCohortMessage(gR2!), a.member.peerId);
+		await delay(30);
+
+		// A slow member's eviction, stamped at the OLD t1, arrives at B AFTER R2 — the reorder the guard closes.
+		const staleEviction = await signedGossip(a.member, coord0, epoch, {
+			evicted: [{ topicId: bytesToB64url(TOPIC), participantId: bytesToB64url(participant.bytes), lastPing: t1 }],
+		});
+		deliverGossip(b.node, staleEviction, a.member.peerId);
+		await delay(30);
+		expect(eB.holds(TOPIC, participant.bytes), 'the stale eviction (lastPing=t1) did NOT delete the fresher R2 (lastPing=t2)').to.equal(true);
+
+		// Positive control: a genuine eviction stamped at the held lastPing (t2) still converges the delete —
+		// proving the guard ignores only stale evictions, not all of them.
+		const genuineEviction = await signedGossip(a.member, coord0, epoch, {
+			evicted: [{ topicId: bytesToB64url(TOPIC), participantId: bytesToB64url(participant.bytes), lastPing: t2 }],
+		});
+		deliverGossip(b.node, genuineEviction, a.member.peerId);
+		await delay(30);
+		expect(eB.holds(TOPIC, participant.bytes), 'a genuine eviction stamped at the held lastPing converges the delete').to.equal(false);
 
 		await a.host.stop();
 		await b.host.stop();
