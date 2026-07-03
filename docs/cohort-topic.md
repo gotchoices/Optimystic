@@ -1540,6 +1540,7 @@ interface CohortGossipV1 {
   evicted?: {                         // records this member evicted (stale); converge the active set
     topicId:            string
     participantId:      string
+    lastPing:           number        // freshness guard: the receiver ignores a stale eviction (older than the held record) so a re-registration survives
   }[]
   childLinks?: {                      // child cohorts this member recorded — converge the child SET (union)
     topicId:            string
@@ -1559,7 +1560,9 @@ interface CohortGossipV1 {
 The `records` / `evicted` deltas are how a registration replicates across the `~k` members so a
 backup already holds the record when the primary fails (see §Registration record). A receiving
 member merges each record last-writer-wins by `lastPing` (so a touch overwrites an older replica)
-and applies evictions, but **only when the gossip's `cohortEpoch` matches its own** — a delta under a
+and applies evictions — an eviction deletes only when the held record is no newer than the eviction's
+`lastPing`, so a stale (reordered/slow) eviction cannot delete a fresher re-registration — but **only
+when the gossip's `cohortEpoch` matches its own** — a delta under a
 foreign epoch belongs to a different membership snapshot (different slot assignments) and is dropped,
 with the mismatch surfaced as membership drift. The implementation is the gossip bus in
 [`packages/db-core/src/cohort-topic/gossip`](../packages/db-core/src/cohort-topic/gossip); the

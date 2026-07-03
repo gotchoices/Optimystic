@@ -282,6 +282,13 @@ export interface GossipRecordRefV1 {
 	topicId: string;
 	/** Participant peer id, base64url. */
 	participantId: string;
+	/**
+	 * Unix ms of the evicted record's most-recent ping (mirrors {@link GossipRecordV1.lastPing}). The
+	 * receiver's freshness guard for the delete: a held record newer than this stamp is a re-registration
+	 * that arrived after the eviction was produced, so the stale eviction is ignored rather than deleting
+	 * the fresh record. Required — every real eviction has this on hand from the held record.
+	 */
+	lastPing: number;
 }
 
 /**

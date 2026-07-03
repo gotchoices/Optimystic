@@ -113,7 +113,9 @@ export function createPendingDeltas(): PendingDeltas {
 		},
 		evicted(rec: RegistrationRecord): void {
 			const key = keyOf(rec.topicId, rec.participantId);
-			evicted.set(key, { topicId: bytesToB64url(rec.topicId), participantId: bytesToB64url(rec.participantId) });
+			// Stamp the evicted record's lastPing so the receiver can gate the delete on freshness (a stale
+			// eviction must not delete a record the participant has since re-registered — see bus.mergeRecords).
+			evicted.set(key, { topicId: bytesToB64url(rec.topicId), participantId: bytesToB64url(rec.participantId), lastPing: rec.lastPing });
 			records.delete(key);
 		},
 		childLink(topicId: Uint8Array, childCohortCoord: Uint8Array, effectiveAt: number): void {

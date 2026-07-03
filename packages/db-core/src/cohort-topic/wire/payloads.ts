@@ -118,7 +118,7 @@ export function cohortGossipSigningPayload(g: CohortGossipSignable): Uint8Array 
 			r.ttl,
 			r.appState ?? null,
 		]),
-		(g.evicted ?? []).map((e) => [e.topicId, e.participantId]),
+		(g.evicted ?? []).map((e) => [e.topicId, e.participantId, e.lastPing]),
 		(g.childLinks ?? []).map((c) => [c.topicId, c.childCohortCoord, c.effectiveAt]),
 		(g.childUnlinks ?? []).map((c) => [c.topicId, c.childCohortCoord, c.effectiveAt]),
 		g.timestamp,

@@ -447,6 +447,7 @@ function validateGossipRecordRefV1(value: unknown): GossipRecordRefV1 {
 	return {
 		topicId: b64urlField(reqString(obj, "topicId", what), "topicId", what),
 		participantId: b64urlField(reqString(obj, "participantId", what), "participantId", what),
+		lastPing: reqFiniteNumber(obj, "lastPing", what),
 	};
 }
 

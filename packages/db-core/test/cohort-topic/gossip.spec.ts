@@ -8,7 +8,7 @@ import { bytesToB64url, encodeCohortMessage } from '../../src/cohort-topic/wire/
 import type { ICohortGossipTransport, PeerRef, RingCoord } from '../../src/cohort-topic/ports.js';
 import type { RegistrationStore, RegistrationRecord } from '../../src/cohort-topic/registration/types.js';
 import { MAX_TTL_MS } from '../../src/cohort-topic/registration/types.js';
-import type { ChildLinkRefV1, CohortGossipV1 } from '../../src/cohort-topic/wire/types.js';
+import type { ChildLinkRefV1, CohortGossipV1, GossipRecordRefV1 } from '../../src/cohort-topic/wire/types.js';
 
 function bytes(label: string, len = 32): Uint8Array {
 	return sha256(new TextEncoder().encode(label)).slice(0, len);
@@ -43,6 +43,11 @@ function record(participant: string, lastPing: number): RegistrationRecord {
 		lastPing,
 		ttl: 90_000,
 	};
+}
+
+/** An eviction ref for `rec`, stamped with `lastPing` (the freshness key the receiver's guard compares). */
+function evictionRef(rec: RegistrationRecord, lastPing: number): GossipRecordRefV1 {
+	return { topicId: bytesToB64url(rec.topicId), participantId: bytesToB64url(rec.participantId), lastPing };
 }
 
 function gossip(from: string, epoch: Uint8Array, opts: Partial<CohortGossipV1> = {}): CohortGossipV1 {
@@ -135,8 +140,34 @@ describe('cohort-topic / gossip bus', () => {
 		const rec = record('p', 1_000);
 		store.put(rec);
 		const bus = busFor(store, new FanoutTransport(), () => EPOCH);
-		bus.applyInbound(gossip('m', EPOCH, { evicted: [{ topicId: bytesToB64url(rec.topicId), participantId: bytesToB64url(rec.participantId) }] }), 2_000);
+		bus.applyInbound(gossip('m', EPOCH, { evicted: [evictionRef(rec, rec.lastPing)] }), 2_000);
 		expect(store.getByParticipant(rec.topicId, rec.participantId)).to.be.undefined;
+	});
+
+	it('ignores a stale eviction (older than the held record) so a fresh re-registration survives', () => {
+		// R1 held at t1; the participant re-registers as R2 at t2 > t1; a slow eviction stamped t1 arrives
+		// AFTER the re-registration. Evictions are not last-writer-wins, so without the freshness guard this
+		// stale delta would delete R2. It must be ignored — R2 survives.
+		const store = createRegistrationStore();
+		const r2 = record('p', 5_000);
+		store.put(r2);
+		const bus = busFor(store, new FanoutTransport(), () => EPOCH);
+		bus.applyInbound(gossip('m', EPOCH, { evicted: [evictionRef(r2, 1_000)] }), 2_000);
+		const got = store.getByParticipant(r2.topicId, r2.participantId);
+		expect(got, 'the fresher re-registration survives a stale eviction').to.not.be.undefined;
+		expect(got!.lastPing).to.equal(5_000);
+	});
+
+	it('applies a genuine eviction stamped at (or after) the held record lastPing', () => {
+		// A same-age eviction (held.lastPing <= ref.lastPing) is genuine and deletes; so is a later-stamped one.
+		for (const stamp of [1_000, 9_000]) {
+			const store = createRegistrationStore();
+			const rec = record('p', 1_000);
+			store.put(rec);
+			const bus = busFor(store, new FanoutTransport(), () => EPOCH);
+			bus.applyInbound(gossip('m', EPOCH, { evicted: [evictionRef(rec, stamp)] }), 2_000);
+			expect(store.getByParticipant(rec.topicId, rec.participantId), `eviction stamped ${stamp} removes the record`).to.be.undefined;
+		}
 	});
 
 	it('re-touches the topic budget down when a gossiped eviction drains a topic (sibling-drain leak fix)', () => {
@@ -161,9 +192,35 @@ describe('cohort-topic / gossip bus', () => {
 				for (const t of topicIds) budget.touch(t, store.directParticipants(t));
 			},
 		});
-		bus.applyInbound(gossip('m', EPOCH, { evicted: [{ topicId: bytesToB64url(rec.topicId), participantId: bytesToB64url(rec.participantId) }] }), 2_000);
+		bus.applyInbound(gossip('m', EPOCH, { evicted: [evictionRef(rec, rec.lastPing)] }), 2_000);
 		expect(store.getByParticipant(rec.topicId, rec.participantId), 'the gossiped eviction removed the record').to.be.undefined;
 		expect(budget.participantCount(rec.topicId), 'the drained topic was re-touched down to 0 (slot reclaimable)').to.equal(0);
+	});
+
+	it('a stale (ignored) eviction does not re-touch the topic budget', () => {
+		// A stale eviction deletes nothing, so it must not fire onRecordsEvicted — otherwise it would re-touch
+		// the budget down for a topic that still holds a live (fresher) participant.
+		const store = createRegistrationStore();
+		const budget = createTopicBudget({ topicsMax: 2 });
+		const r2 = record('p', 5_000); // fresh re-registration
+		store.put(r2);
+		budget.admit(r2.topicId);
+		budget.touch(r2.topicId, store.directParticipants(r2.topicId));
+		expect(budget.participantCount(r2.topicId)).to.equal(1);
+
+		const calls: string[][] = [];
+		const bus = createCohortGossipBus({
+			transport: new FanoutTransport(),
+			store,
+			coord: COORD,
+			localEpoch: () => EPOCH,
+			now: () => 2_000,
+			onRecordsEvicted: (topicIds) => { calls.push(topicIds.map(bytesToB64url)); for (const t of topicIds) budget.touch(t, store.directParticipants(t)); },
+		});
+		bus.applyInbound(gossip('m', EPOCH, { evicted: [evictionRef(r2, 1_000)] }), 2_000);
+		expect(store.getByParticipant(r2.topicId, r2.participantId), 'the fresh record survives').to.not.be.undefined;
+		expect(calls.length, 'a skipped stale eviction fires no budget re-touch').to.equal(0);
+		expect(budget.participantCount(r2.topicId), 'the live participant still holds its slot').to.equal(1);
 	});
 
 	it('fires onRecordsEvicted once per distinct drained topic, and not at all without evictions', () => {
@@ -187,8 +244,8 @@ describe('cohort-topic / gossip bus', () => {
 		store.put(r1);
 		store.put(r2);
 		bus.applyInbound(gossip('m', EPOCH, { evicted: [
-			{ topicId: bytesToB64url(r1.topicId), participantId: bytesToB64url(r1.participantId) },
-			{ topicId: bytesToB64url(r2.topicId), participantId: bytesToB64url(r2.participantId) },
+			evictionRef(r1, r1.lastPing),
+			evictionRef(r2, r2.lastPing),
 		] }), 2_000);
 		expect(calls.length, 'one merge with evictions → exactly one hook call').to.equal(1);
 		expect(calls[0], 'distinct topic ids only').to.deep.equal([bytesToB64url(r1.topicId)]);

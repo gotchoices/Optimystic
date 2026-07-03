@@ -32,6 +32,7 @@ import type {
 	ChildLinkV1,
 	ChildLinkReplyV1,
 	ChildLinkRefV1,
+	GossipRecordRefV1,
 	PromotionNoticeV1,
 	DemotionNoticeV1,
 	CohortGossipV1,
@@ -393,6 +394,32 @@ describe('cohort-topic wire', () => {
 
 			const badArray = { ...sampleGossip(), childUnlinks: 'nope' as unknown as ChildLinkRefV1[] };
 			expect(() => validateCohortGossipV1(badArray), 'childUnlinks must be an array when present').to.throw(CohortWireError, /childUnlinks/);
+		});
+
+		it('round-trips an evicted ref carrying lastPing, and rejects a missing / non-finite lastPing', () => {
+			const ref: GossipRecordRefV1 = { topicId: b64(32, 91), participantId: b64(16, 92), lastPing: 1_700_000_030_000 };
+			const msg: CohortGossipV1 = { ...sampleGossip(), evicted: [ref] };
+			const decoded = decodeCohortGossipV1(encodeCohortMessage(msg));
+			expect(decoded.evicted, 'the evicted ref (with lastPing) survives the round-trip').to.deep.equal([ref]);
+
+			// lastPing is required — a ref without it is a malformed frame (mirrors the childLinks rejections).
+			const { lastPing: _drop, ...noPing } = ref;
+			const missing = { ...sampleGossip(), evicted: [noPing] };
+			expect(() => decodeCohortGossipV1(encodeCohortMessage(missing as unknown as { v: 1 })), 'a missing lastPing is rejected').to.throw(CohortWireError, /lastPing/);
+
+			// A non-finite lastPing (null on the wire, since JSON cannot carry NaN) is rejected as malformed.
+			const badPing = { ...sampleGossip(), evicted: [{ ...ref, lastPing: null }] };
+			expect(() => decodeCohortGossipV1(encodeCohortMessage(badPing as unknown as { v: 1 })), 'a non-finite lastPing is rejected').to.throw(CohortWireError, /lastPing/);
+		});
+
+		it('the gossip signing payload covers an evicted ref lastPing (a MITM cannot alter it)', () => {
+			// Cover lastPing so a MITM cannot strip/alter it to turn a stale eviction back into a wild-card delete.
+			const base = sampleGossip();
+			const stale: GossipRecordRefV1 = { topicId: b64(32, 91), participantId: b64(16, 92), lastPing: 1_000 };
+			const fresh: GossipRecordRefV1 = { ...stale, lastPing: 9_000 };
+			const staleImage = bytesToB64url(cohortGossipSigningPayload({ ...base, evicted: [stale] }));
+			const freshImage = bytesToB64url(cohortGossipSigningPayload({ ...base, evicted: [fresh] }));
+			expect(staleImage, 'two refs differing only in lastPing sign distinct images').to.not.equal(freshImage);
 		});
 
 		it('the gossip signing payload covers childLinks and childUnlinks (a MITM cannot strip or inject one)', () => {

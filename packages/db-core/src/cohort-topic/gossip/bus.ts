@@ -225,7 +225,19 @@ class TransportCohortGossipBus implements CohortGossipBus {
 		let evictedTopics: Map<string, Uint8Array> | undefined;
 		for (const ref of g.evicted ?? []) {
 			const topicId = b64urlToBytes(ref.topicId);
-			this.deps.store.delete(topicId, b64urlToBytes(ref.participantId));
+			const participantId = b64urlToBytes(ref.participantId);
+			// NOTE: freshness guard adds one getByParticipant per eviction ref (on top of the delete's own
+			// lookup); evictions are low-volume, but if this path ever shows as hot, fold the guard into a
+			// single conditional-delete store op.
+			const held = this.deps.store.getByParticipant(topicId, participantId);
+			// A stale eviction (older than the held record) must not delete a fresher re-registration.
+			// Evictions are otherwise NOT last-writer-wins like merges are, so a reordered/slow delta would
+			// win against a record the participant already renewed. Skip it — and, since nothing drained,
+			// do NOT add the topic to `evictedTopics` (no delete → no budget re-touch).
+			if (held !== undefined && held.lastPing > ref.lastPing) {
+				continue;
+			}
+			this.deps.store.delete(topicId, participantId);
 			if (this.deps.onRecordsEvicted !== undefined) {
 				(evictedTopics ??= new Map()).set(bytesKey(topicId), topicId);
 			}
