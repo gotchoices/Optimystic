@@ -386,6 +386,10 @@ class StoreCohortMemberEngine implements CohortMemberEngine {
 		// rate limiter would reject must not first insert a `seen` entry (which would let an attacker grow
 		// the replay guard's memory at full attack speed regardless of the rate limit). Running it before
 		// the potentially-expensive bootstrap verify (which may do PoW) also short-circuits floods sooner.
+		// NOTE: a replayed frame now consumes a rate-limiter accept before the replay guard (below) drops it,
+		// whereas the old order dropped replays pre-rate. Fine for spam (inbound traffic should be counted);
+		// only matters if a legitimate client reuses one correlationId across retransmits — it would then
+		// burn rate budget per retransmit. If clients adopt idempotent same-cid retry, revisit this order.
 		const rate = this.deps.rateLimiter?.check(participantId, topicId, now);
 		if (rate !== undefined && rate.ok === false) {
 			return { v: 1, result: "unwilling_cohort", retryAfterMs: rate.retryAfterMs };

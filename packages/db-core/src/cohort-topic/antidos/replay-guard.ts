@@ -41,7 +41,7 @@ export interface CorrelationReplayGuardConfig {
 	maxAgeMs?: number;
 	/** A timestamp newer than `now + maxFutureSkewMs` is rejected. Default {@link DEFAULT_REPLAY_MAX_FUTURE_SKEW_MS}. */
 	maxFutureSkewMs?: number;
-	/** Hard LRU cap on remembered correlationIds; oldest-inserted (oldest-timestamp) evicted beyond this. Default {@link DEFAULT_REPLAY_GUARD_MAX_KEYS}. */
+	/** Hard LRU cap on remembered correlationIds; oldest-inserted (≈ oldest-timestamp) evicted beyond this. Default {@link DEFAULT_REPLAY_GUARD_MAX_KEYS}. */
 	maxKeys?: number;
 }
 
@@ -106,8 +106,11 @@ class WindowedReplayGuard implements CorrelationReplayGuard {
 			return false; // replay
 		}
 		// New id: enforce the hard cap by evicting the oldest-inserted entries (oldest by `Map` insertion
-		// order, which — since entries are inserted once and never refreshed — is also oldest-timestamp,
-		// i.e. nearest to aging out as stale) until this insertion stays within `maxKeys`.
+		// order) until this insertion stays within `maxKeys`. Since entries are inserted once and never
+		// refreshed, insertion order closely tracks timestamp order, so the victim is ≈ the oldest-timestamp
+		// — nearest to aging out as stale. (It is only ≈: ids from distinct peers can arrive out of
+		// timestamp order within the skew window, so a victim may retain slightly more window than a
+		// strictly-oldest pick. The forgiveness bound — at most one entry's remaining window — holds either way.)
 		while (this.seen.size >= this.maxKeys) {
 			const oldest = this.seen.keys().next().value;
 			if (oldest === undefined) break;
