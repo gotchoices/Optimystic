@@ -228,7 +228,7 @@ For the full dialect reference, see the [Quereus SQL Reference](https://github.c
 
 - Primary keys must be TEXT type (tree keys are strings)
 - `msgpack` encoding is declared but not yet implemented
-- Savepoints are not implemented
+- Savepoints (including Quereus's internal statement-/row-level atomicity) work in legacy/single-node mode; in distributed-consensus (session) mode they are no-ops, so a mid-statement abort there can still leave partial rows staged
 - Cross-collection transactions not yet supported
 
 ## Development

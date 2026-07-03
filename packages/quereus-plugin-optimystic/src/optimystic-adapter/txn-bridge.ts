@@ -459,6 +459,12 @@ export class TransactionBridge {
     if (this.session) {
       return;
     }
+    // NOTE: keeping only the FIRST capture per depth is correct only while Quereus
+    // releases/rolls-back a savepoint before any later savepoint reuses its depth
+    // (verified by the primary-repro test: two statements in one txn reuse the same
+    // __stmt_atomic depth, and row 1 survives). If Quereus ever left statement
+    // savepoints open and reused a depth, this dedup would return a stale snapshot —
+    // capture per (depth, generation) instead.
     if (this.savepoints.has(depth)) {
       return;
     }
