@@ -5,6 +5,7 @@ import { createRegistrationStore } from '../../src/cohort-topic/registration/sto
 import { createRenewalCohortSide } from '../../src/cohort-topic/registration/renewal.js';
 import { createTopicBudget } from '../../src/cohort-topic/antidos/topic-budget.js';
 import { createRegisterRateLimiter } from '../../src/cohort-topic/antidos/rate-limiter.js';
+import { createCorrelationReplayGuard } from '../../src/cohort-topic/antidos/replay-guard.js';
 import { createSlotAssigner } from '../../src/cohort-topic/registration/sharding.js';
 import { createRingHash } from '../../src/cohort-topic/ring-hash.js';
 import { bytesEqual, bytesKey } from '../../src/cohort-topic/registration/bytes.js';
@@ -607,6 +608,49 @@ describe('cohort-topic / member-engine: sweepStale reclaims idle rate-limiter ke
 		engine.sweepStale(1_000 + 1_000);
 		expect(rateLimiter.size, 'the idle register key was reclaimed on the gossip cadence').to.equal(0);
 		expect(probeRateLimiter.size, 'the idle probe key was reclaimed on the gossip cadence').to.equal(0);
+	});
+
+	it('a rate-rejected register leaves no replay-guard entry; an admitted one records', async () => {
+		// Guards run sig → rate → bootstrap → replay, so the replay guard records ONLY after rate admission.
+		// A fresh-correlationId frame the rate limiter sheds must not grow the replay guard's memory.
+		const store = createRegistrationStore();
+		const renewal = createRenewalCohortSide({ store, self, slots, cohort, gossip: { touch: (): void => {}, evicted: (): void => {} } });
+		const rateLimiter = createRegisterRateLimiter({ ratePerWindow: 1 }); // one accept per window → the 2nd is shed
+		const replayGuard = createCorrelationReplayGuard();
+		const engine = createCohortMemberEngine({
+			self,
+			profile: unused('profile'),
+			hash,
+			store,
+			slots,
+			willingness: unused('willingness'),
+			promotion: unused('promotion'),
+			coldStart,
+			traffic: unused('traffic'),
+			renewal,
+			cohort,
+			quorumWilling: (): boolean => false, // cold → no_state, but the sig/rate/replay guards ran first
+			rateLimiter,
+			replayGuard,
+		});
+
+		const topic = bytes('rr-topic');
+		const peer = bytes('rr-peer', 16);
+		const now = 1_000;
+
+		// First frame: rate admits it (first in the window) → the replay guard records its correlationId.
+		const first = await engine.handleRegister(mkReg(topic, peer, 'rr-cid-1', now), { followOn: false, treeTier: 0 }, now);
+		expect(first.result, 'cold cohort still serves no state').to.equal('no_state');
+		expect(replayGuard.size, 'the admitted frame recorded its correlationId').to.equal(1);
+
+		// Second + third frames, fresh correlationIds, same window: the rate limiter sheds them BEFORE the
+		// replay guard runs, so they answer unwilling_cohort and leave the replay guard's size unchanged.
+		for (const cid of ['rr-cid-2', 'rr-cid-3']) {
+			const shed = await engine.handleRegister(mkReg(topic, peer, cid, now), { followOn: false, treeTier: 0 }, now);
+			expect(shed.result, 'over-rate frame is shed').to.equal('unwilling_cohort');
+			expect(shed.retryAfterMs, 'shed with a back-off').to.be.a('number');
+		}
+		expect(replayGuard.size, 'rate-rejected frames recorded no correlationId').to.equal(1);
 	});
 });
 

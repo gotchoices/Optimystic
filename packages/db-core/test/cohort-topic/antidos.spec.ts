@@ -10,6 +10,7 @@ import {
 	DEFAULT_TOPICS_MAX,
 	createCorrelationReplayGuard,
 	DEFAULT_REPLAY_MAX_AGE_MS,
+	DEFAULT_REPLAY_GUARD_MAX_KEYS,
 	createBootstrapEvidence,
 } from '../../src/cohort-topic/antidos/index.js';
 import { backoffRetryMs } from '../../src/cohort-topic/willingness.js';
@@ -321,6 +322,38 @@ describe('cohort-topic / anti-DoS', () => {
 			expect(guard.accept(cid, PEER_A, later, later)).to.be.true;
 			// ...but an immediate exact replay at that fresh timestamp is still caught.
 			expect(guard.accept(cid, PEER_A, later, later + 1)).to.be.false;
+		});
+
+		it('exposes the LRU-cap default', () => {
+			expect(DEFAULT_REPLAY_GUARD_MAX_KEYS).to.equal(100_000);
+		});
+
+		it('caps tracked ids at maxKeys, evicting the oldest-inserted', () => {
+			// Four fresh ids all inside one window: the cap must hold at 3, evicting the oldest-inserted.
+			// Insertion order == timestamp order, so the evicted victim is the one nearest to aging out.
+			const guard = createCorrelationReplayGuard({ maxKeys: 3 });
+			const now = 1_000_000;
+			const ids = [bytes('cap-0', 16), bytes('cap-1', 16), bytes('cap-2', 16), bytes('cap-3', 16)];
+			expect(guard.accept(ids[0]!, PEER_A, now, now)).to.be.true; // seen [0]
+			expect(guard.accept(ids[1]!, PEER_A, now, now)).to.be.true; // seen [0,1]
+			expect(guard.accept(ids[2]!, PEER_A, now, now)).to.be.true; // seen [0,1,2]
+			expect(guard.size, 'at cap').to.equal(3);
+
+			// The fourth fresh id evicts the oldest (id0). Size holds at the cap.
+			expect(guard.accept(ids[3]!, PEER_A, now, now)).to.be.true; // evicts id0 → seen [1,2,3]
+			expect(guard.size, 'still capped after the flood id').to.equal(3);
+
+			// A survivor (id2) is still remembered → its replay is rejected. Probe it BEFORE re-inserting
+			// the evicted id0, whose fresh insert would evict the next-oldest (id1).
+			expect(guard.accept(ids[2]!, PEER_A, now, now + 1), 'a surviving id is still caught as a replay').to.be.false;
+			// The evicted id0 is now unknown → admitted as fresh (the documented reopened-window tradeoff).
+			expect(guard.accept(ids[0]!, PEER_A, now, now + 1), 'the evicted id returns as first-sight').to.be.true;
+		});
+
+		it('rejects invalid maxKeys at construction', () => {
+			expect(() => createCorrelationReplayGuard({ maxKeys: 0 })).to.throw(RangeError);
+			expect(() => createCorrelationReplayGuard({ maxKeys: 2.5 })).to.throw(RangeError);
+			expect(() => createCorrelationReplayGuard({ maxKeys: -1 })).to.throw(RangeError);
 		});
 	});
 

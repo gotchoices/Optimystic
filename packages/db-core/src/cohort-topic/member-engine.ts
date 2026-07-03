@@ -378,21 +378,28 @@ class StoreCohortMemberEngine implements CohortMemberEngine {
 	): RegisterReplyV1 | undefined {
 		if (this.deps.verifyRegisterSig?.(reg) === false) {
 			// Unsigned / forged participant signature: serve nothing and record nothing (the cohort
-			// cannot trust this participantCoord). Checked before the replay/rate guards so a forged
-			// frame cannot consume their state.
+			// cannot trust this participantCoord). Cheap + stateless, so checked first — a forged frame
+			// cannot consume any downstream guard state.
 			return { v: 1, result: "no_state" };
 		}
-		const correlationId = b64urlToBytes(reg.correlationId);
-		if (this.deps.replayGuard?.accept(correlationId, participantId, reg.timestamp, now) === false) {
-			// Stale / future-skewed / replayed: serve nothing and record nothing.
-			return { v: 1, result: "no_state" };
+		// Rate-check BEFORE the replay guard records anything: a fresh-correlationId spam frame that the
+		// rate limiter would reject must not first insert a `seen` entry (which would let an attacker grow
+		// the replay guard's memory at full attack speed regardless of the rate limit). Running it before
+		// the potentially-expensive bootstrap verify (which may do PoW) also short-circuits floods sooner.
+		const rate = this.deps.rateLimiter?.check(participantId, topicId, now);
+		if (rate !== undefined && rate.ok === false) {
+			return { v: 1, result: "unwilling_cohort", retryAfterMs: rate.retryAfterMs };
 		}
 		if (this.deps.bootstrapEvidence?.verify(reg, tier) === false) {
 			return this.unwillingCohort(reg, now);
 		}
-		const rate = this.deps.rateLimiter?.check(participantId, topicId, now);
-		if (rate !== undefined && rate.ok === false) {
-			return { v: 1, result: "unwilling_cohort", retryAfterMs: rate.retryAfterMs };
+		// Replay guard records LAST, so only frames that passed signature + rate + bootstrap ever insert a
+		// `seen` entry. An *accepted* frame is still always recorded here, so a genuine replay of a served
+		// correlationId is still caught; only rate-rejected frames (never served, never recorded) skip it.
+		const correlationId = b64urlToBytes(reg.correlationId);
+		if (this.deps.replayGuard?.accept(correlationId, participantId, reg.timestamp, now) === false) {
+			// Stale / future-skewed / replayed: serve nothing and record nothing.
+			return { v: 1, result: "no_state" };
 		}
 		return undefined;
 	}

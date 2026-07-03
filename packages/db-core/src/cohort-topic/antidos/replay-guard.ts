@@ -11,6 +11,17 @@
  * Because a stale registration is rejected outright, the guard only needs to remember correlation ids
  * for one `maxAgeMs` window: an id older than that would be rejected on timestamp alone, so its record
  * can be pruned. Pruning runs on access, bounding memory to the live window's worth of registrations.
+ *
+ * On top of the age-based prune, the map carries a **hard LRU `maxKeys` cap** (mirroring the sibling
+ * {@link import("./rate-limiter.js").RegisterRateLimiter}) so a flood of genuinely-fresh, admitted
+ * correlationIds cannot grow `seen` without bound before the age prune fires. When a new id would
+ * exceed the cap, the **oldest-inserted** entries are evicted until within cap. That victim is the
+ * least-bad one: replay entries are inserted once and never refreshed, so `Map` insertion order tracks
+ * timestamp order — the oldest entry is the one nearest to aging out of the window and being pruned as
+ * stale anyway. Evicting it forgives at most that entry's remaining replay-protection window: a bounded,
+ * documented tradeoff (unlike the rate limiter's fully penalty-free eviction), and one that only
+ * triggers under a flood of admitted ids — which, in the register pipeline, must also have passed the
+ * signature, rate, and bootstrap gates before ever reaching this guard.
  */
 
 import { bytesKey } from "../registration/bytes.js";
@@ -22,12 +33,16 @@ const log = createLogger("cohort-topic:antidos");
 export const DEFAULT_REPLAY_MAX_AGE_MS = 60_000;
 /** Default tolerated forward clock skew: a timestamp this far past `now` is rejected as implausible. */
 export const DEFAULT_REPLAY_MAX_FUTURE_SKEW_MS = 5_000;
+/** Default hard cap on remembered correlationIds; the oldest-inserted are evicted beyond this. */
+export const DEFAULT_REPLAY_GUARD_MAX_KEYS = 100_000;
 
 export interface CorrelationReplayGuardConfig {
 	/** A timestamp older than `now − maxAgeMs` is stale. Default {@link DEFAULT_REPLAY_MAX_AGE_MS}. */
 	maxAgeMs?: number;
 	/** A timestamp newer than `now + maxFutureSkewMs` is rejected. Default {@link DEFAULT_REPLAY_MAX_FUTURE_SKEW_MS}. */
 	maxFutureSkewMs?: number;
+	/** Hard LRU cap on remembered correlationIds; oldest-inserted (oldest-timestamp) evicted beyond this. Default {@link DEFAULT_REPLAY_GUARD_MAX_KEYS}. */
+	maxKeys?: number;
 }
 
 /** Freshness + anti-replay gate over registration `correlationId`s and timestamps. */
@@ -39,6 +54,8 @@ export interface CorrelationReplayGuard {
 	 * id on first sight of a fresh registration.
 	 */
 	accept(correlationId: Uint8Array, peerId: Uint8Array, timestamp: number, now: number): boolean;
+	/** Remembered correlationId count (test/diagnostic introspection). */
+	readonly size: number;
 }
 
 /** A remembered acceptance, kept until its timestamp ages out of the window. */
@@ -51,6 +68,7 @@ class WindowedReplayGuard implements CorrelationReplayGuard {
 	private readonly seen = new Map<string, SeenEntry>();
 	private readonly maxAgeMs: number;
 	private readonly maxFutureSkewMs: number;
+	private readonly maxKeys: number;
 	/** `now` of the last prune, so pruning amortizes rather than scanning on every call. */
 	private lastPruneAt = -Infinity;
 
@@ -62,6 +80,10 @@ class WindowedReplayGuard implements CorrelationReplayGuard {
 		this.maxFutureSkewMs = config.maxFutureSkewMs ?? DEFAULT_REPLAY_MAX_FUTURE_SKEW_MS;
 		if (!(this.maxFutureSkewMs >= 0)) {
 			throw new RangeError(`maxFutureSkewMs must be >= 0, got ${this.maxFutureSkewMs}`);
+		}
+		this.maxKeys = config.maxKeys ?? DEFAULT_REPLAY_GUARD_MAX_KEYS;
+		if (!Number.isInteger(this.maxKeys) || this.maxKeys <= 0) {
+			throw new RangeError(`maxKeys must be a positive integer, got ${this.maxKeys}`);
 		}
 	}
 
@@ -83,6 +105,14 @@ class WindowedReplayGuard implements CorrelationReplayGuard {
 			log("replay-guard reject: replayed correlationId (first seen from peer=%s)", prior.peer);
 			return false; // replay
 		}
+		// New id: enforce the hard cap by evicting the oldest-inserted entries (oldest by `Map` insertion
+		// order, which — since entries are inserted once and never refreshed — is also oldest-timestamp,
+		// i.e. nearest to aging out as stale) until this insertion stays within `maxKeys`.
+		while (this.seen.size >= this.maxKeys) {
+			const oldest = this.seen.keys().next().value;
+			if (oldest === undefined) break;
+			this.seen.delete(oldest);
+		}
 		this.seen.set(key, { timestamp, peer: bytesKey(peerId) });
 		return true;
 	}
@@ -100,6 +130,10 @@ class WindowedReplayGuard implements CorrelationReplayGuard {
 				this.seen.delete(key);
 			}
 		}
+	}
+
+	get size(): number {
+		return this.seen.size;
 	}
 }
 

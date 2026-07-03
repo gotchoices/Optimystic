@@ -31,8 +31,9 @@
  * driver to call.
  *
  * **Anti-DoS + cold-start (gaps 6–7).** Each {@link CoordEngine} is injected its own per-coord anti-DoS
- * guards — a `RegisterRateLimiter` (4/min per peer-topic), a `CorrelationReplayGuard` (60 s freshness),
- * and a `TopicBudget` (2048 topics, LRU) — so a budget/limit at one coord is independent of another. The
+ * guards — a `RegisterRateLimiter` (4/min per peer-topic), a `CorrelationReplayGuard` (60 s freshness,
+ * hard `maxKeys` LRU cap), and a `TopicBudget` (2048 topics, LRU) — so a budget/limit at one coord is
+ * independent of another. The
  * node-level {@link BootstrapEvidence} policy (one tier→verifier policy, no per-coord state) is built once
  * and shared. db-core embeds no PoW / reputation scheme, so the host supplies the real verifiers
  * ({@link createPoWVerifier} / {@link createReputationVerifier}) and the participant-side PoW minter
