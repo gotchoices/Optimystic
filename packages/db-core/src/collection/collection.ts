@@ -375,6 +375,8 @@ export class Collection<TAction> implements ICollection<TAction> {
 		}
 		for await (const entry of log.select(undefined, forward)) {
 			if (entry.action) {
+				// NOTE: copy-then-reverse to avoid mutating the stored log entry array.
+				// Once tsconfig targets ES2023, `entry.action.actions.toReversed()` is cleaner.
 				yield* forward ? entry.action.actions : [...entry.action.actions].reverse();
 			}
 		}

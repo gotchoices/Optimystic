@@ -154,6 +154,38 @@ describe('Collection', () => {
     expect(logActions).to.deep.equal([...actions].reverse())
   })
 
+  it('should not mutate the stored log across repeated reverse iteration', async () => {
+    const collection = await Collection.createOrOpen<TestAction>(transactor, collectionId, initOptions)
+
+    const actions: Action<TestAction>[] = Array(3).fill(0).map((_, i) => ({
+      type: 'set',
+      data: {
+        value: `value ${i + 1}`,
+        timestamp: Date.now() + i
+      }
+    }))
+
+    for (const action of actions) {
+      await collection.act(action)
+    }
+    await collection.updateAndSync()
+
+    const readReverse = async () => {
+      const out: Action<TestAction>[] = []
+      for await (const action of collection.selectLog(false)) {
+        out.push(action)
+      }
+      return out
+    }
+
+    // selectLog previously reversed the stored entry array in place; a second pass
+    // would then see the already-reversed order. Both passes must be identical.
+    const first = await readReverse()
+    const second = await readReverse()
+    expect(first).to.deep.equal([...actions].reverse())
+    expect(second).to.deep.equal(first)
+  })
+
   it('should handle reverse synced log iteration', async () => {
     const collection = await Collection.createOrOpen<TestAction>(transactor, collectionId, initOptions)
 
