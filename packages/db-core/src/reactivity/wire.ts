@@ -31,7 +31,7 @@ import {
 	asObject,
 	b64urlField,
 	failWire as fail,
-	reqBoolean,
+	reqBool,
 	reqFiniteNumber,
 	reqIntInRange,
 	reqString,
@@ -179,7 +179,7 @@ export function validateNotificationV1(value: unknown): NotificationV1 {
 	const what = "NotificationV1";
 	const obj = asObject(value, what);
 	requireV1(obj, what);
-	const signers = reqStringArray(obj["signers"], "signers", what);
+	const signers = reqStringArray(obj, "signers", what);
 	const out: NotificationV1 = {
 		v: 1,
 		collectionId: b64urlField(reqString(obj, "collectionId", what), "collectionId", what),
@@ -197,7 +197,7 @@ export function validateNotificationV1(value: unknown): NotificationV1 {
 		out.rotationHint = validateRotationHint(obj["rotationHint"], `${what}.rotationHint`);
 	}
 	if (obj["invalidation"] !== undefined) {
-		out.invalidation = reqBoolean(obj, "invalidation", what);
+		out.invalidation = reqBool(obj, "invalidation", what);
 	}
 	if (obj["invalidatedActionId"] !== undefined) {
 		out.invalidatedActionId = reqString(obj, "invalidatedActionId", what);

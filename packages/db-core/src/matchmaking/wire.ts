@@ -29,7 +29,19 @@ import {
 	encodeCohortMessage,
 	DEFAULT_MAX_MESSAGE_BYTES,
 } from "../cohort-topic/wire/codec.js";
-import { CohortWireError } from "../cohort-topic/wire/validate.js";
+import {
+	asObject,
+	b64urlField,
+	failWire as fail,
+	optBool,
+	optFiniteNumber,
+	reqBool,
+	reqFiniteNumber,
+	reqIntInRange,
+	reqString,
+	reqStringArray,
+	requireV1,
+} from "../cohort-topic/wire/primitives.js";
 import type { TopicTrafficV1 } from "../cohort-topic/wire/types.js";
 import { QUERY_LIMIT_MAX } from "./config.js";
 
@@ -167,103 +179,13 @@ export interface AggregateBucketV1 {
 	count: number;
 }
 
-// --- validation helpers (mirror cohort-topic/wire/validate.ts; local to keep matchmaking DRY) ---
+// --- matchmaking-local wire state (generic validation primitives live in cohort-topic/wire/primitives.js) ---
 
 const utf8Encoder = new TextEncoder();
 const utf8Decoder = new TextDecoder("utf-8", { fatal: true });
 
 /** Ceiling for an opaque app payload (provider/seeker), guarding decode allocation. */
 export const DEFAULT_MAX_APP_PAYLOAD_BYTES = 64 * 1024;
-
-function fail(message: string): never {
-	throw new CohortWireError(message);
-}
-
-function asObject(value: unknown, what: string): Record<string, unknown> {
-	if (typeof value !== "object" || value === null || Array.isArray(value)) {
-		fail(`${what}: expected an object`);
-	}
-	return value as Record<string, unknown>;
-}
-
-function requireV1(obj: Record<string, unknown>, what: string): void {
-	if (obj["v"] !== 1) {
-		fail(`${what}: expected v === 1, got ${JSON.stringify(obj["v"])}`);
-	}
-}
-
-function reqString(obj: Record<string, unknown>, key: string, what: string): string {
-	const value = obj[key];
-	if (typeof value !== "string") {
-		fail(`${what}: field "${key}" must be a string`);
-	}
-	return value;
-}
-
-function reqBool(obj: Record<string, unknown>, key: string, what: string): boolean {
-	const value = obj[key];
-	if (typeof value !== "boolean") {
-		fail(`${what}: field "${key}" must be a boolean`);
-	}
-	return value;
-}
-
-function optBool(obj: Record<string, unknown>, key: string, what: string): boolean | undefined {
-	const value = obj[key];
-	if (value === undefined) {
-		return undefined;
-	}
-	if (typeof value !== "boolean") {
-		fail(`${what}: field "${key}" must be a boolean when present`);
-	}
-	return value;
-}
-
-function reqFiniteNumber(obj: Record<string, unknown>, key: string, what: string): number {
-	const value = obj[key];
-	if (typeof value !== "number" || !Number.isFinite(value)) {
-		fail(`${what}: field "${key}" must be a finite number`);
-	}
-	return value;
-}
-
-function optFiniteNumber(obj: Record<string, unknown>, key: string, what: string): number | undefined {
-	const value = obj[key];
-	if (value === undefined) {
-		return undefined;
-	}
-	if (typeof value !== "number" || !Number.isFinite(value)) {
-		fail(`${what}: field "${key}" must be a finite number when present`);
-	}
-	return value;
-}
-
-function reqStringArray(obj: Record<string, unknown>, key: string, what: string): string[] {
-	const value = obj[key];
-	if (!Array.isArray(value) || value.some((entry) => typeof entry !== "string")) {
-		fail(`${what}: field "${key}" must be an array of strings`);
-	}
-	return value as string[];
-}
-
-/** Assert a base64url string decodes cleanly; returns it unchanged. */
-function b64urlField(value: string, key: string, what: string): string {
-	try {
-		b64urlToBytes(value);
-	} catch {
-		fail(`${what}: field "${key}" is not valid base64url`);
-	}
-	return value;
-}
-
-/** Require an integer `>= min` (and `<= max` when supplied). */
-function reqIntInRange(value: number, key: string, what: string, min: number, max?: number): number {
-	if (!Number.isInteger(value) || value < min || (max !== undefined && value > max)) {
-		const bound = max === undefined ? `>= ${min}` : `in ${min}..${max}`;
-		fail(`${what}: field "${key}" must be an integer ${bound}, got ${value}`);
-	}
-	return value;
-}
 
 function validateCapabilityFilter(value: unknown, what: string): CapabilityFilter {
 	const obj = asObject(value, what);
@@ -273,7 +195,7 @@ function validateCapabilityFilter(value: unknown, what: string): CapabilityFilte
 	};
 	const minBudget = optFiniteNumber(obj, "minBudget", what);
 	if (minBudget !== undefined) {
-		out.minBudget = reqIntInRange(minBudget, "minBudget", what, 0);
+		out.minBudget = reqIntInRange(obj, "minBudget", what, 0);
 	}
 	return out;
 }
@@ -290,7 +212,7 @@ export function validateProviderAppPayloadV1(value: unknown): ProviderAppPayload
 	const out: ProviderAppPayloadV1 = {
 		kind: "match-provider",
 		capabilities: reqStringArray(obj, "capabilities", what),
-		capacityBudget: reqIntInRange(reqFiniteNumber(obj, "capacityBudget", what), "capacityBudget", what, 0),
+		capacityBudget: reqIntInRange(obj, "capacityBudget", what, 0),
 		contactHint: reqString(obj, "contactHint", what),
 		signature: b64urlField(reqString(obj, "signature", what), "signature", what),
 	};
@@ -310,7 +232,7 @@ export function validateSeekerAppPayloadV1(value: unknown): SeekerAppPayloadV1 {
 	}
 	const out: SeekerAppPayloadV1 = {
 		kind: "match-seeker",
-		wantCount: reqIntInRange(reqFiniteNumber(obj, "wantCount", what), "wantCount", what, 1),
+		wantCount: reqIntInRange(obj, "wantCount", what, 1),
 		contactHint: reqString(obj, "contactHint", what),
 		signature: b64urlField(reqString(obj, "signature", what), "signature", what),
 	};
@@ -395,7 +317,7 @@ export function validateQueryV1(value: unknown): QueryV1 {
 		topicId: b64urlField(reqString(obj, "topicId", what), "topicId", what),
 		includeProviders: reqBool(obj, "includeProviders", what),
 		includeSeekers: reqBool(obj, "includeSeekers", what),
-		limit: reqIntInRange(reqFiniteNumber(obj, "limit", what), "limit", what, 1, QUERY_LIMIT_MAX),
+		limit: reqIntInRange(obj, "limit", what, 1, QUERY_LIMIT_MAX),
 		requesterId: reqString(obj, "requesterId", what),
 		timestamp: reqFiniteNumber(obj, "timestamp", what),
 		signature: b64urlField(reqString(obj, "signature", what), "signature", what),
@@ -423,7 +345,7 @@ function validateProviderEntryV1(value: unknown): ProviderEntryV1 {
 	return {
 		participantId: reqString(obj, "participantId", what),
 		capabilities: reqStringArray(obj, "capabilities", what),
-		capacityBudget: reqIntInRange(reqFiniteNumber(obj, "capacityBudget", what), "capacityBudget", what, 0),
+		capacityBudget: reqIntInRange(obj, "capacityBudget", what, 0),
 		contactHint: reqString(obj, "contactHint", what),
 		attachedAt: reqFiniteNumber(obj, "attachedAt", what),
 		registrationSig: b64urlField(reqString(obj, "registrationSig", what), "registrationSig", what),
@@ -435,7 +357,7 @@ function validateSeekerEntryV1(value: unknown): SeekerEntryV1 {
 	const obj = asObject(value, what);
 	return {
 		participantId: reqString(obj, "participantId", what),
-		wantCount: reqIntInRange(reqFiniteNumber(obj, "wantCount", what), "wantCount", what, 1),
+		wantCount: reqIntInRange(obj, "wantCount", what, 1),
 		contactHint: reqString(obj, "contactHint", what),
 		attachedAt: reqFiniteNumber(obj, "attachedAt", what),
 		registrationSig: b64urlField(reqString(obj, "registrationSig", what), "registrationSig", what),
@@ -473,9 +395,9 @@ function validateAggregateBucketV1(value: unknown): AggregateBucketV1 {
 	const what = "AggregateBucketV1";
 	const obj = asObject(value, what);
 	return {
-		targetTier: reqIntInRange(reqFiniteNumber(obj, "targetTier", what), "targetTier", what, 0),
-		prefixSlot: reqIntInRange(reqFiniteNumber(obj, "prefixSlot", what), "prefixSlot", what, 0),
-		count: reqIntInRange(reqFiniteNumber(obj, "count", what), "count", what, 0),
+		targetTier: reqIntInRange(obj, "targetTier", what, 0),
+		prefixSlot: reqIntInRange(obj, "prefixSlot", what, 0),
+		count: reqIntInRange(obj, "count", what, 0),
 	};
 }
 

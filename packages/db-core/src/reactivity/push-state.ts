@@ -18,7 +18,7 @@
  */
 
 import { bytesToB64url, b64urlToBytes, decodeCohortMessage, encodeCohortMessage, DEFAULT_MAX_MESSAGE_BYTES } from "../cohort-topic/wire/codec.js";
-import { CohortWireError } from "../cohort-topic/wire/validate.js";
+import { asObject, b64urlField, failWire as fail, reqFiniteNumber, reqString } from "../cohort-topic/wire/primitives.js";
 import { DEDUPE_WINDOW_DEFAULT, QUEUE_MAX_DEFAULT, W_DEFAULT } from "./config.js";
 import { createSubscriberBackpressure, type SubscriberBackpressure, type SubscriberEnqueueResult } from "./backpressure.js";
 import { RollingCheckpoint, type CheckpointSummary, type DeltaCoalesce, type DigestFold } from "./checkpoint.js";
@@ -204,46 +204,13 @@ export class PushState {
 }
 
 // --- gossip codec (length-framed JSON, mirroring cohort-topic conventions) ---
-
-function fail(message: string): never {
-	throw new CohortWireError(message);
-}
-
-function asObject(value: unknown, what: string): Record<string, unknown> {
-	if (typeof value !== "object" || value === null || Array.isArray(value)) {
-		fail(`${what}: expected an object`);
-	}
-	return value as Record<string, unknown>;
-}
-
-function reqString(obj: Record<string, unknown>, key: string, what: string): string {
-	const value = obj[key];
-	if (typeof value !== "string") {
-		fail(`${what}: field "${key}" must be a string`);
-	}
-	return value;
-}
-
-function reqFiniteNumber(obj: Record<string, unknown>, key: string, what: string): number {
-	const value = obj[key];
-	if (typeof value !== "number" || !Number.isFinite(value)) {
-		fail(`${what}: field "${key}" must be a finite number`);
-	}
-	return value;
-}
+// Generic structural primitives (fail/asObject/reqString/reqFiniteNumber/b64urlField) are imported from
+// cohort-topic/wire/primitives.js; only `reqInt` stays local — it is a range-free integer check (no
+// lower bound), unlike the shared `reqIntInRange`, so folding it in would change behavior.
 
 function reqInt(value: number, key: string, what: string): number {
 	if (!Number.isInteger(value)) {
 		fail(`${what}: field "${key}" must be an integer, got ${value}`);
-	}
-	return value;
-}
-
-function b64urlField(value: string, key: string, what: string): string {
-	try {
-		b64urlToBytes(value);
-	} catch {
-		fail(`${what}: field "${key}" is not valid base64url`);
 	}
 	return value;
 }

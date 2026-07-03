@@ -8,8 +8,24 @@
  * narrow cleanly or throw.
  */
 
-import { b64urlToBytes } from "./codec.js";
 import { DEFAULT_D_MAX_CAP } from "../dmax.js";
+import {
+	assignDefined,
+	asObject,
+	b64urlField,
+	b64urlFixedLen,
+	failWire as fail,
+	optBool,
+	optFiniteNumber,
+	optString,
+	optStringArray,
+	reqBool,
+	reqEnum,
+	reqFiniteNumber,
+	reqString,
+	reqStringArray,
+	requireV1,
+} from "./primitives.js";
 import type {
 	ChildLinkRefV1,
 	ChildLinkReplyV1,
@@ -32,109 +48,11 @@ import type {
 	TopicTrafficV1,
 } from "./types.js";
 
-/** Thrown for any malformed, oversized, or structurally invalid cohort-topic frame. */
-export class CohortWireError extends Error {
-	constructor(message: string) {
-		super(message);
-		this.name = "CohortWireError";
-	}
-}
-
-function fail(message: string): never {
-	throw new CohortWireError(message);
-}
-
-/** Set `obj[key]` only when `value` is defined — keeps absent optionals off the decoded object. */
-function assignDefined<T extends object, K extends keyof T>(obj: T, key: K, value: T[K] | undefined): void {
-	if (value !== undefined) {
-		obj[key] = value;
-	}
-}
-
-function asObject(value: unknown, what: string): Record<string, unknown> {
-	if (typeof value !== "object" || value === null || Array.isArray(value)) {
-		fail(`${what}: expected an object`);
-	}
-	return value as Record<string, unknown>;
-}
-
-function requireV1(obj: Record<string, unknown>, what: string): void {
-	if (obj["v"] !== 1) {
-		fail(`${what}: expected v === 1, got ${JSON.stringify(obj["v"])}`);
-	}
-}
-
-function reqString(obj: Record<string, unknown>, key: string, what: string): string {
-	const value = obj[key];
-	if (typeof value !== "string") {
-		fail(`${what}: field "${key}" must be a string`);
-	}
-	return value;
-}
-
-function optString(obj: Record<string, unknown>, key: string, what: string): string | undefined {
-	const value = obj[key];
-	if (value === undefined) {
-		return undefined;
-	}
-	if (typeof value !== "string") {
-		fail(`${what}: field "${key}" must be a string when present`);
-	}
-	return value;
-}
-
-function reqFiniteNumber(obj: Record<string, unknown>, key: string, what: string): number {
-	const value = obj[key];
-	if (typeof value !== "number" || !Number.isFinite(value)) {
-		fail(`${what}: field "${key}" must be a finite number`);
-	}
-	return value;
-}
-
-function optFiniteNumber(obj: Record<string, unknown>, key: string, what: string): number | undefined {
-	const value = obj[key];
-	if (value === undefined) {
-		return undefined;
-	}
-	if (typeof value !== "number" || !Number.isFinite(value)) {
-		fail(`${what}: field "${key}" must be a finite number when present`);
-	}
-	return value;
-}
-
-function reqBool(obj: Record<string, unknown>, key: string, what: string): boolean {
-	const value = obj[key];
-	if (typeof value !== "boolean") {
-		fail(`${what}: field "${key}" must be a boolean`);
-	}
-	return value;
-}
-
-function optBool(obj: Record<string, unknown>, key: string, what: string): boolean | undefined {
-	const value = obj[key];
-	if (value === undefined) {
-		return undefined;
-	}
-	if (typeof value !== "boolean") {
-		fail(`${what}: field "${key}" must be a boolean when present`);
-	}
-	return value;
-}
-
-function reqStringArray(obj: Record<string, unknown>, key: string, what: string): string[] {
-	const value = obj[key];
-	if (!Array.isArray(value) || value.some((entry) => typeof entry !== "string")) {
-		fail(`${what}: field "${key}" must be an array of strings`);
-	}
-	return value as string[];
-}
-
-function optStringArray(obj: Record<string, unknown>, key: string, what: string): string[] | undefined {
-	if (obj[key] === undefined) {
-		return undefined;
-	}
-	return reqStringArray(obj, key, what);
-}
+// The generic structural-validation primitives (`fail`/`asObject`/`req*`/`opt*`/`b64url*`/`reqEnum`/…)
+// live in ./primitives.js and are imported above; only the cohort-topic domain validators and the
+// tier-semantics helpers below stay local. `CohortWireError` is re-exported here so existing importers
+// of this module (codec, wire/index, matchmaking, reactivity) are unaffected by the move.
+export { CohortWireError } from "./primitives.js";
 
 function tier(value: number, what: string): number {
 	if (!Number.isInteger(value) || value < 0 || value > 3) {
@@ -161,47 +79,6 @@ function treeTier(value: number, what: string): number {
 const COORD_BYTES = 32;
 /** Correlation-id byte width (a 16-byte nonce minted per walk probe / renew). */
 const CORRELATION_BYTES = 16;
-
-/**
- * Assert a base64url string decodes cleanly; returns it unchanged. Used for variable-width fields —
- * peer ids (multihash-encoded, not 32 raw bytes), signatures, and opaque application payloads.
- *
- * NOTE: no max-length bound here. A hostile peer can still bloat one of these variable-width fields
- * (e.g. `participantCoord`, a signature) into a large map key in the store / rate limiter / replay
- * guard. Their widths aren't pinned by the spec, so a ceiling would be a chosen policy value rather
- * than a decode of the format. If a bloated one is ever seen as a map key in practice, add a
- * `b64urlMaxLen` ceiling here. (Fixed-width hash-derived fields go through `b64urlFixedLen` instead.)
- */
-function b64urlField(value: string, key: string, what: string): string {
-	try {
-		b64urlToBytes(value);
-	} catch {
-		fail(`${what}: field "${key}" is not valid base64url`);
-	}
-	return value;
-}
-
-/** Assert a base64url string decodes cleanly to exactly `len` bytes; returns it unchanged. */
-function b64urlFixedLen(value: string, key: string, len: number, what: string): string {
-	let bytes: Uint8Array;
-	try {
-		bytes = b64urlToBytes(value);
-	} catch {
-		return fail(`${what}: field "${key}" is not valid base64url`);
-	}
-	if (bytes.length !== len) {
-		fail(`${what}: field "${key}" must decode to ${len} bytes, got ${bytes.length}`);
-	}
-	return value;
-}
-
-function reqEnum<T extends string>(obj: Record<string, unknown>, key: string, allowed: readonly T[], what: string): T {
-	const value = obj[key];
-	if (typeof value !== "string" || !(allowed as readonly string[]).includes(value)) {
-		fail(`${what}: field "${key}" must be one of ${allowed.join(" | ")}`);
-	}
-	return value as T;
-}
 
 const REGISTER_RESULTS: readonly RegisterResult[] = [
 	"accepted",
