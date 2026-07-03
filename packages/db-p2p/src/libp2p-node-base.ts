@@ -79,6 +79,7 @@ import {
 import { PartitionDetector } from './cluster/partition-detector.js';
 import { createLogger } from './logger.js';
 import { PeerReputationService } from './reputation/peer-reputation.js';
+import type { IPeerReputation } from './reputation/types.js';
 import { DisputeService } from './dispute/dispute-service.js';
 import { DisputeClient } from './dispute/client.js';
 import type { DisputeConfig } from './dispute/types.js';
@@ -86,8 +87,39 @@ import type { DisputeConfig } from './dispute/types.js';
 type Libp2pInit = NonNullable<Parameters<typeof createLibp2p>[0]>;
 export type Libp2pTransports = NonNullable<Libp2pInit['transports']>;
 
+/** A service that accepts post-construction injection of the running libp2p node. */
+interface SetLibp2pCapable {
+	setLibp2p(libp2p: Libp2p): void;
+}
+
+/** A service that accepts post-start injection of the peer-reputation view. */
+interface SetReputationCapable {
+	setReputation(reputation: IPeerReputation): void;
+}
+
+/**
+ * The custom services that receive post-assembly dependency injection. Accessing them through this
+ * typed record (rather than `(node as any).services`) makes the compiler check the injection calls,
+ * so a renamed/removed service or a `setLibp2p`/`setReputation` that changes shape fails the build
+ * instead of being silently skipped by optional-chaining. All three are unconditionally present in
+ * the `services` config below, so a runtime throw here is a genuine wiring bug, not a missing service.
+ */
+type WiredServices = {
+	fret: SetLibp2pCapable;
+	networkManager: SetLibp2pCapable & SetReputationCapable;
+	repo: SetLibp2pCapable;
+};
+
 /** Logger for the reactivity node-wiring (origination/forwarder/recover/rotation composition). */
 const reactivityWiringLog = createLogger('reactivity-node-wiring');
+
+/**
+ * Logger for the best-effort in-factory service wiring. These injections run during `createLibp2p`
+ * internals against the unreliable `components.libp2p` proxy; the real node is re-injected
+ * post-construction (see the load-bearing block after `createLibp2p`), so a failure here is logged,
+ * not fatal.
+ */
+const wiringLog = createLogger('node-wiring');
 
 /** Factory function or instance for creating raw storage */
 export type RawStorageProvider = IRawStorage | (() => IRawStorage);
@@ -362,24 +394,34 @@ export async function createLibp2pNodeBase(
 		? (actionId, cert): void => { certStore.put(actionId, cert); options.onCommitCertificate?.(actionId, cert); }
 		: options.onCommitCertificate;
 
-	const libp2pOptions: unknown = {
+	const libp2pOptions: Libp2pInit = {
 		start: false,
 		privateKey: nodePrivateKey,
 		addresses: {
 			listen: listenAddrs
 		},
 		connectionManager: {
-			autoDial: true,
-			minConnections: 1,
+			// `autoDial`, `minConnections`, and `dialQueue` were stale libp2p option keys silently
+			// ignored under the former `libp2pOptions as any` (removed with this change). This libp2p
+			// version has no such keys — auto-dial is now default connection-manager behavior with no
+			// direct replacement — so they are dropped rather than re-cast. See review handoff.
 			maxConnections: 16,
-			inboundConnectionUpgradeTimeout: 10_000,
-			dialQueue: { concurrency: 2, attempts: 2 }
+			// Renamed from the stale `inboundConnectionUpgradeTimeout`. 10_000 equals this version's
+			// default, so surfacing (and correcting) the key is behavior-preserving; the old key was a no-op.
+			inboundUpgradeTimeout: 10_000
 		},
 		...(options.connectionGater ? { connectionGater: options.connectionGater } : {}),
 		transports,
 		connectionEncrypters: [noise()],
 		streamMuxers: [yamux()],
-		services: {
+		// Narrow cast confined to the `services` field: the built-in factories (identify/dcutr/…) are
+		// typed against a SECOND copy of `@libp2p/interface` pulled in transitively (via `@libp2p/crypto`),
+		// whose `Uint8Array<ArrayBuffer>` vs `<ArrayBufferLike>` PeerId/key shapes are structurally
+		// incompatible with the top-level copy — a dependency-dedup artifact, not a real mismatch. The cast
+		// stays on this field alone so the rest of `libp2pOptions` remains fully typed as `Libp2pInit`.
+		// NOTE: this cast exists ONLY because of the duplicate @libp2p/interface install; if that dedups
+		// (or on a libp2p bump) drop `as unknown as NonNullable<Libp2pInit['services']>` and type the map directly.
+		services: ({
 			identify: identify({
 				protocolPrefix: `/optimystic/${options.networkName}`
 			}),
@@ -478,7 +520,9 @@ export async function createLibp2pNodeBase(
 					clusterSizeTolerance: options.clusterPolicy?.sizeTolerance ?? 0.5
 				});
 				const svc = svcFactory(components);
-				try { (svc as any).setLibp2p?.(components.libp2p); } catch { }
+				// Best-effort proxy-time injection; the real node is re-injected post-construction below.
+				try { (svc as SetLibp2pCapable).setLibp2p(components.libp2p); }
+				catch (err) { wiringLog('networkManager in-factory setLibp2p failed (proxy); real node injected post-construction: %o', err); }
 				return svc;
 			},
 			fret: (components: any) => {
@@ -491,26 +535,32 @@ export async function createLibp2pNodeBase(
 					bootstraps: options.bootstrapNodes ?? []
 				});
 				const svc = svcFactory(components) as Libp2pFretService;
-				try { svc.setLibp2p(components.libp2p); } catch { }
+				// Best-effort proxy-time injection; the real node is re-injected post-construction below.
+				try { (svc as SetLibp2pCapable).setLibp2p(components.libp2p); }
+				catch (err) { wiringLog('fret in-factory setLibp2p failed (proxy); real node injected post-construction: %o', err); }
 				return svc;
 			}
-		},
+		}) as unknown as NonNullable<Libp2pInit['services']>,
 		// Add bootstrap nodes as needed
 		peerDiscovery: [
 			...(options.bootstrapNodes?.length ? [bootstrap({ list: options.bootstrapNodes })] : [])
 		],
 	};
 
-	const node = await createLibp2p(libp2pOptions as any);
+	const node = await createLibp2p(libp2pOptions);
 
-	// Inject libp2p reference into services that need it before start
-	try { ((node as any).services?.fret as any)?.setLibp2p?.(node); } catch { }
-	try { ((node as any).services?.networkManager as any)?.setLibp2p?.(node); } catch { }
+	// Inject the REAL libp2p node into the services that need it, before start(). These are
+	// load-bearing and the node has NOT started yet, so any throw fails fast and rejects node
+	// creation (nothing started leaks) — far better than the service silently falling back to the
+	// unreliable `components.libp2p` proxy and surfacing later as routing/consensus failures.
+	const wired = node.services as unknown as WiredServices;
+	wired.fret.setLibp2p(node);
+	wired.networkManager.setLibp2p(node);
 	// RepoService.checkRedirect resolves the network manager / self id / connection
 	// addrs through this injected node (the components.libp2p proxy is unreliable
 	// from inside a service at request time). Done before start() so the protocol
 	// handler is live with a resolvable node from its first request.
-	try { ((node as any).services?.repo as any)?.setLibp2p?.(node); } catch { }
+	wired.repo.setLibp2p(node);
 
 	await node.start();
 
@@ -529,8 +579,16 @@ export async function createLibp2pNodeBase(
 	await keyNetwork.initFromPersistedState();
 	const createClusterClient = (peerId: any) => ClusterClient.create(peerId, keyNetwork, protocolPrefix);
 
-	// Inject reputation into NetworkManagerService
-	try { ((node as any).services?.networkManager as any)?.setReputation?.(reputation); } catch { }
+	// Inject reputation into NetworkManagerService. Load-bearing and non-optional: the service is
+	// unconditionally present, so a throw is a real wiring bug. Unlike the pre-start injections above
+	// the node has already started here, so stop it before rethrowing rather than leaking a started
+	// node + open transports (mirrors the cohortTopic hard-fail blocks below).
+	try {
+		wired.networkManager.setReputation(reputation);
+	} catch (err) {
+		await node.stop();
+		throw err;
+	}
 
 	// Create partition detector and get FRET service
 	const partitionDetector = new PartitionDetector();
