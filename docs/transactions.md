@@ -4,6 +4,43 @@
 
 This document describes the architecture for multi-collection transactions in Optimystic, with support for pluggable validation engines. The primary use case is SQL-validated transactions where cluster participants independently validate by re-executing SQL statements.
 
+> ### ⚠️ Legacy (single-node) commit is not atomic across trees
+>
+> The distributed consensus path below (GATHER/PEND/COMMIT across all critical
+> blocks) is what delivers all-or-nothing across multiple collections. The
+> **default single-node "legacy" mode** — used when no coordinator/engine is wired
+> (`TransactionBridge` without `configureTransactionMode`) — does **not**.
+>
+> Legacy commit flushes each dirty tree (main table + each secondary index, or
+> two tables mutated in one SQL transaction) with an **independent** `tree.sync()`,
+> and each sync is its own pend+commit against the transactor. There is no
+> cross-tree undo. If the flush of tree *N+1* fails **after** tree *N* has already
+> committed to storage, trees `1..N` stay durably written and trees `N+1..` do not
+> — a real split on disk with no automatic recovery.
+>
+> How the adapter handles this (`quereus-plugin-optimystic/src/optimystic-adapter/txn-bridge.ts`):
+> - **Failure on the first tree** (nothing persisted yet): a clean in-memory
+>   snapshot rollback — genuinely all-or-nothing. This is the common case for a
+>   conflict/validation/stale-read rejection, which surfaces at pend before any
+>   durable commit.
+> - **Failure after the first tree synced**: the bridge throws
+>   [`PartialCommitError`](../packages/quereus-plugin-optimystic/src/optimystic-adapter/txn-bridge.ts),
+>   naming the persisted vs. unpersisted trees. It deliberately does **not** restore
+>   the already-committed trees in memory (that would make memory disagree with
+>   storage and falsely report a rollback). Callers must reconcile (re-run the
+>   transaction, or repair the split).
+>
+> Even the distributed coordinator commits critical blocks via `Promise.all`
+> (`coordinator.commitPhase`), so a failure *after the first block commits* is a
+> narrow-but-real residual window there too — legacy mode just has a wider window
+> because each tree is a separate pend+commit rather than one pended batch.
+>
+> **Planned narrowing (not yet implemented):** restructure legacy commit to
+> pend-all-then-commit-all (mirror the coordinator) so conflict/validation
+> failures — which happen at pend — occur before any durable commit, making those
+> cases truly atomic and shrinking the residual window to the commit sweep only.
+> See the `feat-optimystic-legacy-commit-two-phase` backlog ticket.
+
 ## Terminology
 
 To support multi-collection transactions, we introduce a clear hierarchy:

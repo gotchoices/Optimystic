@@ -153,6 +153,14 @@ export class Tree<TKey, TEntry> implements TreeReadView<TKey, TEntry> {
 			return this.collection;
 	}
 
+	/** This tree's collection id, as a plain string. Used by consumers that flush
+	 * several trees together (e.g. the Quereus adapter's legacy commit sweep) to
+	 * name a specific tree in diagnostics when a partial flush leaves trees out of
+	 * sync. Structurally satisfies the adapter's `DirtyTree.describe()`. */
+	describe(): string {
+			return String(this.collection.id);
+	}
+
 	/**
 	 * Update the local state from the network.
 	 * Call this before reading to ensure you have the latest data.

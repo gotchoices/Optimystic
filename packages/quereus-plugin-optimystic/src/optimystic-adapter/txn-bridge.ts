@@ -20,6 +20,55 @@ export interface DirtyTree {
   sync(): Promise<void>;
   snapshot(): unknown;
   restore(snapshot: unknown): void;
+  /**
+   * Optional human-readable identifier (a Tree returns its collection id) used
+   * only to name persisted vs. unpersisted trees in a {@link PartialCommitError}.
+   * Optional so test doubles need not implement it; the bridge falls back to a
+   * positional label when absent.
+   */
+  describe?(): string;
+}
+
+/**
+ * Thrown by {@link TransactionBridge.commitTransaction} in LEGACY (no-coordinator)
+ * mode when a multi-tree commit fails AFTER at least one tree was already durably
+ * flushed to storage this commit.
+ *
+ * ## Why this exists (and why we can't just "roll back")
+ *
+ * Legacy commit flushes each dirty tree with an independent `tree.sync()`
+ * (its own pend+commit against the transactor). Those flushes are NOT a single
+ * atomic unit: once tree N is committed to storage, a failure flushing tree N+1
+ * cannot un-commit tree N locally (`StorageRepo.commit` is per-block; there is no
+ * cross-tree undo outside the distributed consensus path). Silently restoring the
+ * already-committed trees' in-memory snapshots would make memory disagree with
+ * storage AND falsely report "rolled back" — so instead we surface THIS error,
+ * naming exactly which trees persisted and which did not, and we deliberately do
+ * NOT touch the persisted trees' in-memory state (it correctly reflects storage).
+ *
+ * The {@link persisted} trees and {@link unpersisted} trees are now out of sync on
+ * disk; recovering them is a caller/operator concern (re-run the transaction, or
+ * reconcile). See the commit-site comment in this file and `docs/transactions.md`
+ * (§ "Legacy (single-node) commit is not atomic across trees").
+ */
+export class PartialCommitError extends Error {
+  constructor(
+    /** Ids of trees durably committed to storage before the failure (NOT rolled back). */
+    public readonly persisted: readonly string[],
+    /** Ids of trees never flushed this commit (rolled back in-memory only). */
+    public readonly unpersisted: readonly string[],
+    /** The underlying flush failure that aborted the commit sweep. */
+    public readonly reason?: unknown,
+  ) {
+    super(
+      `Legacy multi-tree commit was not atomic: ${persisted.length} tree(s) were durably ` +
+      `committed to storage before the commit failed and CANNOT be rolled back. ` +
+      `Persisted (now out of sync with the unpersisted trees): [${persisted.join(', ')}]. ` +
+      `Not persisted (reverted in-memory only): [${unpersisted.join(', ')}]. ` +
+      `Underlying failure: ${reason instanceof Error ? reason.message : String(reason)}`
+    );
+    this.name = 'PartialCommitError';
+  }
 }
 
 /**
@@ -265,9 +314,18 @@ export class TransactionBridge {
         // (subquery-bearing) CHECK rejection roll back cleanly: the constraint
         // throws before this point, so the staged trees are rolled back never
         // having touched storage.
-        for (const tree of this.dirtyTrees.keys()) {
-          await tree.sync();
-        }
+        //
+        // ⚠️ NOT DURABLY ATOMIC ACROSS TREES. Each tree.sync() is its own
+        // pend+commit against the transactor; there is no cross-tree undo here.
+        // If the sweep fails AFTER the first tree has synced, trees 1..N are
+        // already durably committed and trees N+1.. are not — a real split on
+        // disk. We surface that as a loud {@link PartialCommitError} rather than
+        // pretending to roll back (see commitDirtyTreesLegacy). True all-or-
+        // nothing across independent block clusters is the distributed consensus
+        // path's job (GATHER/PEND/COMMIT); see docs/transactions.md
+        // (§ "Legacy (single-node) commit is not atomic across trees") for the
+        // residual window and the planned pend-all-then-commit-all narrowing.
+        await this.commitDirtyTreesLegacy();
       }
 
       this.currentTransaction.isActive = false;
@@ -277,9 +335,73 @@ export class TransactionBridge {
       this.savepoints.clear();
 
     } catch (error) {
-      // If commit fails, rollback
+      if (error instanceof PartialCommitError) {
+        // commitDirtyTreesLegacy already cleaned up: it restored the trees that
+        // never touched storage and left the durably-committed trees alone (their
+        // in-memory state correctly mirrors storage). Running rollbackTransaction
+        // here would restore the committed trees too, re-introducing exactly the
+        // memory/storage divergence this error exists to prevent. Just propagate.
+        throw error;
+      }
+      // Nothing durably committed (session-mode commit, or a legacy failure on the
+      // FIRST tree): a clean snapshot-restore rollback is correct.
       await this.rollbackTransaction();
       throw error;
+    }
+  }
+
+  /**
+   * Legacy (no-coordinator) commit sweep: flush each dirty tree in turn.
+   *
+   * On failure the correct recovery depends on how far the sweep got:
+   * - **No tree synced yet** (failure on the first tree): nothing is durably
+   *   committed, so re-throw untouched and let {@link commitTransaction}'s catch
+   *   run the ordinary snapshot-restore {@link rollbackTransaction} — a genuinely
+   *   clean rollback.
+   * - **At least one tree already synced**: trees 1..N are durably committed and
+   *   cannot be un-committed locally. Restore ONLY the trees that never touched
+   *   storage (they revert cleanly), leave the committed trees' in-memory state
+   *   as-is (it matches storage), tear down the transaction, and throw a
+   *   {@link PartialCommitError} naming both sets. We do NOT report success and do
+   *   NOT falsely claim a rollback.
+   */
+  private async commitDirtyTreesLegacy(): Promise<void> {
+    const trees = [...this.dirtyTrees.keys()];
+    const synced: DirtyTree[] = [];
+
+    for (const tree of trees) {
+      try {
+        await tree.sync();
+        synced.push(tree);
+      } catch (error) {
+        if (synced.length === 0) {
+          // First tree failed — nothing persisted. Let the caller roll back cleanly.
+          throw error;
+        }
+
+        // Partial persistence. Restore only the trees that never synced; the
+        // failed tree itself is among them (its sync cancelled its own pend, so it
+        // never reached storage) and reverts cleanly.
+        const unsynced = trees.filter(t => !synced.includes(t));
+        for (const t of unsynced) {
+          t.restore(this.dirtyTrees.get(t));
+        }
+
+        const label = (t: DirtyTree) => t.describe?.() ?? `tree#${trees.indexOf(t)}`;
+        const persisted = synced.map(label);
+        const unpersisted = unsynced.map(label);
+
+        // Tear down transaction state to mirror rollbackTransaction's non-restore
+        // cleanup — WITHOUT restoring the persisted trees (that is the whole point).
+        this.dirtyTrees.clear();
+        this.savepoints.clear();
+        this.currentTransaction!.collections.clear();
+        this.currentTransaction!.isActive = false;
+        this.accumulatedStatements = [];
+        this.session = null;
+
+        throw new PartialCommitError(persisted, unpersisted, error);
+      }
     }
   }
 

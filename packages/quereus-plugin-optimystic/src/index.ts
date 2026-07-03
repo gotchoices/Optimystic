@@ -18,6 +18,11 @@ export { default as register } from './plugin.js';
 // Export virtual table classes
 export { OptimysticModule, OptimysticVirtualTable } from './optimystic-module.js';
 
+// Error raised when a legacy (no-coordinator) multi-tree commit fails after at
+// least one tree was already durably persisted — i.e. the commit was NOT atomic
+// across trees. Exported so hosts can catch it and reconcile the split.
+export { PartialCommitError } from './optimystic-adapter/txn-bridge.js';
+
 // Export schema utilities
 export { RowCodec, type EncodedRow, type PrimaryKeyValue, type EncodingFormat } from './schema/row-codec.js';
 export type { StoredTableSchema, StoredColumnSchema, StoredPrimaryKeyColumn } from './schema/schema-manager.js';
