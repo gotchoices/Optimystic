@@ -913,9 +913,12 @@ export class OptimysticVirtualTable extends VirtualTable {
       throw new Error('Table not initialized');
     }
 
-    // Capture the mutation statement if provided (for transaction replication)
+    // Capture the mutation statement if provided (for transaction replication).
+    // Await so recording lands in the session's statement array BEFORE any
+    // collection.stage below (deterministic snapshot timing) and so a recording
+    // failure aborts this DML instead of committing a record missing a statement.
     if (mutationStatement) {
-      this.txnBridge.addStatement(mutationStatement);
+      await this.txnBridge.addStatement(mutationStatement);
     }
 
     const txnState = this.txnBridge.getCurrentTransaction();

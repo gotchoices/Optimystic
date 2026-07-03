@@ -1365,6 +1365,88 @@ describe('Transaction', () => {
 		});
 	});
 
+	describe('Statement recording (addStatement fire-and-forget regression)', () => {
+		// The optimystic bridge's addStatement used to fire session.execute(stmt, [])
+		// and return without awaiting. session.execute pushes the statement onto the
+		// array commit() compiles into the replicated record ONLY AFTER awaiting
+		// coordinator.applyActions — so an un-awaited call could let the record be
+		// finalised before the statement landed, silently dropping it. These tests pin
+		// the session-side contract the bridge fix now relies on: awaited execute
+		// records every statement, in order, and surfaces failure instead of dropping.
+
+		const makeSession = async () => {
+			const transactor = new TestTransactor();
+			type UserEntry = { key: number; name: string };
+			const usersTree = await Tree.createOrOpen<number, UserEntry>(
+				transactor, 'users', entry => entry.key
+			);
+			const usersCollection = (usersTree as unknown as { collection: unknown }).collection;
+			const collections = new Map();
+			collections.set('users', usersCollection);
+			const coordinator = new TransactionCoordinator(transactor, collections);
+			const actionsEngine = new ActionsEngine(coordinator);
+			const session = await TransactionSession.create(coordinator, actionsEngine);
+			return { coordinator, session };
+		};
+
+		it('records all statements in order across awaited executes', async () => {
+			const { session } = await makeSession();
+
+			const statements = ['stmt-1', 'stmt-2', 'stmt-3', 'stmt-4'];
+			for (const statement of statements) {
+				// Empty actions == the vtab DML path the bridge drives via addStatement:
+				// the row is already staged, so execute() only records the statement
+				// (and, on the first call, snapshots collections for rollback).
+				const result = await session.execute(statement, []);
+				expect(result.success).to.be.true;
+			}
+
+			// getStatements() is exactly what commit() compiles into the record.
+			expect(session.getStatements()).to.deep.equal(statements);
+		});
+
+		it('keeps every statement even when an early apply is slow', async () => {
+			const { coordinator, session } = await makeSession();
+
+			// Make the FIRST apply slow. The old fire-and-forget bridge could finalise
+			// the record before this delayed microtask pushed the first statement,
+			// dropping it. Awaiting execute makes each push happen-before the next
+			// statement, so both order and count survive an out-of-order apply.
+			const originalApply = coordinator.applyActions.bind(coordinator);
+			let firstCall = true;
+			coordinator.applyActions = async (actions, stampId) => {
+				if (firstCall) {
+					firstCall = false;
+					await new Promise<void>(resolve => setTimeout(resolve, 15));
+				}
+				return originalApply(actions, stampId);
+			};
+
+			const statements = ['slow-first', 'fast-second', 'fast-third'];
+			for (const statement of statements) {
+				const result = await session.execute(statement, []);
+				expect(result.success).to.be.true;
+			}
+
+			expect(session.getStatements()).to.deep.equal(statements);
+		});
+
+		it('surfaces a failure instead of silently dropping the statement', async () => {
+			const { session } = await makeSession();
+
+			// Actions target a collection that is not registered: applyActions throws,
+			// execute() returns { success:false }, and — critically — the statement is
+			// NOT recorded. The bridge now throws on this result, aborting the DML
+			// rather than committing a record whose statements silently disagree.
+			const result = await session.execute('bad-stmt', [
+				{ collectionId: 'nope', actions: [{ type: 'replace', data: [[1, { key: 1, name: 'X' }]] }] }
+			]);
+			expect(result.success).to.be.false;
+			expect(result.error).to.include('Collection not found');
+			expect(session.getStatements()).to.not.include('bad-stmt');
+		});
+	});
+
 	describe('Multi-Collection Transaction Conflicts (TEST-2.1.2)', () => {
 		it('should detect pend conflicts from concurrent transactions on same blocks', async () => {
 			const transactor = new TestTransactor();

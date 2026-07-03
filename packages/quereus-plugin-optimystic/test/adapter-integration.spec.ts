@@ -380,8 +380,8 @@ describe('TransactionBridge (TEST-7.3.1)', () => {
 
 			await bridge.beginTransaction(defaultOptions);
 
-			bridge.addStatement('INSERT INTO users VALUES (1, "Alice")');
-			bridge.addStatement('INSERT INTO users VALUES (2, "Bob")');
+			await bridge.addStatement('INSERT INTO users VALUES (1, "Alice")');
+			await bridge.addStatement('INSERT INTO users VALUES (2, "Bob")');
 
 			expect(bridge.getStatements()).to.deep.equal([
 				'INSERT INTO users VALUES (1, "Alice")',
@@ -390,11 +390,11 @@ describe('TransactionBridge (TEST-7.3.1)', () => {
 			expect(bridge.getStatementCount()).to.equal(2);
 		});
 
-		it('should NOT accumulate statements outside a transaction', () => {
+		it('should NOT accumulate statements outside a transaction', async () => {
 			const { plugin } = createTestEnv();
 			const bridge = plugin.txnBridge;
 
-			bridge.addStatement('INSERT INTO users VALUES (1, "Alice")');
+			await bridge.addStatement('INSERT INTO users VALUES (1, "Alice")');
 			expect(bridge.getStatements()).to.deep.equal([]);
 			expect(bridge.getStatementCount()).to.equal(0);
 		});
@@ -404,7 +404,7 @@ describe('TransactionBridge (TEST-7.3.1)', () => {
 			const bridge = plugin.txnBridge;
 
 			await bridge.beginTransaction(defaultOptions);
-			bridge.addStatement('INSERT INTO users VALUES (1, "Alice")');
+			await bridge.addStatement('INSERT INTO users VALUES (1, "Alice")');
 			await bridge.commitTransaction();
 
 			expect(bridge.getStatementCount()).to.equal(0);
@@ -415,7 +415,7 @@ describe('TransactionBridge (TEST-7.3.1)', () => {
 			const bridge = plugin.txnBridge;
 
 			await bridge.beginTransaction(defaultOptions);
-			bridge.addStatement('INSERT INTO users VALUES (1, "Alice")');
+			await bridge.addStatement('INSERT INTO users VALUES (1, "Alice")');
 			await bridge.rollbackTransaction();
 
 			expect(bridge.getStatementCount()).to.equal(0);
@@ -426,7 +426,7 @@ describe('TransactionBridge (TEST-7.3.1)', () => {
 			const bridge = plugin.txnBridge;
 
 			await bridge.beginTransaction(defaultOptions);
-			bridge.addStatement('INSERT INTO users VALUES (1, "Alice")');
+			await bridge.addStatement('INSERT INTO users VALUES (1, "Alice")');
 			await bridge.commitTransaction();
 
 			await bridge.beginTransaction(defaultOptions);

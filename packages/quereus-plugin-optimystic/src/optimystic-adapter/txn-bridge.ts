@@ -357,25 +357,35 @@ export class TransactionBridge {
    * Statements are only accumulated when a transaction is active.
    *
    * In transaction mode, this also forwards the statement to the TransactionSession
-   * for distributed consensus tracking.
+   * for distributed consensus tracking. This MUST be awaited: `session.execute`
+   * pushes the statement onto the session's own array (the source of truth the
+   * replicated Transaction record is compiled from) only AFTER awaiting
+   * `coordinator.applyActions`. Firing it off unawaited raced the finalize at
+   * commit — a statement could be silently absent from the record validator peers
+   * re-execute, diverging their operation set. The empty-actions apply also
+   * creates the coordinator's per-transaction rollback snapshot on its first call,
+   * so awaiting here (before the caller stages rows) makes that snapshot's timing
+   * deterministic — it captures pre-stage state, which session-mode rollback needs.
    *
    * @param statement The deterministic SQL statement to accumulate
    */
-  addStatement(statement: string): void {
+  async addStatement(statement: string): Promise<void> {
     if (!this.currentTransaction?.isActive) {
       return;
     }
 
     this.accumulatedStatements.push(statement);
 
-    // In transaction mode, also track in session
-    // Note: We pass empty actions since the virtual table already applied changes
-    // The session just needs to track the statement for the Transaction record
+    // In transaction mode, also track in session. We pass empty actions since the
+    // virtual table already applied the changes directly to the collection tracker;
+    // the session just needs to record the statement (and, on its first call, have
+    // the coordinator snapshot state for rollback). Await so a failure surfaces as a
+    // failed DML rather than a silently dropped statement or unhandled rejection.
     if (this.session) {
-      // We don't await here - statement tracking is synchronous
-      // The session's execute() will just accumulate the statement
-      // Actions are already applied by the virtual table
-      void this.session.execute(statement, []);
+      const result = await this.session.execute(statement, []);
+      if (!result.success) {
+        throw new Error(`Failed to record statement in transaction: ${result.error}`);
+      }
     }
   }
 
