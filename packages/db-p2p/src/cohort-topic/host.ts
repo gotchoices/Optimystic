@@ -836,6 +836,11 @@ export async function createCohortTopicHost(node: Libp2p, fret: FretService, opt
 			return; // tier-0 milestone only (a tier-d>0 unknown-coord frame falls through to drop)
 		}
 		const coord = b64urlToBytes(g.coord);
+		// NOTE: findByCoord bumps LRU recency as a side effect, and this runs BEFORE the verifyGossip
+		// co-member gate — so an unverified gossip frame naming a coord we already serve can pin that engine
+		// against idle-eviction. Marginal today (an outsider can only pin engines that already exist, bounded
+		// by real co-membership; it cannot create engines — that path is gated below). If gossip-flood
+		// recency-pinning ever matters, add a touch-free `has(coord)` lookup for this existence probe.
 		if (registry.findByCoord(coord) !== undefined) {
 			return; // already serving this coord — nothing to instantiate
 		}
