@@ -6,6 +6,7 @@ import type { BranchNode } from '../src/btree/nodes.js'
 import { TreeBranchBlockType } from '../src/btree/nodes.js'
 import { KeyBound, KeyRange } from '../src/btree/key-range.js'
 import { createActor } from '../src/utility/actor.js'
+import { AtomicProxy } from '../src/transform/atomic-proxy.js'
 import { TestBlockStore } from './test-block-store.js'
 
 describe('BTree', () => {
@@ -769,6 +770,18 @@ describe('BTree', () => {
       expect(await btree.get(5)).to.be.undefined
       expect(await btree.get(105)).to.equal(105)
       expect(await btree.getCount()).to.equal(1)
+    })
+
+    it('a failed in-flight scope releases the serialization queue for a scope queued behind it', async () => {
+      // Regression guard for the mutex's `finally { release() }`: fire a scope that rejects and,
+      // WITHOUT awaiting it, queue a second scope behind it. The second must still run and commit —
+      // if release() only fired on the success path, the second's `await prior` would never resolve
+      // and this test would hang (idle timeout) rather than fail cleanly.
+      const proxy = new AtomicProxy(new TestBlockStore())
+      const bad = proxy.atomic(async () => { await Promise.resolve(); throw new Error('boom') })
+      const good = proxy.atomic(async () => 42)   // genuinely queued behind the in-flight failing scope
+      await expect(bad).to.be.rejectedWith('boom')
+      expect(await good).to.equal(42, 'scope queued behind a failed one must still run')
     })
   })
 

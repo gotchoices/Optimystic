@@ -699,6 +699,11 @@ export class BTree<TKey, TEntry> {
 		}
 
 		if (leftSib && leftSib.entries.length + leaf.entries.length <= this.nodeCapacity) {  // Attempt to merge into left sibling (leaf deleted)
+			// NOTE: this fixes leafIndex, but the parent-branch index up the path is left pointing at
+			// the now-deleted leaf's old slot (same tolerated-staleness class as rebalanceBranch's
+			// left-merge, part c). Harmless today because deleteAt version-bumps and abandons the
+			// returned path. A future path-reuse consumer must audit BOTH left-merge sites, not just
+			// rebalanceBranch.
 			path.leafNode = leftSib;
 			path.leafIndex += leftSib.entries.length;
 			apply(this.store, leftSib, [entries$, leftSib.entries.length, 0, leaf.entries]);
