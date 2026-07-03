@@ -1,7 +1,7 @@
 import type { IRepo, IPeerNetwork } from '@optimystic/db-core';
 import { peerIdFromString } from '@libp2p/peer-id';
 import type { PartitionDetector } from './partition-detector.js';
-import type { RestorationCoordinator } from '../storage/restoration-coordinator-v2.js';
+import type { RestorationCoordinator } from '../storage/restoration-coordinator.js';
 import { BlockTransferClient } from './block-transfer-service.js';
 import type { RebalanceEvent } from './rebalance-monitor.js';
 import { createLogger } from '../logger.js';

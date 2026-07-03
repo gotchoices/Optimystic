@@ -1,12 +1,14 @@
 # Optimystic DB-P2P
 
-A distributed peer-to-peer database system that provides concrete implementations of the Optimystic database abstractions using filesystem storage and libp2p networking. This package transforms the interfaces and abstractions from `@optimystic/db-core` into a fully operational distributed database system.
+A distributed peer-to-peer database system that provides concrete implementations of the Optimystic database abstractions using pluggable storage backends and libp2p networking. This package transforms the interfaces and abstractions from `@optimystic/db-core` into a fully operational distributed database system.
+
+> **Storage is pluggable.** `db-p2p` owns the distributed layer (repo/cluster/coordination) and the storage *interfaces* (`IRawStorage`, `IBlockStorage`, `IKVStore`) plus an in-memory backend. Concrete persistent backends live in separate packages — filesystem persistence is [`@optimystic/db-p2p-storage-fs`](../db-p2p-storage-fs); see also `-storage-ns` (NativeScript/SQLite), `-storage-rn` (React Native/LevelDB), and `-storage-web` (IndexedDB).
 
 ## Overview
 
 The `@optimystic/db-core` package provides abstractions and interfaces for database operations—immutable blocks, versioned transactions, repository interfaces, and collection data structures. However, it doesn't provide concrete implementations for storage or distribution. `db-p2p` provides concrete implementations of the core abstractions using:
 
-- **Filesystem storage** with serialization for persistent, versioned block storage
+- **Versioned block storage** (`StorageRepo` / `BlockStorage`) layered over a pluggable `IRawStorage` backend — an in-memory backend ships here; filesystem persistence lives in `@optimystic/db-p2p-storage-fs`
 - **libp2p networking** for decentralized peer-to-peer communication
 - **Distributed consensus** using 2-phase commit protocols for consistency
 - **Fault-tolerant coordination** with automatic recovery and data restoration
@@ -32,8 +34,8 @@ graph TD
         F[StorageRepo]
         subgraph "Local Storage"
             F1[BlockStorage]
-            F2[FileRawStorage]
-            F3[Local Filesystem]
+            F2[IRawStorage backend]
+            F3[Backend store]
         end
         C --> D
         D --> E
@@ -49,8 +51,8 @@ graph TD
         I1[StorageRepo]
         subgraph "Local Storage 1"
             I1A[BlockStorage]
-            I1B[FileRawStorage]
-            I1C[Local Filesystem]
+            I1B[IRawStorage backend]
+            I1C[Backend store]
         end
         G1 --> H1
         H1 --> I1
@@ -65,8 +67,8 @@ graph TD
         I2[StorageRepo]
         subgraph "Local Storage 2"
             I2A[BlockStorage]
-            I2B[FileRawStorage]
-            I2C[Local Filesystem]
+            I2B[IRawStorage backend]
+            I2C[Backend store]
         end
         G2 --> H2
         H2 --> I2
@@ -81,8 +83,8 @@ graph TD
         I3[StorageRepo]
         subgraph "Local Storage N"
             I3A[BlockStorage]
-            I3B[FileRawStorage]
-            I3C[Local Filesystem]
+            I3B[IRawStorage backend]
+            I3C[Backend store]
         end
         G3 --> H3
         H3 --> I3
@@ -118,11 +120,11 @@ The cluster layer provides the interface for coordinators to communicate with ot
 
 ### Storage Layer: Persistent Data Implementation
 
-The storage layer provides concrete implementations of the core database abstractions:
+The storage layer implements the core database abstractions over a pluggable raw-storage backend:
 
-- **StorageRepo**: Implements `IRepo` interface with filesystem-based persistence
-- **BlockStorage**: Provides versioned block storage with conflict resolution
-- **FileRawStorage**: JSON-based file storage with atomic operations
+- **StorageRepo**: Implements the `IRepo` interface on top of `BlockStorage` — backend-agnostic
+- **BlockStorage**: Provides versioned block storage with conflict resolution, reading/writing through an injected `IRawStorage`
+- **`IRawStorage`**: The raw persistence interface. An in-memory backend ships in this package; the filesystem backend (`FileRawStorage`) lives in `@optimystic/db-p2p-storage-fs`
 - **Data restoration**: Pluggable restoration for missing data from network peers
 
 ## Detailed Component Architecture
@@ -233,7 +235,7 @@ class ClusterMember implements ICluster {
 ### Storage Layer Components
 
 #### `StorageRepo`
-Implements `IRepo` interface with filesystem-based persistence:
+Implements the `IRepo` interface over `BlockStorage` — independent of any particular storage backend:
 
 ```typescript
 class StorageRepo implements IRepo {
@@ -251,10 +253,11 @@ class StorageRepo implements IRepo {
 - Provides atomic commit operations with proper locking
 
 #### `BlockStorage`
-Provides versioned block storage with conflict resolution:
+Provides versioned block storage with conflict resolution, reading and writing through an injected `IRawStorage` backend:
 
 ```typescript
 class BlockStorage implements IBlockStorage {
+  constructor(blockId: BlockId, storage: IRawStorage, /* … */)
   async getBlock(rev?: number): Promise<{ block: IBlock, actionRev: ActionRev }>
   async savePendingAction(actionId: ActionId, transform: Transform): Promise<void>
   async promotePendingAction(actionId: ActionId): Promise<void>
@@ -268,11 +271,14 @@ class BlockStorage implements IBlockStorage {
 - Integrates with restoration callbacks for missing data
 - Uses latches for thread-safe concurrent access
 
-#### `FileRawStorage`
-JSON-based file storage with atomic operations:
+#### `IRawStorage` backends
+`BlockStorage` persists through the `IRawStorage` interface, so the backing store is pluggable:
+
+- **In-memory** (`MemoryRawStorage`) — ships in this package; used for tests and ephemeral nodes.
+- **Filesystem** (`FileRawStorage`) — lives in the separate [`@optimystic/db-p2p-storage-fs`](../db-p2p-storage-fs) package; JSON files with atomic writes, organized per block:
 
 ```typescript
-// File system organization
+// Filesystem backend layout (@optimystic/db-p2p-storage-fs)
 {basePath}/
 ├── {blockId}/
 │   ├── meta.json             # Block metadata and revision ranges
@@ -282,11 +288,7 @@ JSON-based file storage with atomic operations:
 │   └── blocks/{actionId}.json # Materialized blocks
 ```
 
-**Key Features:**
-- Concrete filesystem implementation of storage interfaces
-- JSON serialization for cross-platform compatibility
-- Atomic file operations for consistency
-- Organized directory structure for efficient access
+- **Other backends** — SQLite (`-storage-ns`), LevelDB (`-storage-rn`), IndexedDB (`-storage-web`), each in its own package.
 
 ## Integration Patterns
 
@@ -299,14 +301,14 @@ The `db-p2p` package provides concrete implementations of the core database abst
 import { IRepo, IBlock, Transform, IBlockStorage } from '@optimystic/db-core';
 
 // P2P provides concrete implementations
-class StorageRepo implements IRepo { /* filesystem-based repo */ }
-class BlockStorage implements IBlockStorage { /* versioned block storage */ }
+class StorageRepo implements IRepo { /* backend-agnostic versioned repo */ }
+class BlockStorage implements IBlockStorage { /* versioned block storage over IRawStorage */ }
 class RepoClient implements IRepo { /* network-transparent repo */ }
 class CoordinatorRepo implements IRepo { /* distributed consensus repo */ }
 ```
 
 **Implementation Points:**
-- **Storage Layer**: Provides concrete filesystem-based implementations of core interfaces
+- **Storage Layer**: Implements the core storage interfaces over a pluggable `IRawStorage` backend (in-memory here; filesystem in `@optimystic/db-p2p-storage-fs`)
 - **Network Layer**: Implements peer-to-peer communication using libp2p
 - **Consensus Layer**: Adds distributed consensus while maintaining core interfaces
 - **API Compatibility**: Same interfaces as core abstractions for seamless integration
@@ -350,8 +352,9 @@ const node = await createLibp2pNode({
   }
 });
 
-// Set up storage layer with filesystem persistence
-const storageRepo = new StorageRepo(/* filesystem config */);
+// Set up storage layer over a raw-storage backend
+// (in-memory here; swap in FileRawStorage from @optimystic/db-p2p-storage-fs for persistence)
+const storageRepo = new StorageRepo(/* IRawStorage backend */);
 
 // Set up coordinator that uses cluster layer for consensus
 const coordinatorRepo = new CoordinatorRepo(
@@ -597,6 +600,10 @@ Nodes automatically transition between rings based on capacity thresholds:
 ## Related Packages
 
 - **[@optimystic/db-core](../db-core)**: Core database interfaces and local operations
+- **[@optimystic/db-p2p-storage-fs](../db-p2p-storage-fs)**: Filesystem `IRawStorage` backend (Node)
+- **[@optimystic/db-p2p-storage-ns](../db-p2p-storage-ns)**: NativeScript SQLite storage backend
+- **[@optimystic/db-p2p-storage-rn](../db-p2p-storage-rn)**: React Native LevelDB storage backend
+- **[@optimystic/db-p2p-storage-web](../db-p2p-storage-web)**: Browser IndexedDB storage backend
 - **[@optimystic/db-quereus](../db-quereus)**: Query engine and data access patterns
 - **[p2p-fret](../fret)**: DHT implementation for peer discovery
 

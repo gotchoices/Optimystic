@@ -7,7 +7,7 @@ import { PartitionDetector } from '../src/cluster/partition-detector.js';
 import { BlockTransferCoordinator } from '../src/cluster/block-transfer.js';
 import type { RebalanceEvent } from '../src/cluster/rebalance-monitor.js';
 import { BlockTransferService, type BlockTransferRequest, type BlockTransferResponse, buildBlockTransferProtocol } from '../src/cluster/block-transfer-service.js';
-import type { RestorationCoordinator } from '../src/storage/restoration-coordinator-v2.js';
+import type { RestorationCoordinator } from '../src/storage/restoration-coordinator.js';
 import type { BlockArchive } from '../src/storage/struct.js';
 
 // --- Mocks ---

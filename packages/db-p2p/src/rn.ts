@@ -12,7 +12,7 @@ export * from './storage/i-block-storage.js';
 export * from './storage/i-raw-storage.js';
 export * from './storage/struct.js';
 export * from './storage/storage-repo.js';
-export * from './storage/restoration-coordinator-v2.js';
+export * from './storage/restoration-coordinator.js';
 export * from './storage/ring-selector.js';
 export * from './storage/storage-monitor.js';
 export * from './storage/arachnode-fret-adapter.js';

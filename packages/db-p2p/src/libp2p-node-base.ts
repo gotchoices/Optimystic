@@ -34,7 +34,7 @@ import { syncService } from './sync/service.js';
 import { SyncClient } from './sync/client.js';
 import type { SyncResponse } from './sync/protocol.js';
 import type { ClusterLatestCallback } from './repo/coordinator-repo.js';
-import { RestorationCoordinator } from './storage/restoration-coordinator-v2.js';
+import { RestorationCoordinator } from './storage/restoration-coordinator.js';
 import { RingSelector } from './storage/ring-selector.js';
 import { StorageMonitor } from './storage/storage-monitor.js';
 import type { StorageMonitorConfig } from './storage/storage-monitor.js';
