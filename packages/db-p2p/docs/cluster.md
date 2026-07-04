@@ -386,23 +386,43 @@ private async computeCommitHash(record: ClusterRecord): Promise<string> {
 
 ```typescript
 private async validateSignatures(record: ClusterRecord): Promise<void> {
-  // Validate promise signatures
+  // Validate promise signatures. Reject on any failure; only report an
+  // InvalidSignature penalty when the outcome proves the key belongs to peerId.
   const promiseHash = await this.computePromiseHash(record);
   for (const [peerId, signature] of Object.entries(record.promises)) {
-    if (!await this.verifySignature(peerId, promiseHash, signature)) {
+    const outcome = await this.verifySignature(record, peerId, promiseHash, signature);
+    if (!outcome.valid) {
+      if (outcome.penalize) {
+        this.reputation?.reportPeer(peerId, PenaltyReason.InvalidSignature, ...);
+      }
       throw new Error(`Invalid promise signature from ${peerId}`);
     }
   }
-  
-  // Validate commit signatures
-  const commitHash = await this.computeCommitHash(record);
-  for (const [peerId, signature] of Object.entries(record.commits)) {
-    if (!await this.verifySignature(peerId, commitHash, signature)) {
-      throw new Error(`Invalid commit signature from ${peerId}`);
-    }
-  }
+  // Commit signatures follow the same pattern against computeCommitHash.
 }
 ```
+
+**Key ↔ peer-id binding.** `verifySignature` does not trust the public key a record
+self-asserts for a peer. For a libp2p Ed25519 identity the peer id **is** the multihash
+of the public key (`peerIdBindsPublicKey` in `cluster/peer-key-binding.ts`), so the
+embedded key is checked against the id before the signature is verified. Without this a
+coordinator could attribute a vote to any peer id `X` while signing it with a key it
+controls (stored under `peers[X].publicKey`), and verification would pass.
+
+`verifySignature` returns a `VerifyOutcome` (`{ valid:true } | { valid:false; penalize:boolean }`)
+rather than a bare boolean, and is **total** on hostile input (it never throws):
+
+- missing/empty key, non-Ed25519 id, key **not bound** to the peer id, or malformed
+  key/signature bytes → `{ valid:false, penalize:false }` — reject, but do **not** report
+  the named peer, whose id may be attacker-chosen;
+- key **is** bound but the signature fails to verify → `{ valid:false, penalize:true }` —
+  a genuine bad vote from a proven identity.
+
+The binding proves a vote was signed by the key its id names; it does **not** decide which
+peer ids are legitimately in the cohort (a coordinator can mint fresh keypairs whose ids
+bind to their own keys). Sybil/cohort membership is a separate layer (cohort-topic
+membership certificates). The dispute path (`dispute-service.ts`) applies the same binding
+gate before penalizing a `false-approval`.
 
 ## Fault Tolerance and Recovery
 
@@ -609,7 +629,7 @@ Errors are thrown as plain `Error` instances with descriptive messages. Key erro
 ### Cryptographic Integrity
 
 - **Message Hashing**: SHA-256 hashes (base58btc encoded) uniquely identify transactions
-- **Signature Verification**: Ed25519 signatures on promise and commit hashes are verified against the public key registered in `ClusterPeers`; forged signatures are rejected
+- **Signature Verification**: Ed25519 signatures on promise and commit hashes are verified against the public key registered in `ClusterPeers` — but only after that key is confirmed to be the one the voting peer id provably names (`peerIdBindsPublicKey`). Without this binding a coordinator could attribute a vote to any peer id while signing with a key it controls; forged and unbound-key signatures are both rejected. See *Signature Verification* under *Cryptographic Security* for the full binding/penalty semantics.
 - **Replay Protection**: `executedTransactions` cache (10-minute TTL) prevents re-execution of committed transactions
 
 ### Access Control
