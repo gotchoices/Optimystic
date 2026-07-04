@@ -375,11 +375,13 @@ export class ClusterCoordinator {
 		// near-lone node could rubber-stamp its own writes), so reject unless the
 		// operator has explicitly opted in via allowUnvalidatedSmallCluster (e.g.
 		// single-node / local dev knowingly running below the floor).
-		log('cluster-tx:small-cluster-accepted-without-validation', {
+		const admit = this.cfg.allowUnvalidatedSmallCluster ?? false;
+		log('cluster-tx:small-cluster-no-confident-estimate', {
 			localSize,
-			reason: 'no-confident-network-size-estimate'
+			reason: 'no-confident-network-size-estimate',
+			admit
 		});
-		return this.cfg.allowUnvalidatedSmallCluster ?? false;
+		return admit;
 	}
 
 	/**
