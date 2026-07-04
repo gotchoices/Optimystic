@@ -10,7 +10,17 @@ import { RepoService } from '../src/repo/service.js';
 import { DisputeProtocolService } from '../src/dispute/service.js';
 import { SyncService } from '../src/sync/service.js';
 import { BlockTransferService, type IBlockReplicaStore } from '../src/cluster/block-transfer-service.js';
+import { ClusterClient } from '../src/cluster/client.js';
+import { SyncClient } from '../src/sync/client.js';
 import { MAX_CONTROL_MESSAGE_BYTES, MAX_BLOCK_MESSAGE_BYTES } from '../src/protocol-limits.js';
+
+/**
+ * The `it-length-prefixed` library's own default `maxDataLength` (its `MAX_DATA_LENGTH`
+ * constant). A block handler that omitted the `maxDataLength` edit would fall back to
+ * this, so a frame declaring *above* it but *below* the block cap is the guard that
+ * proves the block cap is actually applied — not the library default.
+ */
+const LIBRARY_DEFAULT_MAX_BYTES = 4 * 1024 * 1024;
 
 /**
  * Inbound message caps (p2p-consensus-inbound-message-caps).
@@ -74,6 +84,24 @@ function makeMockStream(inputFrames: Array<Uint8Array>) {
 		async *[Symbol.asyncIterator]() { for (const f of inputFrames) yield f; },
 	};
 	return { stream, sent, finished, isAborted: () => aborted, isClosed: () => closed };
+}
+
+/**
+ * An IPeerNetwork whose `connect()` returns a stream that replays `frames` as the
+ * response the client reads. Lets a test drive the *client-side* response cap: a mock
+ * peer returns an oversized reply frame and the client must reject at its length-prefix.
+ */
+function frameRespondingNetwork(frames: Array<Uint8Array>) {
+	return {
+		async connect() {
+			return {
+				send: () => { },
+				close: async () => { },
+				abort: () => { },
+				async *[Symbol.asyncIterator]() { for (const f of frames) yield f; },
+			} as any;
+		},
+	} as any;
 }
 
 /** Length-prefix-encode each value into its own wire frame (as the real client does). */
@@ -164,6 +192,25 @@ describe('inbound message caps', () => {
 			await mock.finished;
 
 			expect(mock.isAborted(), 'a frame above the control cap must not be rejected by a block handler').to.equal(false);
+		});
+
+		it('applies the block cap, not the library default: a frame above 4 MiB (within block cap) is not rejected', async () => {
+			// Strong regression guard for the `maxDataLength: MAX_BLOCK_MESSAGE_BYTES` edit.
+			// The frame declares just above the library's own 4 MiB default but below the
+			// 8 MiB block cap. If the edit were reverted, the decoder would fall back to the
+			// 4 MiB default and abort this frame — so a passing "not aborted" proves the cap
+			// is actually threaded and raised, which the `block cap + 1` oversized test (also
+			// above the default) cannot distinguish.
+			const repo = { calls: 0, async get() { repo.calls++; return {}; } };
+			const { registrar, getHandler } = capturingRegistrar();
+			const service = new RepoService({ logger: makeLogger(), registrar, repo: repo as any }, {});
+			await service.start();
+
+			const mock = makeMockStream([oversizedFrame(LIBRARY_DEFAULT_MAX_BYTES + 1)]);
+			getHandler()(mock.stream as any, { remotePeer: await makePeerId() } as any);
+			await mock.finished;
+
+			expect(mock.isAborted(), 'a frame within the block cap must not be rejected (would fail at the 4 MiB default)').to.equal(false);
 		});
 
 		it('processes only the first of two requests on one stream', async () => {
@@ -264,6 +311,55 @@ describe('inbound message caps', () => {
 			await mock.finished;
 
 			expect(mock.isAborted(), 'a frame above the control cap must not be rejected by a block handler').to.equal(false);
+		});
+
+		it('applies the block cap, not the library default: a frame above 4 MiB (within block cap) is not rejected', async () => {
+			// Strong regression guard: a frame above the library's 4 MiB default but below the
+			// 8 MiB block cap. Reverting the `maxDataLength` edit would abort this at the default.
+			const repo: IBlockReplicaStore = {
+				async get() { return {}; },
+				async saveReplicatedBlock() { },
+			} as any;
+			const { registrar, getHandler } = capturingRegistrar();
+			const service = new BlockTransferService({ registrar, repo }, {});
+			await service.start();
+
+			const mock = makeMockStream([oversizedFrame(LIBRARY_DEFAULT_MAX_BYTES + 1)]);
+			await getHandler()(mock.stream as any);
+			await mock.finished;
+
+			expect(mock.isAborted(), 'a frame within the block cap must not be rejected (would fail at the 4 MiB default)').to.equal(false);
+		});
+	});
+
+	// The response a client reads is capped the same way (ProtocolClient.processMessage
+	// threads `maxDataLength` into the response decode). A hostile peer that replies with
+	// an oversized frame must be rejected at the length-prefix, before allocation.
+	describe('client response cap', () => {
+		it('control-cap client rejects an oversized response frame (declared > control cap)', async () => {
+			// The declared length is above the control cap but BELOW the 4 MiB library
+			// default — so this passes only if the client actually threads the control cap
+			// into its response decode. A broken thread would fall back to the 4 MiB default,
+			// not reject, and surface "No response received" instead.
+			const peerId = await makePeerId();
+			const network = frameRespondingNetwork([oversizedFrame(MAX_CONTROL_MESSAGE_BYTES + 1)]);
+			const client = ClusterClient.create(peerId, network, '/optimystic/test');
+
+			let caught: unknown;
+			try { await client.update({} as any, 0); } catch (e) { caught = e; }
+			expect(caught, 'an oversized response must reject the caller').to.be.instanceOf(Error);
+			expect((caught as Error).message, 'must reject at the length-prefix cap').to.match(/Message length too long/);
+		});
+
+		it('block-cap client rejects an oversized response frame (declared > block cap)', async () => {
+			const peerId = await makePeerId();
+			const network = frameRespondingNetwork([oversizedFrame(MAX_BLOCK_MESSAGE_BYTES + 1)]);
+			const client = new SyncClient(peerId, network, '/optimystic/test');
+
+			let caught: unknown;
+			try { await client.requestBlock({ blockId: 'b1' } as any); } catch (e) { caught = e; }
+			expect(caught, 'an oversized response must reject the caller').to.be.instanceOf(Error);
+			expect((caught as Error).message, 'must reject at the length-prefix cap').to.match(/Message length too long/);
 		});
 	});
 });
