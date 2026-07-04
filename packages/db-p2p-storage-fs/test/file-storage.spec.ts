@@ -83,6 +83,19 @@ describe('FileRawStorage atomic writes + corruption tolerance', () => {
 		assert.ok(!(await hasTempSibling(path.join(base, blockId))), 'expected no leftover *.tmp files');
 	});
 
+	it('a successful second write replaces the prior value (rename-over-existing works on this platform)', async () => {
+		const storage = new FileRawStorage(base);
+		const blockId = 'block-replace' as BlockId;
+
+		const valueA: BlockMetadata = { latest: { rev: 1, actionId: 'tx:aaa' as ActionId }, ranges: [[1, 2]] };
+		const valueB: BlockMetadata = { latest: { rev: 2, actionId: 'tx:bbb' as ActionId }, ranges: [[1, 3]] };
+		await storage.saveMetadata(blockId, valueA);
+		await storage.saveMetadata(blockId, valueB);
+
+		assert.deepStrictEqual(await storage.getMetadata(blockId), valueB);
+		assert.ok(!(await hasTempSibling(path.join(base, blockId))), 'expected no leftover *.tmp files');
+	});
+
 	it('a failed rename leaves the canonical file at the prior complete value (never torn)', async () => {
 		const storage = new FileRawStorage(base);
 		const blockId = 'block-atomic' as BlockId;

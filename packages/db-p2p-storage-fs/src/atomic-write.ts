@@ -41,6 +41,14 @@ export async function atomicWriteFile(filePath: string, content: string): Promis
 		await handle.sync();
 		await handle.close();
 		handle = undefined;
+		// NOTE: on win32, rename-over-existing can throw EPERM/EACCES/EBUSY if a
+		// concurrent reader holds the target open without FILE_SHARE_DELETE (Node
+		// readIfExists/get open→read→close in a tiny window, so it's rare). Modern
+		// libuv retries some cases; if this ever surfaces as spurious write failures
+		// under concurrent read+write on Windows, add a bounded retry loop here (the
+		// write-file-atomic package does exactly this). Conditional — the adapter is
+		// already last-writer-wins with no cross-process lock (proper-lockfile TODO
+		// in file-storage.ts), so it is not reachable under current single-writer use.
 		await fs.rename(tmpPath, filePath);
 	} catch (err) {
 		if (handle) await handle.close().catch(() => { /* best-effort */ });
