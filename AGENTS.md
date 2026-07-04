@@ -30,6 +30,10 @@ Each testable package has a `register.mjs` that sets up `ts-node/esm`. Run tests
 
 To grep for a specific test: `yarn test -- --grep "pattern"`
 
+## Dependencies
+
+Shared cross-package deps are version-guarded by `yarn.config.cjs` (Yarn 4 constraints). `@libp2p/peer-id` and `uint8arrays` must declare a single blessed range everywhere; `@libp2p/interface` and `@libp2p/crypto` must stay within a shared major (minor drift is allowed and, for `@libp2p/interface` 3.1 vs 3.2, deliberate — see the comments in that file). After changing any such dep, run `yarn constraints`; single-range violations are auto-repairable with `yarn constraints --fix`, major violations are reported and need a human decision.
+
 ## Tickets (tess)
 
 This project uses [tess](tess/) for AI-driven ticket management.
