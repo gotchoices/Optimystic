@@ -19,11 +19,12 @@ import { BlockStorage } from './storage/block-storage.js';
 import { MemoryRawStorage } from './storage/memory-storage.js';
 import type { IRawStorage } from './storage/i-raw-storage.js';
 import { clusterMember, type ReconcileBlockCallback, type CommitCertificateSink } from './cluster/cluster-repo.js';
+import { selectQuorumRev, selectQuorumBlock, canonicalBlockHash, type RevClaim, type BlockHashCandidate } from './cluster/quorum-restore.js';
 import { createCommitCertStore, makeClusterCommitCertExtractor, type CommitCertStore } from './cluster/commit-cert.js';
 import { coordinatorRepo } from './repo/coordinator-repo.js';
 import { Libp2pKeyPeerNetwork, type NetworkMode, type NetworkStatePersistence } from './libp2p-key-network.js';
 import { ClusterClient } from './cluster/client.js';
-import type { IRepo, ICluster, ITransactionValidator, BlockId, ActionRev, IBlock, IBlockChangeNotifier } from '@optimystic/db-core';
+import type { IRepo, ICluster, ITransactionValidator, BlockId, IBlock, IBlockChangeNotifier } from '@optimystic/db-core';
 import type { ITransactionStateStore } from './cluster/i-transaction-state-store.js';
 import { networkManagerService, type NetworkManagerService } from './network/network-manager-service.js';
 import type { SpreadOnChurnConfig, SpreadOnChurnMonitor } from './cluster/spread-on-churn.js';
@@ -80,6 +81,7 @@ import { PartitionDetector } from './cluster/partition-detector.js';
 import { createLogger } from './logger.js';
 import { PeerReputationService } from './reputation/peer-reputation.js';
 import type { IPeerReputation } from './reputation/types.js';
+import { PenaltyReason } from './reputation/types.js';
 import { DisputeService } from './dispute/dispute-service.js';
 import { DisputeClient } from './dispute/client.js';
 import type { DisputeConfig } from './dispute/types.js';
@@ -640,25 +642,54 @@ export async function createLibp2pNodeBase(
 		const targets = cohortPeerIds.filter(id => id !== node.peerId.toString());
 		if (targets.length === 0) return;
 
-		const archives = await Promise.all(targets.map(peerIdStr => fetchArchiveFromPeer(peerIdStr, blockId)));
+		const fetched = await Promise.all(
+			targets.map(async peerIdStr => ({ peerIdStr, archive: await fetchArchiveFromPeer(peerIdStr, blockId) }))
+		);
 
-		let best: { block: IBlock; source: ActionRev } | undefined;
-		for (const archive of archives) {
+		// Each cohort archive contributes one (rev, actionId) claim from its max
+		// revision (>= the rev we committed). Pick the target rev by quorum
+		// corroboration rather than raw Math.max — a lone peer inflating its rev
+		// cannot steer reconciliation. Keep the serving peer + block per candidate
+		// so we can then verify content agreement.
+		// NOTE: this quorum is corroboration-of-a-claim, NOT Sybil-resistant cohort
+		// membership — deferred to backlog `debt-read-repair-commit-cert-verification`.
+		const candidates: { peerIdStr: string; rev: number; actionId: string; block?: IBlock }[] = [];
+		for (const { peerIdStr, archive } of fetched) {
 			if (!archive) continue;
 			const revs = Object.keys(archive.revisions).map(Number);
 			if (revs.length === 0) continue;
 			const maxRev = Math.max(...revs);
 			if (maxRev < committed.rev) continue;
 			const data = archive.revisions[maxRev];
-			if (!data?.block) continue;
-			if (!best || maxRev > best.source.rev) {
-				best = { block: data.block, source: { actionId: data.action.actionId, rev: maxRev } };
-			}
+			if (!data?.action) continue;
+			candidates.push({ peerIdStr, rev: maxRev, actionId: data.action.actionId, block: data.block });
 		}
 
-		if (best) {
-			await storageRepo.saveReplicatedBlock(blockId, best.block, best.source);
-		}
+		const revClaims: RevClaim[] = candidates.map(c => ({ peerId: c.peerIdStr, rev: c.rev, actionId: c.actionId }));
+		const selected = selectQuorumRev(revClaims, consensusConfig.simpleMajorityThreshold);
+		if (!selected) return; // no rev corroborated by a quorum → leave block, churn/rebalance retries later
+
+		// Content agreement: among archives corroborating the chosen (rev, actionId)
+		// and actually carrying the block, the content must be byte-identical across
+		// a quorum. A cohort member serving content that hashes differently is rejected.
+		const corroborating = candidates.filter(c => c.rev === selected.rev && c.actionId === selected.actionId && c.block);
+		const hashCandidates: BlockHashCandidate[] = await Promise.all(
+			corroborating.map(async c => ({ peerId: c.peerIdStr, hash: await canonicalBlockHash(c.block!), block: c.block! }))
+		);
+		const agreed = selectQuorumBlock(hashCandidates, consensusConfig.simpleMajorityThreshold);
+		if (!agreed) return; // no content quorum → skip persist
+
+		// Best-effort: penalize cohort members that served content contradicting the
+		// agreed hash for the same committed (rev, actionId). Never let this throw.
+		try {
+			for (const c of hashCandidates) {
+				if (c.hash !== agreed.hash) {
+					reputation.reportPeer(c.peerId, PenaltyReason.InvalidRestoration, `reconcile:${blockId}`);
+				}
+			}
+		} catch { /* reputation write must never block restoration */ }
+
+		await storageRepo.saveReplicatedBlock(blockId, agreed.block, { actionId: selected.actionId, rev: selected.rev });
 	};
 
 	clusterImpl = clusterMember({

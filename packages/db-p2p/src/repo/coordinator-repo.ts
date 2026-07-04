@@ -7,7 +7,9 @@ import { peerIdFromString } from "@libp2p/peer-id";
 import type { FretService } from "p2p-fret";
 import { createLogger } from '../logger.js';
 import type { IPeerReputation } from "../reputation/types.js";
+import { PenaltyReason } from "../reputation/types.js";
 import type { ITransactionStateStore } from "../cluster/i-transaction-state-store.js";
+import { selectQuorumRev, type RevClaim, type QuorumRev } from "../cluster/quorum-restore.js";
 
 const log = createLogger('coordinator-repo');
 
@@ -69,6 +71,9 @@ export class CoordinatorRepo implements IRepo {
 	private readonly readRepairMode: 'off' | 'lazy' | 'paranoid';
 	private readonly readRepairWindowMs: number;
 	private readonly readRepairSampleRate: number;
+	/** Simple-majority threshold from the consensus policy; drives the read-repair corroboration quorum. */
+	private readonly simpleMajorityThreshold: number;
+	private readonly reputation?: IPeerReputation;
 	/** Test seam: overridable clock for window-based read-repair gating. */
 	now: () => number = () => Date.now();
 	/** Test seam: overridable RNG (0..1) for sample-rate gating. */
@@ -108,6 +113,8 @@ export class CoordinatorRepo implements IRepo {
 		this.readRepairMode = policy.readRepairMode!;
 		this.readRepairWindowMs = policy.readRepairWindowMs!;
 		this.readRepairSampleRate = policy.readRepairSampleRate!;
+		this.simpleMajorityThreshold = policy.simpleMajorityThreshold;
+		this.reputation = reputation;
 		const localClusterRef = localCluster && localPeerId ? {
 			update: localCluster.update.bind(localCluster),
 			peerId: localPeerId,
@@ -293,11 +300,23 @@ export class CoordinatorRepo implements IRepo {
 	}
 
 	/**
-	 * Query cluster peers to find the maximum latest revision for a block.
+	 * Query cluster peers for their latest revision and return the highest
+	 * revision corroborated by a quorum of distinct peers.
+	 *
+	 * Replaces the old "max rev any single peer reports" — which let one lying
+	 * peer over-reporting its revision steer restoration — with quorum
+	 * corroboration on the exact `(rev, actionId)` pair (see
+	 * {@link selectQuorumRev}). The local node's own latest is included as a
+	 * corroborating vote because `clusterLatestCallback` self-short-circuits to
+	 * local storage. Returns `undefined` (keep local, do not restore) when no
+	 * revision is corroborated.
+	 *
+	 * NOTE: the quorum is corroboration-of-a-claim, NOT Sybil-resistant cohort
+	 * membership — a peer minting fresh keypairs still casts a vote. Commit-cert
+	 * + membership anchoring is deferred to backlog
+	 * `debt-read-repair-commit-cert-verification`.
 	 */
 	private async queryClusterForLatest(peerIds: string[], blockId: BlockId, context?: ActionContext): Promise<ActionRev | undefined> {
-		let maxLatest: ActionRev | undefined;
-
 		// Add timeout wrapper to prevent hanging on unresponsive peers
 		const withTimeout = <T>(promise: Promise<T>, timeoutMs: number): Promise<T | undefined> =>
 			Promise.race([
@@ -305,24 +324,52 @@ export class CoordinatorRepo implements IRepo {
 				new Promise<undefined>(resolve => setTimeout(() => resolve(undefined), timeoutMs))
 			]);
 
-		// Query peers in parallel for their latest revision (with 1s timeout per peer)
+		// Query peers in parallel for their latest revision (with 1s timeout per peer),
+		// tagging each response with the peer that made it so votes stay distinct.
 		const latestResults = await Promise.allSettled(
-			peerIds.map(peerIdStr => {
+			peerIds.map(async peerIdStr => {
 				const peerId = peerIdFromString(peerIdStr);
-				return withTimeout(this.clusterLatestCallback!(peerId, blockId, context), 1000);
+				const value = await withTimeout(this.clusterLatestCallback!(peerId, blockId, context), 1000);
+				return { peerIdStr, value };
 			})
 		);
 
+		const claims: RevClaim[] = [];
 		for (const result of latestResults) {
-			if (result.status === 'fulfilled' && result.value) {
-				const peerLatest = result.value;
-				if (!maxLatest || peerLatest.rev > maxLatest.rev) {
-					maxLatest = peerLatest;
-				}
+			if (result.status === 'fulfilled' && result.value.value) {
+				const { peerIdStr, value } = result.value;
+				claims.push({ peerId: peerIdStr, rev: value.rev, actionId: value.actionId });
 			}
 		}
 
-		return maxLatest;
+		const selected = selectQuorumRev(claims, this.simpleMajorityThreshold);
+		if (!selected) {
+			log('cluster-fetch:no-quorum', { blockId, responders: claims.length });
+			return undefined;
+		}
+
+		// Best-effort: penalize peers whose claim contradicts the corroborated pair
+		// (an inflated rev the quorum outvoted, or conflicting content at the agreed
+		// rev). A lower rev is just lag, never penalized. Never let this throw.
+		this.penalizeContradictingRevClaims(claims, selected, blockId);
+
+		return { actionId: selected.actionId, rev: selected.rev };
+	}
+
+	/** Report peers whose reported latest provably contradicts the quorum-corroborated pair. Best-effort. */
+	private penalizeContradictingRevClaims(claims: RevClaim[], selected: QuorumRev, blockId: BlockId): void {
+		if (!this.reputation) return;
+		try {
+			for (const c of claims) {
+				const contradicts = c.rev > selected.rev
+					|| (c.rev === selected.rev && c.actionId !== selected.actionId);
+				if (contradicts) {
+					this.reputation.reportPeer(c.peerId, PenaltyReason.InvalidRestoration, `read-repair:${blockId}`);
+				}
+			}
+		} catch (err) {
+			log('cluster-fetch:penalize-error', { blockId, error: (err as Error).message });
+		}
 	}
 
 	async pend(request: PendRequest, options?: MessageOptions): Promise<PendResult> {

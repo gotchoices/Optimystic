@@ -20,6 +20,8 @@ export enum PenaltyReason {
 	FalseApproval = 'false-approval',
 	/** Challenger lost a dispute (their rejection was wrong) */
 	DisputeLost = 'dispute-lost',
+	/** Peer reported a block latest (rev/actionId) or served content contradicted by a cluster quorum during restoration */
+	InvalidRestoration = 'invalid-restoration',
 }
 
 /** Default penalty weights by reason */
@@ -34,6 +36,7 @@ export const DEFAULT_PENALTY_WEIGHTS: Record<PenaltyReason, number> = {
 	[PenaltyReason.ConnectionFailure]: 2,
 	[PenaltyReason.FalseApproval]: 40,
 	[PenaltyReason.DisputeLost]: 30,
+	[PenaltyReason.InvalidRestoration]: 30,
 };
 
 /** Thresholds controlling graduated reputation responses */
