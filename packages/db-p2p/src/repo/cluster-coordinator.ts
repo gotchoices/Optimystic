@@ -370,13 +370,16 @@ export class ClusterCoordinator {
 			}
 		}
 
-		// Fallback: accept small clusters in development/testing scenarios
-		// In production, FRET should provide validation
+		// Fallback: with no confident network-size estimate, fail CLOSED by default.
+		// An undersized cluster with no way to justify its size is unsafe (a lone/
+		// near-lone node could rubber-stamp its own writes), so reject unless the
+		// operator has explicitly opted in via allowUnvalidatedSmallCluster (e.g.
+		// single-node / local dev knowingly running below the floor).
 		log('cluster-tx:small-cluster-accepted-without-validation', {
 			localSize,
 			reason: 'no-confident-network-size-estimate'
 		});
-		return true;
+		return this.cfg.allowUnvalidatedSmallCluster ?? false;
 	}
 
 	/**

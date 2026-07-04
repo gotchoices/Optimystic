@@ -308,3 +308,61 @@ describe('ClusterCoordinator broadcast in-line retry', function () {
 		expect(txState?.retry?.intervalMs).to.equal(100);
 	});
 });
+
+describe('ClusterCoordinator undersized-cluster gate (validateSmallCluster)', function () {
+	this.timeout(10000);
+
+	const baseCfg: ClusterConsensusConfig & { clusterSize: number } = {
+		clusterSize: 1,
+		superMajorityThreshold: 0.75,
+		simpleMajorityThreshold: 0.51,
+		minAbsoluteClusterSize: 2,
+		allowClusterDownsize: true,
+		clusterSizeTolerance: 0.5,
+		partitionDetectionWindow: 60000
+	};
+
+	const makeMessage = (): RepoMessage => ({
+		operations: [{ get: { blockIds: ['block-1'] } }],
+		expiration: Date.now() + 30000
+	});
+
+	// Single-peer cluster (peerCount 1 < minAbsoluteClusterSize 2) with NO FRET service,
+	// so validateSmallCluster always falls through to the no-confident-estimate branch.
+	const setupSinglePeer = async (cfg: ClusterConsensusConfig & { clusterSize: number }) => {
+		const pid = await makePeerId();
+		const idStr = pid.toString();
+		const clusterPeers: ClusterPeers = {
+			[idStr]: {
+				multiaddrs: ['/ip4/127.0.0.1/tcp/8000'],
+				publicKey: u8ToString(pid.publicKey!.raw, 'base64url')
+			}
+		};
+		const mock = new MockClusterClient(idStr);
+		const mockKeyNetwork: IKeyNetwork = {
+			async findCoordinator() { return pid; },
+			async findCluster() { return { ...clusterPeers }; }
+		};
+		const createClient = (_peerId: PeerId) => mock;
+		const coordinator = new ClusterCoordinator(mockKeyNetwork, createClient as any, cfg);
+		return { coordinator, mock };
+	};
+
+	it('rejects an undersized cluster with no confident estimate when the flag is off (default)', async () => {
+		const { coordinator } = await setupSinglePeer(baseCfg);
+		let err: Error | undefined;
+		try {
+			await coordinator.executeClusterTransaction('block-1' as BlockId, makeMessage());
+		} catch (e) {
+			err = e as Error;
+		}
+		expect(err, 'expected undersized cluster to be rejected when fail-closed').to.not.equal(undefined);
+		expect(err!.message).to.contain('below minimum 2 and not validated');
+	});
+
+	it('admits an undersized cluster when allowUnvalidatedSmallCluster is on', async () => {
+		const { coordinator } = await setupSinglePeer({ ...baseCfg, allowUnvalidatedSmallCluster: true });
+		const result = await coordinator.executeClusterTransaction('block-1' as BlockId, makeMessage());
+		expect(Object.keys(result.record.commits)).to.have.length(1);
+	});
+});

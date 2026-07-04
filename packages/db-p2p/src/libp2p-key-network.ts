@@ -582,16 +582,21 @@ export class Libp2pKeyPeerNetwork implements IKeyNetwork, IPeerNetwork {
 		// same-network peer is not starved: it flips to 'serves' once identify completes and
 		// is re-included on the caller's retry, and in the meantime a self-only cohort still
 		// completes the write under allowClusterDownsize (the default).
+		// Scoped path only: one peerStore read per cohort member yields both protocols
+		// (for membership classification here) and addresses (reused at backfill below),
+		// so a finally-selected member isn't fetched from the peerStore twice. Left
+		// undefined on the unscoped path, which never classifies membership.
+		let peerStoreRecords: Record<string, { protocols: string[]; addrs: string[] }> | undefined
 		if (this.protocolPrefix != null) {
 			// `cohort` is the over-fetched nearest-first band. Classify each non-self
 			// member, preserving proximity order within each tier.
 			const nonSelf = cohort.filter(id => id !== selfId)
-			const protocolsByPeer = await this.getPeerStoreProtocolsByPeer(nonSelf)
+			peerStoreRecords = await this.getPeerStoreRecordsByPeer(nonSelf)
 			const serves: string[] = []
 			const unknown: string[] = []
 			let foreignDropped = 0
 			for (const id of nonSelf) {
-				const m = this.membershipOf(id, protocolsByPeer[id])
+				const m = this.membershipOf(id, peerStoreRecords[id]?.protocols)
 				if (m === 'serves') serves.push(id)
 				else if (m === 'unknown') unknown.push(id)
 				else foreignDropped++
@@ -623,8 +628,17 @@ export class Libp2pKeyPeerNetwork implements IKeyNetwork, IPeerNetwork {
 		// Backfill addresses from the peerStore for cohort members we don't have
 		// a live connection to. The cohort is keyspace-determined and can include
 		// peers we know-of but haven't dialed yet; without this backfill those
-		// would be silently dropped.
-		const peerStoreAddrs = await this.getPeerStoreAddrsByPeer(ids.filter(id => id !== selfId))
+		// would be silently dropped. On the scoped path reuse the addresses already
+		// read into `peerStoreRecords` above (no second store.get per member); on the
+		// unscoped path (no record map) do the single peerStore read as before.
+		const backfillIds = ids.filter(id => id !== selfId)
+		const peerStoreAddrs = peerStoreRecords
+			? Object.fromEntries(
+				backfillIds
+					.map(id => [id, peerStoreRecords![id]?.addrs ?? []] as const)
+					.filter(([, addrs]) => addrs.length > 0)
+			)
+			: await this.getPeerStoreAddrsByPeer(backfillIds)
 
 		this.log('findCluster key=%s fretCohort=%d connected=%d', keyStr, cohort.length, connectedPeerIds.length)
 		if (verbose) this.log('findCluster:detail key=%s cohortPeers=%o connectedPeers=%o', keyStr, ids, connectedPeerIds)
@@ -677,6 +691,32 @@ export class Libp2pKeyPeerNetwork implements IKeyNetwork, IPeerNetwork {
 				const peer = await store.get!(pid)
 				const addrs = (peer?.addresses ?? []).map(a => a.multiaddr.toString())
 				if (addrs.length > 0) out[idStr] = addrs
+			} catch {
+				// Unknown peer or peerStore failure — leave out of the map.
+			}
+		}))
+		return out
+	}
+
+	/**
+	 * Single-pass peerStore read returning BOTH protocols and addresses per peer from one
+	 * `store.get` call. Used on the membership-scoped `findCluster` hot path, where the
+	 * cohort needs protocols (to classify membership) AND addresses (to backfill dial
+	 * targets) for the same peers — reading them together avoids a second `store.get` per
+	 * finally-selected member. Same error handling as {@link getPeerStoreProtocolsByPeer}
+	 * and {@link getPeerStoreAddrsByPeer}: a missing peer or peerStore failure is left
+	 * absent from the map (caller treats absent protocols as 'unknown', absent addrs as none).
+	 */
+	private async getPeerStoreRecordsByPeer(ids: string[]): Promise<Record<string, { protocols: string[]; addrs: string[] }>> {
+		const out: Record<string, { protocols: string[]; addrs: string[] }> = {}
+		const store = (this.libp2p as { peerStore?: { get?: (id: PeerId) => Promise<{ protocols?: string[]; addresses?: Array<{ multiaddr: { toString(): string } }> }> } }).peerStore
+		if (!store?.get) return out
+		await Promise.all(ids.map(async (idStr) => {
+			try {
+				const pid = peerIdFromString(idStr)
+				const peer = await store.get!(pid)
+				const addrs = (peer?.addresses ?? []).map(a => a.multiaddr.toString())
+				out[idStr] = { protocols: peer?.protocols ?? [], addrs }
 			} catch {
 				// Unknown peer or peerStore failure — leave out of the map.
 			}

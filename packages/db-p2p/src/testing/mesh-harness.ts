@@ -146,7 +146,10 @@ export async function createMesh(nodeCount: number, options: MeshOptions): Promi
 			minAbsoluteClusterSize: 2,
 			allowClusterDownsize: options.allowClusterDownsize ?? true,
 			clusterSizeTolerance: 0.5,
-			partitionDetectionWindow: 60000
+			partitionDetectionWindow: 60000,
+			// Harness spins up small/single-node meshes on purpose; opt into running
+			// below the safe floor without a confident network-size estimate.
+			allowUnvalidatedSmallCluster: true
 		};
 
 		// Active reconciliation simulation: when a member commits a block it never
@@ -258,7 +261,10 @@ export async function createMesh(nodeCount: number, options: MeshOptions): Promi
 			{
 				clusterSize: options.clusterSize ?? nodeCount,
 				superMajorityThreshold: options.superMajorityThreshold ?? 0.75,
-				allowClusterDownsize: options.allowClusterDownsize ?? true
+				allowClusterDownsize: options.allowClusterDownsize ?? true,
+				// Harness meshes run below the safe floor on purpose; opt the coordinator
+				// side into that so validateSmallCluster admits them (fails closed by default).
+				allowUnvalidatedSmallCluster: true
 			}
 		);
 		node.coordinatorRepo = factory({

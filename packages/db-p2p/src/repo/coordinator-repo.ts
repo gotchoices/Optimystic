@@ -108,7 +108,10 @@ export class CoordinatorRepo implements IRepo {
 			promiseImmediateRetries: cfg?.promiseImmediateRetries ?? 1,
 			readRepairMode: cfg?.readRepairMode ?? 'lazy',
 			readRepairWindowMs: cfg?.readRepairWindowMs ?? 10000,
-			readRepairSampleRate: cfg?.readRepairSampleRate ?? 0
+			readRepairSampleRate: cfg?.readRepairSampleRate ?? 0,
+			// Default false: an undersized cluster with no confident network-size estimate
+			// is REJECTED (fail closed). Callers only opt in for single-node/local/test meshes.
+			allowUnvalidatedSmallCluster: cfg?.allowUnvalidatedSmallCluster ?? false
 		};
 		this.readRepairMode = policy.readRepairMode!;
 		this.readRepairWindowMs = policy.readRepairWindowMs!;

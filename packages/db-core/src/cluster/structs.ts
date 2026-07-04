@@ -92,4 +92,11 @@ export interface ClusterConsensusConfig {
 	readRepairWindowMs?: number;
 	/** Per-read probability of triggering read-repair in 'lazy' mode even within the window (0..1). Default 0 (no random check). */
 	readRepairSampleRate?: number;
+	/**
+	 * When FRET has no confident network-size estimate, allow an undersized cluster
+	 * (peerCount < minAbsoluteClusterSize) to proceed anyway. Default false: with no
+	 * confident estimate an undersized cluster is REJECTED. Turn on only for
+	 * single-node / local dev where you knowingly run below the safe floor.
+	 */
+	allowUnvalidatedSmallCluster?: boolean;
 }
