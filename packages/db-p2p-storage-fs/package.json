@@ -34,13 +34,16 @@
 	],
 	"scripts": {
 		"clean": "rimraf dist",
-		"build": "tsc"
+		"build": "tsc",
+		"test": "node --import ./register.mjs node_modules/mocha/bin/mocha.js \"test/**/*.spec.ts\" --colors --reporter spec"
 	},
 	"devDependencies": {
 		"@types/debug": "^4.1.12",
 		"@types/mocha": "^10.0.10",
 		"@types/node": "^25.1.0",
+		"mocha": "^11.7.5",
 		"rimraf": "^6.1.2",
+		"ts-node": "^10.9.2",
 		"typescript": "^5.9.3"
 	},
 	"dependencies": {

@@ -1,6 +1,7 @@
 import { promises as fs } from 'fs';
 import * as path from 'path';
 import type { IKVStore } from '@optimystic/db-p2p';
+import { atomicWriteFile } from './atomic-write.js';
 
 /** Filesystem-backed IKVStore. Keys may contain `/` separators which become subdirectories. */
 export class FileKVStore implements IKVStore {
@@ -16,9 +17,7 @@ export class FileKVStore implements IKVStore {
 	}
 
 	async set(key: string, value: string): Promise<void> {
-		const filePath = this.keyToPath(key);
-		await fs.mkdir(path.dirname(filePath), { recursive: true });
-		await fs.writeFile(filePath, value);
+		await atomicWriteFile(this.keyToPath(key), value);
 	}
 
 	async delete(key: string): Promise<void> {

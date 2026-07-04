@@ -1387,7 +1387,9 @@ __metadata:
     "@types/mocha": "npm:^10.0.10"
     "@types/node": "npm:^25.1.0"
     debug: "npm:^4.4.3"
+    mocha: "npm:^11.7.5"
     rimraf: "npm:^6.1.2"
+    ts-node: "npm:^10.9.2"
     typescript: "npm:^5.9.3"
   languageName: unknown
   linkType: soft

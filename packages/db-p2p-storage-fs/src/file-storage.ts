@@ -3,6 +3,7 @@ import * as path from 'path';
 import type { BlockId, IBlock, Transform, ActionId, ActionRev } from "@optimystic/db-core";
 import type { BlockMetadata, IRawStorage } from "@optimystic/db-p2p";
 import { createLogger } from './logger.js';
+import { atomicWriteFile } from './atomic-write.js';
 
 const log = createLogger('storage:file');
 
@@ -243,13 +244,21 @@ export class FileRawStorage implements IRawStorage {
 		return fs.readFile(filePath, 'utf-8')
 			.then(content => JSON.parse(content) as T)
 			.catch(err => {
-				if (err.code === 'ENOENT') return undefined;
+				if (err?.code === 'ENOENT') return undefined;
+				// A JSON parse failure (SyntaxError, which carries no `code`) means the
+				// file is present but corrupt — most likely a torn write from a crash
+				// before atomic writes existed. Treat it as "missing" so recover() and
+				// normal reads make progress instead of rethrowing forever. A real I/O
+				// error (permissions, EIO, ...) still throws — it must not be masked.
+				if (err instanceof SyntaxError) {
+					log('readIfExists: corrupt JSON at %s, treating as missing - %o', filePath, err);
+					return undefined;
+				}
 				throw err;
 			});
 	}
 
 	private async ensureAndWriteFile(filePath: string, content: string): Promise<void> {
-		await fs.mkdir(path.dirname(filePath), { recursive: true });
-		await fs.writeFile(filePath, content);
+		await atomicWriteFile(filePath, content);
 	}
 }
