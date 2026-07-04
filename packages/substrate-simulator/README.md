@@ -90,8 +90,10 @@ Seven layers ship here:
   `Metrics` sink, keyed by `(claim, axis)`.
 
 Mock-only: it is **not** shipped to runtime consumers and depends on **no** `@optimystic/*` or
-`db-p2p` code. It depends on **`p2p-fret`** (via a `portal:` path ref to the sibling FRET repo)
-solely to wrap its ring/cohort/size math — see Decision 5.
+`db-p2p` code. It depends on the published **`p2p-fret`** npm package solely to wrap its
+ring/cohort/size math — see Decision 5. (Loading `p2p-fret` pulls its libp2p peer deps
+transitively, so `@libp2p/interface`, `@libp2p/peer-id`, and `libp2p` are declared here even
+though the mock only uses the non-libp2p exports.)
 
 ## Quick start
 
