@@ -151,13 +151,19 @@ export class SqliteRawStorage implements IRawStorage {
 	}
 
 	async promotePendingTransaction(blockId: BlockId, actionId: ActionId): Promise<void> {
-		await this.db.transaction(async () => {
-			const row = await this.stmts.getPending.get(blockId, actionId);
+		await this.db.transaction(async (tx) => {
+			// Prepare against the open transaction so these three statements run on
+			// the held mutex slot without re-locking the connection (which would
+			// deadlock). Re-preparing is cheap — the driver caches by SQL text.
+			const getPending = tx.prepare('SELECT value FROM pending WHERE block_id = ? AND action_id = ?');
+			const saveTransaction = tx.prepare('INSERT OR REPLACE INTO transactions (block_id, action_id, value) VALUES (?, ?, ?)');
+			const deletePending = tx.prepare('DELETE FROM pending WHERE block_id = ? AND action_id = ?');
+			const row = await getPending.get(blockId, actionId);
 			if (!row) {
 				throw new Error(`Pending action ${actionId} not found for block ${blockId}`);
 			}
-			await this.stmts.saveTransaction.run(blockId, actionId, row.value as string);
-			await this.stmts.deletePending.run(blockId, actionId);
+			await saveTransaction.run(blockId, actionId, row.value as string);
+			await deletePending.run(blockId, actionId);
 		});
 	}
 }

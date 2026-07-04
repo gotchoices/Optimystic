@@ -25,7 +25,7 @@ const makeBlock = (id: string): IBlock => {
 };
 const makeTransform = (id: string): Transform => ({ insert: makeBlock(id) });
 
-describe.skip('SQLite transaction serialization on the shared connection', () => {
+describe('SQLite transaction serialization on the shared connection', () => {
 	it('two concurrent promotes on disjoint blocks both survive', async () => {
 		const db = await openTestDb();
 		const storage = new SqliteRawStorage(db);

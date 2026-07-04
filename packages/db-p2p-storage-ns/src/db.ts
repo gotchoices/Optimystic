@@ -34,19 +34,44 @@ export interface SqliteStatement {
 }
 
 /**
+ * Statements that execute directly on an already-OPEN transaction.
+ *
+ * Handed to the `transaction(fn)` callback. Its prepared statements run on the
+ * raw connection *inside* the mutex slot the transaction already holds, so they
+ * must NOT re-acquire the connection mutex — doing so would deadlock (the
+ * transaction body holds the only slot). This is the explicit-context seam the
+ * fix threads through instead of a shared `inTransaction` flag, which cannot
+ * tell an inner statement (bypass the lock) from a concurrent external write
+ * (block on it).
+ */
+export interface SqliteTransaction {
+	/** Prepare a statement bound to the open transaction; bypasses the mutex. */
+	prepare(sql: string): SqliteStatement;
+}
+
+/**
  * Minimal SQLite driver surface used by this package.
  *
  * Wraps either the NativeScript plugin (in production) or a Node SQLite
  * driver (in tests). Async on every method so the NS plugin's I/O can be
  * Promised — even where the underlying call is synchronous.
+ *
+ * A single connection is shared across the storage classes, so every mutating
+ * operation (`exec`, statement `run`, and `transaction` bodies) is serialized on
+ * a per-connection FIFO mutex. Reads (`get`/`all`) are intentionally left
+ * unserialized to preserve read concurrency.
  */
 export interface SqliteDb {
-	/** Execute one or more semicolon-separated statements; no result rows. */
+	/** Execute one or more semicolon-separated statements; no result rows. Mutex-guarded. */
 	exec(sql: string): Promise<void>;
-	/** Prepare a parameterized statement for repeated execution. */
+	/** Prepare a parameterized statement for repeated execution (writes are mutex-guarded). */
 	prepare(sql: string): SqliteStatement;
-	/** Run `fn` inside `BEGIN ... COMMIT` (rolls back on throw). */
-	transaction<T>(fn: () => Promise<T>): Promise<T>;
+	/**
+	 * Run `fn` inside `BEGIN IMMEDIATE ... COMMIT` (rolls back on throw), holding
+	 * the connection mutex for the whole body. `fn` receives a `SqliteTransaction`
+	 * whose statements run directly on the open transaction without re-locking.
+	 */
+	transaction<T>(fn: (tx: SqliteTransaction) => Promise<T>): Promise<T>;
 	/** Release the underlying handle. */
 	close(): Promise<void>;
 }

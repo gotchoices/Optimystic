@@ -1,3 +1,10 @@
+<!-- resume-note -->
+RESUME: A prior agent run on this ticket did not complete.
+  Prior run: 2026-07-04T05:03:25.266Z (agent: claude)
+  Log file: C:\projects\optimystic\tickets\.logs\st-nativescript-sqlite-transaction-mutex.implement.2026-07-04T05-03-25-266Z.log
+Read the log to see what was done. Resume where it left off.
+If the prior run hit a timeout or repeated error, be cautious not to rush into the same situation.
+<!-- /resume-note -->
 description: The mobile (NativeScript) SQLite backend shares one database connection with no locking, so two simultaneous writes tangle their transactions and one write's rollback can silently undo another's committed data — serialize writes on the connection so this can't happen.
 prereq:
 files: packages/db-p2p-storage-ns/src/ns-opener.ts, packages/db-p2p-storage-ns/src/db.ts, packages/db-p2p-storage-ns/src/sqlite-storage.ts, packages/db-p2p-storage-ns/test/node-sqlite-driver.ts, packages/db-p2p-storage-ns/test/sqlite-transaction-serialization.spec.ts
