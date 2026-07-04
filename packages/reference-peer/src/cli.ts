@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import { Command } from 'commander';
 import debug from 'debug';
-import { getNetworkManager, createLibp2pNode, StorageRepo, BlockStorage, MemoryRawStorage, Libp2pKeyPeerNetwork, RepoClient, ArachnodeFretAdapter, type IRawStorage } from '@optimystic/db-p2p';
+import { getNetworkManager, createLibp2pNode, MemoryRawStorage, Libp2pKeyPeerNetwork, RepoClient, ArachnodeFretAdapter, type IRawStorage } from '@optimystic/db-p2p';
 import { FileRawStorage } from '@optimystic/db-p2p-storage-fs';
 import { Diary, NetworkTransactor, BTree, ITransactor, BlockGets, GetBlockResults, ActionBlocks, BlockActionStatus, PendRequest, PendResult, CommitRequest, CommitResult } from '@optimystic/db-core';
 import * as readline from 'readline';
@@ -391,9 +391,12 @@ class PeerSession {
 			console.log(`   ${s}`);
 		});
 
-		// Set up storage layer for local transactor (uses same storage as node)
-		const rawStorage = createStorage();
-		const storageRepo = new StorageRepo((blockId: string) => new BlockStorage(blockId, rawStorage));
+		// LocalTransactor shares the node's own StorageRepo so offline writes are
+		// visible to the running node (and to any later distributed reads).
+		const storageRepo = (node as any).storageRepo;
+		if (!storageRepo) {
+			throw new Error('storageRepo not available on node');
+		}
 
 		// Create key network implementation using libp2p
 		const keyNetwork = new Libp2pKeyPeerNetwork(node);
@@ -548,11 +551,11 @@ class PeerSession {
 		const session = this.requireSession();
 
 		if (session.diaries.size === 0) {
-			console.log('📁 No diaries created yet');
+			console.log('📁 No diaries opened this session');
 			return;
 		}
 
-		console.log('📚 Created diaries:');
+		console.log('📚 Diaries opened this session (not a complete list of persisted diaries):');
 		for (const [name, _] of session.diaries) {
 			console.log(`  - ${name}`);
 		}
