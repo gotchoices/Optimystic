@@ -68,6 +68,6 @@
     "@noble/hashes": "^2.0.1",
     "debug": "^4.4.3",
     "multiformats": "^13.4.2",
-    "uint8arrays": "^5.1.0"
+    "uint8arrays": "^6.1.1"
   }
 }

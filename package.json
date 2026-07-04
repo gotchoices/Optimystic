@@ -30,6 +30,7 @@
   "devDependencies": {
     "@eslint/js": "^9.18.0",
     "@types/node": "^22.13.10",
+    "@yarnpkg/types": "^4.0.1",
     "bumpp": "^10.4.0",
     "eslint": "^9.18.0",
     "prettier": "^3.6.2",
