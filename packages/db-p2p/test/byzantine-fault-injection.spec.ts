@@ -700,9 +700,11 @@ describe('Byzantine Fault Injection (TEST-10.4.1)', () => {
 
 			try {
 				await member.update(withPromise);
-				expect.fail('Should have thrown for missing public key');
+				expect.fail('Should have rejected missing public key');
 			} catch (err) {
-				expect((err as Error).message).to.include('No public key');
+				// A missing key means the identity is unproven: verifySignature now returns a reject outcome
+				// (rather than throwing "No public key"), so validateSignatures surfaces the rejection.
+				expect((err as Error).message).to.include('Invalid promise signature');
 			}
 		});
 
@@ -745,6 +747,96 @@ describe('Byzantine Fault Injection (TEST-10.4.1)', () => {
 			} catch (err) {
 				expect((err as Error).message).to.include('Invalid promise signature');
 			}
+		});
+	});
+
+	describe('peer-id key binding', () => {
+		// The attack the "wrong public key" test above does NOT cover: instead of embedding a key the
+		// attacker cannot sign for, the coordinator embeds a key it DOES control under the victim's id and
+		// signs the vote with that key. The signature then verifies against the embedded key — only a check
+		// that the key is the one the peer id provably names catches it.
+		it('coordinator cannot forge a promise from a victim by attaching its own key under the victim id', async () => {
+			const honest = await makeKeyPair();
+			const victim = await makeKeyPair();   // honest peer the attacker wants to impersonate/frame
+			const minted = await makeKeyPair();   // coordinator's fabricated key
+			const victimId = victim.peerId.toString();
+			const reputation = new PeerReputationService();
+
+			// victimId carries the MINTED (attacker-controlled) key rather than the victim's real key.
+			const peers: ClusterPeers = {
+				[honest.peerId.toString()]: {
+					multiaddrs: ['/ip4/127.0.0.1/tcp/8000'],
+					publicKey: uint8ArrayToString(honest.peerId.publicKey!.raw, 'base64url')
+				},
+				[victimId]: {
+					multiaddrs: ['/ip4/127.0.0.1/tcp/8000'],
+					publicKey: uint8ArrayToString(minted.peerId.publicKey!.raw, 'base64url')
+				}
+			};
+
+			const member = clusterMember({
+				storageRepo: mockRepo,
+				peerNetwork: mockNetwork,
+				peerId: honest.peerId,
+				privateKey: honest.privateKey,
+				reputation
+			});
+
+			const record = await createClusterRecord(peers, makeGetOperation(['block-1']));
+			// Signed with the minted key (which matches the embedded publicKey) but attributed to victimId.
+			const forgedPromise = await makeSignedPromise(minted.privateKey, record);
+			const attackRecord: ClusterRecord = {
+				...record,
+				promises: { [victimId]: forgedPromise }
+			};
+
+			try {
+				await member.update(attackRecord);
+				expect.fail('Should have rejected a key not bound to the peer id');
+			} catch (err) {
+				expect((err as Error).message).to.include('Invalid promise signature');
+			}
+
+			// Reputation framing guard: the victim's identity was never proven, so it must NOT be penalized.
+			const summary = reputation.getReputation(victimId);
+			expect(summary.penaltyCount).to.equal(0);
+		});
+
+		it('penalizes a bound-key bad signature (identity proven, signature garbage)', async () => {
+			// Counterpart to the framing test: when the embedded key IS bound to the peer id, a failed
+			// signature verify is a genuine bad vote from that proven identity → penalty is applied.
+			const honest = await makeKeyPair();
+			const other = await makeKeyPair();
+			const otherId = other.peerId.toString();
+			const peers = makeClusterPeers([honest, other]); // otherId carries its own (bound) key
+			const reputation = new PeerReputationService();
+
+			const member = clusterMember({
+				storageRepo: mockRepo,
+				peerNetwork: mockNetwork,
+				peerId: honest.peerId,
+				privateKey: honest.privateKey,
+				reputation
+			});
+
+			const record = await createClusterRecord(peers, makeGetOperation(['block-1']));
+			// Random 64 bytes — a well-formed but invalid Ed25519 signature over the bound key.
+			const garbageSig = uint8ArrayToString(crypto.getRandomValues(new Uint8Array(64)), 'base64url');
+			const attackRecord: ClusterRecord = {
+				...record,
+				promises: { [otherId]: { type: 'approve', signature: garbageSig } }
+			};
+
+			try {
+				await member.update(attackRecord);
+				expect.fail('Should have rejected the invalid signature');
+			} catch (err) {
+				expect((err as Error).message).to.include('Invalid promise signature');
+			}
+
+			// Bound identity + bad signature ⇒ InvalidSignature penalty (weight 50).
+			const summary = reputation.getReputation(otherId);
+			expect(summary.penaltyCount).to.equal(1);
 		});
 	});
 

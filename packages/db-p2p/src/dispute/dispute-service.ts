@@ -6,6 +6,7 @@ import { sha256 } from 'multiformats/hashes/sha2';
 import { base58btc } from 'multiformats/bases/base58';
 import { toString as uint8ArrayToString, fromString as uint8ArrayFromString } from 'uint8arrays';
 import { publicKeyFromRaw } from '@libp2p/crypto/keys';
+import { peerIdBindsPublicKey } from '../cluster/peer-key-binding.js';
 import type {
 	ValidationEvidence,
 	DisputeChallenge,
@@ -23,6 +24,18 @@ import type { IPeerNetwork } from '@optimystic/db-core';
 import type { DisputeClient } from './client.js';
 
 const log = createLogger('dispute');
+
+/**
+ * Deterministic JSON (sorts object keys) — must match `ClusterMember.canonicalJson` in `cluster-repo.ts`,
+ * since we reconstruct the exact promise-vote preimage the cluster path signed to re-verify approvals here.
+ */
+function canonicalJson(value: unknown): string {
+	return JSON.stringify(value, (_, v) =>
+		v && typeof v === 'object' && !Array.isArray(v)
+			? Object.keys(v).sort().reduce((o: Record<string, unknown>, k) => { o[k] = v[k]; return o; }, {})
+			: v
+	);
+}
 
 /** Callback to create a DisputeClient for a given peer */
 export type CreateDisputeClient = (peerId: PeerId) => DisputeClient;
@@ -195,7 +208,7 @@ export class DisputeService {
 
 		// Send challenge to all arbitrators and collect votes
 		const votes = await this.collectVotes(challenge, arbitrators);
-		const resolution = this.resolveDispute(challenge, votes);
+		const resolution = await this.resolveDispute(challenge, votes);
 
 		this.resolvedChallenges.set(disputeId, challenge);
 		this.activeDisputes.delete(disputeId);
@@ -234,10 +247,12 @@ export class DisputeService {
 		const targetHash = await this.computeChallengeTargetHash(challenge);
 		const setHash = await computeArbitratorSetHash(challenge.arbitratorSet ?? []);
 
-		// Verify the challenge signature
+		// Verify the challenge signature — bound to the challenger's id so a relay cannot attach a key it
+		// controls under some other peer's id and pass a forged challenge as that peer.
 		const validSignature = await this.verifyDisputeSignature(
 			challenge.disputeId,
 			challenge.signature,
+			challenge.challengerPeerId,
 			challenge.originalRecord.peers[challenge.challengerPeerId]?.publicKey
 		);
 
@@ -351,7 +366,7 @@ export class DisputeService {
 	}
 
 	/** Determine dispute resolution from collected votes */
-	resolveDispute(challenge: DisputeChallenge, votes: ArbitrationVote[]): DisputeResolution {
+	async resolveDispute(challenge: DisputeChallenge, votes: ArbitrationVote[]): Promise<DisputeResolution> {
 		const challengerVotes = votes.filter(v => v.vote === 'agree-with-challenger').length;
 		const majorityVotes = votes.filter(v => v.vote === 'agree-with-majority').length;
 		const totalDecisive = challengerVotes + majorityVotes;
@@ -366,11 +381,21 @@ export class DisputeService {
 			outcome = 'inconclusive';
 		} else if (challengerVotes >= superMajorityThreshold) {
 			outcome = 'challenger-wins';
-			// Penalize majority peers who approved the transaction
+			// Penalize majority peers who approved the transaction. The promise signatures in a challenge's
+			// originalRecord are NOT otherwise verified on the dispute path, so an attacker who crafts a
+			// challenge carrying a fabricated originalRecord could attach a forged approval under an honest
+			// peer's id to get that peer a FalseApproval penalty. Gate each false-approval on the approval
+			// being binding-valid (key bound to the id AND signature verifies); skip — never penalize —
+			// any approval that is unbound or invalid.
 			const originalRecord = challenge.originalRecord;
+			const promiseHash = await this.computePromiseHash(originalRecord);
 			for (const [peerId, signature] of Object.entries(originalRecord.promises)) {
 				if (signature.type === 'approve' && peerId !== challenge.challengerPeerId) {
-					affectedPeers.push({ peerId, reason: 'false-approval' });
+					if (await this.verifyPromiseSignature(originalRecord, peerId, promiseHash, signature)) {
+						affectedPeers.push({ peerId, reason: 'false-approval' });
+					} else {
+						log('dispute-skip-unverified-approval', { disputeId: challenge.disputeId, peerId });
+					}
 				}
 			}
 		} else if (majorityVotes >= superMajorityThreshold) {
@@ -583,6 +608,7 @@ export class DisputeService {
 	private async verifyDisputeSignature(
 		disputeId: string,
 		signature: string,
+		challengerPeerId: string,
 		publicKey?: string | Uint8Array
 	): Promise<boolean> {
 		if (!publicKey?.length) return false;
@@ -590,9 +616,52 @@ export class DisputeService {
 			const keyBytes = typeof publicKey === 'string'
 				? uint8ArrayFromString(publicKey, 'base64url')
 				: publicKey;
+			// The key must be the one the challenger's id provably names, else a forged challenge could be
+			// attributed to any peer id while signed by a key the relay controls.
+			if (!peerIdBindsPublicKey(challengerPeerId, keyBytes)) return false;
 			const pubKey = publicKeyFromRaw(keyBytes);
 			const payload = new TextEncoder().encode(disputeId);
 			const sigBytes = uint8ArrayFromString(signature, 'base64url');
+			return pubKey.verify(payload, sigBytes);
+		} catch {
+			return false;
+		}
+	}
+
+	/**
+	 * Reconstruct the cluster promise-vote hash for `record` — `base64url(sha256(messageHash + canonicalJson(message)))`
+	 * — identical to `ClusterMember.computePromiseHash`. The promise signatures in a disputed record were
+	 * produced over this by the cluster path, so re-verifying an approval requires reproducing it here.
+	 */
+	private async computePromiseHash(record: ClusterRecord): Promise<string> {
+		const msgBytes = new TextEncoder().encode(record.messageHash + canonicalJson(record.message));
+		const hashBytes = await sha256.digest(msgBytes);
+		return uint8ArrayToString(hashBytes.digest, 'base64url');
+	}
+
+	/**
+	 * True iff `signature` on `record` is a binding-valid promise vote from `peerId`: the record's key for
+	 * `peerId` must be the one that id provably names AND the signature must verify over the reconstructed
+	 * promise-vote preimage. Total: returns `false` (never throws) on a missing/unbound/malformed key or an
+	 * undecodable signature. Mirrors `ClusterMember.verifySignature`'s binding-then-verify order.
+	 */
+	private async verifyPromiseSignature(
+		record: ClusterRecord,
+		peerId: string,
+		promiseHash: string,
+		signature: { type: string; signature: string; rejectReason?: string }
+	): Promise<boolean> {
+		const publicKey = record.peers[peerId]?.publicKey;
+		if (!publicKey?.length) return false;
+		try {
+			const keyBytes = typeof publicKey === 'string'
+				? uint8ArrayFromString(publicKey, 'base64url')
+				: publicKey;
+			if (!peerIdBindsPublicKey(peerId, keyBytes)) return false;
+			const pubKey = publicKeyFromRaw(keyBytes);
+			const payloadStr = promiseHash + ':' + signature.type + (signature.rejectReason ? ':' + signature.rejectReason : '');
+			const payload = new TextEncoder().encode(payloadStr);
+			const sigBytes = uint8ArrayFromString(signature.signature, 'base64url');
 			return pubKey.verify(payload, sigBytes);
 		} catch {
 			return false;

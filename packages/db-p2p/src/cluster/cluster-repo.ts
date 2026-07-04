@@ -8,6 +8,7 @@ import { ClusterClient } from "./client.js";
 import type { PeerId, PrivateKey } from "@libp2p/interface";
 import { peerIdFromString } from "@libp2p/peer-id";
 import { publicKeyFromRaw } from "@libp2p/crypto/keys";
+import { peerIdBindsPublicKey } from "./peer-key-binding.js";
 import { sha256 } from "multiformats/hashes/sha2";
 import { base58btc } from "multiformats/bases/base58";
 import { toString as uint8ArrayToString, fromString as uint8ArrayFromString } from 'uint8arrays';
@@ -36,6 +37,18 @@ interface TransactionState {
 	resolutionTimeout?: NodeJS.Timeout;
 	lastUpdate: number;
 }
+
+/**
+ * Result of verifying one vote signature. `penalize` distinguishes "identity was never proven"
+ * (no key / not Ed25519 / key not bound to the peer id / malformed input — reject, but do NOT
+ * report the named peer, whose id may have been attacker-chosen) from "the key IS the one the
+ * peer id names, yet the signature does not verify" (reject AND report — a genuine bad vote from
+ * that proven identity). Collapsing both into a bare `false` would let a coordinator get an honest
+ * peer penalized just by attaching a key it controls under that peer's id.
+ */
+type VerifyOutcome =
+	| { valid: true }
+	| { valid: false; penalize: boolean };
 
 /**
  * Actively reconciles a block this member committed without having seen the matching
@@ -458,6 +471,10 @@ export class ClusterMember implements ICluster {
 		phase: 'promise' | 'commit',
 		messageHash: string
 	): Record<string, Signature> {
+		// NOTE: relies on validateSignatures() (via validateRecord in processUpdate) having already run on
+		// every record reaching here, so each peerId's signature is key-bound. Without that guarantee the
+		// Equivocation penalty below would act on self-asserted, unverified peer ids and could frame an
+		// honest peer. Do not call this on unvalidated signatures.
 		const merged = { ...existing };
 
 		for (const [peerId, incomingSig] of Object.entries(incoming)) {
@@ -516,11 +533,16 @@ export class ClusterMember implements ICluster {
 	}
 
 	private async validateSignatures(record: ClusterRecord): Promise<void> {
-		// Validate promise signatures
+		// Validate promise signatures. Reject on any failure, but only report an InvalidSignature
+		// penalty when the key was proven to belong to `peerId` (outcome.penalize) — otherwise the id
+		// is attacker-chosen and reporting it would let a coordinator frame an honest peer.
 		const promiseHash = await this.computePromiseHash(record);
 		for (const [peerId, signature] of Object.entries(record.promises)) {
-			if (!await this.verifySignature(record, peerId, promiseHash, signature)) {
-				this.reputation?.reportPeer(peerId, PenaltyReason.InvalidSignature, `promise:${record.messageHash}`);
+			const outcome = await this.verifySignature(record, peerId, promiseHash, signature);
+			if (!outcome.valid) {
+				if (outcome.penalize) {
+					this.reputation?.reportPeer(peerId, PenaltyReason.InvalidSignature, `promise:${record.messageHash}`);
+				}
 				throw new Error(`Invalid promise signature from ${peerId}`);
 			}
 		}
@@ -528,8 +550,11 @@ export class ClusterMember implements ICluster {
 		// Validate commit signatures
 		const commitHash = await this.computeCommitHash(record);
 		for (const [peerId, signature] of Object.entries(record.commits)) {
-			if (!await this.verifySignature(record, peerId, commitHash, signature)) {
-				this.reputation?.reportPeer(peerId, PenaltyReason.InvalidSignature, `commit:${record.messageHash}`);
+			const outcome = await this.verifySignature(record, peerId, commitHash, signature);
+			if (!outcome.valid) {
+				if (outcome.penalize) {
+					this.reputation?.reportPeer(peerId, PenaltyReason.InvalidSignature, `commit:${record.messageHash}`);
+				}
 				throw new Error(`Invalid commit signature from ${peerId}`);
 			}
 		}
@@ -567,17 +592,53 @@ export class ClusterMember implements ICluster {
 		return uint8ArrayToString(sigBytes, 'base64url');
 	}
 
-	private async verifySignature(record: ClusterRecord, peerId: string, hash: string, signature: Signature): Promise<boolean> {
+	/**
+	 * Verify one vote signature and classify the outcome (see {@link VerifyOutcome}). Total on hostile
+	 * input: a missing/empty key, a non-Ed25519 id, a key not bound to `peerId`, or malformed bytes all
+	 * yield `{ valid:false, penalize:false }` (reject without penalizing an unproven identity) rather
+	 * than throwing. Only after the key is proven to be the one `peerId` names does a failed
+	 * cryptographic verify yield `{ valid:false, penalize:true }`.
+	 *
+	 * NOTE: the binding check (`peerIdBindsPublicKey`) proves the vote was signed by the key `peerId`
+	 * names — it does NOT establish that `peerId` is legitimately in the cohort. A coordinator minting
+	 * fresh keypairs and using each key's own derived id passes this for every one. Sybil/cohort
+	 * membership is a separate layer (cohort-topic membership certificates), not solved here.
+	 */
+	private async verifySignature(record: ClusterRecord, peerId: string, hash: string, signature: Signature): Promise<VerifyOutcome> {
 		const peerInfo = record.peers[peerId];
 		if (!peerInfo?.publicKey?.length) {
-			throw new Error(`No public key for peer ${peerId}`);
+			// No key to check against — identity not proven. Reject without penalty.
+			return { valid: false, penalize: false };
 		}
-		// publicKey is base64url-encoded string (JSON-serialization safe)
-		const keyBytes = uint8ArrayFromString(peerInfo.publicKey, 'base64url');
-		const pubKey = publicKeyFromRaw(keyBytes);
-		const payload = this.computeSigningPayload(hash, signature.type, signature.rejectReason);
-		const sigBytes = uint8ArrayFromString(signature.signature, 'base64url');
-		return pubKey.verify(payload, sigBytes);
+		let keyBytes: Uint8Array;
+		try {
+			// publicKey is base64url-encoded string (JSON-serialization safe)
+			keyBytes = uint8ArrayFromString(peerInfo.publicKey, 'base64url');
+		} catch {
+			return { valid: false, penalize: false };
+		}
+		// The key must be the one `peerId` provably names, else the vote could be attributed to any peer
+		// id while signed by a key the coordinator controls. Binding failure ⇒ identity unproven ⇒ no penalty.
+		if (!peerIdBindsPublicKey(peerId, keyBytes)) {
+			return { valid: false, penalize: false };
+		}
+		try {
+			const pubKey = publicKeyFromRaw(keyBytes);
+			const payload = this.computeSigningPayload(hash, signature.type, signature.rejectReason);
+			const sigBytes = uint8ArrayFromString(signature.signature, 'base64url');
+			const ok = await pubKey.verify(payload, sigBytes);
+			// Key is bound to peerId: a failed verify is a genuine bad vote from a proven identity → penalize.
+			// NOTE: residual — an Ed25519 peer's public key is derivable from its (public) id, so an attacker
+			// can attach a victim's REAL key with a garbage signature and still trip this InvalidSignature
+			// penalty on the victim. Binding narrows framing (the attacker must use the victim's own key, not
+			// an arbitrary one) but cannot eliminate it here: a single signature can't distinguish "victim
+			// signed badly" from "someone pasted the victim's public key + junk". Fully closing it needs an
+			// authenticated membership/channel layer (cohort-topic membership certs), out of scope for this fix.
+			return ok ? { valid: true } : { valid: false, penalize: true };
+		} catch {
+			// Malformed signature bytes / key decode failure: reject, but do not penalize on unparseable input.
+			return { valid: false, penalize: false };
+		}
 	}
 
 	private async getTransactionPhase(record: ClusterRecord): Promise<TransactionPhase> {

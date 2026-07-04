@@ -539,7 +539,7 @@ describe('DisputeService', () => {
 				{ version: 'v3', disputeId: 'test-resolve-1', arbitratorPeerId: 'arb-3', vote: 'agree-with-majority', evidence: makeEvidence(), signature: 's3' },
 			];
 
-			const resolution = svc.resolveDispute(challenge, votes);
+			const resolution = await svc.resolveDispute(challenge, votes);
 			expect(resolution.outcome).to.equal('challenger-wins');
 			// Should penalize the 2 majority peers who approved
 			expect(resolution.affectedPeers.length).to.equal(2);
@@ -569,7 +569,7 @@ describe('DisputeService', () => {
 				{ version: 'v3', disputeId: 'test-resolve-2', arbitratorPeerId: 'arb-3', vote: 'agree-with-challenger', evidence: makeEvidence(), signature: 's3' },
 			];
 
-			const resolution = svc.resolveDispute(challenge, votes);
+			const resolution = await svc.resolveDispute(challenge, votes);
 			expect(resolution.outcome).to.equal('majority-wins');
 			expect(resolution.affectedPeers.length).to.equal(1);
 			expect(resolution.affectedPeers[0]!.peerId).to.equal(challenger.peerId.toString());
@@ -600,7 +600,7 @@ describe('DisputeService', () => {
 				{ version: 'v3', disputeId: 'test-resolve-3', arbitratorPeerId: 'arb-3', vote: 'inconclusive', evidence: makeEvidence(), signature: 's3' },
 			];
 
-			const resolution = svc.resolveDispute(challenge, votes);
+			const resolution = await svc.resolveDispute(challenge, votes);
 			expect(resolution.outcome).to.equal('inconclusive');
 			expect(resolution.affectedPeers.length).to.equal(0);
 		});
@@ -628,8 +628,66 @@ describe('DisputeService', () => {
 				{ version: 'v3', disputeId: 'test-resolve-4', arbitratorPeerId: 'arb-2', vote: 'inconclusive', evidence: makeEvidence(), signature: 's2' },
 			];
 
-			const resolution = svc.resolveDispute(challenge, votes);
+			const resolution = await svc.resolveDispute(challenge, votes);
 			expect(resolution.outcome).to.equal('inconclusive');
+		});
+
+		it('does not frame a peer whose approval carries a key not bound to its id', async () => {
+			// An attacker can craft a challenge whose originalRecord contains a forged approval attributed
+			// to an honest victim (the attacker attaches a key it controls under the victim's id and signs
+			// with it). Without the binding gate, a challenger-wins resolution would slap a FalseApproval
+			// penalty on that honest victim. The gate skips any approval that is not binding-valid.
+			const challenger = clusterPeers[0]!;
+			const honestA = clusterPeers[1]!;
+			const honestB = clusterPeers[2]!;
+			const svc = createDisputeService(challenger);
+
+			const record = await makeClusterRecord(
+				[challenger, honestA, honestB],
+				'block-1',
+				{ rejectPeers: new Set([challenger.peerId.toString()]) }
+			);
+
+			// Frame the victim: minted key it controls under the victim's id + a matching forged approval.
+			const victim = await makeKeyPair();
+			const minted = await makeKeyPair();
+			const victimId = victim.peerId.toString();
+			record.peers[victimId] = {
+				multiaddrs: ['/ip4/127.0.0.1/tcp/8000'],
+				publicKey: uint8ArrayToString(minted.peerId.publicKey!.raw, 'base64url'),
+			};
+			const promiseHashBytes = await sha256.digest(
+				new TextEncoder().encode(record.messageHash + canonicalJson(record.message))
+			);
+			const promiseHash = uint8ArrayToString(promiseHashBytes.digest, 'base64url');
+			const forgedSigBytes = await minted.privateKey.sign(new TextEncoder().encode(promiseHash + ':approve'));
+			record.promises[victimId] = { type: 'approve', signature: uint8ArrayToString(forgedSigBytes, 'base64url') };
+
+			const challenge: DisputeChallenge = {
+				disputeId: 'test-framing-1',
+				originalMessageHash: record.messageHash,
+				originalRecord: record,
+				challengerPeerId: challenger.peerId.toString(),
+				challengerEvidence: makeEvidence('hash-A'),
+				signature: 'sig',
+				timestamp: Date.now(),
+				expiration: Date.now() + 60000,
+			};
+
+			const votes: ArbitrationVote[] = [
+				{ version: 'v3', disputeId: 'test-framing-1', arbitratorPeerId: 'arb-1', vote: 'agree-with-challenger', evidence: makeEvidence(), signature: 's1' },
+				{ version: 'v3', disputeId: 'test-framing-1', arbitratorPeerId: 'arb-2', vote: 'agree-with-challenger', evidence: makeEvidence(), signature: 's2' },
+				{ version: 'v3', disputeId: 'test-framing-1', arbitratorPeerId: 'arb-3', vote: 'agree-with-challenger', evidence: makeEvidence(), signature: 's3' },
+			];
+
+			const resolution = await svc.resolveDispute(challenge, votes);
+			expect(resolution.outcome).to.equal('challenger-wins');
+			// The two honest approvers (binding-valid) are penalized; the framed victim (unbound key) is not.
+			const affectedIds = resolution.affectedPeers.map(p => p.peerId);
+			expect(affectedIds).to.include(honestA.peerId.toString());
+			expect(affectedIds).to.include(honestB.peerId.toString());
+			expect(affectedIds).to.not.include(victimId);
+			expect(resolution.affectedPeers.length).to.equal(2);
 		});
 	});
 
