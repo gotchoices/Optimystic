@@ -119,6 +119,26 @@ class MockRepo implements IRepo {
 	}
 }
 
+/**
+ * MockRepo whose `pend` throws a transient fault the first `throwCount` times it is
+ * called (before recording the call), then behaves like MockRepo. Models a transient
+ * storage I/O fault inside applyConsensusOperation so handleConsensus reaches its catch.
+ */
+class ThrowOncePendRepo extends MockRepo {
+	throwCount: number;
+	constructor(throwCount = 1) {
+		super();
+		this.throwCount = throwCount;
+	}
+	override async pend(request: PendRequest): Promise<PendResult> {
+		if (this.throwCount > 0) {
+			this.throwCount--;
+			throw new Error('transient storage I/O fault');
+		}
+		return super.pend(request);
+	}
+}
+
 class MockPeerNetwork implements IPeerNetwork {
 	async connect(_peerId: PeerId, _protocol: string): Promise<any> {
 		return {};
@@ -891,6 +911,88 @@ describe('ClusterMember', () => {
 			// mockRepo2 should have zero pend calls — execution was prevented by persistent dedup
 			expect(mockRepo2.pendCalls.length).to.equal(0);
 			restartedMember.dispose();
+		});
+
+		it('does not persist the durable executed marker when apply throws, and redelivery re-runs the dropped operation', async () => {
+			const stateStore = new MemoryTransactionStateStore();
+			const throwingRepo = new ThrowOncePendRepo(1);
+			const member = clusterMember({
+				storageRepo: throwingRepo,
+				peerNetwork: mockNetwork,
+				peerId: selfKeyPair.peerId,
+				privateKey: selfKeyPair.privateKey,
+				stateStore
+			});
+
+			const peers = makeClusterPeers([selfKeyPair]);
+			const record = await createClusterRecord(peers, makePendOperation('a1', 'block-1'));
+
+			// Drive to consensus: promise phase, then commit phase reaches consensus and
+			// invokes handleConsensus, where throwingRepo.pend throws → applyConsensusOperation
+			// throws → handleConsensus rolls back the in-memory guard and rethrows.
+			const afterPromise = await member.update(record);
+			let threw = false;
+			try {
+				await member.update(afterPromise);
+			} catch (err) {
+				threw = true;
+				expect((err as Error).message).to.equal('transient storage I/O fault');
+			}
+			expect(threw, 'handleConsensus must rethrow the transient apply fault').to.equal(true);
+
+			// The transient pend threw before recording, so nothing was applied.
+			expect(throwingRepo.pendCalls.length).to.equal(0);
+			// In-memory guard rolled back by the catch block.
+			expect(member.wasTransactionExecuted(record.messageHash)).to.equal(false);
+			// The durable marker must NEVER have been written — it lands only after apply
+			// succeeds. Give any (incorrect) fire-and-forget write a chance to land first.
+			await new Promise(resolve => setTimeout(resolve, 50));
+			expect(await stateStore.wasExecuted(record.messageHash)).to.equal(false);
+			member.dispose();
+
+			// Redeliver the same consensus record against a fresh, non-throwing repo sharing
+			// the same persistent store (post-restart). Because the durable marker was never
+			// written, the operation must actually re-run rather than being silently skipped.
+			const healthyRepo = new MockRepo();
+			const restartedMember = clusterMember({
+				storageRepo: healthyRepo,
+				peerNetwork: mockNetwork,
+				peerId: selfKeyPair.peerId,
+				privateKey: selfKeyPair.privateKey,
+				stateStore
+			});
+			const commitSig = await makeSignedCommit(selfKeyPair.privateKey, afterPromise);
+			const fullRecord: ClusterRecord = {
+				...afterPromise,
+				commits: { ...afterPromise.commits, [selfKeyPair.peerId.toString()]: commitSig }
+			};
+			await restartedMember.update(fullRecord);
+			expect(healthyRepo.pendCalls.length).to.equal(1);
+			// Apply succeeded this time, so the durable marker is now set.
+			await new Promise(resolve => setTimeout(resolve, 50));
+			expect(await stateStore.wasExecuted(record.messageHash)).to.equal(true);
+			restartedMember.dispose();
+		});
+
+		it('a second in-flight consensus delivery for the same hash does not double-apply', async () => {
+			const peers = makeClusterPeers([selfKeyPair]);
+			const record = await createClusterRecord(peers, makePendOperation('a1', 'block-1'));
+			const afterPromise = await clusterMemberInstance.update(record);
+			const commitSig = await makeSignedCommit(selfKeyPair.privateKey, afterPromise);
+			const fullRecord: ClusterRecord = {
+				...afterPromise,
+				commits: { ...afterPromise.commits, [selfKeyPair.peerId.toString()]: commitSig }
+			};
+
+			// Two concurrent deliveries of the same consensus record. The synchronous
+			// in-memory check-and-set guard (plus update() serialization) must ensure the
+			// operation is applied exactly once.
+			await Promise.all([
+				clusterMemberInstance.update(fullRecord),
+				clusterMemberInstance.update(fullRecord)
+			]);
+
+			expect(mockRepo.pendCalls.length).to.equal(1);
 		});
 	});
 

@@ -784,9 +784,12 @@ export class ClusterMember implements ICluster {
 	 * @warning This method executes on ALL cluster peers, not just the coordinator.
 	 * Each peer independently applies the operations to its local storage.
 	 *
-	 * @pitfall **Check-then-act race** - Must check AND mark as executed atomically
-	 * (before any `await`) to prevent duplicate execution. JavaScript's single-threaded
-	 * nature makes synchronous check-and-set atomic.
+	 * @pitfall **Check-then-act race** - The in-memory guard must be checked AND set
+	 * atomically (before any `await`) to prevent duplicate execution; JavaScript's
+	 * single-threaded nature makes that synchronous check-and-set atomic. The durable
+	 * marker, by contrast, is persisted only *after* apply succeeds — writing it eagerly
+	 * would leave a stuck marker on a caught fault or a crash mid-apply, silently dropping
+	 * the transaction on this member on redelivery.
 	 *
 	 * @pitfall **Independent node storage** - Each node has its own storage. After consensus,
 	 * each node applies operations locally. Nodes must fetch missing blocks from cluster
@@ -808,24 +811,39 @@ export class ClusterMember implements ICluster {
 			log('cluster-member:consensus-already-executed', { messageHash: record.messageHash });
 			return;
 		}
-		// Mark as executing IMMEDIATELY before any async operations
+		// Set the in-memory guard IMMEDIATELY, before any async operations: its synchronous
+		// check-and-set (line above's `has` + this `set`) is what prevents the concurrent
+		// apply-window race where two handleConsensus calls for the same hash both pass the
+		// async check. The durable marker is deliberately NOT written here — see below.
 		const executedAt = Date.now();
 		this.executedTransactions.set(record.messageHash, executedAt);
-		this.stateStore?.markExecuted(record.messageHash, executedAt)
-			.catch(err => log('cluster-member:persist-executed-error', { messageHash: record.messageHash, error: (err as Error).message }));
 
 		try {
 			for (const operation of record.message.operations) {
 				await this.applyConsensusOperation(record, operation);
 			}
 		} catch (err) {
-			// A genuinely unexpected fault (e.g. storage I/O) — roll back the executed
+			// A genuinely unexpected fault (e.g. storage I/O) — roll back the in-memory
 			// marker so a corrected retry can re-run, and propagate so the caller learns
-			// the real cause. Recoverable local divergence is absorbed inside
-			// applyConsensusOperation and never reaches here.
+			// the real cause. The durable marker was never written (it lands only after
+			// apply succeeds, below), so there is nothing to roll back. Recoverable local
+			// divergence is absorbed inside applyConsensusOperation and never reaches here.
 			this.executedTransactions.delete(record.messageHash);
 			throw err;
 		}
+
+		// Persist the durable marker only now that apply has actually succeeded. Writing it
+		// eagerly (before the loop) would leave a stuck marker on a caught fault OR a crash
+		// mid-apply, and on redelivery handleConsensus short-circuits at the async
+		// wasTransactionExecuted check — silently dropping the transaction on this member
+		// forever. The durable marker exists only for post-restart dedup (the in-memory map
+		// is empty after restart), and the narrow window between "apply succeeded" and
+		// "durable write landed" is safe to re-run on restart: re-applying an
+		// already-applied consensus transaction is idempotent (the "ahead" divergence path
+		// in applyConsensusOperation tolerates it as a no-op), so it converges rather than
+		// dropping. Fire-and-forget: a persist failure must not fail the apply that succeeded.
+		this.stateStore?.markExecuted(record.messageHash, executedAt)
+			.catch(err => log('cluster-member:persist-executed-error', { messageHash: record.messageHash, error: (err as Error).message }));
 	}
 
 	/**
