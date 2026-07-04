@@ -10,8 +10,6 @@
     ]
   },
   "resolutions": {
-    "@quereus/quereus": "portal:../quereus/packages/quereus",
-    "p2p-fret": "portal:../Fret/packages/fret",
     "protons-runtime": "^6.0.0",
     "uint8arrays": "^6.1.1"
   },
@@ -25,7 +23,9 @@
     "release": "yarn bump && yarn pub",
     "pub": "yarn build && yarn workspaces foreach -Apt --no-private npm publish --access public",
     "upgrade:fret": "ncu -u --workspaces --filter 'p2p-fret'",
-    "upgrade:quereus": "ncu -u --workspaces --filter '@quereus/*'"
+    "upgrade:quereus": "ncu -u --workspaces --filter '@quereus/*'",
+    "dev:link": "yarn link -r ../quereus/packages/quereus ../Fret/packages/fret",
+    "dev:unlink": "yarn unlink ../quereus/packages/quereus ../Fret/packages/fret"
   },
   "devDependencies": {
     "@eslint/js": "^9.18.0",

@@ -66,10 +66,10 @@
     "uint8arrays": "^6.1.1"
   },
   "peerDependencies": {
-    "@quereus/quereus": "^0.16.2"
+    "@quereus/quereus": "^4.3.0"
   },
   "engines": {
-    "quereus": "^0.16.2"
+    "quereus": "^4.3.0"
   },
   "keywords": [
     "quereus-plugin",

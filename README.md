@@ -33,6 +33,48 @@ See the following documentation:
 * **Demo** - packages/demo - Hello world demo app exercising Tree and Diary collections across the full stack
 * **Substrate Simulator** - packages/substrate-simulator - Discrete-event virtual-clock engine for the design simulator (mock-only dev tooling; not shipped to runtime consumers)
 
+## Installation
+
+A fresh clone installs with no other repositories checked out:
+
+```bash
+yarn install
+```
+
+The two dependencies that used to require sibling checkouts — `@quereus/quereus`
+and `p2p-fret` — now resolve to their published npm versions by default. CI and
+new contributors need nothing beyond this repo.
+
+### Local co-development against sibling repos (opt-in)
+
+If you are changing `@quereus/quereus` or `p2p-fret` alongside Optimystic, check
+those repos out next to this one so the relative paths line up:
+
+```
+<parent>/
+  optimystic/                 ← this repo
+  quereus/packages/quereus    ← @quereus/quereus source
+  Fret/packages/fret          ← p2p-fret source
+```
+
+Then overlay the local sources with:
+
+```bash
+yarn dev:link      # point @quereus/quereus + p2p-fret at the sibling checkouts
+yarn dev:unlink    # revert to the published npm versions
+```
+
+`dev:link` uses `yarn link`, which writes `portal:` `resolutions` entries into
+the tracked root `package.json`. **Do not commit those lines** — they only make
+sense on a machine that has the sibling repos. Run `yarn dev:unlink` (and
+re-`yarn install`) before committing. If you accidentally staged them, drop the
+two `portal:` `resolutions` entries and the regenerated `yarn.lock` before
+pushing.
+
+<!-- NOTE: dev:link writes portal: resolutions into the tracked package.json;
+     a co-developer must not commit them. If this bites someone, a pre-commit
+     guard rejecting a `portal:` resolution is a reasonable future hardening. -->
+
 ## How to use:
 
 ### Host a stand-alone node

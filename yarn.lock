@@ -1573,7 +1573,7 @@ __metadata:
     typescript: "npm:^5.9.3"
     uint8arrays: "npm:^6.1.1"
   peerDependencies:
-    "@quereus/quereus": ^0.16.2
+    "@quereus/quereus": ^4.3.0
   languageName: unknown
   linkType: soft
 
@@ -1609,7 +1609,7 @@ __metadata:
     typescript: "npm:^5.9.3"
     uint8arrays: "npm:^6.1.1"
   peerDependencies:
-    "@quereus/quereus": ^0.16.2
+    "@quereus/quereus": ^4.3.0
   languageName: unknown
   linkType: soft
 
@@ -1643,12 +1643,15 @@ __metadata:
   version: 0.0.0-use.local
   resolution: "@optimystic/substrate-simulator@workspace:packages/substrate-simulator"
   dependencies:
+    "@libp2p/interface": "npm:^3.1.0"
+    "@libp2p/peer-id": "npm:^6.0.4"
     "@types/chai": "npm:^5.2.3"
     "@types/mocha": "npm:^10.0.10"
     "@types/node": "npm:^25.1.0"
     chai: "npm:^6.2.2"
+    libp2p: "npm:^3.1.3"
     mocha: "npm:^11.7.5"
-    p2p-fret: "portal:../../../Fret/packages/fret"
+    p2p-fret: "npm:^0.6.0"
     rimraf: "npm:^6.1.2"
     ts-node: "npm:^10.9.2"
     typescript: "npm:^5.9.3"
@@ -1662,9 +1665,9 @@ __metadata:
   languageName: node
   linkType: hard
 
-"@quereus/quereus@portal:../quereus/packages/quereus::locator=%40optimystic%2Foptimystic%40workspace%3A.":
-  version: 0.0.0-use.local
-  resolution: "@quereus/quereus@portal:../quereus/packages/quereus::locator=%40optimystic%2Foptimystic%40workspace%3A."
+"@quereus/quereus@npm:^4.3.0":
+  version: 4.3.0
+  resolution: "@quereus/quereus@npm:4.3.0"
   dependencies:
     debug: "npm:^4.4.3"
     fast-json-patch: "npm:^3.1.1"
@@ -1672,8 +1675,9 @@ __metadata:
     moat-maker: "npm:^2.2.0"
     temporal-polyfill: "npm:^0.3.0"
     uint8arrays: "npm:^6.1.1"
+  checksum: 10c0/d9ed52f1c8c85411fe6f040a1fc092092e9e03e3bed56c962ad92aefa767d41b4dc2c5b94a2113652f2ec2fbda035bff69983184ac5ed8bfc826b924d7287578
   languageName: node
-  linkType: soft
+  linkType: hard
 
 "@rollup/rollup-android-arm-eabi@npm:4.52.5":
   version: 4.52.5
@@ -4417,9 +4421,9 @@ __metadata:
   languageName: node
   linkType: hard
 
-"p2p-fret@portal:../Fret/packages/fret::locator=%40optimystic%2Foptimystic%40workspace%3A.":
-  version: 0.0.0-use.local
-  resolution: "p2p-fret@portal:../Fret/packages/fret::locator=%40optimystic%2Foptimystic%40workspace%3A."
+"p2p-fret@npm:^0.6.0":
+  version: 0.6.0
+  resolution: "p2p-fret@npm:0.6.0"
   dependencies:
     "@libp2p/logger": "npm:^6.2.2"
     "@multiformats/multiaddr": "npm:^13.0.1"
@@ -4430,8 +4434,9 @@ __metadata:
     "@libp2p/interface": ^3.1.0
     "@libp2p/peer-id": ^6.0.4
     libp2p: ^3.1.3
+  checksum: 10c0/8750d8e4b0067a0f3c097fcfda86d00dd62c69e290e1b4052ad57bab2faaf93ecf36ed4e3983f9397967839010f9bab057c6c1a7abd5d545a473e81def657e60
   languageName: node
-  linkType: soft
+  linkType: hard
 
 "package-json-from-dist@npm:^1.0.0, package-json-from-dist@npm:^1.0.1":
   version: 1.0.1
