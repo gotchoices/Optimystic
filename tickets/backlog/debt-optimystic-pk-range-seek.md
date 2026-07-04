@@ -1,5 +1,5 @@
 description: Speed up primary-key range queries (like "id > 100") by jumping straight to the matching rows instead of scanning the whole table — only safe once the table's sort order is fixed.
-prereq: optimystic-tree-comparator-lexicographic-missort
+prereq: debt-optimystic-true-key-ordering
 files: packages/quereus-plugin-optimystic/src/optimystic-module.ts, packages/quereus-plugin-optimystic/src/schema/row-codec.ts
 ----
 
@@ -26,10 +26,12 @@ not:
   `createPrimaryKeyComparator` is dead code (`row-codec.ts:249-252`).
 
 So a `KeyRange` built today would bracket the wrong rows for numeric / DESC /
-non-BINARY keys. `optimystic-tree-comparator-lexicographic-missort` (sq-2) fixes
-the comparator and encoding; this seek builds on that. Only after sq-2 may
-`getBestAccessPlan` re-advertise the range as handled (and, where sq-2 allows,
-`providesOrdering`).
+non-BINARY keys. Note: `optimystic-tree-comparator-lexicographic-missort` was
+resolved by `optimystic-ordering-claim-guard`, which only made the planner stop
+*promising* orders the tree can't deliver — it did **not** make tree order match
+value order. The actual encoding/comparator fix (which this seek builds on) is
+`debt-optimystic-true-key-ordering`. Only after that lands may `getBestAccessPlan`
+re-advertise the range as handled (and, where it allows, `providesOrdering`).
 
 ## What to build
 
