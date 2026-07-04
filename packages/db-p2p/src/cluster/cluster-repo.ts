@@ -338,10 +338,7 @@ export class ClusterMember implements ICluster {
 						log('cluster-member:action-consensus-after-commit', {
 							messageHash: record.messageHash
 						});
-						// Check persistent store for post-recovery dedup before synchronous guard
-						if (!await this.wasTransactionExecutedAsync(currentRecord.messageHash)) {
-							await this.handleConsensus(currentRecord);
-						}
+						await this.handleConsensus(currentRecord);
 					}
 				}
 				shouldPersist = false;
@@ -350,12 +347,7 @@ export class ClusterMember implements ICluster {
 				log('cluster-member:action-consensus', {
 					messageHash: record.messageHash
 				});
-				// Check persistent store for post-recovery dedup before synchronous guard
-				if (await this.wasTransactionExecutedAsync(currentRecord.messageHash)) {
-					log('cluster-member:consensus-already-executed', { messageHash: record.messageHash });
-				} else {
-					await this.handleConsensus(currentRecord);
-				}
+				await this.handleConsensus(currentRecord);
 				// Don't call clearTransaction here - it happens in handleConsensus
 				shouldPersist = false;
 				break;
@@ -432,10 +424,10 @@ export class ClusterMember implements ICluster {
 		if (existing.messageHash !== incoming.messageHash) {
 			throw new Error('Message hash mismatch');
 		}
-		if (JSON.stringify(existing.message) !== JSON.stringify(incoming.message)) {
+		if (ClusterMember.canonicalJson(existing.message) !== ClusterMember.canonicalJson(incoming.message)) {
 			throw new Error('Message content mismatch');
 		}
-		if (JSON.stringify(existing.peers) !== JSON.stringify(incoming.peers)) {
+		if (ClusterMember.canonicalJson(existing.peers) !== ClusterMember.canonicalJson(incoming.peers)) {
 			throw new Error('Peers mismatch');
 		}
 
@@ -742,8 +734,14 @@ export class ClusterMember implements ICluster {
 	 * @see docs/internals.md "Check-Then-Act Race in Consensus" and "Independent Node Storage" pitfalls
 	 */
 	private async handleConsensus(record: ClusterRecord): Promise<void> {
+		// Check persistent store first for post-recovery dedup (in-memory map is cleared on restart).
+		// wasTransactionExecutedAsync also checks the in-memory map as a fast path.
+		if (await this.wasTransactionExecutedAsync(record.messageHash)) {
+			log('cluster-member:consensus-already-executed', { messageHash: record.messageHash });
+			return;
+		}
 		// Check-and-set ATOMICALLY to prevent race condition where multiple calls
-		// pass the check before any completes. Since JavaScript is single-threaded,
+		// pass the async check before any completes. Since JavaScript is single-threaded,
 		// this synchronous check-and-set is atomic before any await.
 		if (this.executedTransactions.has(record.messageHash)) {
 			log('cluster-member:consensus-already-executed', { messageHash: record.messageHash });

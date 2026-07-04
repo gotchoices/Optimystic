@@ -1,19 +1,11 @@
 export async function first<T>(
-	createIterable: (signal: AbortSignal) => AsyncIterable<T>,
-	onEmpty: () => T = () => { throw new Error('No items found') },
-	timeoutMs?: number
+	createIterable: () => AsyncIterable<T>,
+	onEmpty: () => T = () => { throw new Error('No items found') }
 ): Promise<T> {
-	const controller = new AbortController();
-	const timer = typeof timeoutMs === 'number' ? setTimeout(() => controller.abort(), timeoutMs) : undefined;
-	try {
-		for await (const item of createIterable(controller.signal)) {
-			return item;
-		}
-		return onEmpty();
-	} finally {
-		if (timer !== undefined) clearTimeout(timer);
-		controller.abort();
+	for await (const item of createIterable()) {
+		return item;
 	}
+	return onEmpty();
 }
 
 export async function asyncIteratorToArray<T>(iterator: AsyncIterable<T>): Promise<T[]> {
