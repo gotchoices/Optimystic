@@ -4,6 +4,7 @@ import { buildSyncProtocol, type SyncRequest, type SyncResponse } from './protoc
 import { pipe } from 'it-pipe';
 import { toString as u8ToString } from 'uint8arrays/to-string';
 import * as lp from 'it-length-prefixed';
+import { MAX_CONTROL_MESSAGE_BYTES } from '../protocol-limits.js';
 import type { Uint8ArrayList } from 'uint8arraylist';
 
 export interface SyncServiceInit {
@@ -114,7 +115,7 @@ export class SyncService implements Startable {
 				const actualStream = stream.stream ?? stream;
 				const responses = pipe(
 					actualStream,
-					(source: any) => lp.decode(source),
+					(source: any) => lp.decode(source, { maxDataLength: MAX_CONTROL_MESSAGE_BYTES }),
 					processStream,
 					(source: any) => lp.encode(source)
 				);

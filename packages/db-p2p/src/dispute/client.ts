@@ -1,6 +1,7 @@
 import type { PeerId, IPeerNetwork } from '@optimystic/db-core';
 import { ProtocolClient } from '../protocol-client.js';
 import { DEFAULT_DIAL_TIMEOUT_MS, withRpcDeadlineDefaults, type RpcDeadlineOptions } from '../rpc-deadline.js';
+import { MAX_CONTROL_MESSAGE_BYTES } from '../protocol-limits.js';
 import type { DisputeChallenge, DisputeResolution, ArbitrationVote, DisputeMessage } from './types.js';
 
 /**
@@ -32,7 +33,7 @@ export class DisputeClient extends ProtocolClient {
 		const response = await this.processMessage<{ type: 'vote'; vote: ArbitrationVote }>(
 			message,
 			this.protocol,
-			{ signal, dialTimeoutMs: DEFAULT_DIAL_TIMEOUT_MS }
+			{ signal, dialTimeoutMs: DEFAULT_DIAL_TIMEOUT_MS, maxDataLength: MAX_CONTROL_MESSAGE_BYTES }
 		);
 		return response.vote;
 	}
@@ -45,7 +46,7 @@ export class DisputeClient extends ProtocolClient {
 		await this.processMessage<{ type: 'ack' }>(
 			message,
 			this.protocol,
-			withRpcDeadlineDefaults(options),
+			{ ...withRpcDeadlineDefaults(options), maxDataLength: MAX_CONTROL_MESSAGE_BYTES },
 		);
 	}
 }

@@ -4,6 +4,7 @@ import { ProtocolClient } from '../protocol-client.js';
 import { peerIdFromString } from '@libp2p/peer-id';
 import { isClusterErrorEnvelope, clusterErrorFromEnvelope } from './cluster-error.js';
 import { withRpcDeadlineDefaults, type RpcDeadlineOptions } from '../rpc-deadline.js';
+import { MAX_CONTROL_MESSAGE_BYTES } from '../protocol-limits.js';
 
 export class ClusterClient extends ProtocolClient implements ICluster {
 	private constructor(peerId: PeerId, peerNetwork: IPeerNetwork, readonly protocolPrefix?: string) {
@@ -27,7 +28,8 @@ export class ClusterClient extends ProtocolClient implements ICluster {
 		const protocol = (this.protocolPrefix ?? '/db-p2p') + '/cluster/1.0.0';
 		// Apply the client-level dial/response deadline so a silent cluster peer
 		// can't hang the coordinator forever; an explicit caller override wins.
-		const response = await this.processMessage<unknown>(message, protocol, withRpcDeadlineDefaults(options));
+		// Response is a ClusterRecord (peer set + signatures + small metadata) → control cap.
+		const response = await this.processMessage<unknown>(message, protocol, { ...withRpcDeadlineDefaults(options), maxDataLength: MAX_CONTROL_MESSAGE_BYTES });
 
 		// A member that threw inside `update` replies with a structured error
 		// envelope rather than aborting the stream; rethrow the server's real

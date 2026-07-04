@@ -2,6 +2,7 @@ import { pipe } from 'it-pipe';
 import { decode as lpDecode, encode as lpEncode } from 'it-length-prefixed';
 import type { Startable, Logger, Stream, Connection, StreamHandler } from '@libp2p/interface';
 import type { Uint8ArrayList } from 'uint8arraylist';
+import { MAX_CONTROL_MESSAGE_BYTES } from '../protocol-limits.js';
 import type { DisputeMessage } from './types.js';
 import type { DisputeService } from './dispute-service.js';
 
@@ -95,6 +96,11 @@ export class DisputeProtocolService implements Startable {
 				}
 
 				yield new TextEncoder().encode(JSON.stringify(response));
+				// One request per stream: every real DisputeClient sends exactly one
+				// request per dial (see ProtocolClient.processMessage), so complete the
+				// generator after the first response. A second frame a peer queued is then
+				// never read or parsed. Mirrors sync/block-transfer.
+				return;
 			}
 		};
 
@@ -102,7 +108,7 @@ export class DisputeProtocolService implements Startable {
 			try {
 				const responses = pipe(
 					stream,
-					(source) => lpDecode(source),
+					(source) => lpDecode(source, { maxDataLength: MAX_CONTROL_MESSAGE_BYTES }),
 					processStream.bind(this),
 					(source) => lpEncode(source)
 				);

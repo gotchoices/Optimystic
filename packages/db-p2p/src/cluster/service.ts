@@ -5,6 +5,7 @@ import type { Startable, Logger, Stream, Connection, StreamHandler, PeerId } fro
 import type { ICluster, ClusterRecord } from '@optimystic/db-core';
 import { encodePeers, type RedirectPayload } from '../repo/redirect.js';
 import { toClusterErrorEnvelope } from './cluster-error.js';
+import { MAX_CONTROL_MESSAGE_BYTES } from '../protocol-limits.js';
 import type { Uint8ArrayList } from 'uint8arraylist';
 
 interface BaseComponents {
@@ -204,6 +205,11 @@ export class ClusterService implements Startable {
 
 				// Encode and yield the response
 				yield new TextEncoder().encode(JSON.stringify(response));
+				// One request per stream: every real ClusterClient sends exactly one
+				// request per dial (see ProtocolClient.processMessage), so complete the
+				// generator after the first response. A second frame a peer queued is
+				// then never read or parsed. Mirrors sync/block-transfer.
+				return;
 			}
 		};
 
@@ -211,7 +217,7 @@ export class ClusterService implements Startable {
 			try {
 				const responses = pipe(
 					stream,
-					(source) => lpDecode(source),
+					(source) => lpDecode(source, { maxDataLength: MAX_CONTROL_MESSAGE_BYTES }),
 					processStream.bind(this),
 					(source) => lpEncode(source)
 				);

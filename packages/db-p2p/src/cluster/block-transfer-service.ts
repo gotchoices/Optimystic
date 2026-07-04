@@ -5,6 +5,7 @@ import * as lp from 'it-length-prefixed';
 import { fromString as u8FromString } from 'uint8arrays/from-string';
 import { toString as u8ToString } from 'uint8arrays/to-string';
 import { ProtocolClient } from '../protocol-client.js';
+import { MAX_BLOCK_MESSAGE_BYTES } from '../protocol-limits.js';
 import { createLogger } from '../logger.js';
 
 const log = createLogger('block-transfer-service');
@@ -125,7 +126,7 @@ export class BlockTransferService implements Startable {
 			// keeps both sides live.
 			const responses = pipe(
 				stream,
-				(source) => lp.decode(source),
+				(source) => lp.decode(source, { maxDataLength: MAX_BLOCK_MESSAGE_BYTES }),
 				async function* (source) {
 					for await (const msg of source) {
 						const request = JSON.parse(u8ToString(msg.subarray(), 'utf8')) as BlockTransferRequest;
@@ -263,7 +264,7 @@ export class BlockTransferClient extends ProtocolClient {
 		options?: { signal?: AbortSignal; dialTimeoutMs?: number; responseTimeoutMs?: number }
 	): Promise<BlockTransferResponse> {
 		const request: BlockTransferRequest = { type: 'pull', blockIds, reason };
-		return await this.processMessage<BlockTransferResponse>(request, this.protocol, options);
+		return await this.processMessage<BlockTransferResponse>(request, this.protocol, { ...options, maxDataLength: MAX_BLOCK_MESSAGE_BYTES });
 	}
 
 	/**
@@ -291,6 +292,6 @@ export class BlockTransferClient extends ProtocolClient {
 			blockData[blockIds[i]!] = Buffer.from(blockDataBuffers[i]!).toString('base64');
 		}
 		const request: BlockTransferRequest = { type: 'push', blockIds, reason, blockData, ...(blockMeta ? { blockMeta } : {}) };
-		return await this.processMessage<BlockTransferResponse>(request, this.protocol, options);
+		return await this.processMessage<BlockTransferResponse>(request, this.protocol, { ...options, maxDataLength: MAX_BLOCK_MESSAGE_BYTES });
 	}
 }

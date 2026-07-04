@@ -5,6 +5,7 @@ import type { IRepo, RepoMessage } from '@optimystic/db-core'
 import { blockIdsForTransforms } from '@optimystic/db-core'
 import { peersEqual } from '../peer-utils.js'
 import { encodePeers, type RedirectPayload } from './redirect.js'
+import { MAX_BLOCK_MESSAGE_BYTES } from '../protocol-limits.js'
 import type { Uint8ArrayList } from 'uint8arraylist'
 import { createLogger } from '../logger.js'
 
@@ -267,6 +268,11 @@ export class RepoService implements Startable {
 
 				// Encode and yield the response
 				yield new TextEncoder().encode(JSON.stringify(response))
+				// One request per stream: every real RepoClient sends exactly one request
+				// per dial (see ProtocolClient.processMessage), so complete the generator
+				// after the first response. A second frame a peer queued is then never read
+				// or parsed. Mirrors sync/block-transfer.
+				return
 			}
 		}
 
@@ -274,7 +280,7 @@ export class RepoService implements Startable {
 			try {
 				const responses = pipe(
 					stream,
-					(source) => lpDecode(source),
+					(source) => lpDecode(source, { maxDataLength: MAX_BLOCK_MESSAGE_BYTES }),
 					processStream.bind(this),
 					(source) => lpEncode(source)
 				)

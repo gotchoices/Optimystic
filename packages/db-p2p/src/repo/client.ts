@@ -5,6 +5,7 @@ import type {
 import type { RepoMessage } from "@optimystic/db-core";
 import { blockIdsForTransforms, blockIdToBytes } from "@optimystic/db-core";
 import { ProtocolClient } from "../protocol-client.js";
+import { MAX_BLOCK_MESSAGE_BYTES } from "../protocol-limits.js";
 import { peerIdFromString } from "@libp2p/peer-id";
 
 export class RepoClient extends ProtocolClient implements IRepo {
@@ -94,6 +95,8 @@ export class RepoClient extends ProtocolClient implements IRepo {
 				signal: combinedSignal,
 				correlationId,
 				dialTimeoutMs: options?.dialTimeoutMs,
+				// A get response carries block data → block cap (not control).
+				maxDataLength: MAX_BLOCK_MESSAGE_BYTES,
 			})
 		} finally {
 			clearTimeout(timer)

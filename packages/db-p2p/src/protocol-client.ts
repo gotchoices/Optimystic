@@ -4,6 +4,7 @@ import type { Stream as Libp2pStream } from '@libp2p/interface';
 import type { PeerId, IPeerNetwork } from '@optimystic/db-core';
 import { first } from './it-utility.js';
 import { createLogger } from './logger.js';
+import { MAX_BLOCK_MESSAGE_BYTES } from './protocol-limits.js';
 
 const log = createLogger('protocol-client');
 
@@ -50,7 +51,7 @@ export class ProtocolClient {
 	protected async processMessage<T>(
 		message: unknown,
 		protocol: string,
-		options?: { signal?: AbortSignal; correlationId?: string; dialTimeoutMs?: number; responseTimeoutMs?: number }
+		options?: { signal?: AbortSignal; correlationId?: string; dialTimeoutMs?: number; responseTimeoutMs?: number; maxDataLength?: number }
 	): Promise<T> {
 		const peer = this.peerId.toString();
 		const cid = options?.correlationId;
@@ -144,11 +145,17 @@ export class ProtocolClient {
 				stream.send(chunk);
 			}
 
-			// Read the response from the stream (which is now directly AsyncIterable)
+			// Read the response from the stream (which is now directly AsyncIterable).
+			// Cap the response frame size so a peer can't flood the client with an
+			// oversized reply; each caller passes the cap matching its response shape
+			// (control vs block), defaulting to the block cap so no existing caller
+			// regresses. An oversized frame rejects at the length-prefix (before
+			// allocation) and surfaces through the read's catch, tearing the stream down.
+			const maxDataLength = options?.maxDataLength ?? MAX_BLOCK_MESSAGE_BYTES;
 			let firstByte = true;
 			const source = pipe(
 				stream,
-				lpDecode,
+				(source) => lpDecode(source, { maxDataLength }),
 				async function* (source) {
 					for await (const data of source) {
 						if (firstByte) {
