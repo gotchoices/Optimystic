@@ -672,6 +672,12 @@ export async function createLibp2pNodeBase(
 		// Content agreement: among archives corroborating the chosen (rev, actionId)
 		// and actually carrying the block, the content must be byte-identical across
 		// a quorum. A cohort member serving content that hashes differently is rejected.
+		// NOTE: selectQuorumBlock recomputes its quorum over only the block-CARRYING
+		// corroborators, not the full rev-responder set. If most peers corroborate the
+		// rev but few carry block bytes (e.g. mid-prune), the content quorum can shrink
+		// to 2. Harmless with honest peers; if a colluding pair ever becomes the only
+		// block-servers for an agreed rev, that is the Sybil regime already deferred to
+		// backlog `debt-read-repair-commit-cert-verification`.
 		const corroborating = candidates.filter(c => c.rev === selected.rev && c.actionId === selected.actionId && c.block);
 		const hashCandidates: BlockHashCandidate[] = await Promise.all(
 			corroborating.map(async c => ({ peerId: c.peerIdStr, hash: await canonicalBlockHash(c.block!), block: c.block! }))

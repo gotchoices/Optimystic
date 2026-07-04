@@ -282,11 +282,16 @@ saveMaterializedBlock(block): store(structuredClone(block));
   the executed marker and rethrows — same as an unexpected *thrown* fault
   (`applyConsensusOperation`).
 - **A *behind* member actively reconciles.** It holds no revision of the committed
-  blocks, so it pulls the committed revision from a cohort peer that holds it (via
-  the injected `reconcileBlock` callback — `SyncClient` fetch + `saveReplicatedBlock`
-  in `libp2p-node-base`) and restores it locally, repairing the under-replication
-  that lazy read-repair alone cannot (no reachable peer the reader sees holds the
-  newer rev). Reconciliation is best-effort and bounded (`ReconcileTimeoutMs`):
+  blocks, so it pulls the committed revision from the cohort (via the injected
+  `reconcileBlock` callback — `SyncClient` fetch + `saveReplicatedBlock` in
+  `libp2p-node-base`) and restores it locally, repairing the under-replication that
+  lazy read-repair alone cannot (no reachable peer the reader sees holds the newer
+  rev). It does **not** trust a single peer: the target `(rev, actionId)` must be
+  corroborated by a quorum of distinct cohort archives, and the block content must
+  hash byte-identically across a quorum, before it persists (`cluster/quorum-restore.ts`;
+  shared with `CoordinatorRepo` read-repair). No rev quorum, or no content quorum →
+  it leaves the block for a later churn/rebalance retry. Reconciliation is
+  best-effort and bounded (`ReconcileTimeoutMs`):
   failures/timeouts are logged (`cluster-member:consensus-commit-reconcile-failed`),
   never thrown. An *ahead* member already holds ≥ the rev, so it does not reconcile
   downward.

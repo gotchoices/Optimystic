@@ -356,7 +356,17 @@ export class CoordinatorRepo implements IRepo {
 		return { actionId: selected.actionId, rev: selected.rev };
 	}
 
-	/** Report peers whose reported latest provably contradicts the quorum-corroborated pair. Best-effort. */
+	/**
+	 * Report peers whose reported latest contradicts the quorum-corroborated pair. Best-effort.
+	 *
+	 * NOTE: the `rev > selected.rev` branch is NOT provable misbehavior — an honest
+	 * peer legitimately ahead of the sampled quorum (an in-flight commit it durably
+	 * stored, or other honest holders dropped from the sample by the 1s per-peer
+	 * timeout) reports a higher rev and gets penalized (weight 30 → immediate
+	 * deprioritize at threshold 20). Distinguishing a liar from an honest leader
+	 * needs the commit-cert verification tracked in backlog
+	 * `debt-read-repair-penalty-provable-only` / `debt-read-repair-commit-cert-verification`.
+	 */
 	private penalizeContradictingRevClaims(claims: RevClaim[], selected: QuorumRev, blockId: BlockId): void {
 		if (!this.reputation) return;
 		try {
