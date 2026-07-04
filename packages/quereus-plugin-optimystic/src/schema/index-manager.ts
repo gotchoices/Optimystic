@@ -131,6 +131,25 @@ export class IndexManager {
 	}
 
 	/**
+	 * Register a freshly built index tree under its name. Used by the vtab's
+	 * addIndex path to wire a newly created CREATE INDEX tree into this manager
+	 * after initialize() has already run. Overwrites any tree already registered
+	 * under the same name.
+	 */
+	registerIndexTree(name: string, tree: Tree<IndexKey, IndexEntry>): void {
+		this.indexTrees.set(name, tree);
+	}
+
+	/**
+	 * Swap the table schema this manager keys off. Used by addIndex to fold a
+	 * newly added index definition into the schema so subsequent insert/delete/
+	 * update staging iterates the new index alongside the existing ones.
+	 */
+	setSchema(schema: StoredTableSchema): void {
+		this.schema = schema;
+	}
+
+	/**
 	 * Create index key from row values
 	 */
 	createIndexKey(indexSchema: StoredIndexSchema, row: Row): IndexKey {

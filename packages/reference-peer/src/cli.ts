@@ -726,27 +726,41 @@ program
 	.description('Optimystic P2P Database Reference Peer')
 	.version('0.0.1');
 
+/**
+ * Apply the network/storage options shared verbatim by the `interactive`,
+ * `service`, and `run` commands. Extracted so the three stay in lockstep;
+ * command-specific options (e.g. `run`'s --action/--diary/--content) are layered
+ * on by each caller after this helper. Flag strings, descriptions, and defaults
+ * are identical to the previous inline copies, so each command's parsed
+ * `options` object is unchanged.
+ */
+function withCommonPeerOptions(cmd: Command): Command {
+	return cmd
+		.option('-p, --port <number>', 'Port to listen on', '0')
+		.option('--ws-port <number>', 'WebSocket port to listen on (e.g. 9091); enables /ws listen for browser/RN peers')
+		.option('--ws-host <ip>', 'Interface to bind the WS listener to', '0.0.0.0')
+		.option('--no-tcp', 'Disable the default TCP listen (browser-only bootstrap)')
+		.option('-b, --bootstrap <string>', 'Comma-separated list of bootstrap nodes')
+		.option('-i, --id <string>', 'Peer ID')
+		.option('--no-relay', 'Disable circuit-relay-v2 server (default: on for peers with an inbound listen address)')
+		.option('-n, --network <string>', 'Network name', 'optimystic')
+		.option('--fret-profile <profile>', "FRET profile: 'edge' or 'core'", 'edge')
+		.option('-s, --storage <type>', 'Storage type: memory or file', 'memory')
+		.option('--storage-path <path>', 'Path for file storage')
+		.option('--storage-capacity <bytes>', 'Override storage capacity in bytes (for ring selection)')
+		.option('--cluster-size <number>', 'Desired cluster size per key (positive integer)')
+		.option('--super-majority-threshold <number>', 'Super-majority threshold as a fraction in (0, 1] (default 0.67)')
+		.option('--offline', 'Run as single-node LocalTransactor (no distributed consensus)')
+		.option('--bootstrap-file <path>', 'Path to JSON containing bootstrap multiaddrs or node list')
+		.option('--announce-file <path>', 'Write node info (peerId, multiaddrs) to this JSON file for mesh launchers');
+}
+
 // Interactive mode - network-first approach
-program
-	.command('interactive')
-	.description('Start interactive mode (default behavior)')
-	.option('-p, --port <number>', 'Port to listen on', '0')
-	.option('--ws-port <number>', 'WebSocket port to listen on (e.g. 9091); enables /ws listen for browser/RN peers')
-	.option('--ws-host <ip>', 'Interface to bind the WS listener to', '0.0.0.0')
-	.option('--no-tcp', 'Disable the default TCP listen (browser-only bootstrap)')
-	.option('-b, --bootstrap <string>', 'Comma-separated list of bootstrap nodes')
-	.option('-i, --id <string>', 'Peer ID')
-	.option('--no-relay', 'Disable circuit-relay-v2 server (default: on for peers with an inbound listen address)')
-	.option('-n, --network <string>', 'Network name', 'optimystic')
-	.option('--fret-profile <profile>', "FRET profile: 'edge' or 'core'", 'edge')
-	.option('-s, --storage <type>', 'Storage type: memory or file', 'memory')
-	.option('--storage-path <path>', 'Path for file storage')
-	.option('--storage-capacity <bytes>', 'Override storage capacity in bytes (for ring selection)')
-	.option('--cluster-size <number>', 'Desired cluster size per key (positive integer)')
-	.option('--super-majority-threshold <number>', 'Super-majority threshold as a fraction in (0, 1] (default 0.67)')
-	.option('--offline', 'Run as single-node LocalTransactor (no distributed consensus)')
-	.option('--bootstrap-file <path>', 'Path to JSON containing bootstrap multiaddrs or node list')
-	.option('--announce-file <path>', 'Write node info (peerId, multiaddrs) to this JSON file for mesh launchers')
+withCommonPeerOptions(
+	program
+		.command('interactive')
+		.description('Start interactive mode (default behavior)')
+)
 	.action(async (options) => {
 		try {
 			await session.startNetwork(options);
@@ -763,26 +777,11 @@ program
 	});
 
 // Headless service node (no REPL); useful for mesh nodes in launch profiles
-program
-	.command('service')
-	.description('Start a headless service node (no interactive prompt)')
-	.option('-p, --port <number>', 'Port to listen on', '0')
-	.option('--ws-port <number>', 'WebSocket port to listen on (e.g. 9091); enables /ws listen for browser/RN peers')
-	.option('--ws-host <ip>', 'Interface to bind the WS listener to', '0.0.0.0')
-	.option('--no-tcp', 'Disable the default TCP listen (browser-only bootstrap)')
-	.option('-b, --bootstrap <string>', 'Comma-separated list of bootstrap nodes')
-	.option('--bootstrap-file <path>', 'Path to JSON containing bootstrap multiaddrs or node list')
-	.option('-i, --id <string>', 'Peer ID')
-	.option('--no-relay', 'Disable circuit-relay-v2 server (default: on for peers with an inbound listen address)')
-	.option('-n, --network <string>', 'Network name', 'optimystic')
-	.option('--fret-profile <profile>', "FRET profile: 'edge' or 'core'", 'edge')
-	.option('-s, --storage <type>', 'Storage type: memory or file', 'memory')
-	.option('--storage-path <path>', 'Path for file storage')
-	.option('--storage-capacity <bytes>', 'Override storage capacity in bytes (for ring selection)')
-	.option('--cluster-size <number>', 'Desired cluster size per key (positive integer)')
-	.option('--super-majority-threshold <number>', 'Super-majority threshold as a fraction in (0, 1] (default 0.67)')
-	.option('--offline', 'Run as single-node LocalTransactor (no distributed consensus)')
-	.option('--announce-file <path>', 'Write node info (peerId, multiaddrs) to this JSON file for mesh launchers')
+withCommonPeerOptions(
+	program
+		.command('service')
+		.description('Start a headless service node (no interactive prompt)')
+)
 	.action(async (options) => {
 		try {
 			await session.startNetwork(options);
@@ -800,27 +799,12 @@ program
 	});
 
 // Single-action mode commands
-program
-	.command('run')
-	.description('Connect to network, run a single action, optionally stay connected')
-	.option('-p, --port <number>', 'Port to listen on', '0')
-	.option('--ws-port <number>', 'WebSocket port to listen on (e.g. 9091); enables /ws listen for browser/RN peers')
-	.option('--ws-host <ip>', 'Interface to bind the WS listener to', '0.0.0.0')
-	.option('--no-tcp', 'Disable the default TCP listen (browser-only bootstrap)')
-	.option('-b, --bootstrap <string>', 'Comma-separated list of bootstrap nodes')
-	.option('-i, --id <string>', 'Peer ID')
-	.option('--no-relay', 'Disable circuit-relay-v2 server (default: on for peers with an inbound listen address)')
-	.option('-n, --network <string>', 'Network name', 'optimystic')
-	.option('--fret-profile <profile>', "FRET profile: 'edge' or 'core'", 'edge')
-	.option('-s, --storage <type>', 'Storage type: memory or file', 'memory')
-	.option('--storage-path <path>', 'Path for file storage')
-	.option('--storage-capacity <bytes>', 'Override storage capacity in bytes (for ring selection)')
-	.option('--cluster-size <number>', 'Desired cluster size per key (positive integer)')
-	.option('--super-majority-threshold <number>', 'Super-majority threshold as a fraction in (0, 1] (default 0.67)')
-	.option('--offline', 'Run as single-node LocalTransactor (no distributed consensus)')
-	.option('--bootstrap-file <path>', 'Path to JSON containing bootstrap multiaddrs or node list')
+withCommonPeerOptions(
+	program
+		.command('run')
+		.description('Connect to network, run a single action, optionally stay connected')
+)
 	.option('--stay-connected', 'Stay connected after action completes')
-	.option('--announce-file <path>', 'Write node info (peerId, multiaddrs) to this JSON file for mesh launchers')
 	.requiredOption('-a, --action <action>', 'Action to perform: create-diary, add-entry, list-diaries, read-diary')
 	.option('--diary <name>', 'Diary name (required for diary operations)')
 	.option('--content <content>', 'Entry content (required for add-entry)')

@@ -12,7 +12,7 @@ import type { ParsedOptimysticOptions, RowData } from './types.js';
 import type { IRawStorage } from '@optimystic/db-p2p';
 import { VirtualTable } from '@quereus/quereus';
 import { ConflictResolution, QuereusError, StatusCode } from '@quereus/quereus';
-import type { VirtualTableModule, BaseModuleConfig, Database, TableSchema, Row, FilterInfo, BestAccessPlanRequest, BestAccessPlanResult, OrderingSpec, VirtualTableConnection, TableIndexSchema as IndexSchema, UpdateArgs, UpdateResult, SqlValue } from '@quereus/quereus';
+import type { VirtualTableModule, BaseModuleConfig, Database, DatabaseInternal, TableSchema, Row, FilterInfo, BestAccessPlanRequest, BestAccessPlanResult, OrderingSpec, VirtualTableConnection, TableIndexSchema as IndexSchema, UpdateArgs, UpdateResult, SqlValue } from '@quereus/quereus';
 import { Tree } from '@optimystic/db-core';
 import { KeyRange } from '@optimystic/db-core';
 import type { CollectionChangeEvent, TreeReadView } from '@optimystic/db-core';
@@ -386,9 +386,11 @@ export class OptimysticVirtualTable extends VirtualTable {
    */
   async ensureConnectionRegistered(): Promise<OptimysticVirtualTableConnection> {
     if (!this.connection) {
-      // Check if there's already an active connection for this table in the database
-      // Using type assertion to access internal methods
-      const db = this.db as any;
+      // Check if there's already an active connection for this table in the database.
+      // registerConnection / getConnectionsForTable are declared on Quereus's
+      // DatabaseInternal interface (the documented extension-point for custom
+      // vtabs with transaction support), not the public Database type — cast once.
+      const db = this.db as DatabaseInternal;
       const existingConnections = db.getConnectionsForTable(this.tableName);
       if (existingConnections.length > 0 && existingConnections[0] instanceof OptimysticVirtualTableConnection) {
         this.connection = existingConnections[0] as OptimysticVirtualTableConnection;
@@ -1241,8 +1243,8 @@ export class OptimysticVirtualTable extends VirtualTable {
 
     // Add the index to the index manager
     if (this.indexManager) {
-      (this.indexManager as any).indexTrees.set(indexSchema.name, indexTree);
-      (this.indexManager as any).schema = updatedSchema;
+      this.indexManager.registerIndexTree(indexSchema.name, indexTree);
+      this.indexManager.setSchema(updatedSchema);
     }
 
     // Register the new index collection so a session-mode coordinator sees it.
@@ -1313,6 +1315,19 @@ export class OptimysticVirtualTable extends VirtualTable {
       this.setErrorMessage(message);
       throw new Error(message);
     }
+  }
+
+  /**
+   * Delete this table's own persisted schema entry as part of teardown. Reads
+   * its own transaction bridge for the active transactor and delegates to the
+   * schema manager. Called from the module's destroy() on the resolved sibling
+   * instance so the teardown path never reaches across this class's private
+   * members. Best-effort by contract: the caller wraps this in a try/catch so a
+   * schema-tree write failure can't stop teardown.
+   */
+  async deleteOwnSchema(tableName: string): Promise<void> {
+    const txnState = this.txnBridge.getCurrentTransaction();
+    await this.schemaManager.deleteSchema(tableName, txnState?.transactor);
   }
 }
 
@@ -1904,8 +1919,7 @@ export class OptimysticModule implements VirtualTableModule<VirtualTable, Optimy
       // so the storage listener doesn't leak past the table's lifetime.
       table.teardownChangeSubscription();
       try {
-        const txnState = (table as any).txnBridge?.getCurrentTransaction?.();
-        await (table as any).schemaManager.deleteSchema(tableName, txnState?.transactor);
+        await table.deleteOwnSchema(tableName);
       } catch {
         // Best-effort: a schema-tree write failure shouldn't stop teardown.
       }
