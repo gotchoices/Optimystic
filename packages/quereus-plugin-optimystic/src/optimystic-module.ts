@@ -1907,6 +1907,12 @@ export class OptimysticModule implements VirtualTableModule<VirtualTable, Optimy
     if (!col) return false;
 
     // TEXT is the only affinity stored as a raw, order-preserving string payload.
+    // NOTE: this gates on the *declared* physicalType, but the stored index payload is
+    // chosen by the runtime JS value type in serializeIndexValue() (string -> raw,
+    // number -> non-order-preserving toExponential). They agree only because Quereus
+    // coerces TEXT-affinity inserts to strings before they reach this vtab. If that
+    // coercion contract ever changes (a numeric value reaching a TEXT column un-coerced),
+    // the promise here would over-order — anchor the check to the persisted affinity then.
     if (col.logicalType?.physicalType !== PhysicalType.TEXT) return false;
 
     // The tree compares raw code units — that is BINARY. Any other declared

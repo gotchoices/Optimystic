@@ -171,6 +171,30 @@ describe('Ordering-claim guard (end-to-end SQL)', () => {
 		}
 	});
 
+	it('returns ASC + BINARY + TEXT rows correctly ordered when the guard DOES push the ordering down', async () => {
+		// Positive control: this is the one envelope the guard promises (ASC/BINARY/TEXT), so
+		// `providesOrdering` is set and the engine skips its own sort — trusting the tree to
+		// deliver order. If the tree ever mis-delivered a promised ordering, only an end-to-end
+		// assertion like this would catch it (the planner tests only prove the promise is made).
+		await db.exec(`
+			CREATE TABLE prods_text (
+				id INTEGER PRIMARY KEY,
+				category TEXT,
+				name TEXT
+			) USING optimystic('tree://test/ord_text')
+		`);
+		await db.exec('CREATE INDEX idx_cat_name ON prods_text(category, name)');
+		await db.exec(`
+			INSERT INTO prods_text (id, category, name) VALUES
+				(1, 'A', 'cherry'),
+				(2, 'A', 'apple'),
+				(3, 'A', 'banana')
+		`);
+
+		const rows = await collectRows(db.eval("SELECT name FROM prods_text WHERE category = 'A' ORDER BY category, name"));
+		expect(rows.map(r => r.name)).to.deep.equal(['apple', 'banana', 'cherry']);
+	});
+
 	it('returns numeric-suffix rows in true ascending order across an exponent-10 boundary', async () => {
 		// Prices 2, 5, 10, 100 in one category. The tree's toExponential(15) keying would
 		// yield 10, 100, 2, 5; a correct result must be 2, 5, 10, 100.
