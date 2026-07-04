@@ -263,9 +263,9 @@ describe('RowCodec', () => {
 			expect(cmp(pk1, pk2)).to.not.equal(0);
 		});
 
-		it('should lose text affinity for numeric-looking strings (known bug)', () => {
-			// BUG: deserializeKeyPart() always tries Number() first, ignoring column affinity.
-			// TEXT "123" is deserialized as number 123, so comparator uses numeric ordering.
+		it('should keep text affinity for numeric-looking strings (affinity-driven deserialize)', () => {
+			// deserializeKeyPart() is affinity-driven: a TEXT column keeps "123" as the
+			// string "123" (lexicographic), an INTEGER column parses it to the number 123.
 			const textSchema = makeSchema([{ name: 'id', affinity: 'TEXT' }]);
 			const textCodec = new RowCodec(textSchema);
 			const textCmp = textCodec.createPrimaryKeyComparator();
@@ -274,9 +274,9 @@ describe('RowCodec', () => {
 			const intCodec = new RowCodec(intSchema);
 			const intCmp = intCodec.createPrimaryKeyComparator();
 
-			// TEXT column: "123" vs "9" — should be lexicographic ("1" < "9"), but...
-			expect(textCmp('123', '9')).to.be.above(0); // BUG: numeric comparison used
-			// INTEGER column: 123 vs 9 — correctly numeric
+			// TEXT column: "123" vs "9" — lexicographic ("1" < "9"), so "123" < "9".
+			expect(textCmp('123', '9')).to.be.below(0);
+			// INTEGER column: 123 vs 9 — numeric, so 123 > 9.
 			expect(intCmp('123', '9')).to.be.above(0);
 		});
 
@@ -349,14 +349,14 @@ describe('RowCodec', () => {
 			expect(cmp(pk1, pk2)).to.not.equal(0);
 		});
 
-		it('should treat whitespace-only string as number 0 (known bug)', () => {
-			// BUG: Number(" ") === 0, so deserializeKeyPart treats space as 0
+		it('should keep whitespace-only string distinct from "0" (affinity-driven deserialize)', () => {
+			// Affinity-driven: a TEXT " " stays the string " " instead of Number(" ") === 0,
+			// so it sorts before "0" ( ' ' 0x20 < '0' 0x30 ) rather than comparing equal.
 			const schema = makeSchema([{ name: 'id', affinity: 'TEXT' }]);
 			const codec = new RowCodec(schema);
 			const cmp = codec.createPrimaryKeyComparator();
 
-			// Space key and "0" key should be different, but both deserialize to 0
-			expect(cmp(' ', '0')).to.equal(0); // BUG: space becomes number 0
+			expect(cmp(' ', '0')).to.be.below(0);
 		});
 
 		it('should NOT collide a \\x01NULL\\x01 literal with an actual null (framing fix)', () => {
@@ -372,14 +372,14 @@ describe('RowCodec', () => {
 			expect(cmp(nullPk, literalPk)).to.not.equal(0);
 		});
 
-		it('should treat scientific notation "1e2" as number 100 (known bug)', () => {
-			// BUG: deserializeKeyPart("1e2") → Number("1e2") → 100
-			// TEXT column with key "1e2" becomes indistinguishable from "100"
+		it('should keep scientific-notation "1e2" distinct from "100" (affinity-driven deserialize)', () => {
+			// Affinity-driven: a TEXT "1e2" stays the string "1e2" instead of Number("1e2") === 100,
+			// so it sorts by code units ('e' 0x65 > '0' 0x30 at index 1) rather than comparing equal.
 			const schema = makeSchema([{ name: 'id', affinity: 'TEXT' }]);
 			const codec = new RowCodec(schema);
 			const cmp = codec.createPrimaryKeyComparator();
 
-			expect(cmp('1e2', '100')).to.equal(0); // BUG: "1e2" treated as number 100
+			expect(cmp('1e2', '100')).to.be.above(0);
 		});
 
 		it('should handle hex strings like "0xff" in key deserialization', () => {

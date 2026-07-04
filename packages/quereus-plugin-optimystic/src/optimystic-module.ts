@@ -19,7 +19,7 @@ import type { CollectionChangeEvent, TreeReadView } from '@optimystic/db-core';
 import { SchemaManager } from './schema/schema-manager.js';
 import type { StoredTableSchema } from './schema/schema-manager.js';
 import { RowCodec, type EncodedRow } from './schema/row-codec.js';
-import { SqlDataType } from '@quereus/quereus';
+import { SqlDataType, PhysicalType } from '@quereus/quereus';
 import { INTEGER_TYPE, REAL_TYPE, TEXT_TYPE, BLOB_TYPE, NUMERIC_TYPE, NULL_TYPE, BOOLEAN_TYPE, type LogicalType } from '@quereus/quereus';
 import { IndexManager, serializeIndexValue, type IndexEntry } from './schema/index-manager.js';
 import { encodeKeyTuple } from './schema/key-encoding.js';
@@ -1829,7 +1829,7 @@ export class OptimysticModule implements VirtualTableModule<VirtualTable, Optimy
               `(selectivity: ${selectivity.toFixed(4)}, cost: ${indexCost.toFixed(2)})`;
 
             // Check if ORDER BY matches index order
-            if (request.requiredOrdering && this.orderingMatchesIndex(request.requiredOrdering, index)) {
+            if (request.requiredOrdering && this.orderingMatchesIndex(request.requiredOrdering, index, tableInfo)) {
               bestOrdering = [...request.requiredOrdering];
             }
           }
@@ -1851,36 +1851,27 @@ export class OptimysticModule implements VirtualTableModule<VirtualTable, Optimy
   }
 
   /**
-   * Helper: Check if required ordering matches primary key order
-   */
-  private orderingMatchesPrimaryKey(
-    requiredOrdering: readonly OrderingSpec[],
-    tableInfo: TableSchema
-  ): boolean {
-    const pkColumns = tableInfo.primaryKeyDefinition;
-    if (requiredOrdering.length > pkColumns.length) return false;
-
-    for (let i = 0; i < requiredOrdering.length; i++) {
-      const orderSpec = requiredOrdering[i];
-      const pkCol = pkColumns[i];
-
-      if (!orderSpec || !pkCol) return false;
-      if (orderSpec.columnIndex !== pkCol.index) return false;
-
-      // Check if sort direction matches
-      const pkDesc = pkCol.desc || false;
-      if (orderSpec.desc !== pkDesc) return false;
-    }
-
-    return true;
-  }
-
-  /**
-   * Helper: Check if required ordering matches index order
+   * Helper: Check if required ordering matches index order AND the storage tree
+   * can actually deliver it.
+   *
+   * The index tree is opened with a raw lexicographic string comparator
+   * (collection-factory.ts) and is only ever iterated forward. It therefore only
+   * *delivers* an ascending, BINARY-collated ordering over columns whose payload
+   * is the raw stored string (TEXT). Numeric columns are keyed via a
+   * non-order-preserving `toExponential(15)` payload, DESC needs reverse
+   * iteration, and non-BINARY collations need a collation-aware compare — none of
+   * which the tree provides. Promising `providesOrdering` for those cases makes
+   * the engine skip its own sort and return genuinely mis-ordered rows.
+   *
+   * So: match positionally (column + prefix length) AND require every ordered
+   * column to be ASC + BINARY + TEXT. Anything else → return false so the engine
+   * sorts (correct, just not pushed down). True numeric/DESC/collated ordering is
+   * gated work — see `debt-optimystic-true-key-ordering`.
    */
   private orderingMatchesIndex(
     requiredOrdering: readonly OrderingSpec[],
-    index: { columns: readonly { index: number; desc?: boolean }[] }
+    index: { columns: readonly { index: number; desc?: boolean }[] },
+    tableInfo: TableSchema
   ): boolean {
     if (requiredOrdering.length > index.columns.length) return false;
 
@@ -1891,10 +1882,37 @@ export class OptimysticModule implements VirtualTableModule<VirtualTable, Optimy
       if (!orderSpec || !indexCol) return false;
       if (orderSpec.columnIndex !== indexCol.index) return false;
 
-      // Check if sort direction matches
-      const indexDesc = indexCol.desc || false;
-      if (orderSpec.desc !== indexDesc) return false;
+      // Only promise the ordering the raw ascending lexicographic tree genuinely delivers.
+      if (!this.treeDeliversOrdering(orderSpec, tableInfo)) return false;
     }
+
+    return true;
+  }
+
+  /**
+   * True only when a raw lexicographic, ascending, forward-iterated tree scan
+   * coincides with the SQL order requested for this column: the request must be
+   * ASC, the column BINARY-collated, and its physical storage a raw string
+   * (TEXT). DESC, non-BINARY collations, and numeric/blob payloads are all
+   * encoded/iterated in a way the tree cannot reproduce, so the engine must sort.
+   */
+  private treeDeliversOrdering(
+    orderSpec: OrderingSpec,
+    tableInfo: TableSchema
+  ): boolean {
+    // Reverse iteration is not available: a forward-only tree can never provide DESC.
+    if (orderSpec.desc) return false;
+
+    const col = tableInfo.columns[orderSpec.columnIndex];
+    if (!col) return false;
+
+    // TEXT is the only affinity stored as a raw, order-preserving string payload.
+    if (col.logicalType?.physicalType !== PhysicalType.TEXT) return false;
+
+    // The tree compares raw code units — that is BINARY. Any other declared
+    // collation (NOCASE, RTRIM, custom) would order differently.
+    const collation = (col.collation || 'BINARY').toUpperCase();
+    if (collation !== 'BINARY') return false;
 
     return true;
   }

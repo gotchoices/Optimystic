@@ -248,15 +248,18 @@ export class RowCodec {
 
 		// NOTE: this comparator is currently dead code — the tree is opened with a raw
 		// lexicographic string comparator (collection-factory.ts), which the injective
-		// framing keeps correct on its own. sq-2 wires this up and reworks the per-part
-		// type-sniffing/collation logic; it inherits framing-aware decode from here.
+		// framing keeps correct on its own. debt-optimystic-true-key-ordering wires this
+		// up (gated on the debt-optimystic-key-format-migration decision because it flips
+		// stored order); the per-part decode below is already affinity-driven.
+		const affinities = pkDef.map(def => this.schema.columns[def.index]?.affinity);
+
 		return (a: string, b: string): -1 | 0 | 1 => {
 			const partsA = this.decodeKeyForCompare(a);
 			const partsB = this.decodeKeyForCompare(b);
 
 			for (let i = 0; i < pkDef.length; i++) {
-				const valueA = this.keyElementToValue(partsA[i]);
-				const valueB = this.keyElementToValue(partsB[i]);
+				const valueA = this.keyElementToValue(partsA[i], affinities[i]);
+				const valueB = this.keyElementToValue(partsB[i], affinities[i]);
 
 				const result = this.compareValues(valueA, valueB, collationFuncs[i]!);
 				if (result !== 0) {
@@ -275,12 +278,14 @@ export class RowCodec {
 	 * A key produced by {@link encodeKeyTuple} begins with a structural tag; it is
 	 * split element-by-element. A key that does not begin with a tag is a bare/legacy
 	 * value (as fed by some low-level comparator unit tests) and is treated as one raw
-	 * present element. sq-2 owns the eventual full decode and can drop this fallback.
+	 * present element. debt-optimystic-true-key-ordering owns the eventual full decode
+	 * and can drop this fallback.
 	 */
 	private decodeKeyForCompare(key: string): DecodedKeyElement[] {
 		// NOTE: legacy/raw fallback for un-framed keys, live only via low-level comparator
-		// unit tests while this comparator is dead code. sq-2 (which wires the comparator
-		// into the tree) should update those tests to feed framed keys and drop this branch.
+		// unit tests while this comparator is dead code. debt-optimystic-true-key-ordering
+		// (which wires the comparator into the tree) should update those tests to feed
+		// framed keys and drop this branch.
 		const lead = key[0];
 		if (lead === '\x00' || lead === '\x02') {
 			return splitKeyTuple(key);
@@ -289,26 +294,37 @@ export class RowCodec {
 	}
 
 	/** Map a decoded key element to its SQL value (missing element or NULL tag -> null). */
-	private keyElementToValue(element: DecodedKeyElement | undefined): SqlValue {
+	private keyElementToValue(element: DecodedKeyElement | undefined, affinity?: string): SqlValue {
 		if (!element || element.isNull) return null;
-		return this.deserializeKeyPart(element.payload);
+		return this.deserializeKeyPart(element.payload, affinity);
 	}
 
 	/**
-	 * Deserialize a present key-part payload back to its original value.
+	 * Deserialize a present key-part payload back to its original value, driven by the
+	 * column's declared affinity rather than by sniffing the string with `Number()`.
 	 *
 	 * NULL is no longer represented in-band (the framing carries it), so there is no
-	 * NULL sentinel here — this only ever sees present payloads. The numeric type-sniff
-	 * is sq-2's to fix; left as-is.
+	 * NULL sentinel here — this only ever sees present payloads. Affinity-driven decode
+	 * keeps a TEXT `"123"`, `" "`, `"1e2"`, or `"0xff"` as its exact string (the old
+	 * `Number()`-first sniff silently coerced all of those to numbers); only the numeric
+	 * affinities parse back to a number.
 	 */
-	private deserializeKeyPart(serialized: string): SqlValue {
-		// Try to parse as number
-		const num = Number(serialized);
-		if (!isNaN(num) && serialized !== '') {
-			return num;
+	private deserializeKeyPart(serialized: string, affinity?: string): SqlValue {
+		const aff = (affinity || '').toUpperCase();
+
+		if (aff === 'INTEGER' || aff === 'REAL' || aff === 'NUMERIC') {
+			// Numeric column: payload was `value.toString()` — parse it back.
+			// NOTE: `serialized.trim() !== ''` guards `Number(' ') === 0`; blank payloads
+			// never come from a numeric column today, so this only matters if/when this
+			// (currently dead) comparator is wired up — see debt-optimystic-true-key-ordering.
+			const num = Number(serialized);
+			if (!isNaN(num) && serialized.trim() !== '') {
+				return num;
+			}
+			return serialized;
 		}
 
-		// Otherwise treat as string
+		// TEXT / BLOB / unknown affinity: keep the raw string payload verbatim.
 		return serialized;
 	}
 

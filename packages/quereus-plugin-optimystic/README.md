@@ -79,7 +79,7 @@ CREATE TABLE products (
 
 You define your own schema — the plugin supports arbitrary columns and types. The primary key is serialized as the tree key using an order-preserving, injective tuple framing (see `src/schema/key-encoding.ts`) so composite keys and values containing control bytes never collide or mis-sort. Non-key columns are JSON-encoded as the tree value.
 
-Primary keys must be TEXT (tree keys are strings). Standard SQL operations (SELECT, INSERT, UPDATE, DELETE) all work. Point lookups on the primary key are optimized (O(log n) seek); range predicates (`>`, `>=`, `<`, `<=`) and all other predicates currently apply over a full scan.
+Primary keys should be TEXT for ordered/range performance; other types (INTEGER, REAL, …) work correctly but are not pushed down as ordered seeks — the tree keys them as raw strings that don't preserve numeric order, so the engine re-sorts them. Standard SQL operations (SELECT, INSERT, UPDATE, DELETE) all work regardless of key type. Point lookups on the primary key are optimized (O(log n) seek); range predicates (`>`, `>=`, `<`, `<=`) and all other predicates currently apply over a full scan. An `ORDER BY` is only served directly from an index (skipping the engine's sort) when every ordered column is ascending, BINARY-collated, and TEXT; anything else is sorted correctly by the engine.
 
 ## Transactions
 
@@ -226,7 +226,7 @@ For the full dialect reference, see the [Quereus SQL Reference](https://github.c
 
 ## Limitations
 
-- Primary keys must be TEXT type (tree keys are strings)
+- Primary keys are stored as strings; non-TEXT keys work correctly but are not order-optimised (the engine re-sorts them rather than reading them ordered from the tree)
 - `msgpack` encoding is declared but not yet implemented
 - Savepoints (including Quereus's internal statement-/row-level atomicity) work in legacy/single-node mode; in distributed-consensus (session) mode they are no-ops, so a mid-statement abort there can still leave partial rows staged
 - Cross-collection transactions not yet supported
