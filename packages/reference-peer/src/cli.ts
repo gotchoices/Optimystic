@@ -548,6 +548,9 @@ class PeerSession {
 	}
 
 	async listDiaries(): Promise<void> {
+		// NOTE: lists only diaries touched in this process session, not persisted state.
+		// No block-storage-level index of collection names exists, so enumerating persisted
+		// diaries would need a separate registry — a `feat-` ticket if ever required.
 		const session = this.requireSession();
 
 		if (session.diaries.size === 0) {
