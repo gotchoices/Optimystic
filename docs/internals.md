@@ -495,6 +495,16 @@ if (executed.has(hash)) return;
 executed.set(hash, now);  // Set IMMEDIATELY
 await doWork();
 ```
+**Two markers, two lifetimes.** The *in-memory* guard above must be set eagerly (before
+any `await`) — it is the synchronous check-and-set that closes the concurrent apply-window
+race. The *durable* marker (`stateStore.markExecuted`), used only for post-restart dedup,
+is the opposite: it is written **after** `doWork()` (the apply loop) succeeds. Writing it
+eagerly would leave a stuck marker on a caught fault or a crash mid-apply, and on
+redelivery `handleConsensus` would short-circuit at the async `wasTransactionExecuted`
+check — silently dropping the transaction on that member forever. The window between
+"apply succeeded" and "durable write landed" is safe to re-run on restart because
+re-applying an already-applied consensus transaction is idempotent (the "ahead" divergence
+path in `applyConsensusOperation` tolerates it as a no-op).
 
 ### 5. Latch Deadlocks
 **Bug**: Latches are per-node, not distributed. Concurrent transactions on same block can deadlock.
