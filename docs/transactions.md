@@ -41,6 +41,58 @@ This document describes the architecture for multi-collection transactions in Op
 > cases truly atomic and shrinking the residual window to the commit sweep only.
 > See the `feat-optimystic-legacy-commit-two-phase` backlog ticket.
 
+## Secrets and the replicated statement record
+
+**Short answer:** passing a private key to `sign(data, key)` — as a literal or a bound
+parameter — is **safe** with respect to replication. The thing to avoid is **storing a
+raw private key as a column value**.
+
+### Why function arguments are not replicated
+
+When Quereus records a DML statement for the distributed transaction log, it does **not**
+capture the source SQL text. Instead, the engine **rebuilds** the statement from the
+already-evaluated row values after the DML executor runs each row (see
+`buildInsertStatement` / `buildUpdateStatement` / `buildDeleteStatement` in
+`@quereus/quereus/src/util/mutation-statement.ts`, called from `dml-executor.ts`).
+
+A function's arguments are evaluated and discarded before the rebuild. So a statement
+like:
+
+```sql
+INSERT INTO signatures (id, sig) VALUES (1, sign(digest(data), '<privkey>'))
+```
+
+is recorded as:
+
+```sql
+INSERT INTO signatures (id, sig) VALUES (1, '<the signature>')
+```
+
+Peers re-execute that rebuilt form. They never see `sign()` or its key argument.
+**Literal-vs-bound is irrelevant** — a bound parameter that becomes a function argument
+is equally invisible in the record.
+
+### The real exposure boundary
+
+The **only** value that lands in the replicated record is one that becomes a **persisted
+column value**. So:
+
+- `INSERT INTO keys (id, priv) VALUES (1, '<privkey>')` — replicated verbatim. Any
+  replicated store must replicate every column value; there is nothing the replication
+  layer can do about this.
+- `INSERT INTO signatures (id, sig) VALUES (1, sign(data, '<privkey>'))` — the key is
+  NOT replicated; only the signature (the column value) is.
+
+**Do not store raw private-key material as a column in an optimystic-backed table.**
+Sign or derive and store only the public result (the signature, a commitment, or a
+public key).
+
+This model is pinned by a regression test in
+`packages/quereus-plugin-optimystic/test/statement-secret-arg-redaction.spec.ts`. The
+tripwire at `TransactionBridge.addStatement` in
+`packages/quereus-plugin-optimystic/src/optimystic-adapter/txn-bridge.ts` explains the
+mechanism for future readers who land at the recording site.
+
 ## Terminology
 
 To support multi-collection transactions, we introduce a clear hierarchy:

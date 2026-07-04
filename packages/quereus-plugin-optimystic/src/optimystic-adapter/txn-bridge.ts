@@ -534,6 +534,15 @@ export class TransactionBridge {
    * so awaiting here (before the caller stages rows) makes that snapshot's timing
    * deterministic — it captures pre-stage state, which session-mode rollback needs.
    *
+   * NOTE: statements recorded here are engine-REBUILT from evaluated row values
+   * (see buildInsertStatement / buildUpdateStatement in @quereus/quereus), NOT
+   * from the source SQL text. A secret passed as a function ARGUMENT (e.g. the
+   * private key in `sign(data, key)`) is evaluated away before the rebuild — it
+   * never reaches the record. The only secret-exposure vector is a secret stored
+   * as a persisted COLUMN VALUE (which any replicated store must replicate). See
+   * docs/transactions.md § "Secrets and the replicated statement record" and the
+   * regression guard in test/statement-secret-arg-redaction.spec.ts.
+   *
    * @param statement The deterministic SQL statement to accumulate
    */
   async addStatement(statement: string): Promise<void> {

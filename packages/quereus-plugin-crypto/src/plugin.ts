@@ -226,6 +226,15 @@ export default function register(_db: Database, config: Record<string, SqlValue>
 				name: 'sign',
 				numArgs: -1, // Variable arguments: data, privateKey, curve?, inputEncoding?, keyEncoding?, outputEncoding?
 				flags: DETERMINISTIC_FLAGS, // sign is deterministic (same key + data = same signature)
+				// Security: passing a private key as the second argument (literal or bound
+				// parameter) is SAFE with respect to replication. The Quereus engine rebuilds
+				// the replicated statement from evaluated column values, not from source SQL
+				// text, so the key argument is discarded before the record is written — peers
+				// re-execute `INSERT ... VALUES (<signature>)`, never `sign(..., key)`. What
+				// to avoid: storing a raw private key AS a column value, since any persisted
+				// column value is replicated. See docs/transactions.md § "Secrets and the
+				// replicated statement record" and the regression guard in
+				// quereus-plugin-optimystic/test/statement-secret-arg-redaction.spec.ts.
 				returnType: { typeClass: 'scalar' as const, logicalType: TEXT_TYPE, nullable: false },
 				implementation: (...args: SqlValue[]) => {
 					const [data, privateKey, curve = 'secp256k1', inputEncoding = 'base64url', keyEncoding = 'base64url', outputEncoding = 'base64url'] = args;

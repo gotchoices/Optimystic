@@ -270,6 +270,16 @@ SELECT random_bytes(64) as random_id;
 
 ### sign(data, privateKey, curve?, inputEncoding?, keyEncoding?, outputEncoding?)
 
+**Security note (replication):** passing a private key to `sign()` as a literal or
+bound parameter is **safe** with respect to Optimystic replication. The Quereus engine
+rebuilds the replicated statement from evaluated column values — not from source SQL —
+so the key argument is evaluated away and never reaches the record. Peers re-execute
+`INSERT ... VALUES (<signature>)`, never the original `sign(..., key)` call. The one
+thing to avoid is storing a raw private key **as a column value** in an
+optimystic-backed table, since any persisted column value is replicated. Sign or derive
+and store only the public result (signature, public key, commitment). See
+`docs/transactions.md` § "Secrets and the replicated statement record" for full detail.
+
 Sign data using secp256k1 (default), P-256, or Ed25519.
 
 ```sql
