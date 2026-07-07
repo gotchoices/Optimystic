@@ -55,10 +55,10 @@ export class BlockStorage implements IBlockStorage {
 		let meta = await this.storage.getMetadata(this.blockId);
 		if (!meta) {
 			// A freshly-pended block holds NO committed revision, so it can reconstruct
-			// nothing yet: seed empty ranges. Each committed revision extends coverage as a
-			// contiguous span (from the prior latest through the new rev) via setLatest/recover.
-			// Seeding open-ended `[[0]]` would falsely claim coverage of every revision and
-			// disable ensureRevision's restore path.
+			// nothing yet: seed empty ranges. The first commit anchors an OPEN-ENDED span at
+			// the earliest held rev E ([E, +inf)); later commits/recover merge into it via
+			// setLatest/recover. Seeding open-ended `[[0]]` would falsely claim coverage of the
+			// un-held revs below E and disable ensureRevision's restore path.
 			meta = { latest: undefined, ranges: [] };
 			await this.storage.saveMetadata(this.blockId, meta);
 		}

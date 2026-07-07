@@ -12,9 +12,10 @@ import type { BlockId, ActionId, IBlock, BlockHeader, Transforms } from '@optimy
  *
  * `getBlock(r)` is served by materializeBlock's DESCENDING walk (highest committed rev
  * <= r), so once a node holds the materialization chain from a block's earliest committed
- * rev E through its latest L, EVERY rev in [E, L+1) is serveable locally — coverage is a
- * contiguous span, not a set of the sparse points at which the block was modified. So each
- * commit EXTENDS the span from the prior latest through the new rev.
+ * rev E, EVERY rev >= E is serveable locally — a read above the latest resolves to the
+ * latest's materialization. So coverage is the OPEN-ENDED span [E, +inf), not a set of the
+ * sparse points at which the block was modified, and not a span bounded at the latest rev.
+ * Each commit merges into that one open-ended span; only revs BELOW E are genuine gaps.
  *
  * Regression guard for two opposite bugs:
  *   - over-claim: `savePendingTransaction` seeded open-ended `[[0]]`, claiming coverage of
