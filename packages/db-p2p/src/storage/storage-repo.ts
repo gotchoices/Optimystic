@@ -173,6 +173,13 @@ export class StorageRepo implements IRepo, IBlockChangeNotifier, IBlockReplicaSt
 				}
 			}
 
+			// NOTE: a Crash-D3 block (durably promoted + revision saved, but the setLatest lost so
+			// meta.latest is stale and the pending record is gone) reads as empty/stale here — a
+			// context-driven get skips promotion (pending gone) and a default getBlock() sees the
+			// stale latest. It is soft-wedged (stale), not hard-wedged: the next commit-retry for
+			// (actionId, rev) self-heals it via storage.recover() in commit(). Not repaired lazily on
+			// the read path because get() holds no commit latch; if stale reads on unwritten blocks
+			// ever become a problem, add a latched lazy recover() here.
 			const blockRev = await blockStorage.getBlock(context?.rev);
 
 			// Include pending action if requested — handled first so a pending-only
@@ -421,10 +428,39 @@ export class StorageRepo implements IRepo, IBlockChangeNotifier, IBlockReplicaSt
 			// Check for missing pending actions only on blocks that still need to commit.
 			// Already-done blocks will have had their pending promoted, so skipping them here
 			// is what makes the idempotent rollforward work.
+			//
+			// A toCommit block whose pending is absent is one of two states:
+			//   - Crash-D3: the action was durably promoted and its revision saved, but the crash
+			//     lost the setLatest, so meta.latest is still < request.rev and the pending record
+			//     is gone. getTransaction(actionId) returns the promoted transform. Self-heal here
+			//     via storage.recover() (redoes the lost setLatest, advancing latest to the highest
+			//     contiguous promoted rev, >= request.rev). recover() is idempotent + monotonic, so
+			//     calling it under the already-held commit latch is safe. Recovered blocks are then
+			//     excluded from the internalCommit loop below — their pending is gone, so
+			//     internalCommit would throw.
+			//   - Genuine missing pend: the action was never promoted (getTransaction → undefined),
+			//     so the pend is truly missing. Throw exactly as before.
+			// Crash-D2 never reaches this branch: its pending record is still present.
 			const missingPends: { blockId: BlockId, actionId: ActionId }[] = [];
+			const recovered = new Set<BlockId>();
 			for (const { blockId, storage } of toCommit) {
 				const pendingAction = await storage.getPendingTransaction(request.actionId);
-				if (!pendingAction) {
+				if (pendingAction) {
+					continue;
+				}
+				const promoted = await storage.getTransaction(request.actionId);
+				if (!promoted) {
+					missingPends.push({ blockId, actionId: request.actionId });
+					continue;
+				}
+				// Crash-D3 signature (pending absent + action durably promoted). Redo the lost setLatest.
+				const result = await storage.recover();
+				if (result.latest !== undefined && result.latest.rev >= request.rev) {
+					recovered.add(blockId);
+				} else {
+					// Torn/partial state: recover() could not advance latest to request.rev (metadata
+					// absent, or a revision entry missing despite the promoted transaction). Fall back
+					// to treating the block as a genuine missing-pend error rather than silently succeeding.
 					missingPends.push({ blockId, actionId: request.actionId });
 				}
 			}
@@ -433,9 +469,31 @@ export class StorageRepo implements IRepo, IBlockChangeNotifier, IBlockReplicaSt
 				throw new Error(`Pending action ${request.actionId} not found for block(s): ${missingPends.map(p => p.blockId).join(', ')}`);
 			}
 
+			// The original commit crashed before setLatest, so it also never emitted a change event
+			// for a recovered (Crash-D3) block. Now that recover() has committed it at request.rev,
+			// report its collection so downstream watchers wake — mirroring internalCommit. Resolve
+			// the collectionId from the now-materialized block; skip the emit when it can't be resolved
+			// (e.g. a tombstone with no materialized block), the same fallback internalCommit uses.
+			for (const { blockId, storage } of toCommit) {
+				if (!recovered.has(blockId)) {
+					continue;
+				}
+				const collectionId = (await storage.getBlock(request.rev))?.block.header.collectionId;
+				if (collectionId !== undefined) {
+					const list = collectionBlocks.get(collectionId) ?? [];
+					list.push(blockId);
+					collectionBlocks.set(collectionId, list);
+				}
+			}
+
 			// Commit the action for each block that still needs it.
 			// This loop will execute atomically for all blocks due to the acquired locks.
+			// Recovered (Crash-D3) blocks are already committed at request.rev and their pending is
+			// gone, so skip them — internalCommit would throw on the missing pending record.
 			for (const { blockId, storage } of toCommit) {
+				if (recovered.has(blockId)) {
+					continue;
+				}
 				try {
 					// internalCommit will throw if it encounters an issue
 					const collectionId = await this.internalCommit(blockId, request.actionId, request.rev, storage);

@@ -590,7 +590,7 @@ describe('Mid-DDL crash recovery (solo node)', function () {
 			expect(await raw.getPendingTransaction(blockA, actionId), 'pending removed by promote').to.equal(undefined);
 		});
 
-		it('retry-commit fails without recovery (pending gone, latest still undefined)', async () => {
+		it('retry-commit self-heals the D3 wedge and succeeds (pending gone, latest advanced)', async () => {
 			const raw = new MemoryRawStorage();
 			await seedPending(raw);
 
@@ -602,24 +602,66 @@ describe('Mid-DDL crash recovery (solo node)', function () {
 				rev: 1
 			} as CommitRequest);
 
-			// With the metadata-clone fix, latest is still undefined on retry.
-			// The idempotency short-circuit can't fire (latest is undefined), and the
-			// pending-missing check throws — commit cannot recover on its own.
+			// Pre-retry: latest still undefined (setLatest was lost), pending gone (promoted).
+			const metaBefore = await raw.getMetadata(blockA);
+			expect(metaBefore?.latest, 'pre-retry: latest still undefined').to.equal(undefined);
+			expect(await raw.getPendingTransaction(blockA, actionId), 'pending removed by promote').to.equal(undefined);
+
+			// Retry-commit with the same (actionId, rev). The block lands in toCommit; its pending
+			// is absent but the action is durably promoted, so commit() detects the Crash-D3
+			// signature and self-heals via storage.recover() instead of throwing.
 			const recovered = await rebuildCleanMesh(raw);
 			const repo = recovered.nodes[0]!.storageRepo;
-			let err: unknown;
-			try {
-				await repo.commit({
-					actionId,
-					blockIds: [blockA],
-					tailId: blockA,
-					rev: 1
-				} as CommitRequest);
-			} catch (e) {
-				err = e;
-			}
-			expect(err, 'retry-commit throws because the pending record is gone').to.be.instanceOf(Error);
-			expect((err as Error).message).to.include(`Pending action ${actionId} not found`);
+			const retry = await repo.commit({
+				actionId,
+				blockIds: [blockA],
+				tailId: blockA,
+				rev: 1
+			} as CommitRequest);
+			expect(retry.success, 'retry-commit self-heals and succeeds').to.equal(true);
+
+			// meta.latest advanced to request.rev; pending stays gone.
+			const metaAfter = await raw.getMetadata(blockA);
+			expect(metaAfter?.latest?.rev, 'latest advanced to request.rev').to.equal(1);
+			expect(metaAfter?.latest?.actionId).to.equal(actionId);
+			expect(await raw.getPendingTransaction(blockA, actionId), 'pending still gone').to.equal(undefined);
+
+			// A subsequent default read now materializes the committed block.
+			const final = await repo.get({ blockIds: [blockA] });
+			expect(final[blockA]?.state.latest?.rev).to.equal(1);
+			expect(final[blockA]?.block, 'block materializes after self-heal').to.not.equal(undefined);
+		});
+
+		it('retry-commit fires a collection change event for the self-healed block', async () => {
+			const raw = new MemoryRawStorage();
+			await seedPending(raw);
+
+			const { mesh } = await buildCrashingMesh(raw, crashTrigger);
+			await mesh.nodes[0]!.storageRepo.commit({
+				actionId,
+				blockIds: [blockA],
+				tailId: blockA,
+				rev: 1
+			} as CommitRequest);
+
+			const recovered = await rebuildCleanMesh(raw);
+			const repo = recovered.nodes[0]!.storageRepo;
+			const events: { collectionId: BlockId; blockIds: BlockId[]; rev: number }[] = [];
+			repo.onAnyCollectionChange((e) => events.push({ collectionId: e.collectionId, blockIds: [...e.blockIds], rev: e.rev }));
+
+			const retry = await repo.commit({
+				actionId,
+				blockIds: [blockA],
+				tailId: blockA,
+				rev: 1
+			} as CommitRequest);
+			expect(retry.success).to.equal(true);
+
+			// The original commit crashed before emitting; the self-heal must wake watchers.
+			expect(events.length, 'one change event for the recovered block').to.equal(1);
+			expect(events[0]!.collectionId).to.equal('coll-mid-ddl');
+			expect(events[0]!.blockIds).to.deep.equal([blockA]);
+			expect(events[0]!.rev).to.equal(1);
 		});
 
 		it('crash before setLatest leaves latest unchanged in raw storage (no reference leak)', async () => {
