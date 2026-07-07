@@ -70,6 +70,12 @@ export interface SqliteDb {
 	 * Run `fn` inside `BEGIN IMMEDIATE ... COMMIT` (rolls back on throw), holding
 	 * the connection mutex for the whole body. `fn` receives a `SqliteTransaction`
 	 * whose statements run directly on the open transaction without re-locking.
+	 *
+	 * NOTE: `fn` must issue its writes through the provided `tx`, never through a
+	 * class-level statement from `db.prepare(...)` (those re-acquire the mutex and
+	 * deadlock behind the slot this transaction holds), and must not call
+	 * `db.transaction(...)` again — nested calls deadlock for the same reason. No
+	 * current caller does either; guard here if that ever changes.
 	 */
 	transaction<T>(fn: (tx: SqliteTransaction) => Promise<T>): Promise<T>;
 	/** Release the underlying handle. */

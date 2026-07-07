@@ -61,9 +61,13 @@ const libp2p = await createLibp2pNode({
 });
 ```
 
-The same handle is shared by all three consumers. SQLite serializes writes
-inside a single connection; reads/writes are short-lived enough that
-single-connection contention is a non-issue for a client peer.
+The same handle is shared by all three consumers. SQLite allows at most one
+open transaction per connection, so the wrapper serializes every mutating
+operation — `exec`, statement `run`, and whole `transaction` bodies — on a
+per-connection FIFO mutex. Without it, two concurrent `transaction` bodies
+would each `BEGIN` on the shared connection; the second nests, throws, and its
+rollback discards the first's still-open writes. Reads (`get`/`all`) stay off
+the mutex to preserve read concurrency.
 
 ## Persistence model
 
