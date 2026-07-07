@@ -55,9 +55,10 @@ export class BlockStorage implements IBlockStorage {
 		let meta = await this.storage.getMetadata(this.blockId);
 		if (!meta) {
 			// A freshly-pended block holds NO committed revision, so it can reconstruct
-			// nothing yet: seed empty ranges. Each committed revision merges its own closed
-			// range via setLatest/recover. Seeding open-ended `[[0]]` would falsely claim
-			// coverage of every revision and disable ensureRevision's restore path.
+			// nothing yet: seed empty ranges. Each committed revision extends coverage as a
+			// contiguous span (from the prior latest through the new rev) via setLatest/recover.
+			// Seeding open-ended `[[0]]` would falsely claim coverage of every revision and
+			// disable ensureRevision's restore path.
 			meta = { latest: undefined, ranges: [] };
 			await this.storage.saveMetadata(this.blockId, meta);
 		}
@@ -91,15 +92,23 @@ export class BlockStorage implements IBlockStorage {
 		if (!meta) {
 			throw new Error(`Block ${this.blockId} not found`);
 		}
+		// Capture the prior latest rev BEFORE overwriting: coverage anchors to the earliest held rev.
+		const prevRev = meta.latest?.rev;
 		meta.latest = latest;
 		// NOTE: re-sorts (mergeRanges) the whole ranges array on every commit; if a block ever
 		// accumulates many disjoint ranges and commits show as slow, keep a running merged structure.
-		// The revision is fully reconstructible before this call (internalCommit runs
-		// saveMaterializedBlock/saveRevision/promotePendingTransaction first), so claim its
-		// closed range. mergeRanges folds it into any contiguous neighbour; a gap survives as
-		// a disjoint range. Range + latest advance in one saveMetadata write (atomic under the
-		// commit latch), so a crash before this call advances neither.
-		meta.ranges.unshift([latest.rev, latest.rev + 1]);
+		// `getBlock(r)` is served by materializeBlock's DESCENDING walk (highest committed rev <= r).
+		// Once this node holds the chain from the block's earliest committed rev E, EVERY rev >= E is
+		// serveable locally: a read at any r >= E resolves to the highest committed rev <= r (at worst
+		// the latest, which is materialized), so coverage is the OPEN-ENDED span [E, +inf) — not the
+		// single point [L, L+1) (which wrongly missed reads above L, e.g. a block read at the collection
+		// tip after a later commit touched only its siblings) and not [0, +inf) (which wrongly claimed
+		// the un-held revs below E). Claim open-ended from the prior latest (>= E via merge); the first
+		// commit (prevRev undefined) anchors the span at E = L. mergeRanges folds it into the existing
+		// [E, +inf). Only revs BELOW E miss inRanges, which is exactly the genuine-gap/restore case.
+		// Range + latest advance in one saveMetadata write (atomic under the commit latch), so a crash
+		// before this call advances neither.
+		meta.ranges.unshift([prevRev ?? latest.rev]);
 		meta.ranges = mergeRanges(meta.ranges);
 		await this.storage.saveMetadata(this.blockId, meta);
 	}
@@ -129,9 +138,11 @@ export class BlockStorage implements IBlockStorage {
 			const advanced: ActionRev = { rev: maxRev, actionId: maxActionId };
 			meta.latest = advanced;
 			// The lost setLatest would have merged each recovered revision's range; redo that
-			// here for the whole probed span. Every rev in (currentRev, maxRev] was verified
-			// present in the committed log above, so [currentRev+1, maxRev+1] is honest to claim.
-			meta.ranges.unshift([currentRev + 1, maxRev + 1]);
+			// here. Open-ended from currentRev+1 (see setLatest): every rev in (currentRev, maxRev]
+			// was verified present in the committed log above, and any rev > maxRev resolves via the
+			// descending walk to maxRev's materialization — so [currentRev+1, +inf) is honest. It joins
+			// the prior [E, currentRev+1) (from the earlier setLatest) into one open-ended [E, +inf).
+			meta.ranges.unshift([currentRev + 1]);
 			meta.ranges = mergeRanges(meta.ranges);
 			await this.storage.saveMetadata(this.blockId, meta);
 			log('recover blockId=%s advanced latest from rev=%d to rev=%d', this.blockId, currentRev, maxRev);
@@ -178,11 +189,17 @@ export class BlockStorage implements IBlockStorage {
 			await this.saveRestored(archive);
 
 			// Seed metadata when absent, advance latest, and merge the covered range.
+			const prevRev = meta?.latest?.rev;
 			if (!meta) {
 				meta = { latest: undefined, ranges: [] };
 			}
 			meta.latest = { rev, actionId };
-			meta.ranges.unshift([rev, rev + 1]);
+			// Open-ended coverage from the earliest held rev (see setLatest): the descending walk serves
+			// any rev >= the anchor. A prior latest at prevRev (< rev per the monotonic guard) is a
+			// materialized point, so anchor at prevRev; the first replica (prevRev undefined) anchors at
+			// rev. Freshness of a stale replica is a separate (replication-lag) concern from what this
+			// node can locally reconstruct, which is exactly what ranges records.
+			meta.ranges.unshift([prevRev ?? rev]);
 			meta.ranges = mergeRanges(meta.ranges);
 			await this.storage.saveMetadata(this.blockId, meta);
 
@@ -225,11 +242,15 @@ export class BlockStorage implements IBlockStorage {
 			await this.saveRestored(archive);
 
 			// Seed metadata when absent, advance latest, and merge the covered range.
+			const prevRev = meta?.latest?.rev;
 			if (!meta) {
 				meta = { latest: undefined, ranges: [] };
 			}
 			meta.latest = { rev, actionId };
-			meta.ranges.unshift([rev, rev + 1]);
+			// Open-ended coverage from the earliest held rev (see setLatest): anchor at the prior latest
+			// (< rev per the monotonic guard) so revs served by the descending walk stay in-range; the
+			// first write (prevRev undefined) anchors the span at rev.
+			meta.ranges.unshift([prevRev ?? rev]);
 			meta.ranges = mergeRanges(meta.ranges);
 			await this.storage.saveMetadata(this.blockId, meta);
 
