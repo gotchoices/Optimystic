@@ -1,81 +1,87 @@
-description: The mobile (NativeScript) SQLite backend now serializes all writes on its shared database connection so two simultaneous writes can no longer tangle their transactions and silently undo each other's committed data.
+description: The mobile (NativeScript) SQLite backend now serializes all writes on its shared database connection, so two simultaneous writes can no longer tangle their transactions and silently undo each other's committed data.
 prereq:
-files: packages/db-p2p-storage-ns/src/connection-mutex.ts, packages/db-p2p-storage-ns/src/db.ts, packages/db-p2p-storage-ns/src/ns-opener.ts, packages/db-p2p-storage-ns/src/sqlite-storage.ts, packages/db-p2p-storage-ns/README.md, packages/db-p2p-storage-ns/test/node-sqlite-driver.ts, packages/db-p2p-storage-ns/test/connection-mutex.spec.ts, packages/db-p2p-storage-ns/test/sqlite-transaction-serialization.spec.ts
+files: packages/db-p2p-storage-ns/src/connection-mutex.ts, packages/db-p2p-storage-ns/src/db.ts, packages/db-p2p-storage-ns/src/ns-opener.ts, packages/db-p2p-storage-ns/src/sqlite-storage.ts, packages/db-p2p-storage-ns/test/node-sqlite-driver.ts, packages/db-p2p-storage-ns/test/connection-mutex.spec.ts, packages/db-p2p-storage-ns/test/sqlite-transaction-serialization.spec.ts, packages/db-p2p-storage-ns/README.md
+difficulty: medium
 ----
 
-# Complete: Serialize SQLite transactions on the shared NativeScript connection
+# Complete: Serialize SQLite transactions (and plain writes) on the shared NativeScript connection
 
 ## What shipped
 
-`NSPluginDbWrapper` (and its test twin `NodeSqliteWrapper`) shared one SQLite
-connection across all storage classes with no mutex. SQLite permits at most one open
-transaction per connection, so two concurrent `transaction()` bodies each ran `BEGIN`;
-the second nested and threw, and its `catch` ran `ROLLBACK` — discarding the *first*
-transaction's still-open writes. Plain writes issued while a transaction was open were
-also folded into it and lost on rollback.
+`NSPluginDbWrapper` shared one SQLite connection across all storage classes with no mutex.
+SQLite permits at most one open transaction per connection, so two concurrent `transaction()`
+bodies each ran `BEGIN`; the second threw `cannot start a transaction within a transaction`, and
+its `catch` ran `ROLLBACK` — discarding the *first* transaction's still-open writes. A secondary
+defect folded any plain write issued while a transaction was open into that transaction, losing it
+on rollback. The concurrency is real because `StorageRepo`'s commit latch serializes only
+same-block work; disjoint-block operations run concurrently against the one shared connection.
 
-Fix: a per-connection FIFO promise-chain mutex (`ConnectionMutex.serialize`) guards every
-mutating op (`exec`, statement `run`, whole `transaction` bodies). Reads (`get`/`all`)
-bypass it to preserve read concurrency. Transaction bodies receive a `SqliteTransaction`
-whose `tx.prepare` statements bypass the mutex (they already hold the slot; re-locking
-would deadlock). See the implement handoff (git `ticket(fix)` /resume commit) for the
-full per-file breakdown.
+The fix adds a per-connection FIFO mutex (`ConnectionMutex`) and threads writes through it:
+`exec`, outside-transaction statement `run`, and whole `transaction` bodies serialize; reads
+(`get`/`all`) stay off the mutex to preserve read concurrency. `transaction(fn)` now hands `fn` a
+`SqliteTransaction` whose `tx.prepare` statements run inside the held slot and **bypass** the mutex
+(re-locking would deadlock) — the explicit context is the reentrancy seam a shared `inTransaction`
+flag could not provide. Production `ns-opener.ts` and the test mirror `node-sqlite-driver.ts` are
+kept behaviorally identical so the regression spec exercises the production shape.
+`promotePendingTransaction` was rewritten onto `tx.prepare`. README's persistence section documents
+the serialization.
 
 ## Review findings
 
-Read the implementation diff with fresh eyes, then scrutinized the mutex, both wrapper
-twins, the storage layer, the tests, and the docs. Build clean, **31 passing / 0 failing**
-(was 27 before this review pass added the mutex unit spec).
+**Diff reviewed** — read all seven touched source/test files plus README and the sole
+`db.transaction(...)` caller before reading the handoff. Build (`yarn build`, tsc clean),
+tests (`yarn test`, **31 passing / 0 failing**), and lint (`eslint` on `src` + `test`, exit 0) all
+green after review, including the one edit made in this pass.
 
-**Checked and clean:**
-- **Mutex correctness** — FIFO chain, non-poisoning tail (a rejected task advances the
-  queue with a sanitized `.then(()=>u,()=>u)`), per-task result/error propagation, sync +
-  async tasks. Verified by reasoning *and* now by a direct unit spec.
-- **Deadlock surface** — only one `db.transaction` caller (`promotePendingTransaction`),
-  and it writes exclusively through `tx.prepare`. No class-level (mutex-guarded) statement
-  is `run` inside a transaction body; no nested `db.transaction`. Both are the only ways to
-  deadlock the held slot.
-- **No stray writers** — grep of `src/` confirms every write path (`sqlite-storage`,
-  `sqlite-kv-store`, `identity`) goes through the wrapper's `db.prepare(...).run`/`exec`,
-  never the raw connection. `db.transaction` has exactly one caller.
-- **Wrapper twins mirror** — `ns-opener` and `node-sqlite-driver` `transaction()` bodies
-  match statement-for-statement (`BEGIN IMMEDIATE` → body → `COMMIT`/swallowed `ROLLBACK`),
-  modulo the driver's single- vs multi-statement `exec` capability. Only the test twin runs
-  in CI, so drift would hide a production bug — the handoff already flags this; left as-is.
-- **Test correctness** — the two regression specs run against real `node:sqlite`; test #2's
-  "plain write survives a concurrent failing transaction" implicitly exercises non-poisoning
-  (the write is queued behind the failing promote and still lands).
+**Checked and clear:**
+- **Correctness of the primitive.** `ConnectionMutex` is a standard non-poisoning FIFO
+  promise-chain: the tail is advanced with a settled-either-way promise so a rejected task cannot
+  reject or stall the tasks behind it, while each task's own outcome still reaches its own caller.
+  Unit tests pin all four properties directly.
+- **Deadlock surface.** Inside a `transaction` body, writes go only through `tx.prepare` (mutex
+  bypass) and there is no nested `db.transaction`. The only caller (`promotePendingTransaction`)
+  obeys both rules. Reads never lock, so reads inside or outside a transaction cannot deadlock.
+- **Wrapper parity.** Production (`ns-opener.ts`) and test (`node-sqlite-driver.ts`) match in
+  serialization behavior — same mutex placement on `exec`/`run`/`transaction`, same unserialized
+  `get`/`all`, same `BEGIN IMMEDIATE … COMMIT/ROLLBACK` body. The spec therefore tests the
+  production shape.
+- **Statement-cache aliasing (test driver).** `tx.prepare(sql)` and a class-level `db.prepare(sql)`
+  with identical SQL text share one cached `StatementSync`. Safe: `node:sqlite`'s `run`/`get`/`all`
+  each execute synchronously and hold no cursor across an `await`, so interleaved reuse of one
+  statement object cannot corrupt state.
+- **Docs.** README persistence section and the `db.ts`/`ns-opener.ts` doc comments accurately
+  describe the mutex, the read-concurrency carve-out, and the `tx`-only-writes invariant.
 
-**Minor — fixed inline this pass:**
-- **Stale README (doc-out-of-date).** `README.md` claimed "SQLite serializes writes inside
-  a single connection; ... contention is a non-issue" — the exact false premise this bug
-  disproved (SQLite throws on nested `BEGIN`; it does *not* serialize concurrent transaction
-  bodies — the wrapper mutex does). Rewrote the paragraph to describe the mutex.
-- **Missing direct mutex coverage (test).** The mutex — the crux of the fix — was only
-  integration-tested. Added `test/connection-mutex.spec.ts` (4 tests): FIFO ordering with a
-  no-overlap assertion, result/error propagation, non-poisoning, and sync-task support.
+**Tripwires (recorded in code, not filed as tickets):**
+- *Uncommitted reads.* Reads run unserialized, so a read on this connection while a write
+  transaction is open observes that transaction's uncommitted rows. Fine today (only same-block
+  promote writes in a transaction, under the commit latch). Parked as a `// NOTE:` at the
+  `get`/`all` bypass site in `ns-opener.ts` — pre-existing, left in place.
+- *Double-wrap footgun (added this pass).* The mutex lives on the wrapper, not the raw handle, so
+  wrapping one raw connection twice yields two independent mutexes that don't serialize against
+  each other — reintroducing the bug. Added a `// NOTE:` to `wrapNSPluginDb`'s doc comment;
+  `openOptimysticNSDb` already wraps each fresh handle exactly once, so no live caller trips it.
+- *Reentrancy guard.* No runtime assertion blocks a future caller from writing via a class-level
+  statement (or nesting `db.transaction`) inside a transaction body — either would deadlock. Judged
+  sufficient to document (already noted in `db.ts:transaction`): single caller, no dynamic
+  transaction nesting in the package.
 
-**Major — none.** No new fix/plan/backlog tickets filed.
+**Filed as follow-up (backlog):**
+- `debt-ns-sqlite-concurrency-stress-test` — coverage is two targeted races plus mutex unit tests;
+  a randomized mixed-operation stress test would exercise interleavings the canned tests don't.
+  Hardening, not a defect.
 
-**Tripwires (recorded, not filed):**
-- *Unserialized reads on the shared connection* — carried over from implement. Reads bypass
-  the mutex and can observe a concurrent transaction's uncommitted rows on the same
-  connection. Fine today (only same-block promote writes, under the per-block commit latch).
-  Parked as `// NOTE:` at the `get`/`all` bypass sites in `src/ns-opener.ts`.
-- *Nested-transaction / class-statement-in-transaction deadlock* — noticed during this
-  review: calling `db.transaction` inside a transaction fn, or running a `db.prepare(...)`
-  statement inside one, re-acquires the held mutex slot and deadlocks. No caller does either
-  today. Parked as a `NOTE:` in the `transaction` doc-comment in `src/db.ts`.
+**Known coverage gaps (unchanged from handoff, honest floor):**
+- No test drives the real `@nativescript-community/sqlite` plugin — it's an uninstalled peer
+  dependency in the Node test env; serialization is verified via the `node:sqlite` mirror only.
+  The production wrapper's mutex logic is identical, but plugin-specific transaction semantics are
+  unverified here. Not resolvable inside the Node test harness.
+- `BEGIN IMMEDIATE`'s file-lock front-loading is untested (in-memory test DB makes it equivalent to
+  plain `BEGIN`); no multi-connection file-lock test exists for the same reason.
 
-## Honest gaps carried forward (unchanged from implement)
+## Changes made in this review pass
+- Added a `// NOTE:` tripwire to `wrapNSPluginDb` (`ns-opener.ts`) documenting the one-wrapper-per-
+  raw-handle invariant.
+- Filed `tickets/backlog/debt-ns-sqlite-concurrency-stress-test.md`.
 
-- No production runtime coverage — regression + mutex tests run against `node:sqlite`, never
-  the real `@nativescript-community/sqlite` plugin (needs a NativeScript host, not
-  agent-runnable). Twins kept identical by hand.
-- Ordering, not isolation — the mutex guarantees write serialization, not snapshot
-  isolation; test concurrency is cooperative microtask interleaving under single-threaded
-  `node:sqlite`, not true parallel threads.
-
-## Validation
-
-`packages/db-p2p-storage-ns`: `yarn build` clean; `yarn test` → **31 passing, 0 failing**.
+No behavioral code changed; the fix was accepted as implemented.

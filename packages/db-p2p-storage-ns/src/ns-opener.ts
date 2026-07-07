@@ -52,6 +52,11 @@ export async function openOptimysticNSDb(
  * internal `SqliteDb` interface used by the storage classes. Exported only
  * for callers that already hold an open NS-plugin handle and want to skip
  * the opener (rare — typically users just call `openOptimysticNSDb`).
+ *
+ * NOTE: the serialization mutex lives on the wrapper, not the raw handle. Wrap
+ * a given raw connection exactly once — two wrappers over one handle each hold
+ * their own mutex and would not serialize against each other, reintroducing the
+ * cross-rollback this fix closes.
  */
 export function wrapNSPluginDb(raw: NSPluginDb): SqliteDb {
 	return new NSPluginDbWrapper(raw);
