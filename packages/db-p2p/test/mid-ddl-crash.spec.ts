@@ -174,7 +174,8 @@ const preSeedMetadata = async (raw: IRawStorage, blockIds: BlockId[]): Promise<v
 	for (const blockId of blockIds) {
 		const existing = await raw.getMetadata(blockId);
 		if (!existing) {
-			await raw.saveMetadata(blockId, { latest: undefined, ranges: [[0]] });
+			// Mirror the production pend seed: empty ranges (nothing reconstructible yet).
+			await raw.saveMetadata(blockId, { latest: undefined, ranges: [] });
 		}
 	}
 };

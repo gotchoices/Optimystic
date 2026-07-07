@@ -230,7 +230,9 @@ export async function createMesh(nodeCount: number, options: MeshOptions): Promi
 					// Ensure metadata exists
 					const meta = await localRawStorage.getMetadata(blockId as BlockId);
 					if (!meta) {
-						await localRawStorage.saveMetadata(blockId as BlockId, { latest: undefined, ranges: [[0]] });
+						// Seed empty ranges (honest: nothing reconstructible yet); the setLatest
+						// below merges [latest.rev, latest.rev+1] once the revision is persisted.
+						await localRawStorage.saveMetadata(blockId as BlockId, { latest: undefined, ranges: [] });
 					}
 					await localBlockStorage.saveMaterializedBlock(latest.actionId, entry.block);
 					await localBlockStorage.saveRevision(latest.rev, latest.actionId);

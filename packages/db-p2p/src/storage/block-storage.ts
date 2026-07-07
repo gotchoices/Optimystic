@@ -54,7 +54,11 @@ export class BlockStorage implements IBlockStorage {
 		log('pend blockId=%s actionId=%s', this.blockId, actionId);
 		let meta = await this.storage.getMetadata(this.blockId);
 		if (!meta) {
-			meta = { latest: undefined, ranges: [[0]] };
+			// A freshly-pended block holds NO committed revision, so it can reconstruct
+			// nothing yet: seed empty ranges. Each committed revision merges its own closed
+			// range via setLatest/recover. Seeding open-ended `[[0]]` would falsely claim
+			// coverage of every revision and disable ensureRevision's restore path.
+			meta = { latest: undefined, ranges: [] };
 			await this.storage.saveMetadata(this.blockId, meta);
 		}
 		await this.storage.savePendingTransaction(this.blockId, actionId, transform);
@@ -88,6 +92,15 @@ export class BlockStorage implements IBlockStorage {
 			throw new Error(`Block ${this.blockId} not found`);
 		}
 		meta.latest = latest;
+		// NOTE: re-sorts (mergeRanges) the whole ranges array on every commit; if a block ever
+		// accumulates many disjoint ranges and commits show as slow, keep a running merged structure.
+		// The revision is fully reconstructible before this call (internalCommit runs
+		// saveMaterializedBlock/saveRevision/promotePendingTransaction first), so claim its
+		// closed range. mergeRanges folds it into any contiguous neighbour; a gap survives as
+		// a disjoint range. Range + latest advance in one saveMetadata write (atomic under the
+		// commit latch), so a crash before this call advances neither.
+		meta.ranges.unshift([latest.rev, latest.rev + 1]);
+		meta.ranges = mergeRanges(meta.ranges);
 		await this.storage.saveMetadata(this.blockId, meta);
 	}
 
@@ -115,6 +128,11 @@ export class BlockStorage implements IBlockStorage {
 		if (maxRev > currentRev && maxActionId !== undefined) {
 			const advanced: ActionRev = { rev: maxRev, actionId: maxActionId };
 			meta.latest = advanced;
+			// The lost setLatest would have merged each recovered revision's range; redo that
+			// here for the whole probed span. Every rev in (currentRev, maxRev] was verified
+			// present in the committed log above, so [currentRev+1, maxRev+1] is honest to claim.
+			meta.ranges.unshift([currentRev + 1, maxRev + 1]);
+			meta.ranges = mergeRanges(meta.ranges);
 			await this.storage.saveMetadata(this.blockId, meta);
 			log('recover blockId=%s advanced latest from rev=%d to rev=%d', this.blockId, currentRev, maxRev);
 			return { reconciled: true, latest: advanced };
