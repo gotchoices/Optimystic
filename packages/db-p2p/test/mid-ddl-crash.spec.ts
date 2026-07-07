@@ -664,6 +664,56 @@ describe('Mid-DDL crash recovery (solo node)', function () {
 			expect(events[0]!.rev).to.equal(1);
 		});
 
+		it('retry-commit fires a change event when the self-healed block is a delete (tombstone)', async () => {
+			// A delete materializes to a tombstone, so getBlock(request.rev) is undefined on the
+			// recovered block. The emit must still fire via the prior-block header fallback —
+			// otherwise a D3-recovered delete would silently fail to wake watchers.
+			const raw = new MemoryRawStorage();
+			const deleteAction = 'action-crash-d3-delete' as ActionId;
+
+			// rev1: clean insert commit (materialized), so a prior header exists to fall back to.
+			const seed = await rebuildCleanMesh(raw);
+			await seed.nodes[0]!.storageRepo.pend({
+				actionId,
+				transforms: makeInsertTransforms({ [blockA]: makeBlock(blockA, { items: ['d3-del'] }) }),
+				policy: 'c'
+			});
+			await seed.nodes[0]!.storageRepo.commit({ actionId, blockIds: [blockA], tailId: blockA, rev: 1 } as CommitRequest);
+
+			// rev2: pend a delete of the same block.
+			await seed.nodes[0]!.storageRepo.pend({
+				actionId: deleteAction,
+				transforms: { inserts: {}, updates: {}, deletes: [blockA] },
+				policy: 'c'
+			});
+
+			// Crash the rev2 delete commit before its setLatest (latest would advance to rev 2).
+			const deleteCrash: FaultTrigger = {
+				method: 'saveMetadata',
+				when: 'before',
+				blockId: blockA,
+				predicate: (args) => (args[1] as BlockMetadata | undefined)?.latest?.rev === 2
+			};
+			const { mesh, proxy } = await buildCrashingMesh(raw, deleteCrash);
+			await mesh.nodes[0]!.storageRepo.commit({ actionId: deleteAction, blockIds: [blockA], tailId: blockA, rev: 2 } as CommitRequest);
+			expect(proxy.fired, 'delete-commit crashed before setLatest').to.equal(true);
+
+			// Retry the rev2 delete: block is D3 (pending gone, action promoted), self-heals via recover().
+			const recovered = await rebuildCleanMesh(raw);
+			const repo = recovered.nodes[0]!.storageRepo;
+			const events: { collectionId: BlockId; blockIds: BlockId[]; rev: number }[] = [];
+			repo.onAnyCollectionChange((e) => events.push({ collectionId: e.collectionId, blockIds: [...e.blockIds], rev: e.rev }));
+
+			const retry = await repo.commit({ actionId: deleteAction, blockIds: [blockA], tailId: blockA, rev: 2 } as CommitRequest);
+			expect(retry.success, 'retry-commit self-heals the delete').to.equal(true);
+
+			// The tombstone has no materialized block, so the collectionId must come from the prior header.
+			expect(events.length, 'one change event for the recovered delete').to.equal(1);
+			expect(events[0]!.collectionId).to.equal('coll-mid-ddl');
+			expect(events[0]!.blockIds).to.deep.equal([blockA]);
+			expect(events[0]!.rev).to.equal(2);
+		});
+
 		it('crash before setLatest leaves latest unchanged in raw storage (no reference leak)', async () => {
 			const raw = new MemoryRawStorage();
 			await seedPending(raw);

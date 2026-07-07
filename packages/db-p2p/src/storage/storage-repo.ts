@@ -465,6 +465,13 @@ export class StorageRepo implements IRepo, IBlockChangeNotifier, IBlockReplicaSt
 				}
 			}
 
+			// NOTE: if a batch ever held BOTH a recovered D3 block and a genuine missing-pend block,
+			// this throw fires after recover() already advanced the D3 block durably, so that block's
+			// change event is skipped (the retry then treats it as alreadyDone and never re-emits;
+			// durable state stays correct, only the emit is lost). Judged unreachable today: a single
+			// crash mid-internalCommit leaves exactly one D3 block, with the rest alreadyDone or
+			// pending-present — a never-pended block cannot coexist with it in one retry. If a path
+			// ever produces that mix, emit recovered blocks' events before throwing here.
 			if (missingPends.length) {
 				throw new Error(`Pending action ${request.actionId} not found for block(s): ${missingPends.map(p => p.blockId).join(', ')}`);
 			}
@@ -472,13 +479,17 @@ export class StorageRepo implements IRepo, IBlockChangeNotifier, IBlockReplicaSt
 			// The original commit crashed before setLatest, so it also never emitted a change event
 			// for a recovered (Crash-D3) block. Now that recover() has committed it at request.rev,
 			// report its collection so downstream watchers wake — mirroring internalCommit. Resolve
-			// the collectionId from the now-materialized block; skip the emit when it can't be resolved
-			// (e.g. a tombstone with no materialized block), the same fallback internalCommit uses.
+			// the collectionId from the now-materialized block; a delete materializes to a tombstone
+			// (getBlock → undefined), so fall back to the prior materialized block's header exactly as
+			// internalCommit does — otherwise a recovered delete would silently fail to wake watchers.
+			// Only when neither resolves (a delete-only block with no prior materialization) is the
+			// emit skipped, the same terminal fallback internalCommit uses.
 			for (const { blockId, storage } of toCommit) {
 				if (!recovered.has(blockId)) {
 					continue;
 				}
-				const collectionId = (await storage.getBlock(request.rev))?.block.header.collectionId;
+				const collectionId = (await storage.getBlock(request.rev))?.block.header.collectionId
+					?? (await storage.getBlock(request.rev - 1))?.block.header.collectionId;
 				if (collectionId !== undefined) {
 					const list = collectionBlocks.get(collectionId) ?? [];
 					list.push(blockId);
