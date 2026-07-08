@@ -99,6 +99,8 @@ export class HashTierAddressing implements TierAddressing {
 			throw new RangeError(`tier d must fit in one byte (≤ 255), got ${d}`);
 		}
 		// H(d ‖ prefix(H(P), d·log₂F) ‖ topicId)  — ring-hash P first so the shard input is uniform
+		// NOTE: re-hashes peerId on every coordD call; a walk over a tier ladder recomputes H(self) per
+		// tier. Negligible today (walk steps are network-bound); if coord becomes hot, cache H(peerId).
 		const prefix = prefixBits(this.hash.H(peerId), d * this.log2F);
 		const input = new Uint8Array(1 + prefix.length + topicId.length);
 		input[0] = d;

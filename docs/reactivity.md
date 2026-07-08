@@ -50,7 +50,7 @@ The cohort-topic layer's tier addressing then proceeds normally:
 
 ```
 coord_0(_, topicId)   = H(0x00 ‖ topicId)
-coord_d(P, topicId)   = H(d ‖ prefix(P, d·log₂F) ‖ topicId)   for d ≥ 1
+coord_d(P, topicId)   = H(d ‖ prefix(H(P), d·log₂F) ‖ topicId)   for d ≥ 1
 ```
 
 When the tail rotates (the current tail block fills and a new tail block is born), `topicId` changes. The cohort-topic layer treats the new `topicId` as an entirely new topic; reactivity manages the migration of subscribers and replay state explicitly (see [Tail rotation](#tail-rotation)).
