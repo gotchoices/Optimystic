@@ -862,14 +862,29 @@ export class TransactionCoordinator {
 			rev
 		};
 
-		// Retry up to 3 attempts for transient failures
+		// Retry ONLY transient/thrown failures (unreachable peers, timeout) — forward recovery.
+		// A returned { success:false } is a permanent stale loss (someone committed a newer rev);
+		// the identical request can never win, so return immediately without retrying. Either way
+		// cancelPhase (run by coordinateTransaction on commitPhase failure) releases the pend
+		// exactly once — commit itself no longer self-cancels.
+		let lastTransientError: string | undefined;
 		for (let attempt = 0; attempt < 3; attempt++) {
-			const commitResult = await this.transactor.commit(commitRequest);
-			if (commitResult.success) {
-				return { collectionId, committed: true };
+			try {
+				const commitResult = await this.transactor.commit(commitRequest);
+				if (commitResult.success) {
+					return { collectionId, committed: true };
+				}
+				// Permanent stale failure: do not retry.
+				return {
+					collectionId,
+					committed: false,
+					error: commitResult.reason ?? `Stale commit for collection ${collectionId}`
+				};
+			} catch (e) {
+				lastTransientError = e instanceof Error ? e.message : String(e);
 			}
 		}
-		return { collectionId, committed: false, error: `Commit failed for collection ${collectionId} after 3 attempts` };
+		return { collectionId, committed: false, error: `Commit failed for collection ${collectionId} after 3 attempts: ${lastTransientError}` };
 	}
 
 	/**

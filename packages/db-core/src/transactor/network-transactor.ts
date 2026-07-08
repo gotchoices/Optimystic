@@ -619,8 +619,10 @@ export class NetworkTransactor implements ITransactor, IBlockChangeNotifier {
 	private async commitBlock(blockId: BlockId, blockIds: BlockId[], actionId: ActionId, rev: number, tailId?: BlockId): Promise<CommitResult> {
 		const { batches: tailBatches, error: tailError } = await this.commitBlocks({ blockIds: [blockId], actionId, rev, tailId });
 		if (tailError) {
-			// Cancel all pending actions as background microtask
-			void Promise.resolve().then(() => this.cancel({ blockIds, actionId })).catch(e => log('WARN: cancel after commit failure rejected: %o', e));
+			// commit is a pure attempt: stale → { success:false }, transient → throw. Cancellation
+			// is the CALLER's responsibility (coordinator cancelPhase; TransactorSource.transact),
+			// which owns the retry budget and the committed-vs-pending picture — self-cancelling here
+			// would tear down a pend a caller's retry loop is still working against, and double-cancel.
 			// Collect and return any active stale failures
 			const stale = Array.from(allBatches(tailBatches, b => b.request?.isResponse as boolean && !b.request!.response!.success));
 			if (stale.length > 0) {

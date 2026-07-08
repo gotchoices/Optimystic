@@ -2640,7 +2640,7 @@ describe('Transaction', () => {
 			expect(pending.size, 'no orphaned pending actions after partial pend failure').to.equal(0);
 		});
 
-		it('should do forward recovery with retry and targeted cancel on partial commit failure', async () => {
+		it('should do forward recovery and targeted cancel on partial commit failure', async () => {
 			const transactor = new TestTransactor();
 			let commitCallCount = 0;
 			const cancelledCollectionBlockIds: BlockId[][] = [];
@@ -2648,7 +2648,9 @@ describe('Transaction', () => {
 			const originalCommit = transactor.commit.bind(transactor);
 			transactor.commit = async (request) => {
 				commitCallCount++;
-				// First call succeeds (collection A), all subsequent calls fail (collection B retries)
+				// First call succeeds (collection A); the second returns a stale failure
+				// (collection B). A returned failure is a permanent stale loss, so it is
+				// attempted exactly once — not retried.
 				if (commitCallCount >= 2) {
 					return { success: false, reason: 'Commit rejected' };
 				}
@@ -2703,8 +2705,8 @@ describe('Transaction', () => {
 			const pending = transactor.getPendingActions();
 			expect(pending.size, 'no orphaned pending actions').to.equal(0);
 
-			// Verify retry: 1 success + 3 retries for the failed collection = 4 total commit calls
-			expect(commitCallCount, 'commit retried 3 times for the failed collection').to.equal(4);
+			// Stale failure is NOT retried: 1 success (collection A) + 1 attempt (collection B) = 2 total.
+			expect(commitCallCount, 'stale commit attempted once per collection, no retry').to.equal(2);
 		});
 
 		it('should retry and succeed when commit transiently fails', async () => {
@@ -2715,9 +2717,11 @@ describe('Transaction', () => {
 			const originalCommit = transactor.commit.bind(transactor);
 			transactor.commit = async (request) => {
 				commitCallCount++;
-				// Fail on 2nd call only (1st collection succeeds, 2nd fails once then succeeds on retry)
+				// Throw on the 2nd call only (1st collection succeeds; 2nd throws once then
+				// succeeds on retry). A thrown commit is the transient class — unreachable
+				// peers, timeout — which is exactly what commitCollection retries.
 				if (commitCallCount === 2) {
-					return { success: false, reason: 'Transient failure' };
+					throw new Error('Transient failure');
 				}
 				return originalCommit(request);
 			};
@@ -3290,9 +3294,9 @@ describe('Transaction', () => {
 
 		it('session.commit failure leaves tracker + pending unchanged, and retry does not double-log', async () => {
 			const inner = new TestTransactor();
-			// Fail every commit attempt in the first commit() (commitPhase retries the
-			// single collection 3x), then let the retry's 4th transactor.commit succeed.
-			const flaky = new FlakyCommitTransactor(inner, 3);
+			// Return a stale failure on the first commit() (a stale loss is attempted once,
+			// not retried), then let the retry session.commit()'s 2nd transactor.commit succeed.
+			const flaky = new FlakyCommitTransactor(inner, 1);
 
 			const usersTree = await Tree.createOrOpen<number, UserEntry>(flaky, 'users', e => e.key);
 			const usersCollection = (usersTree as unknown as { collection: any }).collection;

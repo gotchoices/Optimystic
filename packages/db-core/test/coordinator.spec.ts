@@ -63,7 +63,10 @@ class InstrumentedTransactor implements ITransactor {
 	constructor(
 		private readonly failCollections: Set<string> = new Set(),
 		private readonly stepMs = 5,
-		private readonly throwCollections: Set<string> = new Set()
+		private readonly throwCollections: Set<string> = new Set(),
+		// Collections whose commit THROWS (transient/unreachable) rather than returning a stale
+		// { success:false }. Distinguishes the retry-worthy class from the permanent stale class.
+		private readonly throwCommitCollections: Set<string> = new Set()
 	) {}
 
 	async get(_blockGets: BlockGets): Promise<GetBlockResults> {
@@ -100,6 +103,9 @@ class InstrumentedTransactor implements ITransactor {
 			await delay(this.stepMs);
 			const collectionId = collectionOfBlockId(request.blockIds[0]!);
 			this.commitAttemptsByCollection.set(collectionId, (this.commitAttemptsByCollection.get(collectionId) ?? 0) + 1);
+			if (this.throwCommitCollections.has(collectionId)) {
+				throw new Error(`forced commit throw: ${collectionId}`);
+			}
 			if (this.failCollections.has(collectionId)) {
 				return { success: false, reason: `forced commit failure: ${collectionId}` };
 			}
@@ -243,7 +249,9 @@ describe('TransactionCoordinator phases (concurrency + cancel-on-failure)', () =
 			expect(result.failedCollections.size).to.equal(0);
 		});
 
-		it('partitions committed vs failed and retries a failing collection 3 times', async () => {
+		it('partitions committed vs failed and does NOT retry a returned stale failure', async () => {
+			// A returned { success:false } is a permanent stale loss — retrying the identical
+			// request can never win. It must be attempted exactly once, not three times.
 			const collectionIds = ['c0', 'c1', 'c2'];
 			const failing = 'c1';
 			const transactor = new InstrumentedTransactor(new Set([failing]));
@@ -262,9 +270,34 @@ describe('TransactionCoordinator phases (concurrency + cancel-on-failure)', () =
 			expect(result.error).to.contain(failing);
 			expect([...result.committedCollections].sort()).to.deep.equal(['c0', 'c2']);
 			expect([...result.failedCollections]).to.deep.equal([failing]);
-			// The failing collection was retried the full 3 attempts before giving up.
-			expect(transactor.commitAttemptsByCollection.get(failing)).to.equal(3);
+			// Stale failure → attempted exactly once (no retry).
+			expect(transactor.commitAttemptsByCollection.get(failing)).to.equal(1);
 			// The successful ones committed on their first attempt.
+			expect(transactor.commitAttemptsByCollection.get('c0')).to.equal(1);
+		});
+
+		it('retries a transient (thrown) commit failure the full 3 attempts before giving up', async () => {
+			// A thrown commit is transient (unreachable peers, timeout) — the retry-worthy class.
+			const collectionIds = ['c0', 'c1', 'c2'];
+			const failing = 'c1';
+			const transactor = new InstrumentedTransactor(new Set(), 5, new Set(), new Set([failing]));
+			const coordinator = new TransactionCoordinator(transactor, fakeCollections(collectionIds) as never);
+
+			const pendedBlockIds = new Map<CollectionId, BlockId[]>(
+				collectionIds.map(id => [id, [`${id}-tail` as BlockId]])
+			);
+			const criticalBlockIds = collectionIds.map(id => `${id}-tail` as BlockId);
+
+			const result = await (coordinator as unknown as {
+				commitPhase: (a: string, c: BlockId[], p: Map<CollectionId, BlockId[]>) => Promise<{ success: boolean; error?: string; committedCollections: Set<CollectionId>; failedCollections: Set<CollectionId> }>;
+			}).commitPhase('txn-1', criticalBlockIds, pendedBlockIds);
+
+			expect(result.success).to.be.false;
+			expect(result.error).to.contain(failing);
+			expect([...result.committedCollections].sort()).to.deep.equal(['c0', 'c2']);
+			expect([...result.failedCollections]).to.deep.equal([failing]);
+			// Transient failure → retried the full 3 attempts before giving up.
+			expect(transactor.commitAttemptsByCollection.get(failing)).to.equal(3);
 			expect(transactor.commitAttemptsByCollection.get('c0')).to.equal(1);
 		});
 	});
