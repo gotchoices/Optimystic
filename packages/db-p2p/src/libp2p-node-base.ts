@@ -1058,6 +1058,12 @@ export async function createLibp2pNodeBase(
 				// who owns the block's locale does not thereby own the arbitrators. `assembleCohort` already
 				// filters to known members; excluding the original cluster + self keeps arbitrators independent.
 				const excludeSet = new Set(excludePeers);
+				// NOTE: adding the local node's own id to `exclude` makes the draw node-relative. Cross-node
+				// determinism (the verifiable-recompute property) holds today only because the dissent
+				// coordinator running this is itself a member of the original cluster, so `self` is already in
+				// `excludePeers` — the add is a no-op and every honest node excludes the identical set. When a
+				// verify-path recompute lands, it MUST reconstruct `exclude` from the challenger's identity
+				// (`proof.challengerPeerId`) + original cluster, never the verifier's own id, or re-derivation diverges.
 				excludeSet.add(node.peerId.toString());
 				const picks = await sampleArbitrators(
 					{ blockId: new TextEncoder().encode(blockId), round, epoch, count, exclude: excludeSet },

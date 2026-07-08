@@ -46,8 +46,9 @@ hard-gates the no-anchor case:
 
 - **Layer 2 — live recompute.** Wire `recomputeArbitratorSet` on `ClusterMember` from FRET at the
   composition root, with a churn-tolerance window validated against live topology (not unit-testable
-  here). It must re-derive the eligible set the way `selectArbitrators` did (next-K beyond the original
-  cluster by XOR distance to the disputed block) and judge the carried set, returning
+  here). It must re-derive the eligible set the way `sampleArbitrators` does (verifiable dispersed
+  sampling — the peers nearest K pseudo-random ring coordinates `hash(blockId ‖ round ‖ epoch ‖ i)`,
+  threading the proof's `round`/`epoch` through the recompute context) and judge the carried set, returning
   `{feasible:false}` only for genuine late-joiner/churn cases — never silently accepting.
 - **Layer 3 — trust anchor.** When `cohort-topic-membership-cert-trust-anchoring` lands, upgrade the
   degradation tier from accept-and-log to a **hard gate** for the no-recompute path, so a cert that

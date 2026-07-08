@@ -107,6 +107,9 @@ export async function sampleArbitrators(
 
 		// Walk this coordinate's ascending-distance ordering for the first peer we have not yet seen,
 		// widening the slice until we find one or have proven the whole eligible membership is exhausted.
+		// NOTE: `wants` starts at `seen.size + 1` (conservative — guarantees exhaustion is provable in one
+		// widen). Starting at 1 and widening only on a seen-collision is also correct and asks the resolver
+		// for far fewer peers per coordinate; if `assembleCohort` ever shows up as hot here, start smaller.
 		let wants = seen.size + 1;
 		let prevLen = -1;
 		let picked: string | undefined;
