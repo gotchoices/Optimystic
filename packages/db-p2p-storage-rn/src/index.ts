@@ -1,4 +1,4 @@
-export { LevelDBRawStorage } from './leveldb-storage.js';
+export { LevelDBRawStorage, LevelDBStoreDriver } from './leveldb-storage.js';
 export { LevelDBKVStore } from './leveldb-kv-store.js';
 export { loadOrCreateRNPeerKey, DEFAULT_PEER_KEY_NAME } from './identity.js';
 export {
