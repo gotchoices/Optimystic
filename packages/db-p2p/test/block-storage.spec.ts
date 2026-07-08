@@ -2,8 +2,9 @@ import { expect } from 'chai';
 import { StorageRepo } from '../src/storage/storage-repo.js';
 import { BlockStorage } from '../src/storage/block-storage.js';
 import { MemoryRawStorage } from '../src/storage/memory-storage.js';
-import type { BlockArchive, RestoreCallback } from '../src/storage/struct.js';
-import type { BlockId, ActionId, IBlock, BlockHeader, Transforms } from '@optimystic/db-core';
+import type { BlockArchive, BlockMetadata, RestoreCallback } from '../src/storage/struct.js';
+import { hashString } from '@optimystic/db-core';
+import type { BlockId, ActionId, ActionRev, IBlock, BlockHeader, Transforms } from '@optimystic/db-core';
 
 /**
  * Coverage for the `meta.ranges` honesty invariant: `ranges` must state EXACTLY which
@@ -245,6 +246,135 @@ describe('BlockStorage meta.ranges honesty', () => {
 		const storage = new BlockStorage(blockId, raw, restoreCallback);
 		await storage.getBlock(4);
 		expect(restoreCalls, 'restore invoked for the genuine sub-E gap').to.deep.equal([4]);
+	});
+
+	it('fresh replica seeds open-ended ranges anchored at rev (not [[0]])', async () => {
+		const blockId = 'block-replica-fresh' as BlockId;
+		const storage = new BlockStorage(blockId, raw);
+
+		const latest = await storage.saveReplica(makeBlock('block-replica-fresh', { items: [] }), { rev: 1, actionId: 'r1' as ActionId });
+		expect(latest.rev).to.equal(1);
+		expect(latest.actionId).to.equal('r1');
+
+		const meta = await raw.getMetadata(blockId);
+		// Open-ended from E=1 — NOT the pre-fix over-claim [[0]] and NOT a bounded point [[1, 2]].
+		expect(meta!.ranges, 'coverage open-ended from the anchor rev').to.deep.equal([[1]]);
+		expect(meta!.latest?.rev).to.equal(1);
+	});
+
+	it('source-less replica derives rev=1 and a deterministic (idempotent) actionId', async () => {
+		const blockId = 'block-replica-idem' as BlockId;
+		const storage = new BlockStorage(blockId, raw);
+		const block = makeBlock('block-replica-idem', { items: ['x'] });
+
+		const first = await storage.saveReplica(block);
+		const second = await storage.saveReplica(block);
+
+		// Re-pushing the same block resolves to the same (rev, actionId) — never a fresh id per retry.
+		expect(first.rev).to.equal(1);
+		expect(second.rev).to.equal(1);
+		expect(first.actionId).to.equal(second.actionId);
+
+		// The fallback id is exactly the SHA-256 over `${blockId}:${JSON.stringify(block)}`.
+		const expectedId = await hashString(`${blockId}:${JSON.stringify(block)}`);
+		expect(first.actionId, 'deterministic hash fallback unchanged').to.equal(expectedId);
+
+		// The idempotent re-push hit the monotonic guard: ranges untouched (still one open-ended span).
+		const meta = await raw.getMetadata(blockId);
+		expect(meta!.ranges).to.deep.equal([[1]]);
+	});
+
+	it('monotonic guard: a lower-rev replica returns the held latest and leaves metadata untouched', async () => {
+		const blockId = 'block-guard-replica' as BlockId;
+		const storage = new BlockStorage(blockId, raw);
+
+		// Pre-seed latest at rev 5.
+		await storage.saveReplica(makeBlock('block-guard-replica', { items: [] }), { rev: 5, actionId: 'r5' as ActionId });
+		const before = await raw.getMetadata(blockId);
+
+		// A stale replica at rev 3: equal-or-newer already held ⇒ return held latest, no rewrite.
+		const result = await storage.saveReplica(makeBlock('block-guard-replica', { items: ['stale'] }), { rev: 3, actionId: 'r3' as ActionId });
+		expect(result.rev, 'held rev-5 latest returned, no downgrade').to.equal(5);
+		expect(result.actionId).to.equal('r5');
+
+		const after = await raw.getMetadata(blockId);
+		expect(after, 'metadata untouched by the guarded call').to.deep.equal(before);
+	});
+
+	it('monotonic guard: a lower-rev deletion returns the held latest and leaves metadata untouched', async () => {
+		const blockId = 'block-guard-deletion' as BlockId;
+		const storage = new BlockStorage(blockId, raw);
+
+		// Pre-seed latest at rev 5.
+		await storage.saveReplica(makeBlock('block-guard-deletion', { items: [] }), { rev: 5, actionId: 'r5' as ActionId });
+		const before = await raw.getMetadata(blockId);
+
+		// A stale deletion at rev 3: same guard as replica ⇒ return held latest, no rewrite.
+		const result = await storage.saveDeletion({ rev: 3, actionId: 'd3' as ActionId });
+		expect(result.rev, 'held rev-5 latest returned, no downgrade').to.equal(5);
+		expect(result.actionId).to.equal('r5');
+
+		const after = await raw.getMetadata(blockId);
+		expect(after, 'metadata untouched by the guarded call').to.deep.equal(before);
+	});
+
+	it('deletion tombstone reads back as undefined (absent, not thrown)', async () => {
+		const blockId = 'block-tombstone' as BlockId;
+		const storage = new BlockStorage(blockId, raw);
+
+		// A block present at rev 1, then a forward tombstone at rev 2.
+		await storage.saveReplica(makeBlock('block-tombstone', { items: ['live'] }), { rev: 1, actionId: 'r1' as ActionId });
+		const latest = await storage.saveDeletion({ rev: 2, actionId: 'd2' as ActionId });
+		expect(latest.rev).to.equal(2);
+
+		// getBlock() at the tombstone rev reverse-applies { delete: true } → absent block.
+		const atLatest = await storage.getBlock();
+		expect(atLatest, 'block absent at the tombstone rev').to.equal(undefined);
+
+		// The prior revision still materializes normally.
+		const atRev1 = await storage.getBlock(1);
+		expect(atRev1?.block.header.id, 'rev 1 still serves the live block').to.equal('block-tombstone');
+	});
+
+	it('saveReplica and saveDeletion are mutually exclusive on one block (shared latch)', async () => {
+		// A non-shared (per-method) latch would let the two read-modify-write critical sections
+		// interleave, risking a `latest` downgrade. Each save reads metadata exactly once while
+		// holding the latch, so under a SHARED latch no two getMetadata reads are ever in flight at
+		// once. The probe widens the read window and flags any concurrent entry. The counter is
+		// self-balanced within getMetadata, so the guard-skip path (which never calls saveMetadata)
+		// cannot leak it.
+		class LatchProbeStorage extends MemoryRawStorage {
+			private inFlight = 0;
+			overlaps = 0;
+			override async getMetadata(id: BlockId): Promise<BlockMetadata | undefined> {
+				this.inFlight++;
+				if (this.inFlight > 1) this.overlaps++;
+				try {
+					// Real async gap: yields the event loop so a non-shared latch's second read overlaps.
+					await new Promise<void>(resolve => setTimeout(resolve, 5));
+					return await super.getMetadata(id);
+				} finally {
+					this.inFlight--;
+				}
+			}
+		}
+
+		const probe = new LatchProbeStorage();
+		const blockId = 'block-shared-latch' as BlockId;
+		const storage = new BlockStorage(blockId, probe);
+
+		// Fire a replica at rev 2 and a deletion at rev 3 concurrently on the SAME block.
+		const [a, b] = await Promise.all([
+			storage.saveReplica(makeBlock('block-shared-latch', { items: [] }), { rev: 2, actionId: 'r2' as ActionId }),
+			storage.saveDeletion({ rev: 3, actionId: 'd3' as ActionId })
+		]) as [ActionRev, ActionRev];
+
+		expect(probe.overlaps, 'critical sections never overlapped (latch is shared)').to.equal(0);
+		// Regardless of interleave, the monotonic guard converges latest to the higher rev (3).
+		expect(Math.max(a.rev, b.rev)).to.equal(3);
+		const meta = await probe.getMetadata(blockId);
+		expect(meta!.latest?.rev, 'final latest is the higher rev, no downgrade').to.equal(3);
+		expect(meta!.latest?.actionId).to.equal('d3');
 	});
 
 	it('recover merges the recovered span into ranges', async () => {

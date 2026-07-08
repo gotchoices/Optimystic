@@ -1,4 +1,4 @@
-import type { BlockId, IBlock, Transform, ActionId, ActionRev } from "@optimystic/db-core";
+import type { BlockId, IBlock, Transform, ActionId, ActionRev, ActionTransform } from "@optimystic/db-core";
 import { Latches, applyTransform, hashString } from "@optimystic/db-core";
 import type { BlockArchive, BlockMetadata, RestoreCallback, RevisionRange } from "./struct.js";
 import type { IRawStorage } from "./i-raw-storage.js";
@@ -159,30 +159,70 @@ export class BlockStorage implements IBlockStorage {
 		// idempotent. Never random/time-based — that would mint a new revision per retry.
 		const actionId = source?.actionId ?? await hashString(`${this.blockId}:${JSON.stringify(block)}`);
 
-		// Serialize the read-modify-write on this block's metadata (mirrors ensureRevision).
+		// Replica revision carries the materialized block. `{ insert: block }` satisfies saveRestored's
+		// write invariants; on the serving path materializeBlock returns the materialized block directly
+		// (single rev), so this transform is never applied — see ticket notes.
+		return await this.saveForwardRevision(
+			rev,
+			actionId,
+			{ action: { actionId, rev, transform: { insert: block } }, block },
+			'replica'
+		);
+	}
+
+	async saveDeletion(source: ActionRev): Promise<ActionRev> {
+		const { rev, actionId } = source;
+
+		// Forward tombstone: a `{ delete: true }` transform and NO materialized block. saveRestored
+		// skips materialization when `block` is absent, so the reverse-apply in materializeBlock
+		// resolves this revision to an absent block (read-back as undefined).
+		return await this.saveForwardRevision(
+			rev,
+			actionId,
+			{ action: { actionId, rev, transform: { delete: true } } },
+			'deletion'
+		);
+	}
+
+	/**
+	 * Shared forward-write path for saveReplica and saveDeletion. Both append a single new revision
+	 * that ADVANCES `latest` (never rewrites history): acquire the block's metadata latch, apply the
+	 * monotonic guard, saveRestored a one-revision archive, then seed/advance/merge metadata.
+	 *
+	 * The only per-caller difference is the revision `body`: a replica carries `{ insert: block }`
+	 * plus the materialized `block`; a deletion carries `{ delete: true }` and no block. `rev` and
+	 * `actionId` are passed alongside `body` because the guard and the `latest` advance need them
+	 * independently of the archive body.
+	 */
+	private async saveForwardRevision(
+		rev: number,
+		actionId: ActionId,
+		body: { action: ActionTransform; block?: IBlock },
+		logLabel: 'replica' | 'deletion'
+	): Promise<ActionRev> {
+		// Serialize the read-modify-write on this block's metadata (mirrors ensureRevision). saveReplica
+		// and saveDeletion deliberately SHARE this one lock id (keyed `saveReplica`, NOT per-method):
+		// both do a read-modify-write of `meta.latest`, so they must be mutually exclusive on this block
+		// to keep the monotonic guard sound against a concurrent replica+deletion.
 		const lockId = `BlockStorage.saveReplica:${this.blockId}`;
 		const release = await Latches.acquire(lockId);
 		try {
 			let meta = await this.storage.getMetadata(this.blockId);
 
-			// Monotonic guard: an equal-or-newer revision is already held. The block is
+			// Monotonic guard: an equal-or-newer revision is already held. The block (or tombstone) is
 			// durably present; do not downgrade `latest` or rewrite the metadata.
 			if (meta?.latest && meta.latest.rev >= rev) {
-				log('replica:skip blockId=%s rev=%d held=%d', this.blockId, rev, meta.latest.rev);
+				log('%s:skip blockId=%s rev=%d held=%d', logLabel, this.blockId, rev, meta.latest.rev);
 				return meta.latest;
 			}
 
-			// Write rev → actionId, the action transform, and the materialized block.
-			// `{ insert: block }` satisfies saveRestored's write invariants; on the serving
-			// path materializeBlock returns the materialized block directly (single rev), so
-			// this transform is never applied — see ticket notes.
+			// One-revision archive. A replica's body carries the materialized block; a deletion's body
+			// omits it (forward tombstone). saveRestored skips materialization when `block` is absent,
+			// so a tombstone reverse-applies to an absent block (read back as undefined).
 			const archive: BlockArchive = {
 				blockId: this.blockId,
 				revisions: {
-					[rev]: {
-						action: { actionId, rev, transform: { insert: block } },
-						block
-					}
+					[rev]: body
 				},
 				range: [rev, rev + 1]
 			};
@@ -196,65 +236,14 @@ export class BlockStorage implements IBlockStorage {
 			meta.latest = { rev, actionId };
 			// Open-ended coverage from the earliest held rev (see setLatest): the descending walk serves
 			// any rev >= the anchor. A prior latest at prevRev (< rev per the monotonic guard) is a
-			// materialized point, so anchor at prevRev; the first replica (prevRev undefined) anchors at
+			// materialized point, so anchor at prevRev; the first write (prevRev undefined) anchors at
 			// rev. Freshness of a stale replica is a separate (replication-lag) concern from what this
 			// node can locally reconstruct, which is exactly what ranges records.
 			meta.ranges.unshift([prevRev ?? rev]);
 			meta.ranges = mergeRanges(meta.ranges);
 			await this.storage.saveMetadata(this.blockId, meta);
 
-			log('replica:save blockId=%s rev=%d actionId=%s', this.blockId, rev, actionId);
-			return meta.latest;
-		} finally {
-			release();
-		}
-	}
-
-	async saveDeletion(source: ActionRev): Promise<ActionRev> {
-		const { rev, actionId } = source;
-
-		// Share the saveReplica latch: both do a read-modify-write of `meta.latest`, so they must be
-		// mutually exclusive on this block to keep the monotonic guard sound.
-		const lockId = `BlockStorage.saveReplica:${this.blockId}`;
-		const release = await Latches.acquire(lockId);
-		try {
-			let meta = await this.storage.getMetadata(this.blockId);
-
-			// Monotonic guard: an equal-or-newer revision is already held. Do not downgrade `latest`
-			// or rewrite metadata — the tombstone (or a later revision) is already durable.
-			if (meta?.latest && meta.latest.rev >= rev) {
-				log('deletion:skip blockId=%s rev=%d held=%d', this.blockId, rev, meta.latest.rev);
-				return meta.latest;
-			}
-
-			// Forward tombstone: a `{ delete: true }` transform and NO materialized block. saveRestored
-			// skips materialization when `block` is absent, so the reverse-apply in materializeBlock
-			// resolves this revision to an absent block (read-back as undefined).
-			const archive: BlockArchive = {
-				blockId: this.blockId,
-				revisions: {
-					[rev]: {
-						action: { actionId, rev, transform: { delete: true } }
-					}
-				},
-				range: [rev, rev + 1]
-			};
-			await this.saveRestored(archive);
-
-			// Seed metadata when absent, advance latest, and merge the covered range.
-			const prevRev = meta?.latest?.rev;
-			if (!meta) {
-				meta = { latest: undefined, ranges: [] };
-			}
-			meta.latest = { rev, actionId };
-			// Open-ended coverage from the earliest held rev (see setLatest): anchor at the prior latest
-			// (< rev per the monotonic guard) so revs served by the descending walk stay in-range; the
-			// first write (prevRev undefined) anchors the span at rev.
-			meta.ranges.unshift([prevRev ?? rev]);
-			meta.ranges = mergeRanges(meta.ranges);
-			await this.storage.saveMetadata(this.blockId, meta);
-
-			log('deletion:save blockId=%s rev=%d actionId=%s', this.blockId, rev, actionId);
+			log('%s:save blockId=%s rev=%d actionId=%s', logLabel, this.blockId, rev, actionId);
 			return meta.latest;
 		} finally {
 			release();
