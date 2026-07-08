@@ -1,4 +1,5 @@
 import { expect } from 'chai';
+import { waitFor, delay } from '@optimystic/db-core/test';
 import {
 	PushState,
 	serveBackfill,
@@ -103,8 +104,6 @@ function makeDriver(transport: FakeGossipTransport, opts: DriverOpts = {}): Reac
 		...(opts.onTruncate === undefined ? {} : { onTruncate: opts.onTruncate }),
 	});
 }
-
-const delay = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
 
 // --- tests ------------------------------------------------------------------
 
@@ -255,12 +254,15 @@ describe('reactivity / push-state gossip driver', () => {
 
 		driver.start();
 		driver.start(); // idempotent — a second start must not schedule a second timer
-		await delay(40);
-		const ticked = transport.broadcasts.length;
-		expect(ticked, 'the cadence fired at least once').to.be.greaterThan(0);
+		// The driver's cadence is a real (non-injectable) unref'd setInterval, so poll the observable broadcast
+		// count rather than sleeping a fixed span. intervalMs = 5 → a tick lands well inside the bounded wait.
+		await waitFor(() => transport.broadcasts.length > 0, { description: 'the gossip cadence fired at least one round' });
 
 		driver.stop();
 		const afterStop = transport.broadcasts.length;
+		// A quiescence assertion — "no further rounds fire" — is an absence a condition-poll cannot express, so this
+		// is a residual bounded sleep. Correctness is structural (stop() clears the interval + sets `stopped`); the
+		// wait only gives a regressed impl a chance to reveal itself (intervalMs = 5 → ~8 ticks would land in 40ms).
 		await delay(40);
 		expect(transport.broadcasts.length, 'no rounds fire after stop()').to.equal(afterStop);
 

@@ -12,7 +12,8 @@
  */
 
 import { expect } from 'chai';
-import { buildReactivityMesh, delay, type ReactivityMesh } from '../../src/testing/reactivity-mesh-harness.js';
+import { waitFor } from '@optimystic/db-core/test';
+import { buildReactivityMesh, type ReactivityMesh } from '../../src/testing/reactivity-mesh-harness.js';
 
 const range = (lo: number, hi: number): number[] => Array.from({ length: hi - lo + 1 }, (_v, i) => lo + i);
 
@@ -49,7 +50,10 @@ describe('reactivity / mesh — slow-subscriber isolation', function () {
 
 		// Wake the slow subscriber: it delivers its freshest queued revisions, detects the gap, and backfills.
 		await rx.wakeSubscriber(slow);
-		await delay(50); // let the fire-and-forget backfill RPC(s) settle through the delivery path
+		// The gap-detection backfill is fire-and-forget off `onNotification`, so `wakeSubscriber` resolves before
+		// the missed window lands. Poll the observable delivery state (healed to the full 1..20) rather than
+		// sleeping a fixed span and hoping the RPC settled.
+		await waitFor(() => slow.delivered.length >= 20, { description: 'the slow subscriber backfilled its gap to a complete 1..20' });
 
 		const got = [...new Set(slow.delivered.map((n) => n.revision))].sort((a, b) => a - b);
 		expect(got, 'the slow subscriber healed to a complete 1..20 (no loss)').to.deep.equal(range(1, 20));

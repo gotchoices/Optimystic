@@ -23,8 +23,7 @@ import {
 } from '../../src/reactivity/protocols.js';
 import { makeCohortTopicProtocols } from '../../src/cohort-topic/protocols.js';
 import { bytesToPeerIdString } from '../../src/cohort-topic/peer-codec.js';
-
-const delay = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
+import { waitFor } from '@optimystic/db-core/test';
 
 /** A real (dialable, byte-round-trippable) peer-id string. */
 async function peerIdString(): Promise<string> {
@@ -189,7 +188,8 @@ describe('reactivity / notify transport', () => {
 			abort: (): void => {},
 		};
 		handler!(stream, { remotePeer: peerIdFromString(fromPeer) });
-		await delay(20);
+		// The handler reads + delivers on a fire-and-forget async IIFE; poll for the delivered notification.
+		await waitFor(() => received.length > 0, { description: 'the inbound frame was decoded and delivered' });
 
 		expect(received, 'the inbound frame was decoded and delivered').to.deep.equal([n]);
 		expect(replied, 'notify is one-way — the handler sends no reply frame').to.equal(false);
@@ -222,7 +222,8 @@ describe('reactivity / notify transport', () => {
 			abort: (): void => { aborted = true; },
 		};
 		handler!(stream, { remotePeer: peerIdFromString(fromPeer) });
-		await delay(20);
+		// The bounded read rejects on the async IIFE and the catch aborts the stream; poll that observable state.
+		await waitFor(() => aborted, { description: 'a failed bounded read aborts the stream' });
 
 		expect(aborted, 'a failed read aborts the stream').to.equal(true);
 		expect(fired, 'an oversized/failed read delivers nothing to subscribers').to.equal(0);
