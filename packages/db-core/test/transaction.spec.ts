@@ -3369,5 +3369,56 @@ describe('Transaction', () => {
 			expect(usersCollection.tracker.transforms).to.deep.equal(pre.transforms);
 			expect(usersCollection.getPendingActions()).to.deep.equal(pre.pending);
 		});
+
+		it('multi-collection: a failed commit restores EVERY appended tracker, not just one', async () => {
+			// The append loop runs sequentially across collections, and coordinateTransaction
+			// can fail after ALL of them appended — so the catch must restore each of the
+			// 0..N collections it snapshotted, not only the first. This exercises that
+			// N>1 restore branch (the single-collection tests above cover only N=1).
+			type PostEntry = { key: number; userId: number; title: string };
+			const inner = new TestTransactor();
+			const flaky = new FlakyCommitTransactor(inner, Infinity); // always fail commit
+
+			const usersTree = await Tree.createOrOpen<number, UserEntry>(flaky, 'users', e => e.key);
+			const postsTree = await Tree.createOrOpen<number, PostEntry>(flaky, 'posts', e => e.key);
+			const usersCollection = (usersTree as unknown as { collection: any }).collection;
+			const postsCollection = (postsTree as unknown as { collection: any }).collection;
+			const collections = new Map<string, any>([['users', usersCollection], ['posts', postsCollection]]);
+
+			const coordinator = new TransactionCoordinator(flaky, collections);
+			const engine = new ActionsEngine(coordinator);
+			const session = await TransactionSession.create(coordinator, engine, 'peer1', 'schema1');
+
+			const actions: CollectionActions[] = [
+				{ collectionId: 'users', actions: [{ type: 'replace', data: [[1, { key: 1, name: 'Alice' }]] }] },
+				{ collectionId: 'posts', actions: [{ type: 'replace', data: [[100, { key: 100, userId: 1, title: 'First' }]] }] }
+			];
+			await session.execute(createActionsStatements(actions)[0]!, actions);
+
+			const preUsers = usersCollection.snapshotPending();
+			const prePosts = postsCollection.snapshotPending();
+
+			let threw = false;
+			try {
+				await session.commit();
+			} catch {
+				threw = true;
+			}
+			expect(threw, 'multi-collection commit should reject on forced commit failure').to.be.true;
+
+			// BOTH trackers — both of which had a log entry appended before consensus failed —
+			// must be restored to their pre-append snapshots.
+			expect(usersCollection.tracker.transforms).to.deep.equal(preUsers.transforms,
+				'users tracker transforms should be restored');
+			expect(usersCollection.getPendingActions()).to.deep.equal(preUsers.pending,
+				'users pending queue should be restored');
+			expect(postsCollection.tracker.transforms).to.deep.equal(prePosts.transforms,
+				'posts tracker transforms should be restored');
+			expect(postsCollection.getPendingActions()).to.deep.equal(prePosts.pending,
+				'posts pending queue should be restored');
+
+			// Nothing committed on either collection.
+			expect(inner.getCommittedActions().size, 'no actions committed after forced failure').to.equal(0);
+		});
 	});
 });
