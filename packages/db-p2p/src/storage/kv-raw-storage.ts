@@ -46,10 +46,14 @@ export class KvRawStorage implements IRawStorage {
 
 	// NOTE: every value write funnels through the driver put/delete calls in the
 	// methods below (saveMetadata / saveRevision / save*Transaction /
-	// saveMaterializedBlock). This is the single choke point where the future
-	// incremental byte counter (st-storage-sweep-archival-and-capacity-estimate)
-	// would hook in, replacing the per-driver full-scan getApproximateBytesUsed.
-	// Do NOT implement the counter here — leave the write path a single seam.
+	// saveMaterializedBlock). This is the single choke point where an incremental
+	// byte counter would hook in, replacing the per-driver full-scan
+	// getApproximateBytesUsed. The chosen capacity-estimate mechanism is instead a
+	// short-TTL cache over the full scan in StorageMonitor (see storage-monitor.ts
+	// `usedBytesCacheTtlMs`) — backend-agnostic, no write-path changes, and ring
+	// selection tolerates the bounded staleness by design. The counter remains a
+	// future option only if TTL staleness ever proves insufficient; do NOT
+	// implement it here — leave the write path a single seam.
 	async saveMetadata(blockId: BlockId, metadata: BlockMetadata): Promise<void> {
 		await this.driver.putMetadata(blockId, encodeJson(metadata));
 	}

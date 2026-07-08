@@ -115,4 +115,119 @@ describe('StorageMonitor', () => {
 			expect(capacity.used).to.equal(400);
 		});
 	});
+
+	describe('used-bytes cache (TTL)', () => {
+		/** A `getApproximateBytesUsed` spy that counts calls and returns a fixed value. */
+		function spyStorage(returnValue = 256): { storage: IRawStorage; calls: () => number } {
+			let calls = 0;
+			const storage = makeStorage({
+				getApproximateBytesUsed: async () => {
+					calls++;
+					return returnValue;
+				}
+			});
+			return { storage, calls: () => calls };
+		}
+
+		it('serves two calls within the TTL from one scan', async () => {
+			const { storage, calls } = spyStorage();
+			let clock = 1000;
+			const monitor = new StorageMonitor(storage, {
+				totalBytes: 1024,
+				usedBytesCacheTtlMs: 60_000,
+				now: () => clock
+			});
+
+			await monitor.getCapacity();
+			clock += 30_000; // still inside the 60s window
+			await monitor.getCapacity();
+
+			expect(calls()).to.equal(1);
+		});
+
+		it('re-scans once the injected clock passes the TTL', async () => {
+			const { storage, calls } = spyStorage();
+			let clock = 1000;
+			const monitor = new StorageMonitor(storage, {
+				totalBytes: 1024,
+				usedBytesCacheTtlMs: 60_000,
+				now: () => clock
+			});
+
+			await monitor.getCapacity();
+			clock += 60_001; // past expiry
+			await monitor.getCapacity();
+
+			expect(calls()).to.equal(2);
+		});
+
+		it('never scans when usedBytes override is supplied', async () => {
+			const { storage, calls } = spyStorage();
+			const monitor = new StorageMonitor(storage, {
+				totalBytes: 1000,
+				usedBytes: 250
+			});
+
+			await monitor.getCapacity();
+			await monitor.getCapacity();
+
+			expect(calls()).to.equal(0);
+		});
+
+		it('scans on every call when the TTL is 0 (caching disabled)', async () => {
+			const { storage, calls } = spyStorage();
+			const monitor = new StorageMonitor(storage, {
+				totalBytes: 1024,
+				usedBytesCacheTtlMs: 0
+			});
+
+			await monitor.getCapacity();
+			await monitor.getCapacity();
+
+			expect(calls()).to.equal(2);
+		});
+
+		it('single-flights concurrent misses on a cold cache', async () => {
+			const { storage, calls } = spyStorage();
+			const monitor = new StorageMonitor(storage, {
+				totalBytes: 1024,
+				usedBytesCacheTtlMs: 60_000
+			});
+
+			const [a, b] = await Promise.all([monitor.getCapacity(), monitor.getCapacity()]);
+
+			expect(calls()).to.equal(1);
+			expect(a.used).to.equal(b.used);
+		});
+
+		it('does not cache or wedge on a scan error; the next call retries', async () => {
+			let calls = 0;
+			const storage = makeStorage({
+				getApproximateBytesUsed: async () => {
+					calls++;
+					if (calls === 1) {
+						throw new Error('scan boom');
+					}
+					return 256;
+				}
+			});
+			const monitor = new StorageMonitor(storage, {
+				totalBytes: 1024,
+				usedBytesCacheTtlMs: 60_000
+			});
+
+			let threw = false;
+			try {
+				await monitor.getCapacity();
+			} catch {
+				threw = true;
+			}
+			expect(threw).to.equal(true);
+
+			// Slot cleared, nothing cached: the retry scans and succeeds.
+			const capacity = await monitor.getCapacity();
+			expect(calls).to.equal(2);
+			expect(capacity.used).to.equal(256);
+		});
+	});
 });

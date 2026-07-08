@@ -123,3 +123,20 @@ The storage layer maintains separate stores for:
 - Revisions
 - Transactions (both pending and committed)
 - Materialized block versions
+
+### Capacity estimation and staleness
+
+`StorageMonitor.getCapacity` reports how full the store is. Used bytes come from the backend's
+`getApproximateBytesUsed`, which is a **full-store scan** (LevelDB iterates every key+value, the
+filesystem adapter stats the whole tree). Ring selection calls `getCapacity` several times per
+operation, so the scan is memoized behind a short TTL (`usedBytesCacheTtlMs`, default 60s; `0`
+disables it). Within the window callers share the cached value; concurrent misses share a single
+in-flight scan; a supplied `usedBytes`/`availableBytes` override bypasses the scan (and the cache)
+entirely.
+
+Consequence: the reported `used`/`available`/`usedPercent` may lag reality by up to the TTL. This
+staleness is acceptable — the sole consumer, ring selection (`RingSelector`), damps its move
+triggers with EWMA smoothing, a hysteresis dead-band, and a 10-minute minimum dwell. A ≤60s-stale
+reading cannot cause a wrong or premature ring move; at worst it delays one by up to the TTL, which
+is immaterial against the 10-minute dwell. **`RingSelector` therefore needs no forced-fresh read at
+decision boundaries** — the cached estimate is authoritative for its purposes.
