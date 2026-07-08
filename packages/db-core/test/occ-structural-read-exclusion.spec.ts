@@ -8,6 +8,7 @@ import {
 	KeyBound,
 	ReadDependencyCollector,
 	CacheSource,
+	Tracker,
 	ActionsEngine,
 	createTransactionStamp,
 	createTransactionId,
@@ -121,6 +122,23 @@ describe('OCC structural read exclusion', () => {
 			const cache = new CacheSource<IBlock>(makeRevSource(blocks, new Map([['v', 2]])), undefined, collector)
 			await cache.tryGet('v' as BlockId)                 // default purpose = value
 			expect(collector.getReadDependencies()).to.deep.equal([{ blockId: 'v', revision: 2 }])
+		})
+
+		it('Tracker forwards purpose AND markReadValue down to the CacheSource collector (reopen-path chain)', async () => {
+			// The reopened-tree read path is BTree -> Tracker -> CacheSource -> collector (no AtomicProxy,
+			// unlike a freshly-created tree). Exercise the two forwards the point lookup relies on:
+			// Tracker.tryGet must thread `navigation` through, and Tracker.markReadValue must reach the
+			// CacheSource so the terminal leaf is re-retained.
+			const collector = new ReadDependencyCollector()
+			const blocks = new Map([['n', block('n')]])
+			const cache = new CacheSource<IBlock>(makeRevSource(blocks, new Map([['n', 9]])), undefined, collector)
+			const tracker = new Tracker<IBlock>(cache)
+
+			await tracker.tryGet('n' as BlockId, 'navigation')  // navigation threads Tracker -> CacheSource
+			expect(collector.getReadDependencies(), 'navigation-only read excluded through the tracker').to.be.empty
+
+			tracker.markReadValue('n' as BlockId)               // forwards Tracker -> CacheSource -> collector
+			expect(collector.getReadDependencies()).to.deep.equal([{ blockId: 'n', revision: 9 }])
 		})
 	})
 

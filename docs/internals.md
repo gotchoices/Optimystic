@@ -411,12 +411,13 @@ When cluster peers disagree on transaction validity, the transaction is blocked 
 
 ## Read Dependency Validation
 
-Read dependency tracking prevents **write-skew anomalies** in optimistic concurrency control. Every block read during a transaction is recorded as a `ReadDependency` (`{ blockId, revision }`), and validators check that none of those blocks have been modified before allowing the transaction to commit.
+Read dependency tracking prevents **write-skew anomalies** in optimistic concurrency control. A block read during a transaction is recorded as a `ReadDependency` (`{ blockId, revision }`), and validators check that none of those blocks have been modified before allowing the transaction to commit. Most reads are recorded (default), but purely-structural *navigation* reads are excluded from the conflict set — see the point-lookup exclusion note below and `docs/correctness.md` Theorem 5.
 
 **Data flow**: `TransactorSource.tryGet()` records reads → `Collection` delegates → `TransactionCoordinator` aggregates across collections → `TransactionSession.commit()` collects reads into the `Transaction` → `TransactionValidator` checks each read against current block state.
 
 Key design decisions:
-- Reads are captured at `TransactorSource.tryGet()` level, meaning ALL block reads (including internal structural blocks) are tracked — maximally correct but potentially over-conservative
+- Reads are captured at `TransactorSource.tryGet()` (and `CacheSource.tryGet()`) level. Each read carries a `ReadPurpose` (`value` | `navigation`), defaulting to `value` everywhere so an unclassified read is always retained (fail-safe — a forgotten tag can only over-reject, never miss a conflict). The `ReadDependencyCollector` keeps the highest revision (max-wins) and the stronger purpose (value-wins) per block, and `getReadDependencies()` returns only the `value` reads.
+- **Point-lookup navigation exclusion:** a `BTree.get(key)` descent tags the interior branch nodes it merely walks through as `navigation` and upgrades the terminal leaf back to `value` (`markReadValue`), so the interior reads drop out of the conflict set. This is safe because any concurrent change to the queried result also bumps the retained leaf (`docs/correctness.md` Theorem 5). Range scans, `find`, writes, the root, the collection header, and all log-chain reads stay retained (`value`) — the exclusion is conservative and opt-in.
 - `CacheSource` naturally deduplicates — only the first read of a block reaches `TransactorSource`
 - Non-existent blocks record `revision: 0`; if subsequently created, the read is detected as stale
 - `BlockStateProvider` is optional in `TransactionValidator` — when absent, read validation is skipped (backward compatible)

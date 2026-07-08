@@ -39,7 +39,14 @@ export class Tree<TKey, TEntry> implements TreeReadView<TKey, TEntry> {
 		/** B-tree node fan-out. Defaults to the BTree default (64). Exposed mainly so tests can
 		 *  force a multi-level tree with few entries (a small capacity), which is what exercises the
 		 *  interior-navigation read-exclusion path — with the default you would need thousands of
-		 *  entries before a descent has any interior branch between root and leaf. */
+		 *  entries before a descent has any interior branch between root and leaf.
+		 *
+		 *  NOTE: fan-out is NOT persisted in the collection header — it is a per-call construction
+		 *  param. Creating a tree with a non-default capacity and later reopening it (a separate
+		 *  createOrOpen call) without the SAME capacity silently uses 64, so subsequent writes split
+		 *  at a fan-out the existing nodes were not built for. Fine today (only tests pass it, and
+		 *  they pass it consistently); if a persisted tree ever needs a custom fan-out, persist it in
+		 *  the header and read it back on reopen rather than trusting the caller to re-supply it. */
 		nodeCapacity?: number,
 	): Promise<Tree<TKey, TEntry>> {
 		// Tricky bootstrapping here:
