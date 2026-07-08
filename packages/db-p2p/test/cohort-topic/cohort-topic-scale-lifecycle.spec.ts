@@ -36,7 +36,6 @@ import {
 import { bytesToPeerIdString } from '../../src/cohort-topic/peer-codec.js';
 import {
 	buildMesh,
-	delay,
 	makeMember,
 	makeMembers,
 	participantPrimaryAt,
@@ -269,8 +268,7 @@ describe('cohort-topic: scale lifecycle (mock-tier e2e, N=48 ring / k=16 cohort)
 				expect((await decidingEngine.engine.handleRegister(await signedRegister(p, TOPIC, T0, 'failover'), REG, T0)).result).to.equal('accepted');
 				expect(decidingEngine.engine.handleRenew(await signedPing(p, TOPIC, T0, 'touch'), T0).result, 'primary touches the record').to.equal('ok');
 				await decidingEngine.gossipRound(T0);
-				await delay(30);
-				expect(backupEngine.holds(TOPIC, p.bytes), 'the backup replicated the record').to.equal(true);
+				expect(await waitFor(() => backupEngine.holds(TOPIC, p.bytes), 5_000), 'the backup replicated the record').to.equal(true);
 
 				// Crash the primary (unreachable, but still in FRET assembly so the epoch — and slot math — is
 				// unchanged). The participant's 3-fail path re-attaches to backups[0] with a SIGNED reattach.
@@ -314,17 +312,13 @@ describe('cohort-topic: scale lifecycle (mock-tier e2e, N=48 ring / k=16 cohort)
 				// One gossip round broadcasts the touched record to the cohort over `cohort-gossip`.
 				const g = await decidingEngine.gossipRound(T0);
 				expect(g?.records?.length, 'the round carries the touched record').to.equal(1);
-				await delay(40);
-				const replicated = siblingEngines.filter((e) => e.holds(TOPIC, p.bytes)).length;
-				expect(replicated, 'every cohort sibling replicated the record in one round').to.equal(siblingEngines.length);
+				expect(await waitFor(() => siblingEngines.every((e) => e.holds(TOPIC, p.bytes)), 5_000), 'every cohort sibling replicated the record in one round').to.equal(true);
 
 				// Sweep the now-stale record on the primary and gossip the eviction — the whole cohort converges.
 				const later = T0 + DEFAULT_TTL_MS + 1;
 				const gEvict = await decidingEngine.gossipRound(later);
 				expect(gEvict?.evicted?.length, 'the stale record was swept and queued as an eviction').to.equal(1);
-				await delay(40);
-				const stillHold = siblingEngines.filter((e) => e.holds(TOPIC, p.bytes)).length;
-				expect(stillHold, 'the cohort converged on the eviction').to.equal(0);
+				expect(await waitFor(() => siblingEngines.every((e) => !e.holds(TOPIC, p.bytes)), 5_000), 'the cohort converged on the eviction').to.equal(true);
 			} finally {
 				await mesh.stop();
 			}

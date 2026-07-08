@@ -1,6 +1,7 @@
 import { expect } from 'chai';
 import debug from 'debug';
 import { sha256 } from '@noble/hashes/sha2.js';
+import { waitFor } from '../../src/testing/async-wait.js';
 import {
 	shouldInstantiate,
 	createForwarder,
@@ -87,7 +88,9 @@ describe('cohort-topic / cold-start manager parent registration', () => {
 		expect(registeredWith, 'kicked off parent registration at the parent coord').to.deep.equal(PARENT);
 
 		resolveAck();
-		await new Promise<void>((r) => setTimeout(r, 0)); // flush the registrar promise + .then(onParentAck)
+		// Poll the observable flip rather than a fixed macrotask flush: the ack resolves through the registrar
+		// promise's `.then(onParentAck)`, and `waitFor` lands as soon as that chain has run.
+		await waitFor(() => fwd.servesParentOps(), { description: 'the forwarder flips to serving on the parent ack' });
 		expect(fwd.servesParentOps(), 'serving after parent ack').to.be.true;
 	});
 
@@ -110,7 +113,9 @@ describe('cohort-topic / cold-start manager parent registration', () => {
 			};
 			const mgr = createColdStartManager({ parentRegistrar: registrar });
 			const fwd = mgr.instantiate(TOPIC, 1, PARENT);
-			await new Promise<void>((r) => setTimeout(r, 0)); // flush the rejected registrar promise + .catch
+			// The rejected registration surfaces through the debug logger in its `.catch`; poll for that observable
+			// side-effect rather than a fixed macrotask flush, so the assertions below see the settled failure state.
+			await waitFor(() => logs.length === 1, { description: 'the failed parent link-up is logged via the debug logger' });
 			expect(fwd.acceptsParticipants(), 'still accepts participants after a failed link-up').to.be.true;
 			expect(fwd.servesParentOps(), 'does NOT serve parent-ops on a failed registration').to.be.false;
 			expect(fwd.phase()).to.equal('awaiting_parent');

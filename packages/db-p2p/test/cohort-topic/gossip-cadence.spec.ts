@@ -1,4 +1,5 @@
 import { expect } from 'chai';
+import { waitFor, delay } from '@optimystic/db-core/test';
 import { generateKeyPair } from '@libp2p/crypto/keys';
 import { peerIdFromPrivateKey } from '@libp2p/peer-id';
 import type { PrivateKey, PeerId } from '@libp2p/interface';
@@ -33,8 +34,6 @@ import {
 import { peerIdToBytes } from '../../src/cohort-topic/peer-codec.js';
 import { signPeer, verifyPeerSig } from '../../src/cohort-topic/peer-sig.js';
 import { DEFAULT_COHORT_TOPIC_PROTOCOLS } from '../../src/cohort-topic/protocols.js';
-
-const delay = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
 
 /** A real cohort member: libp2p key, peer-id string, and dialable member-id bytes. */
 interface Member {
@@ -405,7 +404,9 @@ describe('cohort-topic: two-coord inbound routing isolation', () => {
 		};
 		const frame = await signedGossip(self, coordA, eA.cohort().cohortEpoch, { records: [toGossipRecord(rec)] });
 		deliverGossip(node, frame, self.peerId);
-		await delay(30);
+		// The frame is delivered to both engines' buses in one call; wait for coord A to merge it, at which point
+		// coord B's (per-coord routing) rejection has already run in the same fan-out — so the negative is settled.
+		await waitFor(() => eA.holds(TOPIC, participant.bytes), { description: 'coord A merged the delivered record' });
 
 		expect(eA.holds(TOPIC, participant.bytes), 'coord A merged the record').to.equal(true);
 		expect(eB.holds(TOPIC, participant.bytes), 'coord B (same epoch) did NOT — routing isolates by coord').to.equal(false);
@@ -444,7 +445,8 @@ describe('cohort-topic: two-node replication via a gossip round', () => {
 
 		// Seed A's view with B's willingness so the 2-of-2 quorum is met and A can admit.
 		deliverGossip(a.node, await signedGossip(b.member, coord0, epoch, { willingnessBits: 'f' }), b.member.peerId);
-		await delay(30);
+		// Wait for B's willingness to merge into A's view (the 2-of-2 admission quorum) rather than a fixed settle.
+		await waitFor(() => eA.cohortView().get(bytesToB64url(b.member.bytes)) !== undefined, { description: "A merged B's seeded willingness" });
 
 		const now = Date.now();
 		const result = await eA.engine.handleRegister(
@@ -458,7 +460,7 @@ describe('cohort-topic: two-node replication via a gossip round', () => {
 		const g = await eA.gossipRound(now);
 		expect(g?.records?.length, 'the admitted record was drained from the queue with no renewal').to.equal(1);
 		deliverGossip(b.node, encodeCohortMessage(g!), a.member.peerId);
-		await delay(30);
+		await waitFor(() => eB.holds(TOPIC, participant.bytes), { description: 'B replicated the admitted record via admission-time gossip' });
 
 		expect(eB.holds(TOPIC, participant.bytes), 'B replicated the record via admission-time gossip, not renewal').to.equal(true);
 
@@ -476,7 +478,8 @@ describe('cohort-topic: two-node replication via a gossip round', () => {
 
 		// Seed A's view with B's willingness so the 2-of-2 willingness quorum is met and A can admit.
 		deliverGossip(a.node, await signedGossip(b.member, coord0, epoch, { willingnessBits: 'f' }), b.member.peerId);
-		await delay(30);
+		// Wait for B's willingness to merge into A's view (the 2-of-2 admission quorum) rather than a fixed settle.
+		await waitFor(() => eA.cohortView().get(bytesToB64url(b.member.bytes)) !== undefined, { description: "A merged B's seeded willingness" });
 
 		// Real-clock timestamps: the receiver merges with `Date.now()`, so a synthetic `lastPing` would look
 		// past-TTL and be dropped by the bus's anti-resurrection guard.
@@ -489,7 +492,7 @@ describe('cohort-topic: two-node replication via a gossip round', () => {
 		expect(g?.records?.length, 'A’s round carries the touched record').to.equal(1);
 		// Deliver A's real gossip frame to B (A's internal broadcast dial is a no-op in this harness).
 		deliverGossip(b.node, encodeCohortMessage(g!), a.member.peerId);
-		await delay(30);
+		await waitFor(() => eB.holds(TOPIC, participant.bytes), { description: 'B replicated the touched record in one round' });
 
 		expect(eB.holds(TOPIC, participant.bytes), 'B replicated the record in one round').to.equal(true);
 		const contribution = eB.cohortView().get(bytesToB64url(a.member.bytes));
@@ -502,7 +505,7 @@ describe('cohort-topic: two-node replication via a gossip round', () => {
 		const gEvict = await eA.gossipRound(later);
 		expect(gEvict?.evicted?.length, 'the stale record was swept and queued as an eviction').to.equal(1);
 		deliverGossip(b.node, encodeCohortMessage(gEvict!), a.member.peerId);
-		await delay(30);
+		await waitFor(() => !eB.holds(TOPIC, participant.bytes), { description: 'B converged on the eviction' });
 		expect(eB.holds(TOPIC, participant.bytes), 'B converged on the eviction').to.equal(false);
 
 		await a.host.stop();
@@ -521,13 +524,14 @@ describe('cohort-topic: two-node replication via a gossip round', () => {
 
 		// Seed A's view with B's willingness so the 2-of-2 quorum is met and A can admit.
 		deliverGossip(a.node, await signedGossip(b.member, coord0, epoch, { willingnessBits: 'f' }), b.member.peerId);
-		await delay(30);
+		// Wait for B's willingness to merge into A's view (the 2-of-2 admission quorum) rather than a fixed settle.
+		await waitFor(() => eA.cohortView().get(bytesToB64url(b.member.bytes)) !== undefined, { description: "A merged B's seeded willingness" });
 
 		// R1: participant registers on A at real-clock t1; the record replicates to B.
 		const t1 = Date.now();
 		expect((await eA.engine.handleRegister(await signedRegister(participant, TOPIC, 90_000, t1), { followOn: false, treeTier: 0 }, t1)).result, 'A admits R1').to.equal('accepted');
 		deliverGossip(b.node, encodeCohortMessage((await eA.gossipRound(t1))!), a.member.peerId);
-		await delay(30);
+		await waitFor(() => eB.holds(TOPIC, participant.bytes), { description: 'B holds R1 after the first round' });
 		expect(eB.holds(TOPIC, participant.bytes), 'B holds R1 after the first round').to.equal(true);
 
 		// R2: the participant re-registers with a newer lastPing (t2 > t1); A gossips the fresher record to B.
@@ -536,13 +540,18 @@ describe('cohort-topic: two-node replication via a gossip round', () => {
 		const gR2 = await eA.gossipRound(t2);
 		expect(gR2?.records?.length, 'A drained the re-registration record').to.equal(1);
 		deliverGossip(b.node, encodeCohortMessage(gR2!), a.member.peerId);
-		await delay(30);
+		// Wait until B applies the fresher R2 (lastPing = t2) BEFORE the reordered stale eviction arrives — else the
+		// t1 eviction would match B's still-t1 record and delete it, masking the freshness guard under test.
+		await waitFor(() => eB.records(TOPIC).some((r) => r.lastPing >= t2), { description: 'B applied the fresher R2 (lastPing = t2)' });
 
 		// A slow member's eviction, stamped at the OLD t1, arrives at B AFTER R2 — the reorder the guard closes.
 		const staleEviction = await signedGossip(a.member, coord0, epoch, {
 			evicted: [{ topicId: bytesToB64url(TOPIC), participantId: bytesToB64url(participant.bytes), lastPing: t1 }],
 		});
 		deliverGossip(b.node, staleEviction, a.member.peerId);
+		// Absence assertion: the stale eviction (lastPing = t1) must NOT delete the fresher R2. A correctly-guarded
+		// drop is a no-op, so there is no state transition to poll for — this is a residual bounded window that lets
+		// a regressed guard reveal itself by wrongly deleting the record within it. (R2 is already applied above.)
 		await delay(30);
 		expect(eB.holds(TOPIC, participant.bytes), 'the stale eviction (lastPing=t1) did NOT delete the fresher R2 (lastPing=t2)').to.equal(true);
 
@@ -552,7 +561,7 @@ describe('cohort-topic: two-node replication via a gossip round', () => {
 			evicted: [{ topicId: bytesToB64url(TOPIC), participantId: bytesToB64url(participant.bytes), lastPing: t2 }],
 		});
 		deliverGossip(b.node, genuineEviction, a.member.peerId);
-		await delay(30);
+		await waitFor(() => !eB.holds(TOPIC, participant.bytes), { description: 'a genuine eviction at the held lastPing converges the delete' });
 		expect(eB.holds(TOPIC, participant.bytes), 'a genuine eviction stamped at the held lastPing converges the delete').to.equal(false);
 
 		await a.host.stop();
@@ -585,7 +594,7 @@ describe('cohort-topic: two-node replication via a gossip round', () => {
 
 		deliverGossip(b.node, encodeCohortMessage(gA!), a.member.peerId);
 		deliverGossip(a.node, encodeCohortMessage(gB!), b.member.peerId);
-		await delay(30);
+		await waitFor(() => eA.childCohortCount(TOPIC) === 2 && eB.childCohortCount(TOPIC) === 2, { description: 'both members converged on the child-set union {C1, C2}' });
 
 		expect(eA.childCohortCount(TOPIC), 'A converged on the union {C1, C2}').to.equal(2);
 		expect(eB.childCohortCount(TOPIC), 'B converged on the union {C1, C2}').to.equal(2);
@@ -607,7 +616,7 @@ describe('cohort-topic: two-node replication via a gossip round', () => {
 		// Link on A, converge to B.
 		eA.recordChild(TOPIC, c1, 1_000);
 		deliverGossip(b.node, encodeCohortMessage((await eA.gossipRound(1_500))!), a.member.peerId);
-		await delay(30);
+		await waitFor(() => eB.childCohortCount(TOPIC) === 1, { description: 'B learned the child via replication' });
 		expect(eB.childCohortCount(TOPIC), 'B learned the child via replication').to.equal(1);
 
 		// The child demotes → A unrecords it (effectiveAt 2_000 > 1_000) → gossips the unlink → B converges to 0.
@@ -616,7 +625,7 @@ describe('cohort-topic: two-node replication via a gossip round', () => {
 		const gU = await eA.gossipRound(2_500);
 		expect(gU?.childUnlinks?.length, 'A drained the child-unlink delta').to.equal(1);
 		deliverGossip(b.node, encodeCohortMessage(gU!), a.member.peerId);
-		await delay(30);
+		await waitFor(() => eB.childCohortCount(TOPIC) === 0, { description: 'B converged on the child release' });
 		// count == 0 cohort-wide is the demotion-gate input (`promotion.ts` blocks demotion while count > 0);
 		// the gate firing on a real tier-1 parent is exercised by the multi-tier lifecycle spec.
 		expect(eB.childCohortCount(TOPIC), 'B converged on the release — the demotion-gate input is 0').to.equal(0);
@@ -663,7 +672,7 @@ describe('cohort-topic: two-node replication via a gossip round', () => {
 		const link: ChildLinkRefV1 = { topicId: bytesToB64url(TOPIC), childCohortCoord: bytesToB64url(c1), effectiveAt: 1_000 };
 		const frame = await signedGossip(b.member, coord0, foreignEpoch, { childLinks: [link] });
 		deliverGossip(a.node, frame, b.member.peerId);
-		await delay(30);
+		await waitFor(() => eA.childCohortCount(TOPIC) === 1, { description: 'the child link merged despite the epoch drift' });
 		expect(eA.childCohortCount(TOPIC), 'the child link merged despite the epoch drift').to.equal(1);
 		void eB; // (B is only constructed to mirror the cohort; the assertion is on A)
 
@@ -688,18 +697,23 @@ describe('cohort-topic: gossip driver timer lifecycle', () => {
 		// real-clock `now` for the admission: the driver sweeps with `Date.now()`, so a synthetic timestamp
 		// would make the record instantly stale and the engine idle again.
 		deliverGossip(node, await signedGossip(sibling, coord0, ce.cohort().cohortEpoch, { willingnessBits: 'f' }), sibling.peerId);
-		await delay(20);
+		// Wait for the seeded sibling willingness to merge before admitting, so the 2-of-2 quorum is met deterministically.
+		await waitFor(() => ce.cohortView().get(bytesToB64url(sibling.bytes)) !== undefined, { description: "the seeded sibling willingness merged into the engine's cohort view" });
 		const now = Date.now();
 		expect((await ce.engine.handleRegister(await signedRegister(participant, TOPIC, 90_000, now), { followOn: false, treeTier: 0 }, now)).result).to.equal('accepted');
 
 		const gossipDials = (): number => node.dialLog.filter((d) => d.protocol === DEFAULT_COHORT_TOPIC_PROTOCOLS.gossip).length;
-		await delay(120);
-		const duringRun = gossipDials();
-		expect(duringRun, 'the timer fired several gossip rounds').to.be.greaterThan(1);
+		// The driver's cadence is a real (non-injectable) unref'd setInterval, so poll the observable dial count
+		// rather than sleeping a fixed span. gossipIntervalMs = 25 → several rounds land well inside the bounded wait.
+		await waitFor(() => gossipDials() > 1, { timeoutMs: 2_000, description: 'the gossip driver timer fired multiple rounds' });
 
 		await host.stop();
 		const atStop = gossipDials();
-		await delay(120);
+		// A quiescence assertion — "no further rounds fire after stop()" — is an absence a condition-poll cannot
+		// express, so this is a residual bounded window. Correctness is structural (stop() clears the interval and
+		// sets `stopped`); the wait only gives a regressed impl a chance to reveal itself (gossipIntervalMs = 25 →
+		// ~4 ticks would land in 100ms).
+		await delay(100);
 		expect(gossipDials(), 'no gossip rounds fire after stop()').to.equal(atStop);
 		expect(DEFAULT_GOSSIP_INTERVAL_MS, 'the documented default cadence is exported').to.equal(5_000);
 	});
@@ -743,6 +757,8 @@ describe('cohort-topic: host gossip auth gate', () => {
 			records: [toGossipRecord(liveRecord(self, participant))],
 		});
 		deliverGossip(node, frame, outsider.peerId);
+		// Absence assertion: the auth gate must DROP this frame. A drop is a no-op with no state transition to poll
+		// for, so this is a residual bounded window that lets a regressed gate reveal itself by wrongly merging.
 		await delay(30);
 
 		expect(eA.holds(TOPIC, participant.bytes), 'non-member record must not merge').to.equal(false);
@@ -787,6 +803,8 @@ describe('cohort-topic: host gossip auth gate', () => {
 		};
 		g.signature = bytesToB64url(await signPeer(impostorKey, cohortGossipSigningPayload(g)));
 		deliverGossip(node, encodeCohortMessage(g), sibling.peerId);
+		// Absence assertion: the auth gate must DROP this bad-signature frame. A drop is a no-op with no state
+		// transition to poll for, so this is a residual bounded window that lets a regressed gate reveal itself.
 		await delay(30);
 
 		expect(eA.holds(TOPIC, participant.bytes), 'bad-signature record must not merge').to.equal(false);

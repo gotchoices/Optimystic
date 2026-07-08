@@ -1,4 +1,5 @@
 import { expect } from 'chai';
+import { waitFor, delay } from '@optimystic/db-core/test';
 import { generateKeyPair } from '@libp2p/crypto/keys';
 import { peerIdFromPrivateKey } from '@libp2p/peer-id';
 import type { Connection, PeerId, PrivateKey, Stream } from '@libp2p/interface';
@@ -69,8 +70,6 @@ function viewKnowing(known: Uint8Array[]): BootstrapParentTopicView {
 /** A stand-in "existing committed parent topic" and a parent the node has never cached. */
 const KNOWN_PARENT = Uint8Array.from({ length: 32 }, (_v, i) => (i + 130) & 0xff);
 const UNKNOWN_PARENT = Uint8Array.from({ length: 32 }, (_v, i) => (i + 200) & 0xff);
-
-const delay = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
 
 const addressing = createTierAddressing(new RingHash());
 const TOPIC = Uint8Array.from({ length: 32 }, (_v, i) => (i + 3) & 0xff);
@@ -438,7 +437,9 @@ describe('cohort-topic: host anti-DoS wiring (gap 6)', () => {
 		host.promoteGate.rateLimiter.check(await makeParticipantBytes(), TOPIC, Date.now());
 		expect(host.promoteGate.rateLimiter.size, 'the key was allocated').to.equal(1);
 
-		await delay(80); // several 5ms ticks past the 10ms idle TTL
+		// The gossip tick sweeps idle limiter keys on a real (non-injectable) setInterval; poll the observable size
+		// rather than sleeping a fixed span (gossipIntervalMs = 5, idleTtlMs = 10 → the key clears within a few ticks).
+		await waitFor(() => host.promoteGate.rateLimiter.size === 0, { description: 'the gossip tick swept the idle promote-gate key' });
 		expect(host.promoteGate.rateLimiter.size, 'the gossip tick swept the idle key').to.equal(0);
 
 		await host.stop();
@@ -480,7 +481,8 @@ describe('cohort-topic: host cold-start parent registration (gap 7)', () => {
 		expect(fwd, 'a forwarder was instantiated for the topic').to.not.equal(undefined);
 		expect(fwd!.acceptsParticipants()).to.equal(true);
 
-		await delay(30); // let the parent-link round-trip resolve
+		// Poll for the parent-link round-trip to resolve rather than a fixed settle.
+		await waitFor(() => ce.forwarder(TOPIC)?.phase() === 'serving', { description: 'the forwarder flips to serving on the parent linked ack' });
 
 		expect(ce.forwarder(TOPIC)!.phase(), 'the forwarder flips to serving on the parent linked ack').to.equal('serving');
 		expect(ce.forwarder(TOPIC)!.servesParentOps()).to.equal(true);
@@ -516,7 +518,7 @@ describe('cohort-topic: host cold-start parent registration (gap 7)', () => {
 
 		// The child links to the parent → the parent records it.
 		await ce.engine.handleRegister(makeReg(participantCoord, TOPIC, 'cid-fwd2', now, { tier: 1, treeTier: 1 }), { followOn: false, treeTier: 1, parentCoord }, now);
-		await delay(30);
+		await waitFor(() => parentEngine.childCohortCount(TOPIC) === 1, { description: 'the parent recorded the routed child link' });
 
 		expect(parentEngine.childCohortCount(TOPIC), 'parent recorded exactly one child').to.equal(1);
 
@@ -540,7 +542,10 @@ describe('cohort-topic: host cold-start parent registration (gap 7)', () => {
 		// The failure must not crash the instantiating register — the participant is still accepted.
 		expect(reply.result, 'the participant is accepted even when the parent link fails').to.equal('accepted');
 
-		await delay(30); // let the rejected parent-link settle
+		// Absence assertion: a REJECTED parent link must leave the forwarder in `awaiting_parent`, never flip it to
+		// serving. There is no positive state transition to poll for, so this is a residual bounded window that lets
+		// a regressed impl reveal itself by wrongly flipping to serving within it.
+		await delay(30);
 
 		const fwd = ce.forwarder(TOPIC);
 		expect(fwd!.acceptsParticipants(), 'still serves direct participants').to.equal(true);

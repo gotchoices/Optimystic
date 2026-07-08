@@ -58,7 +58,6 @@ import { verifyAndApplyNotice, type NoticeApplyTarget } from '../../src/cohort-t
 import {
 	addressing,
 	buildMesh,
-	delay,
 	makeMember,
 	makeMembers,
 	participantPrimaryAt,
@@ -190,10 +189,10 @@ describe('cohort-topic: live-tier end-to-end milestone', () => {
 			// Stamp the reattach after the register's `lastPing` (= now) so the freshness gate accepts it.
 			expect(decidingEngine.engine.handleRenew(await signedReattach(seedP, TOPIC, now + 1), now).result).to.equal('ok');
 			await decidingEngine.gossipRound(now);
-			await delay(30);
 			const sibling = mesh.nodes.find((n) => n.member.idStr !== deciding.member.idStr)!;
 			const siblingEngine = engines.get(sibling.member.idStr)!;
-			expect(siblingEngine.servesTopic(TOPIC), 'a sibling replicated the seed record and now serves the topic').to.equal(true);
+			// Poll for the seed record to replicate into the sibling rather than a fixed settle.
+			expect(await waitFor(() => siblingEngine.servesTopic(TOPIC), 5_000), 'a sibling replicated the seed record and now serves the topic').to.equal(true);
 			expect(siblingEngine.isPromoted(TOPIC), 'not promoted yet').to.equal(false);
 
 			// Drive direct participants up to cap_promote on the routed primary (the seed already counts as 1,
@@ -253,15 +252,13 @@ describe('cohort-topic: live-tier end-to-end milestone', () => {
 			// One gossip round broadcasts the touched record to the cohort over the `cohort-gossip` protocol.
 			const g = await decidingEngine.gossipRound(now);
 			expect(g?.records?.length, 'the round carries the touched record').to.equal(1);
-			await delay(30);
-			expect(siblingEngine.holds(TOPIC, participant.bytes), 'the sibling replicated the record in one round').to.equal(true);
+			expect(await waitFor(() => siblingEngine.holds(TOPIC, participant.bytes), 5_000), 'the sibling replicated the record in one round').to.equal(true);
 
 			// Let the record go stale, sweep it on the primary, and gossip the eviction — the sibling converges.
 			const later = now + 90_000 + 1;
 			const gEvict = await decidingEngine.gossipRound(later);
 			expect(gEvict?.evicted?.length, 'the stale record was swept and queued as an eviction').to.equal(1);
-			await delay(30);
-			expect(siblingEngine.holds(TOPIC, participant.bytes), 'the sibling converged on the eviction').to.equal(false);
+			expect(await waitFor(() => !siblingEngine.holds(TOPIC, participant.bytes), 5_000), 'the sibling converged on the eviction').to.equal(true);
 		} finally {
 			await mesh.stop();
 		}

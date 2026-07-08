@@ -1,5 +1,6 @@
 import { expect } from 'chai';
 import { sha256 } from '@noble/hashes/sha2.js';
+import { waitFor } from '../../src/testing/async-wait.js';
 import { createCohortMemberEngine } from '../../src/cohort-topic/member-engine.js';
 import { createRegistrationStore } from '../../src/cohort-topic/registration/store.js';
 import { createRenewalCohortSide } from '../../src/cohort-topic/registration/renewal.js';
@@ -348,7 +349,9 @@ describe('cohort-topic / member-engine: followOn cold-start admission', () => {
 		const fwd = coldStart.get(TOPIC);
 		expect(fwd, 'the child forwarder was instantiated').to.not.equal(undefined);
 		expect(fwd!.tier, 'instantiated at the child tree tier (d = 1)').to.equal(1);
-		await new Promise<void>((r) => setTimeout(r, 0)); // flush the background parent registration
+		// The child's parent registration is kicked off as a background promise; poll for the observable call
+		// rather than a fixed macrotask flush.
+		await waitFor(() => parentCalls() === 1, { description: 'the tier-1 child kicks off registration with its tier-0 parent' });
 		expect(parentCalls(), 'the tier-1 child kicks off registration with its tier-0 parent').to.equal(1);
 	});
 
