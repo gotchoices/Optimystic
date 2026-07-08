@@ -159,7 +159,7 @@ record.disputeEvidence = {
 
 ### Current Behavior: Async Dispute
 
-Currently, disputes run asynchronously — the transaction commits first, then the minority can challenge. Arbitrators are selected by ring distance (FRET) beyond the original cluster, re-execute the transaction, and vote. A 2/3 super-majority of decisive votes determines the outcome. **However, this async path is also not wired in production today: `initiateDispute` (`dispute-service.ts:137`) has no production caller, and the dispute service is off by default (`disputeEnabled = false`, `dispute/types.ts:124`). The `disputed` flag and `disputeEvidence` fields on `ClusterRecord` are set on super-majority commit despite minority rejection (`cluster-coordinator.ts:299-332`), but no arbitration round runs end-to-end in the field.**
+Currently, disputes run asynchronously — the transaction commits first, then the minority can challenge. Arbitrators are selected by ring distance (FRET) beyond the original cluster, re-execute the transaction, and vote. A 2/3 super-majority of decisive votes determines the outcome. **However, this async path is also not wired in production today: `initiateDispute` (`dispute-service.ts:137`) has no production caller, and the dispute service is off by default (`disputeEnabled = false`, `dispute/types.ts:124`). The `disputed` flag and `disputeEvidence` fields on `ClusterRecord` are set on super-majority commit despite minority rejection (`cluster-coordinator.ts:312-332`), but no arbitration round runs end-to-end in the field.**
 
 **Target change**: disputes will be synchronous (block the transaction) with cascading escalation.
 
