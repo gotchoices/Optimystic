@@ -18,7 +18,7 @@ import { StorageRepo, withBlockCommitLatch } from './storage/storage-repo.js';
 import { BlockStorage } from './storage/block-storage.js';
 import { MemoryRawStorage } from './storage/memory-storage.js';
 import type { IRawStorage } from './storage/i-raw-storage.js';
-import { clusterMember, type ReconcileBlockCallback, type CommitCertificateSink } from './cluster/cluster-repo.js';
+import { clusterMember, type ReconcileBlockCallback, type CommitCertificateSink, type DeriveExpectedClusterCallback } from './cluster/cluster-repo.js';
 import { selectQuorumRev, selectQuorumBlock, canonicalBlockHash, type RevClaim, type BlockHashCandidate } from './cluster/quorum-restore.js';
 import { createCommitCertStore, makeClusterCommitCertExtractor, type CommitCertStore } from './cluster/commit-cert.js';
 import { coordinatorRepo } from './repo/coordinator-repo.js';
@@ -606,7 +606,11 @@ export async function createLibp2pNodeBase(
 		minAbsoluteClusterSize: 2,
 		allowClusterDownsize: options.clusterPolicy?.allowDownsize ?? true,
 		clusterSizeTolerance: options.clusterPolicy?.sizeTolerance ?? 0.5,
-		partitionDetectionWindow: 60000
+		partitionDetectionWindow: 60000,
+		// Configured full cluster size — the member's own reference for "full size" in the membership
+		// admission gate (a below-full-size declared set under low FRET confidence is refused as a possible
+		// self-shrink). Matches the size threaded into the coordinator below.
+		clusterSize: options.clusterSize ?? 10
 	};
 
 	// Fetch a block archive from one cohort peer over the sync protocol, bounded by a
@@ -698,6 +702,24 @@ export async function createLibp2pNodeBase(
 		await storageRepo.saveReplicatedBlock(blockId, agreed.block, { actionId: selected.actionId, rev: selected.rev });
 	};
 
+	// Member-side membership derivation for the admission gate: independently re-derive this block's
+	// responsible cluster from the SAME source the coordinator uses (IKeyNetwork.findCluster), plus FRET's
+	// network-size confidence. A member gates a coordinator-declared peer set against this view before
+	// voting, so a self-shrunk minority-partition set cannot be voted into super-majority (see cluster-repo
+	// admitMembership). No FRET ⇒ confidence 0 ⇒ the gate fails closed for any downsize.
+	const deriveExpectedCluster: DeriveExpectedClusterCallback = async (blockId) => {
+		const peers = await keyNetwork.findCluster(new TextEncoder().encode(blockId));
+		let confidence = 0;
+		if (fretSvc) {
+			try {
+				confidence = fretSvc.getNetworkSizeEstimate().confidence;
+			} catch {
+				// Leave confidence 0 → fail closed for downsizing.
+			}
+		}
+		return { peers: peers ?? {}, confidence };
+	};
+
 	clusterImpl = clusterMember({
 		storageRepo,
 		peerNetwork: keyNetwork,
@@ -711,7 +733,8 @@ export async function createLibp2pNodeBase(
 		consensusConfig,
 		stateStore: options.transactionStateStore,
 		reconcileBlock,
-		onCommitCertificate
+		onCommitCertificate,
+		deriveExpectedCluster
 		// `recomputeArbitratorSet` (invalidation layer-2) is intentionally NOT wired here yet: a live FRET
 		// recompute needs a churn-tolerance window so it does not false-reject legitimate certificates from
 		// late-joiners (a liveness regression). Until that is tuned against live topology — and the
@@ -724,7 +747,7 @@ export async function createLibp2pNodeBase(
 		keyNetwork,
 		createClusterClient,
 		{
-			clusterSize: options.clusterSize ?? 10,
+			// clusterSize is now part of consensusConfig (member + coordinator share one reference).
 			...consensusConfig
 		},
 		fretSvc,

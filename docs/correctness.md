@@ -99,13 +99,18 @@ Suppose the network partitions into subsets *A* and *B*. For a block with cluste
 
 This requires ⌈0.75K⌉ + ⌈0.75K⌉ ≤ K honest participating peers, which simplifies to approximately 1.5K ≤ K — a contradiction. Therefore at most one partition can achieve super-majority.
 
-This counting argument assumes both partitions are voting on *the same K-peer cluster*. Membership binding (§2) makes that assumption checkable rather than implicit: for version-2 records the peer set is bound into the `messageHash`, so a partition that promises/commits against a different (e.g. self-shrunk) peer set is signing a *different* `messageHash` — a distinct transaction, not a second super-majority for the same one. (This ticket binds the set into the identity; rejecting an *illegitimate* declared set — the self-shrink / partition defense proper — is the membership admission gate follow-up.)
+This counting argument assumes both partitions are voting on *the same K-peer cluster*. Two mechanisms make that assumption enforceable rather than implicit:
+
+- **Membership binding (§2)** folds the peer set into the `messageHash` for version-2 records, so a partition that promises/commits against a different (e.g. self-shrunk) peer set is signing a *different* `messageHash` — a distinct transaction, not a second super-majority for the same one. Binding alone, however, does not stop a coordinator from *choosing* a smaller `K′ < K` cluster and reaching ⌈0.75·K′⌉ of it: both sides could bind their own shrunk sets and each reach super-majority of its own `K′`.
+- **The membership admission gate** closes that residual self-shrink hole. Before a cluster member signs an `approve`, it independently re-derives its own view `E` of the block's responsible cluster (from `IKeyNetwork.findCluster`) and refuses to vote unless the coordinator's declared set `D` is a legitimate cluster it belongs to: `D` must contain the member, must not be a shrink below `⌈admissionFraction · K_est⌉` of the member's *own* confident cluster-size estimate `K_est = |E|`, and must lie within `clusterSizeTolerance` of `E`. Crucially, when the member **cannot confidently derive** `E` — exactly what a partition induces, since FRET's network-size confidence collapses when peers vanish — the gate **fails closed**: it refuses any below-full-size `D` (measured against the configured full `clusterSize`), so a member on a minority side cannot be recruited to vote a self-shrunk cluster into super-majority. A member declining emits an explicit `membership-not-admitted` reject (feeding the dispute accounting), not a silent timeout. The `allowUnvalidatedSmallCluster` opt-in is the single documented escape hatch (single-node / local dev knowingly below the floor), mirroring the coordinator's `validateSmallCluster` posture.
+
+Because each honest member enforces the *same* `K` from its own confident estimate and fails closed under low confidence, the minority partition cannot assemble even ⌈0.75·K′⌉ *admitting* members for its shrunk `K′` — the counting contradiction is restored on the members' side, not just assumed. Membership is thus something the members **agree on**, not merely something the coordinator declares. See §7.1 (Sybil) and §7.2 (partition).
 
 Additionally, the self-coordination guard detects network shrinkage exceeding 50% from the high-water mark and blocks writes. The partition detector flags rapid churn (≥5 peer departures in 10 seconds) as a potential partition, suppressing transaction initiation.
 
-**Bound.** This holds for any partition split where neither side has ≥75% of the cluster. A partition where one side retains ≥75% of peers can commit — this is correct behavior, as the larger partition is the "real" network.
+**Bound.** This holds for any partition split where neither side has ≥75% of the cluster. A partition where one side retains ≥75% of peers can commit — this is correct behavior, as the larger partition is the "real" network. A side that genuinely *is* the surviving network (peers truly gone, not partitioned away) is admitted by the gate's confident path — a confident small `K_est` legitimizes a correspondingly small cluster; only an *unjustified* shrink (low confidence, or `|D|` far below `K_est`) is refused.
 
-**Depends on:** Super-majority threshold (75%), partition detection, self-coordination guard.
+**Depends on:** Super-majority threshold (75%), membership binding (§2), the member-side membership admission gate, FRET network-size confidence, partition detection, self-coordination guard.
 
 ### Theorem 3: Atomicity (Multi-Collection All-or-Nothing)
 
@@ -416,14 +421,15 @@ The honest majority assumption (§1.5) counts *nodes*, not *identities*. A Sybil
 **Mitigations:**
 - Node identity is bound to Ed25519 key pairs (cost of identity generation).
 - FRET network size estimation detects anomalous density and flags low-confidence estimates.
-- The `validateSmallCluster()` check compares local cluster size against FRET's global estimate.
+- The `validateSmallCluster()` check compares local cluster size against FRET's global estimate (coordinator side).
+- The **member-side membership admission gate** (see Theorem 2) makes each cluster member independently re-derive and admit the responsible set before voting, so a coordinator cannot unilaterally shrink a block's cluster to a Sybil-dominated slice and have honest members rubber-stamp it — a below-floor or low-confidence declared set is refused.
 - Dispute escalation recruits validators from progressively wider ring segments, diluting the Sybil attacker's influence.
 
 **Bound.** Sybil resistance is proportional to the cost of key generation and the effectiveness of FRET's density estimation. A sufficiently resourced attacker with N/2 identities breaks the honest majority assumption entirely.
 
 ### 7.2 Network Partition Duration
 
-During a partition, the minority partition is unavailable for writes. Read-only operations from local cache continue to work but may serve stale data.
+During a partition, the minority partition is unavailable for writes. Read-only operations from local cache continue to work but may serve stale data. Write-unavailability on the minority side is *enforced*, not merely expected: the member-side membership admission gate (see Theorem 2) fails closed under the low FRET confidence a partition induces, so minority members refuse to admit a self-shrunk cluster and no super-majority forms there.
 
 **Healing.** When partitions heal, divergent state is reconciled:
 - *Behind*: normal sync catches up.

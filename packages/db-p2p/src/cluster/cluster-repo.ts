@@ -1,4 +1,4 @@
-import type { IRepo, ClusterRecord, Signature, RepoMessage, ITransactionValidator, ClusterConsensusConfig, CommitResult, BlockId, ActionId, ActionRev, CommitRequest, CommitCert, InvalidateRequest } from "@optimystic/db-core";
+import type { IRepo, ClusterRecord, ClusterPeers, Signature, RepoMessage, ITransactionValidator, ClusterConsensusConfig, CommitResult, BlockId, ActionId, ActionRev, CommitRequest, CommitCert, InvalidateRequest } from "@optimystic/db-core";
 import type { ICluster } from "@optimystic/db-core";
 import type { IPeerNetwork } from "@optimystic/db-core";
 import { blockIdsForTransforms } from "@optimystic/db-core";
@@ -97,6 +97,33 @@ export type InvalidationApplySink = (request: InvalidateRequest) => Promise<void
  */
 export type RecomputeArbitratorSetCapability = ArbitratorSetRecompute;
 
+/**
+ * The member's own independently-derived view of a block's responsible cluster, plus FRET's confidence in
+ * the underlying network-size estimate (0..1). Returned by {@link DeriveExpectedClusterCallback} and
+ * consumed by {@link ClusterMember}'s membership admission gate: the member checks a coordinator-declared
+ * peer set against `peers` (its expected set `E`) and gates on `confidence` (low confidence ⇒ fail closed
+ * for any downsizing, the partition posture).
+ */
+export type ExpectedClusterView = {
+	/** The member's own derived responsible-peer set for the block (its view of the legitimate cluster). */
+	peers: ClusterPeers;
+	/** FRET's confidence in the current network-size estimate (0..1); ≤ threshold ⇒ treated as untrusted. */
+	confidence: number;
+};
+
+/**
+ * Independently derive this member's own view of a block's responsible cluster. Injected so
+ * {@link ClusterMember} stays transport-agnostic — the composition root supplies it from
+ * `IKeyNetwork.findCluster` + FRET (mirroring how the coordinator derives the cluster). Absent on nodes
+ * that cannot derive a view (no FRET, unit tests): with no derived view AND no configured full-size
+ * reference the gate preserves legacy approve behavior, but a configured `clusterSize` still lets the gate
+ * fail closed on an unjustified downsize. See {@link ClusterMember} admission gate.
+ */
+export type DeriveExpectedClusterCallback = (blockId: BlockId) => Promise<ExpectedClusterView>;
+
+/** Stable reject reason a member emits when a declared peer set fails the membership admission gate. */
+export const MEMBERSHIP_NOT_ADMITTED = 'membership-not-admitted';
+
 interface ClusterMemberComponents {
 	storageRepo: IRepo;
 	peerNetwork: IPeerNetwork;
@@ -118,6 +145,8 @@ interface ClusterMemberComponents {
 	onInvalidate?: InvalidationApplySink;
 	/** Layer-2 arbitrator-set recompute for invalidation verification; see {@link RecomputeArbitratorSetCapability}. */
 	recomputeArbitratorSet?: RecomputeArbitratorSetCapability;
+	/** Member-side cluster derivation for the membership admission gate; see {@link DeriveExpectedClusterCallback}. */
+	deriveExpectedCluster?: DeriveExpectedClusterCallback;
 }
 
 export function clusterMember(components: ClusterMemberComponents): ClusterMember {
@@ -136,7 +165,8 @@ export function clusterMember(components: ClusterMemberComponents): ClusterMembe
 		components.reconcileBlock,
 		components.onCommitCertificate,
 		components.onInvalidate,
-		components.recomputeArbitratorSet
+		components.recomputeArbitratorSet,
+		components.deriveExpectedCluster
 	);
 }
 
@@ -180,8 +210,23 @@ export class ClusterMember implements ICluster {
 	private readonly expirationInterval: NodeJS.Timeout;
 	private readonly cleanupInterval: NodeJS.Timeout;
 
+	/**
+	 * Confidence floor at/below which FRET's network-size view is treated as untrustworthy for the
+	 * membership gate. Above it the member trusts its derived view (confident path); at/below it the gate
+	 * fails closed for downsizing. Matches the coordinator's `validateSmallCluster` confidence gate (> 0.5).
+	 */
+	private static readonly MembershipConfidenceThreshold = 0.5;
+
 	/** Effective super-majority threshold. Defaults to 1.0 (unanimity) for backward compatibility. */
 	private readonly superMajorityThreshold: number;
+	// Membership admission gate parameters (see {@link admitMembership}). Read once from consensusConfig
+	// so the gate has stable thresholds independent of the (untrusted) values a record declares.
+	private readonly minAbsoluteClusterSize: number;
+	private readonly clusterSizeTolerance: number;
+	private readonly membershipAdmissionFraction: number;
+	/** Configured full cluster size, or undefined when unknown (then the gate cannot judge a downsize). */
+	private readonly configuredClusterSize: number | undefined;
+	private readonly allowUnvalidatedSmallCluster: boolean;
 
 	constructor(
 		private readonly storageRepo: IRepo,
@@ -199,9 +244,15 @@ export class ClusterMember implements ICluster {
 		private readonly reconcileBlock?: ReconcileBlockCallback,
 		private readonly onCommitCertificate?: CommitCertificateSink,
 		private readonly onInvalidate?: InvalidationApplySink,
-		private readonly recomputeArbitratorSet?: RecomputeArbitratorSetCapability
+		private readonly recomputeArbitratorSet?: RecomputeArbitratorSetCapability,
+		private readonly deriveExpectedCluster?: DeriveExpectedClusterCallback
 	) {
 		this.superMajorityThreshold = consensusConfig?.superMajorityThreshold ?? 1.0;
+		this.minAbsoluteClusterSize = consensusConfig?.minAbsoluteClusterSize ?? 3;
+		this.clusterSizeTolerance = consensusConfig?.clusterSizeTolerance ?? 0.5;
+		this.membershipAdmissionFraction = consensusConfig?.membershipAdmissionFraction ?? 0.75;
+		this.configuredClusterSize = consensusConfig?.clusterSize;
+		this.allowUnvalidatedSmallCluster = consensusConfig?.allowUnvalidatedSmallCluster ?? false;
 		// Periodically clean up expired transactions (.unref() so tests/short-lived processes can exit)
 		this.expirationInterval = setInterval(() => this.queueExpiredTransactions(), 60000);
 		this.expirationInterval.unref();
@@ -727,8 +778,11 @@ export class ClusterMember implements ICluster {
 	}
 
 	private async handlePromiseNeeded(record: ClusterRecord): Promise<ClusterRecord> {
-		// Validate pend operations if we have a validator
-		const validationResult = await this.validatePendOperations(record);
+		// Membership admission gate runs BEFORE pend validation: a member independently checks the declared
+		// peer set is a legitimate cluster it belongs to, and refuses (reject vote) rather than rubber-stamping
+		// a set the coordinator chose (e.g. a self-shrunk minority-partition set). On admission failure we skip
+		// pend validation entirely and emit the membership rejection.
+		const validationResult = await this.evaluatePromise(record);
 
 		const promiseHash = await this.computePromiseHash(record);
 		const type = validationResult.valid ? 'approve' as const : 'reject' as const;
@@ -753,6 +807,153 @@ export class ClusterMember implements ICluster {
 				[this.peerId.toString()]: signature
 			}
 		};
+	}
+
+	/**
+	 * The full promise-phase decision for a record: admit the declared membership FIRST, then (only if
+	 * admitted) validate its pend operations. Failing either yields a `{ valid:false, reason }` the caller
+	 * turns into a `reject` vote. Splitting membership from pend validation keeps the reason strings
+	 * distinct — a `membership-not-admitted` reject is a different signal (feeds the dispute path) than a
+	 * stale-revision / custom-validator reject.
+	 */
+	private async evaluatePromise(record: ClusterRecord): Promise<{ valid: boolean; reason?: string }> {
+		const admission = await this.admitMembership(record);
+		if (!admission.admit) {
+			return { valid: false, reason: admission.reason ?? MEMBERSHIP_NOT_ADMITTED };
+		}
+		return await this.validatePendOperations(record);
+	}
+
+	/**
+	 * Membership admission gate. Decides whether the coordinator-declared peer set (`record.peers`, call it
+	 * `D`) is a *legitimate* cluster this member may vote inside, judged against the member's OWN
+	 * independently-derived view — not against anything the (untrusted) record declares about its size.
+	 * Evaluated on the promise path before the member signs an approve.
+	 *
+	 * The predicate admits `D` iff ALL hold:
+	 *  1. **Self-membership** — this member's id ∈ `D`; else this block is not its responsibility (and a
+	 *     coordinator must not route a record to a non-member to pad approval counts).
+	 *  2. **Not a self-shrink below the floor** — with a confident derived view `E`, `|D| ≥ ⌈fraction·|E|⌉`
+	 *     (and ≥ minAbsoluteClusterSize). `|E|` is the member's own confident cluster-size estimate `K_est`,
+	 *     so a minority-partition set (small `D`) is rejected against the member's larger view.
+	 *  3. **Consistency with the derived view** — `|D △ E|` within `clusterSizeTolerance·|E|`; honest churn
+	 *     of a peer or two is absorbed, a wholesale-disjoint or half-size set is not.
+	 *
+	 * **Fail-closed posture.** When the member cannot confidently derive `E` (no capability, low FRET
+	 * confidence — exactly what a partition induces), it must refuse any *downsizing* decision: a
+	 * below-full-size `D` is rejected against the configured full `clusterSize`. With NEITHER a confident
+	 * view NOR a configured full size the gate cannot judge a downsize at all, so it preserves the legacy
+	 * approve behavior (backward-compatible for nodes/tests with no derivation wired). `allowUnvalidatedSmallCluster`
+	 * is the explicit opt-in (single-node / local dev knowingly below the safe floor), matching the
+	 * coordinator's `validateSmallCluster` semantics.
+	 */
+	private async admitMembership(record: ClusterRecord): Promise<{ admit: boolean; reason?: string }> {
+		const ourId = this.peerId.toString();
+		const declared = Object.keys(record.peers ?? {});
+
+		// Predicate 1: self-membership. Always enforced (independent of any opt-in): a member does not vote
+		// in a cluster it is not part of.
+		if (!declared.includes(ourId)) {
+			log('cluster-member:admission-reject', { messageHash: record.messageHash, reason: 'self-not-member', declaredSize: declared.length });
+			return { admit: false, reason: `${MEMBERSHIP_NOT_ADMITTED}:self-not-member` };
+		}
+
+		// Explicit opt-in: knowingly transact below the safe floor (single-node / local dev). Skips the
+		// size/consistency gates but not self-membership above.
+		if (this.allowUnvalidatedSmallCluster) {
+			return { admit: true };
+		}
+
+		const derived = await this.deriveExpectedClusterView(record);
+		const confident = derived !== undefined && derived.confidence > ClusterMember.MembershipConfidenceThreshold;
+
+		if (!confident) {
+			// Fail closed for downsizing under low/absent confidence. A full-size (or larger) declared set is
+			// still admitted — there is nothing to shrink. Without a configured full-size reference we cannot
+			// tell a downsize from a legitimate small cluster, so we preserve legacy approve behavior.
+			if (this.configuredClusterSize === undefined) {
+				return { admit: true };
+			}
+			if (declared.length >= this.configuredClusterSize) {
+				return { admit: true };
+			}
+			log('cluster-member:admission-reject', {
+				messageHash: record.messageHash,
+				reason: 'low-confidence-downsize',
+				declaredSize: declared.length,
+				configuredClusterSize: this.configuredClusterSize,
+				confidence: derived?.confidence
+			});
+			return { admit: false, reason: `${MEMBERSHIP_NOT_ADMITTED}:low-confidence-downsize` };
+		}
+
+		const expected = Object.keys(derived!.peers ?? {});
+		const kEst = expected.length;
+
+		// Predicate 2: floor derived from the member's OWN confident estimate.
+		const floor = Math.max(this.minAbsoluteClusterSize, Math.ceil(this.membershipAdmissionFraction * kEst));
+		if (declared.length < floor) {
+			log('cluster-member:admission-reject', {
+				messageHash: record.messageHash,
+				reason: 'below-floor',
+				declaredSize: declared.length,
+				floor,
+				kEst
+			});
+			return { admit: false, reason: `${MEMBERSHIP_NOT_ADMITTED}:below-floor` };
+		}
+
+		// Predicate 3: consistency with the derived view within tolerance.
+		const symmetricDiff = ClusterMember.symmetricDifferenceSize(declared, expected);
+		const maxDiff = Math.ceil(this.clusterSizeTolerance * kEst);
+		if (symmetricDiff > maxDiff) {
+			log('cluster-member:admission-reject', {
+				messageHash: record.messageHash,
+				reason: 'inconsistent-with-derived-view',
+				declaredSize: declared.length,
+				kEst,
+				symmetricDiff,
+				maxDiff
+			});
+			return { admit: false, reason: `${MEMBERSHIP_NOT_ADMITTED}:inconsistent-with-derived-view` };
+		}
+
+		return { admit: true };
+	}
+
+	/**
+	 * Derive this member's own view of the record's block cluster via the injected capability, or
+	 * `undefined` when it cannot (no capability, no coordinating block id, or a derivation error — all of
+	 * which the gate treats as "not confident"). Derived from the record's coordinating block, the same key
+	 * the coordinator used to select the cluster.
+	 */
+	private async deriveExpectedClusterView(record: ClusterRecord): Promise<ExpectedClusterView | undefined> {
+		if (!this.deriveExpectedCluster) {
+			return undefined;
+		}
+		const blockId = record.coordinatingBlockIds?.[0];
+		if (blockId === undefined) {
+			return undefined;
+		}
+		try {
+			// NOTE: derives (findCluster) once per inbound record on the promise path — one routing lookup
+			// per vote. If this shows up as hot, cache the derived view per (blockId, short TTL): it is a
+			// pure read of current topology, so a few-seconds-stale view is safe for admission.
+			return await this.deriveExpectedCluster(blockId as BlockId);
+		} catch (err) {
+			log('cluster-member:derive-expected-cluster-error', { messageHash: record.messageHash, error: (err as Error).message });
+			return undefined;
+		}
+	}
+
+	/** |A △ B| over two id lists (order-independent set symmetric difference). */
+	private static symmetricDifferenceSize(a: string[], b: string[]): number {
+		const setA = new Set(a);
+		const setB = new Set(b);
+		let count = 0;
+		for (const x of setA) if (!setB.has(x)) count++;
+		for (const x of setB) if (!setA.has(x)) count++;
+		return count;
 	}
 
 	/**

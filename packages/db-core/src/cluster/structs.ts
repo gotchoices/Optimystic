@@ -58,6 +58,20 @@ export interface ClusterConsensusConfig {
 	allowClusterDownsize: boolean;
 	/** Tolerance for cluster size variance as fraction (default 0.5 = 50%) */
 	clusterSizeTolerance: number;
+	/**
+	 * Configured full cluster size (the responsibility-K). Present so a cluster **member** has its own
+	 * reference for "full size" when running the membership admission gate — a below-full-size declared
+	 * peer set under low derivation confidence is refused (see {@link ClusterMember} admission gate).
+	 * The coordinator supplies this as a required `clusterSize` via `ClusterConsensusConfig & { clusterSize: number }`.
+	 */
+	clusterSize?: number;
+	/**
+	 * Fraction of the member's OWN confident cluster-size estimate a declared peer set must meet to be
+	 * admitted for voting (default 0.75). Below `⌈membershipAdmissionFraction · K_est⌉` a declared set is
+	 * treated as an unjustified self-shrink and the member declines to approve. Distinct from
+	 * {@link superMajorityThreshold} (the vote-counting threshold) — this gates *which set* may be voted on.
+	 */
+	membershipAdmissionFraction?: number;
 	/** Window for detecting partition in milliseconds (default 60000 = 1 min) */
 	partitionDetectionWindow: number;
 	/** Enable dispute escalation protocol (default false) */
