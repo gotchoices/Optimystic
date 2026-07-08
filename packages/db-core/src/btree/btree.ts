@@ -70,16 +70,24 @@ export class BTree<TKey, TEntry> {
 
 	/** Attempts to find the given key
 	 * @returns Path to the key or the "crack" before it.  If `on` is true on the resulting path, the key was found.
-	 * 	If `on` is false, next() and prior() can attempt to move to the nearest match. */
-	async find(key: TKey): Promise<Path<TKey, TEntry>> {
-		return await this.getPath(await this.trunk.get(), key);
+	 * 	If `on` is false, next() and prior() can attempt to move to the nearest match.
+	 * @param navigate when true, the interior descent nodes are captured as droppable `navigation`
+	 * 	reads (see {@link getPath}). DEFAULT false: `find` returns a Path a caller may use to seed a
+	 * 	range scan (`ascending`/`next`), whose result depends on tree shape, so its structural reads
+	 * 	must stay retained. Only {@link get} — a point lookup with no such escape — opts in. */
+	async find(key: TKey, navigate = false): Promise<Path<TKey, TEntry>> {
+		return await this.getPath(await this.trunk.get(), key, navigate);
 	}
 
 	/** Retrieves the entry for the given key.
 	 * Use find instead for a path to the key, the nearest match, or as a basis for navigation.
 	 * @returns the entry for the given key if found; undefined otherwise. */
 	async get(key: TKey): Promise<TEntry | undefined> {
-		return this.at(await this.find(key));
+		// Value-of-key point lookup: the result depends ONLY on the terminal leaf's content, so the
+		// interior descent nodes are pure navigation and are dropped from the OCC conflict set. The
+		// returned Path is consumed by `at` and discarded — it never seeds a scan — so navigate=true
+		// is safe here (unlike the public `find`).
+		return this.at(await this.find(key, /* navigate */ true));
 	}
 
 	/** @returns the entry for the given path if on an entry; undefined otherwise. */
@@ -344,18 +352,38 @@ export class BTree<TKey, TEntry> {
 		return endPath;
 	}
 
-	protected async getPath(node: ITreeNode, key: TKey): Promise<Path<TKey, TEntry>> {
+	/** Descend from `node` toward `key`, building the path. When `navigate` is true this is a point
+	 *  lookup (from {@link get}): each interior branch read below the root is captured as a droppable
+	 *  `navigation` read, and the terminal leaf is upgraded back to a retained `value` read — the
+	 *  result depends only on the leaf, and any concurrent restructuring that would change the result
+	 *  also bumps the leaf's revision (Theorem 5), so the interior reads are redundant. When false
+	 *  (find/range/scan/write descents) every read stays `value` (retained). */
+	protected async getPath(node: ITreeNode, key: TKey, navigate = false): Promise<Path<TKey, TEntry>> {
 		if (node.header.type === TreeLeafBlockType) {
 			const leaf = node as LeafNode<TEntry>;
+			if (navigate) {
+				// The leaf ends a point-lookup descent: its content is the load-bearing VALUE read.
+				// Its parent fetched it as `navigation` (a child's type is unknown before reading);
+				// upgrade it (value-wins) so it is retained while the interior nodes above are dropped.
+				this.markReadValue(leaf.header.id);
+			}
 			const [on, index] = this.indexOfEntry(leaf.entries, key);
 			return new Path<TKey, TEntry>([], leaf, index, on, this._version);
 		} else {
 			const branch = node as BranchNode<TKey>;
 			const index = this.indexOfKey(branch.partitions, key);
-			const path = await this.getPath(await get(this.store, branch.nodes[index]!), key);
+			const child = await get(this.store, branch.nodes[index]!, navigate ? 'navigation' : 'value');
+			const path = await this.getPath(child, key, navigate);
 			path.branches.unshift(new PathBranch(branch, index));
 			return path;
 		}
+	}
+
+	/** Upgrade a captured read of `id` to a retained `value` read via the store chain's read
+	 *  collector (duck-typed — a no-op for stores without one, e.g. test doubles or log-walk
+	 *  caches). Used by a point lookup to pin its terminal leaf. */
+	private markReadValue(id: BlockId) {
+		(this.store as { markReadValue?: (id: BlockId) => void }).markReadValue?.(id);
 	}
 
 	private indexOfEntry(entries: TEntry[], key: TKey): [on: boolean, index: number] {

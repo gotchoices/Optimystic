@@ -1,5 +1,5 @@
 import { Atomic } from './atomic.js';
-import type { IBlock, BlockId, BlockStore, BlockType, BlockHeader, BlockOperation } from '../index.js';
+import type { IBlock, BlockId, BlockStore, BlockType, BlockHeader, BlockOperation, ReadPurpose } from '../index.js';
 
 /**
  * Opaque handle to an in-flight atomic scope.
@@ -43,7 +43,10 @@ export class AtomicProxy<T extends IBlock> implements BlockStore<T> {
 		this._active = store;
 	}
 
-	async tryGet(id: BlockId): Promise<T | undefined> { return this._active.tryGet(id); }
+	async tryGet(id: BlockId, purpose?: ReadPurpose): Promise<T | undefined> { return this._active.tryGet(id, purpose); }
+	/** Forward a leaf-value upgrade to the active store (duck-typed; the Tracker/CacheSource chain
+	 *  implements it). Keeps navigation-read filtering working for a B-tree bound to this proxy. */
+	markReadValue(id: BlockId): void { (this._active as { markReadValue?: (id: BlockId) => void }).markReadValue?.(id); }
 	insert(block: T): void { this._active.insert(block); }
 	update(blockId: BlockId, op: BlockOperation): void { this._active.update(blockId, op); }
 	delete(blockId: BlockId): void { this._active.delete(blockId); }

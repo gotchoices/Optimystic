@@ -1,4 +1,4 @@
-import type { IBlock, BlockId, BlockStore as IBlockStore, BlockHeader, BlockOperation, BlockType, BlockSource as IBlockSource } from "../index.js";
+import type { IBlock, BlockId, BlockStore as IBlockStore, BlockHeader, BlockOperation, BlockType, BlockSource as IBlockSource, ReadPurpose } from "../index.js";
 import { applyOperation, applyOperations, emptyTransforms, blockIdsForTransforms, ensured } from "../index.js";
 
 /** A block store that collects transformations, without applying them to the underlying source.
@@ -26,7 +26,7 @@ export class Tracker<T extends IBlock> implements IBlockStore<T> {
 		return typeof src.getGeneration === 'function' ? src.getGeneration(id) : undefined;
 	}
 
-	async tryGet(id: BlockId): Promise<T | undefined> {
+	async tryGet(id: BlockId, purpose: ReadPurpose = 'value'): Promise<T | undefined> {
 		// NOTE: precedence here is insert > delete > source+updates. In a well-formed transform an id is
 		// never in both `inserts` and `deletes` (insert/delete each clear the other), so order is moot. It
 		// only diverges from the canonical `applyTransform` (delete-last-wins, see struct.ts / helpers.ts:132)
@@ -46,7 +46,7 @@ export class Tracker<T extends IBlock> implements IBlockStore<T> {
 		if (memo && (gen === undefined || memo.gen === gen)) {
 			return structuredClone(memo.block);           // O(block size), no replay
 		}
-		const block = await this.source.tryGet(id);
+		const block = await this.source.tryGet(id, purpose);
 		if (block) {
 			const ops = this.transforms.updates?.[id] ?? [];
 			if (ops.length > 0) {
@@ -62,6 +62,14 @@ export class Tracker<T extends IBlock> implements IBlockStore<T> {
 			}
 		}
 		return block;                                    // no-ops path unchanged (source already cloned)
+	}
+
+	/** Forward a leaf-value upgrade down to the source's read collector (duck-typed: only the
+	 *  CacheSource layer implements it). Lets the B-tree point-lookup descent, which reads through
+	 *  this tracker, pin its terminal leaf as a `value` read after tagging interior nodes
+	 *  `navigation`. No-op for sources without a collector (test doubles, log-walk caches). */
+	markReadValue(id: BlockId): void {
+		(this.source as { markReadValue?: (id: BlockId) => void }).markReadValue?.(id);
 	}
 
 	generateId(): BlockId {

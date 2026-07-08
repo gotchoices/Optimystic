@@ -36,6 +36,11 @@ export class Tree<TKey, TEntry> implements TreeReadView<TKey, TEntry> {
 		id: CollectionId,
 		keyFromEntry = (entry: TEntry) => entry as unknown as TKey,
 		compare = (a: TKey, b: TKey) => a < b ? -1 : a > b ? 1 : 0,
+		/** B-tree node fan-out. Defaults to the BTree default (64). Exposed mainly so tests can
+		 *  force a multi-level tree with few entries (a small capacity), which is what exercises the
+		 *  interior-navigation read-exclusion path — with the default you would need thousands of
+		 *  entries before a descent has any interior branch between root and leaf. */
+		nodeCapacity?: number,
 	): Promise<Tree<TKey, TEntry>> {
 		// Tricky bootstrapping here:
 		// We need the root id to initialize the collection header, so we create the btree in the create collection header callback.
@@ -54,6 +59,7 @@ export class Tree<TKey, TEntry> implements TreeReadView<TKey, TEntry> {
 						new CollectionTrunk(trx, id),
 						keyFromEntry,
 						compare,
+						nodeCapacity,	// keep the write btree's fan-out in lock-step with the read btree
 					);
 					for (const [key, entry] of actions) {
 						if (entry) {
@@ -73,7 +79,7 @@ export class Tree<TKey, TEntry> implements TreeReadView<TKey, TEntry> {
 				btree = BTree.create<TKey, TEntry>(store, (_s, r) => {
 						rootId = r;
 						return new CollectionTrunk(store, id);
-					}, keyFromEntry, compare);
+					}, keyFromEntry, compare, nodeCapacity);
 				return {
 					header: store.createBlockHeader(TreeHeaderBlockType, id),
 					rootId: rootId!,
@@ -82,7 +88,7 @@ export class Tree<TKey, TEntry> implements TreeReadView<TKey, TEntry> {
 		};
 
 		const collection = await Collection.createOrOpen<TreeReplaceAction<TKey, TEntry>>(network, id, init);
-		btree = btree ?? new BTree<TKey, TEntry>(collection.tracker, new CollectionTrunk(collection.tracker, collection.id), keyFromEntry, compare);
+		btree = btree ?? new BTree<TKey, TEntry>(collection.tracker, new CollectionTrunk(collection.tracker, collection.id), keyFromEntry, compare, nodeCapacity);
 		return new Tree<TKey, TEntry>(collection, btree, keyFromEntry, compare);
 	}
 

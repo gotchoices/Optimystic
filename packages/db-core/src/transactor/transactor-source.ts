@@ -1,6 +1,6 @@
 import { randomBytes } from '@noble/hashes/utils.js'
 import { toString as uint8ArrayToString } from 'uint8arrays/to-string'
-import type { IBlock, BlockId, BlockHeader, ITransactor, ActionId, StaleFailure, ActionContext, BlockType, BlockSource, Transforms } from "../index.js";
+import type { IBlock, BlockId, BlockHeader, ITransactor, ActionId, StaleFailure, ActionContext, BlockType, BlockSource, ReadPurpose, Transforms } from "../index.js";
 import type { ReadDependency } from "../transaction/transaction.js";
 import { ReadDependencyCollector } from "../transaction/read-dependency-collector.js";
 
@@ -35,7 +35,7 @@ export class TransactorSource<TBlock extends IBlock> implements BlockSource<TBlo
 		return uint8ArrayToString(randomBytes(32), 'base64url')
 	}
 
-	async tryGet(id: BlockId): Promise<TBlock | undefined> {
+	async tryGet(id: BlockId, purpose: ReadPurpose = 'value'): Promise<TBlock | undefined> {
 		const result = await this.transactor.get({ blockIds: [id], context: this.actionContext });
 		// Guard the per-key entry: some transactors return a sparse result that omits `id`
 		// entirely (e.g. block genuinely not found), so `result` is a truthy object but
@@ -49,9 +49,11 @@ export class TransactorSource<TBlock extends IBlock> implements BlockSource<TBlo
 			// dependency for a nonexistent block. This makes the "absent reads nothing" contract uniform
 			// with the sparse-result case (entry omitted) — see transactor-source.spec.ts sparse test.
 			if (block) {
-				// Record read dependency for optimistic concurrency control
+				// Record read dependency for optimistic concurrency control, carrying the caller's
+				// read purpose (default `value`) so a purely-structural navigation read can later be
+				// dropped from the conflict set (see ReadDependencyCollector / Theorem 5).
 				const rev = state.latest?.rev ?? 0;
-				this.collector.record(id, rev);
+				this.collector.record(id, rev, purpose);
 				this.readRevisions.set(id, rev);
 			}
 			// TODO: if the state reports that there is a pending action, record this so that we are sure to update before syncing

@@ -302,6 +302,14 @@ export class Chain<TEntry> {
 		};
 	}
 
+	// NOTE: chain walks (getTail/getHead/select/next/prev) read via `store.tryGet(id)` with the
+	// DEFAULT read purpose (`value`), so every chain node stays in the OCC conflict set. This is
+	// deliberate: the chain backs the log, whose tail is the commit-ordering race arbiter (OCC
+	// "tail binding"), and enumerations return a shape-dependent result set — both are load-bearing
+	// reads that MUST be retained. The B-tree point-lookup navigation exclusion (ticket 4.7) is NOT
+	// applied here. If chain navigation reads ever need excluding, tag ONLY intermediate hops of a
+	// walk that terminates in a consumed entry, and NEVER the tail/header — get the safety predicate
+	// right first (docs/correctness.md Theorem 5).
 	async getTail(header?: ChainHeaderNode): Promise<ChainPath<TEntry> | undefined> {
 		const headerBlock = header ?? await this.getHeader();
 		let tail = headerBlock ? await this.store.tryGet(headerBlock.tailId) as ChainDataNode<TEntry> : undefined;

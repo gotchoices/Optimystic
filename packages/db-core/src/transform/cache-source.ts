@@ -1,4 +1,4 @@
-import type { IBlock, BlockHeader, BlockId, BlockSource, BlockType, Transforms } from "../index.js";
+import type { IBlock, BlockHeader, BlockId, BlockSource, BlockType, ReadPurpose, Transforms } from "../index.js";
 import { applyOperation } from "../index.js";
 import { LruMap } from "../utility/lru-map.js";
 import { createLogger } from "../logger.js";
@@ -58,26 +58,27 @@ export class CacheSource<T extends IBlock> implements BlockSource<T> {
 		return this.generations.get(id) ?? 0;
 	}
 
-	async tryGet(id: BlockId): Promise<T | undefined> {
+	async tryGet(id: BlockId, purpose: ReadPurpose = 'value'): Promise<T | undefined> {
 		let block = this.cache.get(id);
 		if (block) {
 			// Cache hit: the source is never consulted, so re-emit the revision we learned when this
 			// id was first loaded/folded. Without this a block served from cache records NO read
-			// dependency (the original bug), so its stale-read check could never fire.
+			// dependency (the original bug), so its stale-read check could never fire. Carry the
+			// caller's purpose so a navigation-only cache hit stays droppable from the conflict set.
 			const rev = this.revisions.get(id);
-			if (rev !== undefined) this.collector?.record(id, rev);
+			if (rev !== undefined) this.collector?.record(id, rev, purpose);
 			log('hit id=%s', id);
 		} else {
-			block = await this.source.tryGet(id);
+			block = await this.source.tryGet(id, purpose);
 			if (block) {
 				this.cache.set(id, block);
 				this.bump(id);
 				// Learn the revision from the source (which just served it) and record it. On a miss the
-				// underlying TransactorSource already recorded the same id@rev into the shared collector;
-				// max-wins dedup collapses the two to a single entry.
+				// underlying TransactorSource already recorded the same id@rev/purpose into the shared
+				// collector; max-wins (revision) + value-wins (purpose) collapse the two to one entry.
 				const rev = sourceReadRevision(this.source, id) ?? 0;
 				this.revisions.set(id, rev);
-				this.collector?.record(id, rev);
+				this.collector?.record(id, rev, purpose);
 				log('miss:loaded id=%s cacheSize=%d', id, this.cache.size);
 			} else {
 				// Absent block: record nothing (matches TransactorSource, which skips missing blocks).
@@ -85,6 +86,15 @@ export class CacheSource<T extends IBlock> implements BlockSource<T> {
 			}
 		}
 		return structuredClone(block);
+	}
+
+	/** Upgrade an already-captured read of `id` to a `value` read in the shared collector,
+	 *  retaining it in the conflict set. The B-tree point-lookup descent calls this (through the
+	 *  Tracker, which forwards) to pin the terminal leaf after recording the interior nodes as
+	 *  `navigation`. No-op when no collector is wired (log-walk caches) or the id was never
+	 *  recorded. Duck-typed by the Tracker; keep the name in sync with Tracker.markReadValue. */
+	markReadValue(id: BlockId): void {
+		this.collector?.markValue(id);
 	}
 
 	generateId(): BlockId {
