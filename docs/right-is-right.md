@@ -131,6 +131,7 @@ The actors — client (C), coordinator (O), members (M), enlistees (E) — can e
 - **Escalation termination threshold**: at each level, must enlistees be unanimous to resolve, or does a super-majority suffice? Requiring unanimity is cleaner conceptually (unanimity is always the rule, audience just grows) but a single buggy enlistee could force unnecessary escalation.
 - **Ejection durability**: how are ejection rulings stored and propagated? They likely need to be signed, durable artifacts that new peers in the ring segment can discover — otherwise ejected peers could rejoin immediately.
 - **Rejoin policy**: after ejection (e.g., a node fixes its buggy software), what's the path back? Time-based decay? Original ruling re-validation ("evidence" ruling is kept with evictions?)?
+- **Reputation-locality and gossip propagation**: how ejection rulings and reputation penalties propagate across the network (coordinator selection and cluster expansion down-ranking blacklisted peers) is tracked in [backlog: gossip-reputation-blacklisting](../tickets/backlog/speculative/7.5-gossip-reputation-blacklisting.md).
 
 ## Current Implementation
 

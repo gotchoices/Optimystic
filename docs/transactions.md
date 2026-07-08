@@ -487,6 +487,36 @@ A pre-PEND sync — sometimes called the *Phase 0* optimization — is optional 
 
 The net effect is a client-side optimistic concurrency loop: the collection acts as a local working copy, the network is the source of truth, and conflicts are reconciled through deterministic replay plus an explicit `filterConflict` policy. The in-process data flow (Tracker / CacheSource / TransactorSource) that implements this is summarized in [internals.md](internals.md#data-flow); the `Collection.updateAndSync()` entry point drives the whole loop.
 
+## Read Consistency and Staleness
+
+Reads in Optimystic are served optimistically: a node that holds a block's local copy will serve it without necessarily being the formally-responsible node for that block in the DHT, and without necessarily re-verifying against the cluster on every access. Two mechanisms can cause a read to return data that is behind the cluster's latest committed state.
+
+### Non-responsible reads (soft serves)
+
+If this node is not the designated responsible node for a block, it still serves the read rather than failing — graceful degradation that avoids hard availability failures when the responsible node is temporarily unreachable. No error is surfaced to the caller; only an internal `proximity:get-warning` log line is emitted. The returned data is content-addressed and internally consistent, but may not be the latest revision committed by the cluster.
+
+### Lazy read-repair window
+
+In the default `lazy` read-repair mode, a locally-present block is not re-verified against the cluster until the local copy is older than `readRepairWindowMs` (default: **10 000 ms**). Within that window a read is served from local state without consulting peers.
+
+**Worst-case staleness bound:** within the read-repair window a caller can observe state that is up to one commit behind the cluster's current head. Once the window expires, the next read triggers a lazy repair pass that converges the local copy to the current revision.
+
+Configuration knobs in `ClusterConsensusConfig` (`packages/db-core/src/cluster/structs.ts`):
+
+| Knob | Default | Effect |
+|---|---|---|
+| `readRepairMode` | `'lazy'` | `'lazy'` repairs after the window; `'paranoid'` verifies on every read (no staleness window) |
+| `readRepairWindowMs` | `10000` | How long (ms) a local copy is trusted before a repair is triggered |
+| `readRepairSampleRate` | — | Fraction of reads that trigger a repair check in lazy mode |
+
+Use `readRepairMode: 'paranoid'` for callers that cannot tolerate any staleness.
+
+### Transaction protection vs. bare reads
+
+The staleness concern above applies to **bare reads** — reads whose value is consumed directly by the caller without going through a transaction commit. A read that is used as a *transaction read-dependency* is protected at validation time: validators reject any transaction whose recorded `(blockId, revision)` pairs no longer match current cluster state. Stale data that entered through a lazy-served local copy is caught here and causes the transaction to be rejected and retried against fresh state. See [correctness.md](correctness.md) **Theorem 15 (Read-Path Integrity)** for the formal statement.
+
+A bare soft read carries no such check. If your use case cannot tolerate returning data that may be one commit stale, either set `readRepairMode: 'paranoid'` or wrap the read in a transaction whose commit enforces freshness via the read-dependency check.
+
 ## Key Components
 
 ### 1. Transaction Types (db-core)
