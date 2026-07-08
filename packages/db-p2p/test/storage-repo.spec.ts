@@ -1,9 +1,9 @@
 import { expect } from 'chai';
-import { StorageRepo } from '../src/storage/storage-repo.js';
+import { StorageRepo, commitLatchKey } from '../src/storage/storage-repo.js';
 import { BlockStorage } from '../src/storage/block-storage.js';
 import { MemoryRawStorage } from '../src/storage/memory-storage.js';
-import type { BlockId, ActionId, PendRequest, Transforms, IBlock, BlockHeader, CollectionChangeEvent } from '@optimystic/db-core';
-import { isBlockChangeNotifier } from '@optimystic/db-core';
+import type { BlockId, ActionId, ActionRev, PendRequest, Transforms, IBlock, BlockHeader, CollectionChangeEvent } from '@optimystic/db-core';
+import { isBlockChangeNotifier, Latches } from '@optimystic/db-core';
 
 const makeHeader = (id: string): BlockHeader => ({
 	id: id as BlockId,
@@ -527,6 +527,142 @@ describe('StorageRepo', () => {
 			// At least one should succeed; the other may fail with stale revision
 			const successes = [r1, r2].filter(r => r.success);
 			expect(successes.length).to.be.greaterThanOrEqual(1);
+		});
+	});
+
+	describe('read-driven promotion under the commit latch (st-storage-repo-promotion-latch-bypass)', () => {
+		// Commit block-1 at rev 1 directly, then pend a2 at rev 2 without ever driving it
+		// through commit() — so a context-proving get() is what promotes it.
+		const seedRev1AndPendA2 = async () => {
+			const storage = new BlockStorage('block-1' as BlockId, rawStorage);
+			const block = makeBlock('block-1', { items: [] });
+			await storage.savePendingTransaction('setup' as ActionId, { insert: block });
+			await storage.saveMaterializedBlock('setup' as ActionId, block);
+			await storage.saveRevision(1, 'setup' as ActionId);
+			await storage.promotePendingTransaction('setup' as ActionId);
+			await storage.setLatest({ actionId: 'setup' as ActionId, rev: 1 });
+			await repo.pend({
+				actionId: 'a2' as ActionId,
+				transforms: makeUpdateTransforms('block-1' as BlockId, [['items', 0, 0, ['a2']]]),
+				policy: 'c'
+			});
+			return storage;
+		};
+
+		it('does not promote while another writer holds the block commit latch', async () => {
+			// The core of the bug: get()'s read-driven promotion ran internalCommit with NO latch.
+			// Hold the block's commit latch (simulating a concurrent commit sitting in its critical
+			// section); a correctly-latched promotion must BLOCK on it, a bypassing one promotes anyway.
+			const storage = await seedRev1AndPendA2();
+
+			const release = await Latches.acquire(commitLatchKey('block-1' as BlockId));
+
+			let resolved = false;
+			const getPromise = repo.get({
+				blockIds: ['block-1' as BlockId],
+				context: { committed: [{ actionId: 'a2' as ActionId, rev: 2 }], rev: 2 }
+			}).then((r) => { resolved = true; return r; });
+
+			// Release even if an assertion throws: the commit latch is a process-global mutex, so a
+			// leaked hold would wedge every later test that commits block-1.
+			try {
+				// Ample event-loop turns: with the fix the get parks on the held latch; pre-fix it has
+				// already promoted a2 despite the held latch. A held mutex never releases on its own, so
+				// this is not a flaky race — the get simply cannot complete while the latch is out.
+				await new Promise((r) => setTimeout(r, 25));
+
+				expect(resolved).to.equal(false);
+				// meta.latest must NOT have advanced, and rev 2 must NOT have been written, under the held latch.
+				expect((await storage.getLatest())?.rev).to.equal(1);
+				expect(await rawStorage.getRevision('block-1' as BlockId, 2)).to.equal(undefined);
+			} finally {
+				// Release: the promotion now proceeds and lands a2 at rev 2.
+				release();
+			}
+			const result = await getPromise;
+			expect(resolved).to.equal(true);
+			expect(result['block-1']?.state.latest?.rev).to.equal(2);
+			expect((await storage.getLatest())?.rev).to.equal(2);
+			expect(await rawStorage.getRevision('block-1' as BlockId, 2)).to.equal('a2');
+		});
+
+		it('keeps meta.latest monotonic and revisions single-actionId when a read-driven promotion races a commit', async () => {
+			// Force the read-driven promotion of a2@2 to interleave with a concurrent commit of a3@3
+			// on the SAME block. Gate the promotion's setLatest so we can pin the interleaving:
+			//   - pre-fix: the promotion runs unlatched, so the commit lands rev 3 first, then the
+			//     promotion's late setLatest regresses meta.latest back to rev 2 — the bug.
+			//   - post-fix: whichever side takes the latch first runs to completion; the promotion
+			//     re-reads latest inside the latch and either lands rev 2 before the commit lands
+			//     rev 3, or (if the commit won the latch) sees rev 3 and skips a2 as superseded.
+			// Either way meta.latest ends at 3 and each revision holds one actionId.
+			let gateResolve!: () => void;
+			const gate = new Promise<void>((r) => { gateResolve = r; });
+			let reachedResolve!: () => void;
+			const reached = new Promise<void>((r) => { reachedResolve = r; });
+
+			const gatedRepo = new StorageRepo((blockId) => {
+				const storage = new BlockStorage(blockId as BlockId, rawStorage);
+				if (blockId === 'block-1') {
+					const originalSetLatest = storage.setLatest.bind(storage);
+					storage.setLatest = async (latest: ActionRev) => {
+						// Gate only the read-driven promotion's write (a2), not the commit's (a3).
+						if (latest.actionId === 'a2') {
+							reachedResolve();
+							await gate;
+						}
+						return originalSetLatest(latest);
+					};
+				}
+				return storage;
+			});
+
+			// block-1 committed at rev 1, with a2 and a3 both pending (neither committed yet).
+			const storage = new BlockStorage('block-1' as BlockId, rawStorage);
+			const block = makeBlock('block-1', { items: [] });
+			await storage.savePendingTransaction('setup' as ActionId, { insert: block });
+			await storage.saveMaterializedBlock('setup' as ActionId, block);
+			await storage.saveRevision(1, 'setup' as ActionId);
+			await storage.promotePendingTransaction('setup' as ActionId);
+			await storage.setLatest({ actionId: 'setup' as ActionId, rev: 1 });
+			await gatedRepo.pend({
+				actionId: 'a2' as ActionId,
+				transforms: makeUpdateTransforms('block-1' as BlockId, [['items', 0, 0, ['a2']]]),
+				policy: 'c'
+			});
+			await gatedRepo.pend({
+				actionId: 'a3' as ActionId,
+				transforms: makeUpdateTransforms('block-1' as BlockId, [['items', 0, 0, ['a3']]]),
+				policy: 'c'
+			});
+
+			// Read-driven promotion of a2 (context proves it committed) racing a commit of a3.
+			const g = gatedRepo.get({
+				blockIds: ['block-1' as BlockId],
+				context: { committed: [{ actionId: 'a2' as ActionId, rev: 2 }], rev: 2 }
+			});
+			const c = gatedRepo.commit({
+				actionId: 'a3' as ActionId,
+				blockIds: ['block-1' as BlockId],
+				tailId: 'block-1' as BlockId,
+				rev: 3
+			});
+
+			// Proceed once the promotion reaches its gated setLatest, OR the commit already finished
+			// (it won the latch and the promotion will skip a2 as superseded — reached never fires).
+			await Promise.race([reached, c]);
+			// Let the commit make progress: pre-fix it runs unlatched and completes within the window;
+			// post-fix, if the promotion holds the latch, the commit is blocked and this simply elapses.
+			await Promise.race([c, new Promise((r) => setTimeout(r, 25))]);
+			gateResolve();
+			await Promise.all([g, c]);
+
+			// meta.latest is monotonic: it ends at the highest committed rev (3), never regressed to 2.
+			expect((await storage.getLatest())?.rev).to.equal(3);
+			// Each revision entry holds a single, consistent actionId — no cross-write.
+			expect(await rawStorage.getRevision('block-1' as BlockId, 1)).to.equal('setup');
+			expect(await rawStorage.getRevision('block-1' as BlockId, 3)).to.equal('a3');
+			const rev2 = await rawStorage.getRevision('block-1' as BlockId, 2);
+			expect(rev2 === undefined || rev2 === 'a2').to.equal(true);
 		});
 	});
 

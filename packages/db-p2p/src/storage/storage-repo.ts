@@ -156,23 +156,45 @@ export class StorageRepo implements IRepo, IBlockChangeNotifier, IBlockReplicaSt
 		const results = await Promise.all(distinctBlockIds.map(async (blockId) => {
 			const blockStorage = this.createBlockStorage(blockId);
 
-			// Ensure that all outstanding transactions in the context are committed
+			// Ensure that all outstanding transactions in the context are committed.
+			// This promotes a landed-elsewhere pending via internalCommit, which mutates
+			// meta.latest — the same read-modify-write commit()/saveReplicatedBlock guard
+			// with the per-block commit latch. It MUST hold that latch too, or a promotion
+			// racing a concurrent commit on the block regresses latest non-monotonically /
+			// cross-writes a revision. Cheap unlatched pre-scan first so the common
+			// contextless read and no-pending read never pay for latch acquisition; the
+			// authoritative decision is re-made inside the latch.
 			if (context) {
-				const latest = await blockStorage.getLatest();
-				const missing = latest
-					? context.committed.filter(c => c.rev > latest.rev)
+				const preLatest = await blockStorage.getLatest();
+				const preMissing = preLatest
+					? context.committed.filter(c => c.rev > preLatest.rev)
 					: context.committed;
-				// Sort a COPY: when `latest` is undefined, `missing` aliases the caller's
-				// `context.committed` array, and an in-place `.sort()` would reorder the shared
-				// request context under the caller's feet.
-				for (const { actionId, rev } of [...missing].sort((a, b) => a.rev - b.rev)) {
-					const pending = await blockStorage.getPendingTransaction(actionId);
-					if (pending) {
-						const collectionId = await this.internalCommit(blockId, actionId, rev, blockStorage);
-						if (collectionId !== undefined) {
-							promotions.push({ collectionId, blockId, actionId, rev });
+				if (preMissing.length > 0) {
+					await withBlockCommitLatch(blockId, async () => {
+						// Re-read authoritative state under the latch: a concurrent commit may have
+						// promoted or superseded a pending between the unlatched pre-scan and here.
+						// Recompute which committed entries are still ahead of `latest` (drops the
+						// superseded, rev <= latest.rev) and re-fetch each pending inside the loop
+						// (skips the already-promoted, pending gone). This makes read-driven
+						// promotion idempotent under races, mirroring commit()'s alreadyDone/stale
+						// partitioning.
+						const latest = await blockStorage.getLatest();
+						const missing = latest
+							? context.committed.filter(c => c.rev > latest.rev)
+							: context.committed;
+						// Sort a COPY: when `latest` is undefined, `missing` aliases the caller's
+						// `context.committed` array, and an in-place `.sort()` would reorder the shared
+						// request context under the caller's feet.
+						for (const { actionId, rev } of [...missing].sort((a, b) => a.rev - b.rev)) {
+							const pending = await blockStorage.getPendingTransaction(actionId);
+							if (pending) {
+								const collectionId = await this.internalCommit(blockId, actionId, rev, blockStorage);
+								if (collectionId !== undefined) {
+									promotions.push({ collectionId, blockId, actionId, rev });
+								}
+							}
 						}
-					}
+					});
 				}
 			}
 
@@ -596,10 +618,11 @@ export class StorageRepo implements IRepo, IBlockChangeNotifier, IBlockReplicaSt
 	}
 
 	private async internalCommit(blockId: BlockId, actionId: ActionId, rev: number, storage: IBlockStorage): Promise<CollectionId | undefined> {
-		// Note: This method is called within the locked critical section of commit()
-		// So, operations like getPendingTransaction, getLatest, getBlock, saveMaterializedBlock,
-		// saveRevision, promotePendingTransaction, setLatest are protected against
-		// concurrent commits for the *same blockId*.
+		// Note: This method is called under the per-block commit latch — by commit() (within its
+		// locked critical section) and by the read-driven promotion in get() (which now takes the
+		// same latch). So, operations like getPendingTransaction, getLatest, getBlock,
+		// saveMaterializedBlock, saveRevision, promotePendingTransaction, setLatest are protected
+		// against concurrent commits for the *same blockId*.
 
 		const transform = await storage.getPendingTransaction(actionId);
 		// No need to check if !transform here, as the caller (commit) already verified this.
