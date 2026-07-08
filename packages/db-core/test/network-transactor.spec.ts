@@ -302,6 +302,42 @@ describe('NetworkTransactor', () => {
 
       expect(result.success).to.be.true
     })
+
+    // Regression: a commit that fails with a *reason-only* StaleFailure (no `missing`
+    // field) must surface a plain `{ success: false }` result, not crash. TestTransactor
+    // returns `{ success: false, reason }` for an action that was never pended; commitBlock
+    // classifies that non-success response as "stale" and used to destructure its absent
+    // `missing` via a non-null assert, throwing a TypeError inside distinctBlockActionTransforms.
+    it('does not crash when a commit fails with only a reason (missing undefined)', async () => {
+      const peerA = 'peer-A'
+      const net: IKeyNetwork = {
+        async findCoordinator() { return peerIdFromString(peerA) },
+        async findCluster() { return { [peerA]: { multiaddrs: [], publicKey: '' } } },
+      }
+      const transactor = new TestTransactor()
+      const networkTransactor = new NetworkTransactor({
+        timeoutMs: 1000,
+        abortOrCancelTimeoutMs: 500,
+        keyNetwork: net,
+        getRepo: () => transactor,
+      })
+
+      const blockId = generateBlockId()
+      const actionId = generateRandomActionId()
+
+      // Never pended → TestTransactor.commit returns a reason-only StaleFailure.
+      const result = await networkTransactor.commit({
+        actionId,
+        rev: 1,
+        blockIds: [blockId],
+        tailId: blockId,
+      })
+
+      expect(result.success).to.be.false
+      if (!result.success) {
+        expect(result.missing ?? []).to.deep.equal([])
+      }
+    })
   })
 
   describe('cancel', () => {

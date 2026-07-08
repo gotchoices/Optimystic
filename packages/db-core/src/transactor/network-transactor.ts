@@ -624,6 +624,10 @@ export class NetworkTransactor implements ITransactor, IBlockChangeNotifier {
 			// Collect and return any active stale failures
 			const stale = Array.from(allBatches(tailBatches, b => b.request?.isResponse as boolean && !b.request!.response!.success));
 			if (stale.length > 0) {
+				// NOTE: a reason-only StaleFailure (success:false, no `missing`) lands here too and
+				// returns { missing: [], success:false } — the `reason` string is dropped rather than
+				// surfaced via `throw tailError`. Fine today (failure still propagates); if reason-only
+				// commit rejections ever need their diagnostic reason, gate this branch on non-empty missing.
 				return { missing: distinctBlockActionTransforms(stale.flatMap(b => (b.request!.response! as StaleFailure).missing).filter((x): x is ActionTransforms => x !== undefined)), success: false as const };
 			}
 			throw tailError;
