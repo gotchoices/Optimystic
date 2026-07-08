@@ -3,6 +3,7 @@ import chaiAsPromised from 'chai-as-promised'
 use(chaiAsPromised)
 import { Collection, SyncRetryExhaustedError, type CollectionInitOptions } from '../src/collection/index.js'
 import { TestTransactor, FlakyCommitTransactor } from '../src/testing/test-transactor.js'
+import { waitFor } from '../src/testing/async-wait.js'
 import type { Action, ActionHandler, BlockStore, IBlock, ITransactor, BlockGets, GetBlockResults, ActionBlocks, BlockActionStatus, PendRequest, PendResult, CommitRequest, CommitResult } from '../src/index.js'
 
 interface TestAction {
@@ -835,8 +836,8 @@ describe('Collection', () => {
       })
       syncPromise.catch(() => { /* asserted below */ })
 
-      // Let sync reach the (long) backoff sleep, then abort.
-      await new Promise(resolve => setTimeout(resolve, 25))
+      // Poll until the first commit attempt has been made (sync is now in backoff), then abort.
+      await waitFor(() => flaky.commitAttempts >= 1, { description: 'sync should attempt first commit before abort' })
       controller.abort()
 
       const err = await syncPromise.catch(e => e) as Error

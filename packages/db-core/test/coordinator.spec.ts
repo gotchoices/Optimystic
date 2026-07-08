@@ -22,8 +22,6 @@ import type {
 // isolation — no network, no real collections. The phases fan the independent per-collection
 // work out concurrently and, on any failure, cancel EVERY successfully-pended collection.
 
-const delay = (ms: number) => new Promise<void>(resolve => setTimeout(resolve, ms));
-
 /** Build a minimal single-block transforms set whose tail block header carries the collection id. */
 function transformsForCollection(collectionId: string): Transforms {
 	const blockId = `${collectionId}-tail` as BlockId;
@@ -62,7 +60,6 @@ class InstrumentedTransactor implements ITransactor {
 
 	constructor(
 		private readonly failCollections: Set<string> = new Set(),
-		private readonly stepMs = 5,
 		private readonly throwCollections: Set<string> = new Set(),
 		// Collections whose commit THROWS (transient/unreachable) rather than returning a stale
 		// { success:false }. Distinguishes the retry-worthy class from the permanent stale class.
@@ -80,7 +77,7 @@ class InstrumentedTransactor implements ITransactor {
 		this.pendInFlight++;
 		this.pendMaxInFlight = Math.max(this.pendMaxInFlight, this.pendInFlight);
 		try {
-			await delay(this.stepMs);
+			await Promise.resolve();
 			const collectionId = collectionOfTransforms(request.transforms);
 			const blockIds = blockIdsForTransforms(request.transforms);
 			if (this.throwCollections.has(collectionId)) {
@@ -100,7 +97,7 @@ class InstrumentedTransactor implements ITransactor {
 		this.commitInFlight++;
 		this.commitMaxInFlight = Math.max(this.commitMaxInFlight, this.commitInFlight);
 		try {
-			await delay(this.stepMs);
+			await Promise.resolve();
 			const collectionId = collectionOfBlockId(request.blockIds[0]!);
 			this.commitAttemptsByCollection.set(collectionId, (this.commitAttemptsByCollection.get(collectionId) ?? 0) + 1);
 			if (this.throwCommitCollections.has(collectionId)) {
@@ -186,7 +183,7 @@ describe('TransactionCoordinator phases (concurrency + cancel-on-failure)', () =
 		it('cancels every successfully-pended collection when transactor.pend throws for one collection', async () => {
 			const collectionIds = ['c0', 'c1', 'c2', 'c3'];
 			const throwing = 'c2';
-			const transactor = new InstrumentedTransactor(new Set(), 5, new Set([throwing]));
+			const transactor = new InstrumentedTransactor(new Set(), new Set([throwing]));
 			const coordinator = new TransactionCoordinator(transactor, fakeCollections(collectionIds) as never);
 
 			const collectionTransforms = new Map<CollectionId, Transforms>(
@@ -280,7 +277,7 @@ describe('TransactionCoordinator phases (concurrency + cancel-on-failure)', () =
 			// A thrown commit is transient (unreachable peers, timeout) — the retry-worthy class.
 			const collectionIds = ['c0', 'c1', 'c2'];
 			const failing = 'c1';
-			const transactor = new InstrumentedTransactor(new Set(), 5, new Set(), new Set([failing]));
+			const transactor = new InstrumentedTransactor(new Set(), new Set(), new Set([failing]));
 			const coordinator = new TransactionCoordinator(transactor, fakeCollections(collectionIds) as never);
 
 			const pendedBlockIds = new Map<CollectionId, BlockId[]>(

@@ -48,6 +48,7 @@ import {
 	type BlockActionStatus,
 } from '../src/index.js';
 import { TestTransactor, FlakyCommitTransactor } from '../src/testing/test-transactor.js';
+import { waitFor } from '../src/testing/async-wait.js';
 
 /**
  * Test helper: translate a transaction's statements through the engine, THEN apply
@@ -1694,7 +1695,7 @@ describe('Transaction', () => {
 			coordinator.applyActions = async (actions, stampId) => {
 				if (firstCall) {
 					firstCall = false;
-					await new Promise<void>(resolve => setTimeout(resolve, 15));
+					await Promise.resolve();
 				}
 				return originalApply(actions, stampId);
 			};
@@ -3651,8 +3652,8 @@ describe('Transaction', () => {
 			// Create session with a very short TTL (1ms) so it expires immediately
 			const session = await TransactionSession.create(coordinator, engine, 'peer1', 'schema1', 1);
 
-			// Wait a tick to ensure expiration
-			await new Promise(resolve => setTimeout(resolve, 5));
+			// Poll until the stamp has expired (TTL = 1ms).
+			await waitFor(() => isTransactionExpired(session.getStamp()), { description: 'session stamp should have expired' });
 
 			const result = await session.commit();
 			expect(result.success).to.be.false;
@@ -4326,7 +4327,8 @@ describe('Transaction', () => {
 			});
 			p.catch(() => { /* asserted below */ });
 
-			await new Promise(resolve => setTimeout(resolve, 25));
+			// Poll until the first commit attempt has been made (coordinator is now in backoff), then abort.
+			await waitFor(() => flaky.commitAttempts >= 1, { description: 'coordinator should attempt first commit before abort' });
 			controller.abort();
 
 			const err = await p.catch(e => e) as Error;
