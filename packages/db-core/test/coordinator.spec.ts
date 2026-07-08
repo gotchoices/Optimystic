@@ -194,7 +194,8 @@ describe('TransactionCoordinator phases (concurrency + cancel-on-failure)', () =
 			expect(result.success).to.be.false;
 			expect(result.error).to.contain(throwing);
 
-			// The three collections that pended before the throw must all be cancelled.
+			// Every collection that DID pend must be cancelled. The pends fan out concurrently,
+			// so which ones settled before the throw is not deterministic — compare as a set.
 			const expectedCancels = collectionIds.filter(id => id !== throwing).map(id => `${id}-tail`);
 			expect([...transactor.cancelledBlockIds].sort()).to.deep.equal([...expectedCancels].sort());
 		});
