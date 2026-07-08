@@ -404,3 +404,229 @@ describe('BlockStorage meta.ranges honesty', () => {
 		expect(after!.ranges, 'recovered revision opens coverage from E=1').to.deep.equal([[1]]);
 	});
 });
+
+/**
+ * Coverage for the checkpoint-materialization sweep: every committed revision keeps its forward
+ * transform forever, but a full materialized copy is retained only at checkpoint revs (every
+ * `checkpointInterval`th rev), the block's tip, and the floor of each contiguous held range. Redundant
+ * intermediate materializations are pruned incrementally on commit (in `StorageRepo.internalCommit`,
+ * after `setLatest`). Because all transforms are kept and a materialization survives at each floor +
+ * checkpoint, EVERY held rev stays locally reconstructible by replay, so `meta.ranges` is unchanged by
+ * sweeping — a swept rev is still honestly claimed present.
+ */
+describe('BlockStorage checkpoint materialization sweep', () => {
+	let raw: MemoryRawStorage;
+
+	beforeEach(() => {
+		raw = new MemoryRawStorage();
+	});
+
+	// Small injected cadence so tests exercise sweeping without committing 32+ revs.
+	const CK = 4;
+
+	const makeDeleteTransforms = (blockId: BlockId): Transforms => ({
+		inserts: {},
+		updates: {},
+		deletes: [blockId]
+	});
+
+	const repoWithInterval = (interval: number) =>
+		new StorageRepo((id) => new BlockStorage(id, raw, undefined, interval));
+
+	// Enumerate which revs in [1, upTo] currently hold a materialized copy vs a forward transform.
+	const scanStores = async (blockId: BlockId, upTo: number) => {
+		const materialized: number[] = [];
+		const transforms: number[] = [];
+		for (let r = 1; r <= upTo; r++) {
+			const actionId = await raw.getRevision(blockId, r);
+			if (!actionId) continue;
+			if (await raw.getMaterializedBlock(blockId, actionId)) materialized.push(r);
+			if (await raw.getTransaction(blockId, actionId)) transforms.push(r);
+		}
+		return { materialized, transforms };
+	};
+
+	// rev 1 inserts { items: [] }; each later rev prepends 'more' (so items.length === rev - 1). Global
+	// rev === commit count, one block per commit.
+	const insertRev1 = async (repo: StorageRepo, blockId: BlockId) => {
+		await repo.pend({ actionId: 'a1' as ActionId, transforms: makeInsertTransforms(blockId, makeBlock(blockId, { items: [] })), policy: 'c' });
+		expect((await repo.commit({ actionId: 'a1' as ActionId, blockIds: [blockId], tailId: blockId, rev: 1 })).success).to.equal(true);
+	};
+	const updateRev = async (repo: StorageRepo, blockId: BlockId, r: number) => {
+		const actionId = `a${r}` as ActionId;
+		await repo.pend({ actionId, transforms: makeUpdateTransforms(blockId, [['items', 0, 0, ['more']]]), policy: 'c' });
+		expect((await repo.commit({ actionId, blockIds: [blockId], tailId: blockId, rev: r })).success).to.equal(true);
+	};
+	const commitLinear = async (repo: StorageRepo, blockId: BlockId, upTo: number) => {
+		await insertRev1(repo, blockId);
+		for (let r = 2; r <= upTo; r++) await updateRev(repo, blockId, r);
+	};
+
+	it('retains materializations only at {floor, checkpoints, tip}; keeps every transform; every rev reads correctly', async () => {
+		const blockId = 'ck-sweep' as BlockId;
+		const repo = repoWithInterval(CK);
+		const upTo = CK + 5; // 9 — crosses K (4) and 2K (8)
+		await commitLinear(repo, blockId, upTo);
+
+		const { materialized, transforms } = await scanStores(blockId, upTo);
+		// Floor E=1, checkpoints 4 & 8, tip 9. Nothing else.
+		expect(materialized, 'materializations only at floor + checkpoints + tip').to.deep.equal([1, 4, 8, 9]);
+		// Every rev keeps its forward transform (the replay log is never pruned).
+		expect(transforms, 'all transforms retained').to.deep.equal([1, 2, 3, 4, 5, 6, 7, 8, 9]);
+
+		// Every held rev — swept or not — reconstructs correctly and never throws.
+		const storage = new BlockStorage(blockId, raw, undefined, CK);
+		for (let r = 1; r <= upTo; r++) {
+			const got = await storage.getBlock(r);
+			expect(got, `rev ${r} served (never "Failed to find materialized block")`).to.not.equal(undefined);
+			expect((got!.block as unknown as { items: unknown[] }).items.length, `rev ${r} content`).to.equal(r - 1);
+		}
+	});
+
+	it('meta.ranges is byte-identical before vs after sweeping a long chain (open-ended [E,+inf) preserved)', async () => {
+		const blockId = 'ck-ranges' as BlockId;
+		const repo = repoWithInterval(CK);
+
+		await insertRev1(repo, blockId);
+		await updateRev(repo, blockId, 2); // first sweep-triggering commit has landed
+		const early = structuredClone((await raw.getMetadata(blockId))!.ranges);
+
+		for (let r = 3; r <= CK * 3; r++) await updateRev(repo, blockId, r); // sweep a long chain
+
+		const late = (await raw.getMetadata(blockId))!.ranges;
+		expect(late, 'ranges unchanged by sweeping').to.deep.equal(early);
+		expect(late, 'still one open-ended span from E=1').to.deep.equal([[1]]);
+	});
+
+	it('mid-history delete: tombstone rev reads back absent, the rev before it still present, sweep continues', async () => {
+		const blockId = 'ck-del' as BlockId;
+		const repo = repoWithInterval(CK);
+
+		await insertRev1(repo, blockId);          // rev 1: items []
+		await updateRev(repo, blockId, 2);         // rev 2: items ['more']
+		// rev 3: forward tombstone via a delete transform through the commit funnel.
+		await repo.pend({ actionId: 'a3' as ActionId, transforms: makeDeleteTransforms(blockId), policy: 'c' });
+		expect((await repo.commit({ actionId: 'a3' as ActionId, blockIds: [blockId], tailId: blockId, rev: 3 })).success).to.equal(true);
+		await insertRev1AfterDelete(repo, blockId, 4);  // rev 4: re-create, items []
+		await updateRev(repo, blockId, 5);              // rev 5: items ['more']
+
+		const storage = new BlockStorage(blockId, raw, undefined, CK);
+		expect(await storage.getBlock(3), 'tombstone rev reads back absent').to.equal(undefined);
+		const atRev2 = await storage.getBlock(2);
+		expect(atRev2, 'rev before the tombstone still present').to.not.equal(undefined);
+		expect((atRev2!.block as unknown as { items: unknown[] }).items.length).to.equal(1);
+		// Re-created content after the tombstone reads correctly too.
+		expect((await storage.getBlock(4))!.block as unknown as { items: unknown[] }, 'rev 4 re-created items').to.have.property('items').that.deep.equals([]);
+		expect((await storage.getBlock(5))!.block as unknown as { items: unknown[] }, 'rev 5 items').to.have.property('items').that.deep.equals(['more']);
+
+		// The tombstone rev carries no materialization (prune on it is a no-op delete).
+		const action3 = await raw.getRevision(blockId, 3);
+		expect(await raw.getMaterializedBlock(blockId, action3!), 'tombstone carries no materialization').to.equal(undefined);
+	});
+
+	it('multi-range (restore-seeded) block: lower range floor materialization survives commits to the upper range', async () => {
+		const blockId = 'ck-multirange' as BlockId;
+		const lowBlock = makeBlock('ck-multirange', { items: ['low'] });
+		const restoreCallback: RestoreCallback = async (id) => ({
+			blockId: id,
+			revisions: {
+				2: { action: { actionId: 'low2' as ActionId, rev: 2, transform: { insert: lowBlock } }, block: lowBlock }
+			},
+			range: [2, 3]
+		});
+		const repo = new StorageRepo((id) => new BlockStorage(id, raw, restoreCallback, CK));
+
+		// Upper range starts at E=10 (a non-checkpoint floor — exercises the mandatory floor clause).
+		await repo.pend({ actionId: 'u10' as ActionId, transforms: makeInsertTransforms(blockId, makeBlock('ck-multirange', { items: [] })), policy: 'c' });
+		expect((await repo.commit({ actionId: 'u10' as ActionId, blockIds: [blockId], tailId: blockId, rev: 10 })).success).to.equal(true);
+		for (let r = 11; r <= 10 + CK; r++) await updateRev(repo, blockId, r); // through 14
+
+		// Restore the lower range by reading rev 2 (below E=10 ⇒ ensureRevision restores [2,3]).
+		const storage = new BlockStorage(blockId, raw, restoreCallback, CK);
+		expect((await storage.getBlock(2))!.block.header.id).to.equal('ck-multirange');
+		const meta = await raw.getMetadata(blockId);
+		expect(meta!.ranges, 'two disjoint ranges after restore').to.deep.equal([[2, 3], [10]]);
+
+		// More commits to the UPPER range: prune only ever targets the prior upper-range latest.
+		for (let r = 15; r <= 10 + CK * 2; r++) await updateRev(repo, blockId, r); // through 18
+
+		const low2 = await raw.getRevision(blockId, 2);
+		expect(await raw.getMaterializedBlock(blockId, low2!), 'lower range floor materialization survives').to.not.equal(undefined);
+		// Upper range floor (10) retained despite not being a checkpoint (10 % 4 !== 0).
+		const upper10 = await raw.getRevision(blockId, 10);
+		expect(await raw.getMaterializedBlock(blockId, upper10!), 'upper range floor (non-checkpoint) retained').to.not.equal(undefined);
+	});
+
+	it('repeated cold historical read of a swept rev does not repopulate the materialized store', async () => {
+		const blockId = 'ck-coldread' as BlockId;
+		const repo = repoWithInterval(CK);
+		await commitLinear(repo, blockId, CK * 2); // revs 1..8 ⇒ materialized {1,4,8}
+
+		const before = (await scanStores(blockId, CK * 2)).materialized;
+		expect(before, 'swept before reads').to.deep.equal([1, 4, 8]);
+
+		const storage = new BlockStorage(blockId, raw, undefined, CK);
+		for (let i = 0; i < 5; i++) {
+			const got = await storage.getBlock(3); // rev 3 is swept (not floor/checkpoint/tip)
+			expect((got!.block as unknown as { items: unknown[] }).items.length).to.equal(2);
+		}
+
+		const after = (await scanStores(blockId, CK * 2)).materialized;
+		expect(after, 'materialized store did not grow via reads').to.deep.equal(before);
+		expect(after, 'the swept rev was not re-cached').to.not.include(3);
+	});
+
+	it('crash before prune: block stays fully reconstructible and prune resumes on the next commit', async () => {
+		// A crash between setLatest and pruneSupersededMaterialization leaves a redundant (but harmless)
+		// materialization. Simulate by suppressing the prune, then verify the crucial safety property —
+		// full reconstructibility — and that a later commit's prune still functions.
+		let suppressPrune = true;
+		class SkipPruneStorage extends BlockStorage {
+			override async pruneSupersededMaterialization(prior: ActionRev): Promise<void> {
+				if (suppressPrune) return; // simulate crash before the prune ran
+				return super.pruneSupersededMaterialization(prior);
+			}
+		}
+		const blockId = 'ck-crash' as BlockId;
+		const repo = new StorageRepo((id) => new SkipPruneStorage(id, raw, undefined, CK));
+
+		// Commit revs 1..5 with the prune suppressed: every materialization lingers.
+		await insertRev1(repo, blockId);
+		for (let r = 2; r <= 5; r++) await updateRev(repo, blockId, r);
+		expect((await scanStores(blockId, 5)).materialized, 'all materializations linger after crash-before-prune').to.deep.equal([1, 2, 3, 4, 5]);
+
+		// Safety invariant: fully reconstructible despite the lingering copies.
+		const reader = new BlockStorage(blockId, raw, undefined, CK);
+		for (let r = 1; r <= 5; r++) {
+			const got = await reader.getBlock(r);
+			expect((got!.block as unknown as { items: unknown[] }).items.length, `rev ${r} reconstructs`).to.equal(r - 1);
+		}
+
+		// Re-enable prune; the next commit (rev 6) reclaims its immediate prior (rev 5).
+		suppressPrune = false;
+		await updateRev(repo, blockId, 6);
+		const rev5Action = await raw.getRevision(blockId, 5);
+		expect(await raw.getMaterializedBlock(blockId, rev5Action!), 'prune resumed: superseded rev 5 reclaimed').to.equal(undefined);
+		// NOTE: the incrementally-pruned design only ever targets the immediate prior, so the earlier
+		// leaked copies (revs 2 & 3) are NOT auto-reclaimed by later commits — a bounded (≤1 block per
+		// crash), harmless leak. Reconstructibility and consistency are unaffected. See the review handoff.
+		expect((await scanStores(blockId, 6)).materialized).to.deep.equal([1, 2, 3, 4, 6]);
+	});
+});
+
+/** Re-create a block AFTER a tombstone via the commit funnel: an insert at `rev`. Distinct from
+ * `insertRev1` because the action id / rev differ; the prior tombstone read as undefined so the insert
+ * materializes from scratch. */
+async function insertRev1AfterDelete(repo: StorageRepo, blockId: BlockId, rev: number): Promise<void> {
+	const actionId = `a${rev}` as ActionId;
+	// Declare the expected rev so pend's insert-conflict guard (which fires when a prior latest exists —
+	// here the tombstone) is satisfied instead of reporting the block as stale.
+	await repo.pend({
+		actionId,
+		rev,
+		transforms: makeInsertTransforms(blockId, makeBlock(blockId, { items: [] })),
+		policy: 'c'
+	});
+	const result = await repo.commit({ actionId, blockIds: [blockId], tailId: blockId, rev });
+	if (!result.success) throw new Error(`re-create commit failed at rev ${rev}`);
+}

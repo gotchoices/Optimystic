@@ -8,11 +8,24 @@ import { createLogger } from "../logger.js";
 
 const log = createLogger('block-storage');
 
+/**
+ * Default checkpoint cadence: a full materialization is retained at every `CHECKPOINT_INTERVAL`th
+ * revision (plus the tip and each range floor). This bounds the maximum replay depth for any read
+ * to at most `CHECKPOINT_INTERVAL` forward transforms. See {@link BlockStorage.pruneSupersededMaterialization}.
+ */
+const CHECKPOINT_INTERVAL = 32;
+
 export class BlockStorage implements IBlockStorage {
 	constructor(
 		private readonly blockId: BlockId,
 		private readonly storage: IRawStorage,
-		private readonly restoreCallback?: RestoreCallback
+		private readonly restoreCallback?: RestoreCallback,
+		/**
+		 * Revisions where `rev % checkpointInterval === 0` retain a full materialization even after they
+		 * stop being the tip. Optional (default {@link CHECKPOINT_INTERVAL}); tests inject a small value
+		 * to exercise sweeping without committing 32+ revisions.
+		 */
+		private readonly checkpointInterval: number = CHECKPOINT_INTERVAL
 	) { }
 
 	async getLatest(): Promise<ActionRev | undefined> {
@@ -76,6 +89,25 @@ export class BlockStorage implements IBlockStorage {
 
 	async saveMaterializedBlock(actionId: ActionId, block: IBlock | undefined): Promise<void> {
 		await this.storage.saveMaterializedBlock(this.blockId, actionId, block);
+	}
+
+	async pruneSupersededMaterialization(prior: ActionRev): Promise<void> {
+		const meta = await this.storage.getMetadata(this.blockId);
+		// No metadata / no committed tip yet ⇒ nothing has superseded `prior`; leave it.
+		if (!meta || meta.latest === undefined) {
+			return;
+		}
+		// `prior` is the PRIOR latest, so it shares the (latest) range containing meta.latest.rev — its
+		// floor is that span's start. Retain if it is the tip, that floor, or a checkpoint rev.
+		const rangeFloor = this.rangeFloorOf(meta.latest.rev, meta.ranges);
+		if (this.isRetainedRev(prior.rev, meta.latest.rev, rangeFloor)) {
+			return;
+		}
+		// Redundant: `prior`'s forward transform is retained, so it stays reconstructible by replay from
+		// the nearest retained materialization below it. Delete routes to the driver's deleteMaterialized;
+		// a no-op at the driver when `prior.rev` carried no materialization (e.g. a tombstone rev).
+		await this.storage.saveMaterializedBlock(this.blockId, prior.actionId, undefined);
+		log('prune blockId=%s rev=%d actionId=%s', this.blockId, prior.rev, prior.actionId);
 	}
 
 	async saveRevision(rev: number, actionId: ActionId): Promise<void> {
@@ -281,7 +313,7 @@ export class BlockStorage implements IBlockStorage {
 		}
 	}
 
-	private async materializeBlock(_meta: BlockMetadata, targetRev: number): Promise<{ block: IBlock, actionRev: ActionRev } | undefined> {
+	private async materializeBlock(meta: BlockMetadata, targetRev: number): Promise<{ block: IBlock, actionRev: ActionRev } | undefined> {
 		let block: IBlock | undefined;
 		let materializedActionRev: ActionRev | undefined;
 		const actions: ActionRev[] = [];
@@ -321,7 +353,20 @@ export class BlockStorage implements IBlockStorage {
 			return undefined;
 		}
 		if (actions.length) {
-			await this.storage.saveMaterializedBlock(this.blockId, actions[0]!.actionId, block);
+			// Re-cache the recomputed materialization ONLY at a retained rev (checkpoint / range floor /
+			// tip). Caching unconditionally would let a cold read at a non-checkpoint historical rev
+			// re-add a materialization the checkpoint sweep is designed to remove — storage would regrow
+			// via reads. Skipping it means a repeated cold read re-replays each time, bounded by
+			// `checkpointInterval` transforms.
+			// NOTE: cold non-checkpoint historical reads re-replay every time (up to `checkpointInterval`
+			// forward transforms). Acceptable — historical reads are rare and replay is depth-bounded. If
+			// they ever show as hot, cache at the nearest checkpoint below the target instead of skipping.
+			const cacheRev = actions[0]!.rev;
+			const latestRev = meta.latest?.rev ?? cacheRev;
+			const rangeFloor = this.rangeFloorOf(cacheRev, meta.ranges);
+			if (this.isRetainedRev(cacheRev, latestRev, rangeFloor)) {
+				await this.storage.saveMaterializedBlock(this.blockId, actions[0]!.actionId, block);
+			}
 			return { block, actionRev: actions[0]! };
 		}
 		return { block, actionRev: materializedActionRev };
@@ -350,5 +395,34 @@ export class BlockStorage implements IBlockStorage {
 		return ranges.some(range =>
 			rev >= range[0] && (range[1] === undefined || rev < range[1])
 		);
+	}
+
+	/**
+	 * Checkpoint retention predicate. A materialization at `rev` must be kept iff it is the tip
+	 * (`latestRev` — the common read target and the replay base for the next commit), the floor of its
+	 * contiguous range (`rangeFloor` — the descending walk in {@link materializeBlock} has nothing below
+	 * the floor to fall back to), or a periodic checkpoint (`rev % checkpointInterval === 0`, which bounds
+	 * replay depth). Otherwise the materialization is prunable — its forward transform is retained, so the
+	 * rev stays reconstructible by replay from the nearest retained materialization below it. The floor
+	 * clause is SEPARATE and mandatory: absolute `rev % K` checkpoints do not automatically land on the
+	 * floor (e.g. floor `E = 1`, `K = 32`).
+	 */
+	private isRetainedRev(rev: number, latestRev: number, rangeFloor: number): boolean {
+		return rev === latestRev
+			|| rev === rangeFloor
+			|| rev % this.checkpointInterval === 0;
+	}
+
+	/** Start of the contiguous `ranges` span containing `rev`. Falls back to `rev` itself when no span
+	 * contains it — unreachable for a committed rev (setLatest always merges the containing span before a
+	 * prune/read runs), and the conservative direction (treats `rev` as its own floor ⇒ retained). */
+	private rangeFloorOf(rev: number, ranges: RevisionRange[]): number {
+		for (const range of ranges) {
+			const [start, end] = range;
+			if (rev >= start && (end === undefined || rev < end)) {
+				return start;
+			}
+		}
+		return rev;
 	}
 }

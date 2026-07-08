@@ -35,6 +35,15 @@ export interface IBlockStorage {
     /** Saves a materialized block */
     saveMaterializedBlock(actionId: ActionId, block: IBlock | undefined): Promise<void>;
 
+    /**
+     * Delete the materialized copy at `prior` if it is now redundant under the checkpoint
+     * retention policy (not the tip, not its range floor, not a checkpoint rev). The forward
+     * transform for `prior.rev` is retained, so the rev stays reconstructible by replay.
+     * No-op if `prior.rev` must be retained or has no materialization (e.g. a tombstone rev).
+     * Must be called under the per-block commit latch (serialized against concurrent commit).
+     */
+    pruneSupersededMaterialization(prior: ActionRev): Promise<void>;
+
     /** Saves a revision */
     saveRevision(rev: number, actionId: ActionId): Promise<void>;
 

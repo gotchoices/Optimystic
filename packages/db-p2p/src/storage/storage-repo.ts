@@ -660,6 +660,22 @@ export class StorageRepo implements IRepo, IBlockChangeNotifier, IBlockReplicaSt
 		// Update latest revision *last*
 		await storage.setLatest({ actionId, rev });
 
+		// Prune the now-superseded prior materialization (checkpoint retention). Runs LAST — after the
+		// new rev's materialization + revision + transform + setLatest are all durable — so no crash
+		// point can leave a rev unrecoverable: a crash BEFORE this leaves a redundant (harmless)
+		// materialization the next commit's prune reclaims; a crash AFTER is fully consistent. The prune
+		// only ever deletes a materialization reconstructible from the retained floor + transforms. Runs
+		// under the per-block commit latch already held here, so it serializes against concurrent commits.
+		// NOTE: prune targets ONLY the immediate prior. A crash between setLatest and this call leaves that
+		// one prior materialization un-pruned; since a later commit prunes ITS OWN prior (never the earlier
+		// leaked rev), that copy is NOT auto-reclaimed — a bounded (≤1 block-copy per crash), harmless leak
+		// (state stays consistent + reconstructible). If crash-before-prune leaks ever accumulate materially,
+		// add a bounded look-back (prune non-retained mats in [rev-checkpointInterval, rev)) here, or a
+		// periodic reconciliation sweep — do NOT reintroduce a per-read re-cache.
+		if (latest !== undefined) {
+			await storage.pruneSupersededMaterialization(latest);
+		}
+
 		// Report the affected collection for change-event routing. For a delete the
 		// materialized block is undefined, so fall back to the prior block's header.
 		// Either may be absent only for a malformed/headerless block — return

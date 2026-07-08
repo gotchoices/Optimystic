@@ -108,7 +108,19 @@ The system supports:
 * **Deletion**: Marked via delete transform, maintaining revision history
 
 Revisions within a block also have a lifecycle:
-* **Archival**: Older revisions Blocks are archived based on resource pressure, access recency/frequency, or other criteria
+* **Checkpoint materialization**: Each committed revision keeps its forward *transform* (the delta that
+  produced it) forever, but a full *materialized* copy of the block is retained only at **checkpoint**
+  revisions — every `CHECKPOINT_INTERVAL`th rev (default 32), plus the block's tip and the floor of each
+  contiguous locally-held range. Redundant intermediate materializations are pruned incrementally as new
+  commits land (under the per-block commit latch, no separate background pass): each commit deletes the
+  now-superseded prior materialization unless that rev must be retained. Because every transform is kept
+  and a materialization survives at each range floor + checkpoints, **every locally-held revision is still
+  reconstructible** by replaying the forward transforms from the nearest retained materialization at or
+  below it (replay depth bounded by `CHECKPOINT_INTERVAL`). This keeps storage growth O(revisions × delta
+  size) instead of O(revisions × block size). Since no transform is dropped, `meta.ranges` is **unchanged**
+  by sweeping — a swept rev is still honestly claimed as present. Pruning the *transforms* of cold ranges
+  (which would fragment `ranges` and require restoration) is future work — see the cold-range transform
+  offload backlog item.
 * **Restoration**: Previous versions can be restored from archival storage as needed
 
 ## Implementation Notes
