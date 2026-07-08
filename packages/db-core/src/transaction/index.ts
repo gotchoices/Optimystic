@@ -29,3 +29,6 @@ export { CoordinatorPartialCommitError } from './errors.js';
 export { TransactionSession } from './session.js';
 export { TransactionValidator } from './validator.js';
 export type { EngineRegistration, ValidationCoordinatorFactory, BlockStateProvider } from './validator.js';
+
+export { collectOperations, hashOperations, canonicalStringify } from './operations-hash.js';
+export type { Operation } from './operations-hash.js';

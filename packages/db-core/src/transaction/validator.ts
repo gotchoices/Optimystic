@@ -1,17 +1,8 @@
-import type { BlockId, CollectionId, IBlock, BlockOperations, Transforms } from '../index.js';
+import type { BlockId, CollectionId, Transforms } from '../index.js';
 import type { Transaction, ITransactionEngine, ITransactionValidator, ValidationResult, CollectionActions } from './transaction.js';
 import type { BlockActionState } from '../network/struct.js';
 import { isTransactionExpired } from './transaction.js';
-import { hashString } from '../utility/hash-string.js';
-
-/**
- * Represents an operation on a block within a collection.
- * Must match the Operation type in coordinator.ts for consistent hashing.
- */
-type Operation =
-	| { readonly type: 'insert'; readonly collectionId: CollectionId; readonly blockId: BlockId; readonly block: IBlock }
-	| { readonly type: 'update'; readonly collectionId: CollectionId; readonly blockId: BlockId; readonly operations: BlockOperations }
-	| { readonly type: 'delete'; readonly collectionId: CollectionId; readonly blockId: BlockId };
+import { collectOperations, hashOperations } from './operations-hash.js';
 
 /**
  * Engine registration for validation.
@@ -118,10 +109,11 @@ export class TransactionValidator implements ITransactionValidator {
 
 			// 7. Collect operations from validation coordinator
 			const transforms = validationCoordinator.getTransforms();
-			const allOperations = this.collectOperations(transforms);
 
-			// 8. Compute hash
-			const computedHash = await this.hashOperations(allOperations);
+			// 8. Compute hash via the shared operations-hash module — the SAME collect +
+			// canonicalise + hash the coordinator ran, so an honest sender and this
+			// validator cannot diverge on ordering.
+			const computedHash = await hashOperations(collectOperations(transforms));
 
 			// 9. Compare with sender's hash
 			if (computedHash !== operationsHash) {
@@ -141,32 +133,6 @@ export class TransactionValidator implements ITransactionValidator {
 	async getSchemaHash(engineId: string): Promise<string | undefined> {
 		const registration = this.engines.get(engineId);
 		return registration ? await registration.getSchemaHash() : undefined;
-	}
-
-	/**
-	 * Collect all operations from transforms.
-	 */
-	private collectOperations(transforms: Map<CollectionId, Transforms>): readonly Operation[] {
-		return Array.from(transforms.entries()).flatMap(([collectionId, t]) => [
-			...Object.entries(t.inserts ?? {}).map(([blockId, block]) =>
-				({ type: 'insert' as const, collectionId, blockId, block })
-			),
-			...Object.entries(t.updates ?? {}).map(([blockId, operations]) =>
-				({ type: 'update' as const, collectionId, blockId, operations })
-			),
-			...(t.deletes ?? []).map(blockId =>
-				({ type: 'delete' as const, collectionId, blockId })
-			)
-		]);
-	}
-
-	/**
-	 * Compute hash of all operations.
-	 * Must match TransactionCoordinator.hashOperations for consistent validation.
-	 */
-	private async hashOperations(operations: readonly Operation[]): Promise<string> {
-		const operationsData = JSON.stringify(operations);
-		return `ops:${await hashString(operationsData)}`;
 	}
 }
 

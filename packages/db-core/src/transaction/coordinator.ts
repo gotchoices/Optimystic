@@ -1,21 +1,14 @@
-import type { ITransactor, BlockId, CollectionId, Transforms, PendRequest, CommitRequest, ActionId, IBlock, BlockOperations } from "../index.js";
+import type { ITransactor, BlockId, CollectionId, Transforms, PendRequest, CommitRequest, ActionId } from "../index.js";
 import type { Transaction, ExecutionResult, ITransactionEngine, CollectionActions, ReadDependency } from "./transaction.js";
 import type { PeerId } from "../network/types.js";
 import type { Collection } from "../collection/collection.js";
 import { isTransactionExpired } from "./transaction.js";
-import { Log, blockIdsForTransforms, hashString } from "../index.js";
+import { Log, blockIdsForTransforms } from "../index.js";
+import { collectOperations, hashOperations } from "./operations-hash.js";
 import { CoordinatorPartialCommitError } from "./errors.js";
 import { createLogger } from "../logger.js";
 
 const log = createLogger('trx:coordinator');
-
-/**
- * Represents an operation on a block within a collection.
- */
-type Operation =
-	| { readonly type: 'insert'; readonly collectionId: CollectionId; readonly blockId: BlockId; readonly block: IBlock }
-	| { readonly type: 'update'; readonly collectionId: CollectionId; readonly blockId: BlockId; readonly operations: BlockOperations }
-	| { readonly type: 'delete'; readonly collectionId: CollectionId; readonly blockId: BlockId };
 
 /**
  * Coordinates multi-collection transactions.
@@ -178,19 +171,9 @@ export class TransactionCoordinator {
 
 			// Compute hash of ALL operations across ALL collections (post-log-append).
 			// Validators re-execute the transaction and compare their computed hash.
-			const allOperations = Array.from(collectionTransforms.entries()).flatMap(([collectionId, transforms]) => [
-				...Object.entries(transforms.inserts ?? {}).map(([blockId, block]) =>
-					({ type: 'insert' as const, collectionId, blockId, block })
-				),
-				...Object.entries(transforms.updates ?? {}).map(([blockId, operations]) =>
-					({ type: 'update' as const, collectionId, blockId, operations })
-				),
-				...(transforms.deletes ?? []).map(blockId =>
-					({ type: 'delete' as const, collectionId, blockId })
-				)
-			]);
-
-			const operationsHash = await this.hashOperations(allOperations);
+			// The shared operations-hash module canonicalises (sort + canonical JSON) so
+			// this order-independent fingerprint matches what a validator recomputes.
+			const operationsHash = await hashOperations(collectOperations(collectionTransforms));
 
 			// Execute consensus phases (GATHER, PEND, COMMIT)
 			coordResult = await this.coordinateTransaction(
@@ -381,16 +364,6 @@ export class TransactionCoordinator {
 	}
 
 	/**
-	 * Compute hash of all operations in a transaction.
-	 * This hash is used for validation - validators re-execute the transaction
-	 * and compare their computed operations hash with this one.
-	 */
-	private async hashOperations(operations: readonly Operation[]): Promise<string> {
-		const operationsData = JSON.stringify(operations);
-		return `ops:${await hashString(operationsData)}`;
-	}
-
-	/**
 	 * Execute a fully-formed transaction.
 	 *
 	 * This is called with a complete transaction (e.g., from Quereus).
@@ -456,19 +429,8 @@ export class TransactionCoordinator {
 			actionResults.set(collectionActions.collectionId, applyResult.results!);
 		}
 
-		// 3. Compute operations hash for validation
-		const allOperations = Array.from(collectionTransforms.entries()).flatMap(([collectionId, transforms]) => [
-			...Object.entries(transforms.inserts ?? {}).map(([blockId, block]) =>
-				({ type: 'insert' as const, collectionId, blockId, block })
-			),
-			...Object.entries(transforms.updates ?? {}).map(([blockId, operations]) =>
-				({ type: 'update' as const, collectionId, blockId, operations })
-			),
-			...(transforms.deletes ?? []).map(blockId =>
-				({ type: 'delete' as const, collectionId, blockId })
-			)
-		]);
-		const operationsHash = await this.hashOperations(allOperations);
+		// 3. Compute operations hash for validation (order-independent; see commit()).
+		const operationsHash = await hashOperations(collectOperations(collectionTransforms));
 
 		const applyMs = Date.now() - tApply;
 
