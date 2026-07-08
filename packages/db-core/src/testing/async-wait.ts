@@ -1,4 +1,8 @@
 export interface WaitForOptions {
+	// NOTE: default is tuned for in-process settles; integration callers over real libp2p
+	// pass explicit 10k–90k bounds. A new caller that omits timeoutMs gets 2s — fine for
+	// fast local conditions, but if a slow CI machine flakes on a legitimately-slow wait,
+	// give that call site an explicit timeoutMs rather than raising this default.
 	/** Upper bound before the poll gives up. Default 2_000. */
 	timeoutMs?: number;
 	/** Poll cadence. Default 10. */
