@@ -519,6 +519,14 @@ Engines translate domain-specific statements into actions. The engine interface 
 // In db-core/src/transaction/engine.ts
 export interface ITransactionEngine {
   /**
+   * Stable engine identifier. Stamped into TransactionStamp.engineId when a
+   * session builds a transaction, and the key the validator resolves the engine
+   * by; it must match the key the engine is registered under in the validator's
+   * engines map (e.g. ACTIONS_ENGINE_ID, QUEREUS_ENGINE_ID).
+   */
+  readonly id: string;
+
+  /**
    * Execute a complete transaction and return the resulting actions.
    * This is used both during transaction building (to translate statements)
    * and during validation/replay (to verify operations hash).

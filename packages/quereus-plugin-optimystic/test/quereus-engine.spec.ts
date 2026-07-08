@@ -99,6 +99,13 @@ describe('QuereusEngine', () => {
 			const engine = new QuereusEngine(db, mockCoordinator);
 			expect(engine).to.be.instanceOf(QuereusEngine);
 		});
+
+		it('should expose id as QUEREUS_ENGINE_ID so sessions stamp a resolvable engine id', () => {
+			const mockCoordinator = {} as any;
+			const engine = new QuereusEngine(db, mockCoordinator);
+			expect(engine.id).to.equal(QUEREUS_ENGINE_ID);
+			expect(engine.id).to.not.equal('unknown');
+		});
 	});
 
 	describe('Schema hash', () => {
