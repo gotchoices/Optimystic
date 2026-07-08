@@ -150,6 +150,10 @@ export class LevelDBStoreDriver implements RawStoreDriver {
 		}
 	}
 
+	// NOTE: full-scan byte sum — O(total bytes) per call. Fine as an advisory
+	// StorageMonitor input at current sizes; if a StorageMonitor ever polls this
+	// on a large db, replace with the kernel's incremental write-path counter
+	// (see the seam NOTE in kv-raw-storage.ts's saveMetadata).
 	async approximateBytesUsed(): Promise<number> {
 		try {
 			let total = 0;
