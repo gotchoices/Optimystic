@@ -69,13 +69,17 @@ Maintain an exponentially-weighted moving average of the continuous demand depth
 reading an instantaneous value:
 
 ```
-smoothedCoverage ← α · coverage_now + (1 − α) · smoothedCoverage      (α ≈ 0.2)
-d = clamp(-log2(max(ε, smoothedCoverage)), 0, 16)
+smoothedAvailable ← α · available_now + (1 − α) · smoothedAvailable   (α ≈ 0.2)
+smoothedTotalData ← α · totalData_now + (1 − α) · smoothedTotalData
+d = clamp(-log2(max(ε, smoothedAvailable / smoothedTotalData)), 0, 16)
 ```
 
-`coverage_now` is the existing `capacity.available / estimatedTotalData`. Both inputs
-(`estimatedTotalData` from `getRingStats()`, and `capacity`) are smoothed via the same EWMA so a
-single noisy sample cannot move `d`.
+The two demand inputs — `available` (`capacity.available`) and `totalData` (`estimatedTotalData`
+from `getRingStats()`) — are each smoothed with the same-α EWMA, and the smoothed coverage is their
+ratio, so a single noisy sample cannot move `d`. (Smoothing the inputs and dividing is a distinct
+EWMA from smoothing the `available/totalData` ratio directly; the input-wise form is what the
+implementation uses.) Each EWMA is seeded from its first real sample, not from 0 — a 0 seed would
+peg `d` at the clamp ceiling for many ticks.
 
 ### 1.2 Hysteresis / dead-band
 

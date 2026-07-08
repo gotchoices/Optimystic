@@ -344,6 +344,26 @@ describe('RingSelector', () => {
 			}
 		});
 
+		it('smoothing absorbs a single boundary-crossing spike that the raw signal would act on', async () => {
+			// Isolates mechanism #1 (the EWMA), which the boundary-hover test above does NOT: there every
+			// raw sample already sits inside the dead-band, so the dead-band alone explains the no-move.
+			// Here the node advertises R=2 and settles at d≈2.0 (below the move-out boundary R+1-h=2.5),
+			// then a single spike whose *raw* depth is 2.9 — solidly past 2.5, so an unsmoothed signal
+			// WOULD move out. With α=0.2 one spike only drags the smoothed depth to ≈2.23, still inside
+			// the band, so no move fires. (Contrast the seeding test below: a *fresh* selector seeded at
+			// 2.9 would move immediately — it is the accumulated history that damps the spike here.)
+			fretAdapter.setMyArachnodeInfo(advertise(2));
+			for (let i = 0; i < 3; i++) {
+				setSignal(0.9, 2.0); // usage high throughout, so only the depth gate can block a move
+				const settle = await selector.shouldTransition();
+				expect(settle.shouldMove, `settling sample ${i}`).to.equal(false);
+				clock.advance(MINUTE);
+			}
+			setSignal(0.9, 2.9); // raw d=2.9 ≥ 2.5 would move out if unsmoothed
+			const spike = await selector.shouldTransition();
+			expect(spike.shouldMove, 'EWMA absorbs the single spike').to.equal(false);
+		});
+
 		it('seeds the EWMA from the first real sample, not from 0', async () => {
 			// A 0 seed would make smoothedAvailable=0 → coverage=0 → depth=16 on the first tick, which
 			// would BLOCK this legitimate move-in (16 ≤ R-1+h=0.5 is false). Correct seeding yields
