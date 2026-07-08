@@ -1465,53 +1465,61 @@ export class ClusterMember implements ICluster {
 	/**
 	 * Resolve a race between two conflicting transactions. Total and deterministic, so every honest
 	 * member computes the identical winner (the Theorem 1 Case-2 premise). Order:
-	 *   1. higher aged priority wins  (fairness — see {@link recordPriority});
-	 *   2. more promise signatures wins;
-	 *   3. tie → higher message hash wins.
+	 *   1. more promise signatures wins  (progress monotonicity — see safety note below);
+	 *   2. equal promise counts → higher aged priority wins  (fairness — see {@link recordPriority});
+	 *   3. still tied → higher message hash wins.
 	 *
-	 * Priority is FIRST (ahead of promise count) so an aged transaction that keeps losing races
-	 * eventually out-ranks fresh (priority-0) rivals even when a fresh rival has briefly gathered an
-	 * equal/greater promise count — turning "2⁻ᵏ but memoryless" starvation into "at most MaxPriority
-	 * losses, then a deterministic win" (docs/correctness.md Theorem 9). It only orders two
-	 * *concurrently-pending* conflicts; it does NOT defer a fresh pend for an absent aged transaction
-	 * (that residual — sequential sub-window starvation — is the deferred feat-occ-priority-reservation).
+	 * Promise count is FIRST so this comparison never displaces a transaction that is further along.
+	 * That restores the pre-priority safety invariant: a member commits purely on promise supermajority
+	 * (`handleCommitNeeded` signs whenever `approvedPromises >= superMajority`; the commit path has NO
+	 * conflict re-check), so `resolveRace` is the ONLY arbiter among concurrently-pending conflicts.
+	 * With promises-first, once transaction X holds a promise supermajority every conflicting rival Y has
+	 * strictly fewer promises — Y can only match X's count by getting the intersecting quorum member to
+	 * promise it, but that member already holds X at supermajority and `resolveRace(X, Y)` returns
+	 * `keep-existing` on X's higher count, so it never does. By quorum intersection any Y-supermajority
+	 * overlaps X's in ≥1 honest member, and that member rejects Y. One winner (docs/correctness.md
+	 * Theorem 9). Priority-first would break this: it could displace an already-quorum-reached X for a
+	 * higher-priority Y with fewer promises, letting BOTH commit (split brain) — the regression fixed by
+	 * ticket occ-priority-first-breaks-promise-monotonicity.
 	 *
-	 * NOTE: fairness-vs-throughput bound. Aging a transaction up makes more short transactions lose
-	 * THAT block's races while it is pending — but the cost is bounded: it is confined to conflicts on
-	 * the specific block(s) this transaction pends, only for the duration of its pend, and only until
-	 * it commits (≤ MaxPriority extra losses imposed on rivals per aged transaction).
+	 * Priority is now a tie-break that runs only at EQUAL promise counts, which is exactly the
+	 * concurrent-starvation case aging targets (two fresh rivals, 0 promises each, otherwise coin-flipping
+	 * on the hash). Priority still breaks those ties deterministically, so aging still solves the stated
+	 * fairness problem in its common case. It only orders two *concurrently-pending* conflicts; it does NOT
+	 * defer a fresh pend for an absent aged transaction (that residual — sequential sub-window starvation —
+	 * is the deferred feat-occ-priority-reservation).
+	 *
+	 * NOTE: residual-fairness tripwire. Under promises-first an aged transaction can still lose to a fresh
+	 * rival that has *legitimately* gathered even one more promise — that is not the pure-coin-flip
+	 * starvation aging targets (equal counts, priority wins), it is the monotonicity behaviour we WANT (a
+	 * more-progressed rival is never displaced). If deeper fairness against a genuinely-more-progressed
+	 * rival is ever needed, it belongs to feat-occ-priority-reservation (reserve/defer at pend time), NOT
+	 * to this race tie-break.
 	 *
 	 * NOTE: Byzantine self-assert is a fairness DoS, not a safety hole. A coordinator can stamp
 	 * priority == MaxPriority on every transaction; recordPriority clamps to the cap so it cannot
-	 * exceed it, and priority never influences validity/operationsHash/stale-read checks — so it can
-	 * only win races it might have ~50% won anyway, degrading to at-worst-status-quo fairness (the same
-	 * graceful-degradation class as spam under honest-majority). Binding priority to provable age is
-	 * out of scope (feat-occ-priority-reservation).
+	 * exceed it, and priority never influences validity/operationsHash/stale-read checks — and now sits
+	 * below the promise count, so it can only break equal-count ties it might have ~50% won anyway,
+	 * degrading to at-worst-status-quo fairness (the same graceful-degradation class as spam under
+	 * honest-majority). Binding priority to provable age is out of scope (feat-occ-priority-reservation).
 	 *
 	 * NOTE: keep priority a self-contained additive message field + this one comparison key so it
 	 * composes with — does not block — a future HLC/crdt-sync redesign of this same path
 	 * (design-hot-log-tail-sharding-guidance).
 	 */
 	private resolveRace(existing: ClusterRecord, incoming: ClusterRecord): 'keep-existing' | 'accept-incoming' {
-		// WARNING: ordering priority BEFORE the promise count is under review as a possible SAFETY
-		// regression, not just a fairness change — see fix ticket `occ-priority-first-breaks-promise-
-		// monotonicity`. The old "more promises wins" order guaranteed that once a transaction reached a
-		// promise supermajority no conflicting rival could also reach one (the commit path has NO conflict
-		// re-check); priority-first can displace an already-quorum-reached transaction, allowing two
-		// conflicting commits. The "safety intact" wording above holds ONLY once that ticket resolves the
-		// ordering. Do not treat this as settled.
-		// 1. Higher aged priority wins.
-		const existingPriority = this.recordPriority(existing);
-		const incomingPriority = this.recordPriority(incoming);
-		if (existingPriority !== incomingPriority) {
-			return existingPriority > incomingPriority ? 'keep-existing' : 'accept-incoming';
-		}
-
-		// 2. Transaction with more promises wins.
+		// 1. Transaction with more promises wins — never displace a more-progressed rival (safety, see above).
 		const existingCount = Object.keys(existing.promises).length;
 		const incomingCount = Object.keys(incoming.promises).length;
 		if (existingCount !== incomingCount) {
 			return existingCount > incomingCount ? 'keep-existing' : 'accept-incoming';
+		}
+
+		// 2. Equal promise counts → higher aged priority wins (fairness tie-break).
+		const existingPriority = this.recordPriority(existing);
+		const incomingPriority = this.recordPriority(incoming);
+		if (existingPriority !== incomingPriority) {
+			return existingPriority > incomingPriority ? 'keep-existing' : 'accept-incoming';
 		}
 
 		// 3. Tie-breaker: higher message hash wins (deterministic).

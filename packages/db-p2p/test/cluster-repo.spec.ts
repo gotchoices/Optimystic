@@ -829,16 +829,34 @@ describe('ClusterMember', () => {
 			resolveRace(a: ClusterRecord, b: ClusterRecord): 'keep-existing' | 'accept-incoming'
 		});
 
-		it('higher aged priority wins even against a rival with MORE promises', async () => {
+		it('a rival with MORE promises wins even against higher aged priority (monotonicity)', async () => {
 			const peers = makeClusterPeers([selfKeyPair]);
 			// Aged transaction: priority 2, ZERO promises.
 			const aged = await createClusterRecord(peers, makePendOperationP('aged', 'block-shared', { priority: 2 }));
-			// Fresh rival: priority 0 but TWO promises — would win under the old promise-count-first rule.
+			// Fresh rival: priority 0 but TWO promises — more-progressed, so it wins under promises-first.
 			const fresh = await createClusterRecord(
 				peers, makePendOperationP('fresh', 'block-shared'), { p1: dummySig, p2: dummySig }
 			);
-			expect(raceOf().resolveRace(aged, fresh)).to.equal('keep-existing');
-			expect(raceOf().resolveRace(fresh, aged)).to.equal('accept-incoming');
+			// Promises come first now: the further-along transaction is never displaced by priority.
+			expect(raceOf().resolveRace(aged, fresh)).to.equal('accept-incoming');
+			expect(raceOf().resolveRace(fresh, aged)).to.equal('keep-existing');
+		});
+
+		it('priority cannot displace a promise-supermajority transaction (adversarial monotonicity)', async () => {
+			const peers = makeClusterPeers([selfKeyPair]);
+			// X: promise supermajority (three promises), priority 0.
+			const x = await createClusterRecord(
+				peers, makePendOperationP('x', 'block-shared'), { p1: dummySig, p2: dummySig, p3: dummySig }
+			);
+			// Y: conflicting rival, MAX priority but FEWER promises (one).
+			const y = await createClusterRecord(
+				peers, makePendOperationP('y', 'block-shared', { priority: MaxPriority }), { p1: dummySig }
+			);
+			// The commit path has NO conflict re-check, so resolveRace is the only arbiter. Under
+			// promises-first it can never displace a quorum-reached transaction — regression guard for
+			// occ-priority-first-breaks-promise-monotonicity (this FAILED under the old priority-first order).
+			expect(raceOf().resolveRace(x, y)).to.equal('keep-existing');
+			expect(raceOf().resolveRace(y, x)).to.equal('accept-incoming');
 		});
 
 		it('reads priority from the multi-collection carrier (pend.transaction.priority) too', async () => {
@@ -851,22 +869,17 @@ describe('ClusterMember', () => {
 		it('an aged transaction beats fresh rivals within MaxPriority+1 concurrent rounds (livelock guarantee)', async () => {
 			const peers = makeClusterPeers([selfKeyPair]);
 			// Model a transaction that keeps losing: its priority = clampPriority(losses) rises each round,
-			// while every fresh rival stays at priority 0 (and even carries more promises).
-			let firstWin: number | undefined;
-			for (let losses = 0; losses <= MaxPriority; losses++) {
+			// while every fresh rival stays at priority 0 with an EQUAL promise count (0). Under promises-first
+			// the priority tie-break then decides at equal counts — the concurrent-starvation case aging targets.
+			for (let losses = 1; losses <= MaxPriority; losses++) {
 				const agedPriority = Math.min(MaxPriority, losses);
 				const aged = await createClusterRecord(peers, makePendOperationP('aged', 'block-shared', { priority: agedPriority }));
-				const fresh = await createClusterRecord(
-					peers, makePendOperationP(`fresh-${losses}`, 'block-shared'), { p1: dummySig, p2: dummySig }
-				);
-				if (raceOf().resolveRace(aged, fresh) === 'keep-existing' && firstWin === undefined) {
-					firstWin = losses;
-				}
+				const fresh = await createClusterRecord(peers, makePendOperationP(`fresh-${losses}`, 'block-shared'));
+				// priority ≥ 1 deterministically out-ranks a fresh priority-0 rival at equal promise counts,
+				// regardless of the hash — so the starved transaction wins by round 1 (≤ MaxPriority+1).
+				expect(raceOf().resolveRace(aged, fresh), `aged wins at priority ${agedPriority}`).to.equal('keep-existing');
+				expect(raceOf().resolveRace(fresh, aged), `mirror at priority ${agedPriority}`).to.equal('accept-incoming');
 			}
-			// Deterministic win no later than MaxPriority+1 rounds — in fact as soon as priority clears 0.
-			expect(firstWin, 'aged transaction eventually wins deterministically').to.not.be.undefined;
-			expect(firstWin!).to.be.at.most(MaxPriority);
-			expect(firstWin!, 'priority 1 already out-ranks a fresh priority-0 rival').to.equal(1);
 		});
 
 		it('two capped-out conflicts fall back to the hash tiebreak — symmetric, deadlock-free, and over-cap clamps', async () => {
