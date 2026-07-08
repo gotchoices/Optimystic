@@ -1,5 +1,5 @@
 description: The docs promise that any disagreement over a transaction's validity blocks it and triggers a widening, repeated arbitration; in reality the transaction commits anyway on a super-majority, the dispute machinery is off by default, and even when on it votes once, after the fact. Build the promised block-then-escalate mechanism, or state plainly that what ships is weaker.
-prereq: design-cluster-membership-agreement, design-arbitrator-independent-sampling
+prereq: design-cluster-membership-agreement, arbitrator-independent-sampling
 files:
   - packages/db-p2p/src/repo/cluster-coordinator.ts (executeTransaction ~299-332; record.disputed)
   - packages/db-p2p/src/dispute/types.ts (disputeEnabled default false ~124)
