@@ -1493,6 +1493,13 @@ export class ClusterMember implements ICluster {
 	 * (design-hot-log-tail-sharding-guidance).
 	 */
 	private resolveRace(existing: ClusterRecord, incoming: ClusterRecord): 'keep-existing' | 'accept-incoming' {
+		// WARNING: ordering priority BEFORE the promise count is under review as a possible SAFETY
+		// regression, not just a fairness change — see fix ticket `occ-priority-first-breaks-promise-
+		// monotonicity`. The old "more promises wins" order guaranteed that once a transaction reached a
+		// promise supermajority no conflicting rival could also reach one (the commit path has NO conflict
+		// re-check); priority-first can displace an already-quorum-reached transaction, allowing two
+		// conflicting commits. The "safety intact" wording above holds ONLY once that ticket resolves the
+		// ordering. Do not treat this as settled.
 		// 1. Higher aged priority wins.
 		const existingPriority = this.recordPriority(existing);
 		const incomingPriority = this.recordPriority(incoming);
