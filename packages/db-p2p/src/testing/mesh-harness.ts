@@ -2,7 +2,7 @@ import type { PeerId, PrivateKey } from '@libp2p/interface';
 import type { IKeyNetwork, ClusterPeers, ICluster, ClusterRecord, IRepo, BlockId, ActionRev, ClusterConsensusConfig, ITransactor, PeerId as DbPeerId } from '@optimystic/db-core';
 import type { FindCoordinatorOptions } from '@optimystic/db-core';
 import type { IPeerNetwork } from '@optimystic/db-core';
-import { NetworkTransactor } from '@optimystic/db-core';
+import { NetworkTransactor, DEFAULT_SUPER_MAJORITY_THRESHOLD } from '@optimystic/db-core';
 import { peerIdFromPrivateKey } from '@libp2p/peer-id';
 import { generateKeyPair } from '@libp2p/crypto/keys';
 import { ClusterMember, clusterMember, type ReconcileBlockCallback } from '../cluster/cluster-repo.js';
@@ -141,7 +141,7 @@ export async function createMesh(nodeCount: number, options: MeshOptions): Promi
 		);
 
 		const consensusConfig: ClusterConsensusConfig = {
-			superMajorityThreshold: options.superMajorityThreshold ?? 0.75,
+			superMajorityThreshold: options.superMajorityThreshold ?? DEFAULT_SUPER_MAJORITY_THRESHOLD,
 			simpleMajorityThreshold: 0.51,
 			minAbsoluteClusterSize: 2,
 			allowClusterDownsize: options.allowClusterDownsize ?? true,
@@ -262,7 +262,7 @@ export async function createMesh(nodeCount: number, options: MeshOptions): Promi
 			(peerId: PeerId) => createClusterClient(peerId) as any,
 			{
 				clusterSize: options.clusterSize ?? nodeCount,
-				superMajorityThreshold: options.superMajorityThreshold ?? 0.75,
+				superMajorityThreshold: options.superMajorityThreshold ?? DEFAULT_SUPER_MAJORITY_THRESHOLD,
 				allowClusterDownsize: options.allowClusterDownsize ?? true,
 				// Harness meshes run below the safe floor on purpose; opt the coordinator
 				// side into that so validateSmallCluster admits them (fails closed by default).
