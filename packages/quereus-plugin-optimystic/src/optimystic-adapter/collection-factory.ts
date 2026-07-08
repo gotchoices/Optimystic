@@ -1,5 +1,5 @@
-import type { ITransactor, IKeyNetwork, CollectionId, PeerId, IRepo, IBlockChangeNotifier, CollectionChangeListener } from '@optimystic/db-core';
-import { Tree, NetworkTransactor, isBlockChangeNotifier } from '@optimystic/db-core';
+import type { ITransactor, IKeyNetwork, CollectionId, PeerId, IRepo, IBlockChangeNotifier, CollectionChangeListener, TransactionSigner } from '@optimystic/db-core';
+import { Tree, NetworkTransactor, isBlockChangeNotifier, bytesToB64url } from '@optimystic/db-core';
 import {
 	createLibp2pNode,
 	Libp2pKeyPeerNetwork,
@@ -7,10 +7,11 @@ import {
 	StorageRepo,
 	BlockStorage,
 	MemoryRawStorage,
+	signPeer,
 } from '@optimystic/db-p2p';
 import { createMesh, buildNetworkTransactor } from '@optimystic/db-p2p/testing';
 import type { RowData, ParsedOptimysticOptions, TransactionState } from '../types.js';
-import type { Libp2p } from '@libp2p/interface';
+import type { Libp2p, PrivateKey } from '@libp2p/interface';
 import { createLogger } from '../logger.js';
 
 const log = createLogger('collection-factory');
@@ -380,6 +381,36 @@ export class CollectionFactory {
     const nodeKey = this.getNodeKey(options);
     const nodeInfo = this.libp2pNodes.get(nodeKey);
     return nodeInfo?.node.peerId.toString();
+  }
+
+  /**
+   * A {@link TransactionSigner} bound to the current libp2p node's Ed25519 identity key, or
+   * `undefined` when no node/key is available (legacy `local`/`test`/`mesh-test` transactors, or a
+   * node created without an exposed key). The session is then built unsigned — unchanged behavior.
+   *
+   * The returned closure mirrors the reactivity / matchmaking node-signer pattern in
+   * `libp2p-node-base.ts`: `signPeer` (async libp2p `PrivateKey.sign`) over the canonical
+   * client-signature payload, base64url-encoded via the same {@link bytesToB64url} helper the verify
+   * side decodes with. A verifying node with `requireClientSignature` on derives the client's public
+   * key straight from `stamp.peerId` (which is this node's peer-id string), so no key is distributed.
+   *
+   * Signing is always safe to inject: it only adds a `signature` field, which nodes that do not enforce
+   * verification ignore. Enforcement (rejecting unsigned/invalid) is the verifier side's decision.
+   */
+  getSigner(options: ParsedOptimysticOptions): TransactionSigner | undefined {
+    const nodeKey = this.getNodeKey(options);
+    const nodeInfo = this.libp2pNodes.get(nodeKey);
+    // The node's identity key is attached by createLibp2pNode (see libp2p-node-base.ts —
+    // `(node as any).peerPrivateKey`). Absent for injected/legacy nodes and all non-network
+    // transactors, in which case there is no client signer and the transaction is left unsigned.
+    // NOTE: a node injected via registerLibp2pNode that was NOT built by createLibp2pNode carries no
+    // peerPrivateKey, so signing silently disables for it; harmless today (enforcement is off by
+    // default) but if a deployment enforces verification against such a node, thread the key through.
+    const privateKey = (nodeInfo?.node as unknown as { peerPrivateKey?: PrivateKey } | undefined)?.peerPrivateKey;
+    if (!privateKey) {
+      return undefined;
+    }
+    return async (payload: Uint8Array): Promise<string> => bytesToB64url(await signPeer(privateKey, payload));
   }
 
   /**

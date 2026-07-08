@@ -4184,6 +4184,36 @@ describe('Transaction', () => {
 			expect(committed[0]!.signature).to.equal(undefined);
 		});
 
+		it('surfaces a signer failure as a clean commit failure without committing (no partial unsigned tx)', async () => {
+			const transactor = new TestTransactor();
+			type UserEntry = { key: number; name: string };
+			const usersTree = await Tree.createOrOpen<number, UserEntry>(transactor, 'users', e => e.key);
+			const usersCollection = (usersTree as unknown as { collection: unknown }).collection;
+			const collections = new Map();
+			collections.set('users', usersCollection);
+			const coordinator = new TransactionCoordinator(transactor, collections);
+
+			// The coordinator must never be asked to commit when signing throws.
+			const committed: Transaction[] = [];
+			const realCommit = coordinator.commit.bind(coordinator);
+			coordinator.commit = async (tx: Transaction) => { committed.push(tx); return realCommit(tx); };
+
+			const throwingSigner: TransactionSigner = () => { throw new Error('wrong key type'); };
+			const session = await TransactionSession.create(
+				coordinator, new ActionsEngine(), 'client-peer', 'schema-hash-123', undefined, throwingSigner
+			);
+			await session.execute(
+				'stmt',
+				[{ collectionId: 'users', actions: [{ type: 'replace', data: [[1, { key: 1, name: 'Alice' }]] }] }]
+			);
+			const result = await session.commit();
+			expect(result.success).to.be.false;
+			expect(result.error).to.include('Failed to sign transaction');
+			expect(result.error).to.include('wrong key type');
+			// coordinator.commit was never reached — nothing partially committed.
+			expect(committed).to.have.lengthOf(0);
+		});
+
 		it('accepts an unsigned transaction when NO verifier is wired (migration posture)', async () => {
 			const stamp = await createTransactionStamp('client-peer', Date.now(), 'schema-hash-123', 'actions@1.0.0');
 			const transaction: Transaction = {

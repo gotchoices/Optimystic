@@ -257,11 +257,17 @@ export class TransactionBridge {
     // Create TransactionSession if transaction mode is enabled
     if (this.coordinator && this.engine && this.schemaHashProvider) {
       const schemaHash = await this.schemaHashProvider();
+      // Bind the client signer to this node's libp2p key when one exists. `undefined` (legacy/local
+      // mode, or a node with no exposed key) leaves the session unsigned — unchanged behavior. Signing
+      // is always safe: it only adds a `signature` field, verified only by nodes that enforce it.
+      const signer = this.collectionFactory.getSigner(options);
       this.session = await TransactionSession.create(
         this.coordinator,
         this.engine,
         peerId,
-        schemaHash
+        schemaHash,
+        undefined,
+        signer
       );
     } else {
       this.session = null;

@@ -143,10 +143,20 @@ export class TransactionSession {
 		};
 
 		// Sign the canonical client-signature payload if a signer was supplied. The
-		// payload covers stamp.id + statements + reads, which are all final now.
+		// payload covers stamp.id + statements + reads, which are all final now. A signer failure
+		// (e.g. a wrong-key-type libp2p sign) is caught and surfaced as a clean commit failure BEFORE
+		// coordinator.commit runs — the transaction object is local and discarded, so a failed sign can
+		// never leak a partially-built unsigned transaction into consensus.
 		if (this.signer) {
 			const payload = clientSignaturePayload(this.stamp.id, this.statements, reads);
-			transaction.signature = await this.signer(payload);
+			try {
+				transaction.signature = await this.signer(payload);
+			} catch (error) {
+				return {
+					success: false,
+					error: `Failed to sign transaction: ${error instanceof Error ? error.message : String(error)}`
+				};
+			}
 		}
 
 		// Commit through coordinator (which will orchestrate PEND/COMMIT)

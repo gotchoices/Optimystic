@@ -413,5 +413,78 @@ describe('QuereusEngine', () => {
 			expect(result.valid).to.be.false;
 			expect(result.reason).to.include('Schema mismatch');
 		});
+
+		// --- requireClientSignature enforcement wiring (4.1-implement-client-tx-signature-p2p) ---
+
+		const makeCoordinator = () => {
+			const mockTransactor = {
+				pend: async () => ({}),
+				commit: async () => {},
+				abort: async () => {},
+				queryClusterNominees: async () => ({ nodes: [], assignments: {} }),
+			};
+			return new TransactionCoordinator(mockTransactor as any, new Map());
+		};
+
+		it('with requireClientSignature ON, rejects an unsigned transaction as missing a signature', async () => {
+			const validator = createQuereusValidator({
+				db,
+				coordinator: makeCoordinator(),
+				requireClientSignature: true,
+			});
+			// A well-formed (integrity-passing, unexpired) but UNSIGNED transaction. The signature step
+			// runs before the engine/schema checks, so the engine/schema need not match here.
+			const stamp = await createTransactionStamp('test-peer', Date.now(), 'schema', QUEREUS_ENGINE_ID);
+			const transaction: Transaction = {
+				stamp,
+				statements: [],
+				reads: [],
+				id: await createTransactionId(stamp.id, [], []),
+			};
+			const result = await validator.validate(transaction, 'ops:abc');
+			expect(result.valid).to.be.false;
+			expect(result.reason).to.equal('Missing client signature');
+		});
+
+		it('with requireClientSignature ON, rejects a bogus/non-Ed25519-peer signature without throwing', async () => {
+			const validator = createQuereusValidator({
+				db,
+				coordinator: makeCoordinator(),
+				requireClientSignature: true,
+			});
+			// peerId is not a real libp2p identity and the signature is arbitrary — verifyPeerSig returns
+			// false (never throws), so the wired verifier rejects cleanly. Proves the port is total.
+			const stamp = await createTransactionStamp('not-a-real-peer', Date.now(), 'schema', QUEREUS_ENGINE_ID);
+			const transaction: Transaction = {
+				stamp,
+				statements: [],
+				reads: [],
+				id: await createTransactionId(stamp.id, [], []),
+				signature: 'AAAA',
+			};
+			const result = await validator.validate(transaction, 'ops:abc');
+			expect(result.valid).to.be.false;
+			expect(result.reason).to.equal('Invalid client signature');
+		});
+
+		it('with requireClientSignature OFF (default), the same unsigned transaction is NOT rejected at the signature step', async () => {
+			// Default posture: no verifier wired. The unsigned tx passes the signature step and only trips
+			// a DOWNSTREAM check (unknown engine here), proving the signature layer was skipped entirely.
+			const validator = createQuereusValidator({
+				db,
+				coordinator: makeCoordinator(),
+			});
+			const stamp = await createTransactionStamp('test-peer', Date.now(), 'schema', 'other-engine@9.9.9');
+			const transaction: Transaction = {
+				stamp,
+				statements: [],
+				reads: [],
+				id: await createTransactionId(stamp.id, [], []),
+			};
+			const result = await validator.validate(transaction, 'ops:abc');
+			expect(result.valid).to.be.false;
+			expect(result.reason).to.not.match(/signature/i);
+			expect(result.reason).to.include('Unknown engine');
+		});
 	});
 });

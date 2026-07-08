@@ -1095,6 +1095,12 @@ export async function createLibp2pNodeBase(
 	(node as any).keyNetwork = keyNetwork;
 	(node as any).reputation = reputation;
 	(node as any).disputeService = disputeServiceInstance;
+	// The node's libp2p Ed25519 identity key. Exposed on the same `(node as any).*` surface as
+	// coordinatedRepo/keyNetwork so a host can bind a client-transaction signer to it (the Quereus
+	// collection-factory's getSigner reuses this via signPeer). libp2p does not surface the private
+	// key on its public `Libp2p` interface, so this attachment is the sanctioned in-process handle.
+	// Ed25519 by construction (options.privateKey defaults to generateKeyPair('Ed25519')).
+	(node as any).peerPrivateKey = nodePrivateKey;
 
 	// --- Cohort-topic origination activation (post-node: consumes the fully-assembled node + FRET) ---
 	// This is the only place that is after the node + FRET are assembled (node.start() done, fretSvc

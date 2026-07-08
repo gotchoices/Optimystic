@@ -11,8 +11,10 @@ import type {
 	ITransactionValidator,
 	CollectionActions,
 	BlockStateProvider,
+	ClientSignatureVerifier,
 } from '@optimystic/db-core';
-import { TransactionValidator, type EngineRegistration, type ValidationCoordinatorFactory } from '@optimystic/db-core';
+import { TransactionValidator, type EngineRegistration, type ValidationCoordinatorFactory, b64urlToBytes } from '@optimystic/db-core';
+import { verifyPeerSig } from '@optimystic/db-p2p';
 import { QuereusEngine, QUEREUS_ENGINE_ID } from './quereus-engine.js';
 
 /**
@@ -25,6 +27,35 @@ export interface QuereusValidatorOptions {
 	coordinator: TransactionCoordinator;
 	/** Optional provider for looking up current block state (for read dependency validation) */
 	blockStateProvider?: BlockStateProvider;
+	/**
+	 * Enforce client transaction signatures. When `true`, the validator wires a verifier port so
+	 * `validate()` rejects a transaction that is unsigned (`Missing client signature`) or whose
+	 * signature does not verify against `stamp.peerId` (`Invalid client signature`). When `false`
+	 * (the default — phased rollout), the port is omitted and unsigned AND signed transactions both
+	 * pass the signature step, keeping single-node / dev / not-yet-migrated deployments working.
+	 *
+	 * Migration order: land this (clients with a node key start signing immediately), observe clients
+	 * signing in the field, THEN flip this to `true` to start rejecting. Flipping it on before clients
+	 * sign rejects every legacy (unsigned) client at pend.
+	 */
+	requireClientSignature?: boolean;
+}
+
+/**
+ * The p2p-backed {@link ClientSignatureVerifier}: derive the signer's Ed25519 public key from the
+ * peer-id string embedded in `stamp.peerId` and verify the base64url signature over the canonical
+ * payload. `verifyPeerSig` is total (returns `false`, never throws, on a non-Ed25519 / malformed
+ * peer-id or bad signature); the try/catch additionally makes the base64url decode total, so the
+ * whole verifier honors the "never throws" contract even on adversarial input.
+ */
+function createClientSignatureVerifier(): ClientSignatureVerifier {
+	return (peerId: string, payload: Uint8Array, signature: string): boolean => {
+		try {
+			return verifyPeerSig(peerId, payload, b64urlToBytes(signature));
+		} catch {
+			return false;
+		}
+	};
 }
 
 /**
@@ -82,6 +113,11 @@ export function createQuereusValidator(options: QuereusValidatorOptions): ITrans
 		};
 	};
 
-	return new TransactionValidator(engines, createValidationCoordinator, options.blockStateProvider);
+	// Wire the client-signature verifier port ONLY when enforcement is requested. Omitting it (the
+	// default) means the validator's signature step accepts both unsigned and signed transactions —
+	// the phased-rollout posture (see requireClientSignature).
+	const verifyClientSignature = options.requireClientSignature ? createClientSignatureVerifier() : undefined;
+
+	return new TransactionValidator(engines, createValidationCoordinator, options.blockStateProvider, verifyClientSignature);
 }
 
