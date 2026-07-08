@@ -619,49 +619,82 @@ export class TransactionCoordinator {
 			return { success: false, error: 'No transforms to pend' };
 		}
 
-		const pendedBlockIds = new Map<CollectionId, BlockId[]>();
 		const actionId = transaction.id as ActionId;
 		const nominees = superclusterNominees ? Array.from(superclusterNominees) : undefined;
 
-		// Pend each collection's transforms
-		for (const [collectionId, transforms] of collectionTransforms.entries()) {
-			const collection = this.collections.get(collectionId);
-			if (!collection) {
-				return { success: false, error: `Collection not found: ${collectionId}` };
+		// Fan out the independent per-collection pends concurrently. Each settles to a
+		// { collectionId, blockIds } on success, or rejects with the per-collection reason.
+		// NOTE: unbounded fan-out — one concurrent coordinator round-trip per collection.
+		// Transactions touch few collections today; if one ever spans very many, bound this
+		// with a concurrency limiter so peak in-flight round-trips stays sane. Same for commitPhase.
+		const outcomes = await Promise.allSettled(
+			Array.from(collectionTransforms.entries()).map(([collectionId, transforms]) =>
+				this.pendCollection(transaction, operationsHash, collectionId, transforms, actionId, nominees)
+			)
+		);
+
+		// Partition settled results: every collection that DID pend (keyed with its block
+		// ids), plus the first failure reason if any collection failed.
+		const pendedBlockIds = new Map<CollectionId, BlockId[]>();
+		let failure: string | undefined;
+		for (const outcome of outcomes) {
+			if (outcome.status === 'fulfilled') {
+				pendedBlockIds.set(outcome.value.collectionId, outcome.value.blockIds);
+			} else if (failure === undefined) {
+				failure = outcome.reason instanceof Error ? outcome.reason.message : String(outcome.reason);
 			}
+		}
 
-			// Get revision from the collection's source
-			const rev = collection.getNextRev();
-
-			// Create pend request with transaction and operations hash for validation
-			const pendRequest: PendRequest = {
-				actionId,
-				rev,
-				transforms,
-				policy: 'r', // Return policy: fail but return pending actions
-				transaction,
-				operationsHash,
-				superclusterNominees: nominees
-			};
-
-			// Pend the transaction
-			const pendResult = await this.transactor.pend(pendRequest);
-			if (!pendResult.success) {
-				// Cancel any already-pended collections before returning
-				for (const [, pendedBlockIdList] of pendedBlockIds.entries()) {
-					await this.transactor.cancel({ actionId, blockIds: pendedBlockIdList });
-				}
-				return {
-					success: false,
-					error: `Pend failed for collection ${collectionId}: ${pendResult.reason}`
-				};
-			}
-
-			// Store the pended block IDs for commit phase
-			pendedBlockIds.set(collectionId, pendResult.blockIds);
+		if (failure !== undefined) {
+			// Any failure aborts the whole pend. With concurrency several collections may
+			// have pended in parallel, so cancel EVERY successfully-pended collection — not
+			// only those started before the failure. Cancels are best-effort (cancelPhase
+			// swallows their errors) so they cannot mask the original pend failure.
+			await this.cancelPhase(actionId, pendedBlockIds);
+			return { success: false, error: failure };
 		}
 
 		return { success: true, pendedBlockIds };
+	}
+
+	/**
+	 * Pend a single collection's transforms. Resolves with the collection id and its
+	 * pended block ids on success; throws with a per-collection reason on failure so the
+	 * fan-out in {@link pendPhase} can settle it as a rejection.
+	 */
+	private async pendCollection(
+		transaction: Transaction,
+		operationsHash: string,
+		collectionId: CollectionId,
+		transforms: Transforms,
+		actionId: ActionId,
+		nominees: PeerId[] | undefined
+	): Promise<{ collectionId: CollectionId; blockIds: BlockId[] }> {
+		const collection = this.collections.get(collectionId);
+		if (!collection) {
+			throw new Error(`Collection not found: ${collectionId}`);
+		}
+
+		// Get revision from the collection's source
+		const rev = collection.getNextRev();
+
+		// Create pend request with transaction and operations hash for validation
+		const pendRequest: PendRequest = {
+			actionId,
+			rev,
+			transforms,
+			policy: 'r', // Return policy: fail but return pending actions
+			transaction,
+			operationsHash,
+			superclusterNominees: nominees
+		};
+
+		const pendResult = await this.transactor.pend(pendRequest);
+		if (!pendResult.success) {
+			throw new Error(`Pend failed for collection ${collectionId}: ${pendResult.reason}`);
+		}
+
+		return { collectionId, blockIds: pendResult.blockIds };
 	}
 
 	/**
@@ -681,68 +714,86 @@ export class TransactionCoordinator {
 		committedCollections: Set<CollectionId>;
 		failedCollections: Set<CollectionId>;
 	}> {
+		// Fan out the independent per-collection commit-with-retry concurrently, then
+		// aggregate the committed/failed partition from the settled results.
+		const outcomes = await Promise.allSettled(
+			Array.from(pendedBlockIds.entries()).map(([collectionId, blockIds]) =>
+				this.commitCollection(actionId, criticalBlockIds, collectionId, blockIds)
+			)
+		);
+
 		const committedCollections = new Set<CollectionId>();
 		const failedCollections = new Set<CollectionId>();
-
-		// Commit each collection's transaction with retry
-		for (const [collectionId, blockIds] of pendedBlockIds.entries()) {
-			const collection = this.collections.get(collectionId);
-			if (!collection) {
-				failedCollections.add(collectionId);
-				return {
-					success: false,
-					error: `Collection not found: ${collectionId}`,
-					committedCollections,
-					failedCollections
-				};
-			}
-
-			// Get revision
-			const rev = collection.getNextRev();
-
-			// Find the critical block (log tail) for this collection
-			const logTailBlockId = criticalBlockIds.find(blockId =>
-				blockIds.includes(blockId)
-			);
-
-			if (!logTailBlockId) {
-				failedCollections.add(collectionId);
-				return {
-					success: false,
-					error: `Log tail block not found for collection ${collectionId}`,
-					committedCollections,
-					failedCollections
-				};
-			}
-
-			// Create commit request
-			const commitRequest: CommitRequest = {
-				actionId,
-				blockIds,
-				tailId: logTailBlockId,
-				rev
-			};
-
-			// Retry up to 3 attempts for transient failures
-			let committed = false;
-			for (let attempt = 0; attempt < 3 && !committed; attempt++) {
-				const commitResult = await this.transactor.commit(commitRequest);
-				if (commitResult.success) {
-					committed = true;
+		const errors: string[] = [];
+		for (const outcome of outcomes) {
+			if (outcome.status === 'fulfilled') {
+				const { collectionId, committed, error } = outcome.value;
+				if (committed) {
 					committedCollections.add(collectionId);
-				} else if (attempt === 2) {
+				} else {
 					failedCollections.add(collectionId);
-					return {
-						success: false,
-						error: `Commit failed for collection ${collectionId} after 3 attempts`,
-						committedCollections,
-						failedCollections
-					};
+					if (error) errors.push(error);
 				}
+			} else {
+				// commitCollection resolves rather than rejects, but treat any unexpected
+				// rejection as a failure so the partitioned sets stay honest.
+				errors.push(outcome.reason instanceof Error ? outcome.reason.message : String(outcome.reason));
 			}
 		}
 
+		if (failedCollections.size > 0 || errors.length > 0) {
+			return {
+				success: false,
+				error: errors.join('; ') || 'Commit failed',
+				committedCollections,
+				failedCollections
+			};
+		}
+
 		return { success: true, committedCollections, failedCollections };
+	}
+
+	/**
+	 * Commit a single collection's pended blocks, retrying transient failures up to three
+	 * times (forward recovery). Always resolves — success is carried in the returned
+	 * `committed` flag — so the fan-out in {@link commitPhase} can aggregate every result.
+	 */
+	private async commitCollection(
+		actionId: ActionId,
+		criticalBlockIds: BlockId[],
+		collectionId: CollectionId,
+		blockIds: BlockId[]
+	): Promise<{ collectionId: CollectionId; committed: boolean; error?: string }> {
+		const collection = this.collections.get(collectionId);
+		if (!collection) {
+			return { collectionId, committed: false, error: `Collection not found: ${collectionId}` };
+		}
+
+		// Get revision
+		const rev = collection.getNextRev();
+
+		// Find the critical block (log tail) for this collection
+		const logTailBlockId = criticalBlockIds.find(blockId => blockIds.includes(blockId));
+		if (!logTailBlockId) {
+			return { collectionId, committed: false, error: `Log tail block not found for collection ${collectionId}` };
+		}
+
+		// Create commit request
+		const commitRequest: CommitRequest = {
+			actionId,
+			blockIds,
+			tailId: logTailBlockId,
+			rev
+		};
+
+		// Retry up to 3 attempts for transient failures
+		for (let attempt = 0; attempt < 3; attempt++) {
+			const commitResult = await this.transactor.commit(commitRequest);
+			if (commitResult.success) {
+				return { collectionId, committed: true };
+			}
+		}
+		return { collectionId, committed: false, error: `Commit failed for collection ${collectionId} after 3 attempts` };
 	}
 
 	/**
@@ -756,10 +807,17 @@ export class TransactionCoordinator {
 		pendedBlockIds: Map<CollectionId, BlockId[]>,
 		excludeCollections?: Set<CollectionId>
 	): Promise<void> {
-		for (const [collectionId, blockIds] of pendedBlockIds.entries()) {
-			if (excludeCollections?.has(collectionId)) continue;
-			await this.transactor.cancel({ actionId, blockIds });
-		}
+		// Fan out the per-collection cancels concurrently. Each is best-effort: a cancel
+		// fault is logged and swallowed so it cannot mask the pend/commit failure that
+		// triggered this sweep, and so one failed cancel does not abort the others.
+		const cancels = Array.from(pendedBlockIds.entries())
+			.filter(([collectionId]) => !excludeCollections?.has(collectionId))
+			.map(([collectionId, blockIds]) =>
+				this.transactor.cancel({ actionId, blockIds }).catch(err => {
+					log('cancelPhase: best-effort cancel failed collection=%s: %o', collectionId, err);
+				})
+			);
+		await Promise.all(cancels);
 	}
 
 }

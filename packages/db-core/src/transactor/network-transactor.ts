@@ -142,33 +142,36 @@ export class NetworkTransactor implements ITransactor, IBlockChangeNotifier {
 
 		if (retryable.length > 0 && Date.now() < expiration) {
 			log('get:retry retryable=%d', retryable.length);
-			try {
-				const excludedByRoot = new Map<CoordinatorBatch<BlockId[], GetBlockResults>, Set<PeerId>>();
-				for (const b of retryable) {
-					const excluded = new Set<PeerId>([b.peerId, ...((b.excludedPeers ?? []) as PeerId[])]);
-					excludedByRoot.set(b, excluded);
-					const retries = await createBatchesForPayload<BlockId[], GetBlockResults>(
-						b.payload,
-						b.payload,
+			// Fan out the per-batch retries concurrently. Each root batch builds its own
+			// excluded-peer set and attaches its own `subsumedBy`, so the retry rounds are
+			// independent per root and safe to run in parallel.
+			const retryOutcomes = await Promise.allSettled(retryable.map(async b => {
+				const excluded = new Set<PeerId>([b.peerId, ...((b.excludedPeers ?? []) as PeerId[])]);
+				const retries = await createBatchesForPayload<BlockId[], GetBlockResults>(
+					b.payload,
+					b.payload,
+					(gets, blockId, mergeWithGets) => [...(mergeWithGets ?? []), ...gets.filter(id => id === blockId)],
+					Array.from(excluded),
+					async (blockId, options) => this.keyNetwork.findCoordinator(await blockIdToBytes(blockId), options)
+				);
+				if (retries.length > 0) {
+					b.subsumedBy = [...(b.subsumedBy ?? []), ...retries];
+					await processBatches(
+						retries,
+						(batch) => this.getRepo(batch.peerId).get({ blockIds: batch.payload, context: blockGets.context }, { expiration, dialTimeoutMs: this.dialTimeoutMs }),
+						batch => batch.payload,
 						(gets, blockId, mergeWithGets) => [...(mergeWithGets ?? []), ...gets.filter(id => id === blockId)],
-						Array.from(excluded),
+						expiration,
 						async (blockId, options) => this.keyNetwork.findCoordinator(await blockIdToBytes(blockId), options)
 					);
-					if (retries.length > 0) {
-						b.subsumedBy = [...(b.subsumedBy ?? []), ...retries];
-						await processBatches(
-							retries,
-							(batch) => this.getRepo(batch.peerId).get({ blockIds: batch.payload, context: blockGets.context }, { expiration, dialTimeoutMs: this.dialTimeoutMs }),
-							batch => batch.payload,
-							(gets, blockId, mergeWithGets) => [...(mergeWithGets ?? []), ...gets.filter(id => id === blockId)],
-							expiration,
-							async (blockId, options) => this.keyNetwork.findCoordinator(await blockIdToBytes(blockId), options)
-						);
-					}
 				}
-			} catch (e) {
-				// keep original error if any
-				if (!error) error = e as Error;
+			}));
+			// First-error-wins: keep any pre-existing error, otherwise adopt the first
+			// rejection across the concurrent retries (retryable order is preserved).
+			for (const outcome of retryOutcomes) {
+				if (outcome.status === 'rejected' && !error) {
+					error = outcome.reason instanceof Error ? outcome.reason : new Error(String(outcome.reason));
+				}
 			}
 		}
 
