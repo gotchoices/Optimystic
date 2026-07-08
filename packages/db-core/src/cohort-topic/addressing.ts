@@ -5,8 +5,14 @@
  *
  * ```
  * coord_0(_, topicId) = H(0x00 ‖ topicId)
- * coord_d(P, topicId) = H(d ‖ prefix(P, d·log₂F) ‖ topicId)   for d ≥ 1
+ * coord_d(P, topicId) = H(d ‖ prefix(H(P), d·log₂F) ‖ topicId)   for d ≥ 1
  * ```
+ *
+ * `P` is ring-hashed before the prefix so the shard input is uniformly distributed across
+ * participants (the raw peer-id string bytes share a near-constant `12D3Koo…` prefix that would
+ * collapse all tier-`d` shards to one coordinate). The wire field `participantCoord` keeps the
+ * unmodified peer id so the Ed25519 key remains recoverable; the ring-hash is applied only inside
+ * the addressing math.
  *
  * `H` is the injected {@link IRingHash} (db-core's own SHA-256 truncated to the ring width — **not**
  * a FRET import). `prefix(P, n)` is the `n` most-significant bits of peer id `P`, left-padded if
@@ -24,7 +30,7 @@ export interface TierAddressing {
 	readonly F: number;
 	/** Tier-0 root coordinate: `H(0x00 ‖ topicId)`. Peer-independent. */
 	coord0(topicId: Uint8Array): RingCoord;
-	/** Tier-`d` coordinate for `d ≥ 1`: `H(d ‖ prefix(peerId, d·log₂F) ‖ topicId)`. */
+	/** Tier-`d` coordinate for `d ≥ 1`: `H(d ‖ prefix(H(P), d·log₂F) ‖ topicId)` where `H(P)` is the ring-hash of `peerId`. */
 	coordD(d: number, peerId: Uint8Array, topicId: Uint8Array): RingCoord;
 	/** Dispatches `d === 0` to {@link coord0}, otherwise to {@link coordD}. */
 	coord(d: number, peerId: Uint8Array, topicId: Uint8Array): RingCoord;
@@ -92,8 +98,8 @@ export class HashTierAddressing implements TierAddressing {
 		if (d > 255) {
 			throw new RangeError(`tier d must fit in one byte (≤ 255), got ${d}`);
 		}
-		// H(d ‖ prefix(peerId, d·log₂F) ‖ topicId)
-		const prefix = prefixBits(peerId, d * this.log2F);
+		// H(d ‖ prefix(H(P), d·log₂F) ‖ topicId)  — ring-hash P first so the shard input is uniform
+		const prefix = prefixBits(this.hash.H(peerId), d * this.log2F);
 		const input = new Uint8Array(1 + prefix.length + topicId.length);
 		input[0] = d;
 		input.set(prefix, 1);

@@ -57,32 +57,40 @@ A topic's tree is described entirely by the hash function below; there is no sep
 
 ```
 coord_0(_, topicId)         = H(0x00 ‖ topicId)
-coord_d(P, topicId)         = H(d ‖ prefix(P, d·log₂F) ‖ topicId)   for d ≥ 1
+coord_d(P, topicId)         = H(d ‖ prefix(H(P), d·log₂F) ‖ topicId)   for d ≥ 1
 ```
 
 Where:
 - `H` is SHA-256 truncated to FRET's ring width `B` (256 bits today).
-- `prefix(P, n)` is the `n` most-significant bits of peer ID `P`, left-padded if shorter.
+- `P` is the participant's peer id (the raw bytes of the dialable peer-id string).
+- `prefix(H(P), n)` is the `n` most-significant bits of `H(P)`, left-padded if shorter.
 - `F` is the configured fan-out (default 16; `log₂F = 4`).
 - Tier `d` has exactly `F^d` distinct coordinates across the ring.
 
-The hash mixes the tier number, the peer-ID prefix, and the topic ID so that:
+`P` is ring-hashed before the prefix so the shard input is uniformly distributed across
+participants. The raw peer-id string bytes share a near-constant `"12D3KooW…"` prefix on every
+Ed25519 node; feeding raw `P` to `prefix` would collapse all tier-`d` shards to one coordinate.
+`H(P)` spreads the shard input uniformly. The wire field `participantCoord` keeps the unmodified
+peer id so the Ed25519 key remains recoverable; the ring-hash is applied only inside the
+addressing math.
+
+The hash mixes the tier number, the ring-hashed peer-ID prefix, and the topic ID so that:
 - Different topics produce uncorrelated coordinate sets even at the same tier.
 - Different tiers of the same topic produce uncorrelated coordinates (a tier-2 cohort is not a neighbor of its tier-1 parent on the ring).
-- Sibling cohorts at tier `d` (peers sharing the first `d·log₂F` bits) deterministically converge on a single coord.
+- Sibling cohorts at tier `d` (peers whose `H(P)` values share the first `d·log₂F` bits) deterministically converge on a single coord.
 
 This is the only addressing scheme used by the layer. It replaces older bit-shift coord-ladder designs.
 
 > **Implementation.** `packages/db-core/src/cohort-topic/addressing.ts` (`TierAddressing` /
-> `HashTierAddressing`, default `F = 16`) implements the formula exactly: `coord_d` builds
-> `d ‖ prefix(P, d·log₂F) ‖ topicId` and hashes it through the injected `IRingHash` (db-core's own
-> SHA-256 truncated to the ring width — **not** a FRET import; the db-p2p binding makes the ring
-> width match FRET's `RING_BITS` so routing keys line up). `prefix(P, n)` extracts the `n` MSBs
-> MSB-first, left-padding when `P` is shorter than `n` bits. `coord(0, …)` dispatches to
-> `coord_0 = H(0x00 ‖ topicId)`, which equals `coord_d` with the empty tier-0 prefix.
-> **Validated:** the spec `addressing.spec.ts` ("coord_d collision rate") reproduces the
-> simulator's zero-collision result — distinct `(tier, prefix-shard, topic)` triples never alias,
-> and same-prefix peers converge — confirming no revision to the scheme.
+> `HashTierAddressing`, default `F = 16`) implements the formula exactly: `coord_d` ring-hashes `P`
+> via `this.hash.H(peerId)` before calling `prefixBits`, building `d ‖ prefix(H(P), d·log₂F) ‖ topicId`
+> and hashing it through the injected `IRingHash` (db-core's own SHA-256 truncated to the ring width —
+> **not** a FRET import; the db-p2p binding makes the ring width match FRET's `RING_BITS` so routing
+> keys line up). `prefix(H(P), n)` extracts the `n` MSBs MSB-first, left-padding when `H(P)` is
+> shorter than `n` bits. `coord(0, …)` dispatches to `coord_0 = H(0x00 ‖ topicId)`, which is
+> peer-independent and unchanged. **Validated:** the spec `addressing.spec.ts` ("H(P)-shard collision
+> rate") confirms distinct `(tier, H(P)-shard, topic)` triples never alias, and that the raw
+> peer-id-string prefix collapses to one bucket while `H(P)` fans across all buckets.
 
 > **Simulator validation.** Coordinate distribution and `d_max` are exercised by the design
 > simulator (`packages/substrate-simulator`) against real FRET math — it wraps FRET's own
@@ -91,18 +99,15 @@ This is the only addressing scheme used by the layer. It replaces older bit-shif
 > [.../ring/distance.ts](../../Fret/packages/fret/src/ring/distance.ts),
 > [.../service/cohort.ts](../../Fret/packages/fret/src/service/cohort.ts),
 > [.../estimate/size-estimator.ts](../../Fret/packages/fret/src/estimate/size-estimator.ts))
-> rather than restating them here. The simulator also models `coord_d` directly
-> (`topic-addressing.ts`: `coord_d = H(d ‖ prefix(P, d·log₂F) ‖ topicId)` over `hashKey`) and
-> validates its two addressing invariants — peers sharing a `d·log₂F`-bit prefix converge on one
-> tier-`d` coordinate, while coordinates stay uncorrelated across tiers and topics — by measuring
-> the cross-(tier, prefix, topic) **`coord_d` collision rate**.
+> rather than restating them here. The simulator models `coord_d` with an already-uniform ring
+> position (`hashKey(peerId)`) as `P` — matching the assumption that the shard input is uniform.
+> The db-core implementation now matches this assumption by ring-hashing `P` before the prefix.
 >
 > **Measured (validated by simulator):** the collision test enumerates 64 distinct ring positions ×
 > 4 topics × tiers 0–5 = **1,536 coordinates and observes 0 collisions** — consistent with the
-> birthday bound (≈ `total² / 2²⁵⁷`, negligible at 256-bit width). The two invariants hold as
-> written: distinct `(tier, prefix, topic)` triples never alias, and same-prefix peers do converge.
-> **No revision to the `coord_d` scheme is warranted.** (Evidence: `topic-addressing.spec.ts`
-> "coord_d collision rate".)
+> birthday bound (≈ `total² / 2²⁵⁷`, negligible at 256-bit width). The two invariants hold:
+> distinct `(tier, H(P)-shard, topic)` triples never alias, and same-H(P)-prefix peers converge.
+> (Evidence: `addressing.spec.ts` "H(P)-shard collision rate".)
 
 ### Maximum useful depth
 
@@ -1209,13 +1214,12 @@ limit, topic-budget refusal, and `bootstrap: true` root instantiation.
 > **Doc expectations tagged `it.skip([… DOC EXPECTATION NOT YET IMPLEMENTED …])` at this tier** (named,
 > not omitted — each cites its parking ticket):
 > - the §Anti-flood **claim-1 *fan*** (distinct `coord_{d_max}` per participant, ≈ subscriber count):
->   the wire carries `participantCoord` as the **dialable peer-id**, and every Ed25519 libp2p id
->   base58-encodes to a constant `"12D3KooW…"` prefix, so `prefix(P, d·log₂F)` is identical across
->   participants and `coord_d` for `d ≥ 1` **collapses to one coordinate** instead of fanning. The
->   single-direction walk *discipline* (probe `d_max` first, inward-only-on-`no_state`, no speculative
->   outward) IS asserted on the real engine; the fan awaits the routing-key/signer-id reconciliation in
->   `cohort-topic-participant-coord-routing-key-mismatch` (see §Wire formats "Tier-0 caveat"). The fan
->   itself is simulator-validated against the uniform ring coord (`scenarios.ts` cold-start-storm).
+>   `coord_d` now ring-hashes `P` before taking the prefix (`coord_d = H(d ‖ prefix(H(P), d·log₂F) ‖ topicId)`),
+>   so the collapse-to-one-coordinate issue is resolved and the fan is mechanically sound for `d ≥ 1`.
+>   The single-direction walk *discipline* (probe `d_max` first, inward-only-on-`no_state`, no speculative
+>   outward) IS asserted on the real engine; the fan test itself remains `it.skip` because it requires
+>   live multi-tier promotion (not yet reliably driveable in the mock mesh — deferred to the real-libp2p
+>   tier / CI). The fan is simulator-validated against the uniform ring coord (`scenarios.ts` cold-start-storm).
 > - **multi-tier tree growth / depth law** `⌈log_F(N/cap_promote)⌉` over a live walk: `followOn` cold-start
 >   derivation (`cohort-topic-followon-derivation`), the parent-side child recording
 >   (`cohort-topic-parent-child-link` — the signed `ChildLinkV1`, verify, and per-engine `childCohortCount`),
@@ -1361,12 +1365,10 @@ interface RegisterV1 {
 > The signer's public key is read from the participant identity `participantCoord`, which the current
 > implementation carries as the participant's **dialable peer id** (the UTF-8 of the peer-id string,
 > the same peer-codec encoding as the reply's `primary`/`backups`/`cohortMembers`) so the embedded
-> Ed25519 key is recoverable with no network lookup. This `P` is also the record key and the routing
-> coordinate fed to `coord_d`. *Tier-0 caveat:* `coord_0` is participant-independent, so this is exact
-> for the single-tier milestone; multi-tier (`d ≥ 1`) sharding still wants a **uniform** ring coord
-> for `prefix(P, …)`, so reconciling the routing/sharding key with the verifiable signer id (e.g. a
-> separate signer field, or hashing `P` only for the `coord_d` input) is a documented follow-on,
-> tracked with the rest of the multi-tier work.
+> Ed25519 key is recoverable with no network lookup. This `P` is also the record key; for routing,
+> `coord_d` ring-hashes `P` internally before taking the prefix (`coord_d = H(d ‖ prefix(H(P), d·log₂F) ‖ topicId)`)
+> so the shard input is uniform across participants for all tiers. The wire carries the unmodified peer
+> id so the Ed25519 key remains recoverable; the ring-hash is applied only inside the addressing math.
 
 ```
 interface RegisterReplyV1 {
