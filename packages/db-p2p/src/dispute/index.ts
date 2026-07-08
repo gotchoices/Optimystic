@@ -14,7 +14,13 @@ export {
 	type EngineHealthState,
 	DEFAULT_DISPUTE_CONFIG,
 } from './types.js';
-export { selectArbitrators } from './arbitrator-selection.js';
+export {
+	sampleArbitrators,
+	coordinatePreimage,
+	type ArbitratorSamplingParams,
+	type NearestResolver,
+	type RingHashFn,
+} from './arbitrator-selection.js';
 export {
 	buildDisputeResolutionProof,
 	verifyInvalidationCertificate,

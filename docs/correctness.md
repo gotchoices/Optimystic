@@ -204,7 +204,7 @@ Transactions carry an expiration timestamp. Three mechanisms ensure termination:
 
 1. **Expiration enforcement.** Cluster members reject transactions with expired timestamps. The cleanup queue runs every 1 second, removing expired transactions not in terminal phases (Consensus/Rejected). The expiration queue runs every 60 seconds, scanning for newly expired transactions.
 
-2. **Dispute termination.** Each dispute escalation round has a timeout (default 60 seconds). If arbitrators don't respond within the timeout, the round concludes with available votes. The dispute mechanism cannot loop: each round enlists fresh peers from progressively wider FRET ring distance, and the global honest majority ensures eventual resolution (see Theorem 8).
+2. **Dispute termination.** Each dispute escalation round has a timeout (default 60 seconds). If arbitrators don't respond within the timeout, the round concludes with available votes. The dispute mechanism cannot loop: each round enlists fresh peers by dispersed sampling from the whole population (excluding those already drawn), and the global honest majority ensures eventual resolution (see Theorem 8).
 
 3. **Retry backoff.** Failed commit attempts use exponential backoff (2s → 4s → 8s → 16s → 30s cap, max 5 attempts). After exhausting retries, the transaction is abandoned with an error.
 
@@ -218,19 +218,19 @@ Transactions carry an expiration timestamp. Three mechanisms ensure termination:
 
 **Proof sketch.**
 
-At each escalation round, the dissent coordinator enlists *K* additional peers (where *K* is the cluster size) from the next ring segment by FRET distance. The dispute is resolved when enlistees reach 2/3 super-majority among decisive votes.
+At each escalation round, the dissent coordinator enlists *K* additional peers (where *K* is the cluster size) by **dispersed sampling** — the peers nearest *K* pseudo-random ring coordinates (`hash(blockId ‖ round ‖ epoch ‖ i)`), which are uniform over the ring. Crucially, each round's *K* enlistees are drawn from the *whole* population, not the next concentric ring segment: geometric widening only dilutes a locale-Sybil if each wider sample is more representative, and uniform dispersion guarantees that (concentric widening would instead exhaust the attacker's captured neighborhood first). The dispute is resolved when enlistees reach 2/3 super-majority among decisive votes.
 
 Let *p* be the fraction of honest nodes globally (p > 1/2 by assumption). At each round, the probability that the new enlistees have an honest 2/3 majority is:
 
 *P(resolve at round r)* ≥ P(≥ 2K/3 of K enlistees are honest)
 
-For p > 1/2 and K ≥ 3, this probability is bounded below by a constant. Therefore the expected number of rounds is O(1). In the worst case (adversary controls nodes near specific ring positions), escalation may require O(log N) rounds as the audience expands to cover the global population.
+For p > 1/2 and K ≥ 3, this probability is bounded below by a constant. Therefore the expected number of rounds is O(1). Because each round samples from the whole keyspace, an adversary controlling nodes near specific ring positions gains no local advantage over the arbitrators; in the worst case escalation still may require O(log N) rounds as the audience expands to cover the global population.
 
 Each round ejects the losing side, so the honest fraction of active nodes *increases monotonically*. After at most ⌈log₂(N/K)⌉ rounds, the entire network has been consulted, and the honest majority decides.
 
 **Cost.** Round *r* involves *r × K* total peers. The total work across all rounds is bounded by O(K × log(N/K)), which is O(K log N) for K ≪ N. In the common case (no Byzantine nodes nearby), the fast path handles the transaction with zero dispute cost.
 
-**Depends on:** Global honest majority, deterministic arbitrator selection by FRET distance, ejection of losing peers, dispute timeout per round.
+**Depends on:** Global honest majority, deterministic dispersed arbitrator sampling (uniform over the ring), ejection of losing peers, dispute timeout per round.
 
 ### Theorem 8b: Invalidation-Cascade Termination & Convergence
 
@@ -279,7 +279,7 @@ This is not standard BFT. The tolerance is *adaptive*: the validation protocol a
 
 *Tier 3 — Local minority honest (K/4 ≤ f_local < K).* If the Byzantine fraction exceeds the local super-majority threshold, the honest minority triggers a dispute. The dissent coordinator enlists validators from the wider network. Since the global honest fraction p > 1/2, the enlistees are expected to be majority-honest. Cost: one or more escalation rounds.
 
-*Tier 4 — Cascading escalation (wide Byzantine presence).* If enlisted validators are also split, escalation continues to progressively wider ring segments. Each round ejects losing validators, increasing the honest fraction. Cost: O(log N) rounds in the worst case.
+*Tier 4 — Cascading escalation (wide Byzantine presence).* If enlisted validators are also split, escalation continues by drawing further dispersed samples from the whole population (a larger `count` per round). Each round ejects losing validators, increasing the honest fraction. Cost: O(log N) rounds in the worst case.
 
 *Convergence.* At each escalation level, the resolution threshold is 2/3 super-majority of decisive arbitrator votes. With global honest majority (p > 1/2), the expected arbitrator honest fraction exceeds 1/2, and the probability of achieving 2/3 honest decisive votes is bounded below by a positive constant. The honest side wins with probability approaching 1 as the audience grows.
 
@@ -297,7 +297,7 @@ This is not standard BFT. The tolerance is *adaptive*: the validation protocol a
 
 Validation degenerates to whole-network consensus (blockchain-style) only when Byzantine validators are widespread — a scenario that should be exceedingly rare given the economic incentives against it (ejection, reputation loss).
 
-**Depends on:** Global honest majority, dispute escalation mechanism, reputation-based ejection, FRET ring topology for deterministic validator/arbitrator selection.
+**Depends on:** Global honest majority, dispute escalation mechanism, reputation-based ejection, FRET ring topology for deterministic validator selection and dispersed arbitrator sampling.
 
 ### Theorem 11: Equivocation Detection
 
@@ -430,9 +430,9 @@ The honest majority assumption (§1.5) counts *nodes*, not *identities*. A Sybil
 - FRET network size estimation detects anomalous density and flags low-confidence estimates.
 - The `validateSmallCluster()` check compares local cluster size against FRET's global estimate (coordinator side).
 - The **member-side membership admission gate** (see Theorem 2) makes each cluster member independently re-derive and admit the responsible set before voting, so a coordinator cannot unilaterally shrink a block's cluster to a Sybil-dominated slice and have honest members rubber-stamp it — a below-floor or low-confidence declared set is refused.
-- Dispute escalation recruits validators from progressively wider ring segments, diluting the Sybil attacker's influence.
+- Dispute escalation samples arbitrators by **verifiable dispersed sampling**, not ring adjacency: each arbitrator is the peer nearest a pseudo-random ring coordinate derived from `hash(blockId ‖ round ‖ epoch ‖ i)`. Because SHA-256 output is uniform over the ring, the coordinates land spread across the whole keyspace, so arbitrators are drawn from the *entire* population, not the disputed block's neighborhood. A Sybil attacker who placed identities near the block to capture its cluster does **not** thereby own the arbitrators — capturing them would require identities near many independent random points, i.e. a fraction of the whole network rather than one locale. The draw is deterministic (every honest node given the same `(blockId, round, epoch)` and agreed membership computes the identical set) yet not pre-positionable (the coordinates are pinned only once the real-time `round` and the agreed-membership `epoch` are fixed). *Note: earlier revisions drew the next K peers by XOR distance to the block — concentric selection that walked straight through the attacker's captured neighborhood and is what this replaces.*
 
-**Bound.** Sybil resistance is proportional to the cost of key generation and the effectiveness of FRET's density estimation. A sufficiently resourced attacker with N/2 identities breaks the honest majority assumption entirely.
+**Bound.** Sybil resistance is proportional to the cost of key generation and the effectiveness of FRET's density estimation. A sufficiently resourced attacker with N/2 identities breaks the honest majority assumption entirely. Dispersed arbitrator sampling raises the *local* Sybil cost — dominating one block's cluster no longer suffices to also capture its arbitrators.
 
 ### 7.2 Network Partition Duration
 

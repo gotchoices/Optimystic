@@ -40,8 +40,14 @@ export interface DisputeServiceInit {
 	validator?: ITransactionValidator;
 	revalidate?: RevalidateTransaction;
 	config?: Partial<DisputeConfig>;
-	/** Select arbitrators for a dispute (next K peers beyond the original cluster) */
-	selectArbitrators: (blockId: string, excludePeers: string[], count: number) => Promise<PeerId[]>;
+	/**
+	 * Select arbitrators for a dispute via verifiable dispersed sampling (see `sampleArbitrators`): draw
+	 * `count` distinct peers from coordinates spread across the whole keyspace, not the block's neighborhood.
+	 * `round` (0-based escalation round) and `epoch` (agreed membership epoch bytes) are folded into every
+	 * coordinate so the draw is deterministic yet not pre-positionable — an honest node re-derives the
+	 * identical set from the same `(blockId, round, epoch)` + agreed membership.
+	 */
+	selectArbitrators: (blockId: string, excludePeers: string[], count: number, round: number, epoch: Uint8Array) => Promise<PeerId[]>;
 	/**
 	 * Originates the durable reversal when a dispute resolves `challenger-wins`. The dissent
 	 * coordinator (the node that initiated the dispute, holding the original record) builds the
@@ -164,9 +170,18 @@ export class DisputeService {
 		const originalPeers = Object.keys(record.peers);
 		const arbitratorCount = this.config.arbitratorCount ?? originalPeers.length;
 
+		// Round 0 is the only round today (single-round arbitration); `design-dispute-synchronous-escalation`
+		// drives real-time round progression. `epoch` pins the dispersed draw to a membership the attacker
+		// cannot freely advance.
+		// NOTE: interim agreed-membership epoch — hash of the admission-gate-agreed responsible set
+		// (`Object.keys(record.peers)`). When `design-cluster-membership-agreement` lands, `epoch` becomes
+		// the agreed membership epoch rather than this locally-hashed stand-in.
+		const round = 0;
+		const epoch = await this.computeEpochBytes(originalPeers);
+
 		let arbitrators: PeerId[];
 		try {
-			arbitrators = await this.selectArbitrators(blockId, originalPeers, arbitratorCount);
+			arbitrators = await this.selectArbitrators(blockId, originalPeers, arbitratorCount, round, epoch);
 		} catch (err) {
 			log('dispute-arbitrator-selection-failed', { disputeId, error: err instanceof Error ? err.message : String(err) });
 			return undefined;
@@ -568,6 +583,19 @@ export class DisputeService {
 			evidence,
 			signature: uint8ArrayToString(sigBytes, 'base64url'),
 		};
+	}
+
+	/**
+	 * Interim agreed-membership epoch bytes for the dispersed arbitrator draw: SHA-256 of the sorted,
+	 * comma-joined responsible peer-id set (the same set the admission gate agrees on). Sorted so the
+	 * digest is independent of enumeration order, so every honest node computes the identical epoch — the
+	 * property that lets the verify path re-derive the same arbitrator set. Replaced by the real agreed
+	 * membership epoch when `design-cluster-membership-agreement` lands.
+	 */
+	private async computeEpochBytes(peers: string[]): Promise<Uint8Array> {
+		const joined = [...peers].sort().join(',');
+		const digest = await sha256.digest(new TextEncoder().encode(joined));
+		return digest.digest;
 	}
 
 	private async computeDisputeId(messageHash: string, peerId: string, timestamp: number): Promise<string> {

@@ -84,6 +84,7 @@ import type { IPeerReputation } from './reputation/types.js';
 import { PenaltyReason } from './reputation/types.js';
 import { DisputeService } from './dispute/dispute-service.js';
 import { DisputeClient } from './dispute/client.js';
+import { sampleArbitrators } from './dispute/arbitrator-selection.js';
 import type { DisputeConfig } from './dispute/types.js';
 
 type Libp2pInit = NonNullable<Parameters<typeof createLibp2p>[0]>;
@@ -1048,23 +1049,22 @@ export async function createLibp2pNodeBase(
 			reputation,
 			validator: options.validator,
 			config: options.dispute,
-			selectArbitrators: async (blockId: string, excludePeers: string[], count: number) => {
+			selectArbitrators: async (blockId: string, excludePeers: string[], count: number, round: number, epoch: Uint8Array) => {
 				const { hashKey: fretHashKey } = await import('p2p-fret');
-				const blockIdBytes = new TextEncoder().encode(blockId);
 				const fret = (node as any).services?.fret as FretService | undefined;
 				if (!fret) return [];
-				// Get a larger cohort and exclude the original cluster peers
-				const cohortSize = count + excludePeers.length + 1;
-				const hashedCoord = await fretHashKey(blockIdBytes);
-				const allPeerIdStrs = fret.assembleCohort(hashedCoord, cohortSize) as string[];
-				// Filter out original cluster peers and self, convert to PeerId
+				// Dispersed sampling: draw `count` peers from coordinates spread across the whole keyspace
+				// (hash(blockId ‖ round ‖ epoch ‖ i)) rather than the block's XOR neighborhood, so an attacker
+				// who owns the block's locale does not thereby own the arbitrators. `assembleCohort` already
+				// filters to known members; excluding the original cluster + self keeps arbitrators independent.
 				const excludeSet = new Set(excludePeers);
 				excludeSet.add(node.peerId.toString());
-				const arbitratorPeerIds = allPeerIdStrs
-					.filter(pid => !excludeSet.has(pid))
-					.slice(0, count)
-					.map(pid => peerIdFromString(pid));
-				return arbitratorPeerIds;
+				const picks = await sampleArbitrators(
+					{ blockId: new TextEncoder().encode(blockId), round, epoch, count, exclude: excludeSet },
+					(coord, wants) => fret.assembleCohort(coord, wants) as string[],
+					fretHashKey,
+				);
+				return picks.map(pid => peerIdFromString(pid));
 			},
 		});
 	}

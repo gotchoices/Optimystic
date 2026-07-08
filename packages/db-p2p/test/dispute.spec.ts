@@ -12,8 +12,9 @@ import { EngineHealthMonitor } from '../src/dispute/engine-health-monitor.js';
 import type { ValidationEvidence, ArbitrationVote, DisputeChallenge, DisputeResolution } from '../src/dispute/types.js';
 import { PeerReputationService } from '../src/reputation/peer-reputation.js';
 import { PenaltyReason } from '../src/reputation/types.js';
-import { selectArbitrators } from '../src/dispute/arbitrator-selection.js';
+import { sampleArbitrators, coordinatePreimage, type NearestResolver } from '../src/dispute/arbitrator-selection.js';
 import { sortPeersByDistance, type KnownPeer } from '../src/routing/responsibility.js';
+import { hashKey } from 'p2p-fret';
 
 // ─── Canonical JSON for deterministic hashing ───
 
@@ -240,7 +241,7 @@ describe('DisputeService', () => {
 			revalidate: async (_record) => {
 				return makeEvidence(options?.evidenceHash ?? 'hash-default');
 			},
-			selectArbitrators: async (_blockId, _exclude, count) => {
+			selectArbitrators: async (_blockId, _exclude, count, _round, _epoch) => {
 				return arbitratorPeers.slice(0, count).map(p => p.peerId);
 			},
 		});
@@ -363,6 +364,38 @@ describe('DisputeService', () => {
 			expect(result).to.not.be.undefined;
 			expect(result!.outcome).to.equal('inconclusive');
 			expect(result!.affectedPeers.length).to.equal(0);
+		});
+
+		it('threads round 0 and a non-empty agreed-membership epoch to selectArbitrators', async () => {
+			const challenger = clusterPeers[0]!;
+			let capturedRound: number | undefined;
+			let capturedEpoch: Uint8Array | undefined;
+			const svc = new DisputeService({
+				peerId: challenger.peerId,
+				privateKey: challenger.privateKey,
+				peerNetwork: new MockPeerNetwork(),
+				createDisputeClient: createMockClientFactory(allServices) as any,
+				reputation: new PeerReputationService(),
+				config: { disputeEnabled: true, disputeArbitrationTimeoutMs: 5000, engineHealthDisputeThreshold: 3, engineHealthWindowMs: 600_000 },
+				revalidate: async () => makeEvidence('hash-A'),
+				selectArbitrators: async (_blockId, _exclude, count, round, epoch) => {
+					capturedRound = round;
+					capturedEpoch = epoch;
+					return arbitratorPeers.slice(0, count).map(p => p.peerId);
+				},
+			});
+			allServices.set(challenger.peerId.toString(), svc);
+			for (const arb of arbitratorPeers) createDisputeService(arb, { evidenceHash: 'hash-A' });
+
+			const record = await makeClusterRecord(clusterPeers, 'block-1', {
+				rejectPeers: new Set([challenger.peerId.toString()]),
+			});
+			await svc.initiateDispute(record, makeEvidence('hash-A'));
+
+			// Round 0 today (single-round arbitration); epoch is the interim hash of the agreed responsible set.
+			expect(capturedRound).to.equal(0);
+			expect(capturedEpoch).to.be.instanceOf(Uint8Array);
+			expect(capturedEpoch!.length).to.be.greaterThan(0);
 		});
 	});
 
@@ -788,7 +821,7 @@ describe('DisputeService', () => {
 					engineHealthWindowMs: 600_000,
 				},
 				revalidate: async () => makeEvidence('hash-A'),
-				selectArbitrators: async (_blockId, _exclude, count) =>
+				selectArbitrators: async (_blockId, _exclude, count, _round, _epoch) =>
 					arbitratorPeers.slice(0, count).map(p => p.peerId),
 			});
 			allServices.set(challenger.peerId.toString(), svc);
@@ -830,7 +863,7 @@ describe('DisputeService', () => {
 					engineHealthWindowMs: 600_000,
 				},
 				revalidate: async () => makeEvidence('hash-A'),
-				selectArbitrators: async (_blockId, _exclude, count) =>
+				selectArbitrators: async (_blockId, _exclude, count, _round, _epoch) =>
 					arbitratorPeers.slice(0, count).map(p => p.peerId),
 			});
 			allServices.set(challenger.peerId.toString(), svc);
@@ -854,63 +887,135 @@ describe('DisputeService', () => {
 	});
 });
 
-describe('selectArbitrators', () => {
-	it('should select peers beyond the original cluster', async () => {
-		const allPeerKeys = await Promise.all(Array.from({ length: 6 }, () => makeKeyPair()));
-		const blockId = new TextEncoder().encode('test-block');
+describe('sampleArbitrators', () => {
+	// A test NearestResolver over a fixed membership: sort by XOR distance to the coordinate, return ids.
+	function nearestFromPeers(peers: KnownPeer[]): NearestResolver {
+		return (coord, wants) => sortPeersByDistance(peers, coord).slice(0, wants).map(p => p.id.toString());
+	}
 
-		// Sort all by XOR distance
-		const knownPeers: KnownPeer[] = allPeerKeys.map(p => ({
-			id: p.peerId,
-			addrs: ['/ip4/127.0.0.1/tcp/8000'],
-		}));
-		const sorted = sortPeersByDistance(knownPeers, blockId);
+	async function makePeers(n: number): Promise<KnownPeer[]> {
+		const keys = await Promise.all(Array.from({ length: n }, () => makeKeyPair()));
+		return keys.map(k => ({ id: k.peerId, addrs: ['/ip4/127.0.0.1/tcp/8000'] }));
+	}
 
-		// First 3 are in the cluster
-		const clusterPeerIds = new Set(sorted.slice(0, 3).map(p => p.id.toString()));
+	const EPOCH = new TextEncoder().encode('epoch-A');
 
-		// Select 3 arbitrators
-		const arbitrators = selectArbitrators(knownPeers, blockId, clusterPeerIds, 3);
+	it('disperses picks across the keyspace rather than the block neighborhood', async () => {
+		const peers = await makePeers(120);
+		const blockId = new TextEncoder().encode('disperse-block');
+		const nearest = nearestFromPeers(peers);
 
-		// Should get exactly 3 arbitrators
-		expect(arbitrators.length).to.equal(3);
+		// Rank every peer by XOR distance to hash(blockId): the concentric (old) selection drew only the
+		// lowest-ranked peers just past the cluster.
+		const blockCoord = await hashKey(blockId);
+		const rankOrder = sortPeersByDistance(peers, blockCoord).map(p => p.id.toString());
+		const rankOf = new Map(rankOrder.map((id, idx) => [id, idx] as const));
 
-		// None should be in the original cluster
-		for (const arb of arbitrators) {
-			expect(clusterPeerIds.has(arb.toString())).to.be.false;
-		}
+		// Exclude the concentric "cluster": the 6 nearest to hash(blockId).
+		const clusterSize = 6;
+		const exclude = new Set(rankOrder.slice(0, clusterSize));
+		const count = 15;
+
+		const picks = await sampleArbitrators({ blockId, round: 0, epoch: EPOCH, count, exclude }, nearest, hashKey);
+		expect(picks.length).to.equal(count);
+		expect(new Set(picks).size).to.equal(count); // distinct
+
+		// Concentric selection would place every pick at rank < clusterSize + count (~21). Dispersed sampling
+		// draws from the whole ring, so the picks span far beyond that. The chance all 15 uniform draws land
+		// within the nearest ~50/120 ranks is ~0.42^15 ≈ 1e-6, so this holds deterministically in practice.
+		const maxRank = Math.max(...picks.map(p => rankOf.get(p)!));
+		expect(maxRank).to.be.greaterThan(50);
+
+		// And the picks are NOT the concentric next-K set the old function returned.
+		const concentricNextK = new Set(rankOrder.slice(clusterSize, clusterSize + count));
+		const identical = picks.length === concentricNextK.size && picks.every(p => concentricNextK.has(p));
+		expect(identical).to.be.false;
 	});
 
-	it('should return fewer arbitrators if not enough peers available', async () => {
-		const allPeerKeys = await Promise.all(Array.from({ length: 4 }, () => makeKeyPair()));
-		const blockId = new TextEncoder().encode('test-block-2');
-
-		const knownPeers: KnownPeer[] = allPeerKeys.map(p => ({
-			id: p.peerId,
-			addrs: ['/ip4/127.0.0.1/tcp/8000'],
-		}));
-		const sorted = sortPeersByDistance(knownPeers, blockId);
-
-		// First 3 are in the cluster, only 1 available as arbitrator
-		const clusterPeerIds = new Set(sorted.slice(0, 3).map(p => p.id.toString()));
-		const arbitrators = selectArbitrators(knownPeers, blockId, clusterPeerIds, 3);
-
-		expect(arbitrators.length).to.equal(1);
+	it('is deterministic: identical params yield the identical ordered set', async () => {
+		const peers = await makePeers(40);
+		const blockId = new TextEncoder().encode('determinism-block');
+		const nearest = nearestFromPeers(peers);
+		const a = await sampleArbitrators({ blockId, round: 0, epoch: EPOCH, count: 5, exclude: new Set() }, nearest, hashKey);
+		const b = await sampleArbitrators({ blockId, round: 0, epoch: EPOCH, count: 5, exclude: new Set() }, nearest, hashKey);
+		expect(a).to.deep.equal(b);
+		expect(a.length).to.equal(5);
 	});
 
-	it('should return empty array if all peers are in cluster', async () => {
-		const allPeerKeys = await Promise.all(Array.from({ length: 3 }, () => makeKeyPair()));
-		const blockId = new TextEncoder().encode('test-block-3');
+	it('pins the canonical little-endian coordinate encoding (golden vector)', async () => {
+		const peers = await makePeers(10);
+		const blockId = new Uint8Array([0xde, 0xad, 0xbe, 0xef]);
+		const epoch = new Uint8Array([0x01, 0x02, 0x03]);
 
-		const knownPeers: KnownPeer[] = allPeerKeys.map(p => ({
-			id: p.peerId,
-			addrs: ['/ip4/127.0.0.1/tcp/8000'],
-		}));
+		// The i-th coordinate preimage is blockId ‖ u32le(round) ‖ epoch ‖ u32le(i).
+		const expectedPreimage0 = new Uint8Array([
+			0xde, 0xad, 0xbe, 0xef,     // blockId
+			0x07, 0x00, 0x00, 0x00,     // u32le(round = 7)
+			0x01, 0x02, 0x03,           // epoch
+			0x00, 0x00, 0x00, 0x00,     // u32le(i = 0)
+		]);
+		expect(Array.from(coordinatePreimage(blockId, 7, epoch, 0))).to.deep.equal(Array.from(expectedPreimage0));
 
-		const clusterPeerIds = new Set(allPeerKeys.map(p => p.peerId.toString()));
-		const arbitrators = selectArbitrators(knownPeers, blockId, clusterPeerIds, 3);
+		// And sampleArbitrators hashes exactly that preimage for its first coordinate.
+		const seenInputs: Uint8Array[] = [];
+		const spyHash = async (bytes: Uint8Array) => { seenInputs.push(bytes.slice()); return hashKey(bytes); };
+		await sampleArbitrators({ blockId, round: 7, epoch, count: 1, exclude: new Set() }, nearestFromPeers(peers), spyHash);
+		expect(Array.from(seenInputs[0]!)).to.deep.equal(Array.from(expectedPreimage0));
+	});
 
-		expect(arbitrators.length).to.equal(0);
+	it('samples a distinct population per round; excluding prior picks keeps rounds disjoint', async () => {
+		const peers = await makePeers(120);
+		const blockId = new TextEncoder().encode('round-block');
+		const nearest = nearestFromPeers(peers);
+
+		const round0 = await sampleArbitrators({ blockId, round: 0, epoch: EPOCH, count: 5, exclude: new Set() }, nearest, hashKey);
+		// Caller accumulates prior-round picks into exclude → the two rounds are disjoint.
+		const round1 = await sampleArbitrators({ blockId, round: 1, epoch: EPOCH, count: 5, exclude: new Set(round0) }, nearest, hashKey);
+		expect(round1.filter(p => round0.includes(p))).to.have.lengthOf(0);
+
+		// Changing epoch reshuffles the draw (different coordinates → different picks).
+		const otherEpoch = await sampleArbitrators({ blockId, round: 0, epoch: new TextEncoder().encode('epoch-B'), count: 5, exclude: new Set() }, nearest, hashKey);
+		expect(otherEpoch).to.not.deep.equal(round0);
+	});
+
+	it('small-network fallback: cluster+1 yields exactly 1; all-in-cluster yields []', async () => {
+		const peers = await makePeers(6);
+		const blockId = new TextEncoder().encode('small-block');
+		const nearest = nearestFromPeers(peers);
+		const ids = peers.map(p => p.id.toString());
+
+		// cluster = 5 of 6 excluded → exactly 1 arbitrator available, however high count is; no duplicate, no loop.
+		const cluster = new Set(ids.slice(0, 5));
+		const one = await sampleArbitrators({ blockId, round: 0, epoch: EPOCH, count: 3, exclude: cluster }, nearest, hashKey);
+		expect(one).to.have.lengthOf(1);
+		expect(cluster.has(one[0]!)).to.be.false;
+
+		// all peers excluded → empty (matches the old all-in-cluster behavior).
+		const none = await sampleArbitrators({ blockId, round: 0, epoch: EPOCH, count: 3, exclude: new Set(ids) }, nearest, hashKey);
+		expect(none).to.have.lengthOf(0);
+	});
+
+	it('liveness replacement: an excluded nearest pick is replaced by the deterministic next-nearest', async () => {
+		const peers = await makePeers(40);
+		const blockId = new TextEncoder().encode('liveness-block');
+		const nearest = nearestFromPeers(peers);
+
+		// The first coordinate's nearest peer (round 0, i 0) is the natural pick.
+		const coord0 = await hashKey(coordinatePreimage(blockId, 0, EPOCH, 0));
+		const byDist0 = sortPeersByDistance(peers, coord0).map(p => p.id.toString());
+		const naturalPick = byDist0[0]!;
+
+		const first = await sampleArbitrators({ blockId, round: 0, epoch: EPOCH, count: 1, exclude: new Set() }, nearest, hashKey);
+		expect(first).to.deep.equal([naturalPick]);
+
+		// Mark that peer offline (excluded): the replacement is the deterministic next-nearest to coord0…
+		const replacement = byDist0[1]!;
+		const withReplacement = await sampleArbitrators({ blockId, round: 0, epoch: EPOCH, count: 1, exclude: new Set([naturalPick]) }, nearest, hashKey);
+		expect(withReplacement).to.deep.equal([replacement]);
+
+		// …and it is identical across two independent computations.
+		const again = await sampleArbitrators({ blockId, round: 0, epoch: EPOCH, count: 1, exclude: new Set([naturalPick]) }, nearest, hashKey);
+		expect(again).to.deep.equal(withReplacement);
 	});
 });
 

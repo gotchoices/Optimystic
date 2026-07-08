@@ -82,6 +82,21 @@ export type ArbitratorSetRecomputeContext = {
 	readonly blockIds: ReadonlyArray<BlockId>;
 	/** The carried set being judged (peer-id strings). */
 	readonly arbitratorSet: ReadonlyArray<string>;
+	/**
+	 * Escalation round the carried set was drawn at (0-based). A recompute capability MUST feed this to
+	 * `sampleArbitrators` so it re-derives the SAME dispersed draw. Today every dispute is round 0
+	 * (single-round arbitration), so the verify path pins it to 0; `design-dispute-synchronous-escalation`
+	 * threads the real round through the proof and updates this seam.
+	 */
+	readonly round: number;
+	/**
+	 * Agreed membership epoch the carried set was drawn against — the bytes `sampleArbitrators` folds into
+	 * every coordinate. A recompute capability MUST feed this so its re-derivation matches the original
+	 * draw. Optional until `design-dispute-synchronous-escalation` carries/derives it on the proof; while
+	 * absent a recompute cannot reconstruct the draw and should return `{ feasible: false }` (degradation),
+	 * which matches today's behavior — no recompute capability is wired in production.
+	 */
+	readonly epoch?: Uint8Array;
 };
 
 /**
@@ -291,6 +306,11 @@ export async function verifyInvalidationCertificate(proof: DisputeResolutionProo
 			invalidatedActionId: target.invalidatedActionId,
 			blockIds: target.blockIds,
 			arbitratorSet: proof.arbitratorSet,
+			// NOTE: `round` pinned to 0 (single-round arbitration today) and `epoch` omitted until
+			// `design-dispute-synchronous-escalation` threads the real (round, epoch) through the proof, so a
+			// `sampleArbitrators`-based recompute re-derives the identical dispersed set. Until then no recompute
+			// capability is wired in production; the test recomputes ignore these fields.
+			round: 0,
 		});
 		if (verdict.feasible) {
 			if (!verdict.legitimate) {

@@ -105,10 +105,11 @@ export type DisputeResolutionProof = {
 	 */
 	readonly challengerPeerId: string;
 	/**
-	 * The legitimately-selected arbitrator set — the K peer-ids the challenger computed via
-	 * `selectArbitrators` (the next K peers beyond the original cluster by XOR distance to the disputed
-	 * block). Every counted vote's `arbitratorPeerId` must be a member; the set is bound to the originator
-	 * by {@link arbitratorSetSignature} and, when feasible, re-derived from the verifying member's topology.
+	 * The legitimately-selected arbitrator set — the K peer-ids the challenger computed via `sampleArbitrators`
+	 * (verifiable dispersed sampling: the peers nearest K pseudo-random ring coordinates derived from
+	 * `hash(blockId ‖ round ‖ epoch ‖ i)`, spread across the whole keyspace rather than drawn from the disputed
+	 * block's neighborhood). Every counted vote's `arbitratorPeerId` must be a member; the set is bound to the
+	 * originator by {@link arbitratorSetSignature} and, when feasible, re-derived from the verifying member's topology.
 	 */
 	readonly arbitratorSet: ReadonlyArray<string>;
 	/**
