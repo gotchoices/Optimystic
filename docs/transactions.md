@@ -505,9 +505,9 @@ Configuration knobs in `ClusterConsensusConfig` (`packages/db-core/src/cluster/s
 
 | Knob | Default | Effect |
 |---|---|---|
-| `readRepairMode` | `'lazy'` | `'lazy'` repairs after the window; `'paranoid'` verifies on every read (no staleness window) |
-| `readRepairWindowMs` | `10000` | How long (ms) a local copy is trusted before a repair is triggered |
-| `readRepairSampleRate` | — | Fraction of reads that trigger a repair check in lazy mode |
+| `readRepairMode` | `'lazy'` | `'off'` never re-verifies a present block (fetch only on miss — legacy, **staleness unbounded**); `'lazy'` repairs after the window; `'paranoid'` verifies on every read (no staleness window) |
+| `readRepairWindowMs` | `10000` | How long (ms) a local copy is trusted before a repair is triggered (`'lazy'` only) |
+| `readRepairSampleRate` | `0` | Per-read probability (0..1) of forcing a repair check in `'lazy'` mode even within the window; `0` disables the random check |
 
 Use `readRepairMode: 'paranoid'` for callers that cannot tolerate any staleness.
 
