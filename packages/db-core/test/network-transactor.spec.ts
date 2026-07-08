@@ -4,7 +4,7 @@ import { NetworkSimulation } from './simulation.js'
 import type { Scenario } from './simulation.js'
 import { randomBytes } from '@libp2p/crypto'
 import { blockIdToBytes } from '../src/utility/block-id-to-bytes.js'
-import type { BlockId, PendRequest, BlockOperation, ClusterPeers, FindCoordinatorOptions, IKeyNetwork } from '../src/index.js'
+import type { BlockId, PendRequest, BlockOperation, ClusterPeers, FindCoordinatorOptions, IKeyNetwork, IRepo, BlockGets, GetBlockResults } from '../src/index.js'
 import type { PeerId } from '../src/index.js'
 import { peerIdFromString } from '../src/network/types.js'
 import { toString as uint8ArrayToString } from 'uint8arrays/to-string'
@@ -53,6 +53,113 @@ describe('NetworkTransactor', () => {
       expect(result).to.be.an('object')
       expect(result[blockId]).to.exist
       expect(result[blockId]!.state).to.exist
+    })
+  })
+
+  // Retry accounting for get(): an authoritative "absent" answer (an entry that is
+  // present but carries no materialized block) is final and must cost exactly one
+  // coordinator round. Only a genuine no-response — a missing/partial response with
+  // no entry for a requested block id — earns the second-chance retry.
+  describe('get retry accounting', () => {
+    // Counts findCoordinator calls and picks the first non-excluded peer, so a
+    // second-chance retry (which excludes the first coordinator) lands on a distinct
+    // peer — letting the test observe whether a retry round happened at all.
+    class CountingKeyNetwork implements IKeyNetwork {
+      findCoordinatorCalls = 0
+      constructor(private readonly peers: string[]) {}
+      async findCoordinator(_key: Uint8Array, options?: Partial<FindCoordinatorOptions>): Promise<PeerId> {
+        this.findCoordinatorCalls++
+        const excluded = new Set((options?.excludedPeers ?? []).map(p => p.toString()))
+        const pick = this.peers.find(p => !excluded.has(p))
+        if (!pick) throw new Error('No coordinator found')
+        return peerIdFromString(pick)
+      }
+      async findCluster(_key: Uint8Array): Promise<ClusterPeers> {
+        const peers: ClusterPeers = {}
+        for (const p of this.peers) peers[p] = { multiaddrs: [], publicKey: '' }
+        return peers
+      }
+    }
+
+    // Minimal IRepo whose only meaningful method is get(); pend/commit/cancel are
+    // unused on the read path and throw if the test somehow reaches them.
+    const makeGetOnlyRepo = (getImpl: (b: BlockGets) => Promise<GetBlockResults>): IRepo => ({
+      get: getImpl,
+      async pend() { throw new Error('unused on read path') },
+      async commit() { throw new Error('unused on read path') },
+      async cancel() { throw new Error('unused on read path') },
+    })
+
+    it('resolves after exactly one coordinator round for an authoritative absent', async () => {
+      const peerA = 'peer-A'
+      const peerB = 'peer-B' // the fallback the OLD (retry-on-not-found) code would have dialed
+      const net = new CountingKeyNetwork([peerA, peerB])
+
+      let getCalls = 0
+      // Every requested block is authoritatively absent: entry present, no block.
+      const absentRepo = makeGetOnlyRepo(async ({ blockIds }: BlockGets) => {
+        getCalls++
+        const res: GetBlockResults = {}
+        for (const bid of blockIds) res[bid] = { state: {} }
+        return res
+      })
+
+      const networkTransactor = new NetworkTransactor({
+        timeoutMs: 1000,
+        abortOrCancelTimeoutMs: 500,
+        keyNetwork: net,
+        getRepo: (_peerId: PeerId) => absentRepo,
+      })
+
+      const blockId = 'nonexistent-block' as BlockId
+      const result = await networkTransactor.get({ blockIds: [blockId] })
+
+      // Authoritative absent: the entry is present, the block is not.
+      expect(result[blockId]).to.exist
+      expect(result[blockId]!.block).to.be.undefined
+
+      // Exactly one round — no second-chance retry to a different coordinator.
+      expect(net.findCoordinatorCalls).to.equal(1)
+      expect(getCalls).to.equal(1)
+    })
+
+    it('still retries a genuine no-response (empty response with no entry for the block)', async () => {
+      const peerA = 'peer-A'
+      const peerB = 'peer-B'
+      const net = new CountingKeyNetwork([peerA, peerB])
+
+      const blockId = 'block-x' as BlockId
+
+      let aGets = 0
+      let bGets = 0
+      // peerA answers with an empty response — no entry for the block at all: a
+      // genuine no-response that MUST earn a retry.
+      const repoA = makeGetOnlyRepo(async () => {
+        aGets++
+        return {}
+      })
+      // peerB (the retry coordinator) answers authoritatively.
+      const repoB = makeGetOnlyRepo(async ({ blockIds }: BlockGets) => {
+        bGets++
+        const res: GetBlockResults = {}
+        for (const bid of blockIds) res[bid] = { state: {} }
+        return res
+      })
+
+      const networkTransactor = new NetworkTransactor({
+        timeoutMs: 1000,
+        abortOrCancelTimeoutMs: 500,
+        keyNetwork: net,
+        getRepo: (peerId: PeerId) => (peerId.toString() === peerA ? repoA : repoB),
+      })
+
+      const result = await networkTransactor.get({ blockIds: [blockId] })
+
+      // The empty first answer forced a second coordinator round that resolved it.
+      expect(net.findCoordinatorCalls).to.equal(2)
+      expect(aGets).to.equal(1)
+      expect(bGets).to.equal(1)
+      expect(result[blockId]).to.exist
     })
   })
 

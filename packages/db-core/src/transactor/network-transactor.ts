@@ -109,25 +109,35 @@ export class NetworkTransactor implements ITransactor, IBlockChangeNotifier {
 			error = e as Error;
 		}
 
-		// Second-chance retry: if batch failed to respond OR responded with "not found"
-		// Different cluster members may have different views; retry with other coordinators
+		// Second-chance retry: ONLY for a genuine no-response — a batch with no valid
+		// response, or a response missing an entry for a requested block id. An
+		// authoritative "absent" answer (a valid response that carries an entry for
+		// every requested block id, even one whose entry has only `state` and no
+		// materialized `block`) is FINAL and must not retry. A block that genuinely
+		// does not exist yet surfaces as `{ state: {} }` (an entry that is present) —
+		// retrying it doubles the round-trips on the common createOrOpen "does this
+		// block exist?" probe. Cross-member reconciliation for a missing block has
+		// already happened one layer down: CoordinatorRepo.get detects `isMissing` and
+		// consults cluster peers before it responds, so by the time an authoritative
+		// absent reaches here there is nothing left for a transactor-level retry to
+		// discover. See ticket txn-perf-authoritative-notfound.
 		const hasValidResponse = (b: CoordinatorBatch<BlockId[], GetBlockResults>) => {
 			return b.request?.isResponse === true && b.request.response != null;
 		};
 
-		const hasBlockInResponse = (b: CoordinatorBatch<BlockId[], GetBlockResults>) => {
+		// A batch is answered when its response carries an entry for EVERY requested
+		// block id. An entry present with only `state` (no `block`) is an authoritative
+		// "absent", which counts as answered — not a gap.
+		const isAuthoritative = (b: CoordinatorBatch<BlockId[], GetBlockResults>) => {
 			if (!hasValidResponse(b)) return false;
 			const resp = b.request!.response! as GetBlockResults;
-			return b.payload.some(bid => {
-				const entry = resp[bid];
-				return entry && typeof entry === 'object' && 'block' in entry && entry.block != null;
-			});
+			return b.payload.every(bid => resp[bid] !== undefined);
 		};
 
-		// Retry batches that either failed to respond OR responded with "not found"
-		// This provides tolerance for different cluster member views
+		// Retry only genuine no-response / partial-response batches. An authoritative
+		// absent answer is not retried.
 		const retryable = Array.from(allBatches(batches)).filter(b =>
-			!hasValidResponse(b as any) || !hasBlockInResponse(b as any)
+			!isAuthoritative(b as any)
 		) as CoordinatorBatch<BlockId[], GetBlockResults>[];
 
 		if (retryable.length > 0 && Date.now() < expiration) {
