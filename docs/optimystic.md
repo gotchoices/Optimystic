@@ -280,12 +280,17 @@ A collection is hot when its log-tail cluster becomes the bottleneck:
 Partition the logical key-space across N collections, each keyed by a stable attribute of the data:
 
 ```typescript
-// 8 shards keyed by userId suffix
-const shard = (userId: string) => `messages-${parseInt(userId.slice(-4), 16) % 8}`;
+// 8 shards keyed by a stable hash of userId (works for any string id)
+const SHARDS = 8;
+const shard = (userId: string) => {
+  let h = 0;
+  for (const c of userId) h = (h * 31 + c.charCodeAt(0)) | 0;
+  return `messages-${((h % SHARDS) + SHARDS) % SHARDS}`;
+};
 const collection = await Tree.createOrOpen(transactor, shard(userId), ...);
 ```
 
-Each sub-collection has its own log-tail cluster, so write throughput scales with the number of shards. The partitioning key should distribute writes evenly — avoid time-based shards for near-real-time hot writes, because all writes land in one bucket until it rotates.
+Each sub-collection has its own log-tail cluster, so write throughput scales with the number of shards. The partitioning key should distribute writes evenly — hash the whole key rather than slicing a suffix (a suffix skews if ids share a common tail, and a hex parse of a non-hex id collapses every write into one shard). Avoid time-based shards for near-real-time hot writes, because all writes land in one bucket until it rotates.
 
 ### Tradeoff: cross-shard atomicity
 
