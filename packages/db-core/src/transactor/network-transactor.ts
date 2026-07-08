@@ -51,6 +51,26 @@ export class NetworkTransactor implements ITransactor, IBlockChangeNotifier {
 	private readonly getRepo: (peerId: PeerId) => IRepo;
 	private readonly localChangeNotifier: IBlockChangeNotifier | undefined;
 
+	/**
+	 * Per-transaction coordinator cache: `actionId → (blockId → resolved coordinator)`.
+	 * {@link pend} populates it from its final (retry-adjusted) batch assignment; commit
+	 * reads it via {@link resolveCoordinator} before falling back to a live
+	 * `findCoordinator`, so a block's coordinator is resolved once per transaction across
+	 * the pend→commit window instead of once at pend and again at commit.
+	 *
+	 * Keyed by `actionId`, which is unique per transaction, so an entry is only ever read
+	 * by commits of the SAME transaction — the ones that immediately follow its pend. Once
+	 * those finish, nothing reads the entry again (a later transaction has a fresh
+	 * actionId), so it carries no cross-transaction staleness even if it lingers. The TTL
+	 * and size cap in {@link txnCoordinatorsFor} are therefore only a memory backstop that
+	 * reclaims entries from transactions that pend but never commit — NOT a staleness
+	 * bound. This is why keying by actionId gives the same "thrown away when the
+	 * transaction ends" safety as threading a Map through the call, without touching the
+	 * ITransactor contract.
+	 */
+	private readonly txnCoordinatorCache = new Map<ActionId, { coordinators: Map<BlockId, PeerId>; expires: number }>();
+	private static readonly MAX_TXN_COORDINATOR_CACHE_ENTRIES = 1000;
+
 	constructor(
 		init: NetworkTransactorInit,
 	) {
@@ -501,6 +521,26 @@ export class NetworkTransactor implements ITransactor, IBlockChangeNotifier {
 
 		// Collect replies back into result structure
 		const completed = Array.from(allBatches(batches, b => b.request?.isResponse as boolean && b.request!.response!.success));
+
+		// Seed the per-transaction coordinator cache from the final (retry-adjusted) batch
+		// assignment so the follow-up commit reuses pend's resolution without a fresh
+		// findCoordinator round or a hop through the optional recordCoordinator hint. We read
+		// blockIdsForTransforms(b.payload) rather than the anchor b.blockId so EVERY block a
+		// consolidated batch coordinates is recorded — and against the peer that actually
+		// pended it, since a block re-homed by a retry lands in the retry batch's payload.
+		// NOTE: this cache assumes cluster membership is stable for the transaction's
+		// lifetime — the coordinator resolved here is reused verbatim at commit. Transactions
+		// are short, so that holds today. If a future change lets clusters churn *within* a
+		// single transaction (e.g. very long-running commits), a cached coordinator could
+		// point at a peer no longer in the cohort; commit self-heals (a failed cached peer is
+		// excluded and re-resolved live by processBatches), at the cost of one wasted round-trip.
+		const txnCoordinators = this.txnCoordinatorsFor(blockAction.actionId);
+		for (const b of completed) {
+			for (const bid of blockIdsForTransforms(b.payload)) {
+				txnCoordinators.set(bid, b.peerId);
+			}
+		}
+
 		log('pend:done actionId=%s ms=%d batches=%d', blockAction.actionId, Date.now() - t0, batches.length);
 		return {
 			success: true,
@@ -594,7 +634,9 @@ export class NetworkTransactor implements ITransactor, IBlockChangeNotifier {
 	/** Attempts to commit a set of blocks, and handles failures and errors */
 	private async commitBlocks({ blockIds, actionId, rev, tailId }: RepoCommitRequest) {
 		const expiration = Date.now() + this.timeoutMs;
-		const batches = await this.batchesForPayload<BlockId[], CommitResult>(blockIds, blockIds, mergeBlocks, []);
+		// Thread the transaction's actionId so both the initial batch assembly and any
+		// per-block retry re-resolution prefer the coordinator pend already resolved.
+		const batches = await this.batchesForPayload<BlockId[], CommitResult>(blockIds, blockIds, mergeBlocks, [], actionId);
 		log('commitBlocks actionId=%s rev=%d batches=%d', actionId, rev, batches.length);
 		let error: Error | undefined;
 		try {
@@ -604,7 +646,7 @@ export class NetworkTransactor implements ITransactor, IBlockChangeNotifier {
 				batch => batch.payload,
 				mergeBlocks,
 				expiration,
-				async (blockId, options) => this.keyNetwork.findCoordinator(await blockIdToBytes(blockId), options)
+				async (blockId, options) => this.resolveCoordinator(blockId, options, actionId)
 			);
 		} catch (e) {
 			error = e as Error;
@@ -633,15 +675,72 @@ export class NetworkTransactor implements ITransactor, IBlockChangeNotifier {
 		blockIds: BlockId[],
 		payload: TPayload,
 		getBlockPayload: (payload: TPayload, blockId: BlockId, mergeWithPayload: TPayload | undefined) => TPayload,
-		excludedPeers: PeerId[]
+		excludedPeers: PeerId[],
+		/** When set, prefer a coordinator this transaction already resolved at pend (see {@link resolveCoordinator}). */
+		actionId?: ActionId
 	): Promise<CoordinatorBatch<TPayload, TResponse>[]> {
 		return createBatchesForPayload<TPayload, TResponse>(
 			blockIds,
 			payload,
 			getBlockPayload,
 			excludedPeers,
-			async (blockId, options) => this.keyNetwork.findCoordinator(await blockIdToBytes(blockId), options)
+			async (blockId, options) => this.resolveCoordinator(blockId, options, actionId)
 		);
+	}
+
+	/**
+	 * Resolve the coordinator for `blockId`, preferring one this transaction already
+	 * resolved during pend (the per-transaction cache) before falling back to a live
+	 * `findCoordinator`. A cached coordinator that is in `excludedPeers` (already tried and
+	 * failed during a retry) is skipped so a retry can't loop on a dead coordinator. A
+	 * cache miss — including every call with no `actionId` (get/cancel) — never fails; it
+	 * always falls through to live resolution.
+	 */
+	private async resolveCoordinator(
+		blockId: BlockId,
+		options: { excludedPeers: PeerId[] },
+		actionId: ActionId | undefined
+	): Promise<PeerId> {
+		if (actionId !== undefined) {
+			const cached = this.txnCoordinatorCache.get(actionId)?.coordinators.get(blockId);
+			if (cached && !options.excludedPeers.some(p => p.toString() === cached.toString())) {
+				return cached;
+			}
+		}
+		return this.keyNetwork.findCoordinator(await blockIdToBytes(blockId), options);
+	}
+
+	/**
+	 * Get (creating if absent) the per-transaction coordinator map for `actionId`,
+	 * refreshing its expiry and lazily sweeping expired sibling entries. See
+	 * {@link txnCoordinatorCache} for why the TTL/size cap here is a memory backstop and
+	 * not a staleness bound.
+	 */
+	private txnCoordinatorsFor(actionId: ActionId): Map<BlockId, PeerId> {
+		const now = Date.now();
+		// Reclaim entries from transactions that pended but never committed. A live entry is
+		// never stale (unique actionId; read only by its own transaction's commit), so
+		// sweeping lazily on write is safe.
+		for (const [aid, entry] of this.txnCoordinatorCache) {
+			if (entry.expires <= now) this.txnCoordinatorCache.delete(aid);
+		}
+		// Comfortably covers a normal pend→commit gap (~2 op budgets) with a fixed floor;
+		// an entry outliving this only loses the optimization (commit re-resolves live),
+		// never correctness.
+		const ttlMs = Math.max(this.timeoutMs * 2, 60_000);
+		const existing = this.txnCoordinatorCache.get(actionId);
+		if (existing) {
+			existing.expires = now + ttlMs;
+			return existing.coordinators;
+		}
+		const created = { coordinators: new Map<BlockId, PeerId>(), expires: now + ttlMs };
+		this.txnCoordinatorCache.set(actionId, created);
+		while (this.txnCoordinatorCache.size > NetworkTransactor.MAX_TXN_COORDINATOR_CACHE_ENTRIES) {
+			const oldest = this.txnCoordinatorCache.keys().next().value as ActionId | undefined;
+			if (oldest == null || oldest === actionId) break;
+			this.txnCoordinatorCache.delete(oldest);
+		}
+		return created.coordinators;
 	}
 
 	/** Cancels a pending transaction by canceling all blocks associated with the transaction, including failed peers */

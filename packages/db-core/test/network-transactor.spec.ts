@@ -735,4 +735,129 @@ describe('NetworkTransactor', () => {
       expect(result.success).to.be.true;
     });
   })
+
+  // Per-transaction coordinator cache: a block's cluster/coordinator is resolved once per
+  // transaction across the pend→commit window. pend resolves the cluster (findCluster) and
+  // records the chosen coordinator per block; the follow-up commit reuses that resolution
+  // from the cache instead of calling findCoordinator again.
+  describe('per-transaction coordinator cache (pend → commit)', () => {
+    // Counts findCluster + findCoordinator so the "resolved once" claim is observable.
+    class CountingClusterKeyNetwork implements IKeyNetwork {
+      findClusterCalls = 0;
+      findCoordinatorCalls = 0;
+      private clusterMap = new Map<string, string[]>();
+      constructor(private readonly fallbackCoordinator: string) {}
+
+      async setCluster(blockId: BlockId, peerIds: string[]) {
+        const keyBytes = await blockIdToBytes(blockId);
+        this.clusterMap.set(uint8ArrayToString(keyBytes, 'base64url'), peerIds);
+      }
+
+      async findCoordinator(_key: Uint8Array, _options?: Partial<FindCoordinatorOptions>): Promise<PeerId> {
+        this.findCoordinatorCalls++;
+        return peerIdFromString(this.fallbackCoordinator);
+      }
+
+      async findCluster(key: Uint8Array): Promise<ClusterPeers> {
+        this.findClusterCalls++;
+        const peerIds = this.clusterMap.get(uint8ArrayToString(key, 'base64url')) ?? [this.fallbackCoordinator];
+        const peers: ClusterPeers = {};
+        for (const pid of peerIds) peers[pid] = { multiaddrs: [], publicKey: '' };
+        return peers;
+      }
+    }
+
+    const makeTransactor = (net: IKeyNetwork, transactors: Map<string, TestTransactor>) =>
+      new NetworkTransactor({
+        timeoutMs: 1000,
+        abortOrCancelTimeoutMs: 500,
+        keyNetwork: net,
+        getRepo: (peerId: PeerId) => {
+          const t = transactors.get(peerId.toString());
+          if (!t) throw new Error(`No transactor for ${peerId.toString()}`);
+          return t;
+        },
+      });
+
+    it('commit reuses pend\'s coordinator: each block resolved exactly once, no commit-time findCoordinator', async () => {
+      const peerShared = 'peer-shared';
+      const net = new CountingClusterKeyNetwork(peerShared);
+
+      const blockId1 = 'block-1' as BlockId;
+      const blockId2 = 'block-2' as BlockId;
+      // Both blocks share peerShared in their cluster → one consolidated coordinator at pend.
+      await net.setCluster(blockId1, [peerShared]);
+      await net.setCluster(blockId2, [peerShared]);
+
+      const transactors = new Map<string, TestTransactor>([[peerShared, new TestTransactor()]]);
+      const networkTransactor = makeTransactor(net, transactors);
+
+      const actionId = generateRandomActionId();
+      const pendRequest: PendRequest = {
+        actionId,
+        transforms: {
+          inserts: {
+            [blockId1]: { header: { id: blockId1, type: 'block', collectionId: 'test' } },
+            [blockId2]: { header: { id: blockId2, type: 'block', collectionId: 'test' } },
+          },
+          updates: {},
+          deletes: [],
+        },
+        policy: 'c',
+      };
+
+      const pendResult = await networkTransactor.pend(pendRequest);
+      expect(pendResult.success).to.be.true;
+      // pend resolved each block's cluster exactly once; the cluster covered the coordinator
+      // so no findCoordinator fallback was needed.
+      expect(net.findClusterCalls).to.equal(2);
+      expect(net.findCoordinatorCalls).to.equal(0);
+
+      const commitResult = await networkTransactor.commit({
+        actionId,
+        rev: 1,
+        blockIds: [blockId1, blockId2],
+        tailId: blockId1,
+      });
+      expect(commitResult.success).to.be.true;
+
+      // The commit reused pend's per-transaction resolution: no extra findCluster and,
+      // crucially, zero findCoordinator rounds. Each block resolved exactly once, at pend.
+      expect(net.findClusterCalls).to.equal(2);
+      expect(net.findCoordinatorCalls).to.equal(0);
+    });
+
+    it('is per-transaction: a commit under a different actionId misses the cache and resolves live', async () => {
+      const peerShared = 'peer-shared';
+      const net = new CountingClusterKeyNetwork(peerShared);
+
+      const blockId = 'block-x' as BlockId;
+      await net.setCluster(blockId, [peerShared]);
+
+      const transactors = new Map<string, TestTransactor>([[peerShared, new TestTransactor()]]);
+      const networkTransactor = makeTransactor(net, transactors);
+
+      // pend under actionA seeds the cache for the block.
+      const actionA = generateRandomActionId();
+      await networkTransactor.pend({
+        actionId: actionA,
+        transforms: {
+          inserts: { [blockId]: { header: { id: blockId, type: 'block', collectionId: 'test' } } },
+          updates: {},
+          deletes: [],
+        },
+        policy: 'c',
+      });
+
+      // Committing the SAME block under a DIFFERENT actionId must NOT reuse actionA's entry —
+      // it falls back to a live findCoordinator. (The commit itself fails, since the block was
+      // never pended under actionB, but the fallback resolution still happens first.)
+      net.findCoordinatorCalls = 0;
+      const actionB = generateRandomActionId();
+      try {
+        await networkTransactor.commit({ actionId: actionB, rev: 1, blockIds: [blockId], tailId: blockId });
+      } catch { /* expected: block not pending under actionB */ }
+      expect(net.findCoordinatorCalls).to.be.greaterThan(0);
+    });
+  })
 })
