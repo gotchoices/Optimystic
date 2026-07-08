@@ -72,6 +72,10 @@ function pickLocalTcpMultiaddr(node: Libp2p): string {
 }
 
 async function waitForPeers(node: Libp2p, minPeers: number, timeoutMs: number): Promise<void> {
+	// NOTE: event-race — a connection completing between this check and addEventListener below is
+	// missed by that event, but `check` re-reads getPeers() on every subsequent peer:connect, so a
+	// mesh dial (many events) recovers. Only bites if the count-reaching connection is the LAST one
+	// and fires in the gap. Has not flaked; if it ever does, poll getPeers().length via waitFor instead.
 	if (node.getPeers().length >= minPeers) return;
 	await new Promise<void>((resolve, reject) => {
 		const timer = setTimeout(() => {
