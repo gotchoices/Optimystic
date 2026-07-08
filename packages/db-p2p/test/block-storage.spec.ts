@@ -612,6 +612,46 @@ describe('BlockStorage checkpoint materialization sweep', () => {
 		// crash), harmless leak. Reconstructibility and consistency are unaffected. See the review handoff.
 		expect((await scanStores(blockId, 6)).materialized).to.deep.equal([1, 2, 3, 4, 6]);
 	});
+
+	it('restore-then-replay read does NOT re-cache a swept rev (retention uses fresh metadata, not the pre-restore snapshot)', async () => {
+		// Regression: getBlock captures `meta` BEFORE ensureRevision. When a read restores its range in
+		// the same call, that snapshot's `ranges` is stale. If materializeBlock's re-cache gate trusted
+		// the stale snapshot, rangeFloorOf would fall back to treating the target as its own floor and
+		// wrongly RETAIN it — re-caching a materialization the sweep means to prune, regrowing storage via
+		// reads of restored ranges (the exact floor+transforms shape a swept peer serves). The gate must
+		// read metadata fresh so the just-restored range is visible.
+		const blockId = 'ck-staleread' as BlockId;
+		const prependOp: [string, number, number, unknown[]][] = [['items', 0, 0, ['more']]];
+		const lowFloor = makeBlock('ck-staleread', { items: ['a'] });
+		// Lower archive [2,5): rev 2 carries a materialization (floor); revs 3 & 4 carry ONLY forward
+		// transforms (no block ⇒ saveRestored stores no materialization), so reading rev 3 replays.
+		const restoreCallback: RestoreCallback = async (id) => ({
+			blockId: id,
+			revisions: {
+				2: { action: { actionId: 'low2' as ActionId, rev: 2, transform: { insert: lowFloor } }, block: lowFloor },
+				3: { action: { actionId: 'low3' as ActionId, rev: 3, transform: { updates: prependOp } } },
+				4: { action: { actionId: 'low4' as ActionId, rev: 4, transform: { updates: prependOp } } }
+			},
+			range: [2, 5]
+		});
+		const repo = new StorageRepo((id) => new BlockStorage(id, raw, restoreCallback, CK));
+
+		// Local upper range from E=10 (disjoint from the lower archive), so a read at rev 3 must restore.
+		await repo.pend({ actionId: 'u10' as ActionId, transforms: makeInsertTransforms(blockId, makeBlock('ck-staleread', { items: [] })), policy: 'c' });
+		expect((await repo.commit({ actionId: 'u10' as ActionId, blockIds: [blockId], tailId: blockId, rev: 10 })).success).to.equal(true);
+		for (let r = 11; r <= 10 + CK; r++) await updateRev(repo, blockId, r); // through 14
+
+		const storage = new BlockStorage(blockId, raw, restoreCallback, CK);
+		// rev 3: below E=10 ⇒ restores [2,5], then replays from the floor (rev 2). Not floor/checkpoint/tip.
+		const got = await storage.getBlock(3);
+		expect(got, 'restored & replayed rev served').to.not.equal(undefined);
+		expect((got!.block as unknown as { items: unknown[] }).items.length, 'rev 3 content = floor + 1 prepend').to.equal(2);
+
+		const low3 = await raw.getRevision(blockId, 3);
+		expect(await raw.getMaterializedBlock(blockId, low3!), 'swept restored rev NOT re-cached').to.equal(undefined);
+		const low2 = await raw.getRevision(blockId, 2);
+		expect(await raw.getMaterializedBlock(blockId, low2!), 'restored floor retained').to.not.equal(undefined);
+	});
 });
 
 /** Re-create a block AFTER a tombstone via the commit funnel: an insert at `rev`. Distinct from

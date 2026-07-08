@@ -361,9 +361,15 @@ export class BlockStorage implements IBlockStorage {
 			// NOTE: cold non-checkpoint historical reads re-replay every time (up to `checkpointInterval`
 			// forward transforms). Acceptable — historical reads are rare and replay is depth-bounded. If
 			// they ever show as hot, cache at the nearest checkpoint below the target instead of skipping.
+			// Read metadata FRESH for the retention decision: the `meta` passed in was captured by getBlock
+			// BEFORE ensureRevision, which may have restored the containing range during this same read
+			// (ensureRevision mutates its own re-read, not this snapshot). A stale `meta.ranges` would send
+			// rangeFloorOf into its fallback (treats the target as its own floor ⇒ wrongly "retained"),
+			// re-caching a rev the sweep means to prune — regrowing storage via reads of restored ranges.
+			const retentionMeta = (await this.storage.getMetadata(this.blockId)) ?? meta;
 			const cacheRev = actions[0]!.rev;
-			const latestRev = meta.latest?.rev ?? cacheRev;
-			const rangeFloor = this.rangeFloorOf(cacheRev, meta.ranges);
+			const latestRev = retentionMeta.latest?.rev ?? cacheRev;
+			const rangeFloor = this.rangeFloorOf(cacheRev, retentionMeta.ranges);
 			if (this.isRetainedRev(cacheRev, latestRev, rangeFloor)) {
 				await this.storage.saveMaterializedBlock(this.blockId, actions[0]!.actionId, block);
 			}

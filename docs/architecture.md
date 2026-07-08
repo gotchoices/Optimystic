@@ -84,7 +84,7 @@ Block storage (see [repository.md](repository.md)) is versioned and reconstructi
 * Each block retains a revision chain: `(actionId, rev, transform, [materialized], conditions)`.
 * On read, the storage materializes the requested revision by applying transforms from the nearest materialized ancestor.
 * Pending transforms coexist with committed revisions and can be explicitly read, committed, or cancelled.
-* Old revisions and materializations are swept opportunistically; anything still referenced can be restored from archival storage.
+* Forward transforms are retained for every revision, but full *materialized* copies are pruned to periodic checkpoints (plus each range floor and the tip) incrementally as commits land, so any held revision is reconstructed by replaying transforms from the nearest checkpoint (see [repository.md](repository.md)). Revisions outside the locally-held ranges can be restored from archival storage.
 
 ![Block Storage Repository](figures/storage-repo.svg)
 
