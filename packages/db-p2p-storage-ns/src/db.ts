@@ -104,6 +104,15 @@ export const DEFAULT_DB_VERSION = 1;
  * - `kv` → generic string keyspace shared by `IKVStore` (`s_val`) and the
  *   identity helper (`b_val`). NOT kernel-backed; unchanged. The two columns
  *   avoid a base64 round-trip for the libp2p private key.
+ *
+ * NOTE: value columns changed TEXT→BLOB with the kernel refactor, but every
+ * statement is `CREATE TABLE IF NOT EXISTS` — so a database file created by a
+ * pre-refactor build keeps its old TEXT-column schema, and its rows hold JSON
+ * *strings* the kernel now reads back and `TextDecoder.decode`s (garbling /
+ * throwing). There is no migration. Safe today because this backend is
+ * NativeScript-only with no shipped production data; if a build ever ships to
+ * devices that later upgrade, add a `user_version` bump that drops+recreates
+ * these five tables (or a real migration) before assuming BLOB rows.
  */
 export const SCHEMA_SQL = `
 CREATE TABLE IF NOT EXISTS metadata (
