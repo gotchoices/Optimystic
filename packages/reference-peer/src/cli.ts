@@ -3,7 +3,7 @@ import { Command } from 'commander';
 import debug from 'debug';
 import { getNetworkManager, createLibp2pNode, MemoryRawStorage, Libp2pKeyPeerNetwork, RepoClient, ArachnodeFretAdapter, type IRawStorage } from '@optimystic/db-p2p';
 import { FileRawStorage } from '@optimystic/db-p2p-storage-fs';
-import { Diary, NetworkTransactor, BTree, ITransactor, BlockGets, GetBlockResults, ActionBlocks, BlockActionStatus, PendRequest, PendResult, CommitRequest, CommitResult } from '@optimystic/db-core';
+import { Diary, NetworkTransactor, BTree, type ITransactor, type BlockGets, type GetBlockResults, type ActionBlocks, type BlockActionStatus, type PendRequest, type PendResult, type CommitRequest, type CommitResult } from '@optimystic/db-core';
 import * as readline from 'readline';
 import * as path from 'path';
 import * as fs from 'fs';
