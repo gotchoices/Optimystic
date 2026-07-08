@@ -8,7 +8,9 @@ export type {
 	CollectionActions,
 	ValidationResult,
 	ITransactionValidator,
-	ActionsStatement
+	ActionsStatement,
+	TransactionSigner,
+	ClientSignatureVerifier
 } from './transaction.js';
 
 export {
@@ -16,7 +18,9 @@ export {
 	createTransactionId,
 	createActionsStatements,
 	DEFAULT_TRANSACTION_TTL_MS,
-	isTransactionExpired
+	isTransactionExpired,
+	clientSignaturePayload,
+	CLIENT_SIG_VERSION
 } from './transaction.js';
 
 export {

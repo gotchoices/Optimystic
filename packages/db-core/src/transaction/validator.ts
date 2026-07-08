@@ -1,7 +1,7 @@
 import type { BlockId, CollectionId, Transforms } from '../index.js';
-import type { Transaction, ITransactionEngine, ITransactionValidator, ValidationResult, CollectionActions } from './transaction.js';
+import type { Transaction, ITransactionEngine, ITransactionValidator, ValidationResult, CollectionActions, ClientSignatureVerifier } from './transaction.js';
 import type { BlockActionState } from '../network/struct.js';
-import { isTransactionExpired } from './transaction.js';
+import { isTransactionExpired, clientSignaturePayload } from './transaction.js';
 import { collectOperations, hashOperations } from './operations-hash.js';
 
 /**
@@ -43,18 +43,33 @@ export class TransactionValidator implements ITransactionValidator {
 	constructor(
 		private readonly engines: Map<string, EngineRegistration>,
 		private readonly createValidationCoordinator: ValidationCoordinatorFactory,
-		private readonly blockStateProvider?: BlockStateProvider
+		private readonly blockStateProvider?: BlockStateProvider,
+		private readonly verifyClientSignature?: ClientSignatureVerifier
 	) {}
 
 	async validate(transaction: Transaction, operationsHash: string): Promise<ValidationResult> {
 		const { stamp } = transaction;
 
-		// 0. Check expiration before any other work
+		// 0. Check expiration before any other work. Ordered BEFORE the signature check so
+		// an attacker cannot learn signature-validity for an already-expired transaction.
 		if (isTransactionExpired(stamp)) {
 			return {
 				valid: false,
 				reason: `Transaction expired at ${stamp.expiration}`
 			};
+		}
+
+		// 0.5. Verify the client signature, if a verifier port is wired. When the port is
+		// absent (migration / single-node-dev posture) unsigned AND signed transactions
+		// both pass — the p2p enforcement flag decides whether to inject the port at all.
+		if (this.verifyClientSignature) {
+			if (transaction.signature === undefined) {
+				return { valid: false, reason: 'Missing client signature' };
+			}
+			const payload = clientSignaturePayload(stamp.id, transaction.statements, transaction.reads);
+			if (!this.verifyClientSignature(stamp.peerId, payload, transaction.signature)) {
+				return { valid: false, reason: 'Invalid client signature' };
+			}
 		}
 
 		// 1. Verify engine exists

@@ -1,3 +1,5 @@
+import { randomBytes } from "@noble/hashes/utils.js";
+import { toString as uint8ArrayToString } from "uint8arrays/to-string";
 import type { BlockId } from "../blocks/index.js";
 import type { CollectionId } from "../collection/index.js";
 import { hashString } from "../utility/hash-string.js";
@@ -23,6 +25,17 @@ export type TransactionStamp = {
 
 	/** Absolute ms epoch after which transaction is invalid */
 	expiration: number;
+
+	/**
+	 * Random per-transaction nonce, folded into {@link TransactionStamp.id}.
+	 *
+	 * Anti-replay for read-free transactions: a transaction with no reads has nothing
+	 * binding it to a point in history beyond {@link expiration}, so without this a
+	 * captured signed read-free transaction could be re-submitted within the TTL window.
+	 * The nonce makes two otherwise-identical transactions from the same peer at the
+	 * same millisecond produce different ids (hence different signed bytes).
+	 */
+	nonce: string;
 
 	/** Hash of the stamp fields (computed) - stable identifier throughout transaction */
 	id: string;
@@ -52,6 +65,19 @@ export type Transaction = {
 	 * Final transaction identity, used in logs
 	 */
 	id: string;
+
+	/**
+	 * Optional client signature (base64url) over {@link clientSignaturePayload}
+	 * `(stamp.id, statements, reads)`, produced at commit by an injected
+	 * {@link TransactionSigner}.
+	 *
+	 * A node that wires a {@link ClientSignatureVerifier} into its
+	 * {@link TransactionValidator} verifies this at pend; where no verifier is wired,
+	 * unsigned transactions are still accepted (migration / single-node-dev posture).
+	 * Plain field on the transaction, so it rides along through serialization/persistence
+	 * for later recovery-time re-verification.
+	 */
+	signature?: string;
 };
 
 /**
@@ -90,14 +116,24 @@ export async function createTransactionStamp(
 	ttlMs: number = DEFAULT_TRANSACTION_TTL_MS
 ): Promise<TransactionStamp> {
 	const expiration = timestamp + ttlMs;
-	const stampData = JSON.stringify({ peerId, timestamp, schemaHash, engineId, expiration });
+	// Cross-platform CSPRNG (Node + browser) via @noble/hashes — matches the rest of
+	// db-core (see collection.ts, transactor-source.ts). The nonce is folded into the
+	// id hash so two otherwise-identical stamps diverge.
+	const nonce = uint8ArrayToString(randomBytes(16), 'base64url');
+	const stampData = JSON.stringify({ peerId, timestamp, schemaHash, engineId, expiration, nonce });
 	const id = `stamp:${await hashString(stampData)}`;
-	return { peerId, timestamp, schemaHash, engineId, expiration, id };
+	return { peerId, timestamp, schemaHash, engineId, expiration, nonce, id };
 }
 
 /**
  * Create a transaction id from stamp id, statements, and reads.
  * This is the final transaction identity used in logs.
+ *
+ * NOTE: reads are serialized in their given order here (non-canonical). This differs
+ * from {@link clientSignaturePayload}, which canonicalises reads before hashing. That is
+ * intentional for this ticket — the signature payload is self-contained — but the
+ * non-canonical ordering here is a separate hygiene concern (see
+ * design-consensus-hygiene-notes), NOT fixed here to avoid changing existing tx ids.
  */
 export async function createTransactionId(
 	stampId: string,
@@ -107,6 +143,51 @@ export async function createTransactionId(
 	const txData = JSON.stringify({ stampId, statements, reads });
 	return `tx:${await hashString(txData)}`;
 }
+
+/**
+ * Version prefix for the client-signature payload, so the signed form can evolve
+ * without ambiguity. Distinct from (but consistent in spirit with) the operations-hash
+ * canonical form — this covers transaction INPUTS, not operations.
+ */
+export const CLIENT_SIG_VERSION = 'txsig:v1';
+
+/**
+ * Canonical bytes a client signs and a node verifies. Deterministic: reads are sorted
+ * (blockId, then revision); statements keep their sequential order.
+ *
+ * Binds three things at once: the CLIENT IDENTITY (via `stampId`, which hashes peerId +
+ * nonce), the EXACT statements, and the OCC read set (blockId + revision — "tail
+ * binding" for anti-replay). Both signer and verifier derive the bytes from
+ * `transaction.stamp.id` + `transaction.statements` + `transaction.reads` through this
+ * one function, so they reproduce identical bytes regardless of read ordering.
+ */
+export function clientSignaturePayload(
+	stampId: string,
+	statements: readonly string[],
+	reads: readonly ReadDependency[]
+): Uint8Array {
+	const canonicalReads = [...reads].sort(
+		(a, b) => a.blockId < b.blockId ? -1 : a.blockId > b.blockId ? 1
+			: a.revision - b.revision
+	);
+	const body = JSON.stringify({ stampId, statements, reads: canonicalReads });
+	return new TextEncoder().encode(`${CLIENT_SIG_VERSION}:${body}`);
+}
+
+/**
+ * Signs the canonical client-signature payload, returning base64url. Async to allow
+ * libp2p `PrivateKey.sign`; tests pass a synchronous fake.
+ */
+export type TransactionSigner = (payload: Uint8Array) => Promise<string> | string;
+
+/**
+ * Returns true iff `signature` (base64url) is a valid client signature over `payload`
+ * for signer identity `peerId`. Total: returns false, never throws, on any malformed
+ * input. The p2p wiring backs this with verifyPeerSig + peerIdBindsPublicKey; tests
+ * pass a fake.
+ */
+export type ClientSignatureVerifier =
+	(peerId: string, payload: Uint8Array, signature: string) => boolean;
 
 
 

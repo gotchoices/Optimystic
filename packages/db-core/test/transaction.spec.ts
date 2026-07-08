@@ -5,6 +5,8 @@ import {
 	createActionsStatements,
 	createTransactionStamp,
 	createTransactionId,
+	clientSignaturePayload,
+	CLIENT_SIG_VERSION,
 	DEFAULT_TRANSACTION_TTL_MS,
 	isTransactionExpired,
 	hashString,
@@ -21,6 +23,9 @@ import {
 	type EngineRegistration,
 	type ValidationCoordinatorFactory,
 	type BlockStateProvider,
+	type ReadDependency,
+	type TransactionSigner,
+	type ClientSignatureVerifier,
 	type Transforms,
 	type ActionId,
 	type BlockId,
@@ -3338,17 +3343,21 @@ describe('Transaction', () => {
 	});
 
 	describe('Clock Skew and Ordering (TEST-10.8.1)', () => {
-		it('should produce identical stamp IDs for same-millisecond transactions from same peer (collision risk)', async () => {
+		it('should produce distinct stamp IDs for same-millisecond transactions from same peer (nonce anti-replay)', async () => {
 			const now = Date.now();
 			const stamp1 = await createTransactionStamp('peer1', now, 'schema1', 'actions@1.0.0');
 			const stamp2 = await createTransactionStamp('peer1', now, 'schema1', 'actions@1.0.0');
 
-			// Same inputs → same stamp ID. This is by design (deterministic hashing),
-			// but it means two independent transactions from the same peer at the same
-			// millisecond with the same schema and engine are INDISTINGUISHABLE.
-			expect(stamp1.id).to.equal(stamp2.id);
+			// Formerly these collided (deterministic hash of identical inputs). A random
+			// per-stamp nonce is now folded into the id, so two independent transactions
+			// from the same peer at the same millisecond are DISTINGUISHABLE — this closes
+			// the read-free-replay hole (a captured signed read-free tx can't be re-submitted
+			// as a byte-identical duplicate within the TTL window).
+			expect(stamp1.nonce).to.not.equal(stamp2.nonce);
+			expect(stamp1.id).to.not.equal(stamp2.id);
 
-			// With identical stamps and identical statements, transaction IDs also collide
+			// Distinct stamps + identical statements → distinct transaction IDs, so the log
+			// can tell two same-input transactions apart (no silent dedup drop).
 			const actions: CollectionActions[] = [
 				{ collectionId: 'users', actions: [{ type: 'replace', data: [[1, { key: 1, name: 'Alice' }]] }] }
 			];
@@ -3356,10 +3365,7 @@ describe('Transaction', () => {
 			const txId1 = await createTransactionId(stamp1.id, stmts, []);
 			const txId2 = await createTransactionId(stamp2.id, stmts, []);
 
-			// BUG: Two independent transactions produce the same ID.
-			// If peer1 sends the same operation twice (retry, or concurrent sessions),
-			// the log cannot distinguish them — deduplication silently drops one.
-			expect(txId1, 'BUG: independent transactions collide when inputs match').to.equal(txId2);
+			expect(txId1, 'independent same-input transactions now get distinct ids').to.not.equal(txId2);
 		});
 
 		it('should produce completely different stamp IDs for 1ms clock difference', async () => {
@@ -3972,6 +3978,249 @@ describe('Transaction', () => {
 			// Both collections now read back their values.
 			expect(await usersTree.get(1)).to.deep.equal({ key: 1, name: 'Alice' });
 			expect(await postsTree.get(100)).to.deep.equal({ key: 100, userId: 1, title: 'First' });
+		});
+	});
+
+	describe('Client Transaction Signatures', () => {
+		// A deterministic stand-in for real Ed25519. The "signature" is a MAC that binds
+		// the signer identity to the EXACT payload bytes: tamper either the identity or the
+		// payload and it stops matching. The p2p ticket replaces this with libp2p keys.
+		const fakeSign = (peerId: string): TransactionSigner =>
+			(payload) => `fakesig:${peerId}:${new TextDecoder().decode(payload)}`;
+		const fakeVerify: ClientSignatureVerifier = (peerId, payload, signature) =>
+			signature === `fakesig:${peerId}:${new TextDecoder().decode(payload)}`;
+
+		// Minimal validator wiring: engine re-execution over an empty-transforms coordinator,
+		// so a fully valid transaction hashes to ops([]) and passes every step.
+		const emptyOpsHash = async () => `ops:${await hashString(JSON.stringify([]))}`;
+		function makeValidator(verifier?: ClientSignatureVerifier): TransactionValidator {
+			const engines = new Map<string, EngineRegistration>();
+			engines.set('actions@1.0.0', {
+				engine: new ActionsEngine(),
+				getSchemaHash: async () => 'schema-hash-123'
+			});
+			const createValidationCoordinator: ValidationCoordinatorFactory = () => ({
+				applyActions: async () => {},
+				getTransforms: () => new Map(),
+				dispose: () => {}
+			});
+			return new TransactionValidator(engines, createValidationCoordinator, undefined, verifier);
+		}
+
+		async function buildSignedTx(
+			peerId: string,
+			opts: { statements?: string[]; reads?: ReadDependency[]; signWith?: string } = {}
+		): Promise<Transaction> {
+			const statements = opts.statements ?? [];
+			const reads = opts.reads ?? [];
+			const stamp = await createTransactionStamp(peerId, Date.now(), 'schema-hash-123', 'actions@1.0.0');
+			const transaction: Transaction = {
+				stamp,
+				statements,
+				reads,
+				id: await createTransactionId(stamp.id, statements, reads)
+			};
+			// Default: sign as the stamp's own peer. `signWith` overrides to forge a mismatch.
+			const payload = clientSignaturePayload(stamp.id, statements, reads);
+			transaction.signature = await fakeSign(opts.signWith ?? peerId)(payload);
+			return transaction;
+		}
+
+		it('accepts a correctly signed transaction when a verifier is wired', async () => {
+			const tx = await buildSignedTx('client-peer');
+			const validator = makeValidator(fakeVerify);
+			const result = await validator.validate(tx, await emptyOpsHash());
+			expect(result.valid).to.be.true;
+		});
+
+		it('rejects a transaction with no signature when a verifier is wired', async () => {
+			const tx = await buildSignedTx('client-peer');
+			delete tx.signature;
+			const validator = makeValidator(fakeVerify);
+			const result = await validator.validate(tx, await emptyOpsHash());
+			expect(result.valid).to.be.false;
+			expect(result.reason).to.equal('Missing client signature');
+		});
+
+		it('rejects when a statement is tampered after signing', async () => {
+			const tx = await buildSignedTx('client-peer', {
+				statements: createActionsStatements([
+					{ collectionId: 'users', actions: [{ type: 'replace', data: [[1, { key: 1, name: 'Alice' }]] }] }
+				])
+			});
+			// Mutate a statement AFTER signing — the validator recomputes the payload from the
+			// tampered statements, so the original signature no longer matches.
+			tx.statements[0] = tx.statements[0]!.replace('Alice', 'Mallory');
+			const validator = makeValidator(fakeVerify);
+			const result = await validator.validate(tx, await emptyOpsHash());
+			expect(result.valid).to.be.false;
+			expect(result.reason).to.equal('Invalid client signature');
+		});
+
+		it('rejects when a read revision is tampered after signing', async () => {
+			const tx = await buildSignedTx('client-peer', {
+				reads: [{ blockId: 'block-1', revision: 7 }]
+			});
+			tx.reads[0]!.revision = 8;
+			const validator = makeValidator(fakeVerify);
+			const result = await validator.validate(tx, await emptyOpsHash());
+			expect(result.valid).to.be.false;
+			expect(result.reason).to.equal('Invalid client signature');
+		});
+
+		it('rejects when the peerId is tampered after signing', async () => {
+			// The stamp.id (and thus the payload) is unchanged, but the verifier is handed the
+			// forged stamp.peerId, which no longer matches the identity the signature was made for.
+			const tx = await buildSignedTx('client-peer', {
+				statements: createActionsStatements([
+					{ collectionId: 'users', actions: [{ type: 'replace', data: [[1, { key: 1, name: 'Alice' }]] }] }
+				])
+			});
+			(tx.stamp as { peerId: string }).peerId = 'attacker-peer';
+			const validator = makeValidator(fakeVerify);
+			const result = await validator.validate(tx, await emptyOpsHash());
+			expect(result.valid).to.be.false;
+			expect(result.reason).to.equal('Invalid client signature');
+		});
+
+		it('produces identical signature bytes regardless of reads ordering', () => {
+			const readsA: ReadDependency[] = [
+				{ blockId: 'block-2', revision: 1 },
+				{ blockId: 'block-1', revision: 5 },
+				{ blockId: 'block-1', revision: 2 }
+			];
+			const readsB: ReadDependency[] = [
+				{ blockId: 'block-1', revision: 2 },
+				{ blockId: 'block-2', revision: 1 },
+				{ blockId: 'block-1', revision: 5 }
+			];
+			const payloadA = clientSignaturePayload('stamp:x', ['stmt'], readsA);
+			const payloadB = clientSignaturePayload('stamp:x', ['stmt'], readsB);
+			expect(new TextDecoder().decode(payloadA)).to.equal(new TextDecoder().decode(payloadB));
+			expect(new TextDecoder().decode(payloadA)).to.include(CLIENT_SIG_VERSION);
+
+			// A signature made over one ordering therefore verifies against the other.
+			const sig = fakeSign('client-peer')(payloadA) as string;
+			expect(fakeVerify('client-peer', payloadB, sig)).to.be.true;
+		});
+
+		it('folds a random nonce into the stamp id so read-free transactions differ', async () => {
+			const args = ['peer', 1_700_000_000_000, 'schema-hash-123', 'actions@1.0.0'] as const;
+			const stamp1 = await createTransactionStamp(...args);
+			const stamp2 = await createTransactionStamp(...args);
+			expect(stamp1.nonce).to.not.equal(stamp2.nonce);
+			expect(stamp1.id).to.not.equal(stamp2.id);
+			// Identical statements + no reads still yield different tx ids (anti-replay).
+			const id1 = await createTransactionId(stamp1.id, ['stmt'], []);
+			const id2 = await createTransactionId(stamp2.id, ['stmt'], []);
+			expect(id1).to.not.equal(id2);
+		});
+
+		it('a session with a signer stamps the committed transaction; two read-free sessions differ', async () => {
+			const transactor = new TestTransactor();
+			type UserEntry = { key: number; name: string };
+			const usersTree = await Tree.createOrOpen<number, UserEntry>(transactor, 'users', e => e.key);
+			const usersCollection = (usersTree as unknown as { collection: unknown }).collection;
+			const collections = new Map();
+			collections.set('users', usersCollection);
+			const coordinator = new TransactionCoordinator(transactor, collections);
+
+			// Capture the transaction handed to coordinator.commit (post-signing).
+			const committed: Transaction[] = [];
+			const realCommit = coordinator.commit.bind(coordinator);
+			coordinator.commit = async (tx: Transaction) => { committed.push(tx); return realCommit(tx); };
+
+			const runSession = async () => {
+				const session = await TransactionSession.create(
+					coordinator, new ActionsEngine(), 'client-peer', 'schema-hash-123', undefined, fakeSign('client-peer')
+				);
+				await session.execute(
+					'stmt',
+					[{ collectionId: 'users', actions: [{ type: 'replace', data: [[1, { key: 1, name: 'Alice' }]] }] }]
+				);
+				await session.commit();
+			};
+			await runSession();
+			await runSession();
+
+			expect(committed).to.have.lengthOf(2);
+			// Signer ran: each committed transaction carries a signature that verifies.
+			for (const tx of committed) {
+				expect(tx.signature, 'signer stamped a signature').to.be.a('string');
+				const payload = clientSignaturePayload(tx.stamp.id, tx.statements, tx.reads);
+				expect(fakeVerify(tx.stamp.peerId, payload, tx.signature!)).to.be.true;
+			}
+			// Nonce anti-replay: same peer, same statement, no reads → different ids.
+			expect(committed[0]!.stamp.id).to.not.equal(committed[1]!.stamp.id);
+			expect(committed[0]!.id).to.not.equal(committed[1]!.id);
+		});
+
+		it('leaves signature undefined when a session has no signer', async () => {
+			const transactor = new TestTransactor();
+			type UserEntry = { key: number; name: string };
+			const usersTree = await Tree.createOrOpen<number, UserEntry>(transactor, 'users', e => e.key);
+			const usersCollection = (usersTree as unknown as { collection: unknown }).collection;
+			const collections = new Map();
+			collections.set('users', usersCollection);
+			const coordinator = new TransactionCoordinator(transactor, collections);
+
+			const committed: Transaction[] = [];
+			const realCommit = coordinator.commit.bind(coordinator);
+			coordinator.commit = async (tx: Transaction) => { committed.push(tx); return realCommit(tx); };
+
+			const session = await TransactionSession.create(coordinator, new ActionsEngine(), 'client-peer', 'schema-hash-123');
+			await session.execute(
+				'stmt',
+				[{ collectionId: 'users', actions: [{ type: 'replace', data: [[1, { key: 1, name: 'Alice' }]] }] }]
+			);
+			await session.commit();
+
+			expect(committed).to.have.lengthOf(1);
+			expect(committed[0]!.signature).to.equal(undefined);
+		});
+
+		it('accepts an unsigned transaction when NO verifier is wired (migration posture)', async () => {
+			const stamp = await createTransactionStamp('client-peer', Date.now(), 'schema-hash-123', 'actions@1.0.0');
+			const transaction: Transaction = {
+				stamp,
+				statements: [],
+				reads: [],
+				id: await createTransactionId(stamp.id, [], [])
+			};
+			// No signature, no verifier port → the signature step is skipped entirely.
+			const validator = makeValidator(undefined);
+			const result = await validator.validate(transaction, await emptyOpsHash());
+			expect(result.valid).to.be.true;
+		});
+
+		it('rejects an EXPIRED transaction on expiration before it checks the signature', async () => {
+			// Bad signature AND expired: expiration must win, so signature-validity never leaks.
+			const stamp = await createTransactionStamp('client-peer', Date.now() - 10_000, 'schema-hash-123', 'actions@1.0.0', 1);
+			const transaction: Transaction = {
+				stamp,
+				statements: [],
+				reads: [],
+				id: await createTransactionId(stamp.id, [], []),
+				signature: 'totally-bogus'
+			};
+			const validator = makeValidator(fakeVerify);
+			const result = await validator.validate(transaction, await emptyOpsHash());
+			expect(result.valid).to.be.false;
+			expect(result.reason).to.include('expired');
+		});
+
+		it('retains signature through a JSON round-trip (recovery re-verify hook)', async () => {
+			const tx = await buildSignedTx('client-peer', {
+				statements: createActionsStatements([
+					{ collectionId: 'users', actions: [{ type: 'replace', data: [[1, { key: 1, name: 'Alice' }]] }] }
+				]),
+				reads: [{ blockId: 'block-1', revision: 3 }]
+			});
+			const roundTripped = JSON.parse(JSON.stringify(tx)) as Transaction;
+			expect(roundTripped.signature).to.equal(tx.signature);
+			// The round-tripped copy still verifies, so a later recovery path can re-check it.
+			const payload = clientSignaturePayload(roundTripped.stamp.id, roundTripped.statements, roundTripped.reads);
+			expect(fakeVerify(roundTripped.stamp.peerId, payload, roundTripped.signature!)).to.be.true;
 		});
 	});
 });

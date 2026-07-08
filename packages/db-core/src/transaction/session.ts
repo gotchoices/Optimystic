@@ -1,6 +1,6 @@
 import type { TransactionCoordinator } from "./coordinator.js";
-import type { Transaction, ExecutionResult, ITransactionEngine, TransactionStamp, CollectionActions } from "./transaction.js";
-import { createTransactionStamp, createTransactionId, isTransactionExpired } from "./transaction.js";
+import type { Transaction, ExecutionResult, ITransactionEngine, TransactionStamp, CollectionActions, TransactionSigner } from "./transaction.js";
+import { createTransactionStamp, createTransactionId, isTransactionExpired, clientSignaturePayload } from "./transaction.js";
 
 /**
  * TransactionSession manages incremental transaction building.
@@ -30,7 +30,8 @@ export class TransactionSession {
 	private constructor(
 		private readonly coordinator: TransactionCoordinator,
 		private readonly engine: ITransactionEngine,
-		stamp: TransactionStamp
+		stamp: TransactionStamp,
+		private readonly signer?: TransactionSigner
 	) {
 		this.stamp = stamp;
 	}
@@ -38,13 +39,18 @@ export class TransactionSession {
 	/**
 	 * Create a new TransactionSession.
 	 * Uses async factory because stamp creation requires SHA-256 hashing.
+	 *
+	 * @param signer - Optional client signer. When supplied, commit() stamps the built
+	 *   transaction's `signature` over its canonical payload; when omitted the
+	 *   transaction is left unsigned (accepted only by nodes with no verifier wired).
 	 */
 	static async create(
 		coordinator: TransactionCoordinator,
 		engine: ITransactionEngine,
 		peerId: string = 'local',
 		schemaHash: string = '',
-		ttlMs?: number
+		ttlMs?: number,
+		signer?: TransactionSigner
 	): Promise<TransactionSession> {
 		const stamp = await createTransactionStamp(
 			peerId,
@@ -53,7 +59,7 @@ export class TransactionSession {
 			engine.id,
 			ttlMs
 		);
-		return new TransactionSession(coordinator, engine, stamp);
+		return new TransactionSession(coordinator, engine, stamp, signer);
 	}
 
 	/**
@@ -135,6 +141,13 @@ export class TransactionSession {
 			reads,
 			id: await createTransactionId(this.stamp.id, this.statements, reads)
 		};
+
+		// Sign the canonical client-signature payload if a signer was supplied. The
+		// payload covers stamp.id + statements + reads, which are all final now.
+		if (this.signer) {
+			const payload = clientSignaturePayload(this.stamp.id, this.statements, reads);
+			transaction.signature = await this.signer(payload);
+		}
 
 		// Commit through coordinator (which will orchestrate PEND/COMMIT)
 		await this.coordinator.commit(transaction);
