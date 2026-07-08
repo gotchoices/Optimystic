@@ -21,7 +21,7 @@ import {
 	type BlockId,
 	type IBlock,
 } from '../src/index.js';
-import { TestTransactor } from '../src/testing/test-transactor.js';
+import { TestTransactor, FlakyCommitTransactor } from '../src/testing/test-transactor.js';
 
 describe('Transaction', () => {
 	describe('Transaction Structure', () => {
@@ -3271,6 +3271,103 @@ describe('Transaction', () => {
 			const result = await session.commit();
 			expect(result.success).to.be.false;
 			expect(result.error).to.include('expired');
+		});
+	});
+
+	describe('Failed commit restores staged tracker state (txn-failed-commit-leaves-staged-log-entry)', () => {
+		type UserEntry = { key: number; name: string };
+
+		it('session.commit failure leaves tracker + pending unchanged, and retry does not double-log', async () => {
+			const inner = new TestTransactor();
+			// Fail every commit attempt in the first commit() (commitPhase retries the
+			// single collection 3x), then let the retry's 4th transactor.commit succeed.
+			const flaky = new FlakyCommitTransactor(inner, 3);
+
+			const usersTree = await Tree.createOrOpen<number, UserEntry>(flaky, 'users', e => e.key);
+			const usersCollection = (usersTree as unknown as { collection: any }).collection;
+			const collections = new Map<string, any>([['users', usersCollection]]);
+
+			const coordinator = new TransactionCoordinator(flaky, collections);
+			const engine = new ActionsEngine(coordinator);
+			const session = await TransactionSession.create(coordinator, engine, 'peer1', 'schema1');
+
+			const actions: CollectionActions[] = [
+				{ collectionId: 'users', actions: [{ type: 'replace', data: [[1, { key: 1, name: 'Alice' }]] }] }
+			];
+			await session.execute(createActionsStatements(actions)[0]!, actions);
+
+			// Pre-commit staged state: transforms + pending are staged, but the log entry
+			// is NOT appended yet (that happens inside coordinator.commit).
+			const pre = usersCollection.snapshotPending();
+
+			// First commit fails in the COMMIT phase (after the log entry was appended).
+			let threw = false;
+			try {
+				await session.commit();
+			} catch {
+				threw = true;
+			}
+			expect(threw, 'first session.commit() should reject on forced commit failure').to.be.true;
+
+			// The failed commit must leave the tracker EXACTLY as it was pre-append:
+			// no leftover appended log entry, pending queue intact.
+			expect(usersCollection.tracker.transforms).to.deep.equal(pre.transforms,
+				'tracker transforms should be restored to their pre-commit state');
+			expect(usersCollection.getPendingActions()).to.deep.equal(pre.pending,
+				'pending queue should be restored to its pre-commit state');
+
+			// Retry the same session; the transactor now lets commit through.
+			const retry = await session.commit();
+			expect(retry.success, 'retry commit should succeed once the transactor recovers').to.be.true;
+
+			// Exactly ONE committed action for this transaction — the failed attempt did
+			// not leave a duplicate log entry that would re-commit on retry.
+			expect(inner.getCommittedActions().size, 'exactly one action committed, no duplicate').to.equal(1);
+			expect(await usersTree.get(1)).to.deep.equal({ key: 1, name: 'Alice' });
+		});
+
+		it('directly-staged tree: failed commit restores tracker and rollback is a clean no-op', async () => {
+			const inner = new TestTransactor();
+			const flaky = new FlakyCommitTransactor(inner, Infinity); // always fail commit
+
+			const usersTree = await Tree.createOrOpen<number, UserEntry>(flaky, 'users', e => e.key);
+			const usersCollection = (usersTree as unknown as { collection: any }).collection;
+			const collections = new Map<string, any>([['users', usersCollection]]);
+			const coordinator = new TransactionCoordinator(flaky, collections);
+
+			// Stage DIRECTLY into the tracker via Collection.act, bypassing
+			// coordinator.applyActions — this mirrors the vtab deferred-DML path, so NO
+			// stampData entry exists for the stamp we commit below.
+			await usersCollection.act({ type: 'replace', data: [[1, { key: 1, name: 'Alice' }]] });
+
+			const pre = usersCollection.snapshotPending();
+
+			const stamp = await createTransactionStamp('peer1', Date.now(), 'schema1', 'actions@1.0.0');
+			const transaction: Transaction = {
+				stamp,
+				statements: [],
+				reads: [],
+				id: await createTransactionId(stamp.id, [], [])
+			};
+
+			let threw = false;
+			try {
+				await coordinator.commit(transaction);
+			} catch {
+				threw = true;
+			}
+			expect(threw, 'commit should reject on forced commit failure').to.be.true;
+
+			// The restore already left the tracker at its pre-commit staged state — no
+			// poisoned appended log entry — even though rollback(stampId) will no-op.
+			expect(usersCollection.tracker.transforms).to.deep.equal(pre.transforms);
+			expect(usersCollection.getPendingActions()).to.deep.equal(pre.pending);
+
+			// rollback(stampId) no-ops (the stamp was never tracked via applyActions, so
+			// there is no stampData entry); the tracker stays clean regardless.
+			await coordinator.rollback(stamp.id);
+			expect(usersCollection.tracker.transforms).to.deep.equal(pre.transforms);
+			expect(usersCollection.getPendingActions()).to.deep.equal(pre.pending);
 		});
 	});
 });

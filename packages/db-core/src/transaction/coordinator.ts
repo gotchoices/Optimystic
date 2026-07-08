@@ -142,45 +142,68 @@ export class TransactionCoordinator {
 		const collectionTransforms = new Map<CollectionId, Transforms>();
 		const criticalBlocks = new Map<CollectionId, BlockId>();
 
+		// Snapshot EVERY participating collection's staged state (transforms + pending
+		// queue) BEFORE the append loop mutates any tracker. The loop appends log
+		// entries sequentially, so a failure on the Nth collection must also undo the
+		// 0..N-1 collections that already appended — and coordinateTransaction can fail
+		// after ALL of them appended. On any throw below we restore every snapshot, so a
+		// failed commit leaves each tracker exactly as it was: a retry re-appends cleanly
+		// (no duplicate log entry) and a directly-staged tree's rollback (which no-ops
+		// when the stamp was never tracked via applyActions) has nothing poisoned to undo.
+		const preCommitSnapshots = new Map<CollectionId, ReturnType<Collection<any>['snapshotPending']>>();
 		for (const { collectionId, collection } of collectionData) {
-			const applyResult = await this.applyActionsToCollection(
-				{ collectionId, actions: collection.getPendingActions() },
-				transaction,
-				allCollectionIds
-			);
-			if (!applyResult.success) {
-				throw new Error(`Transaction commit failed: ${applyResult.error}`);
-			}
-			collectionTransforms.set(collectionId, applyResult.transforms!);
-			criticalBlocks.set(collectionId, applyResult.logTailBlockId!);
+			preCommitSnapshots.set(collectionId, collection.snapshotPending());
 		}
 
-		// Compute hash of ALL operations across ALL collections (post-log-append).
-		// Validators re-execute the transaction and compare their computed hash.
-		const allOperations = Array.from(collectionTransforms.entries()).flatMap(([collectionId, transforms]) => [
-			...Object.entries(transforms.inserts ?? {}).map(([blockId, block]) =>
-				({ type: 'insert' as const, collectionId, blockId, block })
-			),
-			...Object.entries(transforms.updates ?? {}).map(([blockId, operations]) =>
-				({ type: 'update' as const, collectionId, blockId, operations })
-			),
-			...(transforms.deletes ?? []).map(blockId =>
-				({ type: 'delete' as const, collectionId, blockId })
-			)
-		]);
+		try {
+			for (const { collectionId, collection } of collectionData) {
+				const applyResult = await this.applyActionsToCollection(
+					{ collectionId, actions: collection.getPendingActions() },
+					transaction,
+					allCollectionIds
+				);
+				if (!applyResult.success) {
+					throw new Error(`Transaction commit failed: ${applyResult.error}`);
+				}
+				collectionTransforms.set(collectionId, applyResult.transforms!);
+				criticalBlocks.set(collectionId, applyResult.logTailBlockId!);
+			}
 
-		const operationsHash = await this.hashOperations(allOperations);
+			// Compute hash of ALL operations across ALL collections (post-log-append).
+			// Validators re-execute the transaction and compare their computed hash.
+			const allOperations = Array.from(collectionTransforms.entries()).flatMap(([collectionId, transforms]) => [
+				...Object.entries(transforms.inserts ?? {}).map(([blockId, block]) =>
+					({ type: 'insert' as const, collectionId, blockId, block })
+				),
+				...Object.entries(transforms.updates ?? {}).map(([blockId, operations]) =>
+					({ type: 'update' as const, collectionId, blockId, operations })
+				),
+				...(transforms.deletes ?? []).map(blockId =>
+					({ type: 'delete' as const, collectionId, blockId })
+				)
+			]);
 
-		// Execute consensus phases (GATHER, PEND, COMMIT)
-		const coordResult = await this.coordinateTransaction(
-			transaction,
-			operationsHash,
-			collectionTransforms,
-			criticalBlocks
-		);
+			const operationsHash = await this.hashOperations(allOperations);
 
-		if (!coordResult.success) {
-			throw new Error(`Transaction commit failed: ${coordResult.error}`);
+			// Execute consensus phases (GATHER, PEND, COMMIT)
+			const coordResult = await this.coordinateTransaction(
+				transaction,
+				operationsHash,
+				collectionTransforms,
+				criticalBlocks
+			);
+
+			if (!coordResult.success) {
+				throw new Error(`Transaction commit failed: ${coordResult.error}`);
+			}
+		} catch (err) {
+			// Roll every tracker back to its pre-append snapshot. Remote/consensus
+			// cleanup (cancelling pended blocks) already happened inside
+			// coordinateTransaction; this restores LOCAL tracker state only.
+			for (const { collectionId, collection } of collectionData) {
+				collection.restorePending(preCommitSnapshots.get(collectionId)!);
+			}
+			throw err;
 		}
 
 		// Advance actionContext, fold the committed transforms into each
@@ -353,6 +376,16 @@ export class TransactionCoordinator {
 		}
 
 		// 2. Apply actions to collections and collect transforms
+		//
+		// NOTE: like commit(), this loop appends a log entry into each collection's
+		// tracker and these failure returns do NOT restore that state — so a partially
+		// applied engine transaction leaves appended-but-uncommitted entries in the
+		// trackers. This is deliberately NOT snapshot/restore-wrapped the way commit()
+		// is, because execute()'s asymmetry makes it lower risk: it is not the retryable
+		// session.commit() entry point (a failed execute() is not re-driven through the
+		// same loop), and its actions were tracked via applyActions() so rollback(stampId)
+		// CAN unwind them (unlike commit()'s directly-staged path). If execute() ever
+		// becomes retryable, mirror the commit() snapshot/restore fix here.
 		const tApply = Date.now();
 		const collectionTransforms = new Map<CollectionId, Transforms>();
 		const criticalBlocks = new Map<CollectionId, BlockId>();
