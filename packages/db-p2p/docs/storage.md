@@ -13,8 +13,15 @@ BlockStorage (Block-level operations with versioning)
     ↓
 IRawStorage (Low-level storage interface)
     ↓
-FileRawStorage (File-based implementation)
+Either: a backend that implements IRawStorage directly (e.g. FileRawStorage)
+    or: KvRawStorage (shared kernel) → RawStoreDriver (per-backend bytes layer)
 ```
+
+A backend may satisfy `IRawStorage` in one of two ways: implement the interface
+directly (as `FileRawStorage` does today), or reuse the shared `KvRawStorage`
+kernel over a small `RawStoreDriver` that only speaks bytes. The in-memory
+backend uses the kernel; the four persistent backends still implement
+`IRawStorage` directly and are being migrated onto drivers one at a time.
 
 ## Core Components
 
@@ -64,6 +71,28 @@ The `IRawStorage` interface defines low-level storage operations, abstracting th
 ### 4. File-based Storage (`FileRawStorage`)
 
 The `FileRawStorage` class implements `IRawStorage` using a file system backend with JSON serialization.
+
+### 5. Shared KV Kernel (`KvRawStorage` + `RawStoreDriver`)
+
+`KvRawStorage` implements the full `IRawStorage` surface once, on top of a
+`RawStoreDriver`. The driver exposes each backend's five logical stores
+(metadata, revisions, pending, transactions, materialized) as bytes-valued maps
+over its native mechanism; the kernel owns all value (de)serialization (JSON via
+`raw-store-codec.ts`) and call orchestration. Backends therefore never
+(de)serialize values — they only lay out keys and move bytes.
+
+Because values cross the driver boundary as `Uint8Array` (JSON-encode on save,
+JSON-decode on read), every save stores an independent byte snapshot and every
+read yields a fresh object *by construction*. The `structuredClone`-on-every-get/put
+discipline the old in-memory backend needed is now structural, not a rule — see
+docs/internals.md "Storage Returns References". `promote` (pending → committed) is
+the only cross-key atomic operation the kernel requires; each backend satisfies it
+with its native atomic primitive (batch / DB transaction / rename).
+
+The in-memory backend (`MemoryRawStorage` over `MemoryStoreDriver`) uses this
+kernel today. A shared conformance suite (`src/testing/raw-storage-conformance.ts`,
+exported from the `./testing` entry) asserts every backend behaves identically and
+is the single parity target the persistent backends adopt as they migrate.
 
 **File System Structure:**
 ```
@@ -228,7 +257,7 @@ const blockStorage = new BlockStorage(
 ### 3. Memory Management
 
 - **Lazy Loading**: Loads data only when accessed
-- **Structured Cloning**: Uses efficient deep cloning for immutability
+- **Snapshot-on-Store/Read**: Callers never share mutable references with the store. A backend that keeps live object references must deep-clone on get and put; a kernel-backed backend gets this for free from the `Uint8Array` codec boundary (see the shared KV kernel above)
 - **Resource Cleanup**: Properly manages file handles and locks
 
 ## Error Handling
