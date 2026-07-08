@@ -551,6 +551,13 @@ export async function createLibp2pNodeBase(
 				catch (err) { wiringLog('fret in-factory setLibp2p failed (proxy); real node injected post-construction: %o', err); }
 				return svc;
 			}
+
+			// [dispute-subsystem-dormant] The /optimystic/<network>/dispute/1.0.0 handler
+			// (disputeProtocolService / DisputeProtocolService) is intentionally NOT registered here.
+			// The subsystem is staged dormant pending arbitrator-set anchoring — without it, a peer
+			// minting throwaway keypairs can forge a synthetic super-majority and pass resolution.
+			// Gate: tickets/backlog/hardening/invalidation-live-wiring-requires-arbitrator-set-anchoring
+			// Wiring plan: tickets/backlog/feat-dispute-subsystem-live-activation
 		}) as unknown as NonNullable<Libp2pInit['services']>,
 		// Add bootstrap nodes as needed
 		peerDiscovery: [
@@ -1157,6 +1164,14 @@ export async function createLibp2pNodeBase(
 			.catch((err) => ((node as any).logger?.forComponent?.('db-p2p:owned-block-seed'))?.('seed failed: %o', err));
 	}
 
+	// [dispute-subsystem-dormant] The DisputeService object is constructed below so tests and
+	// getDisputeStatus() work, but it is unreachable from the live network path:
+	//   - No inbound handler: disputeProtocolService is NOT in the services map above.
+	//   - onInvalidation is deliberately unset: maybeInvalidate() is a no-op on live nodes.
+	//   - revalidate is deliberately unset: handleChallenge always votes inconclusive on live nodes.
+	// Full activation requires arbitrator-set anchoring before a forged synthetic cohort can pass resolution.
+	// Gate: tickets/backlog/hardening/invalidation-live-wiring-requires-arbitrator-set-anchoring
+	// Wiring plan: tickets/backlog/feat-dispute-subsystem-live-activation
 	// Initialize dispute service if enabled
 	let disputeServiceInstance: DisputeService | undefined;
 	if (options.dispute?.disputeEnabled) {

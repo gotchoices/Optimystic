@@ -336,6 +336,11 @@ export class ClusterCoordinator {
 				rejectionCount,
 				peerCount
 			});
+			// [dispute-subsystem-dormant] Evidence is computed and persisted but initiateDispute() is
+			// intentionally NOT called here. Dispute origination stays dormant pending arbitrator-set
+			// anchoring — without it a forged synthetic cohort passes resolution.
+			// Gate: tickets/backlog/hardening/invalidation-live-wiring-requires-arbitrator-set-anchoring
+			// Wiring plan: tickets/backlog/feat-dispute-subsystem-live-activation
 		}
 
 		this.persistCoordinatorState(promised.record.messageHash, promised.record, 'committing');
