@@ -491,9 +491,21 @@ Transaction metrics are instrumented with `debug` logging and optional verbose t
 // WRONG
 getMaterializedBlock(): return this.blocks.get(key);
 
-// CORRECT
+// CORRECT (hand-rolled store)
 getMaterializedBlock(): return structuredClone(this.blocks.get(key));
 ```
+
+**Now structural for kernel-backed stores.** Every store built on the shared
+`KvRawStorage` kernel (`packages/db-p2p/src/storage/kv-raw-storage.ts`) over a
+`RawStoreDriver` no longer needs — and must not reintroduce — the `structuredClone`
+discipline. Values cross the driver boundary as `Uint8Array` produced by `JSON`-encode
+(`raw-store-codec.ts`) and consumed by `JSON`-decode, so every save stores an independent
+byte snapshot and every read decodes a fresh object *by construction*. The in-memory
+driver (`memory-store-driver.ts`) stores byte references directly with no cloning. The
+conformance suite (`src/testing/raw-storage-conformance.ts`) asserts clone-on-store /
+clone-on-read against any driver, so a backend that shortcuts the byte boundary is caught.
+The clone rule above still applies only to a store that keeps live object references (none
+do today).
 
 ### 3. Independent Node Storage
 **Bug**: Each node has its own storage. Consensus doesn't automatically sync data.
