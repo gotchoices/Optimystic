@@ -4,6 +4,8 @@ This document states the properties that Optimystic guarantees, the assumptions 
 
 For implementation details, see [transactions.md](transactions.md), [right-is-right.md](right-is-right.md), and [internals.md](internals.md).
 
+> **Implementation status notice.** §5 (Byzantine Fault Tolerance) and the dispute-related theorems — Theorems 1 (Case 3), 2 (escalation clause), 7 (clause 2), 8, 8b, and 10 (Tiers 3–4 and cost model) — describe a **target** mechanism that is **partially implemented**. Per-theorem status notes below flag each gap. The shipping system today provides a materially weaker guarantee than the `f < N/2` headline: validity disagreements are *detectable* (the `ClusterRecord` carries a `disputed` flag and rejection evidence) within a cluster that has an honest super-majority of ≥⌈0.67·K⌉ approvals (`superMajorityThreshold = 0.67`, `libp2p-node-base.ts:605`), but disputes are not initiated pre-commit, the dispute service is off by default (`disputeEnabled = false`, `dispute/types.ts:124`), and `initiateDispute` has no production caller. See `docs/architecture.md` §Status & Evolution and `tickets/blocked/dispute-synchronous-escalation-decision.md` for the strategic decision on completing the full mechanism.
+
 ---
 
 ## 1. System Model
@@ -34,6 +36,8 @@ For implementation details, see [transactions.md](transactions.md), [right-is-ri
 ### 1.5 Global Honest Majority
 
 **The network has an honest majority: f < N/2**, where N is the total number of nodes and f is the number of Byzantine nodes. This is the fundamental trust assumption. All safety and liveness properties derive from it.
+
+> **Status (§1.5):** The `f < N/2` tolerance is the target the full dispute mechanism is designed to reach. The currently-shipping subset provides a weaker guarantee: a Byzantine minority up to ~33% of a cluster (at the default `superMajorityThreshold = 0.67`, `libp2p-node-base.ts:605`) can drive an invalid transaction to commit flagged-but-not-blocked, because dispute escalation is off by default and unwired. See Theorem 10 status note for the concrete current bound.
 
 ---
 
@@ -83,6 +87,8 @@ Membership binding (§2) sharpens the "same inputs" premise here: for version-2 
 
 *Case 3: Cluster is Byzantine-majority.* If the local cluster has a Byzantine majority that approves both conflicting transactions, the minority honest nodes trigger a dispute. The dispute escalates to enlistees selected by FRET ring distance. Since the global network has an honest majority, the escalation eventually reaches an audience where honest nodes outnumber Byzantine ones. The losing side (including the Byzantine approvers) is ejected. Only one transaction commits.
 
+> **Status (Theorem 1, Case 3 — target, not yet built):** Cases 1 and 2 are current. Case 3 is the target design. In the shipping system, a Byzantine local super-majority (≥⌈0.67·K⌉ approvers at the default `superMajorityThreshold`) **commits the transaction anyway** and sets `record.disputed = true` with rejection evidence (`cluster-coordinator.ts:299-332`). No dispute is initiated pre-commit. The dispute service is off by default (`disputeEnabled = false`, `dispute/types.ts:124`) and `initiateDispute` has no production caller. The "honest minority ejects the Byzantine majority" path described in Case 3 requires the full synchronous escalation mechanism — the subject of `tickets/blocked/dispute-synchronous-escalation-decision.md`.
+
 **Depends on:** Global honest majority (§1.5), Ed25519 unforgeability (§1.3), deterministic race resolution.
 
 ### Theorem 2: Partition Safety (No Split-Brain)
@@ -111,6 +117,8 @@ Additionally, the self-coordination guard detects network shrinkage exceeding 50
 **Bound.** This holds for any partition split where neither side has ≥75% of the cluster. A partition where one side retains ≥75% of peers can commit — this is correct behavior, as the larger partition is the "real" network. A side that genuinely *is* the surviving network (peers truly gone, not partitioned away) is admitted by the gate's confident path — a confident small `K_est` legitimizes a correspondingly small cluster; only an *unjustified* shrink (low confidence, or `|D|` far below `K_est`) is refused.
 
 **Depends on:** Super-majority threshold (75%), membership binding (§2), the member-side membership admission gate, FRET network-size confidence, partition detection, self-coordination guard.
+
+> **Status (Theorem 2):** The core partition-safety argument is largely **current**: membership binding (§2) and the member-side membership admission gate both landed (prereqs `bind-cluster-membership-into-signed-record`, `cluster-membership-admission-gate`). Two caveats: (1) **Threshold discrepancy** — the proof's counting argument uses ≥75% (⌈0.75·K⌉) but the code default is `superMajorityThreshold = 0.67` (`libp2p-node-base.ts:605`; 0.75 in the test/mesh harness). With 0.67 the contradiction holds (0.67+0.67 = 1.34 > 1), but the actual floor is ≥⌈0.67·K⌉, not ≥⌈0.75·K⌉. (2) **Escalation clause** — if a minority partition were somehow to form a disputed super-majority despite the gate, the only recourse would be dispute escalation to recruit a wider honest majority (same mechanism as Theorem 1 Case 3). That escalation path is target / not built; the gate is the primary current defense.
 
 ### Theorem 3: Multi-Collection Atomicity of Intent (Eventual, Reported Visibility)
 
@@ -206,6 +214,8 @@ Transactions carry an expiration timestamp. Three mechanisms ensure termination:
 
 2. **Dispute termination.** Each dispute escalation round has a timeout (default 60 seconds). If arbitrators don't respond within the timeout, the round concludes with available votes. The dispute mechanism cannot loop: each round enlists fresh peers by dispersed sampling from the whole population (excluding those already drawn), and the global honest majority ensures eventual resolution (see Theorem 8).
 
+   > **Status (Theorem 7, clause 2 — target, not yet built):** Multi-round escalation with per-round timeouts does not exist in the shipping code. `initiateDispute` (`dispute-service.ts:137`) hard-codes `round = 0` (single round, no recursion), has no production caller, and the service is off by default (`disputeEnabled = false`, `dispute/types.ts:124`). Clauses 1 (expiration enforcement) and 3 (retry backoff) are current.
+
 3. **Retry backoff.** Failed commit attempts use exponential backoff (2s → 4s → 8s → 16s → 30s cap, max 5 attempts). After exhausting retries, the transaction is abandoned with an error.
 
 **Bound.** Worst-case termination time is the transaction's expiration timestamp. Typical termination is within one or two round-trip times for non-conflicting transactions.
@@ -215,6 +225,8 @@ Transactions carry an expiration timestamp. Three mechanisms ensure termination:
 ### Theorem 8: Dispute Convergence
 
 **Statement.** The Right-is-Right dispute mechanism terminates in O(log N) escalation rounds, where N is the network size.
+
+> **Status (Theorem 8 — target / not implemented):** Multi-round escalation does not exist in the shipping code. `initiateDispute` (`dispute-service.ts:137`) hard-codes `round = 0`, selects one arbitrator ring, collects votes once, and resolves — there is no recursion, no geometric widening, no round-to-round ejection loop. Additionally, `initiateDispute` has no production caller and the dispute service is off by default (`disputeEnabled = false`, `dispute/types.ts:124`). The dispersed arbitrator sampling *function* (`sampleArbitrators`, `db-p2p/src/dispute/arbitrator-selection.ts`) is implemented and supports a `round` parameter, but nothing drives it past 0 and the call site is unwired in production. The O(log N) convergence guarantee is not a shipping property; this theorem states the target design.
 
 **Proof sketch.**
 
@@ -235,6 +247,8 @@ Each round ejects the losing side, so the honest fraction of active nodes *incre
 ### Theorem 8b: Invalidation-Cascade Termination & Convergence
 
 **Statement.** When a proven-invalid `T_inv` is reversed, the re-evaluation of its transitive read-dependents terminates and converges to the same end state on every honest member.
+
+> **Status (Theorem 8b — built but not live end-to-end):** The cascade primitive (`db-p2p/src/dispute/cascade.ts`) and reversal machinery (`invalidation.ts`) are implemented and unit-tested; the termination and convergence arguments in the proof sketch apply to that code. However, end-to-end origination wiring is missing: the composition root does not supply `revalidate`/`onInvalidation` callbacks, and the node-side emit of invalidation change events is not in place, so a `challenger-wins` resolution does not originate a durable `InvalidationEntry` end-to-end in production. See `right-is-right.md` §Durable Invalidation "Wiring status" and §Client Notification "Wiring status".
 
 **Proof sketch.**
 
@@ -271,6 +285,8 @@ Starvation: a transaction could theoretically lose every race indefinitely. Howe
 
 This is not standard BFT. The tolerance is *adaptive*: the validation protocol automatically escalates its defense based on the fraction of Byzantine validators encountered.
 
+> **Status (Theorem 10):** *Tiers 1 and 2* (unanimous fast path; honest super-majority commits with minority flagged) are **current**: when ≥⌈`superMajorityThreshold`·K⌉ peers approve, `ClusterCoordinator.executeTransaction` commits and sets `record.disputed = true` with evidence for any rejecting minority (`cluster-coordinator.ts:299-332`). Note the threshold discrepancy: the proof uses ≥75% (K/4 Byzantine floor) but the code default is `superMajorityThreshold = 0.67` (`libp2p-node-base.ts:605`; 0.75 in the test/mesh harness) — at 0.67 the effective Tier-2 Byzantine tolerance is ~33%, not 25% as stated. *Tiers 3 and 4* (honest minority triggers dispute; cascading escalation; geometric widening) and the **cost model table** are **target / not built**: the dispute service is off by default (`disputeEnabled = false`, `dispute/types.ts:124`), `initiateDispute` has no production caller, and multi-round escalation does not exist. **Effective guarantee today:** *Byzantine-detectable under an honest cluster super-majority* — a Byzantine minority up to ~33% of a cluster can drive an invalid transaction to commit, flagged but not blocked and never arbitrated by default.
+
 **Proof sketch.**
 
 *Tier 1 — Fast path (f_local = 0).* If all cluster validators are honest, the transaction validates unanimously. Cost: one round trip. This is the common case.
@@ -296,6 +312,8 @@ This is not standard BFT. The tolerance is *adaptive*: the validation protocol a
 | Full cascade | near-global | O(log N) | O(log N)× |
 
 Validation degenerates to whole-network consensus (blockchain-style) only when Byzantine validators are widespread — a scenario that should be exceedingly rare given the economic incentives against it (ejection, reputation loss).
+
+> **Status (cost model table — target):** This table describes the adaptive escalation goal. In the shipping system all transactions incur the flat cost of a single cluster round (Tiers 1–2 rows). Tiers 3–4 cost rows are not yet reachable.
 
 **Depends on:** Global honest majority, dispute escalation mechanism, reputation-based ejection, FRET ring topology for deterministic validator selection and dispersed arbitrator sampling.
 
@@ -434,6 +452,8 @@ The honest majority assumption (§1.5) counts *nodes*, not *identities*. A Sybil
 
 **Bound.** Sybil resistance is proportional to the cost of key generation and the effectiveness of FRET's density estimation. A sufficiently resourced attacker with N/2 identities breaks the honest majority assumption entirely. Dispersed arbitrator sampling raises the *local* Sybil cost — dominating one block's cluster no longer suffices to also capture its arbitrators.
 
+> **Status (§7.1 dispersed-arbitrator sampling):** The dispersed sampling *function* (`sampleArbitrators`, `db-p2p/src/dispute/arbitrator-selection.ts`) is implemented and current — the `arbitrator-independent-sampling` prereq landed. However it is exercised only inside the unwired single-round dispute path: `initiateDispute` has no production caller and the dispute service is off by default (`disputeEnabled = false`, `dispute/types.ts:124`). The Sybil-resistance argument for arbitrators applies to the target design; no end-to-end dispute round currently selects and queries arbitrators in production.
+
 ### 7.2 Network Partition Duration
 
 During a partition, the minority partition is unavailable for writes. Read-only operations from local cache continue to work but may serve stale data. Write-unavailability on the minority side is *enforced*, not merely expected: the member-side membership admission gate (see Theorem 2) fails closed under the low FRET confidence a partition induces, so minority members refuse to admit a self-shrunk cluster and no super-majority forms there.
@@ -441,7 +461,7 @@ During a partition, the minority partition is unavailable for writes. Read-only 
 **Healing.** When partitions heal, divergent state is reconciled:
 - *Behind*: normal sync catches up.
 - *Ahead*: tentative transactions are validated against the canonical chain.
-- *Forked*: conflicting commits trigger transaction invalidation cascade — the transaction with fewer confirmations is reversed and its dependents are re-evaluated. The reversal is durable and audit-preserving: rather than rewriting the prior-hash-linked log, a compensating **`InvalidationEntry`** is appended that restores each affected block's as-if-absent content via a new monotonic revision, gated on a `challenger-wins` dispute certificate and applied deterministically on every member through the critical cluster (see `docs/right-is-right.md` § Durable Invalidation). The single-collection reversal primitive is implemented; walking read-dependents across collections is the invalidation-cascade follow-up.
+- *Forked*: conflicting commits trigger transaction invalidation cascade — the transaction with fewer confirmations is reversed and its dependents are re-evaluated. The reversal is durable and audit-preserving: rather than rewriting the prior-hash-linked log, a compensating **`InvalidationEntry`** is appended that restores each affected block's as-if-absent content via a new monotonic revision, gated on a `challenger-wins` dispute certificate and applied deterministically on every member through the critical cluster (see `docs/right-is-right.md` § Durable Invalidation). The single-collection reversal primitive is implemented; walking read-dependents across collections is the invalidation-cascade follow-up. **Status: built but not live end-to-end** — same partial status as Theorem 8b. The cascade and reversal code exist and are unit-tested, but end-to-end origination wiring (emit, composition-root callbacks) is not in place, so partition healing via durable invalidation does not yet run in production.
 
 **Bound.** Partition healing requires connectivity restoration and is bounded by sync round-trip time plus conflict resolution time.
 
@@ -480,7 +500,7 @@ The properties above compose to provide the following end-to-end guarantee:
 > 3. Committed transactions are durable and survive up to 25% node failure per cluster.
 > 4. Multi-collection transactions are atomic in *intent* (every collection pends under one content-addressed identity) with *eventual, reported visibility* — normally all collections commit; a partial landing is reported (`committedCollections` / `failedCollections`) for reconciliation, never silently claimed as success (Theorem 3).
 > 5. Concurrent transactions are isolated at the snapshot level with write-skew prevention.
-> 6. Byzantine validators are detected and ejected, with validation cost proportional to the fraction of Byzantine validators encountered.
+> 6. Byzantine validators are detected and flagged (the `ClusterRecord` carries a `disputed` flag and rejection evidence for minority rejecters) — detection is **current**. Ejection via dispute escalation and the adaptive validation cost curve are the **target design**; see Theorem 10 status note.
 > 7. Network partitions cannot cause split-brain; the minority partition blocks writes rather than risk inconsistency.
 > 8. A Byzantine coordinator cannot cause honest validators to commit invalid state.
 > 9. Recovering nodes reconstruct correct state despite Byzantine peers, given honest cluster majority.
@@ -493,6 +513,8 @@ These guarantees degrade gracefully: as the Byzantine fraction increases, valida
 ## 9. Toward Formal Verification
 
 The theorems above are informal proof sketches. A formal verification effort would proceed in stages:
+
+> **Status (§9):** This section targets the *design*, not the current implementation. In particular, Stage 1 (TLA+ model-checking of the dispute escalation state machine) covers phases — `DISPUTE`, `RESOLVE`, multi-round cascading escalation — that are not yet built in the shipping code. A reader planning a TLA+ effort should note that the escalation phases exist only in the design documents (`right-is-right.md`); the implementation to model-check for BFT properties is the target architecture, not the current code. Theorems 1–3, 4–6, 9, 11–15 reference mechanisms that are current and would be valid targets for formal verification today.
 
 ### Stage 1: TLA+ Specification
 
