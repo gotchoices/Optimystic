@@ -1716,6 +1716,52 @@ describe('Transaction', () => {
 			const after = JSON.parse(JSON.stringify(usersCollection.tracker.transforms));
 			expect(after, 'validate() must not mutate the main coordinator state').to.deep.equal(before);
 		});
+
+		it('applies a multi-collection transaction exactly once on coordinator.execute()', async () => {
+			// coordinator.execute() is the OTHER apply path (used with a pure-translator
+			// engine). Pre-fix it relied on the engine's side-effect to stage; removing that
+			// naively made it apply ZERO times (caught elsewhere by an undefined read). But a
+			// double-apply here would slip past value assertions: every action below is a
+			// `replace`, which is idempotent, so applying twice yields the same rows. Pin the
+			// apply-count with a spy so a future regression in either direction is caught.
+			const transactor = new TestTransactor();
+			type UserEntry = { key: number; name: string };
+			type PostEntry = { key: number; title: string };
+			const usersTree = await Tree.createOrOpen<number, UserEntry>(
+				transactor, 'users', entry => entry.key
+			);
+			const postsTree = await Tree.createOrOpen<number, PostEntry>(
+				transactor, 'posts', entry => entry.key
+			);
+			const collections = new Map();
+			collections.set('users', (usersTree as unknown as { collection: unknown }).collection);
+			collections.set('posts', (postsTree as unknown as { collection: unknown }).collection);
+			const coordinator = new TransactionCoordinator(transactor, collections);
+			const engine = new ActionsEngine();
+
+			let applyCalls = 0;
+			const realApply = coordinator.applyActions.bind(coordinator);
+			coordinator.applyActions = async (a, id) => { applyCalls++; return realApply(a, id); };
+
+			const collectionActions: CollectionActions[] = [
+				{ collectionId: 'users', actions: [{ type: 'replace', data: [[1, { key: 1, name: 'Alice' }]] }] },
+				{ collectionId: 'posts', actions: [{ type: 'replace', data: [[100, { key: 100, title: 'First' }]] }] }
+			];
+			const statements = createActionsStatements(collectionActions);
+			const stamp = await createTransactionStamp('peer1', Date.now(), 'schema1', ACTIONS_ENGINE_ID);
+			const transaction: Transaction = {
+				stamp, statements, reads: [],
+				id: await createTransactionId(stamp.id, statements, [])
+			};
+
+			const result = await coordinator.execute(transaction, engine);
+			expect(result.success).to.be.true;
+			expect(applyCalls, 'coordinator.execute double- or zero-applied').to.equal(1); // pre-fix: 0
+
+			// Both rows landed exactly once with the correct value.
+			expect(await usersTree.get(1)).to.deep.equal({ key: 1, name: 'Alice' });
+			expect(await postsTree.get(100)).to.deep.equal({ key: 100, title: 'First' });
+		});
 	});
 
 	describe('Multi-Collection Transaction Conflicts (TEST-2.1.2)', () => {

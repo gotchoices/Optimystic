@@ -95,11 +95,22 @@ export class TransactionValidator implements ITransactionValidator {
 		try {
 			// 5. Re-execute transaction through engine.
 			//
-			// Engines are pure translators (see ITransactionEngine contract): execute()
-			// only parses statements into actions and CANNOT mutate any coordinator's
-			// state. So even though the registered engine may have been constructed with
-			// the MAIN coordinator, re-executing here does NOT leak into main state — the
-			// only application happens on the isolated validationCoordinator below.
+			// Which of the two ITransactionEngine models the registered engine uses decides
+			// where isolation comes from (see the contract in transaction.ts):
+			//
+			//   (a) PURE TRANSLATOR (ActionsEngine) — execute() parses statements into
+			//       actions and mutates NOTHING, so even an engine constructed against the
+			//       MAIN coordinator cannot leak into main state here. The returned actions
+			//       are applied once, on the isolated validationCoordinator at step 6.
+			//
+			//   (b) SIDE-EFFECT APPLY (QuereusEngine) — execute() applies while translating
+			//       (db.exec drives the vtab into coordinator.applyActions) and returns EMPTY
+			//       actions. That application lands on whatever coordinator the engine/vtab is
+			//       bound to, NOT on validationCoordinator, so isolation is the caller's job:
+			//       the createValidationCoordinator wiring must bind/reset an isolated world
+			//       (see quereus-validator, which resets the coordinator before each run and
+			//       makes its validationCoordinator.applyActions a no-op). Step 6 is then
+			//       skipped by the empty-actions guard.
 			const result = await registration.engine.execute(transaction);
 			if (!result.success) {
 				return {
@@ -109,7 +120,8 @@ export class TransactionValidator implements ITransactionValidator {
 			}
 
 			// 6. Apply actions to the isolated validation coordinator (builds transforms).
-			// This is the sole application; the engine did not apply anything.
+			// Reached only for pure-translator engines that RETURNED actions; a side-effect
+			// engine returns empty and already applied during execute() (see above).
 			if (result.actions && result.actions.length > 0) {
 				await validationCoordinator.applyActions(result.actions, stamp.id);
 			}
