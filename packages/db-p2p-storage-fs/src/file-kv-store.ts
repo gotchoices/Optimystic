@@ -56,6 +56,10 @@ export class FileKVStore implements IKVStore {
 	}
 
 	private keyToPath(key: string): string {
+		// NOTE: `/`-separated keys become nested dirs, so a key's first segment shares
+		// the top-level namespace with FileRawStorage's <blockId>/ dirs. Safe today
+		// because block ids are content hashes; if a KV key's first segment could ever
+		// equal a block id, give the two stores separate basePaths (see README Usage).
 		return path.join(this.basePath, ...key.split('/')) + '.json';
 	}
 }

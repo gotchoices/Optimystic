@@ -39,9 +39,13 @@ const libp2p = await createLibp2pNode({
 ```
 
 Both constructors take a single `basePath` — the directory under which all
-data is stored. They can share the same `basePath` because their on-disk
-namespaces do not overlap (block data lives under `<blockId>/` subdirectories;
-KV data lives as flat `.json` files at the top level).
+data is stored. They can share the same `basePath` in practice because their
+top-level names do not collide: block data lives under `<blockId>/`
+subdirectories (block ids are content-address hashes), while KV data lives
+under directories named by the first segment of each key (a `/`-separated key
+becomes nested subdirectories — e.g. `coordinator/key1` → `coordinator/key1.json`).
+Sharing is safe only as long as no block id equals a KV key's first segment;
+give them separate `basePath`s if you cannot guarantee that.
 
 ## On-disk layout
 
