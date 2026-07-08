@@ -507,7 +507,7 @@ export class NetworkTransactor implements ITransactor, IBlockChangeNotifier {
 
 		if (error) { // If any failures, cancel all pending actions as background microtask
 			log('pend:cancel actionId=%s', blockAction.actionId);
-			void Promise.resolve().then(() => this.cancelBatch(batches, { blockIds, actionId: blockAction.actionId }));
+			void Promise.resolve().then(() => this.cancelBatch(batches, { blockIds, actionId: blockAction.actionId })).catch(e => log('WARN: cancel after pend failure rejected: %o', e));
 			const stale = Array.from(allBatches(batches, b => b.request?.isResponse as boolean && !b.request!.response!.success));
 			if (stale.length > 0) {	// Any active stale failures should preempt reporting connection or other potential transient errors (we have information)
 				log('pend:stale actionId=%s staleCount=%d', blockAction.actionId, stale.length);
@@ -620,11 +620,11 @@ export class NetworkTransactor implements ITransactor, IBlockChangeNotifier {
 		const { batches: tailBatches, error: tailError } = await this.commitBlocks({ blockIds: [blockId], actionId, rev, tailId });
 		if (tailError) {
 			// Cancel all pending actions as background microtask
-			Promise.resolve().then(() => this.cancel({ blockIds, actionId }));
+			void Promise.resolve().then(() => this.cancel({ blockIds, actionId })).catch(e => log('WARN: cancel after commit failure rejected: %o', e));
 			// Collect and return any active stale failures
 			const stale = Array.from(allBatches(tailBatches, b => b.request?.isResponse as boolean && !b.request!.response!.success));
 			if (stale.length > 0) {
-				return { missing: distinctBlockActionTransforms(stale.flatMap(b => (b.request!.response! as StaleFailure).missing!)), success: false as const };
+				return { missing: distinctBlockActionTransforms(stale.flatMap(b => (b.request!.response! as StaleFailure).missing).filter((x): x is ActionTransforms => x !== undefined)), success: false as const };
 			}
 			throw tailError;
 		}
