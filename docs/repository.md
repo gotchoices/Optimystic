@@ -140,3 +140,10 @@ triggers with EWMA smoothing, a hysteresis dead-band, and a 10-minute minimum dw
 reading cannot cause a wrong or premature ring move; at worst it delays one by up to the TTL, which
 is immaterial against the 10-minute dwell. **`RingSelector` therefore needs no forced-fresh read at
 decision boundaries** — the cached estimate is authoritative for its purposes.
+
+- NOTE (tripwire): the default TTL (60s) equals the ring monitor tick interval (the `setInterval` in
+  `libp2p-node-base.ts`, also 60s), so each `shouldTransition` tick folds a roughly-fresh sample into
+  its EWMA. If `usedBytesCacheTtlMs` is ever raised *above* the tick interval, consecutive ticks would
+  fold the *same* cached (stale) sample into the EWMA, biasing the smoothed depth toward the stale
+  value. Damping (dead-band + 10-min dwell) absorbs this today; only revisit if the TTL is raised past
+  the tick interval or the tick is shortened below the TTL.
