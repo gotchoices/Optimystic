@@ -1,5 +1,4 @@
 import type { ITransactionEngine, Transaction, ExecutionResult, CollectionActions } from './transaction.js';
-import type { TransactionCoordinator } from './coordinator.js';
 
 export const ACTIONS_ENGINE_ID = "actions@1.0.0";
 
@@ -8,6 +7,11 @@ export const ACTIONS_ENGINE_ID = "actions@1.0.0";
  *
  * This engine treats each statement as a JSON-encoded CollectionActions object.
  * It's useful for testing the transaction infrastructure without needing SQL.
+ *
+ * This is a PURE TRANSLATOR (model (a) of the {@link ITransactionEngine} contract):
+ * execute() parses statements into CollectionActions[] and RETURNS them. It never
+ * touches a coordinator or mutates any collection state — application is the sole
+ * responsibility of the session/coordinator that receives the returned actions.
  *
  * Each statement format:
  * ```json
@@ -21,8 +25,6 @@ export const ACTIONS_ENGINE_ID = "actions@1.0.0";
  */
 export class ActionsEngine implements ITransactionEngine {
 	readonly id = ACTIONS_ENGINE_ID;
-
-	constructor(private coordinator: TransactionCoordinator) {}
 
 	async execute(transaction: Transaction): Promise<ExecutionResult> {
 		try {
@@ -48,12 +50,10 @@ export class ActionsEngine implements ITransactionEngine {
 				}
 
 				allActions.push(collectionActions);
-
-				// Apply actions through coordinator (for validation/replay)
-				await this.coordinator.applyActions([collectionActions], transaction.stamp.id);
 			}
 
-			// Return success (actions already applied)
+			// Pure translation: return parsed actions WITHOUT applying them. The caller
+			// (session.execute / coordinator.execute) applies them exactly once.
 			return {
 				success: true,
 				actions: allActions

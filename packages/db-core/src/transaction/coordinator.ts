@@ -396,7 +396,31 @@ export class TransactionCoordinator {
 			return { success: true }; // Nothing to do
 		}
 
-		// 2. Apply actions to collections and collect transforms
+		// 1b. Stage the returned actions into the collection trackers.
+		//
+		// Reaching here means the engine RETURNED non-empty actions — i.e. the pure-
+		// translator model (see the ITransactionEngine contract): it translated the
+		// statements but did NOT apply them. So THIS path owns application — we stage the
+		// actions here via applyActions() (which also snapshots/tracks the stamp for
+		// rollback) BEFORE the loop below reads each tracker's transforms to materialise
+		// the log entry. (Previously ActionsEngine applied as a side effect and this
+		// method merely re-read the already-staged trackers; that side effect is gone, so
+		// the application must happen explicitly here. A side-effecting engine that
+		// applied internally would instead return EMPTY actions and short-circuit at the
+		// guard above.)
+		//
+		// applyActions() throws if a referenced collection is not registered — the same
+		// "Collection not found" the engine's side-effecting apply used to surface. Convert
+		// it back into a failure result so execute() keeps its return contract.
+		try {
+			await this.applyActions(result.actions, transaction.stamp.id);
+		} catch (error) {
+			const engineMs = Date.now() - tEngine;
+			log('execute:done trxId=%s engine=%dms apply-failed=true total=%dms', trxId, engineMs, Date.now() - t0);
+			return { success: false, error: error instanceof Error ? error.message : String(error) };
+		}
+
+		// 2. Build a log entry per collection from the now-staged tracker transforms.
 		//
 		// NOTE: like commit(), this loop appends a log entry into each collection's
 		// tracker and these failure returns do NOT restore that state — so a partially

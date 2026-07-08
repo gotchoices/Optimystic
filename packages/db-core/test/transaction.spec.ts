@@ -15,6 +15,8 @@ import {
 	TransactionValidator,
 	Tree,
 	type Transaction,
+	type ITransactionEngine,
+	type ExecutionResult,
 	type CollectionActions,
 	type EngineRegistration,
 	type ValidationCoordinatorFactory,
@@ -34,6 +36,29 @@ import {
 	type BlockActionStatus,
 } from '../src/index.js';
 import { TestTransactor, FlakyCommitTransactor } from '../src/testing/test-transactor.js';
+
+/**
+ * Test helper: translate a transaction's statements through the engine, THEN apply
+ * the returned actions to the coordinator.
+ *
+ * Engines are pure translators now — engine.execute() only parses statements into
+ * CollectionActions[] and no longer applies them as a side effect. So a test that
+ * previously relied on `engine.execute(tx)` to stage actions into the collection
+ * trackers must apply them explicitly; this mirrors what TransactionSession.execute /
+ * TransactionCoordinator.execute do. Application errors (e.g. an unregistered
+ * collection) surface by throwing from coordinator.applyActions.
+ */
+async function applyViaEngine(
+	coordinator: TransactionCoordinator,
+	engine: ITransactionEngine,
+	tx: Transaction
+): Promise<ExecutionResult> {
+	const result = await engine.execute(tx);
+	if (result.success && result.actions?.length) {
+		await coordinator.applyActions(result.actions, tx.stamp.id);
+	}
+	return result;
+}
 
 describe('Transaction', () => {
 	describe('Transaction Structure', () => {
@@ -135,13 +160,13 @@ describe('Transaction', () => {
 			const transactor = new TestTransactor();
 			const collections = new Map();
 			coordinator = new TransactionCoordinator(transactor, collections);
-			engine = new ActionsEngine(coordinator);
+			engine = new ActionsEngine();
 		});
 
 		it('should parse and validate actions statements', async () => {
-			// Test that ActionsEngine can parse statements correctly
-			// Note: Execution will fail because no collection is registered,
-			// but we can verify the parsing and validation logic
+			// The engine is a pure translator: parsing/validation succeeds and it RETURNS
+			// the actions without applying them. The unregistered collection only surfaces
+			// when those actions are applied (via coordinator.execute below).
 			const collections: CollectionActions[] = [
 				{
 					collectionId: 'users',
@@ -167,15 +192,21 @@ describe('Transaction', () => {
 				id: await createTransactionId(stamp.id, statements, [])
 			};
 
+			// Pure translation succeeds and returns the parsed actions.
 			const result = await engine.execute(transaction);
+			expect(result.success).to.be.true;
+			expect(result.actions).to.have.lengthOf(1);
+			expect(result.actions![0]!.collectionId).to.equal('users');
 
-			// Execution fails because no collection is registered
-			expect(result.success).to.be.false;
-			expect(result.error).to.include('Collection not found');
+			// Applying surfaces the unregistered collection.
+			const applied = await coordinator.execute(transaction, engine);
+			expect(applied.success).to.be.false;
+			expect(applied.error).to.include('Collection not found');
 		});
 
 		it('should validate multiple collections in statements', async () => {
-			// Test that ActionsEngine can parse statements with multiple collections
+			// Pure translation of a multi-collection transaction: parse succeeds and both
+			// collections' actions are returned; a missing collection surfaces on apply.
 			const collections: CollectionActions[] = [
 				{
 					collectionId: 'users',
@@ -202,11 +233,16 @@ describe('Transaction', () => {
 				id: await createTransactionId(stamp.id, statements, [])
 			};
 
+			// Pure translation succeeds and returns actions for BOTH collections.
 			const result = await engine.execute(transaction);
+			expect(result.success).to.be.true;
+			expect(result.actions).to.have.lengthOf(2);
+			expect(result.actions!.map(a => a.collectionId)).to.deep.equal(['users', 'posts']);
 
-			// Execution fails because no collections are registered
-			expect(result.success).to.be.false;
-			expect(result.error).to.include('Collection not found');
+			// Applying surfaces the unregistered collection.
+			const applied = await coordinator.execute(transaction, engine);
+			expect(applied.success).to.be.false;
+			expect(applied.error).to.include('Collection not found');
 		});
 
 		it('should fail execution for invalid JSON statements', async () => {
@@ -258,7 +294,7 @@ describe('Transaction', () => {
 				transactor,
 				collections
 			);
-			const actionsEngine = new ActionsEngine(coordinator);
+			const actionsEngine = new ActionsEngine();
 
 			// Create transaction with actions
 			const collectionActions: CollectionActions[] = [
@@ -294,7 +330,7 @@ describe('Transaction', () => {
 			};
 
 			// Execute transaction through engine
-			const result = await actionsEngine.execute(transaction);
+			const result = await applyViaEngine(coordinator, actionsEngine, transaction);
 
 			// Verify execution succeeded
 			expect(result.success).to.be.true;
@@ -342,7 +378,7 @@ describe('Transaction', () => {
 				transactor,
 				collections
 			);
-			const actionsEngine = new ActionsEngine(coordinator);
+			const actionsEngine = new ActionsEngine();
 
 			// Create transaction that affects BOTH collections
 			const collectionActions: CollectionActions[] = [
@@ -378,7 +414,7 @@ describe('Transaction', () => {
 			};
 
 			// Execute transaction through engine
-			const result = await actionsEngine.execute(transaction);
+			const result = await applyViaEngine(coordinator, actionsEngine, transaction);
 
 			// Verify execution succeeded
 			expect(result.success).to.be.true;
@@ -433,7 +469,7 @@ describe('Transaction', () => {
 				transactor,
 				collections
 			);
-			const actionsEngine = new ActionsEngine(coordinator);
+			const actionsEngine = new ActionsEngine();
 
 			// Create transaction that affects BOTH collections
 			const collectionActions: CollectionActions[] = [
@@ -509,7 +545,7 @@ describe('Transaction', () => {
 				transactor,
 				collections
 			);
-			const actionsEngine = new ActionsEngine(coordinator);
+			const actionsEngine = new ActionsEngine();
 
 			// Create transaction that affects ONLY one collection
 			const collectionActions: CollectionActions[] = [
@@ -582,7 +618,7 @@ describe('Transaction', () => {
 				transactor,
 				collections
 			);
-			const actionsEngine = new ActionsEngine(coordinator);
+			const actionsEngine = new ActionsEngine();
 
 			// Create transaction that affects BOTH collections
 			const collectionActions: CollectionActions[] = [
@@ -660,7 +696,7 @@ describe('Transaction', () => {
 			collections.set('orders', ordersCollection);
 
 			const coordinator = new TransactionCoordinator(transactor, collections);
-			const actionsEngine = new ActionsEngine(coordinator);
+			const actionsEngine = new ActionsEngine();
 
 			// Create transaction that deducts from Alice and creates an order
 			const collectionActions: CollectionActions[] = [
@@ -689,7 +725,7 @@ describe('Transaction', () => {
 				id: await createTransactionId(stamp.id, statements, [])
 			};
 
-			const result = await actionsEngine.execute(transaction);
+			const result = await applyViaEngine(coordinator, actionsEngine, transaction);
 			expect(result.success).to.be.true;
 
 			// Verify both collections updated atomically
@@ -736,7 +772,7 @@ describe('Transaction', () => {
 			collections.set('comments', commentsCollection);
 
 			const coordinator = new TransactionCoordinator(transactor, collections);
-			const actionsEngine = new ActionsEngine(coordinator);
+			const actionsEngine = new ActionsEngine();
 
 			// Create user, post, and comment all in one transaction
 			const collectionActions: CollectionActions[] = [
@@ -824,7 +860,7 @@ describe('Transaction', () => {
 			collections.set('posts', postsCollection);
 
 			const coordinator = new TransactionCoordinator(transactor, collections);
-			const actionsEngine = new ActionsEngine(coordinator);
+			const actionsEngine = new ActionsEngine();
 
 			const collectionActions: CollectionActions[] = [
 				{
@@ -905,7 +941,7 @@ describe('Transaction', () => {
 			collections.set('posts', postsCollection);
 
 			const coordinator = new TransactionCoordinator(transactor, collections);
-			const actionsEngine = new ActionsEngine(coordinator);
+			const actionsEngine = new ActionsEngine();
 
 			const collectionActions: CollectionActions[] = [
 				{
@@ -955,7 +991,7 @@ describe('Transaction', () => {
 			collections.set('users', usersCollection);
 
 			const coordinator = new TransactionCoordinator(transactor, collections);
-			const actionsEngine = new ActionsEngine(coordinator);
+			const actionsEngine = new ActionsEngine();
 
 			const collectionActions: CollectionActions[] = [
 				{
@@ -977,7 +1013,9 @@ describe('Transaction', () => {
 				id: await createTransactionId(stamp.id, statements, [])
 			};
 
-			const result = await actionsEngine.execute(transaction);
+			// Engines are pure translators: parsing succeeds, but the missing collection
+			// surfaces when the actions are APPLIED — here, through coordinator.execute.
+			const result = await coordinator.execute(transaction, actionsEngine);
 			expect(result.success).to.be.false;
 			expect(result.error).to.include('Collection not found: posts');
 		});
@@ -998,7 +1036,7 @@ describe('Transaction', () => {
 			collections.set('users', usersCollection);
 
 			const coordinator = new TransactionCoordinator(transactor, collections);
-			const actionsEngine = new ActionsEngine(coordinator);
+			const actionsEngine = new ActionsEngine();
 
 			// Empty transaction with no actions
 			const statements = createActionsStatements([]);
@@ -1078,7 +1116,7 @@ describe('Transaction', () => {
 			collections.set('posts', postsCollection);
 
 			const coordinator = new TransactionCoordinator(transactor, collections);
-			const actionsEngine = new ActionsEngine(coordinator);
+			const actionsEngine = new ActionsEngine();
 
 			// Clear phase log before our transaction
 			phaseLog.length = 0;
@@ -1150,7 +1188,7 @@ describe('Transaction', () => {
 			collections.set('users', usersCollection);
 
 			const coordinator = new TransactionCoordinator(transactor, collections);
-			const actionsEngine = new ActionsEngine(coordinator);
+			const actionsEngine = new ActionsEngine();
 
 			// Create transaction
 			const collectionActions: CollectionActions[] = [
@@ -1243,7 +1281,7 @@ describe('Transaction', () => {
 			collections.set('users', usersCollection);
 
 			const coordinator = new TransactionCoordinator(transactor, collections);
-			const actionsEngine = new ActionsEngine(coordinator);
+			const actionsEngine = new ActionsEngine();
 
 			// Engine has DIFFERENT schema hash than transaction
 			const engines = new Map<string, EngineRegistration>();
@@ -1285,7 +1323,7 @@ describe('Transaction', () => {
 			collections.set('users', usersCollection);
 
 			const coordinator = new TransactionCoordinator(transactor, collections);
-			const actionsEngine = new ActionsEngine(coordinator);
+			const actionsEngine = new ActionsEngine();
 
 			// Build a transaction through a session over the ActionsEngine.
 			const session = await TransactionSession.create(coordinator, actionsEngine);
@@ -1340,7 +1378,7 @@ describe('Transaction', () => {
 			collections.set('users', usersCollection);
 
 			const coordinator = new TransactionCoordinator(transactor, collections);
-			const actionsEngine = new ActionsEngine(coordinator);
+			const actionsEngine = new ActionsEngine();
 			const session = await TransactionSession.create(coordinator, actionsEngine);
 
 			await session.execute(
@@ -1379,7 +1417,7 @@ describe('Transaction', () => {
 			collections.set('posts', postsCollection);
 
 			const coordinator = new TransactionCoordinator(transactor, collections);
-			const actionsEngine = new ActionsEngine(coordinator);
+			const actionsEngine = new ActionsEngine();
 			const session = await TransactionSession.create(coordinator, actionsEngine);
 
 			await session.execute('stmt1', [
@@ -1413,7 +1451,7 @@ describe('Transaction', () => {
 			collections.set('users', usersCollection);
 
 			const coordinator = new TransactionCoordinator(transactor, collections);
-			const actionsEngine = new ActionsEngine(coordinator);
+			const actionsEngine = new ActionsEngine();
 			const session = await TransactionSession.create(coordinator, actionsEngine);
 
 			await session.execute('stmt1', [
@@ -1442,7 +1480,7 @@ describe('Transaction', () => {
 			collections.set('users', usersCollection);
 
 			const coordinator = new TransactionCoordinator(transactor, collections);
-			const actionsEngine = new ActionsEngine(coordinator);
+			const actionsEngine = new ActionsEngine();
 			const session = await TransactionSession.create(coordinator, actionsEngine);
 
 			await session.execute('stmt1', [
@@ -1472,7 +1510,7 @@ describe('Transaction', () => {
 			collections.set('users', usersCollection);
 
 			const coordinator = new TransactionCoordinator(transactor, collections);
-			const actionsEngine = new ActionsEngine(coordinator);
+			const actionsEngine = new ActionsEngine();
 			const session = await TransactionSession.create(coordinator, actionsEngine);
 
 			await session.rollback();
@@ -1497,7 +1535,7 @@ describe('Transaction', () => {
 			collections.set('users', usersCollection);
 
 			const coordinator = new TransactionCoordinator(transactor, collections);
-			const actionsEngine = new ActionsEngine(coordinator);
+			const actionsEngine = new ActionsEngine();
 			const session = await TransactionSession.create(coordinator, actionsEngine);
 
 			expect(session.isCommitted()).to.be.false;
@@ -1529,7 +1567,7 @@ describe('Transaction', () => {
 			const collections = new Map();
 			collections.set('users', usersCollection);
 			const coordinator = new TransactionCoordinator(transactor, collections);
-			const actionsEngine = new ActionsEngine(coordinator);
+			const actionsEngine = new ActionsEngine();
 			const session = await TransactionSession.create(coordinator, actionsEngine);
 			return { coordinator, session };
 		};
@@ -1592,6 +1630,94 @@ describe('Transaction', () => {
 		});
 	});
 
+	describe('Engine side-effect-free translation (txn-engine-side-effect-free)', () => {
+		it('applies a statement exactly once on the engine-translation path', async () => {
+			// The session's "no pre-supplied actions" branch lets the engine translate the
+			// statement, then applies the returned actions. Pre-fix the engine ALSO applied
+			// as a side effect, so this path applied twice. Spy on applyActions to pin the
+			// apply-count at exactly one.
+			const transactor = new TestTransactor();
+			type UserEntry = { key: number; name: string };
+			const usersTree = await Tree.createOrOpen<number, UserEntry>(
+				transactor, 'users', entry => entry.key
+			);
+			const usersCollection = (usersTree as unknown as { collection: unknown }).collection;
+			const collections = new Map();
+			collections.set('users', usersCollection);
+			const coordinator = new TransactionCoordinator(transactor, collections);
+			const engine = new ActionsEngine();
+			const session = await TransactionSession.create(coordinator, engine);
+
+			let applyCalls = 0;
+			const realApply = coordinator.applyActions.bind(coordinator);
+			coordinator.applyActions = async (a, id) => { applyCalls++; return realApply(a, id); };
+
+			// NOTE: no `actions` arg → engine translates. This is the untested branch.
+			const stmt = JSON.stringify({
+				collectionId: 'users',
+				actions: [{ type: 'replace', data: [[1, { key: 1, name: 'Alice' }]] }],
+			});
+			const res = await session.execute(stmt);
+
+			expect(res.success).to.be.true;
+			expect(applyCalls, 'engine-translation path double-applied').to.equal(1); // pre-fix: 2
+
+			// The row landed exactly once with the correct value.
+			expect(await usersTree.get(1)).to.deep.equal({ key: 1, name: 'Alice' });
+		});
+
+		it('validate() re-execution does not leak into the main coordinator state', async () => {
+			// The registered engine was constructed against the MAIN coordinator's world.
+			// Pre-fix, re-executing it during validation applied to the main collection's
+			// tracker — a leak. As a pure translator it cannot mutate anything, so the main
+			// coordinator's transforms must be byte-identical before and after validate().
+			const transactor = new TestTransactor();
+			type UserEntry = { key: number; name: string };
+			const usersTree = await Tree.createOrOpen<number, UserEntry>(
+				transactor, 'users', entry => entry.key
+			);
+			const usersCollection = (usersTree as unknown as { collection: { tracker: { transforms: unknown } } }).collection;
+			const collections = new Map();
+			collections.set('users', usersCollection);
+			const coordinator = new TransactionCoordinator(transactor, collections);
+			const engine = new ActionsEngine();
+
+			const collectionActions: CollectionActions[] = [
+				{ collectionId: 'users', actions: [{ type: 'replace', data: [[1, { key: 1, name: 'Alice' }]] }] }
+			];
+			const statements = createActionsStatements(collectionActions);
+			const stamp = await createTransactionStamp('peer1', Date.now(), 'schema1', ACTIONS_ENGINE_ID);
+			const transaction: Transaction = {
+				stamp, statements, reads: [],
+				id: await createTransactionId(stamp.id, statements, [])
+			};
+
+			// Register the same engine the node already holds (bound to the main coordinator).
+			const engines = new Map<string, EngineRegistration>();
+			engines.set(ACTIONS_ENGINE_ID, { engine, getSchemaHash: async () => 'schema1' });
+			const validationTransforms = new Map<string, Transforms>();
+			const createValidationCoordinator: ValidationCoordinatorFactory = () => ({
+				applyActions: async (acts) => {
+					for (const { collectionId } of acts) {
+						validationTransforms.set(collectionId, { inserts: {}, updates: {}, deletes: [] });
+					}
+				},
+				getTransforms: () => validationTransforms,
+				dispose: () => validationTransforms.clear()
+			});
+			const validator = new TransactionValidator(engines, createValidationCoordinator);
+
+			// Snapshot main coordinator collection state before validation.
+			const before = JSON.parse(JSON.stringify(usersCollection.tracker.transforms));
+
+			// Hash need not match — we only assert that re-execution left main state untouched.
+			await validator.validate(transaction, 'ops:whatever');
+
+			const after = JSON.parse(JSON.stringify(usersCollection.tracker.transforms));
+			expect(after, 'validate() must not mutate the main coordinator state').to.deep.equal(before);
+		});
+	});
+
 	describe('Multi-Collection Transaction Conflicts (TEST-2.1.2)', () => {
 		it('should detect pend conflicts from concurrent transactions on same blocks', async () => {
 			const transactor = new TestTransactor();
@@ -1606,7 +1732,7 @@ describe('Transaction', () => {
 			collections.set('users', usersCollection);
 
 			const coordinator = new TransactionCoordinator(transactor, collections);
-			const actionsEngine = new ActionsEngine(coordinator);
+			const actionsEngine = new ActionsEngine();
 
 			// First transaction: insert user
 			const actions1: CollectionActions[] = [
@@ -1634,7 +1760,7 @@ describe('Transaction', () => {
 			};
 
 			// tx2 should encounter the transforms from tx1's committed state
-			const result2 = await actionsEngine.execute(tx2);
+			const result2 = await applyViaEngine(coordinator, actionsEngine, tx2);
 			// The execute itself succeeds (local apply), but the data reflects the second write
 			expect(result2.success).to.be.true;
 		});
@@ -1659,7 +1785,7 @@ describe('Transaction', () => {
 			collections.set('posts', postsCollection);
 
 			const coordinator = new TransactionCoordinator(transactor, collections);
-			const actionsEngine = new ActionsEngine(coordinator);
+			const actionsEngine = new ActionsEngine();
 
 			// Snapshot posts transforms before execution (includes creation transforms)
 			const postsTransformsBefore = JSON.parse(JSON.stringify(
@@ -1677,7 +1803,7 @@ describe('Transaction', () => {
 				id: await createTransactionId(userStamp.id, userStatements, [])
 			};
 
-			await actionsEngine.execute(userTx);
+			await applyViaEngine(coordinator, actionsEngine, userTx);
 
 			// Posts transforms should be unchanged (user transaction shouldn't affect posts)
 			const postsTransformsAfter = JSON.parse(JSON.stringify(
@@ -1701,7 +1827,7 @@ describe('Transaction', () => {
 			collections.set('users', usersCollection);
 
 			const coordinator = new TransactionCoordinator(transactor, collections);
-			const actionsEngine = new ActionsEngine(coordinator);
+			const actionsEngine = new ActionsEngine();
 
 			const actions: CollectionActions[] = [
 				{ collectionId: 'users', actions: [{ type: 'replace', data: [[1, { key: 1, name: 'Alice' }]] }] }
@@ -1714,7 +1840,7 @@ describe('Transaction', () => {
 			};
 
 			// Execute locally first (this succeeds)
-			await actionsEngine.execute(tx);
+			await applyViaEngine(coordinator, actionsEngine, tx);
 
 			// Make transactor unavailable before commit
 			transactor.setAvailable(false);
@@ -1750,7 +1876,7 @@ describe('Transaction', () => {
 			collections.set('users', usersCollection);
 
 			const coordinator = new TransactionCoordinator(transactor, collections);
-			const actionsEngine = new ActionsEngine(coordinator);
+			const actionsEngine = new ActionsEngine();
 
 			const actions: CollectionActions[] = [
 				{ collectionId: 'users', actions: [{ type: 'replace', data: [[1, { key: 1, name: 'Alice' }]] }] }
@@ -1762,7 +1888,7 @@ describe('Transaction', () => {
 				id: await createTransactionId(stamp.id, statements, [])
 			};
 
-			await actionsEngine.execute(tx);
+			await applyViaEngine(coordinator, actionsEngine, tx);
 
 			try {
 				await coordinator.commit(tx);
@@ -1798,7 +1924,7 @@ describe('Transaction', () => {
 			collections.set('posts', postsCollection);
 
 			const coordinator = new TransactionCoordinator(transactor, collections);
-			const actionsEngine = new ActionsEngine(coordinator);
+			const actionsEngine = new ActionsEngine();
 
 			const actions: CollectionActions[] = [
 				{ collectionId: 'users', actions: [{ type: 'replace', data: [[1, { key: 1, name: 'Alice' }]] }] },
@@ -1811,7 +1937,7 @@ describe('Transaction', () => {
 				id: await createTransactionId(stamp.id, statements, [])
 			};
 
-			await actionsEngine.execute(tx);
+			await applyViaEngine(coordinator, actionsEngine, tx);
 
 			try {
 				await coordinator.commit(tx);
@@ -1865,7 +1991,7 @@ describe('Transaction', () => {
 			collections.set('posts', postsCollection);
 
 			const coordinator = new TransactionCoordinator(transactor, collections);
-			const actionsEngine = new ActionsEngine(coordinator);
+			const actionsEngine = new ActionsEngine();
 
 			const actions: CollectionActions[] = [
 				{ collectionId: 'users', actions: [{ type: 'replace', data: [[1, { key: 1, name: 'Alice' }]] }] },
@@ -1878,7 +2004,7 @@ describe('Transaction', () => {
 				id: await createTransactionId(stamp.id, statements, [])
 			};
 
-			await actionsEngine.execute(tx);
+			await applyViaEngine(coordinator, actionsEngine, tx);
 
 			try {
 				await coordinator.commit(tx);
@@ -1923,7 +2049,7 @@ describe('Transaction', () => {
 			collections.set('posts', postsCollection);
 
 			const coordinator = new TransactionCoordinator(transactor, collections);
-			const actionsEngine = new ActionsEngine(coordinator);
+			const actionsEngine = new ActionsEngine();
 
 			const actions: CollectionActions[] = [
 				{ collectionId: 'users', actions: [{ type: 'replace', data: [[1, { key: 1, name: 'Alice' }]] }] },
@@ -1936,7 +2062,7 @@ describe('Transaction', () => {
 				id: await createTransactionId(stamp.id, statements, [])
 			};
 
-			await actionsEngine.execute(tx);
+			await applyViaEngine(coordinator, actionsEngine, tx);
 
 			try {
 				await coordinator.commit(tx);
@@ -1988,7 +2114,7 @@ describe('Transaction', () => {
 			collections.set('posts', postsCollection);
 
 			const coordinator = new TransactionCoordinator(transactor, collections);
-			const actionsEngine = new ActionsEngine(coordinator);
+			const actionsEngine = new ActionsEngine();
 
 			const actions: CollectionActions[] = [
 				{ collectionId: 'users', actions: [{ type: 'replace', data: [[1, { key: 1, name: 'Alice' }]] }] },
@@ -2001,7 +2127,7 @@ describe('Transaction', () => {
 				id: await createTransactionId(stamp.id, statements, [])
 			};
 
-			await actionsEngine.execute(tx);
+			await applyViaEngine(coordinator, actionsEngine, tx);
 
 			// Cancel phase throws, which should propagate as an error
 			try {
@@ -2051,8 +2177,8 @@ describe('Transaction', () => {
 
 			const coordinator1 = new TransactionCoordinator(transactor1, collections1);
 			const coordinator2 = new TransactionCoordinator(transactor2, collections2);
-			const engine1 = new ActionsEngine(coordinator1);
-			const engine2 = new ActionsEngine(coordinator2);
+			const engine1 = new ActionsEngine();
+			const engine2 = new ActionsEngine();
 
 			const actions: CollectionActions[] = [
 				{ collectionId: 'users', actions: [{ type: 'replace', data: [[1, { key: 1, value: 'Alice' }]] }] },
@@ -2095,7 +2221,7 @@ describe('Transaction', () => {
 			collections.set('posts', (postsTree as unknown as { collection: unknown }).collection);
 
 			const coordinator = new TransactionCoordinator(transactor, collections);
-			const actionsEngine = new ActionsEngine(coordinator);
+			const actionsEngine = new ActionsEngine();
 
 			const actions: CollectionActions[] = [
 				{ collectionId: 'users', actions: [{ type: 'replace', data: [[1, { key: 1, value: 'Alice' }]] }] },
@@ -2151,7 +2277,7 @@ describe('Transaction', () => {
 			collections.set('posts', (postsTree as unknown as { collection: unknown }).collection);
 
 			const coordinator = new TransactionCoordinator(transactor, collections);
-			const actionsEngine = new ActionsEngine(coordinator);
+			const actionsEngine = new ActionsEngine();
 
 			const actions: CollectionActions[] = [
 				{ collectionId: 'users', actions: [{ type: 'replace', data: [[1, { key: 1, value: 'Alice' }]] }] },
@@ -2454,7 +2580,7 @@ describe('Transaction', () => {
 
 			const engines = new Map<string, EngineRegistration>();
 			engines.set('actions@1.0.0', {
-				engine: new ActionsEngine({} as any),
+				engine: new ActionsEngine(),
 				getSchemaHash: async () => 'schema1'
 			});
 			const validator = new TransactionValidator(
@@ -2504,7 +2630,7 @@ describe('Transaction', () => {
 
 			const engines = new Map<string, EngineRegistration>();
 			engines.set('actions@1.0.0', {
-				engine: new ActionsEngine({} as any),
+				engine: new ActionsEngine(),
 				getSchemaHash: async () => 'schema1'
 			});
 			const validator = new TransactionValidator(
@@ -2554,7 +2680,7 @@ describe('Transaction', () => {
 
 			const engines = new Map<string, EngineRegistration>();
 			engines.set('actions@1.0.0', {
-				engine: new ActionsEngine({} as any),
+				engine: new ActionsEngine(),
 				getSchemaHash: async () => 'schema1'
 			});
 			const validator = new TransactionValidator(
@@ -2580,7 +2706,7 @@ describe('Transaction', () => {
 		it('should pass validation when transaction has no reads (backward compatible)', async () => {
 			const engines = new Map<string, EngineRegistration>();
 			engines.set('actions@1.0.0', {
-				engine: new ActionsEngine({} as any),
+				engine: new ActionsEngine(),
 				getSchemaHash: async () => 'schema1'
 			});
 
@@ -2666,7 +2792,7 @@ describe('Transaction', () => {
 			collections.set('users', (usersTree as unknown as { collection: unknown }).collection);
 			collections.set('posts', (postsTree as unknown as { collection: unknown }).collection);
 			const coordinator = new TransactionCoordinator(transactor, collections);
-			const actionsEngine = new ActionsEngine(coordinator);
+			const actionsEngine = new ActionsEngine();
 
 			const actions: CollectionActions[] = [
 				{ collectionId: 'users', actions: [{ type: 'replace', data: [[1, { key: 1, name: 'Alice' }]] }] },
@@ -2679,7 +2805,7 @@ describe('Transaction', () => {
 				id: await createTransactionId(stamp.id, statements, [])
 			};
 
-			await actionsEngine.execute(tx);
+			await applyViaEngine(coordinator, actionsEngine, tx);
 
 			try {
 				await coordinator.commit(tx);
@@ -2725,7 +2851,7 @@ describe('Transaction', () => {
 			collections.set('users', (usersTree as unknown as { collection: unknown }).collection);
 			collections.set('posts', (postsTree as unknown as { collection: unknown }).collection);
 			const coordinator = new TransactionCoordinator(transactor, collections);
-			const actionsEngine = new ActionsEngine(coordinator);
+			const actionsEngine = new ActionsEngine();
 
 			const actions: CollectionActions[] = [
 				{ collectionId: 'users', actions: [{ type: 'replace', data: [[1, { key: 1, name: 'Alice' }]] }] },
@@ -2738,7 +2864,7 @@ describe('Transaction', () => {
 				id: await createTransactionId(stamp.id, statements, [])
 			};
 
-			await actionsEngine.execute(tx);
+			await applyViaEngine(coordinator, actionsEngine, tx);
 
 			try {
 				await coordinator.commit(tx);
@@ -2794,7 +2920,7 @@ describe('Transaction', () => {
 			collections.set('users', (usersTree as unknown as { collection: unknown }).collection);
 			collections.set('posts', (postsTree as unknown as { collection: unknown }).collection);
 			const coordinator = new TransactionCoordinator(transactor, collections);
-			const actionsEngine = new ActionsEngine(coordinator);
+			const actionsEngine = new ActionsEngine();
 
 			const actions: CollectionActions[] = [
 				{ collectionId: 'users', actions: [{ type: 'replace', data: [[1, { key: 1, name: 'Alice' }]] }] },
@@ -2807,7 +2933,7 @@ describe('Transaction', () => {
 				id: await createTransactionId(stamp.id, statements, [])
 			};
 
-			await actionsEngine.execute(tx);
+			await applyViaEngine(coordinator, actionsEngine, tx);
 			await coordinator.commit(tx);
 
 			// Transaction committed (both collections share one actionId, so committed.size === 1)
@@ -2840,7 +2966,7 @@ describe('Transaction', () => {
 			collections.set('users', usersCollection);
 
 			const coordinator = new TransactionCoordinator(transactor, collections);
-			const actionsEngine = new ActionsEngine(coordinator);
+			const actionsEngine = new ActionsEngine();
 
 			const actions1: CollectionActions[] = [
 				{ collectionId: 'users', actions: [{ type: 'replace', data: [[1, { key: 1, name: 'Alice' }]] }] }
@@ -2874,7 +3000,7 @@ describe('Transaction', () => {
 			collections.set('users', usersCollection);
 
 			const coordinator = new TransactionCoordinator(transactor, collections);
-			const actionsEngine = new ActionsEngine(coordinator);
+			const actionsEngine = new ActionsEngine();
 
 			const actions1: CollectionActions[] = [
 				{ collectionId: 'users', actions: [{ type: 'replace', data: [[1, { key: 1, name: 'Alice' }]] }] }
@@ -2911,7 +3037,7 @@ describe('Transaction', () => {
 			collections.set('users', usersCollection);
 
 			const coordinator = new TransactionCoordinator(transactor, collections);
-			const actionsEngine = new ActionsEngine(coordinator);
+			const actionsEngine = new ActionsEngine();
 
 			// tx1: insert Alice
 			const actions1: CollectionActions[] = [
@@ -2956,7 +3082,7 @@ describe('Transaction', () => {
 			collections.set('users', usersCollection);
 
 			const coordinator = new TransactionCoordinator(transactor, collections);
-			const actionsEngine = new ActionsEngine(coordinator);
+			const actionsEngine = new ActionsEngine();
 			const session = await TransactionSession.create(coordinator, actionsEngine, 'peer1', 'schema1');
 
 			const actions1: CollectionActions[] = [
@@ -2990,7 +3116,7 @@ describe('Transaction', () => {
 			collections.set('users', usersCollection);
 
 			const coordinator = new TransactionCoordinator(transactor, collections);
-			const actionsEngine = new ActionsEngine(coordinator);
+			const actionsEngine = new ActionsEngine();
 			const session = await TransactionSession.create(coordinator, actionsEngine, 'peer1', 'schema1');
 
 			const actions1: CollectionActions[] = [
@@ -3020,7 +3146,7 @@ describe('Transaction', () => {
 			collections.set('users', usersCollection);
 
 			const coordinator = new TransactionCoordinator(transactor, collections);
-			const actionsEngine = new ActionsEngine(coordinator);
+			const actionsEngine = new ActionsEngine();
 
 			// Session 1: insert Alice via session path
 			const session1 = await TransactionSession.create(coordinator, actionsEngine, 'peer1', 'schema1');
@@ -3062,7 +3188,7 @@ describe('Transaction', () => {
 			collections.set('users', usersCollection);
 
 			const coordinator = new TransactionCoordinator(transactor, collections);
-			const actionsEngine = new ActionsEngine(coordinator);
+			const actionsEngine = new ActionsEngine();
 
 			// Session 1: apply actions
 			const session1 = await TransactionSession.create(coordinator, actionsEngine, 'peer1', 'schema1');
@@ -3114,7 +3240,7 @@ describe('Transaction', () => {
 			collections.set('users', usersCollection);
 
 			const coordinator = new TransactionCoordinator(transactor, collections);
-			const actionsEngine = new ActionsEngine(coordinator);
+			const actionsEngine = new ActionsEngine();
 
 			// Session 1 created first (order=0)
 			const session1 = await TransactionSession.create(coordinator, actionsEngine, 'peer1', 'schema1');
@@ -3306,7 +3432,7 @@ describe('Transaction', () => {
 
 			const engines = new Map<string, EngineRegistration>();
 			engines.set('actions@1.0.0', {
-				engine: new ActionsEngine({} as any),
+				engine: new ActionsEngine(),
 				getSchemaHash: async () => 'schema1'
 			});
 
@@ -3328,7 +3454,7 @@ describe('Transaction', () => {
 			const usersCollection = (tree as unknown as { collection: unknown }).collection;
 			const collections = new Map<string, any>([['data', usersCollection]]);
 			const coordinator = new TransactionCoordinator(transactor, collections);
-			const engine = new ActionsEngine(coordinator);
+			const engine = new ActionsEngine();
 
 			// Create session with a very short TTL (1ms) so it expires immediately
 			const session = await TransactionSession.create(coordinator, engine, 'peer1', 'schema1', 1);
@@ -3356,7 +3482,7 @@ describe('Transaction', () => {
 			const collections = new Map<string, any>([['users', usersCollection]]);
 
 			const coordinator = new TransactionCoordinator(flaky, collections);
-			const engine = new ActionsEngine(coordinator);
+			const engine = new ActionsEngine();
 			const session = await TransactionSession.create(coordinator, engine, 'peer1', 'schema1');
 
 			const actions: CollectionActions[] = [
@@ -3454,7 +3580,7 @@ describe('Transaction', () => {
 			const collections = new Map<string, any>([['users', usersCollection], ['posts', postsCollection]]);
 
 			const coordinator = new TransactionCoordinator(flaky, collections);
-			const engine = new ActionsEngine(coordinator);
+			const engine = new ActionsEngine();
 			const session = await TransactionSession.create(coordinator, engine, 'peer1', 'schema1');
 
 			const actions: CollectionActions[] = [
@@ -3549,7 +3675,7 @@ describe('Transaction', () => {
 			const collections = new Map<string, any>([['users', usersCollection], ['posts', postsCollection]]);
 
 			const coordinator = new TransactionCoordinator(transactor, collections);
-			const engine = new ActionsEngine(coordinator);
+			const engine = new ActionsEngine();
 			const session = await TransactionSession.create(coordinator, engine, 'peer1', 'schema1');
 
 			const actions: CollectionActions[] = [
@@ -3607,7 +3733,7 @@ describe('Transaction', () => {
 			const collections = new Map<string, any>([['users', usersCollection], ['posts', postsCollection]]);
 
 			const coordinator = new TransactionCoordinator(flaky, collections);
-			const engine = new ActionsEngine(coordinator);
+			const engine = new ActionsEngine();
 			const session = await TransactionSession.create(coordinator, engine, 'peer1', 'schema1');
 
 			const actions: CollectionActions[] = [

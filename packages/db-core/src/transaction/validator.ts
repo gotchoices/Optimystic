@@ -93,7 +93,13 @@ export class TransactionValidator implements ITransactionValidator {
 		const validationCoordinator = this.createValidationCoordinator();
 
 		try {
-			// 5. Re-execute transaction through engine
+			// 5. Re-execute transaction through engine.
+			//
+			// Engines are pure translators (see ITransactionEngine contract): execute()
+			// only parses statements into actions and CANNOT mutate any coordinator's
+			// state. So even though the registered engine may have been constructed with
+			// the MAIN coordinator, re-executing here does NOT leak into main state — the
+			// only application happens on the isolated validationCoordinator below.
 			const result = await registration.engine.execute(transaction);
 			if (!result.success) {
 				return {
@@ -102,7 +108,8 @@ export class TransactionValidator implements ITransactionValidator {
 				};
 			}
 
-			// 6. Apply actions to validation coordinator (builds transforms)
+			// 6. Apply actions to the isolated validation coordinator (builds transforms).
+			// This is the sole application; the engine did not apply anything.
 			if (result.actions && result.actions.length > 0) {
 				await validationCoordinator.applyActions(result.actions, stamp.id);
 			}

@@ -118,6 +118,27 @@ export async function createTransactionId(
  * 1. Parsing the engine-specific statements
  * 2. Executing/re-executing to produce actions
  * 3. Returning the resulting actions per collection
+ *
+ * CONTRACT — an engine must never cause the same action to be applied twice. The
+ * caller (a {@link TransactionSession} on the no-pre-supplied-actions branch, or a
+ * {@link TransactionCoordinator} in `execute()`) applies whatever non-empty
+ * `CollectionActions[]` this method RETURNS. Therefore `execute()` must satisfy
+ * exactly ONE of:
+ *
+ *   (a) PURE TRANSLATOR (preferred; how {@link ActionsEngine} works) — parse the
+ *       statements, RETURN the actions, and do NOT apply them / do NOT call
+ *       `coordinator.applyActions` / do NOT mutate any collection state. The caller
+ *       applies them exactly once.
+ *
+ *   (b) SIDE-EFFECT APPLY — apply the actions itself while translating (e.g. the
+ *       Quereus vtab path stages rows into the coordinator during `db.exec`) and then
+ *       RETURN an EMPTY actions array, so the caller re-applies nothing.
+ *
+ * An engine that BOTH applies as a side effect AND returns those same actions
+ * double-applies (the caller re-applies the returned actions). Additionally, a
+ * side-effecting engine used for validation must apply only to the validator's
+ * ISOLATED coordinator — applying to the main coordinator leaks into the validating
+ * node's live state.
  */
 export interface ITransactionEngine {
 	/**

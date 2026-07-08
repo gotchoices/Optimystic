@@ -167,7 +167,7 @@ import {
 } from '@optimystic/db-core';
 
 const coordinator = new TransactionCoordinator(transactor, collectionsById);
-const engine = new ActionsEngine(coordinator);
+const engine = new ActionsEngine(); // engines are pure translators — no coordinator needed
 const session = await TransactionSession.create(coordinator, engine);
 
 // Apply actions through the engine — each batch updates its collection's local snapshot
