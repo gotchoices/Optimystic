@@ -17,6 +17,7 @@ import {
 } from '@optimystic/db-p2p';
 import { NetworkTransactor } from '@optimystic/db-core';
 import { waitForValue, delay } from '@optimystic/db-core/test';
+import { queryAll, queryGet } from './query-helpers.js';
 import register from '../dist/plugin.js';
 
 interface TestNode {
@@ -25,28 +26,6 @@ interface TestNode {
 	storageRepo: StorageRepo;
 	transactor: NetworkTransactor;
 	peerId: string;
-}
-
-/** Collect every row `sql` returns from a node's database, finalizing the statement. */
-async function queryAll(db: Database, sql: string): Promise<Record<string, any>[]> {
-	const stmt = await db.prepare(sql);
-	try {
-		const rows: Record<string, any>[] = [];
-		for await (const row of stmt.all()) rows.push(row);
-		return rows;
-	} finally {
-		await stmt.finalize();
-	}
-}
-
-/** Run `sql` and return its single row, or `undefined` when no row matches (not ready yet). */
-async function queryGet(db: Database, sql: string): Promise<Record<string, any> | undefined> {
-	const stmt = await db.prepare(sql);
-	try {
-		return await stmt.get();
-	} finally {
-		await stmt.finalize();
-	}
 }
 
 describe('Distributed Quereus Operations', function () {
