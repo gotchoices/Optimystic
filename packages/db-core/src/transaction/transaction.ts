@@ -145,6 +145,16 @@ export type ExecutionResult = {
 	results?: Map<CollectionId, any[]>;
 	/** Error message if execution failed */
 	error?: string;
+	/**
+	 * On a PARTIAL multi-collection commit failure, the collections that DID durably
+	 * commit through consensus before the failure (and thus CANNOT be rolled back —
+	 * reconciliation is required). Absent/empty means nothing durably committed, so
+	 * the caller may treat the failure as a clean abort. See
+	 * {@link CoordinatorPartialCommitError} for the session-mode (commit) analog.
+	 */
+	committedCollections?: CollectionId[];
+	/** On a partial multi-collection commit failure, the collections that failed to commit. */
+	failedCollections?: CollectionId[];
 };
 
 /**

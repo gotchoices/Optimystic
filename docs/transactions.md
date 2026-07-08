@@ -41,6 +41,46 @@ This document describes the architecture for multi-collection transactions in Op
 > cases truly atomic and shrinking the residual window to the commit sweep only.
 > See the `feat-optimystic-legacy-commit-two-phase` backlog ticket.
 
+> ### ⚠️ Session-mode (distributed) commit is not atomic across collections either
+>
+> The consensus path narrows the split window but does not (yet) close it. The
+> COMMIT phase commits each collection's pended blocks **independently**
+> (`TransactionCoordinator.commitPhase`, fanned out per collection). Once PEND
+> succeeds for every collection the coordinator has "decided to commit", but a
+> per-collection commit can still fail *permanently* between PEND and COMMIT — most
+> commonly a **stale loss**: a racing transaction advanced that collection's log
+> tail, so our commit can never win. Meanwhile the other collections commit
+> successfully. Those durable commits are per-collection with no cross-collection
+> undo, so the ones that landed cannot be un-committed.
+>
+> **Honest-reporting contract.** When this happens `coordinator.commit()` throws a
+> [`CoordinatorPartialCommitError`](../packages/db-core/src/transaction/errors.ts)
+> naming `committedCollections` (durable — CANNOT be rolled back) vs.
+> `failedCollections` (never committed — local state reverted for retry). The
+> coordinator gives the committed collections the **success-path** local treatment
+> (fold to read cache + reset the tracker + drop pending) so local memory matches
+> cluster storage, and restores only the failed collections. It deliberately does
+> **not** uniformly roll back — doing so would re-stage the committed collections'
+> already-durable actions as still-pending, making memory disagree with storage.
+> `coordinator.execute()` mirrors this on its (non-retryable) path by surfacing
+> `committedCollections`/`failedCollections` on the `ExecutionResult`.
+>
+> The Quereus adapter (`txn-bridge.ts`) special-cases this exactly like the legacy
+> `PartialCommitError`: on a `CoordinatorPartialCommitError` it tears down
+> transaction state **without** calling `rollbackTransaction()` (a clean restore
+> would cement the divergence) and propagates the error so the caller can
+> reconcile. A genuinely clean session-mode failure (PEND failed, or the whole
+> commit failed with nothing durable) still rolls back cleanly and throws a plain
+> error, leaving every tracker pristine for retry.
+>
+> **Still open — real atomicity vs. honest downgrade.** This section documents the
+> *honest-reporting* surface only. Whether to close the window with real
+> cross-collection two-phase commit (a durable coordinator decision record / 2PC
+> journal + crash-mid-loop recovery) or to formally downgrade the guarantee to
+> "atomic intent, reconcile on partial" is an open design decision owned by the
+> `1.5-design-multi-collection-atomicity` ticket. `committedCollections` on the
+> failure is required either way, which is why it exists now.
+
 ## Secrets and the replicated statement record
 
 **Short answer:** passing a private key to `sign(data, key)` — as a literal or a bound

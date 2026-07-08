@@ -1,5 +1,5 @@
 import type { TransactionCoordinator, ITransactionEngine, Collection, CollectionId } from '@optimystic/db-core';
-import { TransactionSession } from '@optimystic/db-core';
+import { TransactionSession, CoordinatorPartialCommitError } from '@optimystic/db-core';
 import type { TransactionState, ParsedOptimysticOptions } from '../types.js';
 import { CollectionFactory } from './collection-factory.js';
 import { generateStampId } from '../util/generate-stamp-id.js';
@@ -343,8 +343,25 @@ export class TransactionBridge {
         // memory/storage divergence this error exists to prevent. Just propagate.
         throw error;
       }
-      // Nothing durably committed (session-mode commit, or a legacy failure on the
-      // FIRST tree): a clean snapshot-restore rollback is correct.
+      if (error instanceof CoordinatorPartialCommitError) {
+        // Session-mode analog of the legacy branch above: the coordinator's commit
+        // half-landed — some collections durably committed via consensus and CANNOT
+        // be rolled back. The coordinator ALREADY did the split local handling (folded
+        // the committed collections' trackers to cache + reset, restored the failed
+        // ones). Running rollbackTransaction here would clean-restore the committed
+        // collections' trackers too, cementing the memory/storage divergence and
+        // falsely reporting a rollback that did not happen. So tear down transaction
+        // state WITHOUT restoring, and propagate the structured signal for reconciliation.
+        this.currentTransaction!.collections.clear();
+        this.currentTransaction!.isActive = false;
+        this.accumulatedStatements = [];
+        this.session = null;
+        this.dirtyTrees.clear();
+        this.savepoints.clear();
+        throw error;
+      }
+      // Nothing durably committed (a clean session-mode commit failure, or a legacy
+      // failure on the FIRST tree): a clean snapshot-restore rollback is correct.
       await this.rollbackTransaction();
       throw error;
     }

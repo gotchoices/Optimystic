@@ -4,6 +4,7 @@ import type { PeerId } from "../network/types.js";
 import type { Collection } from "../collection/collection.js";
 import { isTransactionExpired } from "./transaction.js";
 import { Log, blockIdsForTransforms, hashString } from "../index.js";
+import { CoordinatorPartialCommitError } from "./errors.js";
 import { createLogger } from "../logger.js";
 
 const log = createLogger('trx:coordinator');
@@ -155,6 +156,12 @@ export class TransactionCoordinator {
 			preCommitSnapshots.set(collectionId, collection.snapshotPending());
 		}
 
+		let coordResult: {
+			success: boolean;
+			error?: string;
+			committedCollections?: Set<CollectionId>;
+			failedCollections?: Set<CollectionId>;
+		};
 		try {
 			for (const { collectionId, collection } of collectionData) {
 				const applyResult = await this.applyActionsToCollection(
@@ -186,24 +193,65 @@ export class TransactionCoordinator {
 			const operationsHash = await this.hashOperations(allOperations);
 
 			// Execute consensus phases (GATHER, PEND, COMMIT)
-			const coordResult = await this.coordinateTransaction(
+			coordResult = await this.coordinateTransaction(
 				transaction,
 				operationsHash,
 				collectionTransforms,
 				criticalBlocks
 			);
-
-			if (!coordResult.success) {
-				throw new Error(`Transaction commit failed: ${coordResult.error}`);
-			}
 		} catch (err) {
-			// Roll every tracker back to its pre-append snapshot. Remote/consensus
-			// cleanup (cancelling pended blocks) already happened inside
-			// coordinateTransaction; this restores LOCAL tracker state only.
+			// A throw here means the failure happened BEFORE any collection could
+			// durably commit (a log-append failure, or coordinateTransaction rejecting
+			// unexpectedly). Nothing landed on the cluster, so roll every tracker back
+			// to its pre-append snapshot — a genuinely clean rollback that leaves each
+			// tracker pristine for retry (see txn-failed-commit-leaves-staged-log-entry).
 			for (const { collectionId, collection } of collectionData) {
 				collection.restorePending(preCommitSnapshots.get(collectionId)!);
 			}
 			throw err;
+		}
+
+		if (!coordResult.success) {
+			const committed = coordResult.committedCollections ?? new Set<CollectionId>();
+			if (committed.size > 0) {
+				// PARTIAL COMMIT: at least one collection durably committed via consensus
+				// while another failed permanently. A uniform pre-append restore would
+				// corrupt the committed half — re-staging its already-durable actions as
+				// still-pending, so tracker memory would disagree with cluster storage.
+				// Split the local handling instead:
+				for (const { collectionId, collection } of collectionData) {
+					if (committed.has(collectionId)) {
+						// Committed → the success-path local treatment (see below): fold the
+						// committed transforms into the read cache BEFORE resetting the tracker,
+						// then drop the now-durable pending actions so a retry cannot re-log them.
+						collection.recordCommitted(transaction.id);
+						collection.applyCommittedToCache(collectionTransforms.get(collectionId)!);
+						collection.tracker.reset();
+						collection.clearPendingActions();
+					} else {
+						// Failed / never-committed → restore the pre-append snapshot so a retry
+						// re-appends cleanly (no duplicate log entry).
+						collection.restorePending(preCommitSnapshots.get(collectionId)!);
+					}
+				}
+				// The transaction half-landed, so it is neither cleanly retryable nor
+				// cleanly abortable: drop its stamp tracking (the success path does the
+				// same at the end) and surface the structured signal for reconciliation.
+				this.stampData.delete(transaction.stamp.id);
+				throw new CoordinatorPartialCommitError(
+					[...committed],
+					[...(coordResult.failedCollections ?? new Set<CollectionId>())],
+					coordResult.error
+				);
+			}
+
+			// EMPTY committed set: PEND failed, or the whole commit failed cleanly with
+			// nothing durable. Restore every tracker and throw a plain error, exactly as
+			// before — a genuinely clean failure leaves each tracker pristine for retry.
+			for (const { collectionId, collection } of collectionData) {
+				collection.restorePending(preCommitSnapshots.get(collectionId)!);
+			}
+			throw new Error(`Transaction commit failed: ${coordResult.error}`);
 		}
 
 		// Advance actionContext, fold the committed transforms into each
@@ -436,7 +484,27 @@ export class TransactionCoordinator {
 		const coordMs = Date.now() - tCoord;
 		if (!coordResult.success) {
 			log('execute:done trxId=%s engine=%dms apply=%dms coordinate=%dms success=false total=%dms', trxId, engineMs, applyMs, coordMs, Date.now() - t0);
-			return coordResult;
+			// Stop lying to the caller about a partial commit: if some collections durably
+			// committed, surface that set. execute() is not snapshot/restore-wrapped (see the
+			// note above), but the committed subset must still get the success-path local
+			// treatment (recordCommitted + tracker.reset, as on the success path below) so its
+			// trackers aren't left mis-tracking already-durable state.
+			const committed = coordResult.committedCollections ?? new Set<CollectionId>();
+			if (committed.size > 0) {
+				for (const collectionActions of result.actions) {
+					const collection = this.collections.get(collectionActions.collectionId);
+					if (collection && committed.has(collectionActions.collectionId)) {
+						collection.recordCommitted(transaction.id);
+						collection.tracker.reset();
+					}
+				}
+			}
+			return {
+				success: false,
+				error: coordResult.error,
+				committedCollections: committed.size > 0 ? [...committed] : undefined,
+				failedCollections: coordResult.failedCollections ? [...coordResult.failedCollections] : undefined,
+			};
 		}
 
 		// 5. Update actionContext and reset trackers after successful commit
@@ -541,7 +609,12 @@ export class TransactionCoordinator {
 		operationsHash: string,
 		collectionTransforms: Map<CollectionId, Transforms>,
 		criticalBlocks: Map<CollectionId, BlockId>
-	): Promise<{ success: boolean; error?: string }> {
+	): Promise<{
+		success: boolean;
+		error?: string;
+		committedCollections?: Set<CollectionId>;
+		failedCollections?: Set<CollectionId>;
+	}> {
 		const trxId = transaction.id;
 		const t0 = Date.now();
 
@@ -581,7 +654,15 @@ export class TransactionCoordinator {
 				commitResult.committedCollections
 			);
 			log('trx:phases trxId=%s gather=%dms pend=%dms commit=%dms (failed) total=%dms', trxId, gatherMs, pendMs, commitMs, Date.now() - t0);
-			return { success: false, error: commitResult.error };
+			// Surface the committed/failed partition so commit()/execute() can report which
+			// collections durably landed. A non-empty committedCollections is a PARTIAL commit:
+			// those collections cannot be rolled back and the caller must reconcile.
+			return {
+				success: false,
+				error: commitResult.error,
+				committedCollections: commitResult.committedCollections,
+				failedCollections: commitResult.failedCollections,
+			};
 		}
 
 		// 4. PROPAGATE and CHECKPOINT phases are handled by clusters automatically

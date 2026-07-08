@@ -7,7 +7,9 @@ import {
 	DEFAULT_TRANSACTION_TTL_MS,
 	isTransactionExpired,
 	hashString,
+	blockIdsForTransforms,
 	TransactionCoordinator,
+	CoordinatorPartialCommitError,
 	TransactionSession,
 	TransactionValidator,
 	Tree,
@@ -20,6 +22,15 @@ import {
 	type ActionId,
 	type BlockId,
 	type IBlock,
+	type ITransactor,
+	type PendRequest,
+	type PendResult,
+	type CommitRequest,
+	type CommitResult,
+	type BlockGets,
+	type GetBlockResults,
+	type ActionBlocks,
+	type BlockActionStatus,
 } from '../src/index.js';
 import { TestTransactor, FlakyCommitTransactor } from '../src/testing/test-transactor.js';
 
@@ -3419,6 +3430,156 @@ describe('Transaction', () => {
 
 			// Nothing committed on either collection.
 			expect(inner.getCommittedActions().size, 'no actions committed after forced failure').to.equal(0);
+		});
+	});
+
+	describe('Multi-collection partial commit honest reporting (txn-multi-collection-commit-honest-reporting)', () => {
+		type UserEntry = { key: number; name: string };
+		type PostEntry = { key: number; userId: number; title: string };
+
+		/**
+		 * Wraps a {@link TestTransactor} and forces the COMMIT of exactly ONE collection to
+		 * fail *permanently* (a returned StaleFailure — a lost race that can never win), while
+		 * every other collection commits durably. This reproduces the partial-commit window:
+		 * the coordinator commits each collection's pended blocks independently, so one can land
+		 * durably while another is permanently rejected.
+		 *
+		 * The poison collection is identified at PEND time: each pend request carries exactly one
+		 * collection's transforms, and every inserted block's header names that collection (see
+		 * TransactorSource.createBlockHeader). We record the poison collection's block ids and
+		 * fail any commit that targets them.
+		 */
+		class SelectiveCommitFailTransactor implements ITransactor {
+			private readonly poisonBlockIds = new Set<BlockId>();
+
+			constructor(
+				private readonly inner: TestTransactor,
+				private readonly poisonCollectionId: string,
+				private readonly reason = 'forced stale loss',
+			) {}
+
+			get(b: BlockGets): Promise<GetBlockResults> { return this.inner.get(b); }
+			getStatus(a: ActionBlocks[]): Promise<BlockActionStatus[]> { return this.inner.getStatus(a); }
+			cancel(a: ActionBlocks): Promise<void> { return this.inner.cancel(a); }
+
+			async pend(request: PendRequest): Promise<PendResult> {
+				const firstInsert = Object.values(request.transforms.inserts ?? {})[0] as IBlock | undefined;
+				if (firstInsert?.header.collectionId === this.poisonCollectionId) {
+					for (const blockId of blockIdsForTransforms(request.transforms)) {
+						this.poisonBlockIds.add(blockId);
+					}
+				}
+				return this.inner.pend(request);
+			}
+
+			async commit(request: CommitRequest): Promise<CommitResult> {
+				if (request.blockIds.some(blockId => this.poisonBlockIds.has(blockId))) {
+					return { success: false, reason: `${this.reason}: ${this.poisonCollectionId}` };
+				}
+				return this.inner.commit(request);
+			}
+		}
+
+		it('durably commits one collection, permanently fails another, and reports the partition honestly', async () => {
+			const inner = new TestTransactor();
+			// 'posts' loses its commit permanently (stale loss); 'users' commits durably.
+			const transactor = new SelectiveCommitFailTransactor(inner, 'posts');
+
+			const usersTree = await Tree.createOrOpen<number, UserEntry>(transactor, 'users', e => e.key);
+			const postsTree = await Tree.createOrOpen<number, PostEntry>(transactor, 'posts', e => e.key);
+			const usersCollection = (usersTree as unknown as { collection: any }).collection;
+			const postsCollection = (postsTree as unknown as { collection: any }).collection;
+			const collections = new Map<string, any>([['users', usersCollection], ['posts', postsCollection]]);
+
+			const coordinator = new TransactionCoordinator(transactor, collections);
+			const engine = new ActionsEngine(coordinator);
+			const session = await TransactionSession.create(coordinator, engine, 'peer1', 'schema1');
+
+			const actions: CollectionActions[] = [
+				{ collectionId: 'users', actions: [{ type: 'replace', data: [[1, { key: 1, name: 'Alice' }]] }] },
+				{ collectionId: 'posts', actions: [{ type: 'replace', data: [[100, { key: 100, userId: 1, title: 'First' }]] }] },
+			];
+			await session.execute(createActionsStatements(actions)[0]!, actions);
+
+			const stampId = session.getStampId();
+			const preUsers = usersCollection.snapshotPending();
+			const prePosts = postsCollection.snapshotPending();
+
+			let caught: unknown;
+			try {
+				await session.commit();
+			} catch (e) {
+				caught = e;
+			}
+
+			// 1. The commit rejects with the structured partial-commit error...
+			expect(caught, 'partial commit should reject with CoordinatorPartialCommitError')
+				.to.be.instanceOf(CoordinatorPartialCommitError);
+			const err = caught as CoordinatorPartialCommitError;
+			// ...naming the correct committed vs failed sets.
+			expect([...err.committedCollections]).to.deep.equal(['users']);
+			expect([...err.failedCollections]).to.deep.equal(['posts']);
+
+			// 2. The committed collection got the SUCCESS-path local treatment: its pending queue
+			//    was CLEARED (not restored to the pre-append staged queue), and the durable value
+			//    reads back through the folded cache after the tracker reset.
+			expect(usersCollection.getPendingActions(), 'committed collection pending should be cleared').to.deep.equal([]);
+			expect(usersCollection.getPendingActions(), 'committed collection must NOT be restored to pending')
+				.to.not.deep.equal(preUsers.pending);
+			expect(await usersTree.get(1)).to.deep.equal({ key: 1, name: 'Alice' });
+
+			// 3. The failed collection was RESTORED to its pre-append snapshot for a clean retry.
+			expect(postsCollection.tracker.transforms).to.deep.equal(prePosts.transforms,
+				'failed collection tracker should be restored to pre-append state');
+			expect(postsCollection.getPendingActions()).to.deep.equal(prePosts.pending,
+				'failed collection pending queue should be restored');
+
+			// 4. stampData for the half-committed transaction was cleared.
+			expect((coordinator as any).stampData.has(stampId), 'stampData should be cleared for a partial commit')
+				.to.be.false;
+		});
+
+		it('empty-committed failure (every collection fails) throws a PLAIN error and restores every tracker', async () => {
+			const inner = new TestTransactor();
+			const flaky = new FlakyCommitTransactor(inner, Infinity); // every commit fails → nothing durable
+
+			const usersTree = await Tree.createOrOpen<number, UserEntry>(flaky, 'users', e => e.key);
+			const postsTree = await Tree.createOrOpen<number, PostEntry>(flaky, 'posts', e => e.key);
+			const usersCollection = (usersTree as unknown as { collection: any }).collection;
+			const postsCollection = (postsTree as unknown as { collection: any }).collection;
+			const collections = new Map<string, any>([['users', usersCollection], ['posts', postsCollection]]);
+
+			const coordinator = new TransactionCoordinator(flaky, collections);
+			const engine = new ActionsEngine(coordinator);
+			const session = await TransactionSession.create(coordinator, engine, 'peer1', 'schema1');
+
+			const actions: CollectionActions[] = [
+				{ collectionId: 'users', actions: [{ type: 'replace', data: [[1, { key: 1, name: 'Alice' }]] }] },
+				{ collectionId: 'posts', actions: [{ type: 'replace', data: [[100, { key: 100, userId: 1, title: 'First' }]] }] },
+			];
+			await session.execute(createActionsStatements(actions)[0]!, actions);
+
+			const preUsers = usersCollection.snapshotPending();
+			const prePosts = postsCollection.snapshotPending();
+
+			let caught: unknown;
+			try {
+				await session.commit();
+			} catch (e) {
+				caught = e;
+			}
+
+			// Empty committed set → a genuinely clean failure: a PLAIN Error, never the partial signal.
+			expect(caught).to.be.instanceOf(Error);
+			expect(caught, 'a clean (empty-committed) failure must NOT be a partial commit')
+				.to.not.be.instanceOf(CoordinatorPartialCommitError);
+
+			// Every tracker restored to its pre-append snapshot; nothing durably committed.
+			expect(usersCollection.tracker.transforms).to.deep.equal(preUsers.transforms);
+			expect(usersCollection.getPendingActions()).to.deep.equal(preUsers.pending);
+			expect(postsCollection.tracker.transforms).to.deep.equal(prePosts.transforms);
+			expect(postsCollection.getPendingActions()).to.deep.equal(prePosts.pending);
+			expect(inner.getCommittedActions().size, 'nothing durably committed').to.equal(0);
 		});
 	});
 });
