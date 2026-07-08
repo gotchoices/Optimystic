@@ -156,7 +156,7 @@ To support multi-collection transactions, we introduce a clear hierarchy:
 
 Transactions have two distinct identifiers:
 
-- **Transaction Stamp ID** (`stamp.id`): Created at transaction BEGIN, remains stable throughout the transaction lifecycle. This is a hash of the stamp fields (peer ID, timestamp, schema hash, engine ID). Exposed to users via `StampId()` UDF.
+- **Transaction Stamp ID** (`stamp.id`): Created at transaction BEGIN, remains stable throughout the transaction lifecycle. This is a hash of the six stamp fields (peer ID, timestamp, schema hash, engine ID, expiration, nonce), computed by `computeStampId`. Exposed to users via `StampId()` UDF. A validating node re-derives this hash and rejects the transaction (`Tampered transaction stamp`) if `stamp.id` does not match the fields — so a captured signed transaction cannot have a stamp field (e.g. `expiration`) mutated while holding `stamp.id`/`signature` constant.
 - **Transaction ID** (`transaction.id`): Computed at COMMIT as a hash of the stamp.id + statements + reads. This is the final, immutable transaction identity used in logs and block references.
 
 ## Current Architecture (Single-Collection)
@@ -208,6 +208,7 @@ type TransactionStamp = {
   schemaHash: string;       // Hash of schema version(s) for validation
   engineId: string;         // Which engine (e.g., 'quereus@0.5.3')
   expiration: number;       // Absolute ms epoch after which transaction is invalid (timestamp + ttlMs)
+  nonce: string;            // Random per-transaction nonce (anti-replay for read-free txs)
   id: string;               // Stamp ID (hash of all fields above) - stable throughout transaction
 };
 
@@ -1496,10 +1497,10 @@ Actions include `transaction: StampId` field:
 
 ### 7. Transaction Stamp vs Transaction ID
 Two distinct identifiers serve different purposes:
-- **Stamp ID** (`stamp.id`): Created at BEGIN (hash of peerId + timestamp + schemaHash + engineId), stable throughout, exposed to users via `StampId()` UDF
+- **Stamp ID** (`stamp.id`): Created at BEGIN (hash of peerId + timestamp + schemaHash + engineId + expiration + nonce), stable throughout, exposed to users via `StampId()` UDF; re-derived and integrity-checked by the validator
 - **Transaction ID** (`transaction.id`): Computed at COMMIT (hash of stamp.id + statements + reads), final immutable identity, used in logs
 - Both are hashes, both are internal to their respective structures
-- Stamp contains: peerId, timestamp, schemaHash, engineId, id
+- Stamp contains: peerId, timestamp, schemaHash, engineId, expiration, nonce, id
 - Transaction contains: stamp, statements, reads, id
 
 ### 8. Blocks Don't Receive Operations, They Validate Transactions

@@ -338,7 +338,11 @@ export interface ITransactionValidator {
 	/**
 	 * Validate a transaction by re-executing and comparing operations hash.
 	 *
-	 * Validation steps:
+	 * Validation steps (see TransactionValidator.validate for the authoritative order):
+	 * 0.0. Verify stamp.id is the true hash of the stamp fields (integrity — runs first,
+	 *      since every later step trusts a stamp field)
+	 * 0. Verify the stamp has not expired
+	 * 0.5. Verify the client signature (only if a signature verifier is wired)
 	 * 1. Verify stamp.engineId matches a known engine
 	 * 2. Verify stamp.schemaHash matches local schema
 	 * 3. Verify read dependencies (no stale reads)
