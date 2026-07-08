@@ -16,7 +16,7 @@ For implementation details, see [transactions.md](transactions.md), [right-is-ri
 
 ### 1.2 Nodes
 
-**Crash-recovery.** Honest nodes may crash at any point and restart. On recovery, nodes restore persisted 2PC state and resume protocol participation. Volatile state (in-flight messages, uncommitted overlays) is lost on crash.
+**Crash-recovery.** Honest nodes may crash at any point and restart. On recovery, a node restores its persisted *per-cluster* coordinator state — the `broadcasting`-phase record a single block cluster keeps so it can resume its own consensus round (`PersistedCoordinatorState`, db-p2p) — and resumes protocol participation. This is per-block-cluster durability, **not** a cross-collection transaction decision journal (see Theorem 3, which no longer assumes one). Volatile state (in-flight messages, uncommitted overlays) is lost on crash.
 
 **Byzantine adversary.** Up to *f* nodes may be Byzantine: they can send arbitrary messages, withhold messages, equivocate (send conflicting messages to different peers), or collude. Byzantine nodes are computationally bounded (cannot break cryptographic primitives).
 
@@ -43,7 +43,7 @@ For implementation details, see [transactions.md](transactions.md), [right-is-ri
 
 **Collection.** A logical grouping of blocks with a consistent access pattern. *Tree* collections provide indexed key-value access via B-tree. *Diary* collections provide append-only log access.
 
-**Transaction.** A set of SQL statements that mutate one or more collections atomically. A transaction is identified by its *transaction ID* — a SHA-256 hash of (stamp ID, statements, read dependencies). The transaction ID is the content address of the transaction.
+**Transaction.** A set of SQL statements that mutate one or more collections as a single logical unit (atomic *in intent*; across collections, visibility is eventual — see Theorem 3). A transaction is identified by its *transaction ID* — a SHA-256 hash of (stamp ID, statements, read dependencies). The transaction ID is the content address of the transaction.
 
 **Read dependency.** A pair *(blockId, revision)* recording that a transaction observed a specific block at a specific revision during execution. The set of all read dependencies is the transaction's *read set*.
 
@@ -112,24 +112,31 @@ Additionally, the self-coordination guard detects network shrinkage exceeding 50
 
 **Depends on:** Super-majority threshold (75%), membership binding (§2), the member-side membership admission gate, FRET network-size confidence, partition detection, self-coordination guard.
 
-### Theorem 3: Atomicity (Multi-Collection All-or-Nothing)
+### Theorem 3: Multi-Collection Atomicity of Intent (Eventual, Reported Visibility)
 
-**Statement.** A transaction that spans multiple collections either commits in all collections or commits in none.
+**Statement.** A transaction that spans multiple collections records its *intent to commit the whole set* atomically. Its writes then become visible collection-by-collection: normally all land, but a permanent failure on one collection — or a coordinator crash mid-commit — can leave a **partial landing** in which some collections are durably committed and others are not. The system never silently claims success on a partial landing: it names the durable set and the not-landed set so the application (or a future reconciler) resolves the split.
+
+> **This is weaker than all-or-nothing — read this first.** Earlier drafts of this theorem claimed unconditional all-or-nothing across collections and a "persisted 2PC journal" that recovers a crashed coordinator to a single commit-or-abort outcome. The implementation does not deliver that and no such cross-collection journal exists. What is guaranteed is *atomicity of intent* plus *eventual, reported visibility*, defined below. Genuine cross-collection all-or-nothing is an opt-in future mode — see the backlog item `feat-cross-collection-atomic-commit` and `crdt-sync.md` Stages 4–5.
+
+**Definitions (stated on first use).**
+
+- **Atomicity of intent.** A multi-collection transaction has one content-addressed identity — `transaction.id` = SHA-256(stamp id, statements, reads) (§2). Every participating collection's PEND carries that same identity, so the *intent to commit the whole set* is fixed atomically at the point all collections have pended. No collection can be pended under a different identity: different content produces a different `transaction.id` (Theorem 13, "inconsistent content").
+- **Eventual visibility (not atomic visibility).** The COMMIT phase lands each collection independently (`TransactionCoordinator.commitPhase`, fanned out per collection). A reader observing collection A's write of a transaction is **not** guaranteed to observe collection B's write of the same transaction at that instant. Cross-collection visibility is eventual and, on a partial landing, requires reconciliation.
+- **Partial landing.** When one collection's COMMIT fails permanently while another succeeds, the durably-committed collections stay committed (there is no cross-collection undo) and the failed ones do not.
 
 **Proof sketch.**
 
-Multi-collection transactions use two-phase commit (2PC) with persistent state.
+*Phase 1 (PEND).* The coordinator PENDs every collection's cluster. If any collection's PEND fails, the coordinator cancels every already-pended collection and aborts with nothing durable — a clean, retryable failure (the common case for a conflict / stale-read / validation rejection, which surfaces at PEND before any commit). Reaching the end of PEND establishes **atomicity of intent**: all collections hold the same `transaction.id`, pended.
 
-*Phase 1 (PEND).* The coordinator sends PEND to each collection's cluster sequentially. If any collection's PEND fails, the coordinator cancels all previously pended collections and aborts. 2PC state is persisted before each step, so crash recovery can complete the cancel.
+*Phase 2 (COMMIT).* The coordinator commits each collection's pended blocks independently. The failure mode that breaks all-or-nothing is a **permanent stale loss**: a racing transaction advances a collection's log tail between that collection's PEND and its COMMIT, so this transaction's commit for that collection can never win. `commitCollection` returns `{success:false}` and deliberately does **not** retry — the identical request can never succeed against the advanced tail. Meanwhile the sibling collections commit. Those durable commits are per-collection and there is no cross-collection undo, so the winner cannot be un-committed to match the loser. This is a *permanent* split, not a transient one a journal could later heal.
 
-*Phase 2 (COMMIT).* After all collections are pended, the coordinator sends COMMIT to all. If any collection's COMMIT fails, the coordinator runs the cancel phase for all collections and aborts. A committed collection cannot be uncommitted, but COMMIT only succeeds when the cluster has consensus — so partial commit requires a cluster to achieve consensus and then fail to report it. In this case, the persisted 2PC state allows recovery: on restart, the coordinator queries each cluster for the transaction's status and either completes the commit or rolls back.
+*Honest reporting (what replaces "recovery to atomic").* On a partial landing `coordinator.commit()` throws `CoordinatorPartialCommitError`, naming `committedCollections` (durable — CANNOT be rolled back) and `failedCollections` (never committed — local state reverted for retry); `coordinator.execute()` surfaces the same partition on its `ExecutionResult`. The coordinator gives the committed collections the success-path local treatment (fold to read cache + reset tracker + drop pending) and restores only the failed collections, so local memory matches durable state. It does **not** uniformly roll back — that would re-stage already-durable actions as pending and make memory disagree with storage. The application must **reconcile** the named committed set against the failed set: it must not blindly retry the whole transaction, and must not treat the outcome as a clean abort.
 
-*Recovery.* The persisted 2PC state journal records the transaction phase (pended collections, committed collections). On crash recovery:
-- If no COMMITs succeeded: cancel all pended collections.
-- If some COMMITs succeeded: query remaining clusters and complete the transaction.
-- If all COMMITs succeeded: transaction is complete.
+*Coordinator crash mid-commit-loop.* The db-core `TransactionCoordinator` is an in-memory orchestrator with **no cross-collection decision journal**. If it dies mid-commit-loop, the collections that already committed stay committed; the pended-but-uncommitted collections are released by each cluster's independent expiration cleanup (Theorem 7). The observable outcome is identical to a stale-loss partial landing — intent recorded, visibility partial, reconciliation applies. There is no coordinator-side journal that "queries each cluster and completes or rolls back."
 
-**Depends on:** 2PC state persistence (§1.2), cancel semantics, crash recovery protocol.
+*Per-cluster persistence is not a cross-collection journal.* db-p2p does persist a *per-block-cluster* coordinator state (`ITransactionStateStore` / `PersistedCoordinatorState`) that lets a single block cluster resume its own `broadcasting` phase after a restart (`cluster-coordinator.ts`). That is a per-cluster durability aid for one collection's consensus round — **not** a cross-collection decision record and **not** the basis of a multi-collection all-or-nothing guarantee. The two must not be conflated.
+
+**Depends on:** per-collection consensus (Theorems 1, 6), content-addressed transaction identity (§2, Theorem 13), expiration-based cleanup of abandoned pends (Theorem 7), and honest partial-commit reporting (`CoordinatorPartialCommitError` / `ExecutionResult.committedCollections`). It does **not** depend on a cross-collection 2PC state journal — none exists.
 
 ### Theorem 4: Deterministic Replay (Validator Agreement)
 
@@ -407,7 +414,7 @@ Optimystic provides **snapshot isolation with write-skew prevention** (equivalen
 ### 6.3 Ordering Guarantees
 
 - **Within a collection:** transactions are totally ordered by revision number. Revision is assigned at commit time and increases monotonically.
-- **Across collections:** no total order. Multi-collection transactions are atomic but their relative ordering with single-collection transactions is determined by individual collection commit order.
+- **Across collections:** no total order. Multi-collection transactions are atomic *in intent* but their visibility lands collection-by-collection (Theorem 3), so their relative ordering with single-collection transactions is determined by each collection's independent commit order — and on a partial landing some collections may reflect the transaction while others do not until reconciliation.
 - **Timestamps are metadata.** Transaction ordering is determined by log append order (revision), not by wall-clock timestamps. Clock skew does not affect correctness.
 
 ---
@@ -471,7 +478,7 @@ The properties above compose to provide the following end-to-end guarantee:
 > 1. Every submitted transaction either commits or is rejected within bounded time.
 > 2. No two conflicting transactions both commit.
 > 3. Committed transactions are durable and survive up to 25% node failure per cluster.
-> 4. Multi-collection transactions are atomic.
+> 4. Multi-collection transactions are atomic in *intent* (every collection pends under one content-addressed identity) with *eventual, reported visibility* — normally all collections commit; a partial landing is reported (`committedCollections` / `failedCollections`) for reconciliation, never silently claimed as success (Theorem 3).
 > 5. Concurrent transactions are isolated at the snapshot level with write-skew prevention.
 > 6. Byzantine validators are detected and ejected, with validation cost proportional to the fraction of Byzantine validators encountered.
 > 7. Network partitions cannot cause split-brain; the minority partition blocks writes rather than risk inconsistency.
@@ -534,15 +541,15 @@ For the core consensus algorithm only (dispute escalation convergence, race reso
                     └──────────┘
 
 ┌──────────────┐    ┌──────────────┐    ┌──────────────┐
-│ Deterministic │    │ Snapshot     │    │ Atomicity    │
+│ Deterministic │    │ Snapshot     │    │ Atomic-Intent│
 │ Replay (T4)   │    │ Isolation    │    │ (T3)         │
 │               │    │ (T5)         │    │              │
 └──┬─────┬─────┘    └──────┬───────┘    └──────┬───────┘
    │     │                 │                    │
    │     │                 ▼                    ▼
    │     │          ┌──────────────┐    ┌──────────────┐
-   │     │          │ Read Dep     │    │ 2PC State    │
-   │     │          │ Tracking     │    │ Persistence  │
+   │     │          │ Read Dep     │    │ Per-Coll.    │
+   │     │          │ Tracking     │    │ Consensus    │
    │     │          └──────┬───────┘    └──────────────┘
    │     │                 │
    ▼     ▼                 ▼

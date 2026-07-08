@@ -24,9 +24,23 @@ import type { CollectionId } from "../collection/index.js";
  * falsely report a clean rollback.
  *
  * This is the session-mode / distributed-consensus analog of the plugin's legacy
- * `PartialCommitError` (single-node, per-tree `sync()`). See `docs/transactions.md`
- * (§ "Session-mode (distributed) commit is not atomic across collections") and the
- * still-open design decision in the `1.5-design-multi-collection-atomicity` ticket.
+ * `PartialCommitError` (single-node, per-tree `sync()`).
+ *
+ * ## The design decision is settled (not "still open")
+ *
+ * The default multi-collection guarantee is formally **atomicity of intent + eventual,
+ * reported visibility**, NOT all-or-nothing — see `docs/correctness.md` **Theorem 3** and
+ * `docs/transactions.md` (§ "Session-mode (distributed) commit is not atomic across
+ * collections"). This error IS that guarantee's reporting surface, not a placeholder for a
+ * stronger one. Genuine cross-collection all-or-nothing is a future opt-in strong mode
+ * (backlog `feat-cross-collection-atomic-commit`).
+ *
+ * ## Reconcile contract for the catcher
+ *
+ * A caller receiving this error MUST NOT blindly retry the whole transaction and MUST NOT
+ * treat it as a clean abort: `committedCollections` are durable and cannot be rolled back,
+ * so a whole-transaction retry would double-apply them. Reconcile the named committed set
+ * against `failedCollections` (re-drive only the failed collections, or repair the split).
  */
 export class CoordinatorPartialCommitError extends Error {
 	constructor(

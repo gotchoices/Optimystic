@@ -3709,6 +3709,61 @@ describe('Transaction', () => {
 			}
 		}
 
+		/**
+		 * Like {@link SelectiveCommitFailTransactor} but fails the poison collection's commit only
+		 * for the first `failCount` commit attempts that target it, then delegates. Lets a test
+		 * re-drive commit() after a partial landing and have the previously-failed collection now
+		 * succeed. Records every DURABLE commit (by collection) so a test can assert that re-driving
+		 * does NOT re-commit the already-durable winner.
+		 */
+		class FailCollectionNTimesTransactor implements ITransactor {
+			private readonly poisonBlockIds = new Set<BlockId>();
+			private readonly blockToCollection = new Map<BlockId, string>();
+			private failsRemaining: number;
+			/** One entry per successful commit() call, naming the collection that landed. */
+			readonly durableCommits: string[] = [];
+
+			constructor(
+				private readonly inner: TestTransactor,
+				private readonly poisonCollectionId: string,
+				failCount = 1,
+				private readonly reason = 'forced stale loss',
+			) {
+				this.failsRemaining = failCount;
+			}
+
+			get(b: BlockGets): Promise<GetBlockResults> { return this.inner.get(b); }
+			getStatus(a: ActionBlocks[]): Promise<BlockActionStatus[]> { return this.inner.getStatus(a); }
+			cancel(a: ActionBlocks): Promise<void> { return this.inner.cancel(a); }
+
+			async pend(request: PendRequest): Promise<PendResult> {
+				const firstInsert = Object.values(request.transforms.inserts ?? {})[0] as IBlock | undefined;
+				const cid = firstInsert?.header.collectionId;
+				for (const blockId of blockIdsForTransforms(request.transforms)) {
+					if (cid) this.blockToCollection.set(blockId, cid);
+					if (cid === this.poisonCollectionId) this.poisonBlockIds.add(blockId);
+				}
+				return this.inner.pend(request);
+			}
+
+			async commit(request: CommitRequest): Promise<CommitResult> {
+				if (request.blockIds.some(blockId => this.poisonBlockIds.has(blockId)) && this.failsRemaining > 0) {
+					this.failsRemaining--;
+					return { success: false, reason: `${this.reason}: ${this.poisonCollectionId}` };
+				}
+				const result = await this.inner.commit(request);
+				if (result.success) {
+					const committedCids = new Set(
+						request.blockIds
+							.map(blockId => this.blockToCollection.get(blockId))
+							.filter((c): c is string => c !== undefined)
+					);
+					for (const cid of committedCids) this.durableCommits.push(cid);
+				}
+				return result;
+			}
+		}
+
 		it('durably commits one collection, permanently fails another, and reports the partition honestly', async () => {
 			const inner = new TestTransactor();
 			// 'posts' loses its commit permanently (stale loss); 'users' commits durably.
@@ -3809,6 +3864,114 @@ describe('Transaction', () => {
 			expect(postsCollection.tracker.transforms).to.deep.equal(prePosts.transforms);
 			expect(postsCollection.getPendingActions()).to.deep.equal(prePosts.pending);
 			expect(inner.getCommittedActions().size, 'nothing durably committed').to.equal(0);
+		});
+
+		it('execute() surfaces the partition on ExecutionResult (does not throw) and resets the committed subset', async () => {
+			const inner = new TestTransactor();
+			// 'posts' loses its commit permanently (stale loss); 'users' commits durably.
+			const transactor = new SelectiveCommitFailTransactor(inner, 'posts');
+
+			const usersTree = await Tree.createOrOpen<number, UserEntry>(transactor, 'users', e => e.key);
+			const postsTree = await Tree.createOrOpen<number, PostEntry>(transactor, 'posts', e => e.key);
+			const usersCollection = (usersTree as unknown as { collection: any }).collection;
+			const postsCollection = (postsTree as unknown as { collection: any }).collection;
+			const collections = new Map<string, any>([['users', usersCollection], ['posts', postsCollection]]);
+
+			const coordinator = new TransactionCoordinator(transactor, collections);
+			const engine = new ActionsEngine();
+
+			const actions: CollectionActions[] = [
+				{ collectionId: 'users', actions: [{ type: 'replace', data: [[1, { key: 1, name: 'Alice' }]] }] },
+				{ collectionId: 'posts', actions: [{ type: 'replace', data: [[100, { key: 100, userId: 1, title: 'First' }]] }] },
+			];
+			const statements = createActionsStatements(actions);
+			const stamp = await createTransactionStamp('peer1', Date.now(), 'schema1', ACTIONS_ENGINE_ID);
+			const transaction: Transaction = {
+				stamp,
+				statements,
+				reads: [],
+				id: await createTransactionId(stamp.id, statements, []),
+			};
+
+			// The execute() path is NOT snapshot/restore-wrapped: it RETURNS the partition on the
+			// ExecutionResult rather than throwing CoordinatorPartialCommitError.
+			const result = await coordinator.execute(transaction, engine);
+
+			expect(result.success).to.be.false;
+			expect(result.committedCollections, 'committed set on ExecutionResult').to.deep.equal(['users']);
+			expect(result.failedCollections, 'failed set on ExecutionResult').to.deep.equal(['posts']);
+
+			// The committed subset got the success-path local treatment (recordCommitted + tracker.reset),
+			// so the winner's tracker no longer carries the staged change.
+			const t = usersCollection.tracker.transforms;
+			const usersPendingChanges =
+				Object.keys(t.inserts ?? {}).length +
+				Object.keys(t.updates ?? {}).length +
+				(t.deletes?.length ?? 0);
+			expect(usersPendingChanges, 'committed collection tracker was reset').to.equal(0);
+
+			// Exactly one collection ('users') landed durably through the transactor; 'posts' did not.
+			const durable = inner.getCommittedActions();
+			expect(durable.size, 'exactly one collection landed durably').to.equal(1);
+			expect(durable.has(transaction.id as ActionId), 'the durable commit is this transaction').to.be.true;
+		});
+
+		it('re-driving commit() after a partial landing re-attempts only the failed collection (no double-apply on the winner)', async () => {
+			const inner = new TestTransactor();
+			// 'posts' loses its FIRST commit permanently, then succeeds on the retry; 'users' commits
+			// durably on the first attempt.
+			const transactor = new FailCollectionNTimesTransactor(inner, 'posts', 1);
+
+			const usersTree = await Tree.createOrOpen<number, UserEntry>(transactor, 'users', e => e.key);
+			const postsTree = await Tree.createOrOpen<number, PostEntry>(transactor, 'posts', e => e.key);
+			const usersCollection = (usersTree as unknown as { collection: any }).collection;
+			const postsCollection = (postsTree as unknown as { collection: any }).collection;
+			const collections = new Map<string, any>([['users', usersCollection], ['posts', postsCollection]]);
+
+			const coordinator = new TransactionCoordinator(transactor, collections);
+
+			const actions: CollectionActions[] = [
+				{ collectionId: 'users', actions: [{ type: 'replace', data: [[1, { key: 1, name: 'Alice' }]] }] },
+				{ collectionId: 'posts', actions: [{ type: 'replace', data: [[100, { key: 100, userId: 1, title: 'First' }]] }] },
+			];
+			const statements = createActionsStatements(actions);
+			const stamp = await createTransactionStamp('peer1', Date.now(), 'schema1', ACTIONS_ENGINE_ID);
+			const transaction: Transaction = {
+				stamp,
+				statements,
+				reads: [],
+				id: await createTransactionId(stamp.id, statements, []),
+			};
+
+			// Stage the actions (mirrors a session), then drive commit() directly so it can be
+			// re-driven — a TransactionSession forbids a second commit().
+			await coordinator.applyActions(actions, stamp.id);
+
+			// First commit: 'users' lands durably, 'posts' loses permanently → partial-commit throw.
+			let firstError: unknown;
+			try {
+				await coordinator.commit(transaction);
+			} catch (e) {
+				firstError = e;
+			}
+			expect(firstError, 'first commit throws the partial signal').to.be.instanceOf(CoordinatorPartialCommitError);
+			expect([...(firstError as CoordinatorPartialCommitError).committedCollections]).to.deep.equal(['users']);
+			expect([...(firstError as CoordinatorPartialCommitError).failedCollections]).to.deep.equal(['posts']);
+			expect(transactor.durableCommits, 'only users landed on the first attempt').to.deep.equal(['users']);
+
+			// Second commit (retry) of the SAME transaction: 'users' had its pending CLEARED (durable),
+			// so it is excluded from the retry — no re-append, no re-commit. Only the restored 'posts'
+			// is re-attempted, and now succeeds.
+			await coordinator.commit(transaction);
+
+			// The winner ('users') produced NO new durable commit on retry — no double-apply. Only the
+			// previously-failed 'posts' committed on the second attempt.
+			expect(transactor.durableCommits, 'retry commits only the previously-failed collection')
+				.to.deep.equal(['users', 'posts']);
+
+			// Both collections now read back their values.
+			expect(await usersTree.get(1)).to.deep.equal({ key: 1, name: 'Alice' });
+			expect(await postsTree.get(100)).to.deep.equal({ key: 100, userId: 1, title: 'First' });
 		});
 	});
 });

@@ -7,7 +7,10 @@ This document describes the architecture for multi-collection transactions in Op
 > ### ⚠️ Legacy (single-node) commit is not atomic across trees
 >
 > The distributed consensus path below (GATHER/PEND/COMMIT across all critical
-> blocks) is what delivers all-or-nothing across multiple collections. The
+> blocks) is what delivers cross-collection consistency — though only **atomicity of
+> intent + eventual, reported visibility**, not true all-or-nothing (a permanent
+> stale loss on one collection's COMMIT can still half-land; see the session-mode note
+> below and [correctness.md](correctness.md) Theorem 3). The
 > **default single-node "legacy" mode** — used when no coordinator/engine is wired
 > (`TransactionBridge` without `configureTransactionMode`) — does **not**.
 >
@@ -73,13 +76,21 @@ This document describes the architecture for multi-collection transactions in Op
 > commit failed with nothing durable) still rolls back cleanly and throws a plain
 > error, leaving every tracker pristine for retry.
 >
-> **Still open — real atomicity vs. honest downgrade.** This section documents the
-> *honest-reporting* surface only. Whether to close the window with real
-> cross-collection two-phase commit (a durable coordinator decision record / 2PC
-> journal + crash-mid-loop recovery) or to formally downgrade the guarantee to
-> "atomic intent, reconcile on partial" is an open design decision owned by the
-> `1.5-design-multi-collection-atomicity` ticket. `committedCollections` on the
-> failure is required either way, which is why it exists now.
+> **Resolved — honest downgrade, not real cross-collection 2PC.** The design decision
+> (previously "still open") is settled: the default multi-collection guarantee is
+> formally **atomicity of intent + eventual, reported visibility**, not all-or-nothing.
+> A racing transaction can permanently steal one collection's log-tail slot between its
+> PEND and COMMIT (a *permanent stale loss*, not a transient crash), and the committed
+> siblings have no cross-collection undo — so a durable 2PC journal cannot recover to an
+> atomic outcome in the very scenario the design names. The honest-reporting surface
+> above (`committedCollections` / `failedCollections`, no false rollback, reconcile on
+> partial) **is** the guarantee, not a placeholder for a stronger one. See
+> [correctness.md](correctness.md) **Theorem 3** for the formal statement and the
+> coordinator-crash-mid-loop outcome (identical to a stale-loss partial landing — the
+> in-memory coordinator holds no cross-collection decision journal). Genuine
+> cross-collection all-or-nothing is a future **opt-in strong mode**
+> (reservation-through-commit or cross-collection compensating reversal, both presuming
+> an agreed supercluster), parked as the backlog item `feat-cross-collection-atomic-commit`.
 
 ## Secrets and the replicated statement record
 
@@ -1546,7 +1557,7 @@ canonicalJson(promises)))`). Consequences:
 
 ## Success Criteria
 
-1. **Multi-Collection Atomicity**: Transactions affecting multiple collections (table + indexes) commit atomically or not at all
+1. **Multi-Collection Atomicity of Intent**: Transactions affecting multiple collections (table + indexes) pend under one content-addressed identity; normally all commit, and on the rare permanent partial landing the split is reported (`committedCollections` / `failedCollections`) for reconciliation, never silently claimed as success (see correctness.md Theorem 3)
 2. **Statement Validation**: Validators re-execute statements and verify operations match
 3. **Schema Consistency**: All peers reject transactions with schema mismatches (via stamp.schemaHash)
 4. **Deterministic Execution**: Same statements produce same operations on all peers
@@ -1999,7 +2010,7 @@ Current conflict resolution in `StorageRepo.update` handles revision conflicts d
 - Detect divergent history (not just revision gaps)
 - Identify transactions that need replay
 - Preserve logical intent (mutation descriptors) for re-execution
-- Handle multi-collection transactions atomically
+- Handle multi-collection transactions with atomic intent (report partial landings for reconciliation — see correctness.md Theorem 3)
 
 The transaction payload format already supports this - we store:
 - `statements`: Logical mutation descriptors (e.g., SQL statements)

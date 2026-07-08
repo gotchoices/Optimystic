@@ -207,6 +207,11 @@ export class TransactionCoordinator {
 						// Committed → the success-path local treatment (see below): fold the
 						// committed transforms into the read cache BEFORE resetting the tracker,
 						// then drop the now-durable pending actions so a retry cannot re-log them.
+						// NOTE: no-double-apply on retry depends on clearPendingActions() running for
+						// EVERY committed collection here before any re-drive of commit(). If a committed
+						// collection kept its pending queue, a subsequent commit() would re-append and
+						// re-log its already-durable actions — a duplicate log entry on the winner. The
+						// no-double-apply-on-retry test in transaction.spec.ts locks this.
 						const rev = collection.recordCommitted(transaction.id);
 						collection.applyCommittedToCache(collectionTransforms.get(collectionId)!, rev);
 						collection.tracker.reset();
