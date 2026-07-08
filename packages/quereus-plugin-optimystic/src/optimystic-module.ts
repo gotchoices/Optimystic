@@ -931,14 +931,13 @@ export class OptimysticVirtualTable extends VirtualTable {
 
               if (onConflict === ConflictResolution.IGNORE) {
                 // INSERT OR IGNORE / ON CONFLICT DO NOTHING: preserve the
-                // original row, stage nothing, leave the row count unchanged.
+                // original row and stage nothing.
                 return { status: 'ok' };
               }
 
               if (onConflict === ConflictResolution.REPLACE) {
-                // INSERT OR REPLACE: overwrite the row in place. Same PK, so the
-                // row count is unchanged (no statistics bump) and only changed
-                // indexed columns restage via updateIndexEntries.
+                // INSERT OR REPLACE: overwrite the row in place. Same PK, so
+                // only changed indexed columns restage via updateIndexEntries.
                 const replacementEncoded = this.rowCodec.encodeRow(values);
                 this.markDirtyTrees();
                 await this.collection.stage([[insertKey, [insertKey, replacementEncoded]]]);

@@ -375,7 +375,7 @@ describe('INSERT conflict resolution (local/bootstrap transactor)', function () 
  * UPDATE ("UPDATE has no statement-level OR clause"). optimystic resolves
  * `args.onConflict ?? ABORT` and reads no per-constraint conflict default, so a
  * PK-moving UPDATE always arrives as ABORT. The REPLACE/IGNORE branches are
- * correct-by-construction — they reuse the exact staging / index / statistics
+ * correct-by-construction — they reuse the exact staging / index
  * primitives already exercised by the passing `INSERT OR REPLACE` /
  * `INSERT OR IGNORE` tests above — but cannot be driven from SQL until the
  * engine supplies a non-ABORT onConflict for updates. See the review handoff
