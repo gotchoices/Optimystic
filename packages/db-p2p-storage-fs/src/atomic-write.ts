@@ -22,8 +22,13 @@ let tempCounter = 0;
  * not leave the canonical path damaged. A crash *between* the temp write and the
  * rename leaves only an inert `*.tmp` sibling — never read (reads target
  * canonical paths) and skipped by `.json` directory scans.
+ *
+ * `content` is `string | Uint8Array`: `FileKVStore` writes strings, while the
+ * `KvRawStorage`-backed `FileStoreDriver` writes the kernel's raw value bytes.
+ * `FileHandle.writeFile` writes either losslessly — a `Uint8Array` is written
+ * byte-for-byte, so non-ASCII JSON round-trips exactly.
  */
-export async function atomicWriteFile(filePath: string, content: string): Promise<void> {
+export async function atomicWriteFile(filePath: string, content: string | Uint8Array): Promise<void> {
 	const dir = path.dirname(filePath);
 	await fs.mkdir(dir, { recursive: true });
 

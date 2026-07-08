@@ -5,7 +5,29 @@ import * as path from 'path';
 import { FileRawStorage, FileKVStore } from '../src/index.js';
 import { BlockStorage } from '@optimystic/db-p2p';
 import type { BlockMetadata } from '@optimystic/db-p2p';
+import { runRawStorageConformance, type ConformanceHarness } from '@optimystic/db-p2p/testing';
 import type { BlockId, ActionId, Transform, IBlock } from '@optimystic/db-core';
+
+// ---------------------------------------------------------------------------
+// Shared parity suite. Proves FileRawStorage (KvRawStorage over FileStoreDriver)
+// behaves identically to every other backend — round-trips, listRevisions
+// ordering, promote atomicity + missing-pend error, clone-on-store/read (now
+// structural via the byte boundary), drain-before-yield, and the BlockStorage
+// parity slice. Each case gets a fresh temp dir that cleanup rm -rf's.
+// ---------------------------------------------------------------------------
+runRawStorageConformance('FileSystem', async (): Promise<ConformanceHarness> => {
+	const base = await fs.mkdtemp(path.join(os.tmpdir(), 'optimystic-fs-conformance-'));
+	return {
+		storage: new FileRawStorage(base),
+		cleanup: async () => { await fs.rm(base, { recursive: true, force: true }); }
+	};
+});
+
+// ---------------------------------------------------------------------------
+// fs-only tests the shared suite cannot cover: atomic-write / torn-file
+// corruption tolerance, colon-encoded filenames + legacy raw-colon fallback,
+// readdir error discrimination, and the directory-based listBlockIds meta-gate.
+// ---------------------------------------------------------------------------
 
 // Injects a "crash" between the atomic writer's temp write and its rename by
 // making fs.rename throw. atomic-write.ts holds the same `fs.promises` singleton,
@@ -145,6 +167,15 @@ describe('FileRawStorage atomic writes + corruption tolerance', () => {
 		// Temp file was cleaned up on the failed write.
 		assert.ok(!(await hasTempSibling(path.join(base, blockId))), 'expected no orphaned *.tmp files');
 	});
+
+	it('non-ASCII JSON bytes round-trip exactly (lossless byte write, not a lossy text coercion)', async () => {
+		const storage = new FileRawStorage(base);
+		const blockId = 'block-unicode' as BlockId;
+		// A materialized block carrying multi-byte UTF-8 payloads (emoji, CJK, combining marks).
+		const block = { header: { id: blockId, type: 'test', collectionId: 'c1' as BlockId }, note: '🌐 日本語 café' } as unknown as IBlock;
+		await storage.saveMaterializedBlock(blockId, 'tx:unicode' as ActionId, block);
+		assert.deepStrictEqual(await storage.getMaterializedBlock(blockId, 'tx:unicode' as ActionId), block);
+	});
 });
 
 describe('FileRawStorage.listPendingTransactions readdir error discrimination', () => {
@@ -187,67 +218,15 @@ describe('FileRawStorage.listPendingTransactions readdir error discrimination', 
 	});
 });
 
-describe('FileRawStorage round-trips', () => {
+describe('FileRawStorage colon-encoded action-id filenames', () => {
 	let base: string;
 
 	beforeEach(async () => {
-		base = await fs.mkdtemp(path.join(os.tmpdir(), 'optimystic-fs-rt-'));
+		base = await fs.mkdtemp(path.join(os.tmpdir(), 'optimystic-fs-colon-'));
 	});
 
 	afterEach(async () => {
 		await fs.rm(base, { recursive: true, force: true });
-	});
-
-	it('saveRevision/getRevision round-trips', async () => {
-		const storage = new FileRawStorage(base);
-		const blockId = 'block-rev' as BlockId;
-		const actionId = 'tx:revtest' as ActionId;
-
-		assert.strictEqual(await storage.getRevision(blockId, 1), undefined);
-		await storage.saveRevision(blockId, 1, actionId);
-		assert.strictEqual(await storage.getRevision(blockId, 1), actionId);
-	});
-
-	it('saveTransaction/getTransaction round-trips', async () => {
-		const storage = new FileRawStorage(base);
-		const blockId = 'block-tx' as BlockId;
-		const actionId = 'tx:txtest' as ActionId;
-		const transform: Transform = { delete: true };
-
-		assert.strictEqual(await storage.getTransaction(blockId, actionId), undefined);
-		await storage.saveTransaction(blockId, actionId, transform);
-		assert.deepStrictEqual(await storage.getTransaction(blockId, actionId), transform);
-	});
-
-	it('saveMaterializedBlock/getMaterializedBlock round-trips', async () => {
-		const storage = new FileRawStorage(base);
-		const blockId = 'block-mat' as BlockId;
-		const actionId = 'tx:mattest' as ActionId;
-		const block = { data: 'test-block-content' } as unknown as IBlock;
-
-		assert.strictEqual(await storage.getMaterializedBlock(blockId, actionId), undefined);
-		await storage.saveMaterializedBlock(blockId, actionId, block);
-		assert.deepStrictEqual(await storage.getMaterializedBlock(blockId, actionId), block);
-	});
-
-	it('savePendingTransaction → promotePendingTransaction moves pend to actions', async () => {
-		const storage = new FileRawStorage(base);
-		const blockId = 'block-promote' as BlockId;
-		const actionId = 'tx:promote123' as ActionId;
-		const transform: Transform = { delete: true };
-
-		await storage.savePendingTransaction(blockId, actionId, transform);
-
-		// Must be in pending, not yet in actions
-		assert.deepStrictEqual(await storage.getPendingTransaction(blockId, actionId), transform);
-		assert.strictEqual(await storage.getTransaction(blockId, actionId), undefined);
-
-		await storage.promotePendingTransaction(blockId, actionId);
-
-		// Now in actions, no longer in pending
-		assert.deepStrictEqual(await storage.getTransaction(blockId, actionId), transform);
-		const remaining = await drainPendings(storage, blockId);
-		assert.deepStrictEqual(remaining, []);
 	});
 
 	it('colon-bearing action id round-trips on all platforms (percent-encoded filename)', async () => {
@@ -264,6 +243,31 @@ describe('FileRawStorage round-trips', () => {
 		const files = await fs.readdir(actionsDir);
 		assert.ok(files.some(f => f.includes('%3A')), 'expected %3A encoding in filename');
 		assert.ok(!files.some(f => f.includes(':') && !f.includes('%3A')), 'expected no raw colon in filename');
+	});
+
+	// POSIX-only: pre-encode nodes wrote raw-colon files (`pend/tx:<hash>.json`). The read
+	// fallback must still find them, and a delete must remove them so they can't resurrect via
+	// the fallback. win32 cannot create a raw-colon file (NTFS ADS separator), so skip there.
+	it('reads a legacy raw-colon pend file and deletePendingTransaction removes it (POSIX)', async function () {
+		if (process.platform === 'win32') { this.skip(); return; }
+		const storage = new FileRawStorage(base);
+		const blockId = 'block-legacy-colon' as BlockId;
+		const colonId = 'tx:legacy99' as ActionId;
+
+		// Simulate a pre-encode node: write the value under the raw-colon filename by hand,
+		// as JSON bytes (the kernel's on-disk value form).
+		const pendDir = path.join(base, blockId, 'pend');
+		await fs.mkdir(pendDir, { recursive: true });
+		const rawColonPath = path.join(pendDir, `${colonId}.json`);
+		await fs.writeFile(rawColonPath, JSON.stringify({ delete: true } as Transform));
+
+		// The read fallback finds it despite no encoded file existing.
+		assert.deepStrictEqual(await storage.getPendingTransaction(blockId, colonId), { delete: true });
+
+		// Delete must reach the raw-colon file too — otherwise the fallback resurrects it.
+		await storage.deletePendingTransaction(blockId, colonId);
+		assert.strictEqual(await storage.getPendingTransaction(blockId, colonId), undefined);
+		await assert.rejects(() => fs.access(rawColonPath), (err: NodeJS.ErrnoException) => err.code === 'ENOENT');
 	});
 });
 

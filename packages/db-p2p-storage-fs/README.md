@@ -88,11 +88,19 @@ yarn test          # mocha, minimal reporter
 yarn test:verbose  # mocha, spec reporter
 ```
 
-The suite uses a per-test `fs.mkdtemp` fixture with `afterEach` cleanup and
-`node:assert` (no external assertion library). It covers atomic writes,
-corruption tolerance, readdir error discrimination, full round-trips for all
-`IRawStorage` methods, the pending → actions promotion flow, colon encoding
-round-trips, and `FileKVStore.list`/`delete`.
+Two layers run here, both over a per-test `fs.mkdtemp` fixture with `afterEach`
+cleanup:
+
+- **Shared conformance suite** — `runRawStorageConformance('FileSystem', …)` from
+  `@optimystic/db-p2p/testing`, the one cross-backend parity target. It proves the
+  fs backend (now `KvRawStorage` over a `FileStoreDriver`) behaves identically to
+  every other backend: round-trips, `listRevisions` ordering, promote atomicity +
+  the exact missing-pend error, clone-on-store/read (structural via the byte
+  boundary), drain-before-yield iteration, and a `BlockStorage` parity slice.
+- **fs-only tests** (`node:assert`) — the behaviors the shared suite can't cover:
+  atomic writes + torn-file corruption tolerance, `readdir` error discrimination,
+  colon-encoded filenames + the POSIX legacy raw-colon fallback, the directory-based
+  `listBlockIds` meta-gate, and `FileKVStore.list`/`delete`.
 
 ## Known limitations
 
