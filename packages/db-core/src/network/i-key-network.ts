@@ -21,4 +21,14 @@ export type IKeyNetwork = {
 	 * @returns Promise resolving to the peers in the cluster
 	 */
 	findCluster(key: Uint8Array): Promise<ClusterPeers>;
+
+	/**
+	 * Optionally cache a resolved coordinator for a key, so a follow-up operation
+	 * (e.g. commit after pend) reuses the same peer. Implementations that don't
+	 * cache coordinators simply omit this. `ttlMs` bounds how long the hint lives.
+	 * @param key The key the coordinator was resolved for
+	 * @param peerId The coordinating peer
+	 * @param ttlMs Optional time-to-live for the cached hint, in ms
+	 */
+	recordCoordinator?(key: Uint8Array, peerId: PeerId, ttlMs?: number): void;
 }

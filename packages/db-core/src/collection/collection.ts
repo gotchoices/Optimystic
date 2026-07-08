@@ -1,4 +1,4 @@
-import type { IBlock, Action, ActionType, ActionHandler, BlockId, ITransactor, BlockStore, Transforms } from "../index.js";
+import type { IBlock, Action, ActionType, ActionHandler, BlockId, ITransactor, BlockStore, Transforms, ActionId } from "../index.js";
 import { Log, Atomic, Tracker, copyTransforms, CacheSource, isTransformsEmpty, TransactorSource } from "../index.js";
 import type { CollectionHeaderBlock, CollectionId, ICollection, SyncOptions } from "./index.js";
 import { SyncRetryExhaustedError } from "./index.js";
@@ -244,6 +244,23 @@ export class Collection<TAction> implements ICollection<TAction> {
 	 * nothing. Call BEFORE resetting the tracker (the transforms are read live). */
 	applyCommittedToCache(transforms: Transforms): void {
 		this.sourceCache.transformCache(transforms);
+	}
+
+	/** Next revision this collection would commit at (current committed rev + 1). */
+	getNextRev(): number {
+		return (this.source.actionContext?.rev ?? 0) + 1;
+	}
+
+	/** Record a just-committed action: append its ActionRev to the committed list
+	 *  and advance the revision. Returns the new revision. Mirrors the inline bump
+	 *  in {@link syncInternal}. */
+	recordCommitted(actionId: ActionId): number {
+		const rev = this.getNextRev();
+		this.source.actionContext = {
+			committed: [...(this.source.actionContext?.committed ?? []), { actionId, rev }],
+			rev,
+		};
+		return rev;
 	}
 
 	/** Push our pending actions to the transactor */

@@ -219,8 +219,8 @@ describe('Transaction', () => {
 		});
 	});
 
-	// TransactionContext tests removed - use TransactionSession instead
-	// TransactionContext is now an internal implementation detail used by commitTransaction()
+	// TransactionContext tests removed - the deprecated TransactionContext /
+	// commitTransaction path was deleted; use TransactionSession instead.
 
 	describe('Integration with Collections', () => {
 		it('should execute actions through collections via ActionsEngine', async () => {

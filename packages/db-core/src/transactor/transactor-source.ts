@@ -27,8 +27,12 @@ export class TransactorSource<TBlock extends IBlock> implements BlockSource<TBlo
 
 	async tryGet(id: BlockId): Promise<TBlock | undefined> {
 		const result = await this.transactor.get({ blockIds: [id], context: this.actionContext });
-		if (result) {
-			const { block, state } = result[id]!;
+		// Guard the per-key entry: some transactors return a sparse result that omits `id`
+		// entirely (e.g. block genuinely not found), so `result` is a truthy object but
+		// `result[id]` is undefined. Destructuring that would throw a TypeError.
+		const entry = result?.[id];
+		if (entry) {
+			const { block, state } = entry;
 			// Record read dependency for optimistic concurrency control
 			this.readDependencies.push({ blockId: id, revision: state.latest?.rev ?? 0 });
 			// TODO: if the state reports that there is a pending action, record this so that we are sure to update before syncing

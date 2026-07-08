@@ -388,7 +388,7 @@ export class CoordinatorRepo implements IRepo {
 	async pend(request: PendRequest, options?: MessageOptions): Promise<PendResult> {
 		const allBlockIds = blockIdsForTransforms(request.transforms);
 		await this.verifyResponsibility(allBlockIds);
-		const coordinatingBlockIds = (options as any)?.coordinatingBlockIds ?? allBlockIds;
+		const coordinatingBlockIds = options?.coordinatingBlockIds ?? allBlockIds;
 
 		const peerCount = await this.coordinator.getClusterSize(coordinatingBlockIds[0]!);
 		if (peerCount <= 1) {

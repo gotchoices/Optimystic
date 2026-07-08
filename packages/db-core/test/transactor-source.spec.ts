@@ -5,7 +5,7 @@ import { TransactorSource } from '../src/transactor/transactor-source.js'
 import { TestTransactor } from '../src/testing/test-transactor.js'
 import { randomBytes } from '@libp2p/crypto'
 import { toString as uint8ArrayToString } from 'uint8arrays/to-string'
-import type { IBlock, ActionId, ActionContext, Transforms, BlockOperation, CommitRequest, CommitResult } from '../src/index.js'
+import type { IBlock, ActionId, ActionContext, Transforms, BlockOperation, CommitRequest, CommitResult, ITransactor, BlockGets, GetBlockResults } from '../src/index.js'
 
 describe('TransactorSource', () => {
 	type TestBlock = IBlock & { test: string[] }
@@ -437,6 +437,24 @@ describe('TransactorSource', () => {
 			const result = await src.tryGet('never-inserted');
 			// The block should be undefined — tryGet returns undefined
 			expect(result).to.be.undefined;
+		});
+
+		it('should return undefined (not throw) from tryGet when the transactor returns a SPARSE result missing the requested id', async () => {
+			// The Network transactor always populates the requested key, but other transactors
+			// can return a sparse result object that omits the id entirely. `result` is then a
+			// truthy object, so the old `result[id]!` destructuring threw a TypeError. tryGet
+			// must instead fall through to undefined.
+			const sparseTransactor = {
+				async get(_gets: BlockGets): Promise<GetBlockResults> {
+					return {} as GetBlockResults; // requested id intentionally absent
+				},
+			} as unknown as ITransactor;
+			const src = new TransactorSource<IBlock>('coll', sparseTransactor, undefined);
+
+			const result = await src.tryGet('absent-block');
+			expect(result).to.be.undefined;
+			// And no read dependency should have been recorded for the missing block
+			expect(src.getReadDependencies()).to.be.empty;
 		});
 
 		it('should return stale data when actionContext has outdated revision', async () => {

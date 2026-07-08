@@ -2,9 +2,7 @@ import type { ITransactor, BlockId, CollectionId, Transforms, PendRequest, Commi
 import type { Transaction, ExecutionResult, ITransactionEngine, CollectionActions, ReadDependency } from "./transaction.js";
 import type { PeerId } from "../network/types.js";
 import type { Collection } from "../collection/collection.js";
-import { TransactionContext } from "./context.js";
-import { ActionsEngine } from "./actions-engine.js";
-import { createActionsStatements, createTransactionStamp, createTransactionId, isTransactionExpired } from "./transaction.js";
+import { isTransactionExpired } from "./transaction.js";
 import { Log, blockIdsForTransforms, hashString } from "../index.js";
 import { createLogger } from "../logger.js";
 
@@ -193,14 +191,7 @@ export class TransactionCoordinator {
 		// serves the new revision instead of the stale cached one. Clearing
 		// pending keeps a subsequent commit from re-logging these actions.
 		for (const { collectionId, collection } of collectionData) {
-			const newRev = (collection['source'].actionContext?.rev ?? 0) + 1;
-			collection['source'].actionContext = {
-				committed: [
-					...(collection['source'].actionContext?.committed ?? []),
-					{ actionId: transaction.id, rev: newRev }
-				],
-				rev: newRev,
-			};
+			collection.recordCommitted(transaction.id);
 			collection.applyCommittedToCache(collectionTransforms.get(collectionId)!);
 			collection.tracker.reset();
 			collection.clearPendingActions();
@@ -329,53 +320,9 @@ export class TransactionCoordinator {
 	}
 
 	/**
-	 * Commit a transaction context.
-	 *
-	 * @deprecated Use TransactionSession instead of TransactionContext
-	 * This is called by TransactionContext.commit().
-	 *
-	 * @param context - The transaction context to commit
-	 * @returns Execution result with actions and results
-	 */
-	async commitTransaction(context: TransactionContext): Promise<ExecutionResult> {
-		const collectionActions = Array.from(context.getCollectionActions().entries()).map(
-			([collectionId, actions]) => ({ collectionId, actions })
-		);
-
-		if (collectionActions.length === 0) {
-			return { success: true }; // Nothing to commit
-		}
-
-		// Create transaction statements
-		const statements = createActionsStatements(collectionActions);
-		const reads = context.getReads();
-
-		// Create stamp from context
-		const stamp = await createTransactionStamp(
-			'local', // TODO: Get from context or coordinator
-			Date.now(),
-			'', // TODO: Get from engine
-			context.engine
-		);
-
-		const transaction: Transaction = {
-			stamp,
-			statements,
-			reads,
-			id: await createTransactionId(stamp.id, statements, reads)
-		};
-
-		const engine = new ActionsEngine(this);
-
-		// Execute through standard path
-		return await this.execute(transaction, engine);
-	}
-
-	/**
 	 * Execute a fully-formed transaction.
 	 *
-	 * This can be called directly with a complete transaction (e.g., from Quereus),
-	 * or indirectly via commitTransaction().
+	 * This is called with a complete transaction (e.g., from Quereus).
 	 *
 	 * @param transaction - The transaction to execute
 	 * @param engine - The engine to use for executing the transaction
@@ -463,15 +410,7 @@ export class TransactionCoordinator {
 		for (const collectionActions of result.actions) {
 			const collection = this.collections.get(collectionActions.collectionId);
 			if (collection) {
-				const newRev = (collection['source'].actionContext?.rev ?? 0) + 1;
-				const actionId = transaction.id;
-				collection['source'].actionContext = {
-					committed: [
-						...(collection['source'].actionContext?.committed ?? []),
-						{ actionId, rev: newRev }
-					],
-					rev: newRev,
-				};
+				collection.recordCommitted(transaction.id);
 				collection.tracker.reset();
 			}
 		}
@@ -513,7 +452,7 @@ export class TransactionCoordinator {
 		}
 
 		// At this point, actions have already been executed through collection.act()
-		// when they were added to the TransactionContext. The collection's tracker
+		// (via the engine or the vtab's staging path). The collection's tracker
 		// already has the transforms, and the actions are in the pending buffer.
 
 		// Get transforms from the collection's tracker
@@ -530,7 +469,7 @@ export class TransactionCoordinator {
 
 		// Generate action ID from transaction ID
 		const actionId = transaction.id;
-		const newRev = (collection['source'].actionContext?.rev ?? 0) + 1;
+		const newRev = collection.getNextRev();
 
 		// Add actions to log (this updates the tracker with log block changes).
 		// Persist the transaction's read set on the entry so a later invalidation cascade can
@@ -647,16 +586,19 @@ export class TransactionCoordinator {
 		);
 		const results = await Promise.all(nomineePromises);
 
-		// Merge all nominees into a single set
-		const supercluster = results.reduce(
+		// Merge all nominees into a single set, deduped by peer identity. Each
+		// queryClusterNominees builds a fresh PeerId object per call (peerIdFromString),
+		// so a Set keyed by object reference would keep the same physical peer twice when
+		// it nominates for two critical clusters. Key by toString() to collapse duplicates.
+		const byId = results.reduce(
 			(acc, result) => {
-				result.nominees.forEach(nominee => acc.add(nominee));
+				result.nominees.forEach(nominee => acc.set(nominee.toString(), nominee));
 				return acc;
 			},
-			new Set<PeerId>()
+			new Map<string, PeerId>()
 		);
 
-		return supercluster;
+		return new Set(byId.values());
 	}
 
 	/**
@@ -689,7 +631,7 @@ export class TransactionCoordinator {
 			}
 
 			// Get revision from the collection's source
-			const rev = (collection['source'].actionContext?.rev ?? 0) + 1;
+			const rev = collection.getNextRev();
 
 			// Create pend request with transaction and operations hash for validation
 			const pendRequest: PendRequest = {
@@ -756,7 +698,7 @@ export class TransactionCoordinator {
 			}
 
 			// Get revision
-			const rev = (collection['source'].actionContext?.rev ?? 0) + 1;
+			const rev = collection.getNextRev();
 
 			// Find the critical block (log tail) for this collection
 			const logTailBlockId = criticalBlockIds.find(blockId =>

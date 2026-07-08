@@ -437,7 +437,7 @@ export class NetworkTransactor implements ITransactor, IBlockChangeNotifier {
 						expiration,
 						dialTimeoutMs: this.dialTimeoutMs,
 						coordinatingBlockIds: batch.coordinatingBlockIds
-					} as any
+					}
 				),
 				batch => blockIdsForTransforms(batch.payload),
 				transformForBlock,
@@ -446,11 +446,8 @@ export class NetworkTransactor implements ITransactor, IBlockChangeNotifier {
 			);
 			// Cache resolved coordinators for follow-up commit to hit the same peers
 			try {
-				const pn: any = this.keyNetwork as any;
-				if (typeof pn?.recordCoordinator === 'function') {
-					for (const b of Array.from(allBatches(batches))) {
-						pn.recordCoordinator(await blockIdToBytes(b.blockId), b.peerId);
-					}
+				for (const b of Array.from(allBatches(batches))) {
+					this.keyNetwork.recordCoordinator?.(await blockIdToBytes(b.blockId), b.peerId);
 				}
 			} catch (e) { log('WARN: Failed to record coordinator hint %o', e); }
 		} catch (e) {

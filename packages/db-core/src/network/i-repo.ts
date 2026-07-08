@@ -13,6 +13,14 @@ export type MessageOptions = {
 	 * impose a separate dial cap; the overall budget is the cap".
 	 */
 	dialTimeoutMs?: number;
+	/**
+	 * Blocks this coordinator is responsible for driving through consensus. Threaded
+	 * from {@link NetworkTransactor.pend}'s batch (which consolidates several blocks
+	 * onto one coordinating peer) into {@link CoordinatorRepo.pend}, which uses it to
+	 * pick the cluster anchor. Absent on bare per-block paths, which fall back to the
+	 * transforms' own block ids.
+	 */
+	coordinatingBlockIds?: BlockId[];
 }
 
 export type RepoCommitRequest = {
