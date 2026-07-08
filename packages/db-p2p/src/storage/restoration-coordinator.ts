@@ -5,6 +5,7 @@ import type { BlockArchive, RestoreCallback } from './struct.js';
 import { SyncClient } from '../sync/client.js';
 import type { IPeerNetwork } from '@optimystic/db-core';
 import type { ArachnodeFretAdapter } from './arachnode-fret-adapter.js';
+import { partitionCovers } from './arachnode-partition.js';
 import { createLogger } from '../logger.js';
 
 /**
@@ -132,28 +133,12 @@ export class RestorationCoordinator {
 			return peers; // Ring 0 covers all blocks
 		}
 
-		const blockPrefix = this.extractPrefix(blockCoord, ringDepth);
-
 		return peers.filter(peerId => {
 			const info = this.fretAdapter.getArachnodeInfo(peerId);
 			if (!info || !info.partition) return false;
-			return info.partition.prefixValue === blockPrefix;
+			// Compare block prefix vs peer partition via the shared responsibility derivation.
+			return partitionCovers(info.partition, blockCoord);
 		});
-	}
-
-	/**
-	 * Extract the first N bits of a hashed coordinate as a number.
-	 * Mirrors RingSelector.extractPrefix so block and peer partitions are computed identically.
-	 */
-	private extractPrefix(coord: RingCoord, bits: number): number {
-		let value = 0;
-		for (let i = 0; i < bits; i++) {
-			const byteIndex = Math.floor(i / 8);
-			const bitIndex = 7 - (i % 8);
-			const bit = (coord[byteIndex]! >> bitIndex) & 1;
-			value = (value << 1) | bit;
-		}
-		return value;
 	}
 
 	/**

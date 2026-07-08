@@ -23,6 +23,24 @@ export interface ArachnodeInfo {
 
 	/** Ring membership status */
 	status: 'joining' | 'active' | 'moving' | 'leaving';
+
+	/**
+	 * The ring/partition this node is moving *from*, present only while `status === 'moving'`.
+	 *
+	 * During a ring shift the node advertises its **target** `ringDepth`/`partition` (Phase A) but
+	 * keeps serving its old range until it has confirmed the shed range is replicated elsewhere
+	 * (Phase B) and releases it (Phase C). `moveFrom` records that old range so peers can treat a
+	 * `moving` node as *still responsible for its old range* (fail-toward-old-holder), and so a
+	 * crash between advertise and release is recoverable. Cleared on release/rollback (→ `active`).
+	 * See `docs/arachnode-ring-handoff.md` § Part 2 & Part 3.
+	 */
+	moveFrom?: {
+		ringDepth: number;
+		partition?: {
+			prefixBits: number;
+			prefixValue: number;
+		};
+	};
 }
 
 /**

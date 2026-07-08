@@ -398,6 +398,29 @@ describe('RingSelector', () => {
 			expect(after.direction).to.equal('out');
 		});
 
+		it('recordShiftSettled re-stamps dwell from the settled shift (spec §1.3)', async () => {
+			// A trigger stamps dwell; but the handoff settles LATER, so the driver re-stamps on settle.
+			// After a settle at t, a fresh sustained move must stay blocked until minDwellMs past t.
+			fretAdapter.setMyArachnodeInfo(advertise(2));
+			setSignal(0.9, 3.0);
+			const first = await selector.shouldTransition();
+			expect(first.shouldMove, 'first move triggers').to.equal(true);
+
+			// The shift runs a while, then settles: re-stamp dwell at the (later) settle time.
+			clock.advance(MINUTE);
+			selector.recordShiftSettled();
+
+			// Just before the dwell (measured from the settle) elapses: still blocked.
+			clock.advance(dwellMs - 1);
+			setSignal(0.9, 3.0);
+			expect((await selector.shouldTransition()).shouldMove, 'blocked until dwell past settle').to.equal(false);
+
+			// One tick past the settle-anchored dwell: a sustained move fires again.
+			clock.advance(2);
+			setSignal(0.9, 3.0);
+			expect((await selector.shouldTransition()).shouldMove, 'moves once dwell past settle elapses').to.equal(true);
+		});
+
 		it('steps exactly one ring even when depth implies a two-ring jump', async () => {
 			// From ring 0 with depth ≈ 2.5, one call must target ring 1 only. The second ring is taken
 			// only on a later tick, after dwell and after the node advertises the intermediate ring.

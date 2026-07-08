@@ -230,18 +230,28 @@ responsible holders for any shed key fall below N. Release is reachable only thr
 Phase B, so the property reduces to "Phase B's count excludes self and same-range movers and
 requires ≥ N," which the tests verify directly.
 
-## Key code sites the implementation touches
+## Key code sites (implemented)
+
+Part 1 (damping) and Parts 2–3 (this handoff) have landed. The state machine lives in a dedicated
+coordinator rather than inline in `libp2p-node-base.ts`:
 
 - `packages/db-p2p/src/storage/ring-selector.ts` — damping (Part 1): EWMA state, dead-band in
-  `shouldTransition`, dwell timer, single-step target. Extend `RingSelectorConfig`.
-- `packages/db-p2p/src/libp2p-node-base.ts` (~899, ~982-988, ~1017-1027) — drive the state machine:
-  replace the unilateral `setArachnodeInfo` flip with advertise→confirm→release; gate the
-  rebalance `untrackBlock` release on push confirmation.
-- `packages/db-p2p/src/cluster/block-transfer.ts` — `pushBlocks` already returns `missing`; expose a
-  confirm result the release step can gate on (do not release blocks whose confirmation failed).
-- `packages/db-p2p/src/cluster/rebalance-monitor.ts` — `RebalanceEvent.newOwners` and
-  `getCohortSize()` supply the post-move holders and floor N.
-- `packages/db-p2p/src/storage/arachnode-fret-adapter.ts` — `status` transitions and metadata
-  publication in Phase A.
+  `shouldTransition`, dwell timer, single-step target. `RingSelectorConfig`.
+- `packages/db-p2p/src/storage/ring-shift-coordinator.ts` — the Part 2/3 state machine:
+  `executeShift` (advertise→confirm→release for move-out; advertise-only for move-in), rollback on
+  any Phase-B failure, and `reconcileOnStart` for crash mid-handoff.
+- `packages/db-p2p/src/storage/arachnode-partition.ts` — the shared prefix/coverage predicates:
+  `partitionCovers`, `isServingHolder` (fail-toward-old-holder), `qualifiesForFloor` (excludes
+  same-range movers). Single source of truth for block/peer responsibility derivation.
+- `packages/db-p2p/src/cluster/block-transfer.ts` — `confirmReplicated(blockIds, owners, floor)` is
+  the confirm primitive (pushes, counts holders reporting *not* `missing`, requires ≥ floor);
+  `handleRebalanceEvent` returns `{ pulled, released, retained }` so release is gated on confirmation.
+- `packages/db-p2p/src/cluster/rebalance-monitor.ts` — `RebalanceEvent.newOwners` / `.floor` and the
+  now-public `getCohortSize()` supply the post-move holders and floor `N`.
+- `packages/db-p2p/src/storage/arachnode-fret-adapter.ts` — `status` transitions and the `moveFrom`
+  field advertised through Phase A (the old range a `moving` node still serves).
+- `packages/db-p2p/src/libp2p-node-base.ts` — wires the coordinator (driven off the damped
+  `shouldTransition` trigger), the gated rebalance release, and the `gcEligibleBlocks` set the future
+  storage sweep must consult before reclaiming any released range.
 </content>
 </invoke>

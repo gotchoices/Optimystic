@@ -266,6 +266,57 @@ describe('BlockTransferCoordinator', () => {
 		});
 	});
 
+	describe('confirmReplicated (Phase B / gated-release primitive)', () => {
+		it('confirms a block replicated to the floor when enough owners report it not missing', async () => {
+			repo.blocks.set('block-1', makeBlock('block-1'));
+			const o1 = (await makePeerId()).toString();
+			const o2 = (await makePeerId()).toString();
+			peerNetwork.responses.set(o1, { blocks: { 'block-1': 'data' }, missing: [] });
+			peerNetwork.responses.set(o2, { blocks: { 'block-1': 'data' }, missing: [] });
+
+			const result = await coordinator.confirmReplicated(['block-1'], new Map([['block-1', [o1, o2]]]), 2);
+
+			expect(result.confirmed).to.deep.equal(['block-1']);
+			expect(result.unconfirmed).to.deep.equal([]);
+		});
+
+		it('leaves a block unconfirmed when fewer than floor owners hold it', async () => {
+			repo.blocks.set('block-1', makeBlock('block-1'));
+			const o1 = (await makePeerId()).toString();
+			const o2 = (await makePeerId()).toString();
+			peerNetwork.responses.set(o1, { blocks: { 'block-1': 'data' }, missing: [] });  // confirms
+			peerNetwork.responses.set(o2, { blocks: {}, missing: ['block-1'] });             // does NOT confirm
+
+			const result = await coordinator.confirmReplicated(['block-1'], new Map([['block-1', [o1, o2]]]), 2);
+
+			expect(result.confirmed).to.deep.equal([]);
+			expect(result.unconfirmed).to.deep.equal(['block-1']);
+		});
+
+		it('leaves every block unconfirmed during a detected partition (no release)', async () => {
+			for (let i = 0; i < 10; i++) {
+				partitionDetector.recordFailure(`peer-${i}`);
+				partitionDetector.recordFailure(`peer-${i}`);
+				partitionDetector.recordFailure(`peer-${i}`);
+			}
+			repo.blocks.set('block-1', makeBlock('block-1'));
+			const o1 = (await makePeerId()).toString();
+			peerNetwork.responses.set(o1, { blocks: { 'block-1': 'data' }, missing: [] });
+
+			const result = await coordinator.confirmReplicated(['block-1'], new Map([['block-1', [o1]]]), 1);
+
+			expect(result.confirmed).to.deep.equal([]);
+			expect(result.unconfirmed).to.deep.equal(['block-1']);
+		});
+
+		it('leaves a block unconfirmed when it has no qualifying owners', async () => {
+			repo.blocks.set('block-1', makeBlock('block-1'));
+			const result = await coordinator.confirmReplicated(['block-1'], new Map([['block-1', []]]), 1);
+			expect(result.confirmed).to.deep.equal([]);
+			expect(result.unconfirmed).to.deep.equal(['block-1']);
+		});
+	});
+
 	describe('concurrency limiting', () => {
 		it('does not deadlock when all concurrent tasks retry', async function () {
 			// Tighter than the 10s package default: this test is a forcing function for a
@@ -325,12 +376,15 @@ describe('BlockTransferCoordinator', () => {
 				gained: ['block-new'],
 				lost: ['block-old'],
 				newOwners: new Map([['block-old', [ownerId.toString()]]]),
+				floor: 1,
 				triggeredAt: Date.now()
 			};
 
-			await coordinator.handleRebalanceEvent(event);
+			const result = await coordinator.handleRebalanceEvent(event);
 
 			expect(restoration.restoreCalls).to.include('block-new');
+			// The lost block confirmed to its single new owner (missing:[] response) → released.
+			expect(result.released).to.include('block-old');
 		});
 
 		it('handles empty rebalance events', async () => {
@@ -338,6 +392,7 @@ describe('BlockTransferCoordinator', () => {
 				gained: [],
 				lost: [],
 				newOwners: new Map(),
+				floor: 1,
 				triggeredAt: Date.now()
 			};
 

@@ -437,7 +437,18 @@ Two topology-aware monitors react to peer arrivals/departures via `connection:op
 
 ### RebalanceMonitor
 
-Tracks whether the local node's responsibility for blocks has changed after topology shifts. Emits `RebalanceEvent` with `gained`/`lost` block lists and `newOwners` for lost blocks. Throttled to one scan per `minRebalanceIntervalMs` (default 60s).
+Tracks whether the local node's responsibility for blocks has changed after topology shifts. Emits `RebalanceEvent` with `gained`/`lost` block lists, `newOwners` for lost blocks, and `floor` (the replication floor `N` = `getCohortSize()`). Throttled to one scan per `minRebalanceIntervalMs` (default 60s).
+
+**Gated release (confirm-before-untrack).** A `lost` block is no longer untracked synchronously. `BlockTransferCoordinator.handleRebalanceEvent` now returns `{ pulled, released, retained }`: `released` holds only blocks it **confirmed** replicated to ≥ `floor` new owners (via `confirmReplicated`, which pushes and counts holders reporting the block *not* `missing`). The node-base handler untracks + marks GC-eligible ONLY those; a block whose push failed / was partition-skipped stays in `retained` — still tracked and served — and is retried next rebalance. This closes the release-before-confirm hole (`docs/arachnode-ring-handoff.md` § Part 2).
+
+### RingShiftCoordinator (advertise → confirm → release)
+
+`packages/db-p2p/src/storage/ring-shift-coordinator.ts` carries a damped `RingSelector.shouldTransition()` decision through the responsibility handoff so a ring shift never drops a key below `N`:
+
+- **Move-out** (`R → R+1`): Phase A advertises the target ring (`status='moving'`, `moveFrom` records the old range) while still serving everything; Phase B confirms every shed block is replicated to ≥ `N` qualifying holders; Phase C sets `status='active'` at the new ring and releases the shed range (untrack + GC-eligible). Any Phase-B failure — partition, unreachable holders, floor unmet — rolls back to `active` at the old ring. No shed block is released unless *every* shed block confirmed.
+- **Move-in** (`R → R-1`): Phase A only — sheds nothing, advertises the inner ring and pulls the gained half via restoration/rebalance.
+
+**Qualifying holders** come from `arachnode-partition.ts`: a peer counts toward another mover's floor only if its *advertised (target)* partition covers the key (`qualifiesForFloor`), which excludes a concurrent same-range mover; whereas `isServingHolder` treats a `moving` peer as still covering its *old* range (fail-toward-old-holder), so a mid-handoff crash leaves the range covered. `reconcileOnStart()` refreshes a stale `moving` advertisement (crash between advertise and release) back to `active` at the old ring. Ring shifts run only when the rebalance reaction is wired (a move-out is unsafe without the confirm/release path).
 
 ### SpreadOnChurnMonitor (Middle-Out)
 

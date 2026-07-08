@@ -37,6 +37,7 @@ import type { SyncResponse } from './sync/protocol.js';
 import type { ClusterLatestCallback } from './repo/coordinator-repo.js';
 import { RestorationCoordinator } from './storage/restoration-coordinator.js';
 import { RingSelector } from './storage/ring-selector.js';
+import { RingShiftCoordinator } from './storage/ring-shift-coordinator.js';
 import { StorageMonitor } from './storage/storage-monitor.js';
 import type { StorageMonitorConfig } from './storage/storage-monitor.js';
 import { ArachnodeFretAdapter } from './storage/arachnode-fret-adapter.js';
@@ -895,6 +896,23 @@ export async function createLibp2pNodeBase(
 		if (fret) {
 			const fretAdapter = new ArachnodeFretAdapter(fret, node.peerId.toString());
 
+			// Blocks whose shed range has been RELEASED (Phase C of a ring shift, or a confirmed
+			// rebalance release). This is the GC-eligibility signal the future storage sweep
+			// (`st-storage-sweep-archival-and-capacity-estimate`) must consult: a block's local bytes may
+			// be reclaimed ONLY once it appears here, so an unconfirmed / still-served range is never
+			// swept. Populated strictly after replication is confirmed. See
+			// docs/arachnode-ring-handoff.md § Part 2 (Local bytes vs. tracking).
+			// NOTE: no sweep consumes this set yet; it is the coordinated eligibility handoff the sweep
+			// ticket will read. Until then it grows unbounded — bound it when the sweep lands.
+			const gcEligible = new Set<string>();
+			(node as any).gcEligibleBlocks = gcEligible;
+
+			// The ring-shift state machine (advertise→confirm→release). Wired inside the rebalance block
+			// below (it needs the BlockTransferCoordinator confirmer + the cohort-size floor); left
+			// undefined when the rebalance reaction is not wired, in which case ring shifts stay inert —
+			// a move-out is unsafe without the confirm/release path.
+			let ringShift: RingShiftCoordinator | undefined;
+
 			const storageMonitor = new StorageMonitor(rawStorage, options.arachnode?.storage ?? {});
 			const ringSelector = new RingSelector(fretAdapter, storageMonitor, {
 				minCapacity: 100 * 1024 * 1024,
@@ -972,12 +990,17 @@ export async function createLibp2pNodeBase(
 					// reaction is a resilience optimization, so swallow + log instead.
 					//
 					// ALONGSIDE dispatching to the coordinator, drive the shared owned-block set off this
-					// authoritative responsibility signal: a LOST block is evicted (so spread stops
-					// re-pushing a block this node no longer owns — the authoritative untrack that
-					// complements spread's lazy no-local-data self-prune) and its stale was-responsible
-					// snapshot entry cleared, both via untrackBlock; a GAINED block is added so it is tracked
-					// even before its next commit/replica touches the feed. Ordering vs the coordinator does
-					// not matter for correctness — the coordinator reads `event`, not the set.
+					// authoritative responsibility signal. A GAINED block is added immediately so it is
+					// tracked even before its next commit/replica touches the feed.
+					//
+					// A LOST block is NO LONGER released synchronously: doing so stopped spreading a block
+					// whose push to the new owners might fail, drop it below the replication floor, and let a
+					// later sweep reclaim it (docs/arachnode-ring-handoff.md § Why the current code violates
+					// it #2). Instead the release is GATED on confirmation — the coordinator returns the lost
+					// blocks it confirmed replicated to ≥ floor new owners, and ONLY those are untracked
+					// (authoritative eviction from the shared set — complements spread's lazy self-prune) and
+					// marked GC-eligible. A lost block whose push failed / was partition-skipped stays
+					// tracked and served, and is retried on the next rebalance.
 					//
 					// Best-effort iteration safety: this eviction can mutate ownedBlocks while
 					// SpreadOnChurnMonitor (or this monitor) is mid for...of over the same Set inside an
@@ -986,11 +1009,40 @@ export async function createLibp2pNodeBase(
 					// document it here rather than add locking.
 					rebalanceMonitor.onRebalance((event) => {
 						for (const blockId of event.gained) ownedBlocks.add(blockId);
-						for (const blockId of event.lost) rebalanceMonitor.untrackBlock(blockId);
-						coordinator.handleRebalanceEvent(event).catch((err) => {
+						coordinator.handleRebalanceEvent(event).then((result) => {
+							for (const blockId of result.released) {
+								rebalanceMonitor.untrackBlock(blockId); // also evicts from the shared ownedBlocks set
+								gcEligible.add(blockId);                 // confirmed replicated → safe to sweep
+							}
+						}).catch((err) => {
 							log?.('rebalance reaction failed: %o', err);
 						});
 					});
+
+					// Ring-shift handoff (advertise→confirm→release). It needs the confirmer (this
+					// coordinator) and the cohort-size floor (this monitor), so it is wired here. The
+					// `onRelease` callback runs Phase C's local effect: stop serving/spreading the shed
+					// range and mark it GC-eligible — the same authoritative eviction the confirmed-rebalance
+					// release performs.
+					ringShift = new RingShiftCoordinator({
+						fretAdapter,
+						ringSelector,
+						fret,
+						partitionDetector,
+						confirmer: coordinator,
+						ownedBlocks,
+						selfPeerId: peerId,
+						getFloor: () => rebalanceMonitor.getCohortSize(),
+						onRelease: (blockIds) => {
+							for (const blockId of blockIds) {
+								rebalanceMonitor.untrackBlock(blockId);
+								gcEligible.add(blockId);
+							}
+						}
+					});
+					// Reconcile any stale `moving` advertisement left by a crash mid-handoff (no-op unless
+					// arachnode metadata survived a restart still marked `moving`).
+					ringShift.reconcileOnStart();
 
 					// Feed owned blocks via the SINGLE shared feed (idempotent — already live if the spread
 					// block above wired it). Both monitors read the same ownedBlocks set this populates.
@@ -999,6 +1051,7 @@ export async function createLibp2pNodeBase(
 					// Expose for tests/diagnostics (mirrors node.spreadOnChurnMonitor).
 					(node as any).rebalanceMonitor = rebalanceMonitor;
 					(node as any).blockTransferCoordinator = coordinator;
+					(node as any).ringShiftCoordinator = ringShift;
 
 					// Disposal: stop the monitor before transports close. Composes with the other stop
 					// wrappers (each calls its captured previousStop last). Idempotent — RebalanceMonitor.stop()
@@ -1019,16 +1072,33 @@ export async function createLibp2pNodeBase(
 				}
 			}
 
-			// Monitor capacity and adjust ring periodically
+			// Monitor capacity and adjust ring periodically. The damped `shouldTransition()` decides
+			// WHETHER/where to move (docs/arachnode-ring-handoff.md § Part 1); the RingShiftCoordinator
+			// carries the move out through the advertise→confirm→release handoff (§ Part 2) so a shift
+			// never drops a key below its replication floor. The old unilateral `setArachnodeInfo` flip —
+			// which changed advertised responsibility instantly with no data handoff — is gone.
+			//
+			// Ring shifts run ONLY when `ringShift` is wired (i.e. the rebalance reaction is enabled): a
+			// move-out is unsafe without the confirm/release path, so a node with the rebalance reaction
+			// disabled stays at its bootstrap ring rather than flipping unsafely.
 			const monitorInterval = setInterval(async () => {
+				if (!ringShift) return;
 				const transition = await ringSelector.shouldTransition();
-				if (transition.shouldMove) {
+				if (transition.shouldMove && transition.direction && transition.newRingDepth !== undefined) {
 					log?.('Ring transition needed: moving %s to Ring %d', transition.direction, transition.newRingDepth);
-
-					// Advertise exactly the single-step target the transition just chose, so the
-					// advertised ring can never disagree with that decision on the next tick.
-					const updatedInfo = await ringSelector.createArachnodeInfo(peerId, transition.newRingDepth);
-					fretAdapter.setArachnodeInfo(updatedInfo);
+					try {
+						const outcome = await ringShift.executeShift({
+							direction: transition.direction,
+							newRingDepth: transition.newRingDepth
+						});
+						log?.('Ring shift outcome: %o', outcome);
+					} catch (err) {
+						log?.('Ring shift failed: %o', err);
+					} finally {
+						// Measure the minimum dwell from the SETTLED shift (completed or rolled back), not
+						// just the trigger stamped inside shouldTransition (docs/arachnode-ring-handoff.md §1.3).
+						ringSelector.recordShiftSettled();
+					}
 				}
 			}, 60_000);
 

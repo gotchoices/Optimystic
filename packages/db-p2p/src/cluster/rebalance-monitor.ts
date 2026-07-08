@@ -15,6 +15,13 @@ export interface RebalanceEvent {
 	lost: string[]
 	/** Peers that are now closer for the lost blocks: blockId → peerId[] */
 	newOwners: Map<string, string[]>
+	/**
+	 * Replication floor `N` for this event — the cohort size FRET assembled at check time
+	 * ({@link RebalanceMonitor.getCohortSize}). The reaction gates release of a `lost` block on
+	 * confirming it replicated to this many new owners, so a lost block is never released below the
+	 * floor. See `docs/arachnode-ring-handoff.md` § Part 2.
+	 */
+	floor: number
 	/** Timestamp of the topology change that triggered this */
 	triggeredAt: number
 }
@@ -210,10 +217,16 @@ export class RebalanceMonitor implements Startable {
 
 		log('rebalance check: gained=%d lost=%d', gained.length, lost.length)
 
-		return { gained, lost, newOwners, triggeredAt }
+		return { gained, lost, newOwners, floor: this.getCohortSize(), triggeredAt }
 	}
 
-	private getCohortSize(): number {
+	/**
+	 * The replication floor `N` — the cohort size FRET assembles for a block. Public so the ring-shift
+	 * handoff and the rebalance reaction can gate release on confirming replication to this many
+	 * holders (`docs/arachnode-ring-handoff.md` § Replication floor). Derives from FRET's network-size
+	 * estimate: `clamp(ceil(sqrt(n_est)), 1, 3)`, defaulting to 3 when no confident estimate exists.
+	 */
+	getCohortSize(): number {
 		const diag: any = (this.deps.fret as any).getDiagnostics?.()
 		const estimate = diag?.estimate ?? diag?.n
 		if (typeof estimate === 'number' && Number.isFinite(estimate) && estimate > 0) {

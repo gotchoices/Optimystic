@@ -2,6 +2,7 @@ import { hashPeerId } from 'p2p-fret';
 import { peerIdFromString } from '@libp2p/peer-id';
 import type { StorageMonitor } from './storage-monitor.js';
 import type { ArachnodeInfo, ArachnodeFretAdapter } from './arachnode-fret-adapter.js';
+import { extractPrefix } from './arachnode-partition.js';
 
 /** EWMA weight for the demand inputs. Higher = more reactive, lower = smoother. */
 const DEFAULT_SMOOTHING_ALPHA = 0.2;
@@ -112,6 +113,9 @@ export class RingSelector {
 		return Math.min(ringDepth, 16); // Cap at Ring 16 (65536 partitions)
 	}
 
+	// NOTE: prefix extraction lives in `arachnode-partition.ts` (single source of truth shared with
+	// the block-side responsibility derivation in RestorationCoordinator / RingShiftCoordinator).
+
 	/**
 	 * Estimate total network spare capacity (bytes) by aggregating observed per-ring stats.
 	 *
@@ -189,9 +193,9 @@ export class RingSelector {
 		// vs peer-prefix comparison stops meaning "this peer owns this block's slice".
 		const coord = await hashPeerId(peerIdFromString(peerId));
 
-		// Extract prefix bits from coordinate
+		// Extract prefix bits from coordinate (shared with block-side responsibility derivation).
 		const prefixBits = ringDepth;
-		const prefixValue = this.extractPrefix(coord, prefixBits);
+		const prefixValue = extractPrefix(coord, prefixBits);
 
 		return { prefixBits, prefixValue };
 	}
@@ -265,10 +269,10 @@ export class RingSelector {
 		}
 
 		// Minimum dwell: rate-limit so signal noise cannot drive rapid flips. `lastMoveAt` undefined
-		// means no prior move, so the first genuine move is never blocked.
-		// NOTE: dwell keys off when a move is *triggered*, not when the advertise→confirm→release
-		// handoff completes; once that protocol lands (sibling ticket), re-stamp `lastMoveAt` on
-		// completion so an aborted/rolled-back shift does not consume the dwell window.
+		// means no prior move, so the first genuine move is never blocked. The stamp here (at *trigger*)
+		// keeps a move from immediately re-triggering before `status` flips to `moving`; the driver then
+		// calls {@link recordShiftSettled} once the advertise→confirm→release handoff SETTLES, so the
+		// effective dwell is measured from the *completed* shift (spec §1.3), not merely the trigger.
 		const minDwellMs = this.config.minDwellMs ?? DEFAULT_MIN_DWELL_MS;
 		if (this.lastMoveAt !== undefined && (this.now() - this.lastMoveAt) < minDwellMs) {
 			return { shouldMove: false };
@@ -300,16 +304,14 @@ export class RingSelector {
 	}
 
 	/**
-	 * Extract first N bits from byte array as a number.
+	 * Re-stamp the dwell timer at the moment a ring shift *settles* — the driver
+	 * (`RingShiftCoordinator` via `libp2p-node-base`) calls this once `executeShift` resolves, for a
+	 * completed OR a rolled-back move. So the minimum dwell is measured from the settled shift rather
+	 * than only from the trigger (`shouldTransition`): a completed shift dwells `minDwellMs` before the
+	 * next move (spec §1.3, "after a *completed* shift"), and a shift that keeps failing is rate-limited
+	 * rather than retried every tick. No-op-safe to call when no shift ran.
 	 */
-	private extractPrefix(bytes: Uint8Array, bits: number): number {
-		let value = 0;
-		for (let i = 0; i < bits; i++) {
-			const byteIndex = Math.floor(i / 8);
-			const bitIndex = 7 - (i % 8);
-			const bit = (bytes[byteIndex]! >> bitIndex) & 1;
-			value = (value << 1) | bit;
-		}
-		return value;
+	recordShiftSettled(): void {
+		this.lastMoveAt = this.now();
 	}
 }
