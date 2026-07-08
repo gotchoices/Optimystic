@@ -13,6 +13,34 @@ import type { ITransactionStateStore } from "../cluster/i-transaction-state-stor
 
 const log = createLogger('cluster')
 
+/** Cancel handle for an injected timer; cancels a not-yet-fired timer (safe no-op after fire/cancel). */
+export type TimerCancel = () => void;
+
+/**
+ * Production timer binding: a one-shot `setTimeout` whose handle is **unref'd** so a pending
+ * commit-retry (or the deferred transaction cleanup) never keeps an otherwise-idle process alive.
+ * The returned handle clears the timeout (idempotent). Mirrors the reactivity rotation
+ * re-registration scheduler's `defaultSetTimer` (see reactivity/rotation-rereg-scheduler.ts).
+ */
+function defaultSetTimer(fn: () => void, delayMs: number): TimerCancel {
+	const handle = setTimeout(fn, delayMs);
+	// An idle retry/cleanup timer must not pin a process (mirror rotation re-registration + push-state gossip).
+	(handle as { unref?: () => void }).unref?.();
+	return (): void => clearTimeout(handle);
+}
+
+/**
+ * Optional injection seam for deterministic time. Production leaves both undefined and gets
+ * `Date.now` + an unref'd `setTimeout`; tests inject a fake clock + timer queue so scheduled
+ * commit-retries fire in virtual (not wall-clock) time.
+ */
+export interface ClusterCoordinatorClock {
+	/** Clock (Unix ms). Defaults to `Date.now`. */
+	now?: () => number;
+	/** Schedule a one-shot timer, returning a cancel handle. Defaults to an unref'd `setTimeout`. */
+	setTimer?: (fn: () => void, delayMs: number) => TimerCancel;
+}
+
 /**
  * Manages the state of cluster transactions for a specific block ID
  */
@@ -20,7 +48,7 @@ interface CommitRetryState {
 	pendingPeers: Set<string>;
 	attempt: number;
 	intervalMs: number;
-	timer?: NodeJS.Timeout;
+	cancel?: TimerCancel;
 }
 
 interface ClusterTransactionState {
@@ -42,6 +70,9 @@ export class ClusterCoordinator {
 	private readonly retryMaxAttempts: number;
 	private readonly commitBroadcastImmediateRetries: number;
 	private readonly promiseImmediateRetries: number;
+	/** Injected clock/timer seam; production defaults to `Date.now` + unref'd `setTimeout`. */
+	private readonly now: () => number;
+	private readonly setTimer: (fn: () => void, delayMs: number) => TimerCancel;
 
 	constructor(
 		private readonly keyNetwork: IKeyNetwork,
@@ -54,7 +85,8 @@ export class ClusterCoordinator {
 		},
 		private readonly fretService?: FretService,
 		private readonly reputation?: IPeerReputation,
-		private readonly stateStore?: ITransactionStateStore
+		private readonly stateStore?: ITransactionStateStore,
+		clock?: ClusterCoordinatorClock
 	) {
 		this.retryInitialIntervalMs = cfg.commitBroadcastRetryInitialMs ?? 250;
 		this.retryBackoffFactor = cfg.commitBroadcastRetryBackoffFactor ?? 2;
@@ -62,6 +94,8 @@ export class ClusterCoordinator {
 		this.retryMaxAttempts = cfg.commitBroadcastRetryMaxAttempts ?? 5;
 		this.commitBroadcastImmediateRetries = cfg.commitBroadcastImmediateRetries ?? 1;
 		this.promiseImmediateRetries = cfg.promiseImmediateRetries ?? 1;
+		this.now = clock?.now ?? ((): number => Date.now());
+		this.setTimer = clock?.setTimer ?? defaultSetTimer;
 	}
 
 	/**
@@ -207,7 +241,7 @@ export class ClusterCoordinator {
 			messageHash,
 			record,
 			pending,
-			lastUpdate: Date.now()
+			lastUpdate: this.now()
 		};
 		this.transactions.set(messageHash, state);
 		this.persistCoordinatorState(messageHash, record, 'promising');
@@ -238,7 +272,7 @@ export class ClusterCoordinator {
 			// Let the retry completion or abort handle cleanup
 			if (!stored?.retry) {
 				// Wait a bit before cleanup to allow any in-flight responses to arrive
-				setTimeout(() => {
+				this.setTimer(() => {
 					this.transactions.delete(messageHash);
 					this.deleteCoordinatorState(messageHash);
 					log('cluster-tx:transaction-remove', {
@@ -645,7 +679,7 @@ export class ClusterCoordinator {
 			return;
 		}
 		state.record = { ...record };
-		state.lastUpdate = Date.now();
+		state.lastUpdate = this.now();
 		log('cluster-tx:transaction-update', {
 			messageHash: record.messageHash,
 			stage,
@@ -671,17 +705,15 @@ export class ClusterCoordinator {
 		}
 		const pendingPeers = new Set(missingPeers);
 		const baseInterval = existing ? Math.min(existing.intervalMs * this.retryBackoffFactor, this.retryMaxIntervalMs) : this.retryInitialIntervalMs;
-		if (existing?.timer) {
-			clearTimeout(existing.timer);
-		}
-		const timer = setTimeout(() => {
+		existing?.cancel?.();
+		const cancel = this.setTimer(() => {
 			void this.retryCommits(messageHash);
 		}, baseInterval);
 		state.retry = {
 			pendingPeers,
 			attempt: nextAttempt,
 			intervalMs: baseInterval,
-			timer
+			cancel
 		};
 		this.persistCoordinatorState(messageHash, state.record, 'broadcasting', {
 			pendingPeers: Array.from(pendingPeers),
@@ -746,12 +778,10 @@ export class ClusterCoordinator {
 		if (!state?.retry) {
 			return;
 		}
-		if (state.retry.timer) {
-			clearTimeout(state.retry.timer);
-		}
+		state.retry.cancel?.();
 		state.retry = undefined;
 		// Clean up the transaction after retry is complete
-		setTimeout(() => {
+		this.setTimer(() => {
 			this.transactions.delete(messageHash);
 			this.deleteCoordinatorState(messageHash);
 			log('cluster-tx:transaction-remove', {
@@ -772,7 +802,7 @@ export class ClusterCoordinator {
 		this.stateStore.saveCoordinatorState(messageHash, {
 			messageHash,
 			record,
-			lastUpdate: Date.now(),
+			lastUpdate: this.now(),
 			phase,
 			retryState
 		}).catch(err => log('cluster-tx:persist-error', { messageHash, error: (err as Error).message }));
@@ -795,7 +825,7 @@ export class ClusterCoordinator {
 		for (const state of states) {
 			const { messageHash } = state;
 			// Expired — clean up
-			if (state.record.message.expiration && state.record.message.expiration < Date.now()) {
+			if (state.record.message.expiration && state.record.message.expiration < this.now()) {
 				log('cluster-tx:recovery-expired', { messageHash });
 				await this.stateStore.deleteCoordinatorState(messageHash);
 				continue;

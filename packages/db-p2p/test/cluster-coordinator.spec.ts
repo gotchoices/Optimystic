@@ -1,5 +1,5 @@
 import { expect } from 'chai';
-import { ClusterCoordinator } from '../src/repo/cluster-coordinator.js';
+import { ClusterCoordinator, type TimerCancel } from '../src/repo/cluster-coordinator.js';
 import type { ClusterRecord, ClusterPeers, IKeyNetwork, RepoMessage, ClusterConsensusConfig, BlockId, Signature } from '@optimystic/db-core';
 import type { PeerId } from '@libp2p/interface';
 import { peerIdFromPrivateKey } from '@libp2p/peer-id';
@@ -10,6 +10,74 @@ const makePeerId = async (): Promise<PeerId> => {
 	const pk = await generateKeyPair('Ed25519');
 	return peerIdFromPrivateKey(pk);
 };
+
+/**
+ * A deterministic clock + timer queue for the coordinator's scheduled commit retries. `now` advances
+ * only via {@link advance}; due timers fire in ascending `fireAt` order and a cancel handle removes a
+ * not-yet-fired timer. Mirrors the reactivity `FakeScheduler`
+ * (test/reactivity/rotation-rereg-scheduler.spec.ts) so the two timer seams are tested the same way.
+ *
+ * Unlike the reactivity scheduler, the coordinator's retry callback (`retryCommits`) is **async**: a
+ * fired timer only *starts* the retry, and the next retry is armed after the retry's promises settle.
+ * So the migration pairs every {@link advance} with an `await flush()` — advancing fires the due timer
+ * synchronously, then `flush()` drains the microtasks the async retry runs on (state mutation + arming
+ * the next backoff timer). Without the flush the assertions read pre-retry state (a vacuous pass).
+ */
+class FakeScheduler {
+	now = 0;
+	private nextId = 1;
+	private readonly timers = new Map<number, { fireAt: number; fn: () => void }>();
+
+	readonly setTimer = (fn: () => void, delayMs: number): TimerCancel => {
+		const id = this.nextId++;
+		this.timers.set(id, { fireAt: this.now + delayMs, fn });
+		return (): void => {
+			this.timers.delete(id);
+		};
+	};
+
+	readonly clock = (): number => this.now;
+
+	get pending(): number {
+		return this.timers.size;
+	}
+
+	/** Advance the clock by `ms`, firing every timer due at or before the new time (ascending `fireAt`). */
+	advance(ms: number): void {
+		const target = this.now + ms;
+		for (;;) {
+			let nextId: number | undefined;
+			let next: { fireAt: number; fn: () => void } | undefined;
+			for (const [id, t] of this.timers) {
+				if (t.fireAt <= target && (next === undefined || t.fireAt < next.fireAt)) {
+					nextId = id;
+					next = t;
+				}
+			}
+			if (nextId === undefined || next === undefined) {
+				break;
+			}
+			this.timers.delete(nextId);
+			this.now = next.fireAt;
+			next.fn();
+		}
+		this.now = target;
+	}
+}
+
+/**
+ * Drain the microtask queue (plus one macrotask boundary) so an async `retryCommits` — which awaits
+ * `Promise.all(peer updates)` — fully settles before the assertion. The mock `update` resolves on the
+ * microtask queue, so one `setImmediate` boundary is sufficient to run the retry's continuation
+ * (commit merge + arming the next backoff timer).
+ */
+const flush = (): Promise<void> => new Promise<void>((resolve) => setImmediate(resolve));
+
+/** The 8th `ClusterCoordinator` constructor argument: the injected clock/timer seam. */
+const clockOpts = (clock: FakeScheduler): { now: () => number; setTimer: FakeScheduler['setTimer'] } => ({
+	now: clock.clock,
+	setTimer: clock.setTimer
+});
 
 /**
  * Mock cluster client for testing ClusterCoordinator retry behavior.
@@ -61,13 +129,14 @@ class MockClusterClient {
 }
 
 describe('ClusterCoordinator retry logic (TEST-5.2.1)', function () {
-	// Retry scenarios below use real setTimeout delays totaling up to ~4.5s per case;
-	// budget above the 10s package default to accommodate multiple sequential retry windows.
-	this.timeout(15000);
+	// Retry scenarios below run entirely on a fake clock (FakeScheduler) — the coordinator's scheduled
+	// commit-retry timers are driven by clock.advance(), so no real wall-clock time elapses and the
+	// default mocha timeout is ample. (Previously this block waited on real timers totaling ~4.5s/case.)
 
 	let peerIds: PeerId[];
 	let mockClusters: Map<string, MockClusterClient>;
 	let coordinator: ClusterCoordinator;
+	let clock: FakeScheduler;
 
 	const cfg: ClusterConsensusConfig & { clusterSize: number } = {
 		clusterSize: 3,
@@ -79,12 +148,15 @@ describe('ClusterCoordinator retry logic (TEST-5.2.1)', function () {
 		partitionDetectionWindow: 60000
 	};
 
+	// Expiration is stamped against the SAME fake clock the coordinator reads, so it is not instantly
+	// expired against a fake `now` that starts at 0.
 	const makeMessage = (): RepoMessage => ({
 		operations: [{ get: { blockIds: ['block-1'] } }],
-		expiration: Date.now() + 30000
+		expiration: clock.now + 30000
 	});
 
 	beforeEach(async () => {
+		clock = new FakeScheduler();
 		peerIds = await Promise.all([makePeerId(), makePeerId(), makePeerId()]);
 
 		const clusterPeers: ClusterPeers = {};
@@ -112,7 +184,12 @@ describe('ClusterCoordinator retry logic (TEST-5.2.1)', function () {
 		coordinator = new ClusterCoordinator(
 			mockKeyNetwork,
 			createClient as any,
-			cfg
+			cfg,
+			undefined, // localCluster
+			undefined, // fretService
+			undefined, // reputation
+			undefined, // stateStore
+			clockOpts(clock)
 		);
 	});
 
@@ -127,8 +204,10 @@ describe('ClusterCoordinator retry logic (TEST-5.2.1)', function () {
 			expect(mock.updateCalls).to.equal(3);
 		}
 
-		// No retry in background — wait briefly and verify no extra calls
-		await new Promise(r => setTimeout(r, 300));
+		// No retry scheduled — advancing the fake clock fires only the deferred cleanup timer, never
+		// another update.
+		clock.advance(300);
+		await flush();
 		for (const [_, mock] of mockClusters) {
 			expect(mock.updateCalls).to.equal(3);
 		}
@@ -156,11 +235,15 @@ describe('ClusterCoordinator retry logic (TEST-5.2.1)', function () {
 		// (initial + 1 immediate in-line retry, both fail) = 4
 		expect(failingMock.updateCalls).to.equal(4);
 
-		// Wait for first scheduled retry (default initial interval is 250ms)
-		await new Promise(r => setTimeout(r, 500));
+		// The first scheduled retry fires at EXACTLY the 250ms initial interval — one tick short and
+		// nothing fires; at the interval, exactly one retry attempt runs.
+		clock.advance(249);
+		await flush();
+		expect(failingMock.updateCalls, 'no retry one tick before the initial interval').to.equal(4);
 
-		// Scheduled retry should have fired: at least 1 additional call
-		expect(failingMock.updateCalls).to.be.greaterThanOrEqual(5);
+		clock.advance(1);
+		await flush();
+		expect(failingMock.updateCalls, 'exactly one scheduled retry attempt fired at 250ms').to.equal(5);
 	});
 
 	it('retry succeeds when peer recovers', async () => {
@@ -169,20 +252,21 @@ describe('ClusterCoordinator retry logic (TEST-5.2.1)', function () {
 		failingMock.failCommit = true;
 
 		await coordinator.executeClusterTransaction('block-1' as BlockId, makeMessage());
+		expect(failingMock.updateCalls).to.equal(4);
 
 		// Fix the peer before the retry fires
 		failingMock.failCommit = false;
 
-		// Wait for retry
-		await new Promise(r => setTimeout(r, 2500));
+		// First scheduled retry (250ms) fires and succeeds → pending peer clears → no further retries.
+		clock.advance(250);
+		await flush();
+		expect(failingMock.updateCalls, 'the single scheduled retry ran and succeeded').to.equal(5);
 
-		// Peer should have been retried and succeeded (no further retries scheduled)
-		expect(failingMock.updateCalls).to.be.greaterThanOrEqual(3);
-
-		// Wait another interval to confirm no further retries after success
+		// Advance well past several backoff intervals to confirm no further retries after success.
 		const callsAfterRecovery = failingMock.updateCalls;
-		await new Promise(r => setTimeout(r, 2500));
-		expect(failingMock.updateCalls).to.equal(callsAfterRecovery);
+		clock.advance(5000);
+		await flush();
+		expect(failingMock.updateCalls, 'no further retries after the peer recovered').to.equal(callsAfterRecovery);
 	});
 
 	it('continues retrying with exponential backoff on persistent failure', async () => {
@@ -190,23 +274,42 @@ describe('ClusterCoordinator retry logic (TEST-5.2.1)', function () {
 		const failingMock = mockClusters.get(failingId)!;
 		failingMock.failCommit = true;
 
-		await coordinator.executeClusterTransaction('block-1' as BlockId, makeMessage());
+		const result = await coordinator.executeClusterTransaction('block-1' as BlockId, makeMessage());
+		expect(failingMock.updateCalls).to.equal(4);
 
-		// First retry at ~2s
-		await new Promise(r => setTimeout(r, 2500));
-		const callsAfterFirst = failingMock.updateCalls;
-		expect(callsAfterFirst).to.be.greaterThanOrEqual(3);
+		const hash = result.record.messageHash;
+		const retryState = (): { attempt: number; intervalMs: number } | undefined =>
+			(coordinator as any).transactions.get(hash)?.retry;
 
-		// Second retry at ~4s after first (backoff factor 2)
-		await new Promise(r => setTimeout(r, 4500));
-		const callsAfterSecond = failingMock.updateCalls;
-		expect(callsAfterSecond).to.be.greaterThan(callsAfterFirst);
+		// Attempt 1 is armed at the 250ms initial interval.
+		expect(retryState()?.intervalMs, 'attempt 1 interval').to.equal(250);
+
+		// Fire attempt 1 → it fails again and arms attempt 2 at 250 * 2 = 500ms (backoff factor 2).
+		clock.advance(250);
+		await flush();
+		expect(failingMock.updateCalls, 'attempt 1 ran').to.equal(5);
+		expect(retryState()?.intervalMs, 'attempt 2 interval doubles to 500').to.equal(500);
+
+		// Virtual time is exact: one tick short of 500 fires nothing; at 500 attempt 2 runs and arms
+		// attempt 3 at 500 * 2 = 1000ms.
+		clock.advance(499);
+		await flush();
+		expect(failingMock.updateCalls, 'no fire one tick short of the 500ms backoff').to.equal(5);
+
+		clock.advance(1);
+		await flush();
+		expect(failingMock.updateCalls, 'attempt 2 ran at exactly 500ms').to.equal(6);
+		expect(retryState()?.intervalMs, 'attempt 3 interval doubles to 1000').to.equal(1000);
+
+		// Fire attempt 3 → arms attempt 4 at 1000 * 2 = 2000ms.
+		clock.advance(1000);
+		await flush();
+		expect(failingMock.updateCalls, 'attempt 3 ran at exactly 1000ms').to.equal(7);
+		expect(retryState()?.intervalMs, 'attempt 4 interval doubles to 2000').to.equal(2000);
 	});
 });
 
 describe('ClusterCoordinator broadcast in-line retry', function () {
-	this.timeout(15000);
-
 	let peerIds: PeerId[];
 	let mockClusters: Map<string, MockClusterClient>;
 
@@ -220,12 +323,12 @@ describe('ClusterCoordinator broadcast in-line retry', function () {
 		partitionDetectionWindow: 60000
 	};
 
-	const makeMessage = (): RepoMessage => ({
+	const makeMessage = (clock: FakeScheduler): RepoMessage => ({
 		operations: [{ get: { blockIds: ['block-1'] } }],
-		expiration: Date.now() + 30000
+		expiration: clock.now + 30000
 	});
 
-	const setupCluster = async (cfg: ClusterConsensusConfig & { clusterSize: number }) => {
+	const setupCluster = async (cfg: ClusterConsensusConfig & { clusterSize: number }, clock: FakeScheduler) => {
 		peerIds = await Promise.all([makePeerId(), makePeerId(), makePeerId()]);
 		const clusterPeers: ClusterPeers = {};
 		mockClusters = new Map();
@@ -246,18 +349,28 @@ describe('ClusterCoordinator broadcast in-line retry', function () {
 			if (!mock) throw new Error(`No mock for ${peerId.toString()}`);
 			return mock;
 		};
-		return new ClusterCoordinator(mockKeyNetwork, createClient as any, cfg);
+		return new ClusterCoordinator(
+			mockKeyNetwork,
+			createClient as any,
+			cfg,
+			undefined, // localCluster
+			undefined, // fretService
+			undefined, // reputation
+			undefined, // stateStore
+			clockOpts(clock)
+		);
 	};
 
 	it('recovers when first broadcast attempt fails but in-line retry succeeds', async () => {
-		const coordinator = await setupCluster(baseCfg);
+		const clock = new FakeScheduler();
+		const coordinator = await setupCluster(baseCfg, clock);
 		const failingId = peerIds[2]!.toString();
 		const failingMock = mockClusters.get(failingId)!;
 		// commit phase = call 1 (succeeds), broadcast attempt 1 = call 2 (fails),
 		// broadcast in-line retry = call 3 (succeeds)
 		failingMock.failOnCommitCall = 2;
 
-		const result = await coordinator.executeClusterTransaction('block-1' as BlockId, makeMessage());
+		const result = await coordinator.executeClusterTransaction('block-1' as BlockId, makeMessage(clock));
 
 		expect(Object.keys(result.record.commits)).to.have.length(3);
 		expect(failingMock.commitPhaseCalls).to.equal(3);
@@ -265,19 +378,21 @@ describe('ClusterCoordinator broadcast in-line retry', function () {
 		const txState = (coordinator as any).transactions.get(result.record.messageHash);
 		expect(txState?.retry, 'expected no scheduled retry after successful in-line retry').to.equal(undefined);
 
-		// Wait past the default 250ms initial timer; no extra calls should fire
+		// Advance past the default 250ms initial timer; no extra calls should fire (only cleanup runs).
 		const callsAfterBroadcast = failingMock.updateCalls;
-		await new Promise(r => setTimeout(r, 400));
+		clock.advance(400);
+		await flush();
 		expect(failingMock.updateCalls).to.equal(callsAfterBroadcast);
 	});
 
 	it('schedules a 250ms retry when both broadcast attempts fail', async () => {
-		const coordinator = await setupCluster(baseCfg);
+		const clock = new FakeScheduler();
+		const coordinator = await setupCluster(baseCfg, clock);
 		const failingId = peerIds[2]!.toString();
 		const failingMock = mockClusters.get(failingId)!;
 		failingMock.failCommit = true;
 
-		const result = await coordinator.executeClusterTransaction('block-1' as BlockId, makeMessage());
+		const result = await coordinator.executeClusterTransaction('block-1' as BlockId, makeMessage(clock));
 
 		// 1 promise + 1 commit-fail + 2 broadcast attempts (both fail) = 4
 		expect(failingMock.updateCalls).to.equal(4);
@@ -289,17 +404,18 @@ describe('ClusterCoordinator broadcast in-line retry', function () {
 	});
 
 	it('honors custom commitBroadcastImmediateRetries and commitBroadcastRetryInitialMs', async () => {
+		const clock = new FakeScheduler();
 		const customCfg = {
 			...baseCfg,
 			commitBroadcastRetryInitialMs: 100,
 			commitBroadcastImmediateRetries: 2
 		};
-		const coordinator = await setupCluster(customCfg);
+		const coordinator = await setupCluster(customCfg, clock);
 		const failingId = peerIds[2]!.toString();
 		const failingMock = mockClusters.get(failingId)!;
 		failingMock.failCommit = true;
 
-		const result = await coordinator.executeClusterTransaction('block-1' as BlockId, makeMessage());
+		const result = await coordinator.executeClusterTransaction('block-1' as BlockId, makeMessage(clock));
 
 		// 1 promise + 1 commit-fail + 3 broadcast attempts (initial + 2 immediate retries) = 5
 		expect(failingMock.updateCalls).to.equal(5);
@@ -310,8 +426,6 @@ describe('ClusterCoordinator broadcast in-line retry', function () {
 });
 
 describe('ClusterCoordinator undersized-cluster gate (validateSmallCluster)', function () {
-	this.timeout(10000);
-
 	const baseCfg: ClusterConsensusConfig & { clusterSize: number } = {
 		clusterSize: 1,
 		superMajorityThreshold: 0.75,
@@ -322,14 +436,14 @@ describe('ClusterCoordinator undersized-cluster gate (validateSmallCluster)', fu
 		partitionDetectionWindow: 60000
 	};
 
-	const makeMessage = (): RepoMessage => ({
+	const makeMessage = (clock: FakeScheduler): RepoMessage => ({
 		operations: [{ get: { blockIds: ['block-1'] } }],
-		expiration: Date.now() + 30000
+		expiration: clock.now + 30000
 	});
 
 	// Single-peer cluster (peerCount 1 < minAbsoluteClusterSize 2) with NO FRET service,
 	// so validateSmallCluster always falls through to the no-confident-estimate branch.
-	const setupSinglePeer = async (cfg: ClusterConsensusConfig & { clusterSize: number }) => {
+	const setupSinglePeer = async (cfg: ClusterConsensusConfig & { clusterSize: number }, clock: FakeScheduler) => {
 		const pid = await makePeerId();
 		const idStr = pid.toString();
 		const clusterPeers: ClusterPeers = {
@@ -344,15 +458,25 @@ describe('ClusterCoordinator undersized-cluster gate (validateSmallCluster)', fu
 			async findCluster() { return { ...clusterPeers }; }
 		};
 		const createClient = (_peerId: PeerId) => mock;
-		const coordinator = new ClusterCoordinator(mockKeyNetwork, createClient as any, cfg);
+		const coordinator = new ClusterCoordinator(
+			mockKeyNetwork,
+			createClient as any,
+			cfg,
+			undefined, // localCluster
+			undefined, // fretService
+			undefined, // reputation
+			undefined, // stateStore
+			clockOpts(clock)
+		);
 		return { coordinator, mock };
 	};
 
 	it('rejects an undersized cluster with no confident estimate when the flag is off (default)', async () => {
-		const { coordinator } = await setupSinglePeer(baseCfg);
+		const clock = new FakeScheduler();
+		const { coordinator } = await setupSinglePeer(baseCfg, clock);
 		let err: Error | undefined;
 		try {
-			await coordinator.executeClusterTransaction('block-1' as BlockId, makeMessage());
+			await coordinator.executeClusterTransaction('block-1' as BlockId, makeMessage(clock));
 		} catch (e) {
 			err = e as Error;
 		}
@@ -361,8 +485,9 @@ describe('ClusterCoordinator undersized-cluster gate (validateSmallCluster)', fu
 	});
 
 	it('admits an undersized cluster when allowUnvalidatedSmallCluster is on', async () => {
-		const { coordinator } = await setupSinglePeer({ ...baseCfg, allowUnvalidatedSmallCluster: true });
-		const result = await coordinator.executeClusterTransaction('block-1' as BlockId, makeMessage());
+		const clock = new FakeScheduler();
+		const { coordinator } = await setupSinglePeer({ ...baseCfg, allowUnvalidatedSmallCluster: true }, clock);
+		const result = await coordinator.executeClusterTransaction('block-1' as BlockId, makeMessage(clock));
 		expect(Object.keys(result.record.commits)).to.have.length(1);
 	});
 });
