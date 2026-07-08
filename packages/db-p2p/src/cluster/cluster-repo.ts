@@ -865,7 +865,15 @@ export class ClusterMember implements ICluster {
 		}
 
 		const derived = await this.deriveExpectedClusterView(record);
-		const confident = derived !== undefined && derived.confidence > ClusterMember.MembershipConfidenceThreshold;
+		// An empty derived view (kEst === 0) carries no usable reference set: measured against it every
+		// non-empty declared set is wholly "inconsistent" (maxDiff = ceil(tol·0) = 0), which would spuriously
+		// reject a legitimate full cluster — a stricter, worse outcome than an absent view. Treat empty as
+		// not-confident so it takes the fail-closed-or-legacy branch below instead. (Not normally reachable:
+		// a responsible member's findCluster includes at least itself; this guards a transient empty read.)
+		const derivedSize = derived !== undefined ? Object.keys(derived.peers ?? {}).length : 0;
+		const confident = derived !== undefined
+			&& derived.confidence > ClusterMember.MembershipConfidenceThreshold
+			&& derivedSize > 0;
 
 		if (!confident) {
 			// Fail closed for downsizing under low/absent confidence. A full-size (or larger) declared set is

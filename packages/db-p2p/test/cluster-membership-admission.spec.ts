@@ -225,6 +225,22 @@ describe('ClusterMember — membership admission gate', () => {
 		});
 	});
 
+	describe('empty derived view (confident but unusable reference)', () => {
+		it('treats a confident-but-empty view as not-confident: full-size D admitted, shrunk D fails closed', async () => {
+			const emptyView: ExpectedClusterView = { peers: {}, confidence: 0.9 };
+			// Full-size D (>= configured clusterSize): nothing to shrink → admit (legacy/fail-open direction).
+			const full = cluster(8);
+			const fullVote = await voteOn(self, full, emptyView, baseConfig({ clusterSize: 8 }));
+			expect(fullVote.type, 'full-size D under empty view admits').to.equal('approve');
+
+			// Shrunk D (< configured clusterSize): fail closed rather than spuriously reject as inconsistent.
+			const shrunk = cluster(3);
+			const shrunkVote = await voteOn(self, shrunk, emptyView, baseConfig({ clusterSize: 8 }));
+			expect(shrunkVote.type, 'shrunk D under empty view fails closed').to.equal('reject');
+			expect(shrunkVote.rejectReason).to.equal(`${MEMBERSHIP_NOT_ADMITTED}:low-confidence-downsize`);
+		});
+	});
+
 	describe('allowUnvalidatedSmallCluster opt-in', () => {
 		it('lets a solo/dev member admit an undersized D', async () => {
 			const solo = [self];
