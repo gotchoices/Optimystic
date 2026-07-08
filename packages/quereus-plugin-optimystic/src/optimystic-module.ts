@@ -23,7 +23,6 @@ import { SqlDataType, PhysicalType } from '@quereus/quereus';
 import { INTEGER_TYPE, REAL_TYPE, TEXT_TYPE, BLOB_TYPE, NUMERIC_TYPE, NULL_TYPE, BOOLEAN_TYPE, type LogicalType } from '@quereus/quereus';
 import { IndexManager, serializeIndexValue, type IndexEntry } from './schema/index-manager.js';
 import { encodeKeyTuple } from './schema/key-encoding.js';
-import { StatisticsCollector } from './schema/statistics-collector.js';
 import { createLogger } from './logger.js';
 
 const log = createLogger('module');
@@ -103,7 +102,6 @@ export class OptimysticVirtualTable extends VirtualTable {
   private schemaManager: SchemaManager;
   private rowCodec?: RowCodec;
   private indexManager?: IndexManager;
-  private statisticsCollector?: StatisticsCollector;
   private connection?: OptimysticVirtualTableConnection;
   /** Unsubscribe handle for the collection-change → watch bridge (set once after init). */
   private changeUnsubscribe?: () => void;
@@ -252,9 +250,6 @@ export class OptimysticVirtualTable extends VirtualTable {
       });
 
       await this.indexManager.initialize(txnState?.transactor);
-
-      // Create statistics collector
-      this.statisticsCollector = new StatisticsCollector(storedSchema);
 
       // Register the main + index collections with the bridge so a session-mode
       // coordinator shares the very trackers this vtab stages into (see
@@ -992,9 +987,6 @@ export class OptimysticVirtualTable extends VirtualTable {
             // Stage into all indexes
             await this.indexManager.insertIndexEntries(values, insertKey, txnState?.transactor);
 
-            // Update statistics
-            this.statisticsCollector?.incrementRowCount();
-
             return { status: 'ok', row: values };
           }
 
@@ -1088,11 +1080,6 @@ export class OptimysticVirtualTable extends VirtualTable {
                     txnState?.transactor
                   );
 
-                  // The displaced row is gone, so the net row count drops by one
-                  // — the one UPDATE that is not count-neutral, mirroring the
-                  // delete path's decrementRowCount().
-                  this.statisticsCollector?.decrementRowCount();
-
                   return { status: 'ok', row: values, replacedRow: existingRow };
                 }
 
@@ -1157,9 +1144,6 @@ export class OptimysticVirtualTable extends VirtualTable {
 
             // Stage deletes from all indexes
             await this.indexManager.deleteIndexEntries(oldRow, deleteKey, txnState?.transactor);
-
-            // Update statistics
-            this.statisticsCollector?.decrementRowCount();
 
             return { status: 'ok' };
           }
@@ -1698,8 +1682,6 @@ export class OptimysticModule implements VirtualTableModule<VirtualTable, Optimy
     tableInfo: TableSchema,
     request: BestAccessPlanRequest
   ): BestAccessPlanResult {
-    // Get statistics for cost estimation - note: statisticsCollector is per-table, not per-module
-    // For now, use default estimates
     const tableRowCount = tableInfo.estimatedRows || 1000000;
     const tableScanCost = Math.max(1000, tableRowCount);
 
