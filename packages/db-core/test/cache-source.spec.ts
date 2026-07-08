@@ -1,6 +1,7 @@
 import { expect } from 'chai';
 import type { BlockId, BlockOperation, BlockSource, BlockType, IBlock, Transforms } from '../src/index.js';
 import { CacheSource } from '../src/transform/cache-source.js';
+import { ReadDependencyCollector } from '../src/transaction/read-dependency-collector.js';
 
 interface TestBlock extends IBlock {
 	data: string;
@@ -24,6 +25,15 @@ function makeSource(blocks: Map<string, TestBlock>): BlockSource<TestBlock> {
 		generateId: () => 'gen-id' as BlockId,
 		createBlockHeader: (type: BlockType) => ({ id: 'gen-id' as BlockId, type, collectionId: 'col' as BlockId }),
 	};
+}
+
+/** A source that also reports a per-id read revision (the duck-typed `getReadRevision` that
+ * CacheSource probes on a miss-load), mirroring what a real TransactorSource exposes. */
+function makeRevSource(blocks: Map<string, TestBlock>, revs: Map<string, number>): BlockSource<TestBlock> {
+	return {
+		...makeSource(blocks),
+		getReadRevision: (id: BlockId) => revs.get(id),
+	} as BlockSource<TestBlock>;
 }
 
 describe('CacheSource', () => {
@@ -116,7 +126,7 @@ describe('CacheSource', () => {
 			await cache.tryGet('a' as BlockId);
 
 			const transform: Transforms = { deletes: ['a' as BlockId] };
-			cache.transformCache(transform);
+			cache.transformCache(transform, 1);
 
 			// Block is removed from cache — refetch from source
 			blocks.set('a', makeBlock('a', 'refetched'));
@@ -127,7 +137,7 @@ describe('CacheSource', () => {
 		it('should apply inserts to cache', async () => {
 			const newBlock = makeBlock('c', 'gamma');
 			const transform: Transforms = { inserts: { c: newBlock } };
-			cache.transformCache(transform);
+			cache.transformCache(transform, 1);
 
 			const result = await cache.tryGet('c' as BlockId);
 			expect(result!.data).to.equal('gamma');
@@ -136,7 +146,7 @@ describe('CacheSource', () => {
 		it('should clone inserted blocks', async () => {
 			const newBlock = makeBlock('c', 'gamma');
 			const transform: Transforms = { inserts: { c: newBlock } };
-			cache.transformCache(transform);
+			cache.transformCache(transform, 1);
 
 			// Mutate original
 			newBlock.data = 'mutated';
@@ -150,7 +160,7 @@ describe('CacheSource', () => {
 
 			const op: BlockOperation = ['data', 0, 0, 'updated'];
 			const transform: Transforms = { updates: { a: [op] } };
-			cache.transformCache(transform);
+			cache.transformCache(transform, 1);
 
 			const result = await cache.tryGet('a' as BlockId);
 			expect(result!.data).to.equal('updated');
@@ -161,7 +171,7 @@ describe('CacheSource', () => {
 
 			const op: BlockOperation = ['items', 1, 1, ['z']];
 			const transform: Transforms = { updates: { a: [op] } };
-			cache.transformCache(transform);
+			cache.transformCache(transform, 1);
 
 			const result = await cache.tryGet('a' as BlockId);
 			expect(result!.items).to.deep.equal(['x', 'z']);
@@ -170,7 +180,7 @@ describe('CacheSource', () => {
 		it('should no-op for updates on uncached blocks', async () => {
 			const op: BlockOperation = ['data', 0, 0, 'updated'];
 			const transform: Transforms = { updates: { a: [op] } };
-			cache.transformCache(transform);
+			cache.transformCache(transform, 1);
 
 			// Block was not in cache, so update is a no-op — source data is unchanged
 			const result = await cache.tryGet('a' as BlockId);
@@ -202,7 +212,7 @@ describe('CacheSource', () => {
 			const gen = cache.getGeneration('a' as BlockId);
 
 			const op: BlockOperation = ['data', 0, 0, 'updated'];
-			cache.transformCache({ updates: { a: [op] } });
+			cache.transformCache({ updates: { a: [op] } }, 1);
 
 			expect(cache.getGeneration('a' as BlockId)).to.be.greaterThan(gen);
 		});
@@ -283,5 +293,97 @@ describe('CacheSource', () => {
 			const header = cache.createBlockHeader('test' as BlockType);
 			expect(header.type).to.equal('test');
 		});
+	});
+
+	describe('read-dependency capture', () => {
+		it('records a dependency on a cache HIT, re-emitting the revision learned on miss-load', async () => {
+			const collector = new ReadDependencyCollector();
+			const revSource = makeRevSource(blocks, new Map([['a', 7]]));
+			const c = new CacheSource(revSource, undefined, collector);
+
+			await c.tryGet('a' as BlockId);   // miss -> learns + records a@7
+			collector.clear();
+
+			await c.tryGet('a' as BlockId);   // hit -> re-emits a@7
+			expect(collector.getReadDependencies()).to.deep.equal([{ blockId: 'a', revision: 7 }]);
+		});
+
+		it('records revision 0 on miss-load when the source cannot report a revision', async () => {
+			const collector = new ReadDependencyCollector();
+			const c = new CacheSource(source, undefined, collector); // plain source: no getReadRevision
+
+			await c.tryGet('a' as BlockId);
+			expect(collector.getReadDependencies()).to.deep.equal([{ blockId: 'a', revision: 0 }]);
+		});
+
+		it('advances the recorded revision after transformCache folds in a newer commit', async () => {
+			const collector = new ReadDependencyCollector();
+			const revSource = makeRevSource(blocks, new Map([['a', 1]]));
+			const c = new CacheSource(revSource, undefined, collector);
+
+			await c.tryGet('a' as BlockId);   // records a@1, cache revision = 1
+			c.transformCache({ updates: { a: [['data', 0, 0, 'v2']] } }, 2); // fold committed rev 2
+			collector.clear();
+
+			await c.tryGet('a' as BlockId);   // hit -> records a@2, not the stale a@1
+			expect(collector.getReadDependencies()).to.deep.equal([{ blockId: 'a', revision: 2 }]);
+		});
+
+		it('records nothing for an absent block (miss:absent)', async () => {
+			const collector = new ReadDependencyCollector();
+			const c = new CacheSource(source, undefined, collector);
+
+			await c.tryGet('missing' as BlockId);
+			await c.tryGet('missing' as BlockId); // absent is never cached — still a miss
+			expect(collector.getReadDependencies()).to.be.empty;
+		});
+
+		it('drops the stored revision when transformCache deletes the block (later read re-learns)', async () => {
+			const collector = new ReadDependencyCollector();
+			const revs = new Map([['a', 3]]);
+			const revSource = makeRevSource(blocks, revs);
+			const c = new CacheSource(revSource, undefined, collector);
+
+			await c.tryGet('a' as BlockId);   // cache a@3
+			c.transformCache({ deletes: ['a' as BlockId] }, 4); // evict from cache + revision map
+			collector.clear();
+
+			revs.set('a', 5);                 // source now serves a newer revision
+			await c.tryGet('a' as BlockId);   // miss -> re-learns a@5
+			expect(collector.getReadDependencies()).to.deep.equal([{ blockId: 'a', revision: 5 }]);
+		});
+
+		it('works without a collector (log-walk caches pass none)', async () => {
+			const c = new CacheSource(makeRevSource(blocks, new Map([['a', 1]]))); // no collector
+			// Just must not throw on hit or miss.
+			await c.tryGet('a' as BlockId);
+			const hit = await c.tryGet('a' as BlockId);
+			expect(hit!.data).to.equal('alpha');
+		});
+	});
+});
+
+describe('ReadDependencyCollector', () => {
+	it('keeps the highest revision per id (never downgrades)', () => {
+		const collector = new ReadDependencyCollector();
+		collector.record('a' as BlockId, 5);
+		collector.record('a' as BlockId, 3); // lower — must not overwrite
+		expect(collector.getReadDependencies()).to.deep.equal([{ blockId: 'a', revision: 5 }]);
+	});
+
+	it('upgrades to a higher revision', () => {
+		const collector = new ReadDependencyCollector();
+		collector.record('a' as BlockId, 2);
+		collector.record('a' as BlockId, 4);
+		expect(collector.getReadDependencies()).to.deep.equal([{ blockId: 'a', revision: 4 }]);
+	});
+
+	it('collects one entry per distinct id and clears', () => {
+		const collector = new ReadDependencyCollector();
+		collector.record('a' as BlockId, 1);
+		collector.record('b' as BlockId, 2);
+		expect(collector.getReadDependencies()).to.have.length(2);
+		collector.clear();
+		expect(collector.getReadDependencies()).to.be.empty;
 	});
 });

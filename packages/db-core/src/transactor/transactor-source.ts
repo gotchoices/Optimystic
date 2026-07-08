@@ -2,15 +2,25 @@ import { randomBytes } from '@noble/hashes/utils.js'
 import { toString as uint8ArrayToString } from 'uint8arrays/to-string'
 import type { IBlock, BlockId, BlockHeader, ITransactor, ActionId, StaleFailure, ActionContext, BlockType, BlockSource, Transforms } from "../index.js";
 import type { ReadDependency } from "../transaction/transaction.js";
+import { ReadDependencyCollector } from "../transaction/read-dependency-collector.js";
 
 export class TransactorSource<TBlock extends IBlock> implements BlockSource<TBlock> {
-	private readDependencies: ReadDependency[] = [];
+	/** Shared with this collection's CacheSource so cache hits also record dependencies.
+	 *  Defaults to a private instance so internal log-walk sources (which never need a
+	 *  transaction read set) work standalone. */
+	private readonly collector: ReadDependencyCollector;
+	/** Last revision observed per id, so CacheSource can learn the revision on a miss-load
+	 *  (it calls {@link getReadRevision} right after this source serves the block). */
+	private readRevisions = new Map<BlockId, number>();
 
 	constructor(
 		private readonly collectionId: BlockId,
 		private readonly transactor: ITransactor,
 		public actionContext: ActionContext | undefined,
-	) { }
+		collector?: ReadDependencyCollector,
+	) {
+		this.collector = collector ?? new ReadDependencyCollector();
+	}
 
 	createBlockHeader(type: BlockType, newId?: BlockId): BlockHeader {
 		return {
@@ -33,20 +43,36 @@ export class TransactorSource<TBlock extends IBlock> implements BlockSource<TBlo
 		const entry = result?.[id];
 		if (entry) {
 			const { block, state } = entry;
-			// Record read dependency for optimistic concurrency control
-			this.readDependencies.push({ blockId: id, revision: state.latest?.rev ?? 0 });
+			// Record a read dependency only for a block that actually exists. A transactor may return a
+			// populated entry with `block: undefined` for a genuinely-missing block (TestTransactor does;
+			// the Network transactor always populates the key); recording there would add a phantom
+			// dependency for a nonexistent block. This makes the "absent reads nothing" contract uniform
+			// with the sparse-result case (entry omitted) — see transactor-source.spec.ts sparse test.
+			if (block) {
+				// Record read dependency for optimistic concurrency control
+				const rev = state.latest?.rev ?? 0;
+				this.collector.record(id, rev);
+				this.readRevisions.set(id, rev);
+			}
 			// TODO: if the state reports that there is a pending action, record this so that we are sure to update before syncing
 			//state.pendings
 			return block as TBlock;
 		}
 	}
 
+	/** The revision observed the last time this source served {@link id} (from its committed
+	 *  state), or undefined if this source has never served it. CacheSource reads this on a
+	 *  miss-load to learn the revision to record and store. */
+	getReadRevision(id: BlockId): number | undefined {
+		return this.readRevisions.get(id);
+	}
+
 	getReadDependencies(): ReadDependency[] {
-		return this.readDependencies;
+		return this.collector.getReadDependencies();
 	}
 
 	clearReadDependencies(): void {
-		this.readDependencies = [];
+		this.collector.clear();
 	}
 
 	/**

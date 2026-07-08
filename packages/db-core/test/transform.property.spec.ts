@@ -402,7 +402,7 @@ describe('Transform property-based tests', () => {
           const cache = new CacheSource<TestBlock>(src)
           // Pre-populate so updates have a cache target
           for (const id of BLOCK_IDS) await cache.tryGet(id)
-          cache.transformCache(transforms)
+          cache.transformCache(transforms, 1)
 
           for (const id of BLOCK_IDS) {
             const fromCache = await cache.tryGet(id)

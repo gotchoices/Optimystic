@@ -217,7 +217,7 @@ async sync() {
         this.pending = this.pending.slice(pending.length);
         const transforms = tracker.reset();
         await this.replayActions();
-        this.sourceCache.transformCache(transforms);
+        this.sourceCache.transformCache(transforms, newRev);
         this.source.trxContext = {
           committed: [...(this.source.trxContext?.committed ?? []), { actionId, rev: newRev }],
           rev: newRev

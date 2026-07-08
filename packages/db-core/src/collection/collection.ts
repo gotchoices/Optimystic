@@ -3,6 +3,7 @@ import { Log, Atomic, Tracker, copyTransforms, CacheSource, isTransformsEmpty, T
 import type { CollectionHeaderBlock, CollectionId, ICollection, SyncOptions } from "./index.js";
 import { SyncRetryExhaustedError } from "./index.js";
 import type { ReadDependency } from "../transaction/transaction.js";
+import { ReadDependencyCollector } from "../transaction/read-dependency-collector.js";
 import { randomBytes } from '@noble/hashes/utils.js';
 import { toString as uint8ArrayToString } from 'uint8arrays/to-string';
 import { Latches } from "../utility/latches.js";
@@ -55,9 +56,12 @@ export class Collection<TAction> implements ICollection<TAction> {
 	}
 
 	static async createOrOpen<TAction>(transactor: ITransactor, id: CollectionId, init: CollectionInitOptions<TAction>) {
-		// Start with a context that has an infinite revision number to ensure that we always fetch the latest log information
-		const source = new TransactorSource(id, transactor, undefined);
-		const sourceCache = new CacheSource(source);
+		// Start with a context that has an infinite revision number to ensure that we always fetch the latest log information.
+		// One shared read-dependency collector feeds both the source (direct structural reads) and the cache (every
+		// cache hit/miss), so a block read from either layer records a dependency — cache hits included.
+		const collector = new ReadDependencyCollector();
+		const source = new TransactorSource(id, transactor, undefined, collector);
+		const sourceCache = new CacheSource(source, undefined, collector);
 		const tracker = new Tracker(sourceCache);
 		const header = await source.tryGet(id) as CollectionHeaderBlock | undefined;
 
@@ -241,9 +245,12 @@ export class Collection<TAction> implements ICollection<TAction> {
 	 * this, a collection that already had committed state (e.g. a pre-synced index
 	 * tree, or any collection on its second commit) keeps serving the stale prior
 	 * revision because {@link update} sees its rev is already current and refetches
-	 * nothing. Call BEFORE resetting the tracker (the transforms are read live). */
-	applyCommittedToCache(transforms: Transforms): void {
-		this.sourceCache.transformCache(transforms);
+	 * nothing. Call BEFORE resetting the tracker (the transforms are read live).
+	 *
+	 * @param revision - the committed revision these transforms land at (from
+	 * {@link recordCommitted}), so cached read-dependency revisions advance to it. */
+	applyCommittedToCache(transforms: Transforms, revision: number): void {
+		this.sourceCache.transformCache(transforms, revision);
 	}
 
 	/** Next revision this collection would commit at (current committed rev + 1). */
@@ -348,7 +355,7 @@ export class Collection<TAction> implements ICollection<TAction> {
 				// Reset cache and replay any actions that were added during the action
 				const transforms = tracker.reset();
 				await this.replayActions();
-				this.sourceCache.transformCache(transforms);
+				this.sourceCache.transformCache(transforms, newRev);
 				this.source.actionContext = this.source.actionContext
 					? { committed: [...this.source.actionContext.committed, { actionId, rev: newRev }], rev: newRev }
 					: { committed: [{ actionId, rev: newRev }], rev: newRev };

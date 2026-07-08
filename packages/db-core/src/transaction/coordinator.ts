@@ -207,8 +207,8 @@ export class TransactionCoordinator {
 						// Committed → the success-path local treatment (see below): fold the
 						// committed transforms into the read cache BEFORE resetting the tracker,
 						// then drop the now-durable pending actions so a retry cannot re-log them.
-						collection.recordCommitted(transaction.id);
-						collection.applyCommittedToCache(collectionTransforms.get(collectionId)!);
+						const rev = collection.recordCommitted(transaction.id);
+						collection.applyCommittedToCache(collectionTransforms.get(collectionId)!, rev);
 						collection.tracker.reset();
 						collection.clearPendingActions();
 					} else {
@@ -245,8 +245,8 @@ export class TransactionCoordinator {
 		// serves the new revision instead of the stale cached one. Clearing
 		// pending keeps a subsequent commit from re-logging these actions.
 		for (const { collectionId, collection } of collectionData) {
-			collection.recordCommitted(transaction.id);
-			collection.applyCommittedToCache(collectionTransforms.get(collectionId)!);
+			const rev = collection.recordCommitted(transaction.id);
+			collection.applyCommittedToCache(collectionTransforms.get(collectionId)!, rev);
 			collection.tracker.reset();
 			collection.clearPendingActions();
 		}

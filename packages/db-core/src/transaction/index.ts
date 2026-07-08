@@ -24,6 +24,7 @@ export {
 	ACTIONS_ENGINE_ID,
 } from './actions-engine.js';
 
+export { ReadDependencyCollector } from './read-dependency-collector.js';
 export { TransactionCoordinator } from './coordinator.js';
 export { CoordinatorPartialCommitError } from './errors.js';
 export { TransactionSession } from './session.js';

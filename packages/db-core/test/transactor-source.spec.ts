@@ -437,6 +437,9 @@ describe('TransactorSource', () => {
 			const result = await src.tryGet('never-inserted');
 			// The block should be undefined — tryGet returns undefined
 			expect(result).to.be.undefined;
+			// And no read dependency is recorded: a populated-but-blockless entry is an absent read,
+			// which records nothing (uniform with the sparse-entry case below).
+			expect(src.getReadDependencies(), 'no dep for a populated-but-blockless entry').to.be.empty;
 		});
 
 		it('should return undefined (not throw) from tryGet when the transactor returns a SPARSE result missing the requested id', async () => {
