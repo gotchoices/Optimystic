@@ -1,188 +1,89 @@
 // Polyfill IndexedDB into the Node test environment before importing `idb`.
 import 'fake-indexeddb/auto';
 import { expect } from 'chai';
-import { IndexedDBRawStorage } from '../src/indexeddb-storage.js';
+import { IndexedDBRawStorage, IndexedDBStoreDriver } from '../src/indexeddb-storage.js';
 import { openOptimysticWebDb, type OptimysticWebDBHandle } from '../src/db.js';
-import type { ActionId, BlockId, BlockHeader, IBlock, Transform } from '@optimystic/db-core';
-import type { BlockMetadata } from '@optimystic/db-p2p';
-
-const blockId = 'block-1' as BlockId;
-const otherBlockId = 'block-2' as BlockId;
-const actionId = 'action-1' as ActionId;
-
-const makeBlock = (id: string): IBlock => {
-	const header: BlockHeader = {
-		id: id as BlockId,
-		type: 'test',
-		collectionId: 'collection-1' as BlockId
-	};
-	return { header };
-};
-
-const makeTransform = (): Transform => ({ insert: makeBlock(blockId) });
+import { runRawStorageConformance, type ConformanceHarness } from '@optimystic/db-p2p/testing';
+import type { BlockId, ActionId } from '@optimystic/db-core';
 
 let dbCounter = 0;
 
 async function freshDb(): Promise<OptimysticWebDBHandle> {
-	return openOptimysticWebDb(`optimystic-test-${++dbCounter}-${Math.random().toString(36).slice(2)}`);
+	return openOptimysticWebDb(`optimystic-idb-test-${++dbCounter}-${Math.random().toString(36).slice(2)}`);
 }
 
-describe('IndexedDBRawStorage', () => {
+// ---------------------------------------------------------------------------
+// Shared parity suite. Proves IndexedDBRawStorage (KvRawStorage over
+// IndexedDBStoreDriver) behaves identically to every other backend — round-trips,
+// listRevisions ordering, promote atomicity + the exact missing-pend error,
+// clone-on-store/read (structural via the byte boundary), drain-before-yield
+// iteration, and a BlockStorage parity slice. Runs against `fake-indexeddb`;
+// production is the browser, both satisfy the handle interface. Each case gets a
+// fresh, uniquely-named db that cleanup closes.
+// ---------------------------------------------------------------------------
+runRawStorageConformance('IndexedDB', async (): Promise<ConformanceHarness> => {
+	const db = await freshDb();
+	return {
+		storage: new IndexedDBRawStorage(db),
+		cleanup: async () => { db.close(); }
+	};
+});
+
+// ---------------------------------------------------------------------------
+// IndexedDB-only tests the shared suite does not cover.
+// ---------------------------------------------------------------------------
+describe('IndexedDB driver specifics', () => {
 	let db: OptimysticWebDBHandle;
-	let storage: IndexedDBRawStorage;
 
 	beforeEach(async () => {
 		db = await freshDb();
-		storage = new IndexedDBRawStorage(db);
 	});
 
 	afterEach(() => {
 		db.close();
 	});
 
-	it('round-trips metadata', async () => {
-		const meta: BlockMetadata = { ranges: [[1, 5]], latest: { rev: 4, actionId } };
-		await storage.saveMetadata(blockId, meta);
-		const got = await storage.getMetadata(blockId);
-		expect(got).to.deep.equal(meta);
-	});
-
-	it('returns undefined for missing metadata', async () => {
-		expect(await storage.getMetadata('missing' as BlockId)).to.equal(undefined);
-	});
-
-	it('round-trips a single revision', async () => {
-		await storage.saveRevision(blockId, 3, actionId);
-		expect(await storage.getRevision(blockId, 3)).to.equal(actionId);
-		expect(await storage.getRevision(blockId, 4)).to.equal(undefined);
-	});
-
-	it('listRevisions ascending yields revs in order', async () => {
-		await storage.saveRevision(blockId, 1, 'a' as ActionId);
-		await storage.saveRevision(blockId, 2, 'b' as ActionId);
-		await storage.saveRevision(blockId, 3, 'c' as ActionId);
-		await storage.saveRevision(otherBlockId, 1, 'x' as ActionId); // should not leak
-
-		const out: Array<{ rev: number; actionId: ActionId }> = [];
-		for await (const r of storage.listRevisions(blockId, 1, 3)) out.push(r);
-		expect(out).to.deep.equal([
-			{ rev: 1, actionId: 'a' },
-			{ rev: 2, actionId: 'b' },
-			{ rev: 3, actionId: 'c' },
-		]);
-	});
-
-	it('listRevisions descending yields revs in reverse', async () => {
-		await storage.saveRevision(blockId, 1, 'a' as ActionId);
-		await storage.saveRevision(blockId, 2, 'b' as ActionId);
-		await storage.saveRevision(blockId, 3, 'c' as ActionId);
-
-		const out: number[] = [];
-		for await (const r of storage.listRevisions(blockId, 3, 1)) out.push(r.rev);
-		expect(out).to.deep.equal([3, 2, 1]);
-	});
-
-	it('listRevisions skips gaps', async () => {
-		await storage.saveRevision(blockId, 1, 'a' as ActionId);
-		await storage.saveRevision(blockId, 4, 'd' as ActionId);
-
-		const out: number[] = [];
-		for await (const r of storage.listRevisions(blockId, 1, 5)) out.push(r.rev);
-		expect(out).to.deep.equal([1, 4]);
-	});
-
-	it('round-trips a pending transaction and lists it', async () => {
-		await storage.savePendingTransaction(blockId, actionId, makeTransform());
-		await storage.savePendingTransaction(blockId, 'action-2' as ActionId, makeTransform());
-		await storage.savePendingTransaction(otherBlockId, 'action-3' as ActionId, makeTransform());
-
-		expect(await storage.getPendingTransaction(blockId, actionId)).to.deep.equal(makeTransform());
-
-		const ids: ActionId[] = [];
-		for await (const id of storage.listPendingTransactions(blockId)) ids.push(id);
-		expect(ids.sort()).to.deep.equal(['action-1', 'action-2']);
-	});
-
-	it('deletePendingTransaction removes it from the store and from listing', async () => {
-		await storage.savePendingTransaction(blockId, actionId, makeTransform());
-		await storage.deletePendingTransaction(blockId, actionId);
-
-		expect(await storage.getPendingTransaction(blockId, actionId)).to.equal(undefined);
-		const ids: ActionId[] = [];
-		for await (const id of storage.listPendingTransactions(blockId)) ids.push(id);
-		expect(ids).to.deep.equal([]);
-	});
-
-	it('round-trips a committed transaction', async () => {
-		await storage.saveTransaction(blockId, actionId, makeTransform());
-		expect(await storage.getTransaction(blockId, actionId)).to.deep.equal(makeTransform());
-	});
-
-	it('round-trips a materialized block', async () => {
-		const block = makeBlock(blockId);
-		await storage.saveMaterializedBlock(blockId, actionId, block);
-		expect(await storage.getMaterializedBlock(blockId, actionId)).to.deep.equal(block);
-	});
-
-	it('saveMaterializedBlock(undefined) deletes the row', async () => {
-		const block = makeBlock(blockId);
-		await storage.saveMaterializedBlock(blockId, actionId, block);
-		await storage.saveMaterializedBlock(blockId, actionId, undefined);
-		expect(await storage.getMaterializedBlock(blockId, actionId)).to.equal(undefined);
-	});
-
-	it('promotePendingTransaction moves pending → committed atomically', async () => {
-		await storage.savePendingTransaction(blockId, actionId, makeTransform());
-		await storage.promotePendingTransaction(blockId, actionId);
-
-		expect(await storage.getPendingTransaction(blockId, actionId)).to.equal(undefined);
-		expect(await storage.getTransaction(blockId, actionId)).to.deep.equal(makeTransform());
-
-		const ids: ActionId[] = [];
-		for await (const id of storage.listPendingTransactions(blockId)) ids.push(id);
-		expect(ids).to.deep.equal([]);
-	});
-
-	it('throws when promoting a missing pending action', async () => {
-		try {
-			await storage.promotePendingTransaction(blockId, actionId);
-			expect.fail('expected promotePendingTransaction to throw');
-		} catch (err) {
-			expect((err as Error).message).to.match(/Pending action .* not found/);
-		}
-	});
-
+	// The shared suite has no getApproximateBytesUsed case; navigator.storage is
+	// generally absent under Node + fake-indexeddb, so we expect 0. In a real
+	// browser the value is > 0; the contract here is "doesn't throw, returns a
+	// number >= 0."
 	it('getApproximateBytesUsed returns a number', async () => {
-		// navigator.storage is generally absent in Node + fake-indexeddb, in which
-		// case we expect 0. In a real browser the value will be > 0; the contract
-		// here is just "doesn't throw, returns a number."
+		const storage = new IndexedDBRawStorage(db);
 		const used = await storage.getApproximateBytesUsed();
 		expect(used).to.be.a('number');
 		expect(used).to.be.at.least(0);
 	});
 
-	it('listBlockIds yields exactly the ids of blocks with metadata', async () => {
-		await storage.saveMetadata('b1' as BlockId, { ranges: [[1, 1]], latest: { rev: 1, actionId } });
-		await storage.saveMetadata('b2' as BlockId, { ranges: [[1, 2]], latest: { rev: 2, actionId } });
+	// Structured-clone byte fidelity is IndexedDB-specific: a stored Uint8Array
+	// must come back AS a Uint8Array (not an ArrayBuffer / DataView), byte-for-byte,
+	// or the kernel's decode would drift. Assert it at the driver's byte boundary
+	// directly. (The conformance round-trip/clone cases catch this indirectly via
+	// decode; this pins the exact type + bytes.)
+	it('stores and returns a byte-identical Uint8Array (structured-clone fidelity)', async () => {
+		const driver = new IndexedDBStoreDriver(db);
+		const bytes = new Uint8Array([0, 1, 2, 250, 255, 128]);
+		await driver.putMetadata('bytes-block' as BlockId, bytes);
 
-		const out = new Set<string>();
-		for await (const id of storage.listBlockIds()) out.add(id);
-		expect(out).to.deep.equal(new Set(['b1', 'b2']));
+		const got = await driver.getMetadata('bytes-block' as BlockId);
+		expect(got).to.be.instanceOf(Uint8Array);
+		expect(Array.from(got!)).to.deep.equal([0, 1, 2, 250, 255, 128]);
 	});
 
-	it('listBlockIds excludes a pending-only block (no metadata)', async () => {
-		await storage.saveMetadata(blockId, { ranges: [[1, 1]], latest: { rev: 1, actionId } });
-		// Pended, never committed → no metadata row → must not be enumerated.
-		await storage.savePendingTransaction('pending-only' as BlockId, actionId, makeTransform());
+	// The pending scan relies on IndexedDB array-key ordering: the
+	// `[blockId] .. [blockId, []]` bound must capture every `[blockId, actionId]`
+	// key for the block and nothing from a neighbouring block whose id sorts
+	// adjacently. Exercise it directly at the driver level.
+	it('listPendingActionIds captures all of a block and leaks no neighbour', async () => {
+		const driver = new IndexedDBStoreDriver(db);
+		const value = new Uint8Array([1]);
+		await driver.putPending('block-1' as BlockId, 'a' as ActionId, value);
+		await driver.putPending('block-1' as BlockId, 'b' as ActionId, value);
+		// `block-10` sorts adjacent to `block-1` under string comparison; it must
+		// not leak into `block-1`'s pending listing.
+		await driver.putPending('block-10' as BlockId, 'x' as ActionId, value);
 
-		const out = new Set<string>();
-		for await (const id of storage.listBlockIds()) out.add(id);
-		expect(out).to.deep.equal(new Set([blockId]));
-	});
-
-	it('listBlockIds yields nothing for an empty store', async () => {
-		const out = new Set<string>();
-		for await (const id of storage.listBlockIds()) out.add(id);
-		expect(out).to.deep.equal(new Set());
+		const ids: ActionId[] = [];
+		for await (const id of driver.listPendingActionIds('block-1' as BlockId)) ids.push(id);
+		expect(ids.sort()).to.deep.equal(['a', 'b']);
 	});
 });
