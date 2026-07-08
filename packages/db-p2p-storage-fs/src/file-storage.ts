@@ -24,6 +24,11 @@ function decodeFilenameToActionId(filename: string): ActionId {
 // crash-truncated file reads as absent (letting recover() make progress) instead
 // of surfacing a parse error forever. Only the JSON-valued stores use this; the
 // revisions store holds a bare ActionId string (not JSON) and is never guarded.
+// NOTE: every guarded read parses the JSON here (validate, discard) and the kernel's
+// decodeJson parses the same bytes AGAIN to build the value — 2× parse per get. The
+// guard is intrinsic to the driver's "corrupt→missing" contract (the kernel can't
+// express it), so it can't simply be dropped. Fine at current read volumes; if a read
+// path ever shows up hot, parse once and thread the parsed value through the driver.
 function isParseableJson(bytes: Uint8Array): boolean {
 	try {
 		JSON.parse(decoder.decode(bytes));
