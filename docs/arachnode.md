@@ -32,6 +32,7 @@ By separating transaction and storage responsibilities, Arachnode can achieve hi
   - If not, if the node has capacity for storage beyond Ring Zulu, it starts its own ring at the outermost storage ring and incrementally loads a slice of the keyspace from inner nodes.
 - Once populated, the node switches to complete status.
 - Based on network activity and node capacity, the node can continue to move inward if it is under utilized, or outward if it is nearing capacity.
+- **A ring shift is not a unilateral, instantaneous change.** When a node moves *outward* it sheds half its keyspace; releasing that half before the new holders have a confirmed replica would drop those keys below their replication floor. Moving nodes therefore follow the **advertise → confirm-replication → release** handoff, and the move decision itself is **damped** (smoothing + a dead-band + a minimum dwell time) so a node hovering near a ring boundary does not thrash in and out. The full protocol, the replication-floor invariant it protects, and the damping parameters are specified in [arachnode-ring-handoff.md](arachnode-ring-handoff.md).
 
 ### **Propagation of Storage Messages**
 - **Transaction Initiation (Ring Zulu)**: When a transaction (such as a key-value write) is initiated, it is first processed by the overlapping nodes in **Ring Zulu**. These nodes handle the transaction logic (e.g., verifying the write), persist the data to a log, and then forward the storage message to reachable storage nodes.
@@ -77,6 +78,7 @@ Each node maintains **references to nodes** in both inner and outer rings:
 - **Overlap Factor Sampling**: Arachnode periodically samples the **overlap factor** (the number of storage nodes responsible for any given key) across the rings. 
   - A high overlap factor signals an over abundance of storage, suggesting that **fewer** storage resources are needed.
   - A low overlap factor signals that **more** storage resources are needed.
+- **Damped ring-depth signal**: the per-node ring-depth target is `-log2(capacity/demand)`, but this is a reactive control loop and must **not** be applied to raw instantaneous samples — near a ring boundary that oscillates. The signal is smoothed, gated by a dead-band, and rate-limited by a minimum dwell time before it can trigger a move; see [arachnode-ring-handoff.md § Part 1](arachnode-ring-handoff.md#part-1--damping-the-ring-shift-decision).
 
 ### **Global Transaction Demand Management**:
 - **Cache Coverage Sampling**: Arachnode periodically samples the **cache coverage** (the percentage of keys that are present in the cache) across the rings.
