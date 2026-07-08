@@ -381,6 +381,15 @@ export interface CoordEngine {
 	 */
 	topicTraffic(topicId: Uint8Array): TopicTrafficV1;
 	/**
+	 * Record that an application-level query (matchmaking `QueryV1`, and any future genuine cohort query
+	 * such as the `AggregateCountV1` sweep) was served against `topicId` at `now`. Feeds `queriesPerMin`.
+	 * Pure passthrough to this engine's `TrafficCounters` — no store lookup, no instantiation. The counter
+	 * surfaces in {@link topicTraffic} only after the next {@link gossipRound} freezes it (lags ≤ one round,
+	 * exactly like the arrivals counter). Non-fatal / synchronous — a separate mutating accessor from the
+	 * pure-read {@link topicTraffic}; the two are never overloaded.
+	 */
+	recordQuery(topicId: Uint8Array, now: number): void;
+	/**
 	 * Publish a fresh threshold-signed `MembershipCertV1` on a cohort-membership-change / stabilization
 	 * event (republishes only when the cohort epoch — `H(sorted members)` — changed, i.e. on any member
 	 * change, head or tail). Returns the cert if published.
@@ -2040,6 +2049,10 @@ function createCoordEngine(ctx: CoordEngineContext, servedCoord: RingCoord, tree
 			store.getByParticipant(topicId, participantId) !== undefined,
 		records: (topicId: Uint8Array): readonly RegistrationRecord[] => store.listByTopic(topicId),
 		topicTraffic: (topicId: Uint8Array): TopicTrafficV1 => traffic.snapshot(topicId),
+		// NOTE: the only production caller today is the matchmaking QueryV1 serve handler
+		// (matchmaking-query-accounting-seam). When the AggregateCountV1 sweep RPC lands it is another
+		// genuine cohort query and should bump the same seam — reuse `engine.recordQuery` at that call site.
+		recordQuery: (topicId: Uint8Array, now: number): void => traffic.recordQuery(topicId, now),
 		cohortView: (): CohortView => view,
 		servesTopic: (topicId: Uint8Array): boolean =>
 			store.directParticipants(topicId) > 0 || coldStart.get(topicId) !== undefined,

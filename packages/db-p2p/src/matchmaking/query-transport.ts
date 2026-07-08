@@ -112,6 +112,8 @@ export interface MatchmakingQueryServeDeps {
 	readonly gate?: (from: PeerId, topicId: Uint8Array) => boolean;
 	/** Per-frame ceiling for encode/decode; default {@link DEFAULT_STREAM_MAX_BYTES}. */
 	readonly maxBytes?: number;
+	/** Wall clock (unix ms) stamped on the query-accounting bump; default {@link Date.now}. Injectable for tests. */
+	readonly clock?: () => number;
 }
 
 /**
@@ -150,6 +152,13 @@ export function createMatchmakingQueryHandler(
 				// seeker side treats this as an empty advisory result.
 				return undefined;
 			}
+
+			// Query accounting (matchmaking-query-accounting-seam): a served query bumps `queriesPerMin` for the
+			// topic on the served coord's TrafficCounters; surfaces in a later reply's snapshot (lags one round).
+			// Sits AFTER the gate + no-engine guards (a dropped / unserved query never inflates the barometer) and
+			// BEFORE the reply build (a query that resolved a serving engine is counted on serve, even if signing
+			// later fails transiently). A decode failure threw before `topicId` resolved, so it never counts.
+			engine.recordQuery(topicId, (deps.clock ?? Date.now)());
 
 			// Build the reply from a single synchronous read (records + traffic + epoch) so a concurrent gossip
 			// round cannot tear the snapshot between read and sign. `handleMatchmakingQuery` forwards each record's

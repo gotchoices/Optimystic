@@ -6,6 +6,7 @@ import {
 	matchTopicId,
 	createTierAddressing,
 	createRingHash,
+	createTrafficCounters,
 	encodeQueryV1,
 	decodeQueryReplyV1,
 	bytesToB64url,
@@ -80,11 +81,19 @@ function foreignRecord(id: string): RegistrationRecord {
 	};
 }
 
-/** A stub CoordEngine exposing only the read surface the serve transport touches. */
-function stubEngine(records: readonly RegistrationRecord[]): CoordEngine {
+/** A query-accounting bump the stub engine's `recordQuery` spy captured. */
+interface RecordedQuery { topicId: Uint8Array; now: number; }
+
+/**
+ * A stub CoordEngine exposing only the read surface the serve transport touches, plus a `recordQuery`
+ * spy: every call is pushed onto `calls` so a test can assert the accounting seam fired exactly once
+ * with the served `topicId` and the injected clock's `now`.
+ */
+function stubEngine(records: readonly RegistrationRecord[], calls: RecordedQuery[] = []): CoordEngine {
 	return {
 		records: (): readonly RegistrationRecord[] => records,
 		topicTraffic: (): TopicTrafficV1 => traffic,
+		recordQuery: (t: Uint8Array, now: number): void => { calls.push({ topicId: t, now }); },
 		cohort: (): { cohortEpoch: Uint8Array } => ({ cohortEpoch }),
 	} as unknown as CoordEngine;
 }
@@ -198,5 +207,65 @@ describe('matchmaking / query serve transport', () => {
 			sign: async (): Promise<string> => { throw new Error('signer offline'); },
 		});
 		expect(await handle(frameOf(query()), remotePeer), 'a sign failure drops to no reply').to.equal(undefined);
+	});
+
+	it('records exactly one query-accounting bump with the served topicId and the injected clock', async () => {
+		const calls: RecordedQuery[] = [];
+		const handle = createMatchmakingQueryHandler({
+			registry: stubRegistry(stubEngine([await providerRecord('p1', ['gpu'], 4)], calls)),
+			addressing,
+			sign: fakeSign,
+			clock: (): number => 12345,
+		});
+		await handle(frameOf(query()), remotePeer);
+		expect(calls.length, 'exactly one accounting bump for one served query').to.equal(1);
+		expect(bytesEqual(calls[0]!.topicId, topicId), 'the bump keys on the served topicId').to.equal(true);
+		expect(calls[0]!.now, 'the bump stamps the injected clock').to.equal(12345);
+	});
+
+	it('feeds queriesPerMin end-to-end: a served query surfaces in a subsequent snapshot after publish (lags one round)', async () => {
+		// Drive a REAL TrafficCounters through the handler's `recordQuery` bump. `now` must agree between the
+		// injected `clock` and the `publish`/`snapshot` timestamps, else the sliding-window prune drops the event
+		// (virtual-time note: a real host would use Date.now for both; here we pin both to `now`).
+		const now = 1000;
+		const counters = createTrafficCounters({
+			view: { get: () => undefined, all: () => new Map() } as unknown as Parameters<typeof createTrafficCounters>[0]['view'],
+			store: { directParticipants: (): number => 0 },
+			selfMember: 'self',
+		});
+		const engine = { ...stubEngine([]), recordQuery: (t: Uint8Array, n: number): void => counters.recordQuery(t, n) } as unknown as CoordEngine;
+		const handle = createMatchmakingQueryHandler({ registry: stubRegistry(engine), addressing, sign: fakeSign, clock: (): number => now });
+
+		await handle(frameOf(query()), remotePeer);
+		// Self-increment lag: the recording query's own snapshot (before any publish) still reads the pre-bump value.
+		expect(counters.snapshot(topicId).queriesPerMin, 'the bump is not visible before the next round freezes it').to.equal(0);
+		// The next gossip round freezes the window; now the served query surfaces.
+		counters.publish(topicId, now);
+		expect(counters.snapshot(topicId).queriesPerMin, 'one served query in-window → queriesPerMin > 0').to.equal(1);
+	});
+
+	it('records nothing when no engine serves the topic (never reaches recordQuery)', async () => {
+		const handle = createMatchmakingQueryHandler({ registry: stubRegistry(undefined), addressing, sign: fakeSign });
+		// `stubRegistry(undefined).forCoord` throws, so a reached instantiation path would fail loudly.
+		expect(await handle(frameOf(query()), remotePeer), 'no serving engine → no reply').to.equal(undefined);
+	});
+
+	it('records nothing on a gate rejection', async () => {
+		const calls: RecordedQuery[] = [];
+		const handle = createMatchmakingQueryHandler({
+			registry: stubRegistry(stubEngine([await providerRecord('p1', ['gpu'], 4)], calls)),
+			addressing,
+			sign: fakeSign,
+			gate: (): boolean => false,
+		});
+		expect(await handle(frameOf(query()), remotePeer), 'a gate rejection drops the query').to.equal(undefined);
+		expect(calls.length, 'a gate-rejected query never bumps the barometer').to.equal(0);
+	});
+
+	it('records nothing on a malformed frame', async () => {
+		const calls: RecordedQuery[] = [];
+		const handle = createMatchmakingQueryHandler({ registry: stubRegistry(stubEngine([], calls)), addressing, sign: fakeSign });
+		expect(await handle(Uint8Array.from([1, 2, 3, 4]), remotePeer), 'an undecodable frame yields no reply').to.equal(undefined);
+		expect(calls.length, 'a decode failure throws before topicId resolves → no bump').to.equal(0);
 	});
 });
