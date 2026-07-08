@@ -380,6 +380,30 @@ describe('StorageRepo', () => {
 			expect(result['block-1']?.state.latest?.rev).to.equal(1);
 		});
 
+		it('does not mutate the caller context.committed array when the block has no committed latest', async () => {
+			// Regression for the in-place sort: when a block has no committed `latest`, the
+			// promotion loop's `missing` aliases the caller's `context.committed` array, so an
+			// in-place `.sort()` would reorder the shared request context under the caller's feet.
+			// No pending actions exist for this block, so the loop is a no-op apart from the sort.
+			const committed = [
+				{ actionId: 'a3' as ActionId, rev: 3 },
+				{ actionId: 'a1' as ActionId, rev: 1 },
+				{ actionId: 'a2' as ActionId, rev: 2 }
+			];
+			const firstRef = committed[0];
+			const orderBefore = committed.map(c => c.rev);
+
+			// context.rev is the caller's latest-known GLOBAL rev; the block itself still has no
+			// committed `latest`, which is what routes `missing` onto the aliased array.
+			await repo.get({
+				blockIds: ['no-latest-block' as BlockId],
+				context: { committed, rev: 3 }
+			});
+
+			expect(committed.map(c => c.rev)).to.deep.equal(orderBefore);
+			expect(committed[0]).to.equal(firstRef); // same identity, not reordered
+		});
+
 		it('promotes multiple pending blocks from same action via context', async () => {
 			// Multi-block action: tail and non-tail
 			const transforms: Transforms = {

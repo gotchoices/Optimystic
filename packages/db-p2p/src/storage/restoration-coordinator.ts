@@ -69,6 +69,8 @@ export class RestorationCoordinator {
 				return archive;
 			}
 		}
+		// My transaction ring was queried and yielded nothing — count it as one ring failure.
+		this.recordFailure(myRingDepth);
 
 		// 2. Try inner storage rings (broader coverage)
 		for (let ringDepth = myRingDepth - 1; ringDepth >= 0; ringDepth--) {
@@ -85,6 +87,8 @@ export class RestorationCoordinator {
 					return archive;
 				}
 			}
+			// This inner ring was queried and yielded nothing — count it as one ring failure.
+			this.recordFailure(ringDepth);
 		}
 
 		// No ring had the data
@@ -189,6 +193,17 @@ export class RestorationCoordinator {
 	}
 
 	/**
+	 * Record that a ring was queried during a restore but did not yield the block.
+	 * Counterpart to {@link recordSuccess}: the ring — not the individual peer query — is the
+	 * failure unit, so this increments once per exhausted ring at the points where the peer
+	 * loops in {@link restore} complete without returning an archive.
+	 */
+	private recordFailure(ringDepth: number): void {
+		const count = this.metrics.failureByRing.get(ringDepth) ?? 0;
+		this.metrics.failureByRing.set(ringDepth, count + 1);
+	}
+
+	/**
 	 * Get restoration metrics for monitoring.
 	 */
 	getMetrics(): {
@@ -197,7 +212,15 @@ export class RestorationCoordinator {
 		failureByRing: Map<number, number>;
 		averageDurationMs: number;
 	} {
-		return { ...this.metrics };
+		// Copy the Maps: a bare `{ ...this.metrics }` spreads only the top level, handing the
+		// caller the SAME Map instances this coordinator keeps mutating — the snapshot would
+		// then change under the caller's feet, and a caller mutation would corrupt internal state.
+		return {
+			totalRequests: this.metrics.totalRequests,
+			successByRing: new Map(this.metrics.successByRing),
+			failureByRing: new Map(this.metrics.failureByRing),
+			averageDurationMs: this.metrics.averageDurationMs
+		};
 	}
 }
 

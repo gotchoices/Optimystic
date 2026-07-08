@@ -162,7 +162,10 @@ export class StorageRepo implements IRepo, IBlockChangeNotifier, IBlockReplicaSt
 				const missing = latest
 					? context.committed.filter(c => c.rev > latest.rev)
 					: context.committed;
-				for (const { actionId, rev } of missing.sort((a, b) => a.rev - b.rev)) {
+				// Sort a COPY: when `latest` is undefined, `missing` aliases the caller's
+				// `context.committed` array, and an in-place `.sort()` would reorder the shared
+				// request context under the caller's feet.
+				for (const { actionId, rev } of [...missing].sort((a, b) => a.rev - b.rev)) {
 					const pending = await blockStorage.getPendingTransaction(actionId);
 					if (pending) {
 						const collectionId = await this.internalCommit(blockId, actionId, rev, blockStorage);

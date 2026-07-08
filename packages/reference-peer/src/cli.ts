@@ -157,7 +157,7 @@ class PeerSession {
 			logDebug('ring info unavailable (no FRET service)');
 			return;
 		}
-		const adapter = new ArachnodeFretAdapter(fret);
+		const adapter = new ArachnodeFretAdapter(fret, node.peerId?.toString());
 		const myInfo = adapter.getMyArachnodeInfo();
 		if (myInfo) {
 			logDebug('local arachnode info', myInfo);

@@ -100,7 +100,10 @@ export class MemoryRawStorage implements IRawStorage {
 	}
 
 	async saveTransaction(blockId: BlockId, actionId: ActionId, transform: Transform): Promise<void> {
-		this.actions.set(this.getActionKey(blockId, actionId), transform);
+		// Clone transform to prevent external modifications from affecting stored data,
+		// matching savePendingTransaction/saveMaterializedBlock and the store's
+		// clone-on-store invariant (see docs/internals.md "Storage Returns References").
+		this.actions.set(this.getActionKey(blockId, actionId), structuredClone(transform));
 	}
 
 	/**

@@ -70,14 +70,28 @@ export class FileRawStorage implements IRawStorage {
 	async *listPendingTransactions(blockId: BlockId): AsyncIterable<ActionId> {
 		const pendingPath = path.join(this.getBlockPath(blockId), 'pend');
 
-		const files = await fs.readdir(pendingPath).catch((err) => { log('listPendingTransactions readdir failed for %s - %o', blockId, err); return [] as string[]; });
+		// Only a genuinely-absent directory (ENOENT) maps to "no pendings". Any other error
+		// (EACCES, EIO, ENOTDIR, ...) must surface — swallowing it here would make
+		// listPendingTransactions silently report an empty directory, so pend's conflict
+		// detection would be skipped. Mirrors directoryByteSize's ENOENT-vs-other discrimination.
+		const files = await fs.readdir(pendingPath).catch((err) => {
+			if ((err as NodeJS.ErrnoException)?.code === 'ENOENT') return [] as string[];
+			log('listPendingTransactions readdir failed for %s - %o', blockId, err);
+			throw err;
+		});
 		for (const file of files) {
 			if (!file.endsWith('.json')) continue;
 			const actionId = decodeFilenameToActionId(file.slice(0, -5));
 			// Accept legacy UUID format and consensus tx:/stamp: format. The
 			// consensus hash is base64url-encoded SHA-256 (see db-core hashString),
 			// so its alphabet is [A-Za-z0-9_-] — NOT lowercase hex.
-			if (!/^(?:[\w\d]+-[\w\d]+-[\w\d]+-[\w\d]+-[\w\d]+|(?:tx|stamp):[A-Za-z0-9_-]+)$/.test(actionId)) continue;
+			if (!/^(?:[\w\d]+-[\w\d]+-[\w\d]+-[\w\d]+-[\w\d]+|(?:tx|stamp):[A-Za-z0-9_-]+)$/.test(actionId)) {
+				// Leave a breadcrumb rather than silently dropping: a future id scheme that
+				// doesn't match legacy-UUID or tx:/stamp: shape would otherwise vanish from
+				// the listing with no signal. The .json + decode guard still excludes stray files.
+				log('listPendingTransactions skipping unrecognized action-id file %s for %s', file, blockId);
+				continue;
+			}
 			yield actionId;
 		}
 	}

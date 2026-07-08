@@ -1,6 +1,19 @@
 import { expect } from 'chai';
+import { generateKeyPair } from '@libp2p/crypto/keys';
+import { peerIdFromPrivateKey } from '@libp2p/peer-id';
 import { RingSelector, type RingSelectorConfig } from '../src/storage/ring-selector.js';
 import type { ArachnodeFretAdapter } from '../src/storage/arachnode-fret-adapter.js';
+
+/** Generate `n` real (base58-encodable) Ed25519 peer-id strings — what calculatePartition needs
+ *  to reach p2p-fret's hashPeerId, which reads `peerId.toMultihash().bytes`. */
+async function makeValidPeerIds(n: number): Promise<string[]> {
+	const ids: string[] = [];
+	for (let i = 0; i < n; i++) {
+		const key = await generateKeyPair('Ed25519');
+		ids.push(peerIdFromPrivateKey(key).toString());
+	}
+	return ids;
+}
 
 /** Mock storage monitor that implements only the getCapacity method needed by RingSelector */
 class MockStorageMonitor {
@@ -52,6 +65,11 @@ describe('RingSelector', () => {
 	let monitor: MockStorageMonitor;
 	let fretAdapter: MockFretAdapter;
 	let selector: RingSelector;
+	let peerIds: string[];
+
+	before(async () => {
+		peerIds = await makeValidPeerIds(8);
+	});
 
 	beforeEach(() => {
 		monitor = new MockStorageMonitor(1024 * 1024 * 1024, 0); // 1GB total, 0 used
@@ -167,65 +185,48 @@ describe('RingSelector', () => {
 
 	describe('calculatePartition', () => {
 		it('returns undefined for ring 0', async () => {
-			const partition = await selector.calculatePartition(0, 'some-peer-id');
+			const partition = await selector.calculatePartition(0, peerIds[0]!);
 			expect(partition).to.equal(undefined);
 		});
 
 		it('returns partition info for ring > 0', async () => {
-			try {
-				const partition = await selector.calculatePartition(4, 'some-peer-id');
-				expect(partition).to.not.equal(undefined);
-				expect(partition!.prefixBits).to.equal(4);
-				expect(partition!.prefixValue).to.be.at.least(0);
-				expect(partition!.prefixValue).to.be.lessThan(16);
-			} catch (err) {
-				// hashPeerId might fail for non-multiaddr peer IDs - that's acceptable
-				// The function depends on p2p-fret's hashPeerId which expects real peer IDs
-				expect(err).to.be.instanceOf(Error);
-			}
+			// Real peer id → hashPeerId succeeds → a defined partition is produced. This
+			// assertion fails outright if calculatePartition throws (the pre-fix behavior).
+			const partition = await selector.calculatePartition(4, peerIds[0]!);
+			expect(partition).to.not.equal(undefined);
+			expect(partition!.prefixBits).to.equal(4);
+			expect(partition!.prefixValue).to.be.at.least(0);
+			expect(partition!.prefixValue).to.be.lessThan(16);
 		});
 
 		it('partition value is bounded by ring depth', async () => {
-			// Skip this test if hashPeerId fails - depends on p2p-fret implementation
-			try {
-				for (const ringDepth of [1, 2, 3, 8, 12]) {
-					const partition = await selector.calculatePartition(ringDepth, `peer-${ringDepth}`);
-					expect(partition).to.not.equal(undefined);
-					const maxValue = Math.pow(2, ringDepth);
-					expect(partition!.prefixValue).to.be.lessThan(maxValue);
-				}
-			} catch (err) {
-				// hashPeerId may fail with test peer ID strings
-				expect(err).to.be.instanceOf(Error);
+			for (const ringDepth of [1, 2, 3, 8, 12]) {
+				const partition = await selector.calculatePartition(ringDepth, peerIds[ringDepth % peerIds.length]!);
+				expect(partition).to.not.equal(undefined);
+				const maxValue = Math.pow(2, ringDepth);
+				expect(partition!.prefixValue).to.be.at.least(0);
+				expect(partition!.prefixValue).to.be.lessThan(maxValue);
 			}
 		});
 
 		it('same peer gets same partition for same ring depth', async () => {
-			try {
-				const peerId = 'consistent-peer-id';
-				const p1 = await selector.calculatePartition(5, peerId);
-				const p2 = await selector.calculatePartition(5, peerId);
-				expect(p1).to.deep.equal(p2);
-			} catch (err) {
-				// hashPeerId may fail with test peer ID strings
-				expect(err).to.be.instanceOf(Error);
-			}
+			const peerId = peerIds[1]!;
+			const p1 = await selector.calculatePartition(5, peerId);
+			const p2 = await selector.calculatePartition(5, peerId);
+			expect(p1).to.not.equal(undefined);
+			expect(p1).to.deep.equal(p2);
 		});
 
 		it('different peers may get different partitions', async () => {
-			try {
-				const partitions = await Promise.all(
-					['peer-a', 'peer-b', 'peer-c', 'peer-d', 'peer-e'].map(
-						id => selector.calculatePartition(8, id)
-					)
-				);
-				const values = partitions.map(p => p!.prefixValue);
-				const uniqueValues = new Set(values);
-				expect(uniqueValues.size).to.be.at.least(1);
-			} catch (err) {
-				// hashPeerId may fail with test peer ID strings
-				expect(err).to.be.instanceOf(Error);
+			const partitions = await Promise.all(
+				peerIds.slice(0, 5).map(id => selector.calculatePartition(8, id))
+			);
+			for (const p of partitions) {
+				expect(p).to.not.equal(undefined);
 			}
+			const values = partitions.map(p => p!.prefixValue);
+			const uniqueValues = new Set(values);
+			expect(uniqueValues.size).to.be.at.least(1);
 		});
 	});
 
@@ -271,7 +272,7 @@ describe('RingSelector', () => {
 	describe('createArachnodeInfo', () => {
 		it('creates valid info for normal capacity', async () => {
 			monitor.setCapacity(1024 * 1024 * 1024, 100 * 1024 * 1024); // 1GB total, 100MB used
-			const info = await selector.createArachnodeInfo('my-peer-id');
+			const info = await selector.createArachnodeInfo(peerIds[0]!);
 
 			expect(info.ringDepth).to.be.at.least(0);
 			expect(info.capacity.total).to.equal(1024 * 1024 * 1024);
@@ -282,7 +283,7 @@ describe('RingSelector', () => {
 
 		it('handles below-minimum capacity gracefully', async () => {
 			monitor.setCapacity(100, 0); // Way below minimum
-			const info = await selector.createArachnodeInfo('low-capacity-peer');
+			const info = await selector.createArachnodeInfo(peerIds[0]!);
 
 			// ringDepth becomes max(0, -1) = 0 when below minimum
 			expect(info.ringDepth).to.equal(0);
@@ -290,40 +291,32 @@ describe('RingSelector', () => {
 		});
 
 		it('includes partition info for non-zero ring depth', async () => {
-			try {
-				monitor.setCapacity(50 * 1024 * 1024, 0); // 50MB - should result in ring > 0
-				const info = await selector.createArachnodeInfo('partitioned-peer');
+			// 50MB available against the bootstrap 100MB estimate → coverage 0.5 → ring 1. With a real
+			// peer id calculatePartition succeeds, so a ring > 0 node DOES publish a partition (the
+			// pre-fix throw would have left partition unset and never surfaced here).
+			monitor.setCapacity(50 * 1024 * 1024, 0);
+			const info = await selector.createArachnodeInfo(peerIds[2]!);
 
-				if (info.ringDepth > 0) {
-					expect(info.partition).to.not.equal(undefined);
-					expect(info.partition!.prefixBits).to.be.greaterThan(0);
-				}
-			} catch (err) {
-				// hashPeerId may fail with test peer ID strings
-				expect(err).to.be.instanceOf(Error);
-			}
+			expect(info.ringDepth).to.be.greaterThan(0);
+			expect(info.partition).to.not.equal(undefined);
+			expect(info.partition!.prefixBits).to.be.greaterThan(0);
 		});
 	});
 
 	describe('extractPrefix (via calculatePartition)', () => {
 		it('extracts correct prefix for various bit counts', async () => {
-			try {
-				const testCases = [
-					{ bits: 1, maxValue: 2 },
-					{ bits: 4, maxValue: 16 },
-					{ bits: 8, maxValue: 256 },
-					{ bits: 16, maxValue: 65536 }
-				];
+			const testCases = [
+				{ bits: 1, maxValue: 2 },
+				{ bits: 4, maxValue: 16 },
+				{ bits: 8, maxValue: 256 },
+				{ bits: 16, maxValue: 65536 }
+			];
 
-				for (const { bits, maxValue } of testCases) {
-					const partition = await selector.calculatePartition(bits, 'test-peer-for-prefix');
-					expect(partition).to.not.equal(undefined);
-					expect(partition!.prefixValue).to.be.at.least(0);
-					expect(partition!.prefixValue).to.be.lessThan(maxValue);
-				}
-			} catch (err) {
-				// hashPeerId may fail with test peer ID strings
-				expect(err).to.be.instanceOf(Error);
+			for (const { bits, maxValue } of testCases) {
+				const partition = await selector.calculatePartition(bits, peerIds[3]!);
+				expect(partition).to.not.equal(undefined);
+				expect(partition!.prefixValue).to.be.at.least(0);
+				expect(partition!.prefixValue).to.be.lessThan(maxValue);
 			}
 		});
 	});

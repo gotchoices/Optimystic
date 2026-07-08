@@ -1,4 +1,5 @@
 import { hashPeerId } from 'p2p-fret';
+import { peerIdFromString } from '@libp2p/peer-id';
 import type { StorageMonitor } from './storage-monitor.js';
 import type { ArachnodeInfo, ArachnodeFretAdapter } from './arachnode-fret-adapter.js';
 
@@ -91,8 +92,11 @@ export class RingSelector {
 			return undefined; // Full keyspace, no partition
 		}
 
-		// Hash peer ID to get coordinate
-		const coord = await hashPeerId({ toString: () => peerId } as any);
+		// Hash peer ID to get coordinate. hashPeerId reads `peerId.toMultihash().bytes`, so it
+		// needs a real PeerId — reconstruct one from the string. Peers must occupy the SAME ring
+		// coordinate FRET uses to place them (hashPeerId(peerId)), or restoration's block-prefix
+		// vs peer-prefix comparison stops meaning "this peer owns this block's slice".
+		const coord = await hashPeerId(peerIdFromString(peerId));
 
 		// Extract prefix bits from coordinate
 		const prefixBits = ringDepth;

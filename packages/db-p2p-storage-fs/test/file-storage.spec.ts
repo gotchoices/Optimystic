@@ -26,6 +26,32 @@ async function hasTempSibling(dir: string): Promise<boolean> {
 	return entries.some(e => e.endsWith('.tmp'));
 }
 
+// Injects a readdir failure with a specific errno code (e.g. EACCES), so a caller can assert
+// how the storage layer discriminates readdir errors. file-storage.ts holds the same
+// `fs.promises` singleton, so overriding `readdir` on it intercepts its calls. Always restore
+// in a finally so one test's injection never leaks into another.
+async function withFailingReaddir(code: string, fn: () => Promise<void>): Promise<void> {
+	const original = fs.readdir;
+	(fs as { readdir: typeof fs.readdir }).readdir = (async () => {
+		const err = new Error(`injected ${code}`) as NodeJS.ErrnoException;
+		err.code = code;
+		throw err;
+	}) as typeof fs.readdir;
+	try {
+		await fn();
+	} finally {
+		(fs as { readdir: typeof fs.readdir }).readdir = original;
+	}
+}
+
+async function drainPendings(storage: FileRawStorage, blockId: BlockId): Promise<ActionId[]> {
+	const out: ActionId[] = [];
+	for await (const id of storage.listPendingTransactions(blockId)) {
+		out.push(id);
+	}
+	return out;
+}
+
 describe('FileRawStorage atomic writes + corruption tolerance', () => {
 	let base: string;
 
@@ -118,6 +144,46 @@ describe('FileRawStorage atomic writes + corruption tolerance', () => {
 
 		// Temp file was cleaned up on the failed write.
 		assert.ok(!(await hasTempSibling(path.join(base, blockId))), 'expected no orphaned *.tmp files');
+	});
+});
+
+describe('FileRawStorage.listPendingTransactions readdir error discrimination', () => {
+	let base: string;
+
+	beforeEach(async () => {
+		base = await fs.mkdtemp(path.join(os.tmpdir(), 'optimystic-fs-pend-'));
+	});
+
+	afterEach(async () => {
+		await fs.rm(base, { recursive: true, force: true });
+	});
+
+	it('yields empty for a genuinely-absent pend directory (ENOENT)', async () => {
+		const storage = new FileRawStorage(base);
+		// No block dir written at all → the pend dir does not exist → ENOENT → empty listing.
+		const out = await drainPendings(storage, 'no-such-block' as BlockId);
+		assert.deepStrictEqual(out, []);
+	});
+
+	it('rejects (does not silently yield "no pendings") when readdir fails with a non-ENOENT error', async () => {
+		const storage = new FileRawStorage(base);
+		// A swallowed EACCES/EIO would make listPendingTransactions report an empty directory,
+		// so pend's conflict detection would be skipped — a correctness hazard, not just noise.
+		await withFailingReaddir('EACCES', async () => {
+			await assert.rejects(
+				() => drainPendings(storage, 'block-eacces' as BlockId),
+				(err: NodeJS.ErrnoException) => err.code === 'EACCES'
+			);
+		});
+	});
+
+	it('still lists recognized pending action ids after the ENOENT/other discrimination change', async () => {
+		const storage = new FileRawStorage(base);
+		const blockId = 'block-with-pendings' as BlockId;
+		await storage.savePendingTransaction(blockId, 'tx:abc123' as ActionId, { delete: true });
+
+		const out = await drainPendings(storage, blockId);
+		assert.deepStrictEqual(out, ['tx:abc123']);
 	});
 });
 

@@ -115,4 +115,38 @@ describe('RestorationCoordinator', () => {
 			expect(queried).to.not.include(PEER_B);
 		});
 	});
+
+	describe('metrics', () => {
+		it('getMetrics returns copies of the ring maps — a caller mutation cannot corrupt internal state', async () => {
+			const adapter = makeStubAdapter({ myRingDepth: 1, ringPeers: new Map(), infoByPeer: new Map() });
+			const coordinator = new RestorationCoordinator(adapter, {} as IPeerNetwork, '/test');
+
+			// recordSuccess is internal; drive it directly to seed a metric without a live query.
+			(coordinator as any).recordSuccess(1, 'block-x', 5);
+
+			const snapshot1 = coordinator.getMetrics();
+			// Mutating the returned snapshot must not reach the coordinator's own Maps.
+			snapshot1.successByRing.set(1, 999);
+			snapshot1.failureByRing.set(7, 42);
+
+			const snapshot2 = coordinator.getMetrics();
+			expect(snapshot2.successByRing.get(1)).to.equal(1);
+			expect(snapshot2.failureByRing.has(7)).to.equal(false);
+		});
+
+		it('records one failure per ring exhausted without yielding the block', async () => {
+			// No peers anywhere and myRingDepth=2 → my ring (2) plus inner rings 1 and 0 are each
+			// queried and come up empty, so failureByRing should hold one count for each.
+			const adapter = makeStubAdapter({ myRingDepth: 2, ringPeers: new Map(), infoByPeer: new Map() });
+			const coordinator = new RestorationCoordinator(adapter, {} as IPeerNetwork, '/test');
+
+			const result = await coordinator.restore('block-nowhere');
+
+			expect(result).to.equal(undefined);
+			const metrics = coordinator.getMetrics();
+			expect(metrics.failureByRing.get(2)).to.equal(1);
+			expect(metrics.failureByRing.get(1)).to.equal(1);
+			expect(metrics.failureByRing.get(0)).to.equal(1);
+		});
+	});
 });

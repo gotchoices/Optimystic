@@ -869,7 +869,7 @@ export async function createLibp2pNodeBase(
 		const fret = (node as any).services?.fret as any;
 
 		if (fret) {
-			const fretAdapter = new ArachnodeFretAdapter(fret);
+			const fretAdapter = new ArachnodeFretAdapter(fret, node.peerId.toString());
 
 			const storageMonitor = new StorageMonitor(rawStorage, options.arachnode?.storage ?? {});
 			const ringSelector = new RingSelector(fretAdapter, storageMonitor, {

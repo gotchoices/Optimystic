@@ -33,7 +33,15 @@ export interface ArachnodeInfo {
 export class ArachnodeFretAdapter {
 	private static readonly ARACHNODE_KEY = 'arachnode';
 
-	constructor(private readonly fret: FretService) {}
+	constructor(
+		private readonly fret: FretService,
+		/**
+		 * This node's own peer id string. When provided, {@link getMyArachnodeInfo} uses it
+		 * directly instead of reaching into the concrete FretService impl's private `.node` —
+		 * {@link FretService} (the public interface) exposes no self-peer accessor.
+		 */
+		private readonly selfPeerId?: string
+	) {}
 
 	/**
 	 * Set this node's Arachnode ring membership.
@@ -56,7 +64,12 @@ export class ArachnodeFretAdapter {
 	 * Get my own Arachnode info.
 	 */
 	getMyArachnodeInfo(): ArachnodeInfo | undefined {
-		const myPeerId = (this.fret as any).node?.peerId?.toString();
+		// Prefer the injected self peer id. Fall back to the concrete Libp2pFretService's private
+		// `.node.peerId` only when no id was injected — this cast is load-bearing (it depends on the
+		// concrete impl's shape, not the public FretService interface) and silently yields undefined
+		// for any impl lacking `.node`, so injection is the intended path.
+		const myPeerId = this.selfPeerId
+			?? (this.fret as unknown as { node?: { peerId?: { toString(): string } } }).node?.peerId?.toString();
 		if (!myPeerId) return undefined;
 		return this.getArachnodeInfo(myPeerId);
 	}
