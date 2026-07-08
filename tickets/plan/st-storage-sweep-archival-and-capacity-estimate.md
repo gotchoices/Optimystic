@@ -1,3 +1,10 @@
+<!-- resume-note -->
+RESUME: A prior agent run on this ticket did not complete.
+  Prior run: 2026-07-08T16:15:48.105Z (agent: claude)
+  Log file: C:\projects\optimystic\tickets\.logs\st-storage-sweep-archival-and-capacity-estimate.plan.2026-07-08T16-15-48-105Z.log
+Read the log to see what was done. Resume where it left off.
+If the prior run hit a timeout or repeated error, be cautious not to rush into the same situation.
+<!-- /resume-note -->
 description: Storage never shrinks — every version of every block is kept forever, so disk use grows without bound, and the "how full am I" check scans the entire store each time it runs. Design a way to prune old versions and to answer the capacity question cheaply.
 prereq:
 files: packages/db-p2p/src/storage/storage-repo.ts, packages/db-p2p-storage-rn/src/leveldb-storage.ts, packages/db-p2p-storage-fs/src/file-storage.ts, packages/db-p2p/src/storage/ring-selector.ts, docs/repository.md
