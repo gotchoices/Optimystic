@@ -50,6 +50,7 @@ import { DEFAULT_COHORT_TOPIC_PROTOCOLS } from '../src/cohort-topic/protocols.js
 import { DEFAULT_MATCHMAKING_PROTOCOLS } from '../src/matchmaking/protocols.js';
 import { createLibp2pMatchmakingTransport } from '../src/matchmaking/query-transport.js';
 import { SeekerWalkClient, type SeekerWalkResult } from '../src/matchmaking/seeker-walk-client.js';
+import { waitFor, delay } from '@optimystic/db-core/test';
 import { signedWillingness, type Member } from '../src/testing/cohort-topic-mesh-harness.js';
 import { createReactivitySelfMembershipGate, reactivityTailBytes } from '../src/cohort-topic/reactivity-membership-gate.js';
 import { DEFAULT_REACTIVITY_PROTOCOLS } from '../src/reactivity/protocols.js';
@@ -122,17 +123,6 @@ const TAIL_ID = 'optimystic/collection/tail-real-libp2p';
 
 const addressing = createTierAddressing(new RingHash());
 const slots = createSlotAssigner(new RingHash());
-const delay = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
-
-/** Poll `predicate` until it returns true or `timeoutMs` elapses (no fixed sleeps; bounded async settle). */
-async function waitFor(predicate: () => boolean | Promise<boolean>, timeoutMs: number, intervalMs = 150): Promise<boolean> {
-	const deadline = Date.now() + timeoutMs;
-	for (;;) {
-		if (await predicate()) return true;
-		if (Date.now() >= deadline) return false;
-		await delay(intervalMs);
-	}
-}
 
 function slotPrimary(participantBytes: Uint8Array, cohortEpoch: Uint8Array, members: readonly Uint8Array[]): Uint8Array {
 	return slots.assignSlots(participantBytes, cohortEpoch, members as Uint8Array[]).primary;
@@ -317,11 +307,20 @@ async function memberOf(key: PrivateKey, peerId: PeerId): Promise<Member> {
 	/** Seed willingness for `coord` and wait until the primary's view carries the strict-majority quorum. */
 	async function quorumOn(primaryEngine: CoordEngine, coord: RingCoord): Promise<boolean> {
 		await seedWillingness(coord);
-		const ok = await waitFor(() => primaryEngine.cohortView().all().size >= WILLING_SIBLINGS_NEEDED, 20_000, 200);
-		if (ok) return true;
-		// One more seed wave in case some first-round dials lost the race to a not-yet-open stream.
-		await seedWillingness(coord);
-		return waitFor(() => primaryEngine.cohortView().all().size >= WILLING_SIBLINGS_NEEDED, 20_000, 200);
+		const pred = (): boolean => primaryEngine.cohortView().all().size >= WILLING_SIBLINGS_NEEDED;
+		try {
+			await waitFor(pred, { timeoutMs: 20_000, intervalMs: 200 });
+			return true;
+		} catch {
+			// One more seed wave in case some first-round dials lost the race to a not-yet-open stream.
+			await seedWillingness(coord);
+			try {
+				await waitFor(pred, { timeoutMs: 20_000, intervalMs: 200 });
+				return true;
+			} catch {
+				return false;
+			}
+		}
 	}
 
 	/** Publish a coord's membership cert, retrying past transient sub-quorum `/sign` rounds (real RPC settle). */
@@ -376,8 +375,7 @@ async function memberOf(key: PrivateKey, peerId: PeerId): Promise<Member> {
 				try { await n.node.dial(multiaddr(dialAddrs[j]!)); } catch { /* a peer already dialed us covers this edge */ }
 			}
 		}
-		const connected = await waitFor(() => nodes.every((n) => n.node.getPeers().length >= N - 1), 60_000, 250);
-		expect(connected, `the ${N}-node full mesh did not fully connect within the bound`).to.equal(true);
+		await waitFor(() => nodes.every((n) => n.node.getPeers().length >= N - 1), { timeoutMs: 60_000, intervalMs: 250, description: `the ${N}-node full mesh did not fully connect within the bound` });
 
 		coord0 = addressing.coord0(TOPIC);
 
@@ -388,15 +386,14 @@ async function memberOf(key: PrivateKey, peerId: PeerId): Promise<Member> {
 		// Wait for real FRET two-sided stabilization: every node's tier-0 cohort around coord_0 must be the
 		// whole-mesh set. Generous bound — real FRET discovery gossip is non-instant.
 		const expected = fullIdSet();
-		const stabilized = await waitFor(() => {
+		await waitFor(() => {
 			for (const n of nodes) {
 				const members = new Set(engineOf(n, coord0).cohort().members.map(bytesToPeerIdString));
 				if (members.size !== N) return false;
 				for (const id of expected) if (!members.has(id)) return false;
 			}
 			return true;
-		}, 90_000, 250);
-		expect(stabilized, `FRET did not stabilize the ${N}-node tier-0 cohort within the bound`).to.equal(true);
+		}, { timeoutMs: 90_000, intervalMs: 250, description: `FRET did not stabilize the ${N}-node tier-0 cohort within the bound` });
 
 		// Publish the coord_0 cohort's membership cert once (real (N-1)-of-N multisig collected over `/sign`);
 		// it stays served on the routed primary's `/membership` handler for the verify + stale-refetch tests.
@@ -517,8 +514,7 @@ async function memberOf(key: PrivateKey, peerId: PeerId): Promise<Member> {
 		const g = await primaryEngine.gossipRound(now);
 		expect(g?.records?.length, 'the round carries the touched record').to.be.at.least(1);
 
-		const replicated = await waitFor(() => siblingEngine.holds(TOPIC, participant.bytes), 20_000, 150);
-		expect(replicated, 'the sibling replicated the record over real /cohort-gossip').to.equal(true);
+		await waitFor(() => siblingEngine.holds(TOPIC, participant.bytes), { timeoutMs: 20_000, intervalMs: 150, description: 'the sibling replicated the record over real /cohort-gossip' });
 		// Handoff readiness: the sibling now *serves the topic*, so it is a viable warm-failover target for the
 		// participant's primary — the cohort-side half of primary handoff. (The full FRET-departure-driven epoch
 		// rotation is timing-bound on real churn detection; see the suite header + the review handoff.)
@@ -668,13 +664,11 @@ async function memberOf(key: PrivateKey, peerId: PeerId): Promise<Member> {
 			expect(typeof origin.host.service.onLocalCommit, 'origination hook installed on the origin').to.equal('function');
 			origin.host.service.onLocalCommit!(event, commitCert);
 
-			const delivered = await waitFor(() => received.length >= 1, 20_000, 150);
-			expect(delivered, 'the remote subscriber received a NotificationV1 over the real notify socket').to.equal(true);
+			await waitFor(() => received.length >= 1, { timeoutMs: 20_000, intervalMs: 150, description: 'the remote subscriber received a NotificationV1 over the real notify socket' });
 			expect(received[0]!.revision, 'the delivered notification carries the committed revision').to.equal(1);
 			expect(received[0]!.tailId, 'the delivered notification anchors on the committed tail').to.equal(bytesToB64url(tailBytes));
 
-			const verified = await waitFor(() => verdicts.length >= 1, 5_000, 50);
-			expect(verified, 'the subscriber ran the verify path on the delivered notification').to.equal(true);
+			await waitFor(() => verdicts.length >= 1, { timeoutMs: 5_000, intervalMs: 50, description: 'the subscriber ran the verify path on the delivered notification' });
 			expect(verdicts[0], 'the delivered notification verified end-to-end (real Ed25519 against the tail cohort)').to.equal('verified');
 		} finally {
 			off();
@@ -771,7 +765,7 @@ async function memberOf(key: PrivateKey, peerId: PeerId): Promise<Member> {
 		// not-yet-served collection replies with no frame (the dial rejects). Each attempt re-stamps `timestamp`
 		// (fresh, re-signed) so the serve-side freshness/replay guard admits the retry rather than rejecting it.
 		let reply: ResumeReplyV1 | undefined;
-		const brought = await waitFor(async () => {
+		await waitFor(async () => {
 			const unsigned: ResumeSignable = {
 				v: 1,
 				collectionId: collectionIdB64,
@@ -787,9 +781,7 @@ async function memberOf(key: PrivateKey, peerId: PeerId): Promise<Member> {
 			} catch {
 				return false; // origin not yet serving the PushState (ingest pending) → dial rejected; retry
 			}
-		}, 20_000, 200);
-
-		expect(brought, 'the remote got a backfill resume reply from the real tail-cohort member over a real socket').to.equal(true);
+		}, { timeoutMs: 20_000, intervalMs: 200, description: 'the remote got a backfill resume reply from the real tail-cohort member over a real socket' });
 		expect(reply!.result, 'within the replay ring → backfill').to.equal('backfill');
 		expect(reply!.entries!.map((e) => e.revision), 'the backfill brings the remote current to the tail revision').to.deep.equal([1]);
 		expect(reply!.currentRevision, 'the reply carries the current tail revision').to.equal(1);
@@ -836,8 +828,7 @@ async function memberOf(key: PrivateKey, peerId: PeerId): Promise<Member> {
 		await matchPrimaryEngine.gossipRound(now);
 		const sibling = nodes.find((n) => n.idStr !== matchPrimary.idStr)!;
 		const siblingEngine = engineOf(sibling, matchCoord);
-		const replicated = await waitFor(() => siblingEngine.records(matchTopic).length >= 1, 20_000, 150);
-		expect(replicated, 'the provider record replicated to a sibling cohort member over real /cohort-gossip').to.equal(true);
+		await waitFor(() => siblingEngine.records(matchTopic).length >= 1, { timeoutMs: 20_000, intervalMs: 150, description: 'the provider record replicated to a sibling cohort member over real /cohort-gossip' });
 	});
 
 	// --- 5b. Matchmaking: a remote seeker reads a cohort's provider set over the real QueryV1 RPC ---
@@ -981,7 +972,7 @@ async function memberOf(key: PrivateKey, peerId: PeerId): Promise<Member> {
 		// sockets). Each attempt is a fresh single-deadline walk; the provider is already on the dialed primary's
 		// engine, so the first walk normally converges — the retry just absorbs a transient real-socket hiccup.
 		let result: SeekerWalkResult | undefined;
-		const converged = await waitFor(async () => {
+		await waitFor(async () => {
 			try {
 				const client = new SeekerWalkClient({
 					transport: transport.walkTransport(matchTopic),
@@ -996,8 +987,7 @@ async function memberOf(key: PrivateKey, peerId: PeerId): Promise<Member> {
 			} catch {
 				return false; // transient real-socket failure; retry within the bound
 			}
-		}, 60_000, 500);
-		expect(converged, 'the seeker walk converged to a match over real sockets').to.equal(true);
+		}, { timeoutMs: 60_000, intervalMs: 500, description: 'the seeker walk converged to a match over real sockets' });
 		expect(result!.providers.length, 'at least one provider matched').to.be.at.least(1);
 		const matchedIds = result!.providers.map((p) => p.participantId);
 		expect(matchedIds, 'the genuine provider is in the matched set').to.include(provider.idStr);

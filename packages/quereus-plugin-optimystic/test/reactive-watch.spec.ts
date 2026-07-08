@@ -18,6 +18,7 @@
 import { expect } from 'chai';
 import { Database } from '@quereus/quereus';
 import type { WatchEvent } from '@quereus/quereus';
+import { waitFor, delay } from '@optimystic/db-core/test';
 import register from '../dist/plugin.js';
 import type { ParsedOptimysticTreeOptions as ParsedOptimysticOptions } from '../dist/index.js';
 import type { CollectionChangeEvent } from '@optimystic/db-core';
@@ -63,15 +64,6 @@ async function externalCommit(plugin: Plugin, collectionUri: string, key: string
 	await collection.replace([[key, [key, JSON.stringify(value)]]]);
 }
 
-/** Poll `pred` until true or timeout; returns its final value. */
-async function waitUntil(pred: () => boolean, timeoutMs = 1000, stepMs = 5): Promise<boolean> {
-	const start = Date.now();
-	while (Date.now() - start < timeoutMs) {
-		if (pred()) return true;
-		await new Promise(resolve => setTimeout(resolve, stepMs));
-	}
-	return pred();
-}
 
 describe('Reactive watch bridge (collection change → Database.watch)', function () {
 	this.timeout(10000);
@@ -86,10 +78,9 @@ describe('Reactive watch bridge (collection change → Database.watch)', functio
 
 			await externalCommit(plugin, 'tree://reactive-wake/t', 'r1', 'hello');
 
-			const fired = await waitUntil(() => events.length > 0);
+			await waitFor(() => events.length > 0, { description: 'watcher should fire on external commit' });
 			sub.unsubscribe();
 
-			expect(fired, 'watcher should fire on external commit').to.equal(true);
 			const ev = events[0]!;
 			expect(ev.matched.some(m => m.watch.table.table === 't')).to.equal(true);
 		} finally {
@@ -110,7 +101,7 @@ describe('Reactive watch bridge (collection change → Database.watch)', functio
 			await externalCommit(plugin, 'tree://reactive-scope/u', 'r1', 'hi');
 
 			// Give any erroneous wake a chance to land before asserting absence.
-			await waitUntil(() => events.length > 0, 250);
+			await delay(250);
 			sub.unsubscribe();
 
 			expect(events).to.have.length(0);
@@ -129,10 +120,9 @@ describe('Reactive watch bridge (collection change → Database.watch)', functio
 
 			await externalCommit(plugin, 'tree://reactive-row/t', 'x', 'val');
 
-			const fired = await waitUntil(() => events.length > 0);
+			await waitFor(() => events.length > 0, { description: 'row-scoped watcher should fire' });
 			sub.unsubscribe();
 
-			expect(fired, 'row-scoped watcher should fire').to.equal(true);
 			const hits = events[0]!.matched.flatMap(m => m.hits.map(h => h[0]));
 			expect(hits).to.include('x');
 		} finally {
@@ -148,12 +138,12 @@ describe('Reactive watch bridge (collection change → Database.watch)', functio
 			const sub = db.watch(db.prepare('select * from t').getChangeScope(), e => { events.push(e); });
 
 			await externalCommit(plugin, 'tree://reactive-unsub/t', 'r1', 'a');
-			await waitUntil(() => events.length > 0);
+			await waitFor(() => events.length > 0);
 			expect(events.length, 'first external commit wakes the watcher').to.equal(1);
 
 			sub.unsubscribe();
 			await externalCommit(plugin, 'tree://reactive-unsub/t', 'r2', 'b');
-			await waitUntil(() => events.length > 1, 250);
+			await delay(250);
 
 			expect(events.length, 'no further wakeups after unsubscribe').to.equal(1);
 		} finally {
@@ -178,14 +168,14 @@ describe('Reactive watch bridge (collection change → Database.watch)', functio
 
 			// Before drop: an external commit drives notifyExternalChange.
 			await externalCommit(plugin, 'tree://reactive-drop/t', 'r1', 'a');
-			await waitUntil(() => externalCalls > 0);
+			await waitFor(() => externalCalls > 0);
 			expect(externalCalls, 'storage listener active before drop').to.equal(1);
 
 			await db.exec('drop table t');
 
 			// After drop: the storage listener is gone — no further dispatch.
 			await externalCommit(plugin, 'tree://reactive-drop/t', 'r2', 'b');
-			await waitUntil(() => externalCalls > 1, 250);
+			await delay(250);
 
 			expect(externalCalls, 'no notifyExternalChange after drop (listener removed)').to.equal(1);
 		} finally {
@@ -211,10 +201,9 @@ describe('Reactive watch bridge (collection change → Database.watch)', functio
 			);
 
 			await externalCommit(plugin, 'tree://reactive-map/c', 'r1', 'a');
-			const fired = await waitUntil(() => captured.length > 0);
+			await waitFor(() => captured.length > 0, { description: 'direct subscription should receive the event' });
 			unsub();
 
-			expect(fired, 'direct subscription should receive the event').to.equal(true);
 			expect(captured[0]!.collectionId).to.equal('reactive-map/c');
 		} finally {
 			await db.close();
@@ -249,7 +238,7 @@ describe('Reactive watch bridge (collection change → Database.watch)', functio
 			await externalCommit(plugin, 'tree://reactive-err/t', 'r2', 'b');
 
 			// Let any (mis)handled rejection surface before asserting absence.
-			await waitUntil(() => unhandled.length > 0, 100);
+			await delay(100);
 			expect(unhandled, 'no unhandled rejection escaped the bridge').to.have.length(0);
 		} finally {
 			process.removeListener('unhandledRejection', onUnhandled);

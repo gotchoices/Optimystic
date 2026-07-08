@@ -56,18 +56,18 @@ import { DEFAULT_COHORT_TOPIC_PROTOCOLS as PROTOCOLS } from '../cohort-topic/pro
 
 export { PROTOCOLS };
 
-export const delay = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
+export { delay } from '@optimystic/db-core/test';
+import { delay } from '@optimystic/db-core/test';
 
-/** Poll `predicate` until true or `timeoutMs` elapses (deterministic-but-not-flaky async settle). */
-export async function waitFor(predicate: () => boolean, timeoutMs = 2_000, intervalMs = 5): Promise<boolean> {
+// NOTE: backward-compat wrapper returning boolean; downstream tickets (3-8) replace each
+// call site with the throw-on-timeout canonical waitFor from @optimystic/db-core/test.
+export async function waitFor(predicate: () => boolean | Promise<boolean>, timeoutMs = 2_000, intervalMs = 5): Promise<boolean> {
 	const deadline = Date.now() + timeoutMs;
 	while (Date.now() < deadline) {
-		if (predicate()) {
-			return true;
-		}
+		if (await predicate()) return true;
 		await delay(intervalMs);
 	}
-	return predicate();
+	return !!(await predicate());
 }
 
 // --- members (real Ed25519 keys) ---

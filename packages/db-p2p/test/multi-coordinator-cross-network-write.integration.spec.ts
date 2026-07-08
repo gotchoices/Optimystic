@@ -1,6 +1,7 @@
 import { expect } from 'chai';
 import type { Libp2p } from 'libp2p';
 import type { BlockId, IBlock, BlockHeader, Transforms, IRepo } from '@optimystic/db-core';
+import { waitFor } from '@optimystic/db-core/test';
 import { multiaddr } from '@multiformats/multiaddr';
 import { createLibp2pNode, type NodeOptions } from '../src/libp2p-node.js';
 
@@ -51,16 +52,6 @@ function pickLocalTcpMultiaddr(node: Libp2p): string {
 	return local;
 }
 
-const delay = (ms: number): Promise<void> => new Promise(resolve => setTimeout(resolve, ms));
-
-async function waitFor(predicate: () => boolean | Promise<boolean>, timeoutMs: number, intervalMs = 250): Promise<boolean> {
-	const deadline = Date.now() + timeoutMs;
-	for (;;) {
-		if (await predicate()) return true;
-		if (Date.now() >= deadline) return false;
-		await delay(intervalMs);
-	}
-}
 
 async function dialBoth(x: Libp2p, y: Libp2p): Promise<void> {
 	const xa = pickLocalTcpMultiaddr(x);
@@ -116,11 +107,10 @@ describe('Multi-coordinator cross-network selection (two control networks, share
 		await dialBoth(a1, b1);
 		await dialBoth(a2, b1);
 
-		const everyoneConnected = await waitFor(
+		await waitFor(
 			() => a1.getPeers().length >= 2 && a2.getPeers().length >= 2 && b1.getPeers().length >= 2,
-			30_000, 250
+			{ timeoutMs: 30_000, intervalMs: 250, description: 'all three nodes connected to both peers' },
 		);
-		expect(everyoneConnected, 'all three nodes connected to both peers').to.equal(true);
 
 		const b1Id = b1.peerId.toString();
 
@@ -128,7 +118,7 @@ describe('Multi-coordinator cross-network selection (two control networks, share
 		// has NOT registered any control-A protocol (its namespaced identify can't
 		// complete across networks). This is exactly the signal the selection filter
 		// keys on.
-		const b1Contaminates = await waitFor(async () => {
+		await waitFor(async () => {
 			try {
 				const peer = await (a1 as any).peerStore.get(b1.peerId);
 				const protos: string[] = peer?.protocols ?? [];
@@ -137,12 +127,11 @@ describe('Multi-coordinator cross-network selection (two control networks, share
 			} catch {
 				return false;
 			}
-		}, 30_000, 250);
-		expect(b1Contaminates, 'B1 is in A1 peerStore without any control-A protocol').to.equal(true);
+		}, { timeoutMs: 30_000, intervalMs: 250, description: 'B1 is in A1 peerStore without any control-A protocol' });
 
 		// Let A1/A2 settle so A2 has completed identify and is a positively-'serves'
 		// candidate before the write (the filter prefers serving peers over unknowns).
-		const aServes = await waitFor(async () => {
+		await waitFor(async () => {
 			try {
 				const peer = await (a1 as any).peerStore.get(a2.peerId);
 				const protos: string[] = peer?.protocols ?? [];
@@ -151,8 +140,7 @@ describe('Multi-coordinator cross-network selection (two control networks, share
 			} catch {
 				return false;
 			}
-		}, 40_000, 500);
-		expect(aServes, 'A2 has completed identify and serves control-A on A1').to.equal(true);
+		}, { timeoutMs: 40_000, intervalMs: 500, description: 'A2 has completed identify and serves control-A on A1' });
 
 		// Drive several A-network writes; for each, A1's cohort must be exactly {A1, A2}
 		// (never B1) and the 2-of-2 write must succeed without a control-B negotiation error.

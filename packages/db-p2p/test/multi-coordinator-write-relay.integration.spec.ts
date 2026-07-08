@@ -1,6 +1,7 @@
 import { expect } from 'chai';
 import type { Libp2p } from 'libp2p';
 import type { BlockId, IBlock, BlockHeader, Transforms, IRepo } from '@optimystic/db-core';
+import { waitFor } from '@optimystic/db-core/test';
 import { webSockets } from '@libp2p/websockets';
 import { circuitRelayTransport } from '@libp2p/circuit-relay-v2';
 import { multiaddr, type Multiaddr } from '@multiformats/multiaddr';
@@ -41,15 +42,6 @@ const makeTransforms = (blockId: string): Transforms => ({
 	deletes: []
 });
 
-const delay = (ms: number): Promise<void> => new Promise(resolve => setTimeout(resolve, ms));
-async function waitFor(predicate: () => boolean | Promise<boolean>, timeoutMs: number, intervalMs = 250): Promise<boolean> {
-	const deadline = Date.now() + timeoutMs;
-	for (;;) {
-		if (await predicate()) return true;
-		if (Date.now() >= deadline) return false;
-		await delay(intervalMs);
-	}
-}
 
 // A browser-shaped storage node: WS + circuit only, listening on the relay's
 // circuit. clusterSize:2 so for every block BOTH storage nodes are in the cohort.
@@ -101,8 +93,7 @@ describe('Multi-coordinator write over a relay (limited inter-coordinator stream
 		try { await a.dial(multiaddr(bCircuit.toString())); } catch { /* reciprocal dial below covers it */ }
 		try { await b.dial(multiaddr(aCircuit.toString())); } catch { /* already connected */ }
 
-		const connected = await waitFor(() => a!.getPeers().some(p => p.toString() === b!.peerId.toString()), 20_000, 250);
-		expect(connected, 'A and B connected to each other via the relay').to.equal(true);
+		await waitFor(() => a!.getPeers().some(p => p.toString() === b!.peerId.toString()), { timeoutMs: 20_000, intervalMs: 250, description: 'A and B connected to each other via the relay' });
 
 		// FRET must converge so A and B each hold the OTHER's coordinate in their ring —
 		// the real precondition for findCluster to return a cohort that can span both.
@@ -124,15 +115,14 @@ describe('Multi-coordinator write over a relay (limited inter-coordinator stream
 		const fretOf = (n: Libp2p): {
 			exportTable(): { entries: Array<{ id: string }> };
 		} => (n as any).services.fret;
-		const stabilized = await waitFor(() => {
+		await waitFor(() => {
 			const want = [a!.peerId.toString(), b!.peerId.toString()];
 			for (const n of [a!, b!]) {
 				const ringIds = new Set(fretOf(n).exportTable().entries.map(e => e.id));
 				for (const id of want) if (!ringIds.has(id)) return false;
 			}
 			return true;
-		}, 40_000, 500);
-		expect(stabilized, 'A and B converge FRET state over the relay (both rings hold both peers)').to.equal(true);
+		}, { timeoutMs: 40_000, intervalMs: 500, description: 'A and B converge FRET state over the relay (both rings hold both peers)' });
 
 		// The relay node is itself in the FRET keyspace, so a block's cohort is drawn
 		// from {A, B, relay}. Find a block whose cohort (from A) actually includes B, so

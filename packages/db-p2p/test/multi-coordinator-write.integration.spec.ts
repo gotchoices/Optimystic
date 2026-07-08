@@ -1,6 +1,7 @@
 import { expect } from 'chai';
 import type { Libp2p } from 'libp2p';
 import type { BlockId, IBlock, BlockHeader, Transforms, IRepo } from '@optimystic/db-core';
+import { waitFor } from '@optimystic/db-core/test';
 import { multiaddr } from '@multiformats/multiaddr';
 import { hashKey } from 'p2p-fret';
 import { createLibp2pNode, type NodeOptions } from '../src/libp2p-node.js';
@@ -59,16 +60,6 @@ function pickLocalTcpMultiaddr(node: Libp2p): string {
 	return local;
 }
 
-const delay = (ms: number): Promise<void> => new Promise(resolve => setTimeout(resolve, ms));
-
-async function waitFor(predicate: () => boolean | Promise<boolean>, timeoutMs: number, intervalMs = 250): Promise<boolean> {
-	const deadline = Date.now() + timeoutMs;
-	for (;;) {
-		if (await predicate()) return true;
-		if (Date.now() >= deadline) return false;
-		await delay(intervalMs);
-	}
-}
 
 async function fullMeshDial(meshNodes: Libp2p[]): Promise<void> {
 	const addrs = meshNodes.map(pickLocalTcpMultiaddr);
@@ -121,15 +112,14 @@ describe('Multi-coordinator write (real libp2p, two same-keyspace coordinators)'
 		const mesh = [a, b];
 
 		await fullMeshDial(mesh);
-		const connected = await waitFor(() => mesh.every(n => n.getPeers().length >= 1), 30_000, 250);
-		expect(connected, 'the 2-node mesh connected').to.equal(true);
+		await waitFor(() => mesh.every(n => n.getPeers().length >= 1), { timeoutMs: 30_000, intervalMs: 250, description: 'the 2-node mesh connected' });
 
 		// FRET two-sided stabilization: both nodes must rank the same 2-peer ring so
 		// findCluster on either node returns the SAME {A, B} cohort for the block.
 		const fretOf = (n: Libp2p): { assembleCohort(coord: Uint8Array, wants: number): string[] } =>
 			(n as any).services.fret;
 		const probeCoord = await hashKey(new TextEncoder().encode('multi-coord-fret-probe'));
-		const stabilized = await waitFor(() => {
+		await waitFor(() => {
 			const ref = new Set(fretOf(a).assembleCohort(probeCoord, mesh.length));
 			if (ref.size !== mesh.length) return false;
 			for (const n of mesh) {
@@ -138,8 +128,7 @@ describe('Multi-coordinator write (real libp2p, two same-keyspace coordinators)'
 				for (const id of ref) if (!seen.has(id)) return false;
 			}
 			return true;
-		}, 40_000, 500);
-		expect(stabilized, 'FRET stabilized the 2-node ring (each node sees both peers)').to.equal(true);
+		}, { timeoutMs: 40_000, intervalMs: 500, description: 'FRET stabilized the 2-node ring (each node sees both peers)' });
 
 		const blockId = 'multi-coord-block';
 
@@ -184,17 +173,15 @@ describe('Multi-coordinator write (real libp2p, two same-keyspace coordinators)'
 		const mesh = [a, b];
 
 		await fullMeshDial(mesh);
-		const connected = await waitFor(() => mesh.every(n => n.getPeers().length >= 1), 30_000, 250);
-		expect(connected, 'the 2-node mesh connected').to.equal(true);
+		await waitFor(() => mesh.every(n => n.getPeers().length >= 1), { timeoutMs: 30_000, intervalMs: 250, description: 'the 2-node mesh connected' });
 
 		// Only a minimal cohort-readiness wait (NOT full FRET stabilization): proceed
 		// as soon as the joiner's own cohort for a probe block already has both peers,
 		// mirroring a node that writes right after join.
-		const cohortReady = await waitFor(async () => {
+		await waitFor(async () => {
 			const ids = Object.keys(await (b as any).keyNetwork.findCluster(new TextEncoder().encode('mcw-join-probe')));
 			return ids.length === 2;
-		}, 30_000, 250);
-		expect(cohortReady, "joiner's cohort for the probe has both coordinators").to.equal(true);
+		}, { timeoutMs: 30_000, intervalMs: 250, description: "joiner's cohort for the probe has both coordinators" });
 
 		const bRepo = (b as any).coordinatedRepo as IRepo;
 

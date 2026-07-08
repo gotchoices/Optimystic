@@ -1,6 +1,7 @@
 import { expect } from 'chai';
 import type { Libp2p } from 'libp2p';
 import type { BlockId, IBlock, BlockHeader, Transforms, IRepo } from '@optimystic/db-core';
+import { waitFor } from '@optimystic/db-core/test';
 import { generateKeyPair } from '@libp2p/crypto/keys';
 import { multiaddr } from '@multiformats/multiaddr';
 import { hashKey } from 'p2p-fret';
@@ -88,17 +89,6 @@ async function waitForPeers(node: Libp2p, minPeers: number, timeoutMs: number): 
 	});
 }
 
-const delay = (ms: number): Promise<void> => new Promise(resolve => setTimeout(resolve, ms));
-
-/** Poll `predicate` until truthy or `timeoutMs` elapses (bounded async settle, no fixed sleeps). */
-async function waitFor(predicate: () => boolean | Promise<boolean>, timeoutMs: number, intervalMs = 250): Promise<boolean> {
-	const deadline = Date.now() + timeoutMs;
-	for (;;) {
-		if (await predicate()) return true;
-		if (Date.now() >= deadline) return false;
-		await delay(intervalMs);
-	}
-}
 
 /** Establish a full mesh of warm connections: every node dials every other node's TCP addr. */
 async function fullMeshDial(meshNodes: Libp2p[]): Promise<void> {
@@ -329,15 +319,14 @@ describe('Real libp2p integration', function () {
 		const mesh = [a, b, c];
 
 		await fullMeshDial(mesh);
-		const connected = await waitFor(() => mesh.every(n => n.getPeers().length >= 2), 30_000, 250);
-		expect(connected, 'the 3-node mesh fully connected').to.equal(true);
+		await waitFor(() => mesh.every(n => n.getPeers().length >= 2), { timeoutMs: 30_000, intervalMs: 250, description: 'the 3-node mesh fully connected' });
 
 		// Wait for real FRET two-sided stabilization: every node must rank the same whole
 		// ring (assembleCohort is not cached, so this is a clean readiness probe).
 		const fretOf = (n: Libp2p): { assembleCohort(coord: Uint8Array, wants: number): string[] } =>
 			(n as any).services.fret;
 		const probeCoord = await hashKey(new TextEncoder().encode('redirect-rt-fret-probe'));
-		const stabilized = await waitFor(() => {
+		await waitFor(() => {
 			const ref = new Set(fretOf(a).assembleCohort(probeCoord, mesh.length));
 			if (ref.size !== mesh.length) return false;
 			for (const n of mesh) {
@@ -346,8 +335,7 @@ describe('Real libp2p integration', function () {
 				for (const id of ref) if (!seen.has(id)) return false;
 			}
 			return true;
-		}, 60_000, 500);
-		expect(stabilized, 'FRET stabilized the 3-node ring (every node knows every peer)').to.equal(true);
+		}, { timeoutMs: 60_000, intervalMs: 500, description: 'FRET stabilized the 3-node ring (every node knows every peer)' });
 
 		// Probe for a block whose responsible peer is a REMOTE node (entry E = a is excluded).
 		// Fresh ids each iteration so getCluster's per-key cache never serves a pre-stable result.
@@ -439,8 +427,7 @@ describe('Real libp2p integration', function () {
 		const mesh = [a, b, c, d];
 
 		await fullMeshDial(mesh);
-		const connected = await waitFor(() => mesh.every(n => n.getPeers().length >= 3), 30_000, 250);
-		expect(connected, 'the 4-node mesh fully connected').to.equal(true);
+		await waitFor(() => mesh.every(n => n.getPeers().length >= 3), { timeoutMs: 30_000, intervalMs: 250, description: 'the 4-node mesh fully connected' });
 
 		// Wait for real FRET two-sided stabilization: every node must rank the same whole
 		// ring (assembleCohort is not cached, so this is a clean readiness probe). With the
@@ -449,7 +436,7 @@ describe('Real libp2p integration', function () {
 		const fretOf = (n: Libp2p): { assembleCohort(coord: Uint8Array, wants: number): string[] } =>
 			(n as any).services.fret;
 		const probeCoord = await hashKey(new TextEncoder().encode('mm-redirect-fret-probe'));
-		const stabilized = await waitFor(() => {
+		await waitFor(() => {
 			const ref = new Set(fretOf(a).assembleCohort(probeCoord, mesh.length));
 			if (ref.size !== mesh.length) return false;
 			for (const n of mesh) {
@@ -458,8 +445,7 @@ describe('Real libp2p integration', function () {
 				for (const id of ref) if (!seen.has(id)) return false;
 			}
 			return true;
-		}, 60_000, 500);
-		expect(stabilized, 'FRET stabilized the 4-node ring (every node knows every peer)').to.equal(true);
+		}, { timeoutMs: 60_000, intervalMs: 500, description: 'FRET stabilized the 4-node ring (every node knows every peer)' });
 
 		// Probe for a block whose 2-peer responsible cohort EXCLUDES entry E = a. Fresh ids
 		// each iteration so getCluster's per-key cache never serves a pre-stable cohort.
@@ -581,13 +567,12 @@ describe('Real libp2p integration', function () {
 		const mesh = [a, b, c, d];
 
 		await fullMeshDial(mesh);
-		const connected = await waitFor(() => mesh.every(n => n.getPeers().length >= 3), 30_000, 250);
-		expect(connected, 'the 4-node mesh fully connected').to.equal(true);
+		await waitFor(() => mesh.every(n => n.getPeers().length >= 3), { timeoutMs: 30_000, intervalMs: 250, description: 'the 4-node mesh fully connected' });
 
 		const fretOf = (n: Libp2p): { assembleCohort(coord: Uint8Array, wants: number): string[] } =>
 			(n as any).services.fret;
 		const probeCoord = await hashKey(new TextEncoder().encode('spread-churn-fret-probe'));
-		const stabilized = await waitFor(() => {
+		await waitFor(() => {
 			const ref = new Set(fretOf(a).assembleCohort(probeCoord, mesh.length));
 			if (ref.size !== mesh.length) return false;
 			for (const n of mesh) {
@@ -596,8 +581,7 @@ describe('Real libp2p integration', function () {
 				for (const id of ref) if (!seen.has(id)) return false;
 			}
 			return true;
-		}, 60_000, 500);
-		expect(stabilized, 'FRET stabilized the 4-node ring (every node knows every peer)').to.equal(true);
+		}, { timeoutMs: 60_000, intervalMs: 500, description: 'FRET stabilized the 4-node ring (every node knows every peer)' });
 
 		// Find a block whose 2-peer cohort is a proper subset of the ring. The cohort nodes are the
 		// owners; the other two are the expansion-cohort non-members the spread must reach.
@@ -634,21 +618,19 @@ describe('Real libp2p integration', function () {
 		// The owned-block feed must have tracked the committed block on the owner's monitor.
 		const monitor = (owner as any).spreadOnChurnMonitor;
 		expect(monitor, 'owner has a live spread monitor').to.exist;
-		const tracked = await waitFor(() => monitor.getTrackedBlockCount() >= 1, 10_000, 100);
-		expect(tracked, 'the owner tracked the committed block via the owned-block feed').to.equal(true);
+		await waitFor(() => monitor.getTrackedBlockCount() >= 1, { timeoutMs: 10_000, intervalMs: 100, description: 'the owner tracked the committed block via the owned-block feed' });
 
 		// Trigger the spread directly (no real departure / debounce needed for the assertion).
 		const event = await monitor.checkNow();
 		expect(event, 'the spread produced an event (the owner is an eligible middle peer with expansion targets)').to.not.be.null;
 
 		// An expansion peer now serves the block from its OWN local storage (replica landed).
-		const replicated = await waitFor(async () => {
+		await waitFor(async () => {
 			for (const nm of nonMembers) {
 				const local = await (nm as any).storageRepo.get({ blockIds: [blockId] }, { skipClusterFetch: true });
 				if (local[blockId]?.block?.header.id === blockId) return true;
 			}
 			return false;
-		}, 15_000, 250);
-		expect(replicated, 'an expansion-cohort peer durably holds the re-pushed block').to.equal(true);
+		}, { timeoutMs: 15_000, intervalMs: 250, description: 'an expansion-cohort peer durably holds the re-pushed block' });
 	});
 });
