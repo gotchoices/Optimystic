@@ -1465,7 +1465,13 @@ export class OptimysticVirtualTable extends VirtualTable {
       }
     }
 
-    // Populate the index with existing data
+    // Populate the index with existing data.
+    // NOTE: CREATE UNIQUE INDEX does not reject pre-existing duplicate values — the
+    // populate loop keys each entry on indexCols‖pk, so duplicates coexist and the
+    // index builds successfully. Now that the derived uniqueConstraint is mirrored onto
+    // this.tableSchema (above), the probe rejects FUTURE duplicates but the existing
+    // ones remain. This diverges from SQLite (which fails the CREATE on dup data). If a
+    // pre-build integrity check is ever wanted, validate uniqueness here before staging.
     if (this.collection && this.rowCodec) {
       const firstPath = await this.collection.first();
       for await (const path of this.collection.ascending(firstPath)) {
