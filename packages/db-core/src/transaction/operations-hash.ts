@@ -128,6 +128,13 @@ export function canonicalStringify(value: unknown): string {
  * This is the fingerprint the coordinator sends in PendRequest.operationsHash and
  * the validator recomputes; equality of this string is the cross-node agreement
  * that a transaction's operations match.
+ *
+ * NOTE: this canonical encoding differs from the pre-refactor raw JSON.stringify
+ * encoding, so the hash a given transaction produces changed. Same-version clusters
+ * are unaffected (both sender and validator recompute fresh, nothing persisted). But
+ * there is NO protocol-version gate on this hash: in a MIXED-version cluster an old
+ * node and a new node would disagree and reject each other with "Operations hash
+ * mismatch". If rolling upgrades become a supported deployment, version-gate this.
  */
 export async function hashOperations(operations: readonly Operation[]): Promise<string> {
 	const sorted = [...operations].sort(compareOperations);
