@@ -1,5 +1,6 @@
 import type { IBlock, BlockId, Action } from "../index.js";
 import type { IChainHeader } from "../chain/chain-nodes.js";
+import type { RandFn } from "../utility/backoff.js";
 
 export type CollectionId = BlockId;
 
@@ -26,6 +27,9 @@ export interface SyncOptions {
 	 * backoff sleep, so an aborted sync rejects promptly (with an AbortError) rather than finishing
 	 * the current sleep. */
 	signal?: AbortSignal;
+	/** Advanced/testing hook: source of uniform [0,1) randomness for the backoff jitter. Defaults to
+	 * the package CSPRNG; inject a deterministic sequence to assert exact retry delays. */
+	rand?: RandFn;
 }
 
 /** Thrown by {@link ICollection.sync} / {@link ICollection.updateAndSync} when the retry budget

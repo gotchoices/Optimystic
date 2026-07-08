@@ -7,6 +7,7 @@ import { ReadDependencyCollector } from "../transaction/read-dependency-collecto
 import { randomBytes } from '@noble/hashes/utils.js';
 import { toString as uint8ArrayToString } from 'uint8arrays/to-string';
 import { Latches } from "../utility/latches.js";
+import { jitteredBackoffMs, abortableDelay, makeAbortError } from "../utility/backoff.js";
 
 /** Default base backoff (and historical fixed delay) between sync retries, in ms. */
 const PendingRetryDelayMs = 100;
@@ -336,14 +337,16 @@ export class Collection<TAction> implements ICollection<TAction> {
 					throw new SyncRetryExhaustedError(this.id, consecutiveFailures, lastReason);
 				}
 				// Back off before every retry (any stale failure — reason/missing/pending), growing
-				// exponentially from the base delay up to the cap. The abortable sleep lets an aborted
-				// sync reject promptly instead of finishing the sleep.
+				// exponentially from the base delay up to the cap, with proportional random jitter so a
+				// herd of clients that lost the same race does not re-collide on the next tick (see
+				// utility/backoff.ts). The abortable sleep lets an aborted sync reject promptly instead
+				// of finishing the sleep.
 				// NOTE: the `missing`/`reason` conflict paths now pay this backoff too (they previously
 				// retried with zero delay); that is what stops the persistent-`reason` hot spin. If a
 				// high-contention workload ever shows this base delay as recovery latency, lower
 				// baseBackoffMs for that caller rather than reintroducing the zero-delay retry.
-				const delay = Math.min(baseBackoffMs * 2 ** (consecutiveFailures - 1), maxBackoffMs);
-				await this.backoffSleep(delay, signal);
+				const delay = jitteredBackoffMs(consecutiveFailures - 1, { baseMs: baseBackoffMs, capMs: maxBackoffMs }, options?.rand);
+				await abortableDelay(delay, signal);
 				// Fetch latest state - updateInternal() will call replayActions() if there are conflicts
 				await this.updateInternal();
 			} else {
@@ -361,25 +364,6 @@ export class Collection<TAction> implements ICollection<TAction> {
 					: { committed: [{ actionId, rev: newRev }], rev: newRev };
 			}
 		}
-	}
-
-	/** Sleep for {@link ms}, resolving early (rejecting with an AbortError) if {@link signal} aborts. */
-	private backoffSleep(ms: number, signal?: AbortSignal): Promise<void> {
-		return new Promise<void>((resolve, reject) => {
-			if (signal?.aborted) {
-				reject(makeAbortError(signal));
-				return;
-			}
-			const onAbort = () => {
-				clearTimeout(timer);
-				reject(makeAbortError(signal!));
-			};
-			const timer = setTimeout(() => {
-				signal?.removeEventListener('abort', onAbort);
-				resolve();
-			}, ms);
-			signal?.addEventListener('abort', onAbort, { once: true });
-		});
 	}
 
 	async updateAndSync(options?: SyncOptions) {
@@ -455,15 +439,4 @@ export class Collection<TAction> implements ICollection<TAction> {
 			}
 		}
 	}
-}
-
-/** Build an AbortError for a cooperatively-aborted sync. Prefers the signal's own reason when it is
- * an Error (so callers who passed a custom abort reason see it), otherwise a name='AbortError' Error. */
-function makeAbortError(signal?: AbortSignal): Error {
-	if (signal && signal.reason instanceof Error) {
-		return signal.reason;
-	}
-	const err = new Error('The sync operation was aborted');
-	err.name = 'AbortError';
-	return err;
 }

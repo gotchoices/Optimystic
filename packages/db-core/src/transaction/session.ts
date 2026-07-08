@@ -1,4 +1,5 @@
 import type { TransactionCoordinator } from "./coordinator.js";
+import type { SyncOptions } from "../collection/index.js";
 import type { Transaction, ExecutionResult, ITransactionEngine, TransactionStamp, CollectionActions, TransactionSigner } from "./transaction.js";
 import { createTransactionStamp, createTransactionId, isTransactionExpired, clientSignaturePayload } from "./transaction.js";
 
@@ -119,8 +120,11 @@ export class TransactionSession {
 	 * Commit the transaction.
 	 *
 	 * Compiles all statements into a complete Transaction and commits through coordinator.
+	 *
+	 * @param options - Optional retry knobs forwarded to {@link TransactionCoordinator.commit}
+	 *   (bounded backoff+jitter retry of a clean stale loss). Defaults are safe out of the box.
 	 */
-	async commit(): Promise<ExecutionResult> {
+	async commit(options?: SyncOptions): Promise<ExecutionResult> {
 		if (this.committed) {
 			return { success: false, error: 'Transaction already committed' };
 		}
@@ -159,8 +163,9 @@ export class TransactionSession {
 			}
 		}
 
-		// Commit through coordinator (which will orchestrate PEND/COMMIT)
-		await this.coordinator.commit(transaction);
+		// Commit through coordinator (which will orchestrate PEND/COMMIT, with bounded
+		// backoff+jitter retry of a clean stale loss)
+		await this.coordinator.commit(transaction, options);
 
 		// Clear read dependencies after successful commit
 		this.coordinator.clearReadDependencies();

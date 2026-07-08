@@ -2,13 +2,37 @@ import type { ITransactor, BlockId, CollectionId, Transforms, PendRequest, Commi
 import type { Transaction, ExecutionResult, ITransactionEngine, CollectionActions, ReadDependency } from "./transaction.js";
 import type { PeerId } from "../network/types.js";
 import type { Collection } from "../collection/collection.js";
+import type { SyncOptions } from "../collection/index.js";
 import { isTransactionExpired } from "./transaction.js";
 import { Log, blockIdsForTransforms } from "../index.js";
 import { collectOperations, hashOperations } from "./operations-hash.js";
-import { CoordinatorPartialCommitError } from "./errors.js";
+import { CoordinatorPartialCommitError, CoordinatorStaleLossError } from "./errors.js";
+import { jitteredBackoffMs, abortableDelay, makeAbortError } from "../utility/backoff.js";
 import { createLogger } from "../logger.js";
 
 const log = createLogger('trx:coordinator');
+
+/** Default max consecutive clean-stale-loss retries before {@link TransactionCoordinator.commit}
+ * gives up. Mirrors the single-collection sync default so the two retry loops share one policy. */
+const DefaultMaxAttempts = 10;
+/** Default base backoff (ms) before the first commit retry. */
+const DefaultBaseBackoffMs = 100;
+/** Default ceiling (ms) on a single commit-retry backoff sleep. */
+const DefaultMaxBackoffMs = 5000;
+
+/**
+ * A pend that failed. `conflict` marks the retryable class — an optimistic-concurrency collision (a
+ * committed `missing` action newer than our rev, or a `pending` action on a touched block) that a
+ * re-read + re-pend can clear. A bare rejection reason (storage full, policy) is NOT a conflict and
+ * is not worth re-driving. Thrown by {@link TransactionCoordinator.pendCollection} so the fan-out in
+ * pendPhase can settle it and read the flag off the rejection.
+ */
+class PendRejectedError extends Error {
+	constructor(collectionId: CollectionId, readonly conflict: boolean, reason?: string) {
+		super(`Pend failed for collection ${collectionId}: ${reason ?? (conflict ? 'stale conflict' : 'rejected')}`);
+		this.name = 'PendRejectedError';
+	}
+}
 
 /**
  * Coordinates multi-collection transactions.
@@ -86,19 +110,96 @@ export class TransactionCoordinator {
 	}
 
 	/**
-	 * Commit a transaction: materialise a log entry from each collection's staged
+	 * Commit a transaction with a bounded, jittered backoff retry around a CLEAN stale loss.
+	 *
+	 * The single-attempt work lives in {@link commitOnce}; this wrapper re-drives it when the attempt
+	 * fails as a clean optimistic-concurrency loss ({@link CoordinatorStaleLossError} — nothing
+	 * durably committed, every tracker restored to its pre-append state). Before each re-attempt it
+	 * re-reads each collection to fresh revisions (so the retry pends against current state rather
+	 * than immediately re-failing stale), then backs off with the same jitter policy as
+	 * {@link Collection.sync}. Retry is bounded by `maxAttempts` and an optional wall-clock
+	 * `deadlineMs`, and honours an abort `signal`.
+	 *
+	 * A {@link CoordinatorPartialCommitError} (a partial landing — some collection durably committed)
+	 * is NOT retryable and escapes immediately: blindly retrying would re-log already-durable actions.
+	 * Any other failure (expired transaction, unavailable transactor, unreachable cluster) also
+	 * propagates without retry — only genuine clean stale losses are re-driven.
+	 *
+	 * Defaults are safe out of the box: a caller that passes no options gets bounded, jittered retry.
+	 *
+	 * @param transaction - The transaction to commit
+	 * @param options - Retry knobs; shares the {@link SyncOptions} vocabulary with `Collection.sync`.
+	 */
+	async commit(transaction: Transaction, options?: SyncOptions): Promise<void> {
+		const maxAttempts = options?.maxAttempts ?? DefaultMaxAttempts;
+		const baseBackoffMs = options?.baseBackoffMs ?? DefaultBaseBackoffMs;
+		const maxBackoffMs = options?.maxBackoffMs ?? DefaultMaxBackoffMs;
+		const deadlineMs = options?.deadlineMs;
+		const signal = options?.signal;
+		const startedAt = Date.now();
+
+		// Count of consecutive clean stale losses. There is no forward-progress notion here (a
+		// single commit either lands or it does not), so this simply bounds how many times we
+		// re-drive a losing transaction before surfacing a terminal error.
+		let staleLosses = 0;
+		let lastLoss: CoordinatorStaleLossError | undefined;
+		for (;;) {
+			if (signal?.aborted) {
+				throw makeAbortError(signal);
+			}
+			// Progress-agnostic ceiling: once we've taken at least one loss, give up if the
+			// wall-clock deadline passed (independent of the attempt cap).
+			if (deadlineMs !== undefined && lastLoss && Date.now() - startedAt >= deadlineMs) {
+				throw lastLoss;
+			}
+
+			try {
+				await this.commitOnce(transaction);
+				return;
+			} catch (err) {
+				// Only a CLEAN stale loss is retryable. A partial landing, an expired transaction, an
+				// unavailable transactor, etc. all propagate unchanged.
+				if (!(err instanceof CoordinatorStaleLossError)) {
+					throw err;
+				}
+				lastLoss = err;
+				staleLosses++;
+				if (staleLosses >= maxAttempts) {
+					throw err;
+				}
+				const delay = jitteredBackoffMs(staleLosses - 1, { baseMs: baseBackoffMs, capMs: maxBackoffMs }, options?.rand);
+				await abortableDelay(delay, signal);
+				// Re-read fresh state before re-attempting so the next commit pends against current
+				// revisions (mirrors how Collection.sync calls updateInternal() before retrying).
+				// NOTE: refreshes EVERY registered collection, not only the participants of this
+				// transaction. Harmless (a non-participant's update() just fetches latest) and the
+				// registered set is small today; if a coordinator ever holds many collections and this
+				// shows up as retry latency, narrow it to the transaction's participating collections.
+				for (const collection of this.collections.values()) {
+					await collection.update();
+				}
+			}
+		}
+	}
+
+	/**
+	 * Commit a transaction (single attempt): materialise a log entry from each collection's staged
 	 * pending actions, then orchestrate the distributed consensus (GATHER/PEND/COMMIT).
 	 *
-	 * Called by TransactionSession.commit() after all statements have executed. The
+	 * Called by {@link commit} (which wraps it in the backoff+jitter retry loop). The
 	 * staged mutations already live in each collection's tracker — applied either via
 	 * applyActions() (engine-driven path) or directly via Collection.act()/Tree.stage
 	 * (the vtab's deferred-DML path) — but in BOTH cases without a log entry yet, so
 	 * this method appends that entry here (see the inline note below) before pending,
 	 * and folds the committed transforms back into each collection's read cache.
 	 *
+	 * On a clean stale loss (nothing durable, every tracker restored) it throws
+	 * {@link CoordinatorStaleLossError} so the caller can retry; on a partial landing it throws
+	 * {@link CoordinatorPartialCommitError} (not retryable).
+	 *
 	 * @param transaction - The transaction to commit
 	 */
-	async commit(transaction: Transaction): Promise<void> {
+	private async commitOnce(transaction: Transaction): Promise<void> {
 		if (isTransactionExpired(transaction.stamp)) {
 			throw new Error(`Transaction expired at ${transaction.stamp.expiration}`);
 		}
@@ -154,6 +255,7 @@ export class TransactionCoordinator {
 			error?: string;
 			committedCollections?: Set<CollectionId>;
 			failedCollections?: Set<CollectionId>;
+			staleLoss?: boolean;
 		};
 		try {
 			for (const { collectionId, collection } of collectionData) {
@@ -234,10 +336,17 @@ export class TransactionCoordinator {
 			}
 
 			// EMPTY committed set: PEND failed, or the whole commit failed cleanly with
-			// nothing durable. Restore every tracker and throw a plain error, exactly as
-			// before — a genuinely clean failure leaves each tracker pristine for retry.
+			// nothing durable. Restore every tracker so each is pristine for retry.
 			for (const { collectionId, collection } of collectionData) {
 				collection.restorePending(preCommitSnapshots.get(collectionId)!);
+			}
+			// Distinguish a genuine optimistic-concurrency conflict (a stale loss / pending
+			// contention — retryable after a re-read) from a hard failure (unavailable transactor,
+			// storage rejection, expired). Only the former is worth re-driving; the retry wrapper in
+			// commit() catches CoordinatorStaleLossError and re-attempts, while a plain Error escapes
+			// immediately (preserving the historical fail-fast behaviour for hard failures).
+			if (coordResult.staleLoss) {
+				throw new CoordinatorStaleLossError([...(coordResult.failedCollections ?? new Set(allCollectionIds))], coordResult.error);
 			}
 			throw new Error(`Transaction commit failed: ${coordResult.error}`);
 		}
@@ -605,6 +714,9 @@ export class TransactionCoordinator {
 		error?: string;
 		committedCollections?: Set<CollectionId>;
 		failedCollections?: Set<CollectionId>;
+		/** True when the failure was a clean optimistic-concurrency conflict (stale loss / pending
+		 * contention) with nothing durable — i.e. safe to re-drive after a re-read. */
+		staleLoss?: boolean;
 	}> {
 		const trxId = transaction.id;
 		const t0 = Date.now();
@@ -653,6 +765,7 @@ export class TransactionCoordinator {
 				error: commitResult.error,
 				committedCollections: commitResult.committedCollections,
 				failedCollections: commitResult.failedCollections,
+				staleLoss: commitResult.staleLoss,
 			};
 		}
 
@@ -719,7 +832,7 @@ export class TransactionCoordinator {
 		operationsHash: string,
 		collectionTransforms: ReadonlyMap<CollectionId, Transforms>,
 		superclusterNominees: ReadonlySet<PeerId> | null
-	): Promise<{ success: boolean; error?: string; pendedBlockIds?: Map<CollectionId, BlockId[]> }> {
+	): Promise<{ success: boolean; error?: string; pendedBlockIds?: Map<CollectionId, BlockId[]>; staleLoss?: boolean }> {
 		if (collectionTransforms.size === 0) {
 			return { success: false, error: 'No transforms to pend' };
 		}
@@ -742,11 +855,15 @@ export class TransactionCoordinator {
 		// ids), plus the first failure reason if any collection failed.
 		const pendedBlockIds = new Map<CollectionId, BlockId[]>();
 		let failure: string | undefined;
+		// Classify the first failure: a conflicting pend (PendRejectedError.conflict) is a clean
+		// stale loss the caller may retry; anything else (hard rejection, thrown/unavailable) is not.
+		let failureConflict = false;
 		for (const outcome of outcomes) {
 			if (outcome.status === 'fulfilled') {
 				pendedBlockIds.set(outcome.value.collectionId, outcome.value.blockIds);
 			} else if (failure === undefined) {
 				failure = outcome.reason instanceof Error ? outcome.reason.message : String(outcome.reason);
+				failureConflict = outcome.reason instanceof PendRejectedError && outcome.reason.conflict;
 			}
 		}
 
@@ -756,7 +873,7 @@ export class TransactionCoordinator {
 			// only those started before the failure. Cancels are best-effort (cancelPhase
 			// swallows their errors) so they cannot mask the original pend failure.
 			await this.cancelPhase(actionId, pendedBlockIds);
-			return { success: false, error: failure };
+			return { success: false, error: failure, staleLoss: failureConflict };
 		}
 
 		return { success: true, pendedBlockIds };
@@ -796,7 +913,11 @@ export class TransactionCoordinator {
 
 		const pendResult = await this.transactor.pend(pendRequest);
 		if (!pendResult.success) {
-			throw new Error(`Pend failed for collection ${collectionId}: ${pendResult.reason}`);
+			// A committed `missing` action or a `pending` action on a touched block is an
+			// optimistic-concurrency conflict — retryable after a re-read. A bare `reason` is a hard
+			// rejection (storage/policy) that re-driving won't fix.
+			const conflict = Boolean(pendResult.missing?.length || pendResult.pending?.length);
+			throw new PendRejectedError(collectionId, conflict, pendResult.reason);
 		}
 
 		return { collectionId, blockIds: pendResult.blockIds };
@@ -818,6 +939,7 @@ export class TransactionCoordinator {
 		error?: string;
 		committedCollections: Set<CollectionId>;
 		failedCollections: Set<CollectionId>;
+		staleLoss?: boolean;
 	}> {
 		// Fan out the independent per-collection commit-with-retry concurrently, then
 		// aggregate the committed/failed partition from the settled results.
@@ -830,19 +952,27 @@ export class TransactionCoordinator {
 		const committedCollections = new Set<CollectionId>();
 		const failedCollections = new Set<CollectionId>();
 		const errors: string[] = [];
+		// Classify failures: a returned stale loss (someone committed a newer rev) is retryable after
+		// a re-read; a thrown/transient-exhausted or structural failure is not. staleLoss holds only
+		// if EVERY failure was a stale loss — a single hard failure makes the whole attempt not worth
+		// re-driving.
+		let anyStale = false;
+		let anyHard = false;
 		for (const outcome of outcomes) {
 			if (outcome.status === 'fulfilled') {
-				const { collectionId, committed, error } = outcome.value;
+				const { collectionId, committed, error, stale } = outcome.value;
 				if (committed) {
 					committedCollections.add(collectionId);
 				} else {
 					failedCollections.add(collectionId);
 					if (error) errors.push(error);
+					if (stale) anyStale = true; else anyHard = true;
 				}
 			} else {
 				// commitCollection resolves rather than rejects, but treat any unexpected
-				// rejection as a failure so the partitioned sets stay honest.
+				// rejection as a (hard) failure so the partitioned sets stay honest.
 				errors.push(outcome.reason instanceof Error ? outcome.reason.message : String(outcome.reason));
+				anyHard = true;
 			}
 		}
 
@@ -851,7 +981,8 @@ export class TransactionCoordinator {
 				success: false,
 				error: errors.join('; ') || 'Commit failed',
 				committedCollections,
-				failedCollections
+				failedCollections,
+				staleLoss: anyStale && !anyHard,
 			};
 		}
 
@@ -868,7 +999,7 @@ export class TransactionCoordinator {
 		criticalBlockIds: BlockId[],
 		collectionId: CollectionId,
 		blockIds: BlockId[]
-	): Promise<{ collectionId: CollectionId; committed: boolean; error?: string }> {
+	): Promise<{ collectionId: CollectionId; committed: boolean; error?: string; stale?: boolean }> {
 		const collection = this.collections.get(collectionId);
 		if (!collection) {
 			return { collectionId, committed: false, error: `Collection not found: ${collectionId}` };
@@ -903,10 +1034,12 @@ export class TransactionCoordinator {
 				if (commitResult.success) {
 					return { collectionId, committed: true };
 				}
-				// Permanent stale failure: do not retry.
+				// Permanent stale failure: do not retry here. It IS a clean stale loss, though, so
+				// mark it retryable at the coordinator level (after a re-read advances the rev).
 				return {
 					collectionId,
 					committed: false,
+					stale: true,
 					error: commitResult.reason ?? `Stale commit for collection ${collectionId}`
 				};
 			} catch (e) {

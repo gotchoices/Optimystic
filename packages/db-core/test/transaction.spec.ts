@@ -14,6 +14,7 @@ import {
 	blockIdsForTransforms,
 	TransactionCoordinator,
 	CoordinatorPartialCommitError,
+	CoordinatorStaleLossError,
 	TransactionSession,
 	TransactionValidator,
 	Tree,
@@ -3524,10 +3525,10 @@ describe('Transaction', () => {
 	describe('Failed commit restores staged tracker state (txn-failed-commit-leaves-staged-log-entry)', () => {
 		type UserEntry = { key: number; name: string };
 
-		it('session.commit failure leaves tracker + pending unchanged, and retry does not double-log', async () => {
+		it('session.commit auto-retries a clean stale loss and lands exactly once (no double-log)', async () => {
 			const inner = new TestTransactor();
-			// Return a stale failure on the first commit() (a stale loss is attempted once,
-			// not retried), then let the retry session.commit()'s 2nd transactor.commit succeed.
+			// The FIRST commit() returns a stale failure (a clean loss — nothing durable); the
+			// coordinator's built-in backoff+jitter retry then re-drives and the 2nd commit succeeds.
 			const flaky = new FlakyCommitTransactor(inner, 1);
 
 			const usersTree = await Tree.createOrOpen<number, UserEntry>(flaky, 'users', e => e.key);
@@ -3543,34 +3544,27 @@ describe('Transaction', () => {
 			];
 			await session.execute(createActionsStatements(actions)[0]!, actions);
 
-			// Pre-commit staged state: transforms + pending are staged, but the log entry
-			// is NOT appended yet (that happens inside coordinator.commit).
-			const pre = usersCollection.snapshotPending();
+			// A SINGLE commit() succeeds despite the first-attempt stale loss: the internal retry
+			// restored the tracker to its pre-append state between attempts, so it re-appended cleanly.
+			const result = await session.commit({ baseBackoffMs: 1, maxBackoffMs: 5 });
+			expect(result.success, 'commit should succeed after the internal stale-loss retry').to.be.true;
 
-			// First commit fails in the COMMIT phase (after the log entry was appended).
-			let threw = false;
-			try {
-				await session.commit();
-			} catch {
-				threw = true;
-			}
-			expect(threw, 'first session.commit() should reject on forced commit failure').to.be.true;
+			// The transactor saw exactly two commit attempts: the forced loss + the winning retry —
+			// proof the internal retry is bounded and does not re-log the already-appended entry.
+			expect(flaky.commitAttempts, 'one forced loss + one winning retry').to.equal(2);
 
-			// The failed commit must leave the tracker EXACTLY as it was pre-append:
-			// no leftover appended log entry, pending queue intact.
-			expect(usersCollection.tracker.transforms).to.deep.equal(pre.transforms,
-				'tracker transforms should be restored to their pre-commit state');
-			expect(usersCollection.getPendingActions()).to.deep.equal(pre.pending,
-				'pending queue should be restored to its pre-commit state');
-
-			// Retry the same session; the transactor now lets commit through.
-			const retry = await session.commit();
-			expect(retry.success, 'retry commit should succeed once the transactor recovers').to.be.true;
-
-			// Exactly ONE committed action for this transaction — the failed attempt did
-			// not leave a duplicate log entry that would re-commit on retry.
+			// Exactly ONE committed action for this transaction — the failed attempt did NOT leave a
+			// duplicate log entry that would re-commit on retry.
 			expect(inner.getCommittedActions().size, 'exactly one action committed, no duplicate').to.equal(1);
 			expect(await usersTree.get(1)).to.deep.equal({ key: 1, name: 'Alice' });
+
+			// Tracker + pending fully drained after the successful commit.
+			const t = usersCollection.tracker.transforms;
+			expect(
+				Object.keys(t.inserts ?? {}).length + Object.keys(t.updates ?? {}).length + (t.deletes?.length ?? 0),
+				'tracker reset after successful commit'
+			).to.equal(0);
+			expect(usersCollection.getPendingActions(), 'pending drained after commit').to.deep.equal([]);
 		});
 
 		it('directly-staged tree: failed commit restores tracker and rollback is a clean no-op', async () => {
@@ -3597,9 +3591,11 @@ describe('Transaction', () => {
 				id: await createTransactionId(stamp.id, [], [])
 			};
 
+			// maxAttempts:1 so the always-losing commit surfaces its terminal error immediately
+			// (the clean stale loss is otherwise auto-retried); the restore invariant is what we test.
 			let threw = false;
 			try {
-				await coordinator.commit(transaction);
+				await coordinator.commit(transaction, { maxAttempts: 1, baseBackoffMs: 1 });
 			} catch {
 				threw = true;
 			}
@@ -3645,9 +3641,11 @@ describe('Transaction', () => {
 			const preUsers = usersCollection.snapshotPending();
 			const prePosts = postsCollection.snapshotPending();
 
+			// maxAttempts:1 so the always-losing commit surfaces immediately instead of auto-retrying
+			// the clean stale loss; we are testing the multi-tracker restore, not the retry.
 			let threw = false;
 			try {
-				await session.commit();
+				await session.commit({ maxAttempts: 1, baseBackoffMs: 1 });
 			} catch {
 				threw = true;
 			}
@@ -3830,7 +3828,7 @@ describe('Transaction', () => {
 				.to.be.false;
 		});
 
-		it('empty-committed failure (every collection fails) throws a PLAIN error and restores every tracker', async () => {
+		it('empty-committed failure (every collection fails) throws a clean stale-loss error (not the partial signal) and restores every tracker', async () => {
 			const inner = new TestTransactor();
 			const flaky = new FlakyCommitTransactor(inner, Infinity); // every commit fails → nothing durable
 
@@ -3853,15 +3851,18 @@ describe('Transaction', () => {
 			const preUsers = usersCollection.snapshotPending();
 			const prePosts = postsCollection.snapshotPending();
 
+			// maxAttempts:1 so the always-losing commit surfaces its terminal error immediately
+			// rather than auto-retrying the clean stale loss.
 			let caught: unknown;
 			try {
-				await session.commit();
+				await session.commit({ maxAttempts: 1, baseBackoffMs: 1 });
 			} catch (e) {
 				caught = e;
 			}
 
-			// Empty committed set → a genuinely clean failure: a PLAIN Error, never the partial signal.
-			expect(caught).to.be.instanceOf(Error);
+			// Empty committed set → a genuinely clean stale loss: the retryable stale-loss signal,
+			// NEVER the partial-commit signal (nothing durable landed, so nothing to reconcile).
+			expect(caught).to.be.instanceOf(CoordinatorStaleLossError);
 			expect(caught, 'a clean (empty-committed) failure must NOT be a partial commit')
 				.to.not.be.instanceOf(CoordinatorPartialCommitError);
 
@@ -3979,6 +3980,191 @@ describe('Transaction', () => {
 			// Both collections now read back their values.
 			expect(await usersTree.get(1)).to.deep.equal({ key: 1, name: 'Alice' });
 			expect(await postsTree.get(100)).to.deep.equal({ key: 100, userId: 1, title: 'First' });
+		});
+	});
+
+	describe('Coordinator commit backoff+jitter retry (occ-default-backoff)', () => {
+		type UserEntry = { key: number; name: string };
+		type PostEntry = { key: number; userId: number; title: string };
+
+		/** Commits every collection EXCEPT the poison one, which loses (a returned StaleFailure)
+		 * permanently — reproducing a PARTIAL landing (winner durable, loser rejected). Counts commit
+		 * calls so a test can prove the partial signal is NOT auto-retried. */
+		class PartialLossTransactor implements ITransactor {
+			commitCalls = 0;
+			private readonly poison = new Set<BlockId>();
+			constructor(private readonly inner: TestTransactor, private readonly poisonCollectionId: string) {}
+			get(b: BlockGets): Promise<GetBlockResults> { return this.inner.get(b); }
+			getStatus(a: ActionBlocks[]): Promise<BlockActionStatus[]> { return this.inner.getStatus(a); }
+			cancel(a: ActionBlocks): Promise<void> { return this.inner.cancel(a); }
+			async pend(request: PendRequest): Promise<PendResult> {
+				const firstInsert = Object.values(request.transforms.inserts ?? {})[0] as IBlock | undefined;
+				if (firstInsert?.header.collectionId === this.poisonCollectionId) {
+					for (const id of blockIdsForTransforms(request.transforms)) this.poison.add(id);
+				}
+				return this.inner.pend(request);
+			}
+			async commit(request: CommitRequest): Promise<CommitResult> {
+				this.commitCalls++;
+				if (request.blockIds.some(id => this.poison.has(id))) {
+					return { success: false, reason: `forced loss: ${this.poisonCollectionId}` };
+				}
+				return this.inner.commit(request);
+			}
+		}
+
+		async function makeMultiCollection(transactor: ITransactor) {
+			const usersTree = await Tree.createOrOpen<number, UserEntry>(transactor, 'users', e => e.key);
+			const postsTree = await Tree.createOrOpen<number, PostEntry>(transactor, 'posts', e => e.key);
+			const collections = new Map<string, any>([
+				['users', (usersTree as unknown as { collection: any }).collection],
+				['posts', (postsTree as unknown as { collection: any }).collection],
+			]);
+			const coordinator = new TransactionCoordinator(transactor, collections);
+			const actions: CollectionActions[] = [
+				{ collectionId: 'users', actions: [{ type: 'replace', data: [[1, { key: 1, name: 'Alice' }]] }] },
+				{ collectionId: 'posts', actions: [{ type: 'replace', data: [[100, { key: 100, userId: 1, title: 'First' }]] }] },
+			];
+			const statements = createActionsStatements(actions);
+			const stamp = await createTransactionStamp('peer1', Date.now(), 'schema1', ACTIONS_ENGINE_ID);
+			const transaction: Transaction = {
+				stamp, statements, reads: [],
+				id: await createTransactionId(stamp.id, statements, []),
+			};
+			await coordinator.applyActions(actions, stamp.id);
+			return { coordinator, usersTree, postsTree, transaction };
+		}
+
+		it('clean multi-collection stale loss backs off, re-reads, then commits (bounded attempts)', async () => {
+			const inner = new TestTransactor();
+			// Fail the first 2 commits — attempt 1 loses BOTH collections (nothing durable), then the
+			// re-driven attempt 2 commits both.
+			const flaky = new FlakyCommitTransactor(inner, 2);
+			const { coordinator, usersTree, postsTree, transaction } = await makeMultiCollection(flaky);
+
+			await coordinator.commit(transaction, { baseBackoffMs: 1, maxBackoffMs: 5 });
+
+			// Bounded: 2 forced losses (attempt 1) + 2 winning commits (attempt 2) = 4 commit calls.
+			expect(flaky.commitAttempts, 'attempt 1 loses both, attempt 2 wins both').to.equal(4);
+			// Exactly one durable transaction (both collections share the action id).
+			expect(inner.getCommittedActions().size, 'transaction landed durably exactly once').to.equal(1);
+			expect(await usersTree.get(1)).to.deep.equal({ key: 1, name: 'Alice' });
+			expect(await postsTree.get(100)).to.deep.equal({ key: 100, userId: 1, title: 'First' });
+		});
+
+		it('a PARTIAL landing throws CoordinatorPartialCommitError and is NOT auto-retried', async () => {
+			const inner = new TestTransactor();
+			const transactor = new PartialLossTransactor(inner, 'posts'); // posts loses permanently
+			const { coordinator, transaction } = await makeMultiCollection(transactor);
+
+			let err: unknown;
+			try {
+				// Default options → auto-retry is ON, but a partial landing must bypass it.
+				await coordinator.commit(transaction);
+			} catch (e) {
+				err = e;
+			}
+
+			expect(err, 'partial landing surfaces the partial signal').to.be.instanceOf(CoordinatorPartialCommitError);
+			expect([...(err as CoordinatorPartialCommitError).committedCollections]).to.deep.equal(['users']);
+			expect([...(err as CoordinatorPartialCommitError).failedCollections]).to.deep.equal(['posts']);
+			// The winner ('users') stayed durable; nothing was re-driven.
+			expect(inner.getCommittedActions().size, "only the winner's half landed").to.equal(1);
+			// Proof of no-retry: exactly one commit call per collection (2), NOT 2 + retry rounds.
+			expect(transactor.commitCalls, 'partial landing was not re-driven').to.equal(2);
+		});
+
+		it('an always-losing transaction exhausts maxAttempts and surfaces a terminal error (no infinite loop)', async () => {
+			const inner = new TestTransactor();
+			const flaky = new FlakyCommitTransactor(inner, Infinity); // every commit loses
+			const usersTree = await Tree.createOrOpen<number, UserEntry>(flaky, 'users', e => e.key);
+			const usersCollection = (usersTree as unknown as { collection: any }).collection;
+			const collections = new Map<string, any>([['users', usersCollection]]);
+			const coordinator = new TransactionCoordinator(flaky, collections);
+			const actions: CollectionActions[] = [
+				{ collectionId: 'users', actions: [{ type: 'replace', data: [[1, { key: 1, name: 'Alice' }]] }] },
+			];
+			const statements = createActionsStatements(actions);
+			const stamp = await createTransactionStamp('peer1', Date.now(), 'schema1', ACTIONS_ENGINE_ID);
+			const transaction: Transaction = {
+				stamp, statements, reads: [], id: await createTransactionId(stamp.id, statements, []),
+			};
+			await coordinator.applyActions(actions, stamp.id);
+
+			let err: unknown;
+			try {
+				await coordinator.commit(transaction, { maxAttempts: 3, baseBackoffMs: 1, maxBackoffMs: 5 });
+			} catch (e) {
+				err = e;
+			}
+
+			expect(err, 'terminal stale-loss error after the budget is spent').to.be.instanceOf(CoordinatorStaleLossError);
+			// Exactly maxAttempts commit calls — bounded, not spinning forever.
+			expect(flaky.commitAttempts, 'attempt count == cap').to.equal(3);
+			expect(inner.getCommittedActions().size, 'nothing durably committed').to.equal(0);
+		});
+
+		it('rejects promptly with an AbortError when the signal aborts mid-backoff', async () => {
+			const inner = new TestTransactor();
+			const flaky = new FlakyCommitTransactor(inner, Infinity);
+			const usersTree = await Tree.createOrOpen<number, UserEntry>(flaky, 'users', e => e.key);
+			const usersCollection = (usersTree as unknown as { collection: any }).collection;
+			const collections = new Map<string, any>([['users', usersCollection]]);
+			const coordinator = new TransactionCoordinator(flaky, collections);
+			const actions: CollectionActions[] = [
+				{ collectionId: 'users', actions: [{ type: 'replace', data: [[1, { key: 1, name: 'Alice' }]] }] },
+			];
+			const statements = createActionsStatements(actions);
+			const stamp = await createTransactionStamp('peer1', Date.now(), 'schema1', ACTIONS_ENGINE_ID);
+			const transaction: Transaction = {
+				stamp, statements, reads: [], id: await createTransactionId(stamp.id, statements, []),
+			};
+			await coordinator.applyActions(actions, stamp.id);
+
+			const controller = new AbortController();
+			// Long backoff + huge attempt budget: without the abort this would sit in the backoff sleep.
+			const p = coordinator.commit(transaction, {
+				signal: controller.signal, maxAttempts: 1000, baseBackoffMs: 60_000, maxBackoffMs: 60_000,
+			});
+			p.catch(() => { /* asserted below */ });
+
+			await new Promise(resolve => setTimeout(resolve, 25));
+			controller.abort();
+
+			const err = await p.catch(e => e) as Error;
+			expect(err.name).to.equal('AbortError');
+			expect(err, 'abort is not a retry-exhaustion').to.not.be.instanceOf(CoordinatorStaleLossError);
+		});
+
+		it('deadlineMs stops the retry independently of a large maxAttempts', async () => {
+			const inner = new TestTransactor();
+			const flaky = new FlakyCommitTransactor(inner, Infinity);
+			const usersTree = await Tree.createOrOpen<number, UserEntry>(flaky, 'users', e => e.key);
+			const usersCollection = (usersTree as unknown as { collection: any }).collection;
+			const collections = new Map<string, any>([['users', usersCollection]]);
+			const coordinator = new TransactionCoordinator(flaky, collections);
+			const actions: CollectionActions[] = [
+				{ collectionId: 'users', actions: [{ type: 'replace', data: [[1, { key: 1, name: 'Alice' }]] }] },
+			];
+			const statements = createActionsStatements(actions);
+			const stamp = await createTransactionStamp('peer1', Date.now(), 'schema1', ACTIONS_ENGINE_ID);
+			const transaction: Transaction = {
+				stamp, statements, reads: [], id: await createTransactionId(stamp.id, statements, []),
+			};
+			await coordinator.applyActions(actions, stamp.id);
+
+			let err: unknown;
+			try {
+				await coordinator.commit(transaction, {
+					deadlineMs: 30, maxAttempts: 1_000_000, baseBackoffMs: 1, maxBackoffMs: 1,
+				});
+			} catch (e) {
+				err = e;
+			}
+
+			expect(err).to.be.instanceOf(CoordinatorStaleLossError);
+			// Stopped by the wall-clock deadline, not the (unreachable) attempt cap.
+			expect(flaky.commitAttempts, 'deadline halted retries well below the attempt cap').to.be.lessThan(1_000_000);
 		});
 	});
 

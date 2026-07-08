@@ -62,3 +62,30 @@ export class CoordinatorPartialCommitError extends Error {
 		this.name = 'CoordinatorPartialCommitError';
 	}
 }
+
+/**
+ * Thrown by {@link TransactionCoordinator.commit} when a multi-collection commit failed as a
+ * CLEAN stale loss — an optimistic-concurrency conflict (a racing transaction advanced a log tail)
+ * in which NOTHING durably committed, so every participating collection's local tracker was
+ * restored to its pre-append state and the transaction is safe to re-drive.
+ *
+ * This is the retryable counterpart to {@link CoordinatorPartialCommitError}: a partial landing
+ * cannot be blindly retried (it would double-apply the durable half), but a clean loss can. The
+ * coordinator's built-in backoff+jitter retry catches this internally and re-drives after re-reading
+ * fresh revisions; it only escapes to the caller once the retry budget (`maxAttempts` / `deadlineMs`)
+ * is exhausted, at which point it signals "gave up after a clean loss" rather than a partial split.
+ */
+export class CoordinatorStaleLossError extends Error {
+	constructor(
+		/** Collections that lost the race this attempt (all had their local state reverted for retry). */
+		public readonly failedCollections: readonly CollectionId[],
+		/** The underlying stale/conflict reason surfaced by the failed pend/commit phase. */
+		public readonly reason?: string,
+	) {
+		super(
+			`Multi-collection commit failed on a clean stale loss (no collection durably committed) ` +
+			`for [${failedCollections.join(', ')}]` + (reason ? ` — ${reason}` : '')
+		);
+		this.name = 'CoordinatorStaleLossError';
+	}
+}
