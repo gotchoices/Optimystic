@@ -846,7 +846,7 @@ describe('Mid-DDL crash recovery (solo node)', function () {
 		it('crash before any saveRevision: Tree retries succeed post-recovery', async () => {
 			const raw = new MemoryRawStorage();
 			// Fault on the FIRST saveRevision — aborts commit before any block gets a revision.
-			const { mesh } = await buildCrashingMesh(raw, {
+			const { mesh, proxy } = await buildCrashingMesh(raw, {
 				method: 'saveRevision',
 				when: 'before'
 			});
@@ -863,7 +863,23 @@ describe('Mid-DDL crash recovery (solo node)', function () {
 			} catch (err) {
 				ddlErr = err;
 			}
-			expect(ddlErr, 'DDL surfaces an error (not a silent success)').to.not.equal(undefined);
+
+			// The injected fault MUST have fired — otherwise this test is exercising nothing.
+			expect(proxy.fired, 'saveRevision fault fired during the DDL commit').to.equal(true);
+
+			// The `CrashingRawStorage` proxy fires exactly once, so the aborted commit is a
+			// single transient storage fault, not a durable crash. Collection.sync's bounded
+			// retry loop (see collection-sync-infinite-retry) re-pends the same action and the
+			// second saveRevision — no longer intercepted — lands cleanly. Transparent recovery
+			// from a transient fault is the CORRECT resilient outcome (a persistent fault would
+			// instead exhaust the retry budget and surface a SyncRetryExhaustedError), so the DDL
+			// legitimately either recovers silently or surfaces an error. What it must NOT do is
+			// wedge the DB with a silent-corruption sentinel.
+			if (ddlErr) {
+				const message = (ddlErr as Error).message ?? '';
+				expect(message).to.not.include('non-existent chain');
+				expect(message).to.not.include('not found during restore attempt');
+			}
 
 			// Recovery: fresh Tree on the same id must not silently corrupt — it should
 			// either succeed (rolled-back or committed state) or surface a clear,
