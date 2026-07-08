@@ -194,6 +194,13 @@ export class CoordinatorRepo implements IRepo {
 		//   (b) Stale-by-policy — block is present but read-repair policy says verify.
 		// Skip cluster fetch if this is already a sync request (to prevent recursive queries).
 		const skipClusterFetch = (options as any)?.skipClusterFetch;
+		// NOTE: NetworkTransactor.get treats an authoritative "absent" ({ state: {} })
+		// as final and no longer retries it (ticket txn-perf-authoritative-notfound),
+		// relying on this cluster reconciliation to have already run. If a coordinator
+		// is ever configured WITHOUT clusterLatestCallback, a missing block is answered
+		// from local state alone with no transactor-level retry to compensate. That is
+		// fine today (such a coordinator has no cluster to reconcile against), but keep
+		// this coupling in mind if a partial-cluster read path is added.
 		if (this.clusterLatestCallback && !skipClusterFetch) {
 			for (const blockId of blockGets.blockIds) {
 				const localEntry = localResult[blockId];

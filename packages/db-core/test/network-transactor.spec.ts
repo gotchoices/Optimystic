@@ -161,6 +161,51 @@ describe('NetworkTransactor', () => {
       expect(bGets).to.equal(1)
       expect(result[blockId]).to.exist
     })
+
+    // Multi-block partial batch: a single coordinator answers for b1 but returns
+    // NO entry for b2. The old `.some` predicate judged this batch non-retryable
+    // (b1 had an entry) and let b2 fall straight to the missingIds aggregate-error
+    // path. The `.every` predicate retries the whole payload on a distinct
+    // coordinator and recovers b2.
+    it('retries the whole payload when a batch answers some but not all block ids', async () => {
+      const peerA = 'peer-A'
+      const peerB = 'peer-B'
+      const net = new CountingKeyNetwork([peerA, peerB])
+
+      const b1 = 'block-1' as BlockId
+      const b2 = 'block-2' as BlockId
+
+      let bGets = 0
+      // peerA answers for b1 only — b2 has no entry at all (a partial response).
+      const repoA = makeGetOnlyRepo(async () => {
+        const res: GetBlockResults = {}
+        res[b1] = { state: {} }
+        return res
+      })
+      // peerB (the retry coordinator) answers authoritatively for everything asked.
+      const repoB = makeGetOnlyRepo(async ({ blockIds }: BlockGets) => {
+        bGets++
+        const res: GetBlockResults = {}
+        for (const bid of blockIds) res[bid] = { state: {} }
+        return res
+      })
+
+      const networkTransactor = new NetworkTransactor({
+        timeoutMs: 1000,
+        abortOrCancelTimeoutMs: 500,
+        keyNetwork: net,
+        getRepo: (peerId: PeerId) => (peerId.toString() === peerA ? repoA : repoB),
+      })
+
+      // Both blocks route to peerA first (CountingKeyNetwork picks the first
+      // non-excluded peer), so they share one batch whose partial answer forces a
+      // retry to peerB. Without the retry this get() would throw for b2.
+      const result = await networkTransactor.get({ blockIds: [b1, b2] })
+
+      expect(bGets).to.be.greaterThan(0) // retry reached the second coordinator
+      expect(result[b1]).to.exist
+      expect(result[b2]).to.exist
+    })
   })
 
   describe('pend', () => {
