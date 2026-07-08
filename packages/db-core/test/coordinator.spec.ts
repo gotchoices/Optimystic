@@ -60,7 +60,11 @@ class InstrumentedTransactor implements ITransactor {
 	cancelledBlockIds: BlockId[] = [];
 	commitAttemptsByCollection = new Map<string, number>();
 
-	constructor(private readonly failCollections: Set<string> = new Set(), private readonly stepMs = 5) {}
+	constructor(
+		private readonly failCollections: Set<string> = new Set(),
+		private readonly stepMs = 5,
+		private readonly throwCollections: Set<string> = new Set()
+	) {}
 
 	async get(_blockGets: BlockGets): Promise<GetBlockResults> {
 		throw new Error('unused on the phase path');
@@ -76,6 +80,9 @@ class InstrumentedTransactor implements ITransactor {
 			await delay(this.stepMs);
 			const collectionId = collectionOfTransforms(request.transforms);
 			const blockIds = blockIdsForTransforms(request.transforms);
+			if (this.throwCollections.has(collectionId)) {
+				throw new Error(`forced pend throw: ${collectionId}`);
+			}
 			if (this.failCollections.has(collectionId)) {
 				return { success: false, reason: `forced pend failure: ${collectionId}` };
 			}
@@ -167,6 +174,28 @@ describe('TransactionCoordinator phases (concurrency + cancel-on-failure)', () =
 			// happened to pend before the failure. Order is not guaranteed under concurrency, so
 			// compare as a set.
 			const expectedCancels = collectionIds.filter(id => id !== failing).map(id => `${id}-tail`);
+			expect([...transactor.cancelledBlockIds].sort()).to.deep.equal([...expectedCancels].sort());
+		});
+
+		it('cancels every successfully-pended collection when transactor.pend throws for one collection', async () => {
+			const collectionIds = ['c0', 'c1', 'c2', 'c3'];
+			const throwing = 'c2';
+			const transactor = new InstrumentedTransactor(new Set(), 5, new Set([throwing]));
+			const coordinator = new TransactionCoordinator(transactor, fakeCollections(collectionIds) as never);
+
+			const collectionTransforms = new Map<CollectionId, Transforms>(
+				collectionIds.map(id => [id, transformsForCollection(id)])
+			);
+
+			const result = await (coordinator as unknown as {
+				pendPhase: (t: Transaction, h: string, ct: Map<CollectionId, Transforms>, n: null) => Promise<{ success: boolean; error?: string }>;
+			}).pendPhase(transaction, 'ops:hash', collectionTransforms, null);
+
+			expect(result.success).to.be.false;
+			expect(result.error).to.contain(throwing);
+
+			// The three collections that pended before the throw must all be cancelled.
+			const expectedCancels = collectionIds.filter(id => id !== throwing).map(id => `${id}-tail`);
 			expect([...transactor.cancelledBlockIds].sort()).to.deep.equal([...expectedCancels].sort());
 		});
 
