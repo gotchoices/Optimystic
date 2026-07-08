@@ -901,7 +901,12 @@ export async function createLibp2pNodeBase(
 				thresholds: {
 					moveOut: 0.85,
 					moveIn: 0.40
-				}
+				},
+				// Damping so the ring decision cannot thrash near a boundary
+				// (docs/arachnode-ring-handoff.md § Part 1).
+				smoothingAlpha: 0.2,
+				deadband: 0.5,
+				minDwellMs: 10 * 60 * 1000
 			});
 
 			// Determine and announce ring membership
@@ -1020,8 +1025,9 @@ export async function createLibp2pNodeBase(
 				if (transition.shouldMove) {
 					log?.('Ring transition needed: moving %s to Ring %d', transition.direction, transition.newRingDepth);
 
-					// Update Arachnode info with new ring
-					const updatedInfo = await ringSelector.createArachnodeInfo(peerId);
+					// Advertise exactly the single-step target the transition just chose, so the
+					// advertised ring can never disagree with that decision on the next tick.
+					const updatedInfo = await ringSelector.createArachnodeInfo(peerId, transition.newRingDepth);
 					fretAdapter.setArachnodeInfo(updatedInfo);
 				}
 			}, 60_000);

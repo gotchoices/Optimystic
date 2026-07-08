@@ -2,7 +2,7 @@ import { expect } from 'chai';
 import { generateKeyPair } from '@libp2p/crypto/keys';
 import { peerIdFromPrivateKey } from '@libp2p/peer-id';
 import { RingSelector, type RingSelectorConfig } from '../src/storage/ring-selector.js';
-import type { ArachnodeFretAdapter } from '../src/storage/arachnode-fret-adapter.js';
+import type { ArachnodeFretAdapter, ArachnodeInfo } from '../src/storage/arachnode-fret-adapter.js';
 
 /** Generate `n` real (base58-encodable) Ed25519 peer-id strings — what calculatePartition needs
  *  to reach p2p-fret's hashPeerId, which reads `peerId.toMultihash().bytes`. */
@@ -43,14 +43,32 @@ type RingStat = { ringDepth: number; peerCount: number; avgCapacity: number };
 
 class MockFretAdapter implements Pick<ArachnodeFretAdapter, 'getMyArachnodeInfo' | 'getKnownRings' | 'getRingStats'> {
 	private _ringStats: RingStat[] = [];
+	private _myInfo: ArachnodeInfo | undefined;
 
 	setRingStats(stats: RingStat[]): void {
 		this._ringStats = stats;
 	}
 
-	getMyArachnodeInfo() { return undefined; }
+	/** Set the node's currently-advertised ArachnodeInfo (the hysteresis anchor shouldTransition reads). */
+	setMyArachnodeInfo(info: ArachnodeInfo | undefined): void {
+		this._myInfo = info;
+	}
+
+	getMyArachnodeInfo() { return this._myInfo; }
 	getKnownRings() { return this._ringStats.map(s => s.ringDepth); }
 	getRingStats() { return this._ringStats; }
+}
+
+/** Deterministic clock (Unix ms). `now` advances only via {@link advance} — no wall time. */
+class FakeClock {
+	private t = 0;
+	readonly now = (): number => this.t;
+	advance(ms: number): void { this.t += ms; }
+}
+
+/** Build a minimal advertised ArachnodeInfo at ring `ringDepth`. Capacity fields are unused here. */
+function advertise(ringDepth: number, status: ArachnodeInfo['status'] = 'active'): ArachnodeInfo {
+	return { ringDepth, capacity: { total: 0, used: 0, available: 0 }, status };
 }
 
 describe('RingSelector', () => {
@@ -230,42 +248,152 @@ describe('RingSelector', () => {
 		});
 	});
 
-	describe('shouldTransition', () => {
-		it('no transition when usage is in normal range', async () => {
-			monitor.setCapacity(1000, 500); // 50% used
+	describe('shouldTransition (damped)', () => {
+		// A dedicated selector wired with the damping config + a fake clock, so dwell can be
+		// exercised without sleeping. Defaults mirror production intent: h = 0.5 (a full ring between
+		// triggers), α = 0.2. moveOut/moveIn kept at the suite's 0.8/0.2 for readable percentages.
+		const MINUTE = 60 * 1000;
+		const dwellMs = 10 * MINUTE;
+		let clock: FakeClock;
+		let dampedConfig: RingSelectorConfig;
+
+		beforeEach(() => {
+			clock = new FakeClock();
+			dampedConfig = {
+				minCapacity: 1024 * 1024,
+				thresholds: { moveOut: 0.8, moveIn: 0.2 },
+				smoothingAlpha: 0.2,
+				deadband: 0.5,
+				minDwellMs: dwellMs,
+				now: clock.now
+			};
+			selector = new RingSelector(fretAdapter as any, monitor as any, dampedConfig);
+		});
+
+		/**
+		 * Drive the demand signal so the *smoothed* continuous depth equals `d` on the first sample
+		 * (EWMA seeds from the first sample, so seeded value == raw). `coverage = available/totalData
+		 * = 2^-d`; usedPercent is set independently via the monitor. total defaults to 1 GB.
+		 */
+		function setSignal(usedPercent: number, d: number, total = 1024 * 1024 * 1024): void {
+			const used = Math.round(usedPercent * total);
+			monitor.setCapacity(total, used);
+			const available = total - used;
+			const totalData = available * Math.pow(2, d);
+			fretAdapter.setRingStats([{ ringDepth: 0, peerCount: 1, avgCapacity: totalData }]);
+		}
+
+		it('no move when depth sits inside the dead-band and usage is normal', async () => {
+			fretAdapter.setMyArachnodeInfo(advertise(3));
+			setSignal(0.5, 3.0); // depth exactly on the ring, moderate usage
 			const result = await selector.shouldTransition();
 			expect(result.shouldMove).to.equal(false);
 		});
 
-		it('suggests moving out when usage exceeds moveOut threshold', async () => {
-			monitor.setCapacity(1000, 850); // 85% used, above 80% threshold
+		it('moves out when depth is past the outer boundary AND usage exceeds moveOut', async () => {
+			fretAdapter.setMyArachnodeInfo(advertise(2));
+			setSignal(0.9, 3.0); // d=3 ≥ R+1-h=2.5 and 0.9 > 0.8
 			const result = await selector.shouldTransition();
 			expect(result.shouldMove).to.equal(true);
 			expect(result.direction).to.equal('out');
-			expect(result.newRingDepth).to.not.equal(undefined);
+			expect(result.newRingDepth).to.equal(3);
 		});
 
-		it('suggests moving in when usage below moveIn threshold', async () => {
-			// Need to start at ring > 0 to be able to move in
-			monitor.setCapacity(100 * 1024 * 1024, 10 * 1024 * 1024); // 10% used, below 20% threshold
+		it('dead-band blocks a move-out when usage is high but depth is not past the boundary', async () => {
+			fretAdapter.setMyArachnodeInfo(advertise(2));
+			setSignal(0.9, 2.2); // usage high, but d=2.2 < R+1-h=2.5
 			const result = await selector.shouldTransition();
+			expect(result.shouldMove).to.equal(false);
+		});
 
-			// May or may not suggest moving in depending on current ring
-			if (result.shouldMove && result.direction === 'in') {
-				expect(result.newRingDepth).to.not.equal(undefined);
-				expect(result.newRingDepth).to.be.at.least(0);
+		it('moves in when depth is past the inner boundary AND usage is below moveIn', async () => {
+			fretAdapter.setMyArachnodeInfo(advertise(3));
+			setSignal(0.1, 2.0); // d=2 ≤ R-1+h=2.5 and 0.1 < 0.2
+			const result = await selector.shouldTransition();
+			expect(result.shouldMove).to.equal(true);
+			expect(result.direction).to.equal('in');
+			expect(result.newRingDepth).to.equal(2);
+		});
+
+		it('never moves in from ring 0', async () => {
+			fretAdapter.setMyArachnodeInfo(advertise(0));
+			setSignal(0.05, 0.0); // very low usage, ring 0
+			const result = await selector.shouldTransition();
+			expect(result.shouldMove).to.equal(false);
+		});
+
+		it('does not start a new move while a shift is already in flight (status=moving)', async () => {
+			fretAdapter.setMyArachnodeInfo(advertise(2, 'moving'));
+			setSignal(0.9, 3.0); // would move out if not already moving
+			const result = await selector.shouldTransition();
+			expect(result.shouldMove).to.equal(false);
+		});
+
+		it('boundary hover produces zero moves across an oscillating sequence', async () => {
+			// Node advertises R=3; usage pinned high (would move out if the dead-band did not hold).
+			// The depth jitters ±0.3 around the node's own ring integer 3 — the no-move zone for R=3 is
+			// (R-1+h, R+1-h) = (2.5, 3.5), and the jitter never leaves it. Smoothing keeps the running
+			// depth near 3, so no move must ever fire in either direction.
+			fretAdapter.setMyArachnodeInfo(advertise(3));
+			const jitter = [3.3, 2.7, 3.2, 2.8, 3.3, 2.7, 3.1, 2.9, 3.3, 2.7, 3.2, 2.8];
+			for (const d of jitter) {
+				setSignal(0.9, d);
+				const result = await selector.shouldTransition();
+				expect(result.shouldMove, `d=${d}`).to.equal(false);
+				clock.advance(MINUTE); // time passes; still no move
 			}
 		});
 
-		it('does not suggest moving in from ring 0', async () => {
-			// Large capacity = ring 0
-			monitor.setCapacity(1024 * 1024 * 1024 * 100, 0); // 100GB, 0% used
+		it('seeds the EWMA from the first real sample, not from 0', async () => {
+			// A 0 seed would make smoothedAvailable=0 → coverage=0 → depth=16 on the first tick, which
+			// would BLOCK this legitimate move-in (16 ≤ R-1+h=0.5 is false). Correct seeding yields
+			// depth=0, so the move-in fires.
+			fretAdapter.setMyArachnodeInfo(advertise(1));
+			setSignal(0.1, 0.0); // high coverage → depth 0; usage below moveIn
 			const result = await selector.shouldTransition();
+			expect(result.shouldMove).to.equal(true);
+			expect(result.direction).to.equal('in');
+			expect(result.newRingDepth).to.equal(0);
+		});
 
-			// Even though usage is low, can't move to ring -1
-			if (result.shouldMove) {
-				expect(result.direction).to.not.equal('in');
-			}
+		it('dwell rate-limits rapid flips but a sustained move fires after minDwellMs', async () => {
+			fretAdapter.setMyArachnodeInfo(advertise(2));
+			setSignal(0.9, 3.0);
+
+			const first = await selector.shouldTransition();
+			expect(first.shouldMove, 'first move fires immediately').to.equal(true);
+
+			// Within the dwell window the same sustained pressure must NOT flip again.
+			clock.advance(MINUTE);
+			setSignal(0.9, 3.0);
+			const blocked = await selector.shouldTransition();
+			expect(blocked.shouldMove, 'rapid re-flip suppressed within dwell').to.equal(false);
+
+			// Once the dwell elapses, genuine sustained over-capacity moves again — dwell rate-limits,
+			// it does not veto.
+			clock.advance(dwellMs);
+			setSignal(0.9, 3.0);
+			const after = await selector.shouldTransition();
+			expect(after.shouldMove, 'sustained pressure moves after dwell').to.equal(true);
+			expect(after.direction).to.equal('out');
+		});
+
+		it('steps exactly one ring even when depth implies a two-ring jump', async () => {
+			// From ring 0 with depth ≈ 2.5, one call must target ring 1 only. The second ring is taken
+			// only on a later tick, after dwell and after the node advertises the intermediate ring.
+			fretAdapter.setMyArachnodeInfo(advertise(0));
+			setSignal(0.9, 2.5);
+			const step1 = await selector.shouldTransition();
+			expect(step1.shouldMove).to.equal(true);
+			expect(step1.newRingDepth).to.equal(1); // NOT 2, despite d ≈ 2.5
+
+			// Simulate the move landing: advertise ring 1, let dwell elapse, re-sample the same signal.
+			fretAdapter.setMyArachnodeInfo(advertise(1));
+			clock.advance(dwellMs);
+			setSignal(0.9, 2.5);
+			const step2 = await selector.shouldTransition();
+			expect(step2.shouldMove).to.equal(true);
+			expect(step2.newRingDepth).to.equal(2); // second ring, on the later tick
 		});
 	});
 
