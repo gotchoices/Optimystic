@@ -2,6 +2,8 @@
 
 The Network Transactor solves the fundamental challenge of **atomic transactions across content-addressed distributed storage**. Unlike traditional databases where related data resides on a single server, Optimystic's content-addressed blocks are distributed across multiple independent peers based on their block IDs, not their logical relationships.
 
+> **Scope of "atomic" here.** This document describes the per-cluster consensus primitive, where a single cluster's block set commits atomically. It does **not** promise unconditional all-or-nothing *across* collections/clusters: the multi-collection coordinator commits each collection's log-tail cluster in an independent round, so a permanent stale loss on one collection can leave a reported partial landing. The delivered cross-collection guarantee is **atomicity of intent + eventual, reported visibility** — see the canonical statement in [correctness.md](../../../docs/correctness.md) **Theorem 3**. Phrases below like "atomicity across all involved clusters" describe the design goal of the consensus round, not a literal cross-collection all-or-nothing guarantee.
+
 ## The Fundamental Problem
 
 ### Distributed Content Addressing Challenge

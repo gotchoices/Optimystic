@@ -12,7 +12,7 @@ You can access Optimystic through either a **native TypeScript API** or through 
 | Schema | Application-defined per collection | Declared with `create table ... using optimystic(...)` |
 | Mutations | `collection.act(...)`, `tree.replace(...)` | `insert` / `update` / `delete` |
 | Reads | `tree.range(...)`, `diary.select()` | `select` with optimized primary-key lookup and range scan |
-| Multi-collection atomic | `TransactionSession` + `ActionsEngine` | `begin` / `commit` / `rollback` |
+| Multi-collection (atomic-intent) | `TransactionSession` + `ActionsEngine` | `begin` / `commit` / `rollback` |
 | Good fit when | Custom data structures, per-collection conflict policies, mobile footprint | Table-shaped data, declarative constraints, SQL tooling |
 
 ## Running a Node
@@ -175,7 +175,7 @@ await session.execute('', actionsForTable);
 await session.execute('', actionsForIndex1);
 await session.execute('', actionsForIndex2);
 
-// Single atomic commit — GATHER + PEND + COMMIT across all affected collections
+// One commit round — GATHER + PEND + COMMIT across all affected collections (atomic in intent)
 await session.commit();
 ```
 
@@ -184,7 +184,7 @@ Two engines ship today:
 - **`ActionsEngine`** — takes JSON actions directly. Used by native callers and tests.
 - **`QuereusEngine`** — accepts SQL statements; used by the Quereus plugin.
 
-On commit, the coordinator identifies the log-tail cluster for every collection touched and drives one consensus round across them all. Either every collection advances or none do. Full protocol: [transactions.md](transactions.md).
+On commit, the coordinator identifies the log-tail cluster for every collection touched and drives one consensus round across them all. Normally every collection advances; a rare permanent partial landing is reported (`committedCollections` / `failedCollections`) for reconciliation rather than silently claimed — the guarantee is atomicity of intent with eventual, reported visibility, not literal all-or-nothing. Full protocol: [transactions.md](transactions.md); formal statement: [correctness.md](correctness.md) Theorem 3.
 
 ## SQL via Quereus
 
@@ -215,7 +215,7 @@ Transaction semantics map directly:
 begin;
 update users set email = 'alice@work.com' where id = 'u1';
 select StampId();  -- stable identifier for this transaction
-commit;            -- syncs all touched collections atomically
+commit;            -- syncs all touched collections under one intent (partial landings reported, not silent)
 ```
 
 Quereus is a distinct SQL engine — columns default to `not null`, tables are always virtual, temporal and JSON are native types, and there are no triggers. See the [plugin README](../packages/quereus-plugin-optimystic/README.md) and Quereus's [SQL Reference §11](https://github.com/nicktobey/quereus/blob/main/docs/sql.md) for the full contrast with SQLite.

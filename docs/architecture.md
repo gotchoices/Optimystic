@@ -275,7 +275,7 @@ Typical patterns:
 | Indexed key/value or documents | `Tree` collection |
 | Custom merge semantics | `Collection` with a `filterConflict` policy |
 | SQL front-end | Quereus + `quereus-plugin-optimystic` |
-| Multi-collection atomic mutation | `TransactionCoordinator` / `TransactionSession` |
+| Multi-collection mutation (atomic-intent) | `TransactionCoordinator` / `TransactionSession` |
 
 Nodes can be run as transaction nodes (Ring Zulu only), storage nodes (inner rings), public gateways, or bootstrap nodes. A node with no peers and no listen addresses is a valid solo / mobile configuration.
 

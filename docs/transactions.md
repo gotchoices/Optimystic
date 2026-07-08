@@ -177,7 +177,7 @@ Currently, transactions are scoped to a single collection:
 Many logical operations affect multiple collections:
 - **SQL DML**: A single INSERT/UPDATE/DELETE may update main table + multiple indexes
 - **Constraint validation**: Requires validating against current state
-- **Atomic semantics**: All collections must commit or none
+- **Atomic-intent semantics**: all collections should commit together — delivered as atomicity of intent with reported partial landings, not literal all-or-nothing (see [correctness.md](correctness.md) Theorem 3)
 
 Additionally, for SQL validation:
 - Cluster participants need to validate SQL semantics (constraints, collations, triggers)
@@ -403,7 +403,7 @@ The GATHER phase creates a temporary supercluster for consensus (only when multi
 - **Leverages Existing Clusters**: Each critical cluster nominates based on its local knowledge
 - **Spot-Checking**: Nodes can validate nominees they don't know using routing heuristics
 - **Scalable**: No global coordinator or bottleneck
-- **Atomic**: All critical clusters must agree in COMMIT phase
+- **Atomic-intent**: all critical clusters pend the same transaction id before any commits; a permanent stale loss on one collection's COMMIT is still reported as a partial landing (see [correctness.md](correctness.md) Theorem 3)
 
 ### Example
 
@@ -1742,10 +1742,10 @@ const pendRequest: PendRequest = {
 
 ### What This Achieves
 
-✅ **Atomicity**: Both collections commit or neither
+✅ **Atomicity of intent**: both collections pend under one transaction id; normally both commit, and a rare partial landing is reported (`committedCollections` / `failedCollections`) for reconciliation, not silently claimed (see [correctness.md](correctness.md) Theorem 3)
 ✅ **Validation**: All cluster participants verified the INSERT is valid
 ✅ **Constraint Checking**: PRIMARY KEY uniqueness validated
-✅ **Index Consistency**: Index updated atomically with main table
+✅ **Index Consistency**: Index updated with the main table under one intent (eventual visibility; a partial landing is reported for reconciliation)
 ✅ **Determinism**: All validators got same result from re-execution
 ✅ **Scalability**: No global transaction log, no single bottleneck
 
