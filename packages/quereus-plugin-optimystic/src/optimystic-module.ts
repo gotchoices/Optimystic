@@ -17,7 +17,7 @@ import { Tree } from '@optimystic/db-core';
 import { KeyRange } from '@optimystic/db-core';
 import type { CollectionChangeEvent, TreeReadView } from '@optimystic/db-core';
 import { SchemaManager } from './schema/schema-manager.js';
-import type { StoredTableSchema } from './schema/schema-manager.js';
+import type { StoredTableSchema, StoredIndexSchema } from './schema/schema-manager.js';
 import { RowCodec, type EncodedRow } from './schema/row-codec.js';
 import { SqlDataType, PhysicalType } from '@quereus/quereus';
 import { INTEGER_TYPE, REAL_TYPE, TEXT_TYPE, BLOB_TYPE, NUMERIC_TYPE, NULL_TYPE, BOOLEAN_TYPE, type LogicalType } from '@quereus/quereus';
@@ -102,6 +102,19 @@ export class OptimysticVirtualTable extends VirtualTable {
   private schemaManager: SchemaManager;
   private rowCodec?: RowCodec;
   private indexManager?: IndexManager;
+  /**
+   * Synthesized index descriptors that back a secondary UNIQUE constraint lacking a
+   * declared index (see {@link buildUniqueEnforcementIndexes}). Computed once in
+   * doInitialize and handed to the IndexManager; kept here too so the probe can tell a
+   * synthesized (needs one-time backfill) tree from a reused declared one.
+   */
+  private uniqueEnforcementIndexes: StoredIndexSchema[] = [];
+  /**
+   * Names of synthesized unique trees whose one-time population (for rows written by
+   * an older build that never maintained the tree) has already run this process. Guards
+   * {@link ensureUniquePopulated} so the backfill scan happens at most once per tree.
+   */
+  private populatedUniqueTrees = new Set<string>();
   private connection?: OptimysticVirtualTableConnection;
   /** Unsubscribe handle for the collection-change → watch bridge (set once after init). */
   private changeUnsubscribe?: () => void;
@@ -250,6 +263,17 @@ export class OptimysticVirtualTable extends VirtualTable {
       });
 
       await this.indexManager.initialize(txnState?.transactor);
+
+      // Give every point-enforceable secondary UNIQUE constraint a backing index tree
+      // so checkUniqueConstraints can probe it instead of full-scanning the table per
+      // DML row (an O(N) scan per row -> O(log n) point probe). Must run BEFORE
+      // registerCollections so the synthesized trees are present in getIndexTrees()
+      // when the bridge snapshots this table's collections.
+      this.uniqueEnforcementIndexes = this.buildUniqueEnforcementIndexes(storedSchema);
+      await this.indexManager.setUniqueEnforcementIndexes(
+        this.uniqueEnforcementIndexes,
+        txnState?.transactor,
+      );
 
       // Register the main + index collections with the bridge so a session-mode
       // coordinator shares the very trackers this vtab stages into (see
@@ -793,6 +817,168 @@ export class OptimysticVirtualTable extends VirtualTable {
   }
 
   /**
+   * A stable, order-insensitive key for a set of column indices — sorted indices joined
+   * by `_`. Used both to name a synthesized unique tree (`_uniq_<setKey>`, stable across
+   * restarts so the same tree URI resolves) and to match a UNIQUE constraint's columns
+   * against the PRIMARY KEY / a declared index (as sets, since uniqueness of `(a, b)` and
+   * `(b, a)` is the same constraint).
+   */
+  private columnSetKey(columns: readonly number[]): string {
+    return [...columns].sort((a, b) => a - b).join('_');
+  }
+
+  /**
+   * Decide which secondary UNIQUE constraints need a synthesized backing index tree, and
+   * return one descriptor per such constraint. A constraint is EXCLUDED when:
+   *   - it is partial (`predicate !== undefined`, from `CREATE UNIQUE INDEX … WHERE …`) —
+   *     never point-enforced here, matching the probe's own filter;
+   *   - its columns match the PRIMARY KEY as a set — already structural (the tree key);
+   *   - its columns match a declared index as a set — reuse that tree (covers a
+   *     `derivedFromIndex` UNIQUE index and any plain index over the same columns), so we
+   *     never build a second tree for the same key.
+   * Everything else gets a descriptor with a reserved `_uniq_`-prefixed name (the prefix
+   * is reserved for enforcement trees and must not collide with a user index) and the
+   * constraint's columns in declared order. Two constraints over the same column set
+   * collapse to one descriptor.
+   */
+  private buildUniqueEnforcementIndexes(storedSchema: StoredTableSchema): StoredIndexSchema[] {
+    const constraints = this.tableSchema.uniqueConstraints;
+    if (!constraints || constraints.length === 0) return [];
+
+    const pkKey = this.columnSetKey(storedSchema.primaryKeyDefinition.map(pk => pk.index));
+    const declaredKeys = new Set(
+      storedSchema.indexes.map(idx => this.columnSetKey(idx.columns.map(c => c.index))),
+    );
+
+    const synthesized: StoredIndexSchema[] = [];
+    const seen = new Set<string>();
+    for (const uc of constraints) {
+      if (uc.predicate !== undefined || uc.columns.length === 0) continue;
+      const setKey = this.columnSetKey(uc.columns);
+      if (setKey === pkKey) continue;
+      if (declaredKeys.has(setKey)) continue;
+      if (seen.has(setKey)) continue;
+      seen.add(setKey);
+      synthesized.push({
+        name: `_uniq_${setKey}`,
+        columns: uc.columns.map(index => ({ index })),
+      });
+    }
+    return synthesized;
+  }
+
+  /**
+   * Resolve the index tree that enforces `uc`, or undefined if none can be resolved. A
+   * DECLARED index (in `schema.indexes`) is preferred over a synthesized `_uniq_` tree
+   * covering the same columns, so a real `CREATE UNIQUE INDEX` wins if one lands on the
+   * same column set as an already-synthesized plain UNIQUE. `synthesized` flags whether
+   * the resolved tree may need one-time backfill (see {@link ensureUniquePopulated}).
+   *
+   * NOTE: when both a declared index and a synthesized tree cover the same columns, both
+   * are still maintained on every DML (double writes to redundant trees). This can only
+   * arise from `CREATE UNIQUE INDEX` over columns already carrying a plain UNIQUE — a
+   * degenerate, rare DDL shape. If it ever shows up as a cost, drop the synthesized
+   * descriptor from the maintained set when a declared index subsumes it.
+   */
+  private resolveEnforcingIndex(
+    uc: { columns: readonly number[] },
+  ): { descriptor: StoredIndexSchema; tree: Tree<string, IndexEntry>; synthesized: boolean } | undefined {
+    if (!this.indexManager) return undefined;
+    const setKey = this.columnSetKey(uc.columns);
+
+    for (const idx of this.indexManager.getDeclaredIndexes()) {
+      if (this.columnSetKey(idx.columns.map(c => c.index)) === setKey) {
+        const tree = this.indexManager.getIndexTree(idx.name);
+        if (tree) return { descriptor: idx, tree, synthesized: false };
+      }
+    }
+    for (const idx of this.uniqueEnforcementIndexes) {
+      if (this.columnSetKey(idx.columns.map(c => c.index)) === setKey) {
+        const tree = this.indexManager.getIndexTree(idx.name);
+        if (tree) return { descriptor: idx, tree, synthesized: true };
+      }
+    }
+    return undefined;
+  }
+
+  /**
+   * One-time backfill of a synthesized unique tree from the existing main-table rows.
+   *
+   * A table CREATED under this build maintains its unique tree from the first insert, so
+   * the tree is always in sync and this is a fast no-op (guarded by the empty check). The
+   * case that needs backfill is a table whose rows were written by an OLDER build that
+   * never maintained such a tree: the tree is empty while the main table is populated, so
+   * a probe would find no collision and silently admit a duplicate. Scan the main table
+   * once and stage each non-exempt row's entry into the unique tree IN ISOLATION (stage +
+   * sync only, never touching the caller's staged main-table mutations), mirroring
+   * addIndex's populate loop. O(rows) once per tree per process lifetime.
+   *
+   * NOTE: a table whose unique columns are NULL in every row leaves the tree
+   * legitimately empty (NULL rows are constraint-exempt and stage no entry), so this
+   * cheap no-op-staging scan re-runs on every cold start until a non-null row exists. If
+   * that ever matters, persist a "built" marker and check it here instead of emptiness.
+   */
+  private async ensureUniquePopulated(
+    descriptor: StoredIndexSchema,
+    tree: Tree<string, IndexEntry>,
+  ): Promise<void> {
+    if (this.populatedUniqueTrees.has(descriptor.name)) return;
+    if (!this.collection || !this.rowCodec || !this.indexManager) return;
+
+    await tree.update();
+    // Emptiness is "the first path is not ON an entry" — isValid() only reports whether
+    // a path survived a concurrent mutation (its version), NOT whether it points at a
+    // row, so at()===undefined is the on-entry signal (an empty tree's first() is
+    // version-valid but sits on no entry).
+    const treeEmpty = tree.at(await tree.first()) === undefined;
+    if (treeEmpty) {
+      await this.collection.update();
+      for await (const path of this.collection.ascending(await this.collection.first())) {
+        if (!this.collection.isValid(path)) continue;
+        const entry = this.collection.at(path) as [string, EncodedRow] | undefined;
+        if (!entry || entry.length < 2) continue;
+        const row = this.rowCodec.decodeRow(entry[1]);
+        // NULL-bearing rows are exempt from the constraint — stage no entry, matching the
+        // probe's null-exemption and keeping the all-null tree legitimately empty.
+        if (descriptor.columns.some(c => row[c.index] === null || row[c.index] === undefined)) {
+          continue;
+        }
+        const pk = this.rowCodec.extractPrimaryKey(row);
+        const treeKey = this.indexManager.createIndexKey(descriptor, row) + pk;
+        await tree.stage([[treeKey, [treeKey, pk]]]);
+      }
+      await tree.sync();
+    }
+    this.populatedUniqueTrees.add(descriptor.name);
+  }
+
+  /**
+   * Defensive full-scan fallback for a single UNIQUE constraint whose enforcing tree
+   * could not be resolved (should not happen — logged by the caller). Retains the
+   * pre-index behaviour: compare every existing row's serialized unique key against the
+   * new row's, honouring `excludeKey`.
+   */
+  private async scanUniqueConstraint(
+    uc: { columns: readonly number[] },
+    values: Row,
+    excludeKey?: string,
+  ): Promise<{ row: Row; columns: readonly number[] } | null> {
+    if (!this.collection || !this.rowCodec) return null;
+    const key = this.uniqueKeyFor(uc.columns, values);
+    for await (const path of this.collection.range(new KeyRange<string>(undefined, undefined, true))) {
+      if (!this.collection.isValid(path)) continue;
+      const entry = this.collection.at(path) as [string, EncodedRow] | undefined;
+      if (!entry || entry.length < 2) continue;
+      if (excludeKey !== undefined && entry[0] === excludeKey) continue;
+      const existing = this.rowCodec.decodeRow(entry[1]);
+      if (this.uniqueKeyFor(uc.columns, existing) === key) {
+        return { row: existing, columns: uc.columns };
+      }
+    }
+    return null;
+  }
+
+  /**
    * Probe for an existing row that a secondary UNIQUE constraint would collide with if
    * `values` were written, returning the conflicting row plus the violated
    * constraint's columns, or null when there is no conflict.
@@ -800,21 +986,22 @@ export class OptimysticVirtualTable extends VirtualTable {
    * Optimystic enforces only the PRIMARY KEY structurally (it is the tree key); every
    * other declared UNIQUE constraint must be checked here, mirroring the in-memory
    * vtab. The control schema's single-use `StampId` (and nullable `MemberPrivateKey`)
-   * anti-replay columns depend on this enforcement. The probe reads the LIVE collection
-   * — committed rows plus rows staged earlier in THIS transaction — so two writes
-   * sharing a unique value within one transaction collide exactly as a cross
-   * -transaction duplicate does (the same immediate semantics PK uniqueness has, and
-   * the reason it does NOT read the committed snapshot).
+   * anti-replay columns depend on this enforcement.
+   *
+   * Each active constraint is enforced by a POINT PROBE of its backing index tree (the
+   * reused declared index, or a synthesized `_uniq_` tree) rather than a full table
+   * scan — ~O(log n) per constraint per row instead of O(rows). The tree is refreshed
+   * (`update()`) for a LIVE read so the probe sees rows staged earlier in THIS
+   * transaction plus committed rows; that is what makes two writes sharing a unique
+   * value within one transaction collide exactly as a cross-transaction duplicate does
+   * (the same immediate semantics PK uniqueness has, and the reason it does NOT read the
+   * committed snapshot).
    *
    * SQL semantics honoured: a partial UNIQUE (carrying a `predicate`, synthesized from
    * `CREATE UNIQUE INDEX … WHERE …`) is skipped, and a row is exempt from a constraint
    * when ANY of that constraint's columns is NULL (multiple NULLs are allowed).
    * `excludeKey`, when given, is the primary key of the row being updated, so the row
    * does not conflict with itself.
-   *
-   * Cost: O(rows) per probe — no index backs the unique columns. Fine for the small
-   * control tables this targets; large tables with secondary UNIQUE constraints want an
-   * index-backed probe (tracked separately as a follow-up optimization).
    */
   private async checkUniqueConstraints(
     values: Row,
@@ -822,27 +1009,42 @@ export class OptimysticVirtualTable extends VirtualTable {
   ): Promise<{ row: Row; columns: readonly number[] } | null> {
     const constraints = this.tableSchema.uniqueConstraints;
     if (!constraints || constraints.length === 0) return null;
-    if (!this.collection || !this.rowCodec) return null;
+    if (!this.collection || !this.rowCodec || !this.indexManager) return null;
 
     // Only the constraints that actually bind THIS row: non-partial, every column
-    // present and non-null. Precompute each one's serialized key for the new row.
-    const active = constraints
-      .filter(uc => uc.predicate === undefined && uc.columns.length > 0
-        && uc.columns.every(ci => values[ci] !== null && values[ci] !== undefined))
-      .map(uc => ({ columns: uc.columns, key: this.uniqueKeyFor(uc.columns, values) }));
+    // present and non-null (a NULL-bearing row is exempt and never probes).
+    const active = constraints.filter(uc =>
+      uc.predicate === undefined && uc.columns.length > 0
+      && uc.columns.every(ci => values[ci] !== null && values[ci] !== undefined));
     if (active.length === 0) return null;
 
-    // One live scan; compare every existing row against each active constraint.
-    for await (const path of this.collection.range(new KeyRange<string>(undefined, undefined, true))) {
-      if (!this.collection.isValid(path)) continue;
-      const entry = this.collection.at(path) as [string, EncodedRow] | undefined;
-      if (!entry || entry.length < 2) continue;
-      if (excludeKey !== undefined && entry[0] === excludeKey) continue;
-      const existing = this.rowCodec.decodeRow(entry[1]);
-      for (const a of active) {
-        if (this.uniqueKeyFor(a.columns, existing) === a.key) {
-          return { row: existing, columns: a.columns };
-        }
+    for (const uc of active) {
+      const enforcing = this.resolveEnforcingIndex(uc);
+      if (!enforcing) {
+        // Should not happen: buildUniqueEnforcementIndexes synthesizes a tree for every
+        // point-enforceable constraint. Fall back to a full scan for this constraint
+        // rather than silently skip enforcement.
+        log(
+          `WARN: no enforcing index for UNIQUE(${uc.columns.join(',')}) on ` +
+          `'${this.tableName}'; falling back to full scan`,
+        );
+        const hit = await this.scanUniqueConstraint(uc, values, excludeKey);
+        if (hit) return hit;
+        continue;
+      }
+
+      const { descriptor, tree, synthesized } = enforcing;
+      if (synthesized) {
+        await this.ensureUniquePopulated(descriptor, tree);
+      }
+      await tree.update();
+      const probeKey = this.indexManager.createIndexKey(descriptor, values);
+      for await (const pk of this.indexManager.findByIndexIn(tree, probeKey)) {
+        // The row being updated does not conflict with itself.
+        if (excludeKey !== undefined && pk === excludeKey) continue;
+        const entry = await this.collection.get(pk) as [string, EncodedRow] | undefined;
+        if (!entry || entry.length < 2) continue;
+        return { row: this.rowCodec.decodeRow(entry[1]), columns: uc.columns };
       }
     }
     return null;
@@ -1236,6 +1438,32 @@ export class OptimysticVirtualTable extends VirtualTable {
     // mid-transaction would miss that transaction's already-taken snapshot — a
     // known, documented edge.)
     this.txnBridge.registerCollection(indexTree.getCollection());
+
+    // A CREATE UNIQUE INDEX carries a UNIQUE constraint this vtab must enforce: the
+    // index tree keys on indexCols‖pk, so duplicate index values with distinct PKs
+    // coexist — it does NOT structurally guard uniqueness. Quereus synthesizes the
+    // derived uniqueConstraint on a NEW TableSchema it swaps into its catalog
+    // (appendIndexToTableSchema), but this cached vtab keeps its ORIGINAL tableSchema
+    // reference, so the derived constraint would never reach checkUniqueConstraints.
+    // Mirror it onto this.tableSchema so the probe considers it active; enforcement
+    // then routes through the freshly built declared index tree (resolveEnforcingIndex
+    // prefers a declared index), so no synthesized _uniq_ tree is needed.
+    if (indexSchema.unique) {
+      const columns = indexSchema.columns.map((col: { index: number }) => col.index);
+      const setKey = this.columnSetKey(columns);
+      const already = (this.tableSchema.uniqueConstraints ?? []).some(
+        uc => uc.derivedFromIndex === indexSchema.name || this.columnSetKey(uc.columns) === setKey,
+      );
+      if (!already) {
+        this.tableSchema = {
+          ...this.tableSchema,
+          uniqueConstraints: [
+            ...(this.tableSchema.uniqueConstraints ?? []),
+            { columns, predicate: indexSchema.predicate, derivedFromIndex: indexSchema.name },
+          ],
+        };
+      }
+    }
 
     // Populate the index with existing data
     if (this.collection && this.rowCodec) {

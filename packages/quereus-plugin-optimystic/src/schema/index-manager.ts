@@ -99,6 +99,20 @@ export type IndexTreeFactory = (
 export class IndexManager {
 	private indexTrees = new Map<string, Tree<IndexKey, IndexEntry>>();
 
+	/**
+	 * Internal index descriptors that exist ONLY to enforce a secondary UNIQUE
+	 * constraint that has no declared backing index (a column-level `col unique` or
+	 * table-level `unique (a, b)`). Kept in a SEPARATE list from `schema.indexes` —
+	 * never persisted to StoredTableSchema and never surfaced to the planner — so
+	 * schema round-tripping, `schemasEqual`, and `getBestAccessPlan` are unaffected.
+	 * They are iterated ALONGSIDE `schema.indexes` (see {@link getAllMaintainedIndexes})
+	 * so insert/delete/update staging maintains their trees automatically. A separate
+	 * list also survives {@link setSchema}, which a later `CREATE INDEX` calls with a
+	 * schema rebuilt from the (unique-index-free) persisted form — folding them into
+	 * `schema.indexes` would silently drop them there.
+	 */
+	private uniqueEnforcementIndexes: StoredIndexSchema[] = [];
+
 	constructor(
 		private schema: StoredTableSchema,
 		private indexTreeFactory: IndexTreeFactory
@@ -112,6 +126,47 @@ export class IndexManager {
 			const tree = await this.indexTreeFactory(index.name, transactor);
 			this.indexTrees.set(index.name, tree);
 		}
+	}
+
+	/**
+	 * Declared indexes only (those in `schema.indexes`, surfaced to the planner and
+	 * persisted). Used by the vtab to resolve which tree enforces a UNIQUE constraint,
+	 * preferring a real declared index over a synthesized unique-enforcement one.
+	 */
+	getDeclaredIndexes(): StoredIndexSchema[] {
+		return [...this.schema.indexes];
+	}
+
+	/**
+	 * Replace the set of unique-enforcement index descriptors and open a tree for each
+	 * that does not already have one. Called once during table init AFTER
+	 * {@link initialize}, with the descriptors the vtab synthesized for every
+	 * point-enforceable UNIQUE constraint that lacks a declared backing index. The
+	 * trees land in the same `indexTrees` map as declared indexes, so
+	 * {@link getIndexTrees} (and thus the vtab's dirty-marking / bridge registration)
+	 * includes them with no further wiring.
+	 */
+	async setUniqueEnforcementIndexes(
+		descriptors: StoredIndexSchema[],
+		transactor?: ITransactor
+	): Promise<void> {
+		this.uniqueEnforcementIndexes = descriptors;
+		for (const descriptor of descriptors) {
+			if (!this.indexTrees.has(descriptor.name)) {
+				const tree = await this.indexTreeFactory(descriptor.name, transactor);
+				this.indexTrees.set(descriptor.name, tree);
+			}
+		}
+	}
+
+	/**
+	 * Declared indexes plus unique-enforcement indexes — the full set whose trees are
+	 * maintained in lockstep with DML. Iterated by every staging path so a
+	 * synthesized unique tree is kept current exactly like a declared index, without
+	 * being persisted or surfaced to query planning.
+	 */
+	getAllMaintainedIndexes(): StoredIndexSchema[] {
+		return [...this.schema.indexes, ...this.uniqueEnforcementIndexes];
 	}
 
 	/**
@@ -179,7 +234,7 @@ export class IndexManager {
 		primaryKey: PrimaryKey,
 		_transactor?: ITransactor
 	): Promise<void> {
-		for (const index of this.schema.indexes) {
+		for (const index of this.getAllMaintainedIndexes()) {
 			const indexKey = this.createIndexKey(index, row);
 			const tree = this.indexTrees.get(index.name);
 			if (!tree) {
@@ -203,7 +258,7 @@ export class IndexManager {
 		primaryKey: PrimaryKey,
 		_transactor?: ITransactor
 	): Promise<void> {
-		for (const index of this.schema.indexes) {
+		for (const index of this.getAllMaintainedIndexes()) {
 			const indexKey = this.createIndexKey(index, row);
 			const tree = this.indexTrees.get(index.name);
 			if (!tree) {
@@ -228,7 +283,7 @@ export class IndexManager {
 		_transactor?: ITransactor
 	): Promise<void> {
 		// For each index, check if the indexed columns changed
-		for (const index of this.schema.indexes) {
+		for (const index of this.getAllMaintainedIndexes()) {
 			const oldIndexKey = this.createIndexKey(index, oldRow);
 			const newIndexKey = this.createIndexKey(index, newRow);
 
