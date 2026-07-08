@@ -844,6 +844,87 @@ describe('Transaction', () => {
 			}
 		});
 
+		it('should dedup a peer nominated by two clusters into a single supercluster entry', async () => {
+			// Regression for the GATHER dedup: each queryClusterNominees builds a FRESH PeerId
+			// object (peerIdFromString) for the same physical peer, so a reference-keyed Set kept
+			// the peer twice when two critical clusters both nominated it. gatherPhase now keys by
+			// toString(), so the supercluster must collapse the duplicate to one entry.
+			const { generateKeyPair } = await import('@libp2p/crypto/keys');
+			const { peerIdFromPrivateKey, peerIdFromString } = await import('@libp2p/peer-id');
+
+			// One physical peer, captured as its canonical string id.
+			const sharedPeer = await generateKeyPair('Ed25519').then(peerIdFromPrivateKey);
+			const sharedPeerStr = sharedPeer.toString();
+
+			const pendRequests: { superclusterNominees?: string[] }[] = [];
+			const transactor = new TestTransactor();
+			const originalPend = transactor.pend.bind(transactor);
+			transactor.pend = async (request) => {
+				pendRequests.push({
+					superclusterNominees: request.superclusterNominees?.map(p => p.toString())
+				});
+				return originalPend(request);
+			};
+
+			// Every cluster nominates the SAME peer, but as a distinct object each call.
+			transactor.queryClusterNominees = async () => ({
+				nominees: [peerIdFromString(sharedPeerStr)]
+			});
+
+			type UserEntry = { key: number; name: string };
+			type PostEntry = { key: number; userId: number; title: string };
+
+			const usersTree = await Tree.createOrOpen<number, UserEntry>(
+				transactor,
+				'users',
+				entry => entry.key
+			);
+			const postsTree = await Tree.createOrOpen<number, PostEntry>(
+				transactor,
+				'posts',
+				entry => entry.key
+			);
+
+			const usersCollection = (usersTree as unknown as { collection: unknown }).collection;
+			const postsCollection = (postsTree as unknown as { collection: unknown }).collection;
+
+			const collections = new Map();
+			collections.set('users', usersCollection);
+			collections.set('posts', postsCollection);
+
+			const coordinator = new TransactionCoordinator(transactor, collections);
+			const actionsEngine = new ActionsEngine(coordinator);
+
+			const collectionActions: CollectionActions[] = [
+				{
+					collectionId: 'users',
+					actions: [{ type: 'replace', data: [[1, { key: 1, name: 'Alice' }]] }]
+				},
+				{
+					collectionId: 'posts',
+					actions: [{ type: 'replace', data: [[100, { key: 100, userId: 1, title: 'Post' }]] }]
+				}
+			];
+
+			const statements = createActionsStatements(collectionActions);
+			const stamp = await createTransactionStamp('reference-peer', Date.now(), 'schema-hash-123', 'actions@1.0.0');
+			const transaction: Transaction = {
+				stamp,
+				statements,
+				reads: [],
+				id: await createTransactionId(stamp.id, statements, [])
+			};
+
+			await coordinator.execute(transaction, actionsEngine);
+
+			// Two clusters nominated the same peer → supercluster must hold it exactly once.
+			expect(pendRequests.length).to.be.greaterThan(0);
+			for (const request of pendRequests) {
+				expect(request.superclusterNominees).to.be.an('array');
+				expect(request.superclusterNominees).to.deep.equal([sharedPeerStr]);
+			}
+		});
+
 		it('should fail if a collection does not exist', async () => {
 			const transactor = new TestTransactor();
 
