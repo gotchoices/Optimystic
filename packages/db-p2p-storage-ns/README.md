@@ -3,9 +3,12 @@
 SQLite-backed storage backend for Optimystic NativeScript peers (iOS and
 Android, native — not React Native). Provides:
 
-- **`SqliteRawStorage`** — implements `IRawStorage` so a NativeScript node
-  persists block metadata, revisions, pending transactions, committed
-  transactions, and materialized blocks across app restarts.
+- **`SqliteRawStorage`** — the `IRawStorage` a NativeScript node uses to
+  persist block metadata, revisions, pending transactions, committed
+  transactions, and materialized blocks across app restarts. It is a thin
+  shell over the shared `KvRawStorage` kernel driven by `SqliteStoreDriver`:
+  the kernel owns all JSON serialization, the driver maps the five logical
+  stores onto the five SQLite tables.
 - **`SqliteKVStore`** — implements `IKVStore` for the persistent transaction
   state used to recover crashed two-phase commits.
 - **`loadOrCreateNSPeerKey`** — generates an Ed25519 libp2p private key on
@@ -72,16 +75,23 @@ the mutex to preserve read concurrency.
 ## Persistence model
 
 The package opens a single SQLite database (`optimystic.sqlite` by default
-in the NativeScript app's documents directory) with six tables:
+in the NativeScript app's documents directory) with six tables. The five
+block-storage tables keep their original columns and keys, but their value
+columns are now **BLOB**: `SqliteStoreDriver` binds/reads the kernel's raw
+`Uint8Array` bytes and the shared `KvRawStorage` kernel owns the JSON/UTF-8
+codec. SQLite stores a `Uint8Array` as a BLOB and returns it as a `Uint8Array`,
+so bytes round-trip exactly (a TEXT column would risk UTF-8-coercing non-ASCII
+JSON bytes). The "Decoded" column is the logical type the kernel decodes back
+into; keys stay TEXT/INTEGER.
 
-| Table          | Key                              | Value                            |
-|----------------|----------------------------------|----------------------------------|
-| `metadata`     | `block_id`                       | `BlockMetadata` (JSON)           |
-| `revisions`    | `(block_id, rev)`                | `action_id`                      |
-| `pending`      | `(block_id, action_id)`          | `Transform` (JSON)               |
-| `transactions` | `(block_id, action_id)`          | `Transform` (JSON)               |
-| `materialized` | `(block_id, action_id)`          | `IBlock` (JSON)                  |
-| `kv`           | `key`                            | `s_val` (TEXT) or `b_val` (BLOB) |
+| Table          | Key                              | Stored value | Decoded (logical) type |
+|----------------|----------------------------------|--------------|------------------------|
+| `metadata`     | `block_id`                       | `BLOB`       | `BlockMetadata`        |
+| `revisions`    | `(block_id, rev)`                | `BLOB` (`action_id` col) | `ActionId`     |
+| `pending`      | `(block_id, action_id)`          | `BLOB`       | `Transform`            |
+| `transactions` | `(block_id, action_id)`          | `BLOB`       | `Transform`            |
+| `materialized` | `(block_id, action_id)`          | `BLOB`       | `IBlock`               |
+| `kv`           | `key`                            | `s_val` (TEXT) or `b_val` (BLOB) | — (not kernel-backed) |
 
 Pragmas: `journal_mode = WAL`, `synchronous = NORMAL`, `foreign_keys = OFF`.
 Schema is versioned via `PRAGMA user_version`.
