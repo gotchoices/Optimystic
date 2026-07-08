@@ -7,14 +7,12 @@ import type {
 	TransactionCoordinator
 } from '@optimystic/db-core';
 import { sha256 } from '@noble/hashes/sha2.js';
+import { createRequire } from 'module';
 
-/**
- * Engine ID for Quereus SQL transactions.
- * Format: "quereus@{version}" where version matches the quereus package version.
- * NOTE: Keep this in sync with @quereus/quereus package.json version.
- * TODO: Import version dynamically from @quereus/quereus when it exports its version.
- */
-export const QUEREUS_ENGINE_ID = 'quereus@0.15.1';
+const _require = createRequire(import.meta.url);
+const { version: _quereusVersion } = _require('@quereus/quereus/package.json') as { version: string };
+// Engine ID derived from the installed @quereus/quereus version at runtime.
+export const QUEREUS_ENGINE_ID = `quereus@${_quereusVersion}`;
 
 /**
  * Statement format for Quereus transactions.

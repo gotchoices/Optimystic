@@ -3,7 +3,10 @@
  */
 
 import { expect } from 'chai';
+import { createRequire } from 'module';
 import { Database } from '@quereus/quereus';
+
+const _require = createRequire(import.meta.url);
 import {
 	QuereusEngine,
 	QUEREUS_ENGINE_ID,
@@ -41,12 +44,14 @@ describe('QuereusEngine', () => {
 	});
 
 	describe('Engine ID', () => {
+		// NOTE: this regex fails on pre-release versions (e.g. 4.4.0-alpha.1); if @quereus/quereus ships a pre-release, update or skip this test.
 		it('should have correct engine ID format', () => {
 			expect(QUEREUS_ENGINE_ID).to.match(/^quereus@\d+\.\d+\.\d+$/);
 		});
 
-		it('should be quereus@0.15.1', () => {
-			expect(QUEREUS_ENGINE_ID).to.equal('quereus@0.15.1');
+		it('should match the installed @quereus/quereus version', () => {
+			const { version } = _require('@quereus/quereus/package.json') as { version: string };
+			expect(QUEREUS_ENGINE_ID).to.equal(`quereus@${version}`);
 		});
 	});
 
