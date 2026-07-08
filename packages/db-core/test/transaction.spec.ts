@@ -1695,6 +1695,11 @@ describe('Transaction', () => {
 			coordinator.applyActions = async (actions, stampId) => {
 				if (firstCall) {
 					firstCall = false;
+					// NOTE: load-bearing async-suspension point — do NOT delete as "no-op await".
+					// It gives applyActions a yield so a reverted fire-and-forget bridge would
+					// finalise the record during the suspension, dropping 'slow-first'. A microtask
+					// suffices here; if a future revert only loses statements across a full event-loop
+					// turn, upgrade this to a macrotask (delay(0)) to keep catching it.
 					await Promise.resolve();
 				}
 				return originalApply(actions, stampId);
