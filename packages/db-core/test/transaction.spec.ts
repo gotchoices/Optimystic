@@ -4,6 +4,7 @@ import {
 	ACTIONS_ENGINE_ID,
 	createActionsStatements,
 	createTransactionStamp,
+	computeStampId,
 	createTransactionId,
 	clientSignaturePayload,
 	CLIENT_SIG_VERSION,
@@ -4068,15 +4069,19 @@ describe('Transaction', () => {
 			expect(result.reason).to.equal('Invalid client signature');
 		});
 
-		it('rejects when the peerId is tampered after signing', async () => {
-			// The stamp.id (and thus the payload) is unchanged, but the verifier is handed the
-			// forged stamp.peerId, which no longer matches the identity the signature was made for.
+		it('rejects when the peerId is tampered after signing (signature is peerId\'s second line)', async () => {
+			// peerId is one of the six stamp fields, so simply forging it (id fixed) trips the
+			// step-0.0 integrity check. To reach the SIGNATURE layer — the peerId defense the
+			// integrity check is not the only guarantor of — the attacker must also recompute
+			// stamp.id to match the forged peerId. That passes integrity, but the signature was
+			// made over the ORIGINAL stamp.id for the ORIGINAL identity, so verification fails.
 			const tx = await buildSignedTx('client-peer', {
 				statements: createActionsStatements([
 					{ collectionId: 'users', actions: [{ type: 'replace', data: [[1, { key: 1, name: 'Alice' }]] }] }
 				])
 			});
 			(tx.stamp as { peerId: string }).peerId = 'attacker-peer';
+			(tx.stamp as { id: string }).id = await computeStampId(tx.stamp);
 			const validator = makeValidator(fakeVerify);
 			const result = await validator.validate(tx, await emptyOpsHash());
 			expect(result.valid).to.be.false;
@@ -4221,6 +4226,65 @@ describe('Transaction', () => {
 			// The round-tripped copy still verifies, so a later recovery path can re-check it.
 			const payload = clientSignaturePayload(roundTripped.stamp.id, roundTripped.statements, roundTripped.reads);
 			expect(fakeVerify(roundTripped.stamp.peerId, payload, roundTripped.signature!)).to.be.true;
+		});
+
+		// Stamp-integrity: stamp.id is a hash of the six stamp fields, but the client signature
+		// is made over stamp.id (unchanged), so mutating a NON-peerId field while holding
+		// stamp.id + signature constant would slip past the signature check. Step 0.0 re-derives
+		// the id from the fields and rejects the mismatch. Tamper by casting to match style.
+
+		it('rejects a stamp whose expiration was extended after signing (headline replay guard)', async () => {
+			// Mirror the reproduced exploit: a signed tx with a live signature but a forged, far
+			// future expiration. Without step 0.0 this defeats the TTL-bounded replay window.
+			const tx = await buildSignedTx('client-peer');
+			(tx.stamp as { expiration: number }).expiration = Date.now() + 10_000_000;
+			const validator = makeValidator(fakeVerify);
+			const result = await validator.validate(tx, await emptyOpsHash());
+			expect(result.valid).to.be.false;
+			expect(result.reason).to.equal('Tampered transaction stamp');
+		});
+
+		it('rejects a stamp whose engineId was tampered after signing', async () => {
+			const tx = await buildSignedTx('client-peer');
+			(tx.stamp as { engineId: string }).engineId = 'evil-engine@9.9.9';
+			const validator = makeValidator(fakeVerify);
+			const result = await validator.validate(tx, await emptyOpsHash());
+			expect(result.valid).to.be.false;
+			expect(result.reason).to.equal('Tampered transaction stamp');
+		});
+
+		it('rejects a stamp whose schemaHash was tampered after signing', async () => {
+			const tx = await buildSignedTx('client-peer');
+			(tx.stamp as { schemaHash: string }).schemaHash = 'forged-schema';
+			const validator = makeValidator(fakeVerify);
+			const result = await validator.validate(tx, await emptyOpsHash());
+			expect(result.valid).to.be.false;
+			expect(result.reason).to.equal('Tampered transaction stamp');
+		});
+
+		it('rejects a stamp whose timestamp was tampered after signing', async () => {
+			const tx = await buildSignedTx('client-peer');
+			(tx.stamp as { timestamp: number }).timestamp = 1;
+			const validator = makeValidator(fakeVerify);
+			const result = await validator.validate(tx, await emptyOpsHash());
+			expect(result.valid).to.be.false;
+			expect(result.reason).to.equal('Tampered transaction stamp');
+		});
+
+		it('still validates a legitimately built signed transaction (integrity regression)', async () => {
+			const tx = await buildSignedTx('client-peer');
+			const validator = makeValidator(fakeVerify);
+			const result = await validator.validate(tx, await emptyOpsHash());
+			expect(result.valid).to.be.true;
+		});
+
+		it('fires the integrity check even with NO verifier wired (not gated on signatures)', async () => {
+			const tx = await buildSignedTx('client-peer');
+			(tx.stamp as { expiration: number }).expiration = Date.now() + 10_000_000;
+			const validator = makeValidator(undefined);
+			const result = await validator.validate(tx, await emptyOpsHash());
+			expect(result.valid).to.be.false;
+			expect(result.reason).to.equal('Tampered transaction stamp');
 		});
 	});
 });

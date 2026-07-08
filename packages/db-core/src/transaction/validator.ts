@@ -1,7 +1,7 @@
 import type { BlockId, CollectionId, Transforms } from '../index.js';
 import type { Transaction, ITransactionEngine, ITransactionValidator, ValidationResult, CollectionActions, ClientSignatureVerifier } from './transaction.js';
 import type { BlockActionState } from '../network/struct.js';
-import { isTransactionExpired, clientSignaturePayload } from './transaction.js';
+import { isTransactionExpired, clientSignaturePayload, computeStampId } from './transaction.js';
 import { collectOperations, hashOperations } from './operations-hash.js';
 
 /**
@@ -49,6 +49,15 @@ export class TransactionValidator implements ITransactionValidator {
 
 	async validate(transaction: Transaction, operationsHash: string): Promise<ValidationResult> {
 		const { stamp } = transaction;
+
+		// 0.0. Integrity: the id must be the true hash of the stamp fields. Runs FIRST because
+		// every later step (expiration, signature, engine/schema selection) trusts a stamp field.
+		// Always-on (one SHA-256, cheap) and independent of whether a signature verifier is wired —
+		// a tampered stamp corrupts expiration and engine selection regardless of signatures.
+		const expectedId = await computeStampId(stamp);
+		if (expectedId !== stamp.id) {
+			return { valid: false, reason: 'Tampered transaction stamp' };
+		}
 
 		// 0. Check expiration before any other work. Ordered BEFORE the signature check so
 		// an attacker cannot learn signature-validity for an already-expired transaction.

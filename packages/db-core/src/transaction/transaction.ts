@@ -104,6 +104,25 @@ export function isTransactionExpired(stamp: TransactionStamp): boolean {
 	return Date.now() > stamp.expiration;
 }
 
+/** The stamp fields that feed the id hash (everything except the id itself). */
+export type StampFields = Omit<TransactionStamp, 'id'>;
+
+/**
+ * Compute the canonical stamp id from its fields. MUST match the historical field order
+ * (peerId, timestamp, schemaHash, engineId, expiration, nonce) — changing it churns every
+ * existing stamp id and client signature. Both {@link createTransactionStamp} and the
+ * validator's integrity check derive the id through this one function, so a validating node
+ * can re-derive the id and reject a stamp whose fields were tampered while id stayed fixed.
+ */
+export async function computeStampId(fields: StampFields): Promise<string> {
+	// Destructure and rebuild in fixed order rather than passing `fields` straight to
+	// JSON.stringify — this ignores any stray `id` (or extra) property a caller slipped in,
+	// so the serialized bytes depend on exactly the six fields and nothing else.
+	const { peerId, timestamp, schemaHash, engineId, expiration, nonce } = fields;
+	const stampData = JSON.stringify({ peerId, timestamp, schemaHash, engineId, expiration, nonce });
+	return `stamp:${await hashString(stampData)}`;
+}
+
 /**
  * Create a transaction stamp with computed id.
  * The id is a hash of the stamp fields (including expiration).
@@ -120,8 +139,7 @@ export async function createTransactionStamp(
 	// db-core (see collection.ts, transactor-source.ts). The nonce is folded into the
 	// id hash so two otherwise-identical stamps diverge.
 	const nonce = uint8ArrayToString(randomBytes(16), 'base64url');
-	const stampData = JSON.stringify({ peerId, timestamp, schemaHash, engineId, expiration, nonce });
-	const id = `stamp:${await hashString(stampData)}`;
+	const id = await computeStampId({ peerId, timestamp, schemaHash, engineId, expiration, nonce });
 	return { peerId, timestamp, schemaHash, engineId, expiration, nonce, id };
 }
 

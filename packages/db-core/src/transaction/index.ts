@@ -1,6 +1,7 @@
 export type {
 	Transaction,
 	TransactionStamp,
+	StampFields,
 	ReadDependency,
 	TransactionRef,
 	ITransactionEngine,
@@ -15,6 +16,7 @@ export type {
 
 export {
 	createTransactionStamp,
+	computeStampId,
 	createTransactionId,
 	createActionsStatements,
 	DEFAULT_TRANSACTION_TTL_MS,
