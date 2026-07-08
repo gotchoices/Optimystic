@@ -1,5 +1,5 @@
 import type { PendRequest, ActionBlocks, IRepo, MessageOptions, CommitResult, GetBlockResults, PendResult, BlockGets, CommitRequest, RepoMessage, IKeyNetwork, ICluster, ClusterConsensusConfig, BlockId, ActionRev, ActionContext, ClusterRecord } from "@optimystic/db-core";
-import { LruMap, blockIdsForTransforms } from "@optimystic/db-core";
+import { LruMap, blockIdsForTransforms, DEFAULT_SUPER_MAJORITY_THRESHOLD } from "@optimystic/db-core";
 import { ClusterCoordinator } from "./cluster-coordinator.js";
 import type { ClusterClient } from "../cluster/client.js";
 import type { PeerId } from "@libp2p/interface";
@@ -73,6 +73,8 @@ export class CoordinatorRepo implements IRepo {
 	private readonly readRepairSampleRate: number;
 	/** Simple-majority threshold from the consensus policy; drives the read-repair corroboration quorum. */
 	private readonly simpleMajorityThreshold: number;
+	/** Resolved super-majority threshold the coordinator commits on (mirrors the value handed to ClusterCoordinator). */
+	private readonly superMajorityThreshold: number;
 	private readonly reputation?: IPeerReputation;
 	/** Test seam: overridable clock for window-based read-repair gating. */
 	now: () => number = () => Date.now();
@@ -94,7 +96,7 @@ export class CoordinatorRepo implements IRepo {
 		this.localPeerId = localPeerId;
 		const policy: ClusterConsensusConfig & { clusterSize: number } = {
 			clusterSize: cfg?.clusterSize ?? 10,
-			superMajorityThreshold: cfg?.superMajorityThreshold ?? 0.75,
+			superMajorityThreshold: cfg?.superMajorityThreshold ?? DEFAULT_SUPER_MAJORITY_THRESHOLD,
 			simpleMajorityThreshold: cfg?.simpleMajorityThreshold ?? 0.51,
 			minAbsoluteClusterSize: cfg?.minAbsoluteClusterSize ?? 3,
 			allowClusterDownsize: cfg?.allowClusterDownsize ?? true,
@@ -117,6 +119,7 @@ export class CoordinatorRepo implements IRepo {
 		this.readRepairWindowMs = policy.readRepairWindowMs!;
 		this.readRepairSampleRate = policy.readRepairSampleRate!;
 		this.simpleMajorityThreshold = policy.simpleMajorityThreshold;
+		this.superMajorityThreshold = policy.superMajorityThreshold;
 		this.reputation = reputation;
 		const localClusterRef = localCluster && localPeerId ? {
 			update: localCluster.update.bind(localCluster),
@@ -124,6 +127,15 @@ export class CoordinatorRepo implements IRepo {
 			wasTransactionExecuted: localCluster.wasTransactionExecuted?.bind(localCluster)
 		} : undefined;
 		this.coordinator = new ClusterCoordinator(keyNetwork, createClusterClient, policy, localClusterRef, fretService, reputation, stateStore);
+	}
+
+	/**
+	 * The resolved super-majority threshold this coordinator commits on. Exposed so the composition root
+	 * can fail-fast if the coordinator and the cluster member would run different thresholds (see the
+	 * coupling assertion in `libp2p-node-base.ts`).
+	 */
+	get effectiveSuperMajorityThreshold(): number {
+		return this.superMajorityThreshold;
 	}
 
 	/** Recover coordinator transactions from persistent store after a restart. */

@@ -69,6 +69,7 @@ import {
 	reactivityNodePolicy,
 	createTierAddressing,
 	createRingHash,
+	DEFAULT_SUPER_MAJORITY_THRESHOLD,
 	Tier,
 	b64urlToBytes,
 	bytesToB64url,
@@ -79,6 +80,7 @@ import {
 	type NotificationVerifier,
 } from '@optimystic/db-core';
 import { PartitionDetector } from './cluster/partition-detector.js';
+import { assertSuperMajorityCoupling } from './cluster/supermajority-coupling.js';
 import { createLogger } from './logger.js';
 import { PeerReputationService } from './reputation/peer-reputation.js';
 import type { IPeerReputation } from './reputation/types.js';
@@ -175,7 +177,7 @@ export type NodeOptions = {
 	clusterPolicy?: {
 		allowDownsize?: boolean;
 		sizeTolerance?: number; // acceptable relative difference (e.g. 0.5 = +/-50%)
-		superMajorityThreshold?: number; // fraction of peers needed for super-majority (default: 0.67)
+		superMajorityThreshold?: number; // fraction of peers needed for super-majority (default: DEFAULT_SUPER_MAJORITY_THRESHOLD = 0.75)
 	};
 
 	/** Override libp2p listen multiaddrs. */
@@ -603,7 +605,7 @@ export async function createLibp2pNodeBase(
 	const fretSvc = (node as any).services?.fret as FretService | undefined;
 
 	const consensusConfig = {
-		superMajorityThreshold: options.clusterPolicy?.superMajorityThreshold ?? 0.67,
+		superMajorityThreshold: options.clusterPolicy?.superMajorityThreshold ?? DEFAULT_SUPER_MAJORITY_THRESHOLD,
 		simpleMajorityThreshold: 0.51,
 		minAbsoluteClusterSize: 2,
 		allowClusterDownsize: options.clusterPolicy?.allowDownsize ?? true,
@@ -796,6 +798,16 @@ export async function createLibp2pNodeBase(
 		localPeerId: node.peerId,
 		clusterLatestCallback
 	});
+
+	// Fail-fast coupling: the cluster member (what accepts a super-majority as sufficient) and the
+	// coordinator (what declares a transaction committed on that super-majority) MUST run the same
+	// threshold, or the node would come up able to disagree with itself mid-consensus. Both are fed from
+	// the single `consensusConfig` above; this asserts on their RESOLVED values so any future drift throws
+	// HERE at construction. See `assertSuperMajorityCoupling`.
+	assertSuperMajorityCoupling(
+		clusterImpl as import('./cluster/cluster-repo.js').ClusterMember,
+		coordinatedRepo as import('./repo/coordinator-repo.js').CoordinatorRepo
+	);
 
 	// Recover persisted transaction state before accepting new requests
 	if (options.transactionStateStore) {

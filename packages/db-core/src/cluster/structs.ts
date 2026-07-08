@@ -47,8 +47,18 @@ export type ClusterRecord = {
 	};
 }
 
+/**
+ * Single source of truth for the default super-majority threshold — the fraction of a cluster's peers
+ * that must promise before a transaction may proceed. Every component that falls back to a default when
+ * config is absent (cluster member, coordinator policy, node composition root) references THIS constant,
+ * so a member cannot silently default to a different threshold than the coordinator that commits. Explicit
+ * caller-supplied thresholds are unaffected; this only unifies the *absent-config* default.
+ * 0.75 = 3/4: chosen because the coordinator (which actually commits) already used it and the type documents it.
+ */
+export const DEFAULT_SUPER_MAJORITY_THRESHOLD = 0.75;
+
 export interface ClusterConsensusConfig {
-	/** Super-majority threshold for promises (default 0.75 = 3/4) */
+	/** Super-majority threshold for promises (default {@link DEFAULT_SUPER_MAJORITY_THRESHOLD} = 0.75 = 3/4) */
 	superMajorityThreshold: number;
 	/** Simple majority threshold for commits (default 0.51 = >50%) */
 	simpleMajorityThreshold: number;

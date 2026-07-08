@@ -1,7 +1,7 @@
 import type { IRepo, ClusterRecord, ClusterPeers, Signature, RepoMessage, ITransactionValidator, ClusterConsensusConfig, CommitResult, BlockId, ActionId, ActionRev, CommitRequest, CommitCert, InvalidateRequest } from "@optimystic/db-core";
 import type { ICluster } from "@optimystic/db-core";
 import type { IPeerNetwork } from "@optimystic/db-core";
-import { blockIdsForTransforms } from "@optimystic/db-core";
+import { blockIdsForTransforms, DEFAULT_SUPER_MAJORITY_THRESHOLD } from "@optimystic/db-core";
 import { computeClusterCommitHash, computeClusterMessageHash, computeClusterPromiseHash, membershipDigest, recordMembershipDigest, clampPriority } from "@optimystic/db-core";
 import { verifyInvalidationCertificate, type ArbitratorSetRecompute } from "../dispute/invalidation.js";
 import { buildCommitCert, invalidationActionId } from "./commit-cert.js";
@@ -217,7 +217,12 @@ export class ClusterMember implements ICluster {
 	 */
 	private static readonly MembershipConfidenceThreshold = 0.5;
 
-	/** Effective super-majority threshold. Defaults to 1.0 (unanimity) for backward compatibility. */
+	/**
+	 * Effective super-majority threshold this member accepts as sufficient for a commit. Defaults to
+	 * {@link DEFAULT_SUPER_MAJORITY_THRESHOLD} (0.75) when no config is supplied — the SAME default the
+	 * coordinator uses, so the two can never silently disagree about whether a transaction is final.
+	 * (Previously defaulted to 1.0/unanimity, which split the member from a coordinator committing at 0.75.)
+	 */
 	private readonly superMajorityThreshold: number;
 	// Membership admission gate parameters (see {@link admitMembership}). Read once from consensusConfig
 	// so the gate has stable thresholds independent of the (untrusted) values a record declares.
@@ -247,7 +252,7 @@ export class ClusterMember implements ICluster {
 		private readonly recomputeArbitratorSet?: RecomputeArbitratorSetCapability,
 		private readonly deriveExpectedCluster?: DeriveExpectedClusterCallback
 	) {
-		this.superMajorityThreshold = consensusConfig?.superMajorityThreshold ?? 1.0;
+		this.superMajorityThreshold = consensusConfig?.superMajorityThreshold ?? DEFAULT_SUPER_MAJORITY_THRESHOLD;
 		this.minAbsoluteClusterSize = consensusConfig?.minAbsoluteClusterSize ?? 3;
 		this.clusterSizeTolerance = consensusConfig?.clusterSizeTolerance ?? 0.5;
 		this.membershipAdmissionFraction = consensusConfig?.membershipAdmissionFraction ?? 0.75;
@@ -259,6 +264,16 @@ export class ClusterMember implements ICluster {
 		// Process cleanup queue
 		this.cleanupInterval = setInterval(() => this.processCleanupQueue(), 1000);
 		this.cleanupInterval.unref();
+	}
+
+	/**
+	 * The resolved super-majority threshold this member runs on. Exposed so the composition root can
+	 * fail-fast if the member and the coordinator would run different thresholds (see the coupling
+	 * assertion in `libp2p-node-base.ts`) — a mismatch is a latent phase-disagreement, caught at startup
+	 * rather than mid-consensus.
+	 */
+	get effectiveSuperMajorityThreshold(): number {
+		return this.superMajorityThreshold;
 	}
 
 	/**

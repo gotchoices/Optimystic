@@ -52,6 +52,28 @@ describe('Mesh Sanity Tests', () => {
 			expect(result['never-existed']).to.exist;
 			expect(result['never-existed']!.state?.latest).to.be.undefined;
 		});
+
+		// Regression guard for the unified default: previously the member defaulted to 1.0 (unanimity) and
+		// only an explicit low threshold (0.51) made single-node meshes commit. With the default now the
+		// shared 0.75, ceil(1 * 0.75) = 1, so a 1-peer cluster still needs exactly one promise — its own.
+		it('solo node commits with the unified default threshold (no explicit override)', async () => {
+			const defaultMesh = await createMesh(1, { responsibilityK: 1, clusterSize: 1 });
+			const node = defaultMesh.nodes[0]!;
+			const blockId = 'optimystic/schema-default';
+
+			const pendResult = await node.coordinatorRepo.pend(
+				{ actionId: 'schema-default-a1', transforms: makeTransforms(blockId), policy: 'c' }
+			);
+			expect(pendResult.success).to.equal(true);
+
+			const commitResult = await node.coordinatorRepo.commit(
+				{ actionId: 'schema-default-a1', tailId: blockId as BlockId, rev: 1, blockIds: [blockId] }
+			);
+			expect(commitResult.success).to.equal(true);
+
+			const result = await node.coordinatorRepo.get({ blockIds: [blockId] });
+			expect(result[blockId]?.block?.header.id).to.equal(blockId);
+		});
 	});
 
 	describe('Suite 1: 3-node mesh, responsibilityK=1', () => {
