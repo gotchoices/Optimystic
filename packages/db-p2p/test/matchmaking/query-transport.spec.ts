@@ -198,15 +198,19 @@ describe('matchmaking / query serve transport', () => {
 		expect(await handle(Uint8Array.from([1, 2, 3, 4]), remotePeer), 'an undecodable frame yields no reply').to.equal(undefined);
 	});
 
-	it('drops to no reply (never throws) when the reply build fails', async () => {
+	it('drops to no reply (never throws) when the reply build fails, but still counts the served query', async () => {
 		// A transient signer rejection must surface as a clean no-reply, not a thrown error out of the handler
 		// (the outer handleRequestResponse would otherwise abort the stream). Mirrors the recover serve handler.
+		// The accounting bump precedes the reply build by design (count-on-serve), so a sign failure does NOT
+		// drop the query from the barometer — lock that deliberate ordering here.
+		const calls: RecordedQuery[] = [];
 		const handle = createMatchmakingQueryHandler({
-			registry: stubRegistry(stubEngine([await providerRecord('p1', ['gpu'], 4)])),
+			registry: stubRegistry(stubEngine([await providerRecord('p1', ['gpu'], 4)], calls)),
 			addressing,
 			sign: async (): Promise<string> => { throw new Error('signer offline'); },
 		});
 		expect(await handle(frameOf(query()), remotePeer), 'a sign failure drops to no reply').to.equal(undefined);
+		expect(calls.length, 'a query that resolved a serving engine is counted on serve even if signing fails').to.equal(1);
 	});
 
 	it('records exactly one query-accounting bump with the served topicId and the injected clock', async () => {

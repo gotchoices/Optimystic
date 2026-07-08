@@ -2052,6 +2052,12 @@ function createCoordEngine(ctx: CoordEngineContext, servedCoord: RingCoord, tree
 		// NOTE: the only production caller today is the matchmaking QueryV1 serve handler
 		// (matchmaking-query-accounting-seam). When the AggregateCountV1 sweep RPC lands it is another
 		// genuine cohort query and should bump the same seam — reuse `engine.recordQuery` at that call site.
+		// NOTE: unlike `recordArrival` (whose topic always becomes resident via the store), a query can be
+		// recorded against a NON-resident topic (the recordless `findByCoord` serve fallback). `gossipRound`
+		// only `publish`es `residentTopics()`, and `traffic.forget` fires only on topic-budget eviction, so
+		// such a topic's query window prunes only at epoch `reset`. Harmless now (bounded by epoch lifetime +
+		// the serve gate; a few timestamps per query). If a node ever serves high-volume queries for topics it
+		// holds no records for, prune non-resident windows on a timer or forget them when their engine idles.
 		recordQuery: (topicId: Uint8Array, now: number): void => traffic.recordQuery(topicId, now),
 		cohortView: (): CohortView => view,
 		servesTopic: (topicId: Uint8Array): boolean =>
