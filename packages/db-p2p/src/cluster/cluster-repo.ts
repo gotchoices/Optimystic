@@ -2,6 +2,7 @@ import type { IRepo, ClusterRecord, Signature, RepoMessage, ITransactionValidato
 import type { ICluster } from "@optimystic/db-core";
 import type { IPeerNetwork } from "@optimystic/db-core";
 import { blockIdsForTransforms } from "@optimystic/db-core";
+import { computeClusterCommitHash, computeClusterMessageHash, computeClusterPromiseHash, membershipDigest, recordMembershipDigest } from "@optimystic/db-core";
 import { verifyInvalidationCertificate, type ArbitratorSetRecompute } from "../dispute/invalidation.js";
 import { buildCommitCert, invalidationActionId } from "./commit-cert.js";
 import { ClusterClient } from "./client.js";
@@ -9,8 +10,6 @@ import type { PeerId, PrivateKey } from "@libp2p/interface";
 import { peerIdFromString } from "@libp2p/peer-id";
 import { publicKeyFromRaw } from "@libp2p/crypto/keys";
 import { peerIdBindsPublicKey } from "./peer-key-binding.js";
-import { sha256 } from "multiformats/hashes/sha2";
-import { base58btc } from "multiformats/bases/base58";
 import { toString as uint8ArrayToString, fromString as uint8ArrayFromString } from 'uint8arrays';
 import { createLogger } from '../logger.js'
 import type { PartitionDetector } from "./partition-detector.js";
@@ -440,7 +439,29 @@ export class ClusterMember implements ICluster {
 		if (ClusterMember.canonicalJson(existing.message) !== ClusterMember.canonicalJson(incoming.message)) {
 			throw new Error('Message content mismatch');
 		}
-		if (ClusterMember.canonicalJson(existing.peers) !== ClusterMember.canonicalJson(incoming.peers)) {
+		if (existing.membershipVersion === 2 || incoming.membershipVersion === 2) {
+			// v2: the sorted peer-id set (captured by membershipDigest) is bound into messageHash, so equal
+			// messageHash MUST imply equal membership on any honest path. A mismatch here — different digest
+			// or version at equal hash — is a protocol violation (a bug or a hash-collision attack), NOT an
+			// honest divergence: two honest members with different views now hold two DIFFERENT hashes, i.e.
+			// two competing transactions the race machinery resolves, not one contested record. Log loudly
+			// and reject; never silently adopt the incoming set. (validateRecord already proved each record's
+			// own digest matches its own peers, so multiaddr / pubkey churn within the SAME id set — which
+			// keeps the same digest and hash — does NOT trip this.)
+			if (existing.membershipVersion !== incoming.membershipVersion || existing.membershipDigest !== incoming.membershipDigest) {
+				log('cluster-member:peers-mismatch-invariant-violation', {
+					messageHash: existing.messageHash,
+					existingVersion: existing.membershipVersion,
+					incomingVersion: incoming.membershipVersion,
+					existingDigest: existing.membershipDigest,
+					incomingDigest: incoming.membershipDigest,
+					existingPeers: Object.keys(existing.peers ?? {}).sort(),
+					incomingPeers: Object.keys(incoming.peers ?? {}).sort()
+				});
+				throw new Error('Peers mismatch');
+			}
+		} else if (ClusterMember.canonicalJson(existing.peers) !== ClusterMember.canonicalJson(incoming.peers)) {
+			// v1 (legacy, membership unbound): full peer-object equality is the only available guard.
 			throw new Error('Peers mismatch');
 		}
 
@@ -507,8 +528,27 @@ export class ClusterMember implements ICluster {
 	}
 
 	private async validateRecord(record: ClusterRecord): Promise<void> {
-		// Validate message hash matches the message content
-		const expectedHash = await this.computeMessageHash(record.message);
+		// Reject a record whose membership-binding version this code does not implement. The cluster
+		// consensus code is a single deployable unit (all cluster members upgrade together), so a version
+		// we don't understand is rejected rather than cross-version-consensus'd.
+		if (record.membershipVersion !== undefined && record.membershipVersion !== 1 && record.membershipVersion !== 2) {
+			throw new Error(`Unsupported membershipVersion: ${record.membershipVersion}`);
+		}
+
+		// v2: the declared membership digest must match the record's own peer set. A record whose declared
+		// digest doesn't match its peers is malformed (and its messageHash — computed over that digest —
+		// would not bind the real membership).
+		// NOTE: recomputes membershipDigest (one SHA256 over the sorted peer-id list) on every incoming v2
+		// record; if a hot cluster ever shows this as a cost, memoize per (messageHash → digest).
+		if (record.membershipVersion === 2) {
+			const expectedDigest = await membershipDigest(record.peers);
+			if (expectedDigest !== record.membershipDigest) {
+				throw new Error(`Membership digest mismatch: expected=${expectedDigest}, received=${record.membershipDigest ?? 'undefined'}`);
+			}
+		}
+
+		// Validate message hash matches the message content (v2 folds in the membership digest)
+		const expectedHash = await this.computeMessageHash(record);
 		if (expectedHash !== record.messageHash) {
 			throw new Error(`Message hash mismatch: expected=${expectedHash}, received=${record.messageHash}`);
 		}
@@ -523,13 +563,12 @@ export class ClusterMember implements ICluster {
 	}
 
 	/**
-	 * Compute message hash using the same algorithm as the coordinator.
-	 * Must match cluster-coordinator.ts createMessageHash().
+	 * Compute message hash using the same algorithm as the coordinator. Version-dispatched: a v2 record
+	 * folds its membership digest into the preimage, a v1 / unversioned record hashes byte-identically to
+	 * before this change. Must match cluster-coordinator.ts createMessageHash().
 	 */
-	private async computeMessageHash(message: RepoMessage): Promise<string> {
-		const msgBytes = new TextEncoder().encode(ClusterMember.canonicalJson(message));
-		const hashBytes = await sha256.digest(msgBytes);
-		return base58btc.encode(hashBytes.digest);
+	private async computeMessageHash(record: Pick<ClusterRecord, 'message' | 'membershipVersion' | 'membershipDigest'>): Promise<string> {
+		return computeClusterMessageHash(record.message, recordMembershipDigest(record));
 	}
 
 	private async validateSignatures(record: ClusterRecord): Promise<void> {
@@ -570,15 +609,11 @@ export class ClusterMember implements ICluster {
 	}
 
 	private async computePromiseHash(record: ClusterRecord): Promise<string> {
-		const msgBytes = new TextEncoder().encode(record.messageHash + ClusterMember.canonicalJson(record.message));
-		const hashBytes = await sha256.digest(msgBytes);
-		return uint8ArrayToString(hashBytes.digest, 'base64url');
+		return computeClusterPromiseHash(record.messageHash, record.message, recordMembershipDigest(record));
 	}
 
 	private async computeCommitHash(record: ClusterRecord): Promise<string> {
-		const msgBytes = new TextEncoder().encode(record.messageHash + ClusterMember.canonicalJson(record.message) + ClusterMember.canonicalJson(record.promises));
-		const hashBytes = await sha256.digest(msgBytes);
-		return uint8ArrayToString(hashBytes.digest, 'base64url');
+		return computeClusterCommitHash(record.messageHash, record.message, record.promises, recordMembershipDigest(record));
 	}
 
 	private computeSigningPayload(hash: string, type: string, rejectReason?: string): Uint8Array {

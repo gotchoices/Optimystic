@@ -1,5 +1,5 @@
 import type { ClusterRecord, ITransactionValidator, InvalidateRequest, CommitRequest, PendRequest, CollectionId } from '@optimystic/db-core';
-import { blockIdsForTransforms } from '@optimystic/db-core';
+import { blockIdsForTransforms, computeClusterPromiseHash, recordMembershipDigest } from '@optimystic/db-core';
 import { buildDisputeResolutionProof, computeTargetHash, computeArbitratorSetHash, voteSigningPayload, arbitratorSetSigningPayload, VOTE_VERSION, type CertificateTarget } from './invalidation.js';
 import type { PeerId, PrivateKey } from '@libp2p/interface';
 import { sha256 } from 'multiformats/hashes/sha2';
@@ -24,18 +24,6 @@ import type { IPeerNetwork } from '@optimystic/db-core';
 import type { DisputeClient } from './client.js';
 
 const log = createLogger('dispute');
-
-/**
- * Deterministic JSON (sorts object keys) — must match `ClusterMember.canonicalJson` in `cluster-repo.ts`,
- * since we reconstruct the exact promise-vote preimage the cluster path signed to re-verify approvals here.
- */
-function canonicalJson(value: unknown): string {
-	return JSON.stringify(value, (_, v) =>
-		v && typeof v === 'object' && !Array.isArray(v)
-			? Object.keys(v).sort().reduce((o: Record<string, unknown>, k) => { o[k] = v[k]; return o; }, {})
-			: v
-	);
-}
 
 /** Callback to create a DisputeClient for a given peer */
 export type CreateDisputeClient = (peerId: PeerId) => DisputeClient;
@@ -629,14 +617,14 @@ export class DisputeService {
 	}
 
 	/**
-	 * Reconstruct the cluster promise-vote hash for `record` — `base64url(sha256(messageHash + canonicalJson(message)))`
-	 * — identical to `ClusterMember.computePromiseHash`. The promise signatures in a disputed record were
-	 * produced over this by the cluster path, so re-verifying an approval requires reproducing it here.
+	 * Reconstruct the cluster promise-vote hash for `record` — identical to `ClusterMember.computePromiseHash`,
+	 * and version-dispatched the same way: a v2 record folds its membership digest into the preimage, a v1 /
+	 * unversioned record hashes byte-identically to before. The promise signatures in a disputed record were
+	 * produced over this by the cluster path, so re-verifying an approval requires reproducing it here — a v2
+	 * originalRecord whose digest we omitted would fail to verify its (honest) approvals.
 	 */
 	private async computePromiseHash(record: ClusterRecord): Promise<string> {
-		const msgBytes = new TextEncoder().encode(record.messageHash + canonicalJson(record.message));
-		const hashBytes = await sha256.digest(msgBytes);
-		return uint8ArrayToString(hashBytes.digest, 'base64url');
+		return computeClusterPromiseHash(record.messageHash, record.message, recordMembershipDigest(record));
 	}
 
 	/**

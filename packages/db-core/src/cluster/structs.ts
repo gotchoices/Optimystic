@@ -17,6 +17,16 @@ export type ClusterPeers = {
 export type ClusterRecord = {
 	messageHash: string;	// Serves as a unique identifier for the clustered transaction record
 	peers: ClusterPeers;
+	/**
+	 * Membership-binding version. Absent or `1` = legacy *unbound* record: the peer set is NOT covered by
+	 * any hash (pre-binding history and its stored commit certs verify byte-identically to before). `2` =
+	 * the sorted peer-id set (as {@link ClusterRecord.membershipDigest}) is folded into `messageHash`,
+	 * `promiseHash`, and `commitHash`, so two different peer sets yield two different `messageHash`es.
+	 * New coordinators always emit `2`. See `packages/db-core/src/cluster/membership.ts`.
+	 */
+	membershipVersion?: 1 | 2;
+	/** Membership digest of {@link ClusterRecord.peers}; present iff `membershipVersion === 2`. base64url. */
+	membershipDigest?: string;
 	message: RepoMessage;
 	coordinatingBlockIds?: string[];
 	promises: { [peerId: string]: Signature };

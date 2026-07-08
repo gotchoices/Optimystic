@@ -1,7 +1,6 @@
 import { peerIdFromString } from "@libp2p/peer-id";
 import type { ClusterRecord, IKeyNetwork, RepoMessage, BlockId, ClusterPeers, MessageOptions, ClusterConsensusConfig } from "@optimystic/db-core";
-import { base58btc } from "multiformats/bases/base58";
-import { sha256 } from "multiformats/hashes/sha2";
+import { CURRENT_MEMBERSHIP_VERSION, computeClusterMessageHash, membershipDigest } from "@optimystic/db-core";
 import { ClusterClient } from "../cluster/client.js";
 import { Pending } from "@optimystic/db-core";
 import type { PeerId } from "@libp2p/interface";
@@ -103,21 +102,13 @@ export class ClusterCoordinator {
 	}
 
 	/**
-	 * Creates a base 58 BTC string hash for a message to uniquely identify a transaction
+	 * Creates a base58btc string hash uniquely identifying a transaction. For a v2 record the caller
+	 * threads in the {@link membershipDigest} of the peer set so the responsible membership is bound into
+	 * the identity (two different peer sets ⇒ two different hashes). Omitting `membershipDigestValue`
+	 * reproduces the legacy v1 hash byte-for-byte.
 	 */
-	/** Deterministic JSON: sorts object keys so hash is order-independent */
-	private static canonicalJson(value: unknown): string {
-		return JSON.stringify(value, (_, v) =>
-			v && typeof v === 'object' && !Array.isArray(v)
-				? Object.keys(v).sort().reduce((o: Record<string, unknown>, k) => { o[k] = v[k]; return o; }, {})
-				: v
-		);
-	}
-
-	private async createMessageHash(message: RepoMessage): Promise<string> {
-		const msgBytes = new TextEncoder().encode(ClusterCoordinator.canonicalJson(message));
-		const hashBytes = await sha256.digest(msgBytes);
-		return base58btc.encode(hashBytes.digest);
+	private async createMessageHash(message: RepoMessage, membershipDigestValue?: string): Promise<string> {
+		return computeClusterMessageHash(message, membershipDigestValue);
 	}
 
 	/**
@@ -136,11 +127,15 @@ export class ClusterCoordinator {
 		}
 	}
 
-	private makeRecord(peers: ClusterPeers, messageHash: string, message: RepoMessage): ClusterRecord {
+	private makeRecord(peers: ClusterPeers, messageHash: string, message: RepoMessage, membershipDigestValue: string): ClusterRecord {
 		const peerCount = Object.keys(peers ?? {}).length;
 		const record: ClusterRecord = {
 			messageHash,
 			peers,
+			// v2: bind the responsible membership into the signed identity. messageHash was computed over
+			// this same digest, so a different peer set would have produced a different messageHash.
+			membershipVersion: CURRENT_MEMBERSHIP_VERSION,
+			membershipDigest: membershipDigestValue,
 			message,
 			coordinatingBlockIds: message.coordinatingBlockIds,
 			promises: {},
@@ -176,11 +171,16 @@ export class ClusterCoordinator {
 		// Get the cluster peers for this block
 		const peers = await this.getClusterForBlock(blockId);
 
-		// Create a unique hash for this transaction
-		const messageHash = await this.createMessageHash(message);
+		// Bind the responsible membership into the transaction identity (v2): the digest is folded into
+		// the messageHash below, so two different peer sets produce two different messageHashes rather
+		// than one hash with a silent internal disagreement about who is responsible.
+		const membershipDigestValue = await membershipDigest(peers);
+
+		// Create a unique hash for this transaction (over message + membership digest)
+		const messageHash = await this.createMessageHash(message, membershipDigestValue);
 
 		// Create a cluster record for this transaction
-		const record = this.makeRecord(peers, messageHash, message);
+		const record = this.makeRecord(peers, messageHash, message, membershipDigestValue);
 		log('cluster-tx:start', {
 			messageHash,
 			blockId,

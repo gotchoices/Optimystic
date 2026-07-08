@@ -49,6 +49,8 @@ For implementation details, see [transactions.md](transactions.md), [right-is-ri
 
 **Cluster.** A set of *K* peers responsible for a block, selected deterministically by FRET ring distance from the block ID. Cluster membership is a function of network topology and is eventually consistent.
 
+**Membership binding.** The peer set responsible for a transaction is bound into the transaction's cryptographic identity. A transaction record declares a *membership version*: version 2 (emitted by all current coordinators) folds a *membership digest* — `SHA256` of the sorted peer-id list, i.e. `membershipDigest(peers)` — into the `messageHash`, `promiseHash`, and `commitHash` a member signs. Consequently **for a version-2 record, equal `messageHash` implies an equal responsible peer set**: two coordinators that disagree about who is responsible produce two *different* `messageHash`es (two competing transactions the race/conflict machinery resolves), not one hash with a silent internal disagreement. The digest is over peer *ids only* — multiaddrs and public keys (which churn, or are a function of the id) are excluded, so it is stable under address churn and peer-map ordering. Legacy version-1 (unversioned) records leave the peer set unbound and hash exactly as before this binding was introduced, so already-committed history and its stored commit certificates keep verifying unchanged (see Theorem 14). *This establishes the binding only; it does not by itself decide whether a declared peer set is a legitimate cluster for the block — that admission check is a separate follow-up (the membership admission gate).*
+
 **Consensus.** A transaction achieves consensus when a qualifying set of cluster peers agree on its outcome (commit or reject).
 
 **Conflict.** Two transactions *conflict* if they modify the same block. Conflict is detected by block ID overlap in their respective operation sets.
@@ -77,6 +79,8 @@ Consider two conflicting transactions *T₁* and *T₂* that both attempt to mod
 
 All honest nodes execute the same deterministic algorithm with the same inputs, so all honest nodes agree on the winner. The loser is rejected. Since honest nodes form a super-majority of the cluster (or, failing that, the dispute mechanism recruits a wider honest majority), the honest decision prevails.
 
+Membership binding (§2) sharpens the "same inputs" premise here: for version-2 records the responsible peer set is folded into the `messageHash`, so equal `messageHash` implies an equal peer set. Two honest members with different views of who is responsible therefore hold two *different* hashes — two competing transactions this same race resolution adjudicates — rather than one record they silently disagree about. (Whether a declared set is a *legitimate* cluster for the block is enforced by the separate membership admission gate; this theorem relies only on the binding.)
+
 *Case 3: Cluster is Byzantine-majority.* If the local cluster has a Byzantine majority that approves both conflicting transactions, the minority honest nodes trigger a dispute. The dispute escalates to enlistees selected by FRET ring distance. Since the global network has an honest majority, the escalation eventually reaches an audience where honest nodes outnumber Byzantine ones. The losing side (including the Byzantine approvers) is ejected. Only one transaction commits.
 
 **Depends on:** Global honest majority (§1.5), Ed25519 unforgeability (§1.3), deterministic race resolution.
@@ -94,6 +98,8 @@ Suppose the network partitions into subsets *A* and *B*. For a block with cluste
 - *B* needs ≥ ⌈0.75K⌉ approvals from peers in *B*
 
 This requires ⌈0.75K⌉ + ⌈0.75K⌉ ≤ K honest participating peers, which simplifies to approximately 1.5K ≤ K — a contradiction. Therefore at most one partition can achieve super-majority.
+
+This counting argument assumes both partitions are voting on *the same K-peer cluster*. Membership binding (§2) makes that assumption checkable rather than implicit: for version-2 records the peer set is bound into the `messageHash`, so a partition that promises/commits against a different (e.g. self-shrunk) peer set is signing a *different* `messageHash` — a distinct transaction, not a second super-majority for the same one. (This ticket binds the set into the identity; rejecting an *illegitimate* declared set — the self-shrink / partition defense proper — is the membership admission gate follow-up.)
 
 Additionally, the self-coordination guard detects network shrinkage exceeding 50% from the high-water mark and blocks writes. The partition detector flags rapid churn (≥5 peer departures in 10 seconds) as a potential partition, suppressing transaction initiation.
 
@@ -307,6 +313,8 @@ Since signatures are Ed25519, the Byzantine node cannot deny having signed the c
 Promise signatures are computed as: `Ed25519.sign(privateKey, hash + ":" + type + ":" + reason?)` where `hash = SHA256(messageHash + message)`.
 
 Commit signatures use: `hash = SHA256(messageHash + message + promises)`.
+
+For version-2 records (§2, membership binding) the `membershipDigest` is folded into each preimage — `hash = SHA256(messageHash + message + membershipDigest)` for promises and `SHA256(messageHash + message + membershipDigest + promises)` for commits — so a signature is valid only for the exact responsible peer set it was signed against. Version-1 (unversioned) records omit the digest and hash exactly as the two formulas above, preserving verification of pre-binding history.
 
 Forging requires either:
 1. Producing a valid Ed25519 signature without the private key — contradicts the unforgeability assumption.
