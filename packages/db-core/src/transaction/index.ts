@@ -22,7 +22,9 @@ export {
 	DEFAULT_TRANSACTION_TTL_MS,
 	isTransactionExpired,
 	clientSignaturePayload,
-	CLIENT_SIG_VERSION
+	CLIENT_SIG_VERSION,
+	MaxPriority,
+	clampPriority
 } from './transaction.js';
 
 export {

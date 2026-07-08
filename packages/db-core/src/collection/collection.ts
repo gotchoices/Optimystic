@@ -3,6 +3,7 @@ import { Log, Atomic, Tracker, copyTransforms, CacheSource, isTransformsEmpty, T
 import type { CollectionHeaderBlock, CollectionId, ICollection, SyncOptions } from "./index.js";
 import { SyncRetryExhaustedError } from "./index.js";
 import type { ReadDependency } from "../transaction/transaction.js";
+import { clampPriority } from "../transaction/transaction.js";
 import { ReadDependencyCollector } from "../transaction/read-dependency-collector.js";
 import { randomBytes } from '@noble/hashes/utils.js';
 import { toString as uint8ArrayToString } from 'uint8arrays/to-string';
@@ -322,8 +323,11 @@ export class Collection<TAction> implements ICollection<TAction> {
 			const newRev = (this.source.actionContext?.rev ?? 0) + 1;
 			const addResult = await log.addActions(pending, actionId, newRev, () => tracker.transformedBlockIds());
 
-			// Commit the action to the transactor
-			const staleFailure = await this.source.transact(tracker.transforms, actionId, newRev, this.id, addResult.tailPath.block.header.id);
+			// Commit the action to the transactor. Carry the aged retry priority derived from the
+			// consecutive-failure count so a sync that keeps losing concurrent races out-ranks fresh
+			// (priority-0) rivals in the cluster's resolveRace (fairness-only; capped at MaxPriority).
+			// First attempt has consecutiveFailures == 0, so priority 0 — the common pend is unchanged.
+			const staleFailure = await this.source.transact(tracker.transforms, actionId, newRev, this.id, addResult.tailPath.block.header.id, clampPriority(consecutiveFailures));
 			if (staleFailure) {
 				consecutiveFailures++;
 				lastReason = staleFailure.reason ?? lastReason;

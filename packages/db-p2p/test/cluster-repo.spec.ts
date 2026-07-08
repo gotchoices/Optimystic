@@ -3,6 +3,7 @@ import { ClusterMember, clusterMember } from '../src/cluster/cluster-repo.js';
 import { MemoryTransactionStateStore } from '../src/cluster/memory-transaction-state-store.js';
 import type { IRepo, ClusterRecord, RepoMessage, Signature, BlockGets, GetBlockResults, PendRequest, PendResult, CommitRequest, CommitResult, ActionBlocks, ClusterPeers, Transforms, IBlock, BlockId, BlockHeader, ClusterConsensusConfig } from '@optimystic/db-core';
 import type { IPeerNetwork } from '@optimystic/db-core';
+import { MaxPriority } from '@optimystic/db-core';
 import type { PeerId, PrivateKey } from '@libp2p/interface';
 import { peerIdFromPrivateKey } from '@libp2p/peer-id';
 import { generateKeyPair } from '@libp2p/crypto/keys';
@@ -178,6 +179,31 @@ const makePendOperation = (actionId: string, blockId: string): RepoMessage['oper
 	};
 	return [{ pend: { actionId, transforms, policy: 'c' } }];
 };
+
+/**
+ * Like {@link makePendOperation} but carrying an aged priority. `priority` sets the top-level
+ * single-collection carrier (`pend.priority`); `txPriority` sets the multi-collection carrier
+ * (`pend.transaction.priority`) — resolveRace reads the transaction carrier first. A minimal
+ * transaction stub is fine here: resolveRace only reads `.priority` off it.
+ */
+const makePendOperationP = (
+	actionId: string,
+	blockId: string,
+	opts?: { priority?: number; txPriority?: number }
+): RepoMessage['operations'] => {
+	const transforms: Transforms = {
+		inserts: { [blockId]: makeBlock(blockId) },
+		updates: {},
+		deletes: []
+	};
+	const pend: Record<string, unknown> = { actionId, transforms, policy: 'c' };
+	if (opts?.priority !== undefined) pend.priority = opts.priority;
+	if (opts?.txPriority !== undefined) pend.transaction = { priority: opts.txPriority };
+	return [{ pend } as RepoMessage['operations'][number]];
+};
+
+/** A promise/commit signature whose bytes are irrelevant — resolveRace only counts key presence. */
+const dummySig: Signature = { type: 'approve', signature: 'x' };
 
 describe('ClusterMember', () => {
 	let mockRepo: MockRepo;
@@ -794,6 +820,94 @@ describe('ClusterMember', () => {
 			const result = await clusterMemberInstance.update(record2);
 			// The result should still be valid - race resolution doesn't throw
 			expect(result).to.not.equal(undefined);
+		});
+	});
+
+	describe('priority-aged race resolution', () => {
+		// resolveRace is private; a cast keeps these as focused unit tests of the deterministic tiebreak.
+		const raceOf = () => (clusterMemberInstance as unknown as {
+			resolveRace(a: ClusterRecord, b: ClusterRecord): 'keep-existing' | 'accept-incoming'
+		});
+
+		it('higher aged priority wins even against a rival with MORE promises', async () => {
+			const peers = makeClusterPeers([selfKeyPair]);
+			// Aged transaction: priority 2, ZERO promises.
+			const aged = await createClusterRecord(peers, makePendOperationP('aged', 'block-shared', { priority: 2 }));
+			// Fresh rival: priority 0 but TWO promises — would win under the old promise-count-first rule.
+			const fresh = await createClusterRecord(
+				peers, makePendOperationP('fresh', 'block-shared'), { p1: dummySig, p2: dummySig }
+			);
+			expect(raceOf().resolveRace(aged, fresh)).to.equal('keep-existing');
+			expect(raceOf().resolveRace(fresh, aged)).to.equal('accept-incoming');
+		});
+
+		it('reads priority from the multi-collection carrier (pend.transaction.priority) too', async () => {
+			const peers = makeClusterPeers([selfKeyPair]);
+			const txAged = await createClusterRecord(peers, makePendOperationP('tx-aged', 'block-shared', { txPriority: 4 }));
+			const fresh = await createClusterRecord(peers, makePendOperationP('fresh', 'block-shared'));
+			expect(raceOf().resolveRace(txAged, fresh)).to.equal('keep-existing');
+		});
+
+		it('an aged transaction beats fresh rivals within MaxPriority+1 concurrent rounds (livelock guarantee)', async () => {
+			const peers = makeClusterPeers([selfKeyPair]);
+			// Model a transaction that keeps losing: its priority = clampPriority(losses) rises each round,
+			// while every fresh rival stays at priority 0 (and even carries more promises).
+			let firstWin: number | undefined;
+			for (let losses = 0; losses <= MaxPriority; losses++) {
+				const agedPriority = Math.min(MaxPriority, losses);
+				const aged = await createClusterRecord(peers, makePendOperationP('aged', 'block-shared', { priority: agedPriority }));
+				const fresh = await createClusterRecord(
+					peers, makePendOperationP(`fresh-${losses}`, 'block-shared'), { p1: dummySig, p2: dummySig }
+				);
+				if (raceOf().resolveRace(aged, fresh) === 'keep-existing' && firstWin === undefined) {
+					firstWin = losses;
+				}
+			}
+			// Deterministic win no later than MaxPriority+1 rounds — in fact as soon as priority clears 0.
+			expect(firstWin, 'aged transaction eventually wins deterministically').to.not.be.undefined;
+			expect(firstWin!).to.be.at.most(MaxPriority);
+			expect(firstWin!, 'priority 1 already out-ranks a fresh priority-0 rival').to.equal(1);
+		});
+
+		it('two capped-out conflicts fall back to the hash tiebreak — symmetric, deadlock-free, and over-cap clamps', async () => {
+			const peers = makeClusterPeers([selfKeyPair]);
+			const a = await createClusterRecord(peers, makePendOperationP('a', 'block-shared', { priority: MaxPriority }));
+			// b self-asserts an over-cap priority; recordPriority clamps it to MaxPriority so it TIES a.
+			const b = await createClusterRecord(peers, makePendOperationP('b', 'block-shared', { priority: MaxPriority + 5 }));
+
+			const ab = raceOf().resolveRace(a, b);
+			const ba = raceOf().resolveRace(b, a);
+			// Both orderings must agree on the SAME actual winning record (no deadlock, order-independent).
+			const winnerAB = ab === 'keep-existing' ? a.messageHash : b.messageHash;
+			const winnerBA = ba === 'keep-existing' ? b.messageHash : a.messageHash;
+			expect(winnerAB).to.equal(winnerBA);
+			// …and the winner is exactly the higher-hash record — the pre-priority tiebreak, unchanged.
+			expect(winnerAB).to.equal(a.messageHash > b.messageHash ? a.messageHash : b.messageHash);
+		});
+
+		it('a mixed-version race (priority present vs absent) is deterministic; absent = priority 0', async () => {
+			const peers = makeClusterPeers([selfKeyPair]);
+			const aged = await createClusterRecord(peers, makePendOperationP('aged', 'block-shared', { priority: 3 }));
+			// Legacy record: NO priority field anywhere in the pend (older coordinator).
+			const legacy = await createClusterRecord(peers, makePendOperation('legacy', 'block-shared'));
+			expect(raceOf().resolveRace(aged, legacy)).to.equal('keep-existing');
+			expect(raceOf().resolveRace(legacy, aged)).to.equal('accept-incoming');
+		});
+
+		it('rejects a record whose priority was inflated after signing (integrity in transit)', async () => {
+			const peers = makeClusterPeers([selfKeyPair]);
+			// messageHash is computed over priority:1; then we tamper it up to MaxPriority.
+			const record = await createClusterRecord(peers, makePendOperationP('a1', 'block-1', { priority: 1 }));
+			(record.message.operations[0] as unknown as { pend: { priority: number } }).pend.priority = MaxPriority;
+
+			let err: unknown;
+			try {
+				await clusterMemberInstance.update(record);
+			} catch (e) {
+				err = e;
+			}
+			expect(err).to.be.instanceOf(Error);
+			expect((err as Error).message).to.include('Message hash mismatch');
 		});
 	});
 

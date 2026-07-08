@@ -39,6 +39,16 @@ export type PendRequest = ActionTransforms & {
 	operationsHash?: string;
 	/** For multi-collection transactions: supercluster nominees for consensus */
 	superclusterNominees?: PeerId[];
+	/**
+	 * Aged, advisory retry priority for the *single-collection* pend path (default 0 when absent).
+	 * The multi-collection path instead carries priority on {@link PendRequest.transaction}
+	 * ({@link Transaction.priority}); this top-level field is the carrier for a `Collection.sync`
+	 * pend, which has no `transaction`. A cluster member reads whichever is present as the first
+	 * `resolveRace` tiebreak. FAIRNESS-ONLY: it rides inside the signed cluster `message` (so it is
+	 * integrity-protected in transit) but MUST NOT affect the operations hash, stale-read checks, or
+	 * validity — a stale pend is still rejected regardless of priority.
+	 */
+	priority?: number;
 };
 
 export type BlockActionStatus = ActionBlocks & {

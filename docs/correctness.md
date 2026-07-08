@@ -266,14 +266,13 @@ Each round ejects the losing side, so the honest fraction of active nodes *incre
 
 **Proof sketch.**
 
-When conflicting transactions race, `resolveRace()` deterministically selects exactly one winner (most promises, then highest hash). The winner commits. The loser is rejected and may retry with a new transaction ID.
+When conflicting transactions race, `resolveRace()` deterministically selects exactly one winner. The order is now: **(1) higher aged priority, (2) more promises, (3) higher message hash.** The winner commits. The loser is rejected and may retry.
 
-Starvation: a transaction could theoretically lose every race indefinitely. However:
-- Each retry generates a new transaction ID (different timestamp), producing a different hash.
-- The hash-based tiebreaker is effectively random from the adversary's perspective (SHA-256 preimage resistance).
-- The probability of losing *k* consecutive races decreases exponentially as 2⁻ᵏ.
+*Aged priority (concurrent-contention progress).* A transaction carries an advisory `priority` (default 0) that rises by one per failed retry attempt — attempt-count-derived, so it needs no wall clock and is clock-skew-free (consistent with §7.4) — capped at a small constant `MaxPriority`. Priority is fairness-only: it is excluded from the transaction id, the client signature, the operations hash, and every stale-read/validity check (so Theorem 1 is untouched), and it rides inside the signed cluster `message`, so it is integrity-protected in transit. Because `resolveRace` consults priority *first*, once a starved transaction's priority exceeds a fresh rival's initial priority (0) — i.e. after at most `MaxPriority` losing attempts — every honest member deterministically picks the aged transaction over every fresh rival, so it wins every subsequent *concurrent* race. Two capped-out transactions (both at `MaxPriority`) fall back to the existing promise/hash tiebreak — deterministic and symmetric, no deadlock. Combined with backoff+jitter (§ retry policy) thinning self-inflicted contention, the concurrent-starvation probability collapses from "2⁻ᵏ but memoryless" to "a bounded number of losses, then a deterministic win."
 
-**Bound.** No deterministic starvation prevention exists. Applications should implement bounded retry with backoff. The `StaleFailure` diagnostic provides information for informed retry decisions.
+*Byzantine note.* A coordinator can self-assert `priority == MaxPriority` on every transaction. `resolveRace` clamps to the cap and priority never touches validity, so this cannot cause two conflicting commits (safety intact) — it only wins races it might have ~50% won anyway, degrading to at-worst-status-quo fairness (the same graceful-degradation class as spam under honest-majority). Binding priority to *provable* age is out of scope (see the reservation follow-up below).
+
+**Bound.** Starvation prevention is now **deterministic among concurrently-pending conflicts** — an aged transaction beats any co-pending fresh rival within `MaxPriority + 1` rounds. It is **not** yet deterministic against *sequential* starvation: a stream of quick transactions that each commit-and-finish inside the window while a large transaction is still re-reading never co-pend with it, so they never meet it in `resolveRace` — the large transaction just keeps being stale-rejected at PEND. Closing that residual needs a cluster-side admission reservation (deferring fresh conflicting pends for an aged high-priority transaction); it is deliberately deferred to backlog `feat-occ-priority-reservation` (a distinct, stateful, Byzantine-sensitive subsystem). Until then, applications should still pair the aged-priority progress guarantee with bounded retry + backoff; the `StaleFailure` diagnostic informs those retry decisions.
 
 ---
 

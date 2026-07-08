@@ -3,7 +3,7 @@ import type { Transaction, ExecutionResult, ITransactionEngine, CollectionAction
 import type { PeerId } from "../network/types.js";
 import type { Collection } from "../collection/collection.js";
 import type { SyncOptions } from "../collection/index.js";
-import { isTransactionExpired } from "./transaction.js";
+import { isTransactionExpired, clampPriority } from "./transaction.js";
 import { Log, blockIdsForTransforms } from "../index.js";
 import { collectOperations, hashOperations } from "./operations-hash.js";
 import { CoordinatorPartialCommitError, CoordinatorStaleLossError } from "./errors.js";
@@ -151,6 +151,15 @@ export class TransactionCoordinator {
 			// wall-clock deadline passed (independent of the attempt cap).
 			if (deadlineMs !== undefined && lastLoss && Date.now() - startedAt >= deadlineMs) {
 				throw lastLoss;
+			}
+
+			// Age the transaction's advisory priority by the number of losses taken so far, so a
+			// repeatedly-losing transaction out-ranks fresh (priority-0) rivals in the cluster's
+			// resolveRace. Fairness-only and capped at MaxPriority; excluded from the tx id / client
+			// signature, so bumping it here does not churn identity. Left untouched on the first
+			// attempt (staleLosses == 0) so the initial pend serializes exactly as before.
+			if (staleLosses > 0) {
+				transaction.priority = clampPriority(staleLosses);
 			}
 
 			try {

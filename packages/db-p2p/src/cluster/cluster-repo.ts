@@ -2,7 +2,7 @@ import type { IRepo, ClusterRecord, ClusterPeers, Signature, RepoMessage, ITrans
 import type { ICluster } from "@optimystic/db-core";
 import type { IPeerNetwork } from "@optimystic/db-core";
 import { blockIdsForTransforms } from "@optimystic/db-core";
-import { computeClusterCommitHash, computeClusterMessageHash, computeClusterPromiseHash, membershipDigest, recordMembershipDigest } from "@optimystic/db-core";
+import { computeClusterCommitHash, computeClusterMessageHash, computeClusterPromiseHash, membershipDigest, recordMembershipDigest, clampPriority } from "@optimystic/db-core";
 import { verifyInvalidationCertificate, type ArbitratorSetRecompute } from "../dispute/invalidation.js";
 import { buildCommitCert, invalidationActionId } from "./commit-cert.js";
 import { ClusterClient } from "./client.js";
@@ -1463,23 +1463,76 @@ export class ClusterMember implements ICluster {
 	}
 
 	/**
-	 * Resolve race between two conflicting transactions.
-	 * Transaction with more promises wins. If tied, higher hash wins.
+	 * Resolve a race between two conflicting transactions. Total and deterministic, so every honest
+	 * member computes the identical winner (the Theorem 1 Case-2 premise). Order:
+	 *   1. higher aged priority wins  (fairness — see {@link recordPriority});
+	 *   2. more promise signatures wins;
+	 *   3. tie → higher message hash wins.
+	 *
+	 * Priority is FIRST (ahead of promise count) so an aged transaction that keeps losing races
+	 * eventually out-ranks fresh (priority-0) rivals even when a fresh rival has briefly gathered an
+	 * equal/greater promise count — turning "2⁻ᵏ but memoryless" starvation into "at most MaxPriority
+	 * losses, then a deterministic win" (docs/correctness.md Theorem 9). It only orders two
+	 * *concurrently-pending* conflicts; it does NOT defer a fresh pend for an absent aged transaction
+	 * (that residual — sequential sub-window starvation — is the deferred feat-occ-priority-reservation).
+	 *
+	 * NOTE: fairness-vs-throughput bound. Aging a transaction up makes more short transactions lose
+	 * THAT block's races while it is pending — but the cost is bounded: it is confined to conflicts on
+	 * the specific block(s) this transaction pends, only for the duration of its pend, and only until
+	 * it commits (≤ MaxPriority extra losses imposed on rivals per aged transaction).
+	 *
+	 * NOTE: Byzantine self-assert is a fairness DoS, not a safety hole. A coordinator can stamp
+	 * priority == MaxPriority on every transaction; recordPriority clamps to the cap so it cannot
+	 * exceed it, and priority never influences validity/operationsHash/stale-read checks — so it can
+	 * only win races it might have ~50% won anyway, degrading to at-worst-status-quo fairness (the same
+	 * graceful-degradation class as spam under honest-majority). Binding priority to provable age is
+	 * out of scope (feat-occ-priority-reservation).
+	 *
+	 * NOTE: keep priority a self-contained additive message field + this one comparison key so it
+	 * composes with — does not block — a future HLC/crdt-sync redesign of this same path
+	 * (design-hot-log-tail-sharding-guidance).
 	 */
 	private resolveRace(existing: ClusterRecord, incoming: ClusterRecord): 'keep-existing' | 'accept-incoming' {
+		// 1. Higher aged priority wins.
+		const existingPriority = this.recordPriority(existing);
+		const incomingPriority = this.recordPriority(incoming);
+		if (existingPriority !== incomingPriority) {
+			return existingPriority > incomingPriority ? 'keep-existing' : 'accept-incoming';
+		}
+
+		// 2. Transaction with more promises wins.
 		const existingCount = Object.keys(existing.promises).length;
 		const incomingCount = Object.keys(incoming.promises).length;
-
-		// Transaction with more promises wins
-		if (existingCount > incomingCount) {
-			return 'keep-existing';
-		}
-		if (incomingCount > existingCount) {
-			return 'accept-incoming';
+		if (existingCount !== incomingCount) {
+			return existingCount > incomingCount ? 'keep-existing' : 'accept-incoming';
 		}
 
-		// Tie-breaker: higher message hash wins (deterministic)
+		// 3. Tie-breaker: higher message hash wins (deterministic).
 		return existing.messageHash > incoming.messageHash ? 'keep-existing' : 'accept-incoming';
+	}
+
+	/**
+	 * Aged advisory priority carried by a record's pend operation, clamped to [0, MaxPriority].
+	 * The multi-collection path carries it on `pend.transaction.priority`; the single-collection
+	 * (`Collection.sync`) path carries it as top-level `pend.priority`; a record with neither — a
+	 * legacy/unversioned coordinator's transaction, or a non-pend operation — is priority 0
+	 * (backward compatible: such transactions simply never age). Both carriers live inside the signed
+	 * `message`, so priority is integrity-protected in transit; clamping here bounds a self-asserted
+	 * out-of-range value to the cap.
+	 *
+	 * NOTE: `message` is fixed for a transaction's whole lifecycle (promises/commits accrue in the
+	 * separate `promises`/`commits` maps, never in `message`), so a transaction keeps its rank through
+	 * the commit phase — there is no "priority drops to 0 at commit" asymmetry. resolveRace is only
+	 * consulted at the promise decision (hasConflict), i.e. between two still-open conflicting
+	 * transactions, which is exactly the concurrent-contention case priority is meant to order.
+	 */
+	private recordPriority(record: ClusterRecord): number {
+		for (const op of record.message.operations) {
+			if ('pend' in op) {
+				return clampPriority(op.pend.transaction?.priority ?? op.pend.priority);
+			}
+		}
+		return 0;
 	}
 
 	private operationsConflict(ops1: RepoMessage['operations'], ops2: RepoMessage['operations']): boolean {

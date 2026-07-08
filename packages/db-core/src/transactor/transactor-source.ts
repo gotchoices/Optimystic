@@ -85,10 +85,13 @@ export class TransactorSource<TBlock extends IBlock> implements BlockSource<TBlo
 	 * is transitioning to a new block.  Ignored if the given headerId is not present in the transforms.
 	 * @param tailId - The Id of the collection's log tail block.  If specified, this block's transform is performed next
 	 * (prior to the rest of the block operations), to resolve the "winner" of a race to commit to the collection.
+	 * @param priority - Aged, advisory retry priority (default 0). Rides on the pend so a repeatedly-losing
+	 * single-collection sync out-ranks fresh rivals in a concurrent race (`resolveRace`); fairness-only, never
+	 * affects validity. Omitted from the pend when 0 so the common first-attempt pend serializes exactly as before.
 	 * @returns A promise that resolves to undefined if the action is successful, or a StaleFailure if the action is stale.
 	 */
-	async transact(transform: Transforms, actionId: ActionId, rev: number, headerId: BlockId, tailId: BlockId): Promise<undefined | StaleFailure> {
-		const pendResult = await this.transactor.pend({ transforms: transform, actionId, rev, policy: 'r' });
+	async transact(transform: Transforms, actionId: ActionId, rev: number, headerId: BlockId, tailId: BlockId, priority = 0): Promise<undefined | StaleFailure> {
+		const pendResult = await this.transactor.pend({ transforms: transform, actionId, rev, policy: 'r', ...(priority > 0 ? { priority } : {}) });
 		if (!pendResult.success) {
 			return pendResult;
 		}

@@ -83,6 +83,26 @@ export type Transaction = {
 	 * can re-run at recovery time.
 	 */
 	signature?: string;
+
+	/**
+	 * Aged, advisory retry priority (default 0 when absent). Rises by one per failed retry
+	 * attempt (attempt-count-derived — deterministic, no wall clock, clock-skew-free) and is
+	 * capped at {@link MaxPriority}. A cluster member uses it ONLY as the first tiebreak in a
+	 * concurrent race between two simultaneously-pending conflicting transactions
+	 * (`resolveRace`), so a transaction that keeps losing races eventually out-ranks fresh
+	 * (priority-0) rivals instead of losing at random forever.
+	 *
+	 * FAIRNESS-ONLY — MUST NOT influence validity, the operations hash, stale-read checks, the
+	 * transaction id, or the client signature. It is deliberately excluded from
+	 * {@link createTransactionId} and {@link clientSignaturePayload} so two attempts of the same
+	 * logical transaction (differing only in priority) keep the same id and signature; folding it
+	 * into either would churn identity/anti-replay on every retry. It rides inside the signed
+	 * cluster `message` (via the pend operation), so it is integrity-protected in transit — a
+	 * relaying peer cannot strip or inflate it without invalidating the message hash — but the
+	 * originating coordinator can still self-assert it (a fairness concern, not a safety one; see
+	 * `docs/correctness.md` Theorem 9).
+	 */
+	priority?: number;
 };
 
 /**
@@ -103,6 +123,34 @@ export type TransactionRef = string; // The transaction ID
 
 /** Default transaction time-to-live in milliseconds (30 seconds). */
 export const DEFAULT_TRANSACTION_TTL_MS = 30_000;
+
+/**
+ * Upper bound on a transaction's aged {@link Transaction.priority}. Capping is essential: it
+ * bounds the fairness effect (an aged transaction cannot accrue unlimited advantage) and bounds
+ * the throughput cost (it can impose at most `MaxPriority` extra race-losses on rivals before it
+ * commits). Two transactions capped out at `MaxPriority` fall back to the existing promise-count /
+ * message-hash tiebreak, so behavior degrades gracefully to the pre-priority status quo.
+ */
+export const MaxPriority = 8;
+
+/**
+ * Clamp an attempt-derived priority into `[0, MaxPriority]`. Total: any non-finite / negative
+ * input collapses to 0, anything above the cap to {@link MaxPriority}, and the result is floored
+ * to an integer. Used both where priority is *set* (the retry loops) and where it is *read* (a
+ * cluster member's `resolveRace`), so a Byzantine coordinator self-asserting an out-of-range value
+ * cannot exceed the cap.
+ */
+export function clampPriority(priority: number | undefined): number {
+	if (typeof priority !== 'number' || Number.isNaN(priority) || priority <= 0) {
+		return 0;
+	}
+	// A positive out-of-range value (including +Infinity, or a Byzantine self-asserted number) clamps
+	// DOWN to the cap; anything strictly inside the range is floored to an integer.
+	if (priority >= MaxPriority) {
+		return MaxPriority;
+	}
+	return Math.floor(priority);
+}
 
 /** Check whether a transaction stamp has expired. */
 export function isTransactionExpired(stamp: TransactionStamp): boolean {
@@ -157,6 +205,10 @@ export async function createTransactionStamp(
  * intentional for this ticket — the signature payload is self-contained — but the
  * non-canonical ordering here is a separate hygiene concern (see
  * design-consensus-hygiene-notes), NOT fixed here to avoid changing existing tx ids.
+ *
+ * NOTE: {@link Transaction.priority} is deliberately absent from this preimage — the id is a pure
+ * function of `(stampId, statements, reads)`, so two retry attempts that differ only in aged
+ * priority produce the SAME id. Do not add priority here.
  */
 export async function createTransactionId(
 	stampId: string,
@@ -183,6 +235,10 @@ export const CLIENT_SIG_VERSION = 'txsig:v1';
  * binding" for anti-replay). Both signer and verifier derive the bytes from
  * `transaction.stamp.id` + `transaction.statements` + `transaction.reads` through this
  * one function, so they reproduce identical bytes regardless of read ordering.
+ *
+ * NOTE: {@link Transaction.priority} is deliberately absent from the signed bytes — a retry that
+ * only bumps priority keeps the same signature, so anti-replay / OCC binding never churns. Do not
+ * add priority here.
  */
 export function clientSignaturePayload(
 	stampId: string,

@@ -8,6 +8,8 @@ import {
 	createTransactionId,
 	clientSignaturePayload,
 	CLIENT_SIG_VERSION,
+	MaxPriority,
+	clampPriority,
 	DEFAULT_TRANSACTION_TTL_MS,
 	isTransactionExpired,
 	hashString,
@@ -156,6 +158,54 @@ describe('Transaction', () => {
 			};
 
 			expect(transaction1.id).to.not.equal(transaction2.id);
+		});
+	});
+
+	describe('Aged priority (advisory / fairness-only)', () => {
+		it('clampPriority bounds attempt counts into [0, MaxPriority] and floors them', () => {
+			expect(clampPriority(undefined)).to.equal(0);
+			expect(clampPriority(0)).to.equal(0);
+			expect(clampPriority(-3)).to.equal(0);
+			expect(clampPriority(Number.NaN)).to.equal(0);
+			expect(clampPriority(Infinity)).to.equal(MaxPriority);
+			expect(clampPriority(3)).to.equal(3);
+			expect(clampPriority(2.9)).to.equal(2);
+			expect(clampPriority(MaxPriority)).to.equal(MaxPriority);
+			expect(clampPriority(MaxPriority + 100)).to.equal(MaxPriority);
+		});
+
+		it('transaction id is identical for two attempts that differ only in priority', async () => {
+			const collections: CollectionActions[] = [
+				{ collectionId: 'users', actions: [{ type: 'insert', data: { id: 1, name: 'Alice' } }] }
+			];
+			const statements = createActionsStatements(collections);
+			const stamp = await createTransactionStamp('peer1', Date.now(), 'schema-hash-123', 'actions@1.0.0');
+			const reads = [{ blockId: 'block1', revision: 1 }];
+			const id = await createTransactionId(stamp.id, statements, reads);
+
+			// The id is a pure function of (stampId, statements, reads); priority is deliberately excluded.
+			const fresh: Transaction = { stamp, statements, reads, id, priority: 0 };
+			const aged: Transaction = { stamp, statements, reads, id, priority: MaxPriority };
+
+			// Recomputing the id from the same inputs is stable regardless of the priority field's value.
+			expect(await createTransactionId(fresh.stamp.id, fresh.statements, fresh.reads))
+				.to.equal(await createTransactionId(aged.stamp.id, aged.statements, aged.reads));
+			expect(fresh.id).to.equal(aged.id);
+		});
+
+		it('client signature payload is identical for two attempts that differ only in priority', async () => {
+			const statements = createActionsStatements([
+				{ collectionId: 'users', actions: [{ type: 'insert', data: { id: 1, name: 'Alice' } }] }
+			]);
+			const stamp = await createTransactionStamp('peer1', Date.now(), 'schema-hash-123', 'actions@1.0.0');
+			const reads = [{ blockId: 'block1', revision: 1 }];
+
+			// Both attempts sign the SAME bytes — priority is absent from the payload, so a retry that only
+			// bumps priority keeps the same signature (anti-replay / OCC binding never churns).
+			const payloadFresh = clientSignaturePayload(stamp.id, statements, reads);
+			const payloadAged = clientSignaturePayload(stamp.id, statements, reads);
+			expect(new TextDecoder().decode(payloadFresh)).to.equal(new TextDecoder().decode(payloadAged));
+			expect(new TextDecoder().decode(payloadFresh).startsWith(CLIENT_SIG_VERSION)).to.be.true;
 		});
 	});
 
@@ -1316,6 +1366,40 @@ describe('Transaction', () => {
 			const result = await validator.validate(transaction, 'ops:abc');
 			expect(result.valid).to.be.false;
 			expect(result.reason).to.include('Schema mismatch');
+		});
+
+		it('does not let a maximal priority buy a stale transaction a valid result', async () => {
+			// Priority is fairness-only: it MUST NOT rescue a stale read at PEND validation. The
+			// validator never consults transaction.priority; a maximally-aged transaction whose read
+			// set is stale is still rejected exactly as a priority-0 one would be.
+			const actionsEngine = new ActionsEngine();
+			const engines = new Map<string, EngineRegistration>();
+			engines.set('actions@1.0.0', {
+				engine: actionsEngine,
+				getSchemaHash: async () => 'schema-hash-123'
+			});
+			const createValidationCoordinator: ValidationCoordinatorFactory = () => ({
+				applyActions: async () => {},
+				getTransforms: () => new Map(),
+				dispose: () => {}
+			});
+			// The block advanced to rev 5 since the transaction read it at rev 1 — a stale read.
+			const blockStateProvider: BlockStateProvider = async () => ({ latest: { actionId: 'a5' as ActionId, rev: 5 } });
+			const validator = new TransactionValidator(engines, createValidationCoordinator, blockStateProvider);
+
+			const stamp = await createTransactionStamp('reference-peer', Date.now(), 'schema-hash-123', 'actions@1.0.0');
+			const reads: ReadDependency[] = [{ blockId: 'block-hot' as BlockId, revision: 1 }];
+			const staleButAged: Transaction = {
+				stamp,
+				statements: [],
+				reads,
+				id: await createTransactionId(stamp.id, [], reads),
+				priority: MaxPriority
+			};
+
+			const result = await validator.validate(staleButAged, 'ops:whatever');
+			expect(result.valid).to.be.false;
+			expect(result.reason).to.include('Stale read');
 		});
 
 		it('should stamp session transactions with the engine id so the validator resolves them', async () => {
