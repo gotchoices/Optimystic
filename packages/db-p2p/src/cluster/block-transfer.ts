@@ -165,6 +165,12 @@ export class BlockTransferCoordinator {
 		owners: Map<string, string[]>,
 		floor: number
 	): Promise<{ confirmed: string[]; unconfirmed: string[] }> {
+		// NOTE: unlike pushBlocks, this deliberately does NOT honor `enablePush` — confirmation
+		// fundamentally requires pushing to verify replication, and skipping it would leave every
+		// block unconfirmed → never released → the node never sheds. So `enablePush:false` no longer
+		// suppresses pushes on the rebalance/handoff release path (it only gates the legacy pushBlocks
+		// fire-and-forget). If a config ever needs "never move data at all", gate the release wiring,
+		// not this primitive.
 		if (this.partitionDetector.detectPartition()) {
 			log('confirm:partition-detected, leaving %d blocks unconfirmed', blockIds.length);
 			return { confirmed: [], unconfirmed: [...blockIds] };

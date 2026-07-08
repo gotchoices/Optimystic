@@ -253,5 +253,3 @@ coordinator rather than inline in `libp2p-node-base.ts`:
 - `packages/db-p2p/src/libp2p-node-base.ts` — wires the coordinator (driven off the damped
   `shouldTransition` trigger), the gated rebalance release, and the `gcEligibleBlocks` set the future
   storage sweep must consult before reclaiming any released range.
-</content>
-</invoke>

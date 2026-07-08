@@ -264,6 +264,30 @@ describe('RingShiftCoordinator — advertise→confirm→release handoff', () =>
 			expect(released).to.deep.equal([]);
 			expect(adapter.getMyArachnodeInfo()!.ringDepth).to.equal(0);
 		});
+
+		it('rolls back to a CLEAN active ring-0 advertisement when the node had no prior info', async () => {
+			// A node with no advertised info triggers a move-out (shouldTransition tolerates this) and
+			// Phase B fails. Rollback must restore active ring-0 (whole keyspace) — NOT leave the aborted
+			// narrower target ring/partition + moveFrom advertised as active, which would drop coverage of
+			// the shed range with nothing confirmed (the floor violation this handoff prevents).
+			adapter.setSelf(undefined);
+			adapter.setPeer(peerA, active(1, { prefixBits: 1, prefixValue: shedBit0 }));
+			adapter.setPeer(peerB, active(1, { prefixBits: 1, prefixValue: shedBit0 }));
+			fret.setCohort([selfId, peerA, peerB]);
+			confirmer.behavior = 'fail';
+
+			const outcome = await makeCoordinator(new Set([shedBlock])).executeShift({ direction: 'out', newRingDepth: 1 });
+
+			expect(outcome.status).to.equal('rolled-back');
+			expect(released, 'nothing released').to.deep.equal([]);
+			const info = adapter.getMyArachnodeInfo()!;
+			expect(info.status, 'restored to active').to.equal('active');
+			expect(info.ringDepth, 'restored to the old (ring-0) range, not the aborted target').to.equal(0);
+			expect(info.partition, 'ring-0 whole keyspace — no narrower target partition left advertised').to.equal(undefined);
+			expect(info.moveFrom, 'no stray moveFrom on an active advertisement').to.equal(undefined);
+			// The mover still physically holds the shed block, and now advertises it covers it (ring 0).
+			expect(isServingHolder(info, shedCoord), 'still a serving holder of the shed key after rollback').to.equal(true);
+		});
 	});
 
 	describe('move-in (advertise only, sheds nothing)', () => {

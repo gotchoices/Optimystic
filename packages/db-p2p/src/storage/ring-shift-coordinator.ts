@@ -248,6 +248,16 @@ export class RingShiftCoordinator {
 	private rollback(oldInfo: ArachnodeInfo | undefined): void {
 		if (oldInfo) {
 			this.deps.fretAdapter.setArachnodeInfo(this.clearMove({ ...oldInfo, status: 'active' }));
+			return;
+		}
+		// No prior advertisement: the node's "old range" is the whole keyspace (ring 0). Phase A has
+		// already replaced self with the `moving` target, so a bare `setStatus('active')` would leave
+		// the aborted NARROWER target ring/partition (and a stray `moveFrom`) advertised as active —
+		// dropping coverage of the shed range with nothing confirmed elsewhere, the exact floor
+		// violation this handoff exists to prevent. Restore a CLEAN active ring-0 advertisement instead.
+		const cur = this.deps.fretAdapter.getMyArachnodeInfo();
+		if (cur) {
+			this.deps.fretAdapter.setArachnodeInfo(this.clearMove({ ...cur, ringDepth: 0, partition: undefined, status: 'active' }));
 		} else {
 			this.deps.fretAdapter.setStatus('active');
 		}
