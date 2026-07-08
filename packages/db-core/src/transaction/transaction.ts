@@ -76,6 +76,11 @@ export type Transaction = {
 	 * unsigned transactions are still accepted (migration / single-node-dev posture).
 	 * Plain field on the transaction, so it rides along through serialization/persistence
 	 * for later recovery-time re-verification.
+	 *
+	 * NOTE: preservation is verified only through JSON round-trip and an in-memory session commit —
+	 * NOT yet through the db-p2p cluster-repo on-disk transaction-log serialization. No recovery
+	 * reader exists today; when one lands, confirm this field survives that path so `verifyPeerSig`
+	 * can re-run at recovery time.
 	 */
 	signature?: string;
 };

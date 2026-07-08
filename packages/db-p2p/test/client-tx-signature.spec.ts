@@ -122,6 +122,23 @@ describe('Client transaction signatures — real Ed25519 keys (p2p backing)', ()
 		expect(result.reason).to.equal('Invalid client signature');
 	});
 
+	it('rejects a tampered statement: signature is valid for A but statements are mutated after signing', async () => {
+		// Distinct from impersonation (wrong key): here the key/peer-id match, but a relayer alters the
+		// signed CONTENT. The payload binds `statements`, so the original signature no longer verifies.
+		const tx = await buildSignedTx(peerA, keyA, {
+			statements: createActionsStatements([
+				{ collectionId: 'users', actions: [{ type: 'replace', data: [[1, { key: 1, name: 'Alice' }]] }] },
+			]),
+		});
+		// Tamper AFTER signing, keeping the same (now-stale) signature.
+		tx.statements = createActionsStatements([
+			{ collectionId: 'users', actions: [{ type: 'replace', data: [[1, { key: 1, name: 'Mallory' }]] }] },
+		]);
+		const result = await makeValidator(verifier).validate(tx, await emptyOpsHash());
+		expect(result.valid).to.be.false;
+		expect(result.reason).to.equal('Invalid client signature');
+	});
+
 	it('rejects a malformed (non-Ed25519 peer-id) stamp with enforcement on, without throwing', async () => {
 		// Sign with a real key but stamp a peer-id string that is not a valid libp2p identity.
 		// peerIdFromString throws inside verifyPeerSig; the closure catches → false → clean reject.
