@@ -59,16 +59,20 @@ layer parallelises naturally.
 ## Persistence semantics
 
 The package opens a single IndexedDB database (`optimystic` by default) with
-six object stores:
+six object stores. `IndexedDBRawStorage` is a thin shell over the shared
+`KvRawStorage` kernel driven by an `IndexedDBStoreDriver`: the kernel owns all
+JSON/UTF-8 serialization, so the five block-storage stores now hold opaque
+kernel-encoded `Uint8Array` bytes rather than live objects. The keys and the
+logical types the kernel decodes them back into are unchanged:
 
-| Store          | Key                  | Value                  |
-|----------------|----------------------|------------------------|
-| `metadata`     | `blockId`            | `BlockMetadata`        |
-| `revisions`    | `[blockId, rev]`     | `ActionId`             |
-| `pending`      | `[blockId, actionId]`| `Transform`            |
-| `transactions` | `[blockId, actionId]`| `Transform`            |
-| `materialized` | `[blockId, actionId]`| `IBlock`               |
-| `kv`           | `key`                | `string` or `Uint8Array` |
+| Store          | Key                  | Stored value | Decoded (logical) type |
+|----------------|----------------------|--------------|------------------------|
+| `metadata`     | `blockId`            | `Uint8Array` | `BlockMetadata`        |
+| `revisions`    | `[blockId, rev]`     | `Uint8Array` | `ActionId`             |
+| `pending`      | `[blockId, actionId]`| `Uint8Array` | `Transform`            |
+| `transactions` | `[blockId, actionId]`| `Uint8Array` | `Transform`            |
+| `materialized` | `[blockId, actionId]`| `Uint8Array` | `IBlock`               |
+| `kv`           | `key`                | `string` or `Uint8Array` | — (not kernel-backed) |
 
 `listRevisions` and `listPendingTransactions` use real IndexedDB range cursors
 — never `getAllKeys()` + JS filter — so list latency stays bounded as the store
