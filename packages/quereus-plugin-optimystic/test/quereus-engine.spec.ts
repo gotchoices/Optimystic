@@ -3,10 +3,29 @@
  */
 
 import { expect } from 'chai';
-import { createRequire } from 'module';
+import { readFileSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
+import { dirname, join } from 'node:path';
 import { Database } from '@quereus/quereus';
 
-const _require = createRequire(import.meta.url);
+// Independently resolve the installed @quereus/quereus version WITHOUT reading
+// its blocked './package.json' subpath. Reading that via require throws
+// ERR_PACKAGE_PATH_NOT_EXPORTED — even under the ts-node/esm loader, because
+// createRequire still enforces "exports" encapsulation. Mirror the module's
+// supported path: resolve the ESM entry, then walk up to the package's own
+// package.json (see quereus-engine.ts resolveQuereusVersion).
+function installedQuereusVersion(): string {
+	let dir = dirname(fileURLToPath(import.meta.resolve('@quereus/quereus')));
+	for (let i = 0; i < 6; i++) {
+		try {
+			const pkg = JSON.parse(readFileSync(join(dir, 'package.json'), 'utf8')) as { name?: string; version?: string };
+			if (pkg.name === '@quereus/quereus' && pkg.version) return pkg.version;
+		} catch { /* keep walking up */ }
+		dir = dirname(dir);
+	}
+	throw new Error('Could not resolve @quereus/quereus version');
+}
+
 import {
 	QuereusEngine,
 	QUEREUS_ENGINE_ID,
@@ -50,7 +69,7 @@ describe('QuereusEngine', () => {
 		});
 
 		it('should match the installed @quereus/quereus version', () => {
-			const { version } = _require('@quereus/quereus/package.json') as { version: string };
+			const version = installedQuereusVersion();
 			expect(QUEREUS_ENGINE_ID).to.equal(`quereus@${version}`);
 		});
 	});

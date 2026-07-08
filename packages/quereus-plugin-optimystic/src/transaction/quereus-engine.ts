@@ -7,12 +7,39 @@ import type {
 	TransactionCoordinator
 } from '@optimystic/db-core';
 import { sha256 } from '@noble/hashes/sha2.js';
-import { createRequire } from 'module';
+import { readFileSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
+import { dirname, join } from 'node:path';
 
-const _require = createRequire(import.meta.url);
-const { version: _quereusVersion } = _require('@quereus/quereus/package.json') as { version: string };
+/**
+ * Resolve the installed @quereus/quereus version at runtime.
+ *
+ * We must NOT read '@quereus/quereus/package.json' directly: the package's
+ * "exports" map defines no './package.json' subpath, so reading it throws
+ * ERR_PACKAGE_PATH_NOT_EXPORTED under plain Node ESM — which used to take down
+ * this whole module at load. It also defines only the "import" condition (no
+ * "require"), so CJS createRequire cannot resolve it at all.
+ *
+ * Instead resolve the package entry via ESM (import.meta.resolve honors the
+ * "import" condition, sync + stable since Node 20.6), then walk up from the
+ * resolved file to find the package's own package.json. Guard on pkg.name so a
+ * stray inner package.json (e.g. a dist/ marker) can't yield the wrong version.
+ */
+function resolveQuereusVersion(): string {
+	const entryUrl = import.meta.resolve('@quereus/quereus');
+	let dir = dirname(fileURLToPath(entryUrl));
+	for (let i = 0; i < 6; i++) {
+		try {
+			const pkg = JSON.parse(readFileSync(join(dir, 'package.json'), 'utf8')) as { name?: string; version?: string };
+			if (pkg.name === '@quereus/quereus' && pkg.version) return pkg.version;
+		} catch { /* keep walking up */ }
+		dir = dirname(dir);
+	}
+	throw new Error('Could not resolve @quereus/quereus version');
+}
+
 // Engine ID derived from the installed @quereus/quereus version at runtime.
-export const QUEREUS_ENGINE_ID = `quereus@${_quereusVersion}`;
+export const QUEREUS_ENGINE_ID = `quereus@${resolveQuereusVersion()}`;
 
 /**
  * Statement format for Quereus transactions.
