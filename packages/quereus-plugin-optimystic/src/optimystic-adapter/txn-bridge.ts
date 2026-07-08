@@ -309,6 +309,11 @@ export class TransactionBridge {
         // getCollectionRegistry), the staged transforms are exactly what
         // consensus pends/commits — so we deliberately do NOT tree.sync() here;
         // flushing would reset the trackers out from under consensus.
+        // NOTE: session.commit() with no options inherits the coordinator's default
+        // bounded backoff+jitter retry of a clean stale loss (~10 attempts, up to a
+        // few seconds under sustained contention) before surfacing an error. That is
+        // the intended safe default; if the SQL layer ever needs faster failure here,
+        // thread a SyncOptions ({ maxAttempts, deadlineMs, signal }) through commit().
         const result = await this.session.commit();
         if (!result.success) {
           throw new Error(result.error || 'Transaction commit failed');

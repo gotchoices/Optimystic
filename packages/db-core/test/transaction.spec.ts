@@ -4013,6 +4013,41 @@ describe('Transaction', () => {
 			}
 		}
 
+		/** Fails the PEND phase for two collections at once: one as a retryable optimistic-concurrency
+		 * CONFLICT (a StaleFailure carrying `pending`), the other as a HARD rejection (a bare `reason`).
+		 * Lets a test prove that a MIXED pend failure is classified fail-fast (a hard failure poisons
+		 * the whole attempt), independent of which collection the fan-out settled first. */
+		class MixedPendTransactor implements ITransactor {
+			readonly pendCalls = new Map<string, number>();
+			commitCalls = 0;
+			constructor(
+				private readonly inner: TestTransactor,
+				private readonly conflictCollectionId: string,
+				private readonly hardCollectionId: string,
+			) {}
+			get(b: BlockGets): Promise<GetBlockResults> { return this.inner.get(b); }
+			getStatus(a: ActionBlocks[]): Promise<BlockActionStatus[]> { return this.inner.getStatus(a); }
+			cancel(a: ActionBlocks): Promise<void> { return this.inner.cancel(a); }
+			async pend(request: PendRequest): Promise<PendResult> {
+				const firstInsert = Object.values(request.transforms.inserts ?? {})[0] as IBlock | undefined;
+				const cid = firstInsert?.header.collectionId ?? '';
+				this.pendCalls.set(cid, (this.pendCalls.get(cid) ?? 0) + 1);
+				if (cid === this.conflictCollectionId) {
+					// A pending action on a touched block ⇒ retryable conflict.
+					return { success: false, pending: [{} as any], reason: 'pending contention' };
+				}
+				if (cid === this.hardCollectionId) {
+					// A bare reason (no missing/pending) ⇒ hard rejection, not retryable.
+					return { success: false, reason: 'storage full' };
+				}
+				return this.inner.pend(request);
+			}
+			async commit(request: CommitRequest): Promise<CommitResult> {
+				this.commitCalls++;
+				return this.inner.commit(request);
+			}
+		}
+
 		async function makeMultiCollection(transactor: ITransactor) {
 			const usersTree = await Tree.createOrOpen<number, UserEntry>(transactor, 'users', e => e.key);
 			const postsTree = await Tree.createOrOpen<number, PostEntry>(transactor, 'posts', e => e.key);
@@ -4072,6 +4107,31 @@ describe('Transaction', () => {
 			expect(inner.getCommittedActions().size, "only the winner's half landed").to.equal(1);
 			// Proof of no-retry: exactly one commit call per collection (2), NOT 2 + retry rounds.
 			expect(transactor.commitCalls, 'partial landing was not re-driven').to.equal(2);
+		});
+
+		it('a MIXED pend failure (one conflict + one hard) fails fast, not as a retryable stale loss', async () => {
+			const inner = new TestTransactor();
+			// 'users' loses as a retryable conflict; 'posts' hard-rejects. A hard failure anywhere in the
+			// pend must poison the whole attempt so it is NOT re-driven (regardless of settle order).
+			const transactor = new MixedPendTransactor(inner, 'users', 'posts');
+			const { coordinator, transaction } = await makeMultiCollection(transactor);
+
+			let err: unknown;
+			try {
+				// Default options → retry is ON for a clean stale loss; a mixed/hard pend must bypass it.
+				await coordinator.commit(transaction, { maxAttempts: 5, baseBackoffMs: 1, maxBackoffMs: 5 });
+			} catch (e) {
+				err = e;
+			}
+
+			expect(err, 'a hard pend failure is not a retryable stale loss').to.be.instanceOf(Error);
+			expect(err, 'must not be treated as a clean stale loss').to.not.be.instanceOf(CoordinatorStaleLossError);
+			// Fail-fast: each collection pended exactly once — no backoff+retry rounds.
+			expect(transactor.pendCalls.get('users'), 'no retry round for the conflicting collection').to.equal(1);
+			expect(transactor.pendCalls.get('posts'), 'no retry round for the hard-rejecting collection').to.equal(1);
+			// Never reached COMMIT, nothing durable.
+			expect(transactor.commitCalls, 'pend failed before any commit').to.equal(0);
+			expect(inner.getCommittedActions().size, 'nothing durably committed').to.equal(0);
 		});
 
 		it('an always-losing transaction exhausts maxAttempts and surfaces a terminal error (no infinite loop)', async () => {

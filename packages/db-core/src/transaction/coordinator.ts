@@ -855,15 +855,22 @@ export class TransactionCoordinator {
 		// ids), plus the first failure reason if any collection failed.
 		const pendedBlockIds = new Map<CollectionId, BlockId[]>();
 		let failure: string | undefined;
-		// Classify the first failure: a conflicting pend (PendRejectedError.conflict) is a clean
-		// stale loss the caller may retry; anything else (hard rejection, thrown/unavailable) is not.
-		let failureConflict = false;
+		// Classify across ALL failures (mirroring commitPhase, and independent of iteration order):
+		// the pend is a retryable clean stale loss only if at least one failure was a conflicting pend
+		// (PendRejectedError.conflict) AND none was a hard failure. A single hard failure (storage/
+		// policy rejection, or a thrown/unavailable transactor) will not clear on a re-read, so
+		// re-driving it would just burn the retry budget — fail fast instead.
+		let anyConflict = false;
+		let anyHard = false;
 		for (const outcome of outcomes) {
 			if (outcome.status === 'fulfilled') {
 				pendedBlockIds.set(outcome.value.collectionId, outcome.value.blockIds);
-			} else if (failure === undefined) {
-				failure = outcome.reason instanceof Error ? outcome.reason.message : String(outcome.reason);
-				failureConflict = outcome.reason instanceof PendRejectedError && outcome.reason.conflict;
+			} else {
+				if (failure === undefined) {
+					failure = outcome.reason instanceof Error ? outcome.reason.message : String(outcome.reason);
+				}
+				if (outcome.reason instanceof PendRejectedError && outcome.reason.conflict) anyConflict = true;
+				else anyHard = true;
 			}
 		}
 
@@ -873,7 +880,7 @@ export class TransactionCoordinator {
 			// only those started before the failure. Cancels are best-effort (cancelPhase
 			// swallows their errors) so they cannot mask the original pend failure.
 			await this.cancelPhase(actionId, pendedBlockIds);
-			return { success: false, error: failure, staleLoss: failureConflict };
+			return { success: false, error: failure, staleLoss: anyConflict && !anyHard };
 		}
 
 		return { success: true, pendedBlockIds };

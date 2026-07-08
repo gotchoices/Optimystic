@@ -72,9 +72,28 @@ This document describes the architecture for multi-collection transactions in Op
 > `PartialCommitError`: on a `CoordinatorPartialCommitError` it tears down
 > transaction state **without** calling `rollbackTransaction()` (a clean restore
 > would cement the divergence) and propagates the error so the caller can
-> reconcile. A genuinely clean session-mode failure (PEND failed, or the whole
-> commit failed with nothing durable) still rolls back cleanly and throws a plain
-> error, leaving every tracker pristine for retry.
+> reconcile. A genuinely clean session-mode failure with nothing durable always
+> rolls back cleanly, leaving every tracker pristine for retry — but how it
+> surfaces now depends on *why* it lost:
+>
+> - A **clean stale loss** (a retryable optimistic-concurrency conflict — a
+>   committed/pending action collided, nothing durable) is now re-driven
+>   **automatically** by `coordinator.commit()`: a bounded, jittered backoff retry
+>   that re-reads each collection to fresh revisions between attempts (the same
+>   default policy as `Collection.sync` — see
+>   [`utility/backoff.ts`](../packages/db-core/src/utility/backoff.ts)). Only once
+>   the retry budget (`maxAttempts` / optional `deadlineMs`, tunable via the
+>   `SyncOptions` passed to `commit`/`session.commit`) is exhausted does it throw a
+>   [`CoordinatorStaleLossError`](../packages/db-core/src/transaction/errors.ts),
+>   which names the `failedCollections` from the losing attempt. Defaults are safe
+>   out of the box, so a caller that passes no options gets bounded retry rather
+>   than an immediate failure.
+> - A **hard** clean failure (PEND rejected for storage/policy reasons, an expired
+>   transaction, an unavailable transactor) is **not** retried — it still throws a
+>   plain error immediately, preserving the historical fail-fast behaviour.
+>
+> `coordinator.execute()` is intentionally **not** retry-wrapped; it still reports
+> the committed/failed partition on its `ExecutionResult` rather than throwing.
 >
 > **Resolved — honest downgrade, not real cross-collection 2PC.** The design decision
 > (previously "still open") is settled: the default multi-collection guarantee is
