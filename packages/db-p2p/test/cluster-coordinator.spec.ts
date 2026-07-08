@@ -1,5 +1,6 @@
 import { expect } from 'chai';
 import { ClusterCoordinator, type TimerCancel } from '../src/repo/cluster-coordinator.js';
+import type { ITransactionStateStore, PersistedCoordinatorState, PersistedParticipantState } from '../src/cluster/i-transaction-state-store.js';
 import type { ClusterRecord, ClusterPeers, IKeyNetwork, RepoMessage, ClusterConsensusConfig, BlockId, Signature } from '@optimystic/db-core';
 import type { PeerId } from '@libp2p/interface';
 import { peerIdFromPrivateKey } from '@libp2p/peer-id';
@@ -489,5 +490,99 @@ describe('ClusterCoordinator undersized-cluster gate (validateSmallCluster)', fu
 		const { coordinator } = await setupSinglePeer({ ...baseCfg, allowUnvalidatedSmallCluster: true }, clock);
 		const result = await coordinator.executeClusterTransaction('block-1' as BlockId, makeMessage(clock));
 		expect(Object.keys(result.record.commits)).to.have.length(1);
+	});
+});
+
+/**
+ * A minimal in-memory {@link ITransactionStateStore} — only the coordinator-state map is exercised by
+ * `recoverTransactions`; participant/executed methods are inert stubs to satisfy the interface.
+ */
+class InMemoryStateStore implements ITransactionStateStore {
+	readonly coordinator = new Map<string, PersistedCoordinatorState>();
+	async saveCoordinatorState(messageHash: string, state: PersistedCoordinatorState): Promise<void> { this.coordinator.set(messageHash, state); }
+	async getCoordinatorState(messageHash: string): Promise<PersistedCoordinatorState | undefined> { return this.coordinator.get(messageHash); }
+	async deleteCoordinatorState(messageHash: string): Promise<void> { this.coordinator.delete(messageHash); }
+	async getAllCoordinatorStates(): Promise<PersistedCoordinatorState[]> { return Array.from(this.coordinator.values()); }
+	async saveParticipantState(_h: string, _s: PersistedParticipantState): Promise<void> { }
+	async getParticipantState(_h: string): Promise<PersistedParticipantState | undefined> { return undefined; }
+	async deleteParticipantState(_h: string): Promise<void> { }
+	async getAllParticipantStates(): Promise<PersistedParticipantState[]> { return []; }
+	async markExecuted(_h: string, _t: number): Promise<void> { }
+	async wasExecuted(_h: string): Promise<boolean> { return false; }
+	async pruneExecuted(_o: number): Promise<void> { }
+}
+
+/**
+ * Recovery reads the clock ONCE — the expiration cutoff `record.message.expiration < now()`. This exercises
+ * the fourth `this.now()` swap (the only one the retry-path specs above never touch): the seam is proven by
+ * choosing an expiration that is LIVE against the fake clock (now = 0) but would read as EXPIRED against a
+ * real wall clock (~1.7e12 ms). If recovery used `Date.now()` instead of the injected clock, the live state
+ * would be wrongly deleted; asserting it is recovered proves the fake clock drives the decision.
+ */
+describe('ClusterCoordinator recovery clock seam', function () {
+	const cfg: ClusterConsensusConfig & { clusterSize: number } = {
+		clusterSize: 3,
+		superMajorityThreshold: 0.75,
+		simpleMajorityThreshold: 0.51,
+		minAbsoluteClusterSize: 2,
+		allowClusterDownsize: true,
+		clusterSizeTolerance: 0.5,
+		partitionDetectionWindow: 60000
+	};
+
+	const makeRecord = (messageHash: string, expiration: number): ClusterRecord => ({
+		messageHash,
+		peers: {},
+		message: { operations: [{ get: { blockIds: ['block-1'] } }], expiration },
+		promises: {},
+		commits: {}
+	});
+
+	it('uses the injected clock for the expiration cutoff and re-arms recovered retries on the injected timer', async () => {
+		const clock = new FakeScheduler(); // now = 0
+
+		const store = new InMemoryStateStore();
+		// Live against the fake clock (0 < 50_000) but EXPIRED against a real wall clock — isolates this.now().
+		store.coordinator.set('live-hash', {
+			messageHash: 'live-hash',
+			record: makeRecord('live-hash', 50_000),
+			lastUpdate: 0,
+			phase: 'broadcasting',
+			retryState: { pendingPeers: ['peer-x'], attempt: 1, intervalMs: 250 }
+		});
+		// Expired against the fake clock (-1 < 0) — the delete branch.
+		store.coordinator.set('expired-hash', {
+			messageHash: 'expired-hash',
+			record: makeRecord('expired-hash', -1),
+			lastUpdate: 0,
+			phase: 'broadcasting',
+			retryState: { pendingPeers: ['peer-y'], attempt: 1, intervalMs: 250 }
+		});
+
+		const mockKeyNetwork: IKeyNetwork = {
+			async findCoordinator() { return await makePeerId(); },
+			async findCluster() { return {}; }
+		};
+		// Recovery only schedules a timer; the retry callback (which would dial) is never fired in this test.
+		const createClient = (_peerId: PeerId) => { throw new Error('retry timer must not fire in this test'); };
+
+		const coordinator = new ClusterCoordinator(
+			mockKeyNetwork,
+			createClient as any,
+			cfg,
+			undefined, // localCluster
+			undefined, // fretService
+			undefined, // reputation
+			store,
+			clockOpts(clock)
+		);
+
+		await coordinator.recoverTransactions();
+
+		const transactions: Map<string, unknown> = (coordinator as any).transactions;
+		expect(transactions.has('live-hash'), 'live state recovered (fake clock, not Date.now)').to.equal(true);
+		expect(transactions.has('expired-hash'), 'expired state not recovered').to.equal(false);
+		expect(await store.getCoordinatorState('expired-hash'), 'expired state deleted from the store').to.equal(undefined);
+		expect(clock.pending, 'the recovered broadcast re-armed its retry on the injected timer seam').to.be.greaterThan(0);
 	});
 });
