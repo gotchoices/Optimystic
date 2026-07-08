@@ -14,6 +14,8 @@ import {
 	isTransactionExpired,
 	hashString,
 	hashOperations,
+	OPS_HASH_PREFIX,
+	OPS_HASH_VERSION,
 	blockIdsForTransforms,
 	TransactionCoordinator,
 	CoordinatorPartialCommitError,
@@ -2867,6 +2869,57 @@ describe('Transaction', () => {
 			const expectedHash = await hashOperations([]);
 			const result = await validator.validate(tx, expectedHash);
 			expect(result.valid).to.be.true;
+		});
+
+		// Step 9 splits a hash disagreement into two distinct causes. Both branches are
+		// exercised through validator.validate() (not just the opsHashVersion unit) so the
+		// wire-facing error strings a peer actually receives are pinned.
+		function makeEmptyValidator(): TransactionValidator {
+			const engines = new Map<string, EngineRegistration>();
+			engines.set('actions@1.0.0', {
+				engine: new ActionsEngine(),
+				getSchemaHash: async () => 'schema1'
+			});
+			return new TransactionValidator(
+				engines,
+				() => ({ applyActions: async () => {}, getTransforms: () => new Map(), dispose: () => {} }),
+				async () => undefined
+			);
+		}
+
+		async function makeEmptyTx(): Promise<Transaction> {
+			const stamp = await createTransactionStamp('peer1', Date.now(), 'schema1', 'actions@1.0.0');
+			return { stamp, statements: [], reads: [], id: await createTransactionId(stamp.id, [], []) };
+		}
+
+		it('reports a plain content mismatch when the sender token is the local version but the bytes differ', async () => {
+			const validator = makeEmptyValidator();
+			const tx = await makeEmptyTx();
+			// Same-version token (ops.v1:), wrong hash → genuine content disagreement.
+			const wrongSameVersion = `${OPS_HASH_PREFIX}deadbeef`;
+			const result = await validator.validate(tx, wrongSameVersion);
+			expect(result.valid).to.be.false;
+			expect(result.reason).to.equal('Operations hash mismatch');
+		});
+
+		it('reports version skew for a foreign version token, not a content mismatch', async () => {
+			const validator = makeEmptyValidator();
+			const tx = await makeEmptyTx();
+			const result = await validator.validate(tx, 'ops.v2:whatever');
+			expect(result.valid).to.be.false;
+			expect(result.reason).to.include('Unsupported operations-hash format version');
+			expect(result.reason).to.include(`local=${OPS_HASH_VERSION}`);
+			expect(result.reason).to.include('sender=v2');
+		});
+
+		it('reports version skew (sender=unrecognized) for a bare legacy ops: token', async () => {
+			const validator = makeEmptyValidator();
+			const tx = await makeEmptyTx();
+			// Pre-versioning format has no `.` delimiter → classified as foreign, never a content match.
+			const result = await validator.validate(tx, 'ops:deadbeef');
+			expect(result.valid).to.be.false;
+			expect(result.reason).to.include('Unsupported operations-hash format version');
+			expect(result.reason).to.include('sender=unrecognized');
 		});
 
 		it('should NOT detect write-skew through separate Tree collections (known limitation)', async () => {
