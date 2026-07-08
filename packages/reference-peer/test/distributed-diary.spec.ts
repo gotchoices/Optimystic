@@ -7,6 +7,7 @@ import {
 	RepoClient
 } from '@optimystic/db-p2p';
 import { Diary, NetworkTransactor } from '@optimystic/db-core';
+import { waitForValue, delay } from '@optimystic/db-core/test';
 
 interface TestNode {
 	node: any;
@@ -15,7 +16,19 @@ interface TestNode {
 	peerId: string;
 }
 
-const delay = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
+/**
+ * Poll `diary`, refreshing it from the network each round, until it holds at least
+ * `count` entries; return them. Bounded so stalled replication fails fast with a
+ * descriptive message instead of a fixed sleep that asserts on stale state.
+ */
+async function waitForEntries(diary: any, count: number, description: string): Promise<any[]> {
+	return waitForValue(async () => {
+		await diary.update();
+		const entries: any[] = [];
+		for await (const entry of diary.select()) entries.push(entry);
+		return entries.length >= count ? entries : undefined;
+	}, { timeoutMs: 30_000, intervalMs: 200, description });
+}
 
 describe('Distributed Diary Operations', () => {
 	const nodes: TestNode[] = [];
@@ -154,41 +167,26 @@ describe('Distributed Diary Operations', () => {
 
 		console.log('Adding entry from Node 1...');
 		await diary1.append(entries[0]!);
-		await delay(1000);
 
-		// Open diary on node 2 and add entry
+		// Open diary on node 2; wait until Node 1's entry has propagated before appending,
+		// so the three entries land in a deterministic (Node 1, 2, 3) order.
 		console.log('Opening diary on Node 2 and adding entry...');
 		const diary2 = await Diary.create(nodes[1]!.transactor, diaryName);
+		await waitForEntries(diary2, 1, "Node 2 should see Node 1's entry before appending");
 		await diary2.append(entries[1]!);
-		await delay(1000);
 
-		// Open diary on node 3 and add entry
+		// Open diary on node 3; wait until both prior entries have propagated before appending.
 		console.log('Opening diary on Node 3 and adding entry...');
 		const diary3 = await Diary.create(nodes[2]!.transactor, diaryName);
+		await waitForEntries(diary3, 2, 'Node 3 should see the first two entries before appending');
 		await diary3.append(entries[2]!);
-		await delay(1500);
 
-		// Re-open diary on node 1 to get fresh state from the network
+		// Re-open diary on node 1 to get fresh state from the network; poll until all 3 land.
 		console.log('Reading all entries from Node 1...');
 		const diary1Fresh = await Diary.create(nodes[0]!.transactor, diaryName);
-		const readEntries: any[] = [];
-		for await (const entry of diary1Fresh.select()) {
-			const typedEntry = entry as any;
-			readEntries.push(typedEntry);
+		const readEntries = await waitForEntries(diary1Fresh, 3, 'Node 1 should read all three distributed entries');
+		for (const typedEntry of readEntries as any[]) {
 			console.log(`   - ${typedEntry.content} (ts: ${typedEntry.timestamp})`);
-		}
-
-		if (readEntries.length !== 3) {
-			console.log(`\n⚠️ Expected 3 entries but got ${readEntries.length}. Reading from all nodes for comparison:`);
-			for (let i = 0; i < nodes.length; i++) {
-				const testNode = nodes[i]!;
-				const nodeDiary = await Diary.create(testNode.transactor, diaryName);
-				const nodeEntries: any[] = [];
-				for await (const entry of nodeDiary.select()) {
-					nodeEntries.push(entry as any);
-				}
-				console.log(`   Node ${i + 1}: ${nodeEntries.length} entries: ${nodeEntries.map((e: any) => `${e.content}(ts:${e.timestamp})`).join(', ')}`);
-			}
 		}
 
 		expect(readEntries).to.have.lengthOf(3);
@@ -208,20 +206,11 @@ describe('Distributed Diary Operations', () => {
 		const diary = await Diary.create(nodes[0]!.transactor, diaryName);
 		await diary.append({ content: 'Test entry', timestamp: new Date().toISOString() });
 
-		// Wait for distribution
-		await delay(3000);
-
-		// Read from all nodes and verify
+		// Read from all nodes and verify — poll each node until the entry replicates.
 		console.log('Verifying entries on all nodes...');
 		for (let i = 0; i < nodes.length; i++) {
-			const testNode = nodes[i]!;
-			const nodeDiary = await Diary.create(testNode.transactor, diaryName);
-
-			const entries: any[] = [];
-			for await (const entry of nodeDiary.select()) {
-				entries.push(entry);
-			}
-
+			const nodeDiary = await Diary.create(nodes[i]!.transactor, diaryName);
+			const entries = await waitForEntries(nodeDiary, 1, `Node ${i + 1} should replicate the entry`);
 			console.log(`   Node ${i + 1}: ${entries.length} entries`);
 			expect(entries).to.have.lengthOf(1);
 			expect(entries[0]!.content).to.equal('Test entry');
@@ -270,21 +259,20 @@ describe('Distributed Diary Operations', () => {
 			}
 		});
 
-		// Wait for convergence
-		await delay(2000);
-
-		// Verify all writes succeeded
+		// Count successful writes, then wait for convergence — poll Node 1 (refreshing
+		// from the network) until every successful write appears in its log. Only
+		// successful appends add entries, so the count converges upward to this bound.
 		console.log('Verifying all writes succeeded...');
-		await diaries[0]!.update();  // Fetch latest state from network
-		const finalEntries: any[] = [];
-		for await (const entry of diaries[0]!.select()) {
-			const typedEntry = entry as any;
-			finalEntries.push(typedEntry);
+		const successfulWrites = results.filter(r => r.status === 'fulfilled').length;
+		const finalEntries = await waitForValue(async () => {
+			await diaries[0]!.update();  // Fetch latest state from network
+			const entries: any[] = [];
+			for await (const entry of diaries[0]!.select()) entries.push(entry);
+			return entries.length >= successfulWrites ? entries : undefined;
+		}, { timeoutMs: 30_000, intervalMs: 200, description: 'Node 1 should converge on all successful concurrent writes' });
+		for (const typedEntry of finalEntries as any[]) {
 			console.log(`   - ${typedEntry.content}`);
 		}
-
-		// Count successful writes
-		const successfulWrites = results.filter(r => r.status === 'fulfilled').length;
 		console.log(`   Total entries: ${finalEntries.length}, Expected: ${successfulWrites} concurrent writes`);
 
 		// At minimum, at least one concurrent write should succeed

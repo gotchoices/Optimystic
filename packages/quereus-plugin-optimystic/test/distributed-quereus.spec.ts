@@ -16,6 +16,7 @@ import {
 	RepoClient
 } from '@optimystic/db-p2p';
 import { NetworkTransactor } from '@optimystic/db-core';
+import { waitForValue, delay } from '@optimystic/db-core/test';
 import register from '../dist/plugin.js';
 
 interface TestNode {
@@ -26,7 +27,27 @@ interface TestNode {
 	peerId: string;
 }
 
-const delay = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
+/** Collect every row `sql` returns from a node's database, finalizing the statement. */
+async function queryAll(db: Database, sql: string): Promise<Record<string, any>[]> {
+	const stmt = await db.prepare(sql);
+	try {
+		const rows: Record<string, any>[] = [];
+		for await (const row of stmt.all()) rows.push(row);
+		return rows;
+	} finally {
+		await stmt.finalize();
+	}
+}
+
+/** Run `sql` and return its single row, or `undefined` when no row matches (not ready yet). */
+async function queryGet(db: Database, sql: string): Promise<Record<string, any> | undefined> {
+	const stmt = await db.prepare(sql);
+	try {
+		return await stmt.get();
+	} finally {
+		await stmt.finalize();
+	}
+}
 
 describe('Distributed Quereus Operations', function () {
 	// 3-node real libp2p mesh + convergence delay + distributed SQL round-trips;
@@ -191,17 +212,16 @@ describe('Distributed Quereus Operations', function () {
 			await delay(1000);
 		}
 
-		await delay(2000); // Wait for all transactions to settle
-
-		// Verify all nodes see all data
+		// Verify all nodes see all data — poll each node until replication lands (bounded).
 		console.log('\nVerifying data on all nodes...');
 		for (let i = 0; i < nodes.length; i++) {
-			const stmt = await nodes[i]!.db.prepare(`SELECT * FROM ${tableName} ORDER BY id`);
-			const results = [];
-			for await (const row of stmt.all()) {
-				results.push(row);
-			}
-			await stmt.finalize();
+			const results = await waitForValue(
+				async () => {
+					const rows = await queryAll(nodes[i]!.db, `SELECT * FROM ${tableName} ORDER BY id`);
+					return rows.length === 3 ? rows : undefined;
+				},
+				{ timeoutMs: 30_000, intervalMs: 200, description: `Node ${i + 1} should replicate 3 rows` },
+			);
 			console.log(`   Node ${i + 1}: ${results.length} rows`);
 
 			expect(results.length, `Node ${i + 1} should have 3 rows`).to.equal(3);
@@ -249,18 +269,20 @@ describe('Distributed Quereus Operations', function () {
 			await delay(1000);
 		}
 
-		await delay(2000);
-
-		// Verify initial data on all nodes
+		// Verify initial data on all nodes — poll until each node replicates the row.
 		console.log('Verifying initial data on all nodes...');
 		for (let i = 0; i < nodes.length; i++) {
 			console.log(`   Querying Node ${i + 1}...`);
-			const result = await nodes[i]!.db.prepare(`SELECT * FROM ${tableName} WHERE sku = 'SKU001'`).get();
+			const result = await waitForValue(
+				async () => {
+					const r = await queryGet(nodes[i]!.db, `SELECT * FROM ${tableName} WHERE sku = 'SKU001'`);
+					return r?.quantity === 100 ? r : undefined;
+				},
+				{ timeoutMs: 30_000, intervalMs: 200, description: `Node ${i + 1} should see initial quantity` },
+			);
 			console.log(`   Node ${i + 1}: quantity = ${result?.quantity}`);
 			expect(result?.quantity, `Node ${i + 1} should see initial quantity`).to.equal(100);
 		}
-
-		await delay(1000); // Extra delay to ensure all replication is complete
 
 		// Update from node 2
 		console.log('\nUpdating quantity from Node 2...');
@@ -271,13 +293,16 @@ describe('Distributed Quereus Operations', function () {
 		const node2Result = await nodes[1]!.db.prepare(`SELECT * FROM ${tableName} WHERE sku = 'SKU001'`).get();
 		console.log(`   Node 2 (source) after UPDATE: quantity = ${node2Result?.quantity}`);
 
-		console.log('Waiting for replication...');
-		await delay(5000); // Increased delay for replication
-
-		// Verify update on all nodes
+		// Verify update on all nodes — poll past the stale quantity=100 until 75 lands.
 		console.log('Verifying update on all nodes...');
 		for (let i = 0; i < nodes.length; i++) {
-			const result = await nodes[i]!.db.prepare(`SELECT * FROM ${tableName} WHERE sku = 'SKU001'`).get();
+			const result = await waitForValue(
+				async () => {
+					const r = await queryGet(nodes[i]!.db, `SELECT * FROM ${tableName} WHERE sku = 'SKU001'`);
+					return r?.quantity === 75 ? r : undefined;
+				},
+				{ timeoutMs: 30_000, intervalMs: 200, description: `Node ${i + 1} should see updated quantity` },
+			);
 			console.log(`   Node ${i + 1}: quantity = ${result?.quantity}`);
 			expect(result?.quantity, `Node ${i + 1} should see updated quantity`).to.equal(75);
 		}
@@ -317,17 +342,16 @@ describe('Distributed Quereus Operations', function () {
 			await delay(1000);
 		}
 
-		await delay(2000);
-
-		// Verify initial data replicated before deleting
+		// Verify initial data replicated before deleting — poll until 3 rows land.
 		console.log('\nVerifying initial data on all nodes before DELETE...');
 		for (let i = 0; i < nodes.length; i++) {
-			const stmt = await nodes[i]!.db.prepare(`SELECT * FROM ${tableName} ORDER BY id`);
-			const results = [];
-			for await (const row of stmt.all()) {
-				results.push(row);
-			}
-			await stmt.finalize();
+			const results = await waitForValue(
+				async () => {
+					const rows = await queryAll(nodes[i]!.db, `SELECT * FROM ${tableName} ORDER BY id`);
+					return rows.length === 3 ? rows : undefined;
+				},
+				{ timeoutMs: 30_000, intervalMs: 200, description: `Node ${i + 1} should have 3 rows before DELETE` },
+			);
 			console.log(`   Node ${i + 1}: ${results.length} rows - ${JSON.stringify(results.map(r => r.id))}`);
 			expect(results.length, `Node ${i + 1} should have 3 rows before DELETE`).to.equal(3);
 		}
@@ -336,17 +360,17 @@ describe('Distributed Quereus Operations', function () {
 		console.log('\nDeleting row from Node 3...');
 		await nodes[2]!.db.exec(`DELETE FROM ${tableName} WHERE id = '2'`);
 		console.log('   DELETE executed');
-		await delay(3000);
 
-		// Verify deletion on all nodes
+		// Verify deletion on all nodes — poll past the stale 3-row state until 2 remain.
 		console.log('Verifying deletion on all nodes...');
 		for (let i = 0; i < nodes.length; i++) {
-			const stmt = await nodes[i]!.db.prepare(`SELECT * FROM ${tableName} ORDER BY id`);
-			const results = [];
-			for await (const row of stmt.all()) {
-				results.push(row);
-			}
-			await stmt.finalize();
+			const results = await waitForValue(
+				async () => {
+					const rows = await queryAll(nodes[i]!.db, `SELECT * FROM ${tableName} ORDER BY id`);
+					return rows.length === 2 ? rows : undefined;
+				},
+				{ timeoutMs: 30_000, intervalMs: 200, description: `Node ${i + 1} should have 2 rows after DELETE` },
+			);
 			console.log(`   Node ${i + 1}: ${results.length} rows - ${JSON.stringify(results.map(r => r.id))}`);
 
 			expect(results.length, `Node ${i + 1} should have 2 rows`).to.equal(2);

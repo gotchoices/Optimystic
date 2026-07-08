@@ -20,6 +20,7 @@ import {
 } from '@optimystic/db-p2p';
 import { FileRawStorage } from '@optimystic/db-p2p-storage-fs';
 import { NetworkTransactor } from '@optimystic/db-core';
+import { waitForValue, delay } from '@optimystic/db-core/test';
 import register from '../dist/plugin.js';
 
 interface TestNode {
@@ -30,7 +31,27 @@ interface TestNode {
 	storagePath: string;
 }
 
-const delay = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
+/** Collect every row `sql` returns from a node's database, finalizing the statement. */
+async function queryAll(db: Database, sql: string): Promise<Record<string, any>[]> {
+	const stmt = await db.prepare(sql);
+	try {
+		const rows: Record<string, any>[] = [];
+		for await (const row of stmt.all()) rows.push(row);
+		return rows;
+	} finally {
+		await stmt.finalize();
+	}
+}
+
+/** Run `sql` and return its single row, or `undefined` when no row matches (not ready yet). */
+async function queryGet(db: Database, sql: string): Promise<Record<string, any> | undefined> {
+	const stmt = await db.prepare(sql);
+	try {
+		return await stmt.get();
+	} finally {
+		await stmt.finalize();
+	}
+}
 
 describe('Distributed Transaction Validation', function () {
 	// 3-node real libp2p mesh + filesystem-backed storage + transaction validation across peers;
@@ -152,13 +173,15 @@ describe('Distributed Transaction Validation', function () {
 			console.log(`   Node ${i + 1}: Table created with CHECK constraint`);
 			await delay(1000);
 		}
-		await delay(2000);
-
-		// Verify on all nodes
+		// Verify on all nodes — poll until the row replicates to each node.
 		for (let i = 0; i < nodes.length; i++) {
-			const result = await nodes[i]!.db.prepare(
-				`SELECT * FROM ${tableName} WHERE id = '1'`
-			).get();
+			const result = await waitForValue(
+				async () => {
+					const r = await queryGet(nodes[i]!.db, `SELECT * FROM ${tableName} WHERE id = '1'`);
+					return r?.price === 19.99 ? r : undefined;
+				},
+				{ timeoutMs: 30_000, intervalMs: 200, description: `Node ${i + 1} should see the row` },
+			);
 			expect(result, `Node ${i + 1} should see the row`).to.exist;
 			expect(result!.price).to.equal(19.99);
 		}
@@ -239,11 +262,16 @@ describe('Distributed Transaction Validation', function () {
 		expect(row!.stamp_id, 'stamp_id should be captured').to.equal(stampId);
 		console.log(`✅ Captured stamp_id: ${(row!.stamp_id as string).slice(0, 16)}...`);
 
-		// Verify replicated to other nodes
+		// Verify replicated to other nodes — poll until each carries the stamp_id.
 		console.log('Waiting for replication...');
-		await delay(5000);
 		for (let i = 1; i < nodes.length; i++) {
-			const result = await nodes[i]!.db.prepare(`SELECT stamp_id FROM ${tableName} WHERE id = 'entry1'`).get();
+			const result = await waitForValue(
+				async () => {
+					const r = await queryGet(nodes[i]!.db, `SELECT stamp_id FROM ${tableName} WHERE id = 'entry1'`);
+					return r?.stamp_id === stampId ? r : undefined;
+				},
+				{ timeoutMs: 30_000, intervalMs: 200, description: `Node ${i + 1} should have stamp_id` },
+			);
 			console.log(`   Node ${i + 1}: stamp_id = ${String(result?.stamp_id ?? 'undefined').slice(0, 16)}...`);
 			expect(result?.stamp_id, `Node ${i + 1} should have stamp_id`).to.equal(stampId);
 		}
@@ -293,14 +321,16 @@ describe('Distributed Transaction Validation', function () {
 			VALUES ('ord1', 'Alice', 100.00), ('ord2', 'Bob', 200.00), ('ord3', 'Alice', 150.00)
 		`);
 		console.log('✅ 3 orders inserted (table + index updated)');
-		await delay(1500);
 
-		// Verify data on all nodes
+		// Verify data on all nodes — poll until the 3 inserted rows replicate.
 		for (let i = 0; i < nodes.length; i++) {
-			const stmt = await nodes[i]!.db.prepare(`SELECT * FROM ${tableName} ORDER BY id`);
-			const results = [];
-			for await (const row of stmt.all()) { results.push(row); }
-			await stmt.finalize();
+			const results = await waitForValue(
+				async () => {
+					const rows = await queryAll(nodes[i]!.db, `SELECT * FROM ${tableName} ORDER BY id`);
+					return rows.length === 3 ? rows : undefined;
+				},
+				{ timeoutMs: 30_000, intervalMs: 200, description: `Node ${i + 1} should have 3 rows` },
+			);
 			expect(results.length, `Node ${i + 1} should have 3 rows`).to.equal(3);
 		}
 		console.log('✅ All nodes have 3 orders');
@@ -308,11 +338,16 @@ describe('Distributed Transaction Validation', function () {
 		// Update (modifies index if customer changes)
 		await nodes[1]!.db.exec(`UPDATE ${tableName} SET customer = 'Charlie' WHERE id = 'ord2'`);
 		console.log('✅ Updated ord2 customer (index re-keyed)');
-		await delay(1500);
 
-		// Verify update replicated
+		// Verify update replicated — poll past the stale 'Bob' until 'Charlie' lands.
 		for (let i = 0; i < nodes.length; i++) {
-			const result = await nodes[i]!.db.prepare(`SELECT customer FROM ${tableName} WHERE id = 'ord2'`).get();
+			const result = await waitForValue(
+				async () => {
+					const r = await queryGet(nodes[i]!.db, `SELECT customer FROM ${tableName} WHERE id = 'ord2'`);
+					return r?.customer === 'Charlie' ? r : undefined;
+				},
+				{ timeoutMs: 30_000, intervalMs: 200, description: `Node ${i + 1} should see updated customer` },
+			);
 			expect(result?.customer, `Node ${i + 1} should see updated customer`).to.equal('Charlie');
 		}
 		console.log('✅ Update replicated to all nodes');
@@ -320,14 +355,16 @@ describe('Distributed Transaction Validation', function () {
 		// Delete (removes from both table and index)
 		await nodes[2]!.db.exec(`DELETE FROM ${tableName} WHERE id = 'ord3'`);
 		console.log('✅ Deleted ord3');
-		await delay(1500);
 
-		// Verify deletion replicated
+		// Verify deletion replicated — poll past the stale 3-row state until 2 remain.
 		for (let i = 0; i < nodes.length; i++) {
-			const stmt = await nodes[i]!.db.prepare(`SELECT * FROM ${tableName} ORDER BY id`);
-			const results = [];
-			for await (const row of stmt.all()) { results.push(row); }
-			await stmt.finalize();
+			const results = await waitForValue(
+				async () => {
+					const rows = await queryAll(nodes[i]!.db, `SELECT * FROM ${tableName} ORDER BY id`);
+					return rows.length === 2 ? rows : undefined;
+				},
+				{ timeoutMs: 30_000, intervalMs: 200, description: `Node ${i + 1} should have 2 rows after delete` },
+			);
 			expect(results.length, `Node ${i + 1} should have 2 rows after delete`).to.equal(2);
 		}
 		console.log('✅ Delete replicated to all nodes');
@@ -369,21 +406,16 @@ describe('Distributed Transaction Validation', function () {
 			console.log(`   Node ${i + 1}: Table created`);
 			await delay(1000);
 		}
-		await delay(2000);
-
-		// Verify data persisted on Node 1 (the originator)
-		const originStmt = await nodes[0]!.db.prepare(`SELECT SUM(value) as total FROM ${tableName}`);
-		const originResult = await originStmt.get();
-		await originStmt.finalize();
-		console.log(`   Node 1: total = ${originResult?.total}`);
-		expect(originResult?.total, 'Node 1 should see sum of 600').to.equal(600);
-
-		// Verify data on other nodes
-		for (let i = 1; i < nodes.length; i++) {
-			const stmt = await nodes[i]!.db.prepare(`SELECT SUM(value) as total FROM ${tableName}`);
-			const result = await stmt.get();
-			await stmt.finalize();
-
+		// Verify data persisted + replicated — poll each node until the sum is 600.
+		// (SUM over an empty/partial table yields null until every row lands.)
+		for (let i = 0; i < nodes.length; i++) {
+			const result = await waitForValue(
+				async () => {
+					const r = await queryGet(nodes[i]!.db, `SELECT SUM(value) as total FROM ${tableName}`);
+					return r?.total === 600 ? r : undefined;
+				},
+				{ timeoutMs: 30_000, intervalMs: 200, description: `Node ${i + 1} should see sum of 600` },
+			);
 			console.log(`   Node ${i + 1}: total = ${result?.total}`);
 			expect(result?.total, `Node ${i + 1} should see sum of 600`).to.equal(600);
 		}
@@ -431,18 +463,20 @@ describe('Distributed Transaction Validation', function () {
 			console.log(`   Node ${i + 1}: Table created with CHECK constraint`);
 			await delay(1000);
 		}
-		await delay(2000);
-
-		// Verify data replicated to ALL nodes before updating
+		// Verify data replicated to ALL nodes before updating — poll until balance 1000 lands.
 		console.log('Verifying initial data on all nodes...');
 		for (let i = 0; i < nodes.length; i++) {
-			const result = await nodes[i]!.db.prepare(`SELECT * FROM ${tableName} WHERE account_id = 'acct1'`).get();
+			const result = await waitForValue(
+				async () => {
+					const r = await queryGet(nodes[i]!.db, `SELECT * FROM ${tableName} WHERE account_id = 'acct1'`);
+					return r?.balance === 1000 ? r : undefined;
+				},
+				{ timeoutMs: 30_000, intervalMs: 200, description: `Node ${i + 1} should see initial balance` },
+			);
 			console.log(`   Node ${i + 1}: balance = ${result?.balance}`);
 			expect(result?.balance, `Node ${i + 1} should see initial balance`).to.equal(1000);
 		}
 		console.log('✅ Initial data verified on all nodes');
-
-		await delay(1000); // Extra delay to ensure all replication is complete
 
 		// Update from Node 2 (set to absolute value, not relative)
 		console.log('\nUpdating balance from Node 2...');
@@ -455,22 +489,35 @@ describe('Distributed Transaction Validation', function () {
 		expect(node2Check?.balance, 'Node 2 should have balance 800 after UPDATE').to.equal(800);
 
 		// Also check all rows in the table
-		const allRows = await nodes[1]!.db.prepare(`SELECT * FROM ${tableName}`).all();
+		const allRows = await queryAll(nodes[1]!.db, `SELECT * FROM ${tableName}`);
 		console.log(`   All rows on Node 2: ${JSON.stringify(allRows)}`);
-		await delay(5000);
+
+		// Wait until Node 3 has replicated Node 2's write (balance 800) before it
+		// issues its own update, so the final state is deterministically Node 3's
+		// (last writer) rather than a race between propagation and the next write.
+		await waitForValue(
+			async () => {
+				const r = await queryGet(nodes[2]!.db, `SELECT balance FROM ${tableName} WHERE account_id = 'acct1'`);
+				return r?.balance === 800 ? r : undefined;
+			},
+			{ timeoutMs: 30_000, intervalMs: 200, description: 'Node 3 should replicate balance 800 before its update' },
+		);
 
 		// Update from Node 3 (set to absolute value)
 		await nodes[2]!.db.exec(`UPDATE ${tableName} SET balance = 600.00 WHERE account_id = 'acct1'`);
 		const node3Check = await nodes[2]!.db.prepare(`SELECT balance FROM ${tableName} WHERE account_id = 'acct1'`).get();
 		console.log(`✅ Update from Node 3: balance = ${node3Check?.balance}`);
 		expect(node3Check?.balance, 'Node 3 should have balance 600 after UPDATE').to.equal(600);
-		await delay(5000);
 
-		// Verify final balance on all nodes
+		// Verify final balance on all nodes — poll past the stale 800 until 600 lands.
 		for (let i = 0; i < nodes.length; i++) {
-			const result = await nodes[i]!.db.prepare(
-				`SELECT balance FROM ${tableName} WHERE account_id = 'acct1'`
-			).get();
+			const result = await waitForValue(
+				async () => {
+					const r = await queryGet(nodes[i]!.db, `SELECT balance FROM ${tableName} WHERE account_id = 'acct1'`);
+					return r?.balance === 600 ? r : undefined;
+				},
+				{ timeoutMs: 30_000, intervalMs: 200, description: `Node ${i + 1} should have balance 600` },
+			);
 			console.log(`   Node ${i + 1}: balance = ${result?.balance}`);
 			expect(result?.balance, `Node ${i + 1} should have balance 600`).to.equal(600);
 		}
@@ -529,17 +576,19 @@ describe('Distributed Transaction Validation', function () {
 			`INSERT INTO ${tableName} (id, name, extra_field) VALUES ('1', 'Alice', 'extra_value')`
 		);
 		console.log('✅ Insert with extra_field succeeded on Node 1');
-		await delay(3000);
 
-		// Query from Node 1 - should see the extra field
-		const row1 = await nodes[0]!.db.prepare(`SELECT * FROM ${tableName} WHERE id = '1'`).get();
+		// Query from Node 1 — its own insert, immediately visible with the extra column.
+		const row1 = await queryGet(nodes[0]!.db, `SELECT * FROM ${tableName} WHERE id = '1'`);
 		expect(row1, 'Node 1 should see the row').to.exist;
 		expect(row1!.extra_field).to.equal('extra_value');
 		console.log('   Node 1: Sees extra_field = "extra_value"');
 
-		// Query from Node 2 - the underlying data has extra_field but schema doesn't
-		// Local schema determines what columns are visible in SELECT *
-		const row2 = await nodes[1]!.db.prepare(`SELECT * FROM ${tableName} WHERE id = '1'`).get();
+		// Query from Node 2 — poll until the row replicates. Node 2's schema omits
+		// extra_field, so SELECT * must expose name but NOT extra_field (local schema).
+		const row2 = await waitForValue(
+			async () => await queryGet(nodes[1]!.db, `SELECT * FROM ${tableName} WHERE id = '1'`),
+			{ timeoutMs: 30_000, intervalMs: 200, description: 'Node 2 should replicate the row' },
+		);
 		expect(row2, 'Node 2 should see the row').to.exist;
 		expect(row2!.name).to.equal('Alice');
 		// Node 2's schema doesn't include extra_field, so it won't be in SELECT *
