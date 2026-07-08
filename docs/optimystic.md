@@ -259,6 +259,48 @@ DEBUG='optimystic:db-p2p:cluster*'              node app.js  # consensus
 
 **Development flow.** Start with a solo node + `TestTransactor`, validate the data-structure choices and action handlers, then swap in `NetworkTransactor` and bootstrap peers. The `reference-peer` CLI and `MeshHarness` help exercise multi-node scenarios before real deployment.
 
+## Write Throughput and Collection Sharding
+
+### Per-collection throughput ceiling
+
+Every write to a collection is ordered by a single **log-tail cluster** — the K peers responsible for the tail block of that collection's transaction log. Each write must clear a super-majority promise+commit round before it completes (the `resolveRace` path in `cluster-repo.ts`). That consensus round is the hard throughput ceiling: roughly one completed write per super-majority round-trip, regardless of how many clients are writing.
+
+This is a CP design choice — strong linearizability per collection, with a structural cap on write rate. There is no way to raise the ceiling for a single collection. The only relief is to spread writes across more collections, each with its own log-tail cluster.
+
+### Recognizing a hot collection
+
+A collection is hot when its log-tail cluster becomes the bottleneck:
+
+- **OCC retry rate climbs.** Conflict-losers from the consensus race are logged under `DEBUG='optimystic:db-p2p:cluster*'` with key `cluster-member:consensus-pend-diverged`. A rising count here means writes are stacking up waiting for the cluster.
+- **PEND/COMMIT latency grows on one collection while others are unaffected.** Cross-collection isolation means a slow collection does not drag others; asymmetric latency is the tell.
+- **Large transactions lose to small ones.** Under OCC priority ordering, larger transactions are more likely to be the conflict-loser. Priority aging and structural read exclusion (both implemented) reduce starvation but do not remove the ceiling — they improve fairness within the collection, not throughput.
+
+### How to shard
+
+Partition the logical key-space across N collections, each keyed by a stable attribute of the data:
+
+```typescript
+// 8 shards keyed by userId suffix
+const shard = (userId: string) => `messages-${parseInt(userId.slice(-4), 16) % 8}`;
+const collection = await Tree.createOrOpen(transactor, shard(userId), ...);
+```
+
+Each sub-collection has its own log-tail cluster, so write throughput scales with the number of shards. The partitioning key should distribute writes evenly — avoid time-based shards for near-real-time hot writes, because all writes land in one bucket until it rotates.
+
+### Tradeoff: cross-shard atomicity
+
+A write that must touch two shards requires a multi-collection transaction (`TransactionSession` with `ActionsEngine` or `QuereusEngine`). The guarantee is atomicity-of-intent with eventual, reported visibility — not literal all-or-nothing. A permanent partial landing is reported via `committedCollections` / `failedCollections` for reconciliation. See [transactions.md](transactions.md) and [correctness.md](correctness.md) Theorem 3 for the formal statement.
+
+Design writes to be shard-local wherever possible. Cross-shard operations are safe but carry the GATHER overhead and reintroduce the cross-collection partial-landing possibility. Shard boundaries should align with the natural ownership or access units in the domain (user, tenant, time bucket) so that most operations touch a single shard.
+
+### OCC starvation interaction
+
+A hot collection is precisely where large transactions lose to small ones under OCC priority ordering. Priority aging and structural read exclusion (already implemented) reduce starvation but do not remove the throughput ceiling. Use both together: sharding addresses the ceiling; the starvation mitigations address fairness within a shard.
+
+### Long-term fix
+
+The HLC (hybrid logical clock) redesign in [crdt-sync.md](crdt-sync.md) removes the single-cluster ordering bottleneck by replacing consensus-based sequencing with deterministic replay over an HLC-ordered log. It is unimplemented. Sharding is the current production relief until that migration lands.
+
 ## See Also
 
 * [architecture.md](architecture.md) — subsystem map and mental model

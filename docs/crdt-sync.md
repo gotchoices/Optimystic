@@ -220,6 +220,8 @@ Most reads in current applications assume stable semantics by default. The API s
 
 ## Migration Path
 
+**When to start.** The signal is observed contention on a hot collection that sharding cannot practically resolve — for example, the logical key-space resists even partitioning, or the number of sub-collections has grown large enough to make cross-shard writes routine. At that point, turn Stage 1 through Stage 5 into sequenced implementation tickets (one ticket per stage), gated in order via `prereq:`. Do not start Stage 2 or later until Stage 1 is shipped and measured.
+
 A full rewrite is unnecessary. The design can evolve in stages, and strong-consistency collections coexist with CRDT-sync collections in the same network.
 
 ### Stage 1 — Introduce HLC on every transaction
