@@ -20,6 +20,8 @@ export const ACTIONS_ENGINE_ID = "actions@1.0.0";
  * ```
  */
 export class ActionsEngine implements ITransactionEngine {
+	readonly id = ACTIONS_ENGINE_ID;
+
 	constructor(private coordinator: TransactionCoordinator) {}
 
 	async execute(transaction: Transaction): Promise<ExecutionResult> {

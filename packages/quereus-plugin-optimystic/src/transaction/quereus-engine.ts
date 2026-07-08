@@ -39,6 +39,8 @@ export type QuereusStatement = {
  * re-execution (validators verifying transaction).
  */
 export class QuereusEngine implements ITransactionEngine {
+	readonly id = QUEREUS_ENGINE_ID;
+
 	/**
 	 * Cached schema hash. Set on a successful idle compute; cleared by
 	 * {@link invalidateSchemaCache} whenever the schema changes. While warm, it is

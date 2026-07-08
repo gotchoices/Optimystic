@@ -121,6 +121,18 @@ export async function createTransactionId(
  */
 export interface ITransactionEngine {
 	/**
+	 * Stable identifier for this engine.
+	 *
+	 * This is the value stamped into {@link TransactionStamp.engineId} when a
+	 * {@link TransactionSession} builds a transaction, and the key a
+	 * {@link TransactionValidator} resolves the engine by. It MUST match the key the
+	 * engine is registered under in the validator's `engines` map — otherwise a
+	 * validating node rejects the transaction as `Unknown engine: <id>` before it
+	 * ever re-executes.
+	 */
+	readonly id: string;
+
+	/**
 	 * Process a transaction statements to produce actions.
 	 *
 	 * Used both for:

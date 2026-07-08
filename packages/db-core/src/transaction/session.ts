@@ -50,7 +50,7 @@ export class TransactionSession {
 			peerId,
 			Date.now(),
 			schemaHash,
-			'unknown', // TODO: Get engine ID from engine
+			engine.id,
 			ttlMs
 		);
 		return new TransactionSession(coordinator, engine, stamp);

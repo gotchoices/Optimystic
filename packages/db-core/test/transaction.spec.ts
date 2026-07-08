@@ -1,6 +1,7 @@
 import { expect } from 'chai';
 import {
 	ActionsEngine,
+	ACTIONS_ENGINE_ID,
 	createActionsStatements,
 	createTransactionStamp,
 	createTransactionId,
@@ -1270,6 +1271,58 @@ describe('Transaction', () => {
 			const result = await validator.validate(transaction, 'ops:abc');
 			expect(result.valid).to.be.false;
 			expect(result.reason).to.include('Schema mismatch');
+		});
+
+		it('should stamp session transactions with the engine id so the validator resolves them', async () => {
+			const transactor = new TestTransactor();
+
+			type UserEntry = { key: number; name: string };
+			const usersTree = await Tree.createOrOpen<number, UserEntry>(
+				transactor, 'users', entry => entry.key
+			);
+			const usersCollection = (usersTree as unknown as { collection: unknown }).collection;
+			const collections = new Map();
+			collections.set('users', usersCollection);
+
+			const coordinator = new TransactionCoordinator(transactor, collections);
+			const actionsEngine = new ActionsEngine(coordinator);
+
+			// Build a transaction through a session over the ActionsEngine.
+			const session = await TransactionSession.create(coordinator, actionsEngine);
+			await session.execute(
+				'stmt1',
+				[{ collectionId: 'users', actions: [{ type: 'replace', data: [[1, { key: 1, name: 'Alice' }]] }] }]
+			);
+
+			// The session must stamp the engine's real id, not the old 'unknown' placeholder.
+			const stamp = session.getStamp();
+			expect(stamp.engineId).to.equal(ACTIONS_ENGINE_ID);
+			expect(stamp.engineId).to.not.equal('unknown');
+
+			// A validator whose engines map is keyed by the real id must resolve it,
+			// i.e. NOT reject with 'Unknown engine: unknown'.
+			const engines = new Map<string, EngineRegistration>();
+			engines.set(ACTIONS_ENGINE_ID, {
+				engine: actionsEngine,
+				getSchemaHash: async () => stamp.schemaHash
+			});
+			const createValidationCoordinator: ValidationCoordinatorFactory = () => ({
+				applyActions: async () => {},
+				getTransforms: () => new Map(),
+				dispose: () => {}
+			});
+			const validator = new TransactionValidator(engines, createValidationCoordinator);
+
+			const statements = session.getStatements() as string[];
+			const transaction: Transaction = {
+				stamp,
+				statements,
+				reads: [],
+				id: await createTransactionId(stamp.id, statements, [])
+			};
+
+			const result = await validator.validate(transaction, 'ops:abc');
+			expect(result.reason ?? '').to.not.include('Unknown engine');
 		});
 	});
 
