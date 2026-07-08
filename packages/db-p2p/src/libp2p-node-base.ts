@@ -827,10 +827,10 @@ export async function createLibp2pNodeBase(
 	// storageRepo.onAnyCollectionChange. Subscribe to storageRepo DIRECTLY (not
 	// node.blockChangeNotifier): the cohort-topic activation block below may replace
 	// blockChangeNotifier with a decorating bridge, but storageRepo keeps emitting on its own
-	// surface regardless of that opt-in. NOTE: blocks already durable from a previous run are NOT
-	// re-emitted on startup, so they are not tracked until next touched - acceptable here (churn
-	// re-replication / rebalance re-derive over time); an initial-scan seed is a follow-on
-	// enhancement (optimystic-owned-block-initial-scan-seed). Registered lazily the first time a
+	// surface regardless of that opt-in. NOTE: this feed does NOT re-emit blocks already durable
+	// from a previous run; those are seeded once at startup by the storage-enumeration scan wired
+	// below (seedOwnedBlocksFromStorage), so a restarted node protects on-disk data without waiting
+	// for each block to be touched again. Registered lazily the first time a
 	// monitor that reads ownedBlocks is wired, so when BOTH monitors are disabled no subscription
 	// leaks; torn down exactly once in the stop wrapper below.
 	let offOwnedBlockFeed: (() => void) | undefined;
