@@ -5,7 +5,7 @@ import * as path from 'path';
 import { FileRawStorage, FileKVStore } from '../src/index.js';
 import { BlockStorage } from '@optimystic/db-p2p';
 import type { BlockMetadata } from '@optimystic/db-p2p';
-import type { BlockId, ActionId } from '@optimystic/db-core';
+import type { BlockId, ActionId, Transform, IBlock } from '@optimystic/db-core';
 
 // Injects a "crash" between the atomic writer's temp write and its rename by
 // making fs.rename throw. atomic-write.ts holds the same `fs.promises` singleton,
@@ -187,6 +187,86 @@ describe('FileRawStorage.listPendingTransactions readdir error discrimination', 
 	});
 });
 
+describe('FileRawStorage round-trips', () => {
+	let base: string;
+
+	beforeEach(async () => {
+		base = await fs.mkdtemp(path.join(os.tmpdir(), 'optimystic-fs-rt-'));
+	});
+
+	afterEach(async () => {
+		await fs.rm(base, { recursive: true, force: true });
+	});
+
+	it('saveRevision/getRevision round-trips', async () => {
+		const storage = new FileRawStorage(base);
+		const blockId = 'block-rev' as BlockId;
+		const actionId = 'tx:revtest' as ActionId;
+
+		assert.strictEqual(await storage.getRevision(blockId, 1), undefined);
+		await storage.saveRevision(blockId, 1, actionId);
+		assert.strictEqual(await storage.getRevision(blockId, 1), actionId);
+	});
+
+	it('saveTransaction/getTransaction round-trips', async () => {
+		const storage = new FileRawStorage(base);
+		const blockId = 'block-tx' as BlockId;
+		const actionId = 'tx:txtest' as ActionId;
+		const transform: Transform = { delete: true };
+
+		assert.strictEqual(await storage.getTransaction(blockId, actionId), undefined);
+		await storage.saveTransaction(blockId, actionId, transform);
+		assert.deepStrictEqual(await storage.getTransaction(blockId, actionId), transform);
+	});
+
+	it('saveMaterializedBlock/getMaterializedBlock round-trips', async () => {
+		const storage = new FileRawStorage(base);
+		const blockId = 'block-mat' as BlockId;
+		const actionId = 'tx:mattest' as ActionId;
+		const block = { data: 'test-block-content' } as unknown as IBlock;
+
+		assert.strictEqual(await storage.getMaterializedBlock(blockId, actionId), undefined);
+		await storage.saveMaterializedBlock(blockId, actionId, block);
+		assert.deepStrictEqual(await storage.getMaterializedBlock(blockId, actionId), block);
+	});
+
+	it('savePendingTransaction → promotePendingTransaction moves pend to actions', async () => {
+		const storage = new FileRawStorage(base);
+		const blockId = 'block-promote' as BlockId;
+		const actionId = 'tx:promote123' as ActionId;
+		const transform: Transform = { delete: true };
+
+		await storage.savePendingTransaction(blockId, actionId, transform);
+
+		// Must be in pending, not yet in actions
+		assert.deepStrictEqual(await storage.getPendingTransaction(blockId, actionId), transform);
+		assert.strictEqual(await storage.getTransaction(blockId, actionId), undefined);
+
+		await storage.promotePendingTransaction(blockId, actionId);
+
+		// Now in actions, no longer in pending
+		assert.deepStrictEqual(await storage.getTransaction(blockId, actionId), transform);
+		const remaining = await drainPendings(storage, blockId);
+		assert.deepStrictEqual(remaining, []);
+	});
+
+	it('colon-bearing action id round-trips on all platforms (percent-encoded filename)', async () => {
+		const storage = new FileRawStorage(base);
+		const blockId = 'block-colon' as BlockId;
+		const colonId = 'tx:abcd1234' as ActionId;
+		const transform: Transform = { delete: true };
+
+		await storage.saveTransaction(blockId, colonId, transform);
+		assert.deepStrictEqual(await storage.getTransaction(blockId, colonId), transform);
+
+		// Verify filename is percent-encoded on disk (no raw colon)
+		const actionsDir = path.join(base, blockId, 'actions');
+		const files = await fs.readdir(actionsDir);
+		assert.ok(files.some(f => f.includes('%3A')), 'expected %3A encoding in filename');
+		assert.ok(!files.some(f => f.includes(':') && !f.includes('%3A')), 'expected no raw colon in filename');
+	});
+});
+
 describe('FileKVStore atomic writes', () => {
 	let base: string;
 
@@ -218,5 +298,36 @@ describe('FileKVStore atomic writes', () => {
 
 		assert.strictEqual(await kv.get('coordinator/key1'), 'value-A');
 		assert.ok(!(await hasTempSibling(path.join(base, 'coordinator'))), 'expected no orphaned *.tmp files');
+	});
+
+	it('list(prefix) returns all keys under prefix recursively', async () => {
+		const kv = new FileKVStore(base);
+		await kv.set('ns/a', 'v1');
+		await kv.set('ns/b', 'v2');
+		await kv.set('ns/sub/c', 'v3');
+		await kv.set('other/x', 'vx');
+
+		const results = await kv.list('ns/');
+		results.sort();
+		assert.deepStrictEqual(results, ['ns/a', 'ns/b', 'ns/sub/c']);
+	});
+
+	it('list(prefix) returns empty for non-existent prefix', async () => {
+		const kv = new FileKVStore(base);
+		assert.deepStrictEqual(await kv.list('no-such/'), []);
+	});
+
+	it('delete removes a key; get returns undefined afterward', async () => {
+		const kv = new FileKVStore(base);
+		await kv.set('del/key', 'to-delete');
+		assert.strictEqual(await kv.get('del/key'), 'to-delete');
+
+		await kv.delete('del/key');
+		assert.strictEqual(await kv.get('del/key'), undefined);
+	});
+
+	it('delete on non-existent key does not throw', async () => {
+		const kv = new FileKVStore(base);
+		await assert.doesNotReject(() => kv.delete('never/existed'));
 	});
 });
