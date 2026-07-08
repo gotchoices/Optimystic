@@ -146,6 +146,16 @@ export class MemoryRawStorage implements IRawStorage {
 		}
 	}
 
+	async *listBlockIds(): AsyncIterable<BlockId> {
+		// Snapshot the keys before yielding so a concurrent saveMetadata during the
+		// scan doesn't invalidate a live map iterator. Fresh in-memory storage is
+		// empty, so at real process startup this yields nothing — it exists so the
+		// seed path can be unit-tested against a pre-populated MemoryRawStorage.
+		for (const blockId of Array.from(this.metadata.keys())) {
+			yield blockId;
+		}
+	}
+
 	async getApproximateBytesUsed(): Promise<number> {
 		let total = 0;
 		for (const [blockId, meta] of this.metadata) {

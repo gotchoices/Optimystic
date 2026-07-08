@@ -54,6 +54,17 @@ export class IndexedDBRawStorage implements IRawStorage {
 		}
 	}
 
+	async *listBlockIds(): AsyncIterable<BlockId> {
+		// The `metadata` store is keyed by blockId directly, so its keys ARE the
+		// distinct block ids. getAllKeys reads them under an implicit readonly
+		// transaction and returns an already-materialized array — no cursor held
+		// across yields (same rationale as listRevisions' snapshot-first pattern).
+		const keys = await this.db.getAllKeys('metadata');
+		for (const key of keys) {
+			yield key as BlockId;
+		}
+	}
+
 	async getPendingTransaction(blockId: BlockId, actionId: ActionId): Promise<Transform | undefined> {
 		return this.db.get('pending', [blockId, actionId]);
 	}

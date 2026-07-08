@@ -267,6 +267,63 @@ describe('FileRawStorage round-trips', () => {
 	});
 });
 
+describe('FileRawStorage.listBlockIds', () => {
+	let base: string;
+
+	beforeEach(async () => {
+		base = await fs.mkdtemp(path.join(os.tmpdir(), 'optimystic-fs-listblocks-'));
+	});
+
+	afterEach(async () => {
+		await fs.rm(base, { recursive: true, force: true });
+	});
+
+	async function collect(storage: FileRawStorage): Promise<Set<string>> {
+		const out = new Set<string>();
+		for await (const id of storage.listBlockIds()) out.add(id);
+		return out;
+	}
+
+	const meta = (rev: number): BlockMetadata => ({ latest: { rev, actionId: `tx:a${rev}` as ActionId }, ranges: [[1, rev]] });
+
+	it('yields exactly the ids of blocks that have metadata', async () => {
+		const storage = new FileRawStorage(base);
+		await storage.saveMetadata('block-a' as BlockId, meta(1));
+		await storage.saveMetadata('block-b' as BlockId, meta(2));
+		await storage.saveMetadata('block-c' as BlockId, meta(3));
+
+		assert.deepStrictEqual(await collect(storage), new Set(['block-a', 'block-b', 'block-c']));
+	});
+
+	it('excludes a block that has only a pending transform (no metadata)', async () => {
+		const storage = new FileRawStorage(base);
+		await storage.saveMetadata('committed' as BlockId, meta(1));
+		// Pended but never committed → block dir exists (pend/ created by atomicWriteFile's
+		// recursive mkdir) but no meta.json → must not be enumerated.
+		await storage.savePendingTransaction('pending-only' as BlockId, 'tx:x' as ActionId, { delete: true });
+
+		assert.deepStrictEqual(await collect(storage), new Set(['committed']));
+	});
+
+	it('yields empty for an existing-but-empty basePath', async () => {
+		const storage = new FileRawStorage(base);
+		assert.deepStrictEqual(await collect(storage), new Set());
+	});
+
+	it('yields empty for a non-existent basePath (ENOENT → no throw)', async () => {
+		const storage = new FileRawStorage(path.join(base, 'does-not-exist'));
+		assert.deepStrictEqual(await collect(storage), new Set());
+	});
+
+	it('ignores a stray non-directory file at basePath root', async () => {
+		const storage = new FileRawStorage(base);
+		await storage.saveMetadata('real-block' as BlockId, meta(1));
+		await fs.writeFile(path.join(base, 'stray.txt'), 'not a block');
+
+		assert.deepStrictEqual(await collect(storage), new Set(['real-block']));
+	});
+});
+
 describe('FileKVStore atomic writes', () => {
 	let base: string;
 

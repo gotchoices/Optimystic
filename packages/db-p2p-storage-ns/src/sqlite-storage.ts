@@ -31,6 +31,7 @@ export class SqliteRawStorage implements IRawStorage {
 		savePending: SqliteStatement;
 		deletePending: SqliteStatement;
 		listPending: SqliteStatement;
+		listBlockIds: SqliteStatement;
 		getTransaction: SqliteStatement;
 		saveTransaction: SqliteStatement;
 		getMaterialized: SqliteStatement;
@@ -52,6 +53,11 @@ export class SqliteRawStorage implements IRawStorage {
 			savePending: db.prepare('INSERT OR REPLACE INTO pending (block_id, action_id, value) VALUES (?, ?, ?)'),
 			deletePending: db.prepare('DELETE FROM pending WHERE block_id = ? AND action_id = ?'),
 			listPending: db.prepare('SELECT action_id FROM pending WHERE block_id = ? ORDER BY action_id ASC'),
+			// metadata.block_id is the PRIMARY KEY, so each row is a distinct block id —
+			// no dedup needed. NOTE: drains the whole metadata table up front; if a peer
+			// ever holds millions of blocks and this SELECT becomes a startup-latency
+			// problem, page it (LIMIT/OFFSET or keyset) — fine at current scale.
+			listBlockIds: db.prepare('SELECT block_id FROM metadata'),
 			getTransaction: db.prepare('SELECT value FROM transactions WHERE block_id = ? AND action_id = ?'),
 			saveTransaction: db.prepare('INSERT OR REPLACE INTO transactions (block_id, action_id, value) VALUES (?, ?, ?)'),
 			getMaterialized: db.prepare('SELECT value FROM materialized WHERE block_id = ? AND action_id = ?'),
@@ -110,6 +116,13 @@ export class SqliteRawStorage implements IRawStorage {
 		const rows = await this.stmts.listPending.all(blockId);
 		for (const row of rows) {
 			yield row.action_id as ActionId;
+		}
+	}
+
+	async *listBlockIds(): AsyncIterable<BlockId> {
+		const rows = await this.stmts.listBlockIds.all();
+		for (const row of rows) {
+			yield row.block_id as BlockId;
 		}
 	}
 

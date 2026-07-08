@@ -141,6 +141,50 @@ export class FileRawStorage implements IRawStorage {
 		}
 	}
 
+	async *listBlockIds(): AsyncIterable<BlockId> {
+		// The block layout is `basePath/<blockId>/{meta.json,revs/,pend/,actions/,blocks/}`
+		// (see getBlockPath), so the direct children of basePath are the per-block directories
+		// and each directory NAME is the blockId (used raw, no encoding). Filter to directories
+		// so a stray file can't be mistaken for a block; `*.tmp` atomic-write orphans live inside
+		// block subdirs, never at basePath root, so the root is clean.
+		//
+		// A directory alone is NOT sufficient to call a block "durable owned": a block that was
+		// only PENDED (never committed) still creates `<blockId>/pend/` — hence a root directory
+		// entry — via atomicWriteFile's recursive mkdir, but has no meta.json. So we gate on
+		// meta.json existence: `meta.json` IS this backend's metadata store, and enumerating it
+		// yields exactly the blocks with a committed revision / persisted replica (the same
+		// "owned" population the live change feed tracks, and the same one the metadata-keyed
+		// backends — sqlite/leveldb/indexeddb — enumerate for free). Existence (fs.access), not
+		// parse, matches key-existence semantics: a torn/corrupt meta.json still counts as a key,
+		// exactly as a corrupt value would in the other backends.
+		//
+		// ENOENT (basePath not created yet, or a dir without meta.json) maps to "not owned" —
+		// same discrimination as directoryByteSize. Any OTHER readdir/access error must surface:
+		// swallowing it would make the seed falsely report an empty store and under-protect data
+		// already on disk.
+		// NOTE: reads the whole root listing up front + one meta.json stat per block dir; if a
+		// store ever grows to millions of block subdirs and this becomes a startup-latency
+		// problem, page it (e.g. opendir cursor) — fine at current scale.
+		const entries = await fs.readdir(this.basePath, { withFileTypes: true })
+			.catch((err) => {
+				if ((err as NodeJS.ErrnoException)?.code === 'ENOENT') return [];
+				log('listBlockIds readdir failed for %s - %o', this.basePath, err);
+				throw err;
+			});
+		for (const entry of entries) {
+			if (!entry.isDirectory()) continue;
+			const blockId = entry.name as BlockId;
+			const hasMeta = await fs.access(this.getMetadataPath(blockId))
+				.then(() => true)
+				.catch((err) => {
+					if ((err as NodeJS.ErrnoException)?.code === 'ENOENT') return false;
+					log('listBlockIds access failed for %s - %o', blockId, err);
+					throw err;
+				});
+			if (hasMeta) yield blockId;
+		}
+	}
+
 	async getApproximateBytesUsed(): Promise<number> {
 		return this.directoryByteSize(this.basePath);
 	}

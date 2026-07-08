@@ -18,6 +18,7 @@ import { StorageRepo, withBlockCommitLatch } from './storage/storage-repo.js';
 import { BlockStorage } from './storage/block-storage.js';
 import { MemoryRawStorage } from './storage/memory-storage.js';
 import type { IRawStorage } from './storage/i-raw-storage.js';
+import { seedOwnedBlocksFromStorage } from './owned-block-seed.js';
 import { clusterMember, type ReconcileBlockCallback, type CommitCertificateSink, type DeriveExpectedClusterCallback } from './cluster/cluster-repo.js';
 import { selectQuorumRev, selectQuorumBlock, canonicalBlockHash, type RevClaim, type BlockHashCandidate } from './cluster/quorum-restore.js';
 import { createCommitCertStore, makeClusterCommitCertExtractor, type CommitCertStore } from './cluster/commit-cert.js';
@@ -1123,6 +1124,37 @@ export async function createLibp2pNodeBase(
 		} else {
 			log?.('FRET service not available, Arachnode disabled');
 		}
+	}
+
+	// --- Seed the shared owned-block set from already-durable storage ---
+	// Blocks durable from a previous run are otherwise untracked until next touched (see the
+	// onAnyCollectionChange comment above where ownedBlocks is declared). Placed here, AFTER both
+	// monitor-wiring blocks (spread ~line 862, rebalance ~line 974) have had their chance to call
+	// ensureOwnedBlockFeed():
+	//   - Gate on offOwnedBlockFeed: only seed when a monitor actually consumes ownedBlocks; if both
+	//     are disabled the set is unused and the scan (plus the background task) is wasted work.
+	//   - Feed-before-scan ordering is load-bearing: because the feed is already live, a block
+	//     committed/replicated DURING the scan is caught by the feed; Set.add is idempotent so the
+	//     overlap is harmless. Scanning before subscribing would drop a block committed in the gap.
+	//   - Fire-and-forget so a large store never blocks startup; the .catch keeps a scan rejection
+	//     from becoming an unhandled rejection.
+	//   - Cancellable: a stop wrapper flips seedStopping so the scan loop breaks against a
+	//     stopping/closing backend rather than running the enumeration to completion.
+	// NOTE: a concurrent rebalance release can untrackBlock (delete from ownedBlocks) a confirmed-
+	// released block while this scan is still running, and the scan could then re-add that id. Benign
+	// transient: the block is still in the metadata store (no sweep reclaims metadata yet), so a
+	// re-added released block is simply re-evaluated and re-released on the next rebalance tick. Right
+	// after a restart, responsibility-loss detection lags this fast metadata scan, so the window is
+	// small. Accepted rather than synchronized.
+	if (offOwnedBlockFeed && typeof rawStorage.listBlockIds === 'function') {
+		let seedStopping = false;
+		const previousStop = node.stop.bind(node);
+		node.stop = async () => {
+			seedStopping = true;
+			await previousStop();
+		};
+		void seedOwnedBlocksFromStorage(rawStorage, ownedBlocks, () => seedStopping)
+			.catch((err) => ((node as any).logger?.forComponent?.('db-p2p:owned-block-seed'))?.('seed failed: %o', err));
 	}
 
 	// Initialize dispute service if enabled

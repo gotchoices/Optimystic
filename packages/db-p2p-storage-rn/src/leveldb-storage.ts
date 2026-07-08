@@ -5,8 +5,10 @@ import {
 	TAG_PENDING,
 	actionIdFromKey,
 	blockEnvelopeRange,
+	blockIdFromMetadataKey,
 	materializedKey,
 	metadataKey,
+	metadataRange,
 	pendingKey,
 	revisionFromKey,
 	revisionKey,
@@ -69,6 +71,18 @@ export class LevelDBRawStorage implements IRawStorage {
 				rev: revisionFromKey(key),
 				actionId: textDecoder.decode(value) as ActionId,
 			};
+		}
+	}
+
+	async *listBlockIds(): AsyncIterable<BlockId> {
+		// Scan the whole TAG_METADATA keyspace; each metadata key is one distinct
+		// block id (empty suffix). keys:true skips values — we only need the ids.
+		// Drained before yielding (same discipline as listRevisions): a native
+		// iterator must not stay open across consumer awaits.
+		const range = metadataRange();
+		const entries = await drain(this.db.iterator({ gte: range.gte, lt: range.lt, keys: true }));
+		for (const [key] of entries) {
+			yield blockIdFromMetadataKey(key) as BlockId;
 		}
 	}
 

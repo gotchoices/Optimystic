@@ -160,4 +160,29 @@ describe('IndexedDBRawStorage', () => {
 		expect(used).to.be.a('number');
 		expect(used).to.be.at.least(0);
 	});
+
+	it('listBlockIds yields exactly the ids of blocks with metadata', async () => {
+		await storage.saveMetadata('b1' as BlockId, { ranges: [[1, 1]], latest: { rev: 1, actionId } });
+		await storage.saveMetadata('b2' as BlockId, { ranges: [[1, 2]], latest: { rev: 2, actionId } });
+
+		const out = new Set<string>();
+		for await (const id of storage.listBlockIds()) out.add(id);
+		expect(out).to.deep.equal(new Set(['b1', 'b2']));
+	});
+
+	it('listBlockIds excludes a pending-only block (no metadata)', async () => {
+		await storage.saveMetadata(blockId, { ranges: [[1, 1]], latest: { rev: 1, actionId } });
+		// Pended, never committed → no metadata row → must not be enumerated.
+		await storage.savePendingTransaction('pending-only' as BlockId, actionId, makeTransform());
+
+		const out = new Set<string>();
+		for await (const id of storage.listBlockIds()) out.add(id);
+		expect(out).to.deep.equal(new Set([blockId]));
+	});
+
+	it('listBlockIds yields nothing for an empty store', async () => {
+		const out = new Set<string>();
+		for await (const id of storage.listBlockIds()) out.add(id);
+		expect(out).to.deep.equal(new Set());
+	});
 });

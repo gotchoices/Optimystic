@@ -204,4 +204,35 @@ describe('LevelDBRawStorage', () => {
 	it('getApproximateBytesUsed returns 0 for an empty database', async () => {
 		expect(await storage.getApproximateBytesUsed()).to.equal(0);
 	});
+
+	it('listBlockIds yields exactly the ids of blocks with metadata', async () => {
+		await storage.saveMetadata('b1' as BlockId, { ranges: [[1, 1]], latest: { rev: 1, actionId } });
+		await storage.saveMetadata('b2' as BlockId, { ranges: [[1, 2]], latest: { rev: 2, actionId } });
+
+		const out = new Set<string>();
+		for await (const id of storage.listBlockIds()) out.add(id);
+		expect(out).to.deep.equal(new Set(['b1', 'b2']));
+	});
+
+	it('listBlockIds enumerates only TAG_METADATA keys — higher-tag keys are not decoded as block ids', async () => {
+		// Rows in every OTHER store (pending / revision / transaction / materialized) but NO
+		// metadata. These keys sort above the metadata range (tags 0x02..0x05 vs 0x01), so the
+		// metadataRange upper bound (0x02) must exclude them — none may surface as a block id.
+		await storage.savePendingTransaction('only-pending' as BlockId, actionId, makeTransform());
+		await storage.saveRevision('only-rev' as BlockId, 1, actionId);
+		await storage.saveTransaction('only-tx' as BlockId, actionId, makeTransform());
+		await storage.saveMaterializedBlock('only-mat' as BlockId, actionId, makeBlock('only-mat'));
+		// One genuinely committed block for contrast.
+		await storage.saveMetadata('committed' as BlockId, { ranges: [[1, 1]], latest: { rev: 1, actionId } });
+
+		const out = new Set<string>();
+		for await (const id of storage.listBlockIds()) out.add(id);
+		expect(out).to.deep.equal(new Set(['committed']));
+	});
+
+	it('listBlockIds yields nothing for an empty database', async () => {
+		const out = new Set<string>();
+		for await (const id of storage.listBlockIds()) out.add(id);
+		expect(out).to.deep.equal(new Set());
+	});
 });

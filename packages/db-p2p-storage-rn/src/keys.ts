@@ -59,6 +59,25 @@ export function metadataKey(blockId: string): Uint8Array {
 	return encodeBlockEnvelope(TAG_METADATA, blockId);
 }
 
+/**
+ * Returns the inclusive lower / exclusive upper range covering every metadata
+ * key. Metadata keys are `TAG_METADATA || len(blockId) || blockId` with an empty
+ * suffix, so every metadata key sorts in `[TAG_METADATA, TAG_METADATA+1)`. The
+ * tag bytes are deliberately spaced (0x01, 0x02, ...) so `TAG_METADATA + 1` is
+ * the next tag byte and a clean exclusive upper bound — a revision / pending /
+ * transaction key for the same block (higher tag) falls outside this range.
+ */
+export function metadataRange(): { gte: Uint8Array; lt: Uint8Array } {
+	return { gte: Uint8Array.of(TAG_METADATA), lt: Uint8Array.of(TAG_METADATA + 1) };
+}
+
+/** Decode the `blockId` from a `metadataKey`-encoded key (empty suffix). */
+export function blockIdFromMetadataKey(key: Uint8Array): string {
+	const view = new DataView(key.buffer, key.byteOffset, key.byteLength);
+	const blockIdLen = view.getUint32(1, false);
+	return textDecoder.decode(key.subarray(5, 5 + blockIdLen));
+}
+
 export function revisionKey(blockId: string, rev: number): Uint8Array {
 	const envelope = encodeBlockEnvelope(TAG_REVISIONS, blockId);
 	const out = new Uint8Array(envelope.length + 8);
