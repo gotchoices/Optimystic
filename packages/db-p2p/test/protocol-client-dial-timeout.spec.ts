@@ -91,6 +91,8 @@ describe('ProtocolClient dial timeout', () => {
 		const client = new TestProtocolClient(peerId, network);
 		const parent = new AbortController();
 		const sentinel = new Error('parent aborted');
+		// Deliberate timing (NOT a convergence wait): fire the parent abort at 30ms so it wins the race
+		// against the 5_000ms dial-timeout timer — that ordering is the behavior under test.
 		setTimeout(() => parent.abort(sentinel), 30);
 		let caught: unknown;
 		try {
@@ -136,6 +138,8 @@ describe('ProtocolClient response timeout', () => {
 		const client = new TestProtocolClient(peerId, network);
 		const parent = new AbortController();
 		const sentinel = new Error('parent aborted read');
+		// Deliberate timing (NOT a convergence wait): with no response timer, the read blocks forever, so
+		// this scheduled abort at 30ms is the only thing that ends it — letting real time pass IS the test.
 		setTimeout(() => parent.abort(sentinel), 30);
 		let caught: unknown;
 		try {

@@ -4,6 +4,7 @@ import { generateKeyPair } from '@libp2p/crypto/keys';
 import { multiaddr } from '@multiformats/multiaddr';
 import type { PeerId, Libp2p, Connection } from '@libp2p/interface';
 import type { SerializedTable } from 'p2p-fret';
+import { waitFor } from '@optimystic/db-core/test';
 import {
 	Libp2pKeyPeerNetwork,
 	FindCoordinatorError,
@@ -224,8 +225,8 @@ describe('Libp2pKeyPeerNetwork', () => {
 			// Trigger persist
 			(network as any).persistState();
 
-			// Wait a tick for the fire-and-forget save
-			await new Promise(resolve => setTimeout(resolve, 10));
+			// Poll for the fire-and-forget save to land (in-process, so the default fast cadence applies).
+			await waitFor(() => persistence.saved !== undefined, { description: 'the fire-and-forget persistState() save completed' });
 
 			expect(persistence.saved).to.not.be.undefined;
 			expect(persistence.saved!.version).to.equal(1);
@@ -252,7 +253,7 @@ describe('Libp2pKeyPeerNetwork', () => {
 			const network = new Libp2pKeyPeerNetwork(libp2p, 16, undefined, 'forming', persistence);
 
 			(network as any).persistState();
-			await new Promise(resolve => setTimeout(resolve, 10));
+			await waitFor(() => persistence.saved !== undefined, { description: 'the fire-and-forget persistState() save captured the FRET table' });
 
 			expect(persistence.saved).to.not.be.undefined;
 			expect(persistence.saved!.fretTable).to.deep.equal(mockFretTable);

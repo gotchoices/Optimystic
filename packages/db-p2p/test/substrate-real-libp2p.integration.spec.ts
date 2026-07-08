@@ -50,7 +50,7 @@ import { DEFAULT_COHORT_TOPIC_PROTOCOLS } from '../src/cohort-topic/protocols.js
 import { DEFAULT_MATCHMAKING_PROTOCOLS } from '../src/matchmaking/protocols.js';
 import { createLibp2pMatchmakingTransport } from '../src/matchmaking/query-transport.js';
 import { SeekerWalkClient, type SeekerWalkResult } from '../src/matchmaking/seeker-walk-client.js';
-import { waitFor, delay } from '@optimystic/db-core/test';
+import { waitFor, waitForValue } from '@optimystic/db-core/test';
 import { signedWillingness, type Member } from '../src/testing/cohort-topic-mesh-harness.js';
 import { createReactivitySelfMembershipGate, reactivityTailBytes } from '../src/cohort-topic/reactivity-membership-gate.js';
 import { DEFAULT_REACTIVITY_PROTOCOLS } from '../src/reactivity/protocols.js';
@@ -301,7 +301,9 @@ async function memberOf(key: PrivateKey, peerId: PeerId): Promise<Member> {
 			}
 		}
 		await Promise.allSettled(sends);
-		await delay(300); // let the async inbound /cohort-gossip handlers merge the willingness contributions
+		// No fixed settle here: every caller (`quorumOn`) polls the merged view with `waitFor`, so the
+		// inbound /cohort-gossip handlers are given time to merge by the poll itself — early-exiting the
+		// instant the quorum appears instead of padding a fixed wait.
 	}
 
 	/** Seed willingness for `coord` and wait until the primary's view carries the strict-majority quorum. */
@@ -327,19 +329,25 @@ async function memberOf(key: PrivateKey, peerId: PeerId): Promise<Member> {
 	async function publishCohortCert(coord: RingCoord): Promise<MembershipCertV1> {
 		const primaryEngine = engineOf(primaryFor(coord), coord);
 		let lastErr: unknown;
-		for (let attempt = 0; attempt < 40; attempt++) {
-			try {
-				const cert = await primaryEngine.onStabilized(Date.now());
-				if (cert !== undefined) return cert;
-			} catch (err) {
-				// Transient: a `/sign` round that gathered < minSigs before all warm connections settled. The
-				// publisher published nothing (it threshold-signs before publishing), so a retry is a clean first
-				// publish. Once it succeeds, `onStabilized` returns the cert; a later no-op return never reaches here.
-				lastErr = err;
-			}
-			await delay(500);
+		try {
+			// Poll `onStabilized` on the real /sign RPC cadence, returning the first published cert.
+			// `undefined` = a `/sign` round gathered < minSigs before all warm connections settled (transient:
+			// the publisher threshold-signs before publishing, so nothing leaked); a thrown error is the same
+			// transient, captured for the timeout message. Either way keep polling — early-exit on the first cert.
+			return await waitForValue(async () => {
+				try {
+					return await primaryEngine.onStabilized(Date.now());
+				} catch (err) {
+					lastErr = err;
+					return undefined;
+				}
+			// NOTE: 20s wall-clock bound (the old loop was 40 attempts × ~500ms + RPC, so a longer effective
+			// ceiling when each /sign RPC was slow). Healthy runs publish on the first or second poll; if a
+			// loaded CI machine makes onStabilized slow enough to time out here, raise timeoutMs.
+			}, { timeoutMs: 20_000, intervalMs: 500, description: 'the cohort membership cert reached quorum over real /sign RPC' });
+		} catch {
+			throw lastErr ?? new Error('membership cert never reached quorum');
 		}
-		throw lastErr ?? new Error('membership cert never reached quorum');
 	}
 
 	/** A fresh real-keyed participant whose deterministic slot-primary (under `engine`'s epoch) is the routed primary. */

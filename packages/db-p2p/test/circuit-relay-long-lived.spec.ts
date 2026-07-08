@@ -155,6 +155,9 @@ describe('Circuit-relay long-lived connections', function () {
 			} finally {
 				await stream.close();
 			}
+			// Intentional real-time pacing (NOT a convergence wait): the test is that a *long-lived* relay
+			// connection carries sustained traffic past the byte cap, so the passage of real time between dials
+			// is the thing under test. Bounded by this.timeout(120_000) above; do not convert to a condition poll.
 			await new Promise(r => setTimeout(r, intervalMs));
 		}
 	});
@@ -188,6 +191,8 @@ describe('Circuit-relay long-lived connections', function () {
 				failureSeen = true;
 				break;
 			}
+			// Intentional real-time pacing (see the sibling test): sustained traffic over real time is what
+			// surfaces the reset under the default limit. Bounded by this.timeout(180_000); not a convergence wait.
 			await new Promise(r => setTimeout(r, 500));
 		}
 		expect(failureSeen, 'control variant should surface a relay reset under the default limit').to.equal(true);
