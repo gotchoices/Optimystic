@@ -6,6 +6,7 @@ import { RebalanceMonitor, type RebalanceEvent, type RebalanceMonitorDeps } from
 import { PartitionDetector } from '../src/cluster/partition-detector.js';
 import { ArachnodeFretAdapter, type ArachnodeInfo } from '../src/storage/arachnode-fret-adapter.js';
 import type { FretService } from 'p2p-fret';
+import { waitFor, delay } from '@optimystic/db-core/test';
 
 // --- Helpers ---
 
@@ -256,8 +257,8 @@ describe('RebalanceMonitor', () => {
 			mockLibp2p.emit('connection:close');
 			mockLibp2p.emit('connection:open');
 
-			// Wait for debounce
-			await new Promise(r => setTimeout(r, 100));
+			// Wait until the debounce collapses the rapid changes into a single fired check.
+			await waitFor(() => events.length >= 1, { description: 'the debounced topology changes fired a single rebalance check' });
 
 			// Should have at most 1 event (gained block-1)
 			expect(events.length).to.be.at.most(1);
@@ -281,8 +282,10 @@ describe('RebalanceMonitor', () => {
 
 			await monitor.stop();
 
-			// Wait past debounce window
-			await new Promise(r => setTimeout(r, 100));
+			// Residual bounded sleep: this is a NEGATIVE assertion (nothing fires), which a condition
+			// poll cannot express. stop() clears the debounce timer, so waiting past the 50ms debounce
+			// window proves no event escapes the stop.
+			await delay(100);
 
 			expect(events).to.have.length(0);
 		});
@@ -339,14 +342,17 @@ describe('RebalanceMonitor', () => {
 
 			await monitor.start();
 
-			// First topology change
+			// First topology change fires one event (debounce 10ms).
 			mockLibp2p.emit('connection:open');
-			await new Promise(r => setTimeout(r, 50));
+			await waitFor(() => events.length >= 1, { description: 'the first topology change fired one rebalance event' });
 
-			// Second topology change — should be throttled
+			// Second topology change — should be throttled by minRebalanceIntervalMs.
 			mockFret.setCohort('*', [peerId2.toString()]);
 			mockLibp2p.emit('connection:close');
-			await new Promise(r => setTimeout(r, 50));
+			// Residual bounded sleep: proving the second change does NOT emit within the throttle window
+			// is a negative assertion. Wait past the 10ms debounce so the throttled check has run and been
+			// rejected, then confirm no extra event landed.
+			await delay(50);
 
 			// Only the first event should have fired (gained block-1)
 			expect(events.length).to.be.at.most(1);
@@ -393,8 +399,8 @@ describe('RebalanceMonitor', () => {
 			await monitor.start();
 			mockLibp2p.emit('connection:open');
 
-			// Wait for debounce
-			await new Promise(r => setTimeout(r, 50));
+			// Wait until the debounced rebalance fired and invoked every registered handler.
+			await waitFor(() => calls1.length >= 1 && calls2.length >= 1, { description: 'the debounced rebalance fired and invoked all handlers' });
 
 			expect(calls1).to.have.length(1);
 			expect(calls2).to.have.length(1);
@@ -419,8 +425,8 @@ describe('RebalanceMonitor', () => {
 			await monitor.start();
 			mockLibp2p.emit('connection:open');
 
-			// Wait for debounce
-			await new Promise(r => setTimeout(r, 50));
+			// Wait until the surviving handler recorded the event (the first handler throws).
+			await waitFor(() => calls.length >= 1, { description: 'the second handler still fired despite the first throwing' });
 
 			expect(calls).to.have.length(1);
 

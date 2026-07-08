@@ -4,6 +4,7 @@ import { BlockStorage } from '../src/storage/block-storage.js';
 import { MemoryRawStorage } from '../src/storage/memory-storage.js';
 import type { BlockId, ActionId, ActionRev, PendRequest, Transforms, IBlock, BlockHeader, CollectionChangeEvent } from '@optimystic/db-core';
 import { isBlockChangeNotifier, Latches } from '@optimystic/db-core';
+import { delay } from '@optimystic/db-core/test';
 
 const makeHeader = (id: string): BlockHeader => ({
 	id: id as BlockId,
@@ -569,7 +570,8 @@ describe('StorageRepo', () => {
 				// Ample event-loop turns: with the fix the get parks on the held latch; pre-fix it has
 				// already promoted a2 despite the held latch. A held mutex never releases on its own, so
 				// this is not a flaky race — the get simply cannot complete while the latch is out.
-				await new Promise((r) => setTimeout(r, 25));
+				// Residual bounded sleep: proving the get does NOT resolve is a negative assertion.
+				await delay(25);
 
 				expect(resolved).to.equal(false);
 				// meta.latest must NOT have advanced, and rev 2 must NOT have been written, under the held latch.
@@ -652,7 +654,8 @@ describe('StorageRepo', () => {
 			await Promise.race([reached, c]);
 			// Let the commit make progress: pre-fix it runs unlatched and completes within the window;
 			// post-fix, if the promotion holds the latch, the commit is blocked and this simply elapses.
-			await Promise.race([c, new Promise((r) => setTimeout(r, 25))]);
+			// Residual bounded window: both outcomes are valid, so there is no single state to poll on.
+			await Promise.race([c, delay(25)]);
 			gateResolve();
 			await Promise.all([g, c]);
 
@@ -694,7 +697,8 @@ describe('StorageRepo', () => {
 			try {
 				// A held mutex never self-releases, so a correctly-latched recover cannot complete in this
 				// window; a bypassing one has already advanced latest to rev 2 despite the held latch.
-				await new Promise((r) => setTimeout(r, 25));
+				// Residual bounded sleep: proving recover does NOT resolve is a negative assertion.
+				await delay(25);
 				expect(resolved).to.equal(false);
 				expect((await storage.getLatest())?.rev, 'latest not advanced under held latch').to.equal(1);
 			} finally {

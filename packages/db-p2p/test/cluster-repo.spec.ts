@@ -10,6 +10,7 @@ import { generateKeyPair } from '@libp2p/crypto/keys';
 import { sha256 } from 'multiformats/hashes/sha2';
 import { base58btc } from 'multiformats/bases/base58';
 import { toString as uint8ArrayToString } from 'uint8arrays/to-string';
+import { waitFor, delay } from '@optimystic/db-core/test';
 
 // ─── Canonical JSON for deterministic hashing ───
 
@@ -965,8 +966,8 @@ describe('ClusterMember', () => {
 			await memberWithStore.update(afterPromise);
 			memberWithStore.dispose();
 
-			// Wait for fire-and-forget markExecuted to complete
-			await new Promise(resolve => setTimeout(resolve, 50));
+			// Wait until the fire-and-forget markExecuted lands in the persistent store.
+			await waitFor(async () => await stateStore.wasExecuted(record.messageHash), { description: 'the fire-and-forget markExecuted persisted the executed marker' });
 
 			// Verify persistent store has the executed marker
 			expect(await stateStore.wasExecuted(record.messageHash)).to.equal(true);
@@ -1012,8 +1013,8 @@ describe('ClusterMember', () => {
 			expect(mockRepo1.pendCalls.length).to.equal(1);
 			memberWithStore.dispose();
 
-			// Wait for fire-and-forget markExecuted to complete
-			await new Promise(resolve => setTimeout(resolve, 50));
+			// Wait until the fire-and-forget markExecuted lands in the persistent store.
+			await waitFor(async () => await stateStore.wasExecuted(record.messageHash), { description: 'the fire-and-forget markExecuted persisted the executed marker' });
 
 			// Simulate restart with new repo
 			const mockRepo2 = new MockRepo();
@@ -1071,9 +1072,11 @@ describe('ClusterMember', () => {
 			expect(throwingRepo.pendCalls.length).to.equal(0);
 			// In-memory guard rolled back by the catch block.
 			expect(member.wasTransactionExecuted(record.messageHash)).to.equal(false);
-			// The durable marker must NEVER have been written — it lands only after apply
-			// succeeds. Give any (incorrect) fire-and-forget write a chance to land first.
-			await new Promise(resolve => setTimeout(resolve, 50));
+			// The durable marker must NEVER have been written — it lands only after apply succeeds.
+			// Residual bounded sleep: this is a NEGATIVE assertion (the marker must NOT appear), which a
+			// condition poll cannot express — give any (incorrect) fire-and-forget write a chance to
+			// land first, then confirm it did not.
+			await delay(50);
 			expect(await stateStore.wasExecuted(record.messageHash)).to.equal(false);
 			member.dispose();
 
@@ -1095,8 +1098,8 @@ describe('ClusterMember', () => {
 			};
 			await restartedMember.update(fullRecord);
 			expect(healthyRepo.pendCalls.length).to.equal(1);
-			// Apply succeeded this time, so the durable marker is now set.
-			await new Promise(resolve => setTimeout(resolve, 50));
+			// Apply succeeded this time, so the durable marker is now set — wait for that write to land.
+			await waitFor(async () => await stateStore.wasExecuted(record.messageHash), { description: 'the durable executed marker was written after a successful apply' });
 			expect(await stateStore.wasExecuted(record.messageHash)).to.equal(true);
 			restartedMember.dispose();
 		});

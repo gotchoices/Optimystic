@@ -11,6 +11,7 @@ import {
 import { PartitionDetector } from '../src/cluster/partition-detector.js';
 import { buildBlockTransferProtocol } from '../src/cluster/block-transfer-service.js';
 import type { FretService } from 'p2p-fret';
+import { waitFor, delay } from '@optimystic/db-core/test';
 
 // --- Helpers ---
 
@@ -341,8 +342,10 @@ describe('SpreadOnChurnMonitor', () => {
 			mockLibp2p.emit('connection:close');
 			await monitor.stop();
 
-			// Wait past debounce
-			await new Promise(r => setTimeout(r, 60));
+			// Residual bounded sleep: this is a NEGATIVE assertion (no spread after stop), which a
+			// condition poll cannot express. stop() clears the debounce timer, so waiting past the 20ms
+			// debounce window proves nothing escaped.
+			await delay(60);
 			expect(events).to.have.length(0);
 		});
 	});
@@ -707,8 +710,9 @@ describe('SpreadOnChurnMonitor', () => {
 			mockLibp2p.emit('connection:close');
 			mockLibp2p.emit('connection:close');
 
-			// Wait for debounce
-			await new Promise(r => setTimeout(r, 80));
+			// Wait until the debounce collapses the rapid departures into a single fired spread check
+			// (the mock setup is eligible → exactly one event, matching the emission tests below).
+			await waitFor(() => events.length >= 1, { description: 'the debounced rapid departures fired a single spread check' });
 
 			// Should coalesce into at most 1 event
 			expect(events.length).to.be.at.most(1);
@@ -744,7 +748,9 @@ describe('SpreadOnChurnMonitor', () => {
 
 			await monitor.start();
 			mockLibp2p.emit('connection:close');
-			await new Promise(r => setTimeout(r, 60));
+			// Residual bounded sleep: NEGATIVE assertion (enabled:false skips all spread logic, so no
+			// event ever fires). Wait past the 20ms debounce window to prove nothing was emitted.
+			await delay(60);
 
 			expect(events).to.have.length(0);
 			await monitor.stop();

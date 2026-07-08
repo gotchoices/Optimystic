@@ -12,6 +12,7 @@ import { EngineHealthMonitor } from '../src/dispute/engine-health-monitor.js';
 import type { ValidationEvidence, ArbitrationVote, DisputeChallenge, DisputeResolution } from '../src/dispute/types.js';
 import { PeerReputationService } from '../src/reputation/peer-reputation.js';
 import { PenaltyReason } from '../src/reputation/types.js';
+import { waitFor } from '@optimystic/db-core/test';
 import { sampleArbitrators, coordinatePreimage, type NearestResolver } from '../src/dispute/arbitrator-selection.js';
 import { sortPeersByDistance, type KnownPeer } from '../src/routing/responsibility.js';
 import { hashKey } from 'p2p-fret';
@@ -175,7 +176,7 @@ describe('EngineHealthMonitor', () => {
 		expect(monitor.isUnhealthy()).to.be.true;
 	});
 
-	it('should auto-recover when losses fall below threshold', () => {
+	it('should auto-recover when losses fall below threshold', async () => {
 		const monitor = new EngineHealthMonitor({
 			engineHealthDisputeThreshold: 3,
 			engineHealthWindowMs: 25, // window large enough that 3 synchronous recordDisputeLoss() calls can't outrun it
@@ -185,13 +186,12 @@ describe('EngineHealthMonitor', () => {
 		monitor.recordDisputeLoss();
 		expect(monitor.isUnhealthy()).to.be.true;
 
-		// Wait for losses to expire
-		return new Promise<void>((resolve) => {
-			setTimeout(() => {
-				expect(monitor.isUnhealthy()).to.be.false;
-				resolve();
-			}, 100);
-		});
+		// isUnhealthy() prunes losses outside the window on each call, so once the 25ms window elapses
+		// it auto-recovers. Poll it rather than sleeping a fixed span — fails fast if recovery breaks.
+		// NOTE: still advances on real wall-clock (EngineHealthMonitor has no injectable clock); if this
+		// flakes under CI load, add an injectable `now` to the monitor and drive the window deterministically.
+		await waitFor(() => !monitor.isUnhealthy(), { description: 'the dispute-loss window elapsed and the monitor auto-recovered' });
+		expect(monitor.isUnhealthy()).to.be.false;
 	});
 
 	it('should reset state', () => {

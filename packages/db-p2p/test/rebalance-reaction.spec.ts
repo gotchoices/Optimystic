@@ -10,6 +10,7 @@ import { ArachnodeFretAdapter } from '../src/storage/arachnode-fret-adapter.js';
 import type { RestorationCoordinator } from '../src/storage/restoration-coordinator.js';
 import type { BlockArchive } from '../src/storage/struct.js';
 import type { FretService } from 'p2p-fret';
+import { waitFor } from '@optimystic/db-core/test';
 
 /**
  * The `onRebalance → BlockTransferCoordinator.handleRebalanceEvent` CONNECTION wired on a live node
@@ -182,7 +183,10 @@ describe('RebalanceMonitor → BlockTransferCoordinator reaction wiring', () => 
 
 		await monitor.start();
 		mockLibp2p.emit('connection:open');
-		await new Promise(r => setTimeout(r, 80)); // debounce + async reaction
+		// Poll the terminal effect of the whole chain (debounce → emit → handler → coordinator pull)
+		// rather than sleeping a fixed span: the restore call is the deepest observable, and the handler
+		// pushes to `events` before invoking the coordinator, so a restore proves the event arrived too.
+		await waitFor(() => restoration.restoreCalls.includes('block-1'), { description: 'the topology-triggered gained event drove a pull via restoration' });
 		await monitor.stop();
 
 		expect(events, 'rebalance event reached the onRebalance handler').to.have.length(1);
@@ -203,7 +207,8 @@ describe('RebalanceMonitor → BlockTransferCoordinator reaction wiring', () => 
 		// Now self drops out; the cohort members become the new owners.
 		mockFret.setCohort([peerId2.toString()]);
 		mockLibp2p.emit('connection:close');
-		await new Promise(r => setTimeout(r, 80));
+		// The push dials a new owner; wait on that terminal effect rather than a fixed span.
+		await waitFor(() => peerNetwork.connectCalls.length > 0, { description: 'the topology-triggered lost event drove a push (dial) to a new owner' });
 		await monitor.stop();
 
 		expect(events, 'rebalance event reached the onRebalance handler').to.have.length(1);

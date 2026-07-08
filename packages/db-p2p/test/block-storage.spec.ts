@@ -5,6 +5,7 @@ import { MemoryRawStorage } from '../src/storage/memory-storage.js';
 import type { BlockArchive, BlockMetadata, RestoreCallback } from '../src/storage/struct.js';
 import { hashString } from '@optimystic/db-core';
 import type { BlockId, ActionId, ActionRev, IBlock, BlockHeader, Transforms } from '@optimystic/db-core';
+import { delay } from '@optimystic/db-core/test';
 
 /**
  * Coverage for the `meta.ranges` honesty invariant: `ranges` must state EXACTLY which
@@ -351,7 +352,9 @@ describe('BlockStorage meta.ranges honesty', () => {
 				if (this.inFlight > 1) this.overlaps++;
 				try {
 					// Real async gap: yields the event loop so a non-shared latch's second read overlaps.
-					await new Promise<void>(resolve => setTimeout(resolve, 5));
+					// NOTE: deliberate concurrency-window widener, NOT a settle wait — it manufactures the
+					// overlap that exposes an unshared latch; there is no observable state to condition-poll on.
+					await delay(5);
 					return await super.getMetadata(id);
 				} finally {
 					this.inFlight--;

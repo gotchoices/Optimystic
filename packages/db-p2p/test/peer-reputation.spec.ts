@@ -1,6 +1,7 @@
 import { expect } from 'chai';
 import { PeerReputationService } from '../src/reputation/peer-reputation.js';
 import { PenaltyReason, DEFAULT_PENALTY_WEIGHTS } from '../src/reputation/types.js';
+import { waitFor } from '@optimystic/db-core/test';
 
 describe('PeerReputationService', () => {
 	const peerId = 'QmTestPeer1234567890';
@@ -48,22 +49,22 @@ describe('PeerReputationService', () => {
 		expect(svc.isDeprioritized(peerId)).to.be.true;
 	});
 
-	it('should decay penalties over time', () => {
+	it('should decay penalties over time', async () => {
 		// Use a very short half-life for testing
 		const svc = new PeerReputationService({ halfLifeMs: 100 });
 		svc.reportPeer(peerId, PenaltyReason.InvalidSignature); // weight 50
 		const scoreBefore = svc.getScore(peerId);
 		expect(scoreBefore).to.be.closeTo(50, 1);
 
-		// Wait for one half-life
-		return new Promise<void>(resolve => {
-			setTimeout(() => {
-				const scoreAfter = svc.getScore(peerId);
-				expect(scoreAfter).to.be.lessThan(scoreBefore * 0.7); // should be roughly half
-				expect(scoreAfter).to.be.greaterThan(0);
-				resolve();
-			}, 120);
-		});
+		// getScore() recomputes decay from Date.now() on each call, so poll it rather than sleeping a
+		// fixed span: it returns as soon as the score has decayed past 70% of its initial weight
+		// (roughly a half-life) and fails fast if decay never happens.
+		// NOTE: this poll still advances on real wall-clock (PeerReputationService has no injectable
+		// clock); if it ever flakes under CI load, add an injectable `now` to the service and drive it.
+		await waitFor(() => svc.getScore(peerId) < scoreBefore * 0.7, { description: 'the penalty decayed below 70% of its initial weight after roughly a half-life' });
+		const scoreAfter = svc.getScore(peerId);
+		expect(scoreAfter).to.be.lessThan(scoreBefore * 0.7); // should be roughly half
+		expect(scoreAfter).to.be.greaterThan(0);
 	});
 
 	it('should record successes', () => {

@@ -7,6 +7,7 @@ import { RebalanceMonitor } from '../src/cluster/rebalance-monitor.js';
 import { PartitionDetector } from '../src/cluster/partition-detector.js';
 import { ArachnodeFretAdapter } from '../src/storage/arachnode-fret-adapter.js';
 import type { FretService } from 'p2p-fret';
+import { waitFor } from '@optimystic/db-core/test';
 
 /**
  * **Unified owned-block tracked set** (`5.2-unify-monitor-tracked-block-set`). On a live node the
@@ -72,8 +73,6 @@ class MockFret {
 	setActivityHandler(): void {}
 	iterativeLookup(): any { return (async function*() {})(); }
 }
-
-const delay = (ms: number): Promise<void> => new Promise(r => setTimeout(r, ms));
 
 describe('unified owned-block tracked set (spread + rebalance share one Set)', () => {
 	let selfId: PeerId;
@@ -147,10 +146,14 @@ describe('unified owned-block tracked set (spread + rebalance share one Set)', (
 		const rebalance = makeRebalance(shared);
 
 		// Mirror the node-base onRebalance handler: a lost block is untracked (clears the shared Set
-		// entry + the snapshot); a gained block is (re)added to the shared Set.
+		// entry + the snapshot); a gained block is (re)added to the shared Set. Also record which
+		// blocks the monitor reported gained/lost so the test can poll on the monitor having actually
+		// emitted each event rather than sleeping a fixed span.
+		const gained: string[] = [];
+		const lost: string[] = [];
 		rebalance.onRebalance((event) => {
-			for (const blockId of event.gained) shared.add(blockId);
-			for (const blockId of event.lost) rebalance.untrackBlock(blockId);
+			for (const blockId of event.gained) { shared.add(blockId); gained.push(blockId); }
+			for (const blockId of event.lost) { rebalance.untrackBlock(blockId); lost.push(blockId); }
 		});
 
 		// One owned block, fed once into the shared Set.
@@ -169,14 +172,16 @@ describe('unified owned-block tracked set (spread + rebalance share one Set)', (
 
 		// Drive a real rebalance lost event through the monitor's debounced emit path.
 		await rebalance.start();
-		// Baseline: self IS in the cohort → gained block-1, snapshot = responsible.
+		// Baseline: self IS in the cohort → gained block-1, snapshot = responsible. Wait for the gained
+		// event before shifting topology: the debounced check must establish wasResponsible=true first,
+		// otherwise the second emit would only reset the debounce timer and no `lost` would be derived.
 		mockFret.setCohort([selfId.toString()]);
 		mockLibp2p.emit('connection:open');
-		await delay(50);
+		await waitFor(() => gained.includes('block-1'), { description: 'the rebalance monitor emitted the gained event (wasResponsible now set)' });
 		// Topology shifts so self is no longer responsible → lost block-1 → handler evicts it.
 		mockFret.setCohort([peer2.toString()]);
 		mockLibp2p.emit('connection:close');
-		await delay(50);
+		await waitFor(() => lost.includes('block-1'), { description: 'the rebalance monitor emitted the lost event and the handler evicted the block' });
 		await rebalance.stop();
 
 		// The lost event removed block-1 from the SHARED Set (both monitors drop it).

@@ -9,6 +9,7 @@ import { StorageRepo, commitLatchKey, withBlockCommitLatch } from '../src/storag
 import { BlockStorage } from '../src/storage/block-storage.js';
 import { MemoryRawStorage } from '../src/storage/memory-storage.js';
 import type { BlockMetadata } from '../src/storage/struct.js';
+import { waitFor, delay } from '@optimystic/db-core/test';
 import {
 	buildDisputeResolutionProof,
 	verifyInvalidationCertificate,
@@ -756,12 +757,12 @@ describe('applyInvalidation', () => {
 				).then(r => { applied = true; return r; });
 
 				// Drive apply forward (dedup → cert verify → compute) until it reaches and blocks on the latch.
-				while (!reachedWrite) {
-					await new Promise(res => setTimeout(res, 0));
-				}
-				// A couple more turns confirm it is parked inside acquire (latch held) and has NOT written.
-				await new Promise(res => setTimeout(res, 0));
-				await new Promise(res => setTimeout(res, 0));
+				await waitFor(() => reachedWrite, { description: 'apply reached and blocked on the held commit latch' });
+				// A couple more event-loop turns confirm it is parked inside acquire (latch held) and has
+				// NOT written. Residual micro-yields: proving apply does NOT proceed is a negative assertion
+				// a condition poll cannot express, so give the (buggy) unlatched path turns to run first.
+				await delay(0);
+				await delay(0);
 				expect(applied).to.equal(false);
 				expect((await createBlockStorage(blockId).getLatest())!.rev).to.equal(2);
 

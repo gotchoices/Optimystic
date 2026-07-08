@@ -10,6 +10,7 @@ import {
 	DEFAULT_THRESHOLDS,
 	type IPeerReputation,
 } from '../src/reputation/types.js';
+import { waitFor } from '@optimystic/db-core/test';
 
 describe('IPeerReputation contract (review)', () => {
 	let svc: IPeerReputation;
@@ -153,19 +154,17 @@ describe('IPeerReputation contract (review)', () => {
 
 	// --- Decay semantics ---
 
-	it('score approaches zero as time passes well beyond half-life', () => {
+	it('score approaches zero as time passes well beyond half-life', async () => {
 		// Use a very short half-life
 		const svc2 = new PeerReputationService({ halfLifeMs: 10 });
 		svc2.reportPeer(peerA, PenaltyReason.Equivocation); // weight = 100
 
-		return new Promise<void>(resolve => {
-			setTimeout(() => {
-				// After ~100ms = 10 half-lives, decay = 2^-10 ≈ 0.001, score ≈ 0.1
-				const score = svc2.getScore(peerA);
-				expect(score).to.be.lessThan(1);
-				resolve();
-			}, 100);
-		});
+		// getScore() recomputes decay from Date.now() on each call. Poll until the weight has decayed
+		// below 1 (several half-lives) rather than sleeping a fixed span.
+		// NOTE: still advances on real wall-clock (no injectable clock in PeerReputationService); if it
+		// flakes under CI load, add an injectable `now` to the service and drive it deterministically.
+		await waitFor(() => svc2.getScore(peerA) < 1, { description: 'the penalty decayed below 1 after several half-lives' });
+		expect(svc2.getScore(peerA)).to.be.lessThan(1);
 	});
 
 	// --- Context tracking ---
