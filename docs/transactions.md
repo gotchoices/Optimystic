@@ -957,15 +957,14 @@ export class TransactionCoordinator {
     }
   }
 
-  private hashOperations(operations: any[]): string {
-    const operationsData = JSON.stringify(operations);
-    let hash = 0;
-    for (let i = 0; i < operationsData.length; i++) {
-      const char = operationsData.charCodeAt(i);
-      hash = ((hash << 5) - hash) + char;
-      hash = hash & hash;
-    }
-    return `ops:${Math.abs(hash).toString(36)}`;
+  // Operations hash: sort + canonical JSON + SHA-256, wrapped in a versioned
+  // `ops.vN:` token. This illustrative sketch is NOT the algorithm — the
+  // authoritative, cross-node-binding definition lives in
+  // db-core/src/transaction/operations-hash.ts (hashOperations) and is specified
+  // normatively below under "Operations Hash — Canonical Serialization". Do not
+  // reimplement it here; import it.
+  private async hashOperations(operations: Operation[]): Promise<string> {
+    return hashOperations(operations); // from ./operations-hash.js — see normative spec
   }
 
   private async coordinateTransaction(
@@ -1182,11 +1181,23 @@ export class TransactionValidator {
     // 6. Collect ALL operations from temp coordinator's trackers
     const localOperations = await tempCoordinator.collectOperations(transaction.stampId);
 
-    // 7. Compute hash of ALL operations (entire transaction)
-    const localOperationsHash = this.hashOperations(localOperations);
+    // 7. Compute hash of ALL operations (entire transaction), using the SHARED
+    //    canonical module so an honest sender and this validator hash identical bytes.
+    const localOperationsHash = await hashOperations(localOperations);
 
-    // 8. Compare with sender's operations hash
+    // 8. Compare with sender's operations hash. Two distinct failure causes (see the
+    //    normative spec below and TransactionValidator): a FORMAT-VERSION difference
+    //    (the `ops.vN:` token disagrees) is unsupported-version skew — a legible,
+    //    diagnosable error, NOT the ambiguous content-mismatch; a same-version byte
+    //    difference is a genuine operations mismatch.
     if (localOperationsHash !== operationsHash) {
+      const senderVersion = opsHashVersion(operationsHash);
+      if (senderVersion !== OPS_HASH_VERSION) {
+        return {
+          valid: false,
+          reason: `Unsupported operations-hash format version: local=${OPS_HASH_VERSION}, sender=${senderVersion ?? 'unrecognized'}`
+        };
+      }
       return {
         valid: false,
         reason: `Operations hash mismatch: local=${localOperationsHash}, sender=${operationsHash}`
@@ -1216,19 +1227,89 @@ export class TransactionValidator {
     );
   }
 
-  private hashOperations(operations: Operation[]): string {
-    // Deterministic hash of all operations
-    const serialized = JSON.stringify(
-      operations.map(op => ({
-        blockId: op.blockId,
-        type: op.type,
-        data: op.data
-      }))
-    );
-    return hash(serialized);
+  // See "Operations Hash — Canonical Serialization" below: the deterministic hash is
+  // the shared db-core/src/transaction/operations-hash.ts, imported by BOTH the
+  // coordinator and the validator so the two sides cannot diverge. Do not inline a
+  // second copy here — a private per-class hash is exactly the drift this module removes.
+  private async hashOperations(operations: Operation[]): Promise<string> {
+    return hashOperations(operations); // from ./operations-hash.js
   }
 }
 ```
+
+## Operations Hash — Canonical Serialization
+
+> **Normative.** The authoritative implementation is
+> `db-core/src/transaction/operations-hash.ts` (`hashOperations`,
+> `canonicalStringify`, `collectOperations`). The pseudocode elsewhere in this
+> document is illustrative; where it disagrees with that module, the module wins.
+> Every implementation that produces or verifies an operations hash MUST hash the
+> identical bytes defined here, or two honest nodes will reject each other.
+
+The **operations hash** is the fingerprint a coordinator sends in
+`PendRequest.operationsHash` and every validator independently recomputes and
+compares to agree that a transaction's operations match. It is recomputed fresh
+on both sides and is **never persisted** — distinct from `transaction.id`
+(`createTransactionId`, a hash of `stamp.id + statements + reads`) which IS
+written into logs and block references. Because the ops-hash is not in history,
+changing its format cannot retroactively invalidate committed transactions.
+
+### The bytes (v1)
+
+1. **Collect** every block operation across all collections into a flat list
+   (`collectOperations`). Each operation is one of:
+   `{ type:'insert', collectionId, blockId, block }`,
+   `{ type:'update', collectionId, blockId, operations }`,
+   `{ type:'delete', collectionId, blockId }`.
+2. **Sort** by the tuple **`(collectionId, blockId, type)`** — plain string
+   comparison on `collectionId` then `blockId`, and a fixed type rank
+   `insert < update < delete` as the final tiebreak (the semantic apply order).
+   This makes the sequence independent of the order operations were collected in.
+3. **Canonically stringify** the sorted list (`canonicalStringify`): recursively
+   **sort object keys** ascending, but **preserve array element order** (a
+   `BlockOperations` list `[entity, index, deleteCount, inserted]` is ordered and
+   semantically meaningful). Leaf semantics mirror `JSON.stringify`
+   (`undefined`/function/symbol object-values dropped, the same in arrays encode
+   as `null`, non-finite numbers as `null`).
+4. **Hash** the resulting string with SHA-256, encoded base64url (`hashString`).
+5. **Wrap** the hash in a versioned token: **`ops.v1:<hash>`**. The exact string
+   fed into step 4 (steps 1–3, WITHOUT the token) is available as
+   `canonicalOperationsPayload(operations)`.
+
+### Two dimensions must both match
+
+Two honest nodes agree only if BOTH of these line up — the docs name them together
+because either one drifting produces a different hash:
+
+- **`engineId`** (stamped in the `TransactionStamp`, e.g. `quereus@0.5.3`) versions
+  the *operation content* an engine derives from the same statements.
+- the **ops-hash format version** — the `vN` in the `ops.vN:` token, a single
+  exported constant `OPS_HASH_VERSION` — versions the *serialization of that
+  content into bytes* (the sort key, `canonicalStringify` rules, and the hash step
+  above).
+
+### Version skew is detected, not silently rejected
+
+A validator reads the sender's declared version off the token (`opsHashVersion`).
+When it differs from the local `OPS_HASH_VERSION` — a foreign `vN`, a bare legacy
+`ops:` token, or an unparseable string — the validator returns a **distinct
+"unsupported operations-hash format version" error** naming local vs. sender,
+rather than the ambiguous `Operations hash mismatch`. A malformed or absent token
+is treated as an unsupported/foreign version, **never** as an accidental content
+match.
+
+This is **detection only.** A node does *not* cross-compute historical formats: it
+recognizes that a peer speaks a different version, but cannot reproduce that peer's
+bytes. A mixed-version cluster therefore fails **legibly**, not interoperably;
+multi-version compatibility is future work if rolling upgrades become supported.
+
+### Forward dependency: client signatures
+
+A future client signature (`design-client-transaction-signatures`) is intended to
+cover the canonical serialized byte form pinned here. Bind it to
+`canonicalOperationsPayload(...)` (paired with `OPS_HASH_VERSION` to record which
+format the bytes belong to) so the signature covers the **same** bytes the
+validators hash, rather than re-deriving the serialization and risking drift.
 
 ## Package Structure
 

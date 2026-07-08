@@ -121,22 +121,76 @@ export function canonicalStringify(value: unknown): string {
 }
 
 /**
+ * Current operations-hash FORMAT VERSION. Versions the *serialization* of operations
+ * into bytes (the sort key, {@link canonicalStringify} rules, and the SHA-256/base64url
+ * step) — distinct from `engineId` in the TransactionStamp, which versions the operation
+ * *content* an engine produces from the same statements. Two honest nodes must agree on
+ * BOTH dimensions to produce the same ops-hash.
+ *
+ * Bump this whenever a change to the canonical serialization alters the emitted bytes,
+ * so a peer running the old format is *detected* (a legible version-skew error) rather
+ * than mistaken for a content disagreement or a Byzantine lie. See docs/transactions.md
+ * ("Operations Hash — Canonical Serialization").
+ */
+export const OPS_HASH_VERSION = 'v1';
+
+/**
+ * Wire-token prefix carrying {@link OPS_HASH_VERSION}: `ops.v1:`. The `.` delimiter is
+ * outside the base64url alphabet (A–Z a–z 0–9 `-` `_`) that follows the trailing `:`, so
+ * the version segment can always be sliced back out unambiguously — see {@link opsHashVersion}.
+ */
+export const OPS_HASH_PREFIX = `ops.${OPS_HASH_VERSION}:`;
+
+/**
+ * Extract the format-version segment from an ops-hash token — the `v1` in `ops.v1:<hash>` —
+ * or `null` if the string is not a recognizable versioned ops-hash token.
+ *
+ * Total: never throws. A bare legacy `ops:<hash>` token (no `.` delimiter), an empty
+ * string, or any garbage all return `null`. A validator treats a `null` (or a version it
+ * does not recognize) as an unsupported/foreign format — a legible version-skew error —
+ * never as an accidental content match.
+ */
+export function opsHashVersion(token: string): string | null {
+	if (typeof token !== 'string') return null;
+	if (!token.startsWith('ops.')) return null;
+	const colon = token.indexOf(':', 4);
+	if (colon <= 4) return null; // no version characters between "ops." and ":"
+	return token.slice(4, colon);
+}
+
+/**
+ * The EXACT canonical byte-string {@link hashOperations} feeds into SHA-256: the operations
+ * sorted by {@link compareOperations} and run through {@link canonicalStringify}. The version
+ * token is NOT part of this preimage — it wraps the resulting hash, it is not hashed.
+ *
+ * Exposed so a future client signature (design-client-transaction-signatures) can bind the
+ * IDENTICAL bytes the validators hash, rather than re-deriving the serialization and risking
+ * drift. Pair it with {@link OPS_HASH_VERSION} to record which format the bytes belong to.
+ */
+export function canonicalOperationsPayload(operations: readonly Operation[]): string {
+	return canonicalStringify([...operations].sort(compareOperations));
+}
+
+/**
  * Compute the transaction operations hash: sort into canonical order, canonically
- * stringify, then SHA-256 (base64url) via {@link hashString}, keeping the existing
- * `ops:` prefix so the on-the-wire hash format is unchanged.
+ * stringify, SHA-256 (base64url) via {@link hashString}, then prefix the versioned
+ * {@link OPS_HASH_PREFIX} token (`ops.v1:`) so the wire string is self-describing.
  *
  * This is the fingerprint the coordinator sends in PendRequest.operationsHash and
  * the validator recomputes; equality of this string is the cross-node agreement
  * that a transaction's operations match.
  *
- * NOTE: this canonical encoding differs from the pre-refactor raw JSON.stringify
- * encoding, so the hash a given transaction produces changed. Same-version clusters
- * are unaffected (both sender and validator recompute fresh, nothing persisted). But
- * there is NO protocol-version gate on this hash: in a MIXED-version cluster an old
- * node and a new node would disagree and reject each other with "Operations hash
- * mismatch". If rolling upgrades become a supported deployment, version-gate this.
+ * NOTE: the ops-hash carries a format-version token, so a mixed-version cluster now
+ * *detects* skew — a validator seeing a foreign/legacy version emits a distinct
+ * "unsupported operations-hash format version" error instead of the ambiguous
+ * "Operations hash mismatch" (see TransactionValidator). What it does NOT do is
+ * *cross-compute* older formats: a node only recognizes that a peer speaks a different
+ * version, it cannot reproduce that peer's historical bytes. Mixed-version clusters
+ * therefore fail LEGIBLY, not interoperably; multi-version compatibility is future
+ * work if rolling upgrades ship. The ops-hash is recomputed fresh on both sides and
+ * never persisted, so bumping the version cannot retroactively invalidate committed
+ * transactions (unlike transaction.id, which IS persisted — leave it untouched).
  */
 export async function hashOperations(operations: readonly Operation[]): Promise<string> {
-	const sorted = [...operations].sort(compareOperations);
-	return `ops:${await hashString(canonicalStringify(sorted))}`;
+	return `${OPS_HASH_PREFIX}${await hashString(canonicalOperationsPayload(operations))}`;
 }

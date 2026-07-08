@@ -39,5 +39,13 @@ export { TransactionSession } from './session.js';
 export { TransactionValidator } from './validator.js';
 export type { EngineRegistration, ValidationCoordinatorFactory, BlockStateProvider } from './validator.js';
 
-export { collectOperations, hashOperations, canonicalStringify } from './operations-hash.js';
+export {
+	collectOperations,
+	hashOperations,
+	canonicalStringify,
+	canonicalOperationsPayload,
+	opsHashVersion,
+	OPS_HASH_VERSION,
+	OPS_HASH_PREFIX,
+} from './operations-hash.js';
 export type { Operation } from './operations-hash.js';

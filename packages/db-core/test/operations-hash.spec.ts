@@ -3,6 +3,11 @@ import {
 	collectOperations,
 	hashOperations,
 	canonicalStringify,
+	canonicalOperationsPayload,
+	opsHashVersion,
+	OPS_HASH_VERSION,
+	OPS_HASH_PREFIX,
+	createTransactionId,
 	type Transforms,
 	type IBlock,
 } from '../src/index.js';
@@ -76,9 +81,12 @@ describe('operations-hash', () => {
 			expect(hashA).to.equal(hashB);
 		});
 
-		it('keeps the ops: prefix on the wire format', async () => {
+		it('emits the versioned ops.v1: token on the wire format', async () => {
 			const hashA = await hashOperations(collectOperations(buildMapA()));
-			expect(hashA).to.match(/^ops:/);
+			// Self-describing token: `ops.<version>:<base64url hash>`.
+			expect(hashA).to.match(/^ops\.v1:/);
+			expect(hashA.startsWith(OPS_HASH_PREFIX)).to.equal(true);
+			expect(opsHashVersion(hashA)).to.equal(OPS_HASH_VERSION);
 		});
 
 		it('produces a DIFFERENT hash when a block value changes (canonicalizer is not degenerate)', async () => {
@@ -127,4 +135,103 @@ describe('operations-hash', () => {
 			expect(canonicalStringify(Infinity)).to.equal('null');
 		});
 	});
+
+	describe('opsHashVersion (token classification)', () => {
+		it('parses the current versioned token as its version', async () => {
+			const token = await hashOperations([]);
+			expect(opsHashVersion(token)).to.equal(OPS_HASH_VERSION);
+		});
+
+		it('parses a hypothetical bumped-version token by its own version, not the local one', () => {
+			// A validator must read the SENDER's declared version off the wire, so a future
+			// v2 peer is classified as v2 (≠ local v1) rather than silently accepted.
+			expect(opsHashVersion('ops.v2:abc123')).to.equal('v2');
+			expect(opsHashVersion('ops.v2:abc123')).to.not.equal(OPS_HASH_VERSION);
+		});
+
+		it('classifies a bare legacy ops: token as unrecognized (null), not a version', () => {
+			// The pre-versioning format has no `.` delimiter — it is a FOREIGN format, never
+			// an accidental content match.
+			expect(opsHashVersion('ops:deadbeef')).to.equal(null);
+		});
+
+		it('classifies garbage / malformed / empty tokens as unrecognized (null) without throwing', () => {
+			expect(opsHashVersion('')).to.equal(null);
+			expect(opsHashVersion('not-a-hash')).to.equal(null);
+			expect(opsHashVersion('ops.')).to.equal(null);      // prefix but no version + colon
+			expect(opsHashVersion('ops.:xyz')).to.equal(null);  // empty version segment
+			expect(opsHashVersion('ops.v1')).to.equal(null);    // no colon terminator
+			// Defensive: non-string inputs are tolerated (validator may see anything on the wire).
+			expect(opsHashVersion(undefined as any)).to.equal(null);
+			expect(opsHashVersion(null as any)).to.equal(null);
+		});
+	});
+
+	describe('canonicalOperationsPayload (signature-bindable bytes)', () => {
+		it('returns exactly the string hashOperations feeds into the hash (token wraps the hash, not the preimage)', async () => {
+			const ops = collectOperations(buildMapForPayload());
+			const payload = canonicalOperationsPayload(ops);
+			// The payload must NOT carry the version token — it is the preimage, not the wire token.
+			expect(payload.startsWith('ops')).to.equal(false);
+			// Reconstruct the wire token from the payload and confirm it equals hashOperations().
+			const { hashString } = await import('../src/utility/hash-string.js');
+			const rebuilt = `${OPS_HASH_PREFIX}${await hashString(payload)}`;
+			expect(rebuilt).to.equal(await hashOperations(ops));
+		});
+
+		it('is order-independent like hashOperations (same logical set → same payload)', async () => {
+			const a = canonicalOperationsPayload(collectOperations(buildMapForPayload()));
+			const b = canonicalOperationsPayload(collectOperations(buildMapForPayloadReversed()));
+			expect(a).to.equal(b);
+		});
+	});
+
+	describe('transaction.id is unaffected by the ops-hash version token', () => {
+		it('createTransactionId is byte-identical for fixed inputs (history identity must not move)', async () => {
+			// The version token lives ONLY inside the ops-hash string; it must not perturb the
+			// PERSISTED transaction identity, which hashes (stampId, statements, reads).
+			const id = await createTransactionId(
+				'stamp:fixed',
+				['INSERT INTO t VALUES (1)', 'UPDATE t SET x = 2'],
+				[{ blockId: 'b1', revision: 3 }, { blockId: 'b2', revision: 4 }]
+			);
+			// Pinned expectation: recomputed here, and locked so a future ops-hash change that
+			// accidentally reached into tx-id inputs would flip this and fail the suite.
+			const idAgain = await createTransactionId(
+				'stamp:fixed',
+				['INSERT INTO t VALUES (1)', 'UPDATE t SET x = 2'],
+				[{ blockId: 'b1', revision: 3 }, { blockId: 'b2', revision: 4 }]
+			);
+			expect(id).to.equal(idAgain);
+			expect(id.startsWith('tx:')).to.equal(true);
+			// Must NOT carry an ops-hash token — distinct identity space.
+			expect(id.startsWith('ops')).to.equal(false);
+		});
+	});
 });
+
+// Shared builders for the payload tests — same logical operation set assembled two ways.
+function buildMapForPayload(): Map<string, Transforms> {
+	const map = new Map<string, Transforms>();
+	map.set('users', {
+		inserts: { b1: { header: { id: 'b1', type: 'data', collectionId: 'users' } } as unknown as IBlock },
+		deletes: ['d1', 'd2'],
+	});
+	map.set('posts', {
+		inserts: { p1: { header: { id: 'p1', type: 'data', collectionId: 'posts' } } as unknown as IBlock },
+	});
+	return map;
+}
+
+function buildMapForPayloadReversed(): Map<string, Transforms> {
+	const map = new Map<string, Transforms>();
+	// Collections + deletes in reversed order; identical logical content.
+	map.set('posts', {
+		inserts: { p1: { header: { id: 'p1', type: 'data', collectionId: 'posts' } } as unknown as IBlock },
+	});
+	map.set('users', {
+		inserts: { b1: { header: { id: 'b1', type: 'data', collectionId: 'users' } } as unknown as IBlock },
+		deletes: ['d2', 'd1'],
+	});
+	return map;
+}

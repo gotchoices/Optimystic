@@ -21,7 +21,7 @@ import {
 	createTransactionStamp,
 	createTransactionId,
 	clientSignaturePayload,
-	hashString,
+	hashOperations,
 	bytesToB64url,
 	b64urlToBytes,
 	TransactionValidator,
@@ -54,7 +54,7 @@ const verifier: ClientSignatureVerifier = (peerId, payload, signature) => {
 	}
 };
 
-const emptyOpsHash = async (): Promise<string> => `ops:${await hashString(JSON.stringify([]))}`;
+const emptyOpsHash = async (): Promise<string> => await hashOperations([]);
 
 function makeValidator(verify?: ClientSignatureVerifier): TransactionValidator {
 	const engines = new Map<string, EngineRegistration>();

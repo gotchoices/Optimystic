@@ -2,7 +2,7 @@ import type { BlockId, CollectionId, Transforms } from '../index.js';
 import type { Transaction, ITransactionEngine, ITransactionValidator, ValidationResult, CollectionActions, ClientSignatureVerifier } from './transaction.js';
 import type { BlockActionState } from '../network/struct.js';
 import { isTransactionExpired, clientSignaturePayload, computeStampId } from './transaction.js';
-import { collectOperations, hashOperations } from './operations-hash.js';
+import { collectOperations, hashOperations, opsHashVersion, OPS_HASH_VERSION } from './operations-hash.js';
 
 /**
  * Engine registration for validation.
@@ -158,8 +158,24 @@ export class TransactionValidator implements ITransactionValidator {
 			// validator cannot diverge on ordering.
 			const computedHash = await hashOperations(collectOperations(transforms));
 
-			// 9. Compare with sender's hash
+			// 9. Compare with sender's hash. Split the failure into two distinct causes so
+			// version skew is diagnosable rather than looking like a content fault:
+			//   - VERSION SKEW: the sender's token carries a format version this node does not
+			//     produce (a foreign vN, a bare legacy `ops:`, or an unparseable token → null).
+			//     These bytes are not even comparable, so surface a clear "unsupported format
+			//     version" error. This is DETECTION only — the node cannot cross-compute the
+			//     peer's format, so a mixed-version cluster fails legibly, not silently.
+			//   - CONTENT MISMATCH: same format version, different bytes — a genuine operations
+			//     disagreement (or a Byzantine lie); the existing error is unchanged.
 			if (computedHash !== operationsHash) {
+				const senderVersion = opsHashVersion(operationsHash);
+				if (senderVersion !== OPS_HASH_VERSION) {
+					return {
+						valid: false,
+						reason: `Unsupported operations-hash format version: local=${OPS_HASH_VERSION}, sender=${senderVersion ?? 'unrecognized'}`,
+						computedHash
+					};
+				}
 				return {
 					valid: false,
 					reason: `Operations hash mismatch`,

@@ -13,6 +13,7 @@ import {
 	DEFAULT_TRANSACTION_TTL_MS,
 	isTransactionExpired,
 	hashString,
+	hashOperations,
 	blockIdsForTransforms,
 	TransactionCoordinator,
 	CoordinatorPartialCommitError,
@@ -1294,7 +1295,7 @@ describe('Transaction', () => {
 			const validator = new TransactionValidator(engines, createValidationCoordinator);
 
 			// Validation should succeed with matching hash (using empty transforms since we simplified)
-			const expectedHash = `ops:${await hashString(JSON.stringify([]))}`;
+			const expectedHash = await hashOperations([]);
 			const validationResult = await validator.validate(transaction, expectedHash);
 			expect(validationResult.valid).to.be.true;
 		});
@@ -2397,7 +2398,7 @@ describe('Transaction', () => {
 			});
 
 			const validator = new TransactionValidator(engines, createValidationCoordinator);
-			const expectedHash = `ops:${await hashString(JSON.stringify([]))}`;
+			const expectedHash = await hashOperations([]);
 			const validationResult = await validator.validate(transaction, expectedHash);
 			expect(validationResult.valid).to.be.true;
 		});
@@ -2784,7 +2785,7 @@ describe('Transaction', () => {
 				id: await createTransactionId(stamp.id, [], reads),
 			};
 
-			const expectedHash = `ops:${await hashString(JSON.stringify([]))}`;
+			const expectedHash = await hashOperations([]);
 			const result = await validator.validate(tx, expectedHash);
 			expect(result.valid).to.be.true;
 		});
@@ -2834,7 +2835,7 @@ describe('Transaction', () => {
 				id: await createTransactionId(stamp.id, [], reads),
 			};
 
-			const expectedHash = `ops:${await hashString(JSON.stringify([]))}`;
+			const expectedHash = await hashOperations([]);
 			const result = await validator.validate(tx, expectedHash);
 			expect(result.valid).to.be.false;
 			expect(result.reason).to.include('Stale read');
@@ -2863,7 +2864,7 @@ describe('Transaction', () => {
 				id: await createTransactionId(stamp.id, [], []),
 			};
 
-			const expectedHash = `ops:${await hashString(JSON.stringify([]))}`;
+			const expectedHash = await hashOperations([]);
 			const result = await validator.validate(tx, expectedHash);
 			expect(result.valid).to.be.true;
 		});
@@ -4323,7 +4324,7 @@ describe('Transaction', () => {
 
 		// Minimal validator wiring: engine re-execution over an empty-transforms coordinator,
 		// so a fully valid transaction hashes to ops([]) and passes every step.
-		const emptyOpsHash = async () => `ops:${await hashString(JSON.stringify([]))}`;
+		const emptyOpsHash = async () => await hashOperations([]);
 		function makeValidator(verifier?: ClientSignatureVerifier): TransactionValidator {
 			const engines = new Map<string, EngineRegistration>();
 			engines.set('actions@1.0.0', {
