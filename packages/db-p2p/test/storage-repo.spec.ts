@@ -664,6 +664,47 @@ describe('StorageRepo', () => {
 			const rev2 = await rawStorage.getRevision('block-1' as BlockId, 2);
 			expect(rev2 === undefined || rev2 === 'a2').to.equal(true);
 		});
+
+		it('recoverBlock does not reconcile meta.latest while another writer holds the block commit latch', async () => {
+			// recoverBlock() is a read-modify-write of meta.latest (redoes a lost setLatest), same class
+			// as get()'s read-driven promotion — it must hold the commit latch too, or a concurrent commit
+			// advancing latest in between gets clobbered. Build a Crash-D3 state: rev 1 is latest, but rev 2
+			// is durable (revision + promoted action) with meta.latest never advanced. recover() should lift
+			// latest to 2 — but not while the latch is held.
+			const storage = new BlockStorage('block-1' as BlockId, rawStorage);
+			const block = makeBlock('block-1', { items: [] });
+			await storage.savePendingTransaction('setup' as ActionId, { insert: block });
+			await storage.saveMaterializedBlock('setup' as ActionId, block);
+			await storage.saveRevision(1, 'setup' as ActionId);
+			await storage.promotePendingTransaction('setup' as ActionId);
+			await storage.setLatest({ actionId: 'setup' as ActionId, rev: 1 });
+			// rev 2 durable but latest deliberately NOT advanced (the lost-setLatest / Crash-D3 signature).
+			await storage.savePendingTransaction('a2' as ActionId, { insert: makeBlock('block-1', { items: ['a2'] }) });
+			await storage.saveMaterializedBlock('a2' as ActionId, makeBlock('block-1', { items: ['a2'] }));
+			await storage.saveRevision(2, 'a2' as ActionId);
+			await storage.promotePendingTransaction('a2' as ActionId);
+
+			const release = await Latches.acquire(commitLatchKey('block-1' as BlockId));
+
+			let resolved = false;
+			const recoverPromise = repo.recoverBlock('block-1' as BlockId).then(() => { resolved = true; });
+
+			// Release in finally: the commit latch is a process-global mutex; a leaked hold would wedge
+			// every later test that commits block-1.
+			try {
+				// A held mutex never self-releases, so a correctly-latched recover cannot complete in this
+				// window; a bypassing one has already advanced latest to rev 2 despite the held latch.
+				await new Promise((r) => setTimeout(r, 25));
+				expect(resolved).to.equal(false);
+				expect((await storage.getLatest())?.rev, 'latest not advanced under held latch').to.equal(1);
+			} finally {
+				release();
+			}
+			await recoverPromise;
+			expect(resolved).to.equal(true);
+			// Once the latch is free, recovery reconciles latest to the highest contiguous durable rev.
+			expect((await storage.getLatest())?.rev).to.equal(2);
+		});
 	});
 
 	describe('partial commit recovery (TEST-5.4.2)', () => {

@@ -571,7 +571,13 @@ export class StorageRepo implements IRepo, IBlockChangeNotifier, IBlockReplicaSt
 	async recoverBlock(blockId: BlockId): Promise<void> {
 		log('recoverBlock blockId=%s', blockId);
 		const storage = this.createBlockStorage(blockId);
-		await storage.recover();
+		// Hold the per-block commit latch: recover() is a read-modify-write of meta.latest that
+		// blindly writes back the metadata object it read, so its "advance only" guard is TOCTOU —
+		// racing a concurrent commit()/saveReplicatedBlock that advanced latest in between would
+		// clobber it (a non-monotonic regression). Same latching invariant as every other
+		// latest-mutating site. commit() calls storage.recover() directly under its own held latch,
+		// so it never routes through here — no double-acquire / deadlock.
+		await withBlockCommitLatch(blockId, () => storage.recover());
 	}
 
 	/**
