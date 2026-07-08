@@ -1,5 +1,5 @@
 import type { BlockId } from '@optimystic/db-core';
-import { hashKey } from 'p2p-fret';
+import { hashKey, type RingCoord } from 'p2p-fret';
 import { peerIdFromString } from '@libp2p/peer-id';
 import type { BlockArchive, RestoreCallback } from './struct.js';
 import { SyncClient } from '../sync/client.js';
@@ -41,8 +41,14 @@ export class RestorationCoordinator {
 		const startTime = Date.now();
 		this.metrics.totalRequests++;
 
+		// Hash the block id once into the shared coordinate space. Peer responsibility
+		// (RingSelector.calculatePartition) and cohort assembly both operate on hashed
+		// coords, so restoration must filter in the same space — see getMyRingPeers and
+		// filterByPartition below, which reuse this value.
+		const blockCoord = await hashKey(new TextEncoder().encode(blockId));
+
 		// 1. Try my transaction ring peers first
-		const myPeers = await this.getMyRingPeers(blockId);
+		const myPeers = this.getMyRingPeers(blockCoord);
 		const myRingDepth = this.getMyRingDepth();
 
 		// Avoid dialing self: on a solo/bootstrap node with no listenAddrs, dialing self
@@ -69,7 +75,7 @@ export class RestorationCoordinator {
 			const storagePeers = this.fretAdapter.findPeersAtRing(ringDepth);
 
 			// Filter to peers responsible for this block's partition (skip self — cannot dial self).
-			const responsiblePeers = this.filterByPartition(storagePeers, blockId, ringDepth)
+			const responsiblePeers = this.filterByPartition(storagePeers, blockCoord, ringDepth)
 				.filter(p => !this.selfPeerId || p !== this.selfPeerId);
 
 			for (const peerIdStr of responsiblePeers) {
@@ -98,11 +104,10 @@ export class RestorationCoordinator {
 
 	/**
 	 * Get peers in my transaction ring for a given block.
+	 * @param blockCoord the block id already hashed into the shared coordinate space.
 	 */
-	private async getMyRingPeers(blockId: BlockId): Promise<string[]> {
-		const blockIdBytes = new TextEncoder().encode(blockId);
-		const coord = await hashKey(blockIdBytes);
-		return this.fretAdapter.getFret().assembleCohort(coord, 10);
+	private getMyRingPeers(blockCoord: RingCoord): string[] {
+		return this.fretAdapter.getFret().assembleCohort(blockCoord, 10);
 	}
 
 	/**
@@ -115,13 +120,15 @@ export class RestorationCoordinator {
 
 	/**
 	 * Filter peers by partition responsibility.
+	 * @param blockCoord the block id hashed into the shared coordinate space (same space
+	 *   RingSelector.calculatePartition uses for peer partitions).
 	 */
-	private filterByPartition(peers: string[], blockId: BlockId, ringDepth: number): string[] {
+	private filterByPartition(peers: string[], blockCoord: RingCoord, ringDepth: number): string[] {
 		if (ringDepth === 0) {
 			return peers; // Ring 0 covers all blocks
 		}
 
-		const blockPrefix = this.extractBlockPrefix(blockId, ringDepth);
+		const blockPrefix = this.extractPrefix(blockCoord, ringDepth);
 
 		return peers.filter(peerId => {
 			const info = this.fretAdapter.getArachnodeInfo(peerId);
@@ -131,22 +138,15 @@ export class RestorationCoordinator {
 	}
 
 	/**
-	 * Extract prefix bits from block ID for partition matching.
+	 * Extract the first N bits of a hashed coordinate as a number.
+	 * Mirrors RingSelector.extractPrefix so block and peer partitions are computed identically.
 	 */
-	private extractBlockPrefix(blockId: BlockId, bits: number): number {
-		const bytes = new TextEncoder().encode(blockId);
-		// Hash the block ID to get uniform distribution
-		const hash = new Uint8Array(32);
-		for (let i = 0; i < Math.min(bytes.length, hash.length); i++) {
-			hash[i] = bytes[i]!;
-		}
-
-		// Extract first N bits
+	private extractPrefix(coord: RingCoord, bits: number): number {
 		let value = 0;
 		for (let i = 0; i < bits; i++) {
 			const byteIndex = Math.floor(i / 8);
 			const bitIndex = 7 - (i % 8);
-			const bit = (hash[byteIndex]! >> bitIndex) & 1;
+			const bit = (coord[byteIndex]! >> bitIndex) & 1;
 			value = (value << 1) | bit;
 		}
 		return value;
