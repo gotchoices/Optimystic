@@ -599,7 +599,13 @@ export class ClusterMember implements ICluster {
 		}
 	}
 
-	/** Deterministic JSON: sorts object keys so hash is order-independent */
+	/**
+	 * Deterministic JSON: sorts object keys so comparisons are order-independent.
+	 * NOTE: this is a second copy of the canonicalization in db-core `membership.ts` (which feeds the hash
+	 * preimages). It is used here only for equality checks (message-content / v1-peers compare), and those
+	 * run *after* a messageHash-equality gate, so a drift between the two can't silently forge agreement —
+	 * but keep them byte-identical. If a third caller appears, promote to a single exported helper.
+	 */
 	private static canonicalJson(value: unknown): string {
 		return JSON.stringify(value, (_, v) =>
 			v && typeof v === 'object' && !Array.isArray(v)

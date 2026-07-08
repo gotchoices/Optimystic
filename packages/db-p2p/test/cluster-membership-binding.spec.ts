@@ -234,6 +234,16 @@ describe('cluster membership binding', () => {
 			expect(result.promises[self.peerId.toString()]).to.not.equal(undefined);
 		});
 
+		it('accepts a legacy v1 (unversioned) record and adds our promise — migration safety', async () => {
+			// The headline migration guarantee: a new (v2-capable) member must still accept an old, unbound
+			// record whose messageHash was computed the pre-binding way (no membershipVersion / digest).
+			const peers = makeClusterPeers([self, await makeKeyPair()]);
+			const record = await makeV1Record(peers, makeMessage());
+			expect(record.membershipVersion).to.equal(undefined);
+			const result = await member.update(record);
+			expect(result.promises[self.peerId.toString()]).to.not.equal(undefined);
+		});
+
 		it('rejects a v2 record whose membershipDigest does not match its peers', async () => {
 			const peers = makeClusterPeers([self, await makeKeyPair()]);
 			const record = await makeV2Record(peers, makeMessage());
