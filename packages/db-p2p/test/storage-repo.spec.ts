@@ -1148,6 +1148,57 @@ describe('StorageRepo', () => {
 		});
 	});
 
+	describe('commit — stale-conflict missing transforms', () => {
+		// Regression for perBlockActionTransformsToPerAction discarding the return value of
+		// concatTransform (a pure helper that never mutates its first argument).  Before the fix,
+		// every StaleFailure.missing[*].transforms was an empty Transforms regardless of how many
+		// blocks the missed action had touched.
+
+		it('single-block stale conflict returns non-empty transforms', async () => {
+			const block = makeBlock('block-1');
+			await repo.pend({ actionId: 'a1' as ActionId, transforms: makeInsertTransforms('block-1' as BlockId, block), policy: 'c' });
+			await repo.commit({ actionId: 'a1' as ActionId, blockIds: ['block-1' as BlockId], tailId: 'block-1' as BlockId, rev: 1 });
+
+			await repo.pend({ actionId: 'a2' as ActionId, transforms: makeUpdateTransforms('block-1' as BlockId, [['items', 0, 0, ['x']]]), policy: 'c' });
+			const result = await repo.commit({ actionId: 'a2' as ActionId, blockIds: ['block-1' as BlockId], tailId: 'block-1' as BlockId, rev: 1 });
+
+			expect(result.success).to.equal(false);
+			if (!result.success && 'missing' in result) {
+				expect(result.missing!.length).to.equal(1);
+				const missed = result.missing![0]!;
+				expect(missed.actionId).to.equal('a1');
+				// inserts must contain block-1 — pre-fix this was empty.
+				expect(Object.keys(missed.transforms.inserts ?? {})).to.deep.equal(['block-1']);
+			}
+		});
+
+		it('multi-block stale conflict returns transforms for all missed blocks', async () => {
+			const transforms: Transforms = {
+				inserts: {
+					'block-1': makeBlock('block-1'),
+					'block-2': makeBlock('block-2')
+				},
+				updates: {},
+				deletes: []
+			};
+			await repo.pend({ actionId: 'a1' as ActionId, transforms, policy: 'c' });
+			await repo.commit({ actionId: 'a1' as ActionId, blockIds: ['block-1' as BlockId, 'block-2' as BlockId], tailId: 'block-1' as BlockId, rev: 1 });
+
+			await repo.pend({ actionId: 'a2' as ActionId, transforms, policy: 'c' });
+			const result = await repo.commit({ actionId: 'a2' as ActionId, blockIds: ['block-1' as BlockId, 'block-2' as BlockId], tailId: 'block-1' as BlockId, rev: 1 });
+
+			expect(result.success).to.equal(false);
+			if (!result.success && 'missing' in result) {
+				expect(result.missing!.length).to.equal(1);
+				const missed = result.missing![0]!;
+				expect(missed.actionId).to.equal('a1');
+				const insertedIds = Object.keys(missed.transforms.inserts ?? {}).sort();
+				// Both block-1 and block-2 must appear — pre-fix this was empty.
+				expect(insertedIds).to.deep.equal(['block-1', 'block-2']);
+			}
+		});
+	});
+
 	describe('change notification on replica-persist', () => {
 		it('fresh replica fires exactly one event with correct fields and no tailId', async () => {
 			const events: CollectionChangeEvent[] = [];

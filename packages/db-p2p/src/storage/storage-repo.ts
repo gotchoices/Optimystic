@@ -692,7 +692,7 @@ function perBlockActionTransformsToPerAction(missing: { blockId: BlockId; transf
 	const missingByActionId = groupBy(missingFlat, ({ transform }) => transform.actionId);
 	return Object.entries(missingByActionId).map(([actionId, items]) =>
 		items.reduce((acc, { blockId, transform }) => {
-			concatTransform(acc.transforms, blockId, transform.transform);
+			acc.transforms = concatTransform(acc.transforms, blockId, transform.transform);
 			return acc;
 		}, {
 			actionId: actionId as ActionId,
