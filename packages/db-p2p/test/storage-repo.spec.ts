@@ -2,7 +2,7 @@ import { expect } from 'chai';
 import { StorageRepo, commitLatchKey } from '../src/storage/storage-repo.js';
 import { BlockStorage } from '../src/storage/block-storage.js';
 import { MemoryRawStorage } from '../src/storage/memory-storage.js';
-import type { BlockId, ActionId, ActionRev, PendRequest, Transforms, IBlock, BlockHeader, CollectionChangeEvent } from '@optimystic/db-core';
+import type { BlockId, ActionId, ActionRev, ActionTransforms, CommitResult, PendRequest, Transforms, IBlock, BlockHeader, CollectionChangeEvent } from '@optimystic/db-core';
 import { isBlockChangeNotifier, Latches } from '@optimystic/db-core';
 import { delay } from '@optimystic/db-core/test';
 
@@ -39,6 +39,14 @@ const makeDeleteTransforms = (blockId: BlockId): Transforms => ({
 	updates: {},
 	deletes: [blockId]
 });
+
+/** Asserts the result is a stale failure carrying a `missing` list, and returns that list. */
+const expectStaleMissing = (result: CommitResult): ActionTransforms[] => {
+	expect(result.success, 'expected commit to fail as stale').to.equal(false);
+	const missing = (result as { missing?: ActionTransforms[] }).missing;
+	expect(missing, 'expected StaleFailure.missing to be present').to.not.equal(undefined);
+	return missing!;
+};
 
 describe('StorageRepo', () => {
 	let rawStorage: MemoryRawStorage;
@@ -1162,40 +1170,83 @@ describe('StorageRepo', () => {
 			await repo.pend({ actionId: 'a2' as ActionId, transforms: makeUpdateTransforms('block-1' as BlockId, [['items', 0, 0, ['x']]]), policy: 'c' });
 			const result = await repo.commit({ actionId: 'a2' as ActionId, blockIds: ['block-1' as BlockId], tailId: 'block-1' as BlockId, rev: 1 });
 
-			expect(result.success).to.equal(false);
-			if (!result.success && 'missing' in result) {
-				expect(result.missing!.length).to.equal(1);
-				const missed = result.missing![0]!;
-				expect(missed.actionId).to.equal('a1');
-				// inserts must contain block-1 — pre-fix this was empty.
-				expect(Object.keys(missed.transforms.inserts ?? {})).to.deep.equal(['block-1']);
-			}
+			const missing = expectStaleMissing(result);
+			expect(missing.length).to.equal(1);
+			expect(missing[0]!.actionId).to.equal('a1');
+			expect(missing[0]!.rev).to.equal(1);
+			// inserts must contain block-1 — pre-fix this was empty.
+			expect(Object.keys(missing[0]!.transforms.inserts ?? {})).to.deep.equal(['block-1']);
 		});
 
 		it('multi-block stale conflict returns transforms for all missed blocks', async () => {
-			const transforms: Transforms = {
-				inserts: {
-					'block-1': makeBlock('block-1'),
-					'block-2': makeBlock('block-2')
-				},
+			const inserts = (): Transforms => ({
+				inserts: { 'block-1': makeBlock('block-1'), 'block-2': makeBlock('block-2') },
 				updates: {},
 				deletes: []
-			};
-			await repo.pend({ actionId: 'a1' as ActionId, transforms, policy: 'c' });
+			});
+			await repo.pend({ actionId: 'a1' as ActionId, transforms: inserts(), policy: 'c' });
 			await repo.commit({ actionId: 'a1' as ActionId, blockIds: ['block-1' as BlockId, 'block-2' as BlockId], tailId: 'block-1' as BlockId, rev: 1 });
 
-			await repo.pend({ actionId: 'a2' as ActionId, transforms, policy: 'c' });
+			await repo.pend({ actionId: 'a2' as ActionId, transforms: inserts(), policy: 'c' });
 			const result = await repo.commit({ actionId: 'a2' as ActionId, blockIds: ['block-1' as BlockId, 'block-2' as BlockId], tailId: 'block-1' as BlockId, rev: 1 });
 
-			expect(result.success).to.equal(false);
-			if (!result.success && 'missing' in result) {
-				expect(result.missing!.length).to.equal(1);
-				const missed = result.missing![0]!;
-				expect(missed.actionId).to.equal('a1');
-				const insertedIds = Object.keys(missed.transforms.inserts ?? {}).sort();
-				// Both block-1 and block-2 must appear — pre-fix this was empty.
-				expect(insertedIds).to.deep.equal(['block-1', 'block-2']);
-			}
+			const missing = expectStaleMissing(result);
+			expect(missing.length).to.equal(1);
+			expect(missing[0]!.actionId).to.equal('a1');
+			const insertedIds = Object.keys(missing[0]!.transforms.inserts ?? {}).sort();
+			// Both block-1 and block-2 must appear — pre-fix this was empty.
+			expect(insertedIds).to.deep.equal(['block-1', 'block-2']);
+		});
+
+		it('carries update and delete transforms of the missed action', async () => {
+			await repo.pend({
+				actionId: 'a1' as ActionId,
+				transforms: { inserts: { 'block-1': makeBlock('block-1', { items: [] }), 'block-2': makeBlock('block-2') }, updates: {}, deletes: [] },
+				policy: 'c'
+			});
+			await repo.commit({ actionId: 'a1' as ActionId, blockIds: ['block-1' as BlockId, 'block-2' as BlockId], tailId: 'block-1' as BlockId, rev: 1 });
+
+			// a2 updates block-1 and deletes block-2, landing at rev 2.
+			await repo.pend({
+				actionId: 'a2' as ActionId,
+				transforms: { inserts: {}, updates: { 'block-1': [['items', 0, 0, ['x']]] }, deletes: ['block-2' as BlockId] },
+				policy: 'c'
+			});
+			const commit2 = await repo.commit({ actionId: 'a2' as ActionId, blockIds: ['block-1' as BlockId, 'block-2' as BlockId], tailId: 'block-1' as BlockId, rev: 2 });
+			expect(commit2.success, 'a2 must land at rev 2 for a3 to miss it').to.equal(true);
+
+			// a3 arrives believing rev 2 is free — stale against a2 on both blocks.
+			await repo.pend({ actionId: 'a3' as ActionId, transforms: makeUpdateTransforms('block-1' as BlockId, [['items', 0, 0, ['y']]]), policy: 'c' });
+			const result = await repo.commit({ actionId: 'a3' as ActionId, blockIds: ['block-1' as BlockId, 'block-2' as BlockId], tailId: 'block-1' as BlockId, rev: 2 });
+
+			const missing = expectStaleMissing(result);
+			expect(missing.length).to.equal(1);
+			const missed = missing[0]!;
+			expect(missed.actionId).to.equal('a2');
+			expect(missed.transforms.updates?.['block-1' as BlockId]).to.deep.equal([['items', 0, 0, ['x']]]);
+			expect(missed.transforms.deletes).to.deep.equal(['block-2']);
+			expect(Object.keys(missed.transforms.inserts ?? {})).to.deep.equal([]);
+		});
+
+		it('groups several missed actions on the same block, one entry each', async () => {
+			await repo.pend({ actionId: 'a1' as ActionId, transforms: makeInsertTransforms('block-1' as BlockId, makeBlock('block-1', { items: [] })), policy: 'c' });
+			await repo.commit({ actionId: 'a1' as ActionId, blockIds: ['block-1' as BlockId], tailId: 'block-1' as BlockId, rev: 1 });
+
+			await repo.pend({ actionId: 'a2' as ActionId, transforms: makeUpdateTransforms('block-1' as BlockId, [['items', 0, 0, ['x']]]), policy: 'c' });
+			const commit2 = await repo.commit({ actionId: 'a2' as ActionId, blockIds: ['block-1' as BlockId], tailId: 'block-1' as BlockId, rev: 2 });
+			expect(commit2.success, 'a2 must land at rev 2 for a3 to miss it').to.equal(true);
+
+			// a3 believes it is at rev 1 — it has missed both a1 (rev 1) and a2 (rev 2).
+			await repo.pend({ actionId: 'a3' as ActionId, transforms: makeUpdateTransforms('block-1' as BlockId, [['items', 0, 0, ['y']]]), policy: 'c' });
+			const result = await repo.commit({ actionId: 'a3' as ActionId, blockIds: ['block-1' as BlockId], tailId: 'block-1' as BlockId, rev: 1 });
+
+			const missing = expectStaleMissing(result);
+			expect(missing.map(m => m.actionId).sort()).to.deep.equal(['a1', 'a2']);
+			const byId = new Map(missing.map(m => [m.actionId as string, m]));
+			expect(byId.get('a1')!.rev).to.equal(1);
+			expect(Object.keys(byId.get('a1')!.transforms.inserts ?? {})).to.deep.equal(['block-1']);
+			expect(byId.get('a2')!.rev).to.equal(2);
+			expect(byId.get('a2')!.transforms.updates?.['block-1' as BlockId]).to.deep.equal([['items', 0, 0, ['x']]]);
 		});
 	});
 

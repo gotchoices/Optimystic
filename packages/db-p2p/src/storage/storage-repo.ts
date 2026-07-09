@@ -684,7 +684,14 @@ export class StorageRepo implements IRepo, IBlockChangeNotifier, IBlockReplicaSt
 	}
 }
 
-/** Converts list of missing actions per block into a list of missing actions across blocks. */
+/**
+ * Converts list of missing actions per block into a list of missing actions across blocks.
+ *
+ * NOTE: relies on each (actionId, blockId) pair appearing at most once — one revision per action
+ * per block. If a block ever records two revisions under the same actionId, concatTransform's
+ * last-wins merge would silently drop the earlier revision's ops for that block; group by
+ * (actionId, rev) instead. See debt-concat-transform-overlapping-updates.
+ */
 function perBlockActionTransformsToPerAction(missing: { blockId: BlockId; transforms: ActionTransform[]; }[]) {
 	const missingFlat = missing.flatMap(({ blockId, transforms }) =>
 		transforms.map(transform => ({ blockId, transform }))
@@ -696,7 +703,7 @@ function perBlockActionTransformsToPerAction(missing: { blockId: BlockId; transf
 			return acc;
 		}, {
 			actionId: actionId as ActionId,
-			rev: items[0]!.transform.rev,	// Assumption: all missing actionIds share the same revision
+			rev: items[0]!.transform.rev,	// Assumption: an action commits at one revision, so every block's entry for this actionId agrees. Distinct actionIds may still carry distinct revs.
 			transforms: emptyTransforms()
 		})
 	);
