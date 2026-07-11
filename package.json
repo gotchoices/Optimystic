@@ -1,6 +1,6 @@
 {
   "name": "@optimystic/optimystic",
-  "version": "0.14.1",
+  "version": "0.15.0",
   "private": true,
   "type": "module",
   "packageManager": "yarn@4.12.0",
@@ -11,7 +11,9 @@
   },
   "resolutions": {
     "protons-runtime": "^6.0.0",
-    "uint8arrays": "^6.1.1"
+    "uint8arrays": "^6.1.1",
+    "@quereus/quereus": "portal:../quereus/packages/quereus",
+    "p2p-fret": "portal:../Fret/packages/fret"
   },
   "scripts": {
     "clean": "yarn workspaces foreach -Ap --exclude '@optimystic/optimystic' run clean",
