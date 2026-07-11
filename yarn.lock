@@ -1562,7 +1562,7 @@ __metadata:
   dependencies:
     "@noble/curves": "npm:^2.0.1"
     "@noble/hashes": "npm:^2.0.1"
-    "@quereus/quereus": "npm:^4.3.0"
+    "@quereus/quereus": "npm:^4.3.1"
     "@types/chai": "npm:^5.2.3"
     "@types/mocha": "npm:^10.0.10"
     "@types/node": "npm:^25.2.0"
@@ -1596,7 +1596,7 @@ __metadata:
     "@optimystic/db-core": "workspace:^"
     "@optimystic/db-p2p": "workspace:^"
     "@optimystic/db-p2p-storage-fs": "workspace:^"
-    "@quereus/quereus": "npm:^4.3.0"
+    "@quereus/quereus": "npm:^4.3.1"
     "@types/chai": "npm:^5.2.3"
     "@types/debug": "npm:^4.1.12"
     "@types/mocha": "npm:^10.0.10"
@@ -1667,19 +1667,18 @@ __metadata:
   languageName: node
   linkType: hard
 
-"@quereus/quereus@npm:^4.3.0":
-  version: 4.3.0
-  resolution: "@quereus/quereus@npm:4.3.0"
+"@quereus/quereus@portal:../quereus/packages/quereus::locator=%40optimystic%2Foptimystic%40workspace%3A.":
+  version: 0.0.0-use.local
+  resolution: "@quereus/quereus@portal:../quereus/packages/quereus::locator=%40optimystic%2Foptimystic%40workspace%3A."
   dependencies:
     debug: "npm:^4.4.3"
     fast-json-patch: "npm:^3.1.1"
-    inheritree: "npm:^0.4.0"
+    inheritree: "npm:^1.0.1"
     moat-maker: "npm:^2.2.0"
     temporal-polyfill: "npm:^0.3.0"
     uint8arrays: "npm:^6.1.1"
-  checksum: 10c0/d9ed52f1c8c85411fe6f040a1fc092092e9e03e3bed56c962ad92aefa767d41b4dc2c5b94a2113652f2ec2fbda035bff69983184ac5ed8bfc826b924d7287578
   languageName: node
-  linkType: hard
+  linkType: soft
 
 "@rollup/rollup-android-arm-eabi@npm:4.52.5":
   version: 4.52.5
@@ -3401,10 +3400,10 @@ __metadata:
   languageName: node
   linkType: hard
 
-"inheritree@npm:^0.4.0":
-  version: 0.4.0
-  resolution: "inheritree@npm:0.4.0"
-  checksum: 10c0/d96011ee4ac3b07724fb3cfb59af16c9e53ea9b614db40da26fa5b2ba84b1cb51459213c3ac8fb703edd744d18b46c6f01f7134c1a6098832af1acade2fb5e12
+"inheritree@npm:^1.0.1":
+  version: 1.0.1
+  resolution: "inheritree@npm:1.0.1"
+  checksum: 10c0/062476fed0dcb8a8c9a8e1ce424eae33b720cefd80590514b479222b606c49447aa3382cad5e79e42cb207296aaf19095761921ddbb366a2858d406c70350f06
   languageName: node
   linkType: hard
 
@@ -4423,9 +4422,9 @@ __metadata:
   languageName: node
   linkType: hard
 
-"p2p-fret@npm:^0.6.0":
-  version: 0.6.0
-  resolution: "p2p-fret@npm:0.6.0"
+"p2p-fret@portal:../Fret/packages/fret::locator=%40optimystic%2Foptimystic%40workspace%3A.":
+  version: 0.0.0-use.local
+  resolution: "p2p-fret@portal:../Fret/packages/fret::locator=%40optimystic%2Foptimystic%40workspace%3A."
   dependencies:
     "@libp2p/logger": "npm:^6.2.2"
     "@multiformats/multiaddr": "npm:^13.0.1"
@@ -4436,9 +4435,8 @@ __metadata:
     "@libp2p/interface": ^3.1.0
     "@libp2p/peer-id": ^6.0.4
     libp2p: ^3.1.3
-  checksum: 10c0/8750d8e4b0067a0f3c097fcfda86d00dd62c69e290e1b4052ad57bab2faaf93ecf36ed4e3983f9397967839010f9bab057c6c1a7abd5d545a473e81def657e60
   languageName: node
-  linkType: hard
+  linkType: soft
 
 "package-json-from-dist@npm:^1.0.0, package-json-from-dist@npm:^1.0.1":
   version: 1.0.1

@@ -29,3 +29,6 @@ export * from './routing/responsibility.js';
 export * from './routing/libp2p-known-peers.js';
 export * from './network/network-manager-service.js';
 export * from './network/get-network-manager.js';
+// Browser-safe peer signing seam. The rest of ./cohort-topic pulls node-heavy host.js,
+// so only peer-sig (@noble/curves + peer-id) is surfaced through the RN/browser entry.
+export * from './cohort-topic/peer-sig.js';
