@@ -6,7 +6,7 @@
  */
 
 import type { Row, SqlValue } from '@quereus/quereus';
-import { resolveCollation, compareSqlValues, type CollationFunction } from '@quereus/quereus';
+import { builtinCollationResolver, BINARY_COLLATION, compareSqlValues, type CollationFunction } from '@quereus/quereus';
 import { toString as uint8ToString } from 'uint8arrays/to-string';
 import { fromString as uint8FromString } from 'uint8arrays/from-string';
 import type { StoredTableSchema, StoredColumnSchema } from './schema-manager.js';
@@ -243,7 +243,7 @@ export class RowCodec {
 			return () => 0;
 		}
 
-		const collationFuncs = pkDef.map(def => resolveCollation(def.collation || 'BINARY'));
+		const collationFuncs = pkDef.map(def => builtinCollationResolver(def.collation || 'BINARY') ?? BINARY_COLLATION);
 		const descFlags = pkDef.map(def => def.desc || false);
 
 		// NOTE: this comparator is currently dead code — the tree is opened with a raw
@@ -348,7 +348,7 @@ export class RowCodec {
 		}
 
 		// For mixed types, use SQL comparison rules
-		return compareSqlValues(a, b, 'BINARY');
+		return compareSqlValues(a, b);
 	}
 }
 
