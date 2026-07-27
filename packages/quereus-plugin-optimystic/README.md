@@ -47,6 +47,10 @@ await db.exec(`declare schema App { ... } apply schema App;`); // no-op after hy
 
 `hydrate(db)` resolves to `{ tables, indexes }` (counts of newly-added catalog entries). It is idempotent and a no-op against empty storage.
 
+Uniqueness metadata — secondary `UNIQUE` constraints and the `unique`/partial-predicate flags of `CREATE UNIQUE INDEX` — is persisted with the table schema and reconstructed by `hydrate`, so hydrated tables enforce `UNIQUE` exactly as freshly declared ones. Re-declaring the table is **not** required for enforcement.
+
+One-time upgrade caveat: schemas persisted by plugin versions that predate uniqueness persistence lack this metadata, and the no-op DDL after `hydrate` never re-runs the statements that would restore it. Open such storage once with the DDL actually executing (skip `hydrate` for that open); the `CREATE TABLE` / `CREATE UNIQUE INDEX` statements persist the missing metadata in a single schema write, and every later hydrated open enforces normally.
+
 ## Virtual Table Options
 
 Options are passed in the `USING optimystic(...)` clause:

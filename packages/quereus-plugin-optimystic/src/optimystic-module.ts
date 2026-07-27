@@ -201,6 +201,13 @@ export class OptimysticVirtualTable extends VirtualTable {
         // has none — otherwise the short-circuit miss below would write
         // `indexes: []`, clobbering the persisted indexes and forcing every
         // later `addIndex()` to fail its dedupe and rebuild from scratch.
+        //
+        // A schema persisted before uniqueness metadata was wired through misses
+        // this short-circuit exactly once for a table that HAS unique
+        // constraints (the candidate now carries `uniqueConstraints`; the
+        // persisted side lacks the key). That single re-write persists them and
+        // the second open short-circuits again. Constraint-free tables OMIT the
+        // key on both sides (see tableSchemaToStored) and never miss.
         const candidateStored = this.schemaManager.tableSchemaToStored(this.tableSchema);
         const mergedCandidate: StoredTableSchema =
           candidateStored.indexes.length === 0 && persistedSchema
@@ -246,6 +253,13 @@ export class OptimysticVirtualTable extends VirtualTable {
       } else {
         throw new Error('Cannot create table without column definitions');
       }
+
+      // Fold persisted uniqueness metadata into this.tableSchema BEFORE the
+      // enforcement indexes are synthesized below, so enforcement never depends
+      // on which DDL (if any) replayed this open — a hydrate-only open replays
+      // none, and a re-declared CREATE TABLE arrives without the constraints
+      // its CREATE UNIQUE INDEX siblings once derived.
+      this.attachPersistedUniqueConstraints(storedSchema);
 
       this.rowCodec = new RowCodec(storedSchema, this.options.encoding);
 
@@ -828,6 +842,33 @@ export class OptimysticVirtualTable extends VirtualTable {
   }
 
   /**
+   * Merge the UNIQUE constraints reconstructable from the persisted schema
+   * (explicit `uniqueConstraints` plus one derived per `unique` index — see
+   * {@link SchemaManager.storedToUniqueConstraints}) into
+   * `this.tableSchema.uniqueConstraints`, deduped against whatever the local DDL
+   * already carries (order-insensitive column-set match, same derivation as
+   * {@link columnSetKey}). Idempotent. This is what keeps
+   * {@link checkUniqueConstraints} armed on opens where no `CREATE TABLE` /
+   * `CREATE UNIQUE INDEX` DDL re-runs (the documented hydrate warm-restart flow),
+   * and on re-declares that replay only the CREATE TABLE half.
+   */
+  private attachPersistedUniqueConstraints(storedSchema: StoredTableSchema): void {
+    const persisted = this.schemaManager.storedToUniqueConstraints(storedSchema);
+    if (!persisted) return;
+    const existing = this.tableSchema.uniqueConstraints ?? [];
+    const seen = new Set(existing.map(uc => this.columnSetKey(uc.columns)));
+    const additions = persisted.filter(uc => !seen.has(this.columnSetKey(uc.columns)));
+    if (additions.length === 0) return;
+    // Same copy-on-write pattern as the addIndex mirror: this vtab's enforcement
+    // reads its OWN tableSchema reference, so replacing it never mutates the
+    // schema object Quereus holds in its catalog.
+    this.tableSchema = {
+      ...this.tableSchema,
+      uniqueConstraints: [...existing, ...additions],
+    };
+  }
+
+  /**
    * Decide which secondary UNIQUE constraints need a synthesized backing index tree, and
    * return one descriptor per such constraint. A constraint is EXCLUDED when:
    *   - it is partial (`predicate !== undefined`, from `CREATE UNIQUE INDEX … WHERE …`) —
@@ -1367,6 +1408,35 @@ export class OptimysticVirtualTable extends VirtualTable {
   }
 
   /**
+   * A CREATE UNIQUE INDEX carries a UNIQUE constraint this vtab must enforce: the
+   * index tree keys on indexCols‖pk, so duplicate index values with distinct PKs
+   * coexist — it does NOT structurally guard uniqueness. Quereus synthesizes the
+   * derived uniqueConstraint on a NEW TableSchema it swaps into its catalog
+   * (appendIndexToTableSchema), but this cached vtab keeps its ORIGINAL tableSchema
+   * reference, so the derived constraint would never reach checkUniqueConstraints.
+   * Mirror it onto this.tableSchema so the probe considers it active; enforcement
+   * then routes through the declared index tree (resolveEnforcingIndex prefers a
+   * declared index), so no synthesized _uniq_ tree is needed. No-ops for non-unique
+   * indexes and for constraints already present (by derived-index name or column set).
+   */
+  private mirrorDerivedUniqueConstraint(indexSchema: IndexSchema): void {
+    if (!indexSchema.unique) return;
+    const columns = indexSchema.columns.map((col: { index: number }) => col.index);
+    const setKey = this.columnSetKey(columns);
+    const already = (this.tableSchema.uniqueConstraints ?? []).some(
+      uc => uc.derivedFromIndex === indexSchema.name || this.columnSetKey(uc.columns) === setKey,
+    );
+    if (already) return;
+    this.tableSchema = {
+      ...this.tableSchema,
+      uniqueConstraints: [
+        ...(this.tableSchema.uniqueConstraints ?? []),
+        { columns, predicate: indexSchema.predicate, derivedFromIndex: indexSchema.name },
+      ],
+    };
+  }
+
+  /**
    * Add an index to the table schema
    */
   async addIndex(indexSchema: IndexSchema): Promise<void> {
@@ -1384,12 +1454,38 @@ export class OptimysticVirtualTable extends VirtualTable {
       throw new Error('Schema not found');
     }
 
-    if (storedSchema.indexes.some(idx => idx.name === indexSchema.name)) {
+    // Mirror the derived UNIQUE constraint BEFORE the already-persisted dedupe
+    // below: a re-declared CREATE UNIQUE INDEX on a warm start hits that dedupe
+    // and returns early, but this cached vtab still needs the constraint in
+    // memory for checkUniqueConstraints (see mirrorDerivedUniqueConstraint).
+    this.mirrorDerivedUniqueConstraint(indexSchema);
+
+    const txnState = this.txnBridge.getCurrentTransaction();
+    const existing = storedSchema.indexes.find(idx => idx.name === indexSchema.name);
+    if (existing) {
+      // Upgrade path: a schema persisted before `unique`/`predicate` were wired
+      // through has the index but not its uniqueness metadata. Re-declaring the
+      // index is the documented way to restore it, so persist the flags (one
+      // write; subsequent re-declares see them present and skip). The tree
+      // itself already exists and is registered — nothing else to rebuild.
+      if (indexSchema.unique && !existing.unique) {
+        const upgraded: StoredTableSchema = {
+          ...storedSchema,
+          indexes: storedSchema.indexes.map(idx =>
+            idx.name === indexSchema.name
+              ? { ...idx, unique: true, predicate: indexSchema.predicate }
+              : idx,
+          ),
+        };
+        await this.schemaManager.storeStoredSchema(upgraded, txnState?.transactor);
+        this.indexManager.setSchema(upgraded);
+      }
       return;
     }
 
-    // Add the index to the stored schema
-    const updatedSchema = {
+    // Add the index to the stored schema, carrying its uniqueness metadata so a
+    // later hydrate-only open can reconstruct the derived UNIQUE constraint.
+    const updatedSchema: StoredTableSchema = {
       ...storedSchema,
       indexes: [...storedSchema.indexes, {
         name: indexSchema.name,
@@ -1398,18 +1494,15 @@ export class OptimysticVirtualTable extends VirtualTable {
           desc: col.desc,
           collation: col.collation,
         })),
+        unique: indexSchema.unique ? true : undefined,
+        predicate: indexSchema.predicate,
       }],
     };
 
-    // Save the updated schema
-    const txnState = this.txnBridge.getCurrentTransaction();
-    await this.schemaManager.storeSchema({
-      ...this.tableSchema,
-      indexes: updatedSchema.indexes.map(idx => ({
-        name: idx.name,
-        columns: idx.columns,
-      })),
-    }, txnState?.transactor);
+    // Save the updated schema. Persist the merged stored form directly — the old
+    // detour through `storeSchema({...this.tableSchema, indexes})` re-mapped each
+    // index to bare `{name, columns}` and silently dropped `unique`/`predicate`.
+    await this.schemaManager.storeStoredSchema(updatedSchema, txnState?.transactor);
 
     // Initialize the new index tree
     const indexTreeFactory = async (indexName: string, transactor?: any) => {
@@ -1438,32 +1531,6 @@ export class OptimysticVirtualTable extends VirtualTable {
     // mid-transaction would miss that transaction's already-taken snapshot — a
     // known, documented edge.)
     this.txnBridge.registerCollection(indexTree.getCollection());
-
-    // A CREATE UNIQUE INDEX carries a UNIQUE constraint this vtab must enforce: the
-    // index tree keys on indexCols‖pk, so duplicate index values with distinct PKs
-    // coexist — it does NOT structurally guard uniqueness. Quereus synthesizes the
-    // derived uniqueConstraint on a NEW TableSchema it swaps into its catalog
-    // (appendIndexToTableSchema), but this cached vtab keeps its ORIGINAL tableSchema
-    // reference, so the derived constraint would never reach checkUniqueConstraints.
-    // Mirror it onto this.tableSchema so the probe considers it active; enforcement
-    // then routes through the freshly built declared index tree (resolveEnforcingIndex
-    // prefers a declared index), so no synthesized _uniq_ tree is needed.
-    if (indexSchema.unique) {
-      const columns = indexSchema.columns.map((col: { index: number }) => col.index);
-      const setKey = this.columnSetKey(columns);
-      const already = (this.tableSchema.uniqueConstraints ?? []).some(
-        uc => uc.derivedFromIndex === indexSchema.name || this.columnSetKey(uc.columns) === setKey,
-      );
-      if (!already) {
-        this.tableSchema = {
-          ...this.tableSchema,
-          uniqueConstraints: [
-            ...(this.tableSchema.uniqueConstraints ?? []),
-            { columns, predicate: indexSchema.predicate, derivedFromIndex: indexSchema.name },
-          ],
-        };
-      }
-    }
 
     // Populate the index with existing data.
     // NOTE: CREATE UNIQUE INDEX does not reject pre-existing duplicate values — the

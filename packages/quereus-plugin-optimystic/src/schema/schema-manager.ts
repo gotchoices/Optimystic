@@ -6,12 +6,21 @@
  */
 
 import type { Tree } from '@optimystic/db-core';
-import type { TableSchema, ColumnSchema, VirtualTableModule } from '@quereus/quereus';
+import type { TableSchema, ColumnSchema, VirtualTableModule, UniqueConstraintSchema, ConflictResolution } from '@quereus/quereus';
 import { getTypeOrDefault } from '@quereus/quereus';
 import type { ITransactor } from '@optimystic/db-core';
 
 // IndexSchema type from TableSchema.indexes
 type IndexSchema = NonNullable<TableSchema['indexes']>[number];
+
+/**
+ * Order-insensitive identity for a set of column indices — sorted and joined by `_`.
+ * Same derivation the vtab uses to name synthesized `_uniq_` trees and to match a
+ * UNIQUE constraint against an index, so dedupe here agrees with enforcement there.
+ */
+function columnSetKey(columns: readonly number[]): string {
+	return [...columns].sort((a, b) => a - b).join('_');
+}
 
 /**
  * Serializable schema storage format
@@ -25,6 +34,25 @@ export interface StoredTableSchema {
 	vtabModuleName: string;
 	vtabArgs?: Record<string, any>;
 	estimatedRows?: number;
+	/**
+	 * Non-derived UNIQUE constraints (column-level `unique` / table-level
+	 * `unique (…)`). Constraints derived from a `CREATE UNIQUE INDEX`
+	 * (`derivedFromIndex` set) are NOT stored here — they are reconstructed from
+	 * the owning index's `unique` flag so the index stays the single source of
+	 * truth. OMITTED (not `[]`) when the table has none, so a schema persisted
+	 * before this field existed compares byte-equal against a constraint-free
+	 * candidate and `schemasEqual` keeps its short-circuit without a rewrite.
+	 */
+	uniqueConstraints?: StoredUniqueConstraint[];
+}
+
+export interface StoredUniqueConstraint {
+	name?: string;
+	/** Column indices in declared order (order matters for the synthesized tree's key). */
+	columns: number[];
+	defaultConflict?: ConflictResolution;
+	/** Partial-constraint predicate AST (presence excludes it from point enforcement). */
+	predicate?: unknown;
 }
 
 export interface StoredColumnSchema {
@@ -48,7 +76,11 @@ export interface StoredPrimaryKeyColumn {
 export interface StoredIndexSchema {
 	name: string;
 	columns: StoredIndexColumn[];
+	/** Set (to true) only for a unique index; omitted otherwise so plain indexes
+	 *  stay byte-identical with schemas persisted before this field was wired. */
 	unique?: boolean;
+	/** Partial-index predicate AST (`CREATE UNIQUE INDEX … WHERE …`), if any. */
+	predicate?: unknown;
 }
 
 export interface StoredIndexColumn {
@@ -213,6 +245,8 @@ export class SchemaManager {
 				desc: col.desc,
 				collation: col.collation,
 			})),
+			unique: idx.unique ? true : undefined,
+			predicate: idx.predicate as IndexSchema['predicate'],
 		}));
 		return {
 			name: stored.name,
@@ -228,7 +262,40 @@ export class SchemaManager {
 			isView: false,
 			indexes,
 			estimatedRows: stored.estimatedRows,
+			uniqueConstraints: this.storedToUniqueConstraints(stored),
 		};
+	}
+
+	/**
+	 * Reconstruct the full UNIQUE-constraint list a hydrated table must enforce:
+	 * the persisted non-derived constraints, plus one derived constraint per
+	 * persisted `unique` index (mirroring what Quereus's
+	 * `appendIndexToTableSchema` synthesizes when the `CREATE UNIQUE INDEX` DDL
+	 * actually runs — which it does not on the hydrate path). Deduped by column
+	 * set, so a unique index over columns already carrying a table-level UNIQUE
+	 * contributes no second constraint. Returns undefined when there are none.
+	 */
+	storedToUniqueConstraints(stored: StoredTableSchema): UniqueConstraintSchema[] | undefined {
+		const constraints: UniqueConstraintSchema[] = (stored.uniqueConstraints ?? []).map(uc => ({
+			name: uc.name,
+			columns: [...uc.columns],
+			defaultConflict: uc.defaultConflict,
+			predicate: uc.predicate as UniqueConstraintSchema['predicate'],
+		}));
+		const seen = new Set(constraints.map(uc => columnSetKey(uc.columns)));
+		for (const idx of stored.indexes) {
+			if (!idx.unique) continue;
+			const idxColumns = idx.columns.map(col => col.index);
+			const setKey = columnSetKey(idxColumns);
+			if (seen.has(setKey)) continue;
+			seen.add(setKey);
+			constraints.push({
+				columns: idxColumns,
+				predicate: idx.predicate as UniqueConstraintSchema['predicate'],
+				derivedFromIndex: idx.name,
+			});
+		}
+		return constraints.length > 0 ? constraints : undefined;
 	}
 
 	/**
@@ -238,6 +305,18 @@ export class SchemaManager {
 	 * already on disk).
 	 */
 	tableSchemaToStored(schema: TableSchema): StoredTableSchema {
+		// Persist only NON-derived constraints: a `derivedFromIndex` constraint is
+		// re-synthesized from its index's `unique` flag on read (see
+		// storedToUniqueConstraints), so persisting it too would double it up.
+		// Omit the key entirely when empty — see StoredTableSchema.uniqueConstraints.
+		const uniqueConstraints: StoredUniqueConstraint[] = (schema.uniqueConstraints ?? [])
+			.filter(uc => uc.derivedFromIndex === undefined)
+			.map(uc => ({
+				name: uc.name,
+				columns: [...uc.columns],
+				defaultConflict: uc.defaultConflict,
+				predicate: uc.predicate,
+			}));
 		return {
 			name: schema.name,
 			schemaName: schema.schemaName,
@@ -251,6 +330,7 @@ export class SchemaManager {
 			vtabModuleName: schema.vtabModuleName,
 			vtabArgs: schema.vtabArgs as Record<string, any>,
 			estimatedRows: schema.estimatedRows,
+			uniqueConstraints: uniqueConstraints.length > 0 ? uniqueConstraints : undefined,
 		};
 	}
 
@@ -282,6 +362,10 @@ export class SchemaManager {
 				desc: col.desc,
 				collation: col.collation,
 			})),
+			// Normalize false → omitted so a plain index round-trips byte-identical
+			// with schemas persisted before uniqueness metadata was wired through.
+			unique: idx.unique ? true : undefined,
+			predicate: idx.predicate,
 		};
 	}
 

@@ -25,7 +25,7 @@ export { PartialCommitError } from './optimystic-adapter/txn-bridge.js';
 
 // Export schema utilities
 export { RowCodec, type EncodedRow, type PrimaryKeyValue, type EncodingFormat } from './schema/row-codec.js';
-export type { StoredTableSchema, StoredColumnSchema, StoredPrimaryKeyColumn } from './schema/schema-manager.js';
+export type { StoredTableSchema, StoredColumnSchema, StoredPrimaryKeyColumn, StoredIndexSchema, StoredUniqueConstraint } from './schema/schema-manager.js';
 
 // Export the order-preserving, injective key-framing primitives (shared by the
 // primary-key and secondary-index encoders).
