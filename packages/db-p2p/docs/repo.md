@@ -163,12 +163,18 @@ export type RepoMessage = {
 	operations: [
 		{ get: BlockGets } |
 		{ pend: PendRequest } |
-		{ cancel: { trxRef: TrxBlocks } } |
-		{ commit: CommitRequest }
+		{ cancel: { actionRef: ActionBlocks } } |
+		{ commit: CommitRequest } |
+		{ invalidate: InvalidateRequest }
 	],
-  expiration: number;
+	expiration?: number,
+	coordinatingBlockIds?: string[],
 };
 ```
+
+One request per stream: the service answers the first frame and completes the generator, so a client
+dials, writes one length-prefixed JSON `RepoMessage`, reads one length-prefixed JSON response, and
+closes. A second frame queued on the same stream is never read.
 
 ### Cluster Record Format
 
@@ -187,7 +193,7 @@ export type ClusterRecord = {
 ### Network Protocols
 
 #### Repo Protocol
-- **Protocol ID**: `/db-p2p/repo/1.0.0`
+- **Protocol ID**: `/optimystic/<network>/repo/1.0.0` (built from `protocolPrefix`; see § Protocol id conventions)
 - **Transport**: libp2p streams with length-prefixed encoding
 - **Message Type**: JSON-encoded `RepoMessage`
 - **Response**: JSON-encoded operation results
@@ -197,6 +203,56 @@ export type ClusterRecord = {
 - **Transport**: libp2p streams
 - **Message Type**: `ClusterRecord` updates
 - **Phases**: Promise collection → Commit execution
+
+### Protocol id conventions
+
+Two peers connect only if they agree on the exact protocol id string for each service. Anyone building
+a peer against an Optimystic node — including this repository's own foreign-peer interop fixture —
+needs the table below, because the strings are not all derived the same way.
+
+Every id is **network-scoped**: a node built with `networkName: 'mainnet'` registers ids under
+`/optimystic/mainnet/…` and cannot negotiate with a node on a different network name. That is
+deliberate — it is what keeps two logical networks sharing the same physical machines from selecting
+each other's peers into a cohort.
+
+| Service | Protocol id | Built by |
+| --- | --- | --- |
+| identify | `/optimystic/<network>/id/1.0.0` | `@libp2p/identify` |
+| identify/push | `/optimystic/<network>/id/push/1.0.0` | `@libp2p/identify` |
+| cluster | `/optimystic/<network>/cluster/1.0.0` | `cluster/service.ts` |
+| repo | `/optimystic/<network>/repo/1.0.0` | `repo/service.ts` |
+| sync | `/optimystic/<network>/db-p2p/sync/1.0.0` | `sync/protocol.ts` |
+| block transfer | `/optimystic/<network>/db-p2p/block-transfer/1.0.0` | `cluster/block-transfer-service.ts` |
+
+Two traps in that table:
+
+1. **The identify prefix is spelled slash-LESS.** `@libp2p/identify` builds its own id as
+   `` `/${protocolPrefix}/id/1.0.0` `` — it always prepends the leading slash, and its own default is
+   the bare `'ipfs'`. So it must be handed `optimystic/<network>`, while every service that
+   concatenates its own template literal is handed `/optimystic/<network>`. Passing the slash-prefixed
+   form to identify produces the malformed `//optimystic/<network>/id/1.0.0`, which shipped for
+   several releases ([gotchoices/Optimystic#6](https://github.com/gotchoices/Optimystic/issues/6)) and
+   is invisible to any test whose peers all make the same mistake.
+2. **`sync` and `block-transfer` carry a `/db-p2p/` infix.** Their builders prepend the network prefix
+   to an id that already begins `/db-p2p/…`, so the network scope and the legacy package name both
+   appear. This is the current wire format, not a typo in this document — but it is not guessable, so
+   read it from here rather than inferring it from the other four.
+
+These ids are locked by `test/identify-protocol-id.spec.ts` (in-process) and
+`test/foreign-peer-interop.integration.spec.ts` (from a peer built outside this repository, which is
+the only place a uniformly-wrong convention can be caught).
+
+### Peer classification
+
+`Libp2pKeyPeerNetwork.membershipOf` classifies every peer from its advertised protocol list alone:
+
+- **`serves`** — advertises `/optimystic/<network>/cluster/1.0.0` or `/optimystic/<network>/repo/1.0.0`
+- **`foreign`** — advertises protocols, but neither of those (it belongs to some other network)
+- **`unknown`** — advertises nothing yet (identify has not completed)
+
+Coordinator and cohort selection route work only to peers confirmed `serves`. A peer built to speak
+the repo protocol therefore becomes routable the moment its identify exchange completes; a peer whose
+ids are misspelled stays `foreign` forever and is silently skipped.
 
 ## Distributed Consensus Algorithm
 
