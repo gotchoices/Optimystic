@@ -7,17 +7,50 @@ Tags use the `v` prefix (e.g. `v0.7.0`).
 
 ## Prerequisites
 
-- `yarn build` succeeds
-- `yarn test` passes
+- `yarn check` passes — the full gate (see below)
 - Clean working tree (`git status` shows no uncommitted changes)
+
+### `yarn check`
+
+One command, run before every release:
+
+```bash
+yarn check
+```
+
+It runs, in order:
+
+| Step | What it covers |
+|------|----------------|
+| `yarn lint` | eslint across the monorepo |
+| `yarn build` | every package compiles |
+| `yarn test` | unit suites — fast, no sockets |
+| `yarn test:integration` | real-socket libp2p suites |
+
+`yarn test:integration` is the step that matters most and is the easiest to skip by accident: the
+integration specs are **env-gated** (`OPTIMYSTIC_INTEGRATION=1`) and live in a separate per-package
+`test:integration` script, so **plain `yarn test` does not run them**. They cover real TCP meshes,
+FRET cohort assembly, threshold-signed membership certificates, and cross-node reactivity and
+matchmaking over real sockets — the behaviour that only appears once packets actually move.
 
 ## Quick Release
 
 ```bash
+yarn check      # run this first
 yarn release
 ```
 
-This runs `yarn bump` (interactive version prompt, commits, tags, pushes) then `yarn pub` (clean + build + publish each package).
+`yarn release` runs a preflight prompt (`scripts/release-preflight.mjs`) that restates the checklist,
+reports the working-tree and upstream state, and waits for you to type `release` to confirm — then
+`yarn bump` (interactive version prompt, commits, tags, pushes) then `yarn pub` (clean + build +
+publish each package).
+
+The preflight is a **reminder, not a substitute**: it does not run `yarn check` for you. Publishing
+is irreversible for a given version number, so the confirmation is deliberate rather than a
+y/N keypress.
+
+For automation, `node scripts/release-preflight.mjs --yes` (or `CI=1`) bypasses the prompt. Without a
+terminal and without an explicit bypass the preflight aborts rather than assuming consent.
 
 ## Step by Step
 
@@ -87,8 +120,7 @@ All packages in the monorepo share the same version number. The `--recursive` fl
 
 ## Checklist
 
-- [ ] `yarn build` succeeds
-- [ ] `yarn test` passes
+- [ ] `yarn check` passes (lint + build + test + **test:integration**)
 - [ ] Clean working tree
 - [ ] `yarn release` (or `yarn bump` + `yarn pub` separately)
 - [ ] GitHub release created

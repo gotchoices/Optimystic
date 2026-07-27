@@ -30,6 +30,13 @@ Each testable package has a `register.mjs` that sets up `ts-node/esm`. Run tests
 
 To grep for a specific test: `yarn test -- --grep "pattern"`
 
+**`yarn test` is not the whole suite.** The integration specs (`test/**/*.integration.spec.ts` in
+`db-p2p` and `quereus-plugin-optimystic`) are env-gated on `OPTIMYSTIC_INTEGRATION=1` and run from a
+separate `test:integration` script — they exercise real TCP meshes, FRET cohort assembly, and
+cross-node reactivity/matchmaking over real sockets. Run `yarn test:integration` from root to fan out
+to both, or `yarn check` from root for the full gate (lint + build + test + test:integration).
+`yarn check` is the pre-release gate; see [docs/releasing.md](docs/releasing.md).
+
 ## Dependencies
 
 Shared cross-package deps are version-guarded by `yarn.config.cjs` (Yarn 4 constraints). `@libp2p/peer-id` and `uint8arrays` must declare a single blessed range everywhere; `@libp2p/interface` and `@libp2p/crypto` must stay within a shared major (minor drift is allowed and, for `@libp2p/interface` 3.1 vs 3.2, deliberate — see the comments in that file). After changing any such dep, run `yarn constraints`; single-range violations are auto-repairable with `yarn constraints --fix`, major violations are reported and need a human decision.

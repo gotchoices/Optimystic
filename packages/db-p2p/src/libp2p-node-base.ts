@@ -446,9 +446,17 @@ export async function createLibp2pNodeBase(
 			}),
 			// identify/push propagates *later* address/protocol changes (relay reservation,
 			// AutoNAT-learned observed addr, a service registered post-start) to already-connected
-			// peers. Without it those peers keep the stale snapshot from the initial identify —
-			// which the `serves`/`unknown` membership classification in `libp2p-key-network.ts`
-			// reads, so a late-registered cluster/repo handler would never flip a peer to `serves`.
+			// peers. Without it those peers keep the stale snapshot from the initial identify.
+			// Two consequences, both now covered by tests rather than asserted here:
+			//  - Addresses: a relay-only peer's reservation completes AFTER its first connection to
+			//    the relay, so the circuit address is exactly the one identify cannot have carried.
+			//    The relay's peerStore entry stays empty and a later dial by peer id alone fails
+			//    with NoValidAddressesError against a reachable peer — `relay-address-propagation.spec.ts`
+			//    (its gated control reproduces that failure with push removed).
+			//  - Protocols: `membershipOf` in `libp2p-key-network.ts` classifies a peer serves/
+			//    foreign/unknown purely from the peerStore protocol list, so a cluster/repo handler
+			//    registered post-start never flips an already-connected peer to `serves` —
+			//    `identify-push-propagation.spec.ts`.
 			identifyPush: identifyPush({
 				protocolPrefix: `optimystic/${options.networkName}`
 			}),

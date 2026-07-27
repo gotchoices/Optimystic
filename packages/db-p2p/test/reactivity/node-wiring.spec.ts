@@ -3,8 +3,8 @@ import { generateKeyPair } from '@libp2p/crypto/keys';
 import { peerIdFromPrivateKey, peerIdFromString } from '@libp2p/peer-id';
 import { bytesToB64url, reactivityTopicId } from '@optimystic/db-core';
 import { createLibp2pNode } from '../../src/libp2p-node.js';
-import { DEFAULT_REACTIVITY_PROTOCOLS } from '../../src/reactivity/protocols.js';
 import { ReactivitySubscriberRegistry } from '../../src/reactivity/subscriber-registry.js';
+import { expectWellFormedProtocolIds } from '../util/protocol-ids.js';
 import { Libp2pReactivityRecoverTransport } from '../../src/reactivity/recover-transport.js';
 import { RotationReRegistrationScheduler } from '../../src/reactivity/rotation-rereg-scheduler.js';
 import type { RotationNotice } from '../../src/reactivity/subscription-manager.js';
@@ -12,9 +12,25 @@ import { peerIdToBytes, bytesToPeerIdString } from '../../src/cohort-topic/peer-
 import { edgeProfile } from '@optimystic/db-core';
 import type { CohortTopicHost } from '../../src/cohort-topic/host.js';
 
-const NOTIFY = DEFAULT_REACTIVITY_PROTOCOLS.notify;
-const PUSH_STATE_GOSSIP = DEFAULT_REACTIVITY_PROTOCOLS.pushStateGossip;
-const RECOVER = DEFAULT_REACTIVITY_PROTOCOLS.recover;
+/**
+ * The reactivity protocol ids, written out as LITERALS.
+ *
+ * These used to be `DEFAULT_REACTIVITY_PROTOCOLS.notify` etc. — imported from
+ * `src/reactivity/protocols.ts`, which is the *same* constant object `libp2p-node-base.ts`
+ * registers the handlers from. Both sides of the assertion were then the production value, so a
+ * malformed id would have matched itself and passed: the check proved the constant reached
+ * registration, not that its content was right. That is the defect class behind
+ * gotchoices/Optimystic#6 (`//optimystic/<net>/id/1.0.0` passed every include-assertion for
+ * several releases).
+ *
+ * Owner: `DEFAULT_REACTIVITY_PROTOCOLS` in `src/reactivity/protocols.ts`, registered by the
+ * `cohortTopic` block of `libp2p-node-base.ts`. Note these are the network-AGNOSTIC ids: unlike
+ * the cluster/repo/block-transfer family, reactivity's defaults carry no `<network>` segment.
+ * A deliberate id change now requires editing these literals — that is the point.
+ */
+const NOTIFY = '/optimystic/reactivity/1.0.0/notify';
+const PUSH_STATE_GOSSIP = '/optimystic/reactivity/1.0.0/push-state-gossip';
+const RECOVER = '/optimystic/reactivity/1.0.0/recover';
 
 /**
  * A minimal rotation notice whose `fireAt` is ~1 hour out, used to probe the scheduler's accept/teardown
@@ -60,6 +76,7 @@ describe('reactivity / node wiring (real libp2p, solo forming node)', function (
 			expect(protocols, 'notify handler registered').to.include(NOTIFY);
 			expect(protocols, 'push-state-gossip handler registered').to.include(PUSH_STATE_GOSSIP);
 			expect(protocols, 'recover handler registered').to.include(RECOVER);
+			expectWellFormedProtocolIds(protocols, 'cohortTopic-enabled Core node');
 
 			// The node-level subscriber registry is exposed so a subscribe factory can register managers.
 			expect(node.reactivitySubscribers, 'subscriber registry exposed on the node').to.be.instanceOf(ReactivitySubscriberRegistry);

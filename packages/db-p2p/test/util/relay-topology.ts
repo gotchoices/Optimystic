@@ -1,6 +1,7 @@
 /**
  * Shared topology helpers for the slow circuit-relay / DCUtR integration specs
- * (`circuit-relay-long-lived.spec.ts`, `dcutr-direct-upgrade.spec.ts`).
+ * (`circuit-relay-long-lived.spec.ts`, `dcutr-direct-upgrade.spec.ts`,
+ * `relay-address-propagation.spec.ts`).
  *
  * Each helper spins a real libp2p node (relay or service peer) via
  * `createLibp2pNode` and/or polls multiaddr / connection state. They are only
@@ -113,6 +114,27 @@ export function pickRelayWsAddr(node: Libp2p): Multiaddr {
 		throw new Error(`No /ws multiaddr on node; have: ${addrs.join(', ')}`);
 	}
 	return multiaddr(ws);
+}
+
+/**
+ * A relay-only ("browser-shaped") peer: WebSockets + circuit transport, and a listen address
+ * that is ONLY the qualified circuit address through `relayAddr`. It has no direct listener, so
+ * the sole address anyone can reach it on is the one it gains when the relay grants its
+ * reservation — which happens strictly AFTER its first connection to the relay, and therefore
+ * after that connection's initial identify exchange. That ordering is what makes this shape the
+ * reproduction topology for the identify/push address-propagation defect.
+ */
+export async function spawnCircuitOnlyPeer(network: string, relayAddr: Multiaddr): Promise<Libp2p> {
+	const transports: Libp2pTransports = [webSockets(), circuitRelayTransport()];
+	return await createLibp2pNode({
+		port: 0,
+		networkName: network,
+		bootstrapNodes: [relayAddr.toString()],
+		relay: false,
+		transports,
+		listenAddrs: [`${relayAddr.toString()}/p2p-circuit`],
+		...CLUSTER_SCAFFOLD
+	});
 }
 
 /** Wait until `node` publishes a `/p2p-circuit` listen multiaddr (relay reservation accepted). */

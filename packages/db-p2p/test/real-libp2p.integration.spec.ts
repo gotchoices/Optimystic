@@ -156,6 +156,50 @@ describe('Real libp2p integration', function () {
 		await pendCommitGet(repo, 'optimystic/schema', 'schema-default-a1', 1);
 	});
 
+	it('re-dials a peer by peer id alone, resolved from the peerStore (no harness-supplied multiaddr)', async function () {
+		this.timeout(25_000);
+
+		// Why this test exists. Every other multi-node case in this file (and in every other
+		// integration spec in the repo) wires its mesh by reading the OTHER node's live
+		// `getMultiaddrs()` in-process and handing the string to `dial()` — see `fullMeshDial`
+		// above. That bypasses the peerStore entirely, which is the structure `identifyPush`
+		// exists to populate (gotchoices/Optimystic#7). In production nothing hands you a
+		// multiaddr: FRET yields a peer id and the peerStore has to resolve it. So the whole
+		// class of peerStore-resolution defects was invisible at this tier — not through an
+		// oversight in one spec, but because the shared wiring idiom guarantees it.
+		//
+		// This is deliberately ONE edge, not a rewrite: the explicit-multiaddr wiring elsewhere is
+		// load-bearing for spec runtime and small-N stability. The isolated mechanism is covered by
+		// `relay-address-propagation.spec.ts`; this proves the mesh tier is no longer blind to it.
+		const a = await spawnNode();
+		const b = await spawnNode();
+
+		// Connect the way this file already does — an explicit multiaddr — so only the RE-dial is
+		// under test, not the initial introduction.
+		await b.dial(multiaddr(pickLocalTcpMultiaddr(a)));
+		await waitForPeers(a, 1, 10_000);
+
+		// Drop the connection from both ends so the dialer has nothing warm to reuse.
+		await Promise.allSettled(b.getConnections(a.peerId).map(c => c.close()));
+		await Promise.allSettled(a.getConnections(b.peerId).map(c => c.close()));
+		expect(b.getConnections(a.peerId).length, 'no warm connection left to reuse').to.equal(0);
+
+		// NOT wrapped in a swallowing try/catch. The prevailing "a reciprocal dial covers this edge"
+		// idiom is precisely what makes these failures silent; this edge must fail loudly. The error
+		// name is surfaced so a regression reports `NoValidAddressesError` rather than a bare timeout.
+		let redialError: Error | undefined;
+		let remotePeer: string | undefined;
+		try {
+			remotePeer = (await b.dial(a.peerId)).remotePeer.toString();
+		} catch (err) {
+			redialError = err as Error;
+		}
+		expect(redialError === undefined,
+			`dial(peerId) with no caller-supplied address failed: ${redialError?.name} — ${redialError?.message}`)
+			.to.equal(true);
+		expect(remotePeer, 'the peer-id-only re-dial reached A').to.equal(a.peerId.toString());
+	});
+
 	it('two-node mesh over TCP', async function () {
 		this.timeout(20_000);
 		const a = await spawnNode();

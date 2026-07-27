@@ -2,9 +2,24 @@ import { expect } from 'chai';
 import type { Libp2p } from 'libp2p';
 import type { BlockId, IBlock, BlockHeader, Transforms, IRepo } from '@optimystic/db-core';
 import { createLibp2pNode } from '../src/libp2p-node.js';
-import { buildBlockTransferProtocol } from '../src/cluster/block-transfer-service.js';
 import type { RebalanceMonitor } from '../src/cluster/rebalance-monitor.js';
 import type { BlockTransferCoordinator } from '../src/cluster/block-transfer.js';
+import { expectWellFormedProtocolIds } from './util/protocol-ids.js';
+
+/**
+ * The block-transfer receive handler's id, written out as a LITERAL.
+ *
+ * It used to be computed here by calling `buildBlockTransferProtocol('/optimystic/<net>')` — the
+ * same builder production calls, with the same prefix. That form proves the id flows from
+ * construction to registration and nothing about the id's *content*: had the builder emitted a
+ * malformed string, both sides of the assertion would have been malformed identically and the test
+ * would still have passed. That is exactly the shape of gotchoices/Optimystic#6, one layer up.
+ *
+ * Owner: `blockTransferService` (`src/cluster/block-transfer-service.ts`). A deliberate protocol
+ * version bump now requires editing this literal — that cost is the point, not a drawback.
+ */
+const blockTransferProtocolFor = (networkName: string): string =>
+	`/optimystic/${networkName}/db-p2p/block-transfer/1.0.0`;
 
 /**
  * **Rebalance node-wiring** (`5.1-rebalance-monitor-wiring-and-reaction`). On a real production node
@@ -63,8 +78,10 @@ describe('rebalance-monitor / node wiring (real libp2p, solo arachnode node)', f
 		try {
 			// The block-transfer RECEIVE handler is registered under the same network-scoped prefix the
 			// coordinator pushes to (protocol-prefix match — a mismatch silently fails every lost-block push).
-			const blockTransferProtocol = buildBlockTransferProtocol(`/optimystic/${networkName}`);
-			expect(node.getProtocols() as string[], 'block-transfer handler registered under /optimystic/<net>').to.include(blockTransferProtocol);
+			const protocols = node.getProtocols() as string[];
+			expect(protocols, 'block-transfer handler registered under /optimystic/<net>')
+				.to.include(blockTransferProtocolFor(networkName));
+			expectWellFormedProtocolIds(protocols, 'rebalance-wiring node');
 
 			const monitor = node.rebalanceMonitor as RebalanceMonitor;
 			expect(monitor, 'rebalanceMonitor exposed on the node').to.exist;
@@ -122,8 +139,8 @@ describe('rebalance-monitor / node wiring (real libp2p, solo arachnode node)', f
 			// regardless of the rebalance opt-out (it is independent of the reaction sender).
 			const repo = node.coordinatedRepo as IRepo;
 			await pendCommit(repo, 'rebalance-disabled-block', 'rebalance-coll', 'rebalance-d1', 1);
-			const blockTransferProtocol = buildBlockTransferProtocol('/optimystic/rebalance-wiring-off');
-			expect(node.getProtocols() as string[], 'receive handler still registered when reaction disabled').to.include(blockTransferProtocol);
+			expect(node.getProtocols() as string[], 'receive handler still registered when reaction disabled')
+				.to.include(blockTransferProtocolFor('rebalance-wiring-off'));
 		} finally {
 			await node.stop();
 		}

@@ -2,8 +2,20 @@ import { expect } from 'chai';
 import type { Libp2p } from 'libp2p';
 import type { BlockId, IBlock, BlockHeader, Transforms, IRepo } from '@optimystic/db-core';
 import { createLibp2pNode } from '../src/libp2p-node.js';
-import { buildBlockTransferProtocol } from '../src/cluster/block-transfer-service.js';
 import type { SpreadOnChurnMonitor } from '../src/cluster/spread-on-churn.js';
+import { expectWellFormedProtocolIds } from './util/protocol-ids.js';
+
+/**
+ * The block-transfer receive handler's id, written out as a LITERAL rather than recomputed with
+ * the same `buildBlockTransferProtocol` builder production uses. A test that derives its
+ * expectation from the code under test restates whatever that code produces — a malformed id would
+ * appear identically on both sides and pass. See the twin note in
+ * `rebalance-monitor-node-wiring.spec.ts`.
+ *
+ * Owner: `blockTransferService` (`src/cluster/block-transfer-service.ts`).
+ */
+const blockTransferProtocolFor = (networkName: string): string =>
+	`/optimystic/${networkName}/db-p2p/block-transfer/1.0.0`;
 
 /**
  * **Spread-on-churn node-wiring** (`optimystic-spread-on-churn-monitor-wiring`). On a real
@@ -58,9 +70,10 @@ describe('spread-on-churn / node wiring (real libp2p, solo forming node)', funct
 		try {
 			// The block-transfer RECEIVE handler is registered under the same network-scoped prefix
 			// the monitor dials (protocol-prefix match — a mismatch silently fails every push to dial).
-			const blockTransferProtocol = buildBlockTransferProtocol(`/optimystic/${networkName}`);
 			const protocols: string[] = node.getProtocols();
-			expect(protocols, 'block-transfer handler registered under /optimystic/<net>').to.include(blockTransferProtocol);
+			expect(protocols, 'block-transfer handler registered under /optimystic/<net>')
+				.to.include(blockTransferProtocolFor(networkName));
+			expectWellFormedProtocolIds(protocols, 'spread-wiring node');
 
 			const monitor = node.spreadOnChurnMonitor as SpreadOnChurnMonitor;
 			expect(monitor, 'spreadOnChurnMonitor exposed on the node').to.exist;
@@ -104,8 +117,8 @@ describe('spread-on-churn / node wiring (real libp2p, solo forming node)', funct
 			await pendCommit(repo, 'spread-disabled-block', 'spread-coll', 'spread-d1', 1);
 
 			// The block-transfer RECEIVE handler is still registered regardless of the sender opt-out.
-			const blockTransferProtocol = buildBlockTransferProtocol('/optimystic/spread-wiring-off');
-			expect((node.getProtocols() as string[]), 'receive handler still registered when sender disabled').to.include(blockTransferProtocol);
+			expect((node.getProtocols() as string[]), 'receive handler still registered when sender disabled')
+				.to.include(blockTransferProtocolFor('spread-wiring-off'));
 		} finally {
 			await node.stop();
 		}
