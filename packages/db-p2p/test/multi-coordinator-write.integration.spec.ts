@@ -5,6 +5,7 @@ import { waitFor } from '@optimystic/db-core/test';
 import { multiaddr } from '@multiformats/multiaddr';
 import { hashKey } from 'p2p-fret';
 import { createLibp2pNode, type NodeOptions } from '../src/libp2p-node.js';
+import { pickLocalTcpMultiaddr } from './util/multiaddrs.js';
 
 // Reproducer for `multi-coordinator-write-stream-reset-supermajority`.
 //
@@ -51,14 +52,6 @@ const makeTransforms = (blockId: string): Transforms => ({
 	updates: {},
 	deletes: []
 });
-
-function pickLocalTcpMultiaddr(node: Libp2p): string {
-	const addrs = node.getMultiaddrs().map(a => a.toString());
-	const local = addrs.find(a => a.startsWith('/ip4/127.0.0.1/tcp/'))
-		?? addrs.find(a => a.includes('/tcp/') && a.includes('/p2p/'));
-	if (!local) throw new Error(`No usable TCP multiaddr on node; have: ${addrs.join(', ')}`);
-	return local;
-}
 
 
 async function fullMeshDial(meshNodes: Libp2p[]): Promise<void> {

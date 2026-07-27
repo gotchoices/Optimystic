@@ -44,7 +44,7 @@ export class RepoClient extends ProtocolClient implements IRepo {
   // Core repository operations
   async get(blockGets: BlockGets, options: MessageOptions): Promise<GetBlockResults>
   async pend(request: PendRequest, options: MessageOptions): Promise<PendSuccess | StaleFailure>
-  async cancel(trxRef: TrxBlocks, options: MessageOptions): Promise<void>
+  async cancel(actionRef: ActionBlocks, options: MessageOptions): Promise<void>
   async commit(request: CommitRequest, options: MessageOptions): Promise<CommitResult>
 }
 ```
@@ -72,14 +72,17 @@ The `RepoService` implements a libp2p service that handles incoming repo protoco
 - **Response Handling**: Serializes and sends responses back to clients
 
 **Protocol Details:**
-- **Protocol ID**: `/db-p2p/repo/1.0.0` (configurable)
+- **Protocol ID**: `/optimystic/<network>/repo/1.0.0` — built from the `protocolPrefix` the node was
+  created with; see § Protocol id conventions. (`/db-p2p/repo/1.0.0` is only the fallback used when a
+  service is constructed with no prefix at all, which `createLibp2pNode` never does.)
 - **Message Format**: JSON-encoded `RepoMessage` objects
 - **Stream Handling**: Uses length-prefixed encoding for message framing
 
 **Implementation:**
 ```typescript
 export class RepoService implements Startable {
-  private readonly protocol: string = '/db-p2p/repo/1.0.0'
+  // init.protocol ?? (init.protocolPrefix ?? '/db-p2p') + '/repo/1.0.0'
+  private readonly protocol: string
   
   async start(): Promise<void> {
     await this.components.registrar.handle(
@@ -176,6 +179,11 @@ One request per stream: the service answers the first frame and completes the ge
 dials, writes one length-prefixed JSON `RepoMessage`, reads one length-prefixed JSON response, and
 closes. A second frame queued on the same stream is never read.
 
+`invalidate` is the one operation the repo protocol does not serve. It reaches a node only through
+consensus on the cluster protocol (`ClusterRecord.message`, applied by `cluster/cluster-repo.ts`);
+`RepoService` dispatches `get` / `pend` / `cancel` / `commit` only, so an `invalidate` sent directly
+on the repo protocol produces no meaningful response.
+
 ### Cluster Record Format
 
 Distributed transactions use `ClusterRecord` for state management:
@@ -210,10 +218,10 @@ Two peers connect only if they agree on the exact protocol id string for each se
 a peer against an Optimystic node — including this repository's own foreign-peer interop fixture —
 needs the table below, because the strings are not all derived the same way.
 
-Every id is **network-scoped**: a node built with `networkName: 'mainnet'` registers ids under
-`/optimystic/mainnet/…` and cannot negotiate with a node on a different network name. That is
-deliberate — it is what keeps two logical networks sharing the same physical machines from selecting
-each other's peers into a cohort.
+Every id Optimystic itself defines is **network-scoped**: a node built with `networkName: 'mainnet'`
+registers ids under `/optimystic/mainnet/…` and cannot negotiate with a node on a different network
+name. That is deliberate — it is what keeps two logical networks sharing the same physical machines
+from selecting each other's peers into a cohort.
 
 | Service | Protocol id | Built by |
 | --- | --- | --- |
@@ -223,6 +231,13 @@ each other's peers into a cohort.
 | repo | `/optimystic/<network>/repo/1.0.0` | `repo/service.ts` |
 | sync | `/optimystic/<network>/db-p2p/sync/1.0.0` | `sync/protocol.ts` |
 | block transfer | `/optimystic/<network>/db-p2p/block-transfer/1.0.0` | `cluster/block-transfer-service.ts` |
+| routing (FRET) | `/optimystic/<network>/fret/1.0.0/{ping,neighbors,neighbors/announce,maybeAct,leave}` | `p2p-fret` |
+
+A node also advertises the stock libp2p protocols its services bring with them — `/ipfs/ping/1.0.0`,
+`/libp2p/dcutr`, `/libp2p/autonat/1.0.0`, `/libp2p/circuit/relay/0.2.0/…`, `/meshsub/…`,
+`/floodsub/1.0.0`. Those keep their upstream ids and are **not** network-scoped, so two nodes on
+different Optimystic networks can still ping and gossip each other; only the ids above decide whether
+a peer is treated as part of this network.
 
 Two traps in that table:
 
@@ -236,7 +251,7 @@ Two traps in that table:
 2. **`sync` and `block-transfer` carry a `/db-p2p/` infix.** Their builders prepend the network prefix
    to an id that already begins `/db-p2p/…`, so the network scope and the legacy package name both
    appear. This is the current wire format, not a typo in this document — but it is not guessable, so
-   read it from here rather than inferring it from the other four.
+   read it from here rather than inferring it from `cluster` and `repo`.
 
 These ids are locked by `test/identify-protocol-id.spec.ts` (in-process) and
 `test/foreign-peer-interop.integration.spec.ts` (from a peer built outside this repository, which is
@@ -326,7 +341,7 @@ const commitResult = await client.commit({ actionId: 'tx1', blockIds: ['block1']
 ```typescript
 // Create a service with local storage
 const service = repoService({
-  protocol: '/db-p2p/repo/1.0.0',
+  protocolPrefix: '/optimystic/my-network',   // → /optimystic/my-network/repo/1.0.0
   maxInboundStreams: 32
 });
 
@@ -344,7 +359,7 @@ await service.start();
 const node = await createLibp2pNode({
   services: {
     repo: repoService({
-      protocol: '/db-p2p/repo/1.0.0'
+      protocolPrefix: '/optimystic/my-network'
     })
   }
 });

@@ -150,9 +150,12 @@ If PEND detects stale reads or a conflicting concurrent transaction, the coordin
 
 | Protocol | Who uses it | Purpose |
 |----------|-------------|---------|
-| `/db-p2p/repo/1.0.0` | External client ↔ coordinator node | Client-facing `IRepo` operations (`get`, `pend`, `commit`, `cancel`). |
+| `/{prefix}/repo/1.0.0` | External client ↔ coordinator node | Client-facing `IRepo` operations (`get`, `pend`, `commit`, `cancel`). |
 | `/{prefix}/cluster/1.0.0` | Coordinator ↔ cluster peers | Cluster-record exchange for 2-phase commit. |
 | `/{prefix}/dispute/1.0.0` | Dissenting member ↔ enlistees | Validity dispute escalation (opt-in, see below). |
+
+`{prefix}` is `/optimystic/<network>` for a node built by `createLibp2pNode` — the full id inventory
+and the conventions behind it are in `packages/db-p2p/docs/repo.md` § Protocol id conventions.
 
 ```mermaid
 graph LR

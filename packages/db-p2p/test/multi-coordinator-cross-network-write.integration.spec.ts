@@ -4,6 +4,7 @@ import type { BlockId, IBlock, BlockHeader, Transforms, IRepo } from '@optimysti
 import { waitFor } from '@optimystic/db-core/test';
 import { multiaddr } from '@multiformats/multiaddr';
 import { createLibp2pNode, type NodeOptions } from '../src/libp2p-node.js';
+import { pickLocalTcpMultiaddr } from './util/multiaddrs.js';
 
 // Reproducer / acceptance test for
 // `multi-coordinator-cross-network-coordinator-selection`.
@@ -43,14 +44,6 @@ const makeTransforms = (blockId: string): Transforms => ({
 	updates: {},
 	deletes: []
 });
-
-function pickLocalTcpMultiaddr(node: Libp2p): string {
-	const addrs = node.getMultiaddrs().map(a => a.toString());
-	const local = addrs.find(a => a.startsWith('/ip4/127.0.0.1/tcp/'))
-		?? addrs.find(a => a.includes('/tcp/') && a.includes('/p2p/'));
-	if (!local) throw new Error(`No usable TCP multiaddr on node; have: ${addrs.join(', ')}`);
-	return local;
-}
 
 
 async function dialBoth(x: Libp2p, y: Libp2p): Promise<void> {

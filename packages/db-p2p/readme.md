@@ -94,7 +94,7 @@ graph TD
     end
     
     %% Network communication
-    B -.->|"/db-p2p/repo/1.0.0"| C
+    B -.->|"/optimystic/&lt;network&gt;/repo/1.0.0"| C
     E -.->|"/optimystic/&lt;network&gt;/cluster/1.0.0"| G1
     E -.->|"/optimystic/&lt;network&gt;/cluster/1.0.0"| G2
     E -.->|"/optimystic/&lt;network&gt;/cluster/1.0.0"| G3
@@ -152,7 +152,7 @@ Handles incoming repository protocol messages from external clients:
 
 ```typescript
 class RepoService implements Startable {
-  // Protocol: /db-p2p/repo/1.0.0
+  // Protocol: /optimystic/<network>/repo/1.0.0 (see docs/repo.md § Protocol id conventions)
   // Transport: Length-prefixed JSON over libp2p streams
   async start(): Promise<void>
   async stop(): Promise<void>

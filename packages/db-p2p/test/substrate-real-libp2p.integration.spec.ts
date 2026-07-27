@@ -53,6 +53,7 @@ import { SeekerWalkClient, type SeekerWalkResult } from '../src/matchmaking/seek
 import { waitFor, waitForValue } from '@optimystic/db-core/test';
 import { signedWillingness, type Member } from '../src/testing/cohort-topic-mesh-harness.js';
 import { createReactivitySelfMembershipGate, reactivityTailBytes } from '../src/cohort-topic/reactivity-membership-gate.js';
+import { pickLocalTcpMultiaddr } from './util/multiaddrs.js';
 import { DEFAULT_REACTIVITY_PROTOCOLS } from '../src/reactivity/protocols.js';
 import {
 	Libp2pReactivityRecoverTransport,
@@ -258,13 +259,6 @@ async function memberOf(key: PrivateKey, peerId: PeerId): Promise<Member> {
 		};
 		nodes.push(real);
 		return real;
-	}
-
-	function pickLocalTcpMultiaddr(node: Libp2p): string {
-		const addrs = node.getMultiaddrs().map((a) => a.toString());
-		const local = addrs.find((a) => a.startsWith('/ip4/127.0.0.1/tcp/')) ?? addrs.find((a) => a.includes('/tcp/') && a.includes('/p2p/'));
-		if (!local) throw new Error(`No usable TCP multiaddr; have: ${addrs.join(', ')}`);
-		return local;
 	}
 
 	/** Instantiate every node's tier-0 cohort engine for `coord` (so each has a live `/cohort-gossip` sub). */

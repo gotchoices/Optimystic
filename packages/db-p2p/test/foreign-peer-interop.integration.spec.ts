@@ -45,6 +45,7 @@ import type { BlockId, IBlock, IRepo, Transforms } from '@optimystic/db-core';
 import { createLibp2pNode } from '../src/libp2p-node.js';
 import { waitForPeerStoreProtocols } from './util/peer-store-wait.js';
 import { expectWellFormedProtocolIds } from './util/protocol-ids.js';
+import { pickLocalTcpMultiaddr } from './util/multiaddrs.js';
 
 /** Distinct per-spec: protocol ids are network-scoped, so a shared name lets concurrent specs cross-talk. */
 const NETWORK = 'foreign-peer-interop-it';
@@ -66,9 +67,10 @@ const FOREIGN_IDENTIFY_PREFIX = `optimystic/${NETWORK}`;
  * This is the negotiation surface an integrator actually needs: `identify` (+ its push companion) to
  * exchange lists at all, and `cluster`/`repo` because those two are exactly what
  * `Libp2pKeyPeerNetwork.membershipOf` keys peer classification on. The node advertises more than
- * this (`sync` and `block-transfer` carry a surprising `/db-p2p/` infix — see
- * `packages/db-p2p/docs/repo.md` § Protocol id conventions); they are covered by the whole-list
- * well-formedness assertion below rather than named here, per this spec's scope guard.
+ * this — `sync` and `block-transfer` (which carry a surprising `/db-p2p/` infix), the five FRET
+ * routing ids, and the stock libp2p ids (`/ipfs/ping/1.0.0`, `/meshsub/…`, …). All of those are
+ * covered by the whole-list well-formedness assertion below rather than named here, per this spec's
+ * scope guard; the full inventory is in `packages/db-p2p/docs/repo.md` § Protocol id conventions.
  */
 const IDENTIFY_PROTOCOL = `/optimystic/${NETWORK}/id/1.0.0`;
 const IDENTIFY_PUSH_PROTOCOL = `/optimystic/${NETWORK}/id/push/1.0.0`;
@@ -121,13 +123,6 @@ const makeTransforms = (blockId: string): Transforms => ({
 	deletes: []
 });
 
-function pickLocalTcpMultiaddr(node: Libp2p): string {
-	const addrs = node.getMultiaddrs().map(a => a.toString());
-	const local = addrs.find(a => a.startsWith('/ip4/127.0.0.1/tcp/') && a.includes('/p2p/'));
-	if (!local) throw new Error(`No loopback TCP multiaddr on node; have: ${addrs.join(', ')}`);
-	return local;
-}
-
 /**
  * A peer assembled the way an outside project would assemble one: nothing from `src/`, the minimum
  * service surface that exercises protocol negotiation, and every id spelled out from the documented
@@ -143,8 +138,12 @@ function pickLocalTcpMultiaddr(node: Libp2p): string {
  * deliberately implements no repo semantics: closing the stream is the whole body. Teaching this
  * fixture more of the protocol is the scope creep the ticket warns about; if a future convention
  * needs covering, add an assertion, not a subsystem.
+ *
+ * `registerRepo: false` omits that handler, producing a peer that speaks identify and nothing this
+ * network recognizes. That is the negative control for the classification assertion — see the
+ * `foreign` case below.
  */
-async function spawnForeignPeer(): Promise<Libp2p> {
+async function spawnForeignPeer({ registerRepo = true }: { registerRepo?: boolean } = {}): Promise<Libp2p> {
 	const peer = await createLibp2p({
 		addresses: { listen: ['/ip4/127.0.0.1/tcp/0'] },
 		transports: [tcp()],
@@ -158,7 +157,9 @@ async function spawnForeignPeer(): Promise<Libp2p> {
 	// Registered before any connection, so the initial identify exchange carries it. (The
 	// register-AFTER-connect path — which needs identify/push to propagate — is covered separately
 	// by `identify-push-propagation.spec.ts` and is not this fixture's job.)
-	await peer.handle(REPO_PROTOCOL, (stream: Stream) => { void stream.close(); });
+	if (registerRepo) {
+		await peer.handle(REPO_PROTOCOL, (stream: Stream) => { void stream.close(); });
+	}
 
 	return peer;
 }
@@ -384,6 +385,40 @@ describe('Foreign-peer interop (a peer this repo did not build)', function () {
 			.to.equal(true);
 		expect(classify(settled.protocols), 'a hand-built peer advertising the documented repo id is routable')
 			.to.equal('serves');
+	});
+
+	it('control: a hand-built peer WITHOUT the repo id settles to `foreign`, not `serves`', async function () {
+		// The negative half of check 5, and the reason that check means anything. `membershipOf`
+		// returns `serves` unconditionally when no `protocolPrefix` is configured, so a build that
+		// lost network scoping entirely would still satisfy "settles to serves" — the positive
+		// assertion alone cannot tell a working classifier from a disabled one. This peer is
+		// identical except that it advertises no Optimystic protocol, so only a classifier that
+		// actually reads the list can produce a different answer for it.
+		node = await spawnOptimysticNode();
+		const optimystic = node;
+		foreign = await spawnForeignPeer({ registerRepo: false });
+		const outsider = foreign;
+
+		await outsider.dial(multiaddr(pickLocalTcpMultiaddr(optimystic)));
+
+		const keyNetwork = internalsOf(optimystic).keyNetwork;
+		const classify = (protocols: string[]): NetworkMembership =>
+			keyNetwork.membershipOf(outsider.peerId.toString(), protocols);
+
+		// Polled, and for a REACHED state rather than a sustained one: the peer starts `unknown`
+		// (empty protocol list) and only becomes `foreign` once identify delivers a non-empty list
+		// that contains nothing this network serves. Asserting immediately after the dial would
+		// pass on `unknown` — a different failure wearing the same clothes.
+		const settled = await waitForPeerStoreProtocols(
+			optimystic, outsider.peerId, IDENTIFY_TIMEOUT_MS,
+			protocols => classify(protocols) === 'foreign'
+		);
+		expect(settled.matched,
+			`a peer advertising no Optimystic protocol classified as '${classify(settled.protocols)}', not 'foreign'; `
+			+ `the node's peerStore holds: ${JSON.stringify(settled.protocols)}`)
+			.to.equal(true);
+		expect(settled.protocols, 'the control peer must not be advertising the repo id')
+			.to.not.include(REPO_PROTOCOL);
 	});
 
 	it('control: a dial on the #6-malformed repo id fails as UnsupportedProtocolError, not a timeout', async function () {
