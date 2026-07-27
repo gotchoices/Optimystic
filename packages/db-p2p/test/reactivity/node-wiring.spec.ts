@@ -13,20 +13,14 @@ import { edgeProfile } from '@optimystic/db-core';
 import type { CohortTopicHost } from '../../src/cohort-topic/host.js';
 
 /**
- * The reactivity protocol ids, written out as LITERALS.
- *
- * These used to be `DEFAULT_REACTIVITY_PROTOCOLS.notify` etc. — imported from
- * `src/reactivity/protocols.ts`, which is the *same* constant object `libp2p-node-base.ts`
- * registers the handlers from. Both sides of the assertion were then the production value, so a
- * malformed id would have matched itself and passed: the check proved the constant reached
- * registration, not that its content was right. That is the defect class behind
- * gotchoices/Optimystic#6 (`//optimystic/<net>/id/1.0.0` passed every include-assertion for
- * several releases).
+ * The reactivity protocol ids, written out as LITERALS rather than imported from
+ * `DEFAULT_REACTIVITY_PROTOCOLS` — the same constant object the node registers the handlers from,
+ * which would put the production value on both sides of the assertion. `test/util/protocol-ids.ts`
+ * explains why that shape catches nothing.
  *
  * Owner: `DEFAULT_REACTIVITY_PROTOCOLS` in `src/reactivity/protocols.ts`, registered by the
- * `cohortTopic` block of `libp2p-node-base.ts`. Note these are the network-AGNOSTIC ids: unlike
- * the cluster/repo/block-transfer family, reactivity's defaults carry no `<network>` segment.
- * A deliberate id change now requires editing these literals — that is the point.
+ * `cohortTopic` block of `libp2p-node-base.ts`. These are the network-AGNOSTIC ids: unlike the
+ * cluster/repo/block-transfer family, reactivity's defaults carry no `<network>` segment.
  */
 const NOTIFY = '/optimystic/reactivity/1.0.0/notify';
 const PUSH_STATE_GOSSIP = '/optimystic/reactivity/1.0.0/push-state-gossip';

@@ -68,7 +68,7 @@ describe('identify/push — late protocol registration reaches already-connected
 			clusterSize: 1,
 			clusterPolicy: { allowDownsize: true, sizeTolerance: 1.0 },
 			arachnode: { enableRingZulu: false }
-		} as any);
+		});
 	}
 
 	afterEach(async () => {

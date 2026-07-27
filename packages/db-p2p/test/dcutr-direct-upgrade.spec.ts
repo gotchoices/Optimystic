@@ -48,9 +48,9 @@
  *   bash:        RUN_LONG_TESTS=1 yarn workspace @optimystic/db-p2p test --grep "DCUtR"
  *   strong (bash): RUN_DCUTR_HOLEPUNCH=1 DCUTR_HOST=203.0.113.7 yarn workspace @optimystic/db-p2p test --grep "DCUtR"
  *
- * The always-run `dcutr-autonat-registration.spec.ts` independently guards that
- * `services.dcutr` / `services.autoNAT` are wired, so neither test here re-checks
- * service presence.
+ * The always-run `node-service-set.spec.ts` independently guards that `services.dcutr` /
+ * `services.autoNAT` are wired (it asserts the whole service key set), so neither test here
+ * re-checks service presence.
  */
 import { expect } from 'chai';
 import type { Libp2p } from 'libp2p';

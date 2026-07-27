@@ -21,10 +21,39 @@
  * only the observer's peerStore proves it *propagated*, which is the thing under test.
  */
 import type { Libp2p } from 'libp2p';
-import type { PeerId } from '@libp2p/interface';
+import type { Peer, PeerId } from '@libp2p/interface';
 
 /** How often the polls below re-read the peerStore. */
 const POLL_INTERVAL_MS = 100;
+
+/**
+ * The shared poll both waits below are built from: re-read `observer`'s peerStore entry for
+ * `peerId`, project it with `read`, and stop when `satisfied` accepts the projection or
+ * `timeoutMs` elapses. It always returns what it last saw rather than throwing, so a negative
+ * control asserts on the same result shape as the positive case. A peerStore entry that does not
+ * exist yet leaves the projection at `empty` and keeps polling.
+ */
+async function pollPeerStore<T>(
+	observer: Libp2p,
+	peerId: PeerId,
+	timeoutMs: number,
+	empty: T,
+	read: (peer: Peer) => T,
+	satisfied: (value: T) => boolean
+): Promise<{ matched: boolean; value: T }> {
+	const start = Date.now();
+	let value = empty;
+	for (;;) {
+		try {
+			value = read(await observer.peerStore.get(peerId));
+			if (satisfied(value)) return { matched: true, value };
+		} catch {
+			// No peerStore entry for this peer yet — keep polling until the deadline.
+		}
+		if (Date.now() - start >= timeoutMs) return { matched: false, value };
+		await new Promise(r => setTimeout(r, POLL_INTERVAL_MS));
+	}
+}
 
 /** Outcome of {@link waitForPeerStoreAddresses}. */
 export interface PeerStoreAddressWait {
@@ -36,8 +65,7 @@ export interface PeerStoreAddressWait {
 
 /**
  * Poll `observer`'s peerStore entry for `peerId` until it holds an address matching `predicate`,
- * or `timeoutMs` elapses. Returns what it last saw either way, so a negative-control test can
- * assert on the same result shape as the positive one instead of catching a throw.
+ * or `timeoutMs` elapses.
  */
 export async function waitForPeerStoreAddresses(
 	observer: Libp2p,
@@ -45,19 +73,12 @@ export async function waitForPeerStoreAddresses(
 	timeoutMs: number,
 	predicate: (addr: string) => boolean = () => true
 ): Promise<PeerStoreAddressWait> {
-	const start = Date.now();
-	let addresses: string[] = [];
-	for (;;) {
-		try {
-			const peer = await observer.peerStore.get(peerId);
-			addresses = peer.addresses.map(a => a.multiaddr.toString());
-			if (addresses.some(predicate)) return { matched: true, addresses };
-		} catch {
-			// No peerStore entry for this peer yet — keep polling until the deadline.
-		}
-		if (Date.now() - start >= timeoutMs) return { matched: false, addresses };
-		await new Promise(r => setTimeout(r, POLL_INTERVAL_MS));
-	}
+	const { matched, value } = await pollPeerStore<string[]>(
+		observer, peerId, timeoutMs, [],
+		peer => peer.addresses.map(a => a.multiaddr.toString()),
+		addresses => addresses.some(predicate)
+	);
+	return { matched, addresses: value };
 }
 
 /** Outcome of {@link waitForPeerStoreProtocols}. */
@@ -82,17 +103,10 @@ export async function waitForPeerStoreProtocols(
 	timeoutMs: number,
 	predicate: (protocols: string[]) => boolean
 ): Promise<PeerStoreProtocolWait> {
-	const start = Date.now();
-	let protocols: string[] = [];
-	for (;;) {
-		try {
-			const peer = await observer.peerStore.get(peerId);
-			protocols = [...peer.protocols];
-			if (predicate(protocols)) return { matched: true, protocols };
-		} catch {
-			// No peerStore entry for this peer yet — keep polling until the deadline.
-		}
-		if (Date.now() - start >= timeoutMs) return { matched: false, protocols };
-		await new Promise(r => setTimeout(r, POLL_INTERVAL_MS));
-	}
+	const { matched, value } = await pollPeerStore<string[]>(
+		observer, peerId, timeoutMs, [],
+		peer => [...peer.protocols],
+		predicate
+	);
+	return { matched, protocols: value };
 }

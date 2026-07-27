@@ -10,8 +10,9 @@
  * the literal is updated deliberately.
  *
  * It covers the same two spawn shapes the old spec did (default TCP node, browser-shaped WS-only
- * custom-transports node) plus the `@optimystic/db-p2p/rn` factory, which shares the same base and
- * therefore inherits the same services.
+ * custom-transports node), plus the `@optimystic/db-p2p/rn` factory — which shares the same base
+ * and therefore inherits the same services — and a `relay: true` node, the one branch of the
+ * services map that adds a key.
  *
  * Behavioral coverage lives elsewhere: hole-punching in `dcutr-direct-upgrade.spec.ts`, identify
  * protocol ids in `identify-protocol-id.spec.ts`, and identify/push address propagation in

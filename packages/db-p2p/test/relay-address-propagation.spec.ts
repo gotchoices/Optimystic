@@ -99,6 +99,12 @@ function pickWsAddr(node: Libp2p): Multiaddr {
  * Deliberately hand-built rather than produced by `createLibp2pNodeBase`: `NodeOptions` has no seam
  * for removing a service, and adding one purely so a test can disable a fix would put the fix's own
  * kill switch into production code.
+ *
+ * NOTE: this duplicates the production node's transport/encrypter/muxer choices. It only has to
+ * match closely enough that the relay can still reach it — but if the base node's transports ever
+ * diverge from `[webSockets(), circuitRelayTransport()]` for a circuit-only peer, the control could
+ * start failing to propagate for the WRONG reason and would still assert green. If that happens,
+ * the fix is to make this build from the same transport list, not to relax the assertion.
  */
 async function spawnCircuitOnlyPeerWithoutPush(relayAddr: Multiaddr): Promise<Libp2p> {
 	return await createLibp2p({

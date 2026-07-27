@@ -38,7 +38,7 @@ describe('advertised protocol ids', function () {
 			clusterSize: 1,
 			clusterPolicy: { allowDownsize: true, sizeTolerance: 1.0 },
 			arachnode: { enableRingZulu: false }
-		} as any);
+		});
 		try {
 			return node.getProtocols() as string[];
 		} finally {
