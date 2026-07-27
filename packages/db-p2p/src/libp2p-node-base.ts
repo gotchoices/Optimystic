@@ -1,7 +1,7 @@
 import { createLibp2p, type Libp2p } from 'libp2p';
 import { noise } from '@chainsafe/libp2p-noise';
 import { yamux } from '@chainsafe/libp2p-yamux';
-import { identify } from '@libp2p/identify';
+import { identify, identifyPush } from '@libp2p/identify';
 import { ping } from '@libp2p/ping';
 import { dcutr } from '@libp2p/dcutr';
 import { autoNAT } from '@libp2p/autonat';
@@ -433,8 +433,24 @@ export async function createLibp2pNodeBase(
 		// NOTE: this cast exists ONLY because of the duplicate @libp2p/interface install; if that dedups
 		// (or on a libp2p bump) drop `as unknown as NonNullable<Libp2pInit['services']>` and type the map directly.
 		services: ({
+			// `@libp2p/identify` is the ONE service here whose protocol id it builds itself:
+			// `Identify`/`IdentifyPush` both emit `/${protocolPrefix}/id[/push]/1.0.0`, always
+			// prepending the leading slash (its own default is the BARE `'ipfs'`). So this
+			// prefix must stay slash-LESS — passing `/optimystic/...` yields the malformed
+			// double-slash `//optimystic/<net>/id/1.0.0`. Every other service below
+			// (cluster/repo/sync/blockTransfer) concatenates its own template literal and so
+			// takes the slash-PREFIXED `protocolPrefix` form; do not unify the two.
+			// Locked by `identify-protocol-id.spec.ts`.
 			identify: identify({
-				protocolPrefix: `/optimystic/${options.networkName}`
+				protocolPrefix: `optimystic/${options.networkName}`
+			}),
+			// identify/push propagates *later* address/protocol changes (relay reservation,
+			// AutoNAT-learned observed addr, a service registered post-start) to already-connected
+			// peers. Without it those peers keep the stale snapshot from the initial identify —
+			// which the `serves`/`unknown` membership classification in `libp2p-key-network.ts`
+			// reads, so a late-registered cluster/repo handler would never flip a peer to `serves`.
+			identifyPush: identifyPush({
+				protocolPrefix: `optimystic/${options.networkName}`
 			}),
 			ping: ping(),
 			// DCUtR (hole-punch) upgrades relayed node↔node connections to direct
