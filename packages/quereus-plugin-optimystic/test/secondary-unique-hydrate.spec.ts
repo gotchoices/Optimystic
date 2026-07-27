@@ -17,6 +17,7 @@
 
 import { expect } from 'chai';
 import { Database } from '@quereus/quereus';
+import type { ConflictResolution } from '@quereus/quereus';
 import { MemoryRawStorage, StorageRepo, BlockStorage } from '@optimystic/db-p2p';
 import type { ITransactor } from '@optimystic/db-core';
 import register from '../dist/plugin.js';
@@ -497,6 +498,167 @@ describe('Secondary UNIQUE enforcement across the hydrate warm-restart path', fu
 			expect(await scalar(dbC, `select count(*) as v from T`)).to.equal(2);
 		} finally {
 			dbC.close();
+		}
+	});
+
+	it('a partial unique index does not mask a full one over the same columns after hydrate', async () => {
+		const storage = new MemoryRawStorage();
+		const shared = buildSharedLocalTransactor(storage);
+		const tableDdl = `
+			create table T (Id integer primary key, Stamp text not null, Flag integer not null)
+				using optimystic('tree://uniqhydrate/partialmask')
+		`;
+
+		// Session 1: the PARTIAL unique index is declared FIRST, so it lands first in
+		// the persisted index list. The full one that follows is the constraint that
+		// actually enforces.
+		const dbA = new Database();
+		registerWithSharedTransactor(dbA, shared);
+		try {
+			await dbA.exec(tableDdl);
+			await dbA.exec(`create unique index ux_partial on T (Stamp) where Flag = 1`);
+			await dbA.exec(`create unique index ux_full on T (Stamp)`);
+			await dbA.exec(`insert into T (Id, Stamp, Flag) values (1, 'a', 0)`);
+			// Baseline: on the fresh-DDL path the full index enforces.
+			await expectThrows(
+				() => dbA.exec(`insert into T (Id, Stamp, Flag) values (2, 'a', 0)`),
+				/UNIQUE constraint failed/,
+			);
+		} finally {
+			dbA.close();
+		}
+
+		// Session 2: hydrate only. Reconstruction must not let the partial index's
+		// derived constraint dedupe away the full one — that would drop enforcement
+		// entirely on the warm-restart path.
+		const dbB = new Database();
+		const pluginB = registerWithSharedTransactor(dbB, shared);
+		try {
+			await pluginB.hydrate(dbB);
+			await expectThrows(
+				() => dbB.exec(`insert into T (Id, Stamp, Flag) values (3, 'a', 0)`),
+				/UNIQUE constraint failed/,
+			);
+			await dbB.exec(`insert into T (Id, Stamp, Flag) values (4, 'b', 0)`);
+			expect(await scalar(dbB, `select count(*) as v from T`)).to.equal(2);
+		} finally {
+			dbB.close();
+		}
+	});
+
+	it('hydrate-only open enforces every UNIQUE constraint when a table declares several', async () => {
+		const storage = new MemoryRawStorage();
+		const shared = buildSharedLocalTransactor(storage);
+
+		const dbA = new Database();
+		registerWithSharedTransactor(dbA, shared);
+		try {
+			await dbA.exec(`
+				create table M (Id integer primary key, Email text not null unique, Handle text not null unique)
+					using optimystic('tree://uniqhydrate/multi')
+			`);
+			await dbA.exec(`insert into M (Id, Email, Handle) values (1, 'e1', 'h1')`);
+		} finally {
+			dbA.close();
+		}
+
+		const dbB = new Database();
+		const pluginB = registerWithSharedTransactor(dbB, shared);
+		try {
+			await pluginB.hydrate(dbB);
+			expect(dbB.schemaManager.findTable('M', 'main')?.uniqueConstraints).to.have.lengthOf(2);
+
+			// Each constraint must reject independently — a shared-key collision in the
+			// synthesized-tree naming would let one of them silently win.
+			await expectThrows(
+				() => dbB.exec(`insert into M (Id, Email, Handle) values (2, 'e1', 'h2')`),
+				/UNIQUE constraint failed/,
+			);
+			await expectThrows(
+				() => dbB.exec(`insert into M (Id, Email, Handle) values (3, 'e2', 'h1')`),
+				/UNIQUE constraint failed/,
+			);
+			await dbB.exec(`insert into M (Id, Email, Handle) values (4, 'e2', 'h2')`);
+			expect(await scalar(dbB, `select count(*) as v from M`)).to.equal(2);
+		} finally {
+			dbB.close();
+		}
+	});
+
+	it("round-trips a constraint-level 'on conflict' action through persistence and hydrate", async () => {
+		const storage = new MemoryRawStorage();
+		const shared = buildSharedLocalTransactor(storage);
+		let declared: ConflictResolution | undefined;
+
+		const dbA = new Database();
+		const pluginA = registerWithSharedTransactor(dbA, shared);
+		try {
+			await dbA.exec(`
+				create table I (Id integer primary key, Stamp text not null unique on conflict ignore)
+					using optimystic('tree://uniqhydrate/onconflict')
+			`);
+			declared = dbA.schemaManager.findTable('I', 'main')?.uniqueConstraints?.[0]?.defaultConflict;
+			expect(declared, 'sanity: the parsed schema carries the declared action').to.not.equal(undefined);
+
+			const stored = await sharedSchemaManager(pluginA).getSchema('I');
+			expect(stored?.uniqueConstraints?.[0]?.defaultConflict, 'action must be persisted')
+				.to.equal(declared);
+		} finally {
+			dbA.close();
+		}
+
+		// NOTE: the vtab does not yet ACT on a constraint-level `on conflict` for a
+		// secondary UNIQUE (it honours only the statement-level `insert or ...`) —
+		// a pre-existing gap on every path, tracked by
+		// `bug-optimystic-constraint-level-on-conflict-ignored`. This pins the
+		// persistence round-trip so the fix has correct metadata to act on.
+		const dbB = new Database();
+		const pluginB = registerWithSharedTransactor(dbB, shared);
+		try {
+			await pluginB.hydrate(dbB);
+			expect(dbB.schemaManager.findTable('I', 'main')?.uniqueConstraints?.[0]?.defaultConflict)
+				.to.equal(declared);
+		} finally {
+			dbB.close();
+		}
+	});
+
+	it('hydrate-only open enforces UNIQUE on UPDATE (and lets a row keep its own value)', async () => {
+		const storage = new MemoryRawStorage();
+		const shared = buildSharedLocalTransactor(storage);
+
+		const dbA = new Database();
+		registerWithSharedTransactor(dbA, shared);
+		try {
+			await dbA.exec(`
+				create table U (Id integer primary key, Stamp text not null unique)
+					using optimystic('tree://uniqhydrate/update')
+			`);
+			await dbA.exec(`insert into U (Id, Stamp) values (1, 'a')`);
+			await dbA.exec(`insert into U (Id, Stamp) values (2, 'b')`);
+		} finally {
+			dbA.close();
+		}
+
+		const dbB = new Database();
+		const pluginB = registerWithSharedTransactor(dbB, shared);
+		try {
+			await pluginB.hydrate(dbB);
+
+			// Moving row 2 onto row 1's value collides.
+			await expectThrows(
+				() => dbB.exec(`update U set Stamp = 'a' where Id = 2`),
+				/UNIQUE constraint failed/,
+			);
+			// A no-op self-update must NOT collide with the row's own index entry.
+			await dbB.exec(`update U set Stamp = 'b' where Id = 2`);
+			// A move to a free value succeeds and frees the old one for reuse.
+			await dbB.exec(`update U set Stamp = 'c' where Id = 2`);
+			await dbB.exec(`insert into U (Id, Stamp) values (3, 'b')`);
+			expect(await scalar(dbB, `select count(*) as v from U`)).to.equal(3);
+			expect(await scalar(dbB, `select count(*) as v from U where Stamp = 'c'`)).to.equal(1);
+		} finally {
+			dbB.close();
 		}
 	});
 

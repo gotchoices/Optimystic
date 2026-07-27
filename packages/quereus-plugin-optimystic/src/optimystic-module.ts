@@ -12,11 +12,11 @@ import type { ParsedOptimysticOptions, RowData } from './types.js';
 import type { IRawStorage } from '@optimystic/db-p2p';
 import { VirtualTable } from '@quereus/quereus';
 import { ConflictResolution, QuereusError, StatusCode } from '@quereus/quereus';
-import type { VirtualTableModule, BaseModuleConfig, Database, DatabaseInternal, TableSchema, Row, FilterInfo, BestAccessPlanRequest, BestAccessPlanResult, OrderingSpec, VirtualTableConnection, TableIndexSchema as IndexSchema, UpdateArgs, UpdateResult, SqlValue } from '@quereus/quereus';
+import type { VirtualTableModule, BaseModuleConfig, Database, DatabaseInternal, TableSchema, Row, FilterInfo, BestAccessPlanRequest, BestAccessPlanResult, OrderingSpec, VirtualTableConnection, TableIndexSchema as IndexSchema, UniqueConstraintSchema, UpdateArgs, UpdateResult, SqlValue } from '@quereus/quereus';
 import { Tree } from '@optimystic/db-core';
 import { KeyRange } from '@optimystic/db-core';
 import type { CollectionChangeEvent, TreeReadView } from '@optimystic/db-core';
-import { SchemaManager } from './schema/schema-manager.js';
+import { SchemaManager, columnSetKey, uniqueConstraintKey } from './schema/schema-manager.js';
 import type { StoredTableSchema, StoredIndexSchema } from './schema/schema-manager.js';
 import { RowCodec, type EncodedRow } from './schema/row-codec.js';
 import { SqlDataType, PhysicalType } from '@quereus/quereus';
@@ -831,23 +831,11 @@ export class OptimysticVirtualTable extends VirtualTable {
   }
 
   /**
-   * A stable, order-insensitive key for a set of column indices — sorted indices joined
-   * by `_`. Used both to name a synthesized unique tree (`_uniq_<setKey>`, stable across
-   * restarts so the same tree URI resolves) and to match a UNIQUE constraint's columns
-   * against the PRIMARY KEY / a declared index (as sets, since uniqueness of `(a, b)` and
-   * `(b, a)` is the same constraint).
-   */
-  private columnSetKey(columns: readonly number[]): string {
-    return [...columns].sort((a, b) => a - b).join('_');
-  }
-
-  /**
    * Merge the UNIQUE constraints reconstructable from the persisted schema
    * (explicit `uniqueConstraints` plus one derived per `unique` index — see
    * {@link SchemaManager.storedToUniqueConstraints}) into
    * `this.tableSchema.uniqueConstraints`, deduped against whatever the local DDL
-   * already carries (order-insensitive column-set match, same derivation as
-   * {@link columnSetKey}). Idempotent. This is what keeps
+   * already carries by {@link uniqueConstraintKey}. Idempotent. This is what keeps
    * {@link checkUniqueConstraints} armed on opens where no `CREATE TABLE` /
    * `CREATE UNIQUE INDEX` DDL re-runs (the documented hydrate warm-restart flow),
    * and on re-declares that replay only the CREATE TABLE half.
@@ -856,8 +844,8 @@ export class OptimysticVirtualTable extends VirtualTable {
     const persisted = this.schemaManager.storedToUniqueConstraints(storedSchema);
     if (!persisted) return;
     const existing = this.tableSchema.uniqueConstraints ?? [];
-    const seen = new Set(existing.map(uc => this.columnSetKey(uc.columns)));
-    const additions = persisted.filter(uc => !seen.has(this.columnSetKey(uc.columns)));
+    const seen = new Set(existing.map(uniqueConstraintKey));
+    const additions = persisted.filter(uc => !seen.has(uniqueConstraintKey(uc)));
     if (additions.length === 0) return;
     // Same copy-on-write pattern as the addIndex mirror: this vtab's enforcement
     // reads its OWN tableSchema reference, so replacing it never mutates the
@@ -886,16 +874,16 @@ export class OptimysticVirtualTable extends VirtualTable {
     const constraints = this.tableSchema.uniqueConstraints;
     if (!constraints || constraints.length === 0) return [];
 
-    const pkKey = this.columnSetKey(storedSchema.primaryKeyDefinition.map(pk => pk.index));
+    const pkKey = columnSetKey(storedSchema.primaryKeyDefinition.map(pk => pk.index));
     const declaredKeys = new Set(
-      storedSchema.indexes.map(idx => this.columnSetKey(idx.columns.map(c => c.index))),
+      storedSchema.indexes.map(idx => columnSetKey(idx.columns.map(c => c.index))),
     );
 
     const synthesized: StoredIndexSchema[] = [];
     const seen = new Set<string>();
     for (const uc of constraints) {
       if (uc.predicate !== undefined || uc.columns.length === 0) continue;
-      const setKey = this.columnSetKey(uc.columns);
+      const setKey = columnSetKey(uc.columns);
       if (setKey === pkKey) continue;
       if (declaredKeys.has(setKey)) continue;
       if (seen.has(setKey)) continue;
@@ -925,16 +913,16 @@ export class OptimysticVirtualTable extends VirtualTable {
     uc: { columns: readonly number[] },
   ): { descriptor: StoredIndexSchema; tree: Tree<string, IndexEntry>; synthesized: boolean } | undefined {
     if (!this.indexManager) return undefined;
-    const setKey = this.columnSetKey(uc.columns);
+    const setKey = columnSetKey(uc.columns);
 
     for (const idx of this.indexManager.getDeclaredIndexes()) {
-      if (this.columnSetKey(idx.columns.map(c => c.index)) === setKey) {
+      if (columnSetKey(idx.columns.map(c => c.index)) === setKey) {
         const tree = this.indexManager.getIndexTree(idx.name);
         if (tree) return { descriptor: idx, tree, synthesized: false };
       }
     }
     for (const idx of this.uniqueEnforcementIndexes) {
-      if (this.columnSetKey(idx.columns.map(c => c.index)) === setKey) {
+      if (columnSetKey(idx.columns.map(c => c.index)) === setKey) {
         const tree = this.indexManager.getIndexTree(idx.name);
         if (tree) return { descriptor: idx, tree, synthesized: true };
       }
@@ -1417,22 +1405,25 @@ export class OptimysticVirtualTable extends VirtualTable {
    * Mirror it onto this.tableSchema so the probe considers it active; enforcement
    * then routes through the declared index tree (resolveEnforcingIndex prefers a
    * declared index), so no synthesized _uniq_ tree is needed. No-ops for non-unique
-   * indexes and for constraints already present (by derived-index name or column set).
+   * indexes and for constraints already present (by derived-index name, or by
+   * {@link uniqueConstraintKey} — which deliberately does NOT let an existing
+   * partial constraint mask a full one over the same columns).
    */
   private mirrorDerivedUniqueConstraint(indexSchema: IndexSchema): void {
     if (!indexSchema.unique) return;
-    const columns = indexSchema.columns.map((col: { index: number }) => col.index);
-    const setKey = this.columnSetKey(columns);
+    const derived: UniqueConstraintSchema = {
+      columns: indexSchema.columns.map((col: { index: number }) => col.index),
+      predicate: indexSchema.predicate,
+      derivedFromIndex: indexSchema.name,
+    };
+    const key = uniqueConstraintKey(derived);
     const already = (this.tableSchema.uniqueConstraints ?? []).some(
-      uc => uc.derivedFromIndex === indexSchema.name || this.columnSetKey(uc.columns) === setKey,
+      uc => uc.derivedFromIndex === indexSchema.name || uniqueConstraintKey(uc) === key,
     );
     if (already) return;
     this.tableSchema = {
       ...this.tableSchema,
-      uniqueConstraints: [
-        ...(this.tableSchema.uniqueConstraints ?? []),
-        { columns, predicate: indexSchema.predicate, derivedFromIndex: indexSchema.name },
-      ],
+      uniqueConstraints: [...(this.tableSchema.uniqueConstraints ?? []), derived],
     };
   }
 

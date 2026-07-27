@@ -15,11 +15,35 @@ type IndexSchema = NonNullable<TableSchema['indexes']>[number];
 
 /**
  * Order-insensitive identity for a set of column indices — sorted and joined by `_`.
- * Same derivation the vtab uses to name synthesized `_uniq_` trees and to match a
- * UNIQUE constraint against an index, so dedupe here agrees with enforcement there.
+ * Uniqueness of `(a, b)` and `(b, a)` is the same rule, so constraint/index matching
+ * compares sets. Also names the vtab's synthesized enforcement trees (`_uniq_<key>`),
+ * which must stay stable across restarts so the same tree URI resolves.
  */
-function columnSetKey(columns: readonly number[]): string {
+export function columnSetKey(columns: readonly number[]): string {
 	return [...columns].sort((a, b) => a - b).join('_');
+}
+
+/** The subset of a UNIQUE constraint that {@link uniqueConstraintKey} identifies it by. */
+interface ConstraintIdentity {
+	columns: readonly number[];
+	predicate?: unknown;
+	derivedFromIndex?: string;
+}
+
+/**
+ * Dedupe identity for a UNIQUE constraint.
+ *
+ * A FULL (non-partial) constraint is identified by its column set — two full
+ * constraints over the same columns are the same rule and collapse to one. A
+ * PARTIAL one binds only the rows its predicate admits, so it gets a separate
+ * identity keyed on the index it came from: it must never stand in for a full
+ * constraint over the same columns (that would silently drop enforcement), and
+ * two partials over the same columns with different predicates are distinct.
+ */
+export function uniqueConstraintKey(uc: ConstraintIdentity): string {
+	return uc.predicate === undefined
+		? `cols:${columnSetKey(uc.columns)}`
+		: `partial:${uc.derivedFromIndex ?? columnSetKey(uc.columns)}`;
 }
 
 /**
@@ -46,6 +70,14 @@ export interface StoredTableSchema {
 	uniqueConstraints?: StoredUniqueConstraint[];
 }
 
+/**
+ * NOTE: a deliberate subset of Quereus's `UniqueConstraintSchema` — the fields that
+ * drive enforcement. `coveringStructureName`, `tags` and `exposedIndexTags` are NOT
+ * persisted (nor is `IndexSchema.tags`); they are informational or describe covering
+ * materialized views, which optimystic-backed tables do not use. If a covering MV or
+ * an exposed implicit index is ever pointed at an optimystic table, they must be
+ * persisted too — otherwise hydrate silently drops the link.
+ */
 export interface StoredUniqueConstraint {
 	name?: string;
 	/** Column indices in declared order (order matters for the synthesized tree's key). */
@@ -271,9 +303,11 @@ export class SchemaManager {
 	 * the persisted non-derived constraints, plus one derived constraint per
 	 * persisted `unique` index (mirroring what Quereus's
 	 * `appendIndexToTableSchema` synthesizes when the `CREATE UNIQUE INDEX` DDL
-	 * actually runs — which it does not on the hydrate path). Deduped by column
-	 * set, so a unique index over columns already carrying a table-level UNIQUE
-	 * contributes no second constraint. Returns undefined when there are none.
+	 * actually runs — which it does not on the hydrate path). Deduped by
+	 * {@link uniqueConstraintKey}, so a unique index over columns already carrying
+	 * a table-level UNIQUE contributes no second constraint, while a partial index
+	 * never dedupes away the full constraint it shares columns with. Returns
+	 * undefined when there are none.
 	 */
 	storedToUniqueConstraints(stored: StoredTableSchema): UniqueConstraintSchema[] | undefined {
 		const constraints: UniqueConstraintSchema[] = (stored.uniqueConstraints ?? []).map(uc => ({
@@ -282,18 +316,18 @@ export class SchemaManager {
 			defaultConflict: uc.defaultConflict,
 			predicate: uc.predicate as UniqueConstraintSchema['predicate'],
 		}));
-		const seen = new Set(constraints.map(uc => columnSetKey(uc.columns)));
+		const seen = new Set(constraints.map(uniqueConstraintKey));
 		for (const idx of stored.indexes) {
 			if (!idx.unique) continue;
-			const idxColumns = idx.columns.map(col => col.index);
-			const setKey = columnSetKey(idxColumns);
-			if (seen.has(setKey)) continue;
-			seen.add(setKey);
-			constraints.push({
-				columns: idxColumns,
+			const derived: UniqueConstraintSchema = {
+				columns: idx.columns.map(col => col.index),
 				predicate: idx.predicate as UniqueConstraintSchema['predicate'],
 				derivedFromIndex: idx.name,
-			});
+			};
+			const key = uniqueConstraintKey(derived);
+			if (seen.has(key)) continue;
+			seen.add(key);
+			constraints.push(derived);
 		}
 		return constraints.length > 0 ? constraints : undefined;
 	}
