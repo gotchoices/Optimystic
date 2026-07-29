@@ -708,10 +708,13 @@ export async function createLibp2pNodeBase(
 	const partitionDetector = new PartitionDetector();
 	const fretSvc = (node as any).services?.fret as FretService | undefined;
 
+	// Absolute floor below which no cohort is safe, whatever the size references say. Named rather than
+	// inlined because `assumedClusterSize` below defaults to exactly this value — the two must not drift.
+	const minAbsoluteClusterSize = 2;
 	const consensusConfig = {
 		superMajorityThreshold: options.clusterPolicy?.superMajorityThreshold ?? DEFAULT_SUPER_MAJORITY_THRESHOLD,
 		simpleMajorityThreshold: 0.51,
-		minAbsoluteClusterSize: 2,
+		minAbsoluteClusterSize,
 		allowClusterDownsize: options.clusterPolicy?.allowDownsize ?? true,
 		clusterSizeTolerance: options.clusterPolicy?.sizeTolerance ?? 0.5,
 		// Fail closed by default (an undersized cluster with no confident network-size estimate is
@@ -726,7 +729,7 @@ export async function createLibp2pNodeBase(
 		// assertion of the smallest cohort this deployment can genuinely field. Defaults to
 		// minAbsoluteClusterSize above, so a two- or three-node mesh transacts unconfigured; a large
 		// deployment should set clusterPolicy.assumedClusterSize to its real cohort size.
-		assumedClusterSize: options.clusterPolicy?.assumedClusterSize ?? 2
+		assumedClusterSize: options.clusterPolicy?.assumedClusterSize ?? minAbsoluteClusterSize
 	};
 
 	// Fetch a block archive from one cohort peer over the sync protocol, bounded by a

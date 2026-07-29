@@ -117,9 +117,10 @@ export type ExpectedClusterView = {
  * Independently derive this member's own view of a block's responsible cluster. Injected so
  * {@link ClusterMember} stays transport-agnostic — the composition root supplies it from
  * `IKeyNetwork.findCluster` + FRET (mirroring how the coordinator derives the cluster). Absent on nodes
- * that cannot derive a view (no FRET, unit tests): with no derived view AND no configured full-size
- * reference the gate preserves legacy approve behavior, but a configured `clusterSize` still lets the gate
- * fail closed on an unjustified downsize. See {@link ClusterMember} admission gate.
+ * that cannot derive a view (no FRET, unit tests): with no derived view AND no asserted
+ * {@link ClusterConsensusConfig.assumedClusterSize} the gate preserves legacy approve behavior, but an
+ * asserted size still lets the gate fail closed on an unjustified downsize. See {@link ClusterMember}
+ * admission gate.
  */
 export type DeriveExpectedClusterCallback = (blockId: BlockId) => Promise<ExpectedClusterView>;
 
@@ -982,10 +983,20 @@ export class ClusterMember implements ICluster {
 	 * measured (the confident path's `kEst`) or asserted (`assumedClusterSize`). One function so the
 	 * fallback can never be stricter than the measured path — which it was, demanding the full configured
 	 * size with no fraction and no slack. Clamped at `minAbsoluteClusterSize`, so a degenerate `k` of 0, 1
-	 * or negative yields the absolute floor rather than a floor that admits everything.
+	 * or negative yields the absolute floor rather than a floor that admits everything. A non-finite scaled
+	 * size (a `NaN` or `Infinity` config value) is likewise treated as no usable reference rather than
+	 * propagating: an unguarded `NaN` floor fails EVERY comparison, which would silently make the node
+	 * reject every unconfident write.
+	 *
+	 * NOTE: partition safety needs `2 · membershipAdmissionFraction · superMajorityThreshold > 1` — each
+	 * side of a split must recruit `fraction · threshold · K` distinct honest members, and two sides cannot
+	 * both find them in one K-peer cluster. At the shipped defaults (0.75 · 0.67) that product is 1.005 —
+	 * true, but with almost no margin. If either default is ever lowered, re-check Theorem 2 in
+	 * `docs/correctness.md` before shipping it.
 	 */
 	private admissionFloor(k: number): number {
-		return Math.max(this.minAbsoluteClusterSize, Math.ceil(this.membershipAdmissionFraction * k));
+		const scaled = Math.ceil(this.membershipAdmissionFraction * k);
+		return Math.max(this.minAbsoluteClusterSize, Number.isFinite(scaled) ? scaled : 0);
 	}
 
 	/**

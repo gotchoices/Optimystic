@@ -66,6 +66,15 @@ class PeerSession {
 		return parsed;
 	}
 
+	private parseAssumedClusterSize(options: { assumedClusterSize?: string }): number | undefined {
+		if (options.assumedClusterSize === undefined) return undefined;
+		const parsed = Number(options.assumedClusterSize);
+		if (!Number.isInteger(parsed) || parsed <= 0) {
+			throw new Error('--assumed-cluster-size must be a positive integer');
+		}
+		return parsed;
+	}
+
 	private parseSuperMajorityThreshold(options: { superMajorityThreshold?: string }): number | undefined {
 		if (options.superMajorityThreshold === undefined) return undefined;
 		const parsed = Number(options.superMajorityThreshold);
@@ -201,6 +210,7 @@ class PeerSession {
 		storagePath?: string;
 		storageCapacity?: string;
 		clusterSize?: string;
+		assumedClusterSize?: string;
 		superMajorityThreshold?: string;
 		announceFile?: string;
 		offline?: boolean;
@@ -321,6 +331,11 @@ class PeerSession {
 			console.log(`👥 Cluster size override set to ${clusterSize}`);
 			logDebug('cluster size override set', { clusterSize });
 		}
+		const assumedClusterSize = this.parseAssumedClusterSize(options);
+		if (assumedClusterSize !== undefined) {
+			console.log(`🛡️  Assumed cluster size set to ${assumedClusterSize.toString()}`);
+			logDebug('assumed cluster size override set', { assumedClusterSize });
+		}
 		const superMajorityThreshold = this.parseSuperMajorityThreshold(options);
 		if (superMajorityThreshold !== undefined) {
 			console.log(`🎯 Super-majority threshold set to ${superMajorityThreshold.toString()}`);
@@ -333,6 +348,7 @@ class PeerSession {
 			storagePath: options.storagePath,
 			storageCapacityBytes,
 			clusterSize,
+			assumedClusterSize,
 			superMajorityThreshold,
 			mode: options.offline ? 'offline' : 'distributed'
 		});
@@ -373,8 +389,8 @@ class PeerSession {
 			fretProfile: options.fretProfile,
 			storage: createStorage,
 			clusterSize,
-			clusterPolicy: superMajorityThreshold !== undefined
-				? { superMajorityThreshold }
+			clusterPolicy: superMajorityThreshold !== undefined || assumedClusterSize !== undefined
+				? { superMajorityThreshold, assumedClusterSize }
 				: undefined,
 			arachnode: {
 				enableRingZulu: true,
@@ -749,6 +765,7 @@ function withCommonPeerOptions(cmd: Command): Command {
 		.option('--storage-path <path>', 'Path for file storage')
 		.option('--storage-capacity <bytes>', 'Override storage capacity in bytes (for ring selection)')
 		.option('--cluster-size <number>', 'Desired cluster size per key (positive integer)')
+		.option('--assumed-cluster-size <number>', 'Smallest cohort this deployment can genuinely field; the membership admission gate\'s fallback floor when the node has no confident network-size estimate (default 2)')
 		.option('--super-majority-threshold <number>', 'Super-majority threshold as a fraction in (0, 1] (default 0.67)')
 		.option('--offline', 'Run as single-node LocalTransactor (no distributed consensus)')
 		.option('--bootstrap-file <path>', 'Path to JSON containing bootstrap multiaddrs or node list')

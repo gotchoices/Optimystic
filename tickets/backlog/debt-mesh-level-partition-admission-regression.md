@@ -41,3 +41,13 @@ test infrastructure, which is why it's deferred rather than done inline in the r
 - Minority-side members refuse admission (emit `membership-not-admitted:*`) and the minority reaches no
   super-majority; majority side behaves per the 75% rule.
 - The gate is *armed* in the harness path this test uses (not bypassed via `allowUnvalidatedSmallCluster`).
+
+## Update (review of `split-admission-floor-from-replication-factor`)
+
+Arming the gate now takes **two** harness changes, not one. Turning off `allowUnvalidatedSmallCluster`
+is no longer sufficient: the harness does not wire a `deriveExpectedCluster` callback at all, so every
+member takes the "cannot measure the cohort" path, and on that path the gate needs an
+`assumedClusterSize` in its config to have any size reference. Without one it approves everything, and a
+test written against the harness would pass without exercising anything. So the harness needs a
+derivation callback (or a stub for one) *and* an asserted cohort size, alongside the existing
+partition-shrunk key network and the low-confidence FRET stub.

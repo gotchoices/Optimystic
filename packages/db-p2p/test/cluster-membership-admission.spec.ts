@@ -263,6 +263,17 @@ describe('ClusterMember — membership admission gate', () => {
 			expect(vote.type).to.equal('approve');
 		});
 
+		it('rejects one peer below the fallback floor (the boundary the at-floor case admits)', async () => {
+			// Twin of the at-floor case above: floor - 1 must reject, so the boundary is pinned from both
+			// sides and a future off-by-one in admissionFloor cannot pass silently.
+			const belowFloor = cluster(5);      // floor = ceil(0.75*8) = 6
+			const vote = await voteOn(self, belowFloor, view(cluster(3), 0.2), baseConfig({ assumedClusterSize: 8 }));
+			expect(vote.type).to.equal('reject');
+			expect(vote.rejectReason).to.match(
+				new RegExp(`^${MEMBERSHIP_NOT_ADMITTED}:low-confidence-downsize \\(declared=5, floor=6, assumedClusterSize=8\\)$`)
+			);
+		});
+
 		it('fails closed even with no derivation capability when a cohort size is asserted', async () => {
 			const shrunk = cluster(3);
 			const vote = await voteOn(self, shrunk, undefined, baseConfig({ assumedClusterSize: 8 }));
@@ -293,6 +304,23 @@ describe('ClusterMember — membership admission gate', () => {
 				const vote = await voteOn(self, pair, undefined, baseConfig({ assumedClusterSize }));
 				expect(vote.type, `assumedClusterSize=${assumedClusterSize} floors at minAbsoluteClusterSize`).to.equal('approve');
 			}
+		});
+
+		it('treats a non-finite asserted size as no usable reference rather than rejecting everything', async () => {
+			// A NaN (e.g. Number() of a malformed env var) or Infinity would otherwise propagate through the
+			// floor, and EVERY comparison against NaN is false — the node would silently refuse every write it
+			// could not measure. Both must fall back to minAbsoluteClusterSize instead.
+			const pair = cluster(2);
+			for (const assumedClusterSize of [Number.NaN, Number.POSITIVE_INFINITY]) {
+				const vote = await voteOn(self, pair, undefined, baseConfig({ assumedClusterSize }));
+				expect(vote.type, `assumedClusterSize=${assumedClusterSize} floors at minAbsoluteClusterSize`).to.equal('approve');
+			}
+		});
+
+		it('a non-finite admission fraction cannot make the floor unsatisfiable either', async () => {
+			const pair = cluster(2);
+			const vote = await voteOn(self, pair, undefined, baseConfig({ assumedClusterSize: 8, membershipAdmissionFraction: Number.NaN }));
+			expect(vote.type).to.equal('approve');
 		});
 	});
 
