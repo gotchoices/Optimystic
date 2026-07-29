@@ -23,35 +23,10 @@ import type { FindCoordinatorOptions } from '@optimystic/db-core';
 import { CoordinatorRepo, type ClusterLatestCallback } from '../src/repo/coordinator-repo.js';
 import type { ClusterClient } from '../src/cluster/client.js';
 import { toString as u8ToString } from 'uint8arrays';
-import debug from 'debug';
+import { captureLog, hasTag, hasTagAtRev } from './support/capture-log.js';
 
-/**
- * Capture what `createLogger('coordinator-repo')` emits while `fn` runs.
- * Returns the raw `debug` argument lists so specs can assert on both the event
- * tag (args[0]) and the structured payload (args[1]).
- */
-const captureCoordinatorLog = async (fn: () => Promise<void>): Promise<unknown[][]> => {
-	const captured: unknown[][] = [];
-	const previousNamespaces = debug.disable();
-	const previousLog = debug.log;
-	debug.enable('optimystic:db-p2p:coordinator-repo');
-	debug.log = (...args: unknown[]): void => { captured.push(args); };
-	try {
-		await fn();
-	} finally {
-		debug.log = previousLog;
-		debug.disable();
-		if (previousNamespaces) debug.enable(previousNamespaces);
-	}
-	return captured;
-};
-
-/** True when the captured log contains `tag` carrying a payload with `rev`. */
-const loggedRev = (captured: unknown[][], tag: string, rev: number): boolean =>
-	captured.some(args =>
-		typeof args[0] === 'string' && args[0].includes(tag)
-		&& (args[1] as { rev?: number } | undefined)?.rev === rev
-	);
+const captureCoordinatorLog = (fn: () => Promise<void>): Promise<unknown[][]> =>
+	captureLog('coordinator-repo', fn);
 
 const makePeerId = async (): Promise<PeerId> => {
 	const key = await generateKeyPair('Ed25519');
@@ -117,14 +92,18 @@ describe('CoordinatorRepo read-repair', () => {
 
 	it('paranoid mode invokes clusterLatestCallback for a present (stale) block', async () => {
 		const localPeer = await makePeerId();
-		const otherPeer = await makePeerId();
-		const cluster = makeClusterPeers([localPeer, otherPeer]);
+		const peerA = await makePeerId();
+		const peerB = await makePeerId();
+		const cluster = makeClusterPeers([localPeer, peerA, peerB]);
 
 		const callbackInvocations: string[] = [];
+		const localLatest: ActionRev = { actionId: 'local-action', rev: 1 };
 		const remoteLatest: ActionRev = { actionId: 'remote-action', rev: 2 };
+		// Self answers from local storage exactly as `libp2p-node-base`'s callback does;
+		// the two remote peers corroborate each other on the newer rev.
 		const clusterLatestCallback: ClusterLatestCallback = async (peerId) => {
 			callbackInvocations.push(peerId.toString());
-			return peerId.equals(otherPeer) ? remoteLatest : undefined;
+			return peerId.equals(localPeer) ? localLatest : remoteLatest;
 		};
 
 		const { repo: storageRepo, calls } = makePresentStorageRepo(blockId, 1);
@@ -142,12 +121,11 @@ describe('CoordinatorRepo read-repair', () => {
 
 		await repo.get({ blockIds: [blockId] });
 
-		// Callback consulted both peers (self short-circuits inside the real callback,
-		// but here we count every invocation including self because we mock the
-		// callback directly).
-		expect(callbackInvocations).to.include.members([localPeer.toString(), otherPeer.toString()]);
+		// Callback consulted every cohort peer, self included (the real callback answers
+		// self from local storage rather than dialling itself).
+		expect(callbackInvocations).to.include.members([localPeer.toString(), peerA.toString(), peerB.toString()]);
 
-		// Restoration call must have fired with the remote latest context.
+		// Restoration call must have fired with the corroborated remote latest context.
 		const restorationCall = calls.find(c => c.context?.rev === remoteLatest.rev);
 		expect(restorationCall, 'expected restoration call with remote latest context').to.not.equal(undefined);
 		expect(restorationCall!.context!.committed).to.deep.equal([remoteLatest]);
@@ -155,8 +133,9 @@ describe('CoordinatorRepo read-repair', () => {
 
 	it('paranoid mode is a noop when cluster reports the same rev as local', async () => {
 		const localPeer = await makePeerId();
-		const otherPeer = await makePeerId();
-		const cluster = makeClusterPeers([localPeer, otherPeer]);
+		const peerA = await makePeerId();
+		const peerB = await makePeerId();
+		const cluster = makeClusterPeers([localPeer, peerA, peerB]);
 
 		const callbackInvocations: string[] = [];
 		const sameLatest: ActionRev = { actionId: 'local-action', rev: 5 };
@@ -182,8 +161,9 @@ describe('CoordinatorRepo read-repair', () => {
 
 		// Callback was consulted.
 		expect(callbackInvocations.length).to.be.greaterThan(0);
-		// Restoration call did fire (the simple-path always re-fetches after
-		// queryClusterForLatest finds a max), but the rev is unchanged.
+		// The cohort corroborates the rev this node already holds, so no restoration is
+		// attempted at all — only the plain local read.
+		expect(calls.every(c => c.context === undefined), 'no restoration context expected').to.equal(true);
 		expect(result[blockId]?.state?.latest?.rev).to.equal(5);
 		// Sanity: at least one local lookup happened.
 		expect(calls.length).to.be.greaterThan(0);
@@ -375,36 +355,43 @@ describe('CoordinatorRepo read-repair', () => {
 	});
 
 	/**
-	 * Defect repro: 2-node cluster, node A commits rev 2, node B never observes it.
+	 * Ticket: bug-read-repair-unrepairable-small-cluster.
 	 *
-	 * The specs above mock `clusterLatestCallback` as returning `undefined` for
-	 * SELF, which the real callback never does — `libp2p-node-base` short-circuits
-	 * self to the local storage repo, so the reader's own (possibly stale) rev is
-	 * always one of the claims. `makeSelfAnsweringCallback` models the real
-	 * behavior, which exposes both failure modes below.
+	 * The specs above the fix originally mocked `clusterLatestCallback` as returning
+	 * `undefined` for SELF, which the real callback never does — `libp2p-node-base`
+	 * short-circuits self to the local storage repo, so the reader's own (possibly stale)
+	 * rev is always one of the answers. `makeSelfAnsweringCallback` models the real
+	 * behavior; these specs pin that the reader's own answer is now the baseline being
+	 * repaired rather than a corroborating vote, and that a cohort with exactly one other
+	 * peer can converge instead of deadlocking.
+	 *
+	 * The first two were committed in `ff2cbbf` asserting the broken behavior and are
+	 * inverted here.
 	 */
-	describe('DEFECT: 2-node cluster cannot read-repair', () => {
+	describe('2-node cluster read-repair', () => {
 		const localRev = 1;
 		const localActionId = 'local-action';
 
 		/** Mirrors the real callback: self answers from local storage, remote answers per `remoteLatest`. */
 		const makeSelfAnsweringCallback = (
 			localPeer: PeerId,
-			remoteLatest: ActionRev | undefined
+			remoteLatest: ActionRev | undefined,
+			selfLatest: ActionRev = { actionId: localActionId, rev: localRev }
 		): ClusterLatestCallback => async (peerId) =>
-			peerId.equals(localPeer) ? { actionId: localActionId, rev: localRev } : remoteLatest;
+			peerId.equals(localPeer) ? selfLatest : remoteLatest;
 
 		const makeRepo = (
 			localPeer: PeerId,
 			cluster: ClusterPeers,
-			clusterLatestCallback: ClusterLatestCallback
+			clusterLatestCallback: ClusterLatestCallback,
+			cfg?: { clusterSize?: number; rev?: number }
 		) => {
-			const { repo: storageRepo, calls } = makePresentStorageRepo(blockId, localRev, localActionId);
+			const { repo: storageRepo, calls } = makePresentStorageRepo(blockId, cfg?.rev ?? localRev, localActionId);
 			const repo = new CoordinatorRepo(
 				makeKeyNetwork(cluster),
 				makeClusterClient,
 				storageRepo,
-				{ clusterSize: 2, readRepairMode: 'paranoid' },
+				{ clusterSize: cfg?.clusterSize ?? 2, readRepairMode: 'paranoid' },
 				undefined,
 				localPeer,
 				undefined,
@@ -413,7 +400,7 @@ describe('CoordinatorRepo read-repair', () => {
 			return { repo, calls };
 		};
 
-		it('logs cluster-fetch:synced at the STALE rev when the remote peer drops out', async () => {
+		it('does not treat its own stale rev as corroboration when the remote peer drops out', async () => {
 			const localPeer = await makePeerId();
 			const otherPeer = await makePeerId();
 			const cluster = makeClusterPeers([localPeer, otherPeer]);
@@ -423,18 +410,17 @@ describe('CoordinatorRepo read-repair', () => {
 
 			const captured = await captureCoordinatorLog(async () => { await repo.get({ blockIds: [blockId] }); });
 
-			// The lone self-claim passes the small-cluster fallback and is treated as
-			// a corroborated cluster latest, so the node "syncs" to the rev it had.
-			const restorationCall = calls.find(c => c.context?.rev === localRev);
-			expect(restorationCall, 'restoration fired using the node\'s own stale rev').to.not.equal(undefined);
-			expect(restorationCall!.context!.committed).to.deep.equal([{ actionId: localActionId, rev: localRev }]);
+			// No claim survives self-exclusion, so nothing is restored and — critically —
+			// nothing is reported as synced at the revision we were trying to repair.
+			expect(calls.find(c => c.context !== undefined), 'no restoration must fire').to.equal(undefined);
 			expect(
-				loggedRev(captured, 'cluster-fetch:synced', localRev),
-				`expected cluster-fetch:synced at stale rev ${localRev}; captured: ${JSON.stringify(captured)}`
-			).to.equal(true);
+				hasTagAtRev(captured, 'cluster-fetch:synced', localRev),
+				`must NOT log a sync at the stale rev; captured: ${JSON.stringify(captured)}`
+			).to.equal(false);
+			expect(hasTag(captured, 'cluster-fetch:no-quorum'), 'expected cluster-fetch:no-quorum').to.equal(true);
 		});
 
-		it('declines with no-quorum when the remote peer DOES report the newer rev', async () => {
+		it('adopts the newer rev the only other peer reports', async () => {
 			const localPeer = await makePeerId();
 			const otherPeer = await makePeerId();
 			const cluster = makeClusterPeers([localPeer, otherPeer]);
@@ -445,13 +431,106 @@ describe('CoordinatorRepo read-repair', () => {
 
 			const captured = await captureCoordinatorLog(async () => { await repo.get({ blockIds: [blockId] }); });
 
-			// 2 responders, quorum 2, two singleton groups → nothing corroborated, so
-			// rev 2 is never restored however often the read is retried.
-			expect(calls.find(c => c.context?.rev === remoteLatest.rev), 'must NOT have restored rev 2').to.equal(undefined);
-			expect(
-				captured.some(args => typeof args[0] === 'string' && args[0].includes('cluster-fetch:no-quorum')),
-				`expected cluster-fetch:no-quorum; captured: ${JSON.stringify(captured)}`
-			).to.equal(true);
+			const restore = calls.find(c => c.context?.rev === remoteLatest.rev);
+			expect(restore, 'rev 2 must now drive restoration').to.not.equal(undefined);
+			expect(restore!.context!.committed).to.deep.equal([remoteLatest]);
+			expect(hasTagAtRev(captured, 'cluster-fetch:synced', remoteLatest.rev)).to.equal(true);
+		});
+
+		it('never restores backwards when the reader is ahead of every peer', async () => {
+			const localPeer = await makePeerId();
+			const otherPeer = await makePeerId();
+			const cluster = makeClusterPeers([localPeer, otherPeer]);
+
+			// Reader is at rev 7; the lone peer is lagging at rev 3.
+			const selfLatest: ActionRev = { actionId: 'local-action', rev: 7 };
+			const laggingRemote: ActionRev = { actionId: 'old-action', rev: 3 };
+			const { repo, calls } = makeRepo(
+				localPeer,
+				cluster,
+				makeSelfAnsweringCallback(localPeer, laggingRemote, selfLatest),
+				{ rev: 7 }
+			);
+
+			const captured = await captureCoordinatorLog(async () => { await repo.get({ blockIds: [blockId] }); });
+
+			// The peer's rev 3 IS corroborated (it is the only possible corroborator), which is
+			// exactly the condition self-exclusion could have turned into a regression.
+			expect(calls.find(c => c.context !== undefined), 'must not restore to an older rev').to.equal(undefined);
+			expect(hasTagAtRev(captured, 'cluster-fetch:synced', laggingRemote.rev)).to.equal(false);
+			expect(hasTag(captured, 'cluster-fetch:local-current'), 'expected cluster-fetch:local-current').to.equal(true);
+		});
+
+		it('declines when no peer responds at all', async () => {
+			const localPeer = await makePeerId();
+			const otherPeer = await makePeerId();
+			const cluster = makeClusterPeers([localPeer, otherPeer]);
+
+			// Neither self nor the remote answers (local read failed AND the peer is silent).
+			const silent: ClusterLatestCallback = async () => undefined;
+			const { repo, calls } = makeRepo(localPeer, cluster, silent);
+
+			const captured = await captureCoordinatorLog(async () => { await repo.get({ blockIds: [blockId] }); });
+
+			expect(calls.find(c => c.context !== undefined), 'nothing to adopt').to.equal(undefined);
+			expect(hasTag(captured, 'cluster-fetch:synced')).to.equal(false);
+			expect(hasTag(captured, 'cluster-fetch:no-quorum')).to.equal(true);
+		});
+
+		it('does not relax the floor when a LARGER configured cluster merely looks small', async () => {
+			const localPeer = await makePeerId();
+			const otherPeer = await makePeerId();
+			// findCluster is unauthenticated: a partition (or a routing-level attacker) can
+			// shrink this node's view to itself plus one peer. The corroboration floor is
+			// measured against the CONFIGURED size, so the shrunken view cannot talk it down.
+			const cluster = makeClusterPeers([localPeer, otherPeer]);
+
+			const remoteLatest: ActionRev = { actionId: 'remote-action', rev: 2 };
+			const { repo, calls } = makeRepo(
+				localPeer,
+				cluster,
+				makeSelfAnsweringCallback(localPeer, remoteLatest),
+				{ clusterSize: 10 }
+			);
+
+			const captured = await captureCoordinatorLog(async () => { await repo.get({ blockIds: [blockId] }); });
+
+			expect(calls.find(c => c.context !== undefined), 'a lone claim must not be adopted here').to.equal(undefined);
+			expect(hasTag(captured, 'cluster-fetch:no-quorum')).to.equal(true);
+		});
+
+		it('a declined repair does not suppress the next attempt', async () => {
+			const localPeer = await makePeerId();
+			const otherPeer = await makePeerId();
+			const cluster = makeClusterPeers([localPeer, otherPeer]);
+
+			const invocations: string[] = [];
+			const clusterLatestCallback: ClusterLatestCallback = async (peerId) => {
+				invocations.push(peerId.toString());
+				return peerId.equals(localPeer) ? { actionId: localActionId, rev: localRev } : undefined;
+			};
+
+			const { repo: storageRepo } = makePresentStorageRepo(blockId, localRev, localActionId);
+			const repo = new CoordinatorRepo(
+				makeKeyNetwork(cluster),
+				makeClusterClient,
+				storageRepo,
+				{ clusterSize: 2, readRepairMode: 'lazy', readRepairWindowMs: 60_000 },
+				undefined,
+				localPeer,
+				undefined,
+				clusterLatestCallback
+			);
+			repo.now = () => 1_000_000;
+
+			await repo.get({ blockIds: [blockId] });
+			const afterFirst = invocations.length;
+			expect(afterFirst, 'first read consults the cohort').to.be.greaterThan(0);
+
+			// The first pass corroborated nothing, so the block must NOT have been marked
+			// freshly seen — otherwise the lazy window would hide the divergence for 60 s.
+			await repo.get({ blockIds: [blockId] });
+			expect(invocations.length, 'second read must retry rather than be suppressed').to.be.greaterThan(afterFirst);
 		});
 	});
 });

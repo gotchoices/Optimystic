@@ -499,7 +499,16 @@ If this node is not the designated responsible node for a block, it still serves
 
 In the default `lazy` read-repair mode, a locally-present block is not re-verified against the cluster until the local copy is older than `readRepairWindowMs` (default: **10 000 ms**). Within that window a read is served from local state without consulting peers.
 
-**Worst-case staleness bound:** within the read-repair window a caller can observe state that is up to one commit behind the cluster's current head. Once the window expires, the next read triggers a lazy repair pass that converges the local copy to the current revision.
+**Worst-case staleness bound:** within the read-repair window a caller can observe state that is up to one commit behind the cluster's current head. Once the window expires, the next read polls the cohort for the current revision.
+
+#### What a repair pass will and will not accept
+
+A repair pass adopts the highest `(rev, actionId)` **corroborated by peers other than the reader** (`cluster/quorum-restore.ts`). Two rules matter to operators:
+
+- **The reader's own revision never counts as corroboration.** `clusterLatestCallback` answers a self-query from local storage, so the reader's revision is always one of the answers; it is the baseline being repaired, and it is split out before the vote. It is still compared against the outcome, so a reader that is *ahead* of its whole cohort is never dragged backwards.
+- **A claim needs a second, independent peer — unless the cohort has no second peer to give.** The corroboration floor is two distinct peers, capped by how many peers other than the reader could answer at all. That capacity is the **larger** of the peers currently visible and `clusterSize - 1`, so a cohort view shrunk by a partition (or by an attacker with routing influence) cannot talk the requirement down to a single voter. Practical consequence: **a genuine two-node deployment must configure `clusterSize: 2`**, otherwise its members cannot repair each other and every attempt logs `cluster-fetch:no-quorum`.
+
+**Limitation — a repair pass does not transfer block content.** It selects the revision, then calls `StorageRepo.get` with that commit context, which only promotes a pending transaction the node already holds locally. A node that never saw the action has nothing to promote, so its `latest` pointer does not advance. Block-transferring restoration runs on the commit path only (`reconcileBlock` → `fetchArchiveFromPeer` → `saveReplicatedBlock`). Tracked in `tickets/fix/read-repair-cannot-transfer-block-content.md`; pinned by `packages/db-p2p/test/coordinator-repo-read-repair-content.spec.ts`.
 
 Configuration knobs in `ClusterConsensusConfig` (`packages/db-core/src/cluster/structs.ts`):
 

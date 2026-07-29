@@ -3,8 +3,10 @@
  *
  * Unit specs for the quorum-corroboration primitives shared by the read-repair
  * and reconcile restoration paths. Covers rev selection (single/minority liars,
- * honest quorum, small-cluster fallback) and the reconcile CONTENT-agreement gate
- * (a cohort member serving content that hashes differently is rejected).
+ * honest quorum, and the corroborator-capacity cap that keeps a cohort too small to
+ * supply two corroborators from being permanently unrepairable — ticket
+ * `bug-read-repair-unrepairable-small-cluster`) and the reconcile CONTENT-agreement
+ * gate (a cohort member serving content that hashes differently is rejected).
  */
 
 import { expect } from 'chai';
@@ -21,7 +23,7 @@ const block = (id: string, extra: Record<string, unknown> = {}): IBlock =>
 
 describe('quorum-restore primitives', () => {
 	describe('quorumSize', () => {
-		it('is floor(threshold × responders) with an absolute minimum of 2', () => {
+		it('is floor(threshold × responders) with a floor of 2 when the capacity is unstated', () => {
 			expect(quorumSize(0, THRESHOLD)).to.equal(2);
 			expect(quorumSize(1, THRESHOLD)).to.equal(2);
 			expect(quorumSize(2, THRESHOLD)).to.equal(2); // floor(1.02)=1 → min 2
@@ -29,6 +31,23 @@ describe('quorum-restore primitives', () => {
 			expect(quorumSize(4, THRESHOLD)).to.equal(2); // floor(2.04)=2
 			expect(quorumSize(6, THRESHOLD)).to.equal(3); // floor(3.06)=3
 			expect(quorumSize(10, THRESHOLD)).to.equal(5);
+		});
+
+		it('caps the floor at the number of peers that could corroborate', () => {
+			// One other peer in the cohort: demanding two corroborators cannot be satisfied by
+			// anyone, ever — that is a deadlock, not a safety property.
+			expect(quorumSize(1, THRESHOLD, 1)).to.equal(1);
+			// A second peer exists and merely did not answer → still needs seconding.
+			expect(quorumSize(1, THRESHOLD, 2)).to.equal(2);
+			expect(quorumSize(1, THRESHOLD, 9)).to.equal(2);
+			// Never below a single vote, even with a degenerate capacity.
+			expect(quorumSize(0, THRESHOLD, 0)).to.equal(1);
+		});
+
+		it('caps the FLOOR only — the proportional majority term still grows', () => {
+			// capacity 1 lowers the floor to 1, but 6 responders still demand floor(3.06)=3.
+			expect(quorumSize(6, THRESHOLD, 1)).to.equal(3);
+			expect(quorumSize(10, THRESHOLD, 1)).to.equal(5);
 		});
 	});
 
@@ -72,56 +91,75 @@ describe('quorum-restore primitives', () => {
 			expect(selectQuorumRev(claims, THRESHOLD)).to.equal(undefined);
 		});
 
-		it('falls back to a single responder when all agree (honest lagging peer)', () => {
+		it('declines a lone responder when a second peer could have corroborated it', () => {
 			const claims: RevClaim[] = [{ peerId: 'only', rev: 2, actionId: 'x' }];
-			const sel = selectQuorumRev(claims, THRESHOLD);
-			expect(sel!.rev).to.equal(2);
-			expect(sel!.actionId).to.equal('x');
+			// The old "too few responders but they all agree" fallback accepted this at ANY
+			// cohort size, so a peer that simply out-raced the others' timeouts was believed
+			// on its own word. Unstated capacity ⇒ floor 2 ⇒ decline.
+			expect(selectQuorumRev(claims, THRESHOLD)).to.equal(undefined);
+			expect(selectQuorumRev(claims, THRESHOLD, 4)).to.equal(undefined);
 		});
 
-		it('does NOT fall back when the few responders disagree', () => {
+		it('accepts a lone responder only when it is the ONLY peer that could corroborate', () => {
+			const claims: RevClaim[] = [{ peerId: 'only', rev: 2, actionId: 'x' }];
+			const sel = selectQuorumRev(claims, THRESHOLD, 1);
+			expect(sel!.rev).to.equal(2);
+			expect(sel!.actionId).to.equal('x');
+			expect(sel!.supporters).to.deep.equal(['only']);
+		});
+
+		it('does NOT accept either side when the few responders disagree', () => {
 			const claims: RevClaim[] = [
 				{ peerId: 'p1', rev: 2, actionId: 'x' },
 				{ peerId: 'p2', rev: 9, actionId: 'y' }
 			];
-			// 2 responders, quorum 2, neither pair seconded → decline (no fallback).
+			// 2 responders, quorum 2, neither pair seconded → decline.
 			expect(selectQuorumRev(claims, THRESHOLD)).to.equal(undefined);
+			expect(selectQuorumRev(claims, THRESHOLD, 2)).to.equal(undefined);
 		});
 
 		/**
-		 * Defect repro: 2-node cluster stale read reported as a successful sync.
-		 *
-		 * `clusterLatestCallback` self-short-circuits to local storage, so the READER'S
-		 * OWN revision is one of the claims. In a 2-node cohort that leaves only two
-		 * possible outcomes, and neither can ever repair a divergence:
-		 *   - remote drops out (1 s timeout / unreachable) → the reader's own stale
-		 *     claim is the lone group and the small-cluster fallback accepts it, so
-		 *     `CoordinatorRepo` "restores" to the rev it already had;
-		 *   - remote answers with a higher rev → 2 responders, quorum 2 (unanimity),
-		 *     two singleton groups, `responderCount < quorum` is false → decline.
+		 * These two were committed in `ff2cbbf` asserting the *broken* behavior of a 2-node
+		 * cohort (ticket `bug-read-repair-unrepairable-small-cluster`); they now assert the fix.
+		 * Both failure modes came from the reader's own revision being one of the claims —
+		 * `clusterLatestCallback` short-circuits self to local storage — combined with a
+		 * corroboration floor of 2 that no 2-node cohort can ever reach. The caller now strips
+		 * its own claim before calling, and states how many peers could corroborate.
 		 */
-		it('DEFECT: accepts the reader\'s OWN stale claim when the only other peer drops out', () => {
-			// Node B holds rev 1; node A committed rev 2 but its response timed out.
-			const claims: RevClaim[] = [{ peerId: 'self-node-b', rev: 1, actionId: 'stale-action' }];
-			const sel = selectQuorumRev(claims, THRESHOLD);
-			// A single self-claim is corroborated by nobody, yet it is returned as the
-			// quorum result — the caller cannot tell this apart from a real quorum.
-			expect(sel, 'lone self-claim is accepted as a quorum result').to.not.equal(undefined);
-			expect(sel!.rev).to.equal(1);
-			expect(sel!.actionId).to.equal('stale-action');
-			expect(sel!.supporters).to.deep.equal(['self-node-b']);
+		it('a 2-node divergence IS repairable: the sole other peer\'s newer rev is adopted', () => {
+			// Node B (reader, rev 1) asks node A, which answers rev 2. B's own claim is excluded
+			// by the caller, so one claim remains and exactly one peer could ever have made it.
+			const claims: RevClaim[] = [{ peerId: 'node-a', rev: 2, actionId: 'fresh-action' }];
+			expect(quorumSize(1, THRESHOLD, 1), 'one possible corroborator ⇒ one vote').to.equal(1);
+			const sel = selectQuorumRev(claims, THRESHOLD, 1);
+			expect(sel, 'the fresh rev must now be adoptable').to.not.equal(undefined);
+			expect(sel!.rev).to.equal(2);
+			expect(sel!.actionId).to.equal('fresh-action');
+			expect(sel!.supporters).to.deep.equal(['node-a']);
 		});
 
-		it('DEFECT: a 2-node divergence is structurally unrepairable (quorum 2 == unanimity)', () => {
-			// Both nodes answer; they disagree, which is exactly the case read-repair exists for.
-			const claims: RevClaim[] = [
-				{ peerId: 'self-node-b', rev: 1, actionId: 'stale-action' },
-				{ peerId: 'node-a', rev: 2, actionId: 'fresh-action' }
-			];
-			expect(quorumSize(2, THRESHOLD), '2 responders require 2 votes — unanimity').to.equal(2);
-			// No group reaches 2, and the fallback needs responderCount < quorum (2 < 2 is false),
-			// so the fresh rev 2 is never adopted no matter how many times the read is retried.
-			expect(selectQuorumRev(claims, THRESHOLD)).to.equal(undefined);
+		it('the reader cannot corroborate itself when its only peer stays silent', () => {
+			// Self-exclusion happens in the caller, so a silent peer leaves NO claims at all —
+			// there is nothing to restore to and, crucially, nothing that looks like a quorum.
+			expect(selectQuorumRev([], THRESHOLD, 1)).to.equal(undefined);
+			// And a single voter never seconds itself where a second corroborator should exist.
+			const selfClaim: RevClaim[] = [{ peerId: 'self-node-b', rev: 1, actionId: 'stale-action' }];
+			expect(selectQuorumRev(selfClaim, THRESHOLD, 4)).to.equal(undefined);
+		});
+
+		/**
+		 * Honest exposure note: relaxing the floor for a cohort with one other peer means that
+		 * peer is believed unconditionally. Claims are bare assertions — a `BlockArchive` carries
+		 * no commit certificate — so nothing here can tell a lag from a lie. A 2-member cohort has
+		 * no Byzantine tolerance to lose (there is no honest majority to appeal to), and the
+		 * capacity is measured against the CONFIGURED cluster size so a shrunken view of a larger
+		 * network cannot reach this branch. See `debt-read-repair-commit-cert-verification`.
+		 */
+		it('a sole cohort peer is believed even when its rev is absurd (documented exposure)', () => {
+			const claims: RevClaim[] = [{ peerId: 'node-a', rev: 999_999, actionId: 'absurd' }];
+			expect(selectQuorumRev(claims, THRESHOLD, 1)!.rev).to.equal(999_999);
+			// In any cohort that could supply a second corroborator, the same claim is refused.
+			expect(selectQuorumRev(claims, THRESHOLD, 2)).to.equal(undefined);
 		});
 
 		it('counts one vote per distinct peer (duplicate peerId does not inflate a group)', () => {

@@ -9,9 +9,23 @@ import { createLogger } from '../logger.js';
 import type { IPeerReputation } from "../reputation/types.js";
 import { PenaltyReason } from "../reputation/types.js";
 import type { ITransactionStateStore } from "../cluster/i-transaction-state-store.js";
-import { selectQuorumRev, type RevClaim, type QuorumRev } from "../cluster/quorum-restore.js";
+import { quorumSize, selectQuorumRev, type RevClaim, type QuorumRev } from "../cluster/quorum-restore.js";
 
 const log = createLogger('coordinator-repo');
+
+/**
+ * What one round of polling the cohort learned about a block: the revision the OTHER
+ * cohort members corroborated, and what this node itself already holds. The two are kept
+ * apart on purpose — the local revision is the baseline being repaired, never evidence
+ * about the cluster (see {@link CoordinatorRepo.queryClusterForLatest}) — but the caller
+ * still needs it to tell whether the corroborated revision is actually an advance.
+ */
+interface ClusterLatestQuery {
+	/** Highest `(rev, actionId)` corroborated by peers other than this node, if any. */
+	corroborated?: ActionRev;
+	/** This node's own latest for the block, as answered by the callback's self short-circuit. */
+	local?: ActionRev;
+}
 
 /**
  * Extended cluster interface that includes the ability to check if a transaction was executed.
@@ -73,6 +87,8 @@ export class CoordinatorRepo implements IRepo {
 	private readonly readRepairSampleRate: number;
 	/** Simple-majority threshold from the consensus policy; drives the read-repair corroboration quorum. */
 	private readonly simpleMajorityThreshold: number;
+	/** Configured full cluster size; the operator's declaration of how many corroborators should exist. */
+	private readonly clusterSize: number;
 	/** Resolved super-majority threshold the coordinator commits on (mirrors the value handed to ClusterCoordinator). */
 	private readonly superMajorityThreshold: number;
 	private readonly reputation?: IPeerReputation;
@@ -120,6 +136,7 @@ export class CoordinatorRepo implements IRepo {
 		this.readRepairSampleRate = policy.readRepairSampleRate!;
 		this.simpleMajorityThreshold = policy.simpleMajorityThreshold;
 		this.superMajorityThreshold = policy.superMajorityThreshold;
+		this.clusterSize = policy.clusterSize;
 		this.reputation = reputation;
 		const localClusterRef = localCluster && localPeerId ? {
 			update: localCluster.update.bind(localCluster),
@@ -312,33 +329,66 @@ export class CoordinatorRepo implements IRepo {
 			return;
 		}
 
-		const clusterLatest = await this.queryClusterForLatest(peerIds, blockId, context);
-		if (clusterLatest) {
-			// Found on cluster - trigger restoration to sync the block
-			await this.storageRepo.get({ blockIds: [blockId], context: { committed: [clusterLatest], rev: clusterLatest.rev } });
-			log('cluster-fetch:synced', { blockId, rev: clusterLatest.rev });
+		const { corroborated, local } = await this.queryClusterForLatest(peerIds, blockId, context);
+		// Nothing corroborated: keep local data AND stay eligible for repair — marking the
+		// block seen here would suppress the next attempt for the whole read-repair window.
+		if (!corroborated) return;
+
+		// Never restore backwards. With this node's own claim excluded from the quorum, a
+		// cohort that lags behind the reader corroborates an OLDER revision; adopting it
+		// would be a regression, and logging it as a sync would be a lie. The cohort did
+		// answer, so the block is verified fresh — mark it seen.
+		if (local && corroborated.rev <= local.rev) {
+			log('cluster-fetch:local-current', { blockId, localRev: local.rev, clusterRev: corroborated.rev });
 			this.markBlocksSeen([blockId]);
+			return;
 		}
+
+		// Corroborated revision is ahead of ours — trigger restoration to sync the block.
+		await this.storageRepo.get({ blockIds: [blockId], context: { committed: [corroborated], rev: corroborated.rev } });
+		log('cluster-fetch:synced', { blockId, rev: corroborated.rev });
+		this.markBlocksSeen([blockId]);
 	}
 
 	/**
-	 * Query cluster peers for their latest revision and return the highest
-	 * revision corroborated by a quorum of distinct peers.
+	 * How many peers other than this node could corroborate a claim about a block, given a
+	 * cohort view of `peerIds`. Deliberately the MAX of what we observe and what the
+	 * configured cluster size implies: the corroboration floor may only be relaxed for a
+	 * cohort that is genuinely small, never for one that merely *looks* small. `findCluster`
+	 * results are unauthenticated, so a partition — or an attacker with routing influence —
+	 * can shrink this node's view to itself plus one peer; measuring against the configured
+	 * size keeps that shrunken view from talking the requirement down to a single voter.
+	 * The escape hatch for a real two-node deployment is therefore to configure
+	 * `clusterSize: 2`, an explicit operator declaration, mirroring how
+	 * `allowUnvalidatedSmallCluster` gates the membership admission floor.
+	 */
+	private corroboratorCapacity(peerIds: string[]): number {
+		const selfId = this.localPeerId?.toString();
+		const observed = peerIds.filter(id => id !== selfId).length;
+		return Math.max(observed, this.clusterSize - 1);
+	}
+
+	/**
+	 * Query cluster peers for their latest revision and return the highest revision
+	 * corroborated by a quorum of distinct peers, alongside this node's own latest.
 	 *
 	 * Replaces the old "max rev any single peer reports" — which let one lying
 	 * peer over-reporting its revision steer restoration — with quorum
-	 * corroboration on the exact `(rev, actionId)` pair (see
-	 * {@link selectQuorumRev}). The local node's own latest is included as a
-	 * corroborating vote because `clusterLatestCallback` self-short-circuits to
-	 * local storage. Returns `undefined` (keep local, do not restore) when no
-	 * revision is corroborated.
+	 * corroboration on the exact `(rev, actionId)` pair (see {@link selectQuorumRev}).
+	 *
+	 * This node's own answer is split out of the claim set rather than counted in it:
+	 * `clusterLatestCallback` short-circuits self to local storage, so including it let a
+	 * reader whose only peer timed out "corroborate" the very revision it was trying to
+	 * repair. It is returned separately so the caller can compare, not vote.
 	 *
 	 * NOTE: the quorum is corroboration-of-a-claim, NOT Sybil-resistant cohort
-	 * membership — a peer minting fresh keypairs still casts a vote. Commit-cert
-	 * + membership anchoring is deferred to backlog
+	 * membership — a peer minting fresh keypairs still casts a vote, and the claims
+	 * themselves are bare assertions (a `BlockArchive` carries no commit certificate, so
+	 * there is nothing here to verify a `(rev, actionId)` against). Commit-cert +
+	 * membership anchoring is deferred to backlog
 	 * `debt-read-repair-commit-cert-verification`.
 	 */
-	private async queryClusterForLatest(peerIds: string[], blockId: BlockId, context?: ActionContext): Promise<ActionRev | undefined> {
+	private async queryClusterForLatest(peerIds: string[], blockId: BlockId, context?: ActionContext): Promise<ClusterLatestQuery> {
 		// Add timeout wrapper to prevent hanging on unresponsive peers
 		const withTimeout = <T>(promise: Promise<T>, timeoutMs: number): Promise<T | undefined> =>
 			Promise.race([
@@ -356,18 +406,28 @@ export class CoordinatorRepo implements IRepo {
 			})
 		);
 
+		const selfId = this.localPeerId?.toString();
+		let local: ActionRev | undefined;
 		const claims: RevClaim[] = [];
 		for (const result of latestResults) {
-			if (result.status === 'fulfilled' && result.value.value) {
-				const { peerIdStr, value } = result.value;
-				claims.push({ peerId: peerIdStr, rev: value.rev, actionId: value.actionId });
+			if (result.status !== 'fulfilled' || !result.value.value) continue;
+			const { peerIdStr, value } = result.value;
+			if (peerIdStr === selfId) {
+				local = value;
+				continue;
 			}
+			claims.push({ peerId: peerIdStr, rev: value.rev, actionId: value.actionId });
 		}
 
-		const selected = selectQuorumRev(claims, this.simpleMajorityThreshold);
+		const capacity = this.corroboratorCapacity(peerIds);
+		const selected = selectQuorumRev(claims, this.simpleMajorityThreshold, capacity);
 		if (!selected) {
-			log('cluster-fetch:no-quorum', { blockId, responders: claims.length });
-			return undefined;
+			log('cluster-fetch:no-quorum', {
+				blockId,
+				responders: claims.length,
+				required: quorumSize(claims.length, this.simpleMajorityThreshold, capacity)
+			});
+			return { local };
 		}
 
 		// Best-effort: penalize peers whose claim contradicts the corroborated pair
@@ -375,7 +435,7 @@ export class CoordinatorRepo implements IRepo {
 		// rev). A lower rev is just lag, never penalized. Never let this throw.
 		this.penalizeContradictingRevClaims(claims, selected, blockId);
 
-		return { actionId: selected.actionId, rev: selected.rev };
+		return { corroborated: { actionId: selected.actionId, rev: selected.rev }, local };
 	}
 
 	/**

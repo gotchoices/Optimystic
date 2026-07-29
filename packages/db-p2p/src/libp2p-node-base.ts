@@ -174,11 +174,25 @@ export type NodeOptions = {
 	relayServerInit?: CircuitRelayServerInit;
 	/** Storage provider - either an IRawStorage instance or a factory function. Defaults to MemoryRawStorage if not provided. */
 	storage?: RawStorageProvider;
-	clusterSize?: number; // desired cluster size per key
+	/**
+	 * Desired cluster size per key (default 10). Beyond sizing the cohort, this is the
+	 * node's declaration of how many peers *should* exist to corroborate a claim: the
+	 * read-repair corroboration floor is measured against it, so a genuine two-node
+	 * deployment must set `clusterSize: 2` for its members to be able to repair each
+	 * other (see `CoordinatorRepo.corroboratorCapacity`).
+	 */
+	clusterSize?: number;
 	clusterPolicy?: {
 		allowDownsize?: boolean;
 		sizeTolerance?: number; // acceptable relative difference (e.g. 0.5 = +/-50%)
 		superMajorityThreshold?: number; // fraction of peers needed for super-majority (default: DEFAULT_SUPER_MAJORITY_THRESHOLD = 0.75)
+		/**
+		 * Opt in to transacting below the safe cluster-size floor when FRET has no confident
+		 * network-size estimate — the membership-admission and coordinator small-cluster gates
+		 * both fail closed without it. Default false. Turn on only for single-node / local dev
+		 * meshes that knowingly run undersized.
+		 */
+		allowUnvalidatedSmallCluster?: boolean;
 	};
 
 	/** Override libp2p listen multiaddrs. */
@@ -642,6 +656,9 @@ export async function createLibp2pNodeBase(
 		minAbsoluteClusterSize: 2,
 		allowClusterDownsize: options.clusterPolicy?.allowDownsize ?? true,
 		clusterSizeTolerance: options.clusterPolicy?.sizeTolerance ?? 0.5,
+		// Fail closed by default (an undersized cluster with no confident network-size estimate is
+		// rejected); embedders running knowingly-small meshes opt in through clusterPolicy.
+		allowUnvalidatedSmallCluster: options.clusterPolicy?.allowUnvalidatedSmallCluster ?? false,
 		partitionDetectionWindow: 60000,
 		// Configured full cluster size — the member's own reference for "full size" in the membership
 		// admission gate (a below-full-size declared set under low FRET confidence is refused as a possible

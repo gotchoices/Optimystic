@@ -289,7 +289,10 @@ saveMaterializedBlock(block): store(structuredClone(block));
   rev). It does **not** trust a single peer: the target `(rev, actionId)` must be
   corroborated by a quorum of distinct cohort archives, and the block content must
   hash byte-identically across a quorum, before it persists (`cluster/quorum-restore.ts`;
-  shared with `CoordinatorRepo` read-repair). No rev quorum, or no content quorum →
+  shared with `CoordinatorRepo` read-repair, which excludes the reader's own revision from
+  that quorum and caps the corroboration floor at how many peers *could* corroborate — see
+  [transactions.md § Read Consistency and Staleness](transactions.md#read-consistency-and-staleness)).
+  No rev quorum, or no content quorum →
   it leaves the block for a later churn/rebalance retry. Reconciliation is
   best-effort and bounded (`ReconcileTimeoutMs`):
   failures/timeouts are logged (`cluster-member:consensus-commit-reconcile-failed`),

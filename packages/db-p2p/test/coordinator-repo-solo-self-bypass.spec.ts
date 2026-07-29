@@ -184,16 +184,19 @@ describe('CoordinatorRepo solo-cluster self-sync bypass', () => {
 		expect(callbackInvocations).to.deep.equal([otherPeer.toString()]);
 	});
 
-	it('returns sync result when a remote peer reports a newer revision', async () => {
-		// Sanity: the multi-peer path is unchanged — if a remote has a newer
-		// revision, the callback result feeds into storageRepo.get with context.
+	it('returns sync result when remote peers report a newer revision', async () => {
+		// Sanity: the multi-peer path is unchanged — if the cohort corroborates a newer
+		// revision, the callback result feeds into storageRepo.get with context. Two remotes
+		// are needed because a cohort this size can supply a second corroborator, and a claim
+		// no one seconds is not adopted (see quorum-restore's corroborator capacity).
 		const localPeer = await makePeerId();
 		const otherPeer = await makePeerId();
-		const cluster = makeClusterPeers([localPeer, otherPeer]);
+		const thirdPeer = await makePeerId();
+		const cluster = makeClusterPeers([localPeer, otherPeer, thirdPeer]);
 
 		const remoteLatest: ActionRev = { actionId: 'remote-action', rev: 7 };
 		const clusterLatestCallback: ClusterLatestCallback = async (peerId) =>
-			peerId.equals(otherPeer) ? remoteLatest : undefined;
+			peerId.equals(localPeer) ? undefined : remoteLatest;
 
 		const storageCalls: BlockGets[] = [];
 		const storageRepo: IRepo = {

@@ -8,7 +8,10 @@
  *   - a single lying peer is outvoted (no restore against the lie),
  *   - independent minority liars are outvoted,
  *   - an honest quorum-backed higher rev still drives restoration,
- *   - a lone honest (lagging) responder still restores via the small-cluster fallback.
+ *   - a lone honest (lagging) responder still restores when the cohort is small enough
+ *     that it is the only peer that could corroborate (see
+ *     `bug-read-repair-unrepairable-small-cluster`; the old unconditional
+ *     "few responders all agree" fallback it used to ride is gone).
  *
  * NOTE: the quorum is corroboration-of-a-claim, NOT Sybil-resistant cohort
  * membership — colluding peers minting fresh keypairs onto the SAME fabricated
@@ -213,13 +216,14 @@ describe('CoordinatorRepo read-repair TRUST (quorum-corroborated)', () => {
 		expect(restore!.context!.committed).to.deep.equal([newer]);
 	});
 
-	it('a lone honest (lagging) responder still restores via the small-cluster fallback', async () => {
+	it('a lone honest (lagging) responder still restores when it is the only possible corroborator', async () => {
 		const localPeer = await makePeerId();
 		const otherPeer = await makePeerId();
 		const cluster = makeClusterPeers([localPeer, otherPeer]);
 
 		const remoteLatest: ActionRev = { actionId: 'remote-action', rev: 2 };
-		// Only the other peer answers (local is missing/undefined here) — one honest responder.
+		// Only the other peer answers (local is missing/undefined here) — one honest responder,
+		// and with clusterSize 2 it is the only peer that could ever corroborate.
 		const clusterLatestCallback: ClusterLatestCallback = async (peerId) =>
 			peerId.equals(otherPeer) ? remoteLatest : undefined;
 
