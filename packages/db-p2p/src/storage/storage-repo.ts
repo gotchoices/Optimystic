@@ -745,6 +745,15 @@ export class StorageRepo implements IRepo, IBlockChangeNotifier, IBlockReplicaSt
 	 * all, so it is translated into {@link MissingBaseRevisionError} rather than surfacing as an opaque
 	 * storage fault: the healing path can then repair the block instead of the fault resetting the
 	 * cluster stream, and a wedged node recovers on the next write touching the block.
+	 *
+	 * The catch is deliberately UNNARROWED — it also absorbs a transient fault (a raw-storage read
+	 * error, a `restoreCallback` timeout on a block whose `ranges` do not cover its own `latest`).
+	 * BlockStorage reports every one of these as a bare `Error`, so they cannot be told apart here,
+	 * and treating them as divergence is the safe default: this node genuinely cannot materialize the
+	 * base right now, and the cluster's policy is to heal rather than throw out of consensus. The
+	 * price is that a transient fault ALSO drops the pending (see {@link refuseMissingBase}), so the
+	 * block converges by replication instead of by a replay the retry could have done. Narrowing this
+	 * would require typed faults out of BlockStorage; until then, prefer the tolerant reading.
 	 */
 	private async readCommitBase(
 		blockId: BlockId,

@@ -324,6 +324,16 @@ saveMaterializedBlock(block): store(structuredClone(block));
   `StorageRepo.commit:<blockId>` latch, so fetching the base from inside the commit path
   would deadlock against the lock the commit already holds. That constraint is why a member
   with no base *refuses and heals* rather than *fetching then committing*.
+- **The coordinator tolerates the same divergence, in both its shapes.** When
+  `CoordinatorRepo.commit` finds its own member did not execute during consensus, it falls back
+  to a local commit — which can diverge for reasons the caller is not responsible for. A thrown
+  missing pend and a returned `missing-base-revision` refusal are treated identically: if the
+  record shows a simple majority approved the commit, report success
+  (`coordinator-repo:commit-local-failed-cluster-succeeded`) and let replication converge this
+  peer. Returning the refusal instead would surface a *landed* transaction as a stale loss, since
+  db-core's `commitPhase` treats any returned `success:false` as a permanent stale failure and
+  retries until its budget is exhausted. A `success:false` with any other reason is a genuine
+  lost race and still reaches the caller.
 
 ### Collection Header Blocks
 - Header blockId = collection name (deterministic)

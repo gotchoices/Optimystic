@@ -11,6 +11,7 @@ import { PenaltyReason } from "../reputation/types.js";
 import type { ITransactionStateStore } from "../cluster/i-transaction-state-store.js";
 import { quorumSize, selectQuorumRev, type RevClaim, type QuorumRev } from "../cluster/quorum-restore.js";
 import { RECONCILE_TIMEOUT_MS } from "../cluster/reconcile-block.js";
+import { isMissingBaseRevisionFailure, MISSING_BASE_REVISION_REASON } from "../storage/storage-repo.js";
 import type { ReconcileBlockCallback } from "../cluster/cluster-repo.js";
 
 const log = createLogger('coordinator-repo');
@@ -700,23 +701,32 @@ export class CoordinatorRepo implements IRepo {
 				this.markBlocksSeen(blockIds);
 				return { success: true };
 			}
-			// Local cluster didn't execute during consensus. Attempt a local commit,
-			// but tolerate failure (e.g., "pending action not found") when the cluster
-			// already reached consensus — this coordinator was likely picked for commit
-			// after missing the pend phase (unreachable during pend, fresh join, etc.).
-			// The cluster's majority is authoritative; this peer will catch up via sync.
+			// Local cluster didn't execute during consensus. Attempt a local commit, but tolerate
+			// local divergence when the cluster already reached consensus — this coordinator was
+			// likely picked for commit after missing the pend phase (unreachable during pend, fresh
+			// join, etc.). The cluster's majority is authoritative; this peer catches up via sync.
+			//
+			// Divergence reaches us in BOTH shapes and both must be tolerated identically:
+			//   - a THROW ("Pending action … not found"), when we never saw the pend;
+			//   - a RETURNED `success:false` carrying `missing-base-revision`, when we saw the pend
+			//     but not the revision that created the block (see StorageRepo.internalCommit).
+			// Only the throw was tolerated before the refusal existed. Reporting the refusal to the
+			// caller instead would surface a committed transaction as a stale loss: db-core's
+			// commitPhase treats any returned `success:false` as a permanent stale failure, so the
+			// client would retry an action the cluster already landed until it exhausted its budget.
 			try {
 				const result = await this.storageRepo.commit(request, options);
-				if (result.success) this.markBlocksSeen(blockIds);
+				if (result.success) {
+					this.markBlocksSeen(blockIds);
+					return result;
+				}
+				if (isMissingBaseRevisionFailure(result) && clusterReachedCommitConsensus(record)) {
+					return this.tolerateLocalCommitDivergence(request, blockIds, result.reason ?? MISSING_BASE_REVISION_REASON);
+				}
 				return result;
 			} catch (err) {
 				if (clusterReachedCommitConsensus(record)) {
-					log('coordinator-repo:commit-local-failed-cluster-succeeded', {
-						actionId: request.actionId,
-						error: (err as Error).message
-					});
-					this.markBlocksSeen(blockIds);
-					return { success: true };
+					return this.tolerateLocalCommitDivergence(request, blockIds, (err as Error).message);
 				}
 				throw err;
 			}
@@ -724,6 +734,17 @@ export class CoordinatorRepo implements IRepo {
 			log('coordinator-repo:commit-error', { actionId: request.actionId, error: (error as Error).message });
 			throw error;
 		}
+	}
+
+	/**
+	 * Report success for a commit the cluster carried but this peer could not apply locally. The
+	 * blocks are marked seen so the read path treats them as freshness-checked; convergence comes
+	 * from replication (cohort reconcile, or read-driven acquisition), not from replay here.
+	 */
+	private tolerateLocalCommitDivergence(request: CommitRequest, blockIds: BlockId[], detail: string): CommitResult {
+		log('coordinator-repo:commit-local-failed-cluster-succeeded', { actionId: request.actionId, error: detail });
+		this.markBlocksSeen(blockIds);
+		return { success: true };
 	}
 }
 

@@ -1403,6 +1403,102 @@ describe('StorageRepo', () => {
 			const after = await repo.get({ blockIds: [BLOCK] });
 			expect((after[BLOCK]?.block as unknown as { items: unknown[] }).items).to.deep.equal(['x', 'y']);
 		});
+
+		/**
+		 * A batch mixing a committable block with one that has no base. `commit()` breaks out of its
+		 * per-block loop on the first failure, so which block refuses decides how much of the batch
+		 * lands. Both orders must still surface the refusal (that is what routes the action to the
+		 * healing path) and must never leave a block at a revision it cannot materialize.
+		 */
+		describe('mixed batch (one block committable, one with no base)', () => {
+			const OK = 'sibling-block' as BlockId;
+
+			/** Pend an insert on `OK` and an update on `BLOCK` under one action, then commit both. */
+			const commitMixedBatch = async (blockIds: BlockId[]): Promise<CommitResult> => {
+				await repo.pend({
+					actionId: 'a-mixed' as ActionId,
+					transforms: {
+						inserts: { [OK]: makeBlock(OK, { items: [] }) },
+						updates: { [BLOCK]: [['items', 0, 0, ['x']]] },
+						deletes: []
+					},
+					policy: 'c'
+				});
+				return await repo.commit({ actionId: 'a-mixed' as ActionId, blockIds, tailId: OK, rev: 2 });
+			};
+
+			it('surfaces the refusal even when a sibling block committed first', async () => {
+				const result = await commitMixedBatch([OK, BLOCK]);
+
+				expectMissingBase(result);
+				// The sibling landed durably before the break — a retry treats it as an idempotent
+				// no-op, so it must NOT be rolled back.
+				expect((await repo.get({ blockIds: [OK] }))[OK]?.state?.latest?.rev, 'sibling landed').to.equal(2);
+				expect((await repo.get({ blockIds: [BLOCK] }))[BLOCK]?.state?.latest, 'refusing block untouched').to.equal(undefined);
+			});
+
+			it('leaves a not-yet-reached sibling uncommitted rather than half-applied', async () => {
+				// Refusing block first: the break happens before the sibling is reached, so the whole
+				// batch is unapplied here. The action still reached consensus cluster-wide; this member
+				// converges by replication, which is what the refusal routes to.
+				expectMissingBase(await commitMixedBatch([BLOCK, OK]));
+
+				expect((await repo.get({ blockIds: [OK] }))[OK]?.state?.latest, 'sibling not reached').to.equal(undefined);
+				expect((await repo.get({ blockIds: [BLOCK] }))[BLOCK]?.state?.latest).to.equal(undefined);
+			});
+
+			/** Pend a later exclusive write to `OK` and report whether it was accepted. */
+			const laterExclusiveWriteAccepted = async (): Promise<boolean> => {
+				const later = await repo.pend({
+					actionId: 'a-later' as ActionId,
+					transforms: makeUpdateTransforms(OK, [['items', 0, 0, ['y']]]),
+					policy: 'f'
+				});
+				return later.success;
+			};
+
+			it('KNOWN GAP: a not-yet-reached sibling keeps a pending it can never promote', async () => {
+				// The break leaves the sibling's pending in place; reconcile then advances that block
+				// past the action, so the pending is unpromotable forever. It is reported as a
+				// conflicting action by every later write to the block.
+				//
+				// Consensus tolerates this (a member's failed pend is logged, not thrown — see
+				// ClusterMember's consensus-pend-diverged branch), so the member is degraded rather
+				// than broken: it stops participating in that block's pend/commit and converges only
+				// by replication. Tracked by `bug-orphaned-pending-after-divergent-commit`; flip this
+				// assertion when that lands.
+				await commitMixedBatch([BLOCK, OK]);
+				await repo.saveReplicatedBlock(OK, makeBlock(OK, { items: [] }), { actionId: 'a-mixed' as ActionId, rev: 2 });
+
+				expect(await laterExclusiveWriteAccepted(), 'orphaned pending currently blocks later writes').to.equal(false);
+			});
+
+			it('KNOWN GAP: the pre-existing missing-pend divergence orphans the same way', async () => {
+				// Same orphan without any missing-base refusal involved: commit() throws for the block
+				// whose pend never arrived, BEFORE the per-block loop runs, so every block in the batch
+				// keeps its pending. This is why the gap above is pre-existing rather than introduced by
+				// the refusal — the refusal only adds one more route into it.
+				await repo.pend({
+					actionId: 'a-mixed' as ActionId,
+					transforms: makeInsertTransforms(OK, makeBlock(OK, { items: [] })),
+					policy: 'c'
+				});
+
+				// BLOCK was never pended here, so commit throws rather than returning a refusal.
+				let thrown: Error | undefined;
+				try {
+					await repo.commit({ actionId: 'a-mixed' as ActionId, blockIds: [OK, BLOCK], tailId: OK, rev: 2 });
+				} catch (err) {
+					thrown = err as Error;
+				}
+				expect(thrown?.message ?? '', 'this path throws, it does not refuse').to.include('Pending action');
+				expect(thrown?.message ?? '').to.not.include(MISSING_BASE_REVISION_REASON);
+
+				await repo.saveReplicatedBlock(OK, makeBlock(OK, { items: [] }), { actionId: 'a-mixed' as ActionId, rev: 2 });
+
+				expect(await laterExclusiveWriteAccepted(), 'same orphan, no refusal involved').to.equal(false);
+			});
+		});
 	});
 
 	describe('change notification on replica-persist', () => {

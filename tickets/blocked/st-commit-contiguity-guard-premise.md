@@ -72,6 +72,27 @@ carries **no base-revision stamp**. So there is no revision-number arithmetic th
 "legitimately skipped rev 2" from "missed a write at rev 2". Any guard keyed on `latest.rev` vs
 `request.rev` rejects both — which is why the specified fix regresses.
 
+## Update (review of `bug-member-commits-unmaterializable-revision`)
+
+Part of question 1 below has since been answered in code, which narrows — but does not close — this
+decision:
+
+- The **"no base at all"** sub-case is now guarded. A node asked to commit revision N of a block it
+  holds *no* revision of used to record N while materializing nothing, wedging the block locally.
+  `StorageRepo.internalCommit` now refuses that commit and routes it to the peer-reconcile path.
+  That is a strictly weaker check than the guard this ticket rejected: it keys off "I hold nothing"
+  rather than off revision-number arithmetic, so it never fires on the legitimate sparse jump.
+- The **"I hold an older revision but missed a write that touched this block"** sub-case — the real
+  risk described below — is still **unguarded and still undetectable locally**, for exactly the
+  reason this ticket gives. That node applies the new edits to stale content and records the result
+  as valid, so it silently diverges *and* serves the wrong bytes to peers. The refusal above does
+  not help: it only fires when there is no base whatsoever.
+
+So the remaining decision is unchanged in substance but smaller in scope: it is now only about the
+stale-base case, and the "already covered by the reconcile path" argument in question 1 does **not**
+cover it (that path is only reached when a node *reports* divergence, which a stale-base node never
+does).
+
 ## The decision needed (human / design)
 
 1. **Is the underlying risk actually reachable** in this system, or already covered? Cluster members
