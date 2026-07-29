@@ -17,6 +17,7 @@ import type { FretService } from "p2p-fret";
 import type { IPeerReputation } from "../reputation/types.js";
 import { PenaltyReason } from "../reputation/types.js";
 import type { ITransactionStateStore } from "./i-transaction-state-store.js";
+import { isMissingBaseRevisionFailure } from "../storage/storage-repo.js";
 
 const log = createLogger('cluster-member')
 
@@ -1124,9 +1125,13 @@ export class ClusterMember implements ICluster {
 	 *   - **behind**: we missed the prior `pend` cluster-transaction (cohort drift
 	 *     between the independent pend and commit phases, or transient unreachability),
 	 *     so we lack the pending action — `StorageRepo.commit` *throws* "Pending
-	 *     action … not found".
+	 *     action … not found";
+	 *   - **behind (no base)**: we DID see the pend, but we never saw the revision that
+	 *     created the block, so the transform has nothing to apply to —
+	 *     `StorageRepo.commit` returns `success:false` with a `missing-base-revision`
+	 *     reason rather than recording a revision it could not materialize.
 	 *
-	 * For the **behind** case we hold no revision of the committed blocks at all, so we
+	 * For both **behind** cases we hold no usable revision of the committed blocks, so we
 	 * actively reconcile: pull the committed revision from a cohort peer that holds it
 	 * (`reconcileBlock`) and restore it locally. Lazy read-repair on a later read cannot
 	 * recover it on its own when cohort drift has left the block under-replicated (no
@@ -1215,7 +1220,8 @@ export class ClusterMember implements ICluster {
 			}
 			if (!result.success) {
 				// success:false is a StaleFailure. `missing` ⇒ ahead/stale divergence
-				// (we already hold ≥ this rev): tolerate, do NOT reconcile downward. A bare
+				// (we already hold ≥ this rev): tolerate, do NOT reconcile downward. A
+				// missing-base reason ⇒ behind divergence, reconcile (below). Any other bare
 				// `reason` with no `missing` ⇒ a genuine internalCommit fault: propagate so
 				// handleConsensus rolls back the executed marker and rethrows.
 				if (result.missing?.length) {
@@ -1226,6 +1232,22 @@ export class ClusterMember implements ICluster {
 						reason: result.reason,
 						hasMissing: true
 					});
+					return;
+				}
+				// This member holds no materializable base for one of the blocks, so
+				// `StorageRepo.commit` REFUSED rather than record a revision it could never serve.
+				// Same "behind" divergence as a missing pend — and the same cure: pull the committed
+				// revision from a cohort peer. Reconciling here (after commit released its per-block
+				// latches) is what makes refusing safe; fetching inside the commit path would deadlock
+				// against the latch `saveReplicatedBlock` needs to persist what it fetched.
+				if (isMissingBaseRevisionFailure(result)) {
+					log('cluster-member:consensus-commit-diverged', {
+						messageHash,
+						actionId: commit.actionId,
+						divergence: 'behind',
+						reason: result.reason
+					});
+					await this.reconcileDivergentCommit(record, commit);
 					return;
 				}
 				throw new Error(`Consensus commit for action ${commit.actionId} failed: ${result.reason ?? 'unknown reason'}`);

@@ -63,13 +63,22 @@ const makeClusterClient = ((_peerId: PeerId) => ({} as any)) as (peerId: PeerId)
  */
 const makePresentStorageRepo = (blockId: BlockId, rev: number, actionId = 'local-action') => {
 	const calls: BlockGets[] = [];
+	// Held revision, mutable: a restoration context naming a newer committed revision advances it,
+	// modelling a storage repo whose restore actually lands. `CoordinatorRepo` now reports
+	// `cluster-fetch:synced` vs `cluster-fetch:not-restored` from the revision it reads back, so a
+	// stub frozen at its initial rev would report every restoration as a failure.
+	let held: ActionRev = { actionId, rev };
 	const repo: IRepo = {
 		async get(blockGets: BlockGets, _options?: MessageOptions): Promise<GetBlockResults> {
 			calls.push(blockGets);
+			const restoring = blockGets.context?.committed?.find(c => c.rev > held.rev);
+			if (restoring && blockGets.blockIds.includes(blockId)) {
+				held = restoring;
+			}
 			const result: GetBlockResults = {};
 			for (const id of blockGets.blockIds) {
 				if (id === blockId) {
-					result[id] = { state: { latest: { actionId, rev } } };
+					result[id] = { state: { latest: held } };
 				} else {
 					result[id] = { state: {} };
 				}

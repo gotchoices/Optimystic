@@ -345,8 +345,23 @@ export class CoordinatorRepo implements IRepo {
 		}
 
 		// Corroborated revision is ahead of ours — trigger restoration to sync the block.
-		await this.storageRepo.get({ blockIds: [blockId], context: { committed: [corroborated], rev: corroborated.rev } });
-		log('cluster-fetch:synced', { blockId, rev: corroborated.rev });
+		const restored = await this.storageRepo.get({ blockIds: [blockId], context: { committed: [corroborated], rev: corroborated.rev } });
+		const restoredRev = restored[blockId]?.state?.latest?.rev;
+
+		// Log the OUTCOME, not the attempt. The restore above only moves data when this node already
+		// holds the corroborated action as a local pending it can promote; otherwise it is a no-op and
+		// the block stays behind. Logging `synced` unconditionally reported hundreds of phantom
+		// convergences per run and made a real replication defect invisible for two debugging sessions.
+		if (typeof restoredRev === 'number' && (local === undefined || restoredRev > local.rev)) {
+			log('cluster-fetch:synced', { blockId, rev: restoredRev });
+		} else {
+			log('cluster-fetch:not-restored', { blockId, localRev: local?.rev, clusterRev: corroborated.rev });
+		}
+		// NOTE: the block is marked seen either way — the cohort DID answer, so its freshness was
+		// checked, which is what the read-repair window tracks. That does suppress a retry for the
+		// window even though the block is still behind; whether a failed transfer should stay eligible
+		// is owned by ticket `read-repair-cannot-transfer-block-content`, which also supplies the
+		// transfer that would make this branch succeed.
 		this.markBlocksSeen([blockId]);
 	}
 

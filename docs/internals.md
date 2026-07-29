@@ -271,17 +271,30 @@ saveMaterializedBlock(block): store(structuredClone(block));
   consensus is reached the operation is authoritative; a member that cannot apply
   it locally (it is *ahead* — stale pend/commit returns `success:false` with
   `missing` — or *behind* — missing the prior pend, so `StorageRepo.commit` throws
-  "Pending action … not found") logs `cluster-member:consensus-{pend,commit}-diverged`
+  "Pending action … not found"; or *behind with no base*, below) logs
+  `cluster-member:consensus-{pend,commit}-diverged`
   and tolerates the divergence rather than throwing. Throwing would reset the
   cluster stream the coordinator awaits and surface as a spurious `StreamResetError`,
   sinking an otherwise-successful transaction.
+- **`latest` never advances past a revision the node can materialize.** A member can hold
+  the *pend* for revision N of a block yet have missed the revision that created it —
+  cohort membership drifts between a collection's revisions. `applyTransform` silently
+  drops `updates` when there is no block to apply them to, so committing anyway would
+  record rev N while materializing nothing: the block is then unreadable on that node
+  (`materializeBlock` throws), unservable to peers (`SyncService.buildArchive` returns
+  nothing), and every later pend for it is rejected — a permanent local wedge with no
+  self-healing path. `StorageRepo.internalCommit` therefore **refuses**: it drops the
+  unusable pending and fails the commit with a `missing-base-revision` reason
+  (`MISSING_BASE_REVISION_REASON`, matched by `isMissingBaseRevisionFailure`). The same
+  refusal covers a block whose existing `latest` is itself unmaterializable, so a node
+  wedged by older code recovers on the next write touching that block.
 - **The commit divergence split keys off `CommitResult`, not throw-vs-return.** A
-  missing pend (thrown "not found") or a stale/ahead commit (`success:false` with
-  `missing`) is divergence and tolerated; a genuine mid-commit fault (`success:false`
-  with a bare `reason`, no `missing`) is propagated so `handleConsensus` rolls back
-  the executed marker and rethrows — same as an unexpected *thrown* fault
-  (`applyConsensusOperation`).
-- **A *behind* member actively reconciles.** It holds no revision of the committed
+  missing pend (thrown "not found"), a stale/ahead commit (`success:false` with
+  `missing`), or a `missing-base-revision` refusal is divergence and tolerated; any other
+  mid-commit fault (`success:false` with a bare `reason`, no `missing`) is propagated so
+  `handleConsensus` rolls back the executed marker and rethrows — same as an unexpected
+  *thrown* fault (`applyConsensusOperation`).
+- **A *behind* member actively reconciles.** It holds no usable revision of the committed
   blocks, so it pulls the committed revision from the cohort (via the injected
   `reconcileBlock` callback — `SyncClient` fetch + `saveReplicatedBlock` in
   `libp2p-node-base`) and restores it locally, repairing the under-replication that
@@ -297,7 +310,11 @@ saveMaterializedBlock(block): store(structuredClone(block));
   best-effort and bounded (`ReconcileTimeoutMs`):
   failures/timeouts are logged (`cluster-member:consensus-commit-reconcile-failed`),
   never thrown. An *ahead* member already holds ≥ the rev, so it does not reconcile
-  downward.
+  downward. Reconciliation deliberately runs **after** `StorageRepo.commit` returns, once
+  its per-block latches are released: `saveReplicatedBlock` takes the same
+  `StorageRepo.commit:<blockId>` latch, so fetching the base from inside the commit path
+  would deadlock against the lock the commit already holds. That constraint is why a member
+  with no base *refuses and heals* rather than *fetching then committing*.
 
 ### Collection Header Blocks
 - Header blockId = collection name (deterministic)

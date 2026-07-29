@@ -44,6 +44,37 @@ export async function withBlockCommitLatch<T>(blockId: BlockId, fn: () => Promis
 	}
 }
 
+/**
+ * Stable, greppable prefix on the failure reason a commit carries when this node cannot materialize
+ * the revision it was asked to record. It is a STRING marker rather than only an error class because
+ * {@link StorageRepo.commit} reports per-block faults as `StaleFailure.reason` (a plain string that
+ * also crosses the wire), so the class identity is lost by the time a caller inspects the result.
+ */
+export const MISSING_BASE_REVISION_REASON = 'missing-base-revision';
+
+/**
+ * This node was asked to commit revision N of a block it holds no materializable base for, so
+ * applying the transform would materialize nothing while `latest` advanced to N — a block that is
+ * then unreadable locally, unservable to peers, and that rejects every later write (see
+ * {@link StorageRepo.internalCommit}). The commit is refused instead; the caller heals the node
+ * out-of-band (`ClusterMember` pulls the committed revision from a cohort peer) and retries.
+ */
+export class MissingBaseRevisionError extends Error {
+	constructor(readonly blockId: BlockId, readonly rev: number, detail: string) {
+		super(`${MISSING_BASE_REVISION_REASON}: block ${blockId} cannot materialize rev ${rev} — ${detail}`);
+		this.name = 'MissingBaseRevisionError';
+	}
+}
+
+/**
+ * True when a {@link CommitResult} failed because this node holds no materializable base for one of
+ * the committed blocks. Distinguishes that recoverable divergence (heal by fetching the block from a
+ * cohort peer) from a genuine storage fault, which must still propagate.
+ */
+export function isMissingBaseRevisionFailure(result: CommitResult): boolean {
+	return !result.success && (result.reason?.startsWith(MISSING_BASE_REVISION_REASON) ?? false);
+}
+
 export type StorageRepoOptions = {
 	/** Optional hook to validate transactions in PendRequests */
 	validatePend?: PendValidationHook;
@@ -185,14 +216,26 @@ export class StorageRepo implements IRepo, IBlockChangeNotifier, IBlockReplicaSt
 						// Sort a COPY: when `latest` is undefined, `missing` aliases the caller's
 						// `context.committed` array, and an in-place `.sort()` would reorder the shared
 						// request context under the caller's feet.
-						for (const { actionId, rev } of [...missing].sort((a, b) => a.rev - b.rev)) {
-							const pending = await blockStorage.getPendingTransaction(actionId);
-							if (pending) {
-								const collectionId = await this.internalCommit(blockId, actionId, rev, blockStorage);
-								if (collectionId !== undefined) {
-									promotions.push({ collectionId, blockId, actionId, rev });
+						try {
+							for (const { actionId, rev } of [...missing].sort((a, b) => a.rev - b.rev)) {
+								const pending = await blockStorage.getPendingTransaction(actionId);
+								if (pending) {
+									const collectionId = await this.internalCommit(blockId, actionId, rev, blockStorage);
+									if (collectionId !== undefined) {
+										promotions.push({ collectionId, blockId, actionId, rev });
+									}
 								}
 							}
+						} catch (err) {
+							// This node holds no materializable base for the block, so NO context revision
+							// can be promoted here (each builds on the one before). Leave `latest` where it
+							// is — the invariant internalCommit just enforced — and let the commit-path
+							// healing supply the content; a read must not fail for it. Every other fault
+							// still propagates.
+							if (!(err instanceof MissingBaseRevisionError)) {
+								throw err;
+							}
+							log('get:promote-skipped-missing-base blockId=%s rev=%d reason=%s', blockId, err.rev, err.message);
 						}
 					});
 				}
@@ -639,13 +682,23 @@ export class StorageRepo implements IRepo, IBlockChangeNotifier, IBlockReplicaSt
 
 		// Get prior materialized block if it exists
 		const latest = await storage.getLatest();
-		const priorBlock = latest
-			? (await storage.getBlock(latest.rev))?.block
-			: undefined;
+		const priorBlock = await this.readCommitBase(blockId, actionId, rev, storage, latest);
 
 		// Apply transform and save materialized block
 		// applyTransform handles undefined priorBlock correctly for inserts
 		const newBlock = applyTransform(priorBlock, transform);
+
+		// INVARIANT: `latest` must never advance past a revision this node can materialize.
+		// `applyTransform` silently drops `updates` when there is no block to apply them to, so a
+		// member that missed the block's CREATING revision would otherwise record rev N while storing
+		// nothing to serve it from. `latest === undefined` is precisely the "nothing below to fall
+		// back to" case: materializeBlock's descending walk needs some materialization at or below the
+		// target, and with no prior revision there is none. With a prior `latest` an absent newBlock is
+		// a legitimate tombstone (the walk resolves to an earlier materialization), so it stays allowed.
+		if (!newBlock && latest === undefined) {
+			return await this.refuseMissingBase(blockId, actionId, rev, storage,
+				'no committed revision to apply the transform to');
+		}
 
 		if (newBlock) {
 			await storage.saveMaterializedBlock(actionId, newBlock);
@@ -681,6 +734,58 @@ export class StorageRepo implements IRepo, IBlockChangeNotifier, IBlockReplicaSt
 		// Either may be absent only for a malformed/headerless block — return
 		// undefined so the caller skips it rather than emitting a bogus event.
 		return newBlock?.header.collectionId ?? priorBlock?.header.collectionId;
+	}
+
+	/**
+	 * The materialization this commit builds on: the block at `latest`, or `undefined` when the block
+	 * holds no committed revision yet (the normal insert case).
+	 *
+	 * `getBlock` THROWS when this node holds a `latest` it cannot materialize — a block already wedged
+	 * by a pre-fix commit, or by truncated history. That is the same divergence as having no base at
+	 * all, so it is translated into {@link MissingBaseRevisionError} rather than surfacing as an opaque
+	 * storage fault: the healing path can then repair the block instead of the fault resetting the
+	 * cluster stream, and a wedged node recovers on the next write touching the block.
+	 */
+	private async readCommitBase(
+		blockId: BlockId,
+		actionId: ActionId,
+		rev: number,
+		storage: IBlockStorage,
+		latest: ActionRev | undefined
+	): Promise<IBlock | undefined> {
+		if (!latest) {
+			return undefined;
+		}
+		try {
+			return (await storage.getBlock(latest.rev))?.block;
+		} catch (err) {
+			log('commit:unmaterializable-base blockId=%s baseRev=%d error=%s', blockId, latest.rev,
+				err instanceof Error ? err.message : String(err));
+			return await this.refuseMissingBase(blockId, actionId, rev, storage,
+				`local rev ${latest.rev} is not materializable here`);
+		}
+	}
+
+	/**
+	 * Refuse a commit this node cannot materialize. Always throws {@link MissingBaseRevisionError};
+	 * nothing durable has been written at this point, so the block is left exactly as it was minus the
+	 * pending record.
+	 *
+	 * The pending is dropped because it can never be promoted here: promotion needs a base this node
+	 * must obtain out-of-band, and once the healing path lands that revision `latest` is already >= rev,
+	 * so a commit retry partitions the block as already-done/stale and never revisits the pending.
+	 * Leaving it would also report a phantom conflicting action from {@link pend} for every later write.
+	 */
+	private async refuseMissingBase(
+		blockId: BlockId,
+		actionId: ActionId,
+		rev: number,
+		storage: IBlockStorage,
+		detail: string
+	): Promise<never> {
+		await storage.deletePendingTransaction(actionId);
+		log('commit:missing-base blockId=%s rev=%d actionId=%s detail=%s', blockId, rev, actionId, detail);
+		throw new MissingBaseRevisionError(blockId, rev, detail);
 	}
 }
 

@@ -1,5 +1,5 @@
 import { expect } from 'chai';
-import { StorageRepo, commitLatchKey } from '../src/storage/storage-repo.js';
+import { StorageRepo, commitLatchKey, MISSING_BASE_REVISION_REASON } from '../src/storage/storage-repo.js';
 import { BlockStorage } from '../src/storage/block-storage.js';
 import { MemoryRawStorage } from '../src/storage/memory-storage.js';
 import type { BlockId, ActionId, ActionRev, ActionTransforms, CommitResult, PendRequest, Transforms, IBlock, BlockHeader, CollectionChangeEvent } from '@optimystic/db-core';
@@ -1247,6 +1247,161 @@ describe('StorageRepo', () => {
 			expect(Object.keys(byId.get('a1')!.transforms.inserts ?? {})).to.deep.equal(['block-1']);
 			expect(byId.get('a2')!.rev).to.equal(2);
 			expect(byId.get('a2')!.transforms.updates?.['block-1' as BlockId]).to.deep.equal([['items', 0, 0, ['x']]]);
+		});
+	});
+
+	/**
+	 * Ticket: bug-member-commits-unmaterializable-revision.
+	 *
+	 * A cohort member could accept revision N of a block while holding no revision at all:
+	 * `applyTransform(undefined, <updates>)` silently returns undefined, so nothing was
+	 * materialized, yet `setLatest({rev: N})` ran anyway. The block was then unreadable
+	 * locally (`materializeBlock` throws), unservable to peers, and every later pend for it
+	 * was rejected. The invariant these specs pin: **`latest` never advances past a revision
+	 * this node can actually materialize.**
+	 */
+	describe('commit — missing base revision (latest never outruns materialization)', () => {
+		const BLOCK = 'orphan-block' as BlockId;
+
+		/** Pend an update-only transform for a block this repo holds no revision of, then commit it. */
+		const commitUpdateWithoutBase = async (actionId: string, rev: number): Promise<CommitResult> => {
+			await repo.pend({
+				actionId: actionId as ActionId,
+				transforms: makeUpdateTransforms(BLOCK, [['items', 0, 0, ['x']]]),
+				policy: 'c'
+			});
+			return await repo.commit({ actionId: actionId as ActionId, blockIds: [BLOCK], tailId: BLOCK, rev });
+		};
+
+		/** Asserts the result is the distinct missing-base refusal (not a generic fault). */
+		const expectMissingBase = (result: CommitResult): void => {
+			expect(result.success, 'commit must be refused').to.equal(false);
+			const reason = (result as { reason?: string }).reason;
+			expect(reason, 'refusal must carry a reason').to.be.a('string');
+			expect(reason!.startsWith(MISSING_BASE_REVISION_REASON),
+				`reason must be greppable as ${MISSING_BASE_REVISION_REASON}, got: ${reason}`).to.equal(true);
+		};
+
+		it('refuses a forward transform when the block has no committed revision', async () => {
+			expectMissingBase(await commitUpdateWithoutBase('a-orphan', 2));
+		});
+
+		it('leaves latest unset and the block readable-as-absent after the refusal', async () => {
+			await commitUpdateWithoutBase('a-orphan', 2);
+
+			// The whole point: no wedged pointer. get() must answer (not throw) and report no revision.
+			const got = await repo.get({ blockIds: [BLOCK] });
+			expect(got[BLOCK]?.state?.latest, 'latest must not advance to an unmaterializable rev').to.equal(undefined);
+			expect(got[BLOCK]?.block).to.equal(undefined);
+		});
+
+		it('refuses a delete with no base (it would leave nothing to reverse-apply from)', async () => {
+			await repo.pend({ actionId: 'a-del' as ActionId, transforms: makeDeleteTransforms(BLOCK), policy: 'c' });
+			const result = await repo.commit({ actionId: 'a-del' as ActionId, blockIds: [BLOCK], tailId: BLOCK, rev: 4 });
+
+			expectMissingBase(result);
+			const got = await repo.get({ blockIds: [BLOCK] });
+			expect(got[BLOCK]?.state?.latest).to.equal(undefined);
+		});
+
+		it('drops the unusable pending so it cannot block later writes to the block', async () => {
+			await commitUpdateWithoutBase('a-orphan', 2);
+
+			// policy 'f' fails if ANY pending action is outstanding on the block — the refused
+			// pending must be gone, or every later write to this block is rejected as conflicting.
+			const later = await repo.pend({
+				actionId: 'a-later' as ActionId,
+				transforms: makeInsertTransforms(BLOCK, makeBlock(BLOCK)),
+				policy: 'f'
+			});
+			expect(later.success, 'no orphaned pending may remain').to.equal(true);
+		});
+
+		it('does NOT refuse an insert with no prior revision (the normal create path)', async () => {
+			await repo.pend({ actionId: 'a-new' as ActionId, transforms: makeInsertTransforms(BLOCK, makeBlock(BLOCK)), policy: 'c' });
+			const result = await repo.commit({ actionId: 'a-new' as ActionId, blockIds: [BLOCK], tailId: BLOCK, rev: 1 });
+
+			expect(result.success).to.equal(true);
+			const got = await repo.get({ blockIds: [BLOCK] });
+			expect(got[BLOCK]?.state?.latest?.rev).to.equal(1);
+		});
+
+		it('commits across an arbitrary revision gap when a base IS held', async () => {
+			// Revisions are allocated per COLLECTION, so a block only gets one when an action
+			// touches it: local rev 1 → committing rev 7 is routine, not a gap to heal.
+			await repo.pend({ actionId: 'a1' as ActionId, transforms: makeInsertTransforms(BLOCK, makeBlock(BLOCK, { items: [] })), policy: 'c' });
+			await repo.commit({ actionId: 'a1' as ActionId, blockIds: [BLOCK], tailId: BLOCK, rev: 1 });
+
+			await repo.pend({ actionId: 'a7' as ActionId, transforms: makeUpdateTransforms(BLOCK, [['items', 0, 0, ['x']]]), policy: 'c' });
+			const result = await repo.commit({ actionId: 'a7' as ActionId, blockIds: [BLOCK], tailId: BLOCK, rev: 7 });
+
+			expect(result.success, 'a held base makes any forward rev committable').to.equal(true);
+			const got = await repo.get({ blockIds: [BLOCK] });
+			expect(got[BLOCK]?.state?.latest?.rev).to.equal(7);
+			expect((got[BLOCK]?.block as unknown as { items: unknown[] }).items).to.deep.equal(['x']);
+		});
+
+		it('refuses rather than throwing opaquely when latest itself is unmaterializable', async () => {
+			// A block wedged by the pre-fix defect (or by truncated history): latest points at a
+			// revision with no materialization anywhere below it, so getBlock throws. The next
+			// commit must report the same greppable divergence — which routes to healing — rather
+			// than surfacing a raw storage fault that resets the cluster stream.
+			await rawStorage.saveMetadata(BLOCK, { latest: { rev: 3, actionId: 'ghost' as ActionId }, ranges: [[3]] });
+
+			expectMissingBase(await commitUpdateWithoutBase('a-after-wedge', 4));
+		});
+
+		it('read-driven promotion does not advance latest without a base', async () => {
+			await repo.pend({
+				actionId: 'a-ctx' as ActionId,
+				transforms: makeUpdateTransforms(BLOCK, [['items', 0, 0, ['x']]]),
+				policy: 'c'
+			});
+
+			// The read-repair shape: a context asserting the cluster committed rev 2, on a node
+			// holding the pending but no base. get() promotes context revisions through the same
+			// internalCommit, so it must observe the same refusal instead of wedging `latest`.
+			let readError: Error | undefined;
+			try {
+				await repo.get({
+					blockIds: [BLOCK],
+					context: { committed: [{ actionId: 'a-ctx' as ActionId, rev: 2 }], rev: 2 }
+				});
+			} catch (err) {
+				readError = err as Error;
+			}
+
+			expect(await new BlockStorage(BLOCK, rawStorage).getLatest(),
+				'a read must never advance latest to an unmaterializable rev').to.equal(undefined);
+			// The refusal itself is absorbed by get(). Anything that still escapes comes from the
+			// read path's inability to ACQUIRE a block this node has never held — a separate gap,
+			// tracked by `read-repair-cannot-transfer-block-content`, not this refusal leaking out.
+			expect(readError?.message ?? '', 'the missing-base refusal must not escape a read')
+				.to.not.include(MISSING_BASE_REVISION_REASON);
+		});
+
+		it('converges once the block arrives out-of-band, and then accepts later writes', async () => {
+			// Refuse (this node missed the creating revision) …
+			expectMissingBase(await commitUpdateWithoutBase('a-orphan', 2));
+
+			// … the healing path (ClusterMember reconcile → saveReplicatedBlock) supplies rev 2 …
+			await repo.saveReplicatedBlock(BLOCK, makeBlock(BLOCK, { items: ['x'] }), { actionId: 'a-orphan' as ActionId, rev: 2 });
+
+			const healed = await repo.get({ blockIds: [BLOCK] });
+			expect(healed[BLOCK]?.state?.latest?.rev, 'block converged at the committed rev').to.equal(2);
+			expect((healed[BLOCK]?.block as unknown as { items: unknown[] }).items).to.deep.equal(['x']);
+
+			// … and the node participates in the block's next write instead of rejecting it.
+			const pended = await repo.pend({
+				actionId: 'a-next' as ActionId,
+				transforms: makeUpdateTransforms(BLOCK, [['items', 1, 0, ['y']]]),
+				policy: 'c'
+			});
+			expect(pended.success).to.equal(true);
+			const committed = await repo.commit({ actionId: 'a-next' as ActionId, blockIds: [BLOCK], tailId: BLOCK, rev: 3 });
+			expect(committed.success, 'a healed member must not reject later writes').to.equal(true);
+			const after = await repo.get({ blockIds: [BLOCK] });
+			expect((after[BLOCK]?.block as unknown as { items: unknown[] }).items).to.deep.equal(['x', 'y']);
 		});
 	});
 

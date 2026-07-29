@@ -36,6 +36,15 @@ export class BlockStorage implements IBlockStorage {
 	async getBlock(rev?: number): Promise<{ block: IBlock, actionRev: ActionRev } | undefined> {
 		const meta = await this.storage.getMetadata(this.blockId);
 		if (!meta) {
+			// No metadata at all ⇒ this node has never seen the block, and reads report it absent
+			// WITHOUT consulting `restoreCallback`. That is deliberate, not an oversight: `restoreCallback`
+			// is reachable only from ensureRevision below, so a never-seen block is never fetched on the
+			// read path. Attempting a fetch here would turn every read of a genuinely non-existent block —
+			// the common case for an insert probing for a collision — into a network round trip. A node
+			// that legitimately should hold this block acquires it on the WRITE path instead
+			// (`ClusterMember` reconcile → `saveReplicatedBlock`). Read-driven acquisition of a never-seen
+			// block is tracked by ticket `read-repair-cannot-transfer-block-content`; until it lands, do
+			// not read this early return as "read-repair covers this".
 			return undefined;
 		}
 

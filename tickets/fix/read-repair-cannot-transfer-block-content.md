@@ -56,10 +56,28 @@ Block-transferring restoration exists only on the commit path: `reconcileBlock` 
 `fetchArchiveFromPeer` → `storageRepo.saveReplicatedBlock` (`libp2p-node-base.ts`), driven
 by `ClusterMember` when a member commits a block it never pended.
 
-Consequence: `cluster-fetch:synced` is **not** evidence of convergence, and neither is a
-`cluster-tx:read-repair-applied` log (it compares revs that never moved, so it logs
-`cluster-tx:read-repair-noop` instead). A node that misses a commit broadcast stays behind
-until a later commit or a churn/rebalance pass happens to push the block to it.
+Consequence: a node that misses a commit broadcast stays behind until a later commit or a
+churn/rebalance pass happens to push the block to it.
+
+**Update (`bug-member-commits-unmaterializable-revision`, landed).** Two things this ticket
+previously had to work around are now fixed, and one of its edge cases is now settled:
+
+- `cluster-fetch:synced` is emitted only when `latest` actually advanced; a no-op restore logs
+  `cluster-fetch:not-restored`. The logs are now honest evidence, so the acceptance test for
+  this ticket can assert `cluster-fetch:synced` directly.
+- The **block entirely missing locally** edge case below is decided, not open: the read path
+  deliberately does NOT acquire a never-seen block, because turning every read of a genuinely
+  absent block into a network fetch is unacceptable (an insert probes for collisions this way).
+  `BlockStorage.getBlock`'s early return now says so in place. If this ticket's chosen mechanism
+  wants read-driven acquisition of a never-seen block, it must gate it on something narrower than
+  "no local metadata" — e.g. only when the caller supplies a cluster-corroborated `context.rev`.
+- Commit-path acquisition covers strictly more than it used to: a member that holds the pend but
+  missed the block's creating revision now refuses and reconciles instead of wedging, so this
+  ticket is no longer the only route by which a block reaches a lagging member.
+
+Still true and still this ticket's job: `cluster-tx:read-repair-applied` never fires for a
+content gap (the revs never move, so it logs `cluster-tx:read-repair-noop`), and read-repair
+moves no bytes.
 
 ## Why the mesh harness hides this
 
@@ -100,7 +118,15 @@ Whichever is chosen, the fix must also settle:
 
 - Block entirely **missing** locally (no metadata at all): `BlockStorage.getBlock` returns
   `undefined` before `ensureRevision` runs, so today's read path cannot restore a
-  never-seen block either. Confirm whether the chosen fix covers this or only the stale case.
+  never-seen block. That early return is now documented as deliberate (see the update above) —
+  if the chosen fix covers this case it must not make a genuinely-absent block cost a fetch.
+- **Pending-only block asked for an explicit rev.** A block whose metadata exists only because
+  `savePendingTransaction` seeded it (`latest === undefined`, empty `ranges`) does reach
+  `ensureRevision`, which then *throws* `revision N not found during restore attempt` when the
+  restore yields nothing. `fetchBlockFromCluster` swallows that as `cluster-fetch:error`, but
+  any other caller of `StorageRepo.get` with a context sees a read fail where "absent" is the
+  honest answer. Decide whether an unobtainable forward revision should be an error or an
+  absence; it is entangled with the `meta.ranges` semantics this ticket already owns.
 - **Reader ahead of the cohort** — must remain a no-op (already guarded in
   `fetchBlockFromCluster`; keep it guarded once bytes can actually move).
 - **Concurrent local commit** during a read-driven persist — must serialize on
@@ -115,7 +141,13 @@ Whichever is chosen, the fix must also settle:
 - [ ] Decide the transfer mechanism and record the tradeoff.
 - [ ] Make the lagging node's `latest` and content actually converge on a read.
 - [ ] Decide and implement the content-trust gate for read-repair-fetched bytes.
-- [ ] Invert the `KNOWN GAP` spec in `coordinator-repo-read-repair-content.spec.ts`.
+- [ ] Invert the `KNOWN GAP` spec in `coordinator-repo-read-repair-content.spec.ts`, plus the
+      `cluster-fetch:not-restored` assertion in the `selects the peer's newer revision` spec
+      (it should become `cluster-fetch:synced` once bytes really move).
+- [ ] Revisit `markBlocksSeen` on a no-op restore: `fetchBlockFromCluster` still marks the block
+      seen when nothing was restored, suppressing retry for the whole window. Left unchanged
+      deliberately (dropping it would make every read of a stale block re-poll the cohort while
+      the transfer is still missing) — reconsider once the transfer exists.
 - [ ] Stop the mesh harness from faking data sync inside `clusterLatestCallback`.
 - [ ] Update `docs/transactions.md` § "What a repair pass will and will not accept" — it
       currently documents this gap as known.

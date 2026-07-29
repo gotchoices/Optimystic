@@ -94,6 +94,12 @@ const makeHeader = (id: string): BlockHeader => ({
 
 const makeBlock = (id: string): IBlock => ({ header: makeHeader(id) });
 
+/** A block carrying an `items` array, so update transforms have something to apply to. */
+const makeBlockWith = (id: string, items: unknown[]): IBlock => ({ header: makeHeader(id), items } as unknown as IBlock);
+
+const itemsOf = (block: IBlock | undefined): unknown[] | undefined =>
+	(block as unknown as { items?: unknown[] } | undefined)?.items;
+
 const makeClusterPeers = (keyPairs: KeyPair[]): ClusterPeers => {
 	const peers: ClusterPeers = {};
 	for (const { peerId } of keyPairs) {
@@ -322,6 +328,79 @@ describe('ClusterMember consensus-execution divergence (stream-reset root cause)
 		const got = await storage.get({ blockIds: ['block-1'] });
 		expect(got['block-1']?.state?.latest?.rev).to.equal(1);
 		expect(got['block-1']?.state?.latest?.actionId).to.equal('a-missing');
+	});
+
+	/**
+	 * Ticket: bug-member-commits-unmaterializable-revision.
+	 *
+	 * The trace's actual failure: the member DID see the pend (so the missing-pend "behind"
+	 * path above never fires), but it joined the cohort after the block's creating revision.
+	 * `applyTransform(undefined, <updates>)` returns undefined, so nothing is materialized —
+	 * yet `setLatest` used to run anyway, permanently wedging the block on that node. It must
+	 * refuse instead, and the refusal must route into the same reconcile-and-heal path.
+	 */
+	it('refuses and heals when it saw the pend but never the creating revision', async () => {
+		const updateOps: Transforms = { inserts: {}, updates: { 'block-1': [['items', 0, 0, ['x']]] }, deletes: [] };
+
+		// The cohort peer that saw both revisions: block-1 created at rev 1, updated at rev 2.
+		const sibling = realStorageRepo();
+		await sibling.pend({ actionId: 'a-create', transforms: { inserts: { 'block-1': makeBlockWith('block-1', []) }, updates: {}, deletes: [] }, policy: 'c' });
+		expect((await sibling.commit({ actionId: 'a-create', blockIds: ['block-1'], tailId: 'block-1' as BlockId, rev: 1 })).success).to.equal(true);
+		await sibling.pend({ actionId: 'a-update', transforms: updateOps, policy: 'c' });
+		expect((await sibling.commit({ actionId: 'a-update', blockIds: ['block-1'], tailId: 'block-1' as BlockId, rev: 2 })).success).to.equal(true);
+
+		// The behind member reached the cohort only in time for rev 2's pend: it holds the
+		// pending update and NO revision to apply it to.
+		const storage = realStorageRepo();
+		await storage.pend({ actionId: 'a-update', transforms: updateOps, policy: 'c' });
+
+		let reconcileCalls = 0;
+		const reconcileBlock: ReconcileBlockCallback = async (blockId, committed) => {
+			reconcileCalls++;
+			const got = await sibling.get({ blockIds: [blockId] });
+			const entry = got[blockId];
+			const latest = entry?.state?.latest;
+			if (latest && entry?.block && latest.rev >= committed.rev) {
+				await storage.saveReplicatedBlock(blockId, entry.block, latest);
+			}
+		};
+		member = clusterMember({ storageRepo: storage, peerNetwork: mockNetwork, peerId: self.peerId, privateKey: self.privateKey, reconcileBlock });
+
+		const record = await buildConsensusCommitRecord(self, other, makeCommitOperation('a-update', 'block-1', 2));
+		const result = await member.update(record);
+
+		// The stream survives (the refusal is divergence, not a fault) …
+		expect(result.commits[self.peerId.toString()]).to.not.equal(undefined);
+		expect(member.wasTransactionExecuted(record.messageHash)).to.equal(true);
+		// … the refusal routed into reconcile …
+		expect(reconcileCalls, 'a missing-base refusal must heal, not wedge').to.equal(1);
+		// … and the member now holds rev 2 with real content it can serve.
+		const got = await storage.get({ blockIds: ['block-1'] });
+		expect(got['block-1']?.state?.latest?.rev).to.equal(2);
+		expect(itemsOf(got['block-1']?.block)).to.deep.equal(['x']);
+
+		// Before the fix this member rejected every later pend for the block, because the
+		// read inside validatePendOperations threw out of materializeBlock.
+		const later = await storage.pend({ actionId: 'a-next', rev: 3, transforms: updateOps, policy: 'c' });
+		expect(later.success, 'a healed member must accept later writes to the block').to.equal(true);
+	});
+
+	it('leaves the block absent — never at an unmaterializable rev — when the heal cannot run', async () => {
+		const updateOps: Transforms = { inserts: {}, updates: { 'block-1': [['items', 0, 0, ['x']]] }, deletes: [] };
+		const storage = realStorageRepo();
+		await storage.pend({ actionId: 'a-update', transforms: updateOps, policy: 'c' });
+
+		// No reconcile callback wired: the heal cannot run, so the invariant is all that protects
+		// the node. `latest` must stay unset and the block must read as absent, not throw.
+		member = clusterMember({ storageRepo: storage, peerNetwork: mockNetwork, peerId: self.peerId, privateKey: self.privateKey });
+
+		const record = await buildConsensusCommitRecord(self, other, makeCommitOperation('a-update', 'block-1', 2));
+		const result = await member.update(record);
+
+		expect(result.commits[self.peerId.toString()]).to.not.equal(undefined);
+		const got = await storage.get({ blockIds: ['block-1'] });
+		expect(got['block-1']?.state?.latest, 'latest must not advance past what can be materialized').to.equal(undefined);
+		expect(got['block-1']?.block).to.equal(undefined);
 	});
 
 	it('tolerates a reconcile callback that throws (best-effort: never resets the stream)', async () => {

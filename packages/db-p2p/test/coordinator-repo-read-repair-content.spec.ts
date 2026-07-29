@@ -175,10 +175,43 @@ describe('CoordinatorRepo read-repair CONTENT convergence', function () {
 		// Selection no longer declines: A's rev 2 is corroborated (A is the only peer that
 		// could corroborate) and drives a restoration attempt against B's real storage.
 		expect(hasTag(captured, 'cluster-fetch:no-quorum'), 'must not decline').to.equal(false);
-		expect(hasTagAtRev(captured, 'cluster-fetch:synced', 2), 'restoration driven by rev 2').to.equal(true);
+		// The attempt is reported by its OUTCOME. Nothing transfers (see the KNOWN GAP spec
+		// below), so `cluster-fetch:synced` must be absent — logging it unconditionally, as this
+		// path used to, manufactured hundreds of phantom convergences per run and hid a real
+		// replication defect for two debugging sessions.
+		// Ticket: bug-member-commits-unmaterializable-revision, secondary defect 1.
+		expect(hasTagAtRev(captured, 'cluster-fetch:synced', 2), 'nothing was restored, so nothing may claim it was').to.equal(false);
+		expect(hasTag(captured, 'cluster-fetch:not-restored'), 'the failed restore is reported').to.equal(true);
 		// And it ran against real storage without throwing, leaving B consistent.
 		const after = await bRepo.get({ blockIds: [BLOCK_ID] });
 		expect(after[BLOCK_ID]?.state?.latest).to.not.equal(undefined);
+	});
+
+	/**
+	 * Positive control for the outcome logging above: when the restore genuinely moves B
+	 * forward, `cluster-fetch:synced` must still fire. B holds `action-2` as a local pending
+	 * (it saw the pend but missed the commit), which is the one case today's restore context
+	 * can promote.
+	 */
+	it('logs cluster-fetch:synced only when the block actually advanced', async () => {
+		const { bRepo, bCoordinator } = await buildDivergedPair();
+		const pended = await bRepo.pend({
+			actionId: 'action-2' as ActionId,
+			rev: 2,
+			transforms: { inserts: { [BLOCK_ID]: makeBlock('v2') }, updates: {}, deletes: [] } as Transforms,
+			policy: 'c'
+		});
+		expect(pended.success).to.equal(true);
+
+		const captured = await captureLog('coordinator-repo', async () => {
+			await bCoordinator.get({ blockIds: [BLOCK_ID] });
+		});
+
+		expect(hasTagAtRev(captured, 'cluster-fetch:synced', 2), 'a real advance must be reported').to.equal(true);
+		expect(hasTag(captured, 'cluster-fetch:not-restored')).to.equal(false);
+		const after = await bRepo.get({ blockIds: [BLOCK_ID] });
+		expect(after[BLOCK_ID]?.state?.latest?.rev).to.equal(2);
+		expect(payloadOf(after[BLOCK_ID]?.block)).to.equal('v2');
 	});
 
 	/**
