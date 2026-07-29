@@ -88,6 +88,42 @@ describe('quorum-restore primitives', () => {
 			expect(selectQuorumRev(claims, THRESHOLD)).to.equal(undefined);
 		});
 
+		/**
+		 * Defect repro: 2-node cluster stale read reported as a successful sync.
+		 *
+		 * `clusterLatestCallback` self-short-circuits to local storage, so the READER'S
+		 * OWN revision is one of the claims. In a 2-node cohort that leaves only two
+		 * possible outcomes, and neither can ever repair a divergence:
+		 *   - remote drops out (1 s timeout / unreachable) → the reader's own stale
+		 *     claim is the lone group and the small-cluster fallback accepts it, so
+		 *     `CoordinatorRepo` "restores" to the rev it already had;
+		 *   - remote answers with a higher rev → 2 responders, quorum 2 (unanimity),
+		 *     two singleton groups, `responderCount < quorum` is false → decline.
+		 */
+		it('DEFECT: accepts the reader\'s OWN stale claim when the only other peer drops out', () => {
+			// Node B holds rev 1; node A committed rev 2 but its response timed out.
+			const claims: RevClaim[] = [{ peerId: 'self-node-b', rev: 1, actionId: 'stale-action' }];
+			const sel = selectQuorumRev(claims, THRESHOLD);
+			// A single self-claim is corroborated by nobody, yet it is returned as the
+			// quorum result — the caller cannot tell this apart from a real quorum.
+			expect(sel, 'lone self-claim is accepted as a quorum result').to.not.equal(undefined);
+			expect(sel!.rev).to.equal(1);
+			expect(sel!.actionId).to.equal('stale-action');
+			expect(sel!.supporters).to.deep.equal(['self-node-b']);
+		});
+
+		it('DEFECT: a 2-node divergence is structurally unrepairable (quorum 2 == unanimity)', () => {
+			// Both nodes answer; they disagree, which is exactly the case read-repair exists for.
+			const claims: RevClaim[] = [
+				{ peerId: 'self-node-b', rev: 1, actionId: 'stale-action' },
+				{ peerId: 'node-a', rev: 2, actionId: 'fresh-action' }
+			];
+			expect(quorumSize(2, THRESHOLD), '2 responders require 2 votes — unanimity').to.equal(2);
+			// No group reaches 2, and the fallback needs responderCount < quorum (2 < 2 is false),
+			// so the fresh rev 2 is never adopted no matter how many times the read is retried.
+			expect(selectQuorumRev(claims, THRESHOLD)).to.equal(undefined);
+		});
+
 		it('counts one vote per distinct peer (duplicate peerId does not inflate a group)', () => {
 			const claims: RevClaim[] = [
 				{ peerId: 'liar', rev: 99, actionId: 'bogus' },
