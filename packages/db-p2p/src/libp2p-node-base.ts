@@ -196,11 +196,13 @@ export type NodeOptions = {
 		allowUnvalidatedSmallCluster?: boolean;
 		/**
 		 * The smallest cohort this deployment can genuinely field — normally the number of nodes you
-		 * actually run, capped at `clusterSize`. Used only as the membership admission gate's fallback
-		 * yardstick when the node has no confident network-size estimate. Defaults to
-		 * `minAbsoluteClusterSize` (2), which is what lets a small mesh transact without configuration;
-		 * a large deployment should set this to its real cohort size so the gate can still police a
-		 * partition-induced downsize while its size estimate is unconfident.
+		 * actually run, capped at `clusterSize`. Two consumers read it: the membership admission gate,
+		 * on its fallback path when the node has no confident network-size estimate; and the
+		 * read-repair/reconcile corroboration floor (`corroboratorCapacity`), unconditionally.
+		 * Defaults to `minAbsoluteClusterSize` (2), which is what lets a small mesh transact and
+		 * self-repair without configuration; a large deployment should set this to its real cohort
+		 * size, otherwise the gate cannot police a partition-induced downsize while its size estimate
+		 * is unconfident, and a shrunken cohort view can relax the corroboration floor to one voter.
 		 */
 		assumedClusterSize?: number;
 	};
@@ -726,10 +728,12 @@ export async function createLibp2pNodeBase(
 		// cohort. Deliberately NOT the membership admission gate's yardstick: it says nothing about how
 		// many peers actually exist, so an unconfigured small mesh would refuse every write.
 		clusterSize: options.clusterSize ?? 10,
-		// The gate's fallback yardstick when this node has no confident network-size estimate: the operator's
-		// assertion of the smallest cohort this deployment can genuinely field. Defaults to
-		// minAbsoluteClusterSize above, so a two- or three-node mesh transacts unconfigured; a large
-		// deployment should set clusterPolicy.assumedClusterSize to its real cohort size.
+		// The operator's assertion of the smallest cohort this deployment can genuinely field. Read by
+		// the admission gate (fallback path, when this node has no confident network-size estimate) and
+		// by the read-repair/reconcile corroboration floor (unconditionally). Defaults to
+		// minAbsoluteClusterSize above, so a two- or three-node mesh transacts and self-repairs
+		// unconfigured; a large deployment should set clusterPolicy.assumedClusterSize to its real
+		// cohort size — at the default the corroboration floor is relaxable by a shrunken cohort view.
 		assumedClusterSize: options.clusterPolicy?.assumedClusterSize ?? minAbsoluteClusterSize
 	};
 
@@ -762,6 +766,10 @@ export async function createLibp2pNodeBase(
 	// (cohort drift, or a refused `missing-base-revision` commit). See `reconcile-block.ts` for
 	// the corroboration rules — in particular why both quorums are capped by how many peers
 	// could answer at all, which is what lets a genuinely two-node cohort heal.
+	// NOTE: this and the CoordinatorRepo below must cap against the SAME assumedClusterSize, or the
+	// two restoration paths disagree about how much trust a lone peer gets. Safe today because both
+	// read the one `consensusConfig` literal above; if either ever resolves its own value, add a
+	// fail-fast coupling check like `assertSuperMajorityCoupling` rather than relying on proximity.
 	const reconcileBlock: ReconcileBlockCallback = createReconcileBlock({
 		selfPeerId: node.peerId.toString(),
 		fetchArchive: fetchArchiveFromPeer,

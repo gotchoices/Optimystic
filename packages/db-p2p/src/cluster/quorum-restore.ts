@@ -78,6 +78,13 @@ export function quorumSize(
  * therefore to set `assumedClusterSize: 2`, an explicit operator declaration — and, unlike the old
  * `clusterSize`, one that does not also drop the replication factor.
  *
+ * Caveat on "explicit": `libp2p-node-base` *defaults* `assumedClusterSize` to `2`, so an unconfigured
+ * node is already in the relaxed branch and a shrunken view of a large cohort can talk its floor down
+ * to a single voter. That default is what lets a small mesh self-repair out of the box; a large
+ * deployment must set `clusterPolicy.assumedClusterSize` to its real cohort size to get the
+ * shrunken-view protection this function describes. See
+ * `fix/corroboration-floor-defaults-to-two-for-large-meshes`.
+ *
  * Shared by both restoration paths so the two can never drift apart on the rule that decides how
  * much trust a lone peer gets.
  */

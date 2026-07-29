@@ -40,10 +40,11 @@ export interface ReconcileBlockDeps {
 	simpleMajorityThreshold: number;
 	/**
 	 * The smallest cohort the operator asserts this deployment can genuinely field — the floor for
-	 * {@link corroboratorCapacity}. Unlike the membership admission gate, an absent value here should
-	 * fall back to the configured `clusterSize` rather than being treated as "unknown": the failure
-	 * mode of getting this wrong is a block that stays unrepaired (degraded, not dead), not a refused
-	 * write, so there is no reason to relax it just because the caller has not adopted the new field.
+	 * {@link corroboratorCapacity}. Required, not optional: unlike the membership admission gate there
+	 * is no "unknown" handling here, so a caller that cannot state an asserted size should pass its
+	 * configured `clusterSize` (the strict direction) rather than a small placeholder. The failure mode
+	 * of overstating it is a block that stays unrepaired — degraded, not dead; of understating it, a
+	 * shrunken cohort view that can relax the floor to a single voter.
 	 */
 	assumedClusterSize: number;
 	/** Best-effort misbehavior reporting; a throwing implementation is swallowed. */
