@@ -1,4 +1,4 @@
-import type { ComponentLogger, Startable } from '@libp2p/interface';
+import type { ComponentLogger, Connection, Startable } from '@libp2p/interface';
 import type { IRepo } from '@optimystic/db-core';
 import { buildSyncProtocol, type SyncRequest, type SyncResponse } from './protocol.js';
 import { pipe } from 'it-pipe';
@@ -6,8 +6,9 @@ import { toString as u8ToString } from 'uint8arrays/to-string';
 import * as lp from 'it-length-prefixed';
 import { MAX_CONTROL_MESSAGE_BYTES } from '../protocol-limits.js';
 import type { Uint8ArrayList } from 'uint8arraylist';
+import { createInboundStreamAuthorization, type InboundStreamAuthorization, type InboundStreamAuthorizationInit } from '../inbound-authorization.js';
 
-export interface SyncServiceInit {
+export interface SyncServiceInit extends InboundStreamAuthorizationInit {
 	protocolPrefix?: string;
 }
 
@@ -35,6 +36,8 @@ export class SyncService implements Startable {
 	private readonly protocol: string;
 	private readonly repo: IRepo;
 	private readonly registrar: { handle: (...args: any[]) => Promise<void>, unhandle: (...args: any[]) => Promise<void> };
+	/** Optional embedder authorization gate; `undefined` (the default) means no check runs. */
+	private readonly authorization: InboundStreamAuthorization | undefined;
 
 	constructor(
 		components: SyncServiceComponents,
@@ -44,6 +47,7 @@ export class SyncService implements Startable {
 		this.protocol = buildSyncProtocol(init.protocolPrefix ?? '');
 		this.repo = components.repo;
 		this.registrar = components.registrar;
+		this.authorization = createInboundStreamAuthorization(init, this.protocol, (msg, ...args) => this.log.error(msg, ...args));
 	}
 
 	async start(): Promise<void> {
@@ -65,18 +69,19 @@ export class SyncService implements Startable {
 	/**
 	 * Handle an incoming sync request stream.
 	 * Uses a streaming pipeline (like the repo service) to process the
-	 * first request and yield a response without waiting for the client
-	 * to close its write side — avoids a read/write deadlock.
-	 */
-	/**
-	 * Handle an incoming sync request stream.
-	 * Uses a streaming pipeline (like the repo service) to process the
 	 * request and yield a response immediately — avoids a read/write deadlock.
 	 */
-	private handleSyncRequest(stream: any): void {
+	private handleSyncRequest(stream: any, connection?: Connection): void {
 		const self = this;
+		// The registrar handler receives the stream (or, in an older shape, a `{ stream }`
+		// wrapper) directly; resolve it once so the authorization abort, the pipeline and the
+		// error path all act on the same object.
+		const actualStream = stream.stream ?? stream;
 		void (async () => {
 			try {
+				// Authorization runs before ANY decoding or execution. Guarded on the field so a
+				// node without a predicate keeps the original path untouched.
+				if (self.authorization && await self.authorization.deny(actualStream, connection?.remotePeer?.toString())) return;
 				const processStream = async function* (source: AsyncIterable<Uint8ArrayList> | Iterable<Uint8ArrayList>) {
 					for await (const msg of source) {
 						const json = u8ToString(msg.subarray(), 'utf8');
@@ -111,8 +116,6 @@ export class SyncService implements Startable {
 				};
 
 				// Use the same streaming pipeline pattern as the repo service.
-				// The registrar handler receives the stream (or data object) directly.
-				const actualStream = stream.stream ?? stream;
 				const responses = pipe(
 					actualStream,
 					(source: any) => lp.decode(source, { maxDataLength: MAX_CONTROL_MESSAGE_BYTES }),
@@ -125,7 +128,6 @@ export class SyncService implements Startable {
 				await actualStream.close();
 			} catch (error) {
 				self.log.error('Error handling sync request:', error);
-				const actualStream = stream.stream ?? stream;
 				try { actualStream.abort(error instanceof Error ? error : new Error(String(error))); } catch { /* ignore */ }
 			}
 		})();

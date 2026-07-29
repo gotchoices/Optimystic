@@ -85,6 +85,7 @@ import { assertSuperMajorityCoupling } from './cluster/supermajority-coupling.js
 import { createLogger } from './logger.js';
 import { PeerReputationService } from './reputation/peer-reputation.js';
 import type { IPeerReputation } from './reputation/types.js';
+import type { AuthorizeInboundStream, InboundStreamAuthorizationInit } from './inbound-authorization.js';
 import { DisputeService } from './dispute/dispute-service.js';
 import { DisputeClient } from './dispute/client.js';
 import { sampleArbitrators } from './dispute/arbitrator-selection.js';
@@ -289,6 +290,35 @@ export type NodeOptions = {
 	privateKey?: PrivateKey;
 
 	/**
+	 * Optional predicate deciding whether a remote peer may open one of the four Optimystic
+	 * database protocols on this node (`repo`, `cluster`, `sync`, `block-transfer`). It is
+	 * consulted once per inbound stream, before any frame is decoded or any operation executed.
+	 *
+	 * This is deliberately ONE node-level option threaded to all four services rather than four
+	 * per-service options: "is this peer allowed to talk to my database?" is a property of the
+	 * node, not of the protocol, and four independently-settable options make it easy to secure
+	 * three surfaces and silently miss the fourth. (Each service still accepts the same option in
+	 * its own init, so the services stay independently testable and usable outside this factory.)
+	 *
+	 * Absent → no check at all, and today's behavior exactly. Supplied → fail-closed: `false`, a
+	 * throw, a rejection, or a timeout all deny and abort the stream. `remotePeerId` is the
+	 * dialing peer's `PeerId.toString()`. See {@link AuthorizeInboundStream} and
+	 * `docs/internals.md` § Inbound Stream Authorization.
+	 *
+	 * NOTE: this covers the four database protocols only. The reactivity, matchmaking,
+	 * cohort-topic and libp2p built-in (identify/ping/…) protocols this node also registers are
+	 * NOT gated by it.
+	 */
+	authorizeInboundStream?: AuthorizeInboundStream;
+
+	/**
+	 * Deadline for {@link NodeOptions.authorizeInboundStream}; expiry denies the stream (a hanging
+	 * predicate would otherwise pin an inbound stream slot). Defaults to
+	 * `DEFAULT_INBOUND_AUTHORIZATION_TIMEOUT_MS` (5s). Ignored when no predicate is supplied.
+	 */
+	authorizeInboundStreamTimeoutMs?: number;
+
+	/**
 	 * Optional libp2p connection gater. The libp2p browser default denies
 	 * dialing insecure WebSockets and private/loopback addresses; callers
 	 * that need to dial local or unsecured bootstraps (web reference dev,
@@ -396,6 +426,19 @@ export async function createLibp2pNodeBase(
 		}
 	};
 
+	// The ONE authorization slice, spread verbatim into all four database-protocol service inits
+	// below. Building it once (rather than repeating two option reads per service) is what makes
+	// "secured three surfaces, missed the fourth" impossible: adding a fifth protocol service is a
+	// spread of this object, and dropping it from one is visible at the call site.
+	// Absent `authorizeInboundStream` → every service constructs its gate as `undefined` and the
+	// inbound path is byte-for-byte what it was before this option existed.
+	const inboundAuthorization: InboundStreamAuthorizationInit = {
+		...(options.authorizeInboundStream ? { authorizeInboundStream: options.authorizeInboundStream } : {}),
+		...(options.authorizeInboundStreamTimeoutMs !== undefined
+			? { authorizeInboundStreamTimeoutMs: options.authorizeInboundStreamTimeoutMs }
+			: {})
+	};
+
 	const nodePrivateKey = options.privateKey ?? await generateKeyPair('Ed25519');
 
 	const listenAddrs = options.listenAddrs ?? defaults.listenAddrs;
@@ -492,7 +535,8 @@ export async function createLibp2pNodeBase(
 			cluster: (components: any) => {
 				const serviceFactory = clusterService({
 					protocolPrefix: `/optimystic/${options.networkName}`,
-					responsibilityK: options.responsibilityK ?? 1
+					responsibilityK: options.responsibilityK ?? 1,
+					...inboundAuthorization
 				});
 				return serviceFactory({
 					logger: components.logger,
@@ -518,7 +562,8 @@ export async function createLibp2pNodeBase(
 			repo: (components: any) => {
 				const serviceFactory = repoService({
 					protocolPrefix: `/optimystic/${options.networkName}`,
-					responsibilityK: options.responsibilityK ?? 1
+					responsibilityK: options.responsibilityK ?? 1,
+					...inboundAuthorization
 				});
 				// RepoService.checkRedirect needs the running node (network manager for the
 				// responsible-set computation, self id for the membership check, connection
@@ -538,7 +583,8 @@ export async function createLibp2pNodeBase(
 
 			sync: (components: any) => {
 				const serviceFactory = syncService({
-					protocolPrefix: `/optimystic/${options.networkName}`
+					protocolPrefix: `/optimystic/${options.networkName}`,
+					...inboundAuthorization
 				});
 				return serviceFactory({
 					logger: components.logger,
@@ -552,7 +598,8 @@ export async function createLibp2pNodeBase(
 			// node's own storage, not be re-routed through the cluster-coordinated repo.
 			blockTransfer: (components: any) => {
 				const serviceFactory = blockTransferService({
-					protocolPrefix: `/optimystic/${options.networkName}`
+					protocolPrefix: `/optimystic/${options.networkName}`,
+					...inboundAuthorization
 				});
 				return serviceFactory({
 					registrar: components.registrar,

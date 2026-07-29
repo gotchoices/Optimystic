@@ -1,4 +1,4 @@
-import type { Startable, Stream } from '@libp2p/interface';
+import type { Connection, Startable, Stream } from '@libp2p/interface';
 import type { IRepo, PeerId, IPeerNetwork, ActionId, ActionRev, IBlock, BlockId } from '@optimystic/db-core';
 import { pipe } from 'it-pipe';
 import * as lp from 'it-length-prefixed';
@@ -7,6 +7,7 @@ import { toString as u8ToString } from 'uint8arrays/to-string';
 import { ProtocolClient } from '../protocol-client.js';
 import { MAX_BLOCK_MESSAGE_BYTES } from '../protocol-limits.js';
 import { createLogger } from '../logger.js';
+import { createInboundStreamAuthorization, type InboundStreamAuthorization, type InboundStreamAuthorizationInit } from '../inbound-authorization.js';
 
 const log = createLogger('block-transfer-service');
 
@@ -61,7 +62,7 @@ export interface IBlockReplicaStore extends IRepo {
 	saveReplicatedBlock(blockId: BlockId, block: IBlock, source?: ActionRev): Promise<void>;
 }
 
-export interface BlockTransferServiceInit {
+export interface BlockTransferServiceInit extends InboundStreamAuthorizationInit {
 	protocolPrefix?: string;
 }
 
@@ -81,6 +82,8 @@ export class BlockTransferService implements Startable {
 	private readonly protocol: string;
 	private readonly repo: IBlockReplicaStore;
 	private readonly registrar: BlockTransferServiceComponents['registrar'];
+	/** Optional embedder authorization gate; `undefined` (the default) means no check runs. */
+	private readonly authorization: InboundStreamAuthorization | undefined;
 
 	constructor(
 		components: BlockTransferServiceComponents,
@@ -89,11 +92,12 @@ export class BlockTransferService implements Startable {
 		this.protocol = buildBlockTransferProtocol(init.protocolPrefix ?? '');
 		this.repo = components.repo;
 		this.registrar = components.registrar;
+		this.authorization = createInboundStreamAuthorization(init, this.protocol, (msg, ...args) => log(msg, ...args));
 	}
 
 	async start(): Promise<void> {
 		if (this.running) return;
-		await this.registrar.handle(this.protocol, async (data: any) => {
+		await this.registrar.handle(this.protocol, async (data: any, connection?: Connection) => {
 			// libp2p invokes the stream handler with the Stream as the FIRST positional argument
 			// (see cluster/repo/dispute services, which all use `(stream, connection)`). The block-
 			// transfer handler previously read `data.stream`, which is `undefined` for the positional
@@ -101,7 +105,7 @@ export class BlockTransferService implements Startable {
 			// never replied, and every push/pull dialled this service hung with no response. Unwrap
 			// defensively (older shape passed `{ stream }`), mirroring sync/service.ts.
 			const stream = data?.stream ?? data;
-			await this.handleRequest(stream);
+			await this.handleRequest(stream, connection);
 		});
 		this.running = true;
 		log('started on %s', this.protocol);
@@ -114,9 +118,12 @@ export class BlockTransferService implements Startable {
 		log('stopped');
 	}
 
-	private async handleRequest(stream: Stream): Promise<void> {
+	private async handleRequest(stream: Stream, connection?: Connection): Promise<void> {
 		const self = this;
 		try {
+			// Authorization runs before ANY decoding or execution. Guarded on the field so a
+			// node without a predicate keeps the original path untouched.
+			if (this.authorization && await this.authorization.deny(stream, connection?.remotePeer?.toString())) return;
 			// Read the request, process it, and write the response on ONE continuous duplex
 			// pipe (mirrors cluster/repo/dispute services). The earlier read-to-end-then-write
 			// design deadlocked over a real stream: the client sends one length-prefixed request

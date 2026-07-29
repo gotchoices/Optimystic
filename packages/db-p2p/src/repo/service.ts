@@ -8,6 +8,7 @@ import { encodePeers, type RedirectPayload } from './redirect.js'
 import { MAX_BLOCK_MESSAGE_BYTES } from '../protocol-limits.js'
 import type { Uint8ArrayList } from 'uint8arraylist'
 import { createLogger } from '../logger.js'
+import { createInboundStreamAuthorization, type InboundStreamAuthorization, type InboundStreamAuthorizationInit } from '../inbound-authorization.js'
 
 const debugLog = createLogger('repo-service')
 
@@ -38,7 +39,7 @@ export type RepoServiceComponents = BaseComponents & {
 	libp2p?: Libp2p
 }
 
-export type RepoServiceInit = {
+export type RepoServiceInit = InboundStreamAuthorizationInit & {
 	protocol?: string,
 	protocolPrefix?: string,
 	maxInboundStreams?: number,
@@ -81,6 +82,8 @@ export class RepoService implements Startable {
 	 * self identity, and connection addrs through this explicitly-set reference.
 	 */
 	private libp2pRef: Libp2p | undefined
+	/** Optional embedder authorization gate; `undefined` (the default) means no check runs. */
+	private readonly authorization: InboundStreamAuthorization | undefined
 
 	constructor(components: RepoServiceComponents, init: RepoServiceInit = {}) {
 		this.components = components
@@ -92,6 +95,7 @@ export class RepoService implements Startable {
 		this.repo = components.repo
 		this.running = false
 		this.responsibilityK = init.responsibilityK ?? 1
+		this.authorization = createInboundStreamAuthorization(init, this.protocol, (msg, ...args) => this.log.error(msg, ...args))
 	}
 
 	readonly [Symbol.toStringTag] = '@libp2p/repo-service'
@@ -236,8 +240,8 @@ export class RepoService implements Startable {
 	/**
 	 * Handle incoming streams on the repo protocol
 	 */
-	private handleIncomingStream(stream: Stream, connection: Connection): void {
-		const peerId = connection.remotePeer
+	private handleIncomingStream(stream: Stream, connection?: Connection): void {
+		const peerId = connection?.remotePeer
 
 		const processStream = async function* (this: RepoService, source: AsyncIterable<Uint8ArrayList>) {
 			for await (const msg of source) {
@@ -278,6 +282,9 @@ export class RepoService implements Startable {
 
 		void (async () => {
 			try {
+				// Authorization runs before ANY decoding or execution. Guarded on the field so a
+				// node without a predicate keeps the original path untouched.
+				if (this.authorization && await this.authorization.deny(stream, peerId?.toString())) return
 				const responses = pipe(
 					stream,
 					(source) => lpDecode(source, { maxDataLength: MAX_BLOCK_MESSAGE_BYTES }),

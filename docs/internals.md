@@ -422,7 +422,33 @@ The cluster two-phase commit uses **cryptographic signatures**, not to be confus
 
 This proves that the peers listed in the cluster actually voted — a coordinator cannot forge votes.  The signing and verification flow lives in `ClusterMember`: `signVote` signs the hash+vote payload with the local peer's Ed25519 private key, `verifySignature` reconstructs the public key from `record.peers` via `publicKeyFromRaw` and verifies the signature, and `validateSignatures` runs verification for all promises and commits on every incoming record.  The signing payload includes the vote type and reject reason (if any), preventing vote tampering.
 
-**Important**: cluster authentication is about _identity verification_ (did this peer really vote?), not _authorization_ (is this peer allowed to write?).  Authorization decisions like per-collection permissions belong at a higher layer (e.g. application or collection module), not in the cluster consensus path.
+**Important**: cluster authentication is about _identity verification_ (did this peer really vote?), not _authorization_ (is this peer allowed to write?).  Authorization decisions like per-collection permissions belong at a higher layer (e.g. application or collection module), not in the cluster consensus path.  The one authorization seam this library *does* provide is the coarse per-stream gate below — "may this peer talk to my database at all?" — not per-collection permissions.
+
+## Inbound Stream Authorization
+
+The four database protocols — `repo`, `cluster`, `sync`, `block-transfer` — otherwise go straight from "inbound stream opened" to "decode and execute the operation".  Any peer that can open a connection can therefore issue database operations.  An application embedding this library whose database is *private* (only nodes it admitted may read or write) needs a seam ahead of decoding; `authorizeInboundStream` is it.
+
+```ts
+const node = await createLibp2pNode({
+  /* … */
+  authorizeInboundStream: (remotePeerId, protocol) => memberSet.has(remotePeerId),
+  authorizeInboundStreamTimeoutMs: 5_000  // optional; this is the default
+});
+```
+
+It is **one node-level option threaded to all four services** (`packages/db-p2p/src/libp2p-node-base.ts`, `inboundAuthorization`), not four per-service options: "is this peer allowed to talk to my database?" is a property of the node, not of the protocol, and four independently-settable options make it easy to secure three surfaces and silently miss the fourth.  Each service still accepts the same option in its own init (`RepoServiceInit`, `ClusterServiceInit`, `SyncServiceInit`, `BlockTransferServiceInit` all extend `InboundStreamAuthorizationInit`) so the services stay independently testable and usable outside the node factory.  The gate itself lives in `packages/db-p2p/src/inbound-authorization.ts`.
+
+Semantics:
+
+- **Absent predicate → today's behavior exactly.**  Each service holds `InboundStreamAuthorization | undefined`; when it is `undefined` the handler awaits nothing extra and no gate code runs.  This is the default.
+- **Supplied predicate → fail closed.**  Only a literal `true` allows the stream.  `false`, a throw, a rejection, expiry of the timeout, or an inbound connection with no resolvable remote peer id all **deny**, and denial aborts the stream *before* any frame is decoded or any operation executed.  Failures are logged (via the service's error logger), never swallowed.
+- **Once per inbound stream, not per operation.**  All four protocols are strictly one request per stream — each handler's generator `return`s after the first response, so a second frame queued on the same stream is never read or parsed.  Per-stream and per-operation authorization are therefore equivalent here.  (The `repo` protocol's `RepoMessage.operations` is an array, but the handler executes `operations[0]` only.)  A single `commit`/`pend`/`pull`/`push` may still name many block ids; the gate is not a per-block ACL.
+- **Peer id encoding**: the predicate receives `connection.remotePeer.toString()` — the libp2p base58btc/CIDv1 string (`12D3KooW…`).  Compare against that, never against a multiaddr or a raw public key.
+- **What a caller observes**: a stream reset.  Denial is deliberately *not* reported on the wire — telling an unauthorized peer "you are not a member" confirms membership state to exactly the party the embedder decided not to trust, and the four protocols have four different response shapes with no common error frame.  The denial is loud on the *denying* node instead: logged with peer id, protocol and reason, and the stream is aborted with an `UnauthorizedInboundStreamError` carrying `ERR_INBOUND_STREAM_UNAUTHORIZED`.
+- **Self-dials never reach the gate.**  libp2p refuses to dial self at three layers (connection manager, dial queue, upgrader), and every internal caller short-circuits self before dialling anyway (`ClusterCoordinator.updateMember`, `clusterLatestCallback`, `fetchArchiveFromPeer`, `RestorationCoordinator`, `SpreadOnChurnMonitor`).  An embedder predicate that only knows about remote members will therefore never deny its own node.
+- **Cost**: the predicate sits in the hot path of every inbound stream.  Keep it to an in-memory lookup; memoize anything that would otherwise hit storage or the network per stream.
+
+**Scope**: the four database protocols only.  The reactivity, matchmaking, cohort-topic and libp2p built-in (`identify`/`ping`/`dcutr`/…) protocols the same node registers are *not* gated by this option.
 
 ### Equivocation Detection
 

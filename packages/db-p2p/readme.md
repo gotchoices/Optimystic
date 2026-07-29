@@ -336,6 +336,23 @@ const keyNetwork = new Libp2pKeyPeerNetwork(node);
 - **Peer Discovery**: Integrates with libp2p DHT for peer discovery
 - **Security**: Leverages libp2p's cryptographic peer identity
 
+**Inbound stream authorization (optional).** The `repo`, `cluster`, `sync` and `block-transfer`
+protocols are open to any peer that can connect. An embedder whose database is private supplies one
+node-level, fail-closed predicate, consulted once per inbound stream before any decoding or execution:
+
+```typescript
+const node = await createLibp2pNode({
+  networkName: 'my-net',
+  bootstrapNodes: [],
+  // remotePeerId is the dialing peer's PeerId.toString(); only a literal `true` allows.
+  // false / throw / rejection / timeout all deny and abort the stream.
+  authorizeInboundStream: (remotePeerId, protocol) => memberSet.has(remotePeerId)
+});
+```
+
+Omitting it is the default and leaves behavior unchanged. See
+[internals](../../docs/internals.md) § Inbound Stream Authorization for the full contract.
+
 ## Usage Examples
 
 ### Setting Up a Coordinator Node

@@ -7,6 +7,7 @@ import { encodePeers, type RedirectPayload } from '../repo/redirect.js';
 import { toClusterErrorEnvelope } from './cluster-error.js';
 import { MAX_CONTROL_MESSAGE_BYTES } from '../protocol-limits.js';
 import type { Uint8ArrayList } from 'uint8arraylist';
+import { createInboundStreamAuthorization, type InboundStreamAuthorization, type InboundStreamAuthorizationInit } from '../inbound-authorization.js';
 
 interface BaseComponents {
 	logger: { forComponent: (name: string) => Logger },
@@ -31,7 +32,7 @@ export interface ClusterServiceComponents extends BaseComponents {
 	getConnectionAddrs?: (peerId: PeerId) => string[]
 }
 
-export interface ClusterServiceInit {
+export interface ClusterServiceInit extends InboundStreamAuthorizationInit {
 	protocol?: string,
 	protocolPrefix?: string,
 	maxInboundStreams?: number,
@@ -65,6 +66,8 @@ export class ClusterService implements Startable {
 	private running: boolean;
 	/** Responsibility K - small-mesh bypass threshold for redirect decisions */
 	private readonly responsibilityK: number;
+	/** Optional embedder authorization gate; `undefined` (the default) means no check runs. */
+	private readonly authorization: InboundStreamAuthorization | undefined;
 
 	constructor(components: ClusterServiceComponents, init: ClusterServiceInit = {}) {
 		this.components = components;
@@ -75,6 +78,7 @@ export class ClusterService implements Startable {
 		this.cluster = components.cluster;
 		this.running = false;
 		this.responsibilityK = init.responsibilityK ?? 1;
+		this.authorization = createInboundStreamAuthorization(init, this.protocol, (msg, ...args) => this.log.error(msg, ...args));
 	}
 
 	readonly [Symbol.toStringTag] = '@libp2p/cluster';
@@ -180,8 +184,8 @@ export class ClusterService implements Startable {
 		throw new Error(`Unknown operation: ${message.operation}`);
 	}
 
-	private handleIncomingStream(stream: Stream, connection: Connection): void {
-		const peerId = connection.remotePeer;
+	private handleIncomingStream(stream: Stream, connection?: Connection): void {
+		const peerId = connection?.remotePeer;
 
 		const processStream = async function* (this: ClusterService, source: AsyncIterable<Uint8ArrayList>) {
 			for await (const msg of source) {
@@ -215,6 +219,9 @@ export class ClusterService implements Startable {
 
 		void (async () => {
 			try {
+				// Authorization runs before ANY decoding or execution. Guarded on the field so a
+				// node without a predicate keeps the original path untouched.
+				if (this.authorization && await this.authorization.deny(stream, peerId?.toString())) return;
 				const responses = pipe(
 					stream,
 					(source) => lpDecode(source, { maxDataLength: MAX_CONTROL_MESSAGE_BYTES }),

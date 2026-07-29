@@ -157,6 +157,11 @@ If PEND detects stale reads or a conflicting concurrent transaction, the coordin
 `{prefix}` is `/optimystic/<network>` for a node built by `createLibp2pNode` — the full id inventory
 and the conventions behind it are in `packages/db-p2p/docs/repo.md` § Protocol id conventions.
 
+These protocols are open to any peer that can connect. An embedder whose database is private can
+supply `createLibp2pNode({ authorizeInboundStream })` — one optional, fail-closed predicate consulted
+once per inbound stream on the `repo`, `cluster`, `sync` and `block-transfer` protocols, before any
+decoding or execution. See [internals](internals.md) § Inbound Stream Authorization.
+
 ```mermaid
 graph LR
     Client[Client Process] -->|/db-p2p/repo| Coord[Coordinator Node]
