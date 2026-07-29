@@ -4,11 +4,16 @@ import { encode as lpEncode } from 'it-length-prefixed';
 import all from 'it-all';
 import { generateKeyPair } from '@libp2p/crypto/keys';
 import { peerIdFromPrivateKey } from '@libp2p/peer-id';
+import { pushable } from 'it-pushable';
 import type { PeerId } from '@libp2p/interface';
+import type { BlockHeader, BlockId } from '@optimystic/db-core';
 import { ClusterService } from '../src/cluster/service.js';
 import { RepoService } from '../src/repo/service.js';
 import { SyncService } from '../src/sync/service.js';
-import { BlockTransferService, type IBlockReplicaStore } from '../src/cluster/block-transfer-service.js';
+import { BlockStorage } from '../src/storage/block-storage.js';
+import { MemoryRawStorage } from '../src/storage/memory-storage.js';
+import { StorageRepo } from '../src/storage/storage-repo.js';
+import { BlockTransferClient, BlockTransferService, type IBlockReplicaStore } from '../src/cluster/block-transfer-service.js';
 import {
 	INBOUND_STREAM_UNAUTHORIZED_CODE,
 	UnauthorizedInboundStreamError,
@@ -184,16 +189,13 @@ const SERVICE_CASES: ServiceCase[] = [
 		protocol: `${PREFIX}/db-p2p/block-transfer/1.0.0`,
 		async build(init) {
 			const repo = { calls: 0, async get() { repo.calls++; return {}; }, async saveReplicatedBlock() { repo.calls++; } } as unknown as IBlockReplicaStore & { calls: number };
-			const { errors } = makeLogger();
+			const { logger, errors } = makeLogger();
 			const { registrar, getHandler } = capturingRegistrar();
-			const service = new BlockTransferService({ registrar, repo }, { protocolPrefix: PREFIX, ...init });
+			const service = new BlockTransferService({ registrar, repo, logger }, { protocolPrefix: PREFIX, ...init });
 			await service.start();
 			const mock = makeMockStream(await encodeMessages({ type: 'pull', blockIds: ['block-1'], reason: 'rebalance' }));
 			return {
 				mock,
-				// BlockTransferService has no injectable component logger — its authorization sink is
-				// the module-level `optimystic:db-p2p:block-transfer-service` debug logger, so nothing
-				// is captured here. Denial itself is still asserted for this service below.
 				errors,
 				executions: () => repo.calls,
 				drive: async (connection) => { await getHandler()(mock.stream as any, connection as any); await mock.finished; },
@@ -296,10 +298,9 @@ describe('inbound stream authorization', () => {
 		});
 	}
 
-	// The three services with an injectable component logger route the gate's diagnostics through
-	// `log.error`. block-transfer logs to its module-level debug logger instead (see its case above),
-	// so it is excluded here rather than asserted with a weaker check.
-	for (const svc of SERVICE_CASES.filter(s => s.name !== 'block-transfer')) {
+	// All four services route the gate's diagnostics through the component logger's `error` sink,
+	// so an embedder sees denials on the same channel as every other service error.
+	for (const svc of SERVICE_CASES) {
 		describe(`${svc.name} service logging`, () => {
 			it('logs the predicate failure rather than swallowing it', async () => {
 				const driven = await svc.build({
@@ -321,4 +322,95 @@ describe('inbound stream authorization', () => {
 			});
 		});
 	}
+});
+
+/**
+ * The gate from the *dialing client's* side, over a real request/response round trip.
+ *
+ * The per-service cases above drive handlers with a scripted mock stream, which proves the
+ * server never executes a denied operation but cannot show what the caller ends up with. Here a
+ * real `BlockTransferClient` talks to a real `BlockTransferService` across a linked duplex pair
+ * (the harness from `block-transfer-roundtrip.spec.ts`), so two things the unit cases leave open
+ * are pinned down: an *authorized* request still round-trips intact with the gate installed, and
+ * a *denied* one fails the caller promptly instead of hanging until its response deadline.
+ */
+function makeLinkedPair() {
+	const toServer = pushable<any>({ objectMode: true });
+	const toClient = pushable<any>({ objectMode: true });
+	const clientStream = {
+		send: (chunk: any) => { toServer.push(chunk); },
+		close: async () => { toServer.end(); },
+		abort: (err?: Error) => { toServer.end(err); toClient.end(err); },
+		async *[Symbol.asyncIterator]() { yield* toClient; },
+	};
+	const serverStream = {
+		send: (chunk: any) => { toClient.push(chunk); },
+		close: async () => { toClient.end(); },
+		abort: (err?: Error) => { toClient.end(err); toServer.end(err); },
+		async *[Symbol.asyncIterator]() { yield* toServer; },
+	};
+	return { clientStream, serverStream };
+}
+
+describe('inbound stream authorization — what the dialing client observes', () => {
+	const BLOCK_ID = 'authz-roundtrip-1' as BlockId;
+
+	/** A started block-transfer service reachable through a `BlockTransferClient`. */
+	async function wire(init: { authorizeInboundStream?: AuthorizeInboundStream }, clientPeerId: PeerId) {
+		const rawStorage = new MemoryRawStorage();
+		const repo = new StorageRepo((blockId) => new BlockStorage(blockId, rawStorage));
+		await repo.saveReplicatedBlock(BLOCK_ID, {
+			header: { id: BLOCK_ID, type: 'test', collectionId: 'col-1' as BlockId } as BlockHeader
+		});
+
+		const { logger } = makeLogger();
+		const { registrar, getHandler } = capturingRegistrar();
+		const service = new BlockTransferService({ registrar, repo, logger }, { protocolPrefix: PREFIX, ...init });
+		await service.start();
+
+		const peerNetwork = {
+			async connect() {
+				const { clientStream, serverStream } = makeLinkedPair();
+				// Not awaited — mirrors how libp2p invokes a stream handler, with the connection
+				// object the registrar passes as the second argument.
+				void Promise.resolve()
+					.then(() => getHandler()(serverStream, { remotePeer: clientPeerId }))
+					.catch(() => { /* the handler aborts its own stream */ });
+				return clientStream;
+			},
+		};
+		return { service, client: new BlockTransferClient(clientPeerId, peerNetwork as any) };
+	}
+
+	it('an authorized pull still round-trips the block intact through the gate', async function () {
+		this.timeout(4000);
+		const peerId = await makePeerId();
+		const { service, client } = await wire({ authorizeInboundStream: () => true }, peerId);
+		try {
+			const response = await client.pullBlocks([BLOCK_ID], 'replication');
+			expect(response.blocks, 'the gate must not disturb the response framing').to.have.property(BLOCK_ID);
+			expect(response.missing).to.deep.equal([]);
+		} finally {
+			await service.stop();
+		}
+	});
+
+	it('a denied pull fails the caller promptly rather than hanging', async function () {
+		// Well under BlockTransferClient's own response deadline: a denial must surface as a
+		// stream teardown, not as a request that sits open until it times out.
+		this.timeout(4000);
+		const peerId = await makePeerId();
+		const { service, client } = await wire({ authorizeInboundStream: () => false }, peerId);
+		try {
+			const started = Date.now();
+			await client.pullBlocks([BLOCK_ID], 'replication')
+				.then(
+					() => { throw new Error('a denied pull must not resolve with a response'); },
+					() => { /* any rejection is correct: the remote only ever sees a reset */ }
+				);
+			expect(Date.now() - started, 'the denial surfaces immediately, not on a timeout').to.be.lessThan(2000);
+		} finally {
+			await service.stop();
+		}
+	});
 });

@@ -32,6 +32,12 @@
  * - **Cost**: the predicate sits in the hot path of every inbound stream, ahead of the work
  *   that stream would do. Embedders are expected to make it cheap — an in-memory set lookup —
  *   and to memoize anything that would otherwise hit storage or the network per stream.
+ *
+ * NOTE: denial is stateless and unthrottled — a denied peer may reopen streams as fast as
+ * libp2p's per-connection `maxInboundStreams` allows, and nothing here records the denial. That
+ * is fine while the predicate is an in-memory lookup. If a denied peer ever shows up as load, the
+ * fix is upstream of this module, not inside it: feed denials into `PeerReputationService`, or
+ * refuse the peer at the connection level with `NodeOptions.connectionGater`.
  */
 
 /**

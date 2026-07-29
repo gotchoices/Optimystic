@@ -305,9 +305,10 @@ export type NodeOptions = {
 	 * dialing peer's `PeerId.toString()`. See {@link AuthorizeInboundStream} and
 	 * `docs/internals.md` § Inbound Stream Authorization.
 	 *
-	 * NOTE: this covers the four database protocols only. The reactivity, matchmaking,
+	 * NOTE: this covers the four database protocols only. The dispute, reactivity, matchmaking,
 	 * cohort-topic and libp2p built-in (identify/ping/…) protocols this node also registers are
-	 * NOT gated by it.
+	 * NOT gated by it. To refuse a peer at the connection level instead — every protocol at once,
+	 * including identify — use {@link NodeOptions.connectionGater}.
 	 */
 	authorizeInboundStream?: AuthorizeInboundStream;
 
@@ -603,7 +604,9 @@ export async function createLibp2pNodeBase(
 				});
 				return serviceFactory({
 					registrar: components.registrar,
-					repo: storageRepo
+					repo: storageRepo,
+					// So this service's authorization denials reach the same error sink as the other three.
+					logger: components.logger
 				});
 			},
 

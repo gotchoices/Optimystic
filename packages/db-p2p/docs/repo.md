@@ -257,6 +257,14 @@ These ids are locked by `test/identify-protocol-id.spec.ts` (in-process) and
 `test/foreign-peer-interop.integration.spec.ts` (from a peer built outside this repository, which is
 the only place a uniformly-wrong convention can be caught).
 
+**Four of these ids may be closed to you.** `cluster`, `repo`, `sync` and `block transfer` are the
+database protocols, and a node built with `createLibp2pNode({ authorizeInboundStream })` consults
+that predicate before decoding anything on them. A peer it refuses sees the stream reset with no
+error frame — remotely indistinguishable from a transport fault, so if you are building an external
+peer and every database dial resets while `identify` and `ping` work, suspect the gate rather than
+the protocol id. See `docs/internals.md` § Inbound Stream Authorization. Nodes built without that
+option (the default) serve all four to anyone who can connect.
+
 ### Peer classification
 
 `Libp2pKeyPeerNetwork.membershipOf` classifies every peer from its advertised protocol list alone:

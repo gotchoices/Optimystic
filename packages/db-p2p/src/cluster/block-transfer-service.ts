@@ -69,6 +69,12 @@ export interface BlockTransferServiceInit extends InboundStreamAuthorizationInit
 export interface BlockTransferServiceComponents {
 	registrar: { handle: (...args: any[]) => Promise<void>; unhandle: (...args: any[]) => Promise<void> };
 	repo: IBlockReplicaStore;
+	/**
+	 * Optional libp2p component logger. Supplied by the node factory so authorization denials
+	 * land on the same `logger.forComponent(...).error` sink as the repo/cluster/sync services;
+	 * without it they fall back to this module's `debug` logger.
+	 */
+	logger?: { forComponent: (name: string) => { error: (message: string, ...args: unknown[]) => void } };
 }
 
 /**
@@ -92,7 +98,9 @@ export class BlockTransferService implements Startable {
 		this.protocol = buildBlockTransferProtocol(init.protocolPrefix ?? '');
 		this.repo = components.repo;
 		this.registrar = components.registrar;
-		this.authorization = createInboundStreamAuthorization(init, this.protocol, (msg, ...args) => log(msg, ...args));
+		const componentLog = components.logger?.forComponent('db-p2p:block-transfer');
+		this.authorization = createInboundStreamAuthorization(init, this.protocol,
+			componentLog ? (msg, ...args) => componentLog.error(msg, ...args) : (msg, ...args) => log(msg, ...args));
 	}
 
 	async start(): Promise<void> {

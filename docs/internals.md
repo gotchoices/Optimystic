@@ -466,7 +466,7 @@ Semantics:
 - **Self-dials never reach the gate.**  libp2p refuses to dial self at three layers (connection manager, dial queue, upgrader), and every internal caller short-circuits self before dialling anyway (`ClusterCoordinator.updateMember`, `clusterLatestCallback`, `fetchArchiveFromPeer`, `RestorationCoordinator`, `SpreadOnChurnMonitor`).  An embedder predicate that only knows about remote members will therefore never deny its own node.
 - **Cost**: the predicate sits in the hot path of every inbound stream.  Keep it to an in-memory lookup; memoize anything that would otherwise hit storage or the network per stream.
 
-**Scope**: the four database protocols only.  The reactivity, matchmaking, cohort-topic and libp2p built-in (`identify`/`ping`/`dcutr`/…) protocols the same node registers are *not* gated by this option.
+**Scope**: the four database protocols only.  The `dispute` protocol (`packages/db-p2p/src/dispute/service.ts`, which asks this node to vote on a challenge) and the reactivity, matchmaking, cohort-topic and libp2p built-in (`identify`/`ping`/`dcutr`/…) protocols the same node registers are *not* gated by this option.  To refuse a peer across *every* protocol at once, including `identify`, use the connection-level `connectionGater` option instead (`NodeOptions.connectionGater` → libp2p's `denyInboundConnection`); the two are complementary — the gater decides whether to talk to a peer at all, this hook decides whether an already-connected peer may touch the database.
 
 ### Equivocation Detection
 
