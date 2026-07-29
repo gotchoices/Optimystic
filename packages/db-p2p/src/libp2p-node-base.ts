@@ -793,7 +793,13 @@ export async function createLibp2pNodeBase(
 		storageRepo,
 		localCluster: clusterImpl,
 		localPeerId: node.peerId,
-		clusterLatestCallback
+		clusterLatestCallback,
+		// Read-driven acquisition shares the commit path's reconcile callback verbatim: same bounded
+		// archive fetch, same (rev, actionId) and content quorums, same monotonic saveReplicatedBlock
+		// funnel. `clusterLatestCallback` alone can only tell the reader WHICH revision the cohort
+		// holds; this is what moves the bytes. Only reached once a corroborated revision exists, so a
+		// genuinely absent block still costs no archive fetch.
+		acquireBlockFromCohort: reconcileBlock
 	});
 
 	// Fail-fast coupling: the cluster member (what accepts a super-majority as sufficient) and the

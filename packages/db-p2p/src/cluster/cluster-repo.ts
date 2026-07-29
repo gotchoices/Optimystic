@@ -18,6 +18,7 @@ import type { IPeerReputation } from "../reputation/types.js";
 import { PenaltyReason } from "../reputation/types.js";
 import type { ITransactionStateStore } from "./i-transaction-state-store.js";
 import { isMissingBaseRevisionFailure } from "../storage/storage-repo.js";
+import { RECONCILE_TIMEOUT_MS } from "./reconcile-block.js";
 
 const log = createLogger('cluster-member')
 
@@ -177,7 +178,8 @@ const ExecutedTransactionTtlMs = 10 * 60 * 1000;
 // Upper bound on an awaited active reconciliation of a divergent commit. Bounds the
 // consensus path so a slow/unreachable cohort peer can't stall the cluster stream;
 // a timeout is logged and tolerated (never thrown — that would reset the stream).
-const ReconcileTimeoutMs = 5000;
+// Shared with the read path's acquisition (see RECONCILE_TIMEOUT_MS) — same operation, same bound.
+const ReconcileTimeoutMs = RECONCILE_TIMEOUT_MS;
 
 /**
  * True when a thrown storage error reports a missing pending action — i.e. this

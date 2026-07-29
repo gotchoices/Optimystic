@@ -10,8 +10,41 @@ import type { IPeerReputation } from "../reputation/types.js";
 import { PenaltyReason } from "../reputation/types.js";
 import type { ITransactionStateStore } from "../cluster/i-transaction-state-store.js";
 import { quorumSize, selectQuorumRev, type RevClaim, type QuorumRev } from "../cluster/quorum-restore.js";
+import { RECONCILE_TIMEOUT_MS } from "../cluster/reconcile-block.js";
+import type { ReconcileBlockCallback } from "../cluster/cluster-repo.js";
 
 const log = createLogger('coordinator-repo');
+
+/**
+ * Acquire a block's content for a cohort-corroborated revision, from the cohort, and persist it.
+ *
+ * Deliberately the SAME shape as the commit path's {@link ReconcileBlockCallback}, and in the live
+ * node the very same instance (`libp2p-node-base` passes its `reconcileBlock` to both): read-driven
+ * acquisition needs exactly what reconcile already provides — a per-peer-bounded archive fetch, a
+ * quorum vote on the target `(rev, actionId)`, a quorum vote on the *content* at that revision, and a
+ * persist through the monotonic, commit-latched `StorageRepo.saveReplicatedBlock` funnel. Reusing it
+ * is what keeps read-repair from being a weaker trust path than reconcile.
+ */
+export type AcquireBlockCallback = ReconcileBlockCallback;
+
+/** True when a freshly-read local revision is strictly ahead of the baseline the repair started from. */
+function isAdvanceOver(rev: number | undefined, baseline: ActionRev | undefined): boolean {
+	return typeof rev === 'number' && (baseline === undefined || rev > baseline.rev);
+}
+
+/**
+ * Reject if `promise` has not settled within `ms`. The timer is cleared on either outcome, so no
+ * handle outlives the race (hence no `unref`, which does not exist off Node).
+ */
+function withDeadline<T>(promise: Promise<T>, ms: number, label: string): Promise<T> {
+	let timer: ReturnType<typeof setTimeout> | undefined;
+	const deadline = new Promise<never>((_, reject) => {
+		timer = setTimeout(() => reject(new Error(`${label} timed out after ${ms}ms`)), ms);
+	});
+	return Promise.race([promise, deadline]).finally(() => {
+		if (timer !== undefined) clearTimeout(timer);
+	});
+}
 
 /**
  * What one round of polling the cohort learned about a block: the revision the OTHER
@@ -50,6 +83,13 @@ interface CoordinatorRepoComponents {
 	 * Used for read-path cluster verification to discover unknown revisions.
 	 */
 	clusterLatestCallback?: ClusterLatestCallback;
+	/**
+	 * Optional callback that actually moves a block's bytes from the cohort into local storage once
+	 * {@link clusterLatestCallback} has established a corroborated revision this node lacks. Absent →
+	 * the read path can still *select* the right revision but converges only when the node already
+	 * holds the corroborated action as a promotable pending. See {@link AcquireBlockCallback}.
+	 */
+	acquireBlockFromCohort?: AcquireBlockCallback;
 }
 
 export function coordinatorRepo(
@@ -70,7 +110,8 @@ export function coordinatorRepo(
 		fretService,
 		components.clusterLatestCallback,
 		reputation,
-		stateStore
+		stateStore,
+		components.acquireBlockFromCohort
 	);
 }
 
@@ -107,7 +148,8 @@ export class CoordinatorRepo implements IRepo {
 		fretService?: FretService,
 		private readonly clusterLatestCallback?: ClusterLatestCallback,
 		reputation?: IPeerReputation,
-		stateStore?: ITransactionStateStore
+		stateStore?: ITransactionStateStore,
+		private readonly acquireBlockFromCohort?: AcquireBlockCallback
 	) {
 		this.localPeerId = localPeerId;
 		const policy: ClusterConsensusConfig & { clusterSize: number } = {
@@ -344,25 +386,107 @@ export class CoordinatorRepo implements IRepo {
 			return;
 		}
 
-		// Corroborated revision is ahead of ours — trigger restoration to sync the block.
-		const restored = await this.storageRepo.get({ blockIds: [blockId], context: { committed: [corroborated], rev: corroborated.rev } });
-		const restoredRev = restored[blockId]?.state?.latest?.rev;
+		// Corroborated revision is ahead of ours — converge onto it.
+		const rev = await this.restoreCorroborated(blockId, corroborated, local, peerIds);
 
-		// Log the OUTCOME, not the attempt. The restore above only moves data when this node already
-		// holds the corroborated action as a local pending it can promote; otherwise it is a no-op and
-		// the block stays behind. Logging `synced` unconditionally reported hundreds of phantom
-		// convergences per run and made a real replication defect invisible for two debugging sessions.
-		if (typeof restoredRev === 'number' && (local === undefined || restoredRev > local.rev)) {
-			log('cluster-fetch:synced', { blockId, rev: restoredRev });
+		// Log the OUTCOME, not the attempt. Logging `synced` unconditionally reported hundreds of
+		// phantom convergences per run and made a real replication defect invisible for two debugging
+		// sessions.
+		if (rev !== undefined) {
+			log('cluster-fetch:synced', { blockId, rev });
 		} else {
 			log('cluster-fetch:not-restored', { blockId, localRev: local?.rev, clusterRev: corroborated.rev });
 		}
-		// NOTE: the block is marked seen either way — the cohort DID answer, so its freshness was
-		// checked, which is what the read-repair window tracks. That does suppress a retry for the
-		// window even though the block is still behind; whether a failed transfer should stay eligible
-		// is owned by ticket `read-repair-cannot-transfer-block-content`, which also supplies the
-		// transfer that would make this branch succeed.
+		// The block is marked seen either way — the cohort DID answer, so its freshness was checked,
+		// which is what the read-repair window tracks. A failed convergence therefore waits out the
+		// window before retrying.
+		// NOTE: that damping covers only a block this node holds at an OLDER revision. A block entirely
+		// missing locally never consults the window (`get` triggers on `isMissing` before
+		// `shouldReadRepair`), so a persistently failing acquisition — e.g. a two-node deployment left
+		// at the default `clusterSize: 10`, where the content quorum can never be met — re-fetches an
+		// archive on every read of that block. Correct, and self-limiting once the cohort can agree; if
+		// it ever shows as read amplification, gate the acquisition step (not the latest-query) on the
+		// same window rather than widening `isMissing`.
 		this.markBlocksSeen([blockId]);
+	}
+
+	/**
+	 * Bring this node up to the cohort-corroborated `corroborated`, returning the revision it holds
+	 * afterwards when that is an advance over `local`, else `undefined`.
+	 *
+	 * Two mechanisms, cheapest first:
+	 *  1. **Promote a local pending** — free, no network, and the only mechanism that existed before
+	 *     block acquisition. Covers the node that saw the pend and missed the commit broadcast.
+	 *  2. **Acquire the bytes from the cohort** ({@link AcquireBlockCallback}) — covers everything else,
+	 *     including a block this node has never seen at all.
+	 *
+	 * **Why acquisition is gated here and not on a plain local miss.** `BlockStorage.getBlock` returns
+	 * `undefined` for a block with no local metadata *without* consulting its restore callback, so that
+	 * an insert probing a fresh random block id for a collision does not cost a network fetch. That
+	 * remains true: this method runs only after {@link queryClusterForLatest} produced a quorum-
+	 * corroborated `(rev, actionId)`, which a genuinely non-existent block can never produce (no peer
+	 * claims it, so `selectQuorumRev` declines and `fetchBlockFromCluster` returns before reaching
+	 * here). The cost of a genuine absence is unchanged — the latest-query round trip that already
+	 * happened — while a block the cohort demonstrably holds is no longer thrown away.
+	 *
+	 * Cohort peer ids are passed straight through: the callback filters self out and caps its own
+	 * corroboration quorum by how many peers could answer at all.
+	 */
+	private async restoreCorroborated(
+		blockId: BlockId,
+		corroborated: ActionRev,
+		local: ActionRev | undefined,
+		cohortPeerIds: string[]
+	): Promise<number | undefined> {
+		const promoted = await this.promoteCorroborated(blockId, corroborated);
+		if (isAdvanceOver(promoted, local)) {
+			return promoted;
+		}
+
+		if (!this.acquireBlockFromCohort) {
+			return undefined;
+		}
+		try {
+			// Bounded: a stalled cohort peer must not hold up the caller's read. Persisting happens
+			// inside the callback via `saveReplicatedBlock`, which takes the per-block commit latch —
+			// safe to call from here because the read path holds no latch of its own (`StorageRepo.get`
+			// acquires and releases it around the promotion above, and nothing wraps this method).
+			await withDeadline(
+				this.acquireBlockFromCohort(blockId, corroborated, cohortPeerIds),
+				RECONCILE_TIMEOUT_MS,
+				`block acquisition for ${blockId}`
+			);
+		} catch (err) {
+			// Declines are cheap and retryable — nothing was persisted. Report and leave the block behind.
+			log('cluster-fetch:acquire-error', { blockId, rev: corroborated.rev, error: (err as Error).message });
+			return undefined;
+		}
+		const acquired = await this.readLocalRev(blockId);
+		return isAdvanceOver(acquired, local) ? acquired : undefined;
+	}
+
+	/**
+	 * Promote a corroborated action this node already holds as a local pending — the no-network half of
+	 * the repair. Returns the local revision afterwards.
+	 *
+	 * A pending-only block (metadata seeded by `savePendingTransaction`, no committed revision) asked
+	 * for a forward revision throws out of `BlockStorage.ensureRevision` when no restore can supply it.
+	 * On THIS path that is an absence, not a read failure — acquisition is precisely the mechanism that
+	 * can supply it — so the throw is logged and swallowed rather than short-circuiting the caller.
+	 */
+	private async promoteCorroborated(blockId: BlockId, corroborated: ActionRev): Promise<number | undefined> {
+		try {
+			return await this.readLocalRev(blockId, { committed: [corroborated], rev: corroborated.rev });
+		} catch (err) {
+			log('cluster-fetch:promote-unavailable', { blockId, rev: corroborated.rev, error: (err as Error).message });
+			return undefined;
+		}
+	}
+
+	/** This node's own `latest.rev` for a block, optionally driving a promotion context through the read. */
+	private async readLocalRev(blockId: BlockId, context?: ActionContext): Promise<number | undefined> {
+		const result = await this.storageRepo.get({ blockIds: [blockId], context });
+		return result[blockId]?.state?.latest?.rev;
 	}
 
 	/**

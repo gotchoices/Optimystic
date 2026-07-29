@@ -1,18 +1,19 @@
 /**
- * Ticket: bug-read-repair-unrepairable-small-cluster.
+ * Tickets: bug-read-repair-unrepairable-small-cluster, read-repair-cannot-transfer-block-content.
  *
  * Selecting the right revision is necessary for read-repair, but it is not the same
  * thing as converging. Every other read-repair spec in this package stubs `IRepo`, so it
  * can only observe that a restoration call was *made* with the right context. This spec
  * wires two nodes' REAL `StorageRepo`/`BlockStorage` over an in-process stand-in for the
- * sync protocol (`serveArchive` mirrors `SyncService.buildArchive`, and node B's
- * `restoreCallback` plays the part of `RestorationCoordinator`) and then asks the only
- * question that matters: after the read, does the lagging node actually hold the newer
- * block?
+ * sync protocol (`serveArchive` mirrors `SyncService.buildArchive`, node B's
+ * `restoreCallback` plays the part of `RestorationCoordinator`, and B's
+ * `acquireBlockFromCohort` is the real `createReconcileBlock` over that same stand-in, as
+ * `libp2p-node-base` wires it) and then asks the only question that matters: after the read,
+ * does the lagging node actually hold the newer block?
  *
- * It does not. The specs below pin what the read path really does today so the gap is
- * visible in the test output rather than only in a document — see
- * `tickets/fix/read-repair-cannot-transfer-block-content.md`.
+ * It now does — for a stale block AND for one it had never seen. The last spec pins the
+ * boundary that keeps that affordable: a block no peer claims corroborates nothing, so it
+ * never reaches the archive fetch.
  */
 
 import { expect } from 'chai';
@@ -29,6 +30,7 @@ import { MemoryRawStorage } from '../src/storage/memory-storage.js';
 import { StorageRepo } from '../src/storage/storage-repo.js';
 import type { BlockArchive, RestoreCallback } from '../src/storage/struct.js';
 import { CoordinatorRepo, type ClusterLatestCallback } from '../src/repo/coordinator-repo.js';
+import { createReconcileBlock } from '../src/cluster/reconcile-block.js';
 import type { ClusterClient } from '../src/cluster/client.js';
 import { captureLog, hasTag, hasTagAtRev } from './support/capture-log.js';
 
@@ -111,8 +113,12 @@ const latestFromArchive = (archive: BlockArchive | undefined): ActionRev | undef
 describe('CoordinatorRepo read-repair CONTENT convergence', function () {
 	this.timeout(5_000);
 
-	/** Node A holds rev 2; node B stopped at rev 1. B reads and tries to repair itself from A. */
-	const buildDivergedPair = async () => {
+	/**
+	 * Node A holds rev 2. Node B either stopped at rev 1 (`seedB: true`, the default — a CONTENT gap)
+	 * or has never seen the block at all (`seedB: false` — the case that blocks a fresh reader from
+	 * ever opening a collection whose header block it missed). B then reads and repairs itself from A.
+	 */
+	const buildDivergedPair = async ({ seedB = true }: { seedB?: boolean } = {}) => {
 		const aStorage = new MemoryRawStorage();
 		const bStorage = new MemoryRawStorage();
 
@@ -122,9 +128,9 @@ describe('CoordinatorRepo read-repair CONTENT convergence', function () {
 		const restoreFromA: RestoreCallback = async (blockId) => await serveArchive(aRepo, blockId);
 		const bRepo = new StorageRepo(id => new BlockStorage(id, bStorage, restoreFromA));
 
-		// Both land rev 1 from the same action; only A goes on to rev 2.
+		// A lands rev 1 then rev 2; B lands only rev 1, and only when seeded.
 		await writeRevision(aRepo, 'action-1' as ActionId, 1, 'v1');
-		await writeRevision(bRepo, 'action-1' as ActionId, 1, 'v1');
+		if (seedB) await writeRevision(bRepo, 'action-1' as ActionId, 1, 'v1');
 		await writeRevision(aRepo, 'action-2' as ActionId, 2, 'v2');
 
 		const peerA = await makePeerId();
@@ -141,6 +147,20 @@ describe('CoordinatorRepo read-repair CONTENT convergence', function () {
 			return latestFromArchive(await serveArchive(aRepo, blockId));
 		};
 
+		// Counts the archive fetches the acquisition path costs, so a spec can assert that a
+		// genuinely-absent block pays for none.
+		let archiveFetches = 0;
+		const acquireBlockFromCohort = createReconcileBlock({
+			selfPeerId: peerB.toString(),
+			fetchArchive: async (peerIdStr, blockId) => {
+				archiveFetches++;
+				return peerIdStr === peerA.toString() ? await serveArchive(aRepo, blockId) : undefined;
+			},
+			saveReplicatedBlock: (blockId, block, source) => bRepo.saveReplicatedBlock(blockId, block, source),
+			simpleMajorityThreshold: 0.51,
+			clusterSize: 2
+		});
+
 		const bCoordinator = new CoordinatorRepo(
 			makeKeyNetwork(cluster),
 			makeClusterClient,
@@ -149,10 +169,13 @@ describe('CoordinatorRepo read-repair CONTENT convergence', function () {
 			undefined,
 			peerB,
 			undefined,
-			clusterLatestCallback
+			clusterLatestCallback,
+			undefined,
+			undefined,
+			acquireBlockFromCohort
 		);
 
-		return { aRepo, bRepo, bCoordinator };
+		return { aRepo, bRepo, bCoordinator, archiveFetches: () => archiveFetches };
 	};
 
 	it('sanity: the two nodes really are diverged before the read', async () => {
@@ -165,7 +188,7 @@ describe('CoordinatorRepo read-repair CONTENT convergence', function () {
 		expect(payloadOf(b[BLOCK_ID]?.block)).to.equal('v1');
 	});
 
-	it('selects the peer\'s newer revision (the fix in this ticket)', async () => {
+	it('selects the peer\'s newer revision and reports a real sync', async () => {
 		const { bRepo, bCoordinator } = await buildDivergedPair();
 
 		const captured = await captureLog('coordinator-repo', async () => {
@@ -175,16 +198,13 @@ describe('CoordinatorRepo read-repair CONTENT convergence', function () {
 		// Selection no longer declines: A's rev 2 is corroborated (A is the only peer that
 		// could corroborate) and drives a restoration attempt against B's real storage.
 		expect(hasTag(captured, 'cluster-fetch:no-quorum'), 'must not decline').to.equal(false);
-		// The attempt is reported by its OUTCOME. Nothing transfers (see the KNOWN GAP spec
-		// below), so `cluster-fetch:synced` must be absent — logging it unconditionally, as this
-		// path used to, manufactured hundreds of phantom convergences per run and hid a real
-		// replication defect for two debugging sessions.
-		// Ticket: bug-member-commits-unmaterializable-revision, secondary defect 1.
-		expect(hasTagAtRev(captured, 'cluster-fetch:synced', 2), 'nothing was restored, so nothing may claim it was').to.equal(false);
-		expect(hasTag(captured, 'cluster-fetch:not-restored'), 'the failed restore is reported').to.equal(true);
-		// And it ran against real storage without throwing, leaving B consistent.
+		// The attempt is reported by its OUTCOME, and the outcome is now a genuine transfer.
+		// `cluster-fetch:synced` was unreachable for a content gap until block acquisition landed;
+		// it must never be logged without a matching advance in storage, asserted below.
+		expect(hasTagAtRev(captured, 'cluster-fetch:synced', 2), 'the transfer is reported').to.equal(true);
+		expect(hasTag(captured, 'cluster-fetch:not-restored')).to.equal(false);
 		const after = await bRepo.get({ blockIds: [BLOCK_ID] });
-		expect(after[BLOCK_ID]?.state?.latest).to.not.equal(undefined);
+		expect(after[BLOCK_ID]?.state?.latest?.rev).to.equal(2);
 	});
 
 	/**
@@ -215,30 +235,71 @@ describe('CoordinatorRepo read-repair CONTENT convergence', function () {
 	});
 
 	/**
-	 * KNOWN GAP — do not "fix" this spec by loosening it; fix the read path.
+	 * The acceptance test for `read-repair-cannot-transfer-block-content`.
 	 *
-	 * `CoordinatorRepo.fetchBlockFromCluster` restores by calling
-	 * `storageRepo.get({ context: { committed: [clusterLatest], rev } })`. That context only
-	 * promotes a pending transaction the node ALREADY holds locally; B never pended
-	 * `action-2`, so the promotion loop finds nothing. The subsequent `getBlock(2)` does not
-	 * rescue it either: `BlockStorage` records coverage as the open-ended span `[E, +inf)`,
-	 * so `ensureRevision` considers rev 2 already covered and never calls the restore
-	 * callback — the descending walk simply resolves rev 2 to B's rev-1 materialization.
-	 * Nothing transfers, and `meta.latest` stays at rev 1.
+	 * Selecting the corroborated revision was never enough on its own: the restore
+	 * `fetchBlockFromCluster` used to perform (`storageRepo.get({ context: { committed, rev } })`)
+	 * only promotes a pending this node ALREADY holds, and B never pended `action-2`. The follow-up
+	 * `getBlock(2)` cannot rescue it either — `BlockStorage` records coverage as the open-ended span
+	 * `[E, +inf)`, so `ensureRevision` treats rev 2 as covered and the descending walk resolves it
+	 * down to B's own rev-1 materialization. B stayed at `v1` forever.
 	 *
-	 * Block-transferring restoration exists only on the commit path
-	 * (`reconcileBlock` → `fetchArchiveFromPeer` → `saveReplicatedBlock`).
-	 * Tracked by `tickets/fix/read-repair-cannot-transfer-block-content.md`.
+	 * The read path now falls through to `acquireBlockFromCohort` — the same
+	 * `createReconcileBlock` the commit path uses — so the bytes actually move. The read itself must
+	 * also serve the converged content, not just leave it in storage for the next caller.
 	 */
-	it('KNOWN GAP: does NOT converge the block content or the latest pointer', async () => {
+	it('converges the block content and the latest pointer', async () => {
 		const { bRepo, bCoordinator } = await buildDivergedPair();
 
-		await bCoordinator.get({ blockIds: [BLOCK_ID] });
-		// A second read, in case a single pass were merely insufficient.
-		await bCoordinator.get({ blockIds: [BLOCK_ID] });
+		const served = await bCoordinator.get({ blockIds: [BLOCK_ID] });
+		expect(served[BLOCK_ID]?.state?.latest?.rev, 'the repairing read serves the new revision').to.equal(2);
+		expect(payloadOf(served[BLOCK_ID]?.block), 'the repairing read serves the new content').to.equal('v2');
 
 		const after = await bRepo.get({ blockIds: [BLOCK_ID] });
-		expect(after[BLOCK_ID]?.state?.latest?.rev, 'latest pointer does not advance').to.equal(1);
-		expect(payloadOf(after[BLOCK_ID]?.block), 'content does not converge').to.equal('v1');
+		expect(after[BLOCK_ID]?.state?.latest?.rev, 'latest pointer advanced durably').to.equal(2);
+		expect(payloadOf(after[BLOCK_ID]?.block), 'content converged durably').to.equal('v2');
+	});
+
+	/**
+	 * The downstream blocker: a collection's header block committed solo on the writer during a
+	 * cohort-formation race, so the reader has NO local metadata for it. `BlockStorage.getBlock`
+	 * returns `undefined` before `ensureRevision` runs, so the restore callback is unreachable — the
+	 * reader could establish `clusterRev` and still never obtain the block, logging
+	 * `cluster-fetch:not-restored { localRev: undefined, clusterRev: 1 }` on every read.
+	 */
+	it('acquires a block it has never seen once the cohort corroborates one', async () => {
+		const { bRepo, bCoordinator } = await buildDivergedPair({ seedB: false });
+
+		const before = await bRepo.get({ blockIds: [BLOCK_ID] });
+		expect(before[BLOCK_ID]?.state?.latest, 'B starts with no metadata at all').to.equal(undefined);
+
+		const captured = await captureLog('coordinator-repo', async () => {
+			const served = await bCoordinator.get({ blockIds: [BLOCK_ID] });
+			expect(payloadOf(served[BLOCK_ID]?.block), 'the acquiring read serves the block').to.equal('v2');
+		});
+		expect(hasTagAtRev(captured, 'cluster-fetch:synced', 2)).to.equal(true);
+
+		const after = await bRepo.get({ blockIds: [BLOCK_ID] });
+		expect(after[BLOCK_ID]?.state?.latest?.rev).to.equal(2);
+		expect(payloadOf(after[BLOCK_ID]?.block)).to.equal('v2');
+	});
+
+	/**
+	 * The boundary that keeps acquisition affordable. An insert probes a fresh random block id for a
+	 * collision, and that read must not cost a block transfer. No peer claims the id, so nothing is
+	 * corroborated and `fetchBlockFromCluster` returns before the acquisition step — the absence stays
+	 * as cheap as it was, priced at the latest-query round trip that already happened.
+	 */
+	it('never fetches an archive for a block no peer claims', async () => {
+		const { bCoordinator, archiveFetches } = await buildDivergedPair();
+		const absentId = 'block-nobody-has' as BlockId;
+
+		const captured = await captureLog('coordinator-repo', async () => {
+			const result = await bCoordinator.get({ blockIds: [absentId] });
+			expect(result[absentId]?.state?.latest, 'reported absent').to.equal(undefined);
+		});
+
+		expect(hasTag(captured, 'cluster-fetch:no-quorum'), 'nothing corroborated the id').to.equal(true);
+		expect(archiveFetches(), 'a genuine absence costs no archive fetch').to.equal(0);
 	});
 });

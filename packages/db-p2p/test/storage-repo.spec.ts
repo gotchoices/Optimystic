@@ -1373,9 +1373,9 @@ describe('StorageRepo', () => {
 
 			expect(await new BlockStorage(BLOCK, rawStorage).getLatest(),
 				'a read must never advance latest to an unmaterializable rev').to.equal(undefined);
-			// The refusal itself is absorbed by get(). Anything that still escapes comes from the
-			// read path's inability to ACQUIRE a block this node has never held — a separate gap,
-			// tracked by `read-repair-cannot-transfer-block-content`, not this refusal leaking out.
+			// The refusal itself is absorbed by get(). Anything that still escapes is a storage-layer
+			// read fault, not this refusal leaking out — acquiring the block this node never held is
+			// the coordinator's job (`CoordinatorRepo.restoreCorroborated`), one layer up.
 			expect(readError?.message ?? '', 'the missing-base refusal must not escape a read')
 				.to.not.include(MISSING_BASE_REVISION_REASON);
 		});

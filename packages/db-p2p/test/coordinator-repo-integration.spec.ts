@@ -316,36 +316,41 @@ describe('CoordinatorRepo Integration (TEST-5.3.1)', () => {
 	});
 
 	describe('context-driven pending block serving (TEST-5.4.3)', () => {
-		it('should serve a pending block via context when data is only on the writing peer', async () => {
-			// responsibilityK=3: all peers are discoverable so the reader's cluster
-			// query will include the writer (data is still only pended on one peer)
+		it('should serve a pending block via context when data is only on the writing peers', async () => {
+			// responsibilityK=3: all peers are discoverable so the reader's cluster query reaches
+			// the writers (the data is still only PENDED there, never committed).
 			const mesh = await createMesh(3, { responsibilityK: 3 });
-			const writer = mesh.nodes[0]!;
 			const reader = mesh.nodes[1]!;
+			// Two writers, not one. The reader restores only from a quorum-corroborated
+			// `(rev, actionId)`, and a 3-peer cohort can supply two corroborators — so one holder's
+			// uncorroborated claim is correctly refused. (This spec used to pass with a single holder
+			// only because the mesh harness's `clusterLatestCallback` faked the data sync itself; that
+			// fake is gone, so the cohort has to be able to corroborate for real.)
+			const writers = [mesh.nodes[0]!, mesh.nodes[2]!];
 			const blockId = 'block-pending-ctx' as BlockId;
 
-			// Pend on the writer — pending data only on writer's storage
-			const pendResult = await writer.storageRepo.pend({
-				actionId: 'a-pctx',
-				transforms: { inserts: { [blockId]: makeBlock(blockId) }, updates: {}, deletes: [] },
-				policy: 'c'
-			});
-			expect(pendResult.success).to.equal(true);
+			for (const writer of writers) {
+				const pendResult = await writer.storageRepo.pend({
+					actionId: 'a-pctx',
+					transforms: { inserts: { [blockId]: makeBlock(blockId) }, updates: {}, deletes: [] },
+					policy: 'c'
+				});
+				expect(pendResult.success).to.equal(true);
+			}
 
 			// Do NOT commit (simulating non-tail commit failure after tail committed)
 
-			// Reader tries to get the block with context proving the action is committed
-			// This should work: the cluster fetch should query the writer with context,
-			// triggering promotion on the writer, then syncing back to reader
+			// Reader gets the block with context proving the action is committed. The context rides the
+			// cluster callback out to each writer, promoting the pending there; both then corroborate
+			// (1, 'a-pctx') and agree on the content, so the reader acquires it.
 			const result = await reader.coordinatorRepo.get({
 				blockIds: [blockId],
 				context: { committed: [{ actionId: 'a-pctx', rev: 1 }], rev: 1 }
 			});
 
-			// Context is forwarded through the cluster callback to the remote peer,
-			// triggering promotion of the pending block:
 			expect(result[blockId]?.block).to.not.equal(undefined,
 				'Pending block should be served when context proves the action is committed');
+			expect(result[blockId]?.state?.latest?.rev).to.equal(1);
 		});
 	});
 

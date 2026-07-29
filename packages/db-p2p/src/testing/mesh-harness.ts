@@ -108,6 +108,32 @@ export interface Mesh {
 }
 
 /**
+ * Pull a block's committed content from a sibling cohort node into `storageRepo` — the mesh analogue
+ * of `libp2p-node-base`'s `createReconcileBlock` (SyncClient archive fetch + `saveReplicatedBlock`).
+ *
+ * Deliberately shared by BOTH callers, exactly as the live node shares one callback between them: the
+ * commit path (`clusterMember.reconcileBlock`, for a block committed without a materializable base)
+ * and the read path (`CoordinatorRepo.acquireBlockFromCohort`, for a corroborated revision the reader
+ * cannot promote locally). Stateless, so it is simply rebuilt per caller.
+ *
+ * `nodes` is captured by reference and is fully populated by the time either caller invokes it.
+ */
+const makeReconcileBlock = (nodes: MeshNode[], selfPeerId: string, storageRepo: StorageRepo): ReconcileBlockCallback =>
+	async (blockId, committed, cohortPeerIds) => {
+		for (const peerIdStr of cohortPeerIds) {
+			if (peerIdStr === selfPeerId) continue;
+			const target = nodes.find(n => n.peerId.toString() === peerIdStr);
+			if (!target) continue;
+			const result = await target.storageRepo.get({ blockIds: [blockId] }, { skipClusterFetch: true } as any);
+			const entry = result[blockId];
+			const latest = entry?.state?.latest;
+			if (!latest || !entry?.block || latest.rev < committed.rev) continue;
+			await storageRepo.saveReplicatedBlock(blockId, entry.block, latest);
+			return;
+		}
+	};
+
+/**
  * Creates N interconnected mesh nodes with real components and mock transport.
  * ClusterClient calls route directly to target ClusterMember instances.
  */
@@ -125,8 +151,6 @@ export async function createMesh(nodeCount: number, options: MeshOptions): Promi
 	// Build nodes array (partially — coordinatorRepo added after keyNetwork is ready)
 	const nodes: MeshNode[] = [];
 	const peerNetwork = new MockPeerNetwork();
-	// Map peerId → rawStorage for data sync simulation in clusterLatestCallback
-	const rawStorages = new Map<string, IRawStorage>();
 
 	// Phase 1: create storage + cluster members
 	let nodeIndex = 0;
@@ -134,7 +158,6 @@ export async function createMesh(nodeCount: number, options: MeshOptions): Promi
 		const rawStorage = options.rawStorageFactory
 			? options.rawStorageFactory(nodeIndex)
 			: new MemoryRawStorage();
-		rawStorages.set(peerId.toString(), rawStorage);
 		nodeIndex++;
 		const storageRepo = new StorageRepo(
 			(blockId: BlockId) => new BlockStorage(blockId, rawStorage)
@@ -152,24 +175,9 @@ export async function createMesh(nodeCount: number, options: MeshOptions): Promi
 			allowUnvalidatedSmallCluster: true
 		};
 
-		// Active reconciliation simulation: when a member commits a block it never
-		// pended (cohort drift), pull the committed revision from a sibling cohort node
-		// that holds it and persist it locally — the mesh analogue of the SyncClient
-		// fetch + saveReplicatedBlock path wired in `libp2p-node-base`. `nodes` is captured
-		// by reference and fully populated by the time the callback is actually invoked.
-		const reconcileBlock: ReconcileBlockCallback = async (blockId, committed, cohortPeerIds) => {
-			for (const peerIdStr of cohortPeerIds) {
-				if (peerIdStr === peerId.toString()) continue;
-				const target = nodes.find(n => n.peerId.toString() === peerIdStr);
-				if (!target) continue;
-				const result = await target.storageRepo.get({ blockIds: [blockId] }, { skipClusterFetch: true } as any);
-				const entry = result[blockId];
-				const latest = entry?.state?.latest;
-				if (!latest || !entry?.block || latest.rev < committed.rev) continue;
-				await storageRepo.saveReplicatedBlock(blockId, entry.block, latest);
-				return;
-			}
-		};
+		// Active reconciliation: when a member commits a block it never pended (cohort drift),
+		// pull the committed revision from a sibling cohort node that holds it.
+		const reconcileBlock = makeReconcileBlock(nodes, peerId.toString(), storageRepo);
 
 		const member = clusterMember({
 			storageRepo,
@@ -208,10 +216,12 @@ export async function createMesh(nodeCount: number, options: MeshOptions): Promi
 	};
 
 	for (const node of nodes) {
-		const localRawStorage = rawStorages.get(node.peerId.toString())!;
-
-		// Per-node callback: queries remote peer and replicates committed data locally
-		// (simulates what SyncClient does in production)
+		// Per-node callback: reports the queried peer's latest revision, and NOTHING else. It used to
+		// also write the peer's block into local storage ("simulate data sync"), which made every
+		// read-repair assertion on this harness observe a convergence the production callback does not
+		// provide — masking exactly the defect that ticket `read-repair-cannot-transfer-block-content`
+		// existed to expose. Transfer now happens where it does in production: through
+		// `acquireBlockFromCohort` below, gated on a corroborated revision.
 		const clusterLatestCallback: ClusterLatestCallback = async (peerId: PeerId, blockId: BlockId, context?): Promise<ActionRev | undefined> => {
 			const target = nodes.find(n => n.peerId.equals(peerId));
 			if (!target) return undefined;
@@ -219,28 +229,7 @@ export async function createMesh(nodeCount: number, options: MeshOptions): Promi
 				{ blockIds: [blockId], context },
 				{ skipClusterFetch: true } as any
 			);
-			const entry = result[blockId];
-			const latest = entry?.state?.latest;
-
-			// Simulate data sync: replicate committed block data to local storage
-			if (latest && entry?.block) {
-				const localBlockStorage = new BlockStorage(blockId as BlockId, localRawStorage);
-				const localLatest = await localBlockStorage.getLatest();
-				if (!localLatest || localLatest.rev < latest.rev) {
-					// Ensure metadata exists
-					const meta = await localRawStorage.getMetadata(blockId as BlockId);
-					if (!meta) {
-						// Seed empty ranges (honest: nothing reconstructible yet); the setLatest
-						// below merges [latest.rev, latest.rev+1] once the revision is persisted.
-						await localRawStorage.saveMetadata(blockId as BlockId, { latest: undefined, ranges: [] });
-					}
-					await localBlockStorage.saveMaterializedBlock(latest.actionId, entry.block);
-					await localBlockStorage.saveRevision(latest.rev, latest.actionId);
-					await localBlockStorage.setLatest(latest);
-				}
-			}
-
-			return latest;
+			return result[blockId]?.state?.latest;
 		};
 		// Wrap key network to include self in findCluster (matches real Libp2pKeyPeerNetwork behavior)
 		const nodeKeyNetwork: IKeyNetwork = {
@@ -273,7 +262,10 @@ export async function createMesh(nodeCount: number, options: MeshOptions): Promi
 			storageRepo: node.storageRepo,
 			localCluster: node.clusterMember,
 			localPeerId: node.peerId,
-			clusterLatestCallback
+			clusterLatestCallback,
+			// The read path's transfer mechanism — the same callback the member uses on the commit path,
+			// mirroring how `libp2p-node-base` shares one `reconcileBlock` between both.
+			acquireBlockFromCohort: makeReconcileBlock(nodes, node.peerId.toString(), node.storageRepo)
 		});
 	}
 

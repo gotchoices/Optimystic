@@ -38,13 +38,15 @@ export class BlockStorage implements IBlockStorage {
 		if (!meta) {
 			// No metadata at all ⇒ this node has never seen the block, and reads report it absent
 			// WITHOUT consulting `restoreCallback`. That is deliberate, not an oversight: `restoreCallback`
-			// is reachable only from ensureRevision below, so a never-seen block is never fetched on the
-			// read path. Attempting a fetch here would turn every read of a genuinely non-existent block —
-			// the common case for an insert probing for a collision — into a network round trip. A node
-			// that legitimately should hold this block acquires it on the WRITE path instead
-			// (`ClusterMember` reconcile → `saveReplicatedBlock`). Read-driven acquisition of a never-seen
-			// block is tracked by ticket `read-repair-cannot-transfer-block-content`; until it lands, do
-			// not read this early return as "read-repair covers this".
+			// is reachable only from ensureRevision below, so a never-seen block is never fetched HERE.
+			// Attempting a fetch at this layer would turn every read of a genuinely non-existent block —
+			// the common case for an insert probing for a collision — into a network round trip, because
+			// storage cannot tell "nobody has this" from "I don't have this".
+			//
+			// The layer that CAN tell them apart makes that call instead: `CoordinatorRepo` acquires the
+			// block only once the cohort has corroborated a `(rev, actionId)` for it
+			// (`restoreCorroborated` → `acquireBlockFromCohort`), so an id no peer claims still costs
+			// nothing beyond the latest-query it already performed. Keep this early return as-is.
 			return undefined;
 		}
 

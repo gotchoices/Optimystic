@@ -11,6 +11,14 @@ import { createLogger } from '../logger.js';
 
 const log = createLogger('reconcile-block');
 
+/**
+ * Wall-clock bound on one whole reconcile pass (all cohort peers, both quorums, the persist).
+ * Shared by both callers so a slow or unreachable cohort peer stalls neither the commit path
+ * (`ClusterMember.withReconcileTimeout` — a stall there holds up consensus execution) nor the read
+ * path (`CoordinatorRepo.restoreCorroborated` — a stall there holds up a caller's `get`).
+ */
+export const RECONCILE_TIMEOUT_MS = 5000;
+
 /** One cohort peer's answer for a block: its highest revision, and the block bytes if it carried them. */
 interface ReconcileCandidate {
 	peerId: string;
