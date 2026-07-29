@@ -69,12 +69,23 @@ export interface ClusterConsensusConfig {
 	/** Tolerance for cluster size variance as fraction (default 0.5 = 50%) */
 	clusterSizeTolerance: number;
 	/**
-	 * Configured full cluster size (the responsibility-K). Present so a cluster **member** has its own
-	 * reference for "full size" when running the membership admission gate — a below-full-size declared
-	 * peer set under low derivation confidence is refused (see {@link ClusterMember} admission gate).
+	 * Configured full cluster size — the replication factor / target cohort breadth. This is what the
+	 * coordinator aims for when selecting a cohort. It is NOT a statement about how many peers exist,
+	 * and nothing may use it as a security yardstick; see {@link ClusterConsensusConfig.assumedClusterSize}.
 	 * The coordinator supplies this as a required `clusterSize` via `ClusterConsensusConfig & { clusterSize: number }`.
 	 */
 	clusterSize?: number;
+	/**
+	 * The smallest cohort the operator asserts this deployment can genuinely field — typically
+	 * `min(clusterSize, number of nodes actually run)`. Read ONLY when a node cannot independently
+	 * measure a cohort (no derivation capability wired, or no confident network-size estimate), where
+	 * it stands in for the measured estimate in the membership admission floor.
+	 *
+	 * Undefined means "unknown": the admission gate then cannot tell a downsize from a legitimately
+	 * small cluster and preserves legacy approve behavior. Composition roots should supply a concrete
+	 * value; `libp2p-node-base` defaults it to `minAbsoluteClusterSize`.
+	 */
+	assumedClusterSize?: number;
 	/**
 	 * Fraction of the member's OWN confident cluster-size estimate a declared peer set must meet to be
 	 * admitted for voting (default 0.75). Below `⌈membershipAdmissionFraction · K_est⌉` a declared set is

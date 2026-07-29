@@ -193,6 +193,15 @@ export type NodeOptions = {
 		 * meshes that knowingly run undersized.
 		 */
 		allowUnvalidatedSmallCluster?: boolean;
+		/**
+		 * The smallest cohort this deployment can genuinely field — normally the number of nodes you
+		 * actually run, capped at `clusterSize`. Used only as the membership admission gate's fallback
+		 * yardstick when the node has no confident network-size estimate. Defaults to
+		 * `minAbsoluteClusterSize` (2), which is what lets a small mesh transact without configuration;
+		 * a large deployment should set this to its real cohort size so the gate can still police a
+		 * partition-induced downsize while its size estimate is unconfident.
+		 */
+		assumedClusterSize?: number;
 	};
 
 	/** Override libp2p listen multiaddrs. */
@@ -709,10 +718,15 @@ export async function createLibp2pNodeBase(
 		// rejected); embedders running knowingly-small meshes opt in through clusterPolicy.
 		allowUnvalidatedSmallCluster: options.clusterPolicy?.allowUnvalidatedSmallCluster ?? false,
 		partitionDetectionWindow: 60000,
-		// Configured full cluster size — the member's own reference for "full size" in the membership
-		// admission gate (a below-full-size declared set under low FRET confidence is refused as a possible
-		// self-shrink). Matches the size threaded into the coordinator below.
-		clusterSize: options.clusterSize ?? 10
+		// Replication factor / target cohort breadth — what the coordinator aims for when selecting a
+		// cohort. Deliberately NOT the membership admission gate's yardstick: it says nothing about how
+		// many peers actually exist, so an unconfigured small mesh would refuse every write.
+		clusterSize: options.clusterSize ?? 10,
+		// The gate's fallback yardstick when this node has no confident network-size estimate: the operator's
+		// assertion of the smallest cohort this deployment can genuinely field. Defaults to
+		// minAbsoluteClusterSize above, so a two- or three-node mesh transacts unconfigured; a large
+		// deployment should set clusterPolicy.assumedClusterSize to its real cohort size.
+		assumedClusterSize: options.clusterPolicy?.assumedClusterSize ?? 2
 	};
 
 	// Fetch a block archive from one cohort peer over the sync protocol, bounded by a

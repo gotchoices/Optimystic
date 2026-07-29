@@ -612,6 +612,11 @@ Errors are thrown as plain `Error` instances with descriptive messages. Key erro
 - **Downsize rejected**: `Cluster size N below configured minimum M` — `allowClusterDownsize` is false and cluster shrank
 - **Super-majority failed**: `Failed to get super-majority: N/M approvals (needed K, R rejections)` — too few approving promises
 - **Validator rejection**: `Transaction rejected by validators (N/M rejected): reasons` — rejection count exceeds `maxAllowedRejections`
+- **Membership not admitted**: a member declines to vote on the coordinator's declared peer set. Carried as the `rejectReason` on the member's `reject` promise (not thrown), so it feeds the dispute accounting. Variants:
+  - `membership-not-admitted:self-not-member` — the declared peer set does not contain this member; always enforced, never bypassed by `allowUnvalidatedSmallCluster`
+  - `membership-not-admitted:below-floor (declared=D, floor=F, kEst=K)` — the member has a confident derived view of `K` peers and the declared set of `D` is below `⌈membershipAdmissionFraction · K⌉`
+  - `membership-not-admitted:low-confidence-downsize (declared=D, floor=F, assumedClusterSize=A)` — the member has no confident network-size estimate, so the floor falls back to the operator-asserted `assumedClusterSize`. The numbers name the local setting that caused it: if `A` is larger than the cohort you actually run, lower `clusterPolicy.assumedClusterSize`
+  - `membership-not-admitted:inconsistent-with-derived-view` — the declared set differs from the member's derived view by more than `clusterSizeTolerance · kEst` peers
 - **Expiration**: `Transaction expired` — transaction's `message.expiration` timestamp passed
 - **Hash mismatch**: `Message hash mismatch` — incoming record's message doesn't match its hash (forgery detection)
 - **Signature invalid**: `Invalid promise/commit signature from peerId` — cryptographic signature verification failed
@@ -721,8 +726,28 @@ interface ClusterConsensusConfig {
   allowClusterDownsize: boolean;      // Default true
   clusterSizeTolerance: number;       // Default 0.5 (50% variance)
   partitionDetectionWindow: number;   // Default 60000ms (1 min)
+  clusterSize?: number;               // Replication factor / target cohort breadth (default 10)
+  assumedClusterSize?: number;        // Smallest cohort the operator asserts exists (default 2 via libp2p-node-base)
+  membershipAdmissionFraction?: number; // Default 0.75 — fraction of the size reference a declared set must meet
 }
 ```
+
+**`clusterSize` vs `assumedClusterSize`.** These are two different questions and must not be conflated:
+
+- `clusterSize` is **how many copies to keep** — the replication factor the coordinator aims for when
+  selecting a cohort. It says nothing about how many peers exist. Nothing may use it as a security
+  yardstick.
+- `assumedClusterSize` is **how many peers the operator asserts genuinely exist** — normally
+  `min(clusterSize, nodes you actually run)`. It is read *only* by the membership admission gate, and only
+  on the fallback path where the member has no confident network-size estimate (which is what a partition
+  induces). There it stands in for the measured estimate: the declared peer set must be at least
+  `max(minAbsoluteClusterSize, ⌈membershipAdmissionFraction · assumedClusterSize⌉)`.
+
+`libp2p-node-base` defaults `assumedClusterSize` to `minAbsoluteClusterSize` (2), so a two- or three-node
+mesh transacts without configuration. A large deployment should set `clusterPolicy.assumedClusterSize` to
+its real cohort size — otherwise the gate cannot police a partition-induced downsize while its own size
+estimate is unconfident. When `assumedClusterSize` is absent altogether the gate treats the size as
+*unknown* and admits (legacy behavior), because refusing every write is the worse failure.
 
 **Configuration in libp2p-node.ts:**
 ```typescript

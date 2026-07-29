@@ -86,12 +86,15 @@ const baseConfig = (over: Partial<ClusterConsensusConfig> = {}): ClusterConsensu
 	...over
 });
 
-/** Build a member whose declared-set derivation returns `view`, then vote on a record for `declared`. */
+/**
+ * Build a member whose declared-set derivation returns `view`, then vote on a record for `declared`.
+ * `config` may be omitted entirely, exercising the no-consensusConfig construction many other specs use.
+ */
 const voteOn = async (
 	self: KeyPair,
 	declared: KeyPair[],
 	view: ExpectedClusterView | undefined,
-	config: ClusterConsensusConfig
+	config?: ClusterConsensusConfig
 ): Promise<{ type: string; rejectReason?: string }> => {
 	const member = clusterMember({
 		storageRepo: new MockRepo(),
@@ -131,14 +134,21 @@ describe('ClusterMember — membership admission gate', () => {
 	describe('fast path (unchanged behavior)', () => {
 		it('admits the declared full set in a healthy full cluster (confident, D == E)', async () => {
 			const full = cluster(8);
-			const vote = await voteOn(self, full, view(full, 0.9), baseConfig({ clusterSize: 8 }));
+			const vote = await voteOn(self, full, view(full, 0.9), baseConfig({ assumedClusterSize: 8 }));
 			expect(vote.type).to.equal('approve');
 		});
 
-		it('with no derivation capability AND no configured full size, preserves legacy approve', async () => {
+		it('with no derivation capability AND no asserted cohort size, preserves legacy approve', async () => {
 			const full = cluster(8);
-			// No deriveExpectedCluster, no clusterSize → the gate cannot judge a downsize → legacy approve.
+			// No deriveExpectedCluster, no assumedClusterSize → the gate cannot judge a downsize → legacy approve.
 			const vote = await voteOn(self, full, undefined, baseConfig());
+			expect(vote.type).to.equal('approve');
+		});
+
+		it('with no consensusConfig at all, preserves legacy approve', async () => {
+			// Many other specs construct ClusterMember with no config; that path must stay admitting.
+			const shrunk = cluster(3);
+			const vote = await voteOn(self, shrunk, undefined, undefined);
 			expect(vote.type).to.equal('approve');
 		});
 	});
@@ -146,7 +156,7 @@ describe('ClusterMember — membership admission gate', () => {
 	describe('self-membership (predicate 1)', () => {
 		it('rejects a record whose peers omit this member', async () => {
 			const declaredWithoutSelf = others.slice(0, 5); // self not included
-			const vote = await voteOn(self, declaredWithoutSelf, view(cluster(6), 0.9), baseConfig({ clusterSize: 6 }));
+			const vote = await voteOn(self, declaredWithoutSelf, view(cluster(6), 0.9), baseConfig({ assumedClusterSize: 6 }));
 			expect(vote.type).to.equal('reject');
 			expect(vote.rejectReason).to.equal(`${MEMBERSHIP_NOT_ADMITTED}:self-not-member`);
 		});
@@ -156,14 +166,23 @@ describe('ClusterMember — membership admission gate', () => {
 		it('rejects a strict shrink below ceil(admissionFraction * K_est)', async () => {
 			const expected = cluster(8);           // K_est = 8, floor = ceil(0.75*8) = 6
 			const declared = cluster(3);           // |D| = 3 < 6
-			const vote = await voteOn(self, declared, view(expected, 0.9), baseConfig({ clusterSize: 8 }));
+			const vote = await voteOn(self, declared, view(expected, 0.9), baseConfig({ assumedClusterSize: 8 }));
 			expect(vote.type).to.equal('reject');
-			expect(vote.rejectReason).to.equal(`${MEMBERSHIP_NOT_ADMITTED}:below-floor`);
+			expect(vote.rejectReason).to.match(
+				new RegExp(`^${MEMBERSHIP_NOT_ADMITTED}:below-floor \\(declared=3, floor=6, kEst=8\\)$`)
+			);
+		});
+
+		it('admits exactly at the ceil boundary of the confident floor', async () => {
+			const expected = cluster(8);           // K_est = 8, floor = ceil(0.75*8) = 6
+			const declared = cluster(6);           // |D| = 6 == floor, symDiff = 2 <= ceil(0.5*8) = 4
+			const vote = await voteOn(self, declared, view(expected, 0.9), baseConfig({ assumedClusterSize: 8 }));
+			expect(vote.type).to.equal('approve');
 		});
 
 		it('admits a genuinely small cluster when the member is confident of the small size', async () => {
 			const small = cluster(3);              // K_est = 3, floor = max(2, ceil(0.75*3)) = 3
-			const vote = await voteOn(self, small, view(small, 0.9), baseConfig({ clusterSize: 10 }));
+			const vote = await voteOn(self, small, view(small, 0.9), baseConfig({ assumedClusterSize: 10 }));
 			expect(vote.type).to.equal('approve');
 		});
 	});
@@ -173,7 +192,7 @@ describe('ClusterMember — membership admission gate', () => {
 			const expected = cluster(6);                        // E
 			// D = E with one peer swapped: symDiff = 2 <= ceil(0.5*6) = 3
 			const swapped = [...expected.slice(0, 5), others[8]!];
-			const vote = await voteOn(self, swapped, view(expected, 0.9), baseConfig({ clusterSize: 6 }));
+			const vote = await voteOn(self, swapped, view(expected, 0.9), baseConfig({ assumedClusterSize: 6 }));
 			expect(vote.type).to.equal('approve');
 		});
 
@@ -181,12 +200,12 @@ describe('ClusterMember — membership admission gate', () => {
 			const expected = cluster(6);                        // maxDiff = ceil(0.5*6) = 3
 			// symDiff = 3: drop one from E (p5) and add two fresh → {removed:1, added:2}
 			const atBoundary = [...expected.slice(0, 5), others[7]!, others[8]!]; // size 7, symDiff 3
-			const atVote = await voteOn(self, atBoundary, view(expected, 0.9), baseConfig({ clusterSize: 6 }));
+			const atVote = await voteOn(self, atBoundary, view(expected, 0.9), baseConfig({ assumedClusterSize: 6 }));
 			expect(atVote.type, 'symDiff == maxDiff should admit').to.equal('approve');
 
 			// symDiff = 4: drop one from E and add three fresh
 			const beyond = [...expected.slice(0, 5), others[6]!, others[7]!, others[8]!]; // size 8, symDiff 4
-			const beyondVote = await voteOn(self, beyond, view(expected, 0.9), baseConfig({ clusterSize: 6 }));
+			const beyondVote = await voteOn(self, beyond, view(expected, 0.9), baseConfig({ assumedClusterSize: 6 }));
 			expect(beyondVote.type, 'symDiff > maxDiff should reject').to.equal('reject');
 			expect(beyondVote.rejectReason).to.equal(`${MEMBERSHIP_NOT_ADMITTED}:inconsistent-with-derived-view`);
 		});
@@ -194,63 +213,117 @@ describe('ClusterMember — membership admission gate', () => {
 		it('rejects a wholesale-disjoint set of the same size (sharing only self)', async () => {
 			const expected = [self, ...others.slice(0, 4)];      // E = {self, o0..o3}, floor=ceil(0.75*5)=4
 			const disjoint = [self, ...others.slice(4, 8)];      // D = {self, o4..o7}, |D|=5>=floor, symDiff=8
-			const vote = await voteOn(self, disjoint, view(expected, 0.9), baseConfig({ clusterSize: 5 }));
+			const vote = await voteOn(self, disjoint, view(expected, 0.9), baseConfig({ assumedClusterSize: 5 }));
 			expect(vote.type).to.equal('reject');
 			expect(vote.rejectReason).to.equal(`${MEMBERSHIP_NOT_ADMITTED}:inconsistent-with-derived-view`);
 		});
 	});
 
+	describe('clusterSize is decoupled from the admission gate', () => {
+		it('admits a small declared set when only clusterSize (the replication factor) is configured', async () => {
+			// The whole point of the split: clusterSize: 10 says "keep 10 copies", NOT "10 peers exist".
+			// A two-node deployment that never configured assumedClusterSize must still transact.
+			const pair = cluster(2);
+			const vote = await voteOn(self, pair, undefined, baseConfig({ clusterSize: 10 }));
+			expect(vote.type).to.equal('approve');
+		});
+
+		it('admits a two-node declared set under the small-deployment default (assumedClusterSize 2)', async () => {
+			// The reported regression, reproduced at the value libp2p-node-base now defaults to.
+			const pair = cluster(2);
+			const vote = await voteOn(self, pair, undefined, baseConfig({ clusterSize: 10, assumedClusterSize: 2 }));
+			expect(vote.type).to.equal('approve');
+		});
+	});
+
 	describe('fail-closed partition posture (low confidence)', () => {
-		it('rejects any below-full-size D when FRET confidence is low (Theorem 2 regression)', async () => {
+		it('rejects a below-floor D when FRET confidence is low (Theorem 2 regression)', async () => {
 			// The member is on a minority side: its own derived view is a small shrunk set AND confidence is
 			// low (a partition induces exactly this). Even though the record is internally valid, a
-			// below-full-size declared set must be refused against the configured full clusterSize.
-			const shrunk = cluster(3);
-			const vote = await voteOn(self, shrunk, view(shrunk, 0.2), baseConfig({ clusterSize: 8 }));
+			// below-floor declared set must be refused against the asserted cohort size.
+			const shrunk = cluster(3);          // floor = max(2, ceil(0.75*8)) = 6
+			const vote = await voteOn(self, shrunk, view(shrunk, 0.2), baseConfig({ assumedClusterSize: 8 }));
 			expect(vote.type).to.equal('reject');
-			expect(vote.rejectReason).to.equal(`${MEMBERSHIP_NOT_ADMITTED}:low-confidence-downsize`);
+			expect(vote.rejectReason).to.match(
+				new RegExp(`^${MEMBERSHIP_NOT_ADMITTED}:low-confidence-downsize \\(declared=3, floor=6, assumedClusterSize=8\\)$`)
+			);
 		});
 
 		it('still admits a full-size D under low confidence (nothing to shrink)', async () => {
 			const full = cluster(8);
-			const vote = await voteOn(self, full, view(cluster(3), 0.2), baseConfig({ clusterSize: 8 }));
+			const vote = await voteOn(self, full, view(cluster(3), 0.2), baseConfig({ assumedClusterSize: 8 }));
 			expect(vote.type).to.equal('approve');
 		});
 
-		it('fails closed even with no derivation capability when a full size is configured', async () => {
+		it('admits at the fallback floor — the same slack the confident path gets', async () => {
+			// Previously the fallback demanded the FULL asserted size (no fraction), so this rejected: a
+			// deployment sitting at its cohort size got intermittent refusals purely from discovery timing.
+			const atFloor = cluster(6);         // floor = ceil(0.75*8) = 6
+			const vote = await voteOn(self, atFloor, view(cluster(3), 0.2), baseConfig({ assumedClusterSize: 8 }));
+			expect(vote.type).to.equal('approve');
+		});
+
+		it('fails closed even with no derivation capability when a cohort size is asserted', async () => {
 			const shrunk = cluster(3);
-			const vote = await voteOn(self, shrunk, undefined, baseConfig({ clusterSize: 8 }));
+			const vote = await voteOn(self, shrunk, undefined, baseConfig({ assumedClusterSize: 8 }));
 			expect(vote.type).to.equal('reject');
-			expect(vote.rejectReason).to.equal(`${MEMBERSHIP_NOT_ADMITTED}:low-confidence-downsize`);
+			expect(vote.rejectReason).to.match(
+				new RegExp(`^${MEMBERSHIP_NOT_ADMITTED}:low-confidence-downsize \\(declared=3, floor=6, assumedClusterSize=8\\)$`)
+			);
+		});
+	});
+
+	describe('degenerate assumedClusterSize', () => {
+		it('clamps a floor of 1 up to minAbsoluteClusterSize (a solo set still needs the opt-in)', async () => {
+			// assumedClusterSize: 1 → floor = max(minAbsoluteClusterSize=2, ceil(0.75*1)=1) = 2.
+			const solo = [self];
+			const vote = await voteOn(self, solo, undefined, baseConfig({ assumedClusterSize: 1 }));
+			expect(vote.type, 'solo D below the absolute floor rejects').to.equal('reject');
+			expect(vote.rejectReason).to.match(
+				new RegExp(`^${MEMBERSHIP_NOT_ADMITTED}:low-confidence-downsize \\(declared=1, floor=2, assumedClusterSize=1\\)$`)
+			);
+
+			const optIn = await voteOn(self, solo, undefined, baseConfig({ assumedClusterSize: 1, allowUnvalidatedSmallCluster: true }));
+			expect(optIn.type, 'the explicit opt-in still admits a solo member').to.equal('approve');
+		});
+
+		it('does not throw on a zero or negative asserted size', async () => {
+			const pair = cluster(2);
+			for (const assumedClusterSize of [0, -5]) {
+				const vote = await voteOn(self, pair, undefined, baseConfig({ assumedClusterSize }));
+				expect(vote.type, `assumedClusterSize=${assumedClusterSize} floors at minAbsoluteClusterSize`).to.equal('approve');
+			}
 		});
 	});
 
 	describe('empty derived view (confident but unusable reference)', () => {
 		it('treats a confident-but-empty view as not-confident: full-size D admitted, shrunk D fails closed', async () => {
 			const emptyView: ExpectedClusterView = { peers: {}, confidence: 0.9 };
-			// Full-size D (>= configured clusterSize): nothing to shrink → admit (legacy/fail-open direction).
+			// Full-size D (>= the fallback floor): nothing to shrink → admit (legacy/fail-open direction).
 			const full = cluster(8);
-			const fullVote = await voteOn(self, full, emptyView, baseConfig({ clusterSize: 8 }));
+			const fullVote = await voteOn(self, full, emptyView, baseConfig({ assumedClusterSize: 8 }));
 			expect(fullVote.type, 'full-size D under empty view admits').to.equal('approve');
 
-			// Shrunk D (< configured clusterSize): fail closed rather than spuriously reject as inconsistent.
+			// Shrunk D (< the fallback floor): fail closed rather than spuriously reject as inconsistent.
 			const shrunk = cluster(3);
-			const shrunkVote = await voteOn(self, shrunk, emptyView, baseConfig({ clusterSize: 8 }));
+			const shrunkVote = await voteOn(self, shrunk, emptyView, baseConfig({ assumedClusterSize: 8 }));
 			expect(shrunkVote.type, 'shrunk D under empty view fails closed').to.equal('reject');
-			expect(shrunkVote.rejectReason).to.equal(`${MEMBERSHIP_NOT_ADMITTED}:low-confidence-downsize`);
+			expect(shrunkVote.rejectReason).to.match(
+				new RegExp(`^${MEMBERSHIP_NOT_ADMITTED}:low-confidence-downsize \\(declared=3, floor=6, assumedClusterSize=8\\)$`)
+			);
 		});
 	});
 
 	describe('allowUnvalidatedSmallCluster opt-in', () => {
 		it('lets a solo/dev member admit an undersized D', async () => {
 			const solo = [self];
-			const vote = await voteOn(self, solo, undefined, baseConfig({ clusterSize: 8, allowUnvalidatedSmallCluster: true }));
+			const vote = await voteOn(self, solo, undefined, baseConfig({ assumedClusterSize: 8, allowUnvalidatedSmallCluster: true }));
 			expect(vote.type).to.equal('approve');
 		});
 
 		it('opt-in does NOT bypass self-membership', async () => {
 			const withoutSelf = others.slice(0, 3);
-			const vote = await voteOn(self, withoutSelf, undefined, baseConfig({ clusterSize: 8, allowUnvalidatedSmallCluster: true }));
+			const vote = await voteOn(self, withoutSelf, undefined, baseConfig({ assumedClusterSize: 8, allowUnvalidatedSmallCluster: true }));
 			expect(vote.type).to.equal('reject');
 			expect(vote.rejectReason).to.equal(`${MEMBERSHIP_NOT_ADMITTED}:self-not-member`);
 		});
@@ -267,15 +340,17 @@ describe('ClusterMember — membership admission gate', () => {
 			// derives a confident view of ~the same set → admit.
 			const majorityDeclared = majorityMembers;
 			const majView = view(majorityMembers, 0.9);
-			const majVote = await voteOn(self, majorityDeclared, majView, baseConfig({ clusterSize: 8 }));
+			const majVote = await voteOn(self, majorityDeclared, majView, baseConfig({ assumedClusterSize: 8 }));
 
 			// Minority coordinator re-derives a self-shrunk 3-node cluster; the minority member's own view is
 			// that same shrunk set, and FRET confidence collapsed under the partition → refuse.
-			const minVote = await voteOn(minoritySelf, minorityMembers, view(minorityMembers, 0.2), baseConfig({ clusterSize: 8 }));
+			const minVote = await voteOn(minoritySelf, minorityMembers, view(minorityMembers, 0.2), baseConfig({ assumedClusterSize: 8 }));
 
 			expect(majVote.type, 'majority side admits and approves').to.equal('approve');
 			expect(minVote.type, 'minority side refuses admission').to.equal('reject');
-			expect(minVote.rejectReason).to.equal(`${MEMBERSHIP_NOT_ADMITTED}:low-confidence-downsize`);
+			expect(minVote.rejectReason).to.match(
+				new RegExp(`^${MEMBERSHIP_NOT_ADMITTED}:low-confidence-downsize \\(declared=3, floor=6, assumedClusterSize=8\\)$`)
+			);
 		});
 	});
 });

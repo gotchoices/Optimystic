@@ -232,8 +232,8 @@ export class ClusterMember implements ICluster {
 	private readonly minAbsoluteClusterSize: number;
 	private readonly clusterSizeTolerance: number;
 	private readonly membershipAdmissionFraction: number;
-	/** Configured full cluster size, or undefined when unknown (then the gate cannot judge a downsize). */
-	private readonly configuredClusterSize: number | undefined;
+	/** Operator-asserted smallest genuine cohort size, or undefined when unknown. */
+	private readonly assumedClusterSize: number | undefined;
 	private readonly allowUnvalidatedSmallCluster: boolean;
 
 	constructor(
@@ -259,8 +259,17 @@ export class ClusterMember implements ICluster {
 		this.minAbsoluteClusterSize = consensusConfig?.minAbsoluteClusterSize ?? 3;
 		this.clusterSizeTolerance = consensusConfig?.clusterSizeTolerance ?? 0.5;
 		this.membershipAdmissionFraction = consensusConfig?.membershipAdmissionFraction ?? 0.75;
-		this.configuredClusterSize = consensusConfig?.clusterSize;
+		this.assumedClusterSize = consensusConfig?.assumedClusterSize;
 		this.allowUnvalidatedSmallCluster = consensusConfig?.allowUnvalidatedSmallCluster ?? false;
+		// State the resolved gate parameters once, so an operator diagnosing a membership rejection can see
+		// what this node actually resolved. A fact, not a warning: `assumedClusterSize < clusterSize` is the
+		// normal default state, so warning on it would fire for every node and be ignored.
+		log('cluster-member:admission-config', {
+			assumedClusterSize: this.assumedClusterSize,
+			minAbsoluteClusterSize: this.minAbsoluteClusterSize,
+			membershipAdmissionFraction: this.membershipAdmissionFraction,
+			allowUnvalidatedSmallCluster: this.allowUnvalidatedSmallCluster
+		});
 		// Periodically clean up expired transactions (.unref() so tests/short-lived processes can exit)
 		this.expirationInterval = setInterval(() => this.queueExpiredTransactions(), 60000);
 		this.expirationInterval.unref();
@@ -858,12 +867,18 @@ export class ClusterMember implements ICluster {
 	 *     of a peer or two is absorbed, a wholesale-disjoint or half-size set is not.
 	 *
 	 * **Fail-closed posture.** When the member cannot confidently derive `E` (no capability, low FRET
-	 * confidence — exactly what a partition induces), it must refuse any *downsizing* decision: a
-	 * below-full-size `D` is rejected against the configured full `clusterSize`. With NEITHER a confident
-	 * view NOR a configured full size the gate cannot judge a downsize at all, so it preserves the legacy
-	 * approve behavior (backward-compatible for nodes/tests with no derivation wired). `allowUnvalidatedSmallCluster`
-	 * is the explicit opt-in (single-node / local dev knowingly below the safe floor), matching the
-	 * coordinator's `validateSmallCluster` semantics.
+	 * confidence — exactly what a partition induces), it must refuse any *downsizing* decision — but it
+	 * needs a size reference to judge "downsize" against, and it may NOT borrow `clusterSize` for that:
+	 * `clusterSize` is the replication factor (what a cohort should aim for), not a claim about how many
+	 * peers exist, so a small deployment configured with the default 10 would refuse every write. The
+	 * fallback yardstick is instead {@link ClusterConsensusConfig.assumedClusterSize} — the operator's own
+	 * assertion of the smallest cohort this deployment can genuinely field — run through the SAME
+	 * {@link admissionFloor} as the confident path, so the fallback can never be stricter than the measured
+	 * path (it was: it demanded the full configured size, with no fraction and no slack for churn or a peer
+	 * not yet discovered). With NEITHER a confident view NOR an asserted size the gate cannot judge a
+	 * downsize at all, so it preserves the legacy approve behavior (backward-compatible for nodes/tests with
+	 * no derivation wired). `allowUnvalidatedSmallCluster` is the explicit opt-in (single-node / local dev
+	 * knowingly below the safe floor), matching the coordinator's `validateSmallCluster` semantics.
 	 */
 	private async admitMembership(record: ClusterRecord): Promise<{ admit: boolean; reason?: string }> {
 		const ourId = this.peerId.toString();
@@ -894,30 +909,42 @@ export class ClusterMember implements ICluster {
 			&& derivedSize > 0;
 
 		if (!confident) {
-			// Fail closed for downsizing under low/absent confidence. A full-size (or larger) declared set is
-			// still admitted — there is nothing to shrink. Without a configured full-size reference we cannot
-			// tell a downsize from a legitimate small cluster, so we preserve legacy approve behavior.
-			if (this.configuredClusterSize === undefined) {
+			// Fail closed for downsizing under low/absent confidence, measured against the operator's asserted
+			// cohort size rather than the replication factor. With no asserted size the gate cannot tell a
+			// downsize from a legitimately small cluster at all, so it preserves legacy approve behavior.
+			if (this.assumedClusterSize === undefined) {
 				return { admit: true };
 			}
-			if (declared.length >= this.configuredClusterSize) {
+			const floor = this.admissionFloor(this.assumedClusterSize);
+			if (declared.length >= floor) {
 				return { admit: true };
 			}
 			log('cluster-member:admission-reject', {
 				messageHash: record.messageHash,
 				reason: 'low-confidence-downsize',
 				declaredSize: declared.length,
-				configuredClusterSize: this.configuredClusterSize,
+				floor,
+				assumedClusterSize: this.assumedClusterSize,
 				confidence: derived?.confidence
 			});
-			return { admit: false, reason: `${MEMBERSHIP_NOT_ADMITTED}:low-confidence-downsize` };
+			// The numbers ride along in the reason: this rejection is caused by *local* configuration, and
+			// without them a coordinator (or an operator reading a dispute record) has no hint which knob did it.
+			// NOTE: two honest members with different local config now emit *different* reason strings for the
+			// same record. Nothing compares reasons across peers today (`disputeEvidence.rejectReasons` is a
+			// per-peer map, and the signed payload hashes the string each vote carries); if anything ever groups
+			// or dedupes dispute reasons by string equality, group on the `membership-not-admitted:<variant>`
+			// prefix, not the whole string.
+			return {
+				admit: false,
+				reason: `${MEMBERSHIP_NOT_ADMITTED}:low-confidence-downsize (declared=${declared.length}, floor=${floor}, assumedClusterSize=${this.assumedClusterSize})`
+			};
 		}
 
 		const expected = Object.keys(derived!.peers ?? {});
 		const kEst = expected.length;
 
 		// Predicate 2: floor derived from the member's OWN confident estimate.
-		const floor = Math.max(this.minAbsoluteClusterSize, Math.ceil(this.membershipAdmissionFraction * kEst));
+		const floor = this.admissionFloor(kEst);
 		if (declared.length < floor) {
 			log('cluster-member:admission-reject', {
 				messageHash: record.messageHash,
@@ -926,7 +953,10 @@ export class ClusterMember implements ICluster {
 				floor,
 				kEst
 			});
-			return { admit: false, reason: `${MEMBERSHIP_NOT_ADMITTED}:below-floor` };
+			return {
+				admit: false,
+				reason: `${MEMBERSHIP_NOT_ADMITTED}:below-floor (declared=${declared.length}, floor=${floor}, kEst=${kEst})`
+			};
 		}
 
 		// Predicate 3: consistency with the derived view within tolerance.
@@ -945,6 +975,17 @@ export class ClusterMember implements ICluster {
 		}
 
 		return { admit: true };
+	}
+
+	/**
+	 * The smallest declared peer set admissible against a cohort-size reference `k`, whether `k` is
+	 * measured (the confident path's `kEst`) or asserted (`assumedClusterSize`). One function so the
+	 * fallback can never be stricter than the measured path — which it was, demanding the full configured
+	 * size with no fraction and no slack. Clamped at `minAbsoluteClusterSize`, so a degenerate `k` of 0, 1
+	 * or negative yields the absolute floor rather than a floor that admits everything.
+	 */
+	private admissionFloor(k: number): number {
+		return Math.max(this.minAbsoluteClusterSize, Math.ceil(this.membershipAdmissionFraction * k));
 	}
 
 	/**
