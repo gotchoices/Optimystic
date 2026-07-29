@@ -1395,7 +1395,12 @@ export class ClusterMember implements ICluster {
 	private async reconcileOneBlock(messageHash: string, blockId: BlockId, committed: ActionRev, cohortPeerIds: string[]): Promise<void> {
 		try {
 			await this.withReconcileTimeout(this.reconcileBlock!(blockId, committed, cohortPeerIds), blockId);
-			log('cluster-member:consensus-commit-reconciled', { messageHash, blockId, rev: committed.rev });
+			// "attempted", not "reconciled": the callback returns void, and a quorum decline is a
+			// normal, non-throwing outcome — so reaching here means the pass ran to completion, NOT
+			// that anything was restored. `reconcile:restored` (reconcile-block.ts) is the line that
+			// says the bytes actually landed; `reconcile:no-rev-quorum` / `reconcile:no-content-quorum`
+			// say they did not.
+			log('cluster-member:consensus-commit-reconcile-attempted', { messageHash, blockId, rev: committed.rev });
 		} catch (err) {
 			log('cluster-member:consensus-commit-reconcile-failed', {
 				messageHash,

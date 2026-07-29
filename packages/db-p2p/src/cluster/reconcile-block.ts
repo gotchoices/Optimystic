@@ -45,22 +45,60 @@ export interface ReconcileBlockDeps {
 }
 
 /**
+ * Highest revision an archive covers. Keys arrive as strings off the wire from an untrusted peer,
+ * so a non-numeric one is skipped rather than poisoning the maximum with `NaN`; folding instead of
+ * `Math.max(...keys)` also keeps a wide archive off the argument-count limit.
+ */
+function maxRevision(revisions: BlockArchive['revisions']): number | undefined {
+	let max: number | undefined;
+	for (const key of Object.keys(revisions)) {
+		const rev = Number(key);
+		if (Number.isFinite(rev) && (max === undefined || rev > max)) max = rev;
+	}
+	return max;
+}
+
+/**
  * The claim a peer's archive makes: its highest revision, provided that revision is at least the
  * one we committed. `undefined` when the peer served nothing usable (unreachable, empty archive,
  * or only revisions older than the commit we are healing).
  */
 function toCandidate(peerId: string, archive: BlockArchive | undefined, committedRev: number): ReconcileCandidate | undefined {
 	if (!archive) return undefined;
-	const revs = Object.keys(archive.revisions).map(Number);
-	if (revs.length === 0) return undefined;
-	const maxRev = Math.max(...revs);
-	if (maxRev < committedRev) return undefined;
+	const maxRev = maxRevision(archive.revisions);
+	if (maxRev === undefined || maxRev < committedRev) return undefined;
 	const data = archive.revisions[maxRev];
 	if (!data?.action) return undefined;
 	return { peerId, rev: maxRev, actionId: data.action.actionId, block: data.block };
 }
 
-/** Hash the block bytes of every candidate that both corroborates `selected` and actually carried content. */
+/**
+ * One peer's answer, isolated. `fetchArchive` is contracted to answer `undefined` for an
+ * unreachable peer, but a raw `Promise.all` over the cohort would let a single rejecting fetch
+ * discard the answers every other peer already gave — turning a heal the cohort could complete
+ * into a decline. One peer's failure costs only that peer's vote.
+ */
+async function fetchCandidate(
+	deps: ReconcileBlockDeps,
+	peerId: string,
+	blockId: BlockId,
+	committedRev: number
+): Promise<ReconcileCandidate | undefined> {
+	try {
+		return toCandidate(peerId, await deps.fetchArchive(peerId, blockId), committedRev);
+	} catch (err) {
+		log('reconcile:fetch-error', { blockId, peerId, error: (err as Error).message });
+		return undefined;
+	}
+}
+
+/**
+ * Hash the block bytes of every candidate that both corroborates `selected` and actually carried content.
+ *
+ * NOTE: this canonical-JSON-serializes and sha256s every carrier's whole block on every reconcile.
+ * Negligible at today's cohort widths and block sizes; if blocks grow large or cohorts wide enough
+ * for this to show up on a commit-path profile, hash incrementally at receive time instead.
+ */
 async function hashCarriers(candidates: ReconcileCandidate[], selected: QuorumRev): Promise<BlockHashCandidate[]> {
 	const carriers = candidates.filter(c => c.rev === selected.rev && c.actionId === selected.actionId && c.block);
 	return await Promise.all(
@@ -117,7 +155,7 @@ export function createReconcileBlock(deps: ReconcileBlockDeps): ReconcileBlockCa
 		if (targets.length === 0) return;
 
 		const fetched = await Promise.all(
-			targets.map(async peerId => toCandidate(peerId, await deps.fetchArchive(peerId, blockId), committed.rev))
+			targets.map(peerId => fetchCandidate(deps, peerId, blockId, committed.rev))
 		);
 		const candidates = fetched.filter((c): c is ReconcileCandidate => c !== undefined);
 		const capacity = corroboratorCapacity(targets.length, deps.clusterSize);

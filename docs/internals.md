@@ -319,7 +319,10 @@ saveMaterializedBlock(block): store(structuredClone(block));
   `reconcile:no-rev-quorum` / `reconcile:no-content-quorum`). Reconciliation is
   best-effort and bounded (`ReconcileTimeoutMs`):
   failures/timeouts are logged (`cluster-member:consensus-commit-reconcile-failed`),
-  never thrown. An *ahead* member already holds ≥ the rev, so it does not reconcile
+  never thrown. A pass that ran to completion logs
+  `cluster-member:consensus-commit-reconcile-attempted` — deliberately *attempted*, since the
+  callback returns nothing and a quorum decline is a normal non-throwing outcome; `reconcile:restored`
+  is the only line that means bytes actually landed. An *ahead* member already holds ≥ the rev, so it does not reconcile
   downward. Reconciliation deliberately runs **after** `StorageRepo.commit` returns, once
   its per-block latches are released: `saveReplicatedBlock` takes the same
   `StorageRepo.commit:<blockId>` latch, so fetching the base from inside the commit path

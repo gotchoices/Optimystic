@@ -197,6 +197,43 @@ describe('createReconcileBlock (commit-path block restoration)', () => {
 		expect(h.saved[0]!.source.rev, 'the corroborated revision wins over the highest one').to.equal(2);
 	});
 
+	it('lets one peer whose fetch rejects cost only that peer its vote', async () => {
+		// `fetchArchive` is contracted to answer `undefined` for an unreachable peer, but a rejection
+		// must not discard the answers the rest of the cohort already gave.
+		const archives: Record<string, BlockArchive | undefined> = {
+			p1: archiveAt(2, 'action-2', makeBlock('v2')),
+			p2: archiveAt(2, 'action-2', makeBlock('v2'))
+		};
+		const saved: { source: ActionRev }[] = [];
+		const reconcile = createReconcileBlock({
+			selfPeerId: SELF,
+			simpleMajorityThreshold: THRESHOLD,
+			clusterSize: 4,
+			async fetchArchive(peerId) {
+				if (peerId === 'broken') throw new Error('stream reset');
+				return archives[peerId];
+			},
+			async saveReplicatedBlock(_blockId, _block, source) { saved.push({ source }); }
+		});
+
+		await reconcile(BLOCK_ID, COMMITTED, ['broken', 'p1', 'p2']);
+
+		expect(saved.length, 'the two reachable corroborators still complete the heal').to.equal(1);
+	});
+
+	it('ignores a non-numeric revision key rather than dropping the peer', async () => {
+		// Archive keys arrive as strings off the wire; `Number('latest')` is NaN, which would
+		// poison the max and silently discard everything else the peer served.
+		const poisoned = archiveAt(2, 'action-2', makeBlock('v2'));
+		(poisoned.revisions as unknown as Record<string, unknown>)['latest'] = { action: undefined };
+		const h = harness({ [PEER_A]: poisoned });
+
+		await h.reconcile(BLOCK_ID, COMMITTED, [PEER_A]);
+
+		expect(h.saved.length, 'the usable revision is still adopted').to.equal(1);
+		expect(h.saved[0]!.source.rev).to.equal(2);
+	});
+
 	it('survives a reputation sink that throws', async () => {
 		const h = harness(
 			{
