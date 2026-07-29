@@ -130,11 +130,17 @@ describe('Mesh Sanity Tests', () => {
 			const writerResult = await writer.coordinatorRepo.get({ blockIds: [blockId] });
 			expect(writerResult[blockId]?.block).to.not.equal(undefined);
 
-			// Reader gets a response — block entry exists even if sync is partial
-			// (full cross-node block replication requires restoreCallback on BlockStorage)
+			// The reader gets an entry for every id it asked for — `get` always returns one. What it
+			// does NOT get is the block. Read-repair can now acquire content it has never held (see
+			// coordinator-repo-read-repair-content.spec.ts), but only from a CORROBORATED revision:
+			// at responsibilityK=1 the reader's cohort view holds a single peer while the mesh's
+			// clusterSize is its node count (3), so the corroboration floor stays at two and the pass
+			// declines rather than converging on one peer's word.
 			const reader = mesh.nodes[1]!;
 			const readerResult = await reader.coordinatorRepo.get({ blockIds: [blockId] });
 			expect(readerResult[blockId]).to.not.equal(undefined);
+			expect(readerResult[blockId]?.block, 'a lone uncorroborated holder must not repair a reader')
+				.to.equal(undefined);
 		});
 
 		it('pend + commit through different nodes independently', async () => {

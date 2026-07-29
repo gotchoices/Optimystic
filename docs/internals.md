@@ -297,9 +297,12 @@ saveMaterializedBlock(block): store(structuredClone(block));
 - **A *behind* member actively reconciles.** It holds no usable revision of the committed
   blocks, so it pulls the committed revision from the cohort (via the injected
   `reconcileBlock` callback — `SyncClient` fetch + `saveReplicatedBlock` in
-  `libp2p-node-base`) and restores it locally, repairing the under-replication that
-  lazy read-repair alone cannot (no reachable peer the reader sees holds the newer
-  rev). It does **not** trust a single peer: the target `(rev, actionId)` must be
+  `libp2p-node-base`) and restores it locally, repairing the under-replication at the
+  moment of the commit rather than waiting for someone to read the block. The read path
+  is no longer blind to it: `CoordinatorRepo` is handed the *same* callback instance and
+  runs it once the cohort has corroborated a revision the reader cannot promote locally
+  (see [transactions.md](transactions.md#read-consistency-and-staleness)), so the two
+  paths heal by identical rules. It does **not** trust a single peer: the target `(rev, actionId)` must be
   corroborated by a quorum of distinct cohort archives, and the block content must
   hash byte-identically across a quorum, before it persists (`cluster/reconcile-block.ts`
   over `cluster/quorum-restore.ts`; the primitives are shared with `CoordinatorRepo`
@@ -317,7 +320,8 @@ saveMaterializedBlock(block): store(structuredClone(block));
   larger cohort out of that relaxed branch. No rev quorum, or no content quorum →
   it leaves the block for a later churn/rebalance retry (logged
   `reconcile:no-rev-quorum` / `reconcile:no-content-quorum`). Reconciliation is
-  best-effort and bounded (`ReconcileTimeoutMs`):
+  best-effort and bounded (`ReconcileTimeoutMs`, the shared `RECONCILE_TIMEOUT_MS` the read
+  path's acquisition also uses — same operation, same bound):
   failures/timeouts are logged (`cluster-member:consensus-commit-reconcile-failed`),
   never thrown. A pass that ran to completion logs
   `cluster-member:consensus-commit-reconcile-attempted` — deliberately *attempted*, since the

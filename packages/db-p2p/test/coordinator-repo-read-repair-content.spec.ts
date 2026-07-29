@@ -117,8 +117,11 @@ describe('CoordinatorRepo read-repair CONTENT convergence', function () {
 	 * Node A holds rev 2. Node B either stopped at rev 1 (`seedB: true`, the default — a CONTENT gap)
 	 * or has never seen the block at all (`seedB: false` — the case that blocks a fresh reader from
 	 * ever opening a collection whose header block it missed). B then reads and repairs itself from A.
+	 *
+	 * `restoreB: false` drops B's storage-layer restore callback, which is what makes a forward
+	 * revision genuinely unreachable by promotion — see the `promote-unavailable` spec.
 	 */
-	const buildDivergedPair = async ({ seedB = true }: { seedB?: boolean } = {}) => {
+	const buildDivergedPair = async ({ seedB = true, restoreB = true }: { seedB?: boolean, restoreB?: boolean } = {}) => {
 		const aStorage = new MemoryRawStorage();
 		const bStorage = new MemoryRawStorage();
 
@@ -126,7 +129,7 @@ describe('CoordinatorRepo read-repair CONTENT convergence', function () {
 		// B's restore callback is the in-process stand-in for RestorationCoordinator: when
 		// BlockStorage decides it needs a revision it does not hold, it pulls A's archive.
 		const restoreFromA: RestoreCallback = async (blockId) => await serveArchive(aRepo, blockId);
-		const bRepo = new StorageRepo(id => new BlockStorage(id, bStorage, restoreFromA));
+		const bRepo = new StorageRepo(id => new BlockStorage(id, bStorage, restoreB ? restoreFromA : undefined));
 
 		// A lands rev 1 then rev 2; B lands only rev 1, and only when seeded.
 		await writeRevision(aRepo, 'action-1' as ActionId, 1, 'v1');
@@ -285,6 +288,37 @@ describe('CoordinatorRepo read-repair CONTENT convergence', function () {
 	});
 
 	/**
+	 * A forward revision no local promotion can reach must be an ABSENCE, not a read failure.
+	 *
+	 * B holds metadata for the block (seeded by a pend of some unrelated action) but no committed
+	 * revision, so `StorageRepo.get` with the corroborated commit context finds no pending to promote
+	 * and then throws out of `BlockStorage.ensureRevision` — rev 2 is outside B's (empty) coverage
+	 * ranges and B has no storage-layer restore to supply it. That throw used to escape
+	 * `fetchBlockFromCluster` as `cluster-fetch:error`, ending the pass before the one mechanism that
+	 * CAN supply the revision ever ran. It must now be logged and stepped over.
+	 */
+	it('falls through to acquisition when no local promotion can reach the revision', async () => {
+		const { bRepo, bCoordinator } = await buildDivergedPair({ seedB: false, restoreB: false });
+		const pended = await bRepo.pend({
+			actionId: 'action-unrelated' as ActionId,
+			rev: 1,
+			transforms: { inserts: { [BLOCK_ID]: makeBlock('never-committed') }, updates: {}, deletes: [] } as Transforms,
+			policy: 'c'
+		});
+		expect(pended.success).to.equal(true);
+
+		const captured = await captureLog('coordinator-repo', async () => {
+			const served = await bCoordinator.get({ blockIds: [BLOCK_ID] });
+			expect(payloadOf(served[BLOCK_ID]?.block), 'the read still serves the cohort content').to.equal('v2');
+		});
+
+		expect(hasTag(captured, 'cluster-fetch:promote-unavailable'), 'the unreachable promotion is reported').to.equal(true);
+		expect(hasTag(captured, 'cluster-fetch:error'), 'but it must not abort the pass').to.equal(false);
+		expect(hasTagAtRev(captured, 'cluster-fetch:synced', 2), 'acquisition supplied it instead').to.equal(true);
+		expect((await bRepo.get({ blockIds: [BLOCK_ID] }))[BLOCK_ID]?.state?.latest?.rev).to.equal(2);
+	});
+
+	/**
 	 * The boundary that keeps acquisition affordable. An insert probes a fresh random block id for a
 	 * collision, and that read must not cost a block transfer. No peer claims the id, so nothing is
 	 * corroborated and `fetchBlockFromCluster` returns before the acquisition step — the absence stays
@@ -301,5 +335,10 @@ describe('CoordinatorRepo read-repair CONTENT convergence', function () {
 
 		expect(hasTag(captured, 'cluster-fetch:no-quorum'), 'nothing corroborated the id').to.equal(true);
 		expect(archiveFetches(), 'a genuine absence costs no archive fetch').to.equal(0);
+
+		// Control on the counter itself: a zero above must mean "the absence declined early", not
+		// "nothing is wired to this counter". The same fixture's corroborable block does fetch.
+		await bCoordinator.get({ blockIds: [BLOCK_ID] });
+		expect(archiveFetches(), 'a corroborated block does reach the archive fetch').to.be.greaterThan(0);
 	});
 });

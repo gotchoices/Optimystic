@@ -268,6 +268,13 @@ export class CoordinatorRepo implements IRepo {
 
 	async get(blockGets: BlockGets, options?: MessageOptions): Promise<GetBlockResults> {
 		// Soft proximity check — warn but still serve reads for graceful degradation
+		// NOTE: a soft-served read now also *acquires* the block durably (see restoreCorroborated), where
+		// before it could at most promote a pending this node already held. So a soft serve leaves behind
+		// a replica of a block this node is not responsible for, and nothing sweeps those: ring-shift
+		// sheds a keyspace RANGE, not "blocks outside my cohort". Fine while soft serves are what they
+		// are meant to be — a rare degradation during routing churn — since routing already placed this
+		// node near the block. If they ever become routine, gate acquisition (not the serve itself) on
+		// isResponsibleForBlock.
 		for (const blockId of blockGets.blockIds) {
 			if (!await this.isResponsibleForBlock(blockId)) {
 				log('proximity:get-warning', { blockId, msg: 'serving read for non-responsible block' });
@@ -487,6 +494,12 @@ export class CoordinatorRepo implements IRepo {
 			// inside the callback via `saveReplicatedBlock`, which takes the per-block commit latch —
 			// safe to call from here because the read path holds no latch of its own (`StorageRepo.get`
 			// acquires and releases it around the promotion above, and nothing wraps this method).
+			// NOTE: `get` walks its block ids sequentially, so the bound is per block, not per call — a
+			// multi-block read that is missing N blocks against a wholly stalled cohort waits N × this.
+			// Acceptable today (the underlying per-peer archive fetch is itself 1s-bounded and runs the
+			// cohort in parallel, so the 5s is a stall ceiling, not a typical cost). If a cold reader
+			// batching a wide read ever times out above this layer, repair the block ids concurrently
+			// rather than shortening the bound.
 			await withDeadline(
 				this.acquireBlockFromCohort(blockId, corroborated, cohortPeerIds),
 				RECONCILE_TIMEOUT_MS,
