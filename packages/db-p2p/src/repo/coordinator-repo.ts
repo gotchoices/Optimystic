@@ -145,8 +145,12 @@ export class CoordinatorRepo implements IRepo {
 	private readonly readRepairSampleRate: number;
 	/** Simple-majority threshold from the consensus policy; drives the read-repair corroboration quorum. */
 	private readonly simpleMajorityThreshold: number;
-	/** Configured full cluster size; the operator's declaration of how many corroborators should exist. */
-	private readonly clusterSize: number;
+	/**
+	 * The smallest cohort the operator asserts this deployment can genuinely field; the floor for
+	 * {@link corroboratorCapacity}. Falls back to `clusterSize` (see the constructor) when unset, so a
+	 * caller that has not adopted `assumedClusterSize` keeps today's behavior exactly.
+	 */
+	private readonly assumedClusterSize: number;
 	/** Resolved super-majority threshold the coordinator commits on (mirrors the value handed to ClusterCoordinator). */
 	private readonly superMajorityThreshold: number;
 	private readonly reputation?: IPeerReputation;
@@ -171,6 +175,7 @@ export class CoordinatorRepo implements IRepo {
 		this.localPeerId = localPeerId;
 		const policy: ClusterConsensusConfig & { clusterSize: number } = {
 			clusterSize: cfg?.clusterSize ?? 10,
+			assumedClusterSize: cfg?.assumedClusterSize,
 			superMajorityThreshold: cfg?.superMajorityThreshold ?? DEFAULT_SUPER_MAJORITY_THRESHOLD,
 			simpleMajorityThreshold: cfg?.simpleMajorityThreshold ?? 0.51,
 			minAbsoluteClusterSize: cfg?.minAbsoluteClusterSize ?? 3,
@@ -195,7 +200,12 @@ export class CoordinatorRepo implements IRepo {
 		this.readRepairSampleRate = policy.readRepairSampleRate!;
 		this.simpleMajorityThreshold = policy.simpleMajorityThreshold;
 		this.superMajorityThreshold = policy.superMajorityThreshold;
-		this.clusterSize = policy.clusterSize;
+		// Unlike the membership admission gate (which treats an absent assumedClusterSize as "unknown"
+		// and admits — refusing writes outright is unacceptable), this falls back to the replication
+		// factor and stays strict: the failure mode of getting this wrong is a block that goes
+		// unrepaired, degraded rather than dead, so there is no reason to relax it for a caller that
+		// has not adopted the new field.
+		this.assumedClusterSize = policy.assumedClusterSize ?? policy.clusterSize;
 		this.reputation = reputation;
 		const localClusterRef = localCluster && localPeerId ? {
 			update: localCluster.update.bind(localCluster),
@@ -445,8 +455,8 @@ export class CoordinatorRepo implements IRepo {
 		// window before retrying.
 		// NOTE: that damping covers only a block this node holds at an OLDER revision. A block entirely
 		// missing locally never consults the window (`get` triggers on `isMissing` before
-		// `shouldReadRepair`), so a persistently failing acquisition — e.g. a two-node deployment left
-		// at the default `clusterSize: 10`, where the content quorum can never be met — re-fetches an
+		// `shouldReadRepair`), so a persistently failing acquisition — e.g. a two-node deployment that
+		// never set `assumedClusterSize`, where the content quorum can never be met — re-fetches an
 		// archive on every read of that block. Correct, and self-limiting once the cohort can agree; if
 		// it ever shows as read amplification, gate the acquisition step (not the latest-query) on the
 		// same window rather than widening `isMissing`.
@@ -587,7 +597,7 @@ export class CoordinatorRepo implements IRepo {
 			claims.push({ peerId: peerIdStr, rev: value.rev, actionId: value.actionId });
 		}
 
-		const capacity = corroboratorCapacity(peerIds.filter(id => id !== selfId).length, this.clusterSize);
+		const capacity = corroboratorCapacity(peerIds.filter(id => id !== selfId).length, this.assumedClusterSize);
 		const selected = selectQuorumRev(claims, this.simpleMajorityThreshold, capacity);
 		if (!selected) {
 			log('cluster-fetch:no-quorum', {

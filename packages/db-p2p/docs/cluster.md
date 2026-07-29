@@ -738,16 +738,26 @@ interface ClusterConsensusConfig {
   selecting a cohort. It says nothing about how many peers exist. Nothing may use it as a security
   yardstick.
 - `assumedClusterSize` is **how many peers the operator asserts genuinely exist** — normally
-  `min(clusterSize, nodes you actually run)`. It is read *only* by the membership admission gate, and only
-  on the fallback path where the member has no confident network-size estimate (which is what a partition
-  induces). There it stands in for the measured estimate: the declared peer set must be at least
-  `max(minAbsoluteClusterSize, ⌈membershipAdmissionFraction · assumedClusterSize⌉)`.
+  `min(clusterSize, nodes you actually run)`. Two independent consumers read it:
+  - The **membership admission gate**, only on the fallback path where the member has no confident
+    network-size estimate (which is what a partition induces). There it stands in for the measured
+    estimate: the declared peer set must be at least
+    `max(minAbsoluteClusterSize, ⌈membershipAdmissionFraction · assumedClusterSize⌉)`. When absent
+    altogether the gate treats the size as *unknown* and admits (legacy behavior), because refusing
+    every write is the worse failure.
+  - The **read-repair and reconcile corroboration floor** (`corroboratorCapacity` in
+    `cluster/quorum-restore.ts`), unconditionally: `max(peers currently visible, assumedClusterSize − 1)`
+    caps how many corroborators a restoration can be required to produce. Here an absent value falls
+    back to `clusterSize` instead of being treated as unknown — a block that stays unrepaired is
+    degraded, not dead, so there is no reason to relax the floor for a caller that has not adopted the
+    field.
 
 `libp2p-node-base` defaults `assumedClusterSize` to `minAbsoluteClusterSize` (2), so a two- or three-node
-mesh transacts without configuration. A large deployment should set `clusterPolicy.assumedClusterSize` to
-its real cohort size — otherwise the gate cannot police a partition-induced downsize while its own size
-estimate is unconfident. When `assumedClusterSize` is absent altogether the gate treats the size as
-*unknown* and admits (legacy behavior), because refusing every write is the worse failure.
+mesh both transacts and repairs itself without configuration. A large deployment should set
+`clusterPolicy.assumedClusterSize` to its real cohort size — otherwise the admission gate cannot police a
+partition-induced downsize while its own size estimate is unconfident, and read-repair/reconcile demand
+only as many corroborators as that asserted size allows. Setting `clusterSize` alone (the old advice) no
+longer has this effect — `clusterSize` is replication-only.
 
 **Configuration in libp2p-node.ts:**
 ```typescript

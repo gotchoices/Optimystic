@@ -393,14 +393,18 @@ describe('CoordinatorRepo read-repair', () => {
 			localPeer: PeerId,
 			cluster: ClusterPeers,
 			clusterLatestCallback: ClusterLatestCallback,
-			cfg?: { clusterSize?: number; rev?: number }
+			cfg?: { clusterSize?: number; assumedClusterSize?: number; rev?: number }
 		) => {
 			const { repo: storageRepo, calls } = makePresentStorageRepo(blockId, cfg?.rev ?? localRev, localActionId);
 			const repo = new CoordinatorRepo(
 				makeKeyNetwork(cluster),
 				makeClusterClient,
 				storageRepo,
-				{ clusterSize: cfg?.clusterSize ?? 2, readRepairMode: 'paranoid' },
+				{
+					clusterSize: cfg?.clusterSize ?? 2,
+					assumedClusterSize: cfg?.assumedClusterSize,
+					readRepairMode: 'paranoid'
+				},
 				undefined,
 				localPeer,
 				undefined,
@@ -522,8 +526,9 @@ describe('CoordinatorRepo read-repair', () => {
 			const localPeer = await makePeerId();
 			const otherPeer = await makePeerId();
 			// findCluster is unauthenticated: a partition (or a routing-level attacker) can
-			// shrink this node's view to itself plus one peer. The corroboration floor is
-			// measured against the CONFIGURED size, so the shrunken view cannot talk it down.
+			// shrink this node's view to itself plus one peer. `assumedClusterSize` is omitted, so
+			// this also pins the fallback: the floor is measured against `clusterSize`, reproducing
+			// today's behavior exactly for a caller that has not adopted the new field.
 			const cluster = makeClusterPeers([localPeer, otherPeer]);
 
 			const remoteLatest: ActionRev = { actionId: 'remote-action', rev: 2 };
@@ -538,6 +543,29 @@ describe('CoordinatorRepo read-repair', () => {
 
 			expect(calls.find(c => c.context !== undefined), 'a lone claim must not be adopted here').to.equal(undefined);
 			expect(hasTag(captured, 'cluster-fetch:no-quorum')).to.equal(true);
+		});
+
+		it('heals via assumedClusterSize even when clusterSize (replication factor) stays large', async () => {
+			// The healing case this ticket exists for: a genuine two-node deployment that declares
+			// assumedClusterSize: 2 can repair itself WITHOUT also lowering its replication factor —
+			// unlike the old advice of configuring clusterSize: 2 to get the same effect.
+			const localPeer = await makePeerId();
+			const otherPeer = await makePeerId();
+			const cluster = makeClusterPeers([localPeer, otherPeer]);
+
+			const remoteLatest: ActionRev = { actionId: 'remote-action', rev: 2 };
+			const { repo, calls } = makeRepo(
+				localPeer,
+				cluster,
+				makeSelfAnsweringCallback(localPeer, remoteLatest),
+				{ clusterSize: 10, assumedClusterSize: 2 }
+			);
+
+			const captured = await captureCoordinatorLog(async () => { await repo.get({ blockIds: [blockId] }); });
+
+			const restore = calls.find(c => c.context?.rev === remoteLatest.rev);
+			expect(restore, 'the sole peer\'s claim must corroborate under the asserted size').to.not.equal(undefined);
+			expect(hasTagAtRev(captured, 'cluster-fetch:synced', remoteLatest.rev)).to.equal(true);
 		});
 
 		it('a declined repair does not suppress the next attempt', async () => {

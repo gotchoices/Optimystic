@@ -10,7 +10,8 @@
  *
  * Both restoration quorums (revision claim, then block content) are capped by the number of peers
  * that could answer at all, so a cohort with one other peer can converge; a cohort that merely
- * *looks* small — a full-size `clusterSize` with a shrunken observed peer set — still demands two.
+ * *looks* small — a full-size `assumedClusterSize` with a shrunken observed peer set — still
+ * demands two.
  */
 
 import { expect } from 'chai';
@@ -60,7 +61,7 @@ const harness = (
 	const reconcile = createReconcileBlock({
 		selfPeerId: SELF,
 		simpleMajorityThreshold: THRESHOLD,
-		clusterSize: 2,
+		assumedClusterSize: 2,
 		async fetchArchive(peerId) {
 			fetches.push(peerId);
 			return archives[peerId];
@@ -102,7 +103,7 @@ describe('createReconcileBlock (commit-path block restoration)', () => {
 	it('still demands two corroborators when the cohort only LOOKS two-node', async () => {
 		// Same single observed peer, but the operator declared a full-size cluster. A shrunken
 		// view (partition, or routing influence) must not be able to talk the requirement down.
-		const h = harness({ [PEER_A]: archiveAt(2, 'action-2', makeBlock('v2')) }, { clusterSize: 10 });
+		const h = harness({ [PEER_A]: archiveAt(2, 'action-2', makeBlock('v2')) }, { assumedClusterSize: 10 });
 
 		await h.reconcile(BLOCK_ID, COMMITTED, [PEER_A]);
 
@@ -156,7 +157,7 @@ describe('createReconcileBlock (commit-path block restoration)', () => {
 				p2: archiveAt(2, 'action-2', makeBlock('v2')),
 				evil: archiveAt(2, 'action-2', makeBlock('tampered'))
 			},
-			{ clusterSize: 4 }
+			{ assumedClusterSize: 4 }
 		);
 
 		await h.reconcile(BLOCK_ID, COMMITTED, ['p1', 'p2', 'evil']);
@@ -174,7 +175,7 @@ describe('createReconcileBlock (commit-path block restoration)', () => {
 				b1: archiveAt(2, 'action-2', makeBlock('B')),
 				b2: archiveAt(2, 'action-2', makeBlock('B'))
 			},
-			{ clusterSize: 5 }
+			{ assumedClusterSize: 5 }
 		);
 
 		await h.reconcile(BLOCK_ID, COMMITTED, ['a1', 'a2', 'b1', 'b2']);
@@ -189,7 +190,7 @@ describe('createReconcileBlock (commit-path block restoration)', () => {
 				p2: archiveAt(2, 'action-2', makeBlock('v2')),
 				liar: archiveAt(99, 'bogus', makeBlock('bogus'))
 			},
-			{ clusterSize: 4 }
+			{ assumedClusterSize: 4 }
 		);
 
 		await h.reconcile(BLOCK_ID, COMMITTED, ['p1', 'p2', 'liar']);
@@ -208,7 +209,7 @@ describe('createReconcileBlock (commit-path block restoration)', () => {
 		const reconcile = createReconcileBlock({
 			selfPeerId: SELF,
 			simpleMajorityThreshold: THRESHOLD,
-			clusterSize: 4,
+			assumedClusterSize: 4,
 			async fetchArchive(peerId) {
 				if (peerId === 'broken') throw new Error('stream reset');
 				return archives[peerId];
@@ -242,7 +243,7 @@ describe('createReconcileBlock (commit-path block restoration)', () => {
 				evil: archiveAt(2, 'action-2', makeBlock('tampered'))
 			},
 			{
-				clusterSize: 4,
+				assumedClusterSize: 4,
 				reputation: { reportPeer: () => { throw new Error('reputation store down'); } }
 			}
 		);

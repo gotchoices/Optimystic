@@ -54,17 +54,19 @@ describe('quorum-restore primitives', () => {
 	/**
 	 * The rule both restoration paths measure their floor against. It was written twice — once in
 	 * `CoordinatorRepo`, once in `reconcile-block` — and is now shared, so it is pinned here rather
-	 * than only through its two callers.
+	 * than only through its two callers. The second argument is `assumedClusterSize` — the smallest
+	 * cohort the operator asserts this deployment can genuinely field — not the replication factor
+	 * (`clusterSize`); see the doc comment on `corroboratorCapacity`.
 	 */
 	describe('corroboratorCapacity', () => {
-		it('is the visible peer count when the cohort is at or above the configured size', () => {
+		it('is the visible peer count when the cohort is at or above the asserted size', () => {
 			expect(corroboratorCapacity(9, 10)).to.equal(9);
 			expect(corroboratorCapacity(12, 10)).to.equal(12); // an oversized cohort raises the bar
 		});
 
-		it('holds the configured size as a floor so a shrunken view cannot relax anything', () => {
-			// One peer visible in a cohort configured for ten: the requirement stays at what ten
-			// members could supply, so a partition (or a routing-level attacker) gains nothing.
+		it('holds the asserted size as a floor so a shrunken view cannot relax anything', () => {
+			// One peer visible in a cohort whose assumedClusterSize is ten: the requirement stays at
+			// what ten members could supply, so a partition (or a routing-level attacker) gains nothing.
 			expect(corroboratorCapacity(1, 10)).to.equal(9);
 			expect(quorumSize(1, THRESHOLD, corroboratorCapacity(1, 10))).to.equal(2);
 		});
@@ -74,9 +76,9 @@ describe('quorum-restore primitives', () => {
 			expect(quorumSize(1, THRESHOLD, corroboratorCapacity(1, 2))).to.equal(1);
 		});
 
-		it('never goes negative for a degenerate configured size', () => {
-			// clusterSize 1 (or 0) implies no other peer at all; the capacity must not underflow the
-			// `Math.max(1, ...)` guard in quorumSize into accepting a claim from nobody.
+		it('never goes negative for a degenerate asserted size', () => {
+			// assumedClusterSize 1 (or 0) implies no other peer at all; the capacity must not underflow
+			// the `Math.max(1, ...)` guard in quorumSize into accepting a claim from nobody.
 			expect(corroboratorCapacity(0, 1)).to.equal(0);
 			expect(corroboratorCapacity(0, 0)).to.equal(0);
 			expect(selectQuorumRev([], THRESHOLD, corroboratorCapacity(0, 1))).to.equal(undefined);
@@ -184,8 +186,8 @@ describe('quorum-restore primitives', () => {
 		 * peer is believed unconditionally. Claims are bare assertions — a `BlockArchive` carries
 		 * no commit certificate — so nothing here can tell a lag from a lie. A 2-member cohort has
 		 * no Byzantine tolerance to lose (there is no honest majority to appeal to), and the
-		 * capacity is measured against the CONFIGURED cluster size so a shrunken view of a larger
-		 * network cannot reach this branch. See `debt-read-repair-commit-cert-verification`.
+		 * capacity is measured against the ASSERTED cluster size (`assumedClusterSize`) so a shrunken
+		 * view of a larger network cannot reach this branch. See `debt-read-repair-commit-cert-verification`.
 		 */
 		it('a sole cohort peer is believed even when its rev is absurd (documented exposure)', () => {
 			const claims: RevClaim[] = [{ peerId: 'node-a', rev: 999_999, actionId: 'absurd' }];

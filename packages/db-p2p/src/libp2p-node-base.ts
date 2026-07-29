@@ -175,11 +175,12 @@ export type NodeOptions = {
 	/** Storage provider - either an IRawStorage instance or a factory function. Defaults to MemoryRawStorage if not provided. */
 	storage?: RawStorageProvider;
 	/**
-	 * Desired cluster size per key (default 10). Beyond sizing the cohort, this is the
-	 * node's declaration of how many peers *should* exist to corroborate a claim: the
-	 * read-repair corroboration floor is measured against it, so a genuine two-node
-	 * deployment must set `clusterSize: 2` for its members to be able to repair each
-	 * other (see `corroboratorCapacity` in `cluster/quorum-restore.ts`).
+	 * Desired cluster size per key (default 10) — the replication factor / target cohort breadth
+	 * the coordinator aims for. NOT a statement about how many peers actually exist: neither the
+	 * membership admission gate nor the read-repair/reconcile corroboration floor is measured
+	 * against it. A deployment that genuinely runs fewer peers than this should set
+	 * `clusterPolicy.assumedClusterSize` instead (see `corroboratorCapacity` in
+	 * `cluster/quorum-restore.ts` and the admission gate in `cluster/cluster-repo.ts`).
 	 */
 	clusterSize?: number;
 	clusterPolicy?: {
@@ -766,7 +767,7 @@ export async function createLibp2pNodeBase(
 		fetchArchive: fetchArchiveFromPeer,
 		saveReplicatedBlock: (blockId, block, source) => storageRepo.saveReplicatedBlock(blockId, block, source),
 		simpleMajorityThreshold: consensusConfig.simpleMajorityThreshold,
-		clusterSize: consensusConfig.clusterSize,
+		assumedClusterSize: consensusConfig.assumedClusterSize,
 		reputation
 	});
 

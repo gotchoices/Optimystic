@@ -38,8 +38,14 @@ export interface ReconcileBlockDeps {
 	saveReplicatedBlock: (blockId: BlockId, block: IBlock, source: ActionRev) => Promise<void>;
 	/** Proportional corroboration threshold; the cohort's `simpleMajorityThreshold`. */
 	simpleMajorityThreshold: number;
-	/** Configured full cluster size — the floor for {@link corroboratorCapacity}. */
-	clusterSize: number;
+	/**
+	 * The smallest cohort the operator asserts this deployment can genuinely field — the floor for
+	 * {@link corroboratorCapacity}. Unlike the membership admission gate, an absent value here should
+	 * fall back to the configured `clusterSize` rather than being treated as "unknown": the failure
+	 * mode of getting this wrong is a block that stays unrepaired (degraded, not dead), not a refused
+	 * write, so there is no reason to relax it just because the caller has not adopted the new field.
+	 */
+	assumedClusterSize: number;
 	/** Best-effort misbehavior reporting; a throwing implementation is swallowed. */
 	reputation?: Pick<IPeerReputation, 'reportPeer'>;
 }
@@ -158,7 +164,7 @@ export function createReconcileBlock(deps: ReconcileBlockDeps): ReconcileBlockCa
 			targets.map(peerId => fetchCandidate(deps, peerId, blockId, committed.rev))
 		);
 		const candidates = fetched.filter((c): c is ReconcileCandidate => c !== undefined);
-		const capacity = corroboratorCapacity(targets.length, deps.clusterSize);
+		const capacity = corroboratorCapacity(targets.length, deps.assumedClusterSize);
 
 		const revClaims: RevClaim[] = candidates.map(({ peerId, rev, actionId }) => ({ peerId, rev, actionId }));
 		const selected = selectQuorumRev(revClaims, deps.simpleMajorityThreshold, capacity);
