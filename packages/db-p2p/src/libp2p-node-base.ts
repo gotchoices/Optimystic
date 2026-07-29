@@ -20,12 +20,12 @@ import { MemoryRawStorage } from './storage/memory-storage.js';
 import type { IRawStorage } from './storage/i-raw-storage.js';
 import { seedOwnedBlocksFromStorage } from './owned-block-seed.js';
 import { clusterMember, type ReconcileBlockCallback, type CommitCertificateSink, type DeriveExpectedClusterCallback } from './cluster/cluster-repo.js';
-import { selectQuorumRev, selectQuorumBlock, canonicalBlockHash, type RevClaim, type BlockHashCandidate } from './cluster/quorum-restore.js';
+import { createReconcileBlock } from './cluster/reconcile-block.js';
 import { createCommitCertStore, makeClusterCommitCertExtractor, type CommitCertStore } from './cluster/commit-cert.js';
 import { coordinatorRepo } from './repo/coordinator-repo.js';
 import { Libp2pKeyPeerNetwork, type NetworkMode, type NetworkStatePersistence } from './libp2p-key-network.js';
 import { ClusterClient } from './cluster/client.js';
-import type { IRepo, ICluster, ITransactionValidator, BlockId, IBlock, IBlockChangeNotifier } from '@optimystic/db-core';
+import type { IRepo, ICluster, ITransactionValidator, BlockId, IBlockChangeNotifier } from '@optimystic/db-core';
 import type { ITransactionStateStore } from './cluster/i-transaction-state-store.js';
 import { networkManagerService, type NetworkManagerService } from './network/network-manager-service.js';
 import type { SpreadOnChurnConfig, SpreadOnChurnMonitor } from './cluster/spread-on-churn.js';
@@ -85,7 +85,6 @@ import { assertSuperMajorityCoupling } from './cluster/supermajority-coupling.js
 import { createLogger } from './logger.js';
 import { PeerReputationService } from './reputation/peer-reputation.js';
 import type { IPeerReputation } from './reputation/types.js';
-import { PenaltyReason } from './reputation/types.js';
 import { DisputeService } from './dispute/dispute-service.js';
 import { DisputeClient } from './dispute/client.js';
 import { sampleArbitrators } from './dispute/arbitrator-selection.js';
@@ -691,69 +690,18 @@ export async function createLibp2pNodeBase(
 		}
 	};
 
-	// Active reconciliation for a block this member committed without the matching pend
-	// (cohort drift). Queries the commit cohort (self already excluded) for the block,
-	// picks the highest revision that is at least the committed rev, and persists it via
-	// the churn-replication funnel so the block is no longer under-replicated.
-	const reconcileBlock: ReconcileBlockCallback = async (blockId, committed, cohortPeerIds) => {
-		const targets = cohortPeerIds.filter(id => id !== node.peerId.toString());
-		if (targets.length === 0) return;
-
-		const fetched = await Promise.all(
-			targets.map(async peerIdStr => ({ peerIdStr, archive: await fetchArchiveFromPeer(peerIdStr, blockId) }))
-		);
-
-		// Each cohort archive contributes one (rev, actionId) claim from its max
-		// revision (>= the rev we committed). Pick the target rev by quorum
-		// corroboration rather than raw Math.max — a lone peer inflating its rev
-		// cannot steer reconciliation. Keep the serving peer + block per candidate
-		// so we can then verify content agreement.
-		// NOTE: this quorum is corroboration-of-a-claim, NOT Sybil-resistant cohort
-		// membership — deferred to backlog `debt-read-repair-commit-cert-verification`.
-		const candidates: { peerIdStr: string; rev: number; actionId: string; block?: IBlock }[] = [];
-		for (const { peerIdStr, archive } of fetched) {
-			if (!archive) continue;
-			const revs = Object.keys(archive.revisions).map(Number);
-			if (revs.length === 0) continue;
-			const maxRev = Math.max(...revs);
-			if (maxRev < committed.rev) continue;
-			const data = archive.revisions[maxRev];
-			if (!data?.action) continue;
-			candidates.push({ peerIdStr, rev: maxRev, actionId: data.action.actionId, block: data.block });
-		}
-
-		const revClaims: RevClaim[] = candidates.map(c => ({ peerId: c.peerIdStr, rev: c.rev, actionId: c.actionId }));
-		const selected = selectQuorumRev(revClaims, consensusConfig.simpleMajorityThreshold);
-		if (!selected) return; // no rev corroborated by a quorum → leave block, churn/rebalance retries later
-
-		// Content agreement: among archives corroborating the chosen (rev, actionId)
-		// and actually carrying the block, the content must be byte-identical across
-		// a quorum. A cohort member serving content that hashes differently is rejected.
-		// NOTE: selectQuorumBlock recomputes its quorum over only the block-CARRYING
-		// corroborators, not the full rev-responder set. If most peers corroborate the
-		// rev but few carry block bytes (e.g. mid-prune), the content quorum can shrink
-		// to 2. Harmless with honest peers; if a colluding pair ever becomes the only
-		// block-servers for an agreed rev, that is the Sybil regime already deferred to
-		// backlog `debt-read-repair-commit-cert-verification`.
-		const corroborating = candidates.filter(c => c.rev === selected.rev && c.actionId === selected.actionId && c.block);
-		const hashCandidates: BlockHashCandidate[] = await Promise.all(
-			corroborating.map(async c => ({ peerId: c.peerIdStr, hash: await canonicalBlockHash(c.block!), block: c.block! }))
-		);
-		const agreed = selectQuorumBlock(hashCandidates, consensusConfig.simpleMajorityThreshold);
-		if (!agreed) return; // no content quorum → skip persist
-
-		// Best-effort: penalize cohort members that served content contradicting the
-		// agreed hash for the same committed (rev, actionId). Never let this throw.
-		try {
-			for (const c of hashCandidates) {
-				if (c.hash !== agreed.hash) {
-					reputation.reportPeer(c.peerId, PenaltyReason.InvalidRestoration, `reconcile:${blockId}`);
-				}
-			}
-		} catch { /* reputation write must never block restoration */ }
-
-		await storageRepo.saveReplicatedBlock(blockId, agreed.block, { actionId: selected.actionId, rev: selected.rev });
-	};
+	// Active reconciliation for a block this member committed without a materializable base
+	// (cohort drift, or a refused `missing-base-revision` commit). See `reconcile-block.ts` for
+	// the corroboration rules — in particular why both quorums are capped by how many peers
+	// could answer at all, which is what lets a genuinely two-node cohort heal.
+	const reconcileBlock: ReconcileBlockCallback = createReconcileBlock({
+		selfPeerId: node.peerId.toString(),
+		fetchArchive: fetchArchiveFromPeer,
+		saveReplicatedBlock: (blockId, block, source) => storageRepo.saveReplicatedBlock(blockId, block, source),
+		simpleMajorityThreshold: consensusConfig.simpleMajorityThreshold,
+		clusterSize: consensusConfig.clusterSize,
+		reputation
+	});
 
 	// Member-side membership derivation for the admission gate: independently re-derive this block's
 	// responsible cluster from the SAME source the coordinator uses (IKeyNetwork.findCluster), plus FRET's

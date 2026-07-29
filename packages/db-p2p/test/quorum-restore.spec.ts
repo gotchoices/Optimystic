@@ -215,8 +215,42 @@ describe('quorum-restore primitives', () => {
 
 		it('declines when only a single block is available (no content quorum)', async () => {
 			const cands = await Promise.all([hashed('h1', block('b', { payload: 'ok' }))]);
-			// quorum is 2; a lone block cannot be corroborated → skip persist.
+			// Unstated capacity ⇒ floor 2; a lone block cannot be corroborated → skip persist.
 			expect(selectQuorumBlock(cands, THRESHOLD)).to.equal(undefined);
+			// A second block-carrier could have existed and merely did not answer → still declines.
+			expect(selectQuorumBlock(cands, THRESHOLD, 4)).to.equal(undefined);
+		});
+
+		/**
+		 * Ticket: bug-reconcile-cannot-heal-two-node-cohort. The content gate was left on the
+		 * strict floor when `50af693` capped the revision-claim gate, so a cohort with exactly one
+		 * other peer could select the right revision and then decline its only copy of the bytes —
+		 * a permanent decline, not a safety property.
+		 */
+		it('accepts a lone block only when it is the ONLY peer that could carry one', async () => {
+			const only = block('b', { payload: 'ok' });
+			const cands = await Promise.all([hashed('node-a', only)]);
+			const sel = selectQuorumBlock(cands, THRESHOLD, 1);
+			expect(sel, 'a two-node cohort must be able to move bytes').to.not.equal(undefined);
+			expect(sel!.hash).to.equal(await canonicalBlockHash(only));
+		});
+
+		it('caps the FLOOR only — a larger carrier set still needs a proportional majority', async () => {
+			// 6 carriers split 3/3 with capacity 1: floor drops to 1 but floor(0.51×6)=3 still rules,
+			// and both groups reach 3 → ambiguous → decline.
+			const cands = await Promise.all([
+				hashed('a1', block('b', { payload: 'A' })), hashed('a2', block('b', { payload: 'A' })),
+				hashed('a3', block('b', { payload: 'A' })), hashed('b1', block('b', { payload: 'B' })),
+				hashed('b2', block('b', { payload: 'B' })), hashed('b3', block('b', { payload: 'B' }))
+			]);
+			expect(selectQuorumBlock(cands, THRESHOLD, 1)).to.equal(undefined);
+		});
+
+		it('counts one vote per distinct peer (a repeated peer cannot second itself)', async () => {
+			const dup = block('b', { payload: 'ok' });
+			const cands = await Promise.all([hashed('same-peer', dup), hashed('same-peer', dup)]);
+			// Two candidates but ONE voter; the floor of 2 is not met by a peer echoing itself.
+			expect(selectQuorumBlock(cands, THRESHOLD, 4)).to.equal(undefined);
 		});
 
 		it('declines on an even content split (ambiguous, no unique quorum)', async () => {

@@ -301,12 +301,21 @@ saveMaterializedBlock(block): store(structuredClone(block));
   lazy read-repair alone cannot (no reachable peer the reader sees holds the newer
   rev). It does **not** trust a single peer: the target `(rev, actionId)` must be
   corroborated by a quorum of distinct cohort archives, and the block content must
-  hash byte-identically across a quorum, before it persists (`cluster/quorum-restore.ts`;
-  shared with `CoordinatorRepo` read-repair, which excludes the reader's own revision from
-  that quorum and caps the corroboration floor at how many peers *could* corroborate — see
+  hash byte-identically across a quorum, before it persists (`cluster/reconcile-block.ts`
+  over `cluster/quorum-restore.ts`; the primitives are shared with `CoordinatorRepo`
+  read-repair, which excludes the reader's own revision from that quorum — see
   [transactions.md § Read Consistency and Staleness](transactions.md#read-consistency-and-staleness)).
-  No rev quorum, or no content quorum →
-  it leaves the block for a later churn/rebalance retry. Reconciliation is
+  **Both** quorums cap their floor at `max(cohort peers excluding self, clusterSize − 1)`,
+  the same `corroboratorCapacity` shape the read-repair path uses: a cohort with exactly one
+  other peer cannot supply two corroborators *or* two block-carriers, so demanding two would
+  make such a cohort permanently unable to heal rather than making it safe. Block ids are
+  random, not content-addressed, so the content hash is a cross-peer *agreement* check and
+  never a check against the requested id — at capacity one the sole peer's bytes are taken on
+  its word, which is the same trust its (equally uncorroborable) revision claim already gets.
+  Taking the MAX against the configured `clusterSize` is what keeps a *shrunken view* of a
+  larger cohort out of that relaxed branch. No rev quorum, or no content quorum →
+  it leaves the block for a later churn/rebalance retry (logged
+  `reconcile:no-rev-quorum` / `reconcile:no-content-quorum`). Reconciliation is
   best-effort and bounded (`ReconcileTimeoutMs`):
   failures/timeouts are logged (`cluster-member:consensus-commit-reconcile-failed`),
   never thrown. An *ahead* member already holds ≥ the rev, so it does not reconcile
