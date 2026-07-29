@@ -12,7 +12,7 @@
 import { expect } from 'chai';
 import type { IBlock } from '@optimystic/db-core';
 import {
-	quorumSize, selectQuorumRev, selectQuorumBlock, canonicalBlockHash,
+	quorumSize, corroboratorCapacity, selectQuorumRev, selectQuorumBlock, canonicalBlockHash,
 	type RevClaim, type BlockHashCandidate
 } from '../src/cluster/quorum-restore.js';
 
@@ -48,6 +48,38 @@ describe('quorum-restore primitives', () => {
 			// capacity 1 lowers the floor to 1, but 6 responders still demand floor(3.06)=3.
 			expect(quorumSize(6, THRESHOLD, 1)).to.equal(3);
 			expect(quorumSize(10, THRESHOLD, 1)).to.equal(5);
+		});
+	});
+
+	/**
+	 * The rule both restoration paths measure their floor against. It was written twice — once in
+	 * `CoordinatorRepo`, once in `reconcile-block` — and is now shared, so it is pinned here rather
+	 * than only through its two callers.
+	 */
+	describe('corroboratorCapacity', () => {
+		it('is the visible peer count when the cohort is at or above the configured size', () => {
+			expect(corroboratorCapacity(9, 10)).to.equal(9);
+			expect(corroboratorCapacity(12, 10)).to.equal(12); // an oversized cohort raises the bar
+		});
+
+		it('holds the configured size as a floor so a shrunken view cannot relax anything', () => {
+			// One peer visible in a cohort configured for ten: the requirement stays at what ten
+			// members could supply, so a partition (or a routing-level attacker) gains nothing.
+			expect(corroboratorCapacity(1, 10)).to.equal(9);
+			expect(quorumSize(1, THRESHOLD, corroboratorCapacity(1, 10))).to.equal(2);
+		});
+
+		it('relaxes only for a cohort explicitly declared that small', () => {
+			expect(corroboratorCapacity(1, 2)).to.equal(1);
+			expect(quorumSize(1, THRESHOLD, corroboratorCapacity(1, 2))).to.equal(1);
+		});
+
+		it('never goes negative for a degenerate configured size', () => {
+			// clusterSize 1 (or 0) implies no other peer at all; the capacity must not underflow the
+			// `Math.max(1, ...)` guard in quorumSize into accepting a claim from nobody.
+			expect(corroboratorCapacity(0, 1)).to.equal(0);
+			expect(corroboratorCapacity(0, 0)).to.equal(0);
+			expect(selectQuorumRev([], THRESHOLD, corroboratorCapacity(0, 1))).to.equal(undefined);
 		});
 	});
 

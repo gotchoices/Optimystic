@@ -64,6 +64,26 @@ export function quorumSize(
 }
 
 /**
+ * The `corroboratorCapacity` to hand {@link quorumSize}: how many peers other than the asking node
+ * could answer for a block at all, given `cohortPeerCount` peers currently visible (self already
+ * excluded) and the configured `clusterSize`.
+ *
+ * Deliberately the MAX of the two: the corroboration floor may be relaxed only for a cohort that is
+ * *genuinely* small, never for one that merely looks small. Cohort views are unauthenticated — the
+ * read path takes them from `IKeyNetwork.findCluster`, the commit path from a coordinator-declared
+ * peer set — so a partition, a self-shrunk record, or an attacker with routing influence could
+ * otherwise talk the requirement down to a single voter. Measuring against the configured size keeps
+ * a shrunken view out of the relaxed branch; the escape hatch for a real two-node deployment is
+ * therefore to configure `clusterSize: 2`, an explicit operator declaration.
+ *
+ * Shared by both restoration paths so the two can never drift apart on the rule that decides how
+ * much trust a lone peer gets.
+ */
+export function corroboratorCapacity(cohortPeerCount: number, clusterSize: number): number {
+	return Math.max(cohortPeerCount, clusterSize - 1);
+}
+
+/**
  * Select the highest revision corroborated by a quorum of distinct peers.
  *
  * Claims are grouped by the exact `(rev, actionId)` pair; a liar's fabricated
@@ -80,7 +100,7 @@ export function quorumSize(
  * all — lets a genuinely tiny cohort still converge: a cohort with exactly one other peer
  * cannot produce two corroborators, so requiring two makes divergence permanent rather
  * than making it safe. Pass a capacity that a shrunken view of the network cannot talk
- * down (see `CoordinatorRepo.corroboratorCapacity`), or omit it to keep the floor at two.
+ * down (see {@link corroboratorCapacity}), or omit it to keep the floor at two.
  *
  * Returns `undefined` when nothing is corroborated — an uncorroborated claim
  * must never drive restoration.
@@ -165,8 +185,8 @@ export interface BlockHashCandidate {
  * one the sole peer's content is therefore taken on its word. That extends no trust the cohort had
  * not already extended: the same peer's `(rev, actionId)` claim is equally uncorroborable at that
  * size, and a two-member cohort has no honest majority to appeal to. Pass a capacity a shrunken
- * view of the network cannot talk down (see `CoordinatorRepo.corroboratorCapacity` and
- * `reconcile-block.ts`), so only a cohort that is *genuinely* that small reaches this branch.
+ * view of the network cannot talk down (see {@link corroboratorCapacity}), so only a cohort that is
+ * *genuinely* that small reaches this branch.
  */
 export function selectQuorumBlock(
 	candidates: BlockHashCandidate[],

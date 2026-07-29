@@ -4,7 +4,7 @@ import type { ReconcileBlockCallback } from "./cluster-repo.js";
 import type { IPeerReputation } from "../reputation/types.js";
 import { PenaltyReason } from "../reputation/types.js";
 import {
-	selectQuorumRev, selectQuorumBlock, canonicalBlockHash,
+	selectQuorumRev, selectQuorumBlock, canonicalBlockHash, corroboratorCapacity,
 	type RevClaim, type BlockHashCandidate, type QuorumRev
 } from "./quorum-restore.js";
 import { createLogger } from '../logger.js';
@@ -42,19 +42,6 @@ export interface ReconcileBlockDeps {
 	clusterSize: number;
 	/** Best-effort misbehavior reporting; a throwing implementation is swallowed. */
 	reputation?: Pick<IPeerReputation, 'reportPeer'>;
-}
-
-/**
- * How many peers other than this node could answer for the block at all. Mirrors
- * `CoordinatorRepo.corroboratorCapacity` exactly, and for the same reason: the corroboration
- * floor may be relaxed only for a cohort that is *genuinely* small, never for one that merely
- * looks small. `cohortPeerIds` come from the (untrusted) coordinator-declared peer set, so a
- * self-shrunk record could otherwise talk the requirement down to a single voter; taking the MAX
- * against the configured `clusterSize` keeps that shrunken view out of the relaxed branch. The
- * escape hatch for a real two-node deployment is to configure `clusterSize: 2`.
- */
-function corroboratorCapacity(targets: string[], clusterSize: number): number {
-	return Math.max(targets.length, clusterSize - 1);
 }
 
 /**
@@ -133,7 +120,7 @@ export function createReconcileBlock(deps: ReconcileBlockDeps): ReconcileBlockCa
 			targets.map(async peerId => toCandidate(peerId, await deps.fetchArchive(peerId, blockId), committed.rev))
 		);
 		const candidates = fetched.filter((c): c is ReconcileCandidate => c !== undefined);
-		const capacity = corroboratorCapacity(targets, deps.clusterSize);
+		const capacity = corroboratorCapacity(targets.length, deps.clusterSize);
 
 		const revClaims: RevClaim[] = candidates.map(({ peerId, rev, actionId }) => ({ peerId, rev, actionId }));
 		const selected = selectQuorumRev(revClaims, deps.simpleMajorityThreshold, capacity);

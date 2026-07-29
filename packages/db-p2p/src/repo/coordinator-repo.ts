@@ -9,7 +9,7 @@ import { createLogger } from '../logger.js';
 import type { IPeerReputation } from "../reputation/types.js";
 import { PenaltyReason } from "../reputation/types.js";
 import type { ITransactionStateStore } from "../cluster/i-transaction-state-store.js";
-import { quorumSize, selectQuorumRev, type RevClaim, type QuorumRev } from "../cluster/quorum-restore.js";
+import { quorumSize, corroboratorCapacity, selectQuorumRev, type RevClaim, type QuorumRev } from "../cluster/quorum-restore.js";
 import { RECONCILE_TIMEOUT_MS } from "../cluster/reconcile-block.js";
 import { isMissingBaseRevisionFailure, MISSING_BASE_REVISION_REASON } from "../storage/storage-repo.js";
 import type { ReconcileBlockCallback } from "../cluster/cluster-repo.js";
@@ -29,8 +29,8 @@ const log = createLogger('coordinator-repo');
 export type AcquireBlockCallback = ReconcileBlockCallback;
 
 /** True when a freshly-read local revision is strictly ahead of the baseline the repair started from. */
-function isAdvanceOver(rev: number | undefined, baseline: ActionRev | undefined): boolean {
-	return typeof rev === 'number' && (baseline === undefined || rev > baseline.rev);
+function isAdvanceOver(rev: number | undefined, baselineRev: number | undefined): boolean {
+	return typeof rev === 'number' && (baselineRev === undefined || rev > baselineRev);
 }
 
 /**
@@ -43,6 +43,22 @@ function withDeadline<T>(promise: Promise<T>, ms: number, label: string): Promis
 		timer = setTimeout(() => reject(new Error(`${label} timed out after ${ms}ms`)), ms);
 	});
 	return Promise.race([promise, deadline]).finally(() => {
+		if (timer !== undefined) clearTimeout(timer);
+	});
+}
+
+/**
+ * Resolve `undefined` if `promise` has not settled within `ms` — a slow peer is skipped, not an
+ * error. Same timer discipline as {@link withDeadline}: one repair pass races this once per cohort
+ * peer, so leaving the handles pending would keep the event loop alive for the full timeout after
+ * every peer has already answered.
+ */
+function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T | undefined> {
+	let timer: ReturnType<typeof setTimeout> | undefined;
+	const expiry = new Promise<undefined>(resolve => {
+		timer = setTimeout(() => resolve(undefined), ms);
+	});
+	return Promise.race([promise, expiry]).finally(() => {
 		if (timer !== undefined) clearTimeout(timer);
 	});
 }
@@ -291,7 +307,7 @@ export class CoordinatorRepo implements IRepo {
 				}
 
 				try {
-					await this.fetchBlockFromCluster(blockId, blockGets.context);
+					await this.fetchBlockFromCluster(blockId, blockGets.context, localRev);
 					const refreshed = await this.storageRepo.get({ blockIds: [blockId], context: blockGets.context }, options);
 					const newRev = refreshed[blockId]?.state?.latest?.rev;
 					if (refreshed[blockId]) {
@@ -351,7 +367,12 @@ export class CoordinatorRepo implements IRepo {
 		this.lastSeenCommitMs.set(blockId, ts);
 	}
 
-	private async fetchBlockFromCluster(blockId: BlockId, context?: ActionContext): Promise<void> {
+	/**
+	 * One repair pass for a block: ask the cohort what it holds, and converge onto that if it is
+	 * ahead of `localRev` — the revision the caller's read already loaded, and the baseline every
+	 * decision below is measured against.
+	 */
+	private async fetchBlockFromCluster(blockId: BlockId, context?: ActionContext, localRev?: number): Promise<void> {
 		if (!this.clusterLatestCallback) return;
 
 		const blockIdBytes = new TextEncoder().encode(blockId);
@@ -377,18 +398,32 @@ export class CoordinatorRepo implements IRepo {
 		// block seen here would suppress the next attempt for the whole read-repair window.
 		if (!corroborated) return;
 
+		// The self answer is the sharper baseline (same storage, same context, read alongside the
+		// cohort's), but it exists only when `findCluster` returned this node. A soft serve for a
+		// block this node is no longer responsible for is absent from its own cohort view, so fall
+		// back to the revision the caller's read already loaded. Without the fallback both decisions
+		// below degrade to "any local revision is an advance", which restores backwards and reports
+		// a sync at the revision the pass started from.
+		const baselineRev = local?.rev ?? localRev;
+
 		// Never restore backwards. With this node's own claim excluded from the quorum, a
 		// cohort that lags behind the reader corroborates an OLDER revision; adopting it
 		// would be a regression, and logging it as a sync would be a lie. The cohort did
 		// answer, so the block is verified fresh — mark it seen.
-		if (local && corroborated.rev <= local.rev) {
-			log('cluster-fetch:local-current', { blockId, localRev: local.rev, clusterRev: corroborated.rev });
+		// NOTE: in a cohort of two, that sole peer is the only corroborator, so a lying one can park
+		// the reader here — corroborating the revision it already holds — and re-arm the lazy window
+		// on every pass, hiding a real divergence. Bounded by `readRepairWindowMs` (10s default) and
+		// no worse than the peer simply staying silent. If two-member cohorts become a supported
+		// production topology rather than a dev convenience, stop re-arming the window on a
+		// corroboration that came from a single voter.
+		if (baselineRev !== undefined && corroborated.rev <= baselineRev) {
+			log('cluster-fetch:local-current', { blockId, localRev: baselineRev, clusterRev: corroborated.rev });
 			this.markBlocksSeen([blockId]);
 			return;
 		}
 
 		// Corroborated revision is ahead of ours — converge onto it.
-		const rev = await this.restoreCorroborated(blockId, corroborated, local, peerIds);
+		const rev = await this.restoreCorroborated(blockId, corroborated, baselineRev, peerIds);
 
 		// Log the OUTCOME, not the attempt. Logging `synced` unconditionally reported hundreds of
 		// phantom convergences per run and made a real replication defect invisible for two debugging
@@ -396,7 +431,7 @@ export class CoordinatorRepo implements IRepo {
 		if (rev !== undefined) {
 			log('cluster-fetch:synced', { blockId, rev });
 		} else {
-			log('cluster-fetch:not-restored', { blockId, localRev: local?.rev, clusterRev: corroborated.rev });
+			log('cluster-fetch:not-restored', { blockId, localRev: baselineRev, clusterRev: corroborated.rev });
 		}
 		// The block is marked seen either way — the cohort DID answer, so its freshness was checked,
 		// which is what the read-repair window tracks. A failed convergence therefore waits out the
@@ -413,7 +448,7 @@ export class CoordinatorRepo implements IRepo {
 
 	/**
 	 * Bring this node up to the cohort-corroborated `corroborated`, returning the revision it holds
-	 * afterwards when that is an advance over `local`, else `undefined`.
+	 * afterwards when that is an advance over `baselineRev`, else `undefined`.
 	 *
 	 * Two mechanisms, cheapest first:
 	 *  1. **Promote a local pending** — free, no network, and the only mechanism that existed before
@@ -436,11 +471,11 @@ export class CoordinatorRepo implements IRepo {
 	private async restoreCorroborated(
 		blockId: BlockId,
 		corroborated: ActionRev,
-		local: ActionRev | undefined,
+		baselineRev: number | undefined,
 		cohortPeerIds: string[]
 	): Promise<number | undefined> {
 		const promoted = await this.promoteCorroborated(blockId, corroborated);
-		if (isAdvanceOver(promoted, local)) {
+		if (isAdvanceOver(promoted, baselineRev)) {
 			return promoted;
 		}
 
@@ -463,7 +498,7 @@ export class CoordinatorRepo implements IRepo {
 			return undefined;
 		}
 		const acquired = await this.readLocalRev(blockId);
-		return isAdvanceOver(acquired, local) ? acquired : undefined;
+		return isAdvanceOver(acquired, baselineRev) ? acquired : undefined;
 	}
 
 	/**
@@ -491,24 +526,6 @@ export class CoordinatorRepo implements IRepo {
 	}
 
 	/**
-	 * How many peers other than this node could corroborate a claim about a block, given a
-	 * cohort view of `peerIds`. Deliberately the MAX of what we observe and what the
-	 * configured cluster size implies: the corroboration floor may only be relaxed for a
-	 * cohort that is genuinely small, never for one that merely *looks* small. `findCluster`
-	 * results are unauthenticated, so a partition — or an attacker with routing influence —
-	 * can shrink this node's view to itself plus one peer; measuring against the configured
-	 * size keeps that shrunken view from talking the requirement down to a single voter.
-	 * The escape hatch for a real two-node deployment is therefore to configure
-	 * `clusterSize: 2`, an explicit operator declaration, mirroring how
-	 * `allowUnvalidatedSmallCluster` gates the membership admission floor.
-	 */
-	private corroboratorCapacity(peerIds: string[]): number {
-		const selfId = this.localPeerId?.toString();
-		const observed = peerIds.filter(id => id !== selfId).length;
-		return Math.max(observed, this.clusterSize - 1);
-	}
-
-	/**
 	 * Query cluster peers for their latest revision and return the highest revision
 	 * corroborated by a quorum of distinct peers, alongside this node's own latest.
 	 *
@@ -529,13 +546,6 @@ export class CoordinatorRepo implements IRepo {
 	 * `debt-read-repair-commit-cert-verification`.
 	 */
 	private async queryClusterForLatest(peerIds: string[], blockId: BlockId, context?: ActionContext): Promise<ClusterLatestQuery> {
-		// Add timeout wrapper to prevent hanging on unresponsive peers
-		const withTimeout = <T>(promise: Promise<T>, timeoutMs: number): Promise<T | undefined> =>
-			Promise.race([
-				promise,
-				new Promise<undefined>(resolve => setTimeout(() => resolve(undefined), timeoutMs))
-			]);
-
 		// Query peers in parallel for their latest revision (with 1s timeout per peer),
 		// tagging each response with the peer that made it so votes stay distinct.
 		const latestResults = await Promise.allSettled(
@@ -546,6 +556,11 @@ export class CoordinatorRepo implements IRepo {
 			})
 		);
 
+		// NOTE: self-exclusion is keyed on `localPeerId`, which is optional for the single-node/test
+		// construction this class has always tolerated. Left unset, this node's own answer is counted
+		// as a peer claim again. Harmless today — the self answer can only ever corroborate the
+		// revision already held, so the pass declines as `local-current` — but if a future caller can
+		// make self report something the reader does not hold, make `localPeerId` required instead.
 		const selfId = this.localPeerId?.toString();
 		let local: ActionRev | undefined;
 		const claims: RevClaim[] = [];
@@ -559,7 +574,7 @@ export class CoordinatorRepo implements IRepo {
 			claims.push({ peerId: peerIdStr, rev: value.rev, actionId: value.actionId });
 		}
 
-		const capacity = this.corroboratorCapacity(peerIds);
+		const capacity = corroboratorCapacity(peerIds.filter(id => id !== selfId).length, this.clusterSize);
 		const selected = selectQuorumRev(claims, this.simpleMajorityThreshold, capacity);
 		if (!selected) {
 			log('cluster-fetch:no-quorum', {

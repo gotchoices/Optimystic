@@ -305,8 +305,9 @@ saveMaterializedBlock(block): store(structuredClone(block));
   over `cluster/quorum-restore.ts`; the primitives are shared with `CoordinatorRepo`
   read-repair, which excludes the reader's own revision from that quorum — see
   [transactions.md § Read Consistency and Staleness](transactions.md#read-consistency-and-staleness)).
-  **Both** quorums cap their floor at `max(cohort peers excluding self, clusterSize − 1)`,
-  the same `corroboratorCapacity` shape the read-repair path uses: a cohort with exactly one
+  **Both** quorums cap their floor at `max(cohort peers excluding self, clusterSize − 1)` —
+  literally the same `corroboratorCapacity` function the read-repair path calls, so the two
+  restoration paths cannot drift apart on it: a cohort with exactly one
   other peer cannot supply two corroborators *or* two block-carriers, so demanding two would
   make such a cohort permanently unable to heal rather than making it safe. Block ids are
   random, not content-addressed, so the content hash is a cross-peer *agreement* check and

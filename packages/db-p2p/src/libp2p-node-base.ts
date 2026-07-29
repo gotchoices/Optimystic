@@ -179,7 +179,7 @@ export type NodeOptions = {
 	 * node's declaration of how many peers *should* exist to corroborate a claim: the
 	 * read-repair corroboration floor is measured against it, so a genuine two-node
 	 * deployment must set `clusterSize: 2` for its members to be able to repair each
-	 * other (see `CoordinatorRepo.corroboratorCapacity`).
+	 * other (see `corroboratorCapacity` in `cluster/quorum-restore.ts`).
 	 */
 	clusterSize?: number;
 	clusterPolicy?: {

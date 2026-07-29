@@ -470,6 +470,38 @@ describe('CoordinatorRepo read-repair', () => {
 			expect(hasTag(captured, 'cluster-fetch:local-current'), 'expected cluster-fetch:local-current').to.equal(true);
 		});
 
+		/**
+		 * The monotonic guard reads the reader's own revision out of the SELF answer to
+		 * `clusterLatestCallback`, which only exists when `findCluster` returned this node. A
+		 * node serving a read for a block it is no longer responsible for (the documented
+		 * `proximity:get-warning` soft serve) is absent from its own cohort view, so the guard
+		 * has to fall back to the revision the read already loaded — otherwise a pass that
+		 * moved nothing reports `cluster-fetch:synced` at the revision it started from.
+		 */
+		it('uses the revision it already read as the baseline when self is not in the cohort view', async () => {
+			const localPeer = await makePeerId();
+			const otherPeer = await makePeerId();
+			// Self deliberately absent: this node holds the block but is no longer responsible.
+			const cluster = makeClusterPeers([otherPeer]);
+
+			const laggingRemote: ActionRev = { actionId: 'old-action', rev: 3 };
+			const { repo, calls } = makeRepo(
+				localPeer,
+				cluster,
+				async () => laggingRemote,
+				{ rev: 7 }
+			);
+
+			const captured = await captureCoordinatorLog(async () => { await repo.get({ blockIds: [blockId] }); });
+
+			expect(calls.find(c => c.context !== undefined), 'must not attempt an older rev').to.equal(undefined);
+			expect(
+				hasTag(captured, 'cluster-fetch:synced'),
+				`nothing moved, so nothing may claim a sync; captured: ${JSON.stringify(captured)}`
+			).to.equal(false);
+			expect(hasTag(captured, 'cluster-fetch:local-current'), 'expected cluster-fetch:local-current').to.equal(true);
+		});
+
 		it('declines when no peer responds at all', async () => {
 			const localPeer = await makePeerId();
 			const otherPeer = await makePeerId();
