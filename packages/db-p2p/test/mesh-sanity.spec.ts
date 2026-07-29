@@ -1,6 +1,6 @@
 import { expect } from 'chai';
 import type { BlockId, IBlock, BlockHeader, Transforms } from '@optimystic/db-core';
-import { createMesh, type Mesh } from '../src/testing/mesh-harness.js';
+import { createMesh, nonResponsibleNodes, type Mesh } from '../src/testing/mesh-harness.js';
 
 const makeHeader = (id: string): BlockHeader => ({
 	id: id as BlockId,
@@ -136,8 +136,15 @@ describe('Mesh Sanity Tests', () => {
 			// at responsibilityK=1 the reader's cohort view holds a single peer while the mesh's
 			// clusterSize is its node count (3), so the corroboration floor stays at two and the pass
 			// declines rather than converging on one peer's word.
-			const reader = mesh.nodes[1]!;
-			const readerResult = await reader.coordinatorRepo.get({ blockIds: [blockId] });
+			//
+			// The reader has to be a node routing keeps OUT of this block's cohort AND that is not the
+			// writer: peer ids are random per mesh, so `nodes[1]` is the block's responsible peer about a
+			// third of the time, and that peer holds the content because the commit was sent to it — not
+			// because anything repaired it.
+			const reader = (await nonResponsibleNodes(mesh, blockId)).find(n => n !== writer);
+			expect(reader, 'a 3-node K=1 mesh must have a node outside the cohort and off the write path')
+				.to.not.equal(undefined);
+			const readerResult = await reader!.coordinatorRepo.get({ blockIds: [blockId] });
 			expect(readerResult[blockId]).to.not.equal(undefined);
 			expect(readerResult[blockId]?.block, 'a lone uncorroborated holder must not repair a reader')
 				.to.equal(undefined);

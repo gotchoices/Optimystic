@@ -272,6 +272,20 @@ export async function createMesh(nodeCount: number, options: MeshOptions): Promi
 	return { nodes, failures, keyNetwork };
 }
 
+/**
+ * The nodes the key network keeps OUT of `blockId`'s cohort — peers that receive none of the
+ * block's cluster traffic, and so hold none of its content until something repairs them.
+ *
+ * Peer ids are generated fresh per mesh, so which node is responsible for a given block is random
+ * from run to run: in a 3-node `responsibilityK: 1` mesh, `nodes[1]` is the block's sole responsible
+ * peer about a third of the time, and then it receives the writer's commit directly. A test that
+ * needs a genuinely non-responsible node has to ask the routing layer rather than assume an index.
+ */
+export async function nonResponsibleNodes(mesh: Mesh, blockId: string): Promise<MeshNode[]> {
+	const cohort = await mesh.keyNetwork.findCluster(new TextEncoder().encode(blockId));
+	return mesh.nodes.filter(node => !(node.peerId.toString() in cohort));
+}
+
 export interface BuildTransactorOptions {
 	timeoutMs?: number;
 	abortOrCancelTimeoutMs?: number;
