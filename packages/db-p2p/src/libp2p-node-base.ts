@@ -209,6 +209,13 @@ export type NodeOptions = {
 
 	/** Override libp2p listen multiaddrs. */
 	listenAddrs?: string[];
+	/**
+	 * Multiaddrs to advertise INSTEAD OF the listen addrs. For a node behind a NAT / reverse proxy /
+	 * DNS front that binds one address but is reachable at another.
+	 */
+	announceAddrs?: string[];
+	/** Multiaddrs to advertise IN ADDITION TO the listen addrs. */
+	appendAnnounceAddrs?: string[];
 	/** Override libp2p transports. */
 	transports?: Libp2pTransports;
 
@@ -478,7 +485,9 @@ export async function createLibp2pNodeBase(
 		start: false,
 		privateKey: nodePrivateKey,
 		addresses: {
-			listen: listenAddrs
+			listen: listenAddrs,
+			...(options.announceAddrs ? { announce: options.announceAddrs } : {}),
+			...(options.appendAnnounceAddrs ? { appendAnnounce: options.appendAnnounceAddrs } : {})
 		},
 		connectionManager: {
 			// `autoDial`, `minConnections`, and `dialQueue` were stale libp2p option keys silently
