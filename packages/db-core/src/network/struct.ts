@@ -71,6 +71,14 @@ export type StaleFailure = {
 	missing?: ActionTransforms[];
 	/** List of actions that are pending on the blocks touched by this pend */
 	pending?: ActionPending[];
+	/**
+	 * Explicit retryability. True when this failure is an optimistic-concurrency loss — the
+	 * requested revision was taken, or a rival pend holds the blocks — so a re-read, rebase and
+	 * re-pend can win. Set it only when the producer genuinely classified the failure; leave it
+	 * absent otherwise, and consumers fall back to inferring from `missing`/`pending`.
+	 * Read it through `isConflictFailure` rather than testing it directly.
+	 */
+	conflict?: boolean;
 };
 
 export type PendResult = PendSuccess | StaleFailure;

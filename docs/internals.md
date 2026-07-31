@@ -288,6 +288,28 @@ saveMaterializedBlock(block): store(structuredClone(block));
   (`MISSING_BASE_REVISION_REASON`, matched by `isMissingBaseRevisionFailure`). The same
   refusal covers a block whose existing `latest` is itself unmaterializable, so a node
   wedged by older code recovers on the next write touching that block.
+- **A pend rejection is returned only when local storage confirms a revision loss.** When
+  enough members vote reject, `ClusterCoordinator` throws a typed `ValidatorRejectionError`
+  carrying the (free-form, wire-visible) reject reasons. `CoordinatorRepo.pend` then
+  re-reads the affected blocks from its own storage: if any block's `latest.rev >= request.rev`
+  — the same rule the members vote by — the rejection is *returned* as a `StaleFailure` carrying
+  `conflict: true`, so `Collection.sync`'s bounded re-read/rebase/retry loop picks it up instead
+  of an error escaping mid-batch and splitting a multi-tree commit. Every unconfirmed rejection
+  still **throws** — including one whose confirmation read failed, and one only remote members
+  could see (local storage behind). The reject-reason text is never parsed; confirmation is
+  purely the local revision comparison.
+- **Pend retryability is an explicit field, not a payload shape.** `StaleFailure.conflict` says
+  outright "this was a lost race, a re-read can win"; `isConflictFailure`
+  ([`network/stale-failure.ts`](../packages/db-core/src/network/stale-failure.ts)) is the single
+  rule every pend consumer calls, and it treats `conflict` as authoritative when present, falling
+  back to inferring from `missing`/`pending` only for producers that never set it (including a
+  peer on an older build — the repo protocol is plain JSON, so an unset field simply arrives
+  absent). This is why the confirmed-loss response above needs no `missing` list: the local
+  re-read knows the revision is taken but not which actions took it, and nothing rebases from
+  `missing` anyway (it is only counted and logged). `NetworkTransactor.pend` *rebuilds* its
+  aggregate `StaleFailure` from the per-batch responses, so it re-derives `conflict` across them
+  — any conflicting batch makes the aggregate a conflict. The commit side is deliberately
+  untouched: it keys on `CommitResult` shape (next bullet), and no commit producer sets `conflict`.
 - **The commit divergence split keys off `CommitResult`, not throw-vs-return.** A
   missing pend (thrown "not found"), a stale/ahead commit (`success:false` with
   `missing`), or a `missing-base-revision` refusal is divergence and tolerated; any other

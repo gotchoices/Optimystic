@@ -248,7 +248,7 @@ export async function createMesh(nodeCount: number, options: MeshOptions): Promi
 		};
 		const factory = coordinatorRepo(
 			nodeKeyNetwork,
-			(peerId: PeerId) => createClusterClient(peerId) as any,
+			createClusterClient,
 			{
 				clusterSize: options.clusterSize ?? nodeCount,
 				superMajorityThreshold: options.superMajorityThreshold ?? DEFAULT_SUPER_MAJORITY_THRESHOLD,

@@ -226,13 +226,15 @@ After the initial commit phase, the `ClusterCoordinator` tracks any peers that p
 
 ### Stale Failure Handling
 
-When a peer reports that its local revision is behind (stale data), the Network Transactor returns a `StaleFailure` with the `missing` field containing the newer committed transactions. This allows the collection layer to:
+When a peer reports that its local revision is behind (stale data), the Network Transactor returns a `StaleFailure` rather than throwing. This allows the collection layer to:
 
-1. Incorporate the missing transactions (rebase)
+1. Incorporate any `missing` committed actions the failure carries (rebase)
 2. Replay the original actions on top
 3. Retry the transaction with fresh state
 
 This avoids treating stale reads as hard failures and enables optimistic retry without full re-coordination.
+
+**Retryability is a field, not a shape.** `StaleFailure.conflict` says outright whether the failure was an optimistic-concurrency loss; `isConflictFailure` is the single rule consumers call (see [transactor.md](transactor.md#retryability-conflict)). A confirmed loss can arrive with *no* `missing` list, so a consumer that tested `missing?.length` would misread it as a hard rejection. `pend` **rebuilds** its aggregate `StaleFailure` from the per-batch responses, so it re-derives `conflict` across them — any conflicting batch makes the aggregate a conflict.
 
 ### Background Cancellation
 

@@ -177,8 +177,8 @@ export class CollectionFactory {
 
     const { node, coordinatedRepo, blockChangeNotifier } = nodeInfo;
 
-    const keyNetwork = this.resolveKeyNetwork(options.keyNetwork, node);
     const protocolPrefix = `/optimystic/${options.libp2pOptions?.networkName ?? 'optimystic'}`;
+    const keyNetwork = this.resolveKeyNetwork(options.keyNetwork, node, protocolPrefix);
 
     const getRepo = (peerId: PeerId): IRepo => {
       // If it's the local peer, return the coordinated repo
@@ -306,10 +306,30 @@ export class CollectionFactory {
    * Returns Libp2pKeyPeerNetwork (which implements both IKeyNetwork and IPeerNetwork)
    * for the built-in 'libp2p' type. Custom implementations must also satisfy both interfaces.
    */
-  private resolveKeyNetwork(type: string, libp2pNode: Libp2p): Libp2pKeyPeerNetwork {
+  private resolveKeyNetwork(type: string, libp2pNode: Libp2p, protocolPrefix: string): Libp2pKeyPeerNetwork {
     switch (type) {
-      case 'libp2p':
-        return new Libp2pKeyPeerNetwork(libp2pNode);
+      case 'libp2p': {
+        // Prefer the node's OWN key network. `createLibp2pNode` builds one with the
+        // node's configured cluster size, network mode, persistence, reputation and
+        // protocol prefix, and attaches it here; constructing a second one from
+        // defaults would silently give every transactor-level findCluster /
+        // findCoordinator a 16-wide cohort with network scoping disabled — a
+        // different peer set and coordinator than the node's own consensus path uses.
+        const attached = (libp2pNode as unknown as { keyNetwork?: Libp2pKeyPeerNetwork }).keyNetwork;
+        if (attached) {
+          return attached;
+        }
+        // A node injected by a host that did not build it through createLibp2pNode
+        // carries no key network. Cluster size and reputation are unknowable here, but
+        // the network name is, so scope selection to this network's peers. Passing the
+        // prefix is deliberate even though the constructor leaves it optional "because
+        // most call sites don't know the network name": this call site does, and the
+        // SAME prefix string is what `getRepo` hands every `RepoClient.create` dial the
+        // transactor makes — a peer that scoping excludes could never have negotiated
+        // this transactor's repo protocol anyway, so scoping only removes
+        // guaranteed-failure candidates.
+        return new Libp2pKeyPeerNetwork(libp2pNode, undefined, undefined, undefined, undefined, undefined, protocolPrefix);
+      }
       default: {
         const CustomKeyNetwork = this.customKeyNetworkCtors.get(type);
         if (!CustomKeyNetwork) {

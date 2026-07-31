@@ -4,7 +4,7 @@ import { NetworkSimulation } from './simulation.js'
 import type { Scenario } from './simulation.js'
 import { randomBytes } from '@libp2p/crypto'
 import { blockIdToBytes } from '../src/utility/block-id-to-bytes.js'
-import type { BlockId, PendRequest, BlockOperation, ClusterPeers, FindCoordinatorOptions, IKeyNetwork, IRepo, BlockGets, GetBlockResults } from '../src/index.js'
+import type { BlockId, PendRequest, BlockOperation, ClusterPeers, FindCoordinatorOptions, IKeyNetwork, IRepo, BlockGets, GetBlockResults, StaleFailure } from '../src/index.js'
 import type { PeerId } from '../src/index.js'
 import { peerIdFromString } from '../src/network/types.js'
 import { toString as uint8ArrayToString } from 'uint8arrays/to-string'
@@ -894,6 +894,140 @@ describe('NetworkTransactor', () => {
         await networkTransactor.commit({ actionId: actionB, rev: 1, blockIds: [blockId], tailId: blockId });
       } catch { /* expected: block not pending under actionB */ }
       expect(net.findCoordinatorCalls).to.be.greaterThan(0);
+    });
+  })
+
+  // Mixed batch outcome: one coordinator RESPONDS with a non-success (stale) PendResult while
+  // another batch fails with a transport-level throw. The stale response carries real information
+  // ("your rev lost the race") and must preempt the transient error: pend() returns a StaleFailure
+  // so Collection.sync's bounded retry loop runs, instead of the transport error escaping as a
+  // throw mid multi-tree commit (the PartialCommitError shape). Pins network-transactor's
+  // stale-preemption branch (see `pend`'s `stale.length > 0` path).
+  describe('pend mixed stale + transport failure', () => {
+    // `pend` REBUILDS its StaleFailure from the per-batch responses instead of forwarding one, so
+    // whatever the aggregate should carry has to be threaded explicitly. Drives the harness once per
+    // stale response shape and returns both the aggregate and the per-peer pend counts.
+    const runMixedPend = async (staleResponse: StaleFailure) => {
+      const peerA = 'peer-A';
+      const peerB = 'peer-B';
+
+      const clusterMap = new Map<string, string[]>();
+      const setCluster = async (blockId: BlockId, peerIds: string[]) => {
+        const keyBytes = await blockIdToBytes(blockId);
+        clusterMap.set(uint8ArrayToString(keyBytes, 'base64url'), peerIds);
+      };
+      const net: IKeyNetwork = {
+        // Retry lookup after peerB's transport failure excludes peerB; with no alternative
+        // peer this throws, leaving the batch in its errored (never-responded) state — the
+        // captured-evidence shape where every failed batch is `(in-flight)`.
+        async findCoordinator(_key: Uint8Array, options?: Partial<FindCoordinatorOptions>): Promise<PeerId> {
+          if (options?.excludedPeers?.length) throw new Error('no alternative coordinator');
+          return peerIdFromString(peerA);
+        },
+        async findCluster(key: Uint8Array): Promise<ClusterPeers> {
+          const peerIds = clusterMap.get(uint8ArrayToString(key, 'base64url')) ?? [];
+          const peers: ClusterPeers = {};
+          for (const pid of peerIds) peers[pid] = { multiaddrs: [], publicKey: '' };
+          return peers;
+        }
+      };
+
+      const blockId1 = 'block-1' as BlockId;
+      const blockId2 = 'block-2' as BlockId;
+      // Disjoint clusters → two batches, one per coordinator.
+      await setCluster(blockId1, [peerA]);
+      await setCluster(blockId2, [peerB]);
+
+      let aPends = 0;
+      let bPends = 0;
+      // peerA responds with the caller-supplied StaleFailure.
+      const repoA: IRepo = {
+        async get() { return {}; },
+        async pend() {
+          aPends++;
+          return staleResponse;
+        },
+        async cancel() { },
+        async commit() { throw new Error('unused'); }
+      };
+      // peerB fails at the transport layer — no response at all.
+      const repoB: IRepo = {
+        async get() { return {}; },
+        async pend() {
+          bPends++;
+          throw new Error('The stream has been reset');
+        },
+        async cancel() { },
+        async commit() { throw new Error('unused'); }
+      };
+
+      const networkTransactor = new NetworkTransactor({
+        timeoutMs: 1000,
+        abortOrCancelTimeoutMs: 500,
+        keyNetwork: net,
+        getRepo: (peerId: PeerId) => (peerId.toString() === peerA ? repoA : repoB),
+      });
+
+      const actionId = generateRandomActionId();
+      const pendRequest: PendRequest = {
+        actionId,
+        rev: 1,
+        transforms: {
+          updates: {
+            [blockId1]: [createBlockOperation()],
+            [blockId2]: [createBlockOperation()]
+          },
+          inserts: {},
+          deletes: []
+        },
+        policy: 'c'
+      };
+
+      // Must RETURN a non-success result — the stale response preempts the transport error.
+      const result = await networkTransactor.pend(pendRequest);
+      return { result, aPends, bPends };
+    };
+
+    it('returns StaleFailure (not a throw) when one batch responds stale and another throws', async () => {
+      const { result, aPends, bPends } = await runMixedPend({
+        success: false,
+        conflict: true,
+        reason: 'stale revision: block block-1 at rev 1, requested rev 1'
+      });
+
+      expect(result.success).to.be.false;
+      if (!result.success) {
+        // Reason-only stale: the re-aggregated result carries an empty missing list, so the
+        // explicit `conflict` flag is the ONLY thing telling the coordinator this is retryable.
+        expect(result.missing ?? []).to.deep.equal([]);
+        expect(result.reason).to.match(/stale revision/);
+        expect(result.conflict, 'aggregation must carry the batch\'s retryability').to.be.true;
+      }
+      expect(aPends).to.equal(1);
+      expect(bPends).to.equal(1);
+    });
+
+    it('reports conflict:false when the stale batch was a hard rejection', async () => {
+      // A validator/storage rejection carries neither `conflict` nor missing/pending evidence.
+      // Re-driving it cannot help, so the aggregate must not claim retryability.
+      const { result } = await runMixedPend({ success: false, reason: 'operations hash mismatch' });
+
+      expect(result.success).to.be.false;
+      if (!result.success) {
+        expect(result.conflict).to.be.false;
+      }
+    });
+
+    it('infers conflict from missing evidence when the batch sets no flag', async () => {
+      const { result } = await runMixedPend({
+        success: false,
+        missing: [{ actionId: 'rival-action', rev: 1, transforms: { inserts: {}, updates: {}, deletes: [] } }]
+      });
+
+      expect(result.success).to.be.false;
+      if (!result.success) {
+        expect(result.conflict, 'fallback inference keeps older producers retryable').to.be.true;
+      }
     });
   })
 })

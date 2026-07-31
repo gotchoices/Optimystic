@@ -1,6 +1,7 @@
 import type { ITransactor, BlockId, CollectionId, Transforms, PendRequest, CommitRequest, ActionId } from "../index.js";
 import type { Transaction, ExecutionResult, ITransactionEngine, CollectionActions, ReadDependency } from "./transaction.js";
 import type { PeerId } from "../network/types.js";
+import { isConflictFailure } from "../network/stale-failure.js";
 import type { Collection } from "../collection/collection.js";
 import type { SyncOptions } from "../collection/index.js";
 import { isTransactionExpired, clampPriority } from "./transaction.js";
@@ -21,11 +22,11 @@ const DefaultBaseBackoffMs = 100;
 const DefaultMaxBackoffMs = 5000;
 
 /**
- * A pend that failed. `conflict` marks the retryable class — an optimistic-concurrency collision (a
- * committed `missing` action newer than our rev, or a `pending` action on a touched block) that a
- * re-read + re-pend can clear. A bare rejection reason (storage full, policy) is NOT a conflict and
- * is not worth re-driving. Thrown by {@link TransactionCoordinator.pendCollection} so the fan-out in
- * pendPhase can settle it and read the flag off the rejection.
+ * A pend that failed. `conflict` marks the retryable class — an optimistic-concurrency collision that
+ * a re-read + re-pend can clear — as decided by `isConflictFailure` over the failure response. A hard
+ * rejection (storage full, policy) is NOT a conflict and is not worth re-driving. Thrown by
+ * {@link TransactionCoordinator.pendCollection} so the fan-out in pendPhase can settle it and read
+ * the flag off the rejection.
  */
 class PendRejectedError extends Error {
 	constructor(collectionId: CollectionId, readonly conflict: boolean, reason?: string) {
@@ -929,11 +930,11 @@ export class TransactionCoordinator {
 
 		const pendResult = await this.transactor.pend(pendRequest);
 		if (!pendResult.success) {
-			// A committed `missing` action or a `pending` action on a touched block is an
-			// optimistic-concurrency conflict — retryable after a re-read. A bare `reason` is a hard
-			// rejection (storage/policy) that re-driving won't fix.
-			const conflict = Boolean(pendResult.missing?.length || pendResult.pending?.length);
-			throw new PendRejectedError(collectionId, conflict, pendResult.reason);
+			// Retryability comes from the response itself: a producer that classified the failure sets
+			// `conflict`, and only where no producer set it do we fall back to inferring from
+			// `missing`/`pending`. Either way a conflict is an optimistic-concurrency loss, clearable
+			// by a re-read; anything else is a hard rejection (storage/policy) that re-driving won't fix.
+			throw new PendRejectedError(collectionId, isConflictFailure(pendResult), pendResult.reason);
 		}
 
 		return { collectionId, blockIds: pendResult.blockIds };
@@ -1052,6 +1053,11 @@ export class TransactionCoordinator {
 				}
 				// Permanent stale failure: do not retry here. It IS a clean stale loss, though, so
 				// mark it retryable at the coordinator level (after a re-read advances the rev).
+				// NOTE: deliberately does NOT consult `isConflictFailure` / `StaleFailure.conflict`
+				// like the pend path does. Once the pend succeeded, a returned commit failure means
+				// the revision slot moved, and no commit producer sets `conflict` today. If a commit
+				// producer ever starts distinguishing hard commit rejections (validator policy,
+				// storage fault) from lost races, gate `stale` on isConflictFailure here.
 				return {
 					collectionId,
 					committed: false,

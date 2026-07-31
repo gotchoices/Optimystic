@@ -25,7 +25,11 @@ This document describes the architecture for multi-collection transactions in Op
 > - **Failure on the first tree** (nothing persisted yet): a clean in-memory
 >   snapshot rollback — genuinely all-or-nothing. This is the common case for a
 >   conflict/validation/stale-read rejection, which surfaces at pend before any
->   durable commit.
+>   durable commit. NOTE: only per *attempt*. A stale-revision loss is now retried by
+>   `Collection.sync` (see [internals.md](internals.md#consensus-execution) on pend
+>   rejections being returned rather than thrown), so a loss that exhausts its retry
+>   budget surfaces wherever the flush sweep happens to be by then — it can land on
+>   tree *N>1* and split the write, taking the second bullet's path instead.
 > - **Failure after the first tree synced**: the bridge throws
 >   [`PartialCommitError`](../packages/quereus-plugin-optimystic/src/optimystic-adapter/txn-bridge.ts),
 >   naming the persisted vs. unpersisted trees. It deliberately does **not** restore
@@ -76,8 +80,9 @@ This document describes the architecture for multi-collection transactions in Op
 > rolls back cleanly, leaving every tracker pristine for retry — but how it
 > surfaces now depends on *why* it lost:
 >
-> - A **clean stale loss** (a retryable optimistic-concurrency conflict — a
->   committed/pending action collided, nothing durable) is now re-driven
+> - A **clean stale loss** (a retryable optimistic-concurrency conflict — the
+>   losing response says so via `StaleFailure.conflict`, read through
+>   `isConflictFailure`; nothing durable) is now re-driven
 >   **automatically** by `coordinator.commit()`: a bounded, jittered backoff retry
 >   that re-reads each collection to fresh revisions between attempts (the same
 >   default policy as `Collection.sync` — see
@@ -90,7 +95,9 @@ This document describes the architecture for multi-collection transactions in Op
 >   than an immediate failure.
 > - A **hard** clean failure (PEND rejected for storage/policy reasons, an expired
 >   transaction, an unavailable transactor) is **not** retried — it still throws a
->   plain error immediately, preserving the historical fail-fast behaviour.
+>   plain error immediately, preserving the historical fail-fast behaviour. Such a
+>   rejection carries no `conflict` flag and no `missing`/`pending` evidence, which
+>   is exactly what keeps it out of the retry loop.
 >
 > `coordinator.execute()` is intentionally **not** retry-wrapped; it still reports
 > the committed/failed partition on its `ExecutionResult` rather than throwing.

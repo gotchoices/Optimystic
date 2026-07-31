@@ -1,5 +1,6 @@
 import { peerIdFromString } from "../network/types.js";
 import type { PeerId } from "../network/types.js";
+import { isConflictFailure } from "../network/stale-failure.js";
 import type { ActionTransforms, ActionBlocks, BlockActionStatus, ITransactor, PendSuccess, StaleFailure, IKeyNetwork, BlockId, GetBlockResults, PendResult, CommitResult, PendRequest, IRepo, BlockGets, Transforms, CommitRequest, ActionId, RepoCommitRequest, ClusterNomineesResult, CollectionId, IBlock } from "../index.js";
 import type { IBlockChangeNotifier, CollectionChangeListener } from "./change-notifier.js";
 import { transformForBlockId, groupBy, concatTransforms, concatTransform, transformsFromTransform, blockIdsForTransforms, Log, Tracker, CacheSource, TransactorSource } from "../index.js";
@@ -511,8 +512,28 @@ export class NetworkTransactor implements ITransactor, IBlockChangeNotifier {
 			const stale = Array.from(allBatches(batches, b => b.request?.isResponse as boolean && !b.request!.response!.success));
 			if (stale.length > 0) {	// Any active stale failures should preempt reporting connection or other potential transient errors (we have information)
 				log('pend:stale actionId=%s staleCount=%d', blockAction.actionId, stale.length);
+				// Carry the first available reject reason through: `SyncRetryExhaustedError.lastReason`
+				// and the multi-collection writer's failure message both read it, and it is the only
+				// diagnostic that survives an exhausted retry budget.
+				const reason = stale.map(b => (b.request!.response! as StaleFailure).reason).find(r => r !== undefined);
+				// This response is REBUILT from the per-batch ones rather than forwarded, so
+				// retryability has to be carried explicitly or it is lost: a batch whose failure was
+				// a confirmed lost race can arrive with neither `missing` nor `pending` (see
+				// CoordinatorRepo.classifyStaleRejection), and the aggregate would then look like a
+				// hard rejection to `isConflictFailure`. Any conflicting batch makes the aggregate a
+				// conflict — the pend failed as a whole, and a re-read/rebase can clear it.
+				// NOTE: `some`, not `every`, so a pend whose batches mix a lost race with a genuine hard
+				// rejection is reported retryable and burns its (bounded, backed-off) retry budget before
+				// failing. Deliberate: an unclassified reason-only response from an older peer is
+				// indistinguishable from a hard rejection here, and `every` would refuse to retry a real
+				// race whenever one batch came from such a peer. Revisit if every producer sets `conflict`
+				// (then `every` is both safe and tighter), or if mixed-outcome pends show up as wasted
+				// retry latency in practice.
+				const conflict = stale.some(b => isConflictFailure(b.request!.response! as StaleFailure));
 				return {
 					success: false,
+					conflict,
+					...(reason === undefined ? {} : { reason }),
 					missing: distinctBlockActionTransforms(stale.flatMap(b => (b.request!.response! as StaleFailure).missing).filter((x): x is ActionTransforms => x !== undefined)),
 				};
 			}

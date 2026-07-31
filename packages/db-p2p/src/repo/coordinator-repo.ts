@@ -1,7 +1,6 @@
-import type { PendRequest, ActionBlocks, IRepo, MessageOptions, CommitResult, GetBlockResults, PendResult, BlockGets, CommitRequest, RepoMessage, IKeyNetwork, ICluster, ClusterConsensusConfig, BlockId, ActionRev, ActionContext, ClusterRecord } from "@optimystic/db-core";
+import type { PendRequest, ActionBlocks, IRepo, MessageOptions, CommitResult, GetBlockResults, PendResult, StaleFailure, BlockGets, CommitRequest, RepoMessage, IKeyNetwork, ICluster, ClusterConsensusConfig, BlockId, ActionRev, ActionContext, ClusterRecord } from "@optimystic/db-core";
 import { LruMap, blockIdsForTransforms, DEFAULT_SUPER_MAJORITY_THRESHOLD } from "@optimystic/db-core";
-import { ClusterCoordinator } from "./cluster-coordinator.js";
-import type { ClusterClient } from "../cluster/client.js";
+import { ClusterCoordinator, ValidatorRejectionError } from "./cluster-coordinator.js";
 import type { PeerId } from "@libp2p/interface";
 import { peerIdFromString } from "@libp2p/peer-id";
 import type { FretService } from "p2p-fret";
@@ -111,7 +110,7 @@ interface CoordinatorRepoComponents {
 
 export function coordinatorRepo(
 	keyNetwork: IKeyNetwork,
-	createClusterClient: (peerId: PeerId) => ClusterClient,
+	createClusterClient: (peerId: PeerId) => ICluster,
 	cfg?: Partial<ClusterConsensusConfig> & { clusterSize?: number },
 	fretService?: FretService,
 	reputation?: IPeerReputation,
@@ -161,7 +160,7 @@ export class CoordinatorRepo implements IRepo {
 
 	constructor(
 		readonly keyNetwork: IKeyNetwork,
-		readonly createClusterClient: (peerId: PeerId) => ClusterClient,
+		readonly createClusterClient: (peerId: PeerId) => ICluster,
 		private readonly storageRepo: IRepo,
 		cfg?: Partial<ClusterConsensusConfig> & { clusterSize?: number },
 		localCluster?: LocalClusterWithExecutionTracking,
@@ -683,8 +682,59 @@ export class CoordinatorRepo implements IRepo {
 			};
 		} catch (error) {
 			log('coordinator-repo:pend-error', { actionId: request.actionId, error: (error as Error).message });
+			const stale = await this.classifyStaleRejection(error, request, allBlockIds);
+			if (stale) return stale;
 			throw error;
 		}
+	}
+
+	/**
+	 * Decide whether a cluster validator rejection was an optimistic-concurrency loss — the block
+	 * already advanced past the requested revision — rather than a genuine validation fault.
+	 * A confirmed loss returns a {@link StaleFailure} carrying `conflict: true` so the caller
+	 * receives a non-success *response* that says plainly it is a lost race: network-transactor's
+	 * pend then takes its stale branch and both writers (`Collection.sync`, and the coordinator's
+	 * multi-collection pendPhase via `isConflictFailure`) retry, instead of a thrown error escaping
+	 * mid-batch (which splits multi-tree commits — see PartialCommitError).
+	 *
+	 * The failure carries no `missing` list: confirmation is a local re-read that reveals the
+	 * revision is taken but not which actions took it, and no consumer rebases from `missing`
+	 * anyway (it is only counted or logged). `conflict` conveys retryability directly instead.
+	 *
+	 * Confirmation is purely local: re-read the affected blocks from our own storage and require
+	 * `latest.rev >= request.rev`. The signed reject-reason text is never consulted — it is
+	 * free-form wire-visible prose and must not become control flow. Anything unconfirmed
+	 * (including read errors during confirmation) stays a throw, preserving fail-fast for
+	 * genuine validation faults.
+	 */
+	private async classifyStaleRejection(error: unknown, request: PendRequest, blockIds: BlockId[]): Promise<StaleFailure | undefined> {
+		if (!(error instanceof ValidatorRejectionError) || request.rev === undefined) return undefined;
+		let results: GetBlockResults;
+		try {
+			results = await this.storageRepo.get({ blockIds });
+		} catch (readError) {
+			log('coordinator-repo:pend-stale-classify-read-error', {
+				actionId: request.actionId,
+				error: (readError as Error).message
+			});
+			return undefined;
+		}
+		for (const blockId of blockIds) {
+			const latest = results[blockId]?.state.latest;
+			if (latest && latest.rev >= request.rev) {
+				log('coordinator-repo:pend-stale-classified', {
+					actionId: request.actionId,
+					blockId,
+					latestRev: latest.rev,
+					requestedRev: request.rev
+				});
+				return { success: false, conflict: true, reason: `stale revision: block ${blockId} at rev ${latest.rev}, requested rev ${request.rev}` };
+			}
+		}
+		// NOTE: conservative — when only remote members saw the newer revision (local storage still
+		// behind), staleness can't be confirmed locally and the rejection stays a throw. If that
+		// shows up in practice, extend confirmation with a quorum read; never trust the reject text.
+		return undefined;
 	}
 
 	async cancel(actionRef: ActionBlocks, options?: MessageOptions): Promise<void> {

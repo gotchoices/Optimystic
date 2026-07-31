@@ -322,6 +322,8 @@ export class StorageRepo implements IRepo, IBlockChangeNotifier, IBlockReplicaSt
 		if (this.validatePend && request.transaction && request.operationsHash) {
 			const validationResult = await this.validatePend(request.transaction, request.operationsHash);
 			if (!validationResult.valid) {
+				// Hard rejection: the transaction itself is invalid, so no `conflict` flag — a
+				// re-read and re-pend would fail the same way and only burn the retry budget.
 				return {
 					success: false,
 					reason: validationResult.reason ?? 'Transaction validation failed'
@@ -373,16 +375,18 @@ export class StorageRepo implements IRepo, IBlockChangeNotifier, IBlockReplicaSt
 			log('pend:stale actionId=%s missing=%d', request.actionId, missing.length);
 			return {
 				success: false,
+				conflict: true,
 				missing
 			};
 		}
 
 		if (pendings.length > 0) {
 			if (request.policy === 'f') {	// Fail on pending actions
-				return { success: false, pending: pendings };
+				return { success: false, conflict: true, pending: pendings };
 			} else if (request.policy === 'r') {	// Return populated pending actions
 				return {
 					success: false,
+					conflict: true,
 					pending: await Promise.all(pendings.map(async action => {
 						const blockStorage = this.createBlockStorage(action.blockId);
 						return {

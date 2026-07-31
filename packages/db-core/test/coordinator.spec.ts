@@ -63,7 +63,11 @@ class InstrumentedTransactor implements ITransactor {
 		private readonly throwCollections: Set<string> = new Set(),
 		// Collections whose commit THROWS (transient/unreachable) rather than returning a stale
 		// { success:false }. Distinguishes the retry-worthy class from the permanent stale class.
-		private readonly throwCommitCollections: Set<string> = new Set()
+		private readonly throwCommitCollections: Set<string> = new Set(),
+		// Collections whose pend returns a CONFIRMED lost race: `conflict: true` with only a reason
+		// and no missing/pending evidence — exactly what CoordinatorRepo.classifyStaleRejection
+		// emits after a local re-read confirms the requested rev was taken.
+		private readonly conflictPendCollections: Set<string> = new Set()
 	) {}
 
 	async get(_blockGets: BlockGets): Promise<GetBlockResults> {
@@ -82,6 +86,9 @@ class InstrumentedTransactor implements ITransactor {
 			const blockIds = blockIdsForTransforms(request.transforms);
 			if (this.throwCollections.has(collectionId)) {
 				throw new Error(`forced pend throw: ${collectionId}`);
+			}
+			if (this.conflictPendCollections.has(collectionId)) {
+				return { success: false, conflict: true, reason: `stale revision: block ${collectionId}-tail at rev 3, requested rev 3` };
 			}
 			if (this.failCollections.has(collectionId)) {
 				return { success: false, reason: `forced pend failure: ${collectionId}` };
@@ -201,6 +208,75 @@ describe('TransactionCoordinator phases (concurrency + cancel-on-failure)', () =
 			// so which ones settled before the throw is not deterministic — compare as a set.
 			const expectedCancels = collectionIds.filter(id => id !== throwing).map(id => `${id}-tail`);
 			expect([...transactor.cancelledBlockIds].sort()).to.deep.equal([...expectedCancels].sort());
+		});
+
+		// Retryability must come from the failure response's explicit `conflict` flag, not from
+		// whether it happens to carry `missing`/`pending` evidence. A confirmed lost race can arrive
+		// with only a reason (CoordinatorRepo.classifyStaleRejection re-reads its own storage, which
+		// says the rev is taken but not by which actions) — inferring from shape used to call that a
+		// hard rejection and refuse to retry it.
+		it('reports staleLoss for a conflict-flagged pend failure that carries no missing/pending', async () => {
+			const collectionIds = ['c0', 'c1'];
+			const losing = 'c1';
+			const transactor = new InstrumentedTransactor(new Set(), new Set(), new Set(), new Set([losing]));
+			const coordinator = new TransactionCoordinator(transactor, fakeCollections(collectionIds) as never);
+
+			const collectionTransforms = new Map<CollectionId, Transforms>(
+				collectionIds.map(id => [id, transformsForCollection(id)])
+			);
+
+			const result = await (coordinator as unknown as {
+				pendPhase: (t: Transaction, h: string, ct: Map<CollectionId, Transforms>, n: null) => Promise<{ success: boolean; error?: string; staleLoss?: boolean }>;
+			}).pendPhase(transaction, 'ops:hash', collectionTransforms, null);
+
+			expect(result.success).to.be.false;
+			expect(result.error).to.match(/stale revision/);
+			expect(result.staleLoss, 'confirmed lost race must be retryable').to.be.true;
+			// The sibling that did pend is still cancelled — retryability changes the verdict, not the cleanup.
+			expect(transactor.cancelledBlockIds).to.deep.equal(['c0-tail']);
+		});
+
+		it('does not report staleLoss for a reason-only pend failure with no conflict flag', async () => {
+			const collectionIds = ['c0', 'c1'];
+			const failing = 'c1';
+			const transactor = new InstrumentedTransactor(new Set([failing]));
+			const coordinator = new TransactionCoordinator(transactor, fakeCollections(collectionIds) as never);
+
+			const collectionTransforms = new Map<CollectionId, Transforms>(
+				collectionIds.map(id => [id, transformsForCollection(id)])
+			);
+
+			const result = await (coordinator as unknown as {
+				pendPhase: (t: Transaction, h: string, ct: Map<CollectionId, Transforms>, n: null) => Promise<{ success: boolean; error?: string; staleLoss?: boolean }>;
+			}).pendPhase(transaction, 'ops:hash', collectionTransforms, null);
+
+			expect(result.success).to.be.false;
+			// Genuine hard rejections (storage fault, validator policy) also arrive reason-only;
+			// re-driving them would burn the whole retry budget for nothing.
+			expect(result.staleLoss, 'unclassified reason-only failure stays a hard rejection').to.be.false;
+		});
+
+		it('reports staleLoss when the failure carries missing/pending but no conflict flag (older producer)', async () => {
+			// Fallback path in isConflictFailure: a peer on a build that never sets `conflict` still
+			// gets its optimistic-concurrency loss classified from the evidence it does send.
+			const collectionIds = ['c0'];
+			const transactor: ITransactor = {
+				async get(): Promise<GetBlockResults> { throw new Error('unused'); },
+				async getStatus(): Promise<BlockActionStatus[]> { throw new Error('unused'); },
+				async pend(): Promise<PendResult> {
+					return { success: false, pending: [{ blockId: 'c0-tail', actionId: 'rival-action' }] };
+				},
+				async commit(): Promise<CommitResult> { throw new Error('unused'); },
+				async cancel(): Promise<void> { },
+			};
+			const coordinator = new TransactionCoordinator(transactor, fakeCollections(collectionIds) as never);
+
+			const result = await (coordinator as unknown as {
+				pendPhase: (t: Transaction, h: string, ct: Map<CollectionId, Transforms>, n: null) => Promise<{ success: boolean; staleLoss?: boolean }>;
+			}).pendPhase(transaction, 'ops:hash', new Map([['c0', transformsForCollection('c0')]]), null);
+
+			expect(result.success).to.be.false;
+			expect(result.staleLoss).to.be.true;
 		});
 
 		it('returns a failure (no throw) when a collection is missing from the map', async () => {

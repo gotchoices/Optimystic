@@ -189,10 +189,13 @@ export class TestTransactor implements ITransactor {
 			}
 		}
 
-		// Handle failure due to committed conflicts first
+		// Handle failure due to committed conflicts first.
+		// `conflict: true` on the three optimistic-concurrency returns below mirrors what
+		// StorageRepo.pend now emits, so consumers of this test transactor see the real shape.
 		if (missing.length > 0) {
 			return {
 				success: false,
+				conflict: true,
 				missing
 			};
 		}
@@ -200,7 +203,7 @@ export class TestTransactor implements ITransactor {
 		// Handle failure/retry due to pending conflicts
 		if (conflictingPendings.length > 0) {
 			if (policy === 'f') {
-				return { success: false, pending: conflictingPendings };
+				return { success: false, conflict: true, pending: conflictingPendings };
 			} else if (policy === 'r') {
 				// Simulate fetching pending transforms for 'r' policy
 				const pendingWithTransforms = conflictingPendings
@@ -217,6 +220,7 @@ export class TestTransactor implements ITransactor {
 
 				return {
 					success: false,
+					conflict: true,
 					pending: pendingWithTransforms
 				};
 			}

@@ -233,10 +233,23 @@ When transactions conflict, the transactor returns detailed `StaleFailure` infor
 type StaleFailure = {
   success: false;
   reason?: string;
-  missing?: TrxTransforms[];  // Committed transactions newer than our revision
-  pending?: TrxPending[];     // Currently pending transactions on affected blocks
+  missing?: ActionTransforms[];  // Committed actions newer than our revision
+  pending?: ActionPending[];     // Currently pending actions on affected blocks
+  conflict?: boolean;            // Explicit retryability — see below
 };
 ```
+
+#### Retryability (`conflict`)
+
+`missing`/`pending` are *evidence* of a lost race, not a reliable test for one: a
+`CoordinatorRepo` that confirms a lost race by re-reading its own storage learns the revision is
+taken but not which actions took it, so it can only return a `reason`. `conflict` states
+retryability outright — true means "optimistic-concurrency loss; a re-read, rebase and re-pend can
+win". Read it through `isConflictFailure` (`src/network/stale-failure.ts`), never directly: the
+predicate treats `conflict` as authoritative when present and falls back to inferring from
+`missing`/`pending` for producers that never set it, including a peer on an older build. Producers
+set it only on genuine lost races and leave it absent on hard rejections (validation, storage,
+policy). Commit-side failures never set it — see [internals.md](../../../docs/internals.md).
 
 #### Missing Actions
 

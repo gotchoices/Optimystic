@@ -1,3 +1,10 @@
+<!-- resume-note -->
+RESUME: A prior agent run on this ticket did not complete.
+  Prior run: 2026-07-29T18:31:21.429Z (agent: claude)
+  Log file: C:\projects\optimystic\tickets\.logs\corroboration-floor-defaults-to-two-for-large-meshes.fix.2026-07-29T18-31-21-427Z.log
+Read the log to see what was done. Resume where it left off.
+If the prior run hit a timeout or repeated error, be cautious not to rush into the same situation.
+<!-- /resume-note -->
 description: When a node repairs a damaged block it decides how many other peers must agree before it trusts a copy, and out of the box that number is now as low as one — so a large deployment that never touched the settings can be tricked into accepting one peer's word by anything that makes the peer group look smaller than it is.
 files: packages/db-p2p/src/cluster/quorum-restore.ts, packages/db-p2p/src/libp2p-node-base.ts, packages/db-p2p/src/repo/coordinator-repo.ts, packages/db-p2p/src/cluster/reconcile-block.ts, packages/db-p2p/test/coordinator-repo-read-repair.spec.ts, packages/db-p2p/test/reconcile-block.spec.ts
 difficulty: medium

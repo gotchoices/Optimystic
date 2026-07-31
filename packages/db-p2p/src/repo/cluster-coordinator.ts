@@ -1,7 +1,6 @@
 import { peerIdFromString } from "@libp2p/peer-id";
-import type { ClusterRecord, IKeyNetwork, RepoMessage, BlockId, ClusterPeers, MessageOptions, ClusterConsensusConfig } from "@optimystic/db-core";
+import type { ClusterRecord, IKeyNetwork, RepoMessage, BlockId, ClusterPeers, MessageOptions, ClusterConsensusConfig, ICluster } from "@optimystic/db-core";
 import { CURRENT_MEMBERSHIP_VERSION, computeClusterMessageHash, membershipDigest } from "@optimystic/db-core";
-import { ClusterClient } from "../cluster/client.js";
 import { Pending } from "@optimystic/db-core";
 import type { PeerId } from "@libp2p/interface";
 import { createLogger, verbose } from '../logger.js'
@@ -12,6 +11,26 @@ import { PenaltyReason } from "../reputation/types.js";
 import type { ITransactionStateStore } from "../cluster/i-transaction-state-store.js";
 
 const log = createLogger('cluster')
+
+/**
+ * Consensus refused a transaction: enough members voted reject that super-majority became
+ * impossible. A typed error (rather than a bare `Error`) so the repo layer above can distinguish
+ * "the cluster voted this down" from transport/availability failures WITHOUT string-matching the
+ * rejection reasons — those are free-form text that is part of each member's signed vote payload
+ * (see cluster-repo's `computeSigningPayload`), so their wording must never become control flow.
+ * `CoordinatorRepo.pend` uses this to decide whether a rejection is a retryable stale-revision
+ * loss (confirmed against local storage) or a genuine validation fault.
+ */
+export class ValidatorRejectionError extends Error {
+	constructor(
+		message: string,
+		/** Per-peer reject reasons, verbatim from the vote signatures (free-form, wire-visible). */
+		readonly rejectReasons: Record<string, string>
+	) {
+		super(message);
+		this.name = 'ValidatorRejectionError';
+	}
+}
 
 /** Cancel handle for an injected timer; cancels a not-yet-fired timer (safe no-op after fire/cancel). */
 export type TimerCancel = () => void;
@@ -76,7 +95,8 @@ export class ClusterCoordinator {
 
 	constructor(
 		private readonly keyNetwork: IKeyNetwork,
-		private readonly createClusterClient: (peerId: PeerId) => ClusterClient,
+		/** Factory for a per-peer cluster RPC handle; only `update` is ever called, hence `ICluster`. */
+		private readonly createClusterClient: (peerId: PeerId) => ICluster,
 		private readonly cfg: ClusterConsensusConfig & { clusterSize: number },
 		private readonly localCluster?: {
 			update: (record: ClusterRecord) => Promise<ClusterRecord>;
@@ -322,9 +342,11 @@ export class ClusterCoordinator {
 		// If more than (peerCount - superMajority) nodes reject, we can never reach super-majority
 		const maxAllowedRejections = peerCount - superMajority;
 		if (rejectionCount > maxAllowedRejections) {
-			const rejectReasons = Object.entries(promises)
+			const rejectReasonsByPeer = Object.fromEntries(Object.entries(promises)
 				.filter(([_, sig]) => sig.type === 'reject')
-				.map(([peerId, sig]) => `${peerId}: ${sig.rejectReason ?? 'unknown'}`)
+				.map(([peerId, sig]) => [peerId, sig.rejectReason ?? 'unknown']));
+			const rejectReasons = Object.entries(rejectReasonsByPeer)
+				.map(([peerId, reason]) => `${peerId}: ${reason}`)
 				.join('; ');
 			log('cluster-tx:rejected-by-validators', {
 				messageHash: record.messageHash,
@@ -334,7 +356,9 @@ export class ClusterCoordinator {
 				reasons: rejectReasons
 			});
 			this.updateTransactionRecord(promised.record, 'rejected-by-validators');
-			throw new Error(`Transaction rejected by validators (${rejectionCount}/${peerCount} rejected): ${rejectReasons}`);
+			throw new ValidatorRejectionError(
+				`Transaction rejected by validators (${rejectionCount}/${peerCount} rejected): ${rejectReasons}`,
+				rejectReasonsByPeer);
 		}
 
 		if (peerCount > 1 && approvalCount < superMajority) {
