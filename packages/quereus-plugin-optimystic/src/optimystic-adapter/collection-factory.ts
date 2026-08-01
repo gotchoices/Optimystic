@@ -26,32 +26,20 @@ export class CollectionFactory {
   private customKeyNetworkCtors = new Map<string, new (...args: any[]) => IKeyNetwork>();
 
   /**
-   * Create or get a tree collection
+   * Create or get a tree collection, bringing it into existence when nothing has ever
+   * been committed under its id.
    * Collections are only cached within a transaction to ensure proper isolation
    */
   async createOrGetCollection(
     options: ParsedOptimysticOptions,
     txnState?: TransactionState
   ): Promise<Tree<string, RowData>> {
-    const collectionKey = this.getCollectionKey(options);
-
-    // Check transaction-specific cache (only cache within transaction scope)
-    if (txnState?.isActive && txnState.collections.has(collectionKey)) {
-      return txnState.collections.get(collectionKey)!;
+    const cached = this.getCachedCollection(options, txnState);
+    if (cached) {
+      return cached;
     }
 
-    // Create new collection
-    const transactor = await this.getOrCreateTransactor(options);
-    const collectionId = this.parseCollectionId(options.collectionUri);
-
-    const compare = (a: string, b: string): -1 | 0 | 1 => (a < b ? -1 : a > b ? 1 : 0);
-
-    // Schema tree uses simple [key, value] tuples, not RowData arrays
-    const isSchemaTree = options.collectionUri === 'tree://optimystic/schema';
-    const keyExtractor = isSchemaTree
-      ? (entry: any) => entry[0] as string  // For schema tree: [tableName, schema]
-      : (entry: RowData) => this.extractKeyFromEntry(entry);  // For data trees: extract from RowData
-
+    const { transactor, collectionId, keyExtractor, compare } = await this.resolveTreeArgs(options);
     const collection = await Tree.createOrOpen<string, RowData>(
       transactor,
       collectionId,
@@ -59,12 +47,81 @@ export class CollectionFactory {
       compare // Total order
     );
 
-    // Store in transaction-specific cache (if we have an active transaction)
-    if (txnState?.isActive) {
-      txnState.collections.set(collectionKey, collection);
+    this.cacheCollection(options, txnState, collection);
+    return collection;
+  }
+
+  /**
+   * Get an EXISTING tree collection, or `undefined` when no header block has ever been
+   * committed under its id. The read-only counterpart to {@link createOrGetCollection}:
+   * use it wherever an absent collection must read as absent rather than as empty.
+   *
+   * A miss is deliberately NOT cached — the same transaction may create the collection
+   * a moment later, and a negative cache entry would keep it invisible for the rest of
+   * the transaction.
+   */
+  async getCollection(
+    options: ParsedOptimysticOptions,
+    txnState?: TransactionState
+  ): Promise<Tree<string, RowData> | undefined> {
+    const cached = this.getCachedCollection(options, txnState);
+    if (cached) {
+      return cached;
     }
 
+    const { transactor, collectionId, keyExtractor, compare } = await this.resolveTreeArgs(options);
+    const collection = await Tree.open<string, RowData>(
+      transactor,
+      collectionId,
+      keyExtractor,
+      compare // Total order
+    );
+    if (!collection) {
+      return undefined;
+    }
+
+    this.cacheCollection(options, txnState, collection);
     return collection;
+  }
+
+  /** The transactor + Tree construction arguments an open path needs, resolved from options. */
+  private async resolveTreeArgs(options: ParsedOptimysticOptions): Promise<{
+    transactor: ITransactor;
+    collectionId: CollectionId;
+    keyExtractor: (entry: RowData) => string;
+    compare: (a: string, b: string) => -1 | 0 | 1;
+  }> {
+    const transactor = await this.getOrCreateTransactor(options);
+    const collectionId = this.parseCollectionId(options.collectionUri);
+
+    const compare = (a: string, b: string): -1 | 0 | 1 => (a < b ? -1 : a > b ? 1 : 0);
+
+    // Both tree flavours key on the first tuple element: data trees hold
+    // `[primaryKey, encodedRow]`, the schema catalog holds `[tableName, StoredTableSchema]`
+    // (whose second element is an object, not a string — it rides through as RowData).
+    const keyExtractor = (entry: RowData) => this.extractKeyFromEntry(entry);
+
+    return { transactor, collectionId, keyExtractor, compare };
+  }
+
+  /** Transaction-scoped cache lookup; collections are never cached beyond a transaction
+   *  so two transactions can never share a tracker. */
+  private getCachedCollection(
+    options: ParsedOptimysticOptions,
+    txnState?: TransactionState
+  ): Tree<string, RowData> | undefined {
+    const collectionKey = this.getCollectionKey(options);
+    return txnState?.isActive ? txnState.collections.get(collectionKey) : undefined;
+  }
+
+  private cacheCollection(
+    options: ParsedOptimysticOptions,
+    txnState: TransactionState | undefined,
+    collection: Tree<string, RowData>
+  ): void {
+    if (txnState?.isActive) {
+      txnState.collections.set(this.getCollectionKey(options), collection);
+    }
   }
 
   /**

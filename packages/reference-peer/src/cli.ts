@@ -188,9 +188,9 @@ class PeerSession {
 		const session = this.requireSession();
 		const existing = session.diaries.get(name);
 		if (existing) return existing;
-		// Diary.create uses Collection.createOrOpen under the hood, so this will
+		// Diary.createOrOpen uses Collection.createOrOpen under the hood, so this will
 		// attach to an existing diary in the network or create it if missing.
-		const diary = await Diary.create(session.transactor, name);
+		const diary = await Diary.createOrOpen(session.transactor, name);
 		session.diaries.set(name, diary);
 		return diary;
 	}
@@ -542,7 +542,7 @@ class PeerSession {
 		}
 
 		console.log(`📝 Creating diary: ${name}`);
-		const diary = await Diary.create(session.transactor, name);
+		const diary = await Diary.createOrOpen(session.transactor, name);
 		session.diaries.set(name, diary);
 		console.log(`✅ Successfully created diary: ${name}`);
 	}

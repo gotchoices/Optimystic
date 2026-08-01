@@ -45,7 +45,10 @@ export class BTree<TKey, TEntry> {
 		store: BlockStore<ITreeNode | TreeBlock>,
 		createTrunk: getTrunkFunc,
 		keyFromEntry = (entry: TEntry) => entry as unknown as TKey,
-		compare = (a: TKey, b: TKey) => a < b ? -1 : a > b ? 1 : 0,
+		// `as number` so the inferred param type is a comparator returning any number, matching the
+		// constructor above — without it the default narrows to `-1 | 0 | 1` and a perfectly valid
+		// `(a, b) => a - b` comparator is rejected here but accepted there.
+		compare = (a: TKey, b: TKey) => a < b ? -1 : a > b ? 1 : 0 as number,
 		nodeCapacity = NodeCapacity,
 		newId?: BlockId,
 	) {

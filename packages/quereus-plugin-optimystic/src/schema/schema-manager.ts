@@ -127,9 +127,28 @@ export interface StoredIndexColumn {
 export class SchemaManager {
 	private schemaCache = new Map<string, StoredTableSchema>();
 
+	/**
+	 * @param getSchemaTree resolves the plugin-global schema catalog tree. `create` selects the
+	 *   semantics: falsy opens an EXISTING catalog and resolves `undefined` when none has ever
+	 *   been committed (read paths — so a catalog this node cannot see reads as absent, not as
+	 *   "this database has no tables"); `true` brings the catalog into existence, which is what
+	 *   the first `create table` on a fresh network legitimately needs.
+	 */
 	constructor(
-		private readonly getSchemaTree: (transactor?: ITransactor) => Promise<Tree<string, any>>
+		private readonly getSchemaTree: (transactor?: ITransactor, create?: boolean) => Promise<Tree<string, any> | undefined>
 	) {}
+
+	/**
+	 * The schema catalog tree, brought into existence when absent. Only for write paths —
+	 * see the `create` parameter on {@link getSchemaTree}.
+	 */
+	private async requireSchemaTree(transactor?: ITransactor): Promise<Tree<string, any>> {
+		const tree = await this.getSchemaTree(transactor, true);
+		if (!tree) {
+			throw new Error('Schema catalog tree unavailable: create-on-missing resolved to nothing');
+		}
+		return tree;
+	}
 
 	/**
 	 * Store a table schema
@@ -147,7 +166,7 @@ export class SchemaManager {
 	async storeStoredSchema(stored: StoredTableSchema, transactor?: ITransactor): Promise<void> {
 		this.schemaCache.set(stored.name, stored);
 
-		const tree = await this.getSchemaTree(transactor);
+		const tree = await this.requireSchemaTree(transactor);
 		// The schema tree's keyExtractor (in collection-factory) treats entries
 		// as `[name, StoredTableSchema]` tuples — keying on `entry[0]`. The
 		// per-table cache and read paths (getSchema, listTables) also expect
@@ -167,11 +186,17 @@ export class SchemaManager {
 			return cached;
 		}
 
-		// Load from tree. The btree's local state is built lazily, so a fresh
-		// SchemaManager (e.g. after process restart) sees an empty tree until
-		// we sync against storage — without this, cold-start reads silently
-		// return undefined and callers re-persist a schema that already exists.
+		// Load from tree. Open-only: a catalog that has never been committed means this
+		// database has no persisted schemas, and a catalog that exists but cannot be
+		// retrieved throws out of the transactor rather than reading as absent.
+		// The btree's local state is built lazily, so a fresh SchemaManager (e.g. after
+		// process restart) sees an empty tree until we sync against storage — without
+		// this, cold-start reads silently return undefined and callers re-persist a
+		// schema that already exists.
 		const tree = await this.getSchemaTree(transactor);
+		if (!tree) {
+			return undefined;
+		}
 		await tree.update();
 		const path = await tree.find(tableName);
 		if (!tree.isValid(path)) {
@@ -194,7 +219,9 @@ export class SchemaManager {
 	async deleteSchema(tableName: string, transactor?: ITransactor): Promise<void> {
 		this.schemaCache.delete(tableName);
 
-		const tree = await this.getSchemaTree(transactor);
+		// Create-on-missing: writing a tombstone is a write, and the catalog it belongs in
+		// may not exist yet on this node (nothing is written to storage until the tree syncs).
+		const tree = await this.requireSchemaTree(transactor);
 		await tree.replace([[tableName, undefined]]);
 	}
 
@@ -202,7 +229,12 @@ export class SchemaManager {
 	 * List all table names
 	 */
 	async listTables(transactor?: ITransactor): Promise<string[]> {
+		// Open-only: a fresh install has no catalog at all, and must list zero tables
+		// rather than invent an empty catalog to iterate.
 		const tree = await this.getSchemaTree(transactor);
+		if (!tree) {
+			return [];
+		}
 		// Pull the latest tree state from storage; a fresh SchemaManager
 		// otherwise iterates an empty in-memory btree even when the underlying
 		// storage already contains the persisted schemas.

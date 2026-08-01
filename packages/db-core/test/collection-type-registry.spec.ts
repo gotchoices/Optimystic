@@ -19,7 +19,7 @@ describe('Collection Type Registry', () => {
 			expect(descriptor).to.exist
 			expect(descriptor!.name).to.equal('Diary')
 			expect(descriptor!.blockType).to.equal(DiaryHeaderBlockType)
-			expect(descriptor!.open).to.be.a('function')
+			expect(descriptor!.createOrOpen).to.be.a('function')
 		})
 
 		it('should have Tree registered', () => {
@@ -27,7 +27,7 @@ describe('Collection Type Registry', () => {
 			expect(descriptor).to.exist
 			expect(descriptor!.name).to.equal('Tree')
 			expect(descriptor!.blockType).to.equal(TreeHeaderBlockType)
-			expect(descriptor!.open).to.be.undefined
+			expect(descriptor!.createOrOpen).to.be.undefined
 		})
 
 		it('should list all registered types', () => {
@@ -81,7 +81,7 @@ describe('Collection Type Registry', () => {
 		})
 	})
 
-	describe('registry open factory', () => {
+	describe('registry createOrOpen factory', () => {
 		let transactor: TestTransactor
 
 		beforeEach(() => {
@@ -90,9 +90,9 @@ describe('Collection Type Registry', () => {
 
 		it('should open a Diary collection via registry factory', async () => {
 			const descriptor = getCollectionType(DiaryHeaderBlockType)!
-			expect(descriptor.open).to.be.a('function')
+			expect(descriptor.createOrOpen).to.be.a('function')
 
-			const collection = await descriptor.open!(transactor, 'registry-diary')
+			const collection = await descriptor.createOrOpen!(transactor, 'registry-diary')
 
 			await collection.act({ type: 'append', data: { message: 'from registry' } })
 			await collection.updateAndSync()
@@ -105,9 +105,9 @@ describe('Collection Type Registry', () => {
 			expect(actions[0]!.data).to.deep.equal({ message: 'from registry' })
 		})
 
-		it('should return undefined open for Tree (requires parameters)', () => {
+		it('should return undefined createOrOpen for Tree (requires parameters)', () => {
 			const descriptor = getCollectionType(TreeHeaderBlockType)!
-			expect(descriptor.open).to.be.undefined
+			expect(descriptor.createOrOpen).to.be.undefined
 		})
 	})
 
@@ -137,7 +137,7 @@ describe('Collection Type Registry', () => {
 				registerCollectionType({
 					blockType: CounterBlockType,
 					name: 'Counter',
-					open: (t, id) => createCounter(t as TestTransactor, id),
+					createOrOpen: (t, id) => createCounter(t as TestTransactor, id),
 				})
 				registered = true
 			}
@@ -175,7 +175,7 @@ describe('Collection Type Registry', () => {
 
 		it('should open custom collection via registry factory', async () => {
 			const descriptor = getCollectionType(CounterBlockType)!
-			const counter = await descriptor.open!(transactor, 'registry-counter')
+			const counter = await descriptor.createOrOpen!(transactor, 'registry-counter')
 
 			await counter.act({ type: 'adjust', data: 10 })
 			await counter.updateAndSync()

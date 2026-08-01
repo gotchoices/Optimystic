@@ -7,9 +7,10 @@ export interface CollectionTypeDescriptor {
 	blockType: BlockType;
 	/** Human-readable name (e.g. "Diary", "Tree") */
 	name: string;
-	/** Optional factory to open a collection with default settings.
+	/** Optional factory to open a collection with default settings, bringing it into existence
+	 *  when nothing has ever been committed under the id (see {@link Collection.createOrOpen}).
 	 *  Not all types support this (e.g. Tree requires keyFromEntry/compare). */
-	open?: (transactor: ITransactor, id: CollectionId) => Promise<ICollection<any>>;
+	createOrOpen?: (transactor: ITransactor, id: CollectionId) => Promise<ICollection<any>>;
 }
 
 const collectionTypes = new Map<BlockType, CollectionTypeDescriptor>();

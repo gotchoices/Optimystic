@@ -9,6 +9,9 @@ import { randomBytes } from '@noble/hashes/utils.js';
 import { toString as uint8ArrayToString } from 'uint8arrays/to-string';
 import { Latches } from "../utility/latches.js";
 import { jitteredBackoffMs, abortableDelay, makeAbortError } from "../utility/backoff.js";
+import { createLogger } from "../logger.js";
+
+const log = createLogger('collection');
 
 /** Default base backoff (and historical fixed delay) between sync retries, in ms. */
 const PendingRetryDelayMs = 100;
@@ -57,7 +60,57 @@ export class Collection<TAction> implements ICollection<TAction> {
 		this.latchId = `Collection:${this.id}`;
 	}
 
-	static async createOrOpen<TAction>(transactor: ITransactor, id: CollectionId, init: CollectionInitOptions<TAction>) {
+	/** Open an EXISTING collection.
+	 *
+	 * Resolves to `undefined` when the header block is authoritatively absent — i.e. the
+	 * transactor confirmed that nothing has ever been committed under this id. A header
+	 * that could not be RETRIEVED (unreachable peers, a revision this node cannot
+	 * reconstruct) throws from the transactor layer and is never reported as `undefined`.
+	 *
+	 * Use this wherever reading — not creating — is what was meant. {@link createOrOpen}
+	 * would instead stage a fresh empty collection, and reads through it would report an
+	 * absent dataset as a legitimately empty one. */
+	static async open<TAction>(transactor: ITransactor, id: CollectionId, init: CollectionInitOptions<TAction>): Promise<Collection<TAction> | undefined> {
+		const { source, sourceCache, tracker, header } = await Collection.probeHeader(transactor, id);
+		if (!header) {
+			// Return before anything is staged: the tracker's transforms stay empty, so a caller
+			// that ignores the undefined cannot later sync a phantom collection into existence.
+			return undefined;
+		}
+		await Collection.attachToLog<TAction>(source, transactor, tracker, id, header);
+		return new Collection(id, transactor, init.modules, source, sourceCache, tracker, init.filterConflict);
+	}
+
+	/** Open an existing collection, or stage a fresh empty one in the local tracker when the
+	 * header is authoritatively absent. Nothing is written to storage until {@link sync}.
+	 *
+	 * Correct only where inventing a collection is genuinely intended — a first write, a
+	 * bootstrap path. The create branch logs `collection:invented`; prefer {@link open} on
+	 * any pure read path. */
+	static async createOrOpen<TAction>(transactor: ITransactor, id: CollectionId, init: CollectionInitOptions<TAction>): Promise<Collection<TAction>> {
+		const { source, sourceCache, tracker, header } = await Collection.probeHeader(transactor, id);
+
+		if (header) {	// Collection already exists
+			await Collection.attachToLog<TAction>(source, transactor, tracker, id, header);
+		} else {	// Collection does not exist
+			log('collection:invented id=%s — no committed header found; staging a fresh empty collection', id);
+			const headerBlock = init.createHeaderBlock(id, tracker);
+			tracker.insert(headerBlock);
+			source.actionContext = undefined;
+			await Log.open<Action<TAction>>(tracker, id);
+		}
+
+		return new Collection(id, transactor, init.modules, source, sourceCache, tracker, init.filterConflict);
+	}
+
+	/** The per-instance read wiring every open path needs, plus the header probe result.
+	 * Shared by {@link open} and {@link createOrOpen} so the two cannot drift. */
+	private static async probeHeader(transactor: ITransactor, id: CollectionId): Promise<{
+		source: TransactorSource<IBlock>,
+		sourceCache: CacheSource<IBlock>,
+		tracker: Tracker<IBlock>,
+		header: CollectionHeaderBlock | undefined,
+	}> {
 		// Start with a context that has an infinite revision number to ensure that we always fetch the latest log information.
 		// One shared read-dependency collector feeds both the source (direct structural reads) and the cache (every
 		// cache hit/miss), so a block read from either layer records a dependency — cache hits included.
@@ -66,22 +119,25 @@ export class Collection<TAction> implements ICollection<TAction> {
 		const sourceCache = new CacheSource(source, undefined, collector);
 		const tracker = new Tracker(sourceCache);
 		const header = await source.tryGet(id) as CollectionHeaderBlock | undefined;
+		return { source, sourceCache, tracker, header };
+	}
 
-		if (header) {	// Collection already exists
-			// Bootstrap ActionContext from the committed tail before walking the chain.
-			// This allows the transactor to serve pending non-tail blocks during Log.open.
-			await Collection.bootstrapContext(source, transactor, header);
+	/** Walk an existing collection's log and point the source at its latest action context.
+	 * `Log.open` is dereferenced with `!` deliberately: a committed header whose log cannot be
+	 * opened is a fault, not an absence, and must surface rather than read as an empty collection. */
+	private static async attachToLog<TAction>(
+		source: TransactorSource<IBlock>,
+		transactor: ITransactor,
+		tracker: Tracker<IBlock>,
+		id: CollectionId,
+		header: CollectionHeaderBlock,
+	): Promise<void> {
+		// Bootstrap ActionContext from the committed tail before walking the chain.
+		// This allows the transactor to serve pending non-tail blocks during Log.open.
+		await Collection.bootstrapContext(source, transactor, header);
 
-			const log = (await Log.open<Action<TAction>>(tracker, id))!;
-			source.actionContext = await log.getActionContext();
-		} else {	// Collection does not exist
-			const headerBlock = init.createHeaderBlock(id, tracker);
-			tracker.insert(headerBlock);
-			source.actionContext = undefined;
-			await Log.open<Action<TAction>>(tracker, id);
-		}
-
-		return new Collection(id, transactor, init.modules, source, sourceCache, tracker, init.filterConflict);
+		const collectionLog = (await Log.open<Action<TAction>>(tracker, id))!;
+		source.actionContext = await collectionLog.getActionContext();
 	}
 
 	async act(...actions: Action<TAction>[]) {
@@ -129,6 +185,13 @@ export class Collection<TAction> implements ICollection<TAction> {
 
 		// Bootstrap context from committed tail so pending blocks are accessible.
 		// Read through tracker so Chain.open inside Log.open reuses the cached header.
+		// NOTE: when the header comes back absent, this silently no-ops — no bootstrap runs,
+		// `Log.open` below yields nothing, and the collection keeps serving its stale in-memory
+		// state instead of reporting that it could not refresh. Deliberately left as-is here:
+		// the fix belongs at the storage layer, which must distinguish "nothing was ever
+		// committed under this id" from "I could not find out" (ticket
+		// repo-reports-unavailable-vs-absent) — once it throws on the latter, this read stops
+		// being able to observe a spurious absence at all.
 		const header = await tracker.tryGet(this.id) as CollectionHeaderBlock | undefined;
 		if (header) {
 			await Collection.bootstrapContext(source, this.transactor, header);
@@ -136,8 +199,8 @@ export class Collection<TAction> implements ICollection<TAction> {
 
 		// Get the latest entries from the log, starting from where we left off
 		const actionContext = this.source.actionContext;
-		const log = await Log.open<Action<TAction>>(tracker, this.id);
-		const latest = log ? await log.getFrom(actionContext?.rev ?? 0) : undefined;
+		const collectionLog = await Log.open<Action<TAction>>(tracker, this.id);
+		const latest = collectionLog ? await collectionLog.getFrom(actionContext?.rev ?? 0) : undefined;
 
 		// Process the entries and track the blocks they affect
 		let anyConflicts = false;
@@ -166,7 +229,7 @@ export class Collection<TAction> implements ICollection<TAction> {
 		// read — drop the reverted blocks from the read cache and replay pending work against the reverted
 		// base (docs/right-is-right.md §Client notification). De-duped across cascade children by reverted
 		// block; over-inclusive by design (over-invalidation just resubmits — it never wrongly retains).
-		const invalidations = log ? await log.getInvalidationsFrom(actionContext?.rev ?? 0) : [];
+		const invalidations = collectionLog ? await collectionLog.getInvalidationsFrom(actionContext?.rev ?? 0) : [];
 		if (invalidations.length > 0) {
 			const revertedBlockIds = [...new Set(invalidations.flatMap(inv => inv.reverted.map(r => r.blockId)))];
 			this.sourceCache.clear(revertedBlockIds);
@@ -316,12 +379,12 @@ export class Collection<TAction> implements ICollection<TAction> {
 			const tracker = new Tracker(this.sourceCache, snapshot);
 
 			// Add the action to the log (in local tracking space)
-			const log = await Log.open<Action<TAction>>(tracker, this.id);
-			if (!log) {
+			const collectionLog = await Log.open<Action<TAction>>(tracker, this.id);
+			if (!collectionLog) {
 				throw new Error(`Log not found for collection ${this.id}`);
 			}
 			const newRev = (this.source.actionContext?.rev ?? 0) + 1;
-			const addResult = await log.addActions(pending, actionId, newRev, () => tracker.transformedBlockIds());
+			const addResult = await collectionLog.addActions(pending, actionId, newRev, () => tracker.transformedBlockIds());
 
 			// Commit the action to the transactor. Carry the aged retry priority derived from the
 			// consecutive-failure count so a sync that keeps losing concurrent races out-ranks fresh
@@ -381,11 +444,11 @@ export class Collection<TAction> implements ICollection<TAction> {
 	}
 
 	async *selectLog(forward = true): AsyncIterableIterator<Action<TAction>> {
-		const log = await Log.open<Action<TAction>>(this.tracker, this.id);
-		if (!log) {
+		const collectionLog = await Log.open<Action<TAction>>(this.tracker, this.id);
+		if (!collectionLog) {
 			throw new Error(`Log not found for collection ${this.id}`);
 		}
-		for await (const entry of log.select(undefined, forward)) {
+		for await (const entry of collectionLog.select(undefined, forward)) {
 			if (entry.action) {
 				// NOTE: copy-then-reverse to avoid mutating the stored log entry array.
 				// Once tsconfig targets ES2023, `entry.action.actions.toReversed()` is cleaner.

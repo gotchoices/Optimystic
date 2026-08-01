@@ -461,4 +461,77 @@ describe('Tree', () => {
       expect(val2from2).to.deep.equal({ key: 2, value: 'from-tree2' })
     })
   })
+
+  describe('open vs createOrOpen', () => {
+    it('should resolve undefined for a tree that was never created', async () => {
+      const net = new TestTransactor()
+      expect(await Tree.open<number, TestEntry>(net, 'no-such-tree', e => e.key)).to.be.undefined
+    })
+
+    it('should not build a btree or stage a header when open misses', async () => {
+      // The absent path must return before any BTree is constructed over an invented trunk,
+      // and must leave storage untouched so a caller that ignores the undefined cannot later
+      // sync a phantom tree into existence.
+      const net = new TestTransactor()
+      expect(await Tree.open<number, TestEntry>(net, 'no-such-tree', e => e.key)).to.be.undefined
+
+      const probe = await net.get({ blockIds: ['no-such-tree'] })
+      expect(probe['no-such-tree']?.block).to.be.undefined
+      // Still absent on a second attempt — the first one created nothing.
+      expect(await Tree.open<number, TestEntry>(net, 'no-such-tree', e => e.key)).to.be.undefined
+    })
+
+    it('should round-trip rows written through createOrOpen and read back through open', async () => {
+      const net = new TestTransactor()
+      const id = 'open-roundtrip'
+
+      const writer = await Tree.createOrOpen<number, TestEntry>(net, id, e => e.key)
+      await writer.replace([
+        [1, { key: 1, value: 'one' }],
+        [2, { key: 2, value: 'two' }],
+      ])
+      await writer.sync()
+
+      const reader = await Tree.open<number, TestEntry>(net, id, e => e.key)
+      expect(reader).to.exist
+      expect(await reader!.get(1)).to.deep.equal({ key: 1, value: 'one' })
+      expect(await reader!.get(2)).to.deep.equal({ key: 2, value: 'two' })
+    })
+
+    it('should invalidate outstanding paths on a tree opened via open', async () => {
+      // The `replace` handler bumps the read btree's version to invalidate held paths. On the
+      // open path that btree is built by `attach` rather than by createHeaderBlock, so this
+      // pins that the handler is wired to the very instance reads go through.
+      const net = new TestTransactor()
+      const id = 'open-path-invalidation'
+
+      const writer = await Tree.createOrOpen<number, TestEntry>(net, id, e => e.key)
+      await writer.replace([[1, { key: 1, value: 'one' }]])
+      await writer.sync()
+
+      const opened = (await Tree.open<number, TestEntry>(net, id, e => e.key))!
+      const path = await opened.find(1)
+      expect(opened.isValid(path)).to.be.true
+
+      await opened.replace([[2, { key: 2, value: 'two' }]])
+      expect(opened.isValid(path)).to.be.false
+      expect(await opened.get(2)).to.deep.equal({ key: 2, value: 'two' })
+    })
+
+    it('should leave an opened tree writable and durable', async () => {
+      const net = new TestTransactor()
+      const id = 'open-then-write'
+
+      const writer = await Tree.createOrOpen<number, TestEntry>(net, id, e => e.key)
+      await writer.replace([[1, { key: 1, value: 'one' }]])
+      await writer.sync()
+
+      const opened = (await Tree.open<number, TestEntry>(net, id, e => e.key))!
+      await opened.replace([[3, { key: 3, value: 'three' }]])
+
+      const verifier = (await Tree.open<number, TestEntry>(net, id, e => e.key))!
+      expect(await verifier.get(3)).to.deep.equal({ key: 3, value: 'three' })
+      expect(await verifier.get(1)).to.deep.equal({ key: 1, value: 'one' })
+    })
+  })
 })

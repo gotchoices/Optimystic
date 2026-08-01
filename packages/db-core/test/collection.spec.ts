@@ -921,4 +921,77 @@ describe('Collection', () => {
       expect(logActions.map(a => a.data.value)).to.deep.equal(actions.map(a => a.data.value))
     })
   })
+
+  describe('open vs createOrOpen', () => {
+    it('should resolve undefined when opening a collection with no committed header', async () => {
+      const opened = await Collection.open<TestAction>(transactor, 'never-created', initOptions)
+      expect(opened).to.be.undefined
+    })
+
+    it('should stage nothing when open misses, so no phantom collection can be synced', async () => {
+      // A caller that ignores the undefined must not be able to bring the collection into
+      // existence anyway: nothing was inserted into any tracker, so the transactor stays empty.
+      await Collection.open<TestAction>(transactor, 'never-created', initOptions)
+
+      // Nothing was committed under that id, so a subsequent open still misses...
+      expect(await Collection.open<TestAction>(transactor, 'never-created', initOptions)).to.be.undefined
+      // ...and no blocks landed in storage for it.
+      const result = await transactor.get({ blockIds: ['never-created'] })
+      expect(result['never-created']?.block).to.be.undefined
+    })
+
+    it('should open a collection that createOrOpen created and synced', async () => {
+      const created = await Collection.createOrOpen<TestAction>(transactor, collectionId, initOptions)
+      await created.act({ type: 'set', data: { value: 'first', timestamp: 1 } })
+      await created.updateAndSync()
+
+      const opened = await Collection.open<TestAction>(transactor, collectionId, initOptions)
+      expect(opened).to.exist
+      expect(opened!.id).to.equal(collectionId)
+
+      const actions: Action<TestAction>[] = []
+      for await (const a of opened!.selectLog()) {
+        actions.push(a)
+      }
+      expect(actions.map(a => a.data.value)).to.deep.equal(['first'])
+    })
+
+    it('should give open and createOrOpen identical contents for an existing collection', async () => {
+      const created = await Collection.createOrOpen<TestAction>(transactor, collectionId, initOptions)
+      await created.act({ type: 'set', data: { value: 'a', timestamp: 1 } })
+      await created.act({ type: 'set', data: { value: 'b', timestamp: 2 } })
+      await created.updateAndSync()
+
+      const viaOpen = (await Collection.open<TestAction>(transactor, collectionId, initOptions))!
+      const viaCreateOrOpen = await Collection.createOrOpen<TestAction>(transactor, collectionId, initOptions)
+
+      const readLog = async (c: Collection<TestAction>) => {
+        const out: string[] = []
+        for await (const a of c.selectLog()) {
+          out.push(a.data.value)
+        }
+        return out
+      }
+      expect(await readLog(viaOpen)).to.deep.equal(['a', 'b'])
+      expect(await readLog(viaOpen)).to.deep.equal(await readLog(viaCreateOrOpen))
+    })
+
+    it('should let a collection opened read-only accept and sync writes', async () => {
+      // `open` is about resolution semantics, not read-only-ness: the returned collection is a
+      // fully live Collection over the existing header.
+      const created = await Collection.createOrOpen<TestAction>(transactor, collectionId, initOptions)
+      await created.updateAndSync()
+
+      const opened = (await Collection.open<TestAction>(transactor, collectionId, initOptions))!
+      await opened.act({ type: 'set', data: { value: 'from-open', timestamp: 1 } })
+      await opened.updateAndSync()
+
+      const reader = (await Collection.open<TestAction>(transactor, collectionId, initOptions))!
+      const actions: Action<TestAction>[] = []
+      for await (const a of reader.selectLog()) {
+        actions.push(a)
+      }
+      expect(actions.map(a => a.data.value)).to.deep.equal(['from-open'])
+    })
+  })
 })

@@ -61,12 +61,12 @@ describe('Offline mode storage sharing', () => {
 
 			// Write via node.storageRepo
 			const writeT = makeTransactor(nodeStorageRepo);
-			const diary = await Diary.create(writeT as any, 'offline-regression-diary');
+			const diary = await Diary.createOrOpen(writeT as any, 'offline-regression-diary');
 			await diary.append({ content: 'offline-entry', timestamp: '2026-01-01T00:00:00Z' });
 
 			// Read back through the same node.storageRepo — must see the entry
 			const readT = makeTransactor(nodeStorageRepo);
-			const diaryRead = await Diary.create(readT as any, 'offline-regression-diary');
+			const diaryRead = await Diary.createOrOpen(readT as any, 'offline-regression-diary');
 			const entries: any[] = [];
 			for await (const entry of diaryRead.select()) {
 				entries.push(entry);

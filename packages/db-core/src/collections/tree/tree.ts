@@ -20,6 +20,13 @@ export interface TreeReadView<TKey, TEntry> {
 	isValid(path: Path<TKey, TEntry>): boolean;
 }
 
+/** Carries the read {@link BTree} from wherever it gets built (the `createHeaderBlock`
+ * callback on the create path, {@link Tree.attach} on the open path) to the `replace`
+ * handler, which needs the live instance to invalidate outstanding paths. */
+interface BTreeHolder<TKey, TEntry> {
+	btree?: BTree<TKey, TEntry>;
+}
+
 export class Tree<TKey, TEntry> implements TreeReadView<TKey, TEntry> {
 
 	private constructor(
@@ -29,6 +36,24 @@ export class Tree<TKey, TEntry> implements TreeReadView<TKey, TEntry> {
 		private readonly keyFromEntry: (entry: TEntry) => TKey,
 		private readonly compare: (a: TKey, b: TKey) => number,
 	) {
+	}
+
+	/** Open an EXISTING tree, or resolve to `undefined` when no header block has ever been
+	 * committed under this id. Never brings a tree into existence — nothing is staged into the
+	 * collection's tracker on the absent path, so a caller that ignores the `undefined` cannot
+	 * later sync a phantom tree. Use on pure read paths; see {@link Collection.open}. */
+	static async open<TKey, TEntry>(
+		network: ITransactor,
+		id: CollectionId,
+		keyFromEntry = (entry: TEntry) => entry as unknown as TKey,
+		compare = (a: TKey, b: TKey) => a < b ? -1 : a > b ? 1 : 0,
+		/** See {@link Tree.createOrOpen}'s `nodeCapacity`. */
+		nodeCapacity?: number,
+	): Promise<Tree<TKey, TEntry> | undefined> {
+		const held: BTreeHolder<TKey, TEntry> = {};
+		const init = Tree.buildInit(id, keyFromEntry, compare, nodeCapacity, held);
+		const collection = await Collection.open<TreeReplaceAction<TKey, TEntry>>(network, id, init);
+		return collection ? Tree.attach(collection, held, keyFromEntry, compare, nodeCapacity) : undefined;
 	}
 
 	static async createOrOpen<TKey, TEntry>(
@@ -49,10 +74,22 @@ export class Tree<TKey, TEntry> implements TreeReadView<TKey, TEntry> {
 		 *  the header and read it back on reopen rather than trusting the caller to re-supply it. */
 		nodeCapacity?: number,
 	): Promise<Tree<TKey, TEntry>> {
-		// Tricky bootstrapping here:
-		// We need the root id to initialize the collection header, so we create the btree in the create collection header callback.
-		let btree: BTree<TKey, TEntry> | undefined;
-		const init: CollectionInitOptions<TreeReplaceAction<TKey, TEntry>> = {
+		const held: BTreeHolder<TKey, TEntry> = {};
+		const init = Tree.buildInit(id, keyFromEntry, compare, nodeCapacity, held);
+		const collection = await Collection.createOrOpen<TreeReplaceAction<TKey, TEntry>>(network, id, init);
+		return Tree.attach(collection, held, keyFromEntry, compare, nodeCapacity);
+	}
+
+	/** The collection wiring both open paths share. `held` carries the read btree between the
+	 * `createHeaderBlock` callback (which must build it to obtain the root id) and {@link attach}. */
+	private static buildInit<TKey, TEntry>(
+		id: CollectionId,
+		keyFromEntry: (entry: TEntry) => TKey,
+		compare: (a: TKey, b: TKey) => number,
+		nodeCapacity: number | undefined,
+		held: BTreeHolder<TKey, TEntry>,
+	): CollectionInitOptions<TreeReplaceAction<TKey, TEntry>> {
+		return {
 			modules: {
 				"replace": async ({ data: actions }, trx) => {
 					// Write through the Atomic store the handler is handed (`trx`), NOT the captured
@@ -78,25 +115,39 @@ export class Tree<TKey, TEntry> implements TreeReadView<TKey, TEntry> {
 					// Mutations landed in `trx`, not the read btree, so its version counter never moved.
 					// Bump it to invalidate any Path a caller still holds — preserving the path-invalidation
 					// the previous in-place handler gave for free.
-					btree?.invalidatePaths();
+					held.btree?.invalidatePaths();
 				}
 			},
-			createHeaderBlock: (id: BlockId, store: BlockStore<IBlock>) => {	// Only called if the collection does not exist
+			createHeaderBlock: (hid: BlockId, store: BlockStore<IBlock>) => {	// Only called if the collection does not exist
+				// Tricky bootstrapping here:
+				// We need the root id to initialize the collection header, so we create the btree here.
 				let rootId: BlockId;
-				btree = BTree.create<TKey, TEntry>(store, (_s, r) => {
+				held.btree = BTree.create<TKey, TEntry>(store, (_s, r) => {
 						rootId = r;
-						return new CollectionTrunk(store, id);
+						return new CollectionTrunk(store, hid);
 					}, keyFromEntry, compare, nodeCapacity);
 				return {
-					header: store.createBlockHeader(TreeHeaderBlockType, id),
+					header: store.createBlockHeader(TreeHeaderBlockType, hid),
 					rootId: rootId!,
 				}
 			}
 		};
+	}
 
-		const collection = await Collection.createOrOpen<TreeReplaceAction<TKey, TEntry>>(network, id, init);
-		btree = btree ?? new BTree<TKey, TEntry>(collection.tracker, new CollectionTrunk(collection.tracker, collection.id), keyFromEntry, compare, nodeCapacity);
-		return new Tree<TKey, TEntry>(collection, btree, keyFromEntry, compare);
+	/** Bind an opened collection to its read btree. On the create path `createHeaderBlock` already
+	 * built one (it needed the root id for the header); on the open path it never ran, so build it
+	 * over the collection's existing tracker. Either way the result is written back into `held` so
+	 * the `replace` handler's path-invalidation targets the very btree reads go through. */
+	private static attach<TKey, TEntry>(
+		collection: Collection<TreeReplaceAction<TKey, TEntry>>,
+		held: BTreeHolder<TKey, TEntry>,
+		keyFromEntry: (entry: TEntry) => TKey,
+		compare: (a: TKey, b: TKey) => number,
+		nodeCapacity: number | undefined,
+	): Tree<TKey, TEntry> {
+		held.btree = held.btree
+			?? new BTree<TKey, TEntry>(collection.tracker, new CollectionTrunk(collection.tracker, collection.id), keyFromEntry, compare, nodeCapacity);
+		return new Tree<TKey, TEntry>(collection, held.btree, keyFromEntry, compare);
 	}
 
 	async replace(data: TreeReplaceAction<TKey, TEntry>): Promise<void> {

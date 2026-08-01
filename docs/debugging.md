@@ -18,6 +18,7 @@ Logging is controlled via the `DEBUG` environment variable.
 | `network-transactor`  | Batch creation sizes, retries, stale/missing, cancel triggers |
 | `batch-coordinator`   | Batch creation, retry paths, excluded peers       |
 | `cache`               | Block cache hit/miss                              |
+| `collection`          | `collection:invented` — `createOrOpen` found no committed header and staged a fresh empty collection |
 
 ### cohort-topic sub-namespaces
 

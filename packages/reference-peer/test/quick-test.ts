@@ -204,7 +204,7 @@ async function main() {
 		const diaryName = 'test-diary-' + Date.now();
 		console.log(`   Diary name: ${diaryName}`);
 
-		const diary1 = await Diary.create(nodes[0]!.transactor, diaryName);
+		const diary1 = await Diary.createOrOpen(nodes[0]!.transactor, diaryName);
 		console.log(`   ✅ Diary created on Node 1`);
 
 		// Step 3: Add entry from node 1
@@ -221,7 +221,7 @@ async function main() {
 
 		// Step 4: Open diary on node 2 and add entry
 		console.log('\n📝 Step 4: Opening diary on Node 2 and adding entry\n');
-		const diary2 = await Diary.create(nodes[1]!.transactor, diaryName);
+		const diary2 = await Diary.createOrOpen(nodes[1]!.transactor, diaryName);
 		console.log(`   ✅ Diary opened on Node 2`);
 
 		await diary2.append({
@@ -236,7 +236,7 @@ async function main() {
 
 		// Step 5: Open diary on node 3 and add entry
 		console.log('\n📝 Step 5: Opening diary on Node 3 and adding entry\n');
-		const diary3 = await Diary.create(nodes[2]!.transactor, diaryName);
+		const diary3 = await Diary.createOrOpen(nodes[2]!.transactor, diaryName);
 		console.log(`   ✅ Diary opened on Node 3`);
 
 		await diary3.append({
@@ -254,7 +254,7 @@ async function main() {
 
 		for (let i = 0; i < nodes.length; i++) {
 			const testNode = nodes[i]!;
-			const nodeDiary = await Diary.create(testNode.transactor, diaryName);
+			const nodeDiary = await Diary.createOrOpen(testNode.transactor, diaryName);
 
 			console.log(`\n   📚 Node ${i + 1} (port ${testNode.port}):`);
 			const entries: any[] = [];

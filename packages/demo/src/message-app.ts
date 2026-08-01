@@ -26,7 +26,7 @@ export class MessageApp {
 			'demo-messages',
 			(entry) => entry.id,
 		);
-		const activity = await Diary.create<Activity>(transactor, 'demo-activity');
+		const activity = await Diary.createOrOpen<Activity>(transactor, 'demo-activity');
 		return new MessageApp(messages, activity);
 	}
 

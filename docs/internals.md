@@ -374,7 +374,28 @@ saveMaterializedBlock(block): store(structuredClone(block));
 ### Collection Header Blocks
 - Header blockId = collection name (deterministic)
 - All nodes MUST share the same header block for a collection
-- `Collection.createOrOpen()` checks local storage first, then cluster
+- Two entry points, differing only in what they do when the header probe comes back empty:
+  - `Collection.open()` — checks local storage first, then cluster; resolves `undefined` when
+    the header is *authoritatively* absent (nothing has ever been committed under this id).
+    Nothing is staged, so a caller that ignores the `undefined` cannot later sync a phantom
+    collection. A header that exists but could not be **retrieved** throws from the transactor
+    layer and is never reported as `undefined`; likewise a header whose log will not open is a
+    fault, not an absence.
+  - `Collection.createOrOpen()` — same probe, but stages a fresh header in the local tracker on
+    a miss (nothing reaches storage until `sync()`), logging `collection:invented` under the
+    `optimystic:db-core:collection` namespace.
+- Which one a caller gets is decided by whether *inventing* the collection is a correct answer:
+  - Pure reads take `open`. An invented collection reads as a legitimately empty dataset, which
+    an application cannot distinguish from — or defend against — a collection it simply could not
+    reach. The plugin's table catalog (`tree://optimystic/schema`) reads this way.
+  - First writes and bootstrap paths take `createOrOpen`.
+  - A collection that has been *declared* but never written to also takes `createOrOpen`, because
+    it genuinely has no committed header yet — its header is only committed on the first write, so
+    at the block layer "empty" and "absent" are the same state. This is why the plugin's data and
+    index trees keep create-on-missing even on read paths.
+- `Tree` and `Diary` mirror both entry points (`Tree.open` / `Tree.createOrOpen`,
+  `Diary.open` / `Diary.createOrOpen`). `Tree.open` returns before any B-tree is constructed when
+  the header is absent, so no trunk over an invented root is ever built.
 
 ## Cohort-Topic Port Boundary
 

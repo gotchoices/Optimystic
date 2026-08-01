@@ -134,7 +134,7 @@ describe('Distributed Diary Operations', () => {
 		console.log(`\n📝 Test: Create diary "${diaryName}" on Node 1`);
 
 		// Create diary on node 1
-		const diary1 = await Diary.create(nodes[0]!.transactor, diaryName);
+		const diary1 = await Diary.createOrOpen(nodes[0]!.transactor, diaryName);
 		console.log('✅ Diary created on Node 1');
 
 		// Wait for distribution
@@ -142,7 +142,7 @@ describe('Distributed Diary Operations', () => {
 
 		// Open same diary on node 2
 		console.log('📖 Opening diary on Node 2...');
-		const diary2 = await Diary.create(nodes[1]!.transactor, diaryName);
+		const diary2 = await Diary.createOrOpen(nodes[1]!.transactor, diaryName);
 		console.log('✅ Diary opened on Node 2');
 
 		expect(diary1).to.exist;
@@ -156,7 +156,7 @@ describe('Distributed Diary Operations', () => {
 
 		// Create diary on node 1
 		console.log('Creating diary on Node 1...');
-		const diary1 = await Diary.create(nodes[0]!.transactor, diaryName);
+		const diary1 = await Diary.createOrOpen(nodes[0]!.transactor, diaryName);
 
 		// Add entries from different nodes with timestamps for uniqueness
 		const entries = [
@@ -171,19 +171,19 @@ describe('Distributed Diary Operations', () => {
 		// Open diary on node 2; wait until Node 1's entry has propagated before appending,
 		// so the three entries land in a deterministic (Node 1, 2, 3) order.
 		console.log('Opening diary on Node 2 and adding entry...');
-		const diary2 = await Diary.create(nodes[1]!.transactor, diaryName);
+		const diary2 = await Diary.createOrOpen(nodes[1]!.transactor, diaryName);
 		await waitForEntries(diary2, 1, "Node 2 should see Node 1's entry before appending");
 		await diary2.append(entries[1]!);
 
 		// Open diary on node 3; wait until both prior entries have propagated before appending.
 		console.log('Opening diary on Node 3 and adding entry...');
-		const diary3 = await Diary.create(nodes[2]!.transactor, diaryName);
+		const diary3 = await Diary.createOrOpen(nodes[2]!.transactor, diaryName);
 		await waitForEntries(diary3, 2, 'Node 3 should see the first two entries before appending');
 		await diary3.append(entries[2]!);
 
 		// Re-open diary on node 1 to get fresh state from the network; poll until all 3 land.
 		console.log('Reading all entries from Node 1...');
-		const diary1Fresh = await Diary.create(nodes[0]!.transactor, diaryName);
+		const diary1Fresh = await Diary.createOrOpen(nodes[0]!.transactor, diaryName);
 		const readEntries = await waitForEntries(diary1Fresh, 3, 'Node 1 should read all three distributed entries');
 		for (const typedEntry of readEntries as any[]) {
 			console.log(`   - ${typedEntry.content} (ts: ${typedEntry.timestamp})`);
@@ -203,13 +203,13 @@ describe('Distributed Diary Operations', () => {
 		console.log(`\n📝 Test: Verify storage consistency for "${diaryName}"`);
 
 		// Create and populate diary
-		const diary = await Diary.create(nodes[0]!.transactor, diaryName);
+		const diary = await Diary.createOrOpen(nodes[0]!.transactor, diaryName);
 		await diary.append({ content: 'Test entry', timestamp: new Date().toISOString() });
 
 		// Read from all nodes and verify — poll each node until the entry replicates.
 		console.log('Verifying entries on all nodes...');
 		for (let i = 0; i < nodes.length; i++) {
-			const nodeDiary = await Diary.create(nodes[i]!.transactor, diaryName);
+			const nodeDiary = await Diary.createOrOpen(nodes[i]!.transactor, diaryName);
 			const entries = await waitForEntries(nodeDiary, 1, `Node ${i + 1} should replicate the entry`);
 			console.log(`   Node ${i + 1}: ${entries.length} entries`);
 			expect(entries).to.have.lengthOf(1);
@@ -227,7 +227,7 @@ describe('Distributed Diary Operations', () => {
 		// Create diary on Node 1 first, then have other nodes open it
 		// This ensures all nodes work with the SAME header block
 		console.log('Creating diary on Node 1...');
-		const diary1 = await Diary.create(nodes[0]!.transactor, diaryName);
+		const diary1 = await Diary.createOrOpen(nodes[0]!.transactor, diaryName);
 
 		// Wait for the diary header to be available to cluster peers
 		console.log('Waiting for diary to propagate...');
@@ -235,8 +235,8 @@ describe('Distributed Diary Operations', () => {
 
 		// Other nodes open the diary (should fetch header from cluster)
 		console.log('Opening diary on other nodes...');
-		const diary2 = await Diary.create(nodes[1]!.transactor, diaryName);
-		const diary3 = await Diary.create(nodes[2]!.transactor, diaryName);
+		const diary2 = await Diary.createOrOpen(nodes[1]!.transactor, diaryName);
+		const diary3 = await Diary.createOrOpen(nodes[2]!.transactor, diaryName);
 		const diaries = [diary1, diary2, diary3];
 
 		// Write concurrently from all nodes - track errors

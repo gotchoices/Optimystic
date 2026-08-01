@@ -134,21 +134,22 @@ describe('Optimystic plugin catalog hydration', function () {
 
 		// --- Session 2: fresh Database + plugin, shared storage. Spy on the
 		// schema tree's update() so we can count full traversals during hydrate.
-		// `createOrGetCollection` only caches collections inside an active
+		// Neither factory entry point caches collections outside an active
 		// transaction, so each un-cached getSchema call (pre-fix) would open its
 		// own schema tree and call update() on it — wrapping every schema tree
-		// returned counts all of them.
+		// returned counts all of them. Both `getCollection` (the read path
+		// listTables/getSchema take) and `createOrGetCollection` (the write path)
+		// are wrapped so the count is independent of which one hydrate goes through.
 		const dbB = new Database();
 		const pluginB = registerWithSharedTransactor(dbB, sharedTransactor);
 
 		let schemaTreeUpdateCalls = 0;
 		const factory = pluginB.collectionFactory as unknown as {
 			createOrGetCollection: (options: any, txnState?: any) => Promise<any>;
+			getCollection: (options: any, txnState?: any) => Promise<any>;
 		};
-		const originalCreate = factory.createOrGetCollection.bind(factory);
-		factory.createOrGetCollection = async (options: any, txnState?: any) => {
-			const tree = await originalCreate(options, txnState);
-			if (options?.collectionUri === 'tree://optimystic/schema') {
+		const countUpdates = (options: any, tree: any) => {
+			if (tree && options?.collectionUri === 'tree://optimystic/schema') {
 				const originalUpdate = tree.update.bind(tree);
 				tree.update = async (...args: any[]) => {
 					schemaTreeUpdateCalls++;
@@ -157,6 +158,12 @@ describe('Optimystic plugin catalog hydration', function () {
 			}
 			return tree;
 		};
+		const originalCreate = factory.createOrGetCollection.bind(factory);
+		factory.createOrGetCollection = async (options: any, txnState?: any) =>
+			countUpdates(options, await originalCreate(options, txnState));
+		const originalGet = factory.getCollection.bind(factory);
+		factory.getCollection = async (options: any, txnState?: any) =>
+			countUpdates(options, await originalGet(options, txnState));
 
 		const result = await pluginB.hydrate(dbB);
 		expect(result.tables, 'all three persisted tables should hydrate').to.equal(3);

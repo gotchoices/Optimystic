@@ -225,7 +225,7 @@ Concrete implementation for peer-to-peer networks:
 
 ```typescript
 // Create diary for event logging
-const eventLog = await Diary.create<Event>(transactor, 'events');
+const eventLog = await Diary.createOrOpen<Event>(transactor, 'events');
 
 // Add events
 await eventLog.append({ type: 'user_login', userId: '123' });
@@ -310,7 +310,7 @@ const transactor = new NetworkTransactor({
 
 // Create collections
 const userTree = await Tree.createOrOpen(transactor, 'users', /* ... */);
-const eventLog = await Diary.create(transactor, 'events');
+const eventLog = await Diary.createOrOpen(transactor, 'events');
 
 // Use collections
 await userTree.replace([['user1', userData]]);

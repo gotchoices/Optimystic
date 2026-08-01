@@ -75,7 +75,12 @@ For tests, `TestTransactor` from `@optimystic/db-core/test` runs everything in-p
 
 ### Open a collection
 
-`Tree` gives indexed key/value access with range scans; `Diary` is append-only. Both use `createOrOpen` (or `create`) — the header block is content-addressed from the collection name, so every peer in the network resolves to the same collection.
+`Tree` gives indexed key/value access with range scans; `Diary` is append-only. The header block is content-addressed from the collection name, so every peer in the network resolves to the same collection.
+
+Both offer two entry points:
+
+- `createOrOpen` attaches to an existing collection, or stages a fresh empty one when nothing has ever been committed under that name. Nothing reaches storage until the first sync. Use it for first writes and bootstrap paths.
+- `open` attaches to an existing collection only, resolving to `undefined` when nothing has ever been committed under that name. Use it wherever reading — not creating — is what you meant, so an unreachable collection can't read back as an empty one.
 
 ```typescript
 import { Tree, Diary } from '@optimystic/db-core';
@@ -87,7 +92,7 @@ const users = await Tree.createOrOpen<string, User>(
   (a, b) => a.localeCompare(b)
 );
 
-const events = await Diary.create<Event>(transactor, 'events');
+const events = await Diary.createOrOpen<Event>(transactor, 'events');
 ```
 
 ### Apply actions locally
@@ -105,11 +110,21 @@ await events.append({ type: 'user_created', userId: 'u1' });
 
 ### Read
 
-Data-structure APIs work against the combined view (cached blocks + local pending actions):
+Data-structure APIs work against the combined view (cached blocks + local pending actions). A pure reader opens the collection rather than creating it, so a name that was never written to reports as absent instead of as empty:
 
 ```typescript
-for await (const path of users.range({ from: 'u1', to: 'u9' })) {
-  const entry = users.at(path);
+const readers = await Tree.open<string, User>(
+  transactor,
+  'users',
+  user => user.id,
+  (a, b) => a.localeCompare(b)
+);
+if (!readers) {
+  throw new Error('no such collection: users');
+}
+
+for await (const path of readers.range({ from: 'u1', to: 'u9' })) {
+  const entry = readers.at(path);
   render(entry);
 }
 

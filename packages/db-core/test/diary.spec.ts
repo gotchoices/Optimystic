@@ -15,7 +15,7 @@ describe('Diary', () => {
 
   beforeEach(async () => {
     network = new TestTransactor()
-    diary = await Diary.create<TestEntry>(network, collectionId)
+    diary = await Diary.createOrOpen<TestEntry>(network, collectionId)
   })
 
   it('should create a diary collection', async () => {
@@ -164,7 +164,7 @@ describe('Diary', () => {
   })
 
   it('should handle multiple diary instances with same network', async () => {
-    const diary2 = await Diary.create<TestEntry>(network, 'test-diary-2')
+    const diary2 = await Diary.createOrOpen<TestEntry>(network, 'test-diary-2')
 
     const entry1: TestEntry = {
       id: 1,
@@ -196,5 +196,34 @@ describe('Diary', () => {
     }
     expect(entries2).to.have.lengthOf(1)
     expect(entries2[0]).to.deep.equal(entry2)
+  })
+
+  describe('open vs createOrOpen', () => {
+    it('should resolve undefined for a diary that was never created', async () => {
+      expect(await Diary.open<TestEntry>(network, 'no-such-diary')).to.be.undefined
+    })
+
+    it('should leave storage untouched when open misses', async () => {
+      await Diary.open<TestEntry>(network, 'no-such-diary')
+      const probe = await network.get({ blockIds: ['no-such-diary'] })
+      expect(probe['no-such-diary']?.block).to.be.undefined
+      expect(await Diary.open<TestEntry>(network, 'no-such-diary')).to.be.undefined
+    })
+
+    it('should round-trip entries appended through createOrOpen and read back through open', async () => {
+      const id = 'diary-open-roundtrip'
+      const writer = await Diary.createOrOpen<TestEntry>(network, id)
+      await writer.append({ id: 1, content: 'first', timestamp: 1 })
+      await writer.append({ id: 2, content: 'second', timestamp: 2 })
+
+      const reader = await Diary.open<TestEntry>(network, id)
+      expect(reader).to.exist
+
+      const entries: TestEntry[] = []
+      for await (const entry of reader!.select()) {
+        entries.push(entry)
+      }
+      expect(entries.map(e => e.content)).to.deep.equal(['first', 'second'])
+    })
   })
 })

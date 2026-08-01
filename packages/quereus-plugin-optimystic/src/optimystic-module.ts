@@ -168,6 +168,12 @@ export class OptimysticVirtualTable extends VirtualTable {
   private async doInitialize(): Promise<void> {
     try {
       const txnState = this.txnBridge.getCurrentTransaction();
+      // NOTE: create-on-missing is intentional here, and stays. A table registered in the
+      // schema catalog but never written to has NO committed header block — the header is
+      // only committed on the first write — so "absent header" and "empty table" are
+      // genuinely indistinguishable at the block layer on this path. Inventing the tree in
+      // the local tracker is the correct representation of an empty table; switching this to
+      // `getCollection` would make `select` from a created-but-never-written table fail.
       this.collection = await this.collectionFactory.createOrGetCollection(
         this.options,
         txnState || undefined
@@ -269,6 +275,9 @@ export class OptimysticVirtualTable extends VirtualTable {
           ...this.options,
           collectionUri: `${this.options.collectionUri}/index/${indexName}`,
         };
+        // NOTE: create-on-missing is intentional — same reason as the data tree above. An
+        // index whose table has no rows yet has never committed a header block, so an
+        // open-only fetch would report the index as missing rather than as empty.
         const tree = await this.collectionFactory.createOrGetCollection(
           indexOptions,
           transactor ? { transactor, isActive: true, collections: new Map(), stampId: '' } : undefined
@@ -1501,6 +1510,8 @@ export class OptimysticVirtualTable extends VirtualTable {
         ...this.options,
         collectionUri: `${this.options.collectionUri}/index/${indexName}`,
       };
+      // NOTE: create-on-missing is intentional — a freshly declared index has no committed
+      // header block until its first entry lands, so "absent" here means "empty", not "lost".
       const tree = await this.collectionFactory.createOrGetCollection(
         indexOptions,
         transactor ? { transactor, isActive: true, collections: new Map(), stampId: '' } : undefined
@@ -1677,7 +1688,7 @@ export class OptimysticModule implements VirtualTableModule<VirtualTable, Optimy
     const cached = this.schemaManagers.get(fingerprint);
     if (cached) return cached;
 
-    const manager = new SchemaManager(async (transactor) => {
+    const manager = new SchemaManager(async (transactor, create) => {
       const schemaOptions: ParsedOptimysticOptions = {
         collectionUri: 'tree://optimystic/schema',
         transactor: tableOptions.transactor,
@@ -1688,10 +1699,14 @@ export class OptimysticModule implements VirtualTableModule<VirtualTable, Optimy
         encoding: 'json',
         rawStorageFactory: tableOptions.rawStorageFactory,
       };
-      return await this.collectionFactory.createOrGetCollection(
-        schemaOptions,
-        transactor ? { transactor, isActive: true, collections: new Map(), stampId: '' } : undefined
-      );
+      const txnState = transactor
+        ? { transactor, isActive: true, collections: new Map(), stampId: '' }
+        : undefined;
+      // Write paths bring the catalog into existence; read paths must observe an
+      // absent catalog as absent (undefined) rather than as a table-less database.
+      return create
+        ? await this.collectionFactory.createOrGetCollection(schemaOptions, txnState)
+        : await this.collectionFactory.getCollection(schemaOptions, txnState);
     });
     this.schemaManagers.set(fingerprint, manager);
     return manager;
