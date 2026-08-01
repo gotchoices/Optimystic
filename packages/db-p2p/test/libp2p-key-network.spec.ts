@@ -420,6 +420,184 @@ describe('Libp2pKeyPeerNetwork', () => {
 		});
 	});
 
+	// --- Boot-time self-selection and the coordinator cache -----------------------
+	// A node that reads a key before its first dial completes has only itself in FRET,
+	// so the FRET tier legitimately picks self. That pick must NOT be memoized: the
+	// coordinator cache is consulted ahead of every other tier, so a cached boot-time
+	// self would keep serving this node's own (possibly stale) replica for the full
+	// 30-minute TTL long after real peers connected. Every tier that can select self
+	// must also clear shouldAllowSelfCoordination() first, so a partitioned node cannot
+	// slip past the guard just because self happens to sit in the key's FRET neighborhood.
+	describe('findCoordinator() — boot-time self-selection and cache', () => {
+		function connTo(peerId: PeerId): Connection {
+			return {
+				remotePeer: peerId,
+				status: 'open',
+				remoteAddr: { toString: () => `/ip4/10.0.0.1/tcp/4001/p2p/${peerId.toString()}` }
+			} as unknown as Connection;
+		}
+
+		/**
+		 * Mock libp2p whose connection list and FRET neighbor list are MUTABLE between
+		 * calls — the shared `createMockLibp2p` helper closes over a fixed array, but
+		 * these tests need to simulate a peer arriving mid-test.
+		 */
+		function createMutableMock(options: {
+			connections: Connection[];
+			neighbors: string[];
+			sizeEstimate?: number;
+		}) {
+			const state = { connections: options.connections, neighbors: options.neighbors };
+			const fret = {
+				getNeighbors: () => state.neighbors,
+				getNetworkSizeEstimate: () => ({ size_estimate: options.sizeEstimate ?? 1, confidence: 0.5 }),
+				detectPartition: () => false,
+				exportTable: () => undefined,
+				assembleCohort: () => []
+			};
+			const libp2p = {
+				peerId: selfPeerId,
+				getConnections: () => state.connections,
+				getMultiaddrs: () => [],
+				addEventListener: () => {},
+				removeEventListener: () => {},
+				services: { fret }
+			} as unknown as Libp2p;
+			return { libp2p, state };
+		}
+
+		it('does not cache a boot-time self pick, so a peer connecting takes over the key', async () => {
+			const peerA = await makePeerId();
+			const { libp2p, state } = createMutableMock({
+				connections: [],
+				neighbors: [selfPeerId.toString()]
+			});
+			const network = new Libp2pKeyPeerNetwork(libp2p, 16, undefined, 'forming');
+			const key = new TextEncoder().encode('collection-tree-key');
+
+			// Boot-time read, no connections yet → self is picked (correct at this instant).
+			expect((await network.findCoordinator(key)).toString()).to.equal(selfPeerId.toString());
+
+			// A real peer connects moments later and FRET learns it, nearer the key than self.
+			state.connections = [connTo(peerA)];
+			state.neighbors = [peerA.toString(), selfPeerId.toString()];
+
+			// The next read must route to the real peer, not to a cached boot-time self.
+			expect((await network.findCoordinator(key)).toString()).to.equal(peerA.toString());
+		});
+
+		it('writes no cache entry at all for a self pick', async () => {
+			const { libp2p } = createMutableMock({
+				connections: [],
+				neighbors: [selfPeerId.toString()]
+			});
+			const network = new Libp2pKeyPeerNetwork(libp2p, 16, undefined, 'forming');
+			const key = new TextEncoder().encode('collection-tree-key');
+
+			const result = await network.findCoordinator(key);
+			expect(result.toString()).to.equal(selfPeerId.toString());
+			// Pins the no-cache rule directly rather than only through its downstream effect.
+			expect((network as any).coordinatorCache.size, 'no coordinator-cache entry for a self pick').to.equal(0);
+		});
+
+		it('purges an externally-seeded self cache entry once connections arrive', async () => {
+			// recordCoordinator is public and is also called from outside this class on redirect
+			// responses (RepoClient / ClusterClient / NetworkTransactor), so a redirect naming
+			// self can seed an entry the FRET-path carve-out cannot prevent. It must be dropped
+			// at the "real connections arrived" transition.
+			const peerA = await makePeerId();
+			const { libp2p, state } = createMutableMock({
+				connections: [],
+				neighbors: [peerA.toString()]
+			});
+			const network = new Libp2pKeyPeerNetwork(libp2p, 16, undefined, 'forming');
+			const key = new TextEncoder().encode('redirected-key');
+
+			network.recordCoordinator(key, selfPeerId);
+			expect((network as any).coordinatorCache.size).to.equal(1);
+
+			state.connections = [connTo(peerA)];
+			// Equivalent to the 'connection:open' handler wired by setupConnectionTracking().
+			(network as any).updateNetworkObservations();
+
+			expect((network as any).coordinatorCache.size, 'self-valued entry purged').to.equal(0);
+			expect((await network.findCoordinator(key)).toString()).to.equal(peerA.toString());
+		});
+
+		it('honours the self-coordination guard on the FRET path (self is a neighbor of the key)', async () => {
+			// Seen a 5-node network before, zero connections now, disconnected moments ago →
+			// shouldAllowSelfCoordination() refuses with 'grace-period-not-elapsed'. Self IS a
+			// FRET neighbor of this key, which at HEAD let the FRET tier return self and skip
+			// the guard entirely.
+			const persistence = new MemoryPersistence({
+				version: 1,
+				networkHighWaterMark: 5,
+				lastConnectedTimestamp: Date.now(),
+				consecutiveIsolatedSessions: 0
+			});
+			const { libp2p } = createMutableMock({
+				connections: [],
+				neighbors: [selfPeerId.toString()],
+				sizeEstimate: 5
+			});
+			const network = new Libp2pKeyPeerNetwork(libp2p, 16, undefined, 'forming', persistence);
+			await network.initFromPersistedState();
+
+			// Precondition: the guard really does refuse for this node.
+			expect(network.shouldAllowSelfCoordination().allow).to.be.false;
+
+			let caught: unknown;
+			try {
+				await network.findCoordinator(new TextEncoder().encode('collection-tree-key'));
+				expect.fail('Expected findCoordinator to throw SELF_COORDINATION_BLOCKED rather than returning self');
+			} catch (err) {
+				caught = err;
+			}
+			expect(caught).to.be.instanceOf(FindCoordinatorError);
+			expect((caught as FindCoordinatorError).code).to.equal(
+				FIND_COORDINATOR_ERROR_CODES.SELF_COORDINATION_BLOCKED
+			);
+		});
+
+		it('drops self on the FRET path but still selects a connected peer rather than throwing', async () => {
+			// Guard refusal must not short-circuit the whole call: a perfectly good peer the
+			// FRET/fallback tiers would find must still be selected. `allowSelfCoordination:
+			// false` is the one guard verdict that holds regardless of connection state, so it
+			// isolates "self dropped" from "no peers around".
+			const peerA = await makePeerId();
+			// Self listed FIRST among the key's FRET neighbors, so at HEAD it would win outright.
+			const { libp2p, state } = createMutableMock({
+				connections: [],
+				neighbors: [selfPeerId.toString(), peerA.toString()]
+			});
+			state.connections = [connTo(peerA)];
+			const network = new Libp2pKeyPeerNetwork(libp2p, 16, { allowSelfCoordination: false }, 'forming');
+			expect(network.shouldAllowSelfCoordination().allow).to.be.false;
+
+			const result = await network.findCoordinator(new TextEncoder().encode('collection-tree-key'));
+			expect(result.toString()).to.equal(peerA.toString());
+		});
+
+		it('a genuinely solo node still self-coordinates on every call without entering the retry sleep', async () => {
+			// Guard against a regression where not caching self pushes the solo path into the
+			// 3×500ms retry loop. HWM 1, no connections, FRET knows only self → 'bootstrap-node'
+			// allows, self is returned each time, and each call must finish far inside one
+			// inter-attempt delay (500ms).
+			const { libp2p } = createMutableMock({
+				connections: [],
+				neighbors: [selfPeerId.toString()]
+			});
+			const network = new Libp2pKeyPeerNetwork(libp2p, 16, undefined, 'forming');
+			const key = new TextEncoder().encode('solo-key');
+
+			const t0 = Date.now();
+			for (let i = 0; i < 3; i++) {
+				expect((await network.findCoordinator(key)).toString()).to.equal(selfPeerId.toString());
+			}
+			expect(Date.now() - t0, 'three solo lookups stay well under one 500ms retry delay').to.be.lessThan(400);
+		});
+	});
+
 	describe('networkMode defaults', () => {
 		it('defaults to forming when not specified', () => {
 			const libp2p = createMockLibp2p(selfPeerId);
