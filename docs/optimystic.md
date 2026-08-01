@@ -113,18 +113,18 @@ await events.append({ type: 'user_created', userId: 'u1' });
 Data-structure APIs work against the combined view (cached blocks + local pending actions). A pure reader opens the collection rather than creating it, so a name that was never written to reports as absent instead of as empty:
 
 ```typescript
-const readers = await Tree.open<string, User>(
+const usersView = await Tree.open<string, User>(
   transactor,
   'users',
   user => user.id,
   (a, b) => a.localeCompare(b)
 );
-if (!readers) {
+if (!usersView) {
   throw new Error('no such collection: users');
 }
 
-for await (const path of readers.range({ from: 'u1', to: 'u9' })) {
-  const entry = readers.at(path);
+for await (const path of usersView.range({ from: 'u1', to: 'u9' })) {
+  const entry = usersView.at(path);
   render(entry);
 }
 

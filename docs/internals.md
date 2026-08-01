@@ -378,9 +378,11 @@ saveMaterializedBlock(block): store(structuredClone(block));
   - `Collection.open()` — checks local storage first, then cluster; resolves `undefined` when
     the header is *authoritatively* absent (nothing has ever been committed under this id).
     Nothing is staged, so a caller that ignores the `undefined` cannot later sync a phantom
-    collection. A header that exists but could not be **retrieved** throws from the transactor
-    layer and is never reported as `undefined`; likewise a header whose log will not open is a
-    fault, not an absence.
+    collection. A header whose log will not open is a fault, not an absence, and throws.
+    *Caveat:* "authoritatively absent" is only true once the storage layer throws on a header it
+    could not **retrieve** (unreachable peers, an unreconstructable revision) instead of
+    reporting it as missing — ticket `repo-reports-unavailable-vs-absent`, not yet landed. Until
+    then `open` confines that ambiguity to one probe rather than removing it.
   - `Collection.createOrOpen()` — same probe, but stages a fresh header in the local tracker on
     a miss (nothing reaches storage until `sync()`), logging `collection:invented` under the
     `optimystic:db-core:collection` namespace.

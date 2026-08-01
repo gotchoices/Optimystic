@@ -481,6 +481,17 @@ describe('Tree', () => {
       expect(await Tree.open<number, TestEntry>(net, 'no-such-tree', e => e.key)).to.be.undefined
     })
 
+    it('should treat a staged-but-never-synced tree as absent to open', async () => {
+      // createOrOpen stages the header in its own tracker only; nothing reaches storage until
+      // sync. This is exactly why the Quereus plugin keeps create-on-missing on its data and
+      // index trees: a table declared but never written to really has no committed header.
+      const net = new TestTransactor()
+      const id = 'declared-never-written'
+      await Tree.createOrOpen<number, TestEntry>(net, id, e => e.key)
+
+      expect(await Tree.open<number, TestEntry>(net, id, e => e.key)).to.be.undefined
+    })
+
     it('should round-trip rows written through createOrOpen and read back through open', async () => {
       const net = new TestTransactor()
       const id = 'open-roundtrip'

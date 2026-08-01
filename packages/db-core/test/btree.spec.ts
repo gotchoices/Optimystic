@@ -864,4 +864,37 @@ describe('BTree', () => {
     expect(leftMerges).to.be.greaterThan(0, 'test did not exercise a branch left-merge; adjust N/capacity')
     expect(mismatches, `branch left-merge shifted the path index by the wrong amount:\n${mismatches.join('\n')}`).to.be.empty
   })
+
+  // `BTree.create`'s `compare` default is annotated to return `number`, matching the
+  // constructor's. Without that, it narrowed to `-1 | 0 | 1` and a subtraction comparator —
+  // accepted by the constructor — was a compile error here. Passing one and reading the
+  // entries back in order pins both the type surface and the runtime behaviour.
+  it('accepts a subtraction comparator returning arbitrary magnitudes', async () => {
+    const s = new TestBlockStore()
+    const t = BTree.create<number, number>(
+      s,
+      (st, rootId) => {
+        let storedRootId = rootId
+        return {
+          get: async () => (await st.tryGet(storedRootId))!,
+          set: async (node) => { storedRootId = node.header.id },
+          getId: async () => storedRootId,
+        }
+      },
+      undefined,
+      (a: number, b: number) => a - b,
+    )
+
+    for (const n of [50, 3, 17, 900, 1]) {
+      await t.insert(n)
+    }
+
+    const seen: number[] = []
+    for await (const path of t.ascending(await t.first())) {
+      seen.push(t.at(path)!)
+    }
+    expect(seen).to.deep.equal([1, 3, 17, 50, 900])
+    expect(await t.get(17)).to.equal(17)
+    expect(await t.get(18)).to.be.undefined
+  })
 })

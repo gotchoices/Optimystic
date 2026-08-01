@@ -62,10 +62,14 @@ export class Collection<TAction> implements ICollection<TAction> {
 
 	/** Open an EXISTING collection.
 	 *
-	 * Resolves to `undefined` when the header block is authoritatively absent — i.e. the
-	 * transactor confirmed that nothing has ever been committed under this id. A header
-	 * that could not be RETRIEVED (unreachable peers, a revision this node cannot
-	 * reconstruct) throws from the transactor layer and is never reported as `undefined`.
+	 * Resolves to `undefined` when the header block probe comes back empty. That is meant to
+	 * mean "authoritatively absent" — nothing has ever been committed under this id — and it
+	 * only IS that once the storage layer distinguishes an absent block from one it could not
+	 * retrieve (unreachable peers, a revision this node cannot reconstruct) and throws on the
+	 * latter. That half is ticket `repo-reports-unavailable-vs-absent` and has NOT landed, so
+	 * today an unreachable header can still surface here as `undefined`. What this method does
+	 * guarantee now is that the ambiguity is confined to this one probe instead of being spread
+	 * across every read path as a silently-invented empty collection.
 	 *
 	 * Use this wherever reading — not creating — is what was meant. {@link createOrOpen}
 	 * would instead stage a fresh empty collection, and reads through it would report an
@@ -123,8 +127,9 @@ export class Collection<TAction> implements ICollection<TAction> {
 	}
 
 	/** Walk an existing collection's log and point the source at its latest action context.
-	 * `Log.open` is dereferenced with `!` deliberately: a committed header whose log cannot be
-	 * opened is a fault, not an absence, and must surface rather than read as an empty collection. */
+	 * A header we just probed successfully but whose log will not open is a fault, not an
+	 * absence — throw rather than let the collection read as empty. (The re-read goes through
+	 * the tracker/cache, so it can disagree with the probe when storage is flaky mid-open.) */
 	private static async attachToLog<TAction>(
 		source: TransactorSource<IBlock>,
 		transactor: ITransactor,
@@ -136,7 +141,10 @@ export class Collection<TAction> implements ICollection<TAction> {
 		// This allows the transactor to serve pending non-tail blocks during Log.open.
 		await Collection.bootstrapContext(source, transactor, header);
 
-		const collectionLog = (await Log.open<Action<TAction>>(tracker, id))!;
+		const collectionLog = await Log.open<Action<TAction>>(tracker, id);
+		if (!collectionLog) {
+			throw new Error(`Log not found for collection ${id}`);
+		}
 		source.actionContext = await collectionLog.getActionContext();
 	}
 

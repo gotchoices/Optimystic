@@ -287,6 +287,23 @@ const filterConflict = (local: IncrementAction, remote: IncrementAction[]) => {
 
 ## Collection Types
 
+### Opening a collection: `open` vs `createOrOpen`
+
+Every collection type offers two entry points. They differ only in what happens when the
+header-block probe comes back empty:
+
+- `createOrOpen` stages a fresh empty collection in the local tracker. Nothing reaches storage
+  until the first sync. Use it for first writes and bootstrap paths — anywhere *inventing* the
+  collection is a correct answer. The create branch logs `collection:invented` (see
+  [debugging](../../../docs/debugging.md)).
+- `open` resolves to `undefined` and stages nothing, so a caller that ignores the `undefined`
+  cannot later sync a phantom collection. Use it on pure read paths, where an invented
+  collection would read as a legitimately empty dataset that the caller cannot tell apart from
+  one it simply could not reach.
+
+`Collection`, `Tree`, and `Diary` all expose both. See
+[internals](../../../docs/internals.md#collection-header-blocks) for how "absent" is decided.
+
 ### Tree Collection
 
 Tree collections provide indexed access to data using B-tree data structures:
@@ -388,8 +405,11 @@ await collection.act({ type: "append", data });
 #### Diary API
 
 ```typescript
-// Create diary
-const diary = await Diary.create<MyData>(network, diaryId);
+// Attach to an existing diary, or stage a fresh empty one if none was ever committed
+const diary = await Diary.createOrOpen<MyData>(network, diaryId);
+
+// Attach to an existing diary only — `undefined` when none was ever committed
+const existing = await Diary.open<MyData>(network, diaryId);
 
 // Append entries
 await diary.append(entry1);
@@ -472,7 +492,7 @@ this.sourceCache.clear(entry.blockIds);
 
 ```typescript
 // Create a diary for events
-const eventLog = await Diary.create<Event>(network, 'events');
+const eventLog = await Diary.createOrOpen<Event>(network, 'events');
 
 // Add events
 await eventLog.append({ type: 'user_login', userId: '123' });
@@ -546,8 +566,8 @@ class CustomCollection<TData> {
 registerCollectionType({
   blockType: CustomHeaderBlockType,
   name: "Custom",
-  // Provide an open factory if the type can be opened with default settings
-  open: (transactor, id) => Collection.createOrOpen(transactor, id, {
+  // Provide an attach-or-create factory if the type can be opened with default settings
+  createOrOpen: (transactor, id) => Collection.createOrOpen(transactor, id, {
     modules: { "custom_action": async () => {} },
     createHeaderBlock: (hid, store) => ({
       header: store.createBlockHeader(CustomHeaderBlockType, hid)

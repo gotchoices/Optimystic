@@ -993,5 +993,57 @@ describe('Collection', () => {
       }
       expect(actions.map(a => a.data.value)).to.deep.equal(['from-open'])
     })
+
+    it('should pick up another instance\'s committed actions on update()', async () => {
+      const writer = await Collection.createOrOpen<TestAction>(transactor, collectionId, initOptions)
+      await writer.act({ type: 'set', data: { value: 'one', timestamp: 1 } })
+      await writer.updateAndSync()
+
+      // `open` must leave the source's action context where an incremental refresh can
+      // resume from it — not just where a full re-read happens to work.
+      const opened = (await Collection.open<TestAction>(transactor, collectionId, initOptions))!
+
+      await writer.act({ type: 'set', data: { value: 'two', timestamp: 2 } })
+      await writer.updateAndSync()
+
+      await opened.update()
+      const values: string[] = []
+      for await (const a of opened.selectLog()) {
+        values.push(a.data.value)
+      }
+      expect(values).to.deep.equal(['one', 'two'])
+    })
+
+    /**
+     * Serves the header block on the first read and hides it from every read afterwards.
+     * `open` probes the header directly, then re-reads it through the tracker/cache to open
+     * the log — so this reproduces storage that goes unavailable between those two reads.
+     */
+    class VanishingHeaderTransactor implements ITransactor {
+      private headerReads = 0
+      constructor(private readonly inner: TestTransactor, private readonly headerId: string) {}
+
+      async get(blockGets: BlockGets): Promise<GetBlockResults> {
+        const results = await this.inner.get(blockGets)
+        if (blockGets.blockIds.includes(this.headerId) && this.headerReads++ > 0) {
+          delete results[this.headerId]
+        }
+        return results
+      }
+      getStatus(a: ActionBlocks[]): Promise<BlockActionStatus[]> { return this.inner.getStatus(a) }
+      pend(r: PendRequest): Promise<PendResult> { return this.inner.pend(r) }
+      commit(r: CommitRequest): Promise<CommitResult> { return this.inner.commit(r) }
+      cancel(a: ActionBlocks): Promise<void> { return this.inner.cancel(a) }
+    }
+
+    it('should throw, not read empty, when a probed header\'s log will not open', async () => {
+      const created = await Collection.createOrOpen<TestAction>(transactor, collectionId, initOptions)
+      await created.act({ type: 'set', data: { value: 'committed', timestamp: 1 } })
+      await created.updateAndSync()
+
+      const vanishing = new VanishingHeaderTransactor(transactor, collectionId)
+      await expect(Collection.open<TestAction>(vanishing, collectionId, initOptions))
+        .to.be.rejectedWith(`Log not found for collection ${collectionId}`)
+    })
   })
 })
