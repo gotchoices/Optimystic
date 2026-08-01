@@ -6,7 +6,7 @@ import { expect } from 'chai';
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
-import { Database } from '@quereus/quereus';
+import { Database, TEXT_TYPE } from '@quereus/quereus';
 
 // Independently resolve the installed @quereus/quereus version WITHOUT reading
 // its blocked './package.json' subpath. Reading that via require throws
@@ -346,7 +346,10 @@ describe('QuereusEngine', () => {
 				name: 'extra_func',
 				numArgs: 0,
 				flags: 1 as any,
-				returnType: { typeClass: 'scalar' as const, logicalType: { name: 'TEXT' } as any, nullable: true, isReadOnly: true },
+				// logicalType must be a real registered type object (TEXT_TYPE), not a
+				// name-shaped literal — registerFunction rejects the latter. Mirrors the
+				// StampId declaration in src/plugin.ts.
+				returnType: { typeClass: 'scalar' as const, logicalType: TEXT_TYPE, nullable: true, isReadOnly: true },
 				implementation: () => 'hello',
 			});
 			engine1.invalidateSchemaCache();
