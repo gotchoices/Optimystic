@@ -161,23 +161,6 @@ export class Libp2pKeyPeerNetwork implements IKeyNetwork, IPeerNetwork {
 		if (connections.length > 0) {
 			this.lastConnectedTime = Date.now();
 			this.consecutiveIsolatedSessions = 0;
-			// Real connections have arrived — drop every cached coordinator entry naming SELF.
-			// Such an entry can only have been recorded while we had no peers (boot-time
-			// selection, before the first dial completed) or seeded from outside this class by
-			// a redirect response naming us (`recordCoordinator` is public: RepoClient,
-			// ClusterClient and NetworkTransactor all call it). Keeping it would pin every
-			// read/write for that key to our own — possibly stale — replica for the full cache
-			// lifetime even though a better-placed peer is now reachable.
-			// NOTE: this scans the whole cache (bounded at MAX_CACHE_ENTRIES = 1000) on every
-			// connection:open; if connection churn ever makes that show up in a profile, track
-			// self-valued entries in a side set instead of scanning.
-			const selfStr = this.libp2p.peerId.toString();
-			for (const [ck, entry] of this.coordinatorCache) {
-				if (entry.id.toString() === selfStr) {
-					this.coordinatorCache.delete(ck);
-					this.log('coordinator-cache:self-entry-purged key=%s', ck.substring(0, 12));
-				}
-			}
 		}
 
 		try {
@@ -316,7 +299,25 @@ export class Libp2pKeyPeerNetwork implements IKeyNetwork, IPeerNetwork {
 		return { allow: true, reason: 'extended-isolation', warn: true };
 	}
 
+	/**
+	 * Memoize the coordinator for a key. A pick of SELF is deliberately ignored — the
+	 * cache is consulted ahead of every selection tier, so a self entry would keep the
+	 * key routed at our own (possibly stale) replica for the full TTL long after a
+	 * better-placed peer became reachable, and would return self without re-consulting
+	 * {@link shouldAllowSelfCoordination}, letting a partitioned node silently serve its
+	 * own data. Self needs no memoizing anyway: every tier that can select it re-derives
+	 * it from a local lookup with no dial and no retry sleep.
+	 *
+	 * The gate lives here rather than at each call site because most writers are OUTSIDE
+	 * this class — `recordCoordinator` is public and is fed self-valued picks by
+	 * `NetworkTransactor` (it writes back whatever `findCoordinator` returned, including
+	 * self) and by `RepoClient`/`ClusterClient` on redirect responses.
+	 */
 	public recordCoordinator(key: Uint8Array, peerId: PeerId, ttlMs = 30 * 60 * 1000): void {
+		if (peerId.toString() === this.libp2p.peerId.toString()) {
+			this.log('coordinator-cache:self-write-ignored key=%s', this.toCacheKey(key).substring(0, 12))
+			return
+		}
 		const k = this.toCacheKey(key)
 		const now = Date.now()
 		for (const [ck, entry] of this.coordinatorCache) {
@@ -436,23 +437,24 @@ export class Libp2pKeyPeerNetwork implements IKeyNetwork, IPeerNetwork {
 
 				// Filter to only connected FRET neighbors, excluding banned peers. Self is
 				// never "connected" to itself, so it is admitted by the explicit self clause
-				// below — but ONLY when the self-coordination guard allows it. That guard is
-				// what stops a partitioned node from silently serving its own stale data; if
-				// this tier could return self without consulting it, a node whose FRET
-				// neighbor set contains self (essentially always on a small or forming
-				// network) would bypass the guard entirely and the last-resort tier's
-				// SELF_COORDINATION_BLOCKED would never fire. On refusal we merely DROP self
-				// from the candidate list rather than throwing, so the connected-peer fallback
-				// below still gets its chance at a perfectly good remote peer; only if that
-				// also comes up empty does the last-resort tier raise the accurate error.
+				// below — but ONLY when the self-coordination guard allows it, otherwise a
+				// node whose FRET neighborhood contains self (essentially always on a small or
+				// forming network) would bypass the guard and the last-resort tier's
+				// SELF_COORDINATION_BLOCKED would never fire. On refusal self is merely DROPPED
+				// from the candidate list, so the connected-peer fallback below still gets its
+				// chance at a good remote peer; only if that also comes up empty does the
+				// last-resort tier raise the accurate error.
 				const selfStr = this.libp2p.peerId.toString()
 				let selfAllowedThisAttempt: boolean | undefined
-				// Evaluated LAZILY — only when self actually appears in `ids`, so a node whose
-				// FRET neighbors are all remote never pays detectPartition() /
-				// getNetworkSizeEstimate() — and freshly on EVERY attempt (this closure is
-				// per-attempt state): a connection can land during the 500ms inter-attempt
-				// sleep and legitimately flip the answer, mirroring how filterByMembership
-				// re-reads the peerStore each attempt.
+				// Memoized per ATTEMPT, and evaluated lazily so an all-remote neighborhood never
+				// pays detectPartition() / getNetworkSizeEstimate(). Re-evaluated on each attempt
+				// because a connection can land during the 500ms inter-attempt sleep and
+				// legitimately flip the answer — as filterByMembership re-reads the peerStore.
+				// NOTE: on a small network self is a neighbor of nearly every key, so this runs
+				// per findCoordinator call and self-coordinated keys are never cached to absorb
+				// it. Fine while detectPartition()/getNetworkSizeEstimate() stay local FRET
+				// table reads; if either ever grows a probe or other network round-trip, cache
+				// the decision with a short TTL on the instance instead of per attempt.
 				const isSelfAdmissible = (): boolean => {
 					if (selfAllowedThisAttempt === undefined) {
 						const decision = this.shouldAllowSelfCoordination()
@@ -482,16 +484,9 @@ export class Libp2pKeyPeerNetwork implements IKeyNetwork, IPeerNetwork {
 				const pick = ranked[0]
 				if (pick) {
 					const pid = peerIdFromString(pick)
-					// NEVER memoize a self pick. Early in startup — before the first dial
-					// completes — FRET knows only self, so this tier legitimately picks self;
-					// writing that into the 30-minute cache would keep every later read of the
-					// key routed at our own (possibly stale) replica long after real peers
-					// arrived, because the cache is consulted ahead of every other tier.
-					// Caching self buys nothing regardless: self is always reachable and this
-					// path re-derives it from a local FRET table lookup with no retry sleep.
-					// This also makes the tier uniform with the last-resort self block below,
-					// which already returns self WITHOUT caching it.
-					if (pick !== selfStr) this.recordCoordinator(key, pid)
+					// A self pick is a no-op here — recordCoordinator ignores self-valued
+					// writes (see its doc comment), matching the last-resort self tier below.
+					this.recordCoordinator(key, pid)
 					this.log('findCoordinator:done key=%s ms=%d source=%s', keyStr, Date.now() - t0, 'fret')
 					return pid
 				}
@@ -504,9 +499,8 @@ export class Libp2pKeyPeerNetwork implements IKeyNetwork, IPeerNetwork {
 			// `unknown` peer is never picked). Note this candidate set is built from
 			// connected REMOTE peers and never includes self, so when no serving peer is
 			// present selection falls through to the last-resort self-coordination block.
-			// Being remote-only, this tier can never yield self — hence no self-coordination
-			// guard check and no "don't cache self" carve-out are needed here, unlike the
-			// FRET tier above; its `recordCoordinator` below is always caching a remote peer.
+			// Being remote-only, this tier needs no self-coordination guard check, unlike the
+			// FRET tier above.
 			const connectedCandidates = connected
 				.filter(p => !excludedSet.has(p.toString()) && !(this.reputation?.isBanned(p.toString())))
 				.sort((a, b) => (this.reputation?.getScore(a.toString()) ?? 0) - (this.reputation?.getScore(b.toString()) ?? 0))

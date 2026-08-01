@@ -500,11 +500,11 @@ describe('Libp2pKeyPeerNetwork', () => {
 			expect((network as any).coordinatorCache.size, 'no coordinator-cache entry for a self pick').to.equal(0);
 		});
 
-		it('purges an externally-seeded self cache entry once connections arrive', async () => {
-			// recordCoordinator is public and is also called from outside this class on redirect
-			// responses (RepoClient / ClusterClient / NetworkTransactor), so a redirect naming
-			// self can seed an entry the FRET-path carve-out cannot prevent. It must be dropped
-			// at the "real connections arrived" transition.
+		it('ignores an externally-seeded self entry — recordCoordinator is the gate', async () => {
+			// recordCoordinator is public and MOST of its callers are outside this class:
+			// NetworkTransactor writes back whatever findCoordinator returned (self included)
+			// after each pend, and RepoClient / ClusterClient write redirect targets. Gating
+			// only the internal selection tiers would let those writers re-create the entry.
 			const peerA = await makePeerId();
 			const { libp2p, state } = createMutableMock({
 				connections: [],
@@ -514,14 +514,55 @@ describe('Libp2pKeyPeerNetwork', () => {
 			const key = new TextEncoder().encode('redirected-key');
 
 			network.recordCoordinator(key, selfPeerId);
-			expect((network as any).coordinatorCache.size).to.equal(1);
+			expect((network as any).coordinatorCache.size, 'self-valued write ignored').to.equal(0);
 
 			state.connections = [connTo(peerA)];
-			// Equivalent to the 'connection:open' handler wired by setupConnectionTracking().
-			(network as any).updateNetworkObservations();
-
-			expect((network as any).coordinatorCache.size, 'self-valued entry purged').to.equal(0);
 			expect((await network.findCoordinator(key)).toString()).to.equal(peerA.toString());
+		});
+
+		it('reproduces the NetworkTransactor write-back: a self pick never survives to pin the key', async () => {
+			// End-to-end shape of the original poisoning: findCoordinator returns self at boot,
+			// the caller pends against self, then NetworkTransactor caches the peer it actually
+			// used (`recordCoordinator(key, b.peerId)` — self). A peer that arrives WITHOUT a
+			// fresh connection:open event (it was already connected; only its identify landed)
+			// must still take over the key, so the fix cannot rely on a connection-time sweep.
+			const peerA = await makePeerId();
+			const { libp2p, state } = createMutableMock({
+				connections: [connTo(peerA)],
+				neighbors: [selfPeerId.toString()]
+			});
+			const network = new Libp2pKeyPeerNetwork(libp2p, 16, undefined, 'forming');
+			const key = new TextEncoder().encode('collection-tree-key');
+
+			const first = await network.findCoordinator(key);
+			expect(first.toString()).to.equal(selfPeerId.toString());
+			// The write-back NetworkTransactor performs after the pend completes.
+			network.recordCoordinator(key, first);
+			expect((network as any).coordinatorCache.size, 'write-back must not seed a self entry').to.equal(0);
+
+			// FRET now knows the already-connected peer; no connection:open fires.
+			state.neighbors = [peerA.toString(), selfPeerId.toString()];
+			expect((await network.findCoordinator(key)).toString()).to.equal(peerA.toString());
+		});
+
+		it('still caches a remote coordinator — the gate must not disable the cache', async () => {
+			// Regression guard on the write gate: only SELF is refused. A remote entry must
+			// still be written and still short-circuit selection ahead of every tier.
+			const peerA = await makePeerId();
+			const peerB = await makePeerId();
+			const { libp2p, state } = createMutableMock({
+				connections: [connTo(peerA)],
+				neighbors: [peerA.toString()]
+			});
+			const network = new Libp2pKeyPeerNetwork(libp2p, 16, undefined, 'forming');
+			const key = new TextEncoder().encode('remote-coordinated-key');
+
+			network.recordCoordinator(key, peerB);
+			expect((network as any).coordinatorCache.size, 'remote entry cached').to.equal(1);
+
+			// peerB isn't connected or a FRET neighbor; only the cache can produce it.
+			state.neighbors = [peerA.toString()];
+			expect((await network.findCoordinator(key)).toString()).to.equal(peerB.toString());
 		});
 
 		it('honours the self-coordination guard on the FRET path (self is a neighbor of the key)', async () => {
