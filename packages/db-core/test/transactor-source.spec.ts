@@ -5,7 +5,8 @@ import { TransactorSource } from '../src/transactor/transactor-source.js'
 import { TestTransactor } from '../src/testing/test-transactor.js'
 import { randomBytes } from '@libp2p/crypto'
 import { toString as uint8ArrayToString } from 'uint8arrays/to-string'
-import type { IBlock, ActionId, ActionContext, Transforms, BlockOperation, CommitRequest, CommitResult, ITransactor, BlockGets, GetBlockResults } from '../src/index.js'
+import type { IBlock, ActionId, ActionContext, Transforms, BlockOperation, CommitRequest, CommitResult, ITransactor, BlockGets, GetBlockResults, BlockUnavailableReason } from '../src/index.js'
+import { BlockUnavailableError } from '../src/index.js'
 
 describe('TransactorSource', () => {
 	type TestBlock = IBlock & { test: string[] }
@@ -459,6 +460,43 @@ describe('TransactorSource', () => {
 			// And no read dependency should have been recorded for the missing block
 			expect(src.getReadDependencies()).to.be.empty;
 		});
+
+		describe('unavailable entries (ticket repo-reports-unavailable-vs-absent)', () => {
+			/** Transactor answering every requested id with a single fixed entry. */
+			const makeFixedEntryTransactor = (entry: GetBlockResults[string]): ITransactor => ({
+				async get(gets: BlockGets): Promise<GetBlockResults> {
+					return Object.fromEntries(gets.blockIds.map(id => [id, { ...entry }]))
+				},
+			} as unknown as ITransactor)
+
+			for (const reason of ['unmaterializable', 'peers-unreachable'] as BlockUnavailableReason[]) {
+				it(`throws BlockUnavailableError (${reason}) for a blockless entry flagged unavailable, recording no read dependency`, async () => {
+					const src = new TransactorSource<IBlock>('coll', makeFixedEntryTransactor({ state: {}, unavailable: reason }), undefined)
+
+					let thrown: unknown
+					try {
+						await src.tryGet('indeterminate-block')
+					} catch (err) {
+						thrown = err
+					}
+					expect(thrown, 'tryGet must throw, not return undefined').to.be.instanceOf(BlockUnavailableError)
+					expect((thrown as BlockUnavailableError).blockId).to.equal('indeterminate-block')
+					expect((thrown as BlockUnavailableError).reason).to.equal(reason)
+					// No dependency for a block whose existence was never established.
+					expect(src.getReadDependencies()).to.be.empty
+				})
+			}
+
+			it('still serves the block when a flagged entry carries content (flag only matters for an absent read)', async () => {
+				// Defensive: producers only flag absent reads, but a flag alongside a materialized
+				// block must not turn a served read into a throw.
+				const block: IBlock = { header: { id: 'b1', type: 'T', collectionId: 'coll' } }
+				const src = new TransactorSource<IBlock>('coll', makeFixedEntryTransactor({ block, state: { latest: { actionId: 'a1' as ActionId, rev: 1 } }, unavailable: 'unmaterializable' }), undefined)
+
+				const served = await src.tryGet('b1')
+				expect(served).to.deep.equal(block)
+			})
+		})
 
 		it('should return stale data when actionContext has outdated revision', async () => {
 			const transactor = new TestTransactor();

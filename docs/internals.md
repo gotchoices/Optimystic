@@ -370,6 +370,27 @@ saveMaterializedBlock(block): store(structuredClone(block));
   db-core's `commitPhase` treats any returned `success:false` as a permanent stale failure and
   retries until its budget is exhausted. A `success:false` with any other reason is a genuine
   lost race and still reaches the caller.
+- **A block read has three answers, not two: present, authoritatively absent, or unavailable.**
+  `GetBlockResult` carries an optional `unavailable` field
+  ([`network/struct.ts`](../packages/db-core/src/network/struct.ts)) that a repo sets ONLY when it
+  knows its own answer is a guess; an absent field means authoritative, so every producer that
+  never sets it (including `TestTransactor`) keeps its existing meaning. Two producers set it:
+  `StorageRepo.get` flags `'unmaterializable'` when the block reads as absent but this node holds
+  records proving it exists — the missing-base promotion refusal above, or a `getBlock()` throw
+  on truncated history / a failed restore (caught **per block**, so one broken block no longer
+  fails its whole batch); `CoordinatorRepo.get` flags `'peers-unreachable'` when a locally-missing
+  block's cohort consult *throws* (a consult that runs and corroborates nothing stays an
+  authoritative absent — that is the healthy cohort's answer to the routine new-collection probe,
+  and the `ClusterLatestCallback` contract cannot tell "peer holds nothing" from a per-peer
+  timeout without counting responders). A merely-stale block with a failed consult keeps its real
+  local answer, unflagged; so do `skipClusterFetch` sync reads. Consumers: `NetworkTransactor.get`
+  treats a flagged entry as *not* answered — it earns the second-chance retry an authoritative
+  absent deliberately does not — and merges per block by the ranking **has a block > authoritative
+  absent > unavailable**. `TransactorSource.tryGet` converts a surviving blockless flagged entry
+  into a thrown `BlockUnavailableError` (naming the block and reason, recording no read
+  dependency), so a query against a collection this node cannot read fails loudly instead of
+  returning zero rows. `BlockUnavailableError` is not a `StaleFailure`: `Collection.sync` does not
+  absorb or retry it.
 
 ### Collection Header Blocks
 - Header blockId = collection name (deterministic)
@@ -378,11 +399,10 @@ saveMaterializedBlock(block): store(structuredClone(block));
   - `Collection.open()` — checks local storage first, then cluster; resolves `undefined` when
     the header is *authoritatively* absent (nothing has ever been committed under this id).
     Nothing is staged, so a caller that ignores the `undefined` cannot later sync a phantom
-    collection. A header whose log will not open is a fault, not an absence, and throws.
-    *Caveat:* "authoritatively absent" is only true once the storage layer throws on a header it
-    could not **retrieve** (unreachable peers, an unreconstructable revision) instead of
-    reporting it as missing — ticket `repo-reports-unavailable-vs-absent`, not yet landed. Until
-    then `open` confines that ambiguity to one probe rather than removing it.
+    collection. A header whose log will not open is a fault, not an absence, and throws — as
+    does a header the storage layer could not **retrieve** (an unreconstructable revision, an
+    unreachable cohort), which surfaces as a thrown `BlockUnavailableError` rather than an
+    absence (see the three-valued block answer above).
   - `Collection.createOrOpen()` — same probe, but stages a fresh header in the local tracker on
     a miss (nothing reaches storage until `sync()`), logging `collection:invented` under the
     `optimystic:db-core:collection` namespace.

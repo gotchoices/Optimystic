@@ -131,28 +131,33 @@ export class NetworkTransactor implements ITransactor, IBlockChangeNotifier {
 		}
 
 		// Second-chance retry: ONLY for a genuine no-response — a batch with no valid
-		// response, or a response missing an entry for a requested block id. An
-		// authoritative "absent" answer (a valid response that carries an entry for
-		// every requested block id, even one whose entry has only `state` and no
-		// materialized `block`) is FINAL and must not retry. A block that genuinely
-		// does not exist yet surfaces as `{ state: {} }` (an entry that is present) —
-		// retrying it doubles the round-trips on the common createOrOpen "does this
-		// block exist?" probe. Cross-member reconciliation for a missing block has
-		// already happened one layer down: CoordinatorRepo.get detects `isMissing` and
-		// consults cluster peers before it responds, so by the time an authoritative
-		// absent reaches here there is nothing left for a transactor-level retry to
-		// discover. See ticket txn-perf-authoritative-notfound.
+		// response, a response missing an entry for a requested block id, or an entry
+		// flagged `unavailable`. An authoritative "absent" answer (a valid response that
+		// carries an entry for every requested block id, even one whose entry has only
+		// `state` and no materialized `block`) is FINAL and must not retry. A block that
+		// genuinely does not exist yet surfaces as `{ state: {} }` (an entry that is
+		// present and unflagged) — retrying it doubles the round-trips on the common
+		// createOrOpen "does this block exist?" probe. Cross-member reconciliation for a
+		// missing block has already happened one layer down: CoordinatorRepo.get detects
+		// `isMissing` and consults cluster peers before it responds — and when that
+		// consult FAILS, the entry now says so via `unavailable` instead of posing as an
+		// authoritative absent. So by the time an unflagged absent reaches here there is
+		// nothing left for a transactor-level retry to discover, while a flagged entry
+		// earns the retry against a different peer that an absent deliberately does not.
+		// See tickets txn-perf-authoritative-notfound and repo-reports-unavailable-vs-absent.
 		const hasValidResponse = (b: CoordinatorBatch<BlockId[], GetBlockResults>) => {
 			return b.request?.isResponse === true && b.request.response != null;
 		};
 
 		// A batch is answered when its response carries an entry for EVERY requested
-		// block id. An entry present with only `state` (no `block`) is an authoritative
-		// "absent", which counts as answered — not a gap.
+		// block id and none of those entries is flagged `unavailable`. An entry present
+		// with only `state` (no `block`) is an authoritative "absent", which counts as
+		// answered — not a gap. An `unavailable` entry is the peer saying its own answer
+		// is a guess, so it does NOT count as answered.
 		const isAuthoritative = (b: CoordinatorBatch<BlockId[], GetBlockResults>) => {
 			if (!hasValidResponse(b)) return false;
 			const resp = b.request!.response! as GetBlockResults;
-			return b.payload.every(bid => resp[bid] !== undefined);
+			return b.payload.every(bid => resp[bid] !== undefined && resp[bid]!.unavailable === undefined);
 		};
 
 		// Retry only genuine no-response / partial-response batches. An authoritative
@@ -200,16 +205,24 @@ export class NetworkTransactor implements ITransactor, IBlockChangeNotifier {
 		// Cache the completed batches that had actual responses (not just coordinator not found)
 		const completedBatches = Array.from(allBatches(batches, b => b.request?.isResponse as boolean && !isRecordEmpty(b.request!.response!)));
 
+		// Three-way ranking per block id: a materialized block beats an authoritative
+		// absent, which beats an `unavailable` guess — one peer that positively knows the
+		// block is absent outranks another that could not find out. Non-object junk ranks
+		// below everything so any real entry replaces it.
+		const rankOf = (r: unknown): number => {
+			if (!r || typeof r !== 'object') return -1;
+			const entry = r as GetBlockResults[BlockId];
+			if (entry.block != null) return 2;
+			return entry.unavailable === undefined ? 1 : 0;
+		};
+
 		// Create a lookup map from successful responses only
 		const resultEntries = new Map<string, any>();
 		for (const batch of completedBatches) {
 			const resp = batch.request!.response! as any;
 			for (const [bid, res] of Object.entries(resp)) {
 				const existing = resultEntries.get(bid);
-				// Prefer responses that include a materialized block
-				const resHasBlock = res && typeof res === 'object' && 'block' in (res as any) && (res as any).block != null;
-				const existingHasBlock = existing && typeof existing === 'object' && 'block' in (existing as any) && (existing as any).block != null;
-				if (!existing || (resHasBlock && !existingHasBlock)) {
+				if (!existing || rankOf(res) > rankOf(existing)) {
 					resultEntries.set(bid, res);
 				}
 			}

@@ -134,12 +134,38 @@ export type BlockGets = {
 	context?: ActionContext;	// Latest if this is omitted
 };
 
+/** Why a repo could not establish whether a block exists. Present ONLY when the repo
+ *  knows its own answer is a guess; an absent field is an authoritative answer. */
+export type BlockUnavailableReason =
+	/** Records for this block exist here but it cannot be reconstructed locally — a
+	 *  revision was received with no base to apply it to, or its history is truncated. */
+	| 'unmaterializable'
+	/** Nothing is held locally and the cohort could not be consulted to confirm it. */
+	| 'peers-unreachable';
+
 export type GetBlockResult = {
 	/** The retrieved block - undefined if the block was deleted	 */
 	block?: IBlock;
 	/** The latest and pending states of the repo that retrieved the block */
 	state: BlockActionState;
+	/** Set when this repo could not determine whether the block exists — its answer is a
+	 *  guess, not an authoritative absent. Every producer that omits it (including
+	 *  TestTransactor) keeps meaning "authoritative". */
+	unavailable?: BlockUnavailableReason;
 };
+
+/**
+ * Thrown by a block read when the responsible repo could not determine whether the
+ * block exists. Distinct from "the block is absent" (undefined) and from a transport
+ * failure — this node's data is genuinely indeterminate and the caller must not treat
+ * it as empty. Not a StaleFailure: `Collection.sync` does not retry it.
+ */
+export class BlockUnavailableError extends Error {
+	constructor(readonly blockId: BlockId, readonly reason: BlockUnavailableReason) {
+		super(`Block ${blockId} is unavailable (${reason}): the repo could not determine whether it exists`);
+		this.name = 'BlockUnavailableError';
+	}
+}
 
 export type GetBlockResults = Record<BlockId, GetBlockResult>;
 

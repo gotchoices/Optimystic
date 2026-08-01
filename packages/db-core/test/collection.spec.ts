@@ -5,6 +5,7 @@ import { Collection, SyncRetryExhaustedError, type CollectionInitOptions } from 
 import { TestTransactor, FlakyCommitTransactor } from '../src/testing/test-transactor.js'
 import { waitFor } from '../src/testing/async-wait.js'
 import type { Action, ActionHandler, BlockStore, IBlock, ITransactor, BlockGets, GetBlockResults, ActionBlocks, BlockActionStatus, PendRequest, PendResult, CommitRequest, CommitResult } from '../src/index.js'
+import { BlockUnavailableError } from '../src/index.js'
 
 interface TestAction {
   value: string
@@ -43,6 +44,52 @@ describe('Collection', () => {
   it('should create a new collection', async () => {
     const collection = await Collection.createOrOpen<TestAction>(transactor, collectionId, initOptions)
     expect(collection.id).to.equal(collectionId)
+  })
+
+  // Ticket repo-reports-unavailable-vs-absent: the end-to-end assertion for the reported
+  // bug — a header this node COULD NOT RETRIEVE must fail the open loudly instead of the
+  // collection being invented as empty and served indefinitely.
+  describe('unavailable header vs authoritatively absent header', () => {
+    /** Delegates everything to the inner TestTransactor, but answers reads of `unavailableId`
+     *  with a blockless entry flagged `unavailable` — modelling a repo that holds records for
+     *  the block it cannot reconstruct. */
+    const makeUnavailableBlockTransactor = (inner: TestTransactor, unavailableId: string): ITransactor => ({
+      async get(gets: BlockGets): Promise<GetBlockResults> {
+        const res = await inner.get(gets)
+        if (gets.blockIds.includes(unavailableId)) {
+          res[unavailableId] = { state: {}, unavailable: 'unmaterializable' }
+        }
+        return res
+      },
+      getStatus: (refs: ActionBlocks[]) => inner.getStatus(refs),
+      pend: (req: PendRequest) => inner.pend(req),
+      cancel: (ref: ActionBlocks) => inner.cancel(ref),
+      commit: (req: CommitRequest) => inner.commit(req),
+    })
+
+    it('createOrOpen throws BlockUnavailableError instead of inventing an empty collection', async () => {
+      const flaky = makeUnavailableBlockTransactor(transactor, collectionId)
+      const attempt = Collection.createOrOpen<TestAction>(flaky, collectionId, initOptions)
+      await expect(attempt).to.be.rejectedWith(BlockUnavailableError)
+    })
+
+    it('open throws BlockUnavailableError rather than resolving undefined', async () => {
+      const flaky = makeUnavailableBlockTransactor(transactor, collectionId)
+      const attempt = Collection.open<TestAction>(flaky, collectionId, initOptions)
+      await expect(attempt).to.be.rejectedWith(BlockUnavailableError)
+    })
+
+    it('createOrOpen against an authoritative absent still creates (the common new-collection probe)', async () => {
+      // The single most important regression to guard: the first createOrOpen of EVERY
+      // collection probes a header that has never existed. That answer is an unflagged
+      // { state: {} } and must keep creating — were it ever flagged, creating any
+      // collection would become impossible.
+      const collection = await Collection.createOrOpen<TestAction>(transactor, collectionId, initOptions)
+      expect(collection.id).to.equal(collectionId)
+      await collection.updateAndSync()
+      const reopened = await Collection.open<TestAction>(transactor, collectionId, initOptions)
+      expect(reopened, 'a synced collection reopens').to.not.equal(undefined)
+    })
   })
 
   it('should open an existing collection', async () => {

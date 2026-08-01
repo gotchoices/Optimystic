@@ -206,6 +206,116 @@ describe('NetworkTransactor', () => {
       expect(result[b1]).to.exist
       expect(result[b2]).to.exist
     })
+
+    // Ticket repo-reports-unavailable-vs-absent: an entry flagged `unavailable` is the
+    // peer saying its own answer is a guess, so it earns the second-chance retry an
+    // authoritative absent deliberately does not — and loses the merge to any peer
+    // with a real answer.
+    it('retries an unavailable answer against a different peer and prefers the authoritative one', async () => {
+      const peerA = 'peer-A'
+      const peerB = 'peer-B'
+      const net = new CountingKeyNetwork([peerA, peerB])
+
+      const blockId = 'indeterminate-block' as BlockId
+
+      let aGets = 0
+      let bGets = 0
+      // peerA answers, but flags that it could not establish whether the block exists.
+      const unavailableRepo = makeGetOnlyRepo(async ({ blockIds }: BlockGets) => {
+        aGets++
+        const res: GetBlockResults = {}
+        for (const bid of blockIds) res[bid] = { state: {}, unavailable: 'unmaterializable' }
+        return res
+      })
+      // peerB (the retry coordinator) answers with an authoritative absent.
+      const authoritativeRepo = makeGetOnlyRepo(async ({ blockIds }: BlockGets) => {
+        bGets++
+        const res: GetBlockResults = {}
+        for (const bid of blockIds) res[bid] = { state: {} }
+        return res
+      })
+
+      const networkTransactor = new NetworkTransactor({
+        timeoutMs: 1000,
+        abortOrCancelTimeoutMs: 500,
+        keyNetwork: net,
+        getRepo: (peerId: PeerId) => (peerId.toString() === peerA ? unavailableRepo : authoritativeRepo),
+      })
+
+      const result = await networkTransactor.get({ blockIds: [blockId] })
+
+      // The flagged answer forced a second coordinator round…
+      expect(net.findCoordinatorCalls).to.equal(2)
+      expect(aGets).to.equal(1)
+      expect(bGets).to.equal(1)
+      // …and the merge kept the authoritative absent, not the guess.
+      expect(result[blockId]).to.exist
+      expect(result[blockId]!.unavailable).to.equal(undefined)
+    })
+
+    it('carries the unavailable flag through when every consulted peer is indeterminate', async () => {
+      const peerA = 'peer-A'
+      const peerB = 'peer-B'
+      const net = new CountingKeyNetwork([peerA, peerB])
+
+      const blockId = 'indeterminate-block' as BlockId
+
+      // Both peers answer with entries for every id, all flagged — so the read does not
+      // throw for a missing entry, but the surviving entry must keep the flag for
+      // TransactorSource to convert into BlockUnavailableError.
+      const unavailableRepo = makeGetOnlyRepo(async ({ blockIds }: BlockGets) => {
+        const res: GetBlockResults = {}
+        for (const bid of blockIds) res[bid] = { state: {}, unavailable: 'peers-unreachable' }
+        return res
+      })
+
+      const networkTransactor = new NetworkTransactor({
+        timeoutMs: 1000,
+        abortOrCancelTimeoutMs: 500,
+        keyNetwork: net,
+        getRepo: (_peerId: PeerId) => unavailableRepo,
+      })
+
+      const result = await networkTransactor.get({ blockIds: [blockId] })
+
+      // Both rounds ran (initial + second chance) and neither produced a better answer.
+      expect(net.findCoordinatorCalls).to.equal(2)
+      expect(result[blockId]).to.exist
+      expect(result[blockId]!.block).to.equal(undefined)
+      expect(result[blockId]!.unavailable).to.equal('peers-unreachable')
+    })
+
+    it('a materialized block from one peer beats another peer\'s unavailable answer', async () => {
+      const peerA = 'peer-A'
+      const peerB = 'peer-B'
+      const net = new CountingKeyNetwork([peerA, peerB])
+
+      const blockId = 'held-block' as BlockId
+      const block = { header: { id: blockId, type: 'T', collectionId: 'c' as BlockId } }
+
+      const unavailableRepo = makeGetOnlyRepo(async ({ blockIds }: BlockGets) => {
+        const res: GetBlockResults = {}
+        for (const bid of blockIds) res[bid] = { state: {}, unavailable: 'unmaterializable' }
+        return res
+      })
+      const servingRepo = makeGetOnlyRepo(async ({ blockIds }: BlockGets) => {
+        const res: GetBlockResults = {}
+        for (const bid of blockIds) res[bid] = { block, state: { latest: { actionId: 'a1', rev: 1 } } }
+        return res
+      })
+
+      const networkTransactor = new NetworkTransactor({
+        timeoutMs: 1000,
+        abortOrCancelTimeoutMs: 500,
+        keyNetwork: net,
+        getRepo: (peerId: PeerId) => (peerId.toString() === peerA ? unavailableRepo : servingRepo),
+      })
+
+      const result = await networkTransactor.get({ blockIds: [blockId] })
+
+      expect(result[blockId]!.block).to.deep.equal(block)
+      expect(result[blockId]!.unavailable).to.equal(undefined)
+    })
   })
 
   describe('pend', () => {

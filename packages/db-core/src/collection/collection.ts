@@ -62,14 +62,12 @@ export class Collection<TAction> implements ICollection<TAction> {
 
 	/** Open an EXISTING collection.
 	 *
-	 * Resolves to `undefined` when the header block probe comes back empty. That is meant to
-	 * mean "authoritatively absent" — nothing has ever been committed under this id — and it
-	 * only IS that once the storage layer distinguishes an absent block from one it could not
-	 * retrieve (unreachable peers, a revision this node cannot reconstruct) and throws on the
-	 * latter. That half is ticket `repo-reports-unavailable-vs-absent` and has NOT landed, so
-	 * today an unreachable header can still surface here as `undefined`. What this method does
-	 * guarantee now is that the ambiguity is confined to this one probe instead of being spread
-	 * across every read path as a silently-invented empty collection.
+	 * Resolves to `undefined` when the header block probe comes back empty — an
+	 * authoritatively absent header, meaning nothing has ever been committed under this id.
+	 * A header the storage layer could not RETRIEVE (a revision this node cannot
+	 * reconstruct, an unreachable cohort) is not absent: the probe throws
+	 * {@link BlockUnavailableError} instead of resolving `undefined`, so an unreachable
+	 * collection can never be mistaken for a nonexistent one.
 	 *
 	 * Use this wherever reading — not creating — is what was meant. {@link createOrOpen}
 	 * would instead stage a fresh empty collection, and reads through it would report an
@@ -193,13 +191,10 @@ export class Collection<TAction> implements ICollection<TAction> {
 
 		// Bootstrap context from committed tail so pending blocks are accessible.
 		// Read through tracker so Chain.open inside Log.open reuses the cached header.
-		// NOTE: when the header comes back absent, this silently no-ops — no bootstrap runs,
-		// `Log.open` below yields nothing, and the collection keeps serving its stale in-memory
-		// state instead of reporting that it could not refresh. Deliberately left as-is here:
-		// the fix belongs at the storage layer, which must distinguish "nothing was ever
-		// committed under this id" from "I could not find out" (ticket
-		// repo-reports-unavailable-vs-absent) — once it throws on the latter, this read stops
-		// being able to observe a spurious absence at all.
+		// A header the storage layer could not retrieve throws BlockUnavailableError out of
+		// this read (it is not a StaleFailure, so sync's retry loop does not absorb it) —
+		// so an ABSENT header here is authoritative: nothing was ever committed under this
+		// id, and the silent no-op below is correct rather than a masked failure.
 		const header = await tracker.tryGet(this.id) as CollectionHeaderBlock | undefined;
 		if (header) {
 			await Collection.bootstrapContext(source, this.transactor, header);

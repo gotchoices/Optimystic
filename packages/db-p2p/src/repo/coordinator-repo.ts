@@ -313,14 +313,21 @@ export class CoordinatorRepo implements IRepo {
 		//   (a) Missing — block isn't present locally at all (legacy behavior).
 		//   (b) Stale-by-policy — block is present but read-repair policy says verify.
 		// Skip cluster fetch if this is already a sync request (to prevent recursive queries).
+		// A sync read is also never marked `unavailable` here — the consult it skips is the
+		// one whose failure the flag reports, and flagging would feed the recursion this
+		// bypass exists to prevent. (Storage-level 'unmaterializable' flags still pass
+		// through untouched; they report local state, not the consult.)
 		const skipClusterFetch = (options as any)?.skipClusterFetch;
 		// NOTE: NetworkTransactor.get treats an authoritative "absent" ({ state: {} })
 		// as final and no longer retries it (ticket txn-perf-authoritative-notfound),
-		// relying on this cluster reconciliation to have already run. If a coordinator
-		// is ever configured WITHOUT clusterLatestCallback, a missing block is answered
-		// from local state alone with no transactor-level retry to compensate. That is
-		// fine today (such a coordinator has no cluster to reconcile against), but keep
-		// this coupling in mind if a partial-cluster read path is added.
+		// relying on this cluster reconciliation to have already run. When the consult
+		// runs and FAILS, the entry is flagged `unavailable: 'peers-unreachable'` below,
+		// which re-enables the transactor-level retry against a different peer. If a
+		// coordinator is configured WITHOUT clusterLatestCallback, there is no cohort to
+		// consult and the local answer IS the whole truth — it stays authoritative, with
+		// no flag and no transactor-level retry to compensate. That is fine (such a
+		// coordinator has no cluster to reconcile against), but keep this coupling in
+		// mind if a partial-cluster read path is added.
 		if (this.clusterLatestCallback && !skipClusterFetch) {
 			for (const blockId of blockGets.blockIds) {
 				const localEntry = localResult[blockId];
@@ -354,6 +361,23 @@ export class CoordinatorRepo implements IRepo {
 					}
 				} catch (err) {
 					log('cluster-fetch:error', { blockId, error: (err as Error).message });
+					// The consult that was supposed to make this answer trustworthy did not run.
+					// Only a locally-MISSING block is downgraded to `unavailable`: a merely-stale
+					// block still has a real local answer and stays authoritative. A sharper flag
+					// already on the entry (storage's 'unmaterializable') is never overwritten.
+					// NOTE: a consult that runs but corroborates nothing (per-peer timeouts and
+					// "peer holds nothing" both surface as absent claims → no quorum) does NOT
+					// land here and stays an authoritative absent — the common new-collection
+					// probe against a healthy cohort takes exactly that path, and the callback
+					// contract cannot distinguish the two without counting responders.
+					if (isMissing) {
+						const entry = localResult[blockId];
+						if (!entry) {
+							localResult[blockId] = { state: {}, unavailable: 'peers-unreachable' };
+						} else if (entry.unavailable === undefined) {
+							entry.unavailable = 'peers-unreachable';
+						}
+					}
 				}
 			}
 		}
@@ -544,13 +568,21 @@ export class CoordinatorRepo implements IRepo {
 	 * the repair. Returns the local revision afterwards.
 	 *
 	 * A pending-only block (metadata seeded by `savePendingTransaction`, no committed revision) asked
-	 * for a forward revision throws out of `BlockStorage.ensureRevision` when no restore can supply it.
-	 * On THIS path that is an absence, not a read failure — acquisition is precisely the mechanism that
-	 * can supply it — so the throw is logged and swallowed rather than short-circuiting the caller.
+	 * for a forward revision no promotion can reach used to throw out of `BlockStorage.ensureRevision`;
+	 * `StorageRepo.get` now reports it as an entry flagged `unavailable` instead (ticket
+	 * repo-reports-unavailable-vs-absent). On THIS path either shape is an absence, not a read failure —
+	 * acquisition is precisely the mechanism that can supply the revision — so both are logged as
+	 * `promote-unavailable` and stepped over rather than short-circuiting the caller.
 	 */
 	private async promoteCorroborated(blockId: BlockId, corroborated: ActionRev): Promise<number | undefined> {
 		try {
-			return await this.readLocalRev(blockId, { committed: [corroborated], rev: corroborated.rev });
+			const result = await this.storageRepo.get({ blockIds: [blockId], context: { committed: [corroborated], rev: corroborated.rev } });
+			const entry = result[blockId];
+			if (entry?.unavailable !== undefined) {
+				log('cluster-fetch:promote-unavailable', { blockId, rev: corroborated.rev, error: entry.unavailable });
+				return undefined;
+			}
+			return entry?.state?.latest?.rev;
 		} catch (err) {
 			log('cluster-fetch:promote-unavailable', { blockId, rev: corroborated.rev, error: (err as Error).message });
 			return undefined;

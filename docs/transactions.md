@@ -543,6 +543,15 @@ The staleness concern above applies to **bare reads** — reads whose value is c
 
 A bare soft read carries no such check. If your use case cannot tolerate returning data that may be one commit stale, either set `readRepairMode: 'paranoid'` or wrap the read in a transaction whose commit enforces freshness via the read-dependency check.
 
+### Unavailable reads: `BlockUnavailableError`
+
+Staleness is one failure mode; *indeterminacy* is another. A repo that cannot work out whether a block exists at all — it holds records for the block but cannot reconstruct it (a revision received with no base, truncated history), or the block is missing locally and the cohort consult that would confirm the absence threw — answers with `unavailable` set on the block's `GetBlockResult` rather than posing as an authoritative "never existed". When such an answer survives the transactor's second-chance retry (no other peer had a better one), the read **throws `BlockUnavailableError`**, naming the block and the reason (`'unmaterializable'` or `'peers-unreachable'`).
+
+Two properties matter to callers:
+
+- **It is not a `StaleFailure` and is not retried.** `Collection.sync`'s re-read/rebase/retry loop absorbs stale failures; `BlockUnavailableError` propagates straight out of `sync`, `update`, `open`, and `createOrOpen`. An indeterminate read cannot be fixed by rebasing — the node needs healing (replication, read-repair acquisition), not another optimistic attempt.
+- **An authoritatively absent block still reads as absent.** The routine `createOrOpen` probe of a never-existing header keeps returning an unflagged absent (and keeps its single-round-trip cost); only an answer the repo *knows* is a guess throws. See the three-valued block answer in [internals.md](internals.md).
+
 ## Key Components
 
 ### 1. Transaction Types (db-core)

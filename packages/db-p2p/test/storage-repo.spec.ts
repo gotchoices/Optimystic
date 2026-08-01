@@ -343,6 +343,119 @@ describe('StorageRepo', () => {
 		});
 	});
 
+	describe('get — unavailable vs absent (ticket repo-reports-unavailable-vs-absent)', () => {
+		const BLOCK = 'no-base-block' as BlockId;
+
+		/** Pend an update for a block this repo holds no revision of — the shape a node is left
+		 *  in when it received revision N's pend but never the revision it applies to. */
+		const pendUpdateWithoutBase = async (actionId: string): Promise<void> => {
+			await repo.pend({
+				actionId: actionId as ActionId,
+				transforms: makeUpdateTransforms(BLOCK, [['items', 0, 0, ['x']]]),
+				policy: 'c'
+			});
+		};
+
+		it('flags a context-driven read as unmaterializable when the pending has no base', async () => {
+			// The reported trace: this node holds the pending record for rev 2 with no rev 1 to
+			// apply it to, so it cannot reconstruct the block — but its records PROVE the block
+			// exists, so answering { state: {} } would be a guess presented as authoritative.
+			await pendUpdateWithoutBase('a-ctx');
+
+			const result = await repo.get({
+				blockIds: [BLOCK],
+				context: { committed: [{ actionId: 'a-ctx' as ActionId, rev: 2 }], rev: 2 }
+			});
+
+			expect(result[BLOCK]?.block).to.equal(undefined);
+			expect(result[BLOCK]?.state?.latest).to.equal(undefined);
+			expect(result[BLOCK]?.unavailable).to.equal('unmaterializable');
+		});
+
+		it('a block never written returns { state: {} } with NO unavailable field', async () => {
+			// The common createOrOpen "does this block exist?" probe: this answer must stay
+			// authoritative, or creating any collection becomes impossible (the flag would
+			// send it into retries and then a throw).
+			const result = await repo.get({ blockIds: ['never-written' as BlockId] });
+
+			expect(result['never-written']!.state).to.deep.equal({});
+			expect('unavailable' in result['never-written']!).to.equal(false);
+		});
+
+		it('a tombstoned block reads back absent with NO unavailable field', async () => {
+			// A deleted block reverse-applies to nothing by design — an authoritative absent.
+			// It never enters the missing-base catch, so the flag must not appear.
+			await repo.pend({
+				actionId: 'a1' as ActionId,
+				transforms: makeInsertTransforms(BLOCK, makeBlock(BLOCK)),
+				policy: 'c'
+			});
+			await repo.commit({ actionId: 'a1' as ActionId, blockIds: [BLOCK], tailId: BLOCK, rev: 1 });
+			await repo.pend({ actionId: 'a2' as ActionId, transforms: makeDeleteTransforms(BLOCK), policy: 'c' });
+			await repo.commit({ actionId: 'a2' as ActionId, blockIds: [BLOCK], tailId: BLOCK, rev: 2 });
+
+			const result = await repo.get({ blockIds: [BLOCK] });
+
+			expect(result[BLOCK]!.block).to.equal(undefined);
+			expect('unavailable' in result[BLOCK]!).to.equal(false);
+		});
+
+		it('flags a contextless read when latest itself is unmaterializable, instead of failing the batch', async () => {
+			// A wedged block: latest points at a revision with no materialization anywhere below
+			// it, so getBlock() throws ("Failed to find materialized block"). Before this ticket
+			// the throw escaped Promise.all and failed the whole get.
+			await rawStorage.saveMetadata(BLOCK, { latest: { rev: 3, actionId: 'ghost' as ActionId }, ranges: [[3]] });
+
+			const result = await repo.get({ blockIds: [BLOCK] });
+
+			expect(result[BLOCK]?.block).to.equal(undefined);
+			expect(result[BLOCK]?.unavailable).to.equal('unmaterializable');
+		});
+
+		it('a mixed batch returns healthy siblings alongside the flagged block', async () => {
+			// One broken block must fail for the one block that is actually broken — not take
+			// nine healthy siblings down with it.
+			const OK = 'healthy-sibling' as BlockId;
+			await repo.pend({
+				actionId: 'a-ok' as ActionId,
+				transforms: makeInsertTransforms(OK, makeBlock(OK, { items: ['v'] })),
+				policy: 'c'
+			});
+			await repo.commit({ actionId: 'a-ok' as ActionId, blockIds: [OK], tailId: OK, rev: 1 });
+			// Wedge the sibling with an unmaterializable latest.
+			await rawStorage.saveMetadata(BLOCK, { latest: { rev: 3, actionId: 'ghost' as ActionId }, ranges: [[3]] });
+
+			const result = await repo.get({ blockIds: [OK, BLOCK] });
+
+			expect(result[OK]?.block?.header.id, 'healthy sibling served').to.equal(OK);
+			expect(result[OK]?.state?.latest?.rev).to.equal(1);
+			expect('unavailable' in result[OK]!).to.equal(false);
+			expect(result[BLOCK]?.unavailable).to.equal('unmaterializable');
+		});
+
+		it('a block with committed content stays authoritative when a context names a revision this node lacks', async () => {
+			// The stale-but-real-answer case: the block materializes at rev 1, and the caller's
+			// context proves a rev 2 this node holds no pending for. Promotion is a no-op (no
+			// pending, no refusal) and the read serves rev 1 unflagged — a stale answer is a
+			// real answer, never `unavailable`.
+			await repo.pend({
+				actionId: 'a1' as ActionId,
+				transforms: makeInsertTransforms(BLOCK, makeBlock(BLOCK, { items: [] })),
+				policy: 'c'
+			});
+			await repo.commit({ actionId: 'a1' as ActionId, blockIds: [BLOCK], tailId: BLOCK, rev: 1 });
+
+			const result = await repo.get({
+				blockIds: [BLOCK],
+				context: { committed: [{ actionId: 'a-future' as ActionId, rev: 2 }], rev: 2 }
+			});
+
+			expect(result[BLOCK]?.block?.header.id).to.equal(BLOCK);
+			expect(result[BLOCK]?.state?.latest?.rev).to.equal(1);
+			expect('unavailable' in result[BLOCK]!).to.equal(false);
+		});
+	});
+
 	describe('context-driven pending block serving (TEST-5.4.3)', () => {
 		it('serves and promotes a pending block when context proves the action is committed', async () => {
 			// Pend an action that inserts a block — simulating the pend phase

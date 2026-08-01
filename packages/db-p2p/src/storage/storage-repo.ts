@@ -1,7 +1,7 @@
 import type {
 	IRepo, MessageOptions, BlockId, CommitRequest, CommitResult, GetBlockResults, PendRequest, PendResult, ActionBlocks,
 	ActionId, BlockGets, ActionPending, PendSuccess, ActionTransform, ActionTransforms,
-	GetBlockResult, IBlock, ActionRev,
+	GetBlockResult, IBlock, ActionRev, BlockUnavailableReason,
 	PendValidationHook,
 	CollectionId, IBlockChangeNotifier, CollectionChangeListener, CollectionChangeEvent
 } from "@optimystic/db-core";
@@ -186,6 +186,11 @@ export class StorageRepo implements IRepo, IBlockChangeNotifier, IBlockReplicaSt
 		const promotions: { collectionId: CollectionId, blockId: BlockId, actionId: ActionId, rev: number }[] = [];
 		const results = await Promise.all(distinctBlockIds.map(async (blockId) => {
 			const blockStorage = this.createBlockStorage(blockId);
+			// Set when this node KNOWS its answer for the block is a guess: the promotion
+			// below refused for a missing base, or getBlock() threw (truncated history /
+			// failed restore). An absent-reading block then reports `unavailable` instead of
+			// posing as an authoritative "never existed" — see BlockUnavailableReason.
+			let unavailable: BlockUnavailableReason | undefined;
 
 			// Ensure that all outstanding transactions in the context are committed.
 			// This promotes a landed-elsewhere pending via internalCommit, which mutates
@@ -235,6 +240,10 @@ export class StorageRepo implements IRepo, IBlockChangeNotifier, IBlockReplicaSt
 							if (!(err instanceof MissingBaseRevisionError)) {
 								throw err;
 							}
+							// This node holds records PROVING the block exists (a pending it could not
+							// promote); if the block then reads as absent below, the answer is a guess,
+							// not an authoritative "never existed".
+							unavailable = 'unmaterializable';
 							log('get:promote-skipped-missing-base blockId=%s rev=%d reason=%s', blockId, err.rev, err.message);
 						}
 					});
@@ -248,7 +257,20 @@ export class StorageRepo implements IRepo, IBlockChangeNotifier, IBlockReplicaSt
 			// (actionId, rev) self-heals it via storage.recover() in commit(). Not repaired lazily on
 			// the read path because get() holds no commit latch; if stale reads on unwritten blocks
 			// ever become a problem, add a latched lazy recover() here.
-			const blockRev = await blockStorage.getBlock(context?.rev);
+			//
+			// getBlock() THROWS when this node holds a `latest` it cannot materialize (truncated
+			// history: "Failed to find materialized block", or a failed restore). Caught PER BLOCK so
+			// one broken block cannot fail the whole batch's Promise.all and take healthy siblings
+			// down with it. The read still fails for THIS block — TransactorSource throws
+			// BlockUnavailableError on the flagged entry — so nothing is swallowed.
+			let blockRev: Awaited<ReturnType<IBlockStorage['getBlock']>>;
+			try {
+				blockRev = await blockStorage.getBlock(context?.rev);
+			} catch (err) {
+				log('get:unmaterializable blockId=%s error=%s', blockId,
+					err instanceof Error ? err.message : String(err));
+				return [blockId, { state: {}, unavailable: 'unmaterializable' } as GetBlockResult];
+			}
 
 			// Include pending action if requested — handled first so a pending-only
 			// insert (no committed revision yet) can still be served by applying the
@@ -256,6 +278,8 @@ export class StorageRepo implements IRepo, IBlockChangeNotifier, IBlockReplicaSt
 			if (context?.actionId !== undefined) {
 				const pendingTransform = await blockStorage.getPendingTransaction(context.actionId);
 				if (!pendingTransform) {
+					// Caller-contract violation (the caller asserted a pending this repo never had, or
+					// cancelled) — an error, not an availability question. Deliberately NOT `unavailable`.
 					throw new Error(`Pending action ${context.actionId} not found`);
 				}
 				const block = applyTransform(blockRev?.block, pendingTransform);
@@ -264,12 +288,21 @@ export class StorageRepo implements IRepo, IBlockChangeNotifier, IBlockReplicaSt
 					state: {
 						latest: await blockStorage.getLatest(),
 						pendings: [context.actionId]
-					}
-				}];
+					},
+					// A pending applied to a missing base can materialize nothing (applyTransform drops
+					// updates with no block to apply them to) — that absence is a guess, and is flagged.
+					// A materialized block is a real answer regardless of the earlier refusal.
+					...(unavailable !== undefined && block === undefined ? { unavailable } : {})
+				} as GetBlockResult];
 			}
 
 			if (!blockRev) {
-				return [blockId, { state: {} } as GetBlockResult];
+				// `unavailable` distinguishes "never existed" (the common insert-probe case, no flag)
+				// from "this node cannot reconstruct it" (the promotion above refused for a missing
+				// base). A tombstoned block also lands here with meta.latest set, but it never enters
+				// the missing-base catch, so it stays an authoritative absent — keyed off the explicit
+				// flag, not off "no block".
+				return [blockId, { state: {}, ...(unavailable !== undefined ? { unavailable } : {}) } as GetBlockResult];
 			}
 
 			const pendings = await asyncIteratorToArray(blockStorage.listPendingTransactions());
