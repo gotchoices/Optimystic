@@ -21,6 +21,7 @@ import type {
 } from '@optimystic/db-core';
 import type { FindCoordinatorOptions } from '@optimystic/db-core';
 import { CoordinatorRepo, type ClusterLatestCallback } from '../src/repo/coordinator-repo.js';
+import { resolveClusterPolicy } from '../src/cluster/cluster-policy.js';
 import type { ClusterClient } from '../src/cluster/client.js';
 import { toString as u8ToString } from 'uint8arrays';
 import { captureLog, hasTag, hasTagAtRev } from './support/capture-log.js';
@@ -543,6 +544,65 @@ describe('CoordinatorRepo read-repair', () => {
 
 			expect(calls.find(c => c.context !== undefined), 'a lone claim must not be adopted here').to.equal(undefined);
 			expect(hasTag(captured, 'cluster-fetch:no-quorum')).to.equal(true);
+		});
+
+		/**
+		 * Ticket: corroboration-floor-defaults-to-two-for-large-meshes.
+		 *
+		 * The case above builds its config by hand; this one builds it from `resolveClusterPolicy`,
+		 * the function `createLibp2pNodeBase` actually calls — the layer where the regression lived.
+		 * An unconfigured node used to resolve `assumedClusterSize: 2` and hand it to the repair
+		 * floor, so a peer view shrunk to one peer bought that peer full trust.
+		 */
+		it('does not relax the floor for an UNCONFIGURED node (the real composition-root default)', async () => {
+			const localPeer = await makePeerId();
+			const otherPeer = await makePeerId();
+			const cluster = makeClusterPeers([localPeer, otherPeer]);
+
+			const resolved = resolveClusterPolicy({});
+			const { repo: storageRepo, calls } = makePresentStorageRepo(blockId, localRev, localActionId);
+			const repo = new CoordinatorRepo(
+				makeKeyNetwork(cluster),
+				makeClusterClient,
+				storageRepo,
+				{ ...resolved, readRepairMode: 'paranoid' },
+				undefined,
+				localPeer,
+				undefined,
+				makeSelfAnsweringCallback(localPeer, { actionId: 'remote-action', rev: 2 })
+			);
+
+			const captured = await captureCoordinatorLog(async () => { await repo.get({ blockIds: [blockId] }); });
+
+			expect(calls.find(c => c.context !== undefined), 'a lone claim must not be adopted by an unconfigured node').to.equal(undefined);
+			expect(hasTag(captured, 'cluster-fetch:no-quorum')).to.equal(true);
+		});
+
+		it('heals unconfigured-but-declared: resolveClusterPolicy with assumedClusterSize 2 repairs', async () => {
+			// The counterpart trade — one explicit operator setting restores self-repair for a mesh
+			// that really is two nodes, without lowering the replication factor.
+			const localPeer = await makePeerId();
+			const otherPeer = await makePeerId();
+			const cluster = makeClusterPeers([localPeer, otherPeer]);
+
+			const resolved = resolveClusterPolicy({ clusterPolicy: { assumedClusterSize: 2 } });
+			const remoteLatest: ActionRev = { actionId: 'remote-action', rev: 2 };
+			const { repo: storageRepo, calls } = makePresentStorageRepo(blockId, localRev, localActionId);
+			const repo = new CoordinatorRepo(
+				makeKeyNetwork(cluster),
+				makeClusterClient,
+				storageRepo,
+				{ ...resolved, readRepairMode: 'paranoid' },
+				undefined,
+				localPeer,
+				undefined,
+				makeSelfAnsweringCallback(localPeer, remoteLatest)
+			);
+
+			const captured = await captureCoordinatorLog(async () => { await repo.get({ blockIds: [blockId] }); });
+
+			expect(calls.find(c => c.context?.rev === remoteLatest.rev), 'a declared two-node cohort still repairs').to.not.equal(undefined);
+			expect(hasTagAtRev(captured, 'cluster-fetch:synced', remoteLatest.rev)).to.equal(true);
 		});
 
 		it('heals via assumedClusterSize even when clusterSize (replication factor) stays large', async () => {

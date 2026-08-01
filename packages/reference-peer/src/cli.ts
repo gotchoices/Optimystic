@@ -765,7 +765,7 @@ function withCommonPeerOptions(cmd: Command): Command {
 		.option('--storage-path <path>', 'Path for file storage')
 		.option('--storage-capacity <bytes>', 'Override storage capacity in bytes (for ring selection)')
 		.option('--cluster-size <number>', 'Desired cluster size per key (positive integer)')
-		.option('--assumed-cluster-size <number>', 'Smallest cohort this deployment can genuinely field; the membership admission gate\'s fallback floor when the node has no confident network-size estimate, and the read-repair/reconcile corroboration floor (default 2)')
+		.option('--assumed-cluster-size <number>', 'Smallest cohort this deployment can genuinely field. Sets both the membership admission gate\'s fallback floor (used when the node has no confident network-size estimate; defaults to 2 when unset) and the read-repair/reconcile corroboration floor (defaults to --cluster-size when unset). A mesh smaller than --cluster-size needs this to repair damaged blocks')
 		.option('--super-majority-threshold <number>', 'Super-majority threshold as a fraction in (0, 1] (default 0.67)')
 		.option('--offline', 'Run as single-node LocalTransactor (no distributed consensus)')
 		.option('--bootstrap-file <path>', 'Path to JSON containing bootstrap multiaddrs or node list')

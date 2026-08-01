@@ -330,7 +330,7 @@ saveMaterializedBlock(block): store(structuredClone(block));
   over `cluster/quorum-restore.ts`; the primitives are shared with `CoordinatorRepo`
   read-repair, which excludes the reader's own revision from that quorum — see
   [transactions.md § Read Consistency and Staleness](transactions.md#read-consistency-and-staleness)).
-  **Both** quorums cap their floor at `max(cohort peers excluding self, assumedClusterSize − 1)`
+  **Both** quorums cap their floor at `max(cohort peers excluding self, repairCorroborationClusterSize − 1)`
   — literally the same `corroboratorCapacity` function the read-repair path calls, so the two
   restoration paths cannot drift apart on it: a cohort with exactly one
   other peer cannot supply two corroborators *or* two block-carriers, so demanding two would
@@ -338,10 +338,14 @@ saveMaterializedBlock(block): store(structuredClone(block));
   random, not content-addressed, so the content hash is a cross-peer *agreement* check and
   never a check against the requested id — at capacity one the sole peer's bytes are taken on
   its word, which is the same trust its (equally uncorroborable) revision claim already gets.
-  Taking the MAX against the asserted `assumedClusterSize` — not the replication-factor
-  `clusterSize` — is what keeps a *shrunken view* of a larger cohort out of that relaxed
-  branch, and lets a genuine small deployment heal without also lowering its replication
-  factor. No rev quorum, or no content quorum →
+  Taking the MAX against a *declared* size — never against the number of peers a possibly
+  shrunken view happens to show — is what keeps a shrunken view of a larger cohort out of that
+  relaxed branch. `repairCorroborationClusterSize` is resolved by `resolveClusterPolicy`
+  (`cluster/cluster-policy.ts`) from the operator's `clusterPolicy.assumedClusterSize`, falling
+  back to `clusterSize` when it is absent — deliberately the strict fallback, so an unconfigured
+  node keeps the floor of two. A genuine small deployment declares
+  `clusterPolicy.assumedClusterSize` to heal, which — unlike lowering `clusterSize` — does not
+  also lower its replication factor. No rev quorum, or no content quorum →
   it leaves the block for a later churn/rebalance retry (logged
   `reconcile:no-rev-quorum` / `reconcile:no-content-quorum`). Reconciliation is
   best-effort and bounded (`ReconcileTimeoutMs`, the shared `RECONCILE_TIMEOUT_MS` the read

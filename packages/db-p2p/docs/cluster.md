@@ -728,7 +728,7 @@ interface ClusterConsensusConfig {
   clusterSizeTolerance: number;       // Default 0.5 (50% variance)
   partitionDetectionWindow: number;   // Default 60000ms (1 min)
   clusterSize?: number;               // Replication factor / target cohort breadth (default 10)
-  assumedClusterSize?: number;        // Smallest cohort the operator asserts exists (default 2 via libp2p-node-base)
+  assumedClusterSize?: number;        // Smallest cohort the operator asserts exists (admission gate; default 2 via libp2p-node-base)
   membershipAdmissionFraction?: number; // Default 0.75 — fraction of the size reference a declared set must meet
 }
 ```
@@ -747,18 +747,27 @@ interface ClusterConsensusConfig {
     altogether the gate treats the size as *unknown* and admits (legacy behavior), because refusing
     every write is the worse failure.
   - The **read-repair and reconcile corroboration floor** (`corroboratorCapacity` in
-    `cluster/quorum-restore.ts`), unconditionally: `max(peers currently visible, assumedClusterSize − 1)`
-    caps how many corroborators a restoration can be required to produce. Here an absent value falls
-    back to `clusterSize` instead of being treated as unknown — a block that stays unrepaired is
-    degraded, not dead, so there is no reason to relax the floor for a caller that has not adopted the
-    field.
+    `cluster/quorum-restore.ts`), unconditionally:
+    `max(peers currently visible, repairCorroborationClusterSize − 1)` caps how many corroborators a
+    restoration can be required to produce. An absent `assumedClusterSize` falls back to `clusterSize`
+    instead of being treated as unknown — a block that stays unrepaired is degraded, not dead, so
+    there is no reason to relax the floor for a caller that has not adopted the field.
 
-`libp2p-node-base` defaults `assumedClusterSize` to `minAbsoluteClusterSize` (2), so a two- or three-node
-mesh both transacts and repairs itself without configuration. A large deployment should set
-`clusterPolicy.assumedClusterSize` to its real cohort size — otherwise the admission gate cannot police a
-partition-induced downsize while its own size estimate is unconfident, and read-repair/reconcile demand
-only as many corroborators as that asserted size allows. Setting `clusterSize` alone (the old advice) no
-longer has this effect — `clusterSize` is replication-only.
+**The two defaults differ on purpose.** `resolveClusterPolicy` (`cluster/cluster-policy.ts`) — the one
+place `libp2p-node-base` applies these defaults — resolves the single operator field into *two* values:
+
+- `assumedClusterSize` → the operator's value, else `minAbsoluteClusterSize` (2). Permissive, so an
+  unconfigured two- or three-node mesh can still transact; the cost of being wrong here is a
+  partition-induced downsize slipping past an unconfident node.
+- `repairCorroborationClusterSize` → the operator's value, else `clusterSize` (default 10). Strict, so
+  an unconfigured node's repair floor cannot be talked down to a single voter by a shrunken cohort
+  view; the cost of being wrong here is only a block that stays unrepaired.
+
+Declaring `clusterPolicy.assumedClusterSize` sets both. A large deployment should declare its real
+cohort size, otherwise the admission gate cannot police a partition-induced downsize while its own size
+estimate is unconfident. A genuine two-node mesh needs one setting to *self-repair* —
+`clusterPolicy.assumedClusterSize: 2` (which does not lower the replication factor) or an honest
+`clusterSize: 2` — though it transacts and votes unconfigured.
 
 **Configuration in libp2p-node.ts:**
 ```typescript

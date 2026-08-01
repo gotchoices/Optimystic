@@ -108,10 +108,22 @@ interface CoordinatorRepoComponents {
 	acquireBlockFromCohort?: AcquireBlockCallback;
 }
 
+/**
+ * Consensus config for the coordinator side, plus the repair yardstick the read-repair path measures
+ * a (possibly shrunken) cohort view against. `repairCorroborationClusterSize` is deliberately its own
+ * field rather than an overload of {@link ClusterConsensusConfig.assumedClusterSize}: this same object
+ * also builds the `ClusterCoordinator`, and a field whose value silently differed from the cluster
+ * member's copy of it would be a trap. See `cluster/cluster-policy.ts` for why the two differ.
+ */
+export type CoordinatorRepoConfig = Partial<ClusterConsensusConfig> & {
+	clusterSize?: number;
+	repairCorroborationClusterSize?: number;
+};
+
 export function coordinatorRepo(
 	keyNetwork: IKeyNetwork,
 	createClusterClient: (peerId: PeerId) => ICluster,
-	cfg?: Partial<ClusterConsensusConfig> & { clusterSize?: number },
+	cfg?: CoordinatorRepoConfig,
 	fretService?: FretService,
 	reputation?: IPeerReputation,
 	stateStore?: ITransactionStateStore
@@ -145,11 +157,12 @@ export class CoordinatorRepo implements IRepo {
 	/** Simple-majority threshold from the consensus policy; drives the read-repair corroboration quorum. */
 	private readonly simpleMajorityThreshold: number;
 	/**
-	 * The smallest cohort the operator asserts this deployment can genuinely field; the floor for
-	 * {@link corroboratorCapacity}. Falls back to `clusterSize` (see the constructor) when unset, so a
-	 * caller that has not adopted `assumedClusterSize` keeps today's behavior exactly.
+	 * Yardstick the read-repair corroboration floor is measured against; the floor for
+	 * {@link corroboratorCapacity}. Resolved by `resolveClusterPolicy` for a real node; falls back to
+	 * `assumedClusterSize` and then `clusterSize` for direct constructors (see the constructor), so a
+	 * caller that has adopted neither field keeps today's behavior exactly.
 	 */
-	private readonly assumedClusterSize: number;
+	private readonly repairCorroborationClusterSize: number;
 	/** Resolved super-majority threshold the coordinator commits on (mirrors the value handed to ClusterCoordinator). */
 	private readonly superMajorityThreshold: number;
 	private readonly reputation?: IPeerReputation;
@@ -162,7 +175,7 @@ export class CoordinatorRepo implements IRepo {
 		readonly keyNetwork: IKeyNetwork,
 		readonly createClusterClient: (peerId: PeerId) => ICluster,
 		private readonly storageRepo: IRepo,
-		cfg?: Partial<ClusterConsensusConfig> & { clusterSize?: number },
+		cfg?: CoordinatorRepoConfig,
 		localCluster?: LocalClusterWithExecutionTracking,
 		localPeerId?: PeerId,
 		fretService?: FretService,
@@ -203,8 +216,11 @@ export class CoordinatorRepo implements IRepo {
 		// and admits — refusing writes outright is unacceptable), this falls back to the replication
 		// factor and stays strict: the failure mode of getting this wrong is a block that goes
 		// unrepaired, degraded rather than dead, so there is no reason to relax it for a caller that
-		// has not adopted the new field.
-		this.assumedClusterSize = policy.assumedClusterSize ?? policy.clusterSize;
+		// has not adopted the new field. A real node is handed an explicit
+		// `repairCorroborationClusterSize` by `resolveClusterPolicy`; the `assumedClusterSize` middle
+		// term keeps direct constructors (embedders, existing tests) behaving as before.
+		this.repairCorroborationClusterSize =
+			cfg?.repairCorroborationClusterSize ?? policy.assumedClusterSize ?? policy.clusterSize;
 		this.reputation = reputation;
 		const localClusterRef = localCluster && localPeerId ? {
 			update: localCluster.update.bind(localCluster),
@@ -596,7 +612,7 @@ export class CoordinatorRepo implements IRepo {
 			claims.push({ peerId: peerIdStr, rev: value.rev, actionId: value.actionId });
 		}
 
-		const capacity = corroboratorCapacity(peerIds.filter(id => id !== selfId).length, this.assumedClusterSize);
+		const capacity = corroboratorCapacity(peerIds.filter(id => id !== selfId).length, this.repairCorroborationClusterSize);
 		const selected = selectQuorumRev(claims, this.simpleMajorityThreshold, capacity);
 		if (!selected) {
 			log('cluster-fetch:no-quorum', {

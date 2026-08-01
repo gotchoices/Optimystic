@@ -161,7 +161,7 @@ describe('CoordinatorRepo read-repair CONTENT convergence', function () {
 			},
 			saveReplicatedBlock: (blockId, block, source) => bRepo.saveReplicatedBlock(blockId, block, source),
 			simpleMajorityThreshold: 0.51,
-			assumedClusterSize: 2
+			repairCorroborationClusterSize: 2
 		});
 
 		const bCoordinator = new CoordinatorRepo(

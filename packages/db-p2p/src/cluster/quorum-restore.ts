@@ -66,30 +66,26 @@ export function quorumSize(
 /**
  * The `corroboratorCapacity` to hand {@link quorumSize}: how many peers other than the asking node
  * could answer for a block at all, given `cohortPeerCount` peers currently visible (self already
- * excluded) and `assumedClusterSize` — the smallest cohort the operator asserts this deployment can
- * genuinely field.
+ * excluded) and `repairCorroborationClusterSize` — the cohort size this deployment is measured
+ * against, resolved by `resolveClusterPolicy` in `cluster/cluster-policy.ts`.
  *
  * Deliberately the MAX of the two: the corroboration floor may be relaxed only for a cohort that is
  * *genuinely* small, never for one that merely looks small. Cohort views are unauthenticated — the
  * read path takes them from `IKeyNetwork.findCluster`, the commit path from a coordinator-declared
  * peer set — so a partition, a self-shrunk record, or an attacker with routing influence could
- * otherwise talk the requirement down to a single voter. Measuring against the asserted size keeps a
- * shrunken view out of the relaxed branch; the escape hatch for a real two-node deployment is
- * therefore to set `assumedClusterSize: 2`, an explicit operator declaration — and, unlike the old
- * `clusterSize`, one that does not also drop the replication factor.
+ * otherwise talk the requirement down to a single voter. Measuring against the resolved size keeps a
+ * shrunken view out of the relaxed branch.
  *
- * Caveat on "explicit": `libp2p-node-base` *defaults* `assumedClusterSize` to `2`, so an unconfigured
- * node is already in the relaxed branch and a shrunken view of a large cohort can talk its floor down
- * to a single voter. That default is what lets a small mesh self-repair out of the box; a large
- * deployment must set `clusterPolicy.assumedClusterSize` to its real cohort size to get the
- * shrunken-view protection this function describes. See
- * `fix/corroboration-floor-defaults-to-two-for-large-meshes`.
+ * An unconfigured node resolves this to its `clusterSize` (default 10), so the floor of two binds and
+ * a shrunken view gains nothing. The escape hatch for a real two-node deployment is one explicit
+ * operator declaration — `clusterPolicy.assumedClusterSize: 2`, which does NOT also drop the
+ * replication factor, or an honest `clusterSize: 2`.
  *
  * Shared by both restoration paths so the two can never drift apart on the rule that decides how
  * much trust a lone peer gets.
  */
-export function corroboratorCapacity(cohortPeerCount: number, assumedClusterSize: number): number {
-	return Math.max(cohortPeerCount, assumedClusterSize - 1);
+export function corroboratorCapacity(cohortPeerCount: number, repairCorroborationClusterSize: number): number {
+	return Math.max(cohortPeerCount, repairCorroborationClusterSize - 1);
 }
 
 /**

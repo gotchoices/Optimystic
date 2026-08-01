@@ -39,14 +39,15 @@ export interface ReconcileBlockDeps {
 	/** Proportional corroboration threshold; the cohort's `simpleMajorityThreshold`. */
 	simpleMajorityThreshold: number;
 	/**
-	 * The smallest cohort the operator asserts this deployment can genuinely field — the floor for
+	 * Yardstick the corroboration floor is measured against — the floor for
 	 * {@link corroboratorCapacity}. Required, not optional: unlike the membership admission gate there
-	 * is no "unknown" handling here, so a caller that cannot state an asserted size should pass its
-	 * configured `clusterSize` (the strict direction) rather than a small placeholder. The failure mode
-	 * of overstating it is a block that stays unrepaired — degraded, not dead; of understating it, a
-	 * shrunken cohort view that can relax the floor to a single voter.
+	 * is no "unknown" handling here, so a caller that cannot state an asserted cohort size should pass
+	 * its configured `clusterSize` (the strict direction) rather than a small placeholder. The failure
+	 * mode of overstating it is a block that stays unrepaired — degraded, not dead; of understating it,
+	 * a shrunken cohort view that can relax the floor to a single voter. `resolveClusterPolicy`
+	 * (`cluster/cluster-policy.ts`) resolves it for a real node and defaults it to `clusterSize`.
 	 */
-	assumedClusterSize: number;
+	repairCorroborationClusterSize: number;
 	/** Best-effort misbehavior reporting; a throwing implementation is swallowed. */
 	reputation?: Pick<IPeerReputation, 'reportPeer'>;
 }
@@ -165,7 +166,7 @@ export function createReconcileBlock(deps: ReconcileBlockDeps): ReconcileBlockCa
 			targets.map(peerId => fetchCandidate(deps, peerId, blockId, committed.rev))
 		);
 		const candidates = fetched.filter((c): c is ReconcileCandidate => c !== undefined);
-		const capacity = corroboratorCapacity(targets.length, deps.assumedClusterSize);
+		const capacity = corroboratorCapacity(targets.length, deps.repairCorroborationClusterSize);
 
 		const revClaims: RevClaim[] = candidates.map(({ peerId, rev, actionId }) => ({ peerId, rev, actionId }));
 		const selected = selectQuorumRev(revClaims, deps.simpleMajorityThreshold, capacity);

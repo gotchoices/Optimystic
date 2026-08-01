@@ -54,3 +54,10 @@ Until the shrink question has an answer, this is not ready to plan.
 - `implement/split-admission-floor-from-replication-factor` — introduces `assumedClusterSize` and
   documents the tradeoff this ticket would remove.
 - `implement/corroboration-floor-uses-assumed-cluster-size` — the second consumer.
+- `corroboration-floor-defaults-to-two-for-large-meshes` (landed) — the two consumers no longer share
+  a *default*, only the operator field. Resolution now happens in
+  `packages/db-p2p/src/cluster/cluster-policy.ts` (`resolveClusterPolicy`), which produces
+  `assumedClusterSize` (admission gate; permissive default 2) and `repairCorroborationClusterSize`
+  (repair floor; strict default = `clusterSize`). So the "default has to be permissive" cost above now
+  applies only to the admission gate. A learned high-water mark should still subsume **both**;
+  `cluster-policy.ts` is the site where it would replace them.

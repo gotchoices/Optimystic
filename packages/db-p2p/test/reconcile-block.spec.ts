@@ -10,14 +10,15 @@
  *
  * Both restoration quorums (revision claim, then block content) are capped by the number of peers
  * that could answer at all, so a cohort with one other peer can converge; a cohort that merely
- * *looks* small — a full-size `assumedClusterSize` with a shrunken observed peer set — still
- * demands two.
+ * *looks* small — a full-size `repairCorroborationClusterSize` with a shrunken observed peer set —
+ * still demands two.
  */
 
 import { expect } from 'chai';
 import type { ActionId, ActionRev, BlockHeader, BlockId, IBlock } from '@optimystic/db-core';
 import type { BlockArchive } from '../src/storage/struct.js';
 import { createReconcileBlock, type ReconcileBlockDeps } from '../src/cluster/reconcile-block.js';
+import { resolveClusterPolicy } from '../src/cluster/cluster-policy.js';
 import { PenaltyReason } from '../src/reputation/types.js';
 
 const BLOCK_ID = 'reconcile-target-block' as BlockId;
@@ -61,7 +62,7 @@ const harness = (
 	const reconcile = createReconcileBlock({
 		selfPeerId: SELF,
 		simpleMajorityThreshold: THRESHOLD,
-		assumedClusterSize: 2,
+		repairCorroborationClusterSize: 2,
 		async fetchArchive(peerId) {
 			fetches.push(peerId);
 			return archives[peerId];
@@ -103,11 +104,46 @@ describe('createReconcileBlock (commit-path block restoration)', () => {
 	it('still demands two corroborators when the cohort only LOOKS two-node', async () => {
 		// Same single observed peer, but the operator declared a full-size cluster. A shrunken
 		// view (partition, or routing influence) must not be able to talk the requirement down.
-		const h = harness({ [PEER_A]: archiveAt(2, 'action-2', makeBlock('v2')) }, { assumedClusterSize: 10 });
+		const h = harness({ [PEER_A]: archiveAt(2, 'action-2', makeBlock('v2')) }, { repairCorroborationClusterSize: 10 });
 
 		await h.reconcile(BLOCK_ID, COMMITTED, [PEER_A]);
 
 		expect(h.saved.length, 'one voter out of a possible nine is not corroboration').to.equal(0);
+	});
+
+	it('still demands two corroborators on an UNCONFIGURED node (the real composition-root default)', async () => {
+		// Ticket: corroboration-floor-defaults-to-two-for-large-meshes. The case above pins the rule
+		// against a hand-written yardstick; this one takes the number a real node actually resolves
+		// (`resolveClusterPolicy` with no operator settings, i.e. clusterSize 10) and pins that the
+		// unconfigured default is the STRICT one. Before the fix the node resolved 2 here and the lone
+		// peer's claim was reconciled in.
+		const resolved = resolveClusterPolicy({});
+		const h = harness(
+			{ [PEER_A]: archiveAt(2, 'action-2', makeBlock('v2')) },
+			{
+				simpleMajorityThreshold: resolved.simpleMajorityThreshold,
+				repairCorroborationClusterSize: resolved.repairCorroborationClusterSize
+			}
+		);
+
+		await h.reconcile(BLOCK_ID, COMMITTED, [PEER_A]);
+
+		expect(h.saved.length, 'an unconfigured node must not reconcile in a lone, uncorroborated claim').to.equal(0);
+	});
+
+	it('heals unconfigured once the operator declares a genuine two-node deployment', async () => {
+		// The counterpart trade: one explicit setting (which does NOT lower the replication factor)
+		// buys back self-repair for a mesh that is really that small.
+		const resolved = resolveClusterPolicy({ clusterPolicy: { assumedClusterSize: 2 } });
+		const h = harness(
+			{ [PEER_A]: archiveAt(2, 'action-2', makeBlock('v2')) },
+			{ repairCorroborationClusterSize: resolved.repairCorroborationClusterSize }
+		);
+
+		await h.reconcile(BLOCK_ID, COMMITTED, [PEER_A]);
+
+		expect(h.saved.length, 'a declared two-node cohort still heals from its sole peer').to.equal(1);
+		expect(payloadOf(h.saved[0]!.block)).to.equal('v2');
 	});
 
 	it('does not fetch or throw when the cohort has no other member', async () => {
@@ -157,7 +193,7 @@ describe('createReconcileBlock (commit-path block restoration)', () => {
 				p2: archiveAt(2, 'action-2', makeBlock('v2')),
 				evil: archiveAt(2, 'action-2', makeBlock('tampered'))
 			},
-			{ assumedClusterSize: 4 }
+			{ repairCorroborationClusterSize: 4 }
 		);
 
 		await h.reconcile(BLOCK_ID, COMMITTED, ['p1', 'p2', 'evil']);
@@ -175,7 +211,7 @@ describe('createReconcileBlock (commit-path block restoration)', () => {
 				b1: archiveAt(2, 'action-2', makeBlock('B')),
 				b2: archiveAt(2, 'action-2', makeBlock('B'))
 			},
-			{ assumedClusterSize: 5 }
+			{ repairCorroborationClusterSize: 5 }
 		);
 
 		await h.reconcile(BLOCK_ID, COMMITTED, ['a1', 'a2', 'b1', 'b2']);
@@ -190,7 +226,7 @@ describe('createReconcileBlock (commit-path block restoration)', () => {
 				p2: archiveAt(2, 'action-2', makeBlock('v2')),
 				liar: archiveAt(99, 'bogus', makeBlock('bogus'))
 			},
-			{ assumedClusterSize: 4 }
+			{ repairCorroborationClusterSize: 4 }
 		);
 
 		await h.reconcile(BLOCK_ID, COMMITTED, ['p1', 'p2', 'liar']);
@@ -209,7 +245,7 @@ describe('createReconcileBlock (commit-path block restoration)', () => {
 		const reconcile = createReconcileBlock({
 			selfPeerId: SELF,
 			simpleMajorityThreshold: THRESHOLD,
-			assumedClusterSize: 4,
+			repairCorroborationClusterSize: 4,
 			async fetchArchive(peerId) {
 				if (peerId === 'broken') throw new Error('stream reset');
 				return archives[peerId];
@@ -243,7 +279,7 @@ describe('createReconcileBlock (commit-path block restoration)', () => {
 				evil: archiveAt(2, 'action-2', makeBlock('tampered'))
 			},
 			{
-				assumedClusterSize: 4,
+				repairCorroborationClusterSize: 4,
 				reputation: { reportPeer: () => { throw new Error('reputation store down'); } }
 			}
 		);

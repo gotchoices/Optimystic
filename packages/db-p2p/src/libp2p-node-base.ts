@@ -21,6 +21,7 @@ import type { IRawStorage } from './storage/i-raw-storage.js';
 import { seedOwnedBlocksFromStorage } from './owned-block-seed.js';
 import { clusterMember, type ReconcileBlockCallback, type CommitCertificateSink, type DeriveExpectedClusterCallback } from './cluster/cluster-repo.js';
 import { createReconcileBlock } from './cluster/reconcile-block.js';
+import { resolveClusterPolicy } from './cluster/cluster-policy.js';
 import { createCommitCertStore, makeClusterCommitCertExtractor, type CommitCertStore } from './cluster/commit-cert.js';
 import { coordinatorRepo } from './repo/coordinator-repo.js';
 import { Libp2pKeyPeerNetwork, type NetworkMode, type NetworkStatePersistence } from './libp2p-key-network.js';
@@ -70,7 +71,6 @@ import {
 	reactivityNodePolicy,
 	createTierAddressing,
 	createRingHash,
-	DEFAULT_SUPER_MAJORITY_THRESHOLD,
 	Tier,
 	b64urlToBytes,
 	bytesToB64url,
@@ -176,11 +176,14 @@ export type NodeOptions = {
 	storage?: RawStorageProvider;
 	/**
 	 * Desired cluster size per key (default 10) — the replication factor / target cohort breadth
-	 * the coordinator aims for. NOT a statement about how many peers actually exist: neither the
-	 * membership admission gate nor the read-repair/reconcile corroboration floor is measured
-	 * against it. A deployment that genuinely runs fewer peers than this should set
-	 * `clusterPolicy.assumedClusterSize` instead (see `corroboratorCapacity` in
-	 * `cluster/quorum-restore.ts` and the admission gate in `cluster/cluster-repo.ts`).
+	 * the coordinator aims for. NOT a statement about how many peers actually exist, so the
+	 * membership admission gate is never measured against it (see `cluster/cluster-repo.ts`).
+	 *
+	 * The read-repair/reconcile corroboration floor DOES fall back to it when
+	 * `clusterPolicy.assumedClusterSize` is absent — the strict direction, so an unconfigured node
+	 * cannot have its floor talked down by a shrunken cohort view. A deployment that genuinely runs
+	 * fewer peers than this should declare `clusterPolicy.assumedClusterSize`; see
+	 * `resolveClusterPolicy` in `cluster/cluster-policy.ts` for the full resolution.
 	 */
 	clusterSize?: number;
 	clusterPolicy?: {
@@ -199,10 +202,16 @@ export type NodeOptions = {
 		 * actually run, capped at `clusterSize`. Two consumers read it: the membership admission gate,
 		 * on its fallback path when the node has no confident network-size estimate; and the
 		 * read-repair/reconcile corroboration floor (`corroboratorCapacity`), unconditionally.
-		 * Defaults to `minAbsoluteClusterSize` (2), which is what lets a small mesh transact and
-		 * self-repair without configuration; a large deployment should set this to its real cohort
-		 * size, otherwise the gate cannot police a partition-induced downsize while its size estimate
-		 * is unconfident, and a shrunken cohort view can relax the corroboration floor to one voter.
+		 *
+		 * Declaring it sets BOTH. Leaving it unset does NOT — the two default in opposite directions,
+		 * because over- and under-stating them cost opposite things: the gate falls back to
+		 * `minAbsoluteClusterSize` (2), so an unconfigured mesh can still transact, while the repair
+		 * floor falls back to `clusterSize`, so an unconfigured node cannot have its floor relaxed to
+		 * one voter by a shrunken cohort view. See `resolveClusterPolicy` in `cluster/cluster-policy.ts`.
+		 *
+		 * A large deployment should still set this to its real cohort size, otherwise the admission gate
+		 * cannot police a partition-induced downsize while its size estimate is unconfident. A genuine
+		 * two-node mesh needs it (or an honest `clusterSize: 2`) to self-repair.
 		 */
 		assumedClusterSize?: number;
 	};
@@ -728,31 +737,11 @@ export async function createLibp2pNodeBase(
 	const partitionDetector = new PartitionDetector();
 	const fretSvc = (node as any).services?.fret as FretService | undefined;
 
-	// Absolute floor below which no cohort is safe, whatever the size references say. Named rather than
-	// inlined because `assumedClusterSize` below defaults to exactly this value — the two must not drift.
-	const minAbsoluteClusterSize = 2;
-	const consensusConfig = {
-		superMajorityThreshold: options.clusterPolicy?.superMajorityThreshold ?? DEFAULT_SUPER_MAJORITY_THRESHOLD,
-		simpleMajorityThreshold: 0.51,
-		minAbsoluteClusterSize,
-		allowClusterDownsize: options.clusterPolicy?.allowDownsize ?? true,
-		clusterSizeTolerance: options.clusterPolicy?.sizeTolerance ?? 0.5,
-		// Fail closed by default (an undersized cluster with no confident network-size estimate is
-		// rejected); embedders running knowingly-small meshes opt in through clusterPolicy.
-		allowUnvalidatedSmallCluster: options.clusterPolicy?.allowUnvalidatedSmallCluster ?? false,
-		partitionDetectionWindow: 60000,
-		// Replication factor / target cohort breadth — what the coordinator aims for when selecting a
-		// cohort. Deliberately NOT the membership admission gate's yardstick: it says nothing about how
-		// many peers actually exist, so an unconfigured small mesh would refuse every write.
-		clusterSize: options.clusterSize ?? 10,
-		// The operator's assertion of the smallest cohort this deployment can genuinely field. Read by
-		// the admission gate (fallback path, when this node has no confident network-size estimate) and
-		// by the read-repair/reconcile corroboration floor (unconditionally). Defaults to
-		// minAbsoluteClusterSize above, so a two- or three-node mesh transacts and self-repairs
-		// unconfigured; a large deployment should set clusterPolicy.assumedClusterSize to its real
-		// cohort size — at the default the corroboration floor is relaxable by a shrunken cohort view.
-		assumedClusterSize: options.clusterPolicy?.assumedClusterSize ?? minAbsoluteClusterSize
-	};
+	// Every cluster-policy default lives in `cluster/cluster-policy.ts` — including WHY the admission
+	// gate and the repair corroboration floor resolve the one operator field
+	// (`clusterPolicy.assumedClusterSize`) to different values when it is absent. Extracted so those
+	// defaults can be asserted without booting a node.
+	const consensusConfig = resolveClusterPolicy(options);
 
 	// Fetch a block archive from one cohort peer over the sync protocol, bounded by a
 	// per-peer timeout so an unreachable peer can't stall reconciliation. Mirrors the
@@ -783,16 +772,17 @@ export async function createLibp2pNodeBase(
 	// (cohort drift, or a refused `missing-base-revision` commit). See `reconcile-block.ts` for
 	// the corroboration rules — in particular why both quorums are capped by how many peers
 	// could answer at all, which is what lets a genuinely two-node cohort heal.
-	// NOTE: this and the CoordinatorRepo below must cap against the SAME assumedClusterSize, or the
-	// two restoration paths disagree about how much trust a lone peer gets. Safe today because both
-	// read the one `consensusConfig` literal above; if either ever resolves its own value, add a
-	// fail-fast coupling check like `assertSuperMajorityCoupling` rather than relying on proximity.
+	// NOTE: this and the CoordinatorRepo below must cap against the SAME
+	// repairCorroborationClusterSize, or the two restoration paths disagree about how much trust a
+	// lone peer gets. Safe today because both read the one `resolveClusterPolicy` result above; if
+	// either ever resolves its own value, add a fail-fast coupling check like
+	// `assertSuperMajorityCoupling` rather than relying on proximity.
 	const reconcileBlock: ReconcileBlockCallback = createReconcileBlock({
 		selfPeerId: node.peerId.toString(),
 		fetchArchive: fetchArchiveFromPeer,
 		saveReplicatedBlock: (blockId, block, source) => storageRepo.saveReplicatedBlock(blockId, block, source),
 		simpleMajorityThreshold: consensusConfig.simpleMajorityThreshold,
-		assumedClusterSize: consensusConfig.assumedClusterSize,
+		repairCorroborationClusterSize: consensusConfig.repairCorroborationClusterSize,
 		reputation
 	});
 
