@@ -857,6 +857,31 @@ describe('SpreadOnChurnMonitor', () => {
 			// self-pruned it so the tracked set stays bounded to blocks actually held locally.
 			expect(monitor.getTrackedBlockCount(), 'self-pruned the missing block').to.equal(0);
 		});
+
+		it('keeps a block tracked when the repo could not determine whether it holds it', async () => {
+			const selfStr = selfId.toString();
+			const peer4Str = peerId4.toString();
+
+			mockFret.setNeighborDistance(0);
+			mockFret.setCohort('*', [selfStr, peerId2.toString()]);
+			mockFret.setExpandResult('*', [selfStr, peerId2.toString(), peer4Str]);
+
+			// An `unavailable` entry is not "the block left local storage" — it is "I could not
+			// find out". Self-pruning on it would silently shrink the replication set on a guess,
+			// with only a later re-commit to put the block back.
+			const indeterminateRepo = {
+				...makeMockRepo({}),
+				async get(query: { blockIds: string[] }) {
+					return Object.fromEntries(query.blockIds.map(id => [id, { state: {}, unavailable: 'unmaterializable' }]));
+				},
+			};
+			const monitor = makeMonitor({ repo: indeterminateRepo as any });
+			monitor.trackBlock('wedged-block');
+
+			const event = await monitor.checkNow();
+			expect(event).to.be.null;
+			expect(monitor.getTrackedBlockCount(), 'an indeterminate read must not self-prune').to.equal(1);
+		});
 	});
 
 	// ── Protocol prefix ──────────────────────────────────────────────

@@ -390,7 +390,13 @@ saveMaterializedBlock(block): store(structuredClone(block));
   into a thrown `BlockUnavailableError` (naming the block and reason, recording no read
   dependency), so a query against a collection this node cannot read fails loudly instead of
   returning zero rows. `BlockUnavailableError` is not a `StaleFailure`: `Collection.sync` does not
-  absorb or retry it.
+  absorb or retry it. Every other consumer that reads a `GetBlockResult` directly checks the flag
+  before drawing a conclusion from an empty `state`: `Collection.bootstrapContext` (the log-tail
+  read bypasses `TransactorSource`) throws rather than opening with no `ActionContext`;
+  `NetworkTransactor.getStatus` throws rather than reporting the action `aborted`;
+  `ClusterMember`'s promise-phase stale-revision gate votes *reject* rather than approving a pend
+  whose revision it could not check; `SpreadOnChurnMonitor` keeps the block tracked rather than
+  self-pruning it from the replication set.
 
 ### Collection Header Blocks
 - Header blockId = collection name (deterministic)

@@ -266,6 +266,47 @@ describe('ClusterMember', () => {
 			// Should still have a promise
 			expect(result.promises[ourId]).to.not.equal(undefined);
 		});
+
+		// Ticket repo-reports-unavailable-vs-absent: StorageRepo now reports a block it cannot
+		// materialize as a flagged entry instead of throwing out of the read. The stale-revision
+		// gate must not read that empty `state` as "no revision here, looks fresh" — a member
+		// that cannot check votes reject, not approve.
+		it('rejects a pend whose block read came back unavailable', async () => {
+			class UnavailableRepo extends MockRepo {
+				override async get(blockGets: BlockGets): Promise<GetBlockResults> {
+					await super.get(blockGets);
+					return Object.fromEntries(
+						blockGets.blockIds.map(id => [id, { state: {}, unavailable: 'unmaterializable' as const }])
+					);
+				}
+			}
+			const unavailableRepo = new UnavailableRepo();
+			const member = clusterMember({
+				storageRepo: unavailableRepo,
+				peerNetwork: mockNetwork,
+				peerId: selfKeyPair.peerId,
+				privateKey: selfKeyPair.privateKey
+			});
+			try {
+				const otherKeyPair = await makeKeyPair();
+				const ourId = selfKeyPair.peerId.toString();
+				const peers = makeClusterPeers([selfKeyPair, otherKeyPair]);
+
+				// `rev` is what turns on the stale-revision gate; without it the check is skipped.
+				const transforms: Transforms = { inserts: { 'block-1': makeBlock('block-1') }, updates: {}, deletes: [] };
+				const record = await createClusterRecord(
+					peers,
+					[{ pend: { actionId: 'action-1', transforms, policy: 'c', rev: 5 } }]
+				);
+
+				const result = await member.update(record);
+
+				expect(result.promises[ourId]).to.not.equal(undefined);
+				expect(result.promises[ourId]!.type, 'an unverifiable revision must not be approved').to.equal('reject');
+			} finally {
+				member.dispose();
+			}
+		});
 	});
 
 	describe('update - commit phase', () => {

@@ -68,6 +68,13 @@ if (state.pendings.length > 0) {
 }
 ```
 
+An entry may also carry `unavailable` — set only when the responding repo knows its own answer is
+a guess (it cannot reconstruct the block, or the cohort consult that would confirm the absence
+failed). An entry *without* the field is authoritative, so a repo that never sets it keeps its
+existing meaning. Never read a flagged blockless entry as "the block does not exist": reading
+through `TransactorSource` turns it into a thrown `BlockUnavailableError`, and `getStatus` throws
+rather than reporting a status for it. See `docs/internals.md` § three-valued block answer.
+
 **Get Status**: Checks action status across multiple blocks
 
 ```typescript

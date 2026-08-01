@@ -1052,6 +1052,20 @@ export class ClusterMember implements ICluster {
 					const blockResults = await this.storageRepo.get({ blockIds });
 					for (const blockId of blockIds) {
 						const blockResult = blockResults[blockId];
+						if (blockResult?.unavailable !== undefined) {
+							// This member cannot establish the block's revision, so it cannot judge
+							// staleness. Vote reject rather than approve on an answer it knows is a
+							// guess — approving would let a stale pend reach consensus on the strength
+							// of a member that could not check it. (Before StorageRepo caught
+							// materialization faults per block, this read threw out of the promise
+							// handler; rejecting keeps the fail-closed posture with a signed reason.)
+							log('cluster-member:validation-block-unavailable', {
+								messageHash: record.messageHash,
+								blockId,
+								reason: blockResult.unavailable
+							});
+							return { valid: false, reason: `block ${blockId} unavailable (${blockResult.unavailable}): cannot verify revision` };
+						}
 						const latestRev = blockResult?.state?.latest?.rev;
 						if (latestRev !== undefined && latestRev >= pendRequest.rev) {
 							log('cluster-member:validation-stale-revision', {

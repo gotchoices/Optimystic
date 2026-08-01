@@ -1,6 +1,7 @@
 import { peerIdFromString } from "../network/types.js";
 import type { PeerId } from "../network/types.js";
 import { isConflictFailure } from "../network/stale-failure.js";
+import { BlockUnavailableError } from "../network/struct.js";
 import type { ActionTransforms, ActionBlocks, BlockActionStatus, ITransactor, PendSuccess, StaleFailure, IKeyNetwork, BlockId, GetBlockResults, PendResult, CommitResult, PendRequest, IRepo, BlockGets, Transforms, CommitRequest, ActionId, RepoCommitRequest, ClusterNomineesResult, CollectionId, IBlock } from "../index.js";
 import type { IBlockChangeNotifier, CollectionChangeListener } from "./change-notifier.js";
 import { transformForBlockId, groupBy, concatTransforms, concatTransform, transformsFromTransform, blockIdsForTransforms, Log, Tracker, CacheSource, TransactorSource } from "../index.js";
@@ -258,6 +259,17 @@ export class NetworkTransactor implements ITransactor, IBlockChangeNotifier {
 
 		// Get block states from repos
 		const blockStates = await this.get({ blockIds: allBlockIds });
+
+		// A block whose repo could not determine whether it exists carries no status either:
+		// its empty `state` would read below as `aborted`, turning "I could not find out" into
+		// a definite verdict on someone's action. Fail loudly instead, like every other read of
+		// an unavailable block (see BlockUnavailableError).
+		for (const blockId of allBlockIds) {
+			const entry = blockStates[blockId];
+			if (entry?.unavailable !== undefined && entry.block == null) {
+				throw new BlockUnavailableError(blockId, entry.unavailable);
+			}
+		}
 
 		// Determine status for each action ref
 		const results: BlockActionStatus[] = blockActions.map(ref => ({

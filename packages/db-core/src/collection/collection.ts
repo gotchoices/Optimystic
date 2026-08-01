@@ -1,5 +1,6 @@
 import type { IBlock, Action, ActionType, ActionHandler, BlockId, ITransactor, BlockStore, Transforms, ActionId } from "../index.js";
 import { Log, Atomic, Tracker, copyTransforms, CacheSource, isTransformsEmpty, TransactorSource } from "../index.js";
+import { BlockUnavailableError } from "../network/struct.js";
 import type { CollectionHeaderBlock, CollectionId, ICollection, SyncOptions } from "./index.js";
 import { SyncRetryExhaustedError } from "./index.js";
 import type { ReadDependency } from "../transaction/transaction.js";
@@ -491,6 +492,13 @@ export class Collection<TAction> implements ICollection<TAction> {
 	 * with context=undefined. Its state.latest contains the ActionRev of the most recent
 	 * committed action — exactly the proof needed for the transactor to serve pending
 	 * non-tail blocks during chain walks.
+	 *
+	 * This read goes to the transactor directly rather than through {@link TransactorSource},
+	 * so it has to honour the `unavailable` flag itself: a tail the repo could not retrieve
+	 * must not degrade into "no context", which would leave the chain walk unable to see
+	 * pending non-tail blocks and the collection reading as if they did not exist. A tail
+	 * with no `state.latest` and NO flag is a real answer (nothing committed yet) and still
+	 * no-ops.
 	 */
 	private static async bootstrapContext(
 		source: TransactorSource<IBlock>,
@@ -500,7 +508,11 @@ export class Collection<TAction> implements ICollection<TAction> {
 		const tailId = header.tailId;
 		if (tailId) {
 			const tailResult = await transactor.get({ blockIds: [tailId] });
-			const tailState = tailResult?.[tailId]?.state;
+			const tailEntry = tailResult?.[tailId];
+			if (tailEntry?.unavailable !== undefined && tailEntry.block == null) {
+				throw new BlockUnavailableError(tailId, tailEntry.unavailable);
+			}
+			const tailState = tailEntry?.state;
 			if (tailState?.latest) {
 				source.actionContext = {
 					committed: [{ actionId: tailState.latest.actionId, rev: tailState.latest.rev }],

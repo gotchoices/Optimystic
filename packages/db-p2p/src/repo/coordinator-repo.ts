@@ -576,8 +576,7 @@ export class CoordinatorRepo implements IRepo {
 	 */
 	private async promoteCorroborated(blockId: BlockId, corroborated: ActionRev): Promise<number | undefined> {
 		try {
-			const result = await this.storageRepo.get({ blockIds: [blockId], context: { committed: [corroborated], rev: corroborated.rev } });
-			const entry = result[blockId];
+			const entry = await this.readLocalEntry(blockId, { committed: [corroborated], rev: corroborated.rev });
 			if (entry?.unavailable !== undefined) {
 				log('cluster-fetch:promote-unavailable', { blockId, rev: corroborated.rev, error: entry.unavailable });
 				return undefined;
@@ -589,10 +588,16 @@ export class CoordinatorRepo implements IRepo {
 		}
 	}
 
+	/** This node's own answer for a block, optionally driving a promotion context through the read.
+	 *  Callers that care whether the answer is authoritative inspect `entry.unavailable`. */
+	private async readLocalEntry(blockId: BlockId, context?: ActionContext) {
+		const result = await this.storageRepo.get({ blockIds: [blockId], context });
+		return result[blockId];
+	}
+
 	/** This node's own `latest.rev` for a block, optionally driving a promotion context through the read. */
 	private async readLocalRev(blockId: BlockId, context?: ActionContext): Promise<number | undefined> {
-		const result = await this.storageRepo.get({ blockIds: [blockId], context });
-		return result[blockId]?.state?.latest?.rev;
+		return (await this.readLocalEntry(blockId, context))?.state?.latest?.rev;
 	}
 
 	/**

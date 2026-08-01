@@ -221,6 +221,14 @@ export class SpreadOnChurnMonitor implements Startable {
 			// Read block data from local storage
 			const result = await this.deps.repo.get({ blockIds: [blockId] })
 			const blockResult = result[blockId]
+			if (blockResult?.unavailable !== undefined) {
+				// The repo could not work out whether it still holds this block (unmaterializable
+				// history / failed restore). Untracking on that answer would silently drop the block
+				// from the spread set on a guess, and only a later re-commit would put it back — so
+				// keep it tracked and let the next sweep (or a heal) settle it.
+				log('unavailable block=%s reason=%s (keeping tracked)', blockId, blockResult.unavailable)
+				continue
+			}
 			if (!blockResult?.block) {
 				// The block has left local storage. No deletion event exists today to evict it
 				// from the tracked set, so prune here. Deleting the current element of a Set mid

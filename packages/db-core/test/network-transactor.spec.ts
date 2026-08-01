@@ -4,7 +4,8 @@ import { NetworkSimulation } from './simulation.js'
 import type { Scenario } from './simulation.js'
 import { randomBytes } from '@libp2p/crypto'
 import { blockIdToBytes } from '../src/utility/block-id-to-bytes.js'
-import type { BlockId, PendRequest, BlockOperation, ClusterPeers, FindCoordinatorOptions, IKeyNetwork, IRepo, BlockGets, GetBlockResults, StaleFailure } from '../src/index.js'
+import type { BlockId, PendRequest, BlockOperation, ClusterPeers, FindCoordinatorOptions, IKeyNetwork, IRepo, BlockGets, GetBlockResults, StaleFailure, ActionId } from '../src/index.js'
+import { BlockUnavailableError } from '../src/index.js'
 import type { PeerId } from '../src/index.js'
 import { peerIdFromString } from '../src/network/types.js'
 import { toString as uint8ArrayToString } from 'uint8arrays/to-string'
@@ -315,6 +316,55 @@ describe('NetworkTransactor', () => {
 
       expect(result[blockId]!.block).to.deep.equal(block)
       expect(result[blockId]!.unavailable).to.equal(undefined)
+    })
+
+    // getStatus reads the same three-valued answer: an entry the repo could not determine
+    // carries an empty `state`, which the status mapping would otherwise read as a definite
+    // `aborted` verdict on the caller's action.
+    it('getStatus throws rather than reporting an indeterminate block as aborted', async () => {
+      const net = new CountingKeyNetwork(['peer-A', 'peer-B'])
+      const blockId = 'indeterminate-block' as BlockId
+      const unavailableRepo = makeGetOnlyRepo(async ({ blockIds }: BlockGets) => {
+        const res: GetBlockResults = {}
+        for (const bid of blockIds) res[bid] = { state: {}, unavailable: 'unmaterializable' }
+        return res
+      })
+
+      const networkTransactor = new NetworkTransactor({
+        timeoutMs: 1000,
+        abortOrCancelTimeoutMs: 500,
+        keyNetwork: net,
+        getRepo: (_peerId: PeerId) => unavailableRepo,
+      })
+
+      let thrown: unknown
+      try {
+        await networkTransactor.getStatus([{ blockIds: [blockId], actionId: 'a1' as ActionId }])
+      } catch (err) {
+        thrown = err
+      }
+      expect(thrown, 'getStatus must not answer from an indeterminate read').to.be.instanceOf(BlockUnavailableError)
+      expect((thrown as BlockUnavailableError).blockId).to.equal(blockId)
+    })
+
+    it('getStatus still reports aborted for an authoritatively absent block', async () => {
+      const net = new CountingKeyNetwork(['peer-A', 'peer-B'])
+      const blockId = 'nonexistent-block' as BlockId
+      const absentRepo = makeGetOnlyRepo(async ({ blockIds }: BlockGets) => {
+        const res: GetBlockResults = {}
+        for (const bid of blockIds) res[bid] = { state: {} }
+        return res
+      })
+
+      const networkTransactor = new NetworkTransactor({
+        timeoutMs: 1000,
+        abortOrCancelTimeoutMs: 500,
+        keyNetwork: net,
+        getRepo: (_peerId: PeerId) => absentRepo,
+      })
+
+      const statuses = await networkTransactor.getStatus([{ blockIds: [blockId], actionId: 'a1' as ActionId }])
+      expect(statuses[0]!.statuses).to.deep.equal(['aborted'])
     })
   })
 

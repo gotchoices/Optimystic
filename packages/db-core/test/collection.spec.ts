@@ -50,14 +50,17 @@ describe('Collection', () => {
   // bug — a header this node COULD NOT RETRIEVE must fail the open loudly instead of the
   // collection being invented as empty and served indefinitely.
   describe('unavailable header vs authoritatively absent header', () => {
-    /** Delegates everything to the inner TestTransactor, but answers reads of `unavailableId`
-     *  with a blockless entry flagged `unavailable` — modelling a repo that holds records for
-     *  the block it cannot reconstruct. */
-    const makeUnavailableBlockTransactor = (inner: TestTransactor, unavailableId: string): ITransactor => ({
+    /** Delegates everything to the inner TestTransactor, but answers reads of any id in
+     *  `unavailableIds` with a blockless entry flagged `unavailable` — modelling a repo that
+     *  holds records for a block it cannot reconstruct. The set is live, so a test can wedge
+     *  a block after the collection is already open. */
+    const makeUnavailableBlockTransactor = (inner: TestTransactor, unavailableIds: Set<string>): ITransactor => ({
       async get(gets: BlockGets): Promise<GetBlockResults> {
         const res = await inner.get(gets)
-        if (gets.blockIds.includes(unavailableId)) {
-          res[unavailableId] = { state: {}, unavailable: 'unmaterializable' }
+        for (const id of gets.blockIds) {
+          if (unavailableIds.has(id)) {
+            res[id] = { state: {}, unavailable: 'unmaterializable' }
+          }
         }
         return res
       },
@@ -67,16 +70,48 @@ describe('Collection', () => {
       commit: (req: CommitRequest) => inner.commit(req),
     })
 
+    /** The tail block id the synced header points at — the block `bootstrapContext` reads. */
+    const syncedTailId = async (collection: Collection<TestAction>): Promise<string> => {
+      await collection.updateAndSync()
+      const headerEntry = (await transactor.get({ blockIds: [collectionId] }))[collectionId]
+      const tailId = (headerEntry?.block as { tailId?: string } | undefined)?.tailId
+      expect(tailId, 'a synced header names its log tail block').to.be.a('string')
+      return tailId!
+    }
+
     it('createOrOpen throws BlockUnavailableError instead of inventing an empty collection', async () => {
-      const flaky = makeUnavailableBlockTransactor(transactor, collectionId)
+      const flaky = makeUnavailableBlockTransactor(transactor, new Set([collectionId]))
       const attempt = Collection.createOrOpen<TestAction>(flaky, collectionId, initOptions)
       await expect(attempt).to.be.rejectedWith(BlockUnavailableError)
     })
 
     it('open throws BlockUnavailableError rather than resolving undefined', async () => {
-      const flaky = makeUnavailableBlockTransactor(transactor, collectionId)
+      const flaky = makeUnavailableBlockTransactor(transactor, new Set([collectionId]))
       const attempt = Collection.open<TestAction>(flaky, collectionId, initOptions)
       await expect(attempt).to.be.rejectedWith(BlockUnavailableError)
+    })
+
+    it('open throws when the LOG TAIL is unavailable, not just the header', async () => {
+      // The tail is read straight off the transactor (bootstrapContext), bypassing
+      // TransactorSource — so it needs its own flag check. Losing it means opening with no
+      // ActionContext: the chain walk cannot see pending non-tail blocks and the collection
+      // reads as though they were never written.
+      const created = await Collection.createOrOpen<TestAction>(transactor, collectionId, initOptions)
+      const tailId = await syncedTailId(created)
+
+      const flaky = makeUnavailableBlockTransactor(transactor, new Set([tailId]))
+      await expect(Collection.open<TestAction>(flaky, collectionId, initOptions)).to.be.rejectedWith(BlockUnavailableError)
+    })
+
+    it('update() throws when the header goes unavailable after the collection is open', async () => {
+      // The mid-life read path: not a StaleFailure, so sync's retry loop cannot absorb it.
+      const wedged = new Set<string>()
+      const flaky = makeUnavailableBlockTransactor(transactor, wedged)
+      const collection = await Collection.createOrOpen<TestAction>(flaky, collectionId, initOptions)
+      await collection.updateAndSync()
+
+      wedged.add(collectionId)
+      await expect(collection.update()).to.be.rejectedWith(BlockUnavailableError)
     })
 
     it('createOrOpen against an authoritative absent still creates (the common new-collection probe)', async () => {

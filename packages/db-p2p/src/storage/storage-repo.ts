@@ -267,6 +267,12 @@ export class StorageRepo implements IRepo, IBlockChangeNotifier, IBlockReplicaSt
 			try {
 				blockRev = await blockStorage.getBlock(context?.rev);
 			} catch (err) {
+				// NOTE: the entry drops `state.latest`, which this node does know (getLatest() does not
+				// materialize, so it does not throw). Empty state is what makes CoordinatorRepo treat the
+				// block as missing and consult the cohort — exactly the repair this block needs. If a
+				// consumer ever needs the revision behind an unavailable answer (e.g. to ask the cohort
+				// for a specific rev instead of the whole block), carry `latest` here and widen the
+				// coordinator's consult trigger to `isMissing || unavailable` so repair still fires.
 				log('get:unmaterializable blockId=%s error=%s', blockId,
 					err instanceof Error ? err.message : String(err));
 				return [blockId, { state: {}, unavailable: 'unmaterializable' } as GetBlockResult];
