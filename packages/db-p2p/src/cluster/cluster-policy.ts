@@ -48,11 +48,21 @@ import { DEFAULT_SUPER_MAJORITY_THRESHOLD, type ClusterConsensusConfig } from "@
  */
 export const minAbsoluteClusterSize = 2;
 
-/** The operator-facing subset of `NodeOptions` that the two size yardsticks are derived from. */
+/**
+ * The operator-facing cluster knobs. `NodeOptions` (`libp2p-node-base.ts`) intersects this rather
+ * than restating it, so a knob added here is one `resolveClusterPolicy` is guaranteed to see — a
+ * second declaration would compile fine and be silently dropped.
+ */
 export interface ClusterPolicyOptions {
 	/**
-	 * Desired cluster size per key (default 10) — the replication factor / target cohort breadth.
-	 * NOT a statement about how many peers actually exist.
+	 * Desired cluster size per key (default 10) — the replication factor / target cohort breadth
+	 * the coordinator aims for. NOT a statement about how many peers actually exist, so the
+	 * membership admission gate is never measured against it (see `cluster/cluster-repo.ts`).
+	 *
+	 * The read-repair/reconcile corroboration floor DOES fall back to it when
+	 * `clusterPolicy.assumedClusterSize` is absent — the strict direction, so an unconfigured node
+	 * cannot have its floor talked down by a shrunken cohort view. A deployment that genuinely runs
+	 * fewer peers than this should declare `clusterPolicy.assumedClusterSize`.
 	 */
 	clusterSize?: number;
 	clusterPolicy?: {
@@ -63,13 +73,22 @@ export interface ClusterPolicyOptions {
 		superMajorityThreshold?: number;
 		/**
 		 * Opt in to transacting below the safe cluster-size floor when FRET has no confident
-		 * network-size estimate. Default false (fail closed).
+		 * network-size estimate — the membership-admission and coordinator small-cluster gates both
+		 * fail closed without it. Default false. Turn on only for single-node / local dev meshes that
+		 * knowingly run undersized.
 		 */
 		allowUnvalidatedSmallCluster?: boolean;
 		/**
 		 * The smallest cohort this deployment can genuinely field — normally the number of nodes you
-		 * actually run, capped at `clusterSize`. Sets both resolved yardsticks when declared; see the
-		 * module doc for what each defaults to when it is not.
+		 * actually run, capped at `clusterSize`. Two consumers read it: the membership admission gate,
+		 * on its fallback path when the node has no confident network-size estimate; and the
+		 * read-repair/reconcile corroboration floor (`corroboratorCapacity`), unconditionally.
+		 *
+		 * Declaring it sets BOTH. Leaving it unset does NOT — see the module doc for why the two
+		 * defaults point in opposite directions. A large deployment should still set this to its real
+		 * cohort size, otherwise the admission gate cannot police a partition-induced downsize while
+		 * its size estimate is unconfident; a genuine two-node mesh needs it (or an honest
+		 * `clusterSize: 2`) to self-repair.
 		 */
 		assumedClusterSize?: number;
 	};

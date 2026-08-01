@@ -21,7 +21,7 @@ import type { IRawStorage } from './storage/i-raw-storage.js';
 import { seedOwnedBlocksFromStorage } from './owned-block-seed.js';
 import { clusterMember, type ReconcileBlockCallback, type CommitCertificateSink, type DeriveExpectedClusterCallback } from './cluster/cluster-repo.js';
 import { createReconcileBlock } from './cluster/reconcile-block.js';
-import { resolveClusterPolicy } from './cluster/cluster-policy.js';
+import { resolveClusterPolicy, type ClusterPolicyOptions } from './cluster/cluster-policy.js';
 import { createCommitCertStore, makeClusterCommitCertExtractor, type CommitCertStore } from './cluster/commit-cert.js';
 import { coordinatorRepo } from './repo/coordinator-repo.js';
 import { Libp2pKeyPeerNetwork, type NetworkMode, type NetworkStatePersistence } from './libp2p-key-network.js';
@@ -135,7 +135,12 @@ const wiringLog = createLogger('node-wiring');
 /** Factory function or instance for creating raw storage */
 export type RawStorageProvider = IRawStorage | (() => IRawStorage);
 
-export type NodeOptions = {
+/**
+ * `ClusterPolicyOptions` is intersected in, not restated: `resolveClusterPolicy` consumes those
+ * fields structurally, so a second copy of the shape here would let a newly added knob compile and
+ * be silently ignored. See `cluster/cluster-policy.ts` for what each one resolves to.
+ */
+export type NodeOptions = ClusterPolicyOptions & {
 	/**
 	 * Network port. Only used by the default `listenAddrs` fallback.
 	 * For non-TCP transports (e.g. WebSockets), set `listenAddrs` explicitly.
@@ -174,48 +179,6 @@ export type NodeOptions = {
 	relayServerInit?: CircuitRelayServerInit;
 	/** Storage provider - either an IRawStorage instance or a factory function. Defaults to MemoryRawStorage if not provided. */
 	storage?: RawStorageProvider;
-	/**
-	 * Desired cluster size per key (default 10) — the replication factor / target cohort breadth
-	 * the coordinator aims for. NOT a statement about how many peers actually exist, so the
-	 * membership admission gate is never measured against it (see `cluster/cluster-repo.ts`).
-	 *
-	 * The read-repair/reconcile corroboration floor DOES fall back to it when
-	 * `clusterPolicy.assumedClusterSize` is absent — the strict direction, so an unconfigured node
-	 * cannot have its floor talked down by a shrunken cohort view. A deployment that genuinely runs
-	 * fewer peers than this should declare `clusterPolicy.assumedClusterSize`; see
-	 * `resolveClusterPolicy` in `cluster/cluster-policy.ts` for the full resolution.
-	 */
-	clusterSize?: number;
-	clusterPolicy?: {
-		allowDownsize?: boolean;
-		sizeTolerance?: number; // acceptable relative difference (e.g. 0.5 = +/-50%)
-		superMajorityThreshold?: number; // fraction of peers needed for super-majority (default: DEFAULT_SUPER_MAJORITY_THRESHOLD = 0.75)
-		/**
-		 * Opt in to transacting below the safe cluster-size floor when FRET has no confident
-		 * network-size estimate — the membership-admission and coordinator small-cluster gates
-		 * both fail closed without it. Default false. Turn on only for single-node / local dev
-		 * meshes that knowingly run undersized.
-		 */
-		allowUnvalidatedSmallCluster?: boolean;
-		/**
-		 * The smallest cohort this deployment can genuinely field — normally the number of nodes you
-		 * actually run, capped at `clusterSize`. Two consumers read it: the membership admission gate,
-		 * on its fallback path when the node has no confident network-size estimate; and the
-		 * read-repair/reconcile corroboration floor (`corroboratorCapacity`), unconditionally.
-		 *
-		 * Declaring it sets BOTH. Leaving it unset does NOT — the two default in opposite directions,
-		 * because over- and under-stating them cost opposite things: the gate falls back to
-		 * `minAbsoluteClusterSize` (2), so an unconfigured mesh can still transact, while the repair
-		 * floor falls back to `clusterSize`, so an unconfigured node cannot have its floor relaxed to
-		 * one voter by a shrunken cohort view. See `resolveClusterPolicy` in `cluster/cluster-policy.ts`.
-		 *
-		 * A large deployment should still set this to its real cohort size, otherwise the admission gate
-		 * cannot police a partition-induced downsize while its size estimate is unconfident. A genuine
-		 * two-node mesh needs it (or an honest `clusterSize: 2`) to self-repair.
-		 */
-		assumedClusterSize?: number;
-	};
-
 	/** Override libp2p listen multiaddrs. */
 	listenAddrs?: string[];
 	/**

@@ -769,23 +769,26 @@ estimate is unconfident. A genuine two-node mesh needs one setting to *self-repa
 `clusterPolicy.assumedClusterSize: 2` (which does not lower the replication factor) or an honest
 `clusterSize: 2` — though it transacts and votes unconfigured.
 
-**Configuration in libp2p-node.ts:**
+**Configuration in `libp2p-node-base.ts`:** the composition root no longer writes a config literal.
+It resolves one, and hands the *same* object to the cluster member, the coordinator, and both
+block-restoration paths, so those four cannot come up disagreeing:
+
 ```typescript
-const coordinatorRepoFactory = coordinatorRepo(
-  keyNetwork,
-  createClusterClient,
-  {
-    clusterSize: 10,
-    superMajorityThreshold: 0.75,
-    simpleMajorityThreshold: 0.51,
-    minAbsoluteClusterSize: 3,
-    allowClusterDownsize: true,
-    clusterSizeTolerance: 0.5,
-    partitionDetectionWindow: 60000
-  },
-  fretService
-);
+const consensusConfig = resolveClusterPolicy(options);   // cluster/cluster-policy.ts
+
+const reconcileBlock = createReconcileBlock({
+  ...,
+  simpleMajorityThreshold: consensusConfig.simpleMajorityThreshold,
+  repairCorroborationClusterSize: consensusConfig.repairCorroborationClusterSize
+});
+const clusterImpl = clusterMember({ ..., consensusConfig, reconcileBlock });
+const coordinatorRepoFactory = coordinatorRepo(keyNetwork, createClusterClient, { ...consensusConfig }, fretSvc);
 ```
+
+Note `minAbsoluteClusterSize`: `resolveClusterPolicy` sets it to `2`, whereas `ClusterMember` and
+`CoordinatorRepo` each fall back to `3` when constructed directly (embedders, tests). A real node
+therefore runs at `2` on both sides — consistent, but not the number the interface's own default
+suggests.
 
 ## Future Enhancements
 
