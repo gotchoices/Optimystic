@@ -10,6 +10,7 @@ import type { Libp2p } from 'libp2p';
 import { createLibp2pNode } from '../src/libp2p-node.js';
 
 const ANNOUNCE_ADDR = '/dns4/example.com/tcp/4321';
+const APPENDED_ADDR = '/dns4/appended.example.com/tcp/5432';
 const LISTEN_ADDR = '/ip4/127.0.0.1/tcp/0';
 
 function isLoopbackTcp(addr: string): boolean {
@@ -18,6 +19,10 @@ function isLoopbackTcp(addr: string): boolean {
 
 function isAnnounced(addr: string): boolean {
 	return addr.startsWith(ANNOUNCE_ADDR);
+}
+
+function isAppended(addr: string): boolean {
+	return addr.startsWith(APPENDED_ADDR);
 }
 
 describe('NodeOptions announce address passthrough', function () {
@@ -70,5 +75,39 @@ describe('NodeOptions announce address passthrough', function () {
 		const addrs = node.getMultiaddrs().map(a => a.toString());
 		expect(addrs.some(isLoopbackTcp), `expected the loopback listen addr, got: ${addrs.join(', ')}`).to.equal(true);
 		expect(addrs.some(isAnnounced), `expected the appended addr, got: ${addrs.join(', ')}`).to.equal(true);
+	});
+
+	// Pins the precedence the option docs claim: libp2p's `AddressManager.getAddressesWithMetadata`
+	// returns the announce set verbatim and never reaches the append branch when it is non-empty.
+	it('with both set, announceAddrs wins and appendAnnounceAddrs is ignored', async () => {
+		node = await createLibp2pNode({
+			bootstrapNodes: [],
+			networkName: 'test-announce-both',
+			listenAddrs: [LISTEN_ADDR],
+			announceAddrs: [ANNOUNCE_ADDR],
+			appendAnnounceAddrs: [APPENDED_ADDR],
+			arachnode: { enableRingZulu: false }
+		});
+
+		const addrs = node.getMultiaddrs().map(a => a.toString());
+		expect(addrs.some(isAnnounced), `expected the announced addr, got: ${addrs.join(', ')}`).to.equal(true);
+		expect(addrs.some(isAppended), `expected no appended addr, got: ${addrs.join(', ')}`).to.equal(false);
+		expect(addrs.some(isLoopbackTcp), `expected no loopback listen addr, got: ${addrs.join(', ')}`).to.equal(false);
+	});
+
+	// Pins the "empty array means unset" claim in the option docs — libp2p spreads `announce = []`
+	// into an empty Set, which its `getAddressesWithMetadata` treats exactly like the absent key.
+	it('with empty announce arrays, advertises the listen addr as if neither option were set', async () => {
+		node = await createLibp2pNode({
+			bootstrapNodes: [],
+			networkName: 'test-announce-empty',
+			listenAddrs: [LISTEN_ADDR],
+			announceAddrs: [],
+			appendAnnounceAddrs: [],
+			arachnode: { enableRingZulu: false }
+		});
+
+		const addrs = node.getMultiaddrs().map(a => a.toString());
+		expect(addrs.some(isLoopbackTcp), `expected a loopback TCP addr, got: ${addrs.join(', ')}`).to.equal(true);
 	});
 });

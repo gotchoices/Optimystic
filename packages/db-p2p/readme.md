@@ -353,6 +353,26 @@ const node = await createLibp2pNode({
 Omitting it is the default and leaves behavior unchanged. See
 [internals](../../docs/internals.md) § Inbound Stream Authorization for the full contract.
 
+**Announcing a different address than you bind (optional).** A node behind a NAT, port forward,
+reverse proxy or DNS front binds one address but is reachable at another. `announceAddrs` advertises
+the reachable address *instead of* whatever the transports report; `appendAnnounceAddrs` advertises
+it *in addition to* them:
+
+```typescript
+const node = await createLibp2pNode({
+  networkName: 'my-net',
+  bootstrapNodes: ['...'],
+  listenAddrs: ['/ip4/0.0.0.0/tcp/4001'],       // what the process binds
+  announceAddrs: ['/dns4/mynode.example.com/tcp/4001']  // what peers are told
+});
+```
+
+`announceAddrs` replaces the advertised set **entirely** — observed and relayed addresses are
+dropped from it, and `appendAnnounceAddrs` is ignored while it is non-empty. Use
+`appendAnnounceAddrs` alone when the automatically discovered addresses are still worth advertising.
+Both are straight passthroughs to libp2p's `addresses.announce` / `addresses.appendAnnounce`; an
+empty array means "unset".
+
 ## Usage Examples
 
 ### Setting Up a Coordinator Node

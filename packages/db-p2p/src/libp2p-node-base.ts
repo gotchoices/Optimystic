@@ -211,10 +211,15 @@ export type NodeOptions = {
 	listenAddrs?: string[];
 	/**
 	 * Multiaddrs to advertise INSTEAD OF the listen addrs. For a node behind a NAT / reverse proxy /
-	 * DNS front that binds one address but is reachable at another.
+	 * DNS front that binds one address but is reachable at another. When non-empty these REPLACE the
+	 * advertised set entirely — observed/relayed addresses and {@link NodeOptions.appendAnnounceAddrs}
+	 * are all dropped from it. An empty array means "unset" (libp2p's own semantics).
 	 */
 	announceAddrs?: string[];
-	/** Multiaddrs to advertise IN ADDITION TO the listen addrs. */
+	/**
+	 * Multiaddrs to advertise IN ADDITION TO the listen addrs. Ignored while
+	 * {@link NodeOptions.announceAddrs} is non-empty.
+	 */
 	appendAnnounceAddrs?: string[];
 	/** Override libp2p transports. */
 	transports?: Libp2pTransports;
@@ -484,6 +489,9 @@ export async function createLibp2pNodeBase(
 	const libp2pOptions: Libp2pInit = {
 		start: false,
 		privateKey: nodePrivateKey,
+		// NOTE: libp2p's `AddressManagerInit` also carries `noAnnounce` and `announceFilter`; neither is
+		// exposed on `NodeOptions`. Add them here the same way if a deployment ever needs to suppress a
+		// specific advertised address rather than replace the whole set.
 		addresses: {
 			listen: listenAddrs,
 			...(options.announceAddrs ? { announce: options.announceAddrs } : {}),
