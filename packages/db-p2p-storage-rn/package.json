@@ -1,6 +1,6 @@
 {
   "name": "@optimystic/db-p2p-storage-rn",
-  "version": "0.17.0",
+  "version": "0.18.0",
   "type": "module",
   "description": "React Native LevelDB storage backend for @optimystic/db-p2p",
   "main": "dist/src/index.js",
