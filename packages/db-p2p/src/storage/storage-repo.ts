@@ -3,11 +3,12 @@ import type {
 	ActionId, BlockGets, ActionPending, PendSuccess, ActionTransform, ActionTransforms,
 	GetBlockResult, IBlock, ActionRev, BlockUnavailableReason,
 	PendValidationHook,
-	CollectionId, IBlockChangeNotifier, CollectionChangeListener, CollectionChangeEvent
+	CollectionId, IBlockChangeNotifier, CollectionChangeListener, CollectionChangeEvent,
+	StaleFailure
 } from "@optimystic/db-core";
 import {
 	Latches, transformForBlockId, applyTransform, groupBy, concatTransform, emptyTransforms,
-	blockIdsForTransforms, transformsFromTransform
+	blockIdsForTransforms, transformsFromTransform, highestStaleAt
 } from "@optimystic/db-core";
 import { asyncIteratorToArray } from "../it-utility.js";
 import type { IBlockStorage } from "./i-block-storage.js";
@@ -374,10 +375,10 @@ export class StorageRepo implements IRepo, IBlockChangeNotifier, IBlockReplicaSt
 		log('pend actionId=%s blockIds=%d rev=%s', request.actionId, blockIds.length, request.rev);
 		const pendings: ActionPending[] = [];
 		const missing: ActionTransforms[] = [];
-		// First block confirmed to sit at or past the requested revision — reported as
-		// StaleFailure.staleAt so a losing writer learns the number instead of parsing prose.
-		// Confirmed-local only: we read it from our own storage below.
-		let staleAt: { blockId: BlockId; rev: number } | undefined;
+		// Highest revision this node confirms holding among the blocks that are at or past the
+		// requested one — reported as StaleFailure.staleAt so a losing writer learns the number
+		// instead of parsing prose. Confirmed-local only: we read it from our own storage below.
+		let staleAt: StaleFailure['staleAt'];
 
 		// Potential race condition: A concurrent commit operation could complete
 		// between the conflict checks (latest.rev, listPendingTransactions) and the
@@ -402,8 +403,8 @@ export class StorageRepo implements IRepo, IBlockChangeNotifier, IBlockReplicaSt
 					// undefined this same branch fires for an insert collision (the comparison degrades
 					// to `latest.rev >= 0`, true for any existing block), and reporting that block's
 					// revision would be a number that answers a question nobody asked.
-					if (request.rev !== undefined && staleAt === undefined) {
-						staleAt = { blockId, rev: latest.rev };
+					if (request.rev !== undefined) {
+						staleAt = highestStaleAt([staleAt, { blockId, rev: latest.rev }]);
 					}
 					const transforms = await asyncIteratorToArray(blockStorage.listRevisions(request.rev ?? 0, latest.rev));
 					for (const actionRev of transforms) {
@@ -514,9 +515,10 @@ export class StorageRepo implements IRepo, IBlockChangeNotifier, IBlockReplicaSt
 			//   - toCommit: latest.rev < request.rev or no latest yet → run internalCommit.
 			const toCommit: { blockId: BlockId, storage: IBlockStorage }[] = [];
 			const missedCommits: { blockId: BlockId, transforms: ActionTransform[] }[] = [];
-			// First block confirmed lost to a newer revision — reported as StaleFailure.staleAt.
-			// The idempotent-retry `continue` below is a no-op, not a loss, so it never seeds this.
-			let staleAt: { blockId: BlockId; rev: number } | undefined;
+			// Highest revision among the blocks confirmed lost to a newer one — reported as
+			// StaleFailure.staleAt. The idempotent-retry `continue` below is a no-op, not a loss,
+			// so it never seeds this.
+			let staleAt: StaleFailure['staleAt'];
 			for (const entry of blockStorages) {
 				const { blockId, storage } = entry;
 				const latest = await storage.getLatest();
@@ -525,7 +527,7 @@ export class StorageRepo implements IRepo, IBlockChangeNotifier, IBlockReplicaSt
 						// Idempotent no-op for this block — already committed with this exact (actionId, rev).
 						continue;
 					}
-					staleAt ??= { blockId, rev: latest.rev };
+					staleAt = highestStaleAt([staleAt, { blockId, rev: latest.rev }]);
 					const transforms: ActionTransform[] = [];
 					for await (const actionRev of storage.listRevisions(request.rev, latest.rev)) {
 						const transform = await storage.getTransaction(actionRev.actionId);

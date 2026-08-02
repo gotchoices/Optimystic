@@ -310,6 +310,22 @@ saveMaterializedBlock(block): store(structuredClone(block));
   aggregate `StaleFailure` from the per-batch responses, so it re-derives `conflict` across them
   — any conflicting batch makes the aggregate a conflict. The commit side is deliberately
   untouched: it keys on `CommitResult` shape (next bullet), and no commit producer sets `conflict`.
+- **The revision a writer lost to travels as data, not prose.** `StaleFailure.staleAt`
+  (`{ blockId, rev }`) carries the one machine-readable fact inside the free-form reject text, so a
+  losing writer never has to parse it. Set **only** where the producer read the revision out of its
+  own storage (`StorageRepo.pend`/`.commit`, and the confirmed branch of
+  `CoordinatorRepo.classifyStaleRejection` — the site that matters most, since that failure carries
+  no `missing`). A number lifted from another peer's reject text is never promoted to this field,
+  and absent means "no confirmed number", never "not stale". It is **diagnostic only**: `conflict`
+  remains the single retryability rule and nothing branches on `staleAt`. Where several candidates
+  exist — a producer scanning multiple blocks, or `NetworkTransactor` rebuilding one response from
+  many per-batch ones — every site picks the **highest** `rev` through the shared `highestStaleAt`
+  ([`network/stale-failure.ts`](../packages/db-core/src/network/stale-failure.ts)), because the
+  loser's next request has to clear every holder. Uniformity is the point: a producer reporting an
+  arbitrary block would make the transactor's max across producers understate the constraint.
+  `ClusterMember`'s promise-phase rejection deliberately stays prose-only — its reason is signed
+  into `Signature.rejectReason`, so structuring it would change the signed byte layout.
+  `SyncRetryExhaustedError.staleAt` is where it surfaces to an embedder.
 - **The commit divergence split keys off `CommitResult`, not throw-vs-return.** A
   missing pend (thrown "not found"), a stale/ahead commit (`success:false` with
   `missing`), or a `missing-base-revision` refusal is divergence and tolerated; any other

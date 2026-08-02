@@ -208,6 +208,36 @@ describe('StorageRepo', () => {
 			expect(Object.prototype.hasOwnProperty.call(result, 'staleAt')).to.equal(false);
 		});
 
+		it('reports the HIGHEST held revision when several blocks are past the requested one', async () => {
+			// Two blocks of the same collection can sit at different revisions (an action that touched
+			// only one advances only that one). The loser has to clear every holder, so the largest is
+			// the binding number — and it must win even though the smaller block is scanned first.
+			await repo.pend({
+				actionId: 'a1' as ActionId,
+				transforms: { inserts: { 'block-1': makeBlock('block-1', { items: [] }), 'block-2': makeBlock('block-2', { items: [] }) }, updates: {}, deletes: [] },
+				policy: 'c'
+			});
+			await repo.commit({ actionId: 'a1' as ActionId, blockIds: ['block-1' as BlockId, 'block-2' as BlockId], tailId: 'block-1' as BlockId, rev: 1 });
+
+			// Advance block-2 alone twice, leaving block-1 at rev 1 and block-2 at rev 3.
+			for (const [actionId, rev] of [['a2', 2], ['a3', 3]] as [string, number][]) {
+				await repo.pend({ actionId: actionId as ActionId, transforms: makeUpdateTransforms('block-2' as BlockId, [['items', 0, 0, ['x']]]), policy: 'c' });
+				const advanced = await repo.commit({ actionId: actionId as ActionId, blockIds: ['block-2' as BlockId], tailId: 'block-2' as BlockId, rev });
+				expect(advanced.success, `setup: block-2 must reach rev ${rev}`).to.equal(true);
+			}
+
+			// block-1 is listed first and is stale at rev 1; block-2 is stale at rev 3.
+			const result = await repo.pend({
+				actionId: 'a4' as ActionId,
+				rev: 1,
+				transforms: { inserts: {}, updates: { 'block-1': [['items', 0, 0, ['y']]], 'block-2': [['items', 0, 0, ['y']]] }, deletes: [] },
+				policy: 'c'
+			});
+
+			expect(result.success).to.equal(false);
+			expect((result as StaleFailure).staleAt, 'the highest holder, not the first scanned').to.deep.equal({ blockId: 'block-2', rev: 3 });
+		});
+
 		it('handles multiple blocks in single pend', async () => {
 			const transforms: Transforms = {
 				inserts: {
@@ -1388,6 +1418,33 @@ describe('StorageRepo', () => {
 
 			expect(result.success).to.equal(false);
 			expect((result as StaleFailure).staleAt).to.deep.equal({ blockId: 'block-2', rev: 2 });
+		});
+
+		it('reports the HIGHEST held revision when several blocks lost at different revisions', async () => {
+			// Same rule as the pend side: block-1 is stale at rev 1 and scanned first, block-2 at rev 3.
+			await repo.pend({
+				actionId: 'a1' as ActionId,
+				transforms: { inserts: { 'block-1': makeBlock('block-1', { items: [] }), 'block-2': makeBlock('block-2', { items: [] }) }, updates: {}, deletes: [] },
+				policy: 'c'
+			});
+			await repo.commit({ actionId: 'a1' as ActionId, blockIds: ['block-1' as BlockId, 'block-2' as BlockId], tailId: 'block-1' as BlockId, rev: 1 });
+
+			for (const [actionId, rev] of [['a2', 2], ['a3', 3]] as [string, number][]) {
+				await repo.pend({ actionId: actionId as ActionId, transforms: makeUpdateTransforms('block-2' as BlockId, [['items', 0, 0, ['x']]]), policy: 'c' });
+				const advanced = await repo.commit({ actionId: actionId as ActionId, blockIds: ['block-2' as BlockId], tailId: 'block-2' as BlockId, rev });
+				expect(advanced.success, `setup: block-2 must reach rev ${rev}`).to.equal(true);
+			}
+
+			// A rev-less pend skips the revision check, so a4 can reach commit and lose there.
+			await repo.pend({
+				actionId: 'a4' as ActionId,
+				transforms: { inserts: {}, updates: { 'block-1': [['items', 0, 0, ['y']]], 'block-2': [['items', 0, 0, ['y']]] }, deletes: [] },
+				policy: 'c'
+			});
+			const result = await repo.commit({ actionId: 'a4' as ActionId, blockIds: ['block-1' as BlockId, 'block-2' as BlockId], tailId: 'block-1' as BlockId, rev: 1 });
+
+			expect(result.success).to.equal(false);
+			expect((result as StaleFailure).staleAt, 'the highest holder, not the first scanned').to.deep.equal({ blockId: 'block-2', rev: 3 });
 		});
 
 		it('multi-block stale conflict returns transforms for all missed blocks', async () => {

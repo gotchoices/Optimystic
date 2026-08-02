@@ -238,7 +238,10 @@ Key aspects of the sync process:
 - **Bounded retry**: A persistent stale failure gives up after `maxAttempts` consecutive no-progress
   attempts (default 10), throwing `SyncRetryExhaustedError` instead of spinning the latch forever.
   Configure via `SyncOptions` (`maxAttempts`, `deadlineMs`, `baseBackoffMs`, `maxBackoffMs`, `signal`)
-  passed to `sync()` / `updateAndSync()`.
+  passed to `sync()` / `updateAndSync()`. The error carries the last rejection's `lastReason` prose
+  and, when a responder confirmed one, `staleAt` — the block and revision it actually holds, as data
+  rather than a number buried in that prose (see `StaleFailure.staleAt` in
+  [transactor.md](transactor.md)).
 - **Pending management**: Waits (with exponential backoff) for conflicting transactions to complete
 - **State consistency**: Maintains proper revision tracking and cache coherence
 

@@ -1,5 +1,5 @@
 import type { PendRequest, ActionBlocks, IRepo, MessageOptions, CommitResult, GetBlockResults, PendResult, StaleFailure, BlockGets, CommitRequest, RepoMessage, IKeyNetwork, ICluster, ClusterConsensusConfig, BlockId, ActionRev, ActionContext, ClusterRecord } from "@optimystic/db-core";
-import { LruMap, blockIdsForTransforms, DEFAULT_SUPER_MAJORITY_THRESHOLD } from "@optimystic/db-core";
+import { LruMap, blockIdsForTransforms, highestStaleAt, DEFAULT_SUPER_MAJORITY_THRESHOLD } from "@optimystic/db-core";
 import { ClusterCoordinator, ValidatorRejectionError } from "./cluster-coordinator.js";
 import type { PeerId } from "@libp2p/interface";
 import { peerIdFromString } from "@libp2p/peer-id";
@@ -821,7 +821,8 @@ export class CoordinatorRepo implements IRepo {
 	 * genuine validation faults.
 	 */
 	private async classifyStaleRejection(error: unknown, request: PendRequest, blockIds: BlockId[]): Promise<StaleFailure | undefined> {
-		if (!(error instanceof ValidatorRejectionError) || request.rev === undefined) return undefined;
+		const requestedRev = request.rev;
+		if (!(error instanceof ValidatorRejectionError) || requestedRev === undefined) return undefined;
 		let results: GetBlockResults;
 		try {
 			results = await this.storageRepo.get({ blockIds });
@@ -832,25 +833,30 @@ export class CoordinatorRepo implements IRepo {
 			});
 			return undefined;
 		}
-		for (const blockId of blockIds) {
+		// Scan EVERY block rather than stopping at the first confirmation: several of the request's
+		// blocks can be past the requested revision at different revisions, and it is the highest
+		// that the loser's next request has to clear (see `highestStaleAt`). Both the reported
+		// number and the reason prose name that block, so they never disagree.
+		const staleAt = highestStaleAt(blockIds.map(blockId => {
 			const latest = results[blockId]?.state.latest;
-			if (latest && latest.rev >= request.rev) {
-				log('coordinator-repo:pend-stale-classified', {
-					actionId: request.actionId,
-					blockId,
-					latestRev: latest.rev,
-					requestedRev: request.rev
-				});
-				return {
-					success: false,
-					conflict: true,
-					reason: `stale revision: block ${blockId} at rev ${latest.rev}, requested rev ${request.rev}`,
-					// The same fact as the reason prose, but as data. This is the ONLY place a losing
-					// writer can learn the revision it lost to, since this failure deliberately carries
-					// no `missing`. Confirmed-local: read out of our own storage just above.
-					staleAt: { blockId, rev: latest.rev }
-				};
-			}
+			return latest && latest.rev >= requestedRev ? { blockId, rev: latest.rev } : undefined;
+		}));
+		if (staleAt) {
+			log('coordinator-repo:pend-stale-classified', {
+				actionId: request.actionId,
+				blockId: staleAt.blockId,
+				latestRev: staleAt.rev,
+				requestedRev
+			});
+			return {
+				success: false,
+				conflict: true,
+				reason: `stale revision: block ${staleAt.blockId} at rev ${staleAt.rev}, requested rev ${requestedRev}`,
+				// The same fact as the reason prose, but as data. This is the ONLY place a losing
+				// writer can learn the revision it lost to, since this failure deliberately carries
+				// no `missing`. Confirmed-local: read out of our own storage just above.
+				staleAt
+			};
 		}
 		// NOTE: conservative — when only remote members saw the newer revision (local storage still
 		// behind), staleness can't be confirmed locally and the rejection stays a throw. If that

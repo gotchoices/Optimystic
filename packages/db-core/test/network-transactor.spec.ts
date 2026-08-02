@@ -1,5 +1,6 @@
 import { expect } from 'chai'
-import { NetworkTransactor, highestStaleAt } from '../src/transactor/network-transactor.js'
+import { NetworkTransactor } from '../src/transactor/network-transactor.js'
+import { highestStaleAt } from '../src/network/stale-failure.js'
 import { NetworkSimulation } from './simulation.js'
 import type { Scenario } from './simulation.js'
 import { randomBytes } from '@libp2p/crypto'

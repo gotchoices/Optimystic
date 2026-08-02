@@ -1,6 +1,6 @@
 import { peerIdFromString } from "../network/types.js";
 import type { PeerId } from "../network/types.js";
-import { isConflictFailure } from "../network/stale-failure.js";
+import { highestStaleAt, isConflictFailure } from "../network/stale-failure.js";
 import { BlockUnavailableError } from "../network/struct.js";
 import type { ActionTransforms, ActionBlocks, BlockActionStatus, ITransactor, PendSuccess, StaleFailure, IKeyNetwork, BlockId, GetBlockResults, PendResult, CommitResult, PendRequest, IRepo, BlockGets, Transforms, CommitRequest, ActionId, RepoCommitRequest, ClusterNomineesResult, CollectionId, IBlock } from "../index.js";
 import type { IBlockChangeNotifier, CollectionChangeListener } from "./change-notifier.js";
@@ -555,14 +555,9 @@ export class NetworkTransactor implements ITransactor, IBlockChangeNotifier {
 				// (then `every` is both safe and tighter), or if mixed-outcome pends show up as wasted
 				// retry latency in practice.
 				const conflict = stale.some(b => isConflictFailure(b.request!.response! as StaleFailure));
-				// Deliberately NOT first-wins like `reason` above: every block in this pend commits under
-				// one collection revision, so the reported numbers are comparable and the LARGEST is the
-				// binding constraint — the client's next request has to clear every holder, not just the
-				// first one that answered. Ties keep the earlier batch's value.
-				// NOTE: comparability rests on one pend covering one collection (Collection.sync pends its
-				// own collection; the multi-collection coordinator calls pend once per collection). If a
-				// pend is ever allowed to span collections, `rev` values from different revision counters
-				// would be compared here and the max would be meaningless — report per-collection then.
+				// Deliberately NOT first-wins like `reason` above — `highestStaleAt` takes the largest
+				// confirmed revision, which is the binding constraint on the client's next request.
+				// Its doc comment carries the rule and the one-pend-one-collection assumption it rests on.
 				const staleAt = highestStaleAt(stale.map(b => (b.request!.response! as StaleFailure).staleAt));
 				return {
 					success: false,
@@ -893,22 +888,6 @@ function firstBatchError<TPayload, TResponse>(batches: CoordinatorBatch<TPayload
 
 function asError(err: unknown): Error {
 	return err instanceof Error ? err : new Error(errorMessage(err));
-}
-
-/**
- * Picks the single {@link StaleFailure.staleAt} to report when one response is rebuilt from many
- * per-batch ones. Highest `rev` wins; undefined entries (a batch that reported no confirmed
- * number, or one from a peer that predates the field) contribute nothing, and an all-undefined
- * input yields undefined so callers can omit the key rather than emit `staleAt: undefined`.
- */
-export function highestStaleAt(candidates: (StaleFailure['staleAt'])[]): StaleFailure['staleAt'] {
-	let best: StaleFailure['staleAt'];
-	for (const candidate of candidates) {
-		if (candidate !== undefined && (best === undefined || candidate.rev > best.rev)) {
-			best = candidate;
-		}
-	}
-	return best;
 }
 
 /**

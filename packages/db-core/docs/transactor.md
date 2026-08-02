@@ -243,6 +243,7 @@ type StaleFailure = {
   missing?: ActionTransforms[];  // Committed actions newer than our revision
   pending?: ActionPending[];     // Currently pending actions on affected blocks
   conflict?: boolean;            // Explicit retryability — see below
+  staleAt?: { blockId: BlockId; rev: number };  // Confirmed revision the responder holds — see below
 };
 ```
 
@@ -257,6 +258,29 @@ predicate treats `conflict` as authoritative when present and falls back to infe
 `missing`/`pending` for producers that never set it, including a peer on an older build. Producers
 set it only on genuine lost races and leave it absent on hard rejections (validation, storage,
 policy). Commit-side failures never set it — see [internals.md](../../../docs/internals.md).
+
+#### The lost-to revision (`staleAt`)
+
+The reject `reason` is free-form, wire-visible prose that no caller may parse. `staleAt` carries the
+one machine-readable fact inside it — which block is at which revision — as data, so a losing writer
+can learn the number it lost to. It matters most on a `CoordinatorRepo`-confirmed loss, which
+deliberately carries no `missing`: there, `staleAt` is the only number available.
+
+Two rules govern it:
+
+- **Confirmed-only.** A producer sets it *only* when it read the revision out of its own storage.
+  Suspicion, or a number lifted from another peer's reject text, leaves it absent. Absent means "no
+  confirmed number", never "not stale" — a peer on an older build simply omits it (the repo protocol
+  is plain JSON).
+- **Diagnostic, never a retryability signal.** `conflict` (via `isConflictFailure`) stays the single
+  source of truth for "can a re-read and re-pend win?". Nothing branches retry decisions on `staleAt`.
+
+Where more than one candidate exists — a producer scanning several blocks, or `NetworkTransactor`
+rebuilding one response from many per-batch ones — every site picks the **highest** `rev` through
+`highestStaleAt` (`src/network/stale-failure.ts`). The loser's next request has to clear every
+holder, so the largest confirmed revision is the binding constraint and any smaller one understates
+it. Consumers: `SyncRetryExhaustedError.staleAt` (also appended to its message) and
+`PendRejectedError`'s message on the multi-collection path.
 
 #### Missing Actions
 

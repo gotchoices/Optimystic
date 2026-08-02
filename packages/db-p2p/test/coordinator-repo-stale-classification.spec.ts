@@ -193,6 +193,21 @@ describe('CoordinatorRepo stale-revision classification (pend)', function () {
 		expect((result as StaleFailure).staleAt).to.deep.equal({ blockId: BLOCK_ID_2, rev: 5 });
 	});
 
+	it('reports the highest confirmed revision when several blocks are past the request', async () => {
+		setVerdicts({ type: 'approve' }, { type: 'reject', reason: 'stale revision: block block-1 at rev 4, requested rev 3' });
+		// Both blocks are stale, at different revisions, and the LOWER one is scanned first. The
+		// loser's next request has to clear every holder, so the larger is the binding number.
+		storage.revByBlock = { [BLOCK_ID]: 4, [BLOCK_ID_2]: 7 };
+
+		const result = await repo.pend(makePendRequest(3, [BLOCK_ID, BLOCK_ID_2]));
+		expect(result.success).to.equal(false);
+		expect((result as StaleFailure).staleAt, 'the highest holder, not the first confirmed')
+			.to.deep.equal({ blockId: BLOCK_ID_2, rev: 7 });
+		// The prose names the same block, so the two can never disagree.
+		expect((result as StaleFailure).reason)
+			.to.equal(`stale revision: block ${BLOCK_ID_2} at rev 7, requested rev 3`);
+	});
+
 	it('rethrows ValidatorRejectionError when local storage cannot confirm staleness', async () => {
 		setVerdicts({ type: 'approve' }, { type: 'reject', reason: 'operations hash mismatch' });
 		storage.latestRev = 0; // behind the requested rev → no local confirmation
