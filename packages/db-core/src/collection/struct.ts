@@ -47,6 +47,31 @@ export class SyncRetryExhaustedError extends Error {
 	}
 }
 
+/** Thrown when a collection that already holds a committed revision reads its own header
+ * block as authoritatively absent.
+ *
+ * The two facts contradict each other: this client has proof that something was committed
+ * under this id (it holds the revision it committed at, or the one it read off the log tail),
+ * and storage has just answered that nothing ever was. Exactly one of them is wrong, so this
+ * is a fault rather than an absence — the same reasoning `Collection.attachToLog` applies to a
+ * header that probes fine but whose log will not open.
+ *
+ * Deliberately NOT a `StaleFailure`: {@link ICollection.sync}'s retry loop only absorbs
+ * returned stale failures, so throwing this aborts the sync immediately with a named
+ * diagnosis instead of letting it spin the full retry budget re-requesting a revision it
+ * has silently forgotten. */
+export class CollectionHeaderVanishedError extends Error {
+	constructor(
+		readonly collectionId: CollectionId,
+		/** The committed revision this collection held when the header read came back absent. */
+		readonly heldRev: number,
+	) {
+		super(`collection ${collectionId} holds committed revision ${heldRev}, but its header block `
+			+ `read as absent — storage reported that nothing was ever committed under this id`);
+		this.name = 'CollectionHeaderVanishedError';
+	}
+}
+
 export interface ICollection<TAction> {
 	readonly id: CollectionId;
 	act(...actions: Action<TAction>[]): Promise<void>;

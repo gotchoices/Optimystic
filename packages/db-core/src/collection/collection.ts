@@ -2,7 +2,8 @@ import type { IBlock, Action, ActionType, ActionHandler, BlockId, ITransactor, B
 import { Log, Atomic, Tracker, copyTransforms, CacheSource, isTransformsEmpty, TransactorSource } from "../index.js";
 import { BlockUnavailableError } from "../network/struct.js";
 import type { CollectionHeaderBlock, CollectionId, ICollection, SyncOptions } from "./index.js";
-import { SyncRetryExhaustedError } from "./index.js";
+import { CollectionHeaderVanishedError, SyncRetryExhaustedError } from "./index.js";
+import type { ActionContext } from "./action.js";
 import type { ReadDependency } from "../transaction/transaction.js";
 import { clampPriority } from "../transaction/transaction.js";
 import { ReadDependencyCollector } from "../transaction/read-dependency-collector.js";
@@ -144,7 +145,31 @@ export class Collection<TAction> implements ICollection<TAction> {
 		if (!collectionLog) {
 			throw new Error(`Log not found for collection ${id}`);
 		}
-		source.actionContext = await collectionLog.getActionContext();
+		// Monotonic, not an overwrite: getActionContext resolves undefined when the chain has no
+		// tail or the tail block carries zero entries, and that must not erase the revision
+		// bootstrapContext just read off the committed tail.
+		Collection.advanceContext(source, id, await collectionLog.getActionContext());
+	}
+
+	/** Adopt a freshly-read action context WITHOUT ever lowering the revision already held.
+	 *
+	 * The revision a collection last committed at is knowledge it earned; a read that found
+	 * nothing — or found an older view of the log — cannot un-earn it. Silently accepting the
+	 * lower value makes the next sync ask for a revision that is long gone, and every retry
+	 * repeats the same doomed request because each retry re-runs the same losing read.
+	 *
+	 * Equal revisions still adopt `next`: the rev is unchanged but its `committed` list may be
+	 * more complete than what we hold. */
+	private static advanceContext(source: TransactorSource<IBlock>, id: CollectionId, next: ActionContext | undefined): void {
+		const current = source.actionContext;
+		if (next === undefined) {
+			return;	// The read learned nothing — keep what we already know.
+		}
+		if (current !== undefined && next.rev < current.rev) {
+			log('collection:context-not-lowered id=%s held=%d read=%d', id, current.rev, next.rev);
+			return;
+		}
+		source.actionContext = next;
 	}
 
 	async act(...actions: Action<TAction>[]) {
@@ -193,13 +218,26 @@ export class Collection<TAction> implements ICollection<TAction> {
 		// Bootstrap context from committed tail so pending blocks are accessible.
 		// Read through tracker so Chain.open inside Log.open reuses the cached header.
 		// A header the storage layer could not retrieve throws BlockUnavailableError out of
-		// this read (it is not a StaleFailure, so sync's retry loop does not absorb it) —
-		// so an ABSENT header here is authoritative: nothing was ever committed under this
-		// id, and the silent no-op below is correct rather than a masked failure.
+		// this read (it is not a StaleFailure, so sync's retry loop does not absorb it).
 		const header = await tracker.tryGet(this.id) as CollectionHeaderBlock | undefined;
 		if (header) {
 			await Collection.bootstrapContext(source, this.transactor, header);
+		} else if (this.source.actionContext) {
+			// An absent header is only believable for a collection that has never committed.
+			// We hold a committed revision, so the two answers contradict each other — surface it
+			// as a fault instead of no-opping into a forgotten revision and a rev-1 retry spin.
+			// NOTE: this aborts every caller of update(), including TransactionCoordinator's
+			// blanket refresh of ALL registered collections between commit retries — a
+			// non-participant with a momentarily-absent header now fails the whole retry rather
+			// than being skipped. That is the intended loud failure; if it ever shows up as
+			// otherwise-healthy transactions aborting, narrow that refresh to the transaction's
+			// participants (see the note at coordinator.ts's update loop) rather than softening
+			// this throw.
+			throw new CollectionHeaderVanishedError(this.id, this.source.actionContext.rev);
 		}
+		// Falling through means the header is genuinely absent AND we hold no revision: nothing
+		// was ever committed under this id. Log.open reads the same block id, so it too resolves
+		// undefined and everything below no-ops — correct here, rather than a masked failure.
 
 		// Get the latest entries from the log, starting from where we left off
 		const actionContext = this.source.actionContext;
@@ -247,8 +285,10 @@ export class Collection<TAction> implements ICollection<TAction> {
 			await this.replayActions();
 		}
 
-		// Update our context to the latest
-		this.source.actionContext = latest?.context;
+		// Update our context to the latest — monotonically. An empty/unopenable log yields no
+		// context at all, and a log read that lags what we already committed yields an older one;
+		// neither is grounds for forgetting the revision we hold.
+		Collection.advanceContext(this.source, this.id, latest?.context);
 	}
 
 	/** Capture the current staged state — tracker transforms plus the pending

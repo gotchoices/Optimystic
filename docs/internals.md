@@ -425,6 +425,27 @@ saveMaterializedBlock(block): store(structuredClone(block));
   `Diary.open` / `Diary.createOrOpen`). `Tree.open` returns before any B-tree is constructed when
   the header is absent, so no trunk over an invented root is ever built.
 
+#### The revision context is monotonic
+- A `Collection`'s `ActionContext.rev` is the revision it last knows itself committed at. Every
+  assignment from a read goes through `Collection.advanceContext`, which may **advance** the
+  revision or leave it alone but never lower it — not to an older revision, and not to `undefined`.
+  This covers both sites that read one: `attachToLog` (bootstrap from the committed log tail, then
+  adopt `Log.getActionContext()`, which resolves `undefined` for a tailless or entries-empty chain)
+  and `updateInternal` (adopt `Log.getFrom(...).context`, which resolves `undefined` for a log that
+  will not open).
+- The rule exists because a read that found *less* than what the client already committed is a
+  read that lost information, not a revision rollback. Accepting it makes the next `sync` request a
+  revision that is long gone, and — since `syncInternal` re-runs `updateInternal` between retries —
+  every retry repeats the same doomed request, burning the whole retry budget and surfacing as a
+  contention-shaped `SyncRetryExhaustedError` rather than the real fault.
+- A header that reads *authoritatively absent* while the collection holds a committed revision is
+  a contradiction, not an absence: the client has proof something was committed under this id.
+  `updateInternal` throws `CollectionHeaderVanishedError` (naming the collection and the held
+  revision) instead of no-opping. Like `BlockUnavailableError`, it is not a `StaleFailure`, so
+  `sync`'s retry loop does not absorb it. A collection that has **never** committed holds no
+  revision, so there is nothing to contradict — the absent-header no-op stays correct for it,
+  which is what keeps `createOrOpen`'s invent path working.
+
 ## Cohort-Topic Port Boundary
 
 The cohort-topic substrate is split across packages so that **db-core stays free of any network/disk dependency** (the same bar that keeps blocks, trees, and logs transport-agnostic).
