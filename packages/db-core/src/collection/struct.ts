@@ -59,7 +59,14 @@ export class SyncRetryExhaustedError extends Error {
  * Deliberately NOT a `StaleFailure`: {@link ICollection.sync}'s retry loop only absorbs
  * returned stale failures, so throwing this aborts the sync immediately with a named
  * diagnosis instead of letting it spin the full retry budget re-requesting a revision it
- * has silently forgotten. */
+ * has silently forgotten.
+ *
+ * NOTE: durable invalidation restores reverted content to its as-if-absent state, so once the
+ * cascade runs end-to-end (docs/right-is-right.md § Durable Invalidation), reverting the commit
+ * that CREATED a collection would make its header legitimately absent for a client still holding
+ * that revision — a reversal, not a contradiction, which this message would misdiagnose.
+ * Aborting is still the right action there; if it ever fires for that reason, distinguish the
+ * two by checking the log for an invalidation of the held revision before wording the error. */
 export class CollectionHeaderVanishedError extends Error {
 	constructor(
 		readonly collectionId: CollectionId,

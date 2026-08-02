@@ -552,6 +552,8 @@ Two properties matter to callers:
 - **It is not a `StaleFailure` and is not retried.** `Collection.sync`'s re-read/rebase/retry loop absorbs stale failures; `BlockUnavailableError` propagates straight out of `sync`, `update`, `open`, and `createOrOpen`. An indeterminate read cannot be fixed by rebasing — the node needs healing (replication, read-repair acquisition), not another optimistic attempt.
 - **An authoritatively absent block still reads as absent.** The routine `createOrOpen` probe of a never-existing header keeps returning an unflagged absent (and keeps its single-round-trip cost); only an answer the repo *knows* is a guess throws. See the three-valued block answer in [internals.md](internals.md).
 
+One absent answer is nonetheless a fault: a collection header that reads absent **while that collection already holds a committed revision**. The two facts contradict each other, so `Collection.update` throws `CollectionHeaderVanishedError` (naming the collection and the held revision) rather than forgetting the revision and re-requesting revision 1 on every retry. Like `BlockUnavailableError` it is not a `StaleFailure`, so `sync` aborts on it instead of absorbing it. A collection that has never committed holds no revision and so still no-ops — see [internals.md](internals.md) § The revision context is monotonic.
+
 ## Key Components
 
 ### 1. Transaction Types (db-core)

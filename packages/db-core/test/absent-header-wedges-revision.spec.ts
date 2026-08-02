@@ -170,6 +170,22 @@ describe('a collection never lowers the revision it already holds', () => {
 		expect(blind.pendRevs, 'exactly one attempt, at the held rev + 1').to.deep.equal([4])
 	})
 
+	it('still adopts a HIGHER revision — the guard blocks lowering only', async () => {
+		// The counterweight to the four tests above: a guard that refused every reassignment would
+		// satisfy all of them and quietly stop `update()` from ever catching up to a peer.
+		const collectionId = 'advances-on-update'
+		const inner = new TestTransactor()
+		await seedRevisions(inner, collectionId, 1)
+
+		const reader = await Collection.createOrOpen<TestAction>(inner, collectionId, initOptions)
+		expect(reader.getNextRev(), 'opened over rev 1').to.equal(2)
+
+		await seedRevisions(inner, collectionId, 2)
+		await reader.update()
+
+		expect(reader.getNextRev(), 'two more revisions landed, so the reader must move to rev 3').to.equal(4)
+	})
+
 	it('keeps its revision when a lagging peer serves an older view of the log', async () => {
 		const collectionId = 'lagging-peer-on-update'
 		const inner = new TestTransactor()

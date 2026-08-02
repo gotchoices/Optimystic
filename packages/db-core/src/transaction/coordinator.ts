@@ -182,9 +182,10 @@ export class TransactionCoordinator {
 				// Re-read fresh state before re-attempting so the next commit pends against current
 				// revisions (mirrors how Collection.sync calls updateInternal() before retrying).
 				// NOTE: refreshes EVERY registered collection, not only the participants of this
-				// transaction. Harmless (a non-participant's update() just fetches latest) and the
-				// registered set is small today; if a coordinator ever holds many collections and this
-				// shows up as retry latency, narrow it to the transaction's participating collections.
+				// transaction. Not free: a non-participant's update() throws CollectionHeaderVanishedError
+				// if its header momentarily reads absent while it holds a committed revision, aborting
+				// this retry. The registered set is small today; if that (or retry latency) ever bites,
+				// narrow this to the transaction's participating collections.
 				for (const collection of this.collections.values()) {
 					await collection.update();
 				}
