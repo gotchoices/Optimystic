@@ -315,6 +315,61 @@ describe('CoordinatorRepo Integration (TEST-5.3.1)', () => {
 		});
 	});
 
+	describe('silent cohort peer during read consult (ticket cluster-read-consult-cannot-report-unreachable)', () => {
+		it('reports peers-unreachable, not an authoritative absent, when the sole holder is silent', async () => {
+			// The field failure's topology: two nodes, so after self-exclusion the reader has
+			// exactly one peer to consult — and that peer holds the only copy. Its silence must
+			// not read as "the block does not exist".
+			const mesh = await createMesh(2, { responsibilityK: 2 });
+			const reader = mesh.nodes[0]!;
+			const holder = mesh.nodes[1]!;
+			const blockId = 'block-silent-holder';
+
+			// The block exists only on the holder — written straight into its storage so no
+			// cluster traffic replicates it to the reader.
+			const pendResult = await holder.storageRepo.pend(
+				{ actionId: 'a-sh', transforms: makeTransforms(blockId), policy: 'c' }
+			);
+			expect(pendResult.success).to.equal(true);
+			await holder.storageRepo.commit(
+				{ actionId: 'a-sh', tailId: blockId as BlockId, rev: 1, blockIds: [blockId] }
+			);
+
+			mesh.failures.silentPeers = new Set([holder.peerId.toString()]);
+
+			const result = await reader.coordinatorRepo.get({ blockIds: [blockId] });
+
+			expect(result[blockId]?.block, 'nothing to serve — the holder is silent').to.equal(undefined);
+			expect(result[blockId]?.unavailable, 'silence must be reported as silence').to.equal('peers-unreachable');
+		});
+
+		it('reports peers-unreachable for a missing block when the only other cohort peer is silent', async () => {
+			// Same topology, block held by NOBODY — even then, silence means the reader
+			// cannot know that, so no authoritative absent.
+			const mesh = await createMesh(2, { responsibilityK: 2 });
+			const reader = mesh.nodes[0]!;
+			const other = mesh.nodes[1]!;
+			mesh.failures.silentPeers = new Set([other.peerId.toString()]);
+
+			const result = await reader.coordinatorRepo.get({ blockIds: ['block-silent-consult'] });
+
+			expect(result['block-silent-consult']?.unavailable).to.equal('peers-unreachable');
+		});
+
+		it('still reports an authoritative absent when the whole cohort answers "holds nothing"', async () => {
+			// The healthy new-collection probe: everyone answers, nobody holds anything.
+			// This must STAY a one-round-trip authoritative absent, or creating a
+			// collection would retry and then throw.
+			const mesh = await createMesh(2, { responsibilityK: 2 });
+			const reader = mesh.nodes[0]!;
+
+			const result = await reader.coordinatorRepo.get({ blockIds: ['block-absent-probe'] });
+
+			expect(result['block-absent-probe']!.state).to.deep.equal({});
+			expect('unavailable' in result['block-absent-probe']!).to.equal(false);
+		});
+	});
+
 	describe('context-driven pending block serving (TEST-5.4.3)', () => {
 		it('should serve a pending block via context when data is only on the writing peers', async () => {
 			// responsibilityK=3: all peers are discoverable so the reader's cluster query reaches

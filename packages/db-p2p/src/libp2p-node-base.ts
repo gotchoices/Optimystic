@@ -802,12 +802,20 @@ export async function createLibp2pNodeBase(
 		options.transactionStateStore
 	);
 
-	// Create callback for querying cluster peers for their latest block revision
+	// Create callback for querying cluster peers for their latest block revision. Three-way
+	// contract (see ClusterLatestCallback): an ActionRev is the peer's claim, a resolved
+	// `undefined` is the peer answering "I hold nothing", and a REJECTION is silence — the
+	// coordinator counts it as "did not answer" and refuses to report an authoritative absent
+	// over it. Transport errors must therefore propagate, not collapse into `undefined` (that
+	// collapse let a slow two-node cohort report a missing block as authoritatively absent —
+	// ticket cluster-read-consult-cannot-report-unreachable).
 	const clusterLatestCallback: ClusterLatestCallback = async (peerId, blockId, context?) => {
 		// Self-read short-circuit: dialling self via SyncClient is a round trip
 		// with no remote on the other end, and on nodes without listen addresses
 		// (solo WebSocket-only, bare-RN, etc.) the self-dial can hang the dial
-		// queue. Read directly from the local storage repo instead.
+		// queue. Read directly from the local storage repo instead. The catch stays:
+		// a local storage error is not a cohort peer being unreachable, and the
+		// coordinator ignores a self rejection anyway.
 		if (peerId.equals(node.peerId)) {
 			try {
 				const result = await storageRepo.get({ blockIds: [blockId], context });
@@ -817,21 +825,22 @@ export async function createLibp2pNodeBase(
 			}
 		}
 		const syncClient = new SyncClient(peerId, keyNetwork, protocolPrefix);
-		try {
-			const response = await syncClient.requestBlock({ blockId, rev: undefined });
-			if (response.success && response.archive) {
-				const revisions = Object.keys(response.archive.revisions).map(Number);
-				if (revisions.length > 0) {
-					const maxRev = Math.max(...revisions);
-					const revisionData = response.archive.revisions[maxRev];
-					if (revisionData?.action) {
-						return { actionId: revisionData.action.actionId, rev: maxRev };
-					}
+		// No try/catch: a dial or protocol failure rejects through to the coordinator, whose
+		// per-peer deadline also bounds a hung request — slowness needs no race here.
+		const response = await syncClient.requestBlock({ blockId, rev: undefined });
+		if (response.success && response.archive) {
+			const revisions = Object.keys(response.archive.revisions).map(Number);
+			if (revisions.length > 0) {
+				const maxRev = Math.max(...revisions);
+				const revisionData = response.archive.revisions[maxRev];
+				if (revisionData?.action) {
+					return { actionId: revisionData.action.actionId, rev: maxRev };
 				}
 			}
-		} catch {
-			// Peer may be unreachable - return undefined to skip this peer
 		}
+		// The peer DID answer, without data: `success:false` is the sync service's "Block not
+		// found in local storage", and an archive with no usable revisions holds nothing either
+		// way. Both are absent claims, not silence.
 		return undefined;
 	};
 

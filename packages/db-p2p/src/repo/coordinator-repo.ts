@@ -47,22 +47,6 @@ function withDeadline<T>(promise: Promise<T>, ms: number, label: string): Promis
 }
 
 /**
- * Resolve `undefined` if `promise` has not settled within `ms` — a slow peer is skipped, not an
- * error. Same timer discipline as {@link withDeadline}: one repair pass races this once per cohort
- * peer, so leaving the handles pending would keep the event loop alive for the full timeout after
- * every peer has already answered.
- */
-function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T | undefined> {
-	let timer: ReturnType<typeof setTimeout> | undefined;
-	const expiry = new Promise<undefined>(resolve => {
-		timer = setTimeout(() => resolve(undefined), ms);
-	});
-	return Promise.race([promise, expiry]).finally(() => {
-		if (timer !== undefined) clearTimeout(timer);
-	});
-}
-
-/**
  * What one round of polling the cohort learned about a block: the revision the OTHER
  * cohort members corroborated, and what this node itself already holds. The two are kept
  * apart on purpose — the local revision is the baseline being repaired, never evidence
@@ -74,6 +58,14 @@ interface ClusterLatestQuery {
 	corroborated?: ActionRev;
 	/** This node's own latest for the block, as answered by the callback's self short-circuit. */
 	local?: ActionRev;
+	/**
+	 * Cohort peers (self excluded) that never answered the consult — the callback rejected
+	 * (dial failure, protocol error) or blew the per-peer deadline. Silence, not evidence:
+	 * these are never counted as claims, but while this is non-empty a caller must not treat
+	 * "nothing corroborated" as an authoritative absence, because a silent peer could be the
+	 * sole holder.
+	 */
+	silent: string[];
 }
 
 /**
@@ -85,8 +77,18 @@ interface LocalClusterWithExecutionTracking extends ICluster {
 }
 
 /**
- * Callback to query a cluster peer for their latest revision of a block.
- * Returns the peer's latest ActionRev if they have the block, undefined otherwise.
+ * Callback to query a cluster peer for their latest revision of a block. Three-way contract:
+ *  - resolves an `ActionRev` — the peer answered and holds the block at that revision;
+ *  - resolves `undefined` — the peer answered and holds NOTHING (an absent claim);
+ *  - REJECTS — the peer could not be asked at all (dial failure, protocol error).
+ *
+ * The distinction between the last two is load-bearing: `queryClusterForLatest` counts a
+ * rejection as a SILENT peer, which stops `CoordinatorRepo.get` from reporting a locally-missing
+ * block as an authoritative absent, while a resolved `undefined` is a real answer that keeps the
+ * absent authoritative. Implementations must therefore let transport errors propagate rather than
+ * swallowing them into `undefined` (see the implementations in `libp2p-node-base` and the mesh
+ * harness's `silentPeers` failure knob). Slowness needs no handling here — the caller deadlines
+ * each query and treats expiry as silence.
  */
 export type ClusterLatestCallback = (peerId: PeerId, blockId: BlockId, context?: ActionContext) => Promise<ActionRev | undefined>;
 
@@ -321,7 +323,8 @@ export class CoordinatorRepo implements IRepo {
 		// NOTE: NetworkTransactor.get treats an authoritative "absent" ({ state: {} })
 		// as final and no longer retries it (ticket txn-perf-authoritative-notfound),
 		// relying on this cluster reconciliation to have already run. When the consult
-		// runs and FAILS, the entry is flagged `unavailable: 'peers-unreachable'` below,
+		// FAILS outright — or runs while part of the cohort stays SILENT and the block
+		// stays missing — the entry is flagged `unavailable: 'peers-unreachable'` below,
 		// which re-enables the transactor-level retry against a different peer. If a
 		// coordinator is configured WITHOUT clusterLatestCallback, there is no cohort to
 		// consult and the local answer IS the whole truth — it stays authoritative, with
@@ -346,7 +349,7 @@ export class CoordinatorRepo implements IRepo {
 				}
 
 				try {
-					await this.fetchBlockFromCluster(blockId, blockGets.context, localRev);
+					const { cohortSilent } = await this.fetchBlockFromCluster(blockId, blockGets.context, localRev);
 					const refreshed = await this.storageRepo.get({ blockIds: [blockId], context: blockGets.context }, options);
 					const newRev = refreshed[blockId]?.state?.latest?.rev;
 					if (refreshed[blockId]) {
@@ -359,17 +362,37 @@ export class CoordinatorRepo implements IRepo {
 							log('cluster-tx:read-repair-noop', { blockId });
 						}
 					}
+					// The consult ran, but part of the cohort was SILENT (rejected callback or
+					// per-peer deadline — see queryClusterForLatest). A silent peer could be the
+					// sole holder, so a block that is STILL missing after the consult must not be
+					// reported as an authoritative absent; flag it exactly as the thrown-consult
+					// path below does. Scope mirrors that path: only a locally-MISSING block is
+					// downgraded (a merely-stale one keeps its real local answer), a block the
+					// consult actually restored is a real answer and stays unflagged, and a
+					// sharper flag (storage's 'unmaterializable') is never overwritten. When the
+					// whole cohort answers "holds nothing", the absent stays authoritative — the
+					// common new-collection probe against a healthy cohort stays one round-trip.
+					// NOTE: a corroborated revision whose ACQUISITION then fails, with the whole
+					// cohort answering, still reports an unflagged absent — nobody was silent,
+					// yet the reader has just learned the block exists. Pre-existing and untouched
+					// here (silence was this ticket's scope); if it shows up in practice, flag
+					// corroborated-but-not-restored the same way.
+					if (isMissing && cohortSilent) {
+						const entry = localResult[blockId];
+						if (!entry?.state?.latest) {
+							if (!entry) {
+								localResult[blockId] = { state: {}, unavailable: 'peers-unreachable' };
+							} else if (entry.unavailable === undefined) {
+								entry.unavailable = 'peers-unreachable';
+							}
+						}
+					}
 				} catch (err) {
 					log('cluster-fetch:error', { blockId, error: (err as Error).message });
 					// The consult that was supposed to make this answer trustworthy did not run.
 					// Only a locally-MISSING block is downgraded to `unavailable`: a merely-stale
 					// block still has a real local answer and stays authoritative. A sharper flag
 					// already on the entry (storage's 'unmaterializable') is never overwritten.
-					// NOTE: a consult that runs but corroborates nothing (per-peer timeouts and
-					// "peer holds nothing" both surface as absent claims → no quorum) does NOT
-					// land here and stays an authoritative absent — the common new-collection
-					// probe against a healthy cohort takes exactly that path, and the callback
-					// contract cannot distinguish the two without counting responders.
 					if (isMissing) {
 						const entry = localResult[blockId];
 						if (!entry) {
@@ -427,14 +450,21 @@ export class CoordinatorRepo implements IRepo {
 	 * One repair pass for a block: ask the cohort what it holds, and converge onto that if it is
 	 * ahead of `localRev` — the revision the caller's read already loaded, and the baseline every
 	 * decision below is measured against.
+	 *
+	 * Returns the one thing `get` needs beyond the storage side effects: whether any cohort peer
+	 * other than this node was SILENT during the latest-consult (rejected callback or per-peer
+	 * deadline). While that is true, a consult that corroborated nothing is a guess, not evidence —
+	 * `get` must not report a still-missing block as an authoritative absent over it. Paths that
+	 * consult nobody (no cohort, solo-self) report no silence: there, the local answer genuinely is
+	 * the whole truth.
 	 */
-	private async fetchBlockFromCluster(blockId: BlockId, context?: ActionContext, localRev?: number): Promise<void> {
-		if (!this.clusterLatestCallback) return;
+	private async fetchBlockFromCluster(blockId: BlockId, context?: ActionContext, localRev?: number): Promise<{ cohortSilent: boolean }> {
+		if (!this.clusterLatestCallback) return { cohortSilent: false };
 
 		const blockIdBytes = new TextEncoder().encode(blockId);
 		const peers = await this.keyNetwork.findCluster(blockIdBytes);
 		const peerIds = peers ? Object.keys(peers) : [];
-		if (peerIds.length === 0) return;
+		if (peerIds.length === 0) return { cohortSilent: false };
 
 		// Solo-cluster short-circuit: the only responsible peer is us. There is no
 		// remote to sync from, so skip the callback entirely. Querying ourselves
@@ -446,13 +476,17 @@ export class CoordinatorRepo implements IRepo {
 			&& peerIds[0] === this.localPeerId.toString()
 		) {
 			log('cluster-fetch:solo-self-skip', { blockId });
-			return;
+			return { cohortSilent: false };
 		}
 
-		const { corroborated, local } = await this.queryClusterForLatest(peerIds, blockId, context);
+		const { corroborated, local, silent } = await this.queryClusterForLatest(peerIds, blockId, context);
+		// Any silence flags the WHOLE consult, not a fraction of it (fail-closed): one silent
+		// peer could be the sole holder, and the cost — an extra transactor-level retry against
+		// another coordinator — is paid only while a peer is actually unreachable.
+		const cohortSilent = silent.length > 0;
 		// Nothing corroborated: keep local data AND stay eligible for repair — marking the
 		// block seen here would suppress the next attempt for the whole read-repair window.
-		if (!corroborated) return;
+		if (!corroborated) return { cohortSilent };
 
 		// The self answer is the sharper baseline (same storage, same context, read alongside the
 		// cohort's), but it exists only when `findCluster` returned this node. A soft serve for a
@@ -475,7 +509,7 @@ export class CoordinatorRepo implements IRepo {
 		if (baselineRev !== undefined && corroborated.rev <= baselineRev) {
 			log('cluster-fetch:local-current', { blockId, localRev: baselineRev, clusterRev: corroborated.rev });
 			this.markBlocksSeen([blockId]);
-			return;
+			return { cohortSilent };
 		}
 
 		// Corroborated revision is ahead of ours — converge onto it.
@@ -500,6 +534,7 @@ export class CoordinatorRepo implements IRepo {
 		// it ever shows as read amplification, gate the acquisition step (not the latest-query) on the
 		// same window rather than widening `isMissing`.
 		this.markBlocksSeen([blockId]);
+		return { cohortSilent };
 	}
 
 	/**
@@ -621,13 +656,14 @@ export class CoordinatorRepo implements IRepo {
 	 * `debt-read-repair-commit-cert-verification`.
 	 */
 	private async queryClusterForLatest(peerIds: string[], blockId: BlockId, context?: ActionContext): Promise<ClusterLatestQuery> {
-		// Query peers in parallel for their latest revision (with 1s timeout per peer),
-		// tagging each response with the peer that made it so votes stay distinct.
+		// Query peers in parallel for their latest revision. Each query is DEADLINED (rejects at
+		// 1s), not raced-to-undefined: a peer that blows the deadline lands in the silent set below
+		// exactly like a dial failure, because a slow peer and a peer claiming "I hold nothing"
+		// must produce different answers (ticket cluster-read-consult-cannot-report-unreachable).
 		const latestResults = await Promise.allSettled(
 			peerIds.map(async peerIdStr => {
 				const peerId = peerIdFromString(peerIdStr);
-				const value = await withTimeout(this.clusterLatestCallback!(peerId, blockId, context), 1000);
-				return { peerIdStr, value };
+				return await withDeadline(this.clusterLatestCallback!(peerId, blockId, context), 1000, `latest query to ${peerIdStr}`);
 			})
 		);
 
@@ -639,14 +675,29 @@ export class CoordinatorRepo implements IRepo {
 		const selfId = this.localPeerId?.toString();
 		let local: ActionRev | undefined;
 		const claims: RevClaim[] = [];
-		for (const result of latestResults) {
-			if (result.status !== 'fulfilled' || !result.value.value) continue;
-			const { peerIdStr, value } = result.value;
+		const silent: string[] = [];
+		// `allSettled` preserves input order, so results correlate to `peerIds` by index — a
+		// rejected entry carries no payload of its own, and its peer id is what `silent` records.
+		for (let i = 0; i < latestResults.length; i++) {
+			const result = latestResults[i]!;
+			const peerIdStr = peerIds[i]!;
+			if (result.status !== 'fulfilled') {
+				// Silence: the callback rejected or the deadline expired. Never a claim. Self is
+				// excluded — its short-circuit reads local storage, and a local read error is not a
+				// cohort peer being unreachable.
+				if (peerIdStr !== selfId) silent.push(peerIdStr);
+				continue;
+			}
+			const value = result.value;
 			if (peerIdStr === selfId) {
 				local = value;
 				continue;
 			}
+			if (!value) continue; // responded, holds nothing — an absent claim, not silence
 			claims.push({ peerId: peerIdStr, rev: value.rev, actionId: value.actionId });
+		}
+		if (silent.length > 0) {
+			log('cluster-fetch:peers-silent', { blockId, silent: silent.length, consulted: peerIds.length });
 		}
 
 		const capacity = corroboratorCapacity(peerIds.filter(id => id !== selfId).length, this.repairCorroborationClusterSize);
@@ -657,7 +708,7 @@ export class CoordinatorRepo implements IRepo {
 				responders: claims.length,
 				required: quorumSize(claims.length, this.simpleMajorityThreshold, capacity)
 			});
-			return { local };
+			return { local, silent };
 		}
 
 		// Best-effort: penalize peers whose claim contradicts the corroborated pair
@@ -665,7 +716,7 @@ export class CoordinatorRepo implements IRepo {
 		// rev). A lower rev is just lag, never penalized. Never let this throw.
 		this.penalizeContradictingRevClaims(claims, selected, blockId);
 
-		return { corroborated: { actionId: selected.actionId, rev: selected.rev }, local };
+		return { corroborated: { actionId: selected.actionId, rev: selected.rev }, local, silent };
 	}
 
 	/**

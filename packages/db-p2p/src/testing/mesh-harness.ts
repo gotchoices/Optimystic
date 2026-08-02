@@ -42,6 +42,13 @@ export interface MeshFailureConfig {
 	failingPeers?: Set<string>;
 	/** Make findCluster return empty (simulate DHT failure) */
 	findClusterFails?: boolean;
+	/**
+	 * Peers that are unreachable on the READ path: their latest-revision consult
+	 * (`ClusterLatestCallback`) REJECTS — silence the coordinator must count as "did not
+	 * answer", never as the peer claiming absence — and the reconcile/acquire transfer skips
+	 * them as a source. Distinct from `failingPeers`, which fails cluster (write) updates.
+	 */
+	silentPeers?: Set<string>;
 }
 
 class MockPeerNetwork implements IPeerNetwork {
@@ -118,10 +125,13 @@ export interface Mesh {
  *
  * `nodes` is captured by reference and is fully populated by the time either caller invokes it.
  */
-const makeReconcileBlock = (nodes: MeshNode[], selfPeerId: string, storageRepo: StorageRepo): ReconcileBlockCallback =>
+const makeReconcileBlock = (nodes: MeshNode[], selfPeerId: string, storageRepo: StorageRepo, failures: MeshFailureConfig): ReconcileBlockCallback =>
 	async (blockId, committed, cohortPeerIds) => {
 		for (const peerIdStr of cohortPeerIds) {
 			if (peerIdStr === selfPeerId) continue;
+			// A silent peer cannot serve bytes either — without this, a test that silenced a
+			// peer's consult could still accidentally converge THROUGH that peer.
+			if (failures.silentPeers?.has(peerIdStr)) continue;
 			const target = nodes.find(n => n.peerId.toString() === peerIdStr);
 			if (!target) continue;
 			const result = await target.storageRepo.get({ blockIds: [blockId] }, { skipClusterFetch: true } as any);
@@ -177,7 +187,7 @@ export async function createMesh(nodeCount: number, options: MeshOptions): Promi
 
 		// Active reconciliation: when a member commits a block it never pended (cohort drift),
 		// pull the committed revision from a sibling cohort node that holds it.
-		const reconcileBlock = makeReconcileBlock(nodes, peerId.toString(), storageRepo);
+		const reconcileBlock = makeReconcileBlock(nodes, peerId.toString(), storageRepo, failures);
 
 		const member = clusterMember({
 			storageRepo,
@@ -223,6 +233,12 @@ export async function createMesh(nodeCount: number, options: MeshOptions): Promi
 		// existed to expose. Transfer now happens where it does in production: through
 		// `acquireBlockFromCohort` below, gated on a corroborated revision.
 		const clusterLatestCallback: ClusterLatestCallback = async (peerId: PeerId, blockId: BlockId, context?): Promise<ActionRev | undefined> => {
+			// Silence: the peer never answers. REJECTS, mirroring what a dial failure does to the
+			// production callback — the coordinator must count this as "did not answer", never as
+			// an absent claim (a resolved `undefined` remains the peer answering "I hold nothing").
+			if (failures.silentPeers?.has(peerId.toString())) {
+				throw new Error(`Peer ${peerId.toString()} is silent`);
+			}
 			const target = nodes.find(n => n.peerId.equals(peerId));
 			if (!target) return undefined;
 			const result = await target.storageRepo.get(
@@ -265,7 +281,7 @@ export async function createMesh(nodeCount: number, options: MeshOptions): Promi
 			clusterLatestCallback,
 			// The read path's transfer mechanism — the same callback the member uses on the commit path,
 			// mirroring how `libp2p-node-base` shares one `reconcileBlock` between both.
-			acquireBlockFromCohort: makeReconcileBlock(nodes, node.peerId.toString(), node.storageRepo)
+			acquireBlockFromCohort: makeReconcileBlock(nodes, node.peerId.toString(), node.storageRepo, failures)
 		});
 	}
 
