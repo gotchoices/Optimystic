@@ -841,12 +841,22 @@ export class CoordinatorRepo implements IRepo {
 					latestRev: latest.rev,
 					requestedRev: request.rev
 				});
-				return { success: false, conflict: true, reason: `stale revision: block ${blockId} at rev ${latest.rev}, requested rev ${request.rev}` };
+				return {
+					success: false,
+					conflict: true,
+					reason: `stale revision: block ${blockId} at rev ${latest.rev}, requested rev ${request.rev}`,
+					// The same fact as the reason prose, but as data. This is the ONLY place a losing
+					// writer can learn the revision it lost to, since this failure deliberately carries
+					// no `missing`. Confirmed-local: read out of our own storage just above.
+					staleAt: { blockId, rev: latest.rev }
+				};
 			}
 		}
 		// NOTE: conservative — when only remote members saw the newer revision (local storage still
 		// behind), staleness can't be confirmed locally and the rejection stays a throw. If that
 		// shows up in practice, extend confirmation with a quorum read; never trust the reject text.
+		// `staleAt` is absent on this path for the same reason, and deliberately so — there is no
+		// confirmed number to report, and the field's contract forbids inferring one from that text.
 		return undefined;
 	}
 

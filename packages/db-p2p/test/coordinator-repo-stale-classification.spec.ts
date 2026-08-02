@@ -163,6 +163,10 @@ describe('CoordinatorRepo stale-revision classification (pend)', function () {
 		// `conflict` is what tells the multi-collection writer this is worth retrying.
 		expect((result as StaleFailure).conflict, 'confirmed loss must be flagged retryable').to.equal(true);
 		expect(isConflictFailure(result as StaleFailure)).to.equal(true);
+		// …and the revision itself rides as data, not only inside the reason prose. This is the
+		// headline site: with no `missing` list, `staleAt` is the ONLY machine-readable number a
+		// losing writer can get out of a confirmed loss.
+		expect((result as StaleFailure).staleAt).to.deep.equal({ blockId: BLOCK_ID, rev: 1 });
 		expect(storage.getCalls, 'classification re-reads local storage').to.be.greaterThan(0);
 		expect(storage.pendCalls, 'a rejected pend must not reach local storage').to.equal(0);
 
@@ -184,6 +188,9 @@ describe('CoordinatorRepo stale-revision classification (pend)', function () {
 		expect((result as StaleFailure).reason, 'reason names the stale block, not the first-scanned one')
 			.to.equal(`stale revision: block ${BLOCK_ID_2} at rev 5, requested rev 3`);
 		expect((result as StaleFailure).conflict).to.equal(true);
+		// staleAt names the block that actually advanced, matching the reason — and reports the
+		// revision it advanced TO (5), not the one that was requested (3).
+		expect((result as StaleFailure).staleAt).to.deep.equal({ blockId: BLOCK_ID_2, rev: 5 });
 	});
 
 	it('rethrows ValidatorRejectionError when local storage cannot confirm staleness', async () => {
@@ -199,6 +206,27 @@ describe('CoordinatorRepo stale-revision classification (pend)', function () {
 		expect(caught, 'unconfirmed rejection must fail fast').to.be.instanceOf(ValidatorRejectionError);
 		expect((caught as ValidatorRejectionError).message).to.match(/rejected by validators/);
 		expect(Object.values((caught as ValidatorRejectionError).rejectReasons)).to.deep.equal(['operations hash mismatch']);
+		// No StaleFailure at all on this path, so no `staleAt`: the field is confirmed-only, and the
+		// signed reject text must never be mined for a number we could not verify ourselves.
+		expect(caught).to.not.have.property('staleAt');
+	});
+
+	it('produces no staleAt when a rejection is real but only remote members could see it', async () => {
+		// The residual gap the classification NOTE describes: the peers rejected on a revision this
+		// node has not received yet, so local confirmation fails. Correct behaviour is still a throw
+		// and still no number — inventing one from the reject prose is exactly what the field forbids.
+		setVerdicts({ type: 'approve' }, { type: 'reject', reason: 'stale revision: block block-1 at rev 9, requested rev 3' });
+		storage.latestRev = 2; // local storage is behind both the request and the peers
+
+		let caught: unknown;
+		try {
+			await repo.pend(makePendRequest(3));
+		} catch (err) {
+			caught = err;
+		}
+		expect(caught).to.be.instanceOf(ValidatorRejectionError);
+		expect(caught).to.not.have.property('staleAt');
+		expect(storage.getCalls, 'classification did attempt a local confirmation').to.be.greaterThan(0);
 	});
 
 	it('rethrows when the request carries no rev (nothing to compare against)', async () => {

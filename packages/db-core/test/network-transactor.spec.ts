@@ -1,5 +1,5 @@
 import { expect } from 'chai'
-import { NetworkTransactor } from '../src/transactor/network-transactor.js'
+import { NetworkTransactor, highestStaleAt } from '../src/transactor/network-transactor.js'
 import { NetworkSimulation } from './simulation.js'
 import type { Scenario } from './simulation.js'
 import { randomBytes } from '@libp2p/crypto'
@@ -496,6 +496,51 @@ describe('NetworkTransactor', () => {
       expect(result.success).to.be.false
       if (!result.success) {
         expect(result.missing ?? []).to.deep.equal([])
+      }
+    })
+
+    // commitBlock rebuilds its failure from the per-batch responses the same way pend does, and
+    // deliberately drops the free-form `reason`. The one machine-readable fact inside that prose —
+    // which block sits at which revision — must survive the rebuild.
+    it('carries staleAt through a rebuilt commit failure even though the reason is dropped', async () => {
+      const peerA = 'peer-A'
+      const net: IKeyNetwork = {
+        async findCoordinator() { return peerIdFromString(peerA) },
+        async findCluster() { return { [peerA]: { multiaddrs: [], publicKey: '' } } },
+      }
+      const staleCommitRepo: IRepo = {
+        async get() { return {} },
+        async pend() { throw new Error('unused on this path') },
+        async cancel() { },
+        async commit() {
+          return {
+            success: false as const,
+            conflict: true,
+            reason: 'stale revision: block hot at rev 12, requested rev 11',
+            staleAt: { blockId: 'hot' as BlockId, rev: 12 }
+          }
+        },
+      }
+      const networkTransactor = new NetworkTransactor({
+        timeoutMs: 1000,
+        abortOrCancelTimeoutMs: 500,
+        keyNetwork: net,
+        getRepo: () => staleCommitRepo,
+      })
+
+      const blockId = generateBlockId()
+      const result = await networkTransactor.commit({
+        actionId: generateRandomActionId(),
+        rev: 11,
+        blockIds: [blockId],
+        tailId: blockId,
+      })
+
+      expect(result.success).to.be.false
+      if (!result.success) {
+        expect(result.staleAt).to.deep.equal({ blockId: 'hot', rev: 12 })
+        // Unchanged behaviour: the prose is still dropped by this branch.
+        expect(result.reason).to.equal(undefined)
       }
     })
   })
@@ -1188,6 +1233,141 @@ describe('NetworkTransactor', () => {
       if (!result.success) {
         expect(result.conflict, 'fallback inference keeps older producers retryable').to.be.true;
       }
+    });
+
+    it('carries a batch\'s staleAt through the rebuilt aggregate', async () => {
+      // The exact combination the field exists for: a confirmed loss with NO `missing`
+      // (CoordinatorRepo.classifyStaleRejection's shape). Retryability still rides on `conflict`,
+      // and the revision now rides alongside it instead of only inside the reason prose.
+      const { result } = await runMixedPend({
+        success: false,
+        conflict: true,
+        reason: 'stale revision: block block-1 at rev 4, requested rev 3',
+        staleAt: { blockId: 'block-1', rev: 4 }
+      });
+
+      expect(result.success).to.be.false;
+      if (!result.success) {
+        expect(result.conflict).to.be.true;
+        expect(result.missing ?? []).to.deep.equal([]);
+        expect(result.staleAt).to.deep.equal({ blockId: 'block-1', rev: 4 });
+      }
+    });
+
+    it('omits staleAt entirely when no batch reported one', async () => {
+      // Not `staleAt: undefined` — the key must be absent, both so the JSON on the wire stays
+      // clean and so the repo compiles if `exactOptionalPropertyTypes` ever lands.
+      const { result } = await runMixedPend({ success: false, conflict: true, reason: 'stale revision' });
+
+      expect(result.success).to.be.false;
+      expect(Object.prototype.hasOwnProperty.call(result, 'staleAt'),
+        'an all-absent aggregate must omit the key, not emit undefined').to.be.false;
+    });
+  })
+
+  // `pend` rebuilds ONE response out of many per-batch ones, so when several batches each report a
+  // confirmed revision it has to choose. It picks the highest — every block in the pend commits
+  // under one collection revision, so the numbers are comparable and the largest is the constraint
+  // the client's next request must clear. Deliberately unlike `reason`, which is first-wins.
+  describe('pend staleAt aggregation across batches', () => {
+    /** Two disjoint-cluster blocks → two batches, each answering with its own StaleFailure. */
+    const runTwoStalePends = async (staleA: StaleFailure, staleB: StaleFailure) => {
+      const peerA = 'peer-A';
+      const peerB = 'peer-B';
+
+      const clusterMap = new Map<string, string[]>();
+      const setCluster = async (blockId: BlockId, peerIds: string[]) => {
+        clusterMap.set(uint8ArrayToString(await blockIdToBytes(blockId), 'base64url'), peerIds);
+      };
+      const net: IKeyNetwork = {
+        async findCoordinator(): Promise<PeerId> { return peerIdFromString(peerA); },
+        async findCluster(key: Uint8Array): Promise<ClusterPeers> {
+          const peers: ClusterPeers = {};
+          for (const pid of clusterMap.get(uint8ArrayToString(key, 'base64url')) ?? []) {
+            peers[pid] = { multiaddrs: [], publicKey: '' };
+          }
+          return peers;
+        }
+      };
+
+      const blockId1 = 'block-1' as BlockId;
+      const blockId2 = 'block-2' as BlockId;
+      await setCluster(blockId1, [peerA]);
+      await setCluster(blockId2, [peerB]);
+
+      const makeRepo = (response: StaleFailure): IRepo => ({
+        async get() { return {}; },
+        async pend() { return response; },
+        async cancel() { },
+        async commit() { throw new Error('unused'); }
+      });
+
+      const networkTransactor = new NetworkTransactor({
+        timeoutMs: 1000,
+        abortOrCancelTimeoutMs: 500,
+        keyNetwork: net,
+        getRepo: (peerId: PeerId) => (peerId.toString() === peerA ? makeRepo(staleA) : makeRepo(staleB)),
+      });
+
+      return networkTransactor.pend({
+        actionId: generateRandomActionId(),
+        rev: 3,
+        transforms: {
+          updates: { [blockId1]: [createBlockOperation()], [blockId2]: [createBlockOperation()] },
+          inserts: {},
+          deletes: []
+        },
+        policy: 'c'
+      });
+    };
+
+    const staleWith = (blockId: string, rev: number): StaleFailure =>
+      ({ success: false, conflict: true, reason: `stale revision: block ${blockId} at rev ${rev}`, staleAt: { blockId, rev } });
+
+    // Run the pair BOTH ways round so the assertion cannot pass by accident on batch ordering:
+    // a first-wins implementation would return rev 4 in exactly one of these two cases.
+    it('reports the highest rev when the higher one arrives in the second batch', async () => {
+      const result = await runTwoStalePends(staleWith('block-1', 4), staleWith('block-2', 9));
+      expect(result.success).to.be.false;
+      if (!result.success) expect(result.staleAt).to.deep.equal({ blockId: 'block-2', rev: 9 });
+    });
+
+    it('reports the highest rev when the higher one arrives in the first batch', async () => {
+      const result = await runTwoStalePends(staleWith('block-1', 9), staleWith('block-2', 4));
+      expect(result.success).to.be.false;
+      if (!result.success) expect(result.staleAt).to.deep.equal({ blockId: 'block-1', rev: 9 });
+    });
+
+    it('ignores a batch that reported no staleAt', async () => {
+      // A hard rejection (or an older peer) contributes nothing to the selection — it must
+      // neither win nor blank out the one real number that was reported.
+      const result = await runTwoStalePends(
+        { success: false, reason: 'operations hash mismatch' },
+        staleWith('block-2', 6)
+      );
+      expect(result.success).to.be.false;
+      if (!result.success) {
+        expect(result.staleAt).to.deep.equal({ blockId: 'block-2', rev: 6 });
+        // The mixed batch keeps its existing `some`-based retryability, unchanged by the new field.
+        expect(result.conflict).to.be.true;
+      }
+    });
+  })
+
+  describe('highestStaleAt', () => {
+    it('returns undefined for an all-absent input so callers can omit the key', () => {
+      expect(highestStaleAt([undefined, undefined])).to.equal(undefined);
+      expect(highestStaleAt([])).to.equal(undefined);
+    });
+
+    it('keeps the earlier entry on a tie', () => {
+      const first = { blockId: 'b1' as BlockId, rev: 5 };
+      expect(highestStaleAt([first, { blockId: 'b2' as BlockId, rev: 5 }])).to.equal(first);
+    });
+
+    it('ignores undefined entries interleaved with real ones', () => {
+      expect(highestStaleAt([undefined, { blockId: 'b1' as BlockId, rev: 2 }, undefined, { blockId: 'b2' as BlockId, rev: 8 }]))
+        .to.deep.equal({ blockId: 'b2', rev: 8 });
     });
   })
 })

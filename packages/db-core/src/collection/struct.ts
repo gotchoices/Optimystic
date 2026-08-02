@@ -40,9 +40,14 @@ export class SyncRetryExhaustedError extends Error {
 		readonly collectionId: CollectionId,
 		readonly attempts: number,
 		readonly lastReason?: string,
+		/** The last confirmed revision a responder reported holding, if any responder reported one
+		 * (see `StaleFailure.staleAt`). Absent whenever no rejection carried a confirmed number —
+		 * which is normal, not a signal that the failure was something other than a lost race. */
+		readonly staleAt?: { blockId: BlockId; rev: number },
 	) {
 		super(`sync for collection ${collectionId} exhausted ${attempts} retries` +
-			(lastReason ? `: ${lastReason}` : ''));
+			(lastReason ? `: ${lastReason}` : '') +
+			(staleAt ? `, last seen block ${staleAt.blockId} at rev ${staleAt.rev}` : ''));
 		this.name = 'SyncRetryExhaustedError';
 	}
 }

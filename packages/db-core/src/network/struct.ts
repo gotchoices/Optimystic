@@ -79,6 +79,20 @@ export type StaleFailure = {
 	 * Read it through `isConflictFailure` rather than testing it directly.
 	 */
 	conflict?: boolean;
+	/**
+	 * The block that already occupies (or is past) the requested revision, and the revision the
+	 * responder holds for it.
+	 *
+	 * CONFIRMED-ONLY: set this only when the producer read the revision out of its own storage.
+	 * A producer that merely suspects staleness — or that learned of it from another peer's
+	 * free-form reject text — must leave it absent. Absent means "no confirmed number", never
+	 * "not stale".
+	 *
+	 * DIAGNOSTIC, NOT A RETRYABILITY SIGNAL: `conflict` (read via `isConflictFailure`) remains the
+	 * single source of truth for "can a re-read and re-pend win?". Never branch retry decisions on
+	 * the presence of this field.
+	 */
+	staleAt?: { blockId: BlockId; rev: number };
 };
 
 export type PendResult = PendSuccess | StaleFailure;

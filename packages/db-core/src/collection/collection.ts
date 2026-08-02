@@ -405,6 +405,9 @@ export class Collection<TAction> implements ICollection<TAction> {
 		// large multi-batch sync (which iterates many times committing progress) never trips it.
 		let consecutiveFailures = 0;
 		let lastReason: string | undefined;
+		// Last confirmed revision a responder reported holding. Purely diagnostic — it is reported
+		// in the exhaustion error and never consulted to decide whether to keep retrying.
+		let lastStaleAt: { blockId: BlockId; rev: number } | undefined;
 
 		while (this.pending.length || !isTransformsEmpty(this.tracker.transforms)) {
 			if (signal?.aborted) {
@@ -412,7 +415,7 @@ export class Collection<TAction> implements ICollection<TAction> {
 			}
 			// Progress-agnostic ceiling: give up if the wall-clock deadline passed.
 			if (deadlineMs !== undefined && Date.now() - startedAt >= deadlineMs) {
-				throw new SyncRetryExhaustedError(this.id, consecutiveFailures, lastReason ?? 'deadline exceeded');
+				throw new SyncRetryExhaustedError(this.id, consecutiveFailures, lastReason ?? 'deadline exceeded', lastStaleAt);
 			}
 
 			// Snapshot the pending actions so that any new actions aren't assumed to be part of this action
@@ -438,6 +441,7 @@ export class Collection<TAction> implements ICollection<TAction> {
 			if (staleFailure) {
 				consecutiveFailures++;
 				lastReason = staleFailure.reason ?? lastReason;
+				lastStaleAt = staleFailure.staleAt ?? lastStaleAt;
 				// Give up once the consecutive no-progress budget is exhausted, so a transactor that
 				// persistently rejects the sync can no longer hold the collection latch forever.
 				// NOTE: this also bounds the legitimate `pending`-wait case (retrying the same action
@@ -445,7 +449,7 @@ export class Collection<TAction> implements ICollection<TAction> {
 				// attempts ≈ 21s of exponential backoff. If a high-contention workload legitimately
 				// needs to wait longer for a pending commit to clear, raise maxAttempts for that caller.
 				if (consecutiveFailures >= maxAttempts) {
-					throw new SyncRetryExhaustedError(this.id, consecutiveFailures, lastReason);
+					throw new SyncRetryExhaustedError(this.id, consecutiveFailures, lastReason, lastStaleAt);
 				}
 				// Back off before every retry (any stale failure — reason/missing/pending), growing
 				// exponentially from the base delay up to the cap, with proportional random jitter so a
@@ -464,6 +468,7 @@ export class Collection<TAction> implements ICollection<TAction> {
 				// Forward progress: reset the no-progress budget.
 				consecutiveFailures = 0;
 				lastReason = undefined;
+				lastStaleAt = undefined;
 				// Clear the pending actions that were part of this action
 				this.pending = this.pending.slice(pending.length);
 				// Reset cache and replay any actions that were added during the action

@@ -1074,6 +1074,13 @@ export class ClusterMember implements ICluster {
 								requestedRev: pendRequest.rev,
 								latestRev
 							});
+							// Deliberately prose-only: this reason is fed to computeSigningPayload, signed,
+							// and carried as Signature.rejectReason, so adding a structured revision here
+							// would change the signed byte layout and the Signature type — every peer would
+							// have to agree on the new format or verification breaks across versions. This
+							// is NOT a StaleFailure producer, so StaleFailure.staleAt does not apply; the
+							// coordinator's own local re-read (CoordinatorRepo.classifyStaleRejection)
+							// supplies that number when it can confirm the revision itself.
 							return { valid: false, reason: `stale revision: block ${blockId} at rev ${latestRev}, requested rev ${pendRequest.rev}` };
 						}
 					}

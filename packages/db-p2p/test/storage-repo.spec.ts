@@ -2,7 +2,7 @@ import { expect } from 'chai';
 import { StorageRepo, commitLatchKey, MISSING_BASE_REVISION_REASON } from '../src/storage/storage-repo.js';
 import { BlockStorage } from '../src/storage/block-storage.js';
 import { MemoryRawStorage } from '../src/storage/memory-storage.js';
-import type { BlockId, ActionId, ActionRev, ActionTransforms, CommitResult, PendRequest, Transforms, IBlock, BlockHeader, CollectionChangeEvent } from '@optimystic/db-core';
+import type { BlockId, ActionId, ActionRev, ActionTransforms, CommitResult, PendRequest, StaleFailure, Transforms, IBlock, BlockHeader, CollectionChangeEvent } from '@optimystic/db-core';
 import { isBlockChangeNotifier, Latches } from '@optimystic/db-core';
 import { delay } from '@optimystic/db-core/test';
 
@@ -159,6 +159,53 @@ describe('StorageRepo', () => {
 			if (!result.success && 'missing' in result) {
 				expect(result.missing!.length).to.be.greaterThan(0);
 			}
+		});
+
+		// `StaleFailure.staleAt` reports the revision this node actually holds, so a losing writer
+		// gets the number as data instead of having to parse it out of the reason prose.
+		it('reports staleAt with the revision this node holds when the requested rev is taken', async () => {
+			const blockStorage = new BlockStorage('block-1' as BlockId, rawStorage);
+			const initialBlock = makeBlock('block-1');
+			await blockStorage.savePendingTransaction('initial-action' as ActionId, { insert: initialBlock });
+			await blockStorage.saveMaterializedBlock('initial-action' as ActionId, initialBlock);
+			await blockStorage.saveRevision(1, 'initial-action' as ActionId);
+			await blockStorage.promotePendingTransaction('initial-action' as ActionId);
+			await blockStorage.setLatest({ actionId: 'initial-action' as ActionId, rev: 1 });
+
+			const result = await repo.pend({
+				actionId: 'new-action' as ActionId,
+				rev: 0,
+				transforms: makeUpdateTransforms('block-1' as BlockId, [['items', 0, 0, ['new']]]),
+				policy: 'c'
+			});
+
+			expect(result.success).to.equal(false);
+			// The held revision (1), not the requested one (0).
+			expect((result as StaleFailure).staleAt).to.deep.equal({ blockId: 'block-1', rev: 1 });
+		});
+
+		it('reports NO staleAt for an insert collision on a request that carries no rev', async () => {
+			// Same code branch, different meaning: with `rev` undefined the comparison degrades to
+			// `latest.rev >= 0`, which matches any existing block. That is an insert collision, not a
+			// revision race, so the held revision would be a number answering no question.
+			const blockStorage = new BlockStorage('block-1' as BlockId, rawStorage);
+			const initialBlock = makeBlock('block-1');
+			await blockStorage.savePendingTransaction('initial-action' as ActionId, { insert: initialBlock });
+			await blockStorage.saveMaterializedBlock('initial-action' as ActionId, initialBlock);
+			await blockStorage.saveRevision(1, 'initial-action' as ActionId);
+			await blockStorage.promotePendingTransaction('initial-action' as ActionId);
+			await blockStorage.setLatest({ actionId: 'initial-action' as ActionId, rev: 1 });
+
+			const result = await repo.pend({
+				actionId: 'colliding-insert' as ActionId,
+				transforms: makeInsertTransforms('block-1' as BlockId, makeBlock('block-1')),
+				policy: 'c'
+			});
+
+			expect(result.success, 'the insert still collides and is still rejected').to.equal(false);
+			expect((result as StaleFailure).missing?.length ?? 0).to.be.greaterThan(0);
+			expect((result as StaleFailure).staleAt, 'an insert collision is not a revision race').to.equal(undefined);
+			expect(Object.prototype.hasOwnProperty.call(result, 'staleAt')).to.equal(false);
 		});
 
 		it('handles multiple blocks in single pend', async () => {
@@ -1289,6 +1336,58 @@ describe('StorageRepo', () => {
 			expect(missing[0]!.rev).to.equal(1);
 			// inserts must contain block-1 — pre-fix this was empty.
 			expect(Object.keys(missing[0]!.transforms.inserts ?? {})).to.deep.equal(['block-1']);
+		});
+
+		it('reports staleAt for a commit that lost to a newer revision', async () => {
+			// CommitResult is a StaleFailure too, and TransactorSource.transact hands it straight back
+			// to Collection — so the commit-side loss deserves the same number as the pend-side one.
+			const block = makeBlock('block-1');
+			await repo.pend({ actionId: 'a1' as ActionId, transforms: makeInsertTransforms('block-1' as BlockId, block), policy: 'c' });
+			await repo.commit({ actionId: 'a1' as ActionId, blockIds: ['block-1' as BlockId], tailId: 'block-1' as BlockId, rev: 1 });
+
+			await repo.pend({ actionId: 'a2' as ActionId, transforms: makeUpdateTransforms('block-1' as BlockId, [['items', 0, 0, ['x']]]), policy: 'c' });
+			const result = await repo.commit({ actionId: 'a2' as ActionId, blockIds: ['block-1' as BlockId], tailId: 'block-1' as BlockId, rev: 1 });
+
+			expect(result.success).to.equal(false);
+			expect((result as StaleFailure).staleAt).to.deep.equal({ blockId: 'block-1', rev: 1 });
+		});
+
+		it('does not report staleAt on an idempotent commit retry', async () => {
+			// Same (actionId, rev) already landed here: a rollforward no-op, not a lost race. It must
+			// neither fail nor seed a staleAt that a later block's real rejection would then carry.
+			const block = makeBlock('block-1');
+			await repo.pend({ actionId: 'a1' as ActionId, transforms: makeInsertTransforms('block-1' as BlockId, block), policy: 'c' });
+			await repo.commit({ actionId: 'a1' as ActionId, blockIds: ['block-1' as BlockId], tailId: 'block-1' as BlockId, rev: 1 });
+
+			const retry = await repo.commit({ actionId: 'a1' as ActionId, blockIds: ['block-1' as BlockId], tailId: 'block-1' as BlockId, rev: 1 });
+
+			expect(retry.success, 'an idempotent retry succeeds').to.equal(true);
+			expect((retry as { staleAt?: unknown }).staleAt).to.equal(undefined);
+		});
+
+		it('an idempotent block does not lend its revision to a sibling block\'s real loss', async () => {
+			// Mixed batch: block-1 is the idempotent no-op (skipped), block-2 genuinely lost to a
+			// newer revision. The reported staleAt must name block-2 — the `continue` above must not
+			// have seeded it from block-1.
+			await repo.pend({
+				actionId: 'a1' as ActionId,
+				// block-2 carries an `items` array so the update below actually applies (the operation
+				// splices into it); without it the rev-2 commit fails and block-2 never advances.
+				transforms: { inserts: { 'block-1': makeBlock('block-1'), 'block-2': makeBlock('block-2', { items: [] }) }, updates: {}, deletes: [] },
+				policy: 'c'
+			});
+			await repo.commit({ actionId: 'a1' as ActionId, blockIds: ['block-1' as BlockId, 'block-2' as BlockId], tailId: 'block-1' as BlockId, rev: 1 });
+
+			// Advance block-2 alone to rev 2, so it is strictly ahead of the rev-1 retry below.
+			await repo.pend({ actionId: 'a2' as ActionId, transforms: makeUpdateTransforms('block-2' as BlockId, [['items', 0, 0, ['x']]]), policy: 'c' });
+			const advanced = await repo.commit({ actionId: 'a2' as ActionId, blockIds: ['block-2' as BlockId], tailId: 'block-2' as BlockId, rev: 2 });
+			expect(advanced.success, 'setup: block-2 must actually reach rev 2').to.equal(true);
+
+			// Re-commit a1 at rev 1: block-1 is idempotent (same actionId + rev), block-2 is at rev 2.
+			const result = await repo.commit({ actionId: 'a1' as ActionId, blockIds: ['block-1' as BlockId, 'block-2' as BlockId], tailId: 'block-1' as BlockId, rev: 1 });
+
+			expect(result.success).to.equal(false);
+			expect((result as StaleFailure).staleAt).to.deep.equal({ blockId: 'block-2', rev: 2 });
 		});
 
 		it('multi-block stale conflict returns transforms for all missed blocks', async () => {

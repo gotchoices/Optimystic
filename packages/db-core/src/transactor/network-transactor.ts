@@ -555,10 +555,20 @@ export class NetworkTransactor implements ITransactor, IBlockChangeNotifier {
 				// (then `every` is both safe and tighter), or if mixed-outcome pends show up as wasted
 				// retry latency in practice.
 				const conflict = stale.some(b => isConflictFailure(b.request!.response! as StaleFailure));
+				// Deliberately NOT first-wins like `reason` above: every block in this pend commits under
+				// one collection revision, so the reported numbers are comparable and the LARGEST is the
+				// binding constraint — the client's next request has to clear every holder, not just the
+				// first one that answered. Ties keep the earlier batch's value.
+				// NOTE: comparability rests on one pend covering one collection (Collection.sync pends its
+				// own collection; the multi-collection coordinator calls pend once per collection). If a
+				// pend is ever allowed to span collections, `rev` values from different revision counters
+				// would be compared here and the max would be meaningless — report per-collection then.
+				const staleAt = highestStaleAt(stale.map(b => (b.request!.response! as StaleFailure).staleAt));
 				return {
 					success: false,
 					conflict,
 					...(reason === undefined ? {} : { reason }),
+					...(staleAt === undefined ? {} : { staleAt }),
 					missing: distinctBlockActionTransforms(stale.flatMap(b => (b.request!.response! as StaleFailure).missing).filter((x): x is ActionTransforms => x !== undefined)),
 				};
 			}
@@ -673,10 +683,17 @@ export class NetworkTransactor implements ITransactor, IBlockChangeNotifier {
 			const stale = Array.from(allBatches(tailBatches, b => b.request?.isResponse as boolean && !b.request!.response!.success));
 			if (stale.length > 0) {
 				// NOTE: a reason-only StaleFailure (success:false, no `missing`) lands here too and
-				// returns { missing: [], success:false } — the `reason` string is dropped rather than
-				// surfaced via `throw tailError`. Fine today (failure still propagates); if reason-only
-				// commit rejections ever need their diagnostic reason, gate this branch on non-empty missing.
-				return { missing: distinctBlockActionTransforms(stale.flatMap(b => (b.request!.response! as StaleFailure).missing).filter((x): x is ActionTransforms => x !== undefined)), success: false as const };
+				// returns { missing: [], success:false } — the `reason` PROSE is still dropped rather
+				// than surfaced via `throw tailError`. `staleAt` is carried, so the one machine-readable
+				// fact in that prose (which block is at which revision) now survives; only the free-form
+				// wording is lost. If the wording itself is ever needed, gate this branch on non-empty
+				// missing rather than reinstating it unconditionally.
+				const staleAt = highestStaleAt(stale.map(b => (b.request!.response! as StaleFailure).staleAt));
+				return {
+					missing: distinctBlockActionTransforms(stale.flatMap(b => (b.request!.response! as StaleFailure).missing).filter((x): x is ActionTransforms => x !== undefined)),
+					...(staleAt === undefined ? {} : { staleAt }),
+					success: false as const
+				};
 			}
 			throw tailError;
 		}
@@ -876,6 +893,22 @@ function firstBatchError<TPayload, TResponse>(batches: CoordinatorBatch<TPayload
 
 function asError(err: unknown): Error {
 	return err instanceof Error ? err : new Error(errorMessage(err));
+}
+
+/**
+ * Picks the single {@link StaleFailure.staleAt} to report when one response is rebuilt from many
+ * per-batch ones. Highest `rev` wins; undefined entries (a batch that reported no confirmed
+ * number, or one from a peer that predates the field) contribute nothing, and an all-undefined
+ * input yields undefined so callers can omit the key rather than emit `staleAt: undefined`.
+ */
+export function highestStaleAt(candidates: (StaleFailure['staleAt'])[]): StaleFailure['staleAt'] {
+	let best: StaleFailure['staleAt'];
+	for (const candidate of candidates) {
+		if (candidate !== undefined && (best === undefined || candidate.rev > best.rev)) {
+			best = candidate;
+		}
+	}
+	return best;
 }
 
 /**

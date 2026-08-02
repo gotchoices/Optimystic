@@ -374,6 +374,10 @@ export class StorageRepo implements IRepo, IBlockChangeNotifier, IBlockReplicaSt
 		log('pend actionId=%s blockIds=%d rev=%s', request.actionId, blockIds.length, request.rev);
 		const pendings: ActionPending[] = [];
 		const missing: ActionTransforms[] = [];
+		// First block confirmed to sit at or past the requested revision — reported as
+		// StaleFailure.staleAt so a losing writer learns the number instead of parsing prose.
+		// Confirmed-local only: we read it from our own storage below.
+		let staleAt: { blockId: BlockId; rev: number } | undefined;
 
 		// Potential race condition: A concurrent commit operation could complete
 		// between the conflict checks (latest.rev, listPendingTransactions) and the
@@ -394,6 +398,13 @@ export class StorageRepo implements IRepo, IBlockChangeNotifier, IBlockReplicaSt
 			if (request.rev !== undefined || transforms.insert) {
 				const latest = await blockStorage.getLatest();
 				if (latest && latest.rev >= (request.rev ?? 0)) {
+					// Only a real revision race yields a meaningful `staleAt`. When `request.rev` is
+					// undefined this same branch fires for an insert collision (the comparison degrades
+					// to `latest.rev >= 0`, true for any existing block), and reporting that block's
+					// revision would be a number that answers a question nobody asked.
+					if (request.rev !== undefined && staleAt === undefined) {
+						staleAt = { blockId, rev: latest.rev };
+					}
 					const transforms = await asyncIteratorToArray(blockStorage.listRevisions(request.rev ?? 0, latest.rev));
 					for (const actionRev of transforms) {
 						const transform = await blockStorage.getTransaction(actionRev.actionId);
@@ -415,7 +426,8 @@ export class StorageRepo implements IRepo, IBlockChangeNotifier, IBlockReplicaSt
 			return {
 				success: false,
 				conflict: true,
-				missing
+				missing,
+				...(staleAt === undefined ? {} : { staleAt })
 			};
 		}
 
@@ -502,6 +514,9 @@ export class StorageRepo implements IRepo, IBlockChangeNotifier, IBlockReplicaSt
 			//   - toCommit: latest.rev < request.rev or no latest yet → run internalCommit.
 			const toCommit: { blockId: BlockId, storage: IBlockStorage }[] = [];
 			const missedCommits: { blockId: BlockId, transforms: ActionTransform[] }[] = [];
+			// First block confirmed lost to a newer revision — reported as StaleFailure.staleAt.
+			// The idempotent-retry `continue` below is a no-op, not a loss, so it never seeds this.
+			let staleAt: { blockId: BlockId; rev: number } | undefined;
 			for (const entry of blockStorages) {
 				const { blockId, storage } = entry;
 				const latest = await storage.getLatest();
@@ -510,6 +525,7 @@ export class StorageRepo implements IRepo, IBlockChangeNotifier, IBlockReplicaSt
 						// Idempotent no-op for this block — already committed with this exact (actionId, rev).
 						continue;
 					}
+					staleAt ??= { blockId, rev: latest.rev };
 					const transforms: ActionTransform[] = [];
 					for await (const actionRev of storage.listRevisions(request.rev, latest.rev)) {
 						const transform = await storage.getTransaction(actionRev.actionId);
@@ -532,7 +548,8 @@ export class StorageRepo implements IRepo, IBlockChangeNotifier, IBlockReplicaSt
 				log('commit:stale actionId=%s missed=%d', request.actionId, missedCommits.length);
 				return { // Return directly, locks will be released in finally
 					success: false,
-					missing: perBlockActionTransformsToPerAction(missedCommits)
+					missing: perBlockActionTransformsToPerAction(missedCommits),
+					...(staleAt === undefined ? {} : { staleAt })
 				};
 			}
 

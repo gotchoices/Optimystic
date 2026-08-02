@@ -4,7 +4,7 @@ use(chaiAsPromised)
 import { Collection, SyncRetryExhaustedError, type CollectionInitOptions } from '../src/collection/index.js'
 import { TestTransactor, FlakyCommitTransactor } from '../src/testing/test-transactor.js'
 import { waitFor } from '../src/testing/async-wait.js'
-import type { Action, ActionHandler, BlockStore, IBlock, ITransactor, BlockGets, GetBlockResults, ActionBlocks, BlockActionStatus, PendRequest, PendResult, CommitRequest, CommitResult } from '../src/index.js'
+import type { Action, ActionHandler, BlockStore, IBlock, ITransactor, BlockGets, GetBlockResults, ActionBlocks, BlockActionStatus, PendRequest, PendResult, CommitRequest, CommitResult, StaleFailure } from '../src/index.js'
 import { BlockUnavailableError } from '../src/index.js'
 
 interface TestAction {
@@ -899,6 +899,86 @@ describe('Collection', () => {
 
       // Latch was released by sync()'s finally — a subsequent latched op must not hang.
       await collection.update()
+    })
+
+    // `staleAt` is the responder's own confirmed revision, carried as data rather than only inside
+    // the reject prose. A stuck writer that burns its whole budget should be told the number it is
+    // up against; a responder that reports none must leave today's message byte-identical.
+    describe('staleAt on exhaustion', () => {
+      /** Always fails commit with the caller-supplied StaleFailure. Deliberately local rather than
+       *  a change to FlakyCommitTransactor: the shared harness must keep never setting `staleAt`. */
+      class StaleAtCommitTransactor implements ITransactor {
+        commitAttempts = 0
+        constructor(private readonly inner: TestTransactor, private readonly failure: StaleFailure) {}
+        get(b: BlockGets) { return this.inner.get(b) }
+        getStatus(a: ActionBlocks[]) { return this.inner.getStatus(a) }
+        pend(r: PendRequest) { return this.inner.pend(r) }
+        cancel(a: ActionBlocks) { return this.inner.cancel(a) }
+        async commit(_request: CommitRequest): Promise<CommitResult> {
+          this.commitAttempts++
+          return this.failure
+        }
+      }
+
+      const exhaust = async (failure: StaleFailure) => {
+        const transactorUnderTest = new StaleAtCommitTransactor(new TestTransactor(), failure)
+        const collection = await Collection.createOrOpen<TestAction>(transactorUnderTest, collectionId, initOptions)
+        await collection.act({ type: 'set', data: { value: 'never-commits', timestamp: 1 } })
+        const syncPromise = collection.sync({ maxAttempts: 3, baseBackoffMs: 1, maxBackoffMs: 5 })
+        syncPromise.catch(() => { /* asserted by the caller */ })
+        return await syncPromise.catch(e => e) as SyncRetryExhaustedError
+      }
+
+      it('surfaces the reported revision on the error and names it in the message', async () => {
+        const err = await exhaust({
+          success: false,
+          conflict: true,
+          reason: 'stale revision: block hot-block at rev 42, requested rev 41',
+          staleAt: { blockId: 'hot-block', rev: 42 }
+        })
+
+        expect(err).to.be.instanceOf(SyncRetryExhaustedError)
+        expect(err.staleAt).to.deep.equal({ blockId: 'hot-block', rev: 42 })
+        expect(err.message).to.contain('last seen block hot-block at rev 42')
+        // The prefix every existing assertion reads is untouched by the appended clause.
+        expect(err.message).to.contain(`sync for collection ${collectionId} exhausted 3 retries`)
+      })
+
+      it('produces today\'s message verbatim when no responder reported a revision', async () => {
+        const err = await exhaust({ success: false, conflict: true, reason: 'always stale' })
+
+        expect(err).to.be.instanceOf(SyncRetryExhaustedError)
+        expect(err.staleAt).to.equal(undefined)
+        expect(err.message).to.equal(`sync for collection ${collectionId} exhausted 3 retries: always stale`)
+      })
+
+      it('keeps the last reported revision when a later failure reports none', async () => {
+        // `lastStaleAt` follows `lastReason`'s rule: a failure that defines it overwrites, one that
+        // does not leaves the previous value standing — so the number survives to the throw.
+        const transactorUnderTest = new (class implements ITransactor {
+          attempts = 0
+          constructor(readonly inner = new TestTransactor()) {}
+          get(b: BlockGets) { return this.inner.get(b) }
+          getStatus(a: ActionBlocks[]) { return this.inner.getStatus(a) }
+          pend(r: PendRequest) { return this.inner.pend(r) }
+          cancel(a: ActionBlocks) { return this.inner.cancel(a) }
+          async commit(_request: CommitRequest): Promise<CommitResult> {
+            this.attempts++
+            return this.attempts === 1
+              ? { success: false, conflict: true, reason: 'first', staleAt: { blockId: 'hot-block', rev: 7 } }
+              : { success: false, conflict: true, reason: 'later, unconfirmed' }
+          }
+        })()
+
+        const collection = await Collection.createOrOpen<TestAction>(transactorUnderTest, collectionId, initOptions)
+        await collection.act({ type: 'set', data: { value: 'never-commits', timestamp: 1 } })
+        const syncPromise = collection.sync({ maxAttempts: 3, baseBackoffMs: 1, maxBackoffMs: 5 })
+        syncPromise.catch(() => { /* asserted below */ })
+        const err = await syncPromise.catch(e => e) as SyncRetryExhaustedError
+
+        expect(err.staleAt).to.deep.equal({ blockId: 'hot-block', rev: 7 })
+        expect(err.lastReason).to.equal('later, unconfirmed')
+      })
     })
 
     it('should reject promptly with an AbortError when the signal aborts mid-retry', async () => {

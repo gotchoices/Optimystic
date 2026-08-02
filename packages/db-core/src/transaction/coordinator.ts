@@ -29,8 +29,17 @@ const DefaultMaxBackoffMs = 5000;
  * the flag off the rejection.
  */
 class PendRejectedError extends Error {
-	constructor(collectionId: CollectionId, readonly conflict: boolean, reason?: string) {
-		super(`Pend failed for collection ${collectionId}: ${reason ?? (conflict ? 'stale conflict' : 'rejected')}`);
+	constructor(
+		collectionId: CollectionId,
+		readonly conflict: boolean,
+		reason?: string,
+		/** Confirmed revision the responder holds, from `StaleFailure.staleAt`. Folded into the
+		 * message because pendPhase collapses this error to its `.message` string, which is the only
+		 * form that reaches an embedder through the transaction result's `error` field. */
+		staleAt?: { blockId: BlockId; rev: number },
+	) {
+		super(`Pend failed for collection ${collectionId}: ${reason ?? (conflict ? 'stale conflict' : 'rejected')}`
+			+ (staleAt ? ` (block ${staleAt.blockId} at rev ${staleAt.rev})` : ''));
 		this.name = 'PendRejectedError';
 	}
 }
@@ -935,7 +944,7 @@ export class TransactionCoordinator {
 			// `conflict`, and only where no producer set it do we fall back to inferring from
 			// `missing`/`pending`. Either way a conflict is an optimistic-concurrency loss, clearable
 			// by a re-read; anything else is a hard rejection (storage/policy) that re-driving won't fix.
-			throw new PendRejectedError(collectionId, isConflictFailure(pendResult), pendResult.reason);
+			throw new PendRejectedError(collectionId, isConflictFailure(pendResult), pendResult.reason, pendResult.staleAt);
 		}
 
 		return { collectionId, blockIds: pendResult.blockIds };
