@@ -3,10 +3,11 @@
  *          cluster-read-consult-cannot-report-unreachable
  *
  * `CoordinatorRepo.get` answers "absent" authoritatively only because it consults the
- * cohort for any block that is missing locally. When that consult THROWS, or runs while
- * part of the cohort is SILENT (a per-peer consult that rejects or times out) and the
- * block stays missing, the local "absent" is an answer the coordinator just failed to
- * confirm — these specs pin that such an entry is flagged
+ * cohort for any block that is missing locally. That consult can come back INCONCLUSIVE
+ * three ways — it THROWS, it runs while part of the cohort is SILENT (a per-peer consult
+ * that rejects or times out), or it corroborates a revision this node then fails to
+ * acquire — and in each the local "absent" is an answer the coordinator just failed to
+ * confirm. These specs pin that such an entry is flagged
  * `unavailable: 'peers-unreachable'` instead of posing as an authoritative absent
  * (which NetworkTransactor deliberately never retries).
  *
@@ -378,6 +379,31 @@ describe('CoordinatorRepo unavailable vs absent', () => {
 
 			expect(result[blockId]!.state).to.deep.equal({});
 			expect('unavailable' in result[blockId]!).to.equal(false);
+		});
+	});
+
+	describe('corroborated but not restored', () => {
+		it('flags a locally-missing block peers-unreachable when the cohort corroborates a revision this node cannot acquire', async () => {
+			const localPeer = await makePeerId();
+			const holderA = await makePeerId();
+			const holderB = await makePeerId();
+			const cluster = makeClusterPeers([localPeer, holderA, holderB]);
+
+			// The whole cohort answers — nobody is silent — and two peers corroborate rev 2, so
+			// the reader has just been TOLD the block exists. Convergence then fails (no
+			// acquisition callback wired, promotion has nothing local to promote), leaving the
+			// block missing. Reporting that as an authoritative absent would licence
+			// `createOrOpen` to build a rival empty collection over data that demonstrably exists.
+			const callback: ClusterLatestCallback = async (peerId) =>
+				peerId.equals(localPeer) ? undefined : { actionId: 'remote-action', rev: 2 };
+
+			const { repo: storageRepo } = makeAbsentStorageRepo();
+			const repo = buildRepo(makeKeyNetwork(cluster), storageRepo, localPeer, callback);
+
+			const result = await repo.get({ blockIds: [blockId] });
+
+			expect(result[blockId]?.block, 'nothing was acquired').to.equal(undefined);
+			expect(result[blockId]?.unavailable).to.equal('peers-unreachable');
 		});
 	});
 });

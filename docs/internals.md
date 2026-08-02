@@ -379,11 +379,17 @@ saveMaterializedBlock(block): store(structuredClone(block));
   records proving it exists — the missing-base promotion refusal above, or a `getBlock()` throw
   on truncated history / a failed restore (caught **per block**, so one broken block no longer
   fails its whole batch); `CoordinatorRepo.get` flags `'peers-unreachable'` when a locally-missing
-  block's cohort consult *throws* (a consult that runs and corroborates nothing stays an
-  authoritative absent — that is the healthy cohort's answer to the routine new-collection probe,
-  and the `ClusterLatestCallback` contract cannot tell "peer holds nothing" from a per-peer
-  timeout without counting responders). A merely-stale block with a failed consult keeps its real
-  local answer, unflagged; so do `skipClusterFetch` sync reads. Consumers: `NetworkTransactor.get`
+  block's cohort consult comes back **inconclusive**: it throws, a cohort peer stays silent, or a
+  revision is corroborated that this node then fails to acquire. A consult where the whole cohort
+  *answers* and corroborates nothing stays an authoritative absent — that is the healthy cohort's
+  answer to the routine new-collection probe, and the one-round-trip path `createOrOpen` depends
+  on. Silence is distinguishable from "I hold nothing" because `ClusterLatestCallback` is a
+  three-way contract: an `ActionRev` is a claim, a resolved `undefined` is the peer answering that
+  it holds nothing, and a **rejection** is silence — so implementations must let transport errors
+  propagate, and the coordinator deadlines each per-peer query (rejecting, not resolving, on
+  expiry) so a slow peer counts as silent too. One silent peer flags the whole consult, fail-closed:
+  it could be the sole holder. A merely-stale block keeps its real local answer,
+  unflagged, whatever the consult did; so do `skipClusterFetch` sync reads. Consumers: `NetworkTransactor.get`
   treats a flagged entry as *not* answered — it earns the second-chance retry an authoritative
   absent deliberately does not — and merges per block by the ranking **has a block > authoritative
   absent > unavailable**. `TransactorSource.tryGet` converts a surviving blockless flagged entry
