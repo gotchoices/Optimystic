@@ -1945,7 +1945,16 @@ Self-coordination is dangerous because it can lead to:
 
 ### Self-Coordination Guard (Design)
 
-We need strict criteria before allowing self-coordination. The principle: **If we've ever seen a larger network, assume our connectivity is the problem, not the network shrinking.**
+We need strict criteria before *preferring* self-coordination. The principle: **If we've ever seen a larger network, assume our connectivity is the problem, not the network shrinking.**
+
+But a refusal is not free, and not every refusal is backed by evidence. The guard therefore produces two grades of "no":
+
+- **Hard** — there is a positive reason to refuse: an operator switched self-coordination off, or FRET reports a partition and the caller wants to *write*. The lookup fails with `SELF_COORDINATION_BLOCKED`.
+- **Deferrable** — self is simply not the *preferred* coordinator, but nothing says serving from our own replica is unsafe. Selection keeps looking for a better peer; if none is found, the last-resort tier returns self and logs a degraded-fallback warning.
+
+`grace-period-not-elapsed` is deferrable for reads *and* writes because it is a clock, not evidence: the same node, with the same FRET table and the same zero connections, is allowed to self-coordinate the moment `gracePeriodMs` passes. Failing the caller only postpones the isolated write by up to the grace period — it does not prevent it, because a self-only cohort commits under `allowClusterDownsize` (the default). Worse, the default grace period (30s) equals the default transaction budget (30s), so "wait it out" is not available either; a hard refusal simply converts a fast failure into a total one.
+
+Reads are never denied their own replica except by the explicit `disabled` switch. A read coordinates no mutation, and the layers below already report how good the answer is — `CoordinatorRepo.fetchBlockFromCluster` short-circuits a self-only cohort as *conclusive*, and a cohort it cannot reach comes back flagged `unavailable`. Raising `SELF_COORDINATION_BLOCKED` throws that reporting away and reads to the caller as an infrastructure fault.
 
 #### Decision Criteria
 
@@ -1957,11 +1966,19 @@ interface SelfCoordinationGuard {
   lastNetworkEstimate: number;     // Most recent network size estimate
 
   // Thresholds
-  isolationGracePeriod: number;    // Time before allowing self-coord (e.g., 30s)
+  isolationGracePeriod: number;    // Time before PREFERRING self-coord (e.g., 30s)
   networkShrinkageThreshold: 0.5;  // >50% shrinkage is suspicious
 }
 
-function shouldAllowSelfCoordination(guard: SelfCoordinationGuard): Decision {
+// `intent` is what the caller means to do with the coordinator ('read' | 'write'),
+// defaulting to 'write' — the conservative reading — when the caller doesn't say.
+// `deferrable` on a denial means "not preferred", not "unsafe": see the table below.
+function shouldAllowSelfCoordination(guard, intent = 'write'): Decision {
+  // Explicit operator switch — absolute for both intents
+  if (!config.allowSelfCoordination) {
+    return { allow: false, reason: 'disabled', deferrable: false };
+  }
+
   // Case 1: New/bootstrap node (never seen larger network)
   if (guard.highWaterMark <= 1) {
     return { allow: true, reason: 'bootstrap-node' };
@@ -1969,19 +1986,19 @@ function shouldAllowSelfCoordination(guard: SelfCoordinationGuard): Decision {
 
   // Case 2: FRET detects partition
   if (fret.detectPartition()) {
-    return { allow: false, reason: 'partition-detected' };
+    return { allow: false, reason: 'partition-detected', deferrable: intent === 'read' };
   }
 
   // Case 3: Suspicious network shrinkage (>50% drop)
   const shrinkage = 1 - (guard.lastNetworkEstimate / guard.highWaterMark);
   if (shrinkage > guard.networkShrinkageThreshold) {
-    return { allow: false, reason: 'suspicious-shrinkage' };
+    return { allow: false, reason: 'suspicious-shrinkage', deferrable: intent === 'read' };
   }
 
-  // Case 4: Recently connected (grace period not elapsed)
+  // Case 4: Recently connected (grace period not elapsed) — a clock, not evidence
   const timeSinceConnection = Date.now() - guard.lastConnectedTime;
   if (timeSinceConnection < guard.isolationGracePeriod) {
-    return { allow: false, reason: 'grace-period-not-elapsed' };
+    return { allow: false, reason: 'grace-period-not-elapsed', deferrable: true };
   }
 
   // Case 5: Extended isolation with gradual shrinkage
@@ -1989,6 +2006,15 @@ function shouldAllowSelfCoordination(guard: SelfCoordinationGuard): Decision {
   return { allow: true, reason: 'extended-isolation', warn: true };
 }
 ```
+
+Hardness by reason and intent:
+
+| reason | write | read |
+| --- | --- | --- |
+| `disabled` | hard | hard |
+| `grace-period-not-elapsed` | deferrable | deferrable |
+| `partition-detected` | hard | deferrable |
+| `suspicious-shrinkage` | hard | deferrable |
 
 #### Integration with FRET
 
@@ -2015,16 +2041,26 @@ FRET already provides the necessary observability:
    this.lastConnectedTime = Date.now();
    ```
 
-3. **Guard self-coordination**:
+3. **Guard self-coordination** — at two tiers, consuming the hardness classification:
    ```typescript
-   // In findCoordinator(), before returning self
-   const decision = this.shouldAllowSelfCoordination();
+   // FRET tier: self is a neighbour of the key. Admitted when allowed, or on a
+   // deferrable denial for a READ (so an isolated read resolves at once instead of
+   // paying the retry loop first). A write keeps dropping self here, so a peer that
+   // lands during the retry window still wins the key.
+   const decision = this.shouldAllowSelfCoordination(intent);
+   const admit = decision.allow || (intent === 'read' && decision.deferrable === true);
+
+   // Last-resort tier: every better tier has already come up empty.
+   const decision = this.shouldAllowSelfCoordination(intent);
+   if (!decision.allow && decision.deferrable !== true) {
+     throw new FindCoordinatorError('SELF_COORDINATION_BLOCKED', decision.reason);
+   }
    if (!decision.allow) {
-     throw new Error(`Self-coordination blocked: ${decision.reason}`);
+     this.log('findCoordinator:self-selected-degraded reason=%s intent=%s', decision.reason, intent);
+   } else if (decision.warn) {
+     this.log('Self-coordination allowed with caution: %s', decision.reason);
    }
-   if (decision.warn) {
-     this.log.warn('Self-coordination allowed with caution: %s', decision.reason);
-   }
+   return self;
    ```
 
 4. **Configurable thresholds**:
@@ -2038,16 +2074,15 @@ FRET already provides the necessary observability:
 
 ### Read vs Write Considerations
 
-Self-coordination risks differ by operation:
+Self-coordination risks differ by operation, and `findCoordinator` is told which one it is serving via `FindCoordinatorOptions.intent` (`'read' | 'write'`, defaulting to `'write'`). `NetworkTransactor.get()` is the only path that passes `'read'`; `pend`, `commit`, `cancel` and coordinator consolidation all stay on the write default.
 
-| Operation | Risk | Recommendation |
-|-----------|------|----------------|
-| **Read** | Stale data | Allow with warning; client can retry |
-| **Write (new block)** | Orphaned data | Block unless bootstrap node |
-| **Write (existing block)** | Fork creation | Block; require quorum confirmation |
-| **Collection header lookup** | Missing data | Retry with backoff; block self-coord |
+| Operation | Risk | Behavior |
+|-----------|------|----------|
+| **Read** | Stale data | Never denied its own replica (except the `disabled` switch). Self is admitted at the FRET tier on a deferrable denial, so an isolated read resolves at once; the reply carries the cluster's own conclusive/`unavailable` verdict. |
+| **Write (new or existing block)** | Orphaned data / fork creation | Self stays dropped for the whole retry window so an arriving peer wins the key. Hard denial → `SELF_COORDINATION_BLOCKED`. Deferrable denial → self with a degraded-fallback warning. |
+| **Collection header lookup** | Missing data | A read; same as the read row. |
 
-The current retry logic (3 attempts, 500ms delay) addresses the common case of temporary connection dropout. The self-coordination guard addresses the rarer case of genuine network partitions.
+The retry logic (3 attempts, 500ms delay, so ~1s of wall clock — the last attempt does not sleep) addresses the common case of temporary connection dropout. Deliberately it is *not* extended to wait out the grace period: the default grace period (30s) equals the default transaction budget (30s), so waiting would consume the entire budget and time the caller out anyway. The self-coordination guard addresses the rarer case of genuine network partitions — and only on writes, where a partition is an argument against coordinating alone.
 
 ### Supercluster Nominee Reasonableness (Future)
 
@@ -2066,6 +2101,7 @@ The self-coordination guard prevents *most* partition-isolated writes, but canno
 
 - **Bootstrap nodes**: New nodes starting during partition may legitimately create blocks
 - **Extended isolation**: After grace period, we allow writes with warning
+- **Inside the grace period**: a write whose only denial is `grace-period-not-elapsed` degrades to self after the retry window rather than failing. This is not a new exposure — the same write commits unchanged once the grace period elapses — and the real control over whether a self-only cohort may commit at all is `allowClusterDownsize`, not this guard.
 - **Mid-transaction partitions**: A partition during PEND phase may leave orphaned state
 
 When a partition heals, we need mechanisms to detect divergence and reconcile.

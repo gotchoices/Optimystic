@@ -312,6 +312,50 @@ describe('Libp2pKeyPeerNetwork', () => {
 			const decision = network.shouldAllowSelfCoordination();
 			// Should not allow because HWM>1, sessions<3, and grace period applies
 			expect(decision.allow).to.be.false;
+			// ...but the refusal is a clock, not evidence: the same node with the same
+			// information self-coordinates once gracePeriodMs elapses, so the denial is
+			// DEFERRABLE and findCoordinator degrades to self rather than failing the caller.
+			expect(decision.reason).to.equal('grace-period-not-elapsed');
+			expect(decision.deferrable, 'a grace-period denial is deferrable for a write too').to.be.true;
+		});
+
+		it('marks a partition denial hard for a write and deferrable for a read', async () => {
+			const persistence = new MemoryPersistence({
+				version: 1,
+				networkHighWaterMark: 10,
+				lastConnectedTimestamp: Date.now() - 10 * 60_000, // grace long elapsed
+				consecutiveIsolatedSessions: 0
+			});
+			const fret = {
+				getNeighbors: () => [],
+				getNetworkSizeEstimate: () => ({ size_estimate: 10, confidence: 0.5 }),
+				detectPartition: () => true,
+				exportTable: () => undefined
+			};
+			const libp2p = createMockLibp2p(selfPeerId, { fret });
+			const network = new Libp2pKeyPeerNetwork(libp2p, 16, undefined, 'forming', persistence);
+			await network.initFromPersistedState();
+
+			const write = network.shouldAllowSelfCoordination('write');
+			expect(write.allow).to.be.false;
+			expect(write.reason).to.equal('partition-detected');
+			expect(write.deferrable, 'a partition is positive evidence against an isolated WRITE').to.be.false;
+
+			const read = network.shouldAllowSelfCoordination('read');
+			expect(read.allow).to.be.false;
+			expect(read.reason).to.equal('partition-detected');
+			expect(read.deferrable, 'a partition says nothing about serving a READ from our own replica').to.be.true;
+		});
+
+		it('marks a disabled denial hard for BOTH intents', () => {
+			const libp2p = createMockLibp2p(selfPeerId);
+			const network = new Libp2pKeyPeerNetwork(libp2p, 16, { allowSelfCoordination: false }, 'forming');
+			for (const intent of ['read', 'write'] as const) {
+				const decision = network.shouldAllowSelfCoordination(intent);
+				expect(decision.allow, `disabled blocks ${intent}`).to.be.false;
+				expect(decision.reason).to.equal('disabled');
+				expect(decision.deferrable, `an explicit operator switch is never deferrable (${intent})`).to.be.false;
+			}
 		});
 	});
 
@@ -446,12 +490,13 @@ describe('Libp2pKeyPeerNetwork', () => {
 			connections: Connection[];
 			neighbors: string[];
 			sizeEstimate?: number;
+			partitioned?: boolean;
 		}) {
 			const state = { connections: options.connections, neighbors: options.neighbors };
 			const fret = {
 				getNeighbors: () => state.neighbors,
 				getNetworkSizeEstimate: () => ({ size_estimate: options.sizeEstimate ?? 1, confidence: 0.5 }),
-				detectPartition: () => false,
+				detectPartition: () => options.partitioned ?? false,
 				exportTable: () => undefined,
 				assembleCohort: () => []
 			};
@@ -566,26 +611,32 @@ describe('Libp2pKeyPeerNetwork', () => {
 		});
 
 		it('honours the self-coordination guard on the FRET path (self is a neighbor of the key)', async () => {
-			// Seen a 5-node network before, zero connections now, disconnected moments ago →
-			// shouldAllowSelfCoordination() refuses with 'grace-period-not-elapsed'. Self IS a
-			// FRET neighbor of this key, which at HEAD let the FRET tier return self and skip
-			// the guard entirely.
+			// Self IS a FRET neighbor of this key, which at one point let the FRET tier return
+			// self and skip the guard entirely. The denial used here must be a HARD one —
+			// FRET reports a partition, and this is a write — because a deferrable denial (e.g.
+			// the grace period) is exactly the case that now degrades to self instead of
+			// throwing. What is pinned here is that self cannot slip past a hard guard verdict
+			// merely by sitting in the key's FRET neighbourhood.
 			const persistence = new MemoryPersistence({
 				version: 1,
 				networkHighWaterMark: 5,
-				lastConnectedTimestamp: Date.now(),
+				lastConnectedTimestamp: Date.now() - 10 * 60_000, // grace long elapsed: the partition is the only denial
 				consecutiveIsolatedSessions: 0
 			});
 			const { libp2p } = createMutableMock({
 				connections: [],
 				neighbors: [selfPeerId.toString()],
-				sizeEstimate: 5
+				sizeEstimate: 5,
+				partitioned: true
 			});
 			const network = new Libp2pKeyPeerNetwork(libp2p, 16, undefined, 'forming', persistence);
 			await network.initFromPersistedState();
 
-			// Precondition: the guard really does refuse for this node.
-			expect(network.shouldAllowSelfCoordination().allow).to.be.false;
+			// Precondition: the guard really does refuse for this node, and refuses HARD.
+			const decision = network.shouldAllowSelfCoordination();
+			expect(decision.allow).to.be.false;
+			expect(decision.reason).to.equal('partition-detected');
+			expect(decision.deferrable).to.be.false;
 
 			let caught: unknown;
 			try {
@@ -636,6 +687,158 @@ describe('Libp2pKeyPeerNetwork', () => {
 				expect((await network.findCoordinator(key)).toString()).to.equal(selfPeerId.toString());
 			}
 			expect(Date.now() - t0, 'three solo lookups stay well under one 500ms retry delay').to.be.lessThan(400);
+		});
+	});
+
+	// --- Isolated node degrades to its own replica --------------------------------
+	// A node that has just lost its last connection is inside the 30s grace period, so the
+	// self-coordination guard refuses. That refusal used to fail the whole lookup with
+	// SELF_COORDINATION_BLOCKED — which bought no safety, because the SAME node with the SAME
+	// information self-coordinates freely once the clock passes gracePeriodMs (and a self-only
+	// cohort commits under allowClusterDownsize, the default). A grace-period denial is now
+	// DEFERRABLE: the last-resort tier degrades to self with a warning instead of throwing,
+	// and a READ skips the retry loop entirely since answering from our own replica is what an
+	// isolated node must accept anyway. Only a HARD denial — an explicit `disabled` switch, or
+	// a detected partition on a WRITE — still fails the caller.
+	describe('findCoordinator() — isolated node degrades to its own replica', () => {
+		function connTo(peerId: PeerId): Connection {
+			return {
+				remotePeer: peerId,
+				status: 'open',
+				remoteAddr: { toString: () => `/ip4/10.0.0.1/tcp/4001/p2p/${peerId.toString()}` }
+			} as unknown as Connection;
+		}
+
+		/**
+		 * The reproduced scenario, verbatim: this node has seen a 10-peer network, has ZERO
+		 * connections, lost its last one 2.3s ago (well inside the 30s grace period), and FRET
+		 * reports no shrinkage, no partition, and self as the key's only neighbour. Nothing here
+		 * is evidence of anything — only a clock that has not run out.
+		 */
+		async function justDisconnectedNode(options?: { partitioned?: boolean }) {
+			const persistence = new MemoryPersistence({
+				version: 1,
+				networkHighWaterMark: 10,
+				lastConnectedTimestamp: Date.now() - 2_300,
+				consecutiveIsolatedSessions: 0
+			});
+			const state = { connections: [] as Connection[], neighbors: [selfPeerId.toString()] };
+			const fret = {
+				getNeighbors: () => state.neighbors,
+				getNetworkSizeEstimate: () => ({ size_estimate: 10, confidence: 0.5 }),
+				detectPartition: () => options?.partitioned ?? false,
+				exportTable: () => undefined,
+				assembleCohort: () => []
+			};
+			const libp2p = {
+				peerId: selfPeerId,
+				getConnections: () => state.connections,
+				getMultiaddrs: () => [],
+				addEventListener: () => {},
+				removeEventListener: () => {},
+				services: { fret }
+			} as unknown as Libp2p;
+			const network = new Libp2pKeyPeerNetwork(libp2p, 16, undefined, 'forming', persistence);
+			await network.initFromPersistedState();
+			return { network, state };
+		}
+
+		const KEY = new TextEncoder().encode('isolated-node-key');
+
+		it('serves a READ from its own replica immediately, without paying the retry loop', async () => {
+			const { network } = await justDisconnectedNode();
+			const t0 = Date.now();
+			const result = await network.findCoordinator(KEY, { intent: 'read' });
+			expect(result.toString()).to.equal(selfPeerId.toString());
+			// The FRET tier admits self on a deferrable denial for a read, so the call must not
+			// enter a single 500ms inter-attempt sleep.
+			expect(Date.now() - t0, 'an isolated read resolves inside one retry delay').to.be.lessThan(400);
+		});
+
+		it('completes a WRITE from its own replica after the retry window, instead of throwing', async () => {
+			const { network } = await justDisconnectedNode();
+			const t0 = Date.now();
+			const result = await network.findCoordinator(KEY); // default intent: 'write'
+			expect(result.toString()).to.equal(selfPeerId.toString());
+			// A write keeps dropping self at the FRET tier, so it still spends the full
+			// 3-attempt / 2×500ms window hoping a peer lands — then degrades rather than failing.
+			expect(Date.now() - t0, 'a write still spends its retry window before degrading').to.be.at.least(500);
+		});
+
+		it('a peer that lands during the write retry window still wins the key over self', async () => {
+			// Guards against the FRET-tier read admission leaking into the write path: while the
+			// retry loop is sleeping, self must stay dropped so a real peer takes the key.
+			const peerA = await makePeerId();
+			const { network, state } = await justDisconnectedNode();
+			const arrival = setTimeout(() => {
+				state.connections = [connTo(peerA)];
+				state.neighbors = [peerA.toString(), selfPeerId.toString()];
+			}, 600);
+			try {
+				const result = await network.findCoordinator(KEY);
+				expect(result.toString(), 'the arriving peer wins over degraded self').to.equal(peerA.toString());
+			} finally {
+				clearTimeout(arrival);
+			}
+		});
+
+		it('a detected partition still blocks a WRITE but never a READ', async () => {
+			const { network: writeNet } = await justDisconnectedNode({ partitioned: true });
+			let caught: unknown;
+			try {
+				await writeNet.findCoordinator(KEY);
+				expect.fail('Expected a partitioned write to throw SELF_COORDINATION_BLOCKED');
+			} catch (err) {
+				caught = err;
+			}
+			expect(caught).to.be.instanceOf(FindCoordinatorError);
+			expect((caught as FindCoordinatorError).code).to.equal(
+				FIND_COORDINATOR_ERROR_CODES.SELF_COORDINATION_BLOCKED
+			);
+
+			// A partition is no argument against answering a read from our own replica — the
+			// layers below already report how good that answer is.
+			const { network: readNet } = await justDisconnectedNode({ partitioned: true });
+			const result = await readNet.findCoordinator(KEY, { intent: 'read' });
+			expect(result.toString()).to.equal(selfPeerId.toString());
+		});
+
+		it('allowSelfCoordination: false still blocks BOTH a read and a write', async () => {
+			// The one denial that is an explicit operator switch rather than an inference, so it
+			// holds regardless of intent or connection state.
+			for (const intent of ['read', 'write'] as const) {
+				const { libp2p } = (() => {
+					const fret = {
+						getNeighbors: () => [selfPeerId.toString()],
+						getNetworkSizeEstimate: () => ({ size_estimate: 1, confidence: 0.5 }),
+						detectPartition: () => false,
+						exportTable: () => undefined,
+						assembleCohort: () => []
+					};
+					return {
+						libp2p: {
+							peerId: selfPeerId,
+							getConnections: () => [],
+							getMultiaddrs: () => [],
+							addEventListener: () => {},
+							removeEventListener: () => {},
+							services: { fret }
+						} as unknown as Libp2p
+					};
+				})();
+				const network = new Libp2pKeyPeerNetwork(libp2p, 16, { allowSelfCoordination: false }, 'forming');
+				let caught: unknown;
+				try {
+					await network.findCoordinator(KEY, { intent });
+					expect.fail(`Expected findCoordinator to throw for intent=${intent} when self-coordination is disabled`);
+				} catch (err) {
+					caught = err;
+				}
+				expect(caught, `intent=${intent}`).to.be.instanceOf(FindCoordinatorError);
+				expect((caught as FindCoordinatorError).code, `intent=${intent}`).to.equal(
+					FIND_COORDINATOR_ERROR_CODES.SELF_COORDINATION_BLOCKED
+				);
+			}
 		});
 	});
 

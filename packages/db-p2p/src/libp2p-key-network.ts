@@ -1,6 +1,6 @@
 import type { AbortOptions, Connection, Libp2p, PeerId, Stream } from "@libp2p/interface";
 import { toString as u8ToString } from 'uint8arrays'
-import type { ClusterPeers, FindCoordinatorOptions, IKeyNetwork, IPeerNetwork } from "@optimystic/db-core";
+import type { ClusterPeers, CoordinatorIntent, FindCoordinatorOptions, IKeyNetwork, IPeerNetwork } from "@optimystic/db-core";
 import { peerIdFromString } from '@libp2p/peer-id'
 import { multiaddr } from '@multiformats/multiaddr'
 import type { FretService, SerializedTable } from 'p2p-fret'
@@ -20,8 +20,11 @@ export type NetworkMode = 'forming' | 'joining';
  */
 export const FIND_COORDINATOR_ERROR_CODES = {
 	/**
-	 * Last-resort self-coordination was blocked by the self-coordination guard
-	 * (e.g. partition detected, suspicious shrinkage). Retrying is unlikely to help.
+	 * Last-resort self-coordination was blocked by a HARD verdict from the
+	 * self-coordination guard — self-coordination switched off by config, or a detected
+	 * partition / suspicious shrinkage on a WRITE. Retrying is unlikely to help. A
+	 * *deferrable* denial (see {@link SelfCoordinationDecision.deferrable}) never produces
+	 * this code: selection degrades to self with a warning instead.
 	 */
 	SELF_COORDINATION_BLOCKED: 'SELF_COORDINATION_BLOCKED',
 	/**
@@ -99,6 +102,35 @@ export interface SelfCoordinationDecision {
 	allow: boolean;
 	reason: 'bootstrap-node' | 'partition-detected' | 'suspicious-shrinkage' | 'grace-period-not-elapsed' | 'extended-isolation' | 'hwm-decay' | 'disabled';
 	warn?: boolean;
+	/**
+	 * Set on a denial. `true` means "self is not the PREFERRED coordinator right now, but
+	 * nothing says it is unsafe" — the last-resort tier degrades to self with a warning
+	 * rather than failing the caller. `false` means there is a positive reason to refuse
+	 * (operator config, or evidence of a partition) and the caller is failed.
+	 *
+	 * Hardness by reason, given the caller's {@link CoordinatorIntent}:
+	 *
+	 * | reason                    | write      | read       |
+	 * | ------------------------- | ---------- | ---------- |
+	 * | `disabled`                | hard       | hard       |
+	 * | `grace-period-not-elapsed`| deferrable | deferrable |
+	 * | `partition-detected`      | hard       | deferrable |
+	 * | `suspicious-shrinkage`    | hard       | deferrable |
+	 *
+	 * `grace-period-not-elapsed` is deferrable for BOTH because it is a timing condition
+	 * with no evidence behind it: the same node, with the same FRET table and the same zero
+	 * connections, is allowed to self-coordinate once the clock passes `gracePeriodMs`. It
+	 * postpones an isolated write rather than preventing it (a self-only cohort commits
+	 * under `allowClusterDownsize`, the default), so failing the caller buys no safety.
+	 *
+	 * The read column is uniformly deferrable because none of these reasons protects a
+	 * read: self-coordinating a read means "answer from my own replica", which is what an
+	 * isolated node must accept anyway, and the layers below already report the quality of
+	 * that answer (`CoordinatorRepo.fetchBlockFromCluster` short-circuits a self-only cohort
+	 * as conclusive; an unreachable cohort comes back flagged `unavailable`). `disabled` is
+	 * the exception for both intents — it is an explicit operator switch, not an inference.
+	 */
+	deferrable?: boolean;
 }
 
 export class Libp2pKeyPeerNetwork implements IKeyNetwork, IPeerNetwork {
@@ -126,6 +158,13 @@ export class Libp2pKeyPeerNetwork implements IKeyNetwork, IPeerNetwork {
 		 */
 		private readonly protocolPrefix?: string
 	) {
+		// NOTE: no construction site in this repo passes a SelfCoordinationConfig — every one
+		// leaves it `undefined` (libp2p-node-base.ts, quereus-plugin-optimystic's
+		// collection-factory.ts and key-network.ts, reference-peer's cli.ts), so these
+		// defaults are always what is in force and no operator can tune them. If tuning
+		// `gracePeriodMs` is ever needed, those four sites have to thread the config through
+		// first. Low urgency: a grace-period denial no longer fails the caller, it only costs
+		// a write the ~1s findCoordinator retry window before self-coordinating.
 		this.selfCoordinationConfig = {
 			gracePeriodMs: selfCoordinationConfig?.gracePeriodMs ?? 30_000,
 			shrinkageThreshold: selfCoordinationConfig?.shrinkageThreshold ?? 0.5,
@@ -236,11 +275,24 @@ export class Libp2pKeyPeerNetwork implements IKeyNetwork, IPeerNetwork {
 	 *
 	 * Principle: If we've ever seen a larger network, assume our connectivity is the problem,
 	 * not the network shrinking.
+	 *
+	 * A denial is classified as HARD or DEFERRABLE via {@link SelfCoordinationDecision.deferrable}
+	 * — see that field for the reason/intent table. A hard denial fails the caller; a deferrable
+	 * one only means "self is not the preferred coordinator", and the last-resort tier degrades
+	 * to self with a warning.
+	 *
+	 * @param intent What the caller means to do with the coordinator. Defaults to `'write'`,
+	 * the conservative reading, so callers that don't know are held to the stricter bar.
 	 */
-	shouldAllowSelfCoordination(): SelfCoordinationDecision {
+	shouldAllowSelfCoordination(intent: CoordinatorIntent = 'write'): SelfCoordinationDecision {
+		// A read never coordinates a mutation, so every evidence-based denial below is merely
+		// a preference for a better-placed peer — the caller can always be answered from this
+		// node's own replica. Only the explicit `disabled` switch is absolute for a read.
+		const deferrableOnEvidence = intent === 'read';
+
 		// Check global disable
 		if (!this.selfCoordinationConfig.allowSelfCoordination) {
-			return { allow: false, reason: 'disabled' };
+			return { allow: false, reason: 'disabled', deferrable: false };
 		}
 
 		// Case 1: New/bootstrap node (never seen larger network)
@@ -258,17 +310,17 @@ export class Libp2pKeyPeerNetwork implements IKeyNetwork, IPeerNetwork {
 		try {
 			const fret = this.getFret();
 			if (fret.detectPartition()) {
-				this.log('self-coord-blocked: partition-detected');
-				return { allow: false, reason: 'partition-detected' };
+				this.log('self-coord-blocked: partition-detected intent=%s', intent);
+				return { allow: false, reason: 'partition-detected', deferrable: deferrableOnEvidence };
 			}
 
 			// Case 3: Suspicious network shrinkage (>threshold drop)
 			const estimate = fret.getNetworkSizeEstimate();
 			const shrinkage = 1 - (estimate.size_estimate / this.networkHighWaterMark);
 			if (shrinkage > this.selfCoordinationConfig.shrinkageThreshold) {
-				this.log('self-coord-blocked: suspicious-shrinkage current=%d hwm=%d shrinkage=%f',
-					estimate.size_estimate, this.networkHighWaterMark, shrinkage);
-				return { allow: false, reason: 'suspicious-shrinkage' };
+				this.log('self-coord-blocked: suspicious-shrinkage current=%d hwm=%d shrinkage=%f intent=%s',
+					estimate.size_estimate, this.networkHighWaterMark, shrinkage, intent);
+				return { allow: false, reason: 'suspicious-shrinkage', deferrable: deferrableOnEvidence };
 			}
 		} catch {
 			// FRET not available - be conservative
@@ -278,7 +330,7 @@ export class Libp2pKeyPeerNetwork implements IKeyNetwork, IPeerNetwork {
 				const timeSinceConnection = Date.now() - this.lastConnectedTime;
 				if (timeSinceConnection < this.selfCoordinationConfig.gracePeriodMs) {
 					this.log('self-coord-blocked: grace-period-not-elapsed since=%dms', timeSinceConnection);
-					return { allow: false, reason: 'grace-period-not-elapsed' };
+					return { allow: false, reason: 'grace-period-not-elapsed', deferrable: true };
 				}
 			}
 		}
@@ -290,7 +342,9 @@ export class Libp2pKeyPeerNetwork implements IKeyNetwork, IPeerNetwork {
 			// Only block if we have no connections but did recently
 			if (connections.length === 0) {
 				this.log('self-coord-blocked: grace-period-not-elapsed since=%dms', timeSinceConnection);
-				return { allow: false, reason: 'grace-period-not-elapsed' };
+				// Deferrable for BOTH intents: nothing here is evidence, only a clock. The same
+				// node with the same information self-coordinates once gracePeriodMs elapses.
+				return { allow: false, reason: 'grace-period-not-elapsed', deferrable: true };
 			}
 		}
 
@@ -401,6 +455,9 @@ export class Libp2pKeyPeerNetwork implements IKeyNetwork, IPeerNetwork {
 	async findCoordinator(key: Uint8Array, _options?: Partial<FindCoordinatorOptions>): Promise<PeerId> {
 		const t0 = Date.now();
 		const excludedSet = new Set<string>((_options?.excludedPeers ?? []).map(p => p.toString()))
+		// Unset means 'write' — the conservative reading, so a caller that doesn't declare an
+		// intent is held to the stricter self-coordination bar.
+		const intent: CoordinatorIntent = _options?.intent ?? 'write';
 		const keyStr = this.toCacheKey(key).substring(0, 12);
 		// Tracks whether the network-membership filter excluded an UNCONFIRMED candidate
 		// — `foreign` (another network) OR `unknown` (not yet confirmed to serve this
@@ -444,6 +501,12 @@ export class Libp2pKeyPeerNetwork implements IKeyNetwork, IPeerNetwork {
 				// from the candidate list, so the connected-peer fallback below still gets its
 				// chance at a good remote peer; only if that also comes up empty does the
 				// last-resort tier raise the accurate error.
+				//
+				// A READ is the exception: a deferrable denial is not evidence that answering
+				// from our own replica is wrong, so self is admitted here and the read resolves
+				// immediately instead of paying the ~1s retry loop before the last-resort tier
+				// degrades to the same answer. A WRITE keeps dropping self exactly as before,
+				// so a peer that lands during the retry window still wins the key.
 				const selfStr = this.libp2p.peerId.toString()
 				let selfAllowedThisAttempt: boolean | undefined
 				// Memoized per ATTEMPT, and evaluated lazily so an all-remote neighborhood never
@@ -457,10 +520,13 @@ export class Libp2pKeyPeerNetwork implements IKeyNetwork, IPeerNetwork {
 				// the decision with a short TTL on the instance instead of per attempt.
 				const isSelfAdmissible = (): boolean => {
 					if (selfAllowedThisAttempt === undefined) {
-						const decision = this.shouldAllowSelfCoordination()
-						selfAllowedThisAttempt = decision.allow
-						if (!decision.allow) {
-							this.log('findCoordinator:fret-self-dropped key=%s reason=%s attempt=%d', keyStr, decision.reason, attempt)
+						const decision = this.shouldAllowSelfCoordination(intent)
+						const degradedRead = !decision.allow && decision.deferrable === true && intent === 'read'
+						selfAllowedThisAttempt = decision.allow || degradedRead
+						if (degradedRead) {
+							this.log('findCoordinator:fret-self-degraded key=%s reason=%s intent=read attempt=%d', keyStr, decision.reason, attempt)
+						} else if (!decision.allow) {
+							this.log('findCoordinator:fret-self-dropped key=%s reason=%s intent=%s attempt=%d', keyStr, decision.reason, intent, attempt)
 						}
 					}
 					return selfAllowedThisAttempt
@@ -531,13 +597,24 @@ export class Libp2pKeyPeerNetwork implements IKeyNetwork, IPeerNetwork {
 		// last resort: prefer self only if not excluded and guard allows
 		const self = this.libp2p.peerId
 		if (!excludedSet.has(self.toString())) {
-			const decision = this.shouldAllowSelfCoordination();
-			if (!decision.allow) {
-				this.log('findCoordinator:self-coord-blocked key=%s reason=%s', keyStr, decision.reason);
+			const decision = this.shouldAllowSelfCoordination(intent);
+			// Only a HARD denial fails the caller. A deferrable one (see
+			// SelfCoordinationDecision.deferrable) means self is merely not the preferred
+			// coordinator — by this point every better tier has already come up empty and the
+			// retry window has been spent, so refusing here would just convert "serve from my
+			// own replica, degraded" into an outright failure of the whole operation.
+			if (!decision.allow && decision.deferrable !== true) {
+				this.log('findCoordinator:self-coord-blocked key=%s reason=%s intent=%s', keyStr, decision.reason, intent);
 				throw new FindCoordinatorError(
 					FIND_COORDINATOR_ERROR_CODES.SELF_COORDINATION_BLOCKED,
 					`Self-coordination blocked: ${decision.reason}. No coordinator available for key.`
 				);
+			}
+			if (!decision.allow) {
+				this.log('findCoordinator:self-selected-degraded key=%s coordinator=%s reason=%s intent=%s',
+					keyStr, self.toString().substring(0, 12), decision.reason, intent);
+				this.log('findCoordinator:done key=%s ms=%d source=%s', keyStr, Date.now() - t0, 'self-degraded')
+				return self
 			}
 			if (decision.warn) {
 				this.log('findCoordinator:self-selected-warn key=%s coordinator=%s reason=%s',

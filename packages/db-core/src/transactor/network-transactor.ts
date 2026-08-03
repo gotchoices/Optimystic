@@ -2,7 +2,7 @@ import { peerIdFromString } from "../network/types.js";
 import type { PeerId } from "../network/types.js";
 import { highestStaleAt, isConflictFailure } from "../network/stale-failure.js";
 import { BlockUnavailableError } from "../network/struct.js";
-import type { ActionTransforms, ActionBlocks, BlockActionStatus, ITransactor, PendSuccess, StaleFailure, IKeyNetwork, BlockId, GetBlockResults, PendResult, CommitResult, PendRequest, IRepo, BlockGets, Transforms, CommitRequest, ActionId, RepoCommitRequest, ClusterNomineesResult, CollectionId, IBlock } from "../index.js";
+import type { ActionTransforms, ActionBlocks, BlockActionStatus, ITransactor, PendSuccess, StaleFailure, IKeyNetwork, BlockId, GetBlockResults, PendResult, CommitResult, PendRequest, IRepo, BlockGets, Transforms, CommitRequest, ActionId, RepoCommitRequest, ClusterNomineesResult, CollectionId, IBlock, CoordinatorIntent } from "../index.js";
 import type { IBlockChangeNotifier, CollectionChangeListener } from "./change-notifier.js";
 import { transformForBlockId, groupBy, concatTransforms, concatTransform, transformsFromTransform, blockIdsForTransforms, Log, Tracker, CacheSource, TransactorSource } from "../index.js";
 import { blockIdToBytes } from "../utility/block-id-to-bytes.js";
@@ -108,11 +108,16 @@ export class NetworkTransactor implements ITransactor, IBlockChangeNotifier {
 		const t0 = Date.now();
 		log('get blockIds=%d', distinctBlockIds.length);
 
+		// `intent: 'read'` throughout this method: a read that can find no reachable
+		// coordinator may still be answered from the local replica (degraded but reported),
+		// where a write on the same evidence may not. See CoordinatorIntent.
 		const batches = await this.batchesForPayload<BlockId[], GetBlockResults>(
 			distinctBlockIds,
 			distinctBlockIds,
 			(gets, blockId, mergeWithGets) => [...(mergeWithGets ?? []), ...gets.filter(bid => bid === blockId)],
-			[]
+			[],
+			undefined,
+			'read'
 		);
 
 		const expiration = Date.now() + this.timeoutMs;
@@ -125,7 +130,7 @@ export class NetworkTransactor implements ITransactor, IBlockChangeNotifier {
 				batch => batch.payload,
 				(gets, blockId, mergeWithGets) => [...(mergeWithGets ?? []), ...gets.filter(bid => bid === blockId)],
 				expiration,
-				async (blockId, options) => this.keyNetwork.findCoordinator(await blockIdToBytes(blockId), options)
+				async (blockId, options) => this.keyNetwork.findCoordinator(await blockIdToBytes(blockId), { ...options, intent: 'read' })
 			);
 		} catch (e) {
 			error = e as Error;
@@ -179,7 +184,7 @@ export class NetworkTransactor implements ITransactor, IBlockChangeNotifier {
 					b.payload,
 					(gets, blockId, mergeWithGets) => [...(mergeWithGets ?? []), ...gets.filter(id => id === blockId)],
 					Array.from(excluded),
-					async (blockId, options) => this.keyNetwork.findCoordinator(await blockIdToBytes(blockId), options)
+					async (blockId, options) => this.keyNetwork.findCoordinator(await blockIdToBytes(blockId), { ...options, intent: 'read' })
 				);
 				if (retries.length > 0) {
 					b.subsumedBy = [...(b.subsumedBy ?? []), ...retries];
@@ -189,7 +194,7 @@ export class NetworkTransactor implements ITransactor, IBlockChangeNotifier {
 						batch => batch.payload,
 						(gets, blockId, mergeWithGets) => [...(mergeWithGets ?? []), ...gets.filter(id => id === blockId)],
 						expiration,
-						async (blockId, options) => this.keyNetwork.findCoordinator(await blockIdToBytes(blockId), options)
+						async (blockId, options) => this.keyNetwork.findCoordinator(await blockIdToBytes(blockId), { ...options, intent: 'read' })
 					);
 				}
 			}));
@@ -741,14 +746,16 @@ export class NetworkTransactor implements ITransactor, IBlockChangeNotifier {
 		getBlockPayload: (payload: TPayload, blockId: BlockId, mergeWithPayload: TPayload | undefined) => TPayload,
 		excludedPeers: PeerId[],
 		/** When set, prefer a coordinator this transaction already resolved at pend (see {@link resolveCoordinator}). */
-		actionId?: ActionId
+		actionId?: ActionId,
+		/** What the batches will be used for. Defaults to `'write'` — see {@link CoordinatorIntent}. */
+		intent: CoordinatorIntent = 'write'
 	): Promise<CoordinatorBatch<TPayload, TResponse>[]> {
 		return createBatchesForPayload<TPayload, TResponse>(
 			blockIds,
 			payload,
 			getBlockPayload,
 			excludedPeers,
-			async (blockId, options) => this.resolveCoordinator(blockId, options, actionId)
+			async (blockId, options) => this.resolveCoordinator(blockId, options, actionId, intent)
 		);
 	}
 
@@ -763,7 +770,8 @@ export class NetworkTransactor implements ITransactor, IBlockChangeNotifier {
 	private async resolveCoordinator(
 		blockId: BlockId,
 		options: { excludedPeers: PeerId[] },
-		actionId: ActionId | undefined
+		actionId: ActionId | undefined,
+		intent: CoordinatorIntent = 'write'
 	): Promise<PeerId> {
 		if (actionId !== undefined) {
 			const cached = this.txnCoordinatorCache.get(actionId)?.coordinators.get(blockId);
@@ -771,7 +779,7 @@ export class NetworkTransactor implements ITransactor, IBlockChangeNotifier {
 				return cached;
 			}
 		}
-		return this.keyNetwork.findCoordinator(await blockIdToBytes(blockId), options);
+		return this.keyNetwork.findCoordinator(await blockIdToBytes(blockId), { ...options, intent });
 	}
 
 	/**
