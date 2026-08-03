@@ -129,6 +129,14 @@ export interface SelfCoordinationDecision {
 	 * that answer (`CoordinatorRepo.fetchBlockFromCluster` short-circuits a self-only cohort
 	 * as conclusive; an unreachable cohort comes back flagged `unavailable`). `disabled` is
 	 * the exception for both intents — it is an explicit operator switch, not an inference.
+	 *
+	 * NOTE: optional, so a NEW denial branch that forgets to set it silently reads as HARD
+	 * (`findCoordinator` tests `deferrable !== true`) — safe for a write, but it reinstates
+	 * the original defect for a read: an outright lookup failure where degrading to our own
+	 * replica would do. Every denial branch today sets it explicitly. If a fifth reason is
+	 * ever added, either set it there too or split this into a discriminated union
+	 * (`{ allow: true, … } | { allow: false, deferrable: boolean, … }`) so omission is a
+	 * compile error.
 	 */
 	deferrable?: boolean;
 }
@@ -502,8 +510,9 @@ export class Libp2pKeyPeerNetwork implements IKeyNetwork, IPeerNetwork {
 				// chance at a good remote peer; only if that also comes up empty does the
 				// last-resort tier raise the accurate error.
 				//
-				// A READ is the exception: a deferrable denial is not evidence that answering
-				// from our own replica is wrong, so self is admitted here and the read resolves
+				// An ISOLATED READ is the exception: with no connection left there is no better
+				// answer to wait for, and a deferrable denial is not evidence that answering
+				// from our own replica is wrong — so self is admitted here and the read resolves
 				// immediately instead of paying the ~1s retry loop before the last-resort tier
 				// degrades to the same answer. A WRITE keeps dropping self exactly as before,
 				// so a peer that lands during the retry window still wins the key.
@@ -518,10 +527,25 @@ export class Libp2pKeyPeerNetwork implements IKeyNetwork, IPeerNetwork {
 				// it. Fine while detectPartition()/getNetworkSizeEstimate() stay local FRET
 				// table reads; if either ever grows a probe or other network round-trip, cache
 				// the decision with a short TTL on the instance instead of per attempt.
+				// NOTE: the guard re-reads getConnections() live, while `connectedSet` above was
+				// snapshotted at the top of this attempt. A connection landing between the two
+				// lifts the guard's grace-period denial while the new peer is still absent from
+				// the candidate filter — so self can win an attempt on evidence that attempt
+				// cannot yet use. Bounded to one attempt (the next re-snapshots and prefers the
+				// peer) and self picks are never cached, so it costs at most one lookup's
+				// routing. If that ever matters, pass the snapshot into the guard instead.
 				const isSelfAdmissible = (): boolean => {
 					if (selfAllowedThisAttempt === undefined) {
 						const decision = this.shouldAllowSelfCoordination(intent)
-						const degradedRead = !decision.allow && decision.deferrable === true && intent === 'read'
+						// Gated on ISOLATION, not just on the read intent. Self carries no reputation
+						// record, so it scores 0 and sorts ahead of every remote candidate in the rank
+						// below — admitting it while a connection is live would hand the key to a node
+						// its own guard just called partitioned, over a reachable FRET neighbour. And
+						// waiting costs a connected read nothing: the inter-attempt sleep further down
+						// only runs when `connected.length === 0`, so with peers present the remaining
+						// attempts and the last-resort degrade run back-to-back with no delay.
+						const degradedRead = !decision.allow && decision.deferrable === true
+							&& intent === 'read' && connected.length === 0
 						selfAllowedThisAttempt = decision.allow || degradedRead
 						if (degradedRead) {
 							this.log('findCoordinator:fret-self-degraded key=%s reason=%s intent=read attempt=%d', keyStr, decision.reason, attempt)

@@ -347,6 +347,35 @@ describe('Libp2pKeyPeerNetwork', () => {
 			expect(read.deferrable, 'a partition says nothing about serving a READ from our own replica').to.be.true;
 		});
 
+		it('marks a suspicious-shrinkage denial hard for a write and deferrable for a read', async () => {
+			const persistence = new MemoryPersistence({
+				version: 1,
+				networkHighWaterMark: 10,
+				lastConnectedTimestamp: Date.now() - 10 * 60_000, // grace long elapsed
+				consecutiveIsolatedSessions: 0
+			});
+			const fret = {
+				getNeighbors: () => [],
+				// 10 → 4 is a 60% drop, past the 0.5 default threshold
+				getNetworkSizeEstimate: () => ({ size_estimate: 4, confidence: 0.5 }),
+				detectPartition: () => false,
+				exportTable: () => undefined
+			};
+			const libp2p = createMockLibp2p(selfPeerId, { fret });
+			const network = new Libp2pKeyPeerNetwork(libp2p, 16, undefined, 'forming', persistence);
+			await network.initFromPersistedState();
+
+			const write = network.shouldAllowSelfCoordination('write');
+			expect(write.allow).to.be.false;
+			expect(write.reason).to.equal('suspicious-shrinkage');
+			expect(write.deferrable, 'lost most of the network we knew — do not coordinate a WRITE alone').to.be.false;
+
+			const read = network.shouldAllowSelfCoordination('read');
+			expect(read.allow).to.be.false;
+			expect(read.reason).to.equal('suspicious-shrinkage');
+			expect(read.deferrable, 'a shrunk network says nothing about serving a READ from our own replica').to.be.true;
+		});
+
 		it('marks a disabled denial hard for BOTH intents', () => {
 			const libp2p = createMockLibp2p(selfPeerId);
 			const network = new Libp2pKeyPeerNetwork(libp2p, 16, { allowSelfCoordination: false }, 'forming');
@@ -714,17 +743,36 @@ describe('Libp2pKeyPeerNetwork', () => {
 		 * connections, lost its last one 2.3s ago (well inside the 30s grace period), and FRET
 		 * reports no shrinkage, no partition, and self as the key's only neighbour. Nothing here
 		 * is evidence of anything — only a clock that has not run out.
+		 *
+		 * `connectedPeer` breaks the isolation: that peer is connected and is a FRET neighbour of
+		 * the key, but ranks BEHIND self — the adversarial ordering, since a self admitted at the
+		 * FRET tier would then take the key ahead of it.
 		 */
-		async function justDisconnectedNode(options?: { partitioned?: boolean }) {
+		type MutableNetworkState = { connections: Connection[]; neighbors: string[] };
+
+		async function justDisconnectedNode(options?: {
+			partitioned?: boolean;
+			connectedPeer?: PeerId;
+		}) {
 			const persistence = new MemoryPersistence({
 				version: 1,
 				networkHighWaterMark: 10,
 				lastConnectedTimestamp: Date.now() - 2_300,
 				consecutiveIsolatedSessions: 0
 			});
-			const state = { connections: [] as Connection[], neighbors: [selfPeerId.toString()] };
+			const peer = options?.connectedPeer;
+			const state: MutableNetworkState = {
+				connections: peer ? [connTo(peer)] : [],
+				neighbors: peer ? [selfPeerId.toString(), peer.toString()] : [selfPeerId.toString()]
+			};
+			// findCoordinator consults FRET exactly once per retry attempt, so this counts
+			// attempts — a clock-free stand-in for "did the lookup enter the retry loop".
+			let attempts = 0;
 			const fret = {
-				getNeighbors: () => state.neighbors,
+				getNeighbors: () => {
+					attempts++;
+					return state.neighbors;
+				},
 				getNetworkSizeEstimate: () => ({ size_estimate: 10, confidence: 0.5 }),
 				detectPartition: () => options?.partitioned ?? false,
 				exportTable: () => undefined,
@@ -740,43 +788,51 @@ describe('Libp2pKeyPeerNetwork', () => {
 			} as unknown as Libp2p;
 			const network = new Libp2pKeyPeerNetwork(libp2p, 16, undefined, 'forming', persistence);
 			await network.initFromPersistedState();
-			return { network, state };
+			return { network, state, attemptCount: () => attempts };
 		}
 
 		const KEY = new TextEncoder().encode('isolated-node-key');
 
 		it('serves a READ from its own replica immediately, without paying the retry loop', async () => {
-			const { network } = await justDisconnectedNode();
-			const t0 = Date.now();
+			const { network, attemptCount } = await justDisconnectedNode();
 			const result = await network.findCoordinator(KEY, { intent: 'read' });
 			expect(result.toString()).to.equal(selfPeerId.toString());
-			// The FRET tier admits self on a deferrable denial for a read, so the call must not
-			// enter a single 500ms inter-attempt sleep.
-			expect(Date.now() - t0, 'an isolated read resolves inside one retry delay').to.be.lessThan(400);
+			// The FRET tier admits self on a deferrable denial for an isolated read, so the
+			// lookup resolves on the first attempt and never enters a 500ms inter-attempt sleep.
+			expect(attemptCount(), 'an isolated read resolves without a second attempt').to.equal(1);
 		});
 
 		it('completes a WRITE from its own replica after the retry window, instead of throwing', async () => {
-			const { network } = await justDisconnectedNode();
-			const t0 = Date.now();
+			const { network, attemptCount } = await justDisconnectedNode();
 			const result = await network.findCoordinator(KEY); // default intent: 'write'
 			expect(result.toString()).to.equal(selfPeerId.toString());
 			// A write keeps dropping self at the FRET tier, so it still spends the full
-			// 3-attempt / 2×500ms window hoping a peer lands — then degrades rather than failing.
-			expect(Date.now() - t0, 'a write still spends its retry window before degrading').to.be.at.least(500);
+			// 3-attempt window hoping a peer lands — then degrades rather than failing.
+			expect(attemptCount(), 'a write still spends its retry window before degrading').to.equal(3);
 		});
 
 		it('a peer that lands during the write retry window still wins the key over self', async () => {
 			// Guards against the FRET-tier read admission leaking into the write path: while the
 			// retry loop is sleeping, self must stay dropped so a real peer takes the key.
+			//
+			// The arrival must land in an INTER-ATTEMPT SLEEP, not mid-attempt: an attempt
+			// snapshots the connection list up front but consults the self-coordination guard
+			// lazily afterwards, so a connection appearing between those two reads is visible to
+			// the guard (which then allows self) while still invisible to the candidate filter.
+			// 50ms puts it deep inside attempt 0's 500ms sleep — attempt 0's body runs in ~1ms —
+			// rather than the 400ms of slack a late-window timer would leave. `attemptCount`
+			// pins WHICH attempt made the pick, so a machine stalled enough to break that
+			// assumption fails loudly here instead of passing for the wrong reason.
 			const peerA = await makePeerId();
-			const { network, state } = await justDisconnectedNode();
+			const { network, state, attemptCount } = await justDisconnectedNode();
 			const arrival = setTimeout(() => {
 				state.connections = [connTo(peerA)];
 				state.neighbors = [peerA.toString(), selfPeerId.toString()];
-			}, 600);
+			}, 50);
 			try {
 				const result = await network.findCoordinator(KEY);
 				expect(result.toString(), 'the arriving peer wins over degraded self').to.equal(peerA.toString());
+				expect(attemptCount(), 'the peer is picked on the attempt right after it arrives').to.equal(2);
 			} finally {
 				clearTimeout(arrival);
 			}
@@ -801,6 +857,19 @@ describe('Libp2pKeyPeerNetwork', () => {
 			const { network: readNet } = await justDisconnectedNode({ partitioned: true });
 			const result = await readNet.findCoordinator(KEY, { intent: 'read' });
 			expect(result.toString()).to.equal(selfPeerId.toString());
+		});
+
+		it('a READ still prefers a reachable peer over degraded self while any connection is live', async () => {
+			// The read admission at the FRET tier is a fallback for an ISOLATED node, not a
+			// standing preference. Self is FIRST in the FRET neighbour list here and has no
+			// reputation record (score 0, the minimum), so admitting it would take the key —
+			// a partitioned node with a live connection must still route the read to that
+			// neighbour rather than to the node its own guard just flagged. Costs nothing:
+			// the retry sleep only runs at zero connections.
+			const peerA = await makePeerId();
+			const { network } = await justDisconnectedNode({ partitioned: true, connectedPeer: peerA });
+			const result = await network.findCoordinator(KEY, { intent: 'read' });
+			expect(result.toString(), 'a reachable FRET neighbour beats degraded self').to.equal(peerA.toString());
 		});
 
 		it('allowSelfCoordination: false still blocks BOTH a read and a write', async () => {

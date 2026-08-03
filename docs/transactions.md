@@ -2044,11 +2044,13 @@ FRET already provides the necessary observability:
 3. **Guard self-coordination** — at two tiers, consuming the hardness classification:
    ```typescript
    // FRET tier: self is a neighbour of the key. Admitted when allowed, or on a
-   // deferrable denial for a READ (so an isolated read resolves at once instead of
-   // paying the retry loop first). A write keeps dropping self here, so a peer that
-   // lands during the retry window still wins the key.
+   // deferrable denial for an ISOLATED READ (so an isolated read resolves at once
+   // instead of paying the retry loop first). A write keeps dropping self here, so a
+   // peer that lands during the retry window still wins the key; and a read with any
+   // connection live keeps dropping it too, so a reachable neighbour is not outranked.
    const decision = this.shouldAllowSelfCoordination(intent);
-   const admit = decision.allow || (intent === 'read' && decision.deferrable === true);
+   const admit = decision.allow
+     || (intent === 'read' && decision.deferrable === true && connected.length === 0);
 
    // Last-resort tier: every better tier has already come up empty.
    const decision = this.shouldAllowSelfCoordination(intent);
@@ -2078,7 +2080,7 @@ Self-coordination risks differ by operation, and `findCoordinator` is told which
 
 | Operation | Risk | Behavior |
 |-----------|------|----------|
-| **Read** | Stale data | Never denied its own replica (except the `disabled` switch). Self is admitted at the FRET tier on a deferrable denial, so an isolated read resolves at once; the reply carries the cluster's own conclusive/`unavailable` verdict. |
+| **Read** | Stale data | Never denied its own replica (except the `disabled` switch). Self is admitted at the FRET tier on a deferrable denial *while the node is isolated*, so an isolated read resolves at once; the reply carries the cluster's own conclusive/`unavailable` verdict. With any connection still live, self stays dropped there so a reachable neighbour wins the key — and no delay is paid, since the retry sleep only runs at zero connections. |
 | **Write (new or existing block)** | Orphaned data / fork creation | Self stays dropped for the whole retry window so an arriving peer wins the key. Hard denial → `SELF_COORDINATION_BLOCKED`. Deferrable denial → self with a degraded-fallback warning. |
 | **Collection header lookup** | Missing data | A read; same as the read row. |
 
