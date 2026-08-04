@@ -261,7 +261,7 @@ export class RepoService implements Startable {
 				if (redirect) {
 					response = redirect
 				} else if ('get' in operation) {
-					response = await this.repo.get(operation.get, { expiration: message.expiration, skipClusterFetch: true } as any)
+					response = await this.repo.get(operation.get, { expiration: message.expiration } as any)
 				} else if ('pend' in operation) {
 					response = await this.repo.pend(operation.pend, { expiration: message.expiration })
 				} else if ('cancel' in operation) {
