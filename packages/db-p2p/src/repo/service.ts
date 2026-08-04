@@ -261,7 +261,16 @@ export class RepoService implements Startable {
 				if (redirect) {
 					response = redirect
 				} else if ('get' in operation) {
-					response = await this.repo.get(operation.get, { expiration: message.expiration } as any)
+					// No `skipClusterFetch` here: a read on this protocol comes from ANOTHER node, so
+					// it must reach `CoordinatorRepo`'s cohort consult — answering a bare absent for
+					// a block a cohort peer holds is an authoritative lie the transactor never
+					// retries. Only the sync protocol keeps the flag (`sync/service.ts`, where the
+					// consult itself lands), and that is what stops the recursion.
+					// NOTE: this also puts lazy read-repair on remote reads of locally-present blocks
+					// — one consult per block per `readRepairWindowMs`, damped by a 1000-entry LRU of
+					// block ids. If a working set wider than that LRU ever shows a consult on every
+					// read, widen the LRU rather than reinstating the skip.
+					response = await this.repo.get(operation.get, { expiration: message.expiration })
 				} else if ('pend' in operation) {
 					response = await this.repo.pend(operation.pend, { expiration: message.expiration })
 				} else if ('cancel' in operation) {

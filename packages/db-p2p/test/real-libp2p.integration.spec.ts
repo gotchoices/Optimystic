@@ -521,8 +521,8 @@ describe('Real libp2p integration', function () {
 
 		// Commit the block on a responsible member. clusterSize 2 → real 2-member consensus;
 		// the commit broadcasts the merged record to BOTH members, so each ends up holding
-		// the block in its own storage. The redirected get (skipClusterFetch: true) then
-		// serves it locally on whichever member the client lands on.
+		// the block in its own storage. The redirected get is then a local hit on whichever
+		// member the client lands on, so it never reaches the cohort consult.
 		const rRepo = (responsible as any).coordinatedRepo as IRepo;
 		const pend = await rRepo.pend({ actionId: 'mm-a1', transforms: makeTransforms(blockId), policy: 'c' });
 		expect(pend.success, 'responsible-member pend').to.equal(true);

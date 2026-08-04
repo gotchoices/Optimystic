@@ -67,13 +67,16 @@ const writeStubs = {
 	}
 };
 
-/** Storage repo holding nothing: every block reads as a bare absent locally. */
-const makeAbsentStorageRepo = (): { repo: IRepo, calls: BlockGets[] } => {
+/**
+ * Storage repo answering every block with `entry` — a bare absent by default, or a
+ * present block when one is supplied — and recording each read it was asked for.
+ */
+const makeStorageRepo = (entry: GetBlockResult = { state: {} }): { repo: IRepo, calls: BlockGets[] } => {
 	const calls: BlockGets[] = [];
 	const repo: IRepo = {
 		async get(blockGets: BlockGets, _options?: MessageOptions): Promise<GetBlockResults> {
 			calls.push(blockGets);
-			return Object.fromEntries(blockGets.blockIds.map(id => [id, { state: {} }]));
+			return Object.fromEntries(blockGets.blockIds.map(id => [id, structuredClone(entry)]));
 		},
 		...writeStubs
 	};
@@ -143,21 +146,26 @@ describe('repo-protocol get consults the cohort', () => {
 	const blockId: BlockId = 'default/CadrePeer';
 
 	/**
-	 * The observed failure shape: this node joined after the block was written, routing
-	 * now points reads at it, and it has never held the block. The cohort peer that DOES
-	 * hold it corroborates rev 2. With no `acquireBlockFromCohort` wired, the consult is
-	 * INCONCLUSIVE (corroborated but unacquired) — which must surface as
-	 * `unavailable: 'peers-unreachable'` so `NetworkTransactor.get` retries elsewhere,
-	 * NOT as the bare absent that makes the writer throw CollectionHeaderVanishedError.
+	 * A 2-peer cohort whose local member answers with `localEntry` (nothing by default) and
+	 * whose other member claims `cohortLatest` — `null` for a peer that answers "I hold
+	 * nothing", which is a real answer and not silence. `acquireBlockFromCohort` is
+	 * deliberately not wired, so a corroborated revision this node lacks can never be
+	 * acquired — the consult ends INCONCLUSIVE, the shape that must surface as `unavailable`.
+	 *
+	 * Defaults reproduce the observed failure: this node joined after the block was written,
+	 * routing now points reads at it, and it has never held the block, while the cohort peer
+	 * that DOES hold it corroborates rev 2.
 	 */
-	const buildCoordinator = async (): Promise<{ repo: CoordinatorRepo, localPeer: PeerId, storageCalls: BlockGets[] }> => {
+	const buildCoordinator = async (
+		{ cohortLatest = { actionId: 'remote-action', rev: 2 }, localEntry }:
+			{ cohortLatest?: ActionRev | null, localEntry?: GetBlockResult } = {}
+	): Promise<{ repo: CoordinatorRepo, localPeer: PeerId, storageCalls: BlockGets[] }> => {
 		const localPeer = await makePeerId();
 		const holder = await makePeerId();
 		const cluster = makeClusterPeers([localPeer, holder]);
-		const remoteLatest: ActionRev = { actionId: 'remote-action', rev: 2 };
 		const callback: ClusterLatestCallback = async (peerId) =>
-			peerId.equals(localPeer) ? undefined : remoteLatest;
-		const { repo: storageRepo, calls } = makeAbsentStorageRepo();
+			peerId.equals(localPeer) ? localEntry?.state?.latest : (cohortLatest ?? undefined);
+		const { repo: storageRepo, calls } = makeStorageRepo(localEntry);
 		const repo = new CoordinatorRepo(
 			makeKeyNetwork(cluster),
 			makeClusterClient,
@@ -202,5 +210,36 @@ describe('repo-protocol get consults the cohort', () => {
 		expect(result[blockId]!.state).to.deep.equal({});
 		expect('unavailable' in result[blockId]!).to.equal(false);
 		expect(storageCalls.length, 'only the plain local read ran').to.equal(1);
+	});
+
+	// The other half of the contract. Reaching the consult must not make every absence
+	// look uncertain: `createOrOpen` probes a not-yet-existing header on every open, and a
+	// healthy cohort answering "I hold nothing" is a real answer. Flagging it would cost a
+	// transactor-level retry against another peer on the routine new-collection path.
+	it('keeps the absent authoritative when the whole cohort answers "holds nothing"', async () => {
+		const { repo, localPeer } = await buildCoordinator({ cohortLatest: null });
+		const service = new RepoService(makeServiceComponents(repo, localPeer));
+
+		const entry = await repoProtocolGet(service, blockId);
+
+		expect(entry!.state, 'the block reads as absent').to.deep.equal({});
+		expect(entry!.unavailable, 'a cohort that answered is authoritative — no flag').to.equal(undefined);
+	});
+
+	// A locally-present block still consults (lazy read-repair, no last-seen timestamp yet),
+	// but the cohort corroborates the revision this node already holds, so the read is served
+	// from local state unflagged rather than being downgraded by the consult it now reaches.
+	it('serves a locally-present block unflagged when the cohort corroborates it', async () => {
+		const latest: ActionRev = { actionId: 'held-action', rev: 2 };
+		const { repo, localPeer } = await buildCoordinator({
+			cohortLatest: latest,
+			localEntry: { state: { latest } }
+		});
+		const service = new RepoService(makeServiceComponents(repo, localPeer));
+
+		const entry = await repoProtocolGet(service, blockId);
+
+		expect(entry!.state.latest, 'the local revision is returned').to.deep.equal(latest);
+		expect(entry!.unavailable, 'a present block is never flagged').to.equal(undefined);
 	});
 });
