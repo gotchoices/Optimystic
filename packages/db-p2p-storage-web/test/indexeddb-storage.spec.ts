@@ -3,7 +3,7 @@ import 'fake-indexeddb/auto';
 import { expect } from 'chai';
 import { IndexedDBRawStorage, IndexedDBStoreDriver } from '../src/indexeddb-storage.js';
 import { openOptimysticWebDb, type OptimysticWebDBHandle } from '../src/db.js';
-import { runRawStorageConformance, type ConformanceHarness } from '@optimystic/db-p2p/testing';
+import { runRawStorageConformance, type ConformanceHarness } from '@optimystic/db-p2p/testing/conformance';
 import type { BlockId, ActionId } from '@optimystic/db-core';
 
 let dbCounter = 0;

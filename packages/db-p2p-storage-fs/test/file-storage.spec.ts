@@ -5,7 +5,7 @@ import * as path from 'path';
 import { FileRawStorage, FileKVStore } from '../src/index.js';
 import { BlockStorage } from '@optimystic/db-p2p';
 import type { BlockMetadata } from '@optimystic/db-p2p';
-import { runRawStorageConformance, type ConformanceHarness } from '@optimystic/db-p2p/testing';
+import { runRawStorageConformance, type ConformanceHarness } from '@optimystic/db-p2p/testing/conformance';
 import type { BlockId, ActionId, Transform, IBlock } from '@optimystic/db-core';
 
 // ---------------------------------------------------------------------------

@@ -27,6 +27,10 @@
     "./testing": {
       "types": "./dist/src/testing/index.d.ts",
       "import": "./dist/src/testing/index.js"
+    },
+    "./testing/conformance": {
+      "types": "./dist/src/testing/raw-storage-conformance.d.ts",
+      "import": "./dist/src/testing/raw-storage-conformance.js"
     }
   },
   "repository": {

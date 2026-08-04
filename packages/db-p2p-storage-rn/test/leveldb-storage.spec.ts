@@ -1,7 +1,7 @@
 import { expect } from 'chai';
 import { LevelDBRawStorage } from '../src/leveldb-storage.js';
 import { openTestDb, type TestDbHandle } from './classic-level-driver.js';
-import { runRawStorageConformance, type ConformanceHarness } from '@optimystic/db-p2p/testing';
+import { runRawStorageConformance, type ConformanceHarness } from '@optimystic/db-p2p/testing/conformance';
 import type { ActionId, BlockHeader, BlockId, IBlock, Transform } from '@optimystic/db-core';
 
 const blockId = 'block-1' as BlockId;

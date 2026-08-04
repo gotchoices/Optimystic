@@ -92,7 +92,7 @@ Two layers run here, both over a per-test `fs.mkdtemp` fixture with `afterEach`
 cleanup:
 
 - **Shared conformance suite** — `runRawStorageConformance('FileSystem', …)` from
-  `@optimystic/db-p2p/testing`, the one cross-backend parity target. It proves the
+  `@optimystic/db-p2p/testing/conformance`, the one cross-backend parity target. It proves the
   fs backend (now `KvRawStorage` over a `FileStoreDriver`) behaves identically to
   every other backend: round-trips, `listRevisions` ordering, promote atomicity +
   the exact missing-pend error, clone-on-store/read (structural via the byte

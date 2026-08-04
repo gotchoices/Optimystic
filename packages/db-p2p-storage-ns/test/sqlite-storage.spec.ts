@@ -2,7 +2,7 @@ import { expect } from 'chai';
 import { SqliteRawStorage } from '../src/sqlite-storage.js';
 import { openTestDb } from './node-sqlite-driver.js';
 import type { SqliteDb } from '../src/db.js';
-import { runRawStorageConformance, type ConformanceHarness } from '@optimystic/db-p2p/testing';
+import { runRawStorageConformance, type ConformanceHarness } from '@optimystic/db-p2p/testing/conformance';
 import type { BlockId, ActionId } from '@optimystic/db-core';
 import type { BlockMetadata } from '@optimystic/db-p2p';
 
