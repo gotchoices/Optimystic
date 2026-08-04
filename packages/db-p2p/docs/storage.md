@@ -91,8 +91,10 @@ with its native atomic primitive (batch / DB transaction / rename).
 
 The in-memory backend (`MemoryRawStorage` over `MemoryStoreDriver`) uses this
 kernel today. A shared conformance suite (`src/testing/raw-storage-conformance.ts`,
-exported from the `./testing` entry) asserts every backend behaves identically and
-is the single parity target the persistent backends adopt as they migrate.
+exported from the `./testing/conformance` entry — separate from `./testing` because
+it imports `chai`, which is a devDependency consumers never install) asserts every
+backend behaves identically and is the single parity target the persistent backends
+adopt as they migrate.
 
 **File System Structure:**
 ```
