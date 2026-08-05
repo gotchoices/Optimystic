@@ -444,17 +444,14 @@ describe('Transform functionality', () => {
       expect((original.inserts![blockId] as TestBlock).data).to.equal('orig')
     })
 
-    it('should silently drop operations when concatTransform overlaps existing updates (BUG: data loss)', () => {
+    it('concatTransform concatenates operations when it overlaps existing updates', () => {
       const existingOps: BlockOperation[] = [['data', 0, 0, 'first'], ['items', 0, 0, ['a']]]
       const base: Transforms = { inserts: {}, updates: { [sharedId]: existingOps }, deletes: [] }
 
       const newOps: BlockOperation[] = [['data', 0, 0, 'second']]
       const result = concatTransform(base, sharedId, { updates: newOps })
 
-      // BUG: base's operations for sharedId are silently overwritten
-      expect(result.updates![sharedId]).to.deep.equal(newOps)
-      expect(result.updates![sharedId]).to.not.include(existingOps[0])
-      expect(result.updates![sharedId]).to.not.include(existingOps[1])
+      expect(result.updates![sharedId]).to.deep.equal([...existingOps, ...newOps])
     })
   })
 })

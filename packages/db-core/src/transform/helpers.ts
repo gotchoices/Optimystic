@@ -150,9 +150,14 @@ export function applyTransform(block: IBlock | undefined, transform: Transform):
 
 /** Concatenates a transform to the given transforms */
 export function concatTransform(transforms: Transforms, blockId: BlockId, transform: Transform): Transforms {
+	// updates: if blockId already has ops, concatenate rather than overwrite (mirrors mergeTransforms)
+	const existingOps = transforms.updates?.[blockId];
+	const updates = transform.updates
+		? { ...transforms.updates, [blockId]: existingOps ? [...existingOps, ...transform.updates] : transform.updates }
+		: { ...transforms.updates };
 	return {
 		inserts: { ...transforms.inserts, ...(transform.insert ? { [blockId]: transform.insert } : {}) },
-		updates: { ...transforms.updates, ...(transform.updates ? { [blockId]: transform.updates } : {}) },
-		deletes: [...(transforms.deletes ?? []), ...(transform.delete ? [blockId] : [])]
+		updates,
+		deletes: [...new Set([...(transforms.deletes ?? []), ...(transform.delete ? [blockId] : [])])]
 	};
 }

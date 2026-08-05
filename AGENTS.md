@@ -82,6 +82,12 @@ This is an important system; write production-grade, maintainble, and expressive
 
 **What's indexed:** project source files tracked by git, minus `node_modules/`, `dist/`, `build/`, `.git/`, `tickets/`, `team/`, `docs/`, and a few cache dirs. If a query about prose-heavy material (long-form architecture docs, design notes, READMEs in nested folders) returns nothing, the file may be outside the indexed set — fall back to `Read`/`Glob` for those paths. Projects can override the filter via `tickets/index-config.json` (see tess README § Customize what gets indexed).
 
+## Tending the garden
+
+If you are asked to "tend the garden" or something like that, what is meant is that the user wishes you to try to keep progress going by monitoring pending (fix/implement/plan/review) tickets, starting a background tess runner (`node tess/scripts/run.mjs`), and then checking on things periodically (ie. every 1-2 hours unless slower or faster cadence is justified).  Be sure not to interfere with tess runners that might be active in other repos.
+
+If more tickets are needed and there isn't something systematically blocking progress, you can look at the root of backlog.  Maintain `tickets/.garden-report.md` and pull in pressing and clear tickets that require no human design decisions.  If nothing seems important, don't do busy-work, it's okay to let the user know and stay idle.
+
 ## Caveman
 
 Respond terse like smart caveman. All technical substance stay. Only fluff die.
