@@ -20,6 +20,7 @@ import type { BlockArchive } from '../src/storage/struct.js';
 import { createReconcileBlock, type ReconcileBlockDeps } from '../src/cluster/reconcile-block.js';
 import { resolveClusterPolicy } from '../src/cluster/cluster-policy.js';
 import { PenaltyReason } from '../src/reputation/types.js';
+import { captureLog } from './support/capture-log.js';
 
 const BLOCK_ID = 'reconcile-target-block' as BlockId;
 const COLLECTION_ID = 'reconcile-collection' as BlockId;
@@ -129,6 +130,31 @@ describe('createReconcileBlock (commit-path block restoration)', () => {
 		await h.reconcile(BLOCK_ID, COMMITTED, [PEER_A]);
 
 		expect(h.saved.length, 'an unconfigured node must not reconcile in a lone, uncorroborated claim').to.equal(0);
+	});
+
+	it('names the knob that caused the decline, not just the vote counts', async () => {
+		// Ticket bug-cluster-size-resolution-single-source: an operator reading `reconcile:no-rev-quorum`
+		// must be able to see WHICH setting made the quorum unreachable, and what it was set to.
+		const resolved = resolveClusterPolicy({});
+		const h = harness(
+			{ [PEER_A]: archiveAt(2, 'action-2', makeBlock('v2')) },
+			{
+				simpleMajorityThreshold: resolved.simpleMajorityThreshold,
+				repairCorroborationClusterSize: resolved.repairCorroborationClusterSize
+			}
+		);
+
+		const captured = await captureLog('reconcile-block', async () => {
+			await h.reconcile(BLOCK_ID, COMMITTED, [PEER_A]);
+		});
+
+		const payload = captured.find(args => typeof args[0] === 'string' && args[0].includes('reconcile:no-rev-quorum'))?.[1] as
+			{ responders?: number, required?: number, repairCorroborationClusterSize?: number } | undefined;
+
+		expect(payload, 'expected reconcile:no-rev-quorum').to.not.equal(undefined);
+		expect(payload?.repairCorroborationClusterSize).to.equal(resolved.repairCorroborationClusterSize);
+		expect(payload?.responders).to.equal(1);
+		expect(payload?.required).to.equal(2);
 	});
 
 	it('heals unconfigured once the operator declares a genuine two-node deployment', async () => {

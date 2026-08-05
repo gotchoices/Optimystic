@@ -576,6 +576,14 @@ describe('CoordinatorRepo read-repair', () => {
 
 			expect(calls.find(c => c.context !== undefined), 'a lone claim must not be adopted by an unconfigured node').to.equal(undefined);
 			expect(hasTag(captured, 'cluster-fetch:no-quorum')).to.equal(true);
+
+			// Ticket bug-cluster-size-resolution-single-source: the decline must name the knob that
+			// caused it, not just the vote counts, or an operator reading the log cannot act on it.
+			const payload = captured.find(args => typeof args[0] === 'string' && args[0].includes('cluster-fetch:no-quorum'))?.[1] as
+				{ responders?: number, required?: number, repairCorroborationClusterSize?: number } | undefined;
+			expect(payload?.repairCorroborationClusterSize).to.equal(resolved.repairCorroborationClusterSize);
+			expect(payload?.required).to.equal(2);
+			expect(payload?.responders).to.equal(1);
 		});
 
 		it('heals unconfigured-but-declared: resolveClusterPolicy with assumedClusterSize 2 repairs', async () => {

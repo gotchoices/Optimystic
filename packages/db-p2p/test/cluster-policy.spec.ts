@@ -113,6 +113,26 @@ describe('resolveClusterPolicy', () => {
 				.to.have.lengthOf(1);
 		});
 
+		it('states the deployment size that actually cannot heal — the corroboration floor plus the reader, not the replication factor', async () => {
+			// `corroboratorCapacity` caps only the floor of two, so an unconfigured clusterSize: 10
+			// deployment running 4 machines repairs fine. Only a cohort that cannot field two peers
+			// besides the reader is stuck. An advisory that overstates the threshold is worse than none.
+			const captured = await captureLog('cluster-policy', async () => {
+				resolveClusterPolicy({ clusterSize: 10 });
+			});
+
+			const payload = captured
+				.find(args => typeof args[0] === 'string' && args[0].includes('assumed-cluster-size-unset'))
+				?.[1] as { minimumSelfHealingDeployment?: number, message?: string } | undefined;
+
+			expect(payload?.minimumSelfHealingDeployment).to.equal(3);
+			expect(payload?.message).to.contain('fewer than 3 machines');
+			expect(payload?.message).to.not.contain('fewer than 10 machines');
+			// The fix and the reassurance that it is not a replication downgrade both stay named.
+			expect(payload?.message).to.contain('clusterPolicy.assumedClusterSize');
+			expect(payload?.message).to.contain('clusterSize=10');
+		});
+
 		it('does not fire when assumedClusterSize is declared', async () => {
 			const captured = await captureLog('cluster-policy', async () => {
 				resolveClusterPolicy({ clusterSize: 16, clusterPolicy: { assumedClusterSize: 16 } });

@@ -453,7 +453,10 @@ saveMaterializedBlock(block): store(structuredClone(block));
   back to `clusterSize` when it is absent — deliberately the strict fallback, so an unconfigured
   node keeps the floor of two. A genuine small deployment declares
   `clusterPolicy.assumedClusterSize` to heal, which — unlike lowering `clusterSize` — does not
-  also lower its replication factor. No rev quorum, or no content quorum →
+  also lower its replication factor. A node that leaves it undeclared says so once at startup
+  (`assumed-cluster-size-unset`), naming the resolved `repairCorroborationClusterSize` and the
+  smallest deployment that can still heal — the corroboration floor of two plus the reader, i.e.
+  three machines. No rev quorum, or no content quorum →
   it leaves the block for a later churn/rebalance retry (logged
   `reconcile:no-rev-quorum` / `reconcile:no-content-quorum`). Reconciliation is
   best-effort and bounded (`ReconcileTimeoutMs`, the shared `RECONCILE_TIMEOUT_MS` the read
