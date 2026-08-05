@@ -60,8 +60,8 @@ transaction that triggered the replay was rolled back — until an unrelated fut
 commit happened to touch the same block again. See
 `packages/db-core/test/collection.spec.ts` ("external commit visibility after
 conflict replay") for the regression test, and
-`packages/quereus-plugin-optimystic/test/committed-read-interleave.spec.ts` for the
-end-to-end shape.
+`packages/quereus-plugin-optimystic/test/external-commit-visibility-after-rollback.spec.ts`
+for the end-to-end shape.
 
 This also settles a question about intended semantics: a **live** read (the vtab
 read path above, or any read through a collection's own `tracker`/`update()`) always
