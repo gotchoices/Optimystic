@@ -1,7 +1,7 @@
 import { expect } from 'chai';
-import { readdir, readFile } from 'node:fs/promises';
+import { readFile } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
-import { join } from 'node:path';
+import { tsFiles } from './source-scan.js';
 
 /**
  * Guardrail enforcing the layering rule from `cohort-topic-package-layering`:
@@ -34,20 +34,6 @@ const FORBIDDEN = (spec: string): boolean =>
 	spec === 'p2p-fret' || spec.startsWith('p2p-fret/') ||
 	spec === 'libp2p' || spec.startsWith('libp2p/') ||
 	spec.startsWith('@libp2p/');
-
-async function tsFiles(dir: string): Promise<string[]> {
-	const entries = await readdir(dir, { withFileTypes: true });
-	const out: string[] = [];
-	for (const entry of entries) {
-		const full = join(dir, entry.name);
-		if (entry.isDirectory()) {
-			out.push(...await tsFiles(full));
-		} else if (entry.name.endsWith('.ts')) {
-			out.push(full);
-		}
-	}
-	return out;
-}
 
 describe('db-core layering — no FRET / libp2p imports', () => {
 	it('packages/db-core/src/** never imports p2p-fret or libp2p', async () => {
