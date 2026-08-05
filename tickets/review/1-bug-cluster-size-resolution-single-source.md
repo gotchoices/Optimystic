@@ -31,10 +31,18 @@ Because the condition is purely configuration-driven (not tied to an observed co
 
 # Tests
 
-- `packages/db-p2p/test/cluster-policy.spec.ts` — new `describe('assumed-cluster-size-unset startup warning')` block: fires exactly once for the default (unconfigured) case, does not fire once `assumedClusterSize` is declared, does not fire for an honest `clusterSize: 2`, and does fire for a large genuinely-provisioned `clusterSize` (documenting the deliberate advisory-not-fault framing). Uses the existing `test/support/capture-log.ts` helper (already used by `coordinator-repo-read-repair*.spec.ts`).
-- `packages/db-p2p/test/cluster-size-coupling.spec.ts` (new) — unit tests on `assertClusterSizeCoupling` directly (passes when consumers agree, throws naming the consumer(s) that don't, skips `undefined` consumers), plus two integration tests that boot a real node via `createLibp2pNode` (`src/libp2p-node.js`) and assert `node.keyNetwork.effectiveClusterSize` and `(node.services.networkManager).effectiveClusterSize` both equal `resolveClusterPolicy({}).clusterSize` on the default path, and both equal an explicitly configured `clusterSize: 4`.
+- `packages/db-p2p/test/cluster-policy.spec.ts` — `describe('assumed-cluster-size-unset startup warning')` block: fires exactly once for the default (unconfigured) case, does not fire once `assumedClusterSize` is declared, does not fire for an honest `clusterSize: 2`, and does fire for a large genuinely-provisioned `clusterSize` (documenting the deliberate advisory-not-fault framing). Uses the existing `test/support/capture-log.ts` helper (already used by `coordinator-repo-read-repair*.spec.ts`).
+- `packages/db-p2p/test/cluster-size-coupling.spec.ts` — unit tests on `assertClusterSizeCoupling` directly (passes when consumers agree, throws naming the consumer(s) that don't, skips `undefined` consumers), plus two integration tests that boot a real node via `createLibp2pNode` (`src/libp2p-node.js`) and assert `node.keyNetwork.effectiveClusterSize` and `(node.services.networkManager).effectiveClusterSize` both equal `resolveClusterPolicy({}).clusterSize` on the default path, and both equal an explicitly configured `clusterSize: 4`.
 
-Full package suite (`packages/db-p2p`): 1529 passing, 0 failing, 44 pending (pre-existing skips, unrelated). Workspace `tsc --noEmit` clean for `db-p2p`, `reference-peer`, and `quereus-plugin-optimystic` (the other two construct `Libp2pKeyPeerNetwork` directly and were checked for fallout from the getter/type additions).
+## Verification performed at implement handoff (this pass)
+
+Re-ran independently, from a clean working tree (no code changes made in this pass — the fix commit had already landed):
+
+- `packages/db-p2p`: `yarn tsc --noEmit` clean.
+- `packages/db-p2p`: `yarn test` → 1529 passing, 0 failing, 44 pending (pre-existing skips, unrelated to this change).
+- `reference-peer`: `yarn tsc --noEmit` clean.
+- `quereus-plugin-optimystic`: `yarn tsc --noEmit` clean.
+- Confirmed by reading `libp2p-node-base.ts`: exactly one `resolveClusterPolicy` call site (line ~470), `assertClusterSizeCoupling` called once against `{ keyNetwork, networkManager }`, and both `effectiveClusterSize` getters exist on `NetworkManagerService` and `Libp2pKeyPeerNetwork`.
 
 # Gaps / what a reviewer should double check
 
