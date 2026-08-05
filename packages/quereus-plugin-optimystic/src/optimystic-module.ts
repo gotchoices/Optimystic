@@ -480,7 +480,9 @@ export class OptimysticVirtualTable extends VirtualTable {
    * Invoked via the per-scan {@link OptimysticCommittedTable} wrapper returned from
    * {@link OptimysticModule.connect} so the committed view never mutates the shared,
    * cached table instance — a concurrent live scan of the same table during deferred
-   * -constraint drain must keep seeing the live view.
+   * -constraint drain must keep seeing the live view. The committed path never
+   * registers a connection (see {@link runQuery}): a `_readCommitted` read must not
+   * mutate the engine's connection registry or join the writer's transaction.
    */
   async* queryCommitted(filterInfo: FilterInfo): AsyncIterable<Row> {
     yield* this.runQuery(filterInfo, true);
@@ -491,10 +493,39 @@ export class OptimysticVirtualTable extends VirtualTable {
    * identical for both; only the read SOURCE differs — `committed` routes each read
    * shape (full scan, point lookup, index seek) to a pre-transaction view of the
    * relevant tree (see {@link committedTreeView}).
+   *
+   * The committed arm builds EVERY view the scan will use — the main tree plus the
+   * index tree, when the parsed plan drives one — in ONE synchronous block, so both
+   * pin the same committed moment. Building them across an await boundary let a
+   * commit land in between: the main view pinned one revision and the index view
+   * another, so an index-driven plan and a full scan of the same nominal snapshot
+   * could disagree — which the committed-snapshot contract forbids (see upstream
+   * module-authoring.md § Committed-Snapshot Reads).
    */
   private async* runQuery(filterInfo: FilterInfo, committed: boolean): AsyncIterable<Row> {
-    // Ensure connection is registered
-    await this.ensureConnectionRegistered();
+    if (committed) {
+      // Refuse to answer from a known-degraded state: after a partial commit some
+      // trees are durably committed and others are not, so NO single tree set is a
+      // coherent commit boundary. Upstream requires throwing from the first pull
+      // rather than answering. Live reads are unaffected — they honestly mirror
+      // whatever the trees hold.
+      const degradedReason = this.txnBridge.getDegradedReason();
+      if (degradedReason !== undefined) {
+        throw new QuereusError(
+          `Committed read refused: storage is in a partially-committed state and no ` +
+          `coherent committed snapshot exists until the next successful commit or ` +
+          `rollback. ${degradedReason}`,
+          StatusCode.ERROR,
+        );
+      }
+      // Deliberately NO ensureConnectionRegistered() here: a `_readCommitted` read
+      // must not mutate the engine's connection registry — a first-touch committed
+      // read running outside the exec mutex would otherwise register the writer's
+      // connection mid-transaction.
+    } else {
+      // Live reads join the writer's transaction; make sure the connection exists.
+      await this.ensureConnectionRegistered();
+    }
 
     // Wait for initialization if needed
     if (!this.isInitialized) {
@@ -506,23 +537,60 @@ export class OptimysticVirtualTable extends VirtualTable {
     }
 
     try {
-      // Resolve the main-table read source once. Live reads refresh from the network
-      // first; committed reads read the captured pre-transaction snapshot as-is (a
-      // mid-constraint network pull would defeat the point of reading committed state).
-      const mainRead = await this.resolveMainRead(committed);
-
-      // Parse idxStr to determine access strategy
+      // Parse the access strategy FIRST (all synchronous), so the committed arm
+      // below can resolve every tree this scan reads before building any view.
       // Quereus uses idxStr like 'idx=_primary_(0);plan=2' for equality seeks
-      // or 'idx=idx_category(0);plan=2' for secondary index seeks
+      // or 'idx=idx_category(0);plan=2' for secondary index seeks.
       const planType = this.parsePlanType(filterInfo.idxStr);
       const indexName = this.parseIndexName(filterInfo.idxStr);
 
       // Determine if this is a secondary index (not primary key)
       const isSecondaryIndex = indexName != null && indexName !== '_primary_';
 
+      // The secondary index this scan reads through, if any: a modern index seek
+      // (idx=<name> with args) or a legacy index scan (idxNum >= 10, idxStr is the
+      // bare index name). Mirrors the dispatch order below — the legacy arm applies
+      // only when no modern plan matched first.
+      let scanIndexName: string | undefined;
       if (isSecondaryIndex && filterInfo.args.length > 0) {
-        // Secondary index seek - route to index scan
-        yield* this.executeIndexScan(mainRead, indexName, filterInfo.args, committed);
+        scanIndexName = indexName;
+      } else if (
+        filterInfo.idxNum >= 10
+        && !(planType === 2 && filterInfo.args.length > 0)
+        && planType !== 3
+      ) {
+        if (!filterInfo.idxStr || typeof filterInfo.idxStr !== 'string') {
+          throw new Error('Index name not provided for index scan');
+        }
+        scanIndexName = filterInfo.idxStr;
+      }
+
+      const mainTree = this.collection as unknown as Tree<string, RowData>;
+      const indexTree = scanIndexName !== undefined
+        ? this.resolveIndexTree(scanIndexName)
+        : undefined;
+
+      let mainRead: TreeReadView<string, RowData>;
+      let indexRead: TreeReadView<string, IndexEntry> | undefined;
+      if (committed) {
+        // ONE synchronous block — no await between the two views — so both pin the
+        // SAME committed moment (committedTreeView is synchronous). A committed read
+        // never refreshes from the network: a mid-constraint pull would defeat the
+        // point of reading committed state.
+        mainRead = this.committedTreeView(mainTree);
+        indexRead = indexTree !== undefined ? this.committedTreeView(indexTree) : undefined;
+      } else {
+        // Live reads refresh each tree from the network first.
+        await mainTree.update();
+        mainRead = mainTree;
+        if (indexTree !== undefined) {
+          await indexTree.update();
+          indexRead = indexTree;
+        }
+      }
+
+      if (scanIndexName !== undefined && indexRead !== undefined) {
+        yield* this.executeIndexScan(mainRead, indexRead, scanIndexName, filterInfo.args);
       } else if (planType === 2 && filterInfo.args.length > 0) {
         // Primary key equality seek (plan=2)
         yield* this.executePointLookup(mainRead, filterInfo.args);
@@ -535,13 +603,6 @@ export class OptimysticVirtualTable extends VirtualTable {
       } else if (filterInfo.idxNum === 2) {
         // Legacy: Range query on primary key
         yield* this.executeRangeQuery(mainRead, filterInfo);
-      } else if (filterInfo.idxNum >= 10) {
-        // Legacy: Index-based scan
-        const idxName = filterInfo.idxStr;
-        if (!idxName || typeof idxName !== 'string') {
-          throw new Error('Index name not provided for index scan');
-        }
-        yield* this.executeIndexScan(mainRead, idxName, filterInfo.args, committed);
       } else {
         // Full table scan
         yield* this.executeTableScan(mainRead);
@@ -554,17 +615,23 @@ export class OptimysticVirtualTable extends VirtualTable {
   }
 
   /**
-   * Resolve the main-table read source for the current read mode. Live → the live
-   * collection, refreshed from the network. Committed → the pre-transaction view of
-   * the collection ({@link committedTreeView}).
+   * Resolve the tree behind a named secondary index, throwing when the index or its
+   * tree is unknown. Synchronous, so {@link runQuery}'s committed arm can resolve it
+   * inside the single view-building block.
    */
-  private async resolveMainRead(committed: boolean): Promise<TreeReadView<string, RowData>> {
-    const collection = this.collection as unknown as Tree<string, RowData>;
-    if (committed) {
-      return this.committedTreeView(collection);
+  private resolveIndexTree(indexName: string): Tree<string, IndexEntry> {
+    if (!this.indexManager) {
+      throw new Error('Table not initialized');
     }
-    await collection.update();
-    return collection;
+    const indexSchema = this.indexManager.getIndexSchema(indexName);
+    if (!indexSchema) {
+      throw new Error(`Index not found: ${indexName}`);
+    }
+    const indexTree = this.indexManager.getIndexTree(indexName);
+    if (!indexTree) {
+      throw new Error(`Index tree not found: ${indexName}`);
+    }
+    return indexTree;
   }
 
   /**
@@ -659,36 +726,22 @@ export class OptimysticVirtualTable extends VirtualTable {
   }
 
   /**
-   * Execute an index-based scan. The main-table rows are fetched through `mainRead`
-   * (live or committed); the index tree is read through a matching source so a
-   * committed seek excludes index entries staged by the in-flight transaction.
+   * Execute an index-based scan. Both read sources are resolved by {@link runQuery}
+   * BEFORE this is called — for a committed read, in the same synchronous block as
+   * the main view, so the index entries and the rows they resolve to come from one
+   * committed moment. This method never builds or refreshes a view itself.
    */
   private async* executeIndexScan(
     mainRead: TreeReadView<string, RowData>,
+    indexRead: TreeReadView<string, IndexEntry>,
     indexName: string,
     args: readonly unknown[],
-    committed: boolean,
   ): AsyncIterable<Row> {
     if (!this.rowCodec || !this.indexManager) return;
 
     const indexSchema = this.indexManager.getIndexSchema(indexName);
     if (!indexSchema) {
       throw new Error(`Index not found: ${indexName}`);
-    }
-
-    const indexTree = this.indexManager.getIndexTree(indexName);
-    if (!indexTree) {
-      throw new Error(`Index tree not found: ${indexName}`);
-    }
-
-    // Resolve the index-tree read source to match the main read mode. Live → refresh
-    // from the network; committed → the pre-transaction view of the index tree.
-    let indexRead: TreeReadView<string, IndexEntry>;
-    if (committed) {
-      indexRead = this.committedTreeView(indexTree);
-    } else {
-      await indexTree.update();
-      indexRead = indexTree;
     }
 
     // Build the (possibly partial) framed index key from constraint values. Must use
@@ -1664,9 +1717,34 @@ class OptimysticCommittedTable extends VirtualTable {
     throw new QuereusError('Cannot modify committed-state snapshot', StatusCode.ERROR);
   }
 
+  /**
+   * A committed-read view must never enlist in the engine's transaction
+   * coordination: upstream's `_readCommitted` contract forbids handing such a
+   * connection to `Database.registerConnection` (it would receive the writer's
+   * begin/commit/rollback/savepoint broadcasts — and this connection class drives
+   * the SHARED TransactionBridge, so an enlisted committed view would drive the
+   * writer's transaction). Refuse loudly rather than let a generic connection
+   * helper enlist this view by accident.
+   */
+  createConnection(): VirtualTableConnection {
+    throw new QuereusError(
+      'A committed-read (_readCommitted) table cannot create a transaction connection',
+      StatusCode.MISUSE,
+    );
+  }
+
+  /** No connection, ever: the committed-read connect path registers nothing. */
+  getConnection(): VirtualTableConnection | undefined {
+    return undefined;
+  }
+
   async disconnect(): Promise<void> {
-    // No-op: the committed view shares the inner table's lifetime and owns no
-    // resources (its per-scan read tracker is created and dropped inside query()).
+    // No-op — and correct BECAUSE nothing was registered: the committed-read
+    // connect path never calls registerConnection (see resolveConnectedTable's
+    // registerConnection flag) and createConnection/getConnection above make sure
+    // nothing can enlist this view later, so there is genuinely nothing to tear
+    // down and the engine's connection registry is left exactly as the writer had
+    // it. The per-scan read tracker is created and dropped inside query().
   }
 }
 
@@ -1674,6 +1752,33 @@ class OptimysticCommittedTable extends VirtualTable {
  * Optimystic Virtual Table Module
  */
 export class OptimysticModule implements VirtualTableModule<VirtualTable, OptimysticModuleConfig> {
+  /**
+   * Concurrent `query()` calls on ONE connected table are safe (audited):
+   *   - every scan's mutable state (read views, iterators, retry bookkeeping,
+   *     `yieldedKeys`) is local to the generator invocation;
+   *   - a committed scan reads a per-scan pinned view that never touches live state;
+   *   - a live scan's `collection.update()` serializes behind the collection's own
+   *     per-collection latch, and mid-scan tree mutation is already tolerated via
+   *     path-invalidation retry (replicated external commits impose the same
+   *     interleaving with or without concurrent reads);
+   *   - the one shared field a FAILING scan writes is `setErrorMessage(...)` —
+   *     diagnostics only, last writer wins; accepted as-is.
+   * Writes still serialize (this mode's contract); the bridge's single-writer
+   * constraint is documented at `TransactionBridge.currentTransaction` and in
+   * docs/transactions.md § "One writer at a time on the shared TransactionBridge".
+   *
+   * `expectedLatencyMs` is deliberately NOT declared: this module fronts
+   * transactors ranging from in-memory (`test`, microseconds) through local file
+   * storage to libp2p network cohorts (tens to hundreds of ms), and the hint is
+   * static per MODULE — any single number would misestimate most deployments.
+   * Declare it if per-deployment configuration can ever feed a measured value.
+   *
+   * `readCommittedSnapshot` stays UNDECLARED (off) until ticket
+   * `committed-read-snapshot-declaration` proves the stall-overlap guarantee —
+   * the declaration is what routes reads onto the mutex-free concurrent path.
+   */
+  readonly concurrencyMode = 'reentrant-reads' as const;
+
   private tables = new Map<string, OptimysticVirtualTable>();
   // The schema tree (`tree://optimystic/schema`) is plugin-global, so a single
   // SchemaManager per (transactor, key-network, network-name, raw-storage-
@@ -1848,11 +1953,18 @@ export class OptimysticModule implements VirtualTableModule<VirtualTable, Optimy
     options: OptimysticModuleConfig,
     tableSchema?: TableSchema
   ): Promise<VirtualTable> {
-    const baseTable = await this.resolveConnectedTable(db, schemaName, tableName, tableSchema);
+    const committed = options?._readCommitted === true;
+
+    // The committed path resolves (and, on first touch, initializes) the table but
+    // never registers a connection: a `_readCommitted` connection must not join the
+    // writer's transaction, and once such reads run outside the exec mutex a
+    // first-touch committed read must not mutate the engine's connection registry
+    // mid-transaction. Initialization is memoized and idempotent, so it is safe here.
+    const baseTable = await this.resolveConnectedTable(db, schemaName, tableName, !committed, tableSchema);
 
     // Honour the committed-read flag with a per-scan read-only view; the shared table
     // is unchanged, so a concurrent live scan of it keeps its live view.
-    if (options?._readCommitted) {
+    if (committed) {
       return new OptimysticCommittedTable(baseTable);
     }
     return baseTable;
@@ -1861,12 +1973,14 @@ export class OptimysticModule implements VirtualTableModule<VirtualTable, Optimy
   /**
    * Resolve (and initialize) the cached {@link OptimysticVirtualTable} for a
    * schema.table, instantiating it from the supplied/looked-up schema on first
-   * connect. Shared by {@link connect} for both the live and committed-read paths.
+   * connect. Shared by {@link connect} for both the live and committed-read paths;
+   * only the live path registers a connection (`registerConnection: true`).
    */
   private async resolveConnectedTable(
     db: Database,
     schemaName: string,
     tableName: string,
+    registerConnection: boolean,
     tableSchema?: TableSchema
   ): Promise<OptimysticVirtualTable> {
     const tableKey = `${schemaName}.${tableName}`.toLowerCase();
@@ -1884,7 +1998,9 @@ export class OptimysticModule implements VirtualTableModule<VirtualTable, Optimy
 
     const table = await this.instantiateTable(db, resolvedSchema);
     await table.initialize();
-    await table.ensureConnectionRegistered();
+    if (registerConnection) {
+      await table.ensureConnectionRegistered();
+    }
 
     return table;
   }

@@ -79,7 +79,33 @@ export class PartialCommitError extends Error {
  * 2. Transaction mode: Using TransactionSession for distributed consensus
  */
 export class TransactionBridge {
+  // NOTE: single-valued transaction state — ONE writer at a time is a standing
+  // constraint of this bridge. `currentTransaction`, `session`, `dirtyTrees`,
+  // `savepoints`, and `accumulatedStatements` all describe THE transaction, not a
+  // transaction per connection; a second concurrent WRITER would overwrite them
+  // wholesale. The bridge cannot enforce this itself without breaking SQLite's
+  // "BEGIN inside a transaction is a no-op" semantics (beginTransaction
+  // deliberately returns the existing transaction, so a second writer's BEGIN is
+  // indistinguishable from a nested BEGIN). Quereus serializes writers behind its
+  // exec mutex and the concurrent `_readCommitted` path is read-only, so the
+  // constraint holds today. If a host ever drives two writers concurrently, each
+  // needs its OWN bridge. See docs/transactions.md § "One writer at a time on the
+  // shared TransactionBridge" for the shared-vs-single-writer state table.
   private currentTransaction: TransactionState | null = null;
+  /**
+   * Non-null while the store is in a known-degraded state: a partial commit
+   * ({@link PartialCommitError} in legacy mode, `CoordinatorPartialCommitError` in
+   * session mode) left some trees durably committed and others not, so NO single
+   * tree set is a coherent commit boundary. While latched, committed
+   * (`_readCommitted`) reads must refuse to answer — the vtab checks
+   * {@link getDegradedReason} at the first pull and throws, per upstream's
+   * committed-snapshot contract ("throw rather than answer from a state that
+   * cannot serve a coherent committed snapshot"). Live reads are unaffected: they
+   * report whatever the trees hold, which honestly mirrors storage. Cleared by the
+   * next successful commit or rollback — the point at which a reconciled local
+   * state is back in view.
+   */
+  private degradedReason: string | null = null;
   private collectionFactory: CollectionFactory;
   /** Accumulated SQL statements for the current transaction */
   private accumulatedStatements: string[] = [];
@@ -344,6 +370,9 @@ export class TransactionBridge {
       this.session = null;
       this.dirtyTrees.clear();
       this.savepoints.clear();
+      // A clean commit reconciles the local view — release the degraded latch so
+      // committed reads answer again (see degradedReason).
+      this.degradedReason = null;
 
     } catch (error) {
       if (error instanceof PartialCommitError) {
@@ -351,7 +380,10 @@ export class TransactionBridge {
         // never touched storage and left the durably-committed trees alone (their
         // in-memory state correctly mirrors storage). Running rollbackTransaction
         // here would restore the committed trees too, re-introducing exactly the
-        // memory/storage divergence this error exists to prevent. Just propagate.
+        // memory/storage divergence this error exists to prevent. Latch the
+        // degraded state (committed reads must refuse until the next clean
+        // commit/rollback) and propagate.
+        this.degradedReason = error.message;
         throw error;
       }
       if (error instanceof CoordinatorPartialCommitError) {
@@ -361,8 +393,11 @@ export class TransactionBridge {
         // the committed collections' trackers to cache + reset, restored the failed
         // ones). Running rollbackTransaction here would clean-restore the committed
         // collections' trackers too, cementing the memory/storage divergence and
-        // falsely reporting a rollback that did not happen. So tear down transaction
-        // state WITHOUT restoring, and propagate the structured signal for reconciliation.
+        // falsely reporting a rollback that did not happen. So latch the degraded
+        // state (committed reads must refuse until the next clean commit/rollback),
+        // tear down transaction state WITHOUT restoring, and propagate the
+        // structured signal for reconciliation.
+        this.degradedReason = error.message;
         this.currentTransaction!.collections.clear();
         this.currentTransaction!.isActive = false;
         this.accumulatedStatements = [];
@@ -491,6 +526,9 @@ export class TransactionBridge {
 
     this.accumulatedStatements = [];
     this.session = null;
+    // A clean rollback restores a reconciled local view (memory matches what each
+    // tree's storage holds) — release the degraded latch (see degradedReason).
+    this.degradedReason = null;
 
     // Note: We intentionally do NOT clear the collection factory cache here.
     // The transactor cache contains pre-registered transactors that should persist
@@ -503,6 +541,24 @@ export class TransactionBridge {
    */
   getCurrentTransaction(): TransactionState | null {
     return this.currentTransaction;
+  }
+
+  /**
+   * True while a partial commit has left the trees split (some durably committed,
+   * some not) and no clean commit/rollback has since restored a reconciled view.
+   * Committed (`_readCommitted`) reads must refuse to answer while this holds —
+   * see {@link degradedReason}.
+   */
+  isDegraded(): boolean {
+    return this.degradedReason !== null;
+  }
+
+  /**
+   * The reason the bridge is degraded (the partial-commit error's message, naming
+   * the persisted vs. unpersisted trees/collections), or undefined when healthy.
+   */
+  getDegradedReason(): string | undefined {
+    return this.degradedReason ?? undefined;
   }
 
   /**

@@ -118,6 +118,46 @@ This document describes the architecture for multi-collection transactions in Op
 > (reservation-through-commit or cross-collection compensating reversal, both presuming
 > an agreed supercluster), parked as the backlog item `feat-cross-collection-atomic-commit`.
 
+## One writer at a time on the shared TransactionBridge
+
+The Quereus adapter wires **one** `TransactionBridge` (and one `OptimysticModule`
+table cache) per plugin registration. The bridge's transaction state is
+single-valued — it describes *the* current transaction, not a transaction per
+connection. What is safe to share across concurrent readers and what is not:
+
+| State | Shared across concurrent readers? | Why |
+| --- | --- | --- |
+| `OptimysticModule.tables` map | safe | read-mostly; entries are per `schema.table` and only added, never mutated in place |
+| `TransactionBridge.collectionRegistry` | safe to read | keyed by collection id; a concurrent read only reads it |
+| `currentTransaction`, `session`, `dirtyTrees`, `savepoints`, `accumulatedStatements` | **one writer at a time** | single-valued; a second concurrent *writer* would overwrite the first's transaction wholesale |
+
+Quereus serializes writers behind its execution mutex, and the concurrent
+committed-read path (`_readCommitted`, mutex-free in Quereus ≥ 4.8) is
+read-only and never registers a connection, so the constraint holds today. It
+cannot be *enforced* inside the bridge without breaking SQLite's "BEGIN inside a
+transaction is a no-op" semantics that `beginTransaction` implements
+deliberately — a second writer's BEGIN is indistinguishable from a nested BEGIN.
+If a host ever drives two writers concurrently (or a future engine overlaps
+write statements), each writer needs its **own** bridge; sharing one corrupts
+both transactions silently: the second BEGIN adopts the first's transaction, and
+either side's commit/rollback tears down state the other still owns. The
+constraint is also noted at the `currentTransaction` field in
+[`txn-bridge.ts`](../packages/quereus-plugin-optimystic/src/optimystic-adapter/txn-bridge.ts).
+
+### Committed reads refuse a degraded (partially-committed) store
+
+After a partial commit (`PartialCommitError` in legacy mode,
+`CoordinatorPartialCommitError` in session mode) some trees are durably
+committed and others are not, so **no** single tree set is a coherent commit
+boundary. The bridge latches a degraded flag when either error is raised
+(`TransactionBridge.isDegraded()` / `getDegradedReason()`). While latched, a
+committed (`_readCommitted`) read throws from its first pull — naming the
+persisted vs. unpersisted trees — rather than serve an incoherent "snapshot";
+this is what upstream's committed-snapshot contract requires of a module in a
+known-degraded state. Live reads still answer: they honestly mirror whatever the
+trees hold. The latch clears on the next successful commit or rollback, the
+point at which a reconciled local state is back in view.
+
 ## Secrets and the replicated statement record
 
 **Short answer:** passing a private key to `sign(data, key)` — as a literal or a bound
