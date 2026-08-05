@@ -1653,7 +1653,18 @@ export class OptimysticVirtualTable extends VirtualTable {
             throw new Error('UPDATE requires old key values');
           }
           {
-            const oldKey = this.rowCodec.extractPrimaryKey(oldKeyValues);
+            // `oldKeyValues` is the COMPACT key tuple — one cell per
+            // primaryKeyDefinition entry, in that order — NOT a full row indexed by
+            // column position (quereus's UpdateArgs contract, vtab/table.ts). So it
+            // goes through createPrimaryKey (positional), never extractPrimaryKey
+            // (which addresses row[pkDef[i].index] and is for full rows only). The
+            // two agree only when the PK columns are the table's leading columns in
+            // PK order; anywhere else extractPrimaryKey read past the tuple, took
+            // `undefined` -> null for the trailing key parts, and produced a key
+            // that matched nothing — making a same-key UPDATE look like a PK move
+            // onto its own occupied slot and reporting the row as colliding with
+            // itself. See test/oldkeyvalues-compact-shape.spec.ts.
+            const oldKey = this.rowCodec.createPrimaryKey(oldKeyValues as SqlValue[]);
             const newKey = this.rowCodec.extractPrimaryKey(values);
             const encodedRow = this.rowCodec.encodeRow(values);
 
@@ -1750,7 +1761,10 @@ export class OptimysticVirtualTable extends VirtualTable {
             throw new Error('DELETE requires old key values');
           }
           {
-            const deleteKey = this.rowCodec.extractPrimaryKey(oldKeyValues);
+            // Compact key tuple, positional — see the note on the UPDATE path's
+            // oldKey. Read as a full row, a non-leading PK yielded a key nothing
+            // occupied and the DELETE silently removed nothing.
+            const deleteKey = this.rowCodec.createPrimaryKey(oldKeyValues as SqlValue[]);
 
             // Fetch the actual old row before staging. Staging clears the slot,
             // so a fetch-after would return nothing. Fallback to oldKeyValues
