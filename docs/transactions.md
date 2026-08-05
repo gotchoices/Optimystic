@@ -202,6 +202,17 @@ What holds the guarantee, and where it is proven:
   the next quiescent or live touch upgrades it. See
   `OptimysticVirtualTable.initializeForCommittedRead`.
 
+**What the pin changed for `committed.<Table>` inside a deferred CHECK.** The
+same snapshot-boundary pin applies to the serialized deferred-constraint path,
+so a `committed.<Table>` reference now describes the boundary the current
+transaction first *touched* that table on, rather than the latest commit some
+other node folded in since. Read-your-transaction-base is the coherent choice
+here — and it costs nothing in safety, because a constraint's real enforcement
+is validator peers re-executing the recorded statements against their own
+committed state. But it does mean a deferred CHECK no longer observes an
+external commit that lands mid-transaction on a table this transaction has
+already written to.
+
 Proven by `test/committed-read-stall.spec.ts`, which parks a delegating
 transactor's commit-side calls (`pend`/`commit`; `get` passes through) and
 asserts committed reads settle within a bounded number of event-loop turns with

@@ -144,13 +144,12 @@ describe('Database.close() with a concurrent committed read in flight', function
 		// Drain the iterator: rows until the abort lands (or clean completion — a
 		// fast scan may finish before the signal is observed). Either way the
 		// generator's finally must run scope.end() so close() can resolve.
-		let sawError = false;
 		try {
 			for (let r = await iter.next(); !r.done; r = await iter.next()) {
 				// draining
 			}
 		} catch {
-			sawError = true;
+			// The abort arm: swallowed deliberately — see below.
 		}
 
 		await closing;
@@ -159,6 +158,5 @@ describe('Database.close() with a concurrent committed read in flight', function
 		// illegal is close() hanging, which the await above (under the suite timeout,
 		// plus the bounded settle below) rules out.
 		await settleMacrotasks(10);
-		void sawError;
 	});
 });

@@ -308,8 +308,22 @@ describe('Committed reads under a stalled commit (proof B)', function () {
 				const scanAIds = scan.filter(r => r.cat === 'a').map(r => Number(r.id)).sort((x, y) => x - y);
 				expect(indexIds).to.deep.equal(scanAIds);
 
+				// Third access path: a primary-key POINT LOOKUP (plan=2) must land on the
+				// same pinned boundary as the full scan and the index scan. It descends the
+				// already-flushed main tree by key instead of walking it in order, so it is
+				// the shape most likely to surface a post-commit block if the pin slipped.
+				const point = await expectPrompt(
+					collectRows(h.db, 'select id, cat from Item where id = 7', true),
+					'committed point lookup during mid-sweep stall',
+				);
+				expect(point.map(r => r.cat)).to.deep.equal(
+					scan.filter(r => Number(r.id) === 7).map(r => r.cat));
+				expect(writerSettled()).to.equal(false);
+
 				h.gate.release();
 				await writer;
+				const freshPoint = await collectRows(h.db, 'select id, cat from Item where id = 7', true);
+				expect(freshPoint.map(r => r.cat)).to.deep.equal(['z']);
 				const fresh = await collectRows(h.db, 'select id, cat from Item order by id', true);
 				expect(fresh.map(r => r.cat)).to.deep.equal(Array.from({ length: SEED }, () => 'z'));
 			} finally {

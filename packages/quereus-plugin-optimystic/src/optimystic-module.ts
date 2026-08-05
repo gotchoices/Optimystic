@@ -218,6 +218,10 @@ export class OptimysticVirtualTable extends VirtualTable {
    * resolve the schema without writing it, and skip collection registration and
    * change subscription. The table stays un-memoized as initialized, so the next
    * touch on a quiescent bridge (or the next live touch) upgrades it fully.
+   *
+   * An initialization already in flight wins over both branches — a full one because
+   * its caller owns the decision to join, a provisional one because awaiting it would
+   * make the quiescence check below stale (see the comments at those checks).
    */
   async initializeForCommittedRead(): Promise<void> {
     if (this.isInitialized) {
@@ -228,20 +232,31 @@ export class OptimysticVirtualTable extends VirtualTable {
     if (this.initializationPromise) {
       return this.initializationPromise;
     }
+    // A PROVISIONAL pass is already in flight: join it, whatever the bridge reads as
+    // right now. Deferring to initialize() here instead would await this pass and only
+    // THEN sample the transaction — a stale check, since a writer may have begun in the
+    // meantime, which is exactly the transaction-joining first touch this method exists
+    // to prevent. A read-only init is always a correct answer for a committed read; the
+    // upgrade happens on the next touch.
+    if (this.provisionalInitPromise) {
+      return this.provisionalInitPromise;
+    }
     if (!this.txnBridge.isTransactionActive()) {
+      // Safe without a re-check: initialize() reaches doInitialize's
+      // getCurrentTransaction() in this same microtask (no provisional pass to await),
+      // so the transaction state it joins is the one just sampled.
       return this.initialize();
     }
     if (this.isProvisionallyInitialized) {
       return;
     }
-    if (!this.provisionalInitPromise) {
-      this.provisionalInitPromise = this.doInitialize(true).finally(() => {
-        // Cleared on completion either way: on success isProvisionallyInitialized
-        // gates re-entry; on failure the next committed read retries.
-        this.provisionalInitPromise = undefined;
-      });
-    }
-    return this.provisionalInitPromise;
+    const pass = this.doInitialize(true).finally(() => {
+      // Cleared on completion either way: on success isProvisionallyInitialized
+      // gates re-entry; on failure the next committed read retries.
+      this.provisionalInitPromise = undefined;
+    });
+    this.provisionalInitPromise = pass;
+    return pass;
   }
 
   /**
@@ -406,6 +421,14 @@ export class OptimysticVirtualTable extends VirtualTable {
       // per-transaction snapshot includes them.
       this.registerCollections();
 
+      // NOTE: this is the one path on which doInitialize runs TWICE for a table — the
+      // upgrade after a provisional pass — so it is the only one that replaces
+      // `rowCodec`/`indexManager` while a committed scan started off the provisional
+      // state may still be iterating (scans re-read both fields per row). Harmless
+      // while both passes resolve the same schema, which they do unless DDL changed the
+      // table in between; if concurrent DDL ever becomes real here, a scan must capture
+      // its codec and index manager as locals alongside its pinned views.
+      this.isProvisionallyInitialized = false;
       this.isInitialized = true;
 
       // Bridge optimystic collection-change notifications to Quereus watch
@@ -744,8 +767,12 @@ export class OptimysticVirtualTable extends VirtualTable {
 
   /**
    * The committed (pre-transaction) read view of `tree`, ALWAYS built through
-   * `readView` — which pins the view to the committed revision current at this call
-   * (see `Collection.createReadTracker`).
+   * `readView` — which pins the view to the boundary the SNAPSHOT was captured on
+   * (`CollectionSnapshot.context`), falling back to the collection's current boundary
+   * only for a snapshot that records none (see `Collection.createReadTracker`). For a
+   * dirty tree that boundary is the transaction's first touch, so the view stays
+   * coherent even mid-commit-sweep; for a clean tree the snapshot is taken here, so
+   * the two are the same moment.
    *
    * When the tree was staged this transaction, the source is the txn-bridge's captured
    * pre-stage snapshot (it excludes the in-flight mutations). When it was not, the
@@ -1851,7 +1878,7 @@ class OptimysticCommittedTable extends VirtualTable {
   async disconnect(): Promise<void> {
     // No-op — and correct BECAUSE nothing was registered: the committed-read
     // connect path never calls registerConnection (see resolveConnectedTable's
-    // registerConnection flag) and createConnection/getConnection above make sure
+    // `committed` arm) and createConnection/getConnection above make sure
     // nothing can enlist this view later, so there is genuinely nothing to tear
     // down and the engine's connection registry is left exactly as the writer had
     // it. The per-scan read tracker is created and dropped inside query().

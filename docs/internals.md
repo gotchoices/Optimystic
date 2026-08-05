@@ -52,8 +52,9 @@ its own current state through a pinned view rather than through the live tree.
 `Tree.readView` → `Collection.createReadTracker` builds a private read stack per view: a fresh
 `Tracker` seeded with the pre-transaction transforms, over a **private**
 `CacheSource` (seeded by cloning the shared cache's current entries), over a
-**private** `TransactorSource` whose action context is deep-copy **frozen** at
-view-creation time. Because the transactor materializes at `context.rev`
+**private** `TransactorSource` whose action context is deep-copy **frozen** at the
+boundary the snapshot was captured on (see the third bullet below; a snapshot with no
+recorded boundary falls back to view-creation time). Because the transactor materializes at `context.rev`
 (`BlockStorage.getBlock` resolves the highest committed rev ≤ the requested one), a
 committed scan returns one point-in-time answer even when a commit folds into — or a
 live read's `update()` clears — the live collection's shared cache mid-scan. The
@@ -68,7 +69,10 @@ rests on validator peers re-executing the recorded statements.
 Three further properties hold for that path:
 
 - **A committed read registers no connection.** `OptimysticModule.connect` with
-  `_readCommitted: true` resolves (and, on first touch, initializes) the shared table
+  `_readCommitted: true` resolves the shared table — initializing it on first touch,
+  and only *provisionally* (read-only: no schema write, no bridge registration, no
+  change subscription) while a writer transaction is open, see
+  `OptimysticVirtualTable.initializeForCommittedRead` —
   but skips `ensureConnectionRegistered()`, and the returned `OptimysticCommittedTable`
   wrapper refuses `createConnection()` and reports no `getConnection()`. So a committed
   read never appears in the engine's connection registry and never receives the
