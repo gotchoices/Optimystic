@@ -6,10 +6,10 @@ This document outlines the design for a Block Repository that provides efficient
 
 The system provides these core operations through the `IBlockNetwork` interface:
 - `get(blockGets[])`: Fetch blocks by their IDs and versions or specific transactions
-- `getStatus(trxRefs[])`: Get statuses of block transactions
-- `pend(blockTrx)`: Post a transaction for a set of blocks
-- `cancel(trxRef)`: Cancel a pending transaction
-- `commit(tailId, trxRef)`: Commit a pending transaction
+- `getStatus(actionRefs[])`: Get statuses of block transactions
+- `pend(blockAction)`: Post a transaction for a set of blocks
+- `cancel(actionRef)`: Cancel a pending transaction
+- `commit(tailId, actionRef)`: Commit a pending transaction
 
 ## Clusters
 
@@ -60,18 +60,18 @@ Here is how a transaction proceeds for a given cluster:
   - Can fail if pending='fail' and other transactions are pending
   - Saves block-specific transforms for each affected block
 
-### 3. `cancel(trxRef)`
+### 3. `cancel(actionRef)`
 
 - **Purpose**: Cancel a pending transaction
-- **Input**: `TrxBlocks` containing block IDs and transaction ID
+- **Input**: `ActionBlocks` containing block IDs and transaction ID
 - **Behavior**: Removes the pending transaction from all specified blocks
 
-### 4. `commit(tailId, trxRef)`
+### 4. `commit(tailId, actionRef)`
 
 - **Purpose**: Commit a pending transaction
 - **Input**:
   - `tailId` - Block ID
-  - `trxRef` - Transaction reference
+  - `actionRef` - Action reference
 - **Output**: `CommitResult` indicating success or missing transactions needed
 - **Behavior**:
   - Verifies expected revision matches current state

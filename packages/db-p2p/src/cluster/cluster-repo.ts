@@ -990,9 +990,9 @@ export class ClusterMember implements ICluster {
 	 *
 	 * NOTE: partition safety needs `2 · membershipAdmissionFraction · superMajorityThreshold > 1` — each
 	 * side of a split must recruit `fraction · threshold · K` distinct honest members, and two sides cannot
-	 * both find them in one K-peer cluster. At the shipped defaults (0.75 · 0.67) that product is 1.005 —
-	 * true, but with almost no margin. If either default is ever lowered, re-check Theorem 2 in
-	 * `docs/correctness.md` before shipping it.
+	 * both find them in one K-peer cluster. At the shipped defaults (0.75 · 0.75 — both default to
+	 * `DEFAULT_SUPER_MAJORITY_THRESHOLD` / `membershipAdmissionFraction`'s own default) that product is
+	 * 1.125. If either default is ever lowered, re-check Theorem 2 in `docs/correctness.md` before shipping it.
 	 */
 	private admissionFloor(k: number): number {
 		const scaled = Math.ceil(this.membershipAdmissionFraction * k);

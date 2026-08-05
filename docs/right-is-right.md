@@ -139,7 +139,9 @@ The current implementation represents a first iteration of these concepts. The d
 
 ### Current Behavior: Threshold-Based Resolution
 
-Promise resolution currently uses a configurable `superMajorityThreshold` (default: 0.67):
+Promise resolution currently uses a configurable `superMajorityThreshold` (default:
+`DEFAULT_SUPER_MAJORITY_THRESHOLD` = 0.75, `packages/db-core/src/cluster/structs.ts`, applied by
+`resolveClusterPolicy` in `packages/db-p2p/src/cluster/cluster-policy.ts`):
 
 ```
 superMajority = ceil(peerCount * superMajorityThreshold)

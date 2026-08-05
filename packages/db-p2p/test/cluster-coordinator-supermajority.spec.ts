@@ -9,7 +9,7 @@ import { toString as u8ToString } from 'uint8arrays';
 /**
  * Locks the super-majority threshold rounding behaviour so the next regression
  * is obvious. `executeTransaction` computes `Math.ceil(peerCount * threshold)`
- * — with a 3-peer cluster and the default 0.67 that rounds to 3, which leaves
+ * — with a 3-peer cluster and the default 0.75 that rounds to 3, which leaves
  * zero slack and demands unanimity. The web-e2e fixture drops to 0.51 so
  * `ceil(3 * 0.51) = 2` and one missing promise no longer sinks consensus.
  *

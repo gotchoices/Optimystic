@@ -1596,12 +1596,12 @@ validators hash, rather than re-deriving the serialization and risking drift.
 ### Phase 0: Nomenclature Alignment (db-core)
 **Goal**: Align all existing code with Operation/Action/Transaction hierarchy
 
-**Context**: The codebase uses "ActionId/ActionRev" as the canonical type names, with "TrxId/TrxRev" as deprecated aliases for backward compatibility.
+**Context**: The codebase uses "ActionId/ActionRev" as the canonical type names, renamed from the earlier "TrxId/TrxRev" (no alias was kept for those two — unlike `TrxBlocks` and its siblings in `network/struct.ts`, which do remain as deprecated aliases).
 
 **Tasks**:
 - [x] Audit all uses of "Trx", "TrxId", "transaction" in db-core
 - [x] Rename to use "Action" terminology consistently
-- [x] Update type names: `TrxId` → `ActionId` (TrxId kept as deprecated alias)
+- [x] Update type names: `TrxId` → `ActionId` (no alias kept)
 - [x] Update function names: `getTrxId()` → `getActionId()`
 - [x] Update comments and documentation
 - [x] Ensure "transaction" is reserved for the new multi-collection concept

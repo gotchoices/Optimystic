@@ -242,7 +242,7 @@ class StorageRepo implements IRepo {
   async get(blockGets: BlockGets): Promise<GetBlockResults>
   async pend(request: PendRequest): Promise<PendResult>  
   async commit(request: CommitRequest): Promise<CommitResult>
-  async cancel(trxRef: TrxBlocks): Promise<void>
+  async cancel(actionRef: ActionBlocks): Promise<void>
 }
 ```
 
@@ -281,11 +281,11 @@ class BlockStorage implements IBlockStorage {
 // Filesystem backend layout (@optimystic/db-p2p-storage-fs)
 {basePath}/
 ├── {blockId}/
-│   ├── meta.json             # Block metadata and revision ranges
-│   ├── revs/{rev}.json       # Revision → ActionId mappings
-│   ├── pend/{actionId}.json  # Pending actions
-│   ├── trx/{actionId}.json   # Committed actions
-│   └── blocks/{actionId}.json # Materialized blocks
+│   ├── meta.json                # Block metadata and revision ranges
+│   ├── revs/{rev}.json          # Revision → ActionId mappings
+│   ├── pend/{actionId}.json     # Pending actions
+│   ├── actions/{actionId}.json  # Committed actions
+│   └── blocks/{actionId}.json   # Materialized blocks
 ```
 
 - **Other backends** — SQLite (`-storage-ns`), LevelDB (`-storage-rn`), IndexedDB (`-storage-web`), each in its own package.

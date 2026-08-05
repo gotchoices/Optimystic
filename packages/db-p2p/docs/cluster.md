@@ -241,7 +241,7 @@ private async handleConsensus(record: ClusterRecord): Promise<void> {
       } else if ('commit' in operation) {
         await this.storageRepo.commit(operation.commit);
       } else if ('cancel' in operation) {
-        await this.storageRepo.cancel(operation.cancel.trxRef);
+        await this.storageRepo.cancel(operation.cancel.actionRef);
       } else if ('get' in operation) {
         await this.storageRepo.get(operation.get);
       }
