@@ -1,5 +1,6 @@
-import { Collection, registerCollectionType } from "../../index.js";
+import { Collection } from "../../index.js";
 import type { ITransactor, Action, BlockId, BlockStore, IBlock, CollectionInitOptions, CollectionId } from "../../index.js";
+import { registerCollectionType } from "../../collection/collection-type-registry.js";
 import { DiaryHeaderBlockType } from "./struct.js";
 
 /** A diary keeps every entry in the log itself, so the header block is the whole structure
