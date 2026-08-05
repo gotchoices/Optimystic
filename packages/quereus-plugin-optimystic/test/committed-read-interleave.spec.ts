@@ -14,6 +14,11 @@
  * Database instance (sharing the same storage) committing inserts and a delete between
  * pulls. The committed scan must return exactly the rows that were committed when it
  * began — no mid-scan rows, no mid-scan disappearances, and never the in-flight row.
+ *
+ * Both arms of `committedTreeView` are covered: a tree that HAS staged DML this
+ * transaction (view built from the captured pre-stage snapshot) and one that has NOT
+ * (view built from the tree's current state). The second used to read through the live
+ * tree, which is exactly the unpinned path — so it must stay covered.
  */
 
 import { expect } from 'chai';
@@ -55,75 +60,88 @@ function registerWithSharedTransactor(db: Database, transactor: ITransactor) {
 	return plugin;
 }
 
+/** Run the interleave probe against `tree://interleave/<tableSuffix>`, optionally
+ * staging an in-flight row first so the committed view comes from the captured
+ * pre-stage snapshot rather than the tree's current state. */
+async function runInterleaveProbe(tableSuffix: string, stageInflight: boolean): Promise<void> {
+	const storage = new MemoryRawStorage();
+	const shared = buildSharedLocalTransactor(storage);
+
+	// Writer/reader database: creates the table and runs the probe statement.
+	const dbA = new Database();
+	registerWithSharedTransactor(dbA, shared);
+	await dbA.exec(`
+		create table Usage (
+			k integer primary key,
+			v text
+		) using optimystic('tree://interleave/${tableSuffix}')
+	`);
+
+	const initialKeys: number[] = [];
+	const values: string[] = [];
+	for (let k = 1; k <= 200; k++) {
+		initialKeys.push(k);
+		values.push(`(${k}, 'v${k}')`);
+	}
+	await dbA.exec(`insert into Usage (k, v) values ${values.join(', ')}`);
+
+	// External writer: a second Database over the SAME storage.
+	const dbB = new Database();
+	const pluginB = registerWithSharedTransactor(dbB, shared);
+	await pluginB.hydrate(dbB);
+
+	try {
+		await dbA.exec('begin');
+		if (stageInflight) {
+			await dbA.exec(`insert into Usage (k, v) values (100000, 'inflight')`);
+		}
+
+		// ONE statement interleaving both read modes: the outer scan is committed,
+		// the correlated subquery scans live Usage — each evaluation runs
+		// collection.update(), which is the cache-clearing arm under probe.
+		const probeSql = `
+			select U.k as k, (select count(*) from Usage L where L.k <= U.k) as live
+			from committed.Usage U
+		`;
+		const iter = dbA.eval(probeSql)[Symbol.asyncIterator]() as AsyncIterator<Row>;
+		const rows: Row[] = [];
+
+		const first = await iter.next();
+		expect(first.done, 'probe scan yielded no rows').to.equal(false);
+		rows.push(first.value);
+
+		// Mid-scan external commit: new rows past the scan frontier, plus deletion of
+		// a committed row the scan has not reached yet.
+		await dbB.exec(`insert into Usage (k, v) values (5001, 'mid'), (5002, 'mid'), (5003, 'mid')`);
+		await dbB.exec(`delete from Usage where k = 150`);
+
+		for (let r = await iter.next(); !r.done; r = await iter.next()) {
+			rows.push(r.value);
+		}
+		await dbA.exec('rollback');
+
+		// The committed view was created before the mid-scan commit: it must show
+		// exactly the initial 200 keys — k=150 still present, no 5001..5003, and
+		// never the in-flight k=100000. (Numeric sort: the vtab stores integer PKs
+		// as encoded strings, so the scan itself yields lexicographic key order.)
+		const keys = rows.map(r => Number(r.k)).sort((a, b) => a - b);
+		expect(keys).to.deep.equal(initialKeys);
+	} finally {
+		dbA.close();
+		dbB.close();
+	}
+}
+
 describe('Committed-read interleave (live scan + committed scan in one statement)', function () {
 	this.timeout(30_000);
 
-	it('a committed scan is unchanged by a commit that lands (and is pulled in by update()) mid-scan', async () => {
-		const storage = new MemoryRawStorage();
-		const shared = buildSharedLocalTransactor(storage);
+	it('a committed scan of a STAGED tree is unchanged by a commit that lands mid-scan', async () => {
+		await runInterleaveProbe('usage', true);
+	});
 
-		// Writer/reader database: creates the table and runs the probe statement.
-		const dbA = new Database();
-		registerWithSharedTransactor(dbA, shared);
-		await dbA.exec(`
-			create table Usage (
-				k integer primary key,
-				v text
-			) using optimystic('tree://interleave/usage')
-		`);
-
-		const initialKeys: number[] = [];
-		const values: string[] = [];
-		for (let k = 1; k <= 200; k++) {
-			initialKeys.push(k);
-			values.push(`(${k}, 'v${k}')`);
-		}
-		await dbA.exec(`insert into Usage (k, v) values ${values.join(', ')}`);
-
-		// External writer: a second Database over the SAME storage.
-		const dbB = new Database();
-		const pluginB = registerWithSharedTransactor(dbB, shared);
-		await pluginB.hydrate(dbB);
-
-		try {
-			// Open a transaction and stage a row so the committed view really is the
-			// captured pre-transaction snapshot (a clean tree would read live directly).
-			await dbA.exec('begin');
-			await dbA.exec(`insert into Usage (k, v) values (100000, 'inflight')`);
-
-			// ONE statement interleaving both read modes: the outer scan is committed,
-			// the correlated subquery scans live Usage — each evaluation runs
-			// collection.update(), which is the cache-clearing arm under probe.
-			const probeSql = `
-				select U.k as k, (select count(*) from Usage L where L.k <= U.k) as live
-				from committed.Usage U
-			`;
-			const iter = dbA.eval(probeSql)[Symbol.asyncIterator]() as AsyncIterator<Row>;
-			const rows: Row[] = [];
-
-			const first = await iter.next();
-			expect(first.done, 'probe scan yielded no rows').to.equal(false);
-			rows.push(first.value);
-
-			// Mid-scan external commit: new rows past the scan frontier, plus deletion of
-			// a committed row the scan has not reached yet.
-			await dbB.exec(`insert into Usage (k, v) values (5001, 'mid'), (5002, 'mid'), (5003, 'mid')`);
-			await dbB.exec(`delete from Usage where k = 150`);
-
-			for (let r = await iter.next(); !r.done; r = await iter.next()) {
-				rows.push(r.value);
-			}
-			await dbA.exec('rollback');
-
-			// The committed view was created before the mid-scan commit: it must show
-			// exactly the initial 200 keys — k=150 still present, no 5001..5003, and
-			// never the in-flight k=100000. (Numeric sort: the vtab stores integer PKs
-			// as encoded strings, so the scan itself yields lexicographic key order.)
-			const keys = rows.map(r => Number(r.k)).sort((a, b) => a - b);
-			expect(keys).to.deep.equal(initialKeys);
-		} finally {
-			dbA.close();
-			dbB.close();
-		}
+	it('a committed scan of a CLEAN (nothing staged) tree is unchanged by a commit that lands mid-scan', async () => {
+		// The clean arm of committedTreeView. Returning the live tree here (as it did
+		// before this ticket's follow-up) failed with `Missing block` mid-scan.
+		await runInterleaveProbe('usage-clean', false);
 	});
 });

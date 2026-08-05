@@ -124,11 +124,13 @@ field naming the constraint and what breaks if a second writer ever appears.
 - **Committed read while the writer's transaction is open on the same table.**
   Pre-stage snapshot present; must return pre-write rows. This is the existing
   `committed-read.spec.ts` guarantee — it must not regress.
-- **Committed read of a table the writer has NOT touched.** No snapshot;
-  `committedTreeView` falls through to the live tree. With ticket 1 landed this
-  is still pinned-at-creation; confirm the fall-through path also goes through a
-  pinned view rather than the raw live tree, or the no-snapshot case is the one
-  remaining unpinned hole.
+- **Committed read of a table the writer has NOT touched.** ALREADY CLOSED by
+  ticket 1's review pass — do not redo. It really was an unpinned hole: the
+  fall-through returned the raw live tree and a mid-scan external commit pulled in
+  by an interleaved live read's `update()` crashed the committed scan with
+  `Missing block` (reproduced end-to-end). `committedTreeView` now always builds a
+  pinned view, using `tree.snapshot()` when the txn-bridge has no captured
+  snapshot; the CLEAN arm is covered in `committed-read-interleave.spec.ts`.
 - **Index-driven vs full-scan agreement** across a commit landing between them —
   the direct test for problem 1. Drive it by hand (build both views, mutate the
   live trees, then iterate), not only through SQL.

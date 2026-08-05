@@ -568,18 +568,32 @@ export class OptimysticVirtualTable extends VirtualTable {
   }
 
   /**
-   * The committed (pre-transaction) read view of `tree`: when the tree was staged
-   * this transaction, a view built from the txn-bridge's captured snapshot (which
-   * excludes the in-flight mutations); otherwise the live tree itself, since a tree
-   * with nothing staged this transaction already reflects committed state. The view
-   * is per-scan and never mutates the live tree, so concurrent live scans of the same
-   * table are unaffected.
+   * The committed (pre-transaction) read view of `tree`, ALWAYS built through
+   * `readView` — which pins the view to the committed revision current at this call
+   * (see `Collection.createReadTracker`).
+   *
+   * When the tree was staged this transaction, the source is the txn-bridge's captured
+   * pre-stage snapshot (it excludes the in-flight mutations). When it was not, the
+   * tree's current staged state already IS the committed state, so `tree.snapshot()`
+   * supplies the same transforms the live tree would read. Returning the live tree
+   * itself in that case is NOT equivalent: the live tree reads through the shared
+   * cache and live action context, so an interleaved live read of the same table
+   * (which runs `collection.update()`, clearing cached blocks when another writer has
+   * committed) makes the committed walk finish against post-commit blocks — observed
+   * as a mid-scan `Missing block` failure, not merely a torn row set.
+   *
+   * The view is per-scan and never mutates the live tree, so concurrent live scans of
+   * the same table are unaffected.
+   *
+   * NOTE: pinning a clean tree costs a transforms copy plus a clone of the cached
+   * blocks (LRU budget, currently 128) per committed scan, where returning the live
+   * tree was free. Fine for per-statement committed reads; if a workload ever opens
+   * committed scans per row over a large hot cache, cache the view per statement.
    */
   private committedTreeView<TKey, TEntry>(tree: Tree<TKey, TEntry>): TreeReadView<TKey, TEntry> {
-    const snapshot = this.txnBridge.getDirtySnapshot(tree);
-    return snapshot !== undefined
-      ? tree.readView(snapshot as Parameters<Tree<TKey, TEntry>['readView']>[0])
-      : tree;
+    const staged = this.txnBridge.getDirtySnapshot(tree);
+    const snapshot = (staged ?? tree.snapshot()) as Parameters<Tree<TKey, TEntry>['readView']>[0];
+    return tree.readView(snapshot);
   }
 
   /**

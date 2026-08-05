@@ -353,7 +353,14 @@ export class Collection<TAction> implements ICollection<TAction> {
 	 *
 	 * NOTE: each view holds up to the cache LRU budget (128) of cloned blocks plus
 	 * whatever it faults in. Views are per-scan and dropped when the scan ends; a very
-	 * long-lived committed scan pins that much memory. */
+	 * long-lived committed scan pins that much memory.
+	 *
+	 * NOTE: an INVENTED collection (createOrOpen found no header, so `actionContext` is
+	 * undefined) pins to no revision — its private source asks the transactor for the
+	 * latest. Harmless today because such a collection's blocks all live in the tracker
+	 * transforms, so a view never reaches storage; if invented collections ever gain
+	 * committed blocks not covered by their transforms, this view would follow storage
+	 * forward instead of staying pinned. */
 	createReadTracker(transforms: Transforms, options?: ReadViewOptions): Tracker<IBlock> {
 		const collector = options?.recordReads ? this.source.getCollector() : undefined;
 		const pinnedSource = new TransactorSource<IBlock>(

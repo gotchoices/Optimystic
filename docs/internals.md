@@ -46,8 +46,10 @@ shape is served from the local materialized tree without first reconciling.
 #### Committed reads are pinned, not shared-cache
 
 `queryCommitted()` (the `committed.<Table>` / `_readCommitted` path) does **not** run
-through the shared pipeline above. `Tree.readView` →
-`Collection.createReadTracker` builds a private read stack per view: a fresh
+through the shared pipeline above. It routes **every** committed read through
+`Tree.readView` — including a tree with nothing staged this transaction, which reads
+its own current state through a pinned view rather than through the live tree.
+`Tree.readView` → `Collection.createReadTracker` builds a private read stack per view: a fresh
 `Tracker` seeded with the pre-transaction transforms, over a **private**
 `CacheSource` (seeded by cloning the shared cache's current entries), over a
 **private** `TransactorSource` whose action context is deep-copy **frozen** at
