@@ -18,6 +18,8 @@
 - Be cross-platform (browser, node, RN, etc.)
 - .editorconfig contains formatting (tabs for code)
 
+This is an important system; write production-grade, maintainble, and expressive code that we don't have to revisit later.  Read @docs/internals.md to come up to speed - also maintain the docs.
+
 ## Testing
 
 All packages use mocha + chai directly (no aegir wrapper). The test command pattern is:
@@ -53,9 +55,6 @@ Shared cross-package deps are version-guarded by `yarn.config.cjs` (Yarn 4 const
 This project uses [tess](tess/) for AI-driven ticket management.
 Read and follow the ticket workflow rules in tess/agent-rules/tickets.md.
 Tickets are in the [tickets/](tickets/) directory.
-
-
-This is an important system; write production-grade, maintainble, and expressive code that we don't have to revisit later.  Read @docs/internals.md to come up to speed - also maintain the docs.
 
 ## Code search (tess)
 

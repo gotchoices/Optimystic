@@ -881,9 +881,10 @@ export class StorageRepo implements IRepo, IBlockChangeNotifier, IBlockReplicaSt
  * Converts list of missing actions per block into a list of missing actions across blocks.
  *
  * NOTE: relies on each (actionId, blockId) pair appearing at most once — one revision per action
- * per block. If a block ever records two revisions under the same actionId, concatTransform's
- * last-wins merge would silently drop the earlier revision's ops for that block; group by
- * (actionId, rev) instead. See debt-concat-transform-overlapping-updates.
+ * per block. If a block ever records two revisions under the same actionId, concatTransform now
+ * concatenates both revisions' ops into one array rather than dropping the earlier one — still
+ * wrong, since ops from distinct revisions are not composable against a single base, but loud
+ * rather than silent. Group by (actionId, rev) instead if that case becomes reachable.
  */
 function perBlockActionTransformsToPerAction(missing: { blockId: BlockId; transforms: ActionTransform[]; }[]) {
 	const missingFlat = missing.flatMap(({ blockId, transforms }) =>

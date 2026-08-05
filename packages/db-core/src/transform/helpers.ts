@@ -148,16 +148,12 @@ export function applyTransform(block: IBlock | undefined, transform: Transform):
 	return block;
 }
 
-/** Concatenates a transform to the given transforms */
+/**
+ * Concatenates a single block's transform onto the given transforms.
+ *
+ * Delegates to `mergeTransforms` so the two helpers cannot drift: updates for a shared
+ * block id concatenate (order-preserving), deletes dedupe, inserts stay last-wins.
+ */
 export function concatTransform(transforms: Transforms, blockId: BlockId, transform: Transform): Transforms {
-	// updates: if blockId already has ops, concatenate rather than overwrite (mirrors mergeTransforms)
-	const existingOps = transforms.updates?.[blockId];
-	const updates = transform.updates
-		? { ...transforms.updates, [blockId]: existingOps ? [...existingOps, ...transform.updates] : transform.updates }
-		: { ...transforms.updates };
-	return {
-		inserts: { ...transforms.inserts, ...(transform.insert ? { [blockId]: transform.insert } : {}) },
-		updates,
-		deletes: [...new Set([...(transforms.deletes ?? []), ...(transform.delete ? [blockId] : [])])]
-	};
+	return mergeTransforms(transforms, transformsFromTransform(transform, blockId));
 }

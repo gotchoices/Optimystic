@@ -453,5 +453,45 @@ describe('Transform functionality', () => {
 
       expect(result.updates![sharedId]).to.deep.equal([...existingOps, ...newOps])
     })
+
+    it('concatTransform assigns operations when the block id has no existing updates', () => {
+      const newOps: BlockOperation[] = [['data', 0, 0, 'only']]
+      const base: Transforms = { inserts: {}, updates: { ['other' as BlockId]: [] }, deletes: [] }
+
+      const result = concatTransform(base, sharedId, { updates: newOps })
+
+      expect(result.updates![sharedId]).to.deep.equal(newOps)
+      expect(result.updates!['other' as BlockId]).to.deep.equal([])
+    })
+
+    it('should dedupe duplicate block IDs in deletes array from concatTransform', () => {
+      const base: Transforms = { inserts: {}, updates: {}, deletes: [sharedId] }
+
+      const result = concatTransform(base, sharedId, { delete: true })
+
+      expect(result.deletes!.filter(id => id === sharedId)).to.have.lengthOf(1)
+    })
+
+    it('concatTransform keeps inserts last-wins for a repeated block id', () => {
+      const first: TestBlock = { header: { id: sharedId, type: 'test', collectionId: 'c' }, data: 'first', items: [] }
+      const second: TestBlock = { header: { id: sharedId, type: 'test', collectionId: 'c' }, data: 'second', items: [] }
+      const base: Transforms = { inserts: { [sharedId]: first }, updates: {}, deletes: [] }
+
+      const result = concatTransform(base, sharedId, { insert: second })
+
+      expect((result.inserts![sharedId] as TestBlock).data).to.equal('second')
+    })
+
+    it('concatTransform does not mutate its inputs', () => {
+      const existingOps: BlockOperation[] = [['data', 0, 0, 'first']]
+      const base: Transforms = { inserts: {}, updates: { [sharedId]: existingOps }, deletes: [] }
+      const newOps: BlockOperation[] = [['data', 0, 0, 'second']]
+
+      concatTransform(base, sharedId, { updates: newOps })
+
+      expect(base.updates![sharedId]).to.deep.equal(existingOps)
+      expect(base.updates![sharedId]).to.have.lengthOf(1)
+      expect(newOps).to.have.lengthOf(1)
+    })
   })
 })
