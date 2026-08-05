@@ -546,7 +546,9 @@ saveMaterializedBlock(block): store(structuredClone(block));
   This covers both sites that read one: `attachToLog` (bootstrap from the committed log tail, then
   adopt `Log.getActionContext()`, which resolves `undefined` for a tailless or entries-empty chain)
   and `updateInternal` (adopt `Log.getFrom(...).context`, which resolves `undefined` for a log that
-  will not open).
+  will not open). In `updateInternal` the adoption is also **ordered**: it must precede the
+  conflict replay — see "Conflict replay must read at the revision it is adopting, not the one it
+  is leaving" above before moving that statement.
 - The rule exists because a read that found *less* than what the client already committed is a
   read that lost information, not a revision rollback. Accepting it makes the next `sync` request a
   revision that is long gone, and — since `syncInternal` re-runs `updateInternal` between retries —

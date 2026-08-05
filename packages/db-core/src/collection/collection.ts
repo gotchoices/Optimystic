@@ -317,7 +317,13 @@ export class Collection<TAction> implements ICollection<TAction> {
 		// will invalidate again (the log entry that would have cleared it was already consumed).
 		Collection.advanceContext(this.source, this.id, latest?.context);
 
-		// On conflicts, clear related caching and block-tracking and replay logical operations
+		// On conflicts, re-stage the pending actions against the adopted revision. The affected
+		// blocks were already dropped from sourceCache above (per log entry / per invalidation),
+		// so the replay's reads re-materialize from the transactor.
+		// NOTE: a throw out of replayActions leaves the tracker holding only the transforms
+		// replayed so far while `pending` still lists them all; the caller's error handling is
+		// expected to abort/reset the collection rather than keep staging. If replay ever gains a
+		// routinely-throwing read path, rebuild into a scratch tracker and swap on success.
 		if (anyConflicts) {
 			await this.replayActions();
 		}
