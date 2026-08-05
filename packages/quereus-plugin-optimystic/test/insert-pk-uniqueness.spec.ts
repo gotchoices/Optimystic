@@ -527,6 +527,110 @@ describe('UPDATE PK-move conflict resolution (local/bootstrap transactor)', func
 		expect(await reopenScalar(dir, `select id from T where cat = 'x'`)).to.equal(1);
 		expect(await reopenScalar(dir, `select id from T where cat = 'y'`)).to.equal(2);
 	});
+
+	// The PK move and the secondary UNIQUE constraints are two decisions over the
+	// same write, and the first one's outcome changes what the second should see:
+	// the row a REPLACE displaces at the target key is on its way out and must not
+	// count as a live secondary collision, and a swallowed/rejected move must not be
+	// preempted by a secondary hit. These pin that ordering (all three cases
+	// previously mis-resolved once the declared PK action became reachable).
+
+	it('UPDATE PK-move REPLACE is not blocked by a secondary UNIQUE collision with the row it displaces', async () => {
+		const uri = 'tree://update-pkmove/displaced-not-a-collision';
+		const { db } = createDb(dir);
+		try {
+			await db.exec(
+				`create table T (id integer primary key on conflict replace, s text not null unique) using optimystic('${uri}')`,
+			);
+			await db.exec(`insert into T (id, s) values (1, 'a')`);
+			await db.exec(`insert into T (id, s) values (2, 'b')`);
+
+			// Row 1 moves onto id 2 AND takes row 2's 's' value. The only row holding
+			// 'b' is the one the move displaces, so the (default-ABORT) UNIQUE is not
+			// actually violated by the post-write state.
+			await db.exec(`update T set id = 2, s = 'b' where id = 1`);
+
+			expect(await selectCount(db, 'select count(*) as c from T')).to.equal(1);
+			expect(await selectScalar(db, `select id from T where s = 'b'`)).to.equal(2);
+		} finally {
+			db.close();
+		}
+
+		expect(await reopenScalar(dir, `select id from T where s = 'b'`)).to.equal(2);
+	});
+
+	it('UPDATE PK-move REPLACE is not swallowed by a declared-IGNORE secondary UNIQUE on the row it displaces', async () => {
+		const uri = 'tree://update-pkmove/displaced-not-swallowed';
+		const { db } = createDb(dir);
+		try {
+			await db.exec(
+				`create table T (id integer primary key on conflict replace, s text not null unique on conflict ignore) `
+				+ `using optimystic('${uri}')`,
+			);
+			await db.exec(`insert into T (id, s) values (1, 'a')`);
+			await db.exec(`insert into T (id, s) values (2, 'b')`);
+
+			// Same shape, but the secondary declares IGNORE — a stale probe would
+			// swallow the whole UPDATE silently, which is worse than rejecting it.
+			await db.exec(`update T set id = 2, s = 'b' where id = 1`);
+
+			expect(await selectCount(db, 'select count(*) as c from T')).to.equal(1);
+			expect(await selectCount(db, 'select count(*) as c from T where id = 1')).to.equal(0);
+		} finally {
+			db.close();
+		}
+
+		expect(await reopenScalar(dir, `select id from T where s = 'b'`)).to.equal(2);
+	});
+
+	it('a swallowed UPDATE PK-move (declared IGNORE) is not preempted by a secondary UNIQUE violation', async () => {
+		const uri = 'tree://update-pkmove/ignore-wins-over-secondary';
+		const { db } = createDb(dir);
+		try {
+			await db.exec(
+				`create table T (id integer primary key on conflict ignore, s text not null unique) using optimystic('${uri}')`,
+			);
+			await db.exec(`insert into T (id, s) values (1, 'a')`);
+			await db.exec(`insert into T (id, s) values (2, 'b')`);
+			await db.exec(`insert into T (id, s) values (3, 'c')`);
+
+			// The move onto the occupied id 2 is swallowed, so the row never takes
+			// 'c' and row 3's UNIQUE is never actually violated — no error.
+			await db.exec(`update T set id = 2, s = 'c' where id = 1`);
+
+			expect(await selectCount(db, 'select count(*) as c from T')).to.equal(3);
+			expect(await selectScalar(db, 'select s from T where id = 1')).to.equal('a');
+		} finally {
+			db.close();
+		}
+
+		expect(await reopenScalar(dir, 'select s from T where id = 1')).to.equal('a');
+	});
+
+	it('an UPDATE that both displaces at the target PK and evicts a third row on a declared-REPLACE UNIQUE keeps the table unique', async () => {
+		const uri = 'tree://update-pkmove/displace-plus-evict';
+		const { db } = createDb(dir);
+		try {
+			await db.exec(
+				`create table T (id integer primary key on conflict replace, s text not null unique on conflict replace) `
+				+ `using optimystic('${uri}')`,
+			);
+			await db.exec(`insert into T (id, s) values (1, 'a')`);
+			await db.exec(`insert into T (id, s) values (2, 'b')`);
+			await db.exec(`insert into T (id, s) values (3, 'c')`);
+
+			// Displaces row 2 at the target PK (replacedRow channel) and evicts row 3
+			// for 's' (evictedRows channel) — two removals, one write.
+			await db.exec(`update T set id = 2, s = 'c' where id = 1`);
+
+			expect(await selectCount(db, 'select count(*) as c from T')).to.equal(1);
+			expect(await selectScalar(db, `select id from T where s = 'c'`)).to.equal(2);
+		} finally {
+			db.close();
+		}
+
+		expect(await reopenScalar(dir, `select id from T where s = 'c'`)).to.equal(2);
+	});
 });
 
 /**

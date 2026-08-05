@@ -405,6 +405,83 @@ describe('Secondary UNIQUE constraint enforcement on the optimystic vtab', funct
 		}
 	});
 
+	it('a swallowing IGNORE discards the evictions an earlier REPLACE constraint had pending (nothing changes at all)', async () => {
+		const { db } = createDb();
+		try {
+			// Degenerate mixed-action shape: A resolves REPLACE (collides with row 1),
+			// B resolves IGNORE (collides with row 2). Constraints are decided in
+			// declared order and NOTHING is staged until every decision is in, so the
+			// IGNORE swallows the write with row 1 still intact.
+			//
+			// This is the one deliberate divergence from the engine's memory module,
+			// which deletes the REPLACE collision first and then swallows — and whose
+			// executor skips the delete pipeline for evictions on a row-less result,
+			// leaving that delete untracked. See resolveSecondaryUniqueDecision.
+			await db.exec(`
+				create table X (Id integer primary key,
+					A text not null unique on conflict replace,
+					B text not null unique on conflict ignore)
+					using optimystic('tree://uniq/replace-then-ignore')
+			`);
+			await db.exec(`insert into X (Id, A, B) values (1, 'a1', 'b1')`);
+			await db.exec(`insert into X (Id, A, B) values (2, 'a2', 'b2')`);
+
+			await db.exec(`insert into X (Id, A, B) values (3, 'a1', 'b2')`);
+
+			expect(await scalar(db, `select count(*) as v from X`)).to.equal(2);
+			expect(await scalar(db, `select Id as v from X where A = 'a1'`)).to.equal(1);
+			expect(await scalar(db, `select Id as v from X where B = 'b2'`)).to.equal(2);
+		} finally {
+			db.close();
+		}
+	});
+
+	it('rolling back a transaction restores a row evicted by a declared REPLACE (main table and index)', async () => {
+		const { db } = createDb();
+		try {
+			await db.exec(`
+				create table T (Id integer primary key, Stamp text not null unique on conflict replace)
+					using optimystic('tree://uniq/evict-rollback')
+			`);
+			await db.exec(`insert into T (Id, Stamp) values (1, 'a')`);
+
+			await db.exec(`begin`);
+			await db.exec(`insert into T (Id, Stamp) values (2, 'a')`);
+			expect(await scalar(db, `select Id as v from T where Stamp = 'a'`)).to.equal(2);
+			await db.exec(`rollback`);
+
+			// markDirtyTrees runs before the eviction is staged, so the rollback
+			// snapshot covers it — the evicted row is back, in the table AND resolvable
+			// through the enforcing index tree.
+			expect(await scalar(db, `select count(*) as v from T`)).to.equal(1);
+			expect(await scalar(db, `select Id as v from T where Stamp = 'a'`)).to.equal(1);
+			expect(await scalar(db, `select count(*) as v from T where Id = 2`)).to.equal(0);
+		} finally {
+			db.close();
+		}
+	});
+
+	it('honours a declared action on a COMPOSITE secondary UNIQUE', async () => {
+		const { db } = createDb();
+		try {
+			await db.exec(`
+				create table C (Id integer primary key, X text not null, Y text not null,
+					unique (X, Y) on conflict replace)
+					using optimystic('tree://uniq/composite-replace')
+			`);
+			await db.exec(`insert into C (Id, X, Y) values (1, 'x', 'y')`);
+			// Only a full (X, Y) match binds the constraint: a partial overlap inserts.
+			await db.exec(`insert into C (Id, X, Y) values (2, 'x', 'z')`);
+			await db.exec(`insert into C (Id, X, Y) values (3, 'x', 'y')`);
+
+			expect(await scalar(db, `select count(*) as v from C`)).to.equal(2);
+			expect(await scalar(db, `select count(*) as v from C where Id = 1`)).to.equal(0);
+			expect(await scalar(db, `select Id as v from C where X = 'x' and Y = 'y'`)).to.equal(3);
+		} finally {
+			db.close();
+		}
+	});
+
 	it('UPDATE moving onto an occupied value under `unique on conflict replace` evicts the occupying row', async () => {
 		const { db } = createDb();
 		try {

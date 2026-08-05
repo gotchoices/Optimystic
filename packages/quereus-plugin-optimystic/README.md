@@ -47,9 +47,11 @@ await db.exec(`declare schema App { ... } apply schema App;`); // no-op after hy
 
 `hydrate(db)` resolves to `{ tables, indexes }` (counts of newly-added catalog entries). It is idempotent and a no-op against empty storage.
 
-Uniqueness metadata — secondary `UNIQUE` constraints and the `unique`/partial-predicate flags of `CREATE UNIQUE INDEX` — is persisted with the table schema and reconstructed by `hydrate`, so hydrated tables enforce `UNIQUE` exactly as freshly declared ones. Re-declaring the table is **not** required for enforcement.
+Uniqueness metadata — secondary `UNIQUE` constraints, the `unique`/partial-predicate flags of `CREATE UNIQUE INDEX`, and the conflict action each rule declares for itself (`unique on conflict ignore`, `primary key (…) on conflict replace`, `id integer primary key on conflict replace`) — is persisted with the table schema and reconstructed by `hydrate`, so hydrated tables enforce `UNIQUE` and resolve duplicates exactly as freshly declared ones. Re-declaring the table is **not** required for enforcement.
 
-One-time upgrade caveat: schemas persisted by plugin versions that predate uniqueness persistence lack this metadata, and the no-op DDL after `hydrate` never re-runs the statements that would restore it. Open such storage once with the DDL actually executing (skip `hydrate` for that open); the `CREATE TABLE` / `CREATE UNIQUE INDEX` statements persist the missing metadata in a single schema write, and every later hydrated open enforces normally.
+A declared action is the *default* for that rule; a statement-level `insert or <action>` always overrides it. `FAIL` and `ROLLBACK` resolved from a declared action behave as `ABORT` (the statement is rejected and the table is unchanged) — the engine selects the FAIL/ROLLBACK unwind behaviour from the statement-level clause only, and its own in-memory tables have the same limitation.
+
+One-time upgrade caveat: schemas persisted by plugin versions that predate uniqueness or conflict-action persistence lack that metadata, and the no-op DDL after `hydrate` never re-runs the statements that would restore it. Open such storage once with the DDL actually executing (skip `hydrate` for that open); the `CREATE TABLE` / `CREATE UNIQUE INDEX` statements persist the missing metadata in a single schema write, and every later hydrated open enforces normally.
 
 ## Virtual Table Options
 
