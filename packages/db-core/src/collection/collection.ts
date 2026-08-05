@@ -308,15 +308,19 @@ export class Collection<TAction> implements ICollection<TAction> {
 			}
 		}
 
+		// Update our context to the latest — monotonically. An empty/unopenable log yields no
+		// context at all, and a log read that lags what we already committed yields an older one;
+		// neither is grounds for forgetting the revision we hold. This must happen BEFORE
+		// replayActions below: replay re-reads blocks through this.source, which materializes
+		// content at this.actionContext.rev — if the cursor hasn't advanced yet, replay re-reads
+		// at the revision we're leaving and refills the cache with stale content that nothing
+		// will invalidate again (the log entry that would have cleared it was already consumed).
+		Collection.advanceContext(this.source, this.id, latest?.context);
+
 		// On conflicts, clear related caching and block-tracking and replay logical operations
 		if (anyConflicts) {
 			await this.replayActions();
 		}
-
-		// Update our context to the latest — monotonically. An empty/unopenable log yields no
-		// context at all, and a log read that lags what we already committed yields an older one;
-		// neither is grounds for forgetting the revision we hold.
-		Collection.advanceContext(this.source, this.id, latest?.context);
 	}
 
 	/** Capture the current staged state — tracker transforms plus the pending

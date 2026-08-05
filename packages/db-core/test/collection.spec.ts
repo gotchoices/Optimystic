@@ -716,6 +716,104 @@ describe('Collection', () => {
     })
   })
 
+  // Regression for bug-external-commit-invisible-after-staged-txn: Collection.updateInternal
+  // used to replay conflicting pending actions BEFORE advancing its revision cursor, so the
+  // replay's block reads landed at the revision it was about to leave rather than the one it
+  // was adopting. Because the log entry that would have invalidated those blocks had already
+  // been consumed, nothing ever re-cleared them — the stale content stuck permanently.
+  describe('external commit visibility after conflict replay', () => {
+    const sharedBlockId = 'shared-block'
+
+    const sharedModules: Record<string, ActionHandler<TestAction>> = {
+      'setShared': async (action, store) => {
+        const existing = await store.tryGet(sharedBlockId)
+        if (existing) {
+          store.update(sharedBlockId, ['value', 0, 0, action.data.value])
+        } else {
+          store.insert({
+            header: store.createBlockHeader('TEST', sharedBlockId),
+            value: action.data.value
+          } as IBlock & { value: string })
+        }
+      },
+      // Depends on the CURRENT content of the block (an append), unlike 'setShared' above which
+      // always overwrites — this is what lets a test distinguish "computed against stale content"
+      // from "computed against the newly adopted revision".
+      'appendShared': async (action, store) => {
+        const existing = await store.tryGet(sharedBlockId) as ({ value?: string } | undefined)
+        store.update(sharedBlockId, ['value', 0, 0, `${existing?.value ?? ''}+${action.data.value}`])
+      },
+      'update': async () => { /* no-op */ }
+    }
+
+    const sharedOptions: CollectionInitOptions<TestAction> = {
+      ...initOptions,
+      modules: sharedModules
+    }
+
+    const readShared = async (collection: Collection<TestAction>): Promise<string | undefined> =>
+      (await collection.tracker.tryGet(sharedBlockId) as { value?: string } | undefined)?.value
+
+    it('a rolled-back transaction must see the external commit that conflicted with it, not the pre-commit content', async () => {
+      const collection1 = await Collection.createOrOpen<TestAction>(transactor, collectionId, sharedOptions)
+      await collection1.act({ type: 'setShared', data: { value: 'v1', timestamp: 1 } })
+      await collection1.updateAndSync() // rev1: shared = v1
+
+      const collection2 = await Collection.createOrOpen<TestAction>(transactor, collectionId, sharedOptions)
+      // Snapshot BEFORE staging anything, so restoring it later mimics a cancelled transaction.
+      const preTransactionSnapshot = collection2.snapshotPending()
+
+      // Stage a local, unsynced pending action touching the same block — this is what forces
+      // update() below to replay rather than just advancing quietly. It also reads (and caches)
+      // 'shared' = v1 into collection2's read cache, which is the content the bug re-serves.
+      await collection2.act({ type: 'setShared', data: { value: 'local-pending', timestamp: 2 } })
+
+      // An external commit lands on the SAME block while collection2's transaction is open.
+      await collection1.act({ type: 'setShared', data: { value: 'v2-committed', timestamp: 3 } })
+      await collection1.updateAndSync() // rev2: shared = v2-committed
+
+      // Collection2 discovers the external commit; its pending action conflicts on the shared
+      // block id, so update() must force Collection.updateInternal's replay branch.
+      await collection2.update()
+
+      // Roll back collection2's own pending transaction.
+      collection2.restorePending(preTransactionSnapshot)
+
+      // With the local pending action gone, a read of the shared block must show collection1's
+      // committed value — not stale pre-commit content the conflict replay re-cached.
+      expect(await readShared(collection2)).to.equal('v2-committed')
+    })
+
+    it('a losing sync() retry rebuilds its transform against the adopted revision, not the stale one', async () => {
+      // Write-path corollary from the ticket: syncInternal's retry loop calls updateInternal()
+      // after a stale pend/commit failure and then resubmits at the new revision. Under the old
+      // ordering, that resubmission's transform was computed by a replay that read at the STALE
+      // revision, even though it gets submitted at the new one.
+      const collection1 = await Collection.createOrOpen<TestAction>(transactor, collectionId, sharedOptions)
+      await collection1.act({ type: 'setShared', data: { value: 'v1', timestamp: 1 } })
+      await collection1.updateAndSync() // rev1: shared = v1
+
+      const collection2 = await Collection.createOrOpen<TestAction>(transactor, collectionId, sharedOptions)
+      // Reads (and caches) 'shared' = v1, then stages a pending append on top of it — WITHOUT
+      // first calling update(), so collection2 still believes it is at rev1.
+      await collection2.act({ type: 'appendShared', data: { value: 'local', timestamp: 2 } })
+
+      // An external commit lands on the same block before collection2 syncs.
+      await collection1.act({ type: 'setShared', data: { value: 'v2-committed', timestamp: 3 } })
+      await collection1.updateAndSync() // rev2: shared = v2-committed
+
+      // collection2's sync() now pends at rev2 (its stale rev1+1), the transactor rejects it as
+      // stale (real conflict — collection1 already committed rev2), and syncInternal's retry path
+      // calls updateInternal() (replay) before resubmitting.
+      await collection2.sync({ maxAttempts: 5, baseBackoffMs: 1, maxBackoffMs: 5 })
+
+      // The resubmitted append must have been computed against the ADOPTED revision's content
+      // (v2-committed), not the stale content (v1) the collection held when it first staged the
+      // pending action.
+      expect(await readShared(collection2)).to.equal('v2-committed+local')
+    })
+  })
+
   // TEST-3.3.2: Concurrent sync() tests
   describe('concurrent sync (TEST-3.3.2)', () => {
     it('should serialize concurrent sync calls via latch', async () => {

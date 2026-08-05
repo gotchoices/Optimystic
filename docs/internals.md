@@ -43,6 +43,35 @@ which spies on `query()` / the execute* methods / `Tree.update` and confirms tha
 writer's committed rows are visible to a count-only reader after that pull. No read
 shape is served from the local materialized tree without first reconciling.
 
+#### Conflict replay must read at the revision it is adopting, not the one it is leaving
+
+`Collection.updateInternal` (`packages/db-core/src/collection/collection.ts`) advances
+its revision cursor (`Collection.advanceContext`) **before** replaying conflicting
+pending actions (`replayActions`), never after. This ordering is load-bearing, not
+cosmetic: `replayActions` re-reads blocks through `this.source` (a
+`TransactorSource`), and the transactor materializes a block at
+`context.rev` — the revision named by that source's `actionContext`. If the cursor
+had not advanced yet, the replay would re-read at the revision the collection is
+leaving, refilling `sourceCache` with pre-commit content. Nothing would ever clear
+it again: cache invalidation for a block is driven by the log entry that named it,
+and that entry was already consumed earlier in the same `updateInternal` call. The
+result was a permanent divergence for those blocks — visible even after the local
+transaction that triggered the replay was rolled back — until an unrelated future
+commit happened to touch the same block again. See
+`packages/db-core/test/collection.spec.ts` ("external commit visibility after
+conflict replay") for the regression test, and
+`packages/quereus-plugin-optimystic/test/committed-read-interleave.spec.ts` for the
+end-to-end shape.
+
+This also settles a question about intended semantics: a **live** read (the vtab
+read path above, or any read through a collection's own `tracker`/`update()`) always
+pulls the latest log and therefore observes a concurrent external commit — including
+one that lands while a local transaction is open, and even after that transaction
+rolls back. That is correct, not a leak: only the separate `committed.<Table>` path
+(previous section) is snapshot-pinned. A plain `select` mid-transaction seeing a
+concurrent peer's commit is expected live-read behavior; snapshot isolation is
+opt-in via `queryCommitted()`, not the default for ordinary reads.
+
 #### Committed reads are pinned, not shared-cache
 
 `queryCommitted()` (the `committed.<Table>` / `_readCommitted` path) does **not** run
