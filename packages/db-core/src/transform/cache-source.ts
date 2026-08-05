@@ -44,8 +44,20 @@ export class CacheSource<T extends IBlock> implements BlockSource<T> {
 		/** Shared per-transaction read-dependency accumulator (same instance the collection's
 		 *  TransactorSource holds). Optional: log-walk caches that never form a transaction omit it. */
 		private readonly collector?: ReadDependencyCollector,
+		/** Pre-warm entries for a pinned read view — the output of another cache's
+		 *  {@link snapshotEntries}. Entries are already cloned by snapshotEntries, so they are
+		 *  adopted as-is; per-id revisions ride along so a seeded HIT still records at the
+		 *  revision the block was committed at. Seeding does not bump generations (a fresh
+		 *  cache has no consumers with stale memos). */
+		seed?: ReadonlyArray<[BlockId, T, number]>,
 	) {
 		this.cache = new LruMap(maxSize);
+		if (seed) {
+			for (const [id, block, revision] of seed) {
+				this.cache.set(id, block);
+				this.revisions.set(id, revision);
+			}
+		}
 	}
 
 	private bump(id: BlockId) {
@@ -119,6 +131,19 @@ export class CacheSource<T extends IBlock> implements BlockSource<T> {
 			this.cache.clear();
 			this.revisions.clear();
 		}
+	}
+
+	/** A cloned copy of the current cache contents with each id's committed revision, in LRU
+	 *  order (oldest first, so replaying into another LruMap preserves eviction order). For
+	 *  building a pinned read view ONLY (see {@link Collection.createReadTracker}): pass the
+	 *  result as the `seed` of a fresh, PRIVATE CacheSource. Blocks are cloned on the way out,
+	 *  so the seeded cache shares no mutable state with this one. */
+	snapshotEntries(): Array<[BlockId, T, number]> {
+		const entries: Array<[BlockId, T, number]> = [];
+		for (const [id, block] of this.cache) {
+			entries.push([id, structuredClone(block), this.revisions.get(id) ?? 0]);
+		}
+		return entries;
 	}
 
 	/** Mutates the cache without affecting the source. `revision` is the committed revision this

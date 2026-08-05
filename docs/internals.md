@@ -43,6 +43,26 @@ which spies on `query()` / the execute* methods / `Tree.update` and confirms tha
 writer's committed rows are visible to a count-only reader after that pull. No read
 shape is served from the local materialized tree without first reconciling.
 
+#### Committed reads are pinned, not shared-cache
+
+`queryCommitted()` (the `committed.<Table>` / `_readCommitted` path) does **not** run
+through the shared pipeline above. `Tree.readView` →
+`Collection.createReadTracker` builds a private read stack per view: a fresh
+`Tracker` seeded with the pre-transaction transforms, over a **private**
+`CacheSource` (seeded by cloning the shared cache's current entries), over a
+**private** `TransactorSource` whose action context is deep-copy **frozen** at
+view-creation time. Because the transactor materializes at `context.rev`
+(`BlockStorage.getBlock` resolves the highest committed rev ≤ the requested one), a
+committed scan returns one point-in-time answer even when a commit folds into — or a
+live read's `update()` clears — the live collection's shared cache mid-scan. The
+regression anchors are `packages/db-core/test/read-view-pinned.spec.ts` and the
+one-statement live+committed interleave in
+`packages/quereus-plugin-optimystic/test/committed-read-interleave.spec.ts` (which,
+pre-pinning, crashed with `Missing block` mid-scan). A pinned view records no read
+dependencies by default (`ReadViewOptions.recordReads`), so a committed scan cannot
+fail a concurrent writer's commit validation; deferred-constraint safety instead
+rests on validator peers re-executing the recorded statements.
+
 ### Write Path (Local Changes)
 ```
 Collection.act(action)

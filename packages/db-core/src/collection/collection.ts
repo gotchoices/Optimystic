@@ -35,6 +35,19 @@ export type CollectionInitOptions<TAction> = {
 	filterConflict?: (action: Action<TAction>, potential: Action<TAction>[]) => Action<TAction> | undefined
 }
 
+/** Options for building a committed read view (see {@link Collection.createReadTracker}
+ * and `Tree.readView`). */
+export interface ReadViewOptions {
+	/** Record read dependencies into the collection's shared collector.
+	 *  Default false — a pinned committed view is not part of any transaction's
+	 *  conflict set, so its reads must not be able to fail the writer's commit
+	 *  validation. Deferred-constraint safety does not depend on these reads:
+	 *  validator peers re-execute the transaction's recorded statements against
+	 *  their own committed state, so a constraint that no longer holds is caught
+	 *  at validation regardless. */
+	recordReads?: boolean;
+}
+
 /** A point-in-time copy of a collection's staged (un-synced) state, produced by
  * {@link Collection.snapshotPending} and consumed by {@link Collection.restorePending}. */
 export interface CollectionSnapshot<TAction> {
@@ -316,15 +329,38 @@ export class Collection<TAction> implements ICollection<TAction> {
 		this.pending = [...snapshot.pending];
 	}
 
-	/** A read-only {@link Tracker} over this collection's committed source cache,
-	 * seeded with a (deep-copied) set of pre-transaction transforms. Reads through it
-	 * observe committed state plus exactly those transforms — and crucially NOT the
-	 * mutations staged into this collection's live tracker afterward. Used to build a
-	 * committed read view (see {@link Tree.readView}) that excludes a transaction's
-	 * own in-flight rows. The returned tracker shares the source cache (committed
-	 * blocks) but has its own independent transform set; it is never sync()'d. */
-	createReadTracker(transforms: Transforms): Tracker<IBlock> {
-		return new Tracker(this.sourceCache, copyTransforms(transforms));
+	/** A read-only {@link Tracker} pinned to this collection's committed state AS OF the
+	 * moment of this call, seeded with a (deep-copied) set of pre-transaction transforms.
+	 * Reads through it observe exactly that revision plus exactly those transforms — NOT
+	 * the mutations staged into this collection's live tracker afterward, and NOT commits
+	 * that fold into (or clear) the live read cache while the view is being walked. Used
+	 * to build a committed read view (see {@link Tree.readView}) that a scan can trust
+	 * from first row to last.
+	 *
+	 * The pinning has three legs, built in ONE synchronous block so they all describe the
+	 * same instant (do not introduce an await between them):
+	 *  - a private {@link TransactorSource} whose action context is a deep copy FROZEN at
+	 *    view-creation time, so a block first read after a later commit still materializes
+	 *    at the pinned revision (the transactor honours `context.rev` on get);
+	 *  - a private {@link CacheSource} nothing else references, so the live collection's
+	 *    `transformCache`/`clear` cannot reach it;
+	 *  - that private cache is seeded from the shared cache's current entries, so the
+	 *    common committed read (deferred CHECK over a warm cache) stays warm instead of
+	 *    refetching every block over the network.
+	 *
+	 * By default the view records NO read dependencies — it is not part of any
+	 * transaction's conflict set (see {@link ReadViewOptions.recordReads}).
+	 *
+	 * NOTE: each view holds up to the cache LRU budget (128) of cloned blocks plus
+	 * whatever it faults in. Views are per-scan and dropped when the scan ends; a very
+	 * long-lived committed scan pins that much memory. */
+	createReadTracker(transforms: Transforms, options?: ReadViewOptions): Tracker<IBlock> {
+		const collector = options?.recordReads ? this.source.getCollector() : undefined;
+		const pinnedSource = new TransactorSource<IBlock>(
+			this.id, this.transactor, structuredClone(this.source.actionContext), collector);
+		const pinnedCache = new CacheSource<IBlock>(
+			pinnedSource, undefined, collector, this.sourceCache.snapshotEntries());
+		return new Tracker(pinnedCache, copyTransforms(transforms));
 	}
 
 	/** The staged (not-yet-synced) actions queued by {@link act}.

@@ -1,4 +1,4 @@
-import { Collection, type CollectionInitOptions, type CollectionId, type CollectionSnapshot } from "../../collection/index.js";
+import { Collection, type CollectionInitOptions, type CollectionId, type CollectionSnapshot, type ReadViewOptions } from "../../collection/index.js";
 import type { ITransactor, BlockId, BlockStore, IBlock } from "../../index.js";
 import { BTree, type Path, type KeyRange } from "../../btree/index.js";
 import { CollectionTrunk } from "./collection-trunk.js";
@@ -187,17 +187,25 @@ export class Tree<TKey, TEntry> implements TreeReadView<TKey, TEntry> {
 
 	/** Build a read-only view of this tree as captured by an earlier {@link snapshot}
 	 * — typically the pre-transaction state recorded before any DML was staged. The
-	 * view reads through a FRESH tracker seeded with the snapshot's transforms over
-	 * the SAME committed source cache, so it observes exactly the snapshot's state:
-	 * it never sees mutations staged into the live tree after the snapshot, and it
-	 * does not disturb the live tree (reads are latch-free and tracker-isolated). This
-	 * is how a `committed.*` scan reads the pre-transaction snapshot while the live
-	 * tree still holds this transaction's in-flight inserts.
+	 * view reads through a FRESH tracker seeded with the snapshot's transforms over a
+	 * PRIVATE, revision-pinned read path (see {@link Collection.createReadTracker}),
+	 * so it observes exactly the snapshot's state from first read to last: it never
+	 * sees mutations staged into the live tree after the snapshot, it is untouched by
+	 * commits folding into (or clearing) the live tree's cache while it is walked, and
+	 * it does not disturb the live tree. This is how a `committed.*` scan reads the
+	 * pre-transaction snapshot while the live tree still holds this transaction's
+	 * in-flight inserts — and keeps reading it even if the live tree commits mid-scan.
+	 *
+	 * By default the view records no read dependencies into the collection's conflict
+	 * set; pass `{ recordReads: true }` to opt in (see {@link ReadViewOptions}).
 	 *
 	 * `snapshot` is the opaque value returned by {@link snapshot}; pass it back
 	 * verbatim. */
-	readView(snapshot: CollectionSnapshot<TreeReplaceAction<TKey, TEntry>>): TreeReadView<TKey, TEntry> {
-			const tracker = this.collection.createReadTracker(snapshot.transforms);
+	readView(
+		snapshot: CollectionSnapshot<TreeReplaceAction<TKey, TEntry>>,
+		options?: ReadViewOptions,
+	): TreeReadView<TKey, TEntry> {
+			const tracker = this.collection.createReadTracker(snapshot.transforms, options);
 			return new BTree<TKey, TEntry>(
 				tracker,
 				new CollectionTrunk(tracker, this.collection.id),

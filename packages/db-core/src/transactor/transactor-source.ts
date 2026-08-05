@@ -81,6 +81,14 @@ export class TransactorSource<TBlock extends IBlock> implements BlockSource<TBlo
 		return this.collector.getReadDependencies();
 	}
 
+	/** The collector this source records into — the one shared with the collection's
+	 *  CacheSource. Exposed ONLY so a pinned read view built with `recordReads: true`
+	 *  can feed the same per-transaction read set (see Collection.createReadTracker);
+	 *  every other consumer should go through {@link getReadDependencies}. */
+	getCollector(): ReadDependencyCollector {
+		return this.collector;
+	}
+
 	clearReadDependencies(): void {
 		this.collector.clear();
 	}
