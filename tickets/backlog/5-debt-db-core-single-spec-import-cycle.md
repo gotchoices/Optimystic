@@ -1,6 +1,10 @@
 description: Running any single db-core test file on its own crashes before the tests start, due to a module load-order problem; you have to run the whole test suite at once to work around it.
 files: packages/db-core/src/collections/diary/diary.ts, packages/db-core/src/collection/collection-type-registry.ts, packages/db-core/src/index.ts, packages/db-core/src/collection/index.js (barrel)
 difficulty: medium
+repro: verified
+severity: edge-case
+likelihood: normal-use
+tradeoffs: It only bites developer iteration and has an easy workaround (run the whole suite), so it never blocks shipping — but every future db-core ticket pays the tax.
 ----
 ## Problem
 

@@ -10,6 +10,10 @@ files:
   - packages/db-p2p/test/reactivity/forwarder-host.spec.ts                # fixture: cohortEpoch [7]
   - packages/db-p2p/test/substrate-real-libp2p.integration.spec.ts        # fixture: cohortEpoch [9,9,9]
 difficulty: easy
+severity: edge-case
+likelihood: contrived
+repro: static
+tradeoffs: Exploiting it needs a hostile peer deliberately sending oversized epochs, and the fix touches seven test fixtures across two packages including a slow real-libp2p integration test — a maintainer might rank other wire hardening first.
 ----
 
 # Pin `cohortEpoch` / `prevEpoch` to 32 bytes across the cohort-topic wire

@@ -2,6 +2,7 @@ description: In the default single-node mode, saving to a table and its indexes 
 prereq:
 files: packages/quereus-plugin-optimystic/src/optimystic-adapter/txn-bridge.ts, packages/db-core/src/collection/collection.ts, packages/db-core/src/transactor/transactor-source.ts, packages/db-core/src/transaction/coordinator.ts, docs/transactions.md
 difficulty: hard
+tradeoffs: The honest-failure half already shipped, so a split no longer masquerades as a rollback; the remaining narrowing means restructuring the most safety-critical sync loop in db-core, and getting it wrong corrupts the durable log format.
 ----
 
 # Narrow the legacy multi-tree commit window (pend-all-then-commit-all)

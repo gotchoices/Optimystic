@@ -1,6 +1,8 @@
 ----
 description: Nodes currently need an operator to tell them how many peers the network really has before they can spot a suspiciously small group of writers; they could instead remember the largest group they have ever seen and use that, so the protection works without configuration.
 files: packages/db-p2p/src/cluster/cluster-repo.ts (admitMembership), packages/db-p2p/src/cluster/quorum-restore.ts (corroboratorCapacity), packages/db-p2p/src/libp2p-node-base.ts (persistence wiring)
+difficulty: hard
+tradeoffs: The design is not settled — nobody has an answer for how a deployment that legitimately shrinks recovers from a high-water mark it can never meet again — so this is not yet buildable, and the cheap interim already covers the discoverability half.
 ----
 
 # Learn the cohort-size reference instead of being told it

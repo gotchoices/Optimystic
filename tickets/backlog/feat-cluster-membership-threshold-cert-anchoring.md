@@ -1,11 +1,13 @@
 description: Right now each node decides who is responsible for a piece of data by re-deriving that group itself from network state; a stronger design would have the whole responsible group jointly sign a certificate of its own membership that any node can verify without re-deriving. Adopt that certificate as the anchor for cluster identity — once the machinery it depends on exists.
-prereq: cluster-membership-admission-gate
+prereq:
 files:
   - packages/db-core/src/cohort-topic/membership/verifier.ts (CachingMembershipVerifier, trust gate)
   - packages/db-core/src/cohort-topic/membership/source.ts (IMembershipSourceRouter — T0/T1 committed vs T2/T3 FRET)
   - packages/db-core/src/cohort-topic/sig/threshold.ts (CohortSigner threshold verify)
   - packages/db-core/src/cohort-topic/wire/types.ts (MembershipCertV1 ~431-438)
   - packages/db-p2p/src/cluster/cluster-repo.ts (where cluster records would consume a cert)
+difficulty: hard
+tradeoffs: The current re-derive-and-tolerate model already satisfies the stated correctness theorems, and the certificate source this would build on has not landed, so adopting it now would mean building on a stub for a strengthening nothing currently demands.
 ----
 
 ## Why this is backlog, not an implement ticket

@@ -3,6 +3,9 @@ prereq:
 files: packages/db-p2p/src/storage/storage-repo.ts, packages/db-p2p/src/storage/block-storage.ts, packages/db-core/src/collection/action.ts, packages/db-p2p/test/storage-repo.spec.ts
 difficulty: medium
 repro: verified
+severity: wrong-result
+likelihood: unusual
+tradeoffs: No caller in this repository reaches the path — only an external peer speaking the public repo protocol could — so the fix is corrective housekeeping, and it requires deciding which of two components is authoritative, which is a judgement call a maintainer may not want to make yet.
 ----
 
 # A not-yet-finalised new block cannot be read back when the reader supplies a context

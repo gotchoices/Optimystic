@@ -1,5 +1,7 @@
 description: Even after we stop keeping a full copy of every block version, the small change-logs for every version are still kept forever, so very old history keeps consuming disk on each node. Let a node offload cold, rarely-read history and re-fetch it from the network on demand.
 files: packages/db-p2p/src/storage/block-storage.ts, packages/db-p2p/src/storage/struct.ts, packages/db-p2p/src/storage/restoration-coordinator.ts, docs/repository.md
+difficulty: hard
+tradeoffs: The checkpoint sweep already removed the dominant growth driver, so what remains grows slowly; against that, offloading risks re-creating the class of bug where a node claims a range it cannot serve, which earlier work eliminated.
 ----
 
 # Cold-range transform offload — let a node drop rarely-read history and restore it on demand

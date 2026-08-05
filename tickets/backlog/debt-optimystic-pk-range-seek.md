@@ -1,6 +1,8 @@
 description: Speed up primary-key range queries (like "id > 100") by jumping straight to the matching rows instead of scanning the whole table — only safe once the table's sort order is fixed.
 prereq: debt-optimystic-true-key-ordering
 files: packages/quereus-plugin-optimystic/src/optimystic-module.ts, packages/quereus-plugin-optimystic/src/schema/row-codec.ts
+difficulty: hard
+tradeoffs: Results are already correct — this is purely a speed-up — and it cannot start until the key-ordering work lands, so it is easy to keep deferring while no workload has been shown to be too slow.
 ----
 
 ## Context

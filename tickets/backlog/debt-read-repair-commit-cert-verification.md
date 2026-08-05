@@ -2,6 +2,11 @@
 description: Harden block read-repair and reconcile so they can prove a peer's claimed "latest version" with a real cryptographic commit certificate, not just agreement between peers — closing the gap where a peer that forges many fake identities could still fool the quorum check.
 prereq:
 files: packages/db-p2p/src/repo/coordinator-repo.ts, packages/db-p2p/src/libp2p-node-base.ts, packages/db-p2p/src/cluster/commit-cert.ts, packages/db-p2p/src/storage/struct.ts (BlockArchive), packages/db-p2p/src/sync/service.ts, packages/db-p2p/src/sync/protocol.ts
+difficulty: hard
+severity: wrong-result
+likelihood: contrived
+repro: static
+tradeoffs: The quorum plus content-hash gate already stops the realistic minority-liar case; this only adds resistance to an attacker minting many fake identities, and it needs cert persistence, a sync-protocol change, and cohort-membership anchoring that does not exist yet.
 ----
 
 # Verify restored blocks against a commit certificate (Sybil-resistant)
@@ -49,6 +54,17 @@ Three gaps, all real work:
   verifies (stronger than / short-circuits the quorum-agreement path).
 - Decide retention: certs must survive long enough to serve historical restores,
   which the current TTL cache does not guarantee.
+
+## Sibling ticket at the same seam
+
+`debt-read-repair-penalty-provable-only` covers the *other* half of the same weakness in
+`queryClusterForLatest`: because a peer's claimed latest cannot be proven, read-repair currently
+penalizes the reputation of any peer reporting a higher revision than the sampled quorum — including
+an honest peer that is simply ahead. The two were kept as separate tickets (both slugs are cited from
+`NOTE:` comments in `coordinator-repo.ts`, `quorum-restore.ts`, and `reconcile-block.ts`), but they
+should be triaged together: the penalty ticket's cheap fix (stop penalizing an uncorroborated higher
+revision) is independently shippable now, and this ticket is what makes the penalty *provable* rather
+than merely dropped. A planner may fold them.
 
 This is a future hardening pass, not an active bug — the quorum + content-hash
 gate already stops the realistic minority-liar case. Promote when Sybil

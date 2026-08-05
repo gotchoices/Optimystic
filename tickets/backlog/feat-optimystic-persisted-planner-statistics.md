@@ -1,5 +1,7 @@
 description: The query planner for Optimystic-backed tables guesses how big each table is and how selective a filter is, using fixed default numbers; give it real, persisted statistics so it picks better query plans.
 files: packages/quereus-plugin-optimystic/src/optimystic-module.ts
+difficulty: hard
+tradeoffs: The planner works correctly on default estimates today, and real statistics bring their own storage, refresh-timing, and multi-node-consistency questions — a lot of machinery for query plans nobody has complained about.
 ----
 
 ## Context

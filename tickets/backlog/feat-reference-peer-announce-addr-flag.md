@@ -1,6 +1,7 @@
 description: The example peer program has no command-line option for telling other peers a public address that differs from the one it binds, so the documented "run it behind a TLS proxy" setup can't actually be completed with it.
 files: packages/reference-peer/src/cli.ts, packages/reference-peer/README.md, packages/db-p2p/src/libp2p-node-base.ts
 difficulty: easy
+tradeoffs: The underlying library option already exists, so anyone building their own peer is unblocked; only the example program and its README recipe are affected, which a maintainer might fix by rewriting the recipe instead.
 ----
 
 # `optimystic-peer` needs an announce-address flag

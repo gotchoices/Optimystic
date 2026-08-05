@@ -3,6 +3,10 @@ files:
   - packages/db-p2p/src/cohort-topic/host.ts (createChildRegistry, gossipRound child-delta drain)
   - packages/db-p2p/src/cohort-topic/cohort-gossip-driver.ts (PendingDeltas child deltas, buildCohortGossip)
   - docs/cohort-topic.md (§Topic traffic signal, §Cohort gossip)
+severity: wrong-result
+likelihood: unusual
+repro: static
+tradeoffs: The path is dormant in every tier currently exercised (no test rotates a live-key parent cohort), and the demotion-endorsement gate it protects is already acknowledged as incomplete elsewhere, so a maintainer could reasonably wait until that whole story is picked up together.
 ----
 
 # Child-set convergence for a late-joining / rotated-in parent member

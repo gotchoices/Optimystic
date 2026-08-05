@@ -3,6 +3,10 @@ description: Nodes built before the recent peer-metadata fix and nodes built aft
 prereq:
 files: packages/db-p2p/src/libp2p-node-base.ts, packages/db-p2p/src/libp2p-key-network.ts, packages/db-p2p/docs/cluster.md, docs/releasing.md
 difficulty: medium
+severity: edge-case
+likelihood: unusual
+repro: static
+tradeoffs: If no long-lived multi-node deployment predates the fix, the whole issue evaporates with "upgrade everything at once" written down somewhere — so the expensive options (a dual-protocol transition release) may be pure waste.
 ---
 
 ## What happens

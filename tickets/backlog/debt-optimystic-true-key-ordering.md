@@ -2,6 +2,7 @@ description: Make Optimystic tables actually store rows in true value order — 
 prereq: debt-optimystic-key-format-migration
 files: packages/quereus-plugin-optimystic/src/optimystic-adapter/collection-factory.ts, packages/quereus-plugin-optimystic/src/schema/row-codec.ts, packages/quereus-plugin-optimystic/src/schema/index-manager.ts, packages/quereus-plugin-optimystic/src/optimystic-module.ts
 difficulty: hard
+tradeoffs: The planner already refuses to promise orders the tree cannot deliver, so today the system is correct and merely slower; this is a deep change to how every key is written, gated behind a migration decision, for a performance win nobody has yet measured a need for.
 ----
 
 ## Context

@@ -2,6 +2,10 @@ description: When starting a peer-to-peer node fails partway through setup, the 
 prereq:
 files: packages/db-p2p/src/libp2p-node-base.ts
 difficulty: medium
+severity: edge-case
+likelihood: unusual
+repro: static
+tradeoffs: It only fires on a startup failure path that no known deployment hits, and the natural fix wraps a long stretch of node construction in one try/catch, which is a larger diff than the symptom justifies to some readers.
 ----
 
 Pre-existing (not introduced by `libp2p-node-base-swallowed-wiring`; surfaced during its review).

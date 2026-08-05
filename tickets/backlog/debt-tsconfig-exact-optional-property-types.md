@@ -1,6 +1,8 @@
 description: Turn on a stricter TypeScript setting that catches a class of subtle optional-property bugs, and fix the roughly two hundred type errors it surfaces across the packages.
-prereq: tsconfig-base-consolidation
+prereq:
 files: tsconfig.base.json, packages/db-core, packages/db-p2p, packages/quereus-plugin-optimystic, packages/substrate-simulator
+difficulty: hard
+tradeoffs: Around two hundred sites each need a semantic decision rather than a mechanical edit, producing a huge diff that touches every package for a class of bug nobody has reported — easy to argue the compiler strictness is not worth the churn.
 ----
 
 ## What

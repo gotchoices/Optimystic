@@ -2,6 +2,7 @@
 description: Asking for four copies of a block gets four machines, but nothing checks whether those machines belong to four different people. All four can sit with one operator, so the replication factor promises more independence than it delivers.
 files: packages/db-p2p/src/libp2p-key-network.ts, packages/db-p2p/src/cluster/spread-on-churn.ts, packages/db-p2p/docs/cluster.md
 difficulty: hard
+tradeoffs: Nothing is failing — replication works, it just delivers less independence than the number suggests — and a self-asserted owner label is only as trustworthy as the identity behind it, so the feature may be unenforceable in exactly the open deployments that need it most.
 ----
 
 # Cohort selection has no notion of who owns a peer

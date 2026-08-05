@@ -3,6 +3,10 @@ description: A helper that stitches block changes together throws away one side'
 prereq:
 files: packages/db-core/src/transform/helpers.ts, packages/db-core/test/transform.spec.ts
 difficulty: easy
+repro: verified
+severity: corruption
+likelihood: contrived
+tradeoffs: No caller feeds this helper an overlapping block id today, so the fix changes nothing observable and could be deferred forever; against that, it is a few lines mirroring an already-landed change to the sibling helper.
 ----
 
 ## Background

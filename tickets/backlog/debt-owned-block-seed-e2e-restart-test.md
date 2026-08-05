@@ -2,6 +2,7 @@ description: Add a test that starts a real node on top of storage that already c
 prereq:
 files: packages/db-p2p/src/libp2p-node-base.ts, packages/db-p2p/src/owned-block-seed.ts, packages/db-p2p/test/spread-on-churn-node-wiring.spec.ts, packages/db-p2p/test/rebalance-monitor-node-wiring.spec.ts, packages/db-p2p/test/unify-tracked-block-set.spec.ts
 difficulty: medium
+tradeoffs: Every piece is unit-tested in isolation and the integration seam is four lines, so the test guards against a fairly narrow class of regression for the cost of standing up a node over pre-populated storage.
 ----
 
 # Test debt: end-to-end restart-seed test over a pre-populated backend

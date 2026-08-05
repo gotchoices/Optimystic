@@ -3,6 +3,10 @@ description: When a node repairs a stale block by asking its peers for the newes
 prereq:
 files: packages/db-p2p/src/repo/coordinator-repo.ts (penalizeContradictingRevClaims), packages/db-p2p/src/reputation/types.ts (PenaltyReason.InvalidRestoration), packages/db-p2p/test/coordinator-repo-read-repair-trust.spec.ts
 difficulty: medium
+severity: edge-case
+likelihood: unusual
+repro: static
+tradeoffs: Dropping the penalty means a genuinely lying peer walks away unpunished until certificate verification exists, so a maintainer might prefer to keep the blunt penalty and fix it properly in one pass with the certificate work.
 ----
 
 # Read-repair should only penalize *provable* misbehavior

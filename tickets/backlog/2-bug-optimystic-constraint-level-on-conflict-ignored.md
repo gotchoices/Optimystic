@@ -1,6 +1,10 @@
 description: When a table column is declared to quietly skip duplicate rows instead of raising an error, the database ignores that instruction and raises an error anyway.
 files: packages/quereus-plugin-optimystic/src/optimystic-module.ts, packages/quereus-plugin-optimystic/test/secondary-unique.spec.ts, packages/quereus-plugin-optimystic/test/secondary-unique-hydrate.spec.ts
 difficulty: medium
+repro: verified
+severity: wrong-result
+likelihood: unusual
+tradeoffs: The statement-level spelling (insert or ignore) works, so there is a supported workaround, and part of the work is settling whether the SQL engine or the virtual table should apply the declared action — a maintainer could defer until that boundary is agreed upstream.
 ----
 
 ## What is wrong

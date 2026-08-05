@@ -2,6 +2,7 @@ description: The mobile SQLite storage now serializes concurrent writes, but its
 prereq:
 files: packages/db-p2p-storage-ns/test/sqlite-transaction-serialization.spec.ts, packages/db-p2p-storage-ns/test/connection-mutex.spec.ts, packages/db-p2p-storage-ns/test/node-sqlite-driver.ts, packages/db-p2p-storage-ns/src/connection-mutex.ts
 difficulty: medium
+tradeoffs: The targeted regression tests already cover the failure the fix was written for, and a randomized suite risks becoming a flaky test nobody trusts if the seeding discipline slips.
 ----
 
 # Add a concurrency stress/fuzz test for the shared-connection SQLite mutex

@@ -10,6 +10,7 @@ files:
   - packages/db-p2p/test/substrate-real-libp2p.integration.spec.ts
   - docs/matchmaking.md
 difficulty: hard
+tradeoffs: It cannot start until two other unwritten pieces exist, and the walk-only path already returns correct (if less complete) results, so the whole feature is optional until someone has a genuinely popular service to find.
 ----
 
 # Real-libp2p multi-cohort sweep ports (`sweepPorts`)

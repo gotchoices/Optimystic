@@ -2,6 +2,10 @@ description: An earlier change altered how Optimystic stores primary-key and ind
 prereq:
 files: packages/quereus-plugin-optimystic/src/schema/key-encoding.ts, packages/quereus-plugin-optimystic/src/schema/row-codec.ts, packages/quereus-plugin-optimystic/src/schema/index-manager.ts
 difficulty: medium
+severity: corruption
+likelihood: unusual
+repro: static
+tradeoffs: The package is pre-1.0, where callers are normally expected to recreate data, so the honest answer may be "no migration, stamp a format version and move on" — building a real reindex path could be work nobody needs.
 ----
 
 ## Background

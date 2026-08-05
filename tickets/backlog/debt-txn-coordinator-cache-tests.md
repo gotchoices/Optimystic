@@ -5,6 +5,7 @@ files:
   - packages/db-core/test/network-transactor.spec.ts ("per-transaction coordinator cache (pend → commit)" describe)
   - packages/db-core/src/testing/test-transactor.ts (FlakyCommitTransactor, TestTransactor)
 difficulty: medium
+tradeoffs: The feature works and its primary paths are covered; the uncovered corners are rare, dormant, or already exercised one layer up, and two of the three need new test harnesses to reach at all.
 ----
 
 # Harden the per-transaction coordinator cache with edge/error-path tests

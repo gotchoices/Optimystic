@@ -1,12 +1,16 @@
 description: Turn the built-but-switched-off dispute/arbitration feature on for real running nodes so a node can actually raise and answer a dispute — but only after the network can independently re-derive who the legitimate referees are, otherwise a node making fake identities could forge a passing outcome.
 prereq: invalidation-live-wiring-requires-arbitrator-set-anchoring
 files:
-  - packages/db-p2p/src/libp2p-node-base.ts (services map ~435-554; DisputeService construction ~1164-1196)
+  - packages/db-p2p/src/libp2p-node-base.ts (services map ~643 dormancy note; DisputeService construction ~1217-1282)
+  - packages/db-p2p/src/inbound-authorization.ts (authorizeInboundStream — must cover the dispute stream when it is registered)
+  - packages/db-p2p/test/inbound-stream-authorization.spec.ts (per-service test table — a fifth entry)
+  - docs/internals.md (§ Inbound Stream Authorization), packages/db-p2p/docs/repo.md (protocol table)
   - packages/db-p2p/src/repo/cluster-coordinator.ts (disputed-record path ~319-339)
   - packages/db-p2p/src/dispute/service.ts (disputeProtocolService factory / DisputeProtocolService handler)
   - packages/db-p2p/src/dispute/dispute-service.ts (initiateDispute ~137; handleChallenge revalidate ~274; maybeInvalidate → onInvalidation ~225)
   - packages/db-p2p/src/dispute/invalidation.ts (verifyInvalidationCertificate — the arbitrator-set-binding verification the resolution path relies on)
 difficulty: hard
+tradeoffs: It is a security-sensitive activation of a subsystem nobody is currently asking for, gated behind anchoring work that has not started — a maintainer could reasonably leave the subsystem dormant indefinitely rather than take on its adversarial surface.
 ----
 
 # Wire the dispute subsystem live on a running node
@@ -42,15 +46,17 @@ invocation, callback wiring) rather than one oversized change.
 
 ## Scope when activated (the three gaps to close)
 
-- **Register the inbound handler.** Add a `dispute:` entry to the libp2p
-  `services` map in `libp2p-node-base.ts` (mirroring `cluster` / `repo` / `sync`),
-  wiring `disputeProtocolService({ protocolPrefix })` to the constructed
-  `DisputeService`, so the node answers `/optimystic/<network>/dispute/1.0.0`.
-  Guard it on `options.dispute?.disputeEnabled` so the default-off behavior is
-  preserved. Note the construction currently happens post-`node.start()`
-  (~1164); the handler needs the DisputeService instance, so resolve the
-  ordering (either construct earlier, or register via the registrar
-  post-construction the way other post-start wiring is done).
+- **Register the inbound handler, behind the permission check.** Add a `dispute:`
+  entry to the libp2p `services` map in `libp2p-node-base.ts` (mirroring
+  `cluster` / `repo` / `sync`), wiring `disputeProtocolService({ protocolPrefix })`
+  to the constructed `DisputeService`, so the node answers
+  `/optimystic/<network>/dispute/1.0.0`. Guard it on
+  `options.dispute?.disputeEnabled` so the default-off behavior is preserved.
+  Note the construction currently happens post-`node.start()` (~1217); the handler
+  needs the DisputeService instance, so resolve the ordering (either construct
+  earlier, or register via the registrar post-construction the way other post-start
+  wiring is done). **See "Who may make this node vote?" below — the authorization
+  decision must be settled before the handler is registered, not after.**
 - **Invoke `initiateDispute` from the coordinator.** From the disputed-record
   path (`cluster-coordinator.ts:319-339`), after `record.disputed = true` and
   `disputeEvidence` are set, call `DisputeService.initiateDispute(record,
@@ -102,6 +108,51 @@ invocation, callback wiring) rather than one oversized change.
 - **Engine-health self-suppression.** `initiateDispute` skips when the local
   engine is unhealthy (`engineHealth.isUnhealthy()`); confirm that path is exercised
   so an unhealthy node does not spam disputes it cannot substantiate.
+
+## Who may make this node vote? (decide before registering the handler)
+
+A node embedding this library can supply one function deciding which remote peers may open the
+"database" conversations with it — reading blocks, writing blocks, syncing history, and transferring
+block copies. It is supplied once at construction (`createLibp2pNode({ authorizeInboundStream })`), and
+a peer it turns down has its connection attempt torn down before the node reads anything the peer sent.
+That work (`2-feat-inbound-stream-authorization-hook`) was scoped, deliberately and explicitly, to
+those four protocols.
+
+Dispute is a fifth conversation of the same kind: a remote peer opens it to challenge another peer's
+behavior, and the node answers by *signing a vote*. It is **not** covered by the permission check.
+Today that is harmless — the handler is not registered at all, so no peer can open the stream (verified:
+`libp2p-node-base.ts` ~643 and ~1217 both carry `[dispute-subsystem-dormant]` notes saying the service
+is constructed but absent from the services map). **The moment this ticket registers the handler, the
+gap becomes real**, which is why the decision belongs here rather than in a separate ticket.
+
+The question: is being asked to vote on a dispute something only admitted peers should be able to do?
+
+- **For gating it:** an application that has decided a peer is not part of its network should not have
+  that peer able to make its node produce signed votes. Votes are cryptographic statements; producing
+  them for strangers is both work and attributable output.
+- **Against gating it:** disputes are, by nature, about misbehaving peers, and the peer reporting one
+  may legitimately be someone the node has not admitted. A permission check written as "only my members"
+  would silently drop those reports.
+
+A reasonable resolution is to gate it but keep it separately controllable, so an application can close
+its database while leaving dispute reporting open. Settle this before writing the registration — the
+plumbing is a handful of lines either way, structurally identical to the cluster handler (same file
+layout, same "one request, one response per connection" shape).
+
+Expected behaviour, whichever way it goes:
+
+- With no permission function supplied, dispute streams are served exactly as the rest of this ticket
+  describes.
+- With one supplied and the decision being "gate it", a refused peer's dispute stream is torn down
+  before the challenge is decoded, no vote is signed, and the refusal is logged on this node with the
+  peer's identity and the reason — matching what the other four surfaces already do.
+- The documentation must stop describing dispute as ungated by omission: `docs/internals.md` §
+  Inbound Stream Authorization and the protocol table in `packages/db-p2p/docs/repo.md` both currently
+  name it as *not* covered, and `libp2p-node-base.ts:304` says the same in a comment.
+- The per-service test table in `packages/db-p2p/test/inbound-stream-authorization.spec.ts` is built so
+  a fifth service is one more entry: for every service it asserts a refused peer's operation never
+  reaches the underlying subsystem and no response is written. A dispute entry should assert the same,
+  plus specifically that no vote is signed.
 
 ## Related
 

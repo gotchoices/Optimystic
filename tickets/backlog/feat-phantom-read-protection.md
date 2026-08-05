@@ -4,6 +4,7 @@ files:
   - packages/db-core/src/transaction/validator.ts (stale-read check, ~line 83)
   - packages/db-core/src/transform/cache-source.ts (absent block records nothing, ~line 80)
 difficulty: medium
+tradeoffs: The answer may simply be "no" — the current stale-read model may be exactly the intended isolation level — in which case the right outcome is to close this having recorded that the removal was deliberate.
 ----
 # Should reads of a not-yet-existing block create a dependency? (phantom-read protection)
 

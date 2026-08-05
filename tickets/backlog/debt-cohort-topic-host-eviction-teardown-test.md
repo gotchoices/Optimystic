@@ -5,6 +5,7 @@ files:
   - packages/db-p2p/src/cohort-topic/host.ts                           # onEvict wiring under review (~1743)
   - packages/db-core/test/cohort-topic/member-engine.spec.ts           # existing engine-layer end-to-end coverage of the same closure
 difficulty: medium
+tradeoffs: The identical closure is already covered end-to-end one layer down at the engine, so this is belt-and-braces; the hard part (producing an evictable zero-participant resident at the host layer) may cost more than the confidence it buys.
 ----
 
 # Add host-layer coverage for topic-budget eviction teardown

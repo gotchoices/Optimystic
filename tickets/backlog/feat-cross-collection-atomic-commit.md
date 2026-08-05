@@ -1,10 +1,12 @@
 description: An optional stronger mode where a transaction spanning several data collections truly commits everywhere or nowhere, for collections that cannot tolerate a partial landing (e.g. money moving between accounts). The current system reports partial landings instead of preventing them; this would prevent them.
-prereq: design-cluster-membership-agreement
+prereq:
 files:
   - packages/db-core/src/transaction/coordinator.ts (commit/PEND/COMMIT phases)
   - docs/crdt-sync.md (Stage 5 per-collection consistency profiles; "Reservation and Escrow")
   - docs/correctness.md (Theorem 3 — atomic-intent/eventual-visibility baseline)
   - docs/right-is-right.md (durable invalidation / compensating reversal, currently single-collection)
+difficulty: hard
+tradeoffs: The shipped atomic-intent model is the right default and reporting partial landings is adequate for most callers, while genuine cross-collection atomicity costs liveness and touches consensus semantics — a maintainer may prefer callers reconcile rather than pay that.
 ----
 
 ## Why this exists
@@ -20,7 +22,9 @@ The partial landing is caused by a **permanent stale loss**: a racing transactio
 - **Reservation-through-commit:** PEND durably *reserves* the log-tail slot and holds it through COMMIT so no racing transaction can steal it. This changes promise/consensus semantics and carries a liveness cost (a crashed coordinator holds reservations until expiration) — the CP/strong end of `crdt-sync.md` Stage 5.
 - **Cross-collection compensating reversal:** on a partial landing, un-commit the already-committed collections via compensating entries. This means extending the single-collection `InvalidationEntry` reversal machinery (docs/right-is-right.md) to walk across collections — related to the invalidation-cascade follow-up.
 
-Both presume an **agreed supercluster** (hence `prereq: design-cluster-membership-agreement`) and both are multi-subsystem changes well beyond one implement run. Neither should be attempted before membership agreement and cross-collection invalidation land.
+Both presume an **agreed supercluster** and both are multi-subsystem changes well beyond one implement run. Neither should be attempted before membership agreement and cross-collection invalidation land.
+
+(Gardening note: this ticket carried `prereq: design-cluster-membership-agreement`, a slug that exists nowhere on the board — the header was dropped. The membership-agreement work it meant has since landed as `1-bind-cluster-membership-into-signed-record` and `2-cluster-membership-admission-gate`, both complete. The remaining real gate is **cross-collection invalidation**, which is not yet ticketed anywhere; whoever promotes this must file that first or absorb it.)
 
 ## What a future planner should decide
 

@@ -2,6 +2,10 @@ description: In the distributed-consensus commit path, a failed or aborted SQL s
 prereq:
 files: packages/quereus-plugin-optimystic/src/optimystic-adapter/txn-bridge.ts, packages/quereus-plugin-optimystic/test/session-mode-commit.spec.ts
 difficulty: hard
+severity: corruption
+likelihood: contrived
+repro: static
+tradeoffs: Session mode is opt-in and no host in this repository wires it, so the defect is unreachable today, while the fix means teaching the coordinator depth-keyed checkpoints without disturbing its snapshot-replay — real risk for a dormant payoff.
 ----
 
 # Session-mode statement-level savepoint atomicity

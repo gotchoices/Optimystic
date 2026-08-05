@@ -3,6 +3,10 @@ description: A second, older copy of the "which node should handle this key" log
 prereq:
 files: packages/db-p2p/src/network/network-manager-service.ts, packages/db-p2p/src/libp2p-key-network.ts
 difficulty: medium
+severity: wrong-result
+likelihood: contrived
+repro: static
+tradeoffs: Nothing in this repository calls the duplicate, so removing it is a published-API break for a hypothetical consumer while leaving it costs nothing today — a maintainer may prefer a deprecation note over either fix.
 ---
 
 # `NetworkManagerService.getCoordinator` is an unmaintained second implementation of coordinator selection

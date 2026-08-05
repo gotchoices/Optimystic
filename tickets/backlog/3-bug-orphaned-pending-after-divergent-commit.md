@@ -2,6 +2,10 @@ description: When a storage node fails to apply part of a write that the rest of
 prereq:
 files: packages/db-p2p/src/storage/storage-repo.ts, packages/db-p2p/src/cluster/cluster-repo.ts, packages/db-p2p/test/storage-repo.spec.ts
 difficulty: medium
+repro: verified
+severity: wrong-result
+likelihood: unusual
+tradeoffs: The cluster keeps working — only the diverged node quietly stops contributing to one block — and every candidate fix either broadens behaviour or touches the commit hot path, so a maintainer may prefer to wait for a deployment that actually shows the degradation.
 ----
 
 # A member that diverges mid-commit keeps unpromotable pending records
@@ -52,6 +56,16 @@ base)`, named `KNOWN GAP: …`:
 The second route was added by `bug-member-commits-unmaterializable-revision`; the review of that
 ticket found the leftover records and confirmed the first route produces them identically. Flip the
 two `KNOWN GAP` assertions from `false` to `true` when this is fixed.
+
+## Sibling ticket in the same file
+
+`debt-pending-only-insert-unreadable-with-context` is the *other* `KNOWN GAP:` in
+`packages/db-p2p/test/storage-repo.spec.ts` — a not-yet-finalised new block that cannot be read back
+when the reader supplies a context. Different function (`StorageRepo.get` / `BlockStorage.getBlock`
+rather than `StorageRepo.commit`) and a different fix, so they are deliberately not merged; but they
+are the same weakness seen twice — the boundary between a pending record and a committed revision is
+handled ad hoc at each site rather than by one owner — and between them they account for every
+`KNOWN GAP:` assertion in that spec. Worth reading together before either is planned.
 
 ## What to decide
 

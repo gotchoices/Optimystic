@@ -1,8 +1,9 @@
 ----
 description: A client whose idea of "the current version" is wrong keeps re-submitting the same doomed write ten times over about twenty seconds before giving up. Once the rejection tells it which version the server actually holds, the client should recognise a hopeless retry and either correct itself or stop immediately.
-prereq: stale-failure-carries-coordinator-revision
+prereq:
 files: packages/db-core/src/collection/collection.ts, packages/db-core/src/collection/struct.ts, packages/db-core/test/collection.spec.ts
 difficulty: medium
+tradeoffs: It changes when every caller of sync gives up, including high-contention workloads that legitimately rely on the current retry budget, and telling a broken revision view apart from ordinary contention is the hard part — getting it wrong turns retryable contention into spurious failures.
 ----
 
 # Stop retrying a write that will re-request the same taken revision
