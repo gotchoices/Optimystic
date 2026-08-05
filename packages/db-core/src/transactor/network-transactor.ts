@@ -215,6 +215,13 @@ export class NetworkTransactor implements ITransactor, IBlockChangeNotifier {
 		// absent, which beats an `unavailable` guess — one peer that positively knows the
 		// block is absent outranks another that could not find out. Non-object junk ranks
 		// below everything so any real entry replaces it.
+		// NOTE: `materializedRev` is not part of the ranking, so two peers answering the same
+		// pinned get with block-carrying entries at DIFFERENT materialized revisions resolve
+		// to whichever arrived first. Not a concern today — cohort peers share the block's
+		// revision log, so they agree on the highest committed rev at or below a pin — and the
+		// failure direction is safe (a lower recorded revision spuriously stale-rejects rather
+		// than wrongly accepting). If peers are ever seen to disagree here, break the tie on
+		// the HIGHEST materializedRev among rank-2 entries.
 		const rankOf = (r: unknown): number => {
 			if (!r || typeof r !== 'object') return -1;
 			const entry = r as GetBlockResults[BlockId];

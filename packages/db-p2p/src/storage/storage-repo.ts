@@ -296,6 +296,10 @@ export class StorageRepo implements IRepo, IBlockChangeNotifier, IBlockReplicaSt
 						latest: await blockStorage.getLatest(),
 						pendings: [context.actionId]
 					},
+					// The COMMITTED revision underneath the pending overlay. A pending has no revision
+					// of its own, so the honest answer is the base it was applied to; absent when there
+					// was no base at all (a pending-only insert), which callers read as "unknown".
+					...(blockRev ? { materializedRev: blockRev.actionRev.rev } : {}),
 					// A pending applied to a missing base can materialize nothing (applyTransform drops
 					// updates with no block to apply them to) — that absence is a guess, and is flagged.
 					// A materialized block is a real answer regardless of the earlier refusal.
@@ -315,6 +319,12 @@ export class StorageRepo implements IRepo, IBlockChangeNotifier, IBlockReplicaSt
 			const pendings = await asyncIteratorToArray(blockStorage.listPendingTransactions());
 			return [blockId, {
 				block: blockRev.block,
+				// `getBlock(context?.rev)` materialized the content at the highest committed revision
+				// at or below the pin, and reports it as `actionRev` — report THAT alongside the
+				// content. `state.latest` deliberately stays the node's newest revision for the block
+				// (StorageRepo.get's own promotion pre-scan and CoordinatorRepo's read-repair compare
+				// against it), so the two disagree exactly when a pinned read is serving older content.
+				materializedRev: blockRev.actionRev.rev,
 				state: {
 					latest: await blockStorage.getLatest(),
 					pendings

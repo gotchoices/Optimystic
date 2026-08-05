@@ -61,6 +61,11 @@ export class TestTransactor implements ITransactor {
 
 				// Get the appropriate materialized block based on context
 				let block: IBlock | undefined;
+				// The revision `block` was actually materialized at, reported as
+				// GetBlockResult.materializedRev. Equals `latestRev` on every unpinned path; only a
+				// revision-pinned read of a block committed further since the pin makes them differ,
+				// and there the pinned value is what the reader observed (see the field's doc).
+				let materializedRev: number | undefined;
 				if (blockGets.context?.actionId !== undefined) {
 					// If requesting a specific action, apply pending transform if it exists
 					const pendingTransform = blockState.pendingActions.get(blockGets.context.actionId);
@@ -68,6 +73,9 @@ export class TestTransactor implements ITransactor {
 						// Read latest committed block as base for pending transform
 						const baseBlock = blockState.materializedBlocks.get(blockState.latestRev);
 						block = applyTransformSafe(baseBlock, pendingTransform);
+						// A pending carries no revision of its own — report the committed base it was
+						// applied over. Absent when there was no base (a pending-only insert).
+						if (baseBlock) materializedRev = blockState.latestRev;
 					} else {
 						// Action not pending, maybe committed? Or maybe invalid actionId for context.
 						// For simplicity, return undefined block if specific pending action not found.
@@ -83,29 +91,37 @@ export class TestTransactor implements ITransactor {
 						if (pendingTransform) {
 							const baseBlock = blockState.materializedBlocks.get(blockState.latestRev);
 							block = applyTransformSafe(baseBlock, pendingTransform);
+							if (baseBlock) materializedRev = blockState.latestRev;
 							break;
 						}
 					}
 					// Fall through to standard resolution if no pending match
 					if (block === undefined) {
 						if (blockGets.context.rev !== undefined) {
-							block = structuredClone(latestMaterializedAt(blockState, blockGets.context.rev));
+							const found = latestMaterializedAt(blockState, blockGets.context.rev);
+							block = structuredClone(found?.block);
+							materializedRev = found?.rev;
 						} else {
 							block = structuredClone(blockState.materializedBlocks.get(blockState.latestRev));
+							if (block) materializedRev = blockState.latestRev;
 						}
 					}
 				} else if (blockGets.context?.rev !== undefined) {
 					// Return the materialized block at the highest revision ≤ requested
-					block = structuredClone(latestMaterializedAt(blockState, blockGets.context.rev));
+					const found = latestMaterializedAt(blockState, blockGets.context.rev);
+					block = structuredClone(found?.block);
+					materializedRev = found?.rev;
 				} else {
 					// Otherwise return latest materialized block
 					block = structuredClone(blockState.materializedBlocks.get(blockState.latestRev));
+					if (block) materializedRev = blockState.latestRev;
 				}
 
 
 				const actionId = blockState.revisionActions.get(blockState.latestRev);
 				results[blockId] = {
 					block,
+					...(materializedRev !== undefined ? { materializedRev } : {}),
 					state: {
 						latest: actionId !== undefined ? {
 							rev: blockState.latestRev,
@@ -457,11 +473,12 @@ function newBlockState(): BlockState {
 	};
 }
 
-/** Returns the materialized block at the highest revision ≤ the given revision */
-function latestMaterializedAt(blockState: BlockState, maxRev: number): IBlock | undefined {
+/** Returns the materialized block at the highest revision ≤ the given revision, together with
+ *  that revision — the caller reports it as {@link GetBlockResult.materializedRev}. */
+function latestMaterializedAt(blockState: BlockState, maxRev: number): { block: IBlock, rev: number } | undefined {
 	for (let rev = maxRev; rev >= 0; rev--) {
 		const block = blockState.materializedBlocks.get(rev);
-		if (block) return block;
+		if (block) return { block, rev };
 	}
 	return undefined;
 }

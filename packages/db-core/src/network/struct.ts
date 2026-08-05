@@ -162,6 +162,19 @@ export type GetBlockResult = {
 	block?: IBlock;
 	/** The latest and pending states of the repo that retrieved the block */
 	state: BlockActionState;
+	/** The revision the returned `block` was actually materialized at — the highest committed
+	 *  revision of THIS block at or below the caller's {@link BlockGets.context}`.rev`. Differs
+	 *  from `state.latest.rev` only for a revision-pinned read of a block that has committed
+	 *  further since the pin; for an unpinned read the two agree.
+	 *
+	 *  This — not `state.latest.rev` — is the revision a read observed, so it is what a read
+	 *  dependency must record (recording `latest` would claim the reader saw content it never
+	 *  read, and the validator's stale-read check would wrongly pass). `state.latest` keeps its
+	 *  own meaning: the newest revision the answering repo holds for the block.
+	 *
+	 *  Optional: a producer that does not know the materialized revision leaves it absent
+	 *  rather than guessing, and consumers fall back to `state.latest?.rev ?? 0`. */
+	materializedRev?: number;
 	/** Set when this repo could not determine whether the block exists — its answer is a
 	 *  guess, not an authoritative absent. Every producer that omits it (including
 	 *  TestTransactor) keeps meaning "authoritative". */

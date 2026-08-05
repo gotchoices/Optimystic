@@ -6,7 +6,7 @@ import { TestTransactor } from '../src/testing/test-transactor.js'
 import { randomBytes } from '@libp2p/crypto'
 import { toString as uint8ArrayToString } from 'uint8arrays/to-string'
 import type { IBlock, ActionId, ActionContext, Transforms, BlockOperation, CommitRequest, CommitResult, ITransactor, BlockGets, GetBlockResults, BlockUnavailableReason } from '../src/index.js'
-import { BlockUnavailableError } from '../src/index.js'
+import { BlockUnavailableError, CacheSource, ReadDependencyCollector } from '../src/index.js'
 
 describe('TransactorSource', () => {
 	type TestBlock = IBlock & { test: string[] }
@@ -530,6 +530,77 @@ describe('TransactorSource', () => {
 			const latestBlock = await latestSource.tryGet(blockId) as IBlock & { data: string };
 			expect(latestBlock).to.not.be.undefined;
 			expect((latestBlock as any).data, 'latest source should see rev 2 data').to.equal('rev2');
+		});
+
+		it('records a pinned read at the revision it materialized, not the transactor\'s latest', async () => {
+			// Ticket 2-bug-pinned-get-reports-latest-revision. The companion of the test above: the
+			// pinned source correctly SEES rev-1 content, and must also SAY rev 1. Recording the
+			// block's latest (rev 2) put "observed block@2" in the conflict set for content that is
+			// rev 1, so the validator's stale-read check — exact equality against the block's current
+			// revision — matched and let the transaction through on data it never read.
+			const transactor = new TestTransactor();
+			const blockId = 'pinned-dep-block';
+
+			await transactor.pend({
+				actionId: 'v1' as ActionId,
+				transforms: { inserts: { [blockId]: { header: { id: blockId, type: 'T', collectionId: 'c' }, data: 'rev1' } as IBlock }, updates: {}, deletes: [] },
+				policy: 'c',
+			});
+			await transactor.commit({ actionId: 'v1' as ActionId, blockIds: [blockId], tailId: blockId, rev: 1 });
+
+			await transactor.pend({
+				actionId: 'v2' as ActionId,
+				transforms: { inserts: {}, updates: { [blockId]: [['data', 0, 0, 'rev2']] }, deletes: [] },
+				policy: 'c',
+				rev: 2,
+			});
+			await transactor.commit({ actionId: 'v2' as ActionId, blockIds: [blockId], tailId: blockId, rev: 2 });
+
+			const pinned = new TransactorSource<IBlock>('c', transactor, { committed: [{ actionId: 'v1' as ActionId, rev: 1 }], rev: 1 });
+			expect(await pinned.tryGet(blockId)).to.not.be.undefined;
+			expect(pinned.getReadDependencies(), 'dependency at the PINNED revision').to.deep.equal([{ blockId, revision: 1 }]);
+			// CacheSource learns the revision through this accessor on a miss-load, so it must carry
+			// the same number the collector got — otherwise later cache hits re-emit a different one.
+			expect(pinned.getReadRevision(blockId), 'cache learns the same revision').to.equal(1);
+
+			// No over-correction: an unpinned read of the same block still records rev 2.
+			const latest = new TransactorSource<IBlock>('c', transactor, undefined);
+			expect(await latest.tryGet(blockId)).to.not.be.undefined;
+			expect(latest.getReadDependencies()).to.deep.equal([{ blockId, revision: 2 }]);
+		});
+
+		it('a CacheSource over a pinned source re-emits the pinned revision on every hit', async () => {
+			// The miss-load path learns the revision from the source (getReadRevision) and stamps it
+			// into CacheSource.revisions; every later HIT re-emits that number without consulting the
+			// source. A mis-stamped miss therefore poisons every subsequent read of the block.
+			const transactor = new TestTransactor();
+			const blockId = 'pinned-cache-block';
+
+			await transactor.pend({
+				actionId: 'v1' as ActionId,
+				transforms: { inserts: { [blockId]: { header: { id: blockId, type: 'T', collectionId: 'c' }, data: 'rev1' } as IBlock }, updates: {}, deletes: [] },
+				policy: 'c',
+			});
+			await transactor.commit({ actionId: 'v1' as ActionId, blockIds: [blockId], tailId: blockId, rev: 1 });
+			await transactor.pend({
+				actionId: 'v2' as ActionId,
+				transforms: { inserts: {}, updates: { [blockId]: [['data', 0, 0, 'rev2']] }, deletes: [] },
+				policy: 'c',
+				rev: 2,
+			});
+			await transactor.commit({ actionId: 'v2' as ActionId, blockIds: [blockId], tailId: blockId, rev: 2 });
+
+			const collector = new ReadDependencyCollector();
+			const pinnedSource = new TransactorSource<IBlock>('c', transactor, { committed: [], rev: 1 }, collector);
+			const cache = new CacheSource<IBlock>(pinnedSource, undefined, collector);
+
+			const miss = await cache.tryGet(blockId) as IBlock & { data: string };
+			expect((miss as any).data, 'miss serves rev 1 content').to.equal('rev1');
+			const hit = await cache.tryGet(blockId) as IBlock & { data: string };
+			expect((hit as any).data, 'hit serves the same content').to.equal('rev1');
+
+			// Max-wins in the collector means a single rev-2 emission anywhere would show up here.
+			expect(collector.getReadDependencies()).to.deep.equal([{ blockId, revision: 1 }]);
 		});
 
 		it('should not propagate pending action info from tryGet (TODO in source code)', async () => {
