@@ -56,6 +56,12 @@ This project uses [tess](tess/) for AI-driven ticket management.
 Read and follow the ticket workflow rules in tess/agent-rules/tickets.md.
 Tickets are in the [tickets/](tickets/) directory.
 
+## Tending the garden
+
+If asked to "tend the garden" or similar,the user wishes you to keep progress going by monitoring pending (fix/implement/plan/review) tickets, starting a background tess runner (`node tess/scripts/run.mjs`), and checking on things periodically (every 1-2 hours unless other cadence justified).  Don't interfere with other repo tess runners.
+
+If more tickets needed and no systematic block, limited allowance to pull from root of backlog.  Maintain `tickets/.garden-report.md` and pull in pressing and clear tickets that require no human design decisions.  If nothing important, don't do busy-work; let user know and standy.
+
 ## Code search (tess)
 
 **First tool** for any "where / how / why" question about this codebase: the local code-aware index wired to `mcp__code-search__*`. Reach for `grep`/`Glob` only when you already know the exact filename or literal string. Pick the right sub-tool — they are not interchangeable.
@@ -80,12 +86,6 @@ Tickets are in the [tickets/](tickets/) directory.
 - Never fall back to `grep` when `find_references` would suffice — it's strictly slower and pulls more bytes.
 
 **What's indexed:** project source files tracked by git, minus `node_modules/`, `dist/`, `build/`, `.git/`, `tickets/`, `team/`, `docs/`, and a few cache dirs. If a query about prose-heavy material (long-form architecture docs, design notes, READMEs in nested folders) returns nothing, the file may be outside the indexed set — fall back to `Read`/`Glob` for those paths. Projects can override the filter via `tickets/index-config.json` (see tess README § Customize what gets indexed).
-
-## Tending the garden
-
-If you are asked to "tend the garden" or something like that, what is meant is that the user wishes you to try to keep progress going by monitoring pending (fix/implement/plan/review) tickets, starting a background tess runner (`node tess/scripts/run.mjs`), and then checking on things periodically (ie. every 1-2 hours unless slower or faster cadence is justified).  Be sure not to interfere with tess runners that might be active in other repos.
-
-If more tickets are needed and there isn't something systematically blocking progress, you can look at the root of backlog.  Maintain `tickets/.garden-report.md` and pull in pressing and clear tickets that require no human design decisions.  If nothing seems important, don't do busy-work, it's okay to let the user know and stay idle.
 
 ## Caveman
 
