@@ -4,7 +4,7 @@ import type { ReconcileBlockCallback } from "./cluster-repo.js";
 import type { IPeerReputation } from "../reputation/types.js";
 import { PenaltyReason } from "../reputation/types.js";
 import {
-	selectQuorumRev, selectQuorumBlock, canonicalBlockHash, corroboratorCapacity,
+	selectQuorumRev, selectQuorumBlock, canonicalBlockHash, corroboratorCapacity, quorumSize,
 	type RevClaim, type BlockHashCandidate, type QuorumRev
 } from "./quorum-restore.js";
 import { createLogger } from '../logger.js';
@@ -172,14 +172,26 @@ export function createReconcileBlock(deps: ReconcileBlockDeps): ReconcileBlockCa
 		const selected = selectQuorumRev(revClaims, deps.simpleMajorityThreshold, capacity);
 		if (!selected) {
 			// Leave the block behind; churn/rebalance and the next commit retry.
-			log('reconcile:no-rev-quorum', { blockId, rev: committed.rev, responders: revClaims.length, capacity });
+			log('reconcile:no-rev-quorum', {
+				blockId,
+				rev: committed.rev,
+				responders: revClaims.length,
+				required: quorumSize(revClaims.length, deps.simpleMajorityThreshold, capacity),
+				repairCorroborationClusterSize: deps.repairCorroborationClusterSize
+			});
 			return;
 		}
 
 		const hashCandidates = await hashCarriers(candidates, selected);
 		const agreed = selectQuorumBlock(hashCandidates, deps.simpleMajorityThreshold, capacity);
 		if (!agreed) {
-			log('reconcile:no-content-quorum', { blockId, rev: selected.rev, carriers: hashCandidates.length, capacity });
+			log('reconcile:no-content-quorum', {
+				blockId,
+				rev: selected.rev,
+				carriers: hashCandidates.length,
+				required: quorumSize(hashCandidates.length, deps.simpleMajorityThreshold, capacity),
+				repairCorroborationClusterSize: deps.repairCorroborationClusterSize
+			});
 			return;
 		}
 

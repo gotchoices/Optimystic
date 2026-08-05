@@ -715,7 +715,8 @@ export class CoordinatorRepo implements IRepo {
 			log('cluster-fetch:no-quorum', {
 				blockId,
 				responders: claims.length,
-				required: quorumSize(claims.length, this.simpleMajorityThreshold, capacity)
+				required: quorumSize(claims.length, this.simpleMajorityThreshold, capacity),
+				repairCorroborationClusterSize: this.repairCorroborationClusterSize
 			});
 			return { local, silent };
 		}

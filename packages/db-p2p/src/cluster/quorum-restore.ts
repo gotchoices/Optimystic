@@ -38,7 +38,7 @@ export interface QuorumRev {
  * seconded by a second, independent peer. See {@link quorumSize} for the cap that
  * applies when the cohort is smaller than this.
  */
-const CORROBORATION_FLOOR = 2;
+export const CORROBORATION_FLOOR = 2;
 
 /**
  * Number of distinct corroborating votes required to accept a claim:

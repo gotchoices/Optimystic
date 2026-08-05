@@ -1,4 +1,8 @@
 import { DEFAULT_SUPER_MAJORITY_THRESHOLD, type ClusterConsensusConfig } from "@optimystic/db-core";
+import { createLogger } from "../logger.js";
+import { CORROBORATION_FLOOR } from "./quorum-restore.js";
+
+const log = createLogger('cluster-policy');
 
 /**
  * Resolves the operator-facing cluster knobs (`clusterSize`, `clusterPolicy.*`) into the concrete
@@ -125,6 +129,28 @@ export function resolveClusterPolicy(options: ClusterPolicyOptions): ResolvedClu
 	// clamp here rather than in each consumer.
 	const declaredCohortSize = options.clusterPolicy?.assumedClusterSize;
 	const clusterSize = options.clusterSize ?? 10;
+	const repairCorroborationClusterSize = declaredCohortSize ?? clusterSize;
+
+	// Called once per node (resolveClusterPolicy runs once at construction), so this fires once per
+	// node startup, not per repair — a per-attempt warn on a busy node would be noise that gets
+	// filtered, defeating the point. Fires purely off configuration (not an observed cohort), so a
+	// deployment that genuinely runs `clusterSize` machines sees it too; worded as a conditional
+	// ("if you run fewer than N machines") rather than a fault for exactly that reason.
+	if (declaredCohortSize === undefined && clusterSize > minAbsoluteClusterSize) {
+		log('assumed-cluster-size-unset', {
+			clusterSize,
+			repairCorroborationClusterSize,
+			corroborationFloor: CORROBORATION_FLOOR,
+			message:
+				`No clusterPolicy.assumedClusterSize declared: block repair (read-repair and reconcile) requires ` +
+				`${CORROBORATION_FLOOR} distinct corroborating peers before it can relax below ` +
+				`repairCorroborationClusterSize=${repairCorroborationClusterSize} — a cohort that genuinely runs ` +
+				`fewer than ${repairCorroborationClusterSize} machines can never supply that and repair will ` +
+				`decline forever. If you run fewer than ${repairCorroborationClusterSize} machines, set ` +
+				`clusterPolicy.assumedClusterSize to your real cohort size; it does not lower clusterSize=${clusterSize} ` +
+				`(the replication factor).`
+		});
+	}
 
 	return {
 		superMajorityThreshold: options.clusterPolicy?.superMajorityThreshold ?? DEFAULT_SUPER_MAJORITY_THRESHOLD,
@@ -147,6 +173,6 @@ export function resolveClusterPolicy(options: ClusterPolicyOptions): ResolvedClu
 		// Repair corroboration floor, every repair. Defaults strict — to the replication factor — so an
 		// unconfigured node cannot have its floor talked down to a single voter by a shrunken cohort
 		// view. A genuinely small mesh declares its size (either field) to regain self-repair.
-		repairCorroborationClusterSize: declaredCohortSize ?? clusterSize
+		repairCorroborationClusterSize
 	};
 }

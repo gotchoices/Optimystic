@@ -58,6 +58,11 @@ export class NetworkManagerService implements Startable {
 		}
 	}
 
+	/** The cluster size this instance actually resolved to, for `assertClusterSizeCoupling`. */
+	get effectiveClusterSize(): number {
+		return this.cfg.clusterSize;
+	}
+
 	setLibp2p(libp2p: Libp2p): void {
 		this.libp2pRef = libp2p;
 	}

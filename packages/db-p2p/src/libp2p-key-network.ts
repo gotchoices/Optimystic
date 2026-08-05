@@ -183,6 +183,11 @@ export class Libp2pKeyPeerNetwork implements IKeyNetwork, IPeerNetwork {
 		this.setupConnectionTracking();
 	}
 
+	/** The cluster size this instance actually resolved to, for `assertClusterSizeCoupling`. */
+	get effectiveClusterSize(): number {
+		return this.clusterSize;
+	}
+
 	// coordinator cache: key (base64url) -> peerId until expiry (bounded LRU-ish via Map insertion order)
 	private readonly coordinatorCache = new Map<string, { id: PeerId, expires: number }>()
 	private static readonly MAX_CACHE_ENTRIES = 1000

@@ -22,6 +22,7 @@ import { seedOwnedBlocksFromStorage } from './owned-block-seed.js';
 import { clusterMember, type ReconcileBlockCallback, type CommitCertificateSink, type DeriveExpectedClusterCallback } from './cluster/cluster-repo.js';
 import { createReconcileBlock } from './cluster/reconcile-block.js';
 import { resolveClusterPolicy, type ClusterPolicyOptions } from './cluster/cluster-policy.js';
+import { assertClusterSizeCoupling } from './cluster/cluster-size-coupling.js';
 import { createCommitCertStore, makeClusterCommitCertExtractor, type CommitCertStore } from './cluster/commit-cert.js';
 import { coordinatorRepo } from './repo/coordinator-repo.js';
 import { Libp2pKeyPeerNetwork, type NetworkMode, type NetworkStatePersistence } from './libp2p-key-network.js';
@@ -458,6 +459,16 @@ export async function createLibp2pNodeBase(
 		? (actionId, cert): void => { certStore.put(actionId, cert); options.onCommitCertificate?.(actionId, cert); }
 		: options.onCommitCertificate;
 
+	// Every cluster-policy default lives in `cluster/cluster-policy.ts` — including WHY the admission
+	// gate and the repair corroboration floor resolve the one operator field
+	// (`clusterPolicy.assumedClusterSize`) to different values when it is absent. Resolved ONCE, here,
+	// before anything that reads a cluster size is constructed: `networkManagerService` below,
+	// `Libp2pKeyPeerNetwork`, and the spread-on-churn monitor init must all read `consensusConfig.clusterSize`
+	// rather than `options.clusterSize` directly, or they can each apply their own fallback default and
+	// silently disagree (ticket bug-cluster-size-resolution-single-source). `assertClusterSizeCoupling`
+	// below is the fail-fast backstop if a future edit reintroduces that split.
+	const consensusConfig = resolveClusterPolicy(options);
+
 	const libp2pOptions: Libp2pInit = {
 		start: false,
 		privateKey: nodePrivateKey,
@@ -613,7 +624,7 @@ export async function createLibp2pNodeBase(
 
 			networkManager: (components: any) => {
 				const svcFactory = networkManagerService({
-					clusterSize: options.clusterSize ?? 10,
+					clusterSize: consensusConfig.clusterSize,
 					expectedRemotes: (options.bootstrapNodes?.length ?? 0) > 0,
 					allowClusterDownsize: options.clusterPolicy?.allowDownsize ?? true,
 					clusterSizeTolerance: options.clusterPolicy?.sizeTolerance ?? 0.5
@@ -681,7 +692,7 @@ export async function createLibp2pNodeBase(
 	// bootstraps registers a different (network-namespaced) identify protocol, so it is
 	// never selected and can't drag this network's super-majority below quorum.
 	const protocolPrefix = `/optimystic/${options.networkName}`;
-	const keyNetwork = new Libp2pKeyPeerNetwork(node, options.clusterSize, undefined, networkMode, options.persistence, reputation, protocolPrefix);
+	const keyNetwork = new Libp2pKeyPeerNetwork(node, consensusConfig.clusterSize, undefined, networkMode, options.persistence, reputation, protocolPrefix);
 	await keyNetwork.initFromPersistedState();
 	const createClusterClient = (peerId: any) => ClusterClient.create(peerId, keyNetwork, protocolPrefix);
 
@@ -699,12 +710,6 @@ export async function createLibp2pNodeBase(
 	// Create partition detector and get FRET service
 	const partitionDetector = new PartitionDetector();
 	const fretSvc = (node as any).services?.fret as FretService | undefined;
-
-	// Every cluster-policy default lives in `cluster/cluster-policy.ts` — including WHY the admission
-	// gate and the repair corroboration floor resolve the one operator field
-	// (`clusterPolicy.assumedClusterSize`) to different values when it is absent. Extracted so those
-	// defaults can be asserted without booting a node.
-	const consensusConfig = resolveClusterPolicy(options);
 
 	// Fetch a block archive from one cohort peer over the sync protocol, bounded by a
 	// per-peer timeout so an unreachable peer can't stall reconciliation. Mirrors the
@@ -879,6 +884,12 @@ export async function createLibp2pNodeBase(
 	// owned-block feed populates it, and the rebalance responsibility-loss signal evicts from it
 	// (in the rebalance block below). Both monitors take this exact instance via deps.trackedBlocks.
 	const networkManager = (node as any).services?.networkManager as NetworkManagerService | undefined;
+
+	// See the comment above `consensusConfig` for why every cluster-size consumer must read the SAME
+	// resolved value. This throws at construction (rather than letting a node come up mismatched) if a
+	// future edit gives `keyNetwork` or `networkManager` their own fallback again.
+	assertClusterSizeCoupling(consensusConfig.clusterSize, { keyNetwork, networkManager });
+
 	const ownedBlocks = new Set<string>();
 	// Single owned-block feed: every block this node commits OR receives as a replica fires
 	// storageRepo.onAnyCollectionChange. Subscribe to storageRepo DIRECTLY (not
@@ -923,7 +934,7 @@ export async function createLibp2pNodeBase(
 				partitionDetector,
 				storageRepo,
 				keyNetwork,
-				options.clusterSize ?? 10,
+				consensusConfig.clusterSize,
 				protocolPrefix,
 				ownedBlocks,
 				options.spreadOnChurn,

@@ -15,6 +15,7 @@
 import { expect } from 'chai';
 import { DEFAULT_SUPER_MAJORITY_THRESHOLD } from '@optimystic/db-core';
 import { minAbsoluteClusterSize, resolveClusterPolicy } from '../src/cluster/cluster-policy.js';
+import { captureLog, hasTag } from './support/capture-log.js';
 
 describe('resolveClusterPolicy', () => {
 	describe('unconfigured node (the defaults a real deployment runs on)', () => {
@@ -98,6 +99,45 @@ describe('resolveClusterPolicy', () => {
 			const options = { clusterSize: 7, clusterPolicy: { assumedClusterSize: 3 } };
 
 			expect(resolveClusterPolicy(options)).to.deep.equal(resolveClusterPolicy(options));
+		});
+	});
+
+	describe('assumed-cluster-size-unset startup warning', () => {
+		it('fires once when clusterSize > minAbsoluteClusterSize and assumedClusterSize is undeclared', async () => {
+			const captured = await captureLog('cluster-policy', async () => {
+				resolveClusterPolicy({});
+			});
+
+			expect(hasTag(captured, 'assumed-cluster-size-unset')).to.equal(true);
+			expect(captured.filter(args => typeof args[0] === 'string' && args[0].includes('assumed-cluster-size-unset')))
+				.to.have.lengthOf(1);
+		});
+
+		it('does not fire when assumedClusterSize is declared', async () => {
+			const captured = await captureLog('cluster-policy', async () => {
+				resolveClusterPolicy({ clusterSize: 16, clusterPolicy: { assumedClusterSize: 16 } });
+			});
+
+			expect(hasTag(captured, 'assumed-cluster-size-unset')).to.equal(false);
+		});
+
+		it('does not fire for an honest small clusterSize at the admission-gate default', async () => {
+			const captured = await captureLog('cluster-policy', async () => {
+				resolveClusterPolicy({ clusterSize: minAbsoluteClusterSize });
+			});
+
+			expect(hasTag(captured, 'assumed-cluster-size-unset')).to.equal(false);
+		});
+
+		it('still fires for a large, genuinely-provisioned clusterSize — it is advisory, not a fault', async () => {
+			// A deployment that really does run 16 machines is correctly configured and gets the
+			// warning too; the wording is conditional ("if you run fewer than N machines"), not a claim
+			// that this deployment is wrong.
+			const captured = await captureLog('cluster-policy', async () => {
+				resolveClusterPolicy({ clusterSize: 16 });
+			});
+
+			expect(hasTag(captured, 'assumed-cluster-size-unset')).to.equal(true);
 		});
 	});
 });
