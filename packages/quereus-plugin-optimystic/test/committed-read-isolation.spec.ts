@@ -165,14 +165,16 @@ describe('Committed-read connection isolation', function () {
 	this.timeout(30_000);
 
 	describe('module declarations', () => {
-		it('declares reentrant-reads; readCommittedSnapshot stays OFF until proven', () => {
+		it('declares reentrant-reads and readCommittedSnapshot (stall-overlap proven)', () => {
 			const { db, plugin } = createTestDb();
 			try {
 				const module = plugin.vtables[0]!.module;
 				expect(getModuleConcurrencyMode(module)).to.equal('reentrant-reads');
-				// Deliberately still false: ticket `committed-read-snapshot-declaration`
-				// flips this assertion WITH its stall-overlap proof. Do not flip it here.
-				expect(getModuleReadCommittedSnapshot(module)).to.equal(false);
+				// Flipped by ticket `committed-read-snapshot-declaration` together with its
+				// stall-overlap proof (committed-read-stall.spec.ts) and standing conformance
+				// cover (committed-read-conformance.spec.ts). Do not turn this off without
+				// re-serializing committed reads — the flag is what routes them off the mutex.
+				expect(getModuleReadCommittedSnapshot(module)).to.equal(true);
 			} finally {
 				db.close();
 			}

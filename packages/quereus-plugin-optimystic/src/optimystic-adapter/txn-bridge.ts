@@ -113,10 +113,14 @@ export class TransactionBridge {
    * table but not its index, a post-clear committed FULL SCAN and a committed
    * INDEX-DRIVEN scan of the same table disagree, and always will: only the
    * application-level reconciliation described in docs/correctness.md § "Partial
-   * landing" fixes that. If anything is ever built that treats a cleared latch as
-   * proof of a coherent store — most likely `readCommittedSnapshot`, which promises
-   * exactly full-scan/index agreement — the clearing rule needs to become a real
-   * reconciliation check first, not a next-commit-wins heuristic.
+   * landing" fixes that. `readCommittedSnapshot` IS now declared, and deliberately
+   * does NOT treat a cleared latch as proof of a coherent store: the declared
+   * obligation is scoped to reads not tearing across a CONCURRENT commit, and the
+   * at-rest split above afflicts the serialized path identically (documented at the
+   * declaration site and in docs/transactions.md § "Committed reads run concurrently
+   * with a stalled commit"). If the clearing rule is ever asked to certify at-rest
+   * coherence, it needs to become a real reconciliation check first, not a
+   * next-commit-wins heuristic.
    */
   private degradedReason: string | null = null;
   private collectionFactory: CollectionFactory;

@@ -65,7 +65,7 @@ dependencies by default (`ReadViewOptions.recordReads`), so a committed scan can
 fail a concurrent writer's commit validation; deferred-constraint safety instead
 rests on validator peers re-executing the recorded statements.
 
-Two further properties hold for that path:
+Three further properties hold for that path:
 
 - **A committed read registers no connection.** `OptimysticModule.connect` with
   `_readCommitted: true` resolves (and, on first touch, initializes) the shared table
@@ -80,15 +80,27 @@ Two further properties hold for that path:
   an index-driven plan — the index-tree view with no `await` between them. Splitting
   them across an await let a commit land in between, so an index-driven plan and a full
   scan of the same nominal snapshot could disagree.
+- **A dirty tree's view pins to the SNAPSHOT's boundary, not the current one.** A
+  `CollectionSnapshot` records the committed boundary (`context`) it was captured on
+  (i.e. at `TransactionBridge.markDirty`, before the first stage), and `Tree.readView`
+  pins the view to that boundary — excluding newer-revision entries from the warm cache
+  seed. So while the legacy tree-by-tree commit sweep is mid-publish (main table
+  flushed and its revision advanced; index still unflushed), a committed read of both
+  trees still describes the one pre-transaction boundary. Regression anchor: the
+  "mid-sweep shape" test in `packages/db-core/test/read-view-pinned.spec.ts` and the
+  MID-SWEEP stall test in
+  `packages/quereus-plugin-optimystic/test/committed-read-stall.spec.ts`.
 
 `OptimysticModule` declares `concurrencyMode = 'reentrant-reads'`: concurrent
 `query()` calls on one connected table are safe (every scan's mutable state is local to
 its generator; committed scans read per-scan pinned views; a live scan's
 `collection.update()` serializes behind db-core's per-collection latch). Writes still
 serialize, which is what keeps the bridge's single-writer state (below) unexposed.
-`readCommittedSnapshot` is **not** declared — that is the stronger, separate promise
-that a committed read survives another connection's commit mid-scan, and it stays off
-until proven under a stalled commit.
+`readCommittedSnapshot` is **also declared** (the stronger promise that a committed
+read survives another connection's commit mid-scan), proven under a stalled commit in
+both commit modes — see docs/transactions.md § "Committed reads run concurrently with
+a stalled commit" for what holds it, the first-touch provisional initialization, the
+conformance harness's blind spot, and the residual degraded-store limit.
 
 ### Write Path (Local Changes)
 ```

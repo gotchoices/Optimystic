@@ -199,13 +199,24 @@ export class Tree<TKey, TEntry> implements TreeReadView<TKey, TEntry> {
 	 * By default the view records no read dependencies into the collection's conflict
 	 * set; pass `{ recordReads: true }` to opt in (see {@link ReadViewOptions}).
 	 *
+	 * The view pins to the snapshot's OWN committed boundary ({@link CollectionSnapshot.context}),
+	 * not the collection's current one — so a snapshot captured before a commit yields a
+	 * coherent pre-commit view even when this tree has already flushed that commit (a
+	 * mid-sweep multi-tree commit). A snapshot with no recorded boundary (an invented
+	 * collection, or a hand-built snapshot) falls back to the current context, which is
+	 * the pre-boundary behaviour.
+	 *
 	 * `snapshot` is the opaque value returned by {@link snapshot}; pass it back
 	 * verbatim. */
 	readView(
 		snapshot: CollectionSnapshot<TreeReplaceAction<TKey, TEntry>>,
 		options?: ReadViewOptions,
 	): TreeReadView<TKey, TEntry> {
-			const tracker = this.collection.createReadTracker(snapshot.transforms, options);
+			const effectiveOptions: ReadViewOptions = {
+				...options,
+				pinContext: options?.pinContext ?? snapshot.context,
+			};
+			const tracker = this.collection.createReadTracker(snapshot.transforms, effectiveOptions);
 			return new BTree<TKey, TEntry>(
 				tracker,
 				new CollectionTrunk(tracker, this.collection.id),

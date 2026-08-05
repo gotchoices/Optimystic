@@ -233,6 +233,42 @@ describe('Tree.readView pinning (committed read view)', function () {
 		expectSameRows(rowsB, expectedB);
 	});
 
+	it('a view built AFTER a later commit still shows the snapshot boundary (mid-sweep shape)', async () => {
+		// A snapshot captures the committed boundary it sat on (CollectionSnapshot.context).
+		// Building the view LATER — after the same tree flushed a further commit, folding new
+		// content into the shared cache and advancing its context — must still yield the
+		// snapshot's boundary, not the new one. This is the multi-tree commit sweep shape:
+		// tree N has already synced while tree N+1 has not, and a committed read of BOTH must
+		// describe the pre-sweep boundary. Without the pin (view context frozen at view
+		// creation, seed unfiltered) this view would read post-commit content.
+		const network = new TestTransactor();
+		const tree = await makeTree(network, 'pinned-boundary', 40, 4);
+
+		const preCommit = tree.snapshot();
+		const expected = await collectRows(tree.readView(preCommit));
+		expect(expected).to.have.length(40);
+
+		// A second commit through the SAME live tree: rewrites every row, appends more.
+		const changes: [number, TestEntry | undefined][] = [];
+		for (let key = 1; key <= 40; key++) {
+			changes.push([key, entry(key, `rewritten-${key}`)]);
+		}
+		for (let key = 41; key <= 60; key++) {
+			changes.push([key, entry(key)]);
+		}
+		await tree.stage(changes);
+		await tree.sync();
+
+		// View built NOW from the OLD snapshot: must show the pre-commit rows.
+		const pinnedRows = await collectRows(tree.readView(preCommit));
+		expectSameRows(pinnedRows, expected);
+
+		// No permanent staleness: a FRESH snapshot's view shows the committed rewrite.
+		const freshRows = await collectRows(tree.readView(tree.snapshot()));
+		expect(freshRows).to.have.length(60);
+		expect(freshRows[0]).to.deep.equal(entry(1, 'rewritten-1'));
+	});
+
 	it('a committed view of a never-synced collection is still readable (and stays empty)', async () => {
 		const network = new TestTransactor();
 		const tree = await Tree.createOrOpen<number, TestEntry>(network, 'pinned-fresh', e => e.key);

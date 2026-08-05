@@ -46,6 +46,14 @@ export interface ReadViewOptions {
 	 *  their own committed state, so a constraint that no longer holds is caught
 	 *  at validation regardless. */
 	recordReads?: boolean;
+	/** Pin the view to this committed boundary instead of the collection's CURRENT
+	 *  action context. Pass a {@link CollectionSnapshot.context} so the view describes
+	 *  the same committed moment the snapshot's transforms sat on — even when the
+	 *  collection has committed further since (e.g. a multi-tree commit sweep that has
+	 *  already flushed THIS tree but not its siblings). Blocks cached at revisions
+	 *  newer than the pin are excluded from the view's warm seed and refetched from
+	 *  the transactor at the pinned revision. Default: the current context. */
+	pinContext?: ActionContext;
 }
 
 /** A point-in-time copy of a collection's staged (un-synced) state, produced by
@@ -55,6 +63,13 @@ export interface CollectionSnapshot<TAction> {
 	transforms: Transforms;
 	/** Pending actions queued at snapshot time. */
 	pending: Action<TAction>[];
+	/** The committed boundary (action context) the staged state sat on when captured.
+	 *  `undefined` for a collection with no committed revision yet (an invented
+	 *  collection whose header/root still live in the tracker). A read view built
+	 *  from this snapshot pins to this boundary (see {@link ReadViewOptions.pinContext}),
+	 *  so the view stays coherent with the snapshot's transforms even if the
+	 *  collection commits further before the view is built. */
+	context?: ActionContext;
 }
 
 export class Collection<TAction> implements ICollection<TAction> {
@@ -318,7 +333,11 @@ export class Collection<TAction> implements ICollection<TAction> {
 	 * Synchronous and latch-free: intended to bracket transaction-scoped staging,
 	 * when no concurrent act/sync is in flight. */
 	snapshotPending(): CollectionSnapshot<TAction> {
-		return { transforms: copyTransforms(this.tracker.transforms), pending: [...this.pending] };
+		return {
+			transforms: copyTransforms(this.tracker.transforms),
+			pending: [...this.pending],
+			context: structuredClone(this.source.actionContext),
+		};
 	}
 
 	/** Restore the staged state captured by {@link snapshotPending}, discarding any
@@ -360,13 +379,32 @@ export class Collection<TAction> implements ICollection<TAction> {
 	 * latest. Harmless today because such a collection's blocks all live in the tracker
 	 * transforms, so a view never reaches storage; if invented collections ever gain
 	 * committed blocks not covered by their transforms, this view would follow storage
-	 * forward instead of staying pinned. */
+	 * forward instead of staying pinned.
+	 *
+	 * When {@link ReadViewOptions.pinContext} is supplied, the view pins to THAT
+	 * boundary instead of the current context, and cache entries committed at a newer
+	 * revision are dropped from the seed (they would otherwise be served blindly — the
+	 * cache never checks a hit against the requested context). Dropped entries are
+	 * refetched from the transactor, which resolves the highest committed revision at
+	 * or below the pin. This is what lets a snapshot captured BEFORE a commit still
+	 * yield a coherent pre-commit view AFTER that commit folded into the shared cache
+	 * (a mid-sweep multi-tree commit being the motivating case). */
 	createReadTracker(transforms: Transforms, options?: ReadViewOptions): Tracker<IBlock> {
 		const collector = options?.recordReads ? this.source.getCollector() : undefined;
+		const pinContext = options?.pinContext ?? this.source.actionContext;
+		const pinRev = options?.pinContext?.rev;
+		let seed = this.sourceCache.snapshotEntries();
+		if (pinRev !== undefined) {
+			// NOTE: entries whose revision the cache never learned read as 0 and pass this
+			// filter. Committed blocks always carry a real revision (the transactor reports
+			// it on load; transformCache stamps it on fold), so a rev-0 entry newer than the
+			// pin does not occur on the paths that reach here.
+			seed = seed.filter(([, , revision]) => revision <= pinRev);
+		}
 		const pinnedSource = new TransactorSource<IBlock>(
-			this.id, this.transactor, structuredClone(this.source.actionContext), collector);
+			this.id, this.transactor, structuredClone(pinContext), collector);
 		const pinnedCache = new CacheSource<IBlock>(
-			pinnedSource, undefined, collector, this.sourceCache.snapshotEntries());
+			pinnedSource, undefined, collector, seed);
 		return new Tracker(pinnedCache, copyTransforms(transforms));
 	}
 

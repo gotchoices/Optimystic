@@ -111,6 +111,15 @@ export class OptimysticVirtualTable extends VirtualTable {
   private collection?: Tree<string, any>;
   private isInitialized = false;
   private initializationPromise?: Promise<void>;
+  /**
+   * True after a PROVISIONAL (read-only) initialization completed — see
+   * {@link initializeForCommittedRead}. The table can serve committed reads but has
+   * not persisted schema, registered its collections with the bridge, or subscribed
+   * to change notifications; the next {@link initialize} upgrades it fully.
+   */
+  private isProvisionallyInitialized = false;
+  /** In-flight provisional initialization, shared by concurrent committed reads. */
+  private provisionalInitPromise?: Promise<void>;
   private txnBridge: TransactionBridge;
   private collectionFactory: CollectionFactory;
   private options: ParsedOptimysticOptions;
@@ -173,16 +182,80 @@ export class OptimysticVirtualTable extends VirtualTable {
     }
 
     // Start initialization
-    this.initializationPromise = this.doInitialize();
+    this.initializationPromise = (async () => {
+      // An in-flight PROVISIONAL (read-only) initialization shares this table's
+      // instance fields; let it settle before rebuilding fully so the two cannot
+      // interleave half-assigned state. Its failure is irrelevant here — the full
+      // pass redoes all of its work.
+      if (this.provisionalInitPromise) {
+        try {
+          await this.provisionalInitPromise;
+        } catch {
+          // Full initialization below redoes the provisional pass's work.
+        }
+      }
+      await this.doInitialize(false);
+    })();
     return this.initializationPromise;
   }
 
   /**
-   * Internal initialization logic
+   * Initialization entry point for the COMMITTED (`_readCommitted`) connect path.
+   *
+   * A committed read must never join the writer's in-flight transaction — but plain
+   * {@link initialize} does exactly that on a cold table: it opens collections under
+   * the writer's transaction state, persists the schema when the local shape
+   * disagrees with storage, registers collections into the live registry a
+   * session-mode coordinator commits from, and subscribes to change notifications.
+   * Serialized reads made that unobservable; with `readCommittedSnapshot` declared,
+   * committed reads run OUTSIDE the execution mutex and a first touch can interleave
+   * with an in-flight commit.
+   *
+   * So: when the bridge is quiescent (no active transaction — the overwhelmingly
+   * common first touch), run the ordinary full initialization; there is nothing to
+   * interleave with. When a writer transaction IS active, run a PROVISIONAL
+   * read-only initialization instead: open collections with NO transaction state,
+   * resolve the schema without writing it, and skip collection registration and
+   * change subscription. The table stays un-memoized as initialized, so the next
+   * touch on a quiescent bridge (or the next live touch) upgrades it fully.
    */
-  private async doInitialize(): Promise<void> {
+  async initializeForCommittedRead(): Promise<void> {
+    if (this.isInitialized) {
+      return;
+    }
+    // A FULL initialization is already in flight (the writer's own create/connect
+    // path — it owns the decision to join its transaction). Await it.
+    if (this.initializationPromise) {
+      return this.initializationPromise;
+    }
+    if (!this.txnBridge.isTransactionActive()) {
+      return this.initialize();
+    }
+    if (this.isProvisionallyInitialized) {
+      return;
+    }
+    if (!this.provisionalInitPromise) {
+      this.provisionalInitPromise = this.doInitialize(true).finally(() => {
+        // Cleared on completion either way: on success isProvisionallyInitialized
+        // gates re-entry; on failure the next committed read retries.
+        this.provisionalInitPromise = undefined;
+      });
+    }
+    return this.provisionalInitPromise;
+  }
+
+  /**
+   * Internal initialization logic.
+   *
+   * @param readOnly PROVISIONAL mode for a committed read arriving while a writer
+   * transaction is in flight (see {@link initializeForCommittedRead}): never joins
+   * the writer's transaction state, never writes the schema tree (a mismatched
+   * local shape is honoured in memory and persisted by the later full pass), and
+   * skips collection registration and change subscription.
+   */
+  private async doInitialize(readOnly: boolean): Promise<void> {
     try {
-      const txnState = this.txnBridge.getCurrentTransaction();
+      const txnState = readOnly ? null : this.txnBridge.getCurrentTransaction();
       // NOTE: create-on-missing is intentional here, and stays. A table registered in the
       // schema catalog but never written to has NO committed header block — the header is
       // only committed on the first write — so "absent header" and "empty table" are
@@ -237,6 +310,12 @@ export class OptimysticVirtualTable extends VirtualTable {
 
         if (persistedSchema && schemasEqual(mergedCandidate, persistedSchema)) {
           storedSchema = persistedSchema;
+        } else if (readOnly) {
+          // Provisional (committed-read) pass: honour the merged candidate in
+          // memory but write NOTHING — a read must not persist schema, and the
+          // schema tree's flush would race the in-flight commit this mode exists
+          // to avoid. The later full initialization persists it.
+          storedSchema = mergedCandidate;
         } else {
           // Structural mismatch (columns/PK/vtab args changed). Write the
           // merged candidate so a real DDL change still wins on columns
@@ -312,6 +391,14 @@ export class OptimysticVirtualTable extends VirtualTable {
         this.uniqueEnforcementIndexes,
         txnState?.transactor,
       );
+
+      if (readOnly) {
+        // Provisional pass: leave the bridge's collection registry untouched (a
+        // live session-mode coordinator commits from that map) and defer the
+        // change subscription. The next full initialization completes both.
+        this.isProvisionallyInitialized = true;
+        return;
+      }
 
       // Register the main + index collections with the bridge so a session-mode
       // coordinator shares the very trackers this vtab stages into (see
@@ -536,15 +623,15 @@ export class OptimysticVirtualTable extends VirtualTable {
       // Deliberately NO ensureConnectionRegistered() here: a `_readCommitted` read
       // must not mutate the engine's connection registry — a first-touch committed
       // read running outside the exec mutex would otherwise register the writer's
-      // connection mid-transaction.
+      // connection mid-transaction. Initialization goes through the committed-read
+      // entry point for the same reason (no joining the writer's transaction).
+      await this.initializeForCommittedRead();
     } else {
       // Live reads join the writer's transaction; make sure the connection exists.
       await this.ensureConnectionRegistered();
-    }
-
-    // Wait for initialization if needed
-    if (!this.isInitialized) {
-      await this.initialize();
+      if (!this.isInitialized) {
+        await this.initialize();
+      }
     }
 
     if (!this.collection || !this.rowCodec || !this.indexManager) {
@@ -677,6 +764,14 @@ export class OptimysticVirtualTable extends VirtualTable {
    * blocks (LRU budget, currently 128) per committed scan, where returning the live
    * tree was free. Fine for per-statement committed reads; if a workload ever opens
    * committed scans per row over a large hot cache, cache the view per statement.
+   *
+   * NOTE: an index CREATED inside the in-flight transaction has no committed entries
+   * at the pre-transaction boundary this view pins to, so a committed scan the
+   * planner routes through that brand-new index returns nothing while a full scan
+   * returns the pre-transaction rows — a disagreement, but only for DDL+DML in one
+   * transaction with a committed read racing its own publish window. If that shape
+   * ever becomes real, committed reads should refuse indexes younger than their
+   * pinned boundary and fall back to a full scan.
    */
   private committedTreeView<TKey, TEntry>(tree: Tree<TKey, TEntry>): TreeReadView<TKey, TEntry> {
     const staged = this.txnBridge.getDirtySnapshot(tree);
@@ -1788,11 +1883,34 @@ export class OptimysticModule implements VirtualTableModule<VirtualTable, Optimy
    * static per MODULE — any single number would misestimate most deployments.
    * Declare it if per-deployment configuration can ever feed a measured value.
    *
-   * `readCommittedSnapshot` stays UNDECLARED (off) until ticket
-   * `committed-read-snapshot-declaration` proves the stall-overlap guarantee —
-   * the declaration is what routes reads onto the mutex-free concurrent path.
+   * `readCommittedSnapshot` (declared below) routes eligible reads onto Quereus's
+   * mutex-free concurrent path, so a committed read answers promptly and from a
+   * coherent boundary even while another statement's commit is parked against an
+   * unresponsive cohort. The obligation (upstream `VirtualTableModule` docs:
+   * a `_readCommitted` connection serves ONE committed boundary for the life of the
+   * scan; index-driven and full scans of the same connection agree) is held by:
+   *   - per-scan pinned read views (`committedTreeView` → `Tree.readView`), built in
+   *     one synchronous block per statement;
+   *   - the snapshot-boundary pin (`CollectionSnapshot.context`): a dirty tree's
+   *     committed view describes the PRE-transaction boundary even when the legacy
+   *     multi-tree commit sweep has already flushed that tree but not its siblings;
+   *   - session-mode publish being event-loop-atomic across collections
+   *     (`TransactionCoordinator.commitOnce`'s fold loop has no await);
+   *   - the degraded latch: after a partial commit, committed reads THROW until a
+   *     clean commit/rollback restores a reconciled view;
+   *   - first-touch isolation (`initializeForCommittedRead`): a committed read of a
+   *     cold table never joins an in-flight writer transaction.
+   * Proven by test/committed-read-stall.spec.ts (stalled-commit overlap in both
+   * commit modes, driven through a gated transactor) and standing conformance cover
+   * in test/committed-read-conformance.spec.ts. NOTE the residual, pre-existing
+   * limit shared with the serialized path: after a partial commit durably splits a
+   * table's trees, the cleared latch does NOT certify coherence — full-scan and
+   * index-driven committed reads of the split table disagree until application-level
+   * reconciliation (docs/correctness.md § "Partial landing"). The flag makes no
+   * promise about a store that was already incoherent at rest.
    */
   readonly concurrencyMode = 'reentrant-reads' as const;
+  readonly readCommittedSnapshot = true;
 
   private tables = new Map<string, OptimysticVirtualTable>();
   // The schema tree (`tree://optimystic/schema`) is plugin-global, so a single
@@ -1901,7 +2019,9 @@ export class OptimysticModule implements VirtualTableModule<VirtualTable, Optimy
     const tableKey = `${tableSchema.schemaName}.${tableSchema.name}`.toLowerCase();
     const existing = this.tables.get(tableKey);
     if (existing) {
-      await existing.initialize();
+      // Initialization is the CALLER's job (create/resolveConnectedTable both do it,
+      // each through the entry point its path requires) — initializing here would
+      // force a full, transaction-joining initialize onto the committed-read path.
       return existing;
     }
 
@@ -1970,12 +2090,13 @@ export class OptimysticModule implements VirtualTableModule<VirtualTable, Optimy
   ): Promise<VirtualTable> {
     const committed = options?._readCommitted === true;
 
-    // The committed path resolves (and, on first touch, initializes) the table but
-    // never registers a connection: a `_readCommitted` connection must not join the
-    // writer's transaction, and once such reads run outside the exec mutex a
-    // first-touch committed read must not mutate the engine's connection registry
-    // mid-transaction. Initialization is memoized and idempotent, so it is safe here.
-    const baseTable = await this.resolveConnectedTable(db, schemaName, tableName, !committed, tableSchema);
+    // The committed path resolves (and, on first touch, PROVISIONALLY initializes)
+    // the table but never registers a connection: a `_readCommitted` connection must
+    // not join the writer's transaction, and since such reads run outside the exec
+    // mutex a first-touch committed read must not mutate the engine's connection
+    // registry — or the bridge's transaction/collection state — mid-transaction
+    // (see OptimysticVirtualTable.initializeForCommittedRead).
+    const baseTable = await this.resolveConnectedTable(db, schemaName, tableName, committed, tableSchema);
 
     // Honour the committed-read flag with a per-scan read-only view; the shared table
     // is unchanged, so a concurrent live scan of it keeps its live view.
@@ -1988,21 +2109,27 @@ export class OptimysticModule implements VirtualTableModule<VirtualTable, Optimy
   /**
    * Resolve (and initialize) the cached {@link OptimysticVirtualTable} for a
    * schema.table, instantiating it from the supplied/looked-up schema on first
-   * connect. Shared by {@link connect} for both the live and committed-read paths;
-   * only the live path registers a connection (`registerConnection: true`).
+   * connect. Shared by {@link connect} for both the live and committed-read paths.
+   * The committed path (`committed: true`) initializes through
+   * {@link OptimysticVirtualTable.initializeForCommittedRead} (which refuses to
+   * join an in-flight writer transaction) and never registers a connection.
    */
   private async resolveConnectedTable(
     db: Database,
     schemaName: string,
     tableName: string,
-    registerConnection: boolean,
+    committed: boolean,
     tableSchema?: TableSchema
   ): Promise<OptimysticVirtualTable> {
     const tableKey = `${schemaName}.${tableName}`.toLowerCase();
     const existingTable = this.tables.get(tableKey);
 
     if (existingTable) {
-      await existingTable.initialize();
+      if (committed) {
+        await existingTable.initializeForCommittedRead();
+      } else {
+        await existingTable.initialize();
+      }
       return existingTable;
     }
 
@@ -2012,8 +2139,10 @@ export class OptimysticModule implements VirtualTableModule<VirtualTable, Optimy
     }
 
     const table = await this.instantiateTable(db, resolvedSchema);
-    await table.initialize();
-    if (registerConnection) {
+    if (committed) {
+      await table.initializeForCommittedRead();
+    } else {
+      await table.initialize();
       await table.ensureConnectionRegistered();
     }
 

@@ -28,11 +28,18 @@ rows while the live tree still holds the transaction's in-flight changes.
 The view guarantees **one consistent answer from first read to last**:
 
 - It never sees mutations staged into the live tree after the snapshot was taken.
-- It is pinned to the collection's committed revision at view-creation time: commits that
-  fold into the live tree's cache — or clear it (a live read's `update()` after another
-  writer commits) — while the view is being walked do not change what the view returns.
-  This holds even for blocks the view has to fetch from storage mid-scan (the view carries
-  its own frozen action context, which the transactor honours on `get`).
+- It is pinned to the **snapshot's** committed boundary — the revision the collection held
+  when `snapshot()` was called (`CollectionSnapshot.context`), not the revision at
+  view-creation time. So a view built AFTER the same tree flushed a further commit still
+  describes the snapshot's boundary (the multi-tree commit-sweep case: tree N already
+  flushed, tree N+1 not — views of both describe the one pre-sweep boundary). Commits
+  that fold into the live tree's cache — or clear it (a live read's `update()` after
+  another writer commits) — while the view is being walked do not change what the view
+  returns. This holds even for blocks the view has to fetch from storage mid-scan (the
+  view carries its own frozen action context, which the transactor honours on `get`, and
+  cache entries newer than the pin are excluded from the view's warm seed). A hand-built
+  snapshot with no recorded boundary falls back to the collection's context at
+  view-creation time.
 - A block the storage layer cannot reconstruct at the pinned revision surfaces as
   `BlockUnavailableError`, never as a silently absent block.
 

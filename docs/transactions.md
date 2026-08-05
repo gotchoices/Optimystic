@@ -158,6 +158,73 @@ known-degraded state. Live reads still answer: they honestly mirror whatever the
 trees hold. The latch clears on the next successful commit or rollback, the
 point at which a reconciled local state is back in view.
 
+### Committed reads run concurrently with a stalled commit (`readCommittedSnapshot`)
+
+A distributed commit can park for tens of seconds against an unresponsive cohort
+member. Historically every read on the same `Database` queued behind it, because
+Quereus holds one execution mutex for all statements. Since Quereus 4.8 a
+read-only statement issued with `readConcurrency: 'committed'` runs **without**
+the mutex — but only when every table's module declares
+`VirtualTableModule.readCommittedSnapshot`. `OptimysticModule` declares **both**:
+
+- `concurrencyMode = 'reentrant-reads'` — concurrent `query()` calls on one
+  connected table are safe (per-scan state is generator-local; audited at the
+  declaration site).
+- `readCommittedSnapshot = true` — a `_readCommitted` connection serves ONE
+  committed boundary for the life of the scan, even while another statement's
+  commit is mid-publish.
+
+What holds the guarantee, and where it is proven:
+
+- **Per-scan pinned views.** Every committed scan reads through a private,
+  revision-pinned view (`Tree.readView`); main-table and index views for one
+  statement are built in one synchronous block. (docs/internals.md § "Committed
+  reads are pinned, not shared-cache".)
+- **The snapshot-boundary pin.** A `CollectionSnapshot` records the committed
+  boundary (`context`) it was captured on, and a read view built from it pins to
+  THAT boundary — not the collection's current one. This is what keeps a
+  committed read coherent while the **legacy tree-by-tree commit sweep** is
+  mid-publish: with the main table already flushed (its revision advanced) and
+  its index still parked, both views still describe the pre-transaction
+  boundary. Cache entries newer than the pin are excluded from the view's warm
+  seed and refetched at the pinned revision.
+- **Session-mode publish is event-loop-atomic.** `TransactionCoordinator`'s
+  post-consensus fold loop (advance context, fold to cache, reset tracker, per
+  collection) contains no `await`, so a committed read observes all collections
+  pre-fold or all post-fold, never a mix.
+- **The degraded latch** (previous section): after a partial commit, committed
+  reads throw instead of answering.
+- **First-touch isolation.** A committed read of a table this process has never
+  touched initializes it WITHOUT joining an in-flight writer transaction: when
+  the bridge is quiescent it runs the ordinary full initialization; when a
+  writer transaction is active it runs a provisional read-only initialization
+  (no schema write, no bridge-registry mutation, no change subscription), and
+  the next quiescent or live touch upgrades it. See
+  `OptimysticVirtualTable.initializeForCommittedRead`.
+
+Proven by `test/committed-read-stall.spec.ts`, which parks a delegating
+transactor's commit-side calls (`pend`/`commit`; `get` passes through) and
+asserts committed reads settle within a bounded number of event-loop turns with
+pre-write values, in both commit modes — including a stall placed **between
+tree N and tree N+1** of the legacy sweep, and a stalled commit that is released
+into a failure.
+
+**Harness blind spot.** The engine-shipped conformance harness
+(`runCommittedReadConformance` + `installCommitStall`, standing cover in
+`test/committed-read-conformance.spec.ts`) parks at the **entry** of the
+registered connection's `commit` — *before* this plugin's publish window begins.
+A tear inside the publish window (the legacy sweep, the coordinator fold) is
+invisible to it, so the gated-transactor spec above is the real cover; do not
+delete it in favour of the harness.
+
+**Residual limit (shared with the serialized path).** The flag promises reads
+that do not tear across a *concurrent* commit. It does not certify a store that
+is already incoherent at rest: after a partial commit durably splits a table's
+trees and the latch is later cleared by an unrelated clean commit, a committed
+full scan and a committed index-driven scan of the split table disagree — on the
+serialized path exactly as on the concurrent one — until the application-level
+reconciliation described in docs/correctness.md § "Partial landing".
+
 ## Secrets and the replicated statement record
 
 **Short answer:** passing a private key to `sign(data, key)` — as a literal or a bound
