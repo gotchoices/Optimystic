@@ -54,6 +54,14 @@ export interface StoredTableSchema {
 	schemaName: string;
 	columns: StoredColumnSchema[];
 	primaryKeyDefinition: StoredPrimaryKeyColumn[];
+	/**
+	 * Declared action of a table-level `primary key (…) on conflict <action>`
+	 * clause. OMITTED when the table declares none (never written as
+	 * `undefined`/`null`), so a schema persisted before this field existed
+	 * compares byte-equal against an action-free candidate and `schemasEqual`
+	 * keeps its no-write short-circuit — same discipline as `uniqueConstraints`.
+	 */
+	primaryKeyDefaultConflict?: ConflictResolution;
 	indexes: StoredIndexSchema[];
 	vtabModuleName: string;
 	vtabArgs?: Record<string, any>;
@@ -97,6 +105,14 @@ export interface StoredColumnSchema {
 	collation: string;
 	generated: boolean;
 	pkDirection?: 'asc' | 'desc';
+	/**
+	 * Column-level `on conflict <action>` (from `… primary key on conflict X` /
+	 * `… not null on conflict X`). The vtab reads it off PK columns to resolve a
+	 * PK collision's default action. OMITTED when absent — see
+	 * {@link StoredTableSchema.primaryKeyDefaultConflict} for the byte-equal
+	 * discipline.
+	 */
+	defaultConflict?: ConflictResolution;
 }
 
 export interface StoredPrimaryKeyColumn {
@@ -302,6 +318,7 @@ export class SchemaManager {
 			collation: col.collation,
 			generated: col.generated,
 			pkDirection: col.pkDirection,
+			defaultConflict: col.defaultConflict,
 		}));
 		const columnIndexMap = new Map<string, number>(
 			columns.map((col, index) => [col.name.toLowerCase(), index])
@@ -327,6 +344,7 @@ export class SchemaManager {
 			columns,
 			columnIndexMap,
 			primaryKeyDefinition,
+			primaryKeyDefaultConflict: stored.primaryKeyDefaultConflict,
 			checkConstraints: [],
 			vtabModule,
 			vtabAuxData,
@@ -401,6 +419,9 @@ export class SchemaManager {
 				desc: pk.desc,
 				collation: pk.collation,
 			})),
+			// undefined-valued keys vanish under JSON serialization, so an absent
+			// action stays byte-identical with pre-upgrade schemas (see the field docs).
+			primaryKeyDefaultConflict: schema.primaryKeyDefaultConflict,
 			indexes: (schema.indexes || []).map(idx => this.indexSchemaToStored(idx)),
 			vtabModuleName: schema.vtabModuleName,
 			vtabArgs: schema.vtabArgs as Record<string, any>,
@@ -423,6 +444,7 @@ export class SchemaManager {
 			collation: col.collation,
 			generated: col.generated,
 			pkDirection: col.pkDirection,
+			defaultConflict: col.defaultConflict,
 		};
 	}
 

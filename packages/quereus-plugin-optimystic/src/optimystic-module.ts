@@ -15,7 +15,7 @@ import { ConflictResolution, QuereusError, StatusCode } from '@quereus/quereus';
 import type { VirtualTableModule, BaseModuleConfig, Database, DatabaseInternal, TableSchema, Row, FilterInfo, BestAccessPlanRequest, BestAccessPlanResult, OrderingSpec, VirtualTableConnection, TableIndexSchema as IndexSchema, UniqueConstraintSchema, UpdateArgs, UpdateResult, SqlValue } from '@quereus/quereus';
 import { Tree } from '@optimystic/db-core';
 import { KeyRange } from '@optimystic/db-core';
-import type { CollectionChangeEvent, TreeReadView } from '@optimystic/db-core';
+import type { CollectionChangeEvent, ITransactor, TreeReadView } from '@optimystic/db-core';
 import { SchemaManager, columnSetKey, uniqueConstraintKey } from './schema/schema-manager.js';
 import type { StoredTableSchema, StoredIndexSchema } from './schema/schema-manager.js';
 import { RowCodec, type EncodedRow } from './schema/row-codec.js';
@@ -56,6 +56,26 @@ interface IndexScanTarget {
 interface IndexScanSource extends IndexScanTarget {
   read: TreeReadView<string, IndexEntry>;
 }
+
+/** One existing row a secondary UNIQUE constraint collides with, keyed by its
+ *  primary key so a REPLACE resolution can evict it. */
+interface UniqueCollision {
+  pk: string;
+  row: Row;
+}
+
+/**
+ * Outcome of resolving a DML row against the table's secondary UNIQUE
+ * constraints (see {@link OptimysticVirtualTable.resolveSecondaryUniqueDecision}):
+ * no collision (`clear`), swallow the write (a constraint resolved IGNORE),
+ * reject it (`blocked`, carrying the structured constraint result), or evict the
+ * colliding rows and proceed with the write (every hit resolved REPLACE).
+ */
+type SecondaryUniqueDecision =
+  | { kind: 'clear' }
+  | { kind: 'swallow' }
+  | { kind: 'blocked'; result: UpdateResult }
+  | { kind: 'evict'; collisions: UniqueCollision[] };
 
 /**
  * Helper function to convert SqlDataType affinity to LogicalType
@@ -354,6 +374,7 @@ export class OptimysticVirtualTable extends VirtualTable {
           collation: col.collation,
           generated: col.generated,
           pkDirection: col.pkDirection,
+          defaultConflict: col.defaultConflict,
           index,
         }));
         this.tableSchema.columnIndexMap = new Map(
@@ -364,6 +385,9 @@ export class OptimysticVirtualTable extends VirtualTable {
           desc: pk.desc,
           collation: pk.collation,
         }));
+        // The PK's declared conflict action must survive a hydrate-only open —
+        // pkDeclaredConflict reads it from this rebuilt schema.
+        this.tableSchema.primaryKeyDefaultConflict = persistedSchema.primaryKeyDefaultConflict;
         storedSchema = persistedSchema;
       } else {
         throw new Error('Cannot create table without column definitions');
@@ -397,7 +421,7 @@ export class OptimysticVirtualTable extends VirtualTable {
       await this.indexManager.initialize(txnState?.transactor);
 
       // Give every point-enforceable secondary UNIQUE constraint a backing index tree
-      // so checkUniqueConstraints can probe it instead of full-scanning the table per
+      // so probeUniqueConstraint can probe it instead of full-scanning the table per
       // DML row (an O(N) scan per row -> O(log n) point probe). Must run BEFORE
       // registerCollections so the synthesized trees are present in getIndexTrees()
       // when the bridge snapshots this table's collections.
@@ -1049,7 +1073,7 @@ export class OptimysticVirtualTable extends VirtualTable {
    * {@link SchemaManager.storedToUniqueConstraints}) into
    * `this.tableSchema.uniqueConstraints`, deduped against whatever the local DDL
    * already carries by {@link uniqueConstraintKey}. Idempotent. This is what keeps
-   * {@link checkUniqueConstraints} armed on opens where no `CREATE TABLE` /
+   * {@link resolveSecondaryUniqueDecision} armed on opens where no `CREATE TABLE` /
    * `CREATE UNIQUE INDEX` DDL re-runs (the documented hydrate warm-restart flow),
    * and on re-declares that replay only the CREATE TABLE half.
    */
@@ -1198,15 +1222,17 @@ export class OptimysticVirtualTable extends VirtualTable {
    * Defensive full-scan fallback for a single UNIQUE constraint whose enforcing tree
    * could not be resolved (should not happen — logged by the caller). Retains the
    * pre-index behaviour: compare every existing row's serialized unique key against the
-   * new row's, honouring `excludeKey`.
+   * new row's, honouring `excludeKey`. Collects every colliding row (not just the
+   * first) so a REPLACE resolution can evict them all.
    */
   private async scanUniqueConstraint(
     uc: { columns: readonly number[] },
     values: Row,
     excludeKey?: string,
-  ): Promise<{ row: Row; columns: readonly number[] } | null> {
-    if (!this.collection || !this.rowCodec) return null;
+  ): Promise<UniqueCollision[]> {
+    if (!this.collection || !this.rowCodec) return [];
     const key = this.uniqueKeyFor(uc.columns, values);
+    const collisions: UniqueCollision[] = [];
     for await (const path of this.collection.range(new KeyRange<string>(undefined, undefined, true))) {
       if (!this.collection.isValid(path)) continue;
       const entry = this.collection.at(path) as [string, EncodedRow] | undefined;
@@ -1214,106 +1240,211 @@ export class OptimysticVirtualTable extends VirtualTable {
       if (excludeKey !== undefined && entry[0] === excludeKey) continue;
       const existing = this.rowCodec.decodeRow(entry[1]);
       if (this.uniqueKeyFor(uc.columns, existing) === key) {
-        return { row: existing, columns: uc.columns };
+        collisions.push({ pk: entry[0], row: existing });
       }
     }
-    return null;
+    return collisions;
   }
 
   /**
-   * Probe for an existing row that a secondary UNIQUE constraint would collide with if
-   * `values` were written, returning the conflicting row plus the violated
-   * constraint's columns, or null when there is no conflict.
+   * All existing rows a single secondary UNIQUE constraint would collide with if
+   * `values` were written — each with its primary key, so a REPLACE resolution can
+   * evict it. More than one collision is possible when the tree admitted duplicates
+   * before the constraint was enforced (CREATE UNIQUE INDEX over duplicate data, or
+   * rows written by a build that predates the constraint).
    *
-   * Optimystic enforces only the PRIMARY KEY structurally (it is the tree key); every
-   * other declared UNIQUE constraint must be checked here, mirroring the in-memory
-   * vtab. The control schema's single-use `StampId` (and nullable `MemberPrivateKey`)
-   * anti-replay columns depend on this enforcement.
-   *
-   * Each active constraint is enforced by a POINT PROBE of its backing index tree (the
-   * reused declared index, or a synthesized `_uniq_` tree) rather than a full table
-   * scan — ~O(log n) per constraint per row instead of O(rows). The tree is refreshed
+   * The probe is a POINT PROBE of the constraint's backing index tree (the reused
+   * declared index, or a synthesized `_uniq_` tree) rather than a full table scan —
+   * ~O(log n) per constraint per row instead of O(rows). The tree is refreshed
    * (`update()`) for a LIVE read so the probe sees rows staged earlier in THIS
    * transaction plus committed rows; that is what makes two writes sharing a unique
    * value within one transaction collide exactly as a cross-transaction duplicate does
    * (the same immediate semantics PK uniqueness has, and the reason it does NOT read the
-   * committed snapshot).
-   *
-   * SQL semantics honoured: a partial UNIQUE (carrying a `predicate`, synthesized from
-   * `CREATE UNIQUE INDEX … WHERE …`) is skipped, and a row is exempt from a constraint
-   * when ANY of that constraint's columns is NULL (multiple NULLs are allowed).
-   * `excludeKey`, when given, is the primary key of the row being updated, so the row
-   * does not conflict with itself.
+   * committed snapshot). `excludeKey`, when given, is the primary key of the row being
+   * updated, so the row does not conflict with itself.
    */
-  private async checkUniqueConstraints(
+  private async probeUniqueConstraint(
+    uc: UniqueConstraintSchema,
     values: Row,
     excludeKey?: string,
-  ): Promise<{ row: Row; columns: readonly number[] } | null> {
+  ): Promise<UniqueCollision[]> {
+    if (!this.collection || !this.rowCodec || !this.indexManager) return [];
+    const enforcing = this.resolveEnforcingIndex(uc);
+    if (!enforcing) {
+      // Should not happen: buildUniqueEnforcementIndexes synthesizes a tree for every
+      // point-enforceable constraint. Fall back to a full scan for this constraint
+      // rather than silently skip enforcement.
+      log(
+        `WARN: no enforcing index for UNIQUE(${uc.columns.join(',')}) on ` +
+        `'${this.tableName}'; falling back to full scan`,
+      );
+      return this.scanUniqueConstraint(uc, values, excludeKey);
+    }
+
+    const { descriptor, tree, synthesized } = enforcing;
+    if (synthesized) {
+      await this.ensureUniquePopulated(descriptor, tree);
+    }
+    await tree.update();
+    const probeKey = this.indexManager.createIndexKey(descriptor, values);
+    const collisions: UniqueCollision[] = [];
+    for await (const pk of this.indexManager.findByIndexIn(tree, probeKey)) {
+      // The row being updated does not conflict with itself.
+      if (excludeKey !== undefined && pk === excludeKey) continue;
+      const entry = await this.collection.get(pk) as [string, EncodedRow] | undefined;
+      if (!entry || entry.length < 2) continue;
+      collisions.push({ pk, row: this.rowCodec.decodeRow(entry[1]) });
+    }
+    return collisions;
+  }
+
+  /**
+   * Effective conflict action for a uniqueness collision: the statement-level
+   * `OR <action>` clause first, else the action declared on the violated rule itself
+   * (`… on conflict <action>`), else ABORT. The engine passes `undefined` when the
+   * statement carries no OR clause precisely so the vtab can fall back to the
+   * schema-declared action (see processInsertRow in quereus's dml-executor); the
+   * memory module resolves the same `onConflict ?? declared ?? ABORT` chain.
+   *
+   * NOTE: FAIL and ROLLBACK resolve here but are honoured only as ABORT. The engine
+   * picks the FAIL/ROLLBACK unwind branch from the error SUBCLASS
+   * (`FailConflictError` / `RollbackConflictError`), which its
+   * `translateConflictError` synthesizes only from the STATEMENT-level clause — a
+   * vtab returning `{status: 'constraint'}` always lands on plain ABORT, and neither
+   * subclass is exported for the vtab to throw. The engine's own memory module has
+   * exactly the same limitation, so parity with it is the bar taken here.
+   */
+  private resolveConflictAction(
+    stmt: ConflictResolution | undefined,
+    declared: ConflictResolution | undefined,
+  ): ConflictResolution {
+    return stmt ?? declared ?? ConflictResolution.ABORT;
+  }
+
+  /**
+   * The PRIMARY KEY's declared conflict action: a table-level
+   * `primary key (…) on conflict <action>` first, else the column-level action on
+   * ANY PK column (`Id integer primary key on conflict <action>`), else undefined.
+   *
+   * NOTE: mirrors quereus's `resolvePkDefaultConflict` (src/schema/table.ts), which
+   * is not exported from the package entry point — the same few-line duplication its
+   * own doc comment notes for the quereus-store and quereus-isolation packages. Keep
+   * in sync with that upstream rule.
+   */
+  private pkDeclaredConflict(): ConflictResolution | undefined {
+    if (this.tableSchema.primaryKeyDefaultConflict !== undefined) {
+      return this.tableSchema.primaryKeyDefaultConflict;
+    }
+    for (const def of this.tableSchema.primaryKeyDefinition) {
+      const col = this.tableSchema.columns[def.index];
+      if (col?.defaultConflict !== undefined) return col.defaultConflict;
+    }
+    return undefined;
+  }
+
+  /**
+   * Decide how a DML row resolves against every SECONDARY UNIQUE constraint, with
+   * the conflict action resolved PER CONSTRAINT ({@link resolveConflictAction}:
+   * statement-level OR > the constraint's own declared action > ABORT). Optimystic
+   * enforces only the PRIMARY KEY structurally (it is the tree key); every other
+   * declared UNIQUE constraint is decided here, mirroring the in-memory vtab. The
+   * control schema's single-use `StampId` (and nullable `MemberPrivateKey`)
+   * anti-replay columns depend on this enforcement.
+   *
+   * SQL semantics honoured: a partial UNIQUE (carrying a `predicate`, synthesized
+   * from `CREATE UNIQUE INDEX … WHERE …`) is skipped, and a row is exempt from a
+   * constraint when ANY of that constraint's columns is NULL (multiple NULLs are
+   * allowed).
+   *
+   * Decision shape: EVERY binding constraint is probed and its action resolved
+   * BEFORE anything is staged, so a blocking outcome (ABORT/FAIL/ROLLBACK) stages
+   * nothing — statement atomicity never depends on undoing a partial eviction.
+   * Constraints are processed in declared order and the first IGNORE or blocking
+   * hit decides the row, matching the memory module; a REPLACE hit accumulates its
+   * colliding rows and keeps scanning, so several constraints can each displace a
+   * different row in one write (the caller stages the evictions via
+   * {@link applyUniqueEvictions}).
+   *
+   * NOTE: one deliberate divergence from the memory module in a degenerate
+   * mixed-action shape (an earlier constraint resolves REPLACE, a later one IGNORE,
+   * both colliding): memory physically deletes the REPLACE collision and THEN
+   * swallows the write — and the DML executor skips its delete pipeline for
+   * evictions reported on a row-less result, leaving those deletes untracked. Here
+   * the swallow discards the pending evictions instead, so a swallowed write
+   * changes nothing at all.
+   */
+  private async resolveSecondaryUniqueDecision(
+    values: Row,
+    stmtOnConflict: ConflictResolution | undefined,
+    excludeKey?: string,
+  ): Promise<SecondaryUniqueDecision> {
     const constraints = this.tableSchema.uniqueConstraints;
-    if (!constraints || constraints.length === 0) return null;
-    if (!this.collection || !this.rowCodec || !this.indexManager) return null;
+    if (!constraints || constraints.length === 0) return { kind: 'clear' };
+    if (!this.collection || !this.rowCodec || !this.indexManager) return { kind: 'clear' };
 
     // Only the constraints that actually bind THIS row: non-partial, every column
     // present and non-null (a NULL-bearing row is exempt and never probes).
     const active = constraints.filter(uc =>
       uc.predicate === undefined && uc.columns.length > 0
       && uc.columns.every(ci => values[ci] !== null && values[ci] !== undefined));
-    if (active.length === 0) return null;
 
+    // Keyed by PK so one row violating two REPLACE-resolved constraints evicts once.
+    const evictable = new Map<string, Row>();
     for (const uc of active) {
-      const enforcing = this.resolveEnforcingIndex(uc);
-      if (!enforcing) {
-        // Should not happen: buildUniqueEnforcementIndexes synthesizes a tree for every
-        // point-enforceable constraint. Fall back to a full scan for this constraint
-        // rather than silently skip enforcement.
-        log(
-          `WARN: no enforcing index for UNIQUE(${uc.columns.join(',')}) on ` +
-          `'${this.tableName}'; falling back to full scan`,
-        );
-        const hit = await this.scanUniqueConstraint(uc, values, excludeKey);
-        if (hit) return hit;
+      const collisions = await this.probeUniqueConstraint(uc, values, excludeKey);
+      if (collisions.length === 0) continue;
+      const effective = this.resolveConflictAction(stmtOnConflict, uc.defaultConflict);
+      if (effective === ConflictResolution.IGNORE) {
+        return { kind: 'swallow' };
+      }
+      if (effective === ConflictResolution.REPLACE) {
+        for (const collision of collisions) evictable.set(collision.pk, collision.row);
         continue;
       }
-
-      const { descriptor, tree, synthesized } = enforcing;
-      if (synthesized) {
-        await this.ensureUniquePopulated(descriptor, tree);
-      }
-      await tree.update();
-      const probeKey = this.indexManager.createIndexKey(descriptor, values);
-      for await (const pk of this.indexManager.findByIndexIn(tree, probeKey)) {
-        // The row being updated does not conflict with itself.
-        if (excludeKey !== undefined && pk === excludeKey) continue;
-        const entry = await this.collection.get(pk) as [string, EncodedRow] | undefined;
-        if (!entry || entry.length < 2) continue;
-        return { row: this.rowCodec.decodeRow(entry[1]), columns: uc.columns };
-      }
+      // ABORT — and FAIL/ROLLBACK, honoured as ABORT (see resolveConflictAction).
+      return {
+        kind: 'blocked',
+        result: {
+          status: 'constraint',
+          constraint: 'unique',
+          message: this.uniqueConstraintMessage(uc.columns),
+          existingRow: collisions[0]!.row,
+        },
+      };
     }
-    return null;
+    if (evictable.size > 0) {
+      return {
+        kind: 'evict',
+        collisions: [...evictable].map(([pk, row]) => ({ pk, row })),
+      };
+    }
+    return { kind: 'clear' };
   }
 
   /**
-   * Resolve a secondary-UNIQUE collision into an {@link UpdateResult}, mirroring the PK
-   * conflict path: IGNORE swallows the write; every other mode returns a structured
-   * constraint result (with `existingRow`) for the engine to map to ABORT/FAIL/ROLLBACK
-   * or drive an ON CONFLICT resolution. Returns null when there is no collision.
+   * Stage the physical removal of every REPLACE-evicted row — clear its main-table
+   * slot and delete its index entries, exactly as the `case 'delete'` arm does —
+   * and return the evicted rows for {@link UpdateResult}'s `evictedRows`, so the
+   * DML executor runs its full delete pipeline (change-tracking, row-time
+   * maintenance, FK cascade, delete auto-events) for each before the new row's own
+   * bookkeeping. The caller must {@link markDirtyTrees} first so a rollback
+   * restores the evicted rows, and must stage its own write AFTER (evict-then-write
+   * journal order).
    */
-  private async resolveUniqueConflict(
-    values: Row,
-    onConflict: ConflictResolution,
-    excludeKey?: string,
-  ): Promise<UpdateResult | null> {
-    const hit = await this.checkUniqueConstraints(values, excludeKey);
-    if (!hit) return null;
-    if (onConflict === ConflictResolution.IGNORE) {
-      return { status: 'ok' };
+  private async applyUniqueEvictions(
+    collisions: readonly UniqueCollision[],
+    transactor?: ITransactor,
+  ): Promise<Row[]> {
+    if (!this.collection || !this.indexManager) {
+      throw new Error('Table not initialized');
     }
-    return {
-      status: 'constraint',
-      constraint: 'unique',
-      message: this.uniqueConstraintMessage(hit.columns),
-      existingRow: hit.row,
-    };
+    const evicted: Row[] = [];
+    for (const { pk, row } of collisions) {
+      await this.collection.stage([[pk, undefined]]);
+      await this.indexManager.deleteIndexEntries(row, pk, transactor);
+      evicted.push(row);
+    }
+    return evicted;
   }
 
   /**
@@ -1369,9 +1500,9 @@ export class OptimysticVirtualTable extends VirtualTable {
               // Decode the displaced row once from the entry value [pk, encoded];
               // reuse the entry already fetched above — do not re-read.
               const existingRow = this.rowCodec.decodeRow(existing[1]);
-              // No per-constraint default in optimystic, so the fallback for an
-              // absent statement-level OR clause is plain ABORT.
-              const onConflict = args.onConflict ?? ConflictResolution.ABORT;
+              // Statement-level OR wins; else the action declared on the PK
+              // itself; else ABORT (see resolveConflictAction).
+              const onConflict = this.resolveConflictAction(args.onConflict, this.pkDeclaredConflict());
 
               if (onConflict === ConflictResolution.IGNORE) {
                 // INSERT OR IGNORE / ON CONFLICT DO NOTHING: preserve the
@@ -1408,14 +1539,17 @@ export class OptimysticVirtualTable extends VirtualTable {
               };
             }
 
-            // PK is clear; now enforce any SECONDARY UNIQUE constraints (the tree only
-            // guards the PK). A hit returns a structured constraint result the same way
-            // the PK path does — e.g. the control schema's single-use StampId column.
-            const uniqueConflict = await this.resolveUniqueConflict(
-              values, args.onConflict ?? ConflictResolution.ABORT,
-            );
-            if (uniqueConflict) {
-              return uniqueConflict;
+            // PK is clear; now resolve any SECONDARY UNIQUE constraints (the tree
+            // only guards the PK), each under its own declared action — e.g. the
+            // control schema's single-use StampId column blocks, while a constraint
+            // declared `on conflict replace` evicts the colliding row instead.
+            const uniqueDecision = await this.resolveSecondaryUniqueDecision(values, args.onConflict);
+            if (uniqueDecision.kind === 'blocked') {
+              return uniqueDecision.result;
+            }
+            if (uniqueDecision.kind === 'swallow') {
+              // IGNORE: preserve the existing row(s) and stage nothing.
+              return { status: 'ok' };
             }
 
             const encodedRow = this.rowCodec.encodeRow(values);
@@ -1424,13 +1558,19 @@ export class OptimysticVirtualTable extends VirtualTable {
             // this mutation (flushed at commit / restored on rollback).
             this.markDirtyTrees();
 
+            // REPLACE against a secondary UNIQUE: evict each colliding row at its
+            // own PK before the new row lands (evict-then-write journal order).
+            const evictedRows = uniqueDecision.kind === 'evict'
+              ? await this.applyUniqueEvictions(uniqueDecision.collisions, txnState?.transactor)
+              : [];
+
             // Stage the row in the main table. Entry format: [primaryKey, encodedRow]
             await this.collection.stage([[insertKey, [insertKey, encodedRow]]]);
 
             // Stage into all indexes
             await this.indexManager.insertIndexEntries(values, insertKey, txnState?.transactor);
 
-            return { status: 'ok', row: values };
+            return { status: 'ok', row: values, ...(evictedRows.length > 0 ? { evictedRows } : {}) };
           }
 
         case 'update':
@@ -1454,17 +1594,26 @@ export class OptimysticVirtualTable extends VirtualTable {
             const oldEntry = await this.collection.get(oldKey) as [string, EncodedRow] | undefined;
             const oldRow: Row = oldEntry ? this.rowCodec.decodeRow(oldEntry[1]) : (oldKeyValues as Row);
 
-            // Enforce SECONDARY UNIQUE constraints against the post-update values,
-            // excluding the row being updated (its own PK), before any staging. A
-            // collision with a DIFFERENT row returns a structured constraint result,
-            // mirroring the INSERT path. (PK collisions on a key change are handled
-            // separately below.)
-            const uniqueConflict = await this.resolveUniqueConflict(
-              values, args.onConflict ?? ConflictResolution.ABORT, oldKey,
-            );
-            if (uniqueConflict) {
-              return uniqueConflict;
+            // Resolve SECONDARY UNIQUE constraints against the post-update values,
+            // excluding the row being updated (its own PK), BEFORE any staging —
+            // each under its own declared action, mirroring the INSERT path. (PK
+            // collisions on a key change are decided separately below; nothing is
+            // staged until every blocking decision is in, so a rejection on either
+            // front leaves the trees untouched.)
+            const uniqueDecision = await this.resolveSecondaryUniqueDecision(values, args.onConflict, oldKey);
+            if (uniqueDecision.kind === 'blocked') {
+              return uniqueDecision.result;
             }
+            if (uniqueDecision.kind === 'swallow') {
+              // IGNORE: leave every row put — the updated row keeps its old
+              // values. Stage nothing so the ignored write costs nothing.
+              return { status: 'ok' };
+            }
+            // REPLACE collisions to evict — staged only once the PK-move decision
+            // below also lands on a write (a swallowed or rejected move discards
+            // them untouched).
+            let pendingEvictions: readonly UniqueCollision[] =
+              uniqueDecision.kind === 'evict' ? uniqueDecision.collisions : [];
 
             // Stage the main-table change (flushed at commit / restored on
             // rollback). A PK change is staged as delete-old + insert-new so both
@@ -1481,25 +1630,34 @@ export class OptimysticVirtualTable extends VirtualTable {
               if (existing !== undefined) {
                 // Decode the displaced row once from the entry value [pk, encoded].
                 const existingRow = this.rowCodec.decodeRow(existing[1]);
-                // No per-constraint default in optimystic, so the fallback for
-                // an absent statement-level OR clause is plain ABORT.
-                const onConflict = args.onConflict ?? ConflictResolution.ABORT;
+                // Statement-level OR wins; else the action declared on the PK
+                // itself; else ABORT (see resolveConflictAction). Quereus's
+                // planner passes no statement-level action for UPDATE, so the
+                // declared action is what makes IGNORE/REPLACE reachable here.
+                const onConflict = this.resolveConflictAction(args.onConflict, this.pkDeclaredConflict());
 
                 if (onConflict === ConflictResolution.IGNORE) {
-                  // UPDATE OR IGNORE: leave both rows put — the moving row stays
-                  // at oldKey, the row at newKey is untouched. Stage nothing and
-                  // skip markDirtyTrees so the ignored move costs nothing.
+                  // IGNORE: leave both rows put — the moving row stays at oldKey,
+                  // the row at newKey is untouched. Stage nothing (pending
+                  // secondary evictions are discarded with the swallowed move)
+                  // and skip markDirtyTrees so the ignored move costs nothing.
                   return { status: 'ok' };
                 }
 
                 if (onConflict === ConflictResolution.REPLACE) {
-                  // UPDATE OR REPLACE: displace the row at newKey and move the
-                  // moving row there. The main-table staging is identical to the
+                  // REPLACE: displace the row at newKey and move the moving row
+                  // there. The main-table staging is identical to the
                   // non-collision move — staging undefined at oldKey clears the
                   // old slot and the upsert at newKey overwrites the displaced
                   // row in one shot, so no separate displaced-row delete is
                   // needed here.
+                  //
+                  // The row displaced at newKey travels the `replacedRow`
+                  // channel; drop any secondary eviction aimed at that same row
+                  // so it is not deleted (and reported) twice.
+                  pendingEvictions = pendingEvictions.filter(c => c.pk !== newKey);
                   this.markDirtyTrees();
+                  const evictedRows = await this.applyUniqueEvictions(pendingEvictions, txnState?.transactor);
                   await this.collection.stage([
                     [oldKey, undefined],
                     [newKey, [newKey, encodedRow]]
@@ -1523,13 +1681,18 @@ export class OptimysticVirtualTable extends VirtualTable {
                     txnState?.transactor
                   );
 
-                  return { status: 'ok', row: values, replacedRow: existingRow };
+                  return {
+                    status: 'ok',
+                    row: values,
+                    replacedRow: existingRow,
+                    ...(evictedRows.length > 0 ? { evictedRows } : {}),
+                  };
                 }
 
-                // ABORT (default) / FAIL / ROLLBACK: reject the move
-                // structurally. Stage nothing and touch no trees; the engine's
-                // translateConflictError maps this to the right subclass for
-                // FAIL/ROLLBACK. The vtab no longer throws for these modes.
+                // ABORT (default; FAIL/ROLLBACK land here too — see
+                // resolveConflictAction): reject the move structurally. Nothing
+                // has been staged (secondary evictions are still pending-only),
+                // so the trees are untouched.
                 return {
                   status: 'constraint',
                   constraint: 'unique',
@@ -1541,18 +1704,35 @@ export class OptimysticVirtualTable extends VirtualTable {
               // Snapshot before staging so a rollback reverts exactly this change.
               this.markDirtyTrees();
 
+              // REPLACE-resolved secondary collisions evict first (evict-then-write).
+              const evictedRows = await this.applyUniqueEvictions(pendingEvictions, txnState?.transactor);
+
               // Key changed, no collision - delete old, insert new
               await this.collection.stage([
                 [oldKey, undefined],
                 [newKey, [newKey, encodedRow]]
               ]);
-            } else {
-              // Snapshot before staging so a rollback reverts exactly this change.
-              this.markDirtyTrees();
 
-              // Simple update
-              await this.collection.stage([[newKey, [newKey, encodedRow]]]);
+              // Stage all index updates
+              await this.indexManager.updateIndexEntries(
+                oldRow,
+                values,
+                oldKey,
+                newKey,
+                txnState?.transactor
+              );
+
+              return { status: 'ok', row: values, ...(evictedRows.length > 0 ? { evictedRows } : {}) };
             }
+
+            // Snapshot before staging so a rollback reverts exactly this change.
+            this.markDirtyTrees();
+
+            // REPLACE-resolved secondary collisions evict first (evict-then-write).
+            const evictedRows = await this.applyUniqueEvictions(pendingEvictions, txnState?.transactor);
+
+            // Simple update
+            await this.collection.stage([[newKey, [newKey, encodedRow]]]);
 
             // Stage all index updates
             await this.indexManager.updateIndexEntries(
@@ -1563,7 +1743,7 @@ export class OptimysticVirtualTable extends VirtualTable {
               txnState?.transactor
             );
 
-            return { status: 'ok', row: values };
+            return { status: 'ok', row: values, ...(evictedRows.length > 0 ? { evictedRows } : {}) };
           }
 
         case 'delete':
@@ -1614,7 +1794,7 @@ export class OptimysticVirtualTable extends VirtualTable {
    * coexist — it does NOT structurally guard uniqueness. Quereus synthesizes the
    * derived uniqueConstraint on a NEW TableSchema it swaps into its catalog
    * (appendIndexToTableSchema), but this cached vtab keeps its ORIGINAL tableSchema
-   * reference, so the derived constraint would never reach checkUniqueConstraints.
+   * reference, so the derived constraint would never reach the uniqueness probe.
    * Mirror it onto this.tableSchema so the probe considers it active; enforcement
    * then routes through the declared index tree (resolveEnforcingIndex prefers a
    * declared index), so no synthesized _uniq_ tree is needed. No-ops for non-unique
@@ -1661,7 +1841,7 @@ export class OptimysticVirtualTable extends VirtualTable {
     // Mirror the derived UNIQUE constraint BEFORE the already-persisted dedupe
     // below: a re-declared CREATE UNIQUE INDEX on a warm start hits that dedupe
     // and returns early, but this cached vtab still needs the constraint in
-    // memory for checkUniqueConstraints (see mirrorDerivedUniqueConstraint).
+    // memory for the uniqueness probe (see mirrorDerivedUniqueConstraint).
     this.mirrorDerivedUniqueConstraint(indexSchema);
 
     const txnState = this.txnBridge.getCurrentTransaction();

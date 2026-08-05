@@ -607,11 +607,9 @@ describe('Secondary UNIQUE enforcement across the hydrate warm-restart path', fu
 			dbA.close();
 		}
 
-		// NOTE: the vtab does not yet ACT on a constraint-level `on conflict` for a
-		// secondary UNIQUE (it honours only the statement-level `insert or ...`) —
-		// a pre-existing gap on every path, tracked by
-		// `bug-optimystic-constraint-level-on-conflict-ignored`. This pins the
-		// persistence round-trip so the fix has correct metadata to act on.
+		// The persisted action pinned here is what the vtab's per-constraint action
+		// resolution reads on a hydrate-only open; behavioral coverage for ACTING on
+		// it lives in the 'declared conflict actions across hydrate' tests below.
 		const dbB = new Database();
 		const pluginB = registerWithSharedTransactor(dbB, shared);
 		try {
@@ -659,6 +657,197 @@ describe('Secondary UNIQUE enforcement across the hydrate warm-restart path', fu
 			expect(await scalar(dbB, `select count(*) as v from U where Stamp = 'c'`)).to.equal(1);
 		} finally {
 			dbB.close();
+		}
+	});
+
+	describe('declared conflict actions across hydrate (no DDL replay)', () => {
+		// Every CONSTRAINT-level cell of the conflict-action matrix, reached through
+		// hydrate only — the declared action must come entirely from the persisted
+		// schema. (Statement-level cells need no persisted metadata and are covered
+		// on the fresh-CREATE path in secondary-unique.spec.ts /
+		// insert-pk-uniqueness.spec.ts.) FAIL and ROLLBACK are honoured as ABORT
+		// from the vtab's structured constraint result (engine memory-module
+		// parity), so the three rejecting actions share one expected outcome.
+		const outcomes = {
+			ignore: 'ignored',
+			replace: 'replaced',
+			abort: 'rejected',
+			fail: 'rejected',
+			rollback: 'rejected',
+		} as const;
+
+		for (const [action, outcome] of Object.entries(outcomes)) {
+			it(`secondary UNIQUE on conflict ${action} → ${outcome} after hydrate`, async () => {
+				const storage = new MemoryRawStorage();
+				const shared = buildSharedLocalTransactor(storage);
+
+				const dbA = new Database();
+				registerWithSharedTransactor(dbA, shared);
+				try {
+					await dbA.exec(`
+						create table T (Id integer primary key, Stamp text not null unique on conflict ${action})
+							using optimystic('tree://uniqhydrate/action-sec-${action}')
+					`);
+					await dbA.exec(`insert into T (Id, Stamp) values (1, 'dup')`);
+				} finally {
+					dbA.close();
+				}
+
+				const dbB = new Database();
+				const pluginB = registerWithSharedTransactor(dbB, shared);
+				try {
+					await pluginB.hydrate(dbB);
+					if (outcome === 'rejected') {
+						await expectThrows(
+							() => dbB.exec(`insert into T (Id, Stamp) values (2, 'dup')`),
+							/UNIQUE constraint failed/,
+						);
+						expect(await scalar(dbB, `select Id as v from T where Stamp = 'dup'`)).to.equal(1);
+					} else if (outcome === 'ignored') {
+						await dbB.exec(`insert into T (Id, Stamp) values (2, 'dup')`);
+						expect(await scalar(dbB, `select Id as v from T where Stamp = 'dup'`)).to.equal(1);
+					} else {
+						await dbB.exec(`insert into T (Id, Stamp) values (2, 'dup')`);
+						expect(await scalar(dbB, `select Id as v from T where Stamp = 'dup'`)).to.equal(2);
+						expect(await scalar(dbB, `select count(*) as v from T where Id = 1`)).to.equal(0);
+					}
+					expect(await scalar(dbB, `select count(*) as v from T`)).to.equal(1);
+				} finally {
+					dbB.close();
+				}
+			});
+
+			for (const spelling of ['table-level', 'column-level'] as const) {
+				it(`${spelling} primary key on conflict ${action} → ${outcome} after hydrate`, async () => {
+					const storage = new MemoryRawStorage();
+					const shared = buildSharedLocalTransactor(storage);
+					const uri = `tree://uniqhydrate/action-pk-${spelling}-${action}`;
+					const ddl = spelling === 'table-level'
+						? `create table T (Id integer, V text, primary key (Id) on conflict ${action}) using optimystic('${uri}')`
+						: `create table T (Id integer primary key on conflict ${action}, V text) using optimystic('${uri}')`;
+
+					const dbA = new Database();
+					registerWithSharedTransactor(dbA, shared);
+					try {
+						await dbA.exec(ddl);
+						await dbA.exec(`insert into T (Id, V) values (1, 'a')`);
+					} finally {
+						dbA.close();
+					}
+
+					const dbB = new Database();
+					const pluginB = registerWithSharedTransactor(dbB, shared);
+					try {
+						await pluginB.hydrate(dbB);
+						if (outcome === 'rejected') {
+							await expectThrows(
+								() => dbB.exec(`insert into T (Id, V) values (1, 'b')`),
+								/UNIQUE constraint failed/,
+							);
+							expect(await scalar(dbB, `select count(*) as v from T where V = 'a'`)).to.equal(1);
+						} else if (outcome === 'ignored') {
+							await dbB.exec(`insert into T (Id, V) values (1, 'b')`);
+							expect(await scalar(dbB, `select count(*) as v from T where V = 'a'`)).to.equal(1);
+						} else {
+							await dbB.exec(`insert into T (Id, V) values (1, 'b')`);
+							expect(await scalar(dbB, `select count(*) as v from T where V = 'b'`)).to.equal(1);
+						}
+						expect(await scalar(dbB, `select count(*) as v from T`)).to.equal(1);
+					} finally {
+						dbB.close();
+					}
+				});
+			}
+		}
+	});
+
+	it('a declared PK conflict action stabilizes: pre-upgrade schema re-writes exactly once, then short-circuits', async () => {
+		const storage = new MemoryRawStorage();
+		const shared = buildSharedLocalTransactor(storage);
+		const ddl = `
+			create table K (Id integer primary key on conflict ignore, V text)
+				using optimystic('tree://uniqhydrate/pk-stabilize')
+		`;
+
+		// Session 1: modern create — the column-level action must reach storage.
+		const dbA = new Database();
+		const pluginA = registerWithSharedTransactor(dbA, shared);
+		try {
+			await dbA.exec(ddl);
+			await dbA.exec(`insert into K (Id, V) values (1, 'a')`);
+			const stored = await sharedSchemaManager(pluginA).getSchema('K');
+			expect(stored?.columns[0]?.defaultConflict, 'column-level action must be persisted')
+				.to.not.equal(undefined);
+		} finally {
+			dbA.close();
+		}
+
+		// Tamper: strip the persisted conflict-action keys to simulate a schema
+		// written by a build that predates their persistence.
+		const dbT = new Database();
+		const pluginT = registerWithSharedTransactor(dbT, shared);
+		try {
+			await pluginT.hydrate(dbT);
+			const manager = sharedSchemaManager(pluginT);
+			const stored = await manager.getSchema('K');
+			const { primaryKeyDefaultConflict: _droppedPk, ...rest } = stored!;
+			await manager.storeStoredSchema({
+				...rest,
+				columns: stored!.columns.map((col: StoredTableSchema['columns'][number]) => {
+					const { defaultConflict: _dropped, ...colRest } = col;
+					return colRest;
+				}),
+			} as StoredTableSchema);
+		} finally {
+			dbT.close();
+		}
+
+		// Count schema-tree writes per session (same shape as the pre-upgrade
+		// uniqueConstraints stabilization test above).
+		const countSchemaTreeWrites = (plugin: PluginHandle): { count: () => number } => {
+			let writes = 0;
+			const factory = plugin.collectionFactory as unknown as {
+				createOrGetCollection: (options: { collectionUri?: string }, txnState?: unknown) => Promise<{ replace: (...args: unknown[]) => Promise<unknown> }>;
+			};
+			const original = factory.createOrGetCollection.bind(factory);
+			factory.createOrGetCollection = async (options, txnState) => {
+				const tree = await original(options, txnState);
+				if (options?.collectionUri === 'tree://optimystic/schema') {
+					const originalReplace = tree.replace.bind(tree);
+					tree.replace = async (...args: unknown[]) => { writes++; return originalReplace(...args); };
+				}
+				return tree;
+			};
+			return { count: () => writes };
+		};
+
+		// Session 2: re-declare — the candidate now carries the action, the persisted
+		// side does not, so exactly ONE re-write persists it; the declared IGNORE is
+		// live immediately (duplicate-PK insert swallowed).
+		const dbB = new Database();
+		const pluginB = registerWithSharedTransactor(dbB, shared);
+		try {
+			const writesB = countSchemaTreeWrites(pluginB);
+			await dbB.exec(ddl);
+			expect(writesB.count(), 're-declare over a pre-upgrade schema writes exactly once').to.equal(1);
+			await dbB.exec(`insert into K (Id, V) values (1, 'b')`);
+			expect(await scalar(dbB, `select count(*) as v from K where V = 'a'`)).to.equal(1);
+		} finally {
+			dbB.close();
+		}
+
+		// Session 3: identical re-declare — persisted schema now carries the action,
+		// so the short-circuit holds and nothing is written.
+		const dbC = new Database();
+		const pluginC = registerWithSharedTransactor(dbC, shared);
+		try {
+			const writesC = countSchemaTreeWrites(pluginC);
+			await dbC.exec(ddl);
+			expect(writesC.count(), 'second post-upgrade open must write nothing').to.equal(0);
+			await dbC.exec(`insert into K (Id, V) values (1, 'c')`);
+			expect(await scalar(dbC, `select count(*) as v from K where V = 'a'`)).to.equal(1);
+		} finally {
+			dbC.close();
 		}
 	});
 

@@ -253,6 +253,178 @@ describe('Secondary UNIQUE constraint enforcement on the optimystic vtab', funct
 		}
 	});
 
+	describe('declared conflict-action matrix (secondary UNIQUE)', () => {
+		// {ignore, replace, abort, fail, rollback} × {statement-level, constraint-level}.
+		// Precedence under test: statement-level `insert or <action>` > the action the
+		// constraint itself declares (`unique on conflict <action>`) > ABORT. FAIL and
+		// ROLLBACK are honoured as ABORT when they resolve from the vtab's structured
+		// constraint result (parity with the engine's in-memory module — see
+		// resolveConflictAction in optimystic-module.ts), so all three rejecting
+		// actions assert the same observable outcome: statement rejected, table
+		// unchanged.
+		const outcomes = {
+			ignore: 'ignored',
+			replace: 'replaced',
+			abort: 'rejected',
+			fail: 'rejected',
+			rollback: 'rejected',
+		} as const;
+
+		for (const spelling of ['statement', 'constraint'] as const) {
+			for (const [action, outcome] of Object.entries(outcomes)) {
+				it(`${spelling}-level ${action} on a secondary-UNIQUE collision is ${outcome}`, async () => {
+					const { db } = createDb();
+					try {
+						const declared = spelling === 'constraint' ? ` on conflict ${action}` : '';
+						await db.exec(`
+							create table T (Id integer primary key, Stamp text not null unique${declared})
+								using optimystic('tree://uniq/matrix-${spelling}-${action}')
+						`);
+						await db.exec(`insert into T (Id, Stamp) values (1, 'dup')`);
+						const collide = spelling === 'statement'
+							? `insert or ${action} into T (Id, Stamp) values (2, 'dup')`
+							: `insert into T (Id, Stamp) values (2, 'dup')`;
+
+						if (outcome === 'rejected') {
+							await expectThrows(() => db.exec(collide), /UNIQUE constraint failed/);
+							expect(await scalar(db, `select Id as v from T where Stamp = 'dup'`)).to.equal(1);
+						} else if (outcome === 'ignored') {
+							await db.exec(collide);
+							expect(await scalar(db, `select Id as v from T where Stamp = 'dup'`)).to.equal(1);
+						} else {
+							// REPLACE against a secondary UNIQUE evicts the colliding row at
+							// its own (different) PK; the new row owns the value.
+							await db.exec(collide);
+							expect(await scalar(db, `select Id as v from T where Stamp = 'dup'`)).to.equal(2);
+							expect(await scalar(db, `select count(*) as v from T where Id = 1`)).to.equal(0);
+						}
+						expect(await scalar(db, `select count(*) as v from T`)).to.equal(1);
+					} finally {
+						db.close();
+					}
+				});
+			}
+		}
+
+		it('statement-level OR wins over the constraint-declared action (or ignore beats declared replace)', async () => {
+			const { db } = createDb();
+			try {
+				await db.exec(`
+					create table P (Id integer primary key, Stamp text not null unique on conflict replace)
+						using optimystic('tree://uniq/matrix-precedence')
+				`);
+				await db.exec(`insert into P (Id, Stamp) values (1, 'dup')`);
+				// Declared REPLACE would evict row 1; the statement-level IGNORE must win
+				// and swallow the write instead.
+				await db.exec(`insert or ignore into P (Id, Stamp) values (2, 'dup')`);
+				expect(await scalar(db, `select count(*) as v from P`)).to.equal(1);
+				expect(await scalar(db, `select Id as v from P where Stamp = 'dup'`)).to.equal(1);
+			} finally {
+				db.close();
+			}
+		});
+	});
+
+	it('insert or replace colliding with a secondary UNIQUE evicts through the DECLARED unique index (indexed lookup sees only the new owner)', async () => {
+		const { db } = createDb();
+		try {
+			await db.exec(`
+				create table S (Id integer primary key, Stamp text not null)
+					using optimystic('tree://uniq/replace-declared')
+			`);
+			await db.exec(`create unique index ux_stamp on S (Stamp)`);
+			await db.exec(`insert into S (Id, Stamp) values (1, 'a')`);
+
+			// Previously raised `UNIQUE constraint failed`: statement-level REPLACE
+			// only special-cased the PK, and a secondary collision fell through to
+			// the constraint result (third defect in the fix ticket).
+			await db.exec(`insert or replace into S (Id, Stamp) values (2, 'a')`);
+
+			// Query THROUGH the indexed column (index-driven seek), not just count(*):
+			// the evicted row must be gone from the table and the index must resolve
+			// 'a' to the new owner only.
+			expect(await scalar(db, `select Id as v from S where Stamp = 'a'`)).to.equal(2);
+			expect(await scalar(db, `select count(*) as v from S where Stamp = 'a'`)).to.equal(1);
+			expect(await scalar(db, `select count(*) as v from S`)).to.equal(1);
+			expect(await scalar(db, `select count(*) as v from S where Id = 1`)).to.equal(0);
+
+			// The value's new owner still collides for a plain insert, and deleting it
+			// frees the value — the index tree carries exactly one live entry for 'a'.
+			await expectThrows(
+				() => db.exec(`insert into S (Id, Stamp) values (3, 'a')`),
+				/UNIQUE constraint failed/,
+			);
+			await db.exec(`delete from S where Id = 2`);
+			await db.exec(`insert into S (Id, Stamp) values (4, 'a')`);
+			expect(await scalar(db, `select Id as v from S where Stamp = 'a'`)).to.equal(4);
+		} finally {
+			db.close();
+		}
+	});
+
+	it('one REPLACE write can evict a different row per violated constraint (keeps scanning after an eviction)', async () => {
+		const { db } = createDb();
+		try {
+			await db.exec(`
+				create table M (Id integer primary key, A text not null unique on conflict replace, B text not null unique on conflict replace)
+					using optimystic('tree://uniq/replace-multi')
+			`);
+			await db.exec(`insert into M (Id, A, B) values (1, 'a1', 'b1')`);
+			await db.exec(`insert into M (Id, A, B) values (2, 'a2', 'b2')`);
+
+			// Collides with row 1 on A and with row 2 on B — one write evicts both.
+			await db.exec(`insert into M (Id, A, B) values (3, 'a1', 'b2')`);
+			expect(await scalar(db, `select count(*) as v from M`)).to.equal(1);
+			expect(await scalar(db, `select Id as v from M where A = 'a1'`)).to.equal(3);
+			expect(await scalar(db, `select Id as v from M where B = 'b2'`)).to.equal(3);
+		} finally {
+			db.close();
+		}
+	});
+
+	it('UPDATE moving onto an occupied value under `unique on conflict ignore` is swallowed (row keeps its old value)', async () => {
+		const { db } = createDb();
+		try {
+			await db.exec(`
+				create table T (Id integer primary key, Stamp text not null unique on conflict ignore)
+					using optimystic('tree://uniq/update-ignore')
+			`);
+			await db.exec(`insert into T (Id, Stamp) values (1, 'a')`);
+			await db.exec(`insert into T (Id, Stamp) values (2, 'b')`);
+
+			// Quereus has no `update or ignore` grammar and its planner passes no
+			// statement-level action for UPDATE, so the constraint-level declaration
+			// is the ONLY way to reach this branch.
+			await db.exec(`update T set Stamp = 'b' where Id = 1`);
+
+			expect(await scalar(db, `select count(*) as v from T`)).to.equal(2);
+			expect(await scalar(db, `select Id as v from T where Stamp = 'a'`)).to.equal(1);
+			expect(await scalar(db, `select Id as v from T where Stamp = 'b'`)).to.equal(2);
+		} finally {
+			db.close();
+		}
+	});
+
+	it('UPDATE moving onto an occupied value under `unique on conflict replace` evicts the occupying row', async () => {
+		const { db } = createDb();
+		try {
+			await db.exec(`
+				create table T (Id integer primary key, Stamp text not null unique on conflict replace)
+					using optimystic('tree://uniq/update-replace')
+			`);
+			await db.exec(`insert into T (Id, Stamp) values (1, 'a')`);
+			await db.exec(`insert into T (Id, Stamp) values (2, 'b')`);
+
+			await db.exec(`update T set Stamp = 'b' where Id = 1`);
+
+			expect(await scalar(db, `select count(*) as v from T`)).to.equal(1);
+			expect(await scalar(db, `select Id as v from T where Stamp = 'b'`)).to.equal(1);
+			expect(await scalar(db, `select count(*) as v from T where Id = 2`)).to.equal(0);
+		} finally {
+			db.close();
+		}
+	});
+
 	it('enforces a UNIQUE derived from CREATE UNIQUE INDEX via the declared index tree (no duplicate tree)', async () => {
 		const { db } = createDb();
 		try {

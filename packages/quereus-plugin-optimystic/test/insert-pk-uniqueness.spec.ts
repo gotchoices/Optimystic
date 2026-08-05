@@ -367,19 +367,15 @@ describe('INSERT conflict resolution (local/bootstrap transactor)', function () 
  * ABORT; status 'ok' + replacedRow for REPLACE; status 'ok' for IGNORE),
  * mirroring the INSERT path and the engine's UpdateResult contract.
  *
- * REACHABILITY: only the default ABORT mode is reachable through Quereus SQL
- * today, so only it is asserted end-to-end here. Quereus has no
- * `UPDATE OR REPLACE` / `UPDATE OR IGNORE` grammar (the parser jumps straight
- * from `UPDATE` to the table name — `update or replace …` raises "Expected
- * table name"), and the planner hard-codes `onConflict = undefined` for every
- * UPDATE ("UPDATE has no statement-level OR clause"). optimystic resolves
- * `args.onConflict ?? ABORT` and reads no per-constraint conflict default, so a
- * PK-moving UPDATE always arrives as ABORT. The REPLACE/IGNORE branches are
- * correct-by-construction — they reuse the exact staging / index
- * primitives already exercised by the passing `INSERT OR REPLACE` /
- * `INSERT OR IGNORE` tests above — but cannot be driven from SQL until the
- * engine supplies a non-ABORT onConflict for updates. See the review handoff
- * for the full analysis and the recommended follow-up.
+ * REACHABILITY: Quereus has no `UPDATE OR REPLACE` / `UPDATE OR IGNORE`
+ * grammar (the parser jumps straight from `UPDATE` to the table name —
+ * `update or replace …` raises "Expected table name"), and the planner
+ * hard-codes `onConflict = undefined` for every UPDATE — so no STATEMENT-level
+ * spelling reaches the IGNORE/REPLACE branches. They ARE reachable through the
+ * CONSTRAINT-level spelling (`primary key … on conflict <action>`), which the
+ * vtab resolves when the statement declares nothing; the 'Declared PK conflict
+ * actions' suite below drives both branches end-to-end that way. This suite
+ * keeps the default-ABORT coverage.
  *
  * These run against the real `local` / FileRawStorage transactor so they
  * exercise persistence + reopen.
@@ -456,6 +452,54 @@ describe('UPDATE PK-move conflict resolution (local/bootstrap transactor)', func
 		expect(await reopenScalar(dir, 'select v from T where id = 2')).to.equal('a');
 	});
 
+	it('UPDATE moving a PK onto an occupied key under a declared `on conflict ignore` is swallowed (both rows intact)', async () => {
+		const uri = 'tree://update-pkmove/declared-ignore';
+		const { db } = createDb(dir);
+		try {
+			await db.exec(
+				`create table T (id integer primary key on conflict ignore, v text) using optimystic('${uri}')`,
+			);
+			await db.exec(`insert into T (id, v) values (1, 'a')`);
+			await db.exec(`insert into T (id, v) values (2, 'b')`);
+
+			// The planner passes no statement-level action for UPDATE, so the
+			// constraint-level declaration is what resolves the collision — first
+			// SQL-reachable path into this branch.
+			await db.exec(`update T set id = 2 where id = 1`);
+
+			expect(await selectCount(db, 'select count(*) as c from T')).to.equal(2);
+			expect(await selectScalar(db, 'select v from T where id = 1')).to.equal('a');
+			expect(await selectScalar(db, 'select v from T where id = 2')).to.equal('b');
+		} finally {
+			db.close();
+		}
+
+		expect(await reopenScalar(dir, 'select v from T where id = 1')).to.equal('a');
+	});
+
+	it('UPDATE moving a PK onto an occupied key under a declared `on conflict replace` displaces the occupying row', async () => {
+		const uri = 'tree://update-pkmove/declared-replace';
+		const { db } = createDb(dir);
+		try {
+			await db.exec(
+				`create table T (id integer primary key on conflict replace, v text) using optimystic('${uri}')`,
+			);
+			await db.exec(`insert into T (id, v) values (1, 'a')`);
+			await db.exec(`insert into T (id, v) values (2, 'b')`);
+
+			await db.exec(`update T set id = 2 where id = 1`);
+
+			// Row 2 is displaced; row 1's payload now lives at id = 2.
+			expect(await selectCount(db, 'select count(*) as c from T')).to.equal(1);
+			expect(await selectCount(db, 'select count(*) as c from T where id = 1')).to.equal(0);
+			expect(await selectScalar(db, 'select v from T where id = 2')).to.equal('a');
+		} finally {
+			db.close();
+		}
+
+		expect(await reopenScalar(dir, 'select v from T where id = 2')).to.equal('a');
+	});
+
 	it('a default UPDATE PK-move collision with a secondary index rejects and leaves the index intact', async () => {
 		// The collision is rejected before any index staging, so the displaced
 		// row's index entry must still resolve and no entry should appear at the
@@ -482,5 +526,107 @@ describe('UPDATE PK-move conflict resolution (local/bootstrap transactor)', func
 
 		expect(await reopenScalar(dir, `select id from T where cat = 'x'`)).to.equal(1);
 		expect(await reopenScalar(dir, `select id from T where cat = 'y'`)).to.equal(2);
+	});
+});
+
+/**
+ * Constraint-level PK conflict actions (see fix ticket
+ * `optimystic-honor-declared-conflict-action`): a `primary key … on conflict
+ * <action>` declared on the TABLE (`primary key (id) on conflict X`) or on the
+ * COLUMN (`id integer primary key on conflict X`) must drive a duplicate-PK
+ * INSERT when the statement carries no OR clause. Precedence: statement-level
+ * OR > declared action > ABORT. FAIL and ROLLBACK are honoured as ABORT when
+ * resolved from the vtab's structured constraint result (parity with the
+ * engine's in-memory module), so all three rejecting actions assert the same
+ * observable outcome.
+ */
+describe('Declared PK conflict actions (local/bootstrap transactor)', function () {
+	this.timeout(20000);
+
+	let dir: string;
+
+	beforeEach(async () => {
+		dir = path.join(os.tmpdir(), 'optimystic-pk-declared-onconflict', randomUUID());
+		await fs.mkdir(dir, { recursive: true });
+	});
+
+	afterEach(async () => {
+		await fs.rm(dir, { recursive: true, force: true });
+	});
+
+	const outcomes = {
+		ignore: 'ignored',
+		replace: 'replaced',
+		abort: 'rejected',
+		fail: 'rejected',
+		rollback: 'rejected',
+	} as const;
+
+	for (const spelling of ['table-level', 'column-level'] as const) {
+		for (const [action, outcome] of Object.entries(outcomes)) {
+			it(`${spelling} primary key on conflict ${action}: duplicate-PK insert is ${outcome}`, async () => {
+				const uri = `tree://pkdeclared/${spelling}-${action}`;
+				const { db } = createDb(dir);
+				try {
+					const ddl = spelling === 'table-level'
+						? `create table T (id integer, v text, primary key (id) on conflict ${action}) using optimystic('${uri}')`
+						: `create table T (id integer primary key on conflict ${action}, v text) using optimystic('${uri}')`;
+					await db.exec(ddl);
+					await db.exec(`insert into T (id, v) values (1, 'a')`);
+
+					if (outcome === 'rejected') {
+						await expectThrows(() => db.exec(`insert into T (id, v) values (1, 'b')`));
+						expect(await selectScalar(db, 'select v from T where id = 1')).to.equal('a');
+					} else if (outcome === 'ignored') {
+						await db.exec(`insert into T (id, v) values (1, 'b')`);
+						expect(await selectScalar(db, 'select v from T where id = 1')).to.equal('a');
+					} else {
+						await db.exec(`insert into T (id, v) values (1, 'b')`);
+						expect(await selectScalar(db, 'select v from T where id = 1')).to.equal('b');
+					}
+					expect(await selectCount(db, 'select count(*) as c from T')).to.equal(1);
+				} finally {
+					db.close();
+				}
+			});
+		}
+	}
+
+	it('statement-level OR wins over the declared PK action (or ignore beats declared replace)', async () => {
+		const uri = 'tree://pkdeclared/precedence';
+		const { db } = createDb(dir);
+		try {
+			await db.exec(
+				`create table T (id integer primary key on conflict replace, v text) using optimystic('${uri}')`,
+			);
+			await db.exec(`insert into T (id, v) values (1, 'a')`);
+
+			// Declared REPLACE would overwrite; the statement-level IGNORE must win.
+			await db.exec(`insert or ignore into T (id, v) values (1, 'b')`);
+
+			expect(await selectCount(db, 'select count(*) as c from T')).to.equal(1);
+			expect(await selectScalar(db, 'select v from T where id = 1')).to.equal('a');
+		} finally {
+			db.close();
+		}
+	});
+
+	it('statement-level or fail / or rollback on a duplicate PK reject and preserve the row', async () => {
+		const uri = 'tree://pkdeclared/stmt-fail-rollback';
+		const { db } = createDb(dir);
+		try {
+			await db.exec(
+				`create table T (id integer primary key, v text) using optimystic('${uri}')`,
+			);
+			await db.exec(`insert into T (id, v) values (1, 'a')`);
+
+			await expectThrows(() => db.exec(`insert or fail into T (id, v) values (1, 'b')`));
+			await expectThrows(() => db.exec(`insert or rollback into T (id, v) values (1, 'c')`));
+
+			expect(await selectCount(db, 'select count(*) as c from T')).to.equal(1);
+			expect(await selectScalar(db, 'select v from T where id = 1')).to.equal('a');
+		} finally {
+			db.close();
+		}
 	});
 });
