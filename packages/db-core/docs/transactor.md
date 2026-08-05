@@ -132,7 +132,7 @@ class TransactorSource<TBlock extends IBlock> implements BlockSource<TBlock> {
   constructor(
     private readonly collectionId: BlockId,
     private readonly transactor: ITransactor,
-    public trxContext: TrxContext | undefined
+    public actionContext: ActionContext | undefined
   ) {}
   
   // BlockSource implementation
@@ -152,7 +152,7 @@ class TransactorSource<TBlock extends IBlock> implements BlockSource<TBlock> {
 async tryGet(id: BlockId): Promise<TBlock | undefined> {
   const result = await this.transactor.get({ 
     blockIds: [id], 
-    context: this.trxContext 
+    context: this.actionContext 
   });
   
   if (result) {

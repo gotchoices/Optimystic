@@ -107,7 +107,7 @@ adopt as they migrate.
 │   ├── pend/
 │   │   ├── {actionId}.json # Pending actions
 │   │   └── ...
-│   ├── trx/
+│   ├── actions/
 │   │   ├── {actionId}.json # Committed actions
 │   │   └── ...
 │   └── blocks/

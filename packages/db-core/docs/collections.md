@@ -153,7 +153,7 @@ async update() {
   }
   
   // 5. Update our snapshot's revision context
-  this.source.trxContext = latest?.context;
+  this.source.actionContext = latest?.context;
 }
 ```
 
@@ -184,7 +184,7 @@ async sync() {
 
       // 3. Add transaction to log (locally)
       const log = await Log.open<Action<TAction>>(tracker, this.id);
-      const newRev = (this.source.trxContext?.rev ?? 0) + 1;
+      const newRev = (this.source.actionContext?.rev ?? 0) + 1;
       const addResult = await log.addActions(
         pending, actionId, newRev,
         () => tracker.transformedBlockIds()
@@ -218,8 +218,8 @@ async sync() {
         const transforms = tracker.reset();
         await this.replayActions();
         this.sourceCache.transformCache(transforms, newRev);
-        this.source.trxContext = {
-          committed: [...(this.source.trxContext?.committed ?? []), { actionId, rev: newRev }],
+        this.source.actionContext = {
+          committed: [...(this.source.actionContext?.committed ?? []), { actionId, rev: newRev }],
           rev: newRev
         };
       }

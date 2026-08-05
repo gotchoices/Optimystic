@@ -4,12 +4,16 @@
 
 This document outlines the design for a Block Repository that provides efficient access to versioned data. The system manages blocks of data with versioning capabilities, allowing users to retrieve blocks at specific versions, update blocks conditionally, and mark blocks for eventual deletion.
 
-The system provides these core operations through the `IBlockNetwork` interface:
+The system provides these core operations through the `IRepo` interface
+(`packages/db-core/src/network/i-repo.ts`):
 - `get(blockGets[])`: Fetch blocks by their IDs and versions or specific transactions
-- `getStatus(actionRefs[])`: Get statuses of block transactions
-- `pend(blockAction)`: Post a transaction for a set of blocks
+- `pend(request)`: Post a transaction for a set of blocks
 - `cancel(actionRef)`: Cancel a pending transaction
-- `commit(tailId, actionRef)`: Commit a pending transaction
+- `commit(request)`: Commit a pending transaction
+
+`getStatus(actionRefs[])` — get statuses of block actions — is *not* on `IRepo`; it lives one layer
+up on `ITransactor` (`packages/db-core/src/transactor/transactor.ts`), which is what applications
+call. The sections below describe the per-block repo operations.
 
 ## Clusters
 
@@ -47,7 +51,7 @@ Here is how a transaction proceeds for a given cluster:
   - If a transaction ID is specified, returns the block with pending changes applied
   - Fails if requesting a deleted block with pending transaction
 
-### 2. `pend(blockTrx)`
+### 2. `pend(request)`
 
 - **Purpose**: Post a transaction for a set of blocks
 - **Input**: `PendRequest` containing:
@@ -66,12 +70,15 @@ Here is how a transaction proceeds for a given cluster:
 - **Input**: `ActionBlocks` containing block IDs and transaction ID
 - **Behavior**: Removes the pending transaction from all specified blocks
 
-### 4. `commit(tailId, actionRef)`
+### 4. `commit(request)`
 
 - **Purpose**: Commit a pending transaction
-- **Input**:
-  - `tailId` - Block ID
-  - `actionRef` - Action reference
+- **Input**: a single `RepoCommitRequest` object containing:
+  - `blockIds` - Blocks covered by this commit
+  - `actionId` - Action identifier
+  - `rev` - Revision being committed
+  - `tailId` - Optional; the committing collection's chain tail block id, threaded through so the
+    committing node can anchor the emitted change event
 - **Output**: `CommitResult` indicating success or missing transactions needed
 - **Behavior**:
   - Verifies expected revision matches current state
