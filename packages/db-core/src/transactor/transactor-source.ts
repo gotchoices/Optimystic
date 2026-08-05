@@ -60,13 +60,10 @@ export class TransactorSource<TBlock extends IBlock> implements BlockSource<TBlo
 				// Record read dependency for optimistic concurrency control, carrying the caller's
 				// read purpose (default `value`) so a purely-structural navigation read can later be
 				// dropped from the conflict set (see ReadDependencyCollector / Theorem 5).
-				// The revision the content we just received was MATERIALIZED at — not the newest
-				// revision the repo holds. They differ when `actionContext` pins below the block's
-				// latest (the lagging-reader case): recording `latest` there would claim we observed
-				// content we never read, and the validator's stale-read check (exact equality against
-				// the block's current revision) would wrongly pass. Fall back to `state.latest` for
-				// repos that do not report the materialized revision — that is today's behaviour.
-				// Both sinks take the SAME value: CacheSource learns it via getReadRevision on a
+				// Record the revision the content was MATERIALIZED at, not the newest the repo holds —
+				// see {@link GetBlockResult.materializedRev} for why `state.latest` is the wrong number
+				// and why the fallback preserves today's behaviour for repos that omit the field.
+				// Both sinks must take the SAME value: CacheSource learns it via getReadRevision on a
 				// miss-load and re-emits it on every later hit, so a split would stamp the cache
 				// differently from the collector.
 				const rev = materializedRev ?? state.latest?.rev ?? 0;

@@ -34,10 +34,16 @@ Here is how a transaction proceeds for a given cluster:
   - `context` - Optional transaction context specifying either a revision or pending transaction
 - **Output**: Array of `GetBlockResult` objects containing:
   - `block` - The block data
-  - `state` - Current block state including latest revision or deletion status
+  - `state` - Current block state including latest revision or deletion status. `state.latest` is
+    the newest revision the *answering repo* holds for the block — not necessarily the revision of
+    the `block` it just returned
+  - `materializedRev` - Optional; the revision the returned `block` was actually materialized at.
+    Equals `state.latest.rev` for an unpinned read; lower when a revision-pinned read serves older
+    content. Consumers that need "what revision did this read observe?" (read-dependency recording)
+    must use this, falling back to `state.latest.rev` only for producers that omit it
 - **Behavior**: 
   - If no context is provided, returns the latest version
-  - If a revision is specified, returns the block at that revision
+  - If a revision is specified, returns the block at the highest committed revision at or below it
   - If a transaction ID is specified, returns the block with pending changes applied
   - Fails if requesting a deleted block with pending transaction
 

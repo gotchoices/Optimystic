@@ -511,6 +511,26 @@ saveMaterializedBlock(block): store(structuredClone(block));
   `ClusterMember`'s promise-phase stale-revision gate votes *reject* rather than approving a pend
   whose revision it could not check; `SpreadOnChurnMonitor` keeps the block tracked rather than
   self-pruning it from the replication set.
+- **"What revision did this read observe?" is a separate field from "what revision does this repo
+  hold?"** `GetBlockResult` carries an optional `materializedRev`
+  ([`network/struct.ts`](../packages/db-core/src/network/struct.ts)): the revision the returned
+  `block` was actually materialized at. It differs from `state.latest.rev` for exactly one case — a
+  read that pins `context.rev` below the revision at which *that block* last committed, so the repo
+  serves older content than it holds. `state.latest` deliberately keeps its own meaning (the newest
+  revision the answering repo holds), because other consumers depend on it: `StorageRepo.get`'s
+  read-driven promotion pre-scan compares `context.committed` against it, and `CoordinatorRepo.get`
+  drives read-repair off it. Producers: `StorageRepo.get` populates it from the `actionRev` that
+  `IBlockStorage.getBlock(rev)` already returns — on the plain committed read, and on the
+  pending-overlay read as the revision of the *committed base* the pending was applied over (a
+  pending has no revision of its own; a pending-only insert with no base leaves it absent);
+  `TestTransactor` mirrors that. `CoordinatorRepo` and `NetworkTransactor` forward peer entries
+  verbatim, and the repo protocol is plain JSON, so the field rides along untouched. The one
+  consumer is `TransactorSource.tryGet`, which records `materializedRev ?? state.latest?.rev ?? 0`
+  as the read dependency and re-emits the same number through `getReadRevision` so a `CacheSource`
+  hit stamps the cache identically. Recording `state.latest` there claimed the reader had observed
+  content it never read, and the validator's stale-read check (exact equality against the block's
+  current revision) then wrongly passed. Being optional with that fallback is what let every
+  producer that cannot report a materialized revision stay unchanged.
 
 ### Collection Header Blocks
 - Header blockId = collection name (deterministic)

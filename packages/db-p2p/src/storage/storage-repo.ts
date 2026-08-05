@@ -279,9 +279,15 @@ export class StorageRepo implements IRepo, IBlockChangeNotifier, IBlockReplicaSt
 				return [blockId, { state: {}, unavailable: 'unmaterializable' } as GetBlockResult];
 			}
 
-			// Include pending action if requested — handled first so a pending-only
-			// insert (no committed revision yet) can still be served by applying the
-			// pending transform to an undefined prior block.
+			// Include pending action if requested, applying the pending transform over whatever
+			// committed base getBlock() resolved (possibly none).
+			// NOTE: the `blockRev == null` arm is currently DEAD, so a pending-only insert is NOT
+			// served here despite what this branch is shaped to do: `ActionContext.rev` is required,
+			// and BlockStorage.getBlock only tolerates a missing committed base when `rev` is
+			// undefined — so a contextful read of a block with no committed revision throws above and
+			// is caught into `unavailable: 'unmaterializable'` before reaching here. Asserted in
+			// storage-repo.spec.ts ('KNOWN GAP: a pending-only insert read WITH a context ...'); see
+			// tickets/backlog/debt-pending-only-insert-unreadable-with-context.
 			if (context?.actionId !== undefined) {
 				const pendingTransform = await blockStorage.getPendingTransaction(context.actionId);
 				if (!pendingTransform) {
@@ -297,8 +303,9 @@ export class StorageRepo implements IRepo, IBlockChangeNotifier, IBlockReplicaSt
 						pendings: [context.actionId]
 					},
 					// The COMMITTED revision underneath the pending overlay. A pending has no revision
-					// of its own, so the honest answer is the base it was applied to; absent when there
-					// was no base at all (a pending-only insert), which callers read as "unknown".
+					// of its own, so the honest answer is the base it was applied to. Absent when there
+					// was no base — unreachable today (see the NOTE above), kept so the field stays
+					// correct rather than fabricating a revision if that arm is ever reopened.
 					...(blockRev ? { materializedRev: blockRev.actionRev.rev } : {}),
 					// A pending applied to a missing base can materialize nothing (applyTransform drops
 					// updates with no block to apply them to) — that absence is a guess, and is flagged.

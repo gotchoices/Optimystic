@@ -485,6 +485,75 @@ describe('StorageRepo', () => {
 			expect(result[bId]!.materializedRev, 'B is served from its own rev 1, not the rev-2 pin').to.equal(1);
 			expect(result[bId]!.state.latest?.rev, 'and its latest is rev 1 too — the two agree here').to.equal(1);
 		});
+
+		it('a pending-overlay get reports the committed base it was applied over', async () => {
+			// A pending carries no revision of its own, so the honest label for pending-overlaid
+			// content is the revision of the committed base underneath it. Pinning the read below
+			// `latest` proves the field tracks the base actually used, not the newest revision held.
+			const blockId = 'block-1' as BlockId;
+			await repo.pend({
+				actionId: 'a1' as ActionId,
+				transforms: makeInsertTransforms(blockId, makeBlock('block-1', { items: ['v1'] })),
+				policy: 'c'
+			});
+			expect((await repo.commit({ actionId: 'a1' as ActionId, blockIds: [blockId], tailId: blockId, rev: 1 })).success).to.equal(true);
+
+			await repo.pend({
+				actionId: 'a2' as ActionId,
+				transforms: makeUpdateTransforms(blockId, [['items', 1, 0, ['v2']]]),
+				policy: 'c'
+			});
+			expect((await repo.commit({ actionId: 'a2' as ActionId, blockIds: [blockId], tailId: blockId, rev: 2 })).success).to.equal(true);
+
+			// Uncommitted pending, read back over a base pinned at rev 1.
+			await repo.pend({
+				actionId: 'a3' as ActionId,
+				transforms: makeUpdateTransforms(blockId, [['items', 1, 0, ['v3']]]),
+				policy: 'c'
+			});
+			const entry = (await repo.get({
+				blockIds: [blockId],
+				context: { actionId: 'a3' as ActionId, rev: 1, committed: [] }
+			}))[blockId]!;
+
+			expect((entry.block as unknown as { items: string[] }).items, 'rev-1 base with the pending applied')
+				.to.deep.equal(['v1', 'v3']);
+			expect(entry.materializedRev, 'reports the base revision, not the newest held').to.equal(1);
+			expect(entry.state.latest?.rev, 'state.latest still the newest revision held').to.equal(2);
+		});
+
+		it('KNOWN GAP: a pending-only insert read WITH a context never reaches the overlay at all', async () => {
+			// get()'s pending-overlay branch is documented to serve a pending-only insert by applying
+			// the transform over an undefined base — and its `materializedRev` is written to be absent
+			// for exactly that case. Neither is reachable: `ActionContext.rev` is REQUIRED, and
+			// BlockStorage.getBlock only tolerates a missing committed base when `rev` is undefined,
+			// so any contextful read of a block with no committed revision throws inside getBlock and
+			// is caught into `unavailable: 'unmaterializable'` BEFORE the overlay branch runs.
+			// Asserted here so the dead branch is visible rather than merely believed to work; see
+			// tickets/backlog/debt-pending-only-insert-unreadable-with-context.
+			const blockId = 'brand-new' as BlockId;
+			await repo.pend({
+				actionId: 'p1' as ActionId,
+				transforms: makeInsertTransforms(blockId, makeBlock('brand-new', { items: ['fresh'] })),
+				policy: 'c'
+			});
+
+			for (const rev of [0, 1, 2]) {
+				const entry = (await repo.get({
+					blockIds: [blockId],
+					context: { actionId: 'p1' as ActionId, rev, committed: [] }
+				}))[blockId]!;
+				expect(entry.block, `rev ${rev}: overlay never applied`).to.equal(undefined);
+				expect(entry.unavailable, `rev ${rev}: reported unavailable instead`).to.equal('unmaterializable');
+				expect(entry.materializedRev, `rev ${rev}: no content ⇒ no materialized revision`).to.equal(undefined);
+			}
+
+			// The contextLESS read is the one path that DOES serve a pending-only block — and it takes
+			// the plain-absent branch (no overlay, no revision), not the overlay branch.
+			const contextless = (await repo.get({ blockIds: [blockId] }))[blockId]!;
+			expect(contextless.block, 'contextless read does not apply pendings either').to.equal(undefined);
+			expect(contextless.state).to.deep.equal({});
+		});
 	});
 
 	describe('get — unavailable vs absent (ticket repo-reports-unavailable-vs-absent)', () => {
