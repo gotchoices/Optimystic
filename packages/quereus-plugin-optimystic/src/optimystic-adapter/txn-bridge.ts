@@ -104,6 +104,19 @@ export class TransactionBridge {
    * report whatever the trees hold, which honestly mirrors storage. Cleared by the
    * next successful commit or rollback — the point at which a reconciled local
    * state is back in view.
+   *
+   * NOTE: the latch is an advisory "I know I am broken" signal, not a repair. It
+   * narrows the window in which committed reads serve an incoherent state; it does
+   * not heal the split, and the clearing rule is deliberately coarse — an unrelated
+   * transaction's clean commit or rollback releases it even though the durably-split
+   * trees are untouched. Concretely, after a legacy split that persisted the main
+   * table but not its index, a post-clear committed FULL SCAN and a committed
+   * INDEX-DRIVEN scan of the same table disagree, and always will: only the
+   * application-level reconciliation described in docs/correctness.md § "Partial
+   * landing" fixes that. If anything is ever built that treats a cleared latch as
+   * proof of a coherent store — most likely `readCommittedSnapshot`, which promises
+   * exactly full-scan/index agreement — the clearing rule needs to become a real
+   * reconciliation check first, not a next-commit-wins heuristic.
    */
   private degradedReason: string | null = null;
   private collectionFactory: CollectionFactory;

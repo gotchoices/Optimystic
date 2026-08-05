@@ -43,6 +43,21 @@ export interface OptimysticModuleConfig extends BaseModuleConfig {
 }
 
 /**
+ * The named secondary index a scan reads through, resolved (schema + tree) BEFORE any
+ * read view is built, so the committed arm of {@link OptimysticVirtualTable.runQuery}
+ * can pin the index view in the same synchronous block as the main-table view.
+ */
+interface IndexScanTarget {
+  schema: StoredIndexSchema;
+  tree: Tree<string, IndexEntry>;
+}
+
+/** An {@link IndexScanTarget} plus the read view the scan actually walks. */
+interface IndexScanSource extends IndexScanTarget {
+  read: TreeReadView<string, IndexEntry>;
+}
+
+/**
  * Helper function to convert SqlDataType affinity to LogicalType
  */
 function affinityToLogicalType(affinity: SqlDataType): LogicalType {
@@ -566,31 +581,37 @@ export class OptimysticVirtualTable extends VirtualTable {
       }
 
       const mainTree = this.collection as unknown as Tree<string, RowData>;
-      const indexTree = scanIndexName !== undefined
-        ? this.resolveIndexTree(scanIndexName)
+      const indexTarget = scanIndexName !== undefined
+        ? this.resolveIndexTarget(scanIndexName)
         : undefined;
 
       let mainRead: TreeReadView<string, RowData>;
-      let indexRead: TreeReadView<string, IndexEntry> | undefined;
+      let indexScan: IndexScanSource | undefined;
       if (committed) {
         // ONE synchronous block — no await between the two views — so both pin the
         // SAME committed moment (committedTreeView is synchronous). A committed read
         // never refreshes from the network: a mid-constraint pull would defeat the
         // point of reading committed state.
         mainRead = this.committedTreeView(mainTree);
-        indexRead = indexTree !== undefined ? this.committedTreeView(indexTree) : undefined;
+        indexScan = indexTarget !== undefined
+          ? { ...indexTarget, read: this.committedTreeView(indexTarget.tree) }
+          : undefined;
       } else {
         // Live reads refresh each tree from the network first.
         await mainTree.update();
         mainRead = mainTree;
-        if (indexTree !== undefined) {
-          await indexTree.update();
-          indexRead = indexTree;
+        if (indexTarget !== undefined) {
+          await indexTarget.tree.update();
+          indexScan = { ...indexTarget, read: indexTarget.tree };
         }
       }
 
-      if (scanIndexName !== undefined && indexRead !== undefined) {
-        yield* this.executeIndexScan(mainRead, indexRead, scanIndexName, filterInfo.args);
+      // Carrying the index schema, tree, and read view as ONE value keeps the
+      // "index-driven plan" decision single-valued — there is no shape where the plan
+      // says index-scan but a source is missing and the scan silently falls through to
+      // a different access path.
+      if (indexScan !== undefined) {
+        yield* this.executeIndexScan(mainRead, indexScan, filterInfo.args);
       } else if (planType === 2 && filterInfo.args.length > 0) {
         // Primary key equality seek (plan=2)
         yield* this.executePointLookup(mainRead, filterInfo.args);
@@ -615,23 +636,23 @@ export class OptimysticVirtualTable extends VirtualTable {
   }
 
   /**
-   * Resolve the tree behind a named secondary index, throwing when the index or its
-   * tree is unknown. Synchronous, so {@link runQuery}'s committed arm can resolve it
-   * inside the single view-building block.
+   * Resolve the schema and tree behind a named secondary index, throwing when either
+   * is unknown. Synchronous, so {@link runQuery}'s committed arm can resolve it inside
+   * the single view-building block.
    */
-  private resolveIndexTree(indexName: string): Tree<string, IndexEntry> {
+  private resolveIndexTarget(indexName: string): IndexScanTarget {
     if (!this.indexManager) {
       throw new Error('Table not initialized');
     }
-    const indexSchema = this.indexManager.getIndexSchema(indexName);
-    if (!indexSchema) {
+    const schema = this.indexManager.getIndexSchema(indexName);
+    if (!schema) {
       throw new Error(`Index not found: ${indexName}`);
     }
-    const indexTree = this.indexManager.getIndexTree(indexName);
-    if (!indexTree) {
+    const tree = this.indexManager.getIndexTree(indexName);
+    if (!tree) {
       throw new Error(`Index tree not found: ${indexName}`);
     }
-    return indexTree;
+    return { schema, tree };
   }
 
   /**
@@ -733,30 +754,24 @@ export class OptimysticVirtualTable extends VirtualTable {
    */
   private async* executeIndexScan(
     mainRead: TreeReadView<string, RowData>,
-    indexRead: TreeReadView<string, IndexEntry>,
-    indexName: string,
+    index: IndexScanSource,
     args: readonly unknown[],
   ): AsyncIterable<Row> {
     if (!this.rowCodec || !this.indexManager) return;
-
-    const indexSchema = this.indexManager.getIndexSchema(indexName);
-    if (!indexSchema) {
-      throw new Error(`Index not found: ${indexName}`);
-    }
 
     // Build the (possibly partial) framed index key from constraint values. Must use
     // the SAME framing IndexManager.createIndexKey stores under, so the prefix range in
     // findByIndexIn brackets exactly this tuple. A partial key (fewer args than index
     // columns) frames only the provided leading columns and prefix-matches the rest.
     const indexKeyPayloads: Array<string | null> = [];
-    for (let i = 0; i < args.length && i < indexSchema.columns.length; i++) {
+    for (let i = 0; i < args.length && i < index.schema.columns.length; i++) {
       indexKeyPayloads.push(serializeIndexValue(args[i] as SqlValue));
     }
 
     const indexKey = encodeKeyTuple(indexKeyPayloads);
 
     // Look up primary keys using the index read source
-    for await (const primaryKey of this.indexManager.findByIndexIn(indexRead, indexKey)) {
+    for await (const primaryKey of this.indexManager.findByIndexIn(index.read, indexKey)) {
       // Fetch the row from the main table using the primary key
       const path = await mainRead.find(primaryKey);
       if (!mainRead.isValid(path)) {

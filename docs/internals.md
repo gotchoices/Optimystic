@@ -65,6 +65,31 @@ dependencies by default (`ReadViewOptions.recordReads`), so a committed scan can
 fail a concurrent writer's commit validation; deferred-constraint safety instead
 rests on validator peers re-executing the recorded statements.
 
+Two further properties hold for that path:
+
+- **A committed read registers no connection.** `OptimysticModule.connect` with
+  `_readCommitted: true` resolves (and, on first touch, initializes) the shared table
+  but skips `ensureConnectionRegistered()`, and the returned `OptimysticCommittedTable`
+  wrapper refuses `createConnection()` and reports no `getConnection()`. So a committed
+  read never appears in the engine's connection registry and never receives the
+  writer's begin/commit/rollback/savepoint broadcasts — the connection class backing
+  this vtab drives the *shared* `TransactionBridge`, so an enlisted committed view
+  would drive the writer's transaction.
+- **All of a scan's views are pinned in one synchronous block.** `runQuery` parses the
+  access strategy first (pure string parsing), then builds the main-tree view and — for
+  an index-driven plan — the index-tree view with no `await` between them. Splitting
+  them across an await let a commit land in between, so an index-driven plan and a full
+  scan of the same nominal snapshot could disagree.
+
+`OptimysticModule` declares `concurrencyMode = 'reentrant-reads'`: concurrent
+`query()` calls on one connected table are safe (every scan's mutable state is local to
+its generator; committed scans read per-scan pinned views; a live scan's
+`collection.update()` serializes behind db-core's per-collection latch). Writes still
+serialize, which is what keeps the bridge's single-writer state (below) unexposed.
+`readCommittedSnapshot` is **not** declared — that is the stronger, separate promise
+that a committed read survives another connection's commit mid-scan, and it stays off
+until proven under a stalled commit.
+
 ### Write Path (Local Changes)
 ```
 Collection.act(action)

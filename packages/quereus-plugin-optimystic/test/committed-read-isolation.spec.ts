@@ -323,6 +323,40 @@ describe('Committed-read connection isolation', function () {
 		});
 	});
 
+	describe('legacy index-scan dispatch (idxNum >= 10)', () => {
+		it('routes a bare-index-name plan to the committed index view', async () => {
+			const { db, plugin } = createTestDb();
+			try {
+				await db.exec(`create table Item (id integer primary key, cat text) using optimystic('tree://iso/legacyidx')`);
+				await db.exec(`create index idx_cat on Item (cat)`);
+				await db.exec(`insert into Item (id, cat) values (1, 'a'), (2, 'b'), (3, 'a')`);
+
+				await db.exec('begin');
+				await db.exec(`insert into Item (id, cat) values (4, 'a')`);
+
+				const committedTable = await connectCommitted(db, plugin, 'Item');
+				// No current planner emits this shape (modern plans carry
+				// `idx=<name>;plan=N`), so the arm has no incidental coverage: drive it by
+				// hand. idxNum >= 10 with idxStr = the BARE index name must reach
+				// executeIndexScan on the committed index view, not fall through to a full
+				// scan — and must not see the staged row 4.
+				const rows = await drain(committedTable.query(filterInfo('idx_cat', ['a'], 10)));
+				expect(rows.map(r => Number(r[0])).sort()).to.deep.equal([1, 3]);
+
+				// The modern-plan guards still win over the legacy arm at the same idxNum:
+				// plan=2 with args is a PK point lookup, plan=3 a PK range.
+				const point = await drain(committedTable.query(filterInfo('idx=_primary_(0);plan=2', [2], 10)));
+				expect(point.map(r => Number(r[0]))).to.deep.equal([2]);
+				const range = await drain(committedTable.query(filterInfo('idx=_primary_(0);plan=3', [], 10)));
+				expect(range.map(r => Number(r[0])).sort()).to.deep.equal([1, 2, 3]);
+
+				await db.exec('rollback');
+			} finally {
+				db.close();
+			}
+		});
+	});
+
 	describe('committed point lookup and range scan', () => {
 		it('composite-PK point lookup and range scan read the committed view, excluding staged rows', async () => {
 			const { db, plugin } = createTestDb();

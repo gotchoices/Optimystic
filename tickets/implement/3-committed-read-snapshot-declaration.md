@@ -162,6 +162,55 @@ Declining is not a defect; over-declaring is.
   option surface on `StatementOptions` in the installed package) completes while
   a stalled write is outstanding on the same `Database`.
 
+## Added arm (from the review of `committed-read-connection-isolation`)
+
+**A committed read of a table this process has not touched yet still writes to
+shared state — and the flag this ticket sets is what makes that concurrent.**
+
+`committed-read-connection-isolation` stopped a committed read from registering an
+engine *connection*. It did not touch the other side effects of a **first touch**.
+When `OptimysticModule.connect` is asked for a committed read of a table that is not
+yet in the module's per-`schema.table` cache, it still calls
+`OptimysticVirtualTable.initialize()`, and that method (`doInitialize`,
+`optimystic-module.ts`) does all of the following using the **writer's** in-flight
+transaction (`this.txnBridge.getCurrentTransaction()`):
+
+- creates or opens the main collection and every index collection through the
+  writer's transactor;
+- **writes the table's schema to the schema tree** (`storeStoredSchema(...,
+  txnState?.transactor)`) whenever the local column/PK/vtab-arg shape does not match
+  what is persisted — a storage write performed on behalf of a read, staged into the
+  writer's transaction;
+- adds the main and index collections to the bridge's collection registry
+  (`registerCollections()` → `TransactionBridge.registerCollection`), which in session
+  mode is the same live map the in-flight `TransactionCoordinator` was built from;
+- subscribes to collection-change notifications (`ensureChangeSubscription`).
+
+Today this is serialized: committed reads still run under Quereus's execution mutex
+because `readCommittedSnapshot` is off, so the first touch cannot interleave with the
+writer. **Setting the flag in this ticket removes that mutex** and the first-touch
+initialize becomes concurrent with an in-flight commit.
+
+The first-touch-as-committed-read path is real and covered:
+`test/committed-read-isolation.spec.ts` → "first-EVER touch of a table as a committed
+read works and registers nothing".
+
+What this arm needs to settle (design question, not a mechanical fix):
+
+- Should a committed read be allowed to initialize a table at all, or should the
+  committed connect fail / fall back to the serialized path when the table is cold?
+- If it may initialize: initialization must not use the writer's transaction. A
+  read-only initialize would need its own transactor and must not write the schema
+  tree, must not mutate the bridge's collection registry mid-transaction, and must not
+  fold new collections into a live coordinator.
+- Whichever shape is chosen, add a test that drives a first-touch committed read while
+  a writer transaction is open and asserts the bridge's transaction state and
+  collection registry are unchanged by it. (Under the current serialized path such a
+  test is already meaningful; under the flag it is required.)
+
+Fail closed as the rest of this ticket does: if this cannot be settled, the flag stays
+off, because the flag is what makes the hazard reachable.
+
 ## TODO
 
 - Build the gated delegating transactor as a reusable test helper under
@@ -171,6 +220,8 @@ Declining is not a defect; over-declaring is.
   cases & interactions*.
 - Write the engine-level end-to-end (concurrent committed read racing a stalled
   write on one `Database`).
+- Settle the *Added arm* above (first-touch committed read's initialize side effects)
+  before setting the flag — the flag is what makes it concurrent.
 - Only then set `readCommittedSnapshot = true` on `OptimysticModule`.
 - Add the `runCommittedReadConformance` + `installCommitStall` spec as standing
   regression cover; assert `observedCommitOverlap`.
