@@ -194,6 +194,26 @@ export function runRawStorageConformance(
 			expect(await collect(storage.listPendingTransactions(blockId))).to.deep.equal([]);
 		});
 
+		it('deletePendingTransaction on an absent entry is a tolerated no-op', async () => {
+			// Load-bearing across backends: the commit path deletes a pending record it has NOT
+			// checked for presence — `StorageRepo.dropUnpromotablePendings` over a whole batch, and
+			// `BlockStorage.saveForwardRevision` maintaining Invariant P — so a backend that threw
+			// (or rejected) on a miss would turn every ordinary commit into a logged failure.
+			const blockId = 'pend-del-absent' as BlockId;
+			await storage.deletePendingTransaction(blockId, 'never-pended' as ActionId);
+
+			// Also a no-op beside a LIVE pending for a different action: the delete must be scoped
+			// to its action id, never a per-block clear.
+			await storage.savePendingTransaction(blockId, 'a1' as ActionId, { delete: true });
+			await storage.deletePendingTransaction(blockId, 'other' as ActionId);
+			expect(await storage.getPendingTransaction(blockId, 'a1' as ActionId)).to.deep.equal({ delete: true });
+
+			// Idempotent: deleting the same entry twice is fine.
+			await storage.deletePendingTransaction(blockId, 'a1' as ActionId);
+			await storage.deletePendingTransaction(blockId, 'a1' as ActionId);
+			expect(await collect(storage.listPendingTransactions(blockId))).to.deep.equal([]);
+		});
+
 		it('listPendingTransactions tolerates awaits interleaved between yields (drain-before-yield)', async () => {
 			const blockId = 'drain-pend' as BlockId;
 			await storage.savePendingTransaction(blockId, 'a1' as ActionId, { delete: true });

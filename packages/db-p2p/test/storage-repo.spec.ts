@@ -1960,6 +1960,36 @@ describe('StorageRepo', () => {
 				expect(got[OK]?.state?.latest?.rev).to.equal(1);
 			});
 
+			it('a cleanup that itself fails must not replace the error the caller reports', async () => {
+				// `ClusterMember.isMissingPendingActionError` pattern-matches this throw's message to
+				// route the action to reconcile. If the cleanup's own failure escaped, consensus would
+				// see an opaque fault instead and propagate it — turning a healable divergence into a
+				// stream reset. So per-block cleanup failures are logged and swallowed.
+				const breaking = new (class extends MemoryRawStorage {
+					override async deletePendingTransaction(): Promise<void> {
+						throw new Error('injected cleanup fault');
+					}
+				})();
+				const breakingRepo = new StorageRepo((blockId) => new BlockStorage(blockId, breaking));
+
+				// Pend on OK only, then commit a batch naming BLOCK too — BLOCK has no pend, so the
+				// pre-loop divergence throw fires and cleanup runs over the batch.
+				await breakingRepo.pend({
+					actionId: 'a-mixed' as ActionId,
+					transforms: makeInsertTransforms(OK, makeBlock(OK, { items: [] })),
+					policy: 'c'
+				});
+
+				let thrown: Error | undefined;
+				try {
+					await breakingRepo.commit({ actionId: 'a-mixed' as ActionId, blockIds: [OK, BLOCK], tailId: OK, rev: 2 });
+				} catch (err) {
+					thrown = err as Error;
+				}
+				expect(thrown?.message ?? '', 'the divergence signal survives a failed cleanup').to.include('Pending action');
+				expect(thrown?.message ?? '').to.not.include('injected cleanup fault');
+			});
+
 			it('an idempotent-retry block is not in the batch, so cleanup cannot touch it', async () => {
 				// OK is committed on its own first, so the mixed commit partitions it as alreadyDone —
 				// never in `toCommit`, hence never a cleanup target. It must keep its committed state

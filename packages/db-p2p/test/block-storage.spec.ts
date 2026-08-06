@@ -440,6 +440,21 @@ describe('BlockStorage meta.ranges honesty', () => {
 			expect(await storage.getPendingTransaction(actionId), 'pending twin removed').to.equal(undefined);
 		});
 
+		it('leaves an unrelated action’s pending alone on the write path', async () => {
+			// The deletion is scoped to the landing revision's action id, NOT a per-block clear: a
+			// genuinely in-flight pend for a different action must survive a replica landing beneath
+			// it. Guards the tripwire at the deletion site against being widened into a blind sweep.
+			const blockId = 'block-invariant-p-scoped' as BlockId;
+			const storage = new BlockStorage(blockId, raw);
+
+			await storage.savePendingTransaction('a-inflight' as ActionId, { updates: [['items', 0, 0, ['x']]] });
+			await storage.saveReplica(makeBlock('block-invariant-p-scoped', { items: [] }), { rev: 2, actionId: 'a-land' as ActionId });
+
+			expect((await storage.getLatest())?.rev, 'the replica landed').to.equal(2);
+			expect(await storage.getPendingTransaction('a-inflight' as ActionId),
+				'a different action’s pend is still in flight').to.not.equal(undefined);
+		});
+
 		it('the monotonic no-op deletes nothing (it wrote nothing)', async () => {
 			// The guard returns before any committed record is written, so it owes no deletion — the
 			// earlier call that wrote the revision is the one that owed it. A pending at a LOWER rev

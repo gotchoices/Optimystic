@@ -424,6 +424,13 @@ saveMaterializedBlock(block): store(structuredClone(block));
   mid-commit fault (`success:false` with a bare `reason`, no `missing`) is propagated so
   `handleConsensus` rolls back the executed marker and rethrows — same as an unexpected
   *thrown* fault (`applyConsensusOperation`).
+  **`StorageRepo.commit` makes the identical split one layer down, to decide what happens to
+  the pending records the pend left behind.** A *behind* divergence (missing pend, or a
+  `missing-base-revision` refusal) is followed by a reconcile that advances every block in the
+  batch past the action, so nothing left pending could ever be promoted — commit drops the whole
+  batch's records before reporting. A genuine fault is retried, and the retry replays those
+  records, so they are kept. The two layers must agree: if the cluster ever stopped retrying
+  propagated commit faults, the keep arm would become dead weight.
 - **A *behind* member actively reconciles.** It holds no usable revision of the committed
   blocks, so it pulls the committed revision from the cohort (via the injected
   `reconcileBlock` callback — `SyncClient` fetch + `saveReplicatedBlock` in
@@ -764,7 +771,7 @@ Tracks whether the local node's responsibility for blocks has changed after topo
 
 Proactively pushes tracked blocks to expansion targets on peer departure. Only "middle" peers (FRET `neighborDistance` rank < d) spread, bounding fan-out to 2d across the cluster. Uses `BlockTransferClient.pushBlocks()` with reason `'replication'`, carrying the source block's `state.latest` as `blockMeta` so the replica's revision mirrors the source.
 
-On the receiver, `BlockTransferService.handlePush` persists each pushed block into **local** storage via `IBlockReplicaStore.saveReplicatedBlock()` → `BlockStorage.saveReplica()`, which seeds metadata, advances `latest` monotonically (never downgrades on a stale push), and makes the block durably servable. A block is reported `accepted` only when it was both parseable and persisted; a parse/validation/persist failure surfaces it in `missing`. The sender only records a target as `succeeded` when the response does not list the block in `missing`, so a non-throwing round-trip that failed to persist is correctly counted as a failed push.
+On the receiver, `BlockTransferService.handlePush` persists each pushed block into **local** storage via `IBlockReplicaStore.saveReplicatedBlock()` → `BlockStorage.saveReplica()`, which seeds metadata, advances `latest` monotonically (never downgrades on a stale push), deletes any pending record this node still holds for the landing revision's action id (Invariant P — see [repository.md](repository.md#invariant-p--a-pending-record-and-a-committed-record-never-coexist-for-one-action)), and makes the block durably servable. The monotonic no-op path deletes nothing: it wrote no committed record, so it owes no deletion. A block is reported `accepted` only when it was both parseable and persisted; a parse/validation/persist failure surfaces it in `missing`. The sender only records a target as `succeeded` when the response does not list the block in `missing`, so a non-throwing round-trip that failed to persist is correctly counted as a failed push.
 
 **Dynamic d**: Under rapid churn (3+ departures in sliding window) or low cluster health (FRET estimate/clusterSize < threshold), `effectiveD` scales up, capped at `clusterSize / 2`.
 

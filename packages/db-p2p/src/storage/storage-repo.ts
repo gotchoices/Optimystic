@@ -514,9 +514,14 @@ export class StorageRepo implements IRepo, IBlockChangeNotifier, IBlockReplicaSt
 	 *   `ClusterMember` propagates it and the commit is retried, and a retry can still replay the
 	 *   pendings, so they are KEPT.
 	 *
-	 * The stale/`missedCommits` early return deliberately keeps pendings too: the client path issues an
-	 * explicit `cancel`, and on the consensus path the block advances by replication, where
-	 * `BlockStorage.saveForwardRevision` removes the record (Invariant P).
+	 * The stale/`missedCommits` early return (this node is AHEAD — it already holds a revision at or
+	 * past `request.rev`, committed under a different action) deliberately keeps pendings too, and its
+	 * cure is the losing client's `cancel`: `CoordinatorRepo.cancel` runs through consensus, so every
+	 * member drops the record, not just the coordinator. Replication cannot be the cure here — this
+	 * node is already ahead, and a later forward write carries a DIFFERENT action id, which is not
+	 * what `BlockStorage.saveForwardRevision` deletes. A client that dies between the stale result and
+	 * its `cancel` therefore still strands the record; that is pre-existing and orthogonal to the
+	 * divergence split above.
 	 */
 	async commit(request: CommitRequest, _options?: MessageOptions): Promise<CommitResult> {
 		log('commit actionId=%s rev=%d blockIds=%d', request.actionId, request.rev, request.blockIds.length);
@@ -912,9 +917,13 @@ export class StorageRepo implements IRepo, IBlockChangeNotifier, IBlockReplicaSt
 	 * BlockStorage reports every one of these as a bare `Error`, so they cannot be told apart here,
 	 * and treating them as divergence is the safe default: this node genuinely cannot materialize the
 	 * base right now, and the cluster's policy is to heal rather than throw out of consensus. The
-	 * price is that a transient fault ALSO drops the pending (see {@link refuseMissingBase}), so the
-	 * block converges by replication instead of by a replay the retry could have done. Narrowing this
-	 * would require typed faults out of BlockStorage; until then, prefer the tolerant reading.
+	 * price is that a transient fault ALSO drops pending records — this block's (see
+	 * {@link refuseMissingBase}) AND, because {@link commit} keys its cleanup off the same error type,
+	 * every not-yet-reached block in the same batch — so those blocks converge by replication instead
+	 * of by a replay the retry could have done. That is a wider blast radius than the per-block
+	 * refusal alone, and it is why the discriminator must NOT be loosened beyond this error type.
+	 * Narrowing this would require typed faults out of BlockStorage; until then, prefer the tolerant
+	 * reading.
 	 */
 	private async readCommitBase(
 		blockId: BlockId,
