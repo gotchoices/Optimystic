@@ -71,7 +71,8 @@ yarn optimystic-peer interactive \
   --ws-port 9091 \
   --relay \
   --no-tcp \
-  --network optimystic
+  --network optimystic \
+  --announce-addr /dns4/bootstrap.example.com/tcp/443/wss
 ```
 
 You'll see a multiaddr like `/ip4/0.0.0.0/tcp/9091/ws/p2p/<PEER_ID>`. Browsers usually need WSS (TLS-terminated WebSocket) — terminate TLS in front of the peer with a reverse proxy. Caddy makes this a one-liner:
@@ -82,7 +83,7 @@ bootstrap.example.com {
 }
 ```
 
-(nginx works too; the only requirement is that it forwards the `Upgrade: websocket` request to the peer.) Clients then dial:
+(nginx works too; the only requirement is that it forwards the `Upgrade: websocket` request to the peer.) `--announce-addr` tells the peer to advertise the public `wss` address instead of the bound `0.0.0.0:9091` one — without it, the peer's own identify/relay-reservation info still points at the unreachable bind address, even though the recipe above works around it manually. Clients then dial:
 
 ```
 /dns4/bootstrap.example.com/tcp/443/wss/p2p/<PEER_ID>
@@ -90,8 +91,9 @@ bootstrap.example.com {
 
 Notes:
 - `--relay` is what lets two browser peers (each unable to accept inbound connections) talk to each other through this node.
-- Drop `--no-tcp` if you want a single bootstrap that serves both Node-side TCP peers and browser/RN WebSocket peers.
-- You can combine `--ws-port` with `--port` — `node.getMultiaddrs()` (the "📡 Listening on:" startup line) prints all listen addresses.
+- Drop `--no-tcp` if you want a single bootstrap that serves both Node-side TCP peers and browser/RN WebSocket peers. In that case use `--append-announce-addr` instead of `--announce-addr` to advertise the public `wss` address *in addition to* the bound TCP one, rather than replacing it.
+- `--announce-addr` / `--append-announce-addr` are repeatable for multiple public addresses.
+- You can combine `--ws-port` with `--port` — `node.getMultiaddrs()` (the "📡 Listening on:" startup line) prints all listen addresses (bound, not announced).
 
 ---
 
@@ -200,6 +202,8 @@ Options:
   So a small mesh transacts unconfigured, but needs one of the two flags to *self-repair*. Setting `--assumed-cluster-size` does not lower the replication factor. Accepted by `interactive`, `service`, and `run`.
 - `--super-majority-threshold <number>`: Super-majority threshold as a fraction in (0, 1]. Overrides the `libp2p-node-base` default (0.75, the shared `DEFAULT_SUPER_MAJORITY_THRESHOLD`). Pair with small `--cluster-size` values: `Math.ceil(3 * 0.75) = 3` demands unanimity on a 3-peer cluster, so a 3-peer mesh typically wants `--super-majority-threshold 0.51` (rounds to 2-of-3) to leave one peer of slack. Must match peers in the same network — coordinator-side approvals are counted against this value on every cluster member. Accepted by `interactive`, `service`, and `run`.
 - `--announce-file <path>`: Write node info (peerId, multiaddrs) to this JSON file for mesh launchers
+- `--announce-addr <multiaddr>`: Multiaddr to advertise INSTEAD OF the listen addrs — for a node behind a NAT/reverse proxy/TLS front that binds one address but is reachable at another (e.g. `/dns4/bootstrap.example.com/tcp/443/wss`). Repeatable; when set, replaces the advertised set entirely
+- `--append-announce-addr <multiaddr>`: Multiaddr to advertise IN ADDITION TO the listen addrs. Repeatable; ignored while `--announce-addr` is set
 - `--offline`: Use local transactor instead of network transactor (no distributed consensus)
 
 Once started, you’ll see a prompt:

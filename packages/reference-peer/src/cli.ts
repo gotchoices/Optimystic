@@ -213,6 +213,8 @@ class PeerSession {
 		assumedClusterSize?: string;
 		superMajorityThreshold?: string;
 		announceFile?: string;
+		announceAddr?: string[];
+		appendAnnounceAddr?: string[];
 		offline?: boolean;
 	}): Promise<void> {
 		if (this.session?.isConnected) {
@@ -385,6 +387,8 @@ class PeerSession {
 			relayServerInit: effectiveRelay
 				? { reservations: { applyDefaultLimit: false } }
 				: undefined,
+			announceAddrs: options.announceAddr,
+			appendAnnounceAddrs: options.appendAnnounceAddr,
 			networkName: options.network || 'optimystic',
 			fretProfile: options.fretProfile,
 			storage: createStorage,
@@ -768,7 +772,9 @@ function withCommonPeerOptions(cmd: Command): Command {
 		.option('--super-majority-threshold <number>', 'Super-majority threshold as a fraction in (0, 1] (default 0.75)')
 		.option('--offline', 'Run as single-node LocalTransactor (no distributed consensus)')
 		.option('--bootstrap-file <path>', 'Path to JSON containing bootstrap multiaddrs or node list')
-		.option('--announce-file <path>', 'Write node info (peerId, multiaddrs) to this JSON file for mesh launchers');
+		.option('--announce-file <path>', 'Write node info (peerId, multiaddrs) to this JSON file for mesh launchers')
+		.option('--announce-addr <multiaddr>', 'Multiaddr to advertise INSTEAD OF the listen addrs (e.g. behind a TLS proxy: /dns4/host/tcp/443/wss). Repeatable; replaces the advertised set entirely', (val: string, prev: string[]) => prev.concat([val]), [] as string[])
+		.option('--append-announce-addr <multiaddr>', 'Multiaddr to advertise IN ADDITION TO the listen addrs. Repeatable; ignored while --announce-addr is set', (val: string, prev: string[]) => prev.concat([val]), [] as string[]);
 }
 
 // Interactive mode - network-first approach
