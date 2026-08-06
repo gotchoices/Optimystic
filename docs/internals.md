@@ -856,19 +856,22 @@ path in `applyConsensusOperation` tolerates it as a no-op).
 **Bug**: Latches are per-node, not distributed. Concurrent transactions on same block can deadlock.
 **Symptom**: Test hangs indefinitely during concurrent writes.
 
-### 6. Importing a Package's Own Root Barrel from Inside It
-**Bug**: A module under `src/` imports the package's own `src/index.ts`. That barrel re-exports
-every module under `src/`, so the module depends on a file that depends on the module — Node
-evaluates the whole group as a cycle, and whichever module is entered first decides which parts
-of the cycle are still half-built when the rest runs.
+### 6. Importing a Barrel That Re-exports You
+**Bug**: A module imports, at runtime, an `index.ts` barrel sitting at or above it — the package
+root barrel (`src/index.ts`) or its own subtree's (`src/log/index.ts` from `src/log/log.ts`).
+Barrels here re-export their whole directory, so the module depends on a file that depends on the
+module — Node evaluates the whole group as a cycle, and whichever module is entered first decides
+which parts of the cycle are still half-built when the rest runs. The root barrel is the worst
+case (every module under `src/` lands in one cycle); a subtree barrel is the same defect at
+smaller radius. A *sibling* subtree's barrel (`src/blocks/index.js` from `src/btree/`) is fine —
+it does not re-export the importer.
 **Symptom**: `ReferenceError: Cannot access 'X' before initialization`, pointing at a
 module-scope value in an apparently unrelated file, reproducing only under some entry orders
-(classically: a single spec run standalone passes as part of the whole suite).
-**Fix**: Import directly from the module (or nearest sub-area barrel) that defines the symbol.
-Clause-level `import type` / `export type` is exempt — under `verbatimModuleSyntax` it is erased
-whole and creates no runtime edge. An *inline* `import { type X }` is not exempt; it still emits
-`import {} from '...'`.
-**Enforced by**: `packages/db-core/test/root-barrel-import-cycle.spec.ts`.
+(classically: a spec that passes in the whole suite and dies when run standalone).
+**Fix**: Import directly from the module that defines the symbol. Clause-level `import type` /
+`export type` is exempt — under `verbatimModuleSyntax` it is erased whole and creates no runtime
+edge. An *inline* `import { type X }` is not exempt; it still emits `import {} from '...'`.
+**Enforced by**: `packages/db-core/test/barrel-import-cycle.spec.ts`.
 NOTE: that guard only scans `db-core`. The other packages were swept and are clean as of this
 writing; if one of them ever grows the pattern, lift the spec into a shared, per-package check
 rather than copying it.

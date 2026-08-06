@@ -1,4 +1,5 @@
-import { Path, PathBranch, type ITreeTrunk, type KeyRange, type getTrunkFunc } from "./index.js";
+import { Path, PathBranch } from "./path.js";
+import type { ITreeTrunk, KeyRange, getTrunkFunc } from "./index.js";
 import type { BlockId, BlockStore } from "../blocks/index.js";
 import { apply, get } from "../blocks/index.js";
 import { TreeLeafBlockType, TreeBranchBlockType, entries$, nodes$, partitions$ } from "./nodes.js";

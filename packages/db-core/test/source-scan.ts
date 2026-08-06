@@ -1,7 +1,7 @@
 import { readdir } from 'node:fs/promises';
 import { join } from 'node:path';
 
-/** Shared by the source-scanning guard specs (`no-fret-import`, `root-barrel-import-cycle`). */
+/** Shared by the source-scanning guard specs (`no-fret-import`, `barrel-import-cycle`). */
 
 /** Every `.ts` file under `dir`, recursively. */
 export async function tsFiles(dir: string): Promise<string[]> {

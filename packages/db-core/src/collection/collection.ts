@@ -7,7 +7,7 @@ import { copyTransforms, isTransformsEmpty } from "../transform/helpers.js";
 import { TransactorSource } from "../transactor/transactor-source.js";
 import { BlockUnavailableError } from "../network/struct.js";
 import type { CollectionHeaderBlock, CollectionId, ICollection, SyncOptions } from "./index.js";
-import { CollectionHeaderVanishedError, SyncRetryExhaustedError } from "./index.js";
+import { CollectionHeaderVanishedError, SyncRetryExhaustedError } from "./struct.js";
 import type { ActionContext } from "./action.js";
 import type { ReadDependency } from "../transaction/transaction.js";
 import { clampPriority } from "../transaction/transaction.js";

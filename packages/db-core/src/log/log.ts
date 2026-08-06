@@ -4,7 +4,7 @@ import { nameof } from "../utility/nameof.js";
 import type { IBlock, BlockId, ActionId, CollectionId, ChainPath, ActionRev, ActionContext, ChainInitOptions, BlockStore, ReadDependency } from "../index.js";
 import type { ChainDataNode } from '../chain/chain-nodes.js';
 import type { LogEntry, ActionEntry, DisputeResolutionProof, InvalidationEntry, RevertedBlock } from "./index.js";
-import { LogDataBlockType, LogHeaderBlockType } from "./index.js";
+import { LogDataBlockType, LogHeaderBlockType } from "./struct.js";
 import { toString as uint8ArrayToString } from 'uint8arrays/to-string'
 import type { GetFromResult } from './struct.js';
 

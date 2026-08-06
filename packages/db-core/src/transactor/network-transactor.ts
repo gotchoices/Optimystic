@@ -646,7 +646,6 @@ export class NetworkTransactor implements ITransactor, IBlockChangeNotifier {
 	async commit(request: CommitRequest): Promise<CommitResult> {
 		const t0 = Date.now();
 		log('commit actionId=%s rev=%d blockIds=%d', request.actionId, request.rev, request.blockIds.length);
-		const allBlockIds = [...new Set([...request.blockIds, request.tailId])];
 
 		// Commit the header block if provided and not already in blockIds.
 		// `request.tailId` is threaded into every per-block commit so the coordinator carries it into the
@@ -654,14 +653,14 @@ export class NetworkTransactor implements ITransactor, IBlockChangeNotifier {
 		// CollectionChangeEvent (the reactivity topic anchor). Without this the per-block RepoCommitRequest
 		// drops the collection tail and reactivity origination is gated off (undefined tail → non-member).
 		if (request.headerId && !request.blockIds.includes(request.headerId)) {
-			const headerResult = await this.commitBlock(request.headerId, allBlockIds, request.actionId, request.rev, request.tailId);
+			const headerResult = await this.commitBlock(request.headerId, request.actionId, request.rev, request.tailId);
 			if (!headerResult.success) {
 				return headerResult;
 			}
 		}
 
 		// Commit the tail block
-		const tailResult = await this.commitBlock(request.tailId, allBlockIds, request.actionId, request.rev, request.tailId);
+		const tailResult = await this.commitBlock(request.tailId, request.actionId, request.rev, request.tailId);
 		if (!tailResult.success) {
 			return tailResult;
 		}
@@ -684,7 +683,7 @@ export class NetworkTransactor implements ITransactor, IBlockChangeNotifier {
 		return { success: true };
 	}
 
-	private async commitBlock(blockId: BlockId, blockIds: BlockId[], actionId: ActionId, rev: number, tailId?: BlockId): Promise<CommitResult> {
+	private async commitBlock(blockId: BlockId, actionId: ActionId, rev: number, tailId?: BlockId): Promise<CommitResult> {
 		const { batches: tailBatches, error: tailError } = await this.commitBlocks({ blockIds: [blockId], actionId, rev, tailId });
 		if (tailError) {
 			// commit is a pure attempt: stale → { success:false }, transient → throw. Cancellation
