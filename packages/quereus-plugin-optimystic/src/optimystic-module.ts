@@ -1672,10 +1672,21 @@ export class OptimysticVirtualTable extends VirtualTable {
             // staged-this-tx + committed state, giving the correct old image even
             // for chained updates within a single transaction. Must precede any
             // collection.stage() call, which would clear or overwrite the old slot.
-            // Fallback to oldKeyValues (PK-only; index key may be wrong) if the
-            // row is unexpectedly absent — should not happen in valid DML.
+            // A miss means the engine and the collection disagree about what
+            // exists — fabricating an old image from oldKeyValues (the compact
+            // key tuple, not a full row) would feed indexManager.updateIndexEntries
+            // wrong-shape data and corrupt index entries silently. Throw instead;
+            // see test/oldkeyvalues-compact-shape.spec.ts "missing pre-write row".
             const oldEntry = await this.collection.get(oldKey) as [string, EncodedRow] | undefined;
-            const oldRow: Row = oldEntry ? this.rowCodec.decodeRow(oldEntry[1]) : (oldKeyValues as Row);
+            if (!oldEntry) {
+              throw new QuereusError(
+                `UPDATE could not find the pre-write row at key ${oldKey} for table ` +
+                `${this.tableSchema.name} — the engine and the collection disagree about ` +
+                `what exists.`,
+                StatusCode.ERROR,
+              );
+            }
+            const oldRow: Row = this.rowCodec.decodeRow(oldEntry[1]);
 
             // Decide the PK move FIRST when the key changes: its outcome is an
             // input to the secondary-UNIQUE probe below. A REPLACE removes the row
@@ -1767,10 +1778,22 @@ export class OptimysticVirtualTable extends VirtualTable {
             const deleteKey = this.rowCodec.createPrimaryKey(oldKeyValues as SqlValue[]);
 
             // Fetch the actual old row before staging. Staging clears the slot,
-            // so a fetch-after would return nothing. Fallback to oldKeyValues
-            // (PK-only; index key may be wrong) if unexpectedly absent.
+            // so a fetch-after would return nothing. A miss means the engine and
+            // the collection disagree about what exists — fabricating an old
+            // image from oldKeyValues (the compact key tuple, not a full row)
+            // would feed indexManager.deleteIndexEntries wrong-shape data and
+            // corrupt index entries silently. Throw instead; see
+            // test/oldkeyvalues-compact-shape.spec.ts "missing pre-write row".
             const delEntry = await this.collection.get(deleteKey) as [string, EncodedRow] | undefined;
-            const oldRow: Row = delEntry ? this.rowCodec.decodeRow(delEntry[1]) : (oldKeyValues as Row);
+            if (!delEntry) {
+              throw new QuereusError(
+                `DELETE could not find the pre-write row at key ${deleteKey} for table ` +
+                `${this.tableSchema.name} — the engine and the collection disagree about ` +
+                `what exists.`,
+                StatusCode.ERROR,
+              );
+            }
+            const oldRow: Row = this.rowCodec.decodeRow(delEntry[1]);
 
             // Snapshot before staging so a rollback reverts exactly this delete.
             this.markDirtyTrees();

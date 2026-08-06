@@ -26,13 +26,49 @@
 
 import { expect } from 'chai';
 import { Database } from '@quereus/quereus';
-import type { SqlValue } from '@quereus/quereus';
+import type { SqlValue, Row } from '@quereus/quereus';
 import { FileRawStorage } from '@optimystic/db-p2p-storage-fs';
 import register from '../dist/plugin.js';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import * as fs from 'node:fs/promises';
 import { randomUUID } from 'node:crypto';
+
+type Plugin = ReturnType<typeof register>;
+
+/** Minimal surface needed to drive a table's write path by hand, bypassing the
+ * SQL engine's own transaction orchestration (which begins a connection's
+ * transaction before ever calling `update`). */
+interface HandDrivenTable {
+	ensureConnectionRegistered(): Promise<{ begin(): Promise<void>; commit(): Promise<void> }>;
+	update(args: {
+		operation: 'update' | 'delete';
+		values: Row | undefined;
+		oldKeyValues?: Row;
+	}): Promise<unknown>;
+}
+
+interface ConnectableModule {
+	connect(
+		db: Database,
+		pAux: unknown,
+		moduleName: string,
+		schemaName: string,
+		tableName: string,
+		options: Record<string, unknown>,
+	): Promise<HandDrivenTable>;
+}
+
+function moduleOf(plugin: Plugin): ConnectableModule {
+	return plugin.vtables[0]!.module as unknown as ConnectableModule;
+}
+
+/** Open a live (non-committed) connect on the plugin's module by hand — this
+ * resolves to the SAME cached table instance the SQL engine itself writes
+ * through, so a hand-driven `update()` call shares the real collection. */
+async function connectTable(db: Database, plugin: Plugin, tableName: string): Promise<HandDrivenTable> {
+	return moduleOf(plugin).connect(db, null, 'optimystic', 'main', tableName, {});
+}
 
 function createDb(dir: string): { db: Database; plugin: ReturnType<typeof register> } {
 	const db = new Database();
@@ -206,5 +242,82 @@ describe('UpdateArgs.oldKeyValues compact-tuple shape (local/bootstrap transacto
 		}
 
 		expect(await reopenScalar(dir, 'select payload from S where id = 7')).to.equal('q');
+	});
+
+	it('UPDATE throws (rather than fabricating an old row image) when the pre-write row is missing', async () => {
+		const uri = 'tree://oldkeyshape/update-missing';
+		const { db, plugin } = createDb(dir);
+		try {
+			await db.exec(
+				`create table Missing (
+					a text,
+					filler text,
+					b text,
+					primary key (a, b)
+				) using optimystic('${uri}')`,
+			);
+			await db.exec(`insert into Missing (a, filler, b) values ('x', 'f', 'y')`);
+			await db.exec(`delete from Missing where a = 'x' and b = 'y'`);
+
+			// The row is gone from the collection. Drive `update()` by hand with
+			// the same (now-stale) compact key tuple a caller who still believed
+			// the row existed would pass — simulating the engine and the
+			// collection disagreeing about what exists (see ticket
+			// bug-same-key-update-reports-unique-collision-with-itself, arm 1).
+			const table = await connectTable(db, plugin, 'Missing');
+			const conn = await table.ensureConnectionRegistered();
+			await conn.begin();
+			try {
+				await table.update({
+					operation: 'update',
+					values: ['x', 'f2', 'y'],
+					oldKeyValues: ['x', 'y'],
+				});
+				expect.fail('Should have thrown for a missing pre-write row');
+			} catch (err) {
+				expect((err as Error).message).to.match(/could not find the pre-write row/i);
+			} finally {
+				await conn.commit();
+			}
+		} finally {
+			db.close();
+		}
+	});
+
+	it('DELETE throws (rather than fabricating an old row image) when the pre-write row is missing', async () => {
+		const uri = 'tree://oldkeyshape/delete-missing';
+		const { db, plugin } = createDb(dir);
+		try {
+			await db.exec(
+				`create table Missing (
+					a text,
+					filler text,
+					b text,
+					primary key (a, b)
+				) using optimystic('${uri}')`,
+			);
+			await db.exec(`insert into Missing (a, filler, b) values ('x', 'f', 'y')`);
+			await db.exec(`delete from Missing where a = 'x' and b = 'y'`);
+
+			// Same row already gone; a second, stale DELETE for the same key must
+			// throw rather than silently reporting success (arm 1 of the ticket).
+			const table = await connectTable(db, plugin, 'Missing');
+			const conn = await table.ensureConnectionRegistered();
+			await conn.begin();
+			try {
+				await table.update({
+					operation: 'delete',
+					values: undefined,
+					oldKeyValues: ['x', 'y'],
+				});
+				expect.fail('Should have thrown for a missing pre-write row');
+			} catch (err) {
+				expect((err as Error).message).to.match(/could not find the pre-write row/i);
+			} finally {
+				await conn.commit();
+			}
+		} finally {
+			db.close();
+		}
 	});
 });

@@ -86,6 +86,19 @@ export class RowCodec {
 	 * Extract primary key value from a row
 	 */
 	extractPrimaryKey(row: Row): PrimaryKeyValue {
+		// Guard against the compact key tuple (UpdateArgs.oldKeyValues — one cell per
+		// primary-key column) being passed here instead of a full row: with no length
+		// check, row[pkCol.index] reads past the tuple's end for any PK column not
+		// among its leading positions and silently produces a wrong key. A full row is
+		// always exactly schema.columns.length long (decodeRow's output, or the
+		// engine's `values`), so this can never reject a legitimate caller.
+		if (row.length !== this.schema.columns.length) {
+			throw new Error(
+				`extractPrimaryKey requires a full row of ${this.schema.columns.length} columns, got ${row.length} — ` +
+				`did you pass a compact key tuple (one cell per primary-key column) instead? Use createPrimaryKey for that.`
+			);
+		}
+
 		// Frame every part (including single-column keys) through the shared, injective
 		// tuple encoding so a value containing the old raw `\x00` separator — or equal to
 		// the old NULL sentinel — can never shift boundaries or collide. See key-encoding.
