@@ -40,7 +40,11 @@ type Plugin = ReturnType<typeof register>;
  * SQL engine's own transaction orchestration (which begins a connection's
  * transaction before ever calling `update`). */
 interface HandDrivenTable {
-	ensureConnectionRegistered(): Promise<{ begin(): Promise<void>; commit(): Promise<void> }>;
+	ensureConnectionRegistered(): Promise<{
+		begin(): Promise<void>;
+		commit(): Promise<void>;
+		rollback(): Promise<void>;
+	}>;
 	update(args: {
 		operation: 'update' | 'delete';
 		values: Row | undefined;
@@ -98,6 +102,62 @@ async function selectScalar(db: Database, sql: string): Promise<SqlValue> {
 
 async function selectCount(db: Database, sql: string): Promise<number> {
 	return Number(await selectScalar(db, sql));
+}
+
+/**
+ * Drive one hand-written `update()` against a table whose only row has already
+ * been deleted, and assert it throws rather than fabricating a pre-write image.
+ *
+ * Going around `db.exec()` means replicating the transaction lifecycle the engine
+ * would otherwise run (begin before the write, rollback on a failed DML) — the
+ * engine never commits a transaction whose DML threw, so neither does this.
+ */
+async function expectMissingPreWriteRowThrow(
+	dir: string,
+	uri: string,
+	args: { operation: 'update' | 'delete'; values: Row | undefined; oldKeyValues: Row },
+): Promise<void> {
+	const { db, plugin } = createDb(dir);
+	try {
+		await db.exec(
+			`create table Missing (
+				a text,
+				filler text,
+				b text,
+				primary key (a, b)
+			) using optimystic('${uri}')`,
+		);
+		await db.exec(`insert into Missing (a, filler, b) values ('x', 'f', 'y')`);
+		await db.exec(`delete from Missing where a = 'x' and b = 'y'`);
+
+		// The row is gone from the collection. Drive `update()` by hand with the
+		// same (now-stale) compact key tuple a caller who still believed the row
+		// existed would pass — simulating the engine and the collection
+		// disagreeing about what exists (see ticket
+		// bug-same-key-update-reports-unique-collision-with-itself, arm 1).
+		const table = await connectTable(db, plugin, 'Missing');
+		const conn = await table.ensureConnectionRegistered();
+		await conn.begin();
+		let thrown: unknown;
+		try {
+			await table.update(args);
+		} catch (err) {
+			thrown = err;
+		} finally {
+			await conn.rollback();
+		}
+
+		expect(thrown, 'update() should have thrown for a missing pre-write row').to.be.an('Error');
+		expect((thrown as Error).message).to.match(/could not find the pre-write row/i);
+		// The logical key values, not the control-character-framed encoded key.
+		expect((thrown as Error).message).to.include(`("x", "y")`);
+
+		// The rejected write must leave nothing behind — no resurrected row, and
+		// no half-written state that a later read could trip over.
+		expect(await selectCount(db, 'select count(*) as c from Missing')).to.equal(0);
+	} finally {
+		db.close();
+	}
 }
 
 async function reopenScalar(dir: string, sql: string): Promise<SqlValue> {
@@ -245,79 +305,18 @@ describe('UpdateArgs.oldKeyValues compact-tuple shape (local/bootstrap transacto
 	});
 
 	it('UPDATE throws (rather than fabricating an old row image) when the pre-write row is missing', async () => {
-		const uri = 'tree://oldkeyshape/update-missing';
-		const { db, plugin } = createDb(dir);
-		try {
-			await db.exec(
-				`create table Missing (
-					a text,
-					filler text,
-					b text,
-					primary key (a, b)
-				) using optimystic('${uri}')`,
-			);
-			await db.exec(`insert into Missing (a, filler, b) values ('x', 'f', 'y')`);
-			await db.exec(`delete from Missing where a = 'x' and b = 'y'`);
-
-			// The row is gone from the collection. Drive `update()` by hand with
-			// the same (now-stale) compact key tuple a caller who still believed
-			// the row existed would pass — simulating the engine and the
-			// collection disagreeing about what exists (see ticket
-			// bug-same-key-update-reports-unique-collision-with-itself, arm 1).
-			const table = await connectTable(db, plugin, 'Missing');
-			const conn = await table.ensureConnectionRegistered();
-			await conn.begin();
-			try {
-				await table.update({
-					operation: 'update',
-					values: ['x', 'f2', 'y'],
-					oldKeyValues: ['x', 'y'],
-				});
-				expect.fail('Should have thrown for a missing pre-write row');
-			} catch (err) {
-				expect((err as Error).message).to.match(/could not find the pre-write row/i);
-			} finally {
-				await conn.commit();
-			}
-		} finally {
-			db.close();
-		}
+		await expectMissingPreWriteRowThrow(dir, 'tree://oldkeyshape/update-missing', {
+			operation: 'update',
+			values: ['x', 'f2', 'y'],
+			oldKeyValues: ['x', 'y'],
+		});
 	});
 
 	it('DELETE throws (rather than fabricating an old row image) when the pre-write row is missing', async () => {
-		const uri = 'tree://oldkeyshape/delete-missing';
-		const { db, plugin } = createDb(dir);
-		try {
-			await db.exec(
-				`create table Missing (
-					a text,
-					filler text,
-					b text,
-					primary key (a, b)
-				) using optimystic('${uri}')`,
-			);
-			await db.exec(`insert into Missing (a, filler, b) values ('x', 'f', 'y')`);
-			await db.exec(`delete from Missing where a = 'x' and b = 'y'`);
-
-			// Same row already gone; a second, stale DELETE for the same key must
-			// throw rather than silently reporting success (arm 1 of the ticket).
-			const table = await connectTable(db, plugin, 'Missing');
-			const conn = await table.ensureConnectionRegistered();
-			await conn.begin();
-			try {
-				await table.update({
-					operation: 'delete',
-					values: undefined,
-					oldKeyValues: ['x', 'y'],
-				});
-				expect.fail('Should have thrown for a missing pre-write row');
-			} catch (err) {
-				expect((err as Error).message).to.match(/could not find the pre-write row/i);
-			} finally {
-				await conn.commit();
-			}
-		} finally {
-			db.close();
-		}
+		await expectMissingPreWriteRowThrow(dir, 'tree://oldkeyshape/delete-missing', {
+			operation: 'delete',
+			values: undefined,
+			oldKeyValues: ['x', 'y'],
+		});
 	});
 });

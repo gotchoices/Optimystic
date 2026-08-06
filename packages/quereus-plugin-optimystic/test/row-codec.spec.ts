@@ -196,6 +196,46 @@ describe('RowCodec', () => {
 		});
 	});
 
+	/**
+	 * `extractPrimaryKey(row)` and `createPrimaryKey(values)` both take a plain
+	 * array, so handing either the other's argument type-checks. Feeding the
+	 * COMPACT key tuple (`UpdateArgs.oldKeyValues` — one cell per PK column) to
+	 * extractPrimaryKey is the mistake behind
+	 * `bug-same-key-update-reports-unique-collision-with-itself`: it addresses
+	 * `row[pkCol.index]`, which reads past the tuple's end for any PK column that
+	 * is not among the table's leading columns, silently yielding a key that
+	 * matches nothing. The length guard makes that a loud failure.
+	 */
+	describe('extractPrimaryKey() full-row guard', () => {
+		// PK on columns 0 and 2 — the shape where a compact tuple and a full row
+		// genuinely disagree (with a leading PK they would coincidentally match).
+		const nonLeadingPkSchema = () => makeSchema(
+			[{ name: 'a', affinity: 'TEXT' }, { name: 'filler', affinity: 'TEXT' }, { name: 'b', affinity: 'TEXT' }],
+			[0, 2]
+		);
+
+		it('should throw when handed a compact key tuple instead of a full row', () => {
+			const codec = new RowCodec(nonLeadingPkSchema());
+
+			expect(() => codec.extractPrimaryKey(['x', 'y'])).to.throw(/full row of 3 columns, got 2/);
+		});
+
+		it('should throw when handed an over-long row', () => {
+			const codec = new RowCodec(nonLeadingPkSchema());
+
+			expect(() => codec.extractPrimaryKey(['x', 'f', 'y', 'extra'])).to.throw(/got 4/);
+		});
+
+		it('should accept a full row and agree with createPrimaryKey on the same logical key', () => {
+			const codec = new RowCodec(nonLeadingPkSchema());
+
+			// Without the guard, extractPrimaryKey(['x','y']) would read index 2 as
+			// undefined -> null and produce a DIFFERENT key from this one — the exact
+			// silent divergence the guard now prevents.
+			expect(codec.extractPrimaryKey(['x', 'f', 'y'])).to.equal(codec.createPrimaryKey(['x', 'y']));
+		});
+	});
+
 	describe('primary key comparator', () => {
 		it('should compare single-column string keys', () => {
 			const schema = makeSchema([{ name: 'id', affinity: 'TEXT' }]);
