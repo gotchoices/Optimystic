@@ -105,6 +105,96 @@ describe('BlockStorage meta.ranges honesty', () => {
 		expect(meta!.ranges).to.deep.equal([[1, 2]]);
 	});
 
+	it('getBlock at a named rev on a pending-only block with NO restoreCallback reads absent, not a fault', async () => {
+		// A brand-new block between pend and commit holds a pending record and no committed
+		// revision. Asking for it at a named revision is what a writer reading back its own
+		// uncommitted insert does (ActionContext.rev is required). There is no committed base to
+		// reconstruct, so the honest answer is "absent" — it used to throw, and StorageRepo.get
+		// turned that throw into `unavailable: 'unmaterializable'`, telling the writer its own
+		// pending content was unreadable.
+		const blockId = 'block-no-restore' as BlockId;
+		const storage = new BlockStorage(blockId, raw);	// no restoreCallback wired
+		await storage.savePendingTransaction('pending' as ActionId, { insert: makeBlock('block-no-restore') });
+
+		expect(await storage.getBlock(1), 'named rev with no committed base ⇒ absent').to.equal(undefined);
+		expect(await storage.getBlock(), 'contextless read unchanged').to.equal(undefined);
+		expect((await raw.getMetadata(blockId))!.latest, 'still no committed revision').to.equal(undefined);
+	});
+
+	it('getBlock at a named rev on a pending-only block whose restore comes back empty reads absent', async () => {
+		// The restore IS attempted (see the 'restore not short-circuited' test above) — it simply
+		// cannot supply the revision. That failure means only "no committed base here", so it is
+		// swallowed into an absent answer rather than propagating as a fault.
+		const blockId = 'block-restore-empty' as BlockId;
+		const restoreCalls: number[] = [];
+		const restoreCallback: RestoreCallback = async (_id, rev) => {
+			restoreCalls.push(rev!);
+			return undefined;
+		};
+
+		const storage = new BlockStorage(blockId, raw, restoreCallback);
+		await storage.savePendingTransaction('pending' as ActionId, { insert: makeBlock('block-restore-empty') });
+
+		expect(await storage.getBlock(1), 'restore supplied nothing ⇒ absent').to.equal(undefined);
+		expect(restoreCalls, 'the restore was still attempted').to.deep.equal([1]);
+	});
+
+	it('a latest pointing at an unmaterializable revision STILL throws (genuine corruption)', async () => {
+		// The counterpart the change above must not erode: `latest` is set, so this node holds
+		// records claiming a committed revision it cannot reconstruct (truncated history). That is
+		// a fault, not an absence, and StorageRepo.get depends on the throw to flag the block
+		// `unavailable: 'unmaterializable'` instead of posing as an authoritative "never existed".
+		const blockId = 'block-wedged' as BlockId;
+		await raw.saveMetadata(blockId, { latest: { rev: 3, actionId: 'ghost' as ActionId }, ranges: [[3]] });
+		const storage = new BlockStorage(blockId, raw);
+
+		let contextlessError: unknown;
+		try {
+			await storage.getBlock();
+		} catch (err) {
+			contextlessError = err;
+		}
+		expect((contextlessError as Error)?.message, 'contextless read of a wedged block throws')
+			.to.contain('Failed to find materialized block');
+
+		let pinnedError: unknown;
+		try {
+			await storage.getBlock(3);
+		} catch (err) {
+			pinnedError = err;
+		}
+		expect((pinnedError as Error)?.message, 'pinned read of a wedged block throws too')
+			.to.contain('Failed to find materialized block');
+	});
+
+	it('a pending-only block whose restore supplies revisions but no materialization still throws', async () => {
+		// The narrow seam inside the new pending-only arm: only `ensureRevision`'s failure means
+		// "no committed base here". Once restore SUCCEEDS, revision records exist — and if nothing
+		// under them is materialized, that is genuine corruption and materializeBlock's throw must
+		// propagate rather than being flattened into an absent answer.
+		const blockId = 'block-restore-hollow' as BlockId;
+		const restoreCallback: RestoreCallback = async (id) => ({
+			blockId: id,
+			revisions: {
+				// Transform + revision entry, but NO `block` — nothing materialized anywhere below.
+				1: { action: { actionId: 'hollow-action' as ActionId, rev: 1, transform: { updates: [] } } }
+			},
+			range: [1, 2]
+		});
+
+		const storage = new BlockStorage(blockId, raw, restoreCallback);
+		await storage.savePendingTransaction('pending' as ActionId, { insert: makeBlock('block-restore-hollow') });
+
+		let error: unknown;
+		try {
+			await storage.getBlock(1);
+		} catch (err) {
+			error = err;
+		}
+		expect((error as Error)?.message, 'restored records with no materialization is a fault')
+			.to.contain('Failed to find materialized block');
+	});
+
 	it('commit opens coverage from the earliest committed rev', async () => {
 		const blockId = 'block-commit' as BlockId;
 		const repo = new StorageRepo((id) => new BlockStorage(id, raw));

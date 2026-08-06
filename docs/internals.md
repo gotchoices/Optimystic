@@ -501,9 +501,16 @@ saveMaterializedBlock(block): store(structuredClone(block));
   knows its own answer is a guess; an absent field means authoritative, so every producer that
   never sets it (including `TestTransactor`) keeps its existing meaning. Two producers set it:
   `StorageRepo.get` flags `'unmaterializable'` when the block reads as absent but this node holds
-  records proving it exists — the missing-base promotion refusal above, or a `getBlock()` throw
-  on truncated history / a failed restore (caught **per block**, so one broken block no longer
-  fails its whole batch); `CoordinatorRepo.get` flags `'peers-unreachable'` when a locally-missing
+  records proving it exists — the missing-base promotion refusal above, a `getBlock()` throw on a
+  `latest` this node cannot materialize (truncated history, or a failed restore of a revision whose
+  range it claims; caught **per block**, so one broken block no longer fails its whole batch), or a
+  pending overlay that materialized nothing over an absent committed base. A block with **no
+  committed revision at all** is deliberately NOT in that set: `getBlock` reports an absent base
+  rather than throwing (nothing is being *failed* to reconstruct), so a pending-only insert read
+  with a context is served from its pending overlay, and only an overlay that produces no block —
+  a pending *update* with nothing to apply itself to — is flagged. A pending *delete* over a real
+  committed base is likewise unflagged: an intended tombstone is an authoritative absent.
+  `CoordinatorRepo.get` flags `'peers-unreachable'` when a locally-missing
   block's cohort consult comes back **inconclusive**: it throws, a cohort peer stays silent, or a
   revision is corroborated that this node then fails to acquire. A consult where the whole cohort
   *answers* and corroborates nothing stays an authoritative absent — that is the healthy cohort's
@@ -539,8 +546,11 @@ saveMaterializedBlock(block): store(structuredClone(block));
   drives read-repair off it. Producers: `StorageRepo.get` populates it from the `actionRev` that
   `IBlockStorage.getBlock(rev)` already returns — on the plain committed read, and on the
   pending-overlay read as the revision of the *committed base* the pending was applied over (a
-  pending has no revision of its own; a pending-only insert with no base leaves it absent);
-  `TestTransactor` mirrors that. `CoordinatorRepo` and `NetworkTransactor` forward peer entries
+  pending has no revision of its own). A pending-only insert — a block pended but not yet committed,
+  read back by its own writer — genuinely has no committed base, so the field is **absent** on that
+  answer rather than fabricating a revision; `TransactorSource.tryGet`'s
+  `materializedRev ?? state.latest?.rev ?? 0` fallback then records revision `0`, the honest "no
+  committed revision observed". `TestTransactor` mirrors that. `CoordinatorRepo` and `NetworkTransactor` forward peer entries
   verbatim, and the repo protocol is plain JSON, so the field rides along untouched. The one
   consumer is `TransactorSource.tryGet`, which records `materializedRev ?? state.latest?.rev ?? 0`
   as the read dependency and re-emits the same number through `getReadRevision` so a `CacheSource`

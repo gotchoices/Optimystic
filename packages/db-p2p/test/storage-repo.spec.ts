@@ -522,15 +522,11 @@ describe('StorageRepo', () => {
 			expect(entry.state.latest?.rev, 'state.latest still the newest revision held').to.equal(2);
 		});
 
-		it('KNOWN GAP: a pending-only insert read WITH a context never reaches the overlay at all', async () => {
-			// get()'s pending-overlay branch is documented to serve a pending-only insert by applying
-			// the transform over an undefined base — and its `materializedRev` is written to be absent
-			// for exactly that case. Neither is reachable: `ActionContext.rev` is REQUIRED, and
-			// BlockStorage.getBlock only tolerates a missing committed base when `rev` is undefined,
-			// so any contextful read of a block with no committed revision throws inside getBlock and
-			// is caught into `unavailable: 'unmaterializable'` BEFORE the overlay branch runs.
-			// Asserted here so the dead branch is visible rather than merely believed to work; see
-			// tickets/backlog/debt-pending-only-insert-unreadable-with-context.
+		it('a pending-only insert read WITH a context is served over an absent committed base', async () => {
+			// The writer reading back its own not-yet-committed insert. There is no committed
+			// revision under the pending, so `getBlock` reports an ABSENT base (not a fault) and the
+			// overlay applies the insert on top of it. Every named `rev` answers identically — the
+			// rev names a base that does not exist, so there is nothing to pin.
 			const blockId = 'brand-new' as BlockId;
 			await repo.pend({
 				actionId: 'p1' as ActionId,
@@ -543,16 +539,139 @@ describe('StorageRepo', () => {
 					blockIds: [blockId],
 					context: { actionId: 'p1' as ActionId, rev, committed: [] }
 				}))[blockId]!;
-				expect(entry.block, `rev ${rev}: overlay never applied`).to.equal(undefined);
-				expect(entry.unavailable, `rev ${rev}: reported unavailable instead`).to.equal('unmaterializable');
-				expect(entry.materializedRev, `rev ${rev}: no content ⇒ no materialized revision`).to.equal(undefined);
+				expect(entry.block?.header.id, `rev ${rev}: the pending insert is served`).to.equal(blockId);
+				expect((entry.block as unknown as { items: string[] }).items, `rev ${rev}: with its content`)
+					.to.deep.equal(['fresh']);
+				expect(entry.materializedRev, `rev ${rev}: no committed base ⇒ no materialized revision`)
+					.to.equal(undefined);
+				expect('unavailable' in entry, `rev ${rev}: a real answer is never flagged`).to.equal(false);
+				expect(entry.state.latest, `rev ${rev}: nothing committed yet`).to.equal(undefined);
+				expect(entry.state.pendings, `rev ${rev}: the overlaid pending is reported`).to.deep.equal(['p1']);
 			}
 
-			// The contextLESS read is the one path that DOES serve a pending-only block — and it takes
-			// the plain-absent branch (no overlay, no revision), not the overlay branch.
+			// The contextLESS read is unchanged: it applies no pendings, so it stays the
+			// authoritative absent the createOrOpen insert probe depends on.
 			const contextless = (await repo.get({ blockIds: [blockId] }))[blockId]!;
-			expect(contextless.block, 'contextless read does not apply pendings either').to.equal(undefined);
+			expect(contextless.block, 'contextless read does not apply pendings').to.equal(undefined);
 			expect(contextless.state).to.deep.equal({});
+		});
+
+		it('a pending UPDATE over an absent committed base materializes nothing and is flagged', async () => {
+			// The overlay runs (getBlock no longer throws), but `applyTransform` drops updates when
+			// there is no block to apply them to. This node holds a pending record PROVING the block
+			// exists and produced nothing — that is a guess, not an authoritative absent, even though
+			// no promotion refusal fired here (`committed: []`).
+			const blockId = 'update-no-base' as BlockId;
+			await repo.pend({
+				actionId: 'p1' as ActionId,
+				transforms: makeUpdateTransforms(blockId, [['items', 0, 0, ['x']]]),
+				policy: 'c'
+			});
+
+			const entry = (await repo.get({
+				blockIds: [blockId],
+				context: { actionId: 'p1' as ActionId, rev: 2, committed: [] }
+			}))[blockId]!;
+
+			expect(entry.block, 'nothing to apply the update to').to.equal(undefined);
+			expect(entry.unavailable, 'an empty overlay over no base is a guess').to.equal('unmaterializable');
+			expect(entry.materializedRev, 'no base ⇒ no materialized revision').to.equal(undefined);
+		});
+
+		it('a promotion refusal on the context\'s OWN actionId returns a flagged entry, never a throw', async () => {
+			// The context proves rev 2 for `p1` AND names `p1` as its pending overlay. Read-driven
+			// promotion refuses (no base to apply the update to) and `refuseMissingBase` DELETES that
+			// pending record. The overlay branch then finds no pending — but this repo did hold it and
+			// dropped it, so the honest answer is the availability flag. Throwing `Pending action …
+			// not found` here would escape the per-block catch and fail the whole batch.
+			const blockId = 'refused-own-pending' as BlockId;
+			await repo.pend({
+				actionId: 'p1' as ActionId,
+				transforms: makeUpdateTransforms(blockId, [['items', 0, 0, ['x']]]),
+				policy: 'c'
+			});
+
+			const result = await repo.get({
+				blockIds: [blockId],
+				context: { actionId: 'p1' as ActionId, rev: 2, committed: [{ actionId: 'p1' as ActionId, rev: 2 }] }
+			});
+
+			expect(result[blockId]!.block).to.equal(undefined);
+			expect(result[blockId]!.unavailable).to.equal('unmaterializable');
+			expect(result[blockId]!.state).to.deep.equal({});
+			// The refusal really did drop the record — otherwise this test proves nothing.
+			expect(await rawStorage.getPendingTransaction(blockId, 'p1' as ActionId)).to.equal(undefined);
+		});
+
+		it('a pending DELETE over a real committed base reads absent and stays UNFLAGGED', async () => {
+			// The counterweight to the two cases above: `block === undefined` here too, but there IS
+			// a committed base underneath and the pending deliberately removes it. That is an
+			// authoritative tombstone, not a reconstruction failure.
+			const blockId = 'pending-tombstone' as BlockId;
+			await repo.pend({
+				actionId: 'a1' as ActionId,
+				transforms: makeInsertTransforms(blockId, makeBlock('pending-tombstone', { items: ['v1'] })),
+				policy: 'c'
+			});
+			expect((await repo.commit({ actionId: 'a1' as ActionId, blockIds: [blockId], tailId: blockId, rev: 1 })).success).to.equal(true);
+
+			await repo.pend({ actionId: 'p2' as ActionId, transforms: makeDeleteTransforms(blockId), policy: 'c' });
+
+			const entry = (await repo.get({
+				blockIds: [blockId],
+				context: { actionId: 'p2' as ActionId, rev: 1, committed: [] }
+			}))[blockId]!;
+
+			expect(entry.block, 'the pending delete removes the base').to.equal(undefined);
+			expect('unavailable' in entry, 'an intended tombstone is an authoritative absent').to.equal(false);
+			expect(entry.materializedRev, 'the base it was applied over is still reported').to.equal(1);
+		});
+
+		it('a context naming a pending this repo NEVER had still throws', async () => {
+			// The genuine caller-contract violation the flagged answers above must not swallow: a
+			// healthy committed block, no refusal, and an actionId this repo has no record of.
+			const blockId = 'healthy-block' as BlockId;
+			await repo.pend({
+				actionId: 'a1' as ActionId,
+				transforms: makeInsertTransforms(blockId, makeBlock('healthy-block', { items: ['v1'] })),
+				policy: 'c'
+			});
+			expect((await repo.commit({ actionId: 'a1' as ActionId, blockIds: [blockId], tailId: blockId, rev: 1 })).success).to.equal(true);
+
+			let error: unknown;
+			try {
+				await repo.get({
+					blockIds: [blockId],
+					context: { actionId: 'never-pended' as ActionId, rev: 1, committed: [] }
+				});
+			} catch (err) {
+				error = err;
+			}
+			expect((error as Error)?.message).to.contain('Pending action never-pended not found');
+		});
+
+		it('a mixed batch serves a pending-only insert alongside a wedged block', async () => {
+			// Each block gets its own answer and `Promise.all` stays unbroken: the pending-only
+			// insert is served from its overlay while the wedged sibling (latest pointing at a
+			// revision with no materialization) is flagged.
+			const fresh = 'fresh-insert' as BlockId;
+			const wedged = 'wedged-block' as BlockId;
+			await repo.pend({
+				actionId: 'p1' as ActionId,
+				transforms: makeInsertTransforms(fresh, makeBlock('fresh-insert', { items: ['new'] })),
+				policy: 'c'
+			});
+			await rawStorage.saveMetadata(wedged, { latest: { rev: 3, actionId: 'ghost' as ActionId }, ranges: [[3]] });
+
+			const result = await repo.get({
+				blockIds: [fresh, wedged],
+				context: { actionId: 'p1' as ActionId, rev: 3, committed: [] }
+			});
+
+			expect(result[fresh]!.block?.header.id, 'pending-only insert served').to.equal(fresh);
+			expect('unavailable' in result[fresh]!, 'and unflagged').to.equal(false);
+			expect(result[wedged]!.block, 'wedged sibling has no content').to.equal(undefined);
+			expect(result[wedged]!.unavailable, 'and is flagged').to.equal('unmaterializable');
 		});
 	});
 

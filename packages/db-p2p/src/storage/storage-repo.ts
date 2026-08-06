@@ -280,17 +280,18 @@ export class StorageRepo implements IRepo, IBlockChangeNotifier, IBlockReplicaSt
 			}
 
 			// Include pending action if requested, applying the pending transform over whatever
-			// committed base getBlock() resolved (possibly none).
-			// NOTE: the `blockRev == null` arm is currently DEAD, so a pending-only insert is NOT
-			// served here despite what this branch is shaped to do: `ActionContext.rev` is required,
-			// and BlockStorage.getBlock only tolerates a missing committed base when `rev` is
-			// undefined — so a contextful read of a block with no committed revision throws above and
-			// is caught into `unavailable: 'unmaterializable'` before reaching here. Asserted in
-			// storage-repo.spec.ts ('KNOWN GAP: a pending-only insert read WITH a context ...'); see
-			// tickets/backlog/debt-pending-only-insert-unreadable-with-context.
+			// committed base getBlock() resolved (possibly none — a pending-only insert has no
+			// committed revision under it and getBlock reports that as an absent base, not a fault).
 			if (context?.actionId !== undefined) {
 				const pendingTransform = await blockStorage.getPendingTransaction(context.actionId);
 				if (!pendingTransform) {
+					if (unavailable !== undefined) {
+						// The promotion refusal above deleted this very pending record
+						// (`refuseMissingBase` drops the pending it cannot promote). This node DID hold
+						// the record and dropped it, so the honest answer is an availability one — not
+						// a caller-contract violation, and never a throw that would fail the whole batch.
+						return [blockId, { state: {}, unavailable } as GetBlockResult];
+					}
 					// Caller-contract violation (the caller asserted a pending this repo never had, or
 					// cancelled) — an error, not an availability question. Deliberately NOT `unavailable`.
 					throw new Error(`Pending action ${context.actionId} not found`);
@@ -304,13 +305,21 @@ export class StorageRepo implements IRepo, IBlockChangeNotifier, IBlockReplicaSt
 					},
 					// The COMMITTED revision underneath the pending overlay. A pending has no revision
 					// of its own, so the honest answer is the base it was applied to. Absent when there
-					// was no base — unreachable today (see the NOTE above), kept so the field stays
-					// correct rather than fabricating a revision if that arm is ever reopened.
+					// was no base at all — a pending-only insert served over an absent committed base,
+					// where fabricating a revision would claim content this node never committed.
 					...(blockRev ? { materializedRev: blockRev.actionRev.rev } : {}),
 					// A pending applied to a missing base can materialize nothing (applyTransform drops
 					// updates with no block to apply them to) — that absence is a guess, and is flagged.
-					// A materialized block is a real answer regardless of the earlier refusal.
-					...(unavailable !== undefined && block === undefined ? { unavailable } : {})
+					// A materialized block is a real answer regardless of the earlier refusal. TWO ways
+					// an empty result is a guess: the promotion refusal fired (`unavailable` set), or
+					// there was no committed base under the overlay at all (`blockRev === undefined`) —
+					// this node holds a pending record PROVING the block exists and produced nothing.
+					// The second clause's ABSENCE in the other direction is equally load-bearing: a
+					// pending DELETE over a real committed base also lands here with no block, and that
+					// is an authoritative tombstone which must stay unflagged.
+					...(block === undefined && (unavailable !== undefined || blockRev === undefined)
+						? { unavailable: unavailable ?? 'unmaterializable' }
+						: {})
 				} as GetBlockResult];
 			}
 

@@ -397,12 +397,21 @@ export class CoordinatorRepo implements IRepo {
 	 *
 	 * No-op once the entry carries a real answer (the consult restored the block) or a sharper flag
 	 * (storage's `'unmaterializable'`), so callers only need to establish that the answer is a guess.
+	 *
+	 * "Carries a real answer" is tested as `entry.block !== undefined`, NOT as `state.latest` being
+	 * set. The two used to move together, so `state.latest` read as a serviceable proxy — but a
+	 * pending-only insert (pended, not yet committed) served through the pending overlay has real
+	 * CONTENT and no committed revision at all, so its `state.latest` is undefined. Flagging that
+	 * entry would mark a block this node is positively holding as an unconfirmed absence, and
+	 * `NetworkTransactor`'s `isAuthoritative` keys off the flag alone — the read would burn its
+	 * retry budget re-asking other peers for content it already has. `state.latest` stays in the
+	 * test as well so a stale-but-real committed answer is likewise never downgraded.
 	 */
 	private flagUnconfirmedAbsence(results: GetBlockResults, blockId: BlockId): void {
 		const entry = results[blockId];
 		if (!entry) {
 			results[blockId] = { state: {}, unavailable: 'peers-unreachable' };
-		} else if (!entry.state?.latest && entry.unavailable === undefined) {
+		} else if (entry.block === undefined && !entry.state?.latest && entry.unavailable === undefined) {
 			entry.unavailable = 'peers-unreachable';
 		}
 	}
@@ -607,11 +616,13 @@ export class CoordinatorRepo implements IRepo {
 	 * the repair. Returns the local revision afterwards.
 	 *
 	 * A pending-only block (metadata seeded by `savePendingTransaction`, no committed revision) asked
-	 * for a forward revision no promotion can reach used to throw out of `BlockStorage.ensureRevision`;
-	 * `StorageRepo.get` now reports it as an entry flagged `unavailable` instead (ticket
-	 * repo-reports-unavailable-vs-absent). On THIS path either shape is an absence, not a read failure —
-	 * acquisition is precisely the mechanism that can supply the revision — so both are logged as
-	 * `promote-unavailable` and stepped over rather than short-circuiting the caller.
+	 * for a forward revision no promotion can reach used to throw out of `BlockStorage.ensureRevision`.
+	 * It no longer does: "no committed base here" is an absence, so that read comes back as a plain
+	 * unflagged `{ state: {} }` and this method simply returns `undefined` — acquisition then supplies
+	 * the revision. The `unavailable` arm below still fires for the shapes that ARE a guess (a `latest`
+	 * this node cannot materialize, a missing-base promotion refusal); on THIS path those are an
+	 * absence too rather than a read failure, so they are logged as `promote-unavailable` and stepped
+	 * over rather than short-circuiting the caller. The catch stays for any other fault, same reason.
 	 */
 	private async promoteCorroborated(blockId: BlockId, corroborated: ActionRev): Promise<number | undefined> {
 		try {

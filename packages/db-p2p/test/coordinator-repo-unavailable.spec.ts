@@ -134,6 +134,28 @@ const makePresentStorageRepo = (blockId: BlockId, rev: number): { repo: IRepo } 
 	return { repo };
 };
 
+/** Storage repo answering the way `StorageRepo.get` does for a pending-only insert read through
+ *  its pending overlay: real CONTENT, but no committed revision under it, so `state.latest` is
+ *  undefined while `state.pendings` names the overlaid action. */
+const makePendingOverlayStorageRepo = (blockId: BlockId): { repo: IRepo } => {
+	const repo: IRepo = {
+		async get(blockGets: BlockGets, _options?: MessageOptions): Promise<GetBlockResults> {
+			const result: GetBlockResults = {};
+			for (const id of blockGets.blockIds) {
+				result[id] = id === blockId
+					? {
+						block: { header: { id: blockId, type: 'T', collectionId: 'c' as BlockId } },
+						state: { pendings: ['p1'] }	// no `latest`: nothing committed yet
+					}
+					: { state: {} };
+			}
+			return result;
+		},
+		...writeStubs
+	};
+	return { repo };
+};
+
 /** Storage repo that already flags the block `unmaterializable` (records held, no base). */
 const makeUnmaterializableStorageRepo = (blockId: BlockId): { repo: IRepo } => {
 	const repo: IRepo = {
@@ -214,6 +236,25 @@ describe('CoordinatorRepo unavailable vs absent', () => {
 		expect(result[blockId]?.block?.header.id).to.equal(blockId);
 		expect(result[blockId]?.state?.latest?.rev).to.equal(1);
 		expect('unavailable' in result[blockId]!).to.equal(false);
+	});
+
+	it('keeps a pending-only insert\'s CONTENT unflagged when its consult throws', async () => {
+		// A block pended but not yet committed is served through the pending overlay: real
+		// content, and `state.latest` undefined because there is no committed revision under it.
+		// The consult still runs (this node holds no revision, so a cohort may) and here it fails
+		// — but the entry is NOT an absence to downgrade. Flagging content this node positively
+		// holds would make NetworkTransactor's `isAuthoritative` treat the batch as unanswered
+		// and burn its retry budget re-asking peers for a block it already has.
+		const localPeer = await makePeerId();
+		const { repo: storageRepo } = makePendingOverlayStorageRepo(blockId);
+
+		const repo = buildRepo(makeThrowingKeyNetwork(), storageRepo, localPeer, async () => undefined);
+
+		const result = await repo.get({ blockIds: [blockId] });
+
+		expect(result[blockId]?.block?.header.id, 'the pending content survives').to.equal(blockId);
+		expect(result[blockId]?.state?.latest, 'still nothing committed').to.equal(undefined);
+		expect('unavailable' in result[blockId]!, 'content is never an unconfirmed absence').to.equal(false);
 	});
 
 	it('stays an authoritative absent when the consult runs but corroborates nothing (the new-collection probe)', async () => {

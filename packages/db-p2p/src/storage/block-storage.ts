@@ -50,14 +50,44 @@ export class BlockStorage implements IBlockStorage {
 			return undefined;
 		}
 
-		// Pending-only state: metadata was seeded by savePendingTransaction but no
-		// revision has been committed yet. Treat as "doesn't exist" for the default
-		// request path — matches StorageRepo.get()'s contract that undefined => empty.
-		if (rev === undefined && meta.latest === undefined) {
-			return undefined;
+		// Pending-only state: metadata was seeded by savePendingTransaction but no revision has been
+		// committed yet. "No committed base here" is an ABSENCE, not a fault — nothing is being
+		// FAILED to reconstruct — so both arms below answer `undefined` rather than throwing, whether
+		// or not the caller named a revision. StorageRepo.get then applies any pending overlay over
+		// that absent base; a throw here would instead be caught into `unavailable: 'unmaterializable'`
+		// and a writer reading back its own not-yet-committed insert would be told it is unreadable.
+		// `unmaterializable` must keep its one meaning: records prove the block exists and this node
+		// cannot reconstruct it.
+		if (meta.latest === undefined) {
+			if (rev === undefined) {
+				return undefined;
+			}
+			// A named rev still ATTEMPTS the restore: `restoreCallback` may be able to supply that
+			// revision even though nothing is committed locally, and a successful restore serves real
+			// content with `latest` still undefined. That capability is pinned by the 'getBlock for an
+			// absent revision fires restoreCallback (restore not short-circuited)' test in
+			// test/block-storage.spec.ts — do not short-circuit it away.
+			//
+			// Only ensureRevision's FAILURE is swallowed (no callback wired, or restore could not
+			// supply the rev): that is precisely the "no committed base here" absence. materializeBlock
+			// below is deliberately OUTSIDE the try — a throw from there means revision records exist
+			// with no materialization anywhere under them, which is genuine corruption and must keep
+			// reading as `unmaterializable`.
+			//
+			// NOTE: a contextful read of a pending-only block still attempts a network restore before
+			// falling back to absent (same cost as the pre-fix throw path); if pending-only read-backs
+			// ever show as hot, short-circuit when ranges are empty.
+			try {
+				await this.ensureRevision(meta, rev);
+			} catch (err) {
+				log('getBlock:no-committed-base blockId=%s rev=%d error=%s', this.blockId, rev,
+					err instanceof Error ? err.message : String(err));
+				return undefined;
+			}
+			return await this.materializeBlock(meta, rev);
 		}
 
-		const targetRev = rev ?? meta.latest!.rev;
+		const targetRev = rev ?? meta.latest.rev;
 		await this.ensureRevision(meta, targetRev);
 		return await this.materializeBlock(meta, targetRev);
 	}

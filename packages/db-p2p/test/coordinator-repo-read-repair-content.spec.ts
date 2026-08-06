@@ -178,7 +178,7 @@ describe('CoordinatorRepo read-repair CONTENT convergence', function () {
 			acquireBlockFromCohort
 		);
 
-		return { aRepo, bRepo, bCoordinator, archiveFetches: () => archiveFetches };
+		return { aRepo, bRepo, bStorage, bCoordinator, archiveFetches: () => archiveFetches };
 	};
 
 	it('sanity: the two nodes really are diverged before the read', async () => {
@@ -292,10 +292,17 @@ describe('CoordinatorRepo read-repair CONTENT convergence', function () {
 	 *
 	 * B holds metadata for the block (seeded by a pend of some unrelated action) but no committed
 	 * revision, so `StorageRepo.get` with the corroborated commit context finds no pending to promote
-	 * and then throws out of `BlockStorage.ensureRevision` — rev 2 is outside B's (empty) coverage
-	 * ranges and B has no storage-layer restore to supply it. That throw used to escape
-	 * `fetchBlockFromCluster` as `cluster-fetch:error`, ending the pass before the one mechanism that
-	 * CAN supply the revision ever ran. It must now be logged and stepped over.
+	 * and no committed base underneath. That read used to throw out of `BlockStorage.ensureRevision`
+	 * — rev 2 is outside B's (empty) coverage ranges and B has no storage-layer restore to supply it
+	 * — and the throw escaped `fetchBlockFromCluster` as `cluster-fetch:error`, ending the pass
+	 * before the one mechanism that CAN supply the revision ever ran.
+	 *
+	 * `getBlock` now reports "no committed base here" as an absent base rather than a fault (ticket
+	 * debt-pending-only-insert-unreadable-with-context), so this read is a plain unflagged absence:
+	 * `promoteCorroborated` simply learns B holds no revision and returns, and acquisition runs. The
+	 * `promote-unavailable` step-over still guards the shapes that ARE faults (a wedged `latest`, a
+	 * missing-base promotion refusal) — it is just no longer this case, so what this test pins is the
+	 * OUTCOME: no error, and acquisition supplies the revision.
 	 */
 	it('falls through to acquisition when no local promotion can reach the revision', async () => {
 		const { bRepo, bCoordinator } = await buildDivergedPair({ seedB: false, restoreB: false });
@@ -312,7 +319,29 @@ describe('CoordinatorRepo read-repair CONTENT convergence', function () {
 			expect(payloadOf(served[BLOCK_ID]?.block), 'the read still serves the cohort content').to.equal('v2');
 		});
 
-		expect(hasTag(captured, 'cluster-fetch:promote-unavailable'), 'the unreachable promotion is reported').to.equal(true);
+		expect(hasTag(captured, 'cluster-fetch:error'), 'the unreachable promotion must not abort the pass').to.equal(false);
+		expect(hasTagAtRev(captured, 'cluster-fetch:synced', 2), 'acquisition supplied it instead').to.equal(true);
+		expect((await bRepo.get({ blockIds: [BLOCK_ID] }))[BLOCK_ID]?.state?.latest?.rev).to.equal(2);
+	});
+
+	/**
+	 * The step-over the test above used to cover, now exercised by a shape that IS a fault: B's
+	 * `latest` points at a revision with no materialization anywhere below it (truncated history), so
+	 * `StorageRepo.get` flags the entry `unavailable`. That is a guess, not an absence, and it must be
+	 * reported and stepped over rather than short-circuiting the pass — acquisition is exactly the
+	 * mechanism that can repair it.
+	 */
+	it('reports and steps over a promotion whose local base is unmaterializable', async () => {
+		const { bRepo, bCoordinator, bStorage } = await buildDivergedPair({ seedB: false, restoreB: false });
+		// Wedge B: a latest it cannot materialize (no materialization under rev 1).
+		await bStorage.saveMetadata(BLOCK_ID, { latest: { rev: 1, actionId: 'ghost' as ActionId }, ranges: [[1]] });
+
+		const captured = await captureLog('coordinator-repo', async () => {
+			const served = await bCoordinator.get({ blockIds: [BLOCK_ID] });
+			expect(payloadOf(served[BLOCK_ID]?.block), 'the read still serves the cohort content').to.equal('v2');
+		});
+
+		expect(hasTag(captured, 'cluster-fetch:promote-unavailable'), 'the unmaterializable promotion is reported').to.equal(true);
 		expect(hasTag(captured, 'cluster-fetch:error'), 'but it must not abort the pass').to.equal(false);
 		expect(hasTagAtRev(captured, 'cluster-fetch:synced', 2), 'acquisition supplied it instead').to.equal(true);
 		expect((await bRepo.get({ blockIds: [BLOCK_ID] }))[BLOCK_ID]?.state?.latest?.rev).to.equal(2);
