@@ -1,5 +1,6 @@
 export * from "./cluster/client.js";
 export * from "./cluster/cluster-repo.js";
+export * from "./cluster/cluster-policy.js";
 export * from "./cluster/commit-cert.js";
 export * from "./cluster/service.js";
 export * from "./cluster/rebalance-monitor.js";
@@ -31,6 +32,7 @@ export * from "./sync/service.js";
 export * from "./it-utility.js";
 export * from "./libp2p-key-network.js";
 export * from "./libp2p-node.js";
+export * from "./optimystic-node.js";
 export * from "./routing/responsibility.js";
 export * from "./routing/libp2p-known-peers.js";
 export * from "./network/network-manager-service.js";

@@ -149,9 +149,19 @@ export class Libp2pKeyPeerNetwork implements IKeyNetwork, IPeerNetwork {
 	private readonly networkMode: NetworkMode;
 	private readonly persistence?: NetworkStatePersistence;
 
+	// NOTE: seven positional parameters, and the list stays that way for now — converting to an
+	// options bag would touch ~50 construction sites in `test/libp2p-key-network.spec.ts` alone.
+	// Revisit if an eighth parameter is ever needed, or if that spec is being rewritten anyway.
 	constructor(
 		private readonly libp2p: Libp2p,
-		private readonly clusterSize: number = 16,
+		/**
+		 * Replication factor / target cohort breadth for peer selection. REQUIRED, deliberately:
+		 * a silent default here meant a caller that did not know the node's cluster size quietly
+		 * selected a different-width cohort than the node's own consensus path used for the same
+		 * key. Reuse the node's own instance (`node.keyNetwork`) where one exists; a caller that
+		 * genuinely must construct standalone passes `DEFAULT_CLUSTER_SIZE` (`cluster/cluster-policy.ts`).
+		 */
+		private readonly clusterSize: number,
 		selfCoordinationConfig?: SelfCoordinationConfig,
 		networkMode?: NetworkMode,
 		persistence?: NetworkStatePersistence,
@@ -186,6 +196,15 @@ export class Libp2pKeyPeerNetwork implements IKeyNetwork, IPeerNetwork {
 	/** The cluster size this instance actually resolved to, for `assertClusterSizeCoupling`. */
 	get effectiveClusterSize(): number {
 		return this.clusterSize;
+	}
+
+	/**
+	 * The network-namespaced protocol prefix (`/optimystic/<networkName>`) selection is scoped to,
+	 * or `undefined` when the network-membership filter is off. Readable so a spec can assert the
+	 * node's attached instance really is network-scoped without reaching into a private field.
+	 */
+	get effectiveProtocolPrefix(): string | undefined {
+		return this.protocolPrefix;
 	}
 
 	// coordinator cache: key (base64url) -> peerId until expiry (bounded LRU-ish via Map insertion order)

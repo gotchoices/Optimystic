@@ -6,7 +6,6 @@ import type { PrivateKey } from '@libp2p/interface';
 import { generateKeyPair } from '@libp2p/crypto/keys';
 import {
 	createLibp2pNode,
-	Libp2pKeyPeerNetwork,
 	MemoryRawStorage,
 	RepoClient,
 } from '@optimystic/db-p2p';
@@ -65,10 +64,11 @@ async function spawnNode(
 	});
 	trackedNodes.push(node);
 
-	const coordinatedRepo = (node as any).coordinatedRepo as IRepo;
-	if (!coordinatedRepo) throw new Error('coordinatedRepo not created by createLibp2pNode');
+	const coordinatedRepo = node.coordinatedRepo;
 
-	const keyNetwork = new Libp2pKeyPeerNetwork(node);
+	// The node's OWN key network — a second one built from constructor defaults would resolve a
+	// different cohort width and drop the network-membership filter.
+	const keyNetwork = node.keyNetwork;
 	const protocolPrefix = `/optimystic/${NETWORK_NAME}`;
 
 	const getRepo = (peerId: DbPeerId): IRepo => {

@@ -2,26 +2,36 @@ import type { ITransactor, IKeyNetwork, CollectionId, PeerId, IRepo, IBlockChang
 import { Tree, NetworkTransactor, isBlockChangeNotifier, bytesToB64url } from '@optimystic/db-core';
 import {
 	createLibp2pNode,
+	DEFAULT_CLUSTER_SIZE,
 	Libp2pKeyPeerNetwork,
 	RepoClient,
 	StorageRepo,
 	BlockStorage,
 	MemoryRawStorage,
 	signPeer,
+	type OptimysticNodeAttachments,
 } from '@optimystic/db-p2p';
 import { createMesh, buildNetworkTransactor } from '@optimystic/db-p2p/testing';
 import type { RowData, ParsedOptimysticOptions, TransactionState } from '../types.js';
-import type { Libp2p, PrivateKey } from '@libp2p/interface';
+import type { Libp2p } from '@libp2p/interface';
 import { createLogger } from '../logger.js';
 
 const log = createLogger('collection-factory');
+
+/**
+ * A libp2p node this factory holds. Nodes it builds itself (`createLibp2pNode`) carry the full
+ * {@link OptimysticNodeAttachments} surface; nodes a host injects through `registerLibp2pNode`
+ * may carry none of it — hence `Partial`, so every read of an attachment has to face the
+ * possibility that this particular node does not have one.
+ */
+type FactoryNode = Libp2p & Partial<OptimysticNodeAttachments>;
 
 /**
  * Factory for creating and managing tree collections
  */
 export class CollectionFactory {
   private transactors = new Map<string, ITransactor>();
-  private libp2pNodes = new Map<string, { node: Libp2p; coordinatedRepo: IRepo; blockChangeNotifier?: IBlockChangeNotifier }>();
+  private libp2pNodes = new Map<string, { node: FactoryNode; coordinatedRepo: IRepo; blockChangeNotifier?: IBlockChangeNotifier }>();
   private customTransactorCtors = new Map<string, new (...args: any[]) => ITransactor>();
   private customKeyNetworkCtors = new Map<string, new (...args: any[]) => IKeyNetwork>();
 
@@ -216,17 +226,15 @@ export class CollectionFactory {
         }
       });
 
-      // Get the coordinatedRepo that was created by createLibp2pNode
-      const coordinatedRepo = (node as any).coordinatedRepo as IRepo;
-      if (!coordinatedRepo) {
-        throw new Error('Failed to get coordinatedRepo from libp2p node');
-      }
+      // The coordinatedRepo the node built. Typed on the node's attachment surface, so
+      // no presence check: createLibp2pNode always attaches it.
+      const coordinatedRepo = node.coordinatedRepo;
 
       // The hosting node exposes its StorageRepo as an IBlockChangeNotifier
       // (libp2p-node-base sets `node.blockChangeNotifier = storageRepo`). Feed it
       // to the transactor so reactive consumers can observe commits that land on
-      // this node's storage. Absent on nodes that don't host collection blocks.
-      const blockChangeNotifier = (node as any).blockChangeNotifier as IBlockChangeNotifier | undefined;
+      // this node's storage.
+      const blockChangeNotifier = node.blockChangeNotifier;
 
       nodeInfo = { node, coordinatedRepo, blockChangeNotifier };
       this.libp2pNodes.set(nodeKey, nodeInfo);
@@ -363,29 +371,35 @@ export class CollectionFactory {
    * Returns Libp2pKeyPeerNetwork (which implements both IKeyNetwork and IPeerNetwork)
    * for the built-in 'libp2p' type. Custom implementations must also satisfy both interfaces.
    */
-  private resolveKeyNetwork(type: string, libp2pNode: Libp2p, protocolPrefix: string): Libp2pKeyPeerNetwork {
+  private resolveKeyNetwork(type: string, libp2pNode: FactoryNode, protocolPrefix: string): Libp2pKeyPeerNetwork {
     switch (type) {
       case 'libp2p': {
         // Prefer the node's OWN key network. `createLibp2pNode` builds one with the
         // node's configured cluster size, network mode, persistence, reputation and
-        // protocol prefix, and attaches it here; constructing a second one from
+        // protocol prefix, and attaches it there; constructing a second one from
         // defaults would silently give every transactor-level findCluster /
-        // findCoordinator a 16-wide cohort with network scoping disabled — a
+        // findCoordinator a different-width cohort with network scoping disabled — a
         // different peer set and coordinator than the node's own consensus path uses.
-        const attached = (libp2pNode as unknown as { keyNetwork?: Libp2pKeyPeerNetwork }).keyNetwork;
+        const attached = libp2pNode.keyNetwork;
         if (attached) {
           return attached;
         }
         // A node injected by a host that did not build it through createLibp2pNode
-        // carries no key network. Cluster size and reputation are unknowable here, but
-        // the network name is, so scope selection to this network's peers. Passing the
-        // prefix is deliberate even though the constructor leaves it optional "because
-        // most call sites don't know the network name": this call site does, and the
-        // SAME prefix string is what `getRepo` hands every `RepoClient.create` dial the
-        // transactor makes — a peer that scoping excludes could never have negotiated
-        // this transactor's repo protocol anyway, so scoping only removes
-        // guaranteed-failure candidates.
-        return new Libp2pKeyPeerNetwork(libp2pNode, undefined, undefined, undefined, undefined, undefined, protocolPrefix);
+        // carries no key network. Reputation is unknowable here and the cluster size is
+        // only guessable — DEFAULT_CLUSTER_SIZE is exactly what a node built here would
+        // have resolved to, and is the honest stand-in — but the network name IS known,
+        // so scope selection to this network's peers. Passing the prefix is deliberate
+        // even though the constructor leaves it optional "because most call sites don't
+        // know the network name": this call site does, and the SAME prefix string is what
+        // `getRepo` hands every `RepoClient.create` dial the transactor makes — a peer
+        // that scoping excludes could never have negotiated this transactor's repo
+        // protocol anyway, so scoping only removes guaranteed-failure candidates.
+        //
+        // NOTE: a host injecting a node through `registerLibp2pNode` should be able to hand
+        // in its key network rather than have one guessed from defaults here. If a real host
+        // ever needs a cluster size other than the default, widen `registerLibp2pNode` to take
+        // the node's own key network (or its cluster size) rather than growing more guesses.
+        return new Libp2pKeyPeerNetwork(libp2pNode, DEFAULT_CLUSTER_SIZE, undefined, undefined, undefined, undefined, protocolPrefix);
       }
       default: {
         const CustomKeyNetwork = this.customKeyNetworkCtors.get(type);
@@ -477,13 +491,13 @@ export class CollectionFactory {
   getSigner(options: ParsedOptimysticOptions): TransactionSigner | undefined {
     const nodeKey = this.getNodeKey(options);
     const nodeInfo = this.libp2pNodes.get(nodeKey);
-    // The node's identity key is attached by createLibp2pNode (see libp2p-node-base.ts —
-    // `(node as any).peerPrivateKey`). Absent for injected/legacy nodes and all non-network
-    // transactors, in which case there is no client signer and the transaction is left unsigned.
+    // The node's identity key is attached by createLibp2pNode (see OptimysticNodeAttachments).
+    // Absent for injected/legacy nodes and all non-network transactors, in which case there is no
+    // client signer and the transaction is left unsigned.
     // NOTE: a node injected via registerLibp2pNode that was NOT built by createLibp2pNode carries no
     // peerPrivateKey, so signing silently disables for it; harmless today (enforcement is off by
     // default) but if a deployment enforces verification against such a node, thread the key through.
-    const privateKey = (nodeInfo?.node as unknown as { peerPrivateKey?: PrivateKey } | undefined)?.peerPrivateKey;
+    const privateKey = nodeInfo?.node.peerPrivateKey;
     if (!privateKey) {
       return undefined;
     }
@@ -494,7 +508,7 @@ export class CollectionFactory {
    * Register an existing libp2p node for use by the factory.
    * This allows tests to inject pre-created nodes instead of having the factory create new ones.
    */
-  registerLibp2pNode(networkName: string, node: Libp2p, coordinatedRepo: IRepo): void {
+  registerLibp2pNode(networkName: string, node: FactoryNode, coordinatedRepo: IRepo): void {
     const nodeKey = `${networkName}:0`; // Use port 0 as default for registered nodes
     this.libp2pNodes.set(nodeKey, { node, coordinatedRepo });
   }

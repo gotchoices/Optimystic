@@ -914,7 +914,8 @@ describe('Libp2pKeyPeerNetwork', () => {
 	describe('networkMode defaults', () => {
 		it('defaults to forming when not specified', () => {
 			const libp2p = createMockLibp2p(selfPeerId);
-			const network = new Libp2pKeyPeerNetwork(libp2p);
+			// clusterSize is stated (it has no default any more); this case is about networkMode.
+			const network = new Libp2pKeyPeerNetwork(libp2p, 16);
 			expect((network as any).networkMode).to.equal('forming');
 		});
 

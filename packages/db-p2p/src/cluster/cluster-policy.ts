@@ -53,6 +53,16 @@ const log = createLogger('cluster-policy');
 export const minAbsoluteClusterSize = 2;
 
 /**
+ * Default replication factor / target cohort breadth when the operator declares no `clusterSize`.
+ *
+ * Exported (and re-exported from the package root) rather than left inline because a caller that
+ * must construct a `Libp2pKeyPeerNetwork` for a node it did not build has to state a cluster size —
+ * the constructor no longer supplies one — and the only defensible answer is "whatever a node built
+ * here would have resolved to". Repeating the literal is how the two drifted last time.
+ */
+export const DEFAULT_CLUSTER_SIZE = 10;
+
+/**
  * The operator-facing cluster knobs. `NodeOptions` (`libp2p-node-base.ts`) intersects this rather
  * than restating it, so a knob added here is one `resolveClusterPolicy` is guaranteed to see — a
  * second declaration would compile fine and be silently dropped.
@@ -130,7 +140,7 @@ export function resolveClusterPolicy(options: ClusterPolicyOptions): ResolvedClu
 	// rejects non-positive integers). If another composition root starts accepting unvalidated config,
 	// clamp here rather than in each consumer.
 	const declaredCohortSize = options.clusterPolicy?.assumedClusterSize;
-	const clusterSize = options.clusterSize ?? 10;
+	const clusterSize = options.clusterSize ?? DEFAULT_CLUSTER_SIZE;
 	const repairCorroborationClusterSize = declaredCohortSize ?? clusterSize;
 
 	// Called once per node (resolveClusterPolicy runs once at construction), so this fires once per

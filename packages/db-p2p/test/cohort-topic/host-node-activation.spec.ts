@@ -90,7 +90,9 @@ describe('cohort-topic host node activation (real libp2p, solo forming node)', f
 	const buildSoloTransactor = (node: any, networkName: string): ITransactor => {
 		const coordinatedRepo = node.coordinatedRepo as IRepo;
 		if (!coordinatedRepo) throw new Error('coordinatedRepo not created');
-		const keyNetwork = new Libp2pKeyPeerNetwork(node);
+		// The node's OWN key network (see OptimysticNodeAttachments). Building a second one from
+		// constructor defaults would give selection a different cohort width and no network filter.
+		const keyNetwork = node.keyNetwork as Libp2pKeyPeerNetwork;
 		const protocolPrefix = `/optimystic/${networkName}`;
 		const getRepo = (peerId: PeerId): IRepo => {
 			if (peerId.toString() === node.peerId.toString()) return coordinatedRepo;

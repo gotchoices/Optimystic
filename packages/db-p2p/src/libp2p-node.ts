@@ -1,4 +1,3 @@
-import type { Libp2p } from 'libp2p';
 import { tcp } from '@libp2p/tcp';
 import { webSockets } from '@libp2p/websockets';
 import { circuitRelayTransport } from '@libp2p/circuit-relay-v2';
@@ -8,10 +7,11 @@ import {
 	type NodeOptions,
 	type RawStorageProvider,
 } from './libp2p-node-base.js';
+import type { OptimysticNode } from './optimystic-node.js';
 
 export type { Libp2pTransports, NodeOptions, RawStorageProvider };
 
-export async function createLibp2pNode(options: NodeOptions): Promise<Libp2p> {
+export async function createLibp2pNode(options: NodeOptions): Promise<OptimysticNode> {
 	const port = options.port ?? 0;
 	const wsHost = options.wsHost ?? '0.0.0.0';
 

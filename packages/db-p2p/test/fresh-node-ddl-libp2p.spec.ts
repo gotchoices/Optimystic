@@ -2,7 +2,7 @@ import { expect } from 'chai';
 import { Tree, NetworkTransactor, type ITransactor, type IRepo, type PeerId as DbPeerId } from '@optimystic/db-core';
 import type { PeerId } from '@libp2p/interface';
 import { createLibp2pNode } from '../src/libp2p-node.js';
-import { Libp2pKeyPeerNetwork } from '../src/libp2p-key-network.js';
+import type { OptimysticNode } from '../src/optimystic-node.js';
 import { RepoClient } from '../src/repo/client.js';
 
 // Real-libp2p integration forcing-function for ticket
@@ -22,7 +22,7 @@ describe('Fresh-node DDL (real libp2p, clusterSize=1, arachnode)', function () {
 	// individual ops should finish in seconds but overall setup dominates the budget.
 	this.timeout(30_000);
 
-	let node: any;
+	let node!: OptimysticNode;
 	let transactor: ITransactor;
 
 	beforeEach(async () => {
@@ -41,10 +41,12 @@ describe('Fresh-node DDL (real libp2p, clusterSize=1, arachnode)', function () {
 			}
 		});
 
-		const coordinatedRepo = (node as any).coordinatedRepo as IRepo;
-		if (!coordinatedRepo) throw new Error('coordinatedRepo not created');
+		const coordinatedRepo = node.coordinatedRepo;
 
-		const keyNetwork = new Libp2pKeyPeerNetwork(node);
+		// The node's OWN key network, not a second one built from constructor defaults: a
+		// second instance resolves a different cohort width and drops the network-membership
+		// filter (bug-second-key-network-built-with-defaults).
+		const keyNetwork = node.keyNetwork;
 		const protocolPrefix = `/optimystic/fresh-ddl-test`;
 
 		const getRepo = (peerId: PeerId): IRepo => {

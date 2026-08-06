@@ -326,8 +326,13 @@ const node = await createLibp2pNode({
   }
 });
 
-// Key network integration
-const keyNetwork = new Libp2pKeyPeerNetwork(node);
+// Key network integration — use the node's OWN key network, do not construct a second one.
+// `createLibp2pNode` returns an `OptimysticNode`, which declares this handle (and
+// `coordinatedRepo`, `storageRepo`, `blockChangeNotifier`, `reputation`, `peerPrivateKey`).
+// The attached instance carries the node's resolved cluster size and its network-namespaced
+// protocol prefix; a separately constructed one selects a different-width cohort and has the
+// "does this peer serve my network?" filter switched off.
+const keyNetwork = node.keyNetwork;
 ```
 
 **Integration Features:**

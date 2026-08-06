@@ -64,9 +64,10 @@ const networkOptions = (): ParsedOptimysticOptions => ({
 
 /**
  * The transactor's key network must be the one the NODE was configured with — same
- * network scoping (protocol prefix) and same cluster size. A second, default-argument
- * instance silently widens the cohort to 16 and disables the "does this peer serve my
- * network?" filter for every write.
+ * network scoping (protocol prefix) and same cluster size. A separately constructed
+ * instance carries whatever cluster size and prefix that call site happened to state,
+ * which for the sites this ticket fixed meant a wider cohort and no "does this peer
+ * serve my network?" filter on every write.
  */
 describe('CollectionFactory network transactor key network', () => {
 	let selfId: PeerId;

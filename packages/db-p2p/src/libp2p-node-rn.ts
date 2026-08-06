@@ -1,10 +1,10 @@
-import type { Libp2p } from 'libp2p';
 import {
 	createLibp2pNodeBase,
 	type Libp2pTransports,
 	type NodeOptions,
 	type RawStorageProvider,
 } from './libp2p-node-base.js';
+import type { OptimysticNode } from './optimystic-node.js';
 
 export type { Libp2pTransports, NodeOptions, RawStorageProvider };
 
@@ -14,7 +14,7 @@ export type { Libp2pTransports, NodeOptions, RawStorageProvider };
  * This entrypoint intentionally does not import Node-only transports (like `@libp2p/tcp`).
  * Callers must provide `options.transports` (and typically `options.listenAddrs`).
  */
-export async function createLibp2pNode(options: NodeOptions): Promise<Libp2p> {
+export async function createLibp2pNode(options: NodeOptions): Promise<OptimysticNode> {
 	const transports = options.transports;
 	if (!transports || transports.length === 0) {
 		throw new Error(

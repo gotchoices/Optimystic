@@ -12,7 +12,6 @@ import {
 	StorageRepo,
 	BlockStorage,
 	MemoryRawStorage,
-	Libp2pKeyPeerNetwork,
 	RepoClient
 } from '@optimystic/db-p2p';
 import { NetworkTransactor } from '@optimystic/db-core';
@@ -380,12 +379,10 @@ describe('Distributed Quereus Operations', function () {
 			new BlockStorage(blockId, rawStorage)
 		);
 
-		const keyNetwork = new Libp2pKeyPeerNetwork(node);
-		const coordinatedRepo = (node as any).coordinatedRepo;
-
-		if (!coordinatedRepo) {
-			throw new Error('coordinatedRepo not available on node');
-		}
+		// The node's OWN key network — a second one built from constructor defaults would resolve a
+		// different cohort width and drop the network-membership filter.
+		const keyNetwork = node.keyNetwork;
+		const coordinatedRepo = node.coordinatedRepo;
 
 		const protocolPrefix = `/optimystic/${NETWORK_NAME}`;
 		const transactor = new NetworkTransactor({

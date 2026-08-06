@@ -25,6 +25,7 @@ export * from './sync/service.js';
 export * from './it-utility.js';
 export * from './libp2p-key-network.js';
 export * from './libp2p-node-rn.js';
+export * from './optimystic-node.js';
 export * from './routing/responsibility.js';
 export * from './routing/libp2p-known-peers.js';
 export * from './network/network-manager-service.js';

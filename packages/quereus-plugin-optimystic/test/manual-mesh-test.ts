@@ -11,7 +11,6 @@ import { Database } from '@quereus/quereus';
 import type { SqlValue } from '@quereus/quereus';
 import {
 	createLibp2pNode,
-	Libp2pKeyPeerNetwork,
 	RepoClient
 } from '@optimystic/db-p2p';
 import { NetworkTransactor } from '@optimystic/db-core';
@@ -50,12 +49,10 @@ async function createNode(port: number, bootstrapNodes: string[], networkName: s
 		}
 	});
 
-	const keyNetwork = new Libp2pKeyPeerNetwork(node);
-	const coordinatedRepo = (node as any).coordinatedRepo;
-
-	if (!coordinatedRepo) {
-		throw new Error('coordinatedRepo not available on node');
-	}
+	// The node's OWN key network — a second one built from constructor defaults would resolve a
+	// different cohort width and drop the network-membership filter.
+	const keyNetwork = node.keyNetwork;
+	const coordinatedRepo = node.coordinatedRepo;
 
 	const protocolPrefix = `/optimystic/${networkName}`;
 	const transactor = new NetworkTransactor({

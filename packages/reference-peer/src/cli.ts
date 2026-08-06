@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import { Command } from 'commander';
 import debug from 'debug';
-import { getNetworkManager, createLibp2pNode, MemoryRawStorage, Libp2pKeyPeerNetwork, RepoClient, ArachnodeFretAdapter, type IRawStorage } from '@optimystic/db-p2p';
+import { getNetworkManager, createLibp2pNode, MemoryRawStorage, RepoClient, ArachnodeFretAdapter, type IRawStorage } from '@optimystic/db-p2p';
 import { FileRawStorage } from '@optimystic/db-p2p-storage-fs';
 import { Diary, NetworkTransactor, BTree, type ITransactor, type BlockGets, type GetBlockResults, type ActionBlocks, type BlockActionStatus, type PendRequest, type PendResult, type CommitRequest, type CommitResult } from '@optimystic/db-core';
 import * as readline from 'readline';
@@ -408,20 +408,19 @@ class PeerSession {
 		});
 
 		// LocalTransactor shares the node's own StorageRepo so offline writes are
-		// visible to the running node (and to any later distributed reads).
-		const storageRepo = (node as any).storageRepo;
-		if (!storageRepo) {
-			throw new Error('storageRepo not available on node');
-		}
+		// visible to the running node (and to any later distributed reads). These come
+		// off the node's typed attachment surface (OptimysticNodeAttachments), so no
+		// presence guard is needed — createLibp2pNode always attaches them.
+		const storageRepo = node.storageRepo;
 
-		// Create key network implementation using libp2p
-		const keyNetwork = new Libp2pKeyPeerNetwork(node);
+		// The node's OWN key network. Do NOT construct a second one: it would resolve a
+		// different cohort width than this node's consensus path and would not carry the
+		// network-membership filter, so peers of a DIFFERENT Optimystic network sharing
+		// these bootstraps would be legal coordinator/cohort candidates.
+		const keyNetwork = node.keyNetwork;
 
-		// Get the coordinated repo that includes cluster consensus
-		const coordinatedRepo = (node as any).coordinatedRepo;
-		if (!coordinatedRepo) {
-			throw new Error('coordinatedRepo not available on node');
-		}
+		// The coordinated repo that includes cluster consensus
+		const coordinatedRepo = node.coordinatedRepo;
 
 		// Determine operating mode
 		const isOffline = Boolean(options.offline);
