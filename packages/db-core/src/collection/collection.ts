@@ -1,5 +1,10 @@
 import type { IBlock, Action, ActionType, ActionHandler, BlockId, ITransactor, BlockStore, Transforms, ActionId } from "../index.js";
-import { Log, Atomic, Tracker, copyTransforms, CacheSource, isTransformsEmpty, TransactorSource } from "../index.js";
+import { Log } from "../log/log.js";
+import { Atomic } from "../transform/atomic.js";
+import { Tracker } from "../transform/tracker.js";
+import { CacheSource } from "../transform/cache-source.js";
+import { copyTransforms, isTransformsEmpty } from "../transform/helpers.js";
+import { TransactorSource } from "../transactor/transactor-source.js";
 import { BlockUnavailableError } from "../network/struct.js";
 import type { CollectionHeaderBlock, CollectionId, ICollection, SyncOptions } from "./index.js";
 import { CollectionHeaderVanishedError, SyncRetryExhaustedError } from "./index.js";

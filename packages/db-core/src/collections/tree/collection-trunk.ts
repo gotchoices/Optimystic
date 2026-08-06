@@ -1,4 +1,4 @@
-import { apply, get } from "../../index.js";
+import { apply, get } from "../../blocks/helpers.js";
 import type { BlockId, BlockStore, IBlock, ITreeTrunk } from "../../index.js";
 import type { ITreeNode } from "../../btree/nodes.js";
 import { rootId$, type TreeCollectionHeaderBlock } from "./struct.js";

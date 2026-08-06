@@ -1,4 +1,5 @@
-import { Atomic, type BlockStore, type BlockId, type IBlock } from "../index.js";
+import { Atomic } from "../transform/atomic.js";
+import type { BlockStore, BlockId, IBlock } from "../index.js";
 import { ChainDataBlockType, ChainHeaderBlockType, entries$, headId$, nextId$, priorId$, tailId$ } from "./chain-nodes.js";
 import type { ChainDataNode, ChainHeaderNode } from "./chain-nodes.js";
 import { apply } from "../blocks/index.js";

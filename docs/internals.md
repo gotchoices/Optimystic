@@ -856,6 +856,23 @@ path in `applyConsensusOperation` tolerates it as a no-op).
 **Bug**: Latches are per-node, not distributed. Concurrent transactions on same block can deadlock.
 **Symptom**: Test hangs indefinitely during concurrent writes.
 
+### 6. Importing a Package's Own Root Barrel from Inside It
+**Bug**: A module under `src/` imports the package's own `src/index.ts`. That barrel re-exports
+every module under `src/`, so the module depends on a file that depends on the module — Node
+evaluates the whole group as a cycle, and whichever module is entered first decides which parts
+of the cycle are still half-built when the rest runs.
+**Symptom**: `ReferenceError: Cannot access 'X' before initialization`, pointing at a
+module-scope value in an apparently unrelated file, reproducing only under some entry orders
+(classically: a single spec run standalone passes as part of the whole suite).
+**Fix**: Import directly from the module (or nearest sub-area barrel) that defines the symbol.
+Clause-level `import type` / `export type` is exempt — under `verbatimModuleSyntax` it is erased
+whole and creates no runtime edge. An *inline* `import { type X }` is not exempt; it still emits
+`import {} from '...'`.
+**Enforced by**: `packages/db-core/test/root-barrel-import-cycle.spec.ts`.
+NOTE: that guard only scans `db-core`. The other packages were swept and are clean as of this
+writing; if one of them ever grows the pattern, lift the spec into a shared, per-package check
+rather than copying it.
+
 ## Quereus SQL Dialect
 
 Quereus is **not** SQLite. It is a distinct SQL engine aligned with [The Third Manifesto](https://www.dcs.warwick.ac.uk/~hugh/TTM/DTATRM.pdf). The most important departure: **columns default to NOT NULL** unless explicitly marked `NULL`. Use `pragma default_column_nullability = 'nullable'` for SQL-standard behavior. Other notable differences include empty primary keys for singleton tables (`PRIMARY KEY ()`), native temporal/JSON types, all-virtual-table architecture, operation-specific CHECK constraints, and no triggers. See the [quereus-plugin-optimystic README](../packages/quereus-plugin-optimystic/README.md#quereus-sql-dialect) and the [Quereus SQL Reference](https://github.com/nicktobey/quereus/blob/main/docs/sql.md) (Section 11) for the full list.

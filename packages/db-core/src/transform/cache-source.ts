@@ -1,5 +1,5 @@
 import type { IBlock, BlockHeader, BlockId, BlockSource, BlockType, ReadPurpose, Transforms } from "../index.js";
-import { applyOperation } from "../index.js";
+import { applyOperation } from "./helpers.js";
 import { LruMap } from "../utility/lru-map.js";
 import { createLogger } from "../logger.js";
 import type { ReadDependencyCollector } from "../transaction/read-dependency-collector.js";

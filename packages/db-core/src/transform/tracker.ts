@@ -1,5 +1,6 @@
 import type { IBlock, BlockId, BlockStore as IBlockStore, BlockHeader, BlockOperation, BlockType, BlockSource as IBlockSource, ReadPurpose } from "../index.js";
-import { applyOperation, applyOperations, emptyTransforms, blockIdsForTransforms, ensured } from "../index.js";
+import { applyOperation, applyOperations, emptyTransforms, blockIdsForTransforms } from "./helpers.js";
+import { ensured } from "../utility/ensured.js";
 
 /** A block store that collects transformations, without applying them to the underlying source.
  * Transformations are also applied to the retrieved blocks, making it seem like the source has been modified.

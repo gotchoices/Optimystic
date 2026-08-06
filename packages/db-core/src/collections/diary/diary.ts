@@ -1,4 +1,4 @@
-import { Collection } from "../../index.js";
+import { Collection } from "../../collection/collection.js";
 import type { ITransactor, Action, BlockId, BlockStore, IBlock, CollectionInitOptions, CollectionId } from "../../index.js";
 import { registerCollectionType } from "../../collection/collection-type-registry.js";
 import { DiaryHeaderBlockType } from "./struct.js";

@@ -1,4 +1,6 @@
-import { type ITransactor, type GetBlockResults, type ActionBlocks, type BlockActionStatus, type PendResult, type CommitResult, type PendRequest, type BlockId, type CommitRequest, type BlockGets, type IBlock, type ActionId, type ActionTransforms, type Transform, type Transforms, ensuredMap, Latches, type ClusterNomineesResult } from "../index.js";
+import type { ITransactor, GetBlockResults, ActionBlocks, BlockActionStatus, PendResult, CommitResult, PendRequest, BlockId, CommitRequest, BlockGets, IBlock, ActionId, ActionTransforms, Transform, Transforms, ClusterNomineesResult } from "../index.js";
+import { ensuredMap } from "../utility/ensured.js";
+import { Latches } from "../utility/latches.js";
 import { applyTransform, blockIdsForTransforms, transformForBlockId, emptyTransforms, concatTransform, transformsFromTransform } from "../transform/index.js";
 
 type RevisionNumber = number;
