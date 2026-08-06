@@ -495,6 +495,29 @@ export class StorageRepo implements IRepo, IBlockChangeNotifier, IBlockReplicaSt
 		}));
 	}
 
+	/**
+	 * Commit a previously-pended action across its blocks, under the per-block commit latches.
+	 *
+	 * **Divergence vs genuine fault.** When the batch cannot be completed, the reason decides what
+	 * happens to the pending records the pend left behind. `ClusterMember.applyConsensusOperation`
+	 * makes the same split one layer up — it *tolerates* a divergence (and reconciles every
+	 * `commit.blockIds` entry from a cohort peer) but *propagates* a genuine fault for retry — so this
+	 * method must agree with it:
+	 *
+	 * - **Divergence** — this node is behind the agreed history, either because it holds no
+	 *   materializable base ({@link MissingBaseRevisionError}) or because it never received the pend
+	 *   (the `Pending action … not found` throw). Reconcile is guaranteed to follow and will advance
+	 *   every block in the batch past `request.rev`, so no pending record here can ever be promoted:
+	 *   {@link dropUnpromotablePendings} deletes them (see {@link refuseMissingBase}, which already
+	 *   accepts this tradeoff for the single refusing block).
+	 * - **Genuine fault** — any other throw out of {@link internalCommit} (a raw-storage error, …).
+	 *   `ClusterMember` propagates it and the commit is retried, and a retry can still replay the
+	 *   pendings, so they are KEPT.
+	 *
+	 * The stale/`missedCommits` early return deliberately keeps pendings too: the client path issues an
+	 * explicit `cancel`, and on the consensus path the block advances by replication, where
+	 * `BlockStorage.saveForwardRevision` removes the record (Invariant P).
+	 */
 	async commit(request: CommitRequest, _options?: MessageOptions): Promise<CommitResult> {
 		log('commit actionId=%s rev=%d blockIds=%d', request.actionId, request.rev, request.blockIds.length);
 		const uniqueBlockIds = Array.from(new Set(request.blockIds)).sort();
@@ -620,6 +643,12 @@ export class StorageRepo implements IRepo, IBlockChangeNotifier, IBlockReplicaSt
 			// pending-present — a never-pended block cannot coexist with it in one retry. If a path
 			// ever produces that mix, emit recovered blocks' events before throwing here.
 			if (missingPends.length) {
+				// Divergence (this node is behind): `ClusterMember` treats this throw as the canonical
+				// "behind" signal and reconciles EVERY block in the batch, advancing each past
+				// `request.rev`. Nothing can promote the pendings the other blocks still hold, so drop
+				// them here — while the latches are still held — before reporting. The thrown message
+				// must stay byte-identical: `ClusterMember.isMissingPendingActionError` matches on it.
+				await this.dropUnpromotablePendings(toCommit, request.actionId);
 				throw new Error(`Pending action ${request.actionId} not found for block(s): ${missingPends.map(p => p.blockId).join(', ')}`);
 			}
 
@@ -648,6 +677,10 @@ export class StorageRepo implements IRepo, IBlockChangeNotifier, IBlockReplicaSt
 			// This loop will execute atomically for all blocks due to the acquired locks.
 			// Recovered (Crash-D3) blocks are already committed at request.rev and their pending is
 			// gone, so skip them — internalCommit would throw on the missing pending record.
+			//
+			// Set when the mid-loop failure was a divergence rather than a genuine fault — the split
+			// documented on commit() above, which decides the fate of the batch's pending records.
+			let divergentFailure = false;
 			for (const { blockId, storage } of toCommit) {
 				if (recovered.has(blockId)) {
 					continue;
@@ -666,8 +699,19 @@ export class StorageRepo implements IRepo, IBlockChangeNotifier, IBlockReplicaSt
 					// treats them as idempotent no-ops and advances the remainder. Break
 					// instead of returning so locks release and those landings emit below.
 					failure = { reason: err instanceof Error ? err.message : 'Unknown error during commit' };
+					divergentFailure = err instanceof MissingBaseRevisionError;
 					break;
 				}
+			}
+
+			// The break left every not-yet-reached block still holding its pending record. Whether
+			// that record is still usable depends ENTIRELY on why we stopped — see the table on
+			// commit() above. Runs inside the try, so the per-block latches are still held.
+			// NOTE: a non-divergence fault deliberately KEEPS the batch's pendings so a retry can
+			// replay them. If ClusterMember ever stops retrying propagated commit faults, this arm
+			// becomes dead weight and the discriminator can collapse to "always drop".
+			if (divergentFailure) {
+				await this.dropUnpromotablePendings(toCommit, request.actionId);
 			}
 		}
 		finally {
@@ -681,6 +725,44 @@ export class StorageRepo implements IRepo, IBlockChangeNotifier, IBlockReplicaSt
 		this.emitCollectionChanges(collectionBlocks, request.actionId, request.rev, request.tailId);
 
 		return failure ? { success: false, reason: failure.reason } : { success: true };
+	}
+
+	/**
+	 * Delete `actionId`'s pending record from every given block, tolerating absence.
+	 *
+	 * Called by {@link commit} when it abandons a batch **because this node has diverged from the
+	 * agreed history** — the caller has already made that determination; this helper does not
+	 * re-derive it. Once `ClusterMember` reconciles the batch, every one of these blocks sits at or
+	 * past `request.rev`, so a commit retry partitions them as already-done/stale and never revisits
+	 * their pendings; left in place they are reported as phantom conflicting actions by {@link pend}
+	 * for every later write to the block (under `policy: 'f'`, forever).
+	 *
+	 * No special-casing is needed for blocks that already landed (record promoted), that were
+	 * `recovered` (record already gone), or for the refusing block itself
+	 * ({@link refuseMissingBase} deleted its record): deleting an absent pending record is a no-op on
+	 * every backend.
+	 *
+	 * Per-block failures are logged and swallowed rather than propagated: this cleanup must never
+	 * replace the failure the caller is about to report — the pre-loop throw's message is pattern-
+	 * matched by `ClusterMember.isMissingPendingActionError`, and a swapped error would misroute
+	 * consensus. A leftover record only degrades this node's participation in that one block.
+	 */
+	private async dropUnpromotablePendings(
+		blocks: { blockId: BlockId, storage: IBlockStorage }[],
+		actionId: ActionId
+	): Promise<void> {
+		if (blocks.length === 0) {
+			return;
+		}
+		log('commit:drop-unpromotable-pendings actionId=%s blockIds=%d', actionId, blocks.length);
+		await Promise.all(blocks.map(async ({ blockId, storage }) => {
+			try {
+				await storage.deletePendingTransaction(actionId);
+			} catch (err) {
+				log('commit:drop-unpromotable-pending-failed blockId=%s actionId=%s error=%s', blockId, actionId,
+					err instanceof Error ? err.message : String(err));
+			}
+		}));
 	}
 
 	/**

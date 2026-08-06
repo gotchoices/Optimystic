@@ -271,6 +271,29 @@ export class BlockStorage implements IBlockStorage {
 			};
 			await this.saveRestored(archive);
 
+			// INVARIANT P: a block never holds a pending record AND a committed record for the same
+			// action id. On the commit path `promotePendingTransaction` maintains it by MOVING the
+			// record atomically; this forward path writes the committed transform directly (via
+			// saveRestored above), so it owes the deletion itself. Without it, a node that pended the
+			// action but diverged before committing keeps a record nothing can ever promote — reported
+			// as a phantom conflicting action by every later `pend` on the block, which under
+			// `policy: 'f'` refuses that node's participation in the block's writes permanently.
+			//
+			// Deliberately on the WRITE path only: the monotonic guard above returns before here, and
+			// that early return must stay a true no-op (the earlier call that wrote the revision is the
+			// one that owed the deletion). Deliberately here rather than in `saveRestored`, which is
+			// also reached from ensureRevision's historical restore under a different latch, where a
+			// deletion could race a concurrent promotePendingTransaction; this path holds
+			// `BlockStorage.saveReplica:<id>` and (via StorageRepo.saveReplicatedBlock) the per-block
+			// commit latch, so it is already mutually exclusive with a live commit.
+			//
+			// NOTE: deletes only this revision's actionId, not every pending whose action is already
+			// committed. A broader sweep would repair records orphaned by routes that do not carry the
+			// committing actionId; if orphaned pendings ever show up in the field on blocks whose
+			// committing action id differs, widen to a sweep over listPendingTransactions filtered by
+			// getTransaction.
+			await this.storage.deletePendingTransaction(this.blockId, actionId);
+
 			// Seed metadata when absent, advance latest, and merge the covered range.
 			const prevRev = meta?.latest?.rev;
 			if (!meta) {

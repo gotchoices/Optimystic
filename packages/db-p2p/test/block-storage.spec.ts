@@ -380,6 +380,87 @@ describe('BlockStorage meta.ranges honesty', () => {
 		expect(meta!.latest?.actionId).to.equal('d3');
 	});
 
+	/**
+	 * Invariant P: a block never holds a pending record and a committed record for the same action id.
+	 * `promotePendingTransaction` maintains it on the commit path by MOVING the record; the forward
+	 * write paths (`saveReplica` / `saveDeletion`) write the committed transform directly, so they must
+	 * delete the pending twin themselves. A record left beside the committed one can never be promoted
+	 * (`latest` is already at/past its rev) and `StorageRepo.pend` reports it as a phantom conflicting
+	 * action on every later write to the block.
+	 */
+	describe('Invariant P on the forward write paths', () => {
+		it('saveReplica clears the pending record for the same action id', async () => {
+			const blockId = 'block-invariant-p-replica' as BlockId;
+			const storage = new BlockStorage(blockId, raw);
+			const actionId = 'a-diverged' as ActionId;
+			const block = makeBlock('block-invariant-p-replica', { items: [] });
+
+			// This node pended the action but diverged before committing it.
+			await storage.savePendingTransaction(actionId, { insert: block });
+			expect(await storage.getPendingTransaction(actionId), 'pended here').to.not.equal(undefined);
+
+			// The reconcile path supplies the committed revision for the SAME action.
+			await storage.saveReplica(block, { rev: 2, actionId });
+
+			expect(await storage.getLatest(), 'revision landed').to.deep.equal({ rev: 2, actionId });
+			expect(await storage.getPendingTransaction(actionId), 'pending twin removed').to.equal(undefined);
+			expect(await storage.getTransaction(actionId), 'committed record present').to.not.equal(undefined);
+		});
+
+		it('a later fail-on-pending write is accepted after the replica lands', async () => {
+			// The user-visible consequence: without the deletion the node refuses every later
+			// `policy: 'f'` write to this block, forever.
+			const blockId = 'block-invariant-p-repo' as BlockId;
+			const repo = new StorageRepo((id) => new BlockStorage(id, raw));
+			const block = makeBlock('block-invariant-p-repo', { items: [] });
+
+			await repo.pend({ actionId: 'a-diverged' as ActionId, transforms: makeInsertTransforms(blockId, block), policy: 'c' });
+			await repo.saveReplicatedBlock(blockId, block, { rev: 2, actionId: 'a-diverged' as ActionId });
+
+			const later = await repo.pend({
+				actionId: 'a-later' as ActionId,
+				transforms: makeUpdateTransforms(blockId, [['items', 0, 0, ['y']]]),
+				policy: 'f'
+			});
+			expect(later.success, 'no phantom conflicting action may remain').to.equal(true);
+		});
+
+		it('saveDeletion clears the pending record for the same action id', async () => {
+			const blockId = 'block-invariant-p-deletion' as BlockId;
+			const storage = new BlockStorage(blockId, raw);
+			const actionId = 'a-del' as ActionId;
+
+			await storage.saveReplica(makeBlock('block-invariant-p-deletion', { items: ['live'] }), { rev: 1, actionId: 'r1' as ActionId });
+			await storage.savePendingTransaction(actionId, { delete: true });
+			expect(await storage.getPendingTransaction(actionId), 'delete pended here').to.not.equal(undefined);
+
+			await storage.saveDeletion({ rev: 2, actionId });
+
+			expect((await storage.getLatest())?.rev, 'tombstone landed').to.equal(2);
+			expect(await storage.getPendingTransaction(actionId), 'pending twin removed').to.equal(undefined);
+		});
+
+		it('the monotonic no-op deletes nothing (it wrote nothing)', async () => {
+			// The guard returns before any committed record is written, so it owes no deletion — the
+			// earlier call that wrote the revision is the one that owed it. A pending at a LOWER rev
+			// stays a legitimate in-flight write here.
+			const blockId = 'block-invariant-p-noop' as BlockId;
+			const storage = new BlockStorage(blockId, raw);
+			const actionId = 'a-inflight' as ActionId;
+
+			await storage.saveReplica(makeBlock('block-invariant-p-noop', { items: [] }), { rev: 5, actionId: 'r5' as ActionId });
+			await storage.savePendingTransaction(actionId, { updates: [['items', 0, 0, ['x']]] });
+			const before = await raw.getMetadata(blockId);
+
+			// rev 3 <= held rev 5 ⇒ monotonic guard fires, nothing is written.
+			const result = await storage.saveReplica(makeBlock('block-invariant-p-noop', { items: ['stale'] }), { rev: 3, actionId });
+			expect(result.rev, 'held latest returned').to.equal(5);
+
+			expect(await storage.getPendingTransaction(actionId), 'guarded call must not delete').to.not.equal(undefined);
+			expect(await raw.getMetadata(blockId), 'metadata untouched').to.deep.equal(before);
+		});
+	});
+
 	it('recover merges the recovered span into ranges', async () => {
 		const blockId = 'block-recover' as BlockId;
 		const actionId = 'a1' as ActionId;

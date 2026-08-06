@@ -1833,6 +1833,9 @@ describe('StorageRepo', () => {
 			};
 
 			it('surfaces the refusal even when a sibling block committed first', async () => {
+				const events: CollectionChangeEvent[] = [];
+				repo.onCollectionChange('collection-1' as BlockId, (e) => events.push(e));
+
 				const result = await commitMixedBatch([OK, BLOCK]);
 
 				expectMissingBase(result);
@@ -1840,6 +1843,12 @@ describe('StorageRepo', () => {
 				// no-op, so it must NOT be rolled back.
 				expect((await repo.get({ blockIds: [OK] }))[OK]?.state?.latest?.rev, 'sibling landed').to.equal(2);
 				expect((await repo.get({ blockIds: [BLOCK] }))[BLOCK]?.state?.latest, 'refusing block untouched').to.equal(undefined);
+				// … and its change event still fires despite the batch failing afterwards. The
+				// pending-record cleanup runs before the emit and must not suppress or disturb it.
+				expect(events.length, 'the landed sibling still emits').to.equal(1);
+				expect(events[0]!.blockIds, 'only the block that landed').to.deep.equal([OK]);
+				expect(events[0]!.actionId).to.equal('a-mixed');
+				expect(events[0]!.rev).to.equal(2);
 			});
 
 			it('leaves a not-yet-reached sibling uncommitted rather than half-applied', async () => {
@@ -1862,27 +1871,22 @@ describe('StorageRepo', () => {
 				return later.success;
 			};
 
-			it('KNOWN GAP: a not-yet-reached sibling keeps a pending it can never promote', async () => {
-				// The break leaves the sibling's pending in place; reconcile then advances that block
-				// past the action, so the pending is unpromotable forever. It is reported as a
-				// conflicting action by every later write to the block.
-				//
-				// Consensus tolerates this (a member's failed pend is logged, not thrown — see
-				// ClusterMember's consensus-pend-diverged branch), so the member is degraded rather
-				// than broken: it stops participating in that block's pend/commit and converges only
-				// by replication. Tracked by `bug-orphaned-pending-after-divergent-commit`; flip this
-				// assertion when that lands.
+			it('drops a not-yet-reached sibling’s pending, which could never be promoted', async () => {
+				// The break leaves the sibling unreached; reconcile then advances that block past the
+				// action, so a pending left behind would be unpromotable forever and would be reported
+				// as a conflicting action by every later write to the block. commit() drops the whole
+				// batch's pendings for this (divergence) failure kind, so the node keeps participating.
 				await commitMixedBatch([BLOCK, OK]);
 				await repo.saveReplicatedBlock(OK, makeBlock(OK, { items: [] }), { actionId: 'a-mixed' as ActionId, rev: 2 });
 
-				expect(await laterExclusiveWriteAccepted(), 'orphaned pending currently blocks later writes').to.equal(false);
+				expect(await laterExclusiveWriteAccepted(), 'no orphaned pending may block later writes').to.equal(true);
 			});
 
-			it('KNOWN GAP: the pre-existing missing-pend divergence orphans the same way', async () => {
-				// Same orphan without any missing-base refusal involved: commit() throws for the block
+			it('drops them for the missing-pend divergence too (no refusal involved)', async () => {
+				// Same orphan route without any missing-base refusal: commit() throws for the block
 				// whose pend never arrived, BEFORE the per-block loop runs, so every block in the batch
-				// keeps its pending. This is why the gap above is pre-existing rather than introduced by
-				// the refusal — the refusal only adds one more route into it.
+				// would keep its pending. ClusterMember reconciles the whole batch after this throw, so
+				// commit drops them here as well.
 				await repo.pend({
 					actionId: 'a-mixed' as ActionId,
 					transforms: makeInsertTransforms(OK, makeBlock(OK, { items: [] })),
@@ -1896,12 +1900,86 @@ describe('StorageRepo', () => {
 				} catch (err) {
 					thrown = err as Error;
 				}
+				// The message shape is load-bearing: ClusterMember.isMissingPendingActionError matches
+				// on it to route this to reconcile. Cleanup must not change or replace it.
 				expect(thrown?.message ?? '', 'this path throws, it does not refuse').to.include('Pending action');
 				expect(thrown?.message ?? '').to.not.include(MISSING_BASE_REVISION_REASON);
 
 				await repo.saveReplicatedBlock(OK, makeBlock(OK, { items: [] }), { actionId: 'a-mixed' as ActionId, rev: 2 });
 
-				expect(await laterExclusiveWriteAccepted(), 'same orphan, no refusal involved').to.equal(false);
+				expect(await laterExclusiveWriteAccepted(), 'same route, same cleanup').to.equal(true);
+			});
+
+			it('KEEPS the pendings when the failure is a genuine fault, and a retry replays them', async () => {
+				// The discriminator's other arm. A raw-storage fault is NOT divergence: ClusterMember
+				// propagates it for retry rather than reconciling, so the batch's pendings must survive
+				// or the retry has nothing to commit. Without this guard, Arm 1 would silently degrade
+				// every transient fault into a reconcile.
+				const FAULT = 'fault-block' as BlockId;
+				let faulted = false;
+				const faulting = new (class extends MemoryRawStorage {
+					override async saveMaterializedBlock(blockId: BlockId, actionId: ActionId, block?: IBlock): Promise<void> {
+						// One-shot, and only for FAULT: the retry below must be able to succeed.
+						if (blockId === FAULT && !faulted) {
+							faulted = true;
+							throw new Error('injected raw-storage fault');
+						}
+						await super.saveMaterializedBlock(blockId, actionId, block);
+					}
+				})();
+				const faultingRepo = new StorageRepo((blockId) => new BlockStorage(blockId, faulting));
+
+				await faultingRepo.pend({
+					actionId: 'a-fault' as ActionId,
+					transforms: {
+						inserts: { [FAULT]: makeBlock(FAULT, { items: [] }), [OK]: makeBlock(OK, { items: [] }) },
+						updates: {},
+						deletes: []
+					},
+					policy: 'c'
+				});
+
+				// FAULT first, so the break happens before OK is reached.
+				const result = await faultingRepo.commit({ actionId: 'a-fault' as ActionId, blockIds: [FAULT, OK], tailId: OK, rev: 1 });
+				expect(result.success, 'the injected fault fails the commit').to.equal(false);
+				expect((result as { reason?: string }).reason ?? '', 'a fault, not a divergence refusal')
+					.to.not.include(MISSING_BASE_REVISION_REASON);
+
+				// The not-yet-reached sibling still holds its pending record …
+				const okPending = await new BlockStorage(OK, faulting).getPendingTransaction('a-fault' as ActionId);
+				expect(okPending, 'a retryable fault must not drop the batch’s pendings').to.not.equal(undefined);
+				// … and so does the faulting block itself (its own commit never reached promotion).
+				const faultPending = await new BlockStorage(FAULT, faulting).getPendingTransaction('a-fault' as ActionId);
+				expect(faultPending, 'the faulting block keeps its pending too').to.not.equal(undefined);
+
+				// The retry (same actionId + rev) replays both from those records.
+				const retried = await faultingRepo.commit({ actionId: 'a-fault' as ActionId, blockIds: [FAULT, OK], tailId: OK, rev: 1 });
+				expect(retried.success, 'retry replays the retained pendings').to.equal(true);
+				const got = await faultingRepo.get({ blockIds: [FAULT, OK] });
+				expect(got[FAULT]?.state?.latest?.rev).to.equal(1);
+				expect(got[OK]?.state?.latest?.rev).to.equal(1);
+			});
+
+			it('an idempotent-retry block is not in the batch, so cleanup cannot touch it', async () => {
+				// OK is committed on its own first, so the mixed commit partitions it as alreadyDone —
+				// never in `toCommit`, hence never a cleanup target. It must keep its committed state
+				// and stay writable.
+				await repo.pend({
+					actionId: 'a-mixed' as ActionId,
+					transforms: {
+						inserts: { [OK]: makeBlock(OK, { items: [] }) },
+						updates: { [BLOCK]: [['items', 0, 0, ['x']]] },
+						deletes: []
+					},
+					policy: 'c'
+				});
+				expect((await repo.commit({ actionId: 'a-mixed' as ActionId, blockIds: [OK], tailId: OK, rev: 2 })).success).to.equal(true);
+
+				// Now the full batch: OK is alreadyDone, BLOCK refuses for a missing base.
+				expectMissingBase(await repo.commit({ actionId: 'a-mixed' as ActionId, blockIds: [OK, BLOCK], tailId: OK, rev: 2 }));
+
+				expect((await repo.get({ blockIds: [OK] }))[OK]?.state?.latest?.rev, 'already-done block untouched').to.equal(2);
+				expect(await laterExclusiveWriteAccepted(), 'and still writable').to.equal(true);
 			});
 		});
 	});

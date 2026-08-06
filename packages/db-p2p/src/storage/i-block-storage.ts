@@ -47,7 +47,18 @@ export interface IBlockStorage {
     /** Saves a revision */
     saveRevision(rev: number, actionId: ActionId): Promise<void>;
 
-    /** Promotes a pending action to committed */
+    /**
+     * Promotes a pending action to committed, MOVING the record from the pending namespace to the
+     * committed one in a single atomic step.
+     *
+     * **Invariant P** — a block never holds a pending record and a committed record for the same
+     * action id at the same time. This method maintains it on the commit path; every OTHER writer of
+     * a committed transform for a block ({@link saveReplica}, {@link saveDeletion}, and any forward
+     * path added later) must maintain it too, by deleting that action's pending record when it
+     * writes the committed one. A pending record left beside a committed one can never be promoted,
+     * and is reported as a phantom conflicting action by `StorageRepo.pend` on every later write to
+     * the block.
+     */
     promotePendingTransaction(actionId: ActionId): Promise<void>;
 
     /** Sets the latest revision information */
@@ -62,6 +73,11 @@ export interface IBlockStorage {
      * it falls back to `rev = 1` and a deterministic `actionId` derived from the block
      * (so retries stay idempotent — never random).
      *
+     * Maintains **Invariant P** (see {@link promotePendingTransaction}): writing the committed
+     * transform for `actionId` also deletes that action's pending record on this block, so a node
+     * that pended the action but diverged before committing it does not keep an unpromotable record.
+     * Only on the write path — the monotonic no-op below deletes nothing.
+     *
      * No-op (still durable) when an equal-or-newer revision is already present: `latest`
      * is never downgraded. Idempotent for a fixed `(rev, actionId)`. Returns the
      * effective latest `ActionRev`.
@@ -74,6 +90,9 @@ export interface IBlockStorage {
      * `ranges` and advances `latest` monotonically. The reverse-apply path treats the absent
      * materialization as a deletion, so a `getBlock()` after a tombstone reads back as *absent*
      * (`undefined`) while a historical `getBlock(creationRev)` still materializes the created content.
+     *
+     * Maintains **Invariant P** (see {@link promotePendingTransaction}) on the write path, exactly as
+     * {@link saveReplica} does: the tombstone's `actionId` loses its pending record on this block.
      *
      * Idempotent for a fixed `(rev, actionId)`; never downgrades `latest` (a no-op — still durable —
      * when an equal-or-newer revision is already present). Returns the effective latest `ActionRev`.

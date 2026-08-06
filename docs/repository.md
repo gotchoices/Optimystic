@@ -86,6 +86,33 @@ Here is how a transaction proceeds for a given cluster:
   - Promotes pending transaction to committed state
   - Handles block deletion if specified in transform
 
+#### Invariant P — a pending record and a committed record never coexist for one action
+
+A block never holds a pending record and a committed record for the same action id at the same
+time. On the commit path this holds because promotion *moves* the record from the pending namespace
+to the committed one atomically (a single rename on the filesystem backend, a synchronous two-map
+swap in memory) rather than copying it.
+
+Every **other** writer of a committed transform for a block must maintain the same invariant by
+deleting that action's pending record when it writes the committed one. Today those writers are the
+forward-write paths `BlockStorage.saveReplica` (replica persist, e.g. churn re-replication and the
+divergence reconcile) and `BlockStorage.saveDeletion` (forward tombstone); both go through
+`saveForwardRevision`, which performs the deletion. Any forward path added later inherits the
+obligation.
+
+The invariant matters because a pending record left beside a committed one can never be promoted:
+once the block's `latest` has advanced past the revision the record was pended at, a commit retry
+partitions the block as already-done or stale and never revisits it. `pend` then reports that
+record as a conflicting action on every later write to the block — under the fail-on-pending policy
+the node refuses those writes outright and can only catch up by replication, so it looks healthy
+and serves reads while silently contributing nothing to that block's writes.
+
+The commit path itself also drops records that become unpromotable when it abandons a batch. It
+does so **only** for divergence failures (this node holds no materializable base for a block, or
+never received the pend), because the cluster layer reconciles the whole batch after those and every
+block advances past the action. A genuine storage fault keeps the batch's pendings, because that
+failure is retried and the retry can still replay them.
+
 ## Block Storage Repository
 
 ![Block Storage Repository](figures/storage-repo.svg)
