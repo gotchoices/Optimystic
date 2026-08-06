@@ -75,7 +75,7 @@ yarn optimystic-peer interactive \
   --announce-addr /dns4/bootstrap.example.com/tcp/443/wss
 ```
 
-You'll see a multiaddr like `/ip4/0.0.0.0/tcp/9091/ws/p2p/<PEER_ID>`. Browsers usually need WSS (TLS-terminated WebSocket) — terminate TLS in front of the peer with a reverse proxy. Caddy makes this a one-liner:
+Browsers usually need WSS (TLS-terminated WebSocket) — terminate TLS in front of the peer with a reverse proxy. Caddy makes this a one-liner:
 
 ```caddy
 bootstrap.example.com {
@@ -83,7 +83,7 @@ bootstrap.example.com {
 }
 ```
 
-(nginx works too; the only requirement is that it forwards the `Upgrade: websocket` request to the peer.) `--announce-addr` tells the peer to advertise the public `wss` address instead of the bound `0.0.0.0:9091` one — without it, the peer's own identify/relay-reservation info still points at the unreachable bind address, even though the recipe above works around it manually. Clients then dial:
+(nginx works too; the only requirement is that it forwards the `Upgrade: websocket` request to the peer.) `--announce-addr` tells the peer to advertise the public `wss` address instead of the bound `0.0.0.0:9091` one. Without it the peer still *works* when dialed at the public address, but everything it says about itself — identify responses, relay reservations, DHT provider records — points at the unreachable bind address, so peers that learn about it indirectly cannot reach it. With the flag set, the startup banner and `--announce-file` report the announced address rather than the bound one. Clients dial:
 
 ```
 /dns4/bootstrap.example.com/tcp/443/wss/p2p/<PEER_ID>
@@ -93,7 +93,7 @@ Notes:
 - `--relay` is what lets two browser peers (each unable to accept inbound connections) talk to each other through this node.
 - Drop `--no-tcp` if you want a single bootstrap that serves both Node-side TCP peers and browser/RN WebSocket peers. In that case use `--append-announce-addr` instead of `--announce-addr` to advertise the public `wss` address *in addition to* the bound TCP one, rather than replacing it.
 - `--announce-addr` / `--append-announce-addr` are repeatable for multiple public addresses.
-- You can combine `--ws-port` with `--port` — `node.getMultiaddrs()` (the "📡 Listening on:" startup line) prints all listen addresses (bound, not announced).
+- You can combine `--ws-port` with `--port` — the "📡 Listening on:" startup line prints `node.getMultiaddrs()`, which is the *advertised* set: the bound listen addresses normally, but the `--announce-addr` set instead once that flag is given (`--append-announce-addr` adds to the bound ones rather than replacing them). Same for what `--announce-file` writes.
 
 ---
 

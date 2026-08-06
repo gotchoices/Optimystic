@@ -59,6 +59,7 @@
   "dependencies": {
     "@libp2p/interface": "^3.2.4",
     "@libp2p/peer-id": "^6.0.4",
+    "@multiformats/multiaddr": "^13.0.1",
     "@optimystic/db-core": "workspace:^",
     "@optimystic/db-p2p": "workspace:^",
     "@optimystic/db-p2p-storage-fs": "workspace:^",

@@ -1,5 +1,6 @@
 #!/usr/bin/env node
-import { Command } from 'commander';
+import { Command, InvalidArgumentError } from 'commander';
+import { multiaddr } from '@multiformats/multiaddr';
 import debug from 'debug';
 import { getNetworkManager, createLibp2pNode, MemoryRawStorage, RepoClient, ArachnodeFretAdapter, type IRawStorage } from '@optimystic/db-p2p';
 import { FileRawStorage } from '@optimystic/db-p2p-storage-fs';
@@ -746,6 +747,25 @@ program
 	.version('0.0.1');
 
 /**
+ * Commander reducer for a repeatable multiaddr option: validates on the way in and appends.
+ *
+ * Validating here rather than letting libp2p do it matters because libp2p does NOT parse the
+ * announce set at node construction — it parses lazily inside `getAddresses()`, so a malformed
+ * value surfaces as a raw `InvalidMultiaddrError` stack trace AFTER "Node started" (port already
+ * bound), naming neither the flag nor the bad value. A shell that rewrites POSIX-looking arguments
+ * makes that an easy mistake: MSYS/Git-Bash on Windows turns `/dns4/host/tcp/443/wss` into
+ * `C:/Program Files/Git/dns4/...` before the CLI ever sees it.
+ */
+const collectMultiaddr = (flag: string) => (val: string, prev: string[]): string[] => {
+	try {
+		multiaddr(val);
+	} catch (err) {
+		throw new InvalidArgumentError(`${flag} "${val}" is not a valid multiaddr: ${(err as Error).message}`);
+	}
+	return prev.concat([val]);
+};
+
+/**
  * Apply the network/storage options shared verbatim by the `interactive`,
  * `service`, and `run` commands. Extracted so the three stay in lockstep;
  * command-specific options (e.g. `run`'s --action/--diary/--content) are layered
@@ -773,8 +793,8 @@ function withCommonPeerOptions(cmd: Command): Command {
 		.option('--offline', 'Run as single-node LocalTransactor (no distributed consensus)')
 		.option('--bootstrap-file <path>', 'Path to JSON containing bootstrap multiaddrs or node list')
 		.option('--announce-file <path>', 'Write node info (peerId, multiaddrs) to this JSON file for mesh launchers')
-		.option('--announce-addr <multiaddr>', 'Multiaddr to advertise INSTEAD OF the listen addrs (e.g. behind a TLS proxy: /dns4/host/tcp/443/wss). Repeatable; replaces the advertised set entirely', (val: string, prev: string[]) => prev.concat([val]), [] as string[])
-		.option('--append-announce-addr <multiaddr>', 'Multiaddr to advertise IN ADDITION TO the listen addrs. Repeatable; ignored while --announce-addr is set', (val: string, prev: string[]) => prev.concat([val]), [] as string[]);
+		.option('--announce-addr <multiaddr>', 'Multiaddr to advertise INSTEAD OF the listen addrs (e.g. behind a TLS proxy: /dns4/host/tcp/443/wss). Repeatable; replaces the advertised set entirely', collectMultiaddr('--announce-addr'), [] as string[])
+		.option('--append-announce-addr <multiaddr>', 'Multiaddr to advertise IN ADDITION TO the listen addrs. Repeatable; ignored while --announce-addr is set', collectMultiaddr('--append-announce-addr'), [] as string[]);
 }
 
 // Interactive mode - network-first approach
