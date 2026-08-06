@@ -682,656 +682,654 @@ export async function createLibp2pNodeBase(
 
 	await node.start();
 
-	// Initialize peer reputation service
-	const reputation = new PeerReputationService();
-
-	// Initialize cluster coordination components
-	const networkMode: NetworkMode = (options.bootstrapNodes?.length ?? 0) > 0 ? 'joining' : 'forming';
-	// Network-namespaced protocol prefix, threaded into the key network so coordinator/
-	// cohort selection is scoped to peers that serve THIS network's cluster/repo protocol.
-	// A peer that only belongs to another network sharing the same physical nodes/
-	// bootstraps registers a different (network-namespaced) identify protocol, so it is
-	// never selected and can't drag this network's super-majority below quorum.
-	const protocolPrefix = `/optimystic/${options.networkName}`;
-	const keyNetwork = new Libp2pKeyPeerNetwork(node, consensusConfig.clusterSize, undefined, networkMode, options.persistence, reputation, protocolPrefix);
-	await keyNetwork.initFromPersistedState();
-	const createClusterClient = (peerId: any) => ClusterClient.create(peerId, keyNetwork, protocolPrefix);
-
-	// Inject reputation into NetworkManagerService. Load-bearing and non-optional: the service is
-	// unconditionally present, so a throw is a real wiring bug. Unlike the pre-start injections above
-	// the node has already started here, so stop it before rethrowing rather than leaking a started
-	// node + open transports (mirrors the cohortTopic hard-fail blocks below).
+	// Everything from here to the `return` runs against an ALREADY STARTED node (open transports,
+	// listening addresses, running services). A rejection out of that span used to hand the caller an
+	// error and no handle, leaving the node running with its listener port still bound — unrecoverable
+	// for the caller and enough to block the port for the next start attempt. So the whole post-start
+	// body rolls back: see the `catch` at the bottom of this function.
 	try {
+
+		// Initialize peer reputation service
+		const reputation = new PeerReputationService();
+
+		// Initialize cluster coordination components
+		const networkMode: NetworkMode = (options.bootstrapNodes?.length ?? 0) > 0 ? 'joining' : 'forming';
+		// Network-namespaced protocol prefix, threaded into the key network so coordinator/
+		// cohort selection is scoped to peers that serve THIS network's cluster/repo protocol.
+		// A peer that only belongs to another network sharing the same physical nodes/
+		// bootstraps registers a different (network-namespaced) identify protocol, so it is
+		// never selected and can't drag this network's super-majority below quorum.
+		const protocolPrefix = `/optimystic/${options.networkName}`;
+		const keyNetwork = new Libp2pKeyPeerNetwork(node, consensusConfig.clusterSize, undefined, networkMode, options.persistence, reputation, protocolPrefix);
+		await keyNetwork.initFromPersistedState();
+		const createClusterClient = (peerId: any) => ClusterClient.create(peerId, keyNetwork, protocolPrefix);
+
+		// Inject reputation into NetworkManagerService. Load-bearing and non-optional: the service is
+		// unconditionally present, so a throw is a real wiring bug. The node has already started here, but
+		// no ad-hoc stop is needed: the post-start rollback `catch` at the bottom of this function stops it.
 		wired.networkManager.setReputation(reputation);
-	} catch (err) {
-		await node.stop();
-		throw err;
-	}
 
-	// Create partition detector and get FRET service
-	const partitionDetector = new PartitionDetector();
-	const fretSvc = (node as any).services?.fret as FretService | undefined;
+		// Create partition detector and get FRET service
+		const partitionDetector = new PartitionDetector();
+		const fretSvc = (node as any).services?.fret as FretService | undefined;
 
-	// Fetch a block archive from one cohort peer over the sync protocol, bounded by a
-	// per-peer timeout so an unreachable peer can't stall reconciliation. Mirrors the
-	// SyncClient query in `clusterLatestCallback`, but returns the full archive (which
-	// carries the materialized block) rather than only the latest ActionRev.
-	const fetchArchiveFromPeer = async (peerIdStr: string, blockId: BlockId): Promise<BlockArchive | undefined> => {
-		let peerId: ReturnType<typeof peerIdFromString>;
-		try {
-			peerId = peerIdFromString(peerIdStr);
-		} catch {
-			return undefined;
-		}
-		if (peerId.equals(node.peerId)) return undefined;
-		const syncClient = new SyncClient(peerId, keyNetwork, protocolPrefix);
-		try {
-			const response = await Promise.race<SyncResponse>([
-				syncClient.requestBlock({ blockId, rev: undefined }),
-				new Promise<SyncResponse>(resolve => { setTimeout(() => resolve({ success: false }), 1000).unref(); })
-			]);
-			return response.success ? response.archive : undefined;
-		} catch {
-			// Peer unreachable / no data — caller falls back to the next cohort peer.
-			return undefined;
-		}
-	};
-
-	// Active reconciliation for a block this member committed without a materializable base
-	// (cohort drift, or a refused `missing-base-revision` commit). See `reconcile-block.ts` for
-	// the corroboration rules — in particular why both quorums are capped by how many peers
-	// could answer at all, which is what lets a genuinely two-node cohort heal.
-	// NOTE: this and the CoordinatorRepo below must cap against the SAME
-	// repairCorroborationClusterSize, or the two restoration paths disagree about how much trust a
-	// lone peer gets. Safe today because both read the one `resolveClusterPolicy` result above; if
-	// either ever resolves its own value, add a fail-fast coupling check like
-	// `assertSuperMajorityCoupling` rather than relying on proximity.
-	const reconcileBlock: ReconcileBlockCallback = createReconcileBlock({
-		selfPeerId: node.peerId.toString(),
-		fetchArchive: fetchArchiveFromPeer,
-		saveReplicatedBlock: (blockId, block, source) => storageRepo.saveReplicatedBlock(blockId, block, source),
-		simpleMajorityThreshold: consensusConfig.simpleMajorityThreshold,
-		repairCorroborationClusterSize: consensusConfig.repairCorroborationClusterSize,
-		reputation
-	});
-
-	// Member-side membership derivation for the admission gate: independently re-derive this block's
-	// responsible cluster from the SAME source the coordinator uses (IKeyNetwork.findCluster), plus FRET's
-	// network-size confidence. A member gates a coordinator-declared peer set against this view before
-	// voting, so a self-shrunk minority-partition set cannot be voted into super-majority (see cluster-repo
-	// admitMembership). No FRET ⇒ confidence 0 ⇒ the gate fails closed for any downsize.
-	const deriveExpectedCluster: DeriveExpectedClusterCallback = async (blockId) => {
-		const peers = await keyNetwork.findCluster(new TextEncoder().encode(blockId));
-		let confidence = 0;
-		if (fretSvc) {
+		// Fetch a block archive from one cohort peer over the sync protocol, bounded by a
+		// per-peer timeout so an unreachable peer can't stall reconciliation. Mirrors the
+		// SyncClient query in `clusterLatestCallback`, but returns the full archive (which
+		// carries the materialized block) rather than only the latest ActionRev.
+		const fetchArchiveFromPeer = async (peerIdStr: string, blockId: BlockId): Promise<BlockArchive | undefined> => {
+			let peerId: ReturnType<typeof peerIdFromString>;
 			try {
-				confidence = fretSvc.getNetworkSizeEstimate().confidence;
-			} catch {
-				// Leave confidence 0 → fail closed for downsizing.
-			}
-		}
-		return { peers: peers ?? {}, confidence };
-	};
-
-	clusterImpl = clusterMember({
-		storageRepo,
-		peerNetwork: keyNetwork,
-		peerId: node.peerId,
-		privateKey: nodePrivateKey,
-		protocolPrefix,
-		partitionDetector,
-		fretService: fretSvc,
-		validator: options.validator,
-		reputation,
-		consensusConfig,
-		stateStore: options.transactionStateStore,
-		reconcileBlock,
-		onCommitCertificate,
-		deriveExpectedCluster
-		// `recomputeArbitratorSet` (invalidation layer-2) is intentionally NOT wired here yet: a live FRET
-		// recompute needs a churn-tolerance window so it does not false-reject legitimate certificates from
-		// late-joiners (a liveness regression). Until that is tuned against live topology — and the
-		// cohort-topic membership-cert trust anchor (layer 3) lands — invalidation verification runs on the
-		// challenger-bound set + membership + dedup (layer 1) and LOGS the residual anchoring gap. See
-		// `verifyInvalidationCertificate` and `tickets/plan/cohort-topic-membership-cert-trust-anchoring.md`.
-	});
-
-	const coordinatorRepoFactory = coordinatorRepo(
-		keyNetwork,
-		createClusterClient,
-		{
-			// clusterSize is now part of consensusConfig (member + coordinator share one reference).
-			...consensusConfig
-		},
-		fretSvc,
-		reputation,
-		options.transactionStateStore
-	);
-
-	// Create callback for querying cluster peers for their latest block revision. Three-way
-	// contract (see ClusterLatestCallback): an ActionRev is the peer's claim, a resolved
-	// `undefined` is the peer answering "I hold nothing", and a REJECTION is silence — the
-	// coordinator counts it as "did not answer" and refuses to report an authoritative absent
-	// over it. Transport errors must therefore propagate, not collapse into `undefined` (that
-	// collapse let a slow two-node cohort report a missing block as authoritatively absent —
-	// ticket cluster-read-consult-cannot-report-unreachable).
-	const clusterLatestCallback: ClusterLatestCallback = async (peerId, blockId, context?) => {
-		// Self-read short-circuit: dialling self via SyncClient is a round trip
-		// with no remote on the other end, and on nodes without listen addresses
-		// (solo WebSocket-only, bare-RN, etc.) the self-dial can hang the dial
-		// queue. Read directly from the local storage repo instead. The catch stays:
-		// a local storage error is not a cohort peer being unreachable, and the
-		// coordinator ignores a self rejection anyway.
-		if (peerId.equals(node.peerId)) {
-			try {
-				const result = await storageRepo.get({ blockIds: [blockId], context });
-				return result[blockId]?.state?.latest;
+				peerId = peerIdFromString(peerIdStr);
 			} catch {
 				return undefined;
 			}
-		}
-		const syncClient = new SyncClient(peerId, keyNetwork, protocolPrefix);
-		// No try/catch: a dial or protocol failure rejects through to the coordinator, whose
-		// per-peer deadline also bounds a hung request — slowness needs no race here.
-		const response = await syncClient.requestBlock({ blockId, rev: undefined });
-		if (response.success && response.archive) {
-			const revisions = Object.keys(response.archive.revisions).map(Number);
-			if (revisions.length > 0) {
-				const maxRev = Math.max(...revisions);
-				const revisionData = response.archive.revisions[maxRev];
-				if (revisionData?.action) {
-					return { actionId: revisionData.action.actionId, rev: maxRev };
-				}
+			if (peerId.equals(node.peerId)) return undefined;
+			const syncClient = new SyncClient(peerId, keyNetwork, protocolPrefix);
+			try {
+				const response = await Promise.race<SyncResponse>([
+					syncClient.requestBlock({ blockId, rev: undefined }),
+					new Promise<SyncResponse>(resolve => { setTimeout(() => resolve({ success: false }), 1000).unref(); })
+				]);
+				return response.success ? response.archive : undefined;
+			} catch {
+				// Peer unreachable / no data — caller falls back to the next cohort peer.
+				return undefined;
 			}
-		}
-		// The peer DID answer, without data: `success:false` is the sync service's "Block not
-		// found in local storage", and an archive with no usable revisions holds nothing either
-		// way. Both are absent claims, not silence.
-		return undefined;
-	};
+		};
 
-	coordinatedRepo = coordinatorRepoFactory({
-		storageRepo,
-		localCluster: clusterImpl,
-		localPeerId: node.peerId,
-		clusterLatestCallback,
-		// Read-driven acquisition shares the commit path's reconcile callback verbatim: same bounded
-		// archive fetch, same (rev, actionId) and content quorums, same monotonic saveReplicatedBlock
-		// funnel. `clusterLatestCallback` alone can only tell the reader WHICH revision the cohort
-		// holds; this is what moves the bytes. Only reached once a corroborated revision exists, so a
-		// genuinely absent block still costs no archive fetch.
-		acquireBlockFromCohort: reconcileBlock
-	});
-
-	// Fail-fast coupling: the cluster member (what accepts a super-majority as sufficient) and the
-	// coordinator (what declares a transaction committed on that super-majority) MUST run the same
-	// threshold, or the node would come up able to disagree with itself mid-consensus. Both are fed from
-	// the single `consensusConfig` above; this asserts on their RESOLVED values so any future drift throws
-	// HERE at construction. See `assertSuperMajorityCoupling`.
-	assertSuperMajorityCoupling(
-		clusterImpl as import('./cluster/cluster-repo.js').ClusterMember,
-		coordinatedRepo as import('./repo/coordinator-repo.js').CoordinatorRepo
-	);
-
-	// Recover persisted transaction state before accepting new requests
-	if (options.transactionStateStore) {
-		await (clusterImpl as import('./cluster/cluster-repo.js').ClusterMember).recoverTransactions();
-		await (coordinatedRepo as import('./repo/coordinator-repo.js').CoordinatorRepo).recoverTransactions();
-	}
-
-	// --- Shared owned-block set for the resilience monitors ---
-	// SpreadOnChurnMonitor (sender) and RebalanceMonitor (responsibility tracker) both act on "the
-	// blocks this node physically holds". They share ONE Set so the two can never drift: a single
-	// owned-block feed populates it, and the rebalance responsibility-loss signal evicts from it
-	// (in the rebalance block below). Both monitors take this exact instance via deps.trackedBlocks.
-	const networkManager = (node as any).services?.networkManager as NetworkManagerService | undefined;
-
-	// See the comment above `consensusConfig` for why every cluster-size consumer must read the SAME
-	// resolved value. This throws at construction (rather than letting a node come up mismatched) if a
-	// future edit gives `keyNetwork` or `networkManager` their own fallback again.
-	assertClusterSizeCoupling(consensusConfig.clusterSize, { keyNetwork, networkManager });
-
-	const ownedBlocks = new Set<string>();
-	// Single owned-block feed: every block this node commits OR receives as a replica fires
-	// storageRepo.onAnyCollectionChange. Subscribe to storageRepo DIRECTLY (not
-	// node.blockChangeNotifier): the cohort-topic activation block below may replace
-	// blockChangeNotifier with a decorating bridge, but storageRepo keeps emitting on its own
-	// surface regardless of that opt-in. NOTE: this feed does NOT re-emit blocks already durable
-	// from a previous run; those are seeded once at startup by the storage-enumeration scan wired
-	// below (seedOwnedBlocksFromStorage), so a restarted node protects on-disk data without waiting
-	// for each block to be touched again. Registered lazily the first time a
-	// monitor that reads ownedBlocks is wired, so when BOTH monitors are disabled no subscription
-	// leaks; torn down exactly once in the stop wrapper below.
-	let offOwnedBlockFeed: (() => void) | undefined;
-	const ensureOwnedBlockFeed = (): void => {
-		if (offOwnedBlockFeed) return;
-		offOwnedBlockFeed = storageRepo.onAnyCollectionChange((e) => {
-			for (const blockId of e.blockIds) ownedBlocks.add(blockId);
+		// Active reconciliation for a block this member committed without a materializable base
+		// (cohort drift, or a refused `missing-base-revision` commit). See `reconcile-block.ts` for
+		// the corroboration rules — in particular why both quorums are capped by how many peers
+		// could answer at all, which is what lets a genuinely two-node cohort heal.
+		// NOTE: this and the CoordinatorRepo below must cap against the SAME
+		// repairCorroborationClusterSize, or the two restoration paths disagree about how much trust a
+		// lone peer gets. Safe today because both read the one `resolveClusterPolicy` result above; if
+		// either ever resolves its own value, add a fail-fast coupling check like
+		// `assertSuperMajorityCoupling` rather than relying on proximity.
+		const reconcileBlock: ReconcileBlockCallback = createReconcileBlock({
+			selfPeerId: node.peerId.toString(),
+			fetchArchive: fetchArchiveFromPeer,
+			saveReplicatedBlock: (blockId, block, source) => storageRepo.saveReplicatedBlock(blockId, block, source),
+			simpleMajorityThreshold: consensusConfig.simpleMajorityThreshold,
+			repairCorroborationClusterSize: consensusConfig.repairCorroborationClusterSize,
+			reputation
 		});
-	};
-	// Single owned-block-feed teardown. Registered up front (before either monitor's own stop
-	// wrapper) so it runs regardless of WHICH monitor subscribed the feed - including the
-	// spread-disabled / rebalance-only case. Idempotent: offOwnedBlockFeed is undefined-guarded.
-	{
-		const previousStop = node.stop.bind(node);
-		node.stop = async () => {
-			try {
-				offOwnedBlockFeed?.();
-			} finally {
-				await previousStop();
-			}
-		};
-	}
 
-	// --- Churn-resilient spread: drive SpreadOnChurnMonitor on a live node ---
-	// Nothing previously activated the SENDING side of the churn-resilient spread protocol on a
-	// real node. Here we init + start the monitor (sharing ownedBlocks) and ensure the single
-	// owned-block feed is live, so a debounced connection:close re-pushes the node's blocks to
-	// expansion-cohort peers (the receiver durably persists each push via saveReplicatedBlock).
-	let spreadMonitor: SpreadOnChurnMonitor | undefined;
-	if (networkManager && (options.spreadOnChurn?.enabled ?? true) !== false) {
-		try {
-			spreadMonitor = networkManager.initSpreadOnChurnMonitor(
-				partitionDetector,
-				storageRepo,
-				keyNetwork,
-				consensusConfig.clusterSize,
-				protocolPrefix,
-				ownedBlocks,
-				options.spreadOnChurn,
-			);
-			await spreadMonitor.start();
-			ensureOwnedBlockFeed();
-		} catch (err) {
-			// Spread is a resilience optimization, not a correctness requirement - a wiring
-			// failure (e.g. FRET briefly unavailable) must NOT hard-fail node startup, unlike the
-			// operator-opted-in cohortTopic block. Log and continue with spread inert.
-			((node as any).logger?.forComponent?.('db-p2p:spread-on-churn'))?.('init failed: %o', err);
-		}
-	}
-
-	// Expose for tests/diagnostics (mirrors node.keyNetwork / node.reputation).
-	(node as any).spreadOnChurnMonitor = spreadMonitor;
-
-	// Disposal: stop the spread monitor deterministically before the transports close. Composes
-	// with the arachnode / clusterMember / cohort-topic stop wrappers (each calls its captured
-	// previousStop last). Idempotent (SpreadOnChurnMonitor.stop early-returns when not running), so
-	// a double node.stop() does not throw. The owned-block feed teardown is the separate up-front
-	// wrapper above (shared across both monitors).
-	{
-		const previousStop = node.stop.bind(node);
-		node.stop = async () => {
-			try {
-				if (spreadMonitor) await spreadMonitor.stop();
-			} finally {
-				await previousStop();
-			}
-		};
-	}
-
-	// Initialize Arachnode ring membership and restoration
-	const enableArachnode = options.arachnode?.enableRingZulu ?? true;
-	if (enableArachnode) {
-		const log = (node as any).logger?.forComponent?.('db-p2p:arachnode');
-		const fret = (node as any).services?.fret as any;
-
-		if (fret) {
-			const fretAdapter = new ArachnodeFretAdapter(fret, node.peerId.toString());
-
-			// Blocks whose shed range has been RELEASED (Phase C of a ring shift, or a confirmed
-			// rebalance release). This is the GC-eligibility signal the future storage sweep
-			// (`st-storage-sweep-archival-and-capacity-estimate`) must consult: a block's local bytes may
-			// be reclaimed ONLY once it appears here, so an unconfirmed / still-served range is never
-			// swept. Populated strictly after replication is confirmed. See
-			// docs/arachnode-ring-handoff.md § Part 2 (Local bytes vs. tracking).
-			// NOTE: no sweep consumes this set yet; it is the coordinated eligibility handoff the sweep
-			// ticket will read. Until then it grows unbounded — bound it when the sweep lands.
-			const gcEligible = new Set<string>();
-			(node as any).gcEligibleBlocks = gcEligible;
-
-			// The ring-shift state machine (advertise→confirm→release). Wired inside the rebalance block
-			// below (it needs the BlockTransferCoordinator confirmer + the cohort-size floor); left
-			// undefined when the rebalance reaction is not wired, in which case ring shifts stay inert —
-			// a move-out is unsafe without the confirm/release path.
-			let ringShift: RingShiftCoordinator | undefined;
-
-			const storageMonitor = new StorageMonitor(rawStorage, options.arachnode?.storage ?? {});
-			const ringSelector = new RingSelector(fretAdapter, storageMonitor, {
-				minCapacity: 100 * 1024 * 1024,
-				thresholds: {
-					moveOut: 0.85,
-					moveIn: 0.40
-				},
-				// Damping so the ring decision cannot thrash near a boundary
-				// (docs/arachnode-ring-handoff.md § Part 1).
-				smoothingAlpha: 0.2,
-				deadband: 0.5,
-				minDwellMs: 10 * 60 * 1000
-			});
-
-			// Determine and announce ring membership
-			const peerId = node.peerId.toString();
-			const arachnodeInfo = await ringSelector.createArachnodeInfo(peerId);
-			fretAdapter.setArachnodeInfo(arachnodeInfo);
-
-			log?.('Announced Arachnode membership: Ring %d', arachnodeInfo.ringDepth);
-
-			// Setup restoration coordinator with FRET adapter
-			const restorationCoordinatorV2 = new RestorationCoordinator(
-				fretAdapter,
-				{ connect: (pid, protocol) => node.dialProtocol(pid as Parameters<typeof node.dialProtocol>[0], [protocol]) },
-				`/optimystic/${options.networkName}`,
-				node.peerId.toString()
-			);
-
-			// Update restore callback to use new coordinator
-			const newRestoreCallback: RestoreCallback = async (blockId, rev?) => {
-				return await restorationCoordinatorV2.restore(blockId, rev);
-			};
-
-			// Replace the restore callback (this is a bit hacky, but works for now)
-			(storageRepo as any).createBlockStorage = (blockId: string) =>
-				new BlockStorage(blockId, rawStorage, newRestoreCallback);
-
-			// --- Rebalance reaction: drive RebalanceMonitor + react via BlockTransferCoordinator ---
-			// Nothing previously activated the rebalance path on a real node: initRebalanceMonitor was
-			// never called, the monitor was never start()ed, and BlockTransferCoordinator (the
-			// pull-gained / push-lost reaction primitive) was never constructed in src. This block lives
-			// inside the arachnode `if (fret)` gate because both dependencies only exist here — the
-			// fretAdapter and the RestorationCoordinator. When arachnode is disabled or FRET is absent the
-			// rebalance path stays inert (acceptable: rebalance is a resilience optimization). A wiring
-			// failure here is non-fatal (log + continue), unlike the operator-opted-in cohortTopic block.
-			if (networkManager && (options.rebalance?.enabled ?? true) !== false) {
+		// Member-side membership derivation for the admission gate: independently re-derive this block's
+		// responsible cluster from the SAME source the coordinator uses (IKeyNetwork.findCluster), plus FRET's
+		// network-size confidence. A member gates a coordinator-declared peer set against this view before
+		// voting, so a self-shrunk minority-partition set cannot be voted into super-majority (see cluster-repo
+		// admitMembership). No FRET ⇒ confidence 0 ⇒ the gate fails closed for any downsize.
+		const deriveExpectedCluster: DeriveExpectedClusterCallback = async (blockId) => {
+			const peers = await keyNetwork.findCluster(new TextEncoder().encode(blockId));
+			let confidence = 0;
+			if (fretSvc) {
 				try {
-					// repo → the LOCAL storageRepo (not repoProxy/coordinatedRepo): a pulled/pushed replica
-					// must land in / be read from this node's own storage, same reasoning as the
-					// blockTransfer service handler registration. protocolPrefix (/optimystic/<networkName>)
-					// MUST match the prefix the node registers its block-transfer handler under, or every
-					// lost-block push dials the wrong protocol and fails to connect.
-					const coordinator = new BlockTransferCoordinator(
-						storageRepo,
-						keyNetwork,
-						restorationCoordinatorV2,
-						partitionDetector,
-						protocolPrefix,
-					);
-
-					const rebalanceMonitor = networkManager.initRebalanceMonitor(
-						partitionDetector,
-						fretAdapter,
-						ownedBlocks,
-						options.rebalance,
-					);
-					await rebalanceMonitor.start();
-
-					// onRebalance fires synchronously from the monitor's debounced check; the coordinator's
-					// reaction (pull gained / push lost, each partition-guarded) is async, so hop it off the
-					// handler rather than blocking the monitor's emit loop. handleRebalanceEvent can REJECT
-					// (e.g. RestorationCoordinator.restore() throws while pulling a gained block) and a bare
-					// `void` would surface that as an unhandled rejection (process-fatal on Node >=15); the
-					// reaction is a resilience optimization, so swallow + log instead.
-					//
-					// ALONGSIDE dispatching to the coordinator, drive the shared owned-block set off this
-					// authoritative responsibility signal. A GAINED block is added immediately so it is
-					// tracked even before its next commit/replica touches the feed.
-					//
-					// A LOST block is NO LONGER released synchronously: doing so stopped spreading a block
-					// whose push to the new owners might fail, drop it below the replication floor, and let a
-					// later sweep reclaim it (docs/arachnode-ring-handoff.md § Why the current code violates
-					// it #2). Instead the release is GATED on confirmation — the coordinator returns the lost
-					// blocks it confirmed replicated to ≥ floor new owners, and ONLY those are untracked
-					// (authoritative eviction from the shared set — complements spread's lazy self-prune) and
-					// marked GC-eligible. A lost block whose push failed / was partition-skipped stays
-					// tracked and served, and is retried on the next rebalance.
-					//
-					// Best-effort iteration safety: this eviction can mutate ownedBlocks while
-					// SpreadOnChurnMonitor (or this monitor) is mid for...of over the same Set inside an
-					// async loop. Adding/deleting a Set entry during iteration does not throw in JS — entries
-					// are visited best-effort — which is acceptable for a resilience mechanism, so we
-					// document it here rather than add locking.
-					rebalanceMonitor.onRebalance((event) => {
-						for (const blockId of event.gained) ownedBlocks.add(blockId);
-						coordinator.handleRebalanceEvent(event).then((result) => {
-							for (const blockId of result.released) {
-								rebalanceMonitor.untrackBlock(blockId); // also evicts from the shared ownedBlocks set
-								gcEligible.add(blockId);                 // confirmed replicated → safe to sweep
-							}
-						}).catch((err) => {
-							log?.('rebalance reaction failed: %o', err);
-						});
-					});
-
-					// Ring-shift handoff (advertise→confirm→release). It needs the confirmer (this
-					// coordinator) and the cohort-size floor (this monitor), so it is wired here. The
-					// `onRelease` callback runs Phase C's local effect: stop serving/spreading the shed
-					// range and mark it GC-eligible — the same authoritative eviction the confirmed-rebalance
-					// release performs.
-					ringShift = new RingShiftCoordinator({
-						fretAdapter,
-						ringSelector,
-						fret,
-						partitionDetector,
-						confirmer: coordinator,
-						ownedBlocks,
-						selfPeerId: peerId,
-						getFloor: () => rebalanceMonitor.getCohortSize(),
-						onRelease: (blockIds) => {
-							for (const blockId of blockIds) {
-								rebalanceMonitor.untrackBlock(blockId);
-								gcEligible.add(blockId);
-							}
-						}
-					});
-					// Reconcile any stale `moving` advertisement left by a crash mid-handoff (no-op unless
-					// arachnode metadata survived a restart still marked `moving`).
-					ringShift.reconcileOnStart();
-
-					// Feed owned blocks via the SINGLE shared feed (idempotent — already live if the spread
-					// block above wired it). Both monitors read the same ownedBlocks set this populates.
-					ensureOwnedBlockFeed();
-
-					// Expose for tests/diagnostics (mirrors node.spreadOnChurnMonitor).
-					(node as any).rebalanceMonitor = rebalanceMonitor;
-					(node as any).blockTransferCoordinator = coordinator;
-					(node as any).ringShiftCoordinator = ringShift;
-
-					// Disposal: stop the monitor before transports close. Composes with the other stop
-					// wrappers (each calls its captured previousStop last). Idempotent — RebalanceMonitor.stop()
-					// early-returns when not running (NetworkManagerService.stop() also stops it). The shared
-					// owned-block feed teardown is the separate up-front wrapper (not duplicated here).
-					const previousStop = node.stop.bind(node);
-					node.stop = async () => {
-						try {
-							await rebalanceMonitor.stop();
-						} finally {
-							await previousStop();
-						}
-					};
-				} catch (err) {
-					// Rebalance is a resilience optimization, not a correctness requirement - a wiring
-					// failure (e.g. FRET briefly unavailable) must NOT hard-fail node startup.
-					log?.('rebalance wiring init failed: %o', err);
+					confidence = fretSvc.getNetworkSizeEstimate().confidence;
+				} catch {
+					// Leave confidence 0 → fail closed for downsizing.
 				}
 			}
-
-			// Monitor capacity and adjust ring periodically. The damped `shouldTransition()` decides
-			// WHETHER/where to move (docs/arachnode-ring-handoff.md § Part 1); the RingShiftCoordinator
-			// carries the move out through the advertise→confirm→release handoff (§ Part 2) so a shift
-			// never drops a key below its replication floor. The old unilateral `setArachnodeInfo` flip —
-			// which changed advertised responsibility instantly with no data handoff — is gone.
-			//
-			// Ring shifts run ONLY when `ringShift` is wired (i.e. the rebalance reaction is enabled): a
-			// move-out is unsafe without the confirm/release path, so a node with the rebalance reaction
-			// disabled stays at its bootstrap ring rather than flipping unsafely.
-			const monitorInterval = setInterval(async () => {
-				if (!ringShift) return;
-				const transition = await ringSelector.shouldTransition();
-				if (transition.shouldMove && transition.direction && transition.newRingDepth !== undefined) {
-					log?.('Ring transition needed: moving %s to Ring %d', transition.direction, transition.newRingDepth);
-					try {
-						const outcome = await ringShift.executeShift({
-							direction: transition.direction,
-							newRingDepth: transition.newRingDepth
-						});
-						log?.('Ring shift outcome: %o', outcome);
-					} catch (err) {
-						log?.('Ring shift failed: %o', err);
-					} finally {
-						// Measure the minimum dwell from the SETTLED shift (completed or rolled back), not
-						// just the trigger stamped inside shouldTransition (docs/arachnode-ring-handoff.md §1.3).
-						ringSelector.recordShiftSettled();
-					}
-				}
-			}, 60_000);
-
-			// Cleanup on node stop
-			const originalStop = node.stop.bind(node);
-			node.stop = async () => {
-				clearInterval(monitorInterval);
-				await originalStop();
-			};
-		} else {
-			log?.('FRET service not available, Arachnode disabled');
-		}
-	}
-
-	// --- Seed the shared owned-block set from already-durable storage ---
-	// Blocks durable from a previous run are otherwise untracked until next touched (see the
-	// onAnyCollectionChange comment above where ownedBlocks is declared). Placed here, AFTER both
-	// monitor-wiring blocks (spread ~line 862, rebalance ~line 974) have had their chance to call
-	// ensureOwnedBlockFeed():
-	//   - Gate on offOwnedBlockFeed: only seed when a monitor actually consumes ownedBlocks; if both
-	//     are disabled the set is unused and the scan (plus the background task) is wasted work.
-	//   - Feed-before-scan ordering is load-bearing: because the feed is already live, a block
-	//     committed/replicated DURING the scan is caught by the feed; Set.add is idempotent so the
-	//     overlap is harmless. Scanning before subscribing would drop a block committed in the gap.
-	//   - Fire-and-forget so a large store never blocks startup; the .catch keeps a scan rejection
-	//     from becoming an unhandled rejection.
-	//   - Cancellable: a stop wrapper flips seedStopping so the scan loop breaks against a
-	//     stopping/closing backend rather than running the enumeration to completion.
-	// NOTE: a concurrent rebalance release can untrackBlock (delete from ownedBlocks) a confirmed-
-	// released block while this scan is still running, and the scan could then re-add that id. Benign
-	// transient: the block is still in the metadata store (no sweep reclaims metadata yet), so a
-	// re-added released block is simply re-evaluated and re-released on the next rebalance tick. Right
-	// after a restart, responsibility-loss detection lags this fast metadata scan, so the window is
-	// small. Accepted rather than synchronized.
-	if (offOwnedBlockFeed && typeof rawStorage.listBlockIds === 'function') {
-		let seedStopping = false;
-		const previousStop = node.stop.bind(node);
-		node.stop = async () => {
-			seedStopping = true;
-			await previousStop();
+			return { peers: peers ?? {}, confidence };
 		};
-		void seedOwnedBlocksFromStorage(rawStorage, ownedBlocks, () => seedStopping)
-			.catch((err) => ((node as any).logger?.forComponent?.('db-p2p:owned-block-seed'))?.('seed failed: %o', err));
-	}
 
-	// [dispute-subsystem-dormant] The DisputeService object is constructed below so tests and
-	// getDisputeStatus() work, but it is unreachable from the live network path:
-	//   - No inbound handler: disputeProtocolService is NOT in the services map above.
-	//   - onInvalidation is deliberately unset: maybeInvalidate() is a no-op on live nodes.
-	//   - revalidate is deliberately unset: handleChallenge always votes inconclusive on live nodes.
-	// Full activation requires arbitrator-set anchoring before a forged synthetic cohort can pass resolution.
-	// Gate: tickets/backlog/hardening/invalidation-live-wiring-requires-arbitrator-set-anchoring
-	// Wiring plan: tickets/backlog/feat-dispute-subsystem-live-activation
-	// Initialize dispute service if enabled
-	let disputeServiceInstance: DisputeService | undefined;
-	if (options.dispute?.disputeEnabled) {
-		const createDisputeClient = (peerId: any) => DisputeClient.create(peerId, keyNetwork, protocolPrefix);
-		disputeServiceInstance = new DisputeService({
+		clusterImpl = clusterMember({
+			storageRepo,
+			peerNetwork: keyNetwork,
 			peerId: node.peerId,
 			privateKey: nodePrivateKey,
-			peerNetwork: keyNetwork,
-			createDisputeClient,
-			reputation,
+			protocolPrefix,
+			partitionDetector,
+			fretService: fretSvc,
 			validator: options.validator,
-			config: options.dispute,
-			selectArbitrators: async (blockId: string, excludePeers: string[], count: number, round: number, epoch: Uint8Array) => {
-				const { hashKey: fretHashKey } = await import('p2p-fret');
-				const fret = (node as any).services?.fret as FretService | undefined;
-				if (!fret) return [];
-				// Dispersed sampling: draw `count` peers from coordinates spread across the whole keyspace
-				// (hash(blockId ‖ round ‖ epoch ‖ i)) rather than the block's XOR neighborhood, so an attacker
-				// who owns the block's locale does not thereby own the arbitrators. `assembleCohort` already
-				// filters to known members; excluding the original cluster + self keeps arbitrators independent.
-				const excludeSet = new Set(excludePeers);
-				// NOTE: adding the local node's own id to `exclude` makes the draw node-relative. Cross-node
-				// determinism (the verifiable-recompute property) holds today only because the dissent
-				// coordinator running this is itself a member of the original cluster, so `self` is already in
-				// `excludePeers` — the add is a no-op and every honest node excludes the identical set. When a
-				// verify-path recompute lands, it MUST reconstruct `exclude` from the challenger's identity
-				// (`proof.challengerPeerId`) + original cluster, never the verifier's own id, or re-derivation diverges.
-				excludeSet.add(node.peerId.toString());
-				const picks = await sampleArbitrators(
-					{ blockId: new TextEncoder().encode(blockId), round, epoch, count, exclude: excludeSet },
-					(coord, wants) => fret.assembleCohort(coord, wants) as string[],
-					fretHashKey,
-				);
-				return picks.map(pid => peerIdFromString(pid));
-			},
+			reputation,
+			consensusConfig,
+			stateStore: options.transactionStateStore,
+			reconcileBlock,
+			onCommitCertificate,
+			deriveExpectedCluster
+			// `recomputeArbitratorSet` (invalidation layer-2) is intentionally NOT wired here yet: a live FRET
+			// recompute needs a churn-tolerance window so it does not false-reject legitimate certificates from
+			// late-joiners (a liveness regression). Until that is tuned against live topology — and the
+			// cohort-topic membership-cert trust anchor (layer 3) lands — invalidation verification runs on the
+			// challenger-bound set + membership + dedup (layer 1) and LOGS the residual anchoring gap. See
+			// `verifyInvalidationCertificate` and `tickets/plan/cohort-topic-membership-cert-trust-anchoring.md`.
 		});
-	}
 
-	// Cleanup cluster member intervals on node stop
-	{
-		const previousStop = node.stop.bind(node);
-		node.stop = async () => {
-			(clusterImpl as import('./cluster/cluster-repo.js').ClusterMember).dispose();
-			await previousStop();
-		};
-	}
-
-	// The host-facing attachment surface, declared once in `optimystic-node.ts` and written here
-	// through ONE object literal so every field is type-checked AND a field added to
-	// `OptimysticNodeAttachments` but never assigned here is a compile error rather than an
-	// `undefined` a host reads as present. Keeping it typed is load-bearing: when
-	// `node.keyNetwork` was reachable only through a cast, three hosts found it easier to build a
-	// SECOND Libp2pKeyPeerNetwork from constructor defaults — a different cohort width and no
-	// network-membership filter than this node's own consensus path uses for the same key
-	// (ticket bug-second-key-network-built-with-defaults).
-	const attachments: OptimysticNodeAttachments = {
-		coordinatedRepo,
-		storageRepo,
-		// The StorageRepo is the single commit funnel for both the coordinated and
-		// direct paths, so it is the node's per-collection change-notifier origin. This is the
-		// default; the cohort-topic activation block below REPLACES it with the origination-decorating
-		// bridge notifier when the substrate is enabled.
-		blockChangeNotifier: storageRepo,
-		keyNetwork,
-		reputation,
-		disputeService: disputeServiceInstance,
-		// The node's libp2p Ed25519 identity key. Exposed on the same attachment surface as
-		// coordinatedRepo/keyNetwork so a host can bind a client-transaction signer to it (the Quereus
-		// collection-factory's getSigner reuses this via signPeer). libp2p does not surface the private
-		// key on its public `Libp2p` interface, so this attachment is the sanctioned in-process handle.
-		// Ed25519 by construction (options.privateKey defaults to generateKeyPair('Ed25519')).
-		peerPrivateKey: nodePrivateKey,
-	};
-	Object.assign(node, attachments);
-
-	// --- Cohort-topic origination activation (post-node: consumes the fully-assembled node + FRET) ---
-	// This is the only place that is after the node + FRET are assembled (node.start() done, fretSvc
-	// available) yet before any caller can capture `blockChangeNotifier` — the Quereus collection-factory
-	// captures it once, immediately after createLibp2pNode returns, and reuses that reference as
-	// `localChangeNotifier` for every NetworkTransactor it builds. Installing the bridge here makes the
-	// origination path live for ALL collections created on the node.
-	if (cohortEnabled) {
-		// The host needs the full FRET engine surface; node.services.fret is the wrapper (see resolveFretEngine).
-		const fret = resolveFretEngine(fretSvc);
-		if (!fret) {
-			// Operator opted in; degrading silently to the bare notifier would hide misconfiguration.
-			// The node has already started (transports open, FRET running), so tear it down before the
-			// hard-fail rather than leaking a started node + open transports on the rejection.
-			await node.stop();
-			throw new Error('cohortTopic enabled but the FRET service is unavailable on the node');
+		// Cleanup cluster member intervals on node stop. Installed HERE, immediately after clusterImpl
+		// exists, rather than further down: the post-start rollback only unwinds resources whose stop
+		// wrapper is already installed at the moment of the throw, so a wrapper trailing its resource by
+		// hundreds of lines leaves those intervals running on a failed startup. Same reasoning as the
+		// owned-block-feed wrapper below.
+		{
+			const previousStop = node.stop.bind(node);
+			node.stop = async () => {
+				(clusterImpl as import('./cluster/cluster-repo.js').ClusterMember).dispose();
+				await previousStop();
+			};
 		}
 
-		// A host-construction failure also hard-fails (operator opted in); stop the started node first so
-		// the rejection does not leak open transports / a running FRET service. node.stop() runs the
-		// already-installed arachnode + clusterMember teardown wrappers and closes the node's connections.
-		let host: Awaited<ReturnType<typeof createCohortTopicHost>>;
-		try {
-			host = await createCohortTopicHost(node, fret, {
+		const coordinatorRepoFactory = coordinatorRepo(
+			keyNetwork,
+			createClusterClient,
+			{
+				// clusterSize is now part of consensusConfig (member + coordinator share one reference).
+				...consensusConfig
+			},
+			fretSvc,
+			reputation,
+			options.transactionStateStore
+		);
+
+		// Create callback for querying cluster peers for their latest block revision. Three-way
+		// contract (see ClusterLatestCallback): an ActionRev is the peer's claim, a resolved
+		// `undefined` is the peer answering "I hold nothing", and a REJECTION is silence — the
+		// coordinator counts it as "did not answer" and refuses to report an authoritative absent
+		// over it. Transport errors must therefore propagate, not collapse into `undefined` (that
+		// collapse let a slow two-node cohort report a missing block as authoritatively absent —
+		// ticket cluster-read-consult-cannot-report-unreachable).
+		const clusterLatestCallback: ClusterLatestCallback = async (peerId, blockId, context?) => {
+			// Self-read short-circuit: dialling self via SyncClient is a round trip
+			// with no remote on the other end, and on nodes without listen addresses
+			// (solo WebSocket-only, bare-RN, etc.) the self-dial can hang the dial
+			// queue. Read directly from the local storage repo instead. The catch stays:
+			// a local storage error is not a cohort peer being unreachable, and the
+			// coordinator ignores a self rejection anyway.
+			if (peerId.equals(node.peerId)) {
+				try {
+					const result = await storageRepo.get({ blockIds: [blockId], context });
+					return result[blockId]?.state?.latest;
+				} catch {
+					return undefined;
+				}
+			}
+			const syncClient = new SyncClient(peerId, keyNetwork, protocolPrefix);
+			// No try/catch: a dial or protocol failure rejects through to the coordinator, whose
+			// per-peer deadline also bounds a hung request — slowness needs no race here.
+			const response = await syncClient.requestBlock({ blockId, rev: undefined });
+			if (response.success && response.archive) {
+				const revisions = Object.keys(response.archive.revisions).map(Number);
+				if (revisions.length > 0) {
+					const maxRev = Math.max(...revisions);
+					const revisionData = response.archive.revisions[maxRev];
+					if (revisionData?.action) {
+						return { actionId: revisionData.action.actionId, rev: maxRev };
+					}
+				}
+			}
+			// The peer DID answer, without data: `success:false` is the sync service's "Block not
+			// found in local storage", and an archive with no usable revisions holds nothing either
+			// way. Both are absent claims, not silence.
+			return undefined;
+		};
+
+		coordinatedRepo = coordinatorRepoFactory({
+			storageRepo,
+			localCluster: clusterImpl,
+			localPeerId: node.peerId,
+			clusterLatestCallback,
+			// Read-driven acquisition shares the commit path's reconcile callback verbatim: same bounded
+			// archive fetch, same (rev, actionId) and content quorums, same monotonic saveReplicatedBlock
+			// funnel. `clusterLatestCallback` alone can only tell the reader WHICH revision the cohort
+			// holds; this is what moves the bytes. Only reached once a corroborated revision exists, so a
+			// genuinely absent block still costs no archive fetch.
+			acquireBlockFromCohort: reconcileBlock
+		});
+
+		// Fail-fast coupling: the cluster member (what accepts a super-majority as sufficient) and the
+		// coordinator (what declares a transaction committed on that super-majority) MUST run the same
+		// threshold, or the node would come up able to disagree with itself mid-consensus. Both are fed from
+		// the single `consensusConfig` above; this asserts on their RESOLVED values so any future drift throws
+		// HERE at construction. See `assertSuperMajorityCoupling`.
+		assertSuperMajorityCoupling(
+			clusterImpl as import('./cluster/cluster-repo.js').ClusterMember,
+			coordinatedRepo as import('./repo/coordinator-repo.js').CoordinatorRepo
+		);
+
+		// Recover persisted transaction state before accepting new requests
+		if (options.transactionStateStore) {
+			await (clusterImpl as import('./cluster/cluster-repo.js').ClusterMember).recoverTransactions();
+			await (coordinatedRepo as import('./repo/coordinator-repo.js').CoordinatorRepo).recoverTransactions();
+		}
+
+		// --- Shared owned-block set for the resilience monitors ---
+		// SpreadOnChurnMonitor (sender) and RebalanceMonitor (responsibility tracker) both act on "the
+		// blocks this node physically holds". They share ONE Set so the two can never drift: a single
+		// owned-block feed populates it, and the rebalance responsibility-loss signal evicts from it
+		// (in the rebalance block below). Both monitors take this exact instance via deps.trackedBlocks.
+		const networkManager = (node as any).services?.networkManager as NetworkManagerService | undefined;
+
+		// See the comment above `consensusConfig` for why every cluster-size consumer must read the SAME
+		// resolved value. This throws at construction (rather than letting a node come up mismatched) if a
+		// future edit gives `keyNetwork` or `networkManager` their own fallback again.
+		assertClusterSizeCoupling(consensusConfig.clusterSize, { keyNetwork, networkManager });
+
+		const ownedBlocks = new Set<string>();
+		// Single owned-block feed: every block this node commits OR receives as a replica fires
+		// storageRepo.onAnyCollectionChange. Subscribe to storageRepo DIRECTLY (not
+		// node.blockChangeNotifier): the cohort-topic activation block below may replace
+		// blockChangeNotifier with a decorating bridge, but storageRepo keeps emitting on its own
+		// surface regardless of that opt-in. NOTE: this feed does NOT re-emit blocks already durable
+		// from a previous run; those are seeded once at startup by the storage-enumeration scan wired
+		// below (seedOwnedBlocksFromStorage), so a restarted node protects on-disk data without waiting
+		// for each block to be touched again. Registered lazily the first time a
+		// monitor that reads ownedBlocks is wired, so when BOTH monitors are disabled no subscription
+		// leaks; torn down exactly once in the stop wrapper below.
+		let offOwnedBlockFeed: (() => void) | undefined;
+		const ensureOwnedBlockFeed = (): void => {
+			if (offOwnedBlockFeed) return;
+			offOwnedBlockFeed = storageRepo.onAnyCollectionChange((e) => {
+				for (const blockId of e.blockIds) ownedBlocks.add(blockId);
+			});
+		};
+		// Single owned-block-feed teardown. Registered up front (before either monitor's own stop
+		// wrapper) so it runs regardless of WHICH monitor subscribed the feed - including the
+		// spread-disabled / rebalance-only case. Idempotent: offOwnedBlockFeed is undefined-guarded.
+		{
+			const previousStop = node.stop.bind(node);
+			node.stop = async () => {
+				try {
+					offOwnedBlockFeed?.();
+				} finally {
+					await previousStop();
+				}
+			};
+		}
+
+		// --- Churn-resilient spread: drive SpreadOnChurnMonitor on a live node ---
+		// Nothing previously activated the SENDING side of the churn-resilient spread protocol on a
+		// real node. Here we init + start the monitor (sharing ownedBlocks) and ensure the single
+		// owned-block feed is live, so a debounced connection:close re-pushes the node's blocks to
+		// expansion-cohort peers (the receiver durably persists each push via saveReplicatedBlock).
+		let spreadMonitor: SpreadOnChurnMonitor | undefined;
+		if (networkManager && (options.spreadOnChurn?.enabled ?? true) !== false) {
+			try {
+				spreadMonitor = networkManager.initSpreadOnChurnMonitor(
+					partitionDetector,
+					storageRepo,
+					keyNetwork,
+					consensusConfig.clusterSize,
+					protocolPrefix,
+					ownedBlocks,
+					options.spreadOnChurn,
+				);
+				await spreadMonitor.start();
+				ensureOwnedBlockFeed();
+			} catch (err) {
+				// Spread is a resilience optimization, not a correctness requirement - a wiring
+				// failure (e.g. FRET briefly unavailable) must NOT hard-fail node startup, unlike the
+				// operator-opted-in cohortTopic block. Log and continue with spread inert.
+				((node as any).logger?.forComponent?.('db-p2p:spread-on-churn'))?.('init failed: %o', err);
+			}
+		}
+
+		// Expose for tests/diagnostics (mirrors node.keyNetwork / node.reputation).
+		(node as any).spreadOnChurnMonitor = spreadMonitor;
+
+		// Disposal: stop the spread monitor deterministically before the transports close. Composes
+		// with the arachnode / clusterMember / cohort-topic stop wrappers (each calls its captured
+		// previousStop last). Idempotent (SpreadOnChurnMonitor.stop early-returns when not running), so
+		// a double node.stop() does not throw. The owned-block feed teardown is the separate up-front
+		// wrapper above (shared across both monitors).
+		{
+			const previousStop = node.stop.bind(node);
+			node.stop = async () => {
+				try {
+					if (spreadMonitor) await spreadMonitor.stop();
+				} finally {
+					await previousStop();
+				}
+			};
+		}
+
+		// Initialize Arachnode ring membership and restoration
+		const enableArachnode = options.arachnode?.enableRingZulu ?? true;
+		if (enableArachnode) {
+			const log = (node as any).logger?.forComponent?.('db-p2p:arachnode');
+			const fret = (node as any).services?.fret as any;
+
+			if (fret) {
+				const fretAdapter = new ArachnodeFretAdapter(fret, node.peerId.toString());
+
+				// Blocks whose shed range has been RELEASED (Phase C of a ring shift, or a confirmed
+				// rebalance release). This is the GC-eligibility signal the future storage sweep
+				// (`st-storage-sweep-archival-and-capacity-estimate`) must consult: a block's local bytes may
+				// be reclaimed ONLY once it appears here, so an unconfirmed / still-served range is never
+				// swept. Populated strictly after replication is confirmed. See
+				// docs/arachnode-ring-handoff.md § Part 2 (Local bytes vs. tracking).
+				// NOTE: no sweep consumes this set yet; it is the coordinated eligibility handoff the sweep
+				// ticket will read. Until then it grows unbounded — bound it when the sweep lands.
+				const gcEligible = new Set<string>();
+				(node as any).gcEligibleBlocks = gcEligible;
+
+				// The ring-shift state machine (advertise→confirm→release). Wired inside the rebalance block
+				// below (it needs the BlockTransferCoordinator confirmer + the cohort-size floor); left
+				// undefined when the rebalance reaction is not wired, in which case ring shifts stay inert —
+				// a move-out is unsafe without the confirm/release path.
+				let ringShift: RingShiftCoordinator | undefined;
+
+				const storageMonitor = new StorageMonitor(rawStorage, options.arachnode?.storage ?? {});
+				const ringSelector = new RingSelector(fretAdapter, storageMonitor, {
+					minCapacity: 100 * 1024 * 1024,
+					thresholds: {
+						moveOut: 0.85,
+						moveIn: 0.40
+					},
+					// Damping so the ring decision cannot thrash near a boundary
+					// (docs/arachnode-ring-handoff.md § Part 1).
+					smoothingAlpha: 0.2,
+					deadband: 0.5,
+					minDwellMs: 10 * 60 * 1000
+				});
+
+				// Determine and announce ring membership
+				const peerId = node.peerId.toString();
+				const arachnodeInfo = await ringSelector.createArachnodeInfo(peerId);
+				fretAdapter.setArachnodeInfo(arachnodeInfo);
+
+				log?.('Announced Arachnode membership: Ring %d', arachnodeInfo.ringDepth);
+
+				// Setup restoration coordinator with FRET adapter
+				const restorationCoordinatorV2 = new RestorationCoordinator(
+					fretAdapter,
+					{ connect: (pid, protocol) => node.dialProtocol(pid as Parameters<typeof node.dialProtocol>[0], [protocol]) },
+					`/optimystic/${options.networkName}`,
+					node.peerId.toString()
+				);
+
+				// Update restore callback to use new coordinator
+				const newRestoreCallback: RestoreCallback = async (blockId, rev?) => {
+					return await restorationCoordinatorV2.restore(blockId, rev);
+				};
+
+				// Replace the restore callback (this is a bit hacky, but works for now)
+				(storageRepo as any).createBlockStorage = (blockId: string) =>
+					new BlockStorage(blockId, rawStorage, newRestoreCallback);
+
+				// --- Rebalance reaction: drive RebalanceMonitor + react via BlockTransferCoordinator ---
+				// Nothing previously activated the rebalance path on a real node: initRebalanceMonitor was
+				// never called, the monitor was never start()ed, and BlockTransferCoordinator (the
+				// pull-gained / push-lost reaction primitive) was never constructed in src. This block lives
+				// inside the arachnode `if (fret)` gate because both dependencies only exist here — the
+				// fretAdapter and the RestorationCoordinator. When arachnode is disabled or FRET is absent the
+				// rebalance path stays inert (acceptable: rebalance is a resilience optimization). A wiring
+				// failure here is non-fatal (log + continue), unlike the operator-opted-in cohortTopic block.
+				if (networkManager && (options.rebalance?.enabled ?? true) !== false) {
+					try {
+						// repo → the LOCAL storageRepo (not repoProxy/coordinatedRepo): a pulled/pushed replica
+						// must land in / be read from this node's own storage, same reasoning as the
+						// blockTransfer service handler registration. protocolPrefix (/optimystic/<networkName>)
+						// MUST match the prefix the node registers its block-transfer handler under, or every
+						// lost-block push dials the wrong protocol and fails to connect.
+						const coordinator = new BlockTransferCoordinator(
+							storageRepo,
+							keyNetwork,
+							restorationCoordinatorV2,
+							partitionDetector,
+							protocolPrefix,
+						);
+
+						const rebalanceMonitor = networkManager.initRebalanceMonitor(
+							partitionDetector,
+							fretAdapter,
+							ownedBlocks,
+							options.rebalance,
+						);
+						await rebalanceMonitor.start();
+
+						// onRebalance fires synchronously from the monitor's debounced check; the coordinator's
+						// reaction (pull gained / push lost, each partition-guarded) is async, so hop it off the
+						// handler rather than blocking the monitor's emit loop. handleRebalanceEvent can REJECT
+						// (e.g. RestorationCoordinator.restore() throws while pulling a gained block) and a bare
+						// `void` would surface that as an unhandled rejection (process-fatal on Node >=15); the
+						// reaction is a resilience optimization, so swallow + log instead.
+						//
+						// ALONGSIDE dispatching to the coordinator, drive the shared owned-block set off this
+						// authoritative responsibility signal. A GAINED block is added immediately so it is
+						// tracked even before its next commit/replica touches the feed.
+						//
+						// A LOST block is NO LONGER released synchronously: doing so stopped spreading a block
+						// whose push to the new owners might fail, drop it below the replication floor, and let a
+						// later sweep reclaim it (docs/arachnode-ring-handoff.md § Why the current code violates
+						// it #2). Instead the release is GATED on confirmation — the coordinator returns the lost
+						// blocks it confirmed replicated to ≥ floor new owners, and ONLY those are untracked
+						// (authoritative eviction from the shared set — complements spread's lazy self-prune) and
+						// marked GC-eligible. A lost block whose push failed / was partition-skipped stays
+						// tracked and served, and is retried on the next rebalance.
+						//
+						// Best-effort iteration safety: this eviction can mutate ownedBlocks while
+						// SpreadOnChurnMonitor (or this monitor) is mid for...of over the same Set inside an
+						// async loop. Adding/deleting a Set entry during iteration does not throw in JS — entries
+						// are visited best-effort — which is acceptable for a resilience mechanism, so we
+						// document it here rather than add locking.
+						rebalanceMonitor.onRebalance((event) => {
+							for (const blockId of event.gained) ownedBlocks.add(blockId);
+							coordinator.handleRebalanceEvent(event).then((result) => {
+								for (const blockId of result.released) {
+									rebalanceMonitor.untrackBlock(blockId); // also evicts from the shared ownedBlocks set
+									gcEligible.add(blockId);                 // confirmed replicated → safe to sweep
+								}
+							}).catch((err) => {
+								log?.('rebalance reaction failed: %o', err);
+							});
+						});
+
+						// Ring-shift handoff (advertise→confirm→release). It needs the confirmer (this
+						// coordinator) and the cohort-size floor (this monitor), so it is wired here. The
+						// `onRelease` callback runs Phase C's local effect: stop serving/spreading the shed
+						// range and mark it GC-eligible — the same authoritative eviction the confirmed-rebalance
+						// release performs.
+						ringShift = new RingShiftCoordinator({
+							fretAdapter,
+							ringSelector,
+							fret,
+							partitionDetector,
+							confirmer: coordinator,
+							ownedBlocks,
+							selfPeerId: peerId,
+							getFloor: () => rebalanceMonitor.getCohortSize(),
+							onRelease: (blockIds) => {
+								for (const blockId of blockIds) {
+									rebalanceMonitor.untrackBlock(blockId);
+									gcEligible.add(blockId);
+								}
+							}
+						});
+						// Reconcile any stale `moving` advertisement left by a crash mid-handoff (no-op unless
+						// arachnode metadata survived a restart still marked `moving`).
+						ringShift.reconcileOnStart();
+
+						// Feed owned blocks via the SINGLE shared feed (idempotent — already live if the spread
+						// block above wired it). Both monitors read the same ownedBlocks set this populates.
+						ensureOwnedBlockFeed();
+
+						// Expose for tests/diagnostics (mirrors node.spreadOnChurnMonitor).
+						(node as any).rebalanceMonitor = rebalanceMonitor;
+						(node as any).blockTransferCoordinator = coordinator;
+						(node as any).ringShiftCoordinator = ringShift;
+
+						// Disposal: stop the monitor before transports close. Composes with the other stop
+						// wrappers (each calls its captured previousStop last). Idempotent — RebalanceMonitor.stop()
+						// early-returns when not running (NetworkManagerService.stop() also stops it). The shared
+						// owned-block feed teardown is the separate up-front wrapper (not duplicated here).
+						const previousStop = node.stop.bind(node);
+						node.stop = async () => {
+							try {
+								await rebalanceMonitor.stop();
+							} finally {
+								await previousStop();
+							}
+						};
+					} catch (err) {
+						// Rebalance is a resilience optimization, not a correctness requirement - a wiring
+						// failure (e.g. FRET briefly unavailable) must NOT hard-fail node startup.
+						log?.('rebalance wiring init failed: %o', err);
+					}
+				}
+
+				// Monitor capacity and adjust ring periodically. The damped `shouldTransition()` decides
+				// WHETHER/where to move (docs/arachnode-ring-handoff.md § Part 1); the RingShiftCoordinator
+				// carries the move out through the advertise→confirm→release handoff (§ Part 2) so a shift
+				// never drops a key below its replication floor. The old unilateral `setArachnodeInfo` flip —
+				// which changed advertised responsibility instantly with no data handoff — is gone.
+				//
+				// Ring shifts run ONLY when `ringShift` is wired (i.e. the rebalance reaction is enabled): a
+				// move-out is unsafe without the confirm/release path, so a node with the rebalance reaction
+				// disabled stays at its bootstrap ring rather than flipping unsafely.
+				const monitorInterval = setInterval(async () => {
+					if (!ringShift) return;
+					const transition = await ringSelector.shouldTransition();
+					if (transition.shouldMove && transition.direction && transition.newRingDepth !== undefined) {
+						log?.('Ring transition needed: moving %s to Ring %d', transition.direction, transition.newRingDepth);
+						try {
+							const outcome = await ringShift.executeShift({
+								direction: transition.direction,
+								newRingDepth: transition.newRingDepth
+							});
+							log?.('Ring shift outcome: %o', outcome);
+						} catch (err) {
+							log?.('Ring shift failed: %o', err);
+						} finally {
+							// Measure the minimum dwell from the SETTLED shift (completed or rolled back), not
+							// just the trigger stamped inside shouldTransition (docs/arachnode-ring-handoff.md §1.3).
+							ringSelector.recordShiftSettled();
+						}
+					}
+				}, 60_000);
+
+				// Cleanup on node stop
+				const originalStop = node.stop.bind(node);
+				node.stop = async () => {
+					clearInterval(monitorInterval);
+					await originalStop();
+				};
+			} else {
+				log?.('FRET service not available, Arachnode disabled');
+			}
+		}
+
+		// --- Seed the shared owned-block set from already-durable storage ---
+		// Blocks durable from a previous run are otherwise untracked until next touched (see the
+		// onAnyCollectionChange comment above where ownedBlocks is declared). Placed here, AFTER both
+		// monitor-wiring blocks (spread ~line 862, rebalance ~line 974) have had their chance to call
+		// ensureOwnedBlockFeed():
+		//   - Gate on offOwnedBlockFeed: only seed when a monitor actually consumes ownedBlocks; if both
+		//     are disabled the set is unused and the scan (plus the background task) is wasted work.
+		//   - Feed-before-scan ordering is load-bearing: because the feed is already live, a block
+		//     committed/replicated DURING the scan is caught by the feed; Set.add is idempotent so the
+		//     overlap is harmless. Scanning before subscribing would drop a block committed in the gap.
+		//   - Fire-and-forget so a large store never blocks startup; the .catch keeps a scan rejection
+		//     from becoming an unhandled rejection.
+		//   - Cancellable: a stop wrapper flips seedStopping so the scan loop breaks against a
+		//     stopping/closing backend rather than running the enumeration to completion.
+		// NOTE: a concurrent rebalance release can untrackBlock (delete from ownedBlocks) a confirmed-
+		// released block while this scan is still running, and the scan could then re-add that id. Benign
+		// transient: the block is still in the metadata store (no sweep reclaims metadata yet), so a
+		// re-added released block is simply re-evaluated and re-released on the next rebalance tick. Right
+		// after a restart, responsibility-loss detection lags this fast metadata scan, so the window is
+		// small. Accepted rather than synchronized.
+		if (offOwnedBlockFeed && typeof rawStorage.listBlockIds === 'function') {
+			let seedStopping = false;
+			const previousStop = node.stop.bind(node);
+			node.stop = async () => {
+				seedStopping = true;
+				await previousStop();
+			};
+			void seedOwnedBlocksFromStorage(rawStorage, ownedBlocks, () => seedStopping)
+				.catch((err) => ((node as any).logger?.forComponent?.('db-p2p:owned-block-seed'))?.('seed failed: %o', err));
+		}
+
+		// [dispute-subsystem-dormant] The DisputeService object is constructed below so tests and
+		// getDisputeStatus() work, but it is unreachable from the live network path:
+		//   - No inbound handler: disputeProtocolService is NOT in the services map above.
+		//   - onInvalidation is deliberately unset: maybeInvalidate() is a no-op on live nodes.
+		//   - revalidate is deliberately unset: handleChallenge always votes inconclusive on live nodes.
+		// Full activation requires arbitrator-set anchoring before a forged synthetic cohort can pass resolution.
+		// Gate: tickets/backlog/hardening/invalidation-live-wiring-requires-arbitrator-set-anchoring
+		// Wiring plan: tickets/backlog/feat-dispute-subsystem-live-activation
+		// Initialize dispute service if enabled
+		let disputeServiceInstance: DisputeService | undefined;
+		if (options.dispute?.disputeEnabled) {
+			const createDisputeClient = (peerId: any) => DisputeClient.create(peerId, keyNetwork, protocolPrefix);
+			disputeServiceInstance = new DisputeService({
+				peerId: node.peerId,
+				privateKey: nodePrivateKey,
+				peerNetwork: keyNetwork,
+				createDisputeClient,
+				reputation,
+				validator: options.validator,
+				config: options.dispute,
+				selectArbitrators: async (blockId: string, excludePeers: string[], count: number, round: number, epoch: Uint8Array) => {
+					const { hashKey: fretHashKey } = await import('p2p-fret');
+					const fret = (node as any).services?.fret as FretService | undefined;
+					if (!fret) return [];
+					// Dispersed sampling: draw `count` peers from coordinates spread across the whole keyspace
+					// (hash(blockId ‖ round ‖ epoch ‖ i)) rather than the block's XOR neighborhood, so an attacker
+					// who owns the block's locale does not thereby own the arbitrators. `assembleCohort` already
+					// filters to known members; excluding the original cluster + self keeps arbitrators independent.
+					const excludeSet = new Set(excludePeers);
+					// NOTE: adding the local node's own id to `exclude` makes the draw node-relative. Cross-node
+					// determinism (the verifiable-recompute property) holds today only because the dissent
+					// coordinator running this is itself a member of the original cluster, so `self` is already in
+					// `excludePeers` — the add is a no-op and every honest node excludes the identical set. When a
+					// verify-path recompute lands, it MUST reconstruct `exclude` from the challenger's identity
+					// (`proof.challengerPeerId`) + original cluster, never the verifier's own id, or re-derivation diverges.
+					excludeSet.add(node.peerId.toString());
+					const picks = await sampleArbitrators(
+						{ blockId: new TextEncoder().encode(blockId), round, epoch, count, exclude: excludeSet },
+						(coord, wants) => fret.assembleCohort(coord, wants) as string[],
+						fretHashKey,
+					);
+					return picks.map(pid => peerIdFromString(pid));
+				},
+			});
+		}
+
+		// The host-facing attachment surface, declared once in `optimystic-node.ts` and written here
+		// through ONE object literal so every field is type-checked AND a field added to
+		// `OptimysticNodeAttachments` but never assigned here is a compile error rather than an
+		// `undefined` a host reads as present. Keeping it typed is load-bearing: when
+		// `node.keyNetwork` was reachable only through a cast, three hosts found it easier to build a
+		// SECOND Libp2pKeyPeerNetwork from constructor defaults — a different cohort width and no
+		// network-membership filter than this node's own consensus path uses for the same key
+		// (ticket bug-second-key-network-built-with-defaults).
+		const attachments: OptimysticNodeAttachments = {
+			coordinatedRepo,
+			storageRepo,
+			// The StorageRepo is the single commit funnel for both the coordinated and
+			// direct paths, so it is the node's per-collection change-notifier origin. This is the
+			// default; the cohort-topic activation block below REPLACES it with the origination-decorating
+			// bridge notifier when the substrate is enabled.
+			blockChangeNotifier: storageRepo,
+			keyNetwork,
+			reputation,
+			disputeService: disputeServiceInstance,
+			// The node's libp2p Ed25519 identity key. Exposed on the same attachment surface as
+			// coordinatedRepo/keyNetwork so a host can bind a client-transaction signer to it (the Quereus
+			// collection-factory's getSigner reuses this via signPeer). libp2p does not surface the private
+			// key on its public `Libp2p` interface, so this attachment is the sanctioned in-process handle.
+			// Ed25519 by construction (options.privateKey defaults to generateKeyPair('Ed25519')).
+			peerPrivateKey: nodePrivateKey,
+		};
+		Object.assign(node, attachments);
+
+		// --- Cohort-topic origination activation (post-node: consumes the fully-assembled node + FRET) ---
+		// This is the only place that is after the node + FRET are assembled (node.start() done, fretSvc
+		// available) yet before any caller can capture `blockChangeNotifier` — the Quereus collection-factory
+		// captures it once, immediately after createLibp2pNode returns, and reuses that reference as
+		// `localChangeNotifier` for every NetworkTransactor it builds. Installing the bridge here makes the
+		// origination path live for ALL collections created on the node.
+		if (cohortEnabled) {
+			// The host needs the full FRET engine surface; node.services.fret is the wrapper (see resolveFretEngine).
+			const fret = resolveFretEngine(fretSvc);
+			if (!fret) {
+				// Operator opted in; degrading silently to the bare notifier would hide misconfiguration.
+				// (The started node is torn down by the post-start rollback `catch` at the bottom of this function.)
+				throw new Error('cohortTopic enabled but the FRET service is unavailable on the node');
+			}
+
+			const host = await createCohortTopicHost(node, fret, {
 				...(options.cohortTopic!.host ?? {}),
 				// Wire the node's reputation service in as the production backing for the bootstrap-evidence
 				// referee verifier (the `{ isBanned, getScore }` view `PeerReputationService` satisfies), so a
@@ -1350,264 +1348,298 @@ export async function createLibp2pNodeBase(
 				privateKey: nodePrivateKey, // real k − x threshold signing
 				wantK: cohortWantK,
 			});
-		} catch (err) {
-			await node.stop();
-			throw err;
+
+			// --- Cohort-topic + reactivity + matchmaking teardown ---
+			// Installed HERE, immediately after `host` exists and BEFORE the ~230 lines of reactivity /
+			// matchmaking wiring below, because the post-start rollback only unwinds resources whose stop
+			// wrapper is already installed at the moment of the throw. With the wrapper at the END of the
+			// block (where it used to live) a throw mid-wiring left the host's gossip timer and cohort-topic
+			// protocol handlers running. The bindings it releases are therefore declared up front and
+			// undefined-guarded — same idiom as `offOwnedBlockFeed` above — so this tears down exactly what
+			// has been created so far, whether that is the host alone or the whole wiring.
+			//
+			// Ordering (load-bearing): release reactivity timers + protocol handlers BEFORE host.stop()
+			// (which clears the cohort gossip timer + unhandles the cohort-topic protocols) BEFORE the node's
+			// transports close (previousStop). Composes with the existing arachnode + clusterMember stop
+			// wrappers (each calls its captured previousStop last). `node.unhandle` on a protocol that was
+			// never registered is a no-op (registrar deletes from a Map), so the handler releases need no
+			// separate registration flags.
+			const reactivityProtocols = DEFAULT_REACTIVITY_PROTOCOLS;
+			const matchmakingProtocols = DEFAULT_MATCHMAKING_PROTOCOLS;
+			let unsubscribeCohortBridge: (() => void) | undefined;
+			let offInboundNotify: (() => void) | undefined;
+			let pushStateGossip: ReactivityPushStateGossipDriver | undefined;
+			let reactivityRotation: RotationReRegistrationScheduler | undefined;
+			{
+				const previousStop = node.stop.bind(node);
+				node.stop = async (): Promise<void> => {
+					try {
+						reactivityRotation?.stop();
+						pushStateGossip?.stop();
+						offInboundNotify?.();
+						await node.unhandle(reactivityProtocolList(reactivityProtocols));
+						await node.unhandle(matchmakingProtocolList(matchmakingProtocols));
+						unsubscribeCohortBridge?.();
+						await host.stop();
+					} finally {
+						await previousStop();
+					}
+				};
+			}
+
+			// selfIsCohortMember: this node owns the collection's reactivity-topic fan-out iff it is in the
+			// FRET cohort around coord_0(H(currentTailId ‖ "reactivity")). Uses db-core's default hashes
+			// (createReactivityTopicAnchor / createTierAddressing / createRingHash), byte-identical to the
+			// host's internal `new RingHash()` and the subscriber-side anchor, and the SAME cohortWantK as
+			// the host — so the coord + cohort line up across origination and subscription.
+			const selfIsCohortMember = createReactivitySelfMembershipGate({
+				fret,
+				selfPeerId: node.peerId.toString(),
+				wantK: cohortWantK,
+			});
+
+			unsubscribeCohortBridge = attachCohortChangeBridge(
+				node as unknown as { blockChangeNotifier?: IBlockChangeNotifier },
+				{
+					source: storageRepo,
+					service: host.service,
+					selfIsCohortMember,
+					extractCommitCert: makeClusterCommitCertExtractor(certStore!),
+				},
+			).unsubscribe;
+
+			// Expose the host so the reactivity origination wiring (and the activation test) can install
+			// `CohortTopicService.onLocalCommit`.
+			(node as any).cohortTopicHost = host;
+
+			// --- Reactivity notification transport (origination → fan-out → inbound delivery → push-state gossip) ---
+			// Compose notify + forwarder-host + push-state-gossip onto the cohort-topic host so a committed change
+			// on a tail-cohort member actually reaches subscribers on OTHER nodes over real sockets. The change
+			// bridge above fires `onLocalCommit`; this is what the emitted notifications travel over.
+			// (docs/reactivity.md §Notification origination / §Propagation.) Reactivity reuses the canonical,
+			// network-agnostic protocol IDs, matching the cohort-topic family's production default.
+			const selfPeerId = node.peerId.toString();
+			const reactivityProfile = host.profile; // Edge ⇒ subscriber-only via the policy gate; Core forwards.
+			const reactivityPolicy = reactivityNodePolicy(reactivityProfile);
+			// db-core default anchor + tier addressing, byte-identical to the host's `new RingHash()`, the
+			// origination gate, and the subscriber-side anchor — so coord_0 derivation lines up everywhere.
+			const reactivityAddressing = createTierAddressing(createRingHash());
+			// Reactivity's forwarder cohort sits at coord_0 — TREE tier 0 (peer-independent), distinct from the
+			// CAPACITY tier T3 the verifier/willingness use. `registry.findServing` keys on the engine's tree
+			// depth, so the served reactivity engine is found at tree tier 0, never at 3.
+			const REACTIVITY_FORWARDER_TREE_TIER = 0;
+
+			// Node-level subscriber registry: a constructed ReactivitySubscriptionManager registers here so a
+			// socket-delivered NotificationV1 reaches it. (The Quereus Database.watch → manager bridge that
+			// CONSTRUCTS managers stays the backlog item optimystic-network-reactive-watch-integration-test.)
+			const reactivitySubscribers = new ReactivitySubscriberRegistry();
+			(node as any).reactivitySubscribers = reactivitySubscribers;
+
+			// 1. Notify transport — unicast NotificationV1 send + inbound subscribe. selfPeerId guards self-dials.
+			const notify = new Libp2pReactivityNotifyTransport(node, { selfPeerId });
+
+			// 2. Forwarder host — turns the forward decision into live fan-out over the notify transport.
+			const forwarderHost = new ReactivityForwarderHost({
+				transport: notify,
+				selfPeerId,
+				profile: reactivityProfile,
+				pushStateInit: (topicId: Uint8Array, n: NotificationV1): PushStateInit => ({
+					collectionId: n.collectionId,
+					topicId: bytesToB64url(topicId),
+					tailIdAtJoin: n.tailId,
+					deltaMaxBytes: reactivityPolicy.deltaMaxBytes,
+				}),
+				verifierFor: (): NotificationVerifier => createNotificationVerifier({ verifier: host.service.verifier(), tier: Tier.T3 }),
+				directSubscribers: (topicId: Uint8Array): string[] => {
+					// Find the served reactivity engine at TREE tier 0 (see REACTIVITY_FORWARDER_TREE_TIER) and read
+					// its direct-subscriber records. The adapter filters to reactivity appState and maps participantId
+					// bytes → dialable peer-id strings (the transport's `peerIdFromString` space) — NOT base64url,
+					// which would silently fail to dial. `undefined` (no subscriber has registered here yet) ⇒ [].
+					const engine = host.registry.findServing(topicId, REACTIVITY_FORWARDER_TREE_TIER);
+					return engine === undefined ? [] : reactivityDirectSubscribers(engine, topicId);
+				},
+				// No childCohorts until cohort-topic-parent-child-link populates PushState.childCohorts (single
+				// tier-0 reach today); wire the resolver anyway. A child cohort's primary is the FRET-nearest member
+				// of its coord, returned as a peer-id string (the dial space).
+				resolveChildPrimary: (ref: CohortRef): string | undefined => {
+					const peers = fret.assembleCohort(b64urlToBytes(ref.coord), cohortWantK);
+					return peers.length > 0 ? peers[0] : undefined;
+				},
+				deliverLocal: (topicId: Uint8Array, n: NotificationV1): void => reactivitySubscribers.deliver(topicId, n),
+			});
+
+			// Inbound notify frames → forwarder host (subscriber role delivers in-process; forwarder role fans out).
+			// NOTE: the four `register*Handler` helpers below (notify / pushStateGossip / recover /
+			// matchmaking query) all call `node.handle(...)` fire-and-forget (`void`), so a rejected
+			// registration escapes the post-start rollback `catch` as an UNHANDLED rejection instead of
+			// failing node creation. Harmless today — every protocol id here is a fixed constant registered
+			// exactly once, so the only realistic rejection is a duplicate, and that needs a caller to pass
+			// overlapping custom `cohortTopic.host.protocols`. If any of these ids ever becomes
+			// caller-configurable, or a helper grows a registration that can genuinely fail, make them await
+			// their `node.handle` so the failure reaches the rollback.
+			registerNotifyHandler(node, reactivityProtocols.notify, notify);
+			offInboundNotify = notify.onNotification((from, n): void => { void forwarderHost.onInbound(from, n); });
+
+			// 3. Origination emit — install onLocalCommit: a member commit builds a NotificationV1 and ingests it.
+			const origination = new ReactivityOriginationManager({
+				service: host.service,
+				resolveContext: (event) => {
+					if (event.tailId === undefined) {
+						return undefined; // tail-less (read-driven promotion) never originates (the gate also returns first)
+					}
+					return {
+						// MUST reuse the gate's `reactivityTailBytes` (utf8), NOT db-core's double-hashing
+						// blockIdToBytes — else origination derives a different coord than subscribers resolve.
+						tailId: reactivityTailBytes(event.tailId),
+						deltaMaxBytes: reactivityPolicy.deltaMaxBytes,
+						// rotationHint stays undefined on a live node: the successor tail id is not knowable at the
+						// filling commit (random block ids; gated on 6.5-block-id-derivation). The authoritative,
+						// observable rotation signal is `event.tailId` CHANGING, which the manager observes via the
+						// `markRotated` binding below. (The pre-announce remains exercised in the mock-tier harness +
+						// the design simulator, both of which can synthesize the successor id.)
+					};
+				},
+				// reactivityNotificationTopicId(n) = reactivityTopicId(b64urlToBytes(n.tailId)); since
+				// n.tailId = b64url(reactivityTailBytes(tail)), this is the SAME topicId the gate assembled coord_0
+				// around and the subscriber/forwarder verifier derives — closing the encoding loop.
+				emit: (n): void => { void forwarderHost.ingest(reactivityNotificationTopicId(n), n); },
+				// Observe-rotation: when a collection's tail id changes between commits the OLD tail's reactivity
+				// topic has rotated. Start its drain so the recover serve begins redirecting to the new tree (the
+				// `reactivity-rotation-recover-redirect-drain` markRotated seam). `oldTopicId` is byte-identical to
+				// the topic a subscriber subscribed under (both `reactivityTopicId(reactivityTailBytes(tail))`).
+				markRotated: (oldTopicId, redirect, now): void => forwarderHost.markRotated(oldTopicId, redirect, now),
+			});
+			origination.install();
+
+			// 4. PushState gossip — periodic intra-cohort convergence so any member (not just the primary) can
+			// serve a replay/backfill. Rides the host's cohort gossip transport (no second transport).
+			pushStateGossip = new ReactivityPushStateGossipDriver({
+				gossipTransport: host.gossipTransport,
+				liveCollections: (): ReactivityGossipCollection[] => forwarderHost.livePushStates().map((pushState) => ({
+					pushState,
+					cohortCoord: reactivityAddressing.coord0(b64urlToBytes(pushState.topicId)),
+				})),
+				pushStateForGossip: (g: PushStateGossipV1) => forwarderHost.pushStateFor(b64urlToBytes(g.topicId)),
+				// Authenticity gate: accept gossip only from a member of the cohort around the frame's reactivity
+				// coord (per-frame peer-sig envelope signing is deferred — reactivity-pushstate-gossip's hardening backlog).
+				isCohortMember: (fromPeerId: string, g: PushStateGossipV1): boolean =>
+					fret.assembleCohort(reactivityAddressing.coord0(b64urlToBytes(g.topicId)), cohortWantK).includes(fromPeerId),
+			});
+			registerPushStateGossipHandler(node, reactivityProtocols.pushStateGossip, pushStateGossip);
+			pushStateGossip.start();
+
+			// 5. Recover RPC — the pull companion to notify (docs/reactivity.md §Backfill RPC / §Resume). A
+			// subscriber that detected a gap, or woke from sleep past the live tail, asks a serving cohort member
+			// "what did I miss?" and is brought current over a real request-reply socket. The SERVE side is live
+			// here: this node answers RecoverRequestV1 frames against its live forwarder PushStates. The OUTBOUND
+			// transport + signers are constructed and exposed for the subscribe factory that CONSTRUCTS managers
+			// (the Quereus Database.watch app-bridge — backlog optimystic-network-reactive-watch-integration-test);
+			// no node-internal manager calls them yet, exactly as the notify subscriber side is constructed against
+			// `reactivitySubscribers` rather than from a watch.
+			//
+			// Node-level sticky cohort-hint cache (keyed by collectionId), shared between the outbound transport's
+			// sticky-primary lookup and a future manager's rotation-invalidation so both see ONE cache. It starts
+			// empty ⇒ the transport falls through to the cohort-walk (any member holding the gossiped PushState
+			// answers); populating the sticky primary is a one-RT optimization, not a correctness need.
+			const reactivityCohortHintCache = createStickyCohortHintCache();
+			// topicId → dialable cohort member peer-id strings: the SAME FRET coord_0 assembly the push-state-gossip
+			// authenticity gate uses (`reactivityAddressing.coord0` → `fret.assembleCohort`), so a recover walk
+			// reaches exactly the cohort that holds the topic's gossiped PushState. `assembleCohort` returns peer-id
+			// strings (the recover dialer's `peerIdFromString` space), matching the notify dial-target space.
+			const resolveReactivityCohort = (topicId: Uint8Array): string[] =>
+				fret.assembleCohort(reactivityAddressing.coord0(topicId), cohortWantK);
+
+			// Outbound transport: exposes the db-core BackfillTransport / ResumeTransport seams against this node.
+			// maxBytes is omitted so the dialer + handler default to DEFAULT_STREAM_MAX_BYTES, matching the notify
+			// transport's default (constructed above without an override) — one frame ceiling across the family.
+			const recover = new Libp2pReactivityRecoverTransport({
+				dialer: createLibp2pRecoverDialer(node, reactivityProtocols.recover),
+				selfPeerId,
+				cohortHintCache: reactivityCohortHintCache,
+				resolveCohort: resolveReactivityCohort,
+			});
+
+			// Inbound serve handler: decode (bounded) → verify the dialing peer's signature → freshness/replay gate →
+			// resolve the live PushState off the forwarder host → serveBackfill/serveResume → reply (no reply on any
+			// failure; the stream aborts and the subscriber walks/chain-reads). One node-level replay guard is shared
+			// across all recover requests — a plain pruned-on-access map, so no new timer to tear down.
+			registerRecoverHandler(node, reactivityProtocols.recover, {
+				pushStateFor: forwarderHost.pushStateFor.bind(forwarderHost),
+				pushStateForCollection: forwarderHost.pushStateForCollection.bind(forwarderHost),
+				replayGuard: createCorrelationReplayGuard(),
+				rotationFor: (req, now) => {
+					// Drain-window redirect: a recover reaching an OLD (rotated, still-draining) tail is bounced to
+					// the new tree (reactivity-rotation-recover-redirect-drain). A resume carries the stale topic
+					// (topicId = reactivityTopicId(latestKnownTailId)); a backfill carries no topic, so resolve the
+					// collection's current served topic. rotationRedirectFor returns the gate's redirect while
+					// draining and undefined once drained (then evicting the gate + the old tail's served PushState).
+					const oldTopicId = req.topicId ?? resolveCurrentServedTopic(forwarderHost, req.collectionId);
+					return oldTopicId === undefined ? undefined : forwarderHost.rotationRedirectFor(oldTopicId, now);
+				},
+			});
+
+			// The subscriber's synchronous request signers over the node's Ed25519 key (resolves the recover wiring's
+			// lone design point — see recover-transport.ts §createRecoverRequestSigners). Fed to a manager by the
+			// subscribe factory alongside recover.backfillTransport(topicId, collectionId) /
+			// recover.resumeTransport(topicId, collectionId).
+			const recoverSigners = createRecoverRequestSigners(nodePrivateKey);
+
+			// Expose the recover seams so the subscribe factory wires backfill/resume RPC + signers + the shared
+			// sticky cache (mirrors `reactivitySubscribers` above).
+			(node as any).reactivityRecover = recover;
+			(node as any).reactivityRecoverSigners = recoverSigners;
+			(node as any).reactivityCohortHintCache = reactivityCohortHintCache;
+
+			// 6. Rotation re-registration scheduler — the host timer that moves a subscriber to the rotated tree
+			// when its manager surfaces a `RotationNotice` (`reactivity-rotation-rereg-scheduler`). Constructed with
+			// the default unref'd `setTimeout` timer so an idle re-registration never pins the process. The
+			// `reRegister(plan)` MOVE belongs to the subscribe factory that CONSTRUCTS managers (the deferred Quereus
+			// `Database.watch` bridge — backlog optimystic-network-reactive-watch-integration-test): on fire it builds
+			// a fresh `ReactivitySubscriptionManager` under `plan.newTopicId` carrying `plan.lastRevision`, registers
+			// it, and swaps the `ReactivitySubscriberRegistry` entry — registering the NEW-topic handler BEFORE
+			// unregistering the old, so a notification mid-swap is never dropped. Until that factory lands no
+			// node-internal manager drives `schedule()`, so this seam is a logged no-op — exactly as 12.33 exposed
+			// `reactivitySubscribers` / `reactivityRecover` without a live manager constructor.
+			reactivityRotation = new RotationReRegistrationScheduler({
+				reRegister: (plan): Promise<void> => {
+					reactivityWiringLog("reactivity rotation re-registration fired for successor topic=%s (lastRevision=%d) but no subscribe factory is wired yet — deferred to optimystic-network-reactive-watch-integration-test", bytesToB64url(plan.newTopicId), plan.lastRevision);
+					return Promise.resolve();
+				},
+			});
+			(node as any).reactivityRotation = reactivityRotation;
+
+			// --- Matchmaking QueryV1 RPC — cohort serve side (docs/matchmaking.md §Seeker query) ---
+			// The server half of the seeker query transport: a remote seeker dials `/optimystic/matchmaking/1.0.0/query`
+			// and this node answers with its cohort's locally-held provider/seeker registrations, signed by the node
+			// peer key. Matchmaking is layered ABOVE the cohort-topic substrate, so it owns its own protocol family
+			// and is wired here (the composition root) over the host's PUBLIC surface only — mirroring the reactivity
+			// registration above; nothing reaches into host.ts internals. The OUTBOUND seeker walk client is the
+			// prereq follow-on `matchmaking-query-rpc-seeker-walk`; only the serve side is live here.
+			registerMatchmakingQueryHandler(node, matchmakingProtocols.query, {
+				registry: host.registry,
+				// Reuse the reactivity addressing: createTierAddressing(createRingHash()) is byte-identical to the
+				// host's internal addressing for the tier-0 coord (peer- and fanout-independent), and the handler
+				// only ever derives coord_0(topicId).
+				addressing: reactivityAddressing,
+				// Single-member reply signature over the node peer key (same pattern reactivity uses for its signers).
+				sign: async (payload: Uint8Array): Promise<string> => bytesToB64url(await signPeer(nodePrivateKey, payload)),
+				// Anti-DoS rate-limit seam (backlog matchmaking-query-rate-limit) intentionally left unwired here:
+				// default-allow. When that ticket lands it passes a `gate: (from, topicId) => boolean` that limits on
+				// the connection's verified `from` peer (NOT the self-asserted query.requesterId).
+			});
 		}
 
-		// selfIsCohortMember: this node owns the collection's reactivity-topic fan-out iff it is in the
-		// FRET cohort around coord_0(H(currentTailId ‖ "reactivity")). Uses db-core's default hashes
-		// (createReactivityTopicAnchor / createTierAddressing / createRingHash), byte-identical to the
-		// host's internal `new RingHash()` and the subscriber-side anchor, and the SAME cohortWantK as
-		// the host — so the coord + cohort line up across origination and subscription.
-		const selfIsCohortMember = createReactivitySelfMembershipGate({
-			fret,
-			selfPeerId: node.peerId.toString(),
-			wantK: cohortWantK,
-		});
-
-		const { unsubscribe } = attachCohortChangeBridge(
-			node as unknown as { blockChangeNotifier?: IBlockChangeNotifier },
-			{
-				source: storageRepo,
-				service: host.service,
-				selfIsCohortMember,
-				extractCommitCert: makeClusterCommitCertExtractor(certStore!),
-			},
-		);
-
-		// Expose the host so the reactivity origination wiring (and the activation test) can install
-		// `CohortTopicService.onLocalCommit`.
-		(node as any).cohortTopicHost = host;
-
-		// --- Reactivity notification transport (origination → fan-out → inbound delivery → push-state gossip) ---
-		// Compose notify + forwarder-host + push-state-gossip onto the cohort-topic host so a committed change
-		// on a tail-cohort member actually reaches subscribers on OTHER nodes over real sockets. The change
-		// bridge above fires `onLocalCommit`; this is what the emitted notifications travel over.
-		// (docs/reactivity.md §Notification origination / §Propagation.) Reactivity reuses the canonical,
-		// network-agnostic protocol IDs, matching the cohort-topic family's production default.
-		const selfPeerId = node.peerId.toString();
-		const reactivityProtocols = DEFAULT_REACTIVITY_PROTOCOLS;
-		const reactivityProfile = host.profile; // Edge ⇒ subscriber-only via the policy gate; Core forwards.
-		const reactivityPolicy = reactivityNodePolicy(reactivityProfile);
-		// db-core default anchor + tier addressing, byte-identical to the host's `new RingHash()`, the
-		// origination gate, and the subscriber-side anchor — so coord_0 derivation lines up everywhere.
-		const reactivityAddressing = createTierAddressing(createRingHash());
-		// Reactivity's forwarder cohort sits at coord_0 — TREE tier 0 (peer-independent), distinct from the
-		// CAPACITY tier T3 the verifier/willingness use. `registry.findServing` keys on the engine's tree
-		// depth, so the served reactivity engine is found at tree tier 0, never at 3.
-		const REACTIVITY_FORWARDER_TREE_TIER = 0;
-
-		// Node-level subscriber registry: a constructed ReactivitySubscriptionManager registers here so a
-		// socket-delivered NotificationV1 reaches it. (The Quereus Database.watch → manager bridge that
-		// CONSTRUCTS managers stays the backlog item optimystic-network-reactive-watch-integration-test.)
-		const reactivitySubscribers = new ReactivitySubscriberRegistry();
-		(node as any).reactivitySubscribers = reactivitySubscribers;
-
-		// 1. Notify transport — unicast NotificationV1 send + inbound subscribe. selfPeerId guards self-dials.
-		const notify = new Libp2pReactivityNotifyTransport(node, { selfPeerId });
-
-		// 2. Forwarder host — turns the forward decision into live fan-out over the notify transport.
-		const forwarderHost = new ReactivityForwarderHost({
-			transport: notify,
-			selfPeerId,
-			profile: reactivityProfile,
-			pushStateInit: (topicId: Uint8Array, n: NotificationV1): PushStateInit => ({
-				collectionId: n.collectionId,
-				topicId: bytesToB64url(topicId),
-				tailIdAtJoin: n.tailId,
-				deltaMaxBytes: reactivityPolicy.deltaMaxBytes,
-			}),
-			verifierFor: (): NotificationVerifier => createNotificationVerifier({ verifier: host.service.verifier(), tier: Tier.T3 }),
-			directSubscribers: (topicId: Uint8Array): string[] => {
-				// Find the served reactivity engine at TREE tier 0 (see REACTIVITY_FORWARDER_TREE_TIER) and read
-				// its direct-subscriber records. The adapter filters to reactivity appState and maps participantId
-				// bytes → dialable peer-id strings (the transport's `peerIdFromString` space) — NOT base64url,
-				// which would silently fail to dial. `undefined` (no subscriber has registered here yet) ⇒ [].
-				const engine = host.registry.findServing(topicId, REACTIVITY_FORWARDER_TREE_TIER);
-				return engine === undefined ? [] : reactivityDirectSubscribers(engine, topicId);
-			},
-			// No childCohorts until cohort-topic-parent-child-link populates PushState.childCohorts (single
-			// tier-0 reach today); wire the resolver anyway. A child cohort's primary is the FRET-nearest member
-			// of its coord, returned as a peer-id string (the dial space).
-			resolveChildPrimary: (ref: CohortRef): string | undefined => {
-				const peers = fret.assembleCohort(b64urlToBytes(ref.coord), cohortWantK);
-				return peers.length > 0 ? peers[0] : undefined;
-			},
-			deliverLocal: (topicId: Uint8Array, n: NotificationV1): void => reactivitySubscribers.deliver(topicId, n),
-		});
-
-		// Inbound notify frames → forwarder host (subscriber role delivers in-process; forwarder role fans out).
-		registerNotifyHandler(node, reactivityProtocols.notify, notify);
-		const offInboundNotify = notify.onNotification((from, n): void => { void forwarderHost.onInbound(from, n); });
-
-		// 3. Origination emit — install onLocalCommit: a member commit builds a NotificationV1 and ingests it.
-		const origination = new ReactivityOriginationManager({
-			service: host.service,
-			resolveContext: (event) => {
-				if (event.tailId === undefined) {
-					return undefined; // tail-less (read-driven promotion) never originates (the gate also returns first)
-				}
-				return {
-					// MUST reuse the gate's `reactivityTailBytes` (utf8), NOT db-core's double-hashing
-					// blockIdToBytes — else origination derives a different coord than subscribers resolve.
-					tailId: reactivityTailBytes(event.tailId),
-					deltaMaxBytes: reactivityPolicy.deltaMaxBytes,
-					// rotationHint stays undefined on a live node: the successor tail id is not knowable at the
-					// filling commit (random block ids; gated on 6.5-block-id-derivation). The authoritative,
-					// observable rotation signal is `event.tailId` CHANGING, which the manager observes via the
-					// `markRotated` binding below. (The pre-announce remains exercised in the mock-tier harness +
-					// the design simulator, both of which can synthesize the successor id.)
-				};
-			},
-			// reactivityNotificationTopicId(n) = reactivityTopicId(b64urlToBytes(n.tailId)); since
-			// n.tailId = b64url(reactivityTailBytes(tail)), this is the SAME topicId the gate assembled coord_0
-			// around and the subscriber/forwarder verifier derives — closing the encoding loop.
-			emit: (n): void => { void forwarderHost.ingest(reactivityNotificationTopicId(n), n); },
-			// Observe-rotation: when a collection's tail id changes between commits the OLD tail's reactivity
-			// topic has rotated. Start its drain so the recover serve begins redirecting to the new tree (the
-			// `reactivity-rotation-recover-redirect-drain` markRotated seam). `oldTopicId` is byte-identical to
-			// the topic a subscriber subscribed under (both `reactivityTopicId(reactivityTailBytes(tail))`).
-			markRotated: (oldTopicId, redirect, now): void => forwarderHost.markRotated(oldTopicId, redirect, now),
-		});
-		origination.install();
-
-		// 4. PushState gossip — periodic intra-cohort convergence so any member (not just the primary) can
-		// serve a replay/backfill. Rides the host's cohort gossip transport (no second transport).
-		const pushStateGossip = new ReactivityPushStateGossipDriver({
-			gossipTransport: host.gossipTransport,
-			liveCollections: (): ReactivityGossipCollection[] => forwarderHost.livePushStates().map((pushState) => ({
-				pushState,
-				cohortCoord: reactivityAddressing.coord0(b64urlToBytes(pushState.topicId)),
-			})),
-			pushStateForGossip: (g: PushStateGossipV1) => forwarderHost.pushStateFor(b64urlToBytes(g.topicId)),
-			// Authenticity gate: accept gossip only from a member of the cohort around the frame's reactivity
-			// coord (per-frame peer-sig envelope signing is deferred — reactivity-pushstate-gossip's hardening backlog).
-			isCohortMember: (fromPeerId: string, g: PushStateGossipV1): boolean =>
-				fret.assembleCohort(reactivityAddressing.coord0(b64urlToBytes(g.topicId)), cohortWantK).includes(fromPeerId),
-		});
-		registerPushStateGossipHandler(node, reactivityProtocols.pushStateGossip, pushStateGossip);
-		pushStateGossip.start();
-
-		// 5. Recover RPC — the pull companion to notify (docs/reactivity.md §Backfill RPC / §Resume). A
-		// subscriber that detected a gap, or woke from sleep past the live tail, asks a serving cohort member
-		// "what did I miss?" and is brought current over a real request-reply socket. The SERVE side is live
-		// here: this node answers RecoverRequestV1 frames against its live forwarder PushStates. The OUTBOUND
-		// transport + signers are constructed and exposed for the subscribe factory that CONSTRUCTS managers
-		// (the Quereus Database.watch app-bridge — backlog optimystic-network-reactive-watch-integration-test);
-		// no node-internal manager calls them yet, exactly as the notify subscriber side is constructed against
-		// `reactivitySubscribers` rather than from a watch.
-		//
-		// Node-level sticky cohort-hint cache (keyed by collectionId), shared between the outbound transport's
-		// sticky-primary lookup and a future manager's rotation-invalidation so both see ONE cache. It starts
-		// empty ⇒ the transport falls through to the cohort-walk (any member holding the gossiped PushState
-		// answers); populating the sticky primary is a one-RT optimization, not a correctness need.
-		const reactivityCohortHintCache = createStickyCohortHintCache();
-		// topicId → dialable cohort member peer-id strings: the SAME FRET coord_0 assembly the push-state-gossip
-		// authenticity gate uses (`reactivityAddressing.coord0` → `fret.assembleCohort`), so a recover walk
-		// reaches exactly the cohort that holds the topic's gossiped PushState. `assembleCohort` returns peer-id
-		// strings (the recover dialer's `peerIdFromString` space), matching the notify dial-target space.
-		const resolveReactivityCohort = (topicId: Uint8Array): string[] =>
-			fret.assembleCohort(reactivityAddressing.coord0(topicId), cohortWantK);
-
-		// Outbound transport: exposes the db-core BackfillTransport / ResumeTransport seams against this node.
-		// maxBytes is omitted so the dialer + handler default to DEFAULT_STREAM_MAX_BYTES, matching the notify
-		// transport's default (constructed above without an override) — one frame ceiling across the family.
-		const recover = new Libp2pReactivityRecoverTransport({
-			dialer: createLibp2pRecoverDialer(node, reactivityProtocols.recover),
-			selfPeerId,
-			cohortHintCache: reactivityCohortHintCache,
-			resolveCohort: resolveReactivityCohort,
-		});
-
-		// Inbound serve handler: decode (bounded) → verify the dialing peer's signature → freshness/replay gate →
-		// resolve the live PushState off the forwarder host → serveBackfill/serveResume → reply (no reply on any
-		// failure; the stream aborts and the subscriber walks/chain-reads). One node-level replay guard is shared
-		// across all recover requests — a plain pruned-on-access map, so no new timer to tear down.
-		registerRecoverHandler(node, reactivityProtocols.recover, {
-			pushStateFor: forwarderHost.pushStateFor.bind(forwarderHost),
-			pushStateForCollection: forwarderHost.pushStateForCollection.bind(forwarderHost),
-			replayGuard: createCorrelationReplayGuard(),
-			rotationFor: (req, now) => {
-				// Drain-window redirect: a recover reaching an OLD (rotated, still-draining) tail is bounced to
-				// the new tree (reactivity-rotation-recover-redirect-drain). A resume carries the stale topic
-				// (topicId = reactivityTopicId(latestKnownTailId)); a backfill carries no topic, so resolve the
-				// collection's current served topic. rotationRedirectFor returns the gate's redirect while
-				// draining and undefined once drained (then evicting the gate + the old tail's served PushState).
-				const oldTopicId = req.topicId ?? resolveCurrentServedTopic(forwarderHost, req.collectionId);
-				return oldTopicId === undefined ? undefined : forwarderHost.rotationRedirectFor(oldTopicId, now);
-			},
-		});
-
-		// The subscriber's synchronous request signers over the node's Ed25519 key (resolves the recover wiring's
-		// lone design point — see recover-transport.ts §createRecoverRequestSigners). Fed to a manager by the
-		// subscribe factory alongside recover.backfillTransport(topicId, collectionId) /
-		// recover.resumeTransport(topicId, collectionId).
-		const recoverSigners = createRecoverRequestSigners(nodePrivateKey);
-
-		// Expose the recover seams so the subscribe factory wires backfill/resume RPC + signers + the shared
-		// sticky cache (mirrors `reactivitySubscribers` above).
-		(node as any).reactivityRecover = recover;
-		(node as any).reactivityRecoverSigners = recoverSigners;
-		(node as any).reactivityCohortHintCache = reactivityCohortHintCache;
-
-		// 6. Rotation re-registration scheduler — the host timer that moves a subscriber to the rotated tree
-		// when its manager surfaces a `RotationNotice` (`reactivity-rotation-rereg-scheduler`). Constructed with
-		// the default unref'd `setTimeout` timer so an idle re-registration never pins the process. The
-		// `reRegister(plan)` MOVE belongs to the subscribe factory that CONSTRUCTS managers (the deferred Quereus
-		// `Database.watch` bridge — backlog optimystic-network-reactive-watch-integration-test): on fire it builds
-		// a fresh `ReactivitySubscriptionManager` under `plan.newTopicId` carrying `plan.lastRevision`, registers
-		// it, and swaps the `ReactivitySubscriberRegistry` entry — registering the NEW-topic handler BEFORE
-		// unregistering the old, so a notification mid-swap is never dropped. Until that factory lands no
-		// node-internal manager drives `schedule()`, so this seam is a logged no-op — exactly as 12.33 exposed
-		// `reactivitySubscribers` / `reactivityRecover` without a live manager constructor.
-		const reactivityRotation = new RotationReRegistrationScheduler({
-			reRegister: (plan): Promise<void> => {
-				reactivityWiringLog("reactivity rotation re-registration fired for successor topic=%s (lastRevision=%d) but no subscribe factory is wired yet — deferred to optimystic-network-reactive-watch-integration-test", bytesToB64url(plan.newTopicId), plan.lastRevision);
-				return Promise.resolve();
-			},
-		});
-		(node as any).reactivityRotation = reactivityRotation;
-
-		// --- Matchmaking QueryV1 RPC — cohort serve side (docs/matchmaking.md §Seeker query) ---
-		// The server half of the seeker query transport: a remote seeker dials `/optimystic/matchmaking/1.0.0/query`
-		// and this node answers with its cohort's locally-held provider/seeker registrations, signed by the node
-		// peer key. Matchmaking is layered ABOVE the cohort-topic substrate, so it owns its own protocol family
-		// and is wired here (the composition root) over the host's PUBLIC surface only — mirroring the reactivity
-		// registration above; nothing reaches into host.ts internals. The OUTBOUND seeker walk client is the
-		// prereq follow-on `matchmaking-query-rpc-seeker-walk`; only the serve side is live here.
-		const matchmakingProtocols = DEFAULT_MATCHMAKING_PROTOCOLS;
-		registerMatchmakingQueryHandler(node, matchmakingProtocols.query, {
-			registry: host.registry,
-			// Reuse the reactivity addressing: createTierAddressing(createRingHash()) is byte-identical to the
-			// host's internal addressing for the tier-0 coord (peer- and fanout-independent), and the handler
-			// only ever derives coord_0(topicId).
-			addressing: reactivityAddressing,
-			// Single-member reply signature over the node peer key (same pattern reactivity uses for its signers).
-			sign: async (payload: Uint8Array): Promise<string> => bytesToB64url(await signPeer(nodePrivateKey, payload)),
-			// Anti-DoS rate-limit seam (backlog matchmaking-query-rate-limit) intentionally left unwired here:
-			// default-allow. When that ticket lands it passes a `gate: (from, topicId) => boolean` that limits on
-			// the connection's verified `from` peer (NOT the self-asserted query.requesterId).
-		});
-
-		// Teardown: release reactivity timers + protocol handlers BEFORE host.stop() (which clears the cohort
-		// gossip timer + unhandles the cohort-topic protocols) BEFORE the node's transports close (previousStop).
-		// Composes with the existing arachnode + clusterMember stop wrappers (each calls its captured previousStop last).
-		const previousStop = node.stop.bind(node);
-		node.stop = async (): Promise<void> => {
-			try {
-				reactivityRotation.stop();
-				pushStateGossip.stop();
-				offInboundNotify();
-				await node.unhandle(reactivityProtocolList(reactivityProtocols));
-				await node.unhandle(matchmakingProtocolList(matchmakingProtocols));
-				unsubscribe();
-				await host.stop();
-			} finally {
-				await previousStop();
-			}
-		};
+		return node as unknown as OptimysticNode;
+	} catch (err) {
+		// Post-start rollback. node.stop() runs whatever teardown wrappers were installed BEFORE the throw
+		// (each wrapper is registered next to the resource it releases, precisely so this unwinds as much as
+		// exists) and closes the transports. A rollback failure must never mask the real startup error, so it
+		// is logged and swallowed; `err` is what the caller sees.
+		try {
+			await node.stop();
+		} catch (stopErr) {
+			wiringLog('rollback stop failed after startup error: %o', stopErr);
+		}
+		throw err;
 	}
-
-	return node as unknown as OptimysticNode;
 }
