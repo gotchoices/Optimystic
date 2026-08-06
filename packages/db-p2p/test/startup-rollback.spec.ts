@@ -52,71 +52,81 @@ async function portIsFree(port: number): Promise<boolean> {
 	});
 }
 
+/**
+ * Run a node creation that is expected to reject, and return the rejection. If the factory instead
+ * SUCCEEDS the returned node is stopped before failing the assertion — otherwise the very leak these
+ * tests exist to catch would hang mocha on the way to reporting the failure.
+ */
+async function rejectionFrom(options: Parameters<typeof createLibp2pNode>[0]): Promise<Error> {
+	let node: Awaited<ReturnType<typeof createLibp2pNode>> | undefined;
+	try {
+		node = await createLibp2pNode(options);
+	} catch (err) {
+		return err as Error;
+	}
+	await node.stop();
+	throw new Error('expected createLibp2pNode to reject, but it resolved');
+}
+
 describe('createLibp2pNode post-start rollback', function () {
 	this.timeout(40_000);
 
 	it('a failure after node.start() rejects AND stops the node (listener port released)', async () => {
 		const port = await freePort();
 
-		let rejected: unknown;
-		try {
-			await createLibp2pNode({
-				bootstrapNodes: [],
-				networkName: 'test-startup-rollback',
-				port,
-				arachnode: { enableRingZulu: false },
-				// Libp2pKeyPeerNetwork.initFromPersistedState() awaits persistence.load() AFTER
-				// node.start() — the first throwable step of the post-start span, and the site that
-				// originally leaked the started node.
-				persistence: {
-					load: async () => { throw new Error('corrupt persisted state'); },
-					save: async () => { /* never reached */ },
-				},
-			});
-		} catch (err) {
-			rejected = err;
-		}
+		const rejected = await rejectionFrom({
+			bootstrapNodes: [],
+			networkName: 'test-startup-rollback',
+			port,
+			arachnode: { enableRingZulu: false },
+			// Libp2pKeyPeerNetwork.initFromPersistedState() awaits persistence.load() AFTER
+			// node.start() — the first throwable step of the post-start span, and the site that
+			// originally leaked the started node.
+			persistence: {
+				load: async () => { throw new Error('corrupt persisted state'); },
+				save: async () => { /* never reached */ },
+			},
+		});
 
-		expect(rejected, 'node creation rejected').to.be.instanceOf(Error);
 		// The ORIGINAL error, never a rollback error.
-		expect((rejected as Error).message).to.equal('corrupt persisted state');
+		expect(rejected.message).to.equal('corrupt persisted state');
 		expect(await portIsFree(port), 'listener port released (the node was stopped)').to.equal(true);
 	});
 
 	it('a cohort-topic host construction failure also rolls back (listener port released)', async () => {
 		const port = await freePort();
 
-		let rejected: unknown;
-		try {
-			await createLibp2pNode({
-				bootstrapNodes: [],
-				networkName: 'test-startup-rollback-cohort',
-				port,
-				arachnode: { enableRingZulu: false },
-				cohortTopic: {
-					enabled: true,
-					host: {
-						// Two cohort protocols sharing one ID: `createCohortTopicHost` registers its five
-						// handlers with `node.handle`, and libp2p's registrar rejects a duplicate protocol
-						// (DuplicateProtocolHandlerError). That makes host construction fail deep inside the
-						// cohort-topic activation block — the far end of the post-start span, well past the
-						// point where earlier rollback wrappers were installed.
-						protocols: {
-							...DEFAULT_COHORT_TOPIC_PROTOCOLS,
-							gossip: DEFAULT_COHORT_TOPIC_PROTOCOLS.register,
-						},
+		const rejected = await rejectionFrom({
+			bootstrapNodes: [],
+			networkName: 'test-startup-rollback-cohort',
+			port,
+			arachnode: { enableRingZulu: false },
+			cohortTopic: {
+				enabled: true,
+				host: {
+					// Two cohort protocols sharing one ID: `createCohortTopicHost` registers its five
+					// handlers with `node.handle`, and libp2p's registrar rejects a duplicate protocol
+					// (DuplicateProtocolHandlerError). That makes host construction fail deep inside the
+					// cohort-topic activation block — the far end of the post-start span, well past the
+					// point where earlier rollback wrappers were installed.
+					protocols: {
+						...DEFAULT_COHORT_TOPIC_PROTOCOLS,
+						gossip: DEFAULT_COHORT_TOPIC_PROTOCOLS.register,
 					},
 				},
-			});
-		} catch (err) {
-			rejected = err;
-		}
+			},
+		});
 
-		expect(rejected, 'node creation rejected').to.be.instanceOf(Error);
 		// Pin WHICH failure this exercises, so the test cannot start passing because the node rejected
 		// earlier (before the cohort block) for an unrelated reason.
-		expect((rejected as Error).name).to.equal('DuplicateProtocolHandlerError');
-		expect((rejected as Error).message).to.contain('/optimystic/cohort-topic/1.0.0/register');
+		expect(rejected.name).to.equal('DuplicateProtocolHandlerError');
+		expect(rejected.message).to.contain('/optimystic/cohort-topic/1.0.0/register');
 		expect(await portIsFree(port), 'listener port released (the node was stopped)').to.equal(true);
 	});
+
+	// NOT covered here: the `cohortTopic enabled but the FRET service is unavailable` hard-fail and the
+	// `networkManager.setReputation` injection — the other two sites whose ad-hoc stop-and-rethrow the
+	// rollback `catch` replaced. Both are unreachable from `NodeOptions`: the fret and networkManager
+	// services are registered unconditionally by the factory and there is no option to suppress or
+	// substitute one. Reaching them needs a service-injection seam this package does not have.
 });

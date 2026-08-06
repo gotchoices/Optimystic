@@ -389,19 +389,15 @@ disagree about the same key's cohort.
 
 ```typescript
 import { createLibp2pNode } from '@optimystic/db-p2p';
-import { repoService, clusterService } from '@optimystic/db-p2p';
 import { FileRawStorage } from '@optimystic/db-p2p-storage-fs';
 
-// Create (and start) a libp2p node with database services
+// Create (and start) a libp2p node. The repo and cluster protocol services are registered by the
+// factory itself — there is no `services` option to pass them in.
 const node = await createLibp2pNode({
   networkName: 'my-net',
   bootstrapNodes: ['...'],
   // In-memory when omitted; a raw-storage backend makes it durable
   storage: new FileRawStorage('/var/lib/optimystic'),
-  services: {
-    repo: repoService(),      // Handles external client requests
-    cluster: clusterService() // Handles peer coordination requests
-  }
 });
 
 // The handles the node already owns (see `OptimysticNodeAttachments`)
@@ -412,6 +408,11 @@ const keyNetwork = node.keyNetwork;            // Peer/coordinator discovery
 // ... use them, then:
 await node.stop();
 ```
+
+`createLibp2pNode` is all-or-nothing: the node is started early and then wired, so if any wiring step
+fails the factory stops the node before rejecting and surfaces the original error. A rejection
+therefore never leaves a running node behind — which matters because the caller gets no handle to
+stop one. Retrying on the same port is safe.
 
 Constructing a `StorageRepo`, `CoordinatorRepo` or `Libp2pKeyPeerNetwork` yourself is only for a
 host assembling a stack *without* `createLibp2pNode`. A standalone `CoordinatorRepo` or

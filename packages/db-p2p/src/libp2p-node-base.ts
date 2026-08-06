@@ -805,8 +805,13 @@ export async function createLibp2pNodeBase(
 		{
 			const previousStop = node.stop.bind(node);
 			node.stop = async () => {
-				(clusterImpl as import('./cluster/cluster-repo.js').ClusterMember).dispose();
-				await previousStop();
+				try {
+					(clusterImpl as import('./cluster/cluster-repo.js').ClusterMember).dispose();
+				} finally {
+					// Never let a dispose failure strand the transports — same try/finally shape every
+					// other wrapper in this chain uses.
+					await previousStop();
+				}
 			};
 		}
 
@@ -1362,8 +1367,9 @@ export async function createLibp2pNodeBase(
 			// (which clears the cohort gossip timer + unhandles the cohort-topic protocols) BEFORE the node's
 			// transports close (previousStop). Composes with the existing arachnode + clusterMember stop
 			// wrappers (each calls its captured previousStop last). `node.unhandle` on a protocol that was
-			// never registered is a no-op (registrar deletes from a Map), so the handler releases need no
-			// separate registration flags.
+			// never registered does not throw — libp2p's registrar deletes each id from its handler map
+			// (a miss is silently ignored) and then re-patches the peer store's advertised protocol list —
+			// so the handler releases need no separate registration flags.
 			const reactivityProtocols = DEFAULT_REACTIVITY_PROTOCOLS;
 			const matchmakingProtocols = DEFAULT_MATCHMAKING_PROTOCOLS;
 			let unsubscribeCohortBridge: (() => void) | undefined;

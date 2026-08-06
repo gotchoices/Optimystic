@@ -293,7 +293,12 @@ StorageRepo.onAnyCollectionChange        # catch-all feed (every collection, not
   once. The host is exposed as `node.cohortTopicHost`. A node **without** `cohortTopic.enabled`
   keeps the bare `blockChangeNotifier = storageRepo` at zero cohort cost (no host, no cert store).
   When enabled, a missing FRET service or a host-construction failure **hard-fails** node startup
-  (the operator opted in). Node teardown releases the catch-all subscription and stops the host
+  (the operator opted in) — and, like every failure after `node.start()`, it **rolls back**: the
+  factory stops the started node before rejecting with the original error, so a rejection never
+  leaves a running node the caller has no handle to stop (`test/startup-rollback.spec.ts`). Rollback
+  unwinds only what has a stop wrapper installed at the moment of the throw, which is why each
+  wrapper is registered immediately after the resource it releases rather than at the end of the
+  block. Node teardown releases the catch-all subscription and stops the host
   (clearing the gossip timer, unhandling the protocols) before transports close.
   - **Now end-to-end live** (`reactivity-notification-transport`). The enabled block also composes
     the reactivity notification transport onto the host: a `ReactivityOriginationManager` installs
