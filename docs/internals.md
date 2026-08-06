@@ -893,6 +893,28 @@ NOTE: that guard only scans `db-core`. The other packages were swept and are cle
 writing; if one of them ever grows the pattern, lift the spec into a shared, per-package check
 rather than copying it.
 
+### 7. A Full Row Where a Key Tuple Belongs (Quereus vtab)
+**Bug**: Three differently-addressed value lists reach the vtab's key-building code and look
+identical to a reader — a **full row** (one cell per table column, read as `row[pkDef[i].index]`),
+a **primary-key tuple** (one cell per PK column in key order, read as `tuple[i]` — this is what
+`UpdateArgs.oldKeyValues` and a point lookup's seek args carry), and an **index-column tuple** (one
+cell per index column, possibly a leading prefix). Passing one where another is expected produces a
+*wrong but perfectly well-formed* tree key.
+**Symptom**: no error anywhere — a composite-PK point lookup matches nothing; a same-key UPDATE is
+reported as colliding with itself; a DELETE removes nothing. Only shows up when the PK columns are
+not the table's leading columns in PK order, so it hides completely in the common single-column-PK
+case.
+**Fix**: the two tuple shapes are distinct nominal (branded) types in
+`packages/quereus-plugin-optimystic/src/schema/key-tuples.ts`, obtainable only from their arity-checking
+constructors (`RowCodec.asPrimaryKeyTuple`, `IndexManager.asIndexColumnTuple`). `Row` is deliberately
+left unbranded — it crosses the engine boundary constantly — and is kept out of tuple parameters by
+the tuples being `readonly` while `Row` is mutable. The constructors refuse an already-branded input,
+so neither tuple kind can be laundered into the other through them. Arity checks alone are *not*
+sufficient: when every table column is in the PK, the two shapes are the same length.
+**Enforced by**: `packages/quereus-plugin-optimystic/test/key-tuple-types.spec.ts` (`@ts-expect-error`
+assertions, checked by `yarn typecheck`) plus the runtime round-trips in
+`test/oldkeyvalues-compact-shape.spec.ts`.
+
 ## Quereus SQL Dialect
 
 Quereus is **not** SQLite. It is a distinct SQL engine aligned with [The Third Manifesto](https://www.dcs.warwick.ac.uk/~hugh/TTM/DTATRM.pdf). The most important departure: **columns default to NOT NULL** unless explicitly marked `NULL`. Use `pragma default_column_nullability = 'nullable'` for SQL-standard behavior. Other notable differences include empty primary keys for singleton tables (`PRIMARY KEY ()`), native temporal/JSON types, all-virtual-table architecture, operation-specific CHECK constraints, and no triggers. See the [quereus-plugin-optimystic README](../packages/quereus-plugin-optimystic/README.md#quereus-sql-dialect) and the [Quereus SQL Reference](https://github.com/nicktobey/quereus/blob/main/docs/sql.md) (Section 11) for the full list.

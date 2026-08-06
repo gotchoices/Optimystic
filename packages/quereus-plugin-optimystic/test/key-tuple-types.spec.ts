@@ -23,7 +23,8 @@
 import { expect } from 'chai';
 import type { Row, SqlValue } from '@quereus/quereus';
 import { RowCodec } from '../src/schema/row-codec.js';
-import { IndexManager } from '../src/schema/index-manager.js';
+import { IndexManager, indexKeyFromValues } from '../src/schema/index-manager.js';
+import { KEY_PREFIX_END } from '../src/schema/key-encoding.js';
 import type { StoredTableSchema, StoredIndexSchema } from '../src/schema/schema-manager.js';
 
 /**
@@ -124,6 +125,25 @@ function _compileTimeGuards(codec: RowCodec, indexes: IndexManager): void {
 	// position.
 	// @ts-expect-error PrimaryKeyTuple is not a Row
 	void indexes.insertIndexEntries(pkTuple, 'some-pk');
+
+	// Laundering one tuple kind into the other THROUGH the checked constructor. The
+	// arity check cannot see this whenever the two happen to be the same width, so the
+	// constructors take `UnbrandedValues` and refuse anything already branded.
+	// @ts-expect-error an IndexColumnTuple cannot be re-branded as a PrimaryKeyTuple
+	codec.asPrimaryKeyTuple(idxTuple);
+
+	// @ts-expect-error a PrimaryKeyTuple cannot be re-branded as an IndexColumnTuple
+	indexes.asIndexColumnTuple(IDX_A, pkTuple);
+
+	// Re-wrapping a tuple as its OWN kind is pointless and likewise refused, so the
+	// constructor stays a one-way door from unbranded values.
+	// @ts-expect-error already a PrimaryKeyTuple
+	codec.asPrimaryKeyTuple(pkTuple);
+
+	// A full row and a bare literal remain valid constructor inputs — `UnbrandedValues`
+	// must not have made the constructors unusable.
+	codec.asPrimaryKeyTuple(row);
+	indexes.asIndexColumnTuple(IDX_A, ['a-value']);
 }
 
 /**
@@ -245,6 +265,24 @@ describe('index key byte-identity across entry points', () => {
 		expect(nullTuple).to.not.equal(emptyTuple);
 		expect(nullTuple).to.equal(indexes.createIndexKey(IDX_XY, fullRow(null, 'y')));
 		expect(emptyTuple).to.equal(indexes.createIndexKey(IDX_XY, fullRow('', 'y')));
+	});
+
+	/**
+	 * The one production path that bypasses `asIndexColumnTuple`: an index-served scan
+	 * with zero constraint values (a plan of the `idxNum >= 10` legacy shape with
+	 * `argc === 0`, e.g. an index-served ORDER BY) calls `indexKeyFromValues([])`
+	 * directly, because the constructor deliberately rejects an empty tuple. Pinned
+	 * here so the bypass keeps meaning "the whole index".
+	 */
+	it('the zero-width key frames to the empty string and prefixes every index key', () => {
+		const indexes = makeIndexManager(WIDE_SCHEMA);
+
+		expect(indexKeyFromValues([])).to.equal('');
+		expect(indexes.createIndexKey(IDX_XY, fullRow('x-val', 'y-val')).startsWith(indexKeyFromValues([])))
+			.to.equal(true);
+		// And it is strictly below the prefix-range upper bound, so [key, key+END) really
+		// does bracket the entire index rather than an empty range.
+		expect(indexKeyFromValues([]) < KEY_PREFIX_END).to.equal(true);
 	});
 
 	it('numeric values agree between the tuple and row paths', () => {

@@ -42,7 +42,9 @@
  * are not sufficient — they are blind when the two shapes happen to be the same length
  * (e.g. `create table R (a text, b text, primary key (b, a))`, where a full row and a
  * key tuple are both length 2 but ordered differently) — which is precisely why the
- * compile-time guard is needed on top of them.
+ * compile-time guard is needed on top of them. The constructors also refuse an input
+ * that is ALREADY branded (see {@link UnbrandedValues}), so neither tuple kind can be
+ * laundered into the other by passing it back through the audit point.
  */
 
 import type { SqlValue } from '@quereus/quereus';
@@ -68,3 +70,18 @@ export type PrimaryKeyTuple = readonly SqlValue[] & { readonly __tupleBrand: 'Pr
  * stumble into.
  */
 export type IndexColumnTuple = readonly SqlValue[] & { readonly __tupleBrand: 'IndexColumnTuple' };
+
+/**
+ * The input type both checked constructors accept: a positional value list that is NOT
+ * already branded as a tuple of either kind.
+ *
+ * Without this, a constructor taking a plain `readonly SqlValue[]` would happily accept
+ * the OTHER tuple kind, laundering an index-ordered tuple into a primary-key one (or
+ * vice versa) through the very site that is supposed to be the audit point. The arity
+ * check catches that in most schemas but not when the two happen to be the same width.
+ *
+ * `__tupleBrand?: never` reads as "must not carry a brand": a `Row`, a bare array
+ * literal, and an unbranded `readonly SqlValue[]` all satisfy it (the property is
+ * optional and absent), while either branded tuple fails on the property's type.
+ */
+export type UnbrandedValues = readonly SqlValue[] & { readonly __tupleBrand?: never };

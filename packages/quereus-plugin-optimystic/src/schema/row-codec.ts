@@ -11,7 +11,7 @@ import { toString as uint8ToString } from 'uint8arrays/to-string';
 import { fromString as uint8FromString } from 'uint8arrays/from-string';
 import type { StoredTableSchema, StoredColumnSchema } from './schema-manager.js';
 import { encodeKeyTuple, splitKeyTuple, type DecodedKeyElement } from './key-encoding.js';
-import type { PrimaryKeyTuple } from './key-tuples.js';
+import type { PrimaryKeyTuple, UnbrandedValues } from './key-tuples.js';
 
 /**
  * Encoding format for row data
@@ -90,14 +90,19 @@ export class RowCodec {
 	 * "these values are key-ordered, not column-positioned". See key-tuples.ts.
 	 *
 	 * An empty tuple is legal: a singleton table has an empty primary key definition.
+	 * An already-branded tuple is refused by the compiler, so an index-column tuple
+	 * cannot be laundered into a primary-key one through here.
 	 */
-	asPrimaryKeyTuple(values: readonly SqlValue[]): PrimaryKeyTuple {
+	asPrimaryKeyTuple(values: UnbrandedValues): PrimaryKeyTuple {
 		if (values.length !== this.schema.primaryKeyDefinition.length) {
 			throw new Error(
 				`Primary key requires ${this.schema.primaryKeyDefinition.length} values, got ${values.length}`
 			);
 		}
-		return values as PrimaryKeyTuple;
+		// The brand-minting site. Widen away the "carries no brand" constraint first —
+		// `UnbrandedValues` and `PrimaryKeyTuple` disagree on `__tupleBrand` by design, so
+		// a direct cast between them is (correctly) rejected as non-overlapping.
+		return values as readonly SqlValue[] as PrimaryKeyTuple;
 	}
 
 	/**

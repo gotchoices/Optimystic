@@ -31,7 +31,7 @@ export { RowCodec, type EncodedRow, type PrimaryKeyValue, type EncodingFormat } 
 // wrong tree key. Obtainable only from their checked constructors
 // (RowCodec.asPrimaryKeyTuple / IndexManager.asIndexColumnTuple) — exported so callers
 // can name them in their own signatures.
-export type { PrimaryKeyTuple, IndexColumnTuple } from './schema/key-tuples.js';
+export type { PrimaryKeyTuple, IndexColumnTuple, UnbrandedValues } from './schema/key-tuples.js';
 export type { StoredTableSchema, StoredColumnSchema, StoredPrimaryKeyColumn, StoredIndexSchema, StoredUniqueConstraint } from './schema/schema-manager.js';
 
 // Export the order-preserving, injective key-framing primitives (shared by the

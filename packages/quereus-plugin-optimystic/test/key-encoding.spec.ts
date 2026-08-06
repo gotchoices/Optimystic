@@ -45,6 +45,35 @@ describe('key-encoding tuple framing', () => {
 		}
 	});
 
+	/**
+	 * Golden bytes. Every other assertion here is RELATIONAL (distinct, ordered) or a
+	 * round-trip through this same module — so a coordinated change to both the encoder
+	 * and the decoder would keep the whole suite green while making every already-persisted
+	 * database unreadable, since these strings ARE the on-disk tree keys.
+	 *
+	 * If a change breaks these, it is a storage format change, not a test to update:
+	 * see tickets/backlog/debt-optimystic-key-format-migration.md before touching them.
+	 */
+	describe('on-disk format (literal bytes)', () => {
+		it('frames each element exactly as documented', () => {
+			expect(encodeKeyElement(null)).to.equal('\x00');
+			expect(encodeKeyElement('')).to.equal('\x02\x00');
+			expect(encodeKeyElement('ab')).to.equal('\x02ab\x00');
+			// A raw \x00 in the payload escapes to \x00\xff so the bare \x00 keeps meaning
+			// "end of element".
+			expect(encodeKeyElement('a\x00b')).to.equal('\x02a\x00\xffb\x00');
+		});
+
+		it('concatenates framed elements with no separator', () => {
+			expect(encodeKeyTuple([])).to.equal('');
+			expect(encodeKeyTuple(['x', null, ''])).to.equal('\x02x\x00' + '\x00' + '\x02\x00');
+		});
+
+		it('pins the prefix-range upper bound', () => {
+			expect(KEY_PREFIX_END).to.equal('\x03');
+		});
+	});
+
 	describe('injectivity (distinct tuples -> distinct encodings)', () => {
 		it('does not collide when a value contains the separator (boundary shift)', () => {
 			// The original bug: ['foo\x00bar','baz'] and ['foo','bar'] both joined to

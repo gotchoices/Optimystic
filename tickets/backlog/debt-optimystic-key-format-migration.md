@@ -45,6 +45,19 @@ are expected to re-create data. So the real question is a product one:
   This is real work and should be split into its own implement ticket once the
   decision is made.
 
+## Drift detection now exists (added by the `debt-nominal-key-tuple-vs-row-types` review)
+
+`test/key-encoding.spec.ts` now has an `on-disk format (literal bytes)` block asserting the
+exact framed strings (`encodeKeyElement(null) === '\x00'`, the `\x00\xff` escape, the empty
+tuple, `KEY_PREFIX_END`). Before that, every assertion in the file was either relational
+(distinct / correctly ordered) or a round-trip through the same module, so a coordinated
+change to both the encoder and the decoder would have kept the suite green while making every
+persisted database unreadable.
+
+That does not answer the decision above — it only means the *next* accidental format change
+fails a test instead of shipping silently. A deliberate change still needs whatever migration
+answer this ticket settles on.
+
 ## Why this is backlog, not blocking
 
 The current change is correct and complete for new data; this only concerns backward

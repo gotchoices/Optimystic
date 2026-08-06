@@ -24,8 +24,15 @@ It runs, in order:
 |------|----------------|
 | `yarn lint` | eslint across the monorepo |
 | `yarn build` | every package compiles |
+| `yarn typecheck` | `tsc --noEmit` for the packages whose build does not type-check |
 | `yarn test` | unit suites — fast, no sockets |
 | `yarn test:integration` | real-socket libp2p suites |
+
+`yarn typecheck` exists because two packages (`quereus-plugin-optimystic`, `quereus-plugin-crypto`)
+build with **tsup/esbuild**, which strips types without checking them — every other package builds
+with `tsc` and is checked by `yarn build` itself. It must run **after** `yarn build`: those two
+packages' specs import their own `dist/index.js`, whose `.d.ts` only exists once the build has run,
+so `yarn typecheck` on a clean tree fails with unresolved-module errors rather than real ones.
 
 `yarn test:integration` is the step that matters most and is the easiest to skip by accident: the
 integration specs are **env-gated** (`OPTIMYSTIC_INTEGRATION=1`) and live in a separate per-package
@@ -120,7 +127,7 @@ All packages in the monorepo share the same version number. The `--recursive` fl
 
 ## Checklist
 
-- [ ] `yarn check` passes (lint + build + test + **test:integration**)
+- [ ] `yarn check` passes (lint + build + typecheck + test + **test:integration**)
 - [ ] Clean working tree
 - [ ] `yarn release` (or `yarn bump` + `yarn pub` separately)
 - [ ] GitHub release created

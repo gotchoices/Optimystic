@@ -12,7 +12,7 @@ import type { ITransactor } from '@optimystic/db-core';
 import type { Row, SqlValue } from '@quereus/quereus';
 import type { StoredTableSchema, StoredIndexSchema } from './schema-manager.js';
 import { encodeKeyTuple, KEY_PREFIX_END } from './key-encoding.js';
-import type { IndexColumnTuple } from './key-tuples.js';
+import type { IndexColumnTuple, UnbrandedValues } from './key-tuples.js';
 
 /**
  * Serialize a single value for use in a secondary-index key.
@@ -251,14 +251,16 @@ export class IndexManager {
 	 * column(s). An EMPTY tuple is rejected — it would range over the whole index, which
 	 * a caller must opt into explicitly rather than reach by accident.
 	 */
-	asIndexColumnTuple(indexSchema: StoredIndexSchema, values: readonly SqlValue[]): IndexColumnTuple {
+	asIndexColumnTuple(indexSchema: StoredIndexSchema, values: UnbrandedValues): IndexColumnTuple {
 		if (values.length === 0 || values.length > indexSchema.columns.length) {
 			throw new Error(
 				`Index '${indexSchema.name}' key tuple requires 1 to ${indexSchema.columns.length} ` +
 				`values (a leading prefix is allowed), got ${values.length}`
 			);
 		}
-		return values as IndexColumnTuple;
+		// Brand-minting site; see the matching note in RowCodec.asPrimaryKeyTuple for why
+		// the widening step is needed.
+		return values as readonly SqlValue[] as IndexColumnTuple;
 	}
 
 	/**

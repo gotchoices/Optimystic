@@ -36,7 +36,10 @@ To grep for a specific test: `yarn test -- --grep "pattern"`
 `db-p2p` and `quereus-plugin-optimystic`) are env-gated on `OPTIMYSTIC_INTEGRATION=1` and run from a
 separate `test:integration` script — they exercise real TCP meshes, FRET cohort assembly, and
 cross-node reactivity/matchmaking over real sockets. Run `yarn test:integration` from root to fan out
-to both, or `yarn check` from root for the full gate (lint + build + test + test:integration).
+to both, or `yarn check` from root for the full gate (lint + build + typecheck + test +
+test:integration). `yarn typecheck` covers the two tsup/esbuild-built packages, whose build strips
+types without checking them; it must run **after** `yarn build`, since their specs import their own
+`dist/` output.
 `yarn check` is the pre-release gate; see [docs/releasing.md](docs/releasing.md).
 
 A third tier sits below even that: individual specs that are too slow to run by default gate
