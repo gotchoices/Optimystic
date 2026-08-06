@@ -12,6 +12,7 @@ import type { ITransactor } from '@optimystic/db-core';
 import type { Row, SqlValue } from '@quereus/quereus';
 import type { StoredTableSchema, StoredIndexSchema } from './schema-manager.js';
 import { encodeKeyTuple, KEY_PREFIX_END } from './key-encoding.js';
+import type { IndexColumnTuple } from './key-tuples.js';
 
 /**
  * Serialize a single value for use in a secondary-index key.
@@ -74,6 +75,30 @@ export function serializeIndexValue(value: SqlValue): string | null {
  * Index key format: composite of indexed column values joined with separator
  */
 export type IndexKey = string;
+
+/**
+ * THE shared framing core for index-style keys — the only place an index key is
+ * assembled from values.
+ *
+ * Every entry point that builds one (row-shaped {@link IndexManager.createIndexKey},
+ * tuple-shaped {@link IndexManager.createIndexKeyFromTuple}, and the vtab's
+ * secondary-UNIQUE comparison key) routes through here, so they are byte-identical by
+ * construction rather than by three hand-maintained copies of the same formula
+ * (`serializeIndexValue` per value, then {@link encodeKeyTuple} to frame). Those copies
+ * previously had to be kept in lockstep by hand; a drift between the seek path and the
+ * store path silently makes an index seek match nothing.
+ *
+ * `values` is positional: one entry per key element, in index order. A shorter list
+ * frames a leading PREFIX, which the caller can use to bracket a range (see
+ * {@link IndexManager.findByIndexIn}); an empty list frames to `''`, which brackets the
+ * whole index.
+ */
+export function indexKeyFromValues(values: readonly SqlValue[]): IndexKey {
+	// Frame each column payload through the shared injective tuple encoding so an
+	// indexed value containing the old raw `\x00` separator can neither shift element
+	// boundaries nor break prefix-range brackets.
+	return encodeKeyTuple(values.map(value => serializeIndexValue(value ?? null)));
+}
 
 /**
  * Primary key format: composite of primary key column values joined with separator
@@ -205,15 +230,45 @@ export class IndexManager {
 	}
 
 	/**
-	 * Create index key from row values
+	 * Create an index key from a FULL ROW — one cell per table column, addressed by
+	 * column position (`row[indexCol.index]`). For a positional seek tuple use
+	 * {@link createIndexKeyFromTuple}; see key-tuples.ts for why the two shapes cannot
+	 * be substituted.
 	 */
 	createIndexKey(indexSchema: StoredIndexSchema, row: Row): IndexKey {
-		// Frame each column payload through the shared injective tuple encoding so an
-		// indexed value containing the old raw `\x00` separator can neither shift
-		// element boundaries nor break the prefix-range brackets below.
-		return encodeKeyTuple(
-			indexSchema.columns.map(indexCol => serializeIndexValue(row[indexCol.index] ?? null))
-		);
+		return indexKeyFromValues(indexSchema.columns.map(indexCol => row[indexCol.index] ?? null));
+	}
+
+	/**
+	 * Wrap a positional index-column tuple — one cell per index column, in index order —
+	 * as an {@link IndexColumnTuple}, checking its arity. This is the ONLY way to obtain
+	 * that type, and therefore the single audited site where a caller asserts "these
+	 * values are index-ordered, not column-positioned".
+	 *
+	 * A PREFIX is accepted (`values.length < indexSchema.columns.length`): a partial seek
+	 * key frames the leading columns only and brackets a range over the rest, which is
+	 * how {@link findByIndexIn} serves a multi-column index constrained on its first
+	 * column(s). An EMPTY tuple is rejected — it would range over the whole index, which
+	 * a caller must opt into explicitly rather than reach by accident.
+	 */
+	asIndexColumnTuple(indexSchema: StoredIndexSchema, values: readonly SqlValue[]): IndexColumnTuple {
+		if (values.length === 0 || values.length > indexSchema.columns.length) {
+			throw new Error(
+				`Index '${indexSchema.name}' key tuple requires 1 to ${indexSchema.columns.length} ` +
+				`values (a leading prefix is allowed), got ${values.length}`
+			);
+		}
+		return values as IndexColumnTuple;
+	}
+
+	/**
+	 * Create an index key from a positional index-column tuple (built via
+	 * {@link asIndexColumnTuple}). Byte-identical to {@link createIndexKey} for the same
+	 * logical values — both route through {@link indexKeyFromValues} — so a seek key
+	 * matches the key an insert stored.
+	 */
+	createIndexKeyFromTuple(tuple: IndexColumnTuple): IndexKey {
+		return indexKeyFromValues(tuple);
 	}
 
 	/**

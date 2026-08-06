@@ -25,6 +25,13 @@ export { PartialCommitError } from './optimystic-adapter/txn-bridge.js';
 
 // Export schema utilities
 export { RowCodec, type EncodedRow, type PrimaryKeyValue, type EncodingFormat } from './schema/row-codec.js';
+
+// Nominal (branded) types that keep the key-ordered tuple shapes distinct from a full
+// row, so substituting one for the other is a compile error rather than a silently
+// wrong tree key. Obtainable only from their checked constructors
+// (RowCodec.asPrimaryKeyTuple / IndexManager.asIndexColumnTuple) — exported so callers
+// can name them in their own signatures.
+export type { PrimaryKeyTuple, IndexColumnTuple } from './schema/key-tuples.js';
 export type { StoredTableSchema, StoredColumnSchema, StoredPrimaryKeyColumn, StoredIndexSchema, StoredUniqueConstraint } from './schema/schema-manager.js';
 
 // Export the order-preserving, injective key-framing primitives (shared by the

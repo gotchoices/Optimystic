@@ -179,7 +179,7 @@ describe('RowCodec', () => {
 			);
 			const codec = new RowCodec(schema);
 
-			const pk = codec.createPrimaryKey(['x', 'y']);
+			const pk = codec.createPrimaryKey(codec.asPrimaryKeyTuple(['x', 'y']));
 			expect(pk).to.equal(encodeKeyTuple(['x', 'y']));
 			// Must match extractPrimaryKey byte-for-byte (insert vs point-lookup parity).
 			expect(pk).to.equal(codec.extractPrimaryKey(['x', 'y']));
@@ -192,19 +192,84 @@ describe('RowCodec', () => {
 			);
 			const codec = new RowCodec(schema);
 
-			expect(() => codec.createPrimaryKey(['x'])).to.throw();
+			// The arity check now lives in the checked constructor, which is the only way
+			// to reach createPrimaryKey at all.
+			expect(() => codec.asPrimaryKeyTuple(['x'])).to.throw();
 		});
 	});
 
 	/**
-	 * `extractPrimaryKey(row)` and `createPrimaryKey(values)` both take a plain
-	 * array, so handing either the other's argument type-checks. Feeding the
-	 * COMPACT key tuple (`UpdateArgs.oldKeyValues` — one cell per PK column) to
+	 * `asPrimaryKeyTuple` is the ONLY way to obtain a `PrimaryKeyTuple`, so it is the
+	 * single audited site where a caller asserts "these values are key-ordered, not
+	 * column-positioned". See src/schema/key-tuples.ts, and
+	 * test/key-tuple-types.spec.ts for the compile-time half of the guard.
+	 */
+	describe('asPrimaryKeyTuple() arity', () => {
+		const twoColPkSchema = () => makeSchema(
+			[{ name: 'a', affinity: 'TEXT' }, { name: 'filler', affinity: 'TEXT' }, { name: 'b', affinity: 'TEXT' }],
+			[0, 2]
+		);
+
+		it('should throw naming the expected count when too few values are given', () => {
+			const codec = new RowCodec(twoColPkSchema());
+
+			expect(() => codec.asPrimaryKeyTuple(['x'])).to.throw(/requires 2 values, got 1/);
+		});
+
+		it('should throw when a full row is handed over instead of a key tuple', () => {
+			const codec = new RowCodec(twoColPkSchema());
+
+			expect(() => codec.asPrimaryKeyTuple(['x', 'f', 'y'])).to.throw(/requires 2 values, got 3/);
+		});
+
+		it('should round-trip byte-identically with extractPrimaryKey on the same logical key', () => {
+			const codec = new RowCodec(twoColPkSchema());
+
+			expect(codec.createPrimaryKey(codec.asPrimaryKeyTuple(['x', 'y'])))
+				.to.equal(codec.extractPrimaryKey(['x', 'f', 'y']));
+		});
+
+		it('should accept an empty tuple for a table with an empty primary key', () => {
+			// A singleton table has no PK columns; createPrimaryKeyComparator already
+			// special-cases pkDef.length === 0, so the empty tuple must stay legal.
+			const schema = makeSchema([{ name: 'only', affinity: 'TEXT' }], []);
+			const codec = new RowCodec(schema);
+
+			const tuple = codec.asPrimaryKeyTuple([]);
+			expect(codec.createPrimaryKey(tuple)).to.equal('');
+		});
+
+		it('should reject a rotated all-column tuple only by TYPE, not by arity', () => {
+			// `create table R (a text, b text, primary key (b, a))`: a full row is [a, b]
+			// and a key tuple is [b, a] — both length 2, so no arity check can tell them
+			// apart. Documented here so a future reader does not mistake the arity guards
+			// for full coverage; the compile-time guard in key-tuple-types.spec.ts is what
+			// actually closes this case.
+			const rotated = makeSchema(
+				[{ name: 'a', affinity: 'TEXT' }, { name: 'b', affinity: 'TEXT' }],
+				[1, 0]
+			);
+			const codec = new RowCodec(rotated);
+
+			// Both calls succeed — and produce DIFFERENT keys from the same two cells.
+			const asRow = codec.extractPrimaryKey(['a-val', 'b-val']);
+			const asTuple = codec.createPrimaryKey(codec.asPrimaryKeyTuple(['a-val', 'b-val']));
+			expect(asRow).to.not.equal(asTuple);
+			// Correctly addressed, they agree.
+			expect(asRow).to.equal(codec.createPrimaryKey(codec.asPrimaryKeyTuple(['b-val', 'a-val'])));
+		});
+	});
+
+	/**
+	 * `extractPrimaryKey(row)` takes a FULL ROW; `createPrimaryKey` takes the key tuple
+	 * (`UpdateArgs.oldKeyValues` — one cell per PK column). Feeding the tuple to
 	 * extractPrimaryKey is the mistake behind
 	 * `bug-same-key-update-reports-unique-collision-with-itself`: it addresses
 	 * `row[pkCol.index]`, which reads past the tuple's end for any PK column that
 	 * is not among the table's leading columns, silently yielding a key that
-	 * matches nothing. The length guard makes that a loud failure.
+	 * matches nothing. The nominal types now make that a compile error for in-repo
+	 * callers; this length guard still covers anything arriving through a cast or from
+	 * plain JavaScript.
 	 */
 	describe('extractPrimaryKey() full-row guard', () => {
 		// PK on columns 0 and 2 — the shape where a compact tuple and a full row
@@ -232,7 +297,8 @@ describe('RowCodec', () => {
 			// Without the guard, extractPrimaryKey(['x','y']) would read index 2 as
 			// undefined -> null and produce a DIFFERENT key from this one — the exact
 			// silent divergence the guard now prevents.
-			expect(codec.extractPrimaryKey(['x', 'f', 'y'])).to.equal(codec.createPrimaryKey(['x', 'y']));
+			expect(codec.extractPrimaryKey(['x', 'f', 'y']))
+				.to.equal(codec.createPrimaryKey(codec.asPrimaryKeyTuple(['x', 'y'])));
 		});
 	});
 
@@ -261,8 +327,8 @@ describe('RowCodec', () => {
 			const codec = new RowCodec(schema);
 			const cmp = codec.createPrimaryKeyComparator();
 
-			const nullKey = codec.createPrimaryKey([null]);
-			const abcKey = codec.createPrimaryKey(['abc']);
+			const nullKey = codec.createPrimaryKey(codec.asPrimaryKeyTuple([null]));
+			const abcKey = codec.createPrimaryKey(codec.asPrimaryKeyTuple(['abc']));
 			expect(cmp(nullKey, abcKey)).to.be.below(0);
 			expect(cmp(abcKey, nullKey)).to.be.above(0);
 			expect(cmp(nullKey, nullKey)).to.equal(0);

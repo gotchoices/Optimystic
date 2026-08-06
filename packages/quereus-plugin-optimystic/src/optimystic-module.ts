@@ -21,8 +21,8 @@ import type { StoredTableSchema, StoredIndexSchema } from './schema/schema-manag
 import { RowCodec, type EncodedRow } from './schema/row-codec.js';
 import { SqlDataType, PhysicalType } from '@quereus/quereus';
 import { INTEGER_TYPE, REAL_TYPE, TEXT_TYPE, BLOB_TYPE, NUMERIC_TYPE, NULL_TYPE, BOOLEAN_TYPE, type LogicalType } from '@quereus/quereus';
-import { IndexManager, serializeIndexValue, type IndexEntry } from './schema/index-manager.js';
-import { encodeKeyTuple } from './schema/key-encoding.js';
+import { IndexManager, indexKeyFromValues, type IndexEntry } from './schema/index-manager.js';
+import type { PrimaryKeyTuple } from './schema/key-tuples.js';
 import { createLogger } from './logger.js';
 
 const log = createLogger('module');
@@ -896,7 +896,10 @@ export class OptimysticVirtualTable extends VirtualTable {
     // the SAME encoding the row codec uses to store keys (extractPrimaryKey).
     // Using only args[0] silently drops every PK column past the first, so a
     // composite-PK point lookup builds a key that can never match a stored row.
-    const key = this.rowCodec.createPrimaryKey(args as SqlValue[]);
+    // Seek args are the key-ordered tuple shape, not a row — see schema/key-tuples.ts.
+    const key = this.rowCodec.createPrimaryKey(
+      this.rowCodec.asPrimaryKeyTuple(args as readonly SqlValue[]),
+    );
 
     const path = await read.find(key);
     if (!read.isValid(path)) {
@@ -936,16 +939,24 @@ export class OptimysticVirtualTable extends VirtualTable {
   ): AsyncIterable<Row> {
     if (!this.rowCodec || !this.indexManager) return;
 
-    // Build the (possibly partial) framed index key from constraint values. Must use
-    // the SAME framing IndexManager.createIndexKey stores under, so the prefix range in
-    // findByIndexIn brackets exactly this tuple. A partial key (fewer args than index
-    // columns) frames only the provided leading columns and prefix-matches the rest.
-    const indexKeyPayloads: Array<string | null> = [];
-    for (let i = 0; i < args.length && i < index.schema.columns.length; i++) {
-      indexKeyPayloads.push(serializeIndexValue(args[i] as SqlValue));
-    }
-
-    const indexKey = encodeKeyTuple(indexKeyPayloads);
+    // Build the (possibly partial) framed index key from constraint values. Both this
+    // and IndexManager.createIndexKey route through indexKeyFromValues, so the prefix
+    // range in findByIndexIn brackets exactly the tuple an insert stored. A partial key
+    // (fewer args than index columns) frames only the provided leading columns and
+    // prefix-matches the rest; the planner may also hand over MORE constraint values
+    // than the index covers, so the excess is truncated rather than rejected.
+    const width = Math.min(args.length, index.schema.columns.length);
+    // Zero constraint values means the plan wants the whole index (e.g. an index-served
+    // ORDER BY): frame the empty prefix directly. asIndexColumnTuple deliberately
+    // rejects an empty tuple, so this case bypasses it rather than weakening that guard.
+    const indexKey = width === 0
+      ? indexKeyFromValues([])
+      : this.indexManager.createIndexKeyFromTuple(
+          this.indexManager.asIndexColumnTuple(
+            index.schema,
+            args.slice(0, width) as readonly SqlValue[],
+          ),
+        );
 
     // Look up primary keys using the index read source
     for await (const primaryKey of this.indexManager.findByIndexIn(index.read, indexKey)) {
@@ -1091,11 +1102,11 @@ export class OptimysticVirtualTable extends VirtualTable {
     return `UNIQUE constraint failed: ${cols}`;
   }
 
-  /** Serialized composite key for a set of column indices, using the SAME per-value
-   *  encoding the secondary-index layer keys on (see {@link serializeIndexValue}),
+  /** Serialized composite key for a set of column indices of a FULL ROW, built by the
+   *  same shared core the secondary-index layer keys on ({@link indexKeyFromValues}),
    *  so a uniqueness comparison agrees byte-for-byte with how the index would key it. */
   private uniqueKeyFor(columns: readonly number[], row: Row): string {
-    return encodeKeyTuple(columns.map(ci => serializeIndexValue(row[ci] ?? null)));
+    return indexKeyFromValues(columns.map(ci => row[ci] ?? null));
   }
 
   /**
@@ -1548,15 +1559,16 @@ export class OptimysticVirtualTable extends VirtualTable {
    * committed state, so chained writes within one transaction see the right image.
    *
    * A miss means the engine and the collection disagree about what exists. The
-   * alternative — fabricating an image from `oldKeyValues` (the COMPACT key tuple,
-   * one cell per PK column, not a full row) — would feed index maintenance
-   * wrong-shape data and corrupt index entries silently, so this fails loudly
-   * instead. See test/oldkeyvalues-compact-shape.spec.ts "missing pre-write row".
+   * alternative — fabricating an image from the key tuple (one cell per PK column, not
+   * a full row) — would feed index maintenance wrong-shape data and corrupt index
+   * entries silently, so this fails loudly instead. `keyValues` is typed as the tuple
+   * precisely so a full row cannot be handed over here by mistake; see
+   * test/oldkeyvalues-compact-shape.spec.ts "missing pre-write row".
    */
   private async requirePreWriteRow(
     operation: 'UPDATE' | 'DELETE',
     key: string,
-    keyValues: readonly SqlValue[],
+    keyValues: PrimaryKeyTuple,
   ): Promise<Row> {
     if (!this.collection || !this.rowCodec) {
       throw new Error('Table not initialized');
@@ -1577,7 +1589,11 @@ export class OptimysticVirtualTable extends VirtualTable {
    * Performs an INSERT, UPDATE, or DELETE operation
    */
   async update(args: UpdateArgs): Promise<UpdateResult> {
-    const { operation, values, oldKeyValues, mutationStatement } = args;
+    // `args.oldKeyValues` is deliberately NOT destructured: an unbranded binding of the
+    // key tuple sitting in scope is exactly the shape that gets handed to a row-taking
+    // method by mistake. Each write case below converts it to a PrimaryKeyTuple and
+    // binds only that. See schema/key-tuples.ts.
+    const { operation, values, mutationStatement } = args;
 
     // Ensure connection is registered
     await this.ensureConnectionRegistered();
@@ -1710,27 +1726,21 @@ export class OptimysticVirtualTable extends VirtualTable {
           if (!values) {
             throw new Error('UPDATE requires values');
           }
-          if (!oldKeyValues) {
+          if (!args.oldKeyValues) {
             throw new Error('UPDATE requires old key values');
           }
           {
-            // `oldKeyValues` is the COMPACT key tuple — one cell per
-            // primaryKeyDefinition entry, in that order — NOT a full row indexed by
-            // column position (quereus's UpdateArgs contract, vtab/table.ts). So it
-            // goes through createPrimaryKey (positional), never extractPrimaryKey
-            // (which addresses row[pkDef[i].index] and is for full rows only). The
-            // two agree only when the PK columns are the table's leading columns in
-            // PK order; anywhere else extractPrimaryKey read past the tuple, took
-            // `undefined` -> null for the trailing key parts, and produced a key
-            // that matched nothing — making a same-key UPDATE look like a PK move
-            // onto its own occupied slot and reporting the row as colliding with
-            // itself. See test/oldkeyvalues-compact-shape.spec.ts.
-            const oldKey = this.rowCodec.createPrimaryKey(oldKeyValues as SqlValue[]);
+            // `oldKeyValues` is the key tuple (quereus's UpdateArgs contract,
+            // vtab/table.ts), NOT a full row — see schema/key-tuples.ts. The
+            // conversion stays HERE, after the guard and after addStatement, so the
+            // arity error keeps its current ordering relative to both.
+            const oldKeyTuple = this.rowCodec.asPrimaryKeyTuple(args.oldKeyValues);
+            const oldKey = this.rowCodec.createPrimaryKey(oldKeyTuple);
             const newKey = this.rowCodec.extractPrimaryKey(values);
             const encodedRow = this.rowCodec.encodeRow(values);
 
             // Must precede every collection.stage() below — see requirePreWriteRow.
-            const oldRow = await this.requirePreWriteRow('UPDATE', oldKey, oldKeyValues);
+            const oldRow = await this.requirePreWriteRow('UPDATE', oldKey, oldKeyTuple);
 
             // Decide the PK move FIRST when the key changes: its outcome is an
             // input to the secondary-UNIQUE probe below. A REPLACE removes the row
@@ -1812,18 +1822,18 @@ export class OptimysticVirtualTable extends VirtualTable {
           }
 
         case 'delete':
-          if (!oldKeyValues) {
+          if (!args.oldKeyValues) {
             throw new Error('DELETE requires old key values');
           }
           {
-            // Compact key tuple, positional — see the note on the UPDATE path's
-            // oldKey. Read as a full row, a non-leading PK yielded a key nothing
-            // occupied and the DELETE silently removed nothing.
-            const deleteKey = this.rowCodec.createPrimaryKey(oldKeyValues as SqlValue[]);
+            // Key tuple, positional — see the note on the UPDATE path's oldKey and
+            // schema/key-tuples.ts.
+            const oldKeyTuple = this.rowCodec.asPrimaryKeyTuple(args.oldKeyValues);
+            const deleteKey = this.rowCodec.createPrimaryKey(oldKeyTuple);
 
             // Must precede the stage() below (which clears the slot) — see
             // requirePreWriteRow.
-            const oldRow = await this.requirePreWriteRow('DELETE', deleteKey, oldKeyValues);
+            const oldRow = await this.requirePreWriteRow('DELETE', deleteKey, oldKeyTuple);
 
             // Snapshot before staging so a rollback reverts exactly this delete.
             this.markDirtyTrees();

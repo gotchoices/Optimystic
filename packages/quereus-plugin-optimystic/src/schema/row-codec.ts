@@ -11,6 +11,7 @@ import { toString as uint8ToString } from 'uint8arrays/to-string';
 import { fromString as uint8FromString } from 'uint8arrays/from-string';
 import type { StoredTableSchema, StoredColumnSchema } from './schema-manager.js';
 import { encodeKeyTuple, splitKeyTuple, type DecodedKeyElement } from './key-encoding.js';
+import type { PrimaryKeyTuple } from './key-tuples.js';
 
 /**
  * Encoding format for row data
@@ -83,15 +84,36 @@ export class RowCodec {
 	}
 
 	/**
-	 * Extract primary key value from a row
+	 * Wrap a positional key tuple — one cell per `primaryKeyDefinition` entry, in key
+	 * order — as a {@link PrimaryKeyTuple}, checking its arity. This is the ONLY way to
+	 * obtain that type, and therefore the single audited site where a caller asserts
+	 * "these values are key-ordered, not column-positioned". See key-tuples.ts.
+	 *
+	 * An empty tuple is legal: a singleton table has an empty primary key definition.
+	 */
+	asPrimaryKeyTuple(values: readonly SqlValue[]): PrimaryKeyTuple {
+		if (values.length !== this.schema.primaryKeyDefinition.length) {
+			throw new Error(
+				`Primary key requires ${this.schema.primaryKeyDefinition.length} values, got ${values.length}`
+			);
+		}
+		return values as PrimaryKeyTuple;
+	}
+
+	/**
+	 * Extract primary key value from a FULL ROW — one cell per table column, addressed
+	 * by column position. For the key-ordered tuple shape use {@link createPrimaryKey}
+	 * (constructed via {@link asPrimaryKeyTuple}); see key-tuples.ts for why the two
+	 * cannot be substituted.
 	 */
 	extractPrimaryKey(row: Row): PrimaryKeyValue {
-		// Guard against the compact key tuple (UpdateArgs.oldKeyValues — one cell per
-		// primary-key column) being passed here instead of a full row: with no length
-		// check, row[pkCol.index] reads past the tuple's end for any PK column not
-		// among its leading positions and silently produces a wrong key. A full row is
-		// always exactly schema.columns.length long (decodeRow's output, or the
-		// engine's `values`), so this can never reject a legitimate caller.
+		// `Row` is mutable and the tuple types are readonly, so a key tuple cannot reach
+		// this parameter from in-repo TypeScript. This runtime guard still covers anything
+		// arriving through a cast or from plain JavaScript: with no length check,
+		// row[pkCol.index] reads past a tuple's end for any PK column not among its leading
+		// positions and silently produces a wrong key. A full row is always exactly
+		// schema.columns.length long (decodeRow's output, or the engine's `values`), so
+		// this can never reject a legitimate caller.
 		if (row.length !== this.schema.columns.length) {
 			throw new Error(
 				`extractPrimaryKey requires a full row of ${this.schema.columns.length} columns, got ${row.length} — ` +
@@ -109,13 +131,17 @@ export class RowCodec {
 	}
 
 	/**
-	 * Create a primary key from individual column values.
+	 * Create a primary key from a KEY TUPLE — one cell per `primaryKeyDefinition` entry,
+	 * in key order, addressed positionally. Build the argument with
+	 * {@link asPrimaryKeyTuple}; a full row is rejected by the compiler (see key-tuples.ts).
 	 *
 	 * Must produce byte-identical output to {@link extractPrimaryKey} for the same
 	 * logical key: inserts key off the extracted row while point lookups key off these
 	 * seek-arg values, and the two are compared by exact tree-key match.
 	 */
-	createPrimaryKey(values: SqlValue[]): PrimaryKeyValue {
+	createPrimaryKey(values: PrimaryKeyTuple): PrimaryKeyValue {
+		// Belt-and-braces: asPrimaryKeyTuple already checked this, but the type can be
+		// reached through a cast or from JavaScript.
 		if (values.length !== this.schema.primaryKeyDefinition.length) {
 			throw new Error(
 				`Primary key requires ${this.schema.primaryKeyDefinition.length} values, got ${values.length}`

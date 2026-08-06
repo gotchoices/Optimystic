@@ -304,6 +304,66 @@ describe('UpdateArgs.oldKeyValues compact-tuple shape (local/bootstrap transacto
 		expect(await reopenScalar(dir, 'select payload from S where id = 7')).to.equal('q');
 	});
 
+	/**
+	 * The blind spot the arity guards CANNOT see.
+	 *
+	 * Every other case here relies on the two shapes having different lengths, which
+	 * `extractPrimaryKey`'s full-row length check turns into a loud error. When EVERY
+	 * table column is part of the primary key, a full row and a key tuple are the same
+	 * length — here both are 2 — so no length check can tell them apart. Declaring the
+	 * PK in the reverse of column order (`primary key (b, a)` over `(a, b)`) makes the
+	 * two shapes disagree on CONTENT while agreeing on length: read as a row, the tuple
+	 * `[b, a]` yields `frame(a, b)` instead of `frame(b, a)`.
+	 *
+	 * This passes on the already-fixed code — it documents the residual hole that the
+	 * nominal key-tuple types close at compile time (see src/schema/key-tuples.ts and
+	 * test/key-tuple-types.spec.ts), and pins it against a future regression.
+	 */
+	it('UPDATE and DELETE stay correct when EVERY column is in the PK and PK order is rotated', async () => {
+		const uri = 'tree://oldkeyshape/rotated';
+		const { db } = createDb(dir);
+		try {
+			await db.exec(
+				`create table R (
+					a text,
+					b text,
+					primary key (b, a)
+				) using optimystic('${uri}')`,
+			);
+			await db.exec(`insert into R (a, b) values ('a1', 'b1')`);
+
+			// Move a KEY column. A wrong oldKey clears a slot nothing occupies, leaving
+			// the original row behind (count 2) — or makes the move look like a
+			// collision with itself.
+			await db.exec(`update R set a = 'a2' where a = 'a1' and b = 'b1'`);
+
+			expect(await selectCount(db, 'select count(*) as c from R')).to.equal(1);
+			expect(await selectCount(db, `select count(*) as c from R where a = 'a2' and b = 'b1'`)).to.equal(1);
+			expect(await selectCount(db, `select count(*) as c from R where a = 'a1'`)).to.equal(0);
+		} finally {
+			db.close();
+		}
+
+		// Exactly one row survives the reopen, at the NEW key — the strongest signal
+		// that the stored key bytes are the ones the read path rebuilds.
+		expect(Number(await reopenScalar(dir, 'select count(*) as c from R'))).to.equal(1);
+		expect(Number(await reopenScalar(dir,
+			`select count(*) as c from R where a = 'a2' and b = 'b1'`,
+		))).to.equal(1);
+
+		// And the DELETE half, addressed by the same rotated tuple.
+		const { db: db2, plugin } = createDb(dir);
+		try {
+			await plugin.hydrate(db2);
+			await db2.exec(`delete from R where a = 'a2' and b = 'b1'`);
+			expect(await selectCount(db2, 'select count(*) as c from R')).to.equal(0);
+		} finally {
+			db2.close();
+		}
+
+		expect(Number(await reopenScalar(dir, 'select count(*) as c from R'))).to.equal(0);
+	});
+
 	it('UPDATE throws (rather than fabricating an old row image) when the pre-write row is missing', async () => {
 		await expectMissingPreWriteRowThrow(dir, 'tree://oldkeyshape/update-missing', {
 			operation: 'update',
