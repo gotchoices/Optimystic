@@ -556,6 +556,32 @@ describe('StorageRepo', () => {
 			expect(contextless.state).to.deep.equal({});
 		});
 
+		it('a pending-only block read at a named rev with NO actionId is a plain unflagged absent', async () => {
+			// The shape production actually issues: `CoordinatorRepo.promoteCorroborated` reads with
+			// `{ committed: [corroborated], rev }` and never sets `actionId`. Before the getBlock
+			// change this threw and came back `unavailable: 'unmaterializable'`, which the read-repair
+			// pass had to log and step over. It is an ABSENCE — no committed revision exists here — so
+			// it must stay unflagged, and `state` must stay the empty object the coordinator reads as
+			// "consult the cohort".
+			const blockId = 'pending-only-no-actionid' as BlockId;
+			await repo.pend({
+				actionId: 'p1' as ActionId,
+				transforms: makeInsertTransforms(blockId, makeBlock('pending-only-no-actionid', { items: ['fresh'] })),
+				policy: 'c'
+			});
+
+			const entry = (await repo.get({
+				blockIds: [blockId],
+				context: { rev: 3, committed: [] }
+			}))[blockId]!;
+
+			expect(entry.block, 'no committed revision to serve').to.equal(undefined);
+			expect('unavailable' in entry, 'an absent base is not a reconstruction failure').to.equal(false);
+			expect(entry.state).to.deep.equal({});
+			// The pending record survives the read — nothing above consumed or refused it.
+			expect(await rawStorage.getPendingTransaction(blockId, 'p1' as ActionId)).to.not.equal(undefined);
+		});
+
 		it('a pending UPDATE over an absent committed base materializes nothing and is flagged', async () => {
 			// The overlay runs (getBlock no longer throws), but `applyTransform` drops updates when
 			// there is no block to apply them to. This node holds a pending record PROVING the block

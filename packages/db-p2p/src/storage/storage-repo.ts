@@ -294,6 +294,16 @@ export class StorageRepo implements IRepo, IBlockChangeNotifier, IBlockReplicaSt
 					}
 					// Caller-contract violation (the caller asserted a pending this repo never had, or
 					// cancelled) — an error, not an availability question. Deliberately NOT `unavailable`.
+					//
+					// It is NOT the only way to reach here. A context that both PROVES its own action
+					// (`committed` names it) and names it as the pending overlay (`actionId`) is
+					// self-contradictory, and the two halves of that contradiction land differently: if
+					// the read-driven promotion above REFUSED, the arm above answers gracefully; if it
+					// SUCCEEDED, `promotePendingTransaction` moved the record and we throw here — failing
+					// the whole batch for a request the refusal path tolerates. No production code sets
+					// `ActionContext.actionId` at all today, so neither is reachable except from tests or
+					// a peer that crafts the field on the wire. See
+					// tickets/blocked/repo-pending-overlay-has-no-producer.
 					throw new Error(`Pending action ${context.actionId} not found`);
 				}
 				const block = applyTransform(blockRev?.block, pendingTransform);

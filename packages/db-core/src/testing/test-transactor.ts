@@ -485,7 +485,18 @@ function latestMaterializedAt(blockState: BlockState, maxRev: number): { block: 
 	return undefined;
 }
 
+/**
+ * `applyTransform` over cloned inputs, so a returned block never aliases stored state.
+ *
+ * An absent base is NOT a short circuit: an insert needs no base — `applyTransform` adopts it as
+ * the block. Bailing out on `!block` made this double silently drop a pending-only insert read
+ * through the pending overlay, the one shape `StorageRepo.get` serves with content but no
+ * `materializedRev` (see docs/internals.md § the `unavailable`/`materializedRev` bullets). A
+ * pending UPDATE over an absent base still resolves to undefined, matching the real repo.
+ */
 function applyTransformSafe(block: IBlock | undefined, transform: Transform): IBlock | undefined {
-  if (!block) return undefined;
-  return applyTransform(structuredClone(block), transform);
+  return applyTransform(
+    block ? structuredClone(block) : undefined,
+    transform.insert ? { ...transform, insert: structuredClone(transform.insert) } : transform
+  );
 }

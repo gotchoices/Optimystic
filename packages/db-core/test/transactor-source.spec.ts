@@ -603,6 +603,34 @@ describe('TransactorSource', () => {
 			expect(collector.getReadDependencies()).to.deep.equal([{ blockId, revision: 1 }]);
 		});
 
+		it('records revision 0 for content served over an absent committed base', async () => {
+			// A block pended but not yet committed, read back through its pending overlay: real
+			// content, but no committed revision under it, so the repo reports NEITHER
+			// `materializedRev` NOR `state.latest` (see GetBlockResult.materializedRev and
+			// docs/internals.md). Both sinks then fall through to 0 — the honest "no committed
+			// revision observed" — rather than fabricating a revision the node never committed.
+			// Pinned here because the fallback is what makes the absent field safe to emit; the
+			// db-p2p side (StorageRepo.get's pending overlay) relies on this reading.
+			const transactor = new TestTransactor();
+			const blockId = 'uncommitted-overlay-block';
+
+			await transactor.pend({
+				actionId: 'p1' as ActionId,
+				transforms: { inserts: { [blockId]: { header: { id: blockId, type: 'T', collectionId: 'c' }, data: 'fresh' } as IBlock }, updates: {}, deletes: [] },
+				policy: 'c',
+			});
+
+			const raw = await transactor.get({ blockIds: [blockId], context: { committed: [], rev: 1, actionId: 'p1' as ActionId } });
+			expect(raw[blockId]?.block, 'the overlay serves the uncommitted content').to.not.equal(undefined);
+			expect(raw[blockId]?.materializedRev, 'no committed base ⇒ no materialized revision').to.equal(undefined);
+			expect(raw[blockId]?.state.latest, 'and nothing committed').to.equal(undefined);
+
+			const source = new TransactorSource<IBlock>('c', transactor, { committed: [], rev: 1, actionId: 'p1' as ActionId });
+			expect(await source.tryGet(blockId), 'the source serves it too').to.not.equal(undefined);
+			expect(source.getReadDependencies(), 'dependency recorded at revision 0').to.deep.equal([{ blockId, revision: 0 }]);
+			expect(source.getReadRevision(blockId), 'and the cache learns the same number').to.equal(0);
+		});
+
 		it('should not propagate pending action info from tryGet (TODO in source code)', async () => {
 			const transactor = new TestTransactor();
 			const src = new TransactorSource<IBlock & { data: string }>('c', transactor, undefined);
