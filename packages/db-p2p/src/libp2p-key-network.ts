@@ -171,17 +171,25 @@ export class Libp2pKeyPeerNetwork implements IKeyNetwork, IPeerNetwork {
 		 * provided, coordinator/cohort selection is scoped to peers that serve THIS
 		 * network's `cluster`/`repo` protocol, so a peer that only belongs to another
 		 * network sharing the same physical nodes/bootstraps is never chosen. When
-		 * ABSENT, the membership filter is disabled (today's exact behavior) — required
-		 * for backward compatibility because most call sites don't know the network name.
+		 * ABSENT, the membership filter is disabled.
+		 *
+		 * NOTE: optional for the same reason `clusterSize` used to be — "most call sites don't
+		 * know the network name" — and that reason no longer holds: both production sites now
+		 * pass it (`libp2p-node-base.ts`, and the foreign-node fallback in the Quereus
+		 * collection-factory), and only the mock-based cases in `test/libp2p-key-network.spec.ts`
+		 * omit it. So a caller omitting it today gets the filter silently off, exactly the shape
+		 * that let a second key network be built with a wrong cohort width. Left optional because
+		 * making it required would touch ~50 construction sites in that one spec and no reachable
+		 * caller is affected. Make it required (or take the whole list as an options bag) the
+		 * moment a THIRD production construction site appears, or when that spec is rewritten.
 		 */
 		private readonly protocolPrefix?: string
 	) {
-		// NOTE: no construction site in this repo passes a SelfCoordinationConfig — every one
-		// leaves it `undefined` (libp2p-node-base.ts, quereus-plugin-optimystic's
-		// collection-factory.ts and key-network.ts, reference-peer's cli.ts), so these
-		// defaults are always what is in force and no operator can tune them. If tuning
-		// `gracePeriodMs` is ever needed, those four sites have to thread the config through
-		// first. Low urgency: a grace-period denial no longer fails the caller, it only costs
+		// NOTE: no production construction site in this repo passes a SelfCoordinationConfig —
+		// both leave it `undefined` (libp2p-node-base.ts, and the foreign-node fallback in
+		// quereus-plugin-optimystic's collection-factory.ts), so these defaults are always what
+		// is in force and no operator can tune them. If tuning `gracePeriodMs` is ever needed,
+		// those two sites have to thread the config through first. Low urgency: a grace-period denial no longer fails the caller, it only costs
 		// a write the ~1s findCoordinator retry window before self-coordinating.
 		this.selfCoordinationConfig = {
 			gracePeriodMs: selfCoordinationConfig?.gracePeriodMs ?? 30_000,

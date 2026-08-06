@@ -1282,28 +1282,32 @@ export async function createLibp2pNodeBase(
 	}
 
 	// The host-facing attachment surface, declared once in `optimystic-node.ts` and written here
-	// through ONE cast so every field is type-checked. Keeping it typed is load-bearing: when
+	// through ONE object literal so every field is type-checked AND a field added to
+	// `OptimysticNodeAttachments` but never assigned here is a compile error rather than an
+	// `undefined` a host reads as present. Keeping it typed is load-bearing: when
 	// `node.keyNetwork` was reachable only through a cast, three hosts found it easier to build a
 	// SECOND Libp2pKeyPeerNetwork from constructor defaults — a different cohort width and no
 	// network-membership filter than this node's own consensus path uses for the same key
 	// (ticket bug-second-key-network-built-with-defaults).
-	const attachments = node as unknown as OptimysticNodeAttachments;
-	attachments.coordinatedRepo = coordinatedRepo;
-	attachments.storageRepo = storageRepo;
-	// The StorageRepo is the single commit funnel for both the coordinated and
-	// direct paths, so it is the node's per-collection change-notifier origin. This is the
-	// default; the cohort-topic activation block below REPLACES it with the origination-decorating
-	// bridge notifier when the substrate is enabled.
-	attachments.blockChangeNotifier = storageRepo;
-	attachments.keyNetwork = keyNetwork;
-	attachments.reputation = reputation;
-	attachments.disputeService = disputeServiceInstance;
-	// The node's libp2p Ed25519 identity key. Exposed on the same attachment surface as
-	// coordinatedRepo/keyNetwork so a host can bind a client-transaction signer to it (the Quereus
-	// collection-factory's getSigner reuses this via signPeer). libp2p does not surface the private
-	// key on its public `Libp2p` interface, so this attachment is the sanctioned in-process handle.
-	// Ed25519 by construction (options.privateKey defaults to generateKeyPair('Ed25519')).
-	attachments.peerPrivateKey = nodePrivateKey;
+	const attachments: OptimysticNodeAttachments = {
+		coordinatedRepo,
+		storageRepo,
+		// The StorageRepo is the single commit funnel for both the coordinated and
+		// direct paths, so it is the node's per-collection change-notifier origin. This is the
+		// default; the cohort-topic activation block below REPLACES it with the origination-decorating
+		// bridge notifier when the substrate is enabled.
+		blockChangeNotifier: storageRepo,
+		keyNetwork,
+		reputation,
+		disputeService: disputeServiceInstance,
+		// The node's libp2p Ed25519 identity key. Exposed on the same attachment surface as
+		// coordinatedRepo/keyNetwork so a host can bind a client-transaction signer to it (the Quereus
+		// collection-factory's getSigner reuses this via signPeer). libp2p does not surface the private
+		// key on its public `Libp2p` interface, so this attachment is the sanctioned in-process handle.
+		// Ed25519 by construction (options.privateKey defaults to generateKeyPair('Ed25519')).
+		peerPrivateKey: nodePrivateKey,
+	};
+	Object.assign(node, attachments);
 
 	// --- Cohort-topic origination activation (post-node: consumes the fully-assembled node + FRET) ---
 	// This is the only place that is after the node + FRET are assembled (node.start() done, fretSvc

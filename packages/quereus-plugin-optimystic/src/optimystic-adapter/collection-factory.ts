@@ -386,9 +386,13 @@ export class CollectionFactory {
         }
         // A node injected by a host that did not build it through createLibp2pNode
         // carries no key network. Reputation is unknowable here and the cluster size is
-        // only guessable — DEFAULT_CLUSTER_SIZE is exactly what a node built here would
-        // have resolved to, and is the honest stand-in — but the network name IS known,
-        // so scope selection to this network's peers. Passing the prefix is deliberate
+        // only guessable — DEFAULT_CLUSTER_SIZE is what a db-p2p node that declares no
+        // clusterSize resolves to, so it is the least-surprising stand-in for a node whose
+        // config we cannot see. It is deliberately NOT `1`, the width this factory gives the
+        // nodes it builds itself above: that value is chosen for a single-node edge profile
+        // and asserting it of someone else's node would be a guess dressed as knowledge.
+        // The network name IS known, though, so scope selection to this network's peers.
+        // Passing the prefix is deliberate
         // even though the constructor leaves it optional "because most call sites don't
         // know the network name": this call site does, and the SAME prefix string is what
         // `getRepo` hands every `RepoClient.create` dial the transactor makes — a peer

@@ -1,4 +1,5 @@
 export * from './cluster/client.js';
+export * from './cluster/cluster-policy.js';
 export * from './cluster/cluster-repo.js';
 export * from './cluster/service.js';
 export * from './protocol-client.js';

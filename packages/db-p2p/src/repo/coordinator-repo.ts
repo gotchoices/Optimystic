@@ -9,6 +9,7 @@ import type { IPeerReputation } from "../reputation/types.js";
 import { PenaltyReason } from "../reputation/types.js";
 import type { ITransactionStateStore } from "../cluster/i-transaction-state-store.js";
 import { quorumSize, corroboratorCapacity, selectQuorumRev, type RevClaim, type QuorumRev } from "../cluster/quorum-restore.js";
+import { DEFAULT_CLUSTER_SIZE } from "../cluster/cluster-policy.js";
 import { RECONCILE_TIMEOUT_MS } from "../cluster/reconcile-block.js";
 import { isMissingBaseRevisionFailure, MISSING_BASE_REVISION_REASON } from "../storage/storage-repo.js";
 import type { ReconcileBlockCallback } from "../cluster/cluster-repo.js";
@@ -191,7 +192,10 @@ export class CoordinatorRepo implements IRepo {
 	) {
 		this.localPeerId = localPeerId;
 		const policy: ClusterConsensusConfig & { clusterSize: number } = {
-			clusterSize: cfg?.clusterSize ?? 10,
+			// Same constant `resolveClusterPolicy` gives a node that declares no clusterSize, not a
+			// second literal: a direct constructor (the readme's manual-wiring path) and the node
+			// assembly must land on the same width or the two disagree about the same key's cohort.
+			clusterSize: cfg?.clusterSize ?? DEFAULT_CLUSTER_SIZE,
 			assumedClusterSize: cfg?.assumedClusterSize,
 			superMajorityThreshold: cfg?.superMajorityThreshold ?? DEFAULT_SUPER_MAJORITY_THRESHOLD,
 			simpleMajorityThreshold: cfg?.simpleMajorityThreshold ?? 0.51,

@@ -188,7 +188,9 @@ StorageRepo.get()                          # read-driven promotion (context prov
   once. The consumer does coarse whole-table invalidation, where over-firing costs only
   a re-query but a missed wake serves a stale view indefinitely — hence the asymmetry
   favors liveness.
-- Exposed on the node as `(node as any).blockChangeNotifier`. `NetworkTransactor`
+- Exposed on the node as `node.blockChangeNotifier` — one of the handles declared by
+  `OptimysticNodeAttachments` (`db-p2p/src/optimystic-node.ts`), which `createLibp2pNode`'s
+  return type carries, so reading it needs no cast. `NetworkTransactor`
   re-exposes it via an optional `localChangeNotifier` ctor option (no-op when absent).
 
 #### Reactive Watch Bridge (Quereus vtab)

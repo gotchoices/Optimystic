@@ -382,32 +382,41 @@ empty array means "unset".
 
 ### Setting Up a Coordinator Node
 
+`createLibp2pNode` assembles the whole stack and **starts** the node: it builds the storage layer,
+the consensus coordinator and the key network from one resolved config, and hands them back on the
+returned `OptimysticNode`. Read them off the node — do not construct your own, or the two copies
+disagree about the same key's cohort.
+
 ```typescript
 import { createLibp2pNode } from '@optimystic/db-p2p';
-import { repoService, clusterService, StorageRepo, CoordinatorRepo } from '@optimystic/db-p2p';
+import { repoService, clusterService } from '@optimystic/db-p2p';
+import { FileRawStorage } from '@optimystic/db-p2p-storage-fs';
 
-// Create a libp2p node with database services
+// Create (and start) a libp2p node with database services
 const node = await createLibp2pNode({
+  networkName: 'my-net',
+  bootstrapNodes: ['...'],
+  // In-memory when omitted; a raw-storage backend makes it durable
+  storage: new FileRawStorage('/var/lib/optimystic'),
   services: {
-    repo: repoService(),     // Handles external client requests
+    repo: repoService(),      // Handles external client requests
     cluster: clusterService() // Handles peer coordination requests
   }
 });
 
-// Set up storage layer over a raw-storage backend
-// (in-memory here; swap in FileRawStorage from @optimystic/db-p2p-storage-fs for persistence)
-const storageRepo = new StorageRepo(/* IRawStorage backend */);
+// The handles the node already owns (see `OptimysticNodeAttachments`)
+const storageRepo = node.storageRepo;          // Local block storage
+const coordinatedRepo = node.coordinatedRepo;  // Cluster-consensus writes and reads
+const keyNetwork = node.keyNetwork;            // Peer/coordinator discovery
 
-// Set up coordinator that uses cluster layer for consensus
-const coordinatorRepo = new CoordinatorRepo(
-  keyNetwork,           // For peer discovery
-  createClusterClient,  // For communicating with cluster peers
-  storageRepo          // For local storage operations
-);
-
-// Start the node
-await node.start();
+// ... use them, then:
+await node.stop();
 ```
+
+Constructing a `StorageRepo`, `CoordinatorRepo` or `Libp2pKeyPeerNetwork` yourself is only for a
+host assembling a stack *without* `createLibp2pNode`. A standalone `CoordinatorRepo` or
+`Libp2pKeyPeerNetwork` must be told its cluster size; pass `DEFAULT_CLUSTER_SIZE` (exported from
+this package) to match what an unconfigured node resolves to.
 
 ### External Client Operations
 

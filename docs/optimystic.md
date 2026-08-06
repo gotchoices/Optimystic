@@ -65,7 +65,9 @@ A `NetworkTransactor` is the bridge between collections and the network:
 import { NetworkTransactor } from '@optimystic/db-core';
 
 const transactor = new NetworkTransactor({
-  keyNetwork,    // Peer discovery (e.g. Libp2pKeyPeerNetwork from db-p2p)
+  keyNetwork,    // Peer discovery — use `node.keyNetwork`, the instance createLibp2pNode
+                 // already built with this node's cluster size and network scoping
+
   peerNetwork,   // libp2p node
   getRepo,       // Factory returning a local IRepo (StorageRepo for persistence)
 });

@@ -3,7 +3,7 @@ import { peerIdFromPrivateKey } from '@libp2p/peer-id';
 import { generateKeyPair } from '@libp2p/crypto/keys';
 import type { Libp2p, PeerId } from '@libp2p/interface';
 import type { IKeyNetwork, IRepo } from '@optimystic/db-core';
-import { Libp2pKeyPeerNetwork } from '@optimystic/db-p2p';
+import { DEFAULT_CLUSTER_SIZE, Libp2pKeyPeerNetwork } from '@optimystic/db-p2p';
 import { CollectionFactory } from '../src/optimystic-adapter/collection-factory.js';
 import type { ParsedOptimysticOptions } from '../src/types.js';
 
@@ -114,5 +114,30 @@ describe('CollectionFactory network transactor key network', () => {
 		const keyNetwork = await transactorKeyNetwork();
 		const peers = await keyNetwork.findCluster(new TextEncoder().encode('block-1'));
 		expect(Object.keys(peers)).to.have.lengthOf(CONFIGURED_CLUSTER_SIZE);
+	});
+
+	/**
+	 * The other branch of `resolveKeyNetwork`: a host registered a node this factory did not
+	 * build, so there is no attached key network to reuse and one has to be constructed. The
+	 * cluster size is a stated constant rather than a constructor default (the constructor has
+	 * none any more), and the network name — which this call site DOES know — is passed, so
+	 * selection stays scoped to peers serving this network.
+	 */
+	describe('node injected without an attached key network', () => {
+		it('states DEFAULT_CLUSTER_SIZE and this network prefix instead of falling back to a constructor default', async () => {
+			const bare = createMockLibp2p(selfId, [servingA.toString()], {
+				[servingA.toString()]: [`${PROTOCOL_PREFIX}/repo/1.0.0`]
+			});
+			expect((bare as unknown as { keyNetwork?: unknown }).keyNetwork, 'precondition: nothing attached')
+				.to.equal(undefined);
+
+			const bareFactory = new CollectionFactory();
+			bareFactory.registerLibp2pNode(NETWORK_NAME, bare, {} as IRepo);
+			const transactor = await bareFactory.createTransactor(networkOptions());
+			const keyNetwork = (transactor as unknown as { keyNetwork: Libp2pKeyPeerNetwork }).keyNetwork;
+
+			expect(keyNetwork.effectiveClusterSize).to.equal(DEFAULT_CLUSTER_SIZE);
+			expect(keyNetwork.effectiveProtocolPrefix).to.equal(PROTOCOL_PREFIX);
+		});
 	});
 });
