@@ -381,7 +381,11 @@ describe('INSERT conflict resolution (local/bootstrap transactor)', function () 
  * exercise persistence + reopen.
  */
 describe('UPDATE PK-move conflict resolution (local/bootstrap transactor)', function () {
-	this.timeout(15000);
+	// The secondary-index cases here each drive a real FileRawStorage tree under
+	// os.tmpdir(); warm they run ~1.7s, but on a loaded/cold machine the same
+	// cases have been measured 10x slower. Budget for that rather than reporting
+	// a wall-clock stall as a conflict-resolution failure.
+	this.timeout(60000);
 
 	let dir: string;
 

@@ -148,7 +148,11 @@ async function drain(db: Database, sql: string): Promise<number> {
 }
 
 describe('Read-path pull mechanism (single node, harness-independent)', function () {
-	this.timeout(20000);
+	// The adversarial case builds a secondary index over a real FileRawStorage
+	// tree; warm it is ~1.5s, but the same case has been measured 10x slower on a
+	// loaded/cold machine. Budget for that so a wall-clock stall is not reported
+	// as a missing read-path pull.
+	this.timeout(60000);
 
 	let dir: string;
 	let probe: ReadProbe;
