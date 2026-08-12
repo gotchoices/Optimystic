@@ -5,7 +5,7 @@ import { Collection, SyncRetryExhaustedError, type CollectionInitOptions } from 
 import { TestTransactor, FlakyCommitTransactor } from '../src/testing/test-transactor.js'
 import { waitFor } from '../src/testing/async-wait.js'
 import type { Action, ActionHandler, BlockStore, IBlock, ITransactor, BlockGets, GetBlockResults, ActionBlocks, BlockActionStatus, PendRequest, PendResult, CommitRequest, CommitResult, StaleFailure } from '../src/index.js'
-import { BlockUnavailableError } from '../src/index.js'
+import { BlockUnavailableError, BlockPossiblyStaleError } from '../src/index.js'
 
 interface TestAction {
   value: string
@@ -112,6 +112,40 @@ describe('Collection', () => {
 
       wedged.add(collectionId)
       await expect(collection.update()).to.be.rejectedWith(BlockUnavailableError)
+    })
+
+    // Ticket coordinator-serves-stale-data-as-if-confirmed: the tail read that seeds a
+    // collection's context is UNPINNED — it is the one read where a lagging node can learn a
+    // newer revision exists. A tail served with `unconfirmedAheadRev` (the repo could not
+    // confirm it is current and a cohort peer claimed a strictly higher revision) must fail
+    // the open loudly; seeding the context from it silently is exactly how a collection view
+    // froze at a stale revision in the field, with every later read pinned to that frozen
+    // context and nothing ever reporting a problem.
+    it('open throws BlockPossiblyStaleError when the LOG TAIL is served as possibly behind a cohort claim', async () => {
+      const created = await Collection.createOrOpen<TestAction>(transactor, collectionId, initOptions)
+      const tailId = await syncedTailId(created)
+
+      const doubted: ITransactor = {
+        async get(gets: BlockGets): Promise<GetBlockResults> {
+          const res = await transactor.get(gets)
+          for (const id of gets.blockIds) {
+            // Only stamp the UNPINNED read — mirroring the coordinator, which never stamps
+            // a read pinned below the claim. The pinned re-reads during the log walk must
+            // keep working.
+            if (id === tailId && gets.context === undefined && res[id]) {
+              const held = res[id]!.state.latest?.rev ?? 0
+              res[id] = { ...res[id]!, unconfirmedAheadRev: held + 1 }
+            }
+          }
+          return res
+        },
+        getStatus: (refs: ActionBlocks[]) => transactor.getStatus(refs),
+        pend: (req: PendRequest) => transactor.pend(req),
+        cancel: (ref: ActionBlocks) => transactor.cancel(ref),
+        commit: (req: CommitRequest) => transactor.commit(req),
+      }
+
+      await expect(Collection.open<TestAction>(doubted, collectionId, initOptions)).to.be.rejectedWith(BlockPossiblyStaleError)
     })
 
     it('createOrOpen against an authoritative absent still creates (the common new-collection probe)', async () => {

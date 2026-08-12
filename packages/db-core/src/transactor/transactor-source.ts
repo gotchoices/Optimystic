@@ -1,7 +1,7 @@
 import { randomBytes } from '@noble/hashes/utils.js'
 import { toString as uint8ArrayToString } from 'uint8arrays/to-string'
 import type { IBlock, BlockId, BlockHeader, ITransactor, ActionId, StaleFailure, ActionContext, BlockType, BlockSource, ReadPurpose, Transforms } from "../index.js";
-import { BlockUnavailableError } from "../network/struct.js";
+import { BlockUnavailableError, BlockPossiblyStaleError } from "../network/struct.js";
 import type { ReadDependency } from "../transaction/transaction.js";
 import { ReadDependencyCollector } from "../transaction/read-dependency-collector.js";
 
@@ -43,13 +43,32 @@ export class TransactorSource<TBlock extends IBlock> implements BlockSource<TBlo
 		// `result[id]` is undefined. Destructuring that would throw a TypeError.
 		const entry = result?.[id];
 		if (entry) {
-			const { block, state, materializedRev, unavailable } = entry;
+			const { block, state, materializedRev, unavailable, unconfirmedAheadRev } = entry;
 			// An entry flagged `unavailable` with no block is the repo saying "I could not find
 			// out whether this exists" — an answer that must not be read as absent. Throw rather
 			// than return undefined, and record no read dependency (dependencies are recorded
 			// only for blocks that actually exist). A repo that omits the flag stays authoritative.
 			if (!block && unavailable) {
 				throw new BlockUnavailableError(id, unavailable);
+			}
+			// An UNPINNED ("give me latest") read whose surviving answer is marked possibly-behind
+			// (`unconfirmedAheadRev` outlived the transactor's retry round: every reachable
+			// coordinator served content it could not confirm current) must not pose as the
+			// latest — the unpinned tail read is the one seam where a lagging collection can
+			// learn the truth (Collection.bootstrapContext), and silently serving the doubted
+			// content there is exactly how a collection view freezes forever. A PINNED read keeps
+			// working: it legitimately asks for an older view, and the coordinator does not stamp
+			// reads pinned below the claim anyway — this guard is belt-and-braces for it.
+			// No read dependency is recorded: the throw means nothing was read.
+			// NOTE: accepted tradeoff — this converts a silent wrong answer into a loud failure. A
+			// node partitioned from every coordinator able to confirm currency used to read (stale)
+			// data indefinitely without any signal; it now raises BlockPossiblyStaleError on
+			// unpinned reads until the partition heals or the claim is settled. Deliberate: the
+			// silent alternative is a collection view that forks and freezes with no report
+			// (ticket coordinator-serves-stale-data-as-if-confirmed). Revisit only if a
+			// degraded-read mode (serve-with-warning) becomes a product requirement.
+			if (this.actionContext === undefined && unconfirmedAheadRev !== undefined) {
+				throw new BlockPossiblyStaleError(id, unconfirmedAheadRev);
 			}
 			// Record a read dependency only for a block that actually exists. A transactor may return a
 			// populated entry with `block: undefined` for a genuinely-missing block (TestTransactor does;

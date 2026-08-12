@@ -1,7 +1,7 @@
 import { peerIdFromString } from "../network/types.js";
 import type { PeerId } from "../network/types.js";
 import { highestStaleAt, isConflictFailure } from "../network/stale-failure.js";
-import { BlockUnavailableError } from "../network/struct.js";
+import { BlockUnavailableError, BlockPossiblyStaleError } from "../network/struct.js";
 import type { ActionTransforms, ActionBlocks, BlockActionStatus, ITransactor, PendSuccess, StaleFailure, IKeyNetwork, BlockId, GetBlockResults, PendResult, CommitResult, PendRequest, IRepo, BlockGets, Transforms, CommitRequest, ActionId, RepoCommitRequest, ClusterNomineesResult, CollectionId, IBlock, CoordinatorIntent } from "../index.js";
 import type { IBlockChangeNotifier, CollectionChangeListener } from "./change-notifier.js";
 import { transformForBlockId, concatTransforms, concatTransform, transformsFromTransform, blockIdsForTransforms } from "../transform/helpers.js";
@@ -161,14 +161,19 @@ export class NetworkTransactor implements ITransactor, IBlockChangeNotifier {
 		};
 
 		// A batch is answered when its response carries an entry for EVERY requested
-		// block id and none of those entries is flagged `unavailable`. An entry present
+		// block id and none of those entries carries a doubt marker. An entry present
 		// with only `state` (no `block`) is an authoritative "absent", which counts as
-		// answered — not a gap. An `unavailable` entry is the peer saying its own answer
-		// is a guess, so it does NOT count as answered.
+		// answered — not a gap. An `unavailable` entry is the peer saying it could not
+		// find out whether the block EXISTS; an `unconfirmedAheadRev` entry is the peer
+		// saying it could not confirm the content it served is CURRENT (a cohort claim
+		// sits ahead of it, unsettled). Neither counts as answered, so both earn the
+		// second-chance retry against a different coordinator.
 		const isAuthoritative = (b: CoordinatorBatch<BlockId[], GetBlockResults>) => {
 			if (!hasValidResponse(b)) return false;
 			const resp = b.request!.response! as GetBlockResults;
-			return b.payload.every(bid => resp[bid] !== undefined && resp[bid]!.unavailable === undefined);
+			return b.payload.every(bid => resp[bid] !== undefined
+				&& resp[bid]!.unavailable === undefined
+				&& resp[bid]!.unconfirmedAheadRev === undefined);
 		};
 
 		// Retry only genuine no-response / partial-response batches. An authoritative
@@ -216,22 +221,29 @@ export class NetworkTransactor implements ITransactor, IBlockChangeNotifier {
 		// Cache the completed batches that had actual responses (not just coordinator not found)
 		const completedBatches = Array.from(allBatches(batches, b => b.request?.isResponse as boolean && !isRecordEmpty(b.request!.response!)));
 
-		// Three-way ranking per block id: a materialized block beats an authoritative
-		// absent, which beats an `unavailable` guess — one peer that positively knows the
-		// block is absent outranks another that could not find out. Non-object junk ranks
-		// below everything so any real entry replaces it.
+		// Ranking per block id: a block the answering repo could confirm is current beats
+		// one it marked possibly-behind (`unconfirmedAheadRev`), which beats an
+		// authoritative absent, which beats an absent marked possibly-behind (a doubted
+		// tombstone), which beats an `unavailable` guess. Content still beats absence at
+		// every confidence level, and one peer that positively knows outranks another
+		// that could not find out. Without the confirmed-over-unconfirmed split, a stale
+		// flagged block and the fresh confirmed block fetched by its own retry round tie
+		// — and only strictly-greater rank replaces, so first-arrival (the stale one)
+		// would win the very merge the retry exists to fix. Non-object junk ranks below
+		// everything so any real entry replaces it.
 		// NOTE: `materializedRev` is not part of the ranking, so two peers answering the same
 		// pinned get with block-carrying entries at DIFFERENT materialized revisions resolve
 		// to whichever arrived first. Not a concern today — cohort peers share the block's
 		// revision log, so they agree on the highest committed rev at or below a pin — and the
 		// failure direction is safe (a lower recorded revision spuriously stale-rejects rather
 		// than wrongly accepting). If peers are ever seen to disagree here, break the tie on
-		// the HIGHEST materializedRev among rank-2 entries.
+		// the HIGHEST materializedRev among top-rank entries.
 		const rankOf = (r: unknown): number => {
 			if (!r || typeof r !== 'object') return -1;
 			const entry = r as GetBlockResults[BlockId];
-			if (entry.block != null) return 2;
-			return entry.unavailable === undefined ? 1 : 0;
+			if (entry.block != null) return entry.unconfirmedAheadRev === undefined ? 4 : 3;
+			if (entry.unavailable !== undefined) return 0;
+			return entry.unconfirmedAheadRev === undefined ? 2 : 1;
 		};
 
 		// Create a lookup map from successful responses only
@@ -280,11 +292,17 @@ export class NetworkTransactor implements ITransactor, IBlockChangeNotifier {
 		// A block whose repo could not determine whether it exists carries no status either:
 		// its empty `state` would read below as `aborted`, turning "I could not find out" into
 		// a definite verdict on someone's action. Fail loudly instead, like every other read of
-		// an unavailable block (see BlockUnavailableError).
+		// an unavailable block (see BlockUnavailableError). The same goes for a state the repo
+		// could not confirm is CURRENT (`unconfirmedAheadRev`, surviving the retry round above):
+		// an action committed at the claimed-ahead revision would read out of the stale state as
+		// a definite `aborted` — this read is unpinned, so the doubt always applies.
 		for (const blockId of allBlockIds) {
 			const entry = blockStates[blockId];
 			if (entry?.unavailable !== undefined && entry.block == null) {
 				throw new BlockUnavailableError(blockId, entry.unavailable);
+			}
+			if (entry?.unconfirmedAheadRev !== undefined) {
+				throw new BlockPossiblyStaleError(blockId, entry.unconfirmedAheadRev);
 			}
 		}
 

@@ -368,7 +368,7 @@ export class CoordinatorRepo implements IRepo {
 				}
 
 				try {
-					const { inconclusive } = await this.fetchBlockFromCluster(blockId, blockGets.context, localRev);
+					const { inconclusive, claimedAheadRev } = await this.fetchBlockFromCluster(blockId, blockGets.context, localRev);
 					const refreshed = await this.storageRepo.get({ blockIds: [blockId], context: blockGets.context }, options);
 					const newRev = refreshed[blockId]?.state?.latest?.rev;
 					if (refreshed[blockId]) {
@@ -389,6 +389,14 @@ export class CoordinatorRepo implements IRepo {
 					// the new-collection probe against a healthy cohort stays one round-trip.
 					if (isMissing && inconclusive) {
 						this.flagUnconfirmedAbsence(localResult, blockId);
+					}
+					// A PRESENT block served below a cohort claim the repair could not settle is
+					// the mirror lie: real content posing as confirmed-current. Mark it, narrowly
+					// (see flagUnconfirmedCurrency). The missing case is excluded — it is the
+					// absence path above, and a bare absent below a claim already reads as either
+					// authoritative (cohort answered, nothing corroborated) or flagged.
+					if (!isMissing && claimedAheadRev !== undefined) {
+						this.flagUnconfirmedCurrency(localResult, blockId, claimedAheadRev, blockGets.context);
 					}
 				} catch (err) {
 					this.log('cluster-fetch:error', { blockId, error: (err as Error).message });
@@ -426,6 +434,38 @@ export class CoordinatorRepo implements IRepo {
 		} else if (entry.block === undefined && !entry.state?.latest && entry.unavailable === undefined) {
 			entry.unavailable = 'peers-unreachable';
 		}
+	}
+
+	/**
+	 * Stamp {@link GetBlockResult.unconfirmedAheadRev} on an entry the repair pass left behind an
+	 * unsettled cohort claim — served committed content the coordinator cannot confirm is current.
+	 * Deliberately narrow; ALL of these must hold:
+	 *  - the entry carries a committed revision (a present block, or a committed tombstone) —
+	 *    never a plain absent, which is the absence path's business;
+	 *  - that served revision is still strictly BELOW the claim: the repair did not converge, and
+	 *    nothing committed past the claim in the meantime;
+	 *  - the caller asked for a view that should contain the claim: an unpinned "latest" read, or
+	 *    a pin at/above the claimed revision. A read pinned BELOW the claim is being served
+	 *    correctly and stays unstamped — this keeps a collection's context-pinned data reads
+	 *    quiet while its unpinned tail read (the one seam where fresher truth could arrive —
+	 *    Collection.bootstrapContext) speaks up.
+	 * NOT covered, on purpose: a cohort that is merely silent and claims nothing (pinned as
+	 * authoritative by the merely-STALE spec in coordinator-repo-unavailable.spec.ts) — silence
+	 * carries no revision to be behind of.
+	 *
+	 * Pin comparability: `ActionContext.rev` and a block's `state.latest.rev` count the same
+	 * per-collection revision sequence — `Collection.bootstrapContext` seeds the context straight
+	 * from the tail block's `latest.rev`, and `syncInternal` commits every block of an action at
+	 * `context.rev + 1` — so `context.rev >= claimedRev` is a well-defined comparison.
+	 */
+	private flagUnconfirmedCurrency(results: GetBlockResults, blockId: BlockId, claimedRev: number, context?: ActionContext): void {
+		const entry = results[blockId];
+		if (!entry || entry.unavailable !== undefined) return;
+		const servedRev = entry.state?.latest?.rev;
+		if (typeof servedRev !== 'number' || servedRev >= claimedRev) return;
+		if (context !== undefined && context.rev < claimedRev) return;
+		entry.unconfirmedAheadRev = claimedRev;
+		this.log('cluster-tx:read-unconfirmed', { blockId, servedRev, claimedAheadRev: claimedRev });
 	}
 
 	/** Decide whether the read-repair policy wants us to consult the cluster for a present-but-possibly-stale block. */
@@ -471,15 +511,21 @@ export class CoordinatorRepo implements IRepo {
 	 * ahead of `localRev` — the revision the caller's read already loaded, and the baseline every
 	 * decision below is measured against.
 	 *
-	 * Returns the one thing `get` needs beyond the storage side effects: whether the pass was
-	 * INCONCLUSIVE — it neither confirmed the cohort holds nothing nor left this node holding the
-	 * block. Two ways that happens: a cohort peer other than this node stayed SILENT (rejected
-	 * callback or per-peer deadline), or a revision WAS corroborated and the convergence onto it
-	 * failed. In both, `get` has learned that its local absence may be wrong, so it must not report
-	 * a still-missing block as an authoritative absent. Paths that consult nobody (no cohort,
-	 * solo-self) are conclusive: there, the local answer genuinely is the whole truth.
+	 * Returns the two things `get` needs beyond the storage side effects:
+	 *  - `inconclusive` — the pass neither confirmed the cohort holds nothing nor left this node
+	 *    holding the block. Two ways that happens: a cohort peer other than this node stayed SILENT
+	 *    (rejected callback or per-peer deadline), or a revision WAS corroborated and the
+	 *    convergence onto it failed. In both, `get` has learned that its local absence may be
+	 *    wrong, so it must not report a still-missing block as an authoritative absent. Paths that
+	 *    consult nobody (no cohort, solo-self) are conclusive: there, the local answer genuinely is
+	 *    the whole truth.
+	 *  - `claimedAheadRev` — a cohort peer claimed a revision strictly ahead of what this node
+	 *    holds and the pass did NOT converge onto it: the claim failed the corroboration quorum,
+	 *    or was corroborated but could not be acquired. Content `get` serves below this revision
+	 *    cannot be confirmed current (see {@link GetBlockResult.unconfirmedAheadRev}); the claim
+	 *    itself must never drive restoration.
 	 */
-	private async fetchBlockFromCluster(blockId: BlockId, context?: ActionContext, localRev?: number): Promise<{ inconclusive: boolean }> {
+	private async fetchBlockFromCluster(blockId: BlockId, context?: ActionContext, localRev?: number): Promise<{ inconclusive: boolean; claimedAheadRev?: number }> {
 		if (!this.clusterLatestCallback) return { inconclusive: false };
 
 		const blockIdBytes = new TextEncoder().encode(blockId);
@@ -500,14 +546,22 @@ export class CoordinatorRepo implements IRepo {
 			return { inconclusive: false };
 		}
 
-		const { corroborated, local, silent } = await this.queryClusterForLatest(peerIds, blockId, context);
+		const { corroborated, local, silent, uncorroboratedRev } = await this.queryClusterForLatest(peerIds, blockId, context);
 		// Any silence flags the WHOLE consult, not a fraction of it (fail-closed): one silent
 		// peer could be the sole holder, and the cost — an extra transactor-level retry against
 		// another coordinator — is paid only while a peer is actually unreachable.
 		const cohortSilent = silent.length > 0;
 		// Nothing corroborated: keep local data AND stay eligible for repair — marking the
 		// block seen here would suppress the next attempt for the whole read-repair window.
-		if (!corroborated) return { inconclusive: cohortSilent };
+		// An uncorroborated claim strictly ahead of what this node holds still travels up as
+		// doubt: the answer about to be served may be behind it, and only the caller knows
+		// whether that matters for the view it was asked for.
+		if (!corroborated) {
+			const uncorroboratedBaseline = local?.rev ?? localRev;
+			const claimIsAhead = uncorroboratedRev !== undefined
+				&& (uncorroboratedBaseline === undefined || uncorroboratedRev > uncorroboratedBaseline);
+			return { inconclusive: cohortSilent, ...(claimIsAhead ? { claimedAheadRev: uncorroboratedRev } : {}) };
+		}
 
 		// The self answer is the sharper baseline (same storage, same context, read alongside the
 		// cohort's), but it exists only when `findCluster` returned this node. A soft serve for a
@@ -548,6 +602,10 @@ export class CoordinatorRepo implements IRepo {
 		// even with the whole cohort answering: the reader has just been TOLD the block exists, so
 		// reporting it absent would be a lie of the same kind a silent peer causes (see `get`).
 		const inconclusive = cohortSilent || rev === undefined;
+		// Converged means REACHED the corroborated revision, not merely advanced: a promotion that
+		// landed short of it (possible in principle — restoreCorroborated only requires an advance
+		// over the baseline) still leaves the served answer behind a revision the cohort attested.
+		const converged = rev !== undefined && rev >= corroborated.rev;
 		// The block is marked seen either way — the cohort DID answer, so its freshness was checked,
 		// which is what the read-repair window tracks. A failed convergence therefore waits out the
 		// window before retrying.
@@ -559,7 +617,7 @@ export class CoordinatorRepo implements IRepo {
 		// it ever shows as read amplification, gate the acquisition step (not the latest-query) on the
 		// same window rather than widening `isMissing`.
 		this.markBlocksSeen([blockId]);
-		return { inconclusive };
+		return { inconclusive, ...(converged ? {} : { claimedAheadRev: corroborated.rev }) };
 	}
 
 	/**

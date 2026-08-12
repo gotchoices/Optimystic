@@ -523,8 +523,8 @@ saveMaterializedBlock(block): store(structuredClone(block));
   it could be the sole holder. A merely-stale block keeps its real local answer,
   unflagged, whatever the consult did; so do `skipClusterFetch` sync reads. Consumers: `NetworkTransactor.get`
   treats a flagged entry as *not* answered — it earns the second-chance retry an authoritative
-  absent deliberately does not — and merges per block by the ranking **has a block > authoritative
-  absent > unavailable**. `TransactorSource.tryGet` converts a surviving blockless flagged entry
+  absent deliberately does not — and merges per block by ranking (see the currency bullet below
+  for the full order). `TransactorSource.tryGet` converts a surviving blockless flagged entry
   into a thrown `BlockUnavailableError` (naming the block and reason, recording no read
   dependency), so a query against a collection this node cannot read fails loudly instead of
   returning zero rows. `BlockUnavailableError` is not a `StaleFailure`: `Collection.sync` does not
@@ -535,6 +535,40 @@ saveMaterializedBlock(block): store(structuredClone(block));
   `ClusterMember`'s promise-phase stale-revision gate votes *reject* rather than approving a pend
   whose revision it could not check; `SpreadOnChurnMonitor` keeps the block tracked rather than
   self-pruning it from the replication set.
+- **A present answer separately says whether it is confirmed CURRENT — `unavailable` is about
+  existence, `unconfirmedAheadRev` is about currency.** `GetBlockResult` carries a second optional
+  doubt marker ([`network/struct.ts`](../packages/db-core/src/network/struct.ts)):
+  `unconfirmedAheadRev`, set when a repo served real committed content it could not confirm is
+  current because a cohort peer claimed a strictly higher revision the repair pass could not
+  settle. Absent means confirmed, so every producer that never sets it keeps its meaning. One
+  producer sets it: `CoordinatorRepo.get`, narrowly — the entry has a committed revision (never a
+  plain absent; that is the existence flag's business), the served revision is still strictly
+  below the claim after the repair pass ran, and the caller asked for a view that should contain
+  the claim (an unpinned "latest" read, or a pin at/above the claimed revision — a read pinned
+  *below* the claim is being served correctly and stays unstamped, which keeps a collection's
+  context-pinned data reads quiet). The claim reaches `get` from both non-converging shapes: a
+  claim that failed the read-repair corroboration quorum (`queryClusterForLatest` returns the
+  highest such claim on its no-quorum path — evidence of doubt only, never a revision to adopt;
+  relaxing the quorum instead is the attack `quorum-restore.ts` exists to prevent), and a
+  corroborated revision this node failed to converge onto. A cohort that is merely silent and
+  claims nothing never stamps — silence carries no revision to be behind of, so the merely-stale
+  pin above holds. Consumers mirror the existence flag: `NetworkTransactor.get` treats a marked
+  entry as *not* answered (it earns the second-chance retry) and merges per block by the ranking
+  **confirmed block > unconfirmed block > authoritative absent > unconfirmed absent >
+  unavailable** — the confirmed-over-unconfirmed split is load-bearing, since without it the
+  stale marked entry and the fresh confirmed one fetched by its own retry tie and first-arrival
+  (the stale one) wins the merge. When the marker survives the retry, every reachable coordinator
+  said the answer may be behind: `TransactorSource.tryGet` then throws `BlockPossiblyStaleError`
+  on an **unpinned** read (a pinned read legitimately asks for an older view and keeps working),
+  `Collection.bootstrapContext` does the same for its direct tail read — the unpinned tail read
+  is the one seam where a lagging collection can learn a newer revision exists, and silently
+  seeding the context from a doubted tail is exactly how a collection view froze in the field —
+  and `NetworkTransactor.getStatus` throws rather than judging actions from a state it could not
+  confirm. `BlockPossiblyStaleError` is `BlockUnavailableError`'s sibling, not a `StaleFailure`:
+  `Collection.sync` surfaces it instead of absorbing it into its retry loop. Accepted tradeoff: a
+  node partitioned from every coordinator able to confirm currency used to read stale data
+  silently and now raises on unpinned reads until the partition heals (see the `NOTE:` at the
+  `tryGet` throw site).
 - **"What revision did this read observe?" is a separate field from "what revision does this repo
   hold?"** `GetBlockResult` carries an optional `materializedRev`
   ([`network/struct.ts`](../packages/db-core/src/network/struct.ts)): the revision the returned

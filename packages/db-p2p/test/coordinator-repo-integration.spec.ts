@@ -8,7 +8,8 @@
 
 import { expect } from 'chai';
 import type { BlockId, IBlock, BlockHeader, Transforms } from '@optimystic/db-core';
-import { createMesh, type Mesh } from '../src/testing/mesh-harness.js';
+import { blockIdToBytes } from '@optimystic/db-core';
+import { createMesh, buildNetworkTransactor, type Mesh } from '../src/testing/mesh-harness.js';
 
 const makeHeader = (id: string): BlockHeader => ({
 	id: id as BlockId,
@@ -542,6 +543,65 @@ describe('CoordinatorRepo Integration (TEST-5.3.1)', () => {
 			const after = await laggard.storageRepo.get({ blockIds: [blockId] });
 			expect(after[blockId]?.state?.latest?.rev).to.equal(1);
 			expect(after[blockId]?.state?.latest?.actionId).to.equal('a-xc');
+		});
+	});
+
+	describe('stale coordinator under partial partition (ticket coordinator-serves-stale-data-as-if-confirmed)', () => {
+		it('a network read lands the confirmed newer revision, not the first coordinator\'s stale copy', async () => {
+			// The field failure's three-peer shape, end to end. One node is stale at rev 1; one
+			// holds rev 2; one is unreachable on the read path. The stale node is arranged to be
+			// the FIRST coordinator the network read routes to, so before this fix the read
+			// returned its rev-1 copy as confirmed and never looked further: the stale node's
+			// freshness consult heard exactly one claim of rev 2 (the dark peer silent), the
+			// corroboration quorum of two rightly declined it, and the inconclusive verdict was
+			// dropped on the floor. Now that verdict survives as `unconfirmedAheadRev`, earns the
+			// transactor's second-chance round against the next coordinator, and the confirmed
+			// rev-2 answer from there outranks the stale marked one in the merge.
+			const mesh = await createMesh(3, { responsibilityK: 3, superMajorityThreshold: 0.51 });
+			const blockId = 'block-stale-partition';
+
+			// Every node committed rev 1 — written into each storage directly so the baseline is
+			// deterministic (no consensus timing involved).
+			for (const node of mesh.nodes) {
+				await node.storageRepo.pend({ actionId: 'old-action', transforms: makeTransforms(blockId), policy: 'c' });
+				await node.storageRepo.commit({ actionId: 'old-action', tailId: blockId as BlockId, rev: 1, blockIds: [blockId] });
+			}
+
+			// Assign roles by the transactor's own routing (XOR distance over sha256(blockId)):
+			// the nearest node is the coordinator every read hits first — it stays stale; the
+			// second-nearest is the retry coordinator — it advances to rev 2; the third goes dark.
+			const routingKey = await blockIdToBytes(blockId as BlockId);
+			const firstPick = await mesh.keyNetwork.findCoordinator(routingKey);
+			const secondPick = await mesh.keyNetwork.findCoordinator(routingKey, { excludedPeers: [firstPick] });
+			const staleReader = mesh.nodes.find(n => n.peerId.equals(firstPick))!;
+			const freshHolder = mesh.nodes.find(n => n.peerId.equals(secondPick))!;
+			const darkPeer = mesh.nodes.find(n => n !== staleReader && n !== freshHolder)!;
+
+			// Rev 2 lands on the fresh holder only — modelling a commit whose broadcast the other
+			// two missed — through the same monotonic funnel replication uses.
+			await freshHolder.storageRepo.saveReplicatedBlock(
+				blockId as BlockId,
+				makeBlock(blockId),
+				{ actionId: 'new-action', rev: 2 }
+			);
+			mesh.failures.silentPeers = new Set([darkPeer.peerId.toString()]);
+
+			// First half: the stale coordinator itself now says "possibly behind rev 2" instead
+			// of posing as confirmed. (Its consult: fresh holder claims 2 — one claim, quorum of
+			// two, declined; dark peer silent.)
+			const staleAnswer = await staleReader.coordinatorRepo.get({ blockIds: [blockId] });
+			expect(staleAnswer[blockId]?.state?.latest?.rev, 'the stale copy is still served').to.equal(1);
+			expect(staleAnswer[blockId]?.unconfirmedAheadRev, 'marked with the unsettled claim').to.equal(2);
+
+			// Second half: a read through the network transactor rides that marker to the retry
+			// coordinator and comes back with the CONFIRMED rev 2 — the read advances instead of
+			// freezing on the first coordinator's copy.
+			const transactor = buildNetworkTransactor(mesh);
+			const result = await transactor.get({ blockIds: [blockId] });
+
+			expect(result[blockId]?.state?.latest?.rev, 'the confirmed newer revision wins').to.equal(2);
+			expect(result[blockId]?.state?.latest?.actionId).to.equal('new-action');
+			expect(result[blockId]?.unconfirmedAheadRev, 'no surviving doubt').to.equal(undefined);
 		});
 	});
 });

@@ -6,7 +6,7 @@ import { TestTransactor } from '../src/testing/test-transactor.js'
 import { randomBytes } from '@libp2p/crypto'
 import { toString as uint8ArrayToString } from 'uint8arrays/to-string'
 import type { IBlock, ActionId, ActionContext, Transforms, BlockOperation, CommitRequest, CommitResult, ITransactor, BlockGets, GetBlockResults, BlockUnavailableReason } from '../src/index.js'
-import { BlockUnavailableError, CacheSource, ReadDependencyCollector } from '../src/index.js'
+import { BlockUnavailableError, BlockPossiblyStaleError, CacheSource, ReadDependencyCollector } from '../src/index.js'
 
 describe('TransactorSource', () => {
 	type TestBlock = IBlock & { test: string[] }
@@ -494,6 +494,51 @@ describe('TransactorSource', () => {
 				const src = new TransactorSource<IBlock>('coll', makeFixedEntryTransactor({ block, state: { latest: { actionId: 'a1' as ActionId, rev: 1 } }, unavailable: 'unmaterializable' }), undefined)
 
 				const served = await src.tryGet('b1')
+				expect(served).to.deep.equal(block)
+			})
+		})
+
+		describe('possibly-stale entries (ticket coordinator-serves-stale-data-as-if-confirmed)', () => {
+			/** Transactor answering every requested id with a single fixed entry. */
+			const makeFixedEntryTransactor = (entry: GetBlockResults[string]): ITransactor => ({
+				async get(_gets: BlockGets): Promise<GetBlockResults> {
+					return Object.fromEntries(_gets.blockIds.map(id => [id, { ...entry }]))
+				},
+			} as unknown as ITransactor)
+
+			const block: IBlock = { header: { id: 'doubted-block', type: 'T', collectionId: 'coll' } }
+			const doubtedEntry: GetBlockResults[string] = {
+				block,
+				state: { latest: { actionId: 'a1' as ActionId, rev: 1 } },
+				unconfirmedAheadRev: 2,
+			}
+
+			it('an UNPINNED read throws BlockPossiblyStaleError instead of serving content marked possibly-behind', async () => {
+				// The unpinned "give me latest" read is the one seam where a lagging collection
+				// can learn the truth (Collection.bootstrapContext reads the tail this way);
+				// silently serving doubted content there is how a collection view freezes forever.
+				const src = new TransactorSource<IBlock>('coll', makeFixedEntryTransactor(doubtedEntry), undefined)
+
+				let thrown: unknown
+				try {
+					await src.tryGet('doubted-block')
+				} catch (err) {
+					thrown = err
+				}
+				expect(thrown, 'tryGet must throw, not serve the doubted block').to.be.instanceOf(BlockPossiblyStaleError)
+				expect((thrown as BlockPossiblyStaleError).blockId).to.equal('doubted-block')
+				expect((thrown as BlockPossiblyStaleError).claimedRev).to.equal(2)
+				// Nothing was read, so nothing joins the conflict set.
+				expect(src.getReadDependencies()).to.be.empty
+			})
+
+			it('a PINNED read still serves the block — an older view was legitimately asked for', async () => {
+				// The coordinator does not stamp reads pinned below the claim, so this is
+				// belt-and-braces — but a producer that stamps anyway must not break pinned views.
+				const pinned: ActionContext = { committed: [{ actionId: 'a1' as ActionId, rev: 1 }], rev: 1 }
+				const src = new TransactorSource<IBlock>('coll', makeFixedEntryTransactor(doubtedEntry), pinned)
+
+				const served = await src.tryGet('doubted-block')
 				expect(served).to.deep.equal(block)
 			})
 		})

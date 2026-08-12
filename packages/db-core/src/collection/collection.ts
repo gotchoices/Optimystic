@@ -5,7 +5,7 @@ import { Tracker } from "../transform/tracker.js";
 import { CacheSource } from "../transform/cache-source.js";
 import { copyTransforms, isTransformsEmpty } from "../transform/helpers.js";
 import { TransactorSource } from "../transactor/transactor-source.js";
-import { BlockUnavailableError } from "../network/struct.js";
+import { BlockUnavailableError, BlockPossiblyStaleError } from "../network/struct.js";
 import type { CollectionHeaderBlock, CollectionId, ICollection, SyncOptions } from "./index.js";
 import { CollectionHeaderVanishedError, SyncRetryExhaustedError } from "./struct.js";
 import type { ActionContext } from "./action.js";
@@ -640,6 +640,13 @@ export class Collection<TAction> implements ICollection<TAction> {
 	 * pending non-tail blocks and the collection reading as if they did not exist. A tail
 	 * with no `state.latest` and NO flag is a real answer (nothing committed yet) and still
 	 * no-ops.
+	 *
+	 * The same goes for `unconfirmedAheadRev`: this unpinned tail read is the ONE seam where a
+	 * lagging collection can learn a newer revision exists — every later data read is pinned to
+	 * the context seeded here. Silently seeding from a tail the repo could not confirm is
+	 * current would freeze the collection at the stale revision with nothing ever reporting a
+	 * problem, so it throws the same way TransactorSource.tryGet does for its unpinned reads
+	 * (see the tradeoff NOTE there).
 	 */
 	private static async bootstrapContext(
 		source: TransactorSource<IBlock>,
@@ -652,6 +659,9 @@ export class Collection<TAction> implements ICollection<TAction> {
 			const tailEntry = tailResult?.[tailId];
 			if (tailEntry?.unavailable !== undefined && tailEntry.block == null) {
 				throw new BlockUnavailableError(tailId, tailEntry.unavailable);
+			}
+			if (tailEntry?.unconfirmedAheadRev !== undefined) {
+				throw new BlockPossiblyStaleError(tailId, tailEntry.unconfirmedAheadRev);
 			}
 			const tailState = tailEntry?.state;
 			if (tailState?.latest) {

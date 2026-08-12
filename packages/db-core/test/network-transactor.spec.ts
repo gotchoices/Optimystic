@@ -6,7 +6,7 @@ import type { Scenario } from './simulation.js'
 import { randomBytes } from '@libp2p/crypto'
 import { blockIdToBytes } from '../src/utility/block-id-to-bytes.js'
 import type { BlockId, PendRequest, BlockOperation, ClusterPeers, FindCoordinatorOptions, IKeyNetwork, IRepo, BlockGets, GetBlockResults, StaleFailure, ActionId } from '../src/index.js'
-import { BlockUnavailableError } from '../src/index.js'
+import { BlockUnavailableError, BlockPossiblyStaleError } from '../src/index.js'
 import type { PeerId } from '../src/index.js'
 import { peerIdFromString } from '../src/network/types.js'
 import { toString as uint8ArrayToString } from 'uint8arrays/to-string'
@@ -317,6 +317,97 @@ describe('NetworkTransactor', () => {
 
       expect(result[blockId]!.block).to.deep.equal(block)
       expect(result[blockId]!.unavailable).to.equal(undefined)
+    })
+
+    // Ticket coordinator-serves-stale-data-as-if-confirmed: an entry marked
+    // `unconfirmedAheadRev` is the peer saying it could not confirm the content it served
+    // is CURRENT. It must earn the same second-chance retry an `unavailable` entry does,
+    // and a confirmed answer from the retry coordinator must WIN the merge — without the
+    // confirmed-over-unconfirmed rank split, both entries carry a block, tie, and
+    // first-arrival (the stale one) survives the very retry that fetched the fresh one.
+    it('prefers a confirmed block over another peer\'s unconfirmed one', async () => {
+      const peerA = 'peer-A', peerB = 'peer-B'
+      const net = new CountingKeyNetwork([peerA, peerB])
+      const blockId = 'forked-block' as BlockId
+      const staleBlock = { header: { id: blockId, type: 'T', collectionId: 'c' as BlockId }, v: 'old' }
+      const freshBlock = { header: { id: blockId, type: 'T', collectionId: 'c' as BlockId }, v: 'new' }
+
+      const staleRepo = makeGetOnlyRepo(async ({ blockIds }: BlockGets) => {
+        const res: GetBlockResults = {}
+        for (const bid of blockIds) res[bid] = { block: staleBlock, state: { latest: { actionId: 'old-action', rev: 1 } }, unconfirmedAheadRev: 2 }
+        return res
+      })
+      const freshRepo = makeGetOnlyRepo(async ({ blockIds }: BlockGets) => {
+        const res: GetBlockResults = {}
+        for (const bid of blockIds) res[bid] = { block: freshBlock, state: { latest: { actionId: 'new-action', rev: 2 } } }
+        return res
+      })
+
+      const networkTransactor = new NetworkTransactor({
+        timeoutMs: 1000, abortOrCancelTimeoutMs: 500, keyNetwork: net,
+        getRepo: (peerId: PeerId) => (peerId.toString() === peerA ? staleRepo : freshRepo),
+      })
+
+      const result = await networkTransactor.get({ blockIds: [blockId] })
+
+      expect(net.findCoordinatorCalls, 'the marker earned a retry round').to.equal(2)
+      expect(result[blockId]!.state.latest!.rev, 'the confirmed answer wins the merge').to.equal(2)
+      expect(result[blockId]!.unconfirmedAheadRev).to.equal(undefined)
+    })
+
+    it('carries the unconfirmedAheadRev marker through when every consulted peer serves unconfirmed content', async () => {
+      // Both rounds run and neither peer can confirm currency — the surviving entry must
+      // KEEP the marker, so TransactorSource can convert an unpinned read of it into
+      // BlockPossiblyStaleError instead of silently serving possibly-behind content.
+      const net = new CountingKeyNetwork(['peer-A', 'peer-B'])
+      const blockId = 'doubted-block' as BlockId
+      const block = { header: { id: blockId, type: 'T', collectionId: 'c' as BlockId } }
+
+      const unconfirmedRepo = makeGetOnlyRepo(async ({ blockIds }: BlockGets) => {
+        const res: GetBlockResults = {}
+        for (const bid of blockIds) res[bid] = { block, state: { latest: { actionId: 'a1', rev: 1 } }, unconfirmedAheadRev: 2 }
+        return res
+      })
+
+      const networkTransactor = new NetworkTransactor({
+        timeoutMs: 1000, abortOrCancelTimeoutMs: 500, keyNetwork: net,
+        getRepo: (_peerId: PeerId) => unconfirmedRepo,
+      })
+
+      const result = await networkTransactor.get({ blockIds: [blockId] })
+
+      expect(net.findCoordinatorCalls, 'initial round plus the second chance').to.equal(2)
+      expect(result[blockId]!.block).to.deep.equal(block)
+      expect(result[blockId]!.unconfirmedAheadRev).to.equal(2)
+    })
+
+    it('getStatus throws rather than judging actions from a state it could not confirm is current', async () => {
+      // An action committed at the claimed-ahead revision would read out of the stale
+      // state as a definite `aborted` — the same indeterminate-read-as-verdict failure
+      // the unavailable guard below pins, in its currency shape.
+      const net = new CountingKeyNetwork(['peer-A', 'peer-B'])
+      const blockId = 'doubted-block' as BlockId
+      const block = { header: { id: blockId, type: 'T', collectionId: 'c' as BlockId } }
+      const unconfirmedRepo = makeGetOnlyRepo(async ({ blockIds }: BlockGets) => {
+        const res: GetBlockResults = {}
+        for (const bid of blockIds) res[bid] = { block, state: { latest: { actionId: 'a1', rev: 1 } }, unconfirmedAheadRev: 2 }
+        return res
+      })
+
+      const networkTransactor = new NetworkTransactor({
+        timeoutMs: 1000, abortOrCancelTimeoutMs: 500, keyNetwork: net,
+        getRepo: (_peerId: PeerId) => unconfirmedRepo,
+      })
+
+      let thrown: unknown
+      try {
+        await networkTransactor.getStatus([{ blockIds: [blockId], actionId: 'a2' as ActionId }])
+      } catch (err) {
+        thrown = err
+      }
+      expect(thrown).to.be.instanceOf(BlockPossiblyStaleError)
+      expect((thrown as BlockPossiblyStaleError).blockId).to.equal(blockId)
+      expect((thrown as BlockPossiblyStaleError).claimedRev).to.equal(2)
     })
 
     // getStatus reads the same three-valued answer: an entry the repo could not determine

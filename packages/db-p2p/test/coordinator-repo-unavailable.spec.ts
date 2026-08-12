@@ -1,6 +1,7 @@
 /**
  * Tickets: repo-reports-unavailable-vs-absent,
- *          cluster-read-consult-cannot-report-unreachable
+ *          cluster-read-consult-cannot-report-unreachable,
+ *          coordinator-serves-stale-data-as-if-confirmed
  *
  * `CoordinatorRepo.get` answers "absent" authoritatively only because it consults the
  * cohort for any block that is missing locally. That consult can come back INCONCLUSIVE
@@ -11,10 +12,17 @@
  * `unavailable: 'peers-unreachable'` instead of posing as an authoritative absent
  * (which NetworkTransactor deliberately never retries).
  *
+ * A PRESENT block has the mirror lie: a repair pass that left a cohort peer's claim of a
+ * strictly higher revision unsettled (it failed the corroboration quorum, or was
+ * corroborated but could not be acquired) must not serve the local content as
+ * confirmed-current. Those entries carry `unconfirmedAheadRev` — see the stale-present
+ * describe below.
+ *
  * Equally important are the answers that must STAY authoritative: a consult where the
  * whole cohort answers and simply corroborates nothing (the common new-collection
- * probe), a merely-stale block whose consult fails (it has a real local answer), and a
- * cluster-internal sync read (`skipClusterFetch`).
+ * probe), a merely-stale block whose consult fails (it has a real local answer) or whose
+ * cohort is silent without claiming anything, and a cluster-internal sync read
+ * (`skipClusterFetch`).
  */
 
 import { expect } from 'chai';
@@ -420,6 +428,134 @@ describe('CoordinatorRepo unavailable vs absent', () => {
 
 			expect(result[blockId]!.state).to.deep.equal({});
 			expect('unavailable' in result[blockId]!).to.equal(false);
+		});
+	});
+
+	describe('stale-present blocks (ticket coordinator-serves-stale-data-as-if-confirmed)', () => {
+		it('flags a stale-present block when a reachable peer claims a higher revision it cannot corroborate', async () => {
+			// The field failure's exact shape: cohort of three, self (B) holds rev 1, A is
+			// reachable and claims rev 2, C is unreachable — and C is unreachable precisely
+			// because the record being repaired is C's address, so the repair can never
+			// converge. One claim against a corroboration floor of two: the quorum rightly
+			// declines (relaxing it is the attack quorum-restore.ts exists to prevent), but
+			// the served rev-1 content must say it could not be confirmed current instead of
+			// posing as authoritative — that silent pose is what froze a whole collection view.
+			const peerB = await makePeerId();  // self — the forked node
+			const peerA = await makePeerId();  // reachable, holds the newer revision
+			const peerC = await makePeerId();  // unreachable — its address is the record being repaired
+			const cluster = makeClusterPeers([peerB, peerA, peerC]);
+
+			const callback: ClusterLatestCallback = async (peerId) => {
+				if (peerId.equals(peerB)) return { actionId: 'old-action', rev: 1 };
+				if (peerId.equals(peerA)) return { actionId: 'new-action', rev: 2 };
+				throw new Error('dial failed');
+			};
+
+			const { repo: storageRepo } = makePresentStorageRepo(blockId, 1);
+			const repo = buildRepo(makeKeyNetwork(cluster), storageRepo, peerB, callback, { readRepairMode: 'paranoid' });
+
+			const result = await repo.get({ blockIds: [blockId] });
+
+			expect(result[blockId]?.block?.header.id, 'the local content is still served').to.equal(blockId);
+			expect(result[blockId]?.unconfirmedAheadRev, 'but marked as possibly behind rev 2').to.equal(2);
+			expect('unavailable' in result[blockId]!, 'currency doubt is not an existence doubt').to.equal(false);
+		});
+
+		it('flags a stale-present block when the cohort corroborates a revision this node cannot acquire', async () => {
+			// Both other peers agree on rev 3, so it clears the quorum — but nothing can bring
+			// the bytes here (no acquisition callback, nothing local to promote). The reader was
+			// positively TOLD a newer revision exists; serving rev 1 as confirmed would be a lie.
+			const localPeer = await makePeerId();
+			const holderA = await makePeerId();
+			const holderB = await makePeerId();
+			const cluster = makeClusterPeers([localPeer, holderA, holderB]);
+
+			const remoteLatest: ActionRev = { actionId: 'remote-action', rev: 3 };
+			const callback: ClusterLatestCallback = async (peerId) =>
+				peerId.equals(localPeer) ? { actionId: 'local-action', rev: 1 } : remoteLatest;
+
+			const { repo: storageRepo } = makePresentStorageRepo(blockId, 1);
+			const repo = buildRepo(makeKeyNetwork(cluster), storageRepo, localPeer, callback, { readRepairMode: 'paranoid' });
+
+			const result = await repo.get({ blockIds: [blockId] });
+
+			expect(result[blockId]?.block?.header.id).to.equal(blockId);
+			expect(result[blockId]?.unconfirmedAheadRev).to.equal(3);
+			expect('unavailable' in result[blockId]!).to.equal(false);
+		});
+
+		it('never flags when the uncorroborated claim is NOT ahead of what this node holds', async () => {
+			// A lone peer claiming the same revision this node already serves is lag or noise,
+			// not evidence of doubt — there is nothing to be behind of.
+			const peerB = await makePeerId();
+			const peerA = await makePeerId();
+			const peerC = await makePeerId();
+			const cluster = makeClusterPeers([peerB, peerA, peerC]);
+
+			const callback: ClusterLatestCallback = async (peerId) => {
+				if (peerId.equals(peerB)) return { actionId: 'local-action', rev: 1 };
+				if (peerId.equals(peerA)) return { actionId: 'local-action', rev: 1 };
+				throw new Error('dial failed');
+			};
+
+			const { repo: storageRepo } = makePresentStorageRepo(blockId, 1);
+			const repo = buildRepo(makeKeyNetwork(cluster), storageRepo, peerB, callback, { readRepairMode: 'paranoid' });
+
+			const result = await repo.get({ blockIds: [blockId] });
+
+			expect(result[blockId]?.block?.header.id).to.equal(blockId);
+			expect('unconfirmedAheadRev' in result[blockId]!).to.equal(false);
+			expect('unavailable' in result[blockId]!).to.equal(false);
+		});
+
+		it('never flags a read pinned BELOW the claimed revision — that view is being served correctly', async () => {
+			// A committed read view legitimately pinned at rev 1 asked for rev-1 content and got
+			// it; a peer claiming rev 2 says nothing about THAT view. This is what keeps a
+			// collection's context-pinned data reads quiet while its unpinned tail read speaks up.
+			const peerB = await makePeerId();
+			const peerA = await makePeerId();
+			const peerC = await makePeerId();
+			const cluster = makeClusterPeers([peerB, peerA, peerC]);
+
+			const callback: ClusterLatestCallback = async (peerId) => {
+				if (peerId.equals(peerB)) return { actionId: 'old-action', rev: 1 };
+				if (peerId.equals(peerA)) return { actionId: 'new-action', rev: 2 };
+				throw new Error('dial failed');
+			};
+
+			const { repo: storageRepo } = makePresentStorageRepo(blockId, 1);
+			const repo = buildRepo(makeKeyNetwork(cluster), storageRepo, peerB, callback, { readRepairMode: 'paranoid' });
+
+			const result = await repo.get({
+				blockIds: [blockId],
+				context: { committed: [{ actionId: 'old-action', rev: 1 }], rev: 1 }
+			});
+
+			expect(result[blockId]?.block?.header.id).to.equal(blockId);
+			expect('unconfirmedAheadRev' in result[blockId]!).to.equal(false);
+		});
+
+		it('flags a read pinned AT or ABOVE the claimed revision — that view should contain the claim', async () => {
+			const peerB = await makePeerId();
+			const peerA = await makePeerId();
+			const peerC = await makePeerId();
+			const cluster = makeClusterPeers([peerB, peerA, peerC]);
+
+			const callback: ClusterLatestCallback = async (peerId) => {
+				if (peerId.equals(peerB)) return { actionId: 'old-action', rev: 1 };
+				if (peerId.equals(peerA)) return { actionId: 'new-action', rev: 2 };
+				throw new Error('dial failed');
+			};
+
+			const { repo: storageRepo } = makePresentStorageRepo(blockId, 1);
+			const repo = buildRepo(makeKeyNetwork(cluster), storageRepo, peerB, callback, { readRepairMode: 'paranoid' });
+
+			const result = await repo.get({
+				blockIds: [blockId],
+				context: { committed: [{ actionId: 'new-action', rev: 2 }], rev: 2 }
+			});
+
+			expect(result[blockId]?.unconfirmedAheadRev).to.equal(2);
 		});
 	});
 
