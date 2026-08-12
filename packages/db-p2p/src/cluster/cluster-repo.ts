@@ -408,10 +408,27 @@ export class ClusterMember implements ICluster {
 					messageHash: record.messageHash
 				});
 				currentRecord = await this.handlePromiseNeeded(currentRecord);
+				// Our own vote can be terminal: `handlePromiseNeeded` appends an approve OR a reject,
+				// and under the default unanimity threshold (maxAllowedRejections === 0) a single
+				// reject already puts the record in `Rejected` — unreachable forever. Retaining it
+				// would leave it in `activeTransactions`, which is this member's reservation table
+				// over blocks (`hasConflict`), so a transaction the member itself proved dead would
+				// go on blocking every later transaction touching those blocks until the staleness
+				// sweep fires. Re-evaluate here, mirroring the `OurCommitNeeded` branch below.
 				log('cluster-member:action-promise-complete', {
 					messageHash: record.messageHash,
 					promises: Object.keys(currentRecord.promises ?? {})
 				});
+				{
+					const newPhase = await this.getTransactionPhase(currentRecord);
+					if (newPhase === TransactionPhase.Rejected) {
+						log('cluster-member:action-rejected-after-promise', {
+							messageHash: record.messageHash
+						});
+						await this.handleRejection(currentRecord);
+						shouldPersist = false;
+					}
+				}
 				break;
 			case TransactionPhase.OurCommitNeeded:
 				log('cluster-member:action-commit', {
@@ -1579,35 +1596,46 @@ export class ClusterMember implements ICluster {
 		return false; // No blocking conflicts
 	}
 
+	/** Number of *approve* promise votes on a record — the count the commit rule uses. */
+	private static approvalCount(record: ClusterRecord): number {
+		return Object.values(record.promises).filter(s => s.type === 'approve').length;
+	}
+
 	/**
 	 * Resolve a race between two conflicting transactions. Total and deterministic, so every honest
 	 * member computes the identical winner (the Theorem 1 Case-2 premise). Order:
-	 *   1. more promise signatures wins  (progress monotonicity — see safety note below);
-	 *   2. equal promise counts → higher aged priority wins  (fairness — see {@link recordPriority});
+	 *   1. more *approve* promise signatures wins  (progress monotonicity — see safety note below);
+	 *   2. equal approval counts → higher aged priority wins  (fairness — see {@link recordPriority});
 	 *   3. still tied → higher message hash wins.
 	 *
-	 * Promise count is FIRST so this comparison never displaces a transaction that is further along.
+	 * The count is APPROVALS, not `promises` keys. `promises` is the vote map — a reject occupies a key
+	 * there exactly as an approve does — so counting keys would treat a rejection as progress, letting a
+	 * record that can never commit outrank (and therefore block, via {@link hasConflict}) a fresh rival
+	 * for the whole staleness window. Approvals is also the count the invariant below actually needs:
+	 * the commit rule is `approvedPromises >= superMajority`, which never looks at rejections.
+	 *
+	 * Approval count is FIRST so this comparison never displaces a transaction that is further along.
 	 * That restores the pre-priority safety invariant: a member commits purely on promise supermajority
 	 * (`handleCommitNeeded` signs whenever `approvedPromises >= superMajority`; the commit path has NO
 	 * conflict re-check), so `resolveRace` is the ONLY arbiter among concurrently-pending conflicts.
-	 * With promises-first, once transaction X holds a promise supermajority every conflicting rival Y has
-	 * strictly fewer promises — Y can only match X's count by getting the intersecting quorum member to
-	 * promise it, but that member already holds X at supermajority and `resolveRace(X, Y)` returns
+	 * With approvals-first, once transaction X holds a promise supermajority every conflicting rival Y has
+	 * strictly fewer approvals — Y can only match X's count by getting the intersecting quorum member to
+	 * approve it, but that member already holds X at supermajority and `resolveRace(X, Y)` returns
 	 * `keep-existing` on X's higher count, so it never does. By quorum intersection any Y-supermajority
 	 * overlaps X's in ≥1 honest member, and that member rejects Y. One winner (docs/correctness.md
 	 * Theorem 9). Priority-first would break this: it could displace an already-quorum-reached X for a
-	 * higher-priority Y with fewer promises, letting BOTH commit (split brain) — the regression fixed by
+	 * higher-priority Y with fewer approvals, letting BOTH commit (split brain) — the regression fixed by
 	 * ticket occ-priority-first-breaks-promise-monotonicity.
 	 *
-	 * Priority is now a tie-break that runs only at EQUAL promise counts, which is exactly the
+	 * Priority is now a tie-break that runs only at EQUAL approval counts, which is exactly the
 	 * concurrent-starvation case aging targets (two fresh rivals, 0 promises each, otherwise coin-flipping
 	 * on the hash). Priority still breaks those ties deterministically, so aging still solves the stated
 	 * fairness problem in its common case. It only orders two *concurrently-pending* conflicts; it does NOT
 	 * defer a fresh pend for an absent aged transaction (that residual — sequential sub-window starvation —
 	 * is the deferred feat-occ-priority-reservation).
 	 *
-	 * NOTE: residual-fairness tripwire. Under promises-first an aged transaction can still lose to a fresh
-	 * rival that has *legitimately* gathered even one more promise — that is not the pure-coin-flip
+	 * NOTE: residual-fairness tripwire. Under approvals-first an aged transaction can still lose to a fresh
+	 * rival that has *legitimately* gathered even one more approval — that is not the pure-coin-flip
 	 * starvation aging targets (equal counts, priority wins), it is the monotonicity behaviour we WANT (a
 	 * more-progressed rival is never displaced). If deeper fairness against a genuinely-more-progressed
 	 * rival is ever needed, it belongs to feat-occ-priority-reservation (reserve/defer at pend time), NOT
@@ -1616,7 +1644,7 @@ export class ClusterMember implements ICluster {
 	 * NOTE: Byzantine self-assert is a fairness DoS, not a safety hole. A coordinator can stamp
 	 * priority == MaxPriority on every transaction; recordPriority clamps to the cap so it cannot
 	 * exceed it, and priority never influences validity/operationsHash/stale-read checks — and now sits
-	 * below the promise count, so it can only break equal-count ties it might have ~50% won anyway,
+	 * below the approval count, so it can only break equal-count ties it might have ~50% won anyway,
 	 * degrading to at-worst-status-quo fairness (the same graceful-degradation class as spam under
 	 * honest-majority). Binding priority to provable age is out of scope (feat-occ-priority-reservation).
 	 *
@@ -1625,14 +1653,18 @@ export class ClusterMember implements ICluster {
 	 * (design-hot-log-tail-sharding-guidance).
 	 */
 	private resolveRace(existing: ClusterRecord, incoming: ClusterRecord): 'keep-existing' | 'accept-incoming' {
-		// 1. Transaction with more promises wins — never displace a more-progressed rival (safety, see above).
-		const existingCount = Object.keys(existing.promises).length;
-		const incomingCount = Object.keys(incoming.promises).length;
+		// 1. Transaction with more APPROVALS wins — never displace a more-progressed rival (safety, see
+		// above). Counting `promises` keys instead would count reject votes as progress: a record holding
+		// one rejection would outrank an untouched rival and reserve its blocks for the whole staleness
+		// window, and the commit rule this ordering protects (`approvedPromises >= superMajority`) never
+		// looks at rejections anyway.
+		const existingCount = ClusterMember.approvalCount(existing);
+		const incomingCount = ClusterMember.approvalCount(incoming);
 		if (existingCount !== incomingCount) {
 			return existingCount > incomingCount ? 'keep-existing' : 'accept-incoming';
 		}
 
-		// 2. Equal promise counts → higher aged priority wins (fairness tie-break).
+		// 2. Equal approval counts → higher aged priority wins (fairness tie-break).
 		const existingPriority = this.recordPriority(existing);
 		const incomingPriority = this.recordPriority(incoming);
 		if (existingPriority !== incomingPriority) {

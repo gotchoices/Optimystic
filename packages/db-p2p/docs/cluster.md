@@ -159,7 +159,7 @@ During the promise phase, each peer evaluates whether they can commit to the tra
 ```typescript
 private async handlePromiseNeeded(record: ClusterRecord): Promise<ClusterRecord> {
   // Check for conflicts with existing transactions
-  // Uses race resolution: transaction with more promises wins
+  // Uses race resolution: transaction with more approvals wins
   if (this.hasConflict(record)) {
     return this.rejectTransaction(record, 'Conflict detected');
   }
@@ -338,20 +338,29 @@ When two transactions conflict (operate on the same blocks), the system uses det
 
 ```typescript
 private resolveRace(existing: ClusterRecord, incoming: ClusterRecord): 'keep-existing' | 'accept-incoming' {
-  const existingCount = Object.keys(existing.promises).length;
-  const incomingCount = Object.keys(incoming.promises).length;
-  
-  // Transaction with more promises wins
-  if (existingCount > incomingCount) return 'keep-existing';
-  if (incomingCount > existingCount) return 'accept-incoming';
-  
+  // APPROVE votes only — `promises` is the vote map, and a reject is not progress.
+  const existingCount = ClusterMember.approvalCount(existing);
+  const incomingCount = ClusterMember.approvalCount(incoming);
+
+  // Transaction with more approvals wins
+  if (existingCount !== incomingCount) {
+    return existingCount > incomingCount ? 'keep-existing' : 'accept-incoming';
+  }
+
+  // Equal approvals: higher aged priority wins (fairness-only tie-break)
+  const existingPriority = this.recordPriority(existing);
+  const incomingPriority = this.recordPriority(incoming);
+  if (existingPriority !== incomingPriority) {
+    return existingPriority > incomingPriority ? 'keep-existing' : 'accept-incoming';
+  }
+
   // Tie-breaker: higher message hash wins (deterministic)
   return existing.messageHash > incoming.messageHash ? 'keep-existing' : 'accept-incoming';
 }
 ```
 
 **Resolution Strategies:**
-- **Promise Count Wins**: Transaction with more promises has made more progress
+- **Approval Count Wins**: Transaction with more `approve` votes has made more progress. Reject votes are excluded — a record that can never commit must not out-rank (and therefore block) a live rival
 - **Deterministic Tie-Breaking**: Hash comparison ensures all peers make the same decision
 - **Automatic Abort**: Losing transaction is cleanly aborted
 - **Parallel Non-Conflicting**: Transactions on different blocks proceed in parallel

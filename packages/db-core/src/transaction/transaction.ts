@@ -128,7 +128,7 @@ export const DEFAULT_TRANSACTION_TTL_MS = 30_000;
  * Upper bound on a transaction's aged {@link Transaction.priority}. Capping is essential: it
  * bounds the fairness effect (an aged transaction cannot accrue unlimited advantage) and bounds
  * the throughput cost (it can impose at most `MaxPriority` extra race-losses on rivals before it
- * commits). Two transactions capped out at `MaxPriority` fall back to the existing promise-count /
+ * commits). Two transactions capped out at `MaxPriority` fall back to the existing approval-count /
  * message-hash tiebreak, so behavior degrades gracefully to the pre-priority status quo.
  */
 export const MaxPriority = 8;

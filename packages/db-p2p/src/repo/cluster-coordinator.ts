@@ -356,6 +356,14 @@ export class ClusterCoordinator {
 				reasons: rejectReasons
 			});
 			this.updateTransactionRecord(promised.record, 'rejected-by-validators');
+			// Abandoning here without telling anyone leaves every member that voted holding this
+			// transaction in its own reservation table, blocking its blocks until that member's
+			// staleness sweep fires — and each retry we throw back to the caller plants a fresh
+			// reservation, so the block never frees. The merged record carries enough signed
+			// rejections to *prove* the transaction is dead, so replaying it to the cohort makes
+			// every member recompute `Rejected` and clear immediately. Proof-carrying, so a member
+			// need not trust us: it verifies the signatures it is shown.
+			this.broadcastAbandonment(promised.record, 'rejected-by-validators');
 			throw new ValidatorRejectionError(
 				`Transaction rejected by validators (${rejectionCount}/${peerCount} rejected): ${rejectReasons}`,
 				rejectReasonsByPeer);
@@ -371,6 +379,14 @@ export class ClusterCoordinator {
 				threshold: this.cfg.superMajorityThreshold
 			});
 			this.updateTransactionRecord(promised.record, 'supermajority-failed');
+			// NOTE: deliberately NOT broadcast, unlike the rejected-by-validators branch above. We get
+			// here mostly because peers did not answer at all, so the record carries no signed evidence
+			// that the transaction is dead — a broadcast would be an unauthenticated "forget this" that
+			// any caller could use to clear a live transaction out of a member's reservation table.
+			// Members that DID vote are freed by their own staleness sweep instead. Once members answer
+			// a lost conflict race with a signed vote rather than staying silent
+			// (ticket member-must-answer-a-lost-conflict-race), the interesting half of this case becomes
+			// proof-carrying too and can use the same broadcastAbandonment call.
 			throw new Error(`Failed to get super-majority: ${approvalCount}/${peerCount} approvals (needed ${superMajority}, ${rejectionCount} rejections)`);
 		}
 
@@ -694,6 +710,34 @@ export class ClusterCoordinator {
 		}));
 		const failures = results.filter(r => !r.success).map(r => r.peerId);
 		return { failures };
+	}
+
+	/**
+	 * Fire-and-forget replay of an abandoned transaction's record to every peer in its cohort.
+	 *
+	 * Called only where the record itself proves the transaction is dead (enough signed rejections that
+	 * super-majority is unreachable). Each member re-derives `TransactionPhase.Rejected` from the votes
+	 * it verifies and drops the entry from its own reservation table, freeing the blocks immediately
+	 * instead of after its 2 s staleness window. No new message type and no wire-format change — this is
+	 * the same `update()` every other phase uses.
+	 *
+	 * Never awaited into the caller's throw and never rethrows: an abandonment must not turn into a
+	 * *different* failure, and the staleness sweep remains the backstop if delivery fails.
+	 */
+	private broadcastAbandonment(record: ClusterRecord, reason: string): void {
+		const peerIds = Object.keys(record.peers);
+		log('cluster-tx:abandon-broadcast', { messageHash: record.messageHash, reason, peerIds });
+		void Promise.all(peerIds.map(async peerIdStr => {
+			try {
+				await this.updateMember(peerIdStr, record, 0, 'abandon-broadcast');
+			} catch (err) {
+				log('cluster-tx:abandon-broadcast-error', {
+					messageHash: record.messageHash,
+					peerId: peerIdStr,
+					error: err instanceof Error ? err.message : String(err)
+				});
+			}
+		}));
 	}
 
 	private updateTransactionRecord(record: ClusterRecord, stage: string): void {

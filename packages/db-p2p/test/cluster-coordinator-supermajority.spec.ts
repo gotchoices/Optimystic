@@ -5,6 +5,7 @@ import type { PeerId } from '@libp2p/interface';
 import { peerIdFromPrivateKey } from '@libp2p/peer-id';
 import { generateKeyPair } from '@libp2p/crypto/keys';
 import { toString as u8ToString } from 'uint8arrays';
+import { waitFor } from '@optimystic/db-core/test';
 
 /**
  * Locks the super-majority threshold rounding behaviour so the next regression
@@ -157,4 +158,89 @@ describe('ClusterCoordinator super-majority threshold math (web-e2e-tier2-cluste
 			}
 		});
 	}
+});
+
+/**
+ * A member that voted keeps the transaction in its own reservation table until something
+ * advances it — so a coordinator that abandons a transaction and merely throws leaves every
+ * member holding the touched blocks for the full staleness window, and each blocked retry
+ * plants a fresh reservation. At the `rejected-by-validators` site the coordinator holds a
+ * merged record carrying enough signed rejections to *prove* the transaction is dead, so it
+ * broadcasts that record: every member recomputes `Rejected` and clears immediately.
+ *
+ * (The `supermajority-failed` site carries no such proof and is deliberately not broadcast —
+ * see the NOTE at that site in cluster-coordinator.ts.)
+ */
+class RecordingClusterClient {
+	readonly received: ClusterRecord[] = [];
+
+	constructor(
+		private readonly peerIdStr: string,
+		private readonly verdict: 'approve' | 'reject'
+	) { }
+
+	async update(record: ClusterRecord): Promise<ClusterRecord> {
+		// Snapshot: collectPromises merges into the *same* record object it handed out, so keeping
+		// the reference would make a first-delivery entry retroactively appear to carry the votes.
+		this.received.push({ ...record, promises: { ...record.promises }, commits: { ...record.commits } });
+		if (!(this.peerIdStr in record.promises)) {
+			const sig: Signature = this.verdict === 'approve'
+				? { type: 'approve', signature: `psig-${this.peerIdStr.substring(0, 8)}` }
+				: { type: 'reject', signature: `psig-${this.peerIdStr.substring(0, 8)}`, rejectReason: 'validation failed' };
+			return { ...record, promises: { ...record.promises, [this.peerIdStr]: sig } };
+		}
+		return record;
+	}
+}
+
+describe('ClusterCoordinator abandonment broadcast (1-abandoned-pend-holds-the-block)', function () {
+	this.timeout(10000);
+
+	it('tells the cohort when it abandons a transaction the validators rejected', async () => {
+		const peerIds = await Promise.all([makePeerId(), makePeerId(), makePeerId()]);
+		const clusterPeers: ClusterPeers = {};
+		for (const pid of peerIds) {
+			clusterPeers[pid.toString()] = {
+				multiaddrs: ['/ip4/127.0.0.1/tcp/8000'],
+				publicKey: u8ToString(pid.publicKey!.raw, 'base64url')
+			};
+		}
+
+		// threshold 0.75 over 3 peers ⇒ superMajority 3 ⇒ maxAllowedRejections 0, so one reject
+		// is already terminal and the coordinator takes the `rejected-by-validators` path.
+		const mocks = peerIds.map((pid, idx) =>
+			new RecordingClusterClient(pid.toString(), idx === 2 ? 'reject' : 'approve'));
+		const byId = new Map(peerIds.map((pid, idx) => [pid.toString(), mocks[idx]!]));
+
+		const mockKeyNetwork: IKeyNetwork = {
+			async findCoordinator() { return peerIds[0]!; },
+			async findCluster() { return { ...clusterPeers }; }
+		};
+		const createClient = (peerId: PeerId) => {
+			const mock = byId.get(peerId.toString());
+			if (!mock) throw new Error(`No mock for ${peerId.toString()}`);
+			return mock;
+		};
+
+		const coordinator = new ClusterCoordinator(
+			mockKeyNetwork,
+			createClient as any,
+			{ ...baseCfg, superMajorityThreshold: 0.75 }
+		);
+
+		let caught: Error | null = null;
+		try {
+			await coordinator.executeClusterTransaction('block-1' as BlockId, makeMessage());
+		} catch (err) {
+			caught = err as Error;
+		}
+		expect(caught, 'expected a validator rejection').to.be.instanceOf(Error);
+
+		// The broadcast is fire-and-forget so the throw does not wait on it — poll for arrival.
+		const sawRejection = (mock: RecordingClusterClient) =>
+			mock.received.some(r => Object.values(r.promises ?? {}).some(s => s.type === 'reject'));
+		await waitFor(() => mocks.every(sawRejection), {
+			description: 'every member receives the rejection-carrying record'
+		});
+	});
 });

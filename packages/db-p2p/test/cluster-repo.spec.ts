@@ -203,7 +203,7 @@ const makePendOperationP = (
 	return [{ pend } as RepoMessage['operations'][number]];
 };
 
-/** A promise/commit signature whose bytes are irrelevant — resolveRace only counts key presence. */
+/** A promise/commit signature whose bytes are irrelevant — resolveRace only counts `approve` votes. */
 const dummySig: Signature = { type: 'approve', signature: 'x' };
 
 describe('ClusterMember', () => {
@@ -875,7 +875,7 @@ describe('ClusterMember', () => {
 			const peers = makeClusterPeers([selfKeyPair]);
 			// Aged transaction: priority 2, ZERO promises.
 			const aged = await createClusterRecord(peers, makePendOperationP('aged', 'block-shared', { priority: 2 }));
-			// Fresh rival: priority 0 but TWO promises — more-progressed, so it wins under promises-first.
+			// Fresh rival: priority 0 but TWO promises — more-progressed, so it wins under approvals-first.
 			const fresh = await createClusterRecord(
 				peers, makePendOperationP('fresh', 'block-shared'), { p1: dummySig, p2: dummySig }
 			);
@@ -895,7 +895,7 @@ describe('ClusterMember', () => {
 				peers, makePendOperationP('y', 'block-shared', { priority: MaxPriority }), { p1: dummySig }
 			);
 			// The commit path has NO conflict re-check, so resolveRace is the only arbiter. Under
-			// promises-first it can never displace a quorum-reached transaction — regression guard for
+			// approvals-first it can never displace a quorum-reached transaction — regression guard for
 			// occ-priority-first-breaks-promise-monotonicity (this FAILED under the old priority-first order).
 			expect(raceOf().resolveRace(x, y)).to.equal('keep-existing');
 			expect(raceOf().resolveRace(y, x)).to.equal('accept-incoming');
@@ -911,13 +911,13 @@ describe('ClusterMember', () => {
 		it('an aged transaction beats fresh rivals within MaxPriority+1 concurrent rounds (livelock guarantee)', async () => {
 			const peers = makeClusterPeers([selfKeyPair]);
 			// Model a transaction that keeps losing: its priority = clampPriority(losses) rises each round,
-			// while every fresh rival stays at priority 0 with an EQUAL promise count (0). Under promises-first
+			// while every fresh rival stays at priority 0 with an EQUAL approval count (0). Under approvals-first
 			// the priority tie-break then decides at equal counts — the concurrent-starvation case aging targets.
 			for (let losses = 1; losses <= MaxPriority; losses++) {
 				const agedPriority = Math.min(MaxPriority, losses);
 				const aged = await createClusterRecord(peers, makePendOperationP('aged', 'block-shared', { priority: agedPriority }));
 				const fresh = await createClusterRecord(peers, makePendOperationP(`fresh-${losses}`, 'block-shared'));
-				// priority ≥ 1 deterministically out-ranks a fresh priority-0 rival at equal promise counts,
+				// priority ≥ 1 deterministically out-ranks a fresh priority-0 rival at equal approval counts,
 				// regardless of the hash — so the starved transaction wins by round 1 (≤ MaxPriority+1).
 				expect(raceOf().resolveRace(aged, fresh), `aged wins at priority ${agedPriority}`).to.equal('keep-existing');
 				expect(raceOf().resolveRace(fresh, aged), `mirror at priority ${agedPriority}`).to.equal('accept-incoming');
@@ -947,6 +947,28 @@ describe('ClusterMember', () => {
 			const legacy = await createClusterRecord(peers, makePendOperation('legacy', 'block-shared'));
 			expect(raceOf().resolveRace(aged, legacy)).to.equal('keep-existing');
 			expect(raceOf().resolveRace(legacy, aged)).to.equal('accept-incoming');
+		});
+
+		it('a record carrying only a REJECT vote does not outrank a fresh rival', async () => {
+			const peer2 = await makeKeyPair();
+			const peers = makeClusterPeers([selfKeyPair, peer2]);
+
+			// A: one *reject* vote and nothing else. `promises` is the vote map, not the approval
+			// map, so counting its keys made this look "more progressed" than an untouched rival —
+			// and a rejected record then reserved its blocks (hasConflict) for the whole staleness
+			// window. Ranking is by APPROVE votes, which is the count the commit rule actually uses.
+			const baseA = await createClusterRecord(peers, makePendOperationP('a', 'block-shared'));
+			const rejection = await makeSignedPromise(peer2.privateKey, baseA, 'reject', 'stale-revision');
+			const rejectedA: ClusterRecord = {
+				...baseA,
+				promises: { [peer2.peerId.toString()]: rejection }
+			};
+			// B: no votes at all, priority 1 — so the outcome is decided by the priority tie-break at
+			// equal approve counts (0 vs 0) rather than by the hash, keeping this assertion deterministic.
+			const freshB = await createClusterRecord(peers, makePendOperationP('b', 'block-shared', { priority: 1 }));
+
+			expect(raceOf().resolveRace(rejectedA, freshB)).to.equal('accept-incoming');
+			expect(raceOf().resolveRace(freshB, rejectedA)).to.equal('keep-existing');
 		});
 
 		it('rejects a record whose priority was inflated after signing (integrity in transit)', async () => {
@@ -1248,6 +1270,50 @@ describe('ClusterMember', () => {
 			// Should have a reject promise
 			expect(result.promises[ourId]?.type).to.equal('reject');
 			expect(result.promises[ourId]?.rejectReason).to.include('Validation failed');
+		});
+
+		it('does not retain a transaction it rejected itself', async () => {
+			const validatingMember = clusterMember({
+				storageRepo: mockRepo,
+				peerNetwork: mockNetwork,
+				peerId: selfKeyPair.peerId,
+				privateKey: selfKeyPair.privateKey,
+				validator: {
+					validate: async () => ({ valid: false, reason: 'Validation failed' }),
+					getSchemaHash: async () => 'test-hash'
+				}
+			});
+
+			const peers = makeClusterPeers([selfKeyPair]);
+			const transforms: Transforms = {
+				inserts: { 'block-1': makeBlock('block-1') },
+				updates: {},
+				deletes: []
+			};
+			// `transaction` + `operationsHash` are what make validatePendOperations consult the validator.
+			const record = await createClusterRecord(
+				peers,
+				[{
+					pend: {
+						actionId: 'a1',
+						transforms,
+						policy: 'c',
+						transaction: { statements: [], stamp: {} } as any,
+						operationsHash: 'hash'
+					}
+				}]
+			);
+
+			await validatingMember.update(record);
+
+			// activeTransactions is the member's reservation table over blocks: anything in it blocks
+			// every later transaction touching the same block until the staleness sweep fires. A record
+			// this member has itself proven unreachable (one reject already satisfies Rejected under the
+			// default unanimity threshold) must not sit there holding block-1.
+			const active = (validatingMember as unknown as {
+				activeTransactions: Map<string, unknown>
+			}).activeTransactions;
+			expect(active.has(record.messageHash)).to.equal(false);
 		});
 	});
 
