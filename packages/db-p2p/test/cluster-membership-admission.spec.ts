@@ -108,7 +108,7 @@ const voteOn = async (
 		const record = await makeRecord(makeClusterPeers(declared));
 		const result = await member.update(record);
 		const sig = result.promises[self.peerId.toString()];
-		return { type: sig?.type ?? 'none', rejectReason: sig?.rejectReason };
+		return { type: sig?.type ?? 'none', rejectReason: sig?.type === 'reject' ? sig.rejectReason : undefined };
 	} finally {
 		member.dispose();
 	}

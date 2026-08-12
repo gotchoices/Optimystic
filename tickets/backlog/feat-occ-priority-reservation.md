@@ -1,7 +1,7 @@
 description: A big transaction can still be starved by a steady stream of tiny fast ones — the small ones commit and vanish before the big one finishes reading, so they never actually collide where the fairness tiebreak could help. To truly guarantee the big one eventually gets through, the cluster would need to briefly hold off new conflicting transactions once an old one has waited long enough.
 prereq:
 files:
-  - packages/db-p2p/src/cluster/cluster-repo.ts (hasConflict / resolveRace / activeTransactions — admission point)
+  - packages/db-p2p/src/cluster/cluster-repo.ts (findConflict / resolveRace / activeTransactions — admission point)
   - packages/db-core/src/transaction/transaction.ts (priority field from implement-occ-priority-aging)
   - docs/correctness.md (Theorem 9; Theorem 7 termination)
 difficulty: hard

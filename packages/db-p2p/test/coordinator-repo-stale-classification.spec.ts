@@ -26,7 +26,7 @@ const makePeerId = async (): Promise<PeerId> => {
 	return peerIdFromPrivateKey(pk);
 };
 
-type Verdict = { type: 'approve' } | { type: 'reject'; reason: string };
+type Verdict = { type: 'approve' } | { type: 'reject'; reason: string } | { type: 'conflict'; winner: string };
 
 /** Promise phase: votes per verdict. Commit phase (promise already present): always approves. */
 class MockClusterClient implements ICluster {
@@ -39,7 +39,9 @@ class MockClusterClient implements ICluster {
 		if (!(this.peerIdStr in record.promises)) {
 			const sig: Signature = this.verdict.type === 'reject'
 				? { type: 'reject', signature: `psig-${this.peerIdStr.substring(0, 8)}`, rejectReason: this.verdict.reason }
-				: { type: 'approve', signature: `psig-${this.peerIdStr.substring(0, 8)}` };
+				: this.verdict.type === 'conflict'
+					? { type: 'conflict', signature: `psig-${this.peerIdStr.substring(0, 8)}`, conflictWith: this.verdict.winner }
+					: { type: 'approve', signature: `psig-${this.peerIdStr.substring(0, 8)}` };
 			return {
 				...record,
 				promises: { ...record.promises, [this.peerIdStr]: sig }
@@ -256,6 +258,23 @@ describe('CoordinatorRepo stale-revision classification (pend)', function () {
 		}
 		expect(caught).to.be.instanceOf(ValidatorRejectionError);
 		expect(storage.getCalls, 'no rev → classification skips the re-read').to.equal(0);
+	});
+
+	it('returns a retryable StaleFailure (no staleAt) when the pend lost a conflict race', async () => {
+		// A member holding the race winner answers with a signed `conflict` vote. That is not a
+		// validator rejection and not silence — pend must surface it as the StaleFailure shape the
+		// retry machinery already absorbs, without inventing a revision number.
+		setVerdicts({ type: 'approve' }, { type: 'conflict', winner: 'winning-message-hash' });
+
+		const result = await repo.pend(makePendRequest(1));
+		expect(result.success, 'a lost race must be a returned failure, not a throw').to.equal(false);
+		expect((result as StaleFailure).conflict, 'a lost race is retryable by definition').to.equal(true);
+		expect(isConflictFailure(result as StaleFailure)).to.equal(true);
+		// staleAt is confirmed-only: a rival PEND holding the blocks is not a revision claim, so no
+		// number may be reported — and none may be mined from the vote or the error prose.
+		expect(result).to.not.have.property('staleAt');
+		expect(storage.getCalls, 'no stale-classification re-read is needed for a conflict loss').to.equal(0);
+		expect(storage.pendCalls, 'a lost pend must not reach local storage').to.equal(0);
 	});
 
 	it('rethrows when the classification re-read itself fails', async () => {

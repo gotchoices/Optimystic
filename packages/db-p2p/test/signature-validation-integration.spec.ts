@@ -103,7 +103,7 @@ const makeSignedPromise = async (privateKey: PrivateKey, record: ClusterRecord, 
 const makeSignedCommit = async (privateKey: PrivateKey, record: ClusterRecord, type: 'approve' | 'reject' = 'approve'): Promise<Signature> => {
 	const commitHash = await computeCommitHash(record);
 	const sig = await signVote(privateKey, commitHash, type);
-	return { type, signature: sig };
+	return type === 'approve' ? { type: 'approve', signature: sig } : { type: 'reject', signature: sig };
 };
 
 const makeClusterPeers = (keyPairs: KeyPair[]): ClusterPeers => {
@@ -329,7 +329,7 @@ describe('Signature Validation Integration (TEST-6.2.1)', () => {
 
 			const result = await member.update(record);
 			const promise = result.promises[ourId]!;
-			expect(promise.type).to.equal('reject');
+			if (promise.type !== 'reject') expect.fail(`expected a reject vote, got ${promise.type}`);
 
 			// The signing payload for a rejection includes the rejectReason
 			const promiseHash = await computePromiseHash(record);

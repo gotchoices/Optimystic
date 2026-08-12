@@ -1,10 +1,23 @@
 import type { RepoMessage } from "../network/repo-protocol.js";
 
-export type Signature = {
-	type: 'approve' | 'reject';
-	signature: string;
-	rejectReason?: string;
-}
+/**
+ * One member's vote on a cluster transaction, in either the promise or the commit map.
+ *
+ * A discriminated union rather than one shape with optional fields, so each vote kind carries
+ * exactly its own payload: a `conflict` without its `conflictWith` (or a stray `rejectReason` on an
+ * `approve`) does not typecheck. Every variant's extra field is folded into the signed payload
+ * (see cluster-repo's `computeSigningPayload`), so none of them can be altered in transit.
+ */
+export type Signature =
+	| { type: 'approve'; signature: string }
+	| { type: 'reject'; signature: string; rejectReason?: string }
+	/**
+	 * This member refuses the transaction *for now*: it holds a conflicting transaction that won
+	 * the deterministic race (`resolveRace`). Retryable — NOT a validity judgement, and never
+	 * counted toward the permanent-rejection threshold. `conflictWith` is the winning
+	 * transaction's messageHash: structured, signed, and readable without parsing prose.
+	 */
+	| { type: 'conflict'; signature: string; conflictWith: string };
 
 export type ClusterPeers = {
 	[id: string]: {

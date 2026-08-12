@@ -1,5 +1,5 @@
 import { expect } from 'chai';
-import { ClusterCoordinator } from '../src/repo/cluster-coordinator.js';
+import { ClusterCoordinator, ConflictRaceLostError } from '../src/repo/cluster-coordinator.js';
 import type { ClusterRecord, ClusterPeers, IKeyNetwork, RepoMessage, ClusterConsensusConfig, BlockId, Signature } from '@optimystic/db-core';
 import type { PeerId } from '@libp2p/interface';
 import { peerIdFromPrivateKey } from '@libp2p/peer-id';
@@ -192,6 +192,124 @@ class RecordingClusterClient {
 		return record;
 	}
 }
+
+/**
+ * Behaviour split for a promise-phase shortfall (2-member-must-answer-a-lost-conflict-race):
+ *
+ * - `conflict` votes present → `ConflictRaceLostError` (a retryable optimistic-concurrency loss,
+ *   never `ValidatorRejectionError`), with the conflicting peers and winning hashes as data;
+ * - no votes at all (genuinely-silent cohort) → the legacy shortfall error whose message must stay
+ *   BYTE-IDENTICAL: the consuming repo (sereus cadre-core control-write-retry) matches that exact
+ *   text to retry, and conflict votes must never inflate its `rejections` number.
+ */
+class ConflictAnsweringClient {
+	readonly received: ClusterRecord[] = [];
+
+	constructor(
+		private readonly peerIdStr: string,
+		private readonly verdict: 'approve' | 'conflict' | 'silent',
+		private readonly winnerHash = 'winner-hash-mock'
+	) { }
+
+	async update(record: ClusterRecord): Promise<ClusterRecord> {
+		this.received.push({ ...record, promises: { ...record.promises }, commits: { ...record.commits } });
+		if (!(this.peerIdStr in record.promises)) {
+			if (this.verdict === 'silent') return record;
+			const sig: Signature = this.verdict === 'conflict'
+				? { type: 'conflict', signature: `psig-${this.peerIdStr.substring(0, 8)}`, conflictWith: this.winnerHash }
+				: { type: 'approve', signature: `psig-${this.peerIdStr.substring(0, 8)}` };
+			return { ...record, promises: { ...record.promises, [this.peerIdStr]: sig } };
+		}
+		return record;
+	}
+}
+
+describe('ClusterCoordinator lost conflict race (2-member-must-answer-a-lost-conflict-race)', function () {
+	this.timeout(10000);
+
+	let peerIds: PeerId[];
+	let clusterPeers: ClusterPeers;
+
+	beforeEach(async () => {
+		peerIds = await Promise.all([makePeerId(), makePeerId(), makePeerId()]);
+		clusterPeers = {};
+		for (const pid of peerIds) {
+			clusterPeers[pid.toString()] = {
+				multiaddrs: ['/ip4/127.0.0.1/tcp/8000'],
+				publicKey: u8ToString(pid.publicKey!.raw, 'base64url')
+			};
+		}
+	});
+
+	const makeCoordinator = (verdicts: ('approve' | 'conflict' | 'silent')[]): { coordinator: ClusterCoordinator; mocks: ConflictAnsweringClient[] } => {
+		const mocks = peerIds.map((pid, idx) => new ConflictAnsweringClient(pid.toString(), verdicts[idx]!));
+		const byId = new Map(peerIds.map((pid, idx) => [pid.toString(), mocks[idx]!]));
+		const mockKeyNetwork: IKeyNetwork = {
+			async findCoordinator() { return peerIds[0]!; },
+			async findCluster() { return { ...clusterPeers }; }
+		};
+		const createClient = (peerId: PeerId) => {
+			const mock = byId.get(peerId.toString());
+			if (!mock) throw new Error(`No mock for ${peerId.toString()}`);
+			return mock;
+		};
+		// threshold 0.75 over 3 peers ⇒ superMajority 3, maxAllowedRejections 0.
+		const coordinator = new ClusterCoordinator(mockKeyNetwork, createClient as any, { ...baseCfg, superMajorityThreshold: 0.75 });
+		return { coordinator, mocks };
+	};
+
+	it('raises ConflictRaceLostError (not a validator rejection) when a member answers with a conflict vote', async () => {
+		const { coordinator } = makeCoordinator(['approve', 'approve', 'conflict']);
+
+		let caught: unknown;
+		try {
+			await coordinator.executeClusterTransaction('block-1' as BlockId, makeMessage());
+		} catch (err) {
+			caught = err;
+		}
+		expect(caught, 'a lost race must be its own outcome').to.be.instanceOf(ConflictRaceLostError);
+		expect((caught as ConflictRaceLostError).name).to.equal('ConflictRaceLostError');
+		// The winning hash rides as structured data from the signed vote, never parsed from prose.
+		expect(Object.values((caught as ConflictRaceLostError).conflicts)).to.deep.equal(['winner-hash-mock']);
+		expect(Object.keys((caught as ConflictRaceLostError).conflicts)).to.deep.equal([peerIds[2]!.toString()]);
+	});
+
+	it('broadcasts the proof-carrying record so members free the loser\'s blocks immediately', async () => {
+		const { coordinator, mocks } = makeCoordinator(['approve', 'approve', 'conflict']);
+
+		let caught: unknown;
+		try {
+			await coordinator.executeClusterTransaction('block-1' as BlockId, makeMessage());
+		} catch (err) {
+			caught = err;
+		}
+		expect(caught).to.be.instanceOf(ConflictRaceLostError);
+
+		// One conflict vote at maxAllowedRejections 0 proves super-majority unreachable, so the
+		// abandonment broadcast fires (fire-and-forget — poll for arrival).
+		const sawConflict = (mock: ConflictAnsweringClient) =>
+			mock.received.some(r => Object.values(r.promises ?? {}).some(s => s.type === 'conflict'));
+		await waitFor(() => mocks.every(sawConflict), {
+			description: 'every member receives the conflict-carrying record'
+		});
+	});
+
+	it('keeps the genuinely-silent shortfall message byte-identical, uninflated by conflict votes', async () => {
+		const { coordinator } = makeCoordinator(['approve', 'approve', 'silent']);
+
+		let caught: unknown;
+		try {
+			await coordinator.executeClusterTransaction('block-1' as BlockId, makeMessage());
+		} catch (err) {
+			caught = err;
+		}
+		expect(caught).to.be.instanceOf(Error);
+		expect(caught).to.not.be.instanceOf(ConflictRaceLostError);
+		// Load-bearing wire text — the consuming repo retries on exactly this shape. See the NOTE at
+		// the throw site in cluster-coordinator.ts before changing a byte of it.
+		expect((caught as Error).message).to.equal('Failed to get super-majority: 2/3 approvals (needed 3, 0 rejections)');
+	});
+});
 
 describe('ClusterCoordinator abandonment broadcast (1-abandoned-pend-holds-the-block)', function () {
 	this.timeout(10000);

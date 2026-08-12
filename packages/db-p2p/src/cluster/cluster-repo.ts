@@ -24,13 +24,26 @@ const log = createLogger('cluster-member')
 
 /** State of a transaction in the cluster */
 enum TransactionPhase {
-	Promising,       // Collecting promises from peers
+	Promising,       // We have voted; still collecting promises from other peers
 	OurPromiseNeeded, // We need to provide our promise
+	OurConflictVoteNeeded, // We hold a conflicting race winner; we must answer with a conflict vote
 	OurCommitNeeded, // We need to provide our commit
 	Consensus,       // Transaction has reached consensus
-	Rejected,        // Transaction was rejected
+	Rejected,        // Transaction was rejected (validity judgement — enough reject votes)
+	ConflictSuperseded, // Terminal but retryable: conflict votes make super-majority unreachable
 	Propagating     // Transaction is being propagated
 }
+
+/**
+ * A phase plus the data its handler needs: `conflictsWith` (the winning rival's messageHash) is
+ * populated only for {@link TransactionPhase.OurConflictVoteNeeded}, so the conflict-vote handler
+ * does not have to re-run conflict detection (whose race resolution has side effects) to learn
+ * which transaction blocked it.
+ */
+type PhaseResult = {
+	phase: TransactionPhase;
+	conflictsWith?: string;
+};
 
 interface TransactionState {
 	record: ClusterRecord;
@@ -391,98 +404,104 @@ export class ClusterMember implements ICluster {
 			});
 		}
 
-		// Get the current transaction state
-		const phase = await this.getTransactionPhase(currentRecord);
-		log('cluster-member:phase', {
-			messageHash: record.messageHash,
-			phase,
-			promises: Object.keys(currentRecord.promises ?? {}),
-			commits: Object.keys(currentRecord.commits ?? {})
-		});
+		// Drive the phase machine to a FIXPOINT rather than handling one phase per delivery. Each
+		// vote this member adds can put the record straight into the next phase (our promise
+		// completes super-majority ⇒ our commit is due; our commit completes the majority ⇒
+		// consensus; our reject/conflict vote makes the record terminal), and any follow-on phase
+		// not re-handled here would silently wait for the coordinator's next delivery — e.g. a
+		// member whose promise the coordinator never collected receives the commit-phase record,
+		// adds its promise, and must then also commit in the SAME delivery. One loop replaces the
+		// hand-written per-branch re-checks that used to cover only the follow-ons their authors
+		// thought of. Only the three vote-adding phases continue; each strictly grows the record
+		// (adds a promise or commit key), so the loop terminates — the cap guards a
+		// phase-computation bug, not a real bound.
+		const MaxPhaseSteps = 8;
 		let shouldPersist = true;
-
-		// Handle the transaction based on its state
-		switch (phase) {
-			case TransactionPhase.OurPromiseNeeded:
-				log('cluster-member:action-promise', {
-					messageHash: record.messageHash
-				});
-				currentRecord = await this.handlePromiseNeeded(currentRecord);
-				log('cluster-member:action-promise-complete', {
-					messageHash: record.messageHash,
-					promises: Object.keys(currentRecord.promises ?? {})
-				});
-				// Our own vote can be terminal: `handlePromiseNeeded` appends an approve OR a reject, and
-				// wherever `maxAllowedRejections` is 0 — which the default 0.75 threshold yields for every
-				// cohort of three or fewer, since ceil(0.75·n) === n there — that one reject already puts
-				// the record in `Rejected`, unreachable forever. Retaining it would leave it in
-				// `activeTransactions`, this member's reservation table over blocks (`hasConflict`), so a
-				// transaction the member itself proved dead would go on blocking every later transaction
-				// touching those blocks until the staleness sweep fires. Re-evaluate here, mirroring the
-				// `OurCommitNeeded` branch below. In a larger cohort the re-check simply finds a
-				// non-terminal phase and the record is retained as before.
-				{
-					const newPhase = await this.getTransactionPhase(currentRecord);
-					if (newPhase === TransactionPhase.Rejected) {
-						log('cluster-member:action-rejected-after-promise', {
-							messageHash: record.messageHash
-						});
-						await this.handleRejection(currentRecord);
-						shouldPersist = false;
-					}
-				}
+		phaseLoop: for (let step = 0; ; step++) {
+			if (step >= MaxPhaseSteps) {
+				log('cluster-member:phase-loop-overflow', { messageHash: record.messageHash, steps: step });
 				break;
-			case TransactionPhase.OurCommitNeeded:
-				log('cluster-member:action-commit', {
-					messageHash: record.messageHash
-				});
-				currentRecord = await this.handleCommitNeeded(currentRecord);
-				log('cluster-member:action-commit-complete', {
-					messageHash: record.messageHash,
-					commits: Object.keys(currentRecord.commits ?? {})
-				});
-				// After adding our commit, check if we now have consensus and execute if so
-				{
-					const newPhase = await this.getTransactionPhase(currentRecord);
-					if (newPhase === TransactionPhase.Consensus) {
-						log('cluster-member:action-consensus-after-commit', {
-							messageHash: record.messageHash
-						});
-						await this.handleConsensus(currentRecord);
-					}
-				}
-				shouldPersist = false;
-				break;
-			case TransactionPhase.Consensus:
-				log('cluster-member:action-consensus', {
-					messageHash: record.messageHash
-				});
-				await this.handleConsensus(currentRecord);
-				// Don't call clearTransaction here - it happens in handleConsensus
-				shouldPersist = false;
-				break;
-			case TransactionPhase.Rejected:
-				log('cluster-member:action-rejected', {
-					messageHash: record.messageHash
-				});
-				// Don't call clearTransaction here - it happens in handleRejection
-				await this.handleRejection(currentRecord);
-				shouldPersist = false;
-				break;
-			case TransactionPhase.Propagating:
-				// Transaction is complete and propagating - clean it up
-				log('cluster-member:phase-propagating', {
-					messageHash: record.messageHash
-				});
-				shouldPersist = false;
-				break;
-			case TransactionPhase.Promising:
-				// Still collecting promises from peers - if we haven't added ours and there's no conflict, add it
-				// This state shouldn't normally be reached since OurPromiseNeeded is checked first
-				log('cluster-member:phase-promising-blocked', {
-					messageHash: record.messageHash
-				});
-				break;
+			}
+			const { phase, conflictsWith } = await this.getTransactionPhase(currentRecord);
+			log('cluster-member:phase', {
+				messageHash: record.messageHash,
+				phase,
+				step,
+				promises: Object.keys(currentRecord.promises ?? {}),
+				commits: Object.keys(currentRecord.commits ?? {})
+			});
+			switch (phase) {
+				case TransactionPhase.OurPromiseNeeded:
+					log('cluster-member:action-promise', {
+						messageHash: record.messageHash
+					});
+					currentRecord = await this.handlePromiseNeeded(currentRecord);
+					log('cluster-member:action-promise-complete', {
+						messageHash: record.messageHash,
+						promises: Object.keys(currentRecord.promises ?? {})
+					});
+					// Our own vote can be terminal (a reject where maxAllowedRejections is 0) or complete
+					// the super-majority — recompute rather than guess which.
+					continue;
+				case TransactionPhase.OurConflictVoteNeeded:
+					currentRecord = await this.handleConflictVoteNeeded(currentRecord, conflictsWith!);
+					// Never persist a record we conflict-voted: this member holds the WINNER, and
+					// persisting the loser would reserve the same blocks a second time — half of what
+					// made the silent-abstention failure self-sustaining.
+					shouldPersist = false;
+					continue;
+				case TransactionPhase.OurCommitNeeded:
+					log('cluster-member:action-commit', {
+						messageHash: record.messageHash
+					});
+					currentRecord = await this.handleCommitNeeded(currentRecord);
+					log('cluster-member:action-commit-complete', {
+						messageHash: record.messageHash,
+						commits: Object.keys(currentRecord.commits ?? {})
+					});
+					shouldPersist = false;
+					// Our commit may have completed the majority — recompute; Consensus executes below.
+					continue;
+				case TransactionPhase.Consensus:
+					log('cluster-member:action-consensus', {
+						messageHash: record.messageHash
+					});
+					await this.handleConsensus(currentRecord);
+					shouldPersist = false;
+					break phaseLoop;
+				case TransactionPhase.Rejected:
+					log('cluster-member:action-rejected', {
+						messageHash: record.messageHash
+					});
+					await this.handleRejection(currentRecord);
+					shouldPersist = false;
+					break phaseLoop;
+				case TransactionPhase.ConflictSuperseded:
+					// Enough conflict votes that super-majority is unreachable. NOT a rejection — the
+					// callers retry it as a fresh transaction — so it gets its own terminal phase and the
+					// record is cleared rather than held (holding a provably-dead loser would reserve its
+					// blocks against the very retry that is supposed to win).
+					log('cluster-member:action-conflict-superseded', {
+						messageHash: record.messageHash
+					});
+					shouldPersist = false;
+					break phaseLoop;
+				case TransactionPhase.Propagating:
+					// Transaction is complete and propagating - clean it up
+					log('cluster-member:phase-propagating', {
+						messageHash: record.messageHash
+					});
+					shouldPersist = false;
+					break phaseLoop;
+				case TransactionPhase.Promising:
+					// We have already voted (approve, reject, or conflict); the record is still
+					// collecting promises from the rest of the cohort. Nothing to add — retain the
+					// record only if our vote wasn't a conflict (`shouldPersist` already reflects that).
+					log('cluster-member:phase-promising-waiting', {
+						messageHash: record.messageHash
+					});
+					break phaseLoop;
+			}
 		}
 
 		if (shouldPersist) {
@@ -720,13 +739,28 @@ export class ClusterMember implements ICluster {
 		return computeClusterCommitHash(record.messageHash, record.message, record.promises, recordMembershipDigest(record));
 	}
 
-	private computeSigningPayload(hash: string, type: string, rejectReason?: string): Uint8Array {
-		const payload = hash + ':' + type + (rejectReason ? ':' + rejectReason : '');
+	/**
+	 * The exact bytes a vote signature covers: `hash:type[:extra]`, where `extra` is the variant's
+	 * own payload — a reject's `rejectReason`, a conflict's `conflictWith` (see
+	 * {@link signedVoteExtra}), nothing for an approve. Folding the extra in is what makes it
+	 * integrity-protected in transit rather than free-floating prose.
+	 */
+	private computeSigningPayload(hash: string, type: string, extra?: string): Uint8Array {
+		const payload = hash + ':' + type + (extra ? ':' + extra : '');
 		return new TextEncoder().encode(payload);
 	}
 
-	private async signVote(hash: string, type: 'approve' | 'reject', rejectReason?: string): Promise<string> {
-		const payload = this.computeSigningPayload(hash, type, rejectReason);
+	/** The variant-specific field a {@link Signature}'s signed payload carries (see {@link computeSigningPayload}). */
+	private static signedVoteExtra(signature: Signature): string | undefined {
+		switch (signature.type) {
+			case 'reject': return signature.rejectReason;
+			case 'conflict': return signature.conflictWith;
+			default: return undefined;
+		}
+	}
+
+	private async signVote(hash: string, type: Signature['type'], extra?: string): Promise<string> {
+		const payload = this.computeSigningPayload(hash, type, extra);
 		const sigBytes = await this.privateKey.sign(payload);
 		return uint8ArrayToString(sigBytes, 'base64url');
 	}
@@ -763,7 +797,7 @@ export class ClusterMember implements ICluster {
 		}
 		try {
 			const pubKey = publicKeyFromRaw(keyBytes);
-			const payload = this.computeSigningPayload(hash, signature.type, signature.rejectReason);
+			const payload = this.computeSigningPayload(hash, signature.type, ClusterMember.signedVoteExtra(signature));
 			const sigBytes = uint8ArrayFromString(signature.signature, 'base64url');
 			const ok = await pubKey.verify(payload, sigBytes);
 			// Key is bound to peerId: a failed verify is a genuine bad vote from a proven identity → penalize.
@@ -780,7 +814,7 @@ export class ClusterMember implements ICluster {
 		}
 	}
 
-	private async getTransactionPhase(record: ClusterRecord): Promise<TransactionPhase> {
+	private async getTransactionPhase(record: ClusterRecord): Promise<PhaseResult> {
 		const peerCount = Object.keys(record.peers).length;
 		const promiseCount = Object.keys(record.promises).length;
 		const ourId = this.peerId.toString();
@@ -788,36 +822,55 @@ export class ClusterMember implements ICluster {
 		const superMajority = Math.ceil(peerCount * this.superMajorityThreshold);
 		const maxAllowedRejections = peerCount - superMajority;
 
-		// Check for rejections — rejected if too many rejections to ever reach super-majority
+		// Check for rejections — rejected if too many rejections to ever reach super-majority.
+		// ONLY `reject` votes count here: a `conflict` vote is "not now", never a validity
+		// judgement, so it must not push a record into the permanent `Rejected` phase.
 		const rejectedPromises = Object.values(record.promises).filter(s => s.type === 'reject');
+		const conflictPromises = Object.values(record.promises).filter(s => s.type === 'conflict');
 		const rejectedCommits = Object.values(record.commits).filter(s => s.type === 'reject');
 		if (rejectedPromises.length > maxAllowedRejections || this.hasMajority(rejectedCommits.length, peerCount)) {
-			return TransactionPhase.Rejected;
+			return { phase: TransactionPhase.Rejected };
 		}
 
-		// Check if we need to promise
-		if (!record.promises[ourId] && !this.hasConflict(record)) {
-			return TransactionPhase.OurPromiseNeeded;
+		// Conflict votes don't judge validity, but enough of them still make super-majority
+		// unreachable — a distinct terminal outcome (retryable as a fresh transaction) so logs and
+		// reputation-adjacent paths keep meaning what they say.
+		if (conflictPromises.length > 0 && rejectedPromises.length + conflictPromises.length > maxAllowedRejections) {
+			return { phase: TransactionPhase.ConflictSuperseded };
+		}
+
+		// Check if we need to vote. A lost race is answered with a conflict vote, not silence:
+		// absence used to mean both "unreachable" and "refusing in favour of a rival", and the
+		// coordinator could not tell the two apart. Once our conflict vote is merged into
+		// `promises`, this branch is skipped forever — a conflict vote is terminal for this record;
+		// a retry must be a fresh transaction (new messageHash), which `CoordinatorRepo.pend`
+		// already mints per call.
+		if (!record.promises[ourId]) {
+			const conflict = this.findConflict(record);
+			if (conflict) {
+				return { phase: TransactionPhase.OurConflictVoteNeeded, conflictsWith: conflict.blockedBy };
+			}
+			return { phase: TransactionPhase.OurPromiseNeeded };
 		}
 
 		// Check if we have enough approved promises to proceed to commit
 		const approvedPromises = Object.values(record.promises).filter(s => s.type === 'approve');
 		if (approvedPromises.length >= superMajority && !record.commits[ourId]) {
-			return TransactionPhase.OurCommitNeeded;
+			return { phase: TransactionPhase.OurCommitNeeded };
 		}
 
 		// Check if still collecting promises
 		if (promiseCount < peerCount && approvedPromises.length < superMajority) {
-			return TransactionPhase.Promising;
+			return { phase: TransactionPhase.Promising };
 		}
 
 		// Check for consensus
 		const approvedCommits = Object.values(record.commits).filter(s => s.type === 'approve');
 		if (this.hasMajority(approvedCommits.length, peerCount)) {
-			return TransactionPhase.Consensus;
+			return { phase: TransactionPhase.Consensus };
 		}
 
-		return TransactionPhase.Propagating;
+		return { phase: TransactionPhase.Propagating };
 	}
 
 	private hasMajority(count: number, total: number): boolean {
@@ -846,6 +899,33 @@ export class ClusterMember implements ICluster {
 				reason: validationResult.reason
 			});
 		}
+
+		return {
+			...record,
+			promises: {
+				...record.promises,
+				[this.peerId.toString()]: signature
+			}
+		};
+	}
+
+	/**
+	 * Answer a record that lost the deterministic race to a transaction this member already holds
+	 * (`docs/correctness.md` Theorems 1 & 9: the loser is TOLD it lost, not ignored — an unanswered
+	 * loss is indistinguishable from an unreachable cohort at the coordinator). `conflictWith` — the
+	 * winning rival's messageHash — is folded into the signed payload, so the claim is
+	 * integrity-protected in transit and readable without parsing prose. NOT a validity judgement:
+	 * {@link getTransactionPhase} never counts conflict votes toward the permanent-rejection
+	 * threshold, and the coordinator surfaces them as a retryable loss, never a validator rejection.
+	 */
+	private async handleConflictVoteNeeded(record: ClusterRecord, conflictWith: string): Promise<ClusterRecord> {
+		log('cluster-member:action-conflict-vote', {
+			messageHash: record.messageHash,
+			conflictWith
+		});
+		const promiseHash = await this.computePromiseHash(record);
+		const sig = await this.signVote(promiseHash, 'conflict', conflictWith);
+		const signature: Signature = { type: 'conflict', signature: sig, conflictWith };
 
 		return {
 			...record,
@@ -1539,12 +1619,20 @@ export class ClusterMember implements ICluster {
 		};
 	}
 
-	private hasConflict(record: ClusterRecord): boolean {
+	/**
+	 * Scan this member's reservation table (`activeTransactions`) for a held transaction that
+	 * conflicts with `record` AND wins the deterministic race against it. Returns the winner's
+	 * identity — `{ blockedBy: messageHash }` — rather than a bare boolean, because that identity is
+	 * exactly what the resulting conflict vote must name (`Signature.conflictWith`); the old boolean
+	 * lost it. `undefined` means no blocking conflict. Side-effectful on the way through: stale
+	 * entries are swept, and a held transaction that LOSES the race to `record` is cleared.
+	 */
+	private findConflict(record: ClusterRecord): { blockedBy: string } | undefined {
 		const now = Date.now();
 		const staleThresholdMs = 2000; // 2 seconds - allow more time for distributed consensus
 
 		const incomingBlockIds = this.getAffectedBlockIds(record.message.operations);
-		log('cluster-member:hasConflict-check', {
+		log('cluster-member:findConflict-check', {
 			messageHash: record.messageHash,
 			activeCount: this.activeTransactions.size,
 			incomingBlockIds
@@ -1556,7 +1644,7 @@ export class ClusterMember implements ICluster {
 			}
 
 			const existingBlockIds = this.getAffectedBlockIds(state.record.message.operations);
-			log('cluster-member:hasConflict-compare', {
+			log('cluster-member:findConflict-compare', {
 				existing: existingHash,
 				incoming: record.messageHash,
 				existingBlockIds,
@@ -1582,7 +1670,7 @@ export class ClusterMember implements ICluster {
 						existing: existingHash,
 						incoming: record.messageHash
 					});
-					return true; // Reject incoming
+					return { blockedBy: existingHash }; // Reject incoming, naming the winner
 				} else {
 					// Accept incoming, abort existing
 					log('cluster-member:race-accept-incoming', {
@@ -1595,7 +1683,7 @@ export class ClusterMember implements ICluster {
 			}
 		}
 
-		return false; // No blocking conflicts
+		return undefined; // No blocking conflicts
 	}
 
 	/** Number of *approve* promise votes on a record — the count the commit rule uses. */
@@ -1849,11 +1937,11 @@ export class ClusterMember implements ICluster {
 
 			// NOTE: an expired entry already in a terminal phase is deliberately left alone here —
 			// `processUpdate` clears those on the update that made them terminal, so reaching this point
-			// in one means that update never arrived. It is not stranded: `hasConflict`'s 2 s staleness
+			// in one means that update never arrived. It is not stranded: `findConflict`'s 2 s staleness
 			// sweep drops it on the next conflicting arrival. But on a member that then goes idle the
 			// entry lingers until traffic returns. If member memory ever shows entries outliving their
 			// expiration, delete unconditionally here instead of exempting the terminal phases.
-			const phase = await this.getTransactionPhase(state.record);
+			const { phase } = await this.getTransactionPhase(state.record);
 			if (phase !== TransactionPhase.Consensus && phase !== TransactionPhase.Rejected) {
 				this.activeTransactions.delete(messageHash);
 			}

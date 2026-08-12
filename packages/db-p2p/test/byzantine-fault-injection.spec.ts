@@ -81,7 +81,7 @@ const makeSignedPromise = async (privateKey: PrivateKey, record: ClusterRecord, 
 const makeSignedCommit = async (privateKey: PrivateKey, record: ClusterRecord, type: 'approve' | 'reject' = 'approve'): Promise<Signature> => {
 	const commitHash = await computeCommitHash(record);
 	const sig = await signVote(privateKey, commitHash, type);
-	return { type, signature: sig };
+	return type === 'approve' ? { type: 'approve', signature: sig } : { type: 'reject', signature: sig };
 };
 
 const makeHeader = (id: string): BlockHeader => ({
@@ -339,8 +339,13 @@ describe('Byzantine Fault Injection (TEST-10.4.1)', () => {
 		it('Byzantine peer cannot promise approve and reject for the same transaction', async () => {
 			const honest = await makeKeyPair();
 			const byzantine = await makeKeyPair();
+			// Third peer keeps the record below super-majority after the first update (2/3 approvals
+			// at 0.75 ⇒ ceil(2.25)=3 needed), so the member RETAINS it and the second delivery merges
+			// against it — the merge is where equivocation is detected. With only two peers the phase
+			// fixpoint would commit-and-clear on the first delivery and there'd be nothing to merge into.
+			const third = await makeKeyPair();
 			const byzantineId = byzantine.peerId.toString();
-			const peers = makeClusterPeers([honest, byzantine]);
+			const peers = makeClusterPeers([honest, byzantine, third]);
 			const reputation = new PeerReputationService();
 
 			const member = clusterMember({
@@ -439,8 +444,11 @@ describe('Byzantine Fault Injection (TEST-10.4.1)', () => {
 		it('equivocation triggers ban (weight 100 exceeds ban threshold 80)', async () => {
 			const honest = await makeKeyPair();
 			const byzantine = await makeKeyPair();
+			// Third peer keeps the record retained after the first update (see the sibling test above)
+			// so the second delivery merges and the equivocation is seen.
+			const third = await makeKeyPair();
 			const byzantineId = byzantine.peerId.toString();
-			const peers = makeClusterPeers([honest, byzantine]);
+			const peers = makeClusterPeers([honest, byzantine, third]);
 			const reputation = new PeerReputationService();
 
 			const member = clusterMember({

@@ -32,6 +32,27 @@ export class ValidatorRejectionError extends Error {
 	}
 }
 
+/**
+ * The transaction lost a conflict race: one or more members answered with a signed `conflict`
+ * vote (they hold a rival transaction that won the deterministic race on the same blocks) and
+ * approvals fell short of super-majority. Distinct from {@link ValidatorRejectionError} — nobody
+ * judged this write invalid; it lost an optimistic-concurrency race and a fresh retry can win.
+ * `CoordinatorRepo.pend` converts this into a `StaleFailure` with `conflict: true` so the normal
+ * retry machinery (`isConflictFailure`) absorbs it; it should escape as a thrown error only from
+ * paths other than pend. The conflicting peers and the winning hashes ride as structured data
+ * (from the signed `conflictWith` fields), never parsed out of prose.
+ */
+export class ConflictRaceLostError extends Error {
+	constructor(
+		message: string,
+		/** peerId → messageHash of the rival transaction that member holds as the race winner. */
+		readonly conflicts: Record<string, string>
+	) {
+		super(message);
+		this.name = 'ConflictRaceLostError';
+	}
+}
+
 /** Cancel handle for an injected timer; cancels a not-yet-fired timer (safe no-op after fire/cancel). */
 export type TimerCancel = () => void;
 
@@ -333,18 +354,21 @@ export class ClusterCoordinator {
 		const promised = await this.collectPromises(peers, record);
 		const superMajority = Math.ceil(peerCount * this.cfg.superMajorityThreshold);
 
-		// Count approvals and rejections separately
+		// Count approvals, rejections and conflict votes separately. A `conflict` vote is a member
+		// saying "not now — I hold the race winner": it must count toward NEITHER approvals NOR
+		// rejections, or a lost race would masquerade as a validator rejection (permanent) or as
+		// silence (indistinguishable from an unreachable cohort) — both wrong.
 		const promises = promised.record.promises;
 		const approvalCount = Object.values(promises).filter(sig => sig.type === 'approve').length;
 		const rejectionCount = Object.values(promises).filter(sig => sig.type === 'reject').length;
+		const conflictCount = Object.values(promises).filter(sig => sig.type === 'conflict').length;
 
 		// Check if rejections make super-majority impossible
 		// If more than (peerCount - superMajority) nodes reject, we can never reach super-majority
 		const maxAllowedRejections = peerCount - superMajority;
 		if (rejectionCount > maxAllowedRejections) {
 			const rejectReasonsByPeer = Object.fromEntries(Object.entries(promises)
-				.filter(([_, sig]) => sig.type === 'reject')
-				.map(([peerId, sig]) => [peerId, sig.rejectReason ?? 'unknown']));
+				.flatMap(([peerId, sig]) => sig.type === 'reject' ? [[peerId, sig.rejectReason ?? 'unknown'] as const] : []));
 			const rejectReasons = Object.entries(rejectReasonsByPeer)
 				.map(([peerId, reason]) => `${peerId}: ${reason}`)
 				.join('; ');
@@ -369,6 +393,33 @@ export class ClusterCoordinator {
 				rejectReasonsByPeer);
 		}
 
+		// A conflict-answered shortfall is a LOST RACE, not a validator verdict and not silence.
+		// Checked after the rejection threshold (a genuine validator rejection still wins) and
+		// before the generic shortfall (which must stay reserved for the genuinely-silent cohort).
+		if (conflictCount > 0 && approvalCount < superMajority) {
+			const conflicts = Object.fromEntries(Object.entries(promises)
+				.flatMap(([peerId, sig]) => sig.type === 'conflict' ? [[peerId, sig.conflictWith] as const] : []));
+			log('cluster-tx:conflict-race-lost', {
+				messageHash: record.messageHash,
+				peerCount,
+				approvals: approvalCount,
+				rejections: rejectionCount,
+				conflicts,
+				superMajority
+			});
+			this.updateTransactionRecord(promised.record, 'conflict-race-lost');
+			// Broadcast only when the merged record itself PROVES the transaction can no longer reach
+			// super-majority (members re-derive ConflictSuperseded/Rejected from the signed votes and
+			// clear their reservations immediately). Below that bar the record proves nothing and a
+			// broadcast would be the unauthenticated "forget this" the shortfall NOTE below refuses.
+			if (rejectionCount + conflictCount > maxAllowedRejections) {
+				this.broadcastAbandonment(promised.record, 'conflict-race-lost');
+			}
+			throw new ConflictRaceLostError(
+				`Conflict race lost: ${conflictCount}/${peerCount} member(s) hold a conflicting winner (${approvalCount}/${superMajority} approvals)`,
+				conflicts);
+		}
+
 		if (peerCount > 1 && approvalCount < superMajority) {
 			log('cluster-tx:supermajority-failed', {
 				messageHash: record.messageHash,
@@ -379,14 +430,15 @@ export class ClusterCoordinator {
 				threshold: this.cfg.superMajorityThreshold
 			});
 			this.updateTransactionRecord(promised.record, 'supermajority-failed');
-			// NOTE: deliberately NOT broadcast, unlike the rejected-by-validators branch above. We get
-			// here mostly because peers did not answer at all, so the record carries no signed evidence
-			// that the transaction is dead — a broadcast would be an unauthenticated "forget this" that
-			// any caller could use to clear a live transaction out of a member's reservation table.
-			// Members that DID vote are freed by their own staleness sweep instead. Once members answer
-			// a lost conflict race with a signed vote rather than staying silent
-			// (ticket member-must-answer-a-lost-conflict-race), the interesting half of this case becomes
-			// proof-carrying too and can use the same broadcastAbandonment call.
+			// NOTE: deliberately NOT broadcast, unlike the rejected-by-validators branch above. With
+			// conflict-answered shortfalls peeled off above, we get here only because peers did not
+			// answer at all, so the record carries no signed evidence that the transaction is dead — a
+			// broadcast would be an unauthenticated "forget this" that any caller could use to clear a
+			// live transaction out of a member's reservation table. Members that DID vote are freed by
+			// their own staleness sweep instead.
+			// NOTE: the message below is load-bearing wire text — the consuming repo
+			// (sereus cadre-core control-write-retry) matches it verbatim to retry a genuinely-silent
+			// cohort. Keep it byte-identical, and never fold conflict votes into its rejection count.
 			throw new Error(`Failed to get super-majority: ${approvalCount}/${peerCount} approvals (needed ${superMajority}, ${rejectionCount} rejections)`);
 		}
 

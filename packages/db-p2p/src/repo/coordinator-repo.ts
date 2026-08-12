@@ -1,6 +1,6 @@
 import type { PendRequest, ActionBlocks, IRepo, MessageOptions, CommitResult, GetBlockResults, PendResult, StaleFailure, BlockGets, CommitRequest, RepoMessage, IKeyNetwork, ICluster, ClusterConsensusConfig, BlockId, ActionRev, ActionContext, ClusterRecord } from "@optimystic/db-core";
 import { LruMap, blockIdsForTransforms, highestStaleAt, DEFAULT_SUPER_MAJORITY_THRESHOLD } from "@optimystic/db-core";
-import { ClusterCoordinator, ValidatorRejectionError } from "./cluster-coordinator.js";
+import { ClusterCoordinator, ConflictRaceLostError, ValidatorRejectionError } from "./cluster-coordinator.js";
 import type { PeerId } from "@libp2p/interface";
 import { peerIdFromString } from "@libp2p/peer-id";
 import type { FretService } from "p2p-fret";
@@ -943,6 +943,14 @@ export class CoordinatorRepo implements IRepo {
 			};
 		} catch (error) {
 			this.log('coordinator-repo:pend-error', { actionId: request.actionId, error: (error as Error).message });
+			// A lost conflict race is an optimistic-concurrency loss, not a fault: surface it as the
+			// StaleFailure shape the retry machinery already understands (`Collection.sync` and the
+			// multi-collection pendPhase retry it via `isConflictFailure`), exactly as a confirmed
+			// stale revision is. `staleAt` stays absent deliberately — it is confirmed-only, and a
+			// lost race is a rival *pend* holding the blocks, not a revision claim.
+			if (error instanceof ConflictRaceLostError) {
+				return { success: false, conflict: true, reason: error.message };
+			}
 			const stale = await this.classifyStaleRejection(error, request, allBlockIds);
 			if (stale) return stale;
 			throw error;

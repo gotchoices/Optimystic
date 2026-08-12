@@ -71,7 +71,7 @@ const makeSignedPromise = async (privateKey: PrivateKey, record: ClusterRecord, 
 const makeSignedCommit = async (privateKey: PrivateKey, record: ClusterRecord, type: 'approve' | 'reject' = 'approve'): Promise<Signature> => {
 	const commitHash = await computeCommitHash(record);
 	const sig = await signVote(privateKey, commitHash, type);
-	return { type, signature: sig };
+	return type === 'approve' ? { type: 'approve', signature: sig } : { type: 'reject', signature: sig };
 };
 
 const makeHeader = (id: string): BlockHeader => ({
@@ -609,6 +609,110 @@ describe('ClusterMember', () => {
 			const result = await clusterMemberInstance.update(record2);
 			expect(result.promises[ourId]).to.not.equal(undefined);
 		});
+
+		// Regression (2-member-must-answer-a-lost-conflict-race): a member that resolves a race in
+		// favour of a transaction it already holds used to return the loser UNCHANGED — no vote at
+		// all — so the coordinator counted "0 approvals" and reported the loss as an unreachable
+		// cohort. The member must answer with a signed `conflict` vote naming the winner.
+		it('answers a lost conflict race with a conflict vote naming the winner', async () => {
+			const peer2 = await makeKeyPair();
+			const peer3 = await makeKeyPair();
+			const ourId = selfKeyPair.peerId.toString();
+			const peers = makeClusterPeers([selfKeyPair, peer2, peer3]);
+
+			// Pend X on block-shared: our own approve lands and the record is retained (Promising).
+			const recordX = await createClusterRecord(peers, makePendOperation('a-x', 'block-shared'));
+			const afterX = await clusterMemberInstance.update(recordX);
+			expect(afterX.promises[ourId]!.type).to.equal('approve');
+
+			// Conflicting pend Y on the same block. X holds 1 approval vs Y's 0, so resolveRace is
+			// deterministically keep-existing. Before the fix Y came back with promises == {}.
+			const recordY = await createClusterRecord(peers, makePendOperation('a-y', 'block-shared'));
+			const result = await clusterMemberInstance.update(recordY);
+
+			const vote = result.promises[ourId];
+			if (vote?.type !== 'conflict') expect.fail(`expected a conflict vote, got ${vote?.type ?? 'no vote at all'}`);
+			expect(vote.conflictWith, 'the vote names the winning transaction').to.equal(recordX.messageHash);
+			expect(result.commits[ourId], 'a lost race never produces a commit').to.equal(undefined);
+		});
+
+		it('produces a conflict vote that survives signature validation on redelivery', async () => {
+			const peer2 = await makeKeyPair();
+			const peer3 = await makeKeyPair();
+			const ourId = selfKeyPair.peerId.toString();
+			const peers = makeClusterPeers([selfKeyPair, peer2, peer3]);
+
+			const recordX = await createClusterRecord(peers, makePendOperation('a-x', 'block-shared'));
+			await clusterMemberInstance.update(recordX);
+			const recordY = await createClusterRecord(peers, makePendOperation('a-y', 'block-shared'));
+			const voted = await clusterMemberInstance.update(recordY);
+
+			// The coordinator merges our vote and re-presents the record (e.g. commit-broadcast retry).
+			// validateSignatures then reconstructs the conflict vote's signed payload — including
+			// `conflictWith` — and must find it valid; and the member must not vote again.
+			const redelivered = await clusterMemberInstance.update({ ...voted, promises: { ...voted.promises } });
+			const vote = redelivered.promises[ourId];
+			if (vote?.type !== 'conflict') expect.fail(`expected the conflict vote to persist, got ${vote?.type}`);
+			expect(vote.conflictWith).to.equal(recordX.messageHash);
+		});
+
+		it('does not reserve the blocks of a transaction it conflict-voted', async () => {
+			const peer2 = await makeKeyPair();
+			const peer3 = await makeKeyPair();
+			const ourId = selfKeyPair.peerId.toString();
+			const peers = makeClusterPeers([selfKeyPair, peer2, peer3]);
+
+			// X reserves block-shared.
+			const recordX = await createClusterRecord(peers, makePendOperation('a-x', 'block-shared'));
+			await clusterMemberInstance.update(recordX);
+
+			// Y touches block-shared (loses to X) AND block-y-only. If the member wrongly retained Y
+			// after conflict-voting it, block-y-only would now be reserved too.
+			const transformsY: Transforms = {
+				inserts: { 'block-shared': makeBlock('block-shared'), 'block-y-only': makeBlock('block-y-only') },
+				updates: {},
+				deletes: []
+			};
+			const recordY = await createClusterRecord(peers, [{ pend: { actionId: 'a-y', transforms: transformsY, policy: 'c' } }]);
+			const votedY = await clusterMemberInstance.update(recordY);
+			expect(votedY.promises[ourId]!.type).to.equal('conflict');
+
+			// Z touches only block-y-only: no overlap with X. It must get a clean approve — a conflict
+			// here would mean the loser Y was persisted as a second reservation.
+			const recordZ = await createClusterRecord(peers, makePendOperation('a-z', 'block-y-only'));
+			const resultZ = await clusterMemberInstance.update(recordZ);
+			expect(resultZ.promises[ourId]!.type, 'the conflict-voted loser must not hold its blocks').to.equal('approve');
+		});
+	});
+
+	describe('phase fixpoint (2-member-must-answer-a-lost-conflict-race)', () => {
+		// A member whose promise the coordinator never collected (possible whenever super-majority is
+		// below full cohort size, e.g. 4 peers at 0.75 ⇒ 3) receives the commit-phase record, and used
+		// to stop after adding its promise: the record was then in OurCommitNeeded but nobody re-checked,
+		// so its commit waited for the coordinator's next broadcast retry. The phase loop must drive
+		// promise AND commit in the same delivery.
+		it('adds both promise and commit in one delivery when the record already has super-majority', async () => {
+			const peer2 = await makeKeyPair();
+			const peer3 = await makeKeyPair();
+			const peer4 = await makeKeyPair();
+			const ourId = selfKeyPair.peerId.toString();
+			const peers = makeClusterPeers([selfKeyPair, peer2, peer3, peer4]);
+
+			const baseRecord = await createClusterRecord(peers, makeGetOperation(['block-1']));
+			const record: ClusterRecord = {
+				...baseRecord,
+				promises: {
+					[peer2.peerId.toString()]: await makeSignedPromise(peer2.privateKey, baseRecord),
+					[peer3.peerId.toString()]: await makeSignedPromise(peer3.privateKey, baseRecord),
+					[peer4.peerId.toString()]: await makeSignedPromise(peer4.privateKey, baseRecord)
+				}
+			};
+
+			const result = await clusterMemberInstance.update(record);
+			expect(result.promises[ourId]!.type).to.equal('approve');
+			expect(result.commits[ourId], 'commit must land in the SAME delivery, not the next retry').to.not.equal(undefined);
+			expect(result.commits[ourId]!.type).to.equal('approve');
+		});
 	});
 
 	describe('promise/commit phase edge cases (TEST-5.1.1)', () => {
@@ -838,7 +942,10 @@ describe('ClusterMember', () => {
 		it('resolves conflict deterministically based on approval count', async () => {
 			const ourId = selfKeyPair.peerId.toString();
 			const peer2 = await makeKeyPair();
-			const peers = makeClusterPeers([selfKeyPair, peer2]);
+			// Third peer keeps record1 below super-majority (2/3 approvals at 0.75 ⇒ 3 needed) so the
+			// member retains it as the pending race winner instead of committing-and-clearing it.
+			const peer3 = await makeKeyPair();
+			const peers = makeClusterPeers([selfKeyPair, peer2, peer3]);
 
 			const baseRecord1 = await createClusterRecord(
 				peers,
@@ -860,10 +967,13 @@ describe('ClusterMember', () => {
 			);
 
 			// record1 carries two approvals (peer2's plus this member's own) against record2's zero, so
-			// it keeps the block: the member withholds its vote from record2 rather than displacing a
-			// more-progressed rival.
+			// it keeps the block: the member refuses record2 — but with a signed CONFLICT vote naming
+			// the winner, never by staying silent (which was indistinguishable from being unreachable).
 			const result = await clusterMemberInstance.update(record2);
-			expect(result.promises[ourId], 'the losing record must not collect our promise').to.equal(undefined);
+			const vote = result.promises[ourId];
+			if (vote?.type !== 'conflict') expect.fail(`the losing record gets a conflict vote, got ${vote?.type ?? 'no vote at all'}`);
+			expect(vote.conflictWith).to.equal(record1.messageHash);
+			expect(result.commits[ourId]).to.equal(undefined);
 		});
 	});
 
@@ -1120,13 +1230,13 @@ describe('ClusterMember', () => {
 			const peers = makeClusterPeers([selfKeyPair]);
 			const record = await createClusterRecord(peers, makePendOperation('a1', 'block-1'));
 
-			// Drive to consensus: promise phase, then commit phase reaches consensus and
-			// invokes handleConsensus, where throwingRepo.pend throws → applyConsensusOperation
-			// throws → handleConsensus rolls back the in-memory guard and rethrows.
-			const afterPromise = await member.update(record);
+			// Drive to consensus: the phase fixpoint takes a single-peer record through promise →
+			// commit → consensus in ONE delivery, where throwingRepo.pend throws →
+			// applyConsensusOperation throws → handleConsensus rolls back the in-memory guard and
+			// rethrows out of this first update.
 			let threw = false;
 			try {
-				await member.update(afterPromise);
+				await member.update(record);
 			} catch (err) {
 				threw = true;
 				expect((err as Error).message).to.equal('transient storage I/O fault');
@@ -1145,9 +1255,10 @@ describe('ClusterMember', () => {
 			expect(await stateStore.wasExecuted(record.messageHash)).to.equal(false);
 			member.dispose();
 
-			// Redeliver the same consensus record against a fresh, non-throwing repo sharing
-			// the same persistent store (post-restart). Because the durable marker was never
-			// written, the operation must actually re-run rather than being silently skipped.
+			// Redeliver the same record against a fresh, non-throwing repo sharing the same
+			// persistent store (post-restart). Because the durable marker was never written, the
+			// operation must actually re-run (the fixpoint re-derives promise → commit → consensus)
+			// rather than being silently skipped.
 			const healthyRepo = new MockRepo();
 			const restartedMember = clusterMember({
 				storageRepo: healthyRepo,
@@ -1156,12 +1267,7 @@ describe('ClusterMember', () => {
 				privateKey: selfKeyPair.privateKey,
 				stateStore
 			});
-			const commitSig = await makeSignedCommit(selfKeyPair.privateKey, afterPromise);
-			const fullRecord: ClusterRecord = {
-				...afterPromise,
-				commits: { ...afterPromise.commits, [selfKeyPair.peerId.toString()]: commitSig }
-			};
-			await restartedMember.update(fullRecord);
+			await restartedMember.update(record);
 			expect(healthyRepo.pendCalls.length).to.equal(1);
 			// Apply succeeded this time, so the durable marker is now set — wait for that write to land.
 			await waitFor(async () => await stateStore.wasExecuted(record.messageHash), { description: 'the durable executed marker was written after a successful apply' });
@@ -1270,8 +1376,9 @@ describe('ClusterMember', () => {
 			const result = await validatingMember.update(record);
 
 			// Should have a reject promise
-			expect(result.promises[ourId]?.type).to.equal('reject');
-			expect(result.promises[ourId]?.rejectReason).to.include('Validation failed');
+			const vote = result.promises[ourId];
+			if (vote?.type !== 'reject') expect.fail(`expected a reject vote, got ${vote?.type}`);
+			expect(vote.rejectReason).to.include('Validation failed');
 		});
 
 		it('does not retain a transaction it rejected itself', async () => {
