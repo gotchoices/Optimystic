@@ -365,6 +365,29 @@ private resolveRace(existing: ClusterRecord, incoming: ClusterRecord): 'keep-exi
 - **Automatic Abort**: Losing transaction is cleanly aborted
 - **Parallel Non-Conflicting**: Transactions on different blocks proceed in parallel
 
+### Releasing an Abandoned Transaction
+
+`activeTransactions` doubles as each member's reservation table over blocks: while an entry sits
+there, `hasConflict` measures every later transaction against it. A member drops an entry as soon as
+it can prove the transaction is finished — consensus reached, or enough signed `reject` votes that
+super-majority is unreachable (`TransactionPhase.Rejected`, including the case where the member's own
+vote is the one that makes it unreachable). Absent such proof the only release is the 2-second
+staleness sweep inside `hasConflict`.
+
+That leaves the coordinator responsible for telling members about an abandonment they cannot see for
+themselves. When it abandons a transaction at the `rejected-by-validators` branch it replays the
+merged record — the one carrying the signed rejections — to every peer in the cohort
+(`ClusterCoordinator.broadcastAbandonment`):
+
+- **No new message type.** It is the same `update()` call every phase uses, so a member re-derives
+  `Rejected` from votes it verifies itself and clears; nothing about the wire format changes.
+- **Proof-carrying, so trust is not required.** A member accepts the release only because the
+  signatures it is shown prove it, which is why the `supermajority-failed` branch — where peers were
+  silent and the record therefore proves nothing — deliberately does *not* broadcast.
+- **Fire-and-forget.** The coordinator throws to its caller immediately and never awaits or rethrows
+  delivery: an abandonment must not turn into a different failure. The staleness sweep remains the
+  backstop when delivery fails, and a retry that outruns the broadcast simply loses one more race.
+
 ## Cryptographic Security
 
 ### Signature System

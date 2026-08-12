@@ -128,6 +128,32 @@ rejections: `cluster-repo.ts:773` and `cluster-coordinator.ts:339`.
 - Delete the now-false comment at `:461-462` and make the bare `Promising` case explicit about
   what it means (all it should cover is "we have already voted, still waiting on others").
 
+**2b. Added by the review of `abandoned-pend-holds-the-block` — drive the phase to a fixpoint.**
+You are about to add two more phases here, so the pattern this arm is about is worth fixing
+in the same pass rather than repeating.
+
+`processUpdate` handles exactly one phase per delivery, and each branch that changes the
+record then re-checks *by hand* for the one follow-on phase its author had in mind:
+`OurCommitNeeded` re-checks for `Consensus`, and `abandoned-pend-holds-the-block` just added a
+re-check for `Rejected` after `OurPromiseNeeded`. Any follow-on phase nobody thought to
+re-check is silently skipped until the next delivery arrives.
+
+That is not hypothetical. `getTransactionPhase` tests `!record.promises[ourId]` *before* it
+tests the commit condition, so a member whose promise the coordinator never collected — normal
+whenever the cohort is large enough that super-majority is less than the full peer count, e.g.
+four peers at the default 0.75 threshold — receives the commit-phase record, lands in
+`OurPromiseNeeded`, adds its promise, and stops. It is now in `OurCommitNeeded` but does not
+act on it, so its commit waits for the coordinator's next commit-broadcast retry. Verified by
+running it: a 4-peer record carrying three approvals and no vote from the member comes back
+with the member's `approve` in `promises` and nothing in `commits`.
+
+The behaviour is correct — the retry loop covers it — so this is latency and fragility, not a
+lost commit. The fix is one invariant instead of N hand-written re-checks: after handling a
+phase that mutated the record, recompute the phase and handle it again until it stops changing
+(bounded — the phases only ever advance — with a small iteration cap so a bug cannot spin).
+Then the two existing ad-hoc re-checks and the two phases this ticket adds all fall out of the
+same loop, and the next phase added does too.
+
 Consequence worth stating in the code: **a conflict vote is terminal for that record**. Once
 it is merged into the promise map, `!record.promises[ourId]` is false forever, so the member
 will never approve that same `messageHash`. A retry must be a *fresh* transaction, not a

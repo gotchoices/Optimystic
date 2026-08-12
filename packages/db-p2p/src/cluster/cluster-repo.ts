@@ -408,17 +408,19 @@ export class ClusterMember implements ICluster {
 					messageHash: record.messageHash
 				});
 				currentRecord = await this.handlePromiseNeeded(currentRecord);
-				// Our own vote can be terminal: `handlePromiseNeeded` appends an approve OR a reject,
-				// and under the default unanimity threshold (maxAllowedRejections === 0) a single
-				// reject already puts the record in `Rejected` — unreachable forever. Retaining it
-				// would leave it in `activeTransactions`, which is this member's reservation table
-				// over blocks (`hasConflict`), so a transaction the member itself proved dead would
-				// go on blocking every later transaction touching those blocks until the staleness
-				// sweep fires. Re-evaluate here, mirroring the `OurCommitNeeded` branch below.
 				log('cluster-member:action-promise-complete', {
 					messageHash: record.messageHash,
 					promises: Object.keys(currentRecord.promises ?? {})
 				});
+				// Our own vote can be terminal: `handlePromiseNeeded` appends an approve OR a reject, and
+				// wherever `maxAllowedRejections` is 0 — which the default 0.75 threshold yields for every
+				// cohort of three or fewer, since ceil(0.75·n) === n there — that one reject already puts
+				// the record in `Rejected`, unreachable forever. Retaining it would leave it in
+				// `activeTransactions`, this member's reservation table over blocks (`hasConflict`), so a
+				// transaction the member itself proved dead would go on blocking every later transaction
+				// touching those blocks until the staleness sweep fires. Re-evaluate here, mirroring the
+				// `OurCommitNeeded` branch below. In a larger cohort the re-check simply finds a
+				// non-terminal phase and the record is retained as before.
 				{
 					const newPhase = await this.getTransactionPhase(currentRecord);
 					if (newPhase === TransactionPhase.Rejected) {
@@ -1845,6 +1847,12 @@ export class ClusterMember implements ICluster {
 			const state = this.activeTransactions.get(messageHash);
 			if (!state) continue;
 
+			// NOTE: an expired entry already in a terminal phase is deliberately left alone here —
+			// `processUpdate` clears those on the update that made them terminal, so reaching this point
+			// in one means that update never arrived. It is not stranded: `hasConflict`'s 2 s staleness
+			// sweep drops it on the next conflicting arrival. But on a member that then goes idle the
+			// entry lingers until traffic returns. If member memory ever shows entries outliving their
+			// expiration, delete unconditionally here instead of exempting the terminal phases.
 			const phase = await this.getTransactionPhase(state.record);
 			if (phase !== TransactionPhase.Consensus && phase !== TransactionPhase.Rejected) {
 				this.activeTransactions.delete(messageHash);

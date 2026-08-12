@@ -835,7 +835,8 @@ describe('ClusterMember', () => {
 	});
 
 	describe('race resolution', () => {
-		it('resolves conflict deterministically based on promise count', async () => {
+		it('resolves conflict deterministically based on approval count', async () => {
+			const ourId = selfKeyPair.peerId.toString();
 			const peer2 = await makeKeyPair();
 			const peers = makeClusterPeers([selfKeyPair, peer2]);
 
@@ -858,10 +859,11 @@ describe('ClusterMember', () => {
 				makePendOperation('a2', 'block-shared')
 			);
 
-			// record1 has more promises, so it should win
+			// record1 carries two approvals (peer2's plus this member's own) against record2's zero, so
+			// it keeps the block: the member withholds its vote from record2 rather than displacing a
+			// more-progressed rival.
 			const result = await clusterMemberInstance.update(record2);
-			// The result should still be valid - race resolution doesn't throw
-			expect(result).to.not.equal(undefined);
+			expect(result.promises[ourId], 'the losing record must not collect our promise').to.equal(undefined);
 		});
 	});
 
