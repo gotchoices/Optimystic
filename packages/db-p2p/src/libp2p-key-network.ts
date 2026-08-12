@@ -201,7 +201,8 @@ export class Libp2pKeyPeerNetwork implements IKeyNetwork, IPeerNetwork {
 		// quereus-plugin-optimystic's collection-factory.ts), so these defaults are always what
 		// is in force and no operator can tune them. If tuning `gracePeriodMs` is ever needed,
 		// those two sites have to thread the config through first. Low urgency: a grace-period denial no longer fails the caller, it only costs
-		// a write the ~1s findCoordinator retry window before self-coordinating.
+		// a write the findCoordinator retry window before self-coordinating — and only when that
+		// window is worth paying at all (see `retryCouldImprove`), so an isolated node pays nothing.
 		this.selfCoordinationConfig = {
 			gracePeriodMs: selfCoordinationConfig?.gracePeriodMs ?? 30_000,
 			shrinkageThreshold: selfCoordinationConfig?.shrinkageThreshold ?? 0.5,
@@ -341,10 +342,28 @@ export class Libp2pKeyPeerNetwork implements IKeyNetwork, IPeerNetwork {
 	 * it saves. `getDialQueue` is non-optional on the Libp2p interface, so an absent method
 	 * only ever means a test mock — treated as "no evidence of an in-flight dial", exactly as
 	 * `getConnections?.()` is handled elsewhere.
+	 *
+	 * NOTE: this bounds — it does not eliminate — the futile window for the motivating case (a
+	 * node whose only configured bootstrap is unreachable). FRET re-probes such a peer at most
+	 * once per its capped 32s backoff (`fret-service.ts` `recordBackoff`: base 1000ms × factor
+	 * ≤32), and each probe's dial can sit `active` for libp2p's 10s `DIAL_TIMEOUT` — so up to
+	 * roughly a third of wall-clock still has a dial in flight, and lookups in those stretches
+	 * still pay ~1s. Paying there is correct (a succeeding probe makes the peer selectable);
+	 * revisit only if either upstream constant moves far enough to make the duty cycle ~1.
 	 */
 	private dialsInFlight(): number {
 		return (this.libp2p.getDialQueue?.() ?? [])
 			.filter(d => d.status === 'queued' || d.status === 'active').length;
+	}
+
+	/**
+	 * The caller-independent half of eligibility: this peer is neither excluded by the caller
+	 * nor banned by reputation. Shared by all three places `findCoordinator` narrows a candidate
+	 * list — the FRET tier, the connected-peer fallback, and the retry-futility input — so the
+	 * futility test can never disagree with the tiers about who is pickable.
+	 */
+	private isSelectable(id: string, excluded: Set<string>): boolean {
+		return !excluded.has(id) && !(this.reputation?.isBanned(id));
 	}
 
 	private persistState(): void {
@@ -640,7 +659,7 @@ export class Libp2pKeyPeerNetwork implements IKeyNetwork, IPeerNetwork {
 					return selfAllowedThisAttempt
 				}
 				const connectedFretIds = ids
-					.filter(id => !excludedSet.has(id) && !(this.reputation?.isBanned(id)))
+					.filter(id => this.isSelectable(id, excludedSet))
 					.filter(id => connectedSet.has(id) || (id === selfStr && isSelfAdmissible()))
 					.sort((a, b) => (this.reputation?.getScore(a) ?? 0) - (this.reputation?.getScore(b) ?? 0))
 				this.log('findCoordinator:fret-connected key=%s count=%d peers=%o', keyStr, connectedFretIds.length, connectedFretIds.map(s => s.substring(0, 12)))
@@ -676,7 +695,7 @@ export class Libp2pKeyPeerNetwork implements IKeyNetwork, IPeerNetwork {
 			// Being remote-only, this tier needs no self-coordination guard check, unlike the
 			// FRET tier above.
 			const connectedCandidates = connected
-				.filter(p => !excludedSet.has(p.toString()) && !(this.reputation?.isBanned(p.toString())))
+				.filter(p => this.isSelectable(p.toString(), excludedSet))
 				.sort((a, b) => (this.reputation?.getScore(a.toString()) ?? 0) - (this.reputation?.getScore(b.toString()) ?? 0))
 				.map(p => p.toString())
 			const { ranked: connRanked, droppedUnconfirmed: connDroppedUnconfirmed } = await this.filterByMembership(connectedCandidates)
@@ -692,10 +711,14 @@ export class Libp2pKeyPeerNetwork implements IKeyNetwork, IPeerNetwork {
 			// If no connections and not the last attempt, wait and retry
 			if (connected.length === 0 && attempt < maxRetries - 1) {
 				// Exclusion/ban filtered — a neighbour we may never pick is not something to
-				// wait for. The membership filter is deliberately NOT applied: an `unknown`
-				// (not-yet-identified) non-self neighbour is exactly the peer that flips to
-				// `serves` inside the retry window, so its presence must keep the window.
-				const knowable = ids.filter(id => !excludedSet.has(id) && !(this.reputation?.isBanned(id)));
+				// wait for. This network's membership filter (peerStore protocols) is deliberately
+				// NOT applied: a neighbour still `unknown` to it is exactly the peer that flips to
+				// `serves` inside the retry window, so its presence must keep the window. FRET's
+				// own ring membership has already applied a stricter cut upstream — `getNeighbors`
+				// returns confirmed ring members only — so a configured-but-never-reached bootstrap
+				// peer is absent from `ids` entirely, and only the dial-in-flight signal below can
+				// keep the window for it.
+				const knowable = ids.filter(id => this.isSelectable(id, excludedSet));
 				if (!this.retryCouldImprove(knowable)) {
 					this.log('findCoordinator:retry-futile key=%s neighbors=%d dialsInFlight=%d mode=%s hwm=%d',
 						keyStr, knowable.length, this.dialsInFlight(), this.networkMode, this.networkHighWaterMark);
