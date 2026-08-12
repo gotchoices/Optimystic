@@ -70,6 +70,17 @@ interface ClusterLatestQuery {
 	 * sole holder.
 	 */
 	silent: string[];
+	/**
+	 * Highest revision any cohort peer CLAIMED when no claim met the corroboration quorum
+	 * (set only alongside an absent `corroborated`). The claim failed quorum, so it must
+	 * never drive restoration — it exists so `get` can report content it serves below this
+	 * revision as possibly behind ({@link GetBlockResult.unconfirmedAheadRev}) instead of
+	 * confirmed. When a quorum DOES corroborate, higher uncorroborated claims are dropped
+	 * as before: the quorum's affirmative answer outweighs a lone voter (which may simply
+	 * be ahead on an in-flight commit), and stamping doubt there would mark every read that
+	 * races a commit broadcast.
+	 */
+	uncorroboratedRev?: number;
 }
 
 /**
@@ -733,7 +744,11 @@ export class CoordinatorRepo implements IRepo {
 				required: quorumSize(claims.length, this.simpleMajorityThreshold, capacity),
 				repairCorroborationClusterSize: this.repairCorroborationClusterSize
 			});
-			return { local, silent };
+			// The claims themselves must not drive restoration — but their existence is
+			// evidence the caller needs: an answer served below the highest claim cannot be
+			// confirmed current (see ClusterLatestQuery.uncorroboratedRev).
+			const uncorroboratedRev = claims.length > 0 ? Math.max(...claims.map(c => c.rev)) : undefined;
+			return { local, silent, ...(uncorroboratedRev !== undefined ? { uncorroboratedRev } : {}) };
 		}
 
 		// Best-effort: penalize peers whose claim contradicts the corroborated pair

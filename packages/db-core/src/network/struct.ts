@@ -179,6 +179,16 @@ export type GetBlockResult = {
 	 *  guess, not an authoritative absent. Every producer that omits it (including
 	 *  TestTransactor) keeps meaning "authoritative". */
 	unavailable?: BlockUnavailableReason;
+	/** Set when this repo served committed content it could NOT confirm is current: its
+	 *  freshness consult did not converge AND a cohort peer claimed a strictly higher
+	 *  revision than the one served, within the view the caller asked for (unpinned, or
+	 *  pinned at or above the claim). Carries that claimed revision. The claim did not
+	 *  drive a successful repair — it failed the read-repair corroboration quorum, or was
+	 *  corroborated but the content could not be acquired — so it is evidence of DOUBT,
+	 *  never a revision to adopt. Distinct from `unavailable`, which is about EXISTENCE:
+	 *  the content here is real, it may just be behind. Absent = confirmed, so every
+	 *  producer that omits it keeps its meaning. */
+	unconfirmedAheadRev?: number;
 };
 
 /**
@@ -191,6 +201,21 @@ export class BlockUnavailableError extends Error {
 	constructor(readonly blockId: BlockId, readonly reason: BlockUnavailableReason) {
 		super(`Block ${blockId} is unavailable (${reason}): the repo could not determine whether it exists`);
 		this.name = 'BlockUnavailableError';
+	}
+}
+
+/**
+ * Thrown by an unpinned ("give me latest") block read whose surviving answer carries
+ * {@link GetBlockResult.unconfirmedAheadRev}: every reachable coordinator served content
+ * it could not confirm is current, while a cohort peer claimed a strictly higher revision
+ * nothing could corroborate or refute. Sibling of {@link BlockUnavailableError} — that one
+ * is about EXISTENCE (blockless answer, could not find out), this one about CURRENCY (real
+ * content, possibly behind). Not a StaleFailure: `Collection.sync` does not retry it.
+ */
+export class BlockPossiblyStaleError extends Error {
+	constructor(readonly blockId: BlockId, readonly claimedRev: number) {
+		super(`Block ${blockId} may be stale: a cohort peer claimed rev ${claimedRev} that no reachable coordinator could confirm or refute`);
+		this.name = 'BlockPossiblyStaleError';
 	}
 }
 

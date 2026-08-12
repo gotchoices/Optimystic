@@ -1,3 +1,10 @@
+<!-- resume-note -->
+RESUME: A prior agent run on this ticket did not complete.
+  Prior run: 2026-08-12T14:47:13.803Z (agent: claude)
+  Log file: C:\projects\optimystic\tickets\.logs\1-coordinator-serves-stale-data-as-if-confirmed.implement.2026-08-12T14-47-13-803Z.log
+Read the log to see what was done. Resume where it left off.
+If the prior run hit a timeout or repeated error, be cautious not to rush into the same situation.
+<!-- /resume-note -->
 description: When a node can't check whether its copy of a shared table is current, it hands out the copy anyway as if it were confirmed. The node reading it has no way to tell, so it keeps working from out-of-date data forever and nothing ever reports a problem.
 prereq:
 files: packages/db-p2p/src/repo/coordinator-repo.ts, packages/db-core/src/network/struct.ts, packages/db-core/src/transactor/network-transactor.ts, packages/db-core/src/transactor/transactor-source.ts, packages/db-core/src/collection/collection.ts, packages/db-p2p/test/coordinator-repo-unavailable.spec.ts, packages/db-core/test/network-transactor.spec.ts
