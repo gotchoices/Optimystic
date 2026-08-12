@@ -532,14 +532,35 @@ describe('TransactorSource', () => {
 				expect(src.getReadDependencies()).to.be.empty
 			})
 
-			it('a PINNED read still serves the block — an older view was legitimately asked for', async () => {
-				// The coordinator does not stamp reads pinned below the claim, so this is
-				// belt-and-braces — but a producer that stamps anyway must not break pinned views.
+			it('a read pinned BELOW the claim still serves the block — an older view was legitimately asked for', async () => {
+				// Rev-1 content is exactly what a rev-1 view asked for; a peer claiming rev 2 says
+				// nothing about THAT view. This is what keeps a collection's context-pinned data
+				// reads quiet while its unpinned tail read speaks up.
 				const pinned: ActionContext = { committed: [{ actionId: 'a1' as ActionId, rev: 1 }], rev: 1 }
 				const src = new TransactorSource<IBlock>('coll', makeFixedEntryTransactor(doubtedEntry), pinned)
 
 				const served = await src.tryGet('doubted-block')
 				expect(served).to.deep.equal(block)
+			})
+
+			it('a read pinned AT OR ABOVE the claim throws — that snapshot should contain the claimed revision', async () => {
+				// The coordinator stamps these deliberately (it applies the same at/above test
+				// before marking): the pin says "give me the view as of rev 2 or later", and the
+				// content served is a revision the cohort says has been superseded INSIDE that
+				// view. Serving it would hand a collection a snapshot missing a committed update,
+				// silently — and record a read dependency at the stale revision on top.
+				const pinned: ActionContext = { committed: [{ actionId: 'a1' as ActionId, rev: 2 }], rev: 2 }
+				const src = new TransactorSource<IBlock>('coll', makeFixedEntryTransactor(doubtedEntry), pinned)
+
+				let thrown: unknown
+				try {
+					await src.tryGet('doubted-block')
+				} catch (err) {
+					thrown = err
+				}
+				expect(thrown, 'tryGet must throw, not serve into a snapshot that should hold the claim').to.be.instanceOf(BlockPossiblyStaleError)
+				expect((thrown as BlockPossiblyStaleError).claimedRev).to.equal(2)
+				expect(src.getReadDependencies()).to.be.empty
 			})
 		})
 

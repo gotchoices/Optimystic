@@ -552,14 +552,21 @@ saveMaterializedBlock(block): store(structuredClone(block));
   relaxing the quorum instead is the attack `quorum-restore.ts` exists to prevent), and a
   corroborated revision this node failed to converge onto. A cohort that is merely silent and
   claims nothing never stamps — silence carries no revision to be behind of, so the merely-stale
-  pin above holds. Consumers mirror the existence flag: `NetworkTransactor.get` treats a marked
+  pin above holds. The doubt **outlives the consult that formed it**: a corroborated-but-unacquired
+  pass marks the block seen, so the read-repair window skips the next consults, and a doubt that
+  lived only in that consult's return value would let every read inside the window serve the same
+  content as confirmed again. `CoordinatorRepo` remembers the unsettled claim per block and keeps
+  stamping from it; only a consult that actually ran may clear it, or the node reaching the claimed
+  revision. Consumers mirror the existence flag: `NetworkTransactor.get` treats a marked
   entry as *not* answered (it earns the second-chance retry) and merges per block by the ranking
   **confirmed block > unconfirmed block > authoritative absent > unconfirmed absent >
   unavailable** — the confirmed-over-unconfirmed split is load-bearing, since without it the
   stale marked entry and the fresh confirmed one fetched by its own retry tie and first-arrival
   (the stale one) wins the merge. When the marker survives the retry, every reachable coordinator
   said the answer may be behind: `TransactorSource.tryGet` then throws `BlockPossiblyStaleError`
-  on an **unpinned** read (a pinned read legitimately asks for an older view and keeps working),
+  for any read whose view should CONTAIN the claim — the same at/above test the coordinator applies
+  when it stamps, i.e. an **unpinned** read or one pinned at/above the claim (a read pinned *below*
+  the claim legitimately asks for an older view and keeps working),
   `Collection.bootstrapContext` does the same for its direct tail read — the unpinned tail read
   is the one seam where a lagging collection can learn a newer revision exists, and silently
   seeding the context from a doubted tail is exactly how a collection view froze in the field —
@@ -567,8 +574,11 @@ saveMaterializedBlock(block): store(structuredClone(block));
   confirm. `BlockPossiblyStaleError` is `BlockUnavailableError`'s sibling, not a `StaleFailure`:
   `Collection.sync` surfaces it instead of absorbing it into its retry loop. Accepted tradeoff: a
   node partitioned from every coordinator able to confirm currency used to read stale data
-  silently and now raises on unpinned reads until the partition heals (see the `NOTE:` at the
-  `tryGet` throw site).
+  silently and now raises on those reads until the partition heals (see the `NOTE:` at the
+  `tryGet` throw site). Tripwire, recorded at the no-quorum site in `queryClusterForLatest`: one
+  uncorroborated claim is enough to raise doubt, so a single lying cohort peer can deny unpinned
+  reads of a block it falsely claims to be ahead on — cheaper than the silent-staleness it
+  replaces, and revisited when commit-certificate verification can make a claim attestable.
 - **"What revision did this read observe?" is a separate field from "what revision does this repo
   hold?"** `GetBlockResult` carries an optional `materializedRev`
   ([`network/struct.ts`](../packages/db-core/src/network/struct.ts)): the revision the returned

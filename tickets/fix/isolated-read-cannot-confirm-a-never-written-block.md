@@ -112,6 +112,37 @@ decisions) and pushes the opposite way — it widens what gets flagged as unconf
 Read that ticket first; if the two are best resolved together, fold this in as a
 second arm rather than landing them blind to each other.
 
+## Second arm (added by the review of `coordinator-serves-stale-data-as-if-confirmed`)
+
+That ticket has landed. It made a **present** block say when it could not be confirmed
+current, and it left the mirror case on the **missing** path deliberately untouched — so
+this ticket now owns both halves of the same decision, which is why it is filed here as an
+arm rather than as its own ticket.
+
+The untouched case: a block missing locally, one cohort peer claims a revision, the
+corroboration quorum declines it (one voter, floor of two), and **every** peer answers, so
+nothing is silent. `fetchBlockFromCluster` computes that claim and hands it up
+(`claimedAheadRev`), but `CoordinatorRepo.get` only consults it for present blocks — the
+missing entry goes back as an unflagged, authoritative "this block does not exist", to a
+reader that a peer has just told the block *does* exist at a revision.
+
+This is the same lie the just-landed work removed for present blocks, and it is the exact
+distinction the third candidate shape above already proposes: "one peer answered with a
+revision we could not acquire" is a different state from `responders: 0`. Note the two arms
+pull opposite ways at the same code site — the isolated-boot arm wants absence to be
+believed more readily, this one wants it believed less — which is the point of resolving
+them in one pass:
+
+- `responders: 0`, everyone reachable answered "I hold nothing" → the absence should be
+  authoritative even on an isolated/degraded self-coordinated read (arm one).
+- at least one peer claims a revision, corroborated or not → the absence is a guess and must
+  say so (arm two), regardless of how many peers stayed quiet.
+
+The marker to reuse already exists and already crosses the wire; whether this arm should
+stamp `unavailable: 'peers-unreachable'` (existence doubt — the reader must retry) or the
+newer `unconfirmedAheadRev` (currency doubt) on an entry with no content at all is the
+design question the fix stage should settle. Both are plumbed end to end today.
+
 ## Reproduce
 
 In `../sereus/packages/integration-tests` (fails in the first ~5-15 s, before the

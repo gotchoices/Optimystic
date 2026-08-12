@@ -166,6 +166,13 @@ export class CoordinatorRepo implements IRepo {
 	private readonly responsibilityCache = new LruMap<string, { inCluster: boolean, expires: number }>(1000);
 	private static readonly RESPONSIBILITY_TTL_MS = 60_000;
 	private readonly lastSeenCommitMs = new LruMap<string, number>(1000);
+	/** Per block, the cohort-claimed revision the last freshness consult could not settle — the
+	 *  doubt {@link flagUnconfirmedCurrency} stamps onto reads served below it. Outlives the
+	 *  consult on purpose: the read-repair window skips consults for blocks checked recently, and
+	 *  a doubt dropped there is a stale answer served as confirmed again.
+	 *  NOTE: LRU-bounded like `lastSeenCommitMs`; an eviction under >1000 doubted blocks loses the
+	 *  doubt until the next consult re-derives it (one read-repair window later, at worst). */
+	private readonly unsettledAheadClaims = new LruMap<string, number>(1000);
 	private readonly readRepairMode: 'off' | 'lazy' | 'paranoid';
 	private readonly readRepairWindowMs: number;
 	private readonly readRepairSampleRate: number;
@@ -356,7 +363,16 @@ export class CoordinatorRepo implements IRepo {
 				const localRev = localEntry?.state?.latest?.rev;
 				const isMissing = !localEntry?.state?.latest;
 				const isStale = !isMissing && this.shouldReadRepair(blockId);
-				if (!isMissing && !isStale) continue;
+				if (!isMissing && !isStale) {
+					// No consult this pass — the read-repair window says this block was checked
+					// recently. An unsettled claim an earlier pass recorded still applies: the doubt
+					// is a property of what this node HOLDS, not of whether a consult just ran.
+					// Without this, every read inside the window after a failed convergence would
+					// serve the same content as confirmed — the exact silent lie this marker exists
+					// to end, re-opened for `readRepairWindowMs` at a time.
+					this.flagUnconfirmedCurrency(localResult, blockId, blockGets.context);
+					continue;
+				}
 
 				if (isStale) {
 					this.log('cluster-tx:read-repair-triggered', {
@@ -391,18 +407,25 @@ export class CoordinatorRepo implements IRepo {
 						this.flagUnconfirmedAbsence(localResult, blockId);
 					}
 					// A PRESENT block served below a cohort claim the repair could not settle is
-					// the mirror lie: real content posing as confirmed-current. Mark it, narrowly
-					// (see flagUnconfirmedCurrency). The missing case is excluded — it is the
-					// absence path above, and a bare absent below a claim already reads as either
-					// authoritative (cohort answered, nothing corroborated) or flagged.
-					if (!isMissing && claimedAheadRev !== undefined) {
-						this.flagUnconfirmedCurrency(localResult, blockId, claimedAheadRev, blockGets.context);
+					// the mirror lie: real content posing as confirmed-current. This consult is the
+					// authority on that claim, so it replaces whatever an earlier one recorded —
+					// including clearing it when nobody claims anything any more. The missing case
+					// is excluded — it is the absence path above, and a bare absent below a claim
+					// already reads as either authoritative (cohort answered, nothing corroborated)
+					// or flagged.
+					if (!isMissing) {
+						this.recordAheadClaim(blockId, claimedAheadRev);
+						this.flagUnconfirmedCurrency(localResult, blockId, blockGets.context);
 					}
 				} catch (err) {
 					this.log('cluster-fetch:error', { blockId, error: (err as Error).message });
 					// The consult that was supposed to make this answer trustworthy did not run.
 					if (isMissing) {
 						this.flagUnconfirmedAbsence(localResult, blockId);
+					} else {
+						// It told us nothing, so it refutes nothing: an earlier pass's unsettled
+						// claim stands.
+						this.flagUnconfirmedCurrency(localResult, blockId, blockGets.context);
 					}
 				}
 			}
@@ -437,13 +460,27 @@ export class CoordinatorRepo implements IRepo {
 	}
 
 	/**
-	 * Stamp {@link GetBlockResult.unconfirmedAheadRev} on an entry the repair pass left behind an
-	 * unsettled cohort claim — served committed content the coordinator cannot confirm is current.
+	 * Remember (or forget) the cohort claim a freshness consult could not settle for a block.
+	 * Only a consult that actually RAN may call this: it is the authority, so `undefined` clears
+	 * a claim an earlier pass recorded. Entries are also dropped once this node reaches the
+	 * claimed revision (see {@link flagUnconfirmedCurrency}), which is what bounds the map.
+	 */
+	private recordAheadClaim(blockId: BlockId, claimedRev: number | undefined): void {
+		if (claimedRev === undefined) this.unsettledAheadClaims.delete(blockId);
+		else this.unsettledAheadClaims.set(blockId, claimedRev);
+	}
+
+	/**
+	 * Stamp {@link GetBlockResult.unconfirmedAheadRev} on an entry sitting behind an unsettled
+	 * cohort claim — served committed content the coordinator cannot confirm is current.
 	 * Deliberately narrow; ALL of these must hold:
+	 *  - a consult (this read's or an earlier one's, see {@link recordAheadClaim}) left a claim
+	 *    unsettled for this block;
 	 *  - the entry carries a committed revision (a present block, or a committed tombstone) —
 	 *    never a plain absent, which is the absence path's business;
 	 *  - that served revision is still strictly BELOW the claim: the repair did not converge, and
-	 *    nothing committed past the claim in the meantime;
+	 *    nothing committed past the claim in the meantime (if it did, the claim is settled and the
+	 *    memo is dropped here);
 	 *  - the caller asked for a view that should contain the claim: an unpinned "latest" read, or
 	 *    a pin at/above the claimed revision. A read pinned BELOW the claim is being served
 	 *    correctly and stays unstamped — this keeps a collection's context-pinned data reads
@@ -456,13 +493,23 @@ export class CoordinatorRepo implements IRepo {
 	 * Pin comparability: `ActionContext.rev` and a block's `state.latest.rev` count the same
 	 * per-collection revision sequence — `Collection.bootstrapContext` seeds the context straight
 	 * from the tail block's `latest.rev`, and `syncInternal` commits every block of an action at
-	 * `context.rev + 1` — so `context.rev >= claimedRev` is a well-defined comparison.
+	 * `context.rev + 1` — so `context.rev >= claimedRev` is a well-defined comparison. `state.latest`
+	 * is this node's newest revision for the block even on a pinned read (StorageRepo reports the
+	 * content's own revision separately as `materializedRev`), which is exactly the number "is this
+	 * node behind the claim?" asks about.
 	 */
-	private flagUnconfirmedCurrency(results: GetBlockResults, blockId: BlockId, claimedRev: number, context?: ActionContext): void {
+	private flagUnconfirmedCurrency(results: GetBlockResults, blockId: BlockId, context?: ActionContext): void {
+		const claimedRev = this.unsettledAheadClaims.get(blockId);
+		if (claimedRev === undefined) return;
 		const entry = results[blockId];
 		if (!entry || entry.unavailable !== undefined) return;
 		const servedRev = entry.state?.latest?.rev;
-		if (typeof servedRev !== 'number' || servedRev >= claimedRev) return;
+		if (typeof servedRev !== 'number') return;
+		if (servedRev >= claimedRev) {
+			// Caught up — by this pass's repair or by a commit that landed since. Nothing to doubt.
+			this.unsettledAheadClaims.delete(blockId);
+			return;
+		}
 		if (context !== undefined && context.rev < claimedRev) return;
 		entry.unconfirmedAheadRev = claimedRev;
 		this.log('cluster-tx:read-unconfirmed', { blockId, servedRev, claimedAheadRev: claimedRev });
@@ -608,7 +655,9 @@ export class CoordinatorRepo implements IRepo {
 		const converged = rev !== undefined && rev >= corroborated.rev;
 		// The block is marked seen either way — the cohort DID answer, so its freshness was checked,
 		// which is what the read-repair window tracks. A failed convergence therefore waits out the
-		// window before retrying.
+		// window before retrying. The DOUBT it produced does not wait: `get` remembers the
+		// unsettled claim (`recordAheadClaim`) and keeps stamping reads served below it while the
+		// window suppresses the retry — the window damps repair effort, not honesty.
 		// NOTE: that damping covers only a block this node holds at an OLDER revision. A block entirely
 		// missing locally never consults the window (`get` triggers on `isMissing` before
 		// `shouldReadRepair`), so a persistently failing acquisition — e.g. a two-node deployment that
@@ -806,6 +855,15 @@ export class CoordinatorRepo implements IRepo {
 			// The claims themselves must not drive restoration — but their existence is
 			// evidence the caller needs: an answer served below the highest claim cannot be
 			// confirmed current (see ClusterLatestQuery.uncorroboratedRev).
+			// NOTE: ONE claim is enough to raise that doubt, and a claim is a bare assertion
+			// (no commit certificate to verify it against). So a single lying cohort peer can
+			// deny unpinned reads of a block by claiming a revision nobody else holds — an
+			// availability lever it did not have while uncorroborated claims were discarded.
+			// Deliberate for now: the alternative is the silent stale serve this marker exists
+			// to end, and the same liar can already force a silent-treated absence by staying
+			// quiet. Revisit if claims become attestable (backlog
+			// `debt-read-repair-commit-cert-verification`) — then gate the stamp on a verified
+			// certificate rather than on the bare claim.
 			const uncorroboratedRev = claims.length > 0 ? Math.max(...claims.map(c => c.rev)) : undefined;
 			return { local, silent, ...(uncorroboratedRev !== undefined ? { uncorroboratedRev } : {}) };
 		}

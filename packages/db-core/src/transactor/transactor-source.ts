@@ -51,23 +51,27 @@ export class TransactorSource<TBlock extends IBlock> implements BlockSource<TBlo
 			if (!block && unavailable) {
 				throw new BlockUnavailableError(id, unavailable);
 			}
-			// An UNPINNED ("give me latest") read whose surviving answer is marked possibly-behind
-			// (`unconfirmedAheadRev` outlived the transactor's retry round: every reachable
-			// coordinator served content it could not confirm current) must not pose as the
-			// latest — the unpinned tail read is the one seam where a lagging collection can
-			// learn the truth (Collection.bootstrapContext), and silently serving the doubted
-			// content there is exactly how a collection view freezes forever. A PINNED read keeps
-			// working: it legitimately asks for an older view, and the coordinator does not stamp
-			// reads pinned below the claim anyway — this guard is belt-and-braces for it.
+			// A read whose surviving answer is marked possibly-behind (`unconfirmedAheadRev`
+			// outlived the transactor's retry round: every reachable coordinator served content it
+			// could not confirm current) must not pose as an answer for a view that should CONTAIN
+			// the claimed revision. Two such views, the same test the coordinator applies when it
+			// stamps: an UNPINNED "give me latest" read — the tail read is the one seam where a
+			// lagging collection can learn the truth (Collection.bootstrapContext), and silently
+			// serving doubted content there is exactly how a collection view freezes forever — and
+			// a read PINNED AT OR ABOVE the claim, whose snapshot is missing a revision the cohort
+			// says exists inside it. A read pinned strictly BELOW the claim keeps working: it
+			// legitimately asks for an older view, which is being served correctly.
 			// No read dependency is recorded: the throw means nothing was read.
 			// NOTE: accepted tradeoff — this converts a silent wrong answer into a loud failure. A
 			// node partitioned from every coordinator able to confirm currency used to read (stale)
-			// data indefinitely without any signal; it now raises BlockPossiblyStaleError on
-			// unpinned reads until the partition heals or the claim is settled. Deliberate: the
+			// data indefinitely without any signal; it now raises BlockPossiblyStaleError on the
+			// reads that should contain the claim, until the partition heals or the claim is
+			// settled. Deliberate: the
 			// silent alternative is a collection view that forks and freezes with no report
 			// (ticket coordinator-serves-stale-data-as-if-confirmed). Revisit only if a
 			// degraded-read mode (serve-with-warning) becomes a product requirement.
-			if (this.actionContext === undefined && unconfirmedAheadRev !== undefined) {
+			if (unconfirmedAheadRev !== undefined
+				&& (this.actionContext === undefined || this.actionContext.rev >= unconfirmedAheadRev)) {
 				throw new BlockPossiblyStaleError(id, unconfirmedAheadRev);
 			}
 			// Record a read dependency only for a block that actually exists. A transactor may return a

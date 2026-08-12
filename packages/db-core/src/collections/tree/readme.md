@@ -42,6 +42,10 @@ The view guarantees **one consistent answer from first read to last**:
   view-creation time.
 - A block the storage layer cannot reconstruct at the pinned revision surfaces as
   `BlockUnavailableError`, never as a silently absent block.
+- A block served at a revision the repo could not confirm is the newest one *inside the
+  pinned view* (a cohort peer claims a revision at or below the pin that nothing could
+  corroborate) surfaces as `BlockPossiblyStaleError`, never as a snapshot silently missing
+  a committed update. A claim ABOVE the pin is irrelevant to the view and is not raised.
 
 By default a view records **no read dependencies** — it is not part of any transaction's
 conflict set, so an unrelated committed read can never fail a writer's commit validation.

@@ -557,6 +557,92 @@ describe('CoordinatorRepo unavailable vs absent', () => {
 
 			expect(result[blockId]?.unconfirmedAheadRev).to.equal(2);
 		});
+
+		// The doubt has to outlive the consult that formed it. A corroborated-but-unacquired pass
+		// marks the block SEEN (that is what the read-repair window tracks), so in the default
+		// `lazy` mode the next reads inside the window consult nobody — and if the mark lived only
+		// in the consult's return value, every one of them would serve the same content as
+		// confirmed. That is the original lie, re-opened `readRepairWindowMs` at a time.
+		describe('the mark outlives the consult (read-repair window)', () => {
+			/** Cohort of three where both remote peers claim `remoteRev` and nothing can acquire it,
+			 *  so every pass corroborates a revision this node fails to converge onto. */
+			const buildUnacquirableCohort = async (remoteRev: number) => {
+				const localPeer = await makePeerId();
+				const holderA = await makePeerId();
+				const holderB = await makePeerId();
+				const cluster = makeClusterPeers([localPeer, holderA, holderB]);
+				let consults = 0;
+				const callback: ClusterLatestCallback = async (peerId) => {
+					consults++;
+					return peerId.equals(localPeer)
+						? { actionId: 'local-action', rev: 1 }
+						: { actionId: 'remote-action', rev: remoteRev };
+				};
+				return { localPeer, cluster, callback, consultCount: () => consults };
+			};
+
+			it('keeps marking a read whose consult the window skipped', async () => {
+				const { localPeer, cluster, callback, consultCount } = await buildUnacquirableCohort(3);
+				const { repo: storageRepo } = makePresentStorageRepo(blockId, 1);
+				const repo = buildRepo(makeKeyNetwork(cluster), storageRepo, localPeer, callback, { readRepairMode: 'lazy' });
+
+				const first = await repo.get({ blockIds: [blockId] });
+				expect(first[blockId]?.unconfirmedAheadRev, 'the consulting read is marked').to.equal(3);
+
+				const afterFirst = consultCount();
+				const second = await repo.get({ blockIds: [blockId] });
+
+				expect(consultCount(), 'the read-repair window suppressed the second consult').to.equal(afterFirst);
+				expect(second[blockId]?.unconfirmedAheadRev, 'the remembered claim still marks it').to.equal(3);
+			});
+
+			it('drops the mark once a consult finds nothing ahead any more', async () => {
+				// The claim was settled (or the claimant caught up / went away). A consult DID run,
+				// so it is the authority — the remembered doubt must not outlive its refutation.
+				const localPeer = await makePeerId();
+				const holderA = await makePeerId();
+				const holderB = await makePeerId();
+				const cluster = makeClusterPeers([localPeer, holderA, holderB]);
+				let remoteRev = 3;
+				const callback: ClusterLatestCallback = async (peerId) =>
+					peerId.equals(localPeer)
+						? { actionId: 'local-action', rev: 1 }
+						: { actionId: remoteRev === 1 ? 'local-action' : 'remote-action', rev: remoteRev };
+
+				const { repo: storageRepo } = makePresentStorageRepo(blockId, 1);
+				const repo = buildRepo(makeKeyNetwork(cluster), storageRepo, localPeer, callback, { readRepairMode: 'paranoid' });
+
+				expect((await repo.get({ blockIds: [blockId] }))[blockId]?.unconfirmedAheadRev).to.equal(3);
+
+				remoteRev = 1;	// the cohort now agrees with what this node holds
+				const after = await repo.get({ blockIds: [blockId] });
+
+				expect('unconfirmedAheadRev' in after[blockId]!, 'the refuted claim is forgotten').to.equal(false);
+			});
+
+			it('drops the mark once this node reaches the claimed revision', async () => {
+				// Even with the window suppressing consults, a block that caught up (a commit landed
+				// here) is no longer behind anything — nothing left to doubt.
+				const { localPeer, cluster, callback } = await buildUnacquirableCohort(3);
+				let heldRev = 1;
+				const storageRepo: IRepo = {
+					async get(blockGets: BlockGets): Promise<GetBlockResults> {
+						return Object.fromEntries(blockGets.blockIds.map(id => [id, id === blockId
+							? { block: { header: { id: blockId, type: 'T', collectionId: 'c' as BlockId } }, state: { latest: { actionId: 'local-action', rev: heldRev } } }
+							: { state: {} }]));
+					},
+					...writeStubs
+				};
+				const repo = buildRepo(makeKeyNetwork(cluster), storageRepo, localPeer, callback, { readRepairMode: 'lazy' });
+
+				expect((await repo.get({ blockIds: [blockId] }))[blockId]?.unconfirmedAheadRev).to.equal(3);
+
+				heldRev = 3;	// a commit landed locally
+				const after = await repo.get({ blockIds: [blockId] });
+
+				expect('unconfirmedAheadRev' in after[blockId]!, 'caught up — nothing to doubt').to.equal(false);
+			});
+		});
 	});
 
 	describe('corroborated but not restored', () => {
