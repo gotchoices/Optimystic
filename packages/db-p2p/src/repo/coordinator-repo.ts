@@ -1,4 +1,4 @@
-import type { PendRequest, ActionBlocks, IRepo, MessageOptions, CommitResult, GetBlockResults, PendResult, StaleFailure, BlockGets, CommitRequest, RepoMessage, IKeyNetwork, ICluster, ClusterConsensusConfig, BlockId, ActionRev, ActionContext, ClusterRecord } from "@optimystic/db-core";
+﻿import type { PendRequest, ActionBlocks, IRepo, MessageOptions, CommitResult, GetBlockResults, PendResult, StaleFailure, BlockGets, CommitRequest, RepoMessage, IKeyNetwork, ICluster, ClusterConsensusConfig, BlockId, ActionRev, ActionContext, ClusterRecord } from "@optimystic/db-core";
 import { LruMap, blockIdsForTransforms, highestStaleAt, DEFAULT_SUPER_MAJORITY_THRESHOLD } from "@optimystic/db-core";
 import { ClusterCoordinator, ValidatorRejectionError } from "./cluster-coordinator.js";
 import type { PeerId } from "@libp2p/interface";
@@ -14,7 +14,6 @@ import { RECONCILE_TIMEOUT_MS } from "../cluster/reconcile-block.js";
 import { isMissingBaseRevisionFailure, MISSING_BASE_REVISION_REASON } from "../storage/storage-repo.js";
 import type { ReconcileBlockCallback } from "../cluster/cluster-repo.js";
 
-const log = createLogger('coordinator-repo');
 
 /**
  * Acquire a block's content for a cohort-corroborated revision, from the cohort, and persist it.
@@ -183,6 +182,8 @@ export class CoordinatorRepo implements IRepo {
 	/** Resolved super-majority threshold the coordinator commits on (mirrors the value handed to ClusterCoordinator). */
 	private readonly superMajorityThreshold: number;
 	private readonly reputation?: IPeerReputation;
+	/** Per-instance logger, namespaced by peer id when `localPeerId` is known (degrades to the un-suffixed namespace when not — the single-node/test construction has always tolerated its absence). */
+	private readonly log: ReturnType<typeof createLogger>;
 	/** Test seam: overridable clock for window-based read-repair gating. */
 	now: () => number = () => Date.now();
 	/** Test seam: overridable RNG (0..1) for sample-rate gating. */
@@ -202,6 +203,7 @@ export class CoordinatorRepo implements IRepo {
 		private readonly acquireBlockFromCohort?: AcquireBlockCallback
 	) {
 		this.localPeerId = localPeerId;
+		this.log = createLogger('coordinator-repo', localPeerId?.toString());
 		const policy: ClusterConsensusConfig & { clusterSize: number } = {
 			// Same constant `resolveClusterPolicy` gives a node that declares no clusterSize, not a
 			// second literal: a direct constructor (the readme's manual-wiring path) and the node
@@ -285,13 +287,13 @@ export class CoordinatorRepo implements IRepo {
 			const peers = await this.keyNetwork.findCluster(blockIdBytes);
 			inCluster = this.localPeerId.toString() in peers;
 		} catch (err) {
-			log('proximity:check-error', { blockId, error: (err as Error).message });
+			this.log('proximity:check-error', { blockId, error: (err as Error).message });
 			// On failure, assume responsible to avoid false rejections
 			return true;
 		}
 
 		this.responsibilityCache.set(blockId, { inCluster, expires: Date.now() + CoordinatorRepo.RESPONSIBILITY_TTL_MS });
-		log('proximity:checked', { blockId, inCluster });
+		this.log('proximity:checked', { blockId, inCluster });
 		return inCluster;
 	}
 
@@ -306,7 +308,7 @@ export class CoordinatorRepo implements IRepo {
 			}
 		}
 		if (notResponsible.length > 0) {
-			log('proximity:rejected', { blockIds: notResponsible });
+			this.log('proximity:rejected', { blockIds: notResponsible });
 			throw new Error(`Not responsible for block(s): ${notResponsible.join(', ')}`);
 		}
 	}
@@ -322,7 +324,7 @@ export class CoordinatorRepo implements IRepo {
 		// isResponsibleForBlock.
 		for (const blockId of blockGets.blockIds) {
 			if (!await this.isResponsibleForBlock(blockId)) {
-				log('proximity:get-warning', { blockId, msg: 'serving read for non-responsible block' });
+				this.log('proximity:get-warning', { blockId, msg: 'serving read for non-responsible block' });
 			}
 		}
 
@@ -358,7 +360,7 @@ export class CoordinatorRepo implements IRepo {
 				if (!isMissing && !isStale) continue;
 
 				if (isStale) {
-					log('cluster-tx:read-repair-triggered', {
+					this.log('cluster-tx:read-repair-triggered', {
 						blockId,
 						mode: this.readRepairMode,
 						ageMs: this.ageMs(blockId),
@@ -375,9 +377,9 @@ export class CoordinatorRepo implements IRepo {
 					}
 					if (isStale) {
 						if (typeof newRev === 'number' && typeof localRev === 'number' && newRev > localRev) {
-							log('cluster-tx:read-repair-applied', { blockId, oldRev: localRev, newRev });
+							this.log('cluster-tx:read-repair-applied', { blockId, oldRev: localRev, newRev });
 						} else {
-							log('cluster-tx:read-repair-noop', { blockId });
+							this.log('cluster-tx:read-repair-noop', { blockId });
 						}
 					}
 					// The consult ran but came back INCONCLUSIVE (a silent cohort peer, or a
@@ -390,7 +392,7 @@ export class CoordinatorRepo implements IRepo {
 						this.flagUnconfirmedAbsence(localResult, blockId);
 					}
 				} catch (err) {
-					log('cluster-fetch:error', { blockId, error: (err as Error).message });
+					this.log('cluster-fetch:error', { blockId, error: (err as Error).message });
 					// The consult that was supposed to make this answer trustworthy did not run.
 					if (isMissing) {
 						this.flagUnconfirmedAbsence(localResult, blockId);
@@ -495,7 +497,7 @@ export class CoordinatorRepo implements IRepo {
 			&& this.localPeerId
 			&& peerIds[0] === this.localPeerId.toString()
 		) {
-			log('cluster-fetch:solo-self-skip', { blockId });
+			this.log('cluster-fetch:solo-self-skip', { blockId });
 			return { inconclusive: false };
 		}
 
@@ -527,7 +529,7 @@ export class CoordinatorRepo implements IRepo {
 		// production topology rather than a dev convenience, stop re-arming the window on a
 		// corroboration that came from a single voter.
 		if (baselineRev !== undefined && corroborated.rev <= baselineRev) {
-			log('cluster-fetch:local-current', { blockId, localRev: baselineRev, clusterRev: corroborated.rev });
+			this.log('cluster-fetch:local-current', { blockId, localRev: baselineRev, clusterRev: corroborated.rev });
 			this.markBlocksSeen([blockId]);
 			return { inconclusive: cohortSilent };
 		}
@@ -539,9 +541,9 @@ export class CoordinatorRepo implements IRepo {
 		// phantom convergences per run and made a real replication defect invisible for two debugging
 		// sessions.
 		if (rev !== undefined) {
-			log('cluster-fetch:synced', { blockId, rev });
+			this.log('cluster-fetch:synced', { blockId, rev });
 		} else {
-			log('cluster-fetch:not-restored', { blockId, localRev: baselineRev, clusterRev: corroborated.rev });
+			this.log('cluster-fetch:not-restored', { blockId, localRev: baselineRev, clusterRev: corroborated.rev });
 		}
 		// A corroborated revision this node failed to converge onto is inconclusive in its own right,
 		// even with the whole cohort answering: the reader has just been TOLD the block exists, so
@@ -615,7 +617,7 @@ export class CoordinatorRepo implements IRepo {
 			);
 		} catch (err) {
 			// Declines are cheap and retryable — nothing was persisted. Report and leave the block behind.
-			log('cluster-fetch:acquire-error', { blockId, rev: corroborated.rev, error: (err as Error).message });
+			this.log('cluster-fetch:acquire-error', { blockId, rev: corroborated.rev, error: (err as Error).message });
 			return undefined;
 		}
 		const acquired = await this.readLocalRev(blockId);
@@ -639,12 +641,12 @@ export class CoordinatorRepo implements IRepo {
 		try {
 			const entry = await this.readLocalEntry(blockId, { committed: [corroborated], rev: corroborated.rev });
 			if (entry?.unavailable !== undefined) {
-				log('cluster-fetch:promote-unavailable', { blockId, rev: corroborated.rev, error: entry.unavailable });
+				this.log('cluster-fetch:promote-unavailable', { blockId, rev: corroborated.rev, error: entry.unavailable });
 				return undefined;
 			}
 			return entry?.state?.latest?.rev;
 		} catch (err) {
-			log('cluster-fetch:promote-unavailable', { blockId, rev: corroborated.rev, error: (err as Error).message });
+			this.log('cluster-fetch:promote-unavailable', { blockId, rev: corroborated.rev, error: (err as Error).message });
 			return undefined;
 		}
 	}
@@ -732,13 +734,13 @@ export class CoordinatorRepo implements IRepo {
 			claims.push({ peerId: peerIdStr, rev: value.rev, actionId: value.actionId });
 		}
 		if (silent.length > 0) {
-			log('cluster-fetch:peers-silent', { blockId, silent: silent.length, consulted: peerIds.length });
+			this.log('cluster-fetch:peers-silent', { blockId, silent: silent.length, consulted: peerIds.length });
 		}
 
 		const capacity = corroboratorCapacity(peerIds.filter(id => id !== selfId).length, this.repairCorroborationClusterSize);
 		const selected = selectQuorumRev(claims, this.simpleMajorityThreshold, capacity);
 		if (!selected) {
-			log('cluster-fetch:no-quorum', {
+			this.log('cluster-fetch:no-quorum', {
 				blockId,
 				responders: claims.length,
 				required: quorumSize(claims.length, this.simpleMajorityThreshold, capacity),
@@ -781,7 +783,7 @@ export class CoordinatorRepo implements IRepo {
 				}
 			}
 		} catch (err) {
-			log('cluster-fetch:penalize-error', { blockId, error: (err as Error).message });
+			this.log('cluster-fetch:penalize-error', { blockId, error: (err as Error).message });
 		}
 	}
 
@@ -803,14 +805,14 @@ export class CoordinatorRepo implements IRepo {
 
 		try {
 			const { localExecuted } = await this.coordinator.executeClusterTransaction(coordinatingBlockIds[0]!, message, options);
-			log('coordinator-repo:pend-cluster-complete', {
+			this.log('coordinator-repo:pend-cluster-complete', {
 				actionId: request.actionId,
 				localExecuted
 			});
 			// Only call storageRepo if local cluster didn't already execute during consensus
 			if (!localExecuted) {
 				const result = await this.storageRepo.pend(request, options);
-				log('coordinator-repo:pend-fallback-result', {
+				this.log('coordinator-repo:pend-fallback-result', {
 					actionId: request.actionId,
 					success: result.success,
 					hasMissing: !!(result as any).missing?.length,
@@ -825,7 +827,7 @@ export class CoordinatorRepo implements IRepo {
 				blockIds: allBlockIds
 			};
 		} catch (error) {
-			log('coordinator-repo:pend-error', { actionId: request.actionId, error: (error as Error).message });
+			this.log('coordinator-repo:pend-error', { actionId: request.actionId, error: (error as Error).message });
 			const stale = await this.classifyStaleRejection(error, request, allBlockIds);
 			if (stale) return stale;
 			throw error;
@@ -858,7 +860,7 @@ export class CoordinatorRepo implements IRepo {
 		try {
 			results = await this.storageRepo.get({ blockIds });
 		} catch (readError) {
-			log('coordinator-repo:pend-stale-classify-read-error', {
+			this.log('coordinator-repo:pend-stale-classify-read-error', {
 				actionId: request.actionId,
 				error: (readError as Error).message
 			});
@@ -873,7 +875,7 @@ export class CoordinatorRepo implements IRepo {
 			return latest && latest.rev >= requestedRev ? { blockId, rev: latest.rev } : undefined;
 		}));
 		if (staleAt) {
-			log('coordinator-repo:pend-stale-classified', {
+			this.log('coordinator-repo:pend-stale-classified', {
 				actionId: request.actionId,
 				blockId: staleAt.blockId,
 				latestRev: staleAt.rev,
@@ -922,7 +924,7 @@ export class CoordinatorRepo implements IRepo {
 				await this.storageRepo.cancel(actionRef, options);
 			}
 		} catch (error) {
-			log('coordinator-repo:cancel-error', { actionId: actionRef.actionId, error: (error as Error).message });
+			this.log('coordinator-repo:cancel-error', { actionId: actionRef.actionId, error: (error as Error).message });
 			throw error;
 		}
 	}
@@ -979,7 +981,7 @@ export class CoordinatorRepo implements IRepo {
 				throw err;
 			}
 		} catch (error) {
-			log('coordinator-repo:commit-error', { actionId: request.actionId, error: (error as Error).message });
+			this.log('coordinator-repo:commit-error', { actionId: request.actionId, error: (error as Error).message });
 			throw error;
 		}
 	}
@@ -990,7 +992,7 @@ export class CoordinatorRepo implements IRepo {
 	 * from replication (cohort reconcile, or read-driven acquisition), not from replay here.
 	 */
 	private tolerateLocalCommitDivergence(request: CommitRequest, blockIds: BlockId[], detail: string): CommitResult {
-		log('coordinator-repo:commit-local-failed-cluster-succeeded', { actionId: request.actionId, error: detail });
+		this.log('coordinator-repo:commit-local-failed-cluster-succeeded', { actionId: request.actionId, error: detail });
 		this.markBlocksSeen(blockIds);
 		return { success: true };
 	}

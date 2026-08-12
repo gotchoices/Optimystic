@@ -11,7 +11,9 @@ export const captureLog = async (namespace: string, fn: () => Promise<void>): Pr
 	const captured: unknown[][] = [];
 	const previousNamespaces = debug.disable();
 	const previousLog = debug.log;
-	debug.enable(`optimystic:db-p2p:${namespace}`);
+	// Matches both the bare namespace (no peer id known) and a peer-id-suffixed one
+	// (`createLogger` appends `:<truncated-peer-id>` when an instance knows its peer id).
+	debug.enable(`optimystic:db-p2p:${namespace},optimystic:db-p2p:${namespace}:*`);
 	debug.log = (...args: unknown[]): void => { captured.push(args); };
 	try {
 		await fn();

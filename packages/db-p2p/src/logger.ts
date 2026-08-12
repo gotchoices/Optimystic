@@ -2,8 +2,9 @@ import debug from 'debug'
 
 const BASE_NAMESPACE = 'optimystic:db-p2p'
 
-export function createLogger(subNamespace: string): debug.Debugger {
-	return debug(`${BASE_NAMESPACE}:${subNamespace}`)
+export function createLogger(subNamespace: string, peerId?: string): debug.Debugger {
+	const suffix = peerId ? `:${peerId.substring(0, 12)}` : ''
+	return debug(`${BASE_NAMESPACE}:${subNamespace}${suffix}`)
 }
 
 export const verbose = typeof process !== 'undefined'

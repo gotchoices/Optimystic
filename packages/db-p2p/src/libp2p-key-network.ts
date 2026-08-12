@@ -203,6 +203,7 @@ export class Libp2pKeyPeerNetwork implements IKeyNetwork, IPeerNetwork {
 		// those two sites have to thread the config through first. Low urgency: a grace-period denial no longer fails the caller, it only costs
 		// a write the findCoordinator retry window before self-coordinating — and only when that
 		// window is worth paying at all (see `retryCouldImprove`), so an isolated node pays nothing.
+		this.log = createLogger('libp2p-key-network', this.libp2p.peerId.toString())
 		this.selfCoordinationConfig = {
 			gracePeriodMs: selfCoordinationConfig?.gracePeriodMs ?? 30_000,
 			shrinkageThreshold: selfCoordinationConfig?.shrinkageThreshold ?? 0.5,
@@ -230,7 +231,7 @@ export class Libp2pKeyPeerNetwork implements IKeyNetwork, IPeerNetwork {
 	// coordinator cache: key (base64url) -> peerId until expiry (bounded LRU-ish via Map insertion order)
 	private readonly coordinatorCache = new Map<string, { id: PeerId, expires: number }>()
 	private static readonly MAX_CACHE_ENTRIES = 1000
-	private readonly log = createLogger('libp2p-key-network')
+	private readonly log: ReturnType<typeof createLogger>
 
 	private toCacheKey(key: Uint8Array): string { return u8ToString(key, 'base64url') }
 
