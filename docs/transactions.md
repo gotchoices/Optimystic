@@ -2053,7 +2053,7 @@ The `findCoordinator()` method in `Libp2pKeyPeerNetwork` uses this priority orde
 3. **Any connected peer**: Fallback to any connected peer
 4. **Self-coordination**: Last resort, select self as coordinator
 
-**Retry Logic**: If no connections are found, retry up to 3 times with 500ms delay before self-selection. This handles temporary connection dropouts.
+**Retry Logic**: If no connections are found, retry up to 3 times with 500ms delay before self-selection. This handles temporary connection dropouts. The retry is **skipped** when nothing could arrive during it: no non-self FRET neighbour for the key (after exclusions and bans) and no dial `queued`/`active` in libp2p's dial queue. Such a lookup drops straight to the self-coordination tier on the first attempt.
 
 ### Self-Coordination: The Danger
 
@@ -2200,10 +2200,10 @@ Self-coordination risks differ by operation, and `findCoordinator` is told which
 | Operation | Risk | Behavior |
 |-----------|------|----------|
 | **Read** | Stale data | Never denied its own replica (except the `disabled` switch). Self is admitted at the FRET tier on a deferrable denial *while the node is isolated*, so an isolated read resolves at once; the reply carries the cluster's own conclusive/`unavailable` verdict. With any connection still live, self stays dropped there so a reachable neighbour wins the key — and no delay is paid, since the retry sleep only runs at zero connections. |
-| **Write (new or existing block)** | Orphaned data / fork creation | Self stays dropped for the whole retry window so an arriving peer wins the key. Hard denial → `SELF_COORDINATION_BLOCKED`. Deferrable denial → self with a degraded-fallback warning. |
+| **Write (new or existing block)** | Orphaned data / fork creation | Self stays dropped for as long as the retry window is worth paying, so an arriving peer wins the key; a window nothing can arrive during is skipped (see below). Hard denial → `SELF_COORDINATION_BLOCKED`. Deferrable denial → self with a degraded-fallback warning. |
 | **Collection header lookup** | Missing data | A read; same as the read row. |
 
-The retry logic (3 attempts, 500ms delay, so ~1s of wall clock — the last attempt does not sleep) addresses the common case of temporary connection dropout. Deliberately it is *not* extended to wait out the grace period: the default grace period (30s) equals the default transaction budget (30s), so waiting would consume the entire budget and time the caller out anyway. The self-coordination guard addresses the rarer case of genuine network partitions — and only on writes, where a partition is an argument against coordinating alone.
+The retry logic (3 attempts, 500ms delay, so ~1s of wall clock — the last attempt does not sleep) addresses the common case of temporary connection dropout. That window is paid only when something could actually arrive during it, judged from two signals read at the moment of the call: a **non-self FRET neighbour for the key** (a peer this node knows of and routes to, so a connection to it landing mid-sleep makes it selectable — exclusions and bans removed first, but *not* the network-membership filter, since a not-yet-identified peer is exactly the one that may flip to serving), and a **dial in flight** (`queued` or `active` in libp2p's dial queue — including the bootstrap dial of a configured-but-never-reached peer, which keeps the window while it runs and stops keeping it once it fails). With neither present the node is alone with nothing to wait for, and the lookup reaches the self-coordination tier on its first attempt instead of burning ~1s per block. Neither the peerStore nor inbound reachability counts: a peerStore record nobody is dialling will not become a connection during the sleep, and "someone could dial in" holds for nearly every node with a listen address. Deliberately the window is *not* extended to wait out the grace period: the default grace period (30s) equals the default transaction budget (30s), so waiting would consume the entire budget and time the caller out anyway. The self-coordination guard addresses the rarer case of genuine network partitions — and only on writes, where a partition is an argument against coordinating alone.
 
 ### Supercluster Nominee Reasonableness (Future)
 

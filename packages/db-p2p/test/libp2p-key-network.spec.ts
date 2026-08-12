@@ -2,7 +2,7 @@ import { expect } from 'chai';
 import { peerIdFromPrivateKey } from '@libp2p/peer-id';
 import { generateKeyPair } from '@libp2p/crypto/keys';
 import { multiaddr } from '@multiformats/multiaddr';
-import type { PeerId, Libp2p, Connection } from '@libp2p/interface';
+import type { PeerId, Libp2p, Connection, PendingDial } from '@libp2p/interface';
 import type { SerializedTable } from 'p2p-fret';
 import { waitFor } from '@optimystic/db-core/test';
 import {
@@ -19,16 +19,24 @@ const makePeerId = async (): Promise<PeerId> => {
 	return peerIdFromPrivateKey(key);
 };
 
+/** A `queued`/`active`/… entry for a mock's dial queue. */
+function pendingDial(status: PendingDial['status'], id = 'd0'): PendingDial {
+	return { id, status, multiaddrs: [] } as unknown as PendingDial;
+}
+
 /** Minimal mock Libp2p that satisfies Libp2pKeyPeerNetwork's usage */
 function createMockLibp2p(peerId: PeerId, options?: {
 	connections?: Connection[];
 	fret?: any;
 	peerStore?: any;
+	/** Dials libp2p is currently attempting; the futility test reads `queued`/`active` entries. */
+	dialQueue?: PendingDial[];
 }): Libp2p {
 	const listeners: Map<string, Set<Function>> = new Map();
 	return {
 		peerId,
 		getConnections: () => options?.connections ?? [],
+		getDialQueue: () => options?.dialQueue ?? [],
 		getMultiaddrs: () => [],
 		addEventListener: (event: string, handler: Function) => {
 			if (!listeners.has(event)) listeners.set(event, new Set());
@@ -68,30 +76,60 @@ describe('Libp2pKeyPeerNetwork', () => {
 		selfPeerId = await makePeerId();
 	});
 
-	describe('canRetryImprove()', () => {
-		it('returns false for forming + HWM<=1 + self-only FRET', () => {
+	// The inter-attempt sleep is worth paying only when something could arrive during it. The
+	// verdict comes from evidence available at the moment of the call — a non-self candidate we
+	// route to, or a dial libp2p is actually attempting — never from construction-time config
+	// (`networkMode`) or a monotonic history mark (`networkHighWaterMark`), both of which kept
+	// the window open forever on nodes that could never fill it.
+	describe('retryCouldImprove()', () => {
+		const improve = (network: Libp2pKeyPeerNetwork, ids: string[]): boolean =>
+			(network as any).retryCouldImprove(ids);
+
+		it('returns false for a self-only candidate list with an empty dial queue', () => {
 			const libp2p = createMockLibp2p(selfPeerId);
 			const network = new Libp2pKeyPeerNetwork(libp2p, 16, undefined, 'forming');
-			// Access private method via cast
-			const result = (network as any).canRetryImprove([selfPeerId.toString()]);
-			expect(result).to.be.false;
+			expect(improve(network, [selfPeerId.toString()])).to.be.false;
 		});
 
-		it('returns false for forming + HWM<=1 + empty FRET', () => {
+		it('returns false for an empty candidate list with an empty dial queue', () => {
 			const libp2p = createMockLibp2p(selfPeerId);
 			const network = new Libp2pKeyPeerNetwork(libp2p, 16, undefined, 'forming');
-			const result = (network as any).canRetryImprove([]);
-			expect(result).to.be.false;
+			expect(improve(network, [])).to.be.false;
 		});
 
-		it('returns true for joining mode regardless of other conditions', () => {
+		it('returns true when a dial is active, even with a self-only candidate list', () => {
+			const libp2p = createMockLibp2p(selfPeerId, { dialQueue: [pendingDial('active')] });
+			const network = new Libp2pKeyPeerNetwork(libp2p, 16, undefined, 'forming');
+			expect(improve(network, [selfPeerId.toString()])).to.be.true;
+		});
+
+		it('returns true when a dial is queued', () => {
+			const libp2p = createMockLibp2p(selfPeerId, { dialQueue: [pendingDial('queued')] });
+			const network = new Libp2pKeyPeerNetwork(libp2p, 16, undefined, 'forming');
+			expect(improve(network, [selfPeerId.toString()])).to.be.true;
+		});
+
+		it('returns false when the dial queue holds only settled entries', () => {
+			// A dial that has already failed (or succeeded, and so is a connection now) cannot
+			// complete during the sleep — it is history, not something to wait for.
+			const libp2p = createMockLibp2p(selfPeerId, {
+				dialQueue: [pendingDial('error', 'd0'), pendingDial('success', 'd1')]
+			});
+			const network = new Libp2pKeyPeerNetwork(libp2p, 16, undefined, 'forming');
+			expect(improve(network, [selfPeerId.toString()])).to.be.false;
+		});
+
+		it('returns true when the candidate list holds a non-self id', () => {
 			const libp2p = createMockLibp2p(selfPeerId);
-			const network = new Libp2pKeyPeerNetwork(libp2p, 16, undefined, 'joining');
-			const result = (network as any).canRetryImprove([selfPeerId.toString()]);
-			expect(result).to.be.true;
+			const network = new Libp2pKeyPeerNetwork(libp2p, 16, undefined, 'forming');
+			expect(improve(network, [selfPeerId.toString(), 'other-peer-id'])).to.be.true;
 		});
 
-		it('returns true for forming + HWM>1 (persisted history)', async () => {
+		it('returns false for a joining node with HWM>1 that knows no peer and dials nobody', async () => {
+			// The regression this test exists for: configuration ('joining' — a bootstrap
+			// address was configured) and history (HWM 10 — this node once saw a 10-peer
+			// network) both used to force the window open. Neither says a peer can arrive in
+			// the next 500ms; the empty FRET neighbourhood and empty dial queue say it cannot.
 			const persistence = new MemoryPersistence({
 				version: 1,
 				networkHighWaterMark: 10,
@@ -99,17 +137,9 @@ describe('Libp2pKeyPeerNetwork', () => {
 				consecutiveIsolatedSessions: 0
 			});
 			const libp2p = createMockLibp2p(selfPeerId);
-			const network = new Libp2pKeyPeerNetwork(libp2p, 16, undefined, 'forming', persistence);
+			const network = new Libp2pKeyPeerNetwork(libp2p, 16, undefined, 'joining', persistence);
 			await network.initFromPersistedState();
-			const result = (network as any).canRetryImprove([selfPeerId.toString()]);
-			expect(result).to.be.true;
-		});
-
-		it('returns true when FRET has other peers', () => {
-			const libp2p = createMockLibp2p(selfPeerId);
-			const network = new Libp2pKeyPeerNetwork(libp2p, 16, undefined, 'forming');
-			const result = (network as any).canRetryImprove([selfPeerId.toString(), 'other-peer-id']);
-			expect(result).to.be.true;
+			expect(improve(network, [selfPeerId.toString()])).to.be.false;
 		});
 	});
 
@@ -747,23 +777,35 @@ describe('Libp2pKeyPeerNetwork', () => {
 		 * `connectedPeer` breaks the isolation: that peer is connected and is a FRET neighbour of
 		 * the key, but ranks BEHIND self — the adversarial ordering, since a self admitted at the
 		 * FRET tier would then take the key ahead of it.
+		 *
+		 * `dialInFlight` puts one `active` entry in libp2p's dial queue: a connection that can
+		 * complete during an inter-attempt sleep, which is what makes the retry window worth
+		 * paying. Without it this node knows of no peer and is attempting none, so the window is
+		 * futile and the lookup goes straight to the last-resort tier.
 		 */
 		type MutableNetworkState = { connections: Connection[]; neighbors: string[] };
 
 		async function justDisconnectedNode(options?: {
 			partitioned?: boolean;
 			connectedPeer?: PeerId;
+			dialInFlight?: boolean;
+			/** Persisted high-water mark; >1 is the "has seen a real network" shape. */
+			highWaterMark?: number;
+			networkMode?: 'forming' | 'joining';
+			/** FRET neighbours of the key; defaults to self (plus `connectedPeer`, when given). */
+			neighbors?: string[];
 		}) {
 			const persistence = new MemoryPersistence({
 				version: 1,
-				networkHighWaterMark: 10,
+				networkHighWaterMark: options?.highWaterMark ?? 10,
 				lastConnectedTimestamp: Date.now() - 2_300,
 				consecutiveIsolatedSessions: 0
 			});
 			const peer = options?.connectedPeer;
 			const state: MutableNetworkState = {
 				connections: peer ? [connTo(peer)] : [],
-				neighbors: peer ? [selfPeerId.toString(), peer.toString()] : [selfPeerId.toString()]
+				neighbors: options?.neighbors
+					?? (peer ? [selfPeerId.toString(), peer.toString()] : [selfPeerId.toString()])
 			};
 			// findCoordinator consults FRET exactly once per retry attempt, so this counts
 			// attempts — a clock-free stand-in for "did the lookup enter the retry loop".
@@ -778,15 +820,19 @@ describe('Libp2pKeyPeerNetwork', () => {
 				exportTable: () => undefined,
 				assembleCohort: () => []
 			};
+			const dialQueue: PendingDial[] = options?.dialInFlight ? [pendingDial('active')] : [];
 			const libp2p = {
 				peerId: selfPeerId,
 				getConnections: () => state.connections,
+				getDialQueue: () => dialQueue,
 				getMultiaddrs: () => [],
 				addEventListener: () => {},
 				removeEventListener: () => {},
 				services: { fret }
 			} as unknown as Libp2p;
-			const network = new Libp2pKeyPeerNetwork(libp2p, 16, undefined, 'forming', persistence);
+			const network = new Libp2pKeyPeerNetwork(
+				libp2p, 16, undefined, options?.networkMode ?? 'forming', persistence
+			);
 			await network.initFromPersistedState();
 			return { network, state, attemptCount: () => attempts };
 		}
@@ -802,13 +848,43 @@ describe('Libp2pKeyPeerNetwork', () => {
 			expect(attemptCount(), 'an isolated read resolves without a second attempt').to.equal(1);
 		});
 
-		it('completes a WRITE from its own replica after the retry window, instead of throwing', async () => {
+		it('completes a WRITE from its own replica without paying a futile retry window', async () => {
+			// A write keeps dropping self at the FRET tier, so it reaches the inter-attempt
+			// sleep — but this node knows of no peer other than itself and is dialling nobody,
+			// so no connection can land during that sleep. The window is skipped and the
+			// last-resort tier degrades to self on the FIRST attempt, rather than failing (and
+			// rather than burning ~1s per block first).
 			const { network, attemptCount } = await justDisconnectedNode();
 			const result = await network.findCoordinator(KEY); // default intent: 'write'
 			expect(result.toString()).to.equal(selfPeerId.toString());
-			// A write keeps dropping self at the FRET tier, so it still spends the full
-			// 3-attempt window hoping a peer lands — then degrades rather than failing.
-			expect(attemptCount(), 'a write still spends its retry window before degrading').to.equal(3);
+			expect(attemptCount(), 'a futile write window is not paid').to.equal(1);
+		});
+
+		it('a WRITE still spends the full retry window while a dial is in flight', async () => {
+			// The other half of the same rule: with a connection attempt actually running, a
+			// peer CAN land during the sleep, so the window is worth paying and all 3 attempts
+			// run before degrading to self. This is what preserves "a peer that lands during
+			// the write retry window still wins the key over self".
+			const { network, attemptCount } = await justDisconnectedNode({ dialInFlight: true });
+			const result = await network.findCoordinator(KEY);
+			expect(result.toString()).to.equal(selfPeerId.toString());
+			expect(attemptCount(), 'a dial in flight keeps the retry window').to.equal(3);
+		});
+
+		it('a solo node that never had company also skips the window (joining mode, HWM 1)', async () => {
+			// The reported case: a node configured with a bootstrap address it has never
+			// reached. `networkMode` is fixed at construction ('joining' the moment any
+			// bootstrap address is configured) and used to force the window open forever;
+			// nothing about it says a peer can arrive in the next 500ms. FRET is empty here —
+			// not even self — so no tier can pick anything before the last-resort self degrade.
+			const { network, attemptCount } = await justDisconnectedNode({
+				networkMode: 'joining',
+				highWaterMark: 1,
+				neighbors: []
+			});
+			const result = await network.findCoordinator(KEY);
+			expect(result.toString()).to.equal(selfPeerId.toString());
+			expect(attemptCount(), 'configuration alone is not something to wait for').to.equal(1);
 		});
 
 		it('a peer that lands during the write retry window still wins the key over self', async () => {
@@ -823,8 +899,12 @@ describe('Libp2pKeyPeerNetwork', () => {
 			// rather than the 400ms of slack a late-window timer would leave. `attemptCount`
 			// pins WHICH attempt made the pick, so a machine stalled enough to break that
 			// assumption fails loudly here instead of passing for the wrong reason.
+			//
+			// `dialInFlight` is what buys the sleep in the first place — and it is also the
+			// realistic reason a peer shows up 50ms later, so the scenario reads truer than the
+			// dial-less version it replaced.
 			const peerA = await makePeerId();
-			const { network, state, attemptCount } = await justDisconnectedNode();
+			const { network, state, attemptCount } = await justDisconnectedNode({ dialInFlight: true });
 			const arrival = setTimeout(() => {
 				state.connections = [connTo(peerA)];
 				state.neighbors = [peerA.toString(), selfPeerId.toString()];
@@ -839,7 +919,10 @@ describe('Libp2pKeyPeerNetwork', () => {
 		});
 
 		it('a detected partition still blocks a WRITE but never a READ', async () => {
-			const { network: writeNet } = await justDisconnectedNode({ partitioned: true });
+			// Skipping a futile window skips only the WAITING, never a decision: the break falls
+			// through to the same last-resort tier, which asks the same guard. The denial
+			// survives verbatim — it just arrives ~1s sooner, on the first attempt.
+			const { network: writeNet, attemptCount: writeAttempts } = await justDisconnectedNode({ partitioned: true });
 			let caught: unknown;
 			try {
 				await writeNet.findCoordinator(KEY);
@@ -851,12 +934,62 @@ describe('Libp2pKeyPeerNetwork', () => {
 			expect((caught as FindCoordinatorError).code).to.equal(
 				FIND_COORDINATOR_ERROR_CODES.SELF_COORDINATION_BLOCKED
 			);
+			expect(writeAttempts(), 'the denial does not need the retry window to be paid first').to.equal(1);
 
 			// A partition is no argument against answering a read from our own replica — the
 			// layers below already report how good that answer is.
-			const { network: readNet } = await justDisconnectedNode({ partitioned: true });
+			const { network: readNet, attemptCount: readAttempts } = await justDisconnectedNode({ partitioned: true });
 			const result = await readNet.findCoordinator(KEY, { intent: 'read' });
 			expect(result.toString()).to.equal(selfPeerId.toString());
+			expect(readAttempts(), 'a partitioned read still resolves on the first attempt').to.equal(1);
+		});
+
+		it('a futile lookup with self excluded still reports SELF_COORDINATION_EXHAUSTED, in one attempt', async () => {
+			// Self excluded empties the futility input (self was the only FRET neighbour), so
+			// the window is skipped — and the same solo/bootstrap error still surfaces, with
+			// its message about the original first-attempt cause intact.
+			const { network, attemptCount } = await justDisconnectedNode({ highWaterMark: 1 });
+			let caught: unknown;
+			try {
+				await network.findCoordinator(KEY, { excludedPeers: [selfPeerId] });
+				expect.fail('Expected findCoordinator to throw SELF_COORDINATION_EXHAUSTED');
+			} catch (err) {
+				caught = err;
+			}
+			expect(caught).to.be.instanceOf(FindCoordinatorError);
+			expect((caught as FindCoordinatorError).code).to.equal(
+				FIND_COORDINATOR_ERROR_CODES.SELF_COORDINATION_EXHAUSTED
+			);
+			expect(attemptCount(), 'nothing to wait for, so no window').to.equal(1);
+		});
+
+		it('a futile lookup with self excluded and HWM>1 still reports NO_COORDINATOR_AVAILABLE, in one attempt', async () => {
+			const { network, attemptCount } = await justDisconnectedNode(); // HWM 10
+			let caught: unknown;
+			try {
+				await network.findCoordinator(KEY, { excludedPeers: [selfPeerId] });
+				expect.fail('Expected findCoordinator to throw NO_COORDINATOR_AVAILABLE');
+			} catch (err) {
+				caught = err;
+			}
+			expect(caught).to.be.instanceOf(FindCoordinatorError);
+			expect((caught as FindCoordinatorError).code).to.equal(
+				FIND_COORDINATOR_ERROR_CODES.NO_COORDINATOR_AVAILABLE
+			);
+			expect(attemptCount(), 'nothing to wait for, so no window').to.equal(1);
+		});
+
+		it('an excluded non-self FRET neighbour is not something to wait for', async () => {
+			// The futility input is exclusion- and ban-filtered: a neighbour we may never pick
+			// cannot improve a later attempt, so its presence must NOT buy the window. Both the
+			// FRET tier and the connected fallback would reject it too.
+			const peerA = await makePeerId();
+			const { network, attemptCount } = await justDisconnectedNode({
+				neighbors: [selfPeerId.toString(), peerA.toString()]
+			});
+			const result = await network.findCoordinator(KEY, { excludedPeers: [peerA] });
+			expect(result.toString()).to.equal(selfPeerId.toString());
+			expect(attemptCount(), 'an excluded neighbour does not keep the window open').to.equal(1);
 		});
 
 		it('a READ still prefers a reachable peer over degraded self while any connection is live', async () => {

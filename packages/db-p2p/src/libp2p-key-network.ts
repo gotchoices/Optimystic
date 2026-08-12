@@ -146,6 +146,17 @@ export class Libp2pKeyPeerNetwork implements IKeyNetwork, IPeerNetwork {
 	private networkHighWaterMark = 1;
 	private lastConnectedTime = Date.now();
 	private consecutiveIsolatedSessions = 0;
+	/**
+	 * NOTE: diagnostic-only — no decision consults this any more. It used to gate the
+	 * coordinator retry window, but it is computed once at construction
+	 * (`bootstrapNodes.length > 0` in `libp2p-node-base.ts`) and never re-derived, so a node
+	 * configured with a bootstrap address it has never reached read as "company is coming"
+	 * forever; {@link retryCouldImprove} asks libp2p for live evidence instead. It still earns
+	 * its keep in the `retry-futile` log line ("configured
+	 * to expect company" vs. "solo by design"). Drop it, or re-derive it from live state, when
+	 * the constructor becomes an options bag — removing the positional parameter now would
+	 * churn ~50 construction sites in `test/libp2p-key-network.spec.ts` for no behaviour change.
+	 */
 	private readonly networkMode: NetworkMode;
 	private readonly persistence?: NetworkStatePersistence;
 
@@ -287,12 +298,53 @@ export class Libp2pKeyPeerNetwork implements IKeyNetwork, IPeerNetwork {
 		}
 	}
 
-	private canRetryImprove(fretNeighborIds: string[]): boolean {
-		if (this.networkMode !== 'forming') return true;
-		if (this.networkHighWaterMark > 1) return true;
-		const onlySelf = fretNeighborIds.length <= 1
-			&& (fretNeighborIds.length === 0 || fretNeighborIds[0] === this.libp2p.peerId.toString());
-		return !onlySelf;
+	/**
+	 * Can another attempt plausibly return a BETTER answer than this one did? Consulted ONLY
+	 * when the current attempt found no candidate and the node holds zero connections — i.e.
+	 * purely to decide whether the 500ms inter-attempt sleep is worth paying.
+	 *
+	 * Answered from evidence available NOW, never from configuration or history (`networkMode`
+	 * is frozen at construction and `networkHighWaterMark` is monotonic, so both used to keep
+	 * the window open forever on a node that could never fill it):
+	 *  - a non-self candidate in the FRET neighbourhood for this key — a peer we know of and
+	 *    route to; a connection to it landing during the sleep makes it selectable.
+	 *  - a dial in flight (`queued` / `active` in libp2p's dial queue) — a connection attempt
+	 *    that can complete inside the sleep. This is the signal that covers a
+	 *    configured-but-not-yet-reached bootstrap peer: while its dial runs, the window is
+	 *    worth paying; once the dial has failed, it is not.
+	 *
+	 * Neither present → nothing this call can wait for; break to the last-resort tier.
+	 *
+	 * NOTE: accepted regression — a node with no known peers and no dial in flight that
+	 * received an INBOUND connection during a sleep it now skips will route that one lookup to
+	 * self instead of to the arriving peer. A self pick is never cached, so the next lookup
+	 * picks the peer up; the benefit is that every genuinely isolated lookup stops paying ~1s
+	 * per block. Inbound reachability is deliberately NOT a futility signal: it holds for
+	 * nearly every node with a listen address, so it would neuter the test.
+	 * NOTE: deliberately no `peerStore` scan — "we have a record of a peer" is not "a peer can
+	 * arrive in the next 500ms". A peerStore entry with no FRET entry and no in-flight dial is
+	 * a peer nobody is currently attempting, and the scan is an async datastore iteration on a
+	 * per-lookup hot path.
+	 */
+	private retryCouldImprove(candidateIds: string[]): boolean {
+		if (candidateIds.some(id => id !== this.libp2p.peerId.toString())) return true;
+		return this.dialsInFlight() > 0;
+	}
+
+	/**
+	 * Number of dials libp2p is currently attempting (`queued` or `active`) — a connection
+	 * that can plausibly complete inside the inter-attempt sleep.
+	 *
+	 * Over-inclusive by design: the queue may hold a dial to an excluded, banned, or
+	 * foreign-network peer. That keeps the retry window (conservative, matches the behaviour
+	 * before the futility test existed); cross-referencing it would cost more than the sleep
+	 * it saves. `getDialQueue` is non-optional on the Libp2p interface, so an absent method
+	 * only ever means a test mock — treated as "no evidence of an in-flight dial", exactly as
+	 * `getConnections?.()` is handled elsewhere.
+	 */
+	private dialsInFlight(): number {
+		return (this.libp2p.getDialQueue?.() ?? [])
+			.filter(d => d.status === 'queued' || d.status === 'active').length;
 	}
 
 	private persistState(): void {
@@ -639,9 +691,14 @@ export class Libp2pKeyPeerNetwork implements IKeyNetwork, IPeerNetwork {
 
 			// If no connections and not the last attempt, wait and retry
 			if (connected.length === 0 && attempt < maxRetries - 1) {
-				if (!this.canRetryImprove(ids)) {
-					this.log('findCoordinator:retry-futile key=%s mode=%s hwm=%d',
-						keyStr, this.networkMode, this.networkHighWaterMark);
+				// Exclusion/ban filtered — a neighbour we may never pick is not something to
+				// wait for. The membership filter is deliberately NOT applied: an `unknown`
+				// (not-yet-identified) non-self neighbour is exactly the peer that flips to
+				// `serves` inside the retry window, so its presence must keep the window.
+				const knowable = ids.filter(id => !excludedSet.has(id) && !(this.reputation?.isBanned(id)));
+				if (!this.retryCouldImprove(knowable)) {
+					this.log('findCoordinator:retry-futile key=%s neighbors=%d dialsInFlight=%d mode=%s hwm=%d',
+						keyStr, knowable.length, this.dialsInFlight(), this.networkMode, this.networkHighWaterMark);
 					break;
 				}
 				this.log('findCoordinator:no-connections-retry key=%s attempt=%d delay=%dms', keyStr, attempt, retryDelayMs)
