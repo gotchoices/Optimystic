@@ -46,9 +46,37 @@ its own sub-namespace so a single concern can be traced in isolation:
 | `repo-service`             | Redirect decisions (inCluster vs redirect)             |
 | `cluster`                  | ClusterCoordinator phase transitions, majority calc    |
 | `cluster-member`           | ClusterMember promise/commit counts, phase transitions |
-| `coordinator-repo`         | CoordinatorRepo operations                             |
+| `coordinator-repo`         | CoordinatorRepo operations (peer-id suffixed)          |
 | `storage:restoration`      | Block restoration coordination                         |
-| `libp2p-key-network`       | Key network operations                                 |
+| `libp2p-key-network`       | Key network operations (peer-id suffixed)              |
+
+### Telling nodes apart in one process
+
+Integration tests run several nodes in a single process, so their log lines interleave. The
+sub-namespaces marked *peer-id suffixed* above append the owning node's peer id (first 12
+characters) to their namespace:
+
+```
+optimystic:db-p2p:coordinator-repo:12D3KooWAbCd
+```
+
+Because `debug` namespaces are hierarchical, a wildcard filter you already use
+(`optimystic:db-p2p:*`) keeps matching. To isolate one node:
+
+```bash
+# One node's cluster-repair decisions
+DEBUG='optimystic:db-p2p:coordinator-repo:12D3KooWAbCd' node app.js
+
+# Every node's, as before
+DEBUG='optimystic:db-p2p:coordinator-repo*' node app.js
+```
+
+An exact-match filter without a trailing `*` no longer matches these two sub-namespaces — add the
+`*` (this is why `test/support/capture-log.ts` enables both the bare and the suffixed form).
+
+Only these two sub-namespaces carry a peer id today; the rest are flat. If a diagnosis needs
+per-node attribution from another subsystem, pass its peer id as `createLogger`'s second argument
+— the mechanism is already in place.
 
 ### quereus-plugin sub-namespaces
 
@@ -100,7 +128,8 @@ DEBUG='optimystic:db-core:network-transactor,optimystic:db-p2p:storage-repo,opti
 
 ## Adding new loggers
 
-Each package has a `createLogger(subNamespace)` helper:
+Each package has a `createLogger(subNamespace)` helper (in `db-p2p` it takes an optional second
+argument, the owning node's peer id — see *Telling nodes apart in one process* above):
 
 ```typescript
 // In db-core
@@ -112,6 +141,10 @@ log('operation key=%s count=%d', key, count);
 import { createLogger } from '../logger.js';
 const log = createLogger('my-module');
 log('operation key=%s count=%d', key, count);
+
+// In db-p2p, when the instance knows which node it belongs to, suffix the
+// namespace with its peer id so a multi-node-in-one-process run is attributable
+this.log = createLogger('my-module', peerId?.toString());
 
 // In quereus-plugin-optimystic
 import { createLogger } from './logger.js';

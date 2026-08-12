@@ -19,6 +19,7 @@ import { createLogger } from '../src/logger.js';
 import { Libp2pKeyPeerNetwork } from '../src/libp2p-key-network.js';
 import { CoordinatorRepo } from '../src/repo/coordinator-repo.js';
 import type { ClusterClient } from '../src/cluster/client.js';
+import { captureLog, hasTag, hasTagAtRev } from './support/capture-log.js';
 
 const makePeerId = async (): Promise<PeerId> => peerIdFromPrivateKey(await generateKeyPair('Ed25519'));
 
@@ -53,8 +54,7 @@ const noopStorageRepo: IRepo = {
 	async commit() { return { success: true }; }
 };
 
-// eslint-disable-next-line @typescript-eslint/no-unused-vars
-const makeClusterClient = ((_peerId: PeerId) => ({} as any)) as (peerId: PeerId) => ClusterClient;
+const makeClusterClient = (() => ({})) as unknown as (peerId: PeerId) => ClusterClient;
 
 describe('createLogger peer-id namespacing', () => {
 	it('degrades to the bare namespace when no peer id is given', () => {
@@ -87,5 +87,37 @@ describe('createLogger peer-id namespacing', () => {
 	it('CoordinatorRepo with no localPeerId logs under the original un-suffixed namespace', () => {
 		const repo = new CoordinatorRepo(noopKeyNetwork, makeClusterClient, noopStorageRepo);
 		expect(namespaceOf(repo)).to.equal('optimystic:db-p2p:coordinator-repo');
+	});
+});
+
+/**
+ * `captureLog` enables a namespace by name, and `debug.enable` without a wildcard matches EXACTLY —
+ * so peer-id suffixing silently emptied every capture until the helper was widened to enable both
+ * shapes. These pin that seam directly, rather than leaving it to be re-discovered as a wall of
+ * "expected false to equal true" in the read-repair specs.
+ */
+describe('captureLog vs peer-id-suffixed namespaces', () => {
+	it('captures both the bare and the peer-id-suffixed form of the namespace', async () => {
+		const peerId = await makePeerId();
+		const bare = createLogger('capture-probe');
+		const suffixed = createLogger('capture-probe', peerId.toString());
+
+		const captured = await captureLog('capture-probe', async () => {
+			bare('bare-tag', { rev: 1 });
+			suffixed('suffixed-tag', { rev: 2 });
+		});
+
+		expect(hasTag(captured, 'bare-tag')).to.equal(true);
+		expect(hasTagAtRev(captured, 'suffixed-tag', 2)).to.equal(true);
+	});
+
+	it('does not capture a sibling namespace that merely shares a prefix', async () => {
+		const sibling = createLogger('capture-probe-sibling');
+
+		const captured = await captureLog('capture-probe', async () => {
+			sibling('sibling-tag', { rev: 1 });
+		});
+
+		expect(hasTag(captured, 'sibling-tag')).to.equal(false);
 	});
 });

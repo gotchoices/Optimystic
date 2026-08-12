@@ -196,6 +196,9 @@ export class Libp2pKeyPeerNetwork implements IKeyNetwork, IPeerNetwork {
 		 */
 		private readonly protocolPrefix?: string
 	) {
+		// Built here rather than as a field initializer: field initializers run before the
+		// constructor body, where `this.libp2p` (a parameter property) is not yet assigned.
+		this.log = createLogger('libp2p-key-network', this.libp2p.peerId.toString())
 		// NOTE: no production construction site in this repo passes a SelfCoordinationConfig —
 		// both leave it `undefined` (libp2p-node-base.ts, and the foreign-node fallback in
 		// quereus-plugin-optimystic's collection-factory.ts), so these defaults are always what
@@ -203,7 +206,6 @@ export class Libp2pKeyPeerNetwork implements IKeyNetwork, IPeerNetwork {
 		// those two sites have to thread the config through first. Low urgency: a grace-period denial no longer fails the caller, it only costs
 		// a write the findCoordinator retry window before self-coordinating — and only when that
 		// window is worth paying at all (see `retryCouldImprove`), so an isolated node pays nothing.
-		this.log = createLogger('libp2p-key-network', this.libp2p.peerId.toString())
 		this.selfCoordinationConfig = {
 			gracePeriodMs: selfCoordinationConfig?.gracePeriodMs ?? 30_000,
 			shrinkageThreshold: selfCoordinationConfig?.shrinkageThreshold ?? 0.5,
