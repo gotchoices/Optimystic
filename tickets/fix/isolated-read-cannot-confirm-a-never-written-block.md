@@ -1,3 +1,10 @@
+<!-- resume-note -->
+RESUME: A prior agent run on this ticket did not complete.
+  Prior run: 2026-08-12T22:35:12.095Z (agent: claude)
+  Log file: C:\projects\optimystic\tickets\.logs\isolated-read-cannot-confirm-a-never-written-block.fix.2026-08-12T22-35-12-095Z.log
+Read the log to see what was done. Resume where it left off.
+If the prior run hit a timeout or repeated error, be cautious not to rush into the same situation.
+<!-- /resume-note -->
 description: A node that is briefly alone on the network — just started, or a moment after losing its last connection — cannot read a table that has never been written to. The read fails outright instead of coming back empty, which can stop the node from finishing its own start-up.
 prereq:
 files: packages/db-p2p/src/repo/coordinator-repo.ts, packages/db-p2p/src/libp2p-key-network.ts, packages/db-core/src/transactor/network-transactor.ts
