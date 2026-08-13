@@ -138,6 +138,38 @@ export interface StoredIndexColumn {
 }
 
 /**
+ * Name-keyed union of two persisted index lists — the non-destructive merge every
+ * schema write goes through (see {@link SchemaManager.storeStoredSchema}).
+ *
+ * Rules:
+ * - An index present on either side survives. `incoming` keeps its order;
+ *   indexes only `persisted` knows about are appended after it. There is no
+ *   index-removal path in this plugin today (DROP TABLE tombstones the whole
+ *   entry via deleteSchema), so "union" and "correct" coincide; if a DROP INDEX
+ *   ever lands it needs a dedicated removal API, not a shrunken write here.
+ * - Uniqueness never silently downgrades: when both sides carry the index and
+ *   only `persisted` marks it unique, the merged entry keeps `unique` (and the
+ *   predicate that scopes it) — mirroring addIndex's upgrade rule, which only
+ *   ever adds the flag.
+ */
+export function mergeIndexLists(
+	incoming: readonly StoredIndexSchema[],
+	persisted: readonly StoredIndexSchema[]
+): StoredIndexSchema[] {
+	const merged = [...incoming];
+	const position = new Map(incoming.map((idx, i) => [idx.name, i]));
+	for (const idx of persisted) {
+		const at = position.get(idx.name);
+		if (at === undefined) {
+			merged.push(idx);
+		} else if (idx.unique && !merged[at]!.unique) {
+			merged[at] = { ...merged[at]!, unique: true, predicate: merged[at]!.predicate ?? idx.predicate };
+		}
+	}
+	return merged;
+}
+
+/**
  * Manages schema storage and retrieval in Optimystic trees
  */
 export class SchemaManager {
@@ -177,40 +209,128 @@ export class SchemaManager {
 	 * Store an already-converted StoredTableSchema directly. Exposed so callers
 	 * that need precise control over the persisted shape (e.g. merging
 	 * persisted indexes into a local-DDL candidate to avoid clobbering them)
-	 * can hand us the exact bytes to write.
+	 * can hand us the exact bytes to write — with ONE exception, below.
+	 *
+	 * NON-DESTRUCTIVE for `indexes`: before writing, the current catalog entry is
+	 * re-read through the write tree and the incoming index list is unioned with it
+	 * ({@link mergeIndexLists}). This is the last-moment guard against two silent
+	 * loss modes that a caller's earlier read cannot rule out:
+	 * - the caller's read collapsed "catalog unreadable" into "absent" (a provably
+	 *   indeterminate read throws, but a silently-empty cohort answer still reads
+	 *   as absent — see {@link getSchema}) and its candidate would overwrite a
+	 *   real index list with `[]`;
+	 * - the caller read through this instance's cache (or its own earlier snapshot)
+	 *   and a sibling added an index in between — a whole-record write-back would
+	 *   drop it.
+	 * Residual hole: if the WRITE path's read is served that same silent "absent"
+	 * for a catalog that really exists, the union has nothing to merge and the
+	 * write can still clobber — closing that needs the cluster-consult contract to
+	 * count responders (see the coordinator-repo tripwire recorded in
+	 * tickets/complete/4.5-repo-reports-unavailable-vs-absent.md).
+	 *
+	 * Returns the schema actually written (input + any unioned-in indexes); callers
+	 * that keep using the schema after the write must use the returned value, not
+	 * their input.
 	 */
-	async storeStoredSchema(stored: StoredTableSchema, transactor?: ITransactor): Promise<void> {
-		this.schemaCache.set(stored.name, stored);
-
+	async storeStoredSchema(stored: StoredTableSchema, transactor?: ITransactor): Promise<StoredTableSchema> {
 		const tree = await this.requireSchemaTree(transactor);
+
+		// Same read sequence as the read path: pull latest committed state, then
+		// look up this table's entry. Skip tombstones (entry[1] === undefined).
+		await tree.update();
+		const path = await tree.find(stored.name);
+		let persisted: StoredTableSchema | undefined;
+		if (tree.isValid(path)) {
+			const entry = tree.at(path) as [string, StoredTableSchema] | undefined;
+			if (entry && entry.length >= 2 && entry[1]) {
+				persisted = entry[1];
+			}
+		}
+		const merged: StoredTableSchema = persisted
+			? { ...stored, indexes: mergeIndexLists(stored.indexes, persisted.indexes) }
+			: stored;
+
 		// The schema tree's keyExtractor (in collection-factory) treats entries
 		// as `[name, StoredTableSchema]` tuples — keying on `entry[0]`. The
 		// per-table cache and read paths (getSchema, listTables) also expect
 		// the tuple shape. Storing the bare `stored` object made `entry[0]`
 		// undefined inside the btree, so cross-instance reads (and listTables)
 		// couldn't see the entries even after a clean sync.
-		await tree.replace([[stored.name, [stored.name, stored]]]);
+		await tree.replace([[merged.name, [merged.name, merged]]]);
+
+		// Cache what was ACTUALLY written, and only after the write succeeded — a
+		// failed replace must not leave the cache claiming the new value landed.
+		this.schemaCache.set(merged.name, merged);
+		return merged;
 	}
 
 	/**
-	 * Retrieve a table schema
+	 * Retrieve a table schema — CACHED read.
+	 *
+	 * The first answer this instance produced for a table is served from memory on
+	 * every later call; nothing invalidates it, so a schema another node (or another
+	 * SchemaManager over the same storage) changed since is NOT seen here. That is
+	 * fine for read paths (hydrate, planner, doInitialize's short-circuit compare)
+	 * where the write-time union in {@link storeStoredSchema} bounds the damage of
+	 * acting on a stale copy. A MUTATING path — anything that will write the schema
+	 * back or change enforcement based on the answer — must use
+	 * {@link getSchemaFresh} instead.
+	 *
+	 * `undefined` means "no schema visible". The block layer throws
+	 * `BlockUnavailableError` when it can PROVE a read is indeterminate
+	 * (repo-reports-unavailable-vs-absent, landed), and that throw propagates out
+	 * of this method — so a provably-unreachable catalog fails loudly here. But a
+	 * cohort that silently answers "nothing" (a per-peer timeout is
+	 * indistinguishable from a peer that holds nothing) still reads as
+	 * authoritatively absent, so `undefined` is not proof the catalog holds
+	 * nothing. Callers must never treat it as a licence to overwrite what might
+	 * really be persisted; the write-time index union is the standing guard.
 	 */
 	async getSchema(tableName: string, transactor?: ITransactor): Promise<StoredTableSchema | undefined> {
-		// Check cache first
 		const cached = this.schemaCache.get(tableName);
 		if (cached) {
 			return cached;
 		}
+		return await this.readSchemaFromCatalog(tableName, transactor);
+	}
 
-		// Load from tree. Open-only: a catalog that has never been committed means this
-		// database has no persisted schemas — never invent one just to read it.
-		// NOTE: this only fully separates "no schemas" from "could not reach the catalog"
-		// once the storage layer throws on an unretrievable block instead of reporting it
-		// missing (ticket repo-reports-unavailable-vs-absent).
-		// The btree's local state is built lazily, so a fresh SchemaManager (e.g. after
-		// process restart) sees an empty tree until we sync against storage — without
-		// this, cold-start reads silently return undefined and callers re-persist a
-		// schema that already exists.
+	/**
+	 * Retrieve a table schema for a MUTATING path: the catalog is consulted first,
+	 * bypassing the per-instance cache, so a change a sibling instance persisted
+	 * since this instance's first read is seen before anything is written back.
+	 * The blunt rule (every read that precedes a write goes to the catalog) is
+	 * deliberate — schema mutations are rare, and a subtler invalidation scheme is
+	 * exactly the kind of thing that rots.
+	 *
+	 * Falls back to the cached copy when the catalog read yields nothing: a cached
+	 * entry proves a schema existed, and "nothing" can still mean an undetectably
+	 * unreadable catalog (see {@link getSchema} for the residual ambiguity) —
+	 * reporting the table gone would be inventing certainty. The write-time union
+	 * in {@link storeStoredSchema} still guards whatever is written after such a
+	 * fallback.
+	 */
+	async getSchemaFresh(tableName: string, transactor?: ITransactor): Promise<StoredTableSchema | undefined> {
+		const fresh = await this.readSchemaFromCatalog(tableName, transactor);
+		if (fresh) {
+			return fresh;
+		}
+		return this.schemaCache.get(tableName);
+	}
+
+	/**
+	 * The tree-read half of {@link getSchema}: load the entry from the catalog and
+	 * refresh the cache on a hit. Open-only: a catalog that has never been committed
+	 * means this database has no persisted schemas — never invent one just to read it.
+	 * A PROVABLY unretrievable catalog block throws `BlockUnavailableError` out of
+	 * `Tree.open`/`update` (repo-reports-unavailable-vs-absent) rather than reading
+	 * as absent; only a silently-empty cohort answer still collapses to absent —
+	 * see {@link getSchema}.
+	 * The btree's local state is built lazily, so a fresh SchemaManager (e.g. after
+	 * process restart) sees an empty tree until we sync against storage — without
+	 * this, cold-start reads silently return undefined and callers re-persist a
+	 * schema that already exists.
+	 */
+	private async readSchemaFromCatalog(tableName: string, transactor?: ITransactor): Promise<StoredTableSchema | undefined> {
 		const tree = await this.getSchemaTree(transactor);
 		if (!tree) {
 			return undefined;
@@ -222,7 +342,9 @@ export class SchemaManager {
 		}
 
 		const entry = tree.at(path) as [string, StoredTableSchema];
-		if (entry && entry.length >= 2) {
+		// Skip tombstones — a deleted entry surfaces as `entry[1] === undefined`
+		// and must not be cached or returned as a live schema.
+		if (entry && entry.length >= 2 && entry[1]) {
 			const stored = entry[1];
 			this.schemaCache.set(tableName, stored);
 			return stored;

@@ -33,6 +33,10 @@ export { RowCodec, type EncodedRow, type PrimaryKeyValue, type EncodingFormat } 
 // can name them in their own signatures.
 export type { PrimaryKeyTuple, IndexColumnTuple, UnbrandedValues } from './schema/key-tuples.js';
 export type { StoredTableSchema, StoredColumnSchema, StoredPrimaryKeyColumn, StoredIndexSchema, StoredUniqueConstraint } from './schema/schema-manager.js';
+// The non-destructive index-list merge every schema-catalog write goes through
+// (see SchemaManager.storeStoredSchema). Exported so its union/upgrade rules can
+// be pinned directly by tests.
+export { mergeIndexLists } from './schema/schema-manager.js';
 
 // Export the order-preserving, injective key-framing primitives (shared by the
 // primary-key and secondary-index encoders).

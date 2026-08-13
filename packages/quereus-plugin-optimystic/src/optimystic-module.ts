@@ -404,12 +404,26 @@ export class OptimysticVirtualTable extends VirtualTable {
           // Structural mismatch (columns/PK/vtab args changed). Write the
           // merged candidate so a real DDL change still wins on columns
           // while persisted indexes survive — they're managed by addIndex().
-          await this.schemaManager.storeStoredSchema(mergedCandidate, txnState?.transactor);
-          const written = await this.schemaManager.getSchema(this.tableName, txnState?.transactor);
-          if (!written) {
-            throw new Error('Failed to store and retrieve schema');
+          //
+          // CONTRACT: `persistedSchema === undefined` does NOT prove the catalog
+          // holds nothing for this table. A PROVABLY unreachable catalog throws
+          // out of getSchema (BlockUnavailableError) and this initialization
+          // fails loudly — but a silently-empty cohort answer still reads as
+          // absent (see SchemaManager.getSchema). This write is safe against
+          // that residual ambiguity only because storeStoredSchema re-reads the
+          // entry at write time and unions `indexes`, so a persisted index list
+          // this node's read could not see is never overwritten with the
+          // candidate's empty one. The returned value is the schema actually
+          // written (including any unioned-in indexes) and MUST be what this
+          // table honours from here on.
+          if (!persistedSchema && candidateStored.indexes.length === 0) {
+            log(
+              'doInitialize(%s): persisting local DDL schema with no persisted catalog entry visible; ' +
+              'if an entry exists but was unreadable, the write-time index union preserves its indexes',
+              this.tableName
+            );
           }
-          storedSchema = written;
+          storedSchema = await this.schemaManager.storeStoredSchema(mergedCandidate, txnState?.transactor);
         }
       } else if (persistedSchema) {
         this.tableSchema.columns = persistedSchema.columns.map((col, index) => ({
@@ -1935,7 +1949,11 @@ export class OptimysticVirtualTable extends VirtualTable {
       throw new Error('Table not initialized');
     }
 
-    const storedSchema = await this.schemaManager.getSchema(this.tableName);
+    // MUTATING path: read the catalog fresh, not through the per-instance cache.
+    // The dedupe below and the write-back both reason from this value, so serving
+    // a cached copy would let an index a sibling instance persisted since our
+    // first read be silently dropped (or rebuilt from scratch).
+    const storedSchema = await this.schemaManager.getSchemaFresh(this.tableName);
     if (!storedSchema) {
       throw new Error('Schema not found');
     }
@@ -1963,9 +1981,14 @@ export class OptimysticVirtualTable extends VirtualTable {
               : idx,
           ),
         };
-        await this.schemaManager.storeStoredSchema(upgraded, txnState?.transactor);
-        this.indexManager.setSchema(upgraded);
-        effective = upgraded;
+        // storeStoredSchema unions `indexes` with the current catalog entry at
+        // write time, so honour its return value — it may carry indexes a
+        // concurrent writer added after our read above. Folding it into the
+        // IndexManager waits until after reconcile below has opened every tree
+        // it declares: setSchema REPLACES the list the staging paths iterate,
+        // and a listed index with no registered tree makes insertIndexEntries
+        // throw.
+        effective = await this.schemaManager.storeStoredSchema(upgraded, txnState?.transactor);
       }
       // The PERSISTED schema already carries the index, so there is nothing to
       // re-write — but that says nothing about THIS vtab's in-memory maintenance
@@ -1977,6 +2000,12 @@ export class OptimysticVirtualTable extends VirtualTable {
       // maintained set with the persisted one — idempotent, so the common warm
       // re-declare stays cheap.
       await this.reconcileMaintainedIndexes(effective, txnState?.transactor);
+      // With every tree in `effective` now open and registered, fold in the
+      // upgraded descriptors (reconcile only re-sets the schema when an index
+      // was missing entirely, which the unique-flag upgrade is not).
+      if (effective !== storedSchema) {
+        this.indexManager.setSchema(effective);
+      }
       return;
     }
 
@@ -1999,23 +2028,27 @@ export class OptimysticVirtualTable extends VirtualTable {
     // Save the updated schema. Persist the merged stored form directly — the old
     // detour through `storeSchema({...this.tableSchema, indexes})` re-mapped each
     // index to bare `{name, columns}` and silently dropped `unique`/`predicate`.
-    await this.schemaManager.storeStoredSchema(updatedSchema, txnState?.transactor);
+    // The write-back is a name-keyed UNION, not an overwrite: storeStoredSchema
+    // merges `indexes` with the catalog entry as it stands at write time, so an
+    // index a concurrent writer persisted between our fresh read above and this
+    // write survives. Honour the returned (possibly wider) schema from here on.
+    const writtenSchema = await this.schemaManager.storeStoredSchema(updatedSchema, txnState?.transactor);
 
     // Initialize the new index tree
     const indexTree = await this.openIndexTree(indexSchema.name, txnState?.transactor);
 
-    // Add the index to the index manager
-    if (this.indexManager) {
-      this.indexManager.registerIndexTree(indexSchema.name, indexTree);
-      this.indexManager.setSchema(updatedSchema);
-    }
-
-    // Register the new index collection so a session-mode coordinator sees it.
-    // CREATE INDEX normally runs outside a DML transaction, so the coordinator
-    // picks it up before the next transaction's snapshot. (An index created
-    // mid-transaction would miss that transaction's already-taken snapshot — a
-    // known, documented edge.)
-    this.txnBridge.registerCollection(indexTree.getCollection());
+    // Register our tree first (so reconcile does not open a second instance of
+    // it), then reconcile against the WRITTEN schema: that folds the schema into
+    // the manager, opens a tree for any union-added sibling index (setSchema
+    // alone would make staging iterate an index with no registered tree and
+    // throw), and registers every index collection with the transaction bridge
+    // so a session-mode coordinator sees them. CREATE INDEX normally runs
+    // outside a DML transaction, so the coordinator picks the new collection up
+    // before the next transaction's snapshot. (An index created mid-transaction
+    // would miss that transaction's already-taken snapshot — a known,
+    // documented edge.)
+    this.indexManager.registerIndexTree(indexSchema.name, indexTree);
+    await this.reconcileMaintainedIndexes(writtenSchema, txnState?.transactor);
 
     // Populate the index with existing data.
     // NOTE: CREATE UNIQUE INDEX does not reject pre-existing duplicate values — the
@@ -2096,10 +2129,11 @@ export class OptimysticVirtualTable extends VirtualTable {
     const manager = this.indexManager;
     // NOTE: setSchema REPLACES the manager's index list, so a `storedSchema` that is
     // missing an index the manager already maintains would narrow the maintained set
-    // rather than widen it. Reachable only if a stale or index-losing persisted schema
-    // gets this far — the supply side `schema-catalog-index-list-is-lossy` closes; if it
-    // ever lands here anyway, the reads still fail loudly (assertIndexMaintained), but
-    // switch this to a name-keyed union of the two lists.
+    // rather than widen it. The supply side is closed (mutating paths read the catalog
+    // fresh, and storeStoredSchema's write-time union means the persisted list never
+    // shrinks — see SchemaManager); if a narrower schema ever lands here anyway, the
+    // reads still fail loudly (assertIndexMaintained), but switch this to a name-keyed
+    // union of the two lists.
     if (storedSchema.indexes.some(idx => manager.getIndexSchema(idx.name) === undefined)) {
       manager.setSchema(storedSchema);
     }
