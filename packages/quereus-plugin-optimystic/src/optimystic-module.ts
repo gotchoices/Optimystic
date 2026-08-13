@@ -2003,13 +2003,20 @@ export class OptimysticVirtualTable extends VirtualTable {
       // tree while the planner keeps routing seeks into it. Reconcile the
       // maintained set with the persisted one — idempotent, so the common warm
       // re-declare stays cheap.
-      await this.reconcileMaintainedIndexes(effective, txnState?.transactor);
+      const attached = await this.reconcileMaintainedIndexes(effective, txnState?.transactor);
       // With every tree in `effective` now open and registered, fold in the
       // upgraded descriptors (reconcile only re-sets the schema when an index
       // was missing entirely, which the unique-flag upgrade is not).
       if (effective !== storedSchema) {
         this.indexManager.setSchema(effective);
       }
+      // Rows this connection committed WHILE detached from a now-attached index
+      // have no entry in it. Attaching alone would leave them invisible to every
+      // index-driven lookup, forever and silently; backfill closes that gap. Runs
+      // after the setSchema fold above so the helper resolves descriptors from the
+      // final schema. No-op (no scan) when nothing was newly attached, which is the
+      // warm re-declare.
+      await this.backfillIndexTrees(attached);
       return;
     }
 
@@ -2052,41 +2059,88 @@ export class OptimysticVirtualTable extends VirtualTable {
     // would miss that transaction's already-taken snapshot — a known,
     // documented edge.)
     this.indexManager.registerIndexTree(indexSchema.name, indexTree);
-    await this.reconcileMaintainedIndexes(writtenSchema, txnState?.transactor);
+    const attached = await this.reconcileMaintainedIndexes(writtenSchema, txnState?.transactor);
 
-    // Populate the index with existing data.
-    // NOTE: insertIndexEntries stages into EVERY index the manager maintains, not just
-    // the one being built, so this loop re-writes each existing row's entry into every
-    // sibling index too. Idempotent (same key, same value, keyed replace) and correct,
-    // but the write volume is rows x indexes rather than rows. Fine while CREATE INDEX
-    // is a cold-path DDL statement on modest tables; if building an index on a large
-    // table shows up as slow, give IndexManager a single-index staging entry point and
-    // call it here.
-    // NOTE: CREATE UNIQUE INDEX does not reject pre-existing duplicate values — the
-    // populate loop keys each entry on indexCols‖pk, so duplicates coexist and the
-    // index builds successfully. Now that the derived uniqueConstraint is mirrored onto
-    // this.tableSchema (above), the probe rejects FUTURE duplicates but the existing
-    // ones remain. This diverges from SQLite (which fails the CREATE on dup data). If a
-    // pre-build integrity check is ever wanted, validate uniqueness here before staging.
-    if (this.collection && this.rowCodec) {
-      const firstPath = await this.collection.first();
-      for await (const path of this.collection.ascending(firstPath)) {
-        const entry = this.collection.at(path) as [string, EncodedRow] | undefined;
-        if (entry && entry.length >= 2) {
-          const encodedRow = entry[1];
-          const row = this.rowCodec.decodeRow(encodedRow);
-          const primaryKey = this.rowCodec.extractPrimaryKey(row);
-          await this.indexManager.insertIndexEntries(row, primaryKey, txnState?.transactor);
-        }
-      }
+    // Populate the index with existing data. Reconcile reports the index just built
+    // as newly attached (the manager carried no descriptor for it until the setSchema
+    // inside reconcile), so this ONE call serves both the build path and the
+    // re-attach path above — there is no second populate loop to keep in step.
+    await this.backfillIndexTrees(attached);
+  }
 
-      // insertIndexEntries only STAGES now. addIndex runs outside the DML
-      // transaction's commit (and Tree.replace() used to persist inline), so
-      // flush the freshly populated index to storage here. Trees with nothing
-      // staged sync as a no-op.
-      for (const tree of this.indexManager.getIndexTrees()) {
-        await tree.sync();
+  /**
+   * Stage an entry for EVERY committed row into each named index tree, then flush
+   * only those trees. The single populate path: `addIndex` uses it to build a
+   * brand-new index, and the already-persisted branch uses it to close the gap for
+   * rows committed while this connection was detached from an index it has now
+   * re-attached to.
+   *
+   * Modelled on {@link ensureUniquePopulated}: stage into the target trees IN
+   * ISOLATION and sync only those, never touching the caller's staged main-table
+   * mutations. Idempotent by construction — entries are keyed `indexColumns‖primaryKey`,
+   * so re-staging a row that already has an entry writes a byte-identical key and value.
+   *
+   * Two deliberate differences from the populate loop this replaced:
+   *   - it refreshes `this.collection` first (the old loop did not), matching
+   *     ensureUniquePopulated and widening coverage to rows a sibling committed since
+   *     this connection last pulled;
+   *   - it stages per named index and syncs only those trees, rather than staging into
+   *     every maintained index and flushing all of them.
+   *
+   * NOTE: CREATE UNIQUE INDEX does not reject pre-existing duplicate values — entries
+   * are keyed on indexCols‖pk, so duplicates coexist and the index builds successfully.
+   * With the derived uniqueConstraint mirrored onto this.tableSchema, the probe rejects
+   * FUTURE duplicates but the existing ones remain. This diverges from SQLite (which
+   * fails the CREATE on dup data). If a pre-build integrity check is ever wanted,
+   * validate uniqueness here before staging.
+   *
+   * NOTE: a CREATE INDEX issued inside an open transaction force-flushes the trees it
+   * populates, so those entries survive a later ROLLBACK. The caveat predates this
+   * helper (the old populate loop flushed every index tree; ensureUniquePopulated does
+   * the same mid-DML) and is narrowed by it: only NEWLY ATTACHED trees are synced, and
+   * the caller cannot have staged into those — they were attached microseconds ago.
+   *
+   * NOTE: `predicate` (partial indexes) is not honoured here, matching
+   * insertIndexEntries on the live DML path. Backfill and live maintenance therefore
+   * agree; both over-populate a partial index. Fix them together or not at all.
+   */
+  private async backfillIndexTrees(indexNames: readonly string[]): Promise<void> {
+    if (indexNames.length === 0) return;
+    if (!this.collection || !this.rowCodec || !this.indexManager) return;
+    const manager = this.indexManager;
+
+    const targets = indexNames.map(name => {
+      const descriptor = manager.getIndexSchema(name);
+      const tree = manager.getIndexTree(name);
+      if (!descriptor || !tree) {
+        // reconcileMaintainedIndexes folds the descriptor in and opens the tree before
+        // it reports a name as attached, so this is a wiring bug, not a data condition.
+        throw new Error(
+          `Cannot populate index '${name}' on '${this.tableName}': ` +
+          `${descriptor ? 'tree' : 'descriptor'} not registered`,
+        );
       }
+      return { descriptor, tree };
+    });
+
+    await this.collection.update();
+    for await (const path of this.collection.ascending(await this.collection.first())) {
+      if (!this.collection.isValid(path)) continue;
+      const entry = this.collection.at(path) as [string, EncodedRow] | undefined;
+      if (!entry || entry.length < 2) continue;
+      const row = this.rowCodec.decodeRow(entry[1]);
+      const primaryKey = this.rowCodec.extractPrimaryKey(row);
+      for (const { descriptor, tree } of targets) {
+        const treeKey = manager.createIndexKey(descriptor, row) + primaryKey;
+        await tree.stage([[treeKey, [treeKey, primaryKey]]]);
+      }
+    }
+
+    // Staging alone is not durable: addIndex runs outside the DML transaction's
+    // commit, so flush the trees this call populated. Trees with nothing staged sync
+    // as a no-op.
+    for (const { tree } of targets) {
+      await tree.sync();
     }
   }
 
@@ -2120,24 +2174,35 @@ export class OptimysticVirtualTable extends VirtualTable {
    * when nothing is missing this is a map lookup per index and a no-op re-set of
    * the bridge registry (itself keyed by collection id).
    *
-   * NOTE: reconciliation does NOT backfill index entries for rows committed while
-   * this vtab was divergent (writes that skipped the index). Those rows were
-   * indexed by whichever writer built the index (addIndex's populate loop covers
-   * rows persisted before the CREATE INDEX); rows a divergent vtab wrote after
-   * that populate are NOT surfaced by the planner-side maintenance guard either —
-   * once reconciled, this table maintains the index and the guard passes, so an
-   * index-driven lookup silently misses them. Tracked by
-   * `fix/index-reattach-leaves-rows-unindexed`, which decides between backfilling
-   * here and refusing to attach.
+   * RETURNS the names it newly attached — an index the manager had no descriptor for,
+   * or no open tree for. Rows this vtab committed while detached from such an index
+   * have no entry in it, so the caller (addIndex) must populate them: see
+   * {@link backfillIndexTrees}. The set is computed BEFORE anything is mutated, since
+   * the wiring below is exactly what erases the evidence. A re-declare with nothing
+   * missing returns `[]`, so the warm path stays a map lookup per index and pays no
+   * table scan; a re-declare that DOES attach something costs one scan of the table.
+   *
+   * NOTE: backfill runs only on a CREATE INDEX re-declare that actually attaches
+   * something. A connection that opens the table cold and finds the index already in
+   * the persisted schema attaches nothing here and therefore does NOT scan — so rows
+   * orphaned by some other divergent writer stay orphaned until someone re-declares the
+   * index. Making every table open pay an O(rows) verification scan is the wrong trade
+   * for the common case. If orphaned entries ever show up in the field without a
+   * re-declare to heal them, add an explicit repair entry point rather than a scan on
+   * open.
    */
   private async reconcileMaintainedIndexes(
     storedSchema: StoredTableSchema,
     transactor?: ITransactor
-  ): Promise<void> {
+  ): Promise<string[]> {
     if (!this.indexManager) {
       throw new Error('Table not initialized');
     }
     const manager = this.indexManager;
+    const attached = storedSchema.indexes
+      .filter(idx => manager.getIndexSchema(idx.name) === undefined
+        || manager.getIndexTree(idx.name) === undefined)
+      .map(idx => idx.name);
     // NOTE: setSchema REPLACES the manager's index list, so a `storedSchema` that is
     // missing an index the manager already maintains would narrow the maintained set
     // rather than widen it. The supply side is closed (mutating paths read the catalog
@@ -2157,6 +2222,7 @@ export class OptimysticVirtualTable extends VirtualTable {
       // Idempotent (keyed by collection id) — see TransactionBridge.registerCollection.
       this.txnBridge.registerCollection(tree.getCollection());
     }
+    return attached;
   }
 
   /**

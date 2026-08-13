@@ -9,6 +9,7 @@ import { KeyRange } from '@optimystic/db-core';
 import register from '../dist/plugin.js';
 import { encodeKeyElement } from '../src/schema/key-encoding.js';
 import { serializeIndexValue } from '../src/schema/index-manager.js';
+import { expectIndexAgreesWithScan } from './query-helpers.js';
 
 /**
  * Framed single-column index prefix for value `v` — the leading frame(indexValue)
@@ -151,6 +152,15 @@ describe('Optimystic Index Support', () => {
 			`);
 		});
 
+		// Close every case in this block on the generalized invariant: whatever the test
+		// did to the table, an index-routed lookup must still return exactly what a full
+		// scan returns, for every value present. `category` leads idx_category and
+		// `price` leads idx_price, so both forms are routable.
+		afterEach(async () => {
+			await expectIndexAgreesWithScan(db, 'products', 'category');
+			await expectIndexAgreesWithScan(db, 'products', 'price');
+		});
+
 		it('should use index for equality search', async () => {
 			const result = await collectRows(db.eval("SELECT * FROM products WHERE category = 'Tools'"));
 			expect(result).to.have.lengthOf(3);
@@ -223,6 +233,12 @@ describe('Optimystic Index Support', () => {
 			}
 		});
 
+		// `city` leads idx_city_age (10 distinct values over the 100 rows, so this stays
+		// cheap); email/age would be the same assertion at 100/50 queries a case.
+		afterEach(async () => {
+			await expectIndexAgreesWithScan(db, 'users', 'city');
+		});
+
 		it('should choose best index for query', async () => {
 			// Query with email constraint should use idx_email
 			const result = await collectRows(db.eval("SELECT * FROM users WHERE email = 'user50@example.com'"));
@@ -274,6 +290,9 @@ describe('Optimystic Index Support', () => {
 			const result = await collectRows(db.eval("SELECT * FROM categories WHERE type_id = 'food'"));
 			expect(result).to.have.lengthOf(2);
 			expect(result.every(r => r.type_id === 'food')).to.equal(true);
+
+			// Every pre-existing row, not only the 'food' ones, must have been indexed.
+			await expectIndexAgreesWithScan(db, 'categories', 'type_id');
 		});
 	});
 
@@ -287,6 +306,13 @@ describe('Optimystic Index Support', () => {
 			`);
 
 			await db.exec('CREATE INDEX idx_value ON test_table(value)');
+		});
+
+		// `value` is nullable, so this block is also where the NULL arm of the invariant
+		// gets exercised (compared through `where value is null`, which the planner does
+		// not push into a seek).
+		afterEach(async () => {
+			await expectIndexAgreesWithScan(db, 'test_table', 'value');
 		});
 
 		it('should handle NULL values in index', async () => {
@@ -370,6 +396,8 @@ describe('Optimystic Index Support', () => {
 			expect(keys.some(k => k.startsWith(idxPrefix('b'))), "stale 'b' entry is absent").to.be.false;
 			// New entry for 'z'/id=2 must be present.
 			expect(keys.some(k => k.startsWith(idxPrefix('z'))), "new 'z' entry is present").to.be.true;
+
+			await expectIndexAgreesWithScan(db, 'orphan_upd', 'cat');
 		});
 
 		it('DELETE leaves no orphan index entry', async () => {
@@ -389,6 +417,8 @@ describe('Optimystic Index Support', () => {
 			const keys = await scanIndexKeys(plugin, 'tree://test/orphan_del/index/idx_orphan_del_cat');
 			expect(keys.length, 'index entry count after DELETE').to.equal(2);
 			expect(keys.some(k => k.startsWith(idxPrefix('c'))), "deleted 'c' entry is absent").to.be.false;
+
+			await expectIndexAgreesWithScan(db, 'orphan_del', 'cat');
 		});
 
 		it('UPDATE that leaves the indexed column unchanged neither drops nor duplicates the entry', async () => {
@@ -413,6 +443,8 @@ describe('Optimystic Index Support', () => {
 			expect(keys.length, 'index entry count after no-op-index UPDATE').to.equal(2);
 			expect(keys.some(k => k.startsWith(idxPrefix('a'))), "row 1's 'a' entry intact").to.be.true;
 			expect(keys.some(k => k.startsWith(idxPrefix('b'))), "row 2's 'b' entry intact").to.be.true;
+
+			await expectIndexAgreesWithScan(db, 'orphan_noop', 'cat');
 		});
 
 		it("UPDATE on a non-unique index removes only the moved row's entry, not a sibling sharing the old value", async () => {
@@ -437,6 +469,8 @@ describe('Optimystic Index Support', () => {
 			expect(keys, "row 1's b/id=1 entry intact").to.include(idxKey('b', 1));
 			expect(keys, "row 2's b/id=2 entry removed").to.not.include(idxKey('b', 2));
 			expect(keys, "row 2's new z/id=2 entry present").to.include(idxKey('z', 2));
+
+			await expectIndexAgreesWithScan(db, 'orphan_dup', 'cat');
 		});
 
 		it('UPDATE/DELETE on an INTEGER-typed indexed column leaves no orphan and seeks correctly', async () => {
@@ -487,6 +521,8 @@ describe('Optimystic Index Support', () => {
 			const at10 = await collectRows(db.eval('SELECT * FROM orphan_int WHERE n = 10'));
 			expect(at10, 'seek n=10 returns the untouched row').to.have.lengthOf(1);
 			expect(at10[0]!.id).to.equal(1);
+
+			await expectIndexAgreesWithScan(db, 'orphan_int', 'n');
 		});
 	});
 });

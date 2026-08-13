@@ -18,6 +18,7 @@ import { expect } from 'chai';
 import { Database } from '@quereus/quereus';
 import type { SqlValue } from '@quereus/quereus';
 import register from '../dist/plugin.js';
+import { expectIndexAgreesWithScan } from './query-helpers.js';
 
 function createDb(): { db: Database } {
 	const db = new Database();
@@ -357,6 +358,11 @@ describe('Secondary UNIQUE constraint enforcement on the optimystic vtab', funct
 			await db.exec(`delete from S where Id = 2`);
 			await db.exec(`insert into S (Id, Stamp) values (4, 'a')`);
 			expect(await scalar(db, `select Id as v from S where Stamp = 'a'`)).to.equal(4);
+
+			// Generalized close-out over the DECLARED unique index: after the eviction,
+			// delete and re-insert, the index-routed seek and a full scan must agree for
+			// every Stamp value present.
+			await expectIndexAgreesWithScan(db, 'S', 'Stamp');
 		} finally {
 			db.close();
 		}
@@ -528,6 +534,11 @@ describe('Secondary UNIQUE constraint enforcement on the optimystic vtab', funct
 				/UNIQUE constraint failed/,
 			);
 			expect(await scalar(db, `select count(*) as v from T`)).to.equal(2);
+
+			// The index was built over a table that already had rows: the pre-existing row
+			// and the later insert must BOTH be reachable through it, not just the one the
+			// duplicate probe happened to touch.
+			await expectIndexAgreesWithScan(db, 'T', 'Stamp');
 		} finally {
 			db.close();
 		}

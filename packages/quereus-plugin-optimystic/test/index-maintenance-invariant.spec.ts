@@ -32,6 +32,7 @@ import { MemoryRawStorage, StorageRepo, BlockStorage } from '@optimystic/db-p2p'
 import type { ITransactor } from '@optimystic/db-core';
 import { KeyRange } from '@optimystic/db-core';
 import register from '../dist/plugin.js';
+import { expectIndexAgreesWithScan } from './query-helpers.js';
 
 type Row = Record<string, SqlValue>;
 type Plugin = ReturnType<typeof register>;
@@ -181,6 +182,63 @@ describe('Index maintenance must track the declared index set', function () {
 		expect(onC.map(r => r.id)).to.deep.equal([2]);
 		const onA = await collectRows(dbA.eval(`select id from warm_redeclare where token = 'tok-b'`));
 		expect(onA.map(r => r.id)).to.deep.equal([2]);
+	});
+
+	it('re-attaching to an index backfills the rows written while detached from it', async () => {
+		// Ticket `index-reattach-leaves-rows-unindexed`. Same two-connection shape as the
+		// first spec, but the divergent write happens BEFORE the re-declare rather than
+		// after: A commits a row while it is detached from an index B already built. Wiring
+		// A back onto the index (descriptor + tree + bridge) does nothing for that row —
+		// only a populate pass does. Without the backfill the row is committed and visible
+		// to a full scan while every index-driven seek misses it, on BOTH connections,
+		// with no error anywhere.
+		const storage = new MemoryRawStorage();
+		const shared = buildSharedLocalTransactor(storage);
+		const dbA = new Database();
+		const pluginA = registerWithSharedTransactor(dbA, shared);
+		const dbB = new Database();
+		const pluginB = registerWithSharedTransactor(dbB, shared);
+
+		const uri = 'tree://invariant/backfill';
+		const ddl = `create table backfill (id integer primary key, token text) using optimystic('${uri}')`;
+		const indexUri = `${uri}/index/backfill_by_token`;
+
+		// A declares the table (no index yet) and writes row 1.
+		await dbA.exec(ddl);
+		await dbA.exec(`insert into backfill (id, token) values (1, 'tok-a')`);
+
+		// B declares the index and populates it from row 1.
+		await dbB.exec(ddl);
+		await dbB.exec(`create index backfill_by_token on backfill(token)`);
+		expect(await countTreeEntries(pluginB, indexUri), 'B populated from the pre-existing row')
+			.to.equal(1);
+
+		// A — still detached from the index — commits row 2. Its index entry is skipped.
+		await dbA.exec(`insert into backfill (id, token) values (2, 'tok-b')`);
+		expect(await countTreeEntries(pluginA, indexUri), 'the detached write left no index entry')
+			.to.equal(1);
+
+		// A reconciles: hydrate reseeds its schema cache so the CREATE INDEX takes the
+		// already-persisted early return, which must now backfill row 2.
+		await pluginA.hydrate(dbA);
+		await dbA.exec(`create index backfill_by_token on backfill(token)`);
+
+		expect(await countTreeEntries(pluginA, indexUri), 'row 2 gained its index entry on re-attach')
+			.to.equal(2);
+
+		const onA = await collectRows(dbA.eval(`select id from backfill where token = 'tok-b'`));
+		expect(onA.map(r => r.id), "A's index seek finds the backfilled row").to.deep.equal([2]);
+		const onB = await collectRows(dbB.eval(`select id from backfill where token = 'tok-b'`));
+		expect(onB.map(r => r.id), "B's index seek finds the backfilled row").to.deep.equal([2]);
+
+		// The row that was already indexed must not have been duplicated by the backfill
+		// (entries are keyed indexColumns‖pk, so re-staging is a byte-identical rewrite).
+		const stillA = await collectRows(dbA.eval(`select id from backfill where token = 'tok-a'`));
+		expect(stillA.map(r => r.id), 'the pre-existing entry is neither lost nor doubled')
+			.to.deep.equal([1]);
+
+		await expectIndexAgreesWithScan(dbA, 'backfill', 'token');
+		await expectIndexAgreesWithScan(dbB, 'backfill', 'token');
 	});
 
 	it('a query planned onto an unmaintained index fails loudly, naming table and index', async () => {

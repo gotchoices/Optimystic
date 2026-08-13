@@ -24,6 +24,7 @@ import type { ITransactor } from '@optimystic/db-core';
 import { KeyRange } from '@optimystic/db-core';
 import { createMesh, buildNetworkTransactors, type Mesh } from '@optimystic/db-p2p/testing';
 import register from '../dist/plugin.js';
+import { expectIndexAgreesWithScan } from './query-helpers.js';
 
 type Row = Record<string, SqlValue>;
 type Plugin = ReturnType<typeof register>;
@@ -134,6 +135,11 @@ describe('Two-node secondary-index convergence (write on one node, index-seek on
 		// even when query results happen to look right.
 		expect(await countTreeEntries(pluginA, INDEX_URI), 'index entries seen from node A').to.equal(3);
 		expect(await countTreeEntries(pluginB, INDEX_URI), 'index entries seen from node B').to.equal(3);
+
+		// Generalized close-out: for EVERY Token value present, the index-routed seek must
+		// return exactly the full scan's rows — on both nodes.
+		await expectIndexAgreesWithScan(dbA, 'FormationUsage', 'Token');
+		await expectIndexAgreesWithScan(dbB, 'FormationUsage', 'Token');
 	});
 
 	it('both nodes declare table + index before either writes, then both write and both index-seek', async () => {
@@ -158,5 +164,8 @@ describe('Two-node secondary-index convergence (write on one node, index-seek on
 
 		expect(await countTreeEntries(pluginA, INDEX_URI), 'index entries seen from node A').to.equal(3);
 		expect(await countTreeEntries(pluginB, INDEX_URI), 'index entries seen from node B').to.equal(3);
+
+		await expectIndexAgreesWithScan(dbA, 'FormationUsage', 'Token');
+		await expectIndexAgreesWithScan(dbB, 'FormationUsage', 'Token');
 	});
 });
