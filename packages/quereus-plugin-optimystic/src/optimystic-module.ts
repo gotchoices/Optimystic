@@ -1002,7 +1002,17 @@ export class OptimysticVirtualTable extends VirtualTable {
           ),
         );
 
-    // Look up primary keys using the index read source
+    // NOTE: an entry whose row has since moved off the indexed value (a writer that was
+    // not maintaining this index UPDATEd the row; backfillIndexTrees adds the new entry on
+    // re-attach but never purges the old one) still resolves to a LIVE row, and this loop
+    // yields it although it does not match the seek key. Benign only because Quereus
+    // re-applies the predicate: over such a tree, `where token = 'tok-a'` was observed
+    // yielding row `[1, 'tok-z']` here while the statement still returned no rows.
+    // getBestAccessPlan reports those filters as handledFilters=true, so the day the engine
+    // trusts that promise — or a covering-index read lands that never fetches the row — a
+    // stale entry becomes a wrong row. Close it then by re-deriving
+    // IndexManager.createIndexKey from the fetched row and skipping entries whose key does
+    // not prefix-match `indexKey`.
     for await (const primaryKey of this.indexManager.findByIndexIn(index.read, indexKey)) {
       // Fetch the row from the main table using the primary key
       const path = await mainRead.find(primaryKey);
@@ -2103,6 +2113,18 @@ export class OptimysticVirtualTable extends VirtualTable {
    * NOTE: `predicate` (partial indexes) is not honoured here, matching
    * insertIndexEntries on the live DML path. Backfill and live maintenance therefore
    * agree; both over-populate a partial index. Fix them together or not at all.
+   *
+   * NOTE: backfill only ADDS entries, never purges. An entry a detached writer left
+   * behind (its UPDATE moved the row off that indexed value, or its DELETE removed the
+   * row) survives the re-attach — see the stale-entry note in {@link executeIndexScan}
+   * for why that is benign today and what flips it.
+   *
+   * NOTE: the walk stages one action per row per target index, holds them all pending
+   * until the sync below, and re-stages EVERY row on every attach (an identical upsert
+   * still rewrites the leaf). Fine while this is cold-path DDL on modest tables; if
+   * building or re-attaching an index on a large table shows up as slow or
+   * memory-hungry, batch the stage calls per chunk of rows and skip rows whose entry
+   * the tree already carries.
    */
   private async backfillIndexTrees(indexNames: readonly string[]): Promise<void> {
     if (indexNames.length === 0) return;

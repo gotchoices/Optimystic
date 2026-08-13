@@ -110,6 +110,11 @@ function installIndexRoutingProbe(): IndexRoutingProbe {
  * misses it. Any interleaving of table declaration, index declaration and writes must
  * leave the two agreeing.
  *
+ * The values queried come from the SCAN, so this catches a stale/orphaned entry only
+ * when its value is still present in some row (the entry then pulls an extra row into
+ * that value's seek). An entry for a value no longer held by ANY row is never queried
+ * and so never seen here — assert on the tree's keys directly for that.
+ *
  * `column` must be covered by a DECLARED secondary index whose FIRST column it is —
  * that is what makes the equality form routable. Each value-form query is required to
  * have reached `executeIndexScan`, so a full-scan fallback fails the assertion instead
