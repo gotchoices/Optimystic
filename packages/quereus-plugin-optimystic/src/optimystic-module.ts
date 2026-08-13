@@ -434,20 +434,10 @@ export class OptimysticVirtualTable extends VirtualTable {
       this.rowCodec = new RowCodec(storedSchema, this.options.encoding);
 
       // Create and initialize index manager
-      this.indexManager = new IndexManager(storedSchema, async (indexName, transactor) => {
-        const indexOptions: ParsedOptimysticOptions = {
-          ...this.options,
-          collectionUri: `${this.options.collectionUri}/index/${indexName}`,
-        };
-        // NOTE: create-on-missing is intentional — same reason as the data tree above. An
-        // index whose table has no rows yet has never committed a header block, so an
-        // open-only fetch would report the index as missing rather than as empty.
-        const tree = await this.collectionFactory.createOrGetCollection(
-          indexOptions,
-          transactor ? { transactor, isActive: true, collections: new Map(), stampId: '' } : undefined
-        );
-        return tree as unknown as Tree<string, IndexEntry>;
-      });
+      this.indexManager = new IndexManager(
+        storedSchema,
+        (indexName, transactor) => this.openIndexTree(indexName, transactor)
+      );
 
       await this.indexManager.initialize(txnState?.transactor);
 
@@ -809,13 +799,25 @@ export class OptimysticVirtualTable extends VirtualTable {
     if (!this.indexManager) {
       throw new Error('Table not initialized');
     }
+    // Scan-time backstop of the maintained-index invariant (the plan-time guard is
+    // OptimysticModule.assertIndexMaintained): a scan routed through an index this
+    // table does not maintain must fail loudly, naming table and index, instead of
+    // descending a stale tree and honestly returning too few rows.
     const schema = this.indexManager.getIndexSchema(indexName);
     if (!schema) {
-      throw new Error(`Index not found: ${indexName}`);
+      throw new Error(
+        `Table '${this.tableName}' does not maintain index '${indexName}' ` +
+        `(no descriptor in the maintained index set — writes are not keeping this index up to date). ` +
+        `Re-declare the index on this connection (CREATE INDEX) to re-attach it.`
+      );
     }
     const tree = this.indexManager.getIndexTree(indexName);
     if (!tree) {
-      throw new Error(`Index tree not found: ${indexName}`);
+      throw new Error(
+        `Table '${this.tableName}' does not maintain index '${indexName}' ` +
+        `(its tree is not open on this table instance). ` +
+        `Re-declare the index on this connection (CREATE INDEX) to re-attach it.`
+      );
     }
     return { schema, tree };
   }
@@ -1926,8 +1928,8 @@ export class OptimysticVirtualTable extends VirtualTable {
       // Upgrade path: a schema persisted before `unique`/`predicate` were wired
       // through has the index but not its uniqueness metadata. Re-declaring the
       // index is the documented way to restore it, so persist the flags (one
-      // write; subsequent re-declares see them present and skip). The tree
-      // itself already exists and is registered — nothing else to rebuild.
+      // write; subsequent re-declares see them present and skip).
+      let effective = storedSchema;
       if (indexSchema.unique && !existing.unique) {
         const upgraded: StoredTableSchema = {
           ...storedSchema,
@@ -1939,7 +1941,18 @@ export class OptimysticVirtualTable extends VirtualTable {
         };
         await this.schemaManager.storeStoredSchema(upgraded, txnState?.transactor);
         this.indexManager.setSchema(upgraded);
+        effective = upgraded;
       }
+      // The PERSISTED schema already carries the index, so there is nothing to
+      // re-write — but that says nothing about THIS vtab's in-memory maintenance
+      // state. A vtab whose IndexManager was built from a persisted schema that
+      // did not yet carry the index (another writer added it since, or the schema
+      // cache was refreshed in between) would take this branch and stay
+      // permanently index-less for maintenance: writes silently skip the index
+      // tree while the planner keeps routing seeks into it. Reconcile the
+      // maintained set with the persisted one — idempotent, so the common warm
+      // re-declare stays cheap.
+      await this.reconcileMaintainedIndexes(effective, txnState?.transactor);
       return;
     }
 
@@ -1965,21 +1978,7 @@ export class OptimysticVirtualTable extends VirtualTable {
     await this.schemaManager.storeStoredSchema(updatedSchema, txnState?.transactor);
 
     // Initialize the new index tree
-    const indexTreeFactory = async (indexName: string, transactor?: any) => {
-      const indexOptions: ParsedOptimysticOptions = {
-        ...this.options,
-        collectionUri: `${this.options.collectionUri}/index/${indexName}`,
-      };
-      // NOTE: create-on-missing is intentional — a freshly declared index has no committed
-      // header block until its first entry lands, so "absent" here means "empty", not "lost".
-      const tree = await this.collectionFactory.createOrGetCollection(
-        indexOptions,
-        transactor ? { transactor, isActive: true, collections: new Map(), stampId: '' } : undefined
-      );
-      return tree as unknown as Tree<string, IndexEntry>;
-    };
-
-    const indexTree = await indexTreeFactory(indexSchema.name, txnState?.transactor);
+    const indexTree = await this.openIndexTree(indexSchema.name, txnState?.transactor);
 
     // Add the index to the index manager
     if (this.indexManager) {
@@ -2021,6 +2020,88 @@ export class OptimysticVirtualTable extends VirtualTable {
         await tree.sync();
       }
     }
+  }
+
+  /**
+   * Open (create-on-missing) the tree behind a named secondary index. The ONE
+   * place an index sub-collection URI is derived and opened — doInitialize's
+   * IndexManager factory, addIndex's build path and the reconcile path all route
+   * through here so they cannot drift.
+   *
+   * NOTE: create-on-missing is intentional — an index whose table has no rows yet
+   * has never committed a header block, so an open-only fetch would report the
+   * index as missing rather than as empty.
+   */
+  private async openIndexTree(indexName: string, transactor?: ITransactor): Promise<Tree<string, IndexEntry>> {
+    const indexOptions: ParsedOptimysticOptions = {
+      ...this.options,
+      collectionUri: `${this.options.collectionUri}/index/${indexName}`,
+    };
+    const tree = await this.collectionFactory.createOrGetCollection(
+      indexOptions,
+      transactor ? { transactor, isActive: true, collections: new Map(), stampId: '' } : undefined
+    );
+    return tree as unknown as Tree<string, IndexEntry>;
+  }
+
+  /**
+   * Ensure this vtab's IndexManager maintains EVERY index the persisted schema
+   * declares: descriptor folded into the manager's schema, tree open and
+   * registered, collection registered with the transaction bridge — the same
+   * three things addIndex's build path does for a brand-new index. Idempotent:
+   * when nothing is missing this is a map lookup per index and a no-op re-set of
+   * the bridge registry (itself keyed by collection id).
+   *
+   * NOTE: reconciliation does NOT backfill index entries for rows committed while
+   * this vtab was divergent (writes that skipped the index). Those rows were
+   * indexed by whichever writer built the index (addIndex's populate loop covers
+   * rows persisted before the CREATE INDEX); rows a divergent vtab wrote after
+   * that populate are only surfaced by the planner-side maintenance guard
+   * (see OptimysticModule.assertIndexMaintained), not silently repaired here.
+   */
+  private async reconcileMaintainedIndexes(
+    storedSchema: StoredTableSchema,
+    transactor?: ITransactor
+  ): Promise<void> {
+    if (!this.indexManager) {
+      throw new Error('Table not initialized');
+    }
+    const manager = this.indexManager;
+    if (storedSchema.indexes.some(idx => manager.getIndexSchema(idx.name) === undefined)) {
+      manager.setSchema(storedSchema);
+    }
+    for (const idx of storedSchema.indexes) {
+      let tree = manager.getIndexTree(idx.name);
+      if (!tree) {
+        tree = await this.openIndexTree(idx.name, transactor);
+        manager.registerIndexTree(idx.name, tree);
+      }
+      // Idempotent (keyed by collection id) — see TransactionBridge.registerCollection.
+      this.txnBridge.registerCollection(tree.getCollection());
+    }
+  }
+
+  /**
+   * Whether this table instance actually maintains `indexName` — i.e. its
+   * IndexManager carries the descriptor (so INSERT/UPDATE/DELETE stage into the
+   * index) AND holds its tree open (so those stages have somewhere to land).
+   *
+   * 'unknown' while the table has not finished (even provisional) initialization:
+   * the maintained set does not exist yet, so divergence cannot be judged — the
+   * caller must defer to the scan-time backstop in resolveIndexTarget rather
+   * than fail a plan against half-built state.
+   */
+  indexMaintenanceState(indexName: string): 'maintained' | 'unmaintained' | 'unknown' {
+    if (!this.indexManager || (!this.isInitialized && !this.isProvisionallyInitialized)) {
+      return 'unknown';
+    }
+    if (
+      this.indexManager.getIndexSchema(indexName) === undefined
+      || this.indexManager.getIndexTree(indexName) === undefined
+    ) {
+      return 'unmaintained';
+    }
+    return 'maintained';
   }
 
   /**
@@ -2682,6 +2763,13 @@ export class OptimysticModule implements VirtualTableModule<VirtualTable, Optimy
       }
     }
 
+    // Invariant: the planner may only route a scan through an index this table
+    // actually maintains. Checked at plan selection so the query fails BEFORE it
+    // silently answers from a stale tree (see assertIndexMaintained).
+    if (bestIndexName !== undefined && bestIndexName !== '_primary_') {
+      this.assertIndexMaintained(tableInfo, bestIndexName);
+    }
+
     // Return the best access plan found
     return {
       handledFilters: bestHandledFilters,
@@ -2693,6 +2781,41 @@ export class OptimysticModule implements VirtualTableModule<VirtualTable, Optimy
       isSet: bestIsSet,
       explains: bestExplains,
     };
+  }
+
+  /**
+   * Guard for the maintained-index invariant at plan selection.
+   *
+   * Every table carries two independent notions of "which secondary indexes
+   * exist": Quereus's catalog (`TableSchema.indexes` — what the planner offers)
+   * and the vtab's IndexManager (what DML actually stages into). Collapsing them
+   * into one set is not feasible here: Quereus owns the catalog, and the vtab
+   * initializes lazily/asynchronously, so the maintained set may not even exist
+   * at (synchronous) plan time. Instead, the moment a plan selects a secondary
+   * index, require the table to maintain it — a query routed through an
+   * unmaintained index would descend a tree that writes silently skip and
+   * honestly return too few rows, forever, with no error anywhere.
+   *
+   * 'unknown' (table not yet instantiated/initialized) deliberately passes: the
+   * divergence cannot be judged yet, and the scan-time backstop in
+   * resolveIndexTarget throws the same named error after initialization.
+   *
+   * NOTE: a committed read planned CONCURRENTLY with an in-flight CREATE INDEX on
+   * the same table can transiently observe 'unmaintained' and fail; the window is
+   * the same one resolveIndexTarget already had, and retrying the query resolves it.
+   */
+  private assertIndexMaintained(tableInfo: TableSchema, indexName: string): void {
+    const tableKey = `${tableInfo.schemaName}.${tableInfo.name}`.toLowerCase();
+    const state = this.tables.get(tableKey)?.indexMaintenanceState(indexName) ?? 'unknown';
+    if (state === 'unmaintained') {
+      throw new QuereusError(
+        `Table '${tableInfo.name}' does not maintain index '${indexName}': the catalog offers it ` +
+        `to query planning, but this table instance's writes do not keep it up to date, so reading ` +
+        `through it would silently return incomplete results. Re-declare the index on this ` +
+        `connection (CREATE INDEX) to re-attach it.`,
+        StatusCode.ERROR,
+      );
+    }
   }
 
   /**
