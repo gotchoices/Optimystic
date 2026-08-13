@@ -354,21 +354,24 @@ export class SchemaManager {
 	}
 
 	/**
-	 * Delete a table schema
+	 * Delete a table schema — a tombstone write, but OPEN-ONLY on the catalog.
+	 *
+	 * An absent catalog is a no-op, not a reason to invent one. There is nothing to
+	 * tombstone in a catalog that has never been committed, and the alternative
+	 * (create-on-missing) commits a locally-invented EMPTY catalog — which, on a node
+	 * whose read of a real remote catalog came back empty, erases every other table's
+	 * entry. That trade only ever favoured create-on-missing while "absent" reliably
+	 * meant "fresh database"; it does not (see {@link getSchema} — a provably
+	 * unreachable catalog throws, but a silently-empty cohort answer still reads as
+	 * absent). Losing one drop's tombstone is recoverable; losing the catalog is not.
 	 */
 	async deleteSchema(tableName: string, transactor?: ITransactor): Promise<void> {
 		this.schemaCache.delete(tableName);
 
-		// Create-on-missing: writing a tombstone is a write, and the catalog it belongs in
-		// may not exist yet on this node (nothing is written to storage until the tree syncs).
-		// NOTE: a consequence is that dropping a table on a node that has never seen the
-		// catalog brings an (empty) catalog into existence. Harmless while a missing catalog
-		// really means "fresh database" — the drop then targets nothing and commits an empty
-		// catalog. It stops being harmless if a missing catalog can also mean "unreachable":
-		// the drop would then commit a locally-invented catalog over a real remote one. If
-		// repo-reports-unavailable-vs-absent lands and this is still create-on-missing, make
-		// the delete a no-op on an absent catalog instead.
-		const tree = await this.requireSchemaTree(transactor);
+		const tree = await this.getSchemaTree(transactor);
+		if (!tree) {
+			return;
+		}
 		await tree.replace([[tableName, undefined]]);
 	}
 

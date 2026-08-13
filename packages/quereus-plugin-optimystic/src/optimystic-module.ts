@@ -16,7 +16,7 @@ import type { VirtualTableModule, BaseModuleConfig, Database, DatabaseInternal, 
 import { Tree } from '@optimystic/db-core';
 import { KeyRange } from '@optimystic/db-core';
 import type { CollectionChangeEvent, ITransactor, TreeReadView } from '@optimystic/db-core';
-import { SchemaManager, columnSetKey, uniqueConstraintKey } from './schema/schema-manager.js';
+import { SchemaManager, columnSetKey, mergeIndexLists, uniqueConstraintKey } from './schema/schema-manager.js';
 import type { StoredTableSchema, StoredIndexSchema } from './schema/schema-manager.js';
 import { RowCodec, type EncodedRow } from './schema/row-codec.js';
 import { SqlDataType, PhysicalType } from '@quereus/quereus';
@@ -373,12 +373,17 @@ export class OptimysticVirtualTable extends VirtualTable {
         //
         // `CREATE TABLE` / `xConnect` arrives without its `CREATE INDEX`
         // siblings — those dispatch later as separate `addIndex()` calls. So
-        // an empty `candidateStored.indexes` does NOT mean "the table has no
-        // indexes"; it means "the indexes aren't in this DDL statement." The
-        // persisted index list is authoritative whenever the local candidate
-        // has none — otherwise the short-circuit miss below would write
-        // `indexes: []`, clobbering the persisted indexes and forcing every
-        // later `addIndex()` to fail its dedupe and rebuild from scratch.
+        // `candidateStored.indexes` is never authoritative about which indexes
+        // the table HAS; it only says which ones this DDL statement mentioned.
+        // The candidate therefore unions its index list with the persisted one
+        // — the SAME rule storeStoredSchema applies at write time
+        // (mergeIndexLists), so what we compare against is what a write would
+        // actually produce. Two things fall out: an index-free re-declare can
+        // never write `indexes: []` over a real list (which would force every
+        // later `addIndex()` to fail its dedupe and rebuild from scratch), and
+        // a candidate that carries SOME indexes while the catalog carries more
+        // still short-circuits once, instead of missing the compare and
+        // re-writing a byte-identical record on every single open.
         //
         // A schema persisted before uniqueness metadata was wired through misses
         // this short-circuit exactly once for a table that HAS unique
@@ -387,10 +392,9 @@ export class OptimysticVirtualTable extends VirtualTable {
         // the second open short-circuits again. Constraint-free tables OMIT the
         // key on both sides (see tableSchemaToStored) and never miss.
         const candidateStored = this.schemaManager.tableSchemaToStored(this.tableSchema);
-        const mergedCandidate: StoredTableSchema =
-          candidateStored.indexes.length === 0 && persistedSchema
-            ? { ...candidateStored, indexes: persistedSchema.indexes }
-            : candidateStored;
+        const mergedCandidate: StoredTableSchema = persistedSchema
+          ? { ...candidateStored, indexes: mergeIndexLists(candidateStored.indexes, persistedSchema.indexes) }
+          : candidateStored;
 
         if (persistedSchema && schemasEqual(mergedCandidate, persistedSchema)) {
           storedSchema = persistedSchema;
@@ -2051,6 +2055,13 @@ export class OptimysticVirtualTable extends VirtualTable {
     await this.reconcileMaintainedIndexes(writtenSchema, txnState?.transactor);
 
     // Populate the index with existing data.
+    // NOTE: insertIndexEntries stages into EVERY index the manager maintains, not just
+    // the one being built, so this loop re-writes each existing row's entry into every
+    // sibling index too. Idempotent (same key, same value, keyed replace) and correct,
+    // but the write volume is rows x indexes rather than rows. Fine while CREATE INDEX
+    // is a cold-path DDL statement on modest tables; if building an index on a large
+    // table shows up as slow, give IndexManager a single-index staging entry point and
+    // call it here.
     // NOTE: CREATE UNIQUE INDEX does not reject pre-existing duplicate values — the
     // populate loop keys each entry on indexCols‖pk, so duplicates coexist and the
     // index builds successfully. Now that the derived uniqueConstraint is mirrored onto

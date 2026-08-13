@@ -26,7 +26,7 @@ import { Database } from '@quereus/quereus';
 import { MemoryRawStorage, StorageRepo, BlockStorage } from '@optimystic/db-p2p';
 import type { ITransactor } from '@optimystic/db-core';
 import register from '../dist/plugin.js';
-import { mergeIndexLists } from '../dist/index.js';
+import { mergeIndexLists } from '../src/schema/schema-manager.js';
 
 /** Build a `local`-style transactor over the supplied raw storage, shared across
  * plugin instances so trees opened by either side see the other's writes (same
