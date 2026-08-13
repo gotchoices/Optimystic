@@ -238,6 +238,7 @@ For the full dialect reference, see the [Quereus SQL Reference](https://github.c
 - `msgpack` encoding is declared but not yet implemented
 - Savepoints (including Quereus's internal statement-/row-level atomicity) work in legacy/single-node mode; in distributed-consensus (session) mode they are no-ops, so a mid-statement abort there can still leave partial rows staged
 - An UPDATE or DELETE re-reads the row it is about to overwrite (index maintenance needs the pre-write image). If the collection cannot produce that row — the engine and the collection disagreeing about what exists, which a networked transactor can hit as a transient point-lookup miss — the statement fails with `could not find the pre-write row` rather than writing a partially-correct row and silently corrupting secondary indexes
+- A connection only maintains the secondary indexes its own table instance knows about. If a query is planned onto an index this connection does not maintain, it fails with `Table 'X' does not maintain index 'Y'` rather than answering from a tree its writes have been skipping. Re-running that index's `CREATE INDEX` on the connection re-attaches it (it is idempotent). Re-attaching does **not** backfill entries for rows written while the index was detached — those rows stay invisible to index-driven lookups until they are rewritten
 - Cross-collection transactions not yet supported
 
 ## Development

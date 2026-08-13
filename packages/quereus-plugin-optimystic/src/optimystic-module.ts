@@ -90,6 +90,24 @@ type PkMoveDecision =
   | { kind: 'displace'; row: Row };
 
 /**
+ * THE message for a violation of the maintained-index invariant — a table asked to
+ * read through a secondary index its own writes do not keep up to date.
+ *
+ * One builder for every site that can detect it (plan selection in
+ * {@link OptimysticModule.getBestAccessPlan}, scan resolution in
+ * {@link OptimysticVirtualTable.resolveIndexTarget}), so the recognizable phrase
+ * `does not maintain index '<name>'` and the remediation stay identical no matter
+ * which site fires. `detail` says which half of the maintained set is missing.
+ */
+function unmaintainedIndexMessage(tableName: string, indexName: string, detail: string): string {
+  return (
+    `Table '${tableName}' does not maintain index '${indexName}': ${detail}, so reading through ` +
+    `it would silently return incomplete results. Re-declare the index on this connection ` +
+    `(CREATE INDEX) to re-attach it.`
+  );
+}
+
+/**
  * Helper function to convert SqlDataType affinity to LogicalType
  */
 function affinityToLogicalType(affinity: SqlDataType): LogicalType {
@@ -805,18 +823,24 @@ export class OptimysticVirtualTable extends VirtualTable {
     // descending a stale tree and honestly returning too few rows.
     const schema = this.indexManager.getIndexSchema(indexName);
     if (!schema) {
-      throw new Error(
-        `Table '${this.tableName}' does not maintain index '${indexName}' ` +
-        `(no descriptor in the maintained index set — writes are not keeping this index up to date). ` +
-        `Re-declare the index on this connection (CREATE INDEX) to re-attach it.`
+      throw new QuereusError(
+        unmaintainedIndexMessage(
+          this.tableName,
+          indexName,
+          'it has no descriptor in this table instance\'s maintained index set, so writes skip it',
+        ),
+        StatusCode.ERROR,
       );
     }
     const tree = this.indexManager.getIndexTree(indexName);
     if (!tree) {
-      throw new Error(
-        `Table '${this.tableName}' does not maintain index '${indexName}' ` +
-        `(its tree is not open on this table instance). ` +
-        `Re-declare the index on this connection (CREATE INDEX) to re-attach it.`
+      throw new QuereusError(
+        unmaintainedIndexMessage(
+          this.tableName,
+          indexName,
+          'its tree is not open on this table instance, so writes have nowhere to stage into',
+        ),
+        StatusCode.ERROR,
       );
     }
     return { schema, tree };
@@ -2056,8 +2080,11 @@ export class OptimysticVirtualTable extends VirtualTable {
    * this vtab was divergent (writes that skipped the index). Those rows were
    * indexed by whichever writer built the index (addIndex's populate loop covers
    * rows persisted before the CREATE INDEX); rows a divergent vtab wrote after
-   * that populate are only surfaced by the planner-side maintenance guard
-   * (see OptimysticModule.assertIndexMaintained), not silently repaired here.
+   * that populate are NOT surfaced by the planner-side maintenance guard either —
+   * once reconciled, this table maintains the index and the guard passes, so an
+   * index-driven lookup silently misses them. Tracked by
+   * `fix/index-reattach-leaves-rows-unindexed`, which decides between backfilling
+   * here and refusing to attach.
    */
   private async reconcileMaintainedIndexes(
     storedSchema: StoredTableSchema,
@@ -2067,6 +2094,12 @@ export class OptimysticVirtualTable extends VirtualTable {
       throw new Error('Table not initialized');
     }
     const manager = this.indexManager;
+    // NOTE: setSchema REPLACES the manager's index list, so a `storedSchema` that is
+    // missing an index the manager already maintains would narrow the maintained set
+    // rather than widen it. Reachable only if a stale or index-losing persisted schema
+    // gets this far — the supply side `schema-catalog-index-list-is-lossy` closes; if it
+    // ever lands here anyway, the reads still fail loudly (assertIndexMaintained), but
+    // switch this to a name-keyed union of the two lists.
     if (storedSchema.indexes.some(idx => manager.getIndexSchema(idx.name) === undefined)) {
       manager.setSchema(storedSchema);
     }
@@ -2809,10 +2842,11 @@ export class OptimysticModule implements VirtualTableModule<VirtualTable, Optimy
     const state = this.tables.get(tableKey)?.indexMaintenanceState(indexName) ?? 'unknown';
     if (state === 'unmaintained') {
       throw new QuereusError(
-        `Table '${tableInfo.name}' does not maintain index '${indexName}': the catalog offers it ` +
-        `to query planning, but this table instance's writes do not keep it up to date, so reading ` +
-        `through it would silently return incomplete results. Re-declare the index on this ` +
-        `connection (CREATE INDEX) to re-attach it.`,
+        unmaintainedIndexMessage(
+          tableInfo.name,
+          indexName,
+          'the catalog offers it to query planning, but this table instance\'s writes do not keep it up to date',
+        ),
         StatusCode.ERROR,
       );
     }

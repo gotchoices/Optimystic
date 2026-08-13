@@ -26,7 +26,7 @@
  */
 
 import { expect } from 'chai';
-import { Database } from '@quereus/quereus';
+import { Database, QuereusError } from '@quereus/quereus';
 import type { SqlValue } from '@quereus/quereus';
 import { MemoryRawStorage, StorageRepo, BlockStorage } from '@optimystic/db-p2p';
 import type { ITransactor } from '@optimystic/db-core';
@@ -229,9 +229,33 @@ describe('Index maintenance must track the declared index set', function () {
 		expect(message).to.contain(`does not maintain index 'guarded_by_token'`);
 		expect(message).to.contain(`'guarded'`);
 
+		// It must be the PLAN-TIME guard that rejected this, not the scan-time backstop.
+		// Both throw the same `does not maintain index` sentence, so the two are told
+		// apart by their signatures: the plan-time guard raises a QuereusError carrying
+		// the catalog-vs-maintained wording and never reaches runQuery, whose catch
+		// re-wraps anything thrown during a scan as a plain `Query failed: …`. Without
+		// this, the whole plan-time arm could be deleted and this spec would still pass.
+		expect(message, 'rejected at plan selection, before any scan started')
+			.to.not.contain('Query failed');
+		expect(message).to.contain('the catalog offers it to query planning');
+		expect(failure, 'plan-time guard raises a QuereusError').to.be.instanceOf(QuereusError);
+
+		// A DML statement whose row source is routed through the same index must fail
+		// too — an UPDATE that read through a stale index would silently touch a subset
+		// of the rows it claims to match.
+		let dmlFailure: unknown;
+		try {
+			await db.exec(`update guarded set token = 'tok-z' where token = 'tok-a'`);
+		} catch (error) {
+			dmlFailure = error;
+		}
+		expect(dmlFailure, 'UPDATE routed through an unmaintained index must throw').to.be.instanceOf(Error);
+		expect((dmlFailure as Error).message).to.contain(`does not maintain index 'guarded_by_token'`);
+
 		// Plans that do not route through the index still answer.
-		const scanned = await collectRows(db.eval(`select id from guarded`));
+		const scanned = await collectRows(db.eval(`select id, token from guarded`));
 		expect(scanned.map(r => r.id), 'full scan is unaffected').to.deep.equal([1]);
+		expect(scanned.map(r => r.token), 'the rejected UPDATE did not partially apply').to.deep.equal(['tok-a']);
 		const byPk = await collectRows(db.eval(`select id from guarded where id = 1`));
 		expect(byPk.map(r => r.id), 'primary-key seek is unaffected').to.deep.equal([1]);
 	});
