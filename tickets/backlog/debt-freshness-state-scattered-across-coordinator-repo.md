@@ -49,3 +49,27 @@ the read-repair config.
 
 Not a behaviour change; the existing coordinator specs should pass untouched, which is the
 cheapest available proof the extraction was faithful.
+
+## Second instance (added by the fix pass on `isolated-read-cannot-confirm-a-never-written-block`)
+
+The same shape invited a second failure, in the other half of the answer. The consult reported
+what it concluded about **existence** as a single boolean (`inconclusive`), so three genuinely
+different outcomes — "part of the cohort could not be asked", "none of it could be asked", and
+"a peer told us the block exists and we could not get it" — arrived at the flagging decision as
+one bit and left it as one flag value. The third case was worse than vague: because it set the
+bit to `false`, the answer went back as an *authoritative* absent while a peer had just said the
+block exists. Measured and reproduced; being fixed at the instance in
+`implement/absence-verdict-names-the-evidence`, which replaces the boolean with a named verdict
+and adds two `BlockUnavailableReason` values.
+
+Two things this changes for the extraction:
+
+- It is more evidence for the same conclusion, from the existence half rather than the currency
+  half — both failures are "a fact the consult knew, flattened on the way to the answer".
+- Sequence it **after** that fix, not before. The fix lands new types (`AbsenceVerdict`) and a new
+  parameter on `flagUnconfirmedAbsence` inside the same ~450-line span; extracting first would mean
+  doing the same work twice.
+
+The extraction's own acceptance test should be strengthened accordingly: the collaborator's single
+entry point has to return existence and currency as *separate, named* results, not a pair of
+booleans, or the same class of flattening can reappear behind the new seam.
