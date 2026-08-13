@@ -150,7 +150,8 @@ describe('repo-protocol get consults the cohort', () => {
 	 * whose other member claims `cohortLatest` — `null` for a peer that answers "I hold
 	 * nothing", which is a real answer and not silence. `acquireBlockFromCohort` is
 	 * deliberately not wired, so a corroborated revision this node lacks can never be
-	 * acquired — the consult ends INCONCLUSIVE, the shape that must surface as `unavailable`.
+	 * acquired — the consult ends with a positively-attested revision this node cannot
+	 * converge onto, the shape that must surface as `unavailable: 'claimed-elsewhere'`.
 	 *
 	 * Defaults reproduce the observed failure: this node joined after the block was written,
 	 * routing now points reads at it, and it has never held the block, while the cohort peer
@@ -186,8 +187,8 @@ describe('repo-protocol get consults the cohort', () => {
 		const entry = await repoProtocolGet(service, blockId);
 
 		expect(entry, 'a get response was produced').to.exist;
-		expect(entry!.unavailable, 'unconfirmed absence is flagged, not reported as authoritative')
-			.to.equal('peers-unreachable');
+		expect(entry!.unavailable, 'a cohort-attested block this node cannot acquire is flagged, not reported as authoritative')
+			.to.equal('claimed-elsewhere');
 	});
 
 	it('a repo-protocol get reaches the cohort consult', async () => {

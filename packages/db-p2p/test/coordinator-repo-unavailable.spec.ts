@@ -1,16 +1,22 @@
 /**
  * Tickets: repo-reports-unavailable-vs-absent,
  *          cluster-read-consult-cannot-report-unreachable,
- *          coordinator-serves-stale-data-as-if-confirmed
+ *          coordinator-serves-stale-data-as-if-confirmed,
+ *          absence-verdict-names-the-evidence
  *
  * `CoordinatorRepo.get` answers "absent" authoritatively only because it consults the
- * cohort for any block that is missing locally. That consult can come back INCONCLUSIVE
- * three ways — it THROWS, it runs while part of the cohort is SILENT (a per-peer consult
- * that rejects or times out), or it corroborates a revision this node then fails to
- * acquire — and in each the local "absent" is an answer the coordinator just failed to
- * confirm. These specs pin that such an entry is flagged
- * `unavailable: 'peers-unreachable'` instead of posing as an authoritative absent
- * (which NetworkTransactor deliberately never retries).
+ * cohort for any block that is missing locally. That consult can fail to rule the block
+ * out several ways, and the flag NAMES which one — the local "absent" is an answer the
+ * coordinator just failed to confirm, and the reason says what the consult established:
+ *  - `'peers-unreachable'` — the consult THREW, or part of the cohort answered while
+ *    part stayed silent (a per-peer consult that rejects or times out). Another, better-
+ *    connected coordinator may still settle it.
+ *  - `'cohort-unreachable'` — NO cohort member outside this node could be asked at all:
+ *    there is no better-connected coordinator to re-ask; this node's view is all there is.
+ *  - `'claimed-elsewhere'` — a cohort peer positively CLAIMED a revision that could be
+ *    neither corroborated to a quorum nor acquired; the block is known to exist somewhere.
+ * Each is flagged instead of posing as an authoritative absent (which NetworkTransactor
+ * deliberately never retries).
  *
  * A PRESENT block has the mirror lie: a repair pass that left a cohort peer's claim of a
  * strictly higher revision unsettled (it failed the corroboration quorum, or was
@@ -333,7 +339,7 @@ describe('CoordinatorRepo unavailable vs absent', () => {
 			expect(result[blockId]?.unavailable).to.equal('peers-unreachable');
 		});
 
-		it('flags a locally-missing block peers-unreachable when the sole cohort peer never answers (per-peer deadline)', async function () {
+		it('flags a locally-missing block cohort-unreachable when the sole cohort peer never answers (per-peer deadline)', async function () {
 			// Real time passes here: the consult's 1s per-peer deadline has to expire.
 			this.timeout(5000);
 			const localPeer = await makePeerId();
@@ -344,6 +350,9 @@ describe('CoordinatorRepo unavailable vs absent', () => {
 			// exactly one peer to consult, and it hangs. Before the deadline rejected, the
 			// expiry surfaced as an absent claim and the reader confidently reported the
 			// block missing — licencing createOrOpen to invent a rival empty collection.
+			// With NO non-self cohort member answering, this is isolation, not partial
+			// silence: 'cohort-unreachable' tells the caller no better-connected
+			// coordinator exists to re-ask.
 			const callback: ClusterLatestCallback = async (peerId) =>
 				peerId.equals(localPeer) ? undefined : new Promise<never>(() => { /* never settles */ });
 
@@ -352,7 +361,7 @@ describe('CoordinatorRepo unavailable vs absent', () => {
 
 			const result = await repo.get({ blockIds: [blockId] });
 
-			expect(result[blockId]?.unavailable).to.equal('peers-unreachable');
+			expect(result[blockId]?.unavailable).to.equal('cohort-unreachable');
 		});
 
 		it('serves the corroborated block, unflagged, when the rest of the cohort corroborates past one silent peer', async () => {
@@ -646,7 +655,7 @@ describe('CoordinatorRepo unavailable vs absent', () => {
 	});
 
 	describe('corroborated but not restored', () => {
-		it('flags a locally-missing block peers-unreachable when the cohort corroborates a revision this node cannot acquire', async () => {
+		it('flags a locally-missing block claimed-elsewhere when the cohort corroborates a revision this node cannot acquire', async () => {
 			const localPeer = await makePeerId();
 			const holderA = await makePeerId();
 			const holderB = await makePeerId();
@@ -656,7 +665,9 @@ describe('CoordinatorRepo unavailable vs absent', () => {
 			// the reader has just been TOLD the block exists. Convergence then fails (no
 			// acquisition callback wired, promotion has nothing local to promote), leaving the
 			// block missing. Reporting that as an authoritative absent would licence
-			// `createOrOpen` to build a rival empty collection over data that demonstrably exists.
+			// `createOrOpen` to build a rival empty collection over data that demonstrably
+			// exists — and because the cohort positively attested the block, the flag is
+			// 'claimed-elsewhere', not the silence-shaped 'peers-unreachable'.
 			const callback: ClusterLatestCallback = async (peerId) =>
 				peerId.equals(localPeer) ? undefined : { actionId: 'remote-action', rev: 2 };
 
@@ -666,6 +677,122 @@ describe('CoordinatorRepo unavailable vs absent', () => {
 			const result = await repo.get({ blockIds: [blockId] });
 
 			expect(result[blockId]?.block, 'nothing was acquired').to.equal(undefined);
+			expect(result[blockId]?.unavailable).to.equal('claimed-elsewhere');
+		});
+	});
+
+	describe('absence verdicts name the evidence (ticket absence-verdict-names-the-evidence)', () => {
+		it('flags claimed-elsewhere when a lone peer claims a revision the quorum declines', async () => {
+			const localPeer = await makePeerId();
+			const peerA = await makePeerId();
+			const peerB = await makePeerId();
+			const cluster = makeClusterPeers([localPeer, peerA, peerB]);
+
+			// peerA positively claims rev 2; self and peerB answer "I hold nothing"; nobody is
+			// silent. One claim against a corroboration floor of two: the quorum rightly declines
+			// (a lone unverifiable claim must never drive restoration), but the reader has just
+			// been TOLD the block exists — an unflagged absent here is the same lie the
+			// present-block path stopped telling via `unconfirmedAheadRev`, mirrored onto the
+			// missing path.
+			const callback: ClusterLatestCallback = async (peerId) =>
+				peerId.equals(peerA) ? { actionId: 'remote-action', rev: 2 } : undefined;
+
+			const { repo: storageRepo } = makeAbsentStorageRepo();
+			const repo = buildRepo(makeKeyNetwork(cluster), storageRepo, localPeer, callback);
+
+			const result = await repo.get({ blockIds: [blockId] });
+
+			expect(result[blockId]?.block).to.equal(undefined);
+			expect(result[blockId]?.unavailable).to.equal('claimed-elsewhere');
+			// The two doubt markers stay disjoint by meaning: `unavailable` is existence doubt,
+			// `unconfirmedAheadRev` is currency doubt on served content — a blockless entry
+			// must never carry the latter.
+			expect('unconfirmedAheadRev' in result[blockId]!).to.equal(false);
+		});
+
+		it('a claim outranks silence: still claimed-elsewhere when the other peer is also silent', async () => {
+			const localPeer = await makePeerId();
+			const peerA = await makePeerId();
+			const peerB = await makePeerId();
+			const cluster = makeClusterPeers([localPeer, peerA, peerB]);
+
+			// Same lone claim from peerA, but peerB rejects instead of answering. A peer
+			// positively saying "it exists" is the sharpest fact available — sharper than
+			// whatever a silent peer might have said — so the claim verdict wins.
+			const callback: ClusterLatestCallback = async (peerId) => {
+				if (peerId.equals(peerA)) return { actionId: 'remote-action', rev: 2 };
+				if (peerId.equals(peerB)) throw new Error('dial failed');
+				return undefined;
+			};
+
+			const { repo: storageRepo } = makeAbsentStorageRepo();
+			const repo = buildRepo(makeKeyNetwork(cluster), storageRepo, localPeer, callback);
+
+			const result = await repo.get({ blockIds: [blockId] });
+
+			expect(result[blockId]?.unavailable).to.equal('claimed-elsewhere');
+		});
+
+		it('flags cohort-unreachable when the sole cohort peer rejects', async () => {
+			const localPeer = await makePeerId();
+			const peerA = await makePeerId();
+			const cluster = makeClusterPeers([localPeer, peerA]);
+
+			// The isolated-node shape: after self-exclusion there is one peer to consult and it
+			// cannot be dialled. Nobody outside this node was reached, so there is no
+			// better-connected coordinator for the caller to re-ask — a different fact from
+			// partial silence, and the one an isolation policy above needs.
+			const callback: ClusterLatestCallback = async (peerId) => {
+				if (peerId.equals(localPeer)) return undefined;
+				throw new Error('dial failed');
+			};
+
+			const { repo: storageRepo } = makeAbsentStorageRepo();
+			const repo = buildRepo(makeKeyNetwork(cluster), storageRepo, localPeer, callback);
+
+			const result = await repo.get({ blockIds: [blockId] });
+
+			expect(result[blockId]?.block).to.equal(undefined);
+			expect(result[blockId]?.unavailable).to.equal('cohort-unreachable');
+		});
+
+		it('flags cohort-unreachable when every non-self cohort member rejects — isolation is about reach, not cohort size', async () => {
+			const localPeer = await makePeerId();
+			const peerA = await makePeerId();
+			const peerB = await makePeerId();
+			const cluster = makeClusterPeers([localPeer, peerA, peerB]);
+
+			const callback: ClusterLatestCallback = async (peerId) => {
+				if (peerId.equals(localPeer)) return undefined;
+				throw new Error('dial failed');
+			};
+
+			const { repo: storageRepo } = makeAbsentStorageRepo();
+			const repo = buildRepo(makeKeyNetwork(cluster), storageRepo, localPeer, callback);
+
+			const result = await repo.get({ blockIds: [blockId] });
+
+			expect(result[blockId]?.unavailable).to.equal('cohort-unreachable');
+		});
+
+		it('partial reach is NOT isolation: peers-unreachable when one peer rejects but another answers', async () => {
+			// Overlaps the silent-cohort spec above on purpose: that one asserts the flag
+			// exists, this one asserts WHICH of the three reasons it is.
+			const localPeer = await makePeerId();
+			const peerA = await makePeerId();
+			const peerB = await makePeerId();
+			const cluster = makeClusterPeers([localPeer, peerA, peerB]);
+
+			const callback: ClusterLatestCallback = async (peerId) => {
+				if (peerId.equals(peerA)) throw new Error('dial failed');
+				return undefined; // self and peerB answer "I hold nothing"
+			};
+
+			const { repo: storageRepo } = makeAbsentStorageRepo();
+			const repo = buildRepo(makeKeyNetwork(cluster), storageRepo, localPeer, callback);
+
+			const result = await repo.get({ blockIds: [blockId] });
+
 			expect(result[blockId]?.unavailable).to.equal('peers-unreachable');
 		});
 	});

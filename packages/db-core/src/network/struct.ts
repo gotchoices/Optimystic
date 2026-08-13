@@ -154,8 +154,22 @@ export type BlockUnavailableReason =
 	/** Records for this block exist here but it cannot be reconstructed locally — a
 	 *  revision was received with no base to apply it to, or its history is truncated. */
 	| 'unmaterializable'
-	/** Nothing is held locally and the cohort could not be consulted to confirm it. */
-	| 'peers-unreachable';
+	/** Nothing is held locally; PART of the cohort answered and part could not be asked.
+	 *  A silent peer could be the sole holder, so the absence is a guess — but other
+	 *  coordinators are reachable, so asking one of them can still settle it. Also the
+	 *  fallback when the consult could not run at all (the cohort lookup itself failed):
+	 *  a routing failure says nothing about how many cohort members were reachable. */
+	| 'peers-unreachable'
+	/** Nothing is held locally and NO cohort member outside the answering node could be
+	 *  asked at all. Distinct from `peers-unreachable` in exactly the way that matters to
+	 *  a caller: there is no better-connected coordinator to re-ask, so the answer will
+	 *  not improve until that node's connectivity does. Its local view is all there is. */
+	| 'cohort-unreachable'
+	/** Nothing is held locally, but a cohort peer positively CLAIMED a revision of this
+	 *  block, and the answering node could neither corroborate that claim to a quorum nor
+	 *  acquire the content. The block is known to exist somewhere; reporting it absent
+	 *  would be a lie regardless of whether anyone was silent. */
+	| 'claimed-elsewhere';
 
 export type GetBlockResult = {
 	/** The retrieved block - undefined if the block was deleted	 */

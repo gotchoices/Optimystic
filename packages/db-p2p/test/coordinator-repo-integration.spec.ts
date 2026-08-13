@@ -317,10 +317,13 @@ describe('CoordinatorRepo Integration (TEST-5.3.1)', () => {
 	});
 
 	describe('silent cohort peer during read consult (ticket cluster-read-consult-cannot-report-unreachable)', () => {
-		it('reports peers-unreachable, not an authoritative absent, when the sole holder is silent', async () => {
+		it('reports cohort-unreachable, not an authoritative absent, when the sole holder is silent', async () => {
 			// The field failure's topology: two nodes, so after self-exclusion the reader has
 			// exactly one peer to consult — and that peer holds the only copy. Its silence must
-			// not read as "the block does not exist".
+			// not read as "the block does not exist". And because NO non-self cohort member
+			// answered at all, the reason is 'cohort-unreachable' (isolation — no
+			// better-connected coordinator exists to re-ask), not partial-silence
+			// 'peers-unreachable'.
 			const mesh = await createMesh(2, { responsibilityK: 2 });
 			const reader = mesh.nodes[0]!;
 			const holder = mesh.nodes[1]!;
@@ -341,10 +344,10 @@ describe('CoordinatorRepo Integration (TEST-5.3.1)', () => {
 			const result = await reader.coordinatorRepo.get({ blockIds: [blockId] });
 
 			expect(result[blockId]?.block, 'nothing to serve — the holder is silent').to.equal(undefined);
-			expect(result[blockId]?.unavailable, 'silence must be reported as silence').to.equal('peers-unreachable');
+			expect(result[blockId]?.unavailable, 'silence must be reported as silence').to.equal('cohort-unreachable');
 		});
 
-		it('reports peers-unreachable for a missing block when the only other cohort peer is silent', async () => {
+		it('reports cohort-unreachable for a missing block when the only other cohort peer is silent', async () => {
 			// Same topology, block held by NOBODY — even then, silence means the reader
 			// cannot know that, so no authoritative absent.
 			const mesh = await createMesh(2, { responsibilityK: 2 });
@@ -354,7 +357,7 @@ describe('CoordinatorRepo Integration (TEST-5.3.1)', () => {
 
 			const result = await reader.coordinatorRepo.get({ blockIds: ['block-silent-consult'] });
 
-			expect(result['block-silent-consult']?.unavailable).to.equal('peers-unreachable');
+			expect(result['block-silent-consult']?.unavailable).to.equal('cohort-unreachable');
 		});
 
 		it('still reports an authoritative absent when the whole cohort answers "holds nothing"', async () => {

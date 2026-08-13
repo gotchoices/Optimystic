@@ -178,6 +178,12 @@ export class NetworkTransactor implements ITransactor, IBlockChangeNotifier {
 
 		// Retry only genuine no-response / partial-response batches. An authoritative
 		// absent answer is not retried.
+		// NOTE: a 'cohort-unreachable' entry earns this retry like any other flagged entry,
+		// and on a genuinely isolated node the retry re-picks the same node (the
+		// findCoordinator:all-excluded path) and repeats the same futile consult. Fine
+		// today — one extra bounded consult on an already failing read. If isolated-node
+		// read latency ever matters, skip the retry for that reason rather than widening
+		// isAuthoritative.
 		const retryable = Array.from(allBatches(batches)).filter(b =>
 			!isAuthoritative(b as any)
 		) as CoordinatorBatch<BlockId[], GetBlockResults>[];

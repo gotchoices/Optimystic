@@ -521,12 +521,31 @@ saveMaterializedBlock(block): store(structuredClone(block));
   with a context is served from its pending overlay, and only an overlay that produces no block —
   a pending *update* with nothing to apply itself to — is flagged. A pending *delete* over a real
   committed base is likewise unflagged: an intended tombstone is an authoritative absent.
-  `CoordinatorRepo.get` flags `'peers-unreachable'` when a locally-missing
-  block's cohort consult comes back **inconclusive**: it throws, a cohort peer stays silent, or a
-  revision is corroborated that this node then fails to acquire. A consult where the whole cohort
-  *answers* and corroborates nothing stays an authoritative absent — that is the healthy cohort's
-  answer to the routine new-collection probe, and the one-round-trip path `createOrOpen` depends
-  on. Silence is distinguishable from "I hold nothing" because `ClusterLatestCallback` is a
+  `CoordinatorRepo.get` flags a locally-missing block whose cohort consult could not rule it out,
+  and the reason **names what the consult established** rather than one catch-all:
+
+  | what the repair pass found | flag |
+  | --- | --- |
+  | whole cohort answered "holds nothing" (the routine new-collection probe) | none — authoritative absent |
+  | part of the cohort answered, part was silent — or the consult threw outright | `'peers-unreachable'` |
+  | no cohort member outside this node could be asked at all | `'cohort-unreachable'` |
+  | a peer positively claimed a revision that was neither corroborated to a quorum nor acquired | `'claimed-elsewhere'` |
+
+  When several apply the sharpest evidence wins: a claim outranks any amount of silence, and total
+  silence outranks partial. A consult that *throws* (the cohort lookup itself failed) stays
+  `'peers-unreachable'` even on an isolated node — a routing failure says nothing about how many
+  cohort members were reachable. `'cohort-unreachable'` tells the caller there is no
+  better-connected coordinator to re-ask — but the absence is still **not** served as
+  authoritative: a node that reached nobody has zero information about the cohort, and believing
+  its own emptiness is exactly the failure the fail-closed rule exists to prevent (a
+  freshly-rebooted or partitioned node would report every never-locally-seen block as absent).
+  Whether an isolated node's own view is good enough for a given read is per-read policy that
+  belongs to the caller; `BlockUnavailableError.reason` carries the value out verbatim so a
+  consumer can discriminate on it. `'claimed-elsewhere'` extends the fail-closed rule to an
+  absence a peer has flatly contradicted: the same one-claim-raises-doubt tradeoff the
+  currency bullet below accepts, mirrored onto the missing path. The unflagged first row is what
+  keeps the one-round-trip path `createOrOpen` depends on. Silence is distinguishable from
+  "I hold nothing" because `ClusterLatestCallback` is a
   three-way contract: an `ActionRev` is a claim, a resolved `undefined` is the peer answering that
   it holds nothing, and a **rejection** is silence — so implementations must let transport errors
   propagate, and the coordinator deadlines each per-peer query (rejecting, not resolving, on
