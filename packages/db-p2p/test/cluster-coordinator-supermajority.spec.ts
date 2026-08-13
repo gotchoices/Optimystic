@@ -1,5 +1,5 @@
 import { expect } from 'chai';
-import { ClusterCoordinator, ConflictRaceLostError } from '../src/repo/cluster-coordinator.js';
+import { ClusterCoordinator, ConflictRaceLostError, ValidatorRejectionError } from '../src/repo/cluster-coordinator.js';
 import type { ClusterRecord, ClusterPeers, IKeyNetwork, RepoMessage, ClusterConsensusConfig, BlockId, Signature } from '@optimystic/db-core';
 import type { PeerId } from '@libp2p/interface';
 import { peerIdFromPrivateKey } from '@libp2p/peer-id';
@@ -207,7 +207,7 @@ class ConflictAnsweringClient {
 
 	constructor(
 		private readonly peerIdStr: string,
-		private readonly verdict: 'approve' | 'conflict' | 'silent',
+		private readonly verdict: 'approve' | 'reject' | 'conflict' | 'silent',
 		private readonly winnerHash = 'winner-hash-mock'
 	) { }
 
@@ -215,12 +215,21 @@ class ConflictAnsweringClient {
 		this.received.push({ ...record, promises: { ...record.promises }, commits: { ...record.commits } });
 		if (!(this.peerIdStr in record.promises)) {
 			if (this.verdict === 'silent') return record;
+			const signature = `psig-${this.peerIdStr.substring(0, 8)}`;
 			const sig: Signature = this.verdict === 'conflict'
-				? { type: 'conflict', signature: `psig-${this.peerIdStr.substring(0, 8)}`, conflictWith: this.winnerHash }
-				: { type: 'approve', signature: `psig-${this.peerIdStr.substring(0, 8)}` };
+				? { type: 'conflict', signature, conflictWith: this.winnerHash }
+				: this.verdict === 'reject'
+					? { type: 'reject', signature, rejectReason: 'invalid transform' }
+					: { type: 'approve', signature };
 			return { ...record, promises: { ...record.promises, [this.peerIdStr]: sig } };
 		}
-		return record;
+		// Commit phase: every member that already voted signs the commit the cohort decided on —
+		// including one that conflict-voted, which is what the real member does (the commit rule reads
+		// the cohort's approval count, not this member's own vote).
+		return {
+			...record,
+			commits: { ...record.commits, [this.peerIdStr]: { type: 'approve', signature: `csig-${this.peerIdStr.substring(0, 8)}` } }
+		};
 	}
 }
 
@@ -241,7 +250,10 @@ describe('ClusterCoordinator lost conflict race (2-member-must-answer-a-lost-con
 		}
 	});
 
-	const makeCoordinator = (verdicts: ('approve' | 'conflict' | 'silent')[]): { coordinator: ClusterCoordinator; mocks: ConflictAnsweringClient[] } => {
+	const makeCoordinator = (
+		verdicts: ('approve' | 'reject' | 'conflict' | 'silent')[],
+		superMajorityThreshold = 0.75
+	): { coordinator: ClusterCoordinator; mocks: ConflictAnsweringClient[] } => {
 		const mocks = peerIds.map((pid, idx) => new ConflictAnsweringClient(pid.toString(), verdicts[idx]!));
 		const byId = new Map(peerIds.map((pid, idx) => [pid.toString(), mocks[idx]!]));
 		const mockKeyNetwork: IKeyNetwork = {
@@ -253,8 +265,8 @@ describe('ClusterCoordinator lost conflict race (2-member-must-answer-a-lost-con
 			if (!mock) throw new Error(`No mock for ${peerId.toString()}`);
 			return mock;
 		};
-		// threshold 0.75 over 3 peers ⇒ superMajority 3, maxAllowedRejections 0.
-		const coordinator = new ClusterCoordinator(mockKeyNetwork, createClient as any, { ...baseCfg, superMajorityThreshold: 0.75 });
+		// Default threshold 0.75 over 3 peers ⇒ superMajority 3, maxAllowedRejections 0.
+		const coordinator = new ClusterCoordinator(mockKeyNetwork, createClient as any, { ...baseCfg, superMajorityThreshold });
 		return { coordinator, mocks };
 	};
 
@@ -308,6 +320,32 @@ describe('ClusterCoordinator lost conflict race (2-member-must-answer-a-lost-con
 		// Load-bearing wire text — the consuming repo retries on exactly this shape. See the NOTE at
 		// the throw site in cluster-coordinator.ts before changing a byte of it.
 		expect((caught as Error).message).to.equal('Failed to get super-majority: 2/3 approvals (needed 3, 0 rejections)');
+	});
+
+	it('lets a genuine validator rejection outrank a conflict vote', async () => {
+		// A member calling the transaction INVALID is a permanent verdict; a member that merely holds
+		// the race winner is not. When both answer, the caller must hear the permanent one — otherwise
+		// it retries forever against a transaction no cohort will ever accept.
+		const { coordinator } = makeCoordinator(['approve', 'reject', 'conflict']);
+
+		let caught: unknown;
+		try {
+			await coordinator.executeClusterTransaction('block-1' as BlockId, makeMessage());
+		} catch (err) {
+			caught = err;
+		}
+		expect(caught).to.be.instanceOf(ValidatorRejectionError);
+		expect((caught as ValidatorRejectionError).rejectReasons[peerIds[1]!.toString()]).to.equal('invalid transform');
+	});
+
+	it('commits a transaction that reached super-majority despite a conflict vote', async () => {
+		// threshold 0.51 over 3 peers ⇒ super-majority 2, so two approvals carry the transaction even
+		// though a third member holds a rival. A conflict vote refuses; it does not veto.
+		const { coordinator } = makeCoordinator(['approve', 'approve', 'conflict'], 0.51);
+
+		const { record } = await coordinator.executeClusterTransaction('block-1' as BlockId, makeMessage());
+		expect(Object.values(record.promises).filter(s => s.type === 'conflict').length).to.equal(1);
+		expect(Object.keys(record.commits).length, 'the cohort committed').to.be.greaterThan(1);
 	});
 });
 

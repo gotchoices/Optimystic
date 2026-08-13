@@ -397,6 +397,14 @@ saveMaterializedBlock(block): store(structuredClone(block));
   still **throws** — including one whose confirmation read failed, and one only remote members
   could see (local storage behind). The reject-reason text is never parsed; confirmation is
   purely the local revision comparison.
+- **A lost conflict race is returned too — and needs no confirmation.** A member holding the
+  transaction that won a race against this one answers with a signed `conflict` vote naming the
+  winner, and the coordinator raises `ConflictRaceLostError` (never `ValidatorRejectionError`:
+  nobody judged the write invalid). `CoordinatorRepo.pend` returns it directly as a `StaleFailure`
+  with `conflict: true` — no local re-read, because the loss is already proven by the votes and
+  there is nothing local to confirm. `staleAt` stays **absent**: a rival *pend* holding the blocks
+  is not a revision claim, so there is no confirmed number to report. This is the one returned
+  rejection that is not a confirmed revision loss.
 - **Pend retryability is an explicit field, not a payload shape.** `StaleFailure.conflict` says
   outright "this was a lost race, a re-read can win"; `isConflictFailure`
   ([`network/stale-failure.ts`](../packages/db-core/src/network/stale-failure.ts)) is the single
@@ -422,8 +430,11 @@ saveMaterializedBlock(block): store(structuredClone(block));
   ([`network/stale-failure.ts`](../packages/db-core/src/network/stale-failure.ts)), because the
   loser's next request has to clear every holder. Uniformity is the point: a producer reporting an
   arbitrary block would make the transactor's max across producers understate the constraint.
-  `ClusterMember`'s promise-phase rejection deliberately stays prose-only — its reason is signed
-  into `Signature.rejectReason`, so structuring it would change the signed byte layout.
+  `ClusterMember`'s promise-phase *rejection* deliberately stays prose-only — its reason is signed
+  into `Signature.rejectReason`, so structuring it would change the signed byte layout. (Its
+  *conflict* vote is the counter-example that proves the rule is about layout, not principle: the
+  winner's hash is structured data in `Signature.conflictWith` because that variant was designed
+  with the field in its signed payload from the start.)
   `SyncRetryExhaustedError.staleAt` is where it surfaces to an embedder.
 - **The commit divergence split keys off `CommitResult`, not throw-vs-return.** A
   missing pend (thrown "not found"), a stale/ahead commit (`success:false` with

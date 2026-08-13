@@ -116,14 +116,22 @@ The system implements a sophisticated state machine for managing distributed tra
 
 ```typescript
 enum TransactionPhase {
-  Promising,        // Collecting promises from peers
-  OurPromiseNeeded, // We need to provide our promise
-  OurCommitNeeded,  // We need to provide our commit
-  Consensus,        // Transaction has reached consensus
-  Rejected,         // Transaction was rejected
-  Propagating      // Transaction is being propagated
+  Promising,             // We have voted; still collecting promises from other peers
+  OurPromiseNeeded,      // We need to provide our promise
+  OurConflictVoteNeeded, // We hold a conflicting race winner; we must answer with a conflict vote
+  OurCommitNeeded,       // We need to provide our commit
+  Consensus,             // Transaction has reached consensus
+  Rejected,              // Transaction was rejected (validity judgement — enough reject votes)
+  ConflictSuperseded,    // Terminal but retryable: conflict votes make super-majority unreachable
+  Propagating            // Transaction is being propagated
 }
 ```
+
+Each delivery drives this machine to a **fixpoint**, not one step: `processUpdate` recomputes the
+phase after every vote it adds, so a record that arrives already carrying a super-majority is
+promised, committed, and applied in a single `update()` call. Only the vote-adding phases loop, and
+each strictly grows the record, so it terminates. Practical consequence for tests and callers: a
+member does not need a second delivery to advance a phase it could already have advanced.
 
 ### Phase Flow Diagram
 
@@ -133,52 +141,80 @@ enum TransactionPhase {
 │    Initiated    │
 └─────────────────┘
          │
+         ├──────────────────────────────┐ (we hold a rival that won the race)
+         ▼                              ▼
+┌─────────────────┐          ┌───────────────────────┐
+│OurPromiseNeeded │          │ OurConflictVoteNeeded │
+│  (Local Vote)   │          │ (signed "you lost")   │
+└─────────────────┘          └───────────────────────┘
+         │                              │
+         ▼                              ▼
+┌─────────────────┐          ┌───────────────────────┐
+│   Promising     │          │  ConflictSuperseded   │
+│  (Collecting)   │          │ (terminal, RETRYABLE) │
+└─────────────────┘          └───────────────────────┘
+         │
          ▼
-┌─────────────────┐    ┌─────────────────┐
-│   Promising     │───►│OurPromiseNeeded │
-│  (Collecting)   │    │  (Local Vote)   │
-└─────────────────┘    └─────────────────┘
-         │                       │
-         │                       ▼
-         │              ┌─────────────────┐
-         │              │ OurCommitNeeded │
-         │              │ (Final Vote)    │
-         │              └─────────────────┘
-         │                       │
-         ▼                       ▼
-┌─────────────────┐    ┌─────────────────┐
-│    Rejected     │    │   Consensus     │
-│   (Failed)      │    │  (Committed)    │
-└─────────────────┘    └─────────────────┘
+┌─────────────────┐
+│ OurCommitNeeded │
+│  (Final Vote)   │
+└─────────────────┘
+         │
+         ├──────────────────────────────┐
+         ▼                              ▼
+┌─────────────────┐          ┌───────────────────────┐
+│   Consensus     │          │       Rejected        │
+│  (Committed)    │          │ (invalid — permanent) │
+└─────────────────┘          └───────────────────────┘
 ```
+
+`Rejected` and `ConflictSuperseded` are both terminal and both clear the member's reservation, but
+they mean different things and are counted separately at every threshold: `Rejected` is a validity
+verdict, while `ConflictSuperseded` only says "enough members hold a rival that this one can no
+longer reach super-majority" — the writer retries as a fresh transaction.
 
 ### Phase 1: Promise Collection (Super-Majority Required)
 
 During the promise phase, each peer evaluates whether they can commit to the transaction. **The coordinator requires a super-majority (default 3/4) of promises** to proceed to the commit phase, providing stronger consensus guarantees than simple majority.
 
+A member answers with exactly one of three signed vote kinds, chosen by `getTransactionPhase`
+*before* the handler runs (`findConflict` decides between the first two):
+
+```typescript
+type Signature =
+  | { type: 'approve'; signature: string }
+  | { type: 'reject'; signature: string; rejectReason?: string }
+  // We hold a conflicting transaction that won the race; `conflictWith` is its messageHash.
+  | { type: 'conflict'; signature: string; conflictWith: string };
+```
+
 ```typescript
 private async handlePromiseNeeded(record: ClusterRecord): Promise<ClusterRecord> {
-  // Check for conflicts with existing transactions
-  // Uses race resolution: transaction with more approvals wins
-  if (this.hasConflict(record)) {
-    return this.rejectTransaction(record, 'Conflict detected');
-  }
-  
-  // Create promise signature
-  const signature: Signature = {
-    type: 'approve',
-    signature: await this.signPromiseHash(record)
-  };
-  
+  // Validity only — the conflict check already happened in getTransactionPhase, which routes a
+  // lost race to handleConflictVoteNeeded instead of here.
+  const validation = await this.evaluatePromise(record);
+
+  const signature: Signature = validation.valid
+    ? { type: 'approve', signature: await this.signVote(promiseHash, 'approve') }
+    : { type: 'reject', signature: await this.signVote(promiseHash, 'reject', validation.reason), rejectReason: validation.reason };
+
   return {
     ...record,
-    promises: {
-      ...record.promises,
-      [this.peerId.toString()]: signature
-    }
+    promises: { ...record.promises, [this.peerId.toString()]: signature }
   };
 }
 ```
+
+**Never silence.** A member that loses the race answers with a `conflict` vote rather than
+withholding its promise: absence on the wire cannot be told apart from an unreachable peer, so a
+silently-lost race reached the writer as "the cohort did not answer" and could not be retried
+sensibly. Each variant's extra field (`rejectReason`, `conflictWith`) is folded into the signed
+payload (`clusterVoteSigningPayload` in db-core), so neither can be rewritten in transit.
+
+The coordinator counts the three kinds separately and reports a promise-phase shortfall as whichever
+it actually was: `ValidatorRejectionError` (invalid — permanent), `ConflictRaceLostError` (lost race
+— surfaced by `CoordinatorRepo.pend` as a retryable `StaleFailure` with `conflict: true`), or the
+legacy super-majority error reserved for a genuinely silent cohort.
 
 **Super-Majority Validation** (in ClusterCoordinator):
 ```typescript
@@ -308,16 +344,21 @@ export class ClusterMember implements ICluster {
 The system prevents conflicting transactions by analyzing affected block IDs:
 
 ```typescript
-private hasConflict(record: ClusterRecord): boolean {
-  for (const [_, state] of this.activeTransactions) {
+/** The winner's messageHash when a held transaction beats `record`, else undefined. */
+private findConflict(record: ClusterRecord): { blockedBy: string } | undefined {
+  for (const [existingHash, state] of this.activeTransactions) {
     if (this.operationsConflict(
       state.record.message.operations,
       record.message.operations
     )) {
-      return true;
+      // Race resolution decides which one survives; the loser is cleared, not silently kept.
+      if (this.resolveRace(state.record, record) === 'keep-existing') {
+        return { blockedBy: existingHash };  // becomes the conflict vote's `conflictWith`
+      }
+      this.clearTransaction(existingHash);
     }
   }
-  return false;
+  return undefined;
 }
 
 private operationsConflict(ops1: RepoMessage['operations'], ops2: RepoMessage['operations']): boolean {
@@ -368,22 +409,26 @@ private resolveRace(existing: ClusterRecord, incoming: ClusterRecord): 'keep-exi
 ### Releasing an Abandoned Transaction
 
 `activeTransactions` doubles as each member's reservation table over blocks: while an entry sits
-there, `hasConflict` measures every later transaction against it. A member drops an entry as soon as
-it can prove the transaction is finished — consensus reached, or enough signed `reject` votes that
-super-majority is unreachable (`TransactionPhase.Rejected`, including the case where the member's own
-vote is the one that makes it unreachable). Absent such proof the only release is the 2-second
-staleness sweep inside `hasConflict`.
+there, `findConflict` measures every later transaction against it. A member drops an entry as soon as
+it can prove the transaction is finished — consensus reached, enough signed `reject` votes that
+super-majority is unreachable (`TransactionPhase.Rejected`), or enough `conflict` votes for the same
+(`TransactionPhase.ConflictSuperseded`) — including the case where the member's own vote is the one
+that makes it unreachable. A member never keeps a record it conflict-voted: it already holds the
+winner, and keeping the loser would reserve the same blocks twice. Absent such proof the only release
+is the 2-second staleness sweep inside `findConflict`.
 
 That leaves the coordinator responsible for telling members about an abandonment they cannot see for
-themselves. When it abandons a transaction at the `rejected-by-validators` branch it replays the
-merged record — the one carrying the signed rejections — to every peer in the cohort
+themselves. When it abandons a transaction at the `rejected-by-validators` branch — or at the
+`conflict-race-lost` branch, when the merged conflict/reject votes are themselves enough to prove
+super-majority unreachable — it replays the merged record to every peer in the cohort
 (`ClusterCoordinator.broadcastAbandonment`):
 
 - **No new message type.** It is the same `update()` call every phase uses, so a member re-derives
   `Rejected` from votes it verifies itself and clears; nothing about the wire format changes.
 - **Proof-carrying, so trust is not required.** A member accepts the release only because the
   signatures it is shown prove it, which is why the `supermajority-failed` branch — where peers were
-  silent and the record therefore proves nothing — deliberately does *not* broadcast.
+  silent and the record therefore proves nothing — deliberately does *not* broadcast, and why the
+  `conflict-race-lost` branch broadcasts only once the votes it holds carry that proof.
 - **Fire-and-forget.** The coordinator throws to its caller immediately and never awaits or rethrows
   delivery: an abandonment must not turn into a different failure. The staleness sweep remains the
   backstop when delivery fails, and a retry that outruns the broadcast simply loses one more race.
@@ -415,6 +460,12 @@ private async computeCommitHash(record: ClusterRecord): Promise<string> {
   return uint8ArrayToString(hashBytes.digest, 'base64url');
 }
 ```
+
+What a vote actually signs is `<hash>:<type>[:<extra>]`, where `extra` is that variant's own field —
+a reject's reason, a conflict's winning hash. Both the signer and every verifier build those bytes
+through the single `clusterVoteSigningPayload` / `clusterVoteVerificationPayload` pair in db-core
+(beside the `Signature` type): a second copy that forgets a variant would not fail loudly, it would
+report an honest vote as an invalid signature.
 
 ### Signature Verification
 

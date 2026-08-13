@@ -6,7 +6,7 @@ import type { RepoMessage } from "../network/repo-protocol.js";
  * A discriminated union rather than one shape with optional fields, so each vote kind carries
  * exactly its own payload: a `conflict` without its `conflictWith` (or a stray `rejectReason` on an
  * `approve`) does not typecheck. Every variant's extra field is folded into the signed payload
- * (see cluster-repo's `computeSigningPayload`), so none of them can be altered in transit.
+ * ({@link clusterVoteSigningPayload}), so none of them can be altered in transit.
  */
 export type Signature =
 	| { type: 'approve'; signature: string }
@@ -18,6 +18,32 @@ export type Signature =
 	 * transaction's messageHash: structured, signed, and readable without parsing prose.
 	 */
 	| { type: 'conflict'; signature: string; conflictWith: string };
+
+/**
+ * The exact bytes a vote signature covers: `<hash>:<type>[:<extra>]`, where `extra` is the variant's
+ * own payload — a reject's `rejectReason`, a conflict's `conflictWith`, nothing for an approve.
+ * Folding the extra in is what makes it integrity-protected in transit rather than free-floating
+ * prose.
+ *
+ * Producers and verifiers must both build the preimage here. It lives beside {@link Signature}
+ * rather than in either consumer because a second copy that forgets a variant does not fail loudly:
+ * it reports an honest vote as an invalid signature. (The dispute path once carried such a copy.)
+ *
+ * "Cluster" in the name distinguishes these consensus votes from the dispute subsystem's
+ * arbitration votes, which have their own unrelated preimage (`dispute/invalidation.ts`).
+ */
+export function clusterVoteSigningPayload(hash: string, type: Signature['type'], extra?: string): Uint8Array {
+	return new TextEncoder().encode(hash + ':' + type + (extra ? ':' + extra : ''));
+}
+
+/** Verifier-side {@link clusterVoteSigningPayload}: reads each variant's signed extra off the vote itself. */
+export function clusterVoteVerificationPayload(hash: string, signature: Signature): Uint8Array {
+	switch (signature.type) {
+		case 'reject': return clusterVoteSigningPayload(hash, 'reject', signature.rejectReason);
+		case 'conflict': return clusterVoteSigningPayload(hash, 'conflict', signature.conflictWith);
+		default: return clusterVoteSigningPayload(hash, signature.type);
+	}
+}
 
 export type ClusterPeers = {
 	[id: string]: {

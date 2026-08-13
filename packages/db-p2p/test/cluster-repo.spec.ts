@@ -54,8 +54,9 @@ const computeCommitHash = async (record: ClusterRecord): Promise<string> => {
 	return uint8ArrayToString(hashBytes.digest, 'base64url');
 };
 
-const signVote = async (privateKey: PrivateKey, hash: string, type: 'approve' | 'reject', rejectReason?: string): Promise<string> => {
-	const payload = hash + ':' + type + (rejectReason ? ':' + rejectReason : '');
+/** `extra` is the vote variant's signed field: a reject's reason, a conflict's winning hash. */
+const signVote = async (privateKey: PrivateKey, hash: string, type: Signature['type'], extra?: string): Promise<string> => {
+	const payload = hash + ':' + type + (extra ? ':' + extra : '');
 	const sigBytes = await privateKey.sign(new TextEncoder().encode(payload));
 	return uint8ArrayToString(sigBytes, 'base64url');
 };
@@ -66,6 +67,12 @@ const makeSignedPromise = async (privateKey: PrivateKey, record: ClusterRecord, 
 	return type === 'approve'
 		? { type: 'approve', signature: sig }
 		: { type: 'reject', signature: sig, rejectReason };
+};
+
+/** Another member's answer that it holds the rival which won the race — `conflictWith` is signed. */
+const makeSignedConflict = async (privateKey: PrivateKey, record: ClusterRecord, conflictWith: string): Promise<Signature> => {
+	const promiseHash = await computePromiseHash(record);
+	return { type: 'conflict', signature: await signVote(privateKey, promiseHash, 'conflict', conflictWith), conflictWith };
 };
 
 const makeSignedCommit = async (privateKey: PrivateKey, record: ClusterRecord, type: 'approve' | 'reject' = 'approve'): Promise<Signature> => {
@@ -682,6 +689,74 @@ describe('ClusterMember', () => {
 			const recordZ = await createClusterRecord(peers, makePendOperation('a-z', 'block-y-only'));
 			const resultZ = await clusterMemberInstance.update(recordZ);
 			expect(resultZ.promises[ourId]!.type, 'the conflict-voted loser must not hold its blocks').to.equal('approve');
+		});
+
+		it('rejects a conflict vote whose named winner was altered in transit', async () => {
+			const peer2 = await makeKeyPair();
+			const peer3 = await makeKeyPair();
+			const peers = makeClusterPeers([selfKeyPair, peer2, peer3]);
+
+			// `conflictWith` is only meaningful if it is covered by the signature — otherwise a relaying
+			// peer could rewrite which transaction the loss is attributed to.
+			const baseRecord = await createClusterRecord(peers, makeGetOperation(['block-1']));
+			const honestVote = await makeSignedConflict(peer2.privateKey, baseRecord, 'real-winner-hash');
+			const tampered: ClusterRecord = {
+				...baseRecord,
+				promises: {
+					[peer2.peerId.toString()]: { ...honestVote, type: 'conflict', conflictWith: 'attacker-chosen-hash' }
+				}
+			};
+
+			try {
+				await clusterMemberInstance.update(tampered);
+				expect.fail('a conflict vote naming a different winner than it signed must not validate');
+			} catch (err) {
+				expect((err as Error).message).to.include('Invalid promise signature');
+			}
+		});
+
+		it('treats other members\' conflict votes as not-now, not as rejections', async () => {
+			// 8 peers at 0.75 ⇒ super-majority 6, so up to 2 refusals still leave the record live. A
+			// conflict vote must not be counted as a rejection: the member owes this record its own vote.
+			const others = await Promise.all(Array.from({ length: 7 }, () => makeKeyPair()));
+			const ourId = selfKeyPair.peerId.toString();
+			const peers = makeClusterPeers([selfKeyPair, ...others]);
+
+			const baseRecord = await createClusterRecord(peers, makeGetOperation(['block-1']));
+			const record: ClusterRecord = {
+				...baseRecord,
+				promises: {
+					[others[0]!.peerId.toString()]: await makeSignedConflict(others[0]!.privateKey, baseRecord, 'rival-hash'),
+					[others[1]!.peerId.toString()]: await makeSignedConflict(others[1]!.privateKey, baseRecord, 'rival-hash')
+				}
+			};
+
+			const result = await clusterMemberInstance.update(record);
+			expect(result.promises[ourId]?.type, 'a live record still gets our vote').to.equal('approve');
+		});
+
+		it('abstains and clears when others\' conflict votes prove super-majority unreachable', async () => {
+			// Same 8-peer cohort, now with 3 conflict votes: 6 approvals are no longer reachable, so the
+			// record is terminal (ConflictSuperseded). The member must neither vote nor reserve its
+			// blocks — holding a provably-dead loser would block the very retry meant to replace it.
+			const others = await Promise.all(Array.from({ length: 7 }, () => makeKeyPair()));
+			const ourId = selfKeyPair.peerId.toString();
+			const peers = makeClusterPeers([selfKeyPair, ...others]);
+
+			const baseRecord = await createClusterRecord(peers, makePendOperation('a-dead', 'block-contested'));
+			const record: ClusterRecord = {
+				...baseRecord,
+				promises: Object.fromEntries(await Promise.all(others.slice(0, 3).map(async peer =>
+					[peer.peerId.toString(), await makeSignedConflict(peer.privateKey, baseRecord, 'rival-hash')] as const)))
+			};
+
+			const result = await clusterMemberInstance.update(record);
+			expect(result.promises[ourId], 'a record that can never commit gets no vote').to.equal(undefined);
+
+			// A later transaction on the same block must see no reservation from the dead record.
+			const fresh = await createClusterRecord(peers, makePendOperation('a-fresh', 'block-contested'));
+			const freshResult = await clusterMemberInstance.update(fresh);
+			expect(freshResult.promises[ourId]?.type, 'the dead record must not hold its blocks').to.equal('approve');
 		});
 	});
 

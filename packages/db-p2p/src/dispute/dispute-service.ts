@@ -1,5 +1,5 @@
-import type { ClusterRecord, ITransactionValidator, InvalidateRequest, CommitRequest, PendRequest, CollectionId } from '@optimystic/db-core';
-import { blockIdsForTransforms, computeClusterPromiseHash, recordMembershipDigest } from '@optimystic/db-core';
+import type { ClusterRecord, Signature, ITransactionValidator, InvalidateRequest, CommitRequest, PendRequest, CollectionId } from '@optimystic/db-core';
+import { blockIdsForTransforms, computeClusterPromiseHash, clusterVoteVerificationPayload, recordMembershipDigest } from '@optimystic/db-core';
 import { buildDisputeResolutionProof, computeTargetHash, computeArbitratorSetHash, voteSigningPayload, arbitratorSetSigningPayload, VOTE_VERSION, type CertificateTarget } from './invalidation.js';
 import type { PeerId, PrivateKey } from '@libp2p/interface';
 import { sha256 } from 'multiformats/hashes/sha2';
@@ -665,7 +665,7 @@ export class DisputeService {
 		record: ClusterRecord,
 		peerId: string,
 		promiseHash: string,
-		signature: { type: string; signature: string; rejectReason?: string }
+		signature: Signature
 	): Promise<boolean> {
 		const publicKey = record.peers[peerId]?.publicKey;
 		if (!publicKey?.length) return false;
@@ -675,8 +675,7 @@ export class DisputeService {
 				: publicKey;
 			if (!peerIdBindsPublicKey(peerId, keyBytes)) return false;
 			const pubKey = publicKeyFromRaw(keyBytes);
-			const payloadStr = promiseHash + ':' + signature.type + (signature.rejectReason ? ':' + signature.rejectReason : '');
-			const payload = new TextEncoder().encode(payloadStr);
+			const payload = clusterVoteVerificationPayload(promiseHash, signature);
 			const sigBytes = uint8ArrayFromString(signature.signature, 'base64url');
 			return pubKey.verify(payload, sigBytes);
 		} catch {

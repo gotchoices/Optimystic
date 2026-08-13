@@ -948,6 +948,11 @@ export class CoordinatorRepo implements IRepo {
 			// multi-collection pendPhase retry it via `isConflictFailure`), exactly as a confirmed
 			// stale revision is. `staleAt` stays absent deliberately — it is confirmed-only, and a
 			// lost race is a rival *pend* holding the blocks, not a revision claim.
+			//
+			// NOTE: `error.conflicts` (peerId → winning messageHash) is dropped here — `StaleFailure`
+			// has no field for it and the retry loop only needs "retryable". If a caller ever needs to
+			// know WHICH transaction won (e.g. to wait on it rather than re-race it), add a typed field
+			// for it; never recover it by parsing `reason`.
 			if (error instanceof ConflictRaceLostError) {
 				return { success: false, conflict: true, reason: error.message };
 			}

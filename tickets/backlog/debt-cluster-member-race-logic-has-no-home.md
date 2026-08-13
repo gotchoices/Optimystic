@@ -7,8 +7,9 @@ tradeoffs: This is the most safety-critical file in the repo and the split buys 
 
 # The race-resolution logic deserves its own module
 
-`packages/db-p2p/src/cluster/cluster-repo.ts` is **1954 lines**
-(`wc -l packages/db-p2p/src/cluster/cluster-repo.ts`), almost all of it one class,
+`packages/db-p2p/src/cluster/cluster-repo.ts` is **2034 lines**
+(`wc -l packages/db-p2p/src/cluster/cluster-repo.ts`, re-measured after
+`member-must-answer-a-lost-conflict-race` landed), almost all of it one class,
 `ClusterMember`. That one class covers: the two-phase protocol state machine, signature
 signing and verification, membership admission, block storage application, consensus
 certificates, invalidation, persistence and restart recovery, expiration timers — and
@@ -23,15 +24,16 @@ Race resolution is already nearly self-contained and unusually heavily documente
 argument for its ordering runs to about forty lines of comment, and mirrors
 `docs/correctness.md` §Theorem 9). Its members:
 
-- `hasConflict` — scans the member's active transactions for one touching the same blocks, and
-  sweeps stale entries while it is there
+- `findConflict` — scans the member's active transactions for one touching the same blocks and
+  returns the winner's messageHash when the incoming record loses, sweeping stale entries while it
+  is there
 - `resolveRace` — the deterministic arbiter: approvals, then aged priority, then message hash
 - `approvalCount`, `recordPriority` — the two counts `resolveRace` ranks on
 - `operationsConflict`, `getAffectedBlockIds` — pure block-overlap tests
 
-Of these only `hasConflict` touches member state (`activeTransactions`, and it clears entries);
+Of these only `findConflict` touches member state (`activeTransactions`, and it clears entries);
 the rest are pure functions of one or two records. A module that owns the pure arbiter, with
-`hasConflict` staying on the member and calling into it, is a mechanical move.
+`findConflict` staying on the member and calling into it, is a mechanical move.
 
 ## Why it is worth doing
 
@@ -53,6 +55,6 @@ toward it.
 
 ## Sequencing
 
-`implement/2-member-must-answer-a-lost-conflict-race` changes `hasConflict`'s return type and
-adds phases around it. Land that first, or this becomes a needless merge conflict against an
-in-flight consensus change.
+`member-must-answer-a-lost-conflict-race` has landed — it renamed `hasConflict` to `findConflict`,
+changed its return type, and added the conflict-vote phases around it. Nothing in this area is
+in flight now.

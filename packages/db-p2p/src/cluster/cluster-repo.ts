@@ -2,7 +2,7 @@ import type { IRepo, ClusterRecord, ClusterPeers, Signature, RepoMessage, ITrans
 import type { ICluster } from "@optimystic/db-core";
 import type { IPeerNetwork } from "@optimystic/db-core";
 import { blockIdsForTransforms, DEFAULT_SUPER_MAJORITY_THRESHOLD } from "@optimystic/db-core";
-import { computeClusterCommitHash, computeClusterMessageHash, computeClusterPromiseHash, membershipDigest, recordMembershipDigest, clampPriority } from "@optimystic/db-core";
+import { computeClusterCommitHash, computeClusterMessageHash, computeClusterPromiseHash, membershipDigest, recordMembershipDigest, clampPriority, clusterVoteSigningPayload, clusterVoteVerificationPayload } from "@optimystic/db-core";
 import { verifyInvalidationCertificate, type ArbitratorSetRecompute } from "../dispute/invalidation.js";
 import { buildCommitCert, invalidationActionId } from "./commit-cert.js";
 import { ClusterClient } from "./client.js";
@@ -35,15 +35,15 @@ enum TransactionPhase {
 }
 
 /**
- * A phase plus the data its handler needs: `conflictsWith` (the winning rival's messageHash) is
- * populated only for {@link TransactionPhase.OurConflictVoteNeeded}, so the conflict-vote handler
- * does not have to re-run conflict detection (whose race resolution has side effects) to learn
- * which transaction blocked it.
+ * A phase plus the data its handler needs. Only {@link TransactionPhase.OurConflictVoteNeeded}
+ * carries any — `conflictsWith`, the winning rival's messageHash — so the conflict-vote handler need
+ * not re-run conflict detection (whose race resolution has side effects) to learn what blocked it.
+ * Split by phase rather than an optional field so the handler reads it without an assertion, and so
+ * a future phase-with-data cannot silently inherit this one's payload.
  */
-type PhaseResult = {
-	phase: TransactionPhase;
-	conflictsWith?: string;
-};
+type PhaseResult =
+	| { phase: TransactionPhase.OurConflictVoteNeeded; conflictsWith: string }
+	| { phase: Exclude<TransactionPhase, TransactionPhase.OurConflictVoteNeeded> };
 
 interface TransactionState {
 	record: ClusterRecord;
@@ -422,15 +422,15 @@ export class ClusterMember implements ICluster {
 				log('cluster-member:phase-loop-overflow', { messageHash: record.messageHash, steps: step });
 				break;
 			}
-			const { phase, conflictsWith } = await this.getTransactionPhase(currentRecord);
+			const phaseResult = await this.getTransactionPhase(currentRecord);
 			log('cluster-member:phase', {
 				messageHash: record.messageHash,
-				phase,
+				phase: phaseResult.phase,
 				step,
 				promises: Object.keys(currentRecord.promises ?? {}),
 				commits: Object.keys(currentRecord.commits ?? {})
 			});
-			switch (phase) {
+			switch (phaseResult.phase) {
 				case TransactionPhase.OurPromiseNeeded:
 					log('cluster-member:action-promise', {
 						messageHash: record.messageHash
@@ -444,7 +444,7 @@ export class ClusterMember implements ICluster {
 					// the super-majority — recompute rather than guess which.
 					continue;
 				case TransactionPhase.OurConflictVoteNeeded:
-					currentRecord = await this.handleConflictVoteNeeded(currentRecord, conflictsWith!);
+					currentRecord = await this.handleConflictVoteNeeded(currentRecord, phaseResult.conflictsWith);
 					// Never persist a record we conflict-voted: this member holds the WINNER, and
 					// persisting the loser would reserve the same blocks a second time — half of what
 					// made the silent-abstention failure self-sustaining.
@@ -739,29 +739,8 @@ export class ClusterMember implements ICluster {
 		return computeClusterCommitHash(record.messageHash, record.message, record.promises, recordMembershipDigest(record));
 	}
 
-	/**
-	 * The exact bytes a vote signature covers: `hash:type[:extra]`, where `extra` is the variant's
-	 * own payload — a reject's `rejectReason`, a conflict's `conflictWith` (see
-	 * {@link signedVoteExtra}), nothing for an approve. Folding the extra in is what makes it
-	 * integrity-protected in transit rather than free-floating prose.
-	 */
-	private computeSigningPayload(hash: string, type: string, extra?: string): Uint8Array {
-		const payload = hash + ':' + type + (extra ? ':' + extra : '');
-		return new TextEncoder().encode(payload);
-	}
-
-	/** The variant-specific field a {@link Signature}'s signed payload carries (see {@link computeSigningPayload}). */
-	private static signedVoteExtra(signature: Signature): string | undefined {
-		switch (signature.type) {
-			case 'reject': return signature.rejectReason;
-			case 'conflict': return signature.conflictWith;
-			default: return undefined;
-		}
-	}
-
 	private async signVote(hash: string, type: Signature['type'], extra?: string): Promise<string> {
-		const payload = this.computeSigningPayload(hash, type, extra);
-		const sigBytes = await this.privateKey.sign(payload);
+		const sigBytes = await this.privateKey.sign(clusterVoteSigningPayload(hash, type, extra));
 		return uint8ArrayToString(sigBytes, 'base64url');
 	}
 
@@ -797,7 +776,7 @@ export class ClusterMember implements ICluster {
 		}
 		try {
 			const pubKey = publicKeyFromRaw(keyBytes);
-			const payload = this.computeSigningPayload(hash, signature.type, ClusterMember.signedVoteExtra(signature));
+			const payload = clusterVoteVerificationPayload(hash, signature);
 			const sigBytes = uint8ArrayFromString(signature.signature, 'base64url');
 			const ok = await pubKey.verify(payload, sigBytes);
 			// Key is bound to peerId: a failed verify is a genuine bad vote from a proven identity → penalize.
@@ -853,7 +832,20 @@ export class ClusterMember implements ICluster {
 			return { phase: TransactionPhase.OurPromiseNeeded };
 		}
 
-		// Check if we have enough approved promises to proceed to commit
+		// Check if we have enough approved promises to proceed to commit. Deliberately blind to what
+		// OUR own vote was: the rest of the cohort reaching super-majority is the commit rule
+		// (Theorem 1 Case 2), so a member that rejected — or conflict-voted — still signs the commit
+		// the cohort decided on rather than stalling it. Only the rejection/superseded thresholds
+		// above can stop a record here, and both are checked first.
+		//
+		// NOTE: signing the commit drops this member's reservation on the record
+		// (`shouldPersist = false` in the caller), and the phase fixpoint means that can now happen on
+		// the FIRST delivery when the record already arrives at super-majority, rather than a
+		// round-trip later. The safety argument is quorum intersection (Theorem 9: no rival can
+		// assemble its own super-majority once this one has), NOT the reservation — the reservation
+		// only orders *concurrently-pending* rivals. If a lost-update between commit-signing and
+		// consensus-apply ever shows up, hold the reservation until `handleConsensus` instead of
+		// releasing it here.
 		const approvedPromises = Object.values(record.promises).filter(s => s.type === 'approve');
 		if (approvedPromises.length >= superMajority && !record.commits[ourId]) {
 			return { phase: TransactionPhase.OurCommitNeeded };
@@ -1367,7 +1359,7 @@ export class ClusterMember implements ICluster {
 			// Gated on the sink: with no reactivity wired the preimage has no consumer, so a sink-less
 			// node pays neither the extra `sha256` nor the extra microtask — the true zero-cost default.
 			if (this.onCommitCertificate) {
-				const commitSignedPayload = this.computeSigningPayload(await this.computeCommitHash(record), 'approve');
+				const commitSignedPayload = clusterVoteSigningPayload(await this.computeCommitHash(record), 'approve');
 				this.captureCommitCert(record, commit.actionId, commitSignedPayload);
 			}
 			let result: CommitResult;
@@ -1492,7 +1484,7 @@ export class ClusterMember implements ICluster {
 		// {@link invalidationActionId} the invalidation's change event also carries, so the bridge's
 		// cert extractor resolves it. Gated on the sink — a node with no reactivity wired pays nothing.
 		if (this.onCommitCertificate) {
-			const invSignedPayload = this.computeSigningPayload(await this.computeCommitHash(record), 'approve');
+			const invSignedPayload = clusterVoteSigningPayload(await this.computeCommitHash(record), 'approve');
 			this.captureCommitCert(record, invalidationActionId(request.invalidatedActionId, request.resolution.disputeId), invSignedPayload);
 		}
 
@@ -1700,7 +1692,7 @@ export class ClusterMember implements ICluster {
 	 *
 	 * The count is APPROVALS, not `promises` keys. `promises` is the vote map — a reject occupies a key
 	 * there exactly as an approve does — so counting keys would treat a rejection as progress, letting a
-	 * record that can never commit outrank (and therefore block, via {@link hasConflict}) a fresh rival
+	 * record that can never commit outrank (and therefore block, via {@link findConflict}) a fresh rival
 	 * for the whole staleness window. Approvals is also the count the invariant below actually needs:
 	 * the commit rule is `approvedPromises >= superMajority`, which never looks at rejections.
 	 *
@@ -1777,7 +1769,7 @@ export class ClusterMember implements ICluster {
 	 * NOTE: `message` is fixed for a transaction's whole lifecycle (promises/commits accrue in the
 	 * separate `promises`/`commits` maps, never in `message`), so a transaction keeps its rank through
 	 * the commit phase — there is no "priority drops to 0 at commit" asymmetry. resolveRace is only
-	 * consulted at the promise decision (hasConflict), i.e. between two still-open conflicting
+	 * consulted at the promise decision (findConflict), i.e. between two still-open conflicting
 	 * transactions, which is exactly the concurrent-contention case priority is meant to order.
 	 */
 	private recordPriority(record: ClusterRecord): number {
