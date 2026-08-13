@@ -2,7 +2,7 @@ import { peerIdFromString } from "../network/types.js";
 import type { PeerId } from "../network/types.js";
 import { highestStaleAt, isConflictFailure } from "../network/stale-failure.js";
 import { BlockUnavailableError, BlockPossiblyStaleError } from "../network/struct.js";
-import type { ActionTransforms, ActionBlocks, BlockActionStatus, ITransactor, PendSuccess, StaleFailure, IKeyNetwork, BlockId, GetBlockResults, PendResult, CommitResult, PendRequest, IRepo, BlockGets, Transforms, CommitRequest, ActionId, RepoCommitRequest, ClusterNomineesResult, CollectionId, IBlock, CoordinatorIntent } from "../index.js";
+import type { ActionTransforms, ActionBlocks, BlockActionStatus, ITransactor, PendSuccess, StaleFailure, IKeyNetwork, BlockId, GetBlockResults, PendResult, CommitResult, PendRequest, IRepo, BlockGets, Transforms, CommitRequest, ActionId, RepoCommitRequest, ClusterNomineesResult, CollectionId, IBlock, CoordinatorIntent, BlockUnavailableReason } from "../index.js";
 import type { IBlockChangeNotifier, CollectionChangeListener } from "./change-notifier.js";
 import { transformForBlockId, concatTransforms, concatTransform, transformsFromTransform, blockIdsForTransforms } from "../transform/helpers.js";
 import { Tracker } from "../transform/tracker.js";
@@ -244,12 +244,23 @@ export class NetworkTransactor implements ITransactor, IBlockChangeNotifier {
 		// failure direction is safe (a lower recorded revision spuriously stale-rejects rather
 		// than wrongly accepting). If peers are ever seen to disagree here, break the tie on
 		// the HIGHEST materializedRev among top-rank entries.
+		// `unavailable` answers rank among THEMSELVES by how much they establish, so the merged
+		// entry never presents a weaker doubt than some peer actually returned. This matters
+		// because the reason travels out verbatim on `BlockUnavailableError` and callers act on
+		// it: 'cohort-unreachable' is the one reason a caller may treat permissively (the
+		// answering node reached nobody, so its own view is all it has), and a partitioned
+		// coordinator answering first must not mask a well-connected one that positively
+		// established the block EXISTS ('claimed-elsewhere', or 'unmaterializable' — records
+		// held here). 'peers-unreachable' sits between: it establishes that some of the cohort
+		// was reachable, without settling existence.
+		const unavailableRank = (reason: BlockUnavailableReason): number =>
+			reason === 'cohort-unreachable' ? 0 : reason === 'peers-unreachable' ? 1 : 2;
 		const rankOf = (r: unknown): number => {
 			if (!r || typeof r !== 'object') return -1;
 			const entry = r as GetBlockResults[BlockId];
-			if (entry.block != null) return entry.unconfirmedAheadRev === undefined ? 4 : 3;
-			if (entry.unavailable !== undefined) return 0;
-			return entry.unconfirmedAheadRev === undefined ? 2 : 1;
+			if (entry.block != null) return entry.unconfirmedAheadRev === undefined ? 6 : 5;
+			if (entry.unavailable !== undefined) return unavailableRank(entry.unavailable);
+			return entry.unconfirmedAheadRev === undefined ? 4 : 3;
 		};
 
 		// Create a lookup map from successful responses only

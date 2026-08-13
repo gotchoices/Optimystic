@@ -469,7 +469,7 @@ describe('TransactorSource', () => {
 				},
 			} as unknown as ITransactor)
 
-			for (const reason of ['unmaterializable', 'peers-unreachable'] as BlockUnavailableReason[]) {
+			for (const reason of ['unmaterializable', 'peers-unreachable', 'cohort-unreachable', 'claimed-elsewhere'] as BlockUnavailableReason[]) {
 				it(`throws BlockUnavailableError (${reason}) for a blockless entry flagged unavailable, recording no read dependency`, async () => {
 					const src = new TransactorSource<IBlock>('coll', makeFixedEntryTransactor({ state: {}, unavailable: reason }), undefined)
 

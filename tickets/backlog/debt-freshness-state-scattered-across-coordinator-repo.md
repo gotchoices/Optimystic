@@ -23,6 +23,13 @@ the two answer-flagging helpers, the claim memo, the repair-window policy, the c
 consult, the convergence attempt, the peer-reputation penalty). The rest is routing checks,
 construction, and the write path.
 
+Re-measured after ticket `absence-verdict-names-the-evidence` landed (same command):
+**1194 lines**. That ticket added a fourth thing the read path must consult before it
+answers — an `AbsenceVerdict` naming *why* an absence could not be confirmed, threaded from
+the cohort consult through `get` and mapped to a caller-visible reason at the flag site. It
+is further evidence for this ticket, not a separate one: the new state lives in exactly the
+span described above and is remembered the same loose way.
+
 ## Why it is worth attention
 
 This is not only a size complaint. The read path has to consult **every** piece of that

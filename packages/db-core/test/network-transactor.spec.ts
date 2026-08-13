@@ -287,6 +287,41 @@ describe('NetworkTransactor', () => {
       expect(result[blockId]!.unavailable).to.equal('peers-unreachable')
     })
 
+    // Ticket absence-verdict-names-the-evidence (review pass): the reason now travels out
+    // verbatim and callers act on it — 'cohort-unreachable' is the one a caller may treat
+    // permissively (proceed with its own empty view). So a partitioned coordinator answering
+    // first must not mask a well-connected one that positively established the block EXISTS;
+    // without the sub-rank both entries are bare `unavailable`, tie, and first-arrival wins.
+    it('a peer that establishes the block exists beats another peer\'s cohort-unreachable answer', async () => {
+      const peerA = 'peer-A'
+      const peerB = 'peer-B'
+      const net = new CountingKeyNetwork([peerA, peerB])
+
+      const blockId = 'contested-block' as BlockId
+
+      const isolatedRepo = makeGetOnlyRepo(async ({ blockIds }: BlockGets) => {
+        const res: GetBlockResults = {}
+        for (const bid of blockIds) res[bid] = { state: {}, unavailable: 'cohort-unreachable' }
+        return res
+      })
+      const claimingRepo = makeGetOnlyRepo(async ({ blockIds }: BlockGets) => {
+        const res: GetBlockResults = {}
+        for (const bid of blockIds) res[bid] = { state: {}, unavailable: 'claimed-elsewhere' }
+        return res
+      })
+
+      const networkTransactor = new NetworkTransactor({
+        timeoutMs: 1000,
+        abortOrCancelTimeoutMs: 500,
+        keyNetwork: net,
+        getRepo: (peerId: PeerId) => (peerId.toString() === peerA ? isolatedRepo : claimingRepo),
+      })
+
+      const result = await networkTransactor.get({ blockIds: [blockId] })
+
+      expect(result[blockId]!.unavailable).to.equal('claimed-elsewhere')
+    })
+
     it('a materialized block from one peer beats another peer\'s unavailable answer', async () => {
       const peerA = 'peer-A'
       const peerB = 'peer-B'

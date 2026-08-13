@@ -98,9 +98,13 @@ type AbsenceVerdict =
 	 *  "I hold nothing". As confirmed as an absence gets — stays authoritative, which is what
 	 *  keeps the routine new-collection probe at one round trip. */
 	| 'confirmed'
-	/** Some of the cohort answered, some could not be asked (or the consult threw outright). */
+	/** Some of the cohort answered and some could not be asked. (A consult that THROWS produces
+	 *  no verdict at all — `get`'s catch arm reports it directly.) */
 	| 'unconfirmed'
-	/** No cohort member outside this node could be asked at all. */
+	/** No cohort member outside this node could be asked at all. Mutually exclusive with
+	 *  `claimed` in practice: a claim requires a non-self peer to have answered, which is
+	 *  exactly what this verdict rules out. The precedence below still orders the pair, so
+	 *  the mapping stays total, but there is no reachable case to test. */
 	| 'isolated'
 	/** A peer claimed a revision this pass did not converge onto — quorum declined it, or a
 	 *  quorum corroborated it and acquisition failed. */
@@ -867,6 +871,10 @@ export class CoordinatorRepo implements IRepo {
 		// as a peer claim again. Harmless today — the self answer can only ever corroborate the
 		// revision already held, so the pass declines as `local-current` — but if a future caller can
 		// make self report something the reader does not hold, make `localPeerId` required instead.
+		// The same unset-`localPeerId` tolerance also lets self count toward `answered` below, and
+		// lets a self read that REJECTS land in `silent`: a solo repo whose own storage throws then
+		// reads as `answered === 0` and reports isolation ('cohort-unreachable') rather than a local
+		// fault. Same fix if it ever matters — require `localPeerId`.
 		const selfId = this.localPeerId?.toString();
 		let local: ActionRev | undefined;
 		const claims: RevClaim[] = [];

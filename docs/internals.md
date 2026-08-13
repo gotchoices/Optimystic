@@ -527,9 +527,16 @@ saveMaterializedBlock(block): store(structuredClone(block));
   | what the repair pass found | flag |
   | --- | --- |
   | whole cohort answered "holds nothing" (the routine new-collection probe) | none — authoritative absent |
+  | there was nobody to ask: `findCluster` returned an empty cohort, or only this node | none — authoritative absent |
   | part of the cohort answered, part was silent — or the consult threw outright | `'peers-unreachable'` |
-  | no cohort member outside this node could be asked at all | `'cohort-unreachable'` |
+  | this node knows of cohort members outside itself and could reach none of them | `'cohort-unreachable'` |
   | a peer positively claimed a revision that was neither corroborated to a quorum nor acquired | `'claimed-elsewhere'` |
+
+  Note the second row: `'cohort-unreachable'` is *silence from a cohort this node knows about*, not
+  isolation in general. A node whose routing view yields no cohort member at all — a cold boot with
+  an empty routing table — consults nobody, and its local emptiness is served as an authoritative
+  absent, unflagged. So a consumer relying on `'cohort-unreachable'` to detect isolation must also
+  tolerate the unflagged absent; the two differ only in whether FRET still remembers peers.
 
   When several apply the sharpest evidence wins: a claim outranks any amount of silence, and total
   silence outranks partial. A consult that *throws* (the cohort lookup itself failed) stays
@@ -537,8 +544,8 @@ saveMaterializedBlock(block): store(structuredClone(block));
   cohort members were reachable. `'cohort-unreachable'` tells the caller there is no
   better-connected coordinator to re-ask — but the absence is still **not** served as
   authoritative: a node that reached nobody has zero information about the cohort, and believing
-  its own emptiness is exactly the failure the fail-closed rule exists to prevent (a
-  freshly-rebooted or partitioned node would report every never-locally-seen block as absent).
+  its own emptiness is exactly the failure the fail-closed rule exists to prevent (a partitioned
+  node would otherwise report every never-locally-seen block as absent).
   Whether an isolated node's own view is good enough for a given read is per-read policy that
   belongs to the caller; `BlockUnavailableError.reason` carries the value out verbatim so a
   consumer can discriminate on it. `'claimed-elsewhere'` extends the fail-closed rule to an
