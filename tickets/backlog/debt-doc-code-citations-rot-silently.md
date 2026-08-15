@@ -1,5 +1,5 @@
 description: Our written documentation points at specific line numbers in the source code, and those pointers quietly go wrong every time someone edits the code. A reader following one lands on unrelated code and has no way to tell it is wrong. We should stop hand-maintaining them and let a check catch the bad ones.
-files: docs/correctness.md, docs/right-is-right.md, docs/arachnode-ring-handoff.md, packages/db-p2p-storage-fs/readme.md, packages/db-p2p/docs/cluster.md
+files: docs/correctness.md, docs/right-is-right.md, docs/arachnode-ring-handoff.md, packages/db-p2p-storage-fs/readme.md, packages/db-p2p/docs/cluster.md, packages/db-p2p/docs/storage.md, docs/internals.md, docs/architecture.md
 difficulty: medium
 tradeoffs: A checker is real machinery (a parser, a build/CI step, and a decision about what counts as a valid citation) to solve a problem that a reader can usually work around by grepping for the nearby symbol name — a maintainer could reasonably say "just stop writing line numbers" and rely on review discipline instead.
 
@@ -43,6 +43,25 @@ Stop relying on humans to notice. Two complementary directions, either or both:
 A reasonable outcome is: adopt the symbol convention, convert the existing line-number citations to
 it, and keep a lightweight check that fails on any *new* line-number citation — which makes the
 convention self-enforcing instead of a rule people forget.
+
+## Further instance (added during review of `storage-invariants-undocumented-and-doc-rot`)
+
+That ticket added an "Invariants" section to `packages/db-p2p/docs/storage.md` and edited
+`docs/internals.md` and `docs/architecture.md`. Between them the change introduced roughly **a dozen
+new `file:line` citations** into prose — into source files (`kv-raw-storage.ts:47-56`,
+`storage-repo.ts:21-27` / `:29-46`, `invalidation.ts:481-490`, `cascade.ts:43-49`,
+`file-storage.ts:411`, `transactor-source.ts:36`, `collection.ts:502`) and into other documents
+(`internals.md:358` / `:378`, `repository.md:89-114`, `correctness.md:46` / `:440`).
+
+Every one of them was verified accurate at the time of the review, and the review converted the three
+most fragile — the ones pointing at other prose documents — to section-and-symbol references. The
+rest were left as line numbers, because converting a mixed set piecemeal produces a document with two
+conventions, which is worse than either; the convention decision belongs to this ticket.
+
+The point for triage: the citation count is *growing*, and it grows fastest in exactly the documents
+that describe invariants — the ones where a reader following a stale pointer draws the most damaging
+wrong conclusion. Whichever direction this ticket takes, `packages/db-p2p/docs/storage.md` is now one
+of the heaviest users.
 
 ## Scope note
 

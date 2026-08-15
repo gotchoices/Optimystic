@@ -86,30 +86,35 @@ a non-monotonic regression that silently discards the out-of-band write.
 
 ### 3. Committed revisions are append-only; `latest` never advances past a materializable revision
 
-Documented well already — see `docs/correctness.md:46` and `:440` (ordering
-guarantees), and `docs/internals.md`'s "Key Invariants" section at `:358` and
-`:378` ("`latest` never advances past a revision the node can materialize").
-Enforced by `StorageRepo.internalCommit`'s missing-base refusal
-(`storage-repo.ts:876-886`, `MissingBaseRevisionError`).
+Documented well already — see `docs/correctness.md` §6.3 "Ordering Guarantees"
+(revision monotonicity within a collection) and `docs/internals.md`'s "Key
+Invariants" section, bullets `rev` and "`latest` never advances past a revision
+the node can materialize". Enforced by `StorageRepo.internalCommit`'s
+missing-base refusal (`refuseMissingBase` / `MissingBaseRevisionError` in
+`packages/db-p2p/src/storage/storage-repo.ts`).
 
 ### 4. `promotePendingTransaction` is a cross-store atomic *move*, not a copy
 
 Documented well already — see "Shared KV Kernel" below (this file) and
-Invariant P in `docs/repository.md:89-114`. Enforced differently per backend:
-each `RawStoreDriver.promote` implementation uses its own native atomic
+Invariant P in `docs/repository.md` ("a pending record and a committed record
+never coexist for one action"). Enforced differently per backend: each
+persistent `RawStoreDriver.promote` implementation uses its own native atomic
 primitive (filesystem rename, LevelDB/SQLite batch or DB transaction, an
 IndexedDB readwrite transaction) — never a two-step copy-then-delete, since a
 crash between the two steps would leave a pending and a committed record
-coexisting for the same action.
+coexisting for the same action. `MemoryStoreDriver.promote` is the one exception
+in form, not in effect: it does move the value map-to-map, but with no `await`
+between the two map operations and no durability to survive a crash, so no
+observer can see both records.
 
 ### 5. A store is owned by exactly one process
 
 No two processes may point an `IRawStorage` (or a `RawStoreDriver`) at the same
 underlying path/keyspace at the same time. This is **not enforced anywhere in
 code today** — it holds only because every current deployment happens to wire
-one store per node (and, in Sereus, one per strand besides), so nothing shares a
-directory in practice. Nothing stops a future host from embedding two nodes over
-one path.
+one store per node (and, in the Sereus fabric layered over Optimystic, one store
+per trust domain besides), so nothing shares a directory in practice. Nothing
+stops a future host from embedding two nodes over one path.
 
 **Violate it and:** Invariant 1 breaks silently. A second process writing to the
 same backend produces writes that never funnel through the first process's
