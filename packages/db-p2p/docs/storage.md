@@ -96,8 +96,9 @@ missing-base refusal (`refuseMissingBase` / `MissingBaseRevisionError` in
 ### 4. `promotePendingTransaction` is a cross-store atomic *move*, not a copy
 
 Documented well already — see "Shared KV Kernel" below (this file) and
-Invariant P in `docs/repository.md` ("a pending record and a committed record
-never coexist for one action"). Enforced differently per backend: each
+"Invariant P" on `IBlockStorage.promotePendingTransaction`
+(`packages/db-p2p/src/storage/i-block-storage.ts`) — "a pending record and a
+committed record never coexist for one action". Enforced differently per backend: each
 persistent `RawStoreDriver.promote` implementation uses its own native atomic
 primitive (filesystem rename, LevelDB/SQLite batch or DB transaction, an
 IndexedDB readwrite transaction) — never a two-step copy-then-delete, since a
@@ -270,6 +271,10 @@ Semantics worth knowing:
 - **Always clean, never dirty.** Nothing is pinned; `clear()` (or any future
   eviction) is correct at any instant and purely a performance question. If a
   change ever seems to need a dirty or pinned entry, the design has gone wrong.
+  Correct "at any instant" includes *during* an in-flight inner read: every
+  read-miss fill checks that the cache state it started on is still the live one,
+  so a read that overlaps a write and a `clear()` declines to cache its own
+  now-superseded snapshot rather than reinstalling it past the clear.
 - **Unbounded for now — deliberately.** Entries live for the process lifetime;
   the planned shared bounded pool (2Q admission, keyed `(storeId, class, key)`)
   adds the bound. Entry classes and keys are already shaped for that; block ids

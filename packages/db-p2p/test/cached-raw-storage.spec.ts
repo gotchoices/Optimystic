@@ -112,30 +112,51 @@ const WRITE_METHODS = [
 	'putTransaction', 'putMaterialized', 'deleteMaterialized', 'promote'
 ] as const;
 
-/** Delegates to a memory driver, but when armed, its pending-list enumeration pauses at a
- * gate AFTER draining and BEFORE yielding — so a test can land a write "mid-drain" with the
- * cache's enumeration provably in flight, deterministically (no timing sleeps). */
+/** A one-shot rendezvous: arm it, `await reached` once the code under test parks, do
+ * whatever must land "mid-operation", then `open()`. Deterministic — no timing sleeps. */
+class Gate {
+	/** Resolves once an armed operation has parked at the gate. */
+	reached: Promise<void> | undefined;
+	private held: Promise<void> | undefined;
+	private openResolve: (() => void) | undefined;
+	private reachedResolve: (() => void) | undefined;
+
+	arm(): void {
+		this.held = new Promise<void>(res => { this.openResolve = res; });
+		this.reached = new Promise<void>(res => { this.reachedResolve = res; });
+	}
+
+	open(): void {
+		this.openResolve?.();
+		this.openResolve = undefined;
+	}
+
+	/** Park here if armed; consumes the arming so only the next operation waits. */
+	async pass(): Promise<void> {
+		if (!this.held) return;
+		const held = this.held;
+		this.held = undefined;
+		this.reachedResolve?.();
+		await held;
+	}
+}
+
+/** Delegates to a memory driver, but when armed, an inner read pauses at a gate after
+ * reading and before returning — so a test can land writes (and a `clear()`) with the
+ * cache's inner call provably in flight. `listGate` parks the pending-list enumeration
+ * after its drain; `metadataGate` parks a point metadata read after its inner fetch. */
 class GatedStoreDriver implements RawStoreDriver {
 	listCalls = 0;
-	/** Resolves once an armed enumeration has drained and is parked at the gate. */
-	reachedGate: Promise<void> | undefined;
-	private gatePromise: Promise<void> | undefined;
-	private openGateResolve: (() => void) | undefined;
-	private reachedGateResolve: (() => void) | undefined;
+	readonly listGate = new Gate();
+	readonly metadataGate = new Gate();
 
 	constructor(private readonly inner: MemoryStoreDriver) {}
 
-	armGate(): void {
-		this.gatePromise = new Promise<void>(res => { this.openGateResolve = res; });
-		this.reachedGate = new Promise<void>(res => { this.reachedGateResolve = res; });
+	async getMetadata(blockId: BlockId): Promise<Uint8Array | undefined> {
+		const bytes = await this.inner.getMetadata(blockId);
+		await this.metadataGate.pass();
+		return bytes;
 	}
-
-	openGate(): void {
-		this.openGateResolve?.();
-		this.openGateResolve = undefined;
-	}
-
-	getMetadata(blockId: BlockId) { return this.inner.getMetadata(blockId); }
 	putMetadata(blockId: BlockId, value: Uint8Array) { return this.inner.putMetadata(blockId, value); }
 	getRevision(blockId: BlockId, rev: number) { return this.inner.getRevision(blockId, rev); }
 	putRevision(blockId: BlockId, rev: number, value: Uint8Array) { return this.inner.putRevision(blockId, rev, value); }
@@ -156,14 +177,43 @@ class GatedStoreDriver implements RawStoreDriver {
 		for await (const id of this.inner.listPendingActionIds(blockId)) {
 			drained.push(id);
 		}
-		if (this.gatePromise) {
-			const gate = this.gatePromise;
-			this.gatePromise = undefined;
-			this.reachedGateResolve?.();
-			await gate;
-		}
+		await this.listGate.pass();
 		yield* drained;
 	}
+}
+
+/** Delegates to a memory driver, failing the next `putMetadata` once — so a test can
+ * observe what the cache does when an inner write leaves the backend in an unknown state. */
+class FaultyStoreDriver implements RawStoreDriver {
+	failNextPutMetadata = false;
+	metadataReads = 0;
+
+	constructor(private readonly inner: MemoryStoreDriver) {}
+
+	async getMetadata(blockId: BlockId): Promise<Uint8Array | undefined> {
+		this.metadataReads++;
+		return this.inner.getMetadata(blockId);
+	}
+	async putMetadata(blockId: BlockId, value: Uint8Array): Promise<void> {
+		if (this.failNextPutMetadata) {
+			this.failNextPutMetadata = false;
+			throw new Error('inner putMetadata failed');
+		}
+		return this.inner.putMetadata(blockId, value);
+	}
+	getRevision(blockId: BlockId, rev: number) { return this.inner.getRevision(blockId, rev); }
+	putRevision(blockId: BlockId, rev: number, value: Uint8Array) { return this.inner.putRevision(blockId, rev, value); }
+	rangeRevisions(blockId: BlockId, lo: number, hi: number, reverse: boolean) { return this.inner.rangeRevisions(blockId, lo, hi, reverse); }
+	getPending(blockId: BlockId, actionId: ActionId) { return this.inner.getPending(blockId, actionId); }
+	putPending(blockId: BlockId, actionId: ActionId, value: Uint8Array) { return this.inner.putPending(blockId, actionId, value); }
+	deletePending(blockId: BlockId, actionId: ActionId) { return this.inner.deletePending(blockId, actionId); }
+	listPendingActionIds(blockId: BlockId) { return this.inner.listPendingActionIds(blockId); }
+	getTransaction(blockId: BlockId, actionId: ActionId) { return this.inner.getTransaction(blockId, actionId); }
+	putTransaction(blockId: BlockId, actionId: ActionId, value: Uint8Array) { return this.inner.putTransaction(blockId, actionId, value); }
+	getMaterialized(blockId: BlockId, actionId: ActionId) { return this.inner.getMaterialized(blockId, actionId); }
+	putMaterialized(blockId: BlockId, actionId: ActionId, value: Uint8Array) { return this.inner.putMaterialized(blockId, actionId, value); }
+	deleteMaterialized(blockId: BlockId, actionId: ActionId) { return this.inner.deleteMaterialized(blockId, actionId); }
+	promote(blockId: BlockId, actionId: ActionId) { return this.inner.promote(blockId, actionId); }
 }
 
 // --- Full backend-parity conformance over BOTH cached compositions ---
@@ -321,11 +371,11 @@ describe('CachedStoreDriver coherence', () => {
 		const storage = new KvRawStorage(new CachedStoreDriver(gated));
 		await storage.savePendingTransaction(blockId, 'a1' as ActionId, { delete: true });
 
-		gated.armGate();
+		gated.listGate.arm();
 		const firstListPromise = collect(storage.listPendingTransactions(blockId));
-		await gated.reachedGate; // cache's inner drain is provably in flight, parked at the gate
+		await gated.listGate.reached; // cache's inner drain is provably in flight, parked at the gate
 		await storage.savePendingTransaction(blockId, 'a2' as ActionId, { delete: true });
-		gated.openGate();
+		gated.listGate.open();
 
 		// The in-flight enumeration drained before the write — snapshot semantics.
 		expect(await firstListPromise).to.deep.equal(['a1']);
@@ -338,6 +388,55 @@ describe('CachedStoreDriver coherence', () => {
 		// The clean second drain seeds completeness normally.
 		expect(new Set(await collect(storage.listPendingTransactions(blockId)))).to.deep.equal(new Set(['a1', 'a2']));
 		expect(gated.listCalls).to.equal(2);
+	});
+
+	it('a clear() landing during an in-flight read never reinstalls the pre-clear value', async () => {
+		const gated = new GatedStoreDriver(new MemoryStoreDriver());
+		const cache = new CachedStoreDriver(gated);
+		const storage = new KvRawStorage(cache);
+
+		await storage.saveMetadata(blockId, { ranges: [[1]], latest: { rev: 1, actionId: 'a1' as ActionId } });
+		cache.clear(); // durable rev 1, cache empty — the read below is a genuine cold miss
+
+		gated.metadataGate.arm();
+		const inFlight = storage.getMetadata(blockId);
+		await gated.metadataGate.reached; // the inner read has returned rev 1 and is parked
+
+		// A newer write lands (cached on the CURRENT state object), then clear() discards it.
+		await storage.saveMetadata(blockId, { ranges: [[1]], latest: { rev: 2, actionId: 'a2' as ActionId } });
+		cache.clear();
+		gated.metadataGate.open();
+
+		// The in-flight read still returns its own snapshot — that value is simply older,
+		// exactly as an uncached driver read overlapping the same write would be.
+		expect((await inFlight)!.latest!.rev).to.equal(1);
+
+		// What must NOT happen: that snapshot being filled into the post-clear state, where
+		// it would outlive the rev-2 write that the clear took with it and be served forever.
+		expect((await storage.getMetadata(blockId))!.latest!.rev, 'post-clear read reflects the newest durable value').to.equal(2);
+	});
+
+	it('a failed inner write drops the entry to unknown rather than caching a guess', async () => {
+		const faulty = new FaultyStoreDriver(new MemoryStoreDriver());
+		const storage = new KvRawStorage(new CachedStoreDriver(faulty));
+
+		await storage.saveMetadata(blockId, { ranges: [[1]], latest: { rev: 1, actionId: 'a1' as ActionId } });
+		expect((await storage.getMetadata(blockId))!.latest!.rev).to.equal(1);
+		expect(faulty.metadataReads, 'the successful save populated the cache').to.equal(0);
+
+		faulty.failNextPutMetadata = true;
+		let error: Error | undefined;
+		try {
+			await storage.saveMetadata(blockId, { ranges: [[1]], latest: { rev: 2, actionId: 'a2' as ActionId } });
+		} catch (err) {
+			error = err as Error;
+		}
+		expect(error?.message, 'the inner failure propagates').to.equal('inner putMetadata failed');
+
+		// The backend state is unknown after the failure, so the cache must hold NEITHER the
+		// attempted rev 2 nor the stale rev 1 — the next read has to consult the driver.
+		expect((await storage.getMetadata(blockId))!.latest!.rev).to.equal(1);
+		expect(faulty.metadataReads, 'the failed write invalidated, forcing a fall-through').to.equal(1);
 	});
 
 	it('clearCache at an arbitrary instant is safe: subsequent reads refill from the inner storage', async () => {

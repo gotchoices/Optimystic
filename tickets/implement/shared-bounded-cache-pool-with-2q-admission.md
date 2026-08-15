@@ -1,7 +1,7 @@
 ----
 description: A phone running twenty workspaces would otherwise keep twenty separate memory caches, each sized as if it were the only one, and a single bulk scan through one of them could throw away everything the others need. Give them one shared pool with a memory budget and an admission rule that protects frequently used records from one-off bulk reads.
 prereq: coherent-raw-storage-cache
-files: packages/db-p2p/src/storage/kv-raw-storage.ts, packages/db-p2p/src/storage/index.ts, packages/db-p2p/docs/storage.md, packages/db-core/src/utility/
+files: packages/db-p2p/src/storage/cached-store-driver.ts, packages/db-p2p/src/storage/cached-raw-storage.ts, packages/db-p2p/docs/storage.md, packages/db-core/src/utility/
 difficulty: hard
 ----
 
@@ -41,9 +41,22 @@ integrity bug, not a performance bug.
 
 **Budget in bytes, with an entry count as a secondary rail.** Materialized blocks and transforms
 dominate and vary in size; metadata, pending sets and revision maps are small but numerous. A byte
-budget covers both honestly; an entry cap guards the pathological many-tiny-entries case. Byte sizes
-are free at the `KvRawStorage` kernel, which sees encoded bytes and decoded value together
-(`kv-raw-storage.ts:57-58`, `:116-127`) — this is why the prereq hooks there.
+budget covers both honestly; an entry cap guards the pathological many-tiny-entries case.
+
+> **Where the cache actually lives (corrected after the prereq landed).** This ticket originally
+> assumed the prereq would hook the `KvRawStorage` kernel. It did not: `CachedStoreDriver`
+> (`packages/db-p2p/src/storage/cached-store-driver.ts`) sits one layer *below*, wrapping any
+> `RawStoreDriver`, and caches the encoded bytes the driver speaks. Byte sizes are therefore still
+> free — the cached value *is* a `Uint8Array` — but the pool must be plumbed into the driver
+> wrapper, not the kernel. `CachedRawStorage` is the same cache reached through an adapter for
+> backends that only expose `IRawStorage`; both need the shared pool.
+
+**Negative and empty entries count too.** `CachedStoreDriver.state()` allocates a per-block state
+object for *every* block id touched, including ids that do not exist — proven-absent negatives are
+cached deliberately, and `StorageRepo.get` is reachable from a remote peer with an arbitrary block-id
+list. So a remote probe stream grows the cache with entries holding no data at all. The budget must
+charge for negatives and for the bare per-block bookkeeping, or the entry cap is the only thing
+standing between a peer and unbounded growth.
 
 **Large values bypass admission.** A value above roughly 1/16 of the budget is read or written
 through without being cached, so one oversized block cannot flush the pool.

@@ -174,6 +174,14 @@ export class CachedStoreDriver implements RawStoreDriver {
 		this.blocks.clear();
 	}
 
+	/**
+	 * NOTE: this allocates an entry for EVERY block id touched, including ones that turn out
+	 * not to exist (the proven-absent negative is the point). `StorageRepo.get` is reachable
+	 * from a remote peer with an arbitrary block-id list, so once a production call site wires
+	 * this cache, probes for nonexistent blocks grow `blocks` without bound. The bounded pool
+	 * (`shared-bounded-cache-pool-with-2q-admission`) must count negatives and empty states
+	 * against its budget, not just populated values.
+	 */
 	private state(blockId: BlockId): BlockCacheState {
 		let s = this.blocks.get(blockId);
 		if (!s) {
@@ -181,6 +189,32 @@ export class CachedStoreDriver implements RawStoreDriver {
 			this.blocks.set(blockId, s);
 		}
 		return s;
+	}
+
+	/**
+	 * Cache a read-miss result into one of the map-backed entry classes, under BOTH fill
+	 * guards. `started` is the state object the read began on:
+	 *
+	 * - **value guard** — fill only while the entry is still unknown, so a newer funnelled
+	 *   write that landed during the inner read is not clobbered by this older value;
+	 * - **identity guard** — decline entirely if `clear()` swapped the state object during
+	 *   the inner read. Without it a resumed read reinstalls its pre-clear value into the
+	 *   fresh state, and the newer write that superseded it went out with the old state —
+	 *   so the stale value would then be served forever. The revision and pending-list
+	 *   paths make the same identity check against their own sub-state objects.
+	 */
+	private fillMiss(
+		blockId: BlockId,
+		started: BlockCacheState,
+		map: Map<ActionId, CachedBytes>,
+		actionId: ActionId,
+		bytes: Uint8Array | undefined
+	): void {
+		// `blocks.get`, not `state()` — a declined fill must not resurrect the block entry.
+		if (this.blocks.get(blockId) !== started) return;
+		if (map.get(actionId) === undefined) {
+			map.set(actionId, bytes ?? null);
+		}
 	}
 
 	// --- metadata ---
@@ -191,15 +225,13 @@ export class CachedStoreDriver implements RawStoreDriver {
 			return s.meta ?? undefined;
 		}
 		const bytes = await this.inner.getMetadata(blockId);
-		// Fill only while still unknown: a concurrent putMetadata that landed during our inner
-		// read has already cached the NEWER value, and this (older) read must not clobber it.
-		// The same guard appears on every read-miss fill below. Caching the miss (`null`) is
+		// Same two fill guards as {@link fillMiss} (value + state identity), spelled out here
+		// because metadata is a property rather than a map entry. Caching the miss (`null`) is
 		// deliberate: everything that creates metadata funnels through this wrapper, so a
 		// confirmed miss stays provably absent until a funnelled write overwrites it —
 		// repeated probes of not-yet-created blocks are a real cold-start pattern.
-		const current = this.state(blockId);
-		if (current.meta === undefined) {
-			current.meta = bytes ?? null;
+		if (this.blocks.get(blockId) === s && s.meta === undefined) {
+			s.meta = bytes ?? null;
 		}
 		return bytes;
 	}
@@ -258,6 +290,10 @@ export class CachedStoreDriver implements RawStoreDriver {
 		if (coversRange(revs.covered, lo, hi)) {
 			// Snapshot before yielding (drain-before-yield): concurrent writes during the
 			// consumer's awaits must not mutate what this iteration yields.
+			// NOTE: this walks every integer in [lo, hi], not just the present revs — fine
+			// while revisions are dense (one per commit) and callers bound `hi` by a real
+			// `latest.rev`. If a sparse or very wide range ever appears here, iterate
+			// `byRev`'s keys sorted instead.
 			const out: [number, Uint8Array][] = [];
 			if (reverse) {
 				for (let rev = hi; rev >= lo; rev--) {
@@ -307,10 +343,7 @@ export class CachedStoreDriver implements RawStoreDriver {
 			return cached ?? undefined;
 		}
 		const bytes = await this.inner.getPending(blockId, actionId);
-		const current = this.state(blockId);
-		if (current.pending.get(actionId) === undefined) {
-			current.pending.set(actionId, bytes ?? null);
-		}
+		this.fillMiss(blockId, s, s.pending, actionId, bytes);
 		return bytes;
 	}
 
@@ -380,10 +413,7 @@ export class CachedStoreDriver implements RawStoreDriver {
 			return cached ?? undefined;
 		}
 		const bytes = await this.inner.getTransaction(blockId, actionId);
-		const current = this.state(blockId);
-		if (current.transactions.get(actionId) === undefined) {
-			current.transactions.set(actionId, bytes ?? null);
-		}
+		this.fillMiss(blockId, s, s.transactions, actionId, bytes);
 		return bytes;
 	}
 
@@ -406,10 +436,7 @@ export class CachedStoreDriver implements RawStoreDriver {
 			return cached ?? undefined;
 		}
 		const bytes = await this.inner.getMaterialized(blockId, actionId);
-		const current = this.state(blockId);
-		if (current.materialized.get(actionId) === undefined) {
-			current.materialized.set(actionId, bytes ?? null);
-		}
+		this.fillMiss(blockId, s, s.materialized, actionId, bytes);
 		return bytes;
 	}
 
@@ -434,7 +461,8 @@ export class CachedStoreDriver implements RawStoreDriver {
 		this.state(blockId).materialized.set(actionId, null);
 	}
 
-	// --- promote (the single hardest coherence point — see Invariant P, docs/repository.md) ---
+	// --- promote (the single hardest coherence point — see "Invariant P" on
+	// `IBlockStorage.promotePendingTransaction`, src/storage/i-block-storage.ts) ---
 
 	/**
 	 * The inner driver performs the atomic pending → committed move; this wrapper then mirrors

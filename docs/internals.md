@@ -920,7 +920,10 @@ driver (`memory-store-driver.ts`) stores byte references directly with no clonin
 conformance suite (`src/testing/raw-storage-conformance.ts`) asserts clone-on-store /
 clone-on-read against any driver, so a backend that shortcuts the byte boundary is caught.
 The clone rule above still applies only to a store that keeps live object references (none
-do today).
+do today). The optional write-through cache (`cached-store-driver.ts`) sits inside that byte
+boundary for the same reason: it caches the encoded `Uint8Array`, never a decoded object, so
+the kernel still decodes a fresh object per read and needs no cache-side cloning. The
+conformance suite runs against the cached compositions too.
 
 ### 3. Independent Node Storage
 **Bug**: Each node has its own storage. Consensus doesn't automatically sync data.
