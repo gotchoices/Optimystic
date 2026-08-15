@@ -183,6 +183,35 @@ describe('SharedCachePool mechanics', () => {
 		expect(again.where, 'no ghost, so the fresh admission is probation again').to.equal('a1in');
 	});
 
+	it('probation gets a share of the ENTRY rail, so tiny entries cannot flush Am', () => {
+		// Byte budget so large it never binds (a1inTargetBytes = 250_000); the ENTRY rail is what
+		// binds. Without a probation share of that rail, `a1inBytes` sits forever under its byte
+		// target and every admission evicts from Am instead — 2Q degraded to plain LRU, and this
+		// scan takes the whole protected set with it.
+		const pool = new SharedCachePool({ maxBytes: 1_000_000, maxEntries: 40 });
+		const owner = new RecordingOwner();
+		const store = pool.registerStore();
+		const hotIds = Array.from({ length: 8 }, (_, i) => `hot${i}`);
+
+		// Route the hot set into Am the way real reuse does: admit, evict (ghosting them), re-admit.
+		for (const id of hotIds) pool.admit(entryFor(pool, store, owner, id, 100));
+		pool.setBudget({ maxBytes: 1 });          // byte rail evicts all → ghosted (ghost cap 20 intact)
+		pool.setBudget({ maxBytes: 1_000_000 });
+		const hot = hotIds.map(id => entryFor(pool, store, owner, id, 100));
+		for (const e of hot) pool.admit(e);
+		expect(hot.every(e => e.where === 'am'), 'reuse signal put the hot set in Am').to.equal(true);
+
+		for (let i = 0; i < 200; i++) pool.admit(entryFor(pool, store, owner, `scan${i}`, 100));
+
+		expect(pool.bytes, 'the byte rail never bound — only the entry rail did').to.be.lessThan(pool.maxBytes);
+		expect(hot.filter(e => e.where === 'am'), 'the one-pass scan displaced none of Am')
+			.to.have.lengthOf(hotIds.length);
+		// The target decides which queue gives up a victim, not a hard cap — probation still
+		// fills whatever the entry rail leaves over, exactly as it does on the byte rail.
+		expect(pool.stats().am.entries, 'Am holds exactly the reused set; no scan entry got in')
+			.to.equal(hotIds.length);
+	});
+
 	it('the ghost set is capped at half the entry budget', () => {
 		const pool = new SharedCachePool({ maxBytes: 100_000, maxEntries: 8 }); // ghost cap 4
 		const owner = new RecordingOwner();
@@ -218,6 +247,24 @@ describe('SharedCachePool mechanics', () => {
 
 		const s3 = pool.registerStore('three');
 		expect(s3.id, 'ids are monotonic, never recycled').to.not.equal(s1.id);
+	});
+
+	it("unregisterStore's forced sweep notifies the owner, so no entry is left de-accounted", () => {
+		// The owner normally clears first; when it does not, the pool must not silently strip
+		// entries out of its accounting while the owner still holds — and serves — them.
+		const pool = new SharedCachePool({ maxBytes: 1000, maxEntries: 100 });
+		const owner = new RecordingOwner();
+		const store = pool.registerStore('sloppy');
+		const e1 = entryFor(pool, store, owner, 'b1', 100);
+		const e2 = entryFor(pool, store, owner, 'b2', 100);
+		pool.admit(e1); pool.admit(e2);
+
+		pool.unregisterStore(store);
+		expect(new Set(owner.evicted), 'every swept entry reported to its owner')
+			.to.deep.equal(new Set([e1.key, e2.key]));
+		expect([e1.where, e2.where]).to.deep.equal(['none', 'none']);
+		expect(pool.bytes).to.equal(0);
+		expect(pool.stats().evictions, 'a lifecycle release is not budget pressure').to.equal(0);
 	});
 
 	it("in 'lru' mode everything goes to Am, evictions never ghost, and touches drive the order", () => {
@@ -350,6 +397,76 @@ describe('CachedStoreDriver under a bounded pool', () => {
 		b.clear();
 		expect(b.storeStats().bytes, 'clear released all pool occupancy').to.equal(0);
 		expect(b.storeStats().entries).to.equal(0);
+	});
+
+	// Charge accounting is delta-tracked by hand in the driver, so a missed +/- would skew the
+	// budget silently. These check the deltas the way drift shows up — as a failure to return to
+	// the same occupancy after an operation that logically returns to the same state.
+	describe('charge accounting', () => {
+		const roomy = () => new SharedCachePool({ maxBytes: 4 * 1024 * 1024, maxEntries: 10_000 });
+
+		it('rewriting identical values does not drift occupancy; a longer value costs exactly its extra bytes', async () => {
+			const driver = new CachedStoreDriver(new MemoryStoreDriver(), roomy());
+			const write = async (meta: string) => {
+				await driver.putMetadata(blockId, bytesOf(meta));
+				await driver.putRevision(blockId, 7, bytesOf('rev-value'));
+				await driver.putTransaction(blockId, 'a1' as ActionId, bytesOf('tx-value'));
+				await driver.putMaterialized(blockId, 'a1' as ActionId, bytesOf('mat-value'));
+			};
+			await write('meta');
+			const once = driver.storeStats().bytes;
+			const entries = driver.storeStats().entries;
+			await write('meta');
+			await write('meta');
+			expect(driver.storeStats().bytes, 'idempotent rewrites re-charge, never accumulate').to.equal(once);
+			expect(driver.storeStats().entries).to.equal(entries);
+
+			await write('meta-and-then-some');
+			expect(driver.storeStats().bytes - once, 'growth charged exactly the extra content bytes')
+				.to.equal(bytesOf('meta-and-then-some').length - bytesOf('meta').length);
+		});
+
+		it('a pend/unpend cycle returns the pending-id set to its prior charge', async () => {
+			const driver = new CachedStoreDriver(new MemoryStoreDriver(), roomy());
+			await collect(driver.listPendingActionIds(blockId)); // the only path that creates the id set
+			const cycle = async () => {
+				await driver.putPending(blockId, 'a1' as ActionId, bytesOf('payload'));
+				await driver.deletePending(blockId, 'a1' as ActionId);
+			};
+			await cycle();
+			const settled = driver.storeStats().bytes;
+			await cycle();
+			await cycle();
+			expect(driver.storeStats().bytes, 'the add and remove deltas are exact inverses').to.equal(settled);
+		});
+
+		it('contiguous coverage merges intervals instead of charging one per revision', async () => {
+			const value = bytesOf('rev');
+			const fill = async (driver: CachedStoreDriver, from: number, count: number, step: number) => {
+				for (let i = 0; i < count; i++) await driver.putRevision(blockId, from + i * step, value);
+			};
+
+			const dense = new CachedStoreDriver(new MemoryStoreDriver(), roomy());
+			await fill(dense, 1, 100, 1);
+			const at100 = dense.storeStats().bytes;
+			await fill(dense, 101, 100, 1);
+			const at200 = dense.storeStats().bytes;
+			await fill(dense, 201, 100, 1);
+			const at300 = dense.storeStats().bytes;
+
+			// Steady state: each further contiguous chunk costs the same, because the coverage
+			// list stays at one interval no matter how many revisions extend it.
+			expect(at300 - at200, 'no per-interval growth once coverage is one interval').to.equal(at200 - at100);
+			expect(at100, 'the first chunk additionally paid for the entry base and that one interval')
+				.to.be.greaterThan(at200 - at100);
+
+			// Same byte content, no adjacency: every revision keeps its own interval, and the
+			// difference is exactly what interval merging saves.
+			const sparse = new CachedStoreDriver(new MemoryStoreDriver(), roomy());
+			await fill(sparse, 1, 100, 2);
+			expect(sparse.storeStats().bytes, 'sparse coverage costs strictly more than merged coverage')
+				.to.be.greaterThan(at100);
+		});
 	});
 
 	it('values above 1/16 of the budget bypass the cache entirely', async () => {

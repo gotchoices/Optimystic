@@ -295,7 +295,7 @@ Semantics worth knowing:
     evicts, never refuses: entries are never pinned or dirty, so there is no
     exhaustion condition.
   - **2Q admission** (Johnson & Shasha): a first-touch entry enters the A1in
-    probation FIFO (~25% of the byte budget); re-hits inside A1in do NOT
+    probation FIFO; re-hits inside A1in do NOT
     promote (this also absorbs the several correlated touches one logical
     operation makes); A1in eviction demotes the key to the A1out ghost set
     (capped at half the entry budget); a later admission of a ghosted key —
@@ -304,9 +304,19 @@ Semantics worth knowing:
     `test/shared-cache-pool.spec.ts`: a 3000-block one-off bulk scan lives and
     dies inside probation and displaces ZERO of another store's re-used hot
     set, where a plain shared LRU loses all of it.
+    Probation is given ~25% of **each** rail — a quarter of the bytes and a
+    quarter of the entries — and the pool takes its victim from A1in whenever
+    probation is over *either* share. Both are needed: entries small enough
+    that the entry count binds first (cached negatives are near-empty) leave
+    A1in permanently under its byte share, so a byte-only test would send every
+    eviction to Am and a one-pass scan would flush the protected set — 2Q
+    degraded to plain LRU. Note the share picks the victim's queue; it is not a
+    cap, so A1in still occupies whatever Am leaves over.
   - **Large-value bypass**: an entry whose charge exceeds 1/16 of the byte
     budget is not cached at all (reads/writes pass through), so one oversized
-    value cannot flush the pool.
+    value cannot flush the pool. This gates *admission* of a value, not the
+    later growth of a resident container entry — see the `NOTE:` on
+    `SharedCachePool.updated` for when that distinction starts to matter.
   - **Budget**: platform defaults are honest guesses — 8 MB React Native,
     16 MB browser, 32 MB Node — and hosts with better knowledge should size
     explicitly: `defaultCachePool().setBudget({ maxBytes })` (shrinking evicts
