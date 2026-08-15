@@ -4,8 +4,12 @@ import { ProtocolClient } from '../protocol-client.js';
 import { peerIdFromString } from '@libp2p/peer-id';
 import { isClusterErrorEnvelope, clusterErrorFromEnvelope } from './cluster-error.js';
 import type { RedirectPayload } from '../repo/redirect.js';
+import { mergeRecordPeerAddresses } from '../peer-address-book.js';
+import { createLogger } from '../logger.js';
 import { withRpcDeadlineDefaults, type RpcDeadlineOptions } from '../rpc-deadline.js';
 import { MAX_CONTROL_MESSAGE_BYTES } from '../protocol-limits.js';
+
+const log = createLogger('cluster-client');
 
 export class ClusterClient extends ProtocolClient implements ICluster {
 	private constructor(peerId: PeerId, peerNetwork: IPeerNetwork, readonly protocolPrefix?: string) {
@@ -72,27 +76,17 @@ export class ClusterClient extends ProtocolClient implements ICluster {
 
 	/**
 	 * Offer every address a cluster record carries for its cohort to the dialer's address book.
-	 * Self and unparseable ids are dropped here; validation, the per-peer cap, and the trust
-	 * boundary live in the implementation behind `recordPeerAddresses`.
+	 *
+	 * Shares its traversal — and its cap on how many peers one record may introduce — with the
+	 * inbound side (`ClusterService.learnPeerAddresses`); validation, the per-peer cap, and the
+	 * trust boundary live in the implementation behind `recordPeerAddresses`. No self-filter is
+	 * passed: `this.peerId` is the peer we DIALED, not this node, and only the sink knows the
+	 * local node's identity.
 	 */
 	private recordRecordPeerAddresses(record: ClusterRecord): void {
 		const sink = this.peerNetwork.recordPeerAddresses
 		if (!sink) return
-		// No self-filter here: `this.peerId` is the peer we DIALED, not this node. The sink owns
-		// the self-skip, since only it knows the local node's identity.
-		for (const [idStr, peer] of Object.entries(record?.peers ?? {})) {
-			const addrs = peer?.multiaddrs ?? []
-			if (addrs.length === 0) continue
-			let pid: PeerId
-			try {
-				pid = peerIdFromString(idStr)
-			} catch {
-				// A cohort id we cannot parse is not dialable by any route; the consensus path
-				// below already surfaces the resulting membership failure, so skip it here.
-				continue
-			}
-			sink.call(this.peerNetwork, pid, addrs)
-		}
+		mergeRecordPeerAddresses(record?.peers, (pid, addrs) => sink.call(this.peerNetwork, pid, addrs), log)
 	}
 
   /**

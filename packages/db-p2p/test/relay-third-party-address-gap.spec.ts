@@ -21,6 +21,14 @@
  * merge sites are no longer a cure.
  *
  * **Runtime.** ~0.4 s (three real libp2p boots over loopback), so it is not env-gated.
+ *
+ * NOTE: the mechanism is covered end-to-end through real libp2p, but split across two specs — this
+ * one proves `peerStore.merge(carried address)` → a peer-id-only dial reaches a relay-only peer, and
+ * `cluster-service-node-resolvers.spec.ts` proves an inbound `ClusterRecord` → that same address in a
+ * real node's `peerStore`. No single spec joins the halves. That is fine while they meet at the one
+ * `peerStore` object; if the ingress path ever grows a transform between the record and the merge
+ * (address rewriting, a queue, a separate address store), build the joined case — a relay, a
+ * relay-only member, and two host members exchanging a real record over real sockets.
  */
 import { expect } from 'chai';
 import type { Libp2p } from 'libp2p';

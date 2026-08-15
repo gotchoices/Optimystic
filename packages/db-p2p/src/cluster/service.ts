@@ -5,6 +5,7 @@ import type { Startable, Logger, Stream, Connection, StreamHandler, PeerId } fro
 import type { ICluster, ClusterRecord } from '@optimystic/db-core';
 import { encodePeers, type RedirectPayload } from '../repo/redirect.js';
 import { toClusterErrorEnvelope } from './cluster-error.js';
+import { mergeRecordPeerAddresses } from '../peer-address-book.js';
 import { MAX_CONTROL_MESSAGE_BYTES } from '../protocol-limits.js';
 import type { Uint8ArrayList } from 'uint8arraylist';
 import { createInboundStreamAuthorization, type InboundStreamAuthorization, type InboundStreamAuthorizationInit } from '../inbound-authorization.js';
@@ -216,26 +217,23 @@ export class ClusterService implements Startable {
 	}
 
 	/**
-	 * Offer every address the record carries for its cohort members to the node's address
-	 * book. Self and unparseable entries are dropped here; the remaining validation, the
-	 * per-peer cap, and the trust boundary live in the sink (`peer-address-book.ts`).
+	 * Offer every address the record carries for its cohort members to the node's address book.
+	 *
+	 * This runs on a record NOTHING has validated yet — before {@link checkRedirect} and before
+	 * `cluster.update` checks a signature — and inbound stream authorization is opt-in, so the
+	 * peer map here is whatever the dialer chose to send. The traversal (and the cap on how many
+	 * peers one record may introduce) is therefore shared with `ClusterClient`, in
+	 * `peer-address-book.ts`, along with the per-address validation and the trust boundary.
 	 */
 	private learnPeerAddresses(record: ClusterRecord): void {
 		const sink = this.components.recordPeerAddresses;
 		if (!sink) return;
-		const selfStr = this.getSelfId()?.toString();
-		for (const [idStr, peer] of Object.entries(record.peers ?? {})) {
-			const addrs = peer?.multiaddrs ?? [];
-			if (addrs.length === 0 || idStr === selfStr) continue;
-			let pid: PeerId;
-			try {
-				pid = peerIdFromString(idStr);
-			} catch (err) {
-				this.log.error('cluster record carried an unparseable peer id %s - %e', idStr, err);
-				continue;
-			}
-			sink(pid, addrs);
-		}
+		mergeRecordPeerAddresses(
+			record.peers,
+			sink,
+			(fmt, ...args) => this.log.error(fmt, ...args),
+			this.getSelfId()?.toString()
+		);
 	}
 
 	private handleIncomingStream(stream: Stream, connection?: Connection): void {

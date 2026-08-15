@@ -1,4 +1,5 @@
 import type { PeerId } from '@libp2p/interface'
+import { peerIdFromString } from '@libp2p/peer-id'
 import { multiaddr, type Multiaddr } from '@multiformats/multiaddr'
 
 /**
@@ -6,10 +7,23 @@ import { multiaddr, type Multiaddr } from '@multiformats/multiaddr'
  *
  * Without a cap, a crafted cluster record or redirect payload could stuff the address
  * book and turn every cohort member into a dial amplifier aimed at an address of the
- * sender's choosing. A cohort's peer *ids* are keyspace-determined and not attacker-
- * chosen, which bounds the surface further; this bounds the per-peer cost.
+ * sender's choosing. This bounds the per-peer cost;
+ * {@link MAX_LEARNED_PEERS_PER_RECORD} bounds how many peers one record may introduce.
  */
 export const MAX_MERGED_ADDRS_PER_PEER = 8
+
+/**
+ * Cap on how many distinct peers one cluster record may teach us addresses for.
+ *
+ * A record's peer map is NOT self-limiting: `ClusterService.processOperation` learns from it
+ * before `checkRedirect` and before `cluster.update` validates a single signature, and inbound
+ * stream authorization is opt-in (`authorizeInboundStream` is undefined by default), so the map
+ * is attacker-authored at that point. One 1 MiB control message (`MAX_CONTROL_MESSAGE_BYTES`)
+ * holds on the order of a thousand fabricated `{ id, multiaddrs, publicKey }` entries, each of
+ * which would otherwise become a persisted peerStore record. Real cohorts are `clusterSize`
+ * peers — single digits — so this is generous margin, not a functional limit.
+ */
+export const MAX_LEARNED_PEERS_PER_RECORD = 64
 
 /** The narrow slice of libp2p this module needs — a peer id and (optionally) a peerStore writer. */
 export interface PeerAddressBookHost {
@@ -87,4 +101,49 @@ export function mergePeerAddresses(
 	// that would make this whole mechanism silently inert.
 	void Promise.resolve(merge.call(host.peerStore, peerId, { multiaddrs }))
 		.catch((err: unknown) => log('WARN: peerStore.merge failed peer=%s %o', peerId.toString().substring(0, 12), err))
+}
+
+/** The peer map a `ClusterRecord` carries, as it arrives off the wire (nothing about it is trusted). */
+export type RecordPeerMap = Record<string, { multiaddrs?: string[] } | undefined>
+
+/**
+ * Offer the addresses a cluster record carries for its cohort to an address-book `sink`, one
+ * peer at a time.
+ *
+ * The one traversal shared by both record ingress points — `ClusterService` (inbound, from the
+ * coordinator) and `ClusterClient` (outbound, from a member's reply) — so the entries a record is
+ * allowed to introduce are bounded in one place rather than two. Entries with no addresses, with
+ * an id equal to `skipId`, or with an unparseable id are dropped; everything past
+ * {@link MAX_LEARNED_PEERS_PER_RECORD} candidates is dropped with a log line. The per-address
+ * validation, the per-peer cap, and the trust boundary live behind `sink`
+ * (see {@link mergePeerAddresses}).
+ */
+export function mergeRecordPeerAddresses(
+	peers: RecordPeerMap | undefined,
+	sink: (peerId: PeerId, addrs: string[]) => void,
+	log: AddressLog,
+	skipId?: string
+): void {
+	let offered = 0
+	for (const [idStr, peer] of Object.entries(peers ?? {})) {
+		const addrs = peer?.multiaddrs ?? []
+		if (addrs.length === 0 || idStr === skipId) continue
+		if (offered >= MAX_LEARNED_PEERS_PER_RECORD) {
+			// Count candidates, not successes, so a record full of unparseable ids cannot spend
+			// unbounded parse attempts and log lines either.
+			log('peer-address-book:record-capped kept=%d', MAX_LEARNED_PEERS_PER_RECORD)
+			return
+		}
+		offered += 1
+		let pid: PeerId
+		try {
+			pid = peerIdFromString(idStr)
+		} catch (err) {
+			// An id we cannot parse is not dialable by any route; the consensus path surfaces the
+			// resulting membership failure on its own.
+			log('WARN: record carried an unparseable peer id %s %o', idStr, err)
+			continue
+		}
+		sink(pid, addrs)
+	}
 }
