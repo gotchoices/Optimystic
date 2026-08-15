@@ -223,6 +223,71 @@ backend behaves identically against the shared kernel contract.
 └── ...
 ```
 
+### 6. Write-through raw-storage cache (`CachedStoreDriver` + `CachedRawStorage`)
+
+`CachedStoreDriver` wraps any `RawStoreDriver` with an in-memory, **write-through
+coherent** cache at the bytes layer. Every save stores its encoded value *into*
+the cache as it writes the inner driver — it never invalidates — so after one
+cold read per key the cache always holds the last durable value and reads stop
+touching the backend for the life of the process. This is what a plain
+invalidate-on-write memo cannot do at this seam: the hot reads exist to observe
+the writes, so invalidation lands between nearly every read pair (measured: only
+a 23% cut, vs ~96% for write-through on the same cold-start workload — see
+`test/cached-raw-storage.spec.ts`).
+
+Its soundness rests entirely on the five **Invariants** above:
+
+1. every backend write funnels through `IRawStorage` in-process, so the cache
+   sees every mutation (Invariant 1);
+2. every writer of `meta.latest` holds the per-block commit latch, and each
+   cache update is synchronous with its inner write (no `await` between the
+   inner call resolving and the cache mutation), so a latch-protected
+   read-after-write sees the new value exactly as a driver read would
+   (Invariant 2);
+3. committed revisions and materializations are append-only (Invariant 3);
+4. `promote` is mirrored as one synchronous cache mutation after the driver's
+   atomic move — and when the pending bytes were never cached, the committed
+   entry is *invalidated*, never synthesized, preserving Invariant 4 / Invariant
+   P's no-phantom-record guarantee;
+5. **one process owns the store** (Invariant 5). This is the cache's one
+   correctness cliff: a second process writing the same backend bypasses the
+   funnel and makes cached values stale in ways that feed consensus decisions.
+   It is not enforced in code (see Invariant 5's embedder note).
+
+Semantics worth knowing:
+
+- **Never write-behind.** No write is deferred, reordered, or coalesced; the
+  commit path's crash-recovery write ordering is untouched.
+- **Proven absence is cached.** A confirmed inner miss or a funnelled delete is
+  stored as a negative and served without re-consulting the backend; "provably
+  absent" never degrades into "could not confirm". Repeated probes of
+  not-yet-created blocks are a real cold-start pattern.
+- **Lists are served only when provably complete.** `listPendingTransactions`
+  needs one full enumeration to seed completeness (funnelled writes maintain it
+  after); `listRevisions` tracks covered rev intervals from enumerations and
+  written points. A write or `clear()` landing mid-enumeration vetoes the
+  completeness claim (generation guard) rather than freezing a stale set.
+- **Always clean, never dirty.** Nothing is pinned; `clear()` (or any future
+  eviction) is correct at any instant and purely a performance question. If a
+  change ever seems to need a dirty or pinned entry, the design has gone wrong.
+- **Unbounded for now — deliberately.** Entries live for the process lifetime;
+  the planned shared bounded pool (2Q admission, keyed `(storeId, class, key)`)
+  adds the bound. Entry classes and keys are already shaped for that; block ids
+  alone are NOT globally unique (header block ids are name-derived), so no pool
+  may key on them without the store id.
+
+**Wiring:**
+
+- Backend exposes its `RawStoreDriver` (all kernel-backed backends):
+  `new KvRawStorage(new CachedStoreDriver(driver))`.
+- Only the `IRawStorage` surface is reachable:
+  `new CachedRawStorage(inner)` — same cache over an internal
+  `RawStorageDriverAdapter`, at the cost of one extra codec pass per **cold
+  miss** (hits never reach the adapter). `clearCache()` drops every entry.
+- **Never wrap `MemoryRawStorage`/`MemoryStoreDriver`** in production wiring:
+  the memory driver already holds the same byte references, so the cache is
+  pure bookkeeping overhead (tests do wrap it, to prove semantics match).
+
 ## Data Structures
 
 ### Block Metadata
