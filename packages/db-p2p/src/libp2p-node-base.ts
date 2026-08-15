@@ -397,6 +397,14 @@ export async function createLibp2pNodeBase(
 
 	let clusterImpl: ICluster | undefined;
 	let coordinatedRepo: IRepo | undefined;
+	// The running node, bound immediately after `createLibp2p` below. Service factories that need
+	// the node at REQUEST time must close over this, never over `components.libp2p`: `components`
+	// is libp2p's Proxy, whose getter THROWS `MissingServiceError('libp2p not set')` for any key it
+	// does not hold — and `libp2p` is not a component. The throw happens on the property read, so
+	// neither `?.` nor a following `if (!libp2p) return` can catch it; it escapes as an application
+	// error on whatever request touched it. Same reason fret/networkManager/repo take the node via
+	// setLibp2p (see the injection block after `createLibp2p`).
+	let liveNode: Libp2p | undefined;
 
 	const clusterProxy: ICluster = {
 		async update(record) {
@@ -564,7 +572,7 @@ export async function createLibp2pNodeBase(
 					// Fallback addr resolver for redirect targets whose multiaddrs are not
 					// already embedded in record.peers.
 					getConnectionAddrs: (peerId: any) => {
-						const conns = components.libp2p?.getConnections?.(peerId) ?? [];
+						const conns = liveNode?.getConnections?.(peerId) ?? [];
 						const addrs: string[] = [];
 						for (const c of conns) {
 							const addr = c.remoteAddr?.toString?.();
@@ -576,11 +584,10 @@ export async function createLibp2pNodeBase(
 					// propagates addresses between directly-connected peers, so for a cohort chosen
 					// by key position this is often the ONLY way this node learns how to reach a
 					// relay-only sibling. Same late-binding shape as getConnectionAddrs above:
-					// `components.libp2p` resolves at request time, not at service construction.
+					// `liveNode` resolves at request time, not at service construction.
 					recordPeerAddresses: (peerId: any, multiaddrs: string[]) => {
-						const libp2p = components.libp2p;
-						if (!libp2p) return;
-						mergePeerAddresses(libp2p, peerId, multiaddrs, addressLog);
+						if (!liveNode) return;
+						mergePeerAddresses(liveNode, peerId, multiaddrs, addressLog);
 					}
 				});
 			},
@@ -678,6 +685,11 @@ export async function createLibp2pNodeBase(
 	};
 
 	const node = await createLibp2p(libp2pOptions);
+
+	// Bind the closure-captured node BEFORE start(): the cluster service's address-learning and
+	// redirect-addr resolvers read it on every inbound request, and the first one can arrive as
+	// soon as the protocol handler goes live in start().
+	liveNode = node;
 
 	// Inject the REAL libp2p node into the services that need it, before start(). These are
 	// load-bearing and the node has NOT started yet, so any throw fails fast and rejects node

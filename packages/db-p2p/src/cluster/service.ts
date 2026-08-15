@@ -89,9 +89,24 @@ export class ClusterService implements Startable {
 
 	readonly [Symbol.toStringTag] = '@libp2p/cluster';
 
+	/**
+	 * Best-effort read of `components.libp2p`. When `components` is libp2p's own Proxy, the getter
+	 * THROWS `MissingServiceError('libp2p not set')` for any key it does not hold — and `libp2p` is
+	 * not a component — so the read itself must be guarded; `?.` and a following null check are both
+	 * too late. Every fallback below is a convenience for embedders that register this service
+	 * directly; the production wiring supplies `peerId`/`getConnectionAddrs` explicitly.
+	 */
+	private getLibp2p(): any {
+		try {
+			return (this.components as any).libp2p;
+		} catch {
+			return undefined;
+		}
+	}
+
 	private getSelfId(): PeerId | undefined {
 		if (this.components.peerId) return this.components.peerId;
-		return (this.components as any).libp2p?.peerId as PeerId | undefined;
+		return this.getLibp2p()?.peerId as PeerId | undefined;
 	}
 
 	private getPeerAddrs(id: string): string[] {
@@ -102,7 +117,7 @@ export class ClusterService implements Startable {
 			return [];
 		}
 		if (this.components.getConnectionAddrs) return this.components.getConnectionAddrs(pid);
-		const libp2p = (this.components as any).libp2p;
+		const libp2p = this.getLibp2p();
 		if (!libp2p?.getConnections) return [];
 		const conns: any[] = libp2p.getConnections(pid) ?? [];
 		const addrs: string[] = [];
