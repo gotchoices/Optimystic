@@ -28,7 +28,8 @@ const makeStubCluster = (): StubCluster => {
 const makeComponents = (opts: {
 	cluster: ICluster,
 	peerId?: PeerId,
-	getConnectionAddrs?: (pid: PeerId) => string[]
+	getConnectionAddrs?: (pid: PeerId) => string[],
+	recordPeerAddresses?: (pid: PeerId, multiaddrs: string[]) => void
 }): ClusterServiceComponents => ({
 	logger: { forComponent: () => ({ error: () => {}, info: () => {}, trace: () => {}, debug: () => {} }) as any },
 	registrar: {
@@ -38,6 +39,7 @@ const makeComponents = (opts: {
 	cluster: opts.cluster,
 	peerId: opts.peerId,
 	getConnectionAddrs: opts.getConnectionAddrs,
+	recordPeerAddresses: opts.recordPeerAddresses,
 });
 
 /** Build a ClusterPeers map from peer ids, optionally with multiaddrs per peer. */
@@ -213,6 +215,98 @@ describe('ClusterService redirect logic', () => {
 
 			expect(result).to.not.be.null;
 			expect(result!.redirect.peers[0]!.addrs).to.deep.equal([fallback]);
+		});
+	});
+
+	/**
+	 * The wire ingress for a cluster record is where a node meets a cohort sibling it may never
+	 * have had a connection to. libp2p only propagates addresses between directly-connected
+	 * peers, so the record's own `multiaddrs` are often the only route information that will ever
+	 * reach this node about a relay-only member. These tests drive `processOperation` — the real
+	 * ingress — rather than reconstructing it, because the ORDER (learn, then redirect-or-process)
+	 * is the part that matters: the redirect branch dials too.
+	 */
+	describe('address learning from inbound records', () => {
+		const ADDR_A = '/ip4/10.0.0.5/tcp/5001';
+		const ADDR_B = '/ip4/10.0.0.6/tcp/5002';
+
+		/** Component sink that records every (peer, addrs) offer, in order. */
+		const makeSink = () => {
+			const offers: Array<{ peer: string, addrs: string[] }> = [];
+			return { offers, sink: (pid: PeerId, addrs: string[]) => { offers.push({ peer: pid.toString(), addrs }); } };
+		};
+
+		it('offers every non-self peer\'s addresses on the process-locally path', async () => {
+			const self = await makePeerId();
+			const a = await makePeerId();
+			const stub = makeStubCluster();
+			const { offers, sink } = makeSink();
+			const service = new ClusterService(
+				makeComponents({ cluster: stub, peerId: self, recordPeerAddresses: sink }),
+				{ responsibilityK: 1 }
+			);
+
+			// self IS a member → no redirect, cluster.update runs.
+			const addrsFor = (id: string): string[] => id === a.toString() ? [ADDR_A] : [ADDR_B];
+			const record = makeRecord(makePeers([self, a], addrsFor));
+			await service.processOperation({ operation: 'update', record });
+
+			expect(stub.calls, 'this is the process-locally path').to.equal(1);
+			expect(offers.map(o => o.peer), 'self is not offered — the node already knows itself').to.deep.equal([a.toString()]);
+			expect(offers[0]!.addrs).to.deep.equal([ADDR_A]);
+		});
+
+		it('offers addresses on the REDIRECT path too — that branch dials as well', async () => {
+			const self = await makePeerId();
+			const a = await makePeerId();
+			const b = await makePeerId();
+			const stub = makeStubCluster();
+			const { offers, sink } = makeSink();
+			const service = new ClusterService(
+				makeComponents({ cluster: stub, peerId: self, recordPeerAddresses: sink }),
+				{ responsibilityK: 1 }
+			);
+
+			// self is NOT a member → redirect. The old code returned before ever reading multiaddrs.
+			const record = makeRecord(makePeers([a, b], () => [ADDR_A]));
+			const response = await service.processOperation({ operation: 'update', record });
+
+			expect((response as any).redirect, 'precondition: this must be the redirect branch').to.not.be.undefined;
+			expect(stub.calls).to.equal(0);
+			expect(offers.map(o => o.peer)).to.have.members([a.toString(), b.toString()]);
+		});
+
+		it('skips peers with no multiaddrs and unparseable peer ids', async () => {
+			const self = await makePeerId();
+			const a = await makePeerId();
+			const b = await makePeerId();
+			const stub = makeStubCluster();
+			const { offers, sink } = makeSink();
+			const service = new ClusterService(
+				makeComponents({ cluster: stub, peerId: self, recordPeerAddresses: sink }),
+				{ responsibilityK: 1 }
+			);
+
+			const peers = makePeers([self, a, b], (id) => id === a.toString() ? [ADDR_A] : []);
+			peers['not-a-peer-id'] = { multiaddrs: [ADDR_B], publicKey: 'stub-public-key' };
+			await service.processOperation({ operation: 'update', record: makeRecord(peers) });
+
+			expect(offers.map(o => o.peer), 'only the addressed, parseable, non-self peer').to.deep.equal([a.toString()]);
+		});
+
+		it('processes normally when no recordPeerAddresses component is wired', async () => {
+			const self = await makePeerId();
+			const a = await makePeerId();
+			const stub = makeStubCluster();
+			const service = new ClusterService(
+				makeComponents({ cluster: stub, peerId: self }), // no sink
+				{ responsibilityK: 1 }
+			);
+
+			const record = makeRecord(makePeers([self, a], () => [ADDR_A]));
+			await service.processOperation({ operation: 'update', record });
+
+			expect(stub.calls).to.equal(1);
 		});
 	});
 });

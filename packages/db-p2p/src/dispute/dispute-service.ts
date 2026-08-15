@@ -390,6 +390,13 @@ export class DisputeService {
 			// peer's id to get that peer a FalseApproval penalty. Gate each false-approval on the approval
 			// being binding-valid (key bound to the id AND signature verifies); skip — never penalize —
 			// any approval that is unbound or invalid.
+			//
+			// For the same reason, the peer multiaddrs inside `originalRecord.peers` are deliberately
+			// NOT fed to the address book here, unlike the cluster/redirect paths (see
+			// `peer-address-book.ts`). Those paths consume a record we are an intended recipient of;
+			// a challenge's originalRecord is attacker-supplied on a path that already flags itself as
+			// unverified, so learning addresses from it would widen that surface for no gain — a
+			// disputing peer is not one we are about to need a route to.
 			const originalRecord = challenge.originalRecord;
 			const promiseHash = await this.computePromiseHash(originalRecord);
 			for (const [peerId, signature] of Object.entries(originalRecord.promises)) {

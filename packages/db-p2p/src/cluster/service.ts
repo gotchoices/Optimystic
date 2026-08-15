@@ -30,6 +30,12 @@ export interface ClusterServiceComponents extends BaseComponents {
 	 * a redirect target has no multiaddrs embedded in `record.peers`.
 	 */
 	getConnectionAddrs?: (peerId: PeerId) => string[]
+	/**
+	 * Optional sink for dialable addresses carried by an inbound cluster record, so this
+	 * node can later dial a cohort sibling it has never had a connection to. Omitted →
+	 * no address learning (the pre-existing behavior).
+	 */
+	recordPeerAddresses?: (peerId: PeerId, multiaddrs: string[]) => void
 }
 
 export interface ClusterServiceInit extends InboundStreamAuthorizationInit {
@@ -173,15 +179,48 @@ export class ClusterService implements Startable {
 	 * (validation / signature / merge / consensus failure inside `cluster.update`)
 	 * propagates to the caller, which turns it into a structured error envelope;
 	 * a redirect or a successful {@link ClusterRecord} is returned as-is.
+	 *
+	 * Public for the same reason {@link checkRedirect} is: it is the whole wire-ingress decision
+	 * for a cluster update, and a test that reconstructs it by hand stops proving anything about
+	 * the real ordering (address learning before redirect before consensus).
 	 */
-	private async processOperation(message: { operation: string; record: ClusterRecord }): Promise<unknown> {
+	async processOperation(message: { operation: string; record: ClusterRecord }): Promise<unknown> {
 		if (message.operation === 'update') {
+			// Learn the cohort's addresses FIRST — before both the redirect decision and
+			// local consensus, since either can go on to dial these same peers. libp2p only
+			// tells us the addresses of peers we are directly connected to, so for a cohort
+			// picked by key position this record is often the only place a relay-only
+			// sibling's address ever reaches us.
+			this.learnPeerAddresses(message.record);
 			// Scope consensus to responsible peers: redirect when we are not a
 			// member of the record's authoritative peer set, otherwise process.
 			const redirect = this.checkRedirect(message.record);
 			return redirect ?? await this.cluster.update(message.record);
 		}
 		throw new Error(`Unknown operation: ${message.operation}`);
+	}
+
+	/**
+	 * Offer every address the record carries for its cohort members to the node's address
+	 * book. Self and unparseable entries are dropped here; the remaining validation, the
+	 * per-peer cap, and the trust boundary live in the sink (`peer-address-book.ts`).
+	 */
+	private learnPeerAddresses(record: ClusterRecord): void {
+		const sink = this.components.recordPeerAddresses;
+		if (!sink) return;
+		const selfStr = this.getSelfId()?.toString();
+		for (const [idStr, peer] of Object.entries(record.peers ?? {})) {
+			const addrs = peer?.multiaddrs ?? [];
+			if (addrs.length === 0 || idStr === selfStr) continue;
+			let pid: PeerId;
+			try {
+				pid = peerIdFromString(idStr);
+			} catch (err) {
+				this.log.error('cluster record carried an unparseable peer id %s - %e', idStr, err);
+				continue;
+			}
+			sink(pid, addrs);
+		}
 	}
 
 	private handleIncomingStream(stream: Stream, connection?: Connection): void {

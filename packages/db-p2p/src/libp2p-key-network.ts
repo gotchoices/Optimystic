@@ -2,10 +2,10 @@ import type { AbortOptions, Connection, Libp2p, PeerId, Stream } from "@libp2p/i
 import { toString as u8ToString } from 'uint8arrays'
 import type { ClusterPeers, CoordinatorIntent, FindCoordinatorOptions, IKeyNetwork, IPeerNetwork } from "@optimystic/db-core";
 import { peerIdFromString } from '@libp2p/peer-id'
-import { multiaddr } from '@multiformats/multiaddr'
 import type { FretService, SerializedTable } from 'p2p-fret'
 import { hashKey } from 'p2p-fret'
 import { createLogger, verbose } from './logger.js'
+import { mergePeerAddresses, validMultiaddrStrings } from './peer-address-book.js'
 import type { IPeerReputation } from './reputation/types.js'
 
 interface WithFretService { services?: { fret?: FretService } }
@@ -499,6 +499,16 @@ export class Libp2pKeyPeerNetwork implements IKeyNetwork, IPeerNetwork {
 		}
 	}
 
+	/**
+	 * Learn how to reach `peerId` from addresses carried by an application-level message
+	 * (a cluster record's peer map, a redirect payload). See {@link mergePeerAddresses} for
+	 * the rules and the trust boundary; this is the {@link IPeerNetwork} entry point every
+	 * protocol client dials through.
+	 */
+	public recordPeerAddresses(peerId: PeerId, multiaddrs: string[]): void {
+		mergePeerAddresses(this.libp2p, peerId, multiaddrs, (fmt, ...args) => this.log(fmt, ...args))
+	}
+
 	private getCachedCoordinator(key: Uint8Array): PeerId | undefined {
 		const k = this.toCacheKey(key)
 		const hit = this.coordinatorCache.get(k)
@@ -812,11 +822,7 @@ export class Libp2pKeyPeerNetwork implements IKeyNetwork, IPeerNetwork {
 	}
 
 	private parseMultiaddrs(addrs: string[]): string[] {
-		const out: string[] = []
-		for (const a of addrs) {
-			try { multiaddr(a); out.push(a) } catch (err) { this.log('WARN: invalid multiaddr from connection %s %o', a, err) }
-		}
-		return out
+		return validMultiaddrStrings(addrs, (fmt, ...args) => this.log(fmt, ...args))
 	}
 
 	async findCluster(key: Uint8Array): Promise<ClusterPeers> {
@@ -910,6 +916,11 @@ export class Libp2pKeyPeerNetwork implements IKeyNetwork, IPeerNetwork {
 		if (verbose) this.log('findCluster:detail key=%s cohortPeers=%o connectedPeers=%o', keyStr, ids, connectedPeerIds)
 
 		const peers: ClusterPeers = {}
+		// Cohort members we have no dialable address for. Admitting them is deliberate (see
+		// the note at the assignment below), but staying SILENT about it is what produced the
+		// reported symptom: clean membership logs on every node while every dial to the
+		// addressless member died instantly and the write never completed.
+		const addressless: string[] = []
 
 		for (const idStr of ids) {
 			if (idStr === selfId) {
@@ -933,11 +944,21 @@ export class Libp2pKeyPeerNetwork implements IKeyNetwork, IPeerNetwork {
 			// retry/exclude logic takes over — we intentionally do NOT drop
 			// addressless members here, because shrinking the cohort below
 			// `clusterSize` puts consensus supermajority out of reach.
+			if (parsed.length === 0) addressless.push(idStr.substring(0, 12))
 			peers[idStr] = { multiaddrs: parsed, publicKey: u8ToString(raw, 'base64url') }
 		}
 
-		this.log('findCluster:done key=%s ms=%d peers=%d',
-			keyStr, Date.now() - t0, Object.keys(peers).length)
+		// Unconditional (not gated on `verbose`): this is the one line that turns a silent
+		// hang into a diagnosable one. A non-zero count means the cohort LOOKS healthy while
+		// some members cannot be dialed at all until someone teaches us their addresses
+		// (see `recordPeerAddresses` / `peer-address-book.ts`).
+		if (addressless.length > 0) {
+			this.log('findCluster:addressless-members key=%s count=%d of=%d peers=%o',
+				keyStr, addressless.length, Object.keys(peers).length, addressless)
+		}
+
+		this.log('findCluster:done key=%s ms=%d peers=%d addressless=%d',
+			keyStr, Date.now() - t0, Object.keys(peers).length, addressless.length)
 		return peers
 	}
 

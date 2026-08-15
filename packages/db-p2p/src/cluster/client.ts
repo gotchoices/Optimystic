@@ -3,6 +3,7 @@ import { blockIdToBytes, blockIdsForTransforms } from '@optimystic/db-core';
 import { ProtocolClient } from '../protocol-client.js';
 import { peerIdFromString } from '@libp2p/peer-id';
 import { isClusterErrorEnvelope, clusterErrorFromEnvelope } from './cluster-error.js';
+import type { RedirectPayload } from '../repo/redirect.js';
 import { withRpcDeadlineDefaults, type RpcDeadlineOptions } from '../rpc-deadline.js';
 import { MAX_CONTROL_MESSAGE_BYTES } from '../protocol-limits.js';
 
@@ -38,7 +39,10 @@ export class ClusterClient extends ProtocolClient implements ICluster {
 			throw clusterErrorFromEnvelope(response);
 		}
 
-		const redirectResponse = response as { redirect?: { peers?: Array<{ id: string }> } };
+		// Type the redirect branch against the payload the service actually produces
+		// (`RedirectPayload`), not a hand-written narrower shape — the old `{ id: string }`
+		// literal is what structurally discarded the `addrs` the sender took the trouble to embed.
+		const redirectResponse = response as Partial<RedirectPayload>;
 		if (redirectResponse?.redirect?.peers?.length) {
 			if (hop >= 2) {
 				throw new Error('Redirect loop detected in ClusterClient (max hops reached)')
@@ -49,13 +53,46 @@ export class ClusterClient extends ProtocolClient implements ICluster {
 			if (next.id === currentIdStr) {
 				throw new Error('Redirect loop detected in ClusterClient (same peer)')
 			}
+			// Learn the redirect target's addresses BEFORE dialing it: the redirect is the only
+			// notice we get that this peer matters, and if it is relay-only we have no address
+			// for it at all. Merging after the dial would help only some later hop.
+			this.peerNetwork.recordPeerAddresses?.(nextId, next.addrs ?? [])
 			await this.recordCoordinatorForRecordIfSupported(record, nextId)
 			const nextClient = ClusterClient.create(nextId, this.peerNetwork, this.protocolPrefix)
 			// Thread the caller's *original* options through the redirect hop (the
 			// recursive call re-applies its own defaults) so the deadline survives a redirect.
 			return await nextClient.update(record, hop + 1, options)
 		}
-		return response as ClusterRecord;
+		const updated = response as ClusterRecord;
+		// The member's reply carries the cohort's peer map too, and it may name addresses this
+		// node lacks — the coordinator's own half of the same exchange the service handles inbound.
+		this.recordRecordPeerAddresses(updated)
+		return updated;
+	}
+
+	/**
+	 * Offer every address a cluster record carries for its cohort to the dialer's address book.
+	 * Self and unparseable ids are dropped here; validation, the per-peer cap, and the trust
+	 * boundary live in the implementation behind `recordPeerAddresses`.
+	 */
+	private recordRecordPeerAddresses(record: ClusterRecord): void {
+		const sink = this.peerNetwork.recordPeerAddresses
+		if (!sink) return
+		// No self-filter here: `this.peerId` is the peer we DIALED, not this node. The sink owns
+		// the self-skip, since only it knows the local node's identity.
+		for (const [idStr, peer] of Object.entries(record?.peers ?? {})) {
+			const addrs = peer?.multiaddrs ?? []
+			if (addrs.length === 0) continue
+			let pid: PeerId
+			try {
+				pid = peerIdFromString(idStr)
+			} catch {
+				// A cohort id we cannot parse is not dialable by any route; the consensus path
+				// below already surfaces the resulting membership failure, so skip it here.
+				continue
+			}
+			sink.call(this.peerNetwork, pid, addrs)
+		}
 	}
 
   /**

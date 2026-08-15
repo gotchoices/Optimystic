@@ -26,6 +26,7 @@ import { assertClusterSizeCoupling } from './cluster/cluster-size-coupling.js';
 import { createCommitCertStore, makeClusterCommitCertExtractor, type CommitCertStore } from './cluster/commit-cert.js';
 import { coordinatorRepo } from './repo/coordinator-repo.js';
 import { Libp2pKeyPeerNetwork, type NetworkMode, type NetworkStatePersistence } from './libp2p-key-network.js';
+import { mergePeerAddresses, type AddressLog } from './peer-address-book.js';
 import type { OptimysticNode, OptimysticNodeAttachments } from './optimystic-node.js';
 import { ClusterClient } from './cluster/client.js';
 import type { IRepo, ICluster, ITransactionValidator, BlockId, IBlockChangeNotifier } from '@optimystic/db-core';
@@ -547,6 +548,7 @@ export async function createLibp2pNodeBase(
 
 			// Custom services - create wrapper factories that inject dependencies
 			cluster: (components: any) => {
+				const addressLog: AddressLog = components.logger.forComponent('db-p2p:peer-address-book');
 				const serviceFactory = clusterService({
 					protocolPrefix: `/optimystic/${options.networkName}`,
 					responsibilityK: options.responsibilityK ?? 1,
@@ -569,6 +571,16 @@ export async function createLibp2pNodeBase(
 							if (addr) addrs.push(addr);
 						}
 						return addrs;
+					},
+					// Inbound cluster records carry each cohort member's multiaddrs. libp2p only
+					// propagates addresses between directly-connected peers, so for a cohort chosen
+					// by key position this is often the ONLY way this node learns how to reach a
+					// relay-only sibling. Same late-binding shape as getConnectionAddrs above:
+					// `components.libp2p` resolves at request time, not at service construction.
+					recordPeerAddresses: (peerId: any, multiaddrs: string[]) => {
+						const libp2p = components.libp2p;
+						if (!libp2p) return;
+						mergePeerAddresses(libp2p, peerId, multiaddrs, addressLog);
 					}
 				});
 			},

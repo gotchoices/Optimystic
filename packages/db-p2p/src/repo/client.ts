@@ -5,6 +5,7 @@ import type {
 import type { RepoMessage } from "@optimystic/db-core";
 import { blockIdsForTransforms, blockIdToBytes } from "@optimystic/db-core";
 import { ProtocolClient } from "../protocol-client.js";
+import type { RedirectPayload } from "./redirect.js";
 import { MAX_BLOCK_MESSAGE_BYTES } from "../protocol-limits.js";
 import { peerIdFromString } from "@libp2p/peer-id";
 
@@ -102,16 +103,25 @@ export class RepoClient extends ProtocolClient implements IRepo {
 			clearTimeout(timer)
 		}
 
-		if (response?.redirect?.peers?.length) {
+		// Type the redirect branch against the payload the service actually produces
+		// (`RedirectPayload`) rather than reading it off the `any` response — the untyped read
+		// is what let the `addrs` the sender embedded fall on the floor.
+		const redirectResponse = response as Partial<RedirectPayload>
+		if (redirectResponse?.redirect?.peers?.length) {
 			if (hop >= 2) {
 				throw new Error('Redirect loop detected in RepoClient (max hops reached)')
 			}
 			const currentIdStr = this.peerId.toString()
-			const next = response.redirect.peers.find((p: any) => p.id !== currentIdStr) ?? response.redirect.peers[0]
+			const peers = redirectResponse.redirect.peers
+			const next = peers.find((p) => p.id !== currentIdStr) ?? peers[0]!
 			const nextId = peerIdFromString(next.id)
 			if (next.id === currentIdStr) {
 				throw new Error('Redirect loop detected in RepoClient (same peer)')
 			}
+			// Learn the redirect target's addresses BEFORE dialing it: the redirect is the only
+			// notice we get that this peer matters, and if it is relay-only we have no address
+			// for it at all. Merging after the dial would help only some later hop.
+			this.peerNetwork.recordPeerAddresses?.(nextId, next.addrs ?? [])
 			// cache hint — await so the recorded key bytes match what findCoordinator
 			// later looks up (blockIdToBytes is async); deterministic ordering also
 			// keeps the hint testable. The redirect retry below is async anyway.

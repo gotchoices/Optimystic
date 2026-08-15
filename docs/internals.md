@@ -772,6 +772,23 @@ The voting subsystem's **discovery** flow is a thin composition over that surfac
 - **Discovery seam.** db-core is transport-free, so the walk/sweep I/O is injected as a `QuorumDiscovery` port (bound in db-p2p to `MatchmakingSeeker.walk` + `multi-cohort-seeker`). The per-entry `EntrySigVerifier` and the provider `sign`/`registerProvider` hooks are likewise injected, matching the rest of the subsystem.
 - **Snapshot / TTL semantics.** A voting window (`patienceMs` 30–300 s) can outlast `provider_ttl` (60–90 s). The assembled set is a TTL-bounded **snapshot**: voters renew to stay listed, a voter that stops renewing ages out and may be returned-then-dead between assembly and vote-collection, and the voting layer re-validates liveness on dial. Matchmaking does not pin voters. Delegation: the seeker role (coordinator or a delegated assembler peer) owns `patienceMs` and the re-validation duty; a handed-back set is independently checkable, so a coordinator may trust-but-verify by re-running steps 5–6.
 
+## Third-Party Address Learning
+
+libp2p tells a peer's addresses only to the peers it is **directly connected to**.  There is no relay-side gossip of reservations, and this stack registers no peer-routing service (no kad-dht, no `peerRouters`), so a dialer has no `findPeer` fallback either.  A cohort here is chosen by *key position*, not by who happens to be connected, so a node routinely lands in a cohort with a peer it has never met.  When that peer is reachable only through a circuit relay — a phone, a laptop behind NAT — the third party holds an empty address list for it and a dial by peer id alone fails immediately with `NoValidAddressesError`, while membership logs on every node still read healthy.
+
+db-p2p therefore learns third-party addresses from **its own protocol messages**, which already carry them: `ClusterRecord.peers[*].multiaddrs` and a redirect payload's `{ id, addrs }`.  Every ingress for those addresses funnels through one writer, `packages/db-p2p/src/peer-address-book.ts` — the only place in this repository that writes the libp2p peerStore:
+
+- `ClusterService.processOperation` merges the record's peer map *before* deciding to redirect and *before* running consensus, since both go on to dial those peers.
+- `ClusterClient.update` merges the peer map of the record a member returns (the coordinator's half of the same exchange).
+- `ClusterClient` and `RepoClient` merge a redirect target's `addrs` *before* dialing it, so the very first hop benefits.
+- The dispute path deliberately does **not** merge: a challenge's `originalRecord` is attacker-supplied and already flagged as unverified on that path.
+
+Merging a multiaddr only makes a dial *attempt* possible — the dialed peer still authenticates by peer id at the noise handshake, so an address from an unverified record can waste a dial but can never impersonate.  What needs bounding is cost, not authenticity, hence `MAX_MERGED_ADDRS_PER_PEER` (8 per peer per message).
+
+Cohort members with no dialable address are still admitted — dropping them would shrink the cohort below `clusterSize` and put the consensus super-majority out of reach — but `findCluster` now logs `findCluster:addressless-members` whenever the count is non-zero, so the condition is visible rather than silent.
+
+The seam is the optional `recordPeerAddresses?(peerId, multiaddrs: string[])` on `IPeerNetwork` (`packages/db-core/src/network/i-peer-network.ts`); implementations without an address book (test doubles, the in-memory mesh harness) simply omit it.  `packages/db-p2p/test/relay-third-party-address-gap.spec.ts` pins the libp2p-level premise: if a future libp2p ever propagates third-party addresses on its own, that spec's first assertion fails and tells us this whole mechanism has become redundant rather than load-bearing.
+
 ## Cluster Authentication
 
 The cluster two-phase commit uses **cryptographic signatures**, not to be confused with ACLs.  Each peer in a `ClusterRecord.peers` entry carries a `publicKey: Uint8Array` derived from their libp2p peer ID.
