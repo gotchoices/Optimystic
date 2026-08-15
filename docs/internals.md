@@ -353,7 +353,7 @@ saveMaterializedBlock(block): store(structuredClone(block));
 ## Key Invariants
 
 ### Block Identity
-- `blockId` = content-addressed ID (base64url), immutable
+- `blockId` = random ID (base64url; `randomBytes(32)`, `packages/db-core/src/transactor/transactor-source.ts:36`), immutable — not a content hash
 - `actionId` = transaction identifier, unique per commit
 - `rev` = revision number, monotonically increasing per block
 
