@@ -25,7 +25,10 @@ export async function requestResponse(
 	const conns = node.getConnections(peer);
 	let stream: Stream | undefined;
 	try {
-		stream = conns.length > 0 ? await conns[0]!.newStream([protocol]) : await node.dialProtocol(peer, [protocol]);
+		stream =
+			conns.length > 0
+				? await conns[0]!.newStream([protocol], { runOnLimitedConnection: true })
+				: await node.dialProtocol(peer, [protocol], { runOnLimitedConnection: true });
 		stream.send(frame);
 		await stream.close();
 		return await readAllBounded(stream, maxBytes);
@@ -45,7 +48,10 @@ export async function sendOneWay(node: Libp2p, peer: PeerId, protocol: string, f
 	const conns = node.getConnections(peer);
 	let stream: Stream | undefined;
 	try {
-		stream = conns.length > 0 ? await conns[0]!.newStream([protocol]) : await node.dialProtocol(peer, [protocol]);
+		stream =
+			conns.length > 0
+				? await conns[0]!.newStream([protocol], { runOnLimitedConnection: true })
+				: await node.dialProtocol(peer, [protocol], { runOnLimitedConnection: true });
 		stream.send(frame);
 		await stream.close();
 	} finally {
