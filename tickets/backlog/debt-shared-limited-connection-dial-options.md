@@ -1,4 +1,4 @@
-description: Peers reachable only through a relay — the normal situation for phones and machines behind a home router — get silently cut off by any part of the system that forgets one easy-to-miss opt-in flag when opening a connection; one place still forgets it today, and nothing stops the next new connection site from forgetting it too.
+description: Peers reachable only through a relay — the normal situation for phones and machines behind a home router — get silently cut off by any part of the system that forgets an easy-to-miss opt-in when opening a connection; one place still forgets it today, the correct version of this logic is hand-copied three times over, and nothing stops the next new connection site from getting it wrong too.
 prereq:
 files: packages/db-p2p/src/libp2p-node-base.ts, packages/db-p2p/src/libp2p-key-network.ts, packages/db-p2p/src/cohort-topic/stream-util.ts, packages/db-core/src/network/i-peer-network.ts
 difficulty: medium
@@ -61,6 +61,34 @@ relay-only peer holding a block, and an arachnode peer that must restore that bl
 restore return empty. `packages/db-p2p/test/util/relay-topology.ts` already has the relay/relay-only-peer
 scaffolding for this (`spawnRelayNode`, `spawnTcpServicePeer`, and a relay-only peer helper), used by
 the `RUN_LONG_TESTS`-gated specs.
+
+## Arm added during review of `cohort-topic-streams-rejected-on-limited-relay-connections`
+
+The missing flag turned out to be **one of three** things a hand-written stream-open forgets, and the
+correct version of the whole thing already exists upstream but is unreachable:
+
+- **FRET already has the exact right helper** — `openRpcStream` in its `rpc/protocols.ts`. It filters
+  to open connections, prefers a direct connection over a relayed one, and sets both
+  `runOnLimitedConnection: true` and `negotiateFully: false`. But `p2p-fret`'s `package.json`
+  `exports` map exposes only the root entry, and the root entry re-exports `readAllBounded` **without**
+  `openRpcStream` — so there is no import path to it, deep or otherwise.
+- Because it is unreachable, this repo now carries **three hand-written copies** of that same
+  selection logic: `libp2p-key-network.ts#connect` (correct), `cohort-topic/stream-util.ts#openStream`
+  (corrected during the review — it had been missing the open-status filter and the direct-connection
+  preference on top of the flag), and the broken inline lambda at `libp2p-node-base.ts:1041`.
+
+This widens the ticket's target: the thing worth centralizing is **connection selection**, not just the
+one flag. Two cheap options that did not exist when this ticket was written:
+
+- Ask upstream `p2p-fret` to export `openRpcStream`, then delete all three copies. Smallest diff by
+  far, but gated on a dependency release.
+- Failing that, one `openStream` in `db-p2p` that the other sites import, seeded from the
+  `stream-util.ts` version (which now has tests for all three guards, at
+  `test/cohort-topic/stream-util.spec.ts` — a table-driven spec that runs every scenario against
+  every helper, so it generalizes to more call sites by adding a row).
+
+A full sweep of the repo confirms the site list is complete: `grep -rn "\.dialProtocol(\|\.newStream("
+packages/*/src --include=*.ts` returns exactly those three plus nothing else.
 
 ## What "make it unrepresentable" looks like here
 
