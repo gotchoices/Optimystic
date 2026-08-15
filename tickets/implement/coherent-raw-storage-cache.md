@@ -5,6 +5,35 @@ files: packages/db-p2p/src/storage/kv-raw-storage.ts, packages/db-p2p/src/storag
 difficulty: hard
 ----
 
+<!-- resume-note -->
+**Prior run interrupted by BUDGET_WARNING after design + first file. Resume here; do not redo the analysis.**
+
+**Done (unverified — not yet compiled or tested):**
+- `packages/db-p2p/src/storage/cached-store-driver.ts` — complete `CachedStoreDriver implements RawStoreDriver`, the kernel-level hook. Wraps any inner driver; wire as `new KvRawStorage(new CachedStoreDriver(innerDriver))`.
+
+**Design decisions already made (hold to these unless they fail verification):**
+- **Hook level = driver, not IRawStorage.** Cache stores the *encoded bytes* the kernel writes/reads. Kernel's codec (`raw-store-codec.ts`) then decodes fresh objects per read, so clone-on-read/write stays structural (conformance clone tests should pass with zero cache-side cloning) and entry byte-size is free for the follow-up pool ticket.
+- Cached value type: `Uint8Array | null` where `null` = **proven** absence (confirmed inner miss or funnelled delete); map-miss = unknown. Preserves the absence-verdict distinction the ticket requires.
+- Read-miss fills are guarded "fill only if still unknown" after the await, so a stale read never clobbers a newer funnelled write. Write-error paths drop affected entries to unknown and rethrow.
+- Revisions: per-block `{byRev, covered: [lo,hi][] (inclusive, adjacency-merged), gen}`. Coverage from full enumerations + written points only. `listRevisions`/`listPendingTransactions` completeness claims are guarded by a `gen` counter + state-object identity check so a write or `clear()` landing mid-drain vetoes the claim.
+- **No metadata-birth completeness shortcut** (ticket allowed it; declined): pending-sans-metadata and revisions-sans-metadata are reachable at the raw layer (conformance writes the former directly; crash inside `saveForwardRevision` after `saveRestored`, before `saveMetadata`, produces the latter). Cost of declining: ≤2 extra driver enumerations per block per process life — negligible vs target. Document this tradeoff in the handoff.
+- `promote`: inner atomic move first; then one synchronous cache mutation — pending→null, pendList id dropped, committed set from cached pending bytes if present else **invalidated** (also kills any cached negative). On throw: invalidate all three.
+- `clear()` safe at any instant (cache always clean); in-flight enumerations detect state-object swap.
+- Memory backend: do NOT wrap `MemoryStoreDriver` (bookkeeping-only overhead; bytes would be shared refs, so no byte copy, still pointless) — document, don't code-guard.
+
+**Remaining TODO (in order):**
+- `packages/db-p2p/src/storage/cached-raw-storage.ts`: `RawStorageDriverAdapter implements RawStoreDriver` over a plain `IRawStorage` (uses `encodeJson`/`decodeJson`/`encodeActionId`/`decodeActionId`; `rangeRevisions` maps `(lo,hi,reverse)` back to `listRevisions(start,end)` and drains before yielding; `promote`→`promotePendingTransaction`; feature-detected optional passthroughs assigned in constructor like `KvRawStorage` does) + `class CachedRawStorage extends KvRawStorage` constructed as `super(new CachedStoreDriver(new RawStorageDriverAdapter(inner)))`, keeping a ref to the cache driver to expose `clearCache()`.
+- Export both new modules from `src/index.ts` AND `src/rn.ts` (rn.ts mirrors the storage exports).
+- Tests in `packages/db-p2p/test/cached-raw-storage.spec.ts` (mocha+chai, see `test/kv-raw-storage.spec.ts` for the conformance harness call):
+  - `runRawStorageConformance` over BOTH forms: `KvRawStorage(CachedStoreDriver(MemoryStoreDriver))` and `CachedRawStorage(new MemoryRawStorage())`.
+  - Coherence-specific: promote when pending was cached (committed served from cache); promote when pending NOT cached — pre-populate a bare `MemoryRawStorage`, then wrap, `getTransaction`→undefined cached negative, promote, `getTransaction` must return the transform (negative invalidated, read falls to inner); `clear()` mid-sequence then reads still correct; negative metadata cached (repeat probe = 0 inner ops, use a counting driver); `deleteMaterialized`→negative; pending-list completeness (second list = 0 inner enumerations; add id via wrapper appears without re-enumeration); revision coverage ([1,5] enumerated then re-served from cache; saveRevision 6 extends; [0,6] falls to inner once then covered); mid-drain-write gen guard (inner driver with a controllable gate: start list drain, putPending through wrapper mid-drain, finish — next list must include the concurrent id, i.e. completeness not falsely claimed).
+  - Op-count measurement: `CountingStoreDriver` wrapping `MemoryStoreDriver` counting per-method calls; workload ≈ cold start: `StorageRepo(id => new BlockStorage(id, storage))`, 6 blocks, 22 sequential pend→commit rounds (insert first touch, `{updates:[['items',0,0,['v'+rev]]]}` after — see conformance `makeInsertTransforms` and parity-slice for request shapes; commit rev = global counter), `repo.get({blockIds})` each round. Run uncached vs cached, log per-method table, assert cached driver-reads reduced ≥70% and writes unchanged. Report measured numbers in handoff.
+- `docs/storage.md`: add a cache section under/near "Shared KV Kernel" — write-through coherence, the five invariants it relies on (already documented in that file), single-process precondition, wiring guidance (wrap driver for kernel backends; `CachedRawStorage` otherwise; never memory), unbounded-until-pool note.
+- Advisory-lock decision (fs backend single-owner enforcement): DECLINE in this ticket — fs package out of `files:` scope, cross-platform (RN/Expo) advisory locking unreliable, Invariant 5 documented in docs/storage.md. Say so in handoff for the reviewer.
+- `yarn build` (tsc) + `yarn test` in `packages/db-p2p` — full suite must pass unchanged. tsconfig has no `exactOptionalPropertyTypes`, so the `s.revs = undefined` / `s.pendList = undefined` assignments in the new driver are fine.
+- Handoff to `tickets/review/coherent-raw-storage-cache.md` (distilled summary, measured op counts, known gaps: unlatched same-actionId pend-during-promote race is tolerated same as pre-cache; JSON.parse per cache hit tripwire NOTE already in class doc), then delete this ticket file.
+<!-- /resume-note -->
+
 # A write-through coherent cache at the raw-storage seam
 
 ## The problem
