@@ -335,6 +335,33 @@ describe('index backfill correctness around the empty-table skip', function () {
 		await expectIndexAgreesWithScan(a.db, 'detached', 'token');
 	});
 
+	it('a session that never wrote to the table still backfills rows a previous one committed', async () => {
+		// The skip replaced a `collection.update()` that ran BEFORE the emptiness question
+		// was asked, so the check now reads a view established when the collection was
+		// opened. A session that never wrote is the shape where that distinction bites:
+		// everything it can see came from the header probe at open, not from a refresh. If
+		// a cold open ever read a populated table as empty, CREATE INDEX would skip the
+		// scan and leave every existing row unindexed — silently.
+		const shared = buildSharedLocalTransactor(new MemoryRawStorage());
+		const uri = 'tree://backfill-skip/cold-session';
+		const ddl = ddlFor('cold_session', uri);
+
+		const writer = newSession(shared);
+		await writer.db.exec(ddl);
+		await writer.db.exec(`insert into cold_session (id, token) values (1, 'tok-a')`);
+		await writer.db.exec(`insert into cold_session (id, token) values (2, 'tok-b')`);
+
+		const cold = newSession(shared);
+		await cold.db.exec(ddl);
+		await cold.db.exec(`create index cold_session_by_token on cold_session(token)`);
+
+		expect(
+			await countTreeEntries(cold.plugin, `${uri}/index/cold_session_by_token`),
+			'a cold session must not read a populated table as empty',
+		).to.equal(2);
+		await expectIndexAgreesWithScan(cold.db, 'cold_session', 'token');
+	});
+
 	it('several indexes attaching in one reconcile share the single scan decision', async () => {
 		// `attached` is a list, and one scan serves all of it — so the skip is decided
 		// per scan, not per index. Here the table is NOT empty, so all of them populate.

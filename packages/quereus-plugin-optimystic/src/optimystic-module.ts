@@ -1289,11 +1289,24 @@ export class OptimysticVirtualTable extends VirtualTable {
 
     // No rows to copy means every step below is a no-op reached the expensive way: two
     // cache-bypassing refreshes and a walk, to stage nothing. Checked before tree.update()
-    // for that reason — see hasNoRowsToBackfill for why the live view is the sound read
-    // here, and note the probe that called this refreshes the tree itself either way.
+    // for that reason — the probe that called this refreshes the tree itself either way,
+    // so skipping ahead costs the probe no freshness.
+    //
+    // Soundness here is NOT hasNoRowsToBackfill's (that argues about unindexed rows; a
+    // missed populate on THIS path would instead admit a duplicate). The argument is:
+    // the probe reads the tree after tree.update(), so entries any writer running this
+    // build maintained are visible without a populate at all. Populate exists only for
+    // rows an OLDER build wrote past an unmaintained tree — and those are collidable
+    // only against rows this connection can see. An empty live view means it sees none.
+    // The residual hole (a stale view missing an old-build sibling's rows) is the
+    // pre-existing shape of this guard, which already ran once per tree per process and
+    // never re-checked after that first probe.
+    //
     // Deliberately does NOT mark the tree populated: nothing was verified, so a later
-    // probe over a by-then-populated table still gets its one backfill. The table stops
-    // being empty after one insert, so this costs at most a few cached first() reads.
+    // probe over a by-then-populated table still gets its one backfill.
+    // NOTE: re-checked per probed row while the table is empty; that is a cached first()
+    // read and the table stops being empty after one insert. If an empty-table DML burst
+    // ever shows up in a profile, memoize the emptiness answer until the first stage.
     if (await this.hasNoRowsToBackfill()) return;
 
     await tree.update();
@@ -2157,22 +2170,21 @@ export class OptimysticVirtualTable extends VirtualTable {
     });
 
     // Decided ONCE per call, not per index: one scan serves every target, so the
-    // question is only ever "is there anything to copy at all".
-    if (await this.hasNoRowsToBackfill()) {
-      await this.flushDirtyTrees(targets);
-      return;
-    }
-
-    await collection.update();
-    for await (const path of collection.ascending(await collection.first())) {
-      if (!collection.isValid(path)) continue;
-      const entry = collection.at(path) as [string, EncodedRow] | undefined;
-      if (!entry || entry.length < 2) continue;
-      const row = rowCodec.decodeRow(entry[1]);
-      const primaryKey = rowCodec.extractPrimaryKey(row);
-      for (const { descriptor, tree } of targets) {
-        const treeKey = manager.createIndexKey(descriptor, row) + primaryKey;
-        await tree.stage([[treeKey, [treeKey, primaryKey]]]);
+    // question is only ever "is there anything to copy at all". The flush below still
+    // runs when the scan is skipped — a freshly INVENTED tree holds uncommitted
+    // header/root blocks even though no row staged anything into it.
+    if (!await this.hasNoRowsToBackfill()) {
+      await collection.update();
+      for await (const path of collection.ascending(await collection.first())) {
+        if (!collection.isValid(path)) continue;
+        const entry = collection.at(path) as [string, EncodedRow] | undefined;
+        if (!entry || entry.length < 2) continue;
+        const row = rowCodec.decodeRow(entry[1]);
+        const primaryKey = rowCodec.extractPrimaryKey(row);
+        for (const { descriptor, tree } of targets) {
+          const treeKey = manager.createIndexKey(descriptor, row) + primaryKey;
+          await tree.stage([[treeKey, [treeKey, primaryKey]]]);
+        }
       }
     }
 
