@@ -268,27 +268,78 @@ Semantics worth knowing:
   after); `listRevisions` tracks covered rev intervals from enumerations and
   written points. A write or `clear()` landing mid-enumeration vetoes the
   completeness claim (generation guard) rather than freezing a stale set.
-- **Always clean, never dirty.** Nothing is pinned; `clear()` (or any future
+- **Always clean, never dirty.** Nothing is pinned; `clear()` (or a pool
   eviction) is correct at any instant and purely a performance question. If a
   change ever seems to need a dirty or pinned entry, the design has gone wrong.
   Correct "at any instant" includes *during* an in-flight inner read: every
   read-miss fill checks that the cache state it started on is still the live one,
   so a read that overlaps a write and a `clear()` declines to cache its own
   now-superseded snapshot rather than reinstalling it past the clear.
-- **Unbounded for now — deliberately.** Entries live for the process lifetime;
-  the planned shared bounded pool (2Q admission, keyed `(storeId, class, key)`)
-  adds the bound. Entry classes and keys are already shaped for that; block ids
-  alone are NOT globally unique (header block ids are name-derived), so no pool
-  may key on them without the store id.
+- **Bounded by one shared pool per process** (`SharedCachePool`,
+  `src/storage/shared-cache-pool.ts`). Every `CachedStoreDriver` joins the
+  process-wide `defaultCachePool()` unless handed a specific pool, so N
+  workspaces' caches compete inside ONE memory budget instead of each sizing
+  itself as if it were alone. The pool owns residency and eviction only; all
+  coherence semantics above stay in the driver — which is why eviction of any
+  entry at any instant is safe (see "always clean" above).
+  - **Keying**: `(storeId, class, key…)`. The store id leads because block ids
+    alone are NOT globally unique — header block ids are name-derived, so two
+    stores running the same schema collide. Store ids are monotonic and never
+    reused.
+  - **Budget rails**: a byte budget (`maxBytes`) plus an entry-count rail
+    (`maxEntries`, default `max(16, maxBytes/512)`) guarding the
+    many-tiny-entries case. Every entry charges a fixed base (~256 bytes + key)
+    on top of its content, so cached negatives and empty bookkeeping are never
+    free — a remote peer streaming probes for nonexistent blocks churns the
+    probation queue instead of growing memory. At the bound the pool always
+    evicts, never refuses: entries are never pinned or dirty, so there is no
+    exhaustion condition.
+  - **2Q admission** (Johnson & Shasha): a first-touch entry enters the A1in
+    probation FIFO (~25% of the byte budget); re-hits inside A1in do NOT
+    promote (this also absorbs the several correlated touches one logical
+    operation makes); A1in eviction demotes the key to the A1out ghost set
+    (capped at half the entry budget); a later admission of a ghosted key —
+    reuse across operations — goes straight to the protected Am LRU; Am
+    evictions never ghost. Net effect, measured in
+    `test/shared-cache-pool.spec.ts`: a 3000-block one-off bulk scan lives and
+    dies inside probation and displaces ZERO of another store's re-used hot
+    set, where a plain shared LRU loses all of it.
+  - **Large-value bypass**: an entry whose charge exceeds 1/16 of the byte
+    budget is not cached at all (reads/writes pass through), so one oversized
+    value cannot flush the pool.
+  - **Budget**: platform defaults are honest guesses — 8 MB React Native,
+    16 MB browser, 32 MB Node — and hosts with better knowledge should size
+    explicitly: `defaultCachePool().setBudget({ maxBytes })` (shrinking evicts
+    down immediately), or pass their own `SharedCachePool` to each cache.
+    Absurdly small budgets are accepted: they cannot break coherence, they
+    just degrade toward read-through (the conformance suite runs the full
+    contract at 2 KB to prove it).
+  - **Ghost memory**: ghost keys live outside the byte budget, bounded by
+    their own cap (half the entry budget) — order ~2 MB worst-case at the
+    default Node budget, proportionally less at smaller ones.
+  - **Observability**: `pool.stats()` reports budget, per-queue bytes/entries,
+    ghost count, hit/admission/ghost-hit/eviction/bypass counters, and
+    per-store occupancy; `CachedStoreDriver.storeStats()` gives one store's
+    slice.
+  - **Lifecycle**: `CachedStoreDriver.close()` (and
+    `CachedRawStorage.dispose()`) drops the store's entries and ghosts and
+    retires its pool registration; `clear()` drops entries AND this store's
+    ghost keys, so pre-clear recency cannot fast-track post-clear refills into
+    the protected queue. A skipped close leaks only cold entries the pool
+    evicts under pressure.
 
 **Wiring:**
 
 - Backend exposes its `RawStoreDriver` (all kernel-backed backends):
-  `new KvRawStorage(new CachedStoreDriver(driver))`.
+  `new KvRawStorage(new CachedStoreDriver(driver))`. Optional second/third
+  constructor args pick a specific `SharedCachePool` (default: the shared
+  process pool) and a `label` that names the store in `pool.stats()`.
 - Only the `IRawStorage` surface is reachable:
   `new CachedRawStorage(inner)` — same cache over an internal
   `RawStorageDriverAdapter`, at the cost of one extra codec pass per **cold
-  miss** (hits never reach the adapter). `clearCache()` drops every entry.
+  miss** (hits never reach the adapter); same optional `pool`/`label` args.
+  `clearCache()` drops every entry; `dispose()` releases the pool
+  registration when the workspace departs.
 - **Never wrap `MemoryRawStorage`/`MemoryStoreDriver`** in production wiring:
   the memory driver already holds the same byte references, so the cache is
   pure bookkeeping overhead (tests do wrap it, to prove semantics match).

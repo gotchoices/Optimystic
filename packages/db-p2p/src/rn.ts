@@ -10,6 +10,7 @@ export * from './repo/service.js';
 export * from './storage/block-storage.js';
 export * from './storage/raw-store-driver.js';
 export * from './storage/kv-raw-storage.js';
+export * from './storage/shared-cache-pool.js';
 export * from './storage/cached-store-driver.js';
 export * from './storage/cached-raw-storage.js';
 export * from './storage/memory-store-driver.js';

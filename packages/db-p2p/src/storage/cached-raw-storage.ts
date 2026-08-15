@@ -3,6 +3,7 @@ import type { IRawStorage } from "./i-raw-storage.js";
 import type { RawStoreDriver } from "./raw-store-driver.js";
 import { KvRawStorage } from "./kv-raw-storage.js";
 import { CachedStoreDriver } from "./cached-store-driver.js";
+import type { SharedCachePool } from "./shared-cache-pool.js";
 import { encodeJson, decodeJson, encodeActionId, decodeActionId } from "./raw-store-codec.js";
 
 /**
@@ -146,12 +147,17 @@ export class RawStorageDriverAdapter implements RawStoreDriver {
  * extra codec pass on cold misses. Do not wrap `MemoryRawStorage` in production wiring
  * (already in-memory; the cache adds bookkeeping with nothing to save) — tests do, to
  * prove semantics are identical through the full composition.
+ *
+ * By default the cache joins the process-wide shared pool (`defaultCachePool()`), so
+ * every workspace's cache competes inside ONE memory budget; pass a specific
+ * {@link SharedCachePool} only for isolation (tests) or host-specific sizing, and a
+ * `label` to make this store recognizable in the pool's `stats()`.
  */
 export class CachedRawStorage extends KvRawStorage {
 	private readonly cacheDriver: CachedStoreDriver;
 
-	constructor(inner: IRawStorage) {
-		const cacheDriver = new CachedStoreDriver(new RawStorageDriverAdapter(inner));
+	constructor(inner: IRawStorage, pool?: SharedCachePool, label?: string) {
+		const cacheDriver = new CachedStoreDriver(new RawStorageDriverAdapter(inner), pool, label);
 		super(cacheDriver);
 		this.cacheDriver = cacheDriver;
 	}
@@ -159,5 +165,16 @@ export class CachedRawStorage extends KvRawStorage {
 	/** Drop every cached entry. Always safe — the cache is clean (write-through, never write-behind). */
 	clearCache(): void {
 		this.cacheDriver.clear();
+	}
+
+	/**
+	 * Release this storage's cache registration with the shared pool (drops all entries,
+	 * retires the store id). Call when the workspace departs; a skipped dispose leaks only
+	 * cold entries the pool will evict under pressure, but the polite release keeps a
+	 * long-lived process's occupancy honest. `IRawStorage` itself has no close, so this is
+	 * the wrapper's own lifecycle method.
+	 */
+	async dispose(): Promise<void> {
+		await this.cacheDriver.close();
 	}
 }
