@@ -171,6 +171,14 @@ export class Tree<TKey, TEntry> implements TreeReadView<TKey, TEntry> {
 			await this.collection.updateAndSync();
 	}
 
+	/** Whether {@link sync} has anything to push — see
+	 * {@link Collection.hasUnsyncedChanges}. `false` means the commit half of
+	 * {@link sync} is a no-op, so a caller flushing several trees can skip the ones
+	 * with nothing staged and avoid their (cache-bypassing) refresh. */
+	hasUnsyncedChanges(): boolean {
+			return this.collection.hasUnsyncedChanges();
+	}
+
 	/** Capture the current staged state so it can be restored via {@link restore}.
 	 * Take this BEFORE staging a unit of work that may be rolled back. The snapshot
 	 * is opaque; pass the exact value back to {@link restore}. */

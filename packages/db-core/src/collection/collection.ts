@@ -441,6 +441,19 @@ export class Collection<TAction> implements ICollection<TAction> {
 		this.pending = [];
 	}
 
+	/** Whether {@link sync} has anything to push: staged actions, or tracker transforms
+	 * that were never committed (an INVENTED collection's header/root blocks live there
+	 * until its first sync, with no pending action to name them).
+	 *
+	 * This is the exact predicate {@link syncInternal} loops on, so `false` means a sync
+	 * would commit nothing. Exposed so a caller that would otherwise flush
+	 * unconditionally can skip the round trip — note that {@link Tree.sync} routes
+	 * through {@link updateAndSync}, so an unnecessary flush still pays a full,
+	 * cache-bypassing {@link update} before discovering it has nothing to do. */
+	hasUnsyncedChanges(): boolean {
+		return this.pending.length > 0 || !isTransformsEmpty(this.tracker.transforms);
+	}
+
 	/** Fold a just-committed set of transforms into this collection's read cache
 	 * so subsequent reads (and stages) through THIS instance observe the committed
 	 * state, mirroring what {@link sync} does inline after a successful transact.
@@ -505,7 +518,7 @@ export class Collection<TAction> implements ICollection<TAction> {
 		// in the exhaustion error and never consulted to decide whether to keep retrying.
 		let lastStaleAt: { blockId: BlockId; rev: number } | undefined;
 
-		while (this.pending.length || !isTransformsEmpty(this.tracker.transforms)) {
+		while (this.hasUnsyncedChanges()) {
 			if (signal?.aborted) {
 				throw makeAbortError(signal);
 			}

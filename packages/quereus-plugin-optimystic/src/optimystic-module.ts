@@ -1287,6 +1287,15 @@ export class OptimysticVirtualTable extends VirtualTable {
     if (this.populatedUniqueTrees.has(descriptor.name)) return;
     if (!this.collection || !this.rowCodec || !this.indexManager) return;
 
+    // No rows to copy means every step below is a no-op reached the expensive way: two
+    // cache-bypassing refreshes and a walk, to stage nothing. Checked before tree.update()
+    // for that reason — see hasNoRowsToBackfill for why the live view is the sound read
+    // here, and note the probe that called this refreshes the tree itself either way.
+    // Deliberately does NOT mark the tree populated: nothing was verified, so a later
+    // probe over a by-then-populated table still gets its one backfill. The table stops
+    // being empty after one insert, so this costs at most a few cached first() reads.
+    if (await this.hasNoRowsToBackfill()) return;
+
     await tree.update();
     // Emptiness is "the first path is not ON an entry" — isValid() only reports whether
     // a path survived a concurrent mutation (its version), NOT whether it points at a
@@ -2091,11 +2100,11 @@ export class OptimysticVirtualTable extends VirtualTable {
    * so re-staging a row that already has an entry writes a byte-identical key and value.
    *
    * Two deliberate differences from the populate loop this replaced:
-   *   - it refreshes `this.collection` first (the old loop did not), matching
-   *     ensureUniquePopulated and widening coverage to rows a sibling committed since
-   *     this connection last pulled;
    *   - it stages per named index and syncs only those trees, rather than staging into
-   *     every maintained index and flushing all of them.
+   *     every maintained index and flushing all of them;
+   *   - it refreshes `this.collection` before scanning (the old loop did not), matching
+   *     ensureUniquePopulated — but only once {@link hasNoRowsToBackfill} says there is
+   *     something to scan, so the empty table pays neither the refresh nor the walk.
    *
    * NOTE: CREATE UNIQUE INDEX does not reject pre-existing duplicate values — entries
    * are keyed on indexCols‖pk, so duplicates coexist and the index builds successfully.
@@ -2130,6 +2139,8 @@ export class OptimysticVirtualTable extends VirtualTable {
     if (indexNames.length === 0) return;
     if (!this.collection || !this.rowCodec || !this.indexManager) return;
     const manager = this.indexManager;
+    const collection = this.collection;
+    const rowCodec = this.rowCodec;
 
     const targets = indexNames.map(name => {
       const descriptor = manager.getIndexSchema(name);
@@ -2145,13 +2156,20 @@ export class OptimysticVirtualTable extends VirtualTable {
       return { descriptor, tree };
     });
 
-    await this.collection.update();
-    for await (const path of this.collection.ascending(await this.collection.first())) {
-      if (!this.collection.isValid(path)) continue;
-      const entry = this.collection.at(path) as [string, EncodedRow] | undefined;
+    // Decided ONCE per call, not per index: one scan serves every target, so the
+    // question is only ever "is there anything to copy at all".
+    if (await this.hasNoRowsToBackfill()) {
+      await this.flushDirtyTrees(targets);
+      return;
+    }
+
+    await collection.update();
+    for await (const path of collection.ascending(await collection.first())) {
+      if (!collection.isValid(path)) continue;
+      const entry = collection.at(path) as [string, EncodedRow] | undefined;
       if (!entry || entry.length < 2) continue;
-      const row = this.rowCodec.decodeRow(entry[1]);
-      const primaryKey = this.rowCodec.extractPrimaryKey(row);
+      const row = rowCodec.decodeRow(entry[1]);
+      const primaryKey = rowCodec.extractPrimaryKey(row);
       for (const { descriptor, tree } of targets) {
         const treeKey = manager.createIndexKey(descriptor, row) + primaryKey;
         await tree.stage([[treeKey, [treeKey, primaryKey]]]);
@@ -2159,9 +2177,63 @@ export class OptimysticVirtualTable extends VirtualTable {
     }
 
     // Staging alone is not durable: addIndex runs outside the DML transaction's
-    // commit, so flush the trees this call populated. Trees with nothing staged sync
-    // as a no-op.
+    // commit, so flush the trees this call populated.
+    await this.flushDirtyTrees(targets);
+  }
+
+  /**
+   * Whether {@link backfillIndexTrees} provably has nothing to copy, checked WITHOUT the
+   * cache-bypassing {@link Collection.update} the scan itself needs. Attaching an index
+   * to a table with no rows is the common cold-start shape (`CREATE TABLE` then
+   * `CREATE INDEX`, both on an empty table), and the scan that follows is pure cost
+   * there: it reads a whole log chain to copy zero rows.
+   *
+   * Read through the LIVE tree, so "no rows" covers both this connection's committed
+   * rows and anything it has staged in an open transaction — a `CREATE INDEX` issued
+   * mid-transaction still populates from the uncommitted inserts above it. Emptiness is
+   * "the first path is not ON an entry": isValid() only reports whether a path survived a
+   * concurrent mutation, so at()===undefined is the on-entry signal (an empty tree's
+   * first() is version-valid but sits on no entry) — the same idiom as
+   * {@link ensureUniquePopulated}.
+   *
+   * SOUNDNESS. The bar is the bug backfill exists to fix: rows THIS connection committed
+   * while detached from a now-attached index must end up indexed. Those rows are by
+   * construction in this collection's own view (its own commits advanced its context and
+   * folded into its cache), so an empty live view proves this connection wrote none —
+   * and the CREATE INDEX build path over a populated table reads non-empty and takes the
+   * full scan unchanged.
+   *
+   * What the skip gives up against the pre-existing `update()`-first order is narrower:
+   * rows a SIBLING connection committed since this one last pulled, where that sibling
+   * was not itself maintaining the index. That widening was incidental, and it was never
+   * general — see the note on {@link reconcileMaintainedIndexes}: a connection that opens
+   * cold and finds the index already in the persisted schema attaches nothing and never
+   * scans, so a divergent writer's orphans already survive every open that does not
+   * re-declare. Healing those needs the explicit repair entry point named there, not a
+   * refresh on this path.
+   */
+  private async hasNoRowsToBackfill(): Promise<boolean> {
+    if (!this.collection) return true;
+    return this.collection.at(await this.collection.first()) === undefined;
+  }
+
+  /**
+   * Flush the trees that actually have something to push, skipping the ones that do not.
+   *
+   * `Tree.sync()` is `updateAndSync()`, so syncing a tree with an empty change set is not
+   * free: the update half is a deliberately cache-bypassing log walk, paid in full before
+   * the commit half discovers it has nothing to do. Skipping it is provably behaviour-
+   * preserving — `hasUnsyncedChanges()` is the very predicate the commit loop iterates on.
+   *
+   * A newly built index tree that received no entries (CREATE INDEX on an empty table) is
+   * still flushed when it was INVENTED, since its header/root blocks sit uncommitted in
+   * the tracker and count as unsynced.
+   */
+  private async flushDirtyTrees(
+    targets: readonly { tree: Tree<string, IndexEntry> }[],
+  ): Promise<void> {
     for (const { tree } of targets) {
+      if (!tree.hasUnsyncedChanges()) continue;
       await tree.sync();
     }
   }
