@@ -77,7 +77,7 @@ For tests, `TestTransactor` from `@optimystic/db-core/test` runs everything in-p
 
 ### Open a collection
 
-`Tree` gives indexed key/value access with range scans; `Diary` is append-only. The header block is content-addressed from the collection name, so every peer in the network resolves to the same collection.
+`Tree` gives indexed key/value access with range scans; `Diary` is append-only. The header block's ID *is* the collection name, so every peer in the network resolves to the same collection without coordination. (Name-derivation, not content addressing — a block ID is never a hash of block contents.)
 
 Both offer two entry points:
 

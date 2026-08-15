@@ -1,12 +1,12 @@
 # Optimystic Technical Architecture
 
-Optimystic is a distributed database for peer-to-peer networks. It provides ACID transactions over content-addressed, versioned block storage with strong consistency guarantees, Byzantine fault tolerance, and adaptive topology management — all without centralized coordination.
+Optimystic is a distributed database for peer-to-peer networks. It provides ACID transactions over versioned, replicated block storage with strong consistency guarantees, Byzantine fault tolerance, and adaptive topology management — all without centralized coordination.
 
 This document is the top-level architectural map. It explains the layers, names the parts, and points to the deep-dive docs for each subsystem.
 
 ## Design Principles
 
-* **ACID over content-addressed, distributed storage.** Related blocks live on independent peers; transactions span blocks and collections.
+* **ACID over distributed, versioned block storage.** Related blocks live on independent peers — placement follows each block's ID, not its logical relationships — and transactions span blocks and collections.
 * **Log-first ordering.** A transaction's position in the log is decided by a collection's *log-tail cluster*; propagation to other blocks follows.
 * **Optimistic concurrency.** Reads are captured as revision dependencies; validators re-check them at commit. Conflicts trigger replay, not blocking locks.
 * **Pluggable execution engines.** The transaction payload is engine-specific — SQL statements for Quereus, JSON actions for the built-in ActionsEngine — and every cluster member re-executes deterministically to validate.
@@ -100,7 +100,7 @@ Built on the block layer (see `db-core` [documentation index](../packages/db-cor
   * **Diary** — append-only event log
   * **Hashed Tree** *(planned)* — Merkle-style tree with per-node hashes
 
-Each collection's header block is content-addressed from the collection name, so every peer in a network can discover it deterministically.
+Each collection's header block ID *is* the collection name, passed through unchanged, so every peer in a network resolves the same collection to the same header block without coordination. This is name-derivation, not content addressing: the ID says nothing about the block's contents.
 
 ## Transaction Model
 

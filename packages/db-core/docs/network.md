@@ -1,14 +1,16 @@
 # Network Transactor Architecture
 
-The Network Transactor solves the fundamental challenge of **atomic transactions across content-addressed distributed storage**. Unlike traditional databases where related data resides on a single server, Optimystic's content-addressed blocks are distributed across multiple independent peers based on their block IDs, not their logical relationships.
+The Network Transactor solves the fundamental challenge of **atomic transactions across ID-addressed distributed storage**. Unlike traditional databases where related data resides on a single server, Optimystic's blocks are distributed across multiple independent peers based on their block IDs, not their logical relationships.
+
+> **"ID-addressed", not "content-addressed".** Placement really is derived from the block ID — but a block ID is an opaque, stable name (a random 256-bit value for data blocks; the collection name for a header block), *not* a hash of the block's contents. Only the transaction ID is a genuine content hash. See [correctness.md](../../../docs/correctness.md) §2 and Theorem 15 for what this does and does not buy a reader.
 
 > **Scope of "atomic" here.** This document describes the per-cluster consensus primitive, where a single cluster's block set commits atomically. It does **not** promise unconditional all-or-nothing *across* collections/clusters: the multi-collection coordinator commits each collection's log-tail cluster in an independent round, so a permanent stale loss on one collection can leave a reported partial landing. The delivered cross-collection guarantee is **atomicity of intent + eventual, reported visibility** — see the canonical statement in [correctness.md](../../../docs/correctness.md) **Theorem 3**. Phrases below like "atomicity across all involved clusters" describe the design goal of the consensus round, not a literal cross-collection all-or-nothing guarantee.
 
 ## The Fundamental Problem
 
-### Distributed Content Addressing Challenge
+### Distributed ID-Addressing Challenge
 
-In a content-addressed system, **blocks are distributed by their hash/ID**, not by logical grouping:
+In an ID-addressed system, **blocks are distributed by their block ID**, not by logical grouping:
 
 ```
 Transaction affects blocks: [block-A, block-B, block-C]
@@ -22,7 +24,7 @@ Network distribution:
 1. **Atomic Coordination**: All blocks must be updated atomically, despite being managed by different clusters
 2. **Overlapping Clusters**: Peers may participate in multiple clusters (P3 and P5 above)
 3. **Independent Failures**: Any cluster or peer can fail independently during the transaction
-4. **Content Routing**: Must deterministically locate the responsible peers for each block
+4. **Block Routing**: Must deterministically locate the responsible peers for each block
 5. **Consensus Ordering**: Must establish a consistent transaction order across all involved clusters
 
 ### Why Traditional Approaches Fail
@@ -30,15 +32,15 @@ Network distribution:
 - **Single Coordinator**: Cannot handle the peer/cluster failures and network partitions
 - **Broadcast Protocols**: Too expensive when only subset of peers are involved
 - **Block-by-Block**: Cannot maintain atomicity across related blocks
-- **Logical Grouping**: Contradicts content-addressing principles
+- **Logical Grouping**: Contradicts ID-based placement — a block's cluster must be derivable from its ID alone
 
 ## Architectural Solution
 
 ### Core Strategy: Cluster-Aware Distributed Consensus
 
-The Network Transactor solves distributed content-addressing through **cluster-aware coordination**:
+The Network Transactor solves distributed ID-addressing through **cluster-aware coordination**:
 
-1. **Content-to-Cluster Mapping**: Use deterministic hashing to map each block to its responsible cluster
+1. **ID-to-Cluster Mapping**: Use deterministic hashing of the block ID to map each block to its responsible cluster
 2. **Parallel Cluster Coordination**: Execute operations across multiple clusters simultaneously  
 3. **Two-Phase Atomic Commit**: Ensure atomicity across all involved clusters
 4. **Log-First Ordering**: Establish transaction ordering through append-only logs
@@ -49,7 +51,7 @@ The Network Transactor solves distributed content-addressing through **cluster-a
 The architecture separates concerns through three key abstractions:
 
 ```typescript
-// Content addressing and cluster discovery
+// ID addressing and cluster discovery
 interface IKeyNetwork {
   findCoordinator(key: Uint8Array): Promise<PeerId>;
   findCluster(key: Uint8Array): Promise<ClusterPeers>;
@@ -73,11 +75,11 @@ interface IRepo {
 
 ## Distributed Coordination Algorithm
 
-### Step 1: Content-to-Cluster Mapping
+### Step 1: ID-to-Cluster Mapping
 
 **Problem**: Given a block ID, which cluster is responsible for coordinating it?
 
-**Solution**: Deterministic content addressing through consistent hashing
+**Solution**: Deterministic placement by hashing the block ID (consistent hashing over the ring)
 
 ```
 blockId → hash(blockId) → keyspace region → responsible cluster
@@ -116,7 +118,7 @@ Execute: cluster-1.pend() || cluster-2.pend()  // in parallel
 
 **Problem**: Ensure atomicity across all clusters involved in transaction
 
-**Solution**: Classic two-phase commit adapted for content-addressed clusters
+**Solution**: Classic two-phase commit adapted for ID-addressed clusters
 
 ```
 Phase 1 (Pend): Reserve transaction slots across all clusters
@@ -132,7 +134,7 @@ Phase 2 (Commit): Apply changes atomically across all clusters
 
 ### Log-First Transaction Ordering
 
-**The Critical Insight**: In a distributed content-addressed system, transaction ordering must be established independently of the specific blocks being modified.
+**The Critical Insight**: In a distributed ID-addressed system, transaction ordering must be established independently of the specific blocks being modified.
 
 **Solution**: Use the collection's append-only log as the single source of transaction ordering
 
@@ -242,15 +244,15 @@ When a pend or commit fails partway, already-pended blocks must be cancelled to 
 
 ## Why This Architecture Succeeds
 
-### Solving Content-Addressing vs. Transaction Atomicity
+### Solving ID-Addressing vs. Transaction Atomicity
 
-**Traditional Problem**: Content-addressed distribution scatters logically related blocks across independent clusters
+**Traditional Problem**: ID-derived distribution scatters logically related blocks across independent clusters
 **Solution**: Establish transaction ordering independently through dedicated log blocks, then apply changes based on that ordering
 
 ### Handling Distributed Consensus at Scale
 
 **Traditional Problem**: Consensus algorithms don't scale well across large networks with dynamic membership
-**Solution**: Use content-addressing to partition consensus domains, run parallel consensus within each cluster
+**Solution**: Use ID-addressing to partition consensus domains, run parallel consensus within each cluster
 
 ### Achieving Fault Tolerance Without Centralization
 
@@ -262,5 +264,5 @@ When a pend or commit fails partway, already-pended blocks must be cancelled to 
 **Traditional Problem**: Network partitions and peer failures can block entire systems
 **Solution**: Graceful degradation, parallel execution, and timeout-based recovery ensure continuous operation
 
-The Network Transactor architecture enables Optimystic to maintain **ACID transaction properties** across **content-addressed distributed storage** while achieving **horizontal scalability** and **fault tolerance** - solving the fundamental tension between content addressing and transaction coordination.
+The Network Transactor architecture enables Optimystic to maintain **ACID transaction properties** across **ID-addressed distributed storage** while achieving **horizontal scalability** and **fault tolerance** - solving the fundamental tension between ID-derived block placement and transaction coordination.
 

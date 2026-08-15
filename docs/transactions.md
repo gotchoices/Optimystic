@@ -618,7 +618,7 @@ Reads in Optimystic are served optimistically: a node that holds a block's local
 
 ### Non-responsible reads (soft serves)
 
-If this node is not the designated responsible node for a block, it still serves the read rather than failing — graceful degradation that avoids hard availability failures when the responsible node is temporarily unreachable. No error is surfaced to the caller; only an internal `proximity:get-warning` log line is emitted. The returned data is content-addressed and internally consistent, but may not be the latest revision committed by the cluster.
+If this node is not the designated responsible node for a block, it still serves the read rather than failing — graceful degradation that avoids hard availability failures when the responsible node is temporarily unreachable. No error is surfaced to the caller; only an internal `proximity:get-warning` log line is emitted. The returned data is internally consistent — a revision the cluster really committed — but it is not verified against the block id (ids are random, not content hashes, so there is nothing to check bytes against), and it may not be the latest revision committed by the cluster.
 
 ### Lazy read-repair window
 

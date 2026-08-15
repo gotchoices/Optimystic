@@ -43,7 +43,7 @@ For implementation details, see [transactions.md](transactions.md), [right-is-ri
 
 ## 2. Definitions
 
-**Block.** The fundamental unit of versioned storage, identified by a cryptographic block ID. Each block has a revision number that increases monotonically with each committed mutation.
+**Block.** The fundamental unit of versioned storage, identified by a stable `BlockId`: a cryptographically *random* 256-bit value for a data block (`randomBytes(32)`, `packages/db-core/src/transactor/transactor-source.ts:36`), and the collection name itself for a collection's header block. A block ID is an opaque, stable *name* — **not** a hash of the block's contents, which change with every revision. Each block has a revision number that increases monotonically with each committed mutation.
 
 **Collection.** A logical grouping of blocks with a consistent access pattern. *Tree* collections provide indexed key-value access via B-tree. *Diary* collections provide append-only log access.
 
@@ -386,37 +386,37 @@ The coordinator proposes a transaction by distributing *(stamp, statements, para
 
 **Proof sketch.**
 
-A recovering node fetches block history from cluster peers. Two mechanisms provide integrity:
-
-*Content addressing.* Each block's ID is a cryptographic hash of its content. A Byzantine peer cannot serve fabricated content for a known block ID without finding a SHA-256 collision. The recovering node verifies each block's hash on receipt.
+A recovering node fetches block history from cluster peers. Note what is *not* available: block IDs are opaque names, not content hashes (§2), so the recovering node can never check served bytes against the ID it asked for. Integrity comes from two mechanisms instead:
 
 *Prior-hash chain verification.* Each log entry contains the SHA-256 hash of the previous entry. The recovering node walks the chain from the latest entry backward, verifying each link. A Byzantine peer cannot splice entries into the chain without breaking a link (collision resistance) or forking the chain at some point.
 
 *Multi-peer consistency.* The recovering node fetches the same block range from multiple cluster peers and compares. With honest majority in the cluster (*f < K/2*), at least ⌈K/2⌉ + 1 peers serve the canonical chain. The recovering node takes the chain attested by the majority. A Byzantine minority cannot outvote the honest majority on chain content.
 
-*Commit signatures as trust anchor.* Each committed transaction carries super-majority signatures from the committing cluster (≥75% at commit time). The recovering node can verify these signatures against known peer identities without trusting any single peer. A committed block with valid super-majority signatures is canonical regardless of who served it.
+*Commit signatures are not yet a trust anchor on this path.* A commit does produce a super-majority threshold signature over the committed action (`CommitCert`, `packages/db-core/src/transactor/change-notifier.ts`), and in principle a recovering node could verify it against known peer identities and accept the block regardless of who served it. **That is not what happens today.** The cert lives only in an in-memory TTL cache used for reactivity (`packages/db-p2p/src/cluster/commit-cert.ts`); it is not persisted with the block, `BlockArchive` has no field for it, and the sync protocol has no path to serve it — so a restoring node cannot obtain a cert to check. Recovery integrity therefore rests entirely on the two mechanisms above. Closing this gap (and with it the Sybil exposure that majority-counting alone cannot address) is tracked as `debt-read-repair-commit-cert-verification`.
 
-**Bound.** Requires at least one honest, reachable peer in the cluster. If all reachable peers are Byzantine, the recovering node cannot distinguish a valid chain from a fabricated one — but this violates the honest majority assumption within the cluster, which is itself protected by the global honest majority through dispute escalation (Theorem 10).
+**Bound.** Requires an honest *majority* among reachable cluster peers, not merely one honest peer: with no self-authenticating content, a recovering node distinguishes canonical from fabricated only by outvoting liars. If reachable peers are Byzantine-majority, the recovering node cannot tell a valid chain from a fabricated one — but this violates the honest majority assumption within the cluster, which is itself protected by the global honest majority through dispute escalation (Theorem 10).
 
-**Depends on:** SHA-256 collision resistance (§1.3), prior-hash chain integrity (Theorem 6), Ed25519 signature verification (Theorem 12), honest cluster majority.
+**Depends on:** SHA-256 collision resistance (§1.3, for the prior-hash chain only — *not* for block content), prior-hash chain integrity (Theorem 6), honest cluster majority.
 
 ### Theorem 15: Read-Path Integrity
 
-**Statement.** A node reading block data from a Byzantine peer can detect content forgery. Stale reads are detectable within transactions but not for unvalidated out-of-band reads.
+**Statement.** A node reading block data can detect content forgery *only by comparing bytes across peers*, which requires an honest majority among more than one reachable peer. A single-peer read is unverified. Stale reads are detectable within transactions but not for unvalidated out-of-band reads.
 
 **Proof sketch.**
 
-*Integrity (forgery detection).* Block IDs are content hashes. A reader that knows a block ID can fetch the block from any peer and verify the hash. A Byzantine peer serving tampered content produces a hash mismatch — detected immediately. This holds unconditionally: no trust in the serving peer is required, only knowledge of the expected block ID.
+*Integrity (forgery detection).* Block IDs are **not** content hashes — a data block's ID is a random 256-bit value and a collection header's ID is the collection name verbatim (§2) — so a reader **cannot** check served bytes against the ID it asked for. There is no self-authenticating content on the read path: commit certificates are not persisted or served (Theorem 14), so nothing lets a reader validate one peer's bytes in isolation. Forgery detection is therefore *conditional*, and rests on a single mechanism: **cross-peer agreement.** The reader fetches the block from several cluster peers and compares their bytes; with an honest majority (*f < K/2*) the majority's bytes are canonical, and a Byzantine minority cannot outvote them. This is the same content gate the repair path uses (`reconcile-block.ts` requires cohort agreement on block content, not just on revision). Its capacity is bounded by `corroboratorCapacity`: when only one other peer is reachable there is nothing to compare against, and that peer's bytes are accepted on exactly the trust its (equally uncorroborable) revision claim already receives.
+
+**Consequence for client authors.** A read served by one peer carries no integrity guarantee. Applications that need one must read from multiple peers and compare, or transact — the unconditional "verify the hash, trust no one" property that content addressing would give does **not** exist here.
 
 *Freshness within transactions.* A transaction captures read dependencies *(blockId, revision)* for every block accessed during execution. At validation time, validators verify each dependency against current state (Theorem 5). If a Byzantine peer served a stale block during execution, the recorded revision won't match, and validators reject. The transaction author is protected from acting on stale reads.
 
-*Freshness outside transactions.* An application performing a casual read (outside a transaction) from a single peer has no protocol-level freshness guarantee. A Byzantine peer can serve a block at an old revision without detection, because there is no validator checking read dependencies. The reader sees internally consistent (content-addressed) but potentially outdated data.
+*Freshness outside transactions.* An application performing a casual read (outside a transaction) from a single peer has no protocol-level freshness guarantee. A Byzantine peer can serve a block at an old revision without detection, because there is no validator checking read dependencies. The reader sees data that is internally consistent — a real block the cluster committed at *some* revision — but neither verified as untampered (above) nor guaranteed current.
 
 *Availability.* A Byzantine peer can refuse to serve blocks entirely (omission). Multi-peer fetching from the cluster mitigates this — with honest majority, at least ⌈K/2⌉ + 1 peers are willing to serve. The reader falls back to alternative cluster members.
 
-**Bound.** Content integrity is unconditional given the block ID. Freshness is guaranteed only within validated transactions. Out-of-band reads are consistent but not guaranteed fresh — applications requiring freshness must use transactions or read from multiple peers and compare revisions.
+**Bound.** Content integrity is **conditional**, on an honest majority among at least two reachable peers that the reader actually compares; it is *not* obtainable from the block ID, and a single-peer read has none. Freshness is guaranteed only within validated transactions. Out-of-band reads are internally consistent but neither verified nor guaranteed fresh — applications requiring either must use transactions or read from multiple peers and compare.
 
-**Depends on:** SHA-256 collision resistance (§1.3), read dependency tracking (Theorem 5), cluster honest majority for availability.
+**Depends on:** cross-peer content agreement under cluster honest majority (`corroboratorCapacity` ≥ 2), read dependency tracking (Theorem 5), cluster honest majority for availability. Notably **not** SHA-256 collision resistance — no content hash is checked on this path.
 
 ---
 
