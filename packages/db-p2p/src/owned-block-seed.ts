@@ -12,12 +12,9 @@ import type { IRawStorage } from './storage/i-raw-storage.js';
  * This scan closes that gap by enumerating the metadata store — one id per block
  * with ANY durable metadata — and adding each id to `ownedBlocks`.
  *
- * That population is a superset of what the live feed tracks. The feed fires only
- * on a commit or a received replica, whereas metadata is also written on a plain
- * pend: `BlockStorage.savePendingTransaction` seeds `{ latest: undefined, ranges: [] }`
- * for a block that has none before storing the pending transform, and every backend's
- * `listBlockIds` enumerates metadata keys. So a block whose only durable state is an
- * uncommitted pending transform IS seeded — see the NOTE below.
+ * That population is a superset of what the live feed tracks, because metadata is
+ * also written on a plain pend — see the NOTE on the function body for why the
+ * resulting over-inclusion is accepted.
  *
  * Called AFTER the live feed is already subscribed, so a block committed/replicated
  * mid-scan is independently caught by the feed; `Set.add` is idempotent, so the

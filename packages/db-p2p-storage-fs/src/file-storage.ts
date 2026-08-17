@@ -240,15 +240,19 @@ export class FileStoreDriver implements RawStoreDriver {
 		// so a stray file can't be mistaken for a block; `*.tmp` atomic-write orphans live inside
 		// block subdirs, never at basePath root, so the root is clean.
 		//
-		// A directory alone is NOT sufficient to call a block "durable owned": a block that was
-		// only PENDED (never committed) still creates `<blockId>/pend/` — hence a root directory
-		// entry — via atomicWriteFile's recursive mkdir, but has no meta.json. So we gate on
-		// meta.json existence: `meta.json` IS this backend's metadata store, and enumerating it
-		// yields exactly the blocks with a committed revision / persisted replica (the same
-		// "owned" population the live change feed tracks, and the same one the metadata-keyed
-		// backends — sqlite/leveldb/indexeddb — enumerate for free). Existence (fs.access), not
-		// parse, matches key-existence semantics: a torn/corrupt meta.json still counts as a key,
-		// exactly as a corrupt value would in the other backends.
+		// A directory alone is NOT sufficient: pending a transform straight through this driver
+		// creates `<blockId>/pend/` — hence a root directory entry — via atomicWriteFile's
+		// recursive mkdir, without writing meta.json. So we gate on meta.json existence:
+		// `meta.json` IS this backend's metadata store, so gating on it enumerates exactly the
+		// same population the metadata-keyed backends (sqlite/leveldb/indexeddb) get for free.
+		// That population is every block with ANY durable metadata — which on the node path
+		// INCLUDES a pend-only block, because `BlockStorage.savePendingTransaction` seeds
+		// metadata for a block that has none before storing the transform. Do not "improve" this
+		// into a committed-revision filter: reading and parsing every meta.json would turn a
+		// cheap access() sweep into a per-block read at startup (see the `listBlockIds` contract
+		// in i-raw-storage.ts). Existence (fs.access), not parse, matches key-existence
+		// semantics: a torn/corrupt meta.json still counts as a key, exactly as a corrupt value
+		// would in the other backends.
 		//
 		// ENOENT (basePath not created yet, or a dir without meta.json) maps to "not owned" —
 		// same discrimination as directoryByteSize. Any OTHER readdir/access error must surface:

@@ -48,7 +48,8 @@ async function collect<T>(iter: AsyncIterable<T>): Promise<T[]> {
  * behaviors the shared kernel makes parity-critical: clone-on-store/read (now
  * structural via the byte boundary), promote atomicity + the exact missing-pend
  * error, drain-before-yield iteration, and a `BlockStorage`-level slice that
- * guards the `meta.ranges` open-ended seeding invariant and tombstone read-back.
+ * guards the `meta.ranges` open-ended seeding invariant, tombstone read-back,
+ * and the exact id population `listBlockIds` yields on the node path.
  */
 export function runRawStorageConformance(
 	name: string,
@@ -356,7 +357,9 @@ export function runRawStorageConformance(
 			} else {
 				await storage.saveMetadata('b1' as BlockId, { ranges: [], latest: undefined });
 				await storage.saveMetadata('b2' as BlockId, { ranges: [], latest: undefined });
-				// Pended but never committed → no metadata → must not be enumerated.
+				// RAW-DRIVER LAYER: this pends straight through the driver, which writes no metadata, so
+				// the block is not enumerated. It is NOT the node's behavior — a pend through
+				// `BlockStorage` seeds metadata first, and IS enumerated. See the parity case below.
 				await storage.savePendingTransaction('pending-only' as BlockId, 'x' as ActionId, { delete: true });
 
 				const ids = new Set(await collect(listBlockIds.call(storage)));
@@ -394,6 +397,39 @@ export function runRawStorageConformance(
 
 			const got = await new BlockStorage(blockId, storage).getBlock();
 			expect(got?.block.header.id, 'committed block served').to.equal('parity-commit');
+		});
+
+		// The population `listBlockIds` really yields on the node path, pinned per backend. The startup
+		// owned-block seed (`seedOwnedBlocksFromStorage`) adds every enumerated id to the resilience
+		// monitors' tracked set, and `BlockStorage.savePendingTransaction` seeds metadata for a block
+		// that has none — so a pend-only block IS enumerated and IS seeded. The interface doc forbids
+		// filtering that out by reading each block's metadata (a per-block read at startup); this case
+		// is what stops a backend from "helpfully" adding such a filter.
+		it('listBlockIds enumerates a BlockStorage pend-only block (metadata seeded before the transform)', async function () {
+			const listBlockIds = storage.listBlockIds;
+			if (typeof listBlockIds !== 'function') {
+				this.skip();
+			} else {
+				const committed = 'parity-list-committed' as BlockId;
+				const pendOnly = 'parity-list-pend-only' as BlockId;
+				const repo = new StorageRepo((id) => new BlockStorage(id, storage));
+
+				await repo.pend({
+					actionId: 'a1' as ActionId,
+					transforms: makeInsertTransforms(committed, makeBlock('parity-list-committed', { items: [] })),
+					policy: 'c'
+				});
+				await repo.commit({ actionId: 'a1' as ActionId, blockIds: [committed], tailId: committed, rev: 1 });
+
+				await repo.pend({
+					actionId: 'a2' as ActionId,
+					transforms: makeInsertTransforms(pendOnly, makeBlock('parity-list-pend-only', { items: [] })),
+					policy: 'c'
+				});
+				expect(await storage.getMetadata(pendOnly), 'pend seeded metadata for a block that had none').to.exist;
+
+				expect(new Set(await collect(listBlockIds.call(storage)))).to.deep.equal(new Set([committed, pendOnly]));
+			}
 		});
 
 		it('BlockStorage saveReplica → saveDeletion reads the tombstoned rev back as undefined', async () => {

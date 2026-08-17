@@ -302,8 +302,11 @@ describe('FileRawStorage.listBlockIds', () => {
 	it('excludes a block that has only a pending transform (no metadata)', async () => {
 		const storage = new FileRawStorage(base);
 		await storage.saveMetadata('committed' as BlockId, meta(1));
-		// Pended but never committed → block dir exists (pend/ created by atomicWriteFile's
-		// recursive mkdir) but no meta.json → must not be enumerated.
+		// RAW-DRIVER LAYER: pending straight through the driver creates the block dir (pend/ via
+		// atomicWriteFile's recursive mkdir) but no meta.json, so the meta-gate excludes it. This is
+		// what proves the gate is meta.json and not directory-existence — it is NOT the node's
+		// behavior: a pend through `BlockStorage` seeds metadata first and IS enumerated (pinned for
+		// every backend by the shared conformance suite's `listBlockIds` parity case).
 		await storage.savePendingTransaction('pending-only' as BlockId, 'tx:x' as ActionId, { delete: true });
 
 		assert.deepStrictEqual(await collect(storage), new Set(['committed']));

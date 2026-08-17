@@ -51,17 +51,16 @@ describe('owned-block startup seed / node wiring (real libp2p, restart over dura
 		deletes: [],
 	});
 
-	async function pendCommit(repo: IRepo, blockId: string, collectionId: string, actionId: string, rev: number): Promise<void> {
-		const pend = await repo.pend({ actionId, transforms: makeTransforms(blockId, collectionId), policy: 'c' } as any);
-		expect(pend.success, `pend(${blockId})`).to.equal(true);
-		const commit = await repo.commit({ actionId, tailId: blockId as BlockId, rev, blockIds: [blockId as BlockId] } as any);
-		expect(commit.success, `commit(${blockId})`).to.equal(true);
-	}
-
 	/** Pend WITHOUT committing — the block gets durable metadata but never a committed revision. */
 	async function pendOnly(repo: IRepo, blockId: string, collectionId: string, actionId: string): Promise<void> {
-		const pend = await repo.pend({ actionId, transforms: makeTransforms(blockId, collectionId), policy: 'c' } as any);
+		const pend = await repo.pend({ actionId, transforms: makeTransforms(blockId, collectionId), policy: 'c' });
 		expect(pend.success, `pend(${blockId})`).to.equal(true);
+	}
+
+	async function pendCommit(repo: IRepo, blockId: string, collectionId: string, actionId: string, rev: number): Promise<void> {
+		await pendOnly(repo, blockId, collectionId, actionId);
+		const commit = await repo.commit({ actionId, tailId: blockId as BlockId, rev, blockIds: [blockId as BlockId] });
+		expect(commit.success, `commit(${blockId})`).to.equal(true);
 	}
 
 	async function spawn(networkName: string, overrides: Record<string, unknown> = {}): Promise<Libp2p> {
@@ -143,19 +142,15 @@ describe('owned-block startup seed / node wiring (real libp2p, restart over dura
 			const monitor = node2.spreadOnChurnMonitor;
 			expect(monitor, 'spread monitor wired on the restarted node').to.exist;
 
-			// The pend-only block IS seeded, and that is the truthful assertion — not an oversight:
-			// `BlockStorage.savePendingTransaction` writes `{ latest: undefined, ranges: [] }` metadata for a
-			// block that has none BEFORE storing the pending transform, and every backend's `listBlockIds`
-			// enumerates metadata keys. So a pend-only block has durable metadata and is enumerated.
-			// (`owned-block-seed.spec.ts`'s "pending-only excluded" case only differs because it calls
-			// `KvRawStorage.savePendingTransaction` directly, bypassing the layer that writes that metadata.)
+			// The pend-only block IS seeded, and that is the truthful assertion — not an oversight. Why, and
+			// why the over-inclusion is accepted, is the NOTE on `seedOwnedBlocksFromStorage`; the shared
+			// raw-storage conformance suite pins the same population per backend. Asserting the real
+			// behavior means a future change that starts filtering to committed-only fails loudly instead of
+			// silently altering what a restarted node protects.
 			//
-			// The over-inclusion is benign and self-correcting — `SpreadOnChurnMonitor.spreadCheck` untracks
-			// any tracked block whose `repo.get` returns no block, and `BlockTransferCoordinator` reports a
-			// no-local-data block as unconfirmed so it is never released. It is deterministic here because a
-			// solo node with no peers never runs a spread sweep during the test. Asserting the real behavior
-			// means a future change that starts filtering to committed-only fails loudly instead of silently
-			// altering what a restarted node protects.
+			// Deterministic here only because a solo node with no peers never runs a spread sweep during the
+			// test — `SpreadOnChurnMonitor` sweeps on `connection:close`, and its sweep is what would untrack
+			// a no-local-data block. An unconditional startup sweep would make this timing-dependent.
 			const expected = [...committed, pendOnlyId];
 			await waitForTrackedIds(monitor, expected, 'node2');
 			expect(trackedIds(monitor), 'restarted node tracks exactly the durable blocks, nothing more')
