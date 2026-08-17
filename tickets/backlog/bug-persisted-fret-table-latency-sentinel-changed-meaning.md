@@ -1,3 +1,6 @@
+RESOLVED — fixed directly rather than queued; see "Resolution" at the bottom. Kept in backlog only
+until the next tending pass files it to complete/.
+
 ----
 description: A saved snapshot of the peer table from before the FRET upgrade records "never measured this peer's speed" as the number zero. The upgraded FRET reads that same zero as "this peer answered instantly", so after upgrading, every remembered peer is briefly treated as the fastest peer on the network — skewing which peer we talk to first and which peers get evicted when the table is full.
 prereq:
@@ -61,12 +64,33 @@ changes were code-level and were resolved in that pass; this one changes the mea
 already on users' disks, so choosing among the options above — in particular whether to spend a
 persistence version bump — is a maintainer's call, not an implementer's.
 
-## TODO
+## Resolution
 
-- [ ] Decide among the three options above.
-- [ ] If option 1: bump `PersistedState.version` to 2, add the load-side rewrite for version-1
-      snapshots, and state in the code comment when the branch may be dropped.
-- [ ] Cover it: a version-1 snapshot with `avgLatencyMs: 0` must import as `null`; a version-2
-      snapshot with `avgLatencyMs: 0` must import as `0`.
-- [ ] Confirm against FRET whether `importTable` accepts `null` in that field on the way in (the
-      type says yes; the assertion is untested from this side).
+Maintainer's call: back-compat is not a constraint — this is a new system — so none of the three
+options above were taken. All three were shaped around preserving old snapshots, which is work
+nobody is owed.
+
+Implemented instead: a **compatibility fence**. `PERSISTED_STATE_VERSION` is now `2`, and
+`initFromPersistedState` discards any snapshot whose version differs rather than translating it.
+Nothing survives the discard — not the FRET table, not the high-water mark — because a foreign
+snapshot is cheap to replace (both are re-learned within a few stabilization ticks) and far cheaper
+than reasoning about what an older FRET meant by any given field. No migration code exists to carry
+forward, and the next incompatible change costs one integer.
+
+Correction to this ticket's original framing, recorded because it understated the severity: the
+skew is **not** merely transient.
+
+- `relevance.ts:85` gives `avgLatencyMs === null` a 0.5 penalty but a stale `0` a penalty of **0** —
+  the best possible score. Phantom peers therefore outrank every honestly measured peer, rather
+  than merely looking acceptable.
+- Recovery is an EMA at α=0.2, so a peer truly at 300 ms reads 60 ms after one ping, ~146 ms after
+  three, and needs **~11 pings** to come within 10% of the truth.
+- Relevance drives capacity eviction as well as next-hop preference, so a good peer evicted in
+  favour of a phantom during that window does not come back. That part never self-heals.
+
+Covered by `libp2p-key-network.spec.ts` — "discards a snapshot written by an older format instead
+of importing it", which asserts the defaults survive rather than the persisted values, proving the
+return happens ahead of both the FRET import and the isolated-session bump.
+
+The open question about whether FRET's `importTable` accepts `null` on the way in is now moot: no
+pre-2 table is ever handed to it.

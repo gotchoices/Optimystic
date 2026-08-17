@@ -9,6 +9,7 @@ import {
 	Libp2pKeyPeerNetwork,
 	FindCoordinatorError,
 	FIND_COORDINATOR_ERROR_CODES,
+	PERSISTED_STATE_VERSION,
 	type NetworkStatePersistence,
 	type PersistedNetworkState,
 	type SelfCoordinationConfig
@@ -131,7 +132,7 @@ describe('Libp2pKeyPeerNetwork', () => {
 			// network) both used to force the window open. Neither says a peer can arrive in
 			// the next 500ms; the empty FRET neighbourhood and empty dial queue say it cannot.
 			const persistence = new MemoryPersistence({
-				version: 1,
+				version: PERSISTED_STATE_VERSION,
 				networkHighWaterMark: 10,
 				lastConnectedTimestamp: Date.now() - 60000,
 				consecutiveIsolatedSessions: 0
@@ -160,9 +161,40 @@ describe('Libp2pKeyPeerNetwork', () => {
 			expect((network as any).networkHighWaterMark).to.equal(1);
 		});
 
+		it('discards a snapshot written by an older format instead of importing it', async () => {
+			// A pre-2 snapshot carries FRET entries whose `avgLatencyMs: 0` meant "never measured";
+			// current FRET reads that as a genuine 0 ms link, which outranks every measured peer for
+			// both routing and eviction. Discarding the whole snapshot is the contract — nothing
+			// from it may survive, not even the fields that would still parse.
+			const stale = {
+				version: 1,
+				networkHighWaterMark: 50,
+				lastConnectedTimestamp: Date.now() - 120000,
+				consecutiveIsolatedSessions: 2,
+				fretTable: {
+					v: 1, peerId: selfPeerId.toString(), timestamp: Date.now(),
+					entries: [{
+						id: 'peer-stale', coord: 'AAAA', relevance: 1, lastAccess: Date.now(),
+						state: 'disconnected' as const, accessCount: 1,
+						successCount: 1, failureCount: 0, avgLatencyMs: 0
+					}]
+				}
+			} as unknown as PersistedNetworkState;
+			const persistence = new MemoryPersistence(stale);
+			const libp2p = createMockLibp2p(selfPeerId);
+			const network = new Libp2pKeyPeerNetwork(libp2p, 16, undefined, 'forming', persistence);
+			await network.initFromPersistedState();
+
+			// Defaults, not the persisted values: HWM stays 1 and the isolated-session counter is
+			// untouched — proving we returned before the fretTable import as well as before the
+			// isolated-session bump that a HWM of 50 would otherwise have triggered.
+			expect((network as any).networkHighWaterMark).to.equal(1);
+			expect((network as any).consecutiveIsolatedSessions).to.equal(0);
+		});
+
 		it('restores HWM and consecutiveIsolatedSessions from persisted state', async () => {
 			const persistence = new MemoryPersistence({
-				version: 1,
+				version: PERSISTED_STATE_VERSION,
 				networkHighWaterMark: 50,
 				lastConnectedTimestamp: Date.now() - 120000,
 				consecutiveIsolatedSessions: 2
@@ -178,7 +210,7 @@ describe('Libp2pKeyPeerNetwork', () => {
 
 		it('increments consecutiveIsolatedSessions when HWM>1 but FRET table is empty', async () => {
 			const persistence = new MemoryPersistence({
-				version: 1,
+				version: PERSISTED_STATE_VERSION,
 				networkHighWaterMark: 5,
 				lastConnectedTimestamp: Date.now() - 60000,
 				consecutiveIsolatedSessions: 0,
@@ -193,7 +225,7 @@ describe('Libp2pKeyPeerNetwork', () => {
 
 		it('does not increment consecutiveIsolatedSessions when HWM<=1', async () => {
 			const persistence = new MemoryPersistence({
-				version: 1,
+				version: PERSISTED_STATE_VERSION,
 				networkHighWaterMark: 1,
 				lastConnectedTimestamp: Date.now() - 60000,
 				consecutiveIsolatedSessions: 0
@@ -213,7 +245,7 @@ describe('Libp2pKeyPeerNetwork', () => {
 				successCount: 1, failureCount: 0, avgLatencyMs: 10
 			});
 			const persistence = new MemoryPersistence({
-				version: 1,
+				version: PERSISTED_STATE_VERSION,
 				networkHighWaterMark: 10,
 				lastConnectedTimestamp: now - 60000,
 				consecutiveIsolatedSessions: 1,
@@ -243,7 +275,7 @@ describe('Libp2pKeyPeerNetwork', () => {
 
 		it('captures current state including HWM and sessions', async () => {
 			const persistence = new MemoryPersistence({
-				version: 1,
+				version: PERSISTED_STATE_VERSION,
 				networkHighWaterMark: 25,
 				lastConnectedTimestamp: Date.now() - 30000,
 				consecutiveIsolatedSessions: 1
@@ -259,7 +291,7 @@ describe('Libp2pKeyPeerNetwork', () => {
 			await waitFor(() => persistence.saved !== undefined, { description: 'the fire-and-forget persistState() save completed' });
 
 			expect(persistence.saved).to.not.be.undefined;
-			expect(persistence.saved!.version).to.equal(1);
+			expect(persistence.saved!.version).to.equal(PERSISTED_STATE_VERSION);
 			expect(persistence.saved!.networkHighWaterMark).to.equal(25);
 			// consecutiveIsolatedSessions was 1, incremented to 2 because HWM>1 and no FRET entries
 			expect(persistence.saved!.consecutiveIsolatedSessions).to.equal(2);
@@ -310,7 +342,7 @@ describe('Libp2pKeyPeerNetwork', () => {
 
 		it('allows after 3+ consecutive isolated sessions (HWM decay)', async () => {
 			const persistence = new MemoryPersistence({
-				version: 1,
+				version: PERSISTED_STATE_VERSION,
 				networkHighWaterMark: 50,
 				lastConnectedTimestamp: Date.now() - 300000,
 				consecutiveIsolatedSessions: 2 // will be incremented to 3 since HWM>1 and no FRET
@@ -328,7 +360,7 @@ describe('Libp2pKeyPeerNetwork', () => {
 
 		it('blocks when HWM>1 and only 1 isolated session (not enough decay)', async () => {
 			const persistence = new MemoryPersistence({
-				version: 1,
+				version: PERSISTED_STATE_VERSION,
 				networkHighWaterMark: 50,
 				lastConnectedTimestamp: Date.now(), // recently connected
 				consecutiveIsolatedSessions: 0 // will increment to 1
@@ -351,7 +383,7 @@ describe('Libp2pKeyPeerNetwork', () => {
 
 		it('marks a partition denial hard for a write and deferrable for a read', async () => {
 			const persistence = new MemoryPersistence({
-				version: 1,
+				version: PERSISTED_STATE_VERSION,
 				networkHighWaterMark: 10,
 				lastConnectedTimestamp: Date.now() - 10 * 60_000, // grace long elapsed
 				consecutiveIsolatedSessions: 0
@@ -379,7 +411,7 @@ describe('Libp2pKeyPeerNetwork', () => {
 
 		it('marks a suspicious-shrinkage denial hard for a write and deferrable for a read', async () => {
 			const persistence = new MemoryPersistence({
-				version: 1,
+				version: PERSISTED_STATE_VERSION,
 				networkHighWaterMark: 10,
 				lastConnectedTimestamp: Date.now() - 10 * 60_000, // grace long elapsed
 				consecutiveIsolatedSessions: 0
@@ -421,7 +453,7 @@ describe('Libp2pKeyPeerNetwork', () => {
 	describe('consecutiveIsolatedSessions reset on connection', () => {
 		it('resets to 0 when connections are observed', async () => {
 			const persistence = new MemoryPersistence({
-				version: 1,
+				version: PERSISTED_STATE_VERSION,
 				networkHighWaterMark: 10,
 				lastConnectedTimestamp: Date.now() - 60000,
 				consecutiveIsolatedSessions: 2
@@ -492,7 +524,7 @@ describe('Libp2pKeyPeerNetwork', () => {
 		it('throws NO_COORDINATOR_AVAILABLE (not self-exhausted) when HWM>1 and self excluded', async () => {
 			// Simulate a node that has seen a larger network (HWM > 1) but is currently isolated
 			const persistence = new MemoryPersistence({
-				version: 1,
+				version: PERSISTED_STATE_VERSION,
 				networkHighWaterMark: 10,
 				lastConnectedTimestamp: Date.now() - 10 * 60_000,
 				consecutiveIsolatedSessions: 3 // enough for hwm-decay
@@ -677,7 +709,7 @@ describe('Libp2pKeyPeerNetwork', () => {
 			// throwing. What is pinned here is that self cannot slip past a hard guard verdict
 			// merely by sitting in the key's FRET neighbourhood.
 			const persistence = new MemoryPersistence({
-				version: 1,
+				version: PERSISTED_STATE_VERSION,
 				networkHighWaterMark: 5,
 				lastConnectedTimestamp: Date.now() - 10 * 60_000, // grace long elapsed: the partition is the only denial
 				consecutiveIsolatedSessions: 0
@@ -796,7 +828,7 @@ describe('Libp2pKeyPeerNetwork', () => {
 			neighbors?: string[];
 		}) {
 			const persistence = new MemoryPersistence({
-				version: 1,
+				version: PERSISTED_STATE_VERSION,
 				networkHighWaterMark: options?.highWaterMark ?? 10,
 				lastConnectedTimestamp: Date.now() - 2_300,
 				consecutiveIsolatedSessions: 0
@@ -1380,7 +1412,7 @@ describe('Libp2pKeyPeerNetwork', () => {
 			const foreign = await makePeerId();
 			// HWM>1 so this is NOT the solo-bootstrap exhausted case
 			const persistence = new MemoryPersistence({
-				version: 1,
+				version: PERSISTED_STATE_VERSION,
 				networkHighWaterMark: 5,
 				lastConnectedTimestamp: Date.now(),
 				consecutiveIsolatedSessions: 0
@@ -1425,7 +1457,7 @@ describe('Libp2pKeyPeerNetwork', () => {
 			const crossNet = await makePeerId();
 			// HWM>1 so this is NOT the solo-bootstrap exhausted case
 			const persistence = new MemoryPersistence({
-				version: 1,
+				version: PERSISTED_STATE_VERSION,
 				networkHighWaterMark: 5,
 				lastConnectedTimestamp: Date.now(),
 				consecutiveIsolatedSessions: 0
@@ -1471,7 +1503,7 @@ describe('Libp2pKeyPeerNetwork', () => {
 			};
 			// HWM>1 so this is not the solo-bootstrap path; self excluded so it can't mask the flip.
 			const persistence = new MemoryPersistence({
-				version: 1,
+				version: PERSISTED_STATE_VERSION,
 				networkHighWaterMark: 5,
 				lastConnectedTimestamp: Date.now(),
 				consecutiveIsolatedSessions: 0

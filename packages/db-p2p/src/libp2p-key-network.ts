@@ -70,8 +70,22 @@ export class FindCoordinatorError extends Error {
 	}
 }
 
+/** Snapshot format this build writes and is willing to read. Bump on any incompatible change. */
+export const PERSISTED_STATE_VERSION = 2 as const;
+
+/**
+ * On-disk snapshot of what this node learned about the network last run.
+ *
+ * `version` is a compatibility fence, not a migration hook: a snapshot that does not carry
+ * `PERSISTED_STATE_VERSION` is discarded whole rather than translated. Version 2 exists because
+ * FRET 1.0.0-beta.1 made `SerializedPeerEntry.avgLatencyMs` nullable, where `null` means "never
+ * measured". Earlier FRET wrote `0` for that case, and 0 now reads as a genuine zero-millisecond
+ * round trip — the best possible score, ahead of every honestly measured peer. Since relevance
+ * drives next-hop preference *and* capacity eviction, importing such a table would both misroute
+ * and permanently evict good peers in favour of phantoms.
+ */
 export interface PersistedNetworkState {
-	version: 1;
+	version: typeof PERSISTED_STATE_VERSION;
 	networkHighWaterMark: number;
 	lastConnectedTimestamp: number;
 	consecutiveIsolatedSessions: number;
@@ -282,13 +296,21 @@ export class Libp2pKeyPeerNetwork implements IKeyNetwork, IPeerNetwork {
 		const state = await this.persistence.load();
 		if (!state) return;
 
+		// Discard, don't translate. A foreign-version snapshot is cheap to replace — the high-water
+		// mark and the peer table are both re-learned within a few stabilization ticks — and far
+		// cheaper than reasoning about what an older FRET meant by any given field.
+		if (state.version !== PERSISTED_STATE_VERSION) {
+			this.log('init:state-discarded version=%o want=%d', state.version, PERSISTED_STATE_VERSION);
+			return;
+		}
+
 		this.networkHighWaterMark = state.networkHighWaterMark;
 		this.lastConnectedTime = state.lastConnectedTimestamp;
 		this.consecutiveIsolatedSessions = state.consecutiveIsolatedSessions;
 
 		if (state.fretTable) {
 			try {
-				// Must be awaited: importTable is async as of FRET 0.7.0 and enforces capacity
+				// Must be awaited: importTable is async as of FRET 1.0.0-beta.1 and enforces capacity
 				// against the self ring coordinate it hashes on demand. Left floating, the restore
 				// races that enforcement against whatever runs next, and a rejection escapes this
 				// catch entirely rather than being logged as a skipped import.
@@ -376,7 +398,7 @@ export class Libp2pKeyPeerNetwork implements IKeyNetwork, IPeerNetwork {
 	private persistState(): void {
 		if (!this.persistence) return;
 		const state: PersistedNetworkState = {
-			version: 1,
+			version: PERSISTED_STATE_VERSION,
 			networkHighWaterMark: this.networkHighWaterMark,
 			lastConnectedTimestamp: this.lastConnectedTime,
 			consecutiveIsolatedSessions: this.consecutiveIsolatedSessions,
