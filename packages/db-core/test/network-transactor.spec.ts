@@ -1157,6 +1157,13 @@ describe('NetworkTransactor', () => {
      *
      * With both fail counts left at their default of 0 this is a pure call counter — which is
      * how the reachable peer in each test is instrumented. One class, both roles.
+     *
+     * NOTE: kept file-local, matching `PartialLossTransactor` / `MixedPendTransactor` in
+     * transaction.spec.ts. It is the throwing twin of the shared `FlakyCommitTransactor`
+     * (which RETURNS a stale failure), so the pair reads as duplication — but the two failure
+     * shapes drive genuinely different paths and only this spec needs the throwing one. If a
+     * third spec wants it, promote it into src/testing/test-transactor.ts alongside its twin
+     * rather than copying it again.
      */
     class FlakyTransportTransactor extends DelegatingTransactor {
       /** pend() calls observed, including the forced failures. */
@@ -1205,6 +1212,17 @@ describe('NetworkTransactor', () => {
           return t;
         },
       });
+
+    /** The single-block insert most tests here pend. */
+    const insertPend = (actionId: ActionId, blockId: BlockId): PendRequest => ({
+      actionId,
+      transforms: {
+        inserts: { [blockId]: { header: { id: blockId, type: 'block', collectionId: 'test' } } },
+        updates: {},
+        deletes: [],
+      },
+      policy: 'c',
+    });
 
     it('commit reuses pend\'s coordinator: each block resolved exactly once, no commit-time findCoordinator', async () => {
       const peerShared = 'peer-shared';
@@ -1266,15 +1284,7 @@ describe('NetworkTransactor', () => {
 
       // pend under actionA seeds the cache for the block.
       const actionA = generateRandomActionId();
-      await networkTransactor.pend({
-        actionId: actionA,
-        transforms: {
-          inserts: { [blockId]: { header: { id: blockId, type: 'block', collectionId: 'test' } } },
-          updates: {},
-          deletes: [],
-        },
-        policy: 'c',
-      });
+      await networkTransactor.pend(insertPend(actionA, blockId));
 
       // Committing the SAME block under a DIFFERENT actionId must NOT reuse actionA's entry —
       // it falls back to a live findCoordinator. (The commit itself fails, since the block was
@@ -1285,17 +1295,6 @@ describe('NetworkTransactor', () => {
         await networkTransactor.commit({ actionId: actionB, rev: 1, blockIds: [blockId], tailId: blockId });
       } catch { /* expected: block not pending under actionB */ }
       expect(net.findCoordinatorCalls).to.be.greaterThan(0);
-    });
-
-    /** The single-block insert every test below pends. */
-    const insertPend = (actionId: ActionId, blockId: BlockId): PendRequest => ({
-      actionId,
-      transforms: {
-        inserts: { [blockId]: { header: { id: blockId, type: 'block', collectionId: 'test' } } },
-        updates: {},
-        deletes: [],
-      },
-      policy: 'c',
     });
 
     it('caches the RETRY\'s coordinator, not the peer pend first tried', async () => {
@@ -1359,9 +1358,11 @@ describe('NetworkTransactor', () => {
       const commitResult = await networkTransactor.commit({ actionId, rev: 1, blockIds: [blockId], tailId: blockId });
       expect(commitResult.success).to.be.true;
 
-      // The commit's FIRST resolution came from the cache (zero calls at this point would be
-      // impossible if it had gone live); only the retry, which excludes the failed peer, did.
-      expect(net.findCoordinatorCalls, 'only the commit retry went live').to.be.greaterThan(0);
+      // EXACTLY one live lookup: the retry's. `greaterThan(0)` would not do — the commit's
+      // initial resolution going live too would give 2, and that is precisely the broken-cache
+      // case this test exists to exclude.
+      expect(net.findCoordinatorCalls, 'the initial resolution came from the cache; only the retry went live')
+        .to.equal(1);
       expect(net.findCoordinatorExclusions.some(ex => ex.includes(peerA)),
         'the live lookup was the retry\'s, carrying the failed peer as an exclusion').to.be.true;
       expect(deadCommitA.commitCalls, 'the dead cached peer was tried once, not looped on').to.equal(1);
@@ -1407,6 +1408,13 @@ describe('NetworkTransactor', () => {
       // is by peer id string.
       const commitResult = await networkTransactor.commit({ actionId, rev: 1, blockIds: [tailId, blockId2, blockId3], tailId });
       expect(commitResult.success).to.be.true;
+
+      // Both commit rounds opened from the CACHE, so only their retries resolved live: one
+      // lookup for the tail's retry, two for the remainder's (one per re-homed block). Pinning
+      // the exact number is what rules out a commit that ignored the cache and resolved every
+      // round live — that case double-counts here and would slip past a `greaterThan(0)`.
+      expect(net.findCoordinatorCalls, 'only the two retries went live, never the initial rounds')
+        .to.equal(3);
 
       // Two dead dials: one for the tail round, one for the remainder round. A reference
       // comparison would let block-3 re-resolve to the dead peer and add a third.
