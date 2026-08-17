@@ -39,11 +39,18 @@ export interface IRawStorage {
 	getApproximateBytesUsed?(): Promise<number>;
 
 	/**
-	 * Enumerate the block ids that currently have durable state in this backend
-	 * (one id per block that has committed/replicated metadata). Used at node
-	 * startup to seed the resilience monitors' owned-block tracked set from blocks
-	 * already on disk from a previous run, so churn-spread / rebalance protection
-	 * covers them without waiting for each to be touched again.
+	 * Enumerate the block ids that currently have durable state in this backend —
+	 * one id per block with ANY durable metadata. That includes a block whose only
+	 * durable state is an uncommitted pending transform, since
+	 * `BlockStorage.savePendingTransaction` writes metadata for a block that has none
+	 * before storing the transform. Implementations enumerate metadata keys only; they
+	 * must NOT read or decode each block's metadata to filter by committed revision
+	 * (that would turn a cheap key scan into a per-block read).
+	 *
+	 * Used at node startup to seed the resilience monitors' owned-block tracked set
+	 * from blocks already on disk from a previous run, so churn-spread / rebalance
+	 * protection covers them without waiting for each to be touched again. See the
+	 * NOTE in `seedOwnedBlocksFromStorage` for why the over-inclusion is accepted.
 	 *
 	 * Streamed (AsyncIterable) so a large store does not force the whole id list
 	 * into memory at once. Order is unspecified. Optional: a backend that omits it

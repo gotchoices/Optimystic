@@ -25,6 +25,10 @@ describe('seedOwnedBlocksFromStorage', () => {
 		expect(ownedBlocks).to.deep.equal(new Set(['b1', 'b2', 'b3']));
 	});
 
+	// RAW-STORAGE LAYER ONLY. This calls `KvRawStorage.savePendingTransaction` directly, which writes no
+	// metadata. On the real node path a pend goes through `BlockStorage.savePendingTransaction`, which
+	// seeds metadata for a block that has none — so a pend-only block IS enumerated and IS seeded there.
+	// That (accepted) behavior is asserted in `owned-block-seed-node-wiring.spec.ts`; the two specs agree.
 	it('excludes a pending-only block (no metadata → not enumerated)', async () => {
 		const storage = new MemoryRawStorage();
 		await populate(storage, ['committed']);

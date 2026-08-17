@@ -9,9 +9,15 @@ import type { IRawStorage } from './storage/i-raw-storage.js';
  * block that was already durable on disk from a previous run is not tracked
  * after a restart until it happens to be committed or replicated again — a
  * freshly restarted node would under-protect exactly the data it already holds.
- * This scan closes that gap by enumerating the metadata store (one id per block
- * with a committed revision or persisted replica — the same population the live
- * feed tracks) and adding each id to `ownedBlocks`.
+ * This scan closes that gap by enumerating the metadata store — one id per block
+ * with ANY durable metadata — and adding each id to `ownedBlocks`.
+ *
+ * That population is a superset of what the live feed tracks. The feed fires only
+ * on a commit or a received replica, whereas metadata is also written on a plain
+ * pend: `BlockStorage.savePendingTransaction` seeds `{ latest: undefined, ranges: [] }`
+ * for a block that has none before storing the pending transform, and every backend's
+ * `listBlockIds` enumerates metadata keys. So a block whose only durable state is an
+ * uncommitted pending transform IS seeded — see the NOTE below.
  *
  * Called AFTER the live feed is already subscribed, so a block committed/replicated
  * mid-scan is independently caught by the feed; `Set.add` is idempotent, so the
@@ -30,6 +36,16 @@ export async function seedOwnedBlocksFromStorage(
 	isStopping: () => boolean,
 	yieldEvery = 1000,
 ): Promise<void> {
+	// NOTE: accepted over-inclusion — this seeds pend-only blocks (metadata exists, no committed
+	// revision) alongside committed/replicated ones. Filtering to committed-only would mean reading and
+	// decoding metadata for every id at startup — a per-block read on the fs backend, exactly the cost
+	// the streamed key enumeration exists to avoid. It is benign today because every consumer of the
+	// shared set re-checks local data before acting: `SpreadOnChurnMonitor.spreadCheck` untracks a
+	// tracked block whose `repo.get` returns nothing, and `BlockTransferCoordinator.confirmReplicated`
+	// reports a no-local-data block as unconfirmed, so it is never released and never becomes
+	// GC-eligible. REVISIT IF any consumer of the shared owned-block set ever takes a destructive or
+	// irreversible action keyed on membership alone, without a local-data check — then this scan must
+	// filter to committed blocks. Asserted as-is by `test/owned-block-seed-node-wiring.spec.ts`.
 	if (typeof rawStorage.listBlockIds !== 'function') return;
 	let n = 0;
 	for await (const blockId of rawStorage.listBlockIds()) {
