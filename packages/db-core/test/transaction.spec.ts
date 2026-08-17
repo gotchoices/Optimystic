@@ -23,6 +23,11 @@ import {
 	TransactionSession,
 	TransactionValidator,
 	Tree,
+	Collection,
+	type Action,
+	type ActionHandler,
+	type BlockStore,
+	type CollectionInitOptions,
 	type Transaction,
 	type ITransactionEngine,
 	type ExecutionResult,
@@ -47,7 +52,13 @@ import {
 	type ActionBlocks,
 	type BlockActionStatus,
 } from '../src/index.js';
-import { TestTransactor, FlakyCommitTransactor } from '../src/testing/test-transactor.js';
+import {
+	TestTransactor,
+	FlakyCommitTransactor,
+	CompetingWriterTransactor,
+	commitRivalTreeWrite,
+	type CompetingWriterOptions,
+} from '../src/testing/test-transactor.js';
 import { waitFor } from '../src/testing/async-wait.js';
 
 /**
@@ -4192,13 +4203,30 @@ describe('Transaction', () => {
 			}
 		}
 
-		async function makeMultiCollection(transactor: ITransactor) {
+		/**
+		 * Users + posts trees registered in one coordinator, with a single two-collection
+		 * transaction already staged.
+		 *
+		 * `extraCollectionIds` registers ADDITIONAL trees that the transaction never touches — used
+		 * to cover commit()'s blanket refresh, which calls update() on every registered collection
+		 * between retries, not just the participants. Each id must ALREADY have committed state in
+		 * storage, otherwise `createOrOpen` invents it and its staged header/root transforms make it
+		 * a participant after all.
+		 */
+		async function makeMultiCollection(transactor: ITransactor, extraCollectionIds: string[] = []) {
 			const usersTree = await Tree.createOrOpen<number, UserEntry>(transactor, 'users', e => e.key);
 			const postsTree = await Tree.createOrOpen<number, PostEntry>(transactor, 'posts', e => e.key);
 			const collections = new Map<string, any>([
 				['users', (usersTree as unknown as { collection: any }).collection],
 				['posts', (postsTree as unknown as { collection: any }).collection],
 			]);
+			const extras = new Map<string, Tree<number, UserEntry>>();
+			for (const id of extraCollectionIds) {
+				const extra = await Tree.createOrOpen<number, UserEntry>(transactor, id, e => e.key);
+				expect(extra.hasUnsyncedChanges(), `extra collection '${id}' must already exist in storage`).to.be.false;
+				collections.set(id, extra.getCollection());
+				extras.set(id, extra);
+			}
 			const coordinator = new TransactionCoordinator(transactor, collections);
 			const actions: CollectionActions[] = [
 				{ collectionId: 'users', actions: [{ type: 'replace', data: [[1, { key: 1, name: 'Alice' }]] }] },
@@ -4211,7 +4239,32 @@ describe('Transaction', () => {
 				id: await createTransactionId(stamp.id, statements, []),
 			};
 			await coordinator.applyActions(actions, stamp.id);
-			return { coordinator, usersTree, postsTree, transaction };
+			return { coordinator, usersTree, postsTree, transaction, extras };
+		}
+
+		/** Every action recorded in a collection's committed log, oldest first. One entry per
+		 *  landed transaction, so the length is the no-duplicate-log-entry assertion. */
+		async function logActions<T>(collection: Collection<T>): Promise<Action<T>[]> {
+			const out: Action<T>[] = [];
+			for await (const action of collection.selectLog()) out.push(action);
+			return out;
+		}
+
+		/** Fire the rival on the pend that carries any of `blockIds`. Keyed on block ids rather
+		 *  than on pend call ORDER, which would depend on pendPhase's fan-out over the collection
+		 *  map's insertion order. The set is populated after the transaction is staged, so pass a
+		 *  live Set and add to it (do not reassign — the closure captures this instance). */
+		const onPendTouching = (blockIds: Set<BlockId>): CompetingWriterOptions => ({
+			when: request => blockIdsForTransforms(request.transforms).some(id => blockIds.has(id)),
+		});
+
+		/** Copy a collection's staged block ids into `into`, so {@link onPendTouching} can key on
+		 *  them. Reads updates as well as inserts — an ALREADY-EXISTING collection's transforms
+		 *  carry no insert to read a collection id off of. */
+		function captureStagedBlockIds(collection: Collection<any>, into: Set<BlockId>): Set<BlockId> {
+			for (const id of blockIdsForTransforms(collection.tracker.transforms)) into.add(id);
+			expect(into.size, 'the staged transaction has block ids to key the interception on').to.be.greaterThan(0);
+			return into;
 		}
 
 		it('clean multi-collection stale loss backs off, re-reads, then commits (bounded attempts)', async () => {
@@ -4370,6 +4423,274 @@ describe('Transaction', () => {
 			expect(err).to.be.instanceOf(CoordinatorStaleLossError);
 			// Stopped by the wall-clock deadline, not the (unreachable) attempt cap.
 			expect(flaky.commitAttempts, 'deadline halted retries well below the attempt cap').to.be.lessThan(1_000_000);
+		});
+
+		// ── Retry against a REAL competing writer ───────────────────────────────────────────────
+		//
+		// Every case above fakes the rival: FlakyCommitTransactor returns a stale failure WITHOUT
+		// advancing any block's revision, so "lose the race, recover, win" is really "the obstacle
+		// vanished". The cases below use CompetingWriterTransactor, which runs an actual second
+		// writer to a durable commit before delegating the intercepted pend — so the loser takes a
+		// genuine optimistic-concurrency loss and has to observe the newer revision, re-apply its
+		// work on top of it, and land without dropping either side's update.
+		//
+		// The mechanics being locked in (read off coordinator.ts / collection.ts):
+		//  1. the rival commits on 'users' at revision N;
+		//  2. the loser's 'users' pend still asks for N (getNextRev is stale), so TestTransactor.pend
+		//     returns { success:false, conflict:true, missing };
+		//  3. pendCollection wraps that as PendRejectedError(conflict), 'posts' pends fine and is then
+		//     cancelled — classification is anyConflict && !anyHard, a clean stale loss;
+		//  4. commitOnce restores every tracker from its pre-append snapshot and throws
+		//     CoordinatorStaleLossError;
+		//  5. commit() backs off, calls update() on every registered collection; updateInternal reads
+		//     the rival's log entry, clears its block ids from the read cache, sees the tracker
+		//     conflict, advances the action context and calls replayActions();
+		//  6. attempt 2 pends at N+1 and commits.
+
+		it('a REAL competing commit forces a rebase: non-overlapping keys both survive the retry', async () => {
+			const inner = new TestTransactor();
+			const usersBlockIds = new Set<BlockId>();
+			const transactor = new CompetingWriterTransactor(
+				inner,
+				// Rival writes users key 2; the transaction under test writes users key 1. In a tree
+				// this small both keys live in the SAME leaf block, so this is "non-overlapping at the
+				// key level" — the block-level conflict is exactly what forces the replay.
+				unwrapped => commitRivalTreeWrite<number, UserEntry>(
+					unwrapped, 'users', e => e.key, [[2, { key: 2, name: 'Rival' }]]),
+				onPendTouching(usersBlockIds),
+			);
+			const { coordinator, usersTree, postsTree, transaction } = await makeMultiCollection(transactor);
+			const usersCollection = usersTree.getCollection();
+			captureStagedBlockIds(usersCollection, usersBlockIds);
+
+			let err: unknown;
+			try {
+				await coordinator.commit(transaction, {
+					maxAttempts: 4, baseBackoffMs: 1, maxBackoffMs: 5, deadlineMs: 4000,
+				});
+			} catch (e) {
+				err = e;
+			}
+
+			// The loss happened in PEND, so 'posts' was cancelled and nothing was durable — a partial
+			// landing is impossible here. If a future change moves the loss into the commit phase this
+			// case silently becomes a partial landing, and this assertion is what notices.
+			expect(err, 'a pend-phase loss lands nothing, partially or otherwise').to.be.undefined;
+
+			// The rival really ran, exactly once, on the 'users' pend.
+			expect(transactor.firedAtCall, 'the competing writer fired').to.not.be.undefined;
+			// Bounded: attempt 1 pends users + posts (users loses), attempt 2 pends both and wins.
+			expect(transactor.pendCalls, 'one losing pend round then one winning round').to.equal(4);
+			// Attempt 1 never reached COMMIT (the pend failed), so only attempt 2's two commits.
+			expect(transactor.commitCalls, 'only the winning attempt committed').to.equal(2);
+
+			// Both writers' data is present, read back through the loser's own trees...
+			expect(await usersTree.get(1), "the loser's write landed").to.deep.equal({ key: 1, name: 'Alice' });
+			expect(await usersTree.get(2), "the rival's write was not lost").to.deep.equal({ key: 2, name: 'Rival' });
+			expect(await postsTree.get(100)).to.deep.equal({ key: 100, userId: 1, title: 'First' });
+
+			// ...and through a FRESH reader that shares nothing with either writer's caches.
+			const fresh = await Tree.createOrOpen<number, UserEntry>(inner, 'users', e => e.key);
+			expect(await fresh.get(1), 'durable state agrees: loser').to.deep.equal({ key: 1, name: 'Alice' });
+			expect(await fresh.get(2), 'durable state agrees: rival').to.deep.equal({ key: 2, name: 'Rival' });
+
+			// Two distinct durable actions: the rival's, and this transaction's — landed exactly once.
+			const committed = inner.getCommittedActions();
+			expect(committed.size, 'rival + transaction, nothing else').to.equal(2);
+			expect(committed.has(transaction.id), 'the transaction is durable under its own id').to.be.true;
+
+			// No duplicate log entry on the winning attempt: the users log holds one action per writer.
+			const usersLog = await logActions(usersCollection);
+			expect(usersLog, 'one log action for the rival, one for the retried transaction').to.have.lengthOf(2);
+			expect(usersLog.map(a => a.data), 'both writes are in the log, rival first')
+				.to.deep.equal([[[2, { key: 2, name: 'Rival' }]], [[1, { key: 1, name: 'Alice' }]]]);
+			// 'posts' never lost and never re-appended: exactly one entry.
+			expect(await logActions(postsTree.getCollection()), 'posts committed once').to.have.lengthOf(1);
+		});
+
+		it('an OVERLAPPING key rebases last-write-wins without erasing the rival from the log', async () => {
+			const inner = new TestTransactor();
+			const usersBlockIds = new Set<BlockId>();
+			const transactor = new CompetingWriterTransactor(
+				inner,
+				// Both writers target users key 1.
+				unwrapped => commitRivalTreeWrite<number, UserEntry>(
+					unwrapped, 'users', e => e.key, [[1, { key: 1, name: 'Rival' }]]),
+				onPendTouching(usersBlockIds),
+			);
+			const { coordinator, usersTree, transaction } = await makeMultiCollection(transactor);
+			const usersCollection = usersTree.getCollection();
+			captureStagedBlockIds(usersCollection, usersBlockIds);
+
+			await coordinator.commit(transaction, {
+				maxAttempts: 4, baseBackoffMs: 1, maxBackoffMs: 5, deadlineMs: 4000,
+			});
+
+			expect(transactor.firedAtCall, 'the competing writer fired').to.not.be.undefined;
+
+			// The rebased loser replays OVER the rival's committed base, so its value wins the key.
+			expect(await usersTree.get(1), 'the replayed write is the surviving value')
+				.to.deep.equal({ key: 1, name: 'Alice' });
+			const fresh = await Tree.createOrOpen<number, UserEntry>(inner, 'users', e => e.key);
+			expect(await fresh.get(1), 'durable state agrees').to.deep.equal({ key: 1, name: 'Alice' });
+
+			// Lost-update guard, both directions: the rival's commit must not be silently erased from
+			// the log, and the loser's must not be silently dropped.
+			const usersLog = await logActions(usersCollection);
+			expect(usersLog.map(a => a.data), 'both actions survive in order')
+				.to.deep.equal([[[1, { key: 1, name: 'Rival' }]], [[1, { key: 1, name: 'Alice' }]]]);
+			expect(inner.getCommittedActions().has(transaction.id), 'the transaction is durable').to.be.true;
+		});
+
+		it("the retry's blanket refresh of a registered-but-untouched collection is a harmless no-op", async () => {
+			const inner = new TestTransactor();
+			// commit() calls update() on EVERY registered collection between retries, not only the
+			// transaction's participants (see the NOTE at coordinator.ts's refresh loop). Give 'audit'
+			// real committed state on the RAW transactor first, so the tree registered below opens with
+			// an empty tracker and is genuinely a non-participant.
+			await commitRivalTreeWrite<number, UserEntry>(
+				inner, 'audit', e => e.key, [[9, { key: 9, name: 'Audit' }]]);
+
+			const usersBlockIds = new Set<BlockId>();
+			const transactor = new CompetingWriterTransactor(
+				inner,
+				unwrapped => commitRivalTreeWrite<number, UserEntry>(
+					unwrapped, 'users', e => e.key, [[2, { key: 2, name: 'Rival' }]]),
+				onPendTouching(usersBlockIds),
+			);
+			const { coordinator, usersTree, postsTree, transaction, extras } =
+				await makeMultiCollection(transactor, ['audit']);
+			captureStagedBlockIds(usersTree.getCollection(), usersBlockIds);
+
+			// A CollectionHeaderVanishedError (or any other throw) out of the untouched collection's
+			// update() would abort an otherwise healthy retry.
+			await coordinator.commit(transaction, {
+				maxAttempts: 4, baseBackoffMs: 1, maxBackoffMs: 5, deadlineMs: 4000,
+			});
+
+			expect(transactor.firedAtCall, 'the retry actually happened').to.not.be.undefined;
+			expect(await usersTree.get(1)).to.deep.equal({ key: 1, name: 'Alice' });
+			expect(await postsTree.get(100)).to.deep.equal({ key: 100, userId: 1, title: 'First' });
+
+			// The refreshed non-participant is untouched: same value, and no entry was appended to it.
+			const auditTree = extras.get('audit')!;
+			expect(await auditTree.get(9), 'the untouched collection still reads its own value')
+				.to.deep.equal({ key: 9, name: 'Audit' });
+			expect(await logActions(auditTree.getCollection()), 'no log entry was appended to it')
+				.to.have.lengthOf(1);
+		});
+
+		// filterConflict is the OTHER half of the rebase: the block-level conflict path above always
+		// replays every pending action verbatim, because Tree supplies no filterConflict hook (nothing
+		// in src/ sets one). These cases build a raw Collection with a recording hook and drive the
+		// same real-rival interception through a coordinator retry, so the hook's three answers —
+		// keep, replace, discard — are each proven to decide what actually commits.
+		describe('filterConflict during a coordinator retry', () => {
+			type ConflictAction = { value: string };
+			const conflictCollectionId = 'conflicts';
+
+			// Each action inserts one fresh block, so a kept/replaced action leaves a durable trace and
+			// a discarded one leaves none.
+			const conflictHandlers: Record<string, ActionHandler<ConflictAction>> = {
+				set: async (_action, store) => {
+					store.insert({ header: store.createBlockHeader('TEST', store.generateId()) });
+				},
+			};
+			const conflictInit = (
+				filterConflict?: CollectionInitOptions<ConflictAction>['filterConflict'],
+			): CollectionInitOptions<ConflictAction> => ({
+				modules: conflictHandlers,
+				createHeaderBlock: (id: BlockId, store: BlockStore<IBlock>) => ({
+					header: store.createBlockHeader('TEST', id),
+				}),
+				...(filterConflict ? { filterConflict } : {}),
+			});
+
+			/** A second Collection over the same id, committing 'rival' through the single-collection
+			 *  sync path — the raw-Collection analogue of {@link commitRivalTreeWrite}. */
+			const rivalCollectionWrite = async (unwrapped: ITransactor) => {
+				const rival = await Collection.createOrOpen<ConflictAction>(
+					unwrapped, conflictCollectionId, conflictInit());
+				await rival.act({ type: 'set', data: { value: 'rival' } });
+				await rival.updateAndSync();
+			};
+
+			/** Stage one 'local' action into a filterConflict-bearing collection registered in a
+			 *  coordinator, with a real rival armed to fire on its pend. Single collection, so the
+			 *  default first-pend trigger is unambiguous. */
+			async function makeConflictSetup(
+				filterConflict: CollectionInitOptions<ConflictAction>['filterConflict'],
+			) {
+				const inner = new TestTransactor();
+				const transactor = new CompetingWriterTransactor(inner, rivalCollectionWrite);
+				const collection = await Collection.createOrOpen<ConflictAction>(
+					transactor, conflictCollectionId, conflictInit(filterConflict));
+				const collections = new Map<string, any>([[conflictCollectionId, collection]]);
+				const coordinator = new TransactionCoordinator(transactor, collections);
+				const actions: CollectionActions[] = [
+					{ collectionId: conflictCollectionId, actions: [{ type: 'set', data: { value: 'local' } }] },
+				];
+				const statements = createActionsStatements(actions);
+				const stamp = await createTransactionStamp('peer1', Date.now(), 'schema1', ACTIONS_ENGINE_ID);
+				const transaction: Transaction = {
+					stamp, statements, reads: [], id: await createTransactionId(stamp.id, statements, []),
+				};
+				await coordinator.applyActions(actions, stamp.id);
+				return { inner, transactor, collection, coordinator, transaction };
+			}
+
+			const retryOptions = { maxAttempts: 4, baseBackoffMs: 1, maxBackoffMs: 5, deadlineMs: 4000 };
+
+			it('is called with the rival\'s actions as `potential`, and KEEPING commits both', async () => {
+				const seen: { value: string; potential: string[] }[] = [];
+				const { inner, transactor, collection, coordinator, transaction } = await makeConflictSetup(
+					(action: Action<ConflictAction>, potential: Action<ConflictAction>[]) => {
+						seen.push({ value: action.data.value, potential: potential.map(p => p.data.value) });
+						return action; // same instance => keep as-is
+					});
+
+				await coordinator.commit(transaction, retryOptions);
+
+				expect(transactor.firedAtCall, 'the competing writer fired').to.equal(1);
+				// The hook saw the local action paired with the rival's committed action.
+				expect(seen, 'hook invoked once, with the rival as `potential`')
+					.to.deep.equal([{ value: 'local', potential: ['rival'] }]);
+				// Keeping the action means both writers' actions are durable.
+				expect((await logActions(collection)).map(a => a.data.value)).to.deep.equal(['rival', 'local']);
+				expect(inner.getCommittedActions().has(transaction.id), 'the kept action committed').to.be.true;
+			});
+
+			it('REPLACING commits the replacement action instead of the original', async () => {
+				const { inner, collection, coordinator, transaction } = await makeConflictSetup(
+					(action: Action<ConflictAction>) => action.data.value === 'local'
+						// A NEW instance => the contract's "replace"; updateInternal detects the identity
+						// change and forces a replay so the replacement is what gets staged.
+						? { type: 'set', data: { value: 'merged' } }
+						: action);
+
+				await coordinator.commit(transaction, retryOptions);
+
+				const values = (await logActions(collection)).map(a => a.data.value);
+				expect(values, 'the replacement is what committed').to.deep.equal(['rival', 'merged']);
+				expect(values, 'the original was not also committed').to.not.include('local');
+				expect(inner.getCommittedActions().has(transaction.id), 'the replacement committed under the tx id').to.be.true;
+			});
+
+			it('DISCARDING leaves nothing of the losing write behind', async () => {
+				const { inner, transactor, collection, coordinator, transaction } =
+					await makeConflictSetup(() => undefined);
+
+				// Discarding empties the pending queue, so the replay stages nothing and the retry's
+				// commitOnce finds no collection with transforms — it returns without committing.
+				await coordinator.commit(transaction, retryOptions);
+
+				expect(transactor.firedAtCall, 'the competing writer fired').to.equal(1);
+				expect((await logActions(collection)).map(a => a.data.value), 'only the rival is in the log')
+					.to.deep.equal(['rival']);
+				const committed = inner.getCommittedActions();
+				expect(committed.size, "only the rival's action is durable").to.equal(1);
+				expect(committed.has(transaction.id), 'the discarded transaction never committed').to.be.false;
+			});
 		});
 	});
 

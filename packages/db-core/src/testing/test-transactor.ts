@@ -1,7 +1,9 @@
-import type { ITransactor, GetBlockResults, ActionBlocks, BlockActionStatus, PendResult, CommitResult, PendRequest, BlockId, CommitRequest, BlockGets, IBlock, ActionId, ActionTransforms, Transform, Transforms, ClusterNomineesResult } from "../index.js";
+import type { ITransactor, GetBlockResults, ActionBlocks, BlockActionStatus, PendResult, CommitResult, PendRequest, BlockId, CommitRequest, BlockGets, IBlock, ActionId, ActionTransforms, Transform, Transforms, ClusterNomineesResult, CollectionId } from "../index.js";
 import { ensuredMap } from "../utility/ensured.js";
 import { Latches } from "../utility/latches.js";
 import { applyTransform, blockIdsForTransforms, transformForBlockId, emptyTransforms, concatTransform, transformsFromTransform } from "../transform/index.js";
+import { Tree } from "../collections/tree/tree.js";
+import type { TreeReplaceAction } from "../collections/tree/struct.js";
 
 type RevisionNumber = number;
 
@@ -463,6 +465,113 @@ export class FlakyCommitTransactor implements ITransactor {
 		}
 		return this.inner.commit(request);
 	}
+}
+
+/** A competing writer: a real write driven against the UNWRAPPED transactor, so its own
+ *  pend/commit calls are invisible to {@link CompetingWriterTransactor}'s counters and cannot
+ *  re-trigger the interception. See {@link commitRivalTreeWrite} for the usual implementation. */
+export type RivalWrite = (inner: ITransactor) => Promise<void>;
+
+export type CompetingWriterOptions = {
+	/** Fires on the first pend whose request satisfies this predicate. `callIndex` is 1-based over
+	 *  ALL pend calls seen (not only matching ones). Default: fire on the first pend call. */
+	when?: (request: PendRequest, callIndex: number) => boolean;
+};
+
+/**
+ * Wraps a {@link TestTransactor} and, exactly once, runs a real competing writer to completion
+ * BEFORE delegating the intercepted pend. The rival durably commits (real log entry, real
+ * revision bump), so the delegated pend then fails as a GENUINE optimistic-concurrency loss —
+ * nothing is forced or faked, unlike {@link FlakyCommitTransactor}, which returns a stale failure
+ * without ever advancing a block's revision.
+ *
+ * That distinction is the whole point: only a rival that actually landed can prove the loser
+ * OBSERVED a newer revision, re-applied its work on top of it, and did not lose an update.
+ *
+ * Two deliberate design constraints:
+ *
+ * 1. **The trigger is on PEND, and there is no commit trigger.** The rival is a real
+ *    Collection/Tree, so its write pends with policy `'r'` (see `TransactorSource.transact`), and
+ *    {@link TestTransactor.pend} rejects a pend whose blocks already carry a *pending* action.
+ *    Firing before the loser's pend delegates means the loser has pended nothing yet, so the
+ *    rival pends and commits cleanly and the loser's delegated pend then fails with `missing` — a
+ *    real conflict. Firing at COMMIT time instead would leave the loser already pending on the
+ *    shared log-tail block, so the rival's own pend would collide with it and spin through its
+ *    sync retry budget (~10 attempts, ~21s) while the loser sits awaiting the rival inside its
+ *    own commit: a livelock dressed up as a slow test. Do not add a commit trigger.
+ *
+ * 2. **The rival runs before delegation, never inside {@link TestTransactor}'s critical section.**
+ *    `TestTransactor.get`/`commit` hold per-block latches (`TestTransactor.commit:${blockId}`), and
+ *    those latch keys are process-global — a rival invoked from inside one of them would
+ *    self-deadlock on its own reads. Intercepting here in the wrapper, before
+ *    `await this.inner.pend(...)`, is outside every such section.
+ */
+export class CompetingWriterTransactor implements ITransactor {
+	/** Pend calls observed (including the intercepted one). */
+	pendCalls = 0;
+	/** Commit calls observed. */
+	commitCalls = 0;
+	/** The 1-based pend call index the rival fired on; undefined if it never fired. */
+	firedAtCall?: number;
+	/** Latched so the rival fires at most once — otherwise the retry's pend would re-trigger it
+	 *  and the transaction under test could never win. */
+	private fired = false;
+
+	constructor(
+		private readonly inner: TestTransactor,
+		private readonly rival: RivalWrite,
+		private readonly options?: CompetingWriterOptions,
+	) {}
+
+	get(b: BlockGets): Promise<GetBlockResults> { return this.inner.get(b); }
+	getStatus(a: ActionBlocks[]): Promise<BlockActionStatus[]> { return this.inner.getStatus(a); }
+	cancel(a: ActionBlocks): Promise<void> { return this.inner.cancel(a); }
+
+	async pend(request: PendRequest): Promise<PendResult> {
+		// Increment synchronously, before any await, so call indexes reflect the caller's fan-out
+		// order rather than scheduling order.
+		const callIndex = ++this.pendCalls;
+		const matches = this.options?.when
+			? this.options.when(request, callIndex)
+			: callIndex === 1;
+		if (!this.fired && matches) {
+			this.fired = true;
+			this.firedAtCall = callIndex;
+			await this.rival(this.inner);
+		}
+		return this.inner.pend(request);
+	}
+
+	async commit(request: CommitRequest): Promise<CommitResult> {
+		this.commitCalls++;
+		return this.inner.commit(request);
+	}
+}
+
+/**
+ * Durably commit a conflicting change to a tree collection: opens a SECOND {@link Tree} over the
+ * same transactor + collection id and replaces `entries` through it, producing a real log entry
+ * and a real revision bump — the durable competitor a {@link CompetingWriterTransactor} needs.
+ *
+ * `Tree.replace` is act + `updateAndSync`, i.e. a full commit through the single-collection sync
+ * path, so the rival's write is indistinguishable from any other client's.
+ *
+ * Pass the UNWRAPPED transactor (that is what {@link RivalWrite} receives).
+ *
+ * NOTE: opens the rival tree at the DEFAULT node capacity (64), because fan-out is not persisted
+ * in the collection header (see Tree.createOrOpen's `nodeCapacity` note). Fine while every rival
+ * race is between default-fan-out trees; if a test ever needs to race a small-capacity tree, add a
+ * capacity parameter here and pass the same value both sides, or the two writers will split nodes
+ * at different fan-outs.
+ */
+export async function commitRivalTreeWrite<TKey, TEntry>(
+	inner: ITransactor,
+	collectionId: CollectionId,
+	keyFromEntry: (entry: TEntry) => TKey,
+	entries: TreeReplaceAction<TKey, TEntry>,
+): Promise<void> {
+	const tree = await Tree.createOrOpen<TKey, TEntry>(inner, collectionId, keyFromEntry);
+	await tree.replace(entries);
 }
 
 function newBlockState(): BlockState {
