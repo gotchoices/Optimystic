@@ -288,7 +288,11 @@ export class Libp2pKeyPeerNetwork implements IKeyNetwork, IPeerNetwork {
 
 		if (state.fretTable) {
 			try {
-				this.getFret().importTable(state.fretTable);
+				// Must be awaited: importTable is async as of FRET 0.7.0 and enforces capacity
+				// against the self ring coordinate it hashes on demand. Left floating, the restore
+				// races that enforcement against whatever runs next, and a rejection escapes this
+				// catch entirely rather than being logged as a skipped import.
+				await this.getFret().importTable(state.fretTable);
 			} catch (err) { this.log('init:fret-import-skipped %o', err); }
 		}
 

@@ -79,7 +79,7 @@ class MockFret {
 	getNetworkChurn(): number { return 0; }
 	detectPartition(): boolean { return false; }
 	exportTable(): any { return { entries: [] }; }
-	importTable(): number { return 0; }
+	async importTable(): Promise<number> { return 0; }
 }
 
 // --- Tests ---

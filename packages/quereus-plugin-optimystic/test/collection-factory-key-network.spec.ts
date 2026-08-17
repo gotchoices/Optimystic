@@ -45,7 +45,7 @@ function createMockLibp2p(selfId: PeerId, cohort: string[], protocolsByPeer: Rec
 				getNetworkSizeEstimate: () => ({ size_estimate: cohort.length + 1, confidence: 1 }),
 				detectPartition: () => false,
 				exportTable: () => undefined,
-				importTable: () => { }
+				importTable: async () => 0
 			}
 		}
 	};
