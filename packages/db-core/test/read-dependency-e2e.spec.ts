@@ -237,11 +237,24 @@ describe('read dependencies end to end: cache hit -> superseded -> stale-read re
 		// miss:absent branch and the third case in read-dependency-cache-hit.repro.spec.ts). A
 		// spurious `revision: 0` dep here would make every transaction that touched a
 		// not-yet-existing block fail validation the instant that block was created.
+		//
+		// This asserts the CURRENT contract, which is deliberate but not settled: the open ticket
+		// `feat-phantom-read-protection` asks a human whether reading "X does not exist" should
+		// protect against X appearing. If that answer is ever "yes", this test is the thing that
+		// changes — it is not a guarantee to defend, it is today's decision written down.
 		const transactor = new TestTransactor()
 		const tree = await Tree.createOrOpen<number, Entry>(transactor, 'brand-new', e => e.key)
 		const coll = tree.getCollection()
 
+		// Measured, not assumed: the whole open of an absent collection records ZERO deps. Every
+		// read after the miss is served from the tracker's staged header, so nothing reaches the
+		// cache or source. Asserted as an exact count because the weaker per-dep guards below are
+		// vacuous over an empty set — without this line the test passes with capture removed.
 		const deps = coll.getReadDependencies()
+		expect(deps, 'opening an absent collection must record no read dependency at all').to.be.empty
+
+		// Retained as the guard that bites if the open path ever legitimately starts recording:
+		// whatever it records must name a real block at a real revision, never a phantom at 0.
 		for (const dep of deps) {
 			expect(dep.revision, `absent-header probe must not record ${dep.blockId} at revision 0`).to.be.greaterThan(0)
 			expect(
@@ -254,14 +267,25 @@ describe('read dependencies end to end: cache hit -> superseded -> stale-read re
 			'the absent header block itself must not appear in the read set',
 		).to.not.include('brand-new')
 
-		// The scenario the phantom would break: capture the probe's read set, then let the
-		// collection genuinely come into existence, then validate. Must still pass.
-		const captured = [...deps]
+		// Why the absence matters, demonstrated rather than asserted in the abstract: synthesize the
+		// phantom dep the old code emitted and push it through the same validator. Before creation
+		// it is inert; the instant the collection comes into existence it rejects. That rejection is
+		// the failure mode the empty read set above avoids.
+		const phantom: ReadDependency[] = [{ blockId: 'brand-new' as BlockId, revision: 0 }]
+		const validator = makeValidator(transactor)
+		const beforeCreate = await validator.validate(await makeTxn(phantom), await emptyOpsHash())
+		expect(beforeCreate.valid, 'while the block is absent a revision-0 dep still matches').to.be.true
+
 		await tree.replace(seedEntries)
 		expect(await currentRev(transactor, 'brand-new' as BlockId), 'the header block now exists').to.be.greaterThan(0)
 
-		const result = await makeValidator(transactor).validate(await makeTxn(captured), await emptyOpsHash())
-		expect(result.reason ?? '', 'creating a previously-absent block must not stale-reject the probe').to.not.include('Stale read')
-		expect(result.valid).to.be.true
+		const afterCreate = await validator.validate(await makeTxn(phantom), await emptyOpsHash())
+		expect(afterCreate.valid, 'a phantom revision-0 dep WOULD reject once the block is created').to.be.false
+		expect(afterCreate.reason).to.include('Stale read')
+
+		// And the set actually captured — empty — is unaffected by that same creation.
+		const real = await validator.validate(await makeTxn(deps), await emptyOpsHash())
+		expect(real.reason ?? '', 'creating a previously-absent block must not stale-reject the probe').to.not.include('Stale read')
+		expect(real.valid).to.be.true
 	})
 })

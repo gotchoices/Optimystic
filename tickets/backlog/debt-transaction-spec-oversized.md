@@ -50,6 +50,29 @@ An optional second arm, if the split is done: add a `max-lines` cap for `**/*.sp
 `eslint.config.js`, set just above the largest post-split file, so the next file to grow past it
 fails lint instead of quietly becoming the new outlier. Without this the file re-grows.
 
+# Arm added by the `debt-e2e-stale-cache-hit-read-rejected` review
+
+The duplication is not confined to this one file, and the `test/helpers/` module above is the
+natural home for the fix. Standing up a `TransactionValidator` needs the same four-part wiring every
+time — an engine registration map, a stub validation-coordinator factory, a block-state provider,
+and a `makeTxn` that builds a correctly-hashed stamp. That block is currently hand-copied at roughly
+fifteen sites inside `transaction.spec.ts` and again, in near-identical form, in two other files:
+
+- `packages/db-core/test/occ-structural-read-exclusion.spec.ts` (`makeValidator`, ~line 261)
+- `packages/db-core/test/read-dependency-e2e.spec.ts` (`makeValidator`, ~line 74)
+
+Counted with:
+
+```bash
+grep -c "new TransactionValidator" packages/db-core/test/transaction.spec.ts
+grep -rln "new TransactionValidator" packages/db-core/test packages/db-core/src
+```
+
+The copies have already drifted in small ways (which constructor arguments are supplied, whether the
+provider reads a real transactor or a synthetic revision map), so a reader cannot tell at a glance
+whether two tests are validating under the same conditions. When the split lifts fixtures into
+`test/helpers/`, lift this wiring too and have all three files use it.
+
 # Sequencing note
 
 Other tickets have in-flight edits against this file (they cite line ranges within it). A split

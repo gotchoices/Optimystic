@@ -186,7 +186,7 @@ Every incoming record is verified end-to-end: `validateSignatures()` checks ever
 
 ### Read dependency validation
 
-Every read through `TransactorSource.tryGet()` records a `ReadDependency`. At commit, validators ensure no observed block has advanced — preventing write-skew anomalies in optimistic concurrency. `CacheSource` deduplicates reads; non-existent blocks record `revision: 0`.
+Every read of an existing block records a `ReadDependency` — at `TransactorSource.tryGet()` on a miss, and at `CacheSource.tryGet()` on a hit, both feeding one shared collector so a cached read is not silently exempt. At commit, validators ensure no observed block has advanced — preventing write-skew anomalies in optimistic concurrency. Reads of a block that does not exist record nothing, so creating it later does not invalidate the reader.
 
 ## Byzantine Fault Tolerance
 
