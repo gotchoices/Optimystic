@@ -1,5 +1,5 @@
 description: Add tests for the not-yet-covered corners of the per-transaction coordinator cache — the retry path and the self-healing fallback when a cached network node is no longer reachable.
-prereq:
+prereq: debt-competing-writer-test-transactor
 files:
   - packages/db-core/src/transactor/network-transactor.ts (resolveCoordinator, txnCoordinatorsFor, pend population site, commitBlocks)
   - packages/db-core/test/network-transactor.spec.ts ("per-transaction coordinator cache (pend → commit)" describe)
