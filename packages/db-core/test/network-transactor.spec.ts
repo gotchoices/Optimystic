@@ -5,13 +5,13 @@ import { NetworkSimulation } from './simulation.js'
 import type { Scenario } from './simulation.js'
 import { randomBytes } from '@libp2p/crypto'
 import { blockIdToBytes } from '../src/utility/block-id-to-bytes.js'
-import type { BlockId, PendRequest, BlockOperation, ClusterPeers, FindCoordinatorOptions, IKeyNetwork, IRepo, BlockGets, GetBlockResults, StaleFailure, ActionId } from '../src/index.js'
+import type { BlockId, PendRequest, BlockOperation, ClusterPeers, FindCoordinatorOptions, IKeyNetwork, IRepo, ITransactor, BlockGets, GetBlockResults, PendResult, CommitRequest, CommitResult, StaleFailure, ActionId } from '../src/index.js'
 import { BlockUnavailableError, BlockPossiblyStaleError } from '../src/index.js'
 import type { PeerId } from '../src/index.js'
 import { peerIdFromString } from '../src/network/types.js'
 import { toString as uint8ArrayToString } from 'uint8arrays/to-string'
 import { generateRandomActionId } from './generate-random-action-id.js'
-import { TestTransactor } from '../src/testing/test-transactor.js'
+import { TestTransactor, DelegatingTransactor } from '../src/testing/test-transactor.js'
 
 describe('NetworkTransactor', () => {
   // Helper to generate block IDs
@@ -1110,32 +1110,91 @@ describe('NetworkTransactor', () => {
   // from the cache instead of calling findCoordinator again.
   describe('per-transaction coordinator cache (pend → commit)', () => {
     // Counts findCluster + findCoordinator so the "resolved once" claim is observable.
+    // `findCoordinator` walks `fallbackCoordinators` in order and skips anything the caller
+    // excluded, so a retry (which excludes the peer that just failed) lands on the next
+    // candidate — the re-resolution the self-heal tests below drive.
     class CountingClusterKeyNetwork implements IKeyNetwork {
       findClusterCalls = 0;
       findCoordinatorCalls = 0;
+      /** One entry per findCoordinator call: the peer ids that call was told to avoid. Lets a
+       *  test assert WHICH lookup went live (the retry's, carrying an exclusion) rather than
+       *  only that some lookup happened. */
+      findCoordinatorExclusions: string[][] = [];
       private clusterMap = new Map<string, string[]>();
-      constructor(private readonly fallbackCoordinator: string) {}
+      constructor(private readonly fallbackCoordinators: string[]) {}
 
       async setCluster(blockId: BlockId, peerIds: string[]) {
         const keyBytes = await blockIdToBytes(blockId);
         this.clusterMap.set(uint8ArrayToString(keyBytes, 'base64url'), peerIds);
       }
 
-      async findCoordinator(_key: Uint8Array, _options?: Partial<FindCoordinatorOptions>): Promise<PeerId> {
+      async findCoordinator(_key: Uint8Array, options?: Partial<FindCoordinatorOptions>): Promise<PeerId> {
         this.findCoordinatorCalls++;
-        return peerIdFromString(this.fallbackCoordinator);
+        // Compare by string, not reference: PeerId is a structural value type here
+        // (`peerIdFromString` mints a fresh object per call), exactly as in production.
+        const excluded = (options?.excludedPeers ?? []).map(p => p.toString());
+        this.findCoordinatorExclusions.push(excluded);
+        const pick = this.fallbackCoordinators.find(p => !excluded.includes(p));
+        // What a real findCoordinator does once it runs out of candidates.
+        if (pick === undefined) throw new Error('no alternative coordinator');
+        return peerIdFromString(pick);
       }
 
       async findCluster(key: Uint8Array): Promise<ClusterPeers> {
         this.findClusterCalls++;
-        const peerIds = this.clusterMap.get(uint8ArrayToString(key, 'base64url')) ?? [this.fallbackCoordinator];
+        const peerIds = this.clusterMap.get(uint8ArrayToString(key, 'base64url')) ?? this.fallbackCoordinators.slice(0, 1);
         const peers: ClusterPeers = {};
         for (const pid of peerIds) peers[pid] = { multiaddrs: [], publicKey: '' };
         return peers;
       }
     }
 
-    const makeTransactor = (net: IKeyNetwork, transactors: Map<string, TestTransactor>) =>
+    /**
+     * Wraps a {@link TestTransactor} and makes pend/commit THROW — a transport-level failure,
+     * which is the only failure shape `processBatches` retries: its retry logic hangs off the
+     * `.catch` of the per-batch call, so a RETURNED `{ success: false }` is a response and
+     * never retries (which is why {@link FlakyCommitTransactor} cannot drive these tests).
+     *
+     * With both fail counts left at their default of 0 this is a pure call counter — which is
+     * how the reachable peer in each test is instrumented. One class, both roles.
+     */
+    class FlakyTransportTransactor extends DelegatingTransactor {
+      /** pend() calls observed, including the forced failures. */
+      pendCalls = 0;
+      /** commit() calls observed, including the forced failures. */
+      commitCalls = 0;
+
+      constructor(
+        inner: TestTransactor,
+        private readonly opts: {
+          /** Initial pend() calls to throw on; Infinity = always. Default 0 (never). */
+          failPendFirstN?: number;
+          /** Initial commit() calls to throw on; Infinity = always. Default 0 (never). */
+          failCommitFirstN?: number;
+          message?: string;
+        } = {},
+      ) {
+        super(inner);
+      }
+
+      override async pend(request: PendRequest): Promise<PendResult> {
+        this.pendCalls++;
+        if (this.pendCalls <= (this.opts.failPendFirstN ?? 0)) throw new Error(this.failureMessage);
+        return this.inner.pend(request);
+      }
+
+      override async commit(request: CommitRequest): Promise<CommitResult> {
+        this.commitCalls++;
+        if (this.commitCalls <= (this.opts.failCommitFirstN ?? 0)) throw new Error(this.failureMessage);
+        return this.inner.commit(request);
+      }
+
+      private get failureMessage(): string {
+        return this.opts.message ?? 'The stream has been reset';
+      }
+    }
+
+    const makeTransactor = (net: IKeyNetwork, transactors: Map<string, ITransactor>) =>
       new NetworkTransactor({
         timeoutMs: 1000,
         abortOrCancelTimeoutMs: 500,
@@ -1149,7 +1208,7 @@ describe('NetworkTransactor', () => {
 
     it('commit reuses pend\'s coordinator: each block resolved exactly once, no commit-time findCoordinator', async () => {
       const peerShared = 'peer-shared';
-      const net = new CountingClusterKeyNetwork(peerShared);
+      const net = new CountingClusterKeyNetwork([peerShared]);
 
       const blockId1 = 'block-1' as BlockId;
       const blockId2 = 'block-2' as BlockId;
@@ -1157,7 +1216,7 @@ describe('NetworkTransactor', () => {
       await net.setCluster(blockId1, [peerShared]);
       await net.setCluster(blockId2, [peerShared]);
 
-      const transactors = new Map<string, TestTransactor>([[peerShared, new TestTransactor()]]);
+      const transactors = new Map<string, ITransactor>([[peerShared, new TestTransactor()]]);
       const networkTransactor = makeTransactor(net, transactors);
 
       const actionId = generateRandomActionId();
@@ -1197,12 +1256,12 @@ describe('NetworkTransactor', () => {
 
     it('is per-transaction: a commit under a different actionId misses the cache and resolves live', async () => {
       const peerShared = 'peer-shared';
-      const net = new CountingClusterKeyNetwork(peerShared);
+      const net = new CountingClusterKeyNetwork([peerShared]);
 
       const blockId = 'block-x' as BlockId;
       await net.setCluster(blockId, [peerShared]);
 
-      const transactors = new Map<string, TestTransactor>([[peerShared, new TestTransactor()]]);
+      const transactors = new Map<string, ITransactor>([[peerShared, new TestTransactor()]]);
       const networkTransactor = makeTransactor(net, transactors);
 
       // pend under actionA seeds the cache for the block.
@@ -1226,6 +1285,225 @@ describe('NetworkTransactor', () => {
         await networkTransactor.commit({ actionId: actionB, rev: 1, blockIds: [blockId], tailId: blockId });
       } catch { /* expected: block not pending under actionB */ }
       expect(net.findCoordinatorCalls).to.be.greaterThan(0);
+    });
+
+    /** The single-block insert every test below pends. */
+    const insertPend = (actionId: ActionId, blockId: BlockId): PendRequest => ({
+      actionId,
+      transforms: {
+        inserts: { [blockId]: { header: { id: blockId, type: 'block', collectionId: 'test' } } },
+        updates: {},
+        deletes: [],
+      },
+      policy: 'c',
+    });
+
+    it('caches the RETRY\'s coordinator, not the peer pend first tried', async () => {
+      const peerA = 'peer-A';
+      const peerB = 'peer-B';
+      const net = new CountingClusterKeyNetwork([peerA, peerB]);
+
+      const blockId = 'block-retry' as BlockId;
+      // The cluster covers only peerA, so pend's consolidation picks it with no findCoordinator
+      // round; peerB is reachable only through the retry's exclusion-aware lookup.
+      await net.setCluster(blockId, [peerA]);
+
+      const deadA = new FlakyTransportTransactor(new TestTransactor(), { failPendFirstN: Infinity });
+      const liveB = new FlakyTransportTransactor(new TestTransactor());
+      const networkTransactor = makeTransactor(net, new Map<string, ITransactor>([[peerA, deadA], [peerB, liveB]]));
+
+      const actionId = generateRandomActionId();
+      const pendResult = await networkTransactor.pend(insertPend(actionId, blockId));
+      // everyBatch only requires SOME node of a root's retry tree to have succeeded, so a pend
+      // whose retry landed reports success even though its first attempt threw.
+      expect(pendResult.success, 'the retry landed, so the pend as a whole succeeded').to.be.true;
+      expect(deadA.pendCalls, 'pend reached the cluster peer once').to.equal(1);
+      expect(liveB.pendCalls, 'the retry re-homed the block onto peerB').to.equal(1);
+
+      const coordinatorCallsAfterPend = net.findCoordinatorCalls;
+      expect(coordinatorCallsAfterPend, 'only the pend RETRY resolved live').to.be.greaterThan(0);
+
+      const commitResult = await networkTransactor.commit({ actionId, rev: 1, blockIds: [blockId], tailId: blockId });
+      expect(commitResult.success).to.be.true;
+
+      expect(net.findCoordinatorCalls, 'the commit resolved purely from the cache')
+        .to.equal(coordinatorCallsAfterPend);
+      // The failed first attempt never became a response (Pending.isResponse stays false on a
+      // rejection), so it contributed nothing to the cache — only the retry batch did.
+      expect(liveB.commitCalls, 'the cache carried the POST-retry assignment').to.equal(1);
+      expect(deadA.commitCalls, 'the peer that failed at pend was never dialed again').to.equal(0);
+    });
+
+    it('self-heals when a commit retry excludes the cached coordinator', async () => {
+      const peerA = 'peer-A';
+      const peerB = 'peer-B';
+      const net = new CountingClusterKeyNetwork([peerA, peerB]);
+
+      const blockId = 'block-self-heal' as BlockId;
+      await net.setCluster(blockId, [peerA]);
+
+      // ONE store behind both peers — the property cluster replication provides: the action
+      // pended via peerA is visible to peerB, so the re-homed commit can actually land rather
+      // than merely prove a live lookup happened.
+      const inner = new TestTransactor();
+      const deadCommitA = new FlakyTransportTransactor(inner, { failCommitFirstN: Infinity });
+      const liveB = new FlakyTransportTransactor(inner);
+      const networkTransactor = makeTransactor(net, new Map<string, ITransactor>([[peerA, deadCommitA], [peerB, liveB]]));
+
+      const actionId = generateRandomActionId();
+      const pendResult = await networkTransactor.pend(insertPend(actionId, blockId));
+      expect(pendResult.success).to.be.true;
+      expect(deadCommitA.pendCalls, 'pend is not intercepted on peerA').to.equal(1);
+      expect(net.findCoordinatorCalls, 'pend resolved from the cluster alone').to.equal(0);
+
+      const commitResult = await networkTransactor.commit({ actionId, rev: 1, blockIds: [blockId], tailId: blockId });
+      expect(commitResult.success).to.be.true;
+
+      // The commit's FIRST resolution came from the cache (zero calls at this point would be
+      // impossible if it had gone live); only the retry, which excludes the failed peer, did.
+      expect(net.findCoordinatorCalls, 'only the commit retry went live').to.be.greaterThan(0);
+      expect(net.findCoordinatorExclusions.some(ex => ex.includes(peerA)),
+        'the live lookup was the retry\'s, carrying the failed peer as an exclusion').to.be.true;
+      expect(deadCommitA.commitCalls, 'the dead cached peer was tried once, not looped on').to.equal(1);
+      expect(liveB.commitCalls, 'the retry re-resolved to the live peer').to.equal(1);
+      expect(inner.getCommittedActions().has(actionId), 'the commit actually landed').to.be.true;
+    });
+
+    // The exclusion check in `resolveCoordinator` compares PeerIds by `toString()`, not by
+    // reference — and it has to, because `peerIdFromString` mints a fresh object per call, so
+    // two blocks pended in separate rounds hold DIFFERENT PeerId objects naming the same peer.
+    // The single-block test above cannot see that distinction: there the cache hands its own
+    // instance straight to the batch, so the excluded PeerId and the cached one are the same
+    // object and a reference comparison would pass too. This one puts two blocks that were
+    // cached from separate pends into ONE commit batch, so the retry can only exclude the
+    // instance belonging to the first — the second is a same-string, different-object twin.
+    it('excludes a cached coordinator by peer id, not by object identity', async () => {
+      const peerA = 'peer-A';
+      const peerB = 'peer-B';
+      const net = new CountingClusterKeyNetwork([peerA, peerB]);
+
+      const tailId = 'block-twin-tail' as BlockId;
+      const blockId2 = 'block-twin-2' as BlockId;
+      const blockId3 = 'block-twin-3' as BlockId;
+      for (const bid of [tailId, blockId2, blockId3]) await net.setCluster(bid, [peerA]);
+
+      const inner = new TestTransactor();
+      const deadCommitA = new FlakyTransportTransactor(inner, { failCommitFirstN: Infinity });
+      const liveB = new FlakyTransportTransactor(inner);
+      const networkTransactor = makeTransactor(net, new Map<string, ITransactor>([[peerA, deadCommitA], [peerB, liveB]]));
+
+      // One pend PER BLOCK, all under one actionId: each pend consolidates independently and
+      // mints its own PeerId object for peerA, so the three cache entries hold three distinct
+      // objects that all stringify to 'peer-A'.
+      const actionId = generateRandomActionId();
+      for (const bid of [tailId, blockId2, blockId3]) {
+        expect((await networkTransactor.pend(insertPend(actionId, bid))).success).to.be.true;
+      }
+      expect(net.findCoordinatorCalls, 'every pend resolved from the cluster').to.equal(0);
+
+      // commit splits into tail (blockId) then the remainder; the remainder's two blocks
+      // consolidate onto ONE batch, whose peerId is block-2's cached object. The retry excludes
+      // exactly that object, so block-3's own cached object is only excluded if the comparison
+      // is by peer id string.
+      const commitResult = await networkTransactor.commit({ actionId, rev: 1, blockIds: [tailId, blockId2, blockId3], tailId });
+      expect(commitResult.success).to.be.true;
+
+      // Two dead dials: one for the tail round, one for the remainder round. A reference
+      // comparison would let block-3 re-resolve to the dead peer and add a third.
+      expect(deadCommitA.commitCalls, 'the dead peer was dialed once per commit round, not re-picked')
+        .to.equal(2);
+      expect(liveB.commitCalls, 'each round re-homed as a single batch').to.equal(2);
+
+      // Non-tail commit failures are swallowed, so `success` alone proves nothing about
+      // blocks 2 and 3 — check they actually committed.
+      const [status] = await inner.getStatus([{ actionId, blockIds: [tailId, blockId2, blockId3] }]);
+      expect(status!.statuses, 'every block committed, including the re-homed remainder')
+        .to.deep.equal(['committed', 'committed', 'committed']);
+    });
+
+    // A multi-collection transaction fans out one pend() and one commit() per collection, all
+    // under the same actionId, so they share one cache entry. The implementation reclaims
+    // entries by TTL rather than deleting at commit-end precisely so a finished sibling cannot
+    // pull the entry out from under a commit still in flight.
+    describe('one actionId shared by several collections\' commits', () => {
+      const peer1 = 'peer-1';
+      const peer2 = 'peer-2';
+      const blockId1 = 'block-multi-1' as BlockId;
+      const blockId2 = 'block-multi-2' as BlockId;
+
+      /** Two blocks on disjoint single-peer clusters, each peer instrumented with a counter. */
+      const setupTwoCollections = async () => {
+        const net = new CountingClusterKeyNetwork([peer1, peer2]);
+        await net.setCluster(blockId1, [peer1]);
+        await net.setCluster(blockId2, [peer2]);
+        const t1 = new FlakyTransportTransactor(new TestTransactor());
+        const t2 = new FlakyTransportTransactor(new TestTransactor());
+        const networkTransactor = makeTransactor(net, new Map<string, ITransactor>([[peer1, t1], [peer2, t2]]));
+        return { net, t1, t2, networkTransactor };
+      };
+
+      const commitOne = (networkTransactor: NetworkTransactor, actionId: ActionId, blockId: BlockId) =>
+        networkTransactor.commit({ actionId, rev: 1, blockIds: [blockId], tailId: blockId });
+
+      it('keeps the shared entry alive after a sibling commit finishes (sequential)', async () => {
+        const { net, t1, t2, networkTransactor } = await setupTwoCollections();
+        const actionId = generateRandomActionId();
+
+        // Each pend creates-then-reuses the same per-actionId entry.
+        expect((await networkTransactor.pend(insertPend(actionId, blockId1))).success).to.be.true;
+        expect((await networkTransactor.pend(insertPend(actionId, blockId2))).success).to.be.true;
+
+        expect((await commitOne(networkTransactor, actionId, blockId1)).success).to.be.true;
+        // The entry is NOT deleted when the first commit finishes, so the second still hits it.
+        expect((await commitOne(networkTransactor, actionId, blockId2)).success).to.be.true;
+
+        expect(net.findClusterCalls, 'one cluster lookup per block, at pend').to.equal(2);
+        expect(net.findCoordinatorCalls, 'block-2\'s entry survived block-1\'s commit').to.equal(0);
+        expect(t1.commitCalls).to.equal(1);
+        expect(t2.commitCalls).to.equal(1);
+      });
+
+      it('serves every commit of a concurrent fan-out from the shared entry', async () => {
+        const { net, t1, t2, networkTransactor } = await setupTwoCollections();
+        const actionId = generateRandomActionId();
+
+        const pendResults = await Promise.all([
+          networkTransactor.pend(insertPend(actionId, blockId1)),
+          networkTransactor.pend(insertPend(actionId, blockId2)),
+        ]);
+        expect(pendResults.every(r => r.success)).to.be.true;
+
+        const commitResults = await Promise.all([
+          commitOne(networkTransactor, actionId, blockId1),
+          commitOne(networkTransactor, actionId, blockId2),
+        ]);
+        expect(commitResults.every(r => r.success)).to.be.true;
+
+        expect(net.findClusterCalls, 'one cluster lookup per block, at pend').to.equal(2);
+        expect(net.findCoordinatorCalls, 'every commit was served from the shared entry').to.equal(0);
+        // Per-peer counts, so a commit that silently fanned to the wrong peer cannot pass.
+        expect(t1.commitCalls).to.equal(1);
+        expect(t2.commitCalls).to.equal(1);
+      });
+    })
+
+    it('never lets a read borrow a write\'s cached coordinator: get() after a pend resolves live', async () => {
+      const peerShared = 'peer-shared';
+      const net = new CountingClusterKeyNetwork([peerShared]);
+
+      const blockId = 'block-read-after-pend' as BlockId;
+      await net.setCluster(blockId, [peerShared]);
+      const networkTransactor = makeTransactor(net, new Map<string, ITransactor>([[peerShared, new TestTransactor()]]));
+
+      const actionId = generateRandomActionId();
+      expect((await networkTransactor.pend(insertPend(actionId, blockId))).success).to.be.true;
+
+      // get()/cancel() pass no actionId, so resolveCoordinator's cache lookup is skipped
+      // entirely — a miss must fall through to live resolution, never fail or borrow.
+      const before = net.findCoordinatorCalls;
+      const result = await networkTransactor.get({ blockIds: [blockId] });
+      expect(result[blockId]).to.exist;
+      expect(net.findCoordinatorCalls, 'a read resolves its own coordinator').to.be.greaterThan(before);
     });
   })
 
