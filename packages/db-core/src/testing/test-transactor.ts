@@ -433,12 +433,37 @@ export class TestTransactor implements ITransactor {
 }
 
 /**
+ * Base for the intercepting wrappers below: forwards every {@link ITransactor} member to `inner`,
+ * so a wrapper overrides only the one call it intercepts and cannot silently drop the rest.
+ *
+ * `queryClusterNominees` is forwarded through a GETTER rather than a method, because the coordinator
+ * treats its ABSENCE as "no supercluster" (see `gatherPhase`). A wrapper that always defined it
+ * would push every wrapped multi-collection test onto the GATHER path even when the inner
+ * transactor never opted in; a wrapper that omits it (as these did before) does the opposite —
+ * a test that sets `inner.queryClusterNominees` and then wraps would skip GATHER and pass
+ * vacuously. The getter reproduces the inner transactor's own answer either way.
+ */
+export abstract class DelegatingTransactor implements ITransactor {
+	protected constructor(protected readonly inner: TestTransactor) {}
+
+	get(b: BlockGets): Promise<GetBlockResults> { return this.inner.get(b); }
+	getStatus(a: ActionBlocks[]): Promise<BlockActionStatus[]> { return this.inner.getStatus(a); }
+	pend(r: PendRequest): Promise<PendResult> { return this.inner.pend(r); }
+	cancel(a: ActionBlocks): Promise<void> { return this.inner.cancel(a); }
+	commit(r: CommitRequest): Promise<CommitResult> { return this.inner.commit(r); }
+
+	get queryClusterNominees(): ((blockId: BlockId) => Promise<ClusterNomineesResult>) | undefined {
+		return this.inner.queryClusterNominees?.bind(this.inner);
+	}
+}
+
+/**
  * Wraps a {@link TestTransactor} and forces its commit phase to fail a bounded (or unbounded)
  * number of times before delegating, so tests can exercise the sync retry / backoff / give-up
- * path deterministically. pend/get/getStatus/cancel delegate unchanged, so the pend→commit→cancel
+ * path deterministically. Everything else delegates unchanged, so the pend→commit→cancel
  * round-trip runs exactly as in production.
  */
-export class FlakyCommitTransactor implements ITransactor {
+export class FlakyCommitTransactor extends DelegatingTransactor {
 	/** Number of commit() calls observed so far (across success and forced failure). */
 	commitAttempts = 0;
 
@@ -448,17 +473,14 @@ export class FlakyCommitTransactor implements ITransactor {
 	 * @param reason the StaleFailure.reason returned on a forced failure
 	 */
 	constructor(
-		private readonly inner: TestTransactor,
+		inner: TestTransactor,
 		private readonly failFirstN: number,
 		private readonly reason = 'forced stale',
-	) {}
+	) {
+		super(inner);
+	}
 
-	get(b: BlockGets): Promise<GetBlockResults> { return this.inner.get(b); }
-	getStatus(a: ActionBlocks[]): Promise<BlockActionStatus[]> { return this.inner.getStatus(a); }
-	pend(r: PendRequest): Promise<PendResult> { return this.inner.pend(r); }
-	cancel(a: ActionBlocks): Promise<void> { return this.inner.cancel(a); }
-
-	async commit(request: CommitRequest): Promise<CommitResult> {
+	override async commit(request: CommitRequest): Promise<CommitResult> {
 		this.commitAttempts++;
 		if (this.commitAttempts <= this.failFirstN) {
 			return { success: false, reason: this.reason };
@@ -506,43 +528,48 @@ export type CompetingWriterOptions = {
  *    self-deadlock on its own reads. Intercepting here in the wrapper, before
  *    `await this.inner.pend(...)`, is outside every such section.
  */
-export class CompetingWriterTransactor implements ITransactor {
+export class CompetingWriterTransactor extends DelegatingTransactor {
 	/** Pend calls observed (including the intercepted one). */
 	pendCalls = 0;
 	/** Commit calls observed. */
 	commitCalls = 0;
 	/** The 1-based pend call index the rival fired on; undefined if it never fired. */
 	firedAtCall?: number;
-	/** Latched so the rival fires at most once — otherwise the retry's pend would re-trigger it
-	 *  and the transaction under test could never win. */
-	private fired = false;
+	/** How many times the rival ran. Latched to at most 1 — a second firing would collide with the
+	 *  loser's now-pending blocks and the transaction under test could never win. */
+	rivalRuns = 0;
 
 	constructor(
-		private readonly inner: TestTransactor,
+		inner: TestTransactor,
 		private readonly rival: RivalWrite,
 		private readonly options?: CompetingWriterOptions,
-	) {}
+	) {
+		super(inner);
+	}
 
-	get(b: BlockGets): Promise<GetBlockResults> { return this.inner.get(b); }
-	getStatus(a: ActionBlocks[]): Promise<BlockActionStatus[]> { return this.inner.getStatus(a); }
-	cancel(a: ActionBlocks): Promise<void> { return this.inner.cancel(a); }
-
-	async pend(request: PendRequest): Promise<PendResult> {
+	override async pend(request: PendRequest): Promise<PendResult> {
 		// Increment synchronously, before any await, so call indexes reflect the caller's fan-out
 		// order rather than scheduling order.
 		const callIndex = ++this.pendCalls;
 		const matches = this.options?.when
 			? this.options.when(request, callIndex)
 			: callIndex === 1;
-		if (!this.fired && matches) {
-			this.fired = true;
+		if (this.rivalRuns === 0 && matches) {
+			this.rivalRuns++;
 			this.firedAtCall = callIndex;
-			await this.rival(this.inner);
+			// A throwing rival escapes as a rejected pend, which pendPhase flattens to a bare message
+			// string ("hard failure") with the stack discarded — so name the source in the message, or
+			// a broken rival reads as an unexplained coordinator pend failure.
+			try {
+				await this.rival(this.inner);
+			} catch (e) {
+				throw new Error(`competing writer failed: ${e instanceof Error ? e.message : String(e)}`, { cause: e });
+			}
 		}
 		return this.inner.pend(request);
 	}
 
-	async commit(request: CommitRequest): Promise<CommitResult> {
+	override async commit(request: CommitRequest): Promise<CommitResult> {
 		this.commitCalls++;
 		return this.inner.commit(request);
 	}

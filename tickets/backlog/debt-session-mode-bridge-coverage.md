@@ -53,6 +53,14 @@ header's `collectionId`, mirroring `SelectiveCommitFailTransactor`:
 - the bridge tears down transaction state (`isActive === false`, `session === null`,
   savepoints/dirtyTrees cleared) so the connection is not left with a stuck transaction.
 
+**Note (added by the review of `debt-competing-writer-test-transactor`):** the transactor wrapper
+this arm needs no longer has to be hand-rolled. `packages/db-core/src/testing/test-transactor.ts`
+now exports `DelegatingTransactor`, an abstract base that forwards the whole transactor surface —
+including the optional `queryClusterNominees`, which every hand-rolled wrapper in the repo was
+silently dropping — so a wrapper only overrides the one call it intercepts. Extend it rather than
+writing the delegation by hand, and if `SelectiveCommitFailTransactor` is promoted out of
+`transaction.spec.ts` as this ticket's `files:` list suggests, promote it as a subclass of it.
+
 ## Arm B — statement recording and rollback ordering through the session
 
 A recently-fixed bug: the bridge's `addStatement` used to fire `session.execute(statement, [])` without

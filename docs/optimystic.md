@@ -260,7 +260,7 @@ Counters, append-only queues with metadata, specialized indexes, and CRDT-style 
 
 **Browser:** use `@optimystic/db-p2p/rn` (the Node-free entrypoint, which works for browsers as well as React Native) and `@optimystic/db-p2p-storage-web` for IndexedDB-backed persistence — including a `loadOrCreateBrowserPeerKey` helper for a stable, reload-surviving libp2p identity. Use WebSockets and circuit-relay transports; browsers cannot accept inbound connections and usually reach the network through a public gateway.
 
-**Test harness:** `TestTransactor` runs everything in-process with no network. For multi-node integration tests, the `MeshHarness` under `packages/db-p2p/src/testing` spins up a configurable in-memory mesh.
+**Test harness:** `TestTransactor` runs everything in-process with no network. Two wrappers around it (all from `@optimystic/db-core/test`) drive concurrency failures deterministically: `FlakyCommitTransactor` forces a bounded number of commit-phase losses, and `CompetingWriterTransactor` runs a *real* second writer to a durable commit in the middle of a transaction, so the loser takes a genuine optimistic-concurrency loss and has to rebase. Both extend `DelegatingTransactor`, which forwards the rest of the transactor surface — extend it rather than hand-rolling a wrapper, or optional members like `queryClusterNominees` get silently dropped and the wrapped test quietly stops exercising the path it names. For multi-node integration tests, the `MeshHarness` under `packages/db-p2p/src/testing` spins up a configurable in-memory mesh.
 
 ## Operational Basics
 
