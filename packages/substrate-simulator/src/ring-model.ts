@@ -1,4 +1,4 @@
-import { hashKey, xorDistance, type RingCoord } from 'p2p-fret';
+import { hashKey, minDistance, type RingCoord } from 'p2p-fret';
 
 export type { RingCoord };
 
@@ -12,9 +12,14 @@ function bytesToBigInt(bytes: Uint8Array): bigint {
 }
 
 /**
- * Ring-coordinate derivation and XOR distance, delegated to real FRET (`hashKey`,
- * `xorDistance`). Nothing here reimplements the hash or the distance — the simulator measures
+ * Ring-coordinate derivation and ring distance, delegated to real FRET (`hashKey`,
+ * `minDistance`). Nothing here reimplements the hash or the distance — the simulator measures
  * the *same* coordinate distribution production sees.
+ *
+ * The metric is FRET's own `minDistance`: the shorter of the two arcs between the coordinates,
+ * so the ring's wrap-around point behaves like every other point. FRET measures routing,
+ * payload inclusion, and relevance sparsity with it, and it replaced the earlier XOR metric —
+ * following it here is what keeps "same distribution as production" true.
  *
  * `coordOf` is async because FRET hashes with sha256 (`hashKey` returns a Promise). This is
  * the only async seam in the model and runs at seeding time, never inside a scheduler event;
@@ -28,8 +33,8 @@ export class RingModel {
 		return hashKey(key);
 	}
 
-	/** XOR distance between two ring coordinates as a bigint, via FRET `xorDistance`. */
+	/** Ring distance between two coordinates as a bigint, via FRET `minDistance`. */
 	distance(a: RingCoord, b: RingCoord): bigint {
-		return bytesToBigInt(xorDistance(a, b));
+		return bytesToBigInt(minDistance(a, b));
 	}
 }

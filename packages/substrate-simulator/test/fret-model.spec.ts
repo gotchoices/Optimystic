@@ -1,5 +1,5 @@
 import { expect } from 'chai';
-import { DigitreeStore, hashKey, assembleCohort, xorDistance } from 'p2p-fret';
+import { DigitreeStore, hashKey, assembleCohort, minDistance } from 'p2p-fret';
 import { createRng } from '../src/rng.js';
 import { generatePeers } from '../src/peer.js';
 import { createSimWorld } from '../src/world.js';
@@ -38,18 +38,21 @@ function bytesToBigInt(bytes: Uint8Array): bigint {
 	return v;
 }
 
-describe('RingModel — XOR distance (parity with real FRET)', () => {
-	it('matches bytesToBigInt(xorDistance), is zero to self, and is symmetric', async () => {
+describe('RingModel — ring distance (parity with real FRET)', () => {
+	it('matches bytesToBigInt(minDistance), is zero to self, and is symmetric', async () => {
 		const ring = new RingModel();
 		const a = await ring.coordOf(Uint8Array.of(1));
 		const b = await ring.coordOf(Uint8Array.of(2));
 
-		// Byte-identical to a direct FRET xorDistance, presented as a bigint.
-		expect(ring.distance(a, b)).to.equal(bytesToBigInt(xorDistance(a, b)));
-		// XOR-metric invariants: identity is zero, distance is symmetric and positive for a ≠ b.
+		// Byte-identical to a direct FRET minDistance, presented as a bigint.
+		expect(ring.distance(a, b)).to.equal(bytesToBigInt(minDistance(a, b)));
+		// Metric invariants: identity is zero, distance is symmetric and positive for a ≠ b.
 		expect(ring.distance(a, a)).to.equal(0n);
 		expect(ring.distance(a, b)).to.equal(ring.distance(b, a));
 		expect(ring.distance(a, b) > 0n).to.equal(true);
+		// Shorter-arc bound: never exceeds half the ring. This is what separates the ring metric
+		// from the XOR metric it replaced, which ranged over the full 2^256.
+		expect(ring.distance(a, b) <= 1n << 255n).to.equal(true);
 	});
 });
 

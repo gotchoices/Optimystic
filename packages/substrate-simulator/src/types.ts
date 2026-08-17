@@ -12,7 +12,7 @@ export type VTime = number;
 
 /**
  * Decision 5 — Opaque synthetic peer identity. NOT a real libp2p PeerId/keypair
- * (real Ed25519 keygen is far too slow at 1M peers). Ring placement / XOR-distance
+ * (real Ed25519 keygen is far too slow at 1M peers). Ring placement / ring-distance
  * math lives in `simulator-fret-cohort-model`, not here.
  */
 export interface PeerRef {

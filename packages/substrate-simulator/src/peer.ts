@@ -5,8 +5,8 @@ const KEY_BYTES = 32;
 
 /**
  * Decision 5 — deterministically generate `count` synthetic peers from an rng stream. These
- * are opaque ids, NOT real libp2p PeerIds (real keygen does not scale to 1M). XOR-distance
- * ring placement over these keys is `simulator-fret-cohort-model`'s job, not the engine's.
+ * are opaque ids, NOT real libp2p PeerIds (real keygen does not scale to 1M). Ring-distance
+ * placement over these keys is `simulator-fret-cohort-model`'s job, not the engine's.
  *
  * Pass a forked stream (e.g. `rng.fork('peers')`) when you want peer generation insulated
  * from the rest of the simulation's draws.

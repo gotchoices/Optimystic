@@ -12,7 +12,7 @@ export interface FretModelOptions {
 /**
  * Thin model over real FRET. It derives ring coordinates, cohort membership, `n_est`, and
  * `d_max` from an injected synthetic population using the *same* FRET functions production
- * calls (`hashKey`, `xorDistance`, `assembleCohort`, `estimateSizeAndConfidence`) — the
+ * calls (`hashKey`, `minDistance`, `assembleCohort`, `estimateSizeAndConfidence`) — the
  * simulator is FRET's first non-libp2p consumer and wraps, never reimplements, that math.
  *
  * It owns a single `DigitreeStore` seeded by `hashKey` over each peer's synthetic key. Churn
