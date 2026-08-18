@@ -227,6 +227,7 @@ Quereus is not SQLite — it is a distinct SQL engine with intentional departure
 - **All tables are virtual tables** — the `USING` clause specifies the backing module.
 - **Operation-specific CHECK constraints** — e.g., `CHECK ON INSERT (price >= 0)`.
 - **Empty primary keys for singleton tables** — `PRIMARY KEY ()` creates a table limited to 0 or 1 rows, useful for configuration or state tables.
+- **`PRIMARY KEY` does not imply `NOT NULL`** (Quereus ≥ 4.14). A key column keeps its declared nullability, so `x integer null primary key` accepts a NULL-keyed row. Under the shipped `not_null` default this is invisible — `id integer primary key` is still non-nullable because *every* column is. Key equality is NULL-self-equal, so two rows with an all-NULL key collide as a duplicate key; SQL comparison stays three-valued, so `where x = null` (or a parameter bound to NULL) matches nothing and only `where x is null` reaches the row. `UNIQUE` still treats NULLs as distinct.
 - **Conversion functions** (`integer()`, `date()`, `json()`) preferred over `CAST`.
 - **No triggers** — event-driven logic belongs in the application layer.
 

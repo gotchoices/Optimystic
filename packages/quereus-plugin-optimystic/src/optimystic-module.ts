@@ -936,6 +936,26 @@ export class OptimysticVirtualTable extends VirtualTable {
   ): AsyncIterable<Row> {
     if (!this.rowCodec) return;
 
+    // A NULL seek arg makes the equality UNKNOWN under SQL three-valued logic, so no
+    // row matches — even though key EQUALITY is NULL-self-equal and a NULL-keyed row
+    // really is stored under the NULL tag (key-encoding.ts). Without this guard the
+    // seek finds that row and returns it for `where pk = ?` bound to NULL.
+    //
+    // The engine cannot cover this for us: it folds only a *literal* NULL equality to
+    // an empty result at plan time (`isLiteralNullEquality` in
+    // rule-select-access-path.ts), and leaves a dynamic value — parameter, correlated
+    // binding — to a per-module runtime guard (the memory backend's `seekKeyHasNull`).
+    // getBestAccessPlan reports the PK equality filters as handledFilters=true, so
+    // there is no residual FILTER above this seek to catch a leaked row (a secondary
+    // index seek keeps one; the `_primary_` plan does not).
+    //
+    // Reachable since Quereus 4.14: PRIMARY KEY no longer implies NOT NULL, so
+    // `x integer null primary key` stores a NULL-keyed row (quereus
+    // test/logic/43.3-nullable-primary-key.sqllogic pins `where x = null` → []).
+    if (args.some(arg => arg === null || arg === undefined)) {
+      return;
+    }
+
     // Assemble the full (possibly composite) primary key from ALL seek args using
     // the SAME encoding the row codec uses to store keys (extractPrimaryKey).
     // Using only args[0] silently drops every PK column past the first, so a
