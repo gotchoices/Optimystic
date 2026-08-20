@@ -369,8 +369,12 @@ function serveResumeReply(deps: RecoverServeDeps, req: ResumeV1, now: number): U
 
 /**
  * Build the recover serve callback for {@link handleRequestResponse}: it returns the reply frame, or
- * `undefined` for **no reply** (a decode/verify/replay/resolve failure aborts the stream). It never throws
- * out of the handler.
+ * `undefined` on a decode/verify/replay/resolve failure. It never throws out of the handler.
+ *
+ * NOTE: `undefined` reaches the dialer as an explicit zero-length frame, and
+ * {@link Libp2pReactivityRecoverTransport.exchange} decodes that as a *terminal* protocol error rather
+ * than falling through to the next cohort candidate — one member declining ends the whole recover walk.
+ * Tracked as `debt-stream-reply-no-result-untyped`.
  */
 export function createRecoverRequestHandler(deps: RecoverServeDeps): (frame: Uint8Array, fromPeer: PeerId) => Promise<Uint8Array | undefined> {
 	const maxBytes = deps.maxBytes ?? DEFAULT_STREAM_MAX_BYTES;
@@ -394,7 +398,7 @@ export function createRecoverRequestHandler(deps: RecoverServeDeps): (frame: Uin
 			return Promise.resolve(serveResumeReply(deps, r, now));
 		} catch (err) {
 			// A malformed/foreign request (decode failure, foreign collectionId from serve*) must never throw
-			// out of the stream handler: log + no reply (the stream aborts, the subscriber falls back).
+			// out of the stream handler: log + no reply (a zero-length reply frame; see the note above).
 			log("recover serve: dropping request (no reply): %o", err);
 			return Promise.resolve(undefined);
 		}

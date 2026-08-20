@@ -2810,7 +2810,7 @@ async function registerProtocolHandlers(
 	await Promise.all([
 		// register: a direct dial carries a RenewV1 (ping), a ChildLinkV1 (a child cohort registering with this
 		// parent), or a RegisterV1 (re-attach walk fallback). The three shapes are disjoint, so try each in turn.
-		node.handle(protocols.register, makeFrameHandler(async (frame): Promise<Uint8Array | undefined> => {
+		node.handle(protocols.register, makeRequestHandler(async (frame): Promise<Uint8Array> => {
 			const decoded = decodeCohortMessage(frame, maxBytes);
 			const renew = tryValidate(() => validateRenewV1(decoded));
 			if (renew !== undefined) {
@@ -2830,23 +2830,21 @@ async function registerProtocolHandlers(
 		// every coord engine's bus; per-bus epoch matching governs which engine merges the record deltas.
 		// First, if this is a verified co-member frame for a coord we hold no engine for, instantiate that
 		// engine (§Cold-start instantiation) so its freshly-subscribed bus merges this very frame on `deliver`.
-		node.handle(protocols.gossip, makeFrameHandler(async (frame, from): Promise<Uint8Array | undefined> => {
+		node.handle(protocols.gossip, makeOneWayHandler(async (frame, from): Promise<void> => {
 			maybeInstantiateColdSibling(frame);
 			gossipTransport.deliver(from.toString(), frame);
-			return undefined;
 		}, maxBytes)),
 
 		// promote: threshold-signed promotion/demotion notices (one-way, gossip-style fan-out). The dialing
 		// peer arrives as `from`, so the handler can gate per-(peer, topic) before any expensive work. The
 		// full pipeline (rate limit → findServing → effectiveAt high-water → verify+apply, bounded
 		// refetch) lives in the exported `handleInboundNotice`; it logs and never throws on the stream.
-		node.handle(protocols.promote, makeFrameHandler(async (frame, from): Promise<Uint8Array | undefined> => {
+		node.handle(protocols.promote, makeOneWayHandler(async (frame, from): Promise<void> => {
 			await handleInboundNotice(frame, peerIdToBytes(from), registry, verifier, promoteGate, Date.now(), maxBytes);
-			return undefined; // one-way: match the gossip-style fan-out (no ack frame)
 		}, maxBytes)),
 
 		// membership: serve this node's latest published cert; cache any cert the requester returns.
-		node.handle(protocols.membership, makeFrameHandler(async (frame): Promise<Uint8Array | undefined> => {
+		node.handle(protocols.membership, makeRequestHandler(async (frame): Promise<Uint8Array> => {
 			void frame; // request frame is the raw coord; this node serves its own cohort cert
 			const latest = publishSink.latest();
 			if (latest !== undefined) {
@@ -2858,7 +2856,7 @@ async function registerProtocolHandlers(
 		// sign: per-member endorsement for threshold-signature assembly. Validate the request, run the
 		// endorsement policy, and reply with this node's peer-key signature over the request payload (or a
 		// refusal). One Ed25519 sign and nothing more — the cohort + epoch gate bounds who we sign for.
-		node.handle(protocols.sign, makeFrameHandler(async (frame, from): Promise<Uint8Array | undefined> => {
+		node.handle(protocols.sign, makeRequestHandler(async (frame, from): Promise<Uint8Array> => {
 			const request = validateSignRequestV1(decodeCohortMessage(frame, maxBytes));
 			const reply = await signEndorse(request, from.toString());
 			return encodeCohortMessage(reply, maxBytes);
@@ -2867,15 +2865,39 @@ async function registerProtocolHandlers(
 }
 
 /**
- * Wrap a frame handler in the read-one / reply-one libp2p stream lifecycle.
+ * Serve a request/reply protocol: read one framed request, reply with exactly one framed response.
  *
- * `undefined` from `handle` means "one-way protocol, send nothing" (gossip, promote — their dialers
- * use `sendOneWay` and never read, and often have already closed the stream). Every protocol whose
- * dialer *reads* a reply (register, membership, sign) must return a frame — an empty one for
- * "no result" — because the dialer's `readFramed` treats bare end-of-stream as a truncation error,
- * not an empty reply. `stream-util.ts#handleRequestResponse` differs here: all of its consumers are
- * read-reply protocols, so it frames `undefined` as an explicit zero-length frame itself.
+ * `handle` cannot return `undefined`, and that is the point. The dialer's `readFramed` treats bare
+ * end-of-stream as a truncation error rather than an empty reply, so a reply-reading protocol
+ * (register, membership, sign) must always put a frame on the wire — an empty one for "no result".
+ * Making that a separate constructor from {@link makeOneWayHandler} puts the invariant in the type,
+ * where a later edit cannot silently opt out of it. (`stream-util.ts#handleRequestResponse` takes
+ * the other route for the same reason: every consumer of it is a reply-reading protocol, so it maps
+ * a handler's `undefined` onto an explicit zero-length frame itself.)
  */
+function makeRequestHandler(
+	handle: (frame: Uint8Array, from: PeerId) => Promise<Uint8Array>,
+	maxBytes: number,
+): (stream: Stream, connection: Connection) => void {
+	return makeFrameHandler(handle, maxBytes);
+}
+
+/**
+ * Serve a one-way protocol: read one framed message and send nothing back (cohort-gossip, promote).
+ * Their dialers use `sendOneWay`, never read, and have typically already closed the stream — a reply
+ * would be wasted at best and a write into a closed stream at worst.
+ */
+function makeOneWayHandler(
+	handle: (frame: Uint8Array, from: PeerId) => Promise<void>,
+	maxBytes: number,
+): (stream: Stream, connection: Connection) => void {
+	return makeFrameHandler(async (frame, from): Promise<undefined> => {
+		await handle(frame, from);
+		return undefined;
+	}, maxBytes);
+}
+
+/** Shared read-one / maybe-reply-one libp2p stream lifecycle behind the two constructors above. */
 function makeFrameHandler(
 	handle: (frame: Uint8Array, from: PeerId) => Promise<Uint8Array | undefined>,
 	maxBytes: number,

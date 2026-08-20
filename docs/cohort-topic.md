@@ -1156,6 +1156,19 @@ checks. The scheme needs no trusted setup, no new crypto dependency, and no aggr
 O(k) in size (≤ ~14 × 64 bytes at the default `minSigs`) and swappable behind the `ICohortThresholdCrypto`
 port if a constant-size scheme is ever needed at larger `k`.
 
+**Stream framing.** Every one of these protocols — and the reactivity / matchmaking protocols that
+reuse the same helpers — carries exactly **one varint-length-prefixed frame in each direction** per
+stream, written and read with FRET's `sendFramed` / `readFramed`. The varint prefix is what delimits
+the message on the wire; the wire codec's own 4-byte prefix (see §Wire formats) travels *inside* the
+framed body and plays no part in stream delimiting. Two consequences are load-bearing:
+
+- **End-of-stream is not an empty message.** A reader that reaches end-of-stream before a whole frame
+  arrives raises a truncation error. A responder with no result must therefore send an explicit
+  **zero-length frame**, which the dialer resolves as empty bytes — silence on the wire now means
+  failure, not "nothing to report".
+- **One-way protocols send nothing back.** `cohort-gossip` and `promote` are fire-and-forget: the
+  dialer never reads, and typically closes the stream as soon as its frame is written.
+
 Application-specific protocols (notification delivery for reactivity, query for matchmaking, etc.) live under their own subsystem prefix and reuse only the cohort identity and primary/backup assignment from this layer.
 
 ### RouteAndMaybeAct usage
@@ -1305,8 +1318,9 @@ All messages are JSON, length-prefixed UTF-8, with byte fields encoded as base64
 > **Canonical codec.** The implementation lives in
 > [`packages/db-core/src/cohort-topic/wire`](../packages/db-core/src/cohort-topic/wire) — the
 > single source of truth for these shapes and their serialization. Framing is a **4-byte
-> big-endian unsigned length prefix** over the UTF-8 JSON body (so a frame is self-delimiting on a
-> stream), and a frame whose declared body length exceeds `max_message_bytes` (default 1 MiB,
+> big-endian unsigned length prefix** over the UTF-8 JSON body (this is the codec's own internal
+> prefix; stream delimiting is the separate varint prefix described in §Protocol IDs), and a frame
+> whose declared body length exceeds `max_message_bytes` (default 1 MiB,
 > pending an exact bound derived from `topics_max` × the cohort-gossip per-summary size) is
 > rejected before allocation. Byte fields are base64url **without padding**. Decode validates
 > structure per message type and throws a typed `CohortWireError` on any malformed or oversized

@@ -9,6 +9,11 @@
  * (`protocol-client.ts`, the cluster/repo/sync/dispute services) already uses, keeping the stream
  * lifecycle (open → send → close-write → read → close) consistent across all protocol families.
  *
+ * NOTE: every `sendFramed` here discards its boolean result (`false` = "write accepted, transport
+ * buffer now full"), so these helpers apply no backpressure. Harmless while each protocol writes
+ * exactly one bounded frame per stream and then closes; if a caller ever writes repeatedly on one
+ * stream, honor the flag by awaiting the stream's `'drain'` event the way FRET's `rpcRequest` does.
+ *
  * {@link openStream} deliberately duplicates FRET's `rpc/protocols.ts#openRpcStream` connection
  * selection. FRET now exports `openRpcStream`, but the accepted tradeoff on
  * {@link STREAM_OPTIONS} is why the local copy stays: FRET's helper pins `negotiateFully: false`,

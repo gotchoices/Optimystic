@@ -174,9 +174,9 @@ export function createMatchmakingQueryHandler(
 			return encodeQueryReplyV1(reply, maxBytes);
 		} catch (err) {
 			// Any failure — a malformed/foreign query (decode), an oversize reply (encode), or a transient
-			// `sign` rejection — must never throw out of the stream handler: log + no reply. The outer
-			// `handleRequestResponse` would otherwise abort the stream; a clean no-reply lets the seeker treat
-			// it as a benign empty advisory result. Mirrors the reactivity recover serve handler exactly.
+			// `sign` rejection — must never throw out of the stream handler: log + no reply. Throwing would
+			// make `handleRequestResponse` abort the stream; returning `undefined` makes it reply with an
+			// explicit zero-length frame, which the seeker maps to a benign empty advisory result.
 			log("matchmaking query serve: dropping query (no reply): %o", err);
 			return undefined;
 		}
