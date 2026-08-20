@@ -3,6 +3,8 @@ import { waitFor, delay } from '@optimystic/db-core/test';
 import { generateKeyPair } from '@libp2p/crypto/keys';
 import { peerIdFromPrivateKey } from '@libp2p/peer-id';
 import type { PrivateKey, PeerId } from '@libp2p/interface';
+import * as lp from 'it-length-prefixed';
+import type { Uint8ArrayList } from 'uint8arraylist';
 import {
 	RingHash,
 	createTierAddressing,
@@ -86,11 +88,12 @@ function makeFakeNode(peerId: PeerId): FakeNode {
 	};
 }
 
-/** A stream that yields exactly one frame then completes — what the host's frame handler reads. */
-function singleFrameStream(frame: Uint8Array): AsyncIterable<Uint8Array> & { send: () => void; close: () => Promise<void>; abort: () => void } {
+/** A stream that yields exactly one varint-length-prefixed frame (as `sendFramed` writes it) then
+ * completes — what the host's frame handler reads via `readFramed`. */
+function singleFrameStream(frame: Uint8Array): AsyncIterable<Uint8Array | Uint8ArrayList> & { send: () => void; close: () => Promise<void>; abort: () => void } {
 	return {
-		[Symbol.asyncIterator]: async function* (): AsyncGenerator<Uint8Array> {
-			yield frame;
+		[Symbol.asyncIterator]: async function* (): AsyncGenerator<Uint8ArrayList> {
+			yield lp.encode.single(frame);
 		},
 		send: (): void => {},
 		close: (): Promise<void> => Promise.resolve(),

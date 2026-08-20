@@ -57,7 +57,7 @@
 import type { Libp2p } from "libp2p";
 import type { Connection, PeerId, PrivateKey, Stream } from "@libp2p/interface";
 import type { FretService } from "p2p-fret";
-import { hashPeerId, readAllBounded } from "p2p-fret";
+import { hashPeerId, readFramed, sendFramed } from "p2p-fret";
 import {
 	RingHash,
 	createRegistrationStore,
@@ -2866,7 +2866,16 @@ async function registerProtocolHandlers(
 	]);
 }
 
-/** Wrap a frame handler in the read-one / reply-one libp2p stream lifecycle. */
+/**
+ * Wrap a frame handler in the read-one / reply-one libp2p stream lifecycle.
+ *
+ * `undefined` from `handle` means "one-way protocol, send nothing" (gossip, promote — their dialers
+ * use `sendOneWay` and never read, and often have already closed the stream). Every protocol whose
+ * dialer *reads* a reply (register, membership, sign) must return a frame — an empty one for
+ * "no result" — because the dialer's `readFramed` treats bare end-of-stream as a truncation error,
+ * not an empty reply. `stream-util.ts#handleRequestResponse` differs here: all of its consumers are
+ * read-reply protocols, so it frames `undefined` as an explicit zero-length frame itself.
+ */
 function makeFrameHandler(
 	handle: (frame: Uint8Array, from: PeerId) => Promise<Uint8Array | undefined>,
 	maxBytes: number,
@@ -2874,10 +2883,10 @@ function makeFrameHandler(
 	return (stream: Stream, connection: Connection): void => {
 		void (async (): Promise<void> => {
 			try {
-				const frame = await readAllBounded(stream, maxBytes);
+				const frame = await readFramed(stream, maxBytes);
 				const reply = await handle(frame, connection.remotePeer);
 				if (reply !== undefined) {
-					stream.send(reply);
+					sendFramed(stream, reply);
 				}
 				await stream.close();
 			} catch {

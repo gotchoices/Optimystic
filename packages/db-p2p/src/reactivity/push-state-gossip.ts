@@ -40,7 +40,7 @@ import {
 } from "@optimystic/db-core";
 import type { Libp2p } from "libp2p";
 import type { Connection, Stream } from "@libp2p/interface";
-import { readAllBounded } from "p2p-fret";
+import { readFramed } from "p2p-fret";
 import type { FretCohortGossipTransport } from "../cohort-topic/cohort-gossip-transport.js";
 import { DEFAULT_GOSSIP_INTERVAL_MS } from "../cohort-topic/cohort-gossip-driver.js";
 import { DEFAULT_STREAM_MAX_BYTES } from "../cohort-topic/stream-util.js";
@@ -276,7 +276,7 @@ export function registerPushStateGossipHandler(
 	void node.handle(protocol, (stream: Stream, connection: Connection) => {
 		void (async (): Promise<void> => {
 			try {
-				const frame = await readAllBounded(stream, maxBytes);
+				const frame = await readFramed(stream, maxBytes);
 				driver.deliver(connection.remotePeer.toString(), frame);
 				await stream.close();
 			} catch {

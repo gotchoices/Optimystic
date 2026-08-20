@@ -2,6 +2,9 @@ import { expect } from 'chai';
 import { generateKeyPair } from '@libp2p/crypto/keys';
 import { peerIdFromPrivateKey, peerIdFromString } from '@libp2p/peer-id';
 import type { PeerId } from '@libp2p/interface';
+import * as lp from 'it-length-prefixed';
+import type { Uint8ArrayList } from 'uint8arraylist';
+import { readFramed } from 'p2p-fret';
 import {
 	bytesToB64url,
 	encodeNotificationV1,
@@ -45,11 +48,17 @@ const sampleNotification = (revision: number): NotificationV1 => ({
 	signers: [bytesToB64url(new Uint8Array([8]))],
 });
 
-/** A captured outbound dial: which target, which protocol, and the framed bytes that were sent. */
+/** A captured outbound dial: which target, which protocol, and the framed bytes that were sent
+ * (`sendFramed` writes the varint prefix + body as one `Uint8ArrayList`). */
 interface SentFrame {
 	target: string;
 	protocol: string;
-	frame: Uint8Array;
+	frame: Uint8Array | Uint8ArrayList;
+}
+
+/** Unwrap one `sendFramed`-framed chunk back to its body, via FRET's own `readFramed`. */
+function unframe(framed: Uint8Array | Uint8ArrayList): Promise<Uint8Array> {
+	return readFramed((async function* (): AsyncGenerator<Uint8Array | Uint8ArrayList> { yield framed; })(), 1024 * 1024);
 }
 
 /**
@@ -70,7 +79,7 @@ function makeCapturingNode(opts: { dead?: Set<string> } = {}): { node: unknown; 
 				return Promise.reject(new Error(`unreachable: ${target}`));
 			}
 			return Promise.resolve({
-				send: (frame: Uint8Array): void => { sent.push({ target, protocol, frame }); },
+				send: (frame: Uint8Array | Uint8ArrayList): boolean => { sent.push({ target, protocol, frame }); return true; },
 				close: (): Promise<void> => Promise.resolve(),
 				abort: (): void => {},
 			});
@@ -91,13 +100,16 @@ describe('reactivity / notify transport', () => {
 		expect(sent, 'one dial was made').to.have.length(1);
 		expect(sent[0]!.target).to.equal(target);
 		expect(sent[0]!.protocol).to.equal(PROTOCOL_REACTIVITY_NOTIFY);
-		expect([...sent[0]!.frame], 'the framed bytes are exactly encodeNotificationV1(n)').to.deep.equal([...encodeNotificationV1(n)]);
+		// The send side frames the body with sendFramed; unwrapping it with FRET's own readFramed
+		// must recover exactly encodeNotificationV1(n) — the two halves of the framing agree.
+		const body = await unframe(sent[0]!.frame);
+		expect([...body], 'the framed body is exactly encodeNotificationV1(n)').to.deep.equal([...encodeNotificationV1(n)]);
 
-		// Feed the captured frame back through deliver — the decoded notification must be byte-identical.
+		// Feed the unframed body back through deliver — the decoded notification must be byte-identical.
 		const received: Array<{ from: PeerRef; n: NotificationV1 }> = [];
 		tx.onNotification((from, m) => received.push({ from, n: m }));
 		const fromPeer = await peerIdString();
-		tx.deliver(fromPeer, sent[0]!.frame);
+		tx.deliver(fromPeer, body);
 
 		expect(received, 'the subscriber saw the delivered notification').to.have.length(1);
 		expect(received[0]!.n, 'decode is faithful to the originally-sent notification').to.deep.equal(n);
@@ -182,7 +194,8 @@ describe('reactivity / notify transport', () => {
 		const frame = encodeNotificationV1(n);
 		let replied = false;
 		const stream = {
-			[Symbol.asyncIterator]: async function* (): AsyncGenerator<Uint8Array> { yield frame; },
+			// The inbound bytes arrive framed, as sendFramed writes them.
+			[Symbol.asyncIterator]: async function* (): AsyncGenerator<Uint8ArrayList> { yield lp.encode.single(frame); },
 			send: (): void => { replied = true; },
 			close: (): Promise<void> => Promise.resolve(),
 			abort: (): void => {},
@@ -207,16 +220,23 @@ describe('reactivity / notify transport', () => {
 		const tx = new Libp2pReactivityNotifyTransport(dialNode as never);
 		let fired = 0;
 		tx.onNotification(() => { fired++; });
-		// A tiny read ceiling forces readAllBounded to reject the (larger) inbound frame.
+		// A tiny read ceiling forces readFramed to reject the (larger) inbound frame at its prefix.
 		registerNotifyHandler(handleNode as never, PROTOCOL_REACTIVITY_NOTIFY, tx, 4);
 
 		const handler = handlers.get(PROTOCOL_REACTIVITY_NOTIFY);
 		const fromPeer = await peerIdString();
-		const frame = encodeNotificationV1(sampleNotification(11));
-		expect(frame.length, 'the frame is larger than the read ceiling').to.be.greaterThan(4);
+		const body = encodeNotificationV1(sampleNotification(11));
+		expect(body.length, 'the body is larger than the read ceiling').to.be.greaterThan(4);
+		// Pin the mechanism: a properly framed over-ceiling body rejects with the stable
+		// PayloadTooLargeError identity at the varint prefix, before any body byte is pulled.
+		const err = await readFramed(
+			(async function* (): AsyncGenerator<Uint8ArrayList> { yield lp.encode.single(body); })(),
+			4,
+		).then(() => undefined, (e: unknown) => e as Error);
+		expect(err?.name, 'the over-ceiling rejection is PayloadTooLargeError').to.equal('PayloadTooLargeError');
 		let aborted = false;
 		const stream = {
-			[Symbol.asyncIterator]: async function* (): AsyncGenerator<Uint8Array> { yield frame; },
+			[Symbol.asyncIterator]: async function* (): AsyncGenerator<Uint8ArrayList> { yield lp.encode.single(body); },
 			send: (): void => {},
 			close: (): Promise<void> => Promise.resolve(),
 			abort: (): void => { aborted = true; },

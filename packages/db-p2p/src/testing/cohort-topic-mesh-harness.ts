@@ -23,6 +23,8 @@
 import { generateKeyPair } from '@libp2p/crypto/keys';
 import { peerIdFromPrivateKey } from '@libp2p/peer-id';
 import type { PrivateKey, PeerId } from '@libp2p/interface';
+import * as lp from 'it-length-prefixed';
+import type { Uint8ArrayList } from 'uint8arraylist';
 import { hashPeerId, type RouteAndMaybeActV1, type NearAnchorV1 } from 'p2p-fret';
 import {
 	RingHash,
@@ -97,22 +99,29 @@ export async function makeMembers(n: number): Promise<Member[]> {
 	return out;
 }
 
-// --- in-process duplex stream (what readAllBounded iterates) ---
+// --- in-process duplex stream (what readFramed iterates) ---
 
 /**
- * One end of an in-memory duplex pipe. `send` enqueues a frame onto the *peer's* inbox; `close`
- * (half-close-write) signals EOF to the peer's reader. The async iterator yields this end's inbox until
- * the peer closed its write and the buffer drains — so `p2p-fret`'s `readAllBounded` reads exactly the
- * frames the other end wrote, then completes promptly on EOF (no idle-timeout wait).
+ * One end of an in-memory duplex pipe. `send` enqueues a chunk onto the *peer's* inbox; `close`
+ * (half-close-write) signals EOF to the peer's reader. The async iterator yields this end's inbox, so
+ * `p2p-fret`'s `readFramed` decodes exactly one varint-length-prefixed frame from the chunks the other
+ * end wrote — the varint prefix delimits the frame; EOF before a whole frame is a truncation error.
+ *
+ * Chunks are `Uint8Array | Uint8ArrayList` because `sendFramed` writes the prefix + body as one
+ * `Uint8ArrayList`; `send` returns `true` ("queue has room"), matching the `stream.send` signature
+ * `sendFramed` passes through. Deliberately NOT carrying `closeRead` / `addEventListener` /
+ * `removeEventListener` / `push` / `log`: `readFramed` duck-types the full libp2p message-stream
+ * surface onto its `byteStream` path, and this stub must stay on the plain-iterable path.
  */
 export class MockStreamEnd {
-	private readonly inbox: Uint8Array[] = [];
+	private readonly inbox: (Uint8Array | Uint8ArrayList)[] = [];
 	private inboundClosed = false;
 	private waiter: (() => void) | undefined;
 	public peer!: MockStreamEnd;
 
-	send(frame: Uint8Array): void {
+	send(frame: Uint8Array | Uint8ArrayList): boolean {
 		this.peer.accept(frame);
+		return true;
 	}
 
 	close(): Promise<void> {
@@ -124,7 +133,7 @@ export class MockStreamEnd {
 		this.peer.endInbound();
 	}
 
-	private accept(frame: Uint8Array): void {
+	private accept(frame: Uint8Array | Uint8ArrayList): void {
 		this.inbox.push(frame);
 		this.wake();
 	}
@@ -140,7 +149,7 @@ export class MockStreamEnd {
 		w?.();
 	}
 
-	async *[Symbol.asyncIterator](): AsyncGenerator<Uint8Array> {
+	async *[Symbol.asyncIterator](): AsyncGenerator<Uint8Array | Uint8ArrayList> {
 		for (;;) {
 			if (this.inbox.length > 0) {
 				yield this.inbox.shift()!;
@@ -228,7 +237,8 @@ export class MockNode {
 		}
 		const [dialerEnd, handlerEnd] = streamPair();
 		handler(handlerEnd, { remotePeer: from });
-		dialerEnd.send(frame);
+		// Frame exactly as `sendFramed` does — the handler's `readFramed` expects a varint prefix.
+		dialerEnd.send(lp.encode.single(frame));
 		void dialerEnd.close();
 	}
 }

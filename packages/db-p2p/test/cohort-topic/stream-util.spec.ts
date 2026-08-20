@@ -17,13 +17,14 @@ describe('cohort-topic: stream-util connection selection', () => {
 	const PROTOCOL = '/test/1.0.0';
 	const FRAME = new Uint8Array([1]);
 
-	/** A stream that accepts a frame and yields nothing back, so `readAllBounded` returns empty. */
+	/** A stream that accepts a frame and yields one framed empty body (a lone `0x00` varint prefix),
+	 * so `requestResponse`'s `readFramed` resolves with an empty reply rather than a truncation error. */
 	function makeStream() {
 		return {
 			send: () => {},
 			close: async () => {},
 			[Symbol.asyncIterator]: async function* () {
-				/* immediately closed — no frame */
+				yield new Uint8Array([0x00]);
 			},
 		} as any;
 	}

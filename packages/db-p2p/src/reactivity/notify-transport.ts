@@ -7,10 +7,10 @@
  * who to dial and calls {@link ReactivityNotifyTransport.send} once per named target. This module owns only
  * the framing + dial + inbound-decode plumbing — no fan-out, no role decision, no gossip.
  *
- * The db-core `NotificationV1` codec ({@link encodeNotificationV1} / {@link decodeNotificationV1}) does the
- * length-prefixed JSON framing; this layer rides one self-delimiting frame each way over the notify
- * protocol, reusing the cohort-topic {@link sendOneWay} / {@link readAllBounded} stream lifecycle so the
- * two protocol families behave identically on the wire.
+ * The db-core `NotificationV1` codec ({@link encodeNotificationV1} / {@link decodeNotificationV1}) encodes
+ * the body; this layer rides one varint-length-prefixed frame each way over the notify protocol, reusing
+ * the cohort-topic {@link sendOneWay} / FRET `readFramed` stream lifecycle so the two protocol families
+ * behave identically on the wire.
  *
  * Failure isolation is the load-bearing property: notify is fire-and-forget and hint-only, so a dead /
  * unreachable target's rejection is swallowed (logged), never propagated to the caller's fan-out loop or a
@@ -23,7 +23,7 @@ import { encodeNotificationV1, decodeNotificationV1 } from "@optimystic/db-core"
 import type { Libp2p } from "libp2p";
 import type { Connection, Stream } from "@libp2p/interface";
 import { peerIdFromString } from "@libp2p/peer-id";
-import { readAllBounded } from "p2p-fret";
+import { readFramed } from "p2p-fret";
 import { peerIdToBytes } from "../cohort-topic/peer-codec.js";
 import { sendOneWay, DEFAULT_STREAM_MAX_BYTES } from "../cohort-topic/stream-util.js";
 import { PROTOCOL_REACTIVITY_NOTIFY } from "./protocols.js";
@@ -129,7 +129,7 @@ export function registerNotifyHandler(
 	void node.handle(protocol, (stream: Stream, connection: Connection) => {
 		void (async (): Promise<void> => {
 			try {
-				const frame = await readAllBounded(stream, maxBytes);
+				const frame = await readFramed(stream, maxBytes);
 				transport.deliver(connection.remotePeer.toString(), frame);
 				await stream.close();
 			} catch {
