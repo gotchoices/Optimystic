@@ -8,6 +8,7 @@ import { encodePeers, type RedirectPayload } from './redirect.js'
 import { MAX_BLOCK_MESSAGE_BYTES } from '../protocol-limits.js'
 import type { Uint8ArrayList } from 'uint8arraylist'
 import { createLogger } from '../logger.js'
+import { publishableConnectionAddr, type AddressLog, type DirectionalConnection } from '../peer-address-book.js'
 import { createInboundStreamAuthorization, type InboundStreamAuthorization, type InboundStreamAuthorizationInit } from '../inbound-authorization.js'
 
 const debugLog = createLogger('repo-service')
@@ -155,11 +156,14 @@ export class RepoService implements Startable {
 		if (this.components.getConnectionAddrs) return this.components.getConnectionAddrs(peerId)
 		const libp2p = this.getLibp2p() as any
 		if (!libp2p?.getConnections) return []
-		const conns: any[] = libp2p.getConnections(peerId) ?? []
+		// A redirect payload goes to a THIRD party, so only an outbound connection's remoteAddr
+		// qualifies — see `publishableConnectionAddr`.
+		const conns: DirectionalConnection[] = libp2p.getConnections(peerId) ?? []
+		const log: AddressLog = (fmt, ...args) => this.log.error(fmt, ...args)
 		const addrs: string[] = []
 		for (const c of conns) {
-			const addr = c.remoteAddr?.toString?.()
-			if (addr) addrs.push(addr)
+			const addr = publishableConnectionAddr(c, log)
+			if (addr !== undefined) addrs.push(addr)
 		}
 		return addrs
 	}

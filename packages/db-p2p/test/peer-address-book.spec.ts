@@ -11,7 +11,7 @@ import { generateKeyPair } from '@libp2p/crypto/keys';
 import { peerIdFromPrivateKey } from '@libp2p/peer-id';
 import type { PeerId } from '@libp2p/interface';
 import type { Multiaddr } from '@multiformats/multiaddr';
-import { mergePeerAddresses, mergeRecordPeerAddresses, validMultiaddrStrings, MAX_MERGED_ADDRS_PER_PEER, MAX_LEARNED_PEERS_PER_RECORD, type PeerAddressBookHost } from '../src/peer-address-book.js';
+import { mergePeerAddresses, mergeRecordPeerAddresses, publishableConnectionAddr, validMultiaddrStrings, MAX_MERGED_ADDRS_PER_PEER, MAX_LEARNED_PEERS_PER_RECORD, type PeerAddressBookHost } from '../src/peer-address-book.js';
 
 const makePeerId = async (): Promise<PeerId> => peerIdFromPrivateKey(await generateKeyPair('Ed25519'));
 
@@ -51,6 +51,52 @@ describe('peer-address-book', () => {
 			expect(kept).to.deep.equal(['/ip4/127.0.0.1/tcp/4001', '/dns4/example.com/tcp/443/wss']);
 			expect(lines.filter(l => l.startsWith('WARN: invalid multiaddr'))).to.have.length(1);
 		});
+	});
+
+	/**
+	 * Ticket: findcluster-publishes-inbound-source-addresses (gotchoices/Optimystic#13).
+	 *
+	 * `validMultiaddrStrings` answers "may we CARRY this string"; this answers "may we HAND this
+	 * connection's address to a third party". The two differ on exactly one axis — direction —
+	 * because an inbound connection's `remoteAddr` is the far side's ephemeral source socket
+	 * rather than anything it listens on. Table-driven over the address forms that actually occur,
+	 * so a future edit cannot quietly reintroduce a permissive rule for one of them.
+	 */
+	describe('publishableConnectionAddr', () => {
+		// `{RELAY}` / `{DIALER}` are substituted with freshly generated peer ids inside each case:
+		// a `/p2p/` component only parses if it is a real peer id, so a placeholder literal would
+		// make the circuit rows fail as *unparseable* and silently stop testing direction at all.
+		const cases: Array<{ what: string, direction: string | undefined, addr: string | undefined, publishable: boolean }> = [
+			{ what: 'a direct address we dialed', direction: 'outbound', addr: '/ip4/10.0.0.5/tcp/4001', publishable: true },
+			{ what: 'a circuit address we dialed through a relay', direction: 'outbound', addr: '/ip4/10.0.0.9/tcp/4001/p2p/{RELAY}/p2p-circuit', publishable: true },
+			{ what: 'the source socket of a direct connection they dialed', direction: 'inbound', addr: '/ip4/127.0.0.1/tcp/58247/ws', publishable: false },
+			// Composed by @libp2p/circuit-relay-v2 as <our own hop to the relay> + /p2p-circuit/p2p/<dialer>,
+			// so it is only dialable if OUR hop was outbound. The good version of this address reaches us
+			// through identify instead, so keeping it here would buy nothing and reintroduce the same class
+			// of bug one hop down.
+			{ what: 'the composed address of a relayed connection they dialed', direction: 'inbound', addr: '/ip4/10.0.0.9/tcp/4001/p2p/{RELAY}/p2p-circuit/p2p/{DIALER}', publishable: false },
+			{ what: 'an outbound connection with an unparseable address', direction: 'outbound', addr: 'not-a-multiaddr', publishable: false },
+			// The empty string parses as the root multiaddr `/` and encodes to zero bytes.
+			{ what: 'an outbound connection with an empty address', direction: 'outbound', addr: '', publishable: false },
+			{ what: 'an outbound connection with no address at all', direction: 'outbound', addr: undefined, publishable: false },
+			// Real libp2p always sets `direction`; a stub that omits it must NOT inherit the old,
+			// permissive behavior by default.
+			{ what: 'a connection that declares no direction', direction: undefined, addr: '/ip4/10.0.0.5/tcp/4001', publishable: false }
+		];
+
+		for (const c of cases) {
+			it(`${c.publishable ? 'publishes' : 'refuses'} ${c.what}`, async () => {
+				const relay = await makePeerId();
+				const dialer = await makePeerId();
+				const addr = c.addr?.replace('{RELAY}', relay.toString()).replace('{DIALER}', dialer.toString());
+				const { log } = makeLog();
+				const conn = {
+					direction: c.direction,
+					...(addr === undefined ? {} : { remoteAddr: { toString: () => addr } })
+				};
+				expect(publishableConnectionAddr(conn, log)).to.equal(c.publishable ? addr : undefined);
+			});
+		}
 	});
 
 	describe('mergePeerAddresses', () => {

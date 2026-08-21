@@ -26,7 +26,7 @@ import { assertClusterSizeCoupling } from './cluster/cluster-size-coupling.js';
 import { createCommitCertStore, makeClusterCommitCertExtractor, type CommitCertStore } from './cluster/commit-cert.js';
 import { coordinatorRepo } from './repo/coordinator-repo.js';
 import { Libp2pKeyPeerNetwork, type NetworkMode, type NetworkStatePersistence } from './libp2p-key-network.js';
-import { mergePeerAddresses, type AddressLog } from './peer-address-book.js';
+import { mergePeerAddresses, publishableConnectionAddr, type AddressLog } from './peer-address-book.js';
 import type { OptimysticNode, OptimysticNodeAttachments } from './optimystic-node.js';
 import { ClusterClient } from './cluster/client.js';
 import type { IRepo, ICluster, ITransactionValidator, BlockId, IBlockChangeNotifier } from '@optimystic/db-core';
@@ -570,13 +570,16 @@ export async function createLibp2pNodeBase(
 					// libp2p component, available at service-construction time.
 					peerId: components.peerId,
 					// Fallback addr resolver for redirect targets whose multiaddrs are not
-					// already embedded in record.peers.
+					// already embedded in record.peers. A redirect payload is handed to a THIRD
+					// party, so it obeys the same rule the cluster record does — see
+					// `publishableConnectionAddr`: only an outbound connection's remoteAddr is an
+					// address anyone else can reach.
 					getConnectionAddrs: (peerId: any) => {
 						const conns = liveNode?.getConnections?.(peerId) ?? [];
 						const addrs: string[] = [];
 						for (const c of conns) {
-							const addr = c.remoteAddr?.toString?.();
-							if (addr) addrs.push(addr);
+							const addr = publishableConnectionAddr(c, addressLog);
+							if (addr !== undefined) addrs.push(addr);
 						}
 						return addrs;
 					},

@@ -5,7 +5,7 @@ import { peerIdFromString } from '@libp2p/peer-id'
 import type { FretService, SerializedTable } from 'p2p-fret'
 import { hashKey } from 'p2p-fret'
 import { createLogger, verbose } from './logger.js'
-import { mergePeerAddresses, validMultiaddrStrings } from './peer-address-book.js'
+import { mergePeerAddresses, publishableConnectionAddr, validMultiaddrStrings } from './peer-address-book.js'
 import type { IPeerReputation } from './reputation/types.js'
 
 interface WithFretService { services?: { fret?: FretService } }
@@ -836,13 +836,23 @@ export class Libp2pKeyPeerNetwork implements IKeyNetwork, IPeerNetwork {
 		);
 	}
 
+	/**
+	 * Connection-derived addresses for the cluster record, keyed by peer id.
+	 *
+	 * Only OUTBOUND connections contribute — see {@link publishableConnectionAddr} for why an
+	 * inbound connection's `remoteAddr` is an ephemeral source socket that no third party can
+	 * reach. This is the only place `findCluster` derives addresses from connections, so the
+	 * rule has exactly one site.
+	 */
 	private getConnectedAddrsByPeer(): Record<string, string[]> {
 		const conns = this.libp2p.getConnections()
 		const byPeer: Record<string, string[]> = {}
 		for (const c of conns) {
+			const addr = publishableConnectionAddr(c, (fmt, ...args) => this.log(fmt, ...args))
+			if (addr === undefined) continue
 			const id = c.remotePeer.toString()
-			const addr = c.remoteAddr?.toString?.()
-			if (addr) (byPeer[id] ??= []).push(addr)
+			const forPeer = byPeer[id] ??= []
+			forPeer.push(addr)
 		}
 		return byPeer
 	}
@@ -956,10 +966,12 @@ export class Libp2pKeyPeerNetwork implements IKeyNetwork, IPeerNetwork {
 			}
 			const connectedStrings = connectedByPeer[idStr] ?? []
 			const peerStoreStrings = peerStoreAddrs[idStr] ?? []
-			// De-duplicate while preserving connected-first ordering. The
-			// connected multiaddr is the one libp2p just used to reach this peer
-			// and is the most reliable; peerStore addrs are the fallback for
-			// cohort members we know-of but aren't currently connected to.
+			// De-duplicate while preserving connected-first ordering. A connected
+			// multiaddr that reaches this list is one we OUTBOUND-dialed, so it is the
+			// address libp2p just used to reach this peer and is the most reliable;
+			// peerStore addrs are the fallback for cohort members we know-of but aren't
+			// currently connected to — and the only source for a member that only ever
+			// dialed US (see `getConnectedAddrsByPeer`).
 			const merged = Array.from(new Set([...connectedStrings, ...peerStoreStrings]))
 			const parsed = this.parseMultiaddrs(merged)
 			const remotePeerId = peerIdFromString(idStr)

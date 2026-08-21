@@ -44,22 +44,60 @@ export type AddressLog = (fmt: string, ...args: unknown[]) => void
  * "an address string we are willing to carry".
  */
 export function validMultiaddrStrings(addrs: string[], log: AddressLog): string[] {
-	const out: string[] = []
-	for (const a of addrs) {
-		try {
-			// An empty string parses as the root multiaddr `/` — syntactically fine, addresses
-			// nothing, and encodes to zero bytes. Reject it so a blank entry can't occupy a slot
-			// in the address book (or in the per-message cap).
-			if (multiaddr(a).bytes.length === 0) {
-				log('WARN: multiaddr addresses nothing %s', a)
-				continue
-			}
-			out.push(a)
-		} catch (err) {
-			log('WARN: invalid multiaddr %s %o', a, err)
+	return addrs.filter(a => isCarriableMultiaddrString(a, log))
+}
+
+/** One address string's verdict, shared by {@link validMultiaddrStrings} and {@link publishableConnectionAddr}. */
+function isCarriableMultiaddrString(addr: string, log: AddressLog): boolean {
+	try {
+		// An empty string parses as the root multiaddr `/` — syntactically fine, addresses
+		// nothing, and encodes to zero bytes. Reject it so a blank entry can't occupy a slot
+		// in the address book (or in the per-message cap).
+		if (multiaddr(addr).bytes.length === 0) {
+			log('WARN: multiaddr addresses nothing %s', addr)
+			return false
 		}
+		return true
+	} catch (err) {
+		log('WARN: invalid multiaddr %s %o', addr, err)
+		return false
 	}
-	return out
+}
+
+/**
+ * The slice of a libp2p `Connection` that decides whether its remote address may be published.
+ *
+ * `direction` is populated on every connection libp2p creates; it is optional here only because
+ * unit stubs build connection literals by hand — and a missing `direction` is deliberately treated
+ * as NOT publishable, so a stub cannot silently opt back into the pre-fix behavior.
+ */
+export interface DirectionalConnection {
+	direction?: string
+	remoteAddr?: { toString?: () => string }
+}
+
+/**
+ * A live connection's remote address, when it is one we may publish to a **third** party —
+ * otherwise `undefined`.
+ *
+ * The companion to {@link validMultiaddrStrings}: that answers "an address string we are willing
+ * to carry", this answers "an address we are willing to hand to someone else". They are not the
+ * same question, because an inbound connection's `remoteAddr` is not an address at all in the
+ * sense a third party needs. For an **outbound** connection it is the address we dialed — a real
+ * listen (or circuit) address that anyone can reach the peer on. For an **inbound** one it is the
+ * far side's *ephemeral source socket*: the port their operating system picked for this single
+ * connection. It is reachable by nobody else, it is indistinguishable from a listen address once
+ * it is on the wire, and it takes a slot against {@link MAX_MERGED_ADDRS_PER_PEER} in every peer
+ * that merges it. So the cure has to be here, at the producer.
+ *
+ * An inbound-only peer loses nothing by this: its own advertised addresses reach us through
+ * `identify`/`identifyPush` and are published from the peerStore instead.
+ */
+export function publishableConnectionAddr(conn: DirectionalConnection, log: AddressLog): string | undefined {
+	if (conn.direction !== 'outbound') return undefined
+	const addr = conn.remoteAddr?.toString?.()
+	if (addr === undefined) return undefined
+	return isCarriableMultiaddrString(addr, log) ? addr : undefined
 }
 
 /**

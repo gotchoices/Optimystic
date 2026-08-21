@@ -20,16 +20,24 @@ import { tcp } from '@libp2p/tcp';
 import { circuitRelayTransport } from '@libp2p/circuit-relay-v2';
 import { multiaddr, type Multiaddr } from '@multiformats/multiaddr';
 import { createLibp2pNode, type Libp2pTransports } from '../../src/libp2p-node.js';
+import type { OptimysticNode } from '../../src/optimystic-node.js';
 
 /** Default loopback bind host. Override with a non-private IP for real hole-punch runs. */
 export const DEFAULT_HOST = '127.0.0.1';
 
-/** Single-peer cluster scaffold shared by every node these specs spawn. */
-const CLUSTER_SCAFFOLD = {
-	clusterSize: 1,
+/**
+ * Cluster scaffold shared by every node these specs spawn.
+ *
+ * `clusterSize` defaults to 1 — enough for the specs that only care about transports and
+ * addresses. Raise it when a spec needs `findCluster` to admit a NON-self member: the cohort
+ * reserves one slot for self and keeps only `clusterSize - 1` others, so at 1 every cohort is
+ * self-only regardless of who is connected.
+ */
+const clusterScaffold = (clusterSize = 1) => ({
+	clusterSize,
 	clusterPolicy: { allowDownsize: true, sizeTolerance: 1.0 },
 	arachnode: { enableRingZulu: false }
-} as const;
+});
 
 export interface SpawnRelayOpts {
 	/** Bind host for the relay's TCP + WS listeners. Defaults to loopback. */
@@ -41,10 +49,12 @@ export interface SpawnRelayOpts {
 	 * control case passes `true` to prove the cap resets sustained traffic.
 	 */
 	applyDefaultLimit?: boolean;
+	/** See {@link clusterScaffold}. Defaults to 1 (self-only cohorts). */
+	clusterSize?: number;
 }
 
 /** Relay node: TCP + WS + circuit-relay server. */
-export async function spawnRelayNode(network: string, opts: SpawnRelayOpts = {}): Promise<Libp2p> {
+export async function spawnRelayNode(network: string, opts: SpawnRelayOpts = {}): Promise<OptimysticNode> {
 	const host = opts.host ?? DEFAULT_HOST;
 	const transports: Libp2pTransports = [tcp(), webSockets(), circuitRelayTransport()];
 	return await createLibp2pNode({
@@ -58,7 +68,7 @@ export async function spawnRelayNode(network: string, opts: SpawnRelayOpts = {})
 		},
 		transports,
 		listenAddrs: [`/ip4/${host}/tcp/0`, `/ip4/${host}/tcp/0/ws`],
-		...CLUSTER_SCAFFOLD
+		...clusterScaffold(opts.clusterSize)
 	});
 }
 
@@ -67,6 +77,8 @@ export interface SpawnTcpPeerOpts {
 	host?: string;
 	/** Also listen on `<relayAddr>/p2p-circuit` so the peer is reachable via the relay. */
 	listenOnCircuit?: boolean;
+	/** See {@link clusterScaffold}. Defaults to 1 (self-only cohorts). */
+	clusterSize?: number;
 }
 
 /**
@@ -78,7 +90,7 @@ export async function spawnTcpServicePeer(
 	network: string,
 	relayAddr: Multiaddr,
 	opts: SpawnTcpPeerOpts = {}
-): Promise<Libp2p> {
+): Promise<OptimysticNode> {
 	const host = opts.host ?? DEFAULT_HOST;
 	const transports: Libp2pTransports = [tcp(), circuitRelayTransport()];
 	const listenAddrs = [`/ip4/${host}/tcp/0`];
@@ -92,7 +104,7 @@ export async function spawnTcpServicePeer(
 		relay: false,
 		transports,
 		listenAddrs,
-		...CLUSTER_SCAFFOLD
+		...clusterScaffold(opts.clusterSize)
 	});
 }
 
@@ -116,6 +128,11 @@ export function pickRelayWsAddr(node: Libp2p): Multiaddr {
 	return multiaddr(ws);
 }
 
+export interface SpawnCircuitOnlyPeerOpts {
+	/** See {@link clusterScaffold}. Defaults to 1 (self-only cohorts). */
+	clusterSize?: number;
+}
+
 /**
  * A relay-only ("browser-shaped") peer: WebSockets + circuit transport, and a listen address
  * that is ONLY the qualified circuit address through `relayAddr`. It has no direct listener, so
@@ -124,7 +141,11 @@ export function pickRelayWsAddr(node: Libp2p): Multiaddr {
  * after that connection's initial identify exchange. That ordering is what makes this shape the
  * reproduction topology for the identify/push address-propagation defect.
  */
-export async function spawnCircuitOnlyPeer(network: string, relayAddr: Multiaddr): Promise<Libp2p> {
+export async function spawnCircuitOnlyPeer(
+	network: string,
+	relayAddr: Multiaddr,
+	opts: SpawnCircuitOnlyPeerOpts = {}
+): Promise<OptimysticNode> {
 	const transports: Libp2pTransports = [webSockets(), circuitRelayTransport()];
 	return await createLibp2pNode({
 		port: 0,
@@ -133,7 +154,7 @@ export async function spawnCircuitOnlyPeer(network: string, relayAddr: Multiaddr
 		relay: false,
 		transports,
 		listenAddrs: [`${relayAddr.toString()}/p2p-circuit`],
-		...CLUSTER_SCAFFOLD
+		...clusterScaffold(opts.clusterSize)
 	});
 }
 

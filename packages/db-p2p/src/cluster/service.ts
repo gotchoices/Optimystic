@@ -5,7 +5,7 @@ import type { Startable, Logger, Stream, Connection, StreamHandler, PeerId } fro
 import type { ICluster, ClusterRecord } from '@optimystic/db-core';
 import { encodePeers, type RedirectPayload } from '../repo/redirect.js';
 import { toClusterErrorEnvelope } from './cluster-error.js';
-import { mergeRecordPeerAddresses } from '../peer-address-book.js';
+import { mergeRecordPeerAddresses, publishableConnectionAddr, type AddressLog, type DirectionalConnection } from '../peer-address-book.js';
 import { MAX_CONTROL_MESSAGE_BYTES } from '../protocol-limits.js';
 import type { Uint8ArrayList } from 'uint8arraylist';
 import { createInboundStreamAuthorization, type InboundStreamAuthorization, type InboundStreamAuthorizationInit } from '../inbound-authorization.js';
@@ -120,11 +120,14 @@ export class ClusterService implements Startable {
 		if (this.components.getConnectionAddrs) return this.components.getConnectionAddrs(pid);
 		const libp2p = this.getLibp2p();
 		if (!libp2p?.getConnections) return [];
-		const conns: any[] = libp2p.getConnections(pid) ?? [];
+		// A redirect payload goes to a THIRD party, so only an outbound connection's remoteAddr
+		// qualifies — see `publishableConnectionAddr`.
+		const conns: DirectionalConnection[] = libp2p.getConnections(pid) ?? [];
+		const log: AddressLog = (fmt, ...args) => this.log.error(fmt, ...args);
 		const addrs: string[] = [];
 		for (const c of conns) {
-			const addr = c.remoteAddr?.toString?.();
-			if (addr) addrs.push(addr);
+			const addr = publishableConnectionAddr(c, log);
+			if (addr !== undefined) addrs.push(addr);
 		}
 		return addrs;
 	}

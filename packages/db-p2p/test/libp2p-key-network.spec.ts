@@ -14,6 +14,7 @@ import {
 	type PersistedNetworkState,
 	type SelfCoordinationConfig
 } from '../src/libp2p-key-network.js';
+import { captureLog, formatCaptured, hasTag } from './support/capture-log.js';
 
 const makePeerId = async (): Promise<PeerId> => {
 	const key = await generateKeyPair('Ed25519');
@@ -23,6 +24,29 @@ const makePeerId = async (): Promise<PeerId> => {
 /** A `queued`/`active`/… entry for a mock's dial queue. */
 function pendingDial(status: PendingDial['status'], id = 'd0'): PendingDial {
 	return { id, status, multiaddrs: [] } as unknown as PendingDial;
+}
+
+/**
+ * An open stub connection for `getConnections()`.
+ *
+ * `direction` is a REQUIRED positional argument, deliberately: `findCluster` publishes a
+ * connection's `remoteAddr` only when the connection is outbound (an inbound one's `remoteAddr`
+ * is the far side's ephemeral source socket, which no third party can reach). Real libp2p always
+ * populates `direction`, so a stub that omitted it would be the only way left to exercise the
+ * old, broken behavior — hence there is no default to fall back to.
+ */
+function stubConnection(peerId: PeerId, direction: 'inbound' | 'outbound', addr: string): Connection {
+	return {
+		remotePeer: peerId,
+		status: 'open',
+		direction,
+		remoteAddr: { toString: () => addr }
+	} as unknown as Connection;
+}
+
+/** The conventional stub address for a peer in these specs: an outbound-dialed direct TCP address. */
+function outboundConnTo(peerId: PeerId): Connection {
+	return stubConnection(peerId, 'outbound', `/ip4/10.0.0.1/tcp/4001/p2p/${peerId.toString()}`);
 }
 
 /** Minimal mock Libp2p that satisfies Libp2pKeyPeerNetwork's usage */
@@ -460,10 +484,7 @@ describe('Libp2pKeyPeerNetwork', () => {
 			});
 
 			const otherPeerId = await makePeerId();
-			const mockConnection = {
-				remotePeer: otherPeerId,
-				remoteAddr: { toString: () => '/ip4/127.0.0.1/tcp/8000' }
-			} as unknown as Connection;
+			const mockConnection = stubConnection(otherPeerId, 'outbound', '/ip4/127.0.0.1/tcp/8000');
 			const libp2p = createMockLibp2p(selfPeerId, { connections: [mockConnection] });
 			const network = new Libp2pKeyPeerNetwork(libp2p, 16, undefined, 'forming', persistence);
 			await network.initFromPersistedState();
@@ -564,14 +585,6 @@ describe('Libp2pKeyPeerNetwork', () => {
 	// must also clear shouldAllowSelfCoordination() first, so a partitioned node cannot
 	// slip past the guard just because self happens to sit in the key's FRET neighborhood.
 	describe('findCoordinator() — boot-time self-selection and cache', () => {
-		function connTo(peerId: PeerId): Connection {
-			return {
-				remotePeer: peerId,
-				status: 'open',
-				remoteAddr: { toString: () => `/ip4/10.0.0.1/tcp/4001/p2p/${peerId.toString()}` }
-			} as unknown as Connection;
-		}
-
 		/**
 		 * Mock libp2p whose connection list and FRET neighbor list are MUTABLE between
 		 * calls — the shared `createMockLibp2p` helper closes over a fixed array, but
@@ -615,7 +628,7 @@ describe('Libp2pKeyPeerNetwork', () => {
 			expect((await network.findCoordinator(key)).toString()).to.equal(selfPeerId.toString());
 
 			// A real peer connects moments later and FRET learns it, nearer the key than self.
-			state.connections = [connTo(peerA)];
+			state.connections = [outboundConnTo(peerA)];
 			state.neighbors = [peerA.toString(), selfPeerId.toString()];
 
 			// The next read must route to the real peer, not to a cached boot-time self.
@@ -652,7 +665,7 @@ describe('Libp2pKeyPeerNetwork', () => {
 			network.recordCoordinator(key, selfPeerId);
 			expect((network as any).coordinatorCache.size, 'self-valued write ignored').to.equal(0);
 
-			state.connections = [connTo(peerA)];
+			state.connections = [outboundConnTo(peerA)];
 			expect((await network.findCoordinator(key)).toString()).to.equal(peerA.toString());
 		});
 
@@ -664,7 +677,7 @@ describe('Libp2pKeyPeerNetwork', () => {
 			// must still take over the key, so the fix cannot rely on a connection-time sweep.
 			const peerA = await makePeerId();
 			const { libp2p, state } = createMutableMock({
-				connections: [connTo(peerA)],
+				connections: [outboundConnTo(peerA)],
 				neighbors: [selfPeerId.toString()]
 			});
 			const network = new Libp2pKeyPeerNetwork(libp2p, 16, undefined, 'forming');
@@ -687,7 +700,7 @@ describe('Libp2pKeyPeerNetwork', () => {
 			const peerA = await makePeerId();
 			const peerB = await makePeerId();
 			const { libp2p, state } = createMutableMock({
-				connections: [connTo(peerA)],
+				connections: [outboundConnTo(peerA)],
 				neighbors: [peerA.toString()]
 			});
 			const network = new Libp2pKeyPeerNetwork(libp2p, 16, undefined, 'forming');
@@ -753,7 +766,7 @@ describe('Libp2pKeyPeerNetwork', () => {
 				connections: [],
 				neighbors: [selfPeerId.toString(), peerA.toString()]
 			});
-			state.connections = [connTo(peerA)];
+			state.connections = [outboundConnTo(peerA)];
 			const network = new Libp2pKeyPeerNetwork(libp2p, 16, { allowSelfCoordination: false }, 'forming');
 			expect(network.shouldAllowSelfCoordination().allow).to.be.false;
 
@@ -792,14 +805,6 @@ describe('Libp2pKeyPeerNetwork', () => {
 	// isolated node must accept anyway. Only a HARD denial — an explicit `disabled` switch, or
 	// a detected partition on a WRITE — still fails the caller.
 	describe('findCoordinator() — isolated node degrades to its own replica', () => {
-		function connTo(peerId: PeerId): Connection {
-			return {
-				remotePeer: peerId,
-				status: 'open',
-				remoteAddr: { toString: () => `/ip4/10.0.0.1/tcp/4001/p2p/${peerId.toString()}` }
-			} as unknown as Connection;
-		}
-
 		/**
 		 * The reproduced scenario, verbatim: this node has seen a 10-peer network, has ZERO
 		 * connections, lost its last one 2.3s ago (well inside the 30s grace period), and FRET
@@ -835,7 +840,7 @@ describe('Libp2pKeyPeerNetwork', () => {
 			});
 			const peer = options?.connectedPeer;
 			const state: MutableNetworkState = {
-				connections: peer ? [connTo(peer)] : [],
+				connections: peer ? [outboundConnTo(peer)] : [],
 				neighbors: options?.neighbors
 					?? (peer ? [selfPeerId.toString(), peer.toString()] : [selfPeerId.toString()])
 			};
@@ -938,7 +943,7 @@ describe('Libp2pKeyPeerNetwork', () => {
 			const peerA = await makePeerId();
 			const { network, state, attemptCount } = await justDisconnectedNode({ dialInFlight: true });
 			const arrival = setTimeout(() => {
-				state.connections = [connTo(peerA)];
+				state.connections = [outboundConnTo(peerA)];
 				state.neighbors = [peerA.toString(), selfPeerId.toString()];
 			}, 50);
 			try {
@@ -1300,14 +1305,8 @@ describe('Libp2pKeyPeerNetwork', () => {
 				getNeighbors: () => []
 			};
 
-			const remoteConnA = {
-				remotePeer: svcA,
-				remoteAddr: { toString: () => `/ip4/10.0.0.1/tcp/4001/ws/p2p/${svcA.toString()}` }
-			} as unknown as Connection;
-			const remoteConnB = {
-				remotePeer: svcB,
-				remoteAddr: { toString: () => `/ip4/10.0.0.2/tcp/4001/ws/p2p/${svcB.toString()}` }
-			} as unknown as Connection;
+			const remoteConnA = stubConnection(svcA, 'outbound', `/ip4/10.0.0.1/tcp/4001/ws/p2p/${svcA.toString()}`);
+			const remoteConnB = stubConnection(svcB, 'outbound', `/ip4/10.0.0.2/tcp/4001/ws/p2p/${svcB.toString()}`);
 
 			const libp2p = {
 				peerId: selfPeerId,
@@ -1339,6 +1338,153 @@ describe('Libp2pKeyPeerNetwork', () => {
 		});
 	});
 
+	// --- Which addresses a published record may carry -----------------------------
+	/**
+	 * Ticket: findcluster-publishes-inbound-source-addresses (gotchoices/Optimystic#13).
+	 *
+	 * The record `findCluster` returns is dialed by OTHER peers, so every address in it has to be
+	 * reachable by them. An inbound connection's `remoteAddr` is not: it is the far side's
+	 * ephemeral source socket, the port their OS picked for that one connection. Publishing it
+	 * was worse than publishing nothing — a receiving peer cannot tell it from a listen address,
+	 * so it merged, took a slot against `MAX_MERGED_ADDRS_PER_PEER`, and turned an instant
+	 * `NoValidAddressesError` into a burned connection attempt. It also silenced the one
+	 * diagnostic for this condition, since `addressless` counts entries with *zero* addresses and
+	 * an entry holding a bad one does not qualify.
+	 *
+	 * These cases therefore pin both halves: which addresses come out, and that `addressless` —
+	 * now load-bearing — fires in exactly the window the upstream reporter was measuring.
+	 */
+	describe('findCluster() — only outbound connections contribute addresses', () => {
+		const KEY = new TextEncoder().encode('inbound-source-address-key');
+
+		/** FRET stub that puts exactly `ids` in the cohort. */
+		const fretWithCohort = (ids: PeerId[]): any => ({
+			assembleCohort: () => ids.map(id => id.toString()),
+			getNetworkSizeEstimate: () => ({ size_estimate: 5, confidence: 0.5 }),
+			detectPartition: () => false,
+			exportTable: () => undefined,
+			getNeighbors: () => []
+		});
+
+		/** peerStore stub holding `entries` (peer id → address strings); everyone else is empty. */
+		const peerStoreWith = (entries: Record<string, string[]>): any => ({
+			all: async () => [],
+			get: async (pid: { toString(): string }) => ({
+				protocols: [],
+				addresses: (entries[pid.toString()] ?? []).map(a => ({ multiaddr: multiaddr(a) }))
+			})
+		});
+
+		/** Run `findCluster` while capturing this class's debug output. No protocolPrefix: the
+		 *  membership filter is a no-op here, so the cohort member is retained on address grounds
+		 *  alone and nothing else can explain a missing entry. */
+		async function findClusterWithLog(libp2p: Libp2p): Promise<{ cluster: Record<string, { multiaddrs: string[] }>, captured: unknown[][] }> {
+			const network = new Libp2pKeyPeerNetwork(libp2p, 2, undefined, 'joining');
+			let cluster: Record<string, { multiaddrs: string[] }> = {};
+			const captured = await captureLog('libp2p-key-network', async () => {
+				cluster = await network.findCluster(KEY);
+			});
+			return { cluster, captured };
+		}
+
+		/** True when `findCluster:done` reported exactly `count` addressless members. */
+		const reportedAddressless = (captured: unknown[][], count: number): boolean =>
+			captured.some(args => {
+				const line = formatCaptured(args);
+				return line.includes('findCluster:done') && line.includes(`addressless=${count}`);
+			});
+
+		it('publishes NO address for an inbound-only member whose peerStore is still empty, and counts it as addressless', async () => {
+			// The exact window the reporter measured: a relay-only peer has connected to us, but
+			// its reservation (and therefore the identifyPush carrying its circuit address) has not
+			// landed yet. ~1 s wide in the field.
+			const member = await makePeerId();
+			const libp2p = createMockLibp2p(selfPeerId, {
+				connections: [stubConnection(member, 'inbound', `/ip4/127.0.0.1/tcp/58247/ws/p2p/${member.toString()}`)],
+				fret: fretWithCohort([member]),
+				peerStore: peerStoreWith({})
+			});
+
+			const { cluster, captured } = await findClusterWithLog(libp2p);
+			expect(cluster[member.toString()], 'the member is still admitted to the cohort').to.exist;
+			expect(cluster[member.toString()]!.multiaddrs,
+				'an inbound connection\'s ephemeral source port is not an address anyone else can dial').to.deep.equal([]);
+			expect(hasTag(captured, 'findCluster:addressless-members'),
+				'the diagnostic must fire — silencing it is what let this run unnoticed for 1,383 of 1,389 lookups').to.equal(true);
+			expect(reportedAddressless(captured, 1)).to.equal(true);
+		});
+
+		it('publishes the peerStore address for an inbound-only member once identify has landed', async () => {
+			// Steady state after identifyPush: the connection is still inbound and still contributes
+			// nothing, but the peer's OWN advertised address is now available and must survive.
+			const member = await makePeerId();
+			const relay = await makePeerId();
+			const circuitAddr = `/ip4/127.0.0.1/tcp/4001/ws/p2p/${relay.toString()}/p2p-circuit/p2p/${member.toString()}`;
+			const libp2p = createMockLibp2p(selfPeerId, {
+				connections: [stubConnection(member, 'inbound', `/ip4/127.0.0.1/tcp/58247/ws/p2p/${member.toString()}`)],
+				fret: fretWithCohort([member]),
+				peerStore: peerStoreWith({ [member.toString()]: [circuitAddr] })
+			});
+
+			const { cluster, captured } = await findClusterWithLog(libp2p);
+			expect(cluster[member.toString()]!.multiaddrs).to.deep.equal([circuitAddr]);
+			expect(hasTag(captured, 'findCluster:addressless-members'), 'nothing is addressless here').to.equal(false);
+			expect(reportedAddressless(captured, 0)).to.equal(true);
+		});
+
+		it('publishes the remoteAddr of an outbound connection', async () => {
+			// The other side of the rule: an address WE dialed is real and third-party-reachable,
+			// and stays ahead of the peerStore fallback.
+			const member = await makePeerId();
+			const dialed = `/ip4/10.0.0.5/tcp/4001/p2p/${member.toString()}`;
+			const libp2p = createMockLibp2p(selfPeerId, {
+				connections: [stubConnection(member, 'outbound', dialed)],
+				fret: fretWithCohort([member]),
+				peerStore: peerStoreWith({})
+			});
+
+			const { cluster, captured } = await findClusterWithLog(libp2p);
+			expect(cluster[member.toString()]!.multiaddrs).to.deep.equal([dialed]);
+			expect(reportedAddressless(captured, 0)).to.equal(true);
+		});
+
+		it('publishes the outbound address exactly once when both an inbound and an outbound connection exist', async () => {
+			// Both directions coexist briefly after a DCUtR upgrade and whenever two peers dial each
+			// other. The inbound one must not add a second, bogus entry.
+			const member = await makePeerId();
+			const dialed = `/ip4/10.0.0.5/tcp/4001/p2p/${member.toString()}`;
+			const ephemeral = `/ip4/127.0.0.1/tcp/58247/ws/p2p/${member.toString()}`;
+			const libp2p = createMockLibp2p(selfPeerId, {
+				connections: [
+					stubConnection(member, 'inbound', ephemeral),
+					stubConnection(member, 'outbound', dialed)
+				],
+				fret: fretWithCohort([member]),
+				peerStore: peerStoreWith({})
+			});
+
+			const { cluster } = await findClusterWithLog(libp2p);
+			expect(cluster[member.toString()]!.multiaddrs).to.deep.equal([dialed]);
+		});
+
+		it('publishes our own outbound circuit address for a member we reached through a relay', async () => {
+			// A relay-only node's outbound connections all look like this. The filter is about the
+			// connection's DIRECTION, not about the address shape, so a legitimately-dialed circuit
+			// address must not be collateral damage.
+			const member = await makePeerId();
+			const relay = await makePeerId();
+			const viaCircuit = `/ip4/10.0.0.9/tcp/4001/p2p/${relay.toString()}/p2p-circuit/p2p/${member.toString()}`;
+			const libp2p = createMockLibp2p(selfPeerId, {
+				connections: [stubConnection(member, 'outbound', viaCircuit)],
+				fret: fretWithCohort([member]),
+				peerStore: peerStoreWith({})
+			});
+
+			const { cluster } = await findClusterWithLog(libp2p);
+			expect(cluster[member.toString()]!.multiaddrs).to.deep.equal([viaCircuit]);
+		});
+	});
+
 	// --- Cross-network coordinator/cohort scoping ---------------------------------
 	// When two networks share physical nodes/bootstraps, a network-B peer can land in
 	// network-A's peerStore but its network-namespaced identify never completes, so its
@@ -1352,14 +1498,6 @@ describe('Libp2pKeyPeerNetwork', () => {
 	describe('network-membership scoping (protocolPrefix)', () => {
 		const PREFIX = '/optimystic/netA';
 		const servesProto = (prefix: string): string[] => [`${prefix}/cluster/1.0.0`, `${prefix}/repo/1.0.0`];
-
-		function connTo(peerId: PeerId): Connection {
-			return {
-				remotePeer: peerId,
-				status: 'open',
-				remoteAddr: { toString: () => `/ip4/10.0.0.1/tcp/4001/p2p/${peerId.toString()}` }
-			} as unknown as Connection;
-		}
 
 		function peerStoreOf(entries: Record<string, { protocols?: string[]; addresses?: string[] }>): any {
 			return {
@@ -1392,7 +1530,7 @@ describe('Libp2pKeyPeerNetwork', () => {
 				[sameNet.toString()]: { protocols: servesProto(PREFIX) },
 				[crossNet.toString()]: { protocols: [] } // identify never completed across networks
 			});
-			const libp2p = createMockLibp2p(selfPeerId, { connections: [connTo(crossNet), connTo(sameNet)], fret, peerStore });
+			const libp2p = createMockLibp2p(selfPeerId, { connections: [outboundConnTo(crossNet), outboundConnTo(sameNet)], fret, peerStore });
 			const network = new Libp2pKeyPeerNetwork(libp2p, 16, undefined, 'forming', undefined, undefined, PREFIX);
 			const result = await network.findCoordinator(new TextEncoder().encode('block-near-crossnet'));
 			expect(result.toString()).to.equal(sameNet.toString());
@@ -1402,7 +1540,7 @@ describe('Libp2pKeyPeerNetwork', () => {
 			const crossNet = await makePeerId();
 			const fret = baseFret({ getNeighbors: () => [crossNet.toString(), selfPeerId.toString()] });
 			const peerStore = peerStoreOf({ [crossNet.toString()]: { protocols: [] } });
-			const libp2p = createMockLibp2p(selfPeerId, { connections: [connTo(crossNet)], fret, peerStore });
+			const libp2p = createMockLibp2p(selfPeerId, { connections: [outboundConnTo(crossNet)], fret, peerStore });
 			const network = new Libp2pKeyPeerNetwork(libp2p, 16, undefined, 'forming', undefined, undefined, PREFIX);
 			const result = await network.findCoordinator(new TextEncoder().encode('block-near-crossnet'));
 			expect(result.toString()).to.equal(selfPeerId.toString());
@@ -1419,7 +1557,7 @@ describe('Libp2pKeyPeerNetwork', () => {
 			});
 			const fret = baseFret({ getNeighbors: () => [foreign.toString()] });
 			const peerStore = peerStoreOf({ [foreign.toString()]: { protocols: ['/optimystic/netB/cluster/1.0.0'] } });
-			const libp2p = createMockLibp2p(selfPeerId, { connections: [connTo(foreign)], fret, peerStore });
+			const libp2p = createMockLibp2p(selfPeerId, { connections: [outboundConnTo(foreign)], fret, peerStore });
 			const network = new Libp2pKeyPeerNetwork(libp2p, 16, undefined, 'forming', persistence, undefined, PREFIX);
 			await network.initFromPersistedState();
 
@@ -1443,7 +1581,7 @@ describe('Libp2pKeyPeerNetwork', () => {
 			const crossNet = await makePeerId();
 			const fret = baseFret({ getNeighbors: () => [crossNet.toString()] });
 			const peerStore = peerStoreOf({ [crossNet.toString()]: { protocols: [] } });
-			const libp2p = createMockLibp2p(selfPeerId, { connections: [connTo(crossNet)], fret, peerStore });
+			const libp2p = createMockLibp2p(selfPeerId, { connections: [outboundConnTo(crossNet)], fret, peerStore });
 			// 'forming' + default HWM<=1 → self-coordination allowed (bootstrap-node); self NOT excluded.
 			const network = new Libp2pKeyPeerNetwork(libp2p, 16, undefined, 'forming', undefined, undefined, PREFIX);
 			const result = await network.findCoordinator(new TextEncoder().encode('block-near-crossnet'));
@@ -1464,7 +1602,7 @@ describe('Libp2pKeyPeerNetwork', () => {
 			});
 			const fret = baseFret({ getNeighbors: () => [crossNet.toString()] });
 			const peerStore = peerStoreOf({ [crossNet.toString()]: { protocols: [] } }); // identify never completed across networks
-			const libp2p = createMockLibp2p(selfPeerId, { connections: [connTo(crossNet)], fret, peerStore });
+			const libp2p = createMockLibp2p(selfPeerId, { connections: [outboundConnTo(crossNet)], fret, peerStore });
 			const network = new Libp2pKeyPeerNetwork(libp2p, 16, undefined, 'forming', persistence, undefined, PREFIX);
 			await network.initFromPersistedState();
 
@@ -1508,7 +1646,7 @@ describe('Libp2pKeyPeerNetwork', () => {
 				lastConnectedTimestamp: Date.now(),
 				consecutiveIsolatedSessions: 0
 			});
-			const libp2p = createMockLibp2p(selfPeerId, { connections: [connTo(flipPeer)], fret, peerStore });
+			const libp2p = createMockLibp2p(selfPeerId, { connections: [outboundConnTo(flipPeer)], fret, peerStore });
 			const network = new Libp2pKeyPeerNetwork(libp2p, 16, undefined, 'forming', persistence, undefined, PREFIX);
 			await network.initFromPersistedState();
 			const result = await network.findCoordinator(new TextEncoder().encode('block-flip'), { excludedPeers: [selfPeerId] });
@@ -1642,7 +1780,7 @@ describe('Libp2pKeyPeerNetwork', () => {
 			const peerA = await makePeerId();
 			const fret = baseFret({ getNeighbors: () => [peerA.toString()] });
 			const peerStore = peerStoreOf({ [peerA.toString()]: { protocols: [] } });
-			const libp2p = createMockLibp2p(selfPeerId, { connections: [connTo(peerA)], fret, peerStore });
+			const libp2p = createMockLibp2p(selfPeerId, { connections: [outboundConnTo(peerA)], fret, peerStore });
 			const network = new Libp2pKeyPeerNetwork(libp2p, 16, undefined, 'forming');
 			const result = await network.findCoordinator(new TextEncoder().encode('k'));
 			expect(result.toString()).to.equal(peerA.toString());

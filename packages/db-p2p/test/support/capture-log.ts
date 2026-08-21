@@ -1,4 +1,5 @@
 import debug from 'debug';
+import { format } from 'node:util';
 
 /**
  * Capture what a `createLogger(<name>)` namespace emits while `fn` runs, restoring the
@@ -28,6 +29,21 @@ export const captureLog = async (namespace: string, fn: () => Promise<void>): Pr
 /** True when the captured log contains `tag`. */
 export const hasTag = (captured: unknown[][], tag: string): boolean =>
 	captured.some(args => typeof args[0] === 'string' && args[0].includes(tag));
+
+/**
+ * The fully substituted text of one captured line.
+ *
+ * `debug` resolves only its own formatters (`%o`, `%O`, `%j`) before calling the log sink and
+ * leaves `%s`/`%d` for `console.log`'s own `util.format` to fill in downstream — so `args[0]`
+ * still reads `addressless=%d` and the value sits in a later element. Asserting on a *value*
+ * carried by a log line therefore has to go through this rather than through {@link hasTag},
+ * which only ever sees the literal template.
+ */
+export const formatCaptured = (args: unknown[]): string => format(...args);
+
+/** True when the captured log contains a line whose fully substituted text includes `text`. */
+export const hasLine = (captured: unknown[][], text: string): boolean =>
+	captured.some(args => formatCaptured(args).includes(text));
 
 /** True when the captured log contains `tag` carrying a payload with `rev`. */
 export const hasTagAtRev = (captured: unknown[][], tag: string, rev: number): boolean =>
