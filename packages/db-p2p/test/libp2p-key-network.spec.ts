@@ -1389,6 +1389,25 @@ describe('Libp2pKeyPeerNetwork', () => {
 				expect(dialed).to.equal(true);
 			});
 
+			it('dials when the peerStore read itself fails, rather than inventing a verdict', async () => {
+				// `getPeerStoreAddrsByPeer` swallows a failing `store.get` and reports the peer as
+				// holding nothing. That is deliberate fail-open — a datastore we cannot read is not
+				// evidence of a self-relay loop — but it also means a persistently broken peerStore
+				// makes this whole guard silently inert, so pin the direction the failure resolves in.
+				let dialed = false;
+				const otherPeerId = await makePeerId();
+				const libp2p = createLibp2pWithConnect({
+					connections: [],
+					dialProtocol: () => { dialed = true; return Promise.resolve(FAKE_STREAM); },
+					peerStoreAddrs: { [otherPeerId.toString()]: [selfRelay(otherPeerId)] },
+					onPeerStoreRead: () => { throw new Error('datastore unavailable'); }
+				});
+				const network = new Libp2pKeyPeerNetwork(libp2p, 16, undefined, 'forming');
+
+				expect(await network.connect(otherPeerId, PROTOCOL)).to.equal(FAKE_STREAM);
+				expect(dialed, 'an unreadable peerStore must not become a refusal').to.equal(true);
+			});
+
 			it('does not fire on a relay-only node whose peers are reached through SOMEBODY ELSE', async () => {
 				// The easy way to write the predicate backwards. A relay-only node's own dials all
 				// look like this — circuits, through a relay that is not us — so a mistake here

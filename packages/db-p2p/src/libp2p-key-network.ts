@@ -429,6 +429,15 @@ export class Libp2pKeyPeerNetwork implements IKeyNetwork, IPeerNetwork {
 	 * nor banned by reputation. Shared by all three places `findCoordinator` narrows a candidate
 	 * list — the FRET tier, the connected-peer fallback, and the retry-futility input — so the
 	 * futility test can never disagree with the tiers about who is pickable.
+	 *
+	 * NOTE: eligibility here is deliberately blind to self-dialability, so on a relay
+	 * `findCoordinator` can still pick one of our own reservation holders and only then fail fast
+	 * with `SelfRelayOnlyAddressesError`. The caller's exclude-and-continue walk
+	 * (`db-core/utility/batch-coordinator.ts`) absorbs it, and each such pick now costs an
+	 * instant refusal rather than a burned dial timeout, so it is a selection round-trip, not a
+	 * stall — and the verdict is a live peerStore read that a stale eligibility filter would have
+	 * to guess at. If a relay serving many reservation holders is ever measured spending real time
+	 * walking through them, feed the verdict into the tiers instead of discovering it at dial.
 	 */
 	private isSelectable(id: string, excluded: Set<string>): boolean {
 		return !excluded.has(id) && !(this.reputation?.isBanned(id));
@@ -650,6 +659,11 @@ export class Libp2pKeyPeerNetwork implements IKeyNetwork, IPeerNetwork {
 	 * `recordPeerAddresses`).
 	 */
 	private async assertNotSelfRelayOnly(peerId: PeerId, protocol: string, options?: AbortOptions): Promise<void> {
+		// NOTE: this costs one `peerStore.get` on EVERY cold dial, not only on relays, and libp2p's
+		// own dial queue reads the same record moments later — so a cold dial pays the peerStore
+		// twice. Unmeasured, and negligible against a dial's own cost; if cold-dial latency or
+		// peerStore contention ever shows up in a profile, hoist the verdict into the dial path
+		// rather than reading ahead of it.
 		const idStr = peerId.toString()
 		const held = (await this.getPeerStoreAddrsByPeer([idStr]))[idStr] ?? []
 		// A caller that cancelled while we were reading the peerStore is owed ITS reason, not a

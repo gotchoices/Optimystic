@@ -15,8 +15,9 @@
  * connection — the bug is only visible once the client is gone.) `H` is what makes the assertion
  * mean anything: without it, an error raised for any reason at all would satisfy the test.
  *
- * **Runtime.** ~5 s (three real libp2p boots over loopback, plus the reservation/identifyPush
- * round trip), so like `relay-inbound-source-address.spec.ts` it is NOT env-gated.
+ * **Runtime.** ~1.2 s measured on loopback (three real libp2p boots, plus the
+ * reservation/identifyPush round trip), so like `relay-inbound-source-address.spec.ts` it is NOT
+ * env-gated. The generous `timeout`s below are ceilings for a loaded CI box, not expectations.
  */
 import { expect } from 'chai';
 import type { PeerId } from '@libp2p/interface';

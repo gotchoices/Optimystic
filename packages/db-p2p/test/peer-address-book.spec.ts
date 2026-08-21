@@ -194,7 +194,13 @@ describe('peer-address-book', () => {
 			// dialable regardless of how many useless circuit addresses sit beside it.
 			{ what: 'a direct address alongside a self-relay one', addrs: [SELF_RELAY, DIRECT], verdict: 'dialable' },
 			{ what: "an address through somebody else's relay", addrs: [OTHER_RELAY], verdict: 'dialable' },
-			{ what: 'only direct addresses', addrs: [DIRECT], verdict: 'dialable' }
+			{ what: 'only direct addresses', addrs: [DIRECT], verdict: 'dialable' },
+			// An address we cannot parse resolves the same way it does one level down, in
+			// `routesThroughRelay`: fail open. The verdict must be `dialable`, not
+			// `self-relay-only` — otherwise one garbage entry beside a self-relay one would
+			// turn a dial libp2p would have rejected on its own into a hard refusal of ours.
+			{ what: 'an unparseable address on its own', addrs: ['not-a-multiaddr'], verdict: 'dialable' },
+			{ what: 'an unparseable address beside a self-relay one', addrs: [SELF_RELAY, 'not-a-multiaddr'], verdict: 'dialable' }
 		];
 
 		for (const c of cases) {
