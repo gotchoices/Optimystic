@@ -72,7 +72,7 @@ function isCarriableMultiaddrString(addr: string, log: AddressLog): boolean {
  * as NOT publishable, so a stub cannot silently opt back into the pre-fix behavior.
  */
 export interface DirectionalConnection {
-	direction?: string
+	direction?: 'inbound' | 'outbound'
 	remoteAddr?: { toString?: () => string }
 }
 

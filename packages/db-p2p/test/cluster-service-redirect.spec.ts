@@ -29,8 +29,11 @@ const makeComponents = (opts: {
 	cluster: ICluster,
 	peerId?: PeerId,
 	getConnectionAddrs?: (pid: PeerId) => string[],
-	recordPeerAddresses?: (pid: PeerId, multiaddrs: string[]) => void
+	recordPeerAddresses?: (pid: PeerId, multiaddrs: string[]) => void,
+	/** Only for the no-resolver path: `getPeerAddrs` reads `components.libp2p` as its last resort. */
+	libp2p?: unknown
 }): ClusterServiceComponents => ({
+	...(opts.libp2p === undefined ? {} : { libp2p: opts.libp2p }),
 	logger: { forComponent: () => ({ error: () => {}, info: () => {}, trace: () => {}, debug: () => {} }) as any },
 	registrar: {
 		handle: async () => {},
@@ -215,6 +218,43 @@ describe('ClusterService redirect logic', () => {
 
 			expect(result).to.not.be.null;
 			expect(result!.redirect.peers[0]!.addrs).to.deep.equal([fallback]);
+		});
+
+		/**
+		 * Ticket: findcluster-publishes-inbound-source-addresses (gotchoices/Optimystic#13).
+		 *
+		 * With no `getConnectionAddrs` injected (the embedder path — production supplies one), the
+		 * service reads live connections itself. A redirect payload goes to a third party, so it
+		 * obeys the same rule the cluster record does: an inbound connection's `remoteAddr` is the
+		 * far side's ephemeral source socket and is publishable to nobody.
+		 */
+		it('reading connections itself, publishes the outbound address and never the inbound source socket', async () => {
+			const self = await makePeerId();
+			const dialed = await makePeerId();
+			const dialedUs = await makePeerId();
+			const outboundAddr = `/ip4/10.0.0.5/tcp/5001/p2p/${dialed.toString()}`;
+			const sourceSocket = `/ip4/127.0.0.1/tcp/58247/p2p/${dialedUs.toString()}`;
+			const service = new ClusterService(
+				makeComponents({
+					cluster: makeStubCluster(),
+					peerId: self,
+					libp2p: {
+						getConnections: (pid: PeerId) => pid.equals(dialed)
+							? [{ direction: 'outbound', remoteAddr: { toString: () => outboundAddr } }]
+							: [{ direction: 'inbound', remoteAddr: { toString: () => sourceSocket } }]
+					}
+				}),
+				{ responsibilityK: 1 }
+			);
+
+			const result = service.checkRedirect(makeRecord(makePeers([dialed, dialedUs])));
+
+			expect(result).to.not.be.null;
+			const addrsById = Object.fromEntries(result!.redirect.peers.map(p => [p.id, p.addrs]));
+			expect(addrsById[dialed.toString()], 'an address we dialed is real and must be published')
+				.to.deep.equal([outboundAddr]);
+			expect(addrsById[dialedUs.toString()],
+				`the source socket ${sourceSocket} is reachable by nobody else`).to.deep.equal([]);
 		});
 	});
 

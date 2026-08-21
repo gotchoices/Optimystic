@@ -66,7 +66,7 @@ describe('peer-address-book', () => {
 		// `{RELAY}` / `{DIALER}` are substituted with freshly generated peer ids inside each case:
 		// a `/p2p/` component only parses if it is a real peer id, so a placeholder literal would
 		// make the circuit rows fail as *unparseable* and silently stop testing direction at all.
-		const cases: Array<{ what: string, direction: string | undefined, addr: string | undefined, publishable: boolean }> = [
+		const cases: Array<{ what: string, direction: 'inbound' | 'outbound' | undefined, addr: string | undefined, publishable: boolean }> = [
 			{ what: 'a direct address we dialed', direction: 'outbound', addr: '/ip4/10.0.0.5/tcp/4001', publishable: true },
 			{ what: 'a circuit address we dialed through a relay', direction: 'outbound', addr: '/ip4/10.0.0.9/tcp/4001/p2p/{RELAY}/p2p-circuit', publishable: true },
 			{ what: 'the source socket of a direct connection they dialed', direction: 'inbound', addr: '/ip4/127.0.0.1/tcp/58247/ws', publishable: false },

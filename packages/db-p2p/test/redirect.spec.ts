@@ -157,6 +157,44 @@ describe('RepoService redirect logic', () => {
 			expect(result!.redirect.peers[0]!.addrs).to.deep.equal(['/ip4/127.0.0.1/tcp/4001']);
 		});
 
+		/**
+		 * Ticket: findcluster-publishes-inbound-source-addresses (gotchoices/Optimystic#13).
+		 *
+		 * Unlike the cluster service, the repo service gets NO `getConnectionAddrs` from
+		 * `libp2p-node-base` — the node is injected via `setLibp2p`, so this connection-reading
+		 * fallback is the production source of a repo redirect's addresses. It publishes to a third
+		 * party, so it obeys the same rule the cluster record does: an inbound connection's
+		 * `remoteAddr` is the far side's ephemeral source socket and must never be handed on.
+		 */
+		it('publishes only outbound connection addresses in the redirect payload fallback', async () => {
+			const self = await makePeerId();
+			const dialed = await makePeerId();
+			const dialedUs = await makePeerId();
+			const outboundAddr = `/ip4/10.0.0.5/tcp/4001/p2p/${dialed.toString()}`;
+			const sourceSocket = `/ip4/127.0.0.1/tcp/58247/p2p/${dialedUs.toString()}`;
+			const nm = makeNetworkManager([dialed, dialedUs]);
+			// No getConnectionAddrs: force the fallback that reads live connections.
+			const service = new RepoService(
+				makeComponents({ repo: makeStubRepo(), peerId: self, networkManager: nm }),
+				{ responsibilityK: 1 }
+			);
+			service.setLibp2p({
+				getConnections: (pid: PeerId) => pid.equals(dialed)
+					? [{ direction: 'outbound', remoteAddr: { toString: () => outboundAddr } }]
+					: [{ direction: 'inbound', remoteAddr: { toString: () => sourceSocket } }]
+			} as any);
+
+			const message: RepoMessage = { operations: [{ get: { blockIds: ['block-1'], context: { committed: [], rev: 0 } } }] };
+			const result = await service.checkRedirect('block-1', 'get', message);
+
+			expect(result).to.not.be.null;
+			const addrsById = Object.fromEntries(result!.redirect.peers.map(p => [p.id, p.addrs]));
+			expect(addrsById[dialed.toString()], 'an address we dialed is real and must be published')
+				.to.deep.equal([outboundAddr]);
+			expect(addrsById[dialedUs.toString()],
+				`the source socket ${sourceSocket} is reachable by nobody else`).to.deep.equal([]);
+		});
+
 		it('excludes self from redirect peers', async () => {
 			const self = await makePeerId();
 			const coordinator = await makePeerId();

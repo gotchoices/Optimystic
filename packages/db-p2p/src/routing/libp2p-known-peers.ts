@@ -15,6 +15,11 @@ export function buildKnownPeers(libp2p: Libp2p): KnownPeer[] {
     const pid = c.remotePeer
     const key = pid.toString()
     const entry = byPeer[key] ?? (byPeer[key] = { id: pid as unknown as PeerId, addrs: new Set() })
+    // NOTE: this takes every connection's remoteAddr regardless of direction, so an inbound
+    // connection contributes the far side's ephemeral source socket. Harmless today: nothing in
+    // this repo calls buildKnownPeers, and responsibility.ts reads only `id`. But this is a public
+    // export — if a caller ever hands KnownPeer.addrs to a THIRD party (a record, a redirect, a
+    // discovery reply), route it through `publishableConnectionAddr` in peer-address-book.ts first.
     const addrStr = c.remoteAddr?.toString?.()
     if (addrStr) entry.addrs.add(addrStr)
   }
