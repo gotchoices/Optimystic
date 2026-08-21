@@ -85,6 +85,12 @@ export class RepoService implements Startable {
 	private libp2pRef: Libp2p | undefined
 	/** Optional embedder authorization gate; `undefined` (the default) means no check runs. */
 	private readonly authorization: InboundStreamAuthorization | undefined
+	/**
+	 * Sink for this service's `peer-address-book:*` lines — same reasoning as `ClusterService`'s:
+	 * `this.log.error` would strand them under `db-p2p:repo-service:error`, outside the
+	 * `optimystic:db-p2p:*` tree every other address-book line lives in.
+	 */
+	private readonly addressLog: AddressLog
 
 	constructor(components: RepoServiceComponents, init: RepoServiceInit = {}) {
 		this.components = components
@@ -93,6 +99,7 @@ export class RepoService implements Startable {
 		this.maxInboundStreams = init.maxInboundStreams ?? 32
 		this.maxOutboundStreams = init.maxOutboundStreams ?? 64
 		this.log = components.logger.forComponent(init.logPrefix ?? 'db-p2p:repo-service')
+		this.addressLog = createLogger('peer-address-book', components.peerId?.toString())
 		this.repo = components.repo
 		this.running = false
 		this.responsibilityK = init.responsibilityK ?? 1
@@ -159,10 +166,9 @@ export class RepoService implements Startable {
 		// A redirect payload goes to a THIRD party, so only an outbound connection's remoteAddr
 		// qualifies — see `publishableConnectionAddr`.
 		const conns: DirectionalConnection[] = libp2p.getConnections(peerId) ?? []
-		const log: AddressLog = (fmt, ...args) => this.log.error(fmt, ...args)
 		const addrs: string[] = []
 		for (const c of conns) {
-			const addr = publishableConnectionAddr(c, log)
+			const addr = publishableConnectionAddr(c, this.addressLog)
 			if (addr !== undefined) addrs.push(addr)
 		}
 		return addrs

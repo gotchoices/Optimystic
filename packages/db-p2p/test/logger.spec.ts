@@ -212,4 +212,23 @@ describe('peer-address-book:merge is visible from both ingress paths under one D
 			expect(formatCaptured(mergeLine!), `${row.what} must log under ${row.namespace}`).to.include(row.namespace);
 		});
 	}
+
+	// The merge line is not the only address-book line the inbound path produces:
+	// `mergeRecordPeerAddresses` reports unparseable ids and the per-record cap through the sink
+	// `ClusterService` hands it. Those used to go to `this.log.error`, i.e. libp2p's
+	// `db-p2p:cluster:error` namespace — same tag family, different tree, same invisibility.
+	it('inbound record-traversal warnings log under optimystic:db-p2p:peer-address-book too', async () => {
+		node = await spawnNode();
+
+		const captured = await captureLog('*', async () => {
+			await clusterIngressOf(node!).processOperation({
+				operation: 'update',
+				record: recordWithPeers({ 'not-a-peer-id': { multiaddrs: [ADDR], publicKey: '' } })
+			});
+		});
+
+		const warnLine = captured.find(args => hasTag([args], 'record carried an unparseable peer id'));
+		expect(warnLine, 'an unparseable id in record.peers must be reported').to.not.equal(undefined);
+		expect(formatCaptured(warnLine!)).to.include('optimystic:db-p2p:peer-address-book');
+	});
 });

@@ -8,6 +8,7 @@ import { toClusterErrorEnvelope } from './cluster-error.js';
 import { mergeRecordPeerAddresses, publishableConnectionAddr, type AddressLog, type DirectionalConnection } from '../peer-address-book.js';
 import { MAX_CONTROL_MESSAGE_BYTES } from '../protocol-limits.js';
 import type { Uint8ArrayList } from 'uint8arraylist';
+import { createLogger } from '../logger.js';
 import { createInboundStreamAuthorization, type InboundStreamAuthorization, type InboundStreamAuthorizationInit } from '../inbound-authorization.js';
 
 interface BaseComponents {
@@ -68,6 +69,14 @@ export class ClusterService implements Startable {
 	private readonly maxInboundStreams: number;
 	private readonly maxOutboundStreams: number;
 	private readonly log: Logger;
+	/**
+	 * Sink for this service's `peer-address-book:*` lines. Deliberately NOT `this.log.error`, which
+	 * lands them under libp2p's `db-p2p:cluster:error` namespace — invisible to the
+	 * `DEBUG=optimystic:db-p2p:*` filter this package's docs recommend, and the reason
+	 * gotchoices/Optimystic#12 read a zero log count as proof the mechanism never ran. One tag
+	 * family, one namespace tree.
+	 */
+	private readonly addressLog: AddressLog;
 	private readonly cluster: ICluster;
 	private readonly components: ClusterServiceComponents;
 	private running: boolean;
@@ -82,6 +91,7 @@ export class ClusterService implements Startable {
 		this.maxInboundStreams = init.maxInboundStreams ?? 32;
 		this.maxOutboundStreams = init.maxOutboundStreams ?? 64;
 		this.log = components.logger.forComponent(init.logPrefix ?? 'db-p2p:cluster');
+		this.addressLog = createLogger('peer-address-book', components.peerId?.toString());
 		this.cluster = components.cluster;
 		this.running = false;
 		this.responsibilityK = init.responsibilityK ?? 1;
@@ -123,10 +133,9 @@ export class ClusterService implements Startable {
 		// A redirect payload goes to a THIRD party, so only an outbound connection's remoteAddr
 		// qualifies — see `publishableConnectionAddr`.
 		const conns: DirectionalConnection[] = libp2p.getConnections(pid) ?? [];
-		const log: AddressLog = (fmt, ...args) => this.log.error(fmt, ...args);
 		const addrs: string[] = [];
 		for (const c of conns) {
-			const addr = publishableConnectionAddr(c, log);
+			const addr = publishableConnectionAddr(c, this.addressLog);
 			if (addr !== undefined) addrs.push(addr);
 		}
 		return addrs;
@@ -234,7 +243,7 @@ export class ClusterService implements Startable {
 		mergeRecordPeerAddresses(
 			record.peers,
 			sink,
-			(fmt, ...args) => this.log.error(fmt, ...args),
+			this.addressLog,
 			this.getSelfId()?.toString()
 		);
 	}

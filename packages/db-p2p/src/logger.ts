@@ -13,8 +13,8 @@ const BASE_NAMESPACE = 'optimystic:db-p2p'
  * distinguish nodes (~11M combinations — ample for the handful of nodes a test process runs).
  * Widen this only if a run ever needs to match a namespace against a full peer id.
  *
- * NOTE: only the two classes the diagnosability ticket named pass a peer id today
- * (`Libp2pKeyPeerNetwork`, `CoordinatorRepo`); the package's other ~30 `createLogger` call sites
+ * NOTE: only a few call sites pass a peer id today (`Libp2pKeyPeerNetwork`, `CoordinatorRepo`, and
+ * the three `peer-address-book` sinks); the package's other ~30 `createLogger` call sites
  * still log under a flat namespace. Thread a peer id through any of them if a future diagnosis
  * needs per-node attribution from that subsystem — the mechanism is already here.
  */

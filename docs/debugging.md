@@ -49,6 +49,13 @@ its own sub-namespace so a single concern can be traced in isolation:
 | `coordinator-repo`         | CoordinatorRepo operations (peer-id suffixed)          |
 | `storage:restoration`      | Block restoration coordination                         |
 | `libp2p-key-network`       | Key network operations (peer-id suffixed)              |
+| `peer-address-book`        | Peer multiaddrs learned or rejected: `merge`, `capped`, `record-capped` (peer-id suffixed) |
+
+Address learning is reported from two places: the inbound path (a cluster record arriving from a
+coordinator) logs under `peer-address-book`, while the outbound path
+(`Libp2pKeyPeerNetwork.recordPeerAddresses`, reached from the cluster/repo clients) logs the same
+`peer-address-book:merge` tag under `libp2p-key-network`. Enable `optimystic:db-p2p:*`, or both
+sub-namespaces, to see the whole picture.
 
 ### Telling nodes apart in one process
 
@@ -71,10 +78,10 @@ DEBUG='optimystic:db-p2p:coordinator-repo:12D3KooWAbCd' node app.js
 DEBUG='optimystic:db-p2p:coordinator-repo*' node app.js
 ```
 
-An exact-match filter without a trailing `*` no longer matches these two sub-namespaces — add the
+An exact-match filter without a trailing `*` no longer matches these sub-namespaces — add the
 `*` (this is why `test/support/capture-log.ts` enables both the bare and the suffixed form).
 
-Only these two sub-namespaces carry a peer id today; the rest are flat. If a diagnosis needs
+Only these three sub-namespaces carry a peer id today; the rest are flat. If a diagnosis needs
 per-node attribution from another subsystem, pass its peer id as `createLogger`'s second argument
 — the mechanism is already in place.
 
