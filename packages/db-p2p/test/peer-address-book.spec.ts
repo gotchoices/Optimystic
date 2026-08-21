@@ -11,9 +11,15 @@ import { generateKeyPair } from '@libp2p/crypto/keys';
 import { peerIdFromPrivateKey } from '@libp2p/peer-id';
 import type { PeerId } from '@libp2p/interface';
 import type { Multiaddr } from '@multiformats/multiaddr';
-import { mergePeerAddresses, mergeRecordPeerAddresses, publishableConnectionAddr, validMultiaddrStrings, MAX_MERGED_ADDRS_PER_PEER, MAX_LEARNED_PEERS_PER_RECORD, type PeerAddressBookHost } from '../src/peer-address-book.js';
+import { CID } from 'multiformats/cid';
+import * as Digest from 'multiformats/hashes/digest';
+import { base58btc } from 'multiformats/bases/base58';
+import { classifySelfDialability, mergePeerAddresses, mergeRecordPeerAddresses, publishableConnectionAddr, routesThroughRelay, validMultiaddrStrings, MAX_MERGED_ADDRS_PER_PEER, MAX_LEARNED_PEERS_PER_RECORD, type PeerAddressBookHost, type SelfDialability } from '../src/peer-address-book.js';
 
 const makePeerId = async (): Promise<PeerId> => peerIdFromPrivateKey(await generateKeyPair('Ed25519'));
+
+/** Multicodec for `libp2p-key`, the codec a peer id's CIDv1 spelling carries. */
+const LIBP2P_KEY_CODEC = 0x72;
 
 /** A recording peerStore host. `mergeResult` lets a test make the store reject. */
 function makeHost(self: PeerId, mergeResult: () => Promise<unknown> = async () => undefined) {
@@ -95,6 +101,113 @@ describe('peer-address-book', () => {
 					...(addr === undefined ? {} : { remoteAddr: { toString: () => addr } })
 				};
 				expect(publishableConnectionAddr(conn, log)).to.equal(c.publishable ? addr : undefined);
+			});
+		}
+	});
+
+	/**
+	 * Ticket: relay-cannot-dial-its-own-reservation-holders (gotchoices/Optimystic#14).
+	 *
+	 * The third question about an address, after "may we carry it" and "may we publish it": can
+	 * THIS node dial it? A relay learns its reservation holders only by the address they advertise,
+	 * `/<relay's transport addr>/p2p/<relay's peer id>/p2p-circuit` — correct for everyone but the
+	 * relay itself, which would have to relay to the client through itself.
+	 *
+	 * Table-driven over the address forms libp2p actually produces, because the tempting
+	 * implementation (a substring test for `/p2p/<self>/p2p-circuit`) gets several of them wrong:
+	 * the peer id appended after the marker, a circuit with no relay named, and the case that
+	 * matters most operationally — a relay-only node of our own, whose peers' addresses route
+	 * through SOMEONE ELSE and must not trip the check.
+	 */
+	describe('routesThroughRelay', () => {
+		// `{SELF}` / `{OTHER}` / `{TARGET}` are substituted with freshly generated peer ids: a
+		// `/p2p/` component only parses if it holds a real peer id, so a literal placeholder would
+		// make every circuit row fail as *unparseable* and stop testing routing at all.
+		const cases: Array<{ what: string, addr: string, throughSelf: boolean }> = [
+			{ what: "a reservation holder's address on our own relay", addr: '/ip4/10.0.0.1/tcp/4001/p2p/{SELF}/p2p-circuit', throughSelf: true },
+			{ what: "the same address with the target peer id appended (libp2p's dial queue does this)", addr: '/ip4/10.0.0.1/tcp/4001/p2p/{SELF}/p2p-circuit/p2p/{TARGET}', throughSelf: true },
+			{ what: 'a circuit with no transport prefix at all', addr: '/p2p/{SELF}/p2p-circuit/p2p/{TARGET}', throughSelf: true },
+			// The case a relay-only node of ours lives in every day: our peers are reachable
+			// through THEIR relay, not ours. Writing the predicate backwards makes this fire and
+			// takes the node permanently offline.
+			{ what: "a peer reachable through somebody else's relay", addr: '/ip4/10.0.0.9/tcp/4001/p2p/{OTHER}/p2p-circuit/p2p/{TARGET}', throughSelf: false },
+			{ what: 'a plain direct address', addr: '/ip4/10.0.0.5/tcp/4001/p2p/{TARGET}', throughSelf: false },
+			// Multi-hop: a chain that passes through us at ANY hop is one we cannot open ourselves.
+			{ what: 'a two-hop circuit whose FIRST relay is us', addr: '/ip4/10.0.0.1/tcp/4001/p2p/{SELF}/p2p-circuit/p2p/{OTHER}/p2p-circuit/p2p/{TARGET}', throughSelf: true },
+			{ what: 'a two-hop circuit whose SECOND relay is us', addr: '/ip4/10.0.0.9/tcp/4001/p2p/{OTHER}/p2p-circuit/p2p/{SELF}/p2p-circuit/p2p/{TARGET}', throughSelf: true },
+			{ what: 'a two-hop circuit through two other relays', addr: '/ip4/10.0.0.9/tcp/4001/p2p/{OTHER}/p2p-circuit/p2p/{TARGET}/p2p-circuit/p2p/{TARGET}', throughSelf: false },
+			// No `p2p` component precedes the marker, so no relay is named and none can be ours.
+			{ what: 'a circuit that names no relay', addr: '/ip4/10.0.0.9/tcp/4001/p2p-circuit', throughSelf: false },
+			{ what: 'a bare /p2p-circuit', addr: '/p2p-circuit', throughSelf: false },
+			// Our own peer id appearing anywhere OTHER than the relay slot is not a self-relay:
+			// this is the address of a peer reached through the relay `{OTHER}`, which happens to
+			// be us as the *target*. A substring test on `/p2p/<self>/` would get this wrong.
+			{ what: 'our own peer id in the TARGET slot rather than the relay slot', addr: '/ip4/10.0.0.9/tcp/4001/p2p/{OTHER}/p2p-circuit/p2p/{SELF}', throughSelf: false },
+			// `{SELF_CID}` is our own peer id written as a CIDv1 libp2p-key string — the other legal
+			// spelling of a `/p2p/` value. `@multiformats/multiaddr` keeps it verbatim instead of
+			// normalizing to base58btc, so a plain string comparison against `PeerId.toString()`
+			// misses it. Addresses reaching the peerStore from the wire (`mergePeerAddresses`) can
+			// be spelled either way.
+			{ what: 'our own relay written as a CIDv1 peer id', addr: '/ip4/10.0.0.1/tcp/4001/p2p/{SELF_CID}/p2p-circuit/p2p/{TARGET}', throughSelf: true },
+			{ what: 'somebody else’s relay written as a CIDv1 peer id', addr: '/ip4/10.0.0.9/tcp/4001/p2p/{OTHER_CID}/p2p-circuit/p2p/{TARGET}', throughSelf: false }
+		];
+
+		/** A peer id in its CIDv1 libp2p-key spelling — the same identity, a different string. */
+		const asCidV1 = (id: PeerId): string =>
+			CID.createV1(LIBP2P_KEY_CODEC, Digest.decode(base58btc.decode(`z${id.toString()}`))).toString();
+
+		for (const c of cases) {
+			it(`${c.throughSelf ? 'flags' : 'clears'} ${c.what}`, async () => {
+				const self = await makePeerId();
+				const other = await makePeerId();
+				const target = await makePeerId();
+				const addr = c.addr
+					.replaceAll('{SELF_CID}', asCidV1(self))
+					.replaceAll('{OTHER_CID}', asCidV1(other))
+					.replaceAll('{SELF}', self.toString())
+					.replaceAll('{OTHER}', other.toString())
+					.replaceAll('{TARGET}', target.toString());
+				const { log } = makeLog();
+				expect(routesThroughRelay(addr, self.toString(), log)).to.equal(c.throughSelf);
+			});
+		}
+
+		it('fails open (and logs) on an address it cannot parse', async () => {
+			// Not evidence of a self-relay loop — and treating it as one would replace a dial
+			// libp2p would have rejected on its own with a hard error of ours.
+			const self = await makePeerId();
+			const { log, lines } = makeLog();
+			expect(routesThroughRelay('not-a-multiaddr', self.toString(), log)).to.equal(false);
+			expect(lines.filter(l => l.startsWith('WARN: invalid multiaddr'))).to.have.length(1);
+		});
+	});
+
+	describe('classifySelfDialability', () => {
+		const SELF_RELAY = '/ip4/10.0.0.1/tcp/4001/p2p/{SELF}/p2p-circuit';
+		const OTHER_RELAY = '/ip4/10.0.0.9/tcp/4001/p2p/{OTHER}/p2p-circuit/p2p/{TARGET}';
+		const DIRECT = '/ip4/10.0.0.5/tcp/4001/p2p/{TARGET}';
+
+		const cases: Array<{ what: string, addrs: string[], verdict: SelfDialability }> = [
+			{ what: 'no addresses at all', addrs: [], verdict: 'none' },
+			{ what: 'only addresses relayed through us', addrs: [SELF_RELAY, SELF_RELAY + '/p2p/{TARGET}'], verdict: 'self-relay-only' },
+			// The mixed case is the one that must NOT fail fast: a peer with a direct address is
+			// dialable regardless of how many useless circuit addresses sit beside it.
+			{ what: 'a direct address alongside a self-relay one', addrs: [SELF_RELAY, DIRECT], verdict: 'dialable' },
+			{ what: "an address through somebody else's relay", addrs: [OTHER_RELAY], verdict: 'dialable' },
+			{ what: 'only direct addresses', addrs: [DIRECT], verdict: 'dialable' }
+		];
+
+		for (const c of cases) {
+			it(`classifies ${c.what} as ${c.verdict}`, async () => {
+				const self = await makePeerId();
+				const other = await makePeerId();
+				const target = await makePeerId();
+				const addrs = c.addrs.map(a => a
+					.replaceAll('{SELF}', self.toString())
+					.replaceAll('{OTHER}', other.toString())
+					.replaceAll('{TARGET}', target.toString()));
+				const { log } = makeLog();
+				expect(classifySelfDialability(addrs, self.toString(), log)).to.equal(c.verdict);
 			});
 		}
 	});

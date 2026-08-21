@@ -10,6 +10,8 @@ import {
 	FindCoordinatorError,
 	FIND_COORDINATOR_ERROR_CODES,
 	PERSISTED_STATE_VERSION,
+	SelfRelayOnlyAddressesError,
+	SELF_RELAY_ONLY_ERROR_CODE,
 	type NetworkStatePersistence,
 	type PersistedNetworkState,
 	type SelfCoordinationConfig
@@ -1103,7 +1105,24 @@ describe('Libp2pKeyPeerNetwork', () => {
 		function createLibp2pWithConnect(options: {
 			connections?: Connection[];
 			dialProtocol?: (peerId: PeerId, protocols: string[], opts?: any) => Promise<unknown>;
+			/**
+			 * peer id → address strings the peerStore holds. Left undefined entirely (not `{}`)
+			 * to build the no-peerStore shape: several nodes in this codebase are constructed
+			 * without one, and `connect` must dial exactly as before on those.
+			 */
+			peerStoreAddrs?: Record<string, string[]>;
+			/** Called with the peer id whenever the peerStore is read; lets a case abort mid-read. */
+			onPeerStoreRead?: (id: string) => void;
 		}): Libp2p {
+			const peerStore = options.peerStoreAddrs === undefined ? undefined : {
+				get: async (pid: { toString(): string }) => {
+					options.onPeerStoreRead?.(pid.toString());
+					return {
+						protocols: [],
+						addresses: (options.peerStoreAddrs![pid.toString()] ?? []).map(a => ({ multiaddr: multiaddr(a) }))
+					};
+				}
+			};
 			return {
 				peerId: selfPeerId,
 				getConnections: (_peerId: PeerId) => options.connections ?? [],
@@ -1111,6 +1130,7 @@ describe('Libp2pKeyPeerNetwork', () => {
 				addEventListener: () => {},
 				removeEventListener: () => {},
 				dialProtocol: options.dialProtocol ?? (() => Promise.reject(new Error('dialProtocol unexpectedly called'))),
+				...(peerStore ? { peerStore } : {}),
 				services: {}
 			} as unknown as Libp2p;
 		}
@@ -1284,6 +1304,151 @@ describe('Libp2pKeyPeerNetwork', () => {
 
 			await network.connect(otherPeerId, PROTOCOL, { signal: controller.signal });
 			expect(observedSignal).to.equal(controller.signal);
+		});
+
+		// --- The cold path when every address we hold routes back through us --------
+		/**
+		 * Ticket: relay-cannot-dial-its-own-reservation-holders (gotchoices/Optimystic#14).
+		 *
+		 * A relay learns its own reservation holders by the address they advertise —
+		 * `/<our transport addr>/p2p/<our peer id>/p2p-circuit` — which is right for everyone
+		 * except us. Dialing it asks us to relay to the client through ourselves, and libp2p
+		 * reports the failure with the same text as "we hold no address at all". Two conditions,
+		 * one error, and only one of them is ever repaired by a retry; so the cold path separates
+		 * them BEFORE dialing, and leaves the genuinely-unknown case alone.
+		 */
+		describe('a peer we hold only self-relay addresses for', () => {
+			const selfRelay = (target: PeerId): string =>
+				`/ip4/10.0.0.1/tcp/4001/p2p/${selfPeerId.toString()}/p2p-circuit/p2p/${target.toString()}`;
+
+			it('fails fast with SelfRelayOnlyAddressesError and never dials', async () => {
+				let dialed = false;
+				const otherPeerId = await makePeerId();
+				const libp2p = createLibp2pWithConnect({
+					connections: [],
+					dialProtocol: () => { dialed = true; return Promise.resolve(FAKE_STREAM); },
+					peerStoreAddrs: { [otherPeerId.toString()]: [selfRelay(otherPeerId)] }
+				});
+				const network = new Libp2pKeyPeerNetwork(libp2p, 16, undefined, 'forming');
+
+				const err = await network.connect(otherPeerId, PROTOCOL).then(
+					() => undefined,
+					(e: unknown) => e
+				);
+				expect(err, 'the dial must be refused, not attempted').to.be.instanceOf(SelfRelayOnlyAddressesError);
+				expect((err as SelfRelayOnlyAddressesError).code).to.equal(SELF_RELAY_ONLY_ERROR_CODE);
+				// The point of the error is that it names the condition; a generic "no valid
+				// addresses" here would leave the two causes as indistinguishable as before.
+				expect((err as Error).message).to.include('only through a circuit on THIS node');
+				expect(dialed, 'dialProtocol must not be called').to.equal(false);
+			});
+
+			it('dials when a direct address sits alongside the self-relay ones', async () => {
+				let dialed = false;
+				const otherPeerId = await makePeerId();
+				const libp2p = createLibp2pWithConnect({
+					connections: [],
+					dialProtocol: () => { dialed = true; return Promise.resolve(FAKE_STREAM); },
+					peerStoreAddrs: {
+						[otherPeerId.toString()]: [
+							selfRelay(otherPeerId),
+							`/ip4/10.0.0.5/tcp/4001/p2p/${otherPeerId.toString()}`
+						]
+					}
+				});
+				const network = new Libp2pKeyPeerNetwork(libp2p, 16, undefined, 'forming');
+
+				expect(await network.connect(otherPeerId, PROTOCOL)).to.equal(FAKE_STREAM);
+				expect(dialed).to.equal(true);
+			});
+
+			it('dials when the peerStore holds nothing, so an unknown peer keeps its old failure', async () => {
+				let dialed = false;
+				const otherPeerId = await makePeerId();
+				const libp2p = createLibp2pWithConnect({
+					connections: [],
+					dialProtocol: () => { dialed = true; return Promise.resolve(FAKE_STREAM); },
+					peerStoreAddrs: {}
+				});
+				const network = new Libp2pKeyPeerNetwork(libp2p, 16, undefined, 'forming');
+
+				expect(await network.connect(otherPeerId, PROTOCOL)).to.equal(FAKE_STREAM);
+				expect(dialed, 'never-taught-an-address is a different condition; libp2p still owns it').to.equal(true);
+			});
+
+			it('dials when the node has no peerStore at all', async () => {
+				let dialed = false;
+				const otherPeerId = await makePeerId();
+				const libp2p = createLibp2pWithConnect({
+					connections: [],
+					dialProtocol: () => { dialed = true; return Promise.resolve(FAKE_STREAM); }
+				});
+				const network = new Libp2pKeyPeerNetwork(libp2p, 16, undefined, 'forming');
+
+				expect(await network.connect(otherPeerId, PROTOCOL)).to.equal(FAKE_STREAM);
+				expect(dialed).to.equal(true);
+			});
+
+			it('does not fire on a relay-only node whose peers are reached through SOMEBODY ELSE', async () => {
+				// The easy way to write the predicate backwards. A relay-only node's own dials all
+				// look like this — circuits, through a relay that is not us — so a mistake here
+				// takes such a node permanently offline.
+				let dialed = false;
+				const otherPeerId = await makePeerId();
+				const otherRelay = await makePeerId();
+				const libp2p = createLibp2pWithConnect({
+					connections: [],
+					dialProtocol: () => { dialed = true; return Promise.resolve(FAKE_STREAM); },
+					peerStoreAddrs: {
+						[otherPeerId.toString()]: [`/ip4/10.0.0.9/tcp/4001/p2p/${otherRelay.toString()}/p2p-circuit/p2p/${otherPeerId.toString()}`]
+					}
+				});
+				const network = new Libp2pKeyPeerNetwork(libp2p, 16, undefined, 'forming');
+
+				expect(await network.connect(otherPeerId, PROTOCOL)).to.equal(FAKE_STREAM);
+				expect(dialed).to.equal(true);
+			});
+
+			it('reuses a live limited connection without reading the peerStore at all', async () => {
+				// The warm path is the case this method exists to make cheap, and a relayed
+				// connection FROM such a client is exactly how it stays reachable while it lasts.
+				// Neither the peerStore read nor the new error may intrude on it.
+				let peerStoreReads = 0;
+				const otherPeerId = await makePeerId();
+				const limitedOnly = {
+					status: 'open',
+					limits: { bytes: 128n * 1024n },
+					remoteAddr: { toString: () => `/ip4/10.0.0.1/tcp/4001/p2p/${selfPeerId.toString()}/p2p-circuit` },
+					newStream: () => Promise.resolve(FAKE_STREAM)
+				} as unknown as Connection;
+				const libp2p = createLibp2pWithConnect({
+					connections: [limitedOnly],
+					peerStoreAddrs: { [otherPeerId.toString()]: [selfRelay(otherPeerId)] },
+					onPeerStoreRead: () => { peerStoreReads++; }
+				});
+				const network = new Libp2pKeyPeerNetwork(libp2p, 16, undefined, 'forming');
+
+				expect(await network.connect(otherPeerId, PROTOCOL)).to.equal(FAKE_STREAM);
+				expect(peerStoreReads, 'the warm path must not pay a peerStore read').to.equal(0);
+			});
+
+			it('surfaces the caller abort reason, not the self-relay verdict, when cancelled mid-read', async () => {
+				const otherPeerId = await makePeerId();
+				const controller = new AbortController();
+				const cancelled = new Error('caller gave up');
+				const libp2p = createLibp2pWithConnect({
+					connections: [],
+					peerStoreAddrs: { [otherPeerId.toString()]: [selfRelay(otherPeerId)] },
+					onPeerStoreRead: () => { controller.abort(cancelled); }
+				});
+				const network = new Libp2pKeyPeerNetwork(libp2p, 16, undefined, 'forming');
+
+				const err = await network.connect(otherPeerId, PROTOCOL, { signal: controller.signal }).then(
+					() => undefined,
+					(e: unknown) => e
+				);
+				expect(err, 'a cancelled caller is owed ITS reason').to.equal(cancelled);
+			});
 		});
 	});
 
@@ -1482,6 +1647,90 @@ describe('Libp2pKeyPeerNetwork', () => {
 
 			const { cluster } = await findClusterWithLog(libp2p);
 			expect(cluster[member.toString()]!.multiaddrs).to.deep.equal([viaCircuit]);
+		});
+
+		// --- The second way a cohort member can be undialable BY US ------------------
+		/**
+		 * Ticket: relay-cannot-dial-its-own-reservation-holders (gotchoices/Optimystic#14).
+		 *
+		 * `addressless` counts members we hold nothing for. Its sibling counts members we hold
+		 * addresses for that all route back through us — the steady state for our own reservation
+		 * holders. The two need separating because they have different remedies (be taught an
+		 * address, versus wait for the client to re-dial us) and libp2p's dial error cannot tell
+		 * them apart. Crucially the addresses stay IN the record: a cohort sibling reaching the
+		 * member through our relay is the working path, and dropping them would break it.
+		 */
+		describe('the self-relay-only diagnostic', () => {
+			/** True when `findCluster:done` reported exactly `count` self-relay-only members. */
+			const reportedSelfRelayOnly = (captured: unknown[][], count: number): boolean =>
+				captured.some(args => {
+					const line = formatCaptured(args);
+					return line.includes('findCluster:done') && line.includes(`selfRelayOnly=${count}`);
+				});
+
+			it('counts a member we hold only self-relay addresses for, and still publishes them', async () => {
+				const member = await makePeerId();
+				const throughUs = `/ip4/10.0.0.1/tcp/4001/p2p/${selfPeerId.toString()}/p2p-circuit/p2p/${member.toString()}`;
+				const libp2p = createMockLibp2p(selfPeerId, {
+					connections: [],
+					fret: fretWithCohort([member]),
+					peerStore: peerStoreWith({ [member.toString()]: [throughUs] })
+				});
+
+				const { cluster, captured } = await findClusterWithLog(libp2p);
+				expect(cluster[member.toString()]!.multiaddrs,
+					'siblings reach this member through our relay — the address must survive').to.deep.equal([throughUs]);
+				expect(hasTag(captured, 'findCluster:self-relay-only-members')).to.equal(true);
+				expect(reportedSelfRelayOnly(captured, 1)).to.equal(true);
+				expect(reportedAddressless(captured, 0),
+					'holding an address we cannot use is not the same as holding none').to.equal(true);
+			});
+
+			it('does not count a member that also has a direct address', async () => {
+				const member = await makePeerId();
+				const throughUs = `/ip4/10.0.0.1/tcp/4001/p2p/${selfPeerId.toString()}/p2p-circuit/p2p/${member.toString()}`;
+				const direct = `/ip4/10.0.0.5/tcp/4001/p2p/${member.toString()}`;
+				const libp2p = createMockLibp2p(selfPeerId, {
+					connections: [],
+					fret: fretWithCohort([member]),
+					peerStore: peerStoreWith({ [member.toString()]: [throughUs, direct] })
+				});
+
+				const { cluster, captured } = await findClusterWithLog(libp2p);
+				expect(cluster[member.toString()]!.multiaddrs).to.deep.equal([throughUs, direct]);
+				expect(hasTag(captured, 'findCluster:self-relay-only-members')).to.equal(false);
+				expect(reportedSelfRelayOnly(captured, 0)).to.equal(true);
+			});
+
+			it('does not count a member reached through somebody ELSE relay', async () => {
+				// On a relay-only node of our own, every member looks like this. Getting the
+				// predicate backwards here would report the whole cohort as unreachable.
+				const member = await makePeerId();
+				const otherRelay = await makePeerId();
+				const throughThem = `/ip4/10.0.0.9/tcp/4001/p2p/${otherRelay.toString()}/p2p-circuit/p2p/${member.toString()}`;
+				const libp2p = createMockLibp2p(selfPeerId, {
+					connections: [],
+					fret: fretWithCohort([member]),
+					peerStore: peerStoreWith({ [member.toString()]: [throughThem] })
+				});
+
+				const { cluster, captured } = await findClusterWithLog(libp2p);
+				expect(cluster[member.toString()]!.multiaddrs).to.deep.equal([throughThem]);
+				expect(reportedSelfRelayOnly(captured, 0)).to.equal(true);
+			});
+
+			it('counts an addressless member as addressless, not as self-relay-only', async () => {
+				const member = await makePeerId();
+				const libp2p = createMockLibp2p(selfPeerId, {
+					connections: [],
+					fret: fretWithCohort([member]),
+					peerStore: peerStoreWith({})
+				});
+
+				const { captured } = await findClusterWithLog(libp2p);
+				expect(reportedAddressless(captured, 1)).to.equal(true);
+				expect(reportedSelfRelayOnly(captured, 0)).to.equal(true);
+			});
 		});
 	});
 

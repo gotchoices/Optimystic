@@ -5,7 +5,7 @@ import { peerIdFromString } from '@libp2p/peer-id'
 import type { FretService, SerializedTable } from 'p2p-fret'
 import { hashKey } from 'p2p-fret'
 import { createLogger, verbose } from './logger.js'
-import { mergePeerAddresses, publishableConnectionAddr, validMultiaddrStrings } from './peer-address-book.js'
+import { classifySelfDialability, mergePeerAddresses, publishableConnectionAddr, validMultiaddrStrings, type AddressLog } from './peer-address-book.js'
 import type { IPeerReputation } from './reputation/types.js'
 
 interface WithFretService { services?: { fret?: FretService } }
@@ -67,6 +67,39 @@ export class FindCoordinatorError extends Error {
 		super(message);
 		this.name = 'FindCoordinatorError';
 		this.code = code;
+	}
+}
+
+/**
+ * `.code` on {@link SelfRelayOnlyAddressesError}. A stable string so it survives the
+ * `ClusterErrorEnvelope` round trip (`toClusterErrorEnvelope` carries `name` and `code`) and shows
+ * up as `code=SELF_RELAY_ONLY_ADDRESSES` on `ProtocolClient`'s `dial:fail` line instead of `none`.
+ */
+export const SELF_RELAY_ONLY_ERROR_CODE = 'SELF_RELAY_ONLY_ADDRESSES';
+
+/**
+ * Thrown by {@link Libp2pKeyPeerNetwork.connect} when we hold addresses for a peer but EVERY one
+ * of them reaches it by relaying through this node.
+ *
+ * This is the steady state a relay reaches for its own reservation holders: the address such a
+ * client advertises is `/<our transport addr>/p2p/<our peer id>/p2p-circuit`, which is correct and
+ * useful to every node except us. Dialing it asks us to relay to the client through ourselves, so
+ * it can only fail — with an error text (`NoValidAddressesError`, or an `AggregateError` of
+ * `Can not dial self`, depending on whether the circuit transport is registered as a dialer here)
+ * that is indistinguishable from "nobody ever taught us an address". Retrying cannot help: once the
+ * client's connection drops, only the client can re-initiate. So we fail fast and distinctly,
+ * letting the caller's existing exclude-and-continue logic move to another cohort member instead of
+ * burning a dial timeout.
+ */
+export class SelfRelayOnlyAddressesError extends Error {
+	readonly code = SELF_RELAY_ONLY_ERROR_CODE;
+	constructor(peer: string, protocol: string, addrCount: number) {
+		super(
+			`Peer ${peer} is reachable only through a circuit on THIS node: all ${addrCount} address(es) ` +
+			`we hold route back through us, so no dial for ${protocol} can succeed. ` +
+			`Only that peer can re-establish the connection.`
+		);
+		this.name = 'SelfRelayOnlyAddressesError';
 	}
 }
 
@@ -248,6 +281,12 @@ export class Libp2pKeyPeerNetwork implements IKeyNetwork, IPeerNetwork {
 	private readonly coordinatorCache = new Map<string, { id: PeerId, expires: number }>()
 	private static readonly MAX_CACHE_ENTRIES = 1000
 	private readonly log: ReturnType<typeof createLogger>
+	/**
+	 * This instance's logger, in the shape `peer-address-book.ts` accepts. Declared once so the
+	 * five address predicates that take a sink all report under the same peer-id-suffixed
+	 * namespace, rather than five separately-written adapters drifting apart.
+	 */
+	private readonly addressLog: AddressLog = (fmt, ...args) => this.log(fmt, ...args)
 
 	private toCacheKey(key: Uint8Array): string { return u8ToString(key, 'base64url') }
 
@@ -532,7 +571,7 @@ export class Libp2pKeyPeerNetwork implements IKeyNetwork, IPeerNetwork {
 	 * protocol client dials through.
 	 */
 	public recordPeerAddresses(peerId: PeerId, multiaddrs: string[]): void {
-		mergePeerAddresses(this.libp2p, peerId, multiaddrs, (fmt, ...args) => this.log(fmt, ...args))
+		mergePeerAddresses(this.libp2p, peerId, multiaddrs, this.addressLog)
 	}
 
 	private getCachedCoordinator(key: Uint8Array): PeerId | undefined {
@@ -555,7 +594,18 @@ export class Libp2pKeyPeerNetwork implements IKeyNetwork, IPeerNetwork {
 		return addr != null && addr.includes('/p2p-circuit')
 	}
 
-	connect(peerId: PeerId, protocol: string, options?: AbortOptions): Promise<Stream> {
+	/**
+	 * Open a stream to `peerId` on `protocol` — reusing a live connection when we hold one, and
+	 * otherwise dialing.
+	 *
+	 * The cold path pays one `peerStore.get` before dialing, to separate two failures libp2p
+	 * reports identically: "nobody ever taught us an address" and "every address we hold routes
+	 * back through us" (see {@link SelfRelayOnlyAddressesError}). Only the second is diagnosed
+	 * here; the first still dials, so an unknown peer produces libp2p's own `NoValidAddressesError`
+	 * exactly as before. The warm path is deliberately kept clear of that read: it is only reached
+	 * when a connection already exists, which is the case this method exists to make cheap.
+	 */
+	async connect(peerId: PeerId, protocol: string, options?: AbortOptions): Promise<Stream> {
 		const conns = this.libp2p.getConnections?.(peerId) ?? []
 		// Filter to only-open connections so a closing/closed entry that libp2p
 		// hasn't yet evicted from its index doesn't get picked up here.
@@ -581,12 +631,34 @@ export class Libp2pKeyPeerNetwork implements IKeyNetwork, IPeerNetwork {
 				negotiateFully: false
 			})
 		}
+		await this.assertNotSelfRelayOnly(peerId, protocol, options)
 		// Forward the caller's AbortSignal so a per-peer dial deadline (enforced
 		// upstream by ProtocolClient.processMessage) can actually cancel a stuck
 		// dial — without this, libp2p falls back to its built-in dial timeout
 		// (default ~30s) and the caller's tighter deadline is decorative.
 		const dialOptions = { runOnLimitedConnection: true, negotiateFully: false, signal: options?.signal } as const
-		return this.libp2p.dialProtocol(peerId, [protocol], dialOptions)
+		return await this.libp2p.dialProtocol(peerId, [protocol], dialOptions)
+	}
+
+	/**
+	 * Throw {@link SelfRelayOnlyAddressesError} when every address we hold for `peerId` routes
+	 * through us, so the caller skips a dial that cannot succeed.
+	 *
+	 * Holding NOTHING is left alone on purpose — that dial still happens and still fails with
+	 * libp2p's `NoValidAddressesError`, because "we were never told an address" is a genuinely
+	 * different condition with a genuinely different remedy (someone teaches us one; see
+	 * `recordPeerAddresses`).
+	 */
+	private async assertNotSelfRelayOnly(peerId: PeerId, protocol: string, options?: AbortOptions): Promise<void> {
+		const idStr = peerId.toString()
+		const held = (await this.getPeerStoreAddrsByPeer([idStr]))[idStr] ?? []
+		// A caller that cancelled while we were reading the peerStore is owed ITS reason, not a
+		// verdict we computed from a snapshot it no longer cares about.
+		options?.signal?.throwIfAborted()
+		if (classifySelfDialability(held, this.libp2p.peerId.toString(), this.addressLog) !== 'self-relay-only') return
+		this.log('connect:self-relay-only peer=%s protocol=%s addrs=%d',
+			idStr.substring(0, 12), protocol, held.length)
+		throw new SelfRelayOnlyAddressesError(idStr, protocol, held.length)
 	}
 
 	private getFret(): FretService {
@@ -848,7 +920,7 @@ export class Libp2pKeyPeerNetwork implements IKeyNetwork, IPeerNetwork {
 		const conns = this.libp2p.getConnections()
 		const byPeer: Record<string, string[]> = {}
 		for (const c of conns) {
-			const addr = publishableConnectionAddr(c, (fmt, ...args) => this.log(fmt, ...args))
+			const addr = publishableConnectionAddr(c, this.addressLog)
 			if (addr === undefined) continue
 			const id = c.remotePeer.toString()
 			const forPeer = byPeer[id] ??= []
@@ -858,7 +930,7 @@ export class Libp2pKeyPeerNetwork implements IKeyNetwork, IPeerNetwork {
 	}
 
 	private parseMultiaddrs(addrs: string[]): string[] {
-		return validMultiaddrStrings(addrs, (fmt, ...args) => this.log(fmt, ...args))
+		return validMultiaddrStrings(addrs, this.addressLog)
 	}
 
 	async findCluster(key: Uint8Array): Promise<ClusterPeers> {
@@ -957,6 +1029,13 @@ export class Libp2pKeyPeerNetwork implements IKeyNetwork, IPeerNetwork {
 		// reported symptom: clean membership logs on every node while every dial to the
 		// addressless member died instantly and the write never completed.
 		const addressless: string[] = []
+		// The OTHER way a member can be undialable by us: we hold addresses, but every one of
+		// them is a circuit through this node — the steady state for our own reservation holders.
+		// Counted separately because the two have different remedies (be taught an address, vs.
+		// wait for the client to re-dial us) and libp2p's dial error cannot tell them apart.
+		// These addresses are still PUBLISHED: a cohort sibling reaching the member through our
+		// relay is the working path, and dropping them would break it.
+		const selfRelayOnly: string[] = []
 
 		for (const idStr of ids) {
 			if (idStr === selfId) {
@@ -982,7 +1061,9 @@ export class Libp2pKeyPeerNetwork implements IKeyNetwork, IPeerNetwork {
 			// retry/exclude logic takes over — we intentionally do NOT drop
 			// addressless members here, because shrinking the cohort below
 			// `clusterSize` puts consensus supermajority out of reach.
-			if (parsed.length === 0) addressless.push(idStr.substring(0, 12))
+			const dialability = classifySelfDialability(parsed, selfId, this.addressLog)
+			if (dialability === 'none') addressless.push(idStr.substring(0, 12))
+			else if (dialability === 'self-relay-only') selfRelayOnly.push(idStr.substring(0, 12))
 			peers[idStr] = { multiaddrs: parsed, publicKey: u8ToString(raw, 'base64url') }
 		}
 
@@ -995,8 +1076,16 @@ export class Libp2pKeyPeerNetwork implements IKeyNetwork, IPeerNetwork {
 				keyStr, addressless.length, Object.keys(peers).length, addressless)
 		}
 
-		this.log('findCluster:done key=%s ms=%d peers=%d addressless=%d',
-			keyStr, Date.now() - t0, Object.keys(peers).length, addressless.length)
+		// Same reasoning, second condition: a non-zero count here means we DO hold addresses for
+		// these members and still cannot dial them, because the only route we know runs through
+		// our own relay. No amount of retrying changes that (see `SelfRelayOnlyAddressesError`).
+		if (selfRelayOnly.length > 0) {
+			this.log('findCluster:self-relay-only-members key=%s count=%d of=%d peers=%o',
+				keyStr, selfRelayOnly.length, Object.keys(peers).length, selfRelayOnly)
+		}
+
+		this.log('findCluster:done key=%s ms=%d peers=%d addressless=%d selfRelayOnly=%d',
+			keyStr, Date.now() - t0, Object.keys(peers).length, addressless.length, selfRelayOnly.length)
 		return peers
 	}
 

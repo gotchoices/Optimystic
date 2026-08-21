@@ -1,6 +1,6 @@
 import type { PeerId } from '@libp2p/interface'
 import { peerIdFromString } from '@libp2p/peer-id'
-import { multiaddr, type Multiaddr } from '@multiformats/multiaddr'
+import { multiaddr, type Component, type Multiaddr } from '@multiformats/multiaddr'
 
 /**
  * Cap on addresses merged per peer from one application-level message.
@@ -98,6 +98,85 @@ export function publishableConnectionAddr(conn: DirectionalConnection, log: Addr
 	const addr = conn.remoteAddr?.toString?.()
 	if (addr === undefined) return undefined
 	return isCarriableMultiaddrString(addr, log) ? addr : undefined
+}
+
+/**
+ * How useful the addresses we hold for a peer are **to this node's own dialer**.
+ *
+ * - `none` — we hold no address at all. Nobody has told us how to reach the peer.
+ * - `self-relay-only` — we hold addresses, but every one of them reaches the peer by relaying
+ *   through *us*. Useful to everyone except us: to use one we would have to relay to the peer
+ *   through ourselves.
+ * - `dialable` — at least one address does not route through us, so a dial can be attempted.
+ */
+export type SelfDialability = 'none' | 'self-relay-only' | 'dialable'
+
+/**
+ * Does `addr` reach its target by relaying through `relayPeerId`?
+ *
+ * A circuit multiaddr names its relay in the `p2p` component immediately BEFORE the
+ * `p2p-circuit` marker — `/<transport>/p2p/<relay>/p2p-circuit[/p2p/<target>]`. So the question is
+ * answered by walking the address's components, not by testing the string for `/p2p/<id>/p2p-circuit`:
+ * the peer id after the marker (appended by libp2p's dial queue), a bare `/p2p-circuit` with no
+ * relay named, and multi-hop addresses with two circuit markers all read differently as text but
+ * classify correctly as components. True if ANY hop relays through `relayPeerId` — a chain that
+ * passes through us at any point is one we cannot open ourselves.
+ *
+ * Called with our own peer id, this is the "can WE dial this?" question. It is deliberately NOT
+ * the same question as {@link publishableConnectionAddr}'s: a self-relay address is perfectly
+ * publishable — a cohort sibling reaching a peer through our relay is the working path — and is
+ * simply unusable by the one node the circuit terminates on.
+ */
+export function routesThroughRelay(addr: string, relayPeerId: string, log: AddressLog): boolean {
+	let components: Component[]
+	try {
+		components = multiaddr(addr).getComponents()
+	} catch (err) {
+		// Fail open. An address we cannot parse is not evidence of a self-relay loop, and the
+		// caller's fallback — dial it and let libp2p reject it — is the pre-existing behavior.
+		log('WARN: invalid multiaddr %s %o', addr, err)
+		return false
+	}
+	return components.some((component, i) =>
+		component.name === 'p2p-circuit' && isRelayComponent(components[i - 1], relayPeerId))
+}
+
+/**
+ * True when `component` is the `p2p` hop naming `relayPeerId` (absent/other component → false).
+ *
+ * `relayPeerId` is always a `PeerId.toString()`, i.e. base58btc. A multiaddr's `p2p` value usually
+ * is too — but it may equally be written as a CIDv1 libp2p-key string, and `@multiformats/multiaddr`
+ * keeps whichever form it was given rather than normalizing. String equality alone would therefore
+ * miss a CIDv1-form self-relay address arriving from the wire (`mergePeerAddresses` accepts any
+ * parseable multiaddr). The canonical compare runs only when the cheap one fails, and only for the
+ * single component sitting in front of a circuit marker, so the parse is bounded to circuit
+ * addresses rather than paid per address.
+ */
+function isRelayComponent(component: Component | undefined, relayPeerId: string): boolean {
+	if (component?.name !== 'p2p' || component.value === undefined) return false
+	if (component.value === relayPeerId) return true
+	try {
+		return peerIdFromString(component.value).toString() === relayPeerId
+	} catch {
+		// multiaddr accepted the component but we cannot read it back as a peer id; we simply
+		// cannot claim it is ours, and the address stays dialable-as-far-as-we-know.
+		return false
+	}
+}
+
+/**
+ * Classify what the addresses we hold for one peer are worth to our own dialer.
+ *
+ * `self-relay-only` is the state a relay lands in for its own reservation holders: the address
+ * such a client advertises — and therefore the one we learn through `identifyPush` and store — is
+ * `/<our transport addr>/p2p/<our peer id>/p2p-circuit`. Dialing it is guaranteed to fail, and the
+ * failure is indistinguishable from `none` in libp2p's error text, so the two are separated here
+ * instead. Nothing can repair it from our side: once the client's connection drops only the client
+ * can re-initiate, so the useful response is to fail fast and let the caller move on.
+ */
+export function classifySelfDialability(addrs: string[], selfPeerId: string, log: AddressLog): SelfDialability {
+	if (addrs.length === 0) return 'none'
+	return addrs.some(addr => !routesThroughRelay(addr, selfPeerId, log)) ? 'dialable' : 'self-relay-only'
 }
 
 /**
