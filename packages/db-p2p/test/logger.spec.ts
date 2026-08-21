@@ -14,12 +14,14 @@ import { expect } from 'chai';
 import { peerIdFromPrivateKey } from '@libp2p/peer-id';
 import { generateKeyPair } from '@libp2p/crypto/keys';
 import type { PeerId, Libp2p } from '@libp2p/interface';
-import type { IRepo, IKeyNetwork, ClusterPeers, FindCoordinatorOptions } from '@optimystic/db-core';
+import type { IRepo, IKeyNetwork, ClusterPeers, ClusterRecord, RepoMessage, FindCoordinatorOptions } from '@optimystic/db-core';
 import { createLogger } from '../src/logger.js';
 import { Libp2pKeyPeerNetwork } from '../src/libp2p-key-network.js';
 import { CoordinatorRepo } from '../src/repo/coordinator-repo.js';
 import type { ClusterClient } from '../src/cluster/client.js';
-import { captureLog, hasTag, hasTagAtRev } from './support/capture-log.js';
+import { createLibp2pNode } from '../src/libp2p-node.js';
+import type { OptimysticNode } from '../src/optimystic-node.js';
+import { captureLog, formatCaptured, hasTag, hasTagAtRev } from './support/capture-log.js';
 
 const makePeerId = async (): Promise<PeerId> => peerIdFromPrivateKey(await generateKeyPair('Ed25519'));
 
@@ -120,4 +122,94 @@ describe('captureLog vs peer-id-suffixed namespaces', () => {
 
 		expect(hasTag(captured, 'sibling-tag')).to.equal(false);
 	});
+});
+
+/**
+ * Ticket: address-book-merge-logs-under-two-namespaces (gotchoices/Optimystic#12).
+ *
+ * `mergePeerAddresses` (`peer-address-book.ts`) is reached from two unrelated ingress points, each
+ * historically wired to a DIFFERENT logger factory — the inbound (`ClusterService`) sink came from
+ * libp2p's own `components.logger.forComponent(...)`, landing under a bare `db-p2p:*` namespace
+ * that `DEBUG=optimystic:db-p2p:*` (what this package's docs tell people to set) never matches. A
+ * reporter armed only the outbound half, saw zero inbound merge lines, and concluded the mechanism
+ * never ran. These specs pin both ingress paths under the same `optimystic:db-p2p:*` tree so that
+ * regression is structurally impossible to reintroduce one call site at a time.
+ */
+describe('peer-address-book:merge is visible from both ingress paths under one DEBUG filter', () => {
+	let node: OptimysticNode | undefined;
+
+	afterEach(async () => {
+		const toStop = node;
+		node = undefined;
+		if (toStop) await toStop.stop();
+	});
+
+	/** A bare single node: no relay, no peers — just enough wiring to exercise both ingress points. */
+	async function spawnNode(): Promise<OptimysticNode> {
+		return await createLibp2pNode({
+			port: 0,
+			networkName: 'logger-address-book-merge-namespaces',
+			bootstrapNodes: [],
+			relay: false,
+			clusterSize: 1,
+			clusterPolicy: { allowDownsize: true, sizeTolerance: 1.0 },
+			arachnode: { enableRingZulu: false }
+		});
+	}
+
+	/** The record ingress point a cluster service exposes — same narrow cast the relay specs use. */
+	interface ClusterIngress {
+		processOperation(op: { operation: 'update', record: ClusterRecord }): Promise<unknown>;
+	}
+	const clusterIngressOf = (n: Libp2p): ClusterIngress =>
+		(n as unknown as { services: { cluster: ClusterIngress } }).services.cluster;
+
+	const recordWithPeers = (peers: ClusterPeers): ClusterRecord => ({
+		messageHash: 'logger-spec-inbound-merge',
+		peers,
+		message: { operations: [] } as unknown as RepoMessage,
+		promises: {},
+		commits: {}
+	});
+
+	const ADDR = '/ip4/10.0.0.5/tcp/4001';
+
+	/** One row per ingress point `mergePeerAddresses` is reachable from. */
+	const rows: Array<{ what: string, namespace: string, trigger: (n: OptimysticNode, other: PeerId) => Promise<void> }> = [
+		{
+			what: 'inbound (ClusterService, from the coordinator)',
+			namespace: 'optimystic:db-p2p:peer-address-book',
+			trigger: async (n, other) => {
+				await clusterIngressOf(n).processOperation({
+					operation: 'update',
+					record: recordWithPeers({ [other.toString()]: { multiaddrs: [ADDR], publicKey: '' } })
+				});
+			}
+		},
+		{
+			what: 'outbound (Libp2pKeyPeerNetwork.recordPeerAddresses, from ClusterClient/RepoClient)',
+			namespace: 'optimystic:db-p2p:libp2p-key-network',
+			trigger: async (n, other) => {
+				n.keyNetwork.recordPeerAddresses(other, [ADDR]);
+			}
+		}
+	];
+
+	for (const row of rows) {
+		it(`${row.what} logs peer-address-book:merge under ${row.namespace}`, async () => {
+			node = await spawnNode();
+			const other = await makePeerId();
+
+			const captured = await captureLog('*', async () => {
+				await row.trigger(node!, other);
+			});
+
+			const mergeLine = captured.find(args => hasTag([args], 'peer-address-book:merge'));
+			expect(mergeLine, `${row.what} must emit a peer-address-book:merge line`).to.not.equal(undefined);
+			// `optimystic:db-p2p:*` is the filter this package's docs tell people to set — asserting the
+			// namespace prefix, not merely that SOME line was captured, is what pins the fix: without it
+			// this line would sit under the bare `db-p2p:*` tree that filter never matches.
+			expect(formatCaptured(mergeLine!), `${row.what} must log under ${row.namespace}`).to.include(row.namespace);
+		});
+	}
 });

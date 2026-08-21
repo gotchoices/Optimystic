@@ -556,7 +556,7 @@ export async function createLibp2pNodeBase(
 
 			// Custom services - create wrapper factories that inject dependencies
 			cluster: (components: any) => {
-				const addressLog: AddressLog = components.logger.forComponent('db-p2p:peer-address-book');
+				const addressLog: AddressLog = createLogger('peer-address-book', components.peerId?.toString());
 				const serviceFactory = clusterService({
 					protocolPrefix: `/optimystic/${options.networkName}`,
 					responsibilityK: options.responsibilityK ?? 1,
