@@ -1,6 +1,6 @@
 {
   "name": "@optimystic/optimystic",
-  "version": "0.24.1",
+  "version": "0.24.2",
   "private": true,
   "type": "module",
   "packageManager": "yarn@4.12.0",
