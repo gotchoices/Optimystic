@@ -25,11 +25,12 @@ export const MAX_MERGED_ADDRS_PER_PEER = 8
  */
 export const MAX_LEARNED_PEERS_PER_RECORD = 64
 
-/** The narrow slice of libp2p this module needs — a peer id and (optionally) a peerStore writer. */
+/** The narrow slice of libp2p this module needs — a peer id and (optionally) a peerStore. */
 export interface PeerAddressBookHost {
 	peerId: PeerId
 	peerStore?: {
 		merge?: (id: PeerId, data: { multiaddrs: Multiaddr[] }) => Promise<unknown>
+		get?: (id: PeerId) => Promise<{ addresses?: Array<{ multiaddr: { toString(): string } }> }>
 	}
 }
 
@@ -91,13 +92,106 @@ export interface DirectionalConnection {
  * that merges it. So the cure has to be here, at the producer.
  *
  * An inbound-only peer loses nothing by this: its own advertised addresses reach us through
- * `identify`/`identifyPush` and are published from the peerStore instead.
+ * `identify`/`identifyPush` and are published from the peerStore instead — see
+ * {@link publishableAddrsForPeer}, which is where the two halves are joined.
+ *
+ * NOTE: accepted tradeoff — making an INBOUND connection's `remoteAddr` publishable when it is a
+ * circuit address was proposed (the "at least a relayed dialer has a real address" reading) and
+ * declined. Read from `@libp2p/circuit-relay-v2@4.1.3` as vendored under
+ * `packages/db-p2p/node_modules`: the destination side composes that address as
+ * `ourConnectionToTheRelay.remoteAddr` encapsulated with `/p2p-circuit/p2p/<dialer>`
+ * (`dist/src/transport/index.js:272`), so the relay it names is the one WE hold a reservation
+ * with, not one the dialer is reachable on. A relay's `handleConnect` requires a reservation for
+ * the DESTINATION only (`dist/src/server/index.js:219-222`, status `NO_RESERVATION`) — a dialer
+ * needs none — so a third party dialing that composed address reaches the dialer only if the
+ * dialer coincidentally also holds a reservation on our relay, which nothing establishes. When our
+ * own hop to the relay was itself inbound the prefix is an ephemeral source socket, making it
+ * undialable twice over. And in the one case where it would work — dialer and we share a relay —
+ * the dialer's genuine self-advertised circuit address has already reached us through `identify`,
+ * so publishing the composed form adds nothing and costs a slot against
+ * {@link MAX_MERGED_ADDRS_PER_PEER}. Revisit only on a MEASURED case where a peer's genuine
+ * circuit address reaches a third party by no other route.
  */
 export function publishableConnectionAddr(conn: DirectionalConnection, log: AddressLog): string | undefined {
 	if (conn.direction !== 'outbound') return undefined
 	const addr = conn.remoteAddr?.toString?.()
 	if (addr === undefined) return undefined
 	return isCarriableMultiaddrString(addr, log) ? addr : undefined
+}
+
+/**
+ * Join the two sources of a third-party-publishable address set: the publishable half of our live
+ * connections, then the peer's own advertised addresses. De-duplicated, **connection-first**.
+ *
+ * The ordering is not cosmetic. An address that reaches `connectionAddrs` is one we OUTBOUND-dialed,
+ * so libp2p has just succeeded with it; an advertised address is one we have never tried. So the
+ * proven one goes first, and the recipient — which caps what it merges at
+ * {@link MAX_MERGED_ADDRS_PER_PEER} — keeps the proven ones when it truncates.
+ *
+ * `connectionAddrs` are already validated by {@link publishableConnectionAddr}; the advertised half
+ * arrives from a peerStore or a record and is put through {@link validMultiaddrStrings} here, so the
+ * union is uniformly carriable regardless of which side an address came from.
+ *
+ * Split out from {@link publishableAddrsForPeer} for the one caller that has already read the
+ * peerStore for other reasons (`findCluster`'s membership-scoped path reads protocols and addresses
+ * in a single `store.get` per member) and must not pay a second read to reuse the rule.
+ */
+export function unionPublishableAddrs(connectionAddrs: string[], advertisedAddrs: string[], log: AddressLog): string[] {
+	return Array.from(new Set([...connectionAddrs, ...validMultiaddrStrings(advertisedAddrs, log)]))
+}
+
+/**
+ * Every address we may hand a **third** party for `peerId`.
+ *
+ * The single answer to that question: `findCluster` (via {@link unionPublishableAddrs}) and all
+ * three redirect-address resolvers — `RepoService.getPeerAddrs`, `ClusterService.getPeerAddrs`, and
+ * the `getConnectionAddrs` the node wires into the cluster service — go through this one rule.
+ * They used to answer it two different ways, and the connections-only half was the weaker one: a
+ * cohort member that only ever dialed US and is reachable only through a relay has its real circuit
+ * address in exactly one place — the peerStore, where `identify`/`identifyPush` put it — so a
+ * redirect built from connections alone described it as having no address at all.
+ *
+ * A peerStore read that fails or finds nothing yields the connection-derived half rather than
+ * throwing: a redirect carrying half the answer is strictly better than a redirect that errors.
+ */
+export async function publishableAddrsForPeer(
+	host: PeerAddressBookHost,
+	connections: DirectionalConnection[],
+	peerId: PeerId,
+	log: AddressLog
+): Promise<string[]> {
+	const connectionAddrs: string[] = []
+	for (const conn of connections) {
+		const addr = publishableConnectionAddr(conn, log)
+		if (addr !== undefined) connectionAddrs.push(addr)
+	}
+	return unionPublishableAddrs(connectionAddrs, await advertisedAddrsForPeer(host, peerId, log), log)
+}
+
+/**
+ * The addresses `peerId` has advertised to us, as libp2p's peerStore holds them.
+ *
+ * A miss is the common case, not an anomaly — libp2p's `peerStore.get` THROWS for a peer it has no
+ * record of, and a redirect routinely names cohort members we have never met — so this logs under
+ * the ordinary `peer-address-book:*` tag family rather than `WARN:`, which is reserved for input we
+ * were handed and rejected.
+ *
+ * NOTE: this adds one `peerStore.get` per redirect target where the redirect resolvers previously
+ * did none. A redirect names at most `clusterSize` peers — single digits — and only fires when this
+ * node is NOT responsible for the key, so the reads are bounded and off the hot path. Unmeasured;
+ * if redirect volume ever shows up in a profile, batch the reads per payload (they are already
+ * issued concurrently by `Promise.all` at both call sites) rather than dropping the peerStore arm.
+ */
+async function advertisedAddrsForPeer(host: PeerAddressBookHost, peerId: PeerId, log: AddressLog): Promise<string[]> {
+	const get = host.peerStore?.get
+	if (typeof get !== 'function') return []
+	try {
+		const peer = await get.call(host.peerStore, peerId)
+		return (peer?.addresses ?? []).map(a => a.multiaddr.toString())
+	} catch (err) {
+		log('peer-address-book:peerstore-miss peer=%s %o', peerId.toString().substring(0, 12), err)
+		return []
+	}
 }
 
 /**

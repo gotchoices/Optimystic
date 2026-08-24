@@ -8,7 +8,7 @@ import { encodePeers, type RedirectPayload } from './redirect.js'
 import { MAX_BLOCK_MESSAGE_BYTES } from '../protocol-limits.js'
 import type { Uint8ArrayList } from 'uint8arraylist'
 import { createLogger } from '../logger.js'
-import { publishableConnectionAddr, type AddressLog, type DirectionalConnection } from '../peer-address-book.js'
+import { publishableAddrsForPeer, type AddressLog, type DirectionalConnection } from '../peer-address-book.js'
 import { createInboundStreamAuthorization, type InboundStreamAuthorization, type InboundStreamAuthorizationInit } from '../inbound-authorization.js'
 
 const debugLog = createLogger('repo-service')
@@ -30,7 +30,13 @@ export type RepoServiceComponents = BaseComponents & {
 	repo: IRepo
 	networkManager?: NetworkManagerLike
 	peerId?: PeerId
-	getConnectionAddrs?: (peerId: PeerId) => string[]
+	/**
+	 * Optional resolver for the addresses this node may publish for a redirect target. Async
+	 * because the answer includes the peer's own advertised addresses, which live in the
+	 * peerStore — see `publishableAddrsForPeer`. A synchronous `string[]` is still accepted so an
+	 * embedder's connections-only stub keeps working.
+	 */
+	getConnectionAddrs?: (peerId: PeerId) => string[] | Promise<string[]>
 	/**
 	 * Optional libp2p node. The production wiring injects the node post-construction
 	 * via {@link RepoService.setLibp2p} (the `components.libp2p` proxy does not
@@ -159,19 +165,21 @@ export class RepoService implements Startable {
 		return this.getLibp2p()?.peerId as PeerId | undefined
 	}
 
-	private getPeerAddrs(peerId: PeerId): string[] {
-		if (this.components.getConnectionAddrs) return this.components.getConnectionAddrs(peerId)
+	/**
+	 * The addresses this node may publish for `peerId` in a redirect payload.
+	 *
+	 * This fallback is the PRODUCTION source for the repo service: `libp2p-node-base` injects no
+	 * `getConnectionAddrs` here (the node arrives later, via `setLibp2p`), and unlike a cluster
+	 * redirect there is no record whose embedded multiaddrs could stand in. A redirect goes to a
+	 * THIRD party, so it asks `publishableAddrsForPeer` — the one definition, shared with
+	 * `ClusterService` and `findCluster` — rather than reading connections alone.
+	 */
+	private async getPeerAddrs(peerId: PeerId): Promise<string[]> {
+		if (this.components.getConnectionAddrs) return await this.components.getConnectionAddrs(peerId)
 		const libp2p = this.getLibp2p() as any
 		if (!libp2p?.getConnections) return []
-		// A redirect payload goes to a THIRD party, so only an outbound connection's remoteAddr
-		// qualifies — see `publishableConnectionAddr`.
 		const conns: DirectionalConnection[] = libp2p.getConnections(peerId) ?? []
-		const addrs: string[] = []
-		for (const c of conns) {
-			const addr = publishableConnectionAddr(c, this.addressLog)
-			if (addr !== undefined) addrs.push(addr)
-		}
-		return addrs
+		return await publishableAddrsForPeer(libp2p, conns, peerId, this.addressLog)
 	}
 
 	/**
@@ -238,10 +246,10 @@ export class RepoService implements Startable {
 		if (!smallMesh && !isMember) {
 			const peers = cluster.filter((p: PeerId) => !peersEqual(p, selfId))
 			debugLog('redirect op=%s blockKey=%s cluster=%d', opName, blockKey, cluster.length)
-			return encodePeers(peers.map((pid: PeerId) => ({
+			return encodePeers(await Promise.all(peers.map(async (pid: PeerId) => ({
 				id: pid.toString(),
-				addrs: this.getPeerAddrs(pid)
-			})))
+				addrs: await this.getPeerAddrs(pid)
+			}))))
 		}
 
 		return null

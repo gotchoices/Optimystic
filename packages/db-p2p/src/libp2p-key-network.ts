@@ -5,7 +5,7 @@ import { peerIdFromString } from '@libp2p/peer-id'
 import type { FretService, SerializedTable } from 'p2p-fret'
 import { hashKey } from 'p2p-fret'
 import { createLogger, verbose } from './logger.js'
-import { classifySelfDialability, mergePeerAddresses, publishableConnectionAddr, validMultiaddrStrings, type AddressLog } from './peer-address-book.js'
+import { classifySelfDialability, mergePeerAddresses, publishableConnectionAddr, unionPublishableAddrs, type AddressLog } from './peer-address-book.js'
 import type { IPeerReputation } from './reputation/types.js'
 
 interface WithFretService { services?: { fret?: FretService } }
@@ -943,10 +943,6 @@ export class Libp2pKeyPeerNetwork implements IKeyNetwork, IPeerNetwork {
 		return byPeer
 	}
 
-	private parseMultiaddrs(addrs: string[]): string[] {
-		return validMultiaddrStrings(addrs, this.addressLog)
-	}
-
 	async findCluster(key: Uint8Array): Promise<ClusterPeers> {
 		const t0 = Date.now();
 		const fret = this.getFret()
@@ -1059,14 +1055,13 @@ export class Libp2pKeyPeerNetwork implements IKeyNetwork, IPeerNetwork {
 			}
 			const connectedStrings = connectedByPeer[idStr] ?? []
 			const peerStoreStrings = peerStoreAddrs[idStr] ?? []
-			// De-duplicate while preserving connected-first ordering. A connected
-			// multiaddr that reaches this list is one we OUTBOUND-dialed, so it is the
-			// address libp2p just used to reach this peer and is the most reliable;
-			// peerStore addrs are the fallback for cohort members we know-of but aren't
-			// currently connected to — and the only source for a member that only ever
-			// dialed US (see `getConnectedAddrsByPeer`).
-			const merged = Array.from(new Set([...connectedStrings, ...peerStoreStrings]))
-			const parsed = this.parseMultiaddrs(merged)
+			// The union rule — connected-first, de-duplicated, validated — lives in
+			// `unionPublishableAddrs` so a cluster record and a redirect payload cannot describe
+			// the same peer differently. The sync form is used here (rather than
+			// `publishableAddrsForPeer`) because both halves are already in hand: the peerStore
+			// read above is batched across the whole cohort, and on the membership-scoped path it
+			// is the same `store.get` that fetched protocols.
+			const parsed = unionPublishableAddrs(connectedStrings, peerStoreStrings, this.addressLog)
 			const remotePeerId = peerIdFromString(idStr)
 			const raw = remotePeerId.publicKey?.raw ?? new Uint8Array()
 			// Note: parsed may be empty for a cohort member we have neither a

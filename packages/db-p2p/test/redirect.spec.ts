@@ -195,6 +195,107 @@ describe('RepoService redirect logic', () => {
 				`the source socket ${sourceSocket} is reachable by nobody else`).to.deep.equal([]);
 		});
 
+		/**
+		 * Ticket: third-party-address-set-has-two-definitions.
+		 *
+		 * The direction filter above is only half the rule. The other half is the peer's OWN
+		 * advertised addresses, which reach us through `identify`/`identifyPush` and live in the
+		 * peerStore — and for a cohort member that only ever dialed US and is reachable only
+		 * through a relay, that is the ONLY place its real circuit address exists on this node.
+		 * `findCluster` had always unioned the two; the redirect resolvers read connections alone,
+		 * so the same peer was described with a circuit address in a cluster record and with no
+		 * address at all in a repo redirect. `RepoService` is the resolver where that hurts most:
+		 * `libp2p-node-base` injects no `getConnectionAddrs` here, and unlike a cluster redirect
+		 * there is no record whose embedded multiaddrs could stand in.
+		 */
+		it("unions the peerStore's advertised addresses into the redirect payload fallback", async () => {
+			const self = await makePeerId();
+			const dialed = await makePeerId();
+			const relayOnly = await makePeerId();
+			const relay = await makePeerId();
+			const outboundAddr = `/ip4/10.0.0.5/tcp/4001/p2p/${dialed.toString()}`;
+			// What `identify` gave us for the peer we dialed: a second listen address we have not
+			// used. It must be published too — a third party may be able to reach it and not the one
+			// we happened to dial.
+			const dialedAdvertised = '/ip4/192.168.1.9/tcp/4001';
+			// The relay-only peer dialed US, so its connection contributes nothing (the source
+			// socket) and its self-advertised circuit address is the whole answer.
+			const sourceSocket = `/ip4/127.0.0.1/tcp/58247/p2p/${relayOnly.toString()}`;
+			const relayAdvertised = `/ip4/10.0.0.9/tcp/4001/p2p/${relay.toString()}/p2p-circuit`;
+			const advertised: Record<string, string[]> = {
+				[dialed.toString()]: [outboundAddr, dialedAdvertised],
+				[relayOnly.toString()]: [relayAdvertised],
+			};
+
+			const nm = makeNetworkManager([dialed, relayOnly]);
+			// No getConnectionAddrs: force the fallback, which is the production path here.
+			const service = new RepoService(
+				makeComponents({ repo: makeStubRepo(), peerId: self, networkManager: nm }),
+				{ responsibilityK: 1 }
+			);
+			service.setLibp2p({
+				peerId: self,
+				getConnections: (pid: PeerId) => pid.equals(dialed)
+					? [{ direction: 'outbound', remoteAddr: { toString: () => outboundAddr } }]
+					: [{ direction: 'inbound', remoteAddr: { toString: () => sourceSocket } }],
+				peerStore: {
+					get: async (pid: PeerId) => {
+						const addrs = advertised[pid.toString()];
+						// libp2p's peerStore THROWS for a peer it has no record of; the resolver
+						// must treat that as "no advertised addresses", not as an error.
+						if (addrs === undefined) throw new Error('Not Found');
+						return { addresses: addrs.map(a => ({ multiaddr: { toString: () => a } })) };
+					}
+				}
+			} as any);
+
+			const message: RepoMessage = { operations: [{ get: { blockIds: ['block-1'], context: { committed: [], rev: 0 } } }] };
+			const result = await service.checkRedirect('block-1', 'get', message);
+
+			expect(result).to.not.be.null;
+			const addrsById = Object.fromEntries(result!.redirect.peers.map(p => [p.id, p.addrs]));
+			// Connection-first, de-duplicated: the address libp2p just succeeded with leads, and the
+			// peerStore's copy of that same address does not take a second slot.
+			expect(addrsById[dialed.toString()],
+				'the dialed address leads; the advertised one follows; neither is duplicated')
+				.to.deep.equal([outboundAddr, dialedAdvertised]);
+			// The whole point: this peer is NOT addressless, and never was — we just were not looking.
+			expect(addrsById[relayOnly.toString()],
+				'a peer that only ever dialed us is described by its advertised circuit address')
+				.to.deep.equal([relayAdvertised]);
+			expect(addrsById[relayOnly.toString()],
+				`the source socket ${sourceSocket} is reachable by nobody else`).to.not.include(sourceSocket);
+		});
+
+		/**
+		 * A peerStore that is absent, empty, or throwing leaves the connection-derived half intact:
+		 * half a redirect beats a redirect that errors.
+		 */
+		it('falls back to the connection half when the peerStore has nothing or fails', async () => {
+			const self = await makePeerId();
+			const dialed = await makePeerId();
+			const outboundAddr = `/ip4/10.0.0.5/tcp/4001/p2p/${dialed.toString()}`;
+			const nm = makeNetworkManager([dialed]);
+			const message = (): RepoMessage => ({ operations: [{ get: { blockIds: ['block-1'], context: { committed: [], rev: 0 } } }] });
+			const conns = { getConnections: () => [{ direction: 'outbound', remoteAddr: { toString: () => outboundAddr } }] };
+
+			for (const [what, peerStore] of [
+				['no peerStore at all', undefined],
+				['a peerStore that throws', { get: async () => { throw new Error('peerStore exploded'); } }],
+				['a peerStore with no addresses', { get: async () => ({ addresses: [] }) }],
+			] as const) {
+				const service = new RepoService(
+					makeComponents({ repo: makeStubRepo(), peerId: self, networkManager: nm }),
+					{ responsibilityK: 1 }
+				);
+				service.setLibp2p({ peerId: self, ...conns, ...(peerStore ? { peerStore } : {}) } as any);
+				const result = await service.checkRedirect('block-1', 'get', message());
+				expect(result, `${what}: a redirect must still be produced`).to.not.be.null;
+				expect(result!.redirect.peers[0]!.addrs, `${what}: the connection half must survive`)
+					.to.deep.equal([outboundAddr]);
+			}
+		});
+
 		it('excludes self from redirect peers', async () => {
 			const self = await makePeerId();
 			const coordinator = await makePeerId();

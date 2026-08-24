@@ -42,6 +42,18 @@ function recordWithPeers(peers: ClusterPeers): ClusterRecord {
 	};
 }
 
+/** Poll until `from`'s peerStore holds at least one address `to` advertised through `identify`. */
+async function waitForPeerStoreAddrs(from: Libp2p, to: PeerId, timeoutMs = 10_000): Promise<string[]> {
+	const deadline = Date.now() + timeoutMs;
+	for (;;) {
+		const entry = (await from.peerStore.all()).find(p => p.id.toString() === to.toString());
+		const addrs = entry?.addresses.map(a => a.multiaddr.toString()) ?? [];
+		if (addrs.length > 0) return addrs;
+		if (Date.now() >= deadline) throw new Error(`no peerStore addresses for ${to.toString()} after ${timeoutMs}ms`);
+		await new Promise(resolve => setTimeout(resolve, 20));
+	}
+}
+
 /** Poll until `from` has indexed at least one connection to `to`. */
 async function waitForConnections(from: Libp2p, to: PeerId, timeoutMs = 10_000): Promise<Connection[]> {
 	const deadline = Date.now() + timeoutMs;
@@ -137,8 +149,16 @@ describe('cluster service node resolvers', function () {
 	 *
 	 * Two real nodes give both verdicts from one dial — the dialer holds the outbound half and the
 	 * listener the inbound half of the same socket pair.
+	 *
+	 * Ticket: third-party-address-set-has-two-definitions. The rule has a second half, and the
+	 * resolver used to be missing it: after the direction filter drops the inbound half, the peer's
+	 * OWN advertised addresses — the ones `identify` delivered into the peerStore — are what is
+	 * left, and for a peer reachable only through a relay they are the only real address that ever
+	 * exists on this node. The listener therefore publishes the dialer's advertised addresses,
+	 * where before this change it published an empty list and the redirect's recipient had nothing
+	 * to dial.
 	 */
-	it('publishes a redirect target address only from the side that dialed outbound', async () => {
+	it("publishes a redirect target from outbound connections unioned with the peer's advertised addresses", async () => {
 		const common = {
 			bootstrapNodes: [],
 			networkName: 'test-cluster-resolvers-direction',
@@ -169,12 +189,28 @@ describe('cluster service node resolvers', function () {
 			return response.redirect.peers[0]!.addrs;
 		};
 
-		expect(await redirectAddrsFor(listener, dialer),
-			`the listener published the dialer's ephemeral source socket (${sourceSocket}), which no third party can reach`)
-			.to.deep.equal([]);
+		// The listener holds ONLY the inbound half, so the peerStore is its entire answer.
+		const dialerAdvertised = await waitForPeerStoreAddrs(listener, dialer.peerId);
+		const fromListener = await redirectAddrsFor(listener, dialer);
+		expect(fromListener,
+			`the dialer's ephemeral source socket (${sourceSocket}) is reachable by nobody else and must never be published`)
+			.to.not.include(sourceSocket);
+		expect(fromListener,
+			'an inbound-only peer is not addressless: identify already told us where it listens')
+			.to.not.be.empty;
+		for (const addr of dialerAdvertised) {
+			expect(fromListener, `the dialer advertised ${addr}; the redirect must carry it`).to.include(addr);
+		}
 
-		expect(await redirectAddrsFor(dialer, listener),
-			'an address we dialed ourselves is real and must still be published')
-			.to.deep.equal([outbound[0]!.remoteAddr.toString()]);
+		const outboundAddr = outbound[0]!.remoteAddr.toString();
+		const listenerAdvertised = await waitForPeerStoreAddrs(dialer, listener.peerId);
+		const fromDialer = await redirectAddrsFor(dialer, listener);
+		expect(fromDialer[0],
+			'the address we dialed ourselves is one libp2p has just succeeded with, so it leads')
+			.to.equal(outboundAddr);
+		for (const addr of listenerAdvertised) {
+			expect(fromDialer, `the listener advertised ${addr}; the redirect must carry it too`).to.include(addr);
+		}
+		expect(fromDialer.length, 'the union must be de-duplicated').to.equal(new Set(fromDialer).size);
 	});
 });

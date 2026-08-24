@@ -79,7 +79,7 @@ describe('ClusterService redirect logic', () => {
 			);
 
 			const record = makeRecord(makePeers([a, b])); // self absent, size 2 >= K(2)
-			const result = service.checkRedirect(record);
+			const result = await service.checkRedirect(record);
 
 			expect(result).to.not.be.null;
 			expect(result!.redirect.reason).to.equal('not_in_cluster');
@@ -99,7 +99,7 @@ describe('ClusterService redirect logic', () => {
 			);
 
 			const record = makeRecord(makePeers([a, b]));
-			const redirect = service.checkRedirect(record);
+			const redirect = await service.checkRedirect(record);
 			// Mirror the update-path contract: redirect ?? await cluster.update(record)
 			const response = redirect ?? await stub.update(record);
 
@@ -117,7 +117,7 @@ describe('ClusterService redirect logic', () => {
 			);
 
 			const record = makeRecord(makePeers([self, a])); // self present
-			const redirect = service.checkRedirect(record);
+			const redirect = await service.checkRedirect(record);
 			expect(redirect).to.be.null;
 
 			// And the update path processes locally (stub.update IS called).
@@ -137,7 +137,7 @@ describe('ClusterService redirect logic', () => {
 			);
 
 			const record = makeRecord(makePeers([a])); // self NOT a member, but mesh is small
-			const result = service.checkRedirect(record);
+			const result = await service.checkRedirect(record);
 			expect(result).to.be.null;
 		});
 
@@ -151,7 +151,7 @@ describe('ClusterService redirect logic', () => {
 			);
 
 			const record = makeRecord(makePeers([a, b]));
-			const result = service.checkRedirect(record);
+			const result = await service.checkRedirect(record);
 			expect(result).to.be.null;
 		});
 
@@ -164,7 +164,7 @@ describe('ClusterService redirect logic', () => {
 			);
 
 			const record = makeRecord({}); // empty peer set
-			const result = service.checkRedirect(record);
+			const result = await service.checkRedirect(record);
 			expect(result).to.be.null;
 		});
 
@@ -177,7 +177,7 @@ describe('ClusterService redirect logic', () => {
 			);
 
 			const record = makeRecord(makePeers([a])); // size 1 >= K(1), self absent
-			const result = service.checkRedirect(record);
+			const result = await service.checkRedirect(record);
 			expect(result).to.not.be.null;
 			expect(result!.redirect.peers.map(p => p.id)).to.deep.equal([a.toString()]);
 		});
@@ -193,7 +193,7 @@ describe('ClusterService redirect logic', () => {
 
 			const addr = '/ip4/127.0.0.1/tcp/4001';
 			const record = makeRecord(makePeers([a], (id) => id === a.toString() ? [addr] : []));
-			const result = service.checkRedirect(record);
+			const result = await service.checkRedirect(record);
 
 			expect(result).to.not.be.null;
 			expect(result!.redirect.peers[0]!.addrs).to.deep.equal([addr]);
@@ -214,7 +214,7 @@ describe('ClusterService redirect logic', () => {
 			);
 
 			const record = makeRecord(makePeers([a])); // no embedded multiaddrs
-			const result = service.checkRedirect(record);
+			const result = await service.checkRedirect(record);
 
 			expect(result).to.not.be.null;
 			expect(result!.redirect.peers[0]!.addrs).to.deep.equal([fallback]);
@@ -247,7 +247,7 @@ describe('ClusterService redirect logic', () => {
 				{ responsibilityK: 1 }
 			);
 
-			const result = service.checkRedirect(makeRecord(makePeers([dialed, dialedUs])));
+			const result = await service.checkRedirect(makeRecord(makePeers([dialed, dialedUs])));
 
 			expect(result).to.not.be.null;
 			const addrsById = Object.fromEntries(result!.redirect.peers.map(p => [p.id, p.addrs]));

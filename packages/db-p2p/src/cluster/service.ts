@@ -5,7 +5,7 @@ import type { Startable, Logger, Stream, Connection, StreamHandler, PeerId } fro
 import type { ICluster, ClusterRecord } from '@optimystic/db-core';
 import { encodePeers, type RedirectPayload } from '../repo/redirect.js';
 import { toClusterErrorEnvelope } from './cluster-error.js';
-import { mergeRecordPeerAddresses, publishableConnectionAddr, type AddressLog, type DirectionalConnection } from '../peer-address-book.js';
+import { mergeRecordPeerAddresses, publishableAddrsForPeer, type AddressLog, type DirectionalConnection } from '../peer-address-book.js';
 import { MAX_CONTROL_MESSAGE_BYTES } from '../protocol-limits.js';
 import type { Uint8ArrayList } from 'uint8arraylist';
 import { createLogger } from '../logger.js';
@@ -28,10 +28,13 @@ export interface ClusterServiceComponents extends BaseComponents {
 	 */
 	peerId?: PeerId
 	/**
-	 * Optional resolver for a peer's dialable multiaddrs, used as a fallback when
-	 * a redirect target has no multiaddrs embedded in `record.peers`.
+	 * Optional resolver for the addresses this node may publish for a peer, used as a fallback
+	 * when a redirect target has no multiaddrs embedded in `record.peers`. Async because the
+	 * answer includes the peer's own advertised addresses, which live in the peerStore — see
+	 * `publishableAddrsForPeer`. A synchronous `string[]` is still accepted so an embedder's
+	 * connections-only stub keeps working.
 	 */
-	getConnectionAddrs?: (peerId: PeerId) => string[]
+	getConnectionAddrs?: (peerId: PeerId) => string[] | Promise<string[]>
 	/**
 	 * Optional sink for dialable addresses carried by an inbound cluster record, so this
 	 * node can later dial a cohort sibling it has never had a connection to. Omitted →
@@ -120,25 +123,24 @@ export class ClusterService implements Startable {
 		return this.getLibp2p()?.peerId as PeerId | undefined;
 	}
 
-	private getPeerAddrs(id: string): string[] {
+	/**
+	 * The addresses this node may publish for `id` in a redirect payload, when the record carried
+	 * none. A redirect goes to a THIRD party, so it asks `publishableAddrsForPeer` — the one
+	 * definition, shared with `RepoService` and `findCluster` — rather than reading connections
+	 * alone: a cohort sibling that only ever dialed US has its real address in the peerStore only.
+	 */
+	private async getPeerAddrs(id: string): Promise<string[]> {
 		let pid: PeerId;
 		try {
 			pid = peerIdFromString(id);
 		} catch {
 			return [];
 		}
-		if (this.components.getConnectionAddrs) return this.components.getConnectionAddrs(pid);
+		if (this.components.getConnectionAddrs) return await this.components.getConnectionAddrs(pid);
 		const libp2p = this.getLibp2p();
 		if (!libp2p?.getConnections) return [];
-		// A redirect payload goes to a THIRD party, so only an outbound connection's remoteAddr
-		// qualifies — see `publishableConnectionAddr`.
 		const conns: DirectionalConnection[] = libp2p.getConnections(pid) ?? [];
-		const addrs: string[] = [];
-		for (const c of conns) {
-			const addr = publishableConnectionAddr(c, this.addressLog);
-			if (addr !== undefined) addrs.push(addr);
-		}
-		return addrs;
+		return await publishableAddrsForPeer(libp2p, conns, pid, this.addressLog);
 	}
 
 	/**
@@ -156,7 +158,7 @@ export class ClusterService implements Startable {
 	 * when the update should be processed locally (we are a member, the mesh is too
 	 * small to scope, or we lack the identity/peer set to make a decision).
 	 */
-	checkRedirect(record: ClusterRecord): RedirectPayload | null {
+	async checkRedirect(record: ClusterRecord): Promise<RedirectPayload | null> {
 		const selfId = this.getSelfId();
 		if (!selfId) return null;					// no identity → can't scope, process locally
 
@@ -170,11 +172,11 @@ export class ClusterService implements Startable {
 
 		if (!smallMesh && !isMember) {
 			const others = peerIds.filter(id => id !== selfStr);
-			return encodePeers(others.map(id => {
+			return encodePeers(await Promise.all(others.map(async id => {
 				const recAddrs = peers[id]?.multiaddrs ?? [];
-				const addrs = recAddrs.length > 0 ? recAddrs : this.getPeerAddrs(id);
+				const addrs = recAddrs.length > 0 ? recAddrs : await this.getPeerAddrs(id);
 				return { id, addrs };
-			}));
+			})));
 		}
 
 		return null;
@@ -222,7 +224,7 @@ export class ClusterService implements Startable {
 			this.learnPeerAddresses(message.record);
 			// Scope consensus to responsible peers: redirect when we are not a
 			// member of the record's authoritative peer set, otherwise process.
-			const redirect = this.checkRedirect(message.record);
+			const redirect = await this.checkRedirect(message.record);
 			return redirect ?? await this.cluster.update(message.record);
 		}
 		throw new Error(`Unknown operation: ${message.operation}`);

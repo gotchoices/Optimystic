@@ -26,7 +26,7 @@ import { assertClusterSizeCoupling } from './cluster/cluster-size-coupling.js';
 import { createCommitCertStore, makeClusterCommitCertExtractor, type CommitCertStore } from './cluster/commit-cert.js';
 import { coordinatorRepo } from './repo/coordinator-repo.js';
 import { Libp2pKeyPeerNetwork, type NetworkMode, type NetworkStatePersistence } from './libp2p-key-network.js';
-import { mergePeerAddresses, publishableConnectionAddr, type AddressLog } from './peer-address-book.js';
+import { mergePeerAddresses, publishableAddrsForPeer, type AddressLog } from './peer-address-book.js';
 import type { OptimysticNode, OptimysticNodeAttachments } from './optimystic-node.js';
 import { ClusterClient } from './cluster/client.js';
 import type { IRepo, ICluster, ITransactionValidator, BlockId, IBlockChangeNotifier } from '@optimystic/db-core';
@@ -571,17 +571,13 @@ export async function createLibp2pNodeBase(
 					peerId: components.peerId,
 					// Fallback addr resolver for redirect targets whose multiaddrs are not
 					// already embedded in record.peers. A redirect payload is handed to a THIRD
-					// party, so it obeys the same rule the cluster record does — see
-					// `publishableConnectionAddr`: only an outbound connection's remoteAddr is an
-					// address anyone else can reach.
-					getConnectionAddrs: (peerId: any) => {
-						const conns = liveNode?.getConnections?.(peerId) ?? [];
-						const addrs: string[] = [];
-						for (const c of conns) {
-							const addr = publishableConnectionAddr(c, addressLog);
-							if (addr !== undefined) addrs.push(addr);
-						}
-						return addrs;
+					// party, so it answers with `publishableAddrsForPeer` — the same rule, and the
+					// same function, `findCluster` uses to fill a cluster record: the publishable
+					// half of our live connections plus the peer's own advertised addresses.
+					getConnectionAddrs: async (peerId: any) => {
+						if (!liveNode) return [];
+						const conns = liveNode.getConnections?.(peerId) ?? [];
+						return await publishableAddrsForPeer(liveNode, conns, peerId, addressLog);
 					},
 					// Inbound cluster records carry each cohort member's multiaddrs. libp2p only
 					// propagates addresses between directly-connected peers, so for a cohort chosen

@@ -76,10 +76,15 @@ describe('peer-address-book', () => {
 			{ what: 'a direct address we dialed', direction: 'outbound', addr: '/ip4/10.0.0.5/tcp/4001', publishable: true },
 			{ what: 'a circuit address we dialed through a relay', direction: 'outbound', addr: '/ip4/10.0.0.9/tcp/4001/p2p/{RELAY}/p2p-circuit', publishable: true },
 			{ what: 'the source socket of a direct connection they dialed', direction: 'inbound', addr: '/ip4/127.0.0.1/tcp/58247/ws', publishable: false },
-			// Composed by @libp2p/circuit-relay-v2 as <our own hop to the relay> + /p2p-circuit/p2p/<dialer>,
-			// so it is only dialable if OUR hop was outbound. The good version of this address reaches us
-			// through identify instead, so keeping it here would buy nothing and reintroduce the same class
-			// of bug one hop down.
+			// Composed by @libp2p/circuit-relay-v2 as <our own hop to the relay> + /p2p-circuit/p2p/<dialer>
+			// (v4.1.3, dist/src/transport/index.js:272), so it is only dialable if OUR hop was outbound.
+			// The decisive reason, though, is the reservation asymmetry: a relay's handleConnect requires
+			// a reservation for the DESTINATION only (dist/src/server/index.js:219-222, status
+			// NO_RESERVATION) — a dialer needs none — so the relay this address names is the one WE hold a
+			// reservation with, and a third party dialing it reaches the dialer only if the dialer happens
+			// to hold a reservation there too, which nothing establishes. The good version of this address
+			// reaches us through identify instead, so keeping it here would buy nothing and reintroduce the
+			// same class of bug one hop down. See the accepted-tradeoff NOTE on publishableConnectionAddr.
 			{ what: 'the composed address of a relayed connection they dialed', direction: 'inbound', addr: '/ip4/10.0.0.9/tcp/4001/p2p/{RELAY}/p2p-circuit/p2p/{DIALER}', publishable: false },
 			{ what: 'an outbound connection with an unparseable address', direction: 'outbound', addr: 'not-a-multiaddr', publishable: false },
 			// The empty string parses as the root multiaddr `/` and encodes to zero bytes.
