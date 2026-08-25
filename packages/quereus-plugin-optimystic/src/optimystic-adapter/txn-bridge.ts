@@ -39,7 +39,7 @@ export interface DirtyTree {
    */
   hasUnsyncedChanges?(): boolean;
   /**
-   * Optional "which committed revision is this tree reading and writing at?" (a Tree
+   * Optional "which committed revision is this tree reading at?" (a Tree
    * forwards to `Collection.committedRevision()`; `undefined` means the collection was
    * invented locally and never adopted a committed revision). Used ONLY by the
    * `commit:collections` trace; the commit sweep itself does not branch on it. Optional
@@ -74,7 +74,9 @@ interface CommitCollectionTrace {
   /** Whether the collection still holds unflushed changes; `undefined` when unknowable. */
   staged: boolean | undefined;
   /**
-   * The committed revision the collection reads and writes at, or:
+   * The committed revision the collection READS at when the line is emitted — which is
+   * BEFORE the flush, so the commit this line announces lands at this value plus one
+   * (`none` lands at 1). Or:
    * - `'none'` — the collection is INVENTED: it has no committed revision because
    *   nothing was ever committed under its id and this process staged a fresh empty
    *   one (`Collection.createOrOpen`'s create branch).
@@ -519,7 +521,16 @@ export class TransactionBridge {
    * omits `hasUnsyncedChanges`.
    *
    * The revisions follow the id list as ONE trailing `revs=<id>:<rev>,...` field, in the
-   * same sorted order. Strictly ADDITIVE on purpose: the `<id>=staged|clean|unknown`
+   * same sorted order. Each is the revision that collection is READING at as this line is
+   * emitted, which is BEFORE the flush — so the commit being announced lands at that value
+   * plus one (`none` lands at 1). Printing the pre-commit revision is deliberate: it is the
+   * only revision that exists yet, and it is what the staged actions were computed against.
+   * But it means a reader whose `index:seek` `rev=` equals the number here is one revision
+   * STALE, not converged; `docs/debugging.md` (§ "Which collections did a write carry?")
+   * spells the +1 out because reading it as the landing revision inverts the whole
+   * two-worlds decision rule these lines exist to serve.
+   *
+   * Strictly ADDITIVE on purpose: the `<id>=staged|clean|unknown`
    * tokens stay byte-identical to what this line has always emitted, so an operator's
    * existing grep or parser keyed on a collection id keeps matching. Folding the
    * revision into the id token instead (`<id>@7=staged`) would have been shorter and

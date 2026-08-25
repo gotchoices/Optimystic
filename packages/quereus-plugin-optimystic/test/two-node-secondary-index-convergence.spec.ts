@@ -364,4 +364,50 @@ describe('Two-node secondary-index convergence (write on one node, index-seek on
 		expect(seekA!.arm, 'a plain select is a live read').to.equal('live');
 		expect(seekB!.arm, 'a plain select is a live read').to.equal('live');
 	});
+
+	// The two lines are read TOGETHER, and the only thing that makes that legal is knowing
+	// how the write-side number relates to the read-side one. `commit:collections` is
+	// emitted before the flush, so it prints the revision the commit SUPERSEDES; the commit
+	// lands at that plus one (`none` counting as 0). An operator who reads the printed
+	// number as the landing revision inverts the decision rule in `docs/debugging.md`:
+	// a converged reader looks one revision stale, and a reader that IS one revision stale
+	// looks converged and gets diagnosed as "the index action did not survive commit".
+	// Pinned here so the +1 cannot silently become +0 or +2 under a commit-path change.
+	it("the revision a commit lands at is the commit line's revision plus one", async () => {
+		const { db: dbA } = createDb(transactorFor(0));
+
+		await dbA.exec(createTableSql);
+		await dbA.exec(createIndexSql);
+
+		// Capture the INSERT's own commit line — the pre-flush revision of each collection.
+		const commitLines = await captureTrace(async () => {
+			await dbA.exec(`insert into FormationUsage (Id, Token) values (1, 'tok-a')`);
+		});
+		const carrying = commitTraces(commitLines).find(t => t.state.get(INDEX_COLLECTION_ID) === 'staged');
+		expect(carrying, 'the insert emitted a commit line carrying the index collection')
+			.to.not.equal(undefined);
+
+		// `none` means "no committed revision yet", which the next commit turns into 1.
+		const landedAt = (printed: string | undefined): number => {
+			expect(printed, 'the commit line named a revision for this collection').to.match(/^(\d+|none)$/);
+			return (printed === 'none' ? 0 : Number(printed)) + 1;
+		};
+		const indexLanded = landedAt(carrying!.rev.get(INDEX_COLLECTION_ID));
+		const tableLanded = landedAt(carrying!.rev.get(TABLE_COLLECTION_ID));
+
+		// Now read the row back and compare what the seek descended against those.
+		let rows: Row[] = [];
+		const seekLines = await captureTrace(async () => {
+			rows = await collect(dbA, `select Id from FormationUsage where Token = 'tok-a'`);
+		});
+		expect(rows.map(r => r.Id), 'the read this trace describes found the committed row')
+			.to.deep.equal([1]);
+
+		const seek = indexSeekTraces(seekLines).find(t => t.collection === INDEX_COLLECTION_ID);
+		expect(seek, 'the read emitted an index:seek line for the index collection').to.not.equal(undefined);
+		expect(Number(seek!.rev), 'the index collection now reads at the revision the insert landed at')
+			.to.equal(indexLanded);
+		expect(Number(seek!.mainRev), 'and the table collection likewise')
+			.to.equal(tableLanded);
+	});
 });

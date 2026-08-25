@@ -454,9 +454,13 @@ export class Collection<TAction> implements ICollection<TAction> {
 		return this.pending.length > 0 || !isTransformsEmpty(this.tracker.transforms);
 	}
 
-	/** The committed revision this collection currently reads and writes at, or
-	 * `undefined` for an INVENTED collection that has never adopted a committed
-	 * revision ({@link createOrOpen} found no header and staged a fresh empty one).
+	/** The committed revision this collection currently READS at, or `undefined` for an
+	 * INVENTED collection that has never adopted a committed revision
+	 * ({@link createOrOpen} found no header and staged a fresh empty one).
+	 *
+	 * Not the revision a pending write will land at: {@link getNextRev} is this plus one
+	 * (`undefined` counting as 0), so a diagnostic that prints this value BEFORE a commit
+	 * is naming the revision the commit will supersede, not the one it produces.
 	 *
 	 * DIAGNOSTIC ONLY — do not branch on this. Every block this collection reads is
 	 * materialized at this revision ({@link TransactorSource.tryGet} passes it as the

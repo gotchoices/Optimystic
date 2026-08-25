@@ -118,11 +118,17 @@ Reading `commit:collections` — one line per commit, emitted **before** the flu
   that.
 - Each id carries `=staged` (unflushed changes pending at commit time) / `=clean` / `=unknown`.
 - A trailing `revs=<id>:<revision>,...` field names the committed revision each collection is
-  reading and writing at, in the same sorted order as the ids. `:none` means the collection is
-  **invented**: nothing was ever committed under that id and this process staged a fresh empty one,
-  so it has no committed revision at all. `:unknown` appears only for a test double that does not
-  implement the accessor. The revision is the discriminator the id cannot be — see the note below
-  on ids being block ids.
+  reading at, in the same sorted order as the ids. `:none` means the collection is **invented**:
+  nothing was ever committed under that id and this process staged a fresh empty one, so it has no
+  committed revision at all. `:unknown` appears only for a test double that does not implement the
+  accessor. The revision is the discriminator the id cannot be — see the note below on ids being
+  block ids.
+- **The revision is the one the collection is reading at, and this line is emitted BEFORE the
+  flush — so the commit it announces lands at that number plus one** (`:none` lands at `1`). Three
+  successive inserts against one table therefore print `:none`, `:1`, `:2` for the table
+  collection, leaving it at revision `3`. Always add one before comparing this number against a
+  reader's `index:seek` `rev=`; forgetting to is an off-by-one that makes a perfectly converged
+  reader look one revision stale, and a genuinely stale reader look converged.
 - The revisions are a **separate trailing field on purpose**, not folded into the id tokens: the
   `<id>=staged|clean|unknown` tokens are unchanged from before revisions existed, so an existing
   grep or parser keyed on a collection id keeps matching. Each `revs=` pair splits on its LAST `:`
@@ -196,14 +202,21 @@ query is index-routed on both nodes is itself worth doing: a query that seeks on
 full-scans on the other explains an asymmetric result on its own.)
 
 When a row is written on node A and an index-driven lookup on node B cannot find it, read node B's
-`index:seek` line against node A's `commit:collections` revision for the same collection id:
+`index:seek` line against the revision node A's write **landed at**. That landing revision is not
+printed anywhere — derive it from node A's `commit:collections` line for the same collection id:
+
+```
+landed = (revs= value for that id) + 1      # and `none` + 1 = 1
+```
+
+Call that `landed` below. Getting this step wrong inverts every row of the table.
 
 | Node B's index collection at the failing read | Reading |
 | --- | --- |
 | `rev=none` | Node B invented its own empty index collection and never adopted the committed one. |
-| `rev` lower than node A's commit revision | A refresh gap — the collection is real but stale; nothing called `update()` on it before the read. |
-| `rev` equal to node A's commit revision, `matched=0` | The write's index action did not survive commit despite being staged. Look at the sync/merge and conflict replay, not at refresh. |
-| `rev` equal, `matched>0`, but the SQL still returned no row | The index held the entry and the main-table fetch dropped it — compare `main_rev=` against node A's revision for the **table** collection (same collection on both sides), never against `rev=`. |
+| `rev` lower than `landed` | A refresh gap — the collection is real but stale; nothing called `update()` on it before the read. Being short by exactly one is the ordinary shape of this, not evidence of anything else. |
+| `rev` at or above `landed`, `matched=0` | The write's index action did not survive commit despite being staged. Look at the sync/merge and conflict replay, not at refresh. (`above` is normal: any later commit under that id moves the collection past `landed`.) |
+| `rev` at or above `landed`, `matched>0`, but the SQL still returned no row | The index held the entry and the main-table fetch dropped it — compare `main_rev=` against `landed` for the **table** collection (same collection on both sides), never against `rev=`. |
 | `seek=` differs between the two nodes for the same SQL value | Neither of the above: the two nodes framed different keys, so the seek never addressed the entry that was written. |
 
 `none` on its own is not proof of the invention race — a collection that has legitimately never

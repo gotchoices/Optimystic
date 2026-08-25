@@ -950,6 +950,10 @@ export class OptimysticVirtualTable extends VirtualTable {
    *   healthy run (`rev=4 main_rev=3` is normal) and subtracting them means nothing. Each
    *   is comparable only to another revision OF THE SAME COLLECTION — the writer's
    *   `commit:collections` revision for that id, or the other node's `index:seek`.
+   *   Against `commit:collections`, mind the off-by-one: that line is emitted BEFORE the
+   *   flush, so its number is the revision the write SUPERSEDES and the write lands at
+   *   that plus one (`none` lands at 1). A reader sitting exactly on the number printed
+   *   there is one revision STALE, not converged.
    * - `seek=` — the framed index key the descent bracketed on, percent-escaped (the
    *   framing carries control bytes, and a raw key would break whitespace tokenizing).
    *   Two nodes seeking the same SQL value must print the same `seek=`; a difference

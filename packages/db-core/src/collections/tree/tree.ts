@@ -252,7 +252,7 @@ export class Tree<TKey, TEntry> implements TreeReadView<TKey, TEntry> {
 			return String(this.collection.id);
 	}
 
-	/** The committed revision this tree's collection reads and writes at — see
+	/** The committed revision this tree's collection READS at — see
 	 * {@link Collection.committedRevision}. `undefined` means the collection was
 	 * invented locally and has never adopted a committed revision.
 	 *
