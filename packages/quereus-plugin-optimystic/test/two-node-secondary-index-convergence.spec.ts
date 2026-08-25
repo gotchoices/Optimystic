@@ -318,6 +318,42 @@ describe('Two-node secondary-index convergence (write on one node, index-seek on
 			.to.equal(rows.length);
 	});
 
+	// `index:seek` is emitted from a `finally` around the scan, not after it, precisely so
+	// a consumer that walks away mid-iteration still leaves a line behind — an operator
+	// diagnosing a query that errors or short-circuits is exactly who needs it, and a
+	// refactor that moved the call after the loop would silently emit nothing for them.
+	// `matched=` is a floor on this path (documented in `docs/debugging.md`), so this
+	// asserts a range rather than an exact count. Measured while writing it: the line
+	// reports `matched=1` against three matching entries, so the scan really is being
+	// abandoned here, not drained and reported afterwards.
+	it('index seek trace is still emitted when the consumer abandons the scan early', async () => {
+		const { db: dbA } = createDb(transactorFor(0));
+
+		await dbA.exec(createTableSql);
+		await dbA.exec(createIndexSql);
+		await dbA.exec(`insert into FormationUsage (Id, Token) values (1, 'tok-a')`);
+		await dbA.exec(`insert into FormationUsage (Id, Token) values (2, 'tok-a')`);
+		await dbA.exec(`insert into FormationUsage (Id, Token) values (3, 'tok-a')`);
+
+		let seen = 0;
+		const lines = await captureTrace(async () => {
+			// `break` closes the iterator, which propagates a `return()` down the generator
+			// chain — the abandonment case, as opposed to a drained one.
+			for await (const _row of dbA.eval(`select Id from FormationUsage where Token = 'tok-a'`)) {
+				seen++;
+				break;
+			}
+		});
+		expect(seen, 'the consumer took exactly one row and walked away').to.equal(1);
+
+		const seek = indexSeekTraces(lines).find(t => t.collection === INDEX_COLLECTION_ID);
+		expect(seek, 'an abandoned scan still emitted its index:seek line').to.not.equal(undefined);
+		expect(seek!.seek, 'and still names the key it was seeking').to.not.equal('unset');
+		expect(seek!.matched, 'matched is a floor: at least the rows the consumer saw')
+			.to.be.greaterThan(0);
+		expect(seek!.matched, 'and never more than the index actually holds').to.be.at.most(3);
+	});
+
 	it('two converged nodes report the same index collection revision and the same framed key', async () => {
 		const { db: dbA } = createDb(transactorFor(0));
 		const { db: dbB } = createDb(transactorFor(1));

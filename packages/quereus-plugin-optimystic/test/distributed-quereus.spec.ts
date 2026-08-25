@@ -34,6 +34,12 @@ describe('Distributed Quereus Operations', function () {
 
 	const nodes: TestNode[] = [];
 	const MESH_SIZE = 3;
+	// NOTE: fixed, not ephemeral. If this suite's `before all` fails with
+	// `UnsupportedListenAddressesError` / `EADDRINUSE ... 0.0.0.0:9100`, the cause is a
+	// previous run's libp2p nodes still holding the port, not the change under test —
+	// wait for them to exit and re-run before investigating. Fine for a single run;
+	// if back-to-back or parallel runs become routine, bind port 0 and read the assigned
+	// port back off each node's multiaddrs instead of numbering from a constant.
 	const BASE_PORT = 9100;
 	const NETWORK_NAME = 'test-distributed-quereus';
 

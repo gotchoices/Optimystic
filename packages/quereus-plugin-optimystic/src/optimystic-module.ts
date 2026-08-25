@@ -935,33 +935,30 @@ export class OptimysticVirtualTable extends VirtualTable {
    * (§ "Which revision did a read descend?").
    *
    * A table's main tree and its index trees are separate collections that refresh
-   * through DIFFERENT call sites, and a collection's revision advances only when
-   * something calls `update()`/`sync()` on it. So an index tree can sit at a revision
-   * older than the main tree's — or at none at all, having been invented locally — and
-   * a seek down it silently returns nothing while a full scan of the same table returns
-   * the row. Nothing about that is visible without printing both revisions, which is
-   * what this does:
+   * through DIFFERENT call sites, and a collection's revision advances only on an
+   * explicit call on that instance (`update()`/`sync()`, or `recordCommitted()` from the
+   * coordinator in session mode). So an index tree can sit at a revision older than the
+   * main tree's — or at none at all, having been invented locally — and a seek down it
+   * silently returns nothing while a full scan of the same table returns the row.
+   * Nothing about that is visible without printing both revisions, which is what this
+   * does. The field-by-field reading guide, and the decision table an operator applies
+   * to the result, live in `docs/debugging.md`; what matters at THIS site is only what
+   * each field is sourced from:
    *
-   * - `arm=committed` never refreshes (deliberate — see {@link committedTreeView});
-   *   `arm=live` ran `update()` on both trees immediately before the scan.
-   * - `rev=` / `main_rev=` — the index and main collections' committed revisions,
-   *   `none` for a collection that has never adopted one. NOT on a common scale: every
-   *   collection counts its own revisions, so these two are routinely unequal on a
-   *   healthy run (`rev=4 main_rev=3` is normal) and subtracting them means nothing. Each
-   *   is comparable only to another revision OF THE SAME COLLECTION — the writer's
-   *   `commit:collections` revision for that id, or the other node's `index:seek`.
-   *   Against `commit:collections`, mind the off-by-one: that line is emitted BEFORE the
-   *   flush, so its number is the revision the write SUPERSEDES and the write lands at
-   *   that plus one (`none` lands at 1). A reader sitting exactly on the number printed
-   *   there is one revision STALE, not converged.
-   * - `seek=` — the framed index key the descent bracketed on, percent-escaped (the
-   *   framing carries control bytes, and a raw key would break whitespace tokenizing).
-   *   Two nodes seeking the same SQL value must print the same `seek=`; a difference
-   *   means the framing itself diverged, not the tree. `seek=` with an empty value is
-   *   the whole-index prefix (a plan that wants every entry); `seek=unset` means the
-   *   scan returned before framing a key at all.
-   * - `matched=` — index entries the seek produced, so "descended a stale index" is
-   *   distinguishable from "descended a current index that genuinely has no entry".
+   * - `arm=committed` is a pinned pre-transaction view that never refreshes (deliberate
+   *   — see {@link committedTreeView}); `arm=live` ran `update()` on both trees
+   *   immediately before the scan.
+   * - `rev=` / `main_rev=` — the index and main COLLECTIONS' committed revisions, `none`
+   *   for a collection that has never adopted one. Every collection counts its own
+   *   revisions, so the two are not on one scale and are routinely unequal on a healthy
+   *   run; do not make them look comparable by deriving one from the other here.
+   * - `seek=` — the framed index key the descent bracketed on, escaped by
+   *   {@link printableSeekKey} so the line stays one whitespace-free token per field.
+   *   Empty is the whole-index prefix; `unset` means the scan returned before framing a
+   *   key at all, and the two must not be collapsed.
+   * - `matched=` — index entries the seek produced, counted before the row fetch, so
+   *   "descended a stale index" is distinguishable from "descended a current index that
+   *   genuinely has no entry".
    *
    * `collection=` and `main=` are the same id strings `index:tree-open` and
    * `commit:collections` print, so all three lines join on them — and they name BOTH

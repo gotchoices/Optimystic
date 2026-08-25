@@ -49,6 +49,12 @@ themselves on their own env var — `RUN_LONG_TESTS=1` (circuit-relay/DCUtR/subs
 full budget). These run in no script, including `yarn check`; each spec's header comment gives the
 exact command. Grep `process.env.RUN_` under `test/` for the current set.
 
+One `RUN_` var is not third-tier and is worth knowing about: `RUN_INDEX_SWEEP=1` widens
+`quereus-plugin-optimystic`'s `two-node-index-interleaving-sweep.spec.ts` from a 12-case core subset
+to the full 144-ordering cross product. It is *also* widened by `OPTIMYSTIC_INTEGRATION=1`, so the
+full sweep already runs under `yarn test:integration` and `yarn check` — the dedicated var just lets
+you run that one file wide without dragging in the real-socket specs.
+
 ## Dependencies
 
 Shared cross-package deps are version-guarded by `yarn.config.cjs` (Yarn 4 constraints). `@libp2p/peer-id` and `uint8arrays` must declare a single blessed range everywhere; `@libp2p/interface` and `@libp2p/crypto` must stay within a shared major (minor drift is allowed and, for `@libp2p/interface` 3.1 vs 3.2, deliberate — see the comments in that file). After changing any such dep, run `yarn constraints`; single-range violations are auto-repairable with `yarn constraints --fix`, major violations are reported and need a human decision.

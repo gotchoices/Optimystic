@@ -464,8 +464,11 @@ export class Collection<TAction> implements ICollection<TAction> {
 	 *
 	 * DIAGNOSTIC ONLY — do not branch on this. Every block this collection reads is
 	 * materialized at this revision ({@link TransactorSource.tryGet} passes it as the
-	 * read context), and the revision advances ONLY through {@link update} or
-	 * {@link sync}; nothing moves it passively — not time, not another collection's
+	 * read context), and the revision advances ONLY through an explicit call on THIS
+	 * instance — {@link update} or {@link sync} on the single-node path, or
+	 * {@link recordCommitted} when a {@link TransactionCoordinator} commits this
+	 * collection (the session/consensus path, where no `update()` is involved at all).
+	 * Nothing moves it passively — not time, not another collection's
 	 * commit, not a peer's notification. So a collection sitting here at a lagging
 	 * revision silently serves an old root with no error, and two collections in one
 	 * process can be at different revisions at the same instant. That gap is invisible

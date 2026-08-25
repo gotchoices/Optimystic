@@ -536,6 +536,20 @@ describe('Staging-refactor unit gaps (Tree.restore no-op + bridge collection reg
 			// alone does not prove the write touched it — `staged` is what does.
 			expect(carrying.state.get(mainId), 'the main collection had staged changes to push').to.equal('staged');
 			expect(carrying.state.get(indexId), 'the index collection had staged changes to push').to.equal('staged');
+			// The trailing `revs=` field is built by a DIFFERENT expression here than on the
+			// legacy path (the registry holds Collections, so `committedRevision()` is called
+			// directly; legacy goes through the optional `DirtyTree` accessor). Pinned on both
+			// paths because session mode is the one a multi-node deployment actually runs, and
+			// it is the mode whose revisions the two-worlds decision rule is read against.
+			expect(carrying.rev.get(mainId), 'the main collection named a revision')
+				.to.match(/^(\d+|none)$/);
+			expect(carrying.rev.get(indexId), 'the index collection named a revision')
+				.to.match(/^(\d+|none)$/);
+			// A real Collection always implements the accessor, so the session path can never
+			// legitimately print `unknown` — only a test double can. Seeing it here would mean
+			// the registry stopped holding Collections.
+			expect([...carrying.rev.values()], 'no registry-sourced collection reads as unknown')
+				.to.not.include('unknown');
 		} finally {
 			dispose?.();
 			db.close();

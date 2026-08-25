@@ -169,8 +169,10 @@ optimystic:quereus-plugin:module index:seek table=Usage index=by_token collectio
   its id yet (see the caveat under the table below, which separates the two).
 - `main_rev=` — the main table collection's revision at the same instant. A table's main tree and
   its index trees are separate collections refreshed through different call sites, and a
-  collection's revision advances only when something calls `update()`/`sync()` on it — so the two
-  trees can be sitting at different moments, which is the failure this line exists to expose.
+  collection's revision advances only on an explicit call on that collection — `update()`/`sync()`
+  on the single-node path, or `recordCommitted()` when the coordinator commits it in session mode.
+  Nothing advances it passively, so the two trees can be sitting at different moments, which is the
+  failure this line exists to expose.
 
   **Do not subtract `rev=` from `main_rev=`.** Every collection has its own independent revision
   counter, so the two numbers are not on one scale and are routinely unequal on a perfectly healthy
@@ -214,7 +216,7 @@ Call that `landed` below. Getting this step wrong inverts every row of the table
 | Node B's index collection at the failing read | Reading |
 | --- | --- |
 | `rev=none` | Node B invented its own empty index collection and never adopted the committed one. |
-| `rev` lower than `landed` | A refresh gap — the collection is real but stale; nothing called `update()` on it before the read. Being short by exactly one is the ordinary shape of this, not evidence of anything else. |
+| `rev` lower than `landed` | A refresh gap — the collection is real but stale; nothing advanced it before the read (no `update()`/`sync()` on the single-node path; no coordinator `recordCommitted()` in session mode). Being short by exactly one is the ordinary shape of this, not evidence of anything else. |
 | `rev` at or above `landed`, `matched=0` | The write's index action did not survive commit despite being staged. Look at the sync/merge and conflict replay, not at refresh. (`above` is normal: any later commit under that id moves the collection past `landed`.) |
 | `rev` at or above `landed`, `matched>0`, but the SQL still returned no row | The index held the entry and the main-table fetch dropped it — compare `main_rev=` against `landed` for the **table** collection (same collection on both sides), never against `rev=`. |
 | `seek=` differs between the two nodes for the same SQL value | Neither of the above: the two nodes framed different keys, so the seek never addressed the entry that was written. |
@@ -229,10 +231,13 @@ For `arm=committed` over a tree that was staged into the in-flight transaction, 
 to the transaction's first-touch boundary, which can be older than the `rev=` printed here (the
 collection's current revision); for a clean tree the two are the same moment.
 
-All three lines — `commit:collections`, `index:tree-open`, `index:seek` — are pinned by tests
-(`test/trace-helpers.ts` captures and parses them; the legacy commit case and the index seek live
-in `test/two-node-secondary-index-convergence.spec.ts`, the session commit case in
-`test/session-mode-commit.spec.ts`), so a change that stops emitting one of them fails the suite.
+All three lines — `commit:collections`, `index:tree-open`, `index:seek` — are pinned by tests, so a
+change that stops emitting one of them, or that drops a field, fails the suite.
+`test/trace-helpers.ts` captures and parses all three; the pins live in
+`test/two-node-secondary-index-convergence.spec.ts` (legacy commit, the live seek arm, and that an
+abandoned scan still emits), `test/session-mode-commit.spec.ts` (session commit),
+`test/committed-read-isolation.spec.ts` (the `arm=committed` seek, which plain SQL cannot reach),
+and `test/adapter-integration.spec.ts` (`:none` vs `:unknown` in `revs=`).
 
 ## Common DEBUG patterns
 
@@ -264,7 +269,7 @@ DEBUG='optimystic:db-core:batch-coordinator' node app.js
 # Routing and redirect decisions
 DEBUG='optimystic:db-p2p:repo-service' node app.js
 
-# Which collections a SQL write actually carried (main table + index trees)
+# Which collections a SQL write carried, and which revision each index read descended
 DEBUG='optimystic:quereus-plugin:txn-bridge,optimystic:quereus-plugin:module' node app.js
 
 # All cohort-topic substrate logging (walk, promote, willingness, handoff, anti-flood, anti-DoS)
