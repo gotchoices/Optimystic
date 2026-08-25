@@ -1,6 +1,6 @@
 description: Debug logging now names which stored version of the data each machine wrote to and each read came from, so the next run of the failing scenario shows whether two machines disagree about the data itself or only about how fresh their copy is. Review found and fixed an off-by-one in how the two log lines relate, plus a crash the logging could cause in the query it was tracing.
 prereq:
-files: packages/db-core/src/collection/collection.ts, packages/db-core/src/collections/tree/tree.ts, packages/quereus-plugin-optimystic/src/optimystic-adapter/txn-bridge.ts, packages/quereus-plugin-optimystic/src/optimystic-module.ts, packages/quereus-plugin-optimystic/test/trace-helpers.ts, packages/quereus-plugin-optimystic/test/two-node-secondary-index-convergence.spec.ts, packages/quereus-plugin-optimystic/test/committed-read-isolation.spec.ts, packages/quereus-plugin-optimystic/test/index-support.spec.ts, docs/debugging.md
+files: packages/db-core/src/collection/collection.ts, packages/db-core/src/collections/tree/tree.ts, packages/quereus-plugin-optimystic/src/optimystic-adapter/txn-bridge.ts, packages/quereus-plugin-optimystic/src/optimystic-module.ts, packages/quereus-plugin-optimystic/test/trace-helpers.ts, packages/quereus-plugin-optimystic/test/two-node-secondary-index-convergence.spec.ts, packages/quereus-plugin-optimystic/test/committed-read-isolation.spec.ts, packages/quereus-plugin-optimystic/test/index-support.spec.ts, packages/quereus-plugin-optimystic/test/session-mode-commit.spec.ts, packages/quereus-plugin-optimystic/test/distributed-quereus.spec.ts, docs/debugging.md
 ----
 
 # Complete: name the revision each index read and commit lands on
@@ -177,3 +177,119 @@ defects:
 - Per-collection revision counters are not on one scale. `rev=` and `main_rev=` come from
   different collections and are routinely unequal on a healthy run; the doc says so twice
   and the review left both warnings in place.
+
+---
+
+# Second review pass (concurrent run)
+
+The runner dispatched this review ticket twice in parallel. The pass above landed first; this
+one read the tree *after* those fixes were already in it, so the off-by-one and the
+`encodeURIComponent` crash were already gone and are not re-reported. Everything below is
+additive, and is committed — the runner swept it into `f4b359b` and `4e37b63`.
+
+## Review findings (second pass)
+
+### Checked
+
+Read the union diff (`2191ab9..HEAD` over `packages/` and `docs/`) before the handoff summary.
+Beyond the first pass's ground: `Collection.committedRevision()`'s semantics traced against
+`getNextRev`, `recordCommitted`, `syncInternal` and `createOrOpen`'s invention branch;
+`printableSeekKey`'s totality re-derived for lone surrogates and astral pairs (each surrogate
+code unit escapes separately — the regex has no `u` flag — and `%XX`/`%uXXXX` cannot be
+confused because `u` is not a hex digit); the `revs=` parser's last-`:` split and its empty-
+`seek=` handling; and both doc citations (`CollectionId = BlockId` at `struct.ts:5`,
+`probeHeader`'s `source.tryGet(id)`). Grepped the board for open tickets claiming the touched
+files before considering any filing.
+
+### Found and fixed in this pass
+
+**The session-mode `revs=` field was emitted but never pinned.** The two commit paths build
+the field with *different* expressions — legacy goes through the optional
+`DirtyTree.committedRevision()` accessor, while the session path holds real `Collection`s from
+the registry and calls `committedRevision()` directly (`txn-bridge.ts:433`). Only the legacy
+expression had test cover, so deleting `rev:` from the session call site failed nothing, while
+`docs/debugging.md` told the reader the session commit case *was* pinned. Session mode is the
+path a multi-node deployment actually runs, and it is the mode whose revisions the two-worlds
+decision rule is read against. Fixed by adding revision assertions to the existing session-mode
+trace test in `session-mode-commit.spec.ts`, plus an assertion that no registry-sourced
+collection ever reads as `unknown` — a real `Collection` always implements the accessor, so
+`unknown` there would mean the registry stopped holding `Collection`s.
+
+**"A collection's revision advances only through `update()`/`sync()`" is wrong, and wrong in
+exactly the mode the downstream failure runs in.** The coordinator advances it via
+`Collection.recordCommitted()` (`coordinator.ts:338,383,618,635`) with no `update()` involved
+anywhere. The claim appeared at three sites — the `Collection.committedRevision` docblock, the
+`logIndexSeek` docblock, and `docs/debugging.md` — and it drives a decision-table row that
+tells the operator "nothing called `update()` on it". An operator in session mode would go
+hunting for a missing refresh call that never existed on that path. All three corrected to name
+the explicit-call invariant ("nothing moves it passively") and both mechanisms.
+
+**The `finally` emission was reasoned about but not pinned.** The first pass confirmed by
+argument that an early `.return()` delegates through `yield*` and runs the `finally` once; that
+argument is correct but nothing in the suite would catch a refactor moving the `logIndexSeek`
+call after the loop, which is the shape that silently emits nothing for the operator who most
+needs the line. Added *index seek trace is still emitted when the consumer abandons the scan
+early*, which breaks out of `db.eval` after one row of three matching rows. Measured while
+writing it: the line reports `matched=1` against three matching entries, so the scan really is
+being abandoned rather than drained and reported afterwards — the pin bites. That measurement
+is recorded in the test's comment so nobody has to re-derive it.
+
+**`logIndexSeek`'s docblock had grown to 59 lines restating `docs/debugging.md`.** The
+field-by-field reading guide and the "do not subtract / mind the off-by-one" operator guidance
+existed in near-verbatim duplicate at both the code site and in the doc the docblock already
+links — two copies with nothing keeping them in step. Trimmed the code-site copy to what a
+future editor of that function needs (where each field is sourced from, and the invariants that
+must not be collapsed: `none` vs `unknown`, empty `seek=` vs `unset`), leaving the operator
+guide and the decision table in the doc.
+
+**Two doc-accuracy slips.** The "pinned by tests" paragraph named two of the four spec files
+that actually hold the pins — `committed-read-isolation.spec.ts` (the `arm=committed` case,
+which plain SQL cannot reach) and `adapter-integration.spec.ts` (`:none` vs `:unknown`) were
+both missing, which matters here because `debt-doc-code-citations-rot-silently` is open against
+exactly this failure mode. And the `Common DEBUG patterns` entry still described that namespace
+pair as write-side only, though it is now what turns on the read-side line too. Both corrected.
+
+### Recorded as a tripwire, not filed as a ticket
+
+- **`distributed-quereus.spec.ts` binds a fixed `BASE_PORT = 9100`.** Re-running the plugin
+  suite while a previous run's libp2p nodes are still exiting fails that suite's `before all`
+  with `UnsupportedListenAddressesError` / `EADDRINUSE ... 0.0.0.0:9100`. Hit twice during this
+  pass's validation, and it reads like a real failure of whatever change is under test, so it
+  costs an agent a diagnosis each time. Genuinely conditional — a single clean run always
+  passes. `NOTE:` at the constant naming the symptom, the cause, and the fix if back-to-back or
+  parallel runs ever become routine (bind port `0` and read the assigned port back off each
+  node's multiaddrs instead of numbering from a constant).
+
+### Considered and declined
+
+- `optimystic-module.ts` is 3361 lines (`wc -l`). `tickets/backlog/debt-optimystic-vtab-class-is-too-big-to-review.md`
+  already claims that site, and this ticket's contribution to it was mostly comment, now
+  trimmed. Evidence for the existing ticket, not a new one.
+- The `revs=` shape decision (trailing additive field rather than folding the revision into the
+  id token) was re-examined independently and the reversal is right: a parser keyed on the id
+  token would report the collection **absent from the commit**, which is precisely the false
+  negative this line exists to rule out, and it would be read as evidence during the live
+  downstream investigation. Reasoning is already recorded at the site; left alone.
+- No accepted-tradeoff `NOTE:` sits at any site this pass touched, so nothing was skipped on
+  those grounds.
+
+### New tickets filed
+
+None. Every finding was bounded and fixed in this pass, except the one genuinely conditional
+concern, which went to a tripwire per the disposition rules.
+
+## Validation (second pass, final tree)
+
+```bash
+yarn lint && yarn build && yarn typecheck          # all exit 0
+yarn workspace @optimystic/db-core test            # 1387 passing
+yarn workspace @optimystic/quereus-plugin-optimystic test   # 500 passing, 13 pending, 0 failing
+```
+
+The plugin count is 500 rather than the 483 quoted above because this pass added one test and
+the concurrently-running `two-node-index-interleaving-sweep` ticket added its own; two
+consecutive runs agreed on 500/13/0.
+
+`tickets/.pre-existing-error.md` was not written. One `EADDRINUSE` failure was seen during
+validation and is not pre-existing and not a defect — it was this pass's own back-to-back runs
+colliding on port 9100, and it is now documented at that site as the tripwire above.

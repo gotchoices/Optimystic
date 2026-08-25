@@ -135,9 +135,9 @@ function allCases(): Case[] {
 /**
  * The subset a routine `yarn test` runs. Chosen, not sampled: every value of every
  * dimension appears at least four times, and the pairs that plausibly interact
- * (declare × open, open × index, write × read, write × token) are covered exhaustively.
- * `keeps the core subset covering` below re-checks the per-value half of that claim, so
- * the subset cannot silently degrade under a later edit.
+ * ({@link COVERED_PAIRS}) are covered exhaustively. The `core subset` describe below
+ * re-checks BOTH halves of that claim against the dimension tables, so the subset cannot
+ * silently degrade under a later edit.
  */
 const CORE_CASES: Case[] = [
 	{ declare: 'A', open: 'redeclare', index: 'index-first', write: 'a-then-b', read: 'write-first', token: 'same-token' },
