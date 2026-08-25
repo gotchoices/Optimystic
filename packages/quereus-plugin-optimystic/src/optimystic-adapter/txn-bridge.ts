@@ -3,6 +3,9 @@ import { TransactionSession, CoordinatorPartialCommitError } from '@optimystic/d
 import type { TransactionState, ParsedOptimysticOptions } from '../types.js';
 import { CollectionFactory } from './collection-factory.js';
 import { generateStampId } from '../util/generate-stamp-id.js';
+import { createLogger } from '../logger.js';
+
+const log = createLogger('txn-bridge');
 
 /**
  * Minimal tree surface the bridge needs to flush (at commit) or roll back (on
@@ -27,6 +30,22 @@ export interface DirtyTree {
    * positional label when absent.
    */
   describe?(): string;
+  /**
+   * Optional "does this tree still have something to push?" predicate (a Tree
+   * forwards to `Collection.hasUnsyncedChanges()`). Used ONLY by the
+   * `commit:collections` trace to say staged-vs-clean per collection; the commit
+   * sweep itself does not branch on it. Optional so test doubles need not
+   * implement it — the trace reports `unknown` when absent.
+   */
+  hasUnsyncedChanges?(): boolean;
+}
+
+/** One collection's row in a {@link TransactionBridge} `commit:collections` trace line. */
+interface CommitCollectionTrace {
+  /** The collection id — the same string `openIndexTree`'s `index:tree-open` line prints. */
+  id: string;
+  /** Whether the collection still holds unflushed changes; `undefined` when unknowable. */
+  staged: boolean | undefined;
 }
 
 /**
@@ -357,6 +376,16 @@ export class TransactionBridge {
         // few seconds under sustained contention) before surfacing an error. That is
         // the intended safe default; if the SQL layer ever needs faster failure here,
         // thread a SyncOptions ({ maxAttempts, deadlineMs, signal }) through commit().
+        //
+        // Trace what the coordinator is about to carry BEFORE handing off: in session
+        // mode the commit set is the whole live registry (the coordinator iterates its
+        // collection map), not just the trees the vtab happened to mark dirty.
+        if (log.enabled) {
+          this.logCommitCollections('session', [...this.collectionRegistry].map(([id, collection]) => ({
+            id: String(id),
+            staged: collection.hasUnsyncedChanges(),
+          })));
+        }
         const result = await this.session.commit();
         if (!result.success) {
           throw new Error(result.error || 'Transaction commit failed');
@@ -431,6 +460,48 @@ export class TransactionBridge {
   }
 
   /**
+   * Emit the one line that answers "which collections did this write carry?".
+   *
+   * A table with a secondary index is backed by two or more separate Optimystic
+   * collections — the main table tree at the table's `collectionUri`, and one index
+   * tree at `<collectionUri>/index/<indexName>` per maintained index (derived in
+   * exactly one place: `OptimysticTable.openIndexTree`, which prints the matching
+   * `index:tree-open` line). A single SQL statement must stage into all of them and
+   * commit all of them, and until this line existed no log could say whether it did.
+   *
+   * Shape — deliberately ONE physical line, count before the list so a truncated
+   * line still reports how many collections there were:
+   *
+   * ```
+   * optimystic:quereus-plugin:txn-bridge commit:collections mode=legacy count=2 \
+   *   default/FormationUsage=staged default/FormationUsage/index/by_token=staged
+   * ```
+   *
+   * The ids are real collection ids (scheme-stripped, as `parseCollectionId` derives
+   * them), NOT tree labels or array indexes, so an operator can match a commit set
+   * against the `index:tree-open` lines and tell "the index collection was not in the
+   * commit" apart from "both nodes committed, to DIFFERENT index collections".
+   *
+   * Sorted by id so two nodes' lines compare directly; the sweep's own order is
+   * untouched (it is a copy). `unknown` appears only for a `DirtyTree` double that
+   * does not implement `hasUnsyncedChanges`.
+   *
+   * Cost when the namespace is off: nothing. Both call sites build their entry array
+   * inside an `if (log.enabled)` guard, and this method does the sort/join.
+   */
+  private logCommitCollections(mode: 'legacy' | 'session', entries: readonly CommitCollectionTrace[]): void {
+    const sorted = [...entries].sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
+    log(
+      'commit:collections mode=%s count=%d %s',
+      mode,
+      sorted.length,
+      sorted
+        .map(e => `${e.id}=${e.staged === undefined ? 'unknown' : e.staged ? 'staged' : 'clean'}`)
+        .join(' ')
+    );
+  }
+
+  /**
    * Legacy (no-coordinator) commit sweep: flush each dirty tree in turn.
    *
    * On failure the correct recovery depends on how far the sweep got:
@@ -448,6 +519,17 @@ export class TransactionBridge {
   private async commitDirtyTreesLegacy(): Promise<void> {
     const trees = [...this.dirtyTrees.keys()];
     const synced: DirtyTree[] = [];
+
+    // Trace what this sweep is about to carry. Legacy mode's commit set is the
+    // dirty set (a tree only lands here once markDirty saw DML stage into it), so
+    // an index collection missing from THIS line means the index was never staged
+    // into — which is exactly the question the trace exists to answer.
+    if (log.enabled) {
+      this.logCommitCollections('legacy', trees.map((tree, i) => ({
+        id: tree.describe?.() ?? `tree#${i}`,
+        staged: tree.hasUnsyncedChanges?.(),
+      })));
+    }
 
     for (const tree of trees) {
       try {

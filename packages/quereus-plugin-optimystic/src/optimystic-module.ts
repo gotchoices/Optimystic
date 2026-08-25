@@ -2279,15 +2279,36 @@ export class OptimysticVirtualTable extends VirtualTable {
    * NOTE: create-on-missing is intentional — an index whose table has no rows yet
    * has never committed a header block, so an open-only fetch would report the
    * index as missing rather than as empty.
+   *
+   * Emits ONE `index:tree-open` line per open, naming the table, the index as THIS
+   * vtab knows it, the derived URI, and the collection id the URI resolved to (the
+   * URI's scheme is stripped to form the id, so the two differ and an operator
+   * joining logs needs both). This is the companion to the transaction bridge's
+   * `commit:collections` line: that one says which collections a write carried, this
+   * one says which collection each logical index resolves to. Together they separate
+   * "the index collection was absent from the commit" from "both nodes committed, to
+   * DIFFERENT index collections" — two failure shapes that look identical from the
+   * outside (each node's index holding only its own rows) and could not be told apart
+   * from any log this package used to emit. A bring-up-time fact, so once per open is
+   * enough; all four arguments already exist, so nothing is built for a disabled
+   * namespace.
    */
   private async openIndexTree(indexName: string, transactor?: ITransactor): Promise<Tree<string, IndexEntry>> {
+    const indexUri = `${this.options.collectionUri}/index/${indexName}`;
     const indexOptions: ParsedOptimysticOptions = {
       ...this.options,
-      collectionUri: `${this.options.collectionUri}/index/${indexName}`,
+      collectionUri: indexUri,
     };
     const tree = await this.collectionFactory.createOrGetCollection(
       indexOptions,
       transactor ? { transactor, isActive: true, collections: new Map(), stampId: '' } : undefined
+    );
+    log(
+      'index:tree-open table=%s index=%s uri=%s collection=%s',
+      this.tableName,
+      indexName,
+      indexUri,
+      String(tree.getCollection().id)
     );
     return tree as unknown as Tree<string, IndexEntry>;
   }
