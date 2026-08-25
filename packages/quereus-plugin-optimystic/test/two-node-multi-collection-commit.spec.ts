@@ -22,11 +22,9 @@
  */
 
 import { expect } from 'chai';
-import { Database } from '@quereus/quereus';
-import type { SqlValue } from '@quereus/quereus';
+import type { Database, SqlValue } from '@quereus/quereus';
 import type { ITransactor } from '@optimystic/db-core';
-import { createMesh, buildNetworkTransactors, type Mesh } from '@optimystic/db-p2p/testing';
-import register from '../dist/plugin.js';
+import { createMeshDbNode, startMockMesh } from './mesh-node-harness.js';
 
 type Row = Record<string, SqlValue>;
 
@@ -40,25 +38,7 @@ const createTableSql = `
 	) using optimystic('${TABLE_URI}')
 `;
 
-function createDb(transactor: ITransactor): Database {
-	const db = new Database();
-	const config = {
-		default_transactor: 'shared',
-		default_key_network: 'test',
-		enable_cache: false,
-	} as unknown as Record<string, SqlValue>;
-	const plugin = register(db, config);
-	// The factory keys its transactor cache on `${transactor}:${keyNetwork}`, so registering
-	// under `shared:test` makes every collection this Database opens ride THIS node's stack.
-	plugin.collectionFactory.registerTransactor('shared:test', transactor);
-	for (const vtable of plugin.vtables) {
-		db.registerModule(vtable.name, vtable.module, vtable.auxData);
-	}
-	for (const func of plugin.functions) {
-		db.registerFunction(func.schema);
-	}
-	return db;
-}
+const createDb = (transactor: ITransactor): Database => createMeshDbNode(transactor).db;
 
 async function collect(db: Database, sql: string): Promise<Row[]> {
 	const rows: Row[] = [];
@@ -71,24 +51,11 @@ async function collect(db: Database, sql: string): Promise<Row[]> {
 describe('Two-node multi-collection legacy commit (data tree + unique index + schema catalog)', function () {
 	this.timeout(120_000);
 
-	let mesh: Mesh;
-	let transactors: Map<string, ITransactor>;
+	let transactorFor: (index: number) => ITransactor;
 
 	beforeEach(async () => {
-		mesh = await createMesh(2, {
-			responsibilityK: 2,
-			clusterSize: 2,
-			superMajorityThreshold: 0.67,
-		});
-		transactors = buildNetworkTransactors(mesh);
+		({ transactorFor } = await startMockMesh(2));
 	});
-
-	const transactorFor = (index: number): ITransactor => {
-		const peerId = mesh.nodes[index]!.peerId.toString();
-		const t = transactors.get(peerId);
-		if (!t) throw new Error(`No transactor for peer ${peerId}`);
-		return t;
-	};
 
 	it('node B writes after node A advanced all three collections', async () => {
 		const dbA = createDb(transactorFor(0));

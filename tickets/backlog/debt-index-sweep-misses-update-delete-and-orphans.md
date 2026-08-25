@@ -103,11 +103,15 @@ UNIQUE index across two nodes.
 
 `fix/two-nodes-writing-one-index-key-was-never-tested` went looking for a defect in a shape it
 believed was untested, did not find one, and closed some of this ticket's listed gaps on the way.
-`packages/quereus-plugin-optimystic/test/two-node-shared-index-key.spec.ts` (6 cases, ~3s, runs on
+`packages/quereus-plugin-optimystic/test/two-node-shared-index-key.spec.ts` (7 cases, ~1s, runs on
 every `yarn test`) now covers, all green:
 
 - a **UNIQUE index maintained by two machines** — the gap called "the closest to earning its own
-  ticket" above;
+  ticket" above — in both arms: two machines writing DISTINCT values into one unique index (a
+  pure maintenance case), and two machines writing the SAME value, where both admit because the
+  constraint is enforced by reading the tree before the write and neither can see the other's
+  uncommitted row. The same-value case carries a single-node control asserting the constraint
+  DOES reject locally, so "both rows survive" cannot be read as "the constraint is dead";
 - an index tree with **more entries than one block holds**, deriving its preload from the btree's
   exported `NodeCapacity` and asserting via `Path.branches` that the tree really did split (with a
   negative control on the small cases, so the probe cannot be vacuous);

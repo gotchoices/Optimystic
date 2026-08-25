@@ -14,21 +14,17 @@
  * trackers) catch it.
  *
  * Harness mirrors two-node-multi-collection-commit.spec.ts: two Databases,
- * each bound to its own node's transactor over one 2-node mesh.
+ * each bound to its own node's transactor over one 2-node mesh (see mesh-node-harness.ts).
  */
 
 import { expect } from 'chai';
-import { Database } from '@quereus/quereus';
-import type { SqlValue } from '@quereus/quereus';
+import type { Database, SqlValue } from '@quereus/quereus';
 import type { ITransactor } from '@optimystic/db-core';
-import { KeyRange } from '@optimystic/db-core';
-import { createMesh, buildNetworkTransactors, type Mesh } from '@optimystic/db-p2p/testing';
-import register from '../dist/plugin.js';
 import { captureTrace, collectionIdOf, commitTraces, indexOpenTraces, indexSeekTraces } from './trace-helpers.js';
 import { expectIndexAgreesWithScan } from './query-helpers.js';
+import { countTreeEntries, createMeshDbNode, startMockMesh } from './mesh-node-harness.js';
 
 type Row = Record<string, SqlValue>;
-type Plugin = ReturnType<typeof register>;
 
 const TABLE_URI = 'tree://default/FormationUsage';
 const INDEX_URI = `${TABLE_URI}/index/formation_usage_by_token`;
@@ -44,24 +40,6 @@ const createTableSql = `
 `;
 const createIndexSql = `create index formation_usage_by_token on FormationUsage(Token)`;
 
-function createDb(transactor: ITransactor): { db: Database; plugin: Plugin } {
-	const db = new Database();
-	const config = {
-		default_transactor: 'shared',
-		default_key_network: 'test',
-		enable_cache: false,
-	} as unknown as Record<string, SqlValue>;
-	const plugin = register(db, config);
-	plugin.collectionFactory.registerTransactor('shared:test', transactor);
-	for (const vtable of plugin.vtables) {
-		db.registerModule(vtable.name, vtable.module, vtable.auxData);
-	}
-	for (const func of plugin.functions) {
-		db.registerFunction(func.schema);
-	}
-	return { db, plugin };
-}
-
 async function collect(db: Database, sql: string): Promise<Row[]> {
 	const rows: Row[] = [];
 	for await (const row of db.eval(sql)) {
@@ -70,50 +48,18 @@ async function collect(db: Database, sql: string): Promise<Row[]> {
 	return rows;
 }
 
-/** Count committed entries at `collectionUri` through a FRESH Tree on this
- * node's transactor — what consensus persisted, not what a vtab staged. */
-async function countTreeEntries(plugin: Plugin, collectionUri: string): Promise<number> {
-	const tree = await plugin.collectionFactory.createOrGetCollection({
-		collectionUri,
-		transactor: 'shared',
-		keyNetwork: 'test',
-		libp2pOptions: {},
-		cache: false,
-		encoding: 'json' as const,
-	});
-	await tree.update();
-	let n = 0;
-	for await (const treePath of tree.range(new KeyRange<string>(undefined, undefined, true))) {
-		if (tree.isValid(treePath)) n++;
-	}
-	return n;
-}
-
 describe('Two-node secondary-index convergence (write on one node, index-seek on the other)', function () {
 	this.timeout(120_000);
 
-	let mesh: Mesh;
-	let transactors: Map<string, ITransactor>;
+	let transactorFor: (index: number) => ITransactor;
 
 	beforeEach(async () => {
-		mesh = await createMesh(2, {
-			responsibilityK: 2,
-			clusterSize: 2,
-			superMajorityThreshold: 0.67,
-		});
-		transactors = buildNetworkTransactors(mesh);
+		({ transactorFor } = await startMockMesh(2));
 	});
 
-	const transactorFor = (index: number): ITransactor => {
-		const peerId = mesh.nodes[index]!.peerId.toString();
-		const t = transactors.get(peerId);
-		if (!t) throw new Error(`No transactor for peer ${peerId}`);
-		return t;
-	};
-
 	it('A declares and inserts; B re-declares and index-seeks A\'s rows', async () => {
-		const { db: dbA, plugin: pluginA } = createDb(transactorFor(0));
-		const { db: dbB, plugin: pluginB } = createDb(transactorFor(1));
+		const { db: dbA, plugin: pluginA } = createMeshDbNode(transactorFor(0));
+		const { db: dbB, plugin: pluginB } = createMeshDbNode(transactorFor(1));
 
 		await dbA.exec(createTableSql);
 		await dbA.exec(createIndexSql);
@@ -147,8 +93,8 @@ describe('Two-node secondary-index convergence (write on one node, index-seek on
 	});
 
 	it('both nodes declare table + index before either writes, then both write and both index-seek', async () => {
-		const { db: dbA, plugin: pluginA } = createDb(transactorFor(0));
-		const { db: dbB, plugin: pluginB } = createDb(transactorFor(1));
+		const { db: dbA, plugin: pluginA } = createMeshDbNode(transactorFor(0));
+		const { db: dbB, plugin: pluginB } = createMeshDbNode(transactorFor(1));
 
 		await dbA.exec(createTableSql);
 		await dbA.exec(createIndexSql);
@@ -181,7 +127,7 @@ describe('Two-node secondary-index convergence (write on one node, index-seek on
 	// ---------------------------------------------------------------------------
 
 	it('commit trace names the index collection alongside the table for an indexed insert', async () => {
-		const { db: dbA } = createDb(transactorFor(0));
+		const { db: dbA } = createMeshDbNode(transactorFor(0));
 
 		await dbA.exec(createTableSql);
 		await dbA.exec(createIndexSql);
@@ -212,8 +158,8 @@ describe('Two-node secondary-index convergence (write on one node, index-seek on
 	});
 
 	it('both nodes resolve the same index collection id for the same logical index', async () => {
-		const { db: dbA } = createDb(transactorFor(0));
-		const { db: dbB } = createDb(transactorFor(1));
+		const { db: dbA } = createMeshDbNode(transactorFor(0));
+		const { db: dbB } = createMeshDbNode(transactorFor(1));
 
 		const linesA = await captureTrace(async () => {
 			await dbA.exec(createTableSql);
@@ -243,7 +189,7 @@ describe('Two-node secondary-index convergence (write on one node, index-seek on
 	});
 
 	it('index seek trace names the revision each side of the read descended', async () => {
-		const { db: dbA } = createDb(transactorFor(0));
+		const { db: dbA } = createMeshDbNode(transactorFor(0));
 
 		await dbA.exec(createTableSql);
 		await dbA.exec(createIndexSql);
@@ -280,7 +226,7 @@ describe('Two-node secondary-index convergence (write on one node, index-seek on
 	});
 
 	it('index seek trace names both collections, the framed key, and a count that matches the rows', async () => {
-		const { db: dbA } = createDb(transactorFor(0));
+		const { db: dbA } = createMeshDbNode(transactorFor(0));
 
 		await dbA.exec(createTableSql);
 		await dbA.exec(createIndexSql);
@@ -327,7 +273,7 @@ describe('Two-node secondary-index convergence (write on one node, index-seek on
 	// reports `matched=1` against three matching entries, so the scan really is being
 	// abandoned here, not drained and reported afterwards.
 	it('index seek trace is still emitted when the consumer abandons the scan early', async () => {
-		const { db: dbA } = createDb(transactorFor(0));
+		const { db: dbA } = createMeshDbNode(transactorFor(0));
 
 		await dbA.exec(createTableSql);
 		await dbA.exec(createIndexSql);
@@ -355,8 +301,8 @@ describe('Two-node secondary-index convergence (write on one node, index-seek on
 	});
 
 	it('two converged nodes report the same index collection revision and the same framed key', async () => {
-		const { db: dbA } = createDb(transactorFor(0));
-		const { db: dbB } = createDb(transactorFor(1));
+		const { db: dbA } = createMeshDbNode(transactorFor(0));
+		const { db: dbB } = createMeshDbNode(transactorFor(1));
 
 		await dbA.exec(createTableSql);
 		await dbA.exec(createIndexSql);
@@ -410,7 +356,7 @@ describe('Two-node secondary-index convergence (write on one node, index-seek on
 	// looks converged and gets diagnosed as "the index action did not survive commit".
 	// Pinned here so the +1 cannot silently become +0 or +2 under a commit-path change.
 	it("the revision a commit lands at is the commit line's revision plus one", async () => {
-		const { db: dbA } = createDb(transactorFor(0));
+		const { db: dbA } = createMeshDbNode(transactorFor(0));
 
 		await dbA.exec(createTableSql);
 		await dbA.exec(createIndexSql);

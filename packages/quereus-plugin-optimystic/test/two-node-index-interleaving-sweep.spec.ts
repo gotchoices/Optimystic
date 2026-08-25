@@ -58,20 +58,14 @@
  * looking for — the case name states the exact ordering. Do not narrow the generator,
  * skip the case, or soften the oracle to get a green run.
  *
- * Harness mirrors two-node-secondary-index-convergence.spec.ts: two Databases, each
- * bound to its own node's transactor over one 2-node mock mesh.
+ * Harness is the shared `mesh-node-harness.ts`: two Databases, each bound to its own
+ * node's transactor over one 2-node mock mesh.
  */
 
 import { expect } from 'chai';
-import { Database } from '@quereus/quereus';
-import type { SqlValue } from '@quereus/quereus';
 import type { ITransactor } from '@optimystic/db-core';
-import { createMesh, buildNetworkTransactors, type Mesh } from '@optimystic/db-p2p/testing';
-import register from '../dist/plugin.js';
 import { expectIndexAgreesWithScan, queryAll } from './query-helpers.js';
-
-type Plugin = ReturnType<typeof register>;
-type Node = { db: Database; plugin: Plugin };
+import { createMeshDbNode, startMockMesh, type MeshDbNode as Node } from './mesh-node-harness.js';
 
 const TABLE_URI = 'tree://default/FormationUsage';
 
@@ -356,56 +350,23 @@ describe(`Two-node secondary-index interleaving sweep (${SELECTED.length} of ${a
 	`${RUN_FULL_SWEEP ? 'full sweep' : 'core subset only — unset INDEX_SWEEP_CORE_ONLY for all'})`, function () {
 	this.timeout(120_000);
 
-	let mesh: Mesh;
-	let transactors: Map<string, ITransactor>;
+	let transactorFor: (index: number) => ITransactor;
 
 	beforeEach(async () => {
-		mesh = await createMesh(2, {
-			responsibilityK: 2,
-			clusterSize: 2,
-			superMajorityThreshold: 0.67,
-		});
-		transactors = buildNetworkTransactors(mesh);
+		({ transactorFor } = await startMockMesh(2));
 	});
 
-	const transactorFor = (index: number): ITransactor => {
-		const peerId = mesh.nodes[index]!.peerId.toString();
-		const t = transactors.get(peerId);
-		if (!t) throw new Error(`No transactor for peer ${peerId}`);
-		return t;
-	};
-
-	// NOTE: nothing closes these Databases, and nothing tears the mesh down — the mesh is a
-	// pure in-process mock over MemoryRawStorage with no sockets or timers to release, and
-	// the sibling two-node specs leave theirs open the same way. Harmless at the size the
-	// header measures (288 Databases across the wide arm), but it is per-case garbage that
-	// grows with the case count: if a widened sweep slows down or runs the heap up, close
-	// each node in an afterEach before looking anywhere else.
-	function createNode(transactor: ITransactor): Node {
-		const db = new Database();
-		const config = {
-			default_transactor: 'shared',
-			default_key_network: 'test',
-			enable_cache: false,
-		} as unknown as Record<string, SqlValue>;
-		const plugin = register(db, config);
-		// The factory keys its transactor cache on `${transactor}:${keyNetwork}`, so this
-		// makes every collection this Database opens ride THIS mesh node's stack.
-		plugin.collectionFactory.registerTransactor('shared:test', transactor);
-		for (const vtable of plugin.vtables) {
-			db.registerModule(vtable.name, vtable.module, vtable.auxData);
-		}
-		for (const func of plugin.functions) {
-			db.registerFunction(func.schema);
-		}
-		return { db, plugin };
-	}
+	// NOTE: nothing closes these Databases, and nothing tears the mesh down — see the accepted
+	// tradeoff recorded on `startMockMesh`. Harmless at the size the header measures (288
+	// Databases across the wide arm), but it is per-case garbage that grows with the case
+	// count: if a widened sweep slows down or runs the heap up, close each node in an
+	// afterEach before looking anywhere else.
 
 	for (const testCase of SELECTED) {
 		it(caseName(testCase), async () => {
 			const nodes: Record<'A' | 'B', Node> = {
-				A: createNode(transactorFor(0)),
-				B: createNode(transactorFor(1)),
+				A: createMeshDbNode(transactorFor(0)),
+				B: createMeshDbNode(transactorFor(1)),
 			};
 			const first = testCase.declare === 'A' ? nodes.A : nodes.B;
 			const second = testCase.declare === 'A' ? nodes.B : nodes.A;

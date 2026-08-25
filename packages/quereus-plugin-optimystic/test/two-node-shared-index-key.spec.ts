@@ -26,21 +26,20 @@
  * What two same-value writers do share is the tree BLOCK those adjacent keys land in, which is
  * the merge these cases actually exercise.
  *
- * Harness mirrors two-node-secondary-index-convergence.spec.ts: one in-process mock mesh, one
- * Database per node, each bound to its own node's transactor.
+ * Harness is the shared `mesh-node-harness.ts`: one in-process mock mesh, one Database per
+ * node, each bound to its own node's transactor.
  */
 
 import { expect } from 'chai';
-import { Database } from '@quereus/quereus';
-import type { SqlValue } from '@quereus/quereus';
-import type { ITransactor } from '@optimystic/db-core';
-import { KeyRange, NodeCapacity } from '@optimystic/db-core';
-import { createMesh, buildNetworkTransactors, type Mesh } from '@optimystic/db-p2p/testing';
-import register from '../dist/plugin.js';
+import { NodeCapacity } from '@optimystic/db-core';
 import { expectIndexAgreesWithScan, queryAll } from './query-helpers.js';
-
-type Plugin = ReturnType<typeof register>;
-type Node = { db: Database; plugin: Plugin };
+import {
+	countTreeEntries,
+	createMeshDbNode,
+	readTree,
+	startMockMesh,
+	type MeshDbNode as Node,
+} from './mesh-node-harness.js';
 
 const TABLE_URI = 'tree://default/FormationUsage';
 const INDEX_NAME = 'formation_usage_by_token';
@@ -71,71 +70,16 @@ const insertSql = (stampId: number, token: string) =>
 	`insert into FormationUsage (UsageStampId, Token) values (${stampId}, '${token}')`;
 
 /**
- * The orders two machines' writes can reach consensus in. `staged-both` opens both
- * transactions and stages both mutations before either commits, so neither machine's flush
- * can have seen the other's — the closest this harness gets to genuine concurrency.
+ * The orders two machines' writes can reach consensus in. Under `staged-both` both
+ * transactions are open and both mutations staged before either commits, so each machine
+ * staged against a tree snapshot taken before the other's commit existed — the second
+ * commit therefore has to reconcile a stale revision rather than extend a fresh one. (The
+ * commits themselves are still sequential: this harness is single-threaded, so B's flush
+ * runs after A's has returned. Staging, not flushing, is what is overlapped here — which is
+ * the closest this harness gets to genuine concurrency.)
  */
 const WRITE_ORDERS = ['a-then-b', 'b-then-a', 'staged-both'] as const;
 type WriteOrder = (typeof WRITE_ORDERS)[number];
-
-function createNode(transactor: ITransactor): Node {
-	const db = new Database();
-	const config = {
-		default_transactor: 'shared',
-		default_key_network: 'test',
-		enable_cache: false,
-	} as unknown as Record<string, SqlValue>;
-	const plugin = register(db, config);
-	// The factory keys its transactor cache on `${transactor}:${keyNetwork}`, so this makes
-	// every collection this Database opens ride THIS mesh node's stack.
-	plugin.collectionFactory.registerTransactor('shared:test', transactor);
-	for (const vtable of plugin.vtables) {
-		db.registerModule(vtable.name, vtable.module, vtable.auxData);
-	}
-	for (const func of plugin.functions) {
-		db.registerFunction(func.schema);
-	}
-	return { db, plugin };
-}
-
-/**
- * Count committed entries at `collectionUri` through a FRESH Tree on this node's transactor —
- * what consensus persisted, not what a vtab staged. This is the assertion that would catch a
- * lost write whose absence the query path happened to paper over.
- */
-async function readTree(plugin: Plugin, collectionUri: string): Promise<{
-	/** Committed entries in the tree. */
-	entries: number;
-	/**
-	 * True once the btree has at least one branch level — i.e. the entries no longer fit in a
-	 * single leaf block and the tree has actually SPLIT. Read off `Path.branches`, so it is an
-	 * observation rather than an inference from the fan-out constant.
-	 */
-	split: boolean;
-}> {
-	const tree = await plugin.collectionFactory.createOrGetCollection({
-		collectionUri,
-		transactor: 'shared',
-		keyNetwork: 'test',
-		libp2pOptions: {},
-		cache: false,
-		encoding: 'json' as const,
-	});
-	await tree.update();
-	let entries = 0;
-	let split = false;
-	for await (const treePath of tree.range(new KeyRange<string>(undefined, undefined, true))) {
-		if (!tree.isValid(treePath)) continue;
-		entries++;
-		if (treePath.branches.length > 0) split = true;
-	}
-	return { entries, split };
-}
-
-/** Committed entry count at `collectionUri`, seen from this node. */
-async function countTreeEntries(plugin: Plugin, collectionUri: string): Promise<number> {
-	return (await readTree(plugin, collectionUri)).entries;
-}
 
 /** Run the two machines' inserts in `order`, all of them landing on `token`. */
 async function runSharedKeyWrites(
@@ -188,30 +132,11 @@ async function expectAllNodesConverged(
 describe('Two nodes writing one shared secondary-index value', function () {
 	this.timeout(120_000);
 
-	let mesh: Mesh;
-	let transactors: Map<string, ITransactor>;
-
-	const startMesh = async (size: number): Promise<void> => {
-		mesh = await createMesh(size, {
-			responsibilityK: size,
-			clusterSize: size,
-			superMajorityThreshold: 0.67,
-		});
-		transactors = buildNetworkTransactors(mesh);
-	};
-
-	const transactorFor = (index: number): ITransactor => {
-		const peerId = mesh.nodes[index]!.peerId.toString();
-		const t = transactors.get(peerId);
-		if (!t) throw new Error(`No transactor for peer ${peerId}`);
-		return t;
-	};
-
 	/** A declares table + index, B re-declares both. No row exists yet, so the shared index
 	 * value the writes are about to create is genuinely new and the index tree starts empty. */
 	async function openTwoNodesOnEmptyIndex(indexSql = createIndexSql): Promise<Record<'A' | 'B', Node>> {
-		await startMesh(2);
-		const nodes = { A: createNode(transactorFor(0)), B: createNode(transactorFor(1)) };
+		const { transactorFor } = await startMockMesh(2);
+		const nodes = { A: createMeshDbNode(transactorFor(0)), B: createMeshDbNode(transactorFor(1)) };
 		await nodes.A.db.exec(createTableSql);
 		await nodes.A.db.exec(indexSql);
 		await nodes.B.db.exec(createTableSql);
@@ -256,18 +181,19 @@ describe('Two nodes writing one shared secondary-index value', function () {
 	 * group, 2 is a pairwise merge that drops one arm. Two writers cannot tell those apart.
 	 */
 	it('all three rows survive when three nodes create the same index value from nothing', async () => {
-		await startMesh(3);
+		const { transactorFor } = await startMockMesh(3);
 		const nodes: Record<Which, Node> = {
-			A: createNode(transactorFor(0)),
-			B: createNode(transactorFor(1)),
-			C: createNode(transactorFor(2)),
+			A: createMeshDbNode(transactorFor(0)),
+			B: createMeshDbNode(transactorFor(1)),
+			C: createMeshDbNode(transactorFor(2)),
 		};
 		for (const which of ['A', 'B', 'C'] as const) {
 			await nodes[which].db.exec(createTableSql);
 			await nodes[which].db.exec(createIndexSql);
 		}
 
-		// All three stage before any commits, so no writer's flush has seen another's.
+		// All three stage before any commits, so every writer's snapshot predates the others'
+		// commits and two of the three flushes must reconcile a revision that has moved.
 		for (const which of ['A', 'B', 'C'] as const) {
 			await nodes[which].db.exec('begin');
 			await nodes[which].db.exec(insertSql(STAMP_ID[which], SHARED_TOKEN));
@@ -294,13 +220,9 @@ describe('Two nodes writing one shared secondary-index value', function () {
 	 * A UNIQUE index across two nodes. The downstream stack's other failing signature names a
 	 * `_uniq_1` index collection and nothing covered a unique index across machines.
 	 *
-	 * The values here are DISTINCT on purpose. Two machines writing the SAME value into a
-	 * unique index is a different question — uniqueness is enforced by reading the tree before
-	 * the write (`optimystic-module.ts resolveSecondaryUniqueDecision`), so neither machine can
-	 * see the other's uncommitted row and both admit; that is a known consequence of
-	 * check-then-write without consensus-level constraint arbitration, not the convergence
-	 * defect under test. What IS under test is that a unique index maintained by two machines
-	 * still ends up holding both of their entries.
+	 * The values here are DISTINCT, so this case is purely about maintenance: a unique index
+	 * written by two machines still ends up holding both of their entries. The SAME-value
+	 * question is a different one and is pinned separately, immediately below.
 	 */
 	it('a UNIQUE index maintained by two nodes holds both nodes\' entries', async () => {
 		const nodes = await openTwoNodesOnEmptyIndex(createUniqueIndexSql);
@@ -326,6 +248,57 @@ describe('Two nodes writing one shared secondary-index value', function () {
 	});
 
 	/*
+	 * Two machines writing the SAME value into a UNIQUE index. Both admit, and both rows
+	 * survive — uniqueness here is check-then-write (`optimystic-module.ts
+	 * resolveSecondaryUniqueDecision` probes the index tree before staging), so a machine
+	 * cannot see a sibling's uncommitted row and has nothing to reject against.
+	 *
+	 * This is pinned as a case rather than argued in a comment, because "both rows survive"
+	 * has two very different causes and only one of them is acceptable: over-admission by
+	 * two machines that could not see each other, or a unique constraint that is not
+	 * enforced at all. The single-node arm below separates them — the SECOND insert on one
+	 * machine must be rejected, which is what makes the cross-machine pair a statement about
+	 * visibility rather than about a dead constraint.
+	 *
+	 * The downstream schema takes the same trade knowingly, at its own nonce column
+	 * (`sereus/schemas/control.qsql` FormationUsage.UsageStampId): "two nodes that have not
+	 * yet converged could each admit the same nonce and both rows survive the merge". If
+	 * consensus-level constraint arbitration is ever added, this case is what says so.
+	 */
+	it('a UNIQUE index over-admits the same value across two nodes, while rejecting it on one', async () => {
+		const nodes = await openTwoNodesOnEmptyIndex(createUniqueIndexSql);
+
+		// The constraint IS live: a second row with the same Token, on the machine that can
+		// already see the first, is refused.
+		await nodes.A.db.exec(insertSql(STAMP_ID.A, SHARED_TOKEN));
+		let rejected: unknown;
+		try {
+			await nodes.A.db.exec(insertSql(STAMP_ID.C, SHARED_TOKEN));
+		} catch (error) {
+			rejected = error;
+		}
+		expect(rejected, 'a same-value insert on ONE node must violate the UNIQUE index').to.be.instanceOf(Error);
+		expect(String(rejected)).to.match(/unique/i);
+
+		// Across machines it is admitted, because B's probe runs against a tree that predates
+		// A's commit. B stages before it can have observed A's row and commits afterwards.
+		await nodes.B.db.exec(insertSql(STAMP_ID.B, SHARED_TOKEN));
+
+		await expectAllNodesConverged(nodes, [
+			{ UsageStampId: STAMP_ID.A, Token: SHARED_TOKEN },
+			{ UsageStampId: STAMP_ID.B, Token: SHARED_TOKEN },
+		]);
+
+		for (const which of ['A', 'B'] as const) {
+			expect(
+				await countTreeEntries(nodes[which].plugin, INDEX_URI),
+				`committed unique-index entries seen from node ${which} — two rows share one ` +
+				`indexed value, so the "unique" index legitimately holds two entries under it`,
+			).to.equal(2);
+		}
+	});
+
+	/*
 	 * An index tree big enough to span more than one block. Every two-node case before this one
 	 * writes three rows, so the whole index has always fitted in a single block and no case has
 	 * ever merged two writers against a SPLIT tree. The preload size is derived from the btree's
@@ -336,8 +309,8 @@ describe('Two nodes writing one shared secondary-index value', function () {
 	const PRELOAD_ROWS = NodeCapacity + 16;
 
 	it(`both rows survive when the index tree spans several blocks (${PRELOAD_ROWS} preloaded rows)`, async () => {
-		await startMesh(2);
-		const nodes = { A: createNode(transactorFor(0)), B: createNode(transactorFor(1)) };
+		const { transactorFor } = await startMockMesh(2);
+		const nodes = { A: createMeshDbNode(transactorFor(0)), B: createMeshDbNode(transactorFor(1)) };
 
 		await nodes.A.db.exec(createTableSql);
 		await nodes.A.db.exec(createIndexSql);
