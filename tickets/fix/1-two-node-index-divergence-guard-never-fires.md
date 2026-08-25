@@ -76,3 +76,58 @@ Whichever of these the evidence supports:
 Either way, report the conclusion back to sereus's `secondary-index-seek-blind-to-sibling-rows`,
 which currently states this defect as established fact and has been carrying that attribution since
 2026-08-12 on evidence the last investigation partly overturned.
+
+---
+
+## Appended 2026-08-24 from `stale-read-returned-as-authoritative-when-repair-cannot-converge`
+
+That ticket asked the same question this one does — are these one defect? — and got far enough to
+give you a **cheap, decisive check** before you spend time on the mock mesh again.
+
+### The mechanism it found
+
+Read-repair accepts a peer's claimed revision only when a quorum of distinct peers corroborates the
+exact `(rev, actionId)`. The required number of corroborators is floored at 2, and that floor
+relaxes only as far as `corroboratorCapacity(cohortPeersOtherThanMe, repairCorroborationClusterSize)`
+in `packages/db-p2p/src/cluster/quorum-restore.ts`. `repairCorroborationClusterSize` falls back to
+`clusterSize`, whose default is **10**.
+
+So for a two-node deployment the outcome depends entirely on one setting:
+
+- `clusterPolicy.assumedClusterSize: 2` (or an honest `clusterSize: 2`) declared → capacity 1, floor
+  relaxes to 1, the lone peer's newer revision **is** adopted. Repair works.
+- **Nothing declared** → capacity is `max(1, 9) = 9`, the floor stays 2, and a cohort with exactly
+  one other peer **can never supply two corroborators**. Every repair pass declines, forever. Each
+  node keeps its own revision and neither ever adopts the other's.
+
+That second shape is a *symmetric*, permanent, silent non-convergence in which each node holds only
+its own write — which is exactly the symptom reported here, and exactly the symmetry this ticket
+noted did not look like index blindness.
+
+### The check to run first
+
+In the sereus node startup logs, look for:
+
+- `cluster-policy` → `assumed-cluster-size-unset` (fires once per node construction whenever
+  `assumedClusterSize` is undeclared and `clusterSize > 2`), and
+- `coordinator-repo` → `cluster-fetch:no-quorum` with `responders: 1, required: 2`.
+
+Both present ⇒ this is the same defect as the three-node ticket, seen at two nodes, and it is
+**configuration-reachable**: set `clusterPolicy.assumedClusterSize` to the real node count and rerun
+`strand-formation-concurrent-redemption.integration.ts`. If it converges, all three sereus tickets
+(`secondary-index-seek-blind-to-sibling-rows`, `forked-control-collection-sync-livelocks`,
+`control-peer-row-refresh-invisible-to-third-node`) collapse into one, and the index-maintenance
+attribution is refuted rather than merely unproven.
+
+If the advisory is absent (i.e. the size *is* declared) the mechanism does not apply at two nodes,
+and this remains a separate defect — that is a useful result too, and it costs one grep.
+
+### What is already known not to be the answer
+
+The related claim that a stale read is returned silently is **fixed** — a read the coordinator
+cannot confirm is current now throws `BlockPossiblyStaleError`
+(`complete/coordinator-serves-stale-data-as-if-confirmed`, verified again during that
+investigation). If sereus still sees silent empty rows rather than that error, the divergence is
+*not* reaching the coordinator's freshness consult at all, which is itself a strong clue about
+where to look.
+

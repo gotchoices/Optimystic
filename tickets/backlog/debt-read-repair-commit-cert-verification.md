@@ -1,12 +1,12 @@
 ----
-description: Harden block read-repair and reconcile so they can prove a peer's claimed "latest version" with a real cryptographic commit certificate, not just agreement between peers — closing the gap where a peer that forges many fake identities could still fool the quorum check.
+description: Let a machine prove that a record really was updated by checking a signature the group produced when it committed, instead of having to reach two other machines that say the same thing. Without that proof, a machine that cannot reach enough peers can never catch up, and small or partly-connected deployments get stuck permanently.
 prereq:
 files: packages/db-p2p/src/repo/coordinator-repo.ts, packages/db-p2p/src/libp2p-node-base.ts, packages/db-p2p/src/cluster/commit-cert.ts, packages/db-p2p/src/storage/struct.ts (BlockArchive), packages/db-p2p/src/sync/service.ts, packages/db-p2p/src/sync/protocol.ts
 difficulty: hard
 severity: wrong-result
-likelihood: contrived
-repro: static
-tradeoffs: The quorum plus content-hash gate already stops the realistic minority-liar case; this only adds resistance to an attacker minting many fake identities, and it needs cert persistence, a sync-protocol change, and cohort-membership anchoring that does not exist yet.
+likelihood: normal-use
+repro: verified
+tradeoffs: It is a large piece of work whose own prerequisite (cohort-membership anchoring) is not built, and the availability arm below can be worked around by an operator setting `clusterPolicy.assumedClusterSize` — for two-machine deployments; three-machine ones have no workaround at all.
 ----
 
 # Verify restored blocks against a commit certificate (Sybil-resistant)
@@ -66,7 +66,81 @@ should be triaged together: the penalty ticket's cheap fix (stop penalizing an u
 revision) is independently shippable now, and this ticket is what makes the penalty *provable* rather
 than merely dropped. A planner may fold them.
 
-This is a future hardening pass, not an active bug — the quorum + content-hash
-gate already stops the realistic minority-liar case. Promote when Sybil
-resistance on the restore paths becomes a priority and the cohort-membership
-anchor is ready to consume here.
+This was filed as a future hardening pass on the grounds that it was not an
+active bug — the quorum + content-hash gate already stops the realistic
+minority-liar case. **The second arm below overturns that half of the framing:**
+the same missing proof is also a reproduced availability defect, so the
+promotion question is no longer only about Sybil resistance. The cohort-membership
+anchor is still not ready to consume here, which is what keeps this in backlog.
+
+---
+
+## Second arm (appended 2026-08-24): this is an availability defect, not only Sybil hardening
+
+Added from `fix/stale-read-returned-as-authoritative-when-repair-cannot-converge`, which reached
+this site as the *only sound* fix for a reproduced non-convergence. The metadata above was raised
+from `likelihood: contrived` / `repro: static` on this evidence; the analysis below is why.
+
+### What was measured
+
+Corroboration counts *voters*. A voter count cannot be met when the voters are unreachable, and the
+floor is 2. Sweeping `resolveClusterPolicy` → `corroboratorCapacity` → `quorumSize` over real
+cohort sizes gives one rule: **a cohort of three or more needs two cohort peers besides the reader
+to answer, or the repair declines.** So:
+
+- A three-machine deployment has **zero** fault tolerance for repair. One peer unreachable *from
+  one reader* — healthy and reachable from everybody else — leaves that reader's copy permanently
+  unrepairable.
+- A two-machine deployment that never declared `clusterPolicy.assumedClusterSize` falls back to
+  `clusterSize` (default 10), so its floor never relaxes and it can repair nothing, ever.
+
+Reproduced in `packages/db-p2p` against a three-peer cohort with one member unreachable: no quorum,
+no restoration, the reader stays at its old revision across every pass. Matches the field logs
+(`cluster-fetch:no-quorum { responders: 1, required: 2 }`, 1821 times in one boot).
+
+### Why the cost of this ticket changed
+
+The corroboration floor's strict default was chosen as *degraded rather than dead* — an unrepaired
+block was still served, just stale. **That is no longer what happens.**
+`coordinator-serves-stale-data-as-if-confirmed` landed on the same day (2026-08-12) and made an
+unconfirmable read throw `BlockPossiblyStaleError` rather than silently serve. Correct, and the
+right call — but it means an unrepairable block is now **read-dead**, not degraded. The two
+decisions appear to have been made without either seeing the other. The tradeoff that justified the
+strict default was priced against the old cost.
+
+### Why no cheaper fix exists
+
+Every alternative reduces to "trust fewer voters because the others did not answer", which is the
+attack the floor exists to stop. Specifically rejected during the investigation:
+
+- **Use the count of peers that actually answered as the capacity.** A routing-level attacker who
+  shrinks a reader's cohort view to `[reader, attacker]` produces one answerer with nobody silent,
+  and would be believed. This is the `max(cohortPeerCount, …)` in `corroboratorCapacity` doing its
+  job; removing it removes the protection.
+- **Relax when nobody was silent.** Same hole, same reason — silence is not what the attacker
+  needs to induce.
+- **Ask a reachable peer to relay an unreachable peer's answer.** That is a certificate with extra
+  steps and no signature.
+
+A commit certificate breaks the circularity because **one peer carrying a certificate is as strong
+as N peers agreeing** — the signature set *is* the corroboration, so the reader never needs to
+reach a second peer. That property is what this ticket is for, and it is worth as much for
+availability as for Sybil resistance.
+
+### What still blocks it
+
+Unchanged, and stated honestly: the three gaps in the section above, plus
+`feat-cluster-membership-threshold-cert-anchoring` (also backlog, also not buildable). Note the
+precedent for landing this at partial strength: `verifyInvalidationCertificate` in
+`cluster-repo.ts` already verifies at layer-1 (challenger-bound signer set, membership, dedup) and
+**logs** the residual anchoring gap rather than waiting for the anchor. A certified repair claim
+verified to that same standard would still be strictly stronger than today's "two peers said the
+same number", which carries no signatures at all. A planner should weigh that staging.
+
+### Meanwhile
+
+`implement/repair-deadlock-is-never-named` does not fix any of this. It makes the deadlock legible
+— a named, once-per-block signal when every cohort member answered and there were still too few of
+them, plus a startup advisory that stops implying three machines are enough. That is deliberately
+diagnostics only, because nothing else is sound without this ticket.
+
