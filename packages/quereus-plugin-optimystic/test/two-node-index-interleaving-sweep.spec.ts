@@ -25,8 +25,12 @@
  *                  reconcile. (No case reads a value only the SIBLING writes — see
  *                  `runPreReads` for what that leaves uncovered.)
  *   token        — the two nodes write the same indexed value or distinct ones (every
- *                  pre-existing case lands both nodes on the same token; the
- *                  downstream scenario redeems distinct ones)
+ *                  pre-existing case lands both nodes on the same token, and so does the
+ *                  downstream scenario: its two machines redeem the SAME invite in one
+ *                  tick, writing two rows that share a Token and differ only in primary
+ *                  key. An earlier version of this comment said the downstream scenario
+ *                  redeems DISTINCT tokens; that was wrong — see the correction and the
+ *                  extra shared-value cases in two-node-shared-index-key.spec.ts)
  *
  * Running it. All 144 orderings run on EVERY `yarn test` — the sweep is not gated,
  * because a sweep that only runs when someone remembers a flag cannot catch the bug it
