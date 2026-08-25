@@ -14,6 +14,7 @@ import { Database } from '@quereus/quereus';
 import type { SqlValue } from '@quereus/quereus';
 import register from '../dist/plugin.js';
 import type { TransactionState } from '../dist/index.js';
+import { captureTrace, commitTraces } from './trace-helpers.js';
 
 type Row = Record<string, SqlValue>;
 
@@ -370,6 +371,45 @@ describe('TransactionBridge (TEST-7.3.1)', () => {
 			await bridge.commitTransaction();
 
 			expect(stamp1).to.not.equal(stamp2);
+		});
+
+		// `commit:collections` prints a revision per collection, and its two non-numeric
+		// answers mean OPPOSITE things: `none` is "asked, and this collection has never
+		// adopted a committed revision" (invented locally — itself a finding), `unknown`
+		// is "nobody could be asked". An operator reading a failing log leans hardest on
+		// exactly those two tokens, so collapsing them — or dropping one — has to fail
+		// here. Driven through doubles because a real Tree cannot produce `unknown` at
+		// all, and reaches the emitter over the ordinary legacy commit sweep.
+		it('distinguishes none (invented collection) from unknown (unaskable source) in revs=', async () => {
+			const { plugin } = createTestEnv();
+			const bridge = plugin.txnBridge;
+
+			const base = { sync: async () => {}, snapshot: () => ({}), restore: () => {} };
+			const invented = { ...base, describe: () => 'double/invented', committedRevision: () => undefined };
+			const numbered = { ...base, describe: () => 'double/numbered', committedRevision: () => 7 };
+			const unaskable = { ...base, describe: () => 'double/unaskable' };
+
+			await bridge.beginTransaction(defaultOptions);
+			for (const tree of [invented, numbered, unaskable]) bridge.markDirty(tree);
+
+			const lines = await captureTrace(async () => {
+				await bridge.commitTransaction();
+			});
+
+			const trace = commitTraces(lines).find(t => t.rev.has('double/invented'));
+			expect(trace, `a legacy commit:collections line named the doubles; saw ${JSON.stringify(lines)}`)
+				.to.not.equal(undefined);
+			expect(trace!.rev.get('double/invented'), 'committedRevision() returning undefined reads as none')
+				.to.equal('none');
+			expect(trace!.rev.get('double/unaskable'), 'a source without the accessor reads as unknown, not none')
+				.to.equal('unknown');
+			expect(trace!.rev.get('double/numbered'), 'a real revision is printed as its number')
+				.to.equal('7');
+			// The pre-existing `<id>=staged|clean|unknown` half is independent of the
+			// revision half: a double omits hasUnsyncedChanges too, so both read unknown
+			// there while the revisions above still differ.
+			expect(trace!.state.get('double/invented'), 'the state half is unaffected by the revision half')
+				.to.equal('unknown');
 		});
 	});
 

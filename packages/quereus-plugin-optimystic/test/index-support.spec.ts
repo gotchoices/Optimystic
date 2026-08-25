@@ -576,6 +576,26 @@ describe('Optimystic Index Support', () => {
 		// could render alike, an operator would read a real divergence as agreement. The pair
 		// below is the collision a renderer that escapes without escaping its own escape
 		// character would produce.
+		// `none` is the answer an operator reads as "this collection was invented locally",
+		// so what it means when NOTHING has been committed yet has to be pinned: a table
+		// whose first row has not landed prints `main_rev=none` on a perfectly healthy
+		// seek. Without this, a reader meeting `none` in a log has no way to tell the
+		// benign case from the invention race — and `rev()` renders both fields, so this
+		// also covers the index side's `none`.
+		it('prints none for a collection that has never committed, alongside a real revision', async () => {
+			const lines = await captureTrace(async () => {
+				await collectRows(db.eval(`SELECT id FROM traced WHERE label = 'absent'`));
+			});
+
+			const seek = indexSeekTraces(lines)[0];
+			expect(seek, 'the seek emitted an index:seek line').to.not.equal(undefined);
+			expect(seek!.mainRev, 'the table has committed nothing, so its revision is none')
+				.to.equal('none');
+			expect(seek!.rev, 'CREATE INDEX committed the index collection, so its revision is a number')
+				.to.match(/^\d+$/);
+			expect(seek!.matched, 'an empty table matches nothing').to.equal(0);
+		});
+
 		it('renders distinct indexed values to distinct tokens', async () => {
 			await db.exec(`INSERT INTO traced (id, label) VALUES (1, 'a b'), (2, 'a%20b')`);
 

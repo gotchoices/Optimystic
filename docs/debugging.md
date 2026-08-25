@@ -158,7 +158,9 @@ optimystic:quereus-plugin:module index:seek table=Usage index=by_token collectio
 
 - `arm=committed` — a pre-transaction snapshot read, which deliberately never refreshes from the
   network. `arm=live` — the scan ran `update()` on both trees immediately before descending.
-- `rev=` — the index collection's committed revision; `none` if that collection is invented.
+- `rev=` — the index collection's committed revision; `none` when that collection has adopted no
+  committed revision at all — either it was invented locally, or nothing has been committed under
+  its id yet (see the caveat under the table below, which separates the two).
 - `main_rev=` — the main table collection's revision at the same instant. A table's main tree and
   its index trees are separate collections refreshed through different call sites, and a
   collection's revision advances only when something calls `update()`/`sync()` on it — so the two
@@ -178,7 +180,9 @@ optimystic:quereus-plugin:module index:seek table=Usage index=by_token collectio
   the tree. An empty `seek=` is the whole-index prefix (a plan that wants every entry);
   `seek=unset` means the scan returned before framing a key at all. **Compare it, do not decode
   it** — un-escaping yields the raw tuple framing (element tags, escaped NULs), not the SQL value
-  that was sought.
+  that was sought; and only `A-Za-z0-9._-` survive verbatim, every other code unit becoming `%XX`
+  or, above U+00FF, `%uXXXX` — which is not valid percent-encoding, so a decoder would reject or
+  mangle a key carrying non-Latin-1 text.
 - `matched=` — how many **index entries** the seek produced, counted before the row fetch. Rows
   dropped later (missing row, predicate re-applied by the engine) still count here. It is a
   **floor**: a scan the caller abandons early (a satisfied `LIMIT`, an error mid-scan) reports what
