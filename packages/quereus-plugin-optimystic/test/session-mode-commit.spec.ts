@@ -51,6 +51,7 @@ import { KeyRange, TransactionCoordinator } from '@optimystic/db-core';
 import { FileRawStorage } from '@optimystic/db-p2p-storage-fs';
 import register from '../dist/plugin.js';
 import { QuereusEngine } from '../dist/index.js';
+import { captureTrace, commitTraces } from './trace-helpers.js';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import * as fs from 'node:fs/promises';
@@ -500,4 +501,45 @@ describe('Staging-refactor unit gaps (Tree.restore no-op + bridge collection reg
 			db.close();
 		}
 	});
+
+	// The session-mode half of the `commit:collections` trace (ticket
+	// `name-the-collections-a-write-carries`). The legacy half is pinned in
+	// two-node-secondary-index-convergence.spec.ts; this pins that the session
+	// path emits the same line, tagged `mode=session`, drawn from the live
+	// collection registry the coordinator commits from. Without this a change
+	// that dropped the session line would leave the distributed path — the one
+	// a multi-node deployment actually runs — undiagnosable.
+	it('emits a session-mode commit:collections line naming main + index collections', async () => {
+		const uri = 'tree://session/trace';
+		const { db, plugin } = createDb();
+		let dispose: (() => void) | undefined;
+		try {
+			await db.exec(`create table Trace (id integer primary key, cat text) using optimystic('${uri}')`);
+			await db.exec(`create index idx_trace_cat on Trace (cat)`);
+			dispose = await enableSessionMode(db, plugin);
+
+			const mainId = String(plugin.collectionFactory.getCollectionId({ ...memOptions(), collectionUri: uri }));
+			const indexId = String(plugin.collectionFactory.getCollectionId({ ...memOptions(), collectionUri: `${uri}/index/idx_trace_cat` }));
+
+			const lines = await captureTrace(async () => {
+				await db.exec(`insert into Trace (id, cat) values (1, 'a')`);
+			});
+
+			const traces = commitTraces(lines).filter(t => t.ids.includes(mainId));
+			expect(traces.length, `a commit carried the main collection '${mainId}'; saw ${JSON.stringify(commitTraces(lines).map(t => t.ids))}`)
+				.to.be.greaterThan(0);
+			const carrying = traces[0]!;
+			expect(carrying.mode, 'session mode is wired, so the commit goes through the coordinator').to.equal('session');
+			expect(carrying.ids, 'the SAME commit carried the index collection').to.include(indexId);
+			expect(carrying.count, 'count= agrees with the ids actually listed').to.equal(carrying.ids.length);
+			// The registry-sourced set lists every registered collection, so presence
+			// alone does not prove the write touched it — `staged` is what does.
+			expect(carrying.state.get(mainId), 'the main collection had staged changes to push').to.equal('staged');
+			expect(carrying.state.get(indexId), 'the index collection had staged changes to push').to.equal('staged');
+		} finally {
+			dispose?.();
+			db.close();
+		}
+	});
+
 });

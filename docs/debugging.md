@@ -90,8 +90,48 @@ per-node attribution from another subsystem, pass its peer id as `createLogger`'
 | Sub-namespace         | What it covers                                                       |
 |-----------------------|---------------------------------------------------------------------|
 | `plugin`              | Plugin registration (config dump when `debug` option set)           |
-| `module`              | Virtual table change-subscription lifecycle: subscribe/notify/teardown |
+| `module`              | Virtual table change-subscription lifecycle: subscribe/notify/teardown; `index:tree-open` (below) |
 | `collection-factory`  | Collection watch no-op notices and libp2p node shutdown             |
+| `txn-bridge`          | `commit:collections` (below) — which collections each commit carries |
+
+#### Which collections did a write carry?
+
+A table with a secondary index is stored as **two or more separate collections**: the main table
+tree at the table's `collectionUri`, and one index tree at `<collectionUri>/index/<indexName>` per
+maintained index. A single `insert` must stage into all of them and commit all of them. Two lines
+make that answerable from a log; enable both (`DEBUG='optimystic:quereus-plugin:*'`, or
+`DEBUG='optimystic:quereus-plugin:txn-bridge,optimystic:quereus-plugin:module'` if that is noisy):
+
+```
+optimystic:quereus-plugin:txn-bridge commit:collections mode=legacy count=2 default/Usage=staged default/Usage/index/by_token=staged
+optimystic:quereus-plugin:module index:tree-open table=Usage index=by_token uri=tree://default/Usage/index/by_token collection=default/Usage/index/by_token
+```
+
+Reading `commit:collections` — one line per commit, emitted **before** the flush:
+
+- `mode=legacy` is the direct per-tree sync sweep (no coordinator wired). Its set is the **dirty
+  set**: a tree lands there only once DML staged into it, so an index collection *absent from the
+  line* means the index was never staged into.
+- `mode=session` is the distributed-consensus path. Its set is the **whole live collection
+  registry**, because the coordinator commits by iterating its own collection map — so an index
+  collection being *listed* does not by itself mean this write touched it; `=staged` is what says
+  that.
+- Each id carries `=staged` (unflushed changes pending at commit time) / `=clean` / `=unknown`.
+- `count=` is emitted **before** the id list, so a truncated line still reports how many
+  collections there were; if `count=` and the number of ids disagree, the line was truncated.
+- Ids are sorted, so two nodes' lines compare directly by eye. `count=0` is normal — a commit whose
+  bridge had no dirty trees.
+
+Reading `index:tree-open` — one line per index tree opened (bring-up, not per write). It prints
+both the derived URI and the collection id it resolved to, because they differ (the `tree://`
+scheme is stripped to form the id) and `commit:collections` prints ids. Two nodes resolving
+**different** `collection=` values for one logical index would produce a symmetric "each node's
+index holds only its own rows" symptom while leaving the main table fine — a failure shape the pair
+of lines separates from "the index collection was absent from the commit".
+
+Both lines are pinned by tests (`test/trace-helpers.ts` captures and parses them; the legacy case
+lives in `test/two-node-secondary-index-convergence.spec.ts`, the session case in
+`test/session-mode-commit.spec.ts`), so a change that stops emitting either one fails the suite.
 
 ## Common DEBUG patterns
 
@@ -122,6 +162,9 @@ DEBUG='optimystic:db-core:batch-coordinator' node app.js
 
 # Routing and redirect decisions
 DEBUG='optimystic:db-p2p:repo-service' node app.js
+
+# Which collections a SQL write actually carried (main table + index trees)
+DEBUG='optimystic:quereus-plugin:txn-bridge,optimystic:quereus-plugin:module' node app.js
 
 # All cohort-topic substrate logging (walk, promote, willingness, handoff, anti-flood, anti-DoS)
 DEBUG='optimystic:db-core:cohort-topic:*' node app.js

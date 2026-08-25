@@ -2281,17 +2281,12 @@ export class OptimysticVirtualTable extends VirtualTable {
    * index as missing rather than as empty.
    *
    * Emits ONE `index:tree-open` line per open, naming the table, the index as THIS
-   * vtab knows it, the derived URI, and the collection id the URI resolved to (the
-   * URI's scheme is stripped to form the id, so the two differ and an operator
-   * joining logs needs both). This is the companion to the transaction bridge's
-   * `commit:collections` line: that one says which collections a write carried, this
-   * one says which collection each logical index resolves to. Together they separate
-   * "the index collection was absent from the commit" from "both nodes committed, to
-   * DIFFERENT index collections" — two failure shapes that look identical from the
-   * outside (each node's index holding only its own rows) and could not be told apart
-   * from any log this package used to emit. A bring-up-time fact, so once per open is
-   * enough; all four arguments already exist, so nothing is built for a disabled
-   * namespace.
+   * vtab knows it, the derived URI, and the collection id it resolved to — the URI's
+   * scheme is stripped to form the id, so the two differ and an operator joining this
+   * against the bridge's `commit:collections` line (which prints ids) needs both. How
+   * the pair is read: `docs/debugging.md` (§ "Which collections did a write carry?").
+   * Bring-up-time, not per write — callers hold the opened tree — and all four
+   * arguments already exist, so a disabled namespace builds nothing worth guarding.
    */
   private async openIndexTree(indexName: string, transactor?: ITransactor): Promise<Tree<string, IndexEntry>> {
     const indexUri = `${this.options.collectionUri}/index/${indexName}`;

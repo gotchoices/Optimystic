@@ -18,14 +18,13 @@
  */
 
 import { expect } from 'chai';
-import debugFactory from 'debug';
-import { format } from 'node:util';
 import { Database } from '@quereus/quereus';
 import type { SqlValue } from '@quereus/quereus';
 import type { ITransactor } from '@optimystic/db-core';
 import { KeyRange } from '@optimystic/db-core';
 import { createMesh, buildNetworkTransactors, type Mesh } from '@optimystic/db-p2p/testing';
 import register from '../dist/plugin.js';
+import { captureTrace, collectionIdOf, commitTraces, indexOpenTraces } from './trace-helpers.js';
 import { expectIndexAgreesWithScan } from './query-helpers.js';
 
 type Row = Record<string, SqlValue>;
@@ -34,8 +33,6 @@ type Plugin = ReturnType<typeof register>;
 const TABLE_URI = 'tree://default/FormationUsage';
 const INDEX_URI = `${TABLE_URI}/index/formation_usage_by_token`;
 
-/** A collection's id is its URI with the `tree://` scheme stripped (CollectionFactory.parseCollectionId). */
-const collectionIdOf = (uri: string): string => uri.replace(/^tree:\/\//, '');
 const TABLE_COLLECTION_ID = collectionIdOf(TABLE_URI);
 const INDEX_COLLECTION_ID = collectionIdOf(INDEX_URI);
 
@@ -90,73 +87,6 @@ async function countTreeEntries(plugin: Plugin, collectionUri: string): Promise<
 		if (tree.isValid(treePath)) n++;
 	}
 	return n;
-}
-
-/**
- * Run `body` with the plugin's debug namespaces on, returning every line the
- * plugin emitted while it ran.
- *
- * `debug` is an external dependency of this package (tsup leaves `dependencies`
- * unbundled), so the instance imported here is the SAME one `src/logger.ts`
- * builds its loggers from — `enable()` therefore reaches loggers constructed at
- * dist-import time, and replacing `debugFactory.log` intercepts them before they
- * reach stderr. `log` is the fallback sink every instance uses
- * (`self.log || createDebug.log`) and it receives the RAW printf args, so the
- * `%s`/`%d` substitution node's default sink does via `util.format` is redone here.
- */
-async function captureTrace(body: () => Promise<void>): Promise<string[]> {
-	const lines: string[] = [];
-	const previousNamespaces = debugFactory.disable();
-	const previousLog = debugFactory.log;
-	debugFactory.log = (...args: unknown[]) => { lines.push(format(...args)); };
-	debugFactory.enable('optimystic:quereus-plugin:*');
-	try {
-		await body();
-	} finally {
-		debugFactory.log = previousLog;
-		debugFactory.enable(previousNamespaces);
-	}
-	return lines;
-}
-
-/** Strip ANSI colour codes so parsing does not depend on whether stderr is a TTY. */
-const plain = (line: string): string => line.replace(new RegExp(String.fromCharCode(27) + '\[[0-9;]*m', 'g'), '');
-
-interface CommitTrace {
-	mode: string;
-	/** The `count=` field as emitted — asserted against `ids.length` so a truncated list is caught. */
-	count: number;
-	ids: string[];
-	state: Map<string, string>;
-}
-
-/** Parse every `commit:collections` line out of a capture. */
-function commitTraces(lines: readonly string[]): CommitTrace[] {
-	const traces: CommitTrace[] = [];
-	for (const raw of lines) {
-		const head = /commit:collections mode=(\S+) count=(\d+)(.*)$/.exec(plain(raw));
-		if (!head) continue;
-		const state = new Map<string, string>();
-		// A trailing `+1ms` (or any other non-`id=state` token) is dropped by the shape filter.
-		for (const token of head[3]!.trim().split(/\s+/)) {
-			const entry = /^(\S+)=(staged|clean|unknown)$/.exec(token);
-			if (entry) state.set(entry[1]!, entry[2]!);
-		}
-		traces.push({ mode: head[1]!, count: Number(head[2]), ids: [...state.keys()], state });
-	}
-	return traces;
-}
-
-interface IndexOpenTrace { table: string; index: string; uri: string; collection: string }
-
-/** Parse every `index:tree-open` line out of a capture. */
-function indexOpenTraces(lines: readonly string[]): IndexOpenTrace[] {
-	const traces: IndexOpenTrace[] = [];
-	for (const raw of lines) {
-		const m = /index:tree-open table=(\S+) index=(\S+) uri=(\S+) collection=(\S+)/.exec(plain(raw));
-		if (m) traces.push({ table: m[1]!, index: m[2]!, uri: m[3]!, collection: m[4]! });
-	}
-	return traces;
 }
 
 describe('Two-node secondary-index convergence (write on one node, index-seek on the other)', function () {

@@ -13,6 +13,10 @@ $ wc -l packages/quereus-plugin-optimystic/src/optimystic-module.ts
 3000
 ```
 
+Re-measured 2026-08-24 while reviewing `name-the-collections-a-write-carries` (which added a debug
+line inside the big class): the same command now reports **3213**. The file is still growing, so the
+churn argument in `tradeoffs:` gets worse, not better, with delay.
+
 Top-level shape (`grep -n "^export class\|^class\|^function" …`):
 
 | lines | what |

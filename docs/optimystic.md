@@ -270,7 +270,12 @@ Counters, append-only queues with metadata, specialized indexes, and CRDT-style 
 DEBUG='optimystic:*'                            node app.js  # everything
 DEBUG='optimystic:db-core:network-transactor'   node app.js  # client-side transactions
 DEBUG='optimystic:db-p2p:cluster*'              node app.js  # consensus
+DEBUG='optimystic:quereus-plugin:*'             node app.js  # which collections each SQL write carried
 ```
+
+A table with a secondary index is stored as several collections (the table tree plus one tree per
+index), and the `optimystic:quereus-plugin` namespace is what says whether a given write actually
+carried all of them — see [debugging.md](debugging.md#which-collections-did-a-write-carry).
 
 `OPTIMYSTIC_VERBOSE=1` enables batch and peer tracing. Correlation IDs (`trxId`, `actionId`, `messageHash`) tie log entries to specific transactions.
 

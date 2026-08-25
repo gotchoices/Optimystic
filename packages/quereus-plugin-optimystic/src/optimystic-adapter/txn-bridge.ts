@@ -40,6 +40,14 @@ export interface DirtyTree {
   hasUnsyncedChanges?(): boolean;
 }
 
+/**
+ * Name a dirty tree for diagnostics: its collection id, or a positional label when
+ * the tree is a double that does not implement {@link DirtyTree.describe}. Shared by
+ * the `commit:collections` trace and {@link PartialCommitError}'s persisted/unpersisted
+ * lists so both name the same tree the same way.
+ */
+const treeLabel = (tree: DirtyTree, index: number): string => tree.describe?.() ?? `tree#${index}`;
+
 /** One collection's row in a {@link TransactionBridge} `commit:collections` trace line. */
 interface CommitCollectionTrace {
   /** The collection id — the same string `openIndexTree`'s `index:tree-open` line prints. */
@@ -460,34 +468,21 @@ export class TransactionBridge {
   }
 
   /**
-   * Emit the one line that answers "which collections did this write carry?".
+   * Emit the one line that answers "which collections did this write carry?" — a
+   * table with a secondary index is backed by several collections (the table tree
+   * plus one tree per maintained index, opened by `OptimysticTable.openIndexTree`,
+   * which prints the companion `index:tree-open` line), and a write has to carry all
+   * of them. How an operator reads the pair: `docs/debugging.md`
+   * (§ "Which collections did a write carry?").
    *
-   * A table with a secondary index is backed by two or more separate Optimystic
-   * collections — the main table tree at the table's `collectionUri`, and one index
-   * tree at `<collectionUri>/index/<indexName>` per maintained index (derived in
-   * exactly one place: `OptimysticTable.openIndexTree`, which prints the matching
-   * `index:tree-open` line). A single SQL statement must stage into all of them and
-   * commit all of them, and until this line existed no log could say whether it did.
+   * Ids are real collection ids, not tree labels or array indexes, so the two lines
+   * join. Sorted so two nodes' lines compare by eye (on a copy — the sweep's own
+   * order is untouched). `count` precedes the list so a truncated line still reports
+   * how many there were. `unknown` appears only for a {@link DirtyTree} double that
+   * omits `hasUnsyncedChanges`.
    *
-   * Shape — deliberately ONE physical line, count before the list so a truncated
-   * line still reports how many collections there were:
-   *
-   * ```
-   * optimystic:quereus-plugin:txn-bridge commit:collections mode=legacy count=2 \
-   *   default/FormationUsage=staged default/FormationUsage/index/by_token=staged
-   * ```
-   *
-   * The ids are real collection ids (scheme-stripped, as `parseCollectionId` derives
-   * them), NOT tree labels or array indexes, so an operator can match a commit set
-   * against the `index:tree-open` lines and tell "the index collection was not in the
-   * commit" apart from "both nodes committed, to DIFFERENT index collections".
-   *
-   * Sorted by id so two nodes' lines compare directly; the sweep's own order is
-   * untouched (it is a copy). `unknown` appears only for a `DirtyTree` double that
-   * does not implement `hasUnsyncedChanges`.
-   *
-   * Cost when the namespace is off: nothing. Both call sites build their entry array
-   * inside an `if (log.enabled)` guard, and this method does the sort/join.
+   * Costs nothing when the namespace is off: both call sites build their entry array
+   * inside an `if (log.enabled)` guard.
    */
   private logCommitCollections(mode: 'legacy' | 'session', entries: readonly CommitCollectionTrace[]): void {
     const sorted = [...entries].sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
@@ -526,7 +521,7 @@ export class TransactionBridge {
     // into — which is exactly the question the trace exists to answer.
     if (log.enabled) {
       this.logCommitCollections('legacy', trees.map((tree, i) => ({
-        id: tree.describe?.() ?? `tree#${i}`,
+        id: treeLabel(tree, i),
         staged: tree.hasUnsyncedChanges?.(),
       })));
     }
@@ -559,7 +554,7 @@ export class TransactionBridge {
           t.restore(this.dirtyTrees.get(t));
         }
 
-        const label = (t: DirtyTree) => t.describe?.() ?? `tree#${trees.indexOf(t)}`;
+        const label = (t: DirtyTree) => treeLabel(t, trees.indexOf(t));
         const persisted = synced.map(label);
         const unpersisted = unsynced.map(label);
 
