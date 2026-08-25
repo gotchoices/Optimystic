@@ -113,7 +113,14 @@ function installIndexRoutingProbe(): IndexRoutingProbe {
  * The values queried come from the SCAN, so this catches a stale/orphaned entry only
  * when its value is still present in some row (the entry then pulls an extra row into
  * that value's seek). An entry for a value no longer held by ANY row is never queried
- * and so never seen here — assert on the tree's keys directly for that.
+ * and so never seen here — assert on the tree's keys directly for that. The companion
+ * check that would do so does not exist yet; it is tracked, together with the
+ * insert-only sweep that shares the blind spot, in
+ * `debt-index-sweep-misses-update-delete-and-orphans`.
+ *
+ * Both arms below — the routing requirement and the row-set comparison — are pinned
+ * against a deliberately broken index in `query-helpers.spec.ts`, so a refactor here
+ * cannot quietly turn every caller into a no-op.
  *
  * `column` must be covered by a DECLARED secondary index whose FIRST column it is —
  * that is what makes the equality form routable. Each value-form query is required to

@@ -49,11 +49,11 @@ themselves on their own env var — `RUN_LONG_TESTS=1` (circuit-relay/DCUtR/subs
 full budget). These run in no script, including `yarn check`; each spec's header comment gives the
 exact command. Grep `process.env.RUN_` under `test/` for the current set.
 
-One `RUN_` var is not third-tier and is worth knowing about: `RUN_INDEX_SWEEP=1` widens
-`quereus-plugin-optimystic`'s `two-node-index-interleaving-sweep.spec.ts` from a 12-case core subset
-to the full 144-ordering cross product. It is *also* widened by `OPTIMYSTIC_INTEGRATION=1`, so the
-full sweep already runs under `yarn test:integration` and `yarn check` — the dedicated var just lets
-you run that one file wide without dragging in the real-socket specs.
+One env var runs the other way — it *narrows* rather than widens.
+`quereus-plugin-optimystic`'s `two-node-index-interleaving-sweep.spec.ts` generates 144 two-node
+orderings and runs all of them on a plain `yarn test` (~12s of that package's ~2m46s suite);
+`INDEX_SWEEP_CORE_ONLY=1` cuts it to a 12-case subset for a tight inner loop. Nothing in `yarn
+test`, `yarn test:integration` or `yarn check` sets it, so every scripted run is the full sweep.
 
 ## Dependencies
 

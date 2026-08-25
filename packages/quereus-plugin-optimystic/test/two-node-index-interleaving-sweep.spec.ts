@@ -19,27 +19,36 @@
  *   index        — index created before the first rows, or after them (backfill)
  *   write        — A then B, B then A, or both staged in open transactions before
  *                  either commits
- *   read         — whether each node runs an index-routed seek before it writes; a
- *                  node that invents an index collection and only READS it never
- *                  takes the write path's reconcile
+ *   read         — whether each node runs an index-routed seek, for its OWN value on its
+ *                  own database, before it writes; a node that invents an index
+ *                  collection and reaches it by read never takes the write path's
+ *                  reconcile. (No case reads a value only the SIBLING writes — see
+ *                  `runPreReads` for what that leaves uncovered.)
  *   token        — the two nodes write the same indexed value or distinct ones (every
  *                  pre-existing case lands both nodes on the same token; the
  *                  downstream scenario redeems distinct ones)
  *
- * Running it. The full cross product is 144 cases and measured 32s (median 208ms per
- * case) against this package's 2m21s suite — a 23% tax on every routine run, so it is
- * gated. A routine `yarn test` runs the 12-case CORE_CASES subset (~3s); the full
- * sweep runs whenever `OPTIMYSTIC_INTEGRATION=1` is set, which means `yarn
- * test:integration` and the `yarn check` pre-release gate DO exercise every ordering.
- * `RUN_INDEX_SWEEP=1` is the standalone escape hatch for someone chasing this bug who
- * does not want to drag in the real-socket specs:
+ * Running it. All 144 orderings run on EVERY `yarn test` — the sweep is not gated,
+ * because a sweep that only runs when someone remembers a flag cannot catch the bug it
+ * exists for. Measured on this package: the file takes 13s wide against a 2m46s suite,
+ * and the 12-case CORE_CASES subset it replaces took 1s, so running wide costs ~12s —
+ * about 7% of the suite. Re-measure with, from this package:
  *
- *   RUN_INDEX_SWEEP=1 node --import ./register.mjs node_modules/mocha/bin/mocha.js \
- *     "test/two-node-index-interleaving-sweep.spec.ts" --reporter spec --exit
+ *   # wide (the default) and narrow, for the delta
+ *   node --import ./register.mjs node_modules/mocha/bin/mocha.js \
+ *     "test/two-node-index-interleaving-sweep.spec.ts" --reporter min --exit
+ *   INDEX_SWEEP_CORE_ONLY=1 node --import ./register.mjs node_modules/mocha/bin/mocha.js \
+ *     "test/two-node-index-interleaving-sweep.spec.ts" --reporter min --exit
  *
- * NOTE: 144 cases is affordable only because the mock mesh is in-process. Adding a
- * dimension multiplies the count — re-measure before doing it, and note that the same
- * sweep over the real-libp2p harness would not fit any routine run.
+ * `INDEX_SWEEP_CORE_ONLY=1` narrows to CORE_CASES for a tight inner loop. It is a
+ * convenience, not a CI setting: nothing in `yarn test`, `yarn test:integration` or
+ * `yarn check` sets it, so every one of them runs all 144.
+ *
+ * NOTE: 144 cases is affordable only because the mock mesh is in-process, and only while
+ * the whole file stays a small fraction of the suite. Adding a dimension MULTIPLIES the
+ * count — re-measure with the commands above before doing it, and gate rather than
+ * ungate if the delta stops being small. The same sweep over the real-libp2p harness
+ * would not fit any routine run at all.
  *
  * If a generated case goes red, that IS the reproduction the four prior passes were
  * looking for — the case name states the exact ordering. Do not narrow the generator,
@@ -93,9 +102,15 @@ const DECLARERS = ['A', 'B'] as const;
 const OPENS = ['redeclare', 'hydrate', 'both-invent'] as const;
 /** Index declared before the seed row, or after it (the backfill path). */
 const INDEX_TIMINGS = ['index-first', 'rows-first'] as const;
-/** Order the two nodes' post-setup writes land in. */
+/**
+ * Order the two nodes' post-setup writes land in. `a-then-b` and `b-then-a` are the two
+ * sequential orders; `staged-both` is a different KIND of value — it stages both mutations
+ * before either commits, and pins the commit order to A-then-B. So "both staged, B commits
+ * first" is covered and "both staged, A commits second" is not; tracked with the generator's
+ * other coverage gaps in `debt-index-sweep-misses-update-delete-and-orphans`.
+ */
 const WRITE_ORDERS = ['a-then-b', 'b-then-a', 'staged-both'] as const;
-/** Whether each node index-seeks its own token before writing it. */
+/** Whether each node index-seeks its OWN token, on its own database, before writing it. */
 const READS = ['read-first', 'write-first'] as const;
 /** Both nodes write the seed's token, or each writes its own distinct one. */
 const TOKENS = ['same-token', 'distinct-tokens'] as const;
@@ -132,12 +147,29 @@ function allCases(): Case[] {
 	return cases;
 }
 
+/** The dimension tables by name, so the coverage guard iterates them instead of restating them. */
+const DIMENSIONS = {
+	declare: DECLARERS, open: OPENS, index: INDEX_TIMINGS,
+	write: WRITE_ORDERS, read: READS, token: TOKENS,
+} as const satisfies { [K in keyof Case]: readonly Case[K][] };
+
 /**
- * The subset a routine `yarn test` runs. Chosen, not sampled: every value of every
- * dimension appears at least four times, and the pairs that plausibly interact
- * ({@link COVERED_PAIRS}) are covered exhaustively. The `core subset` describe below
- * re-checks BOTH halves of that claim against the dimension tables, so the subset cannot
- * silently degrade under a later edit.
+ * Dimension pairs the core subset covers exhaustively — the ones where the two values
+ * plausibly interact rather than compose independently (how the second node opens the
+ * table interacts with who declared it and with when the index appeared; write order
+ * interacts with whether a read preceded it and with whether the tokens collide).
+ */
+const COVERED_PAIRS: [keyof Case, keyof Case][] = [
+	['declare', 'open'], ['open', 'index'], ['write', 'read'], ['write', 'token'],
+];
+
+/**
+ * The subset `INDEX_SWEEP_CORE_ONLY=1` narrows to — an inner-loop convenience, NOT what
+ * any script runs (see the header). Chosen, not sampled: every value of every dimension
+ * appears at least four times, and the pairs that plausibly interact ({@link COVERED_PAIRS})
+ * are covered exhaustively. The `core subset` describe below re-checks BOTH halves of that
+ * claim against the dimension tables, so the subset cannot silently degrade under a later
+ * edit — and it runs even when the subset itself does not.
  */
 const CORE_CASES: Case[] = [
 	{ declare: 'A', open: 'redeclare', index: 'index-first', write: 'a-then-b', read: 'write-first', token: 'same-token' },
@@ -154,9 +186,11 @@ const CORE_CASES: Case[] = [
 	{ declare: 'B', open: 'redeclare', index: 'index-first', write: 'b-then-a', read: 'write-first', token: 'distinct-tokens' },
 ];
 
-/** See the header comment for why the wide sweep is gated and where it still runs. */
-const RUN_FULL_SWEEP =
-	process.env.OPTIMYSTIC_INTEGRATION === '1' || process.env.RUN_INDEX_SWEEP === '1';
+/**
+ * Wide by default — see the header comment for the measurement that says it can afford to
+ * be. The var only NARROWS, so no CI path can accidentally run less than everything.
+ */
+const RUN_FULL_SWEEP = process.env.INDEX_SWEEP_CORE_ONLY !== '1';
 
 // --- case execution --------------------------------------------------------------
 
@@ -212,11 +246,15 @@ async function runSetup(c: Case, first: Node, second: Node): Promise<void> {
 }
 
 /**
- * Each node index-seeks the token it is ABOUT to write. On a collection this node
- * invented, that read is the arm that never takes the write path's reconcile — the
- * shape a secondary-index sub-collection has on a sibling that only reads the indexed
- * table. The row set is not asserted here (the value may not exist yet); the point is
+ * Each node index-seeks the token it is ABOUT to write, on its OWN database. On a
+ * collection this node invented, that read is the arm that never takes the write path's
+ * reconcile. The row set is not asserted here (the value may not exist yet); the point is
  * that the read happened before the write.
+ *
+ * Note what this deliberately does NOT produce: no node ever seeks a value only the SIBLING
+ * will write, so the read-only-sibling shape — a node that touches an index collection
+ * exclusively through reads of someone else's value — is not covered by any case here.
+ * Tracked in `debt-index-sweep-misses-update-delete-and-orphans`.
  */
 async function runPreReads(c: Case, nodes: Record<'A' | 'B', Node>): Promise<void> {
 	const tokens = tokensFor(c);
@@ -271,10 +309,47 @@ async function expectScansConverged(c: Case, nodes: Record<'A' | 'B', Node>): Pr
 
 const SELECTED = RUN_FULL_SWEEP ? allCases() : CORE_CASES;
 
-// The title states which arm ran, so nobody reads a green routine suite as "all 144
-// orderings passed" when only the core subset was selected.
+/*
+ * Pure data — deliberately its own describe so it needs no mesh, and so a harness that
+ * fails to come up cannot take this guard down with it. It guards what the CORE_CASES
+ * comment claims: if a later edit drops, duplicates, or narrows entries, the routine run
+ * quietly stops covering some ordering, and that must fail loudly rather than go unnoticed
+ * behind a green 12-case run.
+ */
+describe('Two-node secondary-index interleaving sweep — core subset coverage', () => {
+	it('names each ordering exactly once', () => {
+		const names = CORE_CASES.map(caseName);
+		expect(new Set(names).size, `duplicate core case: ${names.join(' / ')}`).to.equal(names.length);
+	});
+
+	it('covers every value of every dimension at least four times', () => {
+		for (const [dimension, values] of Object.entries(DIMENSIONS)) {
+			for (const value of values) {
+				const hits = CORE_CASES.filter(c => c[dimension as keyof Case] === value).length;
+				expect(hits, `core subset covers ${dimension}=${value}`).to.be.greaterThanOrEqual(4);
+			}
+		}
+	});
+
+	// The half the prose used to assert on its own: a subset can hold every dimension VALUE
+	// while missing a combination entirely, which is the coverage that actually matters here.
+	for (const [left, right] of COVERED_PAIRS) {
+		it(`covers every ${left} × ${right} combination`, () => {
+			const present = new Set(CORE_CASES.map(c => `${c[left]}|${c[right]}`));
+			for (const l of DIMENSIONS[left]) {
+				for (const r of DIMENSIONS[right]) {
+					expect(present.has(`${l}|${r}`), `core subset covers ${left}=${l} with ${right}=${r}`)
+						.to.equal(true);
+				}
+			}
+		});
+	}
+});
+
+// The title states which arm ran, so a green run under INDEX_SWEEP_CORE_ONLY is never
+// mistaken for "all 144 orderings passed".
 describe(`Two-node secondary-index interleaving sweep (${SELECTED.length} of ${allCases().length} orderings; ` +
-	`${RUN_FULL_SWEEP ? 'full sweep' : 'core subset — OPTIMYSTIC_INTEGRATION=1 or RUN_INDEX_SWEEP=1 for all'})`, function () {
+	`${RUN_FULL_SWEEP ? 'full sweep' : 'core subset only — unset INDEX_SWEEP_CORE_ONLY for all'})`, function () {
 	this.timeout(120_000);
 
 	let mesh: Mesh;
@@ -296,6 +371,12 @@ describe(`Two-node secondary-index interleaving sweep (${SELECTED.length} of ${a
 		return t;
 	};
 
+	// NOTE: nothing closes these Databases, and nothing tears the mesh down — the mesh is a
+	// pure in-process mock over MemoryRawStorage with no sockets or timers to release, and
+	// the sibling two-node specs leave theirs open the same way. Harmless at the size the
+	// header measures (288 Databases across the wide arm), but it is per-case garbage that
+	// grows with the case count: if a widened sweep slows down or runs the heap up, close
+	// each node in an afterEach before looking anywhere else.
 	function createNode(transactor: ITransactor): Node {
 		const db = new Database();
 		const config = {
@@ -315,21 +396,6 @@ describe(`Two-node secondary-index interleaving sweep (${SELECTED.length} of ${a
 		}
 		return { db, plugin };
 	}
-
-	// Guards the claim CORE_CASES documents: if a later edit drops or narrows entries,
-	// the routine run stops covering some ordering and this fails instead of going quiet.
-	it('keeps the core subset covering every value of every dimension', () => {
-		const dimensions: Record<string, readonly string[]> = {
-			declare: DECLARERS, open: OPENS, index: INDEX_TIMINGS,
-			write: WRITE_ORDERS, read: READS, token: TOKENS,
-		};
-		for (const [dimension, values] of Object.entries(dimensions)) {
-			for (const value of values) {
-				const hits = CORE_CASES.filter(c => c[dimension as keyof Case] === value).length;
-				expect(hits, `core subset covers ${dimension}=${value}`).to.be.greaterThanOrEqual(4);
-			}
-		}
-	});
 
 	for (const testCase of SELECTED) {
 		it(caseName(testCase), async () => {
