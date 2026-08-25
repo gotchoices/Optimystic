@@ -15,6 +15,7 @@ import {
 	quorumSize, corroboratorCapacity, selectQuorumRev, selectQuorumBlock, canonicalBlockHash,
 	type RevClaim, type BlockHashCandidate
 } from '../src/cluster/quorum-restore.js';
+import { resolveClusterPolicy } from '../src/cluster/cluster-policy.js';
 
 const THRESHOLD = 0.51;
 
@@ -82,6 +83,84 @@ describe('quorum-restore primitives', () => {
 			expect(corroboratorCapacity(0, 1)).to.equal(0);
 			expect(corroboratorCapacity(0, 0)).to.equal(0);
 			expect(selectQuorumRev([], THRESHOLD, corroboratorCapacity(0, 1))).to.equal(undefined);
+		});
+	});
+
+	/**
+	 * Ticket: repair-deadlock-is-never-named.
+	 *
+	 * The rule an OPERATOR needs, stated as a count of machines rather than as a restatement of the
+	 * formula: **how many cohort peers besides the reader have to answer that reader, and agree,
+	 * before a repair can converge?** Everything else in this file pins the arithmetic; this pins the
+	 * consequence, so the arithmetic cannot drift underneath the advisory text in
+	 * `cluster-policy.ts`, the `cluster-fetch:repair-deadlock` message in `CoordinatorRepo`, or
+	 * `docs/internals.md` without a spec turning red.
+	 *
+	 * Read through the composition root (`resolveClusterPolicy`) rather than by hand, because that is
+	 * the layer a real deployment runs on and the layer where a wrong default has hidden before.
+	 */
+	describe('how many answering peers a repair needs, by deployment size', () => {
+		/**
+		 * The smallest number of ANSWERING cohort peers (reader excluded) that can carry a repair to
+		 * convergence, given a deployment of `nodes` machines. `undefined` means no number of answering
+		 * peers is enough — the deployment can never repair a block, however healthy it is.
+		 *
+		 * Every peer is assumed to answer with the same `(rev, actionId)`; disagreement only ever makes
+		 * the requirement harder, so this is the optimistic bound.
+		 */
+		const answeringPeersNeeded = (
+			opts: { nodes: number; clusterSize?: number; declared?: number }
+		): number | undefined => {
+			const policy = resolveClusterPolicy({
+				clusterSize: opts.clusterSize ?? opts.nodes,
+				...(opts.declared !== undefined ? { clusterPolicy: { assumedClusterSize: opts.declared } } : {})
+			});
+			// What `CoordinatorRepo.queryClusterForLatest` computes: capacity from the peers VISIBLE in
+			// the cohort (self excluded), quorum from the peers that actually answered.
+			const cohortPeers = opts.nodes - 1;
+			const capacity = corroboratorCapacity(cohortPeers, policy.repairCorroborationClusterSize);
+			for (let answering = 1; answering <= cohortPeers; answering++) {
+				if (answering >= quorumSize(answering, policy.simpleMajorityThreshold, capacity)) return answering;
+			}
+			return undefined;
+		};
+
+		it('needs TWO answering peers besides the reader once the deployment is three machines or more', () => {
+			for (const nodes of [3, 4, 5, 6]) {
+				expect(answeringPeersNeeded({ nodes }), `${nodes} machines, size undeclared`).to.equal(2);
+				expect(answeringPeersNeeded({ nodes, declared: nodes }), `${nodes} machines, size declared`).to.equal(2);
+			}
+		});
+
+		it('gives a three-machine deployment ZERO fault tolerance — it has two peers and needs both', () => {
+			const cohortPeers = 3 - 1;
+			expect(answeringPeersNeeded({ nodes: 3 })).to.equal(cohortPeers);
+			expect(answeringPeersNeeded({ nodes: 3, declared: 3 })).to.equal(cohortPeers);
+			// One peer unreachable FROM THIS READER — healthy and reachable from everyone else — and
+			// this reader's copy is unrepairable for as long as that holds.
+			expect(answeringPeersNeeded({ nodes: 3 })).to.be.greaterThan(cohortPeers - 1);
+		});
+
+		it('gives four machines the first real margin — one peer may be unreachable', () => {
+			for (const nodes of [4, 5, 6]) {
+				const cohortPeers = nodes - 1;
+				expect(answeringPeersNeeded({ nodes }), `${nodes} machines`).to.be.at.most(cohortPeers - 1);
+			}
+		});
+
+		it('lets a two-machine deployment converge on its single peer — but only once its size is stated', () => {
+			// An honest clusterSize: 2 is one way to state it...
+			expect(answeringPeersNeeded({ nodes: 2 })).to.equal(1);
+			// ...and clusterPolicy.assumedClusterSize: 2 is the other, without lowering replication.
+			expect(answeringPeersNeeded({ nodes: 2, clusterSize: 10, declared: 2 })).to.equal(1);
+			// It still has no margin at all: its one peer must answer every single pass.
+			expect(answeringPeersNeeded({ nodes: 2 })).to.equal(2 - 1);
+		});
+
+		it('leaves an UNSTATED two-machine deployment unable to repair anything, ever', () => {
+			// repairCorroborationClusterSize falls back to clusterSize (10 by default), so the floor of
+			// two never relaxes and the single peer can never second itself. No answering count helps.
+			expect(answeringPeersNeeded({ nodes: 2, clusterSize: 10 })).to.equal(undefined);
 		});
 	});
 

@@ -126,8 +126,8 @@ export type ResolvedClusterPolicy = ClusterConsensusConfig & {
 /**
  * Apply every cluster-policy default a node needs. Same options in, same numbers out, so the
  * composition root's behavior is unit-testable (`test/cluster-policy.spec.ts`). Its one side effect
- * is the `assumed-cluster-size-unset` advisory below, which lives here because this is the only place
- * that knows the resolution produced a self-defeating combination.
+ * is the `repair-fault-tolerance` advisory below, which lives here because this is the only place
+ * that knows the resolution produced a combination with no repair margin — or none at all.
  */
 export function resolveClusterPolicy(options: ClusterPolicyOptions): ResolvedClusterPolicy {
 	// undefined here means "the operator said nothing", which is the only case where the two
@@ -143,37 +143,85 @@ export function resolveClusterPolicy(options: ClusterPolicyOptions): ResolvedClu
 	const clusterSize = options.clusterSize ?? DEFAULT_CLUSTER_SIZE;
 	const repairCorroborationClusterSize = declaredCohortSize ?? clusterSize;
 
-	// Called once per node (resolveClusterPolicy runs once at construction), so this fires once per
-	// node startup, not per repair — a per-attempt warn on a busy node would be noise that gets
-	// filtered, defeating the point. Fires purely off configuration (not an observed cohort), so a
-	// deployment that genuinely runs `clusterSize` machines sees it too; worded as a conditional
-	// ("if you run fewer than N machines") rather than a fault for exactly that reason.
+	// ## What the advisory actually claims, and why the trigger is what it is
 	//
-	// The machine count in the message is CORROBORATION_FLOOR + 1, NOT repairCorroborationClusterSize:
-	// `corroboratorCapacity` caps only the FLOOR of two (`quorum-restore.ts`), so a cohort with two
-	// peers besides the reader meets it whatever the declared size. What an undeclared size costs is
-	// the relaxation below two, which is only reachable when repairCorroborationClusterSize <= 2.
-	// NOTE: only the UNDECLARED case warns. An operator who declares an assumedClusterSize larger than
-	// the cohort they actually run is equally unable to repair and gets no warning — deliberate, since
-	// a declaration is an explicit assertion and this function has no observed cohort to contradict it
-	// with. If `feat-admission-floor-from-observed-cohort-high-water-mark` ever lands (deriving the
-	// yardstick from observation), that warning becomes cheap and worth adding here.
-	if (declaredCohortSize === undefined && clusterSize > minAbsoluteClusterSize) {
-		const minimumSelfHealingDeployment = CORROBORATION_FLOOR + 1;
-		log('assumed-cluster-size-unset', {
+	// The rule it states is measurable, not rhetorical: sweep `corroboratorCapacity` and `quorumSize`
+	// over real cohort sizes and every configuration lands on the same requirement — **2 cohort peers
+	// BESIDES the reader must answer that reader and agree on the same (rev, actionId)**, relaxed to 1
+	// only for a cohort DECLARED smaller than three. Two consequences follow, and both are worth
+	// saying out loud because both surprised people in the field:
+	//
+	//  - Fewer than three machines, undeclared, can never repair at all: the floor of two never
+	//    relaxes, because `repairCorroborationClusterSize` falls back to `clusterSize` (default 10).
+	//  - Exactly three machines is the MINIMUM that can ever repair, not a size at which repair is
+	//    safe. The reader has exactly two peers and needs both, so a single peer unreachable FROM THAT
+	//    READER — perfectly healthy and reachable from everybody else — leaves that reader's copy
+	//    permanently unrepairable. Four machines is the first size with any margin.
+	//
+	// So the trigger is a union of two conditions, not one:
+	//
+	//  - **undeclared** (the original case): the operator has asserted nothing, so a deployment
+	//    smaller than three would be silently unrepairable. Conditional wording ("if you run fewer
+	//    than N machines"), never a fault — this fires off configuration, not an observed cohort, so a
+	//    correctly-provisioned large deployment sees it too.
+	//  - **resolved cohort <= CORROBORATION_FLOOR + 1**, whether declared or not. Declaring
+	//    `assumedClusterSize: 3` does not conjure a third peer; it has exactly the same zero tolerance
+	//    as an undeclared three. The earlier "a declaration is an explicit assertion we cannot
+	//    contradict" reasoning holds for whether the NUMBER is honest — it does not hold for the
+	//    fragility implied by the number itself, which is arithmetic.
+	//
+	// Still one line per node construction (`resolveClusterPolicy` runs once), never per repair: a
+	// per-attempt warn on a busy node is noise that gets filtered, which defeats the point. The
+	// per-repair half of this — naming a decline that is provably permanent — lives at the repair site
+	// instead (`CoordinatorRepo.reportRepairDeadlock`, `cluster-fetch:repair-deadlock`), where the
+	// actual cohort is known.
+	//
+	// NOTE: an operator who declares an assumedClusterSize LARGER than the cohort they actually run is
+	// equally unable to repair and still gets no fault — this function has no observed cohort to
+	// contradict the declaration with, and the undeclared arm's conditional wording is the closest it
+	// can honestly get. If `feat-admission-floor-from-observed-cohort-high-water-mark` ever lands
+	// (deriving the yardstick from observation), that check becomes cheap and belongs here.
+	const minimumSelfHealingDeployment = CORROBORATION_FLOOR + 1;
+	const cohortUndeclared = declaredCohortSize === undefined && clusterSize > minAbsoluteClusterSize;
+	const noRepairMargin = repairCorroborationClusterSize <= minimumSelfHealingDeployment;
+	if (cohortUndeclared || noRepairMargin) {
+		// How many peers besides the reader must answer and agree, at the resolved size. Two once the
+		// cohort is three or larger; one for a cohort declared at two, which is the only size whose
+		// floor relaxes. Never below one — a claim nobody made is never accepted.
+		const requiredAnsweringPeers = Math.max(1, Math.min(CORROBORATION_FLOOR, repairCorroborationClusterSize - 1));
+		const availablePeers = Math.max(0, repairCorroborationClusterSize - 1);
+		const rule =
+			`Block repair (read-repair and reconcile) converges only when ${CORROBORATION_FLOOR} cohort peers ` +
+			`BESIDES the reader answer that reader and agree on the same (rev, actionId); that requirement drops ` +
+			`to 1 only for a cohort that DECLARES it is smaller than ${minimumSelfHealingDeployment}. ` +
+			`${minimumSelfHealingDeployment} machines is therefore the MINIMUM that can repair at all, not a safe ` +
+			`size — at exactly ${minimumSelfHealingDeployment} the reader has two peers and needs both, so one ` +
+			`peer unreachable from that reader (healthy and reachable from everyone else) leaves that reader's ` +
+			`copy permanently unrepairable. ${minimumSelfHealingDeployment + 1} machines is the first size with ` +
+			`any margin.`;
+		const undeclaredAdvice = cohortUndeclared
+			? ` No clusterPolicy.assumedClusterSize declared, so the floor is measured against ` +
+			`repairCorroborationClusterSize=${repairCorroborationClusterSize} and never relaxes: if you actually ` +
+			`run fewer than ${minimumSelfHealingDeployment} machines, every repair declines, permanently. Set ` +
+			`clusterPolicy.assumedClusterSize to your real cohort size; it does not lower ` +
+			`clusterSize=${clusterSize} (the replication factor). Larger deployments can ignore this.`
+			: '';
+		const noMarginAdvice = noRepairMargin
+			? ` This node resolved repairCorroborationClusterSize=${repairCorroborationClusterSize}, which leaves ` +
+			`repair with NO fault tolerance: the reader has ${availablePeers} cohort peer(s) and needs ` +
+			`${requiredAnsweringPeers} of them to answer, so losing one is not survivable. Run at least ` +
+			`${minimumSelfHealingDeployment + 1} machines if repair must survive an unreachable peer.`
+			: '';
+		log('repair-fault-tolerance', {
 			clusterSize,
 			repairCorroborationClusterSize,
 			corroborationFloor: CORROBORATION_FLOOR,
+			declaredCohortSize,
+			cohortUndeclared,
+			noRepairMargin,
+			requiredAnsweringPeers,
 			minimumSelfHealingDeployment,
-			message:
-				`No clusterPolicy.assumedClusterSize declared: block repair (read-repair and reconcile) requires ` +
-				`${CORROBORATION_FLOOR} distinct corroborating peers other than the reader, and that floor is ` +
-				`relaxed only for a cohort that DECLARES it is smaller — with ` +
-				`repairCorroborationClusterSize=${repairCorroborationClusterSize} it never relaxes. So a deployment ` +
-				`that actually runs fewer than ${minimumSelfHealingDeployment} machines can never supply the floor ` +
-				`and every repair declines, permanently. If you run fewer than ${minimumSelfHealingDeployment} ` +
-				`machines, set clusterPolicy.assumedClusterSize to your real cohort size; it does not lower ` +
-				`clusterSize=${clusterSize} (the replication factor). Larger deployments can ignore this.`
+			message: rule + undeclaredAdvice + noMarginAdvice
 		});
 	}
 

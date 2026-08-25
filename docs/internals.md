@@ -478,10 +478,48 @@ saveMaterializedBlock(block): store(structuredClone(block));
   back to `clusterSize` when it is absent — deliberately the strict fallback, so an unconfigured
   node keeps the floor of two. A genuine small deployment declares
   `clusterPolicy.assumedClusterSize` to heal, which — unlike lowering `clusterSize` — does not
-  also lower its replication factor. A node that leaves it undeclared says so once at startup
-  (`assumed-cluster-size-unset`), naming the resolved `repairCorroborationClusterSize` and the
-  smallest deployment that can still heal — the corroboration floor of two plus the reader, i.e.
-  three machines. No rev quorum, or no content quorum →
+  also lower its replication factor.
+
+  **How many machines repair actually needs** (swept over `resolveClusterPolicy` +
+  `corroboratorCapacity` + `quorumSize`, and pinned in `test/quorum-restore.spec.ts` under *how
+  many answering peers a repair needs, by deployment size*):
+
+  | machines | cohort size declared? | peers besides the reader | peers that must answer *that reader* | can repair? |
+  | --- | --- | --- | --- | --- |
+  | 2 | no (falls back to `clusterSize`, default 10) | 1 | 2 | **never** |
+  | 2 | yes (`assumedClusterSize: 2`, or an honest `clusterSize: 2`) | 1 | 1 | yes, with no margin |
+  | 3 | either | 2 | 2 | yes, with **no margin** |
+  | 4+ | either | 3+ | 2 | yes, survives one unreachable peer |
+
+  Two consequences are worth stating plainly, because both have cost real debugging time.
+  **Three machines is the minimum that can ever repair, not a size at which repair is safe**: the
+  reader has exactly two peers and needs both, so one peer unreachable *from that reader* — healthy
+  and reachable from everyone else — leaves that reader's copy permanently unrepairable. And
+  **declaring `assumedClusterSize: 3` does not conjure a third peer**; it has the same zero
+  tolerance as an undeclared three. Four machines is the first size with any margin.
+
+  Two signals name this rather than leaving it to be re-derived from logs:
+
+  - **`repair-fault-tolerance`** (`cluster/cluster-policy.ts`), once per node construction, when
+    the cohort size is undeclared *or* the resolved `repairCorroborationClusterSize` is three or
+    fewer. It states the requirement, names the remedy, and says which of the two conditions fired
+    (`cohortUndeclared`, `noRepairMargin`). It fires purely off configuration, so a
+    correctly-provisioned large deployment sees the undeclared arm too — advisory, not a fault.
+    (This is the renamed, widened successor to `assumed-cluster-size-unset`, which fired only when
+    the size was undeclared and told operators three machines "can ignore this".)
+  - **`cluster-fetch:repair-deadlock`** (`CoordinatorRepo.reportRepairDeadlock`), once per block,
+    when a decline is provably permanent: every cohort peer this node can see answered, they agreed,
+    and there were still not enough of them. With nobody silent, no partition and no attacker
+    produced the shortfall — it follows from the machine count and the configuration and will hold
+    on every later pass. A pass with *any* silent peer is deliberately excluded (a silent peer may
+    return, and a reader cannot tell an unreachable peer from a withholding one), as is a decline
+    where the voters did show up and disagreed. Those keep the per-pass `cluster-fetch:no-quorum`
+    line, which still fires on every decline. The once-per-block suppression hangs off the existing
+    `unsettledAheadClaims` entry and clears when the block converges. The reader-facing error is
+    *not* yet aware of this: `BlockPossiblyStaleError` still implies a retry might help, which is
+    wrong advice for a deadlocked repair — see the `NOTE:` at `reportRepairDeadlock`.
+
+  No rev quorum, or no content quorum →
   it leaves the block for a later churn/rebalance retry (logged
   `reconcile:no-rev-quorum` / `reconcile:no-content-quorum`). Reconciliation is
   best-effort and bounded (`ReconcileTimeoutMs`, the shared `RECONCILE_TIMEOUT_MS` the read

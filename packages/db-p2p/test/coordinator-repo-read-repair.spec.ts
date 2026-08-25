@@ -670,4 +670,277 @@ describe('CoordinatorRepo read-repair', () => {
 			expect(invocations.length, 'second read must retry rather than be suppressed').to.be.greaterThan(afterFirst);
 		});
 	});
+
+	/**
+	 * Ticket: repair-deadlock-is-never-named.
+	 *
+	 * `cluster-fetch:no-quorum` fires on every declining pass and cannot say whether the decline was
+	 * transient (a peer did not answer; it may next time) or permanent (every peer that exists
+	 * answered, and there still were not enough of them). The field symptom was 1821 identical
+	 * no-quorum lines, no error of any kind, and twelve days spent re-deriving from those logs a fact
+	 * the node knew at the moment of each decline. `cluster-fetch:repair-deadlock` says it once, in
+	 * words, and only when it is provable.
+	 */
+	describe('naming a repair that can never converge', () => {
+		const DEADLOCK = 'cluster-fetch:repair-deadlock';
+		const localRev = 1;
+		const localActionId = 'local-action';
+		const deadlockLines = (captured: unknown[][]) =>
+			captured.filter(args => typeof args[0] === 'string' && args[0].includes(DEADLOCK));
+
+		it('says it once for a shortfall where every cohort peer answered', async () => {
+			// Three machines: the reader plus two peers. One peer claims a newer rev, the other answers
+			// honestly that it holds nothing — still an ANSWER. Nobody is silent, so the two agreeing
+			// voters this cohort needs do not exist and never will at this size.
+			const localPeer = await makePeerId();
+			const claimant = await makePeerId();
+			const emptyPeer = await makePeerId();
+			const cluster = makeClusterPeers([localPeer, claimant, emptyPeer]);
+
+			const clusterLatestCallback: ClusterLatestCallback = async (peerId) => {
+				if (peerId.equals(localPeer)) return { actionId: localActionId, rev: localRev };
+				if (peerId.equals(claimant)) return { actionId: 'remote-action', rev: 2 };
+				return undefined; // answered: holds nothing
+			};
+
+			const { repo: storageRepo, calls } = makePresentStorageRepo(blockId, localRev, localActionId);
+			const repo = new CoordinatorRepo(
+				makeKeyNetwork(cluster),
+				makeClusterClient,
+				storageRepo,
+				{ clusterSize: 3, readRepairMode: 'paranoid' },
+				undefined,
+				localPeer,
+				undefined,
+				clusterLatestCallback
+			);
+
+			const captured = await captureCoordinatorLog(async () => { await repo.get({ blockIds: [blockId] }); });
+
+			expect(calls.find(c => c.context !== undefined), 'a lone claim must still not be adopted').to.equal(undefined);
+			expect(hasTag(captured, 'cluster-fetch:no-quorum'), 'the per-pass decline line still fires').to.equal(true);
+			expect(deadlockLines(captured), 'expected exactly one deadlock line').to.have.lengthOf(1);
+
+			const payload = deadlockLines(captured)[0]![1] as {
+				cohortPeers?: number, answered?: number, claimants?: number, required?: number,
+				repairCorroborationClusterSize?: number, message?: string
+			};
+			expect(payload.cohortPeers, 'two cohort peers besides the reader').to.equal(2);
+			expect(payload.answered, 'and both of them answered').to.equal(2);
+			expect(payload.claimants, 'only one of the two actually holds the block').to.equal(1);
+			expect(payload.required).to.equal(2);
+			expect(payload.repairCorroborationClusterSize).to.equal(3);
+			// It must say the word, and it must name the remedy — that is the whole point.
+			expect(payload.message).to.contain('PERMANENT');
+			expect(payload.message).to.contain('clusterPolicy.assumedClusterSize');
+		});
+
+		it('stays quiet when a peer was SILENT — that shortfall may fix itself', async () => {
+			// Same shortfall, different cause: the second peer could not be asked at all. A reader
+			// cannot tell an unreachable peer from a withholding one, so nothing here is provable and
+			// the plain no-quorum line is the honest answer.
+			const localPeer = await makePeerId();
+			const claimant = await makePeerId();
+			const unreachable = await makePeerId();
+			const cluster = makeClusterPeers([localPeer, claimant, unreachable]);
+
+			const clusterLatestCallback: ClusterLatestCallback = async (peerId) => {
+				if (peerId.equals(localPeer)) return { actionId: localActionId, rev: localRev };
+				if (peerId.equals(claimant)) return { actionId: 'remote-action', rev: 2 };
+				throw new Error('dial failed');
+			};
+
+			const { repo: storageRepo } = makePresentStorageRepo(blockId, localRev, localActionId);
+			const repo = new CoordinatorRepo(
+				makeKeyNetwork(cluster),
+				makeClusterClient,
+				storageRepo,
+				{ clusterSize: 3, readRepairMode: 'paranoid' },
+				undefined,
+				localPeer,
+				undefined,
+				clusterLatestCallback
+			);
+
+			const captured = await captureCoordinatorLog(async () => { await repo.get({ blockIds: [blockId] }); });
+
+			expect(hasTag(captured, 'cluster-fetch:peers-silent')).to.equal(true);
+			expect(hasTag(captured, 'cluster-fetch:no-quorum')).to.equal(true);
+			expect(deadlockLines(captured), 'silence proves nothing permanent').to.have.lengthOf(0);
+		});
+
+		it('stays quiet when the decline was a genuine disagreement between claims', async () => {
+			// Four machines, three peers: two of them claim DIFFERENT (rev, actionId) pairs and the
+			// third holds nothing. Enough voters showed up for the quorum of two; they simply do not
+			// agree. That is a live cohort split — a later pass can settle it — not a deadlock.
+			const localPeer = await makePeerId();
+			const peerA = await makePeerId();
+			const peerB = await makePeerId();
+			const peerC = await makePeerId();
+			const cluster = makeClusterPeers([localPeer, peerA, peerB, peerC]);
+
+			const clusterLatestCallback: ClusterLatestCallback = async (peerId) => {
+				if (peerId.equals(localPeer)) return { actionId: localActionId, rev: localRev };
+				if (peerId.equals(peerA)) return { actionId: 'action-x', rev: 2 };
+				if (peerId.equals(peerB)) return { actionId: 'action-y', rev: 3 };
+				return undefined;
+			};
+
+			const { repo: storageRepo, calls } = makePresentStorageRepo(blockId, localRev, localActionId);
+			const repo = new CoordinatorRepo(
+				makeKeyNetwork(cluster),
+				makeClusterClient,
+				storageRepo,
+				{ clusterSize: 4, readRepairMode: 'paranoid' },
+				undefined,
+				localPeer,
+				undefined,
+				clusterLatestCallback
+			);
+
+			const captured = await captureCoordinatorLog(async () => { await repo.get({ blockIds: [blockId] }); });
+
+			expect(calls.find(c => c.context !== undefined), 'a split cohort adopts nothing').to.equal(undefined);
+			expect(hasTag(captured, 'cluster-fetch:no-quorum')).to.equal(true);
+			expect(deadlockLines(captured), 'disagreement is not want of voters').to.have.lengthOf(0);
+		});
+
+		it('stays quiet when the whole cohort answers that it holds nothing', async () => {
+			// Nobody claims anything: the cohort agrees the block is absent. That is an answer, not a
+			// repair that failed — there is nothing to be deadlocked about.
+			const localPeer = await makePeerId();
+			const peerA = await makePeerId();
+			const peerB = await makePeerId();
+			const cluster = makeClusterPeers([localPeer, peerA, peerB]);
+
+			const clusterLatestCallback: ClusterLatestCallback = async (peerId) =>
+				peerId.equals(localPeer) ? { actionId: localActionId, rev: localRev } : undefined;
+
+			const { repo: storageRepo } = makePresentStorageRepo(blockId, localRev, localActionId);
+			const repo = new CoordinatorRepo(
+				makeKeyNetwork(cluster),
+				makeClusterClient,
+				storageRepo,
+				{ clusterSize: 3, readRepairMode: 'paranoid' },
+				undefined,
+				localPeer,
+				undefined,
+				clusterLatestCallback
+			);
+
+			const captured = await captureCoordinatorLog(async () => { await repo.get({ blockIds: [blockId] }); });
+
+			expect(deadlockLines(captured), 'an agreed absence is not a deadlock').to.have.lengthOf(0);
+		});
+
+		it('does not repeat across passes for the same block', async () => {
+			// The condition holds identically on every later pass; saying it 1821 times is the defect.
+			const localPeer = await makePeerId();
+			const claimant = await makePeerId();
+			const emptyPeer = await makePeerId();
+			const cluster = makeClusterPeers([localPeer, claimant, emptyPeer]);
+
+			const clusterLatestCallback: ClusterLatestCallback = async (peerId) => {
+				if (peerId.equals(localPeer)) return { actionId: localActionId, rev: localRev };
+				if (peerId.equals(claimant)) return { actionId: 'remote-action', rev: 2 };
+				return undefined;
+			};
+
+			const { repo: storageRepo } = makePresentStorageRepo(blockId, localRev, localActionId);
+			const repo = new CoordinatorRepo(
+				makeKeyNetwork(cluster),
+				makeClusterClient,
+				storageRepo,
+				{ clusterSize: 3, readRepairMode: 'paranoid' },
+				undefined,
+				localPeer,
+				undefined,
+				clusterLatestCallback
+			);
+
+			const captured = await captureCoordinatorLog(async () => {
+				await repo.get({ blockIds: [blockId] });
+				await repo.get({ blockIds: [blockId] });
+				await repo.get({ blockIds: [blockId] });
+			});
+
+			expect(deadlockLines(captured), 'said once, not once per pass').to.have.lengthOf(1);
+			// ...while the per-pass decline line keeps firing, so nothing is hidden.
+			expect(
+				captured.filter(args => typeof args[0] === 'string' && args[0].includes('cluster-fetch:no-quorum')).length,
+				'the per-pass line is untouched'
+			).to.equal(3);
+		});
+
+		it('does not repeat when the cohort claims nothing AHEAD of what the reader holds', async () => {
+			// The suppression bit is hung off the per-block freshness entry, which a consult finding no
+			// ahead-claim otherwise CLEARS. If clearing it dropped the bit too, this block would
+			// re-announce the same permanent condition on every read.
+			const localPeer = await makePeerId();
+			const claimant = await makePeerId();
+			const emptyPeer = await makePeerId();
+			const cluster = makeClusterPeers([localPeer, claimant, emptyPeer]);
+
+			const clusterLatestCallback: ClusterLatestCallback = async (peerId) => {
+				if (peerId.equals(localPeer)) return { actionId: localActionId, rev: localRev };
+				// The same revision the reader already holds: a claim, but nothing to converge onto.
+				if (peerId.equals(claimant)) return { actionId: localActionId, rev: localRev };
+				return undefined;
+			};
+
+			const { repo: storageRepo } = makePresentStorageRepo(blockId, localRev, localActionId);
+			const repo = new CoordinatorRepo(
+				makeKeyNetwork(cluster),
+				makeClusterClient,
+				storageRepo,
+				{ clusterSize: 3, readRepairMode: 'paranoid' },
+				undefined,
+				localPeer,
+				undefined,
+				clusterLatestCallback
+			);
+
+			const captured = await captureCoordinatorLog(async () => {
+				await repo.get({ blockIds: [blockId] });
+				await repo.get({ blockIds: [blockId] });
+			});
+
+			expect(deadlockLines(captured)).to.have.lengthOf(1);
+		});
+
+		it('does not repeat for a block that is MISSING locally', async () => {
+			// A missing block never consults the read-repair window and never records an ahead-claim,
+			// so this is the case the field logs were dominated by. The bit still has to hold.
+			const missingId: BlockId = 'block-not-here';
+			const localPeer = await makePeerId();
+			const claimant = await makePeerId();
+			const emptyPeer = await makePeerId();
+			const cluster = makeClusterPeers([localPeer, claimant, emptyPeer]);
+
+			const clusterLatestCallback: ClusterLatestCallback = async (peerId) => {
+				if (peerId.equals(claimant)) return { actionId: 'remote-action', rev: 4 };
+				return undefined;
+			};
+
+			// The stub reports `{ state: {} }` for every id other than `blockId` — a plain local miss.
+			const { repo: storageRepo } = makePresentStorageRepo(blockId, localRev, localActionId);
+			const repo = new CoordinatorRepo(
+				makeKeyNetwork(cluster),
+				makeClusterClient,
+				storageRepo,
+				{ clusterSize: 3, readRepairMode: 'paranoid' },
+				undefined,
+				localPeer,
+				undefined,
+				clusterLatestCallback
+			);
+
+			const captured = await captureCoordinatorLog(async () => {
+				await repo.get({ blockIds: [missingId] });
+				await repo.get({ blockIds: [missingId] });
+			});
+
+			expect(deadlockLines(captured)).to.have.lengthOf(1);
+		});
+	});
 });

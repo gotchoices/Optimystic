@@ -8,7 +8,7 @@ import { createLogger } from '../logger.js';
 import type { IPeerReputation } from "../reputation/types.js";
 import { PenaltyReason } from "../reputation/types.js";
 import type { ITransactionStateStore } from "../cluster/i-transaction-state-store.js";
-import { quorumSize, corroboratorCapacity, selectQuorumRev, type RevClaim, type QuorumRev } from "../cluster/quorum-restore.js";
+import { quorumSize, corroboratorCapacity, selectQuorumRev, CORROBORATION_FLOOR, type RevClaim, type QuorumRev } from "../cluster/quorum-restore.js";
 import { DEFAULT_CLUSTER_SIZE } from "../cluster/cluster-policy.js";
 import { RECONCILE_TIMEOUT_MS } from "../cluster/reconcile-block.js";
 import { isMissingBaseRevisionFailure, MISSING_BASE_REVISION_REASON } from "../storage/storage-repo.js";
@@ -87,6 +87,33 @@ interface ClusterLatestQuery {
 	 * this node's position (see {@link AbsenceVerdict}).
 	 */
 	answered: number;
+}
+
+/**
+ * What earlier repair passes left unresolved for one block. Two independent facts share one entry
+ * — and one map — on purpose: both are "what the last repair pass could not finish", both are
+ * cleared by the same event (the block converging), and `CoordinatorRepo` already keeps more
+ * per-block maps than anyone can hold in their head (backlog
+ * `debt-freshness-state-scattered-across-coordinator-repo`).
+ *
+ * An entry exists exactly while at least one of the two is set; both clear together in
+ * {@link CoordinatorRepo.flagUnconfirmedCurrency} once this node reaches the claimed revision.
+ */
+interface AheadClaimState {
+	/**
+	 * The cohort-claimed revision the last freshness consult could not settle — the doubt
+	 * {@link CoordinatorRepo.flagUnconfirmedCurrency} stamps onto reads served below it. Absent once a
+	 * consult finds nothing ahead of what this node holds.
+	 */
+	rev?: number;
+	/**
+	 * Whether `cluster-fetch:repair-deadlock` has already been said for this block (see
+	 * {@link CoordinatorRepo.reportRepairDeadlock}). The deadlock is a property of the deployment's
+	 * size, not of any one revision, so it survives {@link CoordinatorRepo.recordAheadClaim} clearing
+	 * `rev`: without that, a block whose cohort claims nothing *ahead* of the reader would re-announce
+	 * the same permanent condition on every single pass — the noise this line exists to replace.
+	 */
+	deadlockReported?: boolean;
 }
 
 /**
@@ -195,13 +222,13 @@ export class CoordinatorRepo implements IRepo {
 	private readonly responsibilityCache = new LruMap<string, { inCluster: boolean, expires: number }>(1000);
 	private static readonly RESPONSIBILITY_TTL_MS = 60_000;
 	private readonly lastSeenCommitMs = new LruMap<string, number>(1000);
-	/** Per block, the cohort-claimed revision the last freshness consult could not settle — the
-	 *  doubt {@link flagUnconfirmedCurrency} stamps onto reads served below it. Outlives the
-	 *  consult on purpose: the read-repair window skips consults for blocks checked recently, and
-	 *  a doubt dropped there is a stale answer served as confirmed again.
+	/** Per block, what earlier repair passes left unresolved — see {@link AheadClaimState}.
+	 *  Outlives the consult on purpose: the read-repair window skips consults for blocks checked
+	 *  recently, and a doubt dropped there is a stale answer served as confirmed again.
 	 *  NOTE: LRU-bounded like `lastSeenCommitMs`; an eviction under >1000 doubted blocks loses the
-	 *  doubt until the next consult re-derives it (one read-repair window later, at worst). */
-	private readonly unsettledAheadClaims = new LruMap<string, number>(1000);
+	 *  doubt until the next consult re-derives it (one read-repair window later, at worst) and lets
+	 *  {@link reportRepairDeadlock} say its piece a second time. */
+	private readonly unsettledAheadClaims = new LruMap<string, AheadClaimState>(1000);
 	private readonly readRepairMode: 'off' | 'lazy' | 'paranoid';
 	private readonly readRepairWindowMs: number;
 	private readonly readRepairSampleRate: number;
@@ -512,8 +539,20 @@ export class CoordinatorRepo implements IRepo {
 	 * claimed revision (see {@link flagUnconfirmedCurrency}), which is what bounds the map.
 	 */
 	private recordAheadClaim(blockId: BlockId, claimedRev: number | undefined): void {
-		if (claimedRev === undefined) this.unsettledAheadClaims.delete(blockId);
-		else this.unsettledAheadClaims.set(blockId, claimedRev);
+		const prior = this.unsettledAheadClaims.get(blockId);
+		if (claimedRev === undefined) {
+			// The consult is the authority on the CLAIM, and only on the claim. A recorded deadlock is
+			// not about any revision — it is about how many machines this deployment can field — so it
+			// outlives the claim that first exposed it and is dropped only when the block converges
+			// (see {@link flagUnconfirmedCurrency}).
+			if (prior?.deadlockReported) this.unsettledAheadClaims.set(blockId, { deadlockReported: true });
+			else this.unsettledAheadClaims.delete(blockId);
+			return;
+		}
+		this.unsettledAheadClaims.set(blockId, {
+			rev: claimedRev,
+			...(prior?.deadlockReported ? { deadlockReported: true } : {})
+		});
 	}
 
 	/**
@@ -545,14 +584,16 @@ export class CoordinatorRepo implements IRepo {
 	 * node behind the claim?" asks about.
 	 */
 	private flagUnconfirmedCurrency(results: GetBlockResults, blockId: BlockId, context?: ActionContext): void {
-		const claimedRev = this.unsettledAheadClaims.get(blockId);
+		const claimedRev = this.unsettledAheadClaims.get(blockId)?.rev;
 		if (claimedRev === undefined) return;
 		const entry = results[blockId];
 		if (!entry || entry.unavailable !== undefined) return;
 		const servedRev = entry.state?.latest?.rev;
 		if (typeof servedRev !== 'number') return;
 		if (servedRev >= claimedRev) {
-			// Caught up — by this pass's repair or by a commit that landed since. Nothing to doubt.
+			// Caught up — by this pass's repair or by a commit that landed since. Nothing to doubt, and
+			// nothing deadlocked either: repair demonstrably converged for this block, so a later
+			// non-convergence is a new episode and gets to say so again.
 			this.unsettledAheadClaims.delete(blockId);
 			return;
 		}
@@ -906,14 +947,18 @@ export class CoordinatorRepo implements IRepo {
 		const nonSelfCount = peerIds.filter(id => id !== selfId).length;
 		const answered = nonSelfCount - silent.length;
 		const capacity = corroboratorCapacity(nonSelfCount, this.repairCorroborationClusterSize);
+		const required = quorumSize(claims.length, this.simpleMajorityThreshold, capacity);
 		const selected = selectQuorumRev(claims, this.simpleMajorityThreshold, capacity);
 		if (!selected) {
 			this.log('cluster-fetch:no-quorum', {
 				blockId,
 				responders: claims.length,
-				required: quorumSize(claims.length, this.simpleMajorityThreshold, capacity),
+				required,
 				repairCorroborationClusterSize: this.repairCorroborationClusterSize
 			});
+			// ...and, when this decline is provably permanent rather than transient, say THAT once,
+			// in words. The `no-quorum` line above fires on every pass and cannot tell the two apart.
+			this.reportRepairDeadlock(blockId, claims, silent.length, nonSelfCount, answered, required);
 			// The claims themselves must not drive restoration — but their existence is
 			// evidence the caller needs: an answer served below the highest claim cannot be
 			// confirmed current (see ClusterLatestQuery.uncorroboratedRev).
@@ -936,6 +981,85 @@ export class CoordinatorRepo implements IRepo {
 		this.penalizeContradictingRevClaims(claims, selected, blockId);
 
 		return { corroborated: { actionId: selected.actionId, rev: selected.rev }, local, silent, answered };
+	}
+
+	/**
+	 * Say ONCE per block, in words, when a corroboration decline is provably PERMANENT — a
+	 * configuration deadlock rather than a transient shortage of answers.
+	 *
+	 * **What makes it provable.** With `silentCount === 0`, every cohort peer this node can see
+	 * answered. If the peers that answered still cannot supply the required number of agreeing
+	 * voters, the shortfall is not something a retry can fix: no peer was silenced, so no partition
+	 * and no attacker produced it. It follows from the deployment's machine count and its
+	 * `repairCorroborationClusterSize`, and it will hold identically on every later pass until one of
+	 * those changes. Twelve days of log archaeology went into re-deriving that fact from a thousand
+	 * identical `cluster-fetch:no-quorum` lines; the node knew it at the moment of each decline.
+	 *
+	 * **What is deliberately NOT reported.** A pass with any silent peer produces the same shortfall
+	 * and is *not* provably permanent: the silent peer may come back, and a reader cannot tell an
+	 * unreachable peer from a withholding one. Those keep the plain `no-quorum` line. Nor is a
+	 * decline where the voters DID show up and disagreed — that is a live cohort split, not a
+	 * deadlock. (With today's `quorumSize` arithmetic the want-of-voters case reduces to exactly one
+	 * claim, so `distinctPairs` can only be 1 here; the check is written generally anyway, because it
+	 * encodes the intent rather than the current numbers, and it costs one Set.)
+	 *
+	 * **Never a lever.** This only classifies and logs. Relaxing the floor because peers went silent
+	 * — including the tempting "measure capacity by who answered" variant — is precisely the attack
+	 * `corroboratorCapacity` exists to stop: a routing-level attacker who shrinks a reader's cohort
+	 * view to itself plus one accomplice produces `answered === 1` with nobody silent.
+	 *
+	 * NOTE: the reader is still told only "this may be stale" — `BlockPossiblyStaleError` implies a
+	 * retry might help, which is wrong advice for a block whose repair is deadlocked as configured.
+	 * Carrying this condition into the error needs a new field on `GetBlockResult` plus a change to
+	 * that error's documented contract; deliberately out of scope here (see the ticket
+	 * `repair-deadlock-is-never-named`, *Not this ticket*).
+	 */
+	private reportRepairDeadlock(
+		blockId: BlockId,
+		claims: RevClaim[],
+		silentCount: number,
+		cohortPeers: number,
+		answered: number,
+		required: number
+	): void {
+		// Any silence and this pass proves nothing — a silent peer may be the missing voter.
+		if (silentCount > 0) return;
+		// Nobody claimed anything: the cohort agrees the block is absent, which is an answer, not a
+		// deadlock.
+		if (claims.length === 0) return;
+		// The voters that answered disagreed → a cohort split, not a shortage of voters.
+		if (new Set(claims.map(c => `${c.rev}\0${c.actionId}`)).size !== 1) return;
+		// Enough voters answered and the quorum still declined → likewise not a shortage.
+		if (claims.length >= required) return;
+
+		const state = this.unsettledAheadClaims.get(blockId);
+		if (state?.deadlockReported) return;
+
+		this.log('cluster-fetch:repair-deadlock', {
+			blockId,
+			cohortPeers,
+			answered,
+			claimants: claims.length,
+			required,
+			repairCorroborationClusterSize: this.repairCorroborationClusterSize,
+			message:
+				`Block repair cannot converge in this deployment and the condition is PERMANENT, not transient: ` +
+				`all ${answered} cohort peer(s) besides this node answered (${claims.length} of them hold the block, ` +
+				`and they agree on the same revision), but accepting a revision requires ${required} agreeing peers ` +
+				`and this node's whole cohort holds only ${cohortPeers}. No peer was silent, so no partition or ` +
+				`unreachable peer is involved — every later pass declines identically until the machine count or the ` +
+				`configuration changes, and this node's copy of the block stays as it is. Repair needs ` +
+				`${CORROBORATION_FLOOR} cohort peers BESIDES the reader to answer and agree, relaxed to 1 only for a ` +
+				`cohort that DECLARES it is smaller; repairCorroborationClusterSize currently resolves to ` +
+				`${this.repairCorroborationClusterSize}. Fix: set clusterPolicy.assumedClusterSize to the number of ` +
+				`machines you actually run (it does not lower clusterSize / the replication factor), or set an ` +
+				`honest clusterSize — and run at least ${CORROBORATION_FLOOR + 2} machines for any tolerance of one ` +
+				`unreachable peer.`
+		});
+		// Hung off the existing per-block freshness entry rather than a fourth per-block map. The entry
+		// survives `recordAheadClaim` clearing its `rev`, and is dropped wholesale once the block
+		// converges — so the line is said once per non-convergence episode, not once per pass.
+		this.unsettledAheadClaims.set(blockId, { ...(state ?? {}), deadlockReported: true });
 	}
 
 	/**
