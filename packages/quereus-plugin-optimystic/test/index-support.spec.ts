@@ -10,6 +10,7 @@ import register from '../dist/plugin.js';
 import { encodeKeyElement } from '../src/schema/key-encoding.js';
 import { serializeIndexValue } from '../src/schema/index-manager.js';
 import { expectIndexAgreesWithScan } from './query-helpers.js';
+import { captureTrace, indexSeekTraces } from './trace-helpers.js';
 
 /**
  * Framed single-column index prefix for value `v` — the leading frame(indexValue)
@@ -523,6 +524,72 @@ describe('Optimystic Index Support', () => {
 			expect(at10[0]!.id).to.equal(1);
 
 			await expectIndexAgreesWithScan(db, 'orphan_int', 'n');
+		});
+	});
+
+	describe('index:seek trace rendering (the trace must not break the query it traces)', () => {
+		beforeEach(async () => {
+			await db.exec(`
+				CREATE TABLE traced (
+					id INTEGER PRIMARY KEY,
+					label TEXT
+				) USING optimystic('tree://test/traced')
+			`);
+			await db.exec('CREATE INDEX idx_traced_label ON traced(label)');
+		});
+
+		/** A TEXT value carrying every shape that can defeat a naive key renderer: a lone
+		 *  surrogate (`encodeURIComponent` throws `URIError` on one, and serializeIndexValue
+		 *  passes TEXT through verbatim, so it reaches the renderer unaltered), plus a space
+		 *  and an `=` that would split one trace field into three if they survived raw.
+		 *  Built by code point so this source file stays ASCII. */
+		const hostileLabel = `lone-${String.fromCharCode(0xD800)} sur=rogate`;
+
+		// The framed key is rendered inside the scan's `finally`, so anything the renderer
+		// cannot handle fails — or masks the real error of — the very query an operator
+		// turned tracing on to diagnose. Asserted as properties of the rendered token rather
+		// than against a literal, so a future change is free to pick a different escaping.
+		it('renders any indexed TEXT value as one whitespace-free token without throwing', async () => {
+			const literal = `'${hostileLabel}'`;
+			await db.exec(`INSERT INTO traced (id, label) VALUES (1, ${literal}), (2, 'plain')`);
+
+			let rows: Row[] = [];
+			const lines = await captureTrace(async () => {
+				rows = await collectRows(db.eval(`SELECT id FROM traced WHERE label = ${literal}`));
+			});
+
+			expect(rows.map(r => r.id), 'the traced seek still returns its row').to.deep.equal([1]);
+
+			const seeks = indexSeekTraces(lines);
+			expect(seeks.length, 'the seek emitted an index:seek line').to.be.greaterThan(0);
+			const seek = seeks[0]!;
+			expect(seek.seek, 'the hostile key was framed, not skipped').to.not.equal('unset');
+			expect(seek.seek, 'the rendered key is a single token with no whitespace')
+				.to.match(/^[^\s]+$/);
+			expect(seek.seek, 'no raw `=` survives to split the line into extra fields')
+				.to.not.include('=');
+			expect(seek.matched, 'the seek matched exactly the row it returned').to.equal(rows.length);
+		});
+
+		// Injectivity is what makes the field usable at all: two nodes compare their rendered
+		// keys for EQUALITY to rule out "the two framed different keys". If two distinct values
+		// could render alike, an operator would read a real divergence as agreement. The pair
+		// below is the collision a renderer that escapes without escaping its own escape
+		// character would produce.
+		it('renders distinct indexed values to distinct tokens', async () => {
+			await db.exec(`INSERT INTO traced (id, label) VALUES (1, 'a b'), (2, 'a%20b')`);
+
+			const rendered: string[] = [];
+			for (const label of ['a b', 'a%20b']) {
+				const lines = await captureTrace(async () => {
+					await collectRows(db.eval(`SELECT id FROM traced WHERE label = '${label}'`));
+				});
+				const seek = indexSeekTraces(lines)[0];
+				expect(seek, `a seek line was emitted for ${JSON.stringify(label)}`).to.not.equal(undefined);
+				rendered.push(seek!.seek);
+			}
+			expect(rendered[0], 'a value and its own escaped form render differently')
+				.to.not.equal(rendered[1]);
 		});
 	});
 });

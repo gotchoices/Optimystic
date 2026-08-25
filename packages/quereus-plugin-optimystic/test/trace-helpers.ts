@@ -1,6 +1,7 @@
 /**
- * Capture and parse the two debug lines that answer "which collections did this
- * write carry, and did every node mean the same index collection?":
+ * Capture and parse the debug lines that answer "which collections did this write
+ * carry, did every node mean the same index collection, and which revision did the
+ * read that could not see the row descend?":
  *
  * - `commit:collections` (`optimystic:quereus-plugin:txn-bridge`) — one line per
  *   commit naming every collection that commit is about to carry.
@@ -13,7 +14,7 @@
  *
  * See `docs/debugging.md` (§ quereus-plugin sub-namespaces) for how an operator
  * reads them. Specs use these helpers so a change that silently stops emitting
- * either line fails the suite.
+ * any one of them fails the suite.
  *
  * Not a `.spec.ts` file on purpose — mocha's glob would otherwise load it as a suite.
  */

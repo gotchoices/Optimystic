@@ -530,8 +530,16 @@ export class TransactionBridge {
    * double that omits `committedRevision`. The revision is the discriminator the id
    * cannot be: a collection's header block IS its id, so two nodes naming one id are
    * addressing one header — what can still differ is which revision of it each reads.
-   * Ids can contain `/` but not whitespace or `,`, and a revision never contains `:`,
-   * so splitting each pair on its LAST `:` recovers both halves.
+   * A revision never contains `:`, so splitting each pair on its LAST `:` recovers both
+   * halves whatever the id holds.
+   *
+   * NOTE: pairs are `,`-separated and the whole field is one whitespace-free token, but
+   * nothing ENFORCES that a collection id contains neither — `parseCollectionId`
+   * (collection-factory.ts) accepts a table's `collectionUri` verbatim after stripping
+   * `tree://`. A URI like `tree://a,b` would make this field, and the `<id>=staged`
+   * tokens that predate it, ambiguous to parse. Harmless while every id in practice is a
+   * slash path; if arbitrary URIs ever become reachable, validate the id at parse time
+   * rather than escaping it here — the id has to be greppable across all three lines.
    *
    * Costs nothing when the namespace is off: both call sites build their entry array
    * inside an `if (log.enabled)` guard.

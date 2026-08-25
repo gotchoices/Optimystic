@@ -176,11 +176,20 @@ optimystic:quereus-plugin:module index:seek table=Usage index=by_token collectio
   control bytes, so a raw key would break whitespace-separated parsing). Two nodes seeking the same
   SQL value must print the same `seek=`; a difference means the key framing diverged rather than
   the tree. An empty `seek=` is the whole-index prefix (a plan that wants every entry);
-  `seek=unset` means the scan returned before framing a key at all.
+  `seek=unset` means the scan returned before framing a key at all. **Compare it, do not decode
+  it** — un-escaping yields the raw tuple framing (element tags, escaped NULs), not the SQL value
+  that was sought.
 - `matched=` — how many **index entries** the seek produced, counted before the row fetch. Rows
   dropped later (missing row, predicate re-applied by the engine) still count here. It is a
   **floor**: a scan the caller abandons early (a satisfied `LIMIT`, an error mid-scan) reports what
   it had produced when it stopped, so `matched=0` still means the descent found nothing.
+
+**Only an index-driven plan emits this line.** A primary-key point lookup, a primary-key range
+query, and a full table scan all read without descending an index tree, so they emit nothing here.
+No `index:seek` line for a failing query therefore means *the planner did not route it through the
+index* — check the plan before concluding anything about the index collection. (Confirming the same
+query is index-routed on both nodes is itself worth doing: a query that seeks on one node and
+full-scans on the other explains an asymmetric result on its own.)
 
 When a row is written on node A and an index-driven lookup on node B cannot find it, read node B's
 `index:seek` line against node A's `commit:collections` revision for the same collection id:
@@ -192,6 +201,12 @@ When a row is written on node A and an index-driven lookup on node B cannot find
 | `rev` equal to node A's commit revision, `matched=0` | The write's index action did not survive commit despite being staged. Look at the sync/merge and conflict replay, not at refresh. |
 | `rev` equal, `matched>0`, but the SQL still returned no row | The index held the entry and the main-table fetch dropped it — compare `main_rev=` against node A's revision for the **table** collection (same collection on both sides), never against `rev=`. |
 | `seek=` differs between the two nodes for the same SQL value | Neither of the above: the two nodes framed different keys, so the seek never addressed the entry that was written. |
+
+`none` on its own is not proof of the invention race — a collection that has legitimately never
+been committed yet also reports `none`, and a first insert normally shows the main table collection
+at `:none` in the very `commit:collections` line that creates it. `none` is a finding only when
+something has already been committed under that id, which is exactly the case the table above
+scopes to (node A committed first).
 
 For `arm=committed` over a tree that was staged into the in-flight transaction, the view is pinned
 to the transaction's first-touch boundary, which can be older than the `rev=` printed here (the

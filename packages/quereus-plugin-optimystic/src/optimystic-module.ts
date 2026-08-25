@@ -79,18 +79,36 @@ interface IndexSeekProbe {
   key?: string;
 }
 
+/** Code units a framed index key may print verbatim: everything else is escaped, so
+ *  the rendered key is always one whitespace-free, `=`-free token. */
+const SEEK_KEY_SAFE = /[^A-Za-z0-9._-]/g;
+
 /**
  * Render a framed index key for the `index:seek` trace.
  *
  * An index key is the output of `encodeKeyTuple`, so it carries control bytes as element
  * framing and can carry any character the indexed value did — including spaces and `=`.
  * Printing it raw would break the `key=value`, whitespace-separated shape every other
- * line in this package uses, so it goes through `encodeURIComponent`: alphanumerics and
- * a handful of safe punctuation survive verbatim (`tok-a` stays readable), everything
- * else becomes `%XX`. The mapping is injective, so two nodes' escaped keys compare
- * exactly — which is the only thing the field is for.
+ * line in this package uses, so each unsafe code unit becomes `%XX` (or `%uXXXX` above
+ * `\xff`); alphanumerics and `-._` survive verbatim, so `tok-a` stays readable and the
+ * framing tags render as `%01`/`%00`. `u` is not a hex digit, so the two escape widths
+ * cannot be confused and the mapping is injective — two nodes' escaped keys compare
+ * exactly, which is the only thing the field is for.
+ *
+ * Escaping per code unit rather than via `encodeURIComponent` is deliberate: that
+ * function throws `URIError` on a lone surrogate, which a SQL TEXT value can legally
+ * contain (`serializeIndexValue` passes strings through verbatim). This runs inside the
+ * scan's `finally`, so a throw here would fail — or mask the real error of — the very
+ * query the operator turned tracing on to diagnose. Total by construction is the only
+ * acceptable shape for it.
  */
-const printableSeekKey = (key: string): string => encodeURIComponent(key);
+const printableSeekKey = (key: string): string =>
+  key.replace(SEEK_KEY_SAFE, ch => {
+    const code = ch.charCodeAt(0);
+    return code <= 0xff
+      ? `%${code.toString(16).toUpperCase().padStart(2, '0')}`
+      : `%u${code.toString(16).toUpperCase().padStart(4, '0')}`;
+  });
 
 /** One existing row a secondary UNIQUE constraint collides with, keyed by its
  *  primary key so a REPLACE resolution can evict it. */
