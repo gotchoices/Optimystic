@@ -252,6 +252,19 @@ export class Tree<TKey, TEntry> implements TreeReadView<TKey, TEntry> {
 			return String(this.collection.id);
 	}
 
+	/** The committed revision this tree's collection reads and writes at — see
+	 * {@link Collection.committedRevision}. `undefined` means the collection was
+	 * invented locally and has never adopted a committed revision.
+	 *
+	 * Diagnostic only. Consumers holding several trees (the Quereus adapter holds a
+	 * table tree plus one per maintained index) use it to state the revision gap
+	 * between them as a number instead of inferring it — the trees refresh through
+	 * different call sites, so they routinely sit at different revisions.
+	 * Structurally satisfies the adapter's optional `DirtyTree.committedRevision()`. */
+	committedRevision(): number | undefined {
+			return this.collection.committedRevision();
+	}
+
 	/**
 	 * Update the local state from the network.
 	 * Call this before reading to ensure you have the latest data.

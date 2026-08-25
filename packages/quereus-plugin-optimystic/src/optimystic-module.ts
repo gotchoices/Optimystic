@@ -57,6 +57,41 @@ interface IndexScanSource extends IndexScanTarget {
   read: TreeReadView<string, IndexEntry>;
 }
 
+/**
+ * Mutable scratch threaded into {@link OptimysticVirtualTable.executeIndexScan} so the
+ * `index:seek` trace can report what the seek actually did, without the trace having to
+ * rebuild the seek key or re-walk the entries:
+ *
+ * - `matched` — how many INDEX ENTRIES the seek produced, not how many rows the caller
+ *   ended up keeping. The distinction is the point of the field: zero entries means the
+ *   descent found nothing in the index tree, which is a different failure from "entries
+ *   found, rows resolved, predicate rejected them later".
+ * - `key` — the framed index key the scan bracketed on, filled in once it is built.
+ *   Stays `undefined` if the scan returned before framing one, which prints as `unset`
+ *   rather than as an empty seek (the empty PREFIX is a legitimate key meaning
+ *   "the whole index", and the two must not read alike).
+ *
+ * Passed only when the trace namespace is enabled; `undefined` otherwise, so a disabled
+ * namespace costs one property read per scan.
+ */
+interface IndexSeekProbe {
+  matched: number;
+  key?: string;
+}
+
+/**
+ * Render a framed index key for the `index:seek` trace.
+ *
+ * An index key is the output of `encodeKeyTuple`, so it carries control bytes as element
+ * framing and can carry any character the indexed value did — including spaces and `=`.
+ * Printing it raw would break the `key=value`, whitespace-separated shape every other
+ * line in this package uses, so it goes through `encodeURIComponent`: alphanumerics and
+ * a handful of safe punctuation survive verbatim (`tok-a` stays readable), everything
+ * else becomes `%XX`. The mapping is injective, so two nodes' escaped keys compare
+ * exactly — which is the only thing the field is for.
+ */
+const printableSeekKey = (key: string): string => encodeURIComponent(key);
+
 /** One existing row a secondary UNIQUE constraint collides with, keyed by its
  *  primary key so a REPLACE resolution can evict it. */
 interface UniqueCollision {
@@ -802,7 +837,18 @@ export class OptimysticVirtualTable extends VirtualTable {
       // says index-scan but a source is missing and the scan silently falls through to
       // a different access path.
       if (indexScan !== undefined) {
-        yield* this.executeIndexScan(mainRead, indexScan, filterInfo.args);
+        // ONE site covers both arms, and neither view is rebuilt to trace it. The counter
+        // is filled in by the scan as it produces entries; the line is emitted in a
+        // `finally` so a consumer that abandons the iteration (a LIMIT, an error mid-scan)
+        // still reports what the seek had produced by then.
+        const seek: IndexSeekProbe | undefined = log.enabled ? { matched: 0 } : undefined;
+        try {
+          yield* this.executeIndexScan(mainRead, indexScan, filterInfo.args, seek);
+        } finally {
+          if (seek !== undefined) {
+            this.logIndexSeek(indexScan, mainTree, committed, seek);
+          }
+        }
       } else if (planType === 2 && filterInfo.args.length > 0) {
         // Primary key equality seek (plan=2)
         yield* this.executePointLookup(mainRead, filterInfo.args);
@@ -862,6 +908,83 @@ export class OptimysticVirtualTable extends VirtualTable {
       );
     }
     return { schema, tree };
+  }
+
+  /**
+   * Emit the one line that answers "which revision did this read descend, and was it
+   * allowed to refresh?" — the read-side counterpart to the bridge's
+   * `commit:collections` line. How an operator reads it: `docs/debugging.md`
+   * (§ "Which revision did a read descend?").
+   *
+   * A table's main tree and its index trees are separate collections that refresh
+   * through DIFFERENT call sites, and a collection's revision advances only when
+   * something calls `update()`/`sync()` on it. So an index tree can sit at a revision
+   * older than the main tree's — or at none at all, having been invented locally — and
+   * a seek down it silently returns nothing while a full scan of the same table returns
+   * the row. Nothing about that is visible without printing both revisions, which is
+   * what this does:
+   *
+   * - `arm=committed` never refreshes (deliberate — see {@link committedTreeView});
+   *   `arm=live` ran `update()` on both trees immediately before the scan.
+   * - `rev=` / `main_rev=` — the index and main collections' committed revisions,
+   *   `none` for a collection that has never adopted one. NOT on a common scale: every
+   *   collection counts its own revisions, so these two are routinely unequal on a
+   *   healthy run (`rev=4 main_rev=3` is normal) and subtracting them means nothing. Each
+   *   is comparable only to another revision OF THE SAME COLLECTION — the writer's
+   *   `commit:collections` revision for that id, or the other node's `index:seek`.
+   * - `seek=` — the framed index key the descent bracketed on, percent-escaped (the
+   *   framing carries control bytes, and a raw key would break whitespace tokenizing).
+   *   Two nodes seeking the same SQL value must print the same `seek=`; a difference
+   *   means the framing itself diverged, not the tree. `seek=` with an empty value is
+   *   the whole-index prefix (a plan that wants every entry); `seek=unset` means the
+   *   scan returned before framing a key at all.
+   * - `matched=` — index entries the seek produced, so "descended a stale index" is
+   *   distinguishable from "descended a current index that genuinely has no entry".
+   *
+   * `collection=` and `main=` are the same id strings `index:tree-open` and
+   * `commit:collections` print, so all three lines join on them — and they name BOTH
+   * collections this scan touched, which is what makes the line answerable on its own
+   * when the failure is "the index tree is behind the table tree".
+   *
+   * NOTE: `rev=`/`main_rev=` report the COLLECTIONS' current revisions. For
+   * `arm=committed` over a tree that was staged into this transaction, the view is
+   * pinned to the transaction's first-touch boundary, which can be older than the
+   * collection's current revision; for a clean tree the two are the same moment. If a
+   * committed-arm investigation ever turns on that difference, print the pinned
+   * `CollectionSnapshot.context.rev` as a further field rather than reinterpreting these.
+   *
+   * NOTE: unlike `index:tree-open` (bring-up only), this is one line PER index-driven
+   * scan, so a query loop that seeks per row emits one per row. Fine now — the namespace
+   * is off by default and the line costs nothing when disabled — but if the `module`
+   * namespace is ever left on over a hot seek path and the volume becomes the problem,
+   * sample it (every Nth scan) or move it to a dedicated `index-seek` sub-namespace
+   * rather than deleting it.
+   *
+   * NOTE: `matched=` counts what the seek had produced when the iteration ENDED, which
+   * for an abandoned scan (a LIMIT satisfied early, an error mid-scan) is short of what
+   * the index holds. It is a floor, never an overcount — so `matched=0` still proves the
+   * descent found nothing, which is the reading the two-worlds decision rule turns on.
+   */
+  private logIndexSeek(
+    index: IndexScanSource,
+    mainTree: Tree<string, RowData>,
+    committed: boolean,
+    seek: IndexSeekProbe,
+  ): void {
+    const rev = (tree: { committedRevision(): number | undefined }): string =>
+      String(tree.committedRevision() ?? 'none');
+    log(
+      'index:seek table=%s index=%s collection=%s main=%s arm=%s rev=%s main_rev=%s seek=%s matched=%d',
+      this.tableName,
+      index.schema.name,
+      String(index.tree.getCollection().id),
+      String(mainTree.getCollection().id),
+      committed ? 'committed' : 'live',
+      rev(index.tree),
+      rev(mainTree),
+      seek.key === undefined ? 'unset' : printableSeekKey(seek.key),
+      seek.matched,
+    );
   }
 
   /**
@@ -1000,6 +1123,7 @@ export class OptimysticVirtualTable extends VirtualTable {
     mainRead: TreeReadView<string, RowData>,
     index: IndexScanSource,
     args: readonly unknown[],
+    seek?: IndexSeekProbe,
   ): AsyncIterable<Row> {
     if (!this.rowCodec || !this.indexManager) return;
 
@@ -1021,6 +1145,9 @@ export class OptimysticVirtualTable extends VirtualTable {
             args.slice(0, width) as readonly SqlValue[],
           ),
         );
+    // Recorded for the `index:seek` trace BEFORE the descent, so a scan that throws
+    // part-way still names the key it was seeking rather than reporting `unset`.
+    if (seek !== undefined) seek.key = String(indexKey);
 
     // NOTE: an entry whose row has since moved off the indexed value (a writer that was
     // not maintaining this index UPDATEd the row; backfillIndexTrees adds the new entry on
@@ -1034,6 +1161,10 @@ export class OptimysticVirtualTable extends VirtualTable {
     // IndexManager.createIndexKey from the fetched row and skipping entries whose key does
     // not prefix-match `indexKey`.
     for await (const primaryKey of this.indexManager.findByIndexIn(index.read, indexKey)) {
+      // Counted HERE, before the row fetch: `matched` must mean "entries the index
+      // descent produced", not "rows that survived". An entry whose row is missing or
+      // that a later predicate rejects still proves the index held something.
+      if (seek !== undefined) seek.matched++;
       // Fetch the row from the main table using the primary key
       const path = await mainRead.find(primaryKey);
       if (!mainRead.isValid(path)) {

@@ -7,6 +7,9 @@
  * - `index:tree-open` (`optimystic:quereus-plugin:module`) — one line per index
  *   tree opened, naming the URI it was derived from and the collection id it
  *   resolved to.
+ * - `index:seek` (`optimystic:quereus-plugin:module`) — one line per index-driven
+ *   scan, naming the revision the index and main collections were read at, whether
+ *   the read was allowed to refresh, and how many index entries the seek produced.
  *
  * See `docs/debugging.md` (§ quereus-plugin sub-namespaces) for how an operator
  * reads them. Specs use these helpers so a change that silently stops emitting
@@ -69,21 +72,40 @@ export interface CommitTrace {
 	ids: string[];
 	/** Collection id → `staged` | `clean` | `unknown`. */
 	state: Map<string, string>;
+	/** Collection id → its entry in the line's trailing `revs=` field: a revision number,
+	 *  `none` (an invented collection with no committed revision), or `unknown` (a double
+	 *  lacking the accessor). Kept as the raw string so `none`/`unknown` stay
+	 *  distinguishable from revision 0. */
+	rev: Map<string, string>;
 }
 
-/** Parse every `commit:collections` line out of a capture. */
+/** Parse every `commit:collections` line out of a capture.
+ *
+ * The line has two halves and they are parsed independently, which is deliberate: the
+ * `<id>=<state>` tokens are the ORIGINAL shape of this line and are matched by the
+ * original pattern, so this parser still reads a build that predates revisions. The
+ * revisions arrive as one trailing `revs=<id>:<rev>,...` field; a line without it simply
+ * yields an empty `rev` map rather than failing to parse. Each pair splits on its LAST
+ * `:` because an id may contain colons while a revision never does. */
 export function commitTraces(lines: readonly string[]): CommitTrace[] {
 	const traces: CommitTrace[] = [];
 	for (const raw of lines) {
 		const head = /commit:collections mode=(\S+) count=(\d+)(.*)$/.exec(plain(raw));
 		if (!head) continue;
+		const tail = head[3]!.trim();
 		const state = new Map<string, string>();
-		// A trailing `+1ms` (or any other non-`id=state` token) is dropped by the shape filter.
-		for (const token of head[3]!.trim().split(/\s+/)) {
+		const rev = new Map<string, string>();
+		// A trailing `+1ms`, and the `revs=` field itself, are dropped by the shape filter.
+		for (const token of tail.split(/\s+/)) {
 			const entry = /^(\S+)=(staged|clean|unknown)$/.exec(token);
 			if (entry) state.set(entry[1]!, entry[2]!);
 		}
-		traces.push({ mode: head[1]!, count: Number(head[2]), ids: [...state.keys()], state });
+		const revs = /(?:^|\s)revs=(\S*)/.exec(tail);
+		for (const pair of (revs?.[1] ?? '').split(',')) {
+			const entry = /^(.*):(\d+|none|unknown)$/.exec(pair);
+			if (entry) rev.set(entry[1]!, entry[2]!);
+		}
+		traces.push({ mode: head[1]!, count: Number(head[2]), ids: [...state.keys()], state, rev });
 	}
 	return traces;
 }
@@ -97,6 +119,50 @@ export function indexOpenTraces(lines: readonly string[]): IndexOpenTrace[] {
 	for (const raw of lines) {
 		const m = /index:tree-open table=(\S+) index=(\S+) uri=(\S+) collection=(\S+)/.exec(plain(raw));
 		if (m) traces.push({ table: m[1]!, index: m[2]!, uri: m[3]!, collection: m[4]! });
+	}
+	return traces;
+}
+
+/** A parsed `index:seek` line — one per index-driven scan. */
+export interface IndexSeekTrace {
+	table: string;
+	index: string;
+	/** The index collection's id — the same string `index:tree-open` and `commit:collections` print. */
+	collection: string;
+	/** The main table collection's id, so one line names BOTH collections the scan read. */
+	main: string;
+	/** `committed` (pinned pre-transaction view, never refreshes) or `live` (refreshed first). */
+	arm: string;
+	/** The index collection's committed revision, or `none` when it has never adopted one.
+	 *  Raw string so `none` stays distinguishable from revision 0. */
+	rev: string;
+	/** The main table collection's committed revision at the same instant, same encoding. */
+	mainRev: string;
+	/** The framed seek key, percent-escaped by the emitter. `''` is the whole-index prefix;
+	 *  `unset` means the scan returned before framing a key. Compare between nodes for
+	 *  equality only — decoding it yields raw framing bytes, not the SQL value. */
+	seek: string;
+	/** Index entries the seek produced, counted before the row fetch. A floor: an
+	 *  abandoned iteration reports what it had produced when it stopped. */
+	matched: number;
+}
+
+/** Parse every `index:seek` line out of a capture.
+ *
+ * `seek=` is matched with `\S*` rather than `\S+` because the whole-index prefix frames
+ * to the empty string, and an empty `seek=` must parse rather than making the whole line
+ * unreadable. */
+export function indexSeekTraces(lines: readonly string[]): IndexSeekTrace[] {
+	const traces: IndexSeekTrace[] = [];
+	for (const raw of lines) {
+		const m = /index:seek table=(\S+) index=(\S+) collection=(\S+) main=(\S+) arm=(\S+) rev=(\S+) main_rev=(\S+) seek=(\S*) matched=(\d+)/
+			.exec(plain(raw));
+		if (m) {
+			traces.push({
+				table: m[1]!, index: m[2]!, collection: m[3]!, main: m[4]!, arm: m[5]!,
+				rev: m[6]!, mainRev: m[7]!, seek: m[8]!, matched: Number(m[9]),
+			});
+		}
 	}
 	return traces;
 }

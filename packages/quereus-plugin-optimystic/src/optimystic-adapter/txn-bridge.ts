@@ -38,6 +38,15 @@ export interface DirtyTree {
    * implement it — the trace reports `unknown` when absent.
    */
   hasUnsyncedChanges?(): boolean;
+  /**
+   * Optional "which committed revision is this tree reading and writing at?" (a Tree
+   * forwards to `Collection.committedRevision()`; `undefined` means the collection was
+   * invented locally and never adopted a committed revision). Used ONLY by the
+   * `commit:collections` trace; the commit sweep itself does not branch on it. Optional
+   * so test doubles need not implement it — the trace reports `:unknown` when absent,
+   * which is distinct from `:none` (implemented, and the collection is invented).
+   */
+  committedRevision?(): number | undefined;
 }
 
 /**
@@ -48,12 +57,37 @@ export interface DirtyTree {
  */
 const treeLabel = (tree: DirtyTree, index: number): string => tree.describe?.() ?? `tree#${index}`;
 
+/**
+ * The committed revision to print for a dirty tree in the `commit:collections` trace.
+ * Keeps the two "no number" cases apart, because they mean opposite things: `unknown`
+ * is "nobody asked" (a double without the method), `none` is "asked, and this
+ * collection has never adopted a committed revision" — i.e. it was invented locally,
+ * which is itself a finding.
+ */
+const treeRevision = (tree: DirtyTree): number | 'none' | 'unknown' =>
+  tree.committedRevision === undefined ? 'unknown' : (tree.committedRevision() ?? 'none');
+
 /** One collection's row in a {@link TransactionBridge} `commit:collections` trace line. */
 interface CommitCollectionTrace {
   /** The collection id — the same string `openIndexTree`'s `index:tree-open` line prints. */
   id: string;
   /** Whether the collection still holds unflushed changes; `undefined` when unknowable. */
   staged: boolean | undefined;
+  /**
+   * The committed revision the collection reads and writes at, or:
+   * - `'none'` — the collection is INVENTED: it has no committed revision because
+   *   nothing was ever committed under its id and this process staged a fresh empty
+   *   one (`Collection.createOrOpen`'s create branch).
+   * - `'unknown'` — the source could not be asked (a {@link DirtyTree} double that
+   *   omits `committedRevision`).
+   *
+   * The discriminator between "two nodes committed into one lineage" and "one node is
+   * reading a lagging or invented copy": the collection ID cannot fork (a collection's
+   * header block id IS its id), so the revision is the only thing left that can differ.
+   * Emitted in the line's trailing `revs=` field, never folded into the id token — see
+   * {@link TransactionBridge.logCommitCollections}.
+   */
+  rev: number | 'none' | 'unknown';
 }
 
 /**
@@ -392,6 +426,9 @@ export class TransactionBridge {
           this.logCommitCollections('session', [...this.collectionRegistry].map(([id, collection]) => ({
             id: String(id),
             staged: collection.hasUnsyncedChanges(),
+            // A real Collection always implements this, so `unknown` is unreachable here;
+            // `none` still is, and means the collection was invented in this process.
+            rev: collection.committedRevision() ?? 'none' as const,
           })));
         }
         const result = await this.session.commit();
@@ -481,18 +518,37 @@ export class TransactionBridge {
    * how many there were. `unknown` appears only for a {@link DirtyTree} double that
    * omits `hasUnsyncedChanges`.
    *
+   * The revisions follow the id list as ONE trailing `revs=<id>:<rev>,...` field, in the
+   * same sorted order. Strictly ADDITIVE on purpose: the `<id>=staged|clean|unknown`
+   * tokens stay byte-identical to what this line has always emitted, so an operator's
+   * existing grep or parser keyed on a collection id keeps matching. Folding the
+   * revision into the id token instead (`<id>@7=staged`) would have been shorter and
+   * would silently break every such parser into reporting the collection ABSENT — the
+   * exact false negative this line exists to rule out.
+   *
+   * `:none` is an invented collection (no committed revision at all); `:unknown` is a
+   * double that omits `committedRevision`. The revision is the discriminator the id
+   * cannot be: a collection's header block IS its id, so two nodes naming one id are
+   * addressing one header — what can still differ is which revision of it each reads.
+   * Ids can contain `/` but not whitespace or `,`, and a revision never contains `:`,
+   * so splitting each pair on its LAST `:` recovers both halves.
+   *
    * Costs nothing when the namespace is off: both call sites build their entry array
    * inside an `if (log.enabled)` guard.
    */
   private logCommitCollections(mode: 'legacy' | 'session', entries: readonly CommitCollectionTrace[]): void {
     const sorted = [...entries].sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
+    const marks = sorted
+      .map(e => `${e.id}=${e.staged === undefined ? 'unknown' : e.staged ? 'staged' : 'clean'}`)
+      .join(' ');
     log(
-      'commit:collections mode=%s count=%d %s',
+      // `count=0` yields an empty mark list; the conditional space keeps that case from
+      // emitting a double space, and leaves the count>0 spacing exactly as it always was.
+      'commit:collections mode=%s count=%d%s revs=%s',
       mode,
       sorted.length,
-      sorted
-        .map(e => `${e.id}=${e.staged === undefined ? 'unknown' : e.staged ? 'staged' : 'clean'}`)
-        .join(' ')
+      marks ? ` ${marks}` : '',
+      sorted.map(e => `${e.id}:${e.rev}`).join(',')
     );
   }
 
@@ -523,6 +579,9 @@ export class TransactionBridge {
       this.logCommitCollections('legacy', trees.map((tree, i) => ({
         id: treeLabel(tree, i),
         staged: tree.hasUnsyncedChanges?.(),
+        // `unknown` (method absent on a double) and `none` (present, collection invented)
+        // are deliberately different answers — collapsing them would hide the invention case.
+        rev: treeRevision(tree),
       })));
     }
 

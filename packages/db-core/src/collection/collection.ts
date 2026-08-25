@@ -454,6 +454,24 @@ export class Collection<TAction> implements ICollection<TAction> {
 		return this.pending.length > 0 || !isTransformsEmpty(this.tracker.transforms);
 	}
 
+	/** The committed revision this collection currently reads and writes at, or
+	 * `undefined` for an INVENTED collection that has never adopted a committed
+	 * revision ({@link createOrOpen} found no header and staged a fresh empty one).
+	 *
+	 * DIAGNOSTIC ONLY — do not branch on this. Every block this collection reads is
+	 * materialized at this revision ({@link TransactorSource.tryGet} passes it as the
+	 * read context), and the revision advances ONLY through {@link update} or
+	 * {@link sync}; nothing moves it passively — not time, not another collection's
+	 * commit, not a peer's notification. So a collection sitting here at a lagging
+	 * revision silently serves an old root with no error, and two collections in one
+	 * process can be at different revisions at the same instant. That gap is invisible
+	 * from outside the class without this accessor, which is the whole reason it
+	 * exists: `docs/debugging.md` (§ "Which revision did a read descend?") explains
+	 * how an operator reads the difference. */
+	committedRevision(): number | undefined {
+		return this.source.actionContext?.rev;
+	}
+
 	/** Fold a just-committed set of transforms into this collection's read cache
 	 * so subsequent reads (and stages) through THIS instance observe the committed
 	 * state, mirroring what {@link sync} does inline after a successful transact.

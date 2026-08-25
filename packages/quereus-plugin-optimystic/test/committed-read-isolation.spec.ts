@@ -38,6 +38,7 @@ import { MemoryRawStorage, StorageRepo, BlockStorage } from '@optimystic/db-p2p'
 import { FileRawStorage } from '@optimystic/db-p2p-storage-fs';
 import type { ITransactor } from '@optimystic/db-core';
 import register from '../dist/plugin.js';
+import { captureTrace, indexSeekTraces } from './trace-helpers.js';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import * as fs from 'node:fs/promises';
@@ -241,6 +242,45 @@ describe('Committed-read connection isolation', function () {
 	});
 
 	describe('single-moment committed views (index-driven vs full scan)', () => {
+		// The `index:seek` trace has two arms and only the LIVE one is reachable from
+		// plain SQL, so without this the committed arm would ship unexercised — and it is
+		// the arm whose `rev=` an operator is most likely to misread, because a committed
+		// view deliberately never refreshes. Pinning `arm=committed` here is what makes
+		// the doc's "arm=committed never refreshes" claim checkable.
+		it('the index:seek trace names the committed arm for a hand-driven committed index scan', async () => {
+			const storage = new MemoryRawStorage();
+			const shared = buildSharedLocalTransactor(storage);
+
+			const db = new Database();
+			const plugin = registerWithSharedTransactor(db, shared);
+			await db.exec(`create table Item (id integer primary key, cat text) using optimystic('tree://iso/seek-arm')`);
+			await db.exec(`create index idx_cat on Item (cat)`);
+			await db.exec(`insert into Item (id, cat) values (1, 'a'), (2, 'b'), (3, 'a')`);
+
+			try {
+				const committedTable = await connectCommitted(db, plugin, 'Item');
+				let rows: VtabRow[] = [];
+				const lines = await captureTrace(async () => {
+					rows = await drain(committedTable.query(filterInfo('idx=idx_cat(0);plan=2', ['a'])));
+				});
+				expect(rows.length, 'the committed index scan returned both cat=a rows').to.equal(2);
+
+				const seeks = indexSeekTraces(lines);
+				expect(seeks.length, 'the committed index scan emitted an index:seek line')
+					.to.be.greaterThan(0);
+				const seek = seeks[0]!;
+				expect(seek.arm, 'a _readCommitted scan reads a pinned view and never refreshes')
+					.to.equal('committed');
+				expect(seek.table).to.equal('Item');
+				expect(seek.index).to.equal('idx_cat');
+				expect(seek.seek, 'the committed arm frames a seek key too').to.not.equal('unset');
+				expect(seek.matched, 'matched equals the rows the committed seek returned')
+					.to.equal(rows.length);
+			} finally {
+				db.close();
+			}
+		});
+
 		it('two concurrent hand-driven committed scans agree and ignore a mid-scan external commit', async () => {
 			const storage = new MemoryRawStorage();
 			const shared = buildSharedLocalTransactor(storage);

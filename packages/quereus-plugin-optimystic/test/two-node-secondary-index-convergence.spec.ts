@@ -24,7 +24,7 @@ import type { ITransactor } from '@optimystic/db-core';
 import { KeyRange } from '@optimystic/db-core';
 import { createMesh, buildNetworkTransactors, type Mesh } from '@optimystic/db-p2p/testing';
 import register from '../dist/plugin.js';
-import { captureTrace, collectionIdOf, commitTraces, indexOpenTraces } from './trace-helpers.js';
+import { captureTrace, collectionIdOf, commitTraces, indexOpenTraces, indexSeekTraces } from './trace-helpers.js';
 import { expectIndexAgreesWithScan } from './query-helpers.js';
 
 type Row = Record<string, SqlValue>;
@@ -199,6 +199,13 @@ describe('Two-node secondary-index convergence (write on one node, index-seek on
 		expect(carrying!.ids, 'the SAME commit carried the index collection').to.include(INDEX_COLLECTION_ID);
 		expect(carrying!.state.get(INDEX_COLLECTION_ID), 'the index collection had staged changes to push')
 			.to.equal('staged');
+		// The trailing `revs=` field is the discriminator two nodes' lines are compared on
+		// — the id cannot differ (it IS the header block id), so a line without a revision
+		// per collection cannot answer the question it exists for.
+		expect(carrying!.rev.get(TABLE_COLLECTION_ID), 'the table collection named a revision')
+			.to.match(/^(\d+|none)$/);
+		expect(carrying!.rev.get(INDEX_COLLECTION_ID), 'the index collection named a revision')
+			.to.match(/^(\d+|none)$/);
 		expect(carrying!.count, 'count= agrees with the ids actually listed').to.equal(carrying!.ids.length);
 		expect(carrying!.mode, 'this harness wires no coordinator, so the commit is the legacy sweep')
 			.to.equal('legacy');
@@ -233,5 +240,128 @@ describe('Two-node secondary-index convergence (write on one node, index-seek on
 		expect(opensA[0]!.uri, 'the URI the id was derived from').to.equal(INDEX_URI);
 		expect(opensA[0]!.table).to.equal('FormationUsage');
 		expect(opensA[0]!.index).to.equal('formation_usage_by_token');
+	});
+
+	it('index seek trace names the revision each side of the read descended', async () => {
+		const { db: dbA } = createDb(transactorFor(0));
+
+		await dbA.exec(createTableSql);
+		await dbA.exec(createIndexSql);
+		await dbA.exec(`insert into FormationUsage (Id, Token) values (1, 'tok-a')`);
+
+		const lines = await captureTrace(async () => {
+			const rows = await collect(dbA, `select Id from FormationUsage where Token = 'tok-a'`);
+			expect(rows.map(r => r.Id), 'the seek this trace describes actually found the row')
+				.to.deep.equal([1]);
+		});
+
+		const seeks = indexSeekTraces(lines);
+		expect(seeks.length, 'the index-routed select emitted at least one index:seek line')
+			.to.be.greaterThan(0);
+		const seek = seeks[0]!;
+		expect(seek.table).to.equal('FormationUsage');
+		expect(seek.index).to.equal('formation_usage_by_token');
+		// Joins against commit:collections and index:tree-open, which print the same id.
+		expect(seek.collection, 'the seek names the index collection by the id the other two lines print')
+			.to.equal(INDEX_COLLECTION_ID);
+		expect(seek.main, 'and names the main table collection, so one line covers both trees')
+			.to.equal(TABLE_COLLECTION_ID);
+		expect(seek.arm, 'a plain select is a live read, so it refreshed both trees first')
+			.to.equal('live');
+		// A framed key was actually built — `unset` would mean the scan returned before
+		// framing one, and an equality seek must never look like the whole-index prefix.
+		expect(seek.seek, 'the seek names the framed key it bracketed on').to.not.equal('unset');
+		expect(seek.seek, 'an equality seek is not the whole-index prefix').to.not.equal('');
+		// This is the whole point of the line: a healthy run states BOTH revisions, so a
+		// failing run's gap between them is readable as a number rather than inferred.
+		expect(seek.rev, "the index collection's revision").to.match(/^(\d+|none)$/);
+		expect(seek.mainRev, "the main collection's revision").to.match(/^(\d+|none)$/);
+		expect(seek.matched, 'one index entry matched the seek key').to.equal(1);
+	});
+
+	it('index seek trace names both collections, the framed key, and a count that matches the rows', async () => {
+		const { db: dbA } = createDb(transactorFor(0));
+
+		await dbA.exec(createTableSql);
+		await dbA.exec(createIndexSql);
+		await dbA.exec(`insert into FormationUsage (Id, Token) values (1, 'tok-a')`);
+		await dbA.exec(`insert into FormationUsage (Id, Token) values (2, 'tok-a')`);
+		await dbA.exec(`insert into FormationUsage (Id, Token) values (3, 'tok-b')`);
+
+		let rows: Row[] = [];
+		const lines = await captureTrace(async () => {
+			rows = await collect(dbA, `select Id from FormationUsage where Token = 'tok-a' order by Id`);
+		});
+		expect(rows.map(r => r.Id), 'the seek this trace describes found both tok-a rows')
+			.to.deep.equal([1, 2]);
+
+		const seeks = indexSeekTraces(lines);
+		expect(seeks.length, 'the index-routed select emitted at least one index:seek line')
+			.to.be.greaterThan(0);
+		const seek = seeks[0]!;
+
+		// Both collections named on ONE line: the failing production shape is "the index
+		// tree is behind the table tree", which is unreadable if the line names only one.
+		expect(seek.collection, 'the index collection id').to.equal(INDEX_COLLECTION_ID);
+		expect(seek.main, 'the main table collection id').to.equal(TABLE_COLLECTION_ID);
+
+		// The framed key is what two nodes compare to rule out "the framing diverged".
+		// Non-empty because this seek is constrained; the escaping must leave it a single
+		// whitespace-free token or the line stops parsing at all.
+		expect(seek.seek, 'the framed seek key was recorded').to.not.equal('unset');
+		expect(seek.seek, 'a constrained seek frames a non-empty key').to.not.equal('');
+		expect(seek.seek, 'the escaped key is one whitespace-free token').to.match(/^\S+$/);
+
+		// The count is DERIVED, not hard-coded: three rows exist, two match, so a line
+		// reporting the whole index (or nothing) fails here rather than looking plausible.
+		expect(seek.matched, 'index entries matched equals the rows the seek returned')
+			.to.equal(rows.length);
+	});
+
+	it('two converged nodes report the same index collection revision and the same framed key', async () => {
+		const { db: dbA } = createDb(transactorFor(0));
+		const { db: dbB } = createDb(transactorFor(1));
+
+		await dbA.exec(createTableSql);
+		await dbA.exec(createIndexSql);
+		await dbA.exec(`insert into FormationUsage (Id, Token) values (1, 'tok-a')`);
+
+		await dbB.exec(createTableSql);
+		await dbB.exec(createIndexSql);
+
+		// Both arms are LIVE reads, so each refreshed its own trees immediately before
+		// descending — the revisions below are what each node had actually adopted.
+		let rowsA: Row[] = [];
+		const linesA = await captureTrace(async () => {
+			rowsA = await collect(dbA, `select Id from FormationUsage where Token = 'tok-a'`);
+		});
+		let rowsB: Row[] = [];
+		const linesB = await captureTrace(async () => {
+			rowsB = await collect(dbB, `select Id from FormationUsage where Token = 'tok-a'`);
+		});
+
+		expect(rowsA.map(r => r.Id), "the writer's own seek finds the row").to.deep.equal([1]);
+		expect(rowsB.map(r => r.Id), "the sibling's seek finds the writer's row").to.deep.equal([1]);
+
+		const seekA = indexSeekTraces(linesA).find(t => t.collection === INDEX_COLLECTION_ID);
+		const seekB = indexSeekTraces(linesB).find(t => t.collection === INDEX_COLLECTION_ID);
+		expect(seekA, 'node A emitted an index:seek line for the index collection').to.not.equal(undefined);
+		expect(seekB, 'node B emitted an index:seek line for the index collection').to.not.equal(undefined);
+
+		// THE pin this line exists for. A run where the sibling cannot find the row is
+		// supposed to be readable as either "forked/stale lineage" (revisions differ) or
+		// "converged but empty" (revisions equal, matched=0). A converged run must
+		// therefore show equal revisions AND a matching count — if a future change makes
+		// the two nodes' revisions disagree on a run that CONVERGES, the diagnostic has
+		// started lying and every reading taken from it downstream is wrong.
+		expect(seekA!.rev, "node A's index collection revision is a real revision").to.match(/^\d+$/);
+		expect(seekB!.rev, "both nodes descended the same index collection revision")
+			.to.equal(seekA!.rev);
+		expect(seekB!.seek, 'both nodes framed the same seek key for the same SQL value')
+			.to.equal(seekA!.seek);
+		expect(seekB!.matched, "the sibling's seek matched the row it returned")
+			.to.equal(rowsB.length);
+		expect(seekA!.arm, 'a plain select is a live read').to.equal('live');
+		expect(seekB!.arm, 'a plain select is a live read').to.equal('live');
 	});
 });

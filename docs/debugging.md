@@ -90,7 +90,7 @@ per-node attribution from another subsystem, pass its peer id as `createLogger`'
 | Sub-namespace         | What it covers                                                       |
 |-----------------------|---------------------------------------------------------------------|
 | `plugin`              | Plugin registration (config dump when `debug` option set)           |
-| `module`              | Virtual table change-subscription lifecycle: subscribe/notify/teardown; `index:tree-open` (below) |
+| `module`              | Virtual table change-subscription lifecycle: subscribe/notify/teardown; `index:tree-open` and `index:seek` (below) |
 | `collection-factory`  | Collection watch no-op notices and libp2p node shutdown             |
 | `txn-bridge`          | `commit:collections` (below) — which collections each commit carries |
 
@@ -103,7 +103,7 @@ make that answerable from a log; enable both (`DEBUG='optimystic:quereus-plugin:
 `DEBUG='optimystic:quereus-plugin:txn-bridge,optimystic:quereus-plugin:module'` if that is noisy):
 
 ```
-optimystic:quereus-plugin:txn-bridge commit:collections mode=legacy count=2 default/Usage=staged default/Usage/index/by_token=staged
+optimystic:quereus-plugin:txn-bridge commit:collections mode=legacy count=2 default/Usage=staged default/Usage/index/by_token=staged revs=default/Usage:7,default/Usage/index/by_token:3
 optimystic:quereus-plugin:module index:tree-open table=Usage index=by_token uri=tree://default/Usage/index/by_token collection=default/Usage/index/by_token
 ```
 
@@ -117,6 +117,16 @@ Reading `commit:collections` — one line per commit, emitted **before** the flu
   collection being *listed* does not by itself mean this write touched it; `=staged` is what says
   that.
 - Each id carries `=staged` (unflushed changes pending at commit time) / `=clean` / `=unknown`.
+- A trailing `revs=<id>:<revision>,...` field names the committed revision each collection is
+  reading and writing at, in the same sorted order as the ids. `:none` means the collection is
+  **invented**: nothing was ever committed under that id and this process staged a fresh empty one,
+  so it has no committed revision at all. `:unknown` appears only for a test double that does not
+  implement the accessor. The revision is the discriminator the id cannot be — see the note below
+  on ids being block ids.
+- The revisions are a **separate trailing field on purpose**, not folded into the id tokens: the
+  `<id>=staged|clean|unknown` tokens are unchanged from before revisions existed, so an existing
+  grep or parser keyed on a collection id keeps matching. Each `revs=` pair splits on its LAST `:`
+  (ids may contain colons; revisions never do).
 - `count=` is emitted **before** the id list, so a truncated line still reports how many
   collections there were; if `count=` and the number of ids disagree, the line was truncated.
 - Ids are sorted, so two nodes' lines compare directly by eye. `count=0` is normal — a commit whose
@@ -129,9 +139,68 @@ scheme is stripped to form the id) and `commit:collections` prints ids. Two node
 index holds only its own rows" symptom while leaving the main table fine — a failure shape the pair
 of lines separates from "the index collection was absent from the commit".
 
-Both lines are pinned by tests (`test/trace-helpers.ts` captures and parses them; the legacy case
-lives in `test/two-node-secondary-index-convergence.spec.ts`, the session case in
-`test/session-mode-commit.spec.ts`), so a change that stops emitting either one fails the suite.
+**The collection id in these lines IS the collection's header block id.** `CollectionId` is a
+`BlockId` (`packages/db-core/src/collection/struct.ts`), and `Collection.probeHeader` reads the
+header with `source.tryGet(id)` — the collection id used directly as a block id. So two nodes
+naming the same id are addressing the same header block; identity cannot fork, and there is
+nothing to gain by printing a block id separately (do not go looking for one — a collection id is
+simply its URI with `tree://` stripped). What CAN differ between two nodes is the revision each is
+reading that header at.
+
+#### Which revision did a read descend?
+
+`commit:collections` answers the write side. `index:seek`
+(`optimystic:quereus-plugin:module`) answers the read side — one line per index-driven scan:
+
+```
+optimystic:quereus-plugin:module index:seek table=Usage index=by_token collection=default/Usage/index/by_token main=default/Usage arm=committed rev=3 main_rev=7 seek=%01tok-a%00 matched=0
+```
+
+- `arm=committed` — a pre-transaction snapshot read, which deliberately never refreshes from the
+  network. `arm=live` — the scan ran `update()` on both trees immediately before descending.
+- `rev=` — the index collection's committed revision; `none` if that collection is invented.
+- `main_rev=` — the main table collection's revision at the same instant. A table's main tree and
+  its index trees are separate collections refreshed through different call sites, and a
+  collection's revision advances only when something calls `update()`/`sync()` on it — so the two
+  trees can be sitting at different moments, which is the failure this line exists to expose.
+
+  **Do not subtract `rev=` from `main_rev=`.** Every collection has its own independent revision
+  counter, so the two numbers are not on one scale and are routinely unequal on a perfectly healthy
+  run (`rev=4 main_rev=3` is normal). A revision is only comparable to another revision **of the
+  same collection** — this node's `rev=` against the writer's `commit:collections` revision for
+  that same collection id, or against the other node's `index:seek` `rev=`.
+- `collection=` / `main=` — the index collection's id and the main table collection's id. One
+  line therefore names both collections the scan read, and joins to `commit:collections` and
+  `index:tree-open`, which print the same ids.
+- `seek=` — the framed index key the descent bracketed on, percent-escaped (the framing carries
+  control bytes, so a raw key would break whitespace-separated parsing). Two nodes seeking the same
+  SQL value must print the same `seek=`; a difference means the key framing diverged rather than
+  the tree. An empty `seek=` is the whole-index prefix (a plan that wants every entry);
+  `seek=unset` means the scan returned before framing a key at all.
+- `matched=` — how many **index entries** the seek produced, counted before the row fetch. Rows
+  dropped later (missing row, predicate re-applied by the engine) still count here. It is a
+  **floor**: a scan the caller abandons early (a satisfied `LIMIT`, an error mid-scan) reports what
+  it had produced when it stopped, so `matched=0` still means the descent found nothing.
+
+When a row is written on node A and an index-driven lookup on node B cannot find it, read node B's
+`index:seek` line against node A's `commit:collections` revision for the same collection id:
+
+| Node B's index collection at the failing read | Reading |
+| --- | --- |
+| `rev=none` | Node B invented its own empty index collection and never adopted the committed one. |
+| `rev` lower than node A's commit revision | A refresh gap — the collection is real but stale; nothing called `update()` on it before the read. |
+| `rev` equal to node A's commit revision, `matched=0` | The write's index action did not survive commit despite being staged. Look at the sync/merge and conflict replay, not at refresh. |
+| `rev` equal, `matched>0`, but the SQL still returned no row | The index held the entry and the main-table fetch dropped it — compare `main_rev=` against node A's revision for the **table** collection (same collection on both sides), never against `rev=`. |
+| `seek=` differs between the two nodes for the same SQL value | Neither of the above: the two nodes framed different keys, so the seek never addressed the entry that was written. |
+
+For `arm=committed` over a tree that was staged into the in-flight transaction, the view is pinned
+to the transaction's first-touch boundary, which can be older than the `rev=` printed here (the
+collection's current revision); for a clean tree the two are the same moment.
+
+All three lines — `commit:collections`, `index:tree-open`, `index:seek` — are pinned by tests
+(`test/trace-helpers.ts` captures and parses them; the legacy commit case and the index seek live
+in `test/two-node-secondary-index-convergence.spec.ts`, the session commit case in
+`test/session-mode-commit.spec.ts`), so a change that stops emitting one of them fails the suite.
 
 ## Common DEBUG patterns
 
