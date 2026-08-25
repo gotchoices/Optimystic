@@ -958,7 +958,9 @@ export class CoordinatorRepo implements IRepo {
 			});
 			// ...and, when this decline is provably permanent rather than transient, say THAT once,
 			// in words. The `no-quorum` line above fires on every pass and cannot tell the two apart.
-			this.reportRepairDeadlock(blockId, claims, silent.length, nonSelfCount, answered, required);
+			this.reportRepairDeadlock({
+				blockId, claims, silentCount: silent.length, cohortPeers: nonSelfCount, answered, required, capacity
+			});
 			// The claims themselves must not drive restoration — but their existence is
 			// evidence the caller needs: an answer served below the highest claim cannot be
 			// confirmed current (see ClusterLatestQuery.uncorroboratedRev).
@@ -984,29 +986,32 @@ export class CoordinatorRepo implements IRepo {
 	}
 
 	/**
-	 * Say ONCE per block, in words, when a corroboration decline is provably PERMANENT — a
-	 * configuration deadlock rather than a transient shortage of answers.
+	 * Say ONCE per block, in words, when a corroboration decline is provably PERMANENT — a cohort too
+	 * small to supply the quorum rather than a transient shortage of answers.
 	 *
-	 * **What makes it provable.** With `silentCount === 0`, every cohort peer this node can see
-	 * answered. If the peers that answered still cannot supply the required number of agreeing
-	 * voters, the shortfall is not something a retry can fix: no peer was silenced, so no partition
-	 * and no attacker produced it. It follows from the deployment's machine count and its
-	 * `repairCorroborationClusterSize`, and it will hold identically on every later pass until one of
-	 * those changes. Twelve days of log archaeology went into re-deriving that fact from a thousand
-	 * identical `cluster-fetch:no-quorum` lines; the node knew it at the moment of each decline.
+	 * **What makes it provable.** Not "this pass fell short" — a pass falls short whenever some peer
+	 * simply does not hold the block *yet*, which that peer's own repair or the next commit fixes. The
+	 * decisive question is whether the cohort could supply the quorum AT ALL: ask what would be required
+	 * if every cohort peer answered and agreed — the best case any later pass can reach without new
+	 * machines — and compare it to how many peers the cohort has. Short of that best case the shortfall
+	 * is not the machine count, and saying PERMANENT would send the operator to change a number that was
+	 * never the problem. Twelve days of log archaeology went into re-deriving the real condition from a
+	 * thousand identical `cluster-fetch:no-quorum` lines; the node knows it at the moment of each
+	 * decline.
 	 *
-	 * **What is deliberately NOT reported.** A pass with any silent peer produces the same shortfall
-	 * and is *not* provably permanent: the silent peer may come back, and a reader cannot tell an
-	 * unreachable peer from a withholding one. Those keep the plain `no-quorum` line. Nor is a
-	 * decline where the voters DID show up and disagreed — that is a live cohort split, not a
-	 * deadlock. (With today's `quorumSize` arithmetic the want-of-voters case reduces to exactly one
-	 * claim, so `distinctPairs` can only be 1 here; the check is written generally anyway, because it
-	 * encodes the intent rather than the current numbers, and it costs one Set.)
+	 * **What is deliberately NOT reported.** A cohort that answers unanimously "I hold nothing" — an
+	 * agreed absence is an answer, not a failed repair. A pass with any silent peer: silence cannot
+	 * change the arithmetic (`cohortPeers` counts silent peers too), but it does mean this node saw less
+	 * than the whole picture, and the next clean pass says the same thing at no cost. Note there is
+	 * deliberately NO "the claims disagreed" exemption: a cohort too small to reach quorum stays too
+	 * small whether its peers agree or not, so disagreement would suppress a line that is still true.
 	 *
-	 * **Never a lever.** This only classifies and logs. Relaxing the floor because peers went silent
-	 * — including the tempting "measure capacity by who answered" variant — is precisely the attack
-	 * `corroboratorCapacity` exists to stop: a routing-level attacker who shrinks a reader's cohort
-	 * view to itself plus one accomplice produces `answered === 1` with nobody silent.
+	 * **Never a lever.** This only classifies and logs; it never relaxes a floor. Which is also why the
+	 * message names *two* readings of the same numbers — a deployment that genuinely runs this few
+	 * machines, or a cohort view shrunk below the real deployment by a partition or by an attacker with
+	 * routing influence. `corroboratorCapacity` keeps the shrunken view out of the relaxed branch, but
+	 * this node cannot tell the two apart from the inside, and an operator sent to fix the wrong one is
+	 * the failure this line exists to end.
 	 *
 	 * NOTE: the reader is still told only "this may be stale" — `BlockPossiblyStaleError` implies a
 	 * retry might help, which is wrong advice for a block whose repair is deadlocked as configured.
@@ -1014,23 +1019,29 @@ export class CoordinatorRepo implements IRepo {
 	 * that error's documented contract; deliberately out of scope here (see the ticket
 	 * `repair-deadlock-is-never-named`, *Not this ticket*).
 	 */
-	private reportRepairDeadlock(
-		blockId: BlockId,
-		claims: RevClaim[],
-		silentCount: number,
-		cohortPeers: number,
-		answered: number,
-		required: number
-	): void {
-		// Any silence and this pass proves nothing — a silent peer may be the missing voter.
+	private reportRepairDeadlock(pass: {
+		blockId: BlockId;
+		claims: RevClaim[];
+		silentCount: number;
+		/** Cohort peers besides this node, from the cohort view — whether they answered or not. */
+		cohortPeers: number;
+		answered: number;
+		/** The quorum THIS pass demanded, computed from the peers that actually claimed. */
+		required: number;
+		/** `corroboratorCapacity` for this pass — a function of the view and the resolved size, not of who answered. */
+		capacity: number;
+	}): void {
+		const { blockId, claims, silentCount, cohortPeers, answered, required, capacity } = pass;
+		// An incomplete picture proves nothing about the deployment; the next clean pass says it.
 		if (silentCount > 0) return;
 		// Nobody claimed anything: the cohort agrees the block is absent, which is an answer, not a
 		// deadlock.
 		if (claims.length === 0) return;
-		// The voters that answered disagreed → a cohort split, not a shortage of voters.
-		if (new Set(claims.map(c => `${c.rev}\0${c.actionId}`)).size !== 1) return;
-		// Enough voters answered and the quorum still declined → likewise not a shortage.
-		if (claims.length >= required) return;
+		// The decisive test. `requiredEvenIfAllAnswered` is the quorum this cohort would face with every
+		// one of its peers answering and agreeing — the best case reachable without adding machines. If
+		// the cohort can meet it, this decline is a peer that does not hold the block yet, not a deadlock.
+		const requiredEvenIfAllAnswered = quorumSize(cohortPeers, this.simpleMajorityThreshold, capacity);
+		if (cohortPeers >= requiredEvenIfAllAnswered) return;
 
 		const state = this.unsettledAheadClaims.get(blockId);
 		if (state?.deadlockReported) return;
@@ -1041,24 +1052,33 @@ export class CoordinatorRepo implements IRepo {
 			answered,
 			claimants: claims.length,
 			required,
+			requiredEvenIfAllAnswered,
 			repairCorroborationClusterSize: this.repairCorroborationClusterSize,
 			message:
-				`Block repair cannot converge in this deployment and the condition is PERMANENT, not transient: ` +
-				`all ${answered} cohort peer(s) besides this node answered (${claims.length} of them hold the block, ` +
-				`and they agree on the same revision), but accepting a revision requires ${required} agreeing peers ` +
-				`and this node's whole cohort holds only ${cohortPeers}. No peer was silent, so no partition or ` +
-				`unreachable peer is involved — every later pass declines identically until the machine count or the ` +
-				`configuration changes, and this node's copy of the block stays as it is. Repair needs ` +
+				`Block repair cannot converge for this block and the condition is PERMANENT, not transient: ` +
+				`this node's cohort has ${cohortPeers} peer(s) besides itself, all of them answered ` +
+				`(${claims.length} hold the block), but accepting a revision would need ${requiredEvenIfAllAnswered} ` +
+				`agreeing peers even if every one of those ${cohortPeers} answered and agreed. No later pass can reach ` +
+				`that, however healthy every peer is, so this node's copy of the block stays as it is. Repair needs ` +
 				`${CORROBORATION_FLOOR} cohort peers BESIDES the reader to answer and agree, relaxed to 1 only for a ` +
 				`cohort that DECLARES it is smaller; repairCorroborationClusterSize currently resolves to ` +
-				`${this.repairCorroborationClusterSize}. Fix: set clusterPolicy.assumedClusterSize to the number of ` +
-				`machines you actually run (it does not lower clusterSize / the replication factor), or set an ` +
-				`honest clusterSize — and run at least ${CORROBORATION_FLOOR + 2} machines for any tolerance of one ` +
-				`unreachable peer.`
+				`${this.repairCorroborationClusterSize}. Two things produce this, and this node cannot tell them ` +
+				`apart: (1) the deployment really does run this few machines — set clusterPolicy.assumedClusterSize ` +
+				`to the number you actually run (it does not lower clusterSize / the replication factor), or set an ` +
+				`honest clusterSize, and run at least ${CORROBORATION_FLOOR + 2} machines for any tolerance of one ` +
+				`unreachable peer; or (2) this node's view of the cohort has shrunk below the real deployment — a ` +
+				`partition or a routing problem, which configuration will not fix. Check the peer count above ` +
+				`against the machines you run before changing anything.`
 		});
 		// Hung off the existing per-block freshness entry rather than a fourth per-block map. The entry
 		// survives `recordAheadClaim` clearing its `rev`, and is dropped wholesale once the block
 		// converges — so the line is said once per non-convergence episode, not once per pass.
+		// NOTE: per BLOCK, though the condition is a property of the cohort, not of any block — so a node
+		// in this state that reads N distinct blocks emits N lines. Deliberate: the operator wants to
+		// know which blocks are stuck, and N is bounded by blocks actually read (1821 lines for a single
+		// block was the defect). If a deployment in this state ever makes this the noisy line again, add
+		// a node-level once-flag keyed on (cohortPeers, requiredEvenIfAllAnswered) and let the per-block
+		// entry only suppress repeats.
 		this.unsettledAheadClaims.set(blockId, { ...(state ?? {}), deadlockReported: true });
 	}
 

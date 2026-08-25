@@ -80,3 +80,27 @@ Two things this changes for the extraction:
 The extraction's own acceptance test should be strengthened accordingly: the collaborator's single
 entry point has to return existence and currency as *separate, named* results, not a pair of
 booleans, or the same class of flattening can reappear behind the new seam.
+
+
+## Third instance (added by the review pass on `repair-deadlock-is-never-named`)
+
+Re-measured after that ticket landed (`wc -l packages/db-p2p/src/repo/coordinator-repo.ts`):
+**1341 lines**, up from 1194. Two things about *how* it grew belong here rather than in a ticket of
+their own:
+
+- The new per-block fact — "we have already said this block's repair cannot converge" — had nowhere
+  natural to live, so it was hung off the existing unresolved-claim entry by widening that entry's
+  value from a plain number to a small record (`AheadClaimState`). That is a reasonable local call
+  and it is commented, but it is the third fact sharing one map for no reason other than "there was
+  already a map", and it needed two explicit lifetime carve-outs at the call sites to behave: one
+  for a claim being cleared, one for a block that is missing locally and never reaches the recording
+  path at all.
+- The consult now also has to answer a *classification* question ("is this decline permanent, or is
+  some peer merely behind?") whose inputs — how many peers the cohort has, how many answered, what
+  the quorum would demand in the best case — are exactly the loose values this ticket is about.
+  Getting that classification wrong the first time is what the review pass caught.
+
+Neither is a new defect, and neither changes the shape of the extraction. They are the strongest
+argument yet for the acceptance criterion already stated above: the collaborator that owns freshness
+should own the *record* of what an earlier pass concluded too, with each fact named and its lifetime
+stated in one place, rather than lifetimes reconstructed at three call sites.

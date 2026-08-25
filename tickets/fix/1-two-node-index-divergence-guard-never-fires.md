@@ -108,9 +108,14 @@ noted did not look like index blindness.
 
 In the sereus node startup logs, look for:
 
-- `cluster-policy` → `assumed-cluster-size-unset` (fires once per node construction whenever
-  `assumedClusterSize` is undeclared and `clusterSize > 2`), and
-- `coordinator-repo` → `cluster-fetch:no-quorum` with `responders: 1, required: 2`.
+- `cluster-policy` → `repair-fault-tolerance` (fires once per node construction whenever
+  `assumedClusterSize` is undeclared and `clusterSize > 2`, or the resolved cohort size is three or
+  fewer; the payload flag `cohortUndeclared: true` is the arm that matters here). This tag was
+  called `assumed-cluster-size-unset` before ticket `repair-deadlock-is-never-named` renamed and
+  widened it — grep for both if the logs predate that.
+- `coordinator-repo` → `cluster-fetch:no-quorum` with `responders: 1, required: 2`, and — on a node
+  running the renamed build — `cluster-fetch:repair-deadlock` once per block, which names this exact
+  condition in words.
 
 Both present ⇒ this is the same defect as the three-node ticket, seen at two nodes, and it is
 **configuration-reachable**: set `clusterPolicy.assumedClusterSize` to the real node count and rerun

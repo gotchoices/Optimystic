@@ -508,16 +508,27 @@ saveMaterializedBlock(block): store(structuredClone(block));
     (This is the renamed, widened successor to `assumed-cluster-size-unset`, which fired only when
     the size was undeclared and told operators three machines "can ignore this".)
   - **`cluster-fetch:repair-deadlock`** (`CoordinatorRepo.reportRepairDeadlock`), once per block,
-    when a decline is provably permanent: every cohort peer this node can see answered, they agreed,
-    and there were still not enough of them. With nobody silent, no partition and no attacker
-    produced the shortfall — it follows from the machine count and the configuration and will hold
-    on every later pass. A pass with *any* silent peer is deliberately excluded (a silent peer may
-    return, and a reader cannot tell an unreachable peer from a withholding one), as is a decline
-    where the voters did show up and disagreed. Those keep the per-pass `cluster-fetch:no-quorum`
-    line, which still fires on every decline. The once-per-block suppression hangs off the existing
-    `unsettledAheadClaims` entry and clears when the block converges. The reader-facing error is
-    *not* yet aware of this: `BlockPossiblyStaleError` still implies a retry might help, which is
-    wrong advice for a deadlocked repair — see the `NOTE:` at `reportRepairDeadlock`.
+    when a decline is provably permanent — meaning the *cohort is too small to reach the quorum at
+    all*, not merely that this pass fell short. The test is explicit: compute what the quorum would
+    demand if **every** cohort peer answered and agreed (`requiredEvenIfAllAnswered`, reported in
+    the payload) and compare it to how many peers the cohort has. Only when the cohort cannot meet
+    even that best case is the shortfall beyond any later pass's reach. Per the table above, that is
+    the row where repair says *never*: one peer besides the reader, with the size undeclared.
+    Deliberately excluded: a shortfall where the cohort *could* reach quorum and some peer simply
+    does not hold the block yet (that peer's own repair, or the next commit, fixes it); a cohort
+    that unanimously answers "I hold nothing" (an agreed absence is an answer); and a pass with any
+    silent peer (silence does not change the arithmetic — silent peers are still counted — but a
+    node that could not ask everyone should not make a permanent claim, and the next clean pass
+    costs nothing). There is deliberately **no** "the claims disagreed" exemption: a cohort too
+    small to reach quorum stays too small whether its peers agree or not. All of those keep the
+    per-pass `cluster-fetch:no-quorum` line, which still fires on every decline. The message names
+    *two* readings of the same numbers, because the node cannot tell them apart from the inside: a
+    deployment that genuinely runs this few machines, or a cohort view shrunk below the real
+    deployment by a partition or by routing influence — configuration will not fix the second. The
+    once-per-block suppression hangs off the existing `unsettledAheadClaims` entry and clears when
+    the block converges. The reader-facing error is *not* yet aware of this:
+    `BlockPossiblyStaleError` still implies a retry might help, which is wrong advice for a
+    deadlocked repair — see the `NOTE:` at `reportRepairDeadlock`.
 
   No rev quorum, or no content quorum →
   it leaves the block for a later churn/rebalance retry (logged
