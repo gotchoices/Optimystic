@@ -256,6 +256,48 @@ describe('ClusterService redirect logic', () => {
 			expect(addrsById[dialedUs.toString()],
 				`the source socket ${sourceSocket} is reachable by nobody else`).to.deep.equal([]);
 		});
+
+		/**
+		 * Ticket: third-party-address-set-has-two-definitions.
+		 *
+		 * The direction filter above is only half the rule; the other half is the peer's own
+		 * advertised addresses, which `identify` puts in the peerStore. `RepoService`'s equivalent
+		 * fallback is covered in `redirect.spec.ts`, but the two services reach the node by
+		 * different routes — `RepoService` through an injected `setLibp2p`, `ClusterService`
+		 * through the (throw-happy) components proxy — so this asserts that the object this
+		 * service hands `publishableAddrsForPeer` really does carry the peerStore.
+		 */
+		it('reading connections itself, unions in what the peer advertised to us', async () => {
+			const self = await makePeerId();
+			const dialedUs = await makePeerId();
+			const relay = await makePeerId();
+			const sourceSocket = `/ip4/127.0.0.1/tcp/58247/p2p/${dialedUs.toString()}`;
+			const advertised = `/ip4/10.0.0.9/tcp/4001/p2p/${relay.toString()}/p2p-circuit`;
+			const service = new ClusterService(
+				makeComponents({
+					cluster: makeStubCluster(),
+					peerId: self,
+					libp2p: {
+						peerId: self,
+						getConnections: () => [{ direction: 'inbound', remoteAddr: { toString: () => sourceSocket } }],
+						peerStore: {
+							get: async (pid: PeerId) => pid.equals(dialedUs)
+								? { addresses: [{ multiaddr: { toString: () => advertised } }] }
+								// libp2p's peerStore THROWS for a peer it has no record of.
+								: (() => { throw new Error('Not Found'); })()
+						}
+					}
+				}),
+				{ responsibilityK: 1 }
+			);
+
+			const result = await service.checkRedirect(makeRecord(makePeers([dialedUs])));
+
+			expect(result).to.not.be.null;
+			expect(result!.redirect.peers[0]!.addrs,
+				'a sibling that only ever dialed us is described by its advertised circuit address, not by nothing')
+				.to.deep.equal([advertised]);
+		});
 	});
 
 	/**

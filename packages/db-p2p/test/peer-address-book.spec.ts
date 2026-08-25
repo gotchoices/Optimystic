@@ -14,7 +14,7 @@ import type { Multiaddr } from '@multiformats/multiaddr';
 import { CID } from 'multiformats/cid';
 import * as Digest from 'multiformats/hashes/digest';
 import { base58btc } from 'multiformats/bases/base58';
-import { classifySelfDialability, mergePeerAddresses, mergeRecordPeerAddresses, publishableConnectionAddr, routesThroughRelay, validMultiaddrStrings, MAX_MERGED_ADDRS_PER_PEER, MAX_LEARNED_PEERS_PER_RECORD, type PeerAddressBookHost, type SelfDialability } from '../src/peer-address-book.js';
+import { classifySelfDialability, mergePeerAddresses, mergeRecordPeerAddresses, publishableAddrsForPeer, publishableConnectionAddr, routesThroughRelay, unionPublishableAddrs, validMultiaddrStrings, MAX_MERGED_ADDRS_PER_PEER, MAX_LEARNED_PEERS_PER_RECORD, type PeerAddressBookHost, type SelfDialability } from '../src/peer-address-book.js';
 
 const makePeerId = async (): Promise<PeerId> => peerIdFromPrivateKey(await generateKeyPair('Ed25519'));
 
@@ -108,6 +108,146 @@ describe('peer-address-book', () => {
 				expect(publishableConnectionAddr(conn, log)).to.equal(c.publishable ? addr : undefined);
 			});
 		}
+	});
+
+	/**
+	 * Ticket: third-party-address-set-has-two-definitions.
+	 *
+	 * `publishableConnectionAddr` above decides only the DIRECTION half. These two join that half
+	 * to the peer's own advertised addresses and are the single answer every producer gives to
+	 * "what may we hand a third party for peer P?" — `findCluster` fills a cluster record from it
+	 * and all three redirect-address resolvers fill a redirect payload from it. Pinned here, on the
+	 * rule itself, rather than only through whichever service happens to call it: the ordering and
+	 * the peerStore failure mode are properties of the rule, and a caller-level test alone would
+	 * let a fifth caller reintroduce the divergence this ticket closed.
+	 */
+	describe('unionPublishableAddrs', () => {
+		it('leads with the connection half, appends the advertised half, and de-duplicates', () => {
+			const { log } = makeLog();
+			const dialed = '/ip4/10.0.0.5/tcp/4001';
+			const advertised = '/ip4/192.168.1.9/tcp/4001';
+			// The advertised half is listed advertised-first here on purpose: the peerStore's own
+			// ordering must not decide the payload's. The peerStore normally also holds the very
+			// address we dialed, and that copy must not take a second slot, while the address
+			// libp2p has already succeeded with stays first — position is what decides survival
+			// when the recipient truncates (see below).
+			expect(unionPublishableAddrs([dialed], [advertised, dialed], log)).to.deep.equal([dialed, advertised]);
+		});
+
+		it('validates the advertised half, which arrives from a peerStore or off the wire', () => {
+			const { log, lines } = makeLog();
+			const dialed = '/ip4/10.0.0.5/tcp/4001';
+			// '' parses as the root multiaddr `/` and encodes to zero bytes; both forms must be
+			// rejected here, or an unreachable entry occupies a slot in every recipient.
+			expect(unionPublishableAddrs([dialed], ['not-a-multiaddr', ''], log)).to.deep.equal([dialed]);
+			expect(lines.filter(l => l.startsWith('WARN:')), 'a dropped address must be visible').to.have.length(2);
+		});
+
+		it('keeps the proven addresses when the recipient truncates at the per-peer cap', async () => {
+			const self = await makePeerId();
+			const other = await makePeerId();
+			const { host, merged } = makeHost(self);
+			const { log } = makeLog();
+			// Three addresses we dialed, then more advertised ones than the cap can admit.
+			const proven = addrs(3);
+			const claimed = addrs(MAX_MERGED_ADDRS_PER_PEER + 5).map(a => a.replace('/ip4/127.0.0.1/', '/ip4/10.9.9.9/'));
+
+			mergePeerAddresses(host, other, unionPublishableAddrs(proven, claimed, log), log);
+
+			const kept = merged[0]!.multiaddrs.map(ma => ma.toString());
+			expect(kept, 'the cap keeps the leading addresses').to.have.length(MAX_MERGED_ADDRS_PER_PEER);
+			expect(kept, 'connection-first ordering is load-bearing: truncation must never drop an address that already worked')
+				.to.include.members(proven);
+		});
+	});
+
+	describe('publishableAddrsForPeer', () => {
+		/** A peerStore that answers for `advertised` and THROWS for anyone else, as libp2p's does. */
+		const makeReadHost = (self: PeerId, advertised: Record<string, string[]>): PeerAddressBookHost => ({
+			peerId: self,
+			peerStore: {
+				get: async (id: PeerId) => {
+					const found = advertised[id.toString()];
+					if (found === undefined) throw new Error('Not Found');
+					return { addresses: found.map(a => ({ multiaddr: { toString: () => a } })) };
+				}
+			}
+		});
+
+		it('describes an inbound-only peer by what identify told us, never by its source socket', async () => {
+			const self = await makePeerId();
+			const other = await makePeerId();
+			const relay = await makePeerId();
+			const sourceSocket = '/ip4/127.0.0.1/tcp/58247';
+			const circuit = `/ip4/10.0.0.9/tcp/4001/p2p/${relay.toString()}/p2p-circuit`;
+			const { log } = makeLog();
+
+			const got = await publishableAddrsForPeer(
+				makeReadHost(self, { [other.toString()]: [circuit] }),
+				[{ direction: 'inbound', remoteAddr: { toString: () => sourceSocket } }],
+				other,
+				log
+			);
+
+			// The whole point of the ticket: connections alone described this peer as addressless
+			// while its real circuit address sat in the peerStore the entire time.
+			expect(got, 'an inbound-only peer is not addressless — the peerStore is its whole answer')
+				.to.deep.equal([circuit]);
+		});
+
+		it('unions both halves for a peer we dialed that also advertised to us', async () => {
+			const self = await makePeerId();
+			const other = await makePeerId();
+			const dialed = '/ip4/10.0.0.5/tcp/4001';
+			const advertised = '/ip4/192.168.1.9/tcp/4001';
+			const { log } = makeLog();
+
+			const got = await publishableAddrsForPeer(
+				makeReadHost(self, { [other.toString()]: [dialed, advertised] }),
+				[
+					{ direction: 'outbound', remoteAddr: { toString: () => dialed } },
+					{ direction: 'inbound', remoteAddr: { toString: () => '/ip4/127.0.0.1/tcp/58247' } }
+				],
+				other,
+				log
+			);
+
+			expect(got).to.deep.equal([dialed, advertised]);
+		});
+
+		it('yields the connection half when the peerStore misses, fails, or is absent', async () => {
+			const self = await makePeerId();
+			const other = await makePeerId();
+			const dialed = '/ip4/10.0.0.5/tcp/4001';
+			const conns = [{ direction: 'outbound' as const, remoteAddr: { toString: () => dialed } }];
+			const hosts: Array<[string, PeerAddressBookHost]> = [
+				['a peer the store has never heard of', makeReadHost(self, {})],
+				['a peerStore that throws outright', { peerId: self, peerStore: { get: async () => { throw new Error('peerStore exploded'); } } }],
+				['a peerStore holding no addresses', { peerId: self, peerStore: { get: async () => ({ addresses: [] }) } }],
+				['no peerStore at all', { peerId: self }]
+			];
+
+			for (const [what, host] of hosts) {
+				const { log, lines } = makeLog();
+				expect(await publishableAddrsForPeer(host, conns, other, log), `${what}: half an answer beats none`)
+					.to.deep.equal([dialed]);
+				// A miss is the ordinary case — a redirect routinely names peers we have never met —
+				// so it must not be reported as input we were handed and rejected.
+				expect(lines.filter(l => l.startsWith('WARN:')), `${what}: a miss is not a WARN`).to.have.length(0);
+			}
+		});
+
+		it('logs a peerStore miss rather than swallowing it', async () => {
+			const self = await makePeerId();
+			const other = await makePeerId();
+			const { log, lines } = makeLog();
+
+			await publishableAddrsForPeer(makeReadHost(self, {}), [], other, log);
+
+			expect(lines.some(l => l.startsWith('peer-address-book:peerstore-miss')),
+				'a peerStore failing for every peer would make the advertised half silently inert')
+				.to.equal(true);
+		});
 	});
 
 	/**
