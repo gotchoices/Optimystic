@@ -128,3 +128,36 @@ Merged from `debt-mesh-harness-reconcile-double-bypasses-quorum` (Arm A),
 `debt-mesh-level-partition-admission-regression` (Arm B), and `debt-mesh-client-signature-enforcement`
 (Arm C) during backlog gardening. Arm C's original `prereq: implement-client-tx-signature-p2p` is
 dropped — that ticket is complete.
+
+## Arm D — added 2026-08-24 from `fix/1-two-node-index-divergence-guard-never-fires`
+
+Same root cause as A/B/C, fourth instance: **the harness cannot express an undeclared cluster
+size, so no mock-mesh test can ever exercise the repair-corroboration floor.**
+
+`createMesh` passes `clusterSize: options.clusterSize ?? nodeCount` into the coordinator factory
+(`packages/db-p2p/src/testing/mesh-harness.ts`, phase 2). A caller that omits `clusterSize` — which
+every existing two-node mesh spec does — therefore gets an *honest* declaration, and
+`CoordinatorRepo` resolves `repairCorroborationClusterSize` to it. For a two-node mesh that is
+`corroboratorCapacity(1, 2) = 1`, the corroboration floor relaxes to one voter, and repair always
+converges.
+
+A real deployment that declares nothing resolves `repairCorroborationClusterSize` to
+`DEFAULT_CLUSTER_SIZE` (10), giving `corroboratorCapacity(1, 10) = 9`, a floor of 2, and a two-node
+cohort that can *never* repair — the permanent decline
+`tickets/complete/1-repair-deadlock-is-never-named.md` documents and names. The harness default
+silently excludes that entire class from every mesh test.
+
+Cost already paid: the 2026-08-13 investigation behind `secondary-index-update-never-reaches-the-sibling`
+reported that "eight two-node/two-Database shapes on the mock mesh all converged" and concluded the
+trigger "needs something the mock mesh lacks". Every one of those eight ran under a declared
+`clusterSize: 2`, so the repair-deadlock class could not have appeared in any of them. The
+conclusion was sound but the coverage claim behind it was weaker than it read.
+
+Done looks like: `MeshOptions` can express "the operator declared nothing" distinctly from "the
+operator declared `nodeCount`" — most directly by threading `clusterPolicy.assumedClusterSize`
+and letting `clusterSize` default to `DEFAULT_CLUSTER_SIZE` rather than to `nodeCount` — plus at
+least one spec that pins the permanent-decline shape on the mesh (two nodes, nothing declared, one
+holding a newer revision: expect `cluster-fetch:no-quorum` on every pass and exactly one
+`cluster-fetch:repair-deadlock`). Changing the default will surface which existing specs were
+relying on the relaxed floor; each of those is a judgement call in the same family as Arm A's
+fallout.

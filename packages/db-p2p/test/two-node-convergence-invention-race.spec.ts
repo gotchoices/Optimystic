@@ -61,6 +61,29 @@ describe('Two-node convergence after a collection-invention race', function () {
 		expect(await treeB.get(1)).to.deep.equal({ key: 1, value: 'from-A-1' });
 	});
 
+	// The PURE-READER arm of the same race, which every case around it misses: each of them
+	// has B write, and a write is what forces the invented instance to reconcile. A node that
+	// invents a collection and then only ever READS it is the shape a secondary-index
+	// sub-collection takes on a sibling that never writes to the indexed table — the symptom
+	// reported by `fix/1-two-node-index-divergence-guard-never-fires`. `update()` re-probes the
+	// header through a fresh source, so the invented instance does adopt the winner's log;
+	// asserted here so a change to updateInternal's header probe cannot silently strand a reader.
+	it('B sees A\'s rows after inventing the collection and NEVER writing to it', async () => {
+		const treeId = 'two-node-invention-race-pure-reader';
+		const keyFn = (entry: TestEntry) => entry.key;
+
+		// B opens first, before anything is committed anywhere, so B invents.
+		const treeB = await Tree.createOrOpen<number, TestEntry>(
+			transactorFor(transactors, mesh.nodes[1]!.peerId.toString()), treeId, keyFn);
+		const treeA = await Tree.createOrOpen<number, TestEntry>(
+			transactorFor(transactors, mesh.nodes[0]!.peerId.toString()), treeId, keyFn);
+
+		await treeA.replace([[1, { key: 1, value: 'from-A' }]]);
+
+		await treeB.update();
+		expect(await treeB.get(1)).to.deep.equal({ key: 1, value: 'from-A' });
+	});
+
 	it('B converges when both staged a write before either synced', async () => {
 		const treeId = 'two-node-invention-race-both-staged';
 		const keyFn = (entry: TestEntry) => entry.key;
