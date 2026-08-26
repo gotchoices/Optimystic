@@ -950,8 +950,8 @@ export class OptimysticVirtualTable extends VirtualTable {
    *   immediately before the scan.
    * - `rev=` / `main_rev=` — the index and main COLLECTIONS' committed revisions, each
    *   rendered `<rev>@<actionId>` by {@link revisionToken}: `none` for a collection that
-   *   has never adopted a revision, and a `@none` action half for a revision whose action
-   *   id has aged out of the collection's bounded committed list. Every collection counts
+   *   has never adopted a revision, and a `@none` action half for a revision slot the log
+   *   gave to a checkpoint or invalidation entry. Every collection counts
    *   its own revisions, so the two NUMBERS are not on one scale and are routinely unequal
    *   on a healthy run; do not make them look comparable by deriving one from the other
    *   here. The action ids are the exception — they are comparable across collections and

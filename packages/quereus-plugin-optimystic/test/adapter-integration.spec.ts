@@ -446,8 +446,8 @@ describe('TransactionBridge (TEST-7.3.1)', () => {
 			const bridge = plugin.txnBridge;
 
 			const base = { sync: async () => {}, snapshot: () => ({}), restore: () => {} };
-			// Revision present, lineage aged out of the bounded committed list: the shape a
-			// real Collection produces when its context holds no entry at its current rev.
+			// Revision present, no action recorded at it: the shape a real Collection produces
+			// when the log gave its current revision slot to a checkpoint or invalidation entry.
 			const aged = {
 				...base, describe: () => 'double/aged',
 				committedRevision: () => 4, committedActionId: () => undefined,
@@ -480,6 +480,55 @@ describe('TransactionBridge (TEST-7.3.1)', () => {
 				.to.equal('unknown');
 			expect(trace!.rev.get('double/unaskable'), 'and its revision half reads unknown too')
 				.to.equal('unknown');
+		});
+
+		// The `revs=` field carries THREE values per collection in one `,`-separated,
+		// whitespace-free token, and two of the three routinely contain a colon: a collection
+		// id is a URI path, and db-core stamps session-mode action ids as `tx:<hash>`. A pair
+		// split on the wrong separator does not fail loudly — it recovers an id that is not a
+		// collection id, which reads as the collection being ABSENT from the commit, the exact
+		// false negative this line exists to rule out. This drives the emitter and the parser
+		// together over ids and action ids that carry every separator involved.
+		it('recovers the collection id and revision from revs= whatever the action id carries', async () => {
+			const { plugin } = createTestEnv();
+			const bridge = plugin.txnBridge;
+
+			const base = { sync: async () => {}, snapshot: () => ({}), restore: () => {} };
+			// A realistic session-mode action id (colon-bearing) under a colon-bearing id.
+			const stamped = {
+				...base, describe: () => 'tree://double/stamped',
+				committedRevision: () => 9, committedActionId: () => 'tx:9Kd_bZ0',
+			};
+			// Everything the field's own framing uses, which the emitter must escape rather
+			// than emit raw: a comma (pair separator), an `@` (the token separator) and a
+			// space (the field separator).
+			const hostile = {
+				...base, describe: () => 'double/hostile',
+				committedRevision: () => 2, committedActionId: () => 'a,b@c d',
+			};
+
+			await bridge.beginTransaction(defaultOptions);
+			for (const tree of [stamped, hostile]) bridge.markDirty(tree);
+
+			const lines = await captureTrace(async () => {
+				await bridge.commitTransaction();
+			});
+
+			const trace = commitTraces(lines).find(t => t.ids.includes('double/hostile'));
+			expect(trace, `a legacy commit:collections line named the doubles; saw ${JSON.stringify(lines)}`)
+				.to.not.equal(undefined);
+			// The whole-set form of the claim, so it holds for any future action-id stamping:
+			// the ids recovered from `revs=` are exactly the ids the untouched `<id>=staged`
+			// half named — no pair ate part of an id, and none was dropped.
+			expect([...trace!.rev.keys()].sort(), 'every pair recovered its id intact')
+				.to.deep.equal([...trace!.ids].sort());
+			expect(trace!.rev.get('tree://double/stamped'), 'a colon-bearing id keeps its revision')
+				.to.equal('9');
+			expect(trace!.action.get('tree://double/stamped'), 'and a colon-bearing action id survives verbatim')
+				.to.equal('tx:9Kd_bZ0');
+			expect(trace!.action.get('double/hostile'), 'separators inside an action id are escaped, not emitted raw')
+				.to.equal('a%2Cb%40c%20d');
+			expect(trace!.rev.get('double/hostile'), 'so its revision is still recoverable').to.equal('2');
 		});
 
 		// Every one of these lines is attributed to the node that emitted it. Without that,

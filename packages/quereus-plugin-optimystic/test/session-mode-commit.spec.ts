@@ -550,6 +550,22 @@ describe('Staging-refactor unit gaps (Tree.restore no-op + bridge collection reg
 			// the registry stopped holding Collections.
 			expect([...carrying.rev.values()], 'no registry-sourced collection reads as unknown')
 				.to.not.include('unknown');
+			// The ACTION half, on the same footing and for the same reason: session mode is
+			// where the fork-vs-lag reading is actually taken, and it is built from a
+			// different expression than the legacy path (`Collection.committedActionId()`
+			// directly, versus the optional `DirtyTree` accessor).
+			expect([...carrying.action.values()], 'no registry-sourced collection reads as unknown')
+				.to.not.include('unknown');
+			expect(carrying.action.get(indexId), 'the index collection names the action behind its revision')
+				.to.not.be.oneOf([undefined, 'none', 'unknown']);
+			// Session-mode action ids are `tx:<hash>` — they CONTAIN A COLON, and so does a
+			// collection id. A `revs=` pair that is split on its last `:` rather than on its
+			// last `@` therefore parses an id that is not a collection id at all, silently
+			// reporting every collection ABSENT. Pin the whole set instead of the shape of one
+			// id, so this holds for any future action-id stamping: the ids recovered from
+			// `revs=` must be exactly the ids the untouched `<id>=staged` half named.
+			expect([...carrying.rev.keys()].sort(), 'every revs= pair recovers its collection id intact')
+				.to.deep.equal([...carrying.ids].sort());
 		} finally {
 			dispose?.();
 			db.close();

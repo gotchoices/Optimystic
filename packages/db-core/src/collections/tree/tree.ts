@@ -265,15 +265,10 @@ export class Tree<TKey, TEntry> implements TreeReadView<TKey, TEntry> {
 			return this.collection.committedRevision();
 	}
 
-	/** The action id that produced this tree's current committed revision — see
-	 * {@link Collection.committedActionId}. `undefined` when the collection's action
-	 * context holds no entry at that revision (including an invented collection, which
-	 * has no context at all).
-	 *
-	 * Diagnostic only. Printed beside {@link committedRevision} by the Quereus adapter's
-	 * trace lines, because the revision alone cannot separate "one collection, this node
-	 * lagging" from "two separately-built collections under one id" — the action id can.
-	 * Structurally satisfies the adapter's optional `DirtyTree.committedActionId()`. */
+	/** The action id that produced this tree's current committed revision, or `undefined`
+	 * when there is none to report — see {@link Collection.committedActionId} for what the
+	 * value means, when it is absent, and why it is diagnostic-only. Structurally satisfies
+	 * the Quereus adapter's optional `DirtyTree.committedActionId()`. */
 	committedActionId(): ActionId | undefined {
 			return this.collection.committedActionId();
 	}

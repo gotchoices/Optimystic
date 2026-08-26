@@ -81,8 +81,9 @@ const treeRevision = (tree: DirtyTree): number | 'none' | 'unknown' =>
  * The lineage marker to print beside {@link treeRevision} — the action that produced the
  * revision the tree is reading at. Same two "no answer" words, meaning the same two
  * things: `unknown` is "nobody asked" (a double without the method), `none` is "asked,
- * and the collection's bounded committed list holds no entry at that revision" (an
- * invented collection, or a revision whose action has aged out).
+ * and there is no action recorded at that revision" (an invented collection, or a
+ * revision slot the log gave to a checkpoint or invalidation entry — see
+ * `Collection.committedActionId`).
  *
  * The revision alone cannot separate "one collection, this node behind" from "two
  * separately-built collections under one id"; this can — see {@link revisionToken}.
@@ -464,8 +465,8 @@ export class TransactionBridge {
             staged: collection.hasUnsyncedChanges(),
             // A real Collection always implements these, so `unknown` is unreachable here;
             // `none` still is: for the revision it means the collection was invented in
-            // this process, and for the action id it additionally covers a revision whose
-            // action has aged out of the collection's bounded committed list.
+            // this process, and for the action id it additionally covers a revision slot
+            // the log gave to a checkpoint or invalidation entry.
             rev: collection.committedRevision() ?? 'none' as const,
             action: collection.committedActionId() ?? 'none' as const,
           })));
@@ -582,9 +583,15 @@ export class TransactionBridge {
    * differ is which revision of it each reads — and the ACTION ID is the discriminator the
    * revision cannot be, because two nodes that each built their own copy of a collection
    * each count their own revisions and so report numbers that look like ordinary lag.
-   * Neither half ever contains `:`, so splitting each pair on its LAST `:` recovers the id
-   * whatever it holds; the value then splits on its FIRST `@`, since the revision half is
-   * a number or one of those two words and an action id is opaque.
+   *
+   * SPLITTING A PAIR, in this order — `,` first, then the LAST `@`, then the LAST `:`.
+   * The id half may contain `:` (it is a URI path) and, in principle, `@`; the revision
+   * half contains neither; the action id half routinely contains `:` — db-core stamps
+   * session-mode action ids as `tx:<hash>`, which is the mode a multi-node deployment
+   * actually runs — but can contain neither `@` nor `,`, because {@link revisionToken}
+   * escapes those. So: take everything after the LAST `@` as the action id, then split
+   * what is left on its LAST `:` into id and revision. Splitting on the FIRST `@`, or on
+   * the last `:` of the whole pair, tears a `tx:`-shaped action id in half.
    *
    * A trailing `node=` names the node that emitted the line
    * ({@link CollectionFactory.nodeTag}) — appended last for the same additive reason the

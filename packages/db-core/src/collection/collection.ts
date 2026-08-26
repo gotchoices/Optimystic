@@ -483,10 +483,19 @@ export class Collection<TAction> implements ICollection<TAction> {
 	 * this collection's lineage marker at that revision — or `undefined` when the action
 	 * context holds no entry at the current revision.
 	 *
-	 * `undefined` is a legitimate, common state, not an error: the context's `committed`
-	 * list is bounded (it holds the actions that may not have been checkpointed yet), and
-	 * an INVENTED collection has no context at all. A caller printing this must therefore
-	 * carry a placeholder rather than invent an id.
+	 * `undefined` is legitimate, not an error, and has exactly two causes. An INVENTED
+	 * collection has no context at all. Otherwise the current revision's slot in the log
+	 * belongs to an entry that carries no action — a CHECKPOINT or an INVALIDATION entry
+	 * takes a revision of its own — so a context freshly read off such a log
+	 * ({@link Log.getActionContext}, {@link Log.getFrom}) holds no `ActionRev` at its own
+	 * `rev`. A caller printing this must therefore carry a placeholder rather than invent
+	 * an id. The contexts this class writes itself ({@link recordCommitted}, the inline
+	 * bump in `syncInternal`, {@link bootstrapContext}) always do hold one.
+	 *
+	 * NOTE: linear in `committed`, which grows one entry per commit between context reads;
+	 * fine now — every caller is a `debug`-gated diagnostic behind `log.enabled`, so this
+	 * does not run on a normal path at all. If a non-diagnostic caller ever appears, index
+	 * the lookup or search from the end (the entry at `rev` is normally the last one).
 	 *
 	 * DIAGNOSTIC ONLY — do not branch on this. Its value is the one thing about a revision
 	 * that IS comparable across collections and across nodes: a revision number is

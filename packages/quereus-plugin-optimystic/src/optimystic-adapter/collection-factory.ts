@@ -1,5 +1,6 @@
 import type { ITransactor, IKeyNetwork, CollectionId, PeerId, IRepo, IBlockChangeNotifier, CollectionChangeListener, TransactionSigner } from '@optimystic/db-core';
 import { Tree, NetworkTransactor, isBlockChangeNotifier, bytesToB64url } from '@optimystic/db-core';
+import { randomBytes } from '@noble/hashes/utils.js';
 import {
 	createLibp2pNode,
 	DEFAULT_CLUSTER_SIZE,
@@ -30,11 +31,13 @@ type FactoryNode = Libp2p & Partial<OptimysticNodeAttachments>;
  * A short, whitespace-free identifier for one node, used only to label trace lines.
  * Four random bytes rendered base64url — six characters, enough that two nodes in one
  * mesh do not collide by accident, short enough to sit on every line without crowding it.
+ *
+ * Drawn from `@noble/hashes` like every other random draw in this repo, rather than
+ * `globalThis.crypto`, so the module keeps loading everywhere the package claims to run
+ * (React Native has no global WebCrypto without a polyfill).
  */
 function randomNodeTag(): string {
-  const bytes = new Uint8Array(4);
-  globalThis.crypto.getRandomValues(bytes);
-  return bytesToB64url(bytes);
+  return bytesToB64url(randomBytes(4));
 }
 
 /**

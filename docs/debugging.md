@@ -103,7 +103,7 @@ make that answerable from a log; enable both (`DEBUG='optimystic:quereus-plugin:
 `DEBUG='optimystic:quereus-plugin:txn-bridge,optimystic:quereus-plugin:module'` if that is noisy):
 
 ```
-optimystic:quereus-plugin:txn-bridge commit:collections mode=legacy count=2 default/Usage=staged default/Usage/index/by_token=staged revs=default/Usage:7@Kx9f-2Qa,default/Usage/index/by_token:3@bT1r_04c node=A
+optimystic:quereus-plugin:txn-bridge commit:collections mode=legacy count=2 default/Usage=staged default/Usage/index/by_token=staged revs=default/Usage:7@tx:Kx9f-2Qa,default/Usage/index/by_token:3@tx:bT1r_04c node=A
 optimystic:quereus-plugin:module index:tree-open table=Usage index=by_token uri=tree://default/Usage/index/by_token collection=default/Usage/index/by_token node=A
 ```
 
@@ -123,8 +123,8 @@ Reading `commit:collections` — one line per commit, emitted **before** the flu
   process staged a fresh empty one, so it has no committed revision at all. `:unknown` appears only
   for a test double that does not implement the accessor. Both words mean the same two things in
   the action half — `@none` is "asked, and there is no action recorded at that revision" (an
-  invented collection, or an action that has aged out of the collection's bounded committed list),
-  `@unknown` is "the source could not be asked". The revision is the discriminator the id cannot be
+  invented collection, or a revision slot the log gave to a checkpoint or invalidation entry, which
+  take a revision of their own but carry no action), `@unknown` is "the source could not be asked". The revision is the discriminator the id cannot be
   (see the note below on ids being block ids), and the **action id is the discriminator the
   revision cannot be** — see *Comparing action ids* below.
 - A trailing `node=` field names the node that emitted the line. See *Which node emitted this
@@ -137,10 +137,14 @@ Reading `commit:collections` — one line per commit, emitted **before** the flu
   reader look one revision stale, and a genuinely stale reader look converged.
 - The revisions are a **separate trailing field on purpose**, not folded into the id tokens: the
   `<id>=staged|clean|unknown` tokens are unchanged from before revisions existed, so an existing
-  grep or parser keyed on a collection id keeps matching. Each `revs=` pair splits on its LAST `:`
-  (ids may contain colons; neither half of the value does), and the value then splits on its FIRST
-  `@` (the revision half is a number or one of those two words; an action id is opaque). `node=`
-  was likewise appended last, so every token that predates it stayed where it was.
+  grep or parser keyed on a collection id keeps matching. `node=` was likewise appended last, so
+  every token that predates it stayed where it was.
+- **Splitting a `revs=` pair: on `,`, then on the LAST `@`, then on the LAST `:` — in that order.**
+  Both the id half and the action-id half contain colons in ordinary use (an id is a URI path, and
+  db-core stamps session-mode action ids as `tx:<hash>`), so splitting the whole pair on its last
+  `:` tears the action id in half. The `@` is unambiguous in the other direction: any `@` inside an
+  action id is escaped `%40`, so the last `@` in a pair is always the separator. Take everything
+  after it as the action id, then split what is left on its last `:` into id and revision.
 - `count=` is emitted **before** the id list, so a truncated line still reports how many
   collections there were; if `count=` and the number of ids disagree, the line was truncated.
 - Ids are sorted, so two nodes' lines compare directly by eye. `count=0` is normal — a commit whose
@@ -168,7 +172,7 @@ reading that header at.
 (`optimystic:quereus-plugin:module`) answers the read side — one line per index-driven scan:
 
 ```
-optimystic:quereus-plugin:module index:seek table=Usage index=by_token collection=default/Usage/index/by_token main=default/Usage arm=committed rev=3@bT1r_04c main_rev=7@Kx9f-2Qa seek=%01tok-a%00 matched=0 node=A
+optimystic:quereus-plugin:module index:seek table=Usage index=by_token collection=default/Usage/index/by_token main=default/Usage arm=committed rev=3@tx:bT1r_04c main_rev=7@tx:Kx9f-2Qa seek=%01tok-a%00 matched=0 node=A
 ```
 
 - `arm=committed` — a pre-transaction snapshot read, which deliberately never refreshes from the
@@ -177,8 +181,8 @@ optimystic:quereus-plugin:module index:seek table=Usage index=by_token collectio
   that produced it; `none` when that collection has adopted no committed revision at all — either
   it was invented locally, or nothing has been committed under its id yet (see the caveat under the
   table below, which separates the two). `@none` in the action half means no action is recorded at
-  that revision (an invented collection, or one whose action has aged out of its bounded committed
-  list).
+  that revision (an invented collection, or a revision slot the log gave to a checkpoint or
+  invalidation entry).
 - `main_rev=` — the main table collection's revision, and its action id, at the same instant. A table's main tree and
   its index trees are separate collections refreshed through different call sites, and a
   collection's revision advances only on an explicit call on that collection — `update()`/`sync()`
@@ -234,8 +238,17 @@ Call that `landed` below. Getting this step wrong inverts every row of the table
 | `rev` at or above `landed`, `matched=0` | The write's index action did not survive commit despite being staged. Look at the sync/merge and conflict replay, not at refresh. (`above` is normal: any later commit under that id moves the collection past `landed`.) |
 | `rev` at or above `landed`, `matched>0`, but the SQL still returned no row | The index held the entry and the main-table fetch dropped it — compare `main_rev=` against `landed` for the **table** collection (same collection on both sides), never against `rev=`. |
 | `seek=` differs between the two nodes for the same SQL value | Neither of the above: the two nodes framed different keys, so the seek never addressed the entry that was written. |
-
 | A live refresh ran immediately before the read and `rev` did not move | Split it by action id. **Same action id at a lower revision than `landed`**: the refresh ran and closed nothing, so the gap is real — the node is genuinely behind on one collection. **Different action id at the same revision as another node's**: the two nodes are not on one collection at all; each built its own copy under the same id, each counting its own revisions. |
+
+`none` on its own is not proof of the invention race — a collection that has legitimately never
+been committed yet also reports `none`, and a first insert normally shows the main table collection
+at `:none` in the very `commit:collections` line that creates it. `none` is a finding only when
+something has already been committed under that id, which is exactly the case the table above
+scopes to (node A committed first).
+
+For `arm=committed` over a tree that was staged into the in-flight transaction, the view is pinned
+to the transaction's first-touch boundary, which can be older than the `rev=` printed here (the
+collection's current revision); for a clean tree the two are the same moment.
 
 #### Comparing action ids
 
@@ -257,7 +270,8 @@ same collection id + same revision + DIFFERENT action ids → two separate colle
 ```
 
 `@none` is not a fork signal on its own — a collection with no committed revision has no lineage
-marker, and a real revision's action can age out of the collection's bounded committed list.
+marker, and a real revision whose log slot went to a checkpoint or invalidation entry has none to
+report either.
 
 #### Which node emitted this line?
 
@@ -278,16 +292,6 @@ namespace here, so splitting the namespace per node would force an operator to k
 ```bash
 DEBUG='optimystic:quereus-plugin:*' node app.js 2>&1 | grep 'node=A'
 ```
-
-`none` on its own is not proof of the invention race — a collection that has legitimately never
-been committed yet also reports `none`, and a first insert normally shows the main table collection
-at `:none` in the very `commit:collections` line that creates it. `none` is a finding only when
-something has already been committed under that id, which is exactly the case the table above
-scopes to (node A committed first).
-
-For `arm=committed` over a tree that was staged into the in-flight transaction, the view is pinned
-to the transaction's first-touch boundary, which can be older than the `rev=` printed here (the
-collection's current revision); for a clean tree the two are the same moment.
 
 All three lines — `commit:collections`, `index:tree-open`, `index:seek` — are pinned by tests, so a
 change that stops emitting one of them, or that drops a field, fails the suite.

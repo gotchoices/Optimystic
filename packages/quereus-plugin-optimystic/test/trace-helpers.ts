@@ -84,9 +84,10 @@ export interface CommitTrace {
 	 *  `none`/`unknown` stay distinguishable from revision 0. */
 	rev: Map<string, string>;
 	/** Collection id → the action-id half of the same `revs=` entry: the id of the action
-	 *  that produced that revision, `none` (no entry at that revision — an invented
-	 *  collection, or an action aged out of the bounded committed list), or `unknown` (a
-	 *  double lacking the accessor). Absent for a line that predates the field.
+	 *  that produced that revision, `none` (no action recorded at that revision — an
+	 *  invented collection, or a revision slot the log gave to a checkpoint or invalidation
+	 *  entry), or `unknown` (a double lacking the accessor). Absent for a line that
+	 *  predates the field.
 	 *
 	 *  This is the half that is comparable ACROSS collections and across nodes: two nodes
 	 *  at the same revision of the same collection id are one collection with one node
@@ -97,16 +98,33 @@ export interface CommitTrace {
 	node: string | undefined;
 }
 
+/** One `revs=` pair, split by the rule `TransactionBridge.logCommitCollections` documents:
+ *  `,` first (the caller), then the LAST `@`, then the LAST `:`.
+ *
+ *  Order matters and no regex shortcut is safe here. The id half is a URI path and
+ *  routinely contains `:`; the ACTION id half does too — db-core stamps session-mode
+ *  action ids as `tx:<hash>` — so splitting the whole pair on its last `:` tears the
+ *  action id in half. `@` is unambiguous in the other direction: `revisionToken` escapes
+ *  `@` inside an action id, so the last `@` in a pair is always the token's separator.
+ *
+ *  Returns `action: undefined` for a line that predates the field (no `@` at all), which
+ *  is why this reads a build older than the action ids rather than failing on one. */
+function parseRevPair(pair: string): { id: string; rev: string; action?: string } | undefined {
+	const at = pair.lastIndexOf('@');
+	const [left, action] = at < 0 ? [pair, undefined] : [pair.slice(0, at), pair.slice(at + 1)];
+	const colon = left.lastIndexOf(':');
+	if (colon < 0) return undefined;
+	return { id: left.slice(0, colon), rev: left.slice(colon + 1), ...(action !== undefined ? { action } : {}) };
+}
+
 /** Parse every `commit:collections` line out of a capture.
  *
  * The line's halves are parsed independently, which is deliberate: the `<id>=<state>`
  * tokens are the ORIGINAL shape of this line and are matched by the original pattern, so
  * this parser still reads a build that predates revisions. The revisions arrive as one
- * `revs=<id>:<rev>@<actionId>,...` field and the emitting node as a trailing `node=`; a
- * line without either simply yields an empty map / `undefined` rather than failing to
- * parse. Each pair splits on its LAST `:` because an id may contain colons while neither
- * half of the value does, then on its FIRST `@` because the revision half is a number or
- * one of two fixed words while an action id is opaque. */
+ * `revs=<id>:<rev>@<actionId>,...` field ({@link parseRevPair} splits a pair) and the
+ * emitting node as a trailing `node=`; a line without either simply yields an empty map /
+ * `undefined` rather than failing to parse. */
 export function commitTraces(lines: readonly string[]): CommitTrace[] {
 	const traces: CommitTrace[] = [];
 	for (const raw of lines) {
@@ -123,10 +141,10 @@ export function commitTraces(lines: readonly string[]): CommitTrace[] {
 		}
 		const revs = /(?:^|\s)revs=(\S*)/.exec(tail);
 		for (const pair of (revs?.[1] ?? '').split(',')) {
-			const entry = /^(.*):(\d+|none|unknown)(?:@([^\s,]*))?$/.exec(pair);
+			const entry = parseRevPair(pair);
 			if (!entry) continue;
-			rev.set(entry[1]!, entry[2]!);
-			if (entry[3] !== undefined) action.set(entry[1]!, entry[3]);
+			rev.set(entry.id, entry.rev);
+			if (entry.action !== undefined) action.set(entry.id, entry.action);
 		}
 		const node = /(?:^|\s)node=(\S+)/.exec(tail);
 		traces.push({
@@ -199,9 +217,11 @@ export interface IndexSeekTrace {
  * to the empty string, and an empty `seek=` must parse rather than making the whole line
  * unreadable.
  *
- * `rev=`/`main_rev=` are split into their revision and action-id halves on the FIRST `@`
- * (`[^\s@]+` then `@(\S+)`), so a spec asserting on `rev` keeps comparing bare revisions
- * while the lineage marker is available separately. */
+ * `rev=`/`main_rev=` are split into their revision and action-id halves on their only `@`
+ * (`[^\s@]+` then `@(\S+)`): the revision half is a number or a fixed word, and
+ * `revisionToken` escapes any `@` inside an action id, so there is exactly one. A spec
+ * asserting on `rev` therefore keeps comparing bare revisions while the lineage marker is
+ * available separately. */
 export function indexSeekTraces(lines: readonly string[]): IndexSeekTrace[] {
 	const traces: IndexSeekTrace[] = [];
 	for (const raw of lines) {

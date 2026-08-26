@@ -35,4 +35,29 @@ describe('re-opened collection action context', () => {
 		const reopened = await Collection.createOrOpen<TestAction>(transactor, collectionId, initOptions)
 		expect(reopened.getNextRev(), 're-opening the same collection resumes at rev 4').to.equal(4)
 	})
+
+	// The lineage marker the Quereus adapter's trace lines print beside every revision
+	// (`<rev>@<actionId>`), which is what separates "one collection and this reader is
+	// behind" from "two separately-built collections under one id". The claim only holds
+	// if a collection that ADOPTED its context from a log read names the same action the
+	// writer does — the writer's context is one it wrote itself, the reader's is one
+	// `attachToLog` read back, and those are different code paths.
+	it('names the same action id from a context read back off the log as the writer that wrote it', async () => {
+		const transactor = new TestTransactor()
+
+		const writer = await Collection.createOrOpen<TestAction>(transactor, 'reopen-lineage', initOptions)
+		for (const v of ['a', 'b']) {
+			await writer.act(act(v))
+			await writer.sync()
+		}
+		const writerAction = writer.committedActionId()
+		expect(writerAction, 'the writer names the action that produced its current revision')
+			.to.not.equal(undefined)
+
+		const reopened = await Collection.createOrOpen<TestAction>(transactor, 'reopen-lineage', initOptions)
+		expect(reopened.committedRevision(), 'both are at the same revision')
+			.to.equal(writer.committedRevision())
+		expect(reopened.committedActionId(), 'and both attribute it to the same action')
+			.to.equal(writerAction)
+	})
 })
