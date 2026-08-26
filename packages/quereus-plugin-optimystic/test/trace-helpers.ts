@@ -12,6 +12,11 @@
  *   scan, naming the revision the index and main collections were read at, whether
  *   the read was allowed to refresh, and how many index entries the seek produced.
  *
+ * All three carry a `node=` field naming the node that emitted them, and every revision
+ * they print is `<rev>@<actionId>` — the two fields that make a merged multi-node log
+ * answer "which machine wrote this, and are these two machines looking at one collection
+ * or at two separately-built copies of it?".
+ *
  * See `docs/debugging.md` (§ quereus-plugin sub-namespaces) for how an operator
  * reads them. Specs use these helpers so a change that silently stops emitting
  * any one of them fails the suite.
@@ -73,21 +78,35 @@ export interface CommitTrace {
 	ids: string[];
 	/** Collection id → `staged` | `clean` | `unknown`. */
 	state: Map<string, string>;
-	/** Collection id → its entry in the line's trailing `revs=` field: a revision number,
-	 *  `none` (an invented collection with no committed revision), or `unknown` (a double
-	 *  lacking the accessor). Kept as the raw string so `none`/`unknown` stay
-	 *  distinguishable from revision 0. */
+	/** Collection id → the revision half of its entry in the line's `revs=` field: a
+	 *  revision number, `none` (an invented collection with no committed revision), or
+	 *  `unknown` (a double lacking the accessor). Kept as the raw string so
+	 *  `none`/`unknown` stay distinguishable from revision 0. */
 	rev: Map<string, string>;
+	/** Collection id → the action-id half of the same `revs=` entry: the id of the action
+	 *  that produced that revision, `none` (no entry at that revision — an invented
+	 *  collection, or an action aged out of the bounded committed list), or `unknown` (a
+	 *  double lacking the accessor). Absent for a line that predates the field.
+	 *
+	 *  This is the half that is comparable ACROSS collections and across nodes: two nodes
+	 *  at the same revision of the same collection id are one collection with one node
+	 *  behind if the ids match, and two separately-built collections if they differ. */
+	action: Map<string, string>;
+	/** The `node=` field: which node emitted the line
+	 *  (`CollectionFactory.nodeTag()`). `undefined` for a line that predates the field. */
+	node: string | undefined;
 }
 
 /** Parse every `commit:collections` line out of a capture.
  *
- * The line has two halves and they are parsed independently, which is deliberate: the
- * `<id>=<state>` tokens are the ORIGINAL shape of this line and are matched by the
- * original pattern, so this parser still reads a build that predates revisions. The
- * revisions arrive as one trailing `revs=<id>:<rev>,...` field; a line without it simply
- * yields an empty `rev` map rather than failing to parse. Each pair splits on its LAST
- * `:` because an id may contain colons while a revision never does. */
+ * The line's halves are parsed independently, which is deliberate: the `<id>=<state>`
+ * tokens are the ORIGINAL shape of this line and are matched by the original pattern, so
+ * this parser still reads a build that predates revisions. The revisions arrive as one
+ * `revs=<id>:<rev>@<actionId>,...` field and the emitting node as a trailing `node=`; a
+ * line without either simply yields an empty map / `undefined` rather than failing to
+ * parse. Each pair splits on its LAST `:` because an id may contain colons while neither
+ * half of the value does, then on its FIRST `@` because the revision half is a number or
+ * one of two fixed words while an action id is opaque. */
 export function commitTraces(lines: readonly string[]): CommitTrace[] {
 	const traces: CommitTrace[] = [];
 	for (const raw of lines) {
@@ -96,30 +115,45 @@ export function commitTraces(lines: readonly string[]): CommitTrace[] {
 		const tail = head[3]!.trim();
 		const state = new Map<string, string>();
 		const rev = new Map<string, string>();
-		// A trailing `+1ms`, and the `revs=` field itself, are dropped by the shape filter.
+		const action = new Map<string, string>();
+		// A trailing `+1ms`, and the `revs=`/`node=` fields themselves, are dropped by the shape filter.
 		for (const token of tail.split(/\s+/)) {
 			const entry = /^(\S+)=(staged|clean|unknown)$/.exec(token);
 			if (entry) state.set(entry[1]!, entry[2]!);
 		}
 		const revs = /(?:^|\s)revs=(\S*)/.exec(tail);
 		for (const pair of (revs?.[1] ?? '').split(',')) {
-			const entry = /^(.*):(\d+|none|unknown)$/.exec(pair);
-			if (entry) rev.set(entry[1]!, entry[2]!);
+			const entry = /^(.*):(\d+|none|unknown)(?:@([^\s,]*))?$/.exec(pair);
+			if (!entry) continue;
+			rev.set(entry[1]!, entry[2]!);
+			if (entry[3] !== undefined) action.set(entry[1]!, entry[3]);
 		}
-		traces.push({ mode: head[1]!, count: Number(head[2]), ids: [...state.keys()], state, rev });
+		const node = /(?:^|\s)node=(\S+)/.exec(tail);
+		traces.push({
+			mode: head[1]!, count: Number(head[2]), ids: [...state.keys()], state, rev, action,
+			node: node?.[1],
+		});
 	}
 	return traces;
 }
 
 /** A parsed `index:tree-open` line. */
-export interface IndexOpenTrace { table: string; index: string; uri: string; collection: string }
+export interface IndexOpenTrace {
+	table: string;
+	index: string;
+	uri: string;
+	collection: string;
+	/** Which node resolved this index tree (`CollectionFactory.nodeTag()`). Two nodes
+	 *  opening the same logical index otherwise emit identical lines. */
+	node: string;
+}
 
 /** Parse every `index:tree-open` line out of a capture. */
 export function indexOpenTraces(lines: readonly string[]): IndexOpenTrace[] {
 	const traces: IndexOpenTrace[] = [];
 	for (const raw of lines) {
-		const m = /index:tree-open table=(\S+) index=(\S+) uri=(\S+) collection=(\S+)/.exec(plain(raw));
-		if (m) traces.push({ table: m[1]!, index: m[2]!, uri: m[3]!, collection: m[4]! });
+		const m = /index:tree-open table=(\S+) index=(\S+) uri=(\S+) collection=(\S+) node=(\S+)/.exec(plain(raw));
+		if (m) traces.push({ table: m[1]!, index: m[2]!, uri: m[3]!, collection: m[4]!, node: m[5]! });
 	}
 	return traces;
 }
@@ -135,10 +169,21 @@ export interface IndexSeekTrace {
 	/** `committed` (pinned pre-transaction view, never refreshes) or `live` (refreshed first). */
 	arm: string;
 	/** The index collection's committed revision, or `none` when it has never adopted one.
-	 *  Raw string so `none` stays distinguishable from revision 0. */
+	 *  Raw string so `none` stays distinguishable from revision 0. The emitted field is
+	 *  `rev=<rev>@<actionId>`; this is the revision half only, {@link action} the other. */
 	rev: string;
+	/** The action that produced {@link rev} — this collection's lineage marker at that
+	 *  revision — or `none` when the collection's bounded committed list holds no entry
+	 *  there. Unlike a revision, this IS comparable across collections and across nodes:
+	 *  same revision + same action id means one collection with one node behind, same
+	 *  revision + different action ids means two separately-built collections. */
+	action: string;
 	/** The main table collection's committed revision at the same instant, same encoding. */
 	mainRev: string;
+	/** The action that produced {@link mainRev}; see {@link action}. */
+	mainAction: string;
+	/** Which node emitted the line (`CollectionFactory.nodeTag()`). */
+	node: string;
 	/** The framed seek key, percent-escaped by the emitter. `''` is the whole-index prefix;
 	 *  `unset` means the scan returned before framing a key. Compare between nodes for
 	 *  equality only — decoding it yields raw framing bytes, not the SQL value. */
@@ -152,16 +197,21 @@ export interface IndexSeekTrace {
  *
  * `seek=` is matched with `\S*` rather than `\S+` because the whole-index prefix frames
  * to the empty string, and an empty `seek=` must parse rather than making the whole line
- * unreadable. */
+ * unreadable.
+ *
+ * `rev=`/`main_rev=` are split into their revision and action-id halves on the FIRST `@`
+ * (`[^\s@]+` then `@(\S+)`), so a spec asserting on `rev` keeps comparing bare revisions
+ * while the lineage marker is available separately. */
 export function indexSeekTraces(lines: readonly string[]): IndexSeekTrace[] {
 	const traces: IndexSeekTrace[] = [];
 	for (const raw of lines) {
-		const m = /index:seek table=(\S+) index=(\S+) collection=(\S+) main=(\S+) arm=(\S+) rev=(\S+) main_rev=(\S+) seek=(\S*) matched=(\d+)/
+		const m = /index:seek table=(\S+) index=(\S+) collection=(\S+) main=(\S+) arm=(\S+) rev=([^\s@]+)@(\S+) main_rev=([^\s@]+)@(\S+) seek=(\S*) matched=(\d+) node=(\S+)/
 			.exec(plain(raw));
 		if (m) {
 			traces.push({
 				table: m[1]!, index: m[2]!, collection: m[3]!, main: m[4]!, arm: m[5]!,
-				rev: m[6]!, mainRev: m[7]!, seek: m[8]!, matched: Number(m[9]),
+				rev: m[6]!, action: m[7]!, mainRev: m[8]!, mainAction: m[9]!,
+				seek: m[10]!, matched: Number(m[11]), node: m[12]!,
 			});
 		}
 	}

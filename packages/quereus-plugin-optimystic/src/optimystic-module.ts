@@ -23,7 +23,7 @@ import { SqlDataType, PhysicalType } from '@quereus/quereus';
 import { INTEGER_TYPE, REAL_TYPE, TEXT_TYPE, BLOB_TYPE, NUMERIC_TYPE, NULL_TYPE, BOOLEAN_TYPE, type LogicalType } from '@quereus/quereus';
 import { IndexManager, indexKeyFromValues, type IndexEntry } from './schema/index-manager.js';
 import type { PrimaryKeyTuple } from './schema/key-tuples.js';
-import { createLogger } from './logger.js';
+import { createLogger, revisionToken } from './logger.js';
 
 const log = createLogger('module');
 
@@ -948,10 +948,17 @@ export class OptimysticVirtualTable extends VirtualTable {
    * - `arm=committed` is a pinned pre-transaction view that never refreshes (deliberate
    *   — see {@link committedTreeView}); `arm=live` ran `update()` on both trees
    *   immediately before the scan.
-   * - `rev=` / `main_rev=` — the index and main COLLECTIONS' committed revisions, `none`
-   *   for a collection that has never adopted one. Every collection counts its own
-   *   revisions, so the two are not on one scale and are routinely unequal on a healthy
-   *   run; do not make them look comparable by deriving one from the other here.
+   * - `rev=` / `main_rev=` — the index and main COLLECTIONS' committed revisions, each
+   *   rendered `<rev>@<actionId>` by {@link revisionToken}: `none` for a collection that
+   *   has never adopted a revision, and a `@none` action half for a revision whose action
+   *   id has aged out of the collection's bounded committed list. Every collection counts
+   *   its own revisions, so the two NUMBERS are not on one scale and are routinely unequal
+   *   on a healthy run; do not make them look comparable by deriving one from the other
+   *   here. The action ids are the exception — they are comparable across collections and
+   *   across nodes, which is the whole reason they are printed.
+   * - `node=` — which node emitted the line ({@link CollectionFactory.nodeTag}). Two nodes
+   *   writing one collection at the same instant used to emit byte-identical lines, so an
+   *   operator could only attribute them positionally.
    * - `seek=` — the framed index key the descent bracketed on, escaped by
    *   {@link printableSeekKey} so the line stays one whitespace-free token per field.
    *   Empty is the whole-index prefix; `unset` means the scan returned before framing a
@@ -990,10 +997,12 @@ export class OptimysticVirtualTable extends VirtualTable {
     committed: boolean,
     seek: IndexSeekProbe,
   ): void {
-    const rev = (tree: { committedRevision(): number | undefined }): string =>
-      String(tree.committedRevision() ?? 'none');
+    const rev = (tree: {
+      committedRevision(): number | undefined;
+      committedActionId(): string | undefined;
+    }): string => revisionToken(tree.committedRevision() ?? 'none', tree.committedActionId() ?? 'none');
     log(
-      'index:seek table=%s index=%s collection=%s main=%s arm=%s rev=%s main_rev=%s seek=%s matched=%d',
+      'index:seek table=%s index=%s collection=%s main=%s arm=%s rev=%s main_rev=%s seek=%s matched=%d node=%s',
       this.tableName,
       index.schema.name,
       String(index.tree.getCollection().id),
@@ -1003,6 +1012,7 @@ export class OptimysticVirtualTable extends VirtualTable {
       rev(mainTree),
       seek.key === undefined ? 'unset' : printableSeekKey(seek.key),
       seek.matched,
+      this.collectionFactory.nodeTag(),
     );
   }
 
@@ -2433,10 +2443,13 @@ export class OptimysticVirtualTable extends VirtualTable {
    * Emits ONE `index:tree-open` line per open, naming the table, the index as THIS
    * vtab knows it, the derived URI, and the collection id it resolved to — the URI's
    * scheme is stripped to form the id, so the two differ and an operator joining this
-   * against the bridge's `commit:collections` line (which prints ids) needs both. How
-   * the pair is read: `docs/debugging.md` (§ "Which collections did a write carry?").
-   * Bring-up-time, not per write — callers hold the opened tree — and all four
-   * arguments already exist, so a disabled namespace builds nothing worth guarding.
+   * against the bridge's `commit:collections` line (which prints ids) needs both. A
+   * trailing `node=` says WHICH node resolved it ({@link CollectionFactory.nodeTag}) —
+   * without it, two nodes resolving one logical index emit the same line and the
+   * "did both machines mean the same collection?" question cannot be answered from a
+   * merged log. How the pair is read: `docs/debugging.md` (§ "Which collections did a
+   * write carry?"). Bring-up-time, not per write — callers hold the opened tree — and all
+   * five arguments already exist, so a disabled namespace builds nothing worth guarding.
    */
   private async openIndexTree(indexName: string, transactor?: ITransactor): Promise<Tree<string, IndexEntry>> {
     const indexUri = `${this.options.collectionUri}/index/${indexName}`;
@@ -2449,11 +2462,12 @@ export class OptimysticVirtualTable extends VirtualTable {
       transactor ? { transactor, isActive: true, collections: new Map(), stampId: '' } : undefined
     );
     log(
-      'index:tree-open table=%s index=%s uri=%s collection=%s',
+      'index:tree-open table=%s index=%s uri=%s collection=%s node=%s',
       this.tableName,
       indexName,
       indexUri,
-      String(tree.getCollection().id)
+      String(tree.getCollection().id),
+      this.collectionFactory.nodeTag()
     );
     return tree as unknown as Tree<string, IndexEntry>;
   }

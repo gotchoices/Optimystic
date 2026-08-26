@@ -27,9 +27,25 @@ const log = createLogger('collection-factory');
 type FactoryNode = Libp2p & Partial<OptimysticNodeAttachments>;
 
 /**
+ * A short, whitespace-free identifier for one node, used only to label trace lines.
+ * Four random bytes rendered base64url — six characters, enough that two nodes in one
+ * mesh do not collide by accident, short enough to sit on every line without crowding it.
+ */
+function randomNodeTag(): string {
+  const bytes = new Uint8Array(4);
+  globalThis.crypto.getRandomValues(bytes);
+  return bytesToB64url(bytes);
+}
+
+/**
  * Factory for creating and managing tree collections
  */
 export class CollectionFactory {
+  /**
+   * This node's tag, printed as `node=` on every cross-node trace line
+   * (`commit:collections`, `index:tree-open`, `index:seek`). See {@link nodeTag}.
+   */
+  private nodeTagValue = randomNodeTag();
   private transactors = new Map<string, ITransactor>();
   private libp2pNodes = new Map<string, { node: FactoryNode; coordinatedRepo: IRepo; blockChangeNotifier?: IBlockChangeNotifier }>();
   private customTransactorCtors = new Map<string, new (...args: any[]) => ITransactor>();
@@ -515,6 +531,50 @@ export class CollectionFactory {
   registerLibp2pNode(networkName: string, node: FactoryNode, coordinatedRepo: IRepo): void {
     const nodeKey = `${networkName}:0`; // Use port 0 as default for registered nodes
     this.libp2pNodes.set(nodeKey, { node, coordinatedRepo });
+  }
+
+  /**
+   * This node's identity for diagnostics, printed as the `node=` field on
+   * `commit:collections`, `index:tree-open` and `index:seek`.
+   *
+   * ONE factory means ONE node. The plugin's `register()` builds exactly one
+   * `CollectionFactory` per registration, a registration happens once per Quereus
+   * `Database`, and a `Database` is one machine's SQL surface — so the factory instance
+   * is the finest identity these three lines can be attributed to, and the only one both
+   * emitting sites (the virtual table and the transaction bridge) already hold.
+   *
+   * Without it, two nodes writing the same collection at the same instant emit
+   * byte-identical lines and an operator can only attribute them positionally (by knowing
+   * which machine their harness polled first), which is not possible at all for the
+   * write-side line.
+   *
+   * Defaults to six random characters. A host that has better names for its machines —
+   * an integration harness with `A`/`B`, a deployment with libp2p peer ids — should call
+   * {@link setNodeTag} once at start-up so its logs read in its own vocabulary.
+   */
+  nodeTag(): string {
+    return this.nodeTagValue;
+  }
+
+  /**
+   * Name this node for diagnostics; see {@link nodeTag}.
+   *
+   * Rejects anything that is not a single non-empty run of non-whitespace characters:
+   * the tag is printed as one whitespace-separated `node=<tag>` field, so a tag with a
+   * space in it would split one trace field into two and make every line carrying it
+   * unparseable. Failing here — at the one call a host makes at start-up — is far
+   * cheaper than discovering it in the log of the run that needed the log.
+   *
+   * A field rather than a namespace suffix (which is how `db-p2p` tells its nodes apart):
+   * all three lines share one `debug` namespace here, so splitting the namespace per node
+   * would force an operator to know the node tags BEFORE choosing a `DEBUG=` filter. A
+   * field keeps one filter and stays greppable (`grep 'node=A'`).
+   */
+  setNodeTag(tag: string): void {
+    if (!/^\S+$/.test(tag)) {
+      throw new Error(`Node tag must be a single non-empty run of non-whitespace characters; got ${JSON.stringify(tag)}`);
+    }
+    this.nodeTagValue = tag;
   }
 
   /**

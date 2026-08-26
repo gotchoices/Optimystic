@@ -392,4 +392,141 @@ describe('Two-node secondary-index convergence (write on one node, index-seek on
 		expect(Number(seek!.mainRev), 'and the table collection likewise')
 			.to.equal(tableLanded);
 	});
+
+	// ---------------------------------------------------------------------------
+	// The two fields that make a MERGED two-node log answerable (ticket
+	// `index-trace-cannot-tell-a-forked-collection-from-a-lagging-one`):
+	//
+	//   node=      — which machine emitted the line. Without it, two machines writing
+	//                one collection at the same instant emit byte-identical lines and
+	//                can only be attributed positionally.
+	//   rev=<r>@<a> — the action that produced revision <r>. Without it, "one collection
+	//                and this node is behind" and "two separately-built collections under
+	//                one id, each counting from 1" produce identical numbers.
+	// ---------------------------------------------------------------------------
+
+	it('every trace line names the node that emitted it, and two nodes are distinguishable', async () => {
+		const { db: dbA, plugin: pluginA } = createMeshDbNode(transactorFor(0));
+		const { db: dbB, plugin: pluginB } = createMeshDbNode(transactorFor(1));
+		pluginA.collectionFactory.setNodeTag('A');
+		pluginB.collectionFactory.setNodeTag('B');
+
+		const linesA = await captureTrace(async () => {
+			await dbA.exec(createTableSql);
+			await dbA.exec(createIndexSql);
+			await dbA.exec(`insert into FormationUsage (Id, Token) values (1, 'tok-shared')`);
+			await collect(dbA, `select Id from FormationUsage where Token = 'tok-shared'`);
+		});
+		const linesB = await captureTrace(async () => {
+			await dbB.exec(createTableSql);
+			await dbB.exec(createIndexSql);
+			await dbB.exec(`insert into FormationUsage (Id, Token) values (2, 'tok-shared')`);
+			await collect(dbB, `select Id from FormationUsage where Token = 'tok-shared'`);
+		});
+
+		// All three lines carry it, because all three are read together and a merged log
+		// that attributes only two of them still cannot be reassembled per machine.
+		for (const [tag, lines] of [['A', linesA], ['B', linesB]] as const) {
+			const commits = commitTraces(lines).filter(t => t.ids.includes(INDEX_COLLECTION_ID));
+			expect(commits.length, `node ${tag} emitted a commit line carrying the index collection`)
+				.to.be.greaterThan(0);
+			expect([...new Set(commits.map(t => t.node))], `every commit:collections line node ${tag} emitted names ${tag}`)
+				.to.deep.equal([tag]);
+
+			const opens = indexOpenTraces(lines);
+			expect(opens.length, `node ${tag} emitted an index:tree-open line`).to.be.greaterThan(0);
+			expect([...new Set(opens.map(o => o.node))], `every index:tree-open line node ${tag} emitted names ${tag}`)
+				.to.deep.equal([tag]);
+
+			const seeks = indexSeekTraces(lines);
+			expect(seeks.length, `node ${tag} emitted an index:seek line`).to.be.greaterThan(0);
+			expect([...new Set(seeks.map(s => s.node))], `every index:seek line node ${tag} emitted names ${tag}`)
+				.to.deep.equal([tag]);
+		}
+	});
+
+	it('a converged read on both nodes reports the same revision AND the same action id', async () => {
+		const { db: dbA, plugin: pluginA } = createMeshDbNode(transactorFor(0));
+		const { db: dbB, plugin: pluginB } = createMeshDbNode(transactorFor(1));
+		pluginA.collectionFactory.setNodeTag('A');
+		pluginB.collectionFactory.setNodeTag('B');
+
+		await dbA.exec(createTableSql);
+		await dbA.exec(createIndexSql);
+		await dbA.exec(`insert into FormationUsage (Id, Token) values (1, 'tok-a')`);
+		await dbB.exec(createTableSql);
+		await dbB.exec(createIndexSql);
+
+		let rowsA: Row[] = [];
+		const linesA = await captureTrace(async () => {
+			rowsA = await collect(dbA, `select Id from FormationUsage where Token = 'tok-a'`);
+		});
+		let rowsB: Row[] = [];
+		const linesB = await captureTrace(async () => {
+			rowsB = await collect(dbB, `select Id from FormationUsage where Token = 'tok-a'`);
+		});
+		expect(rowsA.map(r => r.Id), "the writer's own seek finds the row").to.deep.equal([1]);
+		expect(rowsB.map(r => r.Id), "the sibling's seek finds the writer's row").to.deep.equal([1]);
+
+		const seekA = indexSeekTraces(linesA).find(t => t.collection === INDEX_COLLECTION_ID);
+		const seekB = indexSeekTraces(linesB).find(t => t.collection === INDEX_COLLECTION_ID);
+		expect(seekA, 'node A emitted an index:seek line for the index collection').to.not.equal(undefined);
+		expect(seekB, 'node B emitted an index:seek line for the index collection').to.not.equal(undefined);
+
+		// The healthy baseline the failing downstream run is read against: on a CONVERGED
+		// pair the action ids match, so a run where they DIFFER at the same revision is
+		// two separately-built collections rather than a refresh gap. If a future change
+		// makes two converged nodes print different action ids, the field has started
+		// lying and every "forked" reading taken from it downstream is wrong.
+		expect(seekA!.action, "node A's action id is a real id, not a placeholder")
+			.to.not.be.oneOf(['none', 'unknown']);
+		expect(seekB!.action, 'both nodes name the SAME action as having produced their index revision')
+			.to.equal(seekA!.action);
+		expect(seekB!.rev, 'and they are at the same revision of it').to.equal(seekA!.rev);
+		expect(seekA!.node, 'the lines are attributable').to.equal('A');
+		expect(seekB!.node, 'the lines are attributable').to.equal('B');
+	});
+
+	// The write side needs the same discriminator: a `commit:collections` line is what an
+	// operator compares against a reader's `index:seek`, and the two are only comparable if
+	// both name the lineage as well as the number.
+	it('the commit line names the action id behind each revision, and preserves none', async () => {
+		const { db: dbA, plugin: pluginA } = createMeshDbNode(transactorFor(0));
+		pluginA.collectionFactory.setNodeTag('A');
+
+		await dbA.exec(createTableSql);
+		await dbA.exec(createIndexSql);
+
+		// FIRST insert: the table collection has committed nothing, so it is at `none` with
+		// no lineage; CREATE INDEX already committed the index collection, so that one has
+		// both. One line therefore covers the placeholder case and the ordinary case.
+		const firstLines = await captureTrace(async () => {
+			await dbA.exec(`insert into FormationUsage (Id, Token) values (1, 'tok-a')`);
+		});
+		const first = commitTraces(firstLines).find(t => t.state.get(INDEX_COLLECTION_ID) === 'staged');
+		expect(first, 'the insert emitted a commit line carrying the index collection').to.not.equal(undefined);
+		expect(first!.rev.get(TABLE_COLLECTION_ID), 'the table collection has committed nothing yet')
+			.to.equal('none');
+		expect(first!.action.get(TABLE_COLLECTION_ID), 'so it has no lineage marker either, and says so')
+			.to.equal('none');
+		expect(first!.rev.get(INDEX_COLLECTION_ID), 'CREATE INDEX committed the index collection')
+			.to.match(/^\d+$/);
+		expect(first!.action.get(INDEX_COLLECTION_ID), 'so its revision names the action that produced it')
+			.to.not.be.oneOf(['none', 'unknown']);
+		expect(first!.node, 'and the line says which node is committing').to.equal('A');
+
+		// SECOND insert: both collections now hold a real revision, and the table
+		// collection's lineage has appeared where the first line printed `none`.
+		const secondLines = await captureTrace(async () => {
+			await dbA.exec(`insert into FormationUsage (Id, Token) values (2, 'tok-b')`);
+		});
+		const second = commitTraces(secondLines).find(t => t.state.get(INDEX_COLLECTION_ID) === 'staged');
+		expect(second, 'the second insert emitted a commit line too').to.not.equal(undefined);
+		expect(second!.rev.get(TABLE_COLLECTION_ID), 'the table collection now holds the first insert')
+			.to.match(/^\d+$/);
+		expect(second!.action.get(TABLE_COLLECTION_ID), 'named by the action that landed it')
+			.to.not.be.oneOf(['none', 'unknown']);
+		expect(second!.action.get(INDEX_COLLECTION_ID), 'the index collection advanced to a DIFFERENT action')
+			.to.not.equal(first!.action.get(INDEX_COLLECTION_ID));
+	});
 });

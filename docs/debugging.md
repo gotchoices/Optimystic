@@ -103,8 +103,8 @@ make that answerable from a log; enable both (`DEBUG='optimystic:quereus-plugin:
 `DEBUG='optimystic:quereus-plugin:txn-bridge,optimystic:quereus-plugin:module'` if that is noisy):
 
 ```
-optimystic:quereus-plugin:txn-bridge commit:collections mode=legacy count=2 default/Usage=staged default/Usage/index/by_token=staged revs=default/Usage:7,default/Usage/index/by_token:3
-optimystic:quereus-plugin:module index:tree-open table=Usage index=by_token uri=tree://default/Usage/index/by_token collection=default/Usage/index/by_token
+optimystic:quereus-plugin:txn-bridge commit:collections mode=legacy count=2 default/Usage=staged default/Usage/index/by_token=staged revs=default/Usage:7@Kx9f-2Qa,default/Usage/index/by_token:3@bT1r_04c node=A
+optimystic:quereus-plugin:module index:tree-open table=Usage index=by_token uri=tree://default/Usage/index/by_token collection=default/Usage/index/by_token node=A
 ```
 
 Reading `commit:collections` — one line per commit, emitted **before** the flush:
@@ -117,12 +117,18 @@ Reading `commit:collections` — one line per commit, emitted **before** the flu
   collection being *listed* does not by itself mean this write touched it; `=staged` is what says
   that.
 - Each id carries `=staged` (unflushed changes pending at commit time) / `=clean` / `=unknown`.
-- A trailing `revs=<id>:<revision>,...` field names the committed revision each collection is
-  reading at, in the same sorted order as the ids. `:none` means the collection is **invented**:
-  nothing was ever committed under that id and this process staged a fresh empty one, so it has no
-  committed revision at all. `:unknown` appears only for a test double that does not implement the
-  accessor. The revision is the discriminator the id cannot be — see the note below on ids being
-  block ids.
+- A `revs=<id>:<revision>@<actionId>,...` field names the committed revision each collection is
+  reading at, in the same sorted order as the ids, and the action that produced that revision.
+  `:none` means the collection is **invented**: nothing was ever committed under that id and this
+  process staged a fresh empty one, so it has no committed revision at all. `:unknown` appears only
+  for a test double that does not implement the accessor. Both words mean the same two things in
+  the action half — `@none` is "asked, and there is no action recorded at that revision" (an
+  invented collection, or an action that has aged out of the collection's bounded committed list),
+  `@unknown` is "the source could not be asked". The revision is the discriminator the id cannot be
+  (see the note below on ids being block ids), and the **action id is the discriminator the
+  revision cannot be** — see *Comparing action ids* below.
+- A trailing `node=` field names the node that emitted the line. See *Which node emitted this
+  line?* below.
 - **The revision is the one the collection is reading at, and this line is emitted BEFORE the
   flush — so the commit it announces lands at that number plus one** (`:none` lands at `1`). Three
   successive inserts against one table therefore print `:none`, `:1`, `:2` for the table
@@ -132,7 +138,9 @@ Reading `commit:collections` — one line per commit, emitted **before** the flu
 - The revisions are a **separate trailing field on purpose**, not folded into the id tokens: the
   `<id>=staged|clean|unknown` tokens are unchanged from before revisions existed, so an existing
   grep or parser keyed on a collection id keeps matching. Each `revs=` pair splits on its LAST `:`
-  (ids may contain colons; revisions never do).
+  (ids may contain colons; neither half of the value does), and the value then splits on its FIRST
+  `@` (the revision half is a number or one of those two words; an action id is opaque). `node=`
+  was likewise appended last, so every token that predates it stayed where it was.
 - `count=` is emitted **before** the id list, so a truncated line still reports how many
   collections there were; if `count=` and the number of ids disagree, the line was truncated.
 - Ids are sorted, so two nodes' lines compare directly by eye. `count=0` is normal — a commit whose
@@ -140,7 +148,8 @@ Reading `commit:collections` — one line per commit, emitted **before** the flu
 
 Reading `index:tree-open` — one line per index tree opened (bring-up, not per write). It prints
 both the derived URI and the collection id it resolved to, because they differ (the `tree://`
-scheme is stripped to form the id) and `commit:collections` prints ids. Two nodes resolving
+scheme is stripped to form the id) and `commit:collections` prints ids, plus the `node=` that
+resolved it. Two nodes resolving
 **different** `collection=` values for one logical index would produce a symmetric "each node's
 index holds only its own rows" symptom while leaving the main table fine — a failure shape the pair
 of lines separates from "the index collection was absent from the commit".
@@ -159,15 +168,18 @@ reading that header at.
 (`optimystic:quereus-plugin:module`) answers the read side — one line per index-driven scan:
 
 ```
-optimystic:quereus-plugin:module index:seek table=Usage index=by_token collection=default/Usage/index/by_token main=default/Usage arm=committed rev=3 main_rev=7 seek=%01tok-a%00 matched=0
+optimystic:quereus-plugin:module index:seek table=Usage index=by_token collection=default/Usage/index/by_token main=default/Usage arm=committed rev=3@bT1r_04c main_rev=7@Kx9f-2Qa seek=%01tok-a%00 matched=0 node=A
 ```
 
 - `arm=committed` — a pre-transaction snapshot read, which deliberately never refreshes from the
   network. `arm=live` — the scan ran `update()` on both trees immediately before descending.
-- `rev=` — the index collection's committed revision; `none` when that collection has adopted no
-  committed revision at all — either it was invented locally, or nothing has been committed under
-  its id yet (see the caveat under the table below, which separates the two).
-- `main_rev=` — the main table collection's revision at the same instant. A table's main tree and
+- `rev=` — the index collection's committed revision, followed by `@` and the id of the action
+  that produced it; `none` when that collection has adopted no committed revision at all — either
+  it was invented locally, or nothing has been committed under its id yet (see the caveat under the
+  table below, which separates the two). `@none` in the action half means no action is recorded at
+  that revision (an invented collection, or one whose action has aged out of its bounded committed
+  list).
+- `main_rev=` — the main table collection's revision, and its action id, at the same instant. A table's main tree and
   its index trees are separate collections refreshed through different call sites, and a
   collection's revision advances only on an explicit call on that collection — `update()`/`sync()`
   on the single-node path, or `recordCommitted()` when the coordinator commits it in session mode.
@@ -178,7 +190,9 @@ optimystic:quereus-plugin:module index:seek table=Usage index=by_token collectio
   counter, so the two numbers are not on one scale and are routinely unequal on a perfectly healthy
   run (`rev=4 main_rev=3` is normal). A revision is only comparable to another revision **of the
   same collection** — this node's `rev=` against the writer's `commit:collections` revision for
-  that same collection id, or against the other node's `index:seek` `rev=`.
+  that same collection id, or against the other node's `index:seek` `rev=`. **The action ids are
+  the exception** — see *Comparing action ids* below.
+- `node=` — which node emitted the line; see *Which node emitted this line?* below.
 - `collection=` / `main=` — the index collection's id and the main table collection's id. One
   line therefore names both collections the scan read, and joins to `commit:collections` and
   `index:tree-open`, which print the same ids.
@@ -221,6 +235,50 @@ Call that `landed` below. Getting this step wrong inverts every row of the table
 | `rev` at or above `landed`, `matched>0`, but the SQL still returned no row | The index held the entry and the main-table fetch dropped it — compare `main_rev=` against `landed` for the **table** collection (same collection on both sides), never against `rev=`. |
 | `seek=` differs between the two nodes for the same SQL value | Neither of the above: the two nodes framed different keys, so the seek never addressed the entry that was written. |
 
+| A live refresh ran immediately before the read and `rev` did not move | Split it by action id. **Same action id at a lower revision than `landed`**: the refresh ran and closed nothing, so the gap is real — the node is genuinely behind on one collection. **Different action id at the same revision as another node's**: the two nodes are not on one collection at all; each built its own copy under the same id, each counting its own revisions. |
+
+#### Comparing action ids
+
+A revision number is counted **per collection**, so it means nothing on its own. Two nodes
+reporting the same collection id at the same revision are, on the numbers alone, indistinguishable
+between:
+
+- **one collection, one node behind** — a refresh problem, and
+- **two separately-built collections under one id** — each honestly counting its own revisions
+  from 1, which is a far more serious problem about how a collection comes into existence.
+
+The action id after each revision is what separates them, and it is the **one** value in these
+lines that is comparable **across collections and across nodes** (everything the section above
+says about not comparing revisions still holds):
+
+```
+same collection id + same revision + same action id       → one collection; a lagging reader is simply behind
+same collection id + same revision + DIFFERENT action ids → two separate collections under one id
+```
+
+`@none` is not a fork signal on its own — a collection with no committed revision has no lineage
+marker, and a real revision's action can age out of the collection's bounded committed list.
+
+#### Which node emitted this line?
+
+All three lines end with `node=<tag>`. It defaults to six random characters per Quereus `Database`
+(one plugin registration builds one `CollectionFactory`, which is the node identity these lines are
+attributed to). A host that has better names for its machines should name them once at start-up:
+
+```typescript
+const plugin = register(db, config);
+plugin.collectionFactory.setNodeTag('A');   // must be one non-empty run of non-whitespace characters
+```
+
+It is a **field, not a namespace suffix** — which is deliberately different from how `db-p2p` tells
+its nodes apart (see *Telling nodes apart in one process* above). All three lines share one `debug`
+namespace here, so splitting the namespace per node would force an operator to know the node tags
+*before* choosing a `DEBUG=` filter. A field keeps one filter and stays greppable:
+
+```bash
+DEBUG='optimystic:quereus-plugin:*' node app.js 2>&1 | grep 'node=A'
+```
+
 `none` on its own is not proof of the invention race — a collection that has legitimately never
 been committed yet also reports `none`, and a first insert normally shows the main table collection
 at `:none` in the very `commit:collections` line that creates it. `none` is a finding only when
@@ -237,7 +295,11 @@ change that stops emitting one of them, or that drops a field, fails the suite.
 `test/two-node-secondary-index-convergence.spec.ts` (legacy commit, the live seek arm, and that an
 abandoned scan still emits), `test/session-mode-commit.spec.ts` (session commit),
 `test/committed-read-isolation.spec.ts` (the `arm=committed` seek, which plain SQL cannot reach),
-and `test/adapter-integration.spec.ts` (`:none` vs `:unknown` in `revs=`).
+and `test/adapter-integration.spec.ts` (`:none` vs `:unknown` in `revs=`, the two halves being
+sourced independently, and the node tag's validation). The `node=` and `@<actionId>` fields are
+pinned in `test/two-node-secondary-index-convergence.spec.ts` — that two nodes are distinguishable
+on all three lines, and that a CONVERGED pair reports the same action id (so a run where the ids
+differ at one revision really is a fork).
 
 ## Common DEBUG patterns
 

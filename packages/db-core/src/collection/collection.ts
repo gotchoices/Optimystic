@@ -479,6 +479,29 @@ export class Collection<TAction> implements ICollection<TAction> {
 		return this.source.actionContext?.rev;
 	}
 
+	/** The id of the action that PRODUCED the revision {@link committedRevision} reports —
+	 * this collection's lineage marker at that revision — or `undefined` when the action
+	 * context holds no entry at the current revision.
+	 *
+	 * `undefined` is a legitimate, common state, not an error: the context's `committed`
+	 * list is bounded (it holds the actions that may not have been checkpointed yet), and
+	 * an INVENTED collection has no context at all. A caller printing this must therefore
+	 * carry a placeholder rather than invent an id.
+	 *
+	 * DIAGNOSTIC ONLY — do not branch on this. Its value is the one thing about a revision
+	 * that IS comparable across collections and across nodes: a revision number is
+	 * per-collection and says nothing on its own, so two nodes reporting the same
+	 * collection id at the same revision are indistinguishable between "one collection,
+	 * one node lagging" and "two separately-built collections each counting from 1". Equal
+	 * action ids mean one lineage; different action ids at the same revision mean two.
+	 * `docs/debugging.md` (§ "Which revision did a read descend?") spells out how an
+	 * operator reads the pair. */
+	committedActionId(): ActionId | undefined {
+		const context = this.source.actionContext;
+		if (context === undefined) return undefined;
+		return context.committed.find(entry => entry.rev === context.rev)?.actionId;
+	}
+
 	/** Fold a just-committed set of transforms into this collection's read cache
 	 * so subsequent reads (and stages) through THIS instance observe the committed
 	 * state, mirroring what {@link sync} does inline after a successful transact.

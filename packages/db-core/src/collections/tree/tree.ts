@@ -1,5 +1,5 @@
 import { Collection, type CollectionInitOptions, type CollectionId, type CollectionSnapshot, type ReadViewOptions } from "../../collection/index.js";
-import type { ITransactor, BlockId, BlockStore, IBlock } from "../../index.js";
+import type { ITransactor, BlockId, BlockStore, IBlock, ActionId } from "../../index.js";
 import { BTree, type Path, type KeyRange } from "../../btree/index.js";
 import { CollectionTrunk } from "./collection-trunk.js";
 import { TreeHeaderBlockType, type TreeReplaceAction } from "./struct.js";
@@ -263,6 +263,19 @@ export class Tree<TKey, TEntry> implements TreeReadView<TKey, TEntry> {
 	 * Structurally satisfies the adapter's optional `DirtyTree.committedRevision()`. */
 	committedRevision(): number | undefined {
 			return this.collection.committedRevision();
+	}
+
+	/** The action id that produced this tree's current committed revision — see
+	 * {@link Collection.committedActionId}. `undefined` when the collection's action
+	 * context holds no entry at that revision (including an invented collection, which
+	 * has no context at all).
+	 *
+	 * Diagnostic only. Printed beside {@link committedRevision} by the Quereus adapter's
+	 * trace lines, because the revision alone cannot separate "one collection, this node
+	 * lagging" from "two separately-built collections under one id" — the action id can.
+	 * Structurally satisfies the adapter's optional `DirtyTree.committedActionId()`. */
+	committedActionId(): ActionId | undefined {
+			return this.collection.committedActionId();
 	}
 
 	/**

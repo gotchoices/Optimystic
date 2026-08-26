@@ -3,7 +3,7 @@ import { TransactionSession, CoordinatorPartialCommitError } from '@optimystic/d
 import type { TransactionState, ParsedOptimysticOptions } from '../types.js';
 import { CollectionFactory } from './collection-factory.js';
 import { generateStampId } from '../util/generate-stamp-id.js';
-import { createLogger } from '../logger.js';
+import { createLogger, revisionToken } from '../logger.js';
 
 const log = createLogger('txn-bridge');
 
@@ -47,6 +47,16 @@ export interface DirtyTree {
    * which is distinct from `:none` (implemented, and the collection is invented).
    */
   committedRevision?(): number | undefined;
+  /**
+   * Optional "which action produced the revision this tree is reading at?" (a Tree
+   * forwards to `Collection.committedActionId()`; `undefined` means the collection's
+   * action context holds no entry at that revision — including an invented collection,
+   * which has no context at all). Used ONLY by the `commit:collections` trace; the commit
+   * sweep itself does not branch on it. Optional on the same terms as
+   * {@link committedRevision}, and reported as `unknown` when absent — distinct from
+   * `none`, which is "asked, and there is none".
+   */
+  committedActionId?(): string | undefined;
 }
 
 /**
@@ -67,6 +77,19 @@ const treeLabel = (tree: DirtyTree, index: number): string => tree.describe?.() 
 const treeRevision = (tree: DirtyTree): number | 'none' | 'unknown' =>
   tree.committedRevision === undefined ? 'unknown' : (tree.committedRevision() ?? 'none');
 
+/**
+ * The lineage marker to print beside {@link treeRevision} — the action that produced the
+ * revision the tree is reading at. Same two "no answer" words, meaning the same two
+ * things: `unknown` is "nobody asked" (a double without the method), `none` is "asked,
+ * and the collection's bounded committed list holds no entry at that revision" (an
+ * invented collection, or a revision whose action has aged out).
+ *
+ * The revision alone cannot separate "one collection, this node behind" from "two
+ * separately-built collections under one id"; this can — see {@link revisionToken}.
+ */
+const treeActionId = (tree: DirtyTree): string | 'none' | 'unknown' =>
+  tree.committedActionId === undefined ? 'unknown' : (tree.committedActionId() ?? 'none');
+
 /** One collection's row in a {@link TransactionBridge} `commit:collections` trace line. */
 interface CommitCollectionTrace {
   /** The collection id — the same string `openIndexTree`'s `index:tree-open` line prints. */
@@ -83,13 +106,24 @@ interface CommitCollectionTrace {
    * - `'unknown'` — the source could not be asked (a {@link DirtyTree} double that
    *   omits `committedRevision`).
    *
-   * The discriminator between "two nodes committed into one lineage" and "one node is
-   * reading a lagging or invented copy": the collection ID cannot fork (a collection's
-   * header block id IS its id), so the revision is the only thing left that can differ.
-   * Emitted in the line's trailing `revs=` field, never folded into the id token — see
+   * Emitted in the line's `revs=` field, never folded into the id token — see
    * {@link TransactionBridge.logCommitCollections}.
    */
   rev: number | 'none' | 'unknown';
+  /**
+   * The action that produced {@link rev} — this collection's lineage marker at that
+   * revision, printed as the `@` half of the `revs=` pair. `'none'` when the collection's
+   * committed list holds no entry at that revision (an invented collection has none at
+   * all); `'unknown'` when the source could not be asked.
+   *
+   * This is the discriminator between "two nodes committed into one lineage" and "each
+   * node built its own separate collection under one id". The collection ID cannot fork
+   * (a collection's header block id IS its id) and the revision alone cannot tell the two
+   * apart — under "two copies" each copy honestly reports its own count, which reads as
+   * ordinary lag. Same revision + same action id = one copy, one node behind; same
+   * revision + different action ids = two copies.
+   */
+  action: string | 'none' | 'unknown';
 }
 
 /**
@@ -428,9 +462,12 @@ export class TransactionBridge {
           this.logCommitCollections('session', [...this.collectionRegistry].map(([id, collection]) => ({
             id: String(id),
             staged: collection.hasUnsyncedChanges(),
-            // A real Collection always implements this, so `unknown` is unreachable here;
-            // `none` still is, and means the collection was invented in this process.
+            // A real Collection always implements these, so `unknown` is unreachable here;
+            // `none` still is: for the revision it means the collection was invented in
+            // this process, and for the action id it additionally covers a revision whose
+            // action has aged out of the collection's bounded committed list.
             rev: collection.committedRevision() ?? 'none' as const,
+            action: collection.committedActionId() ?? 'none' as const,
           })));
         }
         const result = await this.session.commit();
@@ -537,12 +574,21 @@ export class TransactionBridge {
    * would silently break every such parser into reporting the collection ABSENT — the
    * exact false negative this line exists to rule out.
    *
-   * `:none` is an invented collection (no committed revision at all); `:unknown` is a
-   * double that omits `committedRevision`. The revision is the discriminator the id
-   * cannot be: a collection's header block IS its id, so two nodes naming one id are
-   * addressing one header — what can still differ is which revision of it each reads.
-   * A revision never contains `:`, so splitting each pair on its LAST `:` recovers both
-   * halves whatever the id holds.
+   * Each revision is rendered `<rev>@<actionId>` ({@link revisionToken}). `:none` is an
+   * invented collection (no committed revision at all); `:unknown` is a double that omits
+   * `committedRevision`; the same two words carry the same two meanings in the action
+   * half. The revision is the discriminator the id cannot be — a collection's header block
+   * IS its id, so two nodes naming one id are addressing one header, and what can still
+   * differ is which revision of it each reads — and the ACTION ID is the discriminator the
+   * revision cannot be, because two nodes that each built their own copy of a collection
+   * each count their own revisions and so report numbers that look like ordinary lag.
+   * Neither half ever contains `:`, so splitting each pair on its LAST `:` recovers the id
+   * whatever it holds; the value then splits on its FIRST `@`, since the revision half is
+   * a number or one of those two words and an action id is opaque.
+   *
+   * A trailing `node=` names the node that emitted the line
+   * ({@link CollectionFactory.nodeTag}) — appended last for the same additive reason the
+   * revisions were: every token that predates it stays where it was.
    *
    * NOTE: pairs are `,`-separated and the whole field is one whitespace-free token, but
    * nothing ENFORCES that a collection id contains neither — `parseCollectionId`
@@ -563,11 +609,12 @@ export class TransactionBridge {
     log(
       // `count=0` yields an empty mark list; the conditional space keeps that case from
       // emitting a double space, and leaves the count>0 spacing exactly as it always was.
-      'commit:collections mode=%s count=%d%s revs=%s',
+      'commit:collections mode=%s count=%d%s revs=%s node=%s',
       mode,
       sorted.length,
       marks ? ` ${marks}` : '',
-      sorted.map(e => `${e.id}:${e.rev}`).join(',')
+      sorted.map(e => `${e.id}:${revisionToken(e.rev, e.action)}`).join(','),
+      this.collectionFactory.nodeTag()
     );
   }
 
@@ -601,6 +648,7 @@ export class TransactionBridge {
         // `unknown` (method absent on a double) and `none` (present, collection invented)
         // are deliberately different answers — collapsing them would hide the invention case.
         rev: treeRevision(tree),
+        action: treeActionId(tree),
       })));
     }
 

@@ -273,6 +273,29 @@ describe('CollectionFactory (TEST-7.3.1)', () => {
 		// Different collections (different URIs)
 		expect(col1).to.not.equal(col2);
 	});
+
+	// The tag is printed as one whitespace-separated `node=<tag>` field, so a tag carrying
+	// whitespace would split one trace field into two and make every line carrying it
+	// unparseable. Failing at the host's one start-up call is far cheaper than discovering
+	// it in the log of the run that needed the log.
+	describe('node tag', () => {
+		it('defaults to a distinct, whitespace-free tag per factory', () => {
+			const a = createTestEnv().plugin.collectionFactory;
+			const b = createTestEnv().plugin.collectionFactory;
+			expect(a.nodeTag(), 'the default tag is one non-empty token').to.match(/^\S+$/);
+			expect(b.nodeTag(), 'two factories in one process do not share a default tag')
+				.to.not.equal(a.nodeTag());
+		});
+
+		it('rejects a tag that would break the line it is printed on', () => {
+			const factory = createTestEnv().plugin.collectionFactory;
+			for (const bad of ['', '   ', 'two words', 'trailing ']) {
+				expect(() => factory.setNodeTag(bad), `rejected ${JSON.stringify(bad)}`).to.throw(/node tag/i);
+			}
+			factory.setNodeTag('A');
+			expect(factory.nodeTag()).to.equal('A');
+		});
+	});
 });
 
 // ─────────────────────────────────────────────────────
@@ -410,6 +433,74 @@ describe('TransactionBridge (TEST-7.3.1)', () => {
 			// there while the revisions above still differ.
 			expect(trace!.state.get('double/invented'), 'the state half is unaffected by the revision half')
 				.to.equal('unknown');
+		});
+
+		// The action id is the half that separates "one collection, this node behind" from
+		// "two separately-built collections under one id" — under the second, each copy
+		// honestly reports its own revision count and the numbers look like ordinary lag.
+		// Its two non-id answers have to keep meaning what the revision half's do, and be
+		// sourced INDEPENDENTLY: a double can implement one accessor and not the other, and
+		// collapsing the two halves would make a fork read as a lag.
+		it('sources the action-id half of revs= independently of the revision half', async () => {
+			const { plugin } = createTestEnv();
+			const bridge = plugin.txnBridge;
+
+			const base = { sync: async () => {}, snapshot: () => ({}), restore: () => {} };
+			// Revision present, lineage aged out of the bounded committed list: the shape a
+			// real Collection produces when its context holds no entry at its current rev.
+			const aged = {
+				...base, describe: () => 'double/aged',
+				committedRevision: () => 4, committedActionId: () => undefined,
+			};
+			const lineaged = {
+				...base, describe: () => 'double/lineaged',
+				committedRevision: () => 5, committedActionId: () => 'act-5',
+			};
+			// Neither accessor: both halves must read `unknown`, not `none`.
+			const unaskable = { ...base, describe: () => 'double/unaskable' };
+
+			await bridge.beginTransaction(defaultOptions);
+			for (const tree of [aged, lineaged, unaskable]) bridge.markDirty(tree);
+
+			const lines = await captureTrace(async () => {
+				await bridge.commitTransaction();
+			});
+
+			const trace = commitTraces(lines).find(t => t.rev.has('double/lineaged'));
+			expect(trace, `a legacy commit:collections line named the doubles; saw ${JSON.stringify(lines)}`)
+				.to.not.equal(undefined);
+			expect(trace!.action.get('double/lineaged'), 'a real action id is printed verbatim')
+				.to.equal('act-5');
+			expect(trace!.rev.get('double/lineaged'), 'and its revision half is unchanged').to.equal('5');
+			expect(trace!.action.get('double/aged'), 'committedActionId() returning undefined reads as none')
+				.to.equal('none');
+			expect(trace!.rev.get('double/aged'), 'a present revision beside an absent lineage still prints')
+				.to.equal('4');
+			expect(trace!.action.get('double/unaskable'), 'a source without the accessor reads as unknown, not none')
+				.to.equal('unknown');
+			expect(trace!.rev.get('double/unaskable'), 'and its revision half reads unknown too')
+				.to.equal('unknown');
+		});
+
+		// Every one of these lines is attributed to the node that emitted it. Without that,
+		// two machines writing one collection at the same instant emit byte-identical lines
+		// and an operator can only attribute them positionally.
+		it('names the emitting node on commit:collections', async () => {
+			const { plugin } = createTestEnv();
+			plugin.collectionFactory.setNodeTag('node-under-test');
+			const bridge = plugin.txnBridge;
+
+			await bridge.beginTransaction(defaultOptions);
+			bridge.markDirty({ sync: async () => {}, snapshot: () => ({}), restore: () => {}, describe: () => 'double/tagged' });
+
+			const lines = await captureTrace(async () => {
+				await bridge.commitTransaction();
+			});
+
+			const trace = commitTraces(lines).find(t => t.ids.includes('double/tagged'));
+			expect(trace, `a legacy commit:collections line named the double; saw ${JSON.stringify(lines)}`)
+				.to.not.equal(undefined);
+			expect(trace!.node, 'the line says which node emitted it').to.equal('node-under-test');
 		});
 	});
 
