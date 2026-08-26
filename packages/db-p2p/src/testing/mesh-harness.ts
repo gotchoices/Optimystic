@@ -1,15 +1,18 @@
 import type { PeerId, PrivateKey } from '@libp2p/interface';
-import type { IKeyNetwork, ClusterPeers, ICluster, ClusterRecord, IRepo, BlockId, ActionRev, ClusterConsensusConfig, ITransactor, PeerId as DbPeerId } from '@optimystic/db-core';
+import type { IKeyNetwork, ClusterPeers, ICluster, ClusterRecord, IRepo, BlockId, ActionRev, ITransactor, PeerId as DbPeerId } from '@optimystic/db-core';
 import type { FindCoordinatorOptions } from '@optimystic/db-core';
 import type { IPeerNetwork } from '@optimystic/db-core';
-import { NetworkTransactor, DEFAULT_SUPER_MAJORITY_THRESHOLD } from '@optimystic/db-core';
+import { NetworkTransactor } from '@optimystic/db-core';
 import { peerIdFromPrivateKey } from '@libp2p/peer-id';
 import { generateKeyPair } from '@libp2p/crypto/keys';
 import { ClusterMember, clusterMember, type ReconcileBlockCallback } from '../cluster/cluster-repo.js';
+import { createReconcileBlock } from '../cluster/reconcile-block.js';
+import { resolveClusterPolicy, type ClusterPolicyOptions } from '../cluster/cluster-policy.js';
 import { StorageRepo } from '../storage/storage-repo.js';
 import { MemoryRawStorage } from '../storage/memory-storage.js';
 import { BlockStorage } from '../storage/block-storage.js';
 import type { IRawStorage } from '../storage/i-raw-storage.js';
+import type { BlockArchive } from '../storage/struct.js';
 import { coordinatorRepo, type ClusterLatestCallback } from '../repo/coordinator-repo.js';
 import type { CoordinatorRepo } from '../repo/coordinator-repo.js';
 import { sortPeersByDistance, type KnownPeer } from '../routing/responsibility.js';
@@ -25,8 +28,24 @@ export interface MeshNode {
 
 export interface MeshOptions {
 	responsibilityK: number;
+	/**
+	 * Replication factor. OMITTED now means what it means in production: the operator declared
+	 * nothing, so it resolves to `DEFAULT_CLUSTER_SIZE` (10) — NOT to `nodeCount`. An undeclared
+	 * two-node mesh therefore measures its repair corroboration floor against 10 and can never
+	 * repair (see `resolveClusterPolicy` in `cluster/cluster-policy.ts`); a mesh that genuinely is
+	 * its node count must say so, exactly as a real deployment must.
+	 */
 	clusterSize?: number;
+	/**
+	 * Passed through to `resolveClusterPolicy` verbatim; this is how a mesh declares its real
+	 * cohort size (`assumedClusterSize`), downsize policy, or small-cluster opt-in. When both a
+	 * legacy top-level field and the matching entry here are given, the entry here wins — it is
+	 * the production-shaped one.
+	 */
+	clusterPolicy?: ClusterPolicyOptions['clusterPolicy'];
+	/** Legacy shorthand for `clusterPolicy.superMajorityThreshold`. */
 	superMajorityThreshold?: number;
+	/** Legacy shorthand for `clusterPolicy.allowDownsize`. */
 	allowClusterDownsize?: boolean;
 	/**
 	 * Optional per-node raw-storage factory. Invoked once per node (indexed from 0)
@@ -115,32 +134,41 @@ export interface Mesh {
 }
 
 /**
- * Pull a block's committed content from a sibling cohort node into `storageRepo` — the mesh analogue
- * of `libp2p-node-base`'s `createReconcileBlock` (SyncClient archive fetch + `saveReplicatedBlock`).
+ * One cohort peer's archive for a block, read straight from the sibling's `StorageRepo` — the mesh
+ * analogue of `libp2p-node-base`'s `fetchArchiveFromPeer` (a SyncClient round trip). The archive
+ * shape mirrors `SyncService.buildArchive` (`src/sync/service.ts`) — the thing the production fetch
+ * actually receives over the wire — so the two cannot drift: `createReconcileBlock` reads only
+ * `revisions[rev].action.actionId` and `revisions[rev].block`, but the `transform` filler is
+ * produced the way the sync service produces it rather than invented here.
  *
- * Deliberately shared by BOTH callers, exactly as the live node shares one callback between them: the
- * commit path (`clusterMember.reconcileBlock`, for a block committed without a materializable base)
- * and the read path (`CoordinatorRepo.acquireBlockFromCohort`, for a corroborated revision the reader
- * cannot promote locally). Stateless, so it is simply rebuilt per caller.
+ * A silent peer serves no bytes either. `undefined` is the right answer: reconcile's `no-archive`
+ * outcome deliberately conflates unreachable with holds-nothing, and the production
+ * `fetchArchiveFromPeer` swallows every dial failure into the same `undefined`. (Contrast the read
+ * path's latest-revision consult, where silence REJECTS — the coordinator counts "did not answer"
+ * separately from "holds nothing".)
  *
- * `nodes` is captured by reference and is fully populated by the time either caller invokes it.
+ * `nodes` is captured by reference and is fully populated by the time this is invoked.
  */
-const makeReconcileBlock = (nodes: MeshNode[], selfPeerId: string, storageRepo: StorageRepo, failures: MeshFailureConfig): ReconcileBlockCallback =>
-	async (blockId, committed, cohortPeerIds) => {
-		for (const peerIdStr of cohortPeerIds) {
-			if (peerIdStr === selfPeerId) continue;
-			// A silent peer cannot serve bytes either — without this, a test that silenced a
-			// peer's consult could still accidentally converge THROUGH that peer.
-			if (failures.silentPeers?.has(peerIdStr)) continue;
-			const target = nodes.find(n => n.peerId.toString() === peerIdStr);
-			if (!target) continue;
-			const result = await target.storageRepo.get({ blockIds: [blockId] }, { skipClusterFetch: true } as any);
-			const entry = result[blockId];
-			const latest = entry?.state?.latest;
-			if (!latest || !entry?.block || latest.rev < committed.rev) continue;
-			await storageRepo.saveReplicatedBlock(blockId, entry.block, latest);
-			return;
-		}
+const makeFetchArchive = (nodes: MeshNode[], selfPeerId: string, failures: MeshFailureConfig) =>
+	async (peerIdStr: string, blockId: BlockId): Promise<BlockArchive | undefined> => {
+		if (peerIdStr === selfPeerId) return undefined;
+		if (failures.silentPeers?.has(peerIdStr)) return undefined;
+		const target = nodes.find(n => n.peerId.toString() === peerIdStr);
+		if (!target) return undefined;
+		const result = await target.storageRepo.get({ blockIds: [blockId] }, { skipClusterFetch: true } as any);
+		const entry = result[blockId];
+		const latest = entry?.state?.latest;
+		if (!latest || !entry?.block) return undefined;
+		return {
+			blockId,
+			revisions: {
+				[latest.rev]: {
+					action: { actionId: latest.actionId, transform: { insert: entry.block } },
+					block: entry.block
+				}
+			},
+			range: [latest.rev, latest.rev + 1]
+		};
 	};
 
 /**
@@ -149,6 +177,28 @@ const makeReconcileBlock = (nodes: MeshNode[], selfPeerId: string, storageRepo: 
  */
 export async function createMesh(nodeCount: number, options: MeshOptions): Promise<Mesh> {
 	const failures: MeshFailureConfig = {};
+
+	// Resolve the operator-facing knobs through the SAME function a real node's composition root
+	// uses (`libp2p-node-base.ts`), then hand the one resolved object to both consumers per node —
+	// the cluster member and the coordinator — exactly as production does. Resolved once per mesh
+	// rather than per node: same input, same numbers, and the resolver's one-line
+	// `repair-fault-tolerance` advisory fires once instead of N times.
+	//
+	// Precedence: an explicit `clusterPolicy` entry wins over the matching legacy top-level field —
+	// the entry is the production-shaped one.
+	const policy = resolveClusterPolicy({
+		clusterSize: options.clusterSize,
+		clusterPolicy: {
+			...options.clusterPolicy,
+			superMajorityThreshold: options.clusterPolicy?.superMajorityThreshold ?? options.superMajorityThreshold,
+			allowDownsize: options.clusterPolicy?.allowDownsize ?? options.allowClusterDownsize,
+			// Gate the harness DISARMS: production fails closed (default false) when an undersized
+			// cluster has no confident network-size estimate, but harness meshes run below the safe
+			// floor on purpose. Passed explicitly and visibly so the disarming is a statement, not an
+			// inheritance. Ticket `mesh-harness-admission-gate` flips this default to false.
+			allowUnvalidatedSmallCluster: options.clusterPolicy?.allowUnvalidatedSmallCluster ?? true
+		}
+	});
 
 	// Generate key pairs for all nodes
 	const keyPairs = await Promise.all(
@@ -161,6 +211,12 @@ export async function createMesh(nodeCount: number, options: MeshOptions): Promi
 	// Build nodes array (partially — coordinatorRepo added after keyNetwork is ready)
 	const nodes: MeshNode[] = [];
 	const peerNetwork = new MockPeerNetwork();
+	// One real reconcile callback per node, shared between the member's commit-path `reconcileBlock`
+	// and the coordinator's read-path `acquireBlockFromCohort` — production shares one instance
+	// (`libp2p-node-base.ts`), and a spec must not be able to tell the two paths apart. Built in
+	// phase 1 (with the member), consumed again in phase 2 (by the coordinator), so it is stashed
+	// here keyed by peer id rather than widened onto the public `MeshNode` type.
+	const reconcileByPeer = new Map<string, ReconcileBlockCallback>();
 
 	// Phase 1: create storage + cluster members
 	let nodeIndex = 0;
@@ -173,28 +229,27 @@ export async function createMesh(nodeCount: number, options: MeshOptions): Promi
 			(blockId: BlockId) => new BlockStorage(blockId, rawStorage)
 		);
 
-		const consensusConfig: ClusterConsensusConfig = {
-			superMajorityThreshold: options.superMajorityThreshold ?? DEFAULT_SUPER_MAJORITY_THRESHOLD,
-			simpleMajorityThreshold: 0.51,
-			minAbsoluteClusterSize: 2,
-			allowClusterDownsize: options.allowClusterDownsize ?? true,
-			clusterSizeTolerance: 0.5,
-			partitionDetectionWindow: 60000,
-			// Harness spins up small/single-node meshes on purpose; opt into running
-			// below the safe floor without a confident network-size estimate.
-			allowUnvalidatedSmallCluster: true
-		};
-
-		// Active reconciliation: when a member commits a block it never pended (cohort drift),
-		// pull the committed revision from a sibling cohort node that holds it.
-		const reconcileBlock = makeReconcileBlock(nodes, peerId.toString(), storageRepo, failures);
+		// Active reconciliation: when a member commits a block it never pended (cohort drift), or a
+		// reader holds a corroborated revision it cannot promote locally, pull the committed revision
+		// from the cohort — through the PRODUCTION quorum rules (`createReconcileBlock`): a quorum of
+		// distinct peers must agree on the target `(rev, actionId)` AND on the block content, or the
+		// pass declines, persisting nothing. `reputation` is omitted — no reputation subsystem in the
+		// harness.
+		const reconcileBlock = createReconcileBlock({
+			selfPeerId: peerId.toString(),
+			fetchArchive: makeFetchArchive(nodes, peerId.toString(), failures),
+			saveReplicatedBlock: (blockId, block, source) => storageRepo.saveReplicatedBlock(blockId, block, source),
+			simpleMajorityThreshold: policy.simpleMajorityThreshold,
+			repairCorroborationClusterSize: policy.repairCorroborationClusterSize
+		});
+		reconcileByPeer.set(peerId.toString(), reconcileBlock);
 
 		const member = clusterMember({
 			storageRepo,
 			peerNetwork,
 			peerId,
 			privateKey,
-			consensusConfig,
+			consensusConfig: policy,
 			reconcileBlock
 		});
 
@@ -265,23 +320,22 @@ export async function createMesh(nodeCount: number, options: MeshOptions): Promi
 		const factory = coordinatorRepo(
 			nodeKeyNetwork,
 			createClusterClient,
-			{
-				clusterSize: options.clusterSize ?? nodeCount,
-				superMajorityThreshold: options.superMajorityThreshold ?? DEFAULT_SUPER_MAJORITY_THRESHOLD,
-				allowClusterDownsize: options.allowClusterDownsize ?? true,
-				// Harness meshes run below the safe floor on purpose; opt the coordinator
-				// side into that so validateSmallCluster admits them (fails closed by default).
-				allowUnvalidatedSmallCluster: true
-			}
+			// The SAME resolved policy the member above was built from, spread the way
+			// `libp2p-node-base` spreads it into its coordinator factory — carrying
+			// `repairCorroborationClusterSize` (the repair floor's yardstick, DEFAULT_CLUSTER_SIZE
+			// when the mesh declared nothing), the production `minAbsoluteClusterSize` (2, not the
+			// coordinator's own fallback of 3), and the explicitly-disarmed
+			// `allowUnvalidatedSmallCluster` gate resolved above.
+			{ ...policy }
 		);
 		node.coordinatorRepo = factory({
 			storageRepo: node.storageRepo,
 			localCluster: node.clusterMember,
 			localPeerId: node.peerId,
 			clusterLatestCallback,
-			// The read path's transfer mechanism — the same callback the member uses on the commit path,
-			// mirroring how `libp2p-node-base` shares one `reconcileBlock` between both.
-			acquireBlockFromCohort: makeReconcileBlock(nodes, node.peerId.toString(), node.storageRepo, failures)
+			// The read path's transfer mechanism — the SAME instance the member uses on the commit
+			// path, mirroring how `libp2p-node-base` shares one `reconcileBlock` between both.
+			acquireBlockFromCohort: reconcileByPeer.get(node.peerId.toString())!
 		});
 	}
 
