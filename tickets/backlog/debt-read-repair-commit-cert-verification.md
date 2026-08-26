@@ -167,5 +167,15 @@ exactly the data that becomes unreadable, and `clusterPolicy.assumedClusterSize`
 block has one holder". A certificate is the only listed direction that lets a lone claim be trusted
 without handing an attacker the sole-claimant lever.
 
-Tracked as `fix/single-holder-block-is-permanently-unreadable`, which enumerates the alternatives and
-must decide whether the safe fix reduces to this ticket.
+That investigation has since concluded (its ticket is gone; successors below). It rejected the two
+cheaper directions on measured grounds — relaxing the floor on an affirmative "I hold nothing" is
+strictly weaker than today's rule and self-amplifying, since an acquiring reader becomes a genuine
+second voter; and structural corroboration against a parent pointer is not buildable, because parents
+name children by bare id only (`BranchNode.nodes: BlockId[]`), with no revision or content hash to
+check a lone claim against. It landed two implement tickets instead:
+`replicate-owned-blocks-when-the-cohort-grows` (stop creating singly-held blocks, and heal existing
+ones while their holder is online) and `name-the-single-holder-deadlock` (say what is happening).
+**Neither covers a block whose sole holder is offline or gone — this ticket is still what covers
+that.** A related threat-model question it surfaced is in
+`blocked/repair-floor-defends-a-door-the-push-path-leaves-open`; how that is answered may change this
+ticket's priority.
