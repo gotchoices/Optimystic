@@ -228,9 +228,14 @@ describe('cohort growth replicates the founder block and makes it readable', fun
 
 	const build = async () => {
 		// Three real storage stacks. A holds the founder block; B and C hold nothing.
-		const aRepo = new StorageRepo(id => new BlockStorage(id, new MemoryRawStorage()));
-		const bRepo = new StorageRepo(id => new BlockStorage(id, new MemoryRawStorage()));
-		const cRepo = new StorageRepo(id => new BlockStorage(id, new MemoryRawStorage()));
+		// One raw storage per node, shared across createBlockStorage calls — the factory runs per
+		// operation, so a fresh MemoryRawStorage inside it would lose the pend before the commit.
+		const aStorage = new MemoryRawStorage();
+		const bStorage = new MemoryRawStorage();
+		const cStorage = new MemoryRawStorage();
+		const aRepo = new StorageRepo(id => new BlockStorage(id, aStorage));
+		const bRepo = new StorageRepo(id => new BlockStorage(id, bStorage));
+		const cRepo = new StorageRepo(id => new BlockStorage(id, cStorage));
 		await writeRevision(aRepo, 'action-1' as ActionId, 1, 'v1');
 
 		const peerA = await makePeerId();
