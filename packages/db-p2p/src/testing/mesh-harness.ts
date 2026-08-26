@@ -148,6 +148,12 @@ export interface Mesh {
  * separately from "holds nothing".)
  *
  * `nodes` is captured by reference and is fully populated by the time this is invoked.
+ *
+ * NOTE: the archive served here always carries exactly ONE revision — the peer's current latest —
+ * because that is all `storageRepo.get` surfaces. Enough for repair, which only ever targets one
+ * `(rev, actionId)`. If a spec ever needs a gap-fill across a revision RANGE (multi-revision
+ * archive, `range` spanning more than `[rev, rev+1]`), this helper has to serve the real range
+ * instead of synthesising a single-entry one.
  */
 const makeFetchArchive = (nodes: MeshNode[], selfPeerId: string, failures: MeshFailureConfig) =>
 	async (peerIdStr: string, blockId: BlockId): Promise<BlockArchive | undefined> => {
@@ -186,6 +192,12 @@ export async function createMesh(nodeCount: number, options: MeshOptions): Promi
 	//
 	// Precedence: an explicit `clusterPolicy` entry wins over the matching legacy top-level field —
 	// the entry is the production-shaped one.
+	//
+	// NOTE: one policy for the whole mesh, so every node necessarily agrees on cluster size and
+	// thresholds. That is right for repair tests, where disagreement is not the variable. A test
+	// that needs nodes to DISAGREE about the cluster (a partition where each side derives its own
+	// view — see ticket `mesh-harness-admission-gate`) has to move this resolve inside the phase-1
+	// loop and take per-node overrides; it cannot be expressed with a single shared object.
 	const policy = resolveClusterPolicy({
 		clusterSize: options.clusterSize,
 		clusterPolicy: {
