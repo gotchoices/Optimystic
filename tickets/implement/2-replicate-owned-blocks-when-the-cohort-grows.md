@@ -5,6 +5,106 @@ files: packages/db-p2p/src/cluster/spread-on-churn.ts, packages/db-p2p/src/clust
 difficulty: hard
 ----
 
+<!-- resume-note -->
+**Resume note (2026-08-26 run, log
+`tickets/.logs/2-replicate-owned-blocks-when-the-cohort-grows.implement.2026-08-26T05-37-43-102Z.log`).**
+The prior run was stopped by a BUDGET_WARNING after investigation only — **no code changes were made;
+the working tree is untouched by this ticket.** All the design decisions the ticket left open were
+settled from reading the code; they are recorded below so the next run can start implementing
+immediately instead of re-deriving them.
+
+### Settled: the growth trigger lives in `RebalanceMonitor`, not `spread-on-churn`
+
+Reasons, from the code as it stands:
+
+- `RebalanceMonitor` already listens to **both** `connection:open` and `connection:close`
+  (`rebalance-monitor.ts:98-99`); `SpreadOnChurnMonitor` listens only to `connection:close` and its
+  whole vocabulary is departure-specific. Cohort growth arrives as `connection:open`.
+- `RebalanceMonitor.performRebalanceCheck` already iterates the shared tracked set, assembles the
+  per-block cohort **at the floor size** (`assembleCohort(coord, this.getCohortSize())`,
+  `rebalance-monitor.ts:197`), and keeps per-block memory (`responsibilitySnapshot`). Extending that
+  snapshot is the minimal change; spread-on-churn has no per-block memory at all.
+- The monitor's event already flows into `BlockTransferCoordinator.handleRebalanceEvent` via the
+  node-base handler (`libp2p-node-base.ts:1134`), so the push path reuses `confirmReplicated` with
+  the floor already carried in the event — no new wiring in `libp2p-node-base.ts` is required for the
+  event to reach the coordinator (only config passthrough + comment updates, if anything).
+- Debounce, `minRebalanceIntervalMs` throttle, and partition suppression come for free.
+
+### Settled: detection design (monitor side)
+
+- Change `responsibilitySnapshot` from `Map<string, boolean>` to
+  `Map<string, { responsible: boolean; cohortPeers: Set<string> }>`. `untrackBlock` still deletes
+  the entry. Gained/lost logic reads `prior?.responsible ?? false`, unchanged in behavior.
+- Add `grown: Map<string, string[]>` to `RebalanceEvent` — blockId → cohort peers newly
+  co-responsible (never self). Growth arm runs whenever `isResponsible` (NOT gated on
+  `wasResponsible`): `newPeers = cohort - self - (prior?.cohortPeers ?? ∅)`.
+- **Treating a missing snapshot entry as "prior cohort = empty" is load-bearing.** First check after
+  a topology event pushes to the whole non-self cohort. This is what heals the founder case (A alone
+  commits; B joins → first check → push to B; C joins → second check → push to C only) AND the
+  restarted-holder case ("stranded until it next runs" residual). Without it, peers that joined
+  before the monitor's first check are recorded as already-seen and never pushed to.
+- **Bound**: primary bound is free — the cohort is assembled at floor size (≤3), so `newPeers` per
+  block is ≤ floor−1, and `confirmReplicated` stops per-block once the floor is met. Secondary bound:
+  a per-check `growthBlockBudget` config (default 64). For a block dropped by the budget, **do not
+  update its snapshot cohort** — the next check re-detects the same growth (self-healing retry) —
+  and count it; emit one `log('growth budget reached: %d blocks deferred...', dropped)` line per
+  check, per the ticket's "log what the bound dropped" requirement.
+- A block cannot be both `lost` and `grown` (lost ⇒ not responsible ⇒ growth arm skipped). It CAN be
+  both `gained` and `grown` (first observation); for a genuinely-just-gained block the push finds no
+  local data and `confirmReplicated` logs `confirm:no-local-data` and reports it unconfirmed —
+  benign, since those cohort peers are the pull's own source. Say this in the handoff.
+
+### Settled: reaction design (coordinator side)
+
+- Extend `handleRebalanceEvent` to also process `event.grown`, reusing
+  `confirmReplicated` per block with a **per-block floor of `min(event.floor, newPeers.length)`**.
+  Passing the raw event floor is wrong: with 1 new peer and floor 3, `executeConfirm` can never reach
+  the floor and would burn `maxRetries` re-pushing a peer that already accepted. With the min, one
+  clean push per new peer, retries only on actual failure. In-flight key `confirm:<id>` dedups
+  against the lost-confirm path for free.
+- Extend `RebalanceReactionResult` with the growth outcome (e.g. `replicated`/`underReplicated`);
+  node-base handler uses it only for logging — `released` gating is untouched.
+- `enablePush` does not gate this path (same rationale as the existing NOTE in
+  `confirmReplicated`, `block-transfer.ts:170`); the growth arm is gated by `rebalance.enabled`.
+  State that in the handoff.
+
+### Settled: test plan
+
+- Unit: growth detection cases go in `rebalance-monitor.spec.ts` (first-observation seeds whole
+  cohort; stable cohort → no `grown`; repeated checks don't re-emit; budget drop defers + re-detects;
+  partition suppresses; lost∩grown impossible). Reaction hop extension in `rebalance-reaction.spec.ts`
+  (its `wire()` already mirrors the node-base handler; `MockPeerNetwork.connect` throwing is enough to
+  prove the grown push dialed).
+- E2E "B reads the founder's block": `src/testing/mesh-harness.ts` is unsuitable — it has **no FRET
+  and no monitors**. Build a component-level spec instead, combining:
+  - the three-peer read harness of `test/coordinator-repo-single-holder.spec.ts` (real StorageRepos,
+    real `CoordinatorRepo` + `createReconcileBlock`) for the "B reads and gets content" half, and
+  - a real `RebalanceMonitor` + `BlockTransferCoordinator` on A with a MockFret whose cohort is
+    mutated to simulate B/C joining (pattern in `rebalance-reaction.spec.ts`), and
+  - a **loopback duplex stream** so A's push actually lands in B/C's storage: `ProtocolClient`
+    (`protocol-client.ts:144`) writes LP-encoded frames via `stream.send(chunk)` then reads the
+    response from the stream's async iterator. The existing mocks are response-only
+    (`block-transfer.spec.ts:80`, `spread-on-churn.spec.ts` `createMockStream`) — the loopback must
+    capture sent chunks, LP-decode + JSON-parse the `BlockTransferRequest`, feed it to the target
+    node's real `BlockTransferService` (`handlePush` driven directly, as
+    `block-transfer-push-persist.spec.ts:53` does), and yield the LP-encoded response.
+  Assert: before growth, B's read fails exactly as `coordinator-repo-single-holder.spec.ts` pins;
+  after the growth event fires and the push persists on B/C, B's read returns the content (two
+  holders → the corroboration floor of 2 is met; no read-path change needed).
+- Node-wiring: existing `rebalance-monitor-node-wiring.spec.ts` covers assembly; growth rides the
+  same wiring, so at most add an assertion there — a separate new node-wiring spec is likely
+  unnecessary (revisit once implemented).
+
+### Remaining TODO (unchanged in substance from the list below)
+
+Implement monitor + coordinator changes per above; write the tests per above; `yarn build`, then
+`yarn workspace @optimystic/db-p2p test`, `yarn lint` from root; write the review handoff with the
+honest residuals: offline-holder-forever case (covered only by
+`backlog/debt-read-repair-commit-cert-verification`), checks are topology-event-driven only (a
+quiet network after FRET converges late gets no re-check until the next connection event), and the
+gained∩grown no-local-data benign push miss.
+<!-- /resume-note -->
+
 # Make the second copy, instead of teaching the reader to trust one
 
 From `fix/single-holder-block-is-permanently-unreadable` (upstream
