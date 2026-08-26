@@ -17,12 +17,15 @@ Read-repair adopts a peer's claimed revision only when a quorum of distinct corr
 peers agree on the same `(rev, actionId)`. Swept over `resolveClusterPolicy` +
 `corroboratorCapacity` + `quorumSize`:
 
-| machines | cohort size declared? | peers besides the reader | peers that must answer *that reader* | can repair? |
+Every row assumes the block already has at least two cohort-peer holders besides the reader — see
+`sole-holder` below for the case where it does not.
+
+| machines | cohort size declared? | peers besides the reader | peers that must answer *that reader* | can repair (given ≥2 holders)? |
 | --- | --- | --- | --- | --- |
 | 2 | no (falls back to `clusterSize`, default 10) | 1 | 2 | **never** |
 | 2 | yes (`assumedClusterSize: 2`, or honest `clusterSize: 2`) | 1 | 1 | yes, no margin |
 | 3 | either | 2 | 2 | yes, **no margin** |
-| 4+ | either | 3+ | 2 | yes, survives one unreachable peer |
+| 4+ | either | 3+ | 2 | yes, survives one unreachable peer — **only for a block ≥2 peers hold; a block held by exactly one cohort peer never repairs, at any machine count (`reason: 'sole-holder'`)** |
 
 `quorum-restore.spec.ts` → *how many answering peers a repair needs, by deployment size* asserts
 this as a count of machines rather than a restatement of the formula, so the arithmetic cannot drift

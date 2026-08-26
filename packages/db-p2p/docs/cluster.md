@@ -860,6 +860,20 @@ estimate is unconfident. A genuine two-node mesh needs one setting to *self-repa
 `clusterPolicy.assumedClusterSize: 2` (which does not lower the replication factor) or an honest
 `clusterSize: 2` — though it transacts and votes unconfigured.
 
+**Every number above counts PEERS, not COPIES — and repair needs both.** `repairCorroborationClusterSize`
+and the corroboration floor it feeds are entirely about how many cohort *peers* exist and can be asked;
+none of it says how many of those peers actually *hold* the block being repaired. A block that only one
+cohort peer holds cannot be repaired at any `assumedClusterSize` / `clusterSize` whatsoever — the sole
+holder cannot second itself, and the two mechanisms that would give a second peer a copy (read-repair
+and reconcile) both decline on this same corroboration floor. The usual cause is data written while the
+deployment (or that block's cohort) was smaller: growing the deployment afterwards does not retroactively
+copy existing blocks to the new peers, so founding data can stay stranded at one copy indefinitely. This
+is reported once per affected block as `cluster-fetch:repair-deadlock` with `reason: 'sole-holder'`
+(`CoordinatorRepo.reportRepairDeadlock`) — a different `reason` from `cohort-too-small`, which is purely
+about peer count — and its remedy is another cohort peer holding the block (committing a new revision),
+never a larger `assumedClusterSize` or `clusterSize`. See [internals.md](../../../docs/internals.md) for
+the full size table and both `reason` values.
+
 **Configuration in `libp2p-node-base.ts`:** the composition root no longer writes a config literal.
 It resolves one, and hands the *same* object to the cluster member, the coordinator, and both
 block-restoration paths, so those four cannot come up disagreeing:

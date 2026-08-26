@@ -482,21 +482,31 @@ saveMaterializedBlock(block): store(structuredClone(block));
 
   **How many machines repair actually needs** (swept over `resolveClusterPolicy` +
   `corroboratorCapacity` + `quorumSize`, and pinned in `test/quorum-restore.spec.ts` under *how
-  many answering peers a repair needs, by deployment size*):
+  many answering peers a repair needs, by deployment size*). **Every row assumes the block already
+  has at least two cohort-peer holders besides the reader** — i.e., enough copies that a quorum is
+  reachable in principle. Machine count alone never repairs a block only one cohort peer holds; see
+  the paragraph below the table:
 
-  | machines | cohort size declared? | peers besides the reader | peers that must answer *that reader* | can repair? |
+  | machines | cohort size declared? | peers besides the reader | peers that must answer *that reader* | can repair (given ≥2 holders)? |
   | --- | --- | --- | --- | --- |
   | 2 | no (falls back to `clusterSize`, default 10) | 1 | 2 | **never** |
   | 2 | yes (`assumedClusterSize: 2`, or an honest `clusterSize: 2`) | 1 | 1 | yes, with no margin |
   | 3 | either | 2 | 2 | yes, with **no margin** |
   | 4+ | either | 3+ | 2 | yes, survives one unreachable peer |
 
-  Two consequences are worth stating plainly, because both have cost real debugging time.
+  Three consequences are worth stating plainly, because all three have cost real debugging time.
   **Three machines is the minimum that can ever repair, not a size at which repair is safe**: the
   reader has exactly two peers and needs both, so one peer unreachable *from that reader* — healthy
-  and reachable from everyone else — leaves that reader's copy permanently unrepairable. And
-  **declaring `assumedClusterSize: 3` does not conjure a third peer**; it has the same zero
-  tolerance as an undeclared three. Four machines is the first size with any margin.
+  and reachable from everyone else — leaves that reader's copy permanently unrepairable. **Declaring
+  `assumedClusterSize: 3` does not conjure a third peer**; it has the same zero tolerance as an
+  undeclared three. And **the `4+` row's "survives one unreachable peer" is conditional on the
+  same ≥2-holders assumption as every other row, not a blanket guarantee at that size**: a block
+  that only one cohort peer holds cannot be repaired at *any* machine count, four-or-more included —
+  more machines never manufactures a second copy of a block that only ever had one. The usual way a
+  block ends up in that state is being written while the deployment (or that block's cohort) was
+  smaller; growing the deployment afterwards does not retroactively copy it. This is reported as
+  `cluster-fetch:repair-deadlock` with `reason: 'sole-holder'` (below) — a diagnosis, not a fault of
+  the read path, and one an operator at four-plus machines can otherwise easily miss.
 
   Two signals name this rather than leaving it to be re-derived from logs:
 
@@ -508,25 +518,44 @@ saveMaterializedBlock(block): store(structuredClone(block));
     (This is the renamed, widened successor to `assumed-cluster-size-unset`, which fired only when
     the size was undeclared and told operators three machines "can ignore this".)
   - **`cluster-fetch:repair-deadlock`** (`CoordinatorRepo.reportRepairDeadlock`), once per block,
-    when a decline is provably permanent — meaning the *cohort is too small to reach the quorum at
-    all*, not merely that this pass fell short. The test is explicit: compute what the quorum would
-    demand if **every** cohort peer answered and agreed (`requiredEvenIfAllAnswered`, reported in
-    the payload) and compare it to how many peers the cohort has. Only when the cohort cannot meet
-    even that best case is the shortfall beyond any later pass's reach. Per the table above, that is
-    the row where repair says *never*: one peer besides the reader, with the size undeclared.
-    Deliberately excluded: a shortfall where the cohort *could* reach quorum and some peer simply
-    does not hold the block yet (that peer's own repair, or the next commit, fixes it); a cohort
-    that unanimously answers "I hold nothing" (an agreed absence is an answer); and a pass with any
-    silent peer (silence does not change the arithmetic — silent peers are still counted — but a
-    node that could not ask everyone should not make a permanent claim, and the next clean pass
-    costs nothing). There is deliberately **no** "the claims disagreed" exemption: a cohort too
-    small to reach quorum stays too small whether its peers agree or not. All of those keep the
-    per-pass `cluster-fetch:no-quorum` line, which still fires on every decline. The message names
-    *two* readings of the same numbers, because the node cannot tell them apart from the inside: a
-    deployment that genuinely runs this few machines, or a cohort view shrunk below the real
-    deployment by a partition or by routing influence — configuration will not fix the second. The
-    once-per-block suppression hangs off the existing `unsettledAheadClaims` entry and clears when
-    the block converges. The reader-facing error is *not* yet aware of this:
+    when a decline is provably permanent — not merely that this pass fell short. Carries a `reason`
+    field with one of two values; they are different faults with different remedies, so each gets
+    its own wording:
+    - **`cohort-too-small`** — this node's cohort has fewer peers than the quorum would demand even
+      if **every** one of them answered and agreed (`requiredEvenIfAllAnswered`, reported in the
+      payload, compared against how many peers the cohort has). Per the table above, that is the row
+      where repair says *never*: one peer besides the reader, with the size undeclared. Remedy: more
+      machines, or an honest declared `clusterPolicy.assumedClusterSize` / `clusterSize`.
+    - **`sole-holder`** — the cohort is big enough (does not trip `cohort-too-small`), but exactly
+      ONE of its peers holds the block and every *other* peer answered that it holds nothing — an
+      answer, not silence. Every row in the table above assumes the block already has two-or-more
+      cohort-peer holders; this is the case where it does not, so it holds at *any* machine count.
+      Scope is deliberately narrow: this node's own copy, if it has one, is excluded from the claim
+      set (it cannot corroborate the revision it is repairing), so the message says "cohort peer",
+      never "machine in the deployment" — a reader that holds the block itself still gets
+      `sole-holder`. Remedy: another cohort peer holding the block, i.e. committing any new revision
+      of the block, which writes it to the current cohort; no machine count or configuration setting
+      helps. The usual cause is data written while the deployment (or that block's cohort) was
+      smaller — growing the deployment afterwards does not copy existing blocks to the new peers, so
+      founding data can stay stranded at one copy indefinitely.
+
+    Deliberately excluded from both: a shortfall where the cohort *could* reach quorum and some peer
+    simply does not hold the block yet (that peer's own repair, or the next commit, fixes it); a
+    cohort that unanimously answers "I hold nothing" (an agreed absence is an answer); and a pass
+    with any silent peer (silence does not change the arithmetic — silent peers are still counted —
+    but a node that could not ask everyone should not make a permanent claim, and the next clean pass
+    costs nothing). There is deliberately **no** "the claims disagreed" exemption for
+    `cohort-too-small`: a cohort too small to reach quorum stays too small whether its peers agree or
+    not. Two or more disagreeing holders DO suppress `sole-holder` — that cohort has two copies whose
+    peers simply have not settled yet, and a later pass can. Both reasons keep the per-pass
+    `cluster-fetch:no-quorum` line, which still fires on every decline. The `cohort-too-small`
+    message names *two* readings of the same numbers, because the node cannot tell them apart from
+    the inside: a deployment that genuinely runs this few machines, or a cohort view shrunk below the
+    real deployment by a partition or by routing influence — configuration will not fix the second.
+    Suppression is per-`reason`, not once outright: an episode that starts as `cohort-too-small` and
+    becomes `sole-holder` (the operator added the machines that reason asked for, and the block is
+    still stuck) says the second thing too. It hangs off the existing `unsettledAheadClaims` entry
+    and clears when the block converges. The reader-facing error is *not* yet aware of this:
     `BlockPossiblyStaleError` still implies a retry might help, which is wrong advice for a
     deadlocked repair — see the `NOTE:` at `reportRepairDeadlock`.
 

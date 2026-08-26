@@ -98,6 +98,15 @@ describe('quorum-restore primitives', () => {
 	 *
 	 * Read through the composition root (`resolveClusterPolicy`) rather than by hand, because that is
 	 * the layer a real deployment runs on and the layer where a wrong default has hidden before.
+	 *
+	 * **Every deployment-size claim here assumes the block already has enough cohort-peer HOLDERS.**
+	 * `answeringPeersNeeded` below assumes every peer that answers does so as a holder — i.e. every
+	 * answering peer reports the SAME `(rev, actionId)` — so it only ever measures how many peers a
+	 * deployment of that size can field, never how many of them actually hold the block in question.
+	 * A block only one cohort peer holds breaks that assumption: no count of machines supplies a
+	 * second holder, so no `nodes` value in this file's cases makes it repairable. See the final case
+	 * below, which pins that directly rather than through `answeringPeersNeeded` (whose "every peer
+	 * answers as a holder" premise is exactly what a singly-held block does not satisfy).
 	 */
 	describe('how many answering peers a repair needs, by deployment size', () => {
 		/**
@@ -161,6 +170,25 @@ describe('quorum-restore primitives', () => {
 			// repairCorroborationClusterSize falls back to clusterSize (10 by default), so the floor of
 			// two never relaxes and the single peer can never second itself. No answering count helps.
 			expect(answeringPeersNeeded({ nodes: 2, clusterSize: 10 })).to.equal(undefined);
+		});
+
+		it('a block only ONE cohort peer holds needs a number of answering peers no deployment size supplies', () => {
+			// answeringPeersNeeded (above) assumes every answering peer is a HOLDER — every one reports
+			// the same (rev, actionId). A singly-held block breaks that: every OTHER cohort peer answers
+			// "holds nothing", which is a real answer (not silence) but contributes no claim at all, so
+			// no count of them corroborates the sole holder. This is `sole-holder` in
+			// `CoordinatorRepo.reportRepairDeadlock`, distinct from the `cohort-too-small` shape the rest
+			// of this describe block measures.
+			for (const nodes of [3, 4, 10]) {
+				const cohortPeers = nodes - 1;
+				const policy = resolveClusterPolicy({ clusterSize: nodes });
+				const capacity = corroboratorCapacity(cohortPeers, policy.repairCorroborationClusterSize);
+				const soleHolderClaim: RevClaim[] = [{ peerId: 'sole-holder', rev: 2, actionId: 'a' }];
+				expect(
+					selectQuorumRev(soleHolderClaim, THRESHOLD, capacity),
+					`${nodes} machines, cohort large enough to repair a shared block, still can't corroborate a lone holder`
+				).to.equal(undefined);
+			}
 		});
 	});
 
