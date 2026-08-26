@@ -6,6 +6,8 @@ import { TestTransactor, FlakyCommitTransactor } from '../src/testing/test-trans
 import { waitFor } from '../src/testing/async-wait.js'
 import type { Action, ActionHandler, BlockStore, IBlock, ITransactor, BlockGets, GetBlockResults, ActionBlocks, BlockActionStatus, PendRequest, PendResult, CommitRequest, CommitResult, StaleFailure } from '../src/index.js'
 import { BlockUnavailableError, BlockPossiblyStaleError } from '../src/index.js'
+import debug from 'debug'
+import { format } from 'node:util'
 
 interface TestAction {
   value: string
@@ -1338,6 +1340,138 @@ describe('Collection', () => {
       const vanishing = new VanishingHeaderTransactor(transactor, collectionId)
       await expect(Collection.open<TestAction>(vanishing, collectionId, initOptions))
         .to.be.rejectedWith(`Log not found for collection ${collectionId}`)
+    })
+  })
+
+  // Ticket a-refresh-that-fails-to-close-a-known-gap-says-nothing: update() reads the
+  // authoritative "latest committed under this id" revision off the log tail, then decides how
+  // far to advance by a SEPARATE chain walk. A walk that lands short of what the tail claimed
+  // means the refresh provably closed nothing — which used to be indistinguishable, from
+  // outside the class, from "there was nothing newer to adopt".
+  describe('a refresh that lands short of the tail it just read', () => {
+    const shortfallTag = 'collection:context-short-of-tail'
+
+    /** Capture what the `db-core:collection` namespace emits while `fn` runs, fully substituted
+     *  (`debug` leaves `%s`/`%d` for the downstream sink, so the raw args are not the text). */
+    const captureCollectionLog = async (fn: () => Promise<void>): Promise<string[]> => {
+      const lines: string[] = []
+      const previousNamespaces = debug.disable()
+      const previousLog = debug.log
+      debug.enable('optimystic:db-core:collection')
+      debug.log = (...args: unknown[]): void => { lines.push(format(...args)) }
+      try {
+        await fn()
+      } finally {
+        debug.log = previousLog
+        debug.disable()
+        if (previousNamespaces) debug.enable(previousNamespaces)
+      }
+      return lines
+    }
+
+    /** The tail block id the synced header points at, and the revision its state claims —
+     *  exactly the block and field `bootstrapContext` reads. */
+    const syncedTail = async (): Promise<{ tailId: string, rev: number }> => {
+      const headerEntry = (await transactor.get({ blockIds: [collectionId] }))[collectionId]
+      const tailId = (headerEntry?.block as { tailId?: string } | undefined)?.tailId
+      expect(tailId, 'a synced header names its log tail block').to.be.a('string')
+      const tailEntry = (await transactor.get({ blockIds: [tailId!] }))[tailId!]
+      const rev = tailEntry?.state.latest?.rev
+      expect(rev, 'a committed tail block carries the latest committed revision').to.be.a('number')
+      return { tailId: tailId!, rev: rev! }
+    }
+
+    /** Inflates `state.latest.rev` on the UNPINNED read of the tail block — the one read
+     *  `bootstrapContext` makes — so the tail claims a revision no chain walk can reach.
+     *  Every pinned read (the walk itself) is passed through untouched.
+     *
+     *  Armed separately from construction on purpose: `Collection.open` bootstraps from the very
+     *  same unpinned tail read, so inflating from the start would simply pin the OPENED
+     *  collection at the inflated revision (and `advanceContext` would then log
+     *  `context-not-lowered` instead). Open clean, arm, then refresh. */
+    const inflatedTailTransactor = (inner: TestTransactor, tailId: string, by: number) => {
+      let armed = false
+      const transactor: ITransactor = {
+        async get(gets: BlockGets): Promise<GetBlockResults> {
+          const res = await inner.get(gets)
+          const entry = res[tailId]
+          if (armed && gets.context === undefined && entry?.state.latest) {
+            res[tailId] = {
+              ...entry,
+              state: { ...entry.state, latest: { ...entry.state.latest, rev: entry.state.latest.rev + by } },
+            }
+          }
+          return res
+        },
+        getStatus: (refs: ActionBlocks[]) => inner.getStatus(refs),
+        pend: (req: PendRequest) => inner.pend(req),
+        cancel: (ref: ActionBlocks) => inner.cancel(ref),
+        commit: (req: CommitRequest) => inner.commit(req),
+      }
+      return { transactor, arm: () => { armed = true } }
+    }
+
+    // The healthy path is the assertion that matters most: a shortfall line on an ordinary
+    // refresh would be noise in every log this diagnostic is meant to be read in.
+    it('an ordinary refresh of an already-current collection says nothing', async () => {
+      const collection = await Collection.createOrOpen<TestAction>(transactor, collectionId, initOptions)
+      await collection.act({ type: 'set', data: { value: 'one', timestamp: 1 } })
+      await collection.updateAndSync()
+      await syncedTail()   // asserts there IS a committed tail, so the check is really exercised
+
+      const lines = await captureCollectionLog(() => collection.update())
+      expect(lines.filter(l => l.includes(shortfallTag)), 'a current collection reports no shortfall').to.deep.equal([])
+    })
+
+    it('a refresh that actually catches up says nothing', async () => {
+      const writer = await Collection.createOrOpen<TestAction>(transactor, collectionId, initOptions)
+      await writer.act({ type: 'set', data: { value: 'one', timestamp: 1 } })
+      await writer.updateAndSync()
+
+      const reader = await Collection.open<TestAction>(transactor, collectionId, initOptions)
+      expect(reader, 'the committed collection reopens').to.not.equal(undefined)
+
+      await writer.act({ type: 'set', data: { value: 'two', timestamp: 2 } })
+      await writer.updateAndSync()
+
+      const lines = await captureCollectionLog(() => reader!.update())
+      expect(lines.filter(l => l.includes(shortfallTag)), 'a refresh that closed the gap reports no shortfall').to.deep.equal([])
+      const values: string[] = []
+      for await (const a of reader!.selectLog()) { values.push(a.data.value) }
+      expect(values, 'the catch-up refresh really did adopt the newer action').to.deep.equal(['one', 'two'])
+    })
+
+    it('a collection with nothing committed under its id says nothing', async () => {
+      // No tail, so no claimed revision — a legitimate "nothing committed yet", not a shortfall.
+      const collection = await Collection.createOrOpen<TestAction>(transactor, collectionId, initOptions)
+      const lines = await captureCollectionLog(() => collection.update())
+      expect(lines.filter(l => l.includes(shortfallTag)), 'an uncommitted collection reports no shortfall').to.deep.equal([])
+    })
+
+    it('a refresh whose walk falls short of the tail logs the gap and still returns normally', async () => {
+      const collection = await Collection.createOrOpen<TestAction>(transactor, collectionId, initOptions)
+      await collection.act({ type: 'set', data: { value: 'one', timestamp: 1 } })
+      await collection.updateAndSync()
+      const { tailId, rev } = await syncedTail()
+
+      // Open honestly (the collection adopts the real committed revision), then make the tail
+      // claim five revisions more than the log holds. The walk cannot reach that number, so the
+      // refresh below provably closes nothing.
+      const inflated = inflatedTailTransactor(transactor, tailId, 5)
+      const lagging = await Collection.open<TestAction>(inflated.transactor, collectionId, initOptions)
+      expect(lagging, 'the collection opens against the honest tail').to.not.equal(undefined)
+      inflated.arm()
+
+      const lines = await captureCollectionLog(() => lagging!.update())   // must NOT throw
+      const shortfall = lines.filter(l => l.includes(shortfallTag))
+      expect(shortfall.length, `exactly one shortfall line, got: ${lines.join(' | ')}`).to.equal(1)
+      const parsed = /id=(\S+) before=(\S+) after=(\S+) tail=(\d+)/.exec(shortfall[0]!)
+      expect(parsed, `the line names id, before, after and tail: ${shortfall[0]}`).to.not.equal(null)
+      const [, id, before, after, tail] = parsed!
+      expect(id, 'the line names the collection').to.equal(collectionId)
+      expect(Number(tail), 'the tail revision reported is the one the tail claimed').to.equal(rev + 5)
+      expect(Number(after), 'the collection ended below the revision the tail claimed').to.be.lessThan(rev + 5)
+      expect(before, 'the refresh moved the collection nowhere').to.equal(after)
     })
   })
 })

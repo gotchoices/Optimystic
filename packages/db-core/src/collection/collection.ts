@@ -272,6 +272,14 @@ export class Collection<TAction> implements ICollection<TAction> {
 		// was ever committed under this id. Log.open reads the same block id, so it too resolves
 		// undefined and everything below no-ops — correct here, rather than a masked failure.
 
+		// The revision the committed tail just claimed, captured before anything else can touch
+		// the local source. This is the authoritative "latest committed under this id" number,
+		// read straight off the tail block's state; the chain walk below arrives at its own
+		// number by a different path, and the two disagreeing is worth saying out loud (see the
+		// shortfall check after advanceContext). Stays undefined when there is no header, no
+		// tail, or a tail with no `latest` — all legitimate "nothing committed yet" states.
+		const tailRev = source.actionContext?.rev;
+
 		// Get the latest entries from the log, starting from where we left off
 		const actionContext = this.source.actionContext;
 		const collectionLog = await Log.open<Action<TAction>>(tracker, this.id);
@@ -321,6 +329,23 @@ export class Collection<TAction> implements ICollection<TAction> {
 		// at the revision we're leaving and refills the cache with stale content that nothing
 		// will invalidate again (the log entry that would have cleared it was already consumed).
 		Collection.advanceContext(this.source, this.id, latest?.context);
+
+		// Sibling guard to `collection:context-not-lowered`: that one reports a collection
+		// declining to move BACKWARDS; this one reports a refresh that failed to move FORWARDS
+		// past a revision it had already read for itself. The tail said `tailRev` is committed
+		// under this id, and the chain walk — a separate read path — did not get us there, so
+		// this refresh provably closed nothing and returning silently would make it
+		// indistinguishable from "there was nothing newer to adopt". Log, do not throw: update()
+		// is called blanket-style over every registered collection between commit retries, and a
+		// shortfall is not yet known to be illegitimate — turning it into an abort would make an
+		// unproven diagnosis into production behaviour. Deliberately does NOT adopt tailRev
+		// either: the two numbers come from different read paths and papering over the
+		// disagreement destroys the evidence this line exists to produce.
+		const afterRev = this.source.actionContext?.rev;
+		if (tailRev !== undefined && (afterRev === undefined || afterRev < tailRev)) {
+			log('collection:context-short-of-tail id=%s before=%s after=%s tail=%d',
+				this.id, actionContext?.rev ?? 'none', afterRev ?? 'none', tailRev);
+		}
 
 		// On conflicts, re-stage the pending actions against the adopted revision. The affected
 		// blocks were already dropped from sourceCache above (per log entry / per invalidation),

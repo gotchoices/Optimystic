@@ -238,7 +238,7 @@ Call that `landed` below. Getting this step wrong inverts every row of the table
 | `rev` at or above `landed`, `matched=0` | The write's index action did not survive commit despite being staged. Look at the sync/merge and conflict replay, not at refresh. (`above` is normal: any later commit under that id moves the collection past `landed`.) |
 | `rev` at or above `landed`, `matched>0`, but the SQL still returned no row | The index held the entry and the main-table fetch dropped it — compare `main_rev=` against `landed` for the **table** collection (same collection on both sides), never against `rev=`. |
 | `seek=` differs between the two nodes for the same SQL value | Neither of the above: the two nodes framed different keys, so the seek never addressed the entry that was written. |
-| A live refresh ran immediately before the read and `rev` did not move | Split it by action id. **Same action id at a lower revision than `landed`**: the refresh ran and closed nothing, so the gap is real — the node is genuinely behind on one collection. **Different action id at the same revision as another node's**: the two nodes are not on one collection at all; each built its own copy under the same id, each counting its own revisions. |
+| A live refresh ran immediately before the read and `rev` did not move | Split it by action id. **Same action id at a lower revision than `landed`**: the refresh ran and closed nothing, so the gap is real — the node is genuinely behind on one collection. **Different action id at the same revision as another node's**: the two nodes are not on one collection at all; each built its own copy under the same id, each counting its own revisions. For the first of those, db-core can confirm the refresh itself came up short — see *Did the refresh itself fail to close the gap?* below. |
 
 `none` on its own is not proof of the invention race — a collection that has legitimately never
 been committed yet also reports `none`, and a first insert normally shows the main table collection
@@ -249,6 +249,49 @@ scopes to (node A committed first).
 For `arm=committed` over a tree that was staged into the in-flight transaction, the view is pinned
 to the transaction's first-touch boundary, which can be older than the `rev=` printed here (the
 collection's current revision); for a clean tree the two are the same moment.
+
+#### Did the refresh itself fail to close the gap?
+
+`index:seek` shows the revision a read descended at, but it cannot say whether the `update()` that
+ran just before it *tried and failed* to advance or simply found nothing newer. `Collection.update()`
+answers that from the inside, on the `optimystic:db-core:collection` namespace:
+
+```
+optimystic:db-core:collection collection:context-short-of-tail id=default/Usage/index/by_token before=1 after=1 tail=6
+```
+
+A refresh reads the collection's **log tail block**, whose stored state names the most recent
+revision committed under that collection id, and then advances the collection by a separate walk of
+the log chain. This line is emitted when the walk lands **below** what the tail had just claimed —
+the refresh provably closed nothing, and the collection is still behind a revision it had already
+been told about. Fields:
+
+- `id=` — the collection id, the same value `index:seek` prints as `collection=` / `main=`.
+- `before=` / `after=` — the revision the collection held going into the refresh and coming out of
+  it. `before` equal to `after` means the refresh moved it nowhere at all. `none` in either position
+  means the collection held no committed revision at that point.
+- `tail=` — the revision the tail block claimed as committed. This is the number the refresh should
+  have been able to reach.
+
+It is **only ever a report**: `update()` returns normally, and the collection deliberately does not
+adopt `tail=`. The tail's number and the walk's number are read through different paths, and
+adopting the higher one would hide exactly the disagreement the line exists to expose.
+
+Silence here is meaningful too, and is the more common case. A collection with no header, no log
+tail, or a tail that names no committed revision has nothing to fall short of — nothing has been
+committed under that id yet — and emits nothing. So for the decision-table row *"a live refresh ran
+immediately before the read and `rev` did not move"*, this line is the db-core-side confirmation:
+**present** means the refresh ran and demonstrably failed to catch up, so look at the refresh path;
+**absent** means the refresh had nothing newer to adopt, so the stale content came from somewhere
+else — a divergent lineage (see *Comparing action ids* below) or a write that never landed.
+
+Its sibling `collection:context-not-lowered` reports the opposite guard — a collection declining to
+move *backwards* because a read returned an older view than the revision it already holds. Both are
+worth enabling together:
+
+```bash
+DEBUG='optimystic:db-core:collection' node your-app.js
+```
 
 #### Comparing action ids
 
