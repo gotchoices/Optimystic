@@ -67,12 +67,33 @@ function maxRevision(revisions: BlockArchive['revisions']): number | undefined {
 }
 
 /**
- * The claim a peer's archive makes: its highest revision, provided that revision is at least the
- * one we committed. `undefined` when the peer served nothing usable (unreachable, empty archive,
- * or only revisions older than the commit we are healing).
+ * What one cohort peer's fetch produced. Kept as separate outcomes rather than collapsed to
+ * `ReconcileCandidate | undefined` so a decline can report WHICH populations it was short of: "1 of 3
+ * responded" and "1 holder, 2 confirmed non-holders" call for completely different operator actions.
+ *
+ * NOTE: `no-archive` deliberately conflates "the peer holds nothing" with "the peer is unreachable" —
+ * that conflation is in `fetchArchive`'s contract, and the production wiring
+ * (`libp2p-node-base.fetchArchiveFromPeer`) swallows every dial failure and timeout into the same
+ * `undefined`. The read path does separate the two (`CoordinatorRepo`'s `silent` set). If a
+ * reconcile-side decline ever needs that distinction, widen `fetchArchive` to report unreachability
+ * rather than trying to infer it here.
  */
-function toCandidate(peerId: string, archive: BlockArchive | undefined, committedRev: number): ReconcileCandidate | undefined {
-	if (!archive) return undefined;
+type PeerAnswer =
+	/** Served an archive covering the committed revision or better. */
+	| { kind: 'claim'; candidate: ReconcileCandidate }
+	/** Served an archive, but it covers nothing at or above the revision being healed. */
+	| { kind: 'behind' }
+	/** Served no archive: holds nothing, or is unreachable — see the note above. */
+	| { kind: 'no-archive' }
+	/** The fetch threw. */
+	| { kind: 'error' };
+
+/**
+ * The claim a peer's archive makes: its highest revision, provided that revision is at least the
+ * one we committed. `undefined` when the archive carries only revisions older than the commit we are
+ * healing, or no usable action at its highest.
+ */
+function toCandidate(peerId: string, archive: BlockArchive, committedRev: number): ReconcileCandidate | undefined {
 	const maxRev = maxRevision(archive.revisions);
 	if (maxRev === undefined || maxRev < committedRev) return undefined;
 	const data = archive.revisions[maxRev];
@@ -86,18 +107,22 @@ function toCandidate(peerId: string, archive: BlockArchive | undefined, committe
  * discard the answers every other peer already gave — turning a heal the cohort could complete
  * into a decline. One peer's failure costs only that peer's vote.
  */
-async function fetchCandidate(
+async function fetchAnswer(
 	deps: ReconcileBlockDeps,
 	peerId: string,
 	blockId: BlockId,
 	committedRev: number
-): Promise<ReconcileCandidate | undefined> {
+): Promise<PeerAnswer> {
+	let archive: BlockArchive | undefined;
 	try {
-		return toCandidate(peerId, await deps.fetchArchive(peerId, blockId), committedRev);
+		archive = await deps.fetchArchive(peerId, blockId);
 	} catch (err) {
 		log('reconcile:fetch-error', { blockId, peerId, error: (err as Error).message });
-		return undefined;
+		return { kind: 'error' };
 	}
+	if (!archive) return { kind: 'no-archive' };
+	const candidate = toCandidate(peerId, archive, committedRev);
+	return candidate ? { kind: 'claim', candidate } : { kind: 'behind' };
 }
 
 /**
@@ -162,10 +187,11 @@ export function createReconcileBlock(deps: ReconcileBlockDeps): ReconcileBlockCa
 		const targets = cohortPeerIds.filter(id => id !== deps.selfPeerId);
 		if (targets.length === 0) return;
 
-		const fetched = await Promise.all(
-			targets.map(peerId => fetchCandidate(deps, peerId, blockId, committed.rev))
+		const answers = await Promise.all(
+			targets.map(peerId => fetchAnswer(deps, peerId, blockId, committed.rev))
 		);
-		const candidates = fetched.filter((c): c is ReconcileCandidate => c !== undefined);
+		const candidates = answers.flatMap(a => a.kind === 'claim' ? [a.candidate] : []);
+		const tally = (kind: PeerAnswer['kind']) => answers.filter(a => a.kind === kind).length;
 		const capacity = corroboratorCapacity(targets.length, deps.repairCorroborationClusterSize);
 
 		const revClaims: RevClaim[] = candidates.map(({ peerId, rev, actionId }) => ({ peerId, rev, actionId }));
@@ -175,7 +201,11 @@ export function createReconcileBlock(deps: ReconcileBlockDeps): ReconcileBlockCa
 			log('reconcile:no-rev-quorum', {
 				blockId,
 				rev: committed.rev,
-				responders: revClaims.length,
+				cohortPeers: targets.length,
+				holders: revClaims.length,
+				behind: tally('behind'),
+				noArchive: tally('no-archive'),
+				fetchErrors: tally('error'),
 				required: quorumSize(revClaims.length, deps.simpleMajorityThreshold, capacity),
 				repairCorroborationClusterSize: deps.repairCorroborationClusterSize
 			});

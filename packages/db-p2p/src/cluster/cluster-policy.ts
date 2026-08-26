@@ -158,6 +158,17 @@ export function resolveClusterPolicy(options: ClusterPolicyOptions): ResolvedClu
 	//    READER — perfectly healthy and reachable from everybody else — leaves that reader's copy
 	//    permanently unrepairable. Four machines is the first size with any margin.
 	//
+	// Both of those are claims about MACHINES, and the advisory used to stop there — which made it
+	// wrong in the operator's favour, because a machine count is only half the requirement. The peers
+	// that answer must also HOLD the block, and two of them must. A block only ONE cohort peer holds
+	// cannot be repaired at any deployment size whatsoever: the sole holder cannot second itself, and
+	// the two mechanisms that would give a second peer a copy (read-repair and reconcile) both consume
+	// this same decision. So an operator at four-plus machines reading "the first size with any margin"
+	// could believe they were covered while a block written when the deployment was smaller stayed
+	// stranded at one copy forever. The advisory now says so; the per-block half is
+	// `cluster-fetch:repair-deadlock` with `reason: 'sole-holder'` (`CoordinatorRepo`), and the
+	// behavioural fix — replicating owned blocks once the cohort grows — is separate work.
+	//
 	// So the trigger is a union of two conditions, not one:
 	//
 	//  - **undeclared** (the original case): the operator has asserted nothing, so a deployment
@@ -199,6 +210,19 @@ export function resolveClusterPolicy(options: ClusterPolicyOptions): ResolvedClu
 			`peer unreachable from that reader (healthy and reachable from everyone else) leaves that reader's ` +
 			`copy permanently unrepairable. ${minimumSelfHealingDeployment + 1} machines is the first size with ` +
 			`any margin.`;
+		// Every number above counts MACHINES. Saying only that overstates the guarantee, because repair
+		// also needs the answering peers to actually HOLD the block — which is a property of the block,
+		// not of the deployment, and which no machine count can supply.
+		const holdersCaveat =
+			` All of that counts MACHINES, and machines are only half the requirement: the peers that answer ` +
+			`must also HOLD the block, and ${CORROBORATION_FLOOR} of them must. A block that only ONE cohort ` +
+			`peer holds can never be repaired at ANY deployment size — the sole holder cannot second itself — ` +
+			`so every size claim above is about a block at least ${CORROBORATION_FLOOR} peers already hold. ` +
+			`The usual way to fall outside that: data written while the deployment (or that block's cohort) ` +
+			`was smaller keeps the number of copies it was written with, and GROWING THE DEPLOYMENT DOES NOT ` +
+			`COPY IT — so founding data can stay stranded however many machines you later run. That case is ` +
+			`reported once per affected block as cluster-fetch:repair-deadlock with reason=sole-holder, and its ` +
+			`remedy is a second copy (commit a new revision of the block), never more machines.`;
 		const undeclaredAdvice = cohortUndeclared
 			? ` No clusterPolicy.assumedClusterSize declared, so the floor is measured against ` +
 			`repairCorroborationClusterSize=${repairCorroborationClusterSize} and never relaxes: if you actually ` +
@@ -221,7 +245,7 @@ export function resolveClusterPolicy(options: ClusterPolicyOptions): ResolvedClu
 			noRepairMargin,
 			requiredAnsweringPeers,
 			minimumSelfHealingDeployment,
-			message: rule + undeclaredAdvice + noMarginAdvice
+			message: rule + undeclaredAdvice + noMarginAdvice + holdersCaveat
 		});
 	}
 

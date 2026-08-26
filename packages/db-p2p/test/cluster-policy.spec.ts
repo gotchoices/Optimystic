@@ -157,6 +157,33 @@ describe('resolveClusterPolicy', () => {
 			expect(payload?.message).to.not.contain('fewer than 10 machines');
 		});
 
+		/**
+		 * Ticket: name-the-single-holder-deadlock.
+		 *
+		 * Every number in the advisory counts MACHINES, and until this ticket that was all it said —
+		 * which quietly overstated the guarantee. Repair also needs two of those machines to actually
+		 * HOLD the block, and that is a property of the block, not of the deployment. An operator at
+		 * four-plus machines read "the first size with any margin" and believed they were covered while
+		 * a block written when the deployment was smaller sat stranded at one copy. The advisory has to
+		 * scope its own claim.
+		 */
+		it('scopes its fault-tolerance claim to blocks more than one peer holds', async () => {
+			const captured = await captureLog('cluster-policy', async () => {
+				resolveClusterPolicy({ clusterSize: 10 });
+			});
+
+			const message = advisoryPayload(captured)?.message;
+			// The claim it is scoping is still there, verbatim...
+			expect(message).to.contain('4 machines is the first size with any margin');
+			// ...and is now explicitly about a block at least two peers already hold.
+			expect(message).to.contain('machines are only half the requirement');
+			expect(message).to.contain('only ONE cohort peer holds can never be repaired at ANY deployment size');
+			// The concrete way an operator ends up outside the scope, and the remedy that is NOT machines.
+			expect(message).to.contain('GROWING THE DEPLOYMENT DOES NOT COPY IT');
+			expect(message).to.contain('reason=sole-holder');
+			expect(message).to.contain('never more machines');
+		});
+
 		it('still fires for a large, genuinely-provisioned clusterSize — it is advisory, not a fault', async () => {
 			// A deployment that really does run 16 machines is correctly configured and gets the
 			// advisory too; the wording is conditional ("if you actually run fewer than N machines"),

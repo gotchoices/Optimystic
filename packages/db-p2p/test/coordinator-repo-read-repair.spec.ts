@@ -580,10 +580,17 @@ describe('CoordinatorRepo read-repair', () => {
 			// Ticket bug-cluster-size-resolution-single-source: the decline must name the knob that
 			// caused it, not just the vote counts, or an operator reading the log cannot act on it.
 			const payload = captured.find(args => typeof args[0] === 'string' && args[0].includes('cluster-fetch:no-quorum'))?.[1] as
-				{ responders?: number, required?: number, repairCorroborationClusterSize?: number } | undefined;
+				{ cohortPeers?: number, holders?: number, absent?: number, silent?: number,
+					required?: number, repairCorroborationClusterSize?: number } | undefined;
 			expect(payload?.repairCorroborationClusterSize).to.equal(resolved.repairCorroborationClusterSize);
 			expect(payload?.required).to.equal(2);
-			expect(payload?.responders).to.equal(1);
+			// Ticket name-the-single-holder-deadlock: the decline separates the three populations rather
+			// than reporting one "responders" count, because "1 of 2 responded" and "1 holder, 0 absent,
+			// 0 silent" are different problems with different operator actions.
+			expect(payload?.cohortPeers).to.equal(1);
+			expect(payload?.holders).to.equal(1);
+			expect(payload?.absent).to.equal(0);
+			expect(payload?.silent).to.equal(0);
 		});
 
 		it('heals unconfigured-but-declared: resolveClusterPolicy with assumedClusterSize 2 repairs', async () => {
@@ -680,11 +687,24 @@ describe('CoordinatorRepo read-repair', () => {
 	 * no-quorum lines, no error of any kind, and twelve days spent re-deriving from those logs a fact
 	 * the node knew at the moment of each decline. `cluster-fetch:repair-deadlock` says it once, in
 	 * words, and only when it is provable.
+	 *
+	 * Ticket name-the-single-holder-deadlock added the second provable shape. There are now two, each
+	 * with its own `reason` because they send the operator to different places:
+	 *
+	 *  - `cohort-too-small` — the cohort has fewer peers than the quorum needs even if every one of
+	 *    them answered and agreed. Remedy: machines, or an honest declared cohort size.
+	 *  - `sole-holder` — the cohort is big enough, but exactly one of its peers holds the block and
+	 *    every other peer ANSWERED that it holds nothing. Remedy: a second copy of the block. No
+	 *    machine count and no setting helps.
 	 */
 	describe('naming a repair that can never converge', () => {
 		const DEADLOCK = 'cluster-fetch:repair-deadlock';
 		const localRev = 1;
 		const localActionId = 'local-action';
+		type DeadlockPayload = {
+			reason?: string, cohortPeers?: number, answered?: number, claimants?: number, required?: number,
+			requiredEvenIfAllAnswered?: number, repairCorroborationClusterSize?: number, message?: string
+		};
 		const deadlockLines = (captured: unknown[][]) =>
 			captured.filter(args => typeof args[0] === 'string' && args[0].includes(DEADLOCK));
 		const noQuorumLines = (captured: unknown[][]) =>
@@ -743,10 +763,8 @@ describe('CoordinatorRepo read-repair', () => {
 			expect(hasTag(captured, 'cluster-fetch:no-quorum'), 'the per-pass decline line still fires').to.equal(true);
 			expect(deadlockLines(captured), 'expected exactly one deadlock line').to.have.lengthOf(1);
 
-			const payload = deadlockLines(captured)[0]![1] as {
-				cohortPeers?: number, answered?: number, claimants?: number, required?: number,
-				requiredEvenIfAllAnswered?: number, repairCorroborationClusterSize?: number, message?: string
-			};
+			const payload = deadlockLines(captured)[0]![1] as DeadlockPayload;
+			expect(payload.reason, 'the cohort itself is what cannot supply the quorum').to.equal('cohort-too-small');
 			expect(payload.cohortPeers, 'one cohort peer besides the reader').to.equal(1);
 			expect(payload.answered, 'and it answered').to.equal(1);
 			expect(payload.claimants).to.equal(1);
@@ -762,11 +780,20 @@ describe('CoordinatorRepo read-repair', () => {
 			expect(payload.message).to.contain('view of the cohort has shrunk');
 		});
 
-		it('stays quiet when the cohort could still supply the quorum — a peer just does not hold the block yet', async () => {
-			// Three machines: one peer claims a newer rev, the other answers honestly that it holds
-			// nothing. This pass falls short, but the cohort HAS the two peers a quorum needs — the
-			// second one simply has not caught up, which its own repair or the next commit fixes.
-			// Calling this permanent would send the operator to change a machine count that is fine.
+		/**
+		 * Ticket: name-the-single-holder-deadlock.
+		 *
+		 * This case used to be classified TRANSIENT, on the reasoning that the cohort has the two peers
+		 * a quorum needs and the second one "simply has not caught up". That reasoning rests on an
+		 * assumption that is false for a peer which ANSWERED "I hold nothing": the only two mechanisms
+		 * that would make it a holder — read-repair and reconcile — consume this very decision, so they
+		 * decline on that peer for exactly the same reason. Every peer answered, one holds the block,
+		 * the rest hold nothing, and no later pass changes it. It is a second COPY that is missing, not
+		 * a second machine, which is why this gets its own reason and its own wording.
+		 */
+		it('says it once when exactly one peer holds the block and every other peer answered absent', async () => {
+			// Three machines, honest declared size: one peer claims a newer rev, the other answers that
+			// it holds nothing. The cohort is big enough; the block has one copy.
 			const { repo } = await makeReader({
 				peers: 2,
 				clusterSize: 3,
@@ -776,7 +803,59 @@ describe('CoordinatorRepo read-repair', () => {
 			const captured = await captureCoordinatorLog(async () => { await repo.get({ blockIds: [blockId] }); });
 
 			expect(hasTag(captured, 'cluster-fetch:no-quorum'), 'the per-pass decline line still fires').to.equal(true);
-			expect(deadlockLines(captured), 'a cohort that can reach quorum is not deadlocked').to.have.lengthOf(0);
+			expect(deadlockLines(captured), 'expected exactly one deadlock line').to.have.lengthOf(1);
+
+			const payload = deadlockLines(captured)[0]![1] as DeadlockPayload;
+			expect(payload.reason).to.equal('sole-holder');
+			expect(payload.cohortPeers, 'two cohort peers besides the reader').to.equal(2);
+			expect(payload.answered, 'both answered').to.equal(2);
+			expect(payload.claimants, 'only one of them holds the block').to.equal(1);
+			// The cohort is NOT too small — this is the number that distinguishes the two reasons.
+			expect(payload.requiredEvenIfAllAnswered).to.equal(2);
+			expect(payload.cohortPeers).to.be.at.least(payload.requiredEvenIfAllAnswered!);
+
+			expect(payload.message).to.contain('PERMANENT');
+			expect(payload.message).to.contain('ONLY ONE MACHINE HOLDS THIS BLOCK');
+			// The operator's action here is a second copy, NOT the machine-count/assumedClusterSize
+			// advice the other reason gives — sending them to config would waste the same twelve days.
+			expect(payload.message).to.contain('MORE MACHINES DO NOT FIX THIS');
+			expect(payload.message).to.contain('SECOND COPY');
+			expect(payload.message).to.not.contain('clusterPolicy.assumedClusterSize');
+		});
+
+		it('fires the same way for an unconfigured three-machine deployment', async () => {
+			// Declaring nothing resolves repairCorroborationClusterSize to clusterSize (10), which
+			// raises the capacity but not the floor — so the sole-holder classification is unchanged.
+			// An operator gets the same diagnosis whether or not they declared their size, because the
+			// missing thing is a copy either way.
+			const { repo } = await makeReader({
+				peers: 2,
+				clusterSize: 10,
+				answer: index => index === 0 ? { actionId: 'remote-action', rev: 2 } : undefined
+			});
+
+			const captured = await captureCoordinatorLog(async () => { await repo.get({ blockIds: [blockId] }); });
+
+			const payload = deadlockLines(captured)[0]![1] as DeadlockPayload;
+			expect(deadlockLines(captured)).to.have.lengthOf(1);
+			expect(payload.reason).to.equal('sole-holder');
+			expect(payload.repairCorroborationClusterSize).to.equal(10);
+		});
+
+		it('stays quiet for a sole holder while any peer is SILENT', async () => {
+			// The same one-claim shape as above, but a third peer never answered. Its silence is not an
+			// absence — it may well be holding the second copy — so nothing here is provable. Two things
+			// suppress the line: the silence guard, and `answered < cohortPeers`.
+			const { repo } = await makeReader({
+				peers: 3,
+				clusterSize: 4,
+				answer: index => index === 0 ? { actionId: 'remote-action', rev: 2 } : index === 1 ? undefined : 'silent'
+			});
+
+			const captured = await captureCoordinatorLog(async () => { await repo.get({ blockIds: [blockId] }); });
+
+			expect(hasTag(captured, 'cluster-fetch:peers-silent')).to.equal(true);
+			expect(deadlockLines(captured), 'an unanswered peer might be the second copy').to.have.lengthOf(0);
 		});
 
 		it('stays quiet when a peer was SILENT — the node saw less than the whole picture', async () => {
@@ -794,7 +873,9 @@ describe('CoordinatorRepo read-repair', () => {
 		it('stays quiet when the decline was a genuine disagreement inside a big-enough cohort', async () => {
 			// Four machines, three peers: two claim DIFFERENT (rev, actionId) pairs and the third holds
 			// nothing. This cohort can field the quorum of two; its peers merely do not agree yet, and
-			// a later pass can settle that.
+			// a later pass can settle that. It is also the shape that separates the two permanent
+			// diagnoses from an unsettled one: TWO copies of the block exist here, so it is not a sole
+			// holder either — what is missing is agreement, and agreement can still arrive.
 			const { repo, calls } = await makeReader({
 				peers: 3,
 				clusterSize: 4,

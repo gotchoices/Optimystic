@@ -149,12 +149,21 @@ describe('createReconcileBlock (commit-path block restoration)', () => {
 		});
 
 		const payload = captured.find(args => typeof args[0] === 'string' && args[0].includes('reconcile:no-rev-quorum'))?.[1] as
-			{ responders?: number, required?: number, repairCorroborationClusterSize?: number } | undefined;
+			{ cohortPeers?: number, holders?: number, behind?: number, noArchive?: number, fetchErrors?: number,
+				required?: number, repairCorroborationClusterSize?: number } | undefined;
 
 		expect(payload, 'expected reconcile:no-rev-quorum').to.not.equal(undefined);
 		expect(payload?.repairCorroborationClusterSize).to.equal(resolved.repairCorroborationClusterSize);
-		expect(payload?.responders).to.equal(1);
+		expect(payload?.holders).to.equal(1);
 		expect(payload?.required).to.equal(2);
+		// Ticket name-the-single-holder-deadlock: the decline separates the populations rather than
+		// rolling them into one "responders" count — a shortfall of holders and a shortfall of answers
+		// are different problems. `noArchive` conflates "holds nothing" with "unreachable", which is
+		// `fetchArchive`'s contract, not something this site can infer around.
+		expect(payload?.cohortPeers, 'one peer was consulted').to.equal(1);
+		expect(payload?.behind).to.equal(0);
+		expect(payload?.noArchive).to.equal(0);
+		expect(payload?.fetchErrors).to.equal(0);
 	});
 
 	it('heals unconfigured once the operator declares a genuine two-node deployment', async () => {
