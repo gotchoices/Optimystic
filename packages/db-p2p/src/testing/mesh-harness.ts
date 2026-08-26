@@ -5,7 +5,7 @@ import type { IPeerNetwork } from '@optimystic/db-core';
 import { NetworkTransactor } from '@optimystic/db-core';
 import { peerIdFromPrivateKey } from '@libp2p/peer-id';
 import { generateKeyPair } from '@libp2p/crypto/keys';
-import { ClusterMember, clusterMember, type ReconcileBlockCallback } from '../cluster/cluster-repo.js';
+import { ClusterMember, clusterMember, type ReconcileBlockCallback, type DeriveExpectedClusterCallback, type ExpectedClusterView } from '../cluster/cluster-repo.js';
 import { createReconcileBlock } from '../cluster/reconcile-block.js';
 import { resolveClusterPolicy, type ClusterPolicyOptions, type ResolvedClusterPolicy } from '../cluster/cluster-policy.js';
 import { StorageRepo } from '../storage/storage-repo.js';
@@ -55,6 +55,21 @@ export interface MeshOptions {
 	 * with a crashing proxy, or by restart tests to rebuild over preserved state.
 	 */
 	rawStorageFactory?: (index: number) => IRawStorage;
+	/**
+	 * Per-node member-side cluster derivation for the membership admission gate — the harness
+	 * analogue of `libp2p-node-base`'s `deriveExpectedCluster` (findCluster + FRET confidence).
+	 * Omitted → each member gets the production-shaped derivation over its own self-including
+	 * key-network view (partition-aware, see `MeshFailureConfig.partitionSides`) with confidence
+	 * from `meshConfidence` (default 1).
+	 */
+	deriveExpectedCluster?: (node: MeshNode, blockId: BlockId) => Promise<ExpectedClusterView>;
+	/**
+	 * Per-node network-size confidence (0..1) fed to the default derivation — the FRET stand-in.
+	 * Default 1 (confident). Evaluated per vote, so a spec may flip it mid-test (e.g. collapse a
+	 * partition side's confidence after the mesh is built). The gate's check is STRICTLY greater
+	 * than its threshold (0.5), so returning the threshold itself lands on the fail-closed side.
+	 */
+	meshConfidence?: (node: MeshNode) => number;
 }
 
 export interface MeshFailureConfig {
@@ -69,6 +84,19 @@ export interface MeshFailureConfig {
 	 * them as a source. Distinct from `failingPeers`, which fails cluster (write) updates.
 	 */
 	silentPeers?: Set<string>;
+	/**
+	 * Simulated network partition: each entry is one side of the split, as a set of peer-id
+	 * strings. While set, a node's own key-network view (`findCluster`) answers a caller on side S
+	 * with only the members of S that would otherwise be in the cohort — an UNAUTHENTICATED
+	 * shrunken view, exactly what the membership admission gate exists to refuse. Callers not in
+	 * any listed side see the unpartitioned cohort.
+	 *
+	 * This shapes cluster VIEWS (what a coordinator declares and what a member derives), not
+	 * transport reachability — combine with `failingPeers`/`silentPeers` to also sever traffic.
+	 * On the write path that rarely matters: a partitioned coordinator only contacts the cohort
+	 * it declared, which is already its own side.
+	 */
+	partitionSides?: Set<string>[];
 }
 
 class MockPeerNetwork implements IPeerNetwork {
@@ -178,12 +206,15 @@ export function resolveMeshPolicy(options: MeshOptions): ResolvedClusterPolicy {
 		clusterPolicy: {
 			...options.clusterPolicy,
 			superMajorityThreshold: options.clusterPolicy?.superMajorityThreshold ?? options.superMajorityThreshold,
-			allowDownsize: options.clusterPolicy?.allowDownsize ?? options.allowClusterDownsize,
-			// Gate the harness DISARMS: production fails closed (default false) when an undersized
-			// cluster has no confident network-size estimate, but harness meshes run below the safe
-			// floor on purpose. Passed explicitly and visibly so the disarming is a statement, not an
-			// inheritance. Ticket `mesh-harness-admission-gate` flips this default to false.
-			allowUnvalidatedSmallCluster: options.clusterPolicy?.allowUnvalidatedSmallCluster ?? true
+			allowDownsize: options.clusterPolicy?.allowDownsize ?? options.allowClusterDownsize
+			// `allowUnvalidatedSmallCluster` passes through UNTOUCHED and so defaults to `false`, same
+			// as `resolveClusterPolicy` — the membership admission gate is ARMED in the harness. A mesh
+			// that must transact below the safe floor says so at its own call site:
+			//   createMesh(1, { responsibilityK: 1, clusterPolicy: { allowUnvalidatedSmallCluster: true } })
+			// No harness-wide re-default: a disarmed gate has to be visible where the test is read.
+			// (Solo cohorts never reach the gate anyway — CoordinatorRepo short-circuits peerCount <= 1
+			// straight to local storage — so only a genuinely undersized MULTI-peer cohort needs the
+			// opt-in.)
 		}
 	});
 }
@@ -229,6 +260,46 @@ export async function createMesh(nodeCount: number, options: MeshOptions): Promi
 	// here keyed by peer id rather than widened onto the public `MeshNode` type.
 	const reconcileByPeer = new Map<string, ReconcileBlockCallback>();
 
+	// The mesh key network is built BEFORE the members: each member's `deriveExpectedCluster` (the
+	// admission gate's view) needs a per-node key network in phase 1, and constructing it here beats
+	// a late-bound slot a closure could fire on before it is filled. Safe because `nodes` is captured
+	// by reference and only consulted at call time, after the array is fully populated.
+	const keyNetwork = new MockMeshKeyNetwork(nodes, options.responsibilityK, failures);
+
+	/**
+	 * One node's own view of the key network — what `Libp2pKeyPeerNetwork` gives a real node:
+	 *  - `findCluster` always includes self, so a responsible member's derived view is never empty
+	 *    (see the empty-view guard in `cluster-repo.admitMembership`);
+	 *  - under a simulated partition (`failures.partitionSides`), a caller inside a side sees only
+	 *    its side's members of the cohort — the caller-aware filtering lives here, in the per-node
+	 *    wrapper, precisely so `IKeyNetwork` itself needs no "who is asking" parameter.
+	 * The SAME instance serves both the member's admission derivation (phase 1) and the node's
+	 * coordinator (phase 2), so the two sides of a node can never see different topologies.
+	 */
+	const makeNodeKeyNetwork = (selfPeerId: PeerId): IKeyNetwork => {
+		const selfStr = selfPeerId.toString();
+		return {
+			findCoordinator: (key, opts) => keyNetwork.findCoordinator(key, opts),
+			async findCluster(key) {
+				const peers = await keyNetwork.findCluster(key);
+				const side = failures.partitionSides?.find(s => s.has(selfStr));
+				if (side) {
+					for (const id of Object.keys(peers)) {
+						if (!side.has(id)) delete peers[id];
+					}
+				}
+				if (!(selfStr in peers)) {
+					peers[selfStr] = {
+						multiaddrs: ['/ip4/127.0.0.1/tcp/8000'],
+						publicKey: u8ToString(selfPeerId.publicKey!.raw, 'base64url')
+					};
+				}
+				return peers;
+			}
+		};
+	};
+	const nodeKeyNetworkByPeer = new Map<string, IKeyNetwork>();
+
 	// Phase 1: create storage + cluster members
 	let nodeIndex = 0;
 	for (const { peerId, privateKey } of keyPairs) {
@@ -255,27 +326,47 @@ export async function createMesh(nodeCount: number, options: MeshOptions): Promi
 		});
 		reconcileByPeer.set(peerId.toString(), reconcileBlock);
 
-		const member = clusterMember({
+		const nodeKeyNetwork = makeNodeKeyNetwork(peerId);
+		nodeKeyNetworkByPeer.set(peerId.toString(), nodeKeyNetwork);
+
+		// The node object exists before its member so the admission derivation below can hand the
+		// finished MeshNode to spec-supplied callbacks; `clusterMember`/`coordinatorRepo` are
+		// assigned as they are built (member just below, coordinator in phase 2) and the closures
+		// only run at vote time, long after both are in place.
+		const meshNode: MeshNode = {
+			peerId,
+			privateKey,
+			storageRepo,
+			clusterMember: undefined as any,
+			coordinatorRepo: undefined as any
+		};
+
+		// Member-side cluster derivation for the membership admission gate — the production shape
+		// (`libp2p-node-base.deriveExpectedCluster`): the SAME per-node key network the coordinator
+		// selects its cohort from, plus a network-size confidence. The self-including wrapper keeps a
+		// responsible member's view non-empty; `meshConfidence` is the FRET stand-in (default 1, i.e.
+		// confident — a partition spec collapses it per side).
+		const deriveExpectedCluster: DeriveExpectedClusterCallback = options.deriveExpectedCluster
+			? (blockId) => options.deriveExpectedCluster!(meshNode, blockId)
+			: async (blockId) => ({
+				peers: await nodeKeyNetwork.findCluster(new TextEncoder().encode(blockId)) ?? {},
+				confidence: options.meshConfidence?.(meshNode) ?? 1
+			});
+
+		meshNode.clusterMember = clusterMember({
 			storageRepo,
 			peerNetwork,
 			peerId,
 			privateKey,
 			consensusConfig: policy,
-			reconcileBlock
+			reconcileBlock,
+			deriveExpectedCluster
 		});
 
-		nodes.push({
-			peerId,
-			privateKey,
-			storageRepo,
-			clusterMember: member,
-			coordinatorRepo: undefined as any // filled in phase 2
-		});
+		nodes.push(meshNode);
 	}
 
-	// Phase 2: create key network and coordinator repos (needs all nodes for routing)
-	const keyNetwork = new MockMeshKeyNetwork(nodes, options.responsibilityK, failures);
-
+	// Phase 2: coordinator repos (needs all nodes for routing; key network built in phase 1)
 	const createClusterClient = (targetPeerId: PeerId): ICluster => {
 		const target = nodes.find(n => n.peerId.equals(targetPeerId));
 		if (!target) {
@@ -313,21 +404,10 @@ export async function createMesh(nodeCount: number, options: MeshOptions): Promi
 			);
 			return result[blockId]?.state?.latest;
 		};
-		// Wrap key network to include self in findCluster (matches real Libp2pKeyPeerNetwork behavior)
-		const nodeKeyNetwork: IKeyNetwork = {
-			findCoordinator: (key, opts) => keyNetwork.findCoordinator(key, opts),
-			async findCluster(key) {
-				const peers = await keyNetwork.findCluster(key);
-				const selfStr = node.peerId.toString();
-				if (!(selfStr in peers)) {
-					peers[selfStr] = {
-						multiaddrs: ['/ip4/127.0.0.1/tcp/8000'],
-						publicKey: u8ToString(node.peerId.publicKey!.raw, 'base64url')
-					};
-				}
-				return peers;
-			}
-		};
+		// The node's own self-including (and partition-aware) key-network view, built in phase 1 —
+		// the SAME instance the member's admission derivation reads, matching real
+		// Libp2pKeyPeerNetwork behavior.
+		const nodeKeyNetwork = nodeKeyNetworkByPeer.get(node.peerId.toString())!;
 		const factory = coordinatorRepo(
 			nodeKeyNetwork,
 			createClusterClient,
@@ -335,8 +415,8 @@ export async function createMesh(nodeCount: number, options: MeshOptions): Promi
 			// `libp2p-node-base` spreads it into its coordinator factory — carrying
 			// `repairCorroborationClusterSize` (the repair floor's yardstick, DEFAULT_CLUSTER_SIZE
 			// when the mesh declared nothing), the production `minAbsoluteClusterSize` (2, not the
-			// coordinator's own fallback of 3), and the explicitly-disarmed
-			// `allowUnvalidatedSmallCluster` gate resolved above.
+			// coordinator's own fallback of 3), and the `allowUnvalidatedSmallCluster` gate —
+			// ARMED (false) unless the mesh opted out at its call site.
 			{ ...policy }
 		);
 		node.coordinatorRepo = factory({
