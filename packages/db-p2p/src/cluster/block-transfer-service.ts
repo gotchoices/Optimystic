@@ -1,5 +1,5 @@
 import type { Connection, Startable, Stream } from '@libp2p/interface';
-import type { IRepo, PeerId, IPeerNetwork, ActionId, ActionRev, IBlock, BlockId } from '@optimystic/db-core';
+import type { IRepo, PeerId, IPeerNetwork, ActionId, ActionRev, GetBlockResult, IBlock, BlockId } from '@optimystic/db-core';
 import { pipe } from 'it-pipe';
 import * as lp from 'it-length-prefixed';
 import { fromString as u8FromString } from 'uint8arrays/from-string';
@@ -34,6 +34,38 @@ export interface BlockTransferRequest {
 	 * deterministic rev-1 replica (see {@link IBlockStorage.saveReplica}).
 	 */
 	blockMeta?: Record<string, { rev: number; actionId: ActionId }>;
+}
+
+/**
+ * The `blockMeta` a pusher sends alongside one block: the source's own `state.latest`, so the
+ * replica lands at the source's `(rev, actionId)` rather than a fabricated one. That match is what
+ * later lets the replica CORROBORATE the source in a read-repair quorum vote — a fabricated action
+ * id never matches the source's claim, so the vote sees one claimant, not two.
+ *
+ * `undefined` when the source repo reports no `latest`; the receiver then falls back to its
+ * deterministic rev-1 replica (see `IBlockStorage.saveReplica`).
+ *
+ * Every push path (rebalance confirm/push, spread-on-churn) builds it here so the wire shape stays
+ * defined in one place alongside {@link BlockTransferRequest.blockMeta}.
+ *
+ * The caller must read the block UNPINNED (no `BlockGets.context`). `state.latest` is the newest
+ * revision the source holds, while `block` is materialized at `materializedRev`; those agree only
+ * for an unpinned read. Pairing pinned (older) content with `latest` would label content with a
+ * revision it is not — so the pairing is guarded below and drops the meta rather than lying.
+ */
+export function sourceBlockMeta(
+	blockId: BlockId,
+	result: Pick<GetBlockResult, 'state' | 'materializedRev'> | undefined
+): Record<string, ActionRev> | undefined {
+	const latest = result?.state?.latest;
+	if (!latest) return undefined;
+	const materializedRev = result?.materializedRev;
+	if (materializedRev !== undefined && materializedRev !== latest.rev) {
+		log('meta:skip block=%s materializedRev=%d latest=%d (pinned read — refusing to mislabel content)',
+			blockId, materializedRev, latest.rev);
+		return undefined;
+	}
+	return { [blockId]: { rev: latest.rev, actionId: latest.actionId } };
 }
 
 /** Response with block data */

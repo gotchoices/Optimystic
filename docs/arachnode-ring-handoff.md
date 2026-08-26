@@ -245,9 +245,10 @@ coordinator rather than inline in `libp2p-node-base.ts`:
   same-range movers). Single source of truth for block/peer responsibility derivation.
 - `packages/db-p2p/src/cluster/block-transfer.ts` — `confirmReplicated(blockIds, owners, floor)` is
   the confirm primitive (pushes, counts holders reporting *not* `missing`, requires ≥ floor);
-  `handleRebalanceEvent` returns `{ pulled, released, retained }` so release is gated on confirmation.
-- `packages/db-p2p/src/cluster/rebalance-monitor.ts` — `RebalanceEvent.newOwners` / `.floor` and the
-  now-public `getCohortSize()` supply the post-move holders and floor `N`.
+  `handleRebalanceEvent` returns `{ pulled, released, retained, replicated, underReplicated }` — release is gated on confirmation, and the last two report the cohort-growth push arm (nothing is ever released off it).
+- `packages/db-p2p/src/cluster/rebalance-monitor.ts` — `RebalanceEvent.newOwners` / `.grown` / `.floor`
+  and the now-public `getCohortSize()` supply the post-move holders, the newly co-responsible peers of
+  blocks that are KEPT, and floor `N`.
 - `packages/db-p2p/src/storage/arachnode-fret-adapter.ts` — `status` transitions and the `moveFrom`
   field advertised through Phase A (the old range a `moving` node still serves).
 - `packages/db-p2p/src/libp2p-node-base.ts` — wires the coordinator (driven off the damped

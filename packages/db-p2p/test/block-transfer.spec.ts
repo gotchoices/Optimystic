@@ -6,7 +6,7 @@ import { peerIdFromPrivateKey } from '@libp2p/peer-id';
 import { PartitionDetector } from '../src/cluster/partition-detector.js';
 import { BlockTransferCoordinator } from '../src/cluster/block-transfer.js';
 import type { RebalanceEvent } from '../src/cluster/rebalance-monitor.js';
-import { BlockTransferService, type BlockTransferRequest, type BlockTransferResponse, buildBlockTransferProtocol } from '../src/cluster/block-transfer-service.js';
+import { BlockTransferService, sourceBlockMeta, type BlockTransferRequest, type BlockTransferResponse, buildBlockTransferProtocol } from '../src/cluster/block-transfer-service.js';
 import type { RestorationCoordinator } from '../src/storage/restoration-coordinator.js';
 import type { BlockArchive } from '../src/storage/struct.js';
 
@@ -61,6 +61,8 @@ class MockRestorationCoordinator {
 
 class MockPeerNetwork implements IPeerNetwork {
 	connectCalls: Array<{ peerId: PeerId; protocol: string }> = [];
+	/** Every request the client wrote to a stream, decoded — so tests can assert the wire payload. */
+	sentRequests: BlockTransferRequest[] = [];
 	responses: Map<string, BlockTransferResponse> = new Map();
 	shouldFail = false;
 
@@ -72,16 +74,27 @@ class MockPeerNetwork implements IPeerNetwork {
 		// Return a mock stream
 		const peerIdStr = peerId.toString();
 		const response = this.responses.get(peerIdStr) ?? { blocks: {}, missing: [] };
-		return createMockStream(response);
+		return createMockStream(response, this.sentRequests);
 	}
 }
 
-/** Create a minimal mock stream that yields a length-prefixed JSON response */
-function createMockStream(response: BlockTransferResponse): any {
+/**
+ * Create a minimal mock stream that yields a length-prefixed JSON response and records the
+ * length-prefixed request the client sends. The client writes exactly one frame per stream, so
+ * decoding is just "skip the varint prefix, parse the rest as JSON".
+ */
+function createMockStream(response: BlockTransferResponse, sentRequests: BlockTransferRequest[] = []): any {
 	const responseBytes = new TextEncoder().encode(JSON.stringify(response));
 	let sent = false;
 	return {
-		send(_chunk: any) { /* no-op in test */ },
+		send(chunk: any) {
+			const bytes: Uint8Array = chunk?.subarray ? chunk.subarray() : chunk;
+			const text = new TextDecoder().decode(bytes);
+			const start = text.indexOf('{');
+			if (start >= 0) {
+				sentRequests.push(JSON.parse(text.slice(start)) as BlockTransferRequest);
+			}
+		},
 		close: async () => {},
 		[Symbol.asyncIterator]: async function* () {
 			if (!sent) {
@@ -214,6 +227,20 @@ describe('BlockTransferCoordinator', () => {
 			expect(result.failed).to.deep.equal([]);
 		});
 
+		it('carries the source revision metadata so the replica is not fabricated at rev 1', async () => {
+			// The replica must land at the SOURCE's (rev, actionId): a fabricated action id can never
+			// corroborate the source in a read-repair quorum vote, so the vote would see one claimant.
+			repo.blocks.set('block-1', makeBlock('block-1'));
+			const ownerIdStr = (await makePeerId()).toString();
+			peerNetwork.responses.set(ownerIdStr, { blocks: { 'block-1': 'data' }, missing: [] });
+
+			await coordinator.pushBlocks(['block-1'], new Map([['block-1', [ownerIdStr]]]));
+
+			expect(peerNetwork.sentRequests).to.have.length(1);
+			expect(peerNetwork.sentRequests[0]!.blockMeta, "the source's own state.latest rides along")
+				.to.deep.equal({ 'block-1': { rev: 1, actionId: 'a1' } });
+		});
+
 		it('fails push when no local data available', async () => {
 			// repo has no blocks
 			const ownerId = await makePeerId();
@@ -278,6 +305,21 @@ describe('BlockTransferCoordinator', () => {
 
 			expect(result.confirmed).to.deep.equal(['block-1']);
 			expect(result.unconfirmed).to.deep.equal([]);
+		});
+
+		it('carries the source revision metadata on every confirming push', async () => {
+			repo.blocks.set('block-1', makeBlock('block-1'));
+			const o1 = (await makePeerId()).toString();
+			const o2 = (await makePeerId()).toString();
+			peerNetwork.responses.set(o1, { blocks: { 'block-1': 'data' }, missing: [] });
+			peerNetwork.responses.set(o2, { blocks: { 'block-1': 'data' }, missing: [] });
+
+			await coordinator.confirmReplicated(['block-1'], new Map([['block-1', [o1, o2]]]), 2);
+
+			expect(peerNetwork.sentRequests).to.have.length(2);
+			for (const request of peerNetwork.sentRequests) {
+				expect(request.blockMeta).to.deep.equal({ 'block-1': { rev: 1, actionId: 'a1' } });
+			}
 		});
 
 		it('leaves a block unconfirmed when fewer than floor owners hold it', async () => {
@@ -551,6 +593,32 @@ describe('BlockTransferService', () => {
 			await service.stop();
 			await service.stop(); // should not throw
 		});
+	});
+});
+
+describe('sourceBlockMeta', () => {
+	it('carries the source latest for an unpinned read', () => {
+		expect(sourceBlockMeta('block-1' as BlockId, { state: { latest: { rev: 7, actionId: 'a7' } } }))
+			.to.deep.equal({ 'block-1': { rev: 7, actionId: 'a7' } });
+	});
+
+	it('agreeing materializedRev is still carried', () => {
+		expect(sourceBlockMeta('block-1' as BlockId,
+			{ state: { latest: { rev: 7, actionId: 'a7' } }, materializedRev: 7 }))
+			.to.deep.equal({ 'block-1': { rev: 7, actionId: 'a7' } });
+	});
+
+	it('drops the meta when the content is older than latest (pinned read)', () => {
+		// Labelling rev-3 content as rev 7 would make every holder of it a false corroborator for a
+		// revision it does not hold. Dropping the meta falls the receiver back to a rev-1 replica.
+		expect(sourceBlockMeta('block-1' as BlockId,
+			{ state: { latest: { rev: 7, actionId: 'a7' } }, materializedRev: 3 }))
+			.to.equal(undefined);
+	});
+
+	it('is undefined when the source holds no latest', () => {
+		expect(sourceBlockMeta('block-1' as BlockId, { state: {} })).to.equal(undefined);
+		expect(sourceBlockMeta('block-1' as BlockId, undefined)).to.equal(undefined);
 	});
 });
 

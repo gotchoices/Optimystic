@@ -1,8 +1,8 @@
-import type { IRepo, IPeerNetwork, ActionId } from '@optimystic/db-core';
+import type { IRepo, IPeerNetwork } from '@optimystic/db-core';
 import { peerIdFromString } from '@libp2p/peer-id';
 import type { PartitionDetector } from './partition-detector.js';
 import type { RestorationCoordinator } from '../storage/restoration-coordinator.js';
-import { BlockTransferClient } from './block-transfer-service.js';
+import { BlockTransferClient, sourceBlockMeta } from './block-transfer-service.js';
 import type { RebalanceEvent } from './rebalance-monitor.js';
 import { createLogger } from '../logger.js';
 
@@ -133,7 +133,7 @@ export class BlockTransferCoordinator {
 	 */
 	async handleRebalanceEvent(event: RebalanceEvent): Promise<RebalanceReactionResult> {
 		log('rebalance:start gained=%d lost=%d grown=%d floor=%d',
-			event.gained.length, event.lost.length, event.grown?.size ?? 0, event.floor);
+			event.gained.length, event.lost.length, event.grown.size, event.floor);
 
 		const floor = Math.max(1, event.floor);
 		const [pullResult, confirmResult, growResult] = await Promise.all([
@@ -141,13 +141,13 @@ export class BlockTransferCoordinator {
 			event.lost.length > 0 && event.newOwners.size > 0
 				? this.confirmReplicated(event.lost, event.newOwners, floor)
 				: { confirmed: [], unconfirmed: [...event.lost] },
-			this.replicateGrown(event.grown ?? new Map<string, string[]>(), floor)
+			this.replicateGrown(event.grown, floor)
 		]);
 
 		log('rebalance:done pull=%d/%d released=%d/%d replicated=%d/%d',
 			pullResult.succeeded.length, event.gained.length,
 			confirmResult.confirmed.length, event.lost.length,
-			growResult.confirmed.length, event.grown?.size ?? 0);
+			growResult.confirmed.length, event.grown.size);
 
 		return {
 			pulled: pullResult.succeeded,
@@ -312,7 +312,7 @@ export class BlockTransferCoordinator {
 					}
 
 					const blockData = new TextEncoder().encode(JSON.stringify(blockResult.block));
-					const blockMeta = this.sourceMeta(blockId, blockResult);
+					const blockMeta = sourceBlockMeta(blockId, blockResult);
 
 					// Push to at least one new owner
 					for (const ownerPeerIdStr of owners) {
@@ -396,7 +396,7 @@ export class BlockTransferCoordinator {
 					}
 
 					const blockData = new TextEncoder().encode(JSON.stringify(blockResult.block));
-					const blockMeta = this.sourceMeta(blockId, blockResult);
+					const blockMeta = sourceBlockMeta(blockId, blockResult);
 
 					// Count DISTINCT owners that hold a current replica; stop once the floor is reached.
 					const confirmedPeers = new Set<string>();
@@ -439,21 +439,6 @@ export class BlockTransferCoordinator {
 		} finally {
 			this.inFlight.delete(key);
 		}
-	}
-
-	/**
-	 * The source's `state.latest` in `blockMeta` wire shape, so a pushed replica lands at the
-	 * source's `(rev, actionId)` instead of being fabricated as rev 1 on the receiver (matching
-	 * spread-on-churn's pushes). This is what lets the replica later CORROBORATE the source in a
-	 * quorum vote — a fabricated actionId would never match the source's claim. `undefined` when the
-	 * local repo reports no latest (the receiver then falls back to its deterministic rev-1 replica).
-	 */
-	private sourceMeta(
-		blockId: string,
-		blockResult: { state?: { latest?: { rev: number; actionId: ActionId } } }
-	): Record<string, { rev: number; actionId: ActionId }> | undefined {
-		const latest = blockResult.state?.latest;
-		return latest ? { [blockId]: { rev: latest.rev, actionId: latest.actionId } } : undefined;
 	}
 
 	// --- Semaphore for concurrency limiting ---

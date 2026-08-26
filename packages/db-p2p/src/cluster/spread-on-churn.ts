@@ -4,7 +4,7 @@ import { hashKey } from 'p2p-fret'
 import type { FretService } from 'p2p-fret'
 import { peerIdFromString } from '@libp2p/peer-id'
 import type { PartitionDetector } from './partition-detector.js'
-import { BlockTransferClient } from './block-transfer-service.js'
+import { BlockTransferClient, sourceBlockMeta } from './block-transfer-service.js'
 import { createLogger } from '../logger.js'
 
 const log = createLogger('spread-on-churn')
@@ -243,10 +243,7 @@ export class SpreadOnChurnMonitor implements Startable {
 
 			// Carry the source's revision metadata so the replica's `latest` matches the
 			// source instead of being fabricated as rev 1 on the receiver.
-			const latest = blockResult.state?.latest
-			const blockMeta = latest
-				? { [blockId]: { rev: latest.rev, actionId: latest.actionId } }
-				: undefined
+			const blockMeta = sourceBlockMeta(blockId, blockResult)
 
 			// Push to each target
 			const succeeded: string[] = []

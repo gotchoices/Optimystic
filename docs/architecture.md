@@ -235,7 +235,7 @@ When a node is missing a block or revision, the `RestorationCoordinator`:
 
 Two `Startable` monitors react to `connection:open` / `connection:close` events (see [internals.md](internals.md#cluster-health-monitors)):
 
-* **RebalanceMonitor** — after topology shifts, scans tracked blocks and emits `gained` / `lost` / `newOwners`, throttled to one scan per minute.
+* **RebalanceMonitor** — after topology shifts, scans tracked blocks and emits `gained` / `lost` / `newOwners` / `grown`, throttled to one scan per minute. `grown` is the cohort-*growth* arm: blocks this node keeps whose cohort acquired new co-responsible peers, which the reaction pushes a copy to — the only path that ever gives a second copy to a block written while the deployment was a single machine.
 * **SpreadOnChurnMonitor** — when peers leave, middle-ranked peers proactively push replicas outward using `BlockTransferClient.pushBlocks()`. Fan-out is bounded to `2·d` where `d` grows under rapid churn or low cluster health, capped at `clusterSize / 2`.
 
 Both monitors are suppressed during detected network partitions (`PartitionDetector`).

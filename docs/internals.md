@@ -507,8 +507,10 @@ saveMaterializedBlock(block): store(structuredClone(block));
   never manufactures a second copy of a block that only ever had one. The declared two-machine row is
   the single exception: its floor relaxes to one, so a lone peer's claim *is* adopted there and a
   singly-held block repairs like any other. The usual way a block ends up stranded is being written
-  while the deployment (or that block's cohort) was smaller; growing the deployment afterwards does
-  not retroactively copy it. This is reported as `cluster-fetch:repair-deadlock` with
+  while the deployment (or that block's cohort) was smaller. Growing the deployment afterwards *does*
+  now copy it — that is the `RebalanceMonitor` `grown` arm below — but only on a best-effort basis:
+  the push happens once per detected growth, and a block whose push could not be confirmed keeps its
+  single copy until the cohort changes again. This is reported as `cluster-fetch:repair-deadlock` with
   `reason: 'sole-holder'` (below) — a diagnosis, not a fault of
   the read path, and one an operator at four-plus machines can otherwise easily miss.
 
@@ -958,9 +960,13 @@ Two topology-aware monitors react to peer arrivals/departures via `connection:op
 
 ### RebalanceMonitor
 
-Tracks whether the local node's responsibility for blocks has changed after topology shifts. Emits `RebalanceEvent` with `gained`/`lost` block lists, `newOwners` for lost blocks, and `floor` (the replication floor `N` = `getCohortSize()`). Throttled to one scan per `minRebalanceIntervalMs` (default 60s).
+Tracks whether the local node's responsibility for blocks has changed after topology shifts. Emits `RebalanceEvent` with `gained`/`lost` block lists, `newOwners` for lost blocks, `grown` (see below), and `floor` (the replication floor `N` = `getCohortSize()`). Throttled to one scan per `minRebalanceIntervalMs` (default 60s).
 
-**Gated release (confirm-before-untrack).** A `lost` block is no longer untracked synchronously. `BlockTransferCoordinator.handleRebalanceEvent` now returns `{ pulled, released, retained }`: `released` holds only blocks it **confirmed** replicated to ≥ `floor` new owners (via `confirmReplicated`, which pushes and counts holders reporting the block *not* `missing`). The node-base handler untracks + marks GC-eligible ONLY those; a block whose push failed / was partition-skipped stays in `retained` — still tracked and served — and is retried next rebalance. This closes the release-before-confirm hole (`docs/arachnode-ring-handoff.md` § Part 2).
+**Cohort growth (`grown`).** Both departure-driven push paths (rebalance `lost`, spread-on-churn) fire only when a node *loses* a block, so a block whose cohort merely GREW was never copied to the peers that joined it. `grown` closes that: blockId → the cohort peers this node has not seen co-responsible for that block before (never self). Per block the monitor remembers `{ responsible, cohortPeers }`; a **missing** entry means "prior cohort empty", so the first check after start/restart reports the whole non-self cohort — that is what heals a block committed while the deployment was one machine. Losing responsibility clears the seen set, so a regain re-reports. `growthBlockBudget` (default 64) caps grown blocks per check; a dropped block's snapshot is deliberately left un-updated so the next check re-detects it.
+
+**Gated release (confirm-before-untrack).** A `lost` block is no longer untracked synchronously. `BlockTransferCoordinator.handleRebalanceEvent` returns `{ pulled, released, retained, replicated, underReplicated }`: `released` holds only blocks it **confirmed** replicated to ≥ `floor` new owners (via `confirmReplicated`, which pushes and counts holders reporting the block *not* `missing`). The node-base handler untracks + marks GC-eligible ONLY those; a block whose push failed / was partition-skipped stays in `retained` — still tracked and served — and is retried next rebalance. This closes the release-before-confirm hole (`docs/arachnode-ring-handoff.md` § Part 2).
+
+**Push payload.** Both `executePush` and `executeConfirm` carry the source's `state.latest` as `blockMeta` (built by the shared `sourceBlockMeta()` in `block-transfer-service.ts`, which spread-on-churn uses too), so a pushed replica lands at the source's `(rev, actionId)` rather than a fabricated rev-1. That match is load-bearing: a replica at a fabricated action id can never corroborate the source's claim in a read-repair quorum vote, so the vote would still see one claimant and decline.
 
 ### RingShiftCoordinator (advertise → confirm → release)
 

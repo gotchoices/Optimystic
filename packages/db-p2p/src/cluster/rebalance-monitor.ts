@@ -270,6 +270,13 @@ export class RebalanceMonitor implements Startable {
 		this.lastRebalanceAt = Date.now()
 
 		if (growthDeferred > 0) {
+			// NOTE: deferred blocks drain one budget-full per CHECK, and checks fire only on a libp2p
+			// connection event (further throttled by minRebalanceIntervalMs, default 60s) — there is no
+			// timer sweep. So a node whose tracked-block count far exceeds growthBlockBudget drains its
+			// backlog only as fast as topology events arrive, and on a quiet network may not drain at
+			// all. Fine at the sizes this runs at today (cohort size is clamped to 3, so each block
+			// costs at most two pushes); if a deployment ever tracks blocks in the thousands, give the
+			// monitor a periodic re-check rather than raising the budget.
 			log('growth budget reached: %d blocks deferred to the next check (budget=%d)',
 				growthDeferred, this.growthBlockBudget)
 		}
