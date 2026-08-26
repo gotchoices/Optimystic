@@ -205,6 +205,28 @@ export class Collection<TAction> implements ICollection<TAction> {
 		source.actionContext = next;
 	}
 
+	/** Report a refresh that failed to move FORWARDS past a revision it had already read for
+	 * itself — the sibling of {@link advanceContext}'s `collection:context-not-lowered`, which
+	 * reports a collection declining to move BACKWARDS.
+	 *
+	 * `tailRev` is what the committed log tail claimed is committed under this id; `after` is
+	 * where a SEPARATE read path (the chain walk) actually landed. Landing below the claim means
+	 * this refresh closed nothing, which from outside the class is otherwise indistinguishable
+	 * from "there was nothing newer to adopt".
+	 *
+	 * Logs, does not throw: `update()` is called blanket-style over every registered collection
+	 * between commit retries, and a shortfall is not yet known to be illegitimate — an abort here
+	 * would promote an unproven diagnosis to production behaviour. Deliberately does NOT adopt
+	 * `tailRev` either: the two numbers come from different read paths, and papering over the
+	 * disagreement destroys the evidence this line exists to produce. */
+	private static reportShortfall(id: CollectionId, tailRev: number | undefined, before: number | undefined, after: number | undefined): void {
+		if (tailRev === undefined || (after !== undefined && after >= tailRev)) {
+			return;
+		}
+		log('collection:context-short-of-tail id=%s before=%s after=%s tail=%d',
+			id, before ?? 'none', after ?? 'none', tailRev);
+	}
+
 	async act(...actions: Action<TAction>[]) {
 		const release = await Latches.acquire(this.latchId);
 		try {
@@ -276,7 +298,7 @@ export class Collection<TAction> implements ICollection<TAction> {
 		// the local source. This is the authoritative "latest committed under this id" number,
 		// read straight off the tail block's state; the chain walk below arrives at its own
 		// number by a different path, and the two disagreeing is worth saying out loud (see the
-		// shortfall check after advanceContext). Stays undefined when there is no header, no
+		// {@link reportShortfall} call after advanceContext). Stays undefined when there is no header, no
 		// tail, or a tail with no `latest` — all legitimate "nothing committed yet" states.
 		const tailRev = source.actionContext?.rev;
 
@@ -330,22 +352,7 @@ export class Collection<TAction> implements ICollection<TAction> {
 		// will invalidate again (the log entry that would have cleared it was already consumed).
 		Collection.advanceContext(this.source, this.id, latest?.context);
 
-		// Sibling guard to `collection:context-not-lowered`: that one reports a collection
-		// declining to move BACKWARDS; this one reports a refresh that failed to move FORWARDS
-		// past a revision it had already read for itself. The tail said `tailRev` is committed
-		// under this id, and the chain walk — a separate read path — did not get us there, so
-		// this refresh provably closed nothing and returning silently would make it
-		// indistinguishable from "there was nothing newer to adopt". Log, do not throw: update()
-		// is called blanket-style over every registered collection between commit retries, and a
-		// shortfall is not yet known to be illegitimate — turning it into an abort would make an
-		// unproven diagnosis into production behaviour. Deliberately does NOT adopt tailRev
-		// either: the two numbers come from different read paths and papering over the
-		// disagreement destroys the evidence this line exists to produce.
-		const afterRev = this.source.actionContext?.rev;
-		if (tailRev !== undefined && (afterRev === undefined || afterRev < tailRev)) {
-			log('collection:context-short-of-tail id=%s before=%s after=%s tail=%d',
-				this.id, actionContext?.rev ?? 'none', afterRev ?? 'none', tailRev);
-		}
+		Collection.reportShortfall(this.id, tailRev, actionContext?.rev, this.source.actionContext?.rev);
 
 		// On conflicts, re-stage the pending actions against the adopted revision. The affected
 		// blocks were already dropped from sourceCache above (per log entry / per invalidation),
@@ -759,6 +766,16 @@ export class Collection<TAction> implements ICollection<TAction> {
 				throw new BlockPossiblyStaleError(tailId, tailEntry.unconfirmedAheadRev);
 			}
 			const tailState = tailEntry?.state;
+			// NOTE: this number is adopted on trust, and adoption is one-way (advanceContext never
+			// lowers it). A tail that over-claims therefore pins the collection at a revision its
+			// own log can never reach, permanently: every later refresh walks the log, reads the
+			// real (lower) revision, and is refused — so the instance emits
+			// `collection:context-not-lowered` forever while `collection:context-short-of-tail`
+			// stays silent (the held revision is at or above what the tail claims). No condition
+			// that makes a real tail over-claim has been demonstrated; this was seen only through a
+			// test double built to lie (see collection.spec.ts, 'a refresh that lands short of the
+			// tail it just read'). If an over-claiming tail is ever observed in the field, the fix
+			// belongs here — validate the claim against the log before pinning — not in the refresh.
 			if (tailState?.latest) {
 				source.actionContext = {
 					committed: [{ actionId: tailState.latest.actionId, rev: tailState.latest.rev }],

@@ -285,6 +285,15 @@ immediately before the read and `rev` did not move"*, this line is the db-core-s
 **absent** means the refresh had nothing newer to adopt, so the stale content came from somewhere
 else — a divergent lineage (see *Comparing action ids* below) or a write that never landed.
 
+**What silence does not prove.** The comparison is entirely local: it measures the walk against the
+number *this node's own tail read* just returned, not against what the cluster actually holds. If
+that tail read was itself served a lagging view, `tail=` is low, the walk matches it, and the line
+stays quiet while the collection is genuinely behind the cluster. So absence rules out "the refresh
+read a newer number and failed to reach it" — it does not rule out "this node cannot see the newer
+number at all". When the tail read lags *below* a revision the collection already holds, the sibling
+line below fires and names it; when it lags while the collection holds nothing yet, nothing fires,
+and the gap has to be found by comparing revisions across nodes instead.
+
 Its sibling `collection:context-not-lowered` reports the opposite guard — a collection declining to
 move *backwards* because a read returned an older view than the revision it already holds. Both are
 worth enabling together:

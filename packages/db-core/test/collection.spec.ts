@@ -1473,5 +1473,32 @@ describe('Collection', () => {
       expect(Number(after), 'the collection ended below the revision the tail claimed').to.be.lessThan(rev + 5)
       expect(before, 'the refresh moved the collection nowhere').to.equal(after)
     })
+
+    // The originating field case was a collection that stayed short across ~100 refreshes over
+    // 30 seconds. An operator reads the line by seeing it keep coming, so it must be a per-call
+    // report and not a once-per-collection latch, and the shortfall must not degrade the
+    // collection into something that stops answering reads.
+    it('keeps reporting on every later refresh, and the collection still reads', async () => {
+      const collection = await Collection.createOrOpen<TestAction>(transactor, collectionId, initOptions)
+      await collection.act({ type: 'set', data: { value: 'one', timestamp: 1 } })
+      await collection.updateAndSync()
+      const { tailId } = await syncedTail()
+
+      const inflated = inflatedTailTransactor(transactor, tailId, 5)
+      const lagging = await Collection.open<TestAction>(inflated.transactor, collectionId, initOptions)
+      inflated.arm()
+
+      const lines = await captureCollectionLog(async () => {
+        await lagging!.update()
+        await lagging!.update()
+        await lagging!.update()
+      })
+      expect(lines.filter(l => l.includes(shortfallTag)).length,
+        `three refreshes report three times, got: ${lines.join(' | ')}`).to.equal(3)
+
+      const values: string[] = []
+      for await (const a of lagging!.selectLog()) { values.push(a.data.value) }
+      expect(values, 'a collection that fell short still serves what it does hold').to.deep.equal(['one'])
+    })
   })
 })

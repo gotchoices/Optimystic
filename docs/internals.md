@@ -769,6 +769,16 @@ saveMaterializedBlock(block): store(structuredClone(block));
   revision that is long gone, and — since `syncInternal` re-runs `updateInternal` between retries —
   every retry repeats the same doomed request, burning the whole retry budget and surfacing as a
   contention-shaped `SyncRetryExhaustedError` rather than the real fault.
+- Monotonicity means a refresh can end **below** where it started looking. `updateInternal` reads
+  the committed tail's revision (the authoritative "latest committed under this id") before the
+  walk, and compares it against where the walk left the collection; landing short means the refresh
+  demonstrably closed nothing. That is reported — `collection:context-short-of-tail
+  id=… before=… after=… tail=…` on the same namespace — and nothing more: it does not throw (this
+  same `update()` runs blanket-style over every registered collection between commit retries) and
+  it does not adopt the tail's number (the two numbers come from different read paths, and adopting
+  the higher one erases the disagreement). The comparison is local to one node's own reads, so
+  silence is not proof the collection is current — see `docs/debugging.md` § "Did the refresh
+  itself fail to close the gap?" for how an operator reads presence and absence.
 - A header that reads *authoritatively absent* while the collection holds a committed revision is
   a contradiction, not an absence: the client has proof something was committed under this id.
   `updateInternal` throws `CollectionHeaderVanishedError` (naming the collection and the held
