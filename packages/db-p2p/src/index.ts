@@ -24,6 +24,7 @@ export * from "./storage/memory-storage.js";
 export * from "./storage/i-block-storage.js";
 export * from "./storage/i-raw-storage.js";
 export * from "./storage/struct.js";
+export * from "./storage/block-archive.js";
 export * from "./storage/storage-repo.js";
 export * from "./storage/restoration-coordinator.js";
 export * from "./storage/ring-selector.js";

@@ -17,6 +17,7 @@
 import { expect } from 'chai';
 import type { ActionId, ActionRev, BlockHeader, BlockId, IBlock } from '@optimystic/db-core';
 import type { BlockArchive } from '../src/storage/struct.js';
+import { singleRevisionArchive } from '../src/storage/block-archive.js';
 import { createReconcileBlock, type ReconcileBlockDeps } from '../src/cluster/reconcile-block.js';
 import { resolveClusterPolicy } from '../src/cluster/cluster-policy.js';
 import { PenaltyReason } from '../src/reputation/types.js';
@@ -34,17 +35,10 @@ const makeBlock = (payload: string): IBlock =>
 const payloadOf = (block: IBlock | undefined): string | undefined =>
 	(block as unknown as { payload?: string } | undefined)?.payload;
 
-/** The archive a peer serves for its own latest revision. Mirrors `SyncService.buildArchive`. */
-const archiveAt = (rev: number, actionId: string, block: IBlock | undefined): BlockArchive => ({
-	blockId: BLOCK_ID,
-	revisions: {
-		[rev]: {
-			action: { actionId: actionId as ActionId, rev, transform: { insert: block } as never },
-			...(block ? { block } : {})
-		}
-	},
-	range: [rev, rev + 1]
-});
+/** The archive a peer serves for its own latest revision — the SAME builder `SyncService` and the
+ *  mesh harness serve real fetches with, so a stand-in here cannot drift from the real shape. */
+const archiveAt = (rev: number, actionId: string, block: IBlock | undefined): BlockArchive =>
+	singleRevisionArchive(BLOCK_ID, { rev, actionId: actionId as ActionId }, block);
 
 interface Harness {
 	reconcile: ReturnType<typeof createReconcileBlock>;

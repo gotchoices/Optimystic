@@ -7,6 +7,8 @@ import * as lp from 'it-length-prefixed';
 import { MAX_CONTROL_MESSAGE_BYTES } from '../protocol-limits.js';
 import type { Uint8ArrayList } from 'uint8arraylist';
 import { createInboundStreamAuthorization, type InboundStreamAuthorization, type InboundStreamAuthorizationInit } from '../inbound-authorization.js';
+import { serveBlockArchive } from '../storage/block-archive.js';
+import type { BlockArchive } from '../storage/struct.js';
 
 export interface SyncServiceInit extends InboundStreamAuthorizationInit {
 	protocolPrefix?: string;
@@ -134,7 +136,9 @@ export class SyncService implements Startable {
 	}
 
 	/**
-	 * Build a block archive from local storage.
+	 * Build a block archive from local storage — what a repair fetch on the other side receives.
+	 * Shape and repo read both live in `storage/block-archive.ts`, shared with every other site that
+	 * serves or fakes one, so a peer's answer cannot mean one thing here and another there.
 	 *
 	 * @param blockId - Block to retrieve
 	 * @param rev - Optional specific revision
@@ -147,41 +151,9 @@ export class SyncService implements Startable {
 		rev?: number,
 		_includePending?: boolean,
 		_maxRevisions?: number
-	): Promise<import('../storage/struct.js').BlockArchive | undefined> {
+	): Promise<BlockArchive | undefined> {
 		try {
-			// Get the block from local storage
-			const context = rev !== undefined
-				? { rev, committed: [], pending: [] }
-				: undefined;
-
-			const result = await this.repo.get({
-				blockIds: [blockId],
-				context
-			}, { skipClusterFetch: true } as any);
-
-			const blockResult = result[blockId];
-			if (!blockResult || !blockResult.state.latest) {
-				return undefined;
-			}
-
-			const latest = blockResult.state.latest;
-
-			// Return minimal archive with just the requested block
-			const archive: import('../storage/struct.js').BlockArchive = {
-				blockId,
-				revisions: {
-					[latest.rev]: {
-						action: {
-							actionId: latest.actionId,
-							transform: { insert: blockResult.block }
-						},
-						block: blockResult.block
-					}
-				},
-				range: [latest.rev, latest.rev + 1]
-			};
-
-			return archive;
+			return await serveBlockArchive(this.repo, blockId, rev);
 		} catch (error) {
 			this.log.error('Error building archive for block %s:', blockId, error);
 			return undefined;

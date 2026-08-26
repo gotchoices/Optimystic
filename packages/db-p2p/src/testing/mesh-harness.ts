@@ -7,12 +7,13 @@ import { peerIdFromPrivateKey } from '@libp2p/peer-id';
 import { generateKeyPair } from '@libp2p/crypto/keys';
 import { ClusterMember, clusterMember, type ReconcileBlockCallback } from '../cluster/cluster-repo.js';
 import { createReconcileBlock } from '../cluster/reconcile-block.js';
-import { resolveClusterPolicy, type ClusterPolicyOptions } from '../cluster/cluster-policy.js';
+import { resolveClusterPolicy, type ClusterPolicyOptions, type ResolvedClusterPolicy } from '../cluster/cluster-policy.js';
 import { StorageRepo } from '../storage/storage-repo.js';
 import { MemoryRawStorage } from '../storage/memory-storage.js';
 import { BlockStorage } from '../storage/block-storage.js';
 import type { IRawStorage } from '../storage/i-raw-storage.js';
 import type { BlockArchive } from '../storage/struct.js';
+import { serveBlockArchive } from '../storage/block-archive.js';
 import { coordinatorRepo, type ClusterLatestCallback } from '../repo/coordinator-repo.js';
 import type { CoordinatorRepo } from '../repo/coordinator-repo.js';
 import { sortPeersByDistance, type KnownPeer } from '../routing/responsibility.js';
@@ -136,10 +137,10 @@ export interface Mesh {
 /**
  * One cohort peer's archive for a block, read straight from the sibling's `StorageRepo` — the mesh
  * analogue of `libp2p-node-base`'s `fetchArchiveFromPeer` (a SyncClient round trip). The archive
- * shape mirrors `SyncService.buildArchive` (`src/sync/service.ts`) — the thing the production fetch
- * actually receives over the wire — so the two cannot drift: `createReconcileBlock` reads only
- * `revisions[rev].action.actionId` and `revisions[rev].block`, but the `transform` filler is
- * produced the way the sync service produces it rather than invented here.
+ * itself comes from `serveBlockArchive`, the same function `SyncService` answers a real fetch with,
+ * so the harness cannot serve a shape production would not — including the case that used to
+ * differ: a peer holding a revision whose content it cannot materialize still votes on
+ * `(rev, actionId)` here, exactly as it does over the wire.
  *
  * A silent peer serves no bytes either. `undefined` is the right answer: reconcile's `no-archive`
  * outcome deliberately conflates unreachable with holds-nothing, and the production
@@ -150,10 +151,9 @@ export interface Mesh {
  * `nodes` is captured by reference and is fully populated by the time this is invoked.
  *
  * NOTE: the archive served here always carries exactly ONE revision — the peer's current latest —
- * because that is all `storageRepo.get` surfaces. Enough for repair, which only ever targets one
- * `(rev, actionId)`. If a spec ever needs a gap-fill across a revision RANGE (multi-revision
- * archive, `range` spanning more than `[rev, rev+1]`), this helper has to serve the real range
- * instead of synthesising a single-entry one.
+ * because that is all a repo read surfaces. Enough for repair, which only ever targets one
+ * `(rev, actionId)`. If a spec ever needs a gap-fill across a revision RANGE, `serveBlockArchive`
+ * has to grow a real range and both callers get it at once.
  */
 const makeFetchArchive = (nodes: MeshNode[], selfPeerId: string, failures: MeshFailureConfig) =>
 	async (peerIdStr: string, blockId: BlockId): Promise<BlockArchive | undefined> => {
@@ -161,44 +161,19 @@ const makeFetchArchive = (nodes: MeshNode[], selfPeerId: string, failures: MeshF
 		if (failures.silentPeers?.has(peerIdStr)) return undefined;
 		const target = nodes.find(n => n.peerId.toString() === peerIdStr);
 		if (!target) return undefined;
-		const result = await target.storageRepo.get({ blockIds: [blockId] }, { skipClusterFetch: true } as any);
-		const entry = result[blockId];
-		const latest = entry?.state?.latest;
-		if (!latest || !entry?.block) return undefined;
-		return {
-			blockId,
-			revisions: {
-				[latest.rev]: {
-					action: { actionId: latest.actionId, transform: { insert: entry.block } },
-					block: entry.block
-				}
-			},
-			range: [latest.rev, latest.rev + 1]
-		};
+		return await serveBlockArchive(target.storageRepo, blockId);
 	};
 
 /**
- * Creates N interconnected mesh nodes with real components and mock transport.
- * ClusterClient calls route directly to target ClusterMember instances.
+ * Fold the mesh's operator-facing knobs into the numbers every node runs on, through the SAME
+ * resolver a real node's composition root uses (`libp2p-node-base.ts`). Named and exported rather
+ * than inlined in `createMesh` so the precedence rule below is assertable without building a mesh.
+ *
+ * Precedence: an explicit `clusterPolicy` entry wins over the matching legacy top-level field — the
+ * entry is the production-shaped one.
  */
-export async function createMesh(nodeCount: number, options: MeshOptions): Promise<Mesh> {
-	const failures: MeshFailureConfig = {};
-
-	// Resolve the operator-facing knobs through the SAME function a real node's composition root
-	// uses (`libp2p-node-base.ts`), then hand the one resolved object to both consumers per node —
-	// the cluster member and the coordinator — exactly as production does. Resolved once per mesh
-	// rather than per node: same input, same numbers, and the resolver's one-line
-	// `repair-fault-tolerance` advisory fires once instead of N times.
-	//
-	// Precedence: an explicit `clusterPolicy` entry wins over the matching legacy top-level field —
-	// the entry is the production-shaped one.
-	//
-	// NOTE: one policy for the whole mesh, so every node necessarily agrees on cluster size and
-	// thresholds. That is right for repair tests, where disagreement is not the variable. A test
-	// that needs nodes to DISAGREE about the cluster (a partition where each side derives its own
-	// view — see ticket `mesh-harness-admission-gate`) has to move this resolve inside the phase-1
-	// loop and take per-node overrides; it cannot be expressed with a single shared object.
-	const policy = resolveClusterPolicy({
+export function resolveMeshPolicy(options: MeshOptions): ResolvedClusterPolicy {
+	return resolveClusterPolicy({
 		clusterSize: options.clusterSize,
 		clusterPolicy: {
 			...options.clusterPolicy,
@@ -211,6 +186,30 @@ export async function createMesh(nodeCount: number, options: MeshOptions): Promi
 			allowUnvalidatedSmallCluster: options.clusterPolicy?.allowUnvalidatedSmallCluster ?? true
 		}
 	});
+}
+
+/**
+ * Creates N interconnected mesh nodes with real components and mock transport.
+ * ClusterClient calls route directly to target ClusterMember instances.
+ */
+export async function createMesh(nodeCount: number, options: MeshOptions): Promise<Mesh> {
+	// NOTE: a mesh is never shut down — `Mesh` exposes no disposal seam, so each node's
+	// `ClusterMember.dispose()` is never called and its two cleanup intervals tick for the rest of
+	// the process. Harmless today: both handles are `.unref()`ed (the process still exits) and the
+	// callbacks are no-ops on an idle member, at ~40 `createMesh` sites across db-p2p's suite. If a
+	// mesh ever holds something a timer keeps alive — a real socket, a file handle, a fake clock a
+	// spec advances — give `Mesh` a `dispose()` that walks the nodes, and make the specs use it.
+	const failures: MeshFailureConfig = {};
+
+	// NOTE: one policy for the whole mesh, so every node necessarily agrees on cluster size and
+	// thresholds. That is right for repair tests, where disagreement is not the variable. A test
+	// that needs nodes to DISAGREE about the cluster (a partition where each side derives its own
+	// view — see ticket `mesh-harness-admission-gate`) has to resolve per node instead; it cannot
+	// be expressed with a single shared object.
+	//
+	// Resolved once per mesh rather than per node for a second reason: the resolver's one-line
+	// `repair-fault-tolerance` advisory then fires once instead of N times.
+	const policy = resolveMeshPolicy(options);
 
 	// Generate key pairs for all nodes
 	const keyPairs = await Promise.all(
