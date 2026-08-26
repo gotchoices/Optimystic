@@ -694,8 +694,9 @@ describe('CoordinatorRepo read-repair', () => {
 	 *  - `cohort-too-small` — the cohort has fewer peers than the quorum needs even if every one of
 	 *    them answered and agreed. Remedy: machines, or an honest declared cohort size.
 	 *  - `sole-holder` — the cohort is big enough, but exactly one of its peers holds the block and
-	 *    every other peer ANSWERED that it holds nothing. Remedy: a second copy of the block. No
-	 *    machine count and no setting helps.
+	 *    every other peer ANSWERED that it holds nothing. Remedy: another cohort peer holding the
+	 *    block. No machine count and no setting helps. The claim is scoped to COHORT PEERS: this
+	 *    node's own copy is excluded from the claim set, so a reader holding the block still sees it.
 	 */
 	describe('naming a repair that can never converge', () => {
 		const DEADLOCK = 'cluster-fetch:repair-deadlock';
@@ -715,6 +716,14 @@ describe('CoordinatorRepo read-repair', () => {
 		 * ('silent' to make the query reject). `clusterSize` doubles as the resolved
 		 * `repairCorroborationClusterSize` — nothing here declares `assumedClusterSize` — which is what
 		 * decides whether the cohort can ever field a quorum.
+		 *
+		 * NOTE: the reader itself HOLDS the block here (`makePresentStorageRepo`), which is the read-
+		 * repair path's normal shape — a present-but-possibly-stale block being checked. Its own answer
+		 * is excluded from the claim set, so `claims.length === 1` never means "one machine holds this".
+		 *
+		 * `grow` appends a peer to the live cohort view between reads (`findCluster` re-spreads the same
+		 * object every call), which is how a deployment that gains a machine is exercised without a
+		 * restart.
 		 */
 		const makeReader = async (opts: {
 			peers: number,
@@ -741,7 +750,12 @@ describe('CoordinatorRepo read-repair', () => {
 				undefined,
 				clusterLatestCallback
 			);
-			return { repo, calls };
+			const grow = async () => {
+				const added = await makePeerId();
+				peers.push(added);
+				Object.assign(cluster, makeClusterPeers([added]));
+			};
+			return { repo, calls, grow };
 		};
 
 		/**
@@ -815,12 +829,77 @@ describe('CoordinatorRepo read-repair', () => {
 			expect(payload.cohortPeers).to.be.at.least(payload.requiredEvenIfAllAnswered!);
 
 			expect(payload.message).to.contain('PERMANENT');
-			expect(payload.message).to.contain('ONLY ONE MACHINE HOLDS THIS BLOCK');
-			// The operator's action here is a second copy, NOT the machine-count/assumedClusterSize
-			// advice the other reason gives — sending them to config would waste the same twelve days.
+			expect(payload.message).to.contain('ONLY ONE COHORT PEER HOLDS THIS BLOCK');
+			// The operator's action here is another cohort peer holding the block, NOT the machine-count
+			// /assumedClusterSize advice the other reason gives — sending them to config would waste the
+			// same twelve days.
 			expect(payload.message).to.contain('MORE MACHINES DO NOT FIX THIS');
-			expect(payload.message).to.contain('SECOND COPY');
+			expect(payload.message).to.contain('ANOTHER COHORT PEER HOLDING THE BLOCK');
 			expect(payload.message).to.not.contain('clusterPolicy.assumedClusterSize');
+		});
+
+		/**
+		 * Review of name-the-single-holder-deadlock. The message must not promote a cohort-relative
+		 * observation into a claim about the whole deployment. This node's own copy is excluded from
+		 * the claim set — it cannot corroborate the revision it is repairing — so `claimants === 1`
+		 * says "one COHORT PEER holds it", never "one machine holds it".
+		 *
+		 * Here the reader and its one holding peer are on the SAME revision: two machines demonstrably
+		 * hold this block, the repair still cannot converge (a lone peer cannot second itself), and a
+		 * line telling that operator their block has a single copy would be false on its face — the
+		 * fastest way to teach them to filter this tag.
+		 */
+		it('scopes the sole-holder claim to cohort peers, never to the deployment', async () => {
+			const { repo } = await makeReader({
+				peers: 2,
+				clusterSize: 3,
+				// Peer 0 answers with exactly what the reader already holds; peer 1 holds nothing.
+				answer: index => index === 0 ? { actionId: localActionId, rev: localRev } : undefined
+			});
+
+			const captured = await captureCoordinatorLog(async () => { await repo.get({ blockIds: [blockId] }); });
+
+			const payload = deadlockLines(captured)[0]![1] as DeadlockPayload;
+			expect(payload.reason, 'still permanent — the lone peer cannot second itself').to.equal('sole-holder');
+			expect(payload.claimants, 'the reader is excluded from its own claim set').to.equal(1);
+			// The reader holds this block too, so any deployment-wide "only one machine" claim is false.
+			expect(payload.message).to.not.contain('ONLY ONE MACHINE');
+			expect(payload.message).to.contain('ONLY ONE COHORT PEER HOLDS THIS BLOCK');
+			expect(payload.message, 'the reader\'s own copy is named and excused, not counted')
+				.to.contain('does not count toward that number');
+		});
+
+		/**
+		 * Review of name-the-single-holder-deadlock. Suppression is per REASON, not once per block.
+		 *
+		 * `cohort-too-small` tells the operator to add machines. Adding them changes the cohort view at
+		 * runtime — no restart — and can leave the block stuck for the OTHER reason. A single
+		 * already-said flag would swallow that second line, and the operator would be left exactly where
+		 * this tag exists to stop them: they acted on the advice, it did not work, and the log went
+		 * quiet about why.
+		 */
+		it('says the second reason when a cohort that grew is still stuck', async () => {
+			// Two machines, size undeclared: the cohort cannot field the quorum at all.
+			const { repo, grow } = await makeUndeclaredTwoNode(
+				index => index === 0 ? { actionId: 'remote-action', rev: 2 } : undefined
+			);
+
+			const first = await captureCoordinatorLog(async () => { await repo.get({ blockIds: [blockId] }); });
+			expect((deadlockLines(first)[0]![1] as DeadlockPayload).reason).to.equal('cohort-too-small');
+
+			// The operator does what that message asked for and adds a machine. It answers, and it holds
+			// nothing — so the cohort is now big enough and the block is still held by one peer.
+			await grow();
+			const second = await captureCoordinatorLog(async () => { await repo.get({ blockIds: [blockId] }); });
+
+			expect(deadlockLines(second), 'the new diagnosis is not swallowed by the old one').to.have.lengthOf(1);
+			const payload = deadlockLines(second)[0]![1] as DeadlockPayload;
+			expect(payload.reason).to.equal('sole-holder');
+			expect(payload.cohortPeers, 'the added machine is in the cohort view').to.equal(2);
+
+			// ...and neither reason repeats after that.
+			const third = await captureCoordinatorLog(async () => { await repo.get({ blockIds: [blockId] }); });
+			expect(deadlockLines(third), 'each reason is said once per episode').to.have.lengthOf(0);
 		});
 
 		it('fires the same way for an unconfigured three-machine deployment', async () => {

@@ -166,6 +166,45 @@ describe('createReconcileBlock (commit-path block restoration)', () => {
 		expect(payload?.fetchErrors).to.equal(0);
 	});
 
+	/**
+	 * Review of name-the-single-holder-deadlock. The case above pins all four population counts at
+	 * zero, which a constant would satisfy just as well. Splitting `responders` into populations is
+	 * only worth anything if each one actually counts its own peers, so drive a cohort holding one of
+	 * each and pin that they land in four different buckets and sum to the cohort.
+	 */
+	it('counts each shortfall population separately in the decline', async () => {
+		const BEHIND = 'node-behind', EMPTY = 'node-empty', BROKEN = 'node-broken';
+		const archives: Record<string, BlockArchive | undefined> = {
+			[PEER_A]: archiveAt(2, 'action-2', makeBlock('v2')),   // holder, at the committed revision
+			[BEHIND]: archiveAt(1, 'action-1', makeBlock('v1')),   // served an archive, but below the commit
+			[EMPTY]: undefined                                      // served nothing
+		};
+		const h = harness(archives, {
+			repairCorroborationClusterSize: 10,
+			async fetchArchive(peerId) {
+				if (peerId === BROKEN) throw new Error('stream reset');
+				return archives[peerId];
+			}
+		});
+
+		const captured = await captureLog('reconcile-block', async () => {
+			await h.reconcile(BLOCK_ID, COMMITTED, [PEER_A, BEHIND, EMPTY, BROKEN, SELF]);
+		});
+
+		const payload = captured.find(args => typeof args[0] === 'string' && args[0].includes('reconcile:no-rev-quorum'))?.[1] as
+			{ cohortPeers?: number, holders?: number, behind?: number, noArchive?: number, fetchErrors?: number } | undefined;
+
+		expect(payload, 'expected reconcile:no-rev-quorum').to.not.equal(undefined);
+		expect(payload?.cohortPeers, 'self is not one of the peers consulted').to.equal(4);
+		expect(payload?.holders).to.equal(1);
+		expect(payload?.behind, 'an archive that stops below the commit is not a non-holder').to.equal(1);
+		expect(payload?.noArchive).to.equal(1);
+		expect(payload?.fetchErrors, 'a throwing fetch is not silently a non-holder').to.equal(1);
+		const { holders = 0, behind = 0, noArchive = 0, fetchErrors = 0 } = payload ?? {};
+		expect(holders + behind + noArchive + fetchErrors, 'the populations partition the cohort')
+			.to.equal(payload?.cohortPeers);
+	});
+
 	it('heals unconfigured once the operator declares a genuine two-node deployment', async () => {
 		// The counterpart trade: one explicit setting (which does NOT lower the replication factor)
 		// buys back self-repair for a mesh that is really that small.

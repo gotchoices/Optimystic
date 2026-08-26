@@ -239,7 +239,7 @@ describe('a block only one machine holds', function () {
 		expect(payload.claimants).to.equal(1);
 		// The cohort is big enough — this is what makes it a different problem from cohort-too-small.
 		expect(payload.requiredEvenIfAllAnswered).to.equal(2);
-		expect(payload.message).to.contain('ONLY ONE MACHINE HOLDS THIS BLOCK');
+		expect(payload.message).to.contain('ONLY ONE COHORT PEER HOLDS THIS BLOCK');
 		expect(payload.message).to.contain('MORE MACHINES DO NOT FIX THIS');
 	});
 

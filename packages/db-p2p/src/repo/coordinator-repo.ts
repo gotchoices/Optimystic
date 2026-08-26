@@ -107,13 +107,73 @@ interface AheadClaimState {
 	 */
 	rev?: number;
 	/**
-	 * Whether `cluster-fetch:repair-deadlock` has already been said for this block (see
-	 * {@link CoordinatorRepo.reportRepairDeadlock}). The deadlock is a property of the deployment's
-	 * size, not of any one revision, so it survives {@link CoordinatorRepo.recordAheadClaim} clearing
-	 * `rev`: without that, a block whose cohort claims nothing *ahead* of the reader would re-announce
-	 * the same permanent condition on every single pass — the noise this line exists to replace.
+	 * Which `cluster-fetch:repair-deadlock` reasons have already been said for this block (see
+	 * {@link CoordinatorRepo.reportRepairDeadlock}). Neither reason is about any one revision — one is
+	 * about the cohort's size, the other about how many of its peers hold the block — so both survive
+	 * {@link CoordinatorRepo.recordAheadClaim} clearing `rev`: without that, a block whose cohort
+	 * claims nothing *ahead* of the reader would re-announce the same permanent condition on every
+	 * single pass, the noise this line exists to replace.
+	 *
+	 * Tracked per REASON rather than as one flag: the two diagnose different faults and send the
+	 * operator to different places, so an episode that starts as `cohort-too-small` and becomes
+	 * `sole-holder` (the operator added machines, which is what that reason told them to do) has to be
+	 * able to say the second thing. Bounded at two entries by the reason union itself.
 	 */
-	deadlockReported?: boolean;
+	deadlocksReported?: readonly DeadlockReason[];
+}
+
+/**
+ * Why a corroboration decline is provably permanent — see {@link CoordinatorRepo.reportRepairDeadlock}
+ * for what makes each provable and which remedy each sends the operator to.
+ */
+type DeadlockReason = 'cohort-too-small' | 'sole-holder';
+
+/** The `cohort-too-small` wording: the cohort cannot field the quorum however healthy its peers are. */
+function cohortTooSmallMessage(
+	cohortPeers: number,
+	claimants: number,
+	requiredEvenIfAllAnswered: number,
+	repairCorroborationClusterSize: number
+): string {
+	return `Block repair cannot converge for this block and the condition is PERMANENT, not transient: ` +
+		`this node's cohort has ${cohortPeers} peer(s) besides itself, all of them answered ` +
+		`(${claimants} hold the block), but accepting a revision would need ${requiredEvenIfAllAnswered} ` +
+		`agreeing peers even if every one of those ${cohortPeers} answered and agreed. No later pass can reach ` +
+		`that, however healthy every peer is, so this node's copy of the block stays as it is. Repair needs ` +
+		`${CORROBORATION_FLOOR} cohort peers BESIDES the reader to answer and agree, relaxed to 1 only for a ` +
+		`cohort that DECLARES it is smaller; repairCorroborationClusterSize currently resolves to ` +
+		`${repairCorroborationClusterSize}. Two things produce this, and this node cannot tell them ` +
+		`apart: (1) the deployment really does run this few machines — set clusterPolicy.assumedClusterSize ` +
+		`to the number you actually run (it does not lower clusterSize / the replication factor), or set an ` +
+		`honest clusterSize, and run at least ${CORROBORATION_FLOOR + 2} machines for any tolerance of one ` +
+		`unreachable peer; or (2) this node's view of the cohort has shrunk below the real deployment — a ` +
+		`partition or a routing problem, which configuration will not fix. Check the peer count above ` +
+		`against the machines you run before changing anything.`;
+}
+
+/**
+ * The `sole-holder` wording: the cohort is big enough, but only one of its peers holds the block.
+ *
+ * Every claim here is scoped to THIS NODE'S COHORT PEERS, which is the whole of what the pass
+ * observed. It deliberately does not say "only one machine in the deployment holds this block": this
+ * node's own copy is excluded from the claim set (it cannot corroborate the revision it is trying to
+ * repair), so a reader that holds the block itself would make that reading false — and a scary
+ * all-caps line an operator can disprove by looking at their own disks is worth less than no line.
+ * For the same reason the remedy is "another COHORT PEER holding it" rather than "a second copy":
+ * with the reader holding one, a second copy already exists and is still not enough.
+ */
+function soleHolderMessage(cohortPeers: number): string {
+	return `Block repair cannot converge for this block and the condition is PERMANENT, not transient: ` +
+		`ONLY ONE COHORT PEER HOLDS THIS BLOCK. Of this node's ${cohortPeers} cohort peers, 1 reports holding ` +
+		`it and the other ${cohortPeers - 1} answered that they hold NOTHING — an answer, not silence, so this ` +
+		`is the whole picture and not a slow pass. Repair adopts a revision only when ${CORROBORATION_FLOOR} ` +
+		`peers BESIDES this node agree on it, and a lone holder cannot second itself, so every later pass ` +
+		`declines identically. This node's own copy, if it has one, is the copy being repaired and does not ` +
+		`count toward that number. MORE MACHINES DO NOT FIX THIS, and neither does any cluster-size setting — ` +
+		`what is missing is ANOTHER COHORT PEER HOLDING THE BLOCK. The usual cause is data written while the ` +
+		`deployment (or this block's cohort) was smaller: a block that had one holder then still has one holder ` +
+		`now, because the two paths that would replicate it — read-repair and reconcile — both decline on this ` +
+		`same rule. Committing any new revision of the block writes it to the current cohort and clears this.`;
 }
 
 /**
@@ -542,16 +602,16 @@ export class CoordinatorRepo implements IRepo {
 		const prior = this.unsettledAheadClaims.get(blockId);
 		if (claimedRev === undefined) {
 			// The consult is the authority on the CLAIM, and only on the claim. A recorded deadlock is
-			// not about any revision — it is about how many machines this deployment can field — so it
-			// outlives the claim that first exposed it and is dropped only when the block converges
-			// (see {@link flagUnconfirmedCurrency}).
-			if (prior?.deadlockReported) this.unsettledAheadClaims.set(blockId, { deadlockReported: true });
+			// not about any revision — it is about how many machines this deployment can field, or how
+			// many of them hold the block — so it outlives the claim that first exposed it and is
+			// dropped only when the block converges (see {@link flagUnconfirmedCurrency}).
+			if (prior?.deadlocksReported) this.unsettledAheadClaims.set(blockId, { deadlocksReported: prior.deadlocksReported });
 			else this.unsettledAheadClaims.delete(blockId);
 			return;
 		}
 		this.unsettledAheadClaims.set(blockId, {
 			rev: claimedRev,
-			...(prior?.deadlockReported ? { deadlockReported: true } : {})
+			...(prior?.deadlocksReported ? { deadlocksReported: prior.deadlocksReported } : {})
 		});
 	}
 
@@ -1000,8 +1060,10 @@ export class CoordinatorRepo implements IRepo {
 	 *  - `cohort-too-small` — this node's cohort has fewer peers than the quorum would demand even if
 	 *    every one of them answered and agreed. The remedy is machines or an honest declared size.
 	 *  - `sole-holder` — the cohort is big enough, but exactly ONE of its peers holds the block at all
-	 *    and every other peer answered that it holds nothing. The remedy is a second copy of the
-	 *    block; machines and configuration are both irrelevant.
+	 *    and every other peer answered that it holds nothing. The remedy is another cohort peer
+	 *    holding the block; machines and configuration are both irrelevant. Note the scope: this node's
+	 *    own copy is excluded from the claim set, so a reader that holds the block itself still sees
+	 *    `sole-holder` — the message says "cohort peer", never "machine in the deployment".
 	 *
 	 * **What makes `cohort-too-small` provable.** Not "this pass fell short" — a pass falls short
 	 * whenever some peer simply does not hold the block *yet*. The decisive question is whether the
@@ -1071,45 +1133,33 @@ export class CoordinatorRepo implements IRepo {
 		// supporter — every other cohort peer answered that it holds nothing. `answered === cohortPeers`
 		// is already implied by the silence guard above; it is stated because the two counts arrive as
 		// independent parameters and "everybody answered" is half of what makes this provable.
+		//
+		// NOTE: there is a narrow window where `sole-holder` is true of the instant but not of the
+		// deployment — a commit that has landed on one cohort member and has not yet been pushed to the
+		// rest presents exactly this shape. Calling it PERMANENT is defensible even there (repair
+		// genuinely cannot converge until the push lands, and the once-per-episode flag clears the
+		// moment the block converges, so the line does not repeat), and widening the window is what the
+		// push path's own threat model decides — see
+		// `tickets/blocked/repair-floor-defends-a-door-the-push-path-leaves-open`. If commit-to-push
+		// latency ever grows enough that operators see `sole-holder` on blocks that heal moments later,
+		// gate the line on the block having been quiet for longer than that latency rather than
+		// softening the wording.
 		const soleHolder = claims.length === 1 && answered === cohortPeers;
 		if (!cohortTooSmall && !soleHolder) return;
-
-		const state = this.unsettledAheadClaims.get(blockId);
-		if (state?.deadlockReported) return;
 
 		// Both shapes can hold at once (an undeclared two-machine deployment whose single peer holds the
 		// block is both). `cohort-too-small` is reported in preference because its remedy is the one
 		// that actually works there: declaring the real size makes the floor reachable, after which the
 		// lone peer's claim IS adopted — so calling it a sole-holder problem would send the operator
-		// looking for a second copy they do not need.
-		const reason = cohortTooSmall ? 'cohort-too-small' : 'sole-holder';
-		const nonHolders = cohortPeers - claims.length;
-		const message = cohortTooSmall
-			? `Block repair cannot converge for this block and the condition is PERMANENT, not transient: ` +
-			`this node's cohort has ${cohortPeers} peer(s) besides itself, all of them answered ` +
-			`(${claims.length} hold the block), but accepting a revision would need ${requiredEvenIfAllAnswered} ` +
-			`agreeing peers even if every one of those ${cohortPeers} answered and agreed. No later pass can reach ` +
-			`that, however healthy every peer is, so this node's copy of the block stays as it is. Repair needs ` +
-			`${CORROBORATION_FLOOR} cohort peers BESIDES the reader to answer and agree, relaxed to 1 only for a ` +
-			`cohort that DECLARES it is smaller; repairCorroborationClusterSize currently resolves to ` +
-			`${this.repairCorroborationClusterSize}. Two things produce this, and this node cannot tell them ` +
-			`apart: (1) the deployment really does run this few machines — set clusterPolicy.assumedClusterSize ` +
-			`to the number you actually run (it does not lower clusterSize / the replication factor), or set an ` +
-			`honest clusterSize, and run at least ${CORROBORATION_FLOOR + 2} machines for any tolerance of one ` +
-			`unreachable peer; or (2) this node's view of the cohort has shrunk below the real deployment — a ` +
-			`partition or a routing problem, which configuration will not fix. Check the peer count above ` +
-			`against the machines you run before changing anything.`
-			: `Block repair cannot converge for this block and the condition is PERMANENT, not transient: ` +
-			`ONLY ONE MACHINE HOLDS THIS BLOCK. Of this node's ${cohortPeers} cohort peers, 1 reports holding it ` +
-			`and the other ${nonHolders} answered that they hold NOTHING — an answer, not silence, so this is the ` +
-			`whole picture and not a slow pass. Repair adopts a revision only when ${CORROBORATION_FLOOR} peers ` +
-			`agree on it and a sole holder cannot second itself, so every later pass declines identically. This ` +
-			`node's own copy, if it has one, is the copy being repaired and cannot corroborate itself. MORE ` +
-			`MACHINES DO NOT FIX THIS, and neither does any cluster-size setting — the block needs a SECOND COPY. ` +
-			`The usual cause is data written while the deployment (or this block's cohort) was smaller: a block ` +
-			`that had one holder then still has one holder now, because the two paths that would replicate it — ` +
-			`read-repair and reconcile — both decline on this same rule. Committing any new revision of the block ` +
-			`writes it to the current cohort and clears this.`;
+		// looking for a copy they do not need.
+		const reason: DeadlockReason = cohortTooSmall ? 'cohort-too-small' : 'sole-holder';
+		const state = this.unsettledAheadClaims.get(blockId);
+		const alreadySaid = state?.deadlocksReported ?? [];
+		// Suppressed per REASON, not once outright: an episode that starts as `cohort-too-small` and
+		// becomes `sole-holder` — the operator added the machines that reason asked for, and the block
+		// is still stuck — has a second thing to say, and a silent log there is the failure this line
+		// exists to end. Neither reason repeats within an episode.
+		if (alreadySaid.includes(reason)) return;
 
 		this.log('cluster-fetch:repair-deadlock', {
 			blockId,
@@ -1120,18 +1170,20 @@ export class CoordinatorRepo implements IRepo {
 			required,
 			requiredEvenIfAllAnswered,
 			repairCorroborationClusterSize: this.repairCorroborationClusterSize,
-			message
+			message: cohortTooSmall
+				? cohortTooSmallMessage(cohortPeers, claims.length, requiredEvenIfAllAnswered, this.repairCorroborationClusterSize)
+				: soleHolderMessage(cohortPeers)
 		});
 		// Hung off the existing per-block freshness entry rather than a fourth per-block map. The entry
 		// survives `recordAheadClaim` clearing its `rev`, and is dropped wholesale once the block
-		// converges — so the line is said once per non-convergence episode, not once per pass.
+		// converges — so each reason is said once per non-convergence episode, not once per pass.
 		// NOTE: per BLOCK, though the condition is a property of the cohort, not of any block — so a node
 		// in this state that reads N distinct blocks emits N lines. Deliberate: the operator wants to
 		// know which blocks are stuck, and N is bounded by blocks actually read (1821 lines for a single
 		// block was the defect). If a deployment in this state ever makes this the noisy line again, add
 		// a node-level once-flag keyed on (cohortPeers, requiredEvenIfAllAnswered) and let the per-block
 		// entry only suppress repeats.
-		this.unsettledAheadClaims.set(blockId, { ...(state ?? {}), deadlockReported: true });
+		this.unsettledAheadClaims.set(blockId, { ...(state ?? {}), deadlocksReported: [...alreadySaid, reason] });
 	}
 
 	/**

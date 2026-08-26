@@ -213,6 +213,16 @@ export function resolveClusterPolicy(options: ClusterPolicyOptions): ResolvedClu
 		// Every number above counts MACHINES. Saying only that overstates the guarantee, because repair
 		// also needs the answering peers to actually HOLD the block — which is a property of the block,
 		// not of the deployment, and which no machine count can supply.
+		//
+		// NOTE: accepted tradeoff — the caveat rides the EXISTING trigger (cohort size undeclared, or
+		// repairCorroborationClusterSize <= 3) rather than firing for every deployment. A correctly-
+		// declared large deployment is arguably the operator most likely to believe a machine count
+		// covers them, and never sees this paragraph at startup; they learn it from the per-block
+		// `cluster-fetch:repair-deadlock` line with reason=sole-holder instead. Weighed and kept: a
+		// startup advisory that fires on every correctly-configured node forever is one operators
+		// filter, which costs more than it buys. Revisit if the per-block line proves too late to be
+		// useful — i.e. if field reports show operators hitting stranded founding data without ever
+		// having read a repair-deadlock line.
 		const holdersCaveat =
 			` All of that counts MACHINES, and machines are only half the requirement: the peers that answer ` +
 			`must also HOLD the block, and ${CORROBORATION_FLOOR} of them must. A block that only ONE cohort ` +
@@ -222,7 +232,7 @@ export function resolveClusterPolicy(options: ClusterPolicyOptions): ResolvedClu
 			`was smaller keeps the number of copies it was written with, and GROWING THE DEPLOYMENT DOES NOT ` +
 			`COPY IT — so founding data can stay stranded however many machines you later run. That case is ` +
 			`reported once per affected block as cluster-fetch:repair-deadlock with reason=sole-holder, and its ` +
-			`remedy is a second copy (commit a new revision of the block), never more machines.`;
+			`remedy is another cohort peer holding it (commit a new revision of the block), never more machines.`;
 		const undeclaredAdvice = cohortUndeclared
 			? ` No clusterPolicy.assumedClusterSize declared, so the floor is measured against ` +
 			`repairCorroborationClusterSize=${repairCorroborationClusterSize} and never relaxes: if you actually ` +
