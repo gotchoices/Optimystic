@@ -144,3 +144,28 @@ same number", which carries no signatures at all. A planner should weigh that st
 them, plus a startup advisory that stops implying three machines are enough. That is deliberately
 diagnostics only, because nothing else is sound without this ticket.
 
+
+## Arm — new evidence, filed 2026-08-25 (gotchoices/Optimystic#15)
+
+An outside reporter measured the availability half of this ticket as a live, permanent data-loss-
+shaped failure, and sharpened *which* quantity is wrong.
+
+`corroboratorCapacity` relaxes the floor based on **cohort size**. What bounds corroboration is
+**how many peers hold the block**. A block with exactly one holder supplies exactly one claim, so it
+is declined in any cohort of three or more — and both paths that could create a second holder
+(`CoordinatorRepo.queryClusterForLatest`, `createReconcileBlock`) consume the same decision. One
+holder is therefore where it stays, permanently.
+
+Verified against our own 0.24.2 build: identical evidence (one honest claim, all other members
+answering "I hold nothing") is accepted at a cohort view of two and declined at three, four and
+nine.
+
+Why this strengthens the case for a certificate specifically: the state is produced by **growth**,
+not by misconfiguration. Whatever was committed while the deployment was one node has one holder,
+and the cohort that later derives for that key has three — so a deployment's founding records are
+exactly the data that becomes unreadable, and `clusterPolicy.assumedClusterSize` cannot express "this
+block has one holder". A certificate is the only listed direction that lets a lone claim be trusted
+without handing an attacker the sole-claimant lever.
+
+Tracked as `fix/single-holder-block-is-permanently-unreadable`, which enumerates the alternatives and
+must decide whether the safe fix reduces to this ticket.
