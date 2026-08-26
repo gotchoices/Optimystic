@@ -862,10 +862,12 @@ estimate is unconfident. A genuine two-node mesh needs one setting to *self-repa
 
 **Every number above counts PEERS, not COPIES — and repair needs both.** `repairCorroborationClusterSize`
 and the corroboration floor it feeds are entirely about how many cohort *peers* exist and can be asked;
-none of it says how many of those peers actually *hold* the block being repaired. A block that only one
-cohort peer holds cannot be repaired at any `assumedClusterSize` / `clusterSize` whatsoever — the sole
-holder cannot second itself, and the two mechanisms that would give a second peer a copy (read-repair
-and reconcile) both decline on this same corroboration floor. The usual cause is data written while the
+none of it says how many of those peers actually *hold* the block being repaired. Wherever the floor is
+two — every configuration except a cohort that declares itself two-member, where it relaxes to one — a
+block that only one cohort peer holds cannot be repaired by raising `assumedClusterSize` /
+`clusterSize` at all: the sole holder cannot second itself, and the two mechanisms that would give a
+second peer a copy (read-repair and reconcile) both decline on this same corroboration floor. Raising
+either setting only ever makes the floor harder to meet, never easier. The usual cause is data written while the
 deployment (or that block's cohort) was smaller: growing the deployment afterwards does not retroactively
 copy existing blocks to the new peers, so founding data can stay stranded at one copy indefinitely. This
 is reported once per affected block as `cluster-fetch:repair-deadlock` with `reason: 'sole-holder'`

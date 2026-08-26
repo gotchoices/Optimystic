@@ -483,11 +483,12 @@ saveMaterializedBlock(block): store(structuredClone(block));
   **How many machines repair actually needs** (swept over `resolveClusterPolicy` +
   `corroboratorCapacity` + `quorumSize`, and pinned in `test/quorum-restore.spec.ts` under *how
   many answering peers a repair needs, by deployment size*). **Every row assumes the block already
-  has at least two cohort-peer holders besides the reader** — i.e., enough copies that a quorum is
-  reachable in principle. Machine count alone never repairs a block only one cohort peer holds; see
-  the paragraph below the table:
+  has at least as many cohort-peer holders as that row's *must answer* column demands** — those peers
+  have to answer *and agree*, which only a peer that holds the block can do. A block with fewer
+  holders than that is a different failure, and machine count does not fix it; see the paragraph
+  below the table:
 
-  | machines | cohort size declared? | peers besides the reader | peers that must answer *that reader* | can repair (given ≥2 holders)? |
+  | machines | cohort size declared? | peers besides the reader | peers that must answer *that reader* | can repair (given that many holders)? |
   | --- | --- | --- | --- | --- |
   | 2 | no (falls back to `clusterSize`, default 10) | 1 | 2 | **never** |
   | 2 | yes (`assumedClusterSize: 2`, or an honest `clusterSize: 2`) | 1 | 1 | yes, with no margin |
@@ -499,13 +500,16 @@ saveMaterializedBlock(block): store(structuredClone(block));
   reader has exactly two peers and needs both, so one peer unreachable *from that reader* — healthy
   and reachable from everyone else — leaves that reader's copy permanently unrepairable. **Declaring
   `assumedClusterSize: 3` does not conjure a third peer**; it has the same zero tolerance as an
-  undeclared three. And **the `4+` row's "survives one unreachable peer" is conditional on the
-  same ≥2-holders assumption as every other row, not a blanket guarantee at that size**: a block
-  that only one cohort peer holds cannot be repaired at *any* machine count, four-or-more included —
-  more machines never manufactures a second copy of a block that only ever had one. The usual way a
-  block ends up in that state is being written while the deployment (or that block's cohort) was
-  smaller; growing the deployment afterwards does not retroactively copy it. This is reported as
-  `cluster-fetch:repair-deadlock` with `reason: 'sole-holder'` (below) — a diagnosis, not a fault of
+  undeclared three. And **the `4+` row's "survives one unreachable peer" is conditional on that row's
+  holder assumption — two of them — not a blanket guarantee at that size**: wherever the
+  corroboration floor is two (every row but the declared-two-machine one), a block that only one
+  cohort peer holds cannot be repaired at *any* machine count, four-or-more included — more machines
+  never manufactures a second copy of a block that only ever had one. The declared two-machine row is
+  the single exception: its floor relaxes to one, so a lone peer's claim *is* adopted there and a
+  singly-held block repairs like any other. The usual way a block ends up stranded is being written
+  while the deployment (or that block's cohort) was smaller; growing the deployment afterwards does
+  not retroactively copy it. This is reported as `cluster-fetch:repair-deadlock` with
+  `reason: 'sole-holder'` (below) — a diagnosis, not a fault of
   the read path, and one an operator at four-plus machines can otherwise easily miss.
 
   Two signals name this rather than leaving it to be re-derived from logs:
@@ -528,8 +532,11 @@ saveMaterializedBlock(block): store(structuredClone(block));
       machines, or an honest declared `clusterPolicy.assumedClusterSize` / `clusterSize`.
     - **`sole-holder`** — the cohort is big enough (does not trip `cohort-too-small`), but exactly
       ONE of its peers holds the block and every *other* peer answered that it holds nothing — an
-      answer, not silence. Every row in the table above assumes the block already has two-or-more
-      cohort-peer holders; this is the case where it does not, so it holds at *any* machine count.
+      answer, not silence. Every row in the table above assumes the block already has as many
+      cohort-peer holders as that row demands; this is the case where it does not, so it holds at any
+      machine count whose corroboration floor is two — that is, everything but a declared two-machine
+      cohort, where the floor is one, a lone holder IS corroborated, and the repair therefore succeeds
+      rather than declining (so this reason cannot arise there).
       Scope is deliberately narrow: this node's own copy, if it has one, is excluded from the claim
       set (it cannot corroborate the revision it is repairing), so the message says "cohort peer",
       never "machine in the deployment" — a reader that holds the block itself still gets

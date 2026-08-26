@@ -104,9 +104,11 @@ describe('quorum-restore primitives', () => {
 	 * answering peer reports the SAME `(rev, actionId)` — so it only ever measures how many peers a
 	 * deployment of that size can field, never how many of them actually hold the block in question.
 	 * A block only one cohort peer holds breaks that assumption: no count of machines supplies a
-	 * second holder, so no `nodes` value in this file's cases makes it repairable. See the final case
-	 * below, which pins that directly rather than through `answeringPeersNeeded` (whose "every peer
-	 * answers as a holder" premise is exactly what a singly-held block does not satisfy).
+	 * second holder, so wherever the corroboration floor is two it stays unrepairable however many
+	 * machines are added. The one exception is a cohort that DECLARES it is two-member, where the
+	 * floor relaxes to one and a lone holder is corroborated like any other claim. See the final case
+	 * below, which pins both halves directly rather than through `answeringPeersNeeded` (whose "every
+	 * peer answers as a holder" premise is exactly what a singly-held block does not satisfy).
 	 */
 	describe('how many answering peers a repair needs, by deployment size', () => {
 		/**
@@ -179,16 +181,27 @@ describe('quorum-restore primitives', () => {
 			// no count of them corroborates the sole holder. This is `sole-holder` in
 			// `CoordinatorRepo.reportRepairDeadlock`, distinct from the `cohort-too-small` shape the rest
 			// of this describe block measures.
+			const soleHolderClaim: RevClaim[] = [{ peerId: 'sole-holder', rev: 2, actionId: 'a' }];
 			for (const nodes of [3, 4, 10]) {
-				const cohortPeers = nodes - 1;
 				const policy = resolveClusterPolicy({ clusterSize: nodes });
-				const capacity = corroboratorCapacity(cohortPeers, policy.repairCorroborationClusterSize);
-				const soleHolderClaim: RevClaim[] = [{ peerId: 'sole-holder', rev: 2, actionId: 'a' }];
+				const capacity = corroboratorCapacity(nodes - 1, policy.repairCorroborationClusterSize);
 				expect(
-					selectQuorumRev(soleHolderClaim, THRESHOLD, capacity),
+					selectQuorumRev(soleHolderClaim, policy.simpleMajorityThreshold, capacity),
 					`${nodes} machines, cohort large enough to repair a shared block, still can't corroborate a lone holder`
 				).to.equal(undefined);
 			}
+		});
+
+		it('except on a DECLARED two-machine cohort, whose floor of one adopts the lone holder', () => {
+			// The boundary of the case above, and the one place the docs must not say "no machine count
+			// helps": with the cohort declared two-member the corroboration floor relaxes to one, so the
+			// single peer's claim IS adopted and the repair converges. `sole-holder` therefore cannot be
+			// reported there — `reportRepairDeadlock` only runs on a decline, and this does not decline.
+			const soleHolderClaim: RevClaim[] = [{ peerId: 'sole-holder', rev: 2, actionId: 'a' }];
+			const policy = resolveClusterPolicy({ clusterSize: 10, clusterPolicy: { assumedClusterSize: 2 } });
+			const capacity = corroboratorCapacity(1, policy.repairCorroborationClusterSize);
+			expect(selectQuorumRev(soleHolderClaim, policy.simpleMajorityThreshold, capacity))
+				.to.deep.equal({ rev: 2, actionId: 'a', supporters: ['sole-holder'] });
 		});
 	});
 
