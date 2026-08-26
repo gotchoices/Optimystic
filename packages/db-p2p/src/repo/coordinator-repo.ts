@@ -1348,16 +1348,22 @@ export class CoordinatorRepo implements IRepo {
 		};
 
 		try {
-			// For each block ID, execute a cluster transaction
-			const clusterPromises = blockIds.map(blockId =>
-				this.coordinator.executeClusterTransaction(blockId, message, options)
-			);
-
-			// Wait for all cluster transactions to complete
-			const results = await Promise.all(clusterPromises);
+			// One cluster transaction per block ID — but a block whose cohort is just this node
+			// short-circuits to local storage, exactly as `pend` and `commit` do above. Without the
+			// short-circuit a solo cohort enters `executeTransaction`, fails `minAbsoluteClusterSize`
+			// (2), and throws `Cluster size 1 below minimum 2 and not validated` — so a single-peer
+			// deployment could pend and commit but never cancel, unless the operator had opened the
+			// `allowUnvalidatedSmallCluster` hatch. Decided per block rather than once for
+			// `blockIds[0]`, because a multi-block cancel can span cohorts of different sizes.
+			const results = await Promise.all(blockIds.map(async blockId => {
+				const peerCount = await this.coordinator.getClusterSize(blockId);
+				if (peerCount <= 1) return false;
+				const { localExecuted } = await this.coordinator.executeClusterTransaction(blockId, message, options);
+				return localExecuted;
+			}));
 
 			// Only call storageRepo if local cluster didn't already execute during consensus
-			const anyLocalExecuted = results.some(r => r.localExecuted);
+			const anyLocalExecuted = results.some(Boolean);
 			if (!anyLocalExecuted) {
 				await this.storageRepo.cancel(actionRef, options);
 			}

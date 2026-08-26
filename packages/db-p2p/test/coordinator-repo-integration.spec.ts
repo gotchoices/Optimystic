@@ -64,6 +64,33 @@ describe('CoordinatorRepo Integration (TEST-5.3.1)', () => {
 			expect(pendResult2.success).to.equal(true);
 		});
 
+		it('should cancel on a solo cohort without opening the small-cluster hatch', async () => {
+			// Deterministic twin of the case above, whose 3-node `responsibilityK: 1` mesh only lands
+			// on a solo cohort when node 0 happens to be the block's sole responsible peer (~1 run in
+			// 3, since peer ids are generated fresh per mesh). A one-node mesh always does.
+			//
+			// The regression: `cancel` used to enter a cluster transaction unconditionally, so a
+			// single-peer cohort failed `minAbsoluteClusterSize` and threw `Cluster size 1 below
+			// minimum 2 and not validated` — pend and commit short-circuit to local storage at
+			// `peerCount <= 1` and cancel did not. Latent until the mesh harness stopped forcing
+			// `allowUnvalidatedSmallCluster: true`; this mesh deliberately leaves that hatch shut.
+			const soloMesh = await createMesh(1, { responsibilityK: 1, clusterSize: 1 });
+			const blockId = 'block-cancel-solo';
+			const node = soloMesh.nodes[0]!;
+
+			const pendResult = await node.coordinatorRepo.pend(
+				{ actionId: 'a-solo-cancel', transforms: makeTransforms(blockId), policy: 'c' }
+			);
+			expect(pendResult.success).to.equal(true);
+
+			await node.coordinatorRepo.cancel({ actionId: 'a-solo-cancel', blockIds: [blockId] });
+
+			const pendResult2 = await node.coordinatorRepo.pend(
+				{ actionId: 'a-solo-after-cancel', transforms: makeTransforms(blockId), policy: 'c' }
+			);
+			expect(pendResult2.success).to.equal(true);
+		});
+
 		it('should cancel a pending transaction with cluster consensus', async () => {
 			mesh = await createMesh(3, {
 				responsibilityK: 3,
