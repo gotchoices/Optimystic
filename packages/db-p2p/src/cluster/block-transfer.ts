@@ -1,4 +1,4 @@
-import type { IRepo, IPeerNetwork } from '@optimystic/db-core';
+import type { IRepo, IPeerNetwork, ActionId } from '@optimystic/db-core';
 import { peerIdFromString } from '@libp2p/peer-id';
 import type { PartitionDetector } from './partition-detector.js';
 import type { RestorationCoordinator } from '../storage/restoration-coordinator.js';
@@ -33,6 +33,15 @@ export interface RebalanceReactionResult {
 	released: string[];
 	/** Lost blocks whose replication could not be confirmed — keep serving, retry later. */
 	retained: string[];
+	/** Grown blocks confirmed pushed to every newly co-responsible peer (capped by the floor). */
+	replicated: string[];
+	/**
+	 * Grown blocks that could not be confirmed on the new peers this pass. Nothing is released or
+	 * retried off this list here — the monitor's snapshot already recorded these peers as seen, so
+	 * the retry is `confirmReplicated`'s own `maxRetries` within the pass, and after that the block
+	 * stays where it was (the next cohort CHANGE re-detects any peer still missing it).
+	 */
+	underReplicated: string[];
 }
 
 /**
@@ -123,25 +132,67 @@ export class BlockTransferCoordinator {
 	 * hole (`docs/arachnode-ring-handoff.md` § Why the current code violates it #2).
 	 */
 	async handleRebalanceEvent(event: RebalanceEvent): Promise<RebalanceReactionResult> {
-		log('rebalance:start gained=%d lost=%d floor=%d', event.gained.length, event.lost.length, event.floor);
+		log('rebalance:start gained=%d lost=%d grown=%d floor=%d',
+			event.gained.length, event.lost.length, event.grown?.size ?? 0, event.floor);
 
 		const floor = Math.max(1, event.floor);
-		const [pullResult, confirmResult] = await Promise.all([
+		const [pullResult, confirmResult, growResult] = await Promise.all([
 			event.gained.length > 0 ? this.pullBlocks(event.gained) : { succeeded: [], failed: [] },
 			event.lost.length > 0 && event.newOwners.size > 0
 				? this.confirmReplicated(event.lost, event.newOwners, floor)
-				: { confirmed: [], unconfirmed: [...event.lost] }
+				: { confirmed: [], unconfirmed: [...event.lost] },
+			this.replicateGrown(event.grown ?? new Map<string, string[]>(), floor)
 		]);
 
-		log('rebalance:done pull=%d/%d released=%d/%d',
+		log('rebalance:done pull=%d/%d released=%d/%d replicated=%d/%d',
 			pullResult.succeeded.length, event.gained.length,
-			confirmResult.confirmed.length, event.lost.length);
+			confirmResult.confirmed.length, event.lost.length,
+			growResult.confirmed.length, event.grown?.size ?? 0);
 
 		return {
 			pulled: pullResult.succeeded,
 			released: confirmResult.confirmed,
-			retained: confirmResult.unconfirmed
+			retained: confirmResult.unconfirmed,
+			replicated: growResult.confirmed,
+			underReplicated: growResult.unconfirmed
 		};
+	}
+
+	/**
+	 * Push each GROWN block (still owned; new peers became co-responsible) to its newly
+	 * co-responsible peers, reusing {@link confirmReplicated} per block. The per-block floor is
+	 * `min(event floor, new-peer count)`: passing the raw event floor would be wrong when fewer new
+	 * peers exist than the floor — `executeConfirm` could then never reach the floor and would burn
+	 * `maxRetries` re-pushing peers that already accepted. Nothing is released off this path (the
+	 * node KEEPS the block either way); the confirmed/unconfirmed split is reporting only. The
+	 * in-flight `confirm:<id>` key dedups against a concurrent lost-confirm for the same block.
+	 * `enablePush` deliberately does not gate this (same rationale as the NOTE in
+	 * {@link confirmReplicated}); the growth arm as a whole is gated by the `rebalance.enabled`
+	 * wiring in `libp2p-node-base`.
+	 */
+	private async replicateGrown(
+		grown: Map<string, string[]>,
+		floor: number
+	): Promise<{ confirmed: string[]; unconfirmed: string[] }> {
+		if (grown.size === 0) {
+			return { confirmed: [], unconfirmed: [] };
+		}
+
+		const confirmed: string[] = [];
+		const unconfirmed: string[] = [];
+
+		await Promise.all([...grown.entries()].map(async ([blockId, newPeers]) => {
+			if (newPeers.length === 0) return;
+			const result = await this.confirmReplicated(
+				[blockId],
+				new Map([[blockId, newPeers]]),
+				Math.min(floor, newPeers.length)
+			);
+			confirmed.push(...result.confirmed);
+			unconfirmed.push(...result.unconfirmed);
+		}));
+
+		return { confirmed, unconfirmed };
 	}
 
 	/**
@@ -261,6 +312,7 @@ export class BlockTransferCoordinator {
 					}
 
 					const blockData = new TextEncoder().encode(JSON.stringify(blockResult.block));
+					const blockMeta = this.sourceMeta(blockId, blockResult);
 
 					// Push to at least one new owner
 					for (const ownerPeerIdStr of owners) {
@@ -268,7 +320,7 @@ export class BlockTransferCoordinator {
 							const peerId = peerIdFromString(ownerPeerIdStr);
 							const client = new BlockTransferClient(peerId, this.peerNetwork, this.protocolPrefix);
 							const response = await this.withTimeout(
-								client.pushBlocks([blockId], [blockData]),
+								client.pushBlocks([blockId], [blockData], 'rebalance', blockMeta),
 								this.transferTimeoutMs
 							);
 
@@ -344,6 +396,7 @@ export class BlockTransferCoordinator {
 					}
 
 					const blockData = new TextEncoder().encode(JSON.stringify(blockResult.block));
+					const blockMeta = this.sourceMeta(blockId, blockResult);
 
 					// Count DISTINCT owners that hold a current replica; stop once the floor is reached.
 					const confirmedPeers = new Set<string>();
@@ -353,7 +406,7 @@ export class BlockTransferCoordinator {
 							const peerId = peerIdFromString(ownerPeerIdStr);
 							const client = new BlockTransferClient(peerId, this.peerNetwork, this.protocolPrefix);
 							const response = await this.withTimeout(
-								client.pushBlocks([blockId], [blockData]),
+								client.pushBlocks([blockId], [blockData], 'rebalance', blockMeta),
 								this.transferTimeoutMs
 							);
 							if (response && !response.missing.includes(blockId)) {
@@ -386,6 +439,21 @@ export class BlockTransferCoordinator {
 		} finally {
 			this.inFlight.delete(key);
 		}
+	}
+
+	/**
+	 * The source's `state.latest` in `blockMeta` wire shape, so a pushed replica lands at the
+	 * source's `(rev, actionId)` instead of being fabricated as rev 1 on the receiver (matching
+	 * spread-on-churn's pushes). This is what lets the replica later CORROBORATE the source in a
+	 * quorum vote — a fabricated actionId would never match the source's claim. `undefined` when the
+	 * local repo reports no latest (the receiver then falls back to its deterministic rev-1 replica).
+	 */
+	private sourceMeta(
+		blockId: string,
+		blockResult: { state?: { latest?: { rev: number; actionId: ActionId } } }
+	): Record<string, { rev: number; actionId: ActionId }> | undefined {
+		const latest = blockResult.state?.latest;
+		return latest ? { [blockId]: { rev: latest.rev, actionId: latest.actionId } } : undefined;
 	}
 
 	// --- Semaphore for concurrency limiting ---

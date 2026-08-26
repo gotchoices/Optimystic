@@ -236,6 +236,120 @@ describe('RebalanceMonitor', () => {
 		});
 	});
 
+	describe('growth detection (cohort grows while responsibility is kept)', () => {
+		it('first observation reports the whole non-self cohort as grown (alongside gained)', async () => {
+			// No snapshot entry yet ⇒ prior cohort treated as empty ⇒ every non-self cohort member is
+			// "new". This is the founder-heal: peers that joined before the monitor's first check (or
+			// before a holder restart) still get the push.
+			mockFret.setCohort('*', [selfId.toString(), peerId2.toString(), peerId3.toString()]);
+
+			const monitor = new RebalanceMonitor(deps, { minRebalanceIntervalMs: 0 });
+			monitor.trackBlock('block-1');
+
+			const event = await monitor.checkNow();
+
+			expect(event).to.not.be.null;
+			expect(event!.gained, 'first observation is also a gain').to.deep.equal(['block-1']);
+			expect(event!.grown.get('block-1'), 'both cohort peers are newly co-responsible').to.have.members(
+				[peerId2.toString(), peerId3.toString()]);
+			expect(event!.grown.get('block-1'), 'self never appears in grown').to.not.include(selfId.toString());
+		});
+
+		it('a peer joining the cohort reports ONLY the new peer as grown', async () => {
+			mockFret.setCohort('*', [selfId.toString(), peerId2.toString()]);
+
+			const monitor = new RebalanceMonitor(deps, { minRebalanceIntervalMs: 0 });
+			monitor.trackBlock('block-1');
+			await monitor.checkNow(); // baseline: peerId2 recorded as seen
+
+			mockFret.setCohort('*', [selfId.toString(), peerId2.toString(), peerId3.toString()]);
+			const event = await monitor.checkNow();
+
+			expect(event).to.not.be.null;
+			expect(event!.gained, 'still responsible — nothing gained').to.deep.equal([]);
+			expect(event!.lost).to.deep.equal([]);
+			expect(event!.grown.get('block-1'), 'only the joiner, not the already-seen peer').to.deep.equal(
+				[peerId3.toString()]);
+		});
+
+		it('a stable cohort does not re-emit growth', async () => {
+			mockFret.setCohort('*', [selfId.toString(), peerId2.toString()]);
+
+			const monitor = new RebalanceMonitor(deps, { minRebalanceIntervalMs: 0 });
+			monitor.trackBlock('block-1');
+			await monitor.checkNow(); // first observation emits gained+grown
+
+			const second = await monitor.checkNow();
+			expect(second, 'no change → no event → no re-push loop').to.be.null;
+
+			const third = await monitor.checkNow();
+			expect(third).to.be.null;
+		});
+
+		it('a lost block never appears in grown (lost ⇒ not responsible ⇒ growth arm skipped)', async () => {
+			mockFret.setCohort('*', [selfId.toString()]);
+
+			const monitor = new RebalanceMonitor(deps, { minRebalanceIntervalMs: 0 });
+			monitor.trackBlock('block-1');
+			await monitor.checkNow(); // baseline: responsible
+
+			mockFret.setCohort('*', [peerId2.toString(), peerId3.toString()]);
+			const event = await monitor.checkNow();
+
+			expect(event).to.not.be.null;
+			expect(event!.lost).to.deep.equal(['block-1']);
+			expect(event!.grown.size, 'grown and lost are mutually exclusive per block').to.equal(0);
+		});
+
+		it('the growth budget defers excess blocks and re-detects them on the next check', async () => {
+			mockFret.setCohort('*', [selfId.toString()]);
+
+			const monitor = new RebalanceMonitor(deps, { minRebalanceIntervalMs: 0, growthBlockBudget: 1 });
+			monitor.trackBlock('block-1');
+			monitor.trackBlock('block-2');
+			await monitor.checkNow(); // baseline: responsible for both, no non-self peers yet
+
+			// Both blocks grow at once; the budget admits one per check.
+			mockFret.setCohort('*', [selfId.toString(), peerId2.toString()]);
+
+			const first = await monitor.checkNow();
+			expect(first).to.not.be.null;
+			expect(first!.grown.size, 'budget admits exactly one block').to.equal(1);
+
+			// The dropped block's snapshot was NOT updated, so the same growth is re-detected.
+			const second = await monitor.checkNow();
+			expect(second).to.not.be.null;
+			expect(second!.grown.size, 'the deferred block surfaces next check').to.equal(1);
+			const firstBlock = [...first!.grown.keys()][0];
+			const secondBlock = [...second!.grown.keys()][0];
+			expect(secondBlock, 'it is the OTHER block, not a re-emit').to.not.equal(firstBlock);
+			expect(second!.grown.get(secondBlock!)).to.deep.equal([peerId2.toString()]);
+
+			// Both now recorded — nothing left to defer.
+			const third = await monitor.checkNow();
+			expect(third).to.be.null;
+		});
+
+		it('regaining responsibility re-reports the whole cohort as grown (seen set cleared on loss)', async () => {
+			mockFret.setCohort('*', [selfId.toString(), peerId2.toString()]);
+
+			const monitor = new RebalanceMonitor(deps, { minRebalanceIntervalMs: 0 });
+			monitor.trackBlock('block-1');
+			await monitor.checkNow(); // baseline: responsible, peerId2 seen
+
+			mockFret.setCohort('*', [peerId2.toString()]); // self drops out
+			await monitor.checkNow(); // lost
+
+			mockFret.setCohort('*', [selfId.toString(), peerId2.toString()]); // self back in
+			const event = await monitor.checkNow();
+
+			expect(event).to.not.be.null;
+			expect(event!.gained).to.deep.equal(['block-1']);
+			expect(event!.grown.get('block-1'), 'peerId2 re-reported: the seen set was cleared on loss').to.deep.equal(
+				[peerId2.toString()]);
+		});
+	});
+
 	describe('debounce behavior', () => {
 		it('rapid topology changes produce a single debounced check', async () => {
 			mockFret.setCohort('*', [selfId.toString()]);

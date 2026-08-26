@@ -225,11 +225,15 @@ export type NodeOptions = ClusterPolicyOptions & {
 
 	/**
 	 * Rebalance reaction tuning. Drives the RebalanceMonitor + BlockTransferCoordinator pull-gained/
-	 * push-lost path when arachnode/FRET are available (the only place fretAdapter + restoration
-	 * coordinator exist). Absent -> enabled with defaults (see RebalanceMonitorConfig). Set
-	 * { enabled: false } to disable the rebalance reaction on this node. When arachnode is disabled
-	 * or FRET is absent the rebalance path stays inert regardless of this flag (rebalance is a
-	 * resilience optimization, not a correctness requirement).
+	 * push-lost/replicate-grown path when arachnode/FRET are available (the only place fretAdapter +
+	 * restoration coordinator exist). The grown arm is what pushes a block this node keeps to peers
+	 * that newly became co-responsible for it — the founder case: anything committed while the
+	 * deployment was one node gets its second copy only through this path (bounded per pass by
+	 * `growthBlockBudget`). Absent -> enabled with defaults (see RebalanceMonitorConfig). Set
+	 * { enabled: false } to disable the rebalance reaction (including the grown arm) on this node.
+	 * When arachnode is disabled or FRET is absent the rebalance path stays inert regardless of this
+	 * flag (rebalance is a resilience optimization — except for singly-held blocks, where the grown
+	 * arm is currently the only mechanism that ever creates a second copy).
 	 */
 	rebalance?: Partial<RebalanceMonitorConfig> & { enabled?: boolean };
 
@@ -1131,12 +1135,22 @@ export async function createLibp2pNodeBase(
 						// async loop. Adding/deleting a Set entry during iteration does not throw in JS — entries
 						// are visited best-effort — which is acceptable for a resilience mechanism, so we
 						// document it here rather than add locking.
+						//
+						// The event's `grown` arm (blocks this node KEEPS whose cohort acquired new peers — the
+						// founder/cohort-growth case) is handled entirely inside handleRebalanceEvent: it pushes
+						// each grown block to the newly co-responsible peers. Nothing is released or untracked off
+						// that arm — the node keeps serving the block either way — so the only local effect here is
+						// the log line naming what could not be confirmed this pass.
 						rebalanceMonitor.onRebalance((event) => {
 							for (const blockId of event.gained) ownedBlocks.add(blockId);
 							coordinator.handleRebalanceEvent(event).then((result) => {
 								for (const blockId of result.released) {
 									rebalanceMonitor.untrackBlock(blockId); // also evicts from the shared ownedBlocks set
 									gcEligible.add(blockId);                 // confirmed replicated → safe to sweep
+								}
+								if (result.underReplicated.length > 0) {
+									log?.('cohort-growth: %d of %d grown blocks not confirmed on new peers this pass',
+										result.underReplicated.length, event.grown.size);
 								}
 							}).catch((err) => {
 								log?.('rebalance reaction failed: %o', err);

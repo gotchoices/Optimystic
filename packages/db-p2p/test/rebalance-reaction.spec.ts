@@ -216,4 +216,28 @@ describe('RebalanceMonitor → BlockTransferCoordinator reaction wiring', () => 
 		expect(events[0]!.newOwners.get('block-1'), 'new owners carried in the event').to.include(peerId2.toString());
 		expect(peerNetwork.connectCalls.length, 'handleRebalanceEvent pushed (dialed a new owner)').to.be.greaterThan(0);
 	});
+
+	it('a topology-triggered GROWN event (cohort grows, block kept) drives a push to the new peer', async () => {
+		// Baseline: self is the sole cohort member and holds the block (the founder case).
+		mockFret.setCohort([selfId.toString()]);
+		repo.blocks.set('block-1', makeBlock('block-1'));
+
+		const { monitor, events } = wire();
+		monitor.trackBlock('block-1');
+		await monitor.checkNow(); // establishes responsible=true, no co-responsible peers seen
+
+		await monitor.start();
+		// A peer joins and becomes co-responsible; self KEEPS the block — nothing is lost or gained.
+		mockFret.setCohort([selfId.toString(), peerId2.toString()]);
+		mockLibp2p.emit('connection:open');
+		// The grown push dials the joiner; wait on that terminal effect.
+		await waitFor(() => peerNetwork.connectCalls.length > 0, { description: 'the topology-triggered grown event drove a push (dial) to the newly co-responsible peer' });
+		await monitor.stop();
+
+		expect(events, 'rebalance event reached the onRebalance handler').to.have.length(1);
+		expect(events[0]!.gained, 'nothing gained — the block was kept').to.deep.equal([]);
+		expect(events[0]!.lost, 'nothing lost — the block was kept').to.deep.equal([]);
+		expect(events[0]!.grown.get('block-1'), 'the joiner carried in the event').to.deep.equal([peerId2.toString()]);
+		expect(peerNetwork.connectCalls[0]!.peerId, 'the push dialed the joiner').to.equal(peerId2.toString());
+	});
 });

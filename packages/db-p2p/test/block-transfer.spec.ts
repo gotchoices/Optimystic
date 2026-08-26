@@ -376,6 +376,7 @@ describe('BlockTransferCoordinator', () => {
 				gained: ['block-new'],
 				lost: ['block-old'],
 				newOwners: new Map([['block-old', [ownerId.toString()]]]),
+				grown: new Map(),
 				floor: 1,
 				triggeredAt: Date.now()
 			};
@@ -392,12 +393,81 @@ describe('BlockTransferCoordinator', () => {
 				gained: [],
 				lost: [],
 				newOwners: new Map(),
+				grown: new Map(),
 				floor: 1,
 				triggeredAt: Date.now()
 			};
 
 			// Should not throw
 			await coordinator.handleRebalanceEvent(event);
+		});
+
+		it('pushes a GROWN block to its newly co-responsible peer exactly once, even below the event floor', async () => {
+			repo.blocks.set('block-kept', makeBlock('block-kept'));
+			const newPeer = await makePeerId();
+			peerNetwork.responses.set(newPeer.toString(), { blocks: { 'block-kept': 'data' }, missing: [] });
+
+			// floor 3 but only ONE new peer: the per-block floor must clamp to the new-peer count, or
+			// executeConfirm could never reach 3 and would burn maxRetries re-pushing an accepted peer.
+			const event: RebalanceEvent = {
+				gained: [],
+				lost: [],
+				newOwners: new Map(),
+				grown: new Map([['block-kept', [newPeer.toString()]]]),
+				floor: 3,
+				triggeredAt: Date.now()
+			};
+
+			const result = await coordinator.handleRebalanceEvent(event);
+
+			expect(result.replicated, 'the grown block confirmed on its new peer').to.deep.equal(['block-kept']);
+			expect(result.underReplicated).to.deep.equal([]);
+			expect(result.released, 'nothing is released off the grown arm').to.deep.equal([]);
+			expect(peerNetwork.connectCalls.length, 'one clean push, no retry churn').to.equal(1);
+			expect(peerNetwork.connectCalls[0]!.peerId.toString()).to.equal(newPeer.toString());
+		});
+
+		it('reports a grown block underReplicated when the new peer refuses to persist it', async () => {
+			repo.blocks.set('block-kept', makeBlock('block-kept'));
+			const newPeer = await makePeerId();
+			// Receiver answers, but lists the block missing (parse/persist failure on its side).
+			peerNetwork.responses.set(newPeer.toString(), { blocks: {}, missing: ['block-kept'] });
+
+			const event: RebalanceEvent = {
+				gained: [],
+				lost: [],
+				newOwners: new Map(),
+				grown: new Map([['block-kept', [newPeer.toString()]]]),
+				floor: 3,
+				triggeredAt: Date.now()
+			};
+
+			const result = await coordinator.handleRebalanceEvent(event);
+
+			expect(result.replicated).to.deep.equal([]);
+			expect(result.underReplicated, 'unconfirmed grown block surfaces for the log line').to.deep.equal(['block-kept']);
+		});
+
+		it('a grown block with no local data is reported underReplicated without dialing (gained∩grown case)', async () => {
+			// The block was only just gained (nothing local yet) but the first observation also lists the
+			// cohort as grown. The push finds no local bytes and no-ops — benign: those cohort peers are
+			// the pull's own source.
+			const newPeer = await makePeerId();
+
+			const event: RebalanceEvent = {
+				gained: [],
+				lost: [],
+				newOwners: new Map(),
+				grown: new Map([['block-absent', [newPeer.toString()]]]),
+				floor: 3,
+				triggeredAt: Date.now()
+			};
+
+			const result = await coordinator.handleRebalanceEvent(event);
+
+			expect(result.replicated).to.deep.equal([]);
+			expect(result.underReplicated).to.deep.equal(['block-absent']);
+			expect(peerNetwork.connectCalls.length, 'no dial without local data').to.equal(0);
 		});
 	});
 
